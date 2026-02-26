@@ -30,3 +30,6 @@ external/
 vendor/
 submodules/
 third-party/
+tests/
+third-party/
+tests/
