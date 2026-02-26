@@ -1,0 +1,125 @@
+DBG_BF16_GEMM LOAD_2x2 k_block_idx=0, A=[[-0.925781, -0.425781],[0.073242, -0.968750]] B=[[-0.345703, 0.628906],[-0.625000, 0.519531]] stage=0
+DBG_BF16_GEMM MMA_OUT threadIDx=32 k_block_idx=0 accum_stage=0 TMEM0..3=0.505646,2.671632,-1.025566,0.857920
+DBG_BF16_GEMM MMA_OUT threadIDx=33 k_block_idx=0 accum_stage=0 TMEM0..3=0.359520,3.904306,-2.620136,-3.781429
+DBG_BF16_GEMM MMA_OUT threadIDx=34 k_block_idx=0 accum_stage=0 TMEM0..3=4.893773,-6.121105,-1.647341,3.043337
+DBG_BF16_GEMM MMA_OUT threadIDx=35 k_block_idx=0 accum_stage=0 TMEM0..3=0.370716,1.738147,1.407841,6.820192
+DBG_BF16_GEMM MMA_OUT threadIDx=36 k_block_idx=0 accum_stage=0 TMEM0..3=-1.972027,10.568491,2.571377,-2.340896
+DBG_BF16_GEMM MMA_OUT threadIDx=37 k_block_idx=0 accum_stage=0 TMEM0..3=0.897799,5.882631,-3.067767,1.224065
+DBG_BF16_GEMM MMA_OUT threadIDx=38 k_block_idx=0 accum_stage=0 TMEM0..3=-1.662281,-0.367128,-0.985310,-4.007107
+DBG_BF16_GEMM MMA_OUT threadIDx=39 k_block_idx=0 accum_stage=0 TMEM0..3=-3.004816,0.889550,-1.475168,-4.395178
+DBG_BF16_GEMM MMA_OUT threadIDx=40 k_block_idx=0 accum_stage=0 TMEM0..3=-4.967861,2.889240,-1.807219,0.840102
+DBG_BF16_GEMM MMA_OUT threadIDx=41 k_block_idx=0 accum_stage=0 TMEM0..3=1.587330,-1.845989,-0.794626,-0.228541
+DBG_BF16_GEMM MMA_OUT threadIDx=42 k_block_idx=0 accum_stage=0 TMEM0..3=-0.837248,1.689048,-2.744293,-4.027596
+DBG_BF16_GEMM MMA_OUT threadIDx=43 k_block_idx=0 accum_stage=0 TMEM0..3=1.632178,11.065275,-3.594131,4.028669
+DBG_BF16_GEMM MMA_OUT threadIDx=44 k_block_idx=0 accum_stage=0 TMEM0..3=3.020214,-1.307471,2.743065,3.712579
+DBG_BF16_GEMM MMA_OUT threadIDx=45 k_block_idx=0 accum_stage=0 TMEM0..3=3.907297,0.717012,-4.067724,3.379261
+DBG_BF16_GEMM MMA_OUT threadIDx=46 k_block_idx=0 accum_stage=0 TMEM0..3=-5.780102,3.391776,1.226036,-8.688699
+DBG_BF16_GEMM MMA_OUT threadIDx=47 k_block_idx=0 accum_stage=0 TMEM0..3=-5.199127,-2.578988,1.398096,-1.924926
+DBG_BF16_GEMM MMA_OUT threadIDx=48 k_block_idx=0 accum_stage=0 TMEM0..3=-2.964666,7.459587,-0.416615,-0.940363
+DBG_BF16_GEMM MMA_OUT threadIDx=49 k_block_idx=0 accum_stage=0 TMEM0..3=3.274190,-7.037257,-0.538132,5.574320
+DBG_BF16_GEMM MMA_OUT threadIDx=50 k_block_idx=0 accum_stage=0 TMEM0..3=0.197743,1.113013,-3.849922,-2.952755
+DBG_BF16_GEMM MMA_OUT threadIDx=51 k_block_idx=0 accum_stage=0 TMEM0..3=-2.183420,1.930203,5.296438,-0.782068
+DBG_BF16_GEMM MMA_OUT threadIDx=52 k_block_idx=0 accum_stage=0 TMEM0..3=3.902552,5.362602,0.830841,2.441333
+DBG_BF16_GEMM MMA_OUT threadIDx=53 k_block_idx=0 accum_stage=0 TMEM0..3=-0.411394,-0.740767,0.275734,-1.209778
+DBG_BF16_GEMM MMA_OUT threadIDx=54 k_block_idx=0 accum_stage=0 TMEM0..3=-3.573426,9.978568,0.245883,1.915689
+DBG_BF16_GEMM MMA_OUT threadIDx=55 k_block_idx=0 accum_stage=0 TMEM0..3=-5.913953,3.878542,1.032225,-3.384987
+DBG_BF16_GEMM MMA_OUT threadIDx=56 k_block_idx=0 accum_stage=0 TMEM0..3=0.057364,-2.726851,-1.500336,-1.107711
+DBG_BF16_GEMM MMA_OUT threadIDx=57 k_block_idx=0 accum_stage=0 TMEM0..3=8.031467,3.666674,1.242004,11.840083
+DBG_BF16_GEMM MMA_OUT threadIDx=58 k_block_idx=0 accum_stage=0 TMEM0..3=-1.853970,-8.469181,2.272869,-3.490524
+DBG_BF16_GEMM MMA_OUT threadIDx=59 k_block_idx=0 accum_stage=0 TMEM0..3=4.932112,0.001781,-2.474382,5.388425
+DBG_BF16_GEMM MMA_OUT threadIDx=60 k_block_idx=0 accum_stage=0 TMEM0..3=3.005010,-3.082947,-3.610598,2.634869
+DBG_BF16_GEMM MMA_OUT threadIDx=61 k_block_idx=0 accum_stage=0 TMEM0..3=-2.824281,1.849591,-2.200624,2.328209
+DBG_BF16_GEMM MMA_OUT threadIDx=62 k_block_idx=0 accum_stage=0 TMEM0..3=2.818990,-6.747717,-2.143921,1.285796
+DBG_BF16_GEMM MMA_OUT threadIDx=63 k_block_idx=0 accum_stage=0 TMEM0..3=-2.861487,-2.631787,-2.296895,-2.629309
+DBG_BF16_GEMM LOAD_2x2 k_block_idx=1, A=[[-0.033447, -0.972656],[-1.765625, 0.652344]] B=[[-0.345703, 0.628906],[-0.625000, 0.519531]] stage=1
+DBG_BF16_GEMM MMA_OUT threadIDx=32 k_block_idx=1 accum_stage=0 TMEM0..3=4.841194,11.521154,2.198572,2.387760
+DBG_BF16_GEMM MMA_OUT threadIDx=33 k_block_idx=1 accum_stage=0 TMEM0..3=9.763740,-0.743098,-5.137537,-10.501110
+DBG_BF16_GEMM MMA_OUT threadIDx=34 k_block_idx=1 accum_stage=0 TMEM0..3=8.959166,-4.718538,-6.602719,1.126274
+DBG_BF16_GEMM MMA_OUT threadIDx=35 k_block_idx=1 accum_stage=0 TMEM0..3=7.321904,5.987856,-0.463028,-1.881281
+DBG_BF16_GEMM MMA_OUT threadIDx=36 k_block_idx=1 accum_stage=0 TMEM0..3=0.536666,24.489685,2.706181,4.825415
+DBG_BF16_GEMM MMA_OUT threadIDx=37 k_block_idx=1 accum_stage=0 TMEM0..3=-6.638909,6.593561,-6.071863,-9.423679
+DBG_BF16_GEMM MMA_OUT threadIDx=38 k_block_idx=1 accum_stage=0 TMEM0..3=-7.820209,-2.898806,-11.668137,-0.497698
+DBG_BF16_GEMM MMA_OUT threadIDx=39 k_block_idx=1 accum_stage=0 TMEM0..3=8.504704,-6.113136,-6.736618,-19.318659
+DBG_BF16_GEMM MMA_OUT threadIDx=40 k_block_idx=1 accum_stage=0 TMEM0..3=-11.586825,9.704611,-6.542978,-6.806098
+DBG_BF16_GEMM MMA_OUT threadIDx=41 k_block_idx=1 accum_stage=0 TMEM0..3=4.036494,-9.446774,-11.348273,-0.983993
+DBG_BF16_GEMM MMA_OUT threadIDx=42 k_block_idx=1 accum_stage=0 TMEM0..3=-3.904797,-9.341006,7.893350,3.824538
+DBG_BF16_GEMM MMA_OUT threadIDx=43 k_block_idx=1 accum_stage=0 TMEM0..3=4.158272,8.338881,9.774178,-6.609728
+DBG_BF16_GEMM MMA_OUT threadIDx=44 k_block_idx=1 accum_stage=0 TMEM0..3=-1.784276,11.934303,15.295143,-5.246745
+DBG_BF16_GEMM MMA_OUT threadIDx=45 k_block_idx=1 accum_stage=0 TMEM0..3=6.950279,-0.866356,-2.736479,6.271789
+DBG_BF16_GEMM MMA_OUT threadIDx=46 k_block_idx=1 accum_stage=0 TMEM0..3=4.182961,7.805486,-7.006389,-5.412108
+DBG_BF16_GEMM MMA_OUT threadIDx=47 k_block_idx=1 accum_stage=0 TMEM0..3=-4.872000,-16.091423,6.042714,14.711081
+DBG_BF16_GEMM MMA_OUT threadIDx=48 k_block_idx=1 accum_stage=0 TMEM0..3=-14.686584,13.889972,14.627441,2.590008
+DBG_BF16_GEMM MMA_OUT threadIDx=49 k_block_idx=1 accum_stage=0 TMEM0..3=-3.744193,3.560363,3.427354,14.038992
+DBG_BF16_GEMM MMA_OUT threadIDx=50 k_block_idx=1 accum_stage=0 TMEM0..3=12.542581,-7.947127,-2.025665,-2.228428
+DBG_BF16_GEMM MMA_OUT threadIDx=51 k_block_idx=1 accum_stage=0 TMEM0..3=3.263093,1.686253,8.567127,-2.616487
+DBG_BF16_GEMM MMA_OUT threadIDx=52 k_block_idx=1 accum_stage=0 TMEM0..3=15.145195,-2.471932,5.347641,-6.459966
+DBG_BF16_GEMM MMA_OUT threadIDx=53 k_block_idx=1 accum_stage=0 TMEM0..3=1.779069,-2.567373,5.285913,8.718250
+DBG_BF16_GEMM MMA_OUT threadIDx=54 k_block_idx=1 accum_stage=0 TMEM0..3=0.747789,8.590171,3.430099,5.259081
+DBG_BF16_GEMM MMA_OUT threadIDx=55 k_block_idx=1 accum_stage=0 TMEM0..3=0.606296,0.549390,8.502528,-8.855053
+DBG_BF16_GEMM MMA_OUT threadIDx=56 k_block_idx=1 accum_stage=0 TMEM0..3=6.127376,-0.295098,-13.001781,-7.554416
+DBG_BF16_GEMM MMA_OUT threadIDx=57 k_block_idx=1 accum_stage=0 TMEM0..3=14.300897,-7.784120,-2.193627,19.136370
+DBG_BF16_GEMM MMA_OUT threadIDx=58 k_block_idx=1 accum_stage=0 TMEM0..3=-11.767319,-5.228821,8.692981,3.686442
+DBG_BF16_GEMM MMA_OUT threadIDx=59 k_block_idx=1 accum_stage=0 TMEM0..3=15.855559,0.996691,-4.331052,-1.370378
+DBG_BF16_GEMM MMA_OUT threadIDx=60 k_block_idx=1 accum_stage=0 TMEM0..3=3.881968,-8.458506,-10.815356,8.690581
+DBG_BF16_GEMM MMA_OUT threadIDx=61 k_block_idx=1 accum_stage=0 TMEM0..3=5.380708,10.162781,-0.191454,3.755465
+DBG_BF16_GEMM MMA_OUT threadIDx=62 k_block_idx=1 accum_stage=0 TMEM0..3=0.387262,-14.005239,6.294926,-6.947056
+DBG_BF16_GEMM MMA_OUT threadIDx=63 k_block_idx=1 accum_stage=0 TMEM0..3=4.188654,-10.510622,-1.790835,-6.877556
+DBG_BF16_GEMM BF16 EPI_TMEM warp=4 epi_warp=0 lane=0 stage=0 tmem_addr=0 values=8.974687,12.626760,0.611940,2.193244
+DBG_BF16_GEMM BF16 EPI_TMEM warp=7 epi_warp=3 lane=0 stage=0 tmem_addr=0 values=5.336422,3.096015,-4.207275,5.920053
+DBG_BF16_GEMM BF16 EPI_TMEM warp=5 epi_warp=1 lane=0 stage=0 tmem_addr=0 values=4.751724,13.047915,5.789784,23.983059
+DBG_BF16_GEMM BF16 EPI_TMEM warp=6 epi_warp=2 lane=0 stage=0 tmem_addr=0 values=-4.820755,-12.581631,-15.170864,-1.348968
+DBG_BF16_ASYM LOAD_2x2 block_k_iter=0, A=[[-0.925781, -0.425781],[0.073242, -0.968750]] B=[[-0.345703, 0.628906],[-0.625000, 0.519531]] stage=0
+DBG_UMMA_RESULT asym threadIDx=32 bk=0 bm=0 nb=0 accum_stage=0 RESULT=-0.879508,-4.883452,-4.421264,2.627306
+DBG_UMMA_RESULT asym threadIDx=33 bk=0 bm=0 nb=0 accum_stage=0 RESULT=7.605403,14.656759,7.334872,-4.836357
+DBG_UMMA_RESULT asym threadIDx=34 bk=0 bm=0 nb=0 accum_stage=0 RESULT=-1.024730,15.385618,-2.866185,4.032755
+DBG_UMMA_RESULT asym threadIDx=35 bk=0 bm=0 nb=0 accum_stage=0 RESULT=-17.451742,14.194434,3.976701,13.348390
+DBG_UMMA_RESULT asym threadIDx=36 bk=0 bm=0 nb=0 accum_stage=0 RESULT=-0.051446,-5.871572,10.121340,15.229502
+DBG_UMMA_RESULT asym threadIDx=37 bk=0 bm=0 nb=0 accum_stage=0 RESULT=-5.376707,-2.599260,7.120583,-4.289405
+DBG_UMMA_RESULT asym threadIDx=38 bk=0 bm=0 nb=0 accum_stage=0 RESULT=-8.012289,-13.938307,-4.118854,0.158209
+DBG_UMMA_RESULT asym threadIDx=39 bk=0 bm=0 nb=0 accum_stage=0 RESULT=5.383142,14.121470,-9.300604,-11.888904
+DBG_UMMA_RESULT asym threadIDx=40 bk=0 bm=0 nb=0 accum_stage=0 RESULT=7.918081,-5.030624,-4.980784,-3.335973
+DBG_UMMA_RESULT asym threadIDx=41 bk=0 bm=0 nb=0 accum_stage=0 RESULT=-8.232807,1.509287,-8.746243,9.594377
+DBG_UMMA_RESULT asym threadIDx=42 bk=0 bm=0 nb=0 accum_stage=0 RESULT=10.141436,-6.425883,-7.733875,-10.337571
+DBG_UMMA_RESULT asym threadIDx=43 bk=0 bm=0 nb=0 accum_stage=0 RESULT=8.659134,-13.686827,-0.616792,-18.270321
+DBG_UMMA_RESULT asym threadIDx=44 bk=0 bm=0 nb=0 accum_stage=0 RESULT=24.647831,6.675749,1.413134,-4.528416
+DBG_UMMA_RESULT asym threadIDx=45 bk=0 bm=0 nb=0 accum_stage=0 RESULT=6.383327,-15.974109,0.544884,-18.008038
+DBG_UMMA_RESULT asym threadIDx=46 bk=0 bm=0 nb=0 accum_stage=0 RESULT=-0.613009,2.784875,-6.128088,-4.449677
+DBG_UMMA_RESULT asym threadIDx=47 bk=0 bm=0 nb=0 accum_stage=0 RESULT=5.891826,-12.456373,-3.660656,-14.064791
+DBG_UMMA_RESULT asym threadIDx=48 bk=0 bm=0 nb=0 accum_stage=0 RESULT=16.914703,8.468070,-1.371324,1.637469
+DBG_UMMA_RESULT asym threadIDx=49 bk=0 bm=0 nb=0 accum_stage=0 RESULT=-7.054390,-14.435501,0.870655,2.432950
+DBG_UMMA_RESULT asym threadIDx=50 bk=0 bm=0 nb=0 accum_stage=0 RESULT=2.762192,1.129727,-1.177275,6.655120
+DBG_UMMA_RESULT asym threadIDx=51 bk=0 bm=0 nb=0 accum_stage=0 RESULT=4.565703,-8.165134,10.467316,-3.264524
+DBG_UMMA_RESULT asym threadIDx=52 bk=0 bm=0 nb=0 accum_stage=0 RESULT=-3.207790,15.607212,-1.825023,-1.845588
+DBG_UMMA_RESULT asym threadIDx=53 bk=0 bm=0 nb=0 accum_stage=0 RESULT=1.142412,2.000812,3.079976,-2.027292
+DBG_UMMA_RESULT asym threadIDx=54 bk=0 bm=0 nb=0 accum_stage=0 RESULT=-17.413078,-4.936707,2.620239,2.056643
+DBG_UMMA_RESULT asym threadIDx=55 bk=0 bm=0 nb=0 accum_stage=0 RESULT=-1.742835,1.972183,4.653465,0.860522
+DBG_UMMA_RESULT asym threadIDx=56 bk=0 bm=0 nb=0 accum_stage=0 RESULT=-5.983551,-3.236670,2.125414,17.756464
+DBG_UMMA_RESULT asym threadIDx=57 bk=0 bm=0 nb=0 accum_stage=0 RESULT=4.945209,-14.302711,10.948692,-12.774733
+DBG_UMMA_RESULT asym threadIDx=58 bk=0 bm=0 nb=0 accum_stage=0 RESULT=12.695207,-9.650476,10.199595,-3.688952
+DBG_UMMA_RESULT asym threadIDx=59 bk=0 bm=0 nb=0 accum_stage=0 RESULT=5.942992,7.988879,-0.574213,6.098386
+DBG_UMMA_RESULT asym threadIDx=60 bk=0 bm=0 nb=0 accum_stage=0 RESULT=-3.232831,4.232272,0.188020,10.999161
+DBG_UMMA_RESULT asym threadIDx=61 bk=0 bm=0 nb=0 accum_stage=0 RESULT=6.592316,-10.066818,7.699089,0.784408
+DBG_UMMA_RESULT asym threadIDx=62 bk=0 bm=0 nb=0 accum_stage=0 RESULT=4.848101,-11.047824,12.228214,-6.529998
+DBG_UMMA_RESULT asym threadIDx=63 bk=0 bm=0 nb=0 accum_stage=0 RESULT=-10.154090,4.909342,-2.230779,-1.037580
+DBG_BF16_ASYM BF16 EPI_TMEM warp=5 epi_warp=1 lane=0 stage=0 tmem_addr=0 values=12.950133,0.224117,-4.534538,4.169067
+DBG_BF16_ASYM BF16 EPI_TMEM warp=7 epi_warp=3 lane=0 stage=0 tmem_addr=0 values=-3.916889,-2.970441,8.315343,18.102165
+DBG_BF16_ASYM BF16 EPI_TMEM warp=4 epi_warp=0 lane=0 stage=0 tmem_addr=0 values=3.990388,12.954658,-12.886656,4.548846
+DBG_BF16_ASYM BF16 EPI_TMEM warp=6 epi_warp=2 lane=0 stage=0 tmem_addr=0 values=1.299999,16.448606,-6.951212,-0.720886
+Library path:
+ > ['/usr/local/lib/python3.12/dist-packages/asym_gemm']
+
+Testing m-grouped contiguous GEMM:
+experts_i32: tensor([ 0,  1,  2,  3, -1], device='cuda:0', dtype=torch.int32)
+offsets_i32: tensor([    0,  9984, 19456, 27264, 34304], device='cuda:0', dtype=torch.int32)
+d_asym sample (2x8):
+tensor([[  3.9844,  12.9375, -12.8750,   4.5625,  -6.0938,   6.9375,   0.3242,
+          12.6250],
+        [  7.0000,   1.9844,   6.4688,  -7.4062,  10.0625, -11.1250,   1.1172,
+           8.8750]], device='cuda:0', dtype=torch.bfloat16)
+ref_d sample (2x8):
+tensor([[ 9.0000, 12.6250,  0.6133,  2.1875, -0.6562, -7.0312, 16.8750, -6.2812],
+        [-0.1064, -7.9062,  4.8750, -0.0608,  7.4375, -8.2500, -7.3125, -6.3438]],
+       device='cuda:0', dtype=torch.bfloat16)
+   asym_gemm diff=9.98146e-01 | mean_abs_diff=1.27357e+01 | p99_abs_diff=4.13750e+01
+ > Perf (num_groups=4, m=34304, n= 4096, k=  128, layout=NT): active_m=34151 | deep_gpu=1703246 us | deep_gpu_tflops(m)=   0 | deep_gpu_tflops(active_m)=   0 | asym_gemm=1682424 us | asym_tflops(m)=   0 | asym_tflops(active_m)=   0 |    0 GB/s
+
