@@ -413,29 +413,29 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                 full_barriers[stage_idx]->wait(phase);
                 tcgen05_after_thread_sync();
 
-                if (lane_idx == 0 and block_k_iter == 0 and block_m_iter == 0 and blockIdx.x == 0 and blockIdx.y == 0) {
-                    const uint32_t a_row_stride = LOAD_BLOCK_M;
-                    const uint32_t b_row_stride = LOAD_BLOCK_N;
-                    printf("DBG_BF16_ASYM LOAD_A_ALL_COLS block_k_iter=%d stage=%u\n",
-                           block_k_iter, (unsigned)stage_idx);
-                    for (uint32_t col = 0; col < BLOCK_K; ++col) {
-                        const uint32_t idx_r0 = col * a_row_stride + 0;
-                        const uint32_t idx_r1 = col * a_row_stride + 1;
-                        printf("DBG_BF16_ASYM LOAD A r0 c=%u v=%f | r1 c=%u v=%f\n",
-                               (unsigned)col, bf16_to_float(smem_a[stage_idx][idx_r0]),
-                               (unsigned)col, bf16_to_float(smem_a[stage_idx][idx_r1]));
-                    }
-                    printf("DBG_BF16_ASYM LOAD B r0=%f,%f,%f,%f,%f,%f,%f,%f\n",
-                           bf16_to_float(smem_b[0][0]), bf16_to_float(smem_b[0][1]),
-                           bf16_to_float(smem_b[0][2]), bf16_to_float(smem_b[0][3]),
-                           bf16_to_float(smem_b[0][4]), bf16_to_float(smem_b[0][5]),
-                           bf16_to_float(smem_b[0][6]), bf16_to_float(smem_b[0][7]));
-                    printf("DBG_BF16_ASYM LOAD B r1=%f,%f,%f,%f,%f,%f,%f,%f\n",
-                           bf16_to_float(smem_b[0][b_row_stride + 0]), bf16_to_float(smem_b[0][b_row_stride + 1]),
-                           bf16_to_float(smem_b[0][b_row_stride + 2]), bf16_to_float(smem_b[0][b_row_stride + 3]),
-                           bf16_to_float(smem_b[0][b_row_stride + 4]), bf16_to_float(smem_b[0][b_row_stride + 5]),
-                           bf16_to_float(smem_b[0][b_row_stride + 6]), bf16_to_float(smem_b[0][b_row_stride + 7]));
-                }
+                // if (lane_idx == 0 and block_k_iter == 0 and block_m_iter == 0 and blockIdx.x == 0 and blockIdx.y == 0) {
+                //     const uint32_t a_row_stride = LOAD_BLOCK_M;
+                //     const uint32_t b_row_stride = LOAD_BLOCK_N;
+                //     printf("DBG_BF16_ASYM LOAD_A_ALL_COLS block_k_iter=%d stage=%u\n",
+                //            block_k_iter, (unsigned)stage_idx);
+                //     for (uint32_t col = 0; col < BLOCK_K; ++col) {
+                //         const uint32_t idx_r0 = col * a_row_stride + 0;
+                //         const uint32_t idx_r1 = col * a_row_stride + 1;
+                //         printf("DBG_BF16_ASYM LOAD A r0 c=%u v=%f | r1 c=%u v=%f\n",
+                //                (unsigned)col, bf16_to_float(smem_a[stage_idx][idx_r0]),
+                //                (unsigned)col, bf16_to_float(smem_a[stage_idx][idx_r1]));
+                //     }
+                //     printf("DBG_BF16_ASYM LOAD B r0=%f,%f,%f,%f,%f,%f,%f,%f\n",
+                //            bf16_to_float(smem_b[0][0]), bf16_to_float(smem_b[0][1]),
+                //            bf16_to_float(smem_b[0][2]), bf16_to_float(smem_b[0][3]),
+                //            bf16_to_float(smem_b[0][4]), bf16_to_float(smem_b[0][5]),
+                //            bf16_to_float(smem_b[0][6]), bf16_to_float(smem_b[0][7]));
+                //     printf("DBG_BF16_ASYM LOAD B r1=%f,%f,%f,%f,%f,%f,%f,%f\n",
+                //            bf16_to_float(smem_b[0][b_row_stride + 0]), bf16_to_float(smem_b[0][b_row_stride + 1]),
+                //            bf16_to_float(smem_b[0][b_row_stride + 2]), bf16_to_float(smem_b[0][b_row_stride + 3]),
+                //            bf16_to_float(smem_b[0][b_row_stride + 4]), bf16_to_float(smem_b[0][b_row_stride + 5]),
+                //            bf16_to_float(smem_b[0][b_row_stride + 6]), bf16_to_float(smem_b[0][b_row_stride + 7]));
+                // }
 
                 // ++accum_stage_iter;
                 // if (threadIdx.x == 32 && blockIdx.x == 0 && blockIdx.y == 0) {
@@ -536,19 +536,19 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                 //     }
                 // }
 
-                if (block_m_iter == 0 and blockIdx.x == 0 and blockIdx.y == 0) {
-                    uint32_t result_values[4];
-                    constexpr uint32_t kDebugResultOffset = 0;
-                    cute::SM100_TMEM_LOAD_32dp32b4x::copy(
-                        accum_stage_idx * kNumMWaves * BLOCK_N + kDebugResultOffset,
-                        result_values[0], result_values[1], result_values[2], result_values[3]);
-                    cutlass::arch::fence_view_async_tmem_load();
-                    printf("DBG_UMMA_RESULT asym threadIDx=%u bk=%d bm=%u nb=%u accum_stage=%u "
-                            "RESULT=%f,%f,%f,%f\n",
-                            (unsigned)threadIdx.x, block_k_iter, block_m_iter, blockIdx.x, accum_stage_idx,
-                            __uint_as_float(result_values[0]), __uint_as_float(result_values[1]),
-                            __uint_as_float(result_values[2]), __uint_as_float(result_values[3]));
-                }
+                // if (block_m_iter == 0 and blockIdx.x == 0 and blockIdx.y == 0) {
+                //     uint32_t result_values[4];
+                //     constexpr uint32_t kDebugResultOffset = 0;
+                //     cute::SM100_TMEM_LOAD_32dp32b4x::copy(
+                //         accum_stage_idx * kNumMWaves * BLOCK_N + kDebugResultOffset,
+                //         result_values[0], result_values[1], result_values[2], result_values[3]);
+                //     cutlass::arch::fence_view_async_tmem_load();
+                //     printf("DBG_UMMA_RESULT asym threadIDx=%u bk=%d bm=%u nb=%u accum_stage=%u "
+                //             "RESULT=%f,%f,%f,%f\n",
+                //             (unsigned)threadIdx.x, block_k_iter, block_m_iter, blockIdx.x, accum_stage_idx,
+                //             __uint_as_float(result_values[0]), __uint_as_float(result_values[1]),
+                //             __uint_as_float(result_values[2]), __uint_as_float(result_values[3]));
+                // }
 
                 // if (lane_idx == 0 and block_m_iter == 0 and blockIdx.x == 0 and blockIdx.y == 0) {
                 //     uint32_t mma_row0[4];
@@ -717,12 +717,12 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                                 cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr,
                                     values[0], values[1], values[2], values[3]);
                                 cutlass::arch::fence_view_async_tmem_load();
-                                if (lane_idx == 0 and block_m_iter == 0 and blockIdx.x == 0 and w == 0 and s == 0 and i == 0 and blockIdx.y == 0) {
-                                    printf("DBG_BF16_ASYM FP32 EPI_TMEM block_k_iter=%u warp=%u epi_warp=%u lane=%u stage=%u tmem_addr=%u values=%f,%f,%f,%f\n",
-                                           (unsigned)block_k_iter, (unsigned)warp_idx, (unsigned)epilogue_warp_idx, (unsigned)lane_idx, (unsigned)accum_stage_idx, (unsigned)tmem_addr,
-                                           __uint_as_float(values[0]), __uint_as_float(values[1]),
-                                           __uint_as_float(values[2]), __uint_as_float(values[3]));
-                                }
+                                // if (lane_idx == 0 and block_m_iter == 0 and blockIdx.x == 0 and w == 0 and s == 0 and i == 0 and blockIdx.y == 0) {
+                                //     printf("DBG_BF16_ASYM FP32 EPI_TMEM block_k_iter=%u warp=%u epi_warp=%u lane=%u stage=%u tmem_addr=%u values=%f,%f,%f,%f\n",
+                                //            (unsigned)block_k_iter, (unsigned)warp_idx, (unsigned)epilogue_warp_idx, (unsigned)lane_idx, (unsigned)accum_stage_idx, (unsigned)tmem_addr,
+                                //            __uint_as_float(values[0]), __uint_as_float(values[1]),
+                                //            __uint_as_float(values[2]), __uint_as_float(values[3]));
+                                // }
                                 // if (epilogue_warp_idx == 0 && lane_idx == 0 && w == 0 && s == 0 && i == 0) {
                                 //     const uint32_t num_m_blocks = ceil_div(shape_m, BLOCK_M);
                                 //     const uint32_t num_n_blocks = ceil_div(shape_n, BLOCK_N);
@@ -756,12 +756,12 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                                     values[0], values[1], values[2], values[3],
                                     values[4], values[5], values[6], values[7]);
                                 cutlass::arch::fence_view_async_tmem_load();
-                                if (lane_idx == 0 and block_m_iter == 0 and blockIdx.x == 0 and w == 0 and s == 0 and i == 0 and blockIdx.y == 0) {
-                                    printf("DBG_BF16_ASYM BF16 EPI_TMEM block_k_iter=%d warp=%u epi_warp=%u lane=%u stage=%u tmem_addr=%u values=%f,%f,%f,%f\n",
-                                           (unsigned)block_k_iter, (unsigned)warp_idx, (unsigned)epilogue_warp_idx, (unsigned)lane_idx, (unsigned)accum_stage_idx, (unsigned)tmem_addr,
-                                           __uint_as_float(values[0]), __uint_as_float(values[1]),
-                                           __uint_as_float(values[2]), __uint_as_float(values[3]));
-                                }
+                                // if (lane_idx == 0 and block_m_iter == 0 and blockIdx.x == 0 and w == 0 and s == 0 and i == 0 and blockIdx.y == 0) {
+                                //     printf("DBG_BF16_ASYM BF16 EPI_TMEM block_k_iter=%d warp=%u epi_warp=%u lane=%u stage=%u tmem_addr=%u values=%f,%f,%f,%f\n",
+                                //            (unsigned)block_k_iter, (unsigned)warp_idx, (unsigned)epilogue_warp_idx, (unsigned)lane_idx, (unsigned)accum_stage_idx, (unsigned)tmem_addr,
+                                //            __uint_as_float(values[0]), __uint_as_float(values[1]),
+                                //            __uint_as_float(values[2]), __uint_as_float(values[3]));
+                                // }
                                 // if (epilogue_warp_idx == 0 && lane_idx == 0 && w == 0 && s == 0 && i == 0) {
                                 //     const uint32_t num_m_blocks = ceil_div(shape_m, BLOCK_M);
                                 //     const uint32_t num_n_blocks = ceil_div(shape_n, BLOCK_N);
