@@ -67,16 +67,22 @@ class CustomBuildPy(build_py):
             shutil.copy2(pyi_source, pyi_target)
 
     def prepare_includes(self):
+        # Copy into both the build directory and the source tree.
+        # The source-tree copy is needed for editable installs (`pip install -e .`),
+        # where the JIT compiler resolves `library_include_path` to the source
+        # `asym_gemm/include/` rather than the build output.
+        source_include_dir = os.path.join(current_dir, 'asym_gemm/include')
         build_include_dir = os.path.join(self.build_lib, 'asym_gemm/include')
-        os.makedirs(build_include_dir, exist_ok=True)
 
-        for d in third_party_include_dirs:
-            dirname = d.split('/')[-1]
-            src_dir = os.path.join(current_dir, d)
-            dst_dir = os.path.join(build_include_dir, dirname)
-            if os.path.exists(dst_dir):
-                shutil.rmtree(dst_dir)
-            shutil.copytree(src_dir, dst_dir)
+        for target_dir in [source_include_dir, build_include_dir]:
+            os.makedirs(target_dir, exist_ok=True)
+            for d in third_party_include_dirs:
+                dirname = d.split('/')[-1]
+                src_dir = os.path.join(current_dir, d)
+                dst_dir = os.path.join(target_dir, dirname)
+                if os.path.exists(dst_dir):
+                    shutil.rmtree(dst_dir)
+                shutil.copytree(src_dir, dst_dir)
 
 
 if __name__ == '__main__':
