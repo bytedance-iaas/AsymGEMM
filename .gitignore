@@ -30,7 +30,8 @@ asym_gemm/include/cutlass
 stubs/
 
 # Symlinks to compiled extensions
-asym_gemm/*.sothird_party/
+asym_gemm/*.so
+third_party/
 3rdparty/
 extern/
 external/
