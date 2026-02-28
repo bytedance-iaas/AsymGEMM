@@ -56,7 +56,7 @@ The library provides some utility functions besides the above kernels:
 
 ## Acknowledgement
 
-AsymGEMM is inspired by the [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) project. Thanks and respect to the developers!
+AsymGEMM is inspired by the [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) project and some files are adapted from it. Thanks and respect to the developers!
 
 ## License
 
