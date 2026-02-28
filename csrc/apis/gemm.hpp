@@ -7,7 +7,7 @@
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_asym_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_fp8_gemm_1d1d.hpp"
-#endif 
+#endif
 
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
 
@@ -90,6 +90,52 @@ static void m_grouped_fp8_asym_gemm_nt_contiguous(const std::pair<torch::Tensor,
     sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, m_indices,
                                                  num_groups, m, n, k, major_a, major_b, compiled_dims);
 }
+
+static void m_grouped_fp8_asym_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                         const std::pair<torch::Tensor, torch::Tensor>& b,
+                                         const torch::Tensor& d,
+                                         const torch::Tensor& masked_m,
+                                         const int& expected_m,
+                                         std::optional<std::tuple<int, int, int>> recipe,
+                                         const std::string& compiled_dims,
+                                         const bool& disable_ue8m0_cast) {
+    // Shape must be `[G, M, K] @ [G, N, K].mT`
+    const auto& major_a = get_major_type_ab(a.first);
+    const auto& major_b = get_major_type_ab(b.first);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
+    if (fp8_requires_k_major())
+        DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(masked_m.is_contiguous());
+
+    // Type and shape checks
+    const auto& [num_groups, m, k] = get_shape<3>(a.first);
+    const auto& [num_groups_, n, k_] = get_shape<3>(b.first);
+    const auto& [num_groups__, m_, n_] = get_shape<3>(d);
+    DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
+    DG_HOST_ASSERT(num_groups == num_groups_ and num_groups == num_groups__);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt);
+
+    // D must be N-major (per-group)
+    check_major_type_cd(d);
+
+    // Do nothing if empty
+    if (m == 0 or expected_m == 0)
+        return;
+
+    // Transform SFA and SFB into compute-required layout
+    if (not recipe.has_value())
+        recipe = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
+    const auto& sfa = layout::transform_sf_into_required_layout(a.second, m, k, recipe.value(), num_groups, true, disable_ue8m0_cast);
+    const auto& sfb = layout::transform_sf_into_required_layout(b.second, n, k, recipe.value(), num_groups, false, disable_ue8m0_cast);
+
+    // Dispatch implementation
+    sm100_m_grouped_fp8_asym_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m, expected_m,
+                                              num_groups, m, n, k, major_a, major_b, compiled_dims);
+}
 #endif
 
 #if DG_TENSORMAP_COMPATIBLE
@@ -163,6 +209,41 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
     sm100_m_grouped_bf16_gemm_contiguous(a, b, d, m_indices,
                                             num_groups, m, n, k, major_a, major_b, compiled_dims);
 }
+
+static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const torch::Tensor& b,
+                                               const torch::Tensor& d,
+                                               const torch::Tensor& masked_m,
+                                               const int& expected_m,
+                                               const std::string& compiled_dims) {
+    // Shape must be `[G, M, K] @ [G, N, K].mT`
+    const auto& major_a = get_major_type_ab(a);
+    const auto& major_b = get_major_type_ab(b);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(masked_m.is_contiguous());
+
+    // Type and shape checks
+    const auto& [num_groups, m, k] = get_shape<3>(a);
+    const auto& [num_groups_, n, k_] = get_shape<3>(b);
+    const auto& [num_groups__, m_, n_] = get_shape<3>(d);
+    DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
+    DG_HOST_ASSERT(num_groups == num_groups_ and num_groups == num_groups__);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt);
+
+    // D must be N-major (per-group)
+    check_major_type_cd(d);
+
+    // Do nothing if empty
+    if (m == 0 or expected_m == 0)
+        return;
+
+    // Dispatch implementation
+    sm100_m_grouped_bf16_asym_gemm_masked(a, b, d, masked_m, expected_m,
+                                          num_groups, m, n, k, major_a, major_b, compiled_dims);
+}
 #endif
 
 static void register_apis(pybind11::module_& m) {
@@ -171,6 +252,11 @@ static void register_apis(pybind11::module_& m) {
     // FP8 GEMMs
     m.def("m_grouped_fp8_asym_gemm_nt_contiguous", &m_grouped_fp8_asym_gemm_nt_contiguous,
         py::arg("a"), py::arg("b"), py::arg("d"), py::arg("m_indices"),
+        py::arg("recipe") = std::nullopt, py::arg("compiled_dims") = "nk",
+        py::arg("disable_ue8m0_cast") = false);
+    m.def("m_grouped_fp8_asym_gemm_nt_masked", &m_grouped_fp8_asym_gemm_nt_masked,
+        py::arg("a"), py::arg("b"), py::arg("d"),
+        py::arg("masked_m"), py::arg("expected_m"),
         py::arg("recipe") = std::nullopt, py::arg("compiled_dims") = "nk",
         py::arg("disable_ue8m0_cast") = false);
 #endif
@@ -186,6 +272,10 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk");
     m.def("m_grouped_bf16_gemm_nt_contiguous", &m_grouped_bf16_gemm_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("m_indices"),
+          py::arg("compiled_dims") = "nk");
+    m.def("m_grouped_bf16_asym_gemm_nt_masked", &m_grouped_bf16_asym_gemm_nt_masked,
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("masked_m"), py::arg("expected_m"),
           py::arg("compiled_dims") = "nk");
 #endif
 }

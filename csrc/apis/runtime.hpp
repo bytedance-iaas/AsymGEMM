@@ -5,6 +5,9 @@
 
 namespace asym_gemm::runtime {
 
+// Global compile mode: 0 = execute (use cache), 1 = force compile
+static int compile_mode = 0;
+
 static void register_apis(pybind11::module_& m) {
     m.def("set_num_sms", [&](const int& new_num_sms) {
         device_runtime->set_num_sms(new_num_sms);
@@ -17,6 +20,12 @@ static void register_apis(pybind11::module_& m) {
     });
     m.def("get_tc_util", [&]() {
         return device_runtime->get_tc_util();
+    });
+    m.def("set_compile_mode", [&](const int& mode) {
+        compile_mode = mode;
+    });
+    m.def("get_compile_mode", [&]() {
+        return compile_mode;
     });
 
     m.def("init", [&](const std::string& library_root_path, const std::string& cuda_home_path_by_python) {
