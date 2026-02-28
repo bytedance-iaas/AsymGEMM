@@ -22,6 +22,8 @@ try:
         get_num_sms,
         set_tc_util,
         get_tc_util,
+        set_compile_mode,
+        get_compile_mode,
     )
 
     if version.parse(cuda_version) >= version.parse('12.1'):
