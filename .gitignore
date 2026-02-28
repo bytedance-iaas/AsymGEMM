@@ -7,6 +7,13 @@ demo
 dist
 *.egg-info
 *.pyc
+*.log
+*.ncu-rep
+__pycache__/
+
+# UV / venv
+.venv/
+uv.lock
 
 # Third-party links created by `setup.py develop`
 asym_gemm/include/cute
