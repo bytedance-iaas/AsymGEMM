@@ -11,6 +11,7 @@ AsymGEMM leverages some concepts from [DeepGEMM](https://github.com/deepseek-ai/
 ## Roadmap
 
 - [x] Support BF16
+- [ ] Support FP8
 
 ## Quick start
 
@@ -26,15 +27,23 @@ AsymGEMM leverages some concepts from [DeepGEMM](https://github.com/deepseek-ai/
 
 ### Development
 
-
-### Installation
+We use [UV](https://docs.astral.sh/uv/) to manage Python dependencies. To get started:
 
 ```bash
-cat install.sh
-./install.sh
+# Clone with submodules (CUTLASS, fmt)
+git clone --recurse-submodules https://github.com/bytedance-iaas/AsymGEMM.git
+cd AsymGEMM
+
+# Create virtual environment, resolve dependencies, and install
+uv sync
+source .venv/bin/activate
 ```
 
-Then, import `asym_gemm` in your Python project, and enjoy!
+Then verify the installation:
+
+```bash
+python -c "import asym_gemm; print(asym_gemm.__version__)"
+```
 
 ## Interfaces
 

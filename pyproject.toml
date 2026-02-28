@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0", "torch", "packaging"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asym_gemm"
+version = "0.1.0"
+description = "Clean and efficient GEMM on NVIDIA Superchips with asymmetric CPU-GPU memory access via NVLink-C2C"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+dependencies = [
+    "torch",
+    "packaging",
+]
+
+[project.urls]
+Homepage = "https://github.com/bytedance-iaas/AsymGEMM"
+
+[tool.setuptools.packages.find]
+include = ["asym_gemm*"]
+
+[tool.setuptools.package-data]
+asym_gemm = [
+    "include/asym_gemm/**/*",
+    "include/cute/**/*",
+    "include/cutlass/**/*",
+]
