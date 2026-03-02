@@ -31,13 +31,8 @@ stubs/
 
 # Symlinks to compiled extensions
 asym_gemm/*.so
-third_party/
-3rdparty/
 extern/
 external/
 vendor/
 submodules/
-third-party/
-tests/
-third-party/
 tests/
