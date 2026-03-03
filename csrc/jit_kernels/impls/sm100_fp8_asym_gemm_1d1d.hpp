@@ -1,7 +1,6 @@
 #pragma once
 
 #include <torch/python.h>
-#include <vector>
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
@@ -80,42 +79,12 @@ static void __instantiate_kernel() {{
     }
 };
 
-static int build_offsets_experts_from_indices(const int* m_indices, const int m,
-                                              int* offsets, int* experts, const int capacity) {
-    if (!offsets || !experts || capacity <= 0 || m <= 0 || !m_indices)
-        return 0;
-
-    int write = 0;
-    auto maybe_emit = [&](int start_idx) {
-        const int e = m_indices[start_idx];
-        if (e != -1) {
-            if (write < capacity) {
-                offsets[write] = start_idx;
-                experts[write] = e;
-            }
-            ++write;
-        }
-    };
-
-    maybe_emit(0);
-    for (int i = 1; i < m; ++i) {
-        if (m_indices[i] != m_indices[i - 1])
-            maybe_emit(i);
-    }
-
-    // Sentinel
-    if (write < capacity) {
-        offsets[write] = m;
-        experts[write] = -1;
-    }
-    ++write;
-    return std::min(write, capacity);
-}
-
 static void sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
                                                      const torch::Tensor& b, const torch::Tensor& sfb,
                                                      const torch::Tensor& d,
-                                                     const torch::Tensor& m_indices,
+                                                     const torch::Tensor& offsets_t,
+                                                     const torch::Tensor& experts_t,
+                                                     const int& list_size,
                                                      const int& num_groups, const int& m, const int& n, const int& k,
                                                      const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                      const std::string& compiled_dims) {
@@ -125,12 +94,36 @@ static void sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d(const torch::Tensor& a
     // const int block_n = 128;
     // const int block_k = 64;
 
-    const auto& config = get_best_config<SM100ArchSpec>(
-        GemmType::MGroupedContiguous, KernelType::Kernel1D1D,
-        // NOTES: `num_groups` is 1, since the contiguous layout is seen as a whole
-        m, n, k, 1, major_a, major_b,
-        torch::kFloat8_e4m3fn, d.scalar_type(), false,
-        device_runtime->get_num_sms());
+    // const auto& config = get_best_config<SM100ArchSpec>(
+    //     GemmType::MGroupedContiguous, KernelType::Kernel1D1D,
+    //     // NOTES: `num_groups` is 1, since the contiguous layout is seen as a whole
+    //     m, n, k, 1, major_a, major_b,
+    //     torch::kFloat8_e4m3fn, d.scalar_type(), false,
+    //     device_runtime->get_num_sms());
+
+    const int block_m = 128;
+    const int block_n = 128;
+    const int block_k = 128;
+
+
+    const bool use_manual_config = block_m > 0 or block_n > 0 or block_k > 0;
+    if (use_manual_config)
+        DG_HOST_ASSERT(block_m > 0 and block_n > 0 and block_k > 0);
+    const auto& config = use_manual_config
+        ? get_manual_config_asym<SM100ArchSpec>(
+            GemmType::MGroupedContiguous, KernelType::Kernel1D1D,
+            // NOTES: `num_groups` is 1, since the contiguous layout is seen as a whole
+            m, n, k, 1, major_a, major_b,
+            torch::kFloat8_e4m3fn, d.scalar_type(), false,
+            device_runtime->get_num_sms(),
+            block_m, block_n, block_k)
+        : get_best_config_asym<SM100ArchSpec>(
+            GemmType::MGroupedContiguous, KernelType::Kernel1D1D,
+            // NOTES: `num_groups` is 1, since the contiguous layout is seen as a whole
+            m, n, k, 1, major_a, major_b,
+            torch::kFloat8_e4m3fn, d.scalar_type(), false,
+            device_runtime->get_num_sms());
+
 
     // Create tensor descriptors
     const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
@@ -153,23 +146,8 @@ static void sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d(const torch::Tensor& a
     const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
                                                   config.block_n, config.block_k, num_groups, 0);
 
-    // Build offsets/experts from m_indices for B-centric scheduling.
-    const auto m_indices_cpu = m_indices.to(torch::kCPU);
-    auto* mi = m_indices_cpu.data_ptr<int>();
-    const int max_len = static_cast<int>(m_indices_cpu.numel()) + 1;
-    std::vector<int> offsets_h(max_len);
-    std::vector<int> experts_h(max_len);
-    const int list_size = build_offsets_experts_from_indices(mi, m, offsets_h.data(), experts_h.data(), max_len);
     if (list_size <= 1)
         return;
-
-    auto opts_i32_cuda = torch::TensorOptions().device(a.device()).dtype(torch::kInt32);
-    auto offsets_t = torch::empty({max_len}, opts_i32_cuda);
-    auto experts_t = torch::empty({max_len}, opts_i32_cuda);
-    auto offsets_cpu_t = torch::from_blob(offsets_h.data(), {max_len}, torch::TensorOptions().dtype(torch::kInt32)).clone();
-    auto experts_cpu_t = torch::from_blob(experts_h.data(), {max_len}, torch::TensorOptions().dtype(torch::kInt32)).clone();
-    offsets_t.copy_(offsets_cpu_t, /*non_blocking=*/false);
-    experts_t.copy_(experts_cpu_t, /*non_blocking=*/false);
 
     // Launch kernel
     const SM100FP8AsymGemm1D1DRuntime::Args& args = {
@@ -189,6 +167,7 @@ static void sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d(const torch::Tensor& a
         .tensor_map_sfb = tensor_map_sfb,
         .tensor_map_cd = tensor_map_cd
     };
+
     const auto& code = SM100FP8AsymGemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d", code);
     SM100FP8AsymGemm1D1DRuntime::launch(runtime, args);
