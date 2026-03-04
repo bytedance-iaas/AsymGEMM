@@ -365,6 +365,7 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
             umma_arrive(reinterpret_cast<uint64_t*>(empty_barriers[stage_idx]));
 
             // NOTES: the tensor memory accumulator pipeline has nothing to do with multicasting
+            // todo: stage_idx should be accum_stage_idx
             umma_arrive(reinterpret_cast<uint64_t*>(tmem_full_barriers[stage_idx]));
         };
 
@@ -835,7 +836,7 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
 
                         // tcgen05_before_thread_sync();
                         // tmem_empty_barriers[stage_idx]->arrive(0u);
-
+                        //toDo: check whether it is neccessary
                         __syncwarp();
 
                         // Synchronize all threads and issue TMA
