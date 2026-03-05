@@ -125,14 +125,14 @@ static void sm100_m_grouped_bf16_asym_gemm_contiguous(const torch::Tensor& a,
                                                  const int& num_groups, const int& m, const int& n, const int& k,
                                                  const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                  const std::string& compiled_dims) {
-    const auto& aligned_k = align(k, 64);
-    const int block_m = 128;
+    const int block_m = 64;
     // SM100 legality requires block_n <= 128 when k <= 256.
     // const int block_n = (k <= 256) ? 128 : 256;
     // const int block_k = 64;
 
-    const int block_n = 128;
-    const int block_k = 128;
+    const int block_n = 64;
+    const int block_k = 512;
+    const auto& aligned_k = align(k, block_k);
 
     const bool use_manual_config = block_m > 0 or block_n > 0 or block_k > 0;
     if (use_manual_config)

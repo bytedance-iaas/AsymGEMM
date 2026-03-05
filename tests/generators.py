@@ -95,7 +95,7 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
 
 def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
     for kernel_type in get_kernel_types(dtype):
-        for num_groups, expected_m_per_group, n, k in ((4, 8192, 4096, 128), (4, 8192, 7168, 2048), (8, 4096, 4096, 7168), (8, 4096, 7168, 2048)):
+        for num_groups, expected_m_per_group, n, k in ((4, 8192, 4096, 512), (4, 8192, 7168, 2048), (8, 4096, 4096, 7168), (8, 4096, 7168, 2048)):
             for major_a, major_b in get_major_ab(False, get_arch_major() != 9 or dtype != torch.float8_e4m3fn):
                 yield kernel_type, num_groups, expected_m_per_group, n, k, major_a, major_b
 

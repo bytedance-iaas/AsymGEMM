@@ -242,7 +242,7 @@ def test_m_grouped_gemm_contiguous() -> None:
 
         # noinspection PyShadowingNames
         def test_func_deep():
-            asym_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b_gpu, d_deep_gpu, m_indices)
+            deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b_gpu, d_deep_gpu, m_indices)
 
         # noinspection PyShadowingNames
         def test_func_asym():
@@ -266,7 +266,7 @@ def test_m_grouped_gemm_contiguous() -> None:
         print(f"d_deep_gpu sample (2x8):\n{d_deep_gpu[:2, :8]}")
         print(f"d_asym sample (2x8):\n{d_asym[:2, :8]}")
         print(f"ref_d sample (2x8):\n{ref_d[:2, :8]}")
-        debug_dump_m_grouped_bf16(a, b_gpu, m_indices, d_asym, ref_d)
+        # debug_dump_m_grouped_bf16(a, b_gpu, m_indices, d_asym, ref_d)
         ref_k0_64, ref_k64_end = split_k_reference_for_m_grouped_bf16(a, b_gpu, m_indices, k_split=64)
         print(f"ref_k0_64 sample (2x8):\n{ref_k0_64[:2, :8].to(dtype=torch.bfloat16)}")
         print(f"ref_k64_end sample (2x8):\n{ref_k64_end[:2, :8].to(dtype=torch.bfloat16)}")
@@ -297,9 +297,102 @@ def test_m_grouped_gemm_contiguous() -> None:
               f'asym_tflops(m)={flops_total / t_asym / 1e12:4.0f} | '
               f'asym_tflops(active_m)={flops_active / t_asym / 1e12:4.0f} | '
               f'{count_bytes(a, b, d_asym) / 1e9 / t_asym:4.0f} GB/s')
-
-        break
     print()
+
+def test_block_k_debug():
+    """Minimal test to isolate block_k=128 issue"""
+    
+    # Use K=128 so block_k=128 means exactly 1 k-iteration (no TMA_REDUCE_ADD)
+    # If this FAILS → problem is in UMMA descriptor / multi-atom K
+    # If this PASSES → problem is in the k-iteration loop / epilogue accumulation
+    print("=== block_k=128 debug test ===")
+    for K in [128, 256, 512]:
+        num_groups = 1
+        m_per_group = 128  # = block_m, single m-block
+        n = 128            # = block_n, single n-block
+        
+        m = m_per_group
+        a = torch.randn((m, K), device='cuda', dtype=torch.bfloat16)
+        b = torch.randn((num_groups, n, K), device='cuda', dtype=torch.bfloat16)
+        m_indices = torch.zeros(m, device='cuda', dtype=torch.int32)
+        
+        ref_d = (a.float() @ b[0].float().t()).to(torch.bfloat16)
+        
+        # --- Test deep_gemm ---
+        d_deep = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d_deep, m_indices)
+        
+        diff_deep = (d_deep.float() - ref_d.float()).abs()
+        max_diff_deep = diff_deep.max().item()
+        mean_diff_deep = diff_deep.mean().item()
+        mismatch_deep = (diff_deep > 1e-2).sum().item()
+        
+        # --- Test asym_gemm ---
+        d_asym = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+        b_pinned = b.detach().to("cpu", non_blocking=False).pin_memory()
+        # Build offsets/experts for single group: offsets=[0, m], experts=[0, -1]
+        offsets_i32 = torch.tensor([0, m], device='cuda', dtype=torch.int32)
+        experts_i32 = torch.tensor([0, -1], device='cuda', dtype=torch.int32)
+        compiled_dims = "mnk"
+        asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous(
+            a, b_pinned, d_asym, offsets_i32, experts_i32, num_groups + 1, compiled_dims
+        )
+        
+        diff_asym = (d_asym.float() - ref_d.float()).abs()
+        max_diff_asym = diff_asym.max().item()
+        mean_diff_asym = diff_asym.mean().item()
+        mismatch_asym = (diff_asym > 1e-2).sum().item()
+        
+        # --- deep vs asym ---
+        diff_deep_asym = (d_deep.float() - d_asym.float()).abs()
+        max_diff_da = diff_deep_asym.max().item()
+        
+        print(f"K={K} (k_iters={K}//128={'1 (no reduce)' if K==128 else str(K//128)}):")
+        print(f"  deep_gemm:  max_diff={max_diff_deep:.6f}, mean_diff={mean_diff_deep:.6f}, "
+              f"mismatches(>1e-2)={mismatch_deep}/{d_deep.numel()}")
+        print(f"  asym_gemm:  max_diff={max_diff_asym:.6f}, mean_diff={mean_diff_asym:.6f}, "
+              f"mismatches(>1e-2)={mismatch_asym}/{d_asym.numel()}")
+        print(f"  deep vs asym: max_diff={max_diff_da:.6f}")
+        
+        # Show sample values
+        print(f"  sample [0,0]: deep={d_deep[0,0].item():.6f}, asym={d_asym[0,0].item():.6f}, ref={ref_d[0,0].item():.6f}")
+        
+        if mismatch_asym > 0:
+            rows, cols = torch.where(diff_asym > 1e-2)
+            for i in range(min(3, len(rows))):
+                r, c = rows[i].item(), cols[i].item()
+                print(f"  mismatch [{r},{c}]: asym={d_asym[r,c].item():.6f}, "
+                      f"deep={d_deep[r,c].item():.6f}, ref={ref_d[r,c].item():.6f}")
+        
+        # --- Python-side partial k-block verification ---
+        # Shows what each block_k=128 chunk contributes to the final result.
+        # If the kernel's single-iteration result matches partial[0] but the
+        # multi-iteration sum diverges, the bug is in TMA_REDUCE_ADD accumulation.
+        # If even partial[0] diverges, the bug is in UMMA descriptor / data load.
+        block_k = 128
+        num_k_iters = K // block_k
+        print(f"  --- Partial k-block analysis (block_k={block_k}, {num_k_iters} iterations) ---")
+        accumulated_bf16 = torch.zeros((m, n), device='cuda', dtype=torch.float32)
+        for ki in range(num_k_iters):
+            k_start = ki * block_k
+            k_end = k_start + block_k
+            # Compute partial product for this k-chunk (FP32 matmul, then cast to BF16)
+            partial_fp32 = a[:, k_start:k_end].float() @ b[0, :, k_start:k_end].float().t()
+            partial_bf16 = partial_fp32.to(torch.bfloat16)
+            # Simulate TMA_REDUCE_ADD: accumulate in BF16 precision
+            accumulated_bf16 += partial_bf16.float()
+            print(f"    k_iter={ki} [k={k_start}:{k_end}]: "
+                  f"partial[0,0]={partial_bf16[0,0].item():.6f}, "
+                  f"accumulated[0,0]={accumulated_bf16[0,0].to(torch.bfloat16).item():.6f}")
+        
+        acc_result = accumulated_bf16.to(torch.bfloat16)
+        diff_acc_vs_asym = (acc_result.float() - d_asym.float()).abs().max().item()
+        diff_acc_vs_deep = (acc_result.float() - d_deep.float()).abs().max().item()
+        diff_acc_vs_ref = (acc_result.float() - ref_d.float()).abs().max().item()
+        print(f"    simulated_reduce vs asym: max_diff={diff_acc_vs_asym:.6f}")
+        print(f"    simulated_reduce vs deep: max_diff={diff_acc_vs_deep:.6f}")
+        print(f"    simulated_reduce vs ref:  max_diff={diff_acc_vs_ref:.6f}")
+        print()
 
 def test_cublaslt_gemm() -> None:
     print('Testing cuBLASLt GEMM:')
@@ -333,6 +426,7 @@ if __name__ == '__main__':
     if get_arch_major() >= 9:
         # test_gemm()
         test_m_grouped_gemm_contiguous()
+        # test_block_k_debug()
         # test_m_grouped_gemm_masked()
         # test_k_grouped_gemm_contiguous()
 

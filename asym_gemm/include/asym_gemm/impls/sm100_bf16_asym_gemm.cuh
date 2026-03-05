@@ -149,6 +149,11 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
     int extend_barrier = 2;
     auto tensor_core_full_barrier   = barrier_start_ptr + kNumStages * 3 + kNumEpilogueStages * 2 + extend_barrier;
 
+    // Add near the top of the kernel, after thread/warp setup:
+    const bool debug_print = false;
+    //  (threadIdx.x % 32 == 0 && blockIdx.x == 0);
+
+
     // if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0)
     // {
     //     printf("information about tensor memory, kNumStages: %d, kNumEpilogueStages: %d, kNumTMAStoreStages: %d, kNumAccumTmemCols: %d, kNumTmemCols: %d \n", kNumStages, kNumEpilogueStages, kNumTMAStoreStages, kNumAccumTmemCols, kNumTmemCols);
@@ -332,8 +337,16 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
         DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
         // Merged stages only happens in NT normal GEMM cases
         constexpr uint32_t BLOCK_ATOM_K = BLOCK_K / kNumStagesPerMerge;
-        auto a_desc = make_umma_desc<kMajorA, LOAD_BLOCK_M, BLOCK_ATOM_K, kSwizzleAMode>(smem_a[0], 0, 0);
-        auto b_desc = make_umma_desc<kMajorB, LOAD_BLOCK_N, BLOCK_ATOM_K, kSwizzleBMode>(smem_b[0], 0, 0);
+
+        // For multi-atom K (block_k > swizzle atom), create descriptors per-atom
+        // so LBO=0, and manually rebase between atoms in the inner loop.
+        constexpr uint32_t SWIZZLE_ATOM_K = kSwizzleBMode / sizeof(cutlass::bfloat16_t);  // 64 for BF16/SW128
+        constexpr uint32_t DESC_ATOM_K = (BLOCK_ATOM_K > SWIZZLE_ATOM_K) ? SWIZZLE_ATOM_K : BLOCK_ATOM_K;
+        constexpr uint32_t NUM_K_ATOMS = BLOCK_ATOM_K / DESC_ATOM_K;  // 2 for block_k=128, 1 for block_k=64
+        constexpr uint32_t UMMA_ITERS_PER_ATOM = DESC_ATOM_K / UMMA_K;  // 4 (64/16)
+
+        auto a_desc = make_umma_desc<kMajorA, LOAD_BLOCK_M, DESC_ATOM_K, kSwizzleAMode>(smem_a[0], 0, 0);
+        auto b_desc = make_umma_desc<kMajorB, LOAD_BLOCK_N, DESC_ATOM_K, kSwizzleBMode>(smem_b[0], 0, 0);
         uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
         uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
         
@@ -361,15 +374,16 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
         //     printf("the MMA warp, before iteraction 327: stage_idx: %d, phase: %d \n", stage_idx, phase);
         // }
 
+        uint32_t accum_stage_iter = 0, accum_stage_idx = 0, accum_phase_idx = 0;
+
         auto empty_barrier_arrive = [&]() {
             umma_arrive(reinterpret_cast<uint64_t*>(empty_barriers[stage_idx]));
 
             // NOTES: the tensor memory accumulator pipeline has nothing to do with multicasting
             // todo: stage_idx should be accum_stage_idx
-            umma_arrive(reinterpret_cast<uint64_t*>(tmem_full_barriers[stage_idx]));
+            umma_arrive(reinterpret_cast<uint64_t*>(tmem_full_barriers[accum_stage_idx]));
         };
 
-        uint32_t accum_stage_iter = 0, accum_stage_idx = 0, accum_phase_idx = 0;
 
         auto advance_accum_pipeline = [&]() {
             accum_stage_idx = (accum_stage_idx + 1) % kNumEpilogueStages;
@@ -391,6 +405,22 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
             // }
             phase_b ^= 1;
             tcgen05_after_thread_sync();
+
+            // After: full_barriers_b[0]->wait(phase_b);
+            if (debug_print && block_k_iter == 0) {
+                // Print first few elements of B in shared memory
+                auto* b_ptr = reinterpret_cast<nv_bfloat16*>(smem_b[0]);
+                printf("B smem[0..7]: ");
+                for (int i = 0; i < 8; i++)
+                    printf("%.4f ", __bfloat162float(b_ptr[i]));
+                printf("\n");
+                // Also print elements at the 64-element boundary (start of 2nd K-atom)
+                printf("B smem[64..71]: ");
+                for (int i = 64; i < 72; i++)
+                    printf("%.4f ", __bfloat162float(b_ptr[i]));
+                printf("\n");
+            }
+
             // Launch MMAs
             const auto& num_total_k_blocks = ceil_div(scheduler.current_shape_k, BLOCK_K);
             for (uint32_t block_m_iter = scheduler.m_start; block_m_iter < scheduler.m_end; advance_pipeline(block_m_iter), advance_accum_pipeline()) {
@@ -452,20 +482,45 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                 const auto& a_desc_base_lo = __shfl_sync(0xffffffff, a_desc_lo, static_cast<int>(stage_idx));
                 const auto& b_desc_base_lo = __shfl_sync(0xffffffff, b_desc_lo, static_cast<int>(0));
                 if (cute::elect_one_sync()) {
+
+                    if (debug_print && block_k_iter == 0) {
+                        printf("BLOCK_K=%d, DESC_ATOM_K=%d, NUM_K_ATOMS=%d, UMMA_K=%d, UMMA_ITERS_PER_ATOM=%d\n",
+                            BLOCK_K, DESC_ATOM_K, NUM_K_ATOMS, UMMA_K, UMMA_ITERS_PER_ATOM);
+                        printf("b_desc_base_lo=0x%x, a_desc_base_lo=0x%x\n",
+                            b_desc_base_lo, a_desc_base_lo);
+                    }
+
+                    // Two-level loop: outer over K-atoms, inner over UMMA_K steps per atom.
+                    // TMA loads each K-atom at smem offset: atom * BLOCK_OUTER * DESC_ATOM_K elements.
+                    // We rebase the descriptor start address for each atom.
                     #pragma unroll
-                    for (uint32_t k = 0; k < BLOCK_K / UMMA_K; ++ k) {
-                    // for (uint32_t k = 0; k < 4; ++ k) {
-                        uint32_t atom_k_idx = k * UMMA_K / BLOCK_ATOM_K;
-                        b_desc.lo = advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kSwizzleBMode, cutlass::bfloat16_t>(b_desc_base_lo, atom_k_idx * LOAD_BLOCK_N * BLOCK_ATOM_K, k * UMMA_K % BLOCK_ATOM_K);
+                    for (uint32_t atom = 0; atom < NUM_K_ATOMS; ++atom) {
+                        // Rebase B descriptor to where TMA placed this K-atom
+                        // B is K-major: TMA placed atom `i` at smem offset i * LOAD_BLOCK_N * DESC_ATOM_K elements
+                        const uint32_t b_atom_offset_bytes = atom * LOAD_BLOCK_N * DESC_ATOM_K * sizeof(cutlass::bfloat16_t);
+                        const uint32_t b_atom_base = b_desc_base_lo + (b_atom_offset_bytes >> 4);
+
+                        // A is K-major: TMA placed atom `i` at smem offset i * LOAD_BLOCK_M * DESC_ATOM_K elements
+                        const uint32_t a_atom_offset_bytes = atom * LOAD_BLOCK_M * DESC_ATOM_K * sizeof(cutlass::bfloat16_t);
+                        const uint32_t a_atom_base = a_desc_base_lo + (a_atom_offset_bytes >> 4);
+
+                        if (debug_print && block_k_iter == 0) {
+                            printf("  atom=%d: b_atom_base=0x%x (offset=%d B), a_atom_base=0x%x (offset=%d B)\n",
+                                atom, b_atom_base, b_atom_offset_bytes, a_atom_base, a_atom_offset_bytes);
+                        }
+
                         #pragma unroll
-                        for (uint32_t w = 0; w < kNumMWaves; ++ w) {
-                        // for (uint32_t w = 0; w < 1; ++ w) {
-                            DG_STATIC_ASSERT((WAVE_BLOCK_M * BLOCK_K) % 128 == 0, "Invalid swizzling offset");
-                            a_desc.lo = advance_umma_desc_lo<kMajorA, LOAD_BLOCK_M, kSwizzleAMode, cutlass::bfloat16_t>(a_desc_base_lo, atom_k_idx * LOAD_BLOCK_M * BLOCK_ATOM_K + w * WAVE_BLOCK_M * BLOCK_ATOM_K, k * UMMA_K % BLOCK_ATOM_K);
-                            mma_t::fma(a_desc, b_desc,
-                                       accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N,
-                                       k > 0, // start fresh (overwrite/init C) k > 0
-                                       runtime_instr_desc);
+                        for (uint32_t ki = 0; ki < UMMA_ITERS_PER_ATOM; ++ki) {
+                            b_desc.lo = advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kSwizzleBMode, cutlass::bfloat16_t>(b_atom_base, 0, ki * UMMA_K);
+                            #pragma unroll
+                            for (uint32_t w = 0; w < kNumMWaves; ++w) {
+                                DG_STATIC_ASSERT((WAVE_BLOCK_M * BLOCK_K) % 128 == 0, "Invalid swizzling offset");
+                                a_desc.lo = advance_umma_desc_lo<kMajorA, LOAD_BLOCK_M, kSwizzleAMode, cutlass::bfloat16_t>(a_atom_base, w * WAVE_BLOCK_M * DESC_ATOM_K, ki * UMMA_K);
+                                mma_t::fma(a_desc, b_desc,
+                                           accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N,
+                                           (atom > 0 || ki > 0), // accumulate: false only for atom=0,ki=0
+                                           runtime_instr_desc);
+                            }
                         }
                     }
                 }
@@ -837,7 +892,7 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                         // tcgen05_before_thread_sync();
                         // tmem_empty_barriers[stage_idx]->arrive(0u);
                         //toDo: check whether it is neccessary
-                        __syncwarp();
+                        // __syncwarp();
 
                         // Synchronize all threads and issue TMA
                         cute::tma_store_fence();
@@ -871,6 +926,15 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                         // if (blockIdx.x == 0 && blockIdx.y == 0) {
                         //     printf("Epilogue warp before store, threadIdx.x: %d, stage_idx: %d, phase: %d \n", threadIdx.x, stage_idx, phase);
                         // }
+
+                        if (debug_print && block_k_iter == 0) {
+                            nv_bfloat16* cd_ptr = reinterpret_cast<nv_bfloat16*>(smem_cd[tma_stage_idx]);
+                            printf("CD smem[0..7]: ");
+                            for (int i = 0; i < 8; i++)
+                                printf("%.4f ", __bfloat162float(cd_ptr[i]));
+                            printf("\n");
+                        }
+
 
                         if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
 
