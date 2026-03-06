@@ -255,6 +255,9 @@ def test_m_grouped_gemm_contiguous() -> None:
 
         experts_i32 = experts.to(dtype=torch.int32, device="cuda").contiguous()
         offsets_i32 = offsets.to(dtype=torch.int32, device="cuda").contiguous()
+        print(f"m: {m}")
+        print(f"n: {n}")
+        print(f"k: {k}")
         print(f"experts_i32: {experts_i32}")
         print(f"offsets_i32: {offsets_i32}")
 

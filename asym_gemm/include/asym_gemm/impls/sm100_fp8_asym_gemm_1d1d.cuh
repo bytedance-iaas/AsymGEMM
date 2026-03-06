@@ -54,16 +54,22 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
     constexpr uint32_t WAVE_BLOCK_M = cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
     constexpr uint32_t kNumMWaves = BLOCK_M / WAVE_BLOCK_M;
     constexpr uint32_t kNumTMAStoreStages = 2;
-    constexpr uint32_t kNumSFStagesPerLoad = sizeof(uint32_t) / sizeof(cutlass::float_ue8m0_t);
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
-    DG_STATIC_ASSERT(BLOCK_K == 128, "Invalid block K");
+    DG_STATIC_ASSERT(BLOCK_K % 128 == 0, "block K must be a multiple of 128 for FP8");
     DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0 and 2 % kNumMWaves == 0, "Invalid block M");
+
+    // SF (scale factor) indexing: keep 128-element granularity regardless of BLOCK_K
+    constexpr uint32_t kSFQuantK = 128;                                                    // SF granularity (elements)
+    constexpr uint32_t kSFAtomsPerBlockK = BLOCK_K / kSFQuantK;                            // SFs consumed per k-block
+    constexpr uint32_t kNumSFPerPack = sizeof(uint32_t) / sizeof(cutlass::float_ue8m0_t);  // 4 (UE8M0 per uint32)
+    constexpr uint32_t kBlockKPerSFLoad = kNumSFPerPack / kSFAtomsPerBlockK;               // k-blocks per SF TMA load
+    DG_STATIC_ASSERT(kNumSFPerPack % kSFAtomsPerBlockK == 0, "SFs per pack must be divisible by SFs per block_k");
 
     // Overwrite shape constants if the compiler gives
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
     shape_n = SHAPE_N != 0 ? SHAPE_N : shape_n;
     shape_k = SHAPE_K != 0 ? SHAPE_K : shape_k;
-    const uint32_t shape_sf_k = ceil_div(shape_k, BLOCK_K * kNumSFStagesPerLoad);
+    const uint32_t shape_sf_k = ceil_div(shape_k, kSFQuantK * kNumSFPerPack);
 
     // Utils
     bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -240,7 +246,7 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
             phase_b ^= 1;
 
             const uint32_t k_idx = k_block_idx * BLOCK_K;
-            const uint32_t sf_k_idx = ceil_div(k_idx, BLOCK_K * kNumSFStagesPerLoad);
+            const uint32_t sf_k_idx = ceil_div(k_idx, kSFQuantK * kNumSFPerPack);
             constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
             const uint32_t batch_idx = (kIsBatchedMM ? scheduler.current_group_idx : 0);
             if constexpr (kMajorB == cute::UMMA::Major::K)
@@ -250,7 +256,7 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                 tma_copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, cutlass::float_e4m3_t, kIsBatchedMM>(
                     &tensor_map_b, full_barriers_b[0], smem_b[0], b_n_idx, k_idx, 1, batch_idx);
             
-            const uint32_t sf_stage_in_group_idx = k_block_idx % kNumSFStagesPerLoad;
+            const uint32_t sf_stage_in_group_idx = k_block_idx % kBlockKPerSFLoad;
             if (sf_stage_in_group_idx == 0) {
                 tma_copy<BLOCK_N, 1, 0>(&tensor_map_sfb, full_barriers_b[0], smem_sfb[0],
                                         n_block_idx * BLOCK_N, scheduler.current_group_idx * shape_sf_k + sf_k_idx);
@@ -309,8 +315,16 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
         auto sf_desc = make_sf_desc(nullptr);
 
         DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
-        auto a_desc = make_umma_desc<kMajorA, LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode>(smem_a[0], 0, 0);
-        auto b_desc = make_umma_desc<kMajorB, LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode>(smem_b[0], 0, 0);
+
+        // For multi-atom K (block_k > swizzle atom), create descriptors per-atom
+        // so LBO=0, and manually rebase between atoms in the inner loop.
+        constexpr uint32_t SWIZZLE_ATOM_K_B = kSwizzleBMode / sizeof(cutlass::float_e4m3_t);  // 128 for FP8/SW128
+        constexpr uint32_t DESC_ATOM_K = (BLOCK_K > SWIZZLE_ATOM_K_B) ? SWIZZLE_ATOM_K_B : BLOCK_K;
+        constexpr uint32_t NUM_K_ATOMS = BLOCK_K / DESC_ATOM_K;
+        constexpr uint32_t UMMA_ITERS_PER_ATOM = DESC_ATOM_K / UMMA_K;
+
+        auto a_desc = make_umma_desc<kMajorA, LOAD_BLOCK_M, DESC_ATOM_K, kSwizzleAMode>(smem_a[0], 0, 0);
+        auto b_desc = make_umma_desc<kMajorB, LOAD_BLOCK_N, DESC_ATOM_K, kSwizzleBMode>(smem_b[0], 0, 0);
         uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
         uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
 
@@ -341,7 +355,7 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
             with_sf_full_barriers_b[0]->wait(sf_phase_b);
             tcgen05_after_thread_sync();
             sf_phase_b ^= 1;
-            const uint32_t sf_stage_in_group_idx = k_block_idx % kNumSFStagesPerLoad;
+            const uint32_t sf_stage_in_group_idx = k_block_idx % kBlockKPerSFLoad;
 
             if (sf_stage_in_group_idx == 0)
             {
@@ -384,23 +398,39 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                             smid, k_block_idx, m_block_idx, stage_idx, phase);
 
                 using mma_t = cute::conditional_t<kNumMulticast == 1, SM100_MMA_MXF8F6F4_SS, SM100_MMA_MXF8F6F4_2x1SM_SS>;
-                const auto& runtime_instr_desc = make_runtime_instr_desc_with_sf_id(instr_desc, sf_stage_in_group_idx);
                 const auto& a_desc_base_lo = __shfl_sync(0xffffffff, a_desc_lo, static_cast<int>(stage_idx));
                 const auto& b_desc_base_lo = __shfl_sync(0xffffffff, b_desc_lo, static_cast<int>(0));
                 if (cute::elect_one_sync()) {
+                    // Two-level loop: outer over K-atoms, inner over UMMA_K steps per atom.
+                    // Each atom gets its own SF index to maintain 128-element dequant granularity.
                     #pragma unroll
-                    for (uint32_t k = 0; k < BLOCK_K / UMMA_K; ++ k) {
-                        b_desc.lo = advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kSwizzleBMode, cutlass::float_e4m3_t>(b_desc_base_lo, 0, k * UMMA_K);
+                    for (uint32_t atom = 0; atom < NUM_K_ATOMS; ++atom) {
+                        // Per-atom SF index: each atom of 128 K-elements gets its own scale factor
+                        const uint32_t sf_id = (k_block_idx * kSFAtomsPerBlockK + atom) % kNumSFPerPack;
+                        const auto& runtime_instr_desc = make_runtime_instr_desc_with_sf_id(instr_desc, sf_id);
+
+                        // Rebase B descriptor to where TMA placed this K-atom
+                        const uint32_t b_atom_offset_bytes = atom * LOAD_BLOCK_N * DESC_ATOM_K * sizeof(cutlass::float_e4m3_t);
+                        const uint32_t b_atom_base = b_desc_base_lo + (b_atom_offset_bytes >> 4);
+
+                        // Rebase A descriptor to where TMA placed this K-atom
+                        const uint32_t a_atom_offset_bytes = atom * LOAD_BLOCK_M * DESC_ATOM_K * sizeof(cutlass::float_e4m3_t);
+                        const uint32_t a_atom_base = a_desc_base_lo + (a_atom_offset_bytes >> 4);
+
                         #pragma unroll
-                        for (uint32_t w = 0; w < kNumMWaves; ++ w) {
-                            DG_STATIC_ASSERT((WAVE_BLOCK_M * BLOCK_K) % 128 == 0, "Invalid swizzling offset");
-                            a_desc.lo = advance_umma_desc_lo<kMajorA, LOAD_BLOCK_M, kSwizzleAMode, cutlass::float_e4m3_t>(a_desc_base_lo, w * WAVE_BLOCK_M * BLOCK_K, k * UMMA_K);
-                            mma_t::fma(a_desc, b_desc,
-                                        accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N,
-                                        k > 0,
-                                        runtime_instr_desc,
-                                        kTmemStartColOfSFA + w * (kNumUTCCPAlignedElems / 32),
-                                        kTmemStartColOfSFB);
+                        for (uint32_t ki = 0; ki < UMMA_ITERS_PER_ATOM; ++ki) {
+                            b_desc.lo = advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kSwizzleBMode, cutlass::float_e4m3_t>(b_atom_base, 0, ki * UMMA_K);
+                            #pragma unroll
+                            for (uint32_t w = 0; w < kNumMWaves; ++w) {
+                                DG_STATIC_ASSERT((WAVE_BLOCK_M * BLOCK_K) % 128 == 0, "Invalid swizzling offset");
+                                a_desc.lo = advance_umma_desc_lo<kMajorA, LOAD_BLOCK_M, kSwizzleAMode, cutlass::float_e4m3_t>(a_atom_base, w * WAVE_BLOCK_M * DESC_ATOM_K, ki * UMMA_K);
+                                mma_t::fma(a_desc, b_desc,
+                                            accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N,
+                                            (atom > 0 || ki > 0), // accumulate: false only for atom=0,ki=0
+                                            runtime_instr_desc,
+                                            kTmemStartColOfSFA + w * (kNumUTCCPAlignedElems / 32),
+                                            kTmemStartColOfSFB);
+                            }
                         }
                     }
                 }
@@ -430,7 +460,7 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
         for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; ++k_block_idx) {
             full_barriers_b[0]->wait(phase_b);
             phase_b ^= 1;
-            const uint32_t sf_stage_in_group_idx = k_block_idx % kNumSFStagesPerLoad;
+            const uint32_t sf_stage_in_group_idx = k_block_idx % kBlockKPerSFLoad;
             if (sf_stage_in_group_idx == 0)
             {
                 // printf("[FP8DBG][W2][SM%u] sf_stage_in_group_idx == 0 k=%u stage=%u phase=%u\n",
