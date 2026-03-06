@@ -139,27 +139,27 @@ def test_m_grouped_gemm_contiguous() -> None:
                 max_i = int(max_pos[0, 0].item())
                 max_j = int(max_pos[0, 1].item())
 
-        print(f'\n[{tag}] Abs diff stats (finite only): '
-              f'max={max_abs_diff:.6f}, mean={mean_abs_diff:.6f}, non_finite={non_finite_count}/{total_count}')
+        # print(f'\n[{tag}] Abs diff stats (finite only): '
+        #       f'max={max_abs_diff:.6f}, mean={mean_abs_diff:.6f}, non_finite={non_finite_count}/{total_count}')
 
-        if max_i >= 0 and max_j >= 0:
-            print(f'[{tag}] Max finite abs diff location: ({max_i}, {max_j})')
-            radius = 2
-            r0 = max(0, max_i - radius)
-            r1 = min(out_cpu.size(0), max_i + radius + 1)
-            c0 = max(0, max_j - radius)
-            c1 = min(out_cpu.size(1), max_j + radius + 1)
+        # if max_i >= 0 and max_j >= 0:
+        #     print(f'[{tag}] Max finite abs diff location: ({max_i}, {max_j})')
+        #     radius = 2
+        #     r0 = max(0, max_i - radius)
+        #     r1 = min(out_cpu.size(0), max_i + radius + 1)
+        #     c0 = max(0, max_j - radius)
+        #     c1 = min(out_cpu.size(1), max_j + radius + 1)
 
-            print(f'[{tag}] Neighborhood rows [{r0}, {r1 - 1}], cols [{c0}, {c1 - 1}]')
-            print(f'\n[{tag}] Out neighborhood:')
-            for i in range(r0, r1):
-                print(' '.join(f'{float(out_acc[i, j]):.6f}' for j in range(c0, c1)))
-            print(f'\n[{tag}] Ref neighborhood:')
-            for i in range(r0, r1):
-                print(' '.join(f'{float(ref_acc[i, j]):.6f}' for j in range(c0, c1)))
-            print(f'\n[{tag}] Diff neighborhood:')
-            for i in range(r0, r1):
-                print(' '.join(f'{float(diff_acc[i, j]):.6f}' for j in range(c0, c1)))
+        #     print(f'[{tag}] Neighborhood rows [{r0}, {r1 - 1}], cols [{c0}, {c1 - 1}]')
+        #     print(f'\n[{tag}] Out neighborhood:')
+        #     for i in range(r0, r1):
+        #         print(' '.join(f'{float(out_acc[i, j]):.6f}' for j in range(c0, c1)))
+        #     print(f'\n[{tag}] Ref neighborhood:')
+        #     for i in range(r0, r1):
+        #         print(' '.join(f'{float(ref_acc[i, j]):.6f}' for j in range(c0, c1)))
+        #     print(f'\n[{tag}] Diff neighborhood:')
+        #     for i in range(r0, r1):
+        #         print(' '.join(f'{float(diff_acc[i, j]):.6f}' for j in range(c0, c1)))
 
     recipe_asym = (1, 128, 128)
     recipe_deepgemm = (1, 128, 128)
@@ -178,8 +178,7 @@ def test_m_grouped_gemm_contiguous() -> None:
         groundtruth = build_groundtruth_from_original(a_bf16, b_bf16, m_indices)
         d_deep = torch.empty_like(d_asym)
         offsets, experts, list_size = build_offsets_experts_from_m_indices(m_indices, num_groups)
-        import ipdb
-        ipdb.set_trace()
+
         asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(
             a, b, d_asym, offsets, experts, list_size,
             recipe=recipe_asym, disable_ue8m0_cast=disable_ue8m0_cast
@@ -196,7 +195,9 @@ def test_m_grouped_gemm_contiguous() -> None:
         print(f'   > Precision ({major_opt}, {kernel_opt}): '
               f'asym128-vs-gt={diff_asym_ref:.5f}, deep128-vs-gt={diff_deep_ref:.5f}, '
               f'asym128-vs-deep128={diff_asym_deep:.5f}')
+        print_5x5_compare_and_max_neighborhood('asym128-vs-sym128', d_asym_masked, d_deep_masked)
         print_5x5_compare_and_max_neighborhood('asym128-vs-gt', d_asym_masked, groundtruth)
+        print_5x5_compare_and_max_neighborhood('sym128-vs-gt', d_deep_masked, groundtruth)
         assert diff_deep_ref < 0.001, (
             f'deep128 baseline drifted: {m=}, {n=}, {k=}, {major_opt}, {kernel_opt}, '
             f'{diff_deep_ref:.5f}'
@@ -223,6 +224,8 @@ def test_m_grouped_gemm_contiguous() -> None:
                   f'{t * 1e6:4.0f} us | '
                   f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
                   f'{count_bytes(a, b, d) / 1e9 / t:4.0f} GB/s')
+        
+        break
     print()
 
 

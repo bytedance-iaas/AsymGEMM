@@ -103,8 +103,7 @@ static void sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d(const torch::Tensor& a
 
     const int block_m = 128;
     const int block_n = 128;
-    const int block_k = 128;
-
+    const int block_k = 512;
 
     const bool use_manual_config = block_m > 0 or block_n > 0 or block_k > 0;
     if (use_manual_config)
@@ -141,10 +140,12 @@ static void sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d(const torch::Tensor& a
                                                  SM100ArchSpec::get_cd_store_block_n(config.block_n),
                                                  static_cast<int>(d.stride(-2)), 1,
                                                  config.smem_config.swizzle_cd_mode);
+    // SF TMA descriptors use sf_quant_k=128 (not block_k) to match the SF tensor shape
+    constexpr int sf_quant_k = 128;
     const auto& tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
-                                                  config.block_m, config.block_k, 1, 0);
+                                                  config.block_m, sf_quant_k, 1, 0);
     const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
-                                                  config.block_n, config.block_k, num_groups, 0);
+                                                  config.block_n, sf_quant_k, num_groups, 0);
 
     if (list_size <= 1)
         return;
@@ -270,10 +271,12 @@ static void sm100_m_grouped_fp8_asym_gemm_masked_1d1d(const torch::Tensor& a, co
                                                  SM100ArchSpec::get_cd_store_block_n(config.block_n),
                                                  static_cast<int>(d.stride(-2)), num_groups,
                                                  config.smem_config.swizzle_cd_mode);
+    // SF TMA descriptors use sf_quant_k=128 (not block_k) to match the SF tensor shape
+    constexpr int sf_quant_k = 128;
     const auto& tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
-                                                  config.block_m, config.block_k, num_groups, 0);
+                                                  config.block_m, sf_quant_k, num_groups, 0);
     const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
-                                                  config.block_n, config.block_k, num_groups, 0);
+                                                  config.block_n, sf_quant_k, num_groups, 0);
 
     // Launch kernel with masked configuration
     const SM100FP8AsymGemmMaskedRuntime::Args& args = {
