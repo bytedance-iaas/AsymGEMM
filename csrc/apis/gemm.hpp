@@ -143,74 +143,12 @@ static void m_grouped_fp8_asym_gemm_nt_contiguous(const std::pair<torch::Tensor,
                                                  num_groups, m, n, k, major_a, major_b, compiled_dims);
 }
 
-static int fill_with_sentinel(
-    int* m_indices, int M,
-    int* offsets, int* experts, int capacity
-) {
-    if (!offsets || !experts || capacity <= 0)
-        return 0;
-    if (M <= 0 || !m_indices)
-        return 0;
-
-    int write = 0;
-    auto maybe_emit = [&](int start_idx) {
-        const int e = m_indices[start_idx];
-        if (e != -1) {
-            if (write < capacity) {
-                offsets[write] = start_idx;
-                experts[write] = e;
-            }
-            ++write;
-        }
-    };
-
-    maybe_emit(0);
-    for (int i = 1; i < M; ++i) {
-        if (m_indices[i] != m_indices[i - 1])
-            maybe_emit(i);
-    }
-
-    if (write < capacity) {
-        offsets[write] = M;
-        experts[write] = -1;
-    }
-    ++write;
-    return std::min(write, capacity);
-}
-
-static void m_grouped_fp8_asym_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
-                                             const std::pair<torch::Tensor, torch::Tensor>& b,
-                                             const torch::Tensor& d,
-                                             const torch::Tensor& m_indices,
-                                             std::optional<std::tuple<int, int, int>> recipe,
-                                             const std::string& compiled_dims,
-                                             const bool& disable_ue8m0_cast) {
-    DG_HOST_ASSERT(m_indices.is_contiguous());
-    DG_HOST_ASSERT(m_indices.scalar_type() == torch::kInt);
-
-    const auto m_indices_cpu = m_indices.to(torch::kCPU);
-    auto* mi = m_indices_cpu.data_ptr<int>();
-    const int max_len = static_cast<int>(b.first.size(0)) + 1;
-    std::vector<int> offsets_h(max_len);
-    std::vector<int> experts_h(max_len);
-    const int list_size = fill_with_sentinel(mi, static_cast<int>(m_indices_cpu.numel()),
-                                             offsets_h.data(), experts_h.data(), max_len);
-
-    auto opts_i32_cuda = torch::TensorOptions().device(a.first.device()).dtype(torch::kInt32);
-    auto offsets_t = torch::empty({max_len}, opts_i32_cuda);
-    auto experts_t = torch::empty({max_len}, opts_i32_cuda);
-    auto offsets_cpu_t = torch::from_blob(offsets_h.data(), {max_len}, torch::TensorOptions().dtype(torch::kInt32)).clone();
-    auto experts_cpu_t = torch::from_blob(experts_h.data(), {max_len}, torch::TensorOptions().dtype(torch::kInt32)).clone();
-    offsets_t.copy_(offsets_cpu_t, /*non_blocking=*/false);
-    experts_t.copy_(experts_cpu_t, /*non_blocking=*/false);
-
-    m_grouped_fp8_asym_gemm_nt_contiguous(a, b, d, offsets_t, experts_t, list_size, recipe, compiled_dims, disable_ue8m0_cast);
-}
-
 static void m_grouped_fp8_asym_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
                                          const std::pair<torch::Tensor, torch::Tensor>& b,
                                          const torch::Tensor& d,
-                                         const torch::Tensor& masked_m,
+                                         const torch::Tensor& offsets_t,
+                                         const torch::Tensor& experts_t,
+                                         const int& list_size,
                                          const int& expected_m,
                                          std::optional<std::tuple<int, int, int>> recipe,
                                          const std::string& compiled_dims,
@@ -221,7 +159,6 @@ static void m_grouped_fp8_asym_gemm_nt_masked(const std::pair<torch::Tensor, tor
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
     if (fp8_requires_k_major())
         DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
-    DG_HOST_ASSERT(masked_m.is_contiguous());
 
     // Type and shape checks
     const auto& [num_groups, m, k] = get_shape<3>(a.first);
@@ -233,7 +170,11 @@ static void m_grouped_fp8_asym_gemm_nt_masked(const std::pair<torch::Tensor, tor
     DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt);
+    
+    DG_HOST_ASSERT(offsets_t.is_cuda() && experts_t.is_cuda());
+    DG_HOST_ASSERT(offsets_t.is_contiguous() && experts_t.is_contiguous());
+    DG_HOST_ASSERT(offsets_t.scalar_type() == torch::kInt && experts_t.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(offsets_t.numel() >= list_size && experts_t.numel() >= list_size);
 
     // D must be N-major (per-group)
     check_major_type_cd(d);
@@ -249,10 +190,11 @@ static void m_grouped_fp8_asym_gemm_nt_masked(const std::pair<torch::Tensor, tor
     const auto& sfb = layout::transform_sf_into_required_layout(b.second, n, k, recipe.value(), num_groups, false, disable_ue8m0_cast);
 
     // Dispatch implementation
-    sm100_m_grouped_fp8_asym_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m, expected_m,
+    sm100_m_grouped_fp8_asym_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, offsets_t, experts_t, list_size, expected_m,
                                               num_groups, m, n, k, major_a, major_b, compiled_dims);
 }
 #endif
+
 
 #if DG_TENSORMAP_COMPATIBLE
 static void m_grouped_bf16_asym_gemm_nt_contiguous(const torch::Tensor& a, const torch::Tensor& b,
@@ -328,14 +270,14 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
 
 static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const torch::Tensor& b,
                                                const torch::Tensor& d,
-                                               const torch::Tensor& masked_m,
+                                               const torch::Tensor& offsets, const torch::Tensor& experts,
+                                               const int& list_size,
                                                const int& expected_m,
                                                const std::string& compiled_dims) {
     // Shape must be `[G, M, K] @ [G, N, K].mT`
     const auto& major_a = get_major_type_ab(a);
     const auto& major_b = get_major_type_ab(b);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
-    DG_HOST_ASSERT(masked_m.is_contiguous());
 
     // Type and shape checks
     const auto& [num_groups, m, k] = get_shape<3>(a);
@@ -347,7 +289,11 @@ static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const tor
     DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt);
+
+    DG_HOST_ASSERT(offsets.is_cuda() && experts.is_cuda());
+    DG_HOST_ASSERT(offsets.is_contiguous() && experts.is_contiguous());
+    DG_HOST_ASSERT(offsets.scalar_type() == torch::kInt && experts.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(offsets.numel() >= list_size && experts.numel() >= list_size);
 
     // D must be N-major (per-group)
     check_major_type_cd(d);
@@ -357,7 +303,7 @@ static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const tor
         return;
 
     // Dispatch implementation
-    sm100_m_grouped_bf16_asym_gemm_masked(a, b, d, masked_m, expected_m,
+    sm100_m_grouped_bf16_asym_gemm_masked(a, b, d, offsets, experts, list_size, expected_m,
                                           num_groups, m, n, k, major_a, major_b, compiled_dims);
 }
 #endif
@@ -376,22 +322,18 @@ static void register_apis(pybind11::module_& m) {
         py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
         py::arg("recipe") = std::nullopt, py::arg("compiled_dims") = "nk",
         py::arg("disable_ue8m0_cast") = false);
-    m.def("m_grouped_fp8_asym_gemm_nt_contiguous",
-        static_cast<void(*)(const std::pair<torch::Tensor, torch::Tensor>&,
-                            const std::pair<torch::Tensor, torch::Tensor>&,
-                            const torch::Tensor&, const torch::Tensor&,
-                            std::optional<std::tuple<int, int, int>>, const std::string&, const bool&)>(
-            &m_grouped_fp8_asym_gemm_nt_contiguous),
-        py::arg("a"), py::arg("b"), py::arg("d"), py::arg("m_indices"),
-        py::arg("recipe") = std::nullopt, py::arg("compiled_dims") = "nk",
-        py::arg("disable_ue8m0_cast") = false);
     m.def("m_grouped_fp8_gemm_nt_contiguous", &m_grouped_fp8_gemm_nt_contiguous,
         py::arg("a"), py::arg("b"), py::arg("d"), py::arg("m_indices"),
         py::arg("recipe") = std::nullopt, py::arg("compiled_dims") = "nk",
         py::arg("disable_ue8m0_cast") = false);
-    m.def("m_grouped_fp8_asym_gemm_nt_masked", &m_grouped_fp8_asym_gemm_nt_masked,
+    m.def("m_grouped_fp8_asym_gemm_nt_masked",
+        static_cast<void(*)(const std::pair<torch::Tensor, torch::Tensor>&,
+                            const std::pair<torch::Tensor, torch::Tensor>&,
+                            const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const int&, const int&,
+                            std::optional<std::tuple<int, int, int>>, const std::string&, const bool&)>(
+            &m_grouped_fp8_asym_gemm_nt_masked),
         py::arg("a"), py::arg("b"), py::arg("d"),
-        py::arg("masked_m"), py::arg("expected_m"),
+        py::arg("offsets"), py::arg("experts"), py::arg("list_size"), py::arg("expected_m"),
         py::arg("recipe") = std::nullopt, py::arg("compiled_dims") = "nk",
         py::arg("disable_ue8m0_cast") = false);
 #endif
@@ -408,9 +350,12 @@ static void register_apis(pybind11::module_& m) {
     m.def("m_grouped_bf16_gemm_nt_contiguous", &m_grouped_bf16_gemm_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("m_indices"),
           py::arg("compiled_dims") = "nk");
-    m.def("m_grouped_bf16_asym_gemm_nt_masked", &m_grouped_bf16_asym_gemm_nt_masked,
+    m.def("m_grouped_bf16_asym_gemm_nt_masked",
+          static_cast<void(*)(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+                              const torch::Tensor&, const torch::Tensor&, const int&, const int&, const std::string&)>(
+              &m_grouped_bf16_asym_gemm_nt_masked),
           py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("masked_m"), py::arg("expected_m"),
+          py::arg("offsets"), py::arg("experts"), py::arg("list_size"), py::arg("expected_m"),
           py::arg("compiled_dims") = "nk");
 #endif
 }

@@ -280,7 +280,12 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                     printf("[FP8DBG][W0][SM%u] post empty.wait k=%u m=%u stage=%u phase=%u\n",
                            smid, k_block_idx, m_block_idx, stage_idx, phase);
 
-                uint32_t m_idx = m_block_idx * BLOCK_M;
+                const uint32_t local_m_idx = kGemmType == GemmType::MGroupedMasked 
+                                           ? (m_block_idx - scheduler.m_start) * BLOCK_M
+                                           : (m_block_idx * BLOCK_M);
+                const uint32_t m_idx = kGemmType == GemmType::MGroupedMasked 
+                                     ? (scheduler.current_group_idx * shape_m + local_m_idx)
+                                     : local_m_idx;
 
                 if constexpr (kNumMulticast > 1)
                     m_idx += kIsMulticastOnA ? (cute::block_rank_in_cluster() * LOAD_BLOCK_M) : 0;
@@ -293,8 +298,11 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                         &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], m_idx, k_idx, 1, batch_idx);
 
                 if (sf_stage_in_group_idx == 0) {
+                    const uint32_t sfa_k_idx = kGemmType == GemmType::MGroupedMasked
+                                             ? scheduler.current_group_idx * shape_sf_k + sf_k_idx
+                                             : sf_k_idx;
                     tma_copy<BLOCK_M, 1, 0>(&tensor_map_sfa, full_barriers[stage_idx], smem_sfa[stage_idx],
-                                            m_block_idx * BLOCK_M, sf_k_idx);
+                                            local_m_idx, sfa_k_idx);
                     full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + BLOCK_M * sizeof(uint32_t));
                 }
                 else
@@ -546,7 +554,12 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                         // const auto n_idx = epilogue_type_t::apply_index_n<STORE_BLOCK_N>(blockIdx.x * BLOCK_N + s * STORE_BLOCK_N);
 
                         // Todo: The pipeline stage
-                        const auto m_idx = BLOCK_M * m_block_idx + w * WAVE_BLOCK_M;
+                        const auto base_local_m_idx = kGemmType == GemmType::MGroupedMasked 
+                                                    ? (m_block_idx - scheduler.m_start) * BLOCK_M
+                                                    : (m_block_idx * BLOCK_M);
+                        const auto m_idx = kGemmType == GemmType::MGroupedMasked
+                                         ? (scheduler.current_group_idx * shape_m + base_local_m_idx + w * WAVE_BLOCK_M)
+                                         : (base_local_m_idx + w * WAVE_BLOCK_M);
                         const auto n_idx = blockIdx.x * BLOCK_N + s * STORE_BLOCK_N;
 
                         // Store into shared memory

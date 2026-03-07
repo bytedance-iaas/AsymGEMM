@@ -187,7 +187,8 @@ public:
         GemmConfig gemm_config;
         LaunchArgs launch_args;
 
-        void* grouped_layout;  // masked_m tensor
+        void* offsets;
+        void* experts;
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_sfa;
@@ -232,7 +233,7 @@ static void __instantiate_kernel() {{
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.grouped_layout, args.grouped_layout, args.m, args.n, args.k,
+            args.offsets, args.experts, args.m, args.n, args.k,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_sfa, args.tensor_map_sfb,
             args.tensor_map_cd));
@@ -242,7 +243,9 @@ static void __instantiate_kernel() {{
 static void sm100_m_grouped_fp8_asym_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
                                                  const torch::Tensor& b, const torch::Tensor& sfb,
                                                  const torch::Tensor& d,
-                                                 const torch::Tensor& masked_m,
+                                                 const torch::Tensor& offsets_t,
+                                                 const torch::Tensor& experts_t,
+                                                 const int& list_size,
                                                  const int& expected_m,
                                                  const int& num_groups, const int& m, const int& n, const int& k,
                                                  const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
@@ -285,10 +288,11 @@ static void sm100_m_grouped_fp8_asym_gemm_masked_1d1d(const torch::Tensor& a, co
         .compiled_dims = compiled_dims,
         .epilogue_type = std::nullopt,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+        .launch_args = LaunchArgs({ceil_div(n, config.block_n), list_size - 1}, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .grouped_layout = masked_m.data_ptr<int>(),
+        .offsets = offsets_t.data_ptr<int>(),
+        .experts = experts_t.data_ptr<int>(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
