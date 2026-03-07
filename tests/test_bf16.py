@@ -110,8 +110,6 @@ def split_k_reference_for_m_grouped_bf16(
 
 def estimate_time(fn, num_warmups: int = 0, num_tests: int = 1,
                   flush_l2: bool = True):
-    # import ipdb
-    # ipdb.set_trace()
     # Simple CUDA-event based timing to compare with bench_kineto
     torch.cuda.synchronize()
     if flush_l2:
@@ -155,12 +153,15 @@ def calc_abs_diff_stats(
 
     flat = abs_diff.reshape(-1)
     mean_diff = flat.mean().item()
+    max_diff = flat.max().item()
+
     # torch.quantile can fail on very large tensors; use order statistic instead.
     n = flat.numel()
-    k = int(np.ceil(0.99 * n))
-    k = min(max(k, 1), n)
-    p99_diff = flat.kthvalue(k).values.item()
-    return mean_diff, p99_diff
+    k_99 = min(max(int(np.ceil(0.99 * n)), 1), n)
+    k_95 = min(max(int(np.ceil(0.95 * n)), 1), n)
+    p99_diff = flat.kthvalue(k_99).values.item()
+    p95_diff = flat.kthvalue(k_95).values.item()
+    return mean_diff, p95_diff, p99_diff, max_diff
 
 @torch.no_grad()
 def extract_offsets_and_experts_start(m_indices: torch.Tensor, drop_invalid: bool = True):
@@ -215,6 +216,135 @@ def extract_offsets_and_experts_start(m_indices: torch.Tensor, drop_invalid: boo
     return offsets, experts
 
 
+def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, block_m: int = 128):
+    offsets = []
+    experts = []
+    curr_offset = 0
+    for g in range(num_groups):
+        v = masked_m[g].item()
+        if v > 0:
+            offsets.append(curr_offset)
+            experts.append(g)
+            curr_offset += ((v + block_m - 1) // block_m) * block_m
+    offsets.append(curr_offset)
+    experts.append(-1)
+    return (torch.tensor(offsets, dtype=torch.int32, device='cuda'), 
+            torch.tensor(experts, dtype=torch.int32, device='cuda'), 
+            len(offsets))
+
+
+
+def test_m_grouped_gemm_masked() -> None:
+    print('Testing m-grouped masked GEMM:')
+
+    # TODO: when the actual `m` is greater than `expected_m_per_group`, efficiency may significantly decrease.
+    for _, _, num_groups, max_m, expected_m_per_group, n, k, use_psum_layout in enumerate_m_grouped_masked(torch.bfloat16):
+        num_tests = 8
+        sum_t_deep, max_t_deep = 0, 0
+        sum_t_asym, max_t_asym = 0, 0
+        sum_ops, sum_bytes = 0, 0
+
+        for i in range(num_tests):
+            a, b, masked_m, psum_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k,
+                                                                         use_bf16=True, use_psum_layout=use_psum_layout)
+
+            if use_psum_layout:
+                a_psum = layout_masked_to_psum(a, psum_m)
+                d_psum_deep = layout_masked_to_psum(d, psum_m)
+
+            b_pinned = b.detach().to("cpu", non_blocking=False).pin_memory()
+            b_gpu = b_pinned.to(device="cuda", non_blocking=True)
+            d_deep = torch.empty_like(d)
+            d_asym = torch.empty_like(d)
+            torch.cuda.synchronize()
+
+            offsets, experts, list_size = build_offsets_experts_from_masked_m(masked_m, num_groups)
+
+            # noinspection PyShadowingNames
+            def test_func_deep():
+                if use_psum_layout:
+                    deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a_psum, b_gpu, d_psum_deep, psum_m,
+                                                                use_psum_layout=True, expected_m_for_psum_layout=expected_m_per_group)
+                else:
+                    deep_gemm.m_grouped_bf16_gemm_nt_masked(a, b_gpu, d_deep, masked_m, expected_m_per_group)
+
+            # noinspection PyShadowingNames
+            def test_func_asym():
+                if use_psum_layout:
+                    pass
+                else:
+                    asym_gemm.m_grouped_bf16_asym_gemm_nt_masked(a, b_pinned, d_asym, offsets, experts, list_size, expected_m_per_group, compiled_dims="nk")
+
+            test_func_deep()
+            if not use_psum_layout:
+                test_func_asym()
+
+            deep_diff_max = 0.0
+            asym_diff_max = 0.0
+            
+            # Using calc_abs_diff_stats using the mask representation
+            # but we can just accumulate the slices and then do calc_abs_diff_stats.
+            deep_slices, asym_slices, ref_slices = [], [], []
+
+            for j in range(num_groups):
+                if masked_m[j].item() == 0:
+                    continue
+                if use_psum_layout:
+                    d_slice_deep = d_psum_deep[: psum_m[j]] if j == 0 else d_psum_deep[align(psum_m[j - 1], 128): psum_m[j]]
+                else:
+                    d_slice_deep = d_deep[j, :masked_m[j].item()]
+                    d_slice_asym = d_asym[j, :masked_m[j].item()]
+                
+                deep_slices.append(d_slice_deep.flatten())
+                ref_slices.append(ref_d[j, :masked_m[j].item()].flatten())
+                
+                deep_diff = calc_diff(d_slice_deep, ref_d[j, :masked_m[j].item()])
+                deep_diff_max = max(deep_diff_max, deep_diff)
+                
+                if not use_psum_layout:
+                    asym_slices.append(d_slice_asym.flatten())
+                    asym_diff = calc_diff(d_slice_asym, ref_d[j, :masked_m[j].item()])
+                    asym_diff_max = max(asym_diff_max, asym_diff)
+
+            if len(deep_slices) > 0:
+                deep_flat = torch.cat(deep_slices)
+                ref_flat = torch.cat(ref_slices)
+                deep_mean, deep_p95, deep_p99, deep_max = calc_abs_diff_stats(deep_flat, ref_flat)
+            else:
+                deep_mean, deep_p95, deep_p99, deep_max = 0.0, 0.0, 0.0, 0.0
+
+            if not use_psum_layout and len(asym_slices) > 0:
+                asym_flat = torch.cat(asym_slices)
+                asym_mean, asym_p95, asym_p99, asym_max = calc_abs_diff_stats(asym_flat, ref_flat)
+            else:
+                asym_mean, asym_p95, asym_p99, asym_max = 0.0, 0.0, 0.0, 0.0
+
+            # Test performance with fixed shapes
+            valid_m = masked_m.sum().item()
+            t_deep_gpu = bench_kineto(test_func_deep, 'bf16_gemm', suppress_kineto_output=True)
+            t_asym = bench_kineto(test_func_asym, 'asym_gemm', suppress_kineto_output=True) if not use_psum_layout else 0
+
+            sum_t_deep += t_deep_gpu
+            max_t_deep = max(max_t_deep, t_deep_gpu)
+            sum_t_asym += t_asym
+            max_t_asym = max(max_t_asym, t_asym)
+            sum_ops += 2 * valid_m * n * k
+            sum_bytes += count_bytes(a, d) * valid_m / (max_m * num_groups) + count_bytes(b)
+
+        if sum_t_deep > 0:
+            print(f' > Perf (num_groups={num_groups:2}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}, '
+                  f'psum={1 if use_psum_layout else 0}): '
+                  f'deep_gpu={sum_t_deep / num_tests * 1e6:4.0f} (max: {max_t_deep * 1e6:3.0f}) us | '
+                  f'{sum_ops / sum_t_deep / 1e12:4.0f} TFLOPS | '
+                  f'asym_gpu={sum_t_asym / num_tests * 1e6:4.0f} (max: {max_t_asym * 1e6:3.0f}) us | '
+                  f'asym_TFLOPS={sum_ops / sum_t_asym / 1e12 if sum_t_asym > 0 else 0:4.0f} | '
+                  f'{sum_bytes / sum_t_deep / 1e9:4.0f} GB/s')
+        if not use_psum_layout:
+            print(f'   deep_gpu diff={deep_diff_max:.5e} | max_abs={deep_max:.5e} | p95_abs={deep_p95:.5e} | mean_abs={deep_mean:.5e}')
+            print(f'   asym_gpu diff={asym_diff_max:.5e} | max_abs={asym_max:.5e} | p95_abs={asym_p95:.5e} | mean_abs={asym_mean:.5e}')
+    print()
+
+
 def test_m_grouped_gemm_contiguous() -> None:
     print('Testing m-grouped contiguous GEMM:')
     compiled_dims = "mnk"
@@ -225,7 +355,11 @@ def test_m_grouped_gemm_contiguous() -> None:
     for _, num_groups, expected_m_per_group, n, k, major_a, major_b in enumerate_m_grouped_contiguous(torch.bfloat16):
         major_opt  = 'N' if major_a.is_k_major() else 'T'
         major_opt += 'T' if major_b.is_k_major() else 'N'
-        
+
+        # we only support k_major until now. vLLM and Sglang mainly use K major
+        if not major_a.is_k_major() or not major_b.is_k_major():
+            continue
+
         m, a, b, m_indices, d, ref_d = generate_m_grouped_contiguous(num_groups, expected_m_per_group, n, k, major_a, major_b, use_bf16=True)
         log_top_left_2x2_ab(
             a,
@@ -260,7 +394,6 @@ def test_m_grouped_gemm_contiguous() -> None:
         print(f"k: {k}")
         print(f"experts_i32: {experts_i32}")
         print(f"offsets_i32: {offsets_i32}")
-
         t_deep_gpu = estimate_time(test_func_deep)
         t_asym = estimate_time(test_func_asym)
 
@@ -276,8 +409,8 @@ def test_m_grouped_gemm_contiguous() -> None:
         deep_gpu_diff = calc_diff(d_deep_gpu, ref_d)
         asym_diff = calc_diff(d_asym, ref_d)
         valid_rows = (m_indices != -1)
-        deep_mean_diff, deep_p99_diff = calc_abs_diff_stats(d_deep_gpu, ref_d, valid_rows)
-        mean_diff, p99_diff = calc_abs_diff_stats(d_asym, ref_d, valid_rows)
+        deep_mean_diff, deep_p95_diff, deep_p99_diff, deep_max_diff = calc_abs_diff_stats(d_deep_gpu, ref_d, valid_rows)
+        mean_diff, p95_diff, p99_diff, max_diff = calc_abs_diff_stats(d_asym, ref_d, valid_rows)
         deep_vs_k0_64 = calc_diff(d_deep_gpu, ref_k0_64.to(dtype=d_deep_gpu.dtype))
         deep_vs_k64_end = calc_diff(d_deep_gpu, ref_k64_end.to(dtype=d_deep_gpu.dtype))
         asym_vs_k0_64 = calc_diff(d_asym, ref_k0_64.to(dtype=d_asym.dtype))
@@ -287,8 +420,7 @@ def test_m_grouped_gemm_contiguous() -> None:
         flops_total = 2 * m * n * k
         flops_active = 2 * active_m * n * k
 
-        print(f'   deep_gpu  diff={deep_gpu_diff:.5e} | mean_abs_diff={deep_mean_diff:.5e} | p99_abs_diff={deep_p99_diff:.5e}')
-        print(f'   asym_gemm diff={asym_diff:.5e} | mean_abs_diff={mean_diff:.5e} | p99_abs_diff={p99_diff:.5e}')
+        print(f'   asym_gemm diff={asym_diff:.5e} | max_abs_diff={max_diff:.5e} | p95_abs_diff={p95_diff:.5e} | mean_abs_diff={mean_diff:.5e}')
         print(f'   deep_gpu vs ref_k0_64={deep_vs_k0_64:.5e} | vs ref_k64_end={deep_vs_k64_end:.5e}')
         print(f'   asym_gemm vs ref_k0_64={asym_vs_k0_64:.5e} | vs ref_k64_end={asym_vs_k64_end:.5e}')
         print(f' > Perf ({num_groups=}, m={m:5}, n={n:5}, k={k:5}, layout={major_opt}): '
@@ -428,9 +560,9 @@ if __name__ == '__main__':
 
     if get_arch_major() >= 9:
         # test_gemm()
-        test_m_grouped_gemm_contiguous()
+        # test_m_grouped_gemm_contiguous()
         # test_block_k_debug()
-        # test_m_grouped_gemm_masked()
+        test_m_grouped_gemm_masked()
         # test_k_grouped_gemm_contiguous()
 
     # test_cublaslt_gemm()
