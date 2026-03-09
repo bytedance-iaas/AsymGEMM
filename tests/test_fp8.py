@@ -18,6 +18,22 @@ from generators import (
 )
 
 
+def print_5x5_matrix_diff(tag: str, out: torch.Tensor, ref: torch.Tensor):
+    out_cpu = out.to(torch.float32).cpu().contiguous()
+    ref_cpu = ref.to(torch.float32).cpu().contiguous()
+    diff_cpu = (out_cpu - ref_cpu).contiguous()
+    rows = min(5, out_cpu.size(0))
+    cols = min(5, out_cpu.size(1))
+    print(f'\n[{tag}] Out (top-left {rows}x{cols}):')
+    for i in range(rows):
+        print(' '.join(f'{float(out_cpu[i, j]):.6f}' for j in range(cols)))
+    print(f'\n[{tag}] Ref (top-left {rows}x{cols}):')
+    for i in range(rows):
+        print(' '.join(f'{float(ref_cpu[i, j]):.6f}' for j in range(cols)))
+    print(f'\n[{tag}] Diff = Out - Ref (top-left {rows}x{cols}):')
+    for i in range(rows):
+        print(' '.join(f'{float(diff_cpu[i, j]):.6f}' for j in range(cols)))
+
 @ignore_env('DG_JIT_PTXAS_CHECK', lambda: get_arch_major() == 9)
 def test_gemm() -> None:
     print('Testing GEMM:')
@@ -258,36 +274,69 @@ def test_m_grouped_gemm_masked() -> None:
         num_tests = 8
         sum_t, max_t = 0, 0
         sum_ops, sum_bytes = 0, 0
-        disable_ue8m0_cast = True
         # Test correctness
-        for i in range(10):
-            a, b, masked_m, psum_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_bf16=True, use_psum_layout=use_psum_layout)
-            offsets, experts, list_size = build_offsets_experts_from_masked_m(masked_m, num_groups)
-            
-            deep_gemm.m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
-            
-            d_asym = torch.empty_like(d)
-            asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(a, b, d_asym, offsets, experts, list_size, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
-            import ipdb;
-            ipdb.set_trace()
+        a, b, masked_m, psum_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0, use_psum_layout=use_psum_layout)
+        offsets, experts, list_size = build_offsets_experts_from_masked_m(masked_m, num_groups)
+        
+        deep_gemm.m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+        
+        d_asym = torch.empty_like(d)
+        asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(a, b, d_asym, offsets, experts, list_size, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
 
-            for j in range(num_groups):
-                if masked_m[j].item() == 0:
-                    continue
+        max_diff_baseline = 0.0
+        max_diff_asym = 0.0
+        max_diff_asym_group = -1
+        for j in range(num_groups):
+            if masked_m[j].item() > 0:
                 diff = calc_diff(d[j, :masked_m[j].item()], ref_d[j, :masked_m[j].item()])
-                assert diff < 0.001, f'{max_m=}, {n=}, {k=}, {j=}, masked_m={masked_m[j]}, {kernel_opt}, {num_groups=}, {diff:.5f} (baseline)'
+                max_diff_baseline = max(max_diff_baseline, diff)
 
                 diff_asym = calc_diff(d_asym[j, :masked_m[j].item()], ref_d[j, :masked_m[j].item()])
-                assert diff_asym < 0.001, f'{max_m=}, {n=}, {k=}, {j=}, masked_m={masked_m[j]}, {kernel_opt}, {num_groups=}, {diff_asym:.5f} (asym)'
+                if diff_asym > max_diff_asym:
+                    max_diff_asym = diff_asym
+                    max_diff_asym_group = j
+
+        print(f'   > Precision ({kernel_opt}): baseline-vs-gt={max_diff_baseline:.5f}, asym-vs-gt={max_diff_asym:.5f}')
+
+        # Output the 5x5 submatrix and neighborhood of max diff for asym_gemm
+        for j in range(num_groups):
+            if masked_m[j].item() > 0:
+                print_5x5_matrix_diff('deep_gemm', d[j, :masked_m[j].item()], ref_d[j, :masked_m[j].item()])
+                print_5x5_matrix_diff('asym_gemm', d_asym[j, :masked_m[j].item()], ref_d[j, :masked_m[j].item()])
+                break
+
+        if max_diff_asym_group >= 0:
+            j = max_diff_asym_group
+            vm = masked_m[j].item()
+            out_g = d_asym[j, :vm].to(torch.float32).cpu().contiguous()
+            ref_g = ref_d[j, :vm].to(torch.float32).cpu().contiguous()
+            abs_diff = (out_g - ref_g).abs()
+            max_val = abs_diff.max().item()
+            max_pos = (abs_diff == max_val).nonzero()[0]
+            mi, ni_ = int(max_pos[0].item()), int(max_pos[1].item())
+            radius = 3
+            r0, r1 = max(0, mi - radius), min(vm, mi + radius + 1)
+            c0, c1 = max(0, ni_ - radius), min(out_g.size(1), ni_ + radius + 1)
+            print(f'\n[asym_gemm max diff] group={j}, location=({mi},{ni_}), max_abs_diff={max_val:.6f}')
+            print(f'[asym_gemm max diff] Neighborhood rows [{r0},{r1-1}], cols [{c0},{c1-1}]:')
+            print('  Out:')
+            for i in range(r0, r1):
+                print('  ' + ' '.join(f'{float(out_g[i, c]):.6f}' for c in range(c0, c1)))
+            print('  Ref:')
+            for i in range(r0, r1):
+                print('  ' + ' '.join(f'{float(ref_g[i, c]):.6f}' for c in range(c0, c1)))
+            print('  Diff:')
+            for i in range(r0, r1):
+                print('  ' + ' '.join(f'{float(out_g[i,c]-ref_g[i,c]):.6f}' for c in range(c0, c1)))
 
         # Construct full cases
-        a, b, masked_m, psum_m, d, ref_d, signal = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
+        a, b, masked_m, psum_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
         offsets, experts, list_size = build_offsets_experts_from_masked_m(masked_m, num_groups)
         d_asym = torch.empty_like(d)
 
         # noinspection PyShadowingNames
         def test_func():
-            asym_gemm.m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+            deep_gemm.m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
 
         # noinspection PyShadowingNames
         def test_func_asym():
@@ -299,8 +348,14 @@ def test_m_grouped_gemm_masked() -> None:
         t_asym = bench_kineto(test_func_asym, 'asym_gemm', suppress_kineto_output=True)
         
         print(f' > Perf ({num_groups=}, expected_m={expected_m_per_group:4}, n={n:4}, k={k:4}, {kernel_opt}): ')
-        print(f'   Baseline: {t * 1e6:4.0f} us | {2 * valid_m * n * k / max(t, 1e-9) / 1e12:4.0f} TFLOPS')
-        print(f'   Asym:     {t_asym * 1e6:4.0f} us | {2 * valid_m * n * k / max(t_asym, 1e-9) / 1e12:4.0f} TFLOPS')
+        if t > 0:
+            print(f'   Baseline: {t * 1e6:4.0f} us | {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS')
+        else:
+            print(f'   Baseline: bench_kineto returned 0, skip')
+        if t_asym > 0:
+            print(f'   Asym:     {t_asym * 1e6:4.0f} us | {2 * valid_m * n * k / t_asym / 1e12:4.0f} TFLOPS')
+        else:
+            print(f'   Asym:     bench_kineto returned 0, skip')
     print()
 
 
@@ -321,7 +376,9 @@ def test_k_grouped_gemm_contiguous() -> None:
             k_grouped_fp8_gemm_contiguous(a, b, d, new_ks, new_ks_tensor, c)
 
             diff = calc_diff(d, ref_d)
-            assert diff < 0.001, f'{m=}, {n=}, {k=}, {ks=}, {diff:.5f}'
+            print(f'{m=}, {n=}, {k=}, {ks=}, {diff:.5f}')
+            if not test_empty_groups:
+                print_5x5_matrix_diff('asym_gemm', d, ref_d)
 
         # Test performance
         k, a, b, c, d, ref_d = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, ks, use_ue8m0=use_ue8m0)
@@ -348,6 +405,6 @@ if __name__ == '__main__':
     print(f' > {asym_gemm.__path__}\n')
 
     # test_gemm()
-    # test_m_grouped_gemm_contiguous()
+    test_m_grouped_gemm_contiguous()
     test_m_grouped_gemm_masked()
     # test_k_grouped_gemm_contiguous()

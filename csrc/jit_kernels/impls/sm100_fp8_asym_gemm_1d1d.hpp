@@ -252,11 +252,25 @@ static void sm100_m_grouped_fp8_asym_gemm_masked_1d1d(const torch::Tensor& a, co
                                                  const std::string& compiled_dims) {
     const auto& aligned_k = align(k, 128);
 
-    const auto& config = get_best_config<SM100ArchSpec>(
-        GemmType::MGroupedMasked, KernelType::Kernel1D1D,
-        expected_m, n, k, num_groups, major_a, major_b,
-        torch::kFloat8_e4m3fn, d.scalar_type(), false,
-        device_runtime->get_num_sms());
+    const int block_m = 128;
+    const int block_n = 128;
+    const int block_k = 512;
+
+    const bool use_manual_config = block_m > 0 or block_n > 0 or block_k > 0;
+    if (use_manual_config)
+        DG_HOST_ASSERT(block_m > 0 and block_n > 0 and block_k > 0);
+    const auto& config = use_manual_config
+        ? get_manual_config_asym<SM100ArchSpec>(
+            GemmType::MGroupedMasked, KernelType::Kernel1D1D,
+            expected_m, n, k, num_groups, major_a, major_b,
+            torch::kFloat8_e4m3fn, d.scalar_type(), false,
+            device_runtime->get_num_sms(),
+            block_m, block_n, block_k)
+        : get_best_config_asym<SM100ArchSpec>(
+            GemmType::MGroupedMasked, KernelType::Kernel1D1D,
+            expected_m, n, k, num_groups, major_a, major_b,
+            torch::kFloat8_e4m3fn, d.scalar_type(), false,
+            device_runtime->get_num_sms());
 
     // Create tensor descriptors with num_groups for grouped layout
     const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
