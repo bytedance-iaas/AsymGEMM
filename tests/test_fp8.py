@@ -11,6 +11,7 @@ from asym_gemm.testing import (
     ignore_env, get_arch_major
 )
 
+from asym_gemm.utils import per_token_cast_to_fp8
 from generators import (
     KernelType, get_ue8m0_usage,
     enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
@@ -359,6 +360,44 @@ def test_m_grouped_gemm_masked() -> None:
     print()
 
 
+@torch.no_grad()
+@ignore_env('DG_JIT_PTXAS_CHECK', lambda: get_arch_major() == 9)
+def test_single_gemm() -> None:
+    print('Testing single FP8 GEMM:')
+    use_ue8m0 = get_ue8m0_usage(KernelType.Kernel1D1D)
+    disable_ue8m0_cast = not use_ue8m0
+    recipe = (1, 1, 128)
+    configs = [
+        (1,    4096, 7168),
+        (128,  4096, 7168),
+        (4096, 4096, 7168),
+        (4096, 7168, 2048),
+    ]
+    for m, n, k in configs:
+        a_bf16 = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+        b_bf16 = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
+        a = per_token_cast_to_fp8(a_bf16, use_ue8m0=use_ue8m0)
+        b = per_token_cast_to_fp8(b_bf16, use_ue8m0=use_ue8m0)
+        d = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+        ref_d = (a_bf16.float() @ b_bf16.float().t()).to(torch.bfloat16)
+
+        asym_gemm.fp8_asym_gemm_nt(a, b, d, recipe=recipe, disable_ue8m0_cast=disable_ue8m0_cast)
+        diff = calc_diff(d, ref_d)
+        print_5x5_matrix_diff(f'fp8_asym_gemm_nt (m={m}, n={n}, k={k})', d, ref_d)
+
+        def test_func():
+            asym_gemm.fp8_asym_gemm_nt(a, b, d, recipe=recipe, disable_ue8m0_cast=disable_ue8m0_cast)
+
+        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+        if t > 0:
+            print(f' > (m={m:5}, n={n:5}, k={k:5}): diff={diff:.5e} | '
+                  f'{t * 1e6:4.0f} us | {2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
+                  f'{count_bytes(a, b, d) / 1e9 / t:4.0f} GB/s')
+        else:
+            print(f' > (m={m:5}, n={n:5}, k={k:5}): diff={diff:.5e} | bench_kineto returned 0, skip perf')
+    print()
+
+
 def test_k_grouped_gemm_contiguous() -> None:
     print('Testing k-grouped contiguous GEMM:')
 
@@ -405,6 +444,7 @@ if __name__ == '__main__':
     print(f' > {asym_gemm.__path__}\n')
 
     # test_gemm()
-    test_m_grouped_gemm_contiguous()
-    test_m_grouped_gemm_masked()
+    test_single_gemm()
+    # test_m_grouped_gemm_contiguous()
+    # test_m_grouped_gemm_masked()
     # test_k_grouped_gemm_contiguous()
