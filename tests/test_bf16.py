@@ -529,6 +529,54 @@ def test_block_k_debug():
         print(f"    simulated_reduce vs ref:  max_diff={diff_acc_vs_ref:.6f}")
         print()
 
+def _print_5x5(tag: str, out: torch.Tensor, ref: torch.Tensor) -> None:
+    rows = min(5, out.size(0))
+    cols = min(5, out.size(1))
+    out_f = out.float().cpu()
+    ref_f = ref.float().cpu()
+    print(f'\n[{tag}] asym_gemm (top-left {rows}x{cols}):')
+    for i in range(rows):
+        print(' '.join(f'{out_f[i, j].item():.6f}' for j in range(cols)))
+    print(f'[{tag}] ref (top-left {rows}x{cols}):')
+    for i in range(rows):
+        print(' '.join(f'{ref_f[i, j].item():.6f}' for j in range(cols)))
+    print(f'[{tag}] diff = asym - ref (top-left {rows}x{cols}):')
+    for i in range(rows):
+        print(' '.join(f'{(out_f[i, j] - ref_f[i, j]).item():.6f}' for j in range(cols)))
+
+
+@torch.no_grad()
+def test_single_gemm() -> None:
+    print('Testing single BF16 GEMM:')
+    configs = [
+        (1,    4096, 7168),
+        (128,  4096, 7168),
+        (4096, 4096, 7168),
+        (4096, 7168, 2048),
+    ]
+    for m, n, k in configs:
+        a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+        b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
+        d = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+        ref_d = (a.float() @ b.float().t()).to(torch.bfloat16)
+
+        asym_gemm.bf16_asym_gemm_nt(a, b, d)
+        diff = calc_diff(d, ref_d)
+        _print_5x5(f'bf16_asym_gemm_nt (m={m}, n={n}, k={k})', d, ref_d)
+
+        def test_func():
+            asym_gemm.bf16_asym_gemm_nt(a, b, d)
+
+        t = bench_kineto(test_func, 'asym_gemm', suppress_kineto_output=True)
+        if t > 0:
+            print(f' > (m={m:5}, n={n:5}, k={k:5}): diff={diff:.5e} | '
+                  f'{t * 1e6:4.0f} us | {2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
+                  f'{count_bytes(a, b, d) / 1e9 / t:4.0f} GB/s')
+        else:
+            print(f' > (m={m:5}, n={n:5}, k={k:5}): diff={diff:.5e} | bench_kineto returned 0, skip perf')
+    print()
+
+
 def test_cublaslt_gemm() -> None:
     print('Testing cuBLASLt GEMM:')
     for kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype in enumerate_normal(dtype=torch.bfloat16):
@@ -562,7 +610,8 @@ if __name__ == '__main__':
         # test_gemm()
         # test_m_grouped_gemm_contiguous()
         # test_block_k_debug()
-        test_m_grouped_gemm_masked()
+        test_single_gemm()
+        # test_m_grouped_gemm_masked()
         # test_k_grouped_gemm_contiguous()
 
     # test_cublaslt_gemm()

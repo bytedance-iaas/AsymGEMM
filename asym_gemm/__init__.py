@@ -71,6 +71,53 @@ try:
         _export_kernel_alias("bf16_m_grouped_asym_gemm_nt_masked", "m_grouped_bf16_asym_gemm_nt_masked")
         _export_kernel_alias("bf16_m_grouped_gemm_nt_masked", "m_grouped_bf16_asym_gemm_nt_masked")
 
+        # Single matrix multiplication wrappers (no MoE grouping)
+        def bf16_asym_gemm_nt(a: torch.Tensor, b: torch.Tensor, d: torch.Tensor,
+                               compiled_dims: str = "nk") -> None:
+            """Single BF16 GEMM: D[M, N] = A[M, K] @ B[N, K].T
+
+            Wraps the grouped GEMM with a single group, so no offsets/experts
+            need to be managed by the caller.
+
+            Args:
+                a: [M, K] BF16 tensor (K-major)
+                b: [N, K] BF16 tensor (K-major)
+                d: [M, N] BF16 tensor (N-major, output)
+                compiled_dims: dimension compilation string (default "nk")
+            """
+            m = a.shape[0]
+            device = a.device
+            offsets = torch.tensor([0, m], dtype=torch.int32, device=device)
+            experts = torch.tensor([0, -1], dtype=torch.int32, device=device)
+            m_grouped_bf16_asym_gemm_nt_contiguous(
+                a, b.unsqueeze(0), d, offsets, experts, 2, compiled_dims
+            )
+
+        def fp8_asym_gemm_nt(a, b, d: torch.Tensor,
+                              recipe=None, compiled_dims: str = "nk",
+                              disable_ue8m0_cast: bool = False) -> None:
+            """Single FP8 GEMM: D[M, N] = A[M, K] @ B[N, K].T
+
+            Wraps the grouped FP8 GEMM with a single group, so no offsets/experts
+            need to be managed by the caller.
+
+            Args:
+                a: (data [M, K], scale_factors) FP8 tensor pair
+                b: (data [N, K], scale_factors) FP8 tensor pair
+                d: [M, N] BF16 output tensor
+                recipe: optional (gran_mn_a, gran_mn_b, gran_k) tuple
+                compiled_dims: dimension compilation string (default "nk")
+                disable_ue8m0_cast: disable UE8M0 cast (for SM90 compatibility)
+            """
+            m = a[0].shape[0]
+            device = a[0].device
+            offsets = torch.tensor([0, m], dtype=torch.int32, device=device)
+            experts = torch.tensor([0, -1], dtype=torch.int32, device=device)
+            b_grouped = (b[0].unsqueeze(0), b[1].unsqueeze(0))
+            m_grouped_fp8_asym_gemm_nt_contiguous(
+                a, b_grouped, d, offsets, experts, 2, recipe, compiled_dims, disable_ue8m0_cast
+            )
+
     # Initialize CPP modules
     def _find_cuda_home() -> str:
         cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
