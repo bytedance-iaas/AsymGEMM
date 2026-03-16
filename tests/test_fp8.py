@@ -204,7 +204,8 @@ def test_m_grouped_gemm_contiguous() -> None:
         groundtruth = build_groundtruth_from_original(a_bf16, b_bf16, m_indices)
         d_deep = torch.empty_like(d_asym)
         offsets, experts, list_size = build_offsets_experts_from_m_indices(m_indices, num_groups)
-
+        b_pinned = (b[0].cpu().pin_memory(), b[1].cpu().pin_memory())
+        import ipdb;ipdb.set_trace()
         asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(
             a, b, d_asym, offsets, experts, list_size,
             recipe=recipe_asym, disable_ue8m0_cast=disable_ue8m0_cast
@@ -212,7 +213,7 @@ def test_m_grouped_gemm_contiguous() -> None:
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             a, b, d_deep, m_indices, recipe=recipe_deepgemm, disable_ue8m0_cast=disable_ue8m0_cast
         )
-        import ipdb;ipdb.set_trace()
+        # import ipdb;ipdb.set_trace()
 
         d_asym_masked = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(d_asym), d_asym)
         d_deep_masked = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(d_deep), d_deep)
@@ -275,6 +276,30 @@ def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int,
 def test_m_grouped_gemm_masked() -> None:
     print('Testing m-grouped masked GEMM:')
 
+    def _tensor_to_int_list(x: torch.Tensor):
+        return [int(v) for v in x.detach().cpu().tolist()]
+
+    def _print_asym_case_debug(
+        tag: str,
+        num_groups: int,
+        max_m: int,
+        expected_m_per_group: int,
+        n: int,
+        k: int,
+        masked_m: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        list_size: int,
+    ) -> None:
+        valid_m = int(masked_m.sum().item())
+        print(
+            f'[{tag}] num_groups={num_groups}, m_max={max_m}, m_valid={valid_m}, '
+            f'expected_m_per_group={expected_m_per_group}, n={n}, k={k}'
+        )
+        print(f'[{tag}] masked_m={_tensor_to_int_list(masked_m)}')
+        print(f'[{tag}] offsets(list_size={list_size})={_tensor_to_int_list(offsets)}')
+        print(f'[{tag}] experts(list_size={list_size})={_tensor_to_int_list(experts)}')
+
     # TODO: when the actual `m` is greater than `expected_m_per_group`, efficiency may significantly decrease.
     for kernel_type, quant_config, num_groups, max_m, expected_m_per_group, n, k, use_psum_layout in enumerate_m_grouped_masked(torch.float8_e4m3fn):
         use_ue8m0 = get_ue8m0_usage(kernel_type)
@@ -289,9 +314,25 @@ def test_m_grouped_gemm_masked() -> None:
         offsets, experts, list_size = build_offsets_experts_from_masked_m(masked_m, num_groups)
         
         deep_gemm.m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
-        
+        # import ipdb
+        # ipdb.set_trace()
         d_asym = torch.empty_like(d)
-        asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(a, b, d_asym, offsets, experts, list_size, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+        _print_asym_case_debug(
+            'asym_gemm correctness',
+            num_groups,
+            max_m,
+            expected_m_per_group,
+            n,
+            k,
+            masked_m,
+            offsets,
+            experts,
+            list_size,
+        )
+
+        b_pinned = (b[0].cpu().pin_memory(), b[1].cpu().pin_memory())
+
+        asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(a, b_pinned, d_asym, offsets, experts, list_size, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
 
         max_diff_baseline = 0.0
         max_diff_asym = 0.0
@@ -340,34 +381,47 @@ def test_m_grouped_gemm_masked() -> None:
                 print('  ' + ' '.join(f'{float(out_g[i,c]-ref_g[i,c]):.6f}' for c in range(c0, c1)))
 
         # Construct full cases
-        a, b, masked_m, psum_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
-        offsets, experts, list_size = build_offsets_experts_from_masked_m(masked_m, num_groups)
-        d_asym = torch.empty_like(d)
+        # a, b, masked_m, psum_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
+        # offsets, experts, list_size = build_offsets_experts_from_masked_m(masked_m, num_groups)
+        # d_asym = torch.empty_like(d)
+        # _print_asym_case_debug(
+        #     'asym_gemm perf',
+        #     num_groups,
+        #     max_m,
+        #     expected_m_per_group,
+        #     n,
+        #     k,
+        #     masked_m,
+        #     offsets,
+        #     experts,
+        #     list_size,
+        # )
 
-        # noinspection PyShadowingNames
-        def test_func():
-            deep_gemm.m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+        # # noinspection PyShadowingNames
+        # def test_func():
+        #     deep_gemm.m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
 
-        # noinspection PyShadowingNames
-        def test_func_asym():
-            asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(a, b, d_asym, offsets, experts, list_size, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+        # # noinspection PyShadowingNames
+        # def test_func_asym():
+        #     asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(a, b, d_asym, offsets, experts, list_size, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
 
-        # Test performance with fixed shapes
-        valid_m = masked_m.sum().item()
-        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
-        t_asym = bench_kineto(test_func_asym, 'asym_gemm', suppress_kineto_output=True)
+        # # Test performance with fixed shapes
+        # valid_m = masked_m.sum().item()
+        # import ipdb;ipdb.set_trace()
+        # t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+        # t_asym = bench_kineto(test_func_asym, 'asym_gemm', suppress_kineto_output=True)
         
-        print(f' > Perf ({num_groups=}, expected_m={expected_m_per_group:4}, n={n:4}, k={k:4}, {kernel_opt}): ')
-        if t > 0:
-            baseline_tflops = gemm_tflops(valid_m, n, k, t)
-            print(f'   Baseline: {t * 1e6:4.0f} us | {baseline_tflops:4.0f} TFLOPS | {baseline_tflops:4.0f} FP4-TFLOPS')
-        else:
-            print(f'   Baseline: bench_kineto returned 0, skip')
-        if t_asym > 0:
-            asym_tflops = gemm_tflops(valid_m, n, k, t_asym)
-            print(f'   Asym:     {t_asym * 1e6:4.0f} us | {asym_tflops:4.0f} TFLOPS | {asym_tflops:4.0f} FP4-TFLOPS')
-        else:
-            print(f'   Asym:     bench_kineto returned 0, skip')
+        # print(f' > Perf ({num_groups=}, expected_m={expected_m_per_group:4}, n={n:4}, k={k:4}, {kernel_opt}): ')
+        # if t > 0:
+        #     baseline_tflops = gemm_tflops(valid_m, n, k, t)
+        #     print(f'   Baseline: {t * 1e6:4.0f} us | {baseline_tflops:4.0f} TFLOPS | {baseline_tflops:4.0f} FP4-TFLOPS')
+        # else:
+        #     print(f'   Baseline: bench_kineto returned 0, skip')
+        # if t_asym > 0:
+        #     asym_tflops = gemm_tflops(valid_m, n, k, t_asym)
+        #     print(f'   Asym:     {t_asym * 1e6:4.0f} us | {asym_tflops:4.0f} TFLOPS | {asym_tflops:4.0f} FP4-TFLOPS')
+        # else:
+        #     print(f'   Asym:     bench_kineto returned 0, skip')
     print()
 
 
@@ -420,5 +474,5 @@ if __name__ == '__main__':
 
     # test_gemm()
     test_m_grouped_gemm_contiguous()
-    test_m_grouped_gemm_masked()
+    # test_m_grouped_gemm_masked()
     # test_k_grouped_gemm_contiguous()

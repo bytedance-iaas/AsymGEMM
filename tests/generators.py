@@ -151,7 +151,7 @@ def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
 
 def enumerate_m_grouped_masked(dtype: torch.dtype) -> Generator:
     quant_config_list = QuantConfig.get_list_from_dtype(dtype)
-    max_m = 4096
+    max_m = 40960
     m_group_list = [(6, 1024), (32, 192), (32, 50)]
     n_k_list = [(6144, 7168), (7168, 3072), (4096, 4096), (4096, 2048)]
     for kernel_type in get_kernel_types(dtype):

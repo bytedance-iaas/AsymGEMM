@@ -106,15 +106,18 @@ static CUtensorMap make_tma_2d_desc(const torch::Tensor& t,
     const cuuint64_t gmem_strides[1] = {static_cast<cuuint64_t>(gmem_outer_stride * elem_size), };
     const cuuint32_t elem_strides[2] = {1, 1};
     if (get_env<int>("DG_JIT_DEBUG")) {
-        printf("Making TMA desc: global memory: %d %d, shared memory: %d %d, outer stride: %d, swizzle: %d (base: %d), elem size: %d\n",
+        printf("Making TMA desc: global memory: %d %d, shared memory: %d %d, outer stride: %d, swizzle: %d (base: %d), elem size: %d, tensor: %s pinned: %d\n",
                gmem_inner_dim, gmem_outer_dim, smem_inner_dim, smem_outer_dim,
-               gmem_outer_stride, swizzle_mode, swizzle_base, elem_size);
+               gmem_outer_stride, swizzle_mode, swizzle_base, elem_size,
+               t.device().is_cpu() ? "CPU" : "GPU", t.is_pinned());
     }
     DG_CUDA_DRIVER_CHECK(lazy_cuTensorMapEncodeTiled(
         &tensor_map, aten_dtype_to_tensor_map_dtype(t.scalar_type(), allow_tf32),
         2, t.data_ptr(), gmem_dims, gmem_strides, smem_dims, elem_strides,
         CU_TENSOR_MAP_INTERLEAVE_NONE, mode_into_tensor_map_swizzle(swizzle_mode, swizzle_base),
         CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    // Note: For SM100+, consider using CU_TENSOR_MAP_ELEMENT_SIZE_4BYTES wrapper for CPU memory
+    // with explicit memory domain specification if CUDA 12.8+ extended TMA API is available.
     return tensor_map;
 }
 
@@ -134,15 +137,18 @@ static CUtensorMap make_tma_3d_desc(const torch::Tensor& t,
     const cuuint64_t gmem_strides[2] = {static_cast<cuuint64_t>(gmem_stride_0 * elem_size), static_cast<cuuint64_t>(gmem_stride_1 * elem_size)};
     const cuuint32_t elem_strides[3] = {1, 1, 1};
     if (get_env<int>("DG_JIT_DEBUG")) {
-        printf("Making 3D TMA desc: global memory: %d %d %d, shared memory: %d %d %d, outer stride: %d %d, swizzle: %d, elem size: %d\n",
+        printf("Making 3D TMA desc: global memory: %d %d %d, shared memory: %d %d %d, outer stride: %d %d, swizzle: %d, elem size: %d, tensor: %s pinned: %d\n",
                gmem_dim_0, gmem_dim_1, gmem_dim_2, smem_dim_0, smem_dim_1, smem_dim_2,
-               gmem_stride_0, gmem_stride_1, swizzle_mode, elem_size);
+               gmem_stride_0, gmem_stride_1, swizzle_mode, elem_size,
+               t.device().is_cpu() ? "CPU" : "GPU", t.is_pinned());
     }
     DG_CUDA_DRIVER_CHECK(lazy_cuTensorMapEncodeTiled(
         &tensor_map, aten_dtype_to_tensor_map_dtype(t.scalar_type(), allow_tf32),
         3, t.data_ptr(), gmem_dims, gmem_strides, smem_dims, elem_strides,
         CU_TENSOR_MAP_INTERLEAVE_NONE, mode_into_tensor_map_swizzle(swizzle_mode, swizzle_base),
         CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    // Note: For SM100+, consider using CU_TENSOR_MAP_ELEMENT_SIZE_4BYTES wrapper for CPU memory
+    // with explicit memory domain specification if CUDA 12.8+ extended TMA API is available.
     return tensor_map;
 }
 
