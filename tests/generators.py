@@ -7,7 +7,7 @@ from deep_gemm.testing import get_arch_major
 from asym_gemm.utils import (
     align, ceil_div,
     per_token_cast_to_fp8, per_channel_cast_to_fp8, per_block_cast_to_fp8,
-    per_token_cast_to_fp4, transpose_packed_fp4,
+    per_token_cast_to_fp4, per_block_cast_to_fp4, transpose_packed_fp4,
     get_mk_alignment_for_contiguous_layout
 )
 
@@ -379,3 +379,637 @@ def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, major_a: Majo
         assert (major_a, major_b) == (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
 
     return k, a_fp8, b_fp8, c, d, ref_d
+
+
+def enumerate_m_grouped_contiguous_fp4() -> Generator:
+    for num_groups, expected_m_per_group, n, k in ((4, 8192, 4096, 512), (4, 8192, 7168, 2048), (8, 4096, 4096, 7168), (8, 4096, 7168, 2048)):
+        yield num_groups, expected_m_per_group, n, k
+
+def get_fp4_quantization_module(backend: str = "100"):
+    backend_modules = {
+        "121": gen_fp4_quantization_sm121_module,
+        "120f": gen_fp4_quantization_sm120f_module,
+        "120": gen_fp4_quantization_sm120_module,
+        "110": gen_fp4_quantization_sm110_module,
+        "103": gen_fp4_quantization_sm103_module,
+        "100": gen_fp4_quantization_sm100_module,
+        "90": gen_fp4_quantization_sm90_module,
+    }
+
+    # Prefer 'f' (family / feature-set) variant for SM12x when CUDA >= 12.9,
+    # as it enables native FP4 conversion instructions (cvt.rn.satfinite.e2m1x2.f32).
+    # sm_120f covers the entire SM12x family (both SM120 and SM121).
+    # See: https://developer.nvidia.com/blog/nvidia-blackwell-and-nvidia-cuda-12-9-introduce-family-specific-architecture-features/
+    if backend in ("120", "121"):
+        from .utils import version_at_least
+
+        if version_at_least(torch.version.cuda, "12.9"):
+            backend = "120f"
+
+    if backend not in backend_modules:
+        raise ValueError(f"Invalid backend: {backend}")
+
+    module = backend_modules[backend]().build_and_load()
+
+    @register_custom_op(
+        "flashinfer::fp4_quantize_sm100",
+        mutates_args=(""),
+    )
+    def fp4_quantize_sm100(
+        input: torch.Tensor,
+        global_scale: Optional[torch.Tensor] = None,
+        sf_vec_size: int = 16,
+        sf_use_ue8m0: bool = False,
+        is_sf_swizzled_layout: bool = True,
+        is_sf_8x4_layout: bool = False,
+        enable_pdl: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize input tensor to FP4 format.
+
+        Args:
+            input (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16/fp8_quantized.
+            global_scale (torch.Tensor, optional): Global scale factor of shape [1] and dtype float32.
+            sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
+            sf_use_ue8m0 (bool, optional): Whether to use UE8M0 format for scale factors. Defaults to False.
+            is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
+            is_sf_8x4_layout (bool, optional): Whether to use 8x4 layout or 128x4 layout for scale factors. Defaults to False.
+            enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
+                If None, automatically detects based on device capability. Defaults to None.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+                - Quantized tensor of shape [M, K/2] with dtype FLOAT4_E2M1X2
+                - Scale factors tensor with shape determined by layout and sf_vec_size
+        """
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(input.device)
+        out_val = torch.empty(
+            (*input.shape[:-1], input.shape[-1] // 2),
+            dtype=torch.uint8,
+            device=input.device,
+        )
+        m = input.numel() // input.shape[-1]
+        k = input.shape[-1]
+        if is_sf_swizzled_layout:
+            out_sf_size = _compute_swizzled_layout_sf_size(
+                m, k // sf_vec_size, 8 if is_sf_8x4_layout else 128
+            )
+            out_sf_size_padded = out_sf_size
+        else:
+            out_sf_size = m * k // sf_vec_size
+            out_sf_size_padded = round_up(m, 16) * k // sf_vec_size
+        out_sf = torch.empty(
+            (out_sf_size_padded,), dtype=torch.uint8, device=input.device
+        )
+        module.fp4_quantize(
+            input,
+            global_scale,
+            out_val,
+            out_sf,
+            sf_vec_size,
+            sf_use_ue8m0,
+            is_sf_swizzled_layout,
+            is_sf_8x4_layout,
+            enable_pdl,
+        )
+        return out_val, out_sf[:out_sf_size]
+
+    @register_fake_op("flashinfer::fp4_quantize_sm100")
+    def _fake_fp4_quantize_sm100(
+        input: torch.Tensor,
+        global_scale: Optional[torch.Tensor] = None,
+        sf_vec_size: int = 16,
+        sf_use_ue8m0: bool = False,
+        is_sf_swizzled_layout: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        m, k = input.shape
+        return (
+            input.new_empty([m, k // 2], dtype=torch.int64),  # FLOAT4_E2M1X2
+            input.new_empty([m * k // sf_vec_size], dtype=torch.int32),  # Scale factors
+        )
+
+    @register_custom_op(
+        "flashinfer::mxfp4_dequantize_host",
+        mutates_args=(""),
+    )
+    def mxfp4_dequantize_host(
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        group_size: int = 32,
+    ) -> torch.Tensor:
+        out = torch.empty(
+            (weight.shape[0], weight.shape[1] * 2),
+            dtype=torch.float32,
+            device=weight.device,
+        )
+        module.mxfp4_dequantize_host(
+            weight,
+            scale,
+            out,
+            group_size,
+        )
+        return out
+
+    @register_fake_op("flashinfer::mxfp4_dequantize_host")
+    def _fake_mxfp4_dequantize_host(
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        group_size: int = 32,
+    ) -> torch.Tensor:
+        return weight.new_empty(
+            [weight.shape[0], weight.shape[1] * 2], dtype=torch.float32
+        )
+
+    @register_custom_op(
+        "flashinfer::block_scale_interleave_sm100",
+        mutates_args=("",),
+    )
+    def block_scale_interleave_sm100(
+        unswizzled_sf: torch.Tensor,
+    ) -> torch.Tensor:
+        """Swizzle block scale tensor for FP4 format.
+
+        Args:
+            unswizzled_sf (torch.Tensor): unswizzled block scale tensor with dtype uint8 or bfloat16.
+
+        Returns:
+            torch.Tensor: output tensor for swizzled block scale with dtype uint8 or bfloat16.
+        """
+        num_experts = unswizzled_sf.shape[0] if unswizzled_sf.dim() == 3 else 1
+        expert_out_size = _compute_swizzled_layout_sf_size(
+            unswizzled_sf.shape[-2], unswizzled_sf.shape[-1], 128
+        )
+        out = torch.empty(
+            (num_experts * expert_out_size,),
+            dtype=unswizzled_sf.dtype,
+            device=unswizzled_sf.device,
+        )
+        module.block_scale_interleave_sm100(unswizzled_sf, out)
+        return out
+
+    @register_fake_op("flashinfer::block_scale_interleave_sm100")
+    def _fake_block_scale_interleave_sm100(
+        unswizzled_sf: torch.Tensor,
+    ) -> torch.Tensor:
+        return unswizzled_sf.new_empty(
+            [unswizzled_sf.shape[0] * unswizzled_sf.shape[1] // 16], dtype=torch.uint8
+        )
+
+    @register_custom_op(
+        "flashinfer::fp4_batched_quantize_sm100",
+        mutates_args=("",),
+    )
+    def fp4_batched_quantize_sm100(
+        input: torch.Tensor,
+        global_scale: Optional[torch.Tensor] = None,
+        sf_vec_size: int = 16,
+        sf_use_ue8m0: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize a batched tensor to FP4 (E2M1x2) with per-block scale factors.
+
+        This function converts a float/bfloat16 (or FP8-quantized) input tensor into a
+        packed FP4 tensor using the E2M1 format (two 4-bit values per byte), along with
+        per-block scale factors. Scale factors are encoded as UE4M3 by default, or UE8M0
+        when requested, and an optional global scale can be applied.
+
+        Args:
+            input (torch.Tensor): Input tensor of shape [B, M, K] with dtype torch.float16,
+                torch.bfloat16, or an FP8-quantized dtype supported by the kernel.
+            global_scale (torch.Tensor, optional): Global scale factor of shape [1] and
+                dtype float32.
+            sf_vec_size (int, optional): Scale-factor vector size and alignment unit along K.
+                Supported/expected values:
+                - 16 (NVFP4 path; supported)
+                - 32 (MXFP4 path; not supported yet)
+                Defaults to 16.
+            sf_use_ue8m0 (bool, optional): Scale-factor encoding type.
+                False → UE4M3 (default), True → UE8M0.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - self_fp4 (torch.Tensor): Packed FP4 tensor in E2M1x2 format of shape
+                [B, M, K // 2] with dtype torch.uint8 (two FP4 lanes per byte).
+                - self_block_scale_factors (torch.Tensor): Block scale factors with dtype
+                uint8 (UE4M3 or UE8M0), laid out as a flat buffer of shape
+                [B, ceil(M / 128) * 128 * ceil(K / sf_vec_size / 4) * 4].
+
+        Notes:
+            - K must be even (because outputs pack two FP4 values per byte).
+            - For best performance, K should be a multiple of sf_vec_size; the scale-factor
+            buffer is aligned to sf_vec_size along K, pads M to multiples of 128, and
+            rounds (K / sf_vec_size) up to a multiple of 4 for storage.
+            - The batch dimension B is preserved for both outputs.
+        """
+        b, m, k = input.shape
+        out_val = torch.empty(
+            (b, m, k // 2),
+            dtype=torch.uint8,
+            device=input.device,
+        )
+        out_sf = torch.empty(
+            (b, _compute_swizzled_layout_sf_size(m, k // sf_vec_size, 128)),
+            dtype=torch.uint8,
+            device=input.device,
+        )
+        module.fp4_batched_quantize(
+            input,
+            global_scale,
+            out_val,
+            out_sf,
+            sf_vec_size,
+            sf_use_ue8m0,
+        )
+        return out_val, out_sf
+
+    @register_fake_op("flashinfer::fp4_batched_quantize_sm100")
+    def _fake_fp4_batched_quantize_sm100(
+        input: torch.Tensor,
+        global_scale: Optional[torch.Tensor] = None,
+        sf_vec_size: int = 16,
+        sf_use_ue8m0: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        b, m, k = input.shape
+        return (
+            input.new_empty([b, m, k // 2], dtype=torch.uint8),  # FLOAT4_E2M1X2
+            input.new_empty(
+                [b, _compute_swizzled_layout_sf_size(m, k // sf_vec_size, 128)],
+                dtype=torch.uint8,
+            ),  # swizzled SF buffer
+        )
+
+    @register_custom_op(
+        "flashinfer::silu_and_mul_scaled_nvfp4_experts_quantize_sm100",
+        mutates_args=("",),
+    )
+    def silu_and_mul_scaled_nvfp4_experts_quantize_sm100(
+        input: torch.Tensor,
+        mask: torch.Tensor,
+        global_scale: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize a silu and matmul with masked batched tensor to FP4 (E2M1x2) with per-block scale factors.
+
+        This function first does silu and matmul to a float/bfloat16 input tensor then convect the result
+        into a packed FP4 tensor using the E2M1 format (two 4-bit values per byte), along with
+        per-block scale factors. Scale factors are encoded as UE4M3 by default, or UE8M0
+        when requested, and an optional global scale can be applied.
+
+        Args:
+            input (torch.Tensor): Input tensor of shape [B, M, K] with dtype torch.float16,
+                torch.bfloat16, or an FP8-quantized dtype supported by the kernel.
+            mask (torch.Tensor): mask tensor of shape [B] with dtype torch.int32.
+            global_scale (torch.Tensor, optional): Global scale factor of shape [1] and
+                dtype float32.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - self_fp4 (torch.Tensor): Packed FP4 tensor in E2M1x2 format of shape
+                [B, M, K // 2] with dtype torch.uint8 (two FP4 lanes per byte).
+                - self_block_scale_factors (torch.Tensor): Block scale factors with dtype
+                uint8 (UE4M3 or UE8M0), laid out as a flat buffer of shape
+                [B, ceil(M / 128) * 128 * ceil(K / sf_vec_size / 4) * 4].
+
+        Notes:
+            - K must be even (because outputs pack two FP4 values per byte).
+            - For best performance, K should be a multiple of sf_vec_size; the scale-factor
+            buffer is aligned to sf_vec_size along K, pads M to multiples of 128, and
+            rounds (K / sf_vec_size) up to a multiple of 4 for storage.
+            - The batch dimension B is preserved for both outputs.
+        """
+        device = input.device
+        l, m, k_by_2 = input.shape
+        k = k_by_2 // 2
+        sf_vec_size = 16
+        assert k % sf_vec_size == 0, f"k must be multiple of 16, but got {k}."
+
+        scale_k = k // sf_vec_size
+        padded_k = round_up(scale_k, 4)
+        padded_k_int32 = padded_k // 4
+        padded_m = round_up(m, 128)
+        output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
+        output_scales = torch.empty(
+            l, padded_m, padded_k_int32, device=device, dtype=torch.int32
+        )
+
+        module.silu_and_mul_scaled_nvfp4_experts_quantize(
+            output.view(l * m, k // 2),
+            output_scales.view(l * padded_m, padded_k_int32),
+            input.view(l * m, k_by_2),
+            global_scale,
+            mask,
+            True,
+        )
+        output = output.permute(1, 2, 0)
+        output_scales = output_scales.view(torch.float8_e4m3fn).view(
+            l, padded_m // 128, padded_k // 4, 32, 4, 4
+        )
+        output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
+        return output, output_scales
+
+    @register_fake_op("flashinfer::silu_and_mul_scaled_nvfp4_experts_quantize_sm100")
+    def _fake_silu_and_mul_scaled_nvfp4_experts_quantize_sm100(
+        input: torch.Tensor,
+        mask: torch.Tensor,
+        global_scale: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = input.device
+        l, m, k_by_2 = input.shape
+        k = k_by_2 // 2
+        sf_vec_size = 16
+        assert k % sf_vec_size == 0, f"k must be multiple of 16, but got {k}."
+
+        scale_k = k // sf_vec_size
+        padded_k = round_up(scale_k, 4)
+        padded_k_int32 = padded_k // 4
+        padded_m = round_up(m, 128)
+        output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
+        output_scales = torch.empty(
+            l, padded_m, padded_k_int32, device=device, dtype=torch.int32
+        )
+
+        output_scales = output_scales.view(torch.float8_e4m3fn).view(
+            l, padded_m // 128, padded_k // 4, 32, 4, 4
+        )
+        output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
+        return (output, output_scales)
+
+    @register_custom_op(
+        "flashinfer::scaled_fp4_grouped_quant_sm100",
+        mutates_args=("",),
+    )
+    def scaled_fp4_grouped_quant_sm100(
+        input_tensor: torch.Tensor,
+        input_global_scale: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Quantize input tensor to FP4 and return quantized tensor and scale, for
+        grouped gemm inputs (e.g., grouped_gemm_nt_masked for flashinfer).
+        Args:
+            input: The input tensor to be quantized to FP4, with shape (l, m, k)
+                l is number of groups, m is number of tokens per group, k is number of features.
+            input_global_scale: A scalar scaling factor for the entire tensor, with
+                shape (l,).
+        Outputs:
+            output: The quantized tensor in FP4, with shape (m, k // 2, l) but the physical
+                layout is (l, m, k // 2). `// 2` is because two fp4 values are packed into
+                an uint8.
+            output_scales: The blockscale tensor in FP8-E4M3, with shape (32, 4, rm, 4, rk, l)
+                but the physical layout is (l, rm, rk, 32, 4, 4).
+        Note:
+            For the shape of output_scales, `32 * 4 * rm` is a padded m to nearest multiple of 128.
+            `4 * rk` is a padded `k // 16` to nearest multiple of 4. These layout constants are
+            required by the NVIDIA Blackwell MMA operations.
+        """
+        device = input_tensor.device
+        l, m, k = input_tensor.shape
+        sf_vec_size = 16
+        assert k % sf_vec_size == 0, f"k must be multiple of 16, but got {k}."
+
+        scale_k = k // sf_vec_size
+        padded_k = round_up(scale_k, 4)
+        padded_k_int32 = padded_k // 4
+        padded_m = round_up(m, 128)
+        output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
+        output_scales = torch.empty(
+            l, padded_m, padded_k_int32, device=device, dtype=torch.int32
+        )
+
+        module.silu_and_mul_scaled_nvfp4_experts_quantize(
+            output.view(l * m, k // 2),
+            output_scales.view(l * padded_m, padded_k_int32),
+            input_tensor.view(l * m, k),
+            input_global_scale,
+            mask,
+            False,
+        )
+        # The physical layout of the output is (l, m, k // 2), but we want to return a
+        # logical layout (m, k // 2, l) required by the flashinfer masked group gemm.
+        output = output.permute(1, 2, 0)
+        # The physical layout of the output scales is already swizzled as (l, rm, rk, 32, 4, 4), a
+        # requirement for the flashinfer masked group gemm, where rm=m/128 and rk=k/4. The logic
+        # layout is (32, 4, rm, 4, rk, l).
+        output_scales = output_scales.view(torch.float8_e4m3fn).view(
+            l, padded_m // 128, padded_k // 4, 32, 4, 4
+        )
+        output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
+        return output, output_scales
+
+    @register_fake_op("flashinfer::scaled_fp4_grouped_quant_sm100")
+    def _fake_scaled_fp4_grouped_quant_sm100(
+        input_tensor: torch.Tensor,
+        input_global_scale: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = input_tensor.device
+        l, m, k = input_tensor.shape
+        sf_vec_size = 16
+        assert k % sf_vec_size == 0, f"k must be multiple of 16, but got {k}."
+
+        scale_k = k // sf_vec_size
+        padded_k = round_up(scale_k, 4)
+        padded_k_int32 = padded_k // 4
+        padded_m = round_up(m, 128)
+        output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
+        output_scales = torch.empty(
+            l, padded_m, padded_k_int32, device=device, dtype=torch.int32
+        )
+
+        output = output.permute(1, 2, 0)
+        output_scales = output_scales.view(torch.float8_e4m3fn).view(
+            l, padded_m // 128, padded_k // 4, 32, 4, 4
+        )
+        output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
+        return output, output_scales
+
+    @register_custom_op(
+        "flashinfer::e2m1_and_ufp8sf_scale_to_float_sm100",
+        mutates_args=(""),
+    )
+    def e2m1_and_ufp8sf_scale_to_float_sm100(
+        e2m1_tensor: torch.Tensor,
+        ufp8_scale_tensor: torch.Tensor,
+        global_scale_tensor: Optional[torch.Tensor] = None,
+        sf_vec_size: int = 16,
+        ufp8_type: int = 1,
+        is_sf_swizzled_layout: bool = True,
+    ) -> torch.Tensor:
+        """Convert E2M1 format tensor and UFP8 scale factors to float tensor.
+
+        This function performs dequantization by converting a packed FP4 tensor in E2M1 format
+        back to float values using the associated UFP8 scale factors and global scale.
+
+        Args:
+            e2m1_tensor (torch.Tensor): Packed FP4 tensor in E2M1 format of shape [M, K/2] with dtype uint8.
+            ufp8_scale_tensor (torch.Tensor): Scale factors tensor in UFP8 format with dtype uint8.
+            global_scale_tensor (torch.Tensor, optional): Global scale factor of shape [1] and dtype float32.
+            sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
+            ufp8_type (int, optional): UFP8 scale factor type (0 for UE8M0, 1 for E4M3). Defaults to 1.
+            is_sf_swizzled_layout (bool, optional): Whether scale factors use swizzled layout. Defaults to True.
+
+        Returns:
+            torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
+        """
+        out = torch.zeros(
+            (e2m1_tensor.shape[0], e2m1_tensor.shape[1] * 2),
+            dtype=torch.float32,
+            device="cpu",
+        )
+        module.e2m1_and_ufp8sf_scale_to_float_sm100(
+            e2m1_tensor.cpu(),
+            ufp8_scale_tensor.cpu().reshape(-1),
+            global_scale_tensor.cpu(),
+            out,
+            sf_vec_size,
+            ufp8_type,
+            is_sf_swizzled_layout,
+        )
+        return out
+
+    @register_fake_op("flashinfer::e2m1_and_ufp8sf_scale_to_float_sm100")
+    def _fake_e2m1_and_ufp8sf_scale_to_float_sm100(
+        e2m1_tensor: torch.Tensor,
+        ufp8_scale_tensor: torch.Tensor,
+        global_scale_tensor: Optional[torch.Tensor] = None,
+        sf_vec_size: int = 16,
+        ufp8_type: int = 1,
+        is_sf_swizzled_layout: bool = True,
+    ) -> torch.Tensor:
+        return e2m1_tensor.new_empty(
+            [e2m1_tensor.shape[0], e2m1_tensor.shape[1] * 2], dtype=torch.float32
+        )
+
+    # Register the module
+    return SimpleNamespace(
+        fp4_quantize_sm100=fp4_quantize_sm100,
+        block_scale_interleave_sm100=block_scale_interleave_sm100,
+        e2m1_and_ufp8sf_scale_to_float_sm100=e2m1_and_ufp8sf_scale_to_float_sm100,
+        mxfp4_dequantize_host=mxfp4_dequantize_host,
+        fp4_batched_quantize_sm100=fp4_batched_quantize_sm100,
+        silu_and_mul_scaled_nvfp4_experts_quantize_sm100=silu_and_mul_scaled_nvfp4_experts_quantize_sm100,
+        scaled_fp4_grouped_quant_sm100=scaled_fp4_grouped_quant_sm100,
+    )
+
+def fp4_quantize_sm100(
+    input: torch.Tensor,
+    global_scale: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 16,
+    sf_use_ue8m0: bool = False,
+    is_sf_swizzled_layout: bool = True,
+    is_sf_8x4_layout: bool = False,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize input tensor to FP4 format.
+
+    Args:
+        input (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16/fp8_quantized.
+        global_scale (torch.Tensor, optional): Global scale factor of shape [1] and dtype float32.
+        sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
+        sf_use_ue8m0 (bool, optional): Whether to use UE8M0 format for scale factors. Defaults to False.
+        is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
+        is_sf_8x4_layout (bool, optional): Whether to use 8x4 layout or 128x4 layout for scale factors. Defaults to False.
+        enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
+            If None, automatically detects based on device capability. Defaults to None.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+            - Quantized tensor of shape [M, K/2] with dtype FLOAT4_E2M1X2
+            - Scale factors tensor with shape determined by layout and sf_vec_size
+    """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
+    out_val = torch.empty(
+        (*input.shape[:-1], input.shape[-1] // 2),
+        dtype=torch.uint8,
+        device=input.device,
+    )
+    m = input.numel() // input.shape[-1]
+    k = input.shape[-1]
+    if is_sf_swizzled_layout:
+        out_sf_size = _compute_swizzled_layout_sf_size(
+            m, k // sf_vec_size, 8 if is_sf_8x4_layout else 128
+        )
+        out_sf_size_padded = out_sf_size
+    else:
+        out_sf_size = m * k // sf_vec_size
+        out_sf_size_padded = round_up(m, 16) * k // sf_vec_size
+    out_sf = torch.empty(
+        (out_sf_size_padded,), dtype=torch.uint8, device=input.device
+    )
+    module.fp4_quantize(
+        input,
+        global_scale,
+        out_val,
+        out_sf,
+        sf_vec_size,
+        sf_use_ue8m0,
+        is_sf_swizzled_layout,
+        is_sf_8x4_layout,
+        enable_pdl,
+    )
+    return out_val, out_sf[:out_sf_size]
+
+def generate_m_grouped_contiguous_fp4(num_groups: int, expected_m_per_group: int, n: int, k: int,
+                                      use_ue8m0: bool = False, gran_k: int = 16,
+                                      return_original: bool = False):
+    actual_ms = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
+    aligned_ms = [align(actual_m, get_mk_alignment_for_contiguous_layout()) for actual_m in actual_ms]
+    m = sum(aligned_ms)
+    import ipdb; ipdb.set_trace()
+    
+    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    b = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
+    m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
+    d = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+    ref_d = torch.randn((m, n), device='cuda', dtype=torch.bfloat16)
+
+    start = 0
+    for i, (actual_m, aligned_m) in enumerate(zip(actual_ms, aligned_ms)):
+        actual_end = start + actual_m
+        aligned_end = start + aligned_m
+        m_indices[start: actual_end] = i
+        m_indices[actual_end: aligned_end] = -1
+        a[actual_end: aligned_end] = 0
+        ref_d[start: aligned_end] = a[start: aligned_end] @ b[i].t()
+        start = aligned_end
+
+    # A: per-token FP4 quantization -> (m, k//2) uint8, SF (m, ceil(k/gran_k)) float
+    a_fp4 = per_token_cast_to_fp4(a, use_ue8m0=use_ue8m0, gran_k=gran_k)
+    # B: per-block FP4 quantization -> (G, n, k//2) uint8, SF (G, ceil(n/gran_k), ceil(k/gran_k)) float
+    b_fp4_data = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.uint8)
+    b_fp4_sf = torch.empty((num_groups, ceil_div(n, gran_k), ceil_div(k, gran_k)), device='cuda', dtype=torch.float)
+    for i in range(num_groups):
+        b_fp4_data[i], b_fp4_sf[i] = per_block_cast_to_fp4(b[i], use_ue8m0=use_ue8m0, gran_k=gran_k)
+    b_fp4 = (b_fp4_data, b_fp4_sf)
+
+    if return_original:
+        return m, a_fp4, b_fp4, m_indices, d, ref_d, a, b
+    return m, a_fp4, b_fp4, m_indices, d, ref_d
+
+
+def generate_m_grouped_masked_fp4(num_groups: int, max_m: int, expected_m_per_group: int, n: int, k: int,
+                                  use_ue8m0: bool = False, gran_k: int = 16):
+    a = torch.randn((num_groups, max_m, k), device='cuda', dtype=torch.bfloat16)
+    b = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
+    d = torch.empty((num_groups, max_m, n), device='cuda', dtype=torch.bfloat16)
+    ref_d = torch.einsum('gmk,gnk->gmn', a, b)
+
+    masked_m = torch.empty((num_groups, ), device='cuda', dtype=torch.int)
+    for j in range(num_groups):
+        masked_m[j] = int(expected_m_per_group * random.uniform(0.7, 1.3))
+    assert masked_m.amax().item() <= max_m
+
+    # A: per-token FP4, grouped -> (G, max_m, k//2) uint8, SF (G, max_m, ceil(k/gran_k)) float
+    a_fp4_data = torch.empty((num_groups, max_m, k // 2), device='cuda', dtype=torch.uint8)
+    a_fp4_sf = torch.empty((num_groups, max_m, ceil_div(k, gran_k)), device='cuda', dtype=torch.float)
+    for i in range(num_groups):
+        a_fp4_data[i], a_fp4_sf[i] = per_token_cast_to_fp4(a[i], use_ue8m0=use_ue8m0, gran_k=gran_k)
+    a_fp4 = (a_fp4_data, a_fp4_sf)
+
+    # B: per-block FP4, grouped -> (G, n, k//2) uint8, SF (G, ceil(n/gran_k), ceil(k/gran_k)) float
+    b_fp4_data = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.uint8)
+    b_fp4_sf = torch.empty((num_groups, ceil_div(n, gran_k), ceil_div(k, gran_k)), device='cuda', dtype=torch.float)
+    for i in range(num_groups):
+        b_fp4_data[i], b_fp4_sf[i] = per_block_cast_to_fp4(b[i], use_ue8m0=use_ue8m0, gran_k=gran_k)
+    b_fp4 = (b_fp4_data, b_fp4_sf)
+
+    return a_fp4, b_fp4, masked_m, d, ref_d

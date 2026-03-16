@@ -260,9 +260,11 @@ int main(int argc, char** argv) {
     // -----------------------------
     // 3) Tensors (your current demo settings)
     // -----------------------------
-    const int64_t n = 4096, k = 7168, num_groups = 4;
-    const int64_t expected_m_per_group = 2048;
+    const int64_t n = 1536, k = 2048, num_groups = 128;
+    const int64_t expected_m_per_group = 128;
     int64_t m = 0, active_m = 0;
+
+    // torch.Size([128, 1536, 2048])
 
     // Scale-factor layout for recipe (1, 128, 128) with BLOCK_K=128:
     //   SFA: [m, ceil(k / 128)]
