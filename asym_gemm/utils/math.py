@@ -91,6 +91,25 @@ def per_token_cast_to_fp4(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128) -
     return packed[:, :n // 2].contiguous(), sf
 
 
+def per_block_cast_to_fp4(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2
+    m, n = x.shape
+    assert n % 2 == 0
+    x_padded = torch.zeros((align(m, gran_k), align(n, gran_k)), dtype=x.dtype, device=x.device)
+    x_padded[:m, :n] = x
+    x_view = x_padded.view(-1, gran_k, x_padded.size(1) // gran_k, gran_k)
+    x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp_min(1e-4)
+    sf = x_amax / 6.0
+    sf = ceil_to_ue8m0(sf) if use_ue8m0 else sf
+    x_scaled = x_view * (1.0 / sf)
+    codes = _quantize_to_fp4_e2m1(x_scaled)
+    codes_flat = codes.view_as(x_padded)[:m, :n].contiguous()
+    codes2 = codes_flat.view(m, n // 2, 2)
+    packed = (codes2[:, :, 0] & 0x0F) | ((codes2[:, :, 1] & 0x0F) << 4)
+    import ipdb; ipdb.set_trace()  # --- IGNORE ---
+    return packed, sf.view(x_view.size(0), x_view.size(2))
+
+
 def transpose_packed_fp4(a: torch.Tensor) -> torch.Tensor:
     assert a.dtype == torch.uint8
     assert a.dim() == 2

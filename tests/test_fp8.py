@@ -34,6 +34,12 @@ def print_5x5_matrix_diff(tag: str, out: torch.Tensor, ref: torch.Tensor):
     for i in range(rows):
         print(' '.join(f'{float(diff_cpu[i, j]):.6f}' for j in range(cols)))
 
+
+def gemm_tflops(m: int, n: int, k: int, elapsed_s: float) -> float:
+    if elapsed_s <= 0:
+        return 0.0
+    return 2 * m * n * k / elapsed_s / 1e12
+
 @ignore_env('DG_JIT_PTXAS_CHECK', lambda: get_arch_major() == 9)
 def test_gemm() -> None:
     print('Testing GEMM:')
@@ -64,8 +70,9 @@ def test_gemm() -> None:
         t = bench_kineto(lambda: asym_gemm.fp8_gemm_nt(a, b, d, c=c, disable_ue8m0_cast=disable_ue8m0_cast, recipe=recipe),
                          'fp8_gemm', suppress_kineto_output=True)
         cublas_t, split_k_t = bench_kineto(lambda: asym_gemm.cublaslt_gemm_nt(a[0], b[0], d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True)
+        tflops = gemm_tflops(m, n, k, t)
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, {kernel_opt}, layout={major_opt}, {out_opt}, {acc_opt}): '
-              f'{t * 1e6:6.1f} us | {2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
+              f'{t * 1e6:6.1f} us | {tflops:4.0f} TFLOPS | {tflops:4.0f} FP4-TFLOPS | '
               f'{(count_bytes(a, b, d) + count_bytes(c) * int(accumulate)) / 1e9 / t:4.0f} GB/s | '
               f'{(cublas_t + split_k_t) / t:.2f}x cuBLAS')
         if cublas_t > 0:
@@ -205,6 +212,7 @@ def test_m_grouped_gemm_contiguous() -> None:
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             a, b, d_deep, m_indices, recipe=recipe_deepgemm, disable_ue8m0_cast=disable_ue8m0_cast
         )
+        import ipdb;ipdb.set_trace()
 
         d_asym_masked = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(d_asym), d_asym)
         d_deep_masked = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(d_deep), d_deep)
@@ -239,9 +247,11 @@ def test_m_grouped_gemm_contiguous() -> None:
             print(f' > Perf ({num_groups=}, m={m:5}, n={n:6}, k={k:5}, {kernel_opt}, layout={major_opt}): '
                   'bench_kineto returned 0, skip TFLOPS/GBps')
         else:
+            tflops = gemm_tflops(m, n, k, t)
             print(f' > Perf ({num_groups=}, m={m:5}, n={n:6}, k={k:5}, {kernel_opt}, layout={major_opt}): '
                   f'{t * 1e6:4.0f} us | '
-                  f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
+                  f'{tflops:4.0f} TFLOPS | '
+                  f'{tflops:4.0f} FP4-TFLOPS | '
                   f'{count_bytes(a, b, d) / 1e9 / t:4.0f} GB/s')
     print()
 
@@ -349,11 +359,13 @@ def test_m_grouped_gemm_masked() -> None:
         
         print(f' > Perf ({num_groups=}, expected_m={expected_m_per_group:4}, n={n:4}, k={k:4}, {kernel_opt}): ')
         if t > 0:
-            print(f'   Baseline: {t * 1e6:4.0f} us | {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS')
+            baseline_tflops = gemm_tflops(valid_m, n, k, t)
+            print(f'   Baseline: {t * 1e6:4.0f} us | {baseline_tflops:4.0f} TFLOPS | {baseline_tflops:4.0f} FP4-TFLOPS')
         else:
             print(f'   Baseline: bench_kineto returned 0, skip')
         if t_asym > 0:
-            print(f'   Asym:     {t_asym * 1e6:4.0f} us | {2 * valid_m * n * k / t_asym / 1e12:4.0f} TFLOPS')
+            asym_tflops = gemm_tflops(valid_m, n, k, t_asym)
+            print(f'   Asym:     {t_asym * 1e6:4.0f} us | {asym_tflops:4.0f} TFLOPS | {asym_tflops:4.0f} FP4-TFLOPS')
         else:
             print(f'   Asym:     bench_kineto returned 0, skip')
     print()
@@ -389,9 +401,11 @@ def test_k_grouped_gemm_contiguous() -> None:
             k_grouped_fp8_gemm_contiguous(a, b, d, ks, ks_tensor, c)
     
         t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+        tflops = gemm_tflops(m, n, k, t)
         print(f' > Perf ({num_groups=:2}, m={m:5}, n={n:5}, k={k:5}): '
               f'{t * 1e6:4.0f} us | '
-              f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
+              f'{tflops:4.0f} TFLOPS | '
+              f'{tflops:4.0f} FP4-TFLOPS | '
               f'{count_bytes(a, b, c, d) / 1e9 / t:4.0f} GB/s')
         break
     print()
