@@ -396,10 +396,21 @@ def test_m_grouped_nvfp4_contiguous_cpp_flow() -> None:
     manual_vs_gt = _diff_stats(d_manual_active, d_gt_active)
     kernel_vs_gt = _diff_stats(d_kernel_active, d_gt_active)
 
-    print("\nDiff stats:")
+    print("\nDiff stats (overall):")
     print(f"  kernel_vs_manual: {kernel_vs_manual}")
     print(f"  manual_vs_gt:     {manual_vs_gt}")
     print(f"  kernel_vs_gt:     {kernel_vs_gt}")
+
+    # Per-group error stats
+    active_m_indices = m_indices_cpu[active_rows]
+    for gid in range(num_groups):
+        group_mask = (active_m_indices == gid)
+        if not group_mask.any():
+            continue
+        k_g = d_kernel_active[group_mask]
+        m_g = d_manual_active[group_mask]
+        g_stats = _diff_stats(k_g, m_g)
+        print(f"  kernel_vs_manual [group {gid}]: {g_stats}")
     _print_max_diff_with_neighborhood(
         "kernel_vs_manual",
         d_kernel_active,

@@ -88,7 +88,7 @@ sm100_fp4_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
     const auto lane_idx = get_lane_idx();
     const auto smid = get_smid();
 
-    constexpr bool kDebugTrace = true;
+    constexpr bool kDebugTrace = false;
     constexpr int kDebugSM = -1;  // set >=0 to filter to one SM
     // Targeted debug tile for large kernel-vs-manual mismatch investigation.
     constexpr int kDbgBlockX = 6;
@@ -383,13 +383,18 @@ sm100_fp4_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
 
         // For multi-atom K (block_k > swizzle atom), create descriptors per-atom
         // so LBO=0, and manually rebase between atoms in the inner loop.
-        constexpr uint32_t SWIZZLE_ATOM_K_B = kSwizzleBMode * 2;  // 256 for FP4/SW128
+        // FP4: sizeof(fp4_input_element_t)==1 but actual element is 0.5 bytes,
+        // so swizzle atom holds kSwizzleMode*2 FP4 elements (not kSwizzleMode/sizeof).
+        constexpr uint32_t SWIZZLE_ATOM_K_B = kSwizzleBMode * 2;  // FP4 elements per 128B swizzle atom
         constexpr uint32_t DESC_ATOM_K = (BLOCK_K > SWIZZLE_ATOM_K_B) ? SWIZZLE_ATOM_K_B : BLOCK_K;
         constexpr uint32_t NUM_K_ATOMS = BLOCK_K / DESC_ATOM_K;
         constexpr uint32_t UMMA_ITERS_PER_ATOM = DESC_ATOM_K / UMMA_K;
 
-        auto a_desc = make_umma_desc<kMajorA, LOAD_BLOCK_M, DESC_ATOM_K, kSwizzleAMode>(smem_a[0], 0, 0);
-        auto b_desc = make_umma_desc<kMajorB, LOAD_BLOCK_N, DESC_ATOM_K, kSwizzleBMode>(smem_b[0], 0, 0);
+        // Pass DESC_ATOM_K/2 as BLOCK_K to make_umma_desc: since sizeof(fp4)==1, the
+        // function computes SBO/LBO using BLOCK_K*sizeof.  DESC_ATOM_K/2 gives the true
+        // byte count per row (128), yielding correct SBO and LBO=0 (single swizzle atom).
+        auto a_desc = make_umma_desc<kMajorA, LOAD_BLOCK_M, DESC_ATOM_K / 2, kSwizzleAMode>(smem_a[0], 0, 0);
+        auto b_desc = make_umma_desc<kMajorB, LOAD_BLOCK_N, DESC_ATOM_K / 2, kSwizzleBMode>(smem_b[0], 0, 0);
         uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
         uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
 
@@ -515,7 +520,7 @@ sm100_fp4_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                 const auto& b_desc_base_lo = __shfl_sync(0xffffffff, b_desc_lo, static_cast<int>(0));
                 if (cute::elect_one_sync()) {
                     // Two-level loop: outer over K-atoms, inner over UMMA_K steps per atom.
-                    // Each atom gets its own SF index to maintain 128-element dequant granularity.
+                    // Each atom gets its own SF index to maintain 16-element dequant granularity.
                     #pragma unroll
                     for (uint32_t atom = 0; atom < NUM_K_ATOMS; ++atom) {
                         // Rebase B descriptor to where TMA placed this K-atom (FP4: half byte per element)
