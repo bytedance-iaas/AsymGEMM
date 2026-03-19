@@ -666,7 +666,8 @@ int main(int argc, char** argv) {
     auto D_kernel = torch::empty({m, n}, torch::TensorOptions().device(dev).dtype(torch::kBFloat16));
 
     std::pair<torch::Tensor, torch::Tensor> a_pair{A_fp4_gpu, SFA};
-    std::pair<torch::Tensor, torch::Tensor> b_pair{B_fp4_gpu, SFB_gpu};
+    // std::pair<torch::Tensor, torch::Tensor> b_pair{B_fp4_gpu, SFB_gpu};
+    std::pair<torch::Tensor, torch::Tensor> b_pair{B_fp4_packed_cpu, SFB_gpu};
 
     auto check_k_major = [](const torch::Tensor& t, const char* name) {
         const bool k_major = t.stride(-1) == 1;
