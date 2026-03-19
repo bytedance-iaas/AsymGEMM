@@ -307,27 +307,13 @@ sm100_fp4_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                            scheduler.m_start, scheduler.m_end,
                            n_block_idx, b_n_idx, k_block_idx, k_packed_idx, sf_k_idx, sfb_outer_idx);
                 }
-                if (k_block_idx == 0 && lane_idx == 0) {
-                    const uint32_t outer_idx = scheduler.current_group_idx * shape_sf_k + sf_k_idx;
-                    const uint32_t outer_dim = kNumGroups * shape_sf_k;
-                    printf("[FP4_TMA_SFB] block=(%u,%u) sm=%u n_block_idx=%u b_n_idx=%u "
-                           "group=%u sf_k_idx=%u shape_sf_k=%u outer_idx=%u outer_dim=%u n=%u\n",
-                           blockIdx.x, blockIdx.y, smid, n_block_idx, b_n_idx,
-                           scheduler.current_group_idx, sf_k_idx, shape_sf_k, outer_idx, outer_dim, shape_n);
-                }
                 tma_copy<BLOCK_N, kSFPacksPerBlockK, 0>(&tensor_map_sfb, full_barriers_b[0], smem_sfb[0],
                                         n_block_idx * BLOCK_N, scheduler.current_group_idx * shape_sf_k + sf_k_idx);
                 full_barriers_b[0]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE + BLOCK_N * sizeof(uint32_t) * kSFPacksPerBlockK);
             }
 
             for (uint32_t m_block_idx = scheduler.m_start; m_block_idx < scheduler.m_end; advance_pipeline(m_block_idx)) {
-                if (should_log(k_block_idx, m_block_idx))
-                    printf("[FP4DBG][W0][SM%u] pre empty.wait k=%u m=%u stage=%u phase=%u\n",
-                           smid, k_block_idx, m_block_idx, stage_idx, phase);
                 empty_barriers[stage_idx]->wait(phase ^ 1);
-                if (should_log(k_block_idx, m_block_idx))
-                    printf("[FP4DBG][W0][SM%u] post empty.wait k=%u m=%u stage=%u phase=%u\n",
-                           smid, k_block_idx, m_block_idx, stage_idx, phase);
 
                 const uint32_t local_m_idx = kGemmType == GemmType::MGroupedMasked 
                                            ? (m_block_idx - scheduler.m_start) * BLOCK_M
@@ -350,16 +336,6 @@ sm100_fp4_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                     const uint32_t sfa_k_idx = kGemmType == GemmType::MGroupedMasked
                                              ? scheduler.current_group_idx * shape_sf_k + sf_k_idx
                                              : sf_k_idx;
-                    if (should_log_target(k_block_idx, m_block_idx)) {
-                        printf("[FP4DBG][TARGET][W0][SM%u] A/SFA load: block=(%u,%u) "
-                               "m_block_idx=%u local_m_idx=%u m_idx=%u sfa_k_idx=%u\n",
-                               smid, blockIdx.x, blockIdx.y,
-                               m_block_idx, local_m_idx, m_idx, sfa_k_idx);
-                    }
-                    if (k_block_idx == 0 && m_block_idx == scheduler.m_start && lane_idx == 0) {
-                        printf("[FP4_TMA_SFA] block=(%u,%u) sm=%u local_m_idx=%u sfa_k_idx=%u shape_sf_k=%u m=%u\n",
-                               blockIdx.x, blockIdx.y, smid, local_m_idx, sfa_k_idx, shape_sf_k, shape_m);
-                    }
                     tma_copy<BLOCK_M, kSFPacksPerBlockK, 0>(&tensor_map_sfa, full_barriers[stage_idx], smem_sfa[stage_idx],
                                             local_m_idx, sfa_k_idx);
                     full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + BLOCK_M * sizeof(uint32_t) * kSFPacksPerBlockK);
@@ -446,57 +422,8 @@ sm100_fp4_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                 tcgen05_after_thread_sync();
 
                 // Wait TMA and SF-transpose arrival
-                if (should_log(k_block_idx, m_block_idx))
-                    printf("[FP4DBG][W1][SM%u] pre with_sf.wait k=%u m=%u stage=%u phase=%u\n",
-                            smid, k_block_idx, m_block_idx, stage_idx, phase);
                 with_sf_full_barriers[stage_idx]->wait(phase);
                 tcgen05_after_thread_sync();
-                if (should_log(k_block_idx, m_block_idx))
-                    printf("[FP4DBG][W1][SM%u] post with_sf.wait k=%u m=%u stage=%u phase=%u\n",
-                            smid, k_block_idx, m_block_idx, stage_idx, phase);
-
-                // ---- Value dump: verify TMA loaded correct FP4 data + scale factors ----
-                if (k_block_idx == 0 && should_log(k_block_idx, m_block_idx)) {
-                    // FP4 packed: each byte holds 2 FP4 values (lo nibble = elem[0], hi nibble = elem[1])
-                    const uint8_t* a_ptr = reinterpret_cast<const uint8_t*>(smem_a[stage_idx]);
-                    printf("[FP4DBG][SMEM][SM%u][k=%u m=%u] A_bytes[0..7]: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                           smid, k_block_idx, m_block_idx,
-                           a_ptr[0], a_ptr[1], a_ptr[2], a_ptr[3],
-                           a_ptr[4], a_ptr[5], a_ptr[6], a_ptr[7]);
-                    const uint8_t* b_ptr = reinterpret_cast<const uint8_t*>(smem_b[0]);
-                    printf("[FP4DBG][SMEM][SM%u][k=%u m=%u] B_bytes[0..7]: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                           smid, k_block_idx, m_block_idx,
-                           b_ptr[0], b_ptr[1], b_ptr[2], b_ptr[3],
-                           b_ptr[4], b_ptr[5], b_ptr[6], b_ptr[7]);
-                    // SFA/SFB: uint32 packs of 4 UE4M3 bytes each (raw hex shows packed bytes)
-                    const uint32_t* sfa_ptr = smem_sfa[stage_idx];
-                    printf("[FP4DBG][SMEM][SM%u][k=%u m=%u] SFA_packs[0..3]: %08x %08x %08x %08x\n",
-                           smid, k_block_idx, m_block_idx,
-                           sfa_ptr[0], sfa_ptr[1], sfa_ptr[2], sfa_ptr[3]);
-                    const uint32_t* sfb_ptr = smem_sfb[0];
-                    printf("[FP4DBG][SMEM][SM%u][k=%u m=%u] SFB_packs[0..3]: %08x %08x %08x %08x\n",
-                           smid, k_block_idx, m_block_idx,
-                           sfb_ptr[0], sfb_ptr[1], sfb_ptr[2], sfb_ptr[3]);
-                }
-                if (should_log_target(k_block_idx, m_block_idx)) {
-                    const uint8_t* a_ptr = reinterpret_cast<const uint8_t*>(smem_a[stage_idx]);
-                    const uint8_t* b_ptr = reinterpret_cast<const uint8_t*>(smem_b[0]);
-                    const uint32_t* sfa_ptr = smem_sfa[stage_idx];
-                    const uint32_t* sfb_ptr = smem_sfb[0];
-                    printf("[FP4DBG][TARGET][SMEM][SM%u][k=%u m=%u] "
-                           "A_bytes[0..7]=%02x %02x %02x %02x %02x %02x %02x %02x "
-                           "B_bytes[0..7]=%02x %02x %02x %02x %02x %02x %02x %02x\n",
-                           smid, k_block_idx, m_block_idx,
-                           a_ptr[0], a_ptr[1], a_ptr[2], a_ptr[3], a_ptr[4], a_ptr[5], a_ptr[6], a_ptr[7],
-                           b_ptr[0], b_ptr[1], b_ptr[2], b_ptr[3], b_ptr[4], b_ptr[5], b_ptr[6], b_ptr[7]);
-                    printf("[FP4DBG][TARGET][SMEM][SM%u][k=%u m=%u] "
-                           "SFA_packs[0..3]=%08x %08x %08x %08x "
-                           "SFB_packs[0..3]=%08x %08x %08x %08x\n",
-                           smid, k_block_idx, m_block_idx,
-                           sfa_ptr[0], sfa_ptr[1], sfa_ptr[2], sfa_ptr[3],
-                           sfb_ptr[0], sfb_ptr[1], sfb_ptr[2], sfb_ptr[3]);
-                }
-                // -------------------------------------------------------------------------
 
                 if (sf_stage_in_group_idx == 0 and cute::elect_one_sync()) {
                     #pragma unroll
@@ -510,10 +437,6 @@ sm100_fp4_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                     }
                 }
                 __syncwarp();
-
-                if (should_log(k_block_idx, m_block_idx))
-                    printf("[FP4DBG][W1][SM%u] pre mma_t k=%u m=%u stage=%u phase=%u\n",
-                            smid, k_block_idx, m_block_idx, stage_idx, phase);
 
                 using mma_t = cute::conditional_t<kNumMulticast == 1, SM100_MMA_MXF4NVF4_SS, SM100_MMA_MXF4NVF4_2x1SM_SS>;
                 const auto& a_desc_base_lo = __shfl_sync(0xffffffff, a_desc_lo, static_cast<int>(stage_idx));
@@ -555,9 +478,6 @@ sm100_fp4_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                     }
                 }
 
-                if (should_log(k_block_idx, m_block_idx))
-                    printf("[FP4DBG][W1][SM%u] pre empty_barrier_arrive k=%u m=%u accum_stage=%u accum_phase=%u\n",
-                            smid, k_block_idx, m_block_idx, accum_stage_idx, accum_phase_idx);
                 // Publish only after the last K tile of this M tile.
                 empty_barrier_arrive();
             }
@@ -596,13 +516,7 @@ sm100_fp4_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
 
             for (uint32_t m_block_idx = scheduler.m_start; m_block_idx < scheduler.m_end; advance_pipeline(m_block_idx)) {
                 // Wait TMA arrival
-                if (should_log(k_block_idx, m_block_idx))
-                    printf("[FP4DBG][W2][SM%u] pre full.wait k=%u m=%u stage=%u phase=%u\n",
-                           smid, k_block_idx, m_block_idx, stage_idx, phase);
                 full_barriers[stage_idx]->wait(phase);
-                if (should_log(k_block_idx, m_block_idx))
-                    printf("[FP4DBG][W2][SM%u] post full.wait k=%u m=%u stage=%u phase=%u\n",
-                           smid, k_block_idx, m_block_idx, stage_idx, phase);
 
                 // Transpose for UTCCP at certain stages
                 if (sf_stage_in_group_idx == 0) {
@@ -647,14 +561,8 @@ sm100_fp4_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
 
             for (uint32_t m_block_idx = scheduler.m_start; m_block_idx < scheduler.m_end; ++m_block_idx, advance_accum_pipeline()) {
                 // Wait UMMA arrival
-                if (epilogue_warp_idx == 0 && should_log(k_block_idx, m_block_idx))
-                    printf("[FP4DBG][EPI0][SM%u] pre tmem_full.wait k=%u m=%u accum_stage=%u accum_phase=%u\n",
-                           smid, k_block_idx, m_block_idx, accum_stage_idx, accum_phase_idx);
                 tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
                 tcgen05_after_thread_sync();
-                if (epilogue_warp_idx == 0 && should_log(k_block_idx, m_block_idx))
-                    printf("[FP4DBG][EPI0][SM%u] post tmem_full.wait k=%u m=%u accum_stage=%u accum_phase=%u\n",
-                           smid, k_block_idx, m_block_idx, accum_stage_idx, accum_phase_idx);
 
                 DG_STATIC_ASSERT(kNumEpilogueThreads == 128, "Epilogue threads not enough");
                 DG_STATIC_ASSERT(BLOCK_N % STORE_BLOCK_N == 0, "Invalid block sizes");

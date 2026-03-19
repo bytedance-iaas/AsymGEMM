@@ -324,7 +324,7 @@ def test_m_grouped_nvfp4_contiguous_cpp_flow() -> None:
     num_groups = 2
     expected_m_per_group = 1024
     n = 1024
-    k = 512
+    k = 1024
     gran_k = 16
     sf_k = (k + gran_k - 1) // gran_k
     sf_n = (n + gran_k - 1) // gran_k
@@ -354,11 +354,13 @@ def test_m_grouped_nvfp4_contiguous_cpp_flow() -> None:
     sfa = torch.from_numpy(a_scales_u8).to(device="cuda", dtype=torch.uint8).view(torch.float8_e4m3fn)
     b_fp4 = torch.from_numpy(b_packed_u8).to(device="cuda", dtype=torch.uint8)
     sfb = torch.from_numpy(b_scales_u8).to(device="cuda", dtype=torch.uint8).view(torch.float8_e4m3fn)
+    b_fp4_pinned = b_fp4.cpu().pin_memory()
+    sfb_pinned = sfb.cpu().pin_memory()
 
     d_kernel = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
     asym_gemm.m_grouped_fp4_asym_gemm_nt_contiguous(
         (a_fp4, sfa),
-        (b_fp4, sfb),
+        (b_fp4_pinned, sfb),
         d_kernel,
         offsets_t,
         experts_t,
