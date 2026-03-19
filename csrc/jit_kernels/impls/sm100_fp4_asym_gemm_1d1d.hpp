@@ -95,6 +95,13 @@ static void sm100_m_grouped_fp4_asym_gemm_contiguous_1d1d(const torch::Tensor& a
     fprintf(stderr, "[FP4_LAUNCH] b shape=(%d,%d,%d), sfb shape=(%d,%d,%d)\n",
             (int)b.size(0), (int)b.size(1), (int)b.size(2),
             (int)sfb.size(0), (int)sfb.size(1), (int)sfb.size(2));
+    fprintf(stderr, "[FP4_LAUNCH] b device=%s pinned=%d, sfb device=%s pinned=%d\n",
+            b.is_cuda() ? "cuda" : "cpu", (int)b.is_pinned(),
+            sfb.is_cuda() ? "cuda" : "cpu", (int)sfb.is_pinned());
+    if (!b.is_cuda() || !sfb.is_cuda()) {
+        fprintf(stderr, "[FP4_LAUNCH][WARN] Using CPU/pinned tensors for FP4 TMA path on SM100; "
+                        "if TMA memory-domain mapping is unsupported, this may trigger illegal address.\n");
+    }
     fprintf(stderr, "[FP4_LAUNCH] d shape=(%d,%d)\n", (int)d.size(0), (int)d.size(1));
 
     const auto& aligned_k = align(k, 64);
@@ -137,11 +144,16 @@ static void sm100_m_grouped_fp4_asym_gemm_contiguous_1d1d(const torch::Tensor& a
                                                static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
                                                config.smem_config.swizzle_a_mode);
     fprintf(stderr, "[FP4_LAUNCH] TMA A done\n");
-    const auto& tensor_map_b = make_tma_b_desc(major_b, b, n, k_packed,
-                                               SM100ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n),
-                                               config.block_k / 2,
-                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
-                                               config.smem_config.swizzle_b_mode);
+    DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
+    const auto& tensor_map_b = make_tma_3d_desc(
+        b,
+        k_packed, n, num_groups,
+        config.block_k / 2,
+        SM100ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n),
+        1,
+        static_cast<int>(b.stride(-2)),
+        static_cast<int>(b.stride(-3)),
+        config.smem_config.swizzle_b_mode);
     fprintf(stderr, "[FP4_LAUNCH] TMA B done\n");
     const auto& tensor_map_cd = make_tma_cd_desc(d, m, n,
                                                  SM100ArchSpec::get_cd_store_block_m(config.block_m),
@@ -155,18 +167,23 @@ static void sm100_m_grouped_fp4_asym_gemm_contiguous_1d1d(const torch::Tensor& a
     constexpr int sf_elem_per_pack = 4;
     const int sf_packs_per_block_k = config.block_k / (sf_quant_k * sf_elem_per_pack);
     const int sf_factor = (sfa.scalar_type() == torch::kFloat) ? 1 : sf_elem_per_pack;
-    const int sfa_aligned_mn = get_tma_aligned_size(m, static_cast<int>(sfa.element_size()));
+    fprintf(stderr, "[FP4_LAUNCH] SF config: sf_quant_k=%d sf_elem_per_pack=%d sf_packs_per_block_k=%d sf_factor=%d\n",
+            sf_quant_k, sf_elem_per_pack, sf_packs_per_block_k, sf_factor);
+    // Use actual SF tensor MN dimensions (may differ from m/n if gran_mn > 1 and not broadcast)
+    const int sfa_mn = static_cast<int>(sfa.size(sfa.dim() - 2));
+    const int sfb_mn = static_cast<int>(sfb.size(sfb.dim() - 2));
+    const int sfa_aligned_mn = get_tma_aligned_size(sfa_mn, static_cast<int>(sfa.element_size()));
     const auto& tensor_map_sfa = make_tma_2d_desc(sfa,
                                                   sfa_aligned_mn, ceil_div(k, sf_quant_k * sf_factor),
                                                   config.block_m, sf_packs_per_block_k,
                                                   sfa_aligned_mn, 0, 0, false);
-    fprintf(stderr, "[FP4_LAUNCH] TMA SFA done\n");
-    const int sfb_aligned_mn = get_tma_aligned_size(n, static_cast<int>(sfb.element_size()));
+    fprintf(stderr, "[FP4_LAUNCH] TMA SFA done (sfa_mn=%d, aligned=%d)\n", sfa_mn, sfa_aligned_mn);
+    const int sfb_aligned_mn = get_tma_aligned_size(sfb_mn, static_cast<int>(sfb.element_size()));
     const auto& tensor_map_sfb = make_tma_2d_desc(sfb,
                                                   sfb_aligned_mn, ceil_div(k, sf_quant_k * sf_factor) * num_groups,
                                                   config.block_n, sf_packs_per_block_k,
                                                   sfb_aligned_mn, 0, 0, false);
-    fprintf(stderr, "[FP4_LAUNCH] TMA SFB done\n");
+    fprintf(stderr, "[FP4_LAUNCH] TMA SFB done (sfb_mn=%d, aligned=%d)\n", sfb_mn, sfb_aligned_mn);
 
     if (list_size <= 1) {
         fprintf(stderr, "[FP4_LAUNCH] list_size <= 1, early return\n");
@@ -312,11 +329,16 @@ static void sm100_m_grouped_fp4_asym_gemm_masked_1d1d(const torch::Tensor& a, co
                                                config.block_k / 2,
                                                static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), num_groups,
                                                config.smem_config.swizzle_a_mode);
-    const auto& tensor_map_b = make_tma_b_desc(major_b, b, n, k_packed,
-                                               SM100ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n),
-                                               config.block_k / 2,
-                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
-                                               config.smem_config.swizzle_b_mode);
+    DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
+    const auto& tensor_map_b = make_tma_3d_desc(
+        b,
+        k_packed, n, num_groups,
+        config.block_k / 2,
+        SM100ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n),
+        1,
+        static_cast<int>(b.stride(-2)),
+        static_cast<int>(b.stride(-3)),
+        config.smem_config.swizzle_b_mode);
     const auto& tensor_map_cd = make_tma_cd_desc(d, m, n,
                                                  SM100ArchSpec::get_cd_store_block_m(config.block_m),
                                                  SM100ArchSpec::get_cd_store_block_n(config.block_n),
@@ -328,12 +350,14 @@ static void sm100_m_grouped_fp4_asym_gemm_masked_1d1d(const torch::Tensor& a, co
     constexpr int sf_elem_per_pack = 4;
     const int sf_packs_per_block_k = config.block_k / (sf_quant_k * sf_elem_per_pack);
     const int sf_factor = (sfa.scalar_type() == torch::kFloat) ? 1 : sf_elem_per_pack;
-    const int sfa_aligned_mn = get_tma_aligned_size(m, static_cast<int>(sfa.element_size()));
+    const int sfa_mn = static_cast<int>(sfa.size(sfa.dim() - 2));
+    const int sfb_mn = static_cast<int>(sfb.size(sfb.dim() - 2));
+    const int sfa_aligned_mn = get_tma_aligned_size(sfa_mn, static_cast<int>(sfa.element_size()));
     const auto& tensor_map_sfa = make_tma_2d_desc(sfa,
                                                   sfa_aligned_mn, ceil_div(k, sf_quant_k * sf_factor) * num_groups,
                                                   config.block_m, sf_packs_per_block_k,
                                                   sfa_aligned_mn, 0, 0, false);
-    const int sfb_aligned_mn = get_tma_aligned_size(n, static_cast<int>(sfb.element_size()));
+    const int sfb_aligned_mn = get_tma_aligned_size(sfb_mn, static_cast<int>(sfb.element_size()));
     const auto& tensor_map_sfb = make_tma_2d_desc(sfb,
                                                   sfb_aligned_mn, ceil_div(k, sf_quant_k * sf_factor) * num_groups,
                                                   config.block_n, sf_packs_per_block_k,
