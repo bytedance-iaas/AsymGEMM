@@ -302,11 +302,57 @@ static void m_grouped_fp4_asym_gemm_nt_contiguous(const std::pair<torch::Tensor,
     constexpr int fp4_sf_quant_k = 16;
     const int sf_gran_k = std::get<2>(recipe.value());
     const int sf_replication = sf_gran_k / fp4_sf_quant_k;
-    const auto& sfa = broadcast_packed_ue8m0_sf(sfa_raw, sf_replication, m);
-    const auto& sfb = broadcast_packed_ue8m0_sf(sfb_raw, sf_replication, n);
+    auto sfa = broadcast_packed_ue8m0_sf(sfa_raw, sf_replication, m);
+    auto sfb = broadcast_packed_ue8m0_sf(sfb_raw, sf_replication, n);
+
+    // Broadcast SFs along MN when gran_mn > 1 (SF has reduced MN dimension).
+    // The kernel assumes SF MN dimension == data MN dimension.
+    const int gran_mn_a = std::get<0>(recipe.value());
+    const int gran_mn_b = std::get<1>(recipe.value());
+    if (gran_mn_a > 1 && static_cast<int>(sfa.size(-2)) < m) {
+        const auto idx = torch::arange(m, at::TensorOptions().device(sfa.device()).dtype(torch::kLong)).floor_divide_(gran_mn_a);
+        const auto broadcasted = sfa.index_select(-2, idx);
+        const int tma_aligned_mn = get_tma_aligned_size(m, static_cast<int>(sfa.element_size()));
+        const auto sf_k_dim = broadcasted.size(-1);
+        sfa = torch::empty_strided({m, sf_k_dim}, {1, tma_aligned_mn}, broadcasted.options());
+        sfa.copy_(broadcasted);
+    }
+    if (gran_mn_b > 1 && static_cast<int>(sfb.size(-2)) < n) {
+        const auto idx = torch::arange(n, at::TensorOptions().device(sfb.device()).dtype(torch::kLong)).floor_divide_(gran_mn_b);
+        const auto broadcasted = sfb.index_select(-2, idx);
+        const int tma_aligned_mn = get_tma_aligned_size(n, static_cast<int>(sfb.element_size()));
+        const auto sf_k_dim = broadcasted.size(-1);
+        sfb = torch::empty_strided({num_groups, n, sf_k_dim},
+                                   {tma_aligned_mn * sf_k_dim, 1, tma_aligned_mn}, broadcasted.options());
+        sfb.copy_(broadcasted);
+    }
     fprintf(stderr, "[FP4_ASYM_CONTIGUOUS] After SF broadcast: sfa=(%d,%d), sfb=(%d,%d,%d)\n",
             (int)sfa.size(0), (int)sfa.size(1),
             (int)sfb.size(0), (int)sfb.size(1), (int)sfb.size(2));
+    fprintf(stderr, "[FP4_ASYM_CONTIGUOUS] Tensor meta: A(device=%s,stride=[%ld,%ld]) "
+                    "B(device=%s,pinned=%d,stride=[%ld,%ld,%ld]) "
+                    "SFA(dtype=%d,device=%s,stride=[%ld,%ld]) "
+                    "SFB(dtype=%d,device=%s,pinned=%d,stride=[%ld,%ld,%ld])\n",
+            a.first.is_cuda() ? "cuda" : "cpu",
+            (long)a.first.stride(0), (long)a.first.stride(1),
+            b.first.is_cuda() ? "cuda" : "cpu",
+            (int)b.first.is_pinned(),
+            (long)b.first.stride(0), (long)b.first.stride(1), (long)b.first.stride(2),
+            (int)sfa.scalar_type(), sfa.is_cuda() ? "cuda" : "cpu",
+            (long)sfa.stride(0), (long)sfa.stride(1),
+            (int)sfb.scalar_type(), sfb.is_cuda() ? "cuda" : "cpu", (int)sfb.is_pinned(),
+            (long)sfb.stride(0), (long)sfb.stride(1), (long)sfb.stride(2));
+
+    // Kernel SFB TMA path uses kSFQuantK=16 and uint32 packs (4 SF bytes per pack) => 64-K elems per SF-pack index.
+    constexpr int kSFPackK = 16 * 4;
+    const int num_k_blocks = ceil_div(k, 512);
+    const int shape_sf_k = ceil_div(k, kSFPackK);
+    const int max_sf_k_idx = (num_k_blocks - 1) * (512 / kSFPackK);
+    const int max_outer_idx = (num_groups - 1) * shape_sf_k + max_sf_k_idx;
+    const long sfb_outer_dim = (sfb.dim() == 3) ? (long)(sfb.size(0) * sfb.size(2)) : (long)sfb.size(1);
+    fprintf(stderr, "[FP4_ASYM_CONTIGUOUS] SFB-index preflight: num_k_blocks=%d shape_sf_k=%d "
+                    "max_sf_k_idx=%d max_outer_idx=%d outer_dim=%ld\n",
+            num_k_blocks, shape_sf_k, max_sf_k_idx, max_outer_idx, sfb_outer_dim);
 
     fprintf(stderr, "[FP4_ASYM_CONTIGUOUS] Calling sm100_m_grouped_fp4_asym_gemm_contiguous_1d1d...\n");
     sm100_m_grouped_fp4_asym_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d,
@@ -348,8 +394,31 @@ static void m_grouped_fp4_asym_gemm_nt_masked(const std::pair<torch::Tensor, tor
     constexpr int fp4_sf_quant_k = 16;
     const int sf_gran_k = std::get<2>(recipe.value());
     const int sf_replication = sf_gran_k / fp4_sf_quant_k;
-    const auto& sfa = broadcast_packed_ue8m0_sf(sfa_raw, sf_replication, m);
-    const auto& sfb = broadcast_packed_ue8m0_sf(sfb_raw, sf_replication, n);
+    auto sfa = broadcast_packed_ue8m0_sf(sfa_raw, sf_replication, m);
+    auto sfb = broadcast_packed_ue8m0_sf(sfb_raw, sf_replication, n);
+
+    // Broadcast SFs along MN when gran_mn > 1 (SF has reduced MN dimension).
+    // The kernel assumes SF MN dimension == data MN dimension.
+    const int gran_mn_a = std::get<0>(recipe.value());
+    const int gran_mn_b = std::get<1>(recipe.value());
+    if (gran_mn_a > 1 && static_cast<int>(sfa.size(-2)) < m) {
+        const auto idx = torch::arange(m, at::TensorOptions().device(sfa.device()).dtype(torch::kLong)).floor_divide_(gran_mn_a);
+        const auto broadcasted = sfa.index_select(-2, idx);
+        const int tma_aligned_mn = get_tma_aligned_size(m, static_cast<int>(sfa.element_size()));
+        const auto sf_k_dim = broadcasted.size(-1);
+        sfa = torch::empty_strided({num_groups, m, sf_k_dim},
+                                   {tma_aligned_mn * sf_k_dim, 1, tma_aligned_mn}, broadcasted.options());
+        sfa.copy_(broadcasted);
+    }
+    if (gran_mn_b > 1 && static_cast<int>(sfb.size(-2)) < n) {
+        const auto idx = torch::arange(n, at::TensorOptions().device(sfb.device()).dtype(torch::kLong)).floor_divide_(gran_mn_b);
+        const auto broadcasted = sfb.index_select(-2, idx);
+        const int tma_aligned_mn = get_tma_aligned_size(n, static_cast<int>(sfb.element_size()));
+        const auto sf_k_dim = broadcasted.size(-1);
+        sfb = torch::empty_strided({num_groups, n, sf_k_dim},
+                                   {tma_aligned_mn * sf_k_dim, 1, tma_aligned_mn}, broadcasted.options());
+        sfb.copy_(broadcasted);
+    }
 
     sm100_m_grouped_fp4_asym_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, offsets_t, experts_t, list_size, expected_m,
                                               num_groups, m, n, k, major_a, major_b, compiled_dims);

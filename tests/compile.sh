@@ -15,8 +15,8 @@
 #     -L/usr/local/cuda/lib64 \
 #     -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -lcudart \
 #     -std=c++17 --expt-relaxed-constexpr --use_fast_math > compile.log 2>&1
-rm asymCompKernelMain_fp8_debug
-/usr/local/cuda-12.9/bin/nvcc -arch=sm_90 -O3 asymCompKernelMain_fp8_debug.cu -o asymCompKernelMain_fp8_debug \
+rm asymCompKernelMain_fp4
+/usr/local/cuda-12.9/bin/nvcc -arch=sm_90 -O3 asymCompKernelMain_fp4.cu -o asymCompKernelMain_fp4 \
   -I/sgl-workspace/sglang/sgl-kernel/csrc/moe/asymCompute_moe/flash-attention/csrc/flash_attn \
   -I/sgl-workspace/sglang/sgl-kernel/csrc/moe/asymCompute_moe/flash-attention/csrc/flash_attn/src \
   -I/sgl-workspace/sglang/demo/AsymGEMM/third-party/cutlass/include \
