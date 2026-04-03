@@ -408,7 +408,10 @@ int main(int argc, char** argv) {
     std::vector<ShapeConfig> shapes = {
         {4,  2048, 4096, 7168},
         {4,  8192, 7168, 2048},
+        {8,  4096, 4096, 7168},
         {8,  4096, 7168, 2048},
+        {16, 2048, 7168, 2048},
+        {32, 1024, 7168, 2048},
     };
 
     bool check_correctness = true;
