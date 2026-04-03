@@ -75,33 +75,11 @@ def test_gemm() -> None:
 def test_m_grouped_gemm_contiguous() -> None:
     print('Testing m-grouped contiguous GEMM:')
 
+    # Use the pairs-format builder that matches asymScheduler's expected layout:
+    # offsets = [start_0, end_0, start_1, end_1, ...]
+    # The scheduler reads offsets[blockIdx.y * 2] and offsets[blockIdx.y * 2 + 1].
     def build_offsets_experts_from_m_indices(m_indices: torch.Tensor, num_groups: int):
-        m_indices_cpu = m_indices.to('cpu', torch.int32).contiguous()
-        m_list = m_indices_cpu.tolist()
-        m = len(m_list)
-        capacity = num_groups + 1
-
-        offsets = []
-        experts = []
-        if m > 0:
-            if m_list[0] != -1:
-                offsets.append(0)
-                experts.append(m_list[0])
-            for i in range(1, m):
-                if m_list[i] != m_list[i - 1] and m_list[i] != -1:
-                    offsets.append(i)
-                    experts.append(m_list[i])
-
-        offsets.append(m)
-        experts.append(-1)
-
-        offsets = offsets[:capacity]
-        experts = experts[:capacity]
-        list_size = len(offsets)
-
-        offsets_t = torch.tensor(offsets, dtype=torch.int32, device=m_indices.device)
-        experts_t = torch.tensor(experts, dtype=torch.int32, device=m_indices.device)
-        return offsets_t, experts_t, list_size
+        return build_offsets_experts_from_m_indices_pairs(m_indices)
 
     def build_groundtruth_from_original(a_bf16: torch.Tensor, b_bf16: torch.Tensor, m_indices: torch.Tensor):
         gt = torch.zeros((a_bf16.size(0), b_bf16.size(1)), device=a_bf16.device, dtype=torch.bfloat16)
