@@ -197,7 +197,6 @@ def test_m_grouped_gemm_contiguous() -> None:
         groundtruth = build_groundtruth_from_original(a_bf16, b_bf16, m_indices)
         d_deep = torch.empty_like(d_asym)
         offsets, experts, list_size = build_offsets_experts_from_m_indices(m_indices, num_groups)
-        import ipdb;ipdb.set_trace()
 
         asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(
             a, b, d_asym, offsets, experts, list_size,
@@ -436,19 +435,19 @@ def test_m_grouped_gemm_masked() -> None:
             asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(a, b, d_asym, offsets, experts, list_size, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
 
         # Test performance with fixed shapes
-        # valid_m = masked_m.sum().item()
-        # t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
-        # t_asym = bench_kineto(test_func_asym, 'asym_gemm', suppress_kineto_output=True)
-        
-        # print(f' > Perf ({num_groups=}, expected_m={expected_m_per_group:4}, n={n:4}, k={k:4}, {kernel_opt}): ')
-        # if t > 0:
-        #     print(f'   Baseline: {t * 1e6:4.0f} us | {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS')
-        # else:
-        #     print(f'   Baseline: bench_kineto returned 0, skip')
-        # if t_asym > 0:
-        #     print(f'   Asym:     {t_asym * 1e6:4.0f} us | {2 * valid_m * n * k / t_asym / 1e12:4.0f} TFLOPS')
-        # else:
-        #     print(f'   Asym:     bench_kineto returned 0, skip')
+        valid_m = int(masked_m.sum().item())
+        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+        t_asym = bench_kineto(test_func_asym, 'asym_gemm', suppress_kineto_output=True)
+
+        print(f' > Perf ({num_groups=}, expected_m={expected_m_per_group:4}, n={n:4}, k={k:4}, {kernel_opt}): ')
+        if t > 0:
+            print(f'   Baseline: {t * 1e6:4.0f} us | {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS')
+        else:
+            print(f'   Baseline: bench_kineto returned 0, skip')
+        if t_asym > 0:
+            print(f'   Asym:     {t_asym * 1e6:4.0f} us | {2 * valid_m * n * k / t_asym / 1e12:4.0f} TFLOPS')
+        else:
+            print(f'   Asym:     bench_kineto returned 0, skip')
     print()
 
 
@@ -497,7 +496,7 @@ if __name__ == '__main__':
     print('Library path:')
     print(f' > {asym_gemm.__path__}\n')
 
-    # test_gemm()
+    # test_gemm()  # requires fp8_gemm_nt which is not in this module version
     test_m_grouped_gemm_contiguous()
-    # test_m_grouped_gemm_masked()
-    # test_k_grouped_gemm_contiguous()
+    test_m_grouped_gemm_masked()
+    # test_k_grouped_gemm_contiguous()  # requires k_grouped functions not in this module
