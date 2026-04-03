@@ -89,39 +89,18 @@ static void sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d(const torch::Tensor& a
                                                      const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                      const std::string& compiled_dims) {
     const auto& aligned_k = align(k, 128);
+    const int num_sms = device_runtime->get_num_sms();
 
-    // const int block_m = 128;
-    // const int block_n = 128;
-    // const int block_k = 64;
-
-    // const auto& config = get_best_config<SM100ArchSpec>(
-    //     GemmType::MGroupedContiguous, KernelType::Kernel1D1D,
-    //     // NOTES: `num_groups` is 1, since the contiguous layout is seen as a whole
-    //     m, n, k, 1, major_a, major_b,
-    //     torch::kFloat8_e4m3fn, d.scalar_type(), false,
-    //     device_runtime->get_num_sms());
-
-    const int block_m = 128;
-    const int block_n = 128;
-    const int block_k = 512;
-
-    const bool use_manual_config = block_m > 0 or block_n > 0 or block_k > 0;
-    if (use_manual_config)
-        DG_HOST_ASSERT(block_m > 0 and block_n > 0 and block_k > 0);
-    const auto& config = use_manual_config
-        ? get_manual_config_asym<SM100ArchSpec>(
-            GemmType::MGroupedContiguous, KernelType::Kernel1D1D,
-            // NOTES: `num_groups` is 1, since the contiguous layout is seen as a whole
-            m, n, k, 1, major_a, major_b,
-            torch::kFloat8_e4m3fn, d.scalar_type(), false,
-            device_runtime->get_num_sms(),
-            block_m, block_n, block_k)
-        : get_best_config_asym<SM100ArchSpec>(
-            GemmType::MGroupedContiguous, KernelType::Kernel1D1D,
-            // NOTES: `num_groups` is 1, since the contiguous layout is seen as a whole
-            m, n, k, 1, major_a, major_b,
-            torch::kFloat8_e4m3fn, d.scalar_type(), false,
-            device_runtime->get_num_sms());
+    // Shape-adaptive tile selection for GB200 (132 SMs).
+    // The auto-tuner scores configs by block_n * block_k * SM_wave_efficiency,
+    // but we can also force specific configs via env vars DG_BLOCK_M/N/K.
+    // Use get_best_config_asym which now correctly accounts for wave efficiency
+    // and includes block_n candidates 192 and 224.
+    const auto& config = get_best_config_asym<SM100ArchSpec>(
+        GemmType::MGroupedContiguous, KernelType::Kernel1D1D,
+        m, n, k, num_groups, major_a, major_b,
+        torch::kFloat8_e4m3fn, d.scalar_type(), false,
+        num_sms);
 
 
     // Create tensor descriptors
@@ -252,25 +231,11 @@ static void sm100_m_grouped_fp8_asym_gemm_masked_1d1d(const torch::Tensor& a, co
                                                  const std::string& compiled_dims) {
     const auto& aligned_k = align(k, 128);
 
-    const int block_m = 128;
-    const int block_n = 128;
-    const int block_k = 512;
-
-    const bool use_manual_config = block_m > 0 or block_n > 0 or block_k > 0;
-    if (use_manual_config)
-        DG_HOST_ASSERT(block_m > 0 and block_n > 0 and block_k > 0);
-    const auto& config = use_manual_config
-        ? get_manual_config_asym<SM100ArchSpec>(
-            GemmType::MGroupedMasked, KernelType::Kernel1D1D,
-            expected_m, n, k, num_groups, major_a, major_b,
-            torch::kFloat8_e4m3fn, d.scalar_type(), false,
-            device_runtime->get_num_sms(),
-            block_m, block_n, block_k)
-        : get_best_config_asym<SM100ArchSpec>(
-            GemmType::MGroupedMasked, KernelType::Kernel1D1D,
-            expected_m, n, k, num_groups, major_a, major_b,
-            torch::kFloat8_e4m3fn, d.scalar_type(), false,
-            device_runtime->get_num_sms());
+    const auto& config = get_best_config_asym<SM100ArchSpec>(
+        GemmType::MGroupedMasked, KernelType::Kernel1D1D,
+        expected_m, n, k, num_groups, major_a, major_b,
+        torch::kFloat8_e4m3fn, d.scalar_type(), false,
+        device_runtime->get_num_sms());
 
     // Create tensor descriptors with num_groups for grouped layout
     const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,

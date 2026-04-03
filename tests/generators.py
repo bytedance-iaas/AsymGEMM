@@ -3,7 +3,7 @@ import random
 import torch
 from typing import Generator, List, Optional, Tuple
 
-from deep_gemm.testing import get_arch_major
+from asym_gemm.testing.utils import get_arch_major
 from asym_gemm.utils import (
     align, ceil_div,
     per_token_cast_to_fp8, per_channel_cast_to_fp8, per_block_cast_to_fp8,
@@ -145,7 +145,14 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
 
 def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
     for kernel_type in get_kernel_types(dtype):
-        for num_groups, expected_m_per_group, n, k in ((4, 8192, 4096, 512), (4, 8192, 7168, 2048), (8, 4096, 4096, 7168), (8, 4096, 7168, 2048)):
+        for num_groups, expected_m_per_group, n, k in (
+            # Standard MoE shapes (4-8 experts, dense)
+            (4,  8192, 4096,  512), (4,  8192, 7168, 2048),
+            (8,  4096, 4096, 7168), (8,  4096, 7168, 2048),
+            # Larger expert counts (stress wave efficiency)
+            (16, 2048, 4096, 7168), (16, 2048, 7168, 2048),
+            (32, 1024, 4096, 7168), (32, 1024, 7168, 2048),
+        ):
             for major_a, major_b in get_major_ab(False, get_arch_major() != 9 or dtype != torch.float8_e4m3fn):
                 yield kernel_type, num_groups, expected_m_per_group, n, k, major_a, major_b
 

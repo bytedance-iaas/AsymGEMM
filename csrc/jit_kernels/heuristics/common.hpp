@@ -444,7 +444,7 @@ static GemmConfig get_best_config_asym(const GemmType& gemm_type, const KernelTy
     if (gemm_type == GemmType::MGroupedMasked)  // Exclude 256 for performance
         block_ms = std::vector{64, 128};
     // auto block_ns = ArchSpec::get_block_n_candidates(kernel_type, cd_dtype);
-    auto block_ns = std::vector{64, 128};
+    auto block_ns = std::vector{64, 128, 192, 224};
 
     // Optional manual overrides
     const int env_block_m = get_env<int>("DG_BLOCK_M", 0);
@@ -464,7 +464,8 @@ static GemmConfig get_best_config_asym(const GemmType& gemm_type, const KernelTy
     MulticastConfig best_multicast_config = {1, false};
     SharedMemoryConfig best_smem_config;
     const int& ab_elem_size = static_cast<int>(c10::elementSize(ab_dtype));
-    const int block_k_step = 16 / ab_elem_size;
+    // FP8 requires BLOCK_K % 128 == 0 (SF granularity), so step by 128 to skip invalid values
+    const int block_k_step = (ab_dtype == torch::kFloat8_e4m3fn) ? 128 : (16 / ab_elem_size);
     const int max_block_k_by_swizzle = is_asym
         ? 512 / ab_elem_size
         : ((major_a == cute::UMMA::Major::K or major_b == cute::UMMA::Major::K)
@@ -517,7 +518,6 @@ static GemmConfig get_best_config_asym(const GemmType& gemm_type, const KernelTy
                                                                   fixed_num_stages, multicast_config,
                                                                   true);
                 if (candidate_smem_config.smem_size <= smem_capacity) {
-                    printf("candidate_smem_config.smem_size: %d", candidate_smem_config.smem_size);
                     candidate_block_k = block_k;
                     break;
                 }
@@ -525,14 +525,17 @@ static GemmConfig get_best_config_asym(const GemmType& gemm_type, const KernelTy
             if (candidate_block_k == 0)
                 continue;
 
+            // Prefer larger block_k first (more compute per load amortizes memory latency),
+            // then larger block_n, then larger block_m as tie-breakers.
             bool success = false;
             if (best_block_k == 0 or candidate_block_k > best_block_k) {
                 success = true;
             } else if (candidate_block_k == best_block_k) {
-                // Prefer larger block_n (and then block_m) when block_k ties.
-                success = block_n > best_block_n;
-                if (block_n == best_block_n)
-                    success |= block_m > best_block_m;
+                if (block_n > best_block_n) {
+                    success = true;
+                } else if (block_n == best_block_n) {
+                    success = block_m > best_block_m;
+                }
             }
 
             if (success) {
@@ -547,7 +550,12 @@ static GemmConfig get_best_config_asym(const GemmType& gemm_type, const KernelTy
     DG_HOST_ASSERT(best_block_m > 0 and best_block_n > 0 and best_block_k > 0);
 
     // Some util functions
-    const auto& get_num_blocks = [=](const int& block_m, const int& block_n) {
+    // For asym grouped GEMMs (contiguous/masked), the actual CTA grid is
+    // (ceil(n/block_n), num_groups) because each CTA sweeps all M-blocks internally.
+    // For all other GEMM types the standard formula applies.
+    const auto& get_num_blocks = [=](const int& block_m, const int& block_n) -> int {
+        if (gemm_type == GemmType::MGroupedContiguous or gemm_type == GemmType::MGroupedMasked)
+            return ceil_div(n, block_n) * num_groups;
         return ceil_div(m, block_m) * ceil_div(n, block_n) * num_groups;
     };
     const auto& get_num_waves = [=](const int& block_m, const int& block_n) {
@@ -559,7 +567,7 @@ static GemmConfig get_best_config_asym(const GemmType& gemm_type, const KernelTy
     // NOTES: less L2 cache usage and less GPU frequency drop
     int num_min_sms = num_sms;
     if (ArchSpec::should_minimize_num_sms()) {
-        num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, best_num_waves);
+        num_min_sms = ceil_div(get_num_blocks(best_block_m, best_block_n), best_num_waves);
         num_min_sms = align(num_min_sms, best_multicast_config.num_multicast);
         DG_HOST_ASSERT(num_min_sms <= num_sms);
     }
