@@ -202,6 +202,14 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = asymScheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs>(shape_m, shape_n, experts, offsets);
 
+    // Skip inactive experts (marked with -1 in the experts array).
+    // Must free TMEM before returning to avoid cudaErrorTensorMemoryLeak.
+    if (!scheduler.valid) {
+        if (warp_idx == 2)
+            Allocator().free(0, kNumTmemCols);
+        return;
+    }
+
     // Pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0, tensor_core_phase = 0, phase_b = 0;
     auto advance_pipeline = [&](uint32_t& block_idx) {

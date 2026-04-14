@@ -555,14 +555,12 @@ static GemmConfig get_best_config_asym(const GemmType& gemm_type, const KernelTy
     };
     const int best_num_waves = get_num_waves(best_block_m, best_block_n);
 
-    // Recompute the minimal number of SMs required
-    // NOTES: less L2 cache usage and less GPU frequency drop
-    int num_min_sms = num_sms;
-    if (ArchSpec::should_minimize_num_sms()) {
-        num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, best_num_waves);
-        num_min_sms = align(num_min_sms, best_multicast_config.num_multicast);
-        DG_HOST_ASSERT(num_min_sms <= num_sms);
-    }
+    // Skip SM minimization for asym GEMMs: weights reside on CPU and are
+    // streamed via NVLink C2C, so the L2 cache savings from fewer SMs do not
+    // apply.  Additionally, the heuristic's num_blocks uses num_groups=1 for
+    // contiguous layout, but the actual grid includes the expert dimension,
+    // so the minimized SM count is far too low.
+    int num_min_sms = align(num_sms, best_multicast_config.num_multicast);
 
     const auto& config = GemmConfig {
         .gemm_type = gemm_type,
@@ -589,27 +587,6 @@ static GemmConfig get_best_config_asym(const GemmType& gemm_type, const KernelTy
     if (config.tc_util < 100)
         DG_HOST_ASSERT(device_runtime->get_arch_major() == 10 and ab_dtype == torch::kBFloat16);
 
-    // Print configs for the first time
-    if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
-        auto key = std::make_tuple(gemm_type, kernel_type, m, n, k, num_groups, major_a, major_b,
-                                   ab_dtype, cd_dtype, with_accumulation, num_sms);
-        static std::set<decltype(key)> printed;
-        if (printed.count(key) == 0) {
-            printf("GEMM type: %d, kernel type: %d, M: %d, N: %d, K: %d, groups: %d, "
-                   "A major: %d, B major: %d, AB dtype: %s, CD dtype: %s, accumulation: %d, "
-                   "SM limit: %d -> block M: %d, block N: %d, block K: %d, stages: %d, last stages: %d, "
-                   "SMs: %d, multicast: %d, multicast on A: %d, shared memory: %d bytes, swizzle A: %d, "
-                   "swizzle B: %d, swizzle CD: %d, SMs: %d, threads: %d, TC util: %d%%\n",
-                   static_cast<int>(gemm_type), static_cast<int>(kernel_type), m, n, k, num_groups,
-                   static_cast<int>(major_a), static_cast<int>(major_b), c10::toString(ab_dtype), c10::toString(cd_dtype),
-                   static_cast<int>(with_accumulation), num_sms, best_block_m, best_block_n, best_block_k,
-                   fixed_num_stages, config.num_last_stages, num_min_sms, best_multicast_config.num_multicast,
-                   static_cast<int>(best_multicast_config.is_multicast_on_a),
-                   best_smem_config.smem_size, best_smem_config.swizzle_a_mode, best_smem_config.swizzle_b_mode,
-                   best_smem_config.swizzle_cd_mode, config.num_sms, config.thread_config.num_threads, config.tc_util);
-            printed.insert(key);
-        }
-    }
     return config;
 }
 
@@ -669,13 +646,8 @@ static GemmConfig get_manual_config_asym(const GemmType& gemm_type, const Kernel
     };
     const int best_num_waves = get_num_waves(block_m, block_n);
 
-    // Recompute the minimal number of SMs required
-    int num_min_sms = num_sms;
-    if (ArchSpec::should_minimize_num_sms()) {
-        num_min_sms = ceil_div(ceil_div(m, block_m) * ceil_div(n, block_n) * num_groups, best_num_waves);
-        num_min_sms = align(num_min_sms, multicast_config.num_multicast);
-        DG_HOST_ASSERT(num_min_sms <= num_sms);
-    }
+    // Skip SM minimization for asym GEMMs (same rationale as get_best_config_asym)
+    int num_min_sms = align(num_sms, multicast_config.num_multicast);
 
     const auto& config = GemmConfig {
         .gemm_type = gemm_type,

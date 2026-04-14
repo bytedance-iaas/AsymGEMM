@@ -15,6 +15,13 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
     const auto& gran_k = std::get<2>(recipe);
     const auto& arch_major = device_runtime->get_arch_major();
 
+    // Fast path: pre-converted INT scales from a prior transform call.
+    // Check BEFORE the general shape validation (which expects the unconverted shape).
+    if (sf.scalar_type() == torch::kInt and gran_mn > 1 and (gran_k == 128 or gran_k == 256) and arch_major == 10) {
+        if (sf.size(-2) == mn and sf.size(-1) == ceil_div(ceil_div(k, gran_k), 4))
+            return sf;
+    }
+
     // Pre-transform checks
     check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups);
 

@@ -75,12 +75,27 @@ struct asymScheduler {
     uint32_t current_shape_k, current_num_valid_groups = 0, current_k_cumsum = 0, current_sf_k_cumsum = 0;
     uint32_t next_group_idx, next_shape_k;
 
+    // Whether this block has a valid expert assignment (inactive slots have expert_id == -1)
+    bool valid = true;
+
     // ReSharper disable once CppPossiblyUninitializedMember
     __device__ __forceinline__ explicit asymScheduler(const uint32_t& shape_m, const uint32_t& shape_n,
                                                   uint32_t* experts, uint32_t* offsets) {
         blocks_perExpert = ceil_div_device(shape_n, BLOCK_N);
 
-        expert_id = experts[blockIdx.y];
+        // Read expert_id as signed int to detect -1 sentinel for inactive experts
+        int signed_expert_id = reinterpret_cast<int*>(experts)[blockIdx.y];
+        if (signed_expert_id < 0) {
+            valid = false;
+            expert_id = 0;
+            m_start = 0;
+            m_end = 0;
+            n_start = 0;
+            n_idx = 0;
+            current_group_idx = 0;
+            return;
+        }
+        expert_id = static_cast<uint32_t>(signed_expert_id);
         n_start = expert_id * blocks_perExpert;
 
         // offsets array is laid out as pairs: [start_0, end_0, start_1, end_1, ...]

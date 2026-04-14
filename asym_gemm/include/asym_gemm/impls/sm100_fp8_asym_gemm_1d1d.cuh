@@ -214,6 +214,15 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
     // Block scheduler: BF16-style B-centric traversal.
     auto scheduler = asymScheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs>(
         shape_m, shape_n, experts, offsets);
+
+    // Skip inactive experts (marked with -1 in the experts array).
+    // Must free TMEM before returning to avoid cudaErrorTensorMemoryLeak.
+    if (!scheduler.valid) {
+        if (warp_idx == 2)
+            Allocator().free(0, kNumTmemCols);
+        return;
+    }
+
     const uint32_t num_total_k_blocks = ceil_div_device(shape_k, BLOCK_K);
 
     // Pipeline and TMA phases
