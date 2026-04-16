@@ -49,7 +49,9 @@ get_default_recipe(const torch::ScalarType& sfa_dtype, const torch::ScalarType& 
         DG_HOST_ASSERT(sfa_dtype == torch::kFloat and sfb_dtype == torch::kFloat);
         return {1, 128, 128};
     } else if (arch_major == 10) {
-        DG_HOST_ASSERT(sfb_dtype == torch::kFloat or sfb_dtype == torch::kInt);
+        DG_HOST_ASSERT(sfb_dtype == torch::kFloat or sfb_dtype == torch::kInt or sfb_dtype == torch::kFloat8_e4m3fn);
+        if (sfb_dtype == torch::kFloat8_e4m3fn)
+            return {1, 1, 16};              // FP4 native E4M3 scales
         return sfb_dtype == torch::kFloat ?
             std::make_tuple(1, 128, 128):   // Legacy format
             std::make_tuple(1,   1, 128);   // 1D1D kernels
