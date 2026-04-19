@@ -258,7 +258,9 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
             for (uint32_t block_m_iter = scheduler.m_start; block_m_iter < scheduler.m_end; advance_pipeline(block_m_iter)) {
                 // Compute offsets
                 // NOTES: the group is always concatenated with the outer dimension
-                uint32_t m_idx = block_m_iter * BLOCK_M;
+                uint32_t m_idx = (kGemmType == GemmType::MGroupedMasked) 
+                                 ? (scheduler.current_group_idx * shape_m + (block_m_iter - scheduler.m_start) * BLOCK_M)
+                                 : (block_m_iter * BLOCK_M);
                 // Wait consumer release
                 empty_barriers[stage_idx]->wait(phase ^ 1);
 
@@ -739,7 +741,9 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                         cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
                         // The pipeline stage
-                        const auto m_idx = BLOCK_M * block_m_iter + w * WAVE_BLOCK_M;
+                        const auto m_idx = (kGemmType == GemmType::MGroupedMasked)
+                            ? (scheduler.current_group_idx * shape_m + (block_m_iter - scheduler.m_start) * BLOCK_M + w * WAVE_BLOCK_M)
+                            : (BLOCK_M * block_m_iter + w * WAVE_BLOCK_M);
                         const auto n_idx = blockIdx.x * BLOCK_N + s * STORE_BLOCK_N;
 
                         // Store into shared memory
