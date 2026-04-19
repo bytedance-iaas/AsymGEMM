@@ -51,7 +51,11 @@ struct asymScheduler {
     uint32_t num_m_blocks;
     uint32_t num_n_blocks;
 
-    // asym
+    // asym - per-expert offset pairs for M dimension
+    // offsets array is laid out as: [start_0, end_0, start_1, end_1, ..., start_N, end_N]
+    // For each expert blockIdx.y, reads offsets[blockIdx.y*2] and offsets[blockIdx.y*2+1]
+    // m_start = ceil_div(offsets[blockIdx.y*2], BLOCK_M)
+    // m_end = ceil_div(offsets[blockIdx.y*2+1], BLOCK_M)
     uint32_t m_start, m_end;
     uint32_t n_start, n_end;
     uint32_t expert_id;
@@ -78,9 +82,12 @@ struct asymScheduler {
 
         expert_id = experts[blockIdx.y];
         n_start = expert_id * blocks_perExpert;
-        
-        m_start = ceil_div_device(offsets[blockIdx.y], BLOCK_M);
-        m_end = ceil_div_device(offsets[blockIdx.y + 1], BLOCK_M);
+
+        // offsets array is laid out as pairs: [start_0, end_0, start_1, end_1, ...]
+        // blockIdx.y indexes into the experts array; multiply by 2 to get offset pair index
+        uint32_t offset_pair_idx = blockIdx.y * 2;
+        m_start = ceil_div_device(offsets[offset_pair_idx], BLOCK_M);
+        m_end = ceil_div_device(offsets[offset_pair_idx + 1], BLOCK_M);
 
         // B is laid out as [group, n, k], so N offset must use expert_id (group id),
         // not blockIdx.y (segment id in offsets/experts list).
@@ -88,7 +95,8 @@ struct asymScheduler {
         current_group_idx = expert_id;
 
         // if (threadIdx.x == 0 && blockIdx.x == 0)
-        //     printf("BLOCK_M: %d, BLOCK_N: %d, m_start: %d, m_end: %d, offsets[blockIdx.y]: %d, offsets[blockIdx.y + 1]: %d \n", BLOCK_M, BLOCK_N, m_start, m_end, offsets[blockIdx.y], offsets[blockIdx.y + 1]); 
+        //     printf("BLOCK_M: %d, BLOCK_N: %d, blockIdx.y: %d, offset_pair_idx: %d, m_start: %d, m_end: %d, offsets[%d]: %d, offsets[%d]: %d \n",
+        //            BLOCK_M, BLOCK_N, blockIdx.y, offset_pair_idx, m_start, m_end, offset_pair_idx, offsets[offset_pair_idx], offset_pair_idx + 1, offsets[offset_pair_idx + 1]);
     }
 
     // template <bool kWithGroupOffset, IndexType kIndexType = IndexType::MN>

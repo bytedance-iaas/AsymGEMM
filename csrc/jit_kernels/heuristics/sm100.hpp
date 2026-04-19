@@ -71,6 +71,17 @@ struct SM100ArchSpec {
         if (block_n % 16 != 0)
             return false;
 
+        // FP8 kernel requires BLOCK_K % 128 == 0 (SF granularity)
+        // and kNumSFPerPack (4) % kSFAtomsPerBlockK (block_k/128) == 0,
+        // so valid values are block_k ∈ {128, 256, 512}.
+        if (ab_dtype == torch::kFloat8_e4m3fn) {
+            if (block_k % 128 != 0)
+                return false;
+            const int sf_atoms = block_k / 128;
+            if (sf_atoms == 0 or 4 % sf_atoms != 0)
+                return false;
+        }
+
         // Performance is lower with 1D1D and `block_m == 256`
         if (kernel_type == KernelType::Kernel1D1D and major_b == cute::UMMA::Major::K and block_m > 128)
             return false;

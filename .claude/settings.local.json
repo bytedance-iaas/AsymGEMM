@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader)",
+      "Bash(python3 -c \"import asym_gemm; print\\('OK'\\)\")",
+      "Bash(python3:*)",
+      "Bash(tee /tmp/phase3_results.log)",
+      "Bash(bash install.sh)",
+      "Bash(tee /tmp/phase3b_results.log)",
+      "Bash(grep -h \"kNumSMs\" /home/shutianluo/.asym_gemm/cache/*/kernel.cu)",
+      "Bash(kill 336572)",
+      "Bash(kill 321452)",
+      "Bash(bash compile.sh)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(./asymCompKernelMain_fp8)",
+      "Bash(strace -p 350240 -e trace=write -c)",
+      "Bash(kill %1)",
+      "Bash(wait)",
+      "Bash(nvidia-smi)",
+      "Bash(kill 350240)",
+      "Bash(./asymCompKernelMain_fp8 --no-check)",
+      "Bash(ncu --target-processes all --kernel-name \"sm100_fp8_asym_gemm\" --launch-count 1 --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed,sm__sass_thread_inst_executed_op_ffma_pred_on.sum,sm__warps_active.avg.pct_of_peak_sustained_active ./asymCompKernelMain_fp8 --no-check)",
+      "Bash(ncu --target-processes all --kernel-name \"sm100_fp8_asym_gemm_1d1d_impl\" --launch-skip 5 --launch-count 1 --set full ./asymCompKernelMain_fp8 --no-check)",
+      "Bash(ls /tmp/deepgemm_jit/cache/kernel.sm100_m_grouped_fp8_asym_gemm_contiguous*/*.cubin)"
+    ]
+  }
+}
