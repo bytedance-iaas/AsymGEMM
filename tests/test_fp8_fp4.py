@@ -112,7 +112,6 @@ def test_m_grouped_gemm_masked() -> None:
 
 
             # Construct full cases
-            offsets, experts, list_size = build_offsets_experts_from_masked_m(masked_m, num_groups, max_m)
             d_asym = torch.empty_like(d)
 
             # noinspection PyShadowingNames
@@ -134,7 +133,7 @@ def test_m_grouped_gemm_masked() -> None:
 
             # noinspection PyShadowingNames
             def test_func_asym():
-                asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(a, b, d_asym, offsets, experts, list_size, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+                asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(a, b, d_asym, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
 
 
             test_func()

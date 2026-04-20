@@ -214,6 +214,15 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
     // Block scheduler: BF16-style B-centric traversal.
     auto scheduler = asymScheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs>(
         shape_m, shape_n, experts, offsets);
+
+    // Early-exit for inactive expert slots in the masked layout.
+    // With gridDim.y == num_groups (constant), slots whose token count is zero must
+    // return immediately. Safe here: cluster_sync() has completed and no TMA or TMEM
+    // barriers have been armed yet, so no barrier is left in an un-arrived state.
+    if constexpr (kGemmType == GemmType::MGroupedMasked) {
+        if (scheduler.m_end == 0) return;
+    }
+
     const uint32_t num_total_k_blocks = ceil_div_device(shape_k, BLOCK_K);
 
     // Pipeline and TMA phases
