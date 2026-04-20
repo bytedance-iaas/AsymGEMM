@@ -296,8 +296,9 @@ public:
         GemmConfig gemm_config;
         LaunchArgs launch_args;
 
-        void* offsets;
-        void* experts;
+        // masked_m: int32 device pointer with shape [num_groups], token count per group.
+        // Passed to the kernel as the `offsets` argument; `experts` is unused (nullptr).
+        void* masked_m;
 
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
@@ -341,7 +342,7 @@ static void __instantiate_kernel() {{
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.offsets, args.experts,
+            args.masked_m, nullptr,   // offsets=masked_m, experts=nullptr (unused)
             args.m, args.n, args.k,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_cd));
@@ -351,9 +352,7 @@ static void __instantiate_kernel() {{
 static void sm100_m_grouped_bf16_asym_gemm_masked(const torch::Tensor& a,
                                              const torch::Tensor& b,
                                              const torch::Tensor& d,
-                                             const torch::Tensor& offsets_t,
-                                             const torch::Tensor& experts_t,
-                                             const int& list_size,
+                                             const torch::Tensor& masked_m_t,
                                              const int& expected_m,
                                              const int& num_groups, const int& m, const int& n, const int& k,
                                              const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
@@ -395,16 +394,16 @@ static void sm100_m_grouped_bf16_asym_gemm_masked(const torch::Tensor& a,
                                                  static_cast<int>(d.stride(-2)), num_groups,
                                                  config.smem_config.swizzle_cd_mode);
 
-    // Launch with masked configuration
+    // Launch with masked configuration. gridDim.y == num_groups (constant) so this
+    // launch is CUDA-graph safe: the grid dimension does not depend on routing.
     const SM100BF16AsymGemmMaskedRuntime::Args& args = {
         .m = m, .n = n, .k = aligned_k,
         .compiled_dims = compiled_dims,
         .gemm_config = config,
-        .launch_args = LaunchArgs({ceil_div(n, config.block_n), list_size - 1}, config.thread_config.num_threads,
+        .launch_args = LaunchArgs({ceil_div(n, config.block_n), num_groups}, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .offsets = offsets_t.data_ptr<int>(),
-        .experts = experts_t.data_ptr<int>(),
+        .masked_m = masked_m_t.data_ptr<int>(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd

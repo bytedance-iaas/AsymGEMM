@@ -80,23 +80,32 @@ struct asymScheduler {
                                                   uint32_t* experts, uint32_t* offsets) {
         blocks_perExpert = ceil_div_device(shape_n, BLOCK_N);
 
-        expert_id = experts[blockIdx.y];
-        n_start = expert_id * blocks_perExpert;
+        if constexpr (kGemmType == GemmType::MGroupedMasked) {
+            // DeepGEMM-style masked scheduler: `offsets` is reused as int32 masked_m[num_groups]
+            // (token counts per group). `experts` is unused.
+            // gridDim.y == num_groups (compile-time constant) so blockIdx.y IS the expert id.
+            // shape_m == max_m (the fixed per-group M allocation, same for every group).
+            expert_id = blockIdx.y;
+            current_group_idx = blockIdx.y;
+            n_idx = blockIdx.x * BLOCK_N + shape_n * expert_id;
+            const int m_count = reinterpret_cast<const int*>(offsets)[blockIdx.y];
+            m_start = 0;
+            m_end = ceil_div_device(static_cast<uint32_t>(m_count > 0 ? m_count : 0), BLOCK_M);
+        } else {
+            expert_id = experts[blockIdx.y];
+            n_start = expert_id * blocks_perExpert;
 
-        // offsets array is laid out as pairs: [start_0, end_0, start_1, end_1, ...]
-        // blockIdx.y indexes into the experts array; multiply by 2 to get offset pair index
-        uint32_t offset_pair_idx = blockIdx.y * 2;
-        m_start = ceil_div_device(offsets[offset_pair_idx], BLOCK_M);
-        m_end = ceil_div_device(offsets[offset_pair_idx + 1], BLOCK_M);
+            // offsets array is laid out as pairs: [start_0, end_0, start_1, end_1, ...]
+            // blockIdx.y indexes into the experts array; multiply by 2 to get offset pair index
+            uint32_t offset_pair_idx = blockIdx.y * 2;
+            m_start = ceil_div_device(offsets[offset_pair_idx], BLOCK_M);
+            m_end = ceil_div_device(offsets[offset_pair_idx + 1], BLOCK_M);
 
-        // B is laid out as [group, n, k], so N offset must use expert_id (group id),
-        // not blockIdx.y (segment id in offsets/experts list).
-        n_idx = blockIdx.x * BLOCK_N + shape_n * expert_id;
-        current_group_idx = expert_id;
-
-        // if (threadIdx.x == 0 && blockIdx.x == 0)
-        //     printf("BLOCK_M: %d, BLOCK_N: %d, blockIdx.y: %d, offset_pair_idx: %d, m_start: %d, m_end: %d, offsets[%d]: %d, offsets[%d]: %d \n",
-        //            BLOCK_M, BLOCK_N, blockIdx.y, offset_pair_idx, m_start, m_end, offset_pair_idx, offsets[offset_pair_idx], offset_pair_idx + 1, offsets[offset_pair_idx + 1]);
+            // B is laid out as [group, n, k], so N offset must use expert_id (group id),
+            // not blockIdx.y (segment id in offsets/experts list).
+            n_idx = blockIdx.x * BLOCK_N + shape_n * expert_id;
+            current_group_idx = expert_id;
+        }
     }
 
     // template <bool kWithGroupOffset, IndexType kIndexType = IndexType::MN>

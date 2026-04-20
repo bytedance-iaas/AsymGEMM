@@ -435,35 +435,6 @@ def test_m_grouped_nvfp4_contiguous_cpp_flow() -> None:
     # assert kernel_vs_manual["max_abs"] < 1.0, f"kernel_vs_manual max_abs too large: {kernel_vs_manual}"
 
 
-def _build_offsets_experts_from_masked_m(
-    masked_m: torch.Tensor, num_groups: int, max_m: int, block_m: int = 128
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    """Build pairs-format (start, end) offsets for asymScheduler from masked_m.
-
-    Matches the FP8 masked-test helper in tests/test_fp8_fp4.py. `a` has layout
-    (num_groups, max_m, K), so each group occupies `max_m` rows starting at
-    `g * max_m`. Groups with masked_m[g] == 0 are filtered out. `end` is aligned
-    up to BLOCK_M so `ceil_div(end, BLOCK_M)` matches the kernel's scheduled
-    tile count exactly.
-    """
-    offsets = []
-    experts = []
-    for g in range(num_groups):
-        v = int(masked_m[g].item())
-        if v > 0:
-            start = g * max_m
-            end = start + ((v + block_m - 1) // block_m) * block_m
-            offsets.append(start)
-            offsets.append(end)
-            experts.append(g)
-    experts.append(-1)
-    return (
-        torch.tensor(offsets, dtype=torch.int32, device="cuda"),
-        torch.tensor(experts, dtype=torch.int32, device="cuda"),
-        len(experts),
-    )
-
-
 @ignore_env("DG_JIT_PTXAS_CHECK", lambda: torch.cuda.is_available() and get_arch_major() == 9)
 def test_m_grouped_nvfp4_masked_cpp_flow() -> None:
     if not torch.cuda.is_available():
@@ -499,11 +470,6 @@ def test_m_grouped_nvfp4_masked_cpp_flow() -> None:
     masked_m_cpu = torch.tensor(masked_m_list, dtype=torch.int32, device="cpu")
     masked_m = masked_m_cpu.to(device="cuda")
 
-    offsets_t, experts_t, list_size = _build_offsets_experts_from_masked_m(
-        masked_m_cpu, num_groups, max_m, block_m=block_m
-    )
-    import ipdb; ipdb.set_trace()
-
     a_bf16 = torch.randn((num_groups, max_m, k), device="cuda", dtype=torch.bfloat16)
     b_bf16 = torch.randn((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
 
@@ -532,9 +498,7 @@ def test_m_grouped_nvfp4_masked_cpp_flow() -> None:
         (a_fp4, sfa),
         (b_fp4, sfb),
         d_kernel,
-        offsets_t,
-        experts_t,
-        list_size,
+        masked_m,
         expected_m_per_group,
         recipe=recipe,
         disable_ue8m0_cast=disable_ue8m0_cast,
@@ -548,8 +512,6 @@ def test_m_grouped_nvfp4_masked_cpp_flow() -> None:
         f"num_groups={num_groups}, max_m={max_m}, expected_m_per_group={expected_m_per_group}, "
         f"n={n}, k={k}\n"
         f"masked_m={masked_m_cpu.tolist()}\n"
-        f"offsets={offsets_t.cpu().tolist()}\n"
-        f"experts={experts_t.cpu().tolist()} (list_size={list_size})\n"
         f"A packed: {tuple(a_fp4.shape)}, SFA: {tuple(sfa.shape)}\n"
         f"B packed: {tuple(b_fp4.shape)}, SFB: {tuple(sfb.shape)}"
     )
