@@ -97,11 +97,11 @@ def test_m_grouped_gemm_contiguous() -> None:
 
         offsets = offsets[:capacity]
         experts = experts[:capacity]
-        list_size = len(offsets)
+        list_size_t = torch.tensor([len(offsets)], dtype=torch.int32, device=m_indices.device)
 
         offsets_t = torch.tensor(offsets, dtype=torch.int32, device=m_indices.device)
         experts_t = torch.tensor(experts, dtype=torch.int32, device=m_indices.device)
-        return offsets_t, experts_t, list_size
+        return offsets_t, experts_t, list_size_t
 
     def build_groundtruth_from_original(a_bf16: torch.Tensor, b_bf16: torch.Tensor, m_indices: torch.Tensor):
         gt = torch.zeros((a_bf16.size(0), b_bf16.size(1)), device=a_bf16.device, dtype=torch.bfloat16)
@@ -308,7 +308,7 @@ def build_offsets_experts_from_m_indices_pairs(m_indices: torch.Tensor, block_m:
 
     return (torch.tensor(offsets, dtype=torch.int32, device=device),
             torch.tensor(experts, dtype=m_indices.dtype, device=device),
-            len(experts))
+            torch.tensor([len(experts)], dtype=torch.int32, device=device))
 
 
 def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, max_m: int, block_m: int = 128):
@@ -353,7 +353,7 @@ def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int,
 
     return (torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
             torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
-            len(experts))
+            torch.tensor([len(experts)], dtype=torch.int32, device=masked_m.device))
 
 def test_m_grouped_gemm_masked() -> None:
     print('Testing m-grouped masked GEMM:')

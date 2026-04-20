@@ -278,7 +278,7 @@ def build_offsets_experts_from_m_indices_pairs(m_indices: torch.Tensor, block_m:
 
     return (torch.tensor(offsets, dtype=torch.int32, device=device),
             torch.tensor(experts, dtype=m_indices.dtype, device=device),
-            len(experts))
+            torch.tensor([len(experts)], dtype=torch.int32, device=device))
 
 
 def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, max_m: int, block_m: int = 128):
@@ -323,7 +323,7 @@ def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int,
 
     return (torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
             torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
-            len(experts))
+            torch.tensor([len(experts)], dtype=torch.int32, device=masked_m.device))
 
 
 

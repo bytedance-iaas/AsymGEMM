@@ -29,9 +29,9 @@ def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int,
             curr_offset += ((v + block_m - 1) // block_m) * block_m
     offsets.append(curr_offset)
     experts.append(-1)
-    return (torch.tensor(offsets, dtype=torch.int32, device='cuda'), 
-            torch.tensor(experts, dtype=torch.int32, device='cuda'), 
-            len(offsets))
+    return (torch.tensor(offsets, dtype=torch.int32, device='cuda'),
+            torch.tensor(experts, dtype=torch.int32, device='cuda'),
+            torch.tensor([len(offsets)], dtype=torch.int32, device='cuda'))
 
 def test_m_grouped_gemm_contiguous() -> None:
     print('Testing m-grouped contiguous GEMM:')

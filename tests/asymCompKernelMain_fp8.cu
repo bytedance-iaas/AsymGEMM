@@ -291,6 +291,7 @@ int main(int argc, char** argv) {
                     max_len * sizeof(int), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(experts_t.data_ptr<int>(), experts_h.data(),
                     max_len * sizeof(int), cudaMemcpyHostToDevice, stream);
+    auto list_size_t = torch::tensor({list_size}, opts_i32_cuda);
 
     auto A_fp16 = torch::randn({m, k}, torch::TensorOptions().device(dev).dtype(torch::kFloat16));
     auto A = make_fp8_e4m3(A_fp16);
@@ -327,7 +328,7 @@ int main(int argc, char** argv) {
               << "  list_size=" << list_size << "\n";
 
     asym_gemm::gemm::m_grouped_fp8_asym_gemm_nt_contiguous(
-        a_pair, b_pair_cpu, D_asym, offsets_t, experts_t, list_size,
+        a_pair, b_pair_cpu, D_asym, offsets_t, experts_t, list_size_t,
         recipe, compiled_dims, disable_ue8m0_cast
     );
     if (!cuda_check("m_grouped_fp8_asym_gemm_nt_contiguous")) {
