@@ -53,7 +53,6 @@ try:
             "m_grouped_fp4_asym_gemm_nt_masked",
             # BF16 GEMMs
             "m_grouped_bf16_asym_gemm_nt_contiguous",
-            "m_grouped_bf16_gemm_nt_contiguous",
             "m_grouped_bf16_asym_gemm_nt_masked",
             # Einsum kernels
             "einsum",

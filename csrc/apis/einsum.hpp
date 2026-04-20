@@ -12,8 +12,6 @@
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/sm90_bmk_bnk_mn.hpp"
 #include "../jit_kernels/impls/sm100_bmk_bnk_mn.hpp"
-#include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
-#include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
 #endif
 

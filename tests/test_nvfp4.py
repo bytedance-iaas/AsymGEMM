@@ -435,9 +435,194 @@ def test_m_grouped_nvfp4_contiguous_cpp_flow() -> None:
     # assert kernel_vs_manual["max_abs"] < 1.0, f"kernel_vs_manual max_abs too large: {kernel_vs_manual}"
 
 
+def _build_offsets_experts_from_masked_m(
+    masked_m: torch.Tensor, num_groups: int, max_m: int, block_m: int = 128
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Build pairs-format (start, end) offsets for asymScheduler from masked_m.
+
+    Matches the FP8 masked-test helper in tests/test_fp8_fp4.py. `a` has layout
+    (num_groups, max_m, K), so each group occupies `max_m` rows starting at
+    `g * max_m`. Groups with masked_m[g] == 0 are filtered out. `end` is aligned
+    up to BLOCK_M so `ceil_div(end, BLOCK_M)` matches the kernel's scheduled
+    tile count exactly.
+    """
+    offsets = []
+    experts = []
+    for g in range(num_groups):
+        v = int(masked_m[g].item())
+        if v > 0:
+            start = g * max_m
+            end = start + ((v + block_m - 1) // block_m) * block_m
+            offsets.append(start)
+            offsets.append(end)
+            experts.append(g)
+    experts.append(-1)
+    return (
+        torch.tensor(offsets, dtype=torch.int32, device="cuda"),
+        torch.tensor(experts, dtype=torch.int32, device="cuda"),
+        len(experts),
+    )
+
+
+@ignore_env("DG_JIT_PTXAS_CHECK", lambda: torch.cuda.is_available() and get_arch_major() == 9)
+def test_m_grouped_nvfp4_masked_cpp_flow() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    if not hasattr(asym_gemm, "m_grouped_fp4_asym_gemm_nt_masked"):
+        pytest.skip("FP4 masked kernel is not available in this build")
+
+    torch.manual_seed(0)
+    random.seed(0)
+    np.random.seed(0)
+
+    # Masked/decode phase: `a` is (num_groups, max_m, k); only the first
+    # masked_m[g] rows of each group are valid. Kernel must respect masked_m
+    # via the offsets/experts pair list (see asymScheduler).
+    num_groups = 2
+    max_m = 512
+    expected_m_per_group = 384
+    n = 1024
+    k = 1024
+    gran_k = 16
+    sf_k = (k + gran_k - 1) // gran_k
+    sf_n = (n + gran_k - 1) // gran_k
+    recipe = (1, 16, 16)
+    disable_ue8m0_cast = True
+    block_m = 128
+
+    # Pick per-group valid lengths in [0.7 * expected, 1.3 * expected], clamped
+    # to max_m. Deterministic via the seeds above.
+    masked_m_list = []
+    for _ in range(num_groups):
+        v = max(1, int(expected_m_per_group * random.uniform(0.7, 1.3)))
+        masked_m_list.append(min(v, max_m))
+    masked_m_cpu = torch.tensor(masked_m_list, dtype=torch.int32, device="cpu")
+    masked_m = masked_m_cpu.to(device="cuda")
+
+    offsets_t, experts_t, list_size = _build_offsets_experts_from_masked_m(
+        masked_m_cpu, num_groups, max_m, block_m=block_m
+    )
+    import ipdb; ipdb.set_trace()
+
+    a_bf16 = torch.randn((num_groups, max_m, k), device="cuda", dtype=torch.bfloat16)
+    b_bf16 = torch.randn((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
+
+    a_f32_cpu = a_bf16.float().cpu().contiguous().numpy()
+    b_f32_cpu = b_bf16.float().cpu().contiguous().numpy()
+
+    a_packed_u8 = np.empty((num_groups, max_m, k // 2), dtype=np.uint8)
+    a_scales_u8 = np.empty((num_groups, max_m, sf_k), dtype=np.uint8)
+    b_packed_u8 = np.empty((num_groups, n, k // 2), dtype=np.uint8)
+    b_scales_u8 = np.empty((num_groups, sf_n, sf_k), dtype=np.uint8)
+    for gid in range(num_groups):
+        ap, asc = _quantize_a_nvfp4_e4m3(a_f32_cpu[gid], gran_k=gran_k)
+        a_packed_u8[gid] = ap
+        a_scales_u8[gid] = asc
+        bp, bs = _quantize_b_nvfp4_e4m3(b_f32_cpu[gid], gran_k=gran_k)
+        b_packed_u8[gid] = bp
+        b_scales_u8[gid] = bs
+
+    a_fp4 = torch.from_numpy(a_packed_u8).to(device="cuda", dtype=torch.uint8)
+    sfa = torch.from_numpy(a_scales_u8).to(device="cuda", dtype=torch.uint8).view(torch.float8_e4m3fn)
+    b_fp4 = torch.from_numpy(b_packed_u8).to(device="cuda", dtype=torch.uint8)
+    sfb = torch.from_numpy(b_scales_u8).to(device="cuda", dtype=torch.uint8).view(torch.float8_e4m3fn)
+
+    d_kernel = torch.empty((num_groups, max_m, n), device="cuda", dtype=torch.bfloat16)
+    asym_gemm.m_grouped_fp4_asym_gemm_nt_masked(
+        (a_fp4, sfa),
+        (b_fp4, sfb),
+        d_kernel,
+        offsets_t,
+        experts_t,
+        list_size,
+        expected_m_per_group,
+        recipe=recipe,
+        disable_ue8m0_cast=disable_ue8m0_cast,
+    )
+    torch.cuda.synchronize()
+
+    # Manual reference per group (dequant NVFP4+E4M3 -> fp32 matmul) for the
+    # valid rows only. Ground truth uses original BF16 a/b for the same rows.
+    print(
+        f"\n=== NVFP4 grouped masked test ===\n"
+        f"num_groups={num_groups}, max_m={max_m}, expected_m_per_group={expected_m_per_group}, "
+        f"n={n}, k={k}\n"
+        f"masked_m={masked_m_cpu.tolist()}\n"
+        f"offsets={offsets_t.cpu().tolist()}\n"
+        f"experts={experts_t.cpu().tolist()} (list_size={list_size})\n"
+        f"A packed: {tuple(a_fp4.shape)}, SFA: {tuple(sfa.shape)}\n"
+        f"B packed: {tuple(b_fp4.shape)}, SFB: {tuple(sfb.shape)}"
+    )
+
+    overall_kvm = {"mean_abs": 0.0, "max_abs": 0.0, "rel_num": 0.0, "rel_den": 0.0, "n": 0}
+    overall_kvg = {"mean_abs": 0.0, "max_abs": 0.0, "rel_num": 0.0, "rel_den": 0.0, "n": 0}
+
+    for gid in range(num_groups):
+        m_valid = int(masked_m_cpu[gid].item())
+        if m_valid == 0:
+            continue
+
+        # Manual FP4 dequant reference for this group's valid rows
+        a_codes = _unpack_fp4_bytes(a_packed_u8[gid, :m_valid])
+        a_q = _decode_e2m1_codes(a_codes)
+        a_sf = _decode_e4m3_bits(a_scales_u8[gid, :m_valid])
+        a_sf = np.repeat(a_sf, gran_k, axis=1)[:, :k]
+        a_deq = a_q * a_sf
+
+        b_codes = _unpack_fp4_bytes(b_packed_u8[gid])
+        b_q = _decode_e2m1_codes(b_codes)
+        b_sf = _decode_e4m3_bits(b_scales_u8[gid])
+        b_sf = np.repeat(np.repeat(b_sf, gran_k, axis=0), gran_k, axis=1)[:n, :k]
+        b_deq = b_q * b_sf
+
+        a_t = torch.from_numpy(a_deq).to(torch.float32)
+        b_t = torch.from_numpy(b_deq).to(torch.float32)
+        d_manual = (a_t @ b_t.t())
+
+        # BF16 ground truth on same rows
+        d_gt = (a_bf16[gid, :m_valid].float() @ b_bf16[gid].float().t()).cpu()
+
+        d_k_valid = d_kernel[gid, :m_valid].float().cpu()
+
+        k_vs_m = _diff_stats(d_k_valid, d_manual)
+        k_vs_g = _diff_stats(d_k_valid, d_gt)
+        m_vs_g = _diff_stats(d_manual, d_gt)
+        print(
+            f"  [group {gid}] masked_m={m_valid} "
+            f"kernel_vs_manual={k_vs_m} kernel_vs_gt={k_vs_g} manual_vs_gt={m_vs_g}"
+        )
+
+        for dst, src in ((overall_kvm, k_vs_m), (overall_kvg, k_vs_g)):
+            dst["mean_abs"] += src["mean_abs"] * m_valid
+            dst["max_abs"] = max(dst["max_abs"], src["max_abs"])
+            dst["n"] += m_valid
+
+        # NaN/Inf gate
+        assert torch.isfinite(d_k_valid).all(), f"Kernel output has NaN/Inf in group {gid}"
+        assert torch.isfinite(d_manual).all(), f"Manual reference has NaN/Inf in group {gid}"
+
+    def _finalize(stats):
+        if stats["n"] == 0:
+            return {"mean_abs": 0.0, "max_abs": 0.0}
+        return {"mean_abs": stats["mean_abs"] / stats["n"], "max_abs": stats["max_abs"]}
+
+    final_kvm = _finalize(overall_kvm)
+    final_kvg = _finalize(overall_kvg)
+    print(f"\nOverall (active rows only):")
+    print(f"  kernel_vs_manual: {final_kvm}")
+    print(f"  kernel_vs_gt:     {final_kvg}")
+
+
 if __name__ == "__main__":
     try:
         test_m_grouped_nvfp4_contiguous_cpp_flow()
+    except pytest.skip.Exception as exc:
+        print(f"Skipped: {exc}")
+    except RuntimeError as exc:
+        print(f"RuntimeError: {exc}")
+
+    try:
+        test_m_grouped_nvfp4_masked_cpp_flow()
     except pytest.skip.Exception as exc:
         print(f"Skipped: {exc}")
     except RuntimeError as exc:
