@@ -318,19 +318,20 @@ int main(int argc, char** argv) {
                     max_len * sizeof(int), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(experts_t.data_ptr<int>(), experts_h.data(),
                     max_len * sizeof(int), cudaMemcpyHostToDevice, stream);
+    auto list_size_t = torch::tensor({list_size}, opts_i32_cuda);
 
     auto D = torch::empty({m, n}, torch::TensorOptions().device(dev).dtype(torch::kBFloat16));
     // auto offsets_i32 = torch::tensor({0, 256, 512, 768, 1024},
     //                                 torch::TensorOptions().device(dev).dtype(torch::kInt32));
-    
+
     auto run_kernel = [&]() {
         asym_gemm::gemm::m_grouped_bf16_asym_gemm_nt_contiguous(
-            A_bp16, B_bp16_cpu, D, offsets_t, experts_t, list_size, compiled_dims
+            A_bp16, B_bp16_cpu, D, offsets_t, experts_t, list_size_t, compiled_dims
         );
     };
 
    asym_gemm::gemm::m_grouped_bf16_asym_gemm_nt_contiguous(
-        A_bp16, B_bp16_cpu, D, offsets_t, experts_t, list_size, compiled_dims
+        A_bp16, B_bp16_cpu, D, offsets_t, experts_t, list_size_t, compiled_dims
     );
 
     asym_gemm::gemm::m_grouped_bf16_gemm_nt_contiguous(

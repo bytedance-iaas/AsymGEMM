@@ -214,6 +214,18 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
     // Block scheduler: BF16-style B-centric traversal.
     auto scheduler = asymScheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs>(
         shape_m, shape_n, experts, offsets);
+    // Sentinel block (inactive expert or empty M range): skip without entering
+    // any TMA / barrier wait paths. All CTAs in a cluster share blockIdx.y, so
+    // they all early-exit together and don't deadlock cluster-wide barriers.
+    // The init phase already ran Allocator().allocate() unconditionally — we
+    // must release the TMEM before returning, otherwise subsequent kernels see
+    // "tensor memory not completely freed". Use the same one-warp-frees pattern
+    // as the normal exit path (warp 2 owned the allocation).
+    if (scheduler.m_start >= scheduler.m_end) {
+        if (warp_idx == 2)
+            Allocator().free(0, kNumTmemCols);
+        return;
+    }
     const uint32_t num_total_k_blocks = ceil_div_device(shape_k, BLOCK_K);
 
     // Pipeline and TMA phases

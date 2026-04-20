@@ -121,7 +121,7 @@ static void sm100_m_grouped_bf16_asym_gemm_contiguous(const torch::Tensor& a,
                                                  const torch::Tensor& d,
                                                  const torch::Tensor& offsets_t,
                                                  const torch::Tensor& experts_t,
-                                                 const int& list_size,
+                                                 const int& grid_y,
                                                  const int& num_groups, const int& m, const int& n, const int& k,
                                                  const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                  const std::string& compiled_dims) {
@@ -205,12 +205,15 @@ static void sm100_m_grouped_bf16_asym_gemm_contiguous(const torch::Tensor& a,
 
     // printf("ceil_div(n, config.block_n): %d, num_groups: %d \n", ceil_div(n, config.block_n), num_groups);
 
+    if (grid_y <= 0)
+        return;
+
     // Launch
     const SM100BF16AsymGemmRuntime::Args& args = {
         .m = m, .n = n, .k = aligned_k,
         .compiled_dims = compiled_dims,
         .gemm_config = config,
-        .launch_args = LaunchArgs({ceil_div(n, config.block_n), list_size - 1}, config.thread_config.num_threads,
+        .launch_args = LaunchArgs({ceil_div(n, config.block_n), grid_y}, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
         .offsets = offsets_t.data_ptr<int>(),
@@ -353,7 +356,7 @@ static void sm100_m_grouped_bf16_asym_gemm_masked(const torch::Tensor& a,
                                              const torch::Tensor& d,
                                              const torch::Tensor& offsets_t,
                                              const torch::Tensor& experts_t,
-                                             const int& list_size,
+                                             const int& grid_y,
                                              const int& expected_m,
                                              const int& num_groups, const int& m, const int& n, const int& k,
                                              const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
@@ -395,12 +398,15 @@ static void sm100_m_grouped_bf16_asym_gemm_masked(const torch::Tensor& a,
                                                  static_cast<int>(d.stride(-2)), num_groups,
                                                  config.smem_config.swizzle_cd_mode);
 
+    if (grid_y <= 0)
+        return;
+
     // Launch with masked configuration
     const SM100BF16AsymGemmMaskedRuntime::Args& args = {
         .m = m, .n = n, .k = aligned_k,
         .compiled_dims = compiled_dims,
         .gemm_config = config,
-        .launch_args = LaunchArgs({ceil_div(n, config.block_n), list_size - 1}, config.thread_config.num_threads,
+        .launch_args = LaunchArgs({ceil_div(n, config.block_n), grid_y}, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
         .offsets = offsets_t.data_ptr<int>(),

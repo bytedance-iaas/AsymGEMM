@@ -84,7 +84,7 @@ static void sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d(const torch::Tensor& a
                                                      const torch::Tensor& d,
                                                      const torch::Tensor& offsets_t,
                                                      const torch::Tensor& experts_t,
-                                                     const int& list_size,
+                                                     const int& grid_y,
                                                      const int& num_groups, const int& m, const int& n, const int& k,
                                                      const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                      const std::string& compiled_dims) {
@@ -147,7 +147,7 @@ static void sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d(const torch::Tensor& a
     const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
                                                   config.block_n, sf_quant_k, num_groups, 0);
 
-    if (list_size <= 1)
+    if (grid_y <= 0)
         return;
 
     // Launch kernel
@@ -157,7 +157,7 @@ static void sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d(const torch::Tensor& a
         .compiled_dims = compiled_dims,
         .epilogue_type = std::nullopt,
         .gemm_config = config,
-        .launch_args = LaunchArgs({ceil_div(n, config.block_n), list_size - 1}, config.thread_config.num_threads,
+        .launch_args = LaunchArgs({ceil_div(n, config.block_n), grid_y}, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
         .offsets = offsets_t.data_ptr<int>(),
@@ -245,7 +245,7 @@ static void sm100_m_grouped_fp8_asym_gemm_masked_1d1d(const torch::Tensor& a, co
                                                  const torch::Tensor& d,
                                                  const torch::Tensor& offsets_t,
                                                  const torch::Tensor& experts_t,
-                                                 const int& list_size,
+                                                 const int& grid_y,
                                                  const int& expected_m,
                                                  const int& num_groups, const int& m, const int& n, const int& k,
                                                  const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
@@ -295,6 +295,9 @@ static void sm100_m_grouped_fp8_asym_gemm_masked_1d1d(const torch::Tensor& a, co
     const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
                                                   config.block_n, sf_quant_k, num_groups, 0);
 
+    if (grid_y <= 0)
+        return;
+
     // Launch kernel with masked configuration
     const SM100FP8AsymGemmMaskedRuntime::Args& args = {
         .m = m, .n = n, .k = aligned_k,
@@ -302,7 +305,7 @@ static void sm100_m_grouped_fp8_asym_gemm_masked_1d1d(const torch::Tensor& a, co
         .compiled_dims = compiled_dims,
         .epilogue_type = std::nullopt,
         .gemm_config = config,
-        .launch_args = LaunchArgs({ceil_div(n, config.block_n), list_size - 1}, config.thread_config.num_threads,
+        .launch_args = LaunchArgs({ceil_div(n, config.block_n), grid_y}, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
         .offsets = offsets_t.data_ptr<int>(),
