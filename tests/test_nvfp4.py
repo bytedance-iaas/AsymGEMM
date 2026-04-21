@@ -161,34 +161,32 @@ def _quantize_a_nvfp4_e4m3(a_f32: np.ndarray, gran_k: int) -> Tuple[np.ndarray, 
 
 
 def _quantize_b_nvfp4_e4m3(b_f32: np.ndarray, gran_k: int) -> Tuple[np.ndarray, np.ndarray]:
+    # Per-row quantization: each row of B gets its own scale per K-group (gran_mn_b=1).
+    # This matches recipe (1, 1, 16) and the production NVFP4 format from fp4_model.json.
     n, k = b_f32.shape
     assert k % 2 == 0
-    sf_n = (n + gran_k - 1) // gran_k
     sf_k = (k + gran_k - 1) // gran_k
 
     packed = np.zeros((n, k // 2), dtype=np.uint8)
-    scales = np.zeros((sf_n, sf_k), dtype=np.uint8)
+    scales = np.zeros((n, sf_k), dtype=np.uint8)  # one scale row per B row
 
-    for gn in range(sf_n):
+    for r in range(n):
         for gk in range(sf_k):
-            r0 = gn * gran_k
-            r1 = min(r0 + gran_k, n)
             c0 = gk * gran_k
             c1 = min(c0 + gran_k, k)
-            chunk = b_f32[r0:r1, c0:c1]
+            chunk = b_f32[r, c0:c1]
             amax = max(float(np.max(np.abs(chunk))), 1e-4)
             sf = amax / 6.0
             sf_bits, sf_decoded = _to_e4m3_bits_and_decoded(sf)
-            scales[gn, gk] = sf_bits
+            scales[r, gk] = sf_bits
 
-            for r in range(r0, r1):
-                for c in range(c0, c1):
-                    code = _encode_e2m1_scalar(float(b_f32[r, c] / sf_decoded))
-                    pidx = c // 2
-                    if (c & 1) == 0:
-                        packed[r, pidx] = code & 0x0F
-                    else:
-                        packed[r, pidx] |= (code & 0x0F) << 4
+            for c in range(c0, c1):
+                code = _encode_e2m1_scalar(float(b_f32[r, c] / sf_decoded))
+                pidx = c // 2
+                if (c & 1) == 0:
+                    packed[r, pidx] = code & 0x0F
+                else:
+                    packed[r, pidx] |= (code & 0x0F) << 4
 
     return packed, scales
 
@@ -242,7 +240,7 @@ def _manual_dequant_reference(
         b_codes = _unpack_fp4_bytes(b_packed_u8[gid])
         b_q = _decode_e2m1_codes(b_codes)
         b_sf = _decode_e4m3_bits(b_scales_u8[gid])
-        b_sf = np.repeat(np.repeat(b_sf, gran_k, axis=0), gran_k, axis=1)[:n, :k]
+        b_sf = np.repeat(b_sf, gran_k, axis=1)[:, :k]  # per-row: only expand K axis
         b_deq = b_q * b_sf
 
         a_rows_t = torch.from_numpy(a_deq[rows]).to(torch.float32)
@@ -335,8 +333,8 @@ def test_m_grouped_nvfp4_contiguous_cpp_flow() -> None:
     k = 1024
     gran_k = 16
     sf_k = (k + gran_k - 1) // gran_k
-    sf_n = (n + gran_k - 1) // gran_k
-    recipe = (1, 16, 16)
+    sf_n = n  # per-row B scales: one scale row per B row (gran_mn_b=1)
+    recipe = (1, 1, 16)
     disable_ue8m0_cast = True
 
     m_indices_cpu, m, active_m = _build_m_indices_like_cpp(expected_m_per_group, num_groups, seed=0)
@@ -456,8 +454,8 @@ def test_m_grouped_nvfp4_masked_cpp_flow() -> None:
     k = 1024
     gran_k = 16
     sf_k = (k + gran_k - 1) // gran_k
-    sf_n = (n + gran_k - 1) // gran_k
-    recipe = (1, 16, 16)
+    sf_n = n  # per-row B scales: one scale row per B row (gran_mn_b=1)
+    recipe = (1, 1, 16)
     disable_ue8m0_cast = True
     block_m = 128
 
@@ -492,6 +490,12 @@ def test_m_grouped_nvfp4_masked_cpp_flow() -> None:
     sfa = torch.from_numpy(a_scales_u8).to(device="cuda", dtype=torch.uint8).view(torch.float8_e4m3fn)
     b_fp4 = torch.from_numpy(b_packed_u8).to(device="cuda", dtype=torch.uint8)
     sfb = torch.from_numpy(b_scales_u8).to(device="cuda", dtype=torch.uint8).view(torch.float8_e4m3fn)
+
+    # warm up
+    # expected_m_per_group = 1
+    # masked_m = torch.zeros(
+    #     (num_groups,), dtype=torch.int32, device="cuda"
+    # )
 
     d_kernel = torch.empty((num_groups, max_m, n), device="cuda", dtype=torch.bfloat16)
     asym_gemm.m_grouped_fp4_asym_gemm_nt_masked(
@@ -534,7 +538,7 @@ def test_m_grouped_nvfp4_masked_cpp_flow() -> None:
         b_codes = _unpack_fp4_bytes(b_packed_u8[gid])
         b_q = _decode_e2m1_codes(b_codes)
         b_sf = _decode_e4m3_bits(b_scales_u8[gid])
-        b_sf = np.repeat(np.repeat(b_sf, gran_k, axis=0), gran_k, axis=1)[:n, :k]
+        b_sf = np.repeat(b_sf, gran_k, axis=1)[:, :k]  # per-row: only expand K axis
         b_deq = b_q * b_sf
 
         a_t = torch.from_numpy(a_deq).to(torch.float32)

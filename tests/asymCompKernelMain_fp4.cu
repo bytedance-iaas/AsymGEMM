@@ -174,12 +174,14 @@ static NvFP4QuantResult quantize_bf16_to_nvfp4(
     return result;
 }
 
-// Per-block quantization for B tensor [n, k] -> packed + 2D scale factors
+// Per-row quantization for B tensor [n, k] -> packed + per-row scale factors.
+// Each row of B gets its own scale per K-group (gran_mn_b=1), matching recipe (1,1,16)
+// and the production NVFP4 format from fp4_model.json.
 struct NvFP4BlockQuantResult {
     std::vector<uint8_t> packed;     // [n * (k/2)]
-    std::vector<uint8_t> scales;     // [ceil(n/gran_k) * ceil(k/gran_k)] as FP8 E4M3
+    std::vector<uint8_t> scales;     // [n * ceil(k/gran_k)] as FP8 E4M3 (one row per B row)
     int64_t n, k, gran_k;
-    int64_t num_groups_n, num_groups_k;
+    int64_t num_groups_k;
 };
 
 // Decode 4-bit E2M1 code to float.
@@ -195,32 +197,26 @@ static NvFP4BlockQuantResult quantize_bf16_to_nvfp4_block(
     const float* data,  // [n, k] in float
     int64_t n, int64_t k, int64_t gran_k
 ) {
-    const int64_t num_groups_n = (n + gran_k - 1) / gran_k;
     const int64_t num_groups_k = (k + gran_k - 1) / gran_k;
 
     NvFP4BlockQuantResult result;
     result.n = n;
     result.k = k;
     result.gran_k = gran_k;
-    result.num_groups_n = num_groups_n;
     result.num_groups_k = num_groups_k;
     result.packed.resize(n * (k / 2), 0);
-    result.scales.resize(num_groups_n * num_groups_k, 0);
+    result.scales.resize(n * num_groups_k, 0);  // one scale row per B row
 
-    for (int64_t gn = 0; gn < num_groups_n; ++gn) {
+    for (int64_t r = 0; r < n; ++r) {
         for (int64_t gk = 0; gk < num_groups_k; ++gk) {
-            const int64_t row_start = gn * gran_k;
-            const int64_t row_end = std::min(row_start + gran_k, n);
             const int64_t col_start = gk * gran_k;
             const int64_t col_end = std::min(col_start + gran_k, k);
 
-            // Find amax in this block
+            // Find amax over this row's K-group
             float amax = 1e-4f;
-            for (int64_t r = row_start; r < row_end; ++r) {
-                for (int64_t c = col_start; c < col_end; ++c) {
-                    float av = std::fabs(data[r * k + c]);
-                    if (av > amax) amax = av;
-                }
+            for (int64_t c = col_start; c < col_end; ++c) {
+                float av = std::fabs(data[r * k + c]);
+                if (av > amax) amax = av;
             }
 
             float sf = amax / 6.0f;
@@ -228,20 +224,18 @@ static NvFP4BlockQuantResult quantize_bf16_to_nvfp4_block(
             float sf_decoded = decode_fp8_e4m3(sf_fp8);
             if (sf_decoded == 0.0f || std::isnan(sf_decoded)) sf_decoded = 1.0f;
 
-            result.scales[gn * num_groups_k + gk] = sf_fp8;
+            result.scales[r * num_groups_k + gk] = sf_fp8;
 
-            // Quantize elements in this block
-            for (int64_t r = row_start; r < row_end; ++r) {
-                for (int64_t c = col_start; c < col_end; ++c) {
-                    float scaled = data[r * k + c] / sf_decoded;
-                    uint8_t code = encode_e2m1(scaled);
+            // Quantize elements in this row's K-group
+            for (int64_t c = col_start; c < col_end; ++c) {
+                float scaled = data[r * k + c] / sf_decoded;
+                uint8_t code = encode_e2m1(scaled);
 
-                    int64_t pack_idx = r * (k / 2) + c / 2;
-                    if (c % 2 == 0) {
-                        result.packed[pack_idx] = code & 0x0F;
-                    } else {
-                        result.packed[pack_idx] |= (code & 0x0F) << 4;
-                    }
+                int64_t pack_idx = r * (k / 2) + c / 2;
+                if (c % 2 == 0) {
+                    result.packed[pack_idx] = code & 0x0F;
+                } else {
+                    result.packed[pack_idx] |= (code & 0x0F) << 4;
                 }
             }
         }
@@ -264,7 +258,6 @@ static torch::Tensor compute_manual_nvfp4_e4m3_reference(
 
     const int64_t num_groups = static_cast<int64_t>(b_quants.size());
     const int64_t sf_k = (k + gran_k - 1) / gran_k;
-    const int64_t sf_n = (n + gran_k - 1) / gran_k;
     const auto* mi = m_indices_cpu.data_ptr<int32_t>();
 
     // Decode A scales once.
@@ -277,15 +270,15 @@ static torch::Tensor compute_manual_nvfp4_e4m3_reference(
         }
     }
 
-    // Decode B scales once per group.
+    // Decode B scales once per group (per-row layout: n * sf_k entries per group).
     std::vector<std::vector<float>> b_scales(
-        num_groups, std::vector<float>(sf_n * sf_k, 1.0f));
+        num_groups, std::vector<float>(n * sf_k, 1.0f));
     for (int64_t g = 0; g < num_groups; ++g) {
-        for (int64_t gn = 0; gn < sf_n; ++gn) {
+        for (int64_t r = 0; r < n; ++r) {
             for (int64_t gk = 0; gk < sf_k; ++gk) {
-                float sf = decode_fp8_e4m3(b_quants[g].scales[gn * sf_k + gk]);
+                float sf = decode_fp8_e4m3(b_quants[g].scales[r * sf_k + gk]);
                 if (sf == 0.0f || std::isnan(sf)) sf = 1.0f;
-                b_scales[g][gn * sf_k + gk] = sf;
+                b_scales[g][r * sf_k + gk] = sf;
             }
         }
     }
@@ -324,7 +317,7 @@ static torch::Tensor compute_manual_nvfp4_e4m3_reference(
                 const uint8_t packed = b_row[c / 2];
                 const uint8_t code = (c & 1) ? ((packed >> 4) & 0x0F) : (packed & 0x0F);
                 const float q = decode_e2m1(code);
-                const float sf = b_scales[g][(r / gran_k) * sf_k + (c / gran_k)];
+                const float sf = b_scales[g][r * sf_k + (c / gran_k)];  // per-row index
                 b_deq_ptr[r * k + c] = q * sf;
             }
         }
@@ -529,13 +522,13 @@ int main(int argc, char** argv) {
     // (One 8-byte unit = 16 FP4 values = 2 nvfp4 packed units of 8 elements each)
     constexpr int64_t gran_k = 16;
     const int64_t sf_k = (k + gran_k - 1) / gran_k;
-    const int64_t sf_n = (n + gran_k - 1) / gran_k;
+    const int64_t sf_n = n;  // per-row B scales: one scale row per B row (gran_mn_b=1)
 
-    // For FP4 recipe (1,16,16), keep SF payload in E4M3 bytes and only do layout packing.
+    // For FP4 recipe (1,1,16), keep SF payload in E4M3 bytes and only do layout packing.
     // `disable_ue8m0_cast=true` avoids FP32->UE8M0 normalization in transform paths.
     const bool disable_ue8m0_cast = true;
     const std::string compiled_dims = "nk";
-    const std::optional<std::tuple<int,int,int>> recipe = std::make_tuple(1, 16, 16);
+    const std::optional<std::tuple<int,int,int>> recipe = std::make_tuple(1, 1, 16);
 
     // -----------------------------------------------------------------------
     // Build m_indices (group assignment for each row of A)
@@ -618,7 +611,7 @@ int main(int argc, char** argv) {
 
     std::cout << "  A packed: [" << m << ", " << k/2 << "] uint8, scales: [" << m << ", " << sf_k << "] FP8\n";
     std::cout << "  B packed: [" << num_groups << ", " << n << ", " << k/2 << "] uint8, "
-              << "scales: [" << num_groups << ", " << sf_n << ", " << sf_k << "] FP8\n";
+              << "scales: [" << num_groups << ", " << n << ", " << sf_k << "] FP8 (per-row)\n";
 
     // Verify 8-byte unit structure
     std::cout << "  Verification: 8 bytes = " << 8*2 << " FP4 elements = 2 nvfp4 packed units\n";
@@ -648,13 +641,13 @@ int main(int argc, char** argv) {
                b_quants[g].packed.data(), n * (k / 2));
     }
 
-    // B scale factors: [num_groups, sf_n, sf_k] as E4M3
+    // B scale factors: [num_groups, n, sf_k] as E4M3 (per-row: one scale row per B row)
     auto SFB_u8_cpu = torch::empty(
-        {num_groups, sf_n, sf_k},
+        {num_groups, n, sf_k},
         torch::TensorOptions().device(torch::kCPU).dtype(torch::kUInt8).pinned_memory(true));
     for (int64_t g = 0; g < num_groups; ++g) {
-        memcpy(SFB_u8_cpu.data_ptr<uint8_t>() + g * sf_n * sf_k,
-               b_quants[g].scales.data(), sf_n * sf_k);
+        memcpy(SFB_u8_cpu.data_ptr<uint8_t>() + g * n * sf_k,
+               b_quants[g].scales.data(), n * sf_k);
     }
     auto SFB_cpu = SFB_u8_cpu.view(torch::kFloat8_e4m3fn);
 
