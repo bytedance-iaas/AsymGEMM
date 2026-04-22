@@ -422,7 +422,7 @@ def test_m_grouped_gemm_masked() -> None:
         def test_func_asym():
             asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(a_bench, b_bench, d_asym, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
 
-        import ipdb; ipdb.set_trace()
+        # import ipdb; ipdb.set_trace()
         # Test performance with fixed shapes
         valid_m = int(masked_m.sum().item())
         t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
@@ -486,6 +486,6 @@ if __name__ == '__main__':
     print(f' > {asym_gemm.__path__}\n')
 
     # test_gemm()  # requires fp8_gemm_nt which is not in this module version
-    test_m_grouped_gemm_contiguous()
+    # test_m_grouped_gemm_contiguous()
     test_m_grouped_gemm_masked()
     # test_k_grouped_gemm_contiguous()  # requires k_grouped functions not in this module
