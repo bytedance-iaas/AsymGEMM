@@ -62,9 +62,8 @@ static void sm80_m_grouped_moe_gemm_contiguous(
     const std::string& element_type_str)
 {
     // Validate dtype string early — gives a readable error rather than an NVCC failure
-    DG_HOST_ASSERT((element_type_str == "cutlass::half_t" ||
-                    element_type_str == "cutlass::bfloat16_t") &&
-                   "element_type_str must be cutlass::half_t or cutlass::bfloat16_t");
+    DG_HOST_ASSERT(element_type_str == "cutlass::half_t" or
+                   element_type_str == "cutlass::bfloat16_t");
 
     // Select block config based on current device arch
     const auto& [arch_major, arch_minor] = device_runtime->get_arch_pair();
@@ -93,9 +92,10 @@ static void sm80_m_grouped_moe_gemm_contiguous(
         .params        = params,
     };
 
-    // Kernel name encodes dtype for separate CUBIN cache entries
-    const std::string kernel_name = fmt::format("sm80_moe_gemm_{}",
-        (element_type_str == "cutlass::half_t") ? "fp16" : "bf16");
+    // Kernel name encodes dtype + tile dims so different configs get separate CUBINs
+    const std::string kernel_name = fmt::format("sm80_moe_gemm_{}_bm{}_bn{}_bk{}",
+        (element_type_str == "cutlass::half_t") ? "fp16" : "bf16",
+        cfg.block_m, cfg.block_n, cfg.block_k);
 
     const auto& code    = SM80MoEGemmRuntime::generate(args);
     const auto& runtime = compiler->build(kernel_name, code);
