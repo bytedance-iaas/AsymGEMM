@@ -8,6 +8,7 @@
 #include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
+#include <cute/arch/mma_sm100_desc.hpp>
 
 #include <asym_gemm/common/asymScheduler.cuh>
 #include <asym_gemm/common/utils.cuh>
@@ -62,7 +63,6 @@ sm90_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
     // Configs
     constexpr uint32_t WAVE_BLOCK_M = (BLOCK_M <= WGMMA::M) ? BLOCK_M : cute::min<uint32_t>(BLOCK_M, static_cast<uint32_t>(WGMMA::M) * 2);
     constexpr uint32_t kNumMWaves = BLOCK_M / WAVE_BLOCK_M;
-    DG_STATIC_ASSERT(kNumMWaves == 1, "BLOCK_M > WAVE_BLOCK_M not supported for SM90 asym GEMM");
     constexpr uint32_t kNumTMAStoreStages = 2;
     DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0, "Invalid block M");
 
@@ -95,7 +95,6 @@ sm90_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
     DG_STATIC_ASSERT(not kIsMulticastOnA or kNumMulticast == 1, "Invalid multicast");
     DG_STATIC_ASSERT(LOAD_BLOCK_M == BLOCK_M, "Only support A/D layout without multicast on A");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
-    DG_STATIC_ASSERT(kNumMulticast == 1 or kIsMulticastOnA, "B-side multicast not supported in SM90 asym GEMM");
 
     // Shared memory sizes
     constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * kSwizzleCDMode;
@@ -344,7 +343,7 @@ sm90_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                 cutlass::arch::NamedBarrier::sync(kNumWGMMAStoreThreads, 0);
 
                 // warp_idx within warp-group for STSM offset computation
-                const uint32_t wg_local_warp_idx = warp_idx;
+                const uint32_t wg_local_warp_idx = warp_idx % 4;
 
                 if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
                     // Write back to shared memory using STSM
