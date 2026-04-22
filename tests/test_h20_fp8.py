@@ -129,7 +129,8 @@ def test_m_grouped_fp8_masked_sm90() -> None:
         d_asym = torch.empty_like(d)
         asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(
             a, b, d_asym, masked_m, expected_m_per_group,
-            disable_ue8m0_cast=disable_ue8m0_cast
+            disable_ue8m0_cast=disable_ue8m0_cast,
+            recipe=(1, 1, 128)
         )
 
         max_diff = 0.0
