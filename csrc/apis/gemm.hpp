@@ -423,50 +423,51 @@ static void m_grouped_moe_gemm_nt_contiguous(
     const torch::Tensor& index_list)
 {
     // ── Shape checks ──────────────────────────────────────────────────────────
-    DG_HOST_ASSERT(x.dim() == 2 && "x must be 2D [total_tokens, K]");
-    DG_HOST_ASSERT(w.dim() == 3 && "w must be 3D [num_experts, N, K]");
-    DG_HOST_ASSERT(o.dim() == 2 && "o must be 2D [total_tokens, N]");
+    DG_HOST_ASSERT(x.dim() == 2);
+    DG_HOST_ASSERT(w.dim() == 3);
+    DG_HOST_ASSERT(o.dim() == 2);
 
-    const int64_t total_tokens = x.size(0);
-    const int64_t K            = x.size(1);
-    const int64_t num_experts  = w.size(0);
-    const int64_t N            = w.size(1);
-    const int64_t K_w          = w.size(2);
+    const int64_t total_tokens   = x.size(0);
+    const int64_t K              = x.size(1);
+    const int64_t num_experts    = w.size(0);
+    const int64_t N              = w.size(1);
+    const int64_t K_w            = w.size(2);
     const int64_t total_tokens_o = o.size(0);
-    const int64_t N_o          = o.size(1);
+    const int64_t N_o            = o.size(1);
 
-    DG_HOST_ASSERT(K == K_w         && "K mismatch between x and w");
-    DG_HOST_ASSERT(N == N_o         && "N mismatch between w and o");
-    DG_HOST_ASSERT(total_tokens == total_tokens_o && "total_tokens mismatch");
+    DG_HOST_ASSERT(K == K_w);
+    DG_HOST_ASSERT(N == N_o);
+    DG_HOST_ASSERT(total_tokens == total_tokens_o);
 
     // ── Dtype checks ──────────────────────────────────────────────────────────
-    DG_HOST_ASSERT((x.scalar_type() == torch::kFloat16 ||
-                    x.scalar_type() == torch::kBFloat16) &&
-                   "x must be float16 or bfloat16");
-    DG_HOST_ASSERT(w.scalar_type() == x.scalar_type() && "w dtype must match x");
-    DG_HOST_ASSERT(o.scalar_type() == x.scalar_type() && "o dtype must match x");
+    DG_HOST_ASSERT(x.scalar_type() == torch::kFloat16 or x.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(w.scalar_type() == x.scalar_type());
+    DG_HOST_ASSERT(o.scalar_type() == x.scalar_type());
+
+    // ── CUDA placement ────────────────────────────────────────────────────────
+    DG_HOST_ASSERT(x.is_cuda());
+    DG_HOST_ASSERT(w.is_cuda());
+    DG_HOST_ASSERT(o.is_cuda());
 
     // ── Contiguity ────────────────────────────────────────────────────────────
-    DG_HOST_ASSERT(x.is_contiguous() && "x must be contiguous");
-    DG_HOST_ASSERT(w.is_contiguous() && "w must be contiguous");
-    DG_HOST_ASSERT(o.is_contiguous() && "o must be contiguous");
+    DG_HOST_ASSERT(x.is_contiguous());
+    DG_HOST_ASSERT(w.is_contiguous());
+    DG_HOST_ASSERT(o.is_contiguous());
 
     // ── expert_list / index_list ──────────────────────────────────────────────
-    DG_HOST_ASSERT(expert_list.is_cuda()       && "expert_list must be CUDA");
-    DG_HOST_ASSERT(index_list.is_cuda()        && "index_list must be CUDA");
-    DG_HOST_ASSERT(expert_list.is_contiguous() && "expert_list must be contiguous");
-    DG_HOST_ASSERT(index_list.is_contiguous()  && "index_list must be contiguous");
-    DG_HOST_ASSERT(expert_list.scalar_type() == torch::kInt32 && "expert_list must be int32");
-    DG_HOST_ASSERT(index_list.scalar_type()  == torch::kInt32 && "index_list must be int32");
-    DG_HOST_ASSERT(expert_list.numel() == index_list.numel() && "expert_list and index_list must have same length");
+    DG_HOST_ASSERT(expert_list.is_cuda() and index_list.is_cuda());
+    DG_HOST_ASSERT(expert_list.is_contiguous() and index_list.is_contiguous());
+    DG_HOST_ASSERT(expert_list.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(index_list.scalar_type()  == torch::kInt32);
+    DG_HOST_ASSERT(expert_list.numel() == index_list.numel());
+
+    // ── Empty check (before alignment guards so K==0 doesn't trigger K>=64) ──
+    if (total_tokens == 0 or N == 0 or K == 0) return;
 
     // ── Alignment checks ──────────────────────────────────────────────────────
-    DG_HOST_ASSERT(K % 16 == 0  && "K must be a multiple of 16 (MMA k-dim)");
-    DG_HOST_ASSERT(N % 32 == 0  && "N must be a multiple of 32 (min block_n)");
-    DG_HOST_ASSERT(K >= 64      && "K must be >= 64");
-
-    // ── Empty check ───────────────────────────────────────────────────────────
-    if (total_tokens == 0 || N == 0 || K == 0) return;
+    DG_HOST_ASSERT(K % 16 == 0);
+    DG_HOST_ASSERT(N % 32 == 0);
+    DG_HOST_ASSERT(K >= 64);
 
     // ── Resolve element type and dispatch ─────────────────────────────────────
     const std::string element_type_str =
