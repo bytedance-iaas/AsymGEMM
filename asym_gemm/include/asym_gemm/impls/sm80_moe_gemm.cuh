@@ -237,13 +237,17 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
                         tidx, static_cast<int>(NWARPS * 32));
                     __syncthreads();
 
-                    // Element-wise copy with M predicate
+                    // Element-wise copy with M predicate — iterate all three modes
+                    // (atom, M, K) so every element within a copy atom is handled.
                     Tensor tXgX_k = tXgX_m(_, _, k);
                     for (int mi = 0; mi < size<1>(tXsX); mi++) {
                         int m_coord = get<0>(tXcX(_0{}, mi, _0{}));
-                        for (int ki = 0; ki < size<2>(tXsX); ki++) {
-                            if (m_coord < m_actual)
-                                tXsX(_0{}, mi, ki) = tXgX_k(_0{}, mi, ki);
+                        if (m_coord < m_actual) {
+                            for (int ai = 0; ai < size<0>(tXsX); ai++) {
+                                for (int ki = 0; ki < size<2>(tXsX); ki++) {
+                                    tXsX(ai, mi, ki) = tXgX_k(ai, mi, ki);
+                                }
+                            }
                         }
                     }
                 }
@@ -285,12 +289,17 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
             Tensor tOrO  = make_tensor<Element>(shape(tOgO));
             cute::copy(gmem_tiled_copy_o, tOsO_src, tOrO);
 
-            // Write to global with M predicate
-            for (int ci = 0; ci < size(tOgO); ci++) {
-                int mi_idx = ci % static_cast<int>(size<1>(tOgO));
-                int m_coord = get<0>(tOcO(_0{}, mi_idx, _0{}));
-                if (m_coord < m_actual)
-                    tOgO(ci) = tOrO(ci);
+            // Write to global with M predicate — iterate modes (atom, M, N)
+            // explicitly so the M-coordinate check is unambiguous.
+            for (int mi = 0; mi < size<1>(tOgO); mi++) {
+                int m_coord = get<0>(tOcO(_0{}, mi, _0{}));
+                if (m_coord < m_actual) {
+                    for (int ai = 0; ai < size<0>(tOgO); ai++) {
+                        for (int ni = 0; ni < size<2>(tOgO); ni++) {
+                            tOgO(ai, mi, ni) = tOrO(ai, mi, ni);
+                        }
+                    }
+                }
             }
 
             __syncthreads();
