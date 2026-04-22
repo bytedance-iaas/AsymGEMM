@@ -2,8 +2,6 @@
 #pragma once
 
 #include <cstdint>
-#include <utility>
-#include <string>
 
 namespace asym_gemm {
 namespace sm80 {
