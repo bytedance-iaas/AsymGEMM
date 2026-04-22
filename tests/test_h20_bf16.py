@@ -9,66 +9,73 @@ from generators import (
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (copied from test_bf16.py — not importable as a package)
 # ---------------------------------------------------------------------------
 
-def build_offsets_experts_from_m_indices_pairs(m_indices: torch.Tensor, block_m: int = 128):
+@torch.no_grad()
+def extract_offsets_and_experts_start(m_indices: torch.Tensor, drop_invalid: bool = True):
     """
-    Convert 1D expert-id array m_indices (contiguous layout) into offset pairs and experts.
+    Convert a 1D expert-id array m_indices (length M) into:
+      offsets: 1D int64 tensor of segment start positions (0-based)
+      experts: 1D tensor of expert ids for each segment
 
-    Groups contiguous tokens by expert, creating (start, end) offset pairs for each group.
-    Each pair is padded to block_m alignment.
-
-    Args:
-        m_indices: (M,) tensor with expert IDs, where -1 indicates invalid tokens
-        block_m: block alignment (default 128)
-
-    Returns:
-        offsets: flat tensor with pairs [start_0, end_0, start_1, end_1, ...]
-        experts: expert IDs for each group + terminator (-1)
-        list_size: number of experts (including terminator)
+    If drop_invalid=True, segments with expert == -1 are removed.
+    A sentinel pair (M, -1) is appended to the output when M > 0.
     """
     assert m_indices.dim() == 1, f"expected 1D m_indices, got {m_indices.shape}"
     M = m_indices.numel()
     device = m_indices.device
 
     if M == 0:
-        offsets = torch.empty((0,), device=device, dtype=torch.int32)
-        experts = torch.tensor([-1], device=device, dtype=m_indices.dtype)
-        return offsets, experts, 1
+        offsets = torch.empty((0,), device=device, dtype=torch.long)
+        experts = torch.empty((0,), device=device, dtype=m_indices.dtype)
+        return offsets, experts
 
-    # Find boundaries where expert id changes
     change = (m_indices[1:] != m_indices[:-1])
-
-    # Segment start indices
     starts = torch.nonzero(change, as_tuple=False).flatten().to(torch.long) + 1
-    segment_starts = torch.cat([torch.zeros((1,), device=device, dtype=torch.long), starts], dim=0)
+    offsets = torch.cat([torch.zeros((1,), device=device, dtype=torch.long), starts], dim=0)
+    experts = m_indices[offsets]
 
-    # Segment end indices
-    segment_ends = torch.cat([starts, torch.tensor([M], device=device, dtype=torch.long)], dim=0)
+    if drop_invalid:
+        keep = (experts != -1)
+        offsets = offsets[keep]
+        experts = experts[keep]
 
-    # Expert id for each segment
-    segment_experts = m_indices[segment_starts]
+    offsets = torch.cat(
+        [offsets, torch.tensor([M], device=device, dtype=torch.long)],
+        dim=0,
+    )
+    experts = torch.cat(
+        [experts, torch.tensor([-1], device=device, dtype=m_indices.dtype)],
+        dim=0,
+    )
 
+    return offsets, experts
+
+
+def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, max_m: int, block_m: int = 128):
+    """
+    Build offsets and experts for sparse m-grouped masked GEMM with fixed per-group allocation.
+
+    Each group gets fixed allocation of max_m space. Only groups with masked_m[g] > 0 are
+    included in the output mapping. Each active group generates a pair of offsets (start, end).
+    """
     offsets = []
     experts = []
 
-    for start, end, expert_id in zip(segment_starts.tolist(), segment_ends.tolist(), segment_experts.tolist()):
-        if expert_id == -1:  # Skip invalid segments
-            continue
+    for g in range(num_groups):
+        v = masked_m[g].item()
+        if v > 0:
+            start = g * max_m
+            end = start + ((v + block_m - 1) // block_m) * block_m
+            offsets.append(start)
+            offsets.append(end)
+            experts.append(g)
 
-        # Pad to block_m alignment
-        start_padded = (start // block_m) * block_m
-        end_padded = ((end + block_m - 1) // block_m) * block_m
+    experts.append(-1)
 
-        offsets.append(start_padded)
-        offsets.append(end_padded)
-        experts.append(expert_id)
-
-    experts.append(-1)  # Terminator
-
-    return (torch.tensor(offsets, dtype=torch.int32, device=device),
-            torch.tensor(experts, dtype=m_indices.dtype, device=device),
+    return (torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
+            torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
             len(experts))
 
 
@@ -93,7 +100,10 @@ def test_m_grouped_bf16_contiguous_sm90():
         b_pinned = b.detach().to("cpu", non_blocking=False).pin_memory()
         d_asym = torch.empty_like(d)
 
-        offsets_i32, experts_i32, list_size = build_offsets_experts_from_m_indices_pairs(m_indices)
+        offsets, experts = extract_offsets_and_experts_start(m_indices)
+        experts_i32 = experts.to(dtype=torch.int32, device="cuda").contiguous()
+        offsets_i32 = offsets.to(dtype=torch.int32, device="cuda").contiguous()
+        list_size = experts_i32.numel()
 
         asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous(
             a, b_pinned, d_asym, offsets_i32, experts_i32, list_size, compiled_dims
@@ -150,11 +160,3 @@ def test_m_grouped_bf16_masked_sm90():
             f"max_diff={max_diff:.5e} too large for "
             f"num_groups={num_groups}, expected_m_per_group={expected_m_per_group}, n={n}, k={k}"
         )
-
-
-if __name__ == '__main__':
-    import random
-    random.seed(0)
-    torch.manual_seed(0)
-    test_m_grouped_bf16_contiguous_sm90()
-    test_m_grouped_bf16_masked_sm90()
