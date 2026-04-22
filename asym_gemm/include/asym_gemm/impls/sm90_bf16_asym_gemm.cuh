@@ -8,6 +8,7 @@
 #include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
+#include <cute/arch/mma_sm100_desc.hpp>
 
 #include <asym_gemm/common/asymScheduler.cuh>
 #include <asym_gemm/common/utils.cuh>
@@ -344,7 +345,7 @@ sm90_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                 cutlass::arch::NamedBarrier::sync(kNumWGMMAStoreThreads, 0);
 
                 // warp_idx within warp-group for STSM offset computation
-                const uint32_t wg_local_warp_idx = warp_idx;
+                const uint32_t wg_local_warp_idx = warp_idx % 4;
 
                 if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
                     // Write back to shared memory using STSM
