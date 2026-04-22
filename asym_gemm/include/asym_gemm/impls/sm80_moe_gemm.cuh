@@ -20,11 +20,11 @@ using namespace cute;
 // ──────────────────────────────────────────────────────────────────────────────
 // Cooperative clear helper: zero a raw smem region using all threads
 // ──────────────────────────────────────────────────────────────────────────────
-template <int NUM_ELEMS>
+template <int NUM_BYTES>
 CUTE_DEVICE void clear_smem_region(char* ptr, int tidx, int num_threads) {
-    static_assert(NUM_ELEMS % 4 == 0, "NUM_ELEMS must be 4-byte aligned");
+    static_assert(NUM_BYTES % 4 == 0, "NUM_BYTES must be 4-byte aligned");
     auto* iptr = reinterpret_cast<int32_t*>(ptr);
-    constexpr int n_ints = NUM_ELEMS / 4;
+    constexpr int n_ints = NUM_BYTES / 4;
     CUTE_UNROLL
     for (int i = tidx; i < n_ints; i += num_threads)
         iptr[i] = 0;
@@ -60,6 +60,8 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
     static_assert(BLOCK_M % (NWARPS * 16) == 0, "BLOCK_M must be divisible by NWARPS*16");
 
     // ── Typed pointer casts ──────────────────────────────────────────────────
+    // Runtime alignment assertions — the heuristic in select_sm80_config guarantees
+    // these, but guard here so any future caller can see a clear failure site.
     const Element* __restrict__ x_g =
         reinterpret_cast<const Element*>(params.x_ptr);
     const Element* __restrict__ w_g =
@@ -69,6 +71,8 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
 
     const int64_t N  = params.N;
     const int64_t K  = params.K;
+    assert(K % static_cast<int64_t>(BLOCK_K) == 0 && "K must be divisible by BLOCK_K");
+    assert(N % static_cast<int64_t>(BLOCK_N) == 0 && "N must be divisible by BLOCK_N");
     const int tidx   = static_cast<int>(threadIdx.x);
     const int n_tile = static_cast<int>(blockIdx.x);  // which N-block this CTA owns
 
@@ -280,6 +284,11 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
             __syncthreads();
 
             // ── Write sO → gO (with M predicate for partial last tile) ────────
+            // Safety invariant for partial tiles: MMA accumulates over zeroed sX rows
+            // (via clear_smem_region + predicated fill), so accumulators for M rows
+            // >= m_actual are 0.0. The M predicate below prevents writing those zeros
+            // to global memory. tOrO is read from sO for all rows but only written for
+            // valid rows — the stale sO values (zeros) for out-of-bounds rows are safe.
             Tensor gO_m  = gO(_, _, m);               // (BLOCK_M, BLOCK_N)
             Tensor cO    = make_identity_tensor(Shape<Int<BLOCK_M>, Int<BLOCK_N>>{});
             Tensor tOcO  = gmem_thr_copy_o.partition_S(cO);
