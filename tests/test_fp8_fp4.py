@@ -17,30 +17,21 @@ from generators import (
     generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous
 )
 
-def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, max_m: int, block_m: int = 128):
-    """
-    Build offsets/experts for asymScheduler (pairs format) from a masked_m tensor.
-
-    `a` is stored as (num_groups, max_m, k), so each group occupies `max_m` slots
-    starting at `g * max_m`. Only groups with masked_m[g] > 0 are emitted.
-    Each active group contributes a (start, end) pair. `experts` has a trailing -1.
-
-    Layout matches asymScheduler: offsets[blockIdx.y*2] = start, offsets[blockIdx.y*2+1] = end.
-    """
+def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, block_m: int = 128):
     offsets = []
     experts = []
+    curr_offset = 0
     for g in range(num_groups):
         v = masked_m[g].item()
         if v > 0:
-            start = g * max_m
-            end = start + ((v + block_m - 1) // block_m) * block_m
-            offsets.append(start)
-            offsets.append(end)
+            offsets.append(curr_offset)
             experts.append(g)
+            curr_offset += ((v + block_m - 1) // block_m) * block_m
+    offsets.append(curr_offset)
     experts.append(-1)
-    return (torch.tensor(offsets, dtype=torch.int32, device='cuda'),
-            torch.tensor(experts, dtype=torch.int32, device='cuda'),
-            len(experts))
+    return (torch.tensor(offsets, dtype=torch.int32, device='cuda'), 
+            torch.tensor(experts, dtype=torch.int32, device='cuda'), 
+            len(offsets))
 
 def test_m_grouped_gemm_contiguous() -> None:
     print('Testing m-grouped contiguous GEMM:')
@@ -55,27 +46,28 @@ def test_m_grouped_gemm_contiguous() -> None:
         disable_ue8m0_cast = not use_ue8m0
         recipe = (1, 128, 128)
 
-        m, a, b, m_indices, d, ref_d = generate_m_grouped_contiguous(
+        m, a, b, grouped_layout, d, ref_d = generate_m_grouped_contiguous(
             num_groups, expected_m_per_group, n, k, major_a, major_b, use_ue8m0=use_ue8m0
         )
-        # Convert m_indices (contiguous layout) into pairs-format offsets/experts
-        # matching asymScheduler's expected layout (see tests/test_fp8.py).
-        from test_fp8 import build_offsets_experts_from_m_indices_pairs
-        offsets, experts, list_size = build_offsets_experts_from_m_indices_pairs(m_indices)
-        fp8_kernel(a, b, d, offsets, experts, list_size,
-                   recipe=recipe, disable_ue8m0_cast=disable_ue8m0_cast)
+        try:
+            fp8_kernel(a, b, d, grouped_layout, recipe=recipe, disable_ue8m0_cast=disable_ue8m0_cast)
+        except TypeError:
+            fp8_kernel(a, b, d, grouped_layout, disable_ue8m0_cast=disable_ue8m0_cast)
         diff = calc_diff(d, ref_d)
         assert diff < 0.05, f'{m=}, {n=}, {k=}, {major_opt}, {kernel_opt}, {diff:.5f}'
-        m, a, b, m_indices, d, ref_d = generate_m_grouped_contiguous(
+        m, a, b, grouped_layout, d, ref_d = generate_m_grouped_contiguous(
             num_groups, expected_m_per_group, n, k, major_a, major_b, use_ue8m0=use_ue8m0
         )
-        offsets, experts, list_size = build_offsets_experts_from_m_indices_pairs(m_indices)
 
         # noinspection PyShadowingNames
         def test_func():
-            fp8_kernel(a, b, d, offsets, experts, list_size,
-                       recipe=recipe, disable_ue8m0_cast=disable_ue8m0_cast)
+            try:
+                fp8_kernel(a, b, d, grouped_layout, recipe=recipe, disable_ue8m0_cast=disable_ue8m0_cast)
+            except TypeError:
+                fp8_kernel(a, b, d, grouped_layout, disable_ue8m0_cast=disable_ue8m0_cast)
 
+        import ipdb
+        ipdb.set_trace()
         t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
         print(f' > Perf ({num_groups=}, m={m:5}, n={n:6}, k={k:5}, {kernel_opt}, layout={major_opt}): '
               f'{t * 1e6:4.0f} us | '
@@ -112,6 +104,7 @@ def test_m_grouped_gemm_masked() -> None:
 
 
             # Construct full cases
+            offsets, experts, list_size = build_offsets_experts_from_masked_m(masked_m, num_groups)
             d_asym = torch.empty_like(d)
 
             # noinspection PyShadowingNames
@@ -133,7 +126,7 @@ def test_m_grouped_gemm_masked() -> None:
 
             # noinspection PyShadowingNames
             def test_func_asym():
-                asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(a, b, d_asym, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+                asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(a, b, d_asym, offsets, experts, list_size, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
 
 
             test_func()

@@ -202,14 +202,6 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = asymScheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs>(shape_m, shape_n, experts, offsets);
 
-    // Early-exit for inactive expert slots in the masked layout.
-    // With gridDim.y == num_groups (constant), slots whose token count is zero must
-    // return immediately. Safe here: cluster_sync() has completed and no TMA or TMEM
-    // barriers have been armed yet, so no barrier is left in an un-arrived state.
-    if constexpr (kGemmType == GemmType::MGroupedMasked) {
-        if (scheduler.m_end == 0) return;
-    }
-
     // Pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0, tensor_core_phase = 0, phase_b = 0;
     auto advance_pipeline = [&](uint32_t& block_idx) {
