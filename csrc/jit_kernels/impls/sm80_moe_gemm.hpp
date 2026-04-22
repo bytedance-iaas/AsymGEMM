@@ -11,27 +11,13 @@
 #include "../../utils/exception.hpp"
 #include "../../utils/format.hpp"
 #include "../heuristics/sm80.hpp"
+#include <asym_gemm/impls/sm80_moe_params.h>
 
 namespace asym_gemm {
-
-// Non-templated params struct — void* data pointers so this struct is layout-stable
-// across the type-erased launch_kernel() boundary. The kernel casts to Element* internally.
-struct SM80MoEParams {
-    void*    x_ptr;         // [total_tokens, K] row-major
-    void*    w_ptr;         // [num_experts, N, K] row-major
-    void*    o_ptr;         // [total_tokens, N] row-major
-    int32_t* expert_list;   // [list_size] expert IDs
-    int32_t* index_list;    // [list_size] cumulative end-token indices
-    int32_t  list_size;
-    int32_t  expert_size;   // num_experts (outer dim of W)
-    int64_t  N;
-    int64_t  K;
-};
 
 class SM80MoEGemmRuntime final : public LaunchRuntime<SM80MoEGemmRuntime> {
 public:
     struct Args {
-        int64_t n, k;
         sm80::SM80GemmConfig gemm_config;
         LaunchArgs launch_args;
         std::string element_type_str;   // "cutlass::half_t" or "cutlass::bfloat16_t"
@@ -94,8 +80,6 @@ static void sm80_m_grouped_moe_gemm_contiguous(
     };
 
     const SM80MoEGemmRuntime::Args args {
-        .n             = N,
-        .k             = K,
         .gemm_config   = cfg,
         .launch_args   = LaunchArgs({cfg.grid_x(static_cast<int>(N)), 1},
                                     cfg.num_threads(),
@@ -106,7 +90,7 @@ static void sm80_m_grouped_moe_gemm_contiguous(
 
     // Kernel name encodes dtype for separate CUBIN cache entries
     const std::string kernel_name = fmt::format("sm80_moe_gemm_{}",
-        (element_type_str.find("half") != std::string::npos) ? "fp16" : "bf16");
+        (element_type_str == "cutlass::half_t") ? "fp16" : "bf16");
 
     const auto& code    = SM80MoEGemmRuntime::generate(args);
     const auto& runtime = compiler->build(kernel_name, code);
