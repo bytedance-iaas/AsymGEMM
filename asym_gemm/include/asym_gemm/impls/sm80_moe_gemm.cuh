@@ -71,8 +71,11 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
 
     const int64_t N  = params.N;
     const int64_t K  = params.K;
-    assert(K % static_cast<int64_t>(BLOCK_K) == 0 && "K must be divisible by BLOCK_K");
-    assert(N % static_cast<int64_t>(BLOCK_N) == 0 && "N must be divisible by BLOCK_N");
+    // Guard to thread 0 to avoid redundant per-thread abort floods on violation.
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        assert(K % static_cast<int64_t>(BLOCK_K) == 0);
+        assert(N % static_cast<int64_t>(BLOCK_N) == 0);
+    }
     const int tidx   = static_cast<int>(threadIdx.x);
     const int n_tile = static_cast<int>(blockIdx.x);  // which N-block this CTA owns
 
