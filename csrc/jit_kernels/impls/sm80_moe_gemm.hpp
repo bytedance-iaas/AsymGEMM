@@ -61,6 +61,11 @@ static void sm80_m_grouped_moe_gemm_contiguous(
     int64_t N, int64_t K, int32_t num_experts, int32_t list_size,
     const std::string& element_type_str)
 {
+    // Validate dtype string early — gives a readable error rather than an NVCC failure
+    DG_HOST_ASSERT((element_type_str == "cutlass::half_t" ||
+                    element_type_str == "cutlass::bfloat16_t") &&
+                   "element_type_str must be cutlass::half_t or cutlass::bfloat16_t");
+
     // Select block config based on current device arch
     const auto& [arch_major, arch_minor] = device_runtime->get_arch_pair();
     const auto cfg = sm80::select_sm80_config(arch_major, arch_minor,
