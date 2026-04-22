@@ -314,9 +314,9 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
         //   r_0 = (warp_idx % 4) * 16 + lane_idx / 4   (first 8 rows of this thread)
         //   r_1 = r_0 + 8                                (second 8 rows)
         //   col_idx = lane_idx % 4
-        const uint32_t wg_local_warp_idx = warp_idx;
+        const uint32_t wg_local_warp_idx_scale = warp_idx % 4;
         const uint32_t row_idx = lane_idx / 4, col_idx_scale = lane_idx % 4;
-        const uint32_t r_0 = wg_local_warp_idx * 16 + row_idx;
+        const uint32_t r_0 = wg_local_warp_idx_scale * 16 + row_idx;
         const uint32_t r_1 = r_0 + 8;
 
         // Empty barrier arrival helpers
@@ -358,24 +358,6 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                 // B is always in slot 0 (single slot)
                 const auto b_desc_base_lo = b_desc_lo;
 
-                // Read scale factors while smem_sfa/smem_sfb are still owned by the math side
-                // (must happen before empty_barrier_arrive_a releases smem_sfa[stage_idx])
-                // Load SFB: 2 floats per group-of-4 accumulator columns
-                float2 scales_b[WGMMA::kNumAccum / 4];
-                #pragma unroll
-                for (int i = 0; i < WGMMA::kNumAccum / 4; ++i)
-                    scales_b[i] = *reinterpret_cast<const float2*>(smem_sfb[0] + i * 8 + col_idx_scale * 2);
-
-                // Load per-token (row) scale factors for rows owned by this thread
-                // m_offset accounts for multiple M waves (kNumMWaves==1 here, but kept general)
-                float scale_a_0[kNumMWaves], scale_a_1[kNumMWaves];
-                #pragma unroll
-                for (uint32_t local_idx = 0; local_idx < kNumMWaves; ++local_idx) {
-                    auto m_offset = local_idx * WAVE_BLOCK_M;
-                    scale_a_0[local_idx] = ld_shared(smem_sfa[stage_idx] + m_offset + r_0);
-                    scale_a_1[local_idx] = ld_shared(smem_sfa[stage_idx] + m_offset + r_1);
-                }
-
                 // Issue WGMMA
                 #pragma unroll
                 for (uint32_t i = 0; i < WGMMA::kNumAccum * kNumMWaves; ++ i)
@@ -400,7 +382,7 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                     warpgroup_fence_operand(accum[i]);
                 warpgroup_wait<0>();
 
-                // Release A smem (safe: scale reads already completed above)
+                // Release A smem
                 empty_barrier_arrive_a(stage_idx);
 
                 // Skip WGMMA store for threads not participating
@@ -416,11 +398,26 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                     cute::tma_store_wait<kNumTMAStoreStages - 1>();
                 cutlass::arch::NamedBarrier::sync(kNumWGMMAStoreThreads, 0);
 
+                // warp_idx within warp-group for address computation
+                const uint32_t wg_local_warp_idx = warp_idx % 4;
+
+                // Load per-row scale factors for rows owned by this thread
+                // m_offset accounts for multiple M waves (kNumMWaves==1 here, but kept general)
+                // Load SFB: 2 floats per group-of-4 accumulator columns
+                float2 scales_b[WGMMA::kNumAccum / 4];
+                #pragma unroll
+                for (int i = 0; i < WGMMA::kNumAccum / 4; ++i)
+                    scales_b[i] = *reinterpret_cast<const float2*>(smem_sfb[0] + i * 8 + col_idx_scale * 2);
+
                 // Use st_shared for FP32 output with per-element scale application
                 #pragma unroll
                 for (uint32_t local_idx = 0; local_idx < kNumMWaves; ++ local_idx) {
                     auto m_offset = local_idx * WAVE_BLOCK_M;
                     auto shifted_accum = accum + WGMMA::kNumAccum * local_idx;
+
+                    // Load per-token (row) scale factors
+                    float scale_a_0 = ld_shared(smem_sfa[stage_idx] + m_offset + r_0);
+                    float scale_a_1 = ld_shared(smem_sfa[stage_idx] + m_offset + r_1);
 
                     auto smem_d_0 = reinterpret_cast<float2*>(smem_cd[tma_stage_idx] + (m_offset + wg_local_warp_idx * WGMMA_M_PER_WARP + lane_idx / 4 + 0) * BLOCK_N + (lane_idx % 4) * 2);
                     auto smem_d_1 = reinterpret_cast<float2*>(smem_cd[tma_stage_idx] + (m_offset + wg_local_warp_idx * WGMMA_M_PER_WARP + lane_idx / 4 + 8) * BLOCK_N + (lane_idx % 4) * 2);
@@ -428,10 +425,10 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                     #pragma unroll
                     for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
                         // Apply scale: final = scale_a * scale_b * raw_accum
-                        float val_0 = scale_a_0[local_idx] * scales_b[i].x * shifted_accum[i * 4 + 0];
-                        float val_1 = scale_a_0[local_idx] * scales_b[i].y * shifted_accum[i * 4 + 1];
-                        float val_2 = scale_a_1[local_idx] * scales_b[i].x * shifted_accum[i * 4 + 2];
-                        float val_3 = scale_a_1[local_idx] * scales_b[i].y * shifted_accum[i * 4 + 3];
+                        float val_0 = scale_a_0 * scales_b[i].x * shifted_accum[i * 4 + 0];
+                        float val_1 = scale_a_0 * scales_b[i].y * shifted_accum[i * 4 + 1];
+                        float val_2 = scale_a_1 * scales_b[i].x * shifted_accum[i * 4 + 2];
+                        float val_3 = scale_a_1 * scales_b[i].y * shifted_accum[i * 4 + 3];
                         st_shared(smem_d_0 + i * 4, make_float2(val_0, val_1));
                         st_shared(smem_d_1 + i * 4, make_float2(val_2, val_3));
                     }
