@@ -229,7 +229,7 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
                 // Load X tile — predicated if this is the last (partial) M-tile
                 if (m_actual == static_cast<int>(BLOCK_M)) {
                     // Full tile: use async copy
-                    Tensor tXgX_k = tXgX_m(_, _, k);
+                    Tensor tXgX_k = tXgX_m(_, _, _, k);
                     cute::copy(gmem_tiled_copy_xw, tXgX_k, tXsX);
                     cp_async_fence();
                     cp_async_wait<0>();
@@ -246,7 +246,7 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
 
                     // Element-wise copy with M predicate — iterate all three modes
                     // (atom, M, K) so every element within a copy atom is handled.
-                    Tensor tXgX_k = tXgX_m(_, _, k);
+                    Tensor tXgX_k = tXgX_m(_, _, _, k);
                     for (int mi = 0; mi < size<1>(tXsX); mi++) {
                         int m_coord = get<0>(tXcX(_0{}, mi, _0{}));
                         if (m_coord < m_actual) {
