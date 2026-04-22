@@ -54,6 +54,8 @@ try:
             # BF16 GEMMs
             "m_grouped_bf16_asym_gemm_nt_contiguous",
             "m_grouped_bf16_asym_gemm_nt_masked",
+            # SM80 MoE GEMM (FP16 + BF16, JIT)
+            "m_grouped_moe_gemm_nt_contiguous",
             # Einsum kernels
             "einsum",
             "fp8_einsum",
