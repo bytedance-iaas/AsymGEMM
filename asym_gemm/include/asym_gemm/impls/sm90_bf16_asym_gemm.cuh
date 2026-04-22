@@ -8,7 +8,6 @@
 #include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
-#include <cute/arch/mma_sm100_desc.hpp>
 
 #include <asym_gemm/common/asymScheduler.cuh>
 #include <asym_gemm/common/utils.cuh>
