@@ -72,7 +72,7 @@ def build_offsets_experts_from_m_indices_pairs(m_indices: torch.Tensor, block_m:
 @pytest.mark.skipif(get_arch_major() != 9, reason="SM90 (H20) required")
 def test_m_grouped_fp8_contiguous_sm90() -> None:
     print('Testing SM90 m-grouped contiguous FP8 asym GEMM:')
-    recipe = (1, 1, 128)
+    recipe = (1, 128, 128)
 
     for kernel_type, num_groups, expected_m_per_group, n, k, major_a, major_b in enumerate_m_grouped_contiguous(torch.float8_e4m3fn):
         major_opt  = 'N' if major_a.is_k_major() else 'T'
@@ -112,7 +112,7 @@ def test_m_grouped_fp8_contiguous_sm90() -> None:
 def test_m_grouped_fp8_masked_sm90() -> None:
     print('Testing SM90 m-grouped masked FP8 asym GEMM:')
 
-    for kernel_type, quant_config, num_groups, max_m, expected_m_per_group, n, k, use_psum_layout in enumerate_m_grouped_masked(torch.float8_e4m3fn):
+    for kernel_type, _, num_groups, max_m, expected_m_per_group, n, k, use_psum_layout in enumerate_m_grouped_masked(torch.float8_e4m3fn):
         # psum layout not supported on SM90
         if use_psum_layout:
             continue
@@ -130,7 +130,7 @@ def test_m_grouped_fp8_masked_sm90() -> None:
         asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(
             a, b, d_asym, masked_m, expected_m_per_group,
             disable_ue8m0_cast=disable_ue8m0_cast,
-            recipe=(1, 1, 128)
+            recipe=(1, 128, 128)
         )
 
         max_diff = 0.0
@@ -149,6 +149,8 @@ def test_m_grouped_fp8_masked_sm90() -> None:
 
 
 if __name__ == '__main__':
+    import random
+    random.seed(0)
     torch.manual_seed(0)
     test_m_grouped_fp8_contiguous_sm90()
     test_m_grouped_fp8_masked_sm90()
