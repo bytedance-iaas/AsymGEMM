@@ -146,50 +146,43 @@ static void print_5x5_compare(const torch::Tensor& d_asym, const torch::Tensor& 
     }
 }
 
-// Produce offset PAIRS [start_0, end_0, start_1, end_1, ...] and experts [e0, e1, ..., -1].
-// The asymScheduler reads offsets[blockIdx.y * 2] and offsets[blockIdx.y * 2 + 1].
 static int fill_with_sentinel(
     int* m_indices, int M,
-    int* offsets, int max_offsets,
-    int* experts, int max_experts
+    int* offsets, int* experts, int capacity
 ) {
-    if (!offsets || !experts || max_experts <= 0) return 0;
-    if (M <= 0 || !m_indices) return 0;
+    if (!offsets || !experts || capacity <= 0) return 0;
 
-    int num_experts = 0;
-    int off_write = 0;
+    if (M <= 0 || !m_indices) {
+        return 0;
+    }
 
-    // Find segments of contiguous expert IDs (skip -1 segments)
-    int seg_start = 0;
-    while (seg_start < M) {
-        int e = m_indices[seg_start];
-        // Find end of this segment
-        int seg_end = seg_start + 1;
-        while (seg_end < M && m_indices[seg_end] == e) ++seg_end;
+    int write = 0;
 
+    auto maybe_emit = [&](int start_idx) {
+        int e = m_indices[start_idx];
         if (e != -1) {
-            // Emit offset pair (start, end) padded to BLOCK_M alignment
-            constexpr int block_m = 128;
-            int start_padded = (seg_start / block_m) * block_m;
-            int end_padded   = ((seg_end + block_m - 1) / block_m) * block_m;
-            if (off_write + 1 < max_offsets && num_experts < max_experts) {
-                offsets[off_write]     = start_padded;
-                offsets[off_write + 1] = end_padded;
-                experts[num_experts]   = e;
-                off_write += 2;
-                ++num_experts;
+            if (write < capacity) {
+                offsets[write] = start_idx;
+                experts[write] = e;
             }
+            ++write;
         }
-        seg_start = seg_end;
+    };
+
+    maybe_emit(0);
+    for (int i = 1; i < M; ++i) {
+        if (m_indices[i] != m_indices[i - 1]) {
+            maybe_emit(i);
+        }
     }
 
-    // Sentinel expert
-    if (num_experts < max_experts) {
-        experts[num_experts] = -1;
+    if (write < capacity) {
+        offsets[write] = M;
+        experts[write] = -1;
     }
-    ++num_experts;
+    ++write;
 
-    return std::min(num_experts, max_experts);
+    return std::min(write, capacity);
 }
 
 static torch::Tensor build_m_indices_like_generators(
@@ -238,21 +231,42 @@ static torch::Tensor build_m_indices_like_generators(
     return m_indices_cpu;
 }
 
-struct ShapeConfig {
-    int64_t num_groups;
-    int64_t expected_m_per_group;
-    int64_t n;
-    int64_t k;
-};
+int main(int argc, char** argv) {
+    // JIT cache + lineinfo (optional but useful)
+    setenv("DG_JIT_CACHE_DIR", "/tmp/deepgemm_jit", 1);
+    setenv("DG_JIT_WITH_LINEINFO", "1", 1);
+    setenv("DG_JIT_DEBUG", "1", 1);
 
-static void run_one_shape(const ShapeConfig& shape, torch::Device dev, cudaStream_t stream,
-                           bool correctness_check) {
-    const int64_t num_groups = shape.num_groups;
-    const int64_t expected_m_per_group = shape.expected_m_per_group;
-    const int64_t n = shape.n;
-    const int64_t k = shape.k;
+    // CRITICAL: initialize DeepGEMM JIT globals BEFORE any kernel build
+    // NOTE: pass the directory whose child is "include/asym_gemm"
+    // In this repo that is: <repo>/asym_gemm
+    asym_gemm::Compiler::prepare_init(
+        "/sgl-workspace/sglang/AsymGEMM/asym_gemm",
+        "/usr/local/cuda-12.9"
+    );
+
+    asym_gemm::KernelRuntime::prepare_init("/usr/local/cuda-12.9");
+
+    torch::NoGradGuard ng;
+    if (!torch::cuda::is_available()) {
+        std::cerr << "CUDA not available.\n";
+        return 1;
+    }
+
+
+    auto dev = torch::Device(torch::kCUDA, 0);
+    c10::cuda::CUDAGuard device_guard(dev);
+
+    // -----------------------------
+    // 3) Tensors (your current demo settings)
+    // -----------------------------
+    const int64_t n = 4096, k = 7168, num_groups = 4;
+    const int64_t expected_m_per_group = 2048;
     int64_t m = 0, active_m = 0;
 
+    // Scale-factor layout for recipe (1, 128, 128) with BLOCK_K=128:
+    //   SFA: [m, ceil(k / 128)]
+    //   SFB: [num_groups, ceil(n / 128), ceil(k / 128)]
     constexpr int64_t block_k = 128;
     constexpr int64_t sfb_gran_n = 128;
     const int64_t sf_k = asym_gemm::ceil_div(k, block_k);
@@ -264,31 +278,22 @@ static void run_one_shape(const ShapeConfig& shape, torch::Device dev, cudaStrea
 
     auto m_indices_cpu = build_m_indices_like_generators(expected_m_per_group, num_groups, &m, &active_m);
     auto m_indices = m_indices_cpu.to(dev);
-    // Offsets are PAIRS: [start_0, end_0, start_1, end_1, ...] → 2*num_groups entries
-    // Experts: [e0, e1, ..., -1] → num_groups+1 entries
-    const int max_offsets = static_cast<int>(num_groups) * 2;
-    const int max_experts = static_cast<int>(num_groups) + 1;
-    std::vector<int> offsets_h(max_offsets);
-    std::vector<int> experts_h(max_experts);
+    const int max_len = static_cast<int>(num_groups) + 1;
+    std::vector<int> offsets_h(max_len);
+    std::vector<int> experts_h(max_len);
     const int list_size = fill_with_sentinel(m_indices_cpu.data_ptr<int>(), m_indices_cpu.numel(),
-                                             offsets_h.data(), max_offsets,
-                                             experts_h.data(), max_experts);
+                                             offsets_h.data(), experts_h.data(), max_len);
     auto opts_i32_cuda = torch::TensorOptions().device(dev).dtype(torch::kInt32);
-    auto offsets_t = torch::empty({max_offsets}, opts_i32_cuda);
-    auto experts_t = torch::empty({max_experts}, opts_i32_cuda);
+    auto offsets_t = torch::empty({max_len}, opts_i32_cuda);
+    auto experts_t = torch::empty({max_len}, opts_i32_cuda);
+    cudaStream_t stream = at::cuda::getDefaultCUDAStream();
     cudaMemcpyAsync(offsets_t.data_ptr<int>(), offsets_h.data(),
-                    max_offsets * sizeof(int), cudaMemcpyHostToDevice, stream);
+                    max_len * sizeof(int), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(experts_t.data_ptr<int>(), experts_h.data(),
-                    max_experts * sizeof(int), cudaMemcpyHostToDevice, stream);
+                    max_len * sizeof(int), cudaMemcpyHostToDevice, stream);
+    auto list_size_t = torch::tensor({list_size}, opts_i32_cuda);
 
     auto A_fp16 = torch::randn({m, k}, torch::TensorOptions().device(dev).dtype(torch::kFloat16));
-    // Zero out padding rows (where m_indices == -1) to match Python generators
-    {
-        auto mi = m_indices_cpu.data_ptr<int32_t>();
-        for (int64_t r = 0; r < m; ++r) {
-            if (mi[r] == -1) A_fp16[r].zero_();
-        }
-    }
     auto A = make_fp8_e4m3(A_fp16);
 
     auto B_fp16_cpu = torch::randn(
@@ -310,124 +315,48 @@ static void run_one_shape(const ShapeConfig& shape, torch::Device dev, cudaStrea
     std::pair<torch::Tensor, torch::Tensor> b_pair_cpu{B_cpu, SFB_cpu};
     std::pair<torch::Tensor, torch::Tensor> b_pair_gpu{B_gpu, SFB_gpu};
 
-    // Correctness check
-    if (correctness_check) {
-        asym_gemm::gemm::m_grouped_fp8_asym_gemm_nt_contiguous(
-            a_pair, b_pair_cpu, D_asym, offsets_t, experts_t, list_size,
-            recipe, compiled_dims, disable_ue8m0_cast);
-        if (!cuda_check("asym")) { std::cerr << "CUDA error in asym kernel\n"; return; }
+    std::cout << "Calling asym_gemm::gemm::m_grouped_fp8_asym_gemm_nt_contiguous...\n";
+    std::cout << "m=" << m << ", active_m=" << active_m << ", n=" << n << ", k=" << k << ", num_groups=" << num_groups << "\n";
+    std::cout << "A=" << A.sizes() << " " << A.scalar_type() << "  SFA=" << SFA.sizes() << " " << SFA.scalar_type() << "\n";
+    std::cout << "B_cpu=" << B_cpu.sizes() << " " << B_cpu.scalar_type()
+              << "  SFB_cpu=" << SFB_cpu.sizes() << " " << SFB_cpu.scalar_type() << "\n";
+    std::cout << "B_gpu=" << B_gpu.sizes() << " " << B_gpu.scalar_type()
+              << "  SFB_gpu=" << SFB_gpu.sizes() << " " << SFB_gpu.scalar_type() << "\n";
+    std::cout << "D_asym=" << D_asym.sizes() << " " << D_asym.scalar_type()
+              << "  D_deepGEMM=" << D_deepGEMM.sizes() << " " << D_deepGEMM.scalar_type()
+              << "  m_indices=" << m_indices.sizes() << " " << m_indices.scalar_type()
+              << "  list_size=" << list_size << "\n";
 
-        asym_gemm::gemm::m_grouped_fp8_gemm_nt_contiguous(
-            a_pair, b_pair_gpu, D_deepGEMM, m_indices, recipe, compiled_dims, disable_ue8m0_cast);
-        if (!cuda_check("deep")) { std::cerr << "CUDA error in deep kernel\n"; return; }
-
-        auto diff = (D_asym.to(torch::kFloat32) - D_deepGEMM.to(torch::kFloat32)).abs();
-        float max_diff = diff.max().item<float>();
-        float mean_diff = diff.mean().item<float>();
-        std::cout << "  Correctness: max_diff=" << std::scientific << max_diff
-                  << ", mean_diff=" << mean_diff << std::fixed << "\n";
-    }
-
-    // Performance benchmark
-    constexpr int warmup = 5;
-    constexpr int iters = 20;
-    cudaEvent_t start_ev, stop_ev;
-    cudaEventCreate(&start_ev);
-    cudaEventCreate(&stop_ev);
-
-    // Asym benchmark
-    for (int i = 0; i < warmup; ++i)
-        asym_gemm::gemm::m_grouped_fp8_asym_gemm_nt_contiguous(
-            a_pair, b_pair_cpu, D_asym, offsets_t, experts_t, list_size,
-            recipe, compiled_dims, disable_ue8m0_cast);
-    cudaDeviceSynchronize();
-
-    cudaEventRecord(start_ev, stream);
-    for (int i = 0; i < iters; ++i)
-        asym_gemm::gemm::m_grouped_fp8_asym_gemm_nt_contiguous(
-            a_pair, b_pair_cpu, D_asym, offsets_t, experts_t, list_size,
-            recipe, compiled_dims, disable_ue8m0_cast);
-    cudaEventRecord(stop_ev, stream);
-    cudaEventSynchronize(stop_ev);
-    float asym_ms = 0;
-    cudaEventElapsedTime(&asym_ms, start_ev, stop_ev);
-    asym_ms /= iters;
-    double flops = 2.0 * active_m * n * k;
-    double asym_tflops = flops / (asym_ms * 1e-3) / 1e12;
-
-    // DeepGEMM benchmark
-    for (int i = 0; i < warmup; ++i)
-        asym_gemm::gemm::m_grouped_fp8_gemm_nt_contiguous(
-            a_pair, b_pair_gpu, D_deepGEMM, m_indices, recipe, compiled_dims, disable_ue8m0_cast);
-    cudaDeviceSynchronize();
-
-    cudaEventRecord(start_ev, stream);
-    for (int i = 0; i < iters; ++i)
-        asym_gemm::gemm::m_grouped_fp8_gemm_nt_contiguous(
-            a_pair, b_pair_gpu, D_deepGEMM, m_indices, recipe, compiled_dims, disable_ue8m0_cast);
-    cudaEventRecord(stop_ev, stream);
-    cudaEventSynchronize(stop_ev);
-    float deep_ms = 0;
-    cudaEventElapsedTime(&deep_ms, start_ev, stop_ev);
-    deep_ms /= iters;
-    double deep_tflops = flops / (deep_ms * 1e-3) / 1e12;
-
-    std::cout << std::fixed << std::setprecision(1);
-    std::cout << "  Asym (B on CPU):     " << std::setw(7) << (asym_ms * 1000) << " us | "
-              << std::setw(6) << asym_tflops << " TFLOPS\n";
-    std::cout << "  DeepGEMM (B on GPU): " << std::setw(7) << (deep_ms * 1000) << " us | "
-              << std::setw(6) << deep_tflops << " TFLOPS\n";
-    std::cout << "  Ratio (asym/deep):   " << std::setprecision(3) << (asym_ms / deep_ms) << "x\n";
-
-    cudaEventDestroy(start_ev);
-    cudaEventDestroy(stop_ev);
-}
-
-int main(int argc, char** argv) {
-    // Force unbuffered stdout so output is visible in real-time
-    std::cout.setf(std::ios::unitbuf);
-    setenv("DG_JIT_CACHE_DIR", "/tmp/deepgemm_jit", 1);
-
-    asym_gemm::Compiler::prepare_init(
-        "/asymGEMMFP8/AsymGEMM/asym_gemm",
-        "/usr/local/cuda"
+    asym_gemm::gemm::m_grouped_fp8_asym_gemm_nt_contiguous(
+        a_pair, b_pair_cpu, D_asym, offsets_t, experts_t, list_size_t,
+        recipe, compiled_dims, disable_ue8m0_cast
     );
-    asym_gemm::KernelRuntime::prepare_init("/usr/local/cuda");
-
-    torch::NoGradGuard ng;
-    if (!torch::cuda::is_available()) {
-        std::cerr << "CUDA not available.\n";
-        return 1;
+    if (!cuda_check("m_grouped_fp8_asym_gemm_nt_contiguous")) {
+        std::cerr << "Stop after asym kernel failure.\n";
+        return 2;
     }
+    std::cout << "asym kernel finished.\n";
 
-    auto dev = torch::Device(torch::kCUDA, 0);
-    c10::cuda::CUDAGuard device_guard(dev);
-    cudaStream_t stream = at::cuda::getDefaultCUDAStream();
-
-    // MoE-relevant shapes: {num_groups, expected_m_per_group, n, k}
-    std::vector<ShapeConfig> shapes = {
-        {4,  2048, 4096, 7168},
-        {4,  8192, 7168, 2048},
-        {8,  4096, 4096, 7168},
-        {8,  4096, 7168, 2048},
-        {16, 2048, 7168, 2048},
-        {32, 1024, 7168, 2048},
-    };
-
-    bool check_correctness = true;
-    for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--no-check") check_correctness = false;
+    asym_gemm::gemm::m_grouped_fp8_gemm_nt_contiguous(
+        a_pair, b_pair_gpu, D_deepGEMM, m_indices, recipe, compiled_dims, disable_ue8m0_cast
+    );
+    if (!cuda_check("m_grouped_fp8_gemm_nt_contiguous")) {
+        std::cerr << "Stop after deepGEMM kernel failure.\n";
+        return 3;
     }
+    std::cout << "deepGEMM kernel finished.\n";
 
-    std::cout << "=== FP8 Asymmetric GEMM Benchmark (B on CPU via NVLink-C2C) ===\n\n";
-
-    for (const auto& shape : shapes) {
-        std::cout << "--- Shape: num_groups=" << shape.num_groups
-                  << ", m_per_group=" << shape.expected_m_per_group
-                  << ", n=" << shape.n << ", k=" << shape.k << " ---\n";
-        run_one_shape(shape, dev, stream, check_correctness);
-        std::cout << "\n";
-    }
-
+    print_5x5_compare(D_asym, D_deepGEMM);
+    std::cout << "Done. D_asym.mean=" << D_asym.to(torch::kFloat32).mean().item<float>()
+              << ", D_deepGEMM.mean=" << D_deepGEMM.to(torch::kFloat32).mean().item<float>() << "\n";
     return 0;
 }
+
+// ipdb> pp a[0].shape
+// torch.Size([35456, 7168])
+// ipdb> pp a[1].shape
+// torch.Size([35456, 56])
+// ipdb> pp b[0].shape
+// torch.Size([4, 4096, 7168])
+// ipdb> pp b[1].shape
+// torch.Size([4, 32, 56])

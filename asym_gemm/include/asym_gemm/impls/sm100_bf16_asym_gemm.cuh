@@ -201,13 +201,19 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = asymScheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs>(shape_m, shape_n, experts, offsets);
-
-    // Early-exit for inactive expert slots in the masked layout.
-    // With gridDim.y == num_groups (constant), slots whose token count is zero must
-    // return immediately. Safe here: cluster_sync() has completed and no TMA or TMEM
-    // barriers have been armed yet, so no barrier is left in an un-arrived state.
-    if constexpr (kGemmType == GemmType::MGroupedMasked) {
-        if (scheduler.m_end == 0) return;
+    // Sentinel block (inactive expert or empty M range): skip without entering
+    // any TMA / barrier wait paths. All CTAs in a cluster share blockIdx.y, so
+    // they all early-exit together and don't deadlock cluster-wide barriers.
+    // The init phase already ran Allocator().allocate() unconditionally — we
+    // must release the TMEM before returning, otherwise subsequent kernels see
+    // "tensor memory not completely freed". Use the same one-warp-frees pattern
+    // as the normal exit path.
+    if (scheduler.m_start >= scheduler.m_end) {
+        if (warp_idx == 2) {
+            const auto tmem_ptr = ld_shared(tmem_ptr_in_smem);
+            Allocator().free(tmem_ptr, kNumTmemCols);
+        }
+        return;
     }
 
     // Pipeline and TMA phases
