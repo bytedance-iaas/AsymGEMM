@@ -70,12 +70,19 @@ public:
     std::string get_arch(const bool& number_only = false,
                          const bool& support_arch_family = false) {
         const auto& [major, minor] = get_arch_pair();
+        const auto arch = std::to_string(major * 10 + minor);
+        if (number_only)
+            return arch;
+
+        // Architecture-specific suffixes are only valid for a subset of SM
+        // targets. Older architectures such as Ada (sm_89) must use the plain
+        // numeric target name.
         if (major == 10 and minor != 1) {
-            if (number_only)
-                return "100";
             return support_arch_family ? "100f" : "100a";
         }
-        return std::to_string(major * 10 + minor) + (number_only ? "" : "a");
+        if (major == 9 and minor == 0)
+            return "90a";
+        return arch;
     }
 
     int get_arch_major() {
