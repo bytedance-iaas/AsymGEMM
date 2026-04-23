@@ -103,7 +103,7 @@ if __name__ == '__main__':
     setuptools.setup(
         name="asym_gemm",
         version="0.1.0",
-        packages=setuptools.find_packages(),
+        packages=setuptools.find_packages(include=['asym_gemm', 'asym_gemm.*']),
         ext_modules=get_ext_modules(),
         cmdclass={'build_py': CustomBuildPy},
     )
