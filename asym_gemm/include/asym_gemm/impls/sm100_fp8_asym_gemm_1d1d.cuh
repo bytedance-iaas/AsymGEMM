@@ -222,8 +222,10 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
     // "tensor memory not completely freed". Use the same one-warp-frees pattern
     // as the normal exit path (warp 2 owned the allocation).
     if (scheduler.m_start >= scheduler.m_end) {
-        if (warp_idx == 2)
-            Allocator().free(0, kNumTmemCols);
+        if (warp_idx == 2) {
+            const auto tmem_ptr = ld_shared(tmem_ptr_in_smem);
+            Allocator().free(tmem_ptr, kNumTmemCols);
+        }
         return;
     }
     const uint32_t num_total_k_blocks = ceil_div_device(shape_k, BLOCK_K);

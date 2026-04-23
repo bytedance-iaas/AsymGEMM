@@ -61,11 +61,6 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0 and 2 % kNumMWaves == 0, "Invalid block M");
     DG_STATIC_ASSERT(sizeof(cutlass::bfloat16_t) * LAYOUT_AD_M % kSwizzleAMode == 0, "Invalid swizzle A mode");
 
-    if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0)
-    {
-        printf("BLOCK_K: %d, BLOCK_K_: %d, kNumStagesPerMerge: %d, kDoMergeStages: %d, kNumStages_: %d, kNumMinStages: %d \n", BLOCK_K, BLOCK_K_, kNumStagesPerMerge, kDoMergeStages, kNumStages_, kNumMinStages);
-    }
-
     // Overwrite shape constants if the compiler gives
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
     shape_n = SHAPE_N != 0 ? SHAPE_N : shape_n;

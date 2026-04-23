@@ -517,7 +517,6 @@ static GemmConfig get_best_config_asym(const GemmType& gemm_type, const KernelTy
                                                                   fixed_num_stages, multicast_config,
                                                                   true);
                 if (candidate_smem_config.smem_size <= smem_capacity) {
-                    printf("candidate_smem_config.smem_size: %d", candidate_smem_config.smem_size);
                     candidate_block_k = block_k;
                     break;
                 }
@@ -547,7 +546,11 @@ static GemmConfig get_best_config_asym(const GemmType& gemm_type, const KernelTy
     DG_HOST_ASSERT(best_block_m > 0 and best_block_n > 0 and best_block_k > 0);
 
     // Some util functions
-    const auto& get_num_blocks = [=](const int& block_m, const int& block_n) {
+    // For asym grouped GEMMs (contiguous/masked), the CTA grid is
+    // (ceil(n/block_n), num_groups) because each CTA sweeps M internally.
+    const auto& get_num_blocks = [=](const int& block_m, const int& block_n) -> int {
+        if (gemm_type == GemmType::MGroupedContiguous or gemm_type == GemmType::MGroupedMasked)
+            return ceil_div(n, block_n) * num_groups;
         return ceil_div(m, block_m) * ceil_div(n, block_n) * num_groups;
     };
     const auto& get_num_waves = [=](const int& block_m, const int& block_n) {
@@ -559,7 +562,7 @@ static GemmConfig get_best_config_asym(const GemmType& gemm_type, const KernelTy
     // NOTES: less L2 cache usage and less GPU frequency drop
     int num_min_sms = num_sms;
     if (ArchSpec::should_minimize_num_sms()) {
-        num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, best_num_waves);
+        num_min_sms = ceil_div(get_num_blocks(best_block_m, best_block_n), best_num_waves);
         num_min_sms = align(num_min_sms, best_multicast_config.num_multicast);
         DG_HOST_ASSERT(num_min_sms <= num_sms);
     }
@@ -661,7 +664,11 @@ static GemmConfig get_manual_config_asym(const GemmType& gemm_type, const Kernel
     DG_HOST_ASSERT(smem_config.smem_size <= smem_capacity);
 
     // Some util functions
-    const auto& get_num_blocks = [=](const int& bm, const int& bn) {
+    // For asym grouped GEMMs (contiguous/masked), the CTA grid is
+    // (ceil(n/block_n), num_groups) because each CTA sweeps M internally.
+    const auto& get_num_blocks = [=](const int& bm, const int& bn) -> int {
+        if (gemm_type == GemmType::MGroupedContiguous or gemm_type == GemmType::MGroupedMasked)
+            return ceil_div(n, bn) * num_groups;
         return ceil_div(m, bm) * ceil_div(n, bn) * num_groups;
     };
     const auto& get_num_waves = [=](const int& bm, const int& bn) {
@@ -672,7 +679,7 @@ static GemmConfig get_manual_config_asym(const GemmType& gemm_type, const Kernel
     // Recompute the minimal number of SMs required
     int num_min_sms = num_sms;
     if (ArchSpec::should_minimize_num_sms()) {
-        num_min_sms = ceil_div(ceil_div(m, block_m) * ceil_div(n, block_n) * num_groups, best_num_waves);
+        num_min_sms = ceil_div(get_num_blocks(block_m, block_n), best_num_waves);
         num_min_sms = align(num_min_sms, multicast_config.num_multicast);
         DG_HOST_ASSERT(num_min_sms <= num_sms);
     }
