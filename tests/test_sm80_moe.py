@@ -23,26 +23,26 @@ import asym_gemm
 # ── Reference implementation ──────────────────────────────────────────────────
 
 @torch.no_grad()
-def ref_moe_gemm(x, w, expert_list, index_list):
+def ref_moe_gemm(a, b, experts, offsets):
     """
-    x:           [total_tokens, K]   fp16 or bf16
-    w:           [num_experts, N, K] fp16 or bf16
-    expert_list: [list_size]         int32 tensor or list
-    index_list:  [list_size]         int32 tensor or list, cumulative end indices
-    returns:     [total_tokens, N]   fp32
+    a:       [total_tokens, K]   fp16 or bf16
+    b:       [num_experts, N, K] fp16 or bf16
+    experts: [list_size]         int32 — expert IDs
+    offsets: [list_size]         int32 — cumulative end indices
+    returns: [total_tokens, N]   fp32
     """
-    total_tokens, K = x.shape
-    num_experts, N, K_ = w.shape
+    total_tokens, K = a.shape
+    num_experts, N, K_ = b.shape
     assert K == K_, "K mismatch"
 
-    out = torch.zeros(total_tokens, N, dtype=torch.float32, device=x.device)
+    out = torch.zeros(total_tokens, N, dtype=torch.float32, device=a.device)
     start = 0
-    elist = expert_list.tolist() if isinstance(expert_list, torch.Tensor) else expert_list
-    ilist = index_list.tolist()  if isinstance(index_list,  torch.Tensor) else index_list
+    elist = experts.tolist() if isinstance(experts, torch.Tensor) else experts
+    ilist = offsets.tolist() if isinstance(offsets, torch.Tensor) else offsets
 
     for i, expert_id in enumerate(elist):
         end = ilist[i]
-        out[start:end] = x[start:end].float() @ w[expert_id].float().t()
+        out[start:end] = a[start:end].float() @ b[expert_id].float().t()
         start = end
     return out
 
@@ -96,9 +96,9 @@ def test_moe_gemm(dtype: torch.dtype):
         torch.cuda.empty_cache()
         gc.collect()
 
-        expert_ids = list(range(len(token_counts)))   # experts 0..list_size-1
+        expert_ids   = list(range(len(token_counts)))
         total_tokens = sum(token_counts)
-        index_list_h = list(itertools.accumulate(token_counts))  # cumulative end indices
+        offsets_h    = list(itertools.accumulate(token_counts))  # cumulative end indices
         required_bytes = int(estimate_case_bytes(num_experts, total_tokens, N, K, dtype) * 1.15)
         free_bytes, _ = torch.cuda.mem_get_info()
         if free_bytes < required_bytes:
@@ -107,20 +107,21 @@ def test_moe_gemm(dtype: torch.dtype):
                   f"required~={required_bytes / 2**20:.1f} MiB")
             continue
 
-        x = w = o = expert_list = index_list = ref = None
+        a = b = d = experts = offsets = ref = None
         try:
-            x = torch.randn(total_tokens, K, dtype=dtype, device='cuda')
-            w = torch.randn(num_experts, N, K, dtype=dtype, device='cuda')
-            o = torch.empty(total_tokens, N, dtype=dtype, device='cuda')
-            expert_list = torch.tensor(expert_ids, dtype=torch.int32, device='cuda')
-            index_list = torch.tensor(index_list_h, dtype=torch.int32, device='cuda')
+            a       = torch.randn(total_tokens, K,    dtype=dtype,       device='cuda')
+            b       = torch.randn(num_experts,  N, K, dtype=dtype,       device='cuda')
+            d       = torch.empty(total_tokens, N,    dtype=dtype,       device='cuda')
+            experts = torch.tensor(expert_ids, dtype=torch.int32, device='cuda')
+            offsets = torch.tensor(offsets_h,  dtype=torch.int32, device='cuda')
+            list_size = experts.numel()
 
-            kernel_fn(x, w, o, expert_list, index_list)
+            kernel_fn(a, b, d, offsets, experts, list_size)
             torch.cuda.synchronize()
 
-            ref = ref_moe_gemm(x, w, expert_list, index_list)  # float32 reference
+            ref = ref_moe_gemm(a, b, experts, offsets)  # float32 reference
 
-            diff = calc_diff(o.float(), ref)
+            diff = calc_diff(d.float(), ref)
             threshold = 0.01  # relative, normalised
             status = "PASS" if diff < threshold else "FAIL"
             print(f"[{status}] {dtype_str}  N={N:5d} K={K:5d} "
@@ -128,7 +129,7 @@ def test_moe_gemm(dtype: torch.dtype):
             if diff >= threshold:
                 all_passed = False
         finally:
-            del x, w, o, expert_list, index_list, ref
+            del a, b, d, experts, offsets, ref
             torch.cuda.empty_cache()
             gc.collect()
 
