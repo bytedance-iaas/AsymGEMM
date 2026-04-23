@@ -197,7 +197,6 @@ def test_m_grouped_gemm_contiguous() -> None:
         groundtruth = build_groundtruth_from_original(a_bf16, b_bf16, m_indices)
         d_deep = torch.empty_like(d_asym)
         offsets, experts, list_size = build_offsets_experts_from_m_indices(m_indices, num_groups)
-        import ipdb;ipdb.set_trace()
 
         asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(
             a, b, d_asym, offsets, experts, list_size,
@@ -426,7 +425,7 @@ def test_m_grouped_gemm_masked() -> None:
         a, b, masked_m, psum_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
         offsets, experts, list_size = build_offsets_experts_from_masked_m(masked_m, num_groups, max_m)
         d_asym = torch.empty_like(d)
-        # import ipdb;ipdb.set_trace()
+
         # noinspection PyShadowingNames
         def test_func():
             deep_gemm.m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
