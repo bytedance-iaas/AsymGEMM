@@ -7,7 +7,16 @@ Run:
     python tests/test_sm80_moe.py
 """
 import itertools
+import os
+import sys
+import gc
+
 import torch
+
+REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
 import asym_gemm
 
 
@@ -44,6 +53,17 @@ def calc_diff(a, b):
     return ((a - b) / scale).norm() / (a.numel() ** 0.5)
 
 
+def estimate_case_bytes(num_experts, total_tokens, n, k, dtype: torch.dtype):
+    elem_size = torch.empty((), dtype=dtype).element_size()
+    int_size = torch.empty((), dtype=torch.int32).element_size()
+    x_bytes = total_tokens * k * elem_size
+    w_bytes = num_experts * n * k * elem_size
+    o_bytes = total_tokens * n * elem_size
+    ref_bytes = total_tokens * n * torch.empty((), dtype=torch.float32).element_size()
+    list_bytes = (total_tokens + num_experts) * int_size
+    return x_bytes + w_bytes + o_bytes + ref_bytes + list_bytes
+
+
 # ── Test cases ─────────────────────────────────────────────────────────────────
 # (num_experts, N, K, token_counts_per_active_expert)
 TEST_CASES = [
@@ -73,28 +93,44 @@ def test_moe_gemm(dtype: torch.dtype):
 
     all_passed = True
     for (num_experts, N, K, token_counts) in TEST_CASES:
-        expert_ids   = list(range(len(token_counts)))   # experts 0..list_size-1
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        expert_ids = list(range(len(token_counts)))   # experts 0..list_size-1
         total_tokens = sum(token_counts)
         index_list_h = list(itertools.accumulate(token_counts))  # cumulative end indices
+        required_bytes = int(estimate_case_bytes(num_experts, total_tokens, N, K, dtype) * 1.15)
+        free_bytes, _ = torch.cuda.mem_get_info()
+        if free_bytes < required_bytes:
+            print(f"[SKIP] {dtype_str}  N={N:5d} K={K:5d} tokens={total_tokens:5d} "
+                  f"experts={len(token_counts)}  free_mem={free_bytes / 2**20:.1f} MiB "
+                  f"required~={required_bytes / 2**20:.1f} MiB")
+            continue
 
-        x           = torch.randn(total_tokens, K,    dtype=dtype,       device='cuda')
-        w           = torch.randn(num_experts,  N, K, dtype=dtype,       device='cuda')
-        o           = torch.empty(total_tokens, N,    dtype=dtype,       device='cuda')
-        expert_list = torch.tensor(expert_ids,        dtype=torch.int32, device='cuda')
-        index_list  = torch.tensor(index_list_h,      dtype=torch.int32, device='cuda')
+        x = w = o = expert_list = index_list = ref = None
+        try:
+            x = torch.randn(total_tokens, K, dtype=dtype, device='cuda')
+            w = torch.randn(num_experts, N, K, dtype=dtype, device='cuda')
+            o = torch.empty(total_tokens, N, dtype=dtype, device='cuda')
+            expert_list = torch.tensor(expert_ids, dtype=torch.int32, device='cuda')
+            index_list = torch.tensor(index_list_h, dtype=torch.int32, device='cuda')
 
-        kernel_fn(x, w, o, expert_list, index_list)
-        torch.cuda.synchronize()
+            kernel_fn(x, w, o, expert_list, index_list)
+            torch.cuda.synchronize()
 
-        ref = ref_moe_gemm(x, w, expert_list, index_list)  # float32 reference
+            ref = ref_moe_gemm(x, w, expert_list, index_list)  # float32 reference
 
-        diff = calc_diff(o.float(), ref)
-        threshold = 0.01  # relative, normalised
-        status = "PASS" if diff < threshold else "FAIL"
-        print(f"[{status}] {dtype_str}  N={N:5d} K={K:5d} "
-              f"tokens={total_tokens:5d} experts={len(token_counts)}  diff={diff:.6f}")
-        if diff >= threshold:
-            all_passed = False
+            diff = calc_diff(o.float(), ref)
+            threshold = 0.01  # relative, normalised
+            status = "PASS" if diff < threshold else "FAIL"
+            print(f"[{status}] {dtype_str}  N={N:5d} K={K:5d} "
+                  f"tokens={total_tokens:5d} experts={len(token_counts)}  diff={diff:.6f}")
+            if diff >= threshold:
+                all_passed = False
+        finally:
+            del x, w, o, expert_list, index_list, ref
+            torch.cuda.empty_cache()
+            gc.collect()
 
     return all_passed
 

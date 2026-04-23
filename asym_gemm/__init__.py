@@ -4,9 +4,13 @@
 
 import os
 import subprocess
+from pkgutil import extend_path
+
 import torch
-from torch.version import cuda as cuda_version
 from packaging import version
+from torch.version import cuda as cuda_version
+
+__path__ = extend_path(__path__, __name__)
 
 # Set some default environment provided at setup
 try:
