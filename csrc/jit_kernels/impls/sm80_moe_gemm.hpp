@@ -53,11 +53,11 @@ static void __instantiate_kernel() {{
 // Free function called from the API layer
 // ──────────────────────────────────────────────────────────────────────────────
 static void sm80_m_grouped_moe_gemm_contiguous(
-    const torch::Tensor& x,
-    const torch::Tensor& w,
-    const torch::Tensor& o,
-    const torch::Tensor& expert_list,
-    const torch::Tensor& index_list,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& d,
+    const torch::Tensor& expert_list,   // expert IDs   (= API's "experts")
+    const torch::Tensor& index_list,    // cumul. ends  (= API's "offsets")
     int64_t N, int64_t K, int32_t num_experts, int32_t list_size,
     const std::string& element_type_str)
 {
@@ -72,9 +72,9 @@ static void sm80_m_grouped_moe_gemm_contiguous(
                                               static_cast<int>(K));
 
     const SM80MoEParams params {
-        .x_ptr        = x.data_ptr(),
-        .w_ptr        = w.data_ptr(),
-        .o_ptr        = o.data_ptr(),
+        .x_ptr        = a.data_ptr(),
+        .w_ptr        = b.data_ptr(),
+        .o_ptr        = d.data_ptr(),
         .expert_list  = expert_list.data_ptr<int32_t>(),
         .index_list   = index_list.data_ptr<int32_t>(),
         .list_size    = list_size,

@@ -416,50 +416,52 @@ static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const tor
 #endif
 
 static void m_grouped_moe_gemm_nt_contiguous(
-    const torch::Tensor& x,
-    const torch::Tensor& w,
-    const torch::Tensor& o,
-    const torch::Tensor& expert_list,
-    const torch::Tensor& index_list)
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& d,
+    const torch::Tensor& offsets,
+    const torch::Tensor& experts,
+    const int& list_size,
+    const std::string& compiled_dims)
 {
     // ── Shape checks ──────────────────────────────────────────────────────────
-    DG_HOST_ASSERT(x.dim() == 2);
-    DG_HOST_ASSERT(w.dim() == 3);
-    DG_HOST_ASSERT(o.dim() == 2);
+    DG_HOST_ASSERT(a.dim() == 2);
+    DG_HOST_ASSERT(b.dim() == 3);
+    DG_HOST_ASSERT(d.dim() == 2);
 
-    const int64_t total_tokens   = x.size(0);
-    const int64_t K              = x.size(1);
-    const int64_t num_experts    = w.size(0);
-    const int64_t N              = w.size(1);
-    const int64_t K_w            = w.size(2);
-    const int64_t total_tokens_o = o.size(0);
-    const int64_t N_o            = o.size(1);
+    const int64_t total_tokens   = a.size(0);
+    const int64_t K              = a.size(1);
+    const int64_t num_experts    = b.size(0);
+    const int64_t N              = b.size(1);
+    const int64_t K_b            = b.size(2);
+    const int64_t total_tokens_d = d.size(0);
+    const int64_t N_d            = d.size(1);
 
-    DG_HOST_ASSERT(K == K_w);
-    DG_HOST_ASSERT(N == N_o);
-    DG_HOST_ASSERT(total_tokens == total_tokens_o);
+    DG_HOST_ASSERT(K == K_b);
+    DG_HOST_ASSERT(N == N_d);
+    DG_HOST_ASSERT(total_tokens == total_tokens_d);
 
     // ── Dtype checks ──────────────────────────────────────────────────────────
-    DG_HOST_ASSERT(x.scalar_type() == torch::kFloat16 or x.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(w.scalar_type() == x.scalar_type());
-    DG_HOST_ASSERT(o.scalar_type() == x.scalar_type());
+    DG_HOST_ASSERT(a.scalar_type() == torch::kFloat16 or a.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(b.scalar_type() == a.scalar_type());
+    DG_HOST_ASSERT(d.scalar_type() == a.scalar_type());
 
     // ── CUDA placement ────────────────────────────────────────────────────────
-    DG_HOST_ASSERT(x.is_cuda());
-    DG_HOST_ASSERT(w.is_cuda());
-    DG_HOST_ASSERT(o.is_cuda());
+    DG_HOST_ASSERT(a.is_cuda());
+    DG_HOST_ASSERT(b.is_cuda());
+    DG_HOST_ASSERT(d.is_cuda());
 
     // ── Contiguity ────────────────────────────────────────────────────────────
-    DG_HOST_ASSERT(x.is_contiguous());
-    DG_HOST_ASSERT(w.is_contiguous());
-    DG_HOST_ASSERT(o.is_contiguous());
+    DG_HOST_ASSERT(a.is_contiguous());
+    DG_HOST_ASSERT(b.is_contiguous());
+    DG_HOST_ASSERT(d.is_contiguous());
 
-    // ── expert_list / index_list ──────────────────────────────────────────────
-    DG_HOST_ASSERT(expert_list.is_cuda() and index_list.is_cuda());
-    DG_HOST_ASSERT(expert_list.is_contiguous() and index_list.is_contiguous());
-    DG_HOST_ASSERT(expert_list.scalar_type() == torch::kInt32);
-    DG_HOST_ASSERT(index_list.scalar_type()  == torch::kInt32);
-    DG_HOST_ASSERT(expert_list.numel() == index_list.numel());
+    // ── offsets / experts ─────────────────────────────────────────────────────
+    DG_HOST_ASSERT(offsets.is_cuda() and experts.is_cuda());
+    DG_HOST_ASSERT(offsets.is_contiguous() and experts.is_contiguous());
+    DG_HOST_ASSERT(offsets.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(experts.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(offsets.numel() >= list_size and experts.numel() >= list_size);
 
     // ── Empty check (before alignment guards so K==0 doesn't trigger K>=64) ──
     if (total_tokens == 0 or N == 0 or K == 0) return;
@@ -470,16 +472,16 @@ static void m_grouped_moe_gemm_nt_contiguous(
     DG_HOST_ASSERT(K >= 64);
 
     // ── Resolve element type and dispatch ─────────────────────────────────────
+    // compiled_dims is accepted for API parity with m_grouped_bf16_asym_gemm_nt_contiguous
+    // but unused: the SM80 kernel selects tile dims via runtime heuristic.
     const std::string element_type_str =
-        (x.scalar_type() == torch::kFloat16) ? "cutlass::half_t" : "cutlass::bfloat16_t";
-
-    const int32_t list_size = static_cast<int32_t>(expert_list.numel());
+        (a.scalar_type() == torch::kFloat16) ? "cutlass::half_t" : "cutlass::bfloat16_t";
 
     sm80_m_grouped_moe_gemm_contiguous(
-        x, w, o, expert_list, index_list,
+        a, b, d, experts, offsets,
         N, K,
         static_cast<int32_t>(num_experts),
-        list_size,
+        static_cast<int32_t>(list_size),
         element_type_str);
 }
 
@@ -549,14 +551,16 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk");
 #endif
 
-    // SM80 MoE GEMM (FP16 + BF16, no arch guard needed: uses >= 800 primitives)
+    // SM80 MoE GEMM (FP16 + BF16, no arch guard needed: uses >= SM80 primitives)
     m.def("m_grouped_moe_gemm_nt_contiguous",
           static_cast<void(*)(const torch::Tensor&, const torch::Tensor&,
                               const torch::Tensor&, const torch::Tensor&,
-                              const torch::Tensor&)>(
+                              const torch::Tensor&, const int&,
+                              const std::string&)>(
               &m_grouped_moe_gemm_nt_contiguous),
-          py::arg("x"), py::arg("w"), py::arg("o"),
-          py::arg("expert_list"), py::arg("index_list"));
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
+          py::arg("compiled_dims") = "nk");
 }
 
 } // namespace asym_gemm::gemm
