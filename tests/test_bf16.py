@@ -278,7 +278,7 @@ def build_offsets_experts_from_m_indices_pairs(m_indices: torch.Tensor, block_m:
 
     return (torch.tensor(offsets, dtype=torch.int32, device=device),
             torch.tensor(experts, dtype=m_indices.dtype, device=device),
-            len(experts))
+            torch.tensor([len(experts)], dtype=torch.int32, device=device))
 
 
 def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, max_m: int, block_m: int = 128):
@@ -323,7 +323,7 @@ def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int,
 
     return (torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
             torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
-            len(experts))
+            torch.tensor([len(experts)], dtype=torch.int32, device=masked_m.device))
 
 
 
@@ -351,6 +351,8 @@ def test_m_grouped_gemm_masked() -> None:
             d_asym = torch.empty_like(d)
             torch.cuda.synchronize()
 
+            offsets, experts, list_size = build_offsets_experts_from_masked_m(masked_m, num_groups, max_m)
+
             # noinspection PyShadowingNames
             def test_func_deep():
                 if use_psum_layout:
@@ -364,7 +366,7 @@ def test_m_grouped_gemm_masked() -> None:
                 if use_psum_layout:
                     pass
                 else:
-                    asym_gemm.m_grouped_bf16_asym_gemm_nt_masked(a, b_pinned, d_asym, masked_m, expected_m_per_group, compiled_dims="nk")
+                    asym_gemm.m_grouped_bf16_asym_gemm_nt_masked(a, b_pinned, d_asym, offsets, experts, list_size, expected_m_per_group, compiled_dims="nk")
 
             test_func_deep()
             if not use_psum_layout:

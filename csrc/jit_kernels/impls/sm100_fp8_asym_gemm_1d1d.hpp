@@ -84,23 +84,44 @@ static void sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d(const torch::Tensor& a
                                                      const torch::Tensor& d,
                                                      const torch::Tensor& offsets_t,
                                                      const torch::Tensor& experts_t,
-                                                     const int& list_size,
+                                                     const int& grid_y,
                                                      const int& num_groups, const int& m, const int& n, const int& k,
                                                      const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                      const std::string& compiled_dims) {
     const auto& aligned_k = align(k, 128);
-    const int num_sms = device_runtime->get_num_sms();
 
-    // Shape-adaptive tile selection for GB200 (132 SMs).
-    // The auto-tuner scores configs by block_n * block_k * SM_wave_efficiency,
-    // but we can also force specific configs via env vars DG_BLOCK_M/N/K.
-    // Use get_best_config_asym which now correctly accounts for wave efficiency
-    // and includes block_n candidates 192 and 224.
-    const auto& config = get_best_config_asym<SM100ArchSpec>(
-        GemmType::MGroupedContiguous, KernelType::Kernel1D1D,
-        m, n, k, num_groups, major_a, major_b,
-        torch::kFloat8_e4m3fn, d.scalar_type(), false,
-        num_sms);
+    // const int block_m = 128;
+    // const int block_n = 128;
+    // const int block_k = 64;
+
+    // const auto& config = get_best_config<SM100ArchSpec>(
+    //     GemmType::MGroupedContiguous, KernelType::Kernel1D1D,
+    //     // NOTES: `num_groups` is 1, since the contiguous layout is seen as a whole
+    //     m, n, k, 1, major_a, major_b,
+    //     torch::kFloat8_e4m3fn, d.scalar_type(), false,
+    //     device_runtime->get_num_sms());
+
+    const int block_m = 128;
+    const int block_n = 128;
+    const int block_k = 512;
+
+    const bool use_manual_config = block_m > 0 or block_n > 0 or block_k > 0;
+    if (use_manual_config)
+        DG_HOST_ASSERT(block_m > 0 and block_n > 0 and block_k > 0);
+    const auto& config = use_manual_config
+        ? get_manual_config_asym<SM100ArchSpec>(
+            GemmType::MGroupedContiguous, KernelType::Kernel1D1D,
+            // NOTES: `num_groups` is 1, since the contiguous layout is seen as a whole
+            m, n, k, 1, major_a, major_b,
+            torch::kFloat8_e4m3fn, d.scalar_type(), false,
+            device_runtime->get_num_sms(),
+            block_m, block_n, block_k)
+        : get_best_config_asym<SM100ArchSpec>(
+            GemmType::MGroupedContiguous, KernelType::Kernel1D1D,
+            // NOTES: `num_groups` is 1, since the contiguous layout is seen as a whole
+            m, n, k, 1, major_a, major_b,
+            torch::kFloat8_e4m3fn, d.scalar_type(), false,
+            device_runtime->get_num_sms());
 
 
     // Create tensor descriptors
@@ -126,7 +147,7 @@ static void sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d(const torch::Tensor& a
     const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
                                                   config.block_n, sf_quant_k, num_groups, 0);
 
-    if (list_size <= 1)
+    if (grid_y <= 0)
         return;
 
     // Launch kernel
@@ -136,7 +157,7 @@ static void sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d(const torch::Tensor& a
         .compiled_dims = compiled_dims,
         .epilogue_type = std::nullopt,
         .gemm_config = config,
-        .launch_args = LaunchArgs({ceil_div(n, config.block_n), list_size - 1}, config.thread_config.num_threads,
+        .launch_args = LaunchArgs({ceil_div(n, config.block_n), grid_y}, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
         .offsets = offsets_t.data_ptr<int>(),
@@ -166,9 +187,8 @@ public:
         GemmConfig gemm_config;
         LaunchArgs launch_args;
 
-        // masked_m: int32 device pointer with shape [num_groups], token count per group.
-        // Passed to the kernel as the `offsets` argument; `experts` is unused (nullptr).
-        void* masked_m;
+        void* offsets;
+        void* experts;
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_sfa;
@@ -213,8 +233,7 @@ static void __instantiate_kernel() {{
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.masked_m, nullptr,   // offsets=masked_m, experts=nullptr (unused)
-            args.m, args.n, args.k,
+            args.offsets, args.experts, args.m, args.n, args.k,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_sfa, args.tensor_map_sfb,
             args.tensor_map_cd));
@@ -224,18 +243,34 @@ static void __instantiate_kernel() {{
 static void sm100_m_grouped_fp8_asym_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
                                                  const torch::Tensor& b, const torch::Tensor& sfb,
                                                  const torch::Tensor& d,
-                                                 const torch::Tensor& masked_m_t,
+                                                 const torch::Tensor& offsets_t,
+                                                 const torch::Tensor& experts_t,
+                                                 const int& grid_y,
                                                  const int& expected_m,
                                                  const int& num_groups, const int& m, const int& n, const int& k,
                                                  const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                  const std::string& compiled_dims) {
     const auto& aligned_k = align(k, 128);
 
-    const auto& config = get_best_config_asym<SM100ArchSpec>(
-        GemmType::MGroupedMasked, KernelType::Kernel1D1D,
-        expected_m, n, k, num_groups, major_a, major_b,
-        torch::kFloat8_e4m3fn, d.scalar_type(), false,
-        device_runtime->get_num_sms());
+    const int block_m = 128;
+    const int block_n = 128;
+    const int block_k = 512;
+
+    const bool use_manual_config = block_m > 0 or block_n > 0 or block_k > 0;
+    if (use_manual_config)
+        DG_HOST_ASSERT(block_m > 0 and block_n > 0 and block_k > 0);
+    const auto& config = use_manual_config
+        ? get_manual_config_asym<SM100ArchSpec>(
+            GemmType::MGroupedMasked, KernelType::Kernel1D1D,
+            expected_m, n, k, num_groups, major_a, major_b,
+            torch::kFloat8_e4m3fn, d.scalar_type(), false,
+            device_runtime->get_num_sms(),
+            block_m, block_n, block_k)
+        : get_best_config_asym<SM100ArchSpec>(
+            GemmType::MGroupedMasked, KernelType::Kernel1D1D,
+            expected_m, n, k, num_groups, major_a, major_b,
+            torch::kFloat8_e4m3fn, d.scalar_type(), false,
+            device_runtime->get_num_sms());
 
     // Create tensor descriptors with num_groups for grouped layout
     const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
@@ -260,18 +295,21 @@ static void sm100_m_grouped_fp8_asym_gemm_masked_1d1d(const torch::Tensor& a, co
     const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
                                                   config.block_n, sf_quant_k, num_groups, 0);
 
-    // Launch kernel with masked configuration. gridDim.y == num_groups (constant) so
-    // this launch is CUDA-graph safe: the grid dimension does not depend on routing.
+    if (grid_y <= 0)
+        return;
+
+    // Launch kernel with masked configuration
     const SM100FP8AsymGemmMaskedRuntime::Args& args = {
         .m = m, .n = n, .k = aligned_k,
         .num_groups = num_groups,
         .compiled_dims = compiled_dims,
         .epilogue_type = std::nullopt,
         .gemm_config = config,
-        .launch_args = LaunchArgs({ceil_div(n, config.block_n), num_groups}, config.thread_config.num_threads,
+        .launch_args = LaunchArgs({ceil_div(n, config.block_n), grid_y}, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .masked_m = masked_m_t.data_ptr<int>(),
+        .offsets = offsets_t.data_ptr<int>(),
+        .experts = experts_t.data_ptr<int>(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
