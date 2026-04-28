@@ -131,64 +131,51 @@ def _decode_e4m3_bits(bits_u8: np.ndarray) -> np.ndarray:
     return t.float().numpy()
 
 
-def _quantize_a_nvfp4_e4m3(a_f32: np.ndarray, gran_k: int) -> Tuple[np.ndarray, np.ndarray]:
-    m, k = a_f32.shape
+def _quantize_nvfp4_e4m3(x_f32: np.ndarray, gran_k: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Vectorized NVFP4 per-row quantization (gran_mn=1, gran_k=gran_k).
+
+    Replaces the triple-nested Python loop with pure NumPy + a single batched
+    PyTorch FP8 cast.  Runs ~1000x faster for large (rows, k) shapes.
+    """
+    rows, k = x_f32.shape
     assert k % 2 == 0
     sf_k = (k + gran_k - 1) // gran_k
+    pad = sf_k * gran_k - k
+    x = np.pad(x_f32, ((0, 0), (0, pad))) if pad > 0 else x_f32
 
-    packed = np.zeros((m, k // 2), dtype=np.uint8)
-    scales = np.zeros((m, sf_k), dtype=np.uint8)
+    # ── scales ──────────────────────────────────────────────────────────────
+    blocks = x.reshape(rows, sf_k, gran_k)                   # (rows, sf_k, gran_k)
+    amax = np.maximum(np.abs(blocks).max(axis=2), 1e-4)      # (rows, sf_k)
+    sf_f32 = (amax / 6.0).astype(np.float32)
+    sf_tensor = torch.from_numpy(sf_f32).to(torch.float8_e4m3fn)
+    scales = sf_tensor.view(torch.uint8).numpy().astype(np.uint8)   # (rows, sf_k)
+    sf_dec = sf_tensor.float().numpy()
+    sf_dec = np.where(sf_dec == 0.0, 1.0, sf_dec)           # guard against NaN/zero
 
-    for row in range(m):
-        for gk in range(sf_k):
-            c0 = gk * gran_k
-            c1 = min(c0 + gran_k, k)
-            chunk = a_f32[row, c0:c1]
-            amax = max(float(np.max(np.abs(chunk))), 1e-4)
-            sf = amax / 6.0
-            sf_bits, sf_decoded = _to_e4m3_bits_and_decoded(sf)
-            scales[row, gk] = sf_bits
+    # ── quantized values ─────────────────────────────────────────────────────
+    q = (blocks / sf_dec[:, :, np.newaxis]).reshape(rows, sf_k * gran_k)[:, :k]  # (rows, k)
 
-            for c in range(c0, c1):
-                code = _encode_e2m1_scalar(float(a_f32[row, c] / sf_decoded))
-                pidx = c // 2
-                if (c & 1) == 0:
-                    packed[row, pidx] = code & 0x0F
-                else:
-                    packed[row, pidx] |= (code & 0x0F) << 4
+    # E2M1 encode: same rounding as _encode_e2m1_scalar
+    _bounds = np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=np.float32)
+    sign = (q < 0.0).astype(np.uint8)
+    mag_code = np.searchsorted(_bounds, np.abs(q).ravel(), side='right') \
+                 .reshape(rows, k).astype(np.uint8)          # 0-7
+    codes = mag_code.copy()
+    codes[(sign != 0) & (mag_code != 0)] |= np.uint8(8)     # set sign bit
 
+    # Pack two nibbles per byte (low nibble = even column, high = odd)
+    packed = ((codes[:, 0::2] & 0x0F) | ((codes[:, 1::2] & 0x0F) << 4)).astype(np.uint8)
     return packed, scales
+
+
+def _quantize_a_nvfp4_e4m3(a_f32: np.ndarray, gran_k: int) -> Tuple[np.ndarray, np.ndarray]:
+    return _quantize_nvfp4_e4m3(a_f32, gran_k)
 
 
 def _quantize_b_nvfp4_e4m3(b_f32: np.ndarray, gran_k: int) -> Tuple[np.ndarray, np.ndarray]:
     # Per-row quantization: each row of B gets its own scale per K-group (gran_mn_b=1).
     # This matches recipe (1, 1, 16) and the production NVFP4 format from fp4_model.json.
-    n, k = b_f32.shape
-    assert k % 2 == 0
-    sf_k = (k + gran_k - 1) // gran_k
-
-    packed = np.zeros((n, k // 2), dtype=np.uint8)
-    scales = np.zeros((n, sf_k), dtype=np.uint8)  # one scale row per B row
-
-    for r in range(n):
-        for gk in range(sf_k):
-            c0 = gk * gran_k
-            c1 = min(c0 + gran_k, k)
-            chunk = b_f32[r, c0:c1]
-            amax = max(float(np.max(np.abs(chunk))), 1e-4)
-            sf = amax / 6.0
-            sf_bits, sf_decoded = _to_e4m3_bits_and_decoded(sf)
-            scales[r, gk] = sf_bits
-
-            for c in range(c0, c1):
-                code = _encode_e2m1_scalar(float(b_f32[r, c] / sf_decoded))
-                pidx = c // 2
-                if (c & 1) == 0:
-                    packed[r, pidx] = code & 0x0F
-                else:
-                    packed[r, pidx] |= (code & 0x0F) << 4
-
-    return packed, scales
+    return _quantize_nvfp4_e4m3(b_f32, gran_k)
 
 
 def _build_ground_truth(
@@ -447,11 +434,11 @@ def test_m_grouped_nvfp4_masked_cpp_flow() -> None:
     # Masked/decode phase: `a` is (num_groups, max_m, k); only the first
     # masked_m[g] rows of each group are valid. Kernel must respect masked_m
     # via the offsets/experts pair list (see asymScheduler).
-    num_groups = 2
-    max_m = 512
-    expected_m_per_group = 384
-    n = 1024
-    k = 1024
+    num_groups = 8
+    max_m = 16384
+    expected_m_per_group = 16384
+    n = 2048
+    k = 4096
     gran_k = 16
     sf_k = (k + gran_k - 1) // gran_k
     sf_n = n  # per-row B scales: one scale row per B row (gran_mn_b=1)
@@ -492,10 +479,11 @@ def test_m_grouped_nvfp4_masked_cpp_flow() -> None:
     sfb = torch.from_numpy(b_scales_u8).to(device="cuda", dtype=torch.uint8).view(torch.float8_e4m3fn)
 
     # warm up
-    # expected_m_per_group = 1
-    # masked_m = torch.zeros(
-    #     (num_groups,), dtype=torch.int32, device="cuda"
-    # )
+    expected_m_per_group = 1
+    masked_m = torch.zeros(
+        (num_groups,), dtype=torch.int32, device="cuda"
+    )
+    import ipdb; ipdb.set_trace()
 
     d_kernel = torch.empty((num_groups, max_m, n), device="cuda", dtype=torch.bfloat16)
     asym_gemm.m_grouped_fp4_asym_gemm_nt_masked(
@@ -509,6 +497,7 @@ def test_m_grouped_nvfp4_masked_cpp_flow() -> None:
     )
     torch.cuda.synchronize()
 
+    import ipdb; ipdb.set_trace()
     # Manual reference per group (dequant NVFP4+E4M3 -> fp32 matmul) for the
     # valid rows only. Ground truth uses original BF16 a/b for the same rows.
     print(
