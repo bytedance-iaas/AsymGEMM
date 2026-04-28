@@ -3,6 +3,11 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
 #include <cutlass/arch/barrier.h>
+#include <cutlass/float_subbyte.h>
+
+#if __has_include(<cuda_fp4.h>)
+#include <cuda_fp4.h>
+#endif
 
 #include <asym_gemm/common/epilogue_utils.cuh>
 #include <asym_gemm/common/asymScheduler.cuh>
@@ -12,6 +17,12 @@
 namespace asym_gemm {
 
 using namespace asym_gemm::sm100;
+using fp4_input_element_t = cutlass::float_e2m1_t;
+
+DG_STATIC_ASSERT(cutlass::sizeof_bits<fp4_input_element_t>::value == 4, "FP4 kernel expects E2M1 FP4 input");
+#if __has_include(<cuda_fp4.h>)
+DG_STATIC_ASSERT(sizeof(__nv_fp4_e2m1) == 1, "__nv_fp4_e2m1 must be byte-addressable storage");
+#endif
 
 __device__ __forceinline__ uint32_t get_smid() {
     uint32_t smid;
@@ -31,7 +42,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t,
           typename epilogue_type_t>
 __global__ void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
-sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
+sm100_fp4_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                          uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_b,
@@ -55,15 +66,15 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
     constexpr uint32_t kNumMWaves = BLOCK_M / WAVE_BLOCK_M;
     constexpr uint32_t kNumTMAStoreStages = 2;
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
-    DG_STATIC_ASSERT(BLOCK_K % 128 == 0, "block K must be a multiple of 128 for FP8");
+    DG_STATIC_ASSERT(BLOCK_K % 64 == 0, "block K must be a multiple of 64 for FP4");
     DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0 and 2 % kNumMWaves == 0, "Invalid block M");
 
-    // SF (scale factor) indexing: keep 128-element granularity regardless of BLOCK_K
-    constexpr uint32_t kSFQuantK = 128;                                                    // SF granularity (elements)
+    // SF (scale factor) indexing: 16-element granularity for NVFP4
+    constexpr uint32_t kSFQuantK = 16;                                                     // SF granularity (elements)
     constexpr uint32_t kSFAtomsPerBlockK = BLOCK_K / kSFQuantK;                            // SFs consumed per k-block
-    constexpr uint32_t kNumSFPerPack = sizeof(uint32_t) / sizeof(cutlass::float_ue8m0_t);  // 4 (UE8M0 per uint32)
-    constexpr uint32_t kBlockKPerSFLoad = kNumSFPerPack / kSFAtomsPerBlockK;               // k-blocks per SF TMA load
-    DG_STATIC_ASSERT(kNumSFPerPack % kSFAtomsPerBlockK == 0, "SFs per pack must be divisible by SFs per block_k");
+    constexpr uint32_t kNumSFPerPack = sizeof(uint32_t) / sizeof(cutlass::float_ue4m3_t);  // 4 (UE4M3 per uint32)
+    constexpr uint32_t kSFPacksPerBlockK = kSFAtomsPerBlockK / kNumSFPerPack;              // Paks per block K
+    DG_STATIC_ASSERT(kSFAtomsPerBlockK % kNumSFPerPack == 0, "SFs per block_k must be divisible by SF per pack");
 
     // Overwrite shape constants if the compiler gives
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
@@ -79,6 +90,11 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
 
     constexpr bool kDebugTrace = false;
     constexpr int kDebugSM = -1;  // set >=0 to filter to one SM
+    // Targeted debug tile for large kernel-vs-manual mismatch investigation.
+    constexpr int kDbgBlockX = 6;
+    constexpr int kDbgBlockY = 1;
+    constexpr int kDbgKBlock = 0;
+    constexpr int kDbgMBlock = 14;
     auto should_log = [&](uint32_t k_iter, uint32_t m_iter) {
         if constexpr (!kDebugTrace)
             return false;
@@ -88,6 +104,15 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
         const bool iter_ok = true;
         // (k_iter < 2 && m_iter < 2);
         return cta_ok && lane_ok && sm_ok && iter_ok;
+    };
+    auto should_log_target = [&](uint32_t k_iter, uint32_t m_iter) {
+        if constexpr (!kDebugTrace)
+            return false;
+        return lane_idx == 0 &&
+               static_cast<int>(blockIdx.x) == kDbgBlockX &&
+               static_cast<int>(blockIdx.y) == kDbgBlockY &&
+               static_cast<int>(k_iter) == kDbgKBlock &&
+               static_cast<int>(m_iter) == kDbgMBlock;
     };
 
     // Align to 1024 bytes for swizzle-128B
@@ -107,25 +132,29 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
     // Share memory sizes
     constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * kSwizzleCDMode;
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;
-    constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
-    constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3);
+    constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K / 2;
+    constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K / 2;
     constexpr uint32_t SMEM_B_SIZE = SMEM_B_SIZE_PER_STAGE;
+    constexpr uint32_t TMA_A_BYTES_PER_STAGE = LOAD_BLOCK_M * (BLOCK_K / 2) * sizeof(fp4_input_element_t);
+    constexpr uint32_t TMA_B_BYTES_PER_STAGE = LOAD_BLOCK_N * (BLOCK_K / 2) * sizeof(fp4_input_element_t);
+    DG_STATIC_ASSERT(TMA_A_BYTES_PER_STAGE == SMEM_A_SIZE_PER_STAGE, "FP4 A-stage TMA bytes/SMEM bytes mismatch");
+    DG_STATIC_ASSERT(TMA_B_BYTES_PER_STAGE == SMEM_B_SIZE_PER_STAGE, "FP4 B-stage TMA bytes/SMEM bytes mismatch");
     constexpr uint32_t SF_BLOCK_M = constexpr_align(BLOCK_M, kNumUTCCPAlignedElems);
     constexpr uint32_t SF_BLOCK_N = constexpr_align(BLOCK_N, kNumUTCCPAlignedElems);
-    constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = SF_BLOCK_M * sizeof(uint32_t);
-    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = SF_BLOCK_N * sizeof(uint32_t);
+    constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = SF_BLOCK_M * sizeof(uint32_t) * kSFPacksPerBlockK;
+    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = SF_BLOCK_N * sizeof(uint32_t) * kSFPacksPerBlockK;
     DG_STATIC_ASSERT(SMEM_CD_SIZE % 1024 == 0 and SMEM_A_SIZE_PER_STAGE % 1024 == 0 and SMEM_B_SIZE_PER_STAGE % 1024 == 0, 
                      "Shared memory of A/B must be aligned to 1024 bytes");
     DG_STATIC_ASSERT(kNumTMAStoreStages >= 1, "Invalid number of TMA stages");
 
     // NOTES: Make sure we have enough shared memory for UMMA padding
-    static constexpr uint32_t UMMA_A_SIZE_PER_STAGE = constexpr_align(LOAD_BLOCK_M, LAYOUT_AD_M) * BLOCK_K * sizeof(__nv_fp8_e4m3);
+    static constexpr uint32_t UMMA_A_SIZE_PER_STAGE = constexpr_align(LOAD_BLOCK_M, LAYOUT_AD_M) * BLOCK_K / 2;
     DG_STATIC_ASSERT(UMMA_A_SIZE_PER_STAGE <= SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE * kNumStages, "Memory Out of bound for UMMA");
 
     // Automatically deduce the number of epilogue stages (1 or 2), according to the tensor memory size
     // TODO: test cases of `kNumMWaves == 2 and kNumEpilogueStages == 2`
-    constexpr uint32_t kNumSFATmemCols = SF_BLOCK_M / 32;
-    constexpr uint32_t kNumSFBTmemCols = SF_BLOCK_N / 32;
+    constexpr uint32_t kNumSFATmemCols = (SF_BLOCK_M / 32) * kSFPacksPerBlockK;
+    constexpr uint32_t kNumSFBTmemCols = (SF_BLOCK_N / 32) * kSFPacksPerBlockK;
     constexpr uint32_t kNumEpilogueStages = (2 * kNumMWaves * BLOCK_N + kNumSFATmemCols + kNumSFBTmemCols) > 512 ? 1 : 2;
 
     // Real tensor memory size and offsets
@@ -148,10 +177,10 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
         return reinterpret_cast<cd_dtype_t*>(smem_buffer + i * SMEM_CD_SIZE_PER_STAGE); 
     });
     auto smem_a  = PatternVisitor([&](const uint32_t& i) {
-        return reinterpret_cast<cutlass::float_e4m3_t*>(smem_buffer + SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE);
+        return reinterpret_cast<fp4_input_element_t*>(smem_buffer + SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE);
     });
     auto smem_b  = PatternVisitor([&](const uint32_t& i) {
-        return reinterpret_cast<cutlass::float_e4m3_t*>(smem_buffer + SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
+        return reinterpret_cast<fp4_input_element_t*>(smem_buffer + SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
     });
 
     // SFA/SFB shared memory
@@ -255,7 +284,13 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
     if (warp_idx == 0 and cute::elect_one_sync()) {
         // TMA load warp (B-centric): for this CTA's B tile, sweep K then all M tiles in its segment.
         const uint32_t n_block_idx = blockIdx.x;
-        const uint32_t base_n_idx = scheduler.n_idx;
+        constexpr bool kIsBatchedB =
+            (kGemmType == GemmType::Batched) ||
+            (kGemmType == GemmType::MGroupedContiguous) ||
+            (kGemmType == GemmType::MGroupedMasked);
+        const uint32_t base_n_idx = kIsBatchedB
+            ? (scheduler.n_idx - scheduler.current_group_idx * shape_n)
+            : scheduler.n_idx;
         uint32_t b_n_idx = base_n_idx;
         if constexpr (kNumMulticast > 1)
             b_n_idx += kIsMulticastOnA ? 0 : (cute::block_rank_in_cluster() * LOAD_BLOCK_N);
@@ -265,39 +300,41 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
             phase_b ^= 1;
 
             const uint32_t k_idx = k_block_idx * BLOCK_K;
+            const uint32_t k_packed_idx = k_block_idx * (BLOCK_K / 2);  // TMA coord in uint8 (byte) units
             const uint32_t sf_k_idx = ceil_div(k_idx, kSFQuantK * kNumSFPerPack);
-            constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
-            const uint32_t batch_idx = (kIsBatchedMM ? scheduler.current_group_idx : 0);
+            constexpr bool kIsBatchedA = (kGemmType == GemmType::Batched);
+            const uint32_t batch_idx_a = (kIsBatchedA ? scheduler.current_group_idx : 0);
+            const uint32_t batch_idx_b = (kIsBatchedB ? scheduler.current_group_idx : 0);
             if constexpr (kMajorB == cute::UMMA::Major::K)
-                tma_copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, cutlass::float_e4m3_t, kIsBatchedMM>(
-                    &tensor_map_b, full_barriers_b[0], smem_b[0], k_idx, b_n_idx, 1, batch_idx);
+                tma_copy<BLOCK_K / 2, LOAD_BLOCK_N, kSwizzleBMode, fp4_input_element_t, kIsBatchedB>(
+                    &tensor_map_b, full_barriers_b[0], smem_b[0], k_packed_idx, b_n_idx, 1, batch_idx_b);
             if constexpr (kMajorB == cute::UMMA::Major::MN)
-                tma_copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, cutlass::float_e4m3_t, kIsBatchedMM>(
-                    &tensor_map_b, full_barriers_b[0], smem_b[0], b_n_idx, k_idx, 1, batch_idx);
+                tma_copy<LOAD_BLOCK_N, BLOCK_K / 2, kSwizzleBMode, fp4_input_element_t, kIsBatchedB>(
+                    &tensor_map_b, full_barriers_b[0], smem_b[0], b_n_idx, k_packed_idx, 1, batch_idx_b);
             
-            const uint32_t sf_stage_in_group_idx = k_block_idx % kBlockKPerSFLoad;
+            const uint32_t sf_stage_in_group_idx = 0;
             if (sf_stage_in_group_idx == 0) {
-                tma_copy<BLOCK_N, 1, 0>(&tensor_map_sfb, full_barriers_b[0], smem_sfb[0],
+                if constexpr (kDebugTrace) {
+                if (lane_idx == 0 &&
+                    static_cast<int>(blockIdx.x) == kDbgBlockX &&
+                    static_cast<int>(blockIdx.y) == kDbgBlockY &&
+                    static_cast<int>(k_block_idx) == kDbgKBlock) {
+                    const uint32_t sfb_outer_idx = scheduler.current_group_idx * shape_sf_k + sf_k_idx;
+                    printf("[FP4DBG][TARGET][W0][SM%u] B/SFB load: block=(%u,%u) group=%u "
+                           "m_start=%u m_end=%u n_block_idx=%u b_n_idx=%u k_block_idx=%u "
+                           "k_packed_idx=%u sf_k_idx=%u sfb_outer_idx=%u\n",
+                           smid, blockIdx.x, blockIdx.y, scheduler.current_group_idx,
+                           scheduler.m_start, scheduler.m_end,
+                           n_block_idx, b_n_idx, k_block_idx, k_packed_idx, sf_k_idx, sfb_outer_idx);
+                }
+                } // kDebugTrace
+                tma_copy<BLOCK_N, kSFPacksPerBlockK, 0>(&tensor_map_sfb, full_barriers_b[0], smem_sfb[0],
                                         n_block_idx * BLOCK_N, scheduler.current_group_idx * shape_sf_k + sf_k_idx);
-                full_barriers_b[0]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE + BLOCK_N * sizeof(uint32_t));
-                // printf("[FP8DBG][W0][SM%u] sf_stage_in_group_idx == 0 k=%u stage=%u phase=%u\n",
-                //            smid, k_block_idx, stage_idx, phase);
-            }
-            else
-            {
-                full_barriers_b[0]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE);
-                // printf("[FP8DBG][W0][SM%u] sf_stage_in_group_idx != 0 k=%u stage=%u phase=%u\n",
-                //            smid, k_block_idx, stage_idx, phase);
+                full_barriers_b[0]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE + BLOCK_N * sizeof(uint32_t) * kSFPacksPerBlockK);
             }
 
             for (uint32_t m_block_idx = scheduler.m_start; m_block_idx < scheduler.m_end; advance_pipeline(m_block_idx)) {
-                if (should_log(k_block_idx, m_block_idx))
-                    printf("[FP8DBG][W0][SM%u] pre empty.wait k=%u m=%u stage=%u phase=%u\n",
-                           smid, k_block_idx, m_block_idx, stage_idx, phase);
                 empty_barriers[stage_idx]->wait(phase ^ 1);
-                if (should_log(k_block_idx, m_block_idx))
-                    printf("[FP8DBG][W0][SM%u] post empty.wait k=%u m=%u stage=%u phase=%u\n",
-                           smid, k_block_idx, m_block_idx, stage_idx, phase);
 
                 const uint32_t local_m_idx = kGemmType == GemmType::MGroupedMasked 
                                            ? (m_block_idx - scheduler.m_start) * BLOCK_M
@@ -310,22 +347,20 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                     m_idx += kIsMulticastOnA ? (cute::block_rank_in_cluster() * LOAD_BLOCK_M) : 0;
 
                 if constexpr (kMajorA == cute::UMMA::Major::K)
-                    tma_copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, cutlass::float_e4m3_t, kIsBatchedMM>(
-                        &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx, 1, batch_idx);
+                    tma_copy<BLOCK_K / 2, LOAD_BLOCK_M, kSwizzleAMode, fp4_input_element_t, kIsBatchedA>(
+                        &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_packed_idx, m_idx, 1, batch_idx_a);
                 if constexpr (kMajorA == cute::UMMA::Major::MN)
-                    tma_copy<LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, cutlass::float_e4m3_t, kIsBatchedMM>(
-                        &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], m_idx, k_idx, 1, batch_idx);
+                    tma_copy<LOAD_BLOCK_M, BLOCK_K / 2, kSwizzleAMode, fp4_input_element_t, kIsBatchedA>(
+                        &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], m_idx, k_packed_idx, 1, batch_idx_a);
 
                 if (sf_stage_in_group_idx == 0) {
                     const uint32_t sfa_k_idx = kGemmType == GemmType::MGroupedMasked
                                              ? scheduler.current_group_idx * shape_sf_k + sf_k_idx
                                              : sf_k_idx;
-                    tma_copy<BLOCK_M, 1, 0>(&tensor_map_sfa, full_barriers[stage_idx], smem_sfa[stage_idx],
+                    tma_copy<BLOCK_M, kSFPacksPerBlockK, 0>(&tensor_map_sfa, full_barriers[stage_idx], smem_sfa[stage_idx],
                                             local_m_idx, sfa_k_idx);
-                    full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + BLOCK_M * sizeof(uint32_t));
+                    full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + BLOCK_M * sizeof(uint32_t) * kSFPacksPerBlockK);
                 }
-                else
-                    full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE);
             }
         }
     } else if (warp_idx == 1 and is_leader_cta) {
@@ -335,9 +370,9 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
         // TODO: refactor `UMMA_M` calculation
         constexpr uint32_t UMMA_M = LAYOUT_AD_M * (kIsMulticastOnA ? 1 : kNumMulticast);
         constexpr uint32_t UMMA_N = BLOCK_N * (kIsMulticastOnA ? kNumMulticast : 1);
-        constexpr uint32_t UMMA_K = 32 / sizeof(cutlass::float_e4m3_t);
-        auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<cutlass::float_e4m3_t, cutlass::float_e4m3_t,
-                                                                   float, cutlass::float_ue8m0_t,
+        constexpr uint32_t UMMA_K = 64; // NVFP4 uses UMMA_K = 64
+        auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<fp4_input_element_t, fp4_input_element_t,
+                                                                   float, cutlass::float_ue4m3_t,
                                                                    UMMA_M, UMMA_N, kMajorA, kMajorB>();
         auto sf_desc = make_sf_desc(nullptr);
 
@@ -345,13 +380,18 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
 
         // For multi-atom K (block_k > swizzle atom), create descriptors per-atom
         // so LBO=0, and manually rebase between atoms in the inner loop.
-        constexpr uint32_t SWIZZLE_ATOM_K_B = kSwizzleBMode / sizeof(cutlass::float_e4m3_t);  // 128 for FP8/SW128
+        // FP4: sizeof(fp4_input_element_t)==1 but actual element is 0.5 bytes,
+        // so swizzle atom holds kSwizzleMode*2 FP4 elements (not kSwizzleMode/sizeof).
+        constexpr uint32_t SWIZZLE_ATOM_K_B = kSwizzleBMode * 2;  // FP4 elements per 128B swizzle atom
         constexpr uint32_t DESC_ATOM_K = (BLOCK_K > SWIZZLE_ATOM_K_B) ? SWIZZLE_ATOM_K_B : BLOCK_K;
         constexpr uint32_t NUM_K_ATOMS = BLOCK_K / DESC_ATOM_K;
         constexpr uint32_t UMMA_ITERS_PER_ATOM = DESC_ATOM_K / UMMA_K;
 
-        auto a_desc = make_umma_desc<kMajorA, LOAD_BLOCK_M, DESC_ATOM_K, kSwizzleAMode>(smem_a[0], 0, 0);
-        auto b_desc = make_umma_desc<kMajorB, LOAD_BLOCK_N, DESC_ATOM_K, kSwizzleBMode>(smem_b[0], 0, 0);
+        // Pass DESC_ATOM_K/2 as BLOCK_K to make_umma_desc: since sizeof(fp4)==1, the
+        // function computes SBO/LBO using BLOCK_K*sizeof.  DESC_ATOM_K/2 gives the true
+        // byte count per row (128), yielding correct SBO and LBO=0 (single swizzle atom).
+        auto a_desc = make_umma_desc<kMajorA, LOAD_BLOCK_M, DESC_ATOM_K / 2, kSwizzleAMode>(smem_a[0], 0, 0);
+        auto b_desc = make_umma_desc<kMajorB, LOAD_BLOCK_N, DESC_ATOM_K / 2, kSwizzleBMode>(smem_b[0], 0, 0);
         uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
         uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
 
@@ -382,15 +422,18 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
             with_sf_full_barriers_b[0]->wait(sf_phase_b);
             tcgen05_after_thread_sync();
             sf_phase_b ^= 1;
-            const uint32_t sf_stage_in_group_idx = k_block_idx % kBlockKPerSFLoad;
+            const uint32_t sf_stage_in_group_idx = 0;
 
             if (sf_stage_in_group_idx == 0)
             {
                 #pragma unroll
-                for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
-                    auto smem_ptr = smem_sfb[0] + i * kNumUTCCPAlignedElems;
-                    replace_smem_desc_addr(sf_desc, smem_ptr);
-                    cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
+                for (uint32_t p = 0; p < kSFPacksPerBlockK; ++p) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
+                        auto smem_ptr = smem_sfb[0] + p * SF_BLOCK_N + i * kNumUTCCPAlignedElems;
+                        replace_smem_desc_addr(sf_desc, smem_ptr);
+                        cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + p * (SF_BLOCK_N / 32) + i * 4);
+                    }
                 }
             }
             
@@ -400,71 +443,62 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                 tcgen05_after_thread_sync();
 
                 // Wait TMA and SF-transpose arrival
-                if (should_log(k_block_idx, m_block_idx))
-                    printf("[FP8DBG][W1][SM%u] pre with_sf.wait k=%u m=%u stage=%u phase=%u\n",
-                            smid, k_block_idx, m_block_idx, stage_idx, phase);
                 with_sf_full_barriers[stage_idx]->wait(phase);
                 tcgen05_after_thread_sync();
-                if (should_log(k_block_idx, m_block_idx))
-                    printf("[FP8DBG][W1][SM%u] post with_sf.wait k=%u m=%u stage=%u phase=%u\n",
-                            smid, k_block_idx, m_block_idx, stage_idx, phase);
 
                 if (sf_stage_in_group_idx == 0 and cute::elect_one_sync()) {
                     #pragma unroll
-                    for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
-                        auto smem_ptr = smem_sfa[stage_idx] + i * kNumUTCCPAlignedElems;
-                        replace_smem_desc_addr(sf_desc, smem_ptr);
-                        cute_utccp_t::copy(sf_desc, kTmemStartColOfSFA + i * 4);
+                    for (uint32_t p = 0; p < kSFPacksPerBlockK; ++p) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
+                            auto smem_ptr = smem_sfa[stage_idx] + p * SF_BLOCK_M + i * kNumUTCCPAlignedElems;
+                            replace_smem_desc_addr(sf_desc, smem_ptr);
+                            cute_utccp_t::copy(sf_desc, kTmemStartColOfSFA + p * (SF_BLOCK_M / 32) + i * 4);
+                        }
                     }
-           
                 }
                 __syncwarp();
 
-                if (should_log(k_block_idx, m_block_idx))
-                    printf("[FP8DBG][W1][SM%u] pre mma_t k=%u m=%u stage=%u phase=%u\n",
-                            smid, k_block_idx, m_block_idx, stage_idx, phase);
-
-                using mma_t = cute::conditional_t<kNumMulticast == 1, SM100_MMA_MXF8F6F4_SS, SM100_MMA_MXF8F6F4_2x1SM_SS>;
+                using mma_t = cute::conditional_t<kNumMulticast == 1, SM100_MMA_MXF4NVF4_SS, SM100_MMA_MXF4NVF4_2x1SM_SS>;
                 const auto& a_desc_base_lo = __shfl_sync(0xffffffff, a_desc_lo, static_cast<int>(stage_idx));
                 const auto& b_desc_base_lo = __shfl_sync(0xffffffff, b_desc_lo, static_cast<int>(0));
                 if (cute::elect_one_sync()) {
                     // Two-level loop: outer over K-atoms, inner over UMMA_K steps per atom.
-                    // Each atom gets its own SF index to maintain 128-element dequant granularity.
+                    // Each atom gets its own SF index to maintain 16-element dequant granularity.
                     #pragma unroll
                     for (uint32_t atom = 0; atom < NUM_K_ATOMS; ++atom) {
-                        // Per-atom SF index: each atom of 128 K-elements gets its own scale factor
-                        const uint32_t sf_id = (k_block_idx * kSFAtomsPerBlockK + atom) % kNumSFPerPack;
-                        const auto& runtime_instr_desc = make_runtime_instr_desc_with_sf_id(instr_desc, sf_id);
-
-                        // Rebase B descriptor to where TMA placed this K-atom
-                        const uint32_t b_atom_offset_bytes = atom * LOAD_BLOCK_N * DESC_ATOM_K * sizeof(cutlass::float_e4m3_t);
+                        // Rebase B descriptor to where TMA placed this K-atom (FP4: half byte per element)
+                        const uint32_t b_atom_offset_bytes = atom * LOAD_BLOCK_N * DESC_ATOM_K / 2;
                         const uint32_t b_atom_base = b_desc_base_lo + (b_atom_offset_bytes >> 4);
 
-                        // Rebase A descriptor to where TMA placed this K-atom
-                        const uint32_t a_atom_offset_bytes = atom * LOAD_BLOCK_M * DESC_ATOM_K * sizeof(cutlass::float_e4m3_t);
+                        // Rebase A descriptor to where TMA placed this K-atom (FP4: half byte per element)
+                        const uint32_t a_atom_offset_bytes = atom * LOAD_BLOCK_M * DESC_ATOM_K / 2;
                         const uint32_t a_atom_base = a_desc_base_lo + (a_atom_offset_bytes >> 4);
 
                         #pragma unroll
                         for (uint32_t ki = 0; ki < UMMA_ITERS_PER_ATOM; ++ki) {
-                            b_desc.lo = advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kSwizzleBMode, cutlass::float_e4m3_t>(b_atom_base, 0, ki * UMMA_K);
+                            // SF pack index across the full BLOCK_K: atom selects which K-atom,
+                            // ki selects which UMMA step within the atom.
+                            const uint32_t sf_pack_idx = atom * UMMA_ITERS_PER_ATOM + ki;
+                            const uint32_t sf_id = ((k_block_idx * kSFAtomsPerBlockK + atom * (DESC_ATOM_K/16) + ki * (UMMA_K/16))) % kNumSFPerPack;
+                            const auto& runtime_instr_desc = make_runtime_instr_desc_with_sf_id(instr_desc, sf_id);
+
+                            b_desc.lo = advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kSwizzleBMode, fp4_input_element_t>(b_atom_base, 0, ki * UMMA_K / 2);
                             #pragma unroll
                             for (uint32_t w = 0; w < kNumMWaves; ++w) {
                                 DG_STATIC_ASSERT((WAVE_BLOCK_M * BLOCK_K) % 128 == 0, "Invalid swizzling offset");
-                                a_desc.lo = advance_umma_desc_lo<kMajorA, LOAD_BLOCK_M, kSwizzleAMode, cutlass::float_e4m3_t>(a_atom_base, w * WAVE_BLOCK_M * DESC_ATOM_K, ki * UMMA_K);
+                                a_desc.lo = advance_umma_desc_lo<kMajorA, LOAD_BLOCK_M, kSwizzleAMode, fp4_input_element_t>(a_atom_base, w * WAVE_BLOCK_M * DESC_ATOM_K / 2, ki * UMMA_K / 2);
                                 mma_t::fma(a_desc, b_desc,
                                             accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N,
                                             (atom > 0 || ki > 0), // accumulate: false only for atom=0,ki=0
                                             runtime_instr_desc,
-                                            kTmemStartColOfSFA + w * (kNumUTCCPAlignedElems / 32),
-                                            kTmemStartColOfSFB);
+                                            kTmemStartColOfSFA + sf_pack_idx * (SF_BLOCK_M / 32) + w * (kNumUTCCPAlignedElems / 32),
+                                            kTmemStartColOfSFB + sf_pack_idx * (SF_BLOCK_N / 32));
                             }
                         }
                     }
                 }
 
-                if (should_log(k_block_idx, m_block_idx))
-                    printf("[FP8DBG][W1][SM%u] pre empty_barrier_arrive k=%u m=%u accum_stage=%u accum_phase=%u\n",
-                            smid, k_block_idx, m_block_idx, accum_stage_idx, accum_phase_idx);
                 // Publish only after the last K tile of this M tile.
                 empty_barrier_arrive();
             }
@@ -487,32 +521,32 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
         for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; ++k_block_idx) {
             full_barriers_b[0]->wait(phase_b);
             phase_b ^= 1;
-            const uint32_t sf_stage_in_group_idx = k_block_idx % kBlockKPerSFLoad;
+            const uint32_t sf_stage_in_group_idx = 0;
             if (sf_stage_in_group_idx == 0)
             {
                 // printf("[FP8DBG][W2][SM%u] sf_stage_in_group_idx == 0 k=%u stage=%u phase=%u\n",
                 #pragma unroll
-                for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i)
-                    utccp_required_smem_warp_transpose(smem_sfb[0] + i * kNumUTCCPAlignedElems);
+                for (uint32_t p = 0; p < kSFPacksPerBlockK; ++p) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i)
+                        utccp_required_smem_warp_transpose(smem_sfb[0] + p * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
+                }
                 cutlass::arch::fence_view_async_shared();
             }
             with_sf_full_barriers_b[0]->arrive(0u);
 
             for (uint32_t m_block_idx = scheduler.m_start; m_block_idx < scheduler.m_end; advance_pipeline(m_block_idx)) {
                 // Wait TMA arrival
-                if (should_log(k_block_idx, m_block_idx))
-                    printf("[FP8DBG][W2][SM%u] pre full.wait k=%u m=%u stage=%u phase=%u\n",
-                           smid, k_block_idx, m_block_idx, stage_idx, phase);
                 full_barriers[stage_idx]->wait(phase);
-                if (should_log(k_block_idx, m_block_idx))
-                    printf("[FP8DBG][W2][SM%u] post full.wait k=%u m=%u stage=%u phase=%u\n",
-                           smid, k_block_idx, m_block_idx, stage_idx, phase);
 
                 // Transpose for UTCCP at certain stages
                 if (sf_stage_in_group_idx == 0) {
                     #pragma unroll
-                    for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i)
-                        utccp_required_smem_warp_transpose(smem_sfa[stage_idx] + i * kNumUTCCPAlignedElems);                  
+                    for (uint32_t p = 0; p < kSFPacksPerBlockK; ++p) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i)
+                            utccp_required_smem_warp_transpose(smem_sfa[stage_idx] + p * SF_BLOCK_M + i * kNumUTCCPAlignedElems);
+                    }                  
                     // TODO: figure out whether the proxy fence is valid for 2-CTA cases
                     cutlass::arch::fence_view_async_shared();
                 }
@@ -548,14 +582,8 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
 
             for (uint32_t m_block_idx = scheduler.m_start; m_block_idx < scheduler.m_end; ++m_block_idx, advance_accum_pipeline()) {
                 // Wait UMMA arrival
-                if (epilogue_warp_idx == 0 && should_log(k_block_idx, m_block_idx))
-                    printf("[FP8DBG][EPI0][SM%u] pre tmem_full.wait k=%u m=%u accum_stage=%u accum_phase=%u\n",
-                           smid, k_block_idx, m_block_idx, accum_stage_idx, accum_phase_idx);
                 tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
                 tcgen05_after_thread_sync();
-                if (epilogue_warp_idx == 0 && should_log(k_block_idx, m_block_idx))
-                    printf("[FP8DBG][EPI0][SM%u] post tmem_full.wait k=%u m=%u accum_stage=%u accum_phase=%u\n",
-                           smid, k_block_idx, m_block_idx, accum_stage_idx, accum_phase_idx);
 
                 DG_STATIC_ASSERT(kNumEpilogueThreads == 128, "Epilogue threads not enough");
                 DG_STATIC_ASSERT(BLOCK_N % STORE_BLOCK_N == 0, "Invalid block sizes");
@@ -612,6 +640,19 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                                 cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr,
                                     values[0], values[1], values[2], values[3]);
                                 cutlass::arch::fence_view_async_tmem_load();
+                                if constexpr (kDebugTrace) {
+                                // Debug: print first 4 accumulator floats for CTA(0,0), lane 0, warp 0, w=0, s=0, i=0
+                                if (i == 0 && w == 0 && s == 0 && lane_idx == 0 && epilogue_warp_idx == 0 &&
+                                    m_block_idx == scheduler.m_start) {
+                                    printf("[FP4DBG][OUT][SM%u][k=%u m=%u] tmem_out[0..3]:"
+                                           " raw=%08x/%g  %08x/%g  %08x/%g  %08x/%g\n",
+                                           smid, k_block_idx, m_block_idx,
+                                           values[0], __uint_as_float(values[0]),
+                                           values[1], __uint_as_float(values[1]),
+                                           values[2], __uint_as_float(values[2]),
+                                           values[3], __uint_as_float(values[3]));
+                                }
+                                } // kDebugTrace
                                 st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
                             } else {
                                 // For BF16 output, read, cast and store
@@ -625,6 +666,26 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                                         cast_into_bf16_and_pack(values[2], values[3]),
                                         cast_into_bf16_and_pack(values[4], values[5]),
                                         cast_into_bf16_and_pack(values[6], values[7]));
+                                if constexpr (kDebugTrace) {
+                                if (lane_idx == 0 && epilogue_warp_idx == 0 && (i == 0 || i == 4 || i == 5) &&
+                                    static_cast<int>(blockIdx.x) == kDbgBlockX &&
+                                    static_cast<int>(blockIdx.y) == kDbgBlockY &&
+                                    static_cast<int>(k_block_idx) == kDbgKBlock &&
+                                    static_cast<int>(m_block_idx) == kDbgMBlock) {
+                                    printf("[FP4DBG][TARGET][EPI][SM%u] TMEM->SMEM: "
+                                           "k=%u m_block=%u w=%u s=%u accum_stage=%u tma_stage=%u "
+                                           "i=%u row=%u col=%u bank_group_idx=%u "
+                                           "tmem_addr=%u m_idx=%u n_idx=%u "
+                                           "vals=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                           smid, k_block_idx, m_block_idx, w, s,
+                                           accum_stage_idx, tma_stage_idx,
+                                           i, static_cast<uint32_t>(row), static_cast<uint32_t>(col),
+                                           static_cast<uint32_t>(bank_group_index),
+                                           tmem_addr, m_idx, n_idx,
+                                           values[0], values[1], values[2], values[3],
+                                           values[4], values[5], values[6], values[7]);
+                                }
+                                } // kDebugTrace
                             }
                         }
 
@@ -639,6 +700,17 @@ sm100_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                         cute::tma_store_fence();
                         cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
                         if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                            if constexpr (kDebugTrace) {
+                            if (lane_idx == 0 &&
+                                static_cast<int>(blockIdx.x) == kDbgBlockX &&
+                                static_cast<int>(blockIdx.y) == kDbgBlockY &&
+                                static_cast<int>(k_block_idx) == kDbgKBlock &&
+                                static_cast<int>(m_block_idx) == kDbgMBlock) {
+                                printf("[FP4DBG][TARGET][EPI][SM%u] TMA store issue: "
+                                       "k=%u m_block=%u w=%u s=%u m_idx=%u n_idx=%u group=%u\n",
+                                       smid, k_block_idx, m_block_idx, w, s, m_idx, n_idx, scheduler.current_group_idx);
+                            }
+                            } // kDebugTrace
                             if constexpr (kGemmType == GemmType::Batched) {
                                 using cute_tma_t = cute::conditional_t<kWithAccumulation,
                                     cute::SM90_TMA_REDUCE_ADD_3D, cute::SM90_TMA_STORE_3D>;
