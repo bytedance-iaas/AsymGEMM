@@ -49,7 +49,9 @@ get_default_recipe(const torch::ScalarType& sfa_dtype, const torch::ScalarType& 
         DG_HOST_ASSERT(sfa_dtype == torch::kFloat and sfb_dtype == torch::kFloat);
         return {1, 128, 128};
     } else if (arch_major == 10) {
-        DG_HOST_ASSERT(sfb_dtype == torch::kFloat or sfb_dtype == torch::kInt);
+        DG_HOST_ASSERT(sfb_dtype == torch::kFloat or sfb_dtype == torch::kInt or sfb_dtype == torch::kFloat8_e4m3fn);
+        if (sfb_dtype == torch::kFloat8_e4m3fn)
+            return {1, 1, 16};              // FP4 native E4M3 scales
         return sfb_dtype == torch::kFloat ?
             std::make_tuple(1, 128, 128):   // Legacy format
             std::make_tuple(1,   1, 128);   // 1D1D kernels
@@ -71,12 +73,13 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
 
     // Always do shape checks
     const auto& sf_dtype = sf.scalar_type();
-    DG_HOST_ASSERT(sf_dtype == torch::kFloat or sf_dtype == torch::kInt);
+    DG_HOST_ASSERT(sf_dtype == torch::kFloat or sf_dtype == torch::kInt or sf_dtype == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(sf.dim() == static_cast<int>(num_groups.has_value()) + 2);
     if (num_groups.has_value())
         DG_HOST_ASSERT(sf.size(-3) == num_groups.value());
     DG_HOST_ASSERT(sf.size(-2) == ceil_div(mn, gran_mn));
-    DG_HOST_ASSERT(sf.size(-1) == ceil_div(k, gran_k * (sf_dtype == torch::kFloat ? 1 : 4)));
+    const int sf_pack_factor = (sf_dtype == torch::kInt) ? 4 : 1;
+    DG_HOST_ASSERT(sf.size(-1) == ceil_div(k, gran_k * sf_pack_factor));
 
     // TMA stride checks: TMA aligned and MN-major
     if (tma_stride_check) {

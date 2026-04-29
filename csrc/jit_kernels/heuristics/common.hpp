@@ -464,7 +464,8 @@ static GemmConfig get_best_config_asym(const GemmType& gemm_type, const KernelTy
     MulticastConfig best_multicast_config = {1, false};
     SharedMemoryConfig best_smem_config;
     const int& ab_elem_size = static_cast<int>(c10::elementSize(ab_dtype));
-    const int block_k_step = 16 / ab_elem_size;
+    // FP8 requires BLOCK_K % 128 == 0 (SF granularity), so step by 128 to skip invalid values
+    const int block_k_step = (ab_dtype == torch::kFloat8_e4m3fn) ? 128 : (16 / ab_elem_size);
     const int max_block_k_by_swizzle = is_asym
         ? 512 / ab_elem_size
         : ((major_a == cute::UMMA::Major::K or major_b == cute::UMMA::Major::K)
