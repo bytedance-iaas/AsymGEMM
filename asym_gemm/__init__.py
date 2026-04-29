@@ -60,6 +60,8 @@ try:
             "m_grouped_bf16_asym_gemm_nt_masked",
             # SM80 MoE GEMM (FP16 + BF16, JIT)
             "m_grouped_moe_gemm_nt_contiguous",
+            # SM89 FP8 MoE GEMM (native FP8 MMA, JIT)
+            "m_grouped_fp8_asym_gemm_sm80",
             # Einsum kernels
             "einsum",
             "fp8_einsum",

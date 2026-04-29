@@ -70,5 +70,50 @@ inline SM80GemmConfig select_sm80_config(int arch_major, int arch_minor, int N, 
     return SM80GemmConfig{128u, block_n, block_k, 4u};
 }
 
+// ── FP8 helpers (SM89 native FP8 MMA, K-outer M-inner loop) ─────────────────
+//
+// Smem formula (FP8 for sX+sW, BF16 for sO):
+//   sX: BLOCK_M * BLOCK_K * 1 B
+//   sW: BLOCK_N * BLOCK_K * 1 B
+//   sO: BLOCK_M * BLOCK_N * 2 B  (output staging + partial-sum seed read-back)
+//
+// For BLOCK_M=BLOCK_N=128:
+//   Total = (128+128)*BLOCK_K + 128*128*2 = 256*BLOCK_K + 32768
+//   SM89 (96 KB = 98304 B): BLOCK_K ≤ (98304-32768)/256 = 256
+inline int smem_bytes_fp8(uint32_t block_m, uint32_t block_n, uint32_t block_k) {
+    return static_cast<int>((block_m + block_n) * block_k          // sX+sW: FP8
+                            + block_m * block_n * 2);               // sO: BF16
+}
+
+// Max BLOCK_K for the FP8 kernel given the arch's smem limit.
+// Derived from smem_bytes_fp8(128,128,block_k) <= limit with BLOCK_M=BLOCK_N=128.
+inline int max_block_k_fp8(int arch_major, int arch_minor) {
+    return (smem_limit(arch_major, arch_minor) - 32768) / 256;
+}
+
+// Config selector for the FP8 kernel.
+// BLOCK_K min = 32 (SM89 FP8 MMA K-atom = 32, must be a multiple of 32).
+inline SM80GemmConfig select_sm80_fp8_config(int arch_major, int arch_minor,
+                                             int N, int K) {
+    const int smem_cap = smem_limit(arch_major, arch_minor);
+
+    // Start at arch max, halve until K is divisible; floor at 32
+    uint32_t block_k = static_cast<uint32_t>(max_block_k_fp8(arch_major, arch_minor));
+    while (block_k > 32u && K % static_cast<int>(block_k) != 0)
+        block_k /= 2u;
+
+    // Largest block_n in {128, 64, 32} that divides N and fits in smem
+    uint32_t block_n = 32u;
+    for (uint32_t bn : {128u, 64u, 32u}) {
+        if (N % static_cast<int>(bn) != 0) continue;
+        if (smem_bytes_fp8(128u, bn, block_k) <= smem_cap) {
+            block_n = bn;
+            break;
+        }
+    }
+
+    return SM80GemmConfig{128u, block_n, block_k, 4u};
+}
+
 }  // namespace sm80
 }  // namespace asym_gemm
