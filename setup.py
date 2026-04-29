@@ -84,9 +84,26 @@ class CustomBuildPy(build_py):
                     shutil.rmtree(dst_dir)
                 shutil.copytree(src_dir, dst_dir)
 
+        # build_lib is the staging area for what eventually goes to dist-packages
+        build_asym_gemm_inc_dir = os.path.join(self.build_lib, 'asym_gemm/include/asym_gemm')
+
+        # Source directory in your workspace
+        source_asym_gemm_inc_dir = os.path.join(current_dir, 'asym_gemm/include/asym_gemm')
+
+        # Ensure the destination path in the build directory exists
+        os.makedirs(build_asym_gemm_inc_dir, exist_ok=True)
+
+        # Copy the contents of your project's include folder
+        if os.path.exists(source_asym_gemm_inc_dir):
+            # Using dirs_exist_ok=True (Python 3.8+) to merge contents if needed
+            shutil.copytree(source_asym_gemm_inc_dir, build_asym_gemm_inc_dir, dirs_exist_ok=True)
+            print(f"Bundled project headers: {source_asym_gemm_inc_dir} -> {build_asym_gemm_inc_dir}")
 
 if __name__ == '__main__':
     setuptools.setup(
+        name="asym_gemm",
+        version="0.1.0",
+        packages=setuptools.find_packages(include=['asym_gemm', 'asym_gemm.*']),
         ext_modules=get_ext_modules(),
         cmdclass={'build_py': CustomBuildPy},
     )
