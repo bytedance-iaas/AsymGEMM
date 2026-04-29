@@ -22,6 +22,29 @@ typedef struct {
     int64_t  K;
 } SM80MoEParams;
 
+/*
+ * FP8 params for SM89 native FP8 MMA (RTX 4090).
+ * x_ptr : float8_e4m3fn in HBM          [total_tokens, K]
+ * w_ptr : float8_e4m3fn in CPU pinned   [num_experts, N, K]
+ * o_ptr : bfloat16 in HBM               [total_tokens, N]
+ *         also used as partial-sum accumulation buffer between K-tiles
+ * scale_a/b: per-tensor float32 scales applied to FP32 accumulator at the
+ *            final K-tile only (intermediate writes store unscaled BF16).
+ */
+typedef struct {
+    void*    x_ptr;
+    void*    w_ptr;
+    void*    o_ptr;
+    int32_t* expert_list;
+    int32_t* index_list;
+    int32_t  list_size;
+    int32_t  expert_size;
+    int64_t  N;
+    int64_t  K;
+    float    scale_a;
+    float    scale_b;
+} SM80MoEFP8Params;
+
 #ifdef __cplusplus
 }  // namespace asym_gemm
 #endif
