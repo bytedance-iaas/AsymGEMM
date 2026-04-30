@@ -19,7 +19,7 @@ struct SM80GemmConfig {
         return static_cast<int>(block_m * block_k + block_n * block_k + block_m * block_n) * 2;
     }
 
-    // Grid is (ceil_div(N, block_n), 1): one CTA per N-tile, experts processed serially
+    // Grid is (ceil_div(N, block_n), list_size): one CTA per (N-tile, expert)
     int grid_x(int N) const { return (N + static_cast<int>(block_n) - 1) / static_cast<int>(block_n); }
 };
 

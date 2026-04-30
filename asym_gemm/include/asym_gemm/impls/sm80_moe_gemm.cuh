@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <type_traits>
 
-#include <cutlass/numeric_types.h>   // cutlass::half_t, cutlass::bfloat16_t
+#include <cutlass/numeric_types.h>      // cutlass::half_t, cutlass::bfloat16_t
+#include <cutlass/array.h>              // cutlass::Array<T, N>
+#include <cutlass/numeric_conversion.h> // cutlass::NumericArrayConverter (cvt.rn.bf16x2.f32)
 
 #include <cute/tensor.hpp>
 #include <cute/arch/mma_sm80.hpp>   // SM80_16x8x16_F32F16F16F32_TN, ...BF16...
@@ -32,25 +34,110 @@ CUTE_DEVICE void clear_smem_region(char* ptr, int tidx, int num_threads) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// moe_predicated_copy: vectorised tile copy with optional M-row predication.
+//
+// Port of FLASH_NAMESPACE::copy (flash-attention/csrc/flash_attn/src/utils.h):
+// dispatches one TiledCopy atom per logical (m, k) sub-tile, gated by a per-row
+// coordinate predicate.  When the underlying atom is 128-bit (UniversalCopy<uint128_t>
+// or SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>), each call emits a single vectorised
+// load/store instead of element-by-element scalar accesses.
+//
+// Template params:
+//   Is_even_MN   — if true, all rows are valid; skip coordinate check (fast path).
+//   Is_even_K    — if true, all K columns are valid; skip predicate_K check.
+//   Clear_OOB_MN — if true, clear destination rows that are out-of-bounds.
+//   Clear_OOB_K  — if true, clear destination columns that are out-of-bounds.
+//
+// Parameters:
+//   tiled_copy   — TiledCopy object (must wrap a 128-bit atom for best perf).
+//   S            — source tensor, rank-3: (Atom, MMA_M, MMA_N).
+//   D            — destination tensor, same shape as S.
+//   identity_MN  — coordinate tensor; identity_MN(0, m, 0) gives the M-row index.
+//   predicate_K  — bool tensor of length size<2>(S); only consulted when !Is_even_K.
+//   max_MN       — exclusive upper bound on valid M rows (ignored when Is_even_MN).
+// ──────────────────────────────────────────────────────────────────────────────
+template <bool Is_even_MN = true, bool Is_even_K = true,
+          bool Clear_OOB_MN = false, bool Clear_OOB_K = false,
+          typename TiledCopy,
+          typename Engine0, typename Layout0,
+          typename Engine1, typename Layout1,
+          typename Engine2, typename Layout2,
+          typename Engine3, typename Layout3>
+CUTE_DEVICE void moe_predicated_copy(
+    TiledCopy tiled_copy,
+    cute::Tensor<Engine0, Layout0> const& S,
+    cute::Tensor<Engine1, Layout1>&       D,
+    cute::Tensor<Engine2, Layout2> const& identity_MN,
+    cute::Tensor<Engine3, Layout3> const& predicate_K,
+    int max_MN = 0)
+{
+    static_assert(!(Clear_OOB_MN && !Clear_OOB_K),
+                  "Clear_OOB_MN requires Clear_OOB_K");
+    CUTE_UNROLL
+    for (int m = 0; m < cute::size<1>(S); ++m) {
+        if (Is_even_MN || cute::get<0>(identity_MN(cute::_0{}, m, cute::_0{})) < max_MN) {
+            CUTE_UNROLL
+            for (int k = 0; k < cute::size<2>(S); ++k) {
+                if (Is_even_K || predicate_K(k))
+                    cute::copy(tiled_copy, S(cute::_, m, k), D(cute::_, m, k));
+                else if (Clear_OOB_K)
+                    cute::clear(D(cute::_, m, k));
+            }
+        } else if (Clear_OOB_MN) {
+            cute::clear(D(cute::_, m, cute::_));
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// moe_convert_type: vectorised register-fragment conversion via cutlass
+// NumericArrayConverter.
+//
+// Port of FLASH_NAMESPACE::convert_type (flash-attention/csrc/flash_attn/src/utils.h).
+// For FP32 → BF16 the inner 2-elem CUTLASS specialisation emits one
+// `cvt.rn.bf16x2.f32` per pair (SM80+); for FP32 → FP16 it emits `cvt.rn.f16x2.f32`.
+// The N>2 specialisation unrolls to N/2 SIMD calls.  Same rounding mode
+// (round-to-nearest-even) and bit-identical output as the equivalent scalar
+// `Element(static_cast<float>(x))` per-element loop.
+//
+// Requirements:
+//   - tensor must be a register-residency tensor (e.g., from partition_fragment_C
+//     or make_tensor<T>(layout)) whose data() returns a contiguous register array.
+//   - tensor's element count must be known at compile time.
+//
+// Usage:
+//   Tensor rO = moe_convert_type<ElementOut>(tSrO);
+// ──────────────────────────────────────────────────────────────────────────────
+template <typename To_type, typename Engine, typename Layout>
+CUTE_DEVICE auto moe_convert_type(cute::Tensor<Engine, Layout> const& tensor) {
+    using From_type = typename Engine::value_type;
+    constexpr int numel = decltype(cute::size(tensor))::value;
+    cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
+    auto frag = convert_op(
+        *reinterpret_cast<const cutlass::Array<From_type, numel>*>(tensor.data()));
+    return cute::make_tensor(cute::make_rmem_ptr<To_type>(&frag), tensor.layout());
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Main kernel
 //
-// Grid:  (ceil_div(N, BLOCK_N), 1)
+// Grid:  (ceil_div(N, BLOCK_N), list_size)
 //   blockIdx.x = which N-tile this CTA handles
-//   blockIdx.y = 0 (unused; serial expert loop inside the kernel)
+//   blockIdx.y = which expert entry (index into expert_list / index_list)
 // Block: (NWARPS * 32, 1, 1)
 //
 // Algorithm (M-outer, K-inner — accumulates in FP32, writes once per M-tile):
-//   for each expert e in [0, list_size):
-//     for each M-tile m:
-//       clear FP32 accumulator
-//       for each K-tile k:
-//         load sX [BLOCK_M, BLOCK_K] from x[e][m][k]  (cp.async or element copy)
-//         load sW [BLOCK_N, BLOCK_K] from w[expert_id][n_tile][k]  (cp.async)
-//         fence + wait + syncthreads
-//         LDSM sX → registers, LDSM sW → registers
-//         MMA: acc += sX_reg @ sW_reg^T
-//         syncthreads
-//       convert acc (fp32) → Element, stage in sO, write sO → gO (with M predicate)
+//   expert derived from blockIdx.y (one CTA per expert — parallel across SMs)
+//   for each M-tile m:
+//     clear FP32 accumulator
+//     for each K-tile k:
+//       load sX [BLOCK_M, BLOCK_K] from x[e][m][k]  (cp.async or element copy)
+//       load sW [BLOCK_N, BLOCK_K] from w[expert_id][n_tile][k]  (cp.async)
+//       fence + wait + syncthreads
+//       LDSM sX → registers, LDSM sW → registers
+//       MMA: acc += sX_reg @ sW_reg^T
+//       syncthreads
+//     convert acc (fp32) → Element, stage in sO, write sO → gO (with M predicate)
 // ──────────────────────────────────────────────────────────────────────────────
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t NWARPS, typename Element>
@@ -162,12 +249,17 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
     auto smem_copy_O     = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
     auto smem_thr_copy_O = smem_copy_O.get_thread_slice(tidx);
 
-    // ── Expert loop ──────────────────────────────────────────────────────────
-    int64_t len_start = 0;
+    // ── Expert selection: one CTA per expert (blockIdx.y = expert entry index) ──
+    {
+        const int     expert_e  = static_cast<int>(blockIdx.y);
+        const int32_t expert_id = params.expert_list[expert_e];
+        const int64_t len_start = (expert_e == 0)
+                                ? 0LL
+                                : static_cast<int64_t>(params.index_list[expert_e - 1]);
+        const int64_t len       = static_cast<int64_t>(params.index_list[expert_e]) - len_start;
 
-    for (int e = 0; e < params.list_size; ++e) {
-        const int32_t expert_id = params.expert_list[e];
-        const int64_t len       = params.index_list[e] - len_start;
+        // Early exit for zero-token experts (no barriers have been armed yet)
+        if (len == 0) return;
 
         // Typed pointers for this expert's slice
         const Element* x_e = x_g + len_start * K;                 // [len, K]
@@ -196,10 +288,20 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
 
         // Coordinate tensor for M predication
         Tensor cX = make_identity_tensor(Shape<Int<BLOCK_M>, Int<BLOCK_K>>{});
+        // Output-side coordinate / K-predicate tensors (stable across M-tiles).
+        Tensor cO       = make_identity_tensor(Shape<Int<BLOCK_M>, Int<BLOCK_N>>{});
+        Tensor tOcO     = gmem_thr_copy_o.partition_S(cO);
 
         // Partition W once (same source for all m_tiles per k_tile)
         Tensor tWsW     = gmem_thr_copy_xw.partition_D(sW);
         Tensor tOsO_src = gmem_thr_copy_o.partition_S(sO);
+        // X-side K-predicate vector (all true; K is BLOCK_K-aligned).  Used by the
+        // partial-tile cp.async path; Is_even_K=true skips the actual check.
+        Tensor tXpX     = make_tensor<bool>(make_shape(size<2>(gmem_thr_copy_xw.partition_D(sX))));
+        cute::fill(tXpX, true);
+        // N-column predicate vector (all true; N is BLOCK_N-aligned by API contract).
+        Tensor tOpO     = make_tensor<bool>(make_shape(size<2>(tOsO_src)));
+        cute::fill(tOpO, true);
 
         // ── M-tile loop ──────────────────────────────────────────────────────
         for (int m = 0; m < M_tiles; ++m) {
@@ -227,38 +329,19 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
                 cute::copy(gmem_tiled_copy_xw, tWgW_k, tWsW);
                 cp_async_fence();
 
-                // Load X tile — predicated if this is the last (partial) M-tile
+                // Load X tile via cp.async; partial last tile uses per-row M predicate.
+                Tensor tXgX_k = tXgX_m(_, _, _, k);
                 if (m_actual == static_cast<int>(BLOCK_M)) {
-                    // Full tile: use async copy
-                    Tensor tXgX_k = tXgX_m(_, _, _, k);
+                    // Full tile: vectorised cp.async, no predicate overhead.
                     cute::copy(gmem_tiled_copy_xw, tXgX_k, tXsX);
-                    cp_async_fence();
-                    cp_async_wait<0>();
                 } else {
-                    // Partial tile: wait for W, then synchronous predicated copy
-                    cp_async_wait<0>();
-                    __syncthreads();
-
-                    // Zero sX cooperatively, then fill valid rows
-                    clear_smem_region<BLOCK_M * BLOCK_K * sizeof(Element)>(
-                        reinterpret_cast<char*>(smem_base),
-                        tidx, static_cast<int>(NWARPS * 32));
-                    __syncthreads();
-
-                    // Element-wise copy with M predicate — iterate all three modes
-                    // (atom, M, K) so every element within a copy atom is handled.
-                    Tensor tXgX_k = tXgX_m(_, _, _, k);
-                    for (int mi = 0; mi < size<1>(tXsX); mi++) {
-                        int m_coord = get<0>(tXcX(_0{}, mi, _0{}));
-                        if (m_coord < m_actual) {
-                            for (int ai = 0; ai < size<0>(tXsX); ai++) {
-                                for (int ki = 0; ki < size<2>(tXsX); ki++) {
-                                    tXsX(ai, mi, ki) = tXgX_k(ai, mi, ki);
-                                }
-                            }
-                        }
-                    }
+                    // Partial last tile: cp.async for valid rows, cute::clear for OOB.
+                    moe_predicated_copy</*Is_even_MN=*/false, /*Is_even_K=*/true,
+                                        /*Clear_OOB_MN=*/true,  /*Clear_OOB_K=*/true>(
+                        gmem_tiled_copy_xw, tXgX_k, tXsX, tXcX, tXpX, m_actual);
                 }
+                cp_async_fence();
+                cp_async_wait<0>();
 
                 __syncthreads();
 
@@ -275,11 +358,8 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
                 __syncthreads();
             }  // K-tile loop
 
-            // ── Convert FP32 accumulator → Element ───────────────────────────
-            Tensor rO = make_tensor<Element>(shape(tSrO));
-            CUTE_UNROLL
-            for (int i = 0; i < size(tSrO); i++)
-                rO(i) = Element(static_cast<float>(tSrO(i)));
+            // ── Convert FP32 accumulator → Element via cvt.rn.{bf16x2,f16x2}.f32 ──
+            Tensor rO = moe_convert_type<Element>(tSrO);
 
             // ── Stage output in smem ──────────────────────────────────────────
             Tensor taccOrO = smem_thr_copy_O.retile_S(rO);
@@ -287,39 +367,27 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
             cute::copy(smem_copy_O, taccOrO, taccOsO);
             __syncthreads();
 
-            // ── Write sO → gO (with M predicate for partial last tile) ────────
-            // Safety invariant for partial tiles: MMA accumulates over zeroed sX rows
-            // (via clear_smem_region + predicated fill), so accumulators for M rows
-            // >= m_actual are 0.0. The M predicate below prevents writing those zeros
-            // to global memory. tOrO is read from sO for all rows but only written for
-            // valid rows — the stale sO values (zeros) for out-of-bounds rows are safe.
-            Tensor gO_m  = gO(_, _, m);               // (BLOCK_M, BLOCK_N)
-            Tensor cO    = make_identity_tensor(Shape<Int<BLOCK_M>, Int<BLOCK_N>>{});
-            Tensor tOcO  = gmem_thr_copy_o.partition_S(cO);
-            Tensor tOgO  = gmem_thr_copy_o.partition_D(gO_m);
+            // ── Write sO → gO via vectorised, predicated 128-bit stores ──────
+            Tensor gO_m = gO(_, _, m);
+            Tensor tOgO = gmem_thr_copy_o.partition_D(gO_m);
 
-            // Load sO → register buffer
-            Tensor tOrO  = make_tensor<Element>(shape(tOgO));
+            // sO (smem) → tOrO (registers) via 128-bit LDS.
+            Tensor tOrO = make_tensor<Element>(shape(tOgO));
             cute::copy(gmem_tiled_copy_o, tOsO_src, tOrO);
 
-            // Write to global with M predicate — iterate modes (atom, M, N)
-            // explicitly so the M-coordinate check is unambiguous.
-            for (int mi = 0; mi < size<1>(tOgO); mi++) {
-                int m_coord = get<0>(tOcO(_0{}, mi, _0{}));
-                if (m_coord < m_actual) {
-                    for (int ai = 0; ai < size<0>(tOgO); ai++) {
-                        for (int ni = 0; ni < size<2>(tOgO); ni++) {
-                            tOgO(ai, mi, ni) = tOrO(ai, mi, ni);
-                        }
-                    }
-                }
+            // tOrO (registers) → tOgO (global) via 128-bit STG.
+            if (m_actual == static_cast<int>(BLOCK_M)) {
+                moe_predicated_copy</*Is_even_MN=*/true,  /*Is_even_K=*/true>(
+                    gmem_tiled_copy_o, tOrO, tOgO, tOcO, tOpO);
+            } else {
+                moe_predicated_copy</*Is_even_MN=*/false, /*Is_even_K=*/true,
+                                    /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                    gmem_tiled_copy_o, tOrO, tOgO, tOcO, tOpO, m_actual);
             }
 
             __syncthreads();
         }  // M-tile loop
-
-        len_start = params.index_list[e];
-    }  // Expert loop
+    }  // expert block
 
 #else
     // Architecture guard: this kernel requires SM80+
@@ -332,7 +400,7 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
 // ──────────────────────────────────────────────────────────────────────────────
 // FP8 MoE GEMM kernel — SM89 (RTX 4090) native FP8 MMA
 //
-// Grid:  (ceil_div(N, BLOCK_N), 1)   — same as the BF16 kernel
+// Grid:  (ceil_div(N, BLOCK_N), list_size)
 // Block: (NWARPS * 32, 1, 1)
 //
 // Algorithm: K-outer, M-inner (mixtureExpertKernel.cu pattern)
@@ -454,43 +522,59 @@ __global__ void sm80_moe_fp8_gemm_impl(SM80MoEFP8Params params) {
     Tensor cX = make_identity_tensor(Shape<Int<BLOCK_M>, Int<BLOCK_K>>{});
     Tensor cO = make_identity_tensor(Shape<Int<BLOCK_M>, Int<BLOCK_N>>{});
 
-    // ── Helper: write BF16 rO register buffer → sO, then sO → gO ───────────
-    // Extracted as a lambda to avoid code duplication between k=0 and k>0 paths.
-    // rO: BF16 register tensor with same shape as tSrO.
-    // gO_m: gmem slice for the current M-tile.
-    // m_actual: number of valid M rows in this tile.
+    // ── Hoist: O-side coordinate / predicate tensors (stable across M-tiles) ──
+    Tensor tOcO_o   = gmem_thr_copy_o.partition_S(cO);
+    Tensor tOsO_src = gmem_thr_copy_o.partition_S(sO);
+    Tensor tOpO_o   = make_tensor<bool>(make_shape(size<2>(tOsO_src)));
+    cute::fill(tOpO_o, true);
+
+    // ── Hoist: X-side K-predicate vector for partial-tile cp.async ──────────
+    // K is always BLOCK_K-aligned (validated at API boundary), so all entries are
+    // true and Is_even_K=true skips the check entirely; tXpX is just a parameter
+    // slot for moe_predicated_copy.
+    Tensor tXpX = make_tensor<bool>(make_shape(size<2>(gmem_thr_copy_xw.partition_D(sX))));
+    cute::fill(tXpX, true);
+
+    // ── Helper: write BF16 rO register buffer → sO → gO ─────────────────────
     auto write_output = [&](auto& rO, auto& gO_m, int m_actual) {
-        // rO (BF16 registers) → sO (BF16 smem)
+        // Stage 1: rO (BF16 registers) → sO (BF16 smem) via MMA-C layout copy.
         Tensor taccOrO = smem_thr_copy_O.retile_S(rO);
         Tensor taccOsO = smem_thr_copy_O.partition_D(sO);
         cute::copy(smem_copy_O, taccOrO, taccOsO);
         __syncthreads();
 
-        // sO → gO_m (with M predicate for partial last tile)
-        Tensor tOsO_src = gmem_thr_copy_o.partition_S(sO);
-        Tensor tOcO     = gmem_thr_copy_o.partition_S(cO);
-        Tensor tOgO     = gmem_thr_copy_o.partition_D(gO_m);
-        Tensor tOrO     = make_tensor<ElementOut>(shape(tOgO));
+        // Stage 2: sO (smem) → tOrO (registers) via 128-bit LDS.
+        Tensor tOgO = gmem_thr_copy_o.partition_D(gO_m);
+        Tensor tOrO = make_tensor<ElementOut>(shape(tOgO));
         cute::copy(gmem_tiled_copy_o, tOsO_src, tOrO);
-        for (int mi = 0; mi < size<1>(tOgO); mi++) {
-            int m_coord = get<0>(tOcO(_0{}, mi, _0{}));
-            if (m_coord < m_actual) {
-                for (int ai = 0; ai < size<0>(tOgO); ai++)
-                    for (int ni = 0; ni < size<2>(tOgO); ni++)
-                        tOgO(ai, mi, ni) = tOrO(ai, mi, ni);
-            }
+
+        // Stage 3: tOrO (registers) → tOgO (global) via 128-bit STG.
+        // Branch on m_actual: full tiles take the Is_even_MN=true fast path.
+        if (m_actual == static_cast<int>(BLOCK_M)) {
+            moe_predicated_copy</*Is_even_MN=*/true,  /*Is_even_K=*/true>(
+                gmem_tiled_copy_o, tOrO, tOgO, tOcO_o, tOpO_o);
+        } else {
+            // Partial last tile: skip OOB rows (Clear_OOB_MN=false → no zeros).
+            moe_predicated_copy</*Is_even_MN=*/false, /*Is_even_K=*/true,
+                                /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                gmem_tiled_copy_o, tOrO, tOgO, tOcO_o, tOpO_o, m_actual);
         }
         __syncthreads();
     };
 
-    // ── Expert loop ──────────────────────────────────────────────────────────
-    int64_t len_start = 0;
-
-    for (int e = 0; e < params.list_size; ++e) {
-        const int32_t expert_id = params.expert_list[e];
-        const int64_t len       = params.index_list[e] - len_start;
+    // ── Expert selection: one CTA per expert (blockIdx.y = expert entry index) ──
+    {
+        const int     expert_e  = static_cast<int>(blockIdx.y);
+        const int32_t expert_id = params.expert_list[expert_e];
+        const int64_t len_start = (expert_e == 0)
+                                ? 0LL
+                                : static_cast<int64_t>(params.index_list[expert_e - 1]);
+        const int64_t len       = static_cast<int64_t>(params.index_list[expert_e]) - len_start;
         const int     m_max     = static_cast<int>((len + BLOCK_M - 1) / BLOCK_M);
         const int     k_max     = static_cast<int>(K / BLOCK_K);
+
+        // Early exit for zero-token experts
+        if (len == 0) return;
 
         const ElementIn* x_e = x_g + len_start * K;
         const ElementIn* w_e = w_g + (int64_t)expert_id * N * K;
@@ -531,23 +615,16 @@ __global__ void sm80_moe_fp8_gemm_impl(SM80MoEFP8Params params) {
                 Tensor tXcX    = gmem_thr_copy_xw.partition_S(cX);
 
                 if (m_actual == static_cast<int>(BLOCK_M)) {
+                    // Full tile: vectorised cp.async.
                     cute::copy(gmem_tiled_copy_xw, tXgX_mk, tXsX);
-                    cp_async_fence();
-                    cp_async_wait<0>();
                 } else {
-                    cp_async_wait<0>();
-                    __syncthreads();
-                    clear_smem_region<BLOCK_M * BLOCK_K * sizeof(ElementIn)>(
-                        reinterpret_cast<char*>(smem_x), tidx, NWARPS * 32);
-                    __syncthreads();
-                    for (int mi = 0; mi < size<1>(tXsX); mi++) {
-                        int m_coord = get<0>(tXcX(_0{}, mi, _0{}));
-                        if (m_coord < m_actual)
-                            for (int ai = 0; ai < size<0>(tXsX); ai++)
-                                for (int ki = 0; ki < size<2>(tXsX); ki++)
-                                    tXsX(ai, mi, ki) = tXgX_mk(ai, mi, ki);
-                    }
+                    // Partial last tile: cp.async for valid rows, cute::clear for OOB.
+                    moe_predicated_copy</*Is_even_MN=*/false, /*Is_even_K=*/true,
+                                        /*Clear_OOB_MN=*/true,  /*Clear_OOB_K=*/true>(
+                        gmem_tiled_copy_xw, tXgX_mk, tXsX, tXcX, tXpX, m_actual);
                 }
+                cp_async_fence();
+                cp_async_wait<0>();
                 __syncthreads();
 
                 // LDSM: sX → tSrX,  sW → tOrW
@@ -566,11 +643,8 @@ __global__ void sm80_moe_fp8_gemm_impl(SM80MoEFP8Params params) {
                     for (int i = 0; i < size(tSrO); i++) tSrO(i) *= cs;
                 }
 
-                // FP32 → BF16 register buffer, then write to sO → gO
-                Tensor rO = make_tensor<ElementOut>(shape(tSrO));
-                CUTE_UNROLL
-                for (int i = 0; i < size(tSrO); i++)
-                    rO(i) = ElementOut(static_cast<float>(tSrO(i)));
+                // FP32 → BF16 via cvt.rn.bf16x2.f32, then write sO → gO
+                Tensor rO = moe_convert_type<ElementOut>(tSrO);
                 Tensor gO_m = gO(_, _, m);
                 write_output(rO, gO_m, m_actual);
             }  // m-loop (k=0)
@@ -598,6 +672,7 @@ __global__ void sm80_moe_fp8_gemm_impl(SM80MoEFP8Params params) {
                 Tensor tXcX    = gmem_thr_copy_xw.partition_S(cX);
 
                 if (m_actual == static_cast<int>(BLOCK_M)) {
+                    // Full tile: vectorised cp.async X.
                     cute::copy(gmem_tiled_copy_xw, tXgX_mk, tXsX);
                     cp_async_fence();
                     cp_async_wait<0>();
@@ -611,19 +686,12 @@ __global__ void sm80_moe_fp8_gemm_impl(SM80MoEFP8Params params) {
                     for (int i = 0; i < size(tSrO); i++)
                         tSrO(i) = static_cast<float>(tSgO(i));
                 } else {
+                    // Partial last tile: cp.async for valid rows, cute::clear for OOB.
+                    moe_predicated_copy</*Is_even_MN=*/false, /*Is_even_K=*/true,
+                                        /*Clear_OOB_MN=*/true,  /*Clear_OOB_K=*/true>(
+                        gmem_tiled_copy_xw, tXgX_mk, tXsX, tXcX, tXpX, m_actual);
+                    cp_async_fence();
                     cp_async_wait<0>();
-                    __syncthreads();
-                    clear_smem_region<BLOCK_M * BLOCK_K * sizeof(ElementIn)>(
-                        reinterpret_cast<char*>(smem_x), tidx, NWARPS * 32);
-                    __syncthreads();
-                    // Predicated X copy
-                    for (int mi = 0; mi < size<1>(tXsX); mi++) {
-                        int m_coord = get<0>(tXcX(_0{}, mi, _0{}));
-                        if (m_coord < m_actual)
-                            for (int ai = 0; ai < size<0>(tXsX); ai++)
-                                for (int ki = 0; ki < size<2>(tXsX); ki++)
-                                    tXsX(ai, mi, ki) = tXgX_mk(ai, mi, ki);
-                    }
                     // Predicated O read-back into sO.
                     // Valid rows are loaded from HBM; invalid rows are zeroed in smem
                     // so that the sO→FP32 conversion below initialises those rows to 0.0.
@@ -665,17 +733,12 @@ __global__ void sm80_moe_fp8_gemm_impl(SM80MoEFP8Params params) {
                     for (int i = 0; i < size(tSrO); i++) tSrO(i) *= cs;
                 }
 
-                // FP32 → BF16 register buffer, then write to sO → gO
-                Tensor rO = make_tensor<ElementOut>(shape(tSrO));
-                CUTE_UNROLL
-                for (int i = 0; i < size(tSrO); i++)
-                    rO(i) = ElementOut(static_cast<float>(tSrO(i)));
+                // FP32 → BF16 via cvt.rn.bf16x2.f32, then write sO → gO
+                Tensor rO = moe_convert_type<ElementOut>(tSrO);
                 write_output(rO, gO_m, m_actual);
             }  // m-loop (k>0)
         }  // k-loop
-
-        len_start = params.index_list[e];
-    }  // expert loop
+    }  // expert block
 
 #else
     if (blockIdx.x == 0 && threadIdx.x == 0)
