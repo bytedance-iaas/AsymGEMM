@@ -85,7 +85,7 @@ static void sm80_m_grouped_moe_gemm_contiguous(
 
     const SM80MoEGemmRuntime::Args args {
         .gemm_config   = cfg,
-        .launch_args   = LaunchArgs({cfg.grid_x(static_cast<int>(N)), 1},
+        .launch_args   = LaunchArgs({cfg.grid_x(static_cast<int>(N)), list_size},
                                     cfg.num_threads(),
                                     cfg.smem_bytes()),
         .element_type_str = element_type_str,
@@ -165,7 +165,7 @@ static void sm80_m_grouped_fp8_moe_gemm_contiguous(
 
     const SM80MoEFP8GemmRuntime::Args runtime_args {
         .gemm_config = cfg,
-        .launch_args = LaunchArgs({cfg.grid_x(static_cast<int>(N)), 1},
+        .launch_args = LaunchArgs({cfg.grid_x(static_cast<int>(N)), list_size},
                                   cfg.num_threads(),
                                   smem_bytes),
         .params      = params,
