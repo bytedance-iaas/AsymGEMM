@@ -1,9 +1,11 @@
+// Copyright (c) 2025 DeepSeek. Licensed under the MIT License.
+// Modified by Bytedance Inc., 2026.
+// Original: https://github.com/deepseek-ai/DeepGEMM
+
 // GEMM kernels
 #include <asym_gemm/impls/sm90_bf16_gemm.cuh>
 #include <asym_gemm/impls/sm90_fp8_gemm_1d1d.cuh>
 #include <asym_gemm/impls/sm90_fp8_gemm_1d2d.cuh>
-#include <asym_gemm/impls/sm100_bf16_gemm.cuh>
-#include <asym_gemm/impls/sm100_fp8_gemm_1d1d.cuh>
 #include <asym_gemm/impls/sm100_fp8_asym_gemm_1d1d.cuh>
 
 // Attention kernels

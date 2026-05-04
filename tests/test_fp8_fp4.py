@@ -1,3 +1,7 @@
+# Copyright (c) 2025 DeepSeek. Licensed under the MIT License.
+# Modified by Bytedance Inc., 2026.
+# Original: https://github.com/deepseek-ai/DeepGEMM
+
 import copy
 import numpy as np
 import random
