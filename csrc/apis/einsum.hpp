@@ -1,3 +1,7 @@
+// Copyright (c) 2025 DeepSeek. Licensed under the MIT License.
+// Modified by Bytedance Inc., 2026.
+// Original: https://github.com/deepseek-ai/DeepGEMM
+
 #pragma once
 
 #include <pybind11/pybind11.h>
@@ -13,7 +17,6 @@
 #include "../jit_kernels/impls/sm90_bmk_bnk_mn.hpp"
 #include "../jit_kernels/impls/sm100_bmk_bnk_mn.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
-#include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
 #endif
 

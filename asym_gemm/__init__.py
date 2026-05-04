@@ -1,3 +1,7 @@
+# Copyright (c) 2025 DeepSeek. Licensed under the MIT License.
+# Modified by Bytedance Inc., 2026.
+# Original: https://github.com/deepseek-ai/DeepGEMM
+
 import os
 import subprocess
 import torch
@@ -53,7 +57,6 @@ try:
             "m_grouped_fp4_asym_gemm_nt_masked",
             # BF16 GEMMs
             "m_grouped_bf16_asym_gemm_nt_contiguous",
-            "m_grouped_bf16_gemm_nt_contiguous",
             "m_grouped_bf16_asym_gemm_nt_masked",
             # Einsum kernels
             "einsum",
