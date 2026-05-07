@@ -158,6 +158,39 @@ __device__ __forceinline__ void prefetch_l1(void *ptr) {
     asm volatile("prefetch.global.L1 [%0];" :: "l"(ptr));
 }
 
+// -----------------------------------------------------------------------------
+// Acquire / release primitives for cross-SM flag communication
+// -----------------------------------------------------------------------------
+// Added for Stage 2/3 of asym_moe_update.md: the L2-arrival-mask handshake
+// between the L1 epilogue (setter) and the L2 A-loader (waiter).  Semantics
+// match DeepGEMM's `deep_gemm/ptx/utils.cuh`:
+//   - ld_acq_gpu : acquire-loads a uint64 (ordered w.r.t. subsequent GPU ops)
+//   - red_or_rel_gpu : release-OR into a uint64 (ordered w.r.t. prior GPU ops)
+
+namespace ptx {
+
+__device__ __forceinline__ uint64_t ld_acq_gpu(const uint64_t* ptr) {
+    uint64_t ret;
+    asm volatile("ld.relaxed.gpu.b64 %0, [%1];" : "=l"(ret) : "l"(ptr));
+    return ret;
+}
+
+__device__ __forceinline__ uint32_t ld_acq_gpu(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.relaxed.gpu.b32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    return ret;
+}
+
+__device__ __forceinline__ void red_or_rel_gpu(uint64_t* ptr, uint64_t value) {
+    asm volatile("red.release.gpu.b64.or [%0], %1;" :: "l"(ptr), "l"(value));
+}
+
+__device__ __forceinline__ void red_add_rel_gpu(uint32_t* ptr, uint32_t value) {
+    asm volatile("red.release.gpu.add.u32 [%0], %1;" :: "l"(ptr), "r"(value));
+}
+
+} // namespace ptx
+
 template <uint32_t kNumBytes>
 struct Vectorized {
     static auto zeros() {
