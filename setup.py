@@ -7,8 +7,9 @@ from setuptools.command.build_py import build_py
 from pathlib import Path
 
 try:
-    from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 except ImportError:
+    BuildExtension = None
     CUDAExtension = None
     CUDA_HOME = None
 
@@ -32,19 +33,29 @@ def get_ext_modules():
         f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}',
     ]
 
+    nvcc_flags = [
+        '-std=c++17', '-O3',
+        '-gencode', 'arch=compute_100a,code=sm_100a',  # Blackwell UMMA (GB200)
+        '--expt-relaxed-constexpr',
+        '-Xcompiler', '-fPIC',
+        '-diag-suppress=550',     # used-but-not-set variable warnings
+        '-diag-suppress=20012',   # __host__ on defaulted ctor
+    ]
+
     return [CUDAExtension(
         name='asym_gemm._C',
-        sources=['csrc/python_api.cpp'],
+        sources=['csrc/python_api.cpp', 'csrc/mega_moe_launch.cu',
+                 'csrc/mega_moe_new_launch.cpp', 'csrc/mega_moe_new_kernel.cu'],
         include_dirs=[
             f'{CUDA_HOME}/include',
             f'{CUDA_HOME}/include/cccl',
-            'asym_gemm/include',
-            'third-party/cutlass/include',
-            'third-party/fmt/include',
+            os.path.join(current_dir, 'asym_gemm/include'),
+            os.path.join(current_dir, 'third-party/cutlass/include'),
+            os.path.join(current_dir, 'third-party/fmt/include'),
         ],
         libraries=['cudart', 'nvrtc'],
         library_dirs=[f'{CUDA_HOME}/lib64'],
-        extra_compile_args=cxx_flags,
+        extra_compile_args={'cxx': cxx_flags, 'nvcc': nvcc_flags},
     )]
 
 
@@ -86,7 +97,11 @@ class CustomBuildPy(build_py):
 
 
 if __name__ == '__main__':
+    cmdclass = {'build_py': CustomBuildPy}
+    if BuildExtension is not None:
+        # Needed so setuptools invokes nvcc for .cu sources in CUDAExtension.
+        cmdclass['build_ext'] = BuildExtension
     setuptools.setup(
         ext_modules=get_ext_modules(),
-        cmdclass={'build_py': CustomBuildPy},
+        cmdclass=cmdclass,
     )
