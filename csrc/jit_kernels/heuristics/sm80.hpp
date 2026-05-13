@@ -82,7 +82,8 @@ inline SM80GemmConfig select_sm80_config(int arch_major, int arch_minor, int N, 
 //   SM89 (96 KB = 98304 B): BLOCK_K ≤ (98304-32768)/256 = 256
 inline int smem_bytes_fp8(uint32_t block_m, uint32_t block_n, uint32_t block_k) {
     return static_cast<int>((block_m + block_n) * block_k          // sX+sW: FP8
-                            + block_m * block_n * 2);               // sO: BF16
+                            + block_m * block_n * 2                // sO: BF16
+                            + block_m * 4);                        // smem_sa: per-token scales
 }
 
 // Max BLOCK_K for the FP8 kernel given the arch's smem limit.
