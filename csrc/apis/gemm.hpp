@@ -16,6 +16,7 @@
 #endif
 
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
+#include "../jit_kernels/impls/sm80_moe_gemm.hpp"
 
 #include "layout.hpp"
 
@@ -409,6 +410,170 @@ static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const tor
 }
 #endif
 
+static void m_grouped_moe_gemm_nt_contiguous(
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& d,
+    const torch::Tensor& offsets,
+    const torch::Tensor& experts,
+    const int& list_size,
+    const std::string& compiled_dims)
+{
+    // ── Shape checks ──────────────────────────────────────────────────────────
+    DG_HOST_ASSERT(a.dim() == 2);
+    DG_HOST_ASSERT(b.dim() == 3);
+    DG_HOST_ASSERT(d.dim() == 2);
+
+    const int64_t total_tokens   = a.size(0);
+    const int64_t K              = a.size(1);
+    const int64_t num_experts    = b.size(0);
+    const int64_t N              = b.size(1);
+    const int64_t K_b            = b.size(2);
+    const int64_t total_tokens_d = d.size(0);
+    const int64_t N_d            = d.size(1);
+
+    DG_HOST_ASSERT(K == K_b);
+    DG_HOST_ASSERT(N == N_d);
+    DG_HOST_ASSERT(total_tokens == total_tokens_d);
+
+    // ── Dtype checks ──────────────────────────────────────────────────────────
+    DG_HOST_ASSERT(a.scalar_type() == torch::kFloat16 or a.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(b.scalar_type() == a.scalar_type());
+    DG_HOST_ASSERT(d.scalar_type() == a.scalar_type());
+
+    // ── CUDA placement ────────────────────────────────────────────────────────
+    DG_HOST_ASSERT(a.is_cuda());
+    DG_HOST_ASSERT(b.is_cuda());
+    DG_HOST_ASSERT(d.is_cuda());
+
+    // ── Contiguity ────────────────────────────────────────────────────────────
+    DG_HOST_ASSERT(a.is_contiguous());
+    DG_HOST_ASSERT(b.is_contiguous());
+    DG_HOST_ASSERT(d.is_contiguous());
+
+    // ── offsets / experts ─────────────────────────────────────────────────────
+    DG_HOST_ASSERT(offsets.is_cuda() and experts.is_cuda());
+    DG_HOST_ASSERT(offsets.is_contiguous() and experts.is_contiguous());
+    DG_HOST_ASSERT(offsets.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(experts.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(offsets.numel() >= list_size and experts.numel() >= list_size);
+
+    // ── Empty check (before alignment guards so K==0 doesn't trigger K>=64) ──
+    if (total_tokens == 0 or N == 0 or K == 0) return;
+
+    // ── Alignment checks ──────────────────────────────────────────────────────
+    DG_HOST_ASSERT(K % 16 == 0);
+    DG_HOST_ASSERT(N % 32 == 0);
+    DG_HOST_ASSERT(K >= 64);
+
+    // ── Resolve element type and dispatch ─────────────────────────────────────
+    // compiled_dims is accepted for API parity with m_grouped_bf16_asym_gemm_nt_contiguous
+    // but unused: the SM80 kernel selects tile dims via runtime heuristic.
+    const std::string element_type_str =
+        (a.scalar_type() == torch::kFloat16) ? "cutlass::half_t" : "cutlass::bfloat16_t";
+
+    sm80_m_grouped_moe_gemm_contiguous(
+        a, b, d, experts, offsets,
+        N, K,
+        static_cast<int32_t>(num_experts),
+        static_cast<int32_t>(list_size),
+        element_type_str);
+}
+
+static void m_grouped_fp8_asym_gemm_sm80(
+    const torch::Tensor& a,        // [total_tokens, K]   float8_e4m3fn  (HBM)
+    const torch::Tensor& b,        // [num_experts, N, K] float8_e4m3fn  (CPU pinned or HBM)
+    const torch::Tensor& d,        // [total_tokens, N]   bfloat16       (HBM)
+    const torch::Tensor& offsets,  // [list_size] int32 cumulative end indices
+    const torch::Tensor& experts,  // [list_size] int32 expert IDs
+    const int&           list_size,
+    const float&         scale_a,
+    const float&         scale_b,
+    const std::optional<torch::Tensor>& scale_a_tensor = std::nullopt,
+    const std::optional<torch::Tensor>& scale_b_tensor = std::nullopt)
+{
+    DG_HOST_ASSERT(a.dim() == 2 && b.dim() == 3 && d.dim() == 2);
+
+    const int64_t total_tokens = a.size(0);
+    const int64_t K            = a.size(1);
+    const int64_t num_experts  = b.size(0);
+    const int64_t N            = b.size(1);
+    DG_HOST_ASSERT(b.size(2) == K);
+    DG_HOST_ASSERT(d.size(0) == total_tokens && d.size(1) == N);
+
+    DG_HOST_ASSERT(a.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(b.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+
+    // a and d must be on CUDA; b may be on CPU pinned memory (PCIe) or CUDA
+    DG_HOST_ASSERT(a.is_cuda() && d.is_cuda());
+    DG_HOST_ASSERT(a.is_contiguous() && b.is_contiguous() && d.is_contiguous());
+
+    DG_HOST_ASSERT(offsets.is_cuda() && experts.is_cuda());
+    DG_HOST_ASSERT(offsets.is_contiguous() && experts.is_contiguous());
+    DG_HOST_ASSERT(offsets.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(experts.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(offsets.numel() >= list_size && experts.numel() >= list_size);
+
+    if (total_tokens == 0 || N == 0 || K == 0) return;
+
+    DG_HOST_ASSERT(K % 32 == 0 && K >= 32);   // SM89 FP8 MMA K-atom = 32
+    DG_HOST_ASSERT(N % 32 == 0);
+
+    sm80_m_grouped_fp8_moe_gemm_contiguous(
+        a, b, d, experts, offsets,
+        N, K,
+        static_cast<int32_t>(num_experts),
+        static_cast<int32_t>(list_size),
+        scale_a, scale_b,
+        scale_a_tensor, scale_b_tensor);
+}
+
+static void m_grouped_fp8_asym_gemm_sm80_masked(
+    const torch::Tensor& a,        // [num_groups, M_max, K]  float8_e4m3fn
+    const torch::Tensor& b,        // [num_groups, N, K]      float8_e4m3fn
+    const torch::Tensor& d,        // [num_groups, M_max, N]  bfloat16
+    const torch::Tensor& masked_m, // [num_groups]            int32
+    const int&           expected_m,
+    const float&         scale_a,
+    const float&         scale_b,
+    const std::optional<torch::Tensor>& scale_a_tensor = std::nullopt,
+    const std::optional<torch::Tensor>& scale_b_tensor = std::nullopt)
+{
+    DG_HOST_ASSERT(a.dim() == 3 && b.dim() == 3 && d.dim() == 3);
+
+    const int64_t num_groups = a.size(0);
+    const int64_t M_max      = a.size(1);
+    const int64_t K          = a.size(2);
+    const int64_t N          = b.size(1);
+    DG_HOST_ASSERT(b.size(0) == num_groups && b.size(2) == K);
+    DG_HOST_ASSERT(d.size(0) == num_groups && d.size(1) == M_max && d.size(2) == N);
+
+    DG_HOST_ASSERT(a.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(b.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+
+    // a and d must be on CUDA; b may be on CPU pinned memory (PCIe) or CUDA
+    DG_HOST_ASSERT(a.is_cuda() && d.is_cuda());
+    DG_HOST_ASSERT(a.is_contiguous() && b.is_contiguous() && d.is_contiguous());
+
+    DG_HOST_ASSERT(masked_m.is_cuda() && masked_m.is_contiguous());
+    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(masked_m.numel() == num_groups);
+
+    if (M_max == 0 || N == 0 || K == 0 || expected_m == 0) return;
+
+    DG_HOST_ASSERT(K % 32 == 0 && K >= 32);
+    DG_HOST_ASSERT(N % 32 == 0);
+
+    sm80_m_grouped_fp8_moe_gemm_masked(
+        a, b, d, masked_m,
+        M_max, N, K,
+        static_cast<int32_t>(num_groups),
+        scale_a, scale_b,
+        scale_a_tensor, scale_b_tensor);
+}
+
 static void register_apis(pybind11::module_& m) {
 
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
@@ -474,6 +639,48 @@ static void register_apis(pybind11::module_& m) {
           py::arg("offsets"), py::arg("experts"), py::arg("list_size"), py::arg("expected_m"),
           py::arg("compiled_dims") = "nk");
 #endif
+
+    // SM89 FP8 MoE GEMM — masked variant (padded [G, M_max, K] layout)
+    m.def("m_grouped_fp8_asym_gemm_sm80_masked",
+          static_cast<void(*)(const torch::Tensor&, const torch::Tensor&,
+                              const torch::Tensor&, const torch::Tensor&,
+                              const int&, const float&, const float&,
+                              const std::optional<torch::Tensor>&,
+                              const std::optional<torch::Tensor>&)>(
+              &m_grouped_fp8_asym_gemm_sm80_masked),
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("masked_m"), py::arg("expected_m"),
+          py::arg("scale_a") = 1.0f,
+          py::arg("scale_b") = 1.0f,
+          py::arg("scale_a_tensor") = py::none(),
+          py::arg("scale_b_tensor") = py::none());
+
+    // SM89 FP8 MoE GEMM (native FP8 MMA, K-outer M-inner, W may be CPU-pinned)
+    m.def("m_grouped_fp8_asym_gemm_sm80",
+          static_cast<void(*)(const torch::Tensor&, const torch::Tensor&,
+                              const torch::Tensor&, const torch::Tensor&,
+                              const torch::Tensor&, const int&,
+                              const float&, const float&,
+                              const std::optional<torch::Tensor>&,
+                              const std::optional<torch::Tensor>&)>(
+              &m_grouped_fp8_asym_gemm_sm80),
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
+          py::arg("scale_a") = 1.0f,
+          py::arg("scale_b") = 1.0f,
+          py::arg("scale_a_tensor") = py::none(),
+          py::arg("scale_b_tensor") = py::none());
+
+    // SM80 MoE GEMM (FP16 + BF16, no arch guard needed: uses >= SM80 primitives)
+    m.def("m_grouped_moe_gemm_nt_contiguous",
+          static_cast<void(*)(const torch::Tensor&, const torch::Tensor&,
+                              const torch::Tensor&, const torch::Tensor&,
+                              const torch::Tensor&, const int&,
+                              const std::string&)>(
+              &m_grouped_moe_gemm_nt_contiguous),
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
+          py::arg("compiled_dims") = "nk");
 }
 
 } // namespace asym_gemm::gemm

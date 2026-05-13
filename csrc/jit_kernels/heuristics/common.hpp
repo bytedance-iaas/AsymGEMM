@@ -244,7 +244,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     // Always pick the largest number of stage
     constexpr int smem_capacity = ArchSpec::smem_capacity;
     int best_num_stages = 0;
-    SharedMemoryConfig best_smem_config;
+    SharedMemoryConfig best_smem_config{};
     for (int num_stages = 32; num_stages > 0; -- num_stages) {
         if (not ArchSpec::is_num_stages_legal(ab_dtype, cd_dtype, num_stages, best_block_m, best_block_n, block_k))
             continue;
@@ -354,7 +354,7 @@ static GemmConfig get_manual_config(const GemmType& gemm_type, const KernelType&
     // Pick stages (manual or auto)
     constexpr int smem_capacity = ArchSpec::smem_capacity;
     int best_num_stages = num_stages;
-    SharedMemoryConfig best_smem_config;
+    SharedMemoryConfig best_smem_config{};
     if (num_stages > 0) {
         DG_HOST_ASSERT(ArchSpec::is_num_stages_legal(ab_dtype, cd_dtype, num_stages,
                                                      block_m, block_n, block_k));
@@ -466,7 +466,7 @@ static GemmConfig get_best_config_asym(const GemmType& gemm_type, const KernelTy
     int best_block_k = 0;
     bool is_asym = true;
     MulticastConfig best_multicast_config = {1, false};
-    SharedMemoryConfig best_smem_config;
+    SharedMemoryConfig best_smem_config{};
     const int& ab_elem_size = static_cast<int>(c10::elementSize(ab_dtype));
     // FP8 requires BLOCK_K % 128 == 0 (SF granularity), so step by 128 to skip invalid values
     const int block_k_step = (ab_dtype == torch::kFloat8_e4m3fn) ? 128 : (16 / ab_elem_size);
