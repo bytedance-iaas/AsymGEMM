@@ -106,6 +106,7 @@ static void check_list_size_tensor(const torch::Tensor& list_size_t) {
     DG_HOST_ASSERT(list_size_t.scalar_type() == torch::kInt);
 }
 
+#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 static void m_grouped_fp8_asym_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
                                              const std::pair<torch::Tensor, torch::Tensor>& b,
                                              const torch::Tensor& d,
