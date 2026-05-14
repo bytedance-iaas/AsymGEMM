@@ -249,9 +249,6 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
             {
                 tma_copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, cutlass::bfloat16_t, kIsBatchedMM>(
                     &tensor_map_b, full_barriers_b[0], smem_b[0], k_idx, n_idx, kNumMulticast, batch_idx);
-                // if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
-                //     printf("block_k_iter: %d \n", block_k_iter);
-                // }
             }
             if constexpr (kMajorB == cute::UMMA::Major::MN)
                 tma_copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, cutlass::bfloat16_t, kIsBatchedMM>(

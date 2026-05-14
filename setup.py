@@ -107,6 +107,7 @@ if __name__ == '__main__':
     setuptools.setup(
         name='asym_gemm',
         version='0.1.0',
+        packages=find_packages(exclude=['tests', 'tests.*', 'scripts', 'scripts.*']),
         ext_modules=get_ext_modules(),
         cmdclass={'build_py': CustomBuildPy},
     )
