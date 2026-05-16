@@ -152,8 +152,8 @@ struct SM90ArchSpec {
         return align<int>(ceil_div(k, block_k) * static_cast<int>(sizeof(float)) * use_uniform_sfb, 8);
     }
 
-    static int get_barrier_smem_size(const int& num_stages, const bool& /*is_asym*/) {
-        return num_stages * 8 * 2;
+    static int get_barrier_smem_size(const int& num_stages, const bool& is_asym) {
+        return num_stages * 8 * 2 + (is_asym ? 2 * 8 : 0);
     }
 
     static int get_tmem_ptr_smem_size() {

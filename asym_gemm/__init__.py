@@ -46,6 +46,8 @@ try:
         # DeepGEMM Kernels (may vary by build flags / arch)
         _maybe_import_from_C([
             # FP8 GEMMs
+            "fp8_gemm_nt",
+            "k_grouped_fp8_gemm_nt_contiguous",
             "m_grouped_fp8_asym_gemm_nt_masked",
             "m_grouped_fp8_asym_gemm_nt_contiguous",
             # FP4 GEMMs

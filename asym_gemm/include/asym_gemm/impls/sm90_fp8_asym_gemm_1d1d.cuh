@@ -101,14 +101,14 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast : 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
     constexpr uint32_t STORE_BLOCK_M = WAVE_BLOCK_M;
-    constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(cd_dtype_t);
+    constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode == 0 ? BLOCK_N : kSwizzleCDMode / sizeof(cd_dtype_t);
     DG_STATIC_ASSERT(not kIsMulticastOnA or kNumMulticast == 1, "Invalid multicast");
     DG_STATIC_ASSERT(LOAD_BLOCK_M == BLOCK_M, "Only support A/D layout without multicast on A");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kIsMulticastOnA, "B-side multicast not supported in SM90 asym GEMM");
 
     // Shared memory sizes
-    constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * kSwizzleCDMode;
+    constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * STORE_BLOCK_N * sizeof(cd_dtype_t);
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(cutlass::float_e4m3_t);
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(cutlass::float_e4m3_t);
@@ -191,7 +191,8 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
     };
 
     uint32_t block_k = ceil_div_device(shape_k, BLOCK_K);
-    uint32_t n_idx = scheduler.n_idx;
+    uint32_t n_idx = blockIdx.x * BLOCK_N;
+    uint32_t b_n_idx = scheduler.n_idx;
 
     // Merged stages constants (no merge for asym)
     constexpr uint32_t BLOCK_ATOM_K = BLOCK_K / kNumStagesPerMerge;
@@ -221,13 +222,14 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                 // Load B tile (single slot)
                 if constexpr (kMajorB == cute::UMMA::Major::K)
                     tma_copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, cutlass::float_e4m3_t, kIsBatchedMM>(
-                        &tensor_map_b, full_barriers_b[0], smem_b[0], k_idx, n_idx, kNumMulticast, batch_idx);
+                        &tensor_map_b, full_barriers_b[0], smem_b[0], k_idx, b_n_idx, kNumMulticast, batch_idx);
                 if constexpr (kMajorB == cute::UMMA::Major::MN)
                     tma_copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, cutlass::float_e4m3_t, kIsBatchedMM>(
-                        &tensor_map_b, full_barriers_b[0], smem_b[0], n_idx, k_idx, kNumMulticast, batch_idx);
+                        &tensor_map_b, full_barriers_b[0], smem_b[0], b_n_idx, k_idx, kNumMulticast, batch_idx);
 
                 // Load SFB (per K-block, single slot) — one float per column of B
-                tma_copy<BLOCK_N, 1, 0>(&tensor_map_sfb, full_barriers_b[0], smem_sfb[0], n_idx, sf_k_idx);
+                const uint32_t sfb_k_idx = scheduler.current_group_idx * ceil_div_device(shape_k, BLOCK_K) + sf_k_idx;
+                tma_copy<BLOCK_N, 1, 0>(&tensor_map_sfb, full_barriers_b[0], smem_sfb[0], n_idx, sfb_k_idx);
 
                 if (is_leader_cta) {
                     full_barriers_b[0]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE);
@@ -292,6 +294,7 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
 
         const auto math_wg_idx = __shfl_sync(0xffffffff, threadIdx.x / 128, 0);
+        const uint32_t math_wg_m_offset = math_wg_idx * WGMMA::M;
 
         // Build GMMA descriptors from smem base pointers
         auto a_desc = make_gmma_desc<kMajorA, BLOCK_M, BLOCK_ATOM_K, kSwizzleAMode>(smem_a[0], math_wg_idx * WGMMA::M, 0);
@@ -372,8 +375,8 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                 #pragma unroll
                 for (uint32_t local_idx = 0; local_idx < kNumMWaves; ++local_idx) {
                     auto m_offset = local_idx * WAVE_BLOCK_M;
-                    scale_a_0[local_idx] = ld_shared(smem_sfa[stage_idx] + m_offset + r_0);
-                    scale_a_1[local_idx] = ld_shared(smem_sfa[stage_idx] + m_offset + r_1);
+                    scale_a_0[local_idx] = ld_shared(smem_sfa[stage_idx] + m_offset + math_wg_m_offset + r_0);
+                    scale_a_1[local_idx] = ld_shared(smem_sfa[stage_idx] + m_offset + math_wg_m_offset + r_1);
                 }
 
                 // Issue WGMMA
@@ -422,8 +425,8 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                     auto m_offset = local_idx * WAVE_BLOCK_M;
                     auto shifted_accum = accum + WGMMA::kNumAccum * local_idx;
 
-                    auto smem_d_0 = reinterpret_cast<float2*>(smem_cd[tma_stage_idx] + (m_offset + wg_local_warp_idx * WGMMA_M_PER_WARP + lane_idx / 4 + 0) * BLOCK_N + (lane_idx % 4) * 2);
-                    auto smem_d_1 = reinterpret_cast<float2*>(smem_cd[tma_stage_idx] + (m_offset + wg_local_warp_idx * WGMMA_M_PER_WARP + lane_idx / 4 + 8) * BLOCK_N + (lane_idx % 4) * 2);
+                    auto smem_d_0 = reinterpret_cast<float2*>(smem_cd[tma_stage_idx] + (m_offset + math_wg_m_offset + wg_local_warp_idx * WGMMA_M_PER_WARP + lane_idx / 4 + 0) * BLOCK_N + (lane_idx % 4) * 2);
+                    auto smem_d_1 = reinterpret_cast<float2*>(smem_cd[tma_stage_idx] + (m_offset + math_wg_m_offset + wg_local_warp_idx * WGMMA_M_PER_WARP + lane_idx / 4 + 8) * BLOCK_N + (lane_idx % 4) * 2);
 
                     #pragma unroll
                     for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
@@ -445,7 +448,7 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                 const auto m_idx_out = (kGemmType == GemmType::MGroupedMasked)
                     ? (scheduler.current_group_idx * shape_m + (block_m_iter - scheduler.m_start) * BLOCK_M)
                     : (BLOCK_M * block_m_iter);
-                const auto n_idx_out = scheduler.n_idx;
+                const auto n_idx_out = n_idx;
 
                 DG_STATIC_ASSERT(kNumWGMMAStoreThreads >= BLOCK_N / TMA_D_BLOCK_N, "Too many TMA blocks");
                 if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {

@@ -35,4 +35,4 @@ extern/
 external/
 vendor/
 submodules/
-tests/
+# tests/

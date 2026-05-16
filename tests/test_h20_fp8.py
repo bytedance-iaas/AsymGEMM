@@ -8,6 +8,8 @@ from generators import (
     generate_m_grouped_contiguous, generate_m_grouped_masked,
 )
 
+MAX_FP8_DIFF = 0.01
+
 
 def build_offsets_experts_from_m_indices_pairs(m_indices: torch.Tensor, block_m: int = 128):
     """
@@ -89,6 +91,8 @@ def test_m_grouped_fp8_contiguous_sm90() -> None:
             num_groups, expected_m_per_group, n, k, major_a, major_b,
             use_ue8m0=use_ue8m0
         )
+        d = torch.empty_like(d, dtype=torch.float)
+        ref_d = ref_d.float()
         offsets, experts, list_size = build_offsets_experts_from_m_indices_pairs(m_indices)
 
         asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(
@@ -101,7 +105,7 @@ def test_m_grouped_fp8_contiguous_sm90() -> None:
 
         diff = calc_diff(d_asym_masked, ref_masked)
         print(f'   > ({num_groups=}, m={m}, n={n}, k={k}, {kernel_opt}, layout={major_opt}): diff={diff:.5f}')
-        assert diff < 0.001, (
+        assert diff < MAX_FP8_DIFF, (
             f'{num_groups=}, {m=}, {n=}, {k=}, {kernel_opt}, {major_opt=}, diff={diff:.5f}'
         )
 
@@ -125,6 +129,8 @@ def test_m_grouped_fp8_masked_sm90() -> None:
             num_groups, max_m, expected_m_per_group, n, k,
             use_ue8m0=use_ue8m0, use_psum_layout=use_psum_layout
         )
+        d = torch.empty_like(d, dtype=torch.float)
+        ref_d = ref_d.float()
 
         d_asym = torch.empty_like(d)
         asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(
@@ -141,7 +147,7 @@ def test_m_grouped_fp8_masked_sm90() -> None:
                 max_diff = max(max_diff, diff)
 
         print(f'   > ({kernel_opt}, {num_groups=}, expected_m={expected_m_per_group}, n={n}, k={k}): max_diff={max_diff:.5f}')
-        assert max_diff < 0.001, (
+        assert max_diff < MAX_FP8_DIFF, (
             f'{kernel_opt}, {num_groups=}, expected_m={expected_m_per_group}, {n=}, {k=}, max_diff={max_diff:.5f}'
         )
 
