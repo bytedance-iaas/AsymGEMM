@@ -9,6 +9,7 @@
 #include "../jit_kernels/impls/sm100_bf16_asym_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_asym_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_fp4_asym_gemm_1d1d.hpp"
+#include "../jit_kernels/impls/sm90_bf16_asym_gemm.hpp"
 #include "../jit_kernels/impls/sm90_fp8_asym_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp"
 #endif
@@ -470,9 +471,10 @@ static void m_grouped_bf16_asym_gemm_nt_contiguous(const torch::Tensor& a, const
     const auto& [num_groups, n, k_] = get_shape<3>(b);
     const auto& [m_, n_] = get_shape<2>(d);
     DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
 
     DG_HOST_ASSERT(offsets.is_cuda() && experts.is_cuda());
     DG_HOST_ASSERT(offsets.is_contiguous() && experts.is_contiguous());
@@ -487,9 +489,17 @@ static void m_grouped_bf16_asym_gemm_nt_contiguous(const torch::Tensor& a, const
         return;
 
     const auto& arch_major = device_runtime->get_arch_major();
-    sm100_m_grouped_bf16_asym_gemm_contiguous(a, b, d,
-                                            offsets, experts, list_size,
-                                            num_groups, m, n, k, major_a, major_b, compiled_dims);
+    if (arch_major == 9) {
+        sm90_m_grouped_bf16_asym_gemm_contiguous(a, b, d,
+                                                 offsets, experts, list_size,
+                                                 num_groups, m, n, k, major_a, major_b, compiled_dims);
+    } else if (arch_major == 10) {
+        sm100_m_grouped_bf16_asym_gemm_contiguous(a, b, d,
+                                                  offsets, experts, list_size,
+                                                  num_groups, m, n, k, major_a, major_b, compiled_dims);
+    } else {
+        DG_HOST_ASSERT(false && "unsupported BF16 asym GEMM architecture");
+    }
 }
 
 static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const torch::Tensor& b,
@@ -511,7 +521,7 @@ static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const tor
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
 
     // masked_m: int32 GPU tensor of shape [num_groups] with per-group token counts
     DG_HOST_ASSERT(masked_m.is_cuda() && masked_m.is_contiguous());
@@ -526,8 +536,16 @@ static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const tor
         return;
 
     // Dispatch implementation
-    sm100_m_grouped_bf16_asym_gemm_masked(a, b, d, masked_m, expected_m,
-                                          num_groups, m, n, k, major_a, major_b, compiled_dims);
+    const auto& arch_major = device_runtime->get_arch_major();
+    if (arch_major == 9) {
+        sm90_m_grouped_bf16_asym_gemm_masked(a, b, d, masked_m, expected_m,
+                                             num_groups, m, n, k, major_a, major_b, compiled_dims);
+    } else if (arch_major == 10) {
+        sm100_m_grouped_bf16_asym_gemm_masked(a, b, d, masked_m, expected_m,
+                                              num_groups, m, n, k, major_a, major_b, compiled_dims);
+    } else {
+        DG_HOST_ASSERT(false && "unsupported BF16 asym GEMM architecture");
+    }
 }
 #endif
 

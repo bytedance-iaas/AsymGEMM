@@ -1,0 +1,48 @@
+{
+  "generated_at_utc": "2026-05-18T21:59:01.026393+00:00",
+  "milestone": "M4.5 Profiling Summary",
+  "reports": [
+    {
+      "backward_seconds": 0.00081427829960982,
+      "direct_fetch_dx_used": true,
+      "direct_fetch_forward_used": true,
+      "expected_hbm_saved_bytes": 131072,
+      "forward_seconds": 0.0007902719080448151,
+      "hbm_peak_bytes": 67498496,
+      "optimizer_seconds": 0.0003076012556751569,
+      "pinned_cpu_cost_bytes": 262144,
+      "total_seconds_per_step_plus_setup": 0.7011790111040076,
+      "w_host_bytes": 131072,
+      "w_t_host_bytes": 131072,
+      "workload": "mlp"
+    },
+    {
+      "backward_seconds": 0.010641008615493774,
+      "direct_fetch_dx_used": true,
+      "direct_fetch_forward_used": true,
+      "expected_hbm_saved_bytes": 1310720,
+      "forward_seconds": 0.012640698502461115,
+      "hbm_peak_bytes": 89690112,
+      "optimizer_seconds": 0.0007493045801917712,
+      "pinned_cpu_cost_bytes": 2621440,
+      "total_seconds_per_step_plus_setup": 0.2115793948372205,
+      "w_host_bytes": 1310720,
+      "w_t_host_bytes": 1310720,
+      "workload": "dense_llm"
+    },
+    {
+      "backward_seconds": 0.022194980022807915,
+      "direct_fetch_dx_used": true,
+      "direct_fetch_forward_used": true,
+      "expected_hbm_saved_bytes": 3932160,
+      "forward_seconds": 0.023831576108932495,
+      "hbm_peak_bytes": 126932992,
+      "optimizer_seconds": 0.0013254887113968532,
+      "pinned_cpu_cost_bytes": 7864320,
+      "total_seconds_per_step_plus_setup": 0.5200093848009903,
+      "w_host_bytes": 3932160,
+      "w_t_host_bytes": 3932160,
+      "workload": "tiny_moe"
+    }
+  ]
+}

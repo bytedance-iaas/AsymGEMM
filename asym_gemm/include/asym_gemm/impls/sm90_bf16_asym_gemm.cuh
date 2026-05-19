@@ -45,8 +45,11 @@ sm90_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
     constexpr uint32_t kNumMathThreads = kNumNonEpilogueThreads;
     constexpr uint32_t kNumTMAThreads = kNumEpilogueThreads;
 
-    // No stage merging for asym kernel on SM90
-    constexpr uint32_t kNumStagesPerMerge = 1;
+    DG_STATIC_ASSERT(kMajorA == cute::UMMA::Major::K and kMajorB == cute::UMMA::Major::K,
+                     "SM90 BF16 asym GEMM currently supports K-major A/B only");
+    constexpr uint32_t BLOCK_ATOM_K = kSwizzleAMode / sizeof(cutlass::bfloat16_t);
+    DG_STATIC_ASSERT(BLOCK_ATOM_K > 0 and BLOCK_K_ % BLOCK_ATOM_K == 0, "Invalid BF16 GMMA K atom");
+    constexpr uint32_t kNumStagesPerMerge = BLOCK_K_ / BLOCK_ATOM_K;
     constexpr uint32_t BLOCK_K = BLOCK_K_;
     constexpr uint32_t kNumStages = kNumStages_;
 
@@ -162,10 +165,8 @@ sm90_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
     };
 
     uint32_t block_k = ceil_div_device(shape_k, BLOCK_K);
-    uint32_t n_idx = scheduler.n_idx;
-
-    // Merged stages constants (no merge for asym)
-    constexpr uint32_t BLOCK_ATOM_K = BLOCK_K / kNumStagesPerMerge;
+    uint32_t n_idx = blockIdx.x * BLOCK_N;
+    uint32_t b_n_idx = scheduler.n_idx;
 
     if (warp_idx >= kNumMathThreads / 32) {
         // =====================================================================
@@ -189,10 +190,10 @@ sm90_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                 // Load B tile (single slot)
                 if constexpr (kMajorB == cute::UMMA::Major::K)
                     tma_copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, cutlass::bfloat16_t, kIsBatchedMM>(
-                        &tensor_map_b, full_barriers_b[0], smem_b[0], k_idx, n_idx, kNumMulticast, batch_idx);
+                        &tensor_map_b, full_barriers_b[0], smem_b[0], k_idx, b_n_idx, kNumMulticast, batch_idx);
                 if constexpr (kMajorB == cute::UMMA::Major::MN)
                     tma_copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, cutlass::bfloat16_t, kIsBatchedMM>(
-                        &tensor_map_b, full_barriers_b[0], smem_b[0], n_idx, k_idx, kNumMulticast, batch_idx);
+                        &tensor_map_b, full_barriers_b[0], smem_b[0], b_n_idx, k_idx, kNumMulticast, batch_idx);
 
                 if (is_leader_cta) {
                     full_barriers_b[0]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE);
@@ -404,7 +405,7 @@ sm90_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                 const auto m_idx_out = (kGemmType == GemmType::MGroupedMasked)
                     ? (scheduler.current_group_idx * shape_m + (block_m_iter - scheduler.m_start) * BLOCK_M)
                     : (BLOCK_M * block_m_iter);
-                const auto n_idx_out = scheduler.n_idx;
+                const auto n_idx_out = n_idx;
 
                 DG_STATIC_ASSERT(kNumWGMMAStoreThreads >= BLOCK_N / TMA_D_BLOCK_N, "Too many TMA blocks");
                 if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {

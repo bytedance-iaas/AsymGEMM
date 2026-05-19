@@ -1,0 +1,169 @@
+{
+  "backend": "asym_only",
+  "config": {
+    "batch_size": 2,
+    "hidden_size": 128,
+    "intermediate_size": 256,
+    "lora_alpha": 256.0,
+    "lora_rank": 128,
+    "num_heads": 4,
+    "num_layers": 4,
+    "seq_len": 8,
+    "vocab_size": 512
+  },
+  "device": "cuda",
+  "direct_fetch_dx_used": true,
+  "direct_fetch_forward_used": true,
+  "dtype": "torch.bfloat16",
+  "environment": {
+    "cuda": "12.9",
+    "cuda_device": "NVIDIA H200",
+    "platform": "Linux-6.1.0-31-amd64-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "pytorch": "2.9.1+cu129"
+  },
+  "execution_stats": {
+    "asym_calls": 224,
+    "asym_dx_calls": 112,
+    "asym_forward_calls": 112,
+    "fallback_reasons": {},
+    "staged_calls": 0,
+    "staged_dx_calls": 0,
+    "staged_forward_calls": 0,
+    "torch_calls": 0,
+    "torch_dx_calls": 0,
+    "torch_forward_calls": 0
+  },
+  "generated_at_utc": "2026-05-18T21:59:00.057548+00:00",
+  "latency": {
+    "breakdown_percent": {
+      "backward_pct": 5.029321793684343,
+      "fallback_overhead_unattributed_pct": 0.0,
+      "forward_pct": 5.974446855841652,
+      "loss_pct": 0.056199522550630474,
+      "optimizer_pct": 0.35414818194760966,
+      "setup_host_preparation_pct": 88.58588364597577
+    },
+    "breakdown_seconds": {
+      "backward_seconds": 0.010641008615493774,
+      "fallback_overhead_unattributed_seconds": 0.0,
+      "forward_seconds": 0.012640698502461115,
+      "loss_seconds": 0.00011890660971403122,
+      "optimizer_seconds": 0.0007493045801917712,
+      "setup_host_preparation_seconds": 0.18742947652935982
+    },
+    "component_percent_of_total": {
+      "attention_seconds": 3.7215886525198982,
+      "base_dx_seconds": 1.4368233821049183,
+      "base_forward_seconds": 1.6465926760256937,
+      "lora_grad_seconds_estimated": 3.592498411579424,
+      "lora_seconds": 4.836619752978402,
+      "mlp_seconds": 1.9654023223495862,
+      "moe_seconds": 0.0,
+      "route_metadata_seconds": 0.0,
+      "route_pack_seconds": 0.0,
+      "route_scatter_seconds": 0.0,
+      "router_seconds": 0.0
+    },
+    "component_seconds_per_step": {
+      "attention_seconds": 0.00787411474933227,
+      "base_dx_seconds": 0.0030400222167372704,
+      "base_forward_seconds": 0.0034838508193691573,
+      "lora_grad_seconds_estimated": 0.007600986398756504,
+      "lora_seconds": 0.01023329080392917,
+      "mlp_seconds": 0.004158386339743932,
+      "moe_seconds": 0.0,
+      "route_metadata_seconds": 0.0,
+      "route_pack_seconds": 0.0,
+      "route_scatter_seconds": 0.0,
+      "router_seconds": 0.0
+    },
+    "measure_steps": 3,
+    "measured_steps": 3,
+    "notes": {
+      "base_dx_seconds_measured": true,
+      "component_timers_may_overlap_parent_forward": true,
+      "lora_grad_seconds_estimated": true,
+      "profiling_backend_imported": true
+    },
+    "setup_seconds": 0.18742947652935982,
+    "steady_state_step_percent_of_total": 11.414116354024234,
+    "steady_state_step_seconds": 0.02414991830786069,
+    "timing_stats": {
+      "coefficient_of_variation": 0.10016739719853661,
+      "count": 3,
+      "max_seconds": 0.028173359110951424,
+      "mean_seconds": 0.02467759729673465,
+      "measured_steps": 3,
+      "median_seconds": 0.022939834743738174,
+      "min_seconds": 0.022919598035514355,
+      "p90_seconds": 0.027126654237508777,
+      "p95_seconds": 0.0276500066742301,
+      "std_seconds": 0.002471890690327553,
+      "values_seconds": [
+        0.028173359110951424,
+        0.022919598035514355,
+        0.022939834743738174
+      ],
+      "warmup_steps": 1
+    },
+    "total_percent": 100.0,
+    "total_seconds": 0.2115793948372205,
+    "total_seconds_per_step_plus_setup": 0.2115793948372205
+  },
+  "measure_steps": 3,
+  "measured_steps": 3,
+  "memory": {
+    "cpu_memory": {
+      "estimated": true,
+      "pinned_bytes": 2621440,
+      "pinned_percent_of_cpu_total": 100.0,
+      "rss_bytes": 1427427328,
+      "rss_percent_of_total": 99.39715200760966,
+      "total_bytes": 2621440,
+      "total_percent": 0.18254076060314034,
+      "unattributed_cpu_bytes": 1424805888,
+      "unattributed_cpu_percent": 99.81635212185037,
+      "w_host_bytes": 1310720,
+      "w_t_host_bytes": 1310720
+    },
+    "gpu_memory": {
+      "current_hbm_bytes": 85208064,
+      "estimated": true,
+      "expected_hbm_saved_bytes": 1310720,
+      "peak_hbm_bytes": 89690112,
+      "peak_hbm_percent_of_total": 1485.9275595894478,
+      "resident_parameter_and_buffer_bytes": 4725248,
+      "staged_buffer_bytes": 0,
+      "total_bytes": 6035968,
+      "total_percent": 0.4203072317871917,
+      "unattributed_gpu_bytes": 84964864,
+      "unattributed_gpu_percent": 94.73158423528338
+    },
+    "percentages": {
+      "hbm_resident_of_gpu_basis_pct": 78.28484180167953,
+      "hbm_saved_of_gpu_basis_pct": 21.71515819832047,
+      "pinned_cpu_of_cpu_total_pct": 100.0,
+      "w_host_of_pinned_cpu_pct": 50.0,
+      "w_t_host_of_pinned_cpu_pct": 50.0
+    },
+    "total_bytes": 1436084736,
+    "total_percent": 100.0,
+    "totals": {
+      "cpu_parameter_and_buffer_bytes": 0,
+      "expected_hbm_saved_bytes": 1310720,
+      "gpu_parameter_and_buffer_bytes": 4725248,
+      "hbm_current_bytes": 85208064,
+      "hbm_peak_bytes": 89690112,
+      "host_weight_count": 28,
+      "pinned_cpu_bytes": 2621440,
+      "pinned_cpu_cost_bytes": 2621440,
+      "rss_bytes": 1427427328,
+      "w_host_bytes": 1310720,
+      "w_t_host_bytes": 1310720
+    }
+  },
+  "milestone": "M4.5 Profiling",
+  "warmup_steps": 1,
+  "workload": "dense_llm"
+}

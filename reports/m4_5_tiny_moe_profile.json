@@ -1,0 +1,364 @@
+{
+  "backend": "asym_only",
+  "config": {
+    "batch_size": 2,
+    "hidden_size": 128,
+    "intermediate_size": 256,
+    "logical_tokens": 16,
+    "lora_alpha": 256.0,
+    "lora_rank": 128,
+    "num_experts": 4,
+    "num_heads": 4,
+    "num_layers": 4,
+    "num_shared_experts": 1,
+    "residual_scale": 0.25,
+    "seq_len": 8,
+    "top_k": 2,
+    "vocab_size": 512
+  },
+  "device": "cuda",
+  "direct_fetch_dx_used": true,
+  "direct_fetch_forward_used": true,
+  "dtype": "torch.bfloat16",
+  "environment": {
+    "cuda": "12.9",
+    "cuda_device": "NVIDIA H200",
+    "platform": "Linux-6.1.0-31-amd64-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "pytorch": "2.9.1+cu129"
+  },
+  "execution_stats": {
+    "asym_calls": 480,
+    "asym_dx_calls": 240,
+    "asym_forward_calls": 240,
+    "fallback_reasons": {},
+    "staged_calls": 0,
+    "staged_dx_calls": 0,
+    "staged_forward_calls": 0,
+    "torch_calls": 0,
+    "torch_dx_calls": 0,
+    "torch_forward_calls": 0
+  },
+  "generated_at_utc": "2026-05-18T21:59:00.877036+00:00",
+  "latency": {
+    "breakdown_percent": {
+      "backward_pct": 4.268188358043195,
+      "fallback_overhead_unattributed_pct": 0.0,
+      "forward_pct": 4.582912694557029,
+      "loss_pct": 0.012956851178214867,
+      "optimizer_pct": 0.2548970749641611,
+      "setup_host_preparation_pct": 90.8810450212574
+    },
+    "breakdown_seconds": {
+      "backward_seconds": 0.022194980022807915,
+      "fallback_overhead_unattributed_seconds": 0.0,
+      "forward_seconds": 0.023831576108932495,
+      "loss_seconds": 6.7376842101415e-05,
+      "optimizer_seconds": 0.0013254887113968532,
+      "setup_host_preparation_seconds": 0.47258996311575174
+    },
+    "component_percent_of_total": {
+      "attention_seconds": 0.30885167756668924,
+      "base_dx_seconds": 1.2114839724820734,
+      "base_forward_seconds": 1.4035020879361881,
+      "expert_moe_seconds": 3.415704610098943,
+      "lora_grad_seconds_estimated": 3.056704385561123,
+      "lora_seconds": 0.0,
+      "mlp_seconds": 0.0,
+      "moe_layer_seconds": 4.549865249726813,
+      "moe_seconds": 3.415704610098943,
+      "route_metadata_seconds": 0.27236496829934276,
+      "route_pack_seconds": 0.03098281158436152,
+      "route_scatter_seconds": 0.04822611695195973,
+      "router_seconds": 0.0
+    },
+    "component_seconds_per_step": {
+      "attention_seconds": 0.0016060577084620793,
+      "base_dx_seconds": 0.006299830352266629,
+      "base_forward_seconds": 0.007298342573146026,
+      "expert_moe_seconds": 0.01776198452959458,
+      "lora_grad_seconds_estimated": 0.015895149670541286,
+      "lora_seconds": 0.0,
+      "mlp_seconds": 0.0,
+      "moe_layer_seconds": 0.02365972629437844,
+      "moe_seconds": 0.01776198452959458,
+      "route_metadata_seconds": 0.0014163233960668247,
+      "route_pack_seconds": 0.0001611135279138883,
+      "route_scatter_seconds": 0.00025078033407529193,
+      "router_seconds": 0.0
+    },
+    "measure_steps": 3,
+    "measured_steps": 3,
+    "notes": {
+      "base_dx_seconds_measured": true,
+      "component_timers_may_overlap_parent_forward": true,
+      "lora_grad_seconds_estimated": true,
+      "profiling_backend_imported": true
+    },
+    "setup_seconds": 0.47258996311575174,
+    "steady_state_step_percent_of_total": 9.1189549787426,
+    "steady_state_step_seconds": 0.047419421685238675,
+    "timing_stats": {
+      "coefficient_of_variation": 0.006528164596143684,
+      "count": 3,
+      "max_seconds": 0.04821031540632248,
+      "mean_seconds": 0.04796303963909546,
+      "measured_steps": 3,
+      "median_seconds": 0.04815751872956753,
+      "min_seconds": 0.04752128478139639,
+      "p90_seconds": 0.04819975607097149,
+      "p95_seconds": 0.048205035738646984,
+      "std_seconds": 0.00031311061729537916,
+      "values_seconds": [
+        0.04821031540632248,
+        0.04815751872956753,
+        0.04752128478139639
+      ],
+      "warmup_steps": 1
+    },
+    "total_percent": 100.0,
+    "total_seconds": 0.5200093848009903,
+    "total_seconds_per_step_plus_setup": 0.5200093848009903
+  },
+  "measure_steps": 3,
+  "measured_steps": 3,
+  "memory": {
+    "cpu_memory": {
+      "estimated": true,
+      "pinned_bytes": 7864320,
+      "pinned_percent_of_cpu_total": 100.0,
+      "rss_bytes": 1567465472,
+      "rss_percent_of_total": 98.46715173518886,
+      "total_bytes": 7864320,
+      "total_percent": 0.49403141859706656,
+      "unattributed_cpu_bytes": 1559601152,
+      "unattributed_cpu_percent": 99.49827794356672,
+      "w_host_bytes": 3932160,
+      "w_t_host_bytes": 3932160
+    },
+    "gpu_memory": {
+      "current_hbm_bytes": 115103744,
+      "estimated": true,
+      "expected_hbm_saved_bytes": 3932160,
+      "peak_hbm_bytes": 126932992,
+      "peak_hbm_percent_of_total": 767.5893244163725,
+      "resident_parameter_and_buffer_bytes": 12604416,
+      "staged_buffer_bytes": 0,
+      "total_bytes": 16536576,
+      "total_percent": 1.0388168462140661,
+      "unattributed_gpu_bytes": 114328576,
+      "unattributed_gpu_percent": 90.07002371771084
+    },
+    "percentages": {
+      "hbm_resident_of_gpu_basis_pct": 76.22143785992941,
+      "hbm_saved_of_gpu_basis_pct": 23.778562140070594,
+      "pinned_cpu_of_cpu_total_pct": 100.0,
+      "w_host_of_pinned_cpu_pct": 50.0,
+      "w_t_host_of_pinned_cpu_pct": 50.0
+    },
+    "total_bytes": 1591866368,
+    "total_percent": 100.0,
+    "totals": {
+      "cpu_parameter_and_buffer_bytes": 0,
+      "expected_hbm_saved_bytes": 3932160,
+      "gpu_parameter_and_buffer_bytes": 12604416,
+      "hbm_current_bytes": 115103744,
+      "hbm_peak_bytes": 126932992,
+      "host_weight_count": 60,
+      "pinned_cpu_bytes": 7864320,
+      "pinned_cpu_cost_bytes": 7864320,
+      "rss_bytes": 1567465472,
+      "w_host_bytes": 3932160,
+      "w_t_host_bytes": 3932160
+    }
+  },
+  "milestone": "M4.5 Profiling",
+  "moe_route_mode_comparison": {
+    "contiguous": {
+      "latency": {
+        "breakdown_percent": {
+          "backward_pct": 49.86115825804752,
+          "fallback_overhead_unattributed_pct": 0.0,
+          "forward_pct": 50.009144389630514,
+          "loss_pct": 0.1296973523219685,
+          "optimizer_pct": 0.0,
+          "setup_host_preparation_pct": 0.0
+        },
+        "breakdown_seconds": {
+          "backward_seconds": 0.022250029258430004,
+          "fallback_overhead_unattributed_seconds": 0.0,
+          "forward_seconds": 0.022316066548228264,
+          "loss_seconds": 5.78761100769043e-05,
+          "optimizer_seconds": 0.0,
+          "setup_host_preparation_seconds": 0.0
+        },
+        "component_percent_of_total": {
+          "attention_seconds": 0.0,
+          "base_dx_seconds": 14.399194400457063,
+          "base_forward_seconds": 15.993292235930053,
+          "lora_grad_seconds_estimated": 35.461963857590455,
+          "lora_seconds": 0.0,
+          "mlp_seconds": 0.0,
+          "moe_seconds": 0.0,
+          "route_metadata_seconds": 3.288524119723362,
+          "route_pack_seconds": 0.3307716589663386,
+          "route_scatter_seconds": 0.604990647427586,
+          "router_seconds": 0.0
+        },
+        "component_seconds_per_step": {
+          "attention_seconds": 0.0,
+          "base_dx_seconds": 0.006425492465496063,
+          "base_forward_seconds": 0.007136842235922813,
+          "lora_grad_seconds_estimated": 0.01582453679293394,
+          "lora_seconds": 0.0,
+          "mlp_seconds": 0.0,
+          "moe_seconds": 0.0,
+          "route_metadata_seconds": 0.0014674700796604156,
+          "route_pack_seconds": 0.00014760345220565796,
+          "route_scatter_seconds": 0.0002699708566069603,
+          "router_seconds": 0.0
+        },
+        "measure_steps": 1,
+        "measured_steps": 1,
+        "notes": {
+          "base_dx_seconds_measured": true,
+          "component_timers_may_overlap_parent_forward": true,
+          "lora_grad_seconds_estimated": true,
+          "profiling_backend_imported": true
+        },
+        "setup_seconds": 0.0,
+        "steady_state_step_percent_of_total": 100.0,
+        "steady_state_step_seconds": 0.04462397191673517,
+        "timing_stats": {
+          "coefficient_of_variation": 0.0,
+          "count": 1,
+          "max_seconds": 0.0447330754250288,
+          "mean_seconds": 0.0447330754250288,
+          "measured_steps": 1,
+          "median_seconds": 0.0447330754250288,
+          "min_seconds": 0.0447330754250288,
+          "p90_seconds": 0.0447330754250288,
+          "p95_seconds": 0.0447330754250288,
+          "std_seconds": 0.0,
+          "values_seconds": [
+            0.0447330754250288
+          ],
+          "warmup_steps": 0
+        },
+        "total_percent": 100.0,
+        "total_seconds": 0.04462397191673517,
+        "total_seconds_per_step_plus_setup": 0.04462397191673517
+      },
+      "mode": "contiguous",
+      "route_metadata": {
+        "active_routes": 32,
+        "empty_experts": 0,
+        "expert_counts": [
+          8,
+          8,
+          8,
+          8
+        ],
+        "mode": "contiguous",
+        "num_experts": 4,
+        "num_tokens": 16,
+        "padded_routes": 0,
+        "top_k": 2
+      }
+    },
+    "masked": {
+      "latency": {
+        "breakdown_percent": {
+          "backward_pct": 67.58321488585564,
+          "fallback_overhead_unattributed_pct": 0.0,
+          "forward_pct": 32.34216119784854,
+          "loss_pct": 0.07462391629581981,
+          "optimizer_pct": 0.0,
+          "setup_host_preparation_pct": 0.0
+        },
+        "breakdown_seconds": {
+          "backward_seconds": 0.058065841905772686,
+          "fallback_overhead_unattributed_seconds": 0.0,
+          "forward_seconds": 0.027787592262029648,
+          "loss_seconds": 6.411504000425339e-05,
+          "optimizer_seconds": 0.0,
+          "setup_host_preparation_seconds": 0.0
+        },
+        "component_percent_of_total": {
+          "attention_seconds": 0.0,
+          "base_dx_seconds": 7.699051001619823,
+          "base_forward_seconds": 8.577436163615063,
+          "lora_grad_seconds_estimated": 59.88416388423582,
+          "lora_seconds": 0.0,
+          "mlp_seconds": 0.0,
+          "moe_seconds": 0.0,
+          "route_metadata_seconds": 2.347693576507091,
+          "route_pack_seconds": 0.4516262871387122,
+          "route_scatter_seconds": 4.955276054942055,
+          "router_seconds": 0.0
+        },
+        "component_seconds_per_step": {
+          "attention_seconds": 0.0,
+          "base_dx_seconds": 0.006614835932850838,
+          "base_forward_seconds": 0.00736952293664217,
+          "lora_grad_seconds_estimated": 0.05145100597292185,
+          "lora_seconds": 0.0,
+          "mlp_seconds": 0.0,
+          "moe_seconds": 0.0,
+          "route_metadata_seconds": 0.002017080783843994,
+          "route_pack_seconds": 0.00038802623748779297,
+          "route_scatter_seconds": 0.004257451742887497,
+          "router_seconds": 0.0
+        },
+        "measure_steps": 1,
+        "measured_steps": 1,
+        "notes": {
+          "base_dx_seconds_measured": true,
+          "component_timers_may_overlap_parent_forward": true,
+          "lora_grad_seconds_estimated": true,
+          "profiling_backend_imported": true
+        },
+        "setup_seconds": 0.0,
+        "steady_state_step_percent_of_total": 100.0,
+        "steady_state_step_seconds": 0.08591754920780659,
+        "timing_stats": {
+          "coefficient_of_variation": 0.0,
+          "count": 1,
+          "max_seconds": 0.08599505294114351,
+          "mean_seconds": 0.08599505294114351,
+          "measured_steps": 1,
+          "median_seconds": 0.08599505294114351,
+          "min_seconds": 0.08599505294114351,
+          "p90_seconds": 0.08599505294114351,
+          "p95_seconds": 0.08599505294114351,
+          "std_seconds": 0.0,
+          "values_seconds": [
+            0.08599505294114351
+          ],
+          "warmup_steps": 0
+        },
+        "total_percent": 100.0,
+        "total_seconds": 0.08591754920780659,
+        "total_seconds_per_step_plus_setup": 0.08591754920780659
+      },
+      "mode": "masked",
+      "route_metadata": {
+        "active_routes": 32,
+        "empty_experts": 0,
+        "expert_counts": [
+          8,
+          8,
+          8,
+          8
+        ],
+        "mode": "masked",
+        "num_experts": 4,
+        "num_tokens": 16,
+        "padded_routes": 0,
+        "top_k": 2
+      }
+    }
+  },
+  "warmup_steps": 1,
+  "workload": "tiny_moe"
+}
