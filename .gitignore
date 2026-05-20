@@ -36,3 +36,5 @@ external/
 vendor/
 submodules/
 # tests/
+
+profiling/

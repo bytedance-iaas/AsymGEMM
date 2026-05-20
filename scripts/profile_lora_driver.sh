@@ -5,28 +5,54 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PY_DRIVER="${ROOT}/scripts/profile_lora_driver.py"
 
+# User-editable defaults. CLI flags override these values.
+DEFAULT_GPU_POOL=(4 5 6 7)
+DEFAULT_WORKLOADS=(mlp_1b mlp_3b mm_1b mm_3b qwen3_14b qwen3_30b_a3b)
+DEFAULT_BACKENDS=(asym_only torch_only)
+DEFAULT_PROFILERS=(nsys cpu ncu)
+DEFAULT_JOBS_PER_GPU=1
+DEFAULT_OUTPUT_ROOT="profiling"
+DEFAULT_RUN_NAME=""
+DEFAULT_PRECISION="bf16"
+DEFAULT_WORKFLOW="lora_sft"
+DEFAULT_MODE="auto"
+DEFAULT_DRIVER_ARGS=(
+  --profile-layers 1
+  --batch-size 32
+  --seq-len 64
+  --tokens 2048
+  --lora-rank 64
+  --lora-alpha 128
+)
+
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/profile_lora_driver.sh --gpus 2,3,4,5,6,7 [driver args...]
+  scripts/profile_lora_driver.sh --gpus 2,3,4,5,6,7 [options]
 
 Required:
   --gpus, --gpu-pool, --cuda-devices  Physical GPU pool. Comma or space separated.
+                                      Not required if DEFAULT_GPU_POOL is set
+                                      at the top of this script.
 
 Shell-only options:
   --jobs-per-gpu N                    Concurrent Python driver jobs per GPU. Default: 1.
   -h, --help                          Show this help.
 
-Common forwarded options:
-  --workloads qwen3_14b qwen3_30b_a3b
+Default run matrix:
+  --workloads mlp_1b mlp_3b mm_1b mm_3b mlp dense moe qwen3_14b qwen3_30b_a3b
   --backends asym_only torch_only
   --profilers source nsys cpu ncu
-  --precision bf16 --workflow lora_sft --mode auto
-  --output-root profiling
+
+Common options:
+  Defaults are defined at the top of this script and can be overridden with
+  flags such as --precision, --workflow, --mode, and --output-root.
 
 The shell launches one background Python driver job per workload/backend pair,
 assigns each job one GPU from the pool, waits for all jobs, and traps
 INT/TERM/ERR to terminate the whole background process tree.
+The Python driver is an internal worker; use this shell script as the profiling
+entrypoint for the standard workflow.
 USAGE
 }
 
@@ -52,8 +78,9 @@ expand_workloads() {
     case "${item}" in
       toy) printf '%s\n' mlp dense moe ;;
       qwen) printf '%s\n' qwen3_14b qwen3_30b_a3b ;;
-      fundamental) printf '%s\n' matrix_1b mlp_1b ;;
-      all) printf '%s\n' mlp dense moe qwen3_14b qwen3_30b_a3b matrix_1b mlp_1b ;;
+      fundamental) printf '%s\n' mlp_1b mlp_3b mm_1b mm_3b ;;
+      all) printf '%s\n' mlp_1b mlp_3b mm_1b mm_3b mlp dense moe qwen3_14b qwen3_30b_a3b ;;
+      matrix_1b) printf '%s\n' mm_1b ;;
       *) printf '%s\n' "${item}" ;;
     esac
   done
@@ -64,6 +91,18 @@ expand_backends() {
   for item in "$@"; do
     case "${item}" in
       all) printf '%s\n' asym_only torch_only ;;
+      *) printf '%s\n' "${item}" ;;
+    esac
+  done
+}
+
+expand_profilers() {
+  local item
+  for item in "$@"; do
+    case "${item}" in
+      all) printf '%s\n' source nsys cpu ncu ;;
+      none|profile) printf '%s\n' source ;;
+      cpu_gaps) printf '%s\n' cpu ;;
       *) printf '%s\n' "${item}" ;;
     esac
   done
@@ -98,15 +137,17 @@ kill_tree_force() {
   kill -KILL "${pid}" 2>/dev/null || true
 }
 
-declare -a gpu_values=()
-declare -a workload_values=()
-declare -a backend_values=()
+declare -a gpu_values=("${DEFAULT_GPU_POOL[@]}")
+declare -a workload_values=("${DEFAULT_WORKLOADS[@]}")
+declare -a backend_values=("${DEFAULT_BACKENDS[@]}")
+declare -a profiler_values=("${DEFAULT_PROFILERS[@]}")
 declare -a pass_args=()
-jobs_per_gpu=1
-output_root="profiling"
-run_name=""
-precision="bf16"
-workflow="lora_sft"
+jobs_per_gpu="${DEFAULT_JOBS_PER_GPU}"
+output_root="${DEFAULT_OUTPUT_ROOT}"
+run_name="${DEFAULT_RUN_NAME}"
+precision="${DEFAULT_PRECISION}"
+workflow="${DEFAULT_WORKFLOW}"
+mode="${DEFAULT_MODE}"
 
 while (($#)); do
   case "$1" in
@@ -115,6 +156,7 @@ while (($#)); do
       exit 0
       ;;
     --gpus|--gpu-pool|--cuda-devices)
+      gpu_values=()
       shift
       while (($#)) && [[ "$1" != --* ]]; do
         gpu_values+=("$1")
@@ -122,6 +164,7 @@ while (($#)); do
       done
       ;;
     --workloads)
+      workload_values=()
       shift
       while (($#)) && [[ "$1" != --* ]]; do
         workload_values+=("$1")
@@ -129,9 +172,18 @@ while (($#)); do
       done
       ;;
     --backends)
+      backend_values=()
       shift
       while (($#)) && [[ "$1" != --* ]]; do
         backend_values+=("$1")
+        shift
+      done
+      ;;
+    --profilers|--profile-modes)
+      profiler_values=()
+      shift
+      while (($#)) && [[ "$1" != --* ]]; do
+        profiler_values+=("$1")
         shift
       done
       ;;
@@ -141,22 +193,22 @@ while (($#)); do
       ;;
     --output-root)
       output_root="$2"
-      pass_args+=("$1" "$2")
       shift 2
       ;;
     --run-name)
       run_name="$2"
-      pass_args+=("$1" "$2")
       shift 2
       ;;
     --precision)
       precision="$2"
-      pass_args+=("$1" "$2")
       shift 2
       ;;
     --workflow)
       workflow="$2"
-      pass_args+=("$1" "$2")
+      shift 2
+      ;;
+    --mode)
+      mode="$2"
       shift 2
       ;;
     --)
@@ -193,12 +245,16 @@ fi
 if ((${#backend_values[@]} == 0)); then
   backend_values=(asym_only torch_only)
 fi
+if ((${#profiler_values[@]} == 0)); then
+  profiler_values=(source nsys cpu ncu)
+fi
 
 mapfile -t workloads < <(split_values "${workload_values[@]}" | xargs -r -n1 printf '%s\n' | while read -r x; do expand_workloads "$x"; done | dedupe_lines)
 mapfile -t backends < <(split_values "${backend_values[@]}" | xargs -r -n1 printf '%s\n' | while read -r x; do expand_backends "$x"; done | dedupe_lines)
+mapfile -t profilers < <(split_values "${profiler_values[@]}" | xargs -r -n1 printf '%s\n' | while read -r x; do expand_profilers "$x"; done | dedupe_lines)
 
-if ((${#workloads[@]} == 0 || ${#backends[@]} == 0)); then
-  echo "error: workloads/backends expanded to empty lists" >&2
+if ((${#workloads[@]} == 0 || ${#backends[@]} == 0 || ${#profilers[@]} == 0)); then
+  echo "error: workloads/backends/profilers expanded to empty lists" >&2
   exit 2
 fi
 
@@ -298,10 +354,19 @@ launch_job() {
     python "${PY_DRIVER}"
     --workloads "${workload}"
     --backends "${backend}"
+    --profilers "${profilers[@]}"
     --cuda-devices "${gpu}"
+    --output-root "${output_root}"
+    --precision "${precision}"
+    --workflow "${workflow}"
+    --mode "${mode}"
     --skip-summary
+    "${DEFAULT_DRIVER_ARGS[@]}"
     "${pass_args[@]}"
   )
+  if [[ -n "${run_name}" ]]; then
+    cmd+=(--run-name "${run_name}")
+  fi
 
   echo "Launching gpu=${gpu} workload=${workload} backend=${backend}"
   echo "  log=${log_file}"
