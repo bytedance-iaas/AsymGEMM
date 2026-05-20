@@ -357,7 +357,7 @@ def _run_demo_impl(
         dev = torch.device("cpu")
         dtype = torch.float32
         if backend == "asym_only":
-            raise RuntimeError("asym_only requires CUDA/H200 BF16 direct execution")
+            raise RuntimeError("asym_only requires CUDA SM90/SM100 BF16 direct execution")
 
     if dev.type == "cuda":
         torch.cuda.empty_cache()

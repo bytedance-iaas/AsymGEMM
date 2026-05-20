@@ -242,6 +242,12 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
             constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
             uint32_t k_idx = block_k_iter * BLOCK_K;
             const uint32_t batch_idx = (kIsBatchedMM ? scheduler.current_group_idx : 0);
+            uint32_t b_n_idx = n_idx;
+            uint32_t b_k_idx = k_idx;
+            if constexpr (kGemmType == GemmType::MGroupedContiguous and kMajorB == cute::UMMA::Major::MN) {
+                b_n_idx = blockIdx.x * BLOCK_N;
+                b_k_idx += scheduler.current_group_idx * shape_k;
+            }
             
             empty_barriers_b[0]->wait(phase_b ^ 1);
             phase_b ^= 1;
@@ -255,7 +261,7 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
             }
             if constexpr (kMajorB == cute::UMMA::Major::MN)
                 tma_copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, cutlass::bfloat16_t, kIsBatchedMM>(
-                    &tensor_map_b, full_barriers_b[0], smem_b[0], n_idx, k_idx, kNumMulticast, batch_idx);
+                    &tensor_map_b, full_barriers_b[0], smem_b[0], b_n_idx, b_k_idx, kNumMulticast, batch_idx);
 
             // if (lane_idx == 0 and block_k_iter == 0 and n_idx == 0 and blockIdx.y == 0) {
             //     printf("DBG_BF16_ASYM LOAD_B warp=%u lane=%u k_idx=%u n_idx=%u\n",

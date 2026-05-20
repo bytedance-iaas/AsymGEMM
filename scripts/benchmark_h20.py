@@ -17,8 +17,8 @@ from generators import (  # noqa: E402
     generate_m_grouped_masked,
     get_ue8m0_usage,
 )
-from test_h20_bf16 import build_offsets_experts_from_m_indices_pairs as build_bf16_offsets  # noqa: E402
-from test_h20_fp8 import build_offsets_experts_from_m_indices_pairs as build_fp8_offsets  # noqa: E402
+from test_sm90_bf16_m_grouped import build_offsets_experts_from_m_indices_pairs as build_bf16_offsets  # noqa: E402
+from test_sm90_fp8_m_grouped import build_offsets_experts_from_m_indices_pairs as build_fp8_offsets  # noqa: E402
 
 try:
     import deep_gemm  # noqa: E402

@@ -1,0 +1,450 @@
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+import asym_gemm
+
+from asym_gemm.testing import calc_diff, get_arch_major  # noqa: E402
+from asym_gemm.utils import per_block_cast_to_fp8, per_token_cast_to_fp8  # noqa: E402
+
+TESTS_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(TESTS_DIR))
+
+from test_nvfp4 import (  # noqa: E402
+    _decode_e2m1_codes,
+    _decode_e4m3_bits,
+    _manual_dequant_reference,
+    _quantize_a_nvfp4_e4m3,
+    _quantize_b_nvfp4_e4m3,
+    _unpack_fp4_bytes,
+)
+
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or get_arch_major() != 10,
+    reason="SM100/GB200 required",
+)
+
+
+def _seed() -> None:
+    random.seed(0)
+    np.random.seed(0)
+    torch.manual_seed(0)
+
+
+def _dense_offsets(segment_rows: list[int], *, device: torch.device | str = "cuda"):
+    offsets: list[int] = []
+    experts: list[int] = []
+    start = 0
+    for expert, rows in enumerate(segment_rows):
+        offsets.extend([start, start + rows])
+        experts.append(expert)
+        start += rows
+    experts.append(-1)
+    return (
+        torch.tensor(offsets, dtype=torch.int32, device=device),
+        torch.tensor(experts, dtype=torch.int32, device=device),
+        torch.tensor([len(experts)], dtype=torch.int32, device=device),
+    )
+
+
+def _offsets_from_m_indices_pairs(m_indices: torch.Tensor, block_m: int = 128):
+    m_indices_cpu = m_indices.to("cpu", torch.int32).contiguous()
+    values = m_indices_cpu.tolist()
+    offsets: list[int] = []
+    experts: list[int] = []
+    start = 0
+    for idx in range(1, len(values) + 1):
+        if idx == len(values) or values[idx] != values[start]:
+            expert = values[start]
+            if expert != -1:
+                offsets.extend([
+                    (start // block_m) * block_m,
+                    ((idx + block_m - 1) // block_m) * block_m,
+                ])
+                experts.append(expert)
+            start = idx
+    experts.append(-1)
+    return (
+        torch.tensor(offsets, dtype=torch.int32, device=m_indices.device),
+        torch.tensor(experts, dtype=torch.int32, device=m_indices.device),
+        torch.tensor([len(experts)], dtype=torch.int32, device=m_indices.device),
+    )
+
+
+def _assert_grouped_close(out: torch.Tensor, ref: torch.Tensor, lengths: list[int], tol: float) -> None:
+    start = 0
+    max_diff = 0.0
+    for rows in lengths:
+        if rows > 0:
+            max_diff = max(max_diff, calc_diff(out[start:start + rows], ref[start:start + rows]))
+        start += rows
+    assert max_diff < tol, f"max grouped diff {max_diff:.5e} >= {tol:.5e}"
+
+
+def _pin_cpu(tensor: torch.Tensor) -> torch.Tensor:
+    pinned = tensor.detach().cpu().pin_memory()
+    assert pinned.device.type == "cpu" and pinned.is_pinned()
+    return pinned
+
+
+def _pin_quantized_b(b: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    return _pin_cpu(b[0]), _pin_cpu(b[1])
+
+
+def _bf16_contiguous_case(lengths: list[int], n: int, k: int):
+    num_groups = len(lengths)
+    m = sum(lengths)
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
+    ref = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    start = 0
+    for group, rows in enumerate(lengths):
+        ref[start:start + rows] = a[start:start + rows].float().matmul(b[group].float().t()).to(torch.bfloat16)
+        start += rows
+    return a, b, ref
+
+
+def _fp8_contiguous_case(lengths: list[int], n: int, k: int):
+    a_bf16, b_bf16, ref = _bf16_contiguous_case(lengths, n, k)
+    a = per_token_cast_to_fp8(a_bf16, use_ue8m0=True)
+    b_values = torch.empty_like(b_bf16, dtype=torch.float8_e4m3fn)
+    b_scales = []
+    for group in range(b_bf16.size(0)):
+        b_values[group], scales = per_block_cast_to_fp8(b_bf16[group], use_ue8m0=True)
+        b_scales.append(scales)
+    return a, (b_values, torch.stack(b_scales)), ref
+
+
+def _bf16_masked_case(num_groups: int, max_m: int, n: int, k: int, masked_m: torch.Tensor):
+    a = torch.randn((num_groups, max_m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
+    ref = torch.einsum("gmk,gnk->gmn", a.float(), b.float()).to(torch.bfloat16)
+    return a, b, ref
+
+
+def _fp8_masked_case(num_groups: int, max_m: int, n: int, k: int, masked_m: torch.Tensor):
+    a_bf16, b_bf16, ref = _bf16_masked_case(num_groups, max_m, n, k, masked_m)
+    a_values = torch.empty_like(a_bf16, dtype=torch.float8_e4m3fn)
+    a_scales = []
+    b_values = torch.empty_like(b_bf16, dtype=torch.float8_e4m3fn)
+    b_scales = []
+    for group in range(num_groups):
+        a_values[group], scales_a = per_token_cast_to_fp8(a_bf16[group], use_ue8m0=True)
+        b_values[group], scales_b = per_block_cast_to_fp8(b_bf16[group], use_ue8m0=True)
+        a_scales.append(scales_a)
+        b_scales.append(scales_b)
+    return (a_values, torch.stack(a_scales)), (b_values, torch.stack(b_scales)), ref
+
+
+def _to_fp4_scale_tensor(scales_u8: np.ndarray) -> torch.Tensor:
+    return torch.from_numpy(scales_u8).to(device="cuda", dtype=torch.uint8).view(torch.float8_e4m3fn)
+
+
+def _fp4_contiguous_case(lengths: list[int], n: int, k: int):
+    num_groups = len(lengths)
+    m = sum(lengths)
+    gran_k = 16
+    sf_k = (k + gran_k - 1) // gran_k
+    m_indices_cpu = torch.cat([
+        torch.full((rows,), group, dtype=torch.int32)
+        for group, rows in enumerate(lengths)
+    ])
+
+    a_bf16 = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b_bf16 = torch.randn((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
+    a_f32_cpu = a_bf16.float().cpu().contiguous().numpy()
+    b_f32_cpu = b_bf16.float().cpu().contiguous().numpy()
+
+    a_packed_u8, a_scales_u8 = _quantize_a_nvfp4_e4m3(a_f32_cpu, gran_k=gran_k)
+    b_packed_u8 = np.empty((num_groups, n, k // 2), dtype=np.uint8)
+    b_scales_u8 = np.empty((num_groups, n, sf_k), dtype=np.uint8)
+    for group in range(num_groups):
+        b_packed_u8[group], b_scales_u8[group] = _quantize_b_nvfp4_e4m3(
+            b_f32_cpu[group], gran_k=gran_k
+        )
+
+    a = (
+        torch.from_numpy(a_packed_u8)
+        .to(device="cuda", dtype=torch.uint8)
+        .contiguous()
+    )
+    b = (
+        torch.from_numpy(b_packed_u8)
+        .to(device="cuda", dtype=torch.uint8)
+        .contiguous()
+    )
+    sfa = _to_fp4_scale_tensor(a_scales_u8).contiguous()
+    sfb = _to_fp4_scale_tensor(b_scales_u8).contiguous()
+    ref = _manual_dequant_reference(
+        a_packed_u8=a_packed_u8,
+        a_scales_u8=a_scales_u8,
+        b_packed_u8=b_packed_u8,
+        b_scales_u8=b_scales_u8,
+        m_indices_cpu=m_indices_cpu,
+        gran_k=gran_k,
+    )
+    return (a, sfa), (b, sfb), ref
+
+
+def _fp4_masked_reference(
+    a_packed_u8: np.ndarray,
+    a_scales_u8: np.ndarray,
+    b_packed_u8: np.ndarray,
+    b_scales_u8: np.ndarray,
+    masked_m_cpu: torch.Tensor,
+    gran_k: int,
+) -> torch.Tensor:
+    num_groups, max_m, packed_k = a_packed_u8.shape
+    n = b_packed_u8.shape[1]
+    k = packed_k * 2
+    ref = torch.zeros((num_groups, max_m, n), dtype=torch.float32, device="cpu")
+
+    for group in range(num_groups):
+        rows = int(masked_m_cpu[group].item())
+        if rows == 0:
+            continue
+
+        a_codes = _unpack_fp4_bytes(a_packed_u8[group, :rows])
+        a_q = _decode_e2m1_codes(a_codes)
+        a_sf = _decode_e4m3_bits(a_scales_u8[group, :rows])
+        a_sf = np.repeat(a_sf, gran_k, axis=1)[:, :k]
+        a_deq = a_q * a_sf
+
+        b_codes = _unpack_fp4_bytes(b_packed_u8[group])
+        b_q = _decode_e2m1_codes(b_codes)
+        b_sf = _decode_e4m3_bits(b_scales_u8[group])
+        b_sf = np.repeat(b_sf, gran_k, axis=1)[:, :k]
+        b_deq = b_q * b_sf
+
+        ref[group, :rows] = torch.from_numpy(a_deq).float().matmul(
+            torch.from_numpy(b_deq).float().t()
+        )
+
+    return ref
+
+
+def _fp4_masked_case(num_groups: int, max_m: int, n: int, k: int, masked_m_cpu: torch.Tensor):
+    gran_k = 16
+    sf_k = (k + gran_k - 1) // gran_k
+    a_bf16 = torch.randn((num_groups, max_m, k), device="cuda", dtype=torch.bfloat16)
+    b_bf16 = torch.randn((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
+    a_f32_cpu = a_bf16.float().cpu().contiguous().numpy()
+    b_f32_cpu = b_bf16.float().cpu().contiguous().numpy()
+
+    a_packed_u8 = np.empty((num_groups, max_m, k // 2), dtype=np.uint8)
+    a_scales_u8 = np.empty((num_groups, max_m, sf_k), dtype=np.uint8)
+    b_packed_u8 = np.empty((num_groups, n, k // 2), dtype=np.uint8)
+    b_scales_u8 = np.empty((num_groups, n, sf_k), dtype=np.uint8)
+    for group in range(num_groups):
+        a_packed_u8[group], a_scales_u8[group] = _quantize_a_nvfp4_e4m3(
+            a_f32_cpu[group], gran_k=gran_k
+        )
+        b_packed_u8[group], b_scales_u8[group] = _quantize_b_nvfp4_e4m3(
+            b_f32_cpu[group], gran_k=gran_k
+        )
+
+    a = (
+        torch.from_numpy(a_packed_u8)
+        .to(device="cuda", dtype=torch.uint8)
+        .contiguous()
+    )
+    b = (
+        torch.from_numpy(b_packed_u8)
+        .to(device="cuda", dtype=torch.uint8)
+        .contiguous()
+    )
+    sfa = _to_fp4_scale_tensor(a_scales_u8).contiguous()
+    sfb = _to_fp4_scale_tensor(b_scales_u8).contiguous()
+    ref = _fp4_masked_reference(
+        a_packed_u8,
+        a_scales_u8,
+        b_packed_u8,
+        b_scales_u8,
+        masked_m_cpu,
+        gran_k,
+    )
+    return (a, sfa), (b, sfb), ref
+
+
+def test_m_grouped_bf16_contiguous_sm100_tensor_list_size() -> None:
+    if not hasattr(asym_gemm, "m_grouped_bf16_asym_gemm_nt_contiguous"):
+        pytest.skip("BF16 m-grouped contiguous kernel is not exported")
+
+    _seed()
+    lengths = [128, 128]
+    n, k = 128, 512
+    a, b, ref = _bf16_contiguous_case(lengths, n, k)
+    b = _pin_cpu(b)
+    d = torch.empty_like(ref)
+
+    offsets, experts, list_size = _dense_offsets(lengths)
+    asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous(
+        a, b, d, offsets, experts, list_size, compiled_dims="nk"
+    )
+    torch.cuda.synchronize()
+    _assert_grouped_close(d, ref, lengths, tol=1e-3)
+
+
+def test_m_grouped_bf16_contiguous_sm100_transpose_b_dx() -> None:
+    if not hasattr(asym_gemm, "m_grouped_bf16_asym_gemm_nt_contiguous"):
+        pytest.skip("BF16 m-grouped contiguous kernel is not exported")
+
+    _seed()
+    lengths = [64, 64, 64]
+    n, k = 192, 128
+    num_groups = len(lengths)
+    m = sum(lengths)
+    grad_output = torch.randn((m, n), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
+    weight_host = _pin_cpu(weight)
+    ref = torch.empty((m, k), device="cuda", dtype=torch.float32)
+    start = 0
+    for group, rows in enumerate(lengths):
+        ref[start:start + rows] = grad_output[start:start + rows].float().matmul(weight[group].float())
+        start += rows
+
+    d = torch.empty_like(ref)
+    offsets, experts, list_size = _dense_offsets(lengths)
+    asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous(
+        grad_output, weight_host, d, offsets, experts, list_size, compiled_dims="nk", transpose_b=True
+    )
+    torch.cuda.synchronize()
+    _assert_grouped_close(d, ref, lengths, tol=1e-3)
+
+
+def test_m_grouped_bf16_masked_sm100_masked_m() -> None:
+    if not hasattr(asym_gemm, "m_grouped_bf16_asym_gemm_nt_masked"):
+        pytest.skip("BF16 m-grouped masked kernel is not exported")
+
+    _seed()
+    num_groups, max_m, expected_m, n, k = 2, 128, 96, 128, 512
+    masked_m = torch.tensor([64, 96], dtype=torch.int32, device="cuda")
+    a, b, ref = _bf16_masked_case(num_groups, max_m, n, k, masked_m)
+    b = _pin_cpu(b)
+    d = torch.empty_like(ref)
+    asym_gemm.m_grouped_bf16_asym_gemm_nt_masked(
+        a, b, d, masked_m, expected_m, compiled_dims="nk"
+    )
+    torch.cuda.synchronize()
+
+    max_diff = 0.0
+    for group in range(num_groups):
+        rows = int(masked_m[group].item())
+        if rows > 0:
+            max_diff = max(max_diff, calc_diff(d[group, :rows], ref[group, :rows]))
+    assert max_diff < 1e-3, f"max masked BF16 diff {max_diff:.5e}"
+
+
+def test_m_grouped_fp8_contiguous_sm100_tensor_list_size() -> None:
+    if not hasattr(asym_gemm, "m_grouped_fp8_asym_gemm_nt_contiguous"):
+        pytest.skip("FP8 m-grouped contiguous kernel is not exported")
+
+    _seed()
+    lengths = [128, 128]
+    n, k = 128, 512
+    a, b, ref = _fp8_contiguous_case(lengths, n, k)
+    b = _pin_quantized_b(b)
+    d = torch.empty_like(ref)
+    offsets, experts, list_size = _dense_offsets(lengths)
+    asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(
+        a,
+        b,
+        d,
+        offsets,
+        experts,
+        list_size,
+        recipe=(1, 128, 128),
+        disable_ue8m0_cast=False,
+    )
+    torch.cuda.synchronize()
+    _assert_grouped_close(d, ref, lengths, tol=2e-2)
+
+
+def test_m_grouped_fp8_masked_sm100_masked_m() -> None:
+    if not hasattr(asym_gemm, "m_grouped_fp8_asym_gemm_nt_masked"):
+        pytest.skip("FP8 m-grouped masked kernel is not exported")
+
+    _seed()
+    num_groups, max_m, expected_m, n, k = 2, 128, 96, 128, 512
+    masked_m = torch.tensor([64, 96], dtype=torch.int32, device="cuda")
+    a, b, ref = _fp8_masked_case(num_groups, max_m, n, k, masked_m)
+    b = _pin_quantized_b(b)
+    d = torch.empty_like(ref)
+    asym_gemm.m_grouped_fp8_asym_gemm_nt_masked(
+        a,
+        b,
+        d,
+        masked_m,
+        expected_m,
+        recipe=(1, 128, 128),
+        disable_ue8m0_cast=False,
+    )
+    torch.cuda.synchronize()
+
+    max_diff = 0.0
+    for group in range(num_groups):
+        rows = int(masked_m[group].item())
+        if rows > 0:
+            max_diff = max(max_diff, calc_diff(d[group, :rows], ref[group, :rows]))
+    assert max_diff < 2e-2, f"max masked FP8 diff {max_diff:.5e}"
+
+
+def test_m_grouped_fp4_contiguous_sm100_tensor_list_size() -> None:
+    if not hasattr(asym_gemm, "m_grouped_fp4_asym_gemm_nt_contiguous"):
+        pytest.skip("FP4 m-grouped contiguous kernel is not exported")
+
+    _seed()
+    lengths = [128, 128]
+    n, k = 128, 512
+    a, b, ref = _fp4_contiguous_case(lengths, n, k)
+    b = _pin_quantized_b(b)
+    d = torch.empty((sum(lengths), n), device="cuda", dtype=torch.bfloat16)
+    offsets, experts, list_size = _dense_offsets(lengths)
+    asym_gemm.m_grouped_fp4_asym_gemm_nt_contiguous(
+        a,
+        b,
+        d,
+        offsets,
+        experts,
+        list_size,
+        recipe=(1, 1, 16),
+        disable_ue8m0_cast=True,
+    )
+    torch.cuda.synchronize()
+    _assert_grouped_close(d.float().cpu(), ref, lengths, tol=2e-2)
+
+
+def test_m_grouped_fp4_masked_sm100_masked_m() -> None:
+    if not hasattr(asym_gemm, "m_grouped_fp4_asym_gemm_nt_masked"):
+        pytest.skip("FP4 m-grouped masked kernel is not exported")
+
+    _seed()
+    num_groups, max_m, expected_m, n, k = 2, 128, 96, 128, 512
+    masked_m_cpu = torch.tensor([64, 96], dtype=torch.int32, device="cpu")
+    masked_m = masked_m_cpu.to(device="cuda")
+    a, b, ref = _fp4_masked_case(num_groups, max_m, n, k, masked_m_cpu)
+    b = _pin_quantized_b(b)
+    d = torch.empty((num_groups, max_m, n), device="cuda", dtype=torch.bfloat16)
+    asym_gemm.m_grouped_fp4_asym_gemm_nt_masked(
+        a,
+        b,
+        d,
+        masked_m,
+        expected_m,
+        recipe=(1, 1, 16),
+        disable_ue8m0_cast=True,
+    )
+    torch.cuda.synchronize()
+
+    max_diff = 0.0
+    d_cpu = d.float().cpu()
+    for group in range(num_groups):
+        rows = int(masked_m_cpu[group].item())
+        if rows > 0:
+            max_diff = max(max_diff, calc_diff(d_cpu[group, :rows], ref[group, :rows]))
+    assert max_diff < 2e-2, f"max masked FP4 diff {max_diff:.5e}"

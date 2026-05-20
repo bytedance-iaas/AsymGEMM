@@ -132,7 +132,7 @@ static void sm100_m_grouped_bf16_asym_gemm_contiguous(const torch::Tensor& a,
     // const int block_k = 64;
 
     const int block_n = 64;
-    const int block_k = 512;
+    const int block_k = (major_b == cute::UMMA::Major::MN) ? 64 : 512;
     const auto& aligned_k = align(k, block_k);
 
     const bool use_manual_config = block_m > 0 or block_n > 0 or block_k > 0;

@@ -327,7 +327,12 @@ class HostWeight:
         if self._transpose is None:
             total_start = time.perf_counter()
             transpose_start = time.perf_counter()
-            transpose = self._tensor.t().contiguous()
+            if self._tensor.dim() == 2:
+                transpose = self._tensor.t().contiguous()
+            elif self._tensor.dim() == 3:
+                transpose = self._tensor.transpose(-1, -2).contiguous()
+            else:
+                raise ValueError(f"cannot transpose HostWeight with shape {tuple(self._tensor.shape)}")
             transpose_seconds = time.perf_counter() - transpose_start
             pin_seconds = 0.0
             pin_error: str | None = None

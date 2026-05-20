@@ -1,0 +1,385 @@
+import pytest
+import torch
+
+from asym_gemm.training import (
+    AsymExecutionStats,
+    AsymFrozenLinear,
+    AsymGroupedFrozenLinear,
+    HostWeight,
+    VALID_BACKENDS,
+    asym_frozen_linear,
+    asym_grouped_frozen_linear,
+    can_use_direct_bf16,
+    measure_gpu_weight_allocation,
+)
+
+
+def _direct_bf16_available() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] in {9, 10}
+
+
+def test_fp64_reference_gradcheck_cpu() -> None:
+    torch.manual_seed(0)
+    x = torch.randn(3, 5, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn(7, 5, dtype=torch.float64)
+    host_weight = HostWeight.from_tensor(weight, pin_memory=False)
+
+    def func(inp: torch.Tensor) -> torch.Tensor:
+        return asym_frozen_linear(inp, host_weight, backend="torch_only")
+
+    assert torch.autograd.gradcheck(func, (x,), eps=1e-6, atol=1e-4)
+
+
+def test_bias_grad_matches_torch_for_batched_inputs_cpu() -> None:
+    torch.manual_seed(10)
+    x = torch.randn(2, 3, 5, dtype=torch.float64, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight = torch.randn(7, 5, dtype=torch.float64)
+    bias = torch.randn(7, dtype=torch.float64, requires_grad=True)
+    bias_ref = bias.detach().clone().requires_grad_(True)
+    host_weight = HostWeight.from_tensor(weight, pin_memory=False)
+
+    y = asym_frozen_linear(x, host_weight, bias=bias, backend="torch_only")
+    y_ref = torch.nn.functional.linear(x_ref, weight, bias_ref)
+    loss = (y.square().mean() + y[..., :2].sum() * 0.03)
+    loss_ref = (y_ref.square().mean() + y_ref[..., :2].sum() * 0.03)
+    loss.backward()
+    loss_ref.backward()
+
+    torch.testing.assert_close(y, y_ref)
+    torch.testing.assert_close(x.grad, x_ref.grad)
+    torch.testing.assert_close(bias.grad, bias_ref.grad)
+    assert host_weight.weight.grad is None
+
+
+def test_backward_does_not_materialize_host_weight_transpose_cpu() -> None:
+    torch.manual_seed(11)
+    x = torch.randn(4, 5, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(7, 5, dtype=torch.float32)
+    host_weight = HostWeight.from_tensor(weight, pin_memory=False)
+
+    y = asym_frozen_linear(x, host_weight, backend="torch_only")
+    y.float().square().mean().backward()
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    y_ref = x_ref @ weight.t()
+    y_ref.float().square().mean().backward()
+
+    assert getattr(host_weight, "_transpose") is None
+    torch.testing.assert_close(x.grad, x_ref.grad)
+
+
+def test_grouped_frozen_linear_cpu_forward_dx_and_no_dw() -> None:
+    torch.manual_seed(13)
+    x = torch.randn(9, 5, dtype=torch.float64, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight = torch.randn(3, 7, 5, dtype=torch.float64)
+    grouped = AsymGroupedFrozenLinear(weight, backend="torch_only", pin_memory=False)
+    offsets = torch.tensor([0, 2, 5, 9], dtype=torch.long)
+    experts = torch.tensor([0, 1, 2, -1], dtype=torch.long)
+
+    y = grouped(x, offsets, experts)
+    y_ref = torch.cat(
+        [
+            x_ref[0:2] @ weight[0].t(),
+            x_ref[2:5] @ weight[1].t(),
+            x_ref[5:9] @ weight[2].t(),
+        ],
+        dim=0,
+    )
+    loss = y.float().square().mean()
+    loss_ref = y_ref.float().square().mean()
+    loss.backward()
+    loss_ref.backward()
+
+    torch.testing.assert_close(y, y_ref)
+    torch.testing.assert_close(x.grad, x_ref.grad)
+    assert grouped.host_weight.weight.device.type == "cpu"
+    assert grouped.host_weight.weight.grad is None
+
+
+def test_grouped_frozen_linear_empty_group_cpu() -> None:
+    torch.manual_seed(14)
+    x = torch.randn(6, 5, dtype=torch.float32, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight = torch.randn(4, 7, 5, dtype=torch.float32)
+    host_weight = HostWeight(weight, pin_memory=False, clone=True, require_2d=False)
+    offsets = torch.tensor([0, 2, 2, 4, 6], dtype=torch.long)
+    experts = torch.tensor([0, 1, 2, 3, -1], dtype=torch.long)
+
+    y = asym_grouped_frozen_linear(x, host_weight, offsets, experts, backend="torch_only")
+    y_ref = torch.cat(
+        [
+            x_ref[0:2] @ weight[0].t(),
+            x_ref[2:4] @ weight[2].t(),
+            x_ref[4:6] @ weight[3].t(),
+        ],
+        dim=0,
+    )
+    (y.float().sum() * 0.1).backward()
+    (y_ref.float().sum() * 0.1).backward()
+
+    torch.testing.assert_close(y, y_ref)
+    torch.testing.assert_close(x.grad, x_ref.grad)
+    assert host_weight.weight.grad is None
+
+
+def test_transpose_capability_check_uses_original_weight_without_copy() -> None:
+    torch.manual_seed(12)
+    x = torch.randn(3, 7, dtype=torch.float32)
+    weight = torch.randn(7, 5, dtype=torch.float32)
+    host_weight = HostWeight.from_tensor(weight, pin_memory=False)
+
+    ok, reason = can_use_direct_bf16(x, host_weight, transpose=True)
+
+    assert not ok
+    assert reason in {"cuda_unavailable", "input_not_cuda", "requires_bf16"}
+    assert getattr(host_weight, "_transpose") is None
+
+
+@pytest.mark.skipif(not _direct_bf16_available(), reason="direct BF16 AsymGEMM requires SM90/SM100")
+def test_direct_bf16_forward_and_dx_match_torch() -> None:
+    torch.manual_seed(1)
+    m = 17
+    n = 24
+    k = 16
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight = torch.randn(n, k, dtype=torch.bfloat16)
+    weight_cuda = weight.to("cuda")
+    host_weight = HostWeight.from_tensor(weight, pin_memory=True)
+    stats = AsymExecutionStats()
+
+    ok, reason = can_use_direct_bf16(x, host_weight)
+    assert ok, reason
+
+    y = asym_frozen_linear(x, host_weight, backend="asym_only", stats=stats)
+    y_ref = x_ref @ weight_cuda.t()
+    torch.testing.assert_close(y, y_ref, atol=0.0, rtol=0.0)
+
+    loss = y.float().square().mean()
+    loss_ref = y_ref.float().square().mean()
+    loss.backward()
+    loss_ref.backward()
+
+    forward_max_abs = float((y.float() - y_ref.float()).abs().max().item())
+    dx_max_abs = float((x.grad.float() - x_ref.grad.float()).abs().max().item())
+    print(
+        "\n[M1 direct BF16 numerical error] "
+        f"forward_max_abs={forward_max_abs:.6g}, dx_max_abs={dx_max_abs:.6g}, "
+        f"asym_forward_calls={stats.asym_forward_calls}, asym_dx_calls={stats.asym_dx_calls}"
+    )
+
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=0.04, rtol=0.04)
+    assert getattr(host_weight, "_transpose") is None
+    assert stats.asym_forward_calls == 1
+    assert stats.asym_dx_calls == 1
+    assert stats.staged_calls == 0
+    assert stats.torch_calls == 0
+
+
+@pytest.mark.skipif(not _direct_bf16_available(), reason="direct grouped BF16 AsymGEMM requires SM90/SM100")
+def test_direct_grouped_bf16_forward_and_dx_match_torch() -> None:
+    torch.manual_seed(15)
+    counts = [5, 7, 6]
+    m = sum(counts)
+    n = 24
+    k = 16
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight = torch.randn(len(counts), n, k, dtype=torch.bfloat16)
+    weight_cuda = weight.to("cuda")
+    grouped = AsymGroupedFrozenLinear(weight, backend="asym_only", pin_memory=True, stats=AsymExecutionStats())
+    offsets = torch.tensor([0, counts[0], counts[0] + counts[1], m], device="cuda", dtype=torch.long)
+    experts = torch.tensor([0, 1, 2, -1], device="cuda", dtype=torch.long)
+
+    y = grouped(x, offsets, experts)
+    y_ref = torch.cat(
+        [
+            x_ref[0 : counts[0]] @ weight_cuda[0].t(),
+            x_ref[counts[0] : counts[0] + counts[1]] @ weight_cuda[1].t(),
+            x_ref[counts[0] + counts[1] :] @ weight_cuda[2].t(),
+        ],
+        dim=0,
+    )
+    loss = y.float().square().mean()
+    loss_ref = y_ref.float().square().mean()
+    loss.backward()
+    loss_ref.backward()
+
+    torch.testing.assert_close(y, y_ref, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=0.04, rtol=0.04)
+    assert grouped.host_weight.weight.device.type == "cpu"
+    assert grouped.host_weight.weight.grad is None
+    assert grouped.stats.asym_forward_calls == 1
+    assert grouped.stats.asym_dx_calls == 1
+    assert grouped.stats.staged_calls == 0
+    assert grouped.stats.torch_calls == 0
+
+
+def test_lora_composition_gets_grads_and_base_stays_frozen() -> None:
+    torch.manual_seed(2)
+    use_cuda = _direct_bf16_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+    dtype = torch.bfloat16 if use_cuda else torch.float32
+    backend = "asym_only" if use_cuda else "torch_only"
+    m = in_features = out_features = 128 if use_cuda else 8
+    rank = 4
+
+    x = torch.randn(m, in_features, device=device, dtype=dtype, requires_grad=True)
+    weight = torch.randn(out_features, in_features, dtype=dtype)
+    base = AsymFrozenLinear(weight, backend=backend, pin_memory=use_cuda)
+    lora_a = torch.nn.Parameter(torch.randn(rank, in_features, device=device, dtype=dtype) * 0.01)
+    lora_b = torch.nn.Parameter(torch.randn(out_features, rank, device=device, dtype=dtype) * 0.01)
+
+    y = base(x) + (x @ lora_a.t() @ lora_b.t())
+    loss = y.float().square().mean()
+    loss.backward()
+
+    assert base.host_weight.weight.device.type == "cpu"
+    assert base.host_weight.weight.grad is None
+    assert lora_a.grad is not None
+    assert lora_b.grad is not None
+    assert x.grad is not None
+    assert float(lora_a.grad.float().abs().sum()) > 0.0
+    assert float(lora_b.grad.float().abs().sum()) > 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA memory accounting requires CUDA")
+def test_cpu_resident_weight_avoids_gpu_hbm_allocation() -> None:
+    torch.manual_seed(3)
+    weight = torch.randn(2048, 1024, dtype=torch.bfloat16)
+    expected_weight_bytes = weight.numel() * weight.element_size()
+
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    before = torch.cuda.memory_allocated()
+    host_weight = HostWeight.from_tensor(weight, pin_memory=True)
+    torch.cuda.synchronize()
+    host_delta = torch.cuda.memory_allocated() - before
+    gpu_alloc = measure_gpu_weight_allocation(weight)
+
+    print(
+        "\n[M1 CPU-resident memory comparison] "
+        f"normal_gpu_weight_hbm_bytes={gpu_alloc}, "
+        f"asym_host_weight_cuda_delta_bytes={host_delta}, "
+        f"asym_pinned_cpu_bytes={host_weight.pinned_cpu_bytes}, "
+        f"expected_weight_bytes={expected_weight_bytes}"
+    )
+
+    assert host_weight.weight.device.type == "cpu"
+    assert host_delta < 1024 * 1024
+    assert gpu_alloc >= expected_weight_bytes
+    assert host_weight.weight_nbytes == expected_weight_bytes
+    assert host_weight.pinned_cpu_bytes >= expected_weight_bytes
+
+
+@pytest.mark.parametrize("backend", ["asym_or_staged", "asym_or_torch", "torch_only"])
+def test_fp32_fallback_backends_match_torch_output_loss_and_dx(backend: str) -> None:
+    torch.manual_seed(4)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    x = torch.randn(7, 11, device=device, dtype=torch.float32, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight = torch.randn(13, 11, dtype=torch.float32)
+    bias = torch.randn(13, dtype=torch.float32)
+    host_weight = HostWeight.from_tensor(weight, pin_memory=torch.cuda.is_available())
+    stats = AsymExecutionStats()
+
+    y = asym_frozen_linear(x, host_weight, bias=bias, backend=backend, stats=stats)
+    loss = (y.square().mean() + y[:, :3].sum() * 0.01)
+    dx = torch.autograd.grad(loss, x)[0]
+
+    y_ref = torch.nn.functional.linear(x_ref, weight.to(device=device), bias.to(device=device))
+    loss_ref = (y_ref.square().mean() + y_ref[:, :3].sum() * 0.01)
+    dx_ref = torch.autograd.grad(loss_ref, x_ref)[0]
+
+    torch.testing.assert_close(y, y_ref, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(loss, loss_ref, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(dx, dx_ref, atol=1e-5, rtol=1e-5)
+    assert host_weight.weight.grad is None
+    assert host_weight.weight.device.type == "cpu"
+    assert stats.asym_calls == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for BF16 staged fallback parity")
+def test_bf16_asym_or_staged_fallback_matches_torch_cuda() -> None:
+    torch.manual_seed(5)
+    x = torch.randn(17, 19, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight = torch.randn(23, 19, dtype=torch.bfloat16)
+    bias = torch.randn(23, dtype=torch.bfloat16)
+    host_weight = HostWeight.from_tensor(weight, pin_memory=True)
+    stats = AsymExecutionStats()
+
+    ok, reason = can_use_direct_bf16(x, host_weight)
+    assert not ok and reason == "requires_8_aligned_nk"
+
+    y = asym_frozen_linear(x, host_weight, bias=bias, backend="asym_or_staged", stats=stats)
+    loss = y.float().square().mean()
+    dx = torch.autograd.grad(loss, x)[0]
+
+    y_ref = torch.nn.functional.linear(x_ref, weight.to("cuda"), bias.to("cuda"))
+    loss_ref = y_ref.float().square().mean()
+    dx_ref = torch.autograd.grad(loss_ref, x_ref)[0]
+
+    torch.testing.assert_close(y.float(), y_ref.float(), atol=7e-2, rtol=3e-2)
+    torch.testing.assert_close(loss, loss_ref, atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(dx.float(), dx_ref.float(), atol=2e-3, rtol=2e-2)
+    assert stats.staged_forward_calls == 1
+    assert stats.staged_dx_calls == 1
+    assert host_weight.weight.device.type == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for module.to('cuda') residency check")
+def test_module_to_cuda_does_not_move_host_weight_or_register_it() -> None:
+    torch.manual_seed(6)
+    weight = torch.randn(9, 7, dtype=torch.float32)
+    module = AsymFrozenLinear(7, 9, weight, backend="torch_only")
+    ptr_before = module.host_weight.weight.data_ptr()
+
+    module = module.to("cuda")
+
+    assert module.host_weight.weight.device.type == "cpu"
+    assert module.host_weight.weight.data_ptr() == ptr_before
+    assert module.weight.device.type == "cpu"
+    assert list(module.parameters()) == []
+    assert "host_weight" not in dict(module.named_buffers())
+    with pytest.raises(RuntimeError, match="CPU-resident"):
+        module.host_weight.to("cuda")
+    with pytest.raises(RuntimeError, match="CPU-resident"):
+        module.host_weight.cuda()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for peak HBM accounting")
+def test_cpu_resident_forward_excludes_weight_bytes_from_peak_cuda_allocation() -> None:
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    batch = 4
+    in_features = 2048
+    out_features = 2048
+
+    x = torch.randn(batch, in_features, device=device, dtype=torch.float32)
+    weight_cpu = torch.randn(out_features, in_features, dtype=torch.float32)
+    host_weight = HostWeight.from_tensor(weight_cpu, pin_memory=True)
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    y_host = asym_frozen_linear(x, host_weight, backend="torch_only")
+    torch.cuda.synchronize()
+    host_peak = torch.cuda.max_memory_allocated()
+    del y_host
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    weight_gpu = weight_cpu.to(device=device)
+    y_gpu = torch.nn.functional.linear(x, weight_gpu)
+    torch.cuda.synchronize()
+    gpu_peak = torch.cuda.max_memory_allocated()
+    del y_gpu, weight_gpu
+
+    assert host_weight.weight.device.type == "cpu"
+    assert gpu_peak - host_peak >= int(host_weight.weight_nbytes * 0.8)
+
+
+def test_backend_names_are_stable() -> None:
+    assert VALID_BACKENDS == ("asym_only", "asym_or_staged", "asym_or_torch", "torch_only")
