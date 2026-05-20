@@ -90,6 +90,7 @@ def _memory_probe(
     rank: int,
     alpha: float,
     backend: str,
+    asym_precision: str,
     device: torch.device,
     dtype: torch.dtype,
     seed: int,
@@ -104,7 +105,17 @@ def _memory_probe(
         model = TorchMLP(w1, w2, rank=rank, alpha=alpha, device=device, dtype=dtype)
     elif mode == "asym_cpu_resident":
         stats = AsymExecutionStats()
-        model = AsymMLP(w1, w2, rank=rank, alpha=alpha, backend=backend, stats=stats, device=device, dtype=dtype)
+        model = AsymMLP(
+            w1,
+            w2,
+            rank=rank,
+            alpha=alpha,
+            backend=backend,
+            stats=stats,
+            device=device,
+            dtype=dtype,
+            precision=asym_precision,
+        )
     else:
         raise ValueError(f"unknown memory probe mode: {mode}")
 
@@ -147,6 +158,7 @@ def _memory_probe(
 
     return {
         "mode": mode,
+        "asym_precision": asym_precision if mode == "asym_cpu_resident" else None,
         "model_hbm_bytes": max(0, model_hbm),
         "peak_hbm_bytes": max(0, peak_hbm),
         "cpu_model_bytes_after_build": model_cpu_accounted,
@@ -169,6 +181,7 @@ def _memory_comparison(
     rank: int,
     alpha: float,
     backend: str,
+    asym_precision: str,
     device: torch.device,
     dtype: torch.dtype,
     seed: int,
@@ -180,6 +193,7 @@ def _memory_comparison(
         rank=rank,
         alpha=alpha,
         backend=backend,
+        asym_precision=asym_precision,
         device=device,
         dtype=dtype,
         seed=seed + 101,
@@ -191,6 +205,7 @@ def _memory_comparison(
         rank=rank,
         alpha=alpha,
         backend=backend,
+        asym_precision=asym_precision,
         device=device,
         dtype=dtype,
         seed=seed + 101,
@@ -211,6 +226,7 @@ def _warm_memory_paths(
     rank: int,
     alpha: float,
     backend: str,
+    asym_precision: str,
     device: torch.device,
     dtype: torch.dtype,
     seed: int,
@@ -222,6 +238,7 @@ def _warm_memory_paths(
         rank=rank,
         alpha=alpha,
         backend=backend,
+        asym_precision=asym_precision,
         device=device,
         dtype=dtype,
         seed=seed + 17,
@@ -233,6 +250,7 @@ def _warm_memory_paths(
         rank=rank,
         alpha=alpha,
         backend=backend,
+        asym_precision=asym_precision,
         device=device,
         dtype=dtype,
         seed=seed + 17,
@@ -243,10 +261,12 @@ def _warm_memory_paths(
 def _run_demo_impl(
     *,
     backend: str = "asym_or_staged",
+    asym_precision: str = "bf16",
     report_path: Optional[Path] = None,
     seed: int = 0,
     device: Optional[str] = None,
 ) -> Dict[str, Any]:
+    asym_precision = str(asym_precision).lower()
     torch.manual_seed(seed)
     if torch.cuda.is_available() and device != "cpu":
         dev = torch.device("cuda")
@@ -255,7 +275,7 @@ def _run_demo_impl(
         dev = torch.device("cpu")
         dtype = torch.float32
         if backend == "asym_only":
-            raise RuntimeError("asym_only requires CUDA SM90/SM100 BF16 direct execution")
+            raise RuntimeError("asym_only requires CUDA SM90/SM100 direct execution")
 
     if dev.type == "cuda":
         torch.cuda.empty_cache()
@@ -280,6 +300,7 @@ def _run_demo_impl(
         rank=rank,
         alpha=alpha,
         backend=backend,
+        asym_precision=asym_precision,
         device=dev,
         dtype=dtype,
         seed=seed,
@@ -290,13 +311,24 @@ def _run_demo_impl(
         rank=rank,
         alpha=alpha,
         backend=backend,
+        asym_precision=asym_precision,
         device=dev,
         dtype=dtype,
         seed=seed,
     )
 
     stats = AsymExecutionStats()
-    asym_model = AsymMLP(w1, w2, rank=rank, alpha=alpha, backend=backend, stats=stats, device=dev, dtype=dtype)
+    asym_model = AsymMLP(
+        w1,
+        w2,
+        rank=rank,
+        alpha=alpha,
+        backend=backend,
+        stats=stats,
+        device=dev,
+        dtype=dtype,
+        precision=asym_precision,
+    )
     ref_model = TorchMLP(w1, w2, rank=rank, alpha=alpha, device=dev, dtype=dtype)
     _copy_lora(asym_model, ref_model)
 
@@ -334,6 +366,8 @@ def _run_demo_impl(
     report: Dict[str, Any] = {
         "seed": seed,
         "backend_requested": backend,
+        "asym_precision_requested": asym_precision,
+        "asym_precision_effective": asym_model.precision,
         "device": str(dev),
         "dtype": str(dtype),
         "dims": {
@@ -387,6 +421,7 @@ def _run_demo_impl(
 def run_demo(
     *,
     backend: str = "asym_or_staged",
+    asym_precision: str = "bf16",
     report_path: Optional[Path] = None,
     seed: int = 0,
     device: Optional[str] = None,
@@ -396,7 +431,13 @@ def run_demo(
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     try:
-        return _run_demo_impl(backend=backend, report_path=report_path, seed=seed, device=device)
+        return _run_demo_impl(
+            backend=backend,
+            asym_precision=asym_precision,
+            report_path=report_path,
+            seed=seed,
+            device=device,
+        )
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prior_matmul_tf32
         torch.backends.cudnn.allow_tf32 = prior_cudnn_tf32
@@ -405,6 +446,7 @@ def run_demo(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", default="asym_or_staged", choices=["asym_only", "asym_or_staged", "asym_or_torch", "torch_only"])
+    parser.add_argument("--asym-precision", default="bf16", choices=["bf16", "fp8", "fp4"])
     parser.add_argument("--report", default="reports/mlp_demo.json")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=["cuda", "cpu"], default=None)
@@ -412,6 +454,7 @@ def main() -> None:
 
     report = run_demo(
         backend=args.backend,
+        asym_precision=args.asym_precision,
         report_path=Path(args.report),
         seed=args.seed,
         device=args.device,

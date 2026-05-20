@@ -6,7 +6,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .frozen_linear import AsymExecutionStats, AsymFrozenLinear
+from .frozen_linear import AsymExecutionStats, AsymFrozenLinear, VALID_ASYM_PRECISIONS
 
 
 class AsymLoRALinear(nn.Module):
@@ -20,12 +20,23 @@ class AsymLoRALinear(nn.Module):
         stats: AsymExecutionStats,
         device: torch.device,
         dtype: torch.dtype,
+        precision: str = "bf16",
     ) -> None:
         super().__init__()
-        self.base = AsymFrozenLinear(weight, backend=backend, pin_memory=device.type == "cuda", stats=stats)
+        precision = str(precision).lower()
+        if precision not in VALID_ASYM_PRECISIONS:
+            raise ValueError(f"unsupported precision={precision!r}; expected one of {VALID_ASYM_PRECISIONS}")
+        self.base = AsymFrozenLinear(
+            weight,
+            backend=backend,
+            pin_memory=device.type == "cuda",
+            stats=stats,
+            precision=precision,
+        )
         self.lora_a = nn.Parameter(torch.randn(rank, weight.shape[1], device=device, dtype=torch.float32) * 0.01)
         self.lora_b = nn.Parameter(torch.randn(weight.shape[0], rank, device=device, dtype=torch.float32) * 0.01)
         self.scaling = alpha / rank
+        self.precision = precision
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base = self.base(x)
@@ -67,10 +78,31 @@ class AsymMLP(nn.Module):
         stats: AsymExecutionStats,
         device: torch.device,
         dtype: torch.dtype,
+        precision: str = "bf16",
     ) -> None:
         super().__init__()
-        self.fc1 = AsymLoRALinear(w1, rank=rank, alpha=alpha, backend=backend, stats=stats, device=device, dtype=dtype)
-        self.fc2 = AsymLoRALinear(w2, rank=rank, alpha=alpha, backend=backend, stats=stats, device=device, dtype=dtype)
+        precision = str(precision).lower()
+        self.fc1 = AsymLoRALinear(
+            w1,
+            rank=rank,
+            alpha=alpha,
+            backend=backend,
+            stats=stats,
+            device=device,
+            dtype=dtype,
+            precision=precision,
+        )
+        self.fc2 = AsymLoRALinear(
+            w2,
+            rank=rank,
+            alpha=alpha,
+            backend=backend,
+            stats=stats,
+            device=device,
+            dtype=dtype,
+            precision=precision,
+        )
+        self.precision = precision
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc2(F.relu(self.fc1(x)))

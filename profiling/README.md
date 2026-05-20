@@ -11,6 +11,8 @@ and are kept as `debug.md` / `debug.json`.
 | `mm_3b/` | Fundamental single 3.058B-parameter frozen matrix | Nsight GPU timeline/kernel/memcpy/no-kernel table |
 | `mlp_1b/` | Fundamental 1.073B-parameter two-layer MLP | Nsight GPU timeline/kernel/memcpy/no-kernel table |
 | `mlp_3b/` | Fundamental 2.999B-parameter two-layer MLP | Nsight GPU timeline/kernel/memcpy/no-kernel table |
+| `dense_3b/` | Custom dense 3B config-matched profile | Nsight GPU timeline/kernel/memcpy/no-kernel table |
+| `moe_3b/` | Custom active-3B MoE config-matched profile | Nsight GPU timeline/kernel/memcpy/no-kernel table |
 | `mlp/` | M4.1 MLP toy | Nsight GPU timeline/kernel/memcpy/no-kernel table |
 | `dense_llm/` | M4.2 dense LLM toy | Nsight GPU timeline/kernel/memcpy/no-kernel table |
 | `moe_contiguous/` | M4.3 MoE toy, contiguous routing | Nsight GPU timeline/kernel/memcpy/no-kernel table |
@@ -51,9 +53,9 @@ scripts/profile_lora_driver.sh --gpus 2,3,4,5,6,7
 ```
 
 The user-editable defaults live at the top of `scripts/profile_lora_driver.sh`.
-By default it runs workloads `mlp_1b mlp_3b mm_1b mm_3b mlp dense moe
-qwen3_14b qwen3_30b_a3b`, backends `asym_only torch_only`, profiler modes
-`source nsys cpu ncu`, and common LoRA settings `--profile-layers 1
+By default it runs workloads `mlp_1b mlp_3b mm_1b mm_3b dense_3b moe_3b mlp
+dense moe qwen3_14b qwen3_30b_a3b`, backends `asym_only torch_only`, profiler
+modes `nsys cpu ncu`, and common LoRA settings `--profile-layers 1
 --batch-size 32 --seq-len 64 --tokens 2048 --lora-rank 64 --lora-alpha 128`,
 with `--precision bf16 --workflow lora_sft --mode auto`.
 
@@ -98,8 +100,8 @@ Driver profiler modes:
 | `ncu` | Nsight Compute kernel-internal metrics | `profiling/<workload>/<stem>/table.md`, `profile.json`, `report.ncu-rep` |
 
 `ncu` is run only for `asym_only` and supported AsymGEMM workloads
-(`mm_1b`, `mm_3b`, `mlp_1b`, `mlp_3b`, `qwen3_14b`, `qwen3_30b_a3b`); unsupported
-combinations are recorded as skipped.
+(`mm_1b`, `mm_3b`, `mlp_1b`, `mlp_3b`, `dense_3b`, `moe_3b`, `qwen3_14b`,
+`qwen3_30b_a3b`); unsupported combinations are recorded as skipped.
 
 The fundamental NCU selectors are:
 

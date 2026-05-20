@@ -5,6 +5,7 @@ from .frozen_linear import (
     AsymFrozenLinearFunction,
     AsymGroupedFrozenLinear,
     AsymGroupedFrozenLinearFunction,
+    VALID_ASYM_PRECISIONS,
     VALID_BACKENDS,
     asym_frozen_linear,
     asym_grouped_frozen_linear,
@@ -23,7 +24,7 @@ from .mlp import (
     lora_parameters,
     optimizer_contains_only,
 )
-from .tiny_dense_llm import (
+from .dense import (
     MICRO_DENSE_LLM_CONFIG,
     SHOWCASE_DENSE_LLM_CONFIG,
     TinyDenseLLMBase,
@@ -31,7 +32,7 @@ from .tiny_dense_llm import (
     estimate_tiny_dense_llm_parameters,
     run_m3_report,
 )
-from .tiny_moe import (
+from .moe import (
     MICRO_MOE_CONFIG,
     SHOWCASE_MOE_CONFIG,
     TinyMoE,
@@ -73,6 +74,7 @@ __all__ = [
     "TinyMoEModel",
     "TorchLoRALinear",
     "TorchMLP",
+    "VALID_ASYM_PRECISIONS",
     "VALID_BACKENDS",
     "asym_frozen_linear",
     "asym_grouped_frozen_linear",

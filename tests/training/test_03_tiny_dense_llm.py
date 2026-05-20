@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-import asym_gemm.training.tiny_dense_llm as tiny_dense_llm
+import asym_gemm.training.dense as tiny_dense_llm
 
 TARGET_MODES = tiny_dense_llm.TARGET_MODES
 TinyDenseLLMConfig = tiny_dense_llm.TinyDenseLLMConfig

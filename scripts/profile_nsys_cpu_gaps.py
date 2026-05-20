@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
 from scripts.postprocess_nsys_cpu_gaps import markdown, summarize_cpu_gaps  # noqa: E402
 
 
-WORKLOADS = ["mlp", "dense", "moe", "matrix_1b", "mm_1b", "mm_3b", "mlp_1b", "mlp_3b", "qwen3_14b", "qwen3_30b_a3b"]
+WORKLOADS = ["mlp", "dense", "moe", "dense_3b", "moe_3b", "matrix_1b", "mm_1b", "mm_3b", "mlp_1b", "mlp_3b", "qwen3_14b", "qwen3_30b_a3b"]
 
 
 def main() -> None:
@@ -26,6 +26,7 @@ def main() -> None:
     parser.add_argument("--workload", choices=WORKLOADS, required=True)
     parser.add_argument("--device", default="cuda:2")
     parser.add_argument("--backend", default="asym_only")
+    parser.add_argument("--precision", default="bf16", choices=["bf16", "fp8", "fp4"])
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--measure-steps", type=int, default=1)
     parser.add_argument("--moe-mode", choices=["contiguous", "masked"], default="contiguous")
@@ -39,8 +40,8 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, default=Path("profiling"))
     parser.add_argument("--output-dir", type=Path, help="Exact output directory. Overrides --output-root/<workload>/cpu_gaps.")
     parser.add_argument("--nsys-bin", default="nsys")
-    parser.add_argument("--trace", default="cuda,nvtx,osrt")
-    parser.add_argument("--sample", default="cpu")
+    parser.add_argument("--trace", default="cuda,nvtx")
+    parser.add_argument("--sample", default="none")
     parser.add_argument(
         "--wait",
         choices=["primary", "all"],
@@ -50,7 +51,7 @@ def main() -> None:
     parser.add_argument(
         "--cpuctxsw",
         choices=["process-tree", "system-wide", "none"],
-        default="process-tree",
+        default="none",
         help="Nsight Systems context-switch scope. This Nsight install rejects --cpuctxsw=true.",
     )
     parser.add_argument("--extra-nsys-arg", action="append", default=[])
@@ -91,6 +92,8 @@ def main() -> None:
         args.device,
         "--backend",
         args.backend,
+        "--precision",
+        args.precision,
         "--warmup-steps",
         str(args.warmup_steps),
         "--measure-steps",

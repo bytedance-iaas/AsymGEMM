@@ -45,6 +45,8 @@ DEFAULT_LAUNCH_SKIP = {
     "matrix_1b": 2,
     "mlp_1b": 4,
     "mlp_3b": 4,
+    "dense_3b": 14,
+    "moe_3b": 0,
     "qwen3_14b": 14,
     "qwen3_30b_a3b": 0,
 }
@@ -56,6 +58,8 @@ DEFAULT_LAUNCH_COUNT = {
     "matrix_1b": 2,
     "mlp_1b": 4,
     "mlp_3b": 4,
+    "dense_3b": 14,
+    "moe_3b": 32,
     "qwen3_14b": 14,
     "qwen3_30b_a3b": 32,
 }

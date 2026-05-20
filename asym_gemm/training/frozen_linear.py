@@ -6,11 +6,16 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from torch import nn
 
+from asym_gemm.utils import per_block_cast_to_fp8, per_token_cast_to_fp8, per_token_cast_to_nvfp4_e4m3
+
 from .host_weight import HostWeight, tensor_nbytes
 from .profile_ranges import is_profile_enabled, prof_range
 
 
 VALID_BACKENDS = ("asym_only", "asym_or_staged", "asym_or_torch", "torch_only")
+VALID_ASYM_PRECISIONS = ("bf16", "fp8", "fp4")
+_FP8_RECIPE = (1, 128, 128)
+_FP4_RECIPE = (1, 1, 16)
 
 
 @dataclass(frozen=True)
@@ -52,9 +57,154 @@ class AsymExecutionStats:
         return data
 
 
+@dataclass(frozen=True)
+class QuantizedHostWeight:
+    precision: str
+    values: torch.Tensor
+    scales: torch.Tensor
+    logical_shape: tuple[int, ...]
+
+    @property
+    def num_groups(self) -> int:
+        return int(self.logical_shape[0]) if len(self.logical_shape) == 3 else 1
+
+    @property
+    def out_features(self) -> int:
+        return int(self.logical_shape[-2])
+
+    @property
+    def in_features(self) -> int:
+        return int(self.logical_shape[-1])
+
+    @property
+    def nbytes(self) -> int:
+        return tensor_nbytes(self.values) + tensor_nbytes(self.scales)
+
+    @property
+    def pinned_cpu_bytes(self) -> int:
+        total = 0
+        if self.values.device.type == "cpu" and self.values.is_pinned():
+            total += tensor_nbytes(self.values)
+        if self.scales.device.type == "cpu" and self.scales.is_pinned():
+            total += tensor_nbytes(self.scales)
+        return total
+
+
 def _check_backend(backend: str) -> None:
     if backend not in VALID_BACKENDS:
         raise ValueError(f"unsupported backend={backend!r}; expected one of {VALID_BACKENDS}")
+
+
+def _normalize_precision(precision: str) -> str:
+    normalized = str(precision).lower()
+    if normalized not in VALID_ASYM_PRECISIONS:
+        raise ValueError(f"unsupported precision={precision!r}; expected one of {VALID_ASYM_PRECISIONS}")
+    return normalized
+
+
+def _pin_cpu_tensor(tensor: torch.Tensor, *, pin_memory: bool) -> torch.Tensor:
+    out = tensor.detach()
+    if out.device.type != "cpu":
+        out = out.to(device="cpu", non_blocking=False)
+    if not out.is_contiguous():
+        out = out.contiguous()
+    if pin_memory and torch.cuda.is_available() and not out.is_pinned():
+        try:
+            out = out.pin_memory()
+        except RuntimeError:
+            pass
+    out.requires_grad_(False)
+    return out
+
+
+def _transpose_source_for_quantization(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dim() == 2:
+        return tensor.t().contiguous()
+    if tensor.dim() == 3:
+        return tensor.transpose(-1, -2).contiguous()
+    raise ValueError(f"cannot transpose host weight with shape {tuple(tensor.shape)}")
+
+
+def _quantize_host_weight_2d(weight: torch.Tensor, precision: str) -> tuple[torch.Tensor, torch.Tensor]:
+    source = weight.detach()
+    if source.device.type != "cpu":
+        source = source.to(device="cpu", non_blocking=False)
+    if not source.is_contiguous():
+        source = source.contiguous()
+    if source.dtype != torch.bfloat16:
+        source = source.to(dtype=torch.bfloat16)
+
+    if precision == "fp8":
+        return per_block_cast_to_fp8(source, use_ue8m0=True, gran_k=128)
+    if precision == "fp4":
+        return per_token_cast_to_nvfp4_e4m3(source, gran_k=16)
+    raise ValueError(f"cannot quantize host weight for precision={precision!r}")
+
+
+def _quantize_host_weight_tensor(
+    weight: torch.Tensor,
+    precision: str,
+    *,
+    pin_memory: bool,
+) -> QuantizedHostWeight:
+    if weight.dim() == 2:
+        values, scales = _quantize_host_weight_2d(weight, precision)
+    elif weight.dim() == 3:
+        values_list: list[torch.Tensor] = []
+        scales_list: list[torch.Tensor] = []
+        for group in range(int(weight.shape[0])):
+            group_values, group_scales = _quantize_host_weight_2d(weight[group], precision)
+            values_list.append(group_values)
+            scales_list.append(group_scales)
+        values = torch.stack(values_list, dim=0).contiguous()
+        scales = torch.stack(scales_list, dim=0).contiguous()
+    else:
+        raise ValueError(f"quantized host weight expects 2D or 3D tensor, got {tuple(weight.shape)}")
+
+    return QuantizedHostWeight(
+        precision=precision,
+        values=_pin_cpu_tensor(values, pin_memory=pin_memory),
+        scales=_pin_cpu_tensor(scales, pin_memory=pin_memory),
+        logical_shape=tuple(int(dim) for dim in weight.shape),
+    )
+
+
+def _get_quantized_host_weight(
+    host_weight: HostWeight,
+    precision: str,
+    *,
+    transpose: bool = False,
+) -> Optional[QuantizedHostWeight]:
+    precision = _normalize_precision(precision)
+    if precision == "bf16":
+        return None
+
+    cache = getattr(host_weight, "_asym_quantized_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(host_weight, "_asym_quantized_cache", cache)
+    key = (precision, bool(transpose))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
+    source = _transpose_source_for_quantization(host_weight.weight) if transpose else host_weight.weight
+    if precision == "fp4" and int(source.shape[-1]) % 2 != 0:
+        return None
+    quantized = _quantize_host_weight_tensor(source, precision, pin_memory=host_weight.is_pinned)
+    cache[key] = quantized
+    return quantized
+
+
+def _quantized_cache_pinned_bytes(host_weight: HostWeight, precision: str) -> int:
+    cache = getattr(host_weight, "_asym_quantized_cache", None)
+    if not cache:
+        return 0
+    return sum(
+        int(qweight.pinned_cpu_bytes)
+        for (cached_precision, _), qweight in cache.items()
+        if cached_precision == precision
+    )
 
 
 def _arch_major(device: torch.device) -> Optional[int]:
@@ -137,6 +287,79 @@ def _direct_grouped_bf16_reason(a: torch.Tensor, b_cpu: torch.Tensor, *, transpo
 
     if not hasattr(asym_gemm, "m_grouped_bf16_asym_gemm_nt_contiguous"):
         return "missing_bf16_asym_binding"
+    return None
+
+
+def _direct_quantized_reason(
+    a: torch.Tensor,
+    qweight: Optional[QuantizedHostWeight],
+    *,
+    precision: str,
+    grouped: bool = False,
+) -> Optional[str]:
+    precision = _normalize_precision(precision)
+    if precision == "bf16":
+        return "requires_quantized_precision"
+    if qweight is None:
+        return "requires_quantized_host_weight"
+    if qweight.precision != precision:
+        return "quantized_precision_mismatch"
+    if not torch.cuda.is_available():
+        return "cuda_unavailable"
+    if a.device.type != "cuda":
+        return "input_not_cuda"
+    arch = _arch_major(a.device)
+    if precision == "fp8" and arch not in {9, 10}:
+        return "requires_sm90_or_sm100_for_fp8"
+    if precision == "fp4" and arch != 10:
+        return "requires_sm100_for_fp4"
+    if a.dim() != 2:
+        return "requires_2d_input"
+    expected_weight_dim = 3 if grouped else 2
+    if len(qweight.logical_shape) != expected_weight_dim or qweight.values.dim() != expected_weight_dim:
+        return "requires_3d_quantized_weight" if grouped else "requires_2d_quantized_weight"
+    if a.dtype != torch.bfloat16:
+        return "requires_bf16_input"
+    if not a.is_contiguous() or not qweight.values.is_contiguous() or not qweight.scales.is_contiguous():
+        return "requires_contiguous"
+    if qweight.values.device.type != "cpu" or qweight.scales.device.type != "cpu":
+        return "quantized_weight_not_cpu"
+    if not qweight.values.is_pinned() or not qweight.scales.is_pinned():
+        return "quantized_weight_not_pinned"
+
+    groups = int(qweight.logical_shape[0]) if grouped else 1
+    n = int(qweight.logical_shape[-2])
+    k = int(qweight.logical_shape[-1])
+    if groups <= 0:
+        return "requires_positive_groups"
+    if n <= 0 or k <= 0:
+        return "requires_positive_nk"
+    if int(a.shape[1]) != k:
+        return "shape_mismatch"
+    if n % 128 != 0 or k % 128 != 0:
+        return "requires_128_aligned_nk"
+
+    if precision == "fp8":
+        if qweight.values.dtype != torch.float8_e4m3fn:
+            return "requires_fp8_quantized_values"
+        if tuple(qweight.values.shape) != qweight.logical_shape:
+            return "quantized_shape_mismatch"
+        import asym_gemm
+
+        if not hasattr(asym_gemm, "m_grouped_fp8_asym_gemm_nt_contiguous"):
+            return "missing_fp8_asym_binding"
+    elif precision == "fp4":
+        if k % 2 != 0:
+            return "requires_even_k_for_fp4"
+        if qweight.values.dtype != torch.uint8 or qweight.scales.dtype != torch.float8_e4m3fn:
+            return "requires_fp4_quantized_values"
+        expected_values_shape = (*qweight.logical_shape[:-1], k // 2)
+        if tuple(qweight.values.shape) != expected_values_shape:
+            return "quantized_shape_mismatch"
+        import asym_gemm
+
+        if not hasattr(asym_gemm, "m_grouped_fp4_asym_gemm_nt_contiguous"):
+            return "missing_fp4_asym_binding"
     return None
 
 
@@ -275,6 +498,131 @@ def _asym_grouped_bf16_nt(
     return d.to(dtype=torch.bfloat16)
 
 
+def _quantize_activation_for_precision(
+    a: torch.Tensor,
+    *,
+    precision: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if precision == "fp8":
+        return per_token_cast_to_fp8(a, use_ue8m0=True, gran_k=128)
+    if precision == "fp4":
+        return per_token_cast_to_nvfp4_e4m3(a, gran_k=16)
+    raise ValueError(f"unsupported quantized activation precision={precision!r}")
+
+
+def _quantized_output_dtype(a: torch.Tensor, *, precision: str) -> torch.dtype:
+    if precision == "fp8" and _arch_major(a.device) == 9:
+        return torch.float32
+    return torch.bfloat16
+
+
+def _asym_quantized_nt(
+    a: torch.Tensor,
+    qweight: QuantizedHostWeight,
+    *,
+    precision: str,
+    compiled_dims: str = "mnk",
+) -> torch.Tensor:
+    import asym_gemm
+
+    reason = _direct_quantized_reason(a, qweight, precision=precision, grouped=False)
+    if reason is not None:
+        raise RuntimeError(f"direct {precision.upper()} AsymGEMM is unavailable: {reason}")
+
+    m = int(a.shape[0])
+    n = int(qweight.out_features)
+    a_quantized = _quantize_activation_for_precision(a, precision=precision)
+    b_group = (qweight.values.unsqueeze(0), qweight.scales.unsqueeze(0))
+    d = torch.empty((m, n), device=a.device, dtype=_quantized_output_dtype(a, precision=precision))
+    offsets = torch.tensor([0, m], device=a.device, dtype=torch.int32)
+    experts = torch.tensor([0, -1], device=a.device, dtype=torch.int32)
+
+    if precision == "fp8":
+        asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(
+            a_quantized,
+            b_group,
+            d,
+            offsets,
+            experts,
+            2,
+            recipe=_FP8_RECIPE,
+            compiled_dims=compiled_dims,
+            disable_ue8m0_cast=False,
+        )
+    elif precision == "fp4":
+        asym_gemm.m_grouped_fp4_asym_gemm_nt_contiguous(
+            a_quantized,
+            b_group,
+            d,
+            offsets,
+            experts,
+            2,
+            recipe=_FP4_RECIPE,
+            compiled_dims=compiled_dims,
+            disable_ue8m0_cast=True,
+        )
+    else:
+        raise ValueError(f"unsupported quantized precision={precision!r}")
+    return d.to(dtype=torch.bfloat16)
+
+
+def _asym_grouped_quantized_nt(
+    a: torch.Tensor,
+    qweight: QuantizedHostWeight,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    *,
+    precision: str,
+    compiled_dims: str = "mnk",
+) -> torch.Tensor:
+    import asym_gemm
+
+    reason = _direct_quantized_reason(a, qweight, precision=precision, grouped=True)
+    if reason is not None:
+        raise RuntimeError(f"direct grouped {precision.upper()} AsymGEMM is unavailable: {reason}")
+
+    m = int(a.shape[0])
+    n = int(qweight.out_features)
+    a_kernel, offsets_kernel, unpad = _pad_grouped_input_for_asym(a, offsets, experts)
+    a_quantized = _quantize_activation_for_precision(a_kernel, precision=precision)
+    d = torch.empty(
+        (int(a_kernel.shape[0]), n),
+        device=a.device,
+        dtype=_quantized_output_dtype(a, precision=precision),
+    )
+    offsets_i32, experts_i32, list_size = _group_metadata_tensors(offsets_kernel, experts, device=a.device)
+
+    if precision == "fp8":
+        asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(
+            a_quantized,
+            (qweight.values, qweight.scales),
+            d,
+            offsets_i32,
+            experts_i32,
+            list_size,
+            recipe=_FP8_RECIPE,
+            compiled_dims=compiled_dims,
+            disable_ue8m0_cast=False,
+        )
+    elif precision == "fp4":
+        asym_gemm.m_grouped_fp4_asym_gemm_nt_contiguous(
+            a_quantized,
+            (qweight.values, qweight.scales),
+            d,
+            offsets_i32,
+            experts_i32,
+            list_size,
+            recipe=_FP4_RECIPE,
+            compiled_dims=compiled_dims,
+            disable_ue8m0_cast=True,
+        )
+    else:
+        raise ValueError(f"unsupported grouped quantized precision={precision!r}")
+
+    d = _unpad_grouped_output(d, unpad, output_m=m)
+    return d.to(dtype=torch.bfloat16)
+
+
 def _staged_nt(a: torch.Tensor, b_cpu: torch.Tensor, *, transpose_b: bool = False) -> torch.Tensor:
     b = b_cpu.to(device=a.device, dtype=a.dtype, non_blocking=b_cpu.is_pinned())
     return a @ b if transpose_b else a @ b.t()
@@ -357,15 +705,31 @@ def _dispatch_nt(
     phase: str,
     compiled_dims: str,
     transpose_b: bool = False,
+    precision: str = "bf16",
+    quantized_weight: Optional[QuantizedHostWeight] = None,
     profile_label: str = "",
 ) -> torch.Tensor:
     _check_backend(backend)
+    precision = _normalize_precision(precision)
 
     if backend != "torch_only":
-        reason = _direct_bf16_reason(a, b_cpu, transpose_b=transpose_b)
+        reason = (
+            _direct_bf16_reason(a, b_cpu, transpose_b=transpose_b)
+            if precision == "bf16"
+            else _direct_quantized_reason(a, quantized_weight, precision=precision, grouped=False)
+        )
         if reason is None:
             try:
-                out = _asym_bf16_nt(a, b_cpu, compiled_dims=compiled_dims, transpose_b=transpose_b)
+                if precision == "bf16":
+                    out = _asym_bf16_nt(a, b_cpu, compiled_dims=compiled_dims, transpose_b=transpose_b)
+                else:
+                    assert quantized_weight is not None
+                    out = _asym_quantized_nt(
+                        a,
+                        quantized_weight,
+                        precision=precision,
+                        compiled_dims=compiled_dims,
+                    )
                 if stats is not None:
                     if phase == "forward":
                         stats.asym_forward_calls += 1
@@ -379,7 +743,7 @@ def _dispatch_nt(
         if stats is not None:
             stats.record_fallback(f"{phase}:{reason}")
         if backend == "asym_only":
-            raise RuntimeError(f"direct BF16 AsymGEMM is unavailable: {reason}")
+            raise RuntimeError(f"direct {precision.upper()} AsymGEMM is unavailable: {reason}")
 
     if backend == "asym_or_staged":
         if stats is not None:
@@ -408,21 +772,39 @@ def _dispatch_grouped_nt(
     phase: str,
     compiled_dims: str,
     transpose_b: bool = False,
+    precision: str = "bf16",
+    quantized_weight: Optional[QuantizedHostWeight] = None,
 ) -> torch.Tensor:
     _check_backend(backend)
+    precision = _normalize_precision(precision)
 
     if backend != "torch_only":
-        reason = _direct_grouped_bf16_reason(a, b_cpu, transpose_b=transpose_b)
+        reason = (
+            _direct_grouped_bf16_reason(a, b_cpu, transpose_b=transpose_b)
+            if precision == "bf16"
+            else _direct_quantized_reason(a, quantized_weight, precision=precision, grouped=True)
+        )
         if reason is None:
             try:
-                out = _asym_grouped_bf16_nt(
-                    a,
-                    b_cpu,
-                    offsets,
-                    experts,
-                    compiled_dims=compiled_dims,
-                    transpose_b=transpose_b,
-                )
+                if precision == "bf16":
+                    out = _asym_grouped_bf16_nt(
+                        a,
+                        b_cpu,
+                        offsets,
+                        experts,
+                        compiled_dims=compiled_dims,
+                        transpose_b=transpose_b,
+                    )
+                else:
+                    assert quantized_weight is not None
+                    out = _asym_grouped_quantized_nt(
+                        a,
+                        quantized_weight,
+                        offsets,
+                        experts,
+                        precision=precision,
+                        compiled_dims=compiled_dims,
+                    )
                 if stats is not None:
                     if phase == "forward":
                         stats.asym_forward_calls += 1
@@ -436,7 +818,7 @@ def _dispatch_grouped_nt(
         if stats is not None:
             stats.record_fallback(f"{phase}:{reason}")
         if backend == "asym_only":
-            raise RuntimeError(f"direct grouped BF16 AsymGEMM is unavailable: {reason}")
+            raise RuntimeError(f"direct grouped {precision.upper()} AsymGEMM is unavailable: {reason}")
 
     if backend == "asym_or_staged":
         if stats is not None:
@@ -465,7 +847,10 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
         stats: Optional[AsymExecutionStats],
         compiled_dims: str,
         profile_name: str,
+        precision: str,
+        quantized_weight: Optional[QuantizedHostWeight],
     ) -> torch.Tensor:
+        precision = _normalize_precision(precision)
         if x.shape[-1] != host_weight.in_features:
             raise ValueError(f"expected input last dim {host_weight.in_features}, got {x.shape[-1]}")
         input_shape = tuple(x.shape)
@@ -480,6 +865,8 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
                 stats=stats,
                 phase="forward",
                 compiled_dims=compiled_dims,
+                precision=precision,
+                quantized_weight=quantized_weight,
                 profile_label=forward_range,
             )
         if bias is not None:
@@ -489,6 +876,7 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
         ctx.backend = backend
         ctx.stats = stats
         ctx.compiled_dims = compiled_dims
+        ctx.precision = precision
         ctx.profile_backward_range = backward_range
         ctx.profile_enabled = is_profile_enabled()
         ctx.has_bias = bias is not None
@@ -498,10 +886,18 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
         return y.reshape(*input_shape[:-1], host_weight.out_features)
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[Optional[torch.Tensor], None, Optional[torch.Tensor], None, None, None, None]:
+    def backward(
+        ctx: Any,
+        grad_output: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], None, Optional[torch.Tensor], None, None, None, None, None, None]:
         grad_x = None
         if ctx.needs_input_grad[0]:
             grad_output_2d = grad_output.reshape(-1, ctx.host_weight.out_features).contiguous()
+            quantized_weight_t = (
+                _get_quantized_host_weight(ctx.host_weight, ctx.precision, transpose=True)
+                if ctx.backend != "torch_only" and ctx.precision != "bf16"
+                else None
+            )
             with prof_range(ctx.profile_backward_range, enabled=ctx.profile_enabled):
                 grad_x = _dispatch_nt(
                     grad_output_2d,
@@ -511,6 +907,8 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
                     phase="dx",
                     compiled_dims=ctx.compiled_dims,
                     transpose_b=True,
+                    precision=ctx.precision,
+                    quantized_weight=quantized_weight_t,
                     profile_label=ctx.profile_backward_range,
                 )
             grad_x = grad_x.reshape(ctx.input_shape)
@@ -522,7 +920,7 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
                 .sum(dim=0)
                 .to(device=ctx.bias_device, dtype=ctx.bias_dtype)
             )
-        return grad_x, None, grad_bias, None, None, None, None
+        return grad_x, None, grad_bias, None, None, None, None, None, None
 
 
 def asym_frozen_linear(
@@ -534,8 +932,25 @@ def asym_frozen_linear(
     stats: Optional[AsymExecutionStats] = None,
     compiled_dims: str = "mnk",
     profile_name: str = "",
+    precision: str = "bf16",
 ) -> torch.Tensor:
-    return AsymFrozenLinearFunction.apply(x, host_weight, bias, backend, stats, compiled_dims, profile_name)
+    precision = _normalize_precision(precision)
+    quantized_weight = (
+        _get_quantized_host_weight(host_weight, precision, transpose=False)
+        if backend != "torch_only" and precision != "bf16"
+        else None
+    )
+    return AsymFrozenLinearFunction.apply(
+        x,
+        host_weight,
+        bias,
+        backend,
+        stats,
+        compiled_dims,
+        profile_name,
+        precision,
+        quantized_weight,
+    )
 
 
 def frozen_linear(
@@ -547,6 +962,7 @@ def frozen_linear(
     stats: Optional[AsymExecutionStats] = None,
     compiled_dims: str = "mnk",
     profile_name: str = "",
+    precision: str = "bf16",
 ) -> torch.Tensor:
     return asym_frozen_linear(
         x,
@@ -556,6 +972,7 @@ def frozen_linear(
         stats=stats,
         compiled_dims=compiled_dims,
         profile_name=profile_name,
+        precision=precision,
     )
 
 
@@ -571,7 +988,10 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
         stats: Optional[AsymExecutionStats],
         compiled_dims: str,
         profile_name: str,
+        precision: str,
+        quantized_weight: Optional[QuantizedHostWeight],
     ) -> torch.Tensor:
+        precision = _normalize_precision(precision)
         if host_weight.weight.dim() != 3:
             raise ValueError(f"grouped host weight must be 3D, got shape {tuple(host_weight.weight.shape)}")
         if x.shape[-1] != int(host_weight.weight.shape[2]):
@@ -591,6 +1011,8 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
                 stats=stats,
                 phase="forward",
                 compiled_dims=compiled_dims,
+                precision=precision,
+                quantized_weight=quantized_weight,
             )
 
         ctx.host_weight = host_weight
@@ -599,6 +1021,7 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
         ctx.backend = backend
         ctx.stats = stats
         ctx.compiled_dims = compiled_dims
+        ctx.precision = precision
         ctx.profile_backward_range = backward_range
         ctx.profile_enabled = is_profile_enabled()
         ctx.input_shape = input_shape
@@ -608,24 +1031,38 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
     def backward(
         ctx: Any,
         grad_output: torch.Tensor,
-    ) -> Tuple[Optional[torch.Tensor], None, None, None, None, None, None, None]:
+    ) -> Tuple[Optional[torch.Tensor], None, None, None, None, None, None, None, None, None]:
         grad_x = None
         if ctx.needs_input_grad[0]:
             grad_output_2d = grad_output.reshape(-1, int(ctx.host_weight.weight.shape[1])).contiguous()
-            weight_t = ctx.host_weight.transposed_tensor()
+            if ctx.precision == "bf16":
+                b_cpu = ctx.host_weight.transposed_tensor()
+                transpose_b = False
+                quantized_weight_t = None
+            else:
+                b_cpu = ctx.host_weight.weight
+                transpose_b = True
+                quantized_weight_t = (
+                    _get_quantized_host_weight(ctx.host_weight, ctx.precision, transpose=True)
+                    if ctx.backend != "torch_only"
+                    else None
+                )
             with prof_range(ctx.profile_backward_range, enabled=ctx.profile_enabled):
                 grad_x = _dispatch_grouped_nt(
                     grad_output_2d,
-                    weight_t,
+                    b_cpu,
                     ctx.offsets,
                     ctx.experts,
                     backend=ctx.backend,
                     stats=ctx.stats,
                     phase="dx",
                     compiled_dims=ctx.compiled_dims,
+                    transpose_b=transpose_b,
+                    precision=ctx.precision,
+                    quantized_weight=quantized_weight_t,
                 )
             grad_x = grad_x.reshape(ctx.input_shape)
-        return grad_x, None, None, None, None, None, None, None
+        return grad_x, None, None, None, None, None, None, None, None, None
 
 
 def asym_grouped_frozen_linear(
@@ -638,7 +1075,14 @@ def asym_grouped_frozen_linear(
     stats: Optional[AsymExecutionStats] = None,
     compiled_dims: str = "mnk",
     profile_name: str = "",
+    precision: str = "bf16",
 ) -> torch.Tensor:
+    precision = _normalize_precision(precision)
+    quantized_weight = (
+        _get_quantized_host_weight(host_weight, precision, transpose=False)
+        if backend != "torch_only" and precision != "bf16"
+        else None
+    )
     return AsymGroupedFrozenLinearFunction.apply(
         x,
         host_weight,
@@ -648,6 +1092,8 @@ def asym_grouped_frozen_linear(
         stats,
         compiled_dims,
         profile_name,
+        precision,
+        quantized_weight,
     )
 
 
@@ -660,6 +1106,7 @@ class AsymGroupedFrozenLinear(nn.Module):
         pin_memory: bool = True,
         stats: Optional[AsymExecutionStats] = None,
         compiled_dims: str = "mnk",
+        precision: str = "bf16",
     ) -> None:
         super().__init__()
         if not isinstance(weight, torch.Tensor):
@@ -667,10 +1114,12 @@ class AsymGroupedFrozenLinear(nn.Module):
         if weight.dim() != 3:
             raise ValueError(f"AsymGroupedFrozenLinear expects [groups, out, in], got {tuple(weight.shape)}")
         _check_backend(backend)
+        precision = _normalize_precision(precision)
         self.host_weight = HostWeight(weight, pin_memory=pin_memory, clone=True, require_2d=False)
         self.backend = backend
         self.stats = stats if stats is not None else AsymExecutionStats()
         self.compiled_dims = compiled_dims
+        self.precision = precision
         self.profile_name = ""
         self.num_groups = int(self.host_weight.weight.shape[0])
         self.out_features = int(self.host_weight.weight.shape[1])
@@ -678,7 +1127,7 @@ class AsymGroupedFrozenLinear(nn.Module):
 
     @property
     def pinned_cpu_bytes(self) -> int:
-        return self.host_weight.pinned_cpu_bytes
+        return self.host_weight.pinned_cpu_bytes + _quantized_cache_pinned_bytes(self.host_weight, self.precision)
 
     @property
     def weight_hbm_saved_bytes(self) -> int:
@@ -698,6 +1147,7 @@ class AsymGroupedFrozenLinear(nn.Module):
             stats=self.stats,
             compiled_dims=self.compiled_dims,
             profile_name=self.profile_name,
+            precision=self.precision,
         )
 
     def _save_to_state_dict(self, destination: Dict[str, torch.Tensor], prefix: str, keep_vars: bool) -> None:
@@ -746,7 +1196,7 @@ class AsymGroupedFrozenLinear(nn.Module):
         return (
             f"num_groups={self.num_groups}, in_features={self.in_features}, "
             f"out_features={self.out_features}, backend={self.backend}, "
-            f"pinned={self.host_weight.metadata.pinned}"
+            f"precision={self.precision}, pinned={self.host_weight.metadata.pinned}"
         )
 
 
@@ -769,6 +1219,7 @@ class AsymFrozenLinear(nn.Module):
         pin_memory: bool = True,
         stats: Optional[AsymExecutionStats] = None,
         compiled_dims: str = "mnk",
+        precision: str = "bf16",
     ) -> None:
         super().__init__()
         if len(args) == 1:
@@ -784,6 +1235,7 @@ class AsymFrozenLinear(nn.Module):
         if not isinstance(weight, torch.Tensor):
             raise TypeError(f"weight must be a torch.Tensor, got {type(weight)!r}")
         _check_backend(backend)
+        precision = _normalize_precision(precision)
         self.host_weight = HostWeight.from_tensor(weight, dtype=weight.dtype, pin_memory=pin_memory)
         self.bias_cpu = None if bias is None else bias.detach().to("cpu", dtype=weight.dtype).contiguous()
         if self.bias_cpu is not None and pin_memory:
@@ -794,6 +1246,7 @@ class AsymFrozenLinear(nn.Module):
         self.backend = backend
         self.stats = stats if stats is not None else AsymExecutionStats()
         self.compiled_dims = compiled_dims
+        self.precision = precision
         self.profile_name = ""
         self.in_features = self.host_weight.in_features
         self.out_features = self.host_weight.out_features
@@ -807,6 +1260,7 @@ class AsymFrozenLinear(nn.Module):
         pin_memory: bool = True,
         stats: Optional[AsymExecutionStats] = None,
         compiled_dims: str = "mnk",
+        precision: str = "bf16",
     ) -> "AsymFrozenLinear":
         return cls(
             linear.weight.detach(),
@@ -815,6 +1269,7 @@ class AsymFrozenLinear(nn.Module):
             pin_memory=pin_memory,
             stats=stats,
             compiled_dims=compiled_dims,
+            precision=precision,
         )
 
     @classmethod
@@ -826,6 +1281,7 @@ class AsymFrozenLinear(nn.Module):
         pin_memory: bool = True,
         stats: Optional[AsymExecutionStats] = None,
         compiled_dims: str = "mnk",
+        precision: str = "bf16",
     ) -> "AsymFrozenLinear":
         return cls.from_gpu_linear(
             linear,
@@ -833,11 +1289,12 @@ class AsymFrozenLinear(nn.Module):
             pin_memory=pin_memory,
             stats=stats,
             compiled_dims=compiled_dims,
+            precision=precision,
         )
 
     @property
     def pinned_cpu_bytes(self) -> int:
-        total = self.host_weight.pinned_cpu_bytes
+        total = self.host_weight.pinned_cpu_bytes + _quantized_cache_pinned_bytes(self.host_weight, self.precision)
         if self.bias_cpu is not None and self.bias_cpu.is_pinned():
             total += tensor_nbytes(self.bias_cpu)
         return total
@@ -863,6 +1320,7 @@ class AsymFrozenLinear(nn.Module):
             stats=self.stats,
             compiled_dims=self.compiled_dims,
             profile_name=self.profile_name,
+            precision=self.precision,
         )
 
     def _save_to_state_dict(self, destination: Dict[str, torch.Tensor], prefix: str, keep_vars: bool) -> None:
@@ -931,7 +1389,7 @@ class AsymFrozenLinear(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"backend={self.backend}, pinned={self.host_weight.metadata.pinned}"
+            f"backend={self.backend}, precision={self.precision}, pinned={self.host_weight.metadata.pinned}"
         )
 
 

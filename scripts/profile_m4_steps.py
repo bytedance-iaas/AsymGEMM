@@ -926,7 +926,7 @@ def _layer_prefix_from_module_name(name: str) -> str:
 
 
 def patch_dense_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
-    import asym_gemm.training.tiny_dense_llm as dense
+    import asym_gemm.training.dense as dense
 
     originals: list[tuple[Any, str, Any]] = []
 
@@ -1144,7 +1144,7 @@ def dense_backward_prefixes(num_layers: int) -> list[str]:
 
 def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
     from asym_gemm.training.frozen_linear import AsymExecutionStats
-    from asym_gemm.training.tiny_dense_llm import AsymTinyDenseLLM, MICRO_DENSE_LLM_CONFIG, make_inputs, make_tiny_dense_weights
+    from asym_gemm.training.dense import AsymTinyDenseLLM, MICRO_DENSE_LLM_CONFIG, make_inputs, make_tiny_dense_weights
 
     clear(device)
     config = getattr(args, "_dense_config_override", MICRO_DENSE_LLM_CONFIG)
@@ -1189,7 +1189,7 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
 
 
 def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
-    import asym_gemm.training.tiny_moe as moe
+    import asym_gemm.training.moe as moe
 
     originals: list[tuple[Any, str, Any]] = []
 
@@ -1451,7 +1451,7 @@ def moe_backward_prefixes(config: Any) -> list[str]:
 
 
 def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
-    from asym_gemm.training.tiny_moe import MICRO_MOE_CONFIG, make_static_routes, make_tiny_moe_pair
+    from asym_gemm.training.moe import MICRO_MOE_CONFIG, make_static_routes, make_tiny_moe_pair
 
     clear(device)
     config = getattr(args, "_moe_config_override", MICRO_MOE_CONFIG)
@@ -1716,7 +1716,7 @@ def profiler_backward_table(prof: Any, *, profiled_steps: int) -> dict[str, Any]
 
 
 def qwen3_14b_dense_config(args: argparse.Namespace) -> Any:
-    from asym_gemm.training.tiny_dense_llm import TinyDenseLLMConfig
+    from asym_gemm.training.dense import TinyDenseLLMConfig
 
     full = QWEN3_14B_CONFIG
     return TinyDenseLLMConfig(
@@ -1733,7 +1733,7 @@ def qwen3_14b_dense_config(args: argparse.Namespace) -> Any:
 
 
 def qwen3_30b_a3b_moe_config(args: argparse.Namespace) -> Any:
-    from asym_gemm.training.tiny_moe import TinyMoEConfig
+    from asym_gemm.training.moe import TinyMoEConfig
 
     full = QWEN3_30B_A3B_CONFIG
     return TinyMoEConfig(

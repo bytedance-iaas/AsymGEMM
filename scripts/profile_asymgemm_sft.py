@@ -920,7 +920,17 @@ def profile_mlp(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         w2 = torch.randn(out_features, hidden, dtype=dtype)
     with _host_weight_profile(deep):
         with deep.time("setup.model_and_host_weights"):
-            model = AsymMLP(w1, w2, rank=rank, alpha=16.0, backend=args.backend, stats=stats, device=device, dtype=dtype)
+            model = AsymMLP(
+                w1,
+                w2,
+                rank=rank,
+                alpha=16.0,
+                backend=args.backend,
+                stats=stats,
+                device=device,
+                dtype=dtype,
+                precision=args.asym_precision,
+            )
     with deep.time("setup.optimizer"):
         optimizer = torch.optim.AdamW(lora_parameters(model), lr=1e-2)
     _sync(device)
@@ -986,7 +996,16 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
         weights = make_tiny_dense_weights(config, seed=1, dtype=dtype)
     with _host_weight_profile(deep):
         with deep.time("setup.model_and_host_weights"):
-            model = AsymTinyDenseLLM(weights, config=config, target_mode="all", backend=args.backend, device=device, dtype=dtype, lora_seed=2)
+            model = AsymTinyDenseLLM(
+                weights,
+                config=config,
+                target_mode="all",
+                backend=args.backend,
+                device=device,
+                dtype=dtype,
+                lora_seed=2,
+                precision=args.asym_precision,
+            )
     with deep.time("setup.optimizer"):
         optimizer = torch.optim.AdamW(model.lora_parameters(), lr=3e-3)
     _sync(device)
@@ -1045,7 +1064,15 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
     config = MICRO_MOE_CONFIG
     with _host_weight_profile(deep):
         with deep.time("setup.model_pair_and_host_weights"):
-            model, _, _, _ = make_tiny_moe_pair(config=config, seed=3, device=device, base_dtype=dtype, backend=args.backend, pin_memory=device.type == "cuda")
+            model, _, _, _ = make_tiny_moe_pair(
+                config=config,
+                seed=3,
+                device=device,
+                base_dtype=dtype,
+                backend=args.backend,
+                pin_memory=device.type == "cuda",
+                precision=args.asym_precision,
+            )
     with deep.time("setup.optimizer"):
         optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3, weight_decay=0.0)
     with deep.time("setup.static_routes"):
@@ -1244,7 +1271,16 @@ def profile_qwen_dense(
         weights = make_tiny_dense_weights(profile_config, seed=11, dtype=dtype)
     with _host_weight_profile(deep):
         with deep.time("setup.model_and_host_weights"):
-            model = AsymTinyDenseLLM(weights, config=profile_config, target_mode="all", backend=args.backend, device=device, dtype=dtype, lora_seed=12)
+            model = AsymTinyDenseLLM(
+                weights,
+                config=profile_config,
+                target_mode="all",
+                backend=args.backend,
+                device=device,
+                dtype=dtype,
+                lora_seed=12,
+                precision=args.asym_precision,
+            )
     with deep.time("setup.optimizer"):
         optimizer = torch.optim.AdamW(model.lora_parameters(), lr=3e-4)
     _sync(device)
@@ -1317,6 +1353,7 @@ def profile_qwen_moe(
                 base_dtype=dtype,
                 backend=args.backend,
                 pin_memory=device.type == "cuda",
+                precision=args.asym_precision,
             )
     with deep.time("setup.optimizer"):
         optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.0)
@@ -1468,6 +1505,8 @@ def _final_report(
         "device": str(device),
         "dtype": str(dtype),
         "backend": args.backend,
+        "asym_precision_requested": args.asym_precision,
+        "asym_precision_effective": str(getattr(model, "precision", "bf16")),
         "warmup_steps": args.warmup_steps,
         "measured_steps": args.measure_steps,
         "measure_steps": args.measure_steps,
@@ -1568,6 +1607,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="cuda:1")
     parser.add_argument("--backend", choices=["asym_only", "asym_or_staged", "asym_or_torch", "torch_only"], default="asym_only")
+    parser.add_argument("--asym-precision", default="bf16", choices=["bf16", "fp8", "fp4"])
     parser.add_argument("--warmup-steps", "--warmup", dest="warmup_steps", type=int, default=10)
     parser.add_argument("--measure-steps", "--measured-steps", "--measured", dest="measure_steps", type=int, default=50)
     parser.add_argument("--profile-layers", "--real-profile-layers", dest="real_profile_layers", metavar="N", type=int, default=1)

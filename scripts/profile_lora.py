@@ -63,6 +63,32 @@ QWEN3_30B_A3B_CONFIG = {
 }
 
 
+CUSTOM_DENSE_3B_CONFIG = {
+    "hf_model_id": "custom/dense-3b",
+    "hf_model_type": "dense_3b",
+    "hf_num_hidden_layers": 36,
+    "hidden_size": 2048,
+    "intermediate_size": 11008,
+    "num_attention_heads": 16,
+    "vocab_size": 151936,
+}
+
+
+CUSTOM_MOE_3B_CONFIG = {
+    "hf_model_id": "custom/moe-3b-active",
+    "hf_model_type": "moe_3b_active",
+    "hf_num_hidden_layers": 32,
+    "hidden_size": 2048,
+    "intermediate_size": 1536,
+    "moe_intermediate_size": 1536,
+    "num_attention_heads": 16,
+    "num_experts": 64,
+    "num_experts_per_tok": 8,
+    "num_shared_experts": 0,
+    "vocab_size": 151936,
+}
+
+
 MM_CONFIGS = {
     "mm_1b": {
         "tokens": 64,
@@ -714,6 +740,7 @@ def profile_mlp(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         stats=stats,
         device=device,
         dtype=dtype,
+        precision=args.precision,
     )
     optimizer = torch.optim.AdamW(lora_parameters(model), lr=1e-2)
 
@@ -833,7 +860,13 @@ def profile_mm(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
     cfg["tokens"] = requested_tokens(args, int(cfg["tokens"]))
     torch.manual_seed(101)
     weight = torch.randn(cfg["out_features"], cfg["in_features"], dtype=dtype)
-    model = AsymFrozenLinear(weight, backend=args.backend, pin_memory=device.type == "cuda", stats=stats)
+    model = AsymFrozenLinear(
+        weight,
+        backend=args.backend,
+        pin_memory=device.type == "cuda",
+        stats=stats,
+        precision=args.precision,
+    )
     model.profile_name = "matrix"
     del weight
 
@@ -882,12 +915,14 @@ def profile_mlp_fundamental(args: argparse.Namespace, device: torch.device, dtyp
                 backend=args.backend,
                 pin_memory=device.type == "cuda",
                 stats=stats,
+                precision=args.precision,
             )
             self.fc2 = AsymFrozenLinear(
                 torch.randn(cfg["out_features"], cfg["hidden_features"], dtype=dtype),
                 backend=args.backend,
                 pin_memory=device.type == "cuda",
                 stats=stats,
+                precision=args.precision,
             )
 
     clear(device)
@@ -1200,7 +1235,17 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
     config_extra = dict(getattr(args, "_config_extra", {}))
     stats = AsymExecutionStats()
     weights = make_tiny_dense_weights(config, seed=1, dtype=dtype)
-    model = AsymTinyDenseLLM(weights, config=config, target_mode="all", backend=args.backend, stats=stats, device=device, dtype=dtype, lora_seed=2)
+    model = AsymTinyDenseLLM(
+        weights,
+        config=config,
+        target_mode="all",
+        backend=args.backend,
+        stats=stats,
+        device=device,
+        dtype=dtype,
+        lora_seed=2,
+        precision=args.precision,
+    )
     set_profile_names(model)
     optimizer = torch.optim.AdamW(model.lora_parameters(), lr=3e-3)
 
@@ -1514,7 +1559,15 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         )
     workload_name = str(getattr(args, "_workload_name_override", "m4_3_moe"))
     config_extra = dict(getattr(args, "_config_extra", {}))
-    model, _, _, stats = make_tiny_moe_pair(config=config, seed=3, device=device, base_dtype=dtype, backend=args.backend, pin_memory=device.type == "cuda")
+    model, _, _, stats = make_tiny_moe_pair(
+        config=config,
+        seed=3,
+        device=device,
+        base_dtype=dtype,
+        backend=args.backend,
+        pin_memory=device.type == "cuda",
+        precision=args.precision,
+    )
     set_profile_names(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3, weight_decay=0.0)
     static_routes = make_static_routes(config, device, pattern="balanced")
@@ -1616,6 +1669,8 @@ def build_report(
     return {
         "workload": workload,
         "device": str(device),
+        "asym_precision_requested": str(config.get("asym_precision_requested", getattr(model, "precision", "bf16"))),
+        "asym_precision_effective": str(getattr(model, "precision", "bf16")),
         "config": config,
         "execution_stats": execution_stats,
         "step": table(
@@ -1789,6 +1844,23 @@ def qwen3_14b_dense_config(args: argparse.Namespace) -> Any:
     )
 
 
+def custom_dense_3b_config(args: argparse.Namespace) -> Any:
+    from asym_gemm.training.dense import TinyDenseLLMConfig
+
+    full = CUSTOM_DENSE_3B_CONFIG
+    return TinyDenseLLMConfig(
+        vocab_size=min(int(full["vocab_size"]), int(args.real_vocab_rows)),
+        hidden_size=int(full["hidden_size"]),
+        num_layers=max(1, min(int(args.real_profile_layers), int(full["hf_num_hidden_layers"]))),
+        num_heads=int(full["num_attention_heads"]),
+        seq_len=int(args.real_seq_len),
+        batch_size=int(args.real_batch_size),
+        intermediate_size=int(full["intermediate_size"]),
+        lora_rank=int(args.real_lora_rank),
+        lora_alpha=float(args.real_lora_alpha),
+    )
+
+
 def qwen3_30b_a3b_moe_config(args: argparse.Namespace) -> Any:
     from asym_gemm.training.moe import TinyMoEConfig
 
@@ -1811,11 +1883,33 @@ def qwen3_30b_a3b_moe_config(args: argparse.Namespace) -> Any:
     )
 
 
+def custom_moe_3b_config(args: argparse.Namespace) -> Any:
+    from asym_gemm.training.moe import TinyMoEConfig
+
+    full = CUSTOM_MOE_3B_CONFIG
+    return TinyMoEConfig(
+        num_layers=max(1, min(int(args.real_profile_layers), int(full["hf_num_hidden_layers"]))),
+        num_experts=int(full["num_experts"]),
+        top_k=int(full["num_experts_per_tok"]),
+        hidden_size=int(full["hidden_size"]),
+        intermediate_size=int(full["moe_intermediate_size"]),
+        logical_tokens=int(args.real_tokens or (int(args.real_seq_len) * int(args.real_batch_size))),
+        lora_rank=int(args.real_lora_rank),
+        lora_alpha=float(args.real_lora_alpha),
+        residual_scale=0.25,
+        num_shared_experts=int(full["num_shared_experts"]),
+        vocab_size=min(int(full["vocab_size"]), int(args.real_vocab_rows)),
+        num_heads=int(full["num_attention_heads"]),
+        batch_size=int(args.real_batch_size),
+        seq_len=int(args.real_seq_len),
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--workload",
-        choices=["mlp", "dense", "moe", "qwen3_14b", "qwen3_30b_a3b", "matrix_1b", "mm_1b", "mm_3b", "mlp_1b", "mlp_3b"],
+        choices=["mlp", "dense", "moe", "dense_3b", "moe_3b", "qwen3_14b", "qwen3_30b_a3b", "matrix_1b", "mm_1b", "mm_3b", "mlp_1b", "mlp_3b"],
         default="mlp",
     )
     parser.add_argument("--device", default="cuda:1")
@@ -1830,6 +1924,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-rank", "--real-lora-rank", dest="real_lora_rank", metavar="N", type=int, default=64)
     parser.add_argument("--lora-alpha", "--real-lora-alpha", dest="real_lora_alpha", metavar="FLOAT", type=float, default=128.0)
     parser.add_argument("--vocab-rows", "--real-vocab-rows", dest="real_vocab_rows", metavar="N", type=int, default=4096)
+    parser.add_argument("--precision", default="bf16", choices=["bf16", "fp8", "fp4"])
     parser.add_argument("--output-dir", type=Path, default=Path("reports"))
     parser.add_argument("--export-torch-trace", action="store_true", help="Export a PyTorch profiler Chrome trace for the measured run")
     parser.add_argument(
@@ -1860,6 +1955,24 @@ def main() -> None:
         if args.workload == "dense":
             return profile_dense(args, device, dtype)
         if args.workload == "moe":
+            return profile_moe(args, device, dtype)
+        if args.workload == "dense_3b":
+            args._dense_config_override = custom_dense_3b_config(args)
+            args._workload_name_override = "dense_3b"
+            args._config_extra = {
+                **CUSTOM_DENSE_3B_CONFIG,
+                "profiled_layers": args._dense_config_override.num_layers,
+                "weight_source": "random_config_matched",
+            }
+            return profile_dense(args, device, dtype)
+        if args.workload == "moe_3b":
+            args._moe_config_override = custom_moe_3b_config(args)
+            args._workload_name_override = "moe_3b"
+            args._config_extra = {
+                **CUSTOM_MOE_3B_CONFIG,
+                "profiled_layers": args._moe_config_override.num_layers,
+                "weight_source": "random_config_matched",
+            }
             return profile_moe(args, device, dtype)
         if args.workload == "matrix_1b":
             return profile_matrix_1b(args, device, dtype)

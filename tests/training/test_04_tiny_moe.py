@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from asym_gemm.training import AsymExecutionStats
-import asym_gemm.training.tiny_moe as tiny_moe
+import asym_gemm.training.moe as tiny_moe
 
 
 TinyMoEConfig = tiny_moe.TinyMoEConfig

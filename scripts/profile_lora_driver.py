@@ -20,9 +20,10 @@ NSYS_POSTPROCESS_SCRIPT = ROOT / "scripts" / "postprocess_nsys_m4.py"
 CPU_GAPS_SCRIPT = ROOT / "scripts" / "profile_nsys_cpu_gaps.py"
 NCU_SCRIPT = ROOT / "scripts" / "profile_ncu_asymgemm.py"
 
-WORKLOADS = ("mlp_1b", "mlp_3b", "mm_1b", "mm_3b", "mlp", "dense", "moe", "qwen3_14b", "qwen3_30b_a3b")
+WORKLOADS = ("mlp_1b", "mlp_3b", "mm_1b", "mm_3b", "dense_3b", "moe_3b", "mlp", "dense", "moe", "qwen3_14b", "qwen3_30b_a3b")
 WORKLOAD_ALIASES = {
     "toy": ("mlp", "dense", "moe"),
+    "custom3b": ("dense_3b", "moe_3b"),
     "qwen": ("qwen3_14b", "qwen3_30b_a3b"),
     "fundamental": ("mlp_1b", "mlp_3b", "mm_1b", "mm_3b"),
     "matrix_1b": ("mm_1b",),
@@ -36,7 +37,7 @@ PROFILER_ALIASES = {
     "profile": ("source",),
     "cpu_gaps": ("cpu",),
 }
-NCU_WORKLOADS = {"mm_1b", "mm_3b", "mlp_1b", "mlp_3b", "qwen3_14b", "qwen3_30b_a3b"}
+NCU_WORKLOADS = {"mm_1b", "mm_3b", "mlp_1b", "mlp_3b", "dense_3b", "moe_3b", "qwen3_14b", "qwen3_30b_a3b"}
 
 
 def _split_tokens(values: Iterable[str]) -> list[str]:
@@ -193,6 +194,8 @@ def _common_profile_args(args: argparse.Namespace, workload: str, backend: str, 
         str(args.lora_alpha),
         "--vocab-rows",
         str(args.vocab_rows),
+        "--precision",
+        str(args.precision),
         "--output-dir",
         str(output_dir),
     ]

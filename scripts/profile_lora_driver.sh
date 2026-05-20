@@ -6,10 +6,10 @@ ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PY_DRIVER="${ROOT}/scripts/profile_lora_driver.py"
 
 # User-editable defaults. CLI flags override these values.
-DEFAULT_GPU_POOL=(0 2)
-DEFAULT_WORKLOADS=(mlp_1b mlp_3b mm_1b mm_3b qwen3_14b qwen3_30b_a3b)
+DEFAULT_GPU_POOL=(0 1 2 3)
+DEFAULT_WORKLOADS=(mlp_1b mlp_3b mm_1b mm_3b dense_3b moe_3b mlp dense moe qwen3_14b qwen3_30b_a3b)
 DEFAULT_BACKENDS=(asym_only torch_only)
-DEFAULT_PROFILERS=(nsys cpu ncu)
+DEFAULT_PROFILERS=(nsys cpu)
 DEFAULT_JOBS_PER_GPU=1
 DEFAULT_OUTPUT_ROOT="profiling"
 DEFAULT_RUN_NAME=""
@@ -40,7 +40,7 @@ Shell-only options:
   -h, --help                          Show this help.
 
 Default run matrix:
-  --workloads mlp_1b mlp_3b mm_1b mm_3b mlp dense moe qwen3_14b qwen3_30b_a3b
+  --workloads mlp_1b mlp_3b mm_1b mm_3b dense_3b moe_3b mlp dense moe qwen3_14b qwen3_30b_a3b
   --backends asym_only torch_only
   --profilers source nsys cpu ncu
 
@@ -77,9 +77,10 @@ expand_workloads() {
   for item in "$@"; do
     case "${item}" in
       toy) printf '%s\n' mlp dense moe ;;
+      custom3b) printf '%s\n' dense_3b moe_3b ;;
       qwen) printf '%s\n' qwen3_14b qwen3_30b_a3b ;;
       fundamental) printf '%s\n' mlp_1b mlp_3b mm_1b mm_3b ;;
-      all) printf '%s\n' mlp_1b mlp_3b mm_1b mm_3b mlp dense moe qwen3_14b qwen3_30b_a3b ;;
+      all) printf '%s\n' mlp_1b mlp_3b mm_1b mm_3b dense_3b moe_3b mlp dense moe qwen3_14b qwen3_30b_a3b ;;
       matrix_1b) printf '%s\n' mm_1b ;;
       *) printf '%s\n' "${item}" ;;
     esac

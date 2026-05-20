@@ -1,6 +1,10 @@
+import importlib
+
 import pytest
 import torch
 
+import asym_gemm
+from asym_gemm.utils import per_token_cast_to_fp8, per_token_cast_to_nvfp4_e4m3
 from asym_gemm.training import (
     AsymExecutionStats,
     AsymFrozenLinear,
@@ -13,9 +17,76 @@ from asym_gemm.training import (
     measure_gpu_weight_allocation,
 )
 
+frozen_linear_impl = importlib.import_module("asym_gemm.training.frozen_linear")
+
 
 def _direct_bf16_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] in {9, 10}
+
+
+def _direct_precision_available(precision: str) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    arch = torch.cuda.get_device_capability(0)[0]
+    if precision == "fp8":
+        return arch in {9, 10} and hasattr(asym_gemm, "m_grouped_fp8_asym_gemm_nt_contiguous")
+    if precision == "fp4":
+        return arch == 10 and hasattr(asym_gemm, "m_grouped_fp4_asym_gemm_nt_contiguous")
+    return False
+
+
+def _relative_max_diff(a: torch.Tensor, b: torch.Tensor) -> float:
+    a_f = a.detach().float()
+    b_f = b.detach().float()
+    denom = float(b_f.abs().max().clamp_min(1e-6).item())
+    return float((a_f - b_f).abs().max().item() / denom)
+
+
+def _expand_last_dim_scales(scales: torch.Tensor, cols: int, gran_k: int) -> torch.Tensor:
+    return scales.float().repeat_interleave(gran_k, dim=-1)[..., :cols]
+
+
+def _expand_fp8_weight_scales(scales: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    return scales.float().repeat_interleave(128, dim=-2).repeat_interleave(128, dim=-1)[..., :rows, :cols]
+
+
+def _unpack_fp4(packed: torch.Tensor, cols: int) -> torch.Tensor:
+    lo = packed & 0x0F
+    hi = (packed >> 4) & 0x0F
+    codes = torch.empty((*packed.shape[:-1], packed.shape[-1] * 2), device=packed.device, dtype=torch.uint8)
+    codes[..., 0::2] = lo
+    codes[..., 1::2] = hi
+    return codes[..., :cols]
+
+
+def _decode_fp4_e2m1(codes: torch.Tensor) -> torch.Tensor:
+    levels = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=codes.device)
+    magnitude = (codes & 0x07).long()
+    decoded = levels[magnitude]
+    sign = ((codes & 0x08) != 0) & (magnitude != 0)
+    return torch.where(sign, -decoded, decoded)
+
+
+def _quantized_linear_reference(a: torch.Tensor, host_weight: HostWeight, precision: str, *, transpose: bool = False) -> torch.Tensor:
+    qweight = frozen_linear_impl._get_quantized_host_weight(host_weight, precision, transpose=transpose)
+    assert qweight is not None
+    k = int(qweight.logical_shape[-1])
+    n = int(qweight.logical_shape[-2])
+    if precision == "fp8":
+        a_values, a_scales = per_token_cast_to_fp8(a, use_ue8m0=True, gran_k=128)
+        a_deq = a_values.float() * _expand_last_dim_scales(a_scales, k, 128)
+        b_values = qweight.values.to(device=a.device)
+        b_scales = qweight.scales.to(device=a.device)
+        b_deq = b_values.float() * _expand_fp8_weight_scales(b_scales, n, k)
+    elif precision == "fp4":
+        a_values, a_scales = per_token_cast_to_nvfp4_e4m3(a, gran_k=16)
+        a_deq = _decode_fp4_e2m1(_unpack_fp4(a_values, k)).float() * _expand_last_dim_scales(a_scales, k, 16)
+        b_values = qweight.values.to(device=a.device)
+        b_scales = qweight.scales.to(device=a.device)
+        b_deq = _decode_fp4_e2m1(_unpack_fp4(b_values, k)).float() * _expand_last_dim_scales(b_scales, k, 16)
+    else:
+        raise ValueError(f"unexpected precision={precision!r}")
+    return a_deq.float() @ b_deq.float().t()
 
 
 def test_fp64_reference_gradcheck_cpu() -> None:
@@ -217,6 +288,98 @@ def test_direct_grouped_bf16_forward_and_dx_match_torch() -> None:
     assert grouped.stats.torch_calls == 0
 
 
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+def test_direct_quantized_precision_forward_and_dx_match_quantized_reference(precision: str) -> None:
+    if not _direct_precision_available(precision):
+        pytest.skip(f"direct {precision.upper()} AsymGEMM is not available on this device/build")
+
+    torch.manual_seed(17)
+    m = 128
+    n = 128
+    k = 512
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(n, k, dtype=torch.bfloat16)
+    stats = AsymExecutionStats()
+    base = AsymFrozenLinear(weight, backend="asym_only", pin_memory=True, stats=stats, precision=precision)
+
+    y = base(x)
+    y_ref = _quantized_linear_reference(x, base.host_weight, precision)
+    forward_diff = _relative_max_diff(y, y_ref)
+
+    grad_out = torch.randn_like(y)
+    (dx,) = torch.autograd.grad(y, x, grad_out)
+    dx_ref = _quantized_linear_reference(grad_out.contiguous(), base.host_weight, precision, transpose=True)
+    dx_diff = _relative_max_diff(dx, dx_ref)
+
+    print(
+        f"\n[M1 direct {precision.upper()} quantized error] "
+        f"forward_rel_max={forward_diff:.6g}, dx_rel_max={dx_diff:.6g}, "
+        f"asym_forward_calls={stats.asym_forward_calls}, asym_dx_calls={stats.asym_dx_calls}"
+    )
+
+    assert forward_diff < 3e-2
+    assert dx_diff < 3e-2
+    assert stats.asym_forward_calls == 1
+    assert stats.asym_dx_calls == 1
+    assert stats.staged_calls == 0
+    assert stats.torch_calls == 0
+    assert base.host_weight.weight.device.type == "cpu"
+    assert base.pinned_cpu_bytes >= base.weight_hbm_saved_bytes
+
+
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+def test_direct_grouped_quantized_precision_forward_and_dx_match_quantized_reference(precision: str) -> None:
+    if not _direct_precision_available(precision):
+        pytest.skip(f"direct grouped {precision.upper()} AsymGEMM is not available on this device/build")
+
+    torch.manual_seed(19)
+    counts = [128, 128]
+    m = sum(counts)
+    n = 128
+    k = 512
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(len(counts), n, k, dtype=torch.bfloat16)
+    stats = AsymExecutionStats()
+    grouped = AsymGroupedFrozenLinear(weight, backend="asym_only", pin_memory=True, stats=stats, precision=precision)
+    offsets = torch.tensor([0, counts[0], m], device="cuda", dtype=torch.long)
+    experts = torch.tensor([0, 1, -1], device="cuda", dtype=torch.long)
+
+    y = grouped(x, offsets, experts)
+    refs = []
+    start = 0
+    for group, rows in enumerate(counts):
+        host = HostWeight.from_tensor(weight[group], pin_memory=True)
+        refs.append(_quantized_linear_reference(x[start : start + rows], host, precision))
+        start += rows
+    y_ref = torch.cat(refs, dim=0)
+    forward_diff = _relative_max_diff(y, y_ref)
+
+    grad_out = torch.randn_like(y)
+    (dx,) = torch.autograd.grad(y, x, grad_out)
+    dx_refs = []
+    start = 0
+    for group, rows in enumerate(counts):
+        host = HostWeight.from_tensor(weight[group], pin_memory=True)
+        dx_refs.append(_quantized_linear_reference(grad_out[start : start + rows].contiguous(), host, precision, transpose=True))
+        start += rows
+    dx_ref = torch.cat(dx_refs, dim=0)
+    dx_diff = _relative_max_diff(dx, dx_ref)
+
+    print(
+        f"\n[M1 direct grouped {precision.upper()} quantized error] "
+        f"forward_rel_max={forward_diff:.6g}, dx_rel_max={dx_diff:.6g}, "
+        f"asym_forward_calls={stats.asym_forward_calls}, asym_dx_calls={stats.asym_dx_calls}"
+    )
+
+    assert forward_diff < 3e-2
+    assert dx_diff < 3e-2
+    assert stats.asym_forward_calls == 1
+    assert stats.asym_dx_calls == 1
+    assert stats.staged_calls == 0
+    assert stats.torch_calls == 0
+    assert grouped.host_weight.weight.device.type == "cpu"
+
+
 def test_lora_composition_gets_grads_and_base_stays_frozen() -> None:
     torch.manual_seed(2)
     use_cuda = _direct_bf16_available()
@@ -243,6 +406,88 @@ def test_lora_composition_gets_grads_and_base_stays_frozen() -> None:
     assert x.grad is not None
     assert float(lora_a.grad.float().abs().sum()) > 0.0
     assert float(lora_b.grad.float().abs().sum()) > 0.0
+
+
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+def test_lora_composition_quantized_precision_gets_grads_and_base_stays_frozen(precision: str) -> None:
+    if not _direct_precision_available(precision):
+        pytest.skip(f"direct {precision.upper()} AsymGEMM is not available on this device/build")
+
+    torch.manual_seed(18)
+    m = 128
+    in_features = 512
+    out_features = 128
+    rank = 8
+    x = torch.randn(m, in_features, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(out_features, in_features, dtype=torch.bfloat16)
+    base = AsymFrozenLinear(weight, backend="asym_only", pin_memory=True, precision=precision)
+    lora_a = torch.nn.Parameter(torch.randn(rank, in_features, device="cuda", dtype=torch.float32) * 0.01)
+    lora_b = torch.nn.Parameter(torch.randn(out_features, rank, device="cuda", dtype=torch.float32) * 0.01)
+
+    before = base.host_weight.weight.clone()
+    y = base(x) + (x.float() @ lora_a.t() @ lora_b.t()).to(torch.bfloat16)
+    loss = y.float().square().mean()
+    loss.backward()
+
+    assert torch.equal(base.host_weight.weight, before)
+    assert base.host_weight.weight.device.type == "cpu"
+    assert base.host_weight.weight.grad is None
+    assert lora_a.grad is not None and torch.isfinite(lora_a.grad).all()
+    assert lora_b.grad is not None and torch.isfinite(lora_b.grad).all()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert float(lora_a.grad.float().abs().sum()) > 0.0
+    assert float(lora_b.grad.float().abs().sum()) > 0.0
+
+
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+def test_lora_quantized_precision_gradients_match_quantized_reference_and_optimizer_only_updates_lora(
+    precision: str,
+) -> None:
+    if not _direct_precision_available(precision):
+        pytest.skip(f"direct {precision.upper()} AsymGEMM is not available on this device/build")
+
+    torch.manual_seed(20)
+    m = 128
+    in_features = 512
+    out_features = 128
+    rank = 8
+    scaling = 2.0
+    x = torch.randn(m, in_features, device="cuda", dtype=torch.bfloat16)
+    target = torch.randn(m, out_features, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(out_features, in_features, dtype=torch.bfloat16)
+    base = AsymFrozenLinear(weight, backend="asym_only", pin_memory=True, precision=precision)
+    lora_a = torch.nn.Parameter(torch.randn(rank, in_features, device="cuda", dtype=torch.float32) * 0.01)
+    lora_b = torch.nn.Parameter(torch.randn(out_features, rank, device="cuda", dtype=torch.float32) * 0.01)
+    lora_a_ref = torch.nn.Parameter(lora_a.detach().clone())
+    lora_b_ref = torch.nn.Parameter(lora_b.detach().clone())
+
+    y = base(x) + (x.float() @ lora_a.t() @ lora_b.t() * scaling).to(torch.bfloat16)
+    y_ref = _quantized_linear_reference(x, base.host_weight, precision).to(torch.bfloat16)
+    y_ref = y_ref + (x.float() @ lora_a_ref.t() @ lora_b_ref.t() * scaling).to(torch.bfloat16)
+    loss = torch.nn.functional.mse_loss(y.float(), target.float())
+    loss_ref = torch.nn.functional.mse_loss(y_ref.float(), target.float())
+    loss.backward()
+    loss_ref.backward()
+
+    grad_a_diff = _relative_max_diff(lora_a.grad, lora_a_ref.grad)
+    grad_b_diff = _relative_max_diff(lora_b.grad, lora_b_ref.grad)
+    print(
+        f"\n[M1 direct {precision.upper()} LoRA quantized-ref gradients] "
+        f"lora_a_rel_max={grad_a_diff:.6g}, lora_b_rel_max={grad_b_diff:.6g}"
+    )
+    assert grad_a_diff < 3e-2
+    assert grad_b_diff < 3e-2
+
+    base_before = base.host_weight.weight.clone()
+    lora_a_before = lora_a.detach().clone()
+    lora_b_before = lora_b.detach().clone()
+    optimizer = torch.optim.SGD([lora_a, lora_b], lr=1e-1)
+    optimizer.step()
+
+    assert torch.equal(base.host_weight.weight, base_before)
+    assert base.host_weight.weight.grad is None
+    assert not torch.equal(lora_a.detach(), lora_a_before)
+    assert not torch.equal(lora_b.detach(), lora_b_before)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA memory accounting requires CUDA")
