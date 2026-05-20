@@ -382,6 +382,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default="", help="Optional subdirectory under --output-root. Default writes directly into --output-root.")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--skip-summary", action="store_true", help="Do not write run-level summary/commands files. Useful for parallel shell orchestration.")
     return parser.parse_args()
 
 
@@ -612,6 +613,12 @@ def main() -> None:
         "runs": rows,
         "comparisons": _add_comparisons(rows),
     }
+    if args.skip_summary:
+        failed = [row for row in rows if row["returncode"] != 0]
+        if failed:
+            raise SystemExit(1)
+        return
+
     summary_stem = "_".join(part for part in (_safe_label(args.precision), _safe_label(args.workflow), "summary") if part)
     commands_path = run_dir / f"{_safe_label(args.precision)}_{_safe_label(args.workflow)}_commands.json"
     commands_path.write_text(json.dumps(commands, indent=2) + "\n", encoding="utf-8")

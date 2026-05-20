@@ -43,15 +43,21 @@ path; it is useful for sanity checks, but it is not a GPU-resident
 LLaMA-Factory baseline.
 
 ```bash
-python scripts/profile_lora_driver.py \
+scripts/profile_lora_driver.sh \
+  --gpus 2,3,4,5,6,7 \
   --workloads qwen3_14b qwen3_30b_a3b \
   --backends asym_only torch_only \
   --profilers source nsys cpu ncu \
-  --cuda-devices 2,3,4,5,6,7 \
   --profile-layers 1 --batch-size 1 --seq-len 64 \
   --lora-rank 64 --lora-alpha 128 \
   --precision bf16 --workflow lora_sft --mode auto
 ```
+
+The shell driver launches one background Python driver job per workload/backend
+pair, assigns jobs across the GPU pool, writes logs under
+`profiling/driver_logs/`, waits for all jobs, and traps INT/TERM/ERR to stop
+the full process tree.  Use `python scripts/profile_lora_driver.py ...` only
+when a single foreground driver process is desired.
 
 The driver stores directly in this `profiling/` tree by default.  Each workload
 gets its own group directory, matching the existing layout:
@@ -62,10 +68,11 @@ profiling/mlp_1b/bf16_lora_sft_asym-only_nsys.md
 profiling/mlp_1b/bf16_lora_sft_asym-only_ncu.md
 ```
 
-With `--mode auto`, the mode label is `<backend>_<profiler>` to avoid
-overwriting tables when multiple backends/profilers are requested.  If one
+With `--mode auto`, the mode label is `<backend-label>_<profiler>` to avoid
+overwriting tables when multiple backends/profilers are requested.  Backend
+labels use hyphens, e.g. `asym-only_nsys` and `torch-only_source`.  If one
 specific experiment mode is requested, pass it explicitly, e.g.
-`--mode asym_nsys`.
+`--mode asym-only_nsys`.
 
 Raw artifacts stay under the same named stem, without an extra profiler
 directory:
@@ -81,10 +88,10 @@ Driver profiler modes:
 
 | Mode | Meaning | Output |
 |---|---|---|
-| `source` | Plain `profile_lora.py` run | `<run>/<workload>/<backend>/source/*_profile.json` and `*_profile.md` |
-| `nsys` | Nsight Systems CUDA/NVTX truth table, no CPU sampling/symbol resolving | `<run>/<workload>/<backend>/nsys/table.md`, `profile.json`, `trace.nsys-rep` |
-| `cpu` | Nsight Systems CPU-gap debug with OSRT/CPU sampling | `<run>/<workload>/<backend>/cpu/table.md`, `profile.json` |
-| `ncu` | Nsight Compute kernel-internal metrics | `<run>/<workload>/<backend>/ncu/table.md`, `profile.json`, `report.ncu-rep` |
+| `source` | Plain `profile_lora.py` run | `profiling/<workload>/<stem>/*_profile.json` and `*_profile.md` |
+| `nsys` | Nsight Systems CUDA/NVTX truth table, no CPU sampling/symbol resolving | `profiling/<workload>/<stem>/table.md`, `profile.json`, `trace.nsys-rep` |
+| `cpu` | Nsight Systems CPU-gap debug with OSRT/CPU sampling | `profiling/<workload>/<stem>/table.md`, `profile.json` |
+| `ncu` | Nsight Compute kernel-internal metrics | `profiling/<workload>/<stem>/table.md`, `profile.json`, `report.ncu-rep` |
 
 `ncu` is run only for `asym_only` and supported AsymGEMM workloads
 (`matrix_1b`, `mlp_1b`, `qwen3_14b`, `qwen3_30b_a3b`); unsupported
