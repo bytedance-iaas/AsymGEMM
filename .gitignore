@@ -8,6 +8,8 @@ dist
 *.pyc
 *.log
 *.ncu-rep
+*.nsys-rep
+*.sqlite
 __pycache__/
 
 # UV / venv
@@ -37,3 +39,11 @@ extern/
 external/
 vendor/
 submodules/
+# tests/
+
+# Local profiling/report artifacts
+agent/
+profiling*/
+!profiling/README.md
+reports/
+~/
