@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from typing import Any, Iterable
@@ -92,12 +93,75 @@ def _timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
+def _safe_label(value: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() or ch == "-" else "_" for ch in value).strip("_-")
+
+
+def _backend_label(backend: str) -> str:
+    return backend.replace("_", "-")
+
+
+def _result_stem(args: argparse.Namespace, backend: str, profiler: str) -> str:
+    mode = args.mode
+    if mode == "auto":
+        mode = f"{_backend_label(backend)}_{profiler}"
+    return "_".join(
+        part
+        for part in (
+            _safe_label(args.precision),
+            _safe_label(args.workflow),
+            _safe_label(mode),
+        )
+        if part
+    )
+
+
+def _raw_output_dir(run_dir: Path, workload: str, args: argparse.Namespace, backend: str, profiler: str) -> Path:
+    return run_dir / workload / _result_stem(args, backend, profiler)
+
+
 def _load_profile(output_dir: Path) -> tuple[dict[str, Any], Path | None]:
     candidates = [output_dir / "profile.json", *sorted(output_dir.glob("*_profile.json"))]
     for path in candidates:
         if path.exists():
             return json.loads(path.read_text(encoding="utf-8")), path
     return {}, None
+
+
+def _find_markdown(output_dir: Path) -> Path | None:
+    candidates = [output_dir / "table.md", *sorted(output_dir.glob("*_profile.md"))]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
+def _write_result_aliases(args: argparse.Namespace, run_dir: Path, row: dict[str, Any]) -> dict[str, str]:
+    if row.get("status") != "ok":
+        return {}
+    workload = str(row["workload"])
+    backend = str(row["backend"])
+    profiler = str(row["profiler"])
+    output_dir = Path(str(row["output_dir"]))
+    workload_dir = run_dir / workload
+    workload_dir.mkdir(parents=True, exist_ok=True)
+    stem = _result_stem(args, backend, profiler)
+    aliases: dict[str, str] = {}
+
+    markdown_path = _find_markdown(output_dir)
+    if markdown_path is not None:
+        target = workload_dir / f"{stem}.md"
+        shutil.copyfile(markdown_path, target)
+        aliases["table_md"] = str(target)
+
+    profile_json = row.get("profile_json")
+    json_path = Path(str(profile_json)) if profile_json else output_dir / "profile.json"
+    if json_path.exists():
+        target = workload_dir / f"{stem}.json"
+        shutil.copyfile(json_path, target)
+        aliases["profile_json"] = str(target)
+
+    return aliases
 
 
 def _common_profile_args(args: argparse.Namespace, workload: str, backend: str, device: str, output_dir: Path) -> list[str]:
@@ -204,14 +268,17 @@ def _markdown(summary: dict[str, Any]) -> str:
     lines = [
         "# LoRA-SFT Profiling Workflow",
         "",
+        f"Precision: `{summary.get('precision', '-')}`  ",
+        f"Workflow: `{summary.get('workflow', '-')}`",
+        "",
         "`asym_only` measures the direct AsymGEMM host-weight path. `torch_only` keeps the same",
         "host-weight wrapper and uses the PyTorch fallback path; it is not a GPU-resident",
         "LLaMA-Factory baseline.",
         "",
         "## Runs",
         "",
-        "| Workload | Backend | Profiler | Status | Device | Step ms | Peak HBM | HBM saved | Pinned CPU | Output |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| Workload | Backend | Profiler | Status | Device | Step ms | Peak HBM | HBM saved | Pinned CPU | Result table | Output |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|",
     ]
     for row in summary["runs"]:
         def fmt(value: Any) -> str:
@@ -228,7 +295,7 @@ def _markdown(summary: dict[str, Any]) -> str:
             device = f"CUDA_VISIBLE_DEVICES={row['physical_cuda_device']}:{device}"
         lines.append(
             "| {workload} | {backend} | {profiler} | {status} | {device} | {step_ms} | {peak_hbm_bytes} | "
-            "{expected_hbm_saved_bytes} | {pinned_cpu_bytes} | `{output_dir}` |".format(
+            "{expected_hbm_saved_bytes} | {pinned_cpu_bytes} | {result_table} | `{output_dir}` |".format(
                 workload=row["workload"],
                 backend=row["backend"],
                 profiler=row.get("profiler", "source"),
@@ -238,6 +305,7 @@ def _markdown(summary: dict[str, Any]) -> str:
                 peak_hbm_bytes=fmt(row.get("peak_hbm_bytes")),
                 expected_hbm_saved_bytes=fmt(row.get("expected_hbm_saved_bytes")),
                 pinned_cpu_bytes=fmt(row.get("pinned_cpu_bytes")),
+                result_table=f"`{row['result_aliases']['table_md']}`" if row.get("result_aliases", {}).get("table_md") else "-",
                 output_dir=row["output_dir"],
             )
         )
@@ -297,14 +365,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-rank", type=int, default=64)
     parser.add_argument("--lora-alpha", type=float, default=128.0)
     parser.add_argument("--vocab-rows", type=int, default=4096)
+    parser.add_argument("--precision", default="bf16", help="Experiment precision label used in result table filenames.")
+    parser.add_argument("--workflow", default="lora_sft", help="Experiment workflow label used in result table filenames.")
+    parser.add_argument(
+        "--mode",
+        default="auto",
+        help="Result filename mode label. Default auto uses <backend-label>_<profiler>, e.g. asym-only_nsys.",
+    )
     parser.add_argument("--moe-mode", choices=["contiguous", "masked"], default="contiguous")
     parser.add_argument("--timing-mode", choices=["profile", "debug_sync"], default="profile")
     parser.add_argument("--nsys-bin", default="nsys")
     parser.add_argument("--ncu-bin", default="ncu")
     parser.add_argument("--ncu-preset", choices=["quick", "paper"], default="paper")
     parser.add_argument("--ncu-clear-jit-cache", action="store_true")
-    parser.add_argument("--output-root", type=Path, default=Path("profiling/lora_sft_runs"))
-    parser.add_argument("--run-name", default="", help="Run directory name. Defaults to a UTC timestamp.")
+    parser.add_argument("--output-root", type=Path, default=Path("profiling"))
+    parser.add_argument("--run-name", default="", help="Optional subdirectory under --output-root. Default writes directly into --output-root.")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -314,9 +389,9 @@ def main() -> None:
     args = parse_args()
     workloads = _expand_workloads(args.workloads)
     backends = _expand_backends(args.backends)
+    profilers = _expand_profilers(args.profilers)
     cuda_devices = _cuda_devices(args.cuda_devices)
-    run_name = args.run_name or _timestamp()
-    run_dir = args.output_root / run_name
+    run_dir = args.output_root / args.run_name if args.run_name else args.output_root
     run_dir.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict[str, Any]] = []
@@ -324,110 +399,227 @@ def main() -> None:
     task_index = 0
     for workload in workloads:
         for backend in backends:
-            physical_cuda_device = cuda_devices[task_index % len(cuda_devices)] if cuda_devices else None
-            child_device = "cuda:0" if physical_cuda_device is not None else args.device
-            output_dir = run_dir / workload / backend
-            output_dir.mkdir(parents=True, exist_ok=True)
-            cmd = [
-                sys.executable,
-                str(PROFILE_SCRIPT),
-                "--workload",
-                workload,
-                "--device",
-                child_device,
-                "--backend",
-                backend,
-                "--warmup-steps",
-                str(args.warmup_steps),
-                "--measure-steps",
-                str(args.measure_steps),
-                "--timing-mode",
-                args.timing_mode,
-                "--moe-mode",
-                args.moe_mode,
-                "--profile-layers",
-                str(args.profile_layers),
-                "--batch-size",
-                str(args.batch_size),
-                "--seq-len",
-                str(args.seq_len),
-                "--tokens",
-                str(args.tokens),
-                "--lora-rank",
-                str(args.lora_rank),
-                "--lora-alpha",
-                str(args.lora_alpha),
-                "--vocab-rows",
-                str(args.vocab_rows),
-                "--output-dir",
-                str(output_dir),
-            ]
-            env = os.environ.copy()
-            env["PYTHONUNBUFFERED"] = "1"
-            if physical_cuda_device is not None:
-                env["CUDA_VISIBLE_DEVICES"] = physical_cuda_device
-            command_record = {
-                "workload": workload,
-                "backend": backend,
-                "device": child_device,
-                "physical_cuda_device": physical_cuda_device,
-                "output_dir": str(output_dir),
-                "command": cmd,
-            }
-            commands.append(command_record)
-            print("Running:", " ".join(cmd), flush=True)
-            if physical_cuda_device is not None:
-                print(f"  CUDA_VISIBLE_DEVICES={physical_cuda_device}", flush=True)
-            if args.dry_run:
-                rows.append(
-                    _summary_row(
+            for profiler in profilers:
+                physical_cuda_device = cuda_devices[task_index % len(cuda_devices)] if cuda_devices else None
+                child_device = "cuda:0" if physical_cuda_device is not None else args.device
+                output_dir = _raw_output_dir(run_dir, workload, args, backend, profiler)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                env = os.environ.copy()
+                env["PYTHONUNBUFFERED"] = "1"
+                if physical_cuda_device is not None:
+                    env["CUDA_VISIBLE_DEVICES"] = physical_cuda_device
+
+                commands_for_task: list[list[str]]
+                skip_reason = ""
+                if profiler == "source":
+                    commands_for_task = [
+                        [
+                            sys.executable,
+                            str(PROFILE_SCRIPT),
+                            *_common_profile_args(args, workload, backend, child_device, output_dir),
+                            "--timing-mode",
+                            args.timing_mode,
+                        ]
+                    ]
+                elif profiler == "nsys":
+                    source_dir = output_dir / "source_debug"
+                    report_prefix = output_dir / "trace"
+                    sqlite_path = output_dir / "trace.sqlite"
+                    commands_for_task = [
+                        [
+                            args.nsys_bin,
+                            "profile",
+                            "--trace=cuda,nvtx",
+                            "--sample=none",
+                            "--cpuctxsw=none",
+                            "--resolve-symbols=false",
+                            "--wait=primary",
+                            "--force-overwrite=true",
+                            f"--output={report_prefix}",
+                            sys.executable,
+                            str(PROFILE_SCRIPT),
+                            *_common_profile_args(args, workload, backend, child_device, source_dir),
+                            "--timing-mode",
+                            "profile",
+                        ],
+                        [
+                            args.nsys_bin,
+                            "export",
+                            "--type=sqlite",
+                            "--force-overwrite=true",
+                            f"--output={sqlite_path}",
+                            str(output_dir / "trace.nsys-rep"),
+                        ],
+                        [
+                            sys.executable,
+                            str(NSYS_POSTPROCESS_SCRIPT),
+                            str(sqlite_path),
+                            "--output-json",
+                            str(output_dir / "profile.json"),
+                            "--output-md",
+                            str(output_dir / "table.md"),
+                        ],
+                    ]
+                elif profiler == "cpu":
+                    commands_for_task = [
+                        [
+                            sys.executable,
+                            str(CPU_GAPS_SCRIPT),
+                            *_common_profile_args(args, workload, backend, child_device, output_dir),
+                            "--nsys-bin",
+                            args.nsys_bin,
+                        ]
+                    ]
+                elif profiler == "ncu":
+                    if backend != "asym_only":
+                        skip_reason = "ncu only profiles AsymGEMM kernels; torch_only has no matching AsymGEMM kernel"
+                        commands_for_task = []
+                    elif workload not in NCU_WORKLOADS:
+                        skip_reason = f"ncu wrapper supports {sorted(NCU_WORKLOADS)}, not {workload!r}"
+                        commands_for_task = []
+                    else:
+                        ncu_cmd = [
+                            sys.executable,
+                            str(NCU_SCRIPT),
+                            "--workload",
+                            workload,
+                            "--device",
+                            child_device,
+                            "--backend",
+                            backend,
+                            "--warmup-steps",
+                            str(args.warmup_steps),
+                            "--measure-steps",
+                            str(args.measure_steps),
+                            "--preset",
+                            args.ncu_preset,
+                            "--ncu-bin",
+                            args.ncu_bin,
+                            "--output-dir",
+                            str(output_dir),
+                            "--moe-mode",
+                            args.moe_mode,
+                            "--profile-layers",
+                            str(args.profile_layers),
+                            "--batch-size",
+                            str(args.batch_size),
+                            "--seq-len",
+                            str(args.seq_len),
+                            "--tokens",
+                            str(args.tokens),
+                            "--lora-rank",
+                            str(args.lora_rank),
+                            "--lora-alpha",
+                            str(args.lora_alpha),
+                            "--vocab-rows",
+                            str(args.vocab_rows),
+                        ]
+                        if args.ncu_clear_jit_cache:
+                            ncu_cmd.append("--clear-jit-cache")
+                        commands_for_task = [ncu_cmd]
+                else:
+                    raise AssertionError(profiler)
+
+                command_record = {
+                    "workload": workload,
+                    "backend": backend,
+                    "profiler": profiler,
+                    "device": child_device,
+                    "physical_cuda_device": physical_cuda_device,
+                    "output_dir": str(output_dir),
+                    "commands": commands_for_task,
+                    "command": commands_for_task[0] if commands_for_task else [],
+                    "skip_reason": skip_reason,
+                }
+                commands.append(command_record)
+
+                if skip_reason:
+                    row = _summary_row(
                         workload=workload,
                         backend=backend,
+                        profiler=profiler,
                         device=child_device,
                         physical_cuda_device=physical_cuda_device,
                         output_dir=output_dir,
                         returncode=0,
                         profile={},
                     )
-                )
+                    row["status"] = "skipped"
+                    row["skip_reason"] = skip_reason
+                    rows.append(row)
+                    task_index += 1
+                    continue
+
+                for cmd in commands_for_task:
+                    print("Running:", " ".join(cmd), flush=True)
+                    if physical_cuda_device is not None:
+                        print(f"  CUDA_VISIBLE_DEVICES={physical_cuda_device}", flush=True)
+                    if args.dry_run:
+                        continue
+                    result = subprocess.run(cmd, cwd=ROOT, env=env, check=False)
+                    if result.returncode != 0:
+                        break
+                else:
+                    result = subprocess.CompletedProcess(commands_for_task[-1] if commands_for_task else [], 0)
+
+                if args.dry_run:
+                    row = _summary_row(
+                        workload=workload,
+                        backend=backend,
+                        profiler=profiler,
+                        device=child_device,
+                        physical_cuda_device=physical_cuda_device,
+                        output_dir=output_dir,
+                        returncode=0,
+                        profile={},
+                    )
+                else:
+                    profile, profile_path = _load_profile(output_dir)
+                    row = _summary_row(
+                        workload=workload,
+                        backend=backend,
+                        profiler=profiler,
+                        device=child_device,
+                        physical_cuda_device=physical_cuda_device,
+                        output_dir=output_dir,
+                        returncode=result.returncode,
+                        profile=profile,
+                    )
+                    row["profile_json"] = str(profile_path) if profile_path is not None else None
+                    row["result_aliases"] = _write_result_aliases(args, run_dir, row)
+                rows.append(row)
+                if result.returncode != 0 and not args.continue_on_error:
+                    break
                 task_index += 1
-                continue
-            result = subprocess.run(cmd, cwd=ROOT, env=env, check=False)
-            profile, profile_path = _load_profile(output_dir)
-            row = _summary_row(
-                workload=workload,
-                backend=backend,
-                device=child_device,
-                physical_cuda_device=physical_cuda_device,
-                output_dir=output_dir,
-                returncode=result.returncode,
-                profile=profile,
-            )
-            row["profile_json"] = str(profile_path) if profile_path is not None else None
-            rows.append(row)
-            if result.returncode != 0 and not args.continue_on_error:
+            if rows and rows[-1]["returncode"] != 0 and not args.continue_on_error:
                 break
-            task_index += 1
         if rows and rows[-1]["returncode"] != 0 and not args.continue_on_error:
             break
 
     summary = {
         "run_dir": str(run_dir),
+        "precision": args.precision,
+        "workflow": args.workflow,
+        "mode": args.mode,
         "backend_semantics": {
             "asym_only": "direct AsymGEMM host-weight path",
             "torch_only": "same host-weight wrapper with PyTorch fallback; not a GPU-resident LLaMA-Factory baseline",
         },
         "workloads": workloads,
         "backends": backends,
+        "profilers": profilers,
         "commands": commands,
         "runs": rows,
         "comparisons": _add_comparisons(rows),
     }
-    (run_dir / "commands.json").write_text(json.dumps(commands, indent=2) + "\n", encoding="utf-8")
-    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    (run_dir / "summary.md").write_text(_markdown(summary), encoding="utf-8")
-    print(f"Wrote {run_dir / 'summary.md'}")
-    print(f"Wrote {run_dir / 'summary.json'}")
+    summary_stem = "_".join(part for part in (_safe_label(args.precision), _safe_label(args.workflow), "summary") if part)
+    commands_path = run_dir / f"{_safe_label(args.precision)}_{_safe_label(args.workflow)}_commands.json"
+    commands_path.write_text(json.dumps(commands, indent=2) + "\n", encoding="utf-8")
+    (run_dir / f"{summary_stem}.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    (run_dir / f"{summary_stem}.md").write_text(_markdown(summary), encoding="utf-8")
+    print(f"Wrote {run_dir / f'{summary_stem}.md'}")
+    print(f"Wrote {run_dir / f'{summary_stem}.json'}")
+    print(f"Wrote {commands_path}")
 
     failed = [row for row in rows if row["returncode"] != 0]
     if failed:

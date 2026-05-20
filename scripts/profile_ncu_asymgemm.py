@@ -62,6 +62,14 @@ def main() -> None:
     parser.add_argument("--backend", default="asym_only")
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--measure-steps", type=int, default=1)
+    parser.add_argument("--moe-mode", choices=["contiguous", "masked"], default="contiguous")
+    parser.add_argument("--profile-layers", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--seq-len", type=int, default=64)
+    parser.add_argument("--tokens", type=int, default=0)
+    parser.add_argument("--lora-rank", type=int, default=64)
+    parser.add_argument("--lora-alpha", type=float, default=128.0)
+    parser.add_argument("--vocab-rows", type=int, default=4096)
     parser.add_argument("--launch-skip", type=int)
     parser.add_argument("--launch-count", type=int)
     parser.add_argument("--preset", choices=["quick", "paper"], default="paper")
@@ -130,6 +138,22 @@ def main() -> None:
         str(args.measure_steps),
         "--timing-mode",
         "profile",
+        "--moe-mode",
+        args.moe_mode,
+        "--profile-layers",
+        str(args.profile_layers),
+        "--batch-size",
+        str(args.batch_size),
+        "--seq-len",
+        str(args.seq_len),
+        "--tokens",
+        str(args.tokens),
+        "--lora-rank",
+        str(args.lora_rank),
+        "--lora-alpha",
+        str(args.lora_alpha),
+        "--vocab-rows",
+        str(args.vocab_rows),
         "--output-dir",
         str(source_dir),
     ]
