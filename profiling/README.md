@@ -17,13 +17,23 @@ and are kept as `debug.md` / `debug.json`.
 | `qwen3_30b_a3b/` | Qwen3-30B-A3B config-matched profile | Nsight GPU timeline/kernel/memcpy/no-kernel table |
 | `*/debug.md`, `*/debug.json` | Matching source-label report | Python/source range coverage only; not performance truth |
 | `*/nsight/` | Matching Nsight report | Same data as the workload top-level table |
+| `*/ncu/` | Matching Nsight Compute report when present | Kernel-internal metrics for AsymGEMM kernels |
 
 Use `--timing-mode profile` plus Nsight Systems for real GPU bubble analysis.
 Use `--timing-mode debug_sync` only for source label coverage debugging.
+Use Nsight Compute only for kernel-internal diagnosis; it replays kernels and
+must not be used for end-to-end wall-time claims.
 
 The fundamental selectors are:
 
 ```bash
 python scripts/profile_m4_steps.py --workload matrix_1b --timing-mode profile
 python scripts/profile_m4_steps.py --workload mlp_1b --timing-mode profile
+```
+
+The fundamental NCU selectors are:
+
+```bash
+python scripts/profile_ncu_asymgemm.py --workload matrix_1b --preset paper
+python scripts/profile_ncu_asymgemm.py --workload mlp_1b --preset paper
 ```

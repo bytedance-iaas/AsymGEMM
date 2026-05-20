@@ -2,6 +2,121 @@
   "source": "reports/fundamental_1b/nsys_mlp_1b_profile.sqlite",
   "stages": [
     {
+      "gpu_no_kernel_gaps": {
+        "rows": [
+          {
+            "cuda_api_overlap_milliseconds": 0.013805,
+            "enclosing_nvtx": "step.forward",
+            "end_offset_milliseconds": 0.202236,
+            "gap_milliseconds": 0.202236,
+            "next_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)65536, (unsigned int)8192, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)128, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "percent": 0.25613283668281817,
+            "previous_kernel": "<stage_start>",
+            "start_offset_milliseconds": 0.0,
+            "sync_overlap_milliseconds": 0.0
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.012344,
+            "enclosing_nvtx": "forward.fc1.base_frozen_asymgemm",
+            "end_offset_milliseconds": 0.233404,
+            "gap_milliseconds": 0.0304,
+            "next_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)65536, (unsigned int)8192, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)128, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "percent": 0.03850174170354275,
+            "previous_kernel": "<stage_start>",
+            "start_offset_milliseconds": 0.203004,
+            "sync_overlap_milliseconds": 0.005744
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.014374,
+            "enclosing_nvtx": "forward.fc1.base_frozen_asymgemm",
+            "end_offset_milliseconds": 0.281916,
+            "gap_milliseconds": 0.047744,
+            "next_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)65536, (unsigned int)8192, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)128, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "percent": 0.06046799854914293,
+            "previous_kernel": "<stage_start>",
+            "start_offset_milliseconds": 0.234172,
+            "sync_overlap_milliseconds": 0.002961
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.001024,
+            "enclosing_nvtx": "forward.fc2.base_frozen_asymgemm",
+            "end_offset_milliseconds": 36.420218,
+            "gap_milliseconds": 0.001024,
+            "next_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "percent": 0.001296900773171966,
+            "previous_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)65536, (unsigned int)8192, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)128, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "start_offset_milliseconds": 36.419194,
+            "sync_overlap_milliseconds": 0.001024
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.000992,
+            "enclosing_nvtx": "forward.fc2.base_frozen_asymgemm",
+            "end_offset_milliseconds": 36.427674,
+            "gap_milliseconds": 0.000992,
+            "next_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::<unnamed>::launch_clamp_scalar(at::TensorIteratorBase &, c10::Scalar, c10::Scalar, at::native::detail::ClampLimits)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 9)]::operator ()() const::[lambda(c10::BFloat16) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "percent": 0.0012563726240103425,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "start_offset_milliseconds": 36.426682,
+            "sync_overlap_milliseconds": 0.000992
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.002176,
+            "enclosing_nvtx": "forward.fc2.base_frozen_asymgemm",
+            "end_offset_milliseconds": 36.434106,
+            "gap_milliseconds": 0.002176,
+            "next_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)8192, (unsigned int)65536, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)128, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "percent": 0.002755914142990428,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::<unnamed>::launch_clamp_scalar(at::TensorIteratorBase &, c10::Scalar, c10::Scalar, at::native::detail::ClampLimits)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 9)]::operator ()() const::[lambda(c10::BFloat16) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "start_offset_milliseconds": 36.43193,
+            "sync_overlap_milliseconds": 0.002176
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.014135,
+            "enclosing_nvtx": "forward.fc2.base_frozen_asymgemm",
+            "end_offset_milliseconds": 36.47465,
+            "gap_milliseconds": 0.039712,
+            "next_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)8192, (unsigned int)65536, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)128, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "percent": 0.05029543310957531,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::<unnamed>::launch_clamp_scalar(at::TensorIteratorBase &, c10::Scalar, c10::Scalar, at::native::detail::ClampLimits)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 9)]::operator ()() const::[lambda(c10::BFloat16) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "start_offset_milliseconds": 36.434938,
+            "sync_overlap_milliseconds": 0.006493
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.015226,
+            "enclosing_nvtx": "forward.fc2.base_frozen_asymgemm",
+            "end_offset_milliseconds": 36.518714,
+            "gap_milliseconds": 0.043264,
+            "next_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)8192, (unsigned int)65536, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)128, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "percent": 0.054794057666515565,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::<unnamed>::launch_clamp_scalar(at::TensorIteratorBase &, c10::Scalar, c10::Scalar, at::native::detail::ClampLimits)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 9)]::operator ()() const::[lambda(c10::BFloat16) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "start_offset_milliseconds": 36.47545,
+            "sync_overlap_milliseconds": 0.003192
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.001024,
+            "enclosing_nvtx": "step.forward",
+            "end_offset_milliseconds": 78.916823,
+            "gap_milliseconds": 0.001024,
+            "next_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "percent": 0.001296900773171966,
+            "previous_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)8192, (unsigned int)65536, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)128, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "start_offset_milliseconds": 78.915799,
+            "sync_overlap_milliseconds": 0.001024
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.011972,
+            "enclosing_nvtx": "step.forward",
+            "end_offset_milliseconds": 78.957467,
+            "gap_milliseconds": 0.038756,
+            "next_kernel": "<stage_end>",
+            "percent": 0.0490846546533718,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "start_offset_milliseconds": 78.918711,
+            "sync_overlap_milliseconds": 0.009074
+          }
+        ],
+        "total_milliseconds": 0.40732799999999486
+      },
       "host_api_breakdown": {
         "rows": [
           {
@@ -103,6 +218,176 @@
       "total_milliseconds": 78.957467
     },
     {
+      "gpu_no_kernel_gaps": {
+        "rows": [
+          {
+            "cuda_api_overlap_milliseconds": 0.007454,
+            "enclosing_nvtx": "step.backward",
+            "end_offset_milliseconds": 0.041039,
+            "gap_milliseconds": 0.041039,
+            "next_kernel": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<float>, std::array<char *, (unsigned long)1>>(int, T2, T3)",
+            "percent": 0.05750482931831297,
+            "previous_kernel": "<stage_start>",
+            "start_offset_milliseconds": 0.0,
+            "sync_overlap_milliseconds": 0.0
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.00941,
+            "enclosing_nvtx": "step.backward",
+            "end_offset_milliseconds": 0.133743,
+            "gap_milliseconds": 0.092,
+            "next_kernel": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "percent": 0.12891260258010165,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<float>, std::array<char *, (unsigned long)1>>(int, T2, T3)",
+            "start_offset_milliseconds": 0.041743,
+            "sync_overlap_milliseconds": 0.0
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.006659,
+            "enclosing_nvtx": "backward.loss.mse",
+            "end_offset_milliseconds": 0.150991,
+            "gap_milliseconds": 0.016288,
+            "next_kernel": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+            "percent": 0.022823135552442347,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "start_offset_milliseconds": 0.134703,
+            "sync_overlap_milliseconds": 0.0
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.005033,
+            "enclosing_nvtx": "step.backward",
+            "end_offset_milliseconds": 0.195023,
+            "gap_milliseconds": 0.041024,
+            "next_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "percent": 0.05748381095919663,
+            "previous_kernel": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+            "start_offset_milliseconds": 0.153999,
+            "sync_overlap_milliseconds": 0.0
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.010724,
+            "enclosing_nvtx": "step.backward",
+            "end_offset_milliseconds": 0.308239,
+            "gap_milliseconds": 0.111584,
+            "next_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)65536, (unsigned int)8192, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)128, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "percent": 0.15635417224237028,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "start_offset_milliseconds": 0.196655,
+            "sync_overlap_milliseconds": 0.000583
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.014431,
+            "enclosing_nvtx": "backward.fc2.base_dx_asymgemm",
+            "end_offset_milliseconds": 0.338255,
+            "gap_milliseconds": 0.029152,
+            "next_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)65536, (unsigned int)8192, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)128, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "percent": 0.04084848033059917,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "start_offset_milliseconds": 0.309103,
+            "sync_overlap_milliseconds": 0.005759
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.011581,
+            "enclosing_nvtx": "backward.fc2.base_dx_asymgemm",
+            "end_offset_milliseconds": 0.373679,
+            "gap_milliseconds": 0.034688,
+            "next_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)65536, (unsigned int)8192, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)128, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "percent": 0.04860565606846268,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "start_offset_milliseconds": 0.338991,
+            "sync_overlap_milliseconds": 0.002995
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.001056,
+            "enclosing_nvtx": "backward.fc1.base_dx_asymgemm",
+            "end_offset_milliseconds": 40.489036,
+            "gap_milliseconds": 0.001056,
+            "next_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "percent": 0.0014796924817889931,
+            "previous_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)65536, (unsigned int)8192, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)128, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "start_offset_milliseconds": 40.48798,
+            "sync_overlap_milliseconds": 0.001056
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.001024,
+            "enclosing_nvtx": "backward.fc1.base_dx_asymgemm",
+            "end_offset_milliseconds": 40.496588,
+            "gap_milliseconds": 0.001024,
+            "next_kernel": "void at::native::vectorized_elementwise_kernel<(int)4, void at::native::compare_scalar_kernel<c10::BFloat16>(at::TensorIteratorBase &, at::native::<unnamed>::OpType, T1)::[lambda(c10::BFloat16) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "percent": 0.001434853315674175,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "start_offset_milliseconds": 40.495564,
+            "sync_overlap_milliseconds": 0.001024
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.000928,
+            "enclosing_nvtx": "backward.fc1.base_dx_asymgemm",
+            "end_offset_milliseconds": 40.501548,
+            "gap_milliseconds": 0.000928,
+            "next_kernel": "void at::native::unrolled_elementwise_kernel<at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)3>, (int)4, TrivialOffsetCalculator<(int)2, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)2>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+            "percent": 0.0013003358173297212,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)4, void at::native::compare_scalar_kernel<c10::BFloat16>(at::TensorIteratorBase &, at::native::<unnamed>::OpType, T1)::[lambda(c10::BFloat16) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "start_offset_milliseconds": 40.50062,
+            "sync_overlap_milliseconds": 0.000928
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.002272,
+            "enclosing_nvtx": "backward.fc1.base_dx_asymgemm",
+            "end_offset_milliseconds": 40.518348,
+            "gap_milliseconds": 0.002272,
+            "next_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)8192, (unsigned int)65536, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)128, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "percent": 0.0031835807941520762,
+            "previous_kernel": "void at::native::unrolled_elementwise_kernel<at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)3>, (int)4, TrivialOffsetCalculator<(int)2, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)2>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+            "start_offset_milliseconds": 40.516076,
+            "sync_overlap_milliseconds": 0.002272
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.016996,
+            "enclosing_nvtx": "backward.fc1.base_dx_asymgemm",
+            "end_offset_milliseconds": 40.564268,
+            "gap_milliseconds": 0.045152,
+            "next_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)8192, (unsigned int)65536, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)128, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "percent": 0.06326806338800815,
+            "previous_kernel": "void at::native::unrolled_elementwise_kernel<at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)3>, (int)4, TrivialOffsetCalculator<(int)2, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)2>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+            "start_offset_milliseconds": 40.519116,
+            "sync_overlap_milliseconds": 0.007014
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.017629,
+            "enclosing_nvtx": "backward.fc1.base_dx_asymgemm",
+            "end_offset_milliseconds": 40.61326,
+            "gap_milliseconds": 0.048256,
+            "next_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)8192, (unsigned int)65536, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)128, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "percent": 0.06761746250114549,
+            "previous_kernel": "void at::native::unrolled_elementwise_kernel<at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)3>, (int)4, TrivialOffsetCalculator<(int)2, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)2>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+            "start_offset_milliseconds": 40.565004,
+            "sync_overlap_milliseconds": 0.00315
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.000864,
+            "enclosing_nvtx": "step.backward",
+            "end_offset_milliseconds": 71.343978,
+            "gap_milliseconds": 0.000864,
+            "next_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "percent": 0.001210657485100085,
+            "previous_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)8192, (unsigned int)65536, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)128, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "start_offset_milliseconds": 71.343114,
+            "sync_overlap_milliseconds": 0.000864
+          },
+          {
+            "cuda_api_overlap_milliseconds": 0.007081,
+            "enclosing_nvtx": "step.backward",
+            "end_offset_milliseconds": 71.36618,
+            "gap_milliseconds": 0.020538,
+            "next_kernel": "<stage_end>",
+            "percent": 0.028778337302066605,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "start_offset_milliseconds": 71.345642,
+            "sync_overlap_milliseconds": 0.005891
+          }
+        ],
+        "total_milliseconds": 0.4858649999999973
+      },
       "host_api_breakdown": {
         "rows": [
           {

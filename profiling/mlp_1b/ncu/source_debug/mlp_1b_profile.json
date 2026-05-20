@@ -1,0 +1,192 @@
+{
+  "backward": {
+    "rows": [
+      {
+        "milliseconds": 0.5066292360424995,
+        "name": "backward.loss.mse.total",
+        "percent": 0.006533961081011636,
+        "seconds": 0.0005066292360424995
+      },
+      {
+        "milliseconds": 4018.0730996653438,
+        "name": "backward.fc2.base_dx_asymgemm.total",
+        "percent": 51.8208018529566,
+        "seconds": 4.018073099665344
+      },
+      {
+        "milliseconds": 0.423661433160305,
+        "name": "backward.activation_relu.total",
+        "percent": 0.0054639312516161845,
+        "seconds": 0.000423661433160305
+      },
+      {
+        "milliseconds": 3732.456819154322,
+        "name": "backward.fc1.base_dx_asymgemm.total",
+        "percent": 48.13722907784386,
+        "seconds": 3.732456819154322
+      },
+      {
+        "milliseconds": 2.3239003494381905,
+        "name": "backward.python_autograd_dispatch_cuda_launch_and_sync",
+        "percent": 0.02997117686691243,
+        "seconds": 0.0023239003494381905
+      },
+      {
+        "milliseconds": 0.0,
+        "name": "backward.accounting_gap",
+        "percent": 0.0,
+        "seconds": 0.0
+      }
+    ],
+    "sum_percent": 100.0,
+    "sum_seconds": 7.753784109838307,
+    "total_milliseconds": 7753.784109838307,
+    "total_seconds": 7.753784109838307
+  },
+  "config": {
+    "base_parameter_billions": 1.073741824,
+    "base_parameter_count": 1073741824,
+    "hidden_features": 65536,
+    "in_features": 8192,
+    "out_features": 8192,
+    "profile_goal": "fundamental_1b_parameter_asymgemm",
+    "tokens": 64
+  },
+  "device": "cuda:1",
+  "execution_stats": {
+    "asym_calls": 4,
+    "asym_dx_calls": 2,
+    "asym_forward_calls": 2,
+    "fallback_reasons": {},
+    "staged_calls": 0,
+    "staged_dx_calls": 0,
+    "staged_forward_calls": 0,
+    "torch_calls": 0,
+    "torch_dx_calls": 0,
+    "torch_forward_calls": 0
+  },
+  "forward": {
+    "rows": [
+      {
+        "milliseconds": 5294.832760468125,
+        "name": "forward.fc1.base_frozen_asymgemm",
+        "percent": 56.34572752426144,
+        "seconds": 5.294832760468125
+      },
+      {
+        "milliseconds": 0.4303930327296257,
+        "name": "forward.activation_relu",
+        "percent": 0.00458008961710435,
+        "seconds": 0.0004303930327296257
+      },
+      {
+        "milliseconds": 4101.563426665962,
+        "name": "forward.fc2.base_frozen_asymgemm",
+        "percent": 43.64737957124144,
+        "seconds": 4.101563426665962
+      },
+      {
+        "milliseconds": 0.2173362299799919,
+        "name": "forward.python_dispatch_cuda_launch_and_sync",
+        "percent": 0.0023128148800152393,
+        "seconds": 0.0002173362299799919
+      }
+    ],
+    "sum_percent": 100.0,
+    "sum_seconds": 9.397043916396797,
+    "total_milliseconds": 9397.043916396797,
+    "total_seconds": 9.397043916396797
+  },
+  "memory": {
+    "cpu": {
+      "host_w_bytes": 2147483648,
+      "host_w_t_bytes": 0,
+      "host_w_t_percent_of_host_weight": 0.0,
+      "pinned_total_bytes": 2147483648,
+      "pinned_w_bytes": 2147483648,
+      "pinned_w_t_bytes": 0,
+      "pinned_w_t_percent_of_host_weight": 0.0
+    },
+    "gpu": {
+      "buffer_bytes": 0,
+      "parameter_bytes": 0,
+      "peak_hbm_bytes": 37750784,
+      "unattributed_peak_bytes": 37750784
+    }
+  },
+  "notes": [
+    "Source-level rows are Python wall-clock range timings. In timing_mode=profile, inner ranges do not synchronize and should be treated as labels/CPU submission timing, not GPU execution timing.",
+    "Use timing_mode=profile under Nsight Systems for real GPU bubble analysis; inner ranges are NVTX/record_function labels and do not force per-op CUDA synchronization.",
+    "timing_mode=debug_sync is a debugging-only source coverage check that synchronizes every region and must not be used for performance claims.",
+    "All explicit tensor ops in the instrumented toy forward/backward are assigned named ranges. Source-level residual rows are non-tensor-op overhead: Python dispatch, PyTorch autograd engine scheduling, CUDA launch latency, and synchronization/profiler overhead.",
+    "pinned_w_t_bytes is an audit field and should remain zero after transpose_b=True dX.",
+    "The optional torch_profiler_backward table is a debug aid averaged over all profiled steps, including warmup; Nsight tables remain the performance truth."
+  ],
+  "raw_dispatch_call_group_seconds_per_step": {
+    "backward.fc1.base_dx_asymgemm": 3.732456819154322,
+    "backward.fc2.base_dx_asymgemm": 4.018073099665344,
+    "forward.base_frozen_asymgemm": 9.395006789825857
+  },
+  "raw_seconds_per_step": {
+    "backward.activation_relu.grad": 0.000423661433160305,
+    "backward.activation_relu.total": 0.000423661433160305,
+    "backward.fc1.base_dx_asymgemm.total": 3.732456819154322,
+    "backward.fc2.base_dx_asymgemm.total": 4.018073099665344,
+    "backward.loss.mse.grad": 0.0005066292360424995,
+    "backward.loss.mse.total": 0.0005066292360424995,
+    "backward.python_autograd_dispatch_cuda_launch_and_sync": 0.0023239003494381905,
+    "forward.activation_relu": 0.0004303930327296257,
+    "forward.fc1.base_frozen_asymgemm": 5.294832760468125,
+    "forward.fc2.base_frozen_asymgemm": 4.101563426665962,
+    "step.backward": 7.753784109838307,
+    "step.forward": 9.397043916396797,
+    "step.input_preparation": 0.0008521294221282005,
+    "step.loss": 0.001007632352411747,
+    "step.optimizer": 0.00010368973016738892
+  },
+  "step": {
+    "rows": [
+      {
+        "milliseconds": 0.8521294221282005,
+        "name": "step.input_preparation",
+        "percent": 0.004967876063986781,
+        "seconds": 0.0008521294221282005
+      },
+      {
+        "milliseconds": 9397.043916396797,
+        "name": "step.forward",
+        "percent": 54.78434182909467,
+        "seconds": 9.397043916396797
+      },
+      {
+        "milliseconds": 1.007632352411747,
+        "name": "step.loss",
+        "percent": 0.0058744511277911285,
+        "seconds": 0.001007632352411747
+      },
+      {
+        "milliseconds": 7753.784109838307,
+        "name": "step.backward",
+        "percent": 45.204211337267466,
+        "seconds": 7.753784109838307
+      },
+      {
+        "milliseconds": 0.10368973016738892,
+        "name": "step.optimizer",
+        "percent": 0.0006045064460904407,
+        "seconds": 0.00010368973016738892
+      },
+      {
+        "milliseconds": 0.0,
+        "name": "step.accounting_gap",
+        "percent": 0.0,
+        "seconds": 0.0
+      }
+    ],
+    "sum_percent": 100.0,
+    "sum_seconds": 17.15279147773981,
+    "total_milliseconds": 17152.79147773981,
+    "total_seconds": 17.15279147773981
+  },
+  "workload": "mlp_1b"
+}

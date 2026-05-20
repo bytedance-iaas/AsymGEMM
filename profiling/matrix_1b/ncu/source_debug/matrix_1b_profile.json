@@ -1,0 +1,161 @@
+{
+  "backward": {
+    "rows": [
+      {
+        "milliseconds": 0.4726732149720192,
+        "name": "backward.loss.mse.total",
+        "percent": 0.00873835012115433,
+        "seconds": 0.0004726732149720192
+      },
+      {
+        "milliseconds": 5406.802954152226,
+        "name": "backward.matrix.base_dx_asymgemm.total",
+        "percent": 99.95602829381933,
+        "seconds": 5.4068029541522264
+      },
+      {
+        "milliseconds": 1.9058361649513245,
+        "name": "backward.python_autograd_dispatch_cuda_launch_and_sync",
+        "percent": 0.03523335605951052,
+        "seconds": 0.0019058361649513245
+      },
+      {
+        "milliseconds": 0.0,
+        "name": "backward.accounting_gap",
+        "percent": 0.0,
+        "seconds": 0.0
+      }
+    ],
+    "sum_percent": 100.0,
+    "sum_seconds": 5.40918146353215,
+    "total_milliseconds": 5409.18146353215,
+    "total_seconds": 5.40918146353215
+  },
+  "config": {
+    "base_parameter_billions": 1.073741824,
+    "base_parameter_count": 1073741824,
+    "in_features": 32768,
+    "out_features": 32768,
+    "profile_goal": "fundamental_1b_parameter_asymgemm",
+    "tokens": 64
+  },
+  "device": "cuda:1",
+  "execution_stats": {
+    "asym_calls": 2,
+    "asym_dx_calls": 1,
+    "asym_forward_calls": 1,
+    "fallback_reasons": {},
+    "staged_calls": 0,
+    "staged_dx_calls": 0,
+    "staged_forward_calls": 0,
+    "torch_calls": 0,
+    "torch_dx_calls": 0,
+    "torch_forward_calls": 0
+  },
+  "forward": {
+    "rows": [
+      {
+        "milliseconds": 6715.576119720936,
+        "name": "forward.matrix.base_frozen_asymgemm",
+        "percent": 99.9976978657773,
+        "seconds": 6.715576119720936
+      },
+      {
+        "milliseconds": 0.15460513532161713,
+        "name": "forward.python_dispatch_cuda_launch_and_sync",
+        "percent": 0.0023021342227048016,
+        "seconds": 0.00015460513532161713
+      }
+    ],
+    "sum_percent": 100.0,
+    "sum_seconds": 6.715730724856257,
+    "total_milliseconds": 6715.730724856257,
+    "total_seconds": 6.715730724856257
+  },
+  "memory": {
+    "cpu": {
+      "host_w_bytes": 2147483648,
+      "host_w_t_bytes": 0,
+      "host_w_t_percent_of_host_weight": 0.0,
+      "pinned_total_bytes": 2147483648,
+      "pinned_w_bytes": 2147483648,
+      "pinned_w_t_bytes": 0,
+      "pinned_w_t_percent_of_host_weight": 0.0
+    },
+    "gpu": {
+      "buffer_bytes": 0,
+      "parameter_bytes": 0,
+      "peak_hbm_bytes": 54528512,
+      "unattributed_peak_bytes": 54528512
+    }
+  },
+  "notes": [
+    "Source-level rows are Python wall-clock range timings. In timing_mode=profile, inner ranges do not synchronize and should be treated as labels/CPU submission timing, not GPU execution timing.",
+    "Use timing_mode=profile under Nsight Systems for real GPU bubble analysis; inner ranges are NVTX/record_function labels and do not force per-op CUDA synchronization.",
+    "timing_mode=debug_sync is a debugging-only source coverage check that synchronizes every region and must not be used for performance claims.",
+    "All explicit tensor ops in the instrumented toy forward/backward are assigned named ranges. Source-level residual rows are non-tensor-op overhead: Python dispatch, PyTorch autograd engine scheduling, CUDA launch latency, and synchronization/profiler overhead.",
+    "pinned_w_t_bytes is an audit field and should remain zero after transpose_b=True dX.",
+    "The optional torch_profiler_backward table is a debug aid averaged over all profiled steps, including warmup; Nsight tables remain the performance truth."
+  ],
+  "raw_dispatch_call_group_seconds_per_step": {
+    "backward.matrix.base_dx_asymgemm": 5.4068029541522264,
+    "forward.base_frozen_asymgemm": 6.7148780189454556
+  },
+  "raw_seconds_per_step": {
+    "backward.loss.mse.grad": 0.0004726732149720192,
+    "backward.loss.mse.total": 0.0004726732149720192,
+    "backward.matrix.base_dx_asymgemm.total": 5.4068029541522264,
+    "backward.python_autograd_dispatch_cuda_launch_and_sync": 0.0019058361649513245,
+    "forward.matrix.base_frozen_asymgemm": 6.715576119720936,
+    "step.backward": 5.40918146353215,
+    "step.forward": 6.715730724856257,
+    "step.input_preparation": 0.0005321856588125229,
+    "step.loss": 0.001033073291182518,
+    "step.optimizer": 0.0001307465136051178
+  },
+  "step": {
+    "rows": [
+      {
+        "milliseconds": 0.5321856588125229,
+        "name": "step.input_preparation",
+        "percent": 0.004388577995637167,
+        "seconds": 0.0005321856588125229
+      },
+      {
+        "milliseconds": 6715.730724856257,
+        "name": "step.forward",
+        "percent": 55.38012457812419,
+        "seconds": 6.715730724856257
+      },
+      {
+        "milliseconds": 1.033073291182518,
+        "name": "step.loss",
+        "percent": 0.008519062170296467,
+        "seconds": 0.001033073291182518
+      },
+      {
+        "milliseconds": 5409.18146353215,
+        "name": "step.backward",
+        "percent": 44.60588960295193,
+        "seconds": 5.40918146353215
+      },
+      {
+        "milliseconds": 0.1307465136051178,
+        "name": "step.optimizer",
+        "percent": 0.0010781787579432487,
+        "seconds": 0.0001307465136051178
+      },
+      {
+        "milliseconds": 0.0,
+        "name": "step.accounting_gap",
+        "percent": 0.0,
+        "seconds": 0.0
+      }
+    ],
+    "sum_percent": 100.0,
+    "sum_seconds": 12.126608193852007,
+    "total_milliseconds": 12126.608193852007,
+    "total_seconds": 12.126608193852007
+  },
+  "workload": "matrix_1b"
+}

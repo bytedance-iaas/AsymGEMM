@@ -44,6 +44,31 @@ def _interval_union(intervals: list[tuple[int, int]]) -> int:
     return total
 
 
+def _merged_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    intervals = sorted((s, e) for s, e in intervals if e > s)
+    if not intervals:
+        return []
+    merged: list[tuple[int, int]] = []
+    cur_s, cur_e = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= cur_e:
+            cur_e = max(cur_e, end)
+        else:
+            merged.append((cur_s, cur_e))
+            cur_s, cur_e = start, end
+    merged.append((cur_s, cur_e))
+    return merged
+
+
+def _overlap_ns(start: int, end: int, intervals: list[tuple[int, int]]) -> int:
+    total = 0
+    for other_start, other_end in intervals:
+        overlap = min(end, other_end) - max(start, other_start)
+        if overlap > 0:
+            total += overlap
+    return total
+
+
 def _percent(value: float, total: float) -> float:
     return 0.0 if total <= 0.0 else value * 100.0 / total
 
@@ -119,6 +144,18 @@ def _runtime_rows(con: sqlite3.Connection, start: int, end: int) -> list[tuple[i
     ]
 
 
+def _sync_intervals(con: sqlite3.Connection, start: int, end: int) -> list[tuple[int, int]]:
+    if not _table_exists(con, "CUPTI_ACTIVITY_KIND_SYNCHRONIZATION"):
+        return []
+    return [
+        (int(s), int(e))
+        for s, e in con.execute(
+            "select start,end from CUPTI_ACTIVITY_KIND_SYNCHRONIZATION where start>=? and end<=?",
+            (start, end),
+        )
+    ]
+
+
 def _correlated_intervals(con: sqlite3.Connection, table: str, correlation_ids: set[int]) -> list[tuple[int, int]]:
     if not correlation_ids or not _table_exists(con, table):
         return []
@@ -129,6 +166,23 @@ def _correlated_intervals(con: sqlite3.Connection, table: str, correlation_ids: 
             f"select start,end from {table} where correlationId in ({placeholders})",
             tuple(correlation_ids),
         )
+    ]
+
+
+def _kernel_events(con: sqlite3.Connection, correlation_ids: set[int]) -> list[dict[str, Any]]:
+    if not correlation_ids or not _table_exists(con, "CUPTI_ACTIVITY_KIND_KERNEL"):
+        return []
+    placeholders = ",".join("?" for _ in correlation_ids)
+    query = f"""
+        select k.start,k.end,coalesce(s.value, '<unknown>')
+        from CUPTI_ACTIVITY_KIND_KERNEL k
+        left join StringIds s on s.id = k.demangledName
+        where k.correlationId in ({placeholders})
+        order by k.start
+    """
+    return [
+        {"start": int(start), "end": int(end), "name": str(name)}
+        for start, end, name in con.execute(query, tuple(correlation_ids))
     ]
 
 
@@ -146,6 +200,81 @@ def _kernel_name_rows(con: sqlite3.Connection, correlation_ids: set[int]) -> dic
     return {str(name): float(ms or 0.0) for name, ms in con.execute(query, tuple(correlation_ids))}
 
 
+def _enclosing_range(gap_start: int, gap_end: int, ranges: list[tuple[int, int, str]], fallback: str) -> str:
+    enclosing: list[tuple[int, str]] = []
+    for start, end, text in ranges:
+        if start <= gap_start and gap_end <= end:
+            name = _normalize_range_name(text)
+            if name is not None:
+                enclosing.append((end - start, name))
+    if not enclosing:
+        return fallback
+    enclosing.sort(key=lambda item: item[0])
+    return enclosing[0][1]
+
+
+def _kernel_before(kernel_events: list[dict[str, Any]], gap_start: int) -> str:
+    before = [event for event in kernel_events if int(event["end"]) <= gap_start]
+    if not before:
+        return "<stage_start>"
+    return str(max(before, key=lambda event: int(event["end"]))["name"])
+
+
+def _kernel_after(kernel_events: list[dict[str, Any]], gap_end: int) -> str:
+    after = [event for event in kernel_events if int(event["start"]) >= gap_end]
+    if not after:
+        return "<stage_end>"
+    return str(min(after, key=lambda event: int(event["start"]))["name"])
+
+
+def _no_kernel_gaps(
+    *,
+    stage_start: int,
+    stage_end: int,
+    total_ms: float,
+    stage_name: str,
+    ranges: list[tuple[int, int, str]],
+    runtime: list[tuple[int, int, int]],
+    sync_intervals: list[tuple[int, int]],
+    kernel_events: list[dict[str, Any]],
+    memcpy_intervals: list[tuple[int, int]],
+) -> list[dict[str, Any]]:
+    busy = _merged_intervals([(int(event["start"]), int(event["end"])) for event in kernel_events] + memcpy_intervals)
+    gaps: list[tuple[int, int]] = []
+    cursor = stage_start
+    for start, end in busy:
+        clipped_start = max(stage_start, start)
+        clipped_end = min(stage_end, end)
+        if clipped_end <= stage_start or clipped_start >= stage_end:
+            continue
+        if clipped_start > cursor:
+            gaps.append((cursor, clipped_start))
+        cursor = max(cursor, clipped_end)
+    if cursor < stage_end:
+        gaps.append((cursor, stage_end))
+
+    runtime_intervals = [(start, end) for start, end, _ in runtime]
+    rows: list[dict[str, Any]] = []
+    for gap_start, gap_end in gaps:
+        gap_ms = _ms(gap_end - gap_start)
+        if gap_ms <= 0.0:
+            continue
+        rows.append(
+            {
+                "previous_kernel": _kernel_before(kernel_events, gap_start),
+                "next_kernel": _kernel_after(kernel_events, gap_end),
+                "gap_milliseconds": gap_ms,
+                "percent": _percent(gap_ms, total_ms),
+                "enclosing_nvtx": _enclosing_range(gap_start, gap_end, ranges, stage_name),
+                "cuda_api_overlap_milliseconds": _ms(_overlap_ns(gap_start, gap_end, runtime_intervals)),
+                "sync_overlap_milliseconds": _ms(_overlap_ns(gap_start, gap_end, sync_intervals)),
+                "start_offset_milliseconds": _ms(gap_start - stage_start),
+                "end_offset_milliseconds": _ms(gap_end - stage_start),
+            }
+        )
+    return rows
+
+
 def summarize_stage(con: sqlite3.Connection, stage_name: str) -> dict[str, Any]:
     start, end = _last_step(con, stage_name)
     total_ms = _ms(end - start)
@@ -153,12 +282,9 @@ def summarize_stage(con: sqlite3.Connection, stage_name: str) -> dict[str, Any]:
     runtime_corr = {corr for _, _, corr in runtime if corr is not None}
     kernel_intervals = _correlated_intervals(con, "CUPTI_ACTIVITY_KIND_KERNEL", runtime_corr)
     memcpy_intervals = _correlated_intervals(con, "CUPTI_ACTIVITY_KIND_MEMCPY", runtime_corr)
-    sync_ns = 0
-    if _table_exists(con, "CUPTI_ACTIVITY_KIND_SYNCHRONIZATION"):
-        sync_ns = int(con.execute(
-            "select coalesce(sum(end-start),0) from CUPTI_ACTIVITY_KIND_SYNCHRONIZATION where start>=? and end<=?",
-            (start, end),
-        ).fetchone()[0])
+    sync_intervals = _sync_intervals(con, start, end)
+    sync_ns = sum(sync_end - sync_start for sync_start, sync_end in sync_intervals)
+    kernel_events = _kernel_events(con, runtime_corr)
 
     kernel_ms = _ms(_interval_union(kernel_intervals))
     memcpy_ms = _ms(_interval_union(memcpy_intervals))
@@ -169,7 +295,8 @@ def summarize_stage(con: sqlite3.Connection, stage_name: str) -> dict[str, Any]:
     prefix = stage_name.replace("step.", "") + ".%"
     op_kernel: dict[str, float] = defaultdict(float)
     op_api: dict[str, float] = defaultdict(float)
-    for r_start, r_end, text in _fetch_ranges(con, prefix):
+    ranges = _fetch_ranges(con, prefix)
+    for r_start, r_end, text in ranges:
         if r_start < start or r_end > end:
             continue
         name = _normalize_range_name(text)
@@ -212,6 +339,20 @@ def summarize_stage(con: sqlite3.Connection, stage_name: str) -> dict[str, Any]:
             "rows": _rows(op_api, total_ms),
         },
         "top_kernels": _rows(_kernel_name_rows(con, runtime_corr), total_ms)[:20],
+        "gpu_no_kernel_gaps": {
+            "total_milliseconds": gpu_idle_or_no_kernel_ms,
+            "rows": _no_kernel_gaps(
+                stage_start=start,
+                stage_end=end,
+                total_ms=total_ms,
+                stage_name=stage_name,
+                ranges=ranges,
+                runtime=runtime,
+                sync_intervals=sync_intervals,
+                kernel_events=kernel_events,
+                memcpy_intervals=memcpy_intervals,
+            ),
+        },
     }
     return summary
 
@@ -233,6 +374,25 @@ def markdown(report: dict[str, Any]) -> str:
         lines += ["### Top Kernels", "", "| Kernel | ms | % stage |", "|---|---:|---:|"]
         for row in stage["top_kernels"]:
             lines.append(f"| `{row['name']}` | {row['milliseconds']:.4f} | {row['percent']:.2f}% |")
+        lines.append("")
+        lines += [
+            "### GPU No-Kernel Gaps",
+            "",
+            "| Previous kernel | Next kernel | gap ms | % stage | enclosing NVTX | CUDA API overlap ms | sync overlap ms | stage offset ms |",
+            "|---|---|---:|---:|---|---:|---:|---:|",
+        ]
+        for row in stage["gpu_no_kernel_gaps"]["rows"]:
+            lines.append(
+                "| "
+                f"`{row['previous_kernel']}` | "
+                f"`{row['next_kernel']}` | "
+                f"{row['gap_milliseconds']:.4f} | "
+                f"{row['percent']:.2f}% | "
+                f"`{row['enclosing_nvtx']}` | "
+                f"{row['cuda_api_overlap_milliseconds']:.4f} | "
+                f"{row['sync_overlap_milliseconds']:.4f} | "
+                f"{row['start_offset_milliseconds']:.4f} |"
+            )
         lines.append("")
     return "\n".join(lines)
 
