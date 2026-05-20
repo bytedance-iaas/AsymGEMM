@@ -847,7 +847,7 @@ def _mlp_architecture_estimate(dtype: torch.dtype) -> dict[str, Any]:
 
 
 def _dense_toy_architecture_estimate(dtype: torch.dtype) -> dict[str, Any]:
-    from asym_gemm.training.tiny_dense_llm import TinyDenseLLMConfig, estimate_tiny_dense_llm_parameters
+    from asym_gemm.training.dense import TinyDenseLLMConfig, estimate_tiny_dense_llm_parameters
 
     config = TinyDenseLLMConfig(
         vocab_size=32768,
@@ -871,7 +871,7 @@ def _dense_toy_architecture_estimate(dtype: torch.dtype) -> dict[str, Any]:
 
 
 def _moe_toy_architecture_estimate(dtype: torch.dtype) -> dict[str, Any]:
-    from asym_gemm.training.tiny_moe import TinyMoEConfig, estimate_tiny_moe_parameters
+    from asym_gemm.training.moe import TinyMoEConfig, estimate_tiny_moe_parameters
 
     config = TinyMoEConfig(
         num_layers=24,
@@ -901,7 +901,7 @@ def _moe_toy_architecture_estimate(dtype: torch.dtype) -> dict[str, Any]:
 
 def profile_mlp(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
     from asym_gemm.training.frozen_linear import AsymExecutionStats
-    from examples.asymgemm.mlp_lora_demo import AsymMLP, _lora_parameters
+    from asym_gemm.training.mlp import AsymMLP, lora_parameters
 
     _clear(device)
     setup_before = _memory_point(device)
@@ -922,7 +922,7 @@ def profile_mlp(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         with deep.time("setup.model_and_host_weights"):
             model = AsymMLP(w1, w2, rank=rank, alpha=16.0, backend=args.backend, stats=stats, device=device, dtype=dtype)
     with deep.time("setup.optimizer"):
-        optimizer = torch.optim.AdamW(_lora_parameters(model), lr=1e-2)
+        optimizer = torch.optim.AdamW(lora_parameters(model), lr=1e-2)
     _sync(device)
     setup_seconds = time.perf_counter() - start
     setup_memory = _setup_memory(setup_before, _memory_point(device))
@@ -974,7 +974,7 @@ def profile_mlp(args: argparse.Namespace, device: torch.device, dtype: torch.dty
 
 
 def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
-    from asym_gemm.training.tiny_dense_llm import AsymTinyDenseLLM, MICRO_DENSE_LLM_CONFIG, make_inputs, make_tiny_dense_weights
+    from asym_gemm.training.dense import AsymTinyDenseLLM, MICRO_DENSE_LLM_CONFIG, make_inputs, make_tiny_dense_weights
 
     _clear(device)
     setup_before = _memory_point(device)
@@ -1034,8 +1034,8 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
 
 
 def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
-    import asym_gemm.training.tiny_moe as tiny_moe
-    from asym_gemm.training.tiny_moe import MICRO_MOE_CONFIG, make_static_routes, make_tiny_moe_pair
+    import asym_gemm.training.moe as tiny_moe
+    from asym_gemm.training.moe import MICRO_MOE_CONFIG, make_static_routes, make_tiny_moe_pair
 
     _clear(device)
     setup_before = _memory_point(device)
@@ -1138,7 +1138,7 @@ def _load_hf_config(model_id: str) -> Any:
 
 
 def _qwen_dense_profile_config(hf_config: Any, args: argparse.Namespace) -> Any:
-    from asym_gemm.training.tiny_dense_llm import TinyDenseLLMConfig
+    from asym_gemm.training.dense import TinyDenseLLMConfig
 
     seq_len = int(args.real_seq_len)
     batch_size = int(args.real_batch_size)
@@ -1157,7 +1157,7 @@ def _qwen_dense_profile_config(hf_config: Any, args: argparse.Namespace) -> Any:
 
 
 def _qwen_moe_profile_config(hf_config: Any, args: argparse.Namespace) -> Any:
-    from asym_gemm.training.tiny_moe import TinyMoEConfig
+    from asym_gemm.training.moe import TinyMoEConfig
 
     seq_len = int(args.real_seq_len)
     batch_size = int(args.real_batch_size)
@@ -1182,7 +1182,7 @@ def _qwen_moe_profile_config(hf_config: Any, args: argparse.Namespace) -> Any:
 
 
 def _qwen_full_dense_estimate(hf_config: Any, args: argparse.Namespace, dtype: torch.dtype) -> dict[str, Any]:
-    from asym_gemm.training.tiny_dense_llm import TinyDenseLLMConfig, estimate_tiny_dense_llm_parameters
+    from asym_gemm.training.dense import TinyDenseLLMConfig, estimate_tiny_dense_llm_parameters
 
     config = TinyDenseLLMConfig(
         vocab_size=int(getattr(hf_config, "vocab_size", 151936)),
@@ -1200,7 +1200,7 @@ def _qwen_full_dense_estimate(hf_config: Any, args: argparse.Namespace, dtype: t
 
 
 def _qwen_full_moe_estimate(hf_config: Any, args: argparse.Namespace, dtype: torch.dtype) -> dict[str, Any]:
-    from asym_gemm.training.tiny_moe import TinyMoEConfig, estimate_tiny_moe_parameters
+    from asym_gemm.training.moe import TinyMoEConfig, estimate_tiny_moe_parameters
 
     config = TinyMoEConfig(
         num_layers=int(hf_config.num_hidden_layers),
@@ -1229,7 +1229,7 @@ def profile_qwen_dense(
     *,
     model_key: str = "qwen3_8b",
 ) -> dict[str, Any]:
-    from asym_gemm.training.tiny_dense_llm import AsymTinyDenseLLM, make_inputs, make_tiny_dense_weights
+    from asym_gemm.training.dense import AsymTinyDenseLLM, make_inputs, make_tiny_dense_weights
 
     model_id = QWEN_MODEL_CHOICES[model_key]
     _clear(device)
@@ -1296,8 +1296,8 @@ def profile_qwen_moe(
     *,
     model_key: str = "qwen3_30b_a3b",
 ) -> dict[str, Any]:
-    import asym_gemm.training.tiny_moe as tiny_moe
-    from asym_gemm.training.tiny_moe import make_static_routes, make_tiny_moe_pair
+    import asym_gemm.training.moe as tiny_moe
+    from asym_gemm.training.moe import make_static_routes, make_tiny_moe_pair
 
     model_id = QWEN_MODEL_CHOICES[model_key]
     _clear(device)
@@ -1411,7 +1411,7 @@ def _profile_moe_route_mode(
     dtype: torch.dtype,
     patch_context: Callable[[TimerBook], Iterator[None]],
 ) -> dict[str, Any]:
-    import asym_gemm.training.tiny_moe as tiny_moe
+    import asym_gemm.training.moe as tiny_moe
 
     model.zero_grad(set_to_none=True)
     book = TimerBook(device)
@@ -1570,13 +1570,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", choices=["asym_only", "asym_or_staged", "asym_or_torch", "torch_only"], default="asym_only")
     parser.add_argument("--warmup-steps", "--warmup", dest="warmup_steps", type=int, default=10)
     parser.add_argument("--measure-steps", "--measured-steps", "--measured", dest="measure_steps", type=int, default=50)
-    parser.add_argument("--real-profile-layers", type=int, default=1)
-    parser.add_argument("--real-batch-size", type=int, default=1)
-    parser.add_argument("--real-seq-len", type=int, default=64)
-    parser.add_argument("--real-tokens", type=int, default=0)
-    parser.add_argument("--real-lora-rank", type=int, default=64)
-    parser.add_argument("--real-lora-alpha", type=float, default=128.0)
-    parser.add_argument("--real-vocab-rows", type=int, default=4096)
+    parser.add_argument("--profile-layers", "--real-profile-layers", dest="real_profile_layers", metavar="N", type=int, default=1)
+    parser.add_argument("--batch-size", "--real-batch-size", dest="real_batch_size", metavar="N", type=int, default=1)
+    parser.add_argument("--seq-len", "--real-seq-len", dest="real_seq_len", metavar="N", type=int, default=64)
+    parser.add_argument("--tokens", "--real-tokens", dest="real_tokens", metavar="N", type=int, default=0)
+    parser.add_argument("--lora-rank", "--real-lora-rank", dest="real_lora_rank", metavar="N", type=int, default=64)
+    parser.add_argument("--lora-alpha", "--real-lora-alpha", dest="real_lora_alpha", metavar="FLOAT", type=float, default=128.0)
+    parser.add_argument("--vocab-rows", "--real-vocab-rows", dest="real_vocab_rows", metavar="N", type=int, default=4096)
     parser.add_argument("--moe-mode", choices=["contiguous", "masked"], default="contiguous")
     parser.add_argument("--output-dir", type=Path, default=Path("reports"))
     return parser.parse_args()
@@ -1592,11 +1592,11 @@ def main() -> None:
         raise SystemExit("--backend asym_only requires a CUDA device")
 
     if args.real_profile_layers <= 0:
-        raise SystemExit("--real-profile-layers must be > 0")
+        raise SystemExit("--profile-layers must be > 0")
     if args.real_batch_size <= 0 or args.real_seq_len <= 1:
-        raise SystemExit("--real-batch-size must be > 0 and --real-seq-len must be > 1")
+        raise SystemExit("--batch-size must be > 0 and --seq-len must be > 1")
     if args.real_lora_rank <= 0 or args.real_lora_alpha <= 0:
-        raise SystemExit("--real-lora-rank and --real-lora-alpha must be > 0")
+        raise SystemExit("--lora-rank and --lora-alpha must be > 0")
 
     if args.workload == "all":
         selected = ["mlp", "dense", "moe", "qwen3_8b", "qwen3_14b", "qwen3_30b_a3b", "qwen3_32b"]

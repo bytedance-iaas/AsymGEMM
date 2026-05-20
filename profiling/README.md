@@ -23,17 +23,95 @@ Use `--timing-mode profile` plus Nsight Systems for real GPU bubble analysis.
 Use `--timing-mode debug_sync` only for source label coverage debugging.
 Use Nsight Compute only for kernel-internal diagnosis; it replays kernels and
 must not be used for end-to-end wall-time claims.
+Use `scripts/profile_nsys_cpu_gaps.py` for CPU-root-cause debug captures of
+GPU no-kernel gaps.  It writes `*/cpu_gaps/table.md` and keeps CUDA/NVTX/OSRT
+CPU sample/context-switch attribution separate from the low-overhead truth
+tables.  This debug mode has non-negligible profiling overhead and should not
+be used for paper timing claims.
 
 The fundamental selectors are:
 
 ```bash
-python scripts/profile_m4_steps.py --workload matrix_1b --timing-mode profile
-python scripts/profile_m4_steps.py --workload mlp_1b --timing-mode profile
+python scripts/profile_lora.py --workload matrix_1b --timing-mode profile
+python scripts/profile_lora.py --workload mlp_1b --timing-mode profile
 ```
+
+LoRA-SFT workflow comparisons can run `asym_only` and `torch_only` over the
+same workload list.  `asym_only` is the direct AsymGEMM host-weight path.
+`torch_only` keeps the same host-weight wrapper and uses the PyTorch fallback
+path; it is useful for sanity checks, but it is not a GPU-resident
+LLaMA-Factory baseline.
+
+```bash
+scripts/profile_lora_driver.sh \
+  --gpus 2,3,4,5,6,7 \
+  --workloads qwen3_14b qwen3_30b_a3b \
+  --backends asym_only torch_only \
+  --profilers source nsys cpu ncu \
+  --profile-layers 1 --batch-size 1 --seq-len 64 \
+  --lora-rank 64 --lora-alpha 128 \
+  --precision bf16 --workflow lora_sft --mode auto
+```
+
+The shell driver launches one background Python driver job per workload/backend
+pair, assigns jobs across the GPU pool, writes logs under
+`profiling/driver_logs/`, waits for all jobs, and traps INT/TERM/ERR to stop
+the full process tree.  Use `python scripts/profile_lora_driver.py ...` only
+when a single foreground driver process is desired.
+
+The driver stores directly in this `profiling/` tree by default.  Each workload
+gets its own group directory, matching the existing layout:
+
+```text
+profiling/mlp_1b/bf16_lora_sft_asym-only_source.md
+profiling/mlp_1b/bf16_lora_sft_asym-only_nsys.md
+profiling/mlp_1b/bf16_lora_sft_asym-only_ncu.md
+```
+
+With `--mode auto`, the mode label is `<backend-label>_<profiler>` to avoid
+overwriting tables when multiple backends/profilers are requested.  Backend
+labels use hyphens, e.g. `asym-only_nsys` and `torch-only_source`.  If one
+specific experiment mode is requested, pass it explicitly, e.g.
+`--mode asym-only_nsys`.
+
+Raw artifacts stay under the same named stem, without an extra profiler
+directory:
+
+```text
+profiling/mlp_1b/bf16_lora_sft_asym-only_source/
+profiling/mlp_1b/bf16_lora_sft_asym-only_nsys/
+profiling/mlp_1b/bf16_lora_sft_asym-only_cpu/
+profiling/mlp_1b/bf16_lora_sft_asym-only_ncu/
+```
+
+Driver profiler modes:
+
+| Mode | Meaning | Output |
+|---|---|---|
+| `source` | Plain `profile_lora.py` run | `profiling/<workload>/<stem>/*_profile.json` and `*_profile.md` |
+| `nsys` | Nsight Systems CUDA/NVTX truth table, no CPU sampling/symbol resolving | `profiling/<workload>/<stem>/table.md`, `profile.json`, `trace.nsys-rep` |
+| `cpu` | Nsight Systems CPU-gap debug with OSRT/CPU sampling | `profiling/<workload>/<stem>/table.md`, `profile.json` |
+| `ncu` | Nsight Compute kernel-internal metrics | `profiling/<workload>/<stem>/table.md`, `profile.json`, `report.ncu-rep` |
+
+`ncu` is run only for `asym_only` and supported AsymGEMM workloads
+(`matrix_1b`, `mlp_1b`, `qwen3_14b`, `qwen3_30b_a3b`); unsupported
+combinations are recorded as skipped.
 
 The fundamental NCU selectors are:
 
 ```bash
 python scripts/profile_ncu_asymgemm.py --workload matrix_1b --preset paper
 python scripts/profile_ncu_asymgemm.py --workload mlp_1b --preset paper
+```
+
+CPU gap debug example:
+
+```bash
+python scripts/profile_nsys_cpu_gaps.py --workload qwen3_30b_a3b --device cuda:2
+```
+
+PyTorch stack debug trace example:
+
+```bash
+python scripts/profile_lora.py --workload mlp_1b --device cuda:2 --export-torch-trace --torch-profiler-with-stack
 ```

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Postprocess an Nsight Systems SQLite export for M4/LoRA profiling.
 
-Run the workload with `scripts/profile_m4_steps.py --timing-mode profile` or
+Run the workload with `scripts/profile_lora.py --timing-mode profile` or
 with the same `asym_gemm.training.profile_ranges.prof_range()` NVTX labels in a
 larger integration such as LLaMA-Factory.  This postprocessor reads the Nsight
 Systems database and reports, per `step.forward` / `step.backward`:

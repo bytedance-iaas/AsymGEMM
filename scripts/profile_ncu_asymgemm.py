@@ -42,12 +42,16 @@ QUICK_SECTIONS = [
 DEFAULT_LAUNCH_SKIP = {
     "matrix_1b": 2,
     "mlp_1b": 4,
+    "qwen3_14b": 14,
+    "qwen3_30b_a3b": 0,
 }
 
 
 DEFAULT_LAUNCH_COUNT = {
     "matrix_1b": 2,
     "mlp_1b": 4,
+    "qwen3_14b": 14,
+    "qwen3_30b_a3b": 32,
 }
 
 
@@ -58,18 +62,27 @@ def main() -> None:
     parser.add_argument("--backend", default="asym_only")
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--measure-steps", type=int, default=1)
+    parser.add_argument("--moe-mode", choices=["contiguous", "masked"], default="contiguous")
+    parser.add_argument("--profile-layers", "--real-profile-layers", dest="profile_layers", type=int, default=1)
+    parser.add_argument("--batch-size", "--real-batch-size", dest="batch_size", type=int, default=1)
+    parser.add_argument("--seq-len", "--real-seq-len", dest="seq_len", type=int, default=64)
+    parser.add_argument("--tokens", "--real-tokens", dest="tokens", type=int, default=0)
+    parser.add_argument("--lora-rank", "--real-lora-rank", dest="lora_rank", type=int, default=64)
+    parser.add_argument("--lora-alpha", "--real-lora-alpha", dest="lora_alpha", type=float, default=128.0)
+    parser.add_argument("--vocab-rows", "--real-vocab-rows", dest="vocab_rows", type=int, default=4096)
     parser.add_argument("--launch-skip", type=int)
     parser.add_argument("--launch-count", type=int)
     parser.add_argument("--preset", choices=["quick", "paper"], default="paper")
     parser.add_argument("--section", action="append", dest="sections")
     parser.add_argument("--ncu-bin", default="ncu")
     parser.add_argument("--output-root", type=Path, default=Path("profiling"))
+    parser.add_argument("--output-dir", type=Path, help="Exact output directory. Overrides --output-root/<workload>/ncu.")
     parser.add_argument("--clear-jit-cache", action="store_true")
     parser.add_argument("--jit-cache-dir", type=Path)
     parser.add_argument("--extra-ncu-arg", action="append", default=[])
     args = parser.parse_args()
 
-    out_dir = args.output_root / args.workload / "ncu"
+    out_dir = args.output_dir if args.output_dir is not None else args.output_root / args.workload / "ncu"
     out_dir.mkdir(parents=True, exist_ok=True)
     source_dir = out_dir / "source_debug"
     raw_csv = out_dir / "raw.csv"
@@ -93,7 +106,7 @@ def main() -> None:
         "--kernel-name-base",
         "demangled",
         "-k",
-        "regex:.*asym_gemm::sm90_bf16_asym_gemm_impl.*",
+        "regex:.*asym_gemm::sm(90|100)_bf16_asym_gemm_impl.*",
         "--launch-skip",
         str(args.launch_skip if args.launch_skip is not None else DEFAULT_LAUNCH_SKIP[args.workload]),
         "--launch-count",
@@ -112,7 +125,7 @@ def main() -> None:
     cmd += args.extra_ncu_arg
     cmd += [
         sys.executable,
-        str(ROOT / "scripts/profile_m4_steps.py"),
+        str(ROOT / "scripts/profile_lora.py"),
         "--workload",
         args.workload,
         "--device",
@@ -125,6 +138,22 @@ def main() -> None:
         str(args.measure_steps),
         "--timing-mode",
         "profile",
+        "--moe-mode",
+        args.moe_mode,
+        "--profile-layers",
+        str(args.profile_layers),
+        "--batch-size",
+        str(args.batch_size),
+        "--seq-len",
+        str(args.seq_len),
+        "--tokens",
+        str(args.tokens),
+        "--lora-rank",
+        str(args.lora_rank),
+        "--lora-alpha",
+        str(args.lora_alpha),
+        "--vocab-rows",
+        str(args.vocab_rows),
         "--output-dir",
         str(source_dir),
     ]
