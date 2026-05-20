@@ -42,12 +42,16 @@ QUICK_SECTIONS = [
 DEFAULT_LAUNCH_SKIP = {
     "matrix_1b": 2,
     "mlp_1b": 4,
+    "qwen3_14b": 14,
+    "qwen3_30b_a3b": 0,
 }
 
 
 DEFAULT_LAUNCH_COUNT = {
     "matrix_1b": 2,
     "mlp_1b": 4,
+    "qwen3_14b": 14,
+    "qwen3_30b_a3b": 32,
 }
 
 
@@ -64,12 +68,13 @@ def main() -> None:
     parser.add_argument("--section", action="append", dest="sections")
     parser.add_argument("--ncu-bin", default="ncu")
     parser.add_argument("--output-root", type=Path, default=Path("profiling"))
+    parser.add_argument("--output-dir", type=Path, help="Exact output directory. Overrides --output-root/<workload>/ncu.")
     parser.add_argument("--clear-jit-cache", action="store_true")
     parser.add_argument("--jit-cache-dir", type=Path)
     parser.add_argument("--extra-ncu-arg", action="append", default=[])
     args = parser.parse_args()
 
-    out_dir = args.output_root / args.workload / "ncu"
+    out_dir = args.output_dir if args.output_dir is not None else args.output_root / args.workload / "ncu"
     out_dir.mkdir(parents=True, exist_ok=True)
     source_dir = out_dir / "source_debug"
     raw_csv = out_dir / "raw.csv"
@@ -112,7 +117,7 @@ def main() -> None:
     cmd += args.extra_ncu_arg
     cmd += [
         sys.executable,
-        str(ROOT / "scripts/profile_m4_steps.py"),
+        str(ROOT / "scripts/profile_lora.py"),
         "--workload",
         args.workload,
         "--device",

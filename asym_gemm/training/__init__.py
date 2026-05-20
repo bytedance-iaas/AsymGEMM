@@ -11,7 +11,16 @@ from .frozen_linear import (
     measure_gpu_weight_allocation,
 )
 from .host_weight import HostWeight, HostWeightMetadata, tensor_nbytes
-from .tiny_dense_llm import (
+from .mlp import (
+    AsymLoRALinear,
+    AsymMLP,
+    TorchLoRALinear,
+    TorchMLP,
+    copy_lora,
+    lora_parameters,
+    optimizer_contains_only,
+)
+from .dense import (
     MICRO_DENSE_LLM_CONFIG,
     SHOWCASE_DENSE_LLM_CONFIG,
     TinyDenseLLMBase,
@@ -19,7 +28,7 @@ from .tiny_dense_llm import (
     estimate_tiny_dense_llm_parameters,
     run_m3_report,
 )
-from .tiny_moe import (
+from .moe import (
     MICRO_MOE_CONFIG,
     SHOWCASE_MOE_CONFIG,
     TinyMoE,
@@ -41,6 +50,8 @@ __all__ = [
     "AsymExecutionStats",
     "AsymFrozenLinear",
     "AsymFrozenLinearFunction",
+    "AsymLoRALinear",
+    "AsymMLP",
     "FrozenLinear",
     "HostWeight",
     "HostWeightMetadata",
@@ -55,14 +66,19 @@ __all__ = [
     "TinyMoEConfig",
     "TinyMoE",
     "TinyMoEModel",
+    "TorchLoRALinear",
+    "TorchMLP",
     "VALID_BACKENDS",
     "asym_frozen_linear",
     "can_use_direct_bf16",
+    "copy_lora",
     "direct_asym_capability",
     "estimate_tiny_dense_llm_parameters",
     "estimate_tiny_moe_parameters",
     "frozen_linear",
+    "lora_parameters",
     "measure_gpu_weight_allocation",
+    "optimizer_contains_only",
     "run_m3_report",
     "run_tiny_dense_llm_case",
     "run_tiny_moe_correctness_report",

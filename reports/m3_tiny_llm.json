@@ -68,7 +68,7 @@
   },
   "backend_requested": "asym_only",
   "command_line": [
-    "asym_gemm/training/tiny_dense_llm.py",
+    "asym_gemm/training/dense.py",
     "--backend",
     "asym_only",
     "--report",

@@ -1,0 +1,2451 @@
+{
+  "mode": "nsight_systems_cpu_gap_debug",
+  "notes": [
+    "CPU sample percentages are sampling shares on stage submission threads, not exact elapsed-time shares.",
+    "Small gaps can be below the CPU sampling period; those rows still keep CUDA API, OSRT, scheduler, and enclosing NVTX attribution.",
+    "Use the regular Nsight table.md/profile.json for low-overhead end-to-end timing truth."
+  ],
+  "source": "reports/debug_cpu_gaps/wrapper_smoke/mlp/cpu_gaps/trace.sqlite",
+  "stages": [
+    {
+      "analyzed_thread_ids": [
+        283865897905326
+      ],
+      "cpu_samples_during_gaps": {
+        "bucket_rows": [
+          {
+            "name": "cuda_runtime_or_driver",
+            "percent": 57.83582089552239,
+            "samples": 155
+          },
+          {
+            "name": "python_interpreter_or_model_code",
+            "percent": 17.53731343283582,
+            "samples": 47
+          },
+          {
+            "name": "pytorch_autograd_engine",
+            "percent": 15.298507462686567,
+            "samples": 41
+          },
+          {
+            "name": "allocator_or_memory",
+            "percent": 8.955223880597014,
+            "samples": 24
+          },
+          {
+            "name": "pytorch_dispatch_or_aten",
+            "percent": 0.373134328358209,
+            "samples": 1
+          }
+        ],
+        "leaf_rows": [
+          {
+            "name": "0xffffffff9f000be0",
+            "percent": 10.447761194029852,
+            "samples": 28
+          },
+          {
+            "name": "0xffffffffc318fca6",
+            "percent": 10.074626865671641,
+            "samples": 27
+          },
+          {
+            "name": "0xffffffff9ee46337",
+            "percent": 10.074626865671641,
+            "samples": 27
+          },
+          {
+            "name": "0xffffffff9e93ef6f",
+            "percent": 5.223880597014926,
+            "samples": 14
+          },
+          {
+            "name": "0xffffffff9e580b90",
+            "percent": 4.104477611940299,
+            "samples": 11
+          },
+          {
+            "name": "0xffffffff9ede2917",
+            "percent": 2.985074626865672,
+            "samples": 8
+          },
+          {
+            "name": "0x7f1b9e6ae6d2",
+            "percent": 2.611940298507463,
+            "samples": 7
+          },
+          {
+            "name": "0xffffffff9e7462b5",
+            "percent": 2.2388059701492535,
+            "samples": 6
+          }
+        ],
+        "sample_count": 268,
+        "stack_rows": [
+          {
+            "bucket": "cuda_runtime_or_driver",
+            "percent": 2.611940298507463,
+            "samples": 7,
+            "signature": "0xffffffffc318fca6 <- NSYS_OSRT_ioctl_0 <- 0x7f1a5d68dec3 <- 0x7f1a5d698097 <- 0x7f1a5d6740fa"
+          },
+          {
+            "bucket": "cuda_runtime_or_driver",
+            "percent": 2.611940298507463,
+            "samples": 7,
+            "signature": "0xffffffff9ee46337 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+          },
+          {
+            "bucket": "cuda_runtime_or_driver",
+            "percent": 2.2388059701492535,
+            "samples": 6,
+            "signature": "0xffffffffc318fca6 <- NSYS_OSRT_ioctl_0 <- 0x7f1a5d68dec3 <- 0x7f1a5d693481 <- 0x7f1a5d697ae3"
+          },
+          {
+            "bucket": "cuda_runtime_or_driver",
+            "percent": 2.2388059701492535,
+            "samples": 6,
+            "signature": "0xffffffffc318fca6 <- NSYS_OSRT_ioctl_0 <- 0x7f1a5d68dec3 <- 0x7f1a5d698097 <- 0x7f1a5d67415c"
+          },
+          {
+            "bucket": "cuda_runtime_or_driver",
+            "percent": 2.2388059701492535,
+            "samples": 6,
+            "signature": "0xffffffff9e93ef6f <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+          },
+          {
+            "bucket": "cuda_runtime_or_driver",
+            "percent": 2.2388059701492535,
+            "samples": 6,
+            "signature": "0x7f1b9e6ae6d2 <- 0x7f191422dcf1 <- 0x7f1914209969 <- 0x7f19142ec04f <- 0x7f19142e1ce8"
+          },
+          {
+            "bucket": "cuda_runtime_or_driver",
+            "percent": 1.8656716417910448,
+            "samples": 5,
+            "signature": "0xffffffff9ee46337 <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+          },
+          {
+            "bucket": "cuda_runtime_or_driver",
+            "percent": 1.492537313432836,
+            "samples": 4,
+            "signature": "0xffffffffc318fca6 <- NSYS_OSRT_ioctl_0 <- 0x7f1a5d68dec3 <- 0x7f1a5d698097 <- 0x7f1a5d6796c8"
+          }
+        ],
+        "thread_state_rows": [
+          {
+            "name": "Running",
+            "percent": 100.0,
+            "samples": 268
+          }
+        ]
+      },
+      "cuda_api_overlap_stage": [
+        {
+          "milliseconds": 69.14153,
+          "name": "cudaLaunchKernel_v7000",
+          "percent_of_gap": 6.0885863815082715
+        },
+        {
+          "milliseconds": 17.606654,
+          "name": "cuLibraryLoadData",
+          "percent_of_gap": 1.5504376858355335
+        },
+        {
+          "milliseconds": 1.763955,
+          "name": "cudaFree_v3020",
+          "percent_of_gap": 0.15533344996261178
+        },
+        {
+          "milliseconds": 1.45111,
+          "name": "cuKernelGetFunction",
+          "percent_of_gap": 0.1277843950527341
+        },
+        {
+          "milliseconds": 1.370166,
+          "name": "cudaGetDeviceProperties_v12000",
+          "percent_of_gap": 0.12065648602230328
+        },
+        {
+          "milliseconds": 0.761775,
+          "name": "cuModuleLoad",
+          "percent_of_gap": 0.06708172195167597
+        },
+        {
+          "milliseconds": 0.540642,
+          "name": "cudaMalloc_v3020",
+          "percent_of_gap": 0.04760880354356339
+        },
+        {
+          "milliseconds": 0.186005,
+          "name": "cuGetProcAddress_v2",
+          "percent_of_gap": 0.016379555238254722
+        }
+      ],
+      "gpu_no_kernel_gaps": {
+        "gap_count": 33,
+        "percent_of_stage": 99.98971435611682,
+        "rows": [
+          {
+            "cpu_sample_buckets": [
+              {
+                "name": "allocator_or_memory",
+                "percent": 100.0,
+                "samples": 4
+              }
+            ],
+            "cpu_sample_count": 4,
+            "cpu_stack_signatures": [
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 25.0,
+                "samples": 1,
+                "signature": "0xffffffffc318fca6 <- NSYS_OSRT_ioctl_0 <- 0x7f1a5d68dec3 <- 0x7f1a5d698097 <- 0x7f1a5d6796c8"
+              },
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 25.0,
+                "samples": 1,
+                "signature": "0xffffffffc318fca6 <- NSYS_OSRT_ioctl_0 <- 0x7f1a5d68dec3 <- 0x7f1a5d693481 <- 0x7f1a5d697ae3"
+              },
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 25.0,
+                "samples": 1,
+                "signature": "_IO_getline_info <- _IO_fgets <- NSYS_OSRT_fgets_0 <- asym_gemm::call_external_command(std::__cxx11::basic_string<char, std::char_t... <- asym_gemm::NVCCCompiler::get_nvcc_version() const"
+              },
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 25.0,
+                "samples": 1,
+                "signature": "0x7f1bb0729622 <- 0x7f1bb072a1f7 <- 0x7f1bb0731bf7 <- 0x7f1bb0734369 <- 0x7f1a5d4e328b"
+              }
+            ],
+            "cuda_api_overlap": [
+              {
+                "milliseconds": 1.370166,
+                "name": "cudaGetDeviceProperties_v12000",
+                "percent_of_gap": 0.2181899427240532
+              },
+              {
+                "milliseconds": 0.32316,
+                "name": "cuModuleLoad",
+                "percent_of_gap": 0.05146110901212337
+              },
+              {
+                "milliseconds": 0.030351,
+                "name": "cuLaunchKernelEx",
+                "percent_of_gap": 0.004833197548047272
+              },
+              {
+                "milliseconds": 0.00407,
+                "name": "cudaStreamSynchronize_v3020",
+                "percent_of_gap": 0.0006481207874716614
+              },
+              {
+                "milliseconds": 0.00337,
+                "name": "cuTensorMapEncodeTiled",
+                "percent_of_gap": 0.0005366503817640047
+              }
+            ],
+            "cuda_api_overlap_milliseconds": 1.731117,
+            "dominant_cpu_bucket": "allocator_or_memory (4)",
+            "enclosing_nvtx": "forward.fc1.base_frozen_asymgemm",
+            "end_ns": 3584757176,
+            "end_offset_milliseconds": 628.556491,
+            "gap_milliseconds": 627.969366,
+            "next_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)256, (unsigned int)512, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)4, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "osrt_overlap": [
+              {
+                "milliseconds": 624.103913,
+                "name": "fgets",
+                "percent_of_gap": 99.38445197978017
+              },
+              {
+                "milliseconds": 1.340723,
+                "name": "ioctl",
+                "percent_of_gap": 0.21350133821655243
+              },
+              {
+                "milliseconds": 0.915327,
+                "name": "popen",
+                "percent_of_gap": 0.14575981720738906
+              },
+              {
+                "milliseconds": 0.020896,
+                "name": "fread",
+                "percent_of_gap": 0.00332755085381028
+              },
+              {
+                "milliseconds": 0.007147,
+                "name": "fopen",
+                "percent_of_gap": 0.0011381128422751755
+              },
+              {
+                "milliseconds": 0.001456,
+                "name": "fclose",
+                "percent_of_gap": 0.00023185844387192607
+              }
+            ],
+            "percent": 55.298830237514025,
+            "previous_kernel": "<stage_start>",
+            "root_cause_hint": "allocator_or_memory (4)",
+            "sample_scope": "stage_submission_threads",
+            "scheduler_context_switch_count": 16,
+            "scheduler_offcpu_overlap": [
+              {
+                "milliseconds": 624.689011,
+                "name": "unknown/Unknown",
+                "percent_of_gap": 99.47762499612122
+              }
+            ],
+            "scheduler_offcpu_overlap_milliseconds": 624.689011,
+            "start_ns": 2956787810,
+            "start_offset_milliseconds": 0.587125,
+            "sync_overlap_milliseconds": 0.003833,
+            "top_cpu_leaf": "0xffffffffc318fca6 (2)",
+            "top_cuda_api": "cudaGetDeviceProperties_v12000 (1.3702 ms)",
+            "top_osrt_api": "fgets (624.1039 ms)"
+          },
+          {
+            "cpu_sample_buckets": [
+              {
+                "name": "allocator_or_memory",
+                "percent": 100.0,
+                "samples": 1
+              }
+            ],
+            "cpu_sample_count": 1,
+            "cpu_stack_signatures": [
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 100.0,
+                "samples": 1,
+                "signature": "0xffffffff9e727bfd <- 0x7f1b9e61c6dd <- 0x7f1b9e61cee6 <- posix_spawn <- _IO_proc_open"
+              }
+            ],
+            "cuda_api_overlap": [
+              {
+                "milliseconds": 0.438615,
+                "name": "cuModuleLoad",
+                "percent_of_gap": 0.13936829923070185
+              },
+              {
+                "milliseconds": 0.030483,
+                "name": "cuLaunchKernelEx",
+                "percent_of_gap": 0.009685860869896114
+              },
+              {
+                "milliseconds": 0.004894,
+                "name": "cuTensorMapEncodeTiled",
+                "percent_of_gap": 0.001555050457542617
+              },
+              {
+                "milliseconds": 0.004063,
+                "name": "cudaStreamSynchronize_v3020",
+                "percent_of_gap": 0.0012910032711474565
+              }
+            ],
+            "cuda_api_overlap_milliseconds": 0.478055,
+            "dominant_cpu_bucket": "allocator_or_memory (1)",
+            "enclosing_nvtx": "forward.fc2.base_frozen_asymgemm",
+            "end_ns": 4090067338,
+            "end_offset_milliseconds": 1133.866653,
+            "gap_milliseconds": 314.716476,
+            "next_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)128, (unsigned int)512, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)2, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "osrt_overlap": [
+              {
+                "milliseconds": 312.974577,
+                "name": "fgets",
+                "percent_of_gap": 99.44651801451921
+              },
+              {
+                "milliseconds": 0.493899,
+                "name": "popen",
+                "percent_of_gap": 0.15693458641803043
+              },
+              {
+                "milliseconds": 0.051411,
+                "name": "fread",
+                "percent_of_gap": 0.016335655715717913
+              },
+              {
+                "milliseconds": 0.02207,
+                "name": "fopen",
+                "percent_of_gap": 0.0070126611356692995
+              },
+              {
+                "milliseconds": 0.001496,
+                "name": "fclose",
+                "percent_of_gap": 0.0004753484847739588
+              }
+            ],
+            "percent": 27.713856633052156,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::<unnamed>::launch_clamp_scalar(at::TensorIteratorBase &, c10::Scalar, c10::Scalar, at::native::detail::ClampLimits)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 9)]::operator ()() const::[lambda(c10::BFloat16) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "root_cause_hint": "allocator_or_memory (1)",
+            "sample_scope": "stage_submission_threads",
+            "scheduler_context_switch_count": 8,
+            "scheduler_offcpu_overlap": [
+              {
+                "milliseconds": 313.279891,
+                "name": "unknown/Unknown",
+                "percent_of_gap": 99.54353041243384
+              }
+            ],
+            "scheduler_offcpu_overlap_milliseconds": 313.279891,
+            "start_ns": 3775350862,
+            "start_offset_milliseconds": 819.150177,
+            "sync_overlap_milliseconds": 0.003768,
+            "top_cpu_leaf": "0xffffffff9e727bfd (1)",
+            "top_cuda_api": "cuModuleLoad (0.4386 ms)",
+            "top_osrt_api": "fgets (312.9746 ms)"
+          },
+          {
+            "cpu_sample_buckets": [
+              {
+                "name": "cuda_runtime_or_driver",
+                "percent": 52.5,
+                "samples": 63
+              },
+              {
+                "name": "python_interpreter_or_model_code",
+                "percent": 35.833333333333336,
+                "samples": 43
+              },
+              {
+                "name": "allocator_or_memory",
+                "percent": 9.166666666666666,
+                "samples": 11
+              },
+              {
+                "name": "pytorch_autograd_engine",
+                "percent": 2.5,
+                "samples": 3
+              }
+            ],
+            "cpu_sample_count": 120,
+            "cpu_stack_signatures": [
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 5.833333333333333,
+                "samples": 7,
+                "signature": "0xffffffffc318fca6 <- NSYS_OSRT_ioctl_0 <- 0x7f1a5d68dec3 <- 0x7f1a5d698097 <- 0x7f1a5d6740fa"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 5.0,
+                "samples": 6,
+                "signature": "0xffffffffc318fca6 <- NSYS_OSRT_ioctl_0 <- 0x7f1a5d68dec3 <- 0x7f1a5d693481 <- 0x7f1a5d697ae3"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 5.0,
+                "samples": 6,
+                "signature": "0xffffffffc318fca6 <- NSYS_OSRT_ioctl_0 <- 0x7f1a5d68dec3 <- 0x7f1a5d698097 <- 0x7f1a5d67415c"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 3.3333333333333335,
+                "samples": 4,
+                "signature": "0xffffffffc318fca6 <- NSYS_OSRT_ioctl_0 <- 0x7f1a5d68dec3 <- 0x7f1a5d698097 <- 0x7f1a5d6796c8"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 3.3333333333333335,
+                "samples": 4,
+                "signature": "0xffffffff9e93ef6f <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "python_interpreter_or_model_code",
+                "percent": 2.5,
+                "samples": 3,
+                "signature": "0xffffffff9f000be0 <- 0x7f1a6d6888cf <- 0x7f1a6d688dcc <- 0x7f1a6da9c852 <- 0x7f1a6da9ce31"
+              },
+              {
+                "bucket": "python_interpreter_or_model_code",
+                "percent": 2.5,
+                "samples": 3,
+                "signature": "0x7f1a6d6988c4 <- 0x7f1a6d6a4477 <- 0x7f1a6d6a6667 <- 0x7f1a6d6a6f1b <- 0x7f1a6d688de8"
+              },
+              {
+                "bucket": "python_interpreter_or_model_code",
+                "percent": 2.5,
+                "samples": 3,
+                "signature": "0x7f1a6d6988d5 <- 0x7f1a6d6a4477 <- 0x7f1a6d6a6667 <- 0x7f1a6d6a6f1b <- 0x7f1a6d688de8"
+              }
+            ],
+            "cuda_api_overlap": [
+              {
+                "milliseconds": 17.606654,
+                "name": "cuLibraryLoadData",
+                "percent_of_gap": 20.006609458252253
+              },
+              {
+                "milliseconds": 1.763955,
+                "name": "cudaFree_v3020",
+                "percent_of_gap": 2.0043989497908776
+              },
+              {
+                "milliseconds": 1.23419,
+                "name": "cuKernelGetFunction",
+                "percent_of_gap": 1.402421909766634
+              },
+              {
+                "milliseconds": 0.540642,
+                "name": "cudaMalloc_v3020",
+                "percent_of_gap": 0.6143366792309551
+              },
+              {
+                "milliseconds": 0.186005,
+                "name": "cuGetProcAddress_v2",
+                "percent_of_gap": 0.21135926180421394
+              },
+              {
+                "milliseconds": 0.019821,
+                "name": "cuLaunchKernel",
+                "percent_of_gap": 0.022522792012157327
+              },
+              {
+                "milliseconds": 0.013977,
+                "name": "cuLibraryGetKernel",
+                "percent_of_gap": 0.015882198877651126
+              },
+              {
+                "milliseconds": 0.012016,
+                "name": "cudaEventCreateWithFlags_v3020",
+                "percent_of_gap": 0.013653895808389207
+              }
+            ],
+            "cuda_api_overlap_milliseconds": 21.409812,
+            "dominant_cpu_bucket": "cuda_runtime_or_driver (63)",
+            "enclosing_nvtx": "forward.fc1.lora_A",
+            "end_ns": 3689708504,
+            "end_offset_milliseconds": 733.507819,
+            "gap_milliseconds": 88.004187,
+            "next_kernel": "void cutlass::Kernel2<cutlass_80_simt_sgemm_32x128_8x5_tn_align1>(T1::Params)",
+            "osrt_overlap": [
+              {
+                "milliseconds": 21.429805,
+                "name": "ioctl",
+                "percent_of_gap": 24.350892531965552
+              }
+            ],
+            "percent": 7.749627387243343,
+            "previous_kernel": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>, (int)4, TrivialOffsetCalculator<(int)1, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)1>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+            "root_cause_hint": "cuda_runtime_or_driver (63)",
+            "sample_scope": "stage_submission_threads",
+            "scheduler_context_switch_count": 4,
+            "scheduler_offcpu_overlap": [
+              {
+                "milliseconds": 0.030545,
+                "name": "unknown/Unknown",
+                "percent_of_gap": 0.03470857585446474
+              }
+            ],
+            "scheduler_offcpu_overlap_milliseconds": 0.030545,
+            "start_ns": 3601704317,
+            "start_offset_milliseconds": 645.503632,
+            "sync_overlap_milliseconds": 0.0,
+            "top_cpu_leaf": "0xffffffffc318fca6 (25)",
+            "top_cuda_api": "cuLibraryLoadData (17.6067 ms)",
+            "top_osrt_api": "ioctl (21.4298 ms)"
+          },
+          {
+            "cpu_sample_buckets": [
+              {
+                "name": "cuda_runtime_or_driver",
+                "percent": 85.71428571428571,
+                "samples": 36
+              },
+              {
+                "name": "allocator_or_memory",
+                "percent": 9.523809523809524,
+                "samples": 4
+              },
+              {
+                "name": "python_interpreter_or_model_code",
+                "percent": 4.761904761904762,
+                "samples": 2
+              }
+            ],
+            "cpu_sample_count": 42,
+            "cpu_stack_signatures": [
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 9.523809523809524,
+                "samples": 4,
+                "signature": "0xffffffff9ee46337 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 7.142857142857143,
+                "samples": 3,
+                "signature": "0xffffffff9f000be0 <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 7.142857142857143,
+                "samples": 3,
+                "signature": "0xffffffff9e580b90 <- 0x7f191422dcf1 <- 0x7f1914209969 <- 0x7f19142ec04f <- 0x7f19142e1ce8"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 4.761904761904762,
+                "samples": 2,
+                "signature": "0x7f1a5d6feb68 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 4.761904761904762,
+                "samples": 2,
+                "signature": "0xffffffff9f000be0 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 4.761904761904762,
+                "samples": 2,
+                "signature": "0xffffffff9ee46337 <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 4.761904761904762,
+                "samples": 2,
+                "signature": "0xffffffff9f000be0 <- 0x7f191422dcf1 <- 0x7f1914209969 <- 0x7f19142ec04f <- 0x7f19142e1ce8"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 4.761904761904762,
+                "samples": 2,
+                "signature": "0x7f1b9e6ae6d2 <- 0x7f191422dcf1 <- 0x7f1914209969 <- 0x7f19142ec04f <- 0x7f19142e1ce8"
+              }
+            ],
+            "cuda_api_overlap": [
+              {
+                "milliseconds": 0.023651,
+                "name": "cudaStreamCreate_v3020",
+                "percent_of_gap": 0.07685259648597993
+              },
+              {
+                "milliseconds": 0.020526,
+                "name": "cudaLaunchKernelExC_v11060",
+                "percent_of_gap": 0.06669808445610012
+              },
+              {
+                "milliseconds": 0.010603,
+                "name": "cudaStreamDestroy_v5050",
+                "percent_of_gap": 0.03445385313690099
+              },
+              {
+                "milliseconds": 0.009992,
+                "name": "cudaOccupancyMaxActiveClusters_v11070",
+                "percent_of_gap": 0.03246844294481888
+              },
+              {
+                "milliseconds": 0.002873,
+                "name": "cudaLaunchKernel_v7000",
+                "percent_of_gap": 0.009335652179790299
+              },
+              {
+                "milliseconds": 0.002867,
+                "name": "cudaOccupancyAvailableDynamicSMemPerBlock_v10200",
+                "percent_of_gap": 0.00931615551669293
+              }
+            ],
+            "cuda_api_overlap_milliseconds": 0.070512,
+            "dominant_cpu_bucket": "cuda_runtime_or_driver (36)",
+            "enclosing_nvtx": "step.forward",
+            "end_ns": 3732869843,
+            "end_offset_milliseconds": 776.669158,
+            "gap_milliseconds": 30.774497,
+            "next_kernel": "sm80_xmma_gemm_f32f32_f32f32_f32_tn_n_tilesize32x32x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+            "osrt_overlap": [
+              {
+                "milliseconds": 0.006205,
+                "name": "ioctl",
+                "percent_of_gap": 0.02016279908652934
+              }
+            ],
+            "percent": 2.709994750361572,
+            "previous_kernel": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+            "root_cause_hint": "cuda_runtime_or_driver (36)",
+            "sample_scope": "stage_submission_threads",
+            "scheduler_context_switch_count": 0,
+            "scheduler_offcpu_overlap": [],
+            "scheduler_offcpu_overlap_milliseconds": 0,
+            "start_ns": 3702095346,
+            "start_offset_milliseconds": 745.894661,
+            "sync_overlap_milliseconds": 0.0,
+            "top_cpu_leaf": "0xffffffff9ee46337 (9)",
+            "top_cuda_api": "cudaStreamCreate_v3020 (0.0237 ms)",
+            "top_osrt_api": "ioctl (0.0062 ms)"
+          },
+          {
+            "cpu_sample_buckets": [
+              {
+                "name": "cuda_runtime_or_driver",
+                "percent": 97.29729729729729,
+                "samples": 36
+              },
+              {
+                "name": "pytorch_autograd_engine",
+                "percent": 2.7027027027027026,
+                "samples": 1
+              }
+            ],
+            "cpu_sample_count": 37,
+            "cpu_stack_signatures": [
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 5.405405405405405,
+                "samples": 2,
+                "signature": "0xffffffff9e93ef6f <- 0x7f191422dcf1 <- 0x7f1914209969 <- 0x7f19142ec04f <- 0x7f19142e1ce8"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 5.405405405405405,
+                "samples": 2,
+                "signature": "0x7f1b9e6ae6d2 <- 0x7f191422dcf1 <- 0x7f1914209969 <- 0x7f19142ec04f <- 0x7f19142e1ce8"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 2.7027027027027026,
+                "samples": 1,
+                "signature": "torch::jit::tracer::getTracingState() <- (anonymous namespace)::THPFunction_apply(_object*, _object*)"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 2.7027027027027026,
+                "samples": 1,
+                "signature": "0xffffffff9ee46337 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 2.7027027027027026,
+                "samples": 1,
+                "signature": "0xffffffff9edc7f9a <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 2.7027027027027026,
+                "samples": 1,
+                "signature": "0xffffffff9e531690 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 2.7027027027027026,
+                "samples": 1,
+                "signature": "0x7f1a5d6fec58 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 2.7027027027027026,
+                "samples": 1,
+                "signature": "0x7f1a5d6fec54 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              }
+            ],
+            "cuda_api_overlap": [
+              {
+                "milliseconds": 26.833883,
+                "name": "cudaLaunchKernel_v7000",
+                "percent_of_gap": 98.92307420073944
+              }
+            ],
+            "cuda_api_overlap_milliseconds": 26.833883,
+            "dominant_cpu_bucket": "cuda_runtime_or_driver (36)",
+            "enclosing_nvtx": "step.forward",
+            "end_ns": 3774134379,
+            "end_offset_milliseconds": 817.933694,
+            "gap_milliseconds": 27.12601,
+            "next_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::<unnamed>::launch_clamp_scalar(at::TensorIteratorBase &, c10::Scalar, c10::Scalar, at::native::detail::ClampLimits)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 9)]::operator ()() const::[lambda(c10::BFloat16) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "osrt_overlap": [],
+            "percent": 2.3887098690274455,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "root_cause_hint": "cuda_runtime_or_driver (36)",
+            "sample_scope": "stage_submission_threads",
+            "scheduler_context_switch_count": 0,
+            "scheduler_offcpu_overlap": [],
+            "scheduler_offcpu_overlap_milliseconds": 0,
+            "start_ns": 3747008369,
+            "start_offset_milliseconds": 790.807684,
+            "sync_overlap_milliseconds": 0.0,
+            "top_cpu_leaf": "0xffffffff9e93ef6f (4)",
+            "top_cuda_api": "cudaLaunchKernel_v7000 (26.8339 ms)",
+            "top_osrt_api": "-"
+          },
+          {
+            "cpu_sample_buckets": [
+              {
+                "name": "pytorch_autograd_engine",
+                "percent": 94.44444444444444,
+                "samples": 17
+              },
+              {
+                "name": "allocator_or_memory",
+                "percent": 5.555555555555555,
+                "samples": 1
+              }
+            ],
+            "cpu_sample_count": 18,
+            "cpu_stack_signatures": [
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 11.11111111111111,
+                "samples": 2,
+                "signature": "0xffffffff9ee46337 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 11.11111111111111,
+                "samples": 2,
+                "signature": "0xffffffff9f000be0 <- 0x7f191422dcf1 <- 0x7f1914209969 <- 0x7f19142ec04f <- 0x7f19142e1ce8"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 5.555555555555555,
+                "samples": 1,
+                "signature": "0x7f1a5d6feec3 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 5.555555555555555,
+                "samples": 1,
+                "signature": "0x7f1a5d6feb68 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 5.555555555555555,
+                "samples": 1,
+                "signature": "0x7f1a5d6febf8 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 5.555555555555555,
+                "samples": 1,
+                "signature": "0x7f1b9e5c7a72 <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 5.555555555555555,
+                "samples": 1,
+                "signature": "0xffffffff9ee46337 <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 5.555555555555555,
+                "samples": 1,
+                "signature": "0xffffffff9f000be0 <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              }
+            ],
+            "cuda_api_overlap": [
+              {
+                "milliseconds": 13.473641,
+                "name": "cudaLaunchKernel_v7000",
+                "percent_of_gap": 99.3873140670433
+              }
+            ],
+            "cuda_api_overlap_milliseconds": 13.473641,
+            "dominant_cpu_bucket": "pytorch_autograd_engine (17)",
+            "enclosing_nvtx": "forward.fc1.add_cast_scale",
+            "end_ns": 3746927537,
+            "end_offset_milliseconds": 790.726852,
+            "gap_milliseconds": 13.556701,
+            "next_kernel": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctor_add<float>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+            "osrt_overlap": [],
+            "percent": 1.1937998058009356,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "root_cause_hint": "pytorch_autograd_engine (17)",
+            "sample_scope": "stage_submission_threads",
+            "scheduler_context_switch_count": 0,
+            "scheduler_offcpu_overlap": [],
+            "scheduler_offcpu_overlap_milliseconds": 0,
+            "start_ns": 3733370836,
+            "start_offset_milliseconds": 777.170151,
+            "sync_overlap_milliseconds": 0.0,
+            "top_cpu_leaf": "0xffffffff9f000be0 (5)",
+            "top_cuda_api": "cudaLaunchKernel_v7000 (13.4736 ms)",
+            "top_osrt_api": "-"
+          },
+          {
+            "cpu_sample_buckets": [
+              {
+                "name": "cuda_runtime_or_driver",
+                "percent": 88.23529411764706,
+                "samples": 15
+              },
+              {
+                "name": "allocator_or_memory",
+                "percent": 11.764705882352942,
+                "samples": 2
+              }
+            ],
+            "cpu_sample_count": 17,
+            "cpu_stack_signatures": [
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 11.764705882352942,
+                "samples": 2,
+                "signature": "0xffffffff9ee46337 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 5.882352941176471,
+                "samples": 1,
+                "signature": "0xffffffff9e580b90 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 5.882352941176471,
+                "samples": 1,
+                "signature": "0x7f1a5d6feec3 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 5.882352941176471,
+                "samples": 1,
+                "signature": "0x7f1b9e5c7a57 <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 5.882352941176471,
+                "samples": 1,
+                "signature": "0xffffffff9ee45e7b <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 5.882352941176471,
+                "samples": 1,
+                "signature": "0xffffffff9e93ef6f <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 5.882352941176471,
+                "samples": 1,
+                "signature": "0x7f1a5d5e5048 <- 0x7f1a5d5e5e67 <- 0x7f1a5d4677f8 <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 5.882352941176471,
+                "samples": 1,
+                "signature": "0xffffffff9e74a3eb <- 0x7f1a5d4b8faa <- 0x7f1a5d47e403 <- 0x7f1a5d4db816 <- 0x7f1a5d4dc615"
+              }
+            ],
+            "cuda_api_overlap": [
+              {
+                "milliseconds": 12.361817,
+                "name": "cudaLaunchKernel_v7000",
+                "percent_of_gap": 99.84181920593485
+              }
+            ],
+            "cuda_api_overlap_milliseconds": 12.361817,
+            "dominant_cpu_bucket": "cuda_runtime_or_driver (15)",
+            "enclosing_nvtx": "forward.fc1.lora_A",
+            "end_ns": 3702094066,
+            "end_offset_milliseconds": 745.893381,
+            "gap_milliseconds": 12.381402,
+            "next_kernel": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+            "osrt_overlap": [],
+            "percent": 1.0903032605899707,
+            "previous_kernel": "void cutlass::Kernel2<cutlass_80_simt_sgemm_32x128_8x5_tn_align1>(T1::Params)",
+            "root_cause_hint": "cuda_runtime_or_driver (15)",
+            "sample_scope": "stage_submission_threads",
+            "scheduler_context_switch_count": 0,
+            "scheduler_offcpu_overlap": [],
+            "scheduler_offcpu_overlap_milliseconds": 0,
+            "start_ns": 3689712664,
+            "start_offset_milliseconds": 733.511979,
+            "sync_overlap_milliseconds": 0.0,
+            "top_cpu_leaf": "0xffffffff9ee46337 (3)",
+            "top_cuda_api": "cudaLaunchKernel_v7000 (12.3618 ms)",
+            "top_osrt_api": "-"
+          },
+          {
+            "cpu_sample_buckets": [
+              {
+                "name": "pytorch_autograd_engine",
+                "percent": 100.0,
+                "samples": 17
+              }
+            ],
+            "cpu_sample_count": 17,
+            "cpu_stack_signatures": [
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 11.764705882352942,
+                "samples": 2,
+                "signature": "0xffffffff9e580b90 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 5.882352941176471,
+                "samples": 1,
+                "signature": "0xffffffff9f000be0 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 5.882352941176471,
+                "samples": 1,
+                "signature": "0xffffffff9ee30d21 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 5.882352941176471,
+                "samples": 1,
+                "signature": "0xffffffff9ee30d21 <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 5.882352941176471,
+                "samples": 1,
+                "signature": "0xffffffff9f000be0 <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 5.882352941176471,
+                "samples": 1,
+                "signature": "0xffffffff9e747c75 <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 5.882352941176471,
+                "samples": 1,
+                "signature": "0xffffffff9ee46337 <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 5.882352941176471,
+                "samples": 1,
+                "signature": "0xffffffff9e6cca7a <- __libc_calloc <- 0x7f1a5d4b8faa <- 0x7f1a5d47e403 <- 0x7f1a5d4db816"
+              }
+            ],
+            "cuda_api_overlap": [
+              {
+                "milliseconds": 12.246021,
+                "name": "cudaLaunchKernel_v7000",
+                "percent_of_gap": 99.0384007274773
+              }
+            ],
+            "cuda_api_overlap_milliseconds": 12.246021,
+            "dominant_cpu_bucket": "pytorch_autograd_engine (17)",
+            "enclosing_nvtx": "forward.fc1.base_frozen_asymgemm",
+            "end_ns": 3597169043,
+            "end_offset_milliseconds": 640.968358,
+            "gap_milliseconds": 12.364922,
+            "next_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "osrt_overlap": [],
+            "percent": 1.0888520357824307,
+            "previous_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)256, (unsigned int)512, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)4, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "root_cause_hint": "pytorch_autograd_engine (17)",
+            "sample_scope": "stage_submission_threads",
+            "scheduler_context_switch_count": 0,
+            "scheduler_offcpu_overlap": [],
+            "scheduler_offcpu_overlap_milliseconds": 0,
+            "start_ns": 3584804121,
+            "start_offset_milliseconds": 628.603436,
+            "sync_overlap_milliseconds": 0.0,
+            "top_cpu_leaf": "0xffffffff9f000be0 (2)",
+            "top_cuda_api": "cudaLaunchKernel_v7000 (12.2460 ms)",
+            "top_osrt_api": "-"
+          }
+        ],
+        "total_milliseconds": 1135.4756920000002
+      },
+      "osrt_overlap_stage": [
+        {
+          "milliseconds": 937.07849,
+          "name": "fgets",
+          "percent_of_gap": 82.51890481188852
+        },
+        {
+          "milliseconds": 26.563348,
+          "name": "ioctl",
+          "percent_of_gap": 2.339161989618468
+        },
+        {
+          "milliseconds": 1.409226,
+          "name": "popen",
+          "percent_of_gap": 0.12409610015959115
+        },
+        {
+          "milliseconds": 0.072307,
+          "name": "fread",
+          "percent_of_gap": 0.006367336902838548
+        },
+        {
+          "milliseconds": 0.037542,
+          "name": "mmap",
+          "percent_of_gap": 0.0033059394250399654
+        },
+        {
+          "milliseconds": 0.029217,
+          "name": "fopen",
+          "percent_of_gap": 0.002572841941862252
+        },
+        {
+          "milliseconds": 0.002952,
+          "name": "fclose",
+          "percent_of_gap": 0.0002599524048457189
+        }
+      ],
+      "scheduler_offcpu_overlap_stage": [
+        {
+          "milliseconds": 937.999447,
+          "name": "unknown/Unknown",
+          "percent_of_gap": 82.60000406219662
+        }
+      ],
+      "stage": "step.forward",
+      "stage_thread_id": 283865897905326,
+      "thread_scope": "NVTX stage thread plus CUDA runtime submission threads",
+      "timeline": {
+        "host_api_breakdown": {
+          "rows": [
+            {
+              "milliseconds": 93.286114,
+              "name": "cuda_runtime_api_sum_overlaps_gpu_timeline",
+              "percent": 8.214752599258768
+            },
+            {
+              "milliseconds": 0.092589,
+              "name": "cuda_synchronization_api_sum_overlaps_gpu_timeline",
+              "percent": 0.008153364909302258
+            }
+          ],
+          "total_milliseconds": 1135.592495
+        },
+        "operation_cuda_api_time": {
+          "rows": [
+            {
+              "milliseconds": 37.7789,
+              "name": "forward.fc1.lora_A",
+              "percent": 3.3268007816483496
+            },
+            {
+              "milliseconds": 26.859438,
+              "name": "forward.activation_relu",
+              "percent": 2.3652356032874273
+            },
+            {
+              "milliseconds": 14.030967,
+              "name": "forward.fc1.base_frozen_asymgemm",
+              "percent": 1.235563554864811
+            },
+            {
+              "milliseconds": 13.528827,
+              "name": "forward.fc1.add_cast_scale",
+              "percent": 1.1913452281137167
+            },
+            {
+              "milliseconds": 0.59459,
+              "name": "forward.fc2.base_frozen_asymgemm",
+              "percent": 0.05235945135407045
+            },
+            {
+              "milliseconds": 0.227325,
+              "name": "forward.fc2.lora_B",
+              "percent": 0.020018184428032874
+            },
+            {
+              "milliseconds": 0.069985,
+              "name": "forward.fc1.lora_B",
+              "percent": 0.00616286214536844
+            },
+            {
+              "milliseconds": 0.065408,
+              "name": "forward.fc2.add_cast_scale",
+              "percent": 0.00575981263419674
+            },
+            {
+              "milliseconds": 0.06498,
+              "name": "forward.fc2.lora_A",
+              "percent": 0.00572212305788442
+            }
+          ],
+          "total_milliseconds": 1135.592495
+        },
+        "operation_kernel_time": {
+          "rows": [
+            {
+              "milliseconds": 0.047969,
+              "name": "forward.fc1.base_frozen_asymgemm",
+              "percent": 0.004224138518985192
+            },
+            {
+              "milliseconds": 0.018529,
+              "name": "forward.fc2.base_frozen_asymgemm",
+              "percent": 0.001631659251147129
+            },
+            {
+              "milliseconds": 0.010048,
+              "name": "forward.fc1.add_cast_scale",
+              "percent": 0.0008848244457621215
+            },
+            {
+              "milliseconds": 0.009888,
+              "name": "forward.fc2.add_cast_scale",
+              "percent": 0.0008707348845238712
+            },
+            {
+              "milliseconds": 0.008672,
+              "name": "forward.fc2.lora_A",
+              "percent": 0.0007636542191131687
+            },
+            {
+              "milliseconds": 0.007905,
+              "name": "forward.fc1.lora_A",
+              "percent": 0.0006961123849273062
+            },
+            {
+              "milliseconds": 0.007392,
+              "name": "forward.fc2.lora_B",
+              "percent": 0.0006509377292071659
+            },
+            {
+              "milliseconds": 0.0024,
+              "name": "forward.fc1.lora_B",
+              "percent": 0.00021134341857375518
+            },
+            {
+              "milliseconds": 0.001024,
+              "name": "forward.activation_relu",
+              "percent": 9.01731919248022e-05
+            }
+          ],
+          "total_milliseconds": 1135.592495
+        },
+        "stage_breakdown": {
+          "rows": [
+            {
+              "milliseconds": 1135.4756920000002,
+              "name": "gpu_no_kernel_time",
+              "percent": 99.98971435611682
+            },
+            {
+              "milliseconds": 0.113827,
+              "name": "cuda_kernel_busy_union",
+              "percent": 0.010023578044164512
+            },
+            {
+              "milliseconds": 0.002976,
+              "name": "cuda_memcpy_union",
+              "percent": 0.0002620658390314564
+            }
+          ],
+          "total_milliseconds": 1135.592495
+        },
+        "top_kernels": [
+          {
+            "milliseconds": 0.046945,
+            "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)256, (unsigned int)512, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)4, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "percent": 0.00413396532706039
+          },
+          {
+            "milliseconds": 0.017601,
+            "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)128, (unsigned int)512, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)2, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "percent": 0.0015499397959652767
+          },
+          {
+            "milliseconds": 0.015809,
+            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>, (int)4, TrivialOffsetCalculator<(int)1, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)1>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+            "percent": 0.0013921367100968732
+          },
+          {
+            "milliseconds": 0.008448,
+            "name": "void cutlass::Kernel2<cutlass_80_simt_sgemm_32x128_8x5_tn_align1>(T1::Params)",
+            "percent": 0.0007439288333796183
+          },
+          {
+            "milliseconds": 0.005664,
+            "name": "void cutlass::Kernel2<cutlass_80_simt_sgemm_128x128_8x4_tn_align1>(T1::Params)",
+            "percent": 0.0004987704678340622
+          },
+          {
+            "milliseconds": 0.0056,
+            "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "percent": 0.000493134643338762
+          },
+          {
+            "milliseconds": 0.004384,
+            "name": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+            "percent": 0.00038605397792805947
+          },
+          {
+            "milliseconds": 0.003968,
+            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "percent": 0.0003494211187086086
+          },
+          {
+            "milliseconds": 0.0024,
+            "name": "sm80_xmma_gemm_f32f32_f32f32_f32_tn_n_tilesize32x32x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+            "percent": 0.00021134341857375518
+          },
+          {
+            "milliseconds": 0.001984,
+            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctor_add<float>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+            "percent": 0.0001747105593543043
+          },
+          {
+            "milliseconds": 0.001024,
+            "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::<unnamed>::launch_clamp_scalar(at::TensorIteratorBase &, c10::Scalar, c10::Scalar, at::native::detail::ClampLimits)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 9)]::operator ()() const::[lambda(c10::BFloat16) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "percent": 9.01731919248022e-05
+          }
+        ]
+      },
+      "total_milliseconds": 1135.592495
+    },
+    {
+      "analyzed_thread_ids": [
+        283865897905326,
+        283865897905428
+      ],
+      "cpu_samples_during_gaps": {
+        "bucket_rows": [
+          {
+            "name": "allocator_or_memory",
+            "percent": 42.857142857142854,
+            "samples": 15
+          },
+          {
+            "name": "pytorch_autograd_engine",
+            "percent": 34.285714285714285,
+            "samples": 12
+          },
+          {
+            "name": "cuda_runtime_or_driver",
+            "percent": 22.857142857142858,
+            "samples": 8
+          }
+        ],
+        "leaf_rows": [
+          {
+            "name": "0xffffffff9ede2917",
+            "percent": 11.428571428571429,
+            "samples": 4
+          },
+          {
+            "name": "0xffffffff9ee46337",
+            "percent": 8.571428571428571,
+            "samples": 3
+          },
+          {
+            "name": "0xffffffff9e580b90",
+            "percent": 8.571428571428571,
+            "samples": 3
+          },
+          {
+            "name": "0xffffffff9f000be0",
+            "percent": 5.714285714285714,
+            "samples": 2
+          },
+          {
+            "name": "0xffffffff9ee30d1e",
+            "percent": 5.714285714285714,
+            "samples": 2
+          },
+          {
+            "name": "std::pair<ska::detailv3::sherwood_v3_table<c10::cuda::CUDACachingAllocator::Native::(anonymous na...",
+            "percent": 2.857142857142857,
+            "samples": 1
+          },
+          {
+            "name": "0xffffffff9e8f6c85",
+            "percent": 2.857142857142857,
+            "samples": 1
+          },
+          {
+            "name": "0xffffffff9f00153b",
+            "percent": 2.857142857142857,
+            "samples": 1
+          }
+        ],
+        "sample_count": 35,
+        "stack_rows": [
+          {
+            "bucket": "allocator_or_memory",
+            "percent": 2.857142857142857,
+            "samples": 1,
+            "signature": "std::pair<ska::detailv3::sherwood_v3_table<c10::cuda::CUDACachingAllocator::N... <- c10::cuda::CUDACachingAllocator::Native::DeviceCachingAllocator::alloc_found_... <- c10::cuda::CUDACachingAllocator::Native::DeviceCachingAllocator::malloc(signe... <- c10::cuda::CUDACachingAllocator::Native::NativeCachingAllocator::malloc(void*... <- c10::cuda::CUDACachingAllocator::Native::NativeCachingAllocator::allocate(uns..."
+          },
+          {
+            "bucket": "cuda_runtime_or_driver",
+            "percent": 2.857142857142857,
+            "samples": 1,
+            "signature": "0xffffffff9e8f6c85 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+          },
+          {
+            "bucket": "cuda_runtime_or_driver",
+            "percent": 2.857142857142857,
+            "samples": 1,
+            "signature": "0xffffffff9ee46337 <- 0x7f1a5d46766e <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+          },
+          {
+            "bucket": "cuda_runtime_or_driver",
+            "percent": 2.857142857142857,
+            "samples": 1,
+            "signature": "0xffffffff9f00153b <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+          },
+          {
+            "bucket": "cuda_runtime_or_driver",
+            "percent": 2.857142857142857,
+            "samples": 1,
+            "signature": "0xffffffff9f000be0 <- 0x7f1a5d4b8faa <- 0x7f1a5d47e403 <- 0x7f1a5d4db816 <- 0x7f1a5d4dc615"
+          },
+          {
+            "bucket": "cuda_runtime_or_driver",
+            "percent": 2.857142857142857,
+            "samples": 1,
+            "signature": "0xffffffff9ee30d1e <- 0x7f1a5d4b8faa <- 0x7f1a5d47e403 <- 0x7f1a5d4db816 <- 0x7f1a5d4dc615"
+          },
+          {
+            "bucket": "allocator_or_memory",
+            "percent": 2.857142857142857,
+            "samples": 1,
+            "signature": "0xffffffff9ede2917 <- __libc_malloc <- 0x7f1a5e14eeee <- 0x7f1a5d47eed3 <- 0x7f1a5d47e403"
+          },
+          {
+            "bucket": "cuda_runtime_or_driver",
+            "percent": 2.857142857142857,
+            "samples": 1,
+            "signature": "0xffffffff9f000be0 <- 0x7f191422dcf1 <- 0x7f1914209969 <- 0x7f19142ec04f <- 0x7f19142e1ce8"
+          }
+        ],
+        "thread_state_rows": [
+          {
+            "name": "Running",
+            "percent": 100.0,
+            "samples": 35
+          }
+        ]
+      },
+      "cuda_api_overlap_stage": [
+        {
+          "milliseconds": 15.4365,
+          "name": "cudaLaunchKernel_v7000",
+          "percent_of_gap": 2.378082896622143
+        },
+        {
+          "milliseconds": 0.836113,
+          "name": "cuModuleLoad",
+          "percent_of_gap": 0.12880808635010718
+        },
+        {
+          "milliseconds": 0.559697,
+          "name": "cudaMalloc_v3020",
+          "percent_of_gap": 0.08622458866911045
+        },
+        {
+          "milliseconds": 0.161334,
+          "name": "cuKernelGetFunction",
+          "percent_of_gap": 0.024854444080176
+        },
+        {
+          "milliseconds": 0.07019,
+          "name": "cuLaunchKernelEx",
+          "percent_of_gap": 0.010813179057034186
+        },
+        {
+          "milliseconds": 0.057825,
+          "name": "cudaMemcpyAsync_v3020",
+          "percent_of_gap": 0.008908278657543834
+        },
+        {
+          "milliseconds": 0.043838,
+          "name": "cuLaunchKernel",
+          "percent_of_gap": 0.0067534996937208235
+        },
+        {
+          "milliseconds": 0.035475,
+          "name": "cudaLaunchKernelExC_v11060",
+          "percent_of_gap": 0.005465130745808345
+        }
+      ],
+      "gpu_no_kernel_gaps": {
+        "gap_count": 41,
+        "percent_of_stage": 99.9869508545541,
+        "rows": [
+          {
+            "cpu_sample_buckets": [
+              {
+                "name": "allocator_or_memory",
+                "percent": 100.0,
+                "samples": 2
+              }
+            ],
+            "cpu_sample_count": 2,
+            "cpu_stack_signatures": [
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 50.0,
+                "samples": 1,
+                "signature": "0xffffffff9ede5f69 <- 0x7f1b9e61c6dd <- 0x7f1b9e61cee6 <- posix_spawn <- _IO_proc_open"
+              },
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 50.0,
+                "samples": 1,
+                "signature": "0x7f1a5d5e749c <- 0x7f1a5d5e7abd <- 0x7f1a5d623a13 <- 0x7f1a5d625016 <- 0x7f1a5e1978a6"
+              }
+            ],
+            "cuda_api_overlap": [
+              {
+                "milliseconds": 0.396933,
+                "name": "cuModuleLoad",
+                "percent_of_gap": 0.12646675418772393
+              },
+              {
+                "milliseconds": 0.031408,
+                "name": "cuLaunchKernelEx",
+                "percent_of_gap": 0.010006897424824928
+              },
+              {
+                "milliseconds": 0.004326,
+                "name": "cudaStreamSynchronize_v3020",
+                "percent_of_gap": 0.0013783061086281405
+              },
+              {
+                "milliseconds": 0.002552,
+                "name": "cuTensorMapEncodeTiled",
+                "percent_of_gap": 0.0008130922767496566
+              }
+            ],
+            "cuda_api_overlap_milliseconds": 0.435219,
+            "dominant_cpu_bucket": "allocator_or_memory (2)",
+            "enclosing_nvtx": "backward.fc1.base_dx_asymgemm",
+            "end_ns": 4793182400,
+            "end_offset_milliseconds": 648.341442,
+            "gap_milliseconds": 313.863515,
+            "next_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)128, (unsigned int)256, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)2, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "osrt_overlap": [
+              {
+                "milliseconds": 313.863515,
+                "name": "pthread_cond_wait",
+                "percent_of_gap": 100.0
+              },
+              {
+                "milliseconds": 312.519895,
+                "name": "fgets",
+                "percent_of_gap": 99.57190946516992
+              },
+              {
+                "milliseconds": 0.44453,
+                "name": "popen",
+                "percent_of_gap": 0.14163162609072288
+              },
+              {
+                "milliseconds": 0.036237,
+                "name": "fread",
+                "percent_of_gap": 0.011545464276088286
+              },
+              {
+                "milliseconds": 0.006446,
+                "name": "fopen",
+                "percent_of_gap": 0.0020537589404107707
+              },
+              {
+                "milliseconds": 0.001834,
+                "name": "fclose",
+                "percent_of_gap": 0.0005843304214572375
+              }
+            ],
+            "percent": 48.35250587213471,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "root_cause_hint": "allocator_or_memory (2)",
+            "sample_scope": "stage_submission_threads",
+            "scheduler_context_switch_count": 8,
+            "scheduler_offcpu_overlap": [
+              {
+                "milliseconds": 626.666949,
+                "name": "unknown/Unknown",
+                "percent_of_gap": 199.66224777671275
+              }
+            ],
+            "scheduler_offcpu_overlap_milliseconds": 626.666949,
+            "start_ns": 4479318885,
+            "start_offset_milliseconds": 334.477927,
+            "sync_overlap_milliseconds": 0.004108,
+            "top_cpu_leaf": "0xffffffff9ede5f69 (1)",
+            "top_cuda_api": "cuModuleLoad (0.3969 ms)",
+            "top_osrt_api": "pthread_cond_wait (313.8635 ms)"
+          },
+          {
+            "cpu_sample_buckets": [
+              {
+                "name": "allocator_or_memory",
+                "percent": 100.0,
+                "samples": 2
+              }
+            ],
+            "cpu_sample_count": 2,
+            "cpu_stack_signatures": [
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 50.0,
+                "samples": 1,
+                "signature": "0xffffffff9edd656e <- 0x7f1b9e61c6dd <- 0x7f1b9e61cee6 <- posix_spawn <- _IO_proc_open"
+              },
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 50.0,
+                "samples": 1,
+                "signature": "0x7f1a5d5bfdc4 <- 0x7f1a5d424026 <- 0x7f1a5d42442c <- 0x7f1a5e19cdc4 <- 0x7f1a5d69dbb0"
+              }
+            ],
+            "cuda_api_overlap": [
+              {
+                "milliseconds": 0.43918,
+                "name": "cuModuleLoad",
+                "percent_of_gap": 0.14114490111730757
+              },
+              {
+                "milliseconds": 0.029062,
+                "name": "cuLaunchKernelEx",
+                "percent_of_gap": 0.009340027133000575
+              },
+              {
+                "milliseconds": 0.004127,
+                "name": "cudaStreamSynchronize_v3020",
+                "percent_of_gap": 0.0013263468439162263
+              },
+              {
+                "milliseconds": 0.002609,
+                "name": "cuTensorMapEncodeTiled",
+                "percent_of_gap": 0.0008384877431009051
+              }
+            ],
+            "cuda_api_overlap_milliseconds": 0.474978,
+            "dominant_cpu_bucket": "allocator_or_memory (2)",
+            "enclosing_nvtx": "backward.fc2.base_dx_asymgemm",
+            "end_ns": 4468040269,
+            "end_offset_milliseconds": 323.199311,
+            "gap_milliseconds": 311.155413,
+            "next_kernel": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)256, (unsigned int)128, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)4, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "osrt_overlap": [
+              {
+                "milliseconds": 311.155413,
+                "name": "pthread_cond_wait",
+                "percent_of_gap": 100.0
+              },
+              {
+                "milliseconds": 309.7444,
+                "name": "fgets",
+                "percent_of_gap": 99.54652468154234
+              },
+              {
+                "milliseconds": 0.482116,
+                "name": "popen",
+                "percent_of_gap": 0.1549437933127006
+              },
+              {
+                "milliseconds": 0.050881,
+                "name": "fread",
+                "percent_of_gap": 0.016352278595905382
+              },
+              {
+                "milliseconds": 0.004799,
+                "name": "fopen",
+                "percent_of_gap": 0.0015423160901269618
+              },
+              {
+                "milliseconds": 0.001142,
+                "name": "fclose",
+                "percent_of_gap": 0.00036701916543550536
+              }
+            ],
+            "percent": 47.93530695732188,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "root_cause_hint": "allocator_or_memory (2)",
+            "sample_scope": "stage_submission_threads",
+            "scheduler_context_switch_count": 8,
+            "scheduler_offcpu_overlap": [
+              {
+                "milliseconds": 621.211322,
+                "name": "unknown/Unknown",
+                "percent_of_gap": 199.64663831832488
+              }
+            ],
+            "scheduler_offcpu_overlap_milliseconds": 621.211322,
+            "start_ns": 4156884856,
+            "start_offset_milliseconds": 12.043898,
+            "sync_overlap_milliseconds": 0.003926,
+            "top_cpu_leaf": "0xffffffff9edd656e (1)",
+            "top_cuda_api": "cuModuleLoad (0.4392 ms)",
+            "top_osrt_api": "pthread_cond_wait (311.1554 ms)"
+          },
+          {
+            "cpu_sample_buckets": [
+              {
+                "name": "pytorch_autograd_engine",
+                "percent": 100.0,
+                "samples": 12
+              }
+            ],
+            "cpu_sample_count": 12,
+            "cpu_stack_signatures": [
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 8.333333333333334,
+                "samples": 1,
+                "signature": "0xffffffff9ee30d1e <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 8.333333333333334,
+                "samples": 1,
+                "signature": "0xffffffff9ede2917 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 8.333333333333334,
+                "samples": 1,
+                "signature": "0xffffffff9ee46337 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 8.333333333333334,
+                "samples": 1,
+                "signature": "0xffffffff9e580b90 <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 8.333333333333334,
+                "samples": 1,
+                "signature": "0xffffffff9ee30d21 <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 8.333333333333334,
+                "samples": 1,
+                "signature": "0xffffffff9e93ef23 <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 8.333333333333334,
+                "samples": 1,
+                "signature": "0x7f1a5d47e9b0 <- 0x7f1a5d4b8ebc <- 0x7f1a5d47e403 <- 0x7f1a5d4db816 <- 0x7f1a5d4dc615"
+              },
+              {
+                "bucket": "pytorch_autograd_engine",
+                "percent": 8.333333333333334,
+                "samples": 1,
+                "signature": "0x7f1a5d3f9178 <- 0x7f1a5e19e0c2 <- 0x7f1a5d625259 <- 0x7f1a5e1b66d6 <- 0x7f1a5d47127f"
+              }
+            ],
+            "cuda_api_overlap": [
+              {
+                "milliseconds": 8.949074,
+                "name": "cudaLaunchKernel_v7000",
+                "percent_of_gap": 97.09267928987636
+              }
+            ],
+            "cuda_api_overlap_milliseconds": 8.949074,
+            "dominant_cpu_bucket": "pytorch_autograd_engine (12)",
+            "enclosing_nvtx": "step.backward",
+            "end_ns": 4477823138,
+            "end_offset_milliseconds": 332.98218,
+            "gap_milliseconds": 9.217043,
+            "next_kernel": "void at::native::vectorized_elementwise_kernel<(int)4, void at::native::compare_scalar_kernel<c10::BFloat16>(at::TensorIteratorBase &, at::native::<unnamed>::OpType, T1)::[lambda(c10::BFloat16) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "osrt_overlap": [
+              {
+                "milliseconds": 9.217043,
+                "name": "pthread_cond_wait",
+                "percent_of_gap": 100.0
+              }
+            ],
+            "percent": 1.4199392553837233,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+            "root_cause_hint": "pytorch_autograd_engine (12)",
+            "sample_scope": "stage_submission_threads",
+            "scheduler_context_switch_count": 2,
+            "scheduler_offcpu_overlap": [
+              {
+                "milliseconds": 9.244411,
+                "name": "unknown/Unknown",
+                "percent_of_gap": 100.29692820137652
+              }
+            ],
+            "scheduler_offcpu_overlap_milliseconds": 9.244411,
+            "start_ns": 4468606095,
+            "start_offset_milliseconds": 323.765137,
+            "sync_overlap_milliseconds": 0.0,
+            "top_cpu_leaf": "0xffffffff9ede2917 (2)",
+            "top_cuda_api": "cudaLaunchKernel_v7000 (8.9491 ms)",
+            "top_osrt_api": "pthread_cond_wait (9.2170 ms)"
+          },
+          {
+            "cpu_sample_buckets": [
+              {
+                "name": "cuda_runtime_or_driver",
+                "percent": 77.77777777777777,
+                "samples": 7
+              },
+              {
+                "name": "allocator_or_memory",
+                "percent": 22.22222222222222,
+                "samples": 2
+              }
+            ],
+            "cpu_sample_count": 9,
+            "cpu_stack_signatures": [
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 11.11111111111111,
+                "samples": 1,
+                "signature": "std::pair<ska::detailv3::sherwood_v3_table<c10::cuda::CUDACachingAllocator::N... <- c10::cuda::CUDACachingAllocator::Native::DeviceCachingAllocator::alloc_found_... <- c10::cuda::CUDACachingAllocator::Native::DeviceCachingAllocator::malloc(signe... <- c10::cuda::CUDACachingAllocator::Native::NativeCachingAllocator::malloc(void*... <- c10::cuda::CUDACachingAllocator::Native::NativeCachingAllocator::allocate(uns..."
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 11.11111111111111,
+                "samples": 1,
+                "signature": "0xffffffff9e8f6c85 <- 0x7f1a5d707516 <- 0x7f1a5d711a5d <- 0x7f1a5d4b8905 <- 0x7f1a5d4da064"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 11.11111111111111,
+                "samples": 1,
+                "signature": "0xffffffff9ee46337 <- 0x7f1a5d46766e <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 11.11111111111111,
+                "samples": 1,
+                "signature": "0xffffffff9f00153b <- 0x7f1a5d46767c <- 0x7f1a5d4db777 <- 0x7f1a5d4dc615 <- 0x7f1a5d3b8dd2"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 11.11111111111111,
+                "samples": 1,
+                "signature": "0xffffffff9f000be0 <- 0x7f1a5d4b8faa <- 0x7f1a5d47e403 <- 0x7f1a5d4db816 <- 0x7f1a5d4dc615"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 11.11111111111111,
+                "samples": 1,
+                "signature": "0xffffffff9ee30d1e <- 0x7f1a5d4b8faa <- 0x7f1a5d47e403 <- 0x7f1a5d4db816 <- 0x7f1a5d4dc615"
+              },
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 11.11111111111111,
+                "samples": 1,
+                "signature": "0xffffffff9ede2917 <- __libc_malloc <- 0x7f1a5e14eeee <- 0x7f1a5d47eed3 <- 0x7f1a5d47e403"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 11.11111111111111,
+                "samples": 1,
+                "signature": "0xffffffff9f000be0 <- 0x7f191422dcf1 <- 0x7f1914209969 <- 0x7f19142ec04f <- 0x7f19142e1ce8"
+              }
+            ],
+            "cuda_api_overlap": [
+              {
+                "milliseconds": 5.994611,
+                "name": "cudaLaunchKernel_v7000",
+                "percent_of_gap": 94.93775511723157
+              }
+            ],
+            "cuda_api_overlap_milliseconds": 5.994611,
+            "dominant_cpu_bucket": "cuda_runtime_or_driver (7)",
+            "enclosing_nvtx": "step.backward",
+            "end_ns": 4151155212,
+            "end_offset_milliseconds": 6.314254,
+            "gap_milliseconds": 6.314254,
+            "next_kernel": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<float>, std::array<char *, (unsigned long)1>>(int, T2, T3)",
+            "osrt_overlap": [],
+            "percent": 0.9727476722267322,
+            "previous_kernel": "<stage_start>",
+            "root_cause_hint": "cuda_runtime_or_driver (7)",
+            "sample_scope": "stage_submission_threads",
+            "scheduler_context_switch_count": 0,
+            "scheduler_offcpu_overlap": [],
+            "scheduler_offcpu_overlap_milliseconds": 0,
+            "start_ns": 4144840958,
+            "start_offset_milliseconds": 0.0,
+            "sync_overlap_milliseconds": 0.0,
+            "top_cpu_leaf": "0xffffffff9f000be0 (2)",
+            "top_cuda_api": "cudaLaunchKernel_v7000 (5.9946 ms)",
+            "top_osrt_api": "-"
+          },
+          {
+            "cpu_sample_buckets": [
+              {
+                "name": "allocator_or_memory",
+                "percent": 100.0,
+                "samples": 4
+              }
+            ],
+            "cpu_sample_count": 4,
+            "cpu_stack_signatures": [
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 25.0,
+                "samples": 1,
+                "signature": "0xffffffff9e727be1 <- 0x7f1b9e636b70 <- 0x7f1b9e5a954b <- pthread_create <- NSYS_OSRT_pthread_create_2"
+              },
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 25.0,
+                "samples": 1,
+                "signature": "0xffffffff9ede2917 <- 0x7f1b9e636b70 <- 0x7f1b9e5a954b <- pthread_create <- NSYS_OSRT_pthread_create_2"
+              },
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 25.0,
+                "samples": 1,
+                "signature": "0xffffffff9e4db5bc <- 0x7f1b9e636b70 <- 0x7f1b9e5a954b <- pthread_create <- NSYS_OSRT_pthread_create_2"
+              },
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 25.0,
+                "samples": 1,
+                "signature": "_init <- c10::alloc_cpu(unsigned long) <- c10::DefaultCPUAllocator::allocate(unsigned long) <- c10::StorageImpl::StorageImpl(c10::StorageImpl::use_byte_size_t, c10::SymInt ... <- at::TensorBase at::detail::_empty_generic<long>(c10::ArrayRef<long>, c10::All..."
+              }
+            ],
+            "cuda_api_overlap": [
+              {
+                "milliseconds": 0.033712,
+                "name": "cudaLaunchKernel_v7000",
+                "percent_of_gap": 1.1054191178616408
+              }
+            ],
+            "cuda_api_overlap_milliseconds": 0.033712,
+            "dominant_cpu_bucket": "allocator_or_memory (4)",
+            "enclosing_nvtx": "step.backward",
+            "end_ns": 4154205587,
+            "end_offset_milliseconds": 9.364629,
+            "gap_milliseconds": 3.049703,
+            "next_kernel": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "osrt_overlap": [
+              {
+                "milliseconds": 2.242796,
+                "name": "pthread_cond_wait",
+                "percent_of_gap": 73.54145633197724
+              },
+              {
+                "milliseconds": 1.709897,
+                "name": "pthread_create",
+                "percent_of_gap": 56.067656424248526
+              },
+              {
+                "milliseconds": 0.00717,
+                "name": "mmap64",
+                "percent_of_gap": 0.23510486103072986
+              },
+              {
+                "milliseconds": 0.001384,
+                "name": "pthread_cond_signal",
+                "percent_of_gap": 0.045381468293797786
+              }
+            ],
+            "percent": 0.4698245420967991,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<float>, std::array<char *, (unsigned long)1>>(int, T2, T3)",
+            "root_cause_hint": "allocator_or_memory (4)",
+            "sample_scope": "stage_submission_threads",
+            "scheduler_context_switch_count": 8,
+            "scheduler_offcpu_overlap": [
+              {
+                "milliseconds": 2.226359,
+                "name": "unknown/Unknown",
+                "percent_of_gap": 73.0024858158319
+              }
+            ],
+            "scheduler_offcpu_overlap_milliseconds": 2.226359,
+            "start_ns": 4151155884,
+            "start_offset_milliseconds": 6.314926,
+            "sync_overlap_milliseconds": 0.0,
+            "top_cpu_leaf": "0xffffffff9e727be1 (1)",
+            "top_cuda_api": "cudaLaunchKernel_v7000 (0.0337 ms)",
+            "top_osrt_api": "pthread_cond_wait (2.2428 ms)"
+          },
+          {
+            "cpu_sample_buckets": [
+              {
+                "name": "allocator_or_memory",
+                "percent": 50.0,
+                "samples": 1
+              },
+              {
+                "name": "cuda_runtime_or_driver",
+                "percent": 50.0,
+                "samples": 1
+              }
+            ],
+            "cpu_sample_count": 2,
+            "cpu_stack_signatures": [
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 50.0,
+                "samples": 1,
+                "signature": "0xffffffff9edcd487 <- 0x7f1b9e5b9791 <- __libc_malloc <- 0x7f1a9e55697c <- cublasCreate_v2"
+              },
+              {
+                "bucket": "cuda_runtime_or_driver",
+                "percent": 50.0,
+                "samples": 1,
+                "signature": "0x7f1a6d68427d <- 0x7f1a6d6765d5 <- 0x7f1a6cc18be7 <- 0x7f1a6cc4cbf8 <- 0x7f1a6cd06dc8"
+              }
+            ],
+            "cuda_api_overlap": [
+              {
+                "milliseconds": 0.559697,
+                "name": "cudaMalloc_v3020",
+                "percent_of_gap": 48.375099611579664
+              },
+              {
+                "milliseconds": 0.155782,
+                "name": "cuKernelGetFunction",
+                "percent_of_gap": 13.464374058983884
+              },
+              {
+                "milliseconds": 0.018472,
+                "name": "cudaEventCreateWithFlags_v3020",
+                "percent_of_gap": 1.596551062494706
+              },
+              {
+                "milliseconds": 0.01716,
+                "name": "cuLaunchKernel",
+                "percent_of_gap": 1.4831537587921806
+              },
+              {
+                "milliseconds": 0.00693,
+                "name": "cudaFree_v3020",
+                "percent_of_gap": 0.5989659410506882
+              },
+              {
+                "milliseconds": 0.00326,
+                "name": "cudaStreamIsCapturing_v10000",
+                "percent_of_gap": 0.2817646418218245
+              }
+            ],
+            "cuda_api_overlap_milliseconds": 0.761301,
+            "dominant_cpu_bucket": "allocator_or_memory (1)",
+            "enclosing_nvtx": "step.backward",
+            "end_ns": 4155873974,
+            "end_offset_milliseconds": 11.033016,
+            "gap_milliseconds": 1.156994,
+            "next_kernel": "void cutlass::Kernel2<cutlass_80_simt_sgemm_64x64_8x5_nn_align1>(T1::Params)",
+            "osrt_overlap": [
+              {
+                "milliseconds": 1.156994,
+                "name": "pthread_cond_wait",
+                "percent_of_gap": 100.0
+              },
+              {
+                "milliseconds": 0.435004,
+                "name": "ioctl",
+                "percent_of_gap": 37.59777492363832
+              }
+            ],
+            "percent": 0.17824167673335534,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "root_cause_hint": "allocator_or_memory (1)",
+            "sample_scope": "stage_submission_threads",
+            "scheduler_context_switch_count": 0,
+            "scheduler_offcpu_overlap": [
+              {
+                "milliseconds": 1.156994,
+                "name": "unknown/Unknown",
+                "percent_of_gap": 100.0
+              }
+            ],
+            "scheduler_offcpu_overlap_milliseconds": 1.156994,
+            "start_ns": 4154716980,
+            "start_offset_milliseconds": 9.876022,
+            "sync_overlap_milliseconds": 0.0,
+            "top_cpu_leaf": "0xffffffff9edcd487 (1)",
+            "top_cuda_api": "cudaMalloc_v3020 (0.5597 ms)",
+            "top_osrt_api": "pthread_cond_wait (1.1570 ms)"
+          },
+          {
+            "cpu_sample_buckets": [
+              {
+                "name": "allocator_or_memory",
+                "percent": 100.0,
+                "samples": 1
+              }
+            ],
+            "cpu_sample_count": 1,
+            "cpu_stack_signatures": [
+              {
+                "bucket": "allocator_or_memory",
+                "percent": 100.0,
+                "samples": 1,
+                "signature": "0x7f1a5d5e74df <- 0x7f1a5d5e7abd <- 0x7f1a5d623a13 <- 0x7f1a5d625016 <- 0x7f1a5e1978a6"
+              }
+            ],
+            "cuda_api_overlap": [
+              {
+                "milliseconds": 0.069934,
+                "name": "cudaLaunchKernel_v7000",
+                "percent_of_gap": 17.33919455332991
+              }
+            ],
+            "cuda_api_overlap_milliseconds": 0.069934,
+            "dominant_cpu_bucket": "allocator_or_memory (1)",
+            "enclosing_nvtx": "step.backward",
+            "end_ns": 4468605135,
+            "end_offset_milliseconds": 323.764177,
+            "gap_milliseconds": 0.403329,
+            "next_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+            "osrt_overlap": [
+              {
+                "milliseconds": 0.403329,
+                "name": "pthread_cond_wait",
+                "percent_of_gap": 100.00000000000001
+              }
+            ],
+            "percent": 0.06213518586543013,
+            "previous_kernel": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "root_cause_hint": "allocator_or_memory (1)",
+            "sample_scope": "stage_submission_threads",
+            "scheduler_context_switch_count": 0,
+            "scheduler_offcpu_overlap": [
+              {
+                "milliseconds": 0.403329,
+                "name": "unknown/Unknown",
+                "percent_of_gap": 100.00000000000001
+              }
+            ],
+            "scheduler_offcpu_overlap_milliseconds": 0.403329,
+            "start_ns": 4468201806,
+            "start_offset_milliseconds": 323.360848,
+            "sync_overlap_milliseconds": 0.0,
+            "top_cpu_leaf": "0x7f1a5d5e74df (1)",
+            "top_cuda_api": "cudaLaunchKernel_v7000 (0.0699 ms)",
+            "top_osrt_api": "pthread_cond_wait (0.4033 ms)"
+          },
+          {
+            "cpu_sample_buckets": [],
+            "cpu_sample_count": 0,
+            "cpu_stack_signatures": [],
+            "cuda_api_overlap": [
+              {
+                "milliseconds": 0.013122,
+                "name": "cudaLaunchKernelExC_v11060",
+                "percent_of_gap": 3.80885481825069
+              }
+            ],
+            "cuda_api_overlap_milliseconds": 0.013122,
+            "dominant_cpu_bucket": "off_cpu_wait_no_cpu_sample: unknown/Unknown",
+            "enclosing_nvtx": "step.backward",
+            "end_ns": 4156237303,
+            "end_offset_milliseconds": 11.396345,
+            "gap_milliseconds": 0.344513,
+            "next_kernel": "sm80_xmma_gemm_f32f32_f32f32_f32_nt_n_tilesize32x32x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+            "osrt_overlap": [
+              {
+                "milliseconds": 0.344513,
+                "name": "pthread_cond_wait",
+                "percent_of_gap": 100.0
+              }
+            ],
+            "percent": 0.05307423787542412,
+            "previous_kernel": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+            "root_cause_hint": "off_cpu_wait_no_cpu_sample: unknown/Unknown",
+            "sample_scope": "below_cpu_sample_resolution",
+            "scheduler_context_switch_count": 0,
+            "scheduler_offcpu_overlap": [
+              {
+                "milliseconds": 0.344513,
+                "name": "unknown/Unknown",
+                "percent_of_gap": 100.0
+              }
+            ],
+            "scheduler_offcpu_overlap_milliseconds": 0.344513,
+            "start_ns": 4155892790,
+            "start_offset_milliseconds": 11.051832,
+            "sync_overlap_milliseconds": 0.0,
+            "top_cpu_leaf": "no_cpu_sample_in_gap",
+            "top_cuda_api": "cudaLaunchKernelExC_v11060 (0.0131 ms)",
+            "top_osrt_api": "pthread_cond_wait (0.3445 ms)"
+          }
+        ],
+        "total_milliseconds": 649.0305989999999
+      },
+      "osrt_overlap_stage": [
+        {
+          "milliseconds": 642.03122,
+          "name": "pthread_cond_wait",
+          "percent_of_gap": 98.90865567838877
+        },
+        {
+          "milliseconds": 622.264295,
+          "name": "fgets",
+          "percent_of_gap": 95.86344554258643
+        },
+        {
+          "milliseconds": 1.709897,
+          "name": "pthread_create",
+          "percent_of_gap": 0.26341961005963216
+        },
+        {
+          "milliseconds": 0.926646,
+          "name": "popen",
+          "percent_of_gap": 0.14275522325807807
+        },
+        {
+          "milliseconds": 0.435004,
+          "name": "ioctl",
+          "percent_of_gap": 0.06701490443832596
+        },
+        {
+          "milliseconds": 0.087118,
+          "name": "fread",
+          "percent_of_gap": 0.013421036231524493
+        },
+        {
+          "milliseconds": 0.011245,
+          "name": "fopen",
+          "percent_of_gap": 0.0017323578643161338
+        },
+        {
+          "milliseconds": 0.00717,
+          "name": "mmap64",
+          "percent_of_gap": 0.0011045803367849424
+        }
+      ],
+      "scheduler_offcpu_overlap_stage": [
+        {
+          "milliseconds": 1264.880143,
+          "name": "unknown/Unknown",
+          "percent_of_gap": 194.86216657566615
+        }
+      ],
+      "stage": "step.backward",
+      "stage_thread_id": 283865897905326,
+      "thread_scope": "NVTX stage thread plus CUDA runtime submission threads",
+      "timeline": {
+        "host_api_breakdown": {
+          "rows": [
+            {
+              "milliseconds": 17.289347,
+              "name": "cuda_runtime_api_sum_overlaps_gpu_timeline",
+              "percent": 2.6635247882917343
+            },
+            {
+              "milliseconds": 0.045626,
+              "name": "cuda_synchronization_api_sum_overlaps_gpu_timeline",
+              "percent": 0.007028951526659662
+            }
+          ],
+          "total_milliseconds": 649.115303
+        },
+        "operation_cuda_api_time": {
+          "rows": [
+            {
+              "milliseconds": 9.062896,
+              "name": "backward.activation_relu",
+              "percent": 1.396192010589527
+            },
+            {
+              "milliseconds": 0.7850309999999999,
+              "name": "backward.fc2.lora_B",
+              "percent": 0.12093860618781312
+            },
+            {
+              "milliseconds": 0.540299,
+              "name": "backward.fc2.base_dx_asymgemm",
+              "percent": 0.083236213582227
+            },
+            {
+              "milliseconds": 0.492819,
+              "name": "backward.fc1.base_dx_asymgemm",
+              "percent": 0.07592164253752003
+            },
+            {
+              "milliseconds": 0.141931,
+              "name": "backward.loss.mse",
+              "percent": 0.021865298714117666
+            },
+            {
+              "milliseconds": 0.027975,
+              "name": "backward.fc1.lora_B",
+              "percent": 0.004309711983480999
+            },
+            {
+              "milliseconds": 0.025608,
+              "name": "backward.fc1.base_lora_add",
+              "percent": 0.003945061822090489
+            },
+            {
+              "milliseconds": 0.025404,
+              "name": "backward.fc2.lora_A",
+              "percent": 0.0039136344317551855
+            },
+            {
+              "milliseconds": 0.020856,
+              "name": "backward.fc1.lora_A",
+              "percent": 0.0032129884942798826
+            },
+            {
+              "milliseconds": 0.017678,
+              "name": "backward.fc2.base_lora_add",
+              "percent": 0.0027233990507230417
+            },
+            {
+              "milliseconds": 0.011717,
+              "name": "backward.fc1.add_cast_scale",
+              "percent": 0.001805072218425268
+            },
+            {
+              "milliseconds": 0.010855,
+              "name": "backward.fc2.add_cast_scale",
+              "percent": 0.0016722760886751114
+            }
+          ],
+          "total_milliseconds": 649.115303
+        },
+        "operation_kernel_time": {
+          "rows": [
+            {
+              "milliseconds": 0.013952,
+              "name": "backward.fc1.base_dx_asymgemm",
+              "percent": 0.002149387009598817
+            },
+            {
+              "milliseconds": 0.00848,
+              "name": "backward.fc2.base_dx_asymgemm",
+              "percent": 0.0013063934806047854
+            },
+            {
+              "milliseconds": 0.008128,
+              "name": "backward.fc1.lora_B",
+              "percent": 0.0012521658266928886
+            },
+            {
+              "milliseconds": 0.008032000000000001,
+              "name": "backward.fc2.lora_A",
+              "percent": 0.0012373764665350988
+            },
+            {
+              "milliseconds": 0.007808000000000001,
+              "name": "backward.fc2.lora_B",
+              "percent": 0.0012028679595002553
+            },
+            {
+              "milliseconds": 0.007168,
+              "name": "backward.fc1.lora_A",
+              "percent": 0.0011042722251149884
+            },
+            {
+              "milliseconds": 0.004608,
+              "name": "backward.fc2.base_lora_add",
+              "percent": 0.0007098892875739212
+            },
+            {
+              "milliseconds": 0.004576,
+              "name": "backward.activation_relu",
+              "percent": 0.0007049595008546578
+            },
+            {
+              "milliseconds": 0.00448,
+              "name": "backward.fc1.base_lora_add",
+              "percent": 0.0006901701406968677
+            },
+            {
+              "milliseconds": 0.003328,
+              "name": "backward.fc2.add_cast_scale",
+              "percent": 0.0005126978188033875
+            },
+            {
+              "milliseconds": 0.003328,
+              "name": "backward.fc1.add_cast_scale",
+              "percent": 0.0005126978188033875
+            },
+            {
+              "milliseconds": 0.002304,
+              "name": "backward.loss.mse",
+              "percent": 0.0003549446437869606
+            }
+          ],
+          "total_milliseconds": 649.115303
+        },
+        "stage_breakdown": {
+          "rows": [
+            {
+              "milliseconds": 649.0305989999999,
+              "name": "gpu_no_kernel_time",
+              "percent": 99.9869508545541
+            },
+            {
+              "milliseconds": 0.081664,
+              "name": "cuda_kernel_busy_union",
+              "percent": 0.012580815707560046
+            },
+            {
+              "milliseconds": 0.00304,
+              "name": "cuda_memcpy_union",
+              "percent": 0.0004683297383300174
+            }
+          ],
+          "total_milliseconds": 649.115303
+        },
+        "top_kernels": [
+          {
+            "milliseconds": 0.01296,
+            "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)128, (unsigned int)256, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)2, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "percent": 0.001996563621301653
+          },
+          {
+            "milliseconds": 0.012864,
+            "name": "sm80_xmma_gemm_f32f32_f32f32_f32_nt_n_tilesize32x32x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+            "percent": 0.0019817742611438634
+          },
+          {
+            "milliseconds": 0.012288,
+            "name": "void cutlass::Kernel2<cutlass_80_simt_sgemm_64x64_8x5_nn_align1>(T1::Params)",
+            "percent": 0.0018930381001971233
+          },
+          {
+            "milliseconds": 0.010048,
+            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>, (int)4, TrivialOffsetCalculator<(int)1, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)1>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+            "percent": 0.001547953029848689
+          },
+          {
+            "milliseconds": 0.00736,
+            "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)256, (unsigned int)128, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)4, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+            "percent": 0.0011338509454305685
+          },
+          {
+            "milliseconds": 0.006848,
+            "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "percent": 0.001054974357922355
+          },
+          {
+            "milliseconds": 0.005984,
+            "name": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+            "percent": 0.0009218701165022448
+          },
+          {
+            "milliseconds": 0.004768,
+            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "percent": 0.0007345382211702378
+          },
+          {
+            "milliseconds": 0.003584,
+            "name": "void at::native::unrolled_elementwise_kernel<at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)3>, (int)4, TrivialOffsetCalculator<(int)2, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)2>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+            "percent": 0.0005521361125574942
+          },
+          {
+            "milliseconds": 0.001856,
+            "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+            "percent": 0.00028592762971727377
+          },
+          {
+            "milliseconds": 0.00144,
+            "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+            "percent": 0.0002218404023668504
+          },
+          {
+            "milliseconds": 0.000992,
+            "name": "void at::native::vectorized_elementwise_kernel<(int)4, void at::native::compare_scalar_kernel<c10::BFloat16>(at::TensorIteratorBase &, at::native::<unnamed>::OpType, T1)::[lambda(c10::BFloat16) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+            "percent": 0.0001528233882971636
+          },
+          {
+            "milliseconds": 0.000672,
+            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<float>, std::array<char *, (unsigned long)1>>(int, T2, T3)",
+            "percent": 0.00010352552110453017
+          }
+        ]
+      },
+      "total_milliseconds": 649.115303
+    }
+  ]
+}

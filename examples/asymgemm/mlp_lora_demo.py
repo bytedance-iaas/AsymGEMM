@@ -5,13 +5,22 @@ import gc
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Optional
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-from asym_gemm.training import AsymExecutionStats, AsymFrozenLinear, measure_gpu_weight_allocation
+from asym_gemm.training import AsymExecutionStats, measure_gpu_weight_allocation
+from asym_gemm.training.mlp import (
+    AsymLoRALinear,
+    AsymMLP,
+    TorchLoRALinear,
+    TorchMLP,
+    copy_lora,
+    lora_parameters,
+    optimizer_contains_only,
+)
 
 
 def _sync(device: torch.device) -> None:
@@ -46,120 +55,9 @@ def _scalar_abs(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(abs(float(a.detach().float().item()) - float(b.detach().float().item())))
 
 
-def _optimizer_contains_only(params: Iterable[torch.nn.Parameter], optimizer: torch.optim.Optimizer) -> bool:
-    expected = {id(p) for p in params}
-    actual = {id(p) for group in optimizer.param_groups for p in group["params"]}
-    return actual == expected
-
-
-class AsymLoRALinear(nn.Module):
-    def __init__(
-        self,
-        weight: torch.Tensor,
-        *,
-        rank: int,
-        alpha: float,
-        backend: str,
-        stats: AsymExecutionStats,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> None:
-        super().__init__()
-        self.base = AsymFrozenLinear(weight, backend=backend, pin_memory=device.type == "cuda", stats=stats)
-        self.lora_a = nn.Parameter(torch.randn(rank, weight.shape[1], device=device, dtype=torch.float32) * 0.01)
-        self.lora_b = nn.Parameter(torch.randn(weight.shape[0], rank, device=device, dtype=torch.float32) * 0.01)
-        self.scaling = alpha / rank
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base = self.base(x)
-        lora = (x.float() @ self.lora_a.t() @ self.lora_b.t()) * self.scaling
-        return base + lora.to(dtype=base.dtype)
-
-
-class TorchLoRALinear(nn.Module):
-    def __init__(
-        self,
-        weight: torch.Tensor,
-        *,
-        rank: int,
-        alpha: float,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> None:
-        super().__init__()
-        self.register_buffer("base_weight", weight.detach().to(device=device, dtype=dtype).contiguous())
-        self.lora_a = nn.Parameter(torch.randn(rank, weight.shape[1], device=device, dtype=torch.float32) * 0.01)
-        self.lora_b = nn.Parameter(torch.randn(weight.shape[0], rank, device=device, dtype=torch.float32) * 0.01)
-        self.scaling = alpha / rank
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base = x @ self.base_weight.t()
-        lora = (x.float() @ self.lora_a.t() @ self.lora_b.t()) * self.scaling
-        return base + lora.to(dtype=base.dtype)
-
-
-class AsymMLP(nn.Module):
-    def __init__(
-        self,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        *,
-        rank: int,
-        alpha: float,
-        backend: str,
-        stats: AsymExecutionStats,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> None:
-        super().__init__()
-        self.fc1 = AsymLoRALinear(w1, rank=rank, alpha=alpha, backend=backend, stats=stats, device=device, dtype=dtype)
-        self.fc2 = AsymLoRALinear(w2, rank=rank, alpha=alpha, backend=backend, stats=stats, device=device, dtype=dtype)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(F.relu(self.fc1(x)))
-
-    @property
-    def pinned_cpu_bytes(self) -> int:
-        return self.fc1.base.pinned_cpu_bytes + self.fc2.base.pinned_cpu_bytes
-
-    @property
-    def expected_hbm_saved_bytes(self) -> int:
-        return self.fc1.base.weight_hbm_saved_bytes + self.fc2.base.weight_hbm_saved_bytes
-
-    @property
-    def cpu_resident_base_weight_bytes(self) -> int:
-        return self.expected_hbm_saved_bytes
-
-
-class TorchMLP(nn.Module):
-    def __init__(
-        self,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        *,
-        rank: int,
-        alpha: float,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> None:
-        super().__init__()
-        self.fc1 = TorchLoRALinear(w1, rank=rank, alpha=alpha, device=device, dtype=dtype)
-        self.fc2 = TorchLoRALinear(w2, rank=rank, alpha=alpha, device=device, dtype=dtype)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(F.relu(self.fc1(x)))
-
-
-def _copy_lora(src: AsymMLP, dst: TorchMLP) -> None:
-    with torch.no_grad():
-        dst.fc1.lora_a.copy_(src.fc1.lora_a)
-        dst.fc1.lora_b.copy_(src.fc1.lora_b)
-        dst.fc2.lora_a.copy_(src.fc2.lora_a)
-        dst.fc2.lora_b.copy_(src.fc2.lora_b)
-
-
-def _lora_parameters(model: nn.Module) -> list[torch.nn.Parameter]:
-    return [p for name, p in model.named_parameters() if "lora_" in name]
+_copy_lora = copy_lora
+_lora_parameters = lora_parameters
+_optimizer_contains_only = optimizer_contains_only
 
 
 def _grad_parity(asym: AsymMLP, ref: TorchMLP) -> Dict[str, float]:
@@ -216,12 +114,12 @@ def _memory_probe(
     cpu_resident_base_weight_bytes = int(getattr(model, "cpu_resident_base_weight_bytes", 0))
     rss_after_build = _process_rss_bytes()
 
-    tokens = 128 if device.type == "cuda" else 8
+    tokens = 64 if device.type == "cuda" else 8
     in_features = int(w1.shape[1])
     out_features = int(w2.shape[0])
     x = torch.randn(tokens, in_features, device=device, dtype=dtype, requires_grad=True)
     target = torch.randn(tokens, out_features, device=device, dtype=dtype)
-    opt = torch.optim.AdamW(_lora_parameters(model), lr=1e-2)
+    opt = torch.optim.AdamW(lora_parameters(model), lr=1e-2)
 
     start = time.perf_counter()
     out = model(x)
@@ -363,7 +261,7 @@ def _run_demo_impl(
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(dev)
 
-    m = 128 if dev.type == "cuda" else 8
+    m = 64 if dev.type == "cuda" else 8
     in_features = 128 if dev.type == "cuda" else 16
     hidden = 256 if dev.type == "cuda" else 32
     out_features = 128 if dev.type == "cuda" else 16
@@ -400,15 +298,15 @@ def _run_demo_impl(
     stats = AsymExecutionStats()
     asym_model = AsymMLP(w1, w2, rank=rank, alpha=alpha, backend=backend, stats=stats, device=dev, dtype=dtype)
     ref_model = TorchMLP(w1, w2, rank=rank, alpha=alpha, device=dev, dtype=dtype)
-    _copy_lora(asym_model, ref_model)
+    copy_lora(asym_model, ref_model)
 
     x = torch.randn(m, in_features, device=dev, dtype=dtype, requires_grad=True)
     x_ref = x.detach().clone().requires_grad_(True)
     target = torch.randn(m, out_features, device=dev, dtype=dtype)
     target_ref = target.detach().clone()
 
-    opt = torch.optim.AdamW(_lora_parameters(asym_model), lr=1e-2)
-    opt_ref = torch.optim.AdamW(_lora_parameters(ref_model), lr=1e-2)
+    opt = torch.optim.AdamW(lora_parameters(asym_model), lr=1e-2)
+    opt_ref = torch.optim.AdamW(lora_parameters(ref_model), lr=1e-2)
 
     base_before = [asym_model.fc1.base.host_weight.weight.clone(), asym_model.fc2.base.host_weight.weight.clone()]
 
@@ -431,7 +329,7 @@ def _run_demo_impl(
 
     base_after = [asym_model.fc1.base.host_weight.weight, asym_model.fc2.base.host_weight.weight]
     frozen_base_unchanged = all(torch.equal(before, after) for before, after in zip(base_before, base_after))
-    base_absent = _optimizer_contains_only(_lora_parameters(asym_model), opt)
+    base_absent = optimizer_contains_only(lora_parameters(asym_model), opt)
 
     report: Dict[str, Any] = {
         "seed": seed,
