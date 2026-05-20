@@ -1,13 +1,237 @@
 {
   "backend": "asym_only",
   "config": {
+    "full_scale_reference": {
+      "base_weight_elements": 3221225472,
+      "expected_hbm_saved_bytes": 6442450944,
+      "expected_pinned_cpu_bytes_without_w_t_copy": 6442450944,
+      "hidden": 196608,
+      "in_features": 8192,
+      "lora_rank": 128,
+      "meets_3b_parameter_requirement": true,
+      "name": ">=3B two-layer LoRA MLP reference",
+      "out_features": 8192,
+      "profiled_with_scaled_micro_tensors": true,
+      "total_model_elements": 3273654272,
+      "trainable_lora_elements": 52428800
+    },
     "hidden": 256,
     "in_features": 128,
     "out_features": 128,
     "rank": 8,
     "tokens": 64
   },
-  "device": "cuda",
+  "deep_profile": {
+    "copy_accounting": {
+      "explicit_gpu_cpu_torch_copy_bytes_observed": 0,
+      "explicit_staged_weight_copy_bytes_observed": 0,
+      "notes": "Direct host fetch happens inside AsymGEMM kernels and is not counted as a Python tensor copy. Staged/Torch fallback copy bytes are zero for asym_only reports unless fallback calls are nonzero.",
+      "staged_calls": 0,
+      "torch_calls": 0
+    },
+    "enabled": true,
+    "host_weight_events": [
+      {
+        "clone_seconds": 0.0001570098102092743,
+        "cpu_copy_seconds": 5.610845983028412e-05,
+        "event": "host_weight_init",
+        "name": null,
+        "nbytes": 65536,
+        "pin_error": null,
+        "pin_seconds": 0.001067490316927433,
+        "pinned": true,
+        "source_device": "cpu",
+        "source_nbytes": 65536,
+        "total_seconds": 0.00535888597369194
+      },
+      {
+        "clone_seconds": 5.9915706515312195e-05,
+        "cpu_copy_seconds": 3.6479905247688293e-06,
+        "event": "host_weight_init",
+        "name": null,
+        "nbytes": 65536,
+        "pin_error": null,
+        "pin_seconds": 4.347972571849823e-05,
+        "pinned": true,
+        "source_device": "cpu",
+        "source_nbytes": 65536,
+        "total_seconds": 0.003949866630136967
+      }
+    ],
+    "memory_timeline": [
+      {
+        "gpu": {
+          "allocated_bytes": 0,
+          "max_allocated_bytes": 0,
+          "max_reserved_bytes": 0,
+          "reserved_bytes": 0,
+          "reserved_minus_allocated_bytes": 0
+        },
+        "label": "before_setup",
+        "model": {},
+        "optimizer_state_bytes": 0,
+        "rss_bytes": 669208576,
+        "timestamp_utc": "2026-05-19T09:48:34.483637+00:00"
+      },
+      {
+        "gpu": {
+          "allocated_bytes": 24576,
+          "max_allocated_bytes": 28672,
+          "max_reserved_bytes": 2097152,
+          "reserved_bytes": 2097152,
+          "reserved_minus_allocated_bytes": 2072576
+        },
+        "label": "after_setup",
+        "model": {
+          "cpu_parameter_and_buffer_bytes": 0,
+          "gpu_parameter_and_buffer_bytes": 24576,
+          "host_weight_count": 2,
+          "pinned_cpu_bytes": 131072,
+          "w_host_bytes": 131072,
+          "w_t_host_bytes": 0
+        },
+        "optimizer_state_bytes": 0,
+        "rss_bytes": 803799040,
+        "timestamp_utc": "2026-05-19T09:48:35.160906+00:00"
+      },
+      {
+        "gpu": {
+          "allocated_bytes": 24576,
+          "max_allocated_bytes": 28672,
+          "max_reserved_bytes": 2097152,
+          "reserved_bytes": 2097152,
+          "reserved_minus_allocated_bytes": 2072576
+        },
+        "label": "before_warmup",
+        "model": {
+          "cpu_parameter_and_buffer_bytes": 0,
+          "gpu_parameter_and_buffer_bytes": 24576,
+          "host_weight_count": 2,
+          "pinned_cpu_bytes": 131072,
+          "w_host_bytes": 131072,
+          "w_t_host_bytes": 0
+        },
+        "optimizer_state_bytes": 0,
+        "rss_bytes": 803799040,
+        "timestamp_utc": "2026-05-19T09:48:35.161645+00:00"
+      },
+      {
+        "gpu": {
+          "allocated_bytes": 67207168,
+          "max_allocated_bytes": 67498496,
+          "max_reserved_bytes": 69206016,
+          "reserved_bytes": 69206016,
+          "reserved_minus_allocated_bytes": 1998848
+        },
+        "label": "after_warmup",
+        "model": {
+          "cpu_parameter_and_buffer_bytes": 0,
+          "gpu_parameter_and_buffer_bytes": 24576,
+          "host_weight_count": 2,
+          "pinned_cpu_bytes": 131072,
+          "w_host_bytes": 131072,
+          "w_t_host_bytes": 0
+        },
+        "optimizer_state_bytes": 49168,
+        "rss_bytes": 1170550784,
+        "timestamp_utc": "2026-05-19T09:48:42.681467+00:00"
+      },
+      {
+        "gpu": {
+          "allocated_bytes": 67207168,
+          "max_allocated_bytes": 67498496,
+          "max_reserved_bytes": 69206016,
+          "reserved_bytes": 69206016,
+          "reserved_minus_allocated_bytes": 1998848
+        },
+        "label": "before_measured_steps",
+        "model": {
+          "cpu_parameter_and_buffer_bytes": 0,
+          "gpu_parameter_and_buffer_bytes": 24576,
+          "host_weight_count": 2,
+          "pinned_cpu_bytes": 131072,
+          "w_host_bytes": 131072,
+          "w_t_host_bytes": 0
+        },
+        "optimizer_state_bytes": 49168,
+        "rss_bytes": 1170550784,
+        "timestamp_utc": "2026-05-19T09:48:42.682084+00:00"
+      },
+      {
+        "gpu": {
+          "allocated_bytes": 67207168,
+          "max_allocated_bytes": 67498496,
+          "max_reserved_bytes": 69206016,
+          "reserved_bytes": 69206016,
+          "reserved_minus_allocated_bytes": 1998848
+        },
+        "label": "after_measured_steps",
+        "model": {
+          "cpu_parameter_and_buffer_bytes": 0,
+          "gpu_parameter_and_buffer_bytes": 24576,
+          "host_weight_count": 2,
+          "pinned_cpu_bytes": 131072,
+          "w_host_bytes": 131072,
+          "w_t_host_bytes": 0
+        },
+        "optimizer_state_bytes": 49168,
+        "rss_bytes": 1170550784,
+        "timestamp_utc": "2026-05-19T09:48:42.781968+00:00"
+      },
+      {
+        "gpu": {
+          "allocated_bytes": 67207168,
+          "max_allocated_bytes": 67498496,
+          "max_reserved_bytes": 69206016,
+          "reserved_bytes": 69206016,
+          "reserved_minus_allocated_bytes": 1998848
+        },
+        "label": "final_report",
+        "model": {
+          "cpu_parameter_and_buffer_bytes": 0,
+          "gpu_parameter_and_buffer_bytes": 24576,
+          "host_weight_count": 2,
+          "pinned_cpu_bytes": 131072,
+          "w_host_bytes": 131072,
+          "w_t_host_bytes": 0
+        },
+        "optimizer_state_bytes": 0,
+        "rss_bytes": 1170743296,
+        "timestamp_utc": "2026-05-19T09:48:42.783184+00:00"
+      }
+    ],
+    "setup_breakdown": {
+      "host_weight_bytes": 131072,
+      "host_weight_clone_seconds": 0.0002169255167245865,
+      "host_weight_count": 2,
+      "host_weight_cpu_copy_seconds": 5.975645035505295e-05,
+      "host_weight_init_seconds": 0.009308752603828907,
+      "host_weight_pin_seconds": 0.0011109700426459312,
+      "sections": {
+        "setup.model_and_host_weights": {
+          "percent_of_profiled_setup": 3.098039629958885,
+          "seconds": 0.0209623072296381
+        },
+        "setup.optimizer": {
+          "percent_of_profiled_setup": 96.25345734563683,
+          "seconds": 0.6512810634449124
+        },
+        "setup.seed_and_cpu_weight_tensors": {
+          "percent_of_profiled_setup": 0.6485030244042765,
+          "seconds": 0.004387974739074707
+        }
+      },
+      "total_profiled_setup_seconds": 0.6766313454136252
+    },
+    "transpose_materialization": {
+      "bytes": 0,
+      "count": 0,
+      "pin_seconds": 0.0,
+      "total_seconds": 0.0,
+      "transpose_seconds": 0.0
+    }
+  },
+  "device": "cuda:1",
   "direct_fetch_dx_used": true,
   "direct_fetch_forward_used": true,
   "dtype": "torch.bfloat16",
@@ -19,9 +243,9 @@
     "pytorch": "2.9.1+cu129"
   },
   "execution_stats": {
-    "asym_calls": 16,
-    "asym_dx_calls": 8,
-    "asym_forward_calls": 8,
+    "asym_calls": 240,
+    "asym_dx_calls": 120,
+    "asym_forward_calls": 120,
     "fallback_reasons": {},
     "staged_calls": 0,
     "staged_dx_calls": 0,
@@ -30,30 +254,60 @@
     "torch_dx_calls": 0,
     "torch_forward_calls": 0
   },
-  "generated_at_utc": "2026-05-18T21:58:59.518546+00:00",
+  "generated_at_utc": "2026-05-19T09:48:42.783223+00:00",
   "latency": {
     "breakdown_percent": {
-      "backward_pct": 0.11612987364349901,
-      "fallback_overhead_unattributed_pct": 5.295926406747557e-15,
-      "forward_pct": 0.11270615570773154,
-      "loss_pct": 0.011583084621639214,
-      "optimizer_pct": 0.04386914765044638,
-      "setup_host_preparation_pct": 99.71571173837668
+      "backward_pct": 0.10821052510505998,
+      "fallback_overhead_unattributed_pct": 6.551510411494767e-15,
+      "forward_pct": 0.10704165635187911,
+      "loss_pct": 0.009788357188061054,
+      "optimizer_pct": 0.04060821509610517,
+      "setup_host_preparation_pct": 99.73435124625888
     },
     "breakdown_seconds": {
-      "backward_seconds": 0.00081427829960982,
-      "fallback_overhead_unattributed_seconds": 3.7133924407628527e-17,
-      "forward_seconds": 0.0007902719080448151,
-      "loss_seconds": 8.121815820535024e-05,
-      "optimizer_seconds": 0.0003076012556751569,
-      "setup_host_preparation_seconds": 0.6991856414824724
+      "backward_seconds": 0.0007342132180929183,
+      "fallback_overhead_unattributed_seconds": 4.445228907190568e-17,
+      "forward_seconds": 0.0007262823916971684,
+      "loss_seconds": 6.641443818807603e-05,
+      "optimizer_seconds": 0.0002755285426974297,
+      "setup_host_preparation_seconds": 0.6767020020633936
     },
+    "bubble_candidates": [
+      {
+        "name": "lora_path",
+        "percent_of_total_plus_setup": 0.09859502354982783,
+        "requires_nsight_to_confirm": false,
+        "seconds_per_step": 0.0006689716130495072,
+        "why_it_can_create_gpu_bubbles": "Low-rank trainable path. Many small GEMMs can underfill the GPU relative to large base GEMMs."
+      },
+      {
+        "name": "base_forward_frozen_dispatch",
+        "percent_of_total_plus_setup": 0.04578671356175619,
+        "requires_nsight_to_confirm": true,
+        "seconds_per_step": 0.0003106648847460747,
+        "why_it_can_create_gpu_bubbles": "CPU-resident base-weight fetch plus GEMM in forward. A high share means PCIe/NVLink fetch latency or small-M GEMM occupancy may be limiting GPU utilization."
+      },
+      {
+        "name": "optimizer",
+        "percent_of_total_plus_setup": 0.04060821509610517,
+        "requires_nsight_to_confirm": false,
+        "seconds_per_step": 0.0002755285426974297,
+        "why_it_can_create_gpu_bubbles": "Optimizer update. For LoRA-only SFT this is usually small, but Python optimizer overhead can still serialize steps."
+      },
+      {
+        "name": "base_dx_frozen_dispatch",
+        "percent_of_total_plus_setup": 0.03204935488361526,
+        "requires_nsight_to_confirm": true,
+        "seconds_per_step": 0.00021745629608631135,
+        "why_it_can_create_gpu_bubbles": "CPU-resident original weight fetch for dX. This now uses transpose_b=True and should not include W.T host materialization."
+      }
+    ],
     "component_percent_of_total": {
       "attention_seconds": 0.0,
-      "base_dx_seconds": 0.03459075250438425,
-      "base_forward_seconds": 0.04412930239751181,
-      "lora_grad_seconds_estimated": 0.08153912113911478,
-      "lora_seconds": 0.10192416706863179,
+      "base_dx_seconds": 0.03204935488361526,
+      "base_forward_seconds": 0.04578671356175619,
+      "lora_grad_seconds_estimated": 0.07616117022144471,
+      "lora_seconds": 0.09859502354982783,
       "mlp_seconds": 0.0,
       "moe_seconds": 0.0,
       "route_metadata_seconds": 0.0,
@@ -63,10 +317,10 @@
     },
     "component_seconds_per_step": {
       "attention_seconds": 0.0,
-      "base_dx_seconds": 0.00024254309634367624,
-      "base_forward_seconds": 0.00030942540615797043,
-      "lora_grad_seconds_estimated": 0.0005717352032661438,
-      "lora_seconds": 0.000714670866727829,
+      "base_dx_seconds": 0.00021745629608631135,
+      "base_forward_seconds": 0.0003106648847460747,
+      "lora_grad_seconds_estimated": 0.000516756922006607,
+      "lora_seconds": 0.0006689716130495072,
       "mlp_seconds": 0.0,
       "moe_seconds": 0.0,
       "route_metadata_seconds": 0.0,
@@ -74,54 +328,101 @@
       "route_scatter_seconds": 0.0,
       "router_seconds": 0.0
     },
-    "measure_steps": 3,
-    "measured_steps": 3,
+    "measure_steps": 50,
+    "measured_steps": 50,
     "notes": {
       "base_dx_seconds_measured": true,
       "component_timers_may_overlap_parent_forward": true,
       "lora_grad_seconds_estimated": true,
       "profiling_backend_imported": true
     },
-    "setup_seconds": 0.6991856414824724,
-    "steady_state_step_percent_of_total": 0.28428826162331616,
-    "steady_state_step_seconds": 0.0019933696215351424,
+    "setup_seconds": 0.6767020020633936,
+    "steady_state_step_percent_of_total": 0.2656487537411053,
+    "steady_state_step_seconds": 0.0018024385906755924,
     "timing_stats": {
-      "coefficient_of_variation": 0.11536068427270703,
-      "count": 3,
-      "max_seconds": 0.0024533290416002274,
-      "mean_seconds": 0.002113482914865017,
-      "measured_steps": 3,
-      "median_seconds": 0.0019940128549933434,
-      "min_seconds": 0.00189310684800148,
-      "p90_seconds": 0.0023614658042788506,
-      "p95_seconds": 0.0024073974229395388,
-      "std_seconds": 0.00024381283525750378,
+      "coefficient_of_variation": 0.060704994695880955,
+      "count": 50,
+      "max_seconds": 0.0025107963010668755,
+      "mean_seconds": 0.0018877422623336316,
+      "measured_steps": 50,
+      "median_seconds": 0.0018641450442373753,
+      "min_seconds": 0.0017595719546079636,
+      "p90_seconds": 0.001974393520504236,
+      "p95_seconds": 0.0020230439025908705,
+      "std_seconds": 0.00011459538402215342,
       "values_seconds": [
-        0.0024533290416002274,
-        0.0019940128549933434,
-        0.00189310684800148
+        0.0020308755338191986,
+        0.002013471908867359,
+        0.001841280609369278,
+        0.0018788808956742287,
+        0.00217641144990921,
+        0.001973634585738182,
+        0.0018554134294390678,
+        0.0019421344622969627,
+        0.0017595719546079636,
+        0.0019284607842564583,
+        0.0017671175301074982,
+        0.0019004400819540024,
+        0.001766909845173359,
+        0.0019081886857748032,
+        0.0017974050715565681,
+        0.0018333420157432556,
+        0.001843801699578762,
+        0.0018559647724032402,
+        0.0018580993637442589,
+        0.0019051134586334229,
+        0.0018335571512579918,
+        0.0018737316131591797,
+        0.001863495446741581,
+        0.001841789111495018,
+        0.0018733683973550797,
+        0.0018288912251591682,
+        0.0018647946417331696,
+        0.0018609566614031792,
+        0.00188511423766613,
+        0.0019341055303812027,
+        0.0018669608980417252,
+        0.001877923496067524,
+        0.0018428312614560127,
+        0.0019187908619642258,
+        0.0018320418894290924,
+        0.001855209469795227,
+        0.001821659505367279,
+        0.0018664011731743813,
+        0.0018204841762781143,
+        0.001798315905034542,
+        0.001838192343711853,
+        0.0018167095258831978,
+        0.0019209114834666252,
+        0.0018055383116006851,
+        0.0018829992040991783,
+        0.001797250472009182,
+        0.0019812239333987236,
+        0.0025107963010668755,
+        0.0019213994964957237,
+        0.0019151512533426285
       ],
-      "warmup_steps": 1
+      "warmup_steps": 10
     },
     "total_percent": 100.0,
-    "total_seconds": 0.7011790111040076,
-    "total_seconds_per_step_plus_setup": 0.7011790111040076
+    "total_seconds": 0.6785044406540692,
+    "total_seconds_per_step_plus_setup": 0.6785044406540692
   },
-  "measure_steps": 3,
-  "measured_steps": 3,
+  "measure_steps": 50,
+  "measured_steps": 50,
   "memory": {
     "cpu_memory": {
       "estimated": true,
-      "pinned_bytes": 262144,
+      "pinned_bytes": 131072,
       "pinned_percent_of_cpu_total": 100.0,
-      "rss_bytes": 1169330176,
-      "rss_percent_of_total": 99.96428358830883,
-      "total_bytes": 262144,
-      "total_percent": 0.022410297531715823,
-      "unattributed_cpu_bytes": 1169068032,
-      "unattributed_cpu_percent": 99.97758169545433,
+      "rss_bytes": 1170550784,
+      "rss_percent_of_total": 99.97551154630591,
+      "total_bytes": 131072,
+      "total_percent": 0.011194721688723767,
+      "unattributed_cpu_bytes": 1170419712,
+      "unattributed_cpu_percent": 99.98880253622555,
       "w_host_bytes": 131072,
-      "w_t_host_bytes": 131072
+      "w_t_host_bytes": 0
     },
     "gpu_memory": {
       "current_hbm_bytes": 67207168,
@@ -132,7 +433,7 @@
       "resident_parameter_and_buffer_bytes": 24576,
       "staged_buffer_bytes": 0,
       "total_bytes": 155648,
-      "total_percent": 0.01330611415945627,
+      "total_percent": 0.013293732005359472,
       "unattributed_gpu_bytes": 67473920,
       "unattributed_gpu_percent": 99.96359029984905
     },
@@ -140,10 +441,10 @@
       "hbm_resident_of_gpu_basis_pct": 15.789473684210526,
       "hbm_saved_of_gpu_basis_pct": 84.21052631578948,
       "pinned_cpu_of_cpu_total_pct": 100.0,
-      "w_host_of_pinned_cpu_pct": 50.0,
-      "w_t_host_of_pinned_cpu_pct": 50.0
+      "w_host_of_pinned_cpu_pct": 100.0,
+      "w_t_host_of_pinned_cpu_pct": 0.0
     },
-    "total_bytes": 1169747968,
+    "total_bytes": 1170837504,
     "total_percent": 100.0,
     "totals": {
       "cpu_parameter_and_buffer_bytes": 0,
@@ -152,14 +453,14 @@
       "hbm_current_bytes": 67207168,
       "hbm_peak_bytes": 67498496,
       "host_weight_count": 2,
-      "pinned_cpu_bytes": 262144,
-      "pinned_cpu_cost_bytes": 262144,
-      "rss_bytes": 1169330176,
+      "pinned_cpu_bytes": 131072,
+      "pinned_cpu_cost_bytes": 131072,
+      "rss_bytes": 1170550784,
       "w_host_bytes": 131072,
-      "w_t_host_bytes": 131072
+      "w_t_host_bytes": 0
     }
   },
   "milestone": "M4.5 Profiling",
-  "warmup_steps": 1,
+  "warmup_steps": 10,
   "workload": "mlp"
 }

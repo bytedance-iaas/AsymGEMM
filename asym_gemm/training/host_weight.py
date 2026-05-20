@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import re
+import time
 from typing import Any
 
 import torch
@@ -36,6 +37,22 @@ def _tensor_nbytes(tensor: torch.Tensor) -> int:
 
 def tensor_nbytes(tensor: torch.Tensor) -> int:
     return _tensor_nbytes(tensor)
+
+
+_profile_recorder: Any | None = None
+
+
+def set_profile_recorder(recorder: Any | None) -> Any | None:
+    global _profile_recorder
+    previous = _profile_recorder
+    _profile_recorder = recorder
+    return previous
+
+
+def _record_profile_event(event_name: str, **payload: Any) -> None:
+    if _profile_recorder is None:
+        return
+    _profile_recorder(event_name, payload)
 
 
 def _cuda_can_map_host_memory(device: int = 0) -> bool | None:
@@ -179,27 +196,52 @@ class HostWeight:
         if require_2d and tensor.dim() != 2:
             raise ValueError(f"HostWeight expects a 2D tensor, got shape {tuple(tensor.shape)}")
 
+        init_start = time.perf_counter()
+        source_device = str(tensor.device)
+        source_nbytes = _tensor_nbytes(tensor)
+
+        copy_start = time.perf_counter()
         cpu_tensor = tensor.detach()
         if cpu_tensor.device.type != "cpu":
             cpu_tensor = cpu_tensor.to(device="cpu", non_blocking=False)
+        copy_seconds = time.perf_counter() - copy_start
+
+        clone_start = time.perf_counter()
         if clone:
             cpu_tensor = cpu_tensor.clone(memory_format=torch.contiguous_format)
         elif not cpu_tensor.is_contiguous():
             cpu_tensor = cpu_tensor.contiguous()
+        clone_seconds = time.perf_counter() - clone_start
         cpu_tensor.requires_grad_(False)
 
         pin_error: str | None = None
+        pin_seconds = 0.0
         if pin_memory and torch.cuda.is_available() and not cpu_tensor.is_pinned():
+            pin_start = time.perf_counter()
             try:
                 cpu_tensor = cpu_tensor.pin_memory()
             except RuntimeError as exc:
                 pin_error = str(exc)
+            pin_seconds = time.perf_counter() - pin_start
 
         self._tensor = cpu_tensor
         self._transpose: torch.Tensor | None = None
         self._name = name
         self._pin_transpose = pin_memory
         self._metadata = _make_metadata(cpu_tensor, pin_error=pin_error)
+        _record_profile_event(
+            "host_weight_init",
+            name=name,
+            source_device=source_device,
+            source_nbytes=source_nbytes,
+            nbytes=self.nbytes,
+            pinned=bool(cpu_tensor.is_pinned()),
+            cpu_copy_seconds=copy_seconds,
+            clone_seconds=clone_seconds,
+            pin_seconds=pin_seconds,
+            total_seconds=time.perf_counter() - init_start,
+            pin_error=pin_error,
+        )
 
     @property
     def tensor(self) -> torch.Tensor:
@@ -283,14 +325,31 @@ class HostWeight:
 
     def transposed_tensor(self) -> torch.Tensor:
         if self._transpose is None:
+            total_start = time.perf_counter()
+            transpose_start = time.perf_counter()
             transpose = self._tensor.t().contiguous()
+            transpose_seconds = time.perf_counter() - transpose_start
+            pin_seconds = 0.0
+            pin_error: str | None = None
             if self._pin_transpose and torch.cuda.is_available() and not transpose.is_pinned():
+                pin_start = time.perf_counter()
                 try:
                     transpose = transpose.pin_memory()
-                except RuntimeError:
-                    pass
+                except RuntimeError as exc:
+                    pin_error = str(exc)
+                pin_seconds = time.perf_counter() - pin_start
             transpose.requires_grad_(False)
             self._transpose = transpose
+            _record_profile_event(
+                "host_weight_transpose",
+                name=self._name,
+                nbytes=tensor_nbytes(transpose),
+                pinned=bool(transpose.is_pinned()),
+                transpose_seconds=transpose_seconds,
+                pin_seconds=pin_seconds,
+                total_seconds=time.perf_counter() - total_start,
+                pin_error=pin_error,
+            )
         return self._transpose
 
     def transposed_grouped_nt_tensor(self) -> torch.Tensor:
@@ -329,4 +388,4 @@ class HostWeight:
         )
 
 
-__all__ = ["HostWeight", "HostWeightMetadata", "tensor_nbytes"]
+__all__ = ["HostWeight", "HostWeightMetadata", "set_profile_recorder", "tensor_nbytes"]

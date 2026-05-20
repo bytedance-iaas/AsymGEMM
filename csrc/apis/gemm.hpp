@@ -460,18 +460,27 @@ static void m_grouped_bf16_asym_gemm_nt_contiguous(const torch::Tensor& a, const
                                               const torch::Tensor& d,
                                               const torch::Tensor& offsets, const torch::Tensor& experts,
                                               const int& list_size,
-                                              const std::string& compiled_dims) {
+                                              const std::string& compiled_dims,
+                                              const bool transpose_b = false) {
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto& major_a = get_major_type_ab(a);
-    const auto& major_b = get_major_type_ab(b);
+    cute::UMMA::Major major_b;
+    if (transpose_b) {
+        major_check(b);
+        major_b = cute::UMMA::Major::MN;
+    } else {
+        major_b = get_major_type_ab(b);
+    }
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
 
     // Type and shape checks
-    const auto& [m, k] = get_shape<2>(a);
-    const auto& [num_groups, n, k_] = get_shape<3>(b);
+    const auto& [m, k_a] = get_shape<2>(a);
+    const auto& [num_groups, n_phys, k_phys] = get_shape<3>(b);
+    const int n = transpose_b ? k_phys : n_phys;
+    const int k = transpose_b ? n_phys : k_phys;
     const auto& [m_, n_] = get_shape<2>(d);
     DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
-    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_a);
     DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
@@ -488,15 +497,21 @@ static void m_grouped_bf16_asym_gemm_nt_contiguous(const torch::Tensor& a, const
     if (m == 0)
         return;
 
+    const int b_outer_stride = transpose_b
+        ? static_cast<int>(b.stride(-2))
+        : static_cast<int>(b.stride(get_non_contiguous_dim(major_b)));
+
     const auto& arch_major = device_runtime->get_arch_major();
     if (arch_major == 9) {
         sm90_m_grouped_bf16_asym_gemm_contiguous(a, b, d,
                                                  offsets, experts, list_size,
-                                                 num_groups, m, n, k, major_a, major_b, compiled_dims);
+                                                 num_groups, m, n, k, major_a, major_b, compiled_dims,
+                                                 b_outer_stride);
     } else if (arch_major == 10) {
         sm100_m_grouped_bf16_asym_gemm_contiguous(a, b, d,
                                                   offsets, experts, list_size,
-                                                  num_groups, m, n, k, major_a, major_b, compiled_dims);
+                                                  num_groups, m, n, k, major_a, major_b, compiled_dims,
+                                                  b_outer_stride);
     } else {
         DG_HOST_ASSERT(false && "unsupported BF16 asym GEMM architecture");
     }
@@ -622,11 +637,13 @@ static void register_apis(pybind11::module_& m) {
     // BF16 GEMMs
     m.def("m_grouped_bf16_asym_gemm_nt_contiguous",
           static_cast<void(*)(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
-                              const torch::Tensor&, const torch::Tensor&, const int&, const std::string&)>(
+                              const torch::Tensor&, const torch::Tensor&, const int&,
+                              const std::string&, const bool)>(
               &m_grouped_bf16_asym_gemm_nt_contiguous),
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
-          py::arg("compiled_dims") = "nk");
+          py::arg("compiled_dims") = "nk",
+          py::arg("transpose_b") = false);
     m.def("m_grouped_bf16_asym_gemm_nt_masked",
           static_cast<void(*)(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
                               const torch::Tensor&, const int&, const std::string&)>(

@@ -113,6 +113,26 @@ def test_m_grouped_bf16_contiguous_sm90():
 
 
 @pytest.mark.skipif(get_arch_major() != 9, reason="SM90 (H20) required")
+def test_m_grouped_bf16_contiguous_transpose_b_sm90():
+    device = torch.device("cuda")
+    m, n_phys, k_phys = 64, 128, 512
+    a = torch.randn((m, n_phys), device=device, dtype=torch.bfloat16)
+    b = torch.randn((1, n_phys, k_phys), device=device, dtype=torch.bfloat16)
+    b_pinned = b.detach().to("cpu", non_blocking=False).pin_memory()
+    d_asym = torch.empty((m, k_phys), device=device, dtype=torch.float32)
+    offsets_i32 = torch.tensor([0, m], device=device, dtype=torch.int32)
+    experts_i32 = torch.tensor([0, -1], device=device, dtype=torch.int32)
+
+    asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous(
+        a, b_pinned, d_asym, offsets_i32, experts_i32, 2, "mnk", True
+    )
+
+    ref_d = a.float() @ b[0].float()
+    diff = calc_diff(d_asym, ref_d)
+    assert diff < 0.001, f"transpose_b diff={diff:.5e} too large"
+
+
+@pytest.mark.skipif(get_arch_major() != 9, reason="SM90 (H20) required")
 def test_m_grouped_bf16_masked_sm90():
     print("\nTesting SM90 m-grouped BF16 masked GEMM:")
     compiled_dims = "nk"

@@ -189,7 +189,7 @@ def estimate_tiny_dense_llm_parameters(
         "trainable_lora_elements": trainable_lora_elements,
         "pytorch_visible_parameter_elements": pytorch_visible_parameter_elements,
         "expected_hbm_saved_bytes": cpu_resident_target_elements * dtype_bytes,
-        "expected_pinned_cpu_bytes_after_dx": cpu_resident_target_elements * dtype_bytes * 2,
+        "expected_pinned_cpu_bytes_after_dx": cpu_resident_target_elements * dtype_bytes,
         "lora_trainable_fraction": trainable_lora_elements / float(total_model_elements),
     }
 

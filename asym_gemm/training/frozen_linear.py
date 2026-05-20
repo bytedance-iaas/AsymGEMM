@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from .host_weight import HostWeight, tensor_nbytes
+from .profile_ranges import is_profile_enabled, prof_range
 
 
 VALID_BACKENDS = ("asym_only", "asym_or_staged", "asym_or_torch", "torch_only")
@@ -62,7 +63,7 @@ def _arch_major(device: torch.device) -> Optional[int]:
     return int(torch.cuda.get_device_capability(device)[0])
 
 
-def _direct_bf16_reason(a: torch.Tensor, b_cpu: torch.Tensor) -> Optional[str]:
+def _direct_bf16_reason(a: torch.Tensor, b_cpu: torch.Tensor, *, transpose_b: bool = False) -> Optional[str]:
     if not torch.cuda.is_available():
         return "cuda_unavailable"
     if a.device.type != "cuda":
@@ -79,10 +80,13 @@ def _direct_bf16_reason(a: torch.Tensor, b_cpu: torch.Tensor) -> Optional[str]:
         return "weight_not_pinned"
     if not a.is_contiguous() or not b_cpu.is_contiguous():
         return "requires_contiguous"
-    if a.shape[1] != b_cpu.shape[1]:
+    if transpose_b:
+        if a.shape[1] != b_cpu.shape[0]:
+            return "shape_mismatch"
+    elif a.shape[1] != b_cpu.shape[1]:
         return "shape_mismatch"
     k = int(a.shape[1])
-    n = int(b_cpu.shape[0])
+    n = int(b_cpu.shape[1] if transpose_b else b_cpu.shape[0])
     if n <= 0 or k <= 0:
         return "requires_positive_nk"
     if n % 8 != 0 or k % 8 != 0:
@@ -96,20 +100,25 @@ def _direct_bf16_reason(a: torch.Tensor, b_cpu: torch.Tensor) -> Optional[str]:
 
 
 def can_use_direct_bf16(a: torch.Tensor, host_weight: HostWeight, *, transpose: bool = False) -> Tuple[bool, Optional[str]]:
-    b_cpu = host_weight.weight_t if transpose else host_weight.weight
-    reason = _direct_bf16_reason(a, b_cpu)
+    reason = _direct_bf16_reason(a, host_weight.weight, transpose_b=transpose)
     return reason is None, reason
 
 
-def _asym_bf16_nt(a: torch.Tensor, b_cpu: torch.Tensor, *, compiled_dims: str = "mnk") -> torch.Tensor:
+def _asym_bf16_nt(
+    a: torch.Tensor,
+    b_cpu: torch.Tensor,
+    *,
+    compiled_dims: str = "mnk",
+    transpose_b: bool = False,
+) -> torch.Tensor:
     import asym_gemm
 
-    reason = _direct_bf16_reason(a, b_cpu)
+    reason = _direct_bf16_reason(a, b_cpu, transpose_b=transpose_b)
     if reason is not None:
         raise RuntimeError(f"direct BF16 AsymGEMM is unavailable: {reason}")
 
     m = int(a.shape[0])
-    n = int(b_cpu.shape[0])
+    n = int(b_cpu.shape[1] if transpose_b else b_cpu.shape[0])
     # Use FP32 D so multi-K-block kernels reduce partial K tiles in FP32.
     # The public training contract still returns BF16 activations/gradients.
     d = torch.empty((m, n), device=a.device, dtype=torch.float32)
@@ -117,20 +126,22 @@ def _asym_bf16_nt(a: torch.Tensor, b_cpu: torch.Tensor, *, compiled_dims: str = 
     experts = torch.tensor([0, -1], device=a.device, dtype=torch.int32)
     b_group = b_cpu.unsqueeze(0)
     asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous(
-        a, b_group, d, offsets, experts, 2, compiled_dims
+        a, b_group, d, offsets, experts, 2, compiled_dims, transpose_b
     )
     return d.to(dtype=torch.bfloat16)
 
 
-def _staged_nt(a: torch.Tensor, b_cpu: torch.Tensor) -> torch.Tensor:
+def _staged_nt(a: torch.Tensor, b_cpu: torch.Tensor, *, transpose_b: bool = False) -> torch.Tensor:
     b = b_cpu.to(device=a.device, dtype=a.dtype, non_blocking=b_cpu.is_pinned())
-    return a @ b.t()
+    return a @ b if transpose_b else a @ b.t()
 
 
-def _torch_nt(a: torch.Tensor, b_cpu: torch.Tensor) -> torch.Tensor:
+def _torch_nt(a: torch.Tensor, b_cpu: torch.Tensor, *, transpose_b: bool = False) -> torch.Tensor:
     if a.device.type == "cpu":
-        return a @ b_cpu.to(dtype=a.dtype).t()
-    out_cpu = a.to(device="cpu", non_blocking=False) @ b_cpu.to(dtype=a.dtype).t()
+        b = b_cpu.to(dtype=a.dtype)
+        return a @ b if transpose_b else a @ b.t()
+    b = b_cpu.to(dtype=a.dtype)
+    out_cpu = a.to(device="cpu", non_blocking=False) @ (b if transpose_b else b.t())
     return out_cpu.to(device=a.device, non_blocking=False)
 
 
@@ -142,14 +153,16 @@ def _dispatch_nt(
     stats: Optional[AsymExecutionStats],
     phase: str,
     compiled_dims: str,
+    transpose_b: bool = False,
+    profile_label: str = "",
 ) -> torch.Tensor:
     _check_backend(backend)
 
     if backend != "torch_only":
-        reason = _direct_bf16_reason(a, b_cpu)
+        reason = _direct_bf16_reason(a, b_cpu, transpose_b=transpose_b)
         if reason is None:
             try:
-                out = _asym_bf16_nt(a, b_cpu, compiled_dims=compiled_dims)
+                out = _asym_bf16_nt(a, b_cpu, compiled_dims=compiled_dims, transpose_b=transpose_b)
                 if stats is not None:
                     if phase == "forward":
                         stats.asym_forward_calls += 1
@@ -171,14 +184,14 @@ def _dispatch_nt(
                 stats.staged_forward_calls += 1
             else:
                 stats.staged_dx_calls += 1
-        return _staged_nt(a, b_cpu)
+        return _staged_nt(a, b_cpu, transpose_b=transpose_b)
 
     if stats is not None:
         if phase == "forward":
             stats.torch_forward_calls += 1
         else:
             stats.torch_dx_calls += 1
-    return _torch_nt(a, b_cpu)
+    return _torch_nt(a, b_cpu, transpose_b=transpose_b)
 
 
 class AsymFrozenLinearFunction(torch.autograd.Function):
@@ -191,19 +204,24 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
         backend: str,
         stats: Optional[AsymExecutionStats],
         compiled_dims: str,
+        profile_name: str,
     ) -> torch.Tensor:
         if x.shape[-1] != host_weight.in_features:
             raise ValueError(f"expected input last dim {host_weight.in_features}, got {x.shape[-1]}")
         input_shape = tuple(x.shape)
         x_2d = x.reshape(-1, host_weight.in_features).contiguous()
-        y = _dispatch_nt(
-            x_2d,
-            host_weight.weight,
-            backend=backend,
-            stats=stats,
-            phase="forward",
-            compiled_dims=compiled_dims,
-        )
+        forward_range = "forward.base_frozen_asymgemm"
+        backward_range = "backward.base_dx_asymgemm" if not profile_name else f"backward.{profile_name}.base_dx_asymgemm"
+        with prof_range(forward_range):
+            y = _dispatch_nt(
+                x_2d,
+                host_weight.weight,
+                backend=backend,
+                stats=stats,
+                phase="forward",
+                compiled_dims=compiled_dims,
+                profile_label=forward_range,
+            )
         if bias is not None:
             y = y + bias.to(device=y.device, dtype=y.dtype)
 
@@ -211,6 +229,8 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
         ctx.backend = backend
         ctx.stats = stats
         ctx.compiled_dims = compiled_dims
+        ctx.profile_backward_range = backward_range
+        ctx.profile_enabled = is_profile_enabled()
         ctx.has_bias = bias is not None
         ctx.bias_device = bias.device if bias is not None else None
         ctx.bias_dtype = bias.dtype if bias is not None else None
@@ -218,18 +238,21 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
         return y.reshape(*input_shape[:-1], host_weight.out_features)
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[Optional[torch.Tensor], None, Optional[torch.Tensor], None, None, None]:
+    def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[Optional[torch.Tensor], None, Optional[torch.Tensor], None, None, None, None]:
         grad_x = None
         if ctx.needs_input_grad[0]:
             grad_output_2d = grad_output.reshape(-1, ctx.host_weight.out_features).contiguous()
-            grad_x = _dispatch_nt(
-                grad_output_2d,
-                ctx.host_weight.weight_t,
-                backend=ctx.backend,
-                stats=ctx.stats,
-                phase="dx",
-                compiled_dims=ctx.compiled_dims,
-            )
+            with prof_range(ctx.profile_backward_range, enabled=ctx.profile_enabled):
+                grad_x = _dispatch_nt(
+                    grad_output_2d,
+                    ctx.host_weight.weight,
+                    backend=ctx.backend,
+                    stats=ctx.stats,
+                    phase="dx",
+                    compiled_dims=ctx.compiled_dims,
+                    transpose_b=True,
+                    profile_label=ctx.profile_backward_range,
+                )
             grad_x = grad_x.reshape(ctx.input_shape)
 
         grad_bias = None
@@ -239,7 +262,7 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
                 .sum(dim=0)
                 .to(device=ctx.bias_device, dtype=ctx.bias_dtype)
             )
-        return grad_x, None, grad_bias, None, None, None
+        return grad_x, None, grad_bias, None, None, None, None
 
 
 def asym_frozen_linear(
@@ -250,8 +273,9 @@ def asym_frozen_linear(
     backend: str = "asym_or_staged",
     stats: Optional[AsymExecutionStats] = None,
     compiled_dims: str = "mnk",
+    profile_name: str = "",
 ) -> torch.Tensor:
-    return AsymFrozenLinearFunction.apply(x, host_weight, bias, backend, stats, compiled_dims)
+    return AsymFrozenLinearFunction.apply(x, host_weight, bias, backend, stats, compiled_dims, profile_name)
 
 
 def frozen_linear(
@@ -262,6 +286,7 @@ def frozen_linear(
     backend: str = "asym_or_torch",
     stats: Optional[AsymExecutionStats] = None,
     compiled_dims: str = "mnk",
+    profile_name: str = "",
 ) -> torch.Tensor:
     return asym_frozen_linear(
         x,
@@ -270,6 +295,7 @@ def frozen_linear(
         backend=backend,
         stats=stats,
         compiled_dims=compiled_dims,
+        profile_name=profile_name,
     )
 
 
@@ -317,6 +343,7 @@ class AsymFrozenLinear(nn.Module):
         self.backend = backend
         self.stats = stats if stats is not None else AsymExecutionStats()
         self.compiled_dims = compiled_dims
+        self.profile_name = ""
         self.in_features = self.host_weight.in_features
         self.out_features = self.host_weight.out_features
 
@@ -384,6 +411,7 @@ class AsymFrozenLinear(nn.Module):
             backend=self.backend,
             stats=self.stats,
             compiled_dims=self.compiled_dims,
+            profile_name=self.profile_name,
         )
 
     def _save_to_state_dict(self, destination: Dict[str, torch.Tensor], prefix: str, keep_vars: bool) -> None:

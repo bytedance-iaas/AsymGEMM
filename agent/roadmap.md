@@ -125,7 +125,9 @@ Update this table after each milestone run.
 | M2 Viable MLP Demo | Done | `examples/asymgemm/mlp_lora_demo.py`, `tests/training/test_02_mlp_demo.py`, `reports/mlp_demo.json` | 2026-05-18 | |
 | M3 Tiny LLM Correctness | Done | `reports/m3_tiny_llm.json`, `tests/training/test_03_tiny_dense_llm.py` | 2026-05-18 | |
 | M4 Tiny MoE Correctness | Done - stop point reached | `reports/m4_tiny_moe.json`, `tests/training/test_04_tiny_moe.py` | 2026-05-18 | Review stop report before M5 |
-| M4.5 Fine-Grained Profiling Gate | Not started | `reports/m4_5_profile_summary.json`, `reports/m4_5_profile_summary.md` | | Required before M5 |
+| M4.1 MLP Step Profiling | Redo required | `reports/m4_1_mlp_profile.json`, `reports/m4_1_mlp_profile.md` | | Required before M4.2 |
+| M4.2 Dense LLM Step Profiling | Not started | `reports/m4_2_dense_llm_profile.json`, `reports/m4_2_dense_llm_profile.md` | | Required before M4.3 |
+| M4.3 MoE Step Profiling | Not started | `reports/m4_3_moe_profile.json`, `reports/m4_3_moe_profile.md` | | Required before M5 |
 | M5 LLaMA-Factory Integration | Not started | `reports/m5_llamafactory.json` | | |
 | M6 KT Benchmark Reproduction | Not started | `reports/m6_kt_repro.json` | | |
 | M7 Optimize And Beat-KT Gate | Not started | `reports/m7_beat_kt.json` | | |
@@ -318,161 +320,329 @@ M4 stop report, 2026-05-18:
 
 Do not begin LLaMA-Factory integration, KTransformers benchmarking, or larger-model work until this stop point is reviewed.
 
-### M4.5 - Fine-Grained Profiling Gate
+### M4.1 - MLP Step Profiling
 
-Purpose: before integrating with LLaMA-Factory or making any performance claim, produce a comprehensive latency, CPU-memory, and GPU-memory breakdown for the three controlled demos: MLP LoRA, tiny dense LLM, and tiny transformer MoE. This milestone is profiling and analysis only; do not change kernels, model logic, or training behavior as part of M4.5.
+Purpose: redo profiling for the M2 toy MLP at the right granularity. The output should look like a stacked bar for one training step and for each major stage: human-meaningful operations, exclusive timings, and percentages that sum to 100%. Do not stop at `forward/backward/loss/optimizer`, and do not jump directly to individual CUDA kernel counters.
 
 Scope:
 
-- Workloads:
-  - MLP LoRA demo from M2;
-  - tiny dense LLM from M3;
-  - tiny transformer MoE from M4.
-- Backends/modes:
-  - Torch GPU-resident baseline;
-  - staged fallback path where supported;
-  - direct AsymGEMM path with `asym_only` on H200;
-  - dense target modes `mlp_only`, `attention_only`, and `all` where applicable;
-  - MoE grouped metadata modes `contiguous` and `masked`.
-- Phases:
-  - setup and host-weight construction;
-  - host pinning and `W.T` materialization;
-  - forward;
-  - loss;
-  - backward;
-  - optimizer step;
-  - report serialization and cleanup excluded from step timing unless reported separately.
+- Workload: MLP LoRA demo from M2 only.
+- Backend: direct AsymGEMM path with `asym_only` on H200.
+- Optional comparisons: Torch GPU-resident baseline and staged fallback, but these are secondary to the direct AsymGEMM breakdown.
+- Profiling target: timing first; memory is reported, but M4.1 is primarily about where forward and backward time go.
+
+Required exclusive timing hierarchy:
+
+```text
+step
+  batch/input preparation
+  forward
+    fc1.base_frozen_asymgemm
+    fc1.lora_A
+    fc1.lora_B
+    fc1.add_cast_scale
+    activation_relu
+    fc2.base_frozen_asymgemm
+    fc2.lora_A
+    fc2.lora_B
+    fc2.add_cast_scale
+    forward_other_unattributed
+  loss
+  backward
+    fc2.base_dx_asymgemm
+    fc2.lora_B_grad
+    fc2.lora_A_grad
+    activation_relu_grad
+    fc1.base_dx_asymgemm
+    fc1.lora_B_grad
+    fc1.lora_A_grad
+    backward_other_unattributed
+  optimizer
+    optimizer_lora_A
+    optimizer_lora_B
+    optimizer_other_unattributed
+```
 
 Deliverables:
 
-- Profiling entrypoint, to be implemented after this roadmap update:
-  - `scripts/profile_asymgemm_sft.py`
-- Per-workload machine-readable reports:
-  - `reports/m4_5_mlp_profile.json`
-  - `reports/m4_5_dense_llm_profile.json`
-  - `reports/m4_5_tiny_moe_profile.json`
-- Cross-workload summary:
-  - `reports/m4_5_profile_summary.json`
-  - `reports/m4_5_profile_summary.md`
-- Optional schema/guard test:
-  - `tests/training/test_04_5_profile_schema.py`
+- `scripts/profile_m4_1_mlp_steps.py` or an equivalent `--workload mlp --exclusive-stages` mode in `scripts/profile_asymgemm_sft.py`.
+- `reports/m4_1_mlp_profile.json`
+- `reports/m4_1_mlp_profile.md`
+- Optional Nsight Systems trace:
+  - `reports/m4_1_mlp.nsys-rep`
+  - `reports/m4_1_mlp.sqlite`
 
-Latency breakdown requirements:
+Report requirements:
 
-- Report total step latency and percent-of-step for every major stage:
-  - input/token preparation;
-  - host-weight pointer preparation;
-  - route logits and top-k router for MoE;
-  - route pack/sort/metadata construction;
-  - frozen base forward AsymGEMM or Torch/staged equivalent;
-  - LoRA forward;
-  - attention forward for dense LLM and MoE;
-  - MoE expert `gate`, `up`, activation, and `down`;
-  - route scatter;
-  - loss;
-  - frozen base `dX`;
-  - LoRA gradient computation;
-  - router gradient computation for MoE;
-  - optimizer step;
-  - explicit synchronization/copy/fallback overhead.
-- Report latency at multiple granularities:
-  - whole training step;
-  - forward vs backward vs optimizer;
-  - per layer;
-  - per projection class such as attention `q/k/v/o`, MLP `gate/up/down`, MoE shared experts, and MoE routed experts;
-  - per backend mode.
-- Include distribution statistics over repeated measured steps:
-  - warmup count;
-  - measured step count;
-  - mean, median, p90, p95, min, max, and standard deviation;
-  - CUDA event time and wall-clock time, with methodology clearly labeled.
+- A top-level step table whose percentages sum to 100%:
+  - input preparation, forward, loss, backward, optimizer, synchronization/other.
+- A forward-only table whose percentages sum to 100%.
+- A backward-only table whose percentages sum to 100%.
+- A memory table:
+  - HBM peak;
+  - pinned CPU `W`;
+  - pinned CPU `W.T` if any;
+  - LoRA parameter bytes;
+  - optimizer-state bytes;
+  - activation bytes where measurable;
+  - explicit `unattributed` bucket.
+- Explicit `W.T` status:
+  - `w_t_host_bytes`;
+  - `transpose_materialization_seconds`;
+  - direct dX uses `transpose_b=True` or not.
 
-GPU memory breakdown requirements:
+Instrumentation requirements:
 
-- Report total and percent breakdown for:
-  - frozen base/expert weights that would be GPU-resident in the Torch baseline;
-  - trainable LoRA parameters;
-  - router parameters;
-  - embeddings, LM head, attention weights, and layernorm buffers;
-  - optimizer states;
-  - activations saved for backward;
-  - route metadata, packed token buffers, scatter buffers, and MoE workspace;
-  - staged weight buffers if any fallback path uses them;
-  - kernel temporary/workspace allocations when measurable;
-  - peak allocated, peak reserved, current allocated, and fragmentation/reserved-minus-allocated.
-- Report both absolute bytes and percentages:
-  - percent of peak allocated HBM;
-  - percent of model-state HBM;
-  - percent of total training-step HBM delta.
-
-CPU memory breakdown requirements:
-
-- Report total and percent breakdown for:
-  - CPU-resident frozen `W` weights;
-  - CPU-resident transposed `W.T` weights used for `dX`;
-  - pinned/page-locked bytes;
-  - pageable CPU bytes;
-  - staging buffers;
-  - route metadata mirrored on CPU, if any;
-  - process RSS and peak RSS;
-  - NUMA node and CPU socket placement where available.
-- Explicitly separate:
-  - CPU memory required by AsymGEMM host weights;
-  - CPU memory required only by reporting/profiling;
-  - CPU memory that would exist in the Torch baseline.
-
-Required percentage accounting:
-
-- Every profile report must include tables where component bytes and component latency sum to the reported total within a documented tolerance.
-- Required percentage views:
-  - latency percent of full step;
-  - latency percent of forward;
-  - latency percent of backward;
-  - GPU bytes percent of peak HBM;
-  - CPU bytes percent of total RSS;
-  - pinned bytes percent of total CPU-resident frozen-weight storage.
-- If any category cannot be measured directly, the report must mark it as `estimated` or `unattributed`, include the estimation method, and keep `unattributed_percent` visible.
-
-Comparison requirements:
-
-- For each workload, compare:
-  - Torch GPU-resident baseline vs AsymGEMM direct;
-  - direct fetch vs staged fallback where supported;
-  - forward-only vs full training step;
-  - forward base matmul vs backward `dX`;
-  - LoRA overhead vs frozen base matmul overhead;
-  - memory saved in HBM vs extra pinned CPU memory required.
-- For tiny MoE, additionally compare:
-  - router time;
-  - pack/sort time;
-  - contiguous vs masked metadata;
-  - routed expert time;
-  - shared expert time;
-  - scatter time;
-  - imbalance statistics: expert token counts, empty experts, max/min/mean routes per expert, and padded-route percent.
-
-Leadership summary requirements:
-
-- The markdown summary must answer, for MLP, dense LLM, and MoE:
-  - where the step time goes;
-  - where HBM goes;
-  - where CPU memory goes;
-  - how much HBM AsymGEMM saves;
-  - how much pinned CPU memory AsymGEMM costs;
-  - whether direct fetch is faster or slower than staged/Torch for forward and `dX`;
-  - whether MoE route overhead dominates expert GEMM time;
-  - whether `W` and `W.T` host-layout overhead is acceptable;
-  - the top three performance blockers before M5.
+- Use explicit stage timers around the MLP operations, not broad module hooks that overlap.
+- Use `torch.cuda.Event` or CUDA-synchronized wall timing for GPU stages.
+- Add NVTX ranges with the same names as the report rows so Nsight Systems can verify the timing.
+- If backward cannot be split by PyTorch autograd automatically, implement a profiled manual MLP training step for this toy workload that computes the same gradients and times each backward sub-operation explicitly.
 
 Acceptance:
 
-- All three workload reports are generated on the H200 target machine with identical hardware metadata.
-- Reports include zero hidden fallback in `asym_only`; any staged/Torch fallback causes M4.5 to fail unless explicitly run as a fallback comparison mode.
-- Latency and memory component percentages sum to the total within `+/- 5%`, or the report clearly identifies the unattributed remainder.
-- At least one table provides total and percent breakdown for every stage listed above.
-- At least one table provides total and percent breakdown for CPU memory and GPU memory.
-- Results are stable enough for leadership review: median step time coefficient of variation is recorded and any high variance is explained.
-- No M5 integration work starts until M4.5 identifies whether the next bottleneck is kernel throughput, host bandwidth, route packing/scatter, `W.T` layout storage, optimizer/activation memory, or framework integration overhead.
+- `forward` subcomponents sum to `100% +/- 2%`.
+- `backward` subcomponents sum to `100% +/- 2%`.
+- `step` subcomponents sum to `100% +/- 2%`.
+- No hidden fallback in `asym_only`.
+- `W.T` host materialization is zero, or any nonzero value is called out as a blocker.
+- Markdown report includes a concise stacked-bar-style table like the reference screenshot: operation name, milliseconds, and percent of the parent stage.
+
+### M4.2 - Dense LLM Step Profiling
+
+Purpose: redo profiling for the M3 toy dense LLM at the same additive stage granularity. This milestone profiles the transformer forward and backward at the operation-group level: embeddings, attention, MLP, layernorm/residual, LM head, loss, and LoRA/base dX work.
+
+Scope:
+
+- Workload: tiny dense LLM from M3 only.
+- Backend: direct AsymGEMM path with `asym_only` on H200.
+- Target modes:
+  - `mlp_only`;
+  - `attention_only`;
+  - `all`.
+- Use the toy model, not Qwen config-matched profiles, for this milestone.
+
+Required exclusive timing hierarchy:
+
+```text
+step
+  input/token preparation
+  forward
+    embeddings
+    per_layer_attention
+      layernorm_input
+      q_proj.base_frozen_asymgemm
+      q_proj.lora
+      k_proj.base_frozen_asymgemm
+      k_proj.lora
+      v_proj.base_frozen_asymgemm
+      v_proj.lora
+      attention_scores_matmul
+      causal_mask
+      softmax
+      value_matmul
+      o_proj.base_frozen_asymgemm
+      o_proj.lora
+      residual_add
+    per_layer_mlp
+      layernorm_post_attention
+      gate_proj.base_frozen_asymgemm
+      gate_proj.lora
+      up_proj.base_frozen_asymgemm
+      up_proj.lora
+      silu_mul_activation
+      down_proj.base_frozen_asymgemm
+      down_proj.lora
+      residual_add
+    final_norm
+    lm_head
+    forward_other_unattributed
+  loss
+  backward
+    lm_head_grad
+    attention_base_dx
+    attention_lora_grads
+    attention_scores_softmax_value_grads
+    mlp_base_dx
+    mlp_lora_grads
+    mlp_activation_grads
+    layernorm_residual_grads
+    embedding_grads_or_none
+    backward_other_unattributed
+  optimizer
+```
+
+Deliverables:
+
+- `scripts/profile_m4_2_dense_steps.py` or equivalent CLI mode.
+- `reports/m4_2_dense_llm_profile.json`
+- `reports/m4_2_dense_llm_profile.md`
+- Optional Nsight Systems trace:
+  - `reports/m4_2_dense_llm.nsys-rep`
+  - `reports/m4_2_dense_llm.sqlite`
+
+Report requirements:
+
+- Step, forward, backward, and optimizer percentage tables, each summing to 100%.
+- Per-layer aggregate table:
+  - attention total;
+  - MLP total;
+  - layernorm/residual total;
+  - base AsymGEMM total;
+  - LoRA total;
+  - attention math non-GEMM total.
+- Projection-class table:
+  - q/k/v/o;
+  - gate/up/down;
+  - base vs LoRA split.
+- Memory table:
+  - frozen CPU weights;
+  - trainable LoRA;
+  - embeddings/LM head/layernorm;
+  - optimizer state;
+  - saved activations;
+  - HBM peak/reserved;
+  - pinned CPU and `W.T` bytes.
+
+Instrumentation requirements:
+
+- Replace overlapping module hooks with exclusive code-region timers.
+- Add NVTX ranges for every row in the forward/backward report.
+- Prefer a profiled manual toy step if PyTorch autograd hooks cannot produce additive backward categories.
+- Keep per-kernel Nsight Compute out of M4.2 unless a single operation group is unclear after Nsight Systems.
+
+Acceptance:
+
+- Forward table sums to `100% +/- 2%`.
+- Backward table sums to `100% +/- 2%`.
+- Step table sums to `100% +/- 2%`.
+- Reports identify whether attention math, MLP base GEMM, MLP LoRA, or backward dX consumes the largest parent-stage share.
+- No M4.3 work starts until M4.2 produces additive dense LLM breakdowns.
+
+### M4.3 - MoE Step Profiling
+
+Purpose: redo profiling for the M4 toy transformer MoE with additive, operation-group timing. This is the required MoE bottleneck report before any LLaMA-Factory or KTransformers comparison.
+
+Scope:
+
+- Workload: tiny transformer MoE from M4 only.
+- Backend: direct AsymGEMM path with `asym_only` on H200.
+- Route modes:
+  - `contiguous`;
+  - `masked`.
+- Route patterns:
+  - balanced;
+  - empty experts;
+  - skewed/Zipf;
+  - repeated expert selections.
+- Use the toy model, not Qwen config-matched profiles, for this milestone.
+
+Required exclusive timing hierarchy:
+
+```text
+step
+  input/token preparation
+  forward
+    embeddings
+    attention
+      qkv_o_base_asymgemm
+      qkv_o_lora_or_none
+      attention_scores_mask_softmax_value
+      attention_other_unattributed
+    router
+      router_logits
+      topk
+      routing_weights
+    route_metadata
+      count_histogram
+      sort_or_group
+      offsets_or_masked_m
+    pack_tokens
+    shared_experts
+      gate_base_asymgemm
+      gate_lora
+      up_base_asymgemm
+      up_lora
+      activation_silu_mul
+      down_base_asymgemm
+      down_lora
+    routed_experts
+      gate_base_asymgemm
+      gate_lora
+      up_base_asymgemm
+      up_lora
+      activation_silu_mul
+      down_base_asymgemm
+      down_lora
+      padding_or_empty_expert_overhead
+    scatter_combine
+    final_norm_lm_head
+    forward_other_unattributed
+  loss
+  backward
+    scatter_grad
+    routed_expert_base_dx
+    routed_expert_lora_grads
+    shared_expert_base_dx
+    shared_expert_lora_grads
+    router_grad
+    attention_grad
+    layernorm_residual_grads
+    backward_other_unattributed
+  optimizer
+```
+
+Deliverables:
+
+- `scripts/profile_m4_3_moe_steps.py` or equivalent CLI mode.
+- `reports/m4_3_moe_profile.json`
+- `reports/m4_3_moe_profile.md`
+- Per-mode reports:
+  - `reports/m4_3_moe_contiguous_profile.json`
+  - `reports/m4_3_moe_masked_profile.json`
+- Optional Nsight Systems traces:
+  - `reports/m4_3_moe_contiguous.nsys-rep`
+  - `reports/m4_3_moe_masked.nsys-rep`
+
+Report requirements:
+
+- Step, forward, backward, router, expert, and route-overhead tables that each sum to 100% within their parent.
+- Separate routed-expert and shared-expert breakdowns.
+- Contiguous vs masked comparison:
+  - metadata time;
+  - pack time;
+  - expert compute time;
+  - scatter time;
+  - padded-route percent;
+  - empty-expert count;
+  - max/min/mean routes per expert.
+- Memory table:
+  - frozen expert weights;
+  - shared expert weights;
+  - routed expert weights;
+  - router params;
+  - route metadata;
+  - packed token buffers;
+  - scatter buffers;
+  - optimizer state;
+  - activations;
+  - HBM peak/reserved;
+  - pinned CPU and `W.T` bytes.
+
+Instrumentation requirements:
+
+- Use exclusive timers and NVTX ranges around route build, pack, each expert projection group, activation, scatter, and corresponding backward groups.
+- Explicitly time padding/empty-expert overhead for masked mode.
+- Use Nsight Systems to validate GPU idle gaps between route ops and expert GEMMs.
+- Use Nsight Compute only after the additive MoE report identifies which expert GEMM group needs kernel-level explanation.
+
+Acceptance:
+
+- Forward table sums to `100% +/- 2%`.
+- Backward table sums to `100% +/- 2%`.
+- Route-overhead table sums to `100% +/- 2%`.
+- Expert table sums to `100% +/- 2%`.
+- The report clearly states whether MoE time is going to routing, packing, expert base GEMMs, expert LoRA, scatter, padding, or backward dX.
+- No M5 integration work starts until M4.1-M4.3 all produce additive timing reports and identify the next bottleneck category.
 
 ### M5 - LLaMA-Factory Integration
 

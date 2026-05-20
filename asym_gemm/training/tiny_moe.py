@@ -132,7 +132,7 @@ def estimate_tiny_moe_parameters(
         "trainable_elements": trainable_elements,
         "pytorch_visible_parameter_elements": trainable_elements,
         "expected_hbm_saved_bytes": frozen_expert_base_elements * dtype_bytes,
-        "expected_pinned_cpu_bytes_after_dx": frozen_expert_base_elements * dtype_bytes * 2,
+        "expected_pinned_cpu_bytes_after_dx": frozen_expert_base_elements * dtype_bytes,
         "trainable_fraction": trainable_elements / float(total_model_elements),
     }
 

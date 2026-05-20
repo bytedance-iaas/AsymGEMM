@@ -45,8 +45,10 @@ sm90_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
     constexpr uint32_t kNumMathThreads = kNumNonEpilogueThreads;
     constexpr uint32_t kNumTMAThreads = kNumEpilogueThreads;
 
-    DG_STATIC_ASSERT(kMajorA == cute::UMMA::Major::K and kMajorB == cute::UMMA::Major::K,
-                     "SM90 BF16 asym GEMM currently supports K-major A/B only");
+    DG_STATIC_ASSERT(kMajorA == cute::UMMA::Major::K,
+                     "SM90 BF16 asym GEMM currently supports K-major A only");
+    DG_STATIC_ASSERT(kMajorB == cute::UMMA::Major::K or kMajorB == cute::UMMA::Major::MN,
+                     "SM90 BF16 asym GEMM currently supports K-major or MN-major B only");
     constexpr uint32_t BLOCK_ATOM_K = kSwizzleAMode / sizeof(cutlass::bfloat16_t);
     DG_STATIC_ASSERT(BLOCK_ATOM_K > 0 and BLOCK_K_ % BLOCK_ATOM_K == 0, "Invalid BF16 GMMA K atom");
     constexpr uint32_t kNumStagesPerMerge = BLOCK_K_ / BLOCK_ATOM_K;

@@ -124,7 +124,8 @@ static void sm100_m_grouped_bf16_asym_gemm_contiguous(const torch::Tensor& a,
                                                  const int& list_size,
                                                  const int& num_groups, const int& m, const int& n, const int& k,
                                                  const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                                 const std::string& compiled_dims) {
+                                                 const std::string& compiled_dims,
+                                                 const int b_outer_stride = -1) {
     const int block_m = 64;
     // SM100 legality requires block_n <= 128 when k <= 256.
     // const int block_n = (k <= 256) ? 128 : 256;
@@ -157,10 +158,13 @@ static void sm100_m_grouped_bf16_asym_gemm_contiguous(const torch::Tensor& a,
                                                config.block_k,
                                                static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
                                                config.smem_config.swizzle_a_mode);
+    const int outer_b = (b_outer_stride >= 0)
+        ? b_outer_stride
+        : static_cast<int>(b.stride(get_non_contiguous_dim(major_b)));
     const auto& tensor_map_b = make_tma_b_desc(major_b, b, n, k,
                                                SM100ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n),
                                                config.block_k,
-                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
+                                               outer_b, num_groups,
                                                config.smem_config.swizzle_b_mode);
     const auto& tensor_map_cd = make_tma_cd_desc(d, m, n,
                                                  SM100ArchSpec::get_cd_store_block_m(config.block_m),
