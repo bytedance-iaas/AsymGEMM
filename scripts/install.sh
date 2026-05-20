@@ -8,6 +8,8 @@
 #   CUDA_HOME=/usr/local/cuda
 #   TORCH_CUDA_ARCH_LIST=9.0a
 #   CUDA_VISIBLE_DEVICES=0
+#   DG_JIT_WITH_LINEINFO=1
+#   DG_JIT_CLEAR_CACHE=0
 #
 # Useful overrides:
 #   CUDA_VISIBLE_DEVICES=2 ./scripts/install.sh
@@ -21,6 +23,8 @@ cd "$SCRIPT_DIR"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0a}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export DG_JIT_WITH_LINEINFO="${DG_JIT_WITH_LINEINFO:-1}"
+export DG_JIT_CLEAR_CACHE="${DG_JIT_CLEAR_CACHE:-0}"
 
 CUTLASS_REF="${CUTLASS_REF:-v4.5.0}"
 
@@ -76,6 +80,10 @@ if torch.cuda.is_available():
 PY
 
   rm -rf build dist *.egg-info
+  if [[ "${DG_JIT_CLEAR_CACHE}" == "1" ]]; then
+    log "Clearing AsymGEMM JIT cache: ${HOME}/.asym_gemm/cache"
+    rm -rf "${HOME}/.asym_gemm/cache"
+  fi
   bash install.sh
 }
 

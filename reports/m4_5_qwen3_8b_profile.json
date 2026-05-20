@@ -1,0 +1,558 @@
+{
+  "backend": "asym_only",
+  "config": {
+    "batch_size": 1,
+    "full_model": {
+      "config": {
+        "batch_size": 1,
+        "hidden_size": 4096,
+        "intermediate_size": 12288,
+        "lora_alpha": 128.0,
+        "lora_rank": 64,
+        "num_heads": 32,
+        "num_layers": 36,
+        "seq_len": 64,
+        "vocab_size": 151936
+      },
+      "estimate": {
+        "config_name": "custom",
+        "cpu_resident_target_elements": 7851737088,
+        "embedding_and_lm_head_buffer_elements": 1244921856,
+        "expected_hbm_saved_bytes": 15703474176,
+        "expected_pinned_cpu_bytes_after_dx": 31406948352,
+        "gpu_resident_nontarget_elements": 0,
+        "layer_projection_base_elements": 7851737088,
+        "layernorm_parameter_elements": 598016,
+        "lora_trainable_fraction": 0.020325615657075812,
+        "pytorch_visible_parameter_elements": 189341696,
+        "target_mode": "all",
+        "total_model_elements": 9286000640,
+        "trainable_lora_elements": 188743680
+      }
+    },
+    "hf_model_id": "Qwen/Qwen3-8B",
+    "hf_model_type": "qwen3",
+    "hf_num_hidden_layers": 36,
+    "hidden_size": 4096,
+    "intermediate_size": 12288,
+    "lora_alpha": 128.0,
+    "lora_rank": 64,
+    "num_heads": 32,
+    "num_layers": 1,
+    "profiled_layers": 1,
+    "seq_len": 64,
+    "vocab_size": 4096,
+    "weight_source": "random_config_matched"
+  },
+  "deep_profile": {
+    "copy_accounting": {
+      "explicit_gpu_cpu_torch_copy_bytes_observed": 0,
+      "explicit_staged_weight_copy_bytes_observed": 0,
+      "notes": "Direct host fetch happens inside AsymGEMM kernels and is not counted as a Python tensor copy. Staged/Torch fallback copy bytes are zero for asym_only reports unless fallback calls are nonzero.",
+      "staged_calls": 0,
+      "torch_calls": 0
+    },
+    "enabled": true,
+    "host_weight_events": [
+      {
+        "clone_seconds": 0.0016682054847478867,
+        "cpu_copy_seconds": 4.13600355386734e-06,
+        "event": "host_weight_init",
+        "name": null,
+        "nbytes": 33554432,
+        "pin_error": null,
+        "pin_seconds": 0.015083917416632175,
+        "pinned": true,
+        "source_device": "cpu",
+        "source_nbytes": 33554432,
+        "total_seconds": 0.04452496115118265
+      },
+      {
+        "clone_seconds": 0.0017824387177824974,
+        "cpu_copy_seconds": 7.750466465950012e-06,
+        "event": "host_weight_init",
+        "name": null,
+        "nbytes": 33554432,
+        "pin_error": null,
+        "pin_seconds": 0.015545486472547054,
+        "pinned": true,
+        "source_device": "cpu",
+        "source_nbytes": 33554432,
+        "total_seconds": 0.04390439670532942
+      },
+      {
+        "clone_seconds": 0.0018083704635500908,
+        "cpu_copy_seconds": 7.254071533679962e-06,
+        "event": "host_weight_init",
+        "name": null,
+        "nbytes": 33554432,
+        "pin_error": null,
+        "pin_seconds": 0.014640096575021744,
+        "pinned": true,
+        "source_device": "cpu",
+        "source_nbytes": 33554432,
+        "total_seconds": 0.04305761121213436
+      },
+      {
+        "clone_seconds": 0.0016767196357250214,
+        "cpu_copy_seconds": 8.652918040752411e-06,
+        "event": "host_weight_init",
+        "name": null,
+        "nbytes": 33554432,
+        "pin_error": null,
+        "pin_seconds": 0.014377632178366184,
+        "pinned": true,
+        "source_device": "cpu",
+        "source_nbytes": 33554432,
+        "total_seconds": 0.04288901202380657
+      },
+      {
+        "clone_seconds": 0.004978296346962452,
+        "cpu_copy_seconds": 7.091090083122253e-06,
+        "event": "host_weight_init",
+        "name": null,
+        "nbytes": 100663296,
+        "pin_error": null,
+        "pin_seconds": 0.05714021623134613,
+        "pinned": true,
+        "source_device": "cpu",
+        "source_nbytes": 100663296,
+        "total_seconds": 0.07594092562794685
+      },
+      {
+        "clone_seconds": 0.004833163693547249,
+        "cpu_copy_seconds": 7.946975529193878e-06,
+        "event": "host_weight_init",
+        "name": null,
+        "nbytes": 100663296,
+        "pin_error": null,
+        "pin_seconds": 0.05528271198272705,
+        "pinned": true,
+        "source_device": "cpu",
+        "source_nbytes": 100663296,
+        "total_seconds": 0.07530855666846037
+      },
+      {
+        "clone_seconds": 0.004805585369467735,
+        "cpu_copy_seconds": 7.175840437412262e-06,
+        "event": "host_weight_init",
+        "name": null,
+        "nbytes": 100663296,
+        "pin_error": null,
+        "pin_seconds": 0.0554022965952754,
+        "pinned": true,
+        "source_device": "cpu",
+        "source_nbytes": 100663296,
+        "total_seconds": 0.07696696370840073
+      }
+    ],
+    "memory_timeline": [
+      {
+        "gpu": {
+          "allocated_bytes": 67108864,
+          "max_allocated_bytes": 67108864,
+          "max_reserved_bytes": 67108864,
+          "reserved_bytes": 67108864,
+          "reserved_minus_allocated_bytes": 0
+        },
+        "label": "before_setup",
+        "model": {},
+        "optimizer_state_bytes": 0,
+        "rss_bytes": 1660112896,
+        "timestamp_utc": "2026-05-19T09:49:10.386683+00:00"
+      },
+      {
+        "gpu": {
+          "allocated_bytes": 155762688,
+          "max_allocated_bytes": 158892032,
+          "max_reserved_bytes": 169869312,
+          "reserved_bytes": 169869312,
+          "reserved_minus_allocated_bytes": 14106624
+        },
+        "label": "after_setup",
+        "model": {
+          "cpu_parameter_and_buffer_bytes": 0,
+          "gpu_parameter_and_buffer_bytes": 88653824,
+          "host_weight_count": 7,
+          "pinned_cpu_bytes": 436207616,
+          "w_host_bytes": 436207616,
+          "w_t_host_bytes": 0
+        },
+        "optimizer_state_bytes": 0,
+        "rss_bytes": 2724827136,
+        "timestamp_utc": "2026-05-19T09:49:25.391387+00:00"
+      },
+      {
+        "gpu": {
+          "allocated_bytes": 155762688,
+          "max_allocated_bytes": 158892032,
+          "max_reserved_bytes": 169869312,
+          "reserved_bytes": 169869312,
+          "reserved_minus_allocated_bytes": 14106624
+        },
+        "label": "before_warmup",
+        "model": {
+          "cpu_parameter_and_buffer_bytes": 0,
+          "gpu_parameter_and_buffer_bytes": 88653824,
+          "host_weight_count": 7,
+          "pinned_cpu_bytes": 436207616,
+          "w_host_bytes": 436207616,
+          "w_t_host_bytes": 0
+        },
+        "optimizer_state_bytes": 0,
+        "rss_bytes": 2724827136,
+        "timestamp_utc": "2026-05-19T09:49:25.392204+00:00"
+      },
+      {
+        "gpu": {
+          "allocated_bytes": 218677248,
+          "max_allocated_bytes": 241222656,
+          "max_reserved_bytes": 257949696,
+          "reserved_bytes": 257949696,
+          "reserved_minus_allocated_bytes": 39272448
+        },
+        "label": "after_warmup",
+        "model": {
+          "cpu_parameter_and_buffer_bytes": 0,
+          "gpu_parameter_and_buffer_bytes": 88653824,
+          "host_weight_count": 7,
+          "pinned_cpu_bytes": 436207616,
+          "w_host_bytes": 436207616,
+          "w_t_host_bytes": 0
+        },
+        "optimizer_state_bytes": 41943096,
+        "rss_bytes": 2728169472,
+        "timestamp_utc": "2026-05-19T09:49:40.398259+00:00"
+      },
+      {
+        "gpu": {
+          "allocated_bytes": 218677248,
+          "max_allocated_bytes": 241222656,
+          "max_reserved_bytes": 257949696,
+          "reserved_bytes": 257949696,
+          "reserved_minus_allocated_bytes": 39272448
+        },
+        "label": "before_measured_steps",
+        "model": {
+          "cpu_parameter_and_buffer_bytes": 0,
+          "gpu_parameter_and_buffer_bytes": 88653824,
+          "host_weight_count": 7,
+          "pinned_cpu_bytes": 436207616,
+          "w_host_bytes": 436207616,
+          "w_t_host_bytes": 0
+        },
+        "optimizer_state_bytes": 41943096,
+        "rss_bytes": 2728169472,
+        "timestamp_utc": "2026-05-19T09:49:40.399025+00:00"
+      },
+      {
+        "gpu": {
+          "allocated_bytes": 218677248,
+          "max_allocated_bytes": 241222656,
+          "max_reserved_bytes": 257949696,
+          "reserved_bytes": 257949696,
+          "reserved_minus_allocated_bytes": 39272448
+        },
+        "label": "after_measured_steps",
+        "model": {
+          "cpu_parameter_and_buffer_bytes": 0,
+          "gpu_parameter_and_buffer_bytes": 88653824,
+          "host_weight_count": 7,
+          "pinned_cpu_bytes": 436207616,
+          "w_host_bytes": 436207616,
+          "w_t_host_bytes": 0
+        },
+        "optimizer_state_bytes": 41943096,
+        "rss_bytes": 2728685568,
+        "timestamp_utc": "2026-05-19T09:49:42.009182+00:00"
+      },
+      {
+        "gpu": {
+          "allocated_bytes": 218677248,
+          "max_allocated_bytes": 241222656,
+          "max_reserved_bytes": 257949696,
+          "reserved_bytes": 257949696,
+          "reserved_minus_allocated_bytes": 39272448
+        },
+        "label": "final_report",
+        "model": {
+          "cpu_parameter_and_buffer_bytes": 0,
+          "gpu_parameter_and_buffer_bytes": 88653824,
+          "host_weight_count": 7,
+          "pinned_cpu_bytes": 436207616,
+          "w_host_bytes": 436207616,
+          "w_t_host_bytes": 0
+        },
+        "optimizer_state_bytes": 0,
+        "rss_bytes": 2728697856,
+        "timestamp_utc": "2026-05-19T09:49:42.010984+00:00"
+      }
+    ],
+    "setup_breakdown": {
+      "host_weight_bytes": 436207616,
+      "host_weight_clone_seconds": 0.021552779711782932,
+      "host_weight_count": 7,
+      "host_weight_cpu_copy_seconds": 5.000736564397812e-05,
+      "host_weight_init_seconds": 0.40259242709726095,
+      "host_weight_pin_seconds": 0.22747235745191574,
+      "sections": {
+        "setup.config_matched_cpu_weight_tensors": {
+          "percent_of_profiled_setup": 9.844562257215925,
+          "seconds": 1.4770387830212712
+        },
+        "setup.hf_config": {
+          "percent_of_profiled_setup": 87.15169373172256,
+          "seconds": 13.075891876593232
+        },
+        "setup.model_and_host_weights": {
+          "percent_of_profiled_setup": 3.0020251649057346,
+          "seconds": 0.4504118598997593
+        },
+        "setup.optimizer": {
+          "percent_of_profiled_setup": 0.0017188461557761314,
+          "seconds": 0.0002578888088464737
+        }
+      },
+      "total_profiled_setup_seconds": 15.00360040832311
+    },
+    "transpose_materialization": {
+      "bytes": 0,
+      "count": 0,
+      "pin_seconds": 0.0,
+      "total_seconds": 0.0,
+      "transpose_seconds": 0.0
+    }
+  },
+  "device": "cuda:1",
+  "direct_fetch_dx_used": true,
+  "direct_fetch_forward_used": true,
+  "dtype": "torch.bfloat16",
+  "environment": {
+    "cuda": "12.9",
+    "cuda_device": "NVIDIA H200",
+    "platform": "Linux-6.1.0-31-amd64-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "pytorch": "2.9.1+cu129"
+  },
+  "execution_stats": {
+    "asym_calls": 840,
+    "asym_dx_calls": 420,
+    "asym_forward_calls": 420,
+    "fallback_reasons": {},
+    "staged_calls": 0,
+    "staged_dx_calls": 0,
+    "staged_forward_calls": 0,
+    "torch_calls": 0,
+    "torch_dx_calls": 0,
+    "torch_forward_calls": 0
+  },
+  "generated_at_utc": "2026-05-19T09:49:42.011023+00:00",
+  "latency": {
+    "breakdown_percent": {
+      "backward_pct": 0.09201197584352278,
+      "fallback_overhead_unattributed_pct": 1.0391097030078651e-14,
+      "forward_pct": 0.10771846736370409,
+      "loss_pct": 0.0005357457168648632,
+      "optimizer_pct": 0.002808070713601682,
+      "setup_host_preparation_pct": 99.7969257403623
+    },
+    "breakdown_seconds": {
+      "backward_seconds": 0.013833340629935265,
+      "fallback_overhead_unattributed_seconds": 1.5622269103343633e-15,
+      "forward_seconds": 0.016194698978215457,
+      "loss_seconds": 8.054552599787713e-05,
+      "optimizer_seconds": 0.00042217329144477844,
+      "setup_host_preparation_seconds": 15.00375201087445
+    },
+    "bubble_candidates": [
+      {
+        "name": "lora_path",
+        "percent_of_total_plus_setup": 0.10292200236921756,
+        "requires_nsight_to_confirm": false,
+        "seconds_per_step": 0.015473584868013859,
+        "why_it_can_create_gpu_bubbles": "Low-rank trainable path. Many small GEMMs can underfill the GPU relative to large base GEMMs."
+      },
+      {
+        "name": "base_forward_frozen_dispatch",
+        "percent_of_total_plus_setup": 0.0932663629783218,
+        "requires_nsight_to_confirm": true,
+        "seconds_per_step": 0.014021928738802671,
+        "why_it_can_create_gpu_bubbles": "CPU-resident base-weight fetch plus GEMM in forward. A high share means PCIe/NVLink fetch latency or small-M GEMM occupancy may be limiting GPU utilization."
+      },
+      {
+        "name": "base_dx_frozen_dispatch",
+        "percent_of_total_plus_setup": 0.07821285109959662,
+        "requires_nsight_to_confirm": true,
+        "seconds_per_step": 0.011758741196244956,
+        "why_it_can_create_gpu_bubbles": "CPU-resident original weight fetch for dX. This now uses transpose_b=True and should not include W.T host materialization."
+      },
+      {
+        "name": "optimizer",
+        "percent_of_total_plus_setup": 0.002808070713601682,
+        "requires_nsight_to_confirm": false,
+        "seconds_per_step": 0.00042217329144477844,
+        "why_it_can_create_gpu_bubbles": "Optimizer update. For LoRA-only SFT this is usually small, but Python optimizer overhead can still serialize steps."
+      }
+    ],
+    "component_percent_of_total": {
+      "attention_seconds": 0.03771022773771251,
+      "base_dx_seconds": 0.07821285109959662,
+      "base_forward_seconds": 0.0932663629783218,
+      "lora_grad_seconds_estimated": 0.013799124743926158,
+      "lora_seconds": 0.10292200236921756,
+      "mlp_seconds": 0.06816280073345957,
+      "moe_seconds": 0.0,
+      "route_metadata_seconds": 0.0,
+      "route_pack_seconds": 0.0,
+      "route_scatter_seconds": 0.0,
+      "router_seconds": 0.0
+    },
+    "component_seconds_per_step": {
+      "attention_seconds": 0.005669462271034717,
+      "base_dx_seconds": 0.011758741196244956,
+      "base_forward_seconds": 0.014021928738802671,
+      "lora_grad_seconds_estimated": 0.0020745994336903092,
+      "lora_seconds": 0.015473584868013859,
+      "mlp_seconds": 0.010247788205742837,
+      "moe_seconds": 0.0,
+      "route_metadata_seconds": 0.0,
+      "route_pack_seconds": 0.0,
+      "route_scatter_seconds": 0.0,
+      "router_seconds": 0.0
+    },
+    "measure_steps": 50,
+    "measured_steps": 50,
+    "notes": {
+      "base_dx_seconds_measured": true,
+      "component_timers_may_overlap_parent_forward": true,
+      "lora_grad_seconds_estimated": true,
+      "profiling_backend_imported": true
+    },
+    "setup_seconds": 15.00375201087445,
+    "steady_state_step_percent_of_total": 0.20307425963769343,
+    "steady_state_step_seconds": 0.03053075842559338,
+    "timing_stats": {
+      "coefficient_of_variation": 0.00968711318809049,
+      "count": 50,
+      "max_seconds": 0.03187972120940685,
+      "mean_seconds": 0.03074051521718502,
+      "measured_steps": 50,
+      "median_seconds": 0.030649354681372643,
+      "min_seconds": 0.030430283397436142,
+      "p90_seconds": 0.031100743822753428,
+      "p95_seconds": 0.031449104426428676,
+      "std_seconds": 0.0002977868503690894,
+      "values_seconds": [
+        0.03070950135588646,
+        0.03055364266037941,
+        0.030499955639243126,
+        0.030732731334865093,
+        0.030509420670568943,
+        0.030430283397436142,
+        0.030610202811658382,
+        0.0314566669985652,
+        0.030831283889710903,
+        0.0305319894105196,
+        0.030627707950770855,
+        0.030831316486001015,
+        0.03171074576675892,
+        0.03111507184803486,
+        0.03083134815096855,
+        0.03109915181994438,
+        0.030631384812295437,
+        0.030610484071075916,
+        0.030848979949951172,
+        0.030661994591355324,
+        0.0306482445448637,
+        0.030695986934006214,
+        0.030677786096930504,
+        0.03081567771732807,
+        0.030624697916209698,
+        0.030626977793872356,
+        0.030608652159571648,
+        0.030652008950710297,
+        0.030491582117974758,
+        0.030554999597370625,
+        0.03079662285745144,
+        0.030500009655952454,
+        0.03072040993720293,
+        0.030551727861166,
+        0.03079293668270111,
+        0.0307530565187335,
+        0.030523459427058697,
+        0.03068769257515669,
+        0.030465565621852875,
+        0.03060270380228758,
+        0.030660456977784634,
+        0.030546724796295166,
+        0.030779823660850525,
+        0.03187972120940685,
+        0.03063767682760954,
+        0.030650464817881584,
+        0.0305946571752429,
+        0.03063368983566761,
+        0.03057802189141512,
+        0.03143986128270626
+      ],
+      "warmup_steps": 10
+    },
+    "total_percent": 100.0,
+    "total_seconds": 15.034282769300045,
+    "total_seconds_per_step_plus_setup": 15.034282769300045
+  },
+  "measure_steps": 50,
+  "measured_steps": 50,
+  "memory": {
+    "cpu_memory": {
+      "estimated": true,
+      "pinned_bytes": 436207616,
+      "pinned_percent_of_cpu_total": 100.0,
+      "rss_bytes": 2728689664,
+      "rss_percent_of_total": 73.95306498523567,
+      "total_bytes": 436207616,
+      "total_percent": 11.822117626162829,
+      "unattributed_cpu_bytes": 2292482048,
+      "unattributed_cpu_percent": 84.01402615493618,
+      "w_host_bytes": 436207616,
+      "w_t_host_bytes": 0
+    },
+    "gpu_memory": {
+      "current_hbm_bytes": 218677248,
+      "estimated": true,
+      "expected_hbm_saved_bytes": 436207616,
+      "peak_hbm_bytes": 241222656,
+      "peak_hbm_percent_of_total": 45.9593023255814,
+      "resident_parameter_and_buffer_bytes": 88653824,
+      "staged_buffer_bytes": 0,
+      "total_bytes": 524861440,
+      "total_percent": 14.224817388601496,
+      "unattributed_gpu_bytes": 152568832,
+      "unattributed_gpu_percent": 63.248135365858836
+    },
+    "percentages": {
+      "hbm_resident_of_gpu_basis_pct": 16.890900577493365,
+      "hbm_saved_of_gpu_basis_pct": 83.10909942250663,
+      "pinned_cpu_of_cpu_total_pct": 100.0,
+      "w_host_of_pinned_cpu_pct": 100.0,
+      "w_t_host_of_pinned_cpu_pct": 0.0
+    },
+    "total_bytes": 3689758720,
+    "total_percent": 100.0,
+    "totals": {
+      "cpu_parameter_and_buffer_bytes": 0,
+      "expected_hbm_saved_bytes": 436207616,
+      "gpu_parameter_and_buffer_bytes": 88653824,
+      "hbm_current_bytes": 218677248,
+      "hbm_peak_bytes": 241222656,
+      "host_weight_count": 7,
+      "pinned_cpu_bytes": 436207616,
+      "pinned_cpu_cost_bytes": 436207616,
+      "rss_bytes": 2728689664,
+      "w_host_bytes": 436207616,
+      "w_t_host_bytes": 0
+    }
+  },
+  "milestone": "M4.5 Profiling",
+  "warmup_steps": 10,
+  "workload": "qwen3_8b"
+}

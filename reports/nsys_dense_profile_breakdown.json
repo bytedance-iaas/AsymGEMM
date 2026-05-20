@@ -1,0 +1,3647 @@
+{
+  "source": "reports/nsys_dense_profile.sqlite",
+  "stages": [
+    {
+      "host_api_breakdown": {
+        "rows": [
+          {
+            "milliseconds": 3.651141,
+            "name": "cuda_runtime_api_sum_overlaps_gpu_timeline",
+            "percent": 16.540428641950967
+          },
+          {
+            "milliseconds": 0.32839,
+            "name": "cuda_synchronization_api_sum_overlaps_gpu_timeline",
+            "percent": 1.4876750478084189
+          }
+        ],
+        "total_milliseconds": 22.074041
+      },
+      "operation_cuda_api_time": {
+        "rows": [
+          {
+            "milliseconds": 0.055532,
+            "name": "forward.layers.0.mlp.layernorm",
+            "percent": 0.2515715178747742
+          },
+          {
+            "milliseconds": 0.054104,
+            "name": "forward.layers.0.attention.layernorm",
+            "percent": 0.24510238066514417
+          },
+          {
+            "milliseconds": 0.049873,
+            "name": "forward.layers.2.attention.layernorm",
+            "percent": 0.22593507006714358
+          },
+          {
+            "milliseconds": 0.049592,
+            "name": "forward.layers.3.attention.layernorm",
+            "percent": 0.22466208158261552
+          },
+          {
+            "milliseconds": 0.049338,
+            "name": "forward.layers.1.attention.layernorm",
+            "percent": 0.22351140871759725
+          },
+          {
+            "milliseconds": 0.049186,
+            "name": "forward.final_norm",
+            "percent": 0.22282281708183832
+          },
+          {
+            "milliseconds": 0.049109,
+            "name": "forward.layers.3.mlp.layernorm",
+            "percent": 0.22247399105582885
+          },
+          {
+            "milliseconds": 0.049085,
+            "name": "forward.layers.2.mlp.layernorm",
+            "percent": 0.22236526606070903
+          },
+          {
+            "milliseconds": 0.048734,
+            "name": "forward.layers.1.mlp.layernorm",
+            "percent": 0.22077516300708147
+          },
+          {
+            "milliseconds": 0.041981,
+            "name": "forward.layers.0.mlp.gate_proj.base_frozen_asymgemm",
+            "percent": 0.19018266750523838
+          },
+          {
+            "milliseconds": 0.041577,
+            "name": "forward.layers.1.attention.o_proj.base_frozen_asymgemm",
+            "percent": 0.1883524634207212
+          },
+          {
+            "milliseconds": 0.041011,
+            "name": "forward.layers.2.mlp.gate_proj.base_frozen_asymgemm",
+            "percent": 0.1857883656191451
+          },
+          {
+            "milliseconds": 0.040799,
+            "name": "forward.layers.3.attention.o_proj.base_frozen_asymgemm",
+            "percent": 0.1848279614955866
+          },
+          {
+            "milliseconds": 0.040419,
+            "name": "forward.layers.1.attention.k_proj.base_frozen_asymgemm",
+            "percent": 0.18310648240618924
+          },
+          {
+            "milliseconds": 0.040118,
+            "name": "forward.layers.2.attention.q_proj.base_frozen_asymgemm",
+            "percent": 0.18174288975906133
+          },
+          {
+            "milliseconds": 0.039994,
+            "name": "forward.layers.0.attention.o_proj.base_frozen_asymgemm",
+            "percent": 0.18118114395094218
+          },
+          {
+            "milliseconds": 0.03994,
+            "name": "forward.layers.1.attention.q_proj.base_frozen_asymgemm",
+            "percent": 0.18093651271192257
+          },
+          {
+            "milliseconds": 0.039727,
+            "name": "forward.layers.0.attention.k_proj.base_frozen_asymgemm",
+            "percent": 0.17997157838023403
+          },
+          {
+            "milliseconds": 0.039608,
+            "name": "forward.layers.3.attention.q_proj.base_frozen_asymgemm",
+            "percent": 0.17943248361276487
+          },
+          {
+            "milliseconds": 0.039534,
+            "name": "forward.layers.0.attention.q_proj.base_frozen_asymgemm",
+            "percent": 0.17909724821114537
+          },
+          {
+            "milliseconds": 0.039496,
+            "name": "forward.layers.1.mlp.gate_proj.base_frozen_asymgemm",
+            "percent": 0.17892510030220565
+          },
+          {
+            "milliseconds": 0.039142,
+            "name": "forward.layers.3.mlp.gate_proj.base_frozen_asymgemm",
+            "percent": 0.1773214066241881
+          },
+          {
+            "milliseconds": 0.038779,
+            "name": "forward.layers.2.mlp.up_proj.base_frozen_asymgemm",
+            "percent": 0.1756769410730006
+          },
+          {
+            "milliseconds": 0.038667,
+            "name": "forward.layers.0.attention.v_proj.base_frozen_asymgemm",
+            "percent": 0.1751695577624414
+          },
+          {
+            "milliseconds": 0.038529,
+            "name": "forward.layers.1.attention.v_proj.base_frozen_asymgemm",
+            "percent": 0.17454438904050237
+          },
+          {
+            "milliseconds": 0.038363,
+            "name": "forward.layers.2.attention.o_proj.base_frozen_asymgemm",
+            "percent": 0.17379237449092352
+          },
+          {
+            "milliseconds": 0.037726,
+            "name": "forward.layers.3.mlp.down_proj.base_frozen_asymgemm",
+            "percent": 0.17090663191211794
+          },
+          {
+            "milliseconds": 0.037502,
+            "name": "forward.layers.2.attention.v_proj.base_frozen_asymgemm",
+            "percent": 0.1698918652909995
+          },
+          {
+            "milliseconds": 0.037411,
+            "name": "forward.layers.0.mlp.up_proj.base_frozen_asymgemm",
+            "percent": 0.16947961635117012
+          },
+          {
+            "milliseconds": 0.037211,
+            "name": "forward.layers.1.mlp.down_proj.base_frozen_asymgemm",
+            "percent": 0.16857357472517154
+          },
+          {
+            "milliseconds": 0.036884,
+            "name": "forward.layers.3.attention.k_proj.base_frozen_asymgemm",
+            "percent": 0.1670921966666638
+          },
+          {
+            "milliseconds": 0.036434,
+            "name": "forward.layers.2.attention.k_proj.base_frozen_asymgemm",
+            "percent": 0.16505360300816693
+          },
+          {
+            "milliseconds": 0.036113,
+            "name": "forward.layers.2.mlp.down_proj.base_frozen_asymgemm",
+            "percent": 0.16359940619843913
+          },
+          {
+            "milliseconds": 0.036088,
+            "name": "forward.layers.1.mlp.up_proj.base_frozen_asymgemm",
+            "percent": 0.16348615099518932
+          },
+          {
+            "milliseconds": 0.03605,
+            "name": "forward.layers.3.mlp.up_proj.base_frozen_asymgemm",
+            "percent": 0.16331400308624958
+          },
+          {
+            "milliseconds": 0.035675,
+            "name": "forward.layers.0.mlp.down_proj.base_frozen_asymgemm",
+            "percent": 0.1616151750375022
+          },
+          {
+            "milliseconds": 0.035662,
+            "name": "forward.layers.2.mlp.gate_proj.add_cast_scale",
+            "percent": 0.16155628233181227
+          },
+          {
+            "milliseconds": 0.035511,
+            "name": "forward.layers.3.attention.v_proj.base_frozen_asymgemm",
+            "percent": 0.16087222090418332
+          },
+          {
+            "milliseconds": 0.031297,
+            "name": "forward.layers.1.attention.q_proj.add_cast_scale",
+            "percent": 0.1417819238443926
+          },
+          {
+            "milliseconds": 0.029749,
+            "name": "forward.layers.0.mlp.down_proj.add_cast_scale",
+            "percent": 0.13476916165916336
+          },
+          {
+            "milliseconds": 0.028451,
+            "name": "forward.layers.2.attention.v_proj.add_cast_scale",
+            "percent": 0.12888895150643237
+          },
+          {
+            "milliseconds": 0.028444,
+            "name": "forward.layers.1.mlp.down_proj.add_cast_scale",
+            "percent": 0.12885724004952243
+          },
+          {
+            "milliseconds": 0.028285,
+            "name": "forward.layers.0.attention.k_proj.add_cast_scale",
+            "percent": 0.12813693695685352
+          },
+          {
+            "milliseconds": 0.028222,
+            "name": "forward.layers.0.attention.q_proj.add_cast_scale",
+            "percent": 0.12785153384466397
+          },
+          {
+            "milliseconds": 0.028151,
+            "name": "forward.layers.0.attention.o_proj.add_cast_scale",
+            "percent": 0.12752988906743443
+          },
+          {
+            "milliseconds": 0.028144,
+            "name": "forward.layers.3.attention.q_proj.add_cast_scale",
+            "percent": 0.1274981776105245
+          },
+          {
+            "milliseconds": 0.028136,
+            "name": "forward.layers.2.attention.k_proj.add_cast_scale",
+            "percent": 0.12746193594548455
+          },
+          {
+            "milliseconds": 0.02809,
+            "name": "forward.layers.1.attention.o_proj.add_cast_scale",
+            "percent": 0.12725354637150488
+          },
+          {
+            "milliseconds": 0.02804,
+            "name": "forward.layers.2.attention.o_proj.add_cast_scale",
+            "percent": 0.12702703596500522
+          },
+          {
+            "milliseconds": 0.028024,
+            "name": "forward.layers.1.attention.v_proj.add_cast_scale",
+            "percent": 0.12695455263492533
+          },
+          {
+            "milliseconds": 0.02794,
+            "name": "forward.layers.1.attention.k_proj.add_cast_scale",
+            "percent": 0.12657401515200592
+          },
+          {
+            "milliseconds": 0.027895,
+            "name": "forward.layers.1.mlp.gate_proj.add_cast_scale",
+            "percent": 0.12637015578615624
+          },
+          {
+            "milliseconds": 0.027882,
+            "name": "forward.layers.0.mlp.gate_proj.add_cast_scale",
+            "percent": 0.12631126308046633
+          },
+          {
+            "milliseconds": 0.027757,
+            "name": "forward.layers.1.mlp.up_proj.add_cast_scale",
+            "percent": 0.1257449870642172
+          },
+          {
+            "milliseconds": 0.027689,
+            "name": "forward.layers.3.mlp.down_proj.add_cast_scale",
+            "percent": 0.12543693291137767
+          },
+          {
+            "milliseconds": 0.027639,
+            "name": "forward.layers.2.attention.q_proj.add_cast_scale",
+            "percent": 0.12521042250487802
+          },
+          {
+            "milliseconds": 0.027591,
+            "name": "forward.layers.3.attention.o_proj.add_cast_scale",
+            "percent": 0.12499297251463835
+          },
+          {
+            "milliseconds": 0.027584,
+            "name": "forward.layers.3.attention.v_proj.add_cast_scale",
+            "percent": 0.1249612610577284
+          },
+          {
+            "milliseconds": 0.027486,
+            "name": "forward.layers.3.attention.k_proj.add_cast_scale",
+            "percent": 0.12451730066098908
+          },
+          {
+            "milliseconds": 0.027431,
+            "name": "forward.layers.2.mlp.up_proj.add_cast_scale",
+            "percent": 0.12426813921383946
+          },
+          {
+            "milliseconds": 0.027359,
+            "name": "forward.layers.0.attention.v_proj.add_cast_scale",
+            "percent": 0.12394196422847996
+          },
+          {
+            "milliseconds": 0.027141,
+            "name": "forward.layers.3.mlp.up_proj.add_cast_scale",
+            "percent": 0.12295437885614145
+          },
+          {
+            "milliseconds": 0.026928,
+            "name": "forward.layers.0.mlp.up_proj.add_cast_scale",
+            "percent": 0.12198944452445296
+          },
+          {
+            "milliseconds": 0.026911,
+            "name": "forward.layers.3.mlp.gate_proj.add_cast_scale",
+            "percent": 0.12191243098624306
+          },
+          {
+            "milliseconds": 0.026869,
+            "name": "forward.layers.0.attention.causal_mask",
+            "percent": 0.12172216224478336
+          },
+          {
+            "milliseconds": 0.026796,
+            "name": "forward.layers.2.attention.causal_mask",
+            "percent": 0.12139145705129388
+          },
+          {
+            "milliseconds": 0.026734,
+            "name": "forward.layers.1.attention.causal_mask",
+            "percent": 0.1211105841472343
+          },
+          {
+            "milliseconds": 0.026586,
+            "name": "forward.layers.2.mlp.down_proj.add_cast_scale",
+            "percent": 0.12044011334399532
+          },
+          {
+            "milliseconds": 0.026004,
+            "name": "forward.layers.3.attention.causal_mask",
+            "percent": 0.11780353221233937
+          },
+          {
+            "milliseconds": 0.024931,
+            "name": "forward.layers.2.attention.scores_matmul",
+            "percent": 0.1129426188888568
+          },
+          {
+            "milliseconds": 0.024908,
+            "name": "forward.layers.1.attention.scores_matmul",
+            "percent": 0.11283842410186698
+          },
+          {
+            "milliseconds": 0.024885,
+            "name": "forward.layers.0.attention.scores_matmul",
+            "percent": 0.11273422931487714
+          },
+          {
+            "milliseconds": 0.024339,
+            "name": "forward.layers.3.attention.scores_matmul",
+            "percent": 0.11026073567590093
+          },
+          {
+            "milliseconds": 0.022539,
+            "name": "forward.layers.1.attention.k_proj.lora_A",
+            "percent": 0.10210636104191342
+          },
+          {
+            "milliseconds": 0.020772,
+            "name": "forward.layers.0.attention.q_proj.lora_A",
+            "percent": 0.0941014832762157
+          },
+          {
+            "milliseconds": 0.020189,
+            "name": "forward.layers.0.mlp.gate_proj.lora_A",
+            "percent": 0.09146037193642975
+          },
+          {
+            "milliseconds": 0.019691,
+            "name": "forward.layers.1.attention.q_proj.lora_A",
+            "percent": 0.08920432828769322
+          },
+          {
+            "milliseconds": 0.019598,
+            "name": "forward.layers.2.mlp.silu_mul_activation",
+            "percent": 0.08878301893160387
+          },
+          {
+            "milliseconds": 0.019525,
+            "name": "forward.layers.0.mlp.silu_mul_activation",
+            "percent": 0.08845231373811438
+          },
+          {
+            "milliseconds": 0.019158,
+            "name": "forward.layers.2.mlp.gate_proj.lora_A",
+            "percent": 0.08678972735440693
+          },
+          {
+            "milliseconds": 0.019103,
+            "name": "forward.layers.1.attention.residual_add",
+            "percent": 0.0865405659072573
+          },
+          {
+            "milliseconds": 0.018871,
+            "name": "forward.layers.2.attention.residual_add",
+            "percent": 0.0854895576210989
+          },
+          {
+            "milliseconds": 0.018866,
+            "name": "forward.layers.3.mlp.silu_mul_activation",
+            "percent": 0.08546690658044895
+          },
+          {
+            "milliseconds": 0.018681,
+            "name": "forward.layers.1.mlp.silu_mul_activation",
+            "percent": 0.08462881807640023
+          },
+          {
+            "milliseconds": 0.018646,
+            "name": "forward.layers.2.attention.q_proj.lora_A",
+            "percent": 0.08447026079185048
+          },
+          {
+            "milliseconds": 0.01861,
+            "name": "forward.layers.3.attention.o_proj.lora_A",
+            "percent": 0.08430717329917074
+          },
+          {
+            "milliseconds": 0.01854,
+            "name": "forward.layers.3.attention.q_proj.lora_A",
+            "percent": 0.08399005873007122
+          },
+          {
+            "milliseconds": 0.018514,
+            "name": "forward.layers.3.mlp.residual_add",
+            "percent": 0.08387227331869139
+          },
+          {
+            "milliseconds": 0.018503,
+            "name": "forward.layers.3.attention.residual_add",
+            "percent": 0.08382244102926147
+          },
+          {
+            "milliseconds": 0.018366,
+            "name": "forward.layers.0.mlp.residual_add",
+            "percent": 0.08320180251545242
+          },
+          {
+            "milliseconds": 0.018312,
+            "name": "forward.layers.0.attention.k_proj.lora_A",
+            "percent": 0.08295717127643279
+          },
+          {
+            "milliseconds": 0.018301,
+            "name": "forward.layers.3.mlp.up_proj.lora_A",
+            "percent": 0.08290733898700288
+          },
+          {
+            "milliseconds": 0.018276,
+            "name": "forward.layers.3.mlp.gate_proj.lora_A",
+            "percent": 0.08279408378375305
+          },
+          {
+            "milliseconds": 0.018257,
+            "name": "forward.layers.0.attention.residual_add",
+            "percent": 0.08270800982928317
+          },
+          {
+            "milliseconds": 0.018209,
+            "name": "forward.layers.1.mlp.residual_add",
+            "percent": 0.0824905598390435
+          },
+          {
+            "milliseconds": 0.018106,
+            "name": "forward.layers.2.mlp.residual_add",
+            "percent": 0.08202394840165422
+          },
+          {
+            "milliseconds": 0.018069,
+            "name": "forward.layers.1.mlp.down_proj.lora_A",
+            "percent": 0.0818563307008445
+          },
+          {
+            "milliseconds": 0.017697,
+            "name": "forward.layers.3.mlp.down_proj.lora_A",
+            "percent": 0.08017109327648707
+          },
+          {
+            "milliseconds": 0.017625,
+            "name": "forward.layers.0.attention.o_proj.lora_A",
+            "percent": 0.07984491829112755
+          },
+          {
+            "milliseconds": 0.01758,
+            "name": "forward.layers.2.attention.v_proj.lora_A",
+            "percent": 0.07964105892527787
+          },
+          {
+            "milliseconds": 0.017569,
+            "name": "forward.layers.1.mlp.gate_proj.lora_A",
+            "percent": 0.07959122663584796
+          },
+          {
+            "milliseconds": 0.017389,
+            "name": "forward.layers.3.attention.v_proj.lora_A",
+            "percent": 0.07877578917244922
+          },
+          {
+            "milliseconds": 0.017279,
+            "name": "forward.layers.0.attention.v_proj.lora_A",
+            "percent": 0.07827746627814998
+          },
+          {
+            "milliseconds": 0.017206,
+            "name": "forward.layers.1.attention.o_proj.lora_A",
+            "percent": 0.07794676108466048
+          },
+          {
+            "milliseconds": 0.017113,
+            "name": "forward.layers.2.attention.o_proj.lora_A",
+            "percent": 0.07752545172857113
+          },
+          {
+            "milliseconds": 0.016999,
+            "name": "forward.layers.1.mlp.up_proj.lora_A",
+            "percent": 0.07700900800175192
+          },
+          {
+            "milliseconds": 0.016957,
+            "name": "forward.layers.2.mlp.up_proj.lora_A",
+            "percent": 0.07681873926029222
+          },
+          {
+            "milliseconds": 0.016894,
+            "name": "forward.layers.3.attention.k_proj.lora_A",
+            "percent": 0.07653333614810265
+          },
+          {
+            "milliseconds": 0.016886,
+            "name": "forward.layers.1.attention.v_proj.lora_A",
+            "percent": 0.0764970944830627
+          },
+          {
+            "milliseconds": 0.016842,
+            "name": "forward.layers.2.attention.value_matmul",
+            "percent": 0.076297765325343
+          },
+          {
+            "milliseconds": 0.016814,
+            "name": "forward.layers.3.attention.value_matmul",
+            "percent": 0.0761709194977032
+          },
+          {
+            "milliseconds": 0.016796,
+            "name": "forward.layers.2.attention.k_proj.lora_A",
+            "percent": 0.07608937575136332
+          },
+          {
+            "milliseconds": 0.01668,
+            "name": "forward.layers.1.attention.value_matmul",
+            "percent": 0.07556387160828414
+          },
+          {
+            "milliseconds": 0.016571,
+            "name": "forward.layers.0.mlp.down_proj.lora_A",
+            "percent": 0.07507007892211488
+          },
+          {
+            "milliseconds": 0.01644,
+            "name": "forward.layers.0.attention.value_matmul",
+            "percent": 0.0744766216570858
+          },
+          {
+            "milliseconds": 0.0163,
+            "name": "forward.layers.0.mlp.up_proj.lora_A",
+            "percent": 0.07384239251888677
+          },
+          {
+            "milliseconds": 0.016196,
+            "name": "forward.layers.2.mlp.down_proj.lora_A",
+            "percent": 0.07337125087336749
+          },
+          {
+            "milliseconds": 0.009851,
+            "name": "forward.embeddings",
+            "percent": 0.04462708028856158
+          },
+          {
+            "milliseconds": 0.009721,
+            "name": "forward.layers.0.attention.q_proj.lora_B",
+            "percent": 0.04403815323166248
+          },
+          {
+            "milliseconds": 0.009652,
+            "name": "forward.layers.1.attention.q_proj.lora_B",
+            "percent": 0.043725568870692955
+          },
+          {
+            "milliseconds": 0.009413,
+            "name": "forward.layers.1.mlp.down_proj.lora_B",
+            "percent": 0.04264284912762461
+          },
+          {
+            "milliseconds": 0.009354,
+            "name": "forward.layers.0.attention.v_proj.lora_B",
+            "percent": 0.04237556684795502
+          },
+          {
+            "milliseconds": 0.009161,
+            "name": "forward.lm_head",
+            "percent": 0.04150123667886636
+          },
+          {
+            "milliseconds": 0.009144,
+            "name": "forward.layers.2.mlp.gate_proj.lora_B",
+            "percent": 0.041424223140656476
+          },
+          {
+            "milliseconds": 0.009041,
+            "name": "forward.layers.1.mlp.gate_proj.lora_B",
+            "percent": 0.0409576117032672
+          },
+          {
+            "milliseconds": 0.00894,
+            "name": "forward.layers.0.attention.k_proj.lora_B",
+            "percent": 0.0405000606821379
+          },
+          {
+            "milliseconds": 0.008922,
+            "name": "forward.layers.1.attention.k_proj.lora_B",
+            "percent": 0.04041851693579802
+          },
+          {
+            "milliseconds": 0.008908,
+            "name": "forward.layers.0.mlp.gate_proj.lora_B",
+            "percent": 0.040355094021978115
+          },
+          {
+            "milliseconds": 0.008906,
+            "name": "forward.layers.3.attention.q_proj.lora_B",
+            "percent": 0.04034603360571814
+          },
+          {
+            "milliseconds": 0.008788,
+            "name": "forward.layers.1.mlp.up_proj.lora_B",
+            "percent": 0.03981146904637896
+          },
+          {
+            "milliseconds": 0.008736,
+            "name": "forward.layers.2.attention.v_proj.lora_B",
+            "percent": 0.039575898223619316
+          },
+          {
+            "milliseconds": 0.008683,
+            "name": "forward.layers.3.mlp.down_proj.lora_B",
+            "percent": 0.039335797192729685
+          },
+          {
+            "milliseconds": 0.008676,
+            "name": "forward.layers.1.attention.o_proj.lora_B",
+            "percent": 0.03930408573581973
+          },
+          {
+            "milliseconds": 0.008639,
+            "name": "forward.layers.0.attention.o_proj.lora_B",
+            "percent": 0.039136468035009996
+          },
+          {
+            "milliseconds": 0.008636,
+            "name": "forward.layers.3.attention.o_proj.lora_B",
+            "percent": 0.03912287741062001
+          },
+          {
+            "milliseconds": 0.008612,
+            "name": "forward.layers.1.attention.v_proj.lora_B",
+            "percent": 0.03901415241550018
+          },
+          {
+            "milliseconds": 0.008594,
+            "name": "forward.layers.2.attention.q_proj.lora_B",
+            "percent": 0.0389326086691603
+          },
+          {
+            "milliseconds": 0.008537,
+            "name": "forward.layers.2.attention.k_proj.lora_B",
+            "percent": 0.03867438680575069
+          },
+          {
+            "milliseconds": 0.008526,
+            "name": "forward.layers.3.attention.v_proj.lora_B",
+            "percent": 0.038624554516320776
+          },
+          {
+            "milliseconds": 0.00849,
+            "name": "forward.layers.0.mlp.up_proj.lora_B",
+            "percent": 0.038461467023641026
+          },
+          {
+            "milliseconds": 0.008465,
+            "name": "forward.layers.0.mlp.down_proj.lora_B",
+            "percent": 0.0383482118203912
+          },
+          {
+            "milliseconds": 0.008414,
+            "name": "forward.layers.2.mlp.down_proj.lora_B",
+            "percent": 0.03811717120576155
+          },
+          {
+            "milliseconds": 0.008391,
+            "name": "forward.layers.3.mlp.up_proj.lora_B",
+            "percent": 0.03801297641877171
+          },
+          {
+            "milliseconds": 0.008362,
+            "name": "forward.layers.3.attention.k_proj.lora_B",
+            "percent": 0.03788160038300191
+          },
+          {
+            "milliseconds": 0.008358,
+            "name": "forward.layers.3.mlp.gate_proj.lora_B",
+            "percent": 0.03786347955048194
+          },
+          {
+            "milliseconds": 0.008275,
+            "name": "forward.layers.2.attention.o_proj.lora_B",
+            "percent": 0.03748747227569251
+          },
+          {
+            "milliseconds": 0.008269,
+            "name": "forward.layers.2.mlp.up_proj.lora_B",
+            "percent": 0.03746029102691256
+          },
+          {
+            "milliseconds": 0.004866,
+            "name": "forward.layers.2.attention.softmax",
+            "percent": 0.022043992760546197
+          },
+          {
+            "milliseconds": 0.004635,
+            "name": "forward.layers.1.attention.softmax",
+            "percent": 0.020997514682517805
+          },
+          {
+            "milliseconds": 0.004411,
+            "name": "forward.layers.0.attention.softmax",
+            "percent": 0.01998274806139936
+          },
+          {
+            "milliseconds": 0.004312,
+            "name": "forward.layers.3.attention.softmax",
+            "percent": 0.019534257456530046
+          }
+        ],
+        "total_milliseconds": 22.074041
+      },
+      "operation_kernel_time": {
+        "rows": [
+          {
+            "milliseconds": 0.06896,
+            "name": "forward.layers.2.mlp.gate_proj.base_frozen_asymgemm",
+            "percent": 0.31240315264432095
+          },
+          {
+            "milliseconds": 0.061376,
+            "name": "forward.layers.3.mlp.up_proj.base_frozen_asymgemm",
+            "percent": 0.2780460541864537
+          },
+          {
+            "milliseconds": 0.060768,
+            "name": "forward.layers.0.mlp.gate_proj.base_frozen_asymgemm",
+            "percent": 0.2752916876434179
+          },
+          {
+            "milliseconds": 0.055392,
+            "name": "forward.layers.0.mlp.up_proj.base_frozen_asymgemm",
+            "percent": 0.25093728873657517
+          },
+          {
+            "milliseconds": 0.054336,
+            "name": "forward.layers.1.mlp.gate_proj.base_frozen_asymgemm",
+            "percent": 0.24615338895130257
+          },
+          {
+            "milliseconds": 0.054336,
+            "name": "forward.layers.2.mlp.up_proj.base_frozen_asymgemm",
+            "percent": 0.24615338895130257
+          },
+          {
+            "milliseconds": 0.0536,
+            "name": "forward.layers.0.attention.q_proj.lora_A",
+            "percent": 0.2428191557676277
+          },
+          {
+            "milliseconds": 0.053056,
+            "name": "forward.layers.2.mlp.gate_proj.lora_A",
+            "percent": 0.24035472254491144
+          },
+          {
+            "milliseconds": 0.053024,
+            "name": "forward.layers.1.mlp.gate_proj.lora_A",
+            "percent": 0.24020975588475169
+          },
+          {
+            "milliseconds": 0.052992,
+            "name": "forward.layers.1.attention.q_proj.lora_A",
+            "percent": 0.2400647892245919
+          },
+          {
+            "milliseconds": 0.052992,
+            "name": "forward.layers.1.attention.o_proj.lora_A",
+            "percent": 0.2400647892245919
+          },
+          {
+            "milliseconds": 0.052992,
+            "name": "forward.layers.3.attention.q_proj.lora_A",
+            "percent": 0.2400647892245919
+          },
+          {
+            "milliseconds": 0.05296,
+            "name": "forward.layers.3.mlp.gate_proj.lora_A",
+            "percent": 0.23991982256443212
+          },
+          {
+            "milliseconds": 0.052896,
+            "name": "forward.layers.0.attention.o_proj.lora_A",
+            "percent": 0.23962988924411258
+          },
+          {
+            "milliseconds": 0.052896,
+            "name": "forward.layers.0.mlp.gate_proj.lora_A",
+            "percent": 0.23962988924411258
+          },
+          {
+            "milliseconds": 0.052896,
+            "name": "forward.layers.2.attention.q_proj.lora_A",
+            "percent": 0.23962988924411258
+          },
+          {
+            "milliseconds": 0.052864,
+            "name": "forward.layers.3.mlp.down_proj.lora_A",
+            "percent": 0.2394849225839528
+          },
+          {
+            "milliseconds": 0.052832,
+            "name": "forward.layers.3.attention.o_proj.lora_A",
+            "percent": 0.239339955923793
+          },
+          {
+            "milliseconds": 0.0528,
+            "name": "forward.layers.2.attention.o_proj.lora_A",
+            "percent": 0.23919498926363325
+          },
+          {
+            "milliseconds": 0.052672,
+            "name": "forward.layers.0.mlp.down_proj.lora_A",
+            "percent": 0.2386151226229941
+          },
+          {
+            "milliseconds": 0.052608,
+            "name": "forward.layers.1.mlp.down_proj.lora_A",
+            "percent": 0.2383251893026746
+          },
+          {
+            "milliseconds": 0.052608,
+            "name": "forward.layers.2.mlp.down_proj.lora_A",
+            "percent": 0.2383251893026746
+          },
+          {
+            "milliseconds": 0.052352,
+            "name": "forward.layers.2.attention.v_proj.lora_A",
+            "percent": 0.23716545602139633
+          },
+          {
+            "milliseconds": 0.05232,
+            "name": "forward.layers.0.attention.k_proj.lora_A",
+            "percent": 0.23702048936123657
+          },
+          {
+            "milliseconds": 0.05232,
+            "name": "forward.layers.1.attention.v_proj.lora_A",
+            "percent": 0.23702048936123657
+          },
+          {
+            "milliseconds": 0.05232,
+            "name": "forward.layers.3.attention.v_proj.lora_A",
+            "percent": 0.23702048936123657
+          },
+          {
+            "milliseconds": 0.052288,
+            "name": "forward.layers.2.mlp.up_proj.lora_A",
+            "percent": 0.23687552270107678
+          },
+          {
+            "milliseconds": 0.052256,
+            "name": "forward.layers.3.attention.k_proj.lora_A",
+            "percent": 0.236730556040917
+          },
+          {
+            "milliseconds": 0.052224,
+            "name": "forward.layers.0.mlp.up_proj.lora_A",
+            "percent": 0.23658558938075724
+          },
+          {
+            "milliseconds": 0.052224,
+            "name": "forward.layers.1.attention.k_proj.lora_A",
+            "percent": 0.23658558938075724
+          },
+          {
+            "milliseconds": 0.052224,
+            "name": "forward.layers.1.mlp.up_proj.lora_A",
+            "percent": 0.23658558938075724
+          },
+          {
+            "milliseconds": 0.05216,
+            "name": "forward.layers.2.attention.k_proj.lora_A",
+            "percent": 0.23629565606043768
+          },
+          {
+            "milliseconds": 0.05216,
+            "name": "forward.layers.3.mlp.up_proj.lora_A",
+            "percent": 0.23629565606043768
+          },
+          {
+            "milliseconds": 0.052096,
+            "name": "forward.layers.0.attention.v_proj.lora_A",
+            "percent": 0.23600572274011813
+          },
+          {
+            "milliseconds": 0.05104,
+            "name": "forward.layers.3.mlp.gate_proj.base_frozen_asymgemm",
+            "percent": 0.23122182295484545
+          },
+          {
+            "milliseconds": 0.050752,
+            "name": "forward.layers.1.mlp.up_proj.base_frozen_asymgemm",
+            "percent": 0.22991712301340744
+          },
+          {
+            "milliseconds": 0.050176,
+            "name": "forward.layers.1.mlp.down_proj.lora_B",
+            "percent": 0.22730772313053146
+          },
+          {
+            "milliseconds": 0.050112,
+            "name": "forward.layers.2.attention.v_proj.lora_B",
+            "percent": 0.2270177898102119
+          },
+          {
+            "milliseconds": 0.050112,
+            "name": "forward.layers.3.attention.k_proj.lora_B",
+            "percent": 0.2270177898102119
+          },
+          {
+            "milliseconds": 0.05008,
+            "name": "forward.layers.0.attention.q_proj.lora_B",
+            "percent": 0.2268728231500521
+          },
+          {
+            "milliseconds": 0.05008,
+            "name": "forward.layers.0.attention.o_proj.lora_B",
+            "percent": 0.2268728231500521
+          },
+          {
+            "milliseconds": 0.050048,
+            "name": "forward.layers.1.attention.v_proj.lora_B",
+            "percent": 0.22672785648989235
+          },
+          {
+            "milliseconds": 0.050016,
+            "name": "forward.layers.1.attention.o_proj.lora_B",
+            "percent": 0.22658288982973257
+          },
+          {
+            "milliseconds": 0.049984,
+            "name": "forward.layers.1.attention.k_proj.lora_B",
+            "percent": 0.22643792316957279
+          },
+          {
+            "milliseconds": 0.049984,
+            "name": "forward.layers.2.attention.q_proj.lora_B",
+            "percent": 0.22643792316957279
+          },
+          {
+            "milliseconds": 0.049984,
+            "name": "forward.layers.2.attention.k_proj.lora_B",
+            "percent": 0.22643792316957279
+          },
+          {
+            "milliseconds": 0.049984,
+            "name": "forward.layers.2.attention.o_proj.lora_B",
+            "percent": 0.22643792316957279
+          },
+          {
+            "milliseconds": 0.049984,
+            "name": "forward.layers.3.attention.o_proj.lora_B",
+            "percent": 0.22643792316957279
+          },
+          {
+            "milliseconds": 0.04992,
+            "name": "forward.layers.0.attention.v_proj.lora_B",
+            "percent": 0.22614798984925324
+          },
+          {
+            "milliseconds": 0.04992,
+            "name": "forward.layers.0.mlp.down_proj.lora_B",
+            "percent": 0.22614798984925324
+          },
+          {
+            "milliseconds": 0.04992,
+            "name": "forward.layers.1.attention.q_proj.lora_B",
+            "percent": 0.22614798984925324
+          },
+          {
+            "milliseconds": 0.04992,
+            "name": "forward.layers.2.mlp.down_proj.lora_B",
+            "percent": 0.22614798984925324
+          },
+          {
+            "milliseconds": 0.04992,
+            "name": "forward.layers.3.mlp.down_proj.lora_B",
+            "percent": 0.22614798984925324
+          },
+          {
+            "milliseconds": 0.049824,
+            "name": "forward.layers.3.attention.q_proj.lora_B",
+            "percent": 0.22571308986877392
+          },
+          {
+            "milliseconds": 0.049792,
+            "name": "forward.layers.0.attention.k_proj.lora_B",
+            "percent": 0.22556812320861414
+          },
+          {
+            "milliseconds": 0.049728,
+            "name": "forward.layers.3.attention.v_proj.lora_B",
+            "percent": 0.2252781898882946
+          },
+          {
+            "milliseconds": 0.040064,
+            "name": "forward.layers.1.attention.o_proj.base_frozen_asymgemm",
+            "percent": 0.1814982585200417
+          },
+          {
+            "milliseconds": 0.037728,
+            "name": "forward.layers.3.attention.o_proj.base_frozen_asymgemm",
+            "percent": 0.17091569232837792
+          },
+          {
+            "milliseconds": 0.037568,
+            "name": "forward.layers.1.attention.v_proj.base_frozen_asymgemm",
+            "percent": 0.17019085902757902
+          },
+          {
+            "milliseconds": 0.034144,
+            "name": "forward.layers.0.attention.k_proj.base_frozen_asymgemm",
+            "percent": 0.15467942639048282
+          },
+          {
+            "milliseconds": 0.033472,
+            "name": "forward.layers.0.attention.q_proj.base_frozen_asymgemm",
+            "percent": 0.1516351265271275
+          },
+          {
+            "milliseconds": 0.0328,
+            "name": "forward.layers.2.attention.v_proj.base_frozen_asymgemm",
+            "percent": 0.14859082666377216
+          },
+          {
+            "milliseconds": 0.031552,
+            "name": "forward.layers.3.attention.v_proj.base_frozen_asymgemm",
+            "percent": 0.14293712691754082
+          },
+          {
+            "milliseconds": 0.02992,
+            "name": "forward.layers.1.attention.q_proj.base_frozen_asymgemm",
+            "percent": 0.13554382724939215
+          },
+          {
+            "milliseconds": 0.02944,
+            "name": "forward.layers.3.attention.q_proj.base_frozen_asymgemm",
+            "percent": 0.1333693273469955
+          },
+          {
+            "milliseconds": 0.029216,
+            "name": "forward.layers.2.attention.q_proj.base_frozen_asymgemm",
+            "percent": 0.13235456072587704
+          },
+          {
+            "milliseconds": 0.029024,
+            "name": "forward.layers.2.attention.o_proj.base_frozen_asymgemm",
+            "percent": 0.13148476076491838
+          },
+          {
+            "milliseconds": 0.028896,
+            "name": "forward.layers.2.mlp.gate_proj.lora_B",
+            "percent": 0.13090489412427928
+          },
+          {
+            "milliseconds": 0.028768,
+            "name": "forward.layers.2.mlp.up_proj.lora_B",
+            "percent": 0.13032502748364017
+          },
+          {
+            "milliseconds": 0.028704,
+            "name": "forward.layers.0.mlp.up_proj.lora_B",
+            "percent": 0.13003509416332062
+          },
+          {
+            "milliseconds": 0.028704,
+            "name": "forward.layers.1.mlp.up_proj.lora_B",
+            "percent": 0.13003509416332062
+          },
+          {
+            "milliseconds": 0.028704,
+            "name": "forward.layers.3.mlp.gate_proj.lora_B",
+            "percent": 0.13003509416332062
+          },
+          {
+            "milliseconds": 0.028672,
+            "name": "forward.layers.1.mlp.gate_proj.lora_B",
+            "percent": 0.12989012750316084
+          },
+          {
+            "milliseconds": 0.028608,
+            "name": "forward.layers.0.mlp.gate_proj.lora_B",
+            "percent": 0.1296001941828413
+          },
+          {
+            "milliseconds": 0.028608,
+            "name": "forward.layers.3.mlp.up_proj.lora_B",
+            "percent": 0.1296001941828413
+          },
+          {
+            "milliseconds": 0.028384,
+            "name": "forward.layers.0.attention.o_proj.base_frozen_asymgemm",
+            "percent": 0.12858542756172284
+          },
+          {
+            "milliseconds": 0.028032,
+            "name": "forward.layers.2.mlp.down_proj.base_frozen_asymgemm",
+            "percent": 0.1269907942999653
+          },
+          {
+            "milliseconds": 0.027648,
+            "name": "forward.layers.2.attention.k_proj.base_frozen_asymgemm",
+            "percent": 0.12525119437804794
+          },
+          {
+            "milliseconds": 0.02752,
+            "name": "forward.layers.1.attention.k_proj.base_frozen_asymgemm",
+            "percent": 0.12467132773740883
+          },
+          {
+            "milliseconds": 0.027232,
+            "name": "forward.layers.0.attention.v_proj.base_frozen_asymgemm",
+            "percent": 0.12336662779597082
+          },
+          {
+            "milliseconds": 0.027168,
+            "name": "forward.layers.3.attention.k_proj.base_frozen_asymgemm",
+            "percent": 0.12307669447565128
+          },
+          {
+            "milliseconds": 0.022016,
+            "name": "forward.layers.3.mlp.down_proj.base_frozen_asymgemm",
+            "percent": 0.09973706218992706
+          },
+          {
+            "milliseconds": 0.0216,
+            "name": "forward.layers.0.mlp.down_proj.base_frozen_asymgemm",
+            "percent": 0.09785249560784996
+          },
+          {
+            "milliseconds": 0.01968,
+            "name": "forward.layers.1.mlp.down_proj.base_frozen_asymgemm",
+            "percent": 0.08915449599826329
+          },
+          {
+            "milliseconds": 0.017376,
+            "name": "forward.layers.0.attention.layernorm",
+            "percent": 0.07871689646675929
+          },
+          {
+            "milliseconds": 0.017248,
+            "name": "forward.layers.1.attention.layernorm",
+            "percent": 0.07813702982612018
+          },
+          {
+            "milliseconds": 0.017088,
+            "name": "forward.layers.0.mlp.layernorm",
+            "percent": 0.07741219652532129
+          },
+          {
+            "milliseconds": 0.016992,
+            "name": "forward.final_norm",
+            "percent": 0.07697729654484196
+          },
+          {
+            "milliseconds": 0.01696,
+            "name": "forward.layers.2.mlp.layernorm",
+            "percent": 0.0768323298846822
+          },
+          {
+            "milliseconds": 0.016928,
+            "name": "forward.layers.1.mlp.layernorm",
+            "percent": 0.07668736322452241
+          },
+          {
+            "milliseconds": 0.016864,
+            "name": "forward.layers.2.attention.layernorm",
+            "percent": 0.07639742990420287
+          },
+          {
+            "milliseconds": 0.016864,
+            "name": "forward.layers.3.mlp.layernorm",
+            "percent": 0.07639742990420287
+          },
+          {
+            "milliseconds": 0.016832,
+            "name": "forward.layers.3.attention.layernorm",
+            "percent": 0.07625246324404308
+          },
+          {
+            "milliseconds": 0.01072,
+            "name": "forward.layers.0.attention.scores_matmul",
+            "percent": 0.048563831153525534
+          },
+          {
+            "milliseconds": 0.01072,
+            "name": "forward.layers.2.attention.scores_matmul",
+            "percent": 0.048563831153525534
+          },
+          {
+            "milliseconds": 0.01072,
+            "name": "forward.layers.3.attention.scores_matmul",
+            "percent": 0.048563831153525534
+          },
+          {
+            "milliseconds": 0.010656,
+            "name": "forward.layers.1.attention.scores_matmul",
+            "percent": 0.048273897833205986
+          },
+          {
+            "milliseconds": 0.008736,
+            "name": "forward.layers.2.attention.k_proj.add_cast_scale",
+            "percent": 0.039575898223619316
+          },
+          {
+            "milliseconds": 0.008704,
+            "name": "forward.layers.2.attention.q_proj.add_cast_scale",
+            "percent": 0.03943093156345954
+          },
+          {
+            "milliseconds": 0.008704,
+            "name": "forward.layers.2.attention.o_proj.add_cast_scale",
+            "percent": 0.03943093156345954
+          },
+          {
+            "milliseconds": 0.008672,
+            "name": "forward.layers.0.attention.v_proj.add_cast_scale",
+            "percent": 0.03928596490329976
+          },
+          {
+            "milliseconds": 0.008672,
+            "name": "forward.layers.0.attention.o_proj.add_cast_scale",
+            "percent": 0.03928596490329976
+          },
+          {
+            "milliseconds": 0.008672,
+            "name": "forward.layers.3.mlp.up_proj.add_cast_scale",
+            "percent": 0.03928596490329976
+          },
+          {
+            "milliseconds": 0.00864,
+            "name": "forward.layers.0.attention.q_proj.add_cast_scale",
+            "percent": 0.039140998243139984
+          },
+          {
+            "milliseconds": 0.00864,
+            "name": "forward.layers.1.mlp.up_proj.add_cast_scale",
+            "percent": 0.039140998243139984
+          },
+          {
+            "milliseconds": 0.00864,
+            "name": "forward.layers.2.mlp.down_proj.add_cast_scale",
+            "percent": 0.039140998243139984
+          },
+          {
+            "milliseconds": 0.00864,
+            "name": "forward.layers.3.mlp.gate_proj.add_cast_scale",
+            "percent": 0.039140998243139984
+          },
+          {
+            "milliseconds": 0.008608,
+            "name": "forward.layers.0.attention.k_proj.add_cast_scale",
+            "percent": 0.0389960315829802
+          },
+          {
+            "milliseconds": 0.008608,
+            "name": "forward.layers.1.mlp.gate_proj.add_cast_scale",
+            "percent": 0.0389960315829802
+          },
+          {
+            "milliseconds": 0.008608,
+            "name": "forward.layers.2.attention.v_proj.add_cast_scale",
+            "percent": 0.0389960315829802
+          },
+          {
+            "milliseconds": 0.008608,
+            "name": "forward.layers.3.attention.o_proj.add_cast_scale",
+            "percent": 0.0389960315829802
+          },
+          {
+            "milliseconds": 0.008576,
+            "name": "forward.layers.0.mlp.down_proj.add_cast_scale",
+            "percent": 0.03885106492282043
+          },
+          {
+            "milliseconds": 0.008576,
+            "name": "forward.layers.1.attention.o_proj.add_cast_scale",
+            "percent": 0.03885106492282043
+          },
+          {
+            "milliseconds": 0.008576,
+            "name": "forward.layers.1.mlp.down_proj.add_cast_scale",
+            "percent": 0.03885106492282043
+          },
+          {
+            "milliseconds": 0.008576,
+            "name": "forward.layers.2.mlp.gate_proj.add_cast_scale",
+            "percent": 0.03885106492282043
+          },
+          {
+            "milliseconds": 0.008576,
+            "name": "forward.layers.3.attention.k_proj.add_cast_scale",
+            "percent": 0.03885106492282043
+          },
+          {
+            "milliseconds": 0.008544,
+            "name": "forward.layers.3.attention.q_proj.add_cast_scale",
+            "percent": 0.038706098262660645
+          },
+          {
+            "milliseconds": 0.008512,
+            "name": "forward.layers.0.mlp.gate_proj.add_cast_scale",
+            "percent": 0.038561131602500874
+          },
+          {
+            "milliseconds": 0.008512,
+            "name": "forward.layers.0.mlp.up_proj.add_cast_scale",
+            "percent": 0.038561131602500874
+          },
+          {
+            "milliseconds": 0.008512,
+            "name": "forward.layers.1.attention.v_proj.add_cast_scale",
+            "percent": 0.038561131602500874
+          },
+          {
+            "milliseconds": 0.008512,
+            "name": "forward.layers.2.mlp.up_proj.add_cast_scale",
+            "percent": 0.038561131602500874
+          },
+          {
+            "milliseconds": 0.008512,
+            "name": "forward.layers.3.mlp.down_proj.add_cast_scale",
+            "percent": 0.038561131602500874
+          },
+          {
+            "milliseconds": 0.00848,
+            "name": "forward.layers.1.attention.q_proj.add_cast_scale",
+            "percent": 0.0384161649423411
+          },
+          {
+            "milliseconds": 0.00848,
+            "name": "forward.layers.3.attention.v_proj.add_cast_scale",
+            "percent": 0.0384161649423411
+          },
+          {
+            "milliseconds": 0.008448,
+            "name": "forward.layers.1.attention.k_proj.add_cast_scale",
+            "percent": 0.03827119828218132
+          },
+          {
+            "milliseconds": 0.007456,
+            "name": "forward.layers.0.attention.value_matmul",
+            "percent": 0.03377723181722821
+          },
+          {
+            "milliseconds": 0.00736,
+            "name": "forward.layers.3.attention.value_matmul",
+            "percent": 0.033342331836748874
+          },
+          {
+            "milliseconds": 0.007328,
+            "name": "forward.layers.1.attention.value_matmul",
+            "percent": 0.0331973651765891
+          },
+          {
+            "milliseconds": 0.007296,
+            "name": "forward.layers.2.attention.value_matmul",
+            "percent": 0.03305239851642932
+          },
+          {
+            "milliseconds": 0.007168,
+            "name": "forward.layers.1.mlp.silu_mul_activation",
+            "percent": 0.03247253187579021
+          },
+          {
+            "milliseconds": 0.007168,
+            "name": "forward.layers.2.mlp.silu_mul_activation",
+            "percent": 0.03247253187579021
+          },
+          {
+            "milliseconds": 0.007136,
+            "name": "forward.layers.3.mlp.silu_mul_activation",
+            "percent": 0.03232756521563043
+          },
+          {
+            "milliseconds": 0.007104,
+            "name": "forward.layers.0.mlp.silu_mul_activation",
+            "percent": 0.032182598555470655
+          },
+          {
+            "milliseconds": 0.006752,
+            "name": "forward.layers.0.mlp.residual_add",
+            "percent": 0.030587965293713097
+          },
+          {
+            "milliseconds": 0.006688,
+            "name": "forward.layers.3.attention.residual_add",
+            "percent": 0.030298031973393546
+          },
+          {
+            "milliseconds": 0.006656,
+            "name": "forward.layers.0.attention.residual_add",
+            "percent": 0.030153065313233765
+          },
+          {
+            "milliseconds": 0.006656,
+            "name": "forward.layers.2.mlp.residual_add",
+            "percent": 0.030153065313233765
+          },
+          {
+            "milliseconds": 0.006656,
+            "name": "forward.layers.3.mlp.residual_add",
+            "percent": 0.030153065313233765
+          },
+          {
+            "milliseconds": 0.006624,
+            "name": "forward.layers.1.attention.residual_add",
+            "percent": 0.030008098653073988
+          },
+          {
+            "milliseconds": 0.006624,
+            "name": "forward.layers.1.mlp.residual_add",
+            "percent": 0.030008098653073988
+          },
+          {
+            "milliseconds": 0.006624,
+            "name": "forward.layers.2.attention.residual_add",
+            "percent": 0.030008098653073988
+          },
+          {
+            "milliseconds": 0.00384,
+            "name": "forward.layers.1.attention.causal_mask",
+            "percent": 0.017395999219173328
+          },
+          {
+            "milliseconds": 0.003808,
+            "name": "forward.layers.0.attention.causal_mask",
+            "percent": 0.01725103255901355
+          },
+          {
+            "milliseconds": 0.00368,
+            "name": "forward.layers.2.attention.causal_mask",
+            "percent": 0.016671165918374437
+          },
+          {
+            "milliseconds": 0.003552,
+            "name": "forward.layers.3.attention.causal_mask",
+            "percent": 0.016091299277735328
+          },
+          {
+            "milliseconds": 0.002272,
+            "name": "forward.lm_head",
+            "percent": 0.010292632871344218
+          },
+          {
+            "milliseconds": 0.001984,
+            "name": "forward.embeddings",
+            "percent": 0.008987932929906219
+          },
+          {
+            "milliseconds": 0.001408,
+            "name": "forward.layers.2.attention.softmax",
+            "percent": 0.00637853304703022
+          },
+          {
+            "milliseconds": 0.001408,
+            "name": "forward.layers.3.attention.softmax",
+            "percent": 0.00637853304703022
+          },
+          {
+            "milliseconds": 0.001376,
+            "name": "forward.layers.0.attention.softmax",
+            "percent": 0.006233566386870441
+          },
+          {
+            "milliseconds": 0.001376,
+            "name": "forward.layers.1.attention.softmax",
+            "percent": 0.006233566386870441
+          }
+        ],
+        "total_milliseconds": 22.074041
+      },
+      "stage": "step.forward",
+      "stage_breakdown": {
+        "rows": [
+          {
+            "milliseconds": 17.691769,
+            "name": "gpu_no_kernel_time",
+            "percent": 80.14739575775909
+          },
+          {
+            "milliseconds": 4.3336,
+            "name": "cuda_kernel_busy_union",
+            "percent": 19.632109952137895
+          },
+          {
+            "milliseconds": 0.048672,
+            "name": "cuda_memcpy_union",
+            "percent": 0.22049429010302193
+          }
+        ],
+        "total_milliseconds": 22.074041
+      },
+      "top_kernels": [
+        {
+          "milliseconds": 2.642144,
+          "name": "sm80_xmma_gemm_f32f32_f32f32_f32_tn_n_tilesize32x128x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+          "percent": 11.969462229412366
+        },
+        {
+          "milliseconds": 0.576736,
+          "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)16, (unsigned int)128, (unsigned int)512, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)2, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "percent": 2.612734116059674
+        },
+        {
+          "milliseconds": 0.449984,
+          "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)16, (unsigned int)256, (unsigned int)512, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)4, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "percent": 2.038521175166794
+        },
+        {
+          "milliseconds": 0.28864,
+          "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>, (int)4, TrivialOffsetCalculator<(int)1, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)1>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+          "percent": 1.307599274641195
+        },
+        {
+          "milliseconds": 0.095808,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.4340301805183745
+        },
+        {
+          "milliseconds": 0.056,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.253691655279611
+        },
+        {
+          "milliseconds": 0.035616,
+          "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::MeanOps<float, float, float, float>, unsigned int, float, (int)4, (int)4>>(T3)",
+          "percent": 0.16134789275783262
+        },
+        {
+          "milliseconds": 0.032832,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctor_add<float>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+          "percent": 0.14873579332393194
+        },
+        {
+          "milliseconds": 0.02352,
+          "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_add<float>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+          "percent": 0.10655049521743662
+        },
+        {
+          "milliseconds": 0.022976,
+          "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+          "percent": 0.1040860619947204
+        },
+        {
+          "milliseconds": 0.022176,
+          "name": "sm80_xmma_gemm_f32f32_f32f32_f32_nn_n_tilesize32x32x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+          "percent": 0.10046189549072596
+        },
+        {
+          "milliseconds": 0.020768,
+          "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)]>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+          "percent": 0.09408336244369574
+        },
+        {
+          "milliseconds": 0.009024,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::rsqrt_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 2)]::operator ()() const::[lambda() (instance 2)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.04088059816505732
+        },
+        {
+          "milliseconds": 0.008128,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctorOnSelf_add<float>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.03682153168058354
+        },
+        {
+          "milliseconds": 0.008032,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, void at::native::<unnamed>::pow_tensor_scalar_kernel_impl<float, float>(at::TensorIteratorBase &, T2)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.0363866317001042
+        },
+        {
+          "milliseconds": 0.007232,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+          "percent": 0.032762465196109765
+        },
+        {
+          "milliseconds": 0.006432,
+          "name": "void at::native::triu_tril_kernel<bool, int, (bool)1, (int)8, (bool)0>(at::cuda::detail::TensorInfo<T1, T2>, at::cuda::detail::TensorInfo<const T1, T2>, long, long, T2)",
+          "percent": 0.02913829869211532
+        },
+        {
+          "milliseconds": 0.005568,
+          "name": "void <unnamed>::softmax_warp_forward<float, float, float, (int)3, (bool)0, (bool)0>(T2 *, const T1 *, int, int, int, const bool *, int, bool)",
+          "percent": 0.02522419886780132
+        },
+        {
+          "milliseconds": 0.005216,
+          "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::<unnamed>::masked_fill_kernel(at::TensorIterator &, const c10::Scalar &)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float, bool) (instance 1)]>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+          "percent": 0.02362956560604377
+        },
+        {
+          "milliseconds": 0.005056,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::sigmoid_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 2)]::operator ()() const::[lambda() (instance 2)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.022904732305244875
+        }
+      ],
+      "total_milliseconds": 22.074041
+    },
+    {
+      "host_api_breakdown": {
+        "rows": [
+          {
+            "milliseconds": 4.005879,
+            "name": "cuda_runtime_api_sum_overlaps_gpu_timeline",
+            "percent": 15.932667927477523
+          },
+          {
+            "milliseconds": 0.336213,
+            "name": "cuda_synchronization_api_sum_overlaps_gpu_timeline",
+            "percent": 1.3372271308996104
+          }
+        ],
+        "total_milliseconds": 25.14255
+      },
+      "operation_cuda_api_time": {
+        "rows": [
+          {
+            "milliseconds": 0.056809,
+            "name": "backward.loss.cross_entropy",
+            "percent": 0.22594764651954552
+          },
+          {
+            "milliseconds": 0.051812,
+            "name": "backward.layers.0.mlp.up_proj.base_dx_asymgemm",
+            "percent": 0.20607297191414553
+          },
+          {
+            "milliseconds": 0.043236,
+            "name": "backward.final_norm",
+            "percent": 0.1719634643264108
+          },
+          {
+            "milliseconds": 0.042452,
+            "name": "backward.layers.3.mlp.down_proj.base_dx_asymgemm",
+            "percent": 0.16884524441633803
+          },
+          {
+            "milliseconds": 0.041935,
+            "name": "backward.layers.1.attention.k_proj.base_dx_asymgemm",
+            "percent": 0.16678896929706813
+          },
+          {
+            "milliseconds": 0.040975,
+            "name": "backward.layers.1.attention.v_proj.base_dx_asymgemm",
+            "percent": 0.16297074083575452
+          },
+          {
+            "milliseconds": 0.039646,
+            "name": "backward.layers.2.mlp.layernorm",
+            "percent": 0.15768488080962353
+          },
+          {
+            "milliseconds": 0.039269,
+            "name": "backward.layers.3.mlp.layernorm",
+            "percent": 0.15618543067429516
+          },
+          {
+            "milliseconds": 0.039135,
+            "name": "backward.layers.0.attention.v_proj.base_dx_asymgemm",
+            "percent": 0.15565246961823684
+          },
+          {
+            "milliseconds": 0.038771,
+            "name": "backward.layers.3.attention.v_proj.base_dx_asymgemm",
+            "percent": 0.15420472465998875
+          },
+          {
+            "milliseconds": 0.038738,
+            "name": "backward.layers.2.attention.v_proj.base_dx_asymgemm",
+            "percent": 0.1540734730566311
+          },
+          {
+            "milliseconds": 0.038635,
+            "name": "backward.layers.1.attention.q_proj.base_dx_asymgemm",
+            "percent": 0.15366380896130266
+          },
+          {
+            "milliseconds": 0.038438,
+            "name": "backward.layers.0.mlp.down_proj.base_dx_asymgemm",
+            "percent": 0.1528802766624706
+          },
+          {
+            "milliseconds": 0.038187,
+            "name": "backward.layers.1.mlp.up_proj.base_dx_asymgemm",
+            "percent": 0.15188196901268963
+          },
+          {
+            "milliseconds": 0.03806,
+            "name": "backward.layers.2.mlp.down_proj.base_dx_asymgemm",
+            "percent": 0.15137684920582836
+          },
+          {
+            "milliseconds": 0.037832,
+            "name": "backward.layers.1.mlp.down_proj.base_dx_asymgemm",
+            "percent": 0.15047001994626638
+          },
+          {
+            "milliseconds": 0.037779,
+            "name": "backward.layers.1.attention.o_proj.base_dx_asymgemm",
+            "percent": 0.15025922191663135
+          },
+          {
+            "milliseconds": 0.03759,
+            "name": "backward.layers.3.mlp.up_proj.base_dx_asymgemm",
+            "percent": 0.14950750818831024
+          },
+          {
+            "milliseconds": 0.037375,
+            "name": "backward.layers.0.attention.k_proj.base_dx_asymgemm",
+            "percent": 0.14865238410582857
+          },
+          {
+            "milliseconds": 0.036569,
+            "name": "backward.layers.0.mlp.gate_proj.base_dx_asymgemm",
+            "percent": 0.1454466631268507
+          },
+          {
+            "milliseconds": 0.036268,
+            "name": "backward.layers.2.mlp.up_proj.base_dx_asymgemm",
+            "percent": 0.14424948941137633
+          },
+          {
+            "milliseconds": 0.035985,
+            "name": "backward.layers.3.attention.k_proj.base_dx_asymgemm",
+            "percent": 0.14312390747955162
+          },
+          {
+            "milliseconds": 0.035959,
+            "name": "backward.layers.2.attention.layernorm",
+            "percent": 0.14302049712539103
+          },
+          {
+            "milliseconds": 0.035884,
+            "name": "backward.layers.0.attention.q_proj.base_dx_asymgemm",
+            "percent": 0.1427221980268509
+          },
+          {
+            "milliseconds": 0.035634,
+            "name": "backward.layers.1.attention.layernorm",
+            "percent": 0.1417278676983838
+          },
+          {
+            "milliseconds": 0.035622,
+            "name": "backward.layers.3.mlp.gate_proj.base_dx_asymgemm",
+            "percent": 0.1416801398426174
+          },
+          {
+            "milliseconds": 0.035542,
+            "name": "backward.layers.3.attention.o_proj.base_dx_asymgemm",
+            "percent": 0.14136195413750793
+          },
+          {
+            "milliseconds": 0.035458,
+            "name": "backward.layers.2.attention.o_proj.base_dx_asymgemm",
+            "percent": 0.141027859147143
+          },
+          {
+            "milliseconds": 0.035335,
+            "name": "backward.layers.0.attention.layernorm",
+            "percent": 0.14053864862553717
+          },
+          {
+            "milliseconds": 0.035257,
+            "name": "backward.layers.3.attention.layernorm",
+            "percent": 0.14022841756305543
+          },
+          {
+            "milliseconds": 0.035104,
+            "name": "backward.layers.0.mlp.layernorm",
+            "percent": 0.1396198874020336
+          },
+          {
+            "milliseconds": 0.035101,
+            "name": "backward.layers.1.mlp.gate_proj.base_dx_asymgemm",
+            "percent": 0.139607955438092
+          },
+          {
+            "milliseconds": 0.035033,
+            "name": "backward.layers.2.mlp.gate_proj.base_dx_asymgemm",
+            "percent": 0.13933749758874897
+          },
+          {
+            "milliseconds": 0.034954,
+            "name": "backward.layers.2.attention.q_proj.base_dx_asymgemm",
+            "percent": 0.13902328920495335
+          },
+          {
+            "milliseconds": 0.034945,
+            "name": "backward.layers.2.attention.k_proj.base_dx_asymgemm",
+            "percent": 0.1389874933131285
+          },
+          {
+            "milliseconds": 0.034925,
+            "name": "backward.layers.0.attention.o_proj.base_dx_asymgemm",
+            "percent": 0.13890794688685115
+          },
+          {
+            "milliseconds": 0.034289,
+            "name": "backward.layers.1.mlp.layernorm",
+            "percent": 0.13637837053123092
+          },
+          {
+            "milliseconds": 0.034238,
+            "name": "backward.layers.3.attention.q_proj.base_dx_asymgemm",
+            "percent": 0.13617552714422362
+          },
+          {
+            "milliseconds": 0.026137,
+            "name": "backward.layers.1.mlp.silu_mul_activation",
+            "percent": 0.10395524718057636
+          },
+          {
+            "milliseconds": 0.026042,
+            "name": "backward.layers.2.mlp.silu_mul_activation",
+            "percent": 0.10357740165575886
+          },
+          {
+            "milliseconds": 0.025775,
+            "name": "backward.layers.3.mlp.silu_mul_activation",
+            "percent": 0.10251545686495603
+          },
+          {
+            "milliseconds": 0.025728,
+            "name": "backward.layers.0.mlp.silu_mul_activation",
+            "percent": 0.10232852276320421
+          },
+          {
+            "milliseconds": 0.023794,
+            "name": "backward.layers.1.attention.softmax",
+            "percent": 0.09463638334218287
+          },
+          {
+            "milliseconds": 0.020479,
+            "name": "backward.layers.3.mlp.down_proj.lora_B",
+            "percent": 0.08145156318670939
+          },
+          {
+            "milliseconds": 0.020094,
+            "name": "backward.layers.2.attention.v_proj.base_lora_add",
+            "percent": 0.0799202944808701
+          },
+          {
+            "milliseconds": 0.019222,
+            "name": "backward.layers.0.mlp.down_proj.lora_B",
+            "percent": 0.0764520702951769
+          },
+          {
+            "milliseconds": 0.018935,
+            "name": "backward.layers.1.attention.v_proj.lora_B",
+            "percent": 0.07531057907809668
+          },
+          {
+            "milliseconds": 0.018893,
+            "name": "backward.layers.3.mlp.up_proj.lora_B",
+            "percent": 0.07514353158291422
+          },
+          {
+            "milliseconds": 0.018719,
+            "name": "backward.layers.2.attention.v_proj.lora_B",
+            "percent": 0.07445147767430113
+          },
+          {
+            "milliseconds": 0.018609,
+            "name": "backward.layers.1.mlp.up_proj.lora_B",
+            "percent": 0.07401397232977562
+          },
+          {
+            "milliseconds": 0.018525,
+            "name": "backward.layers.1.attention.q_proj.lora_B",
+            "percent": 0.07367987733941068
+          },
+          {
+            "milliseconds": 0.01816,
+            "name": "backward.layers.2.mlp.up_proj.lora_B",
+            "percent": 0.07222815505984874
+          },
+          {
+            "milliseconds": 0.018131,
+            "name": "backward.layers.3.attention.v_proj.lora_B",
+            "percent": 0.07211281274174657
+          },
+          {
+            "milliseconds": 0.018006,
+            "name": "backward.layers.1.mlp.down_proj.lora_B",
+            "percent": 0.07161564757751303
+          },
+          {
+            "milliseconds": 0.017972,
+            "name": "backward.layers.0.attention.v_proj.lora_B",
+            "percent": 0.0714804186528415
+          },
+          {
+            "milliseconds": 0.017637,
+            "name": "backward.layers.0.mlp.up_proj.lora_B",
+            "percent": 0.07014801601269562
+          },
+          {
+            "milliseconds": 0.017403,
+            "name": "backward.layers.0.mlp.gate_proj.lora_B",
+            "percent": 0.06921732282525041
+          },
+          {
+            "milliseconds": 0.017358,
+            "name": "backward.layers.3.mlp.down_proj.lora_A",
+            "percent": 0.06903834336612634
+          },
+          {
+            "milliseconds": 0.017136,
+            "name": "backward.layers.1.attention.o_proj.lora_B",
+            "percent": 0.06815537803444757
+          },
+          {
+            "milliseconds": 0.016992,
+            "name": "backward.layers.2.attention.o_proj.lora_B",
+            "percent": 0.06758264376525054
+          },
+          {
+            "milliseconds": 0.016978,
+            "name": "backward.layers.3.attention.o_proj.lora_B",
+            "percent": 0.06752696126685638
+          },
+          {
+            "milliseconds": 0.016972,
+            "name": "backward.layers.0.attention.k_proj.lora_B",
+            "percent": 0.06750309733897318
+          },
+          {
+            "milliseconds": 0.016708,
+            "name": "backward.layers.2.mlp.down_proj.lora_A",
+            "percent": 0.06645308451211195
+          },
+          {
+            "milliseconds": 0.01658,
+            "name": "backward.layers.2.mlp.down_proj.lora_B",
+            "percent": 0.0659439873839368
+          },
+          {
+            "milliseconds": 0.016554,
+            "name": "backward.layers.0.mlp.down_proj.lora_A",
+            "percent": 0.06584057702977622
+          },
+          {
+            "milliseconds": 0.016522,
+            "name": "backward.layers.0.attention.o_proj.lora_B",
+            "percent": 0.06571330274773242
+          },
+          {
+            "milliseconds": 0.016515000000000002,
+            "name": "backward.layers.1.attention.k_proj.lora_B",
+            "percent": 0.06568546149853535
+          },
+          {
+            "milliseconds": 0.016479,
+            "name": "backward.layers.3.attention.q_proj.lora_B",
+            "percent": 0.0655422779312361
+          },
+          {
+            "milliseconds": 0.016345,
+            "name": "backward.layers.3.attention.softmax",
+            "percent": 0.06500931687517773
+          },
+          {
+            "milliseconds": 0.016309,
+            "name": "backward.layers.3.mlp.gate_proj.lora_B",
+            "percent": 0.06486613330787848
+          },
+          {
+            "milliseconds": 0.016281999999999998,
+            "name": "backward.layers.2.attention.q_proj.lora_B",
+            "percent": 0.06475874563240402
+          },
+          {
+            "milliseconds": 0.016193,
+            "name": "backward.layers.0.attention.softmax",
+            "percent": 0.06440476403546976
+          },
+          {
+            "milliseconds": 0.016165,
+            "name": "backward.layers.1.mlp.down_proj.lora_A",
+            "percent": 0.06429339903868143
+          },
+          {
+            "milliseconds": 0.016013,
+            "name": "backward.layers.1.mlp.gate_proj.lora_B",
+            "percent": 0.06368884619897346
+          },
+          {
+            "milliseconds": 0.01593,
+            "name": "backward.layers.2.attention.q_proj.lora_A",
+            "percent": 0.06335872852992239
+          },
+          {
+            "milliseconds": 0.015898,
+            "name": "backward.layers.2.attention.softmax",
+            "percent": 0.06323145424787859
+          },
+          {
+            "milliseconds": 0.015779,
+            "name": "backward.layers.0.attention.q_proj.lora_B",
+            "percent": 0.06275815301152828
+          },
+          {
+            "milliseconds": 0.015769,
+            "name": "backward.layers.1.attention.v_proj.lora_A",
+            "percent": 0.06271837979838957
+          },
+          {
+            "milliseconds": 0.015596,
+            "name": "backward.layers.2.mlp.gate_proj.lora_B",
+            "percent": 0.06203030321109037
+          },
+          {
+            "milliseconds": 0.015535,
+            "name": "backward.layers.0.mlp.gate_proj.base_lora_add",
+            "percent": 0.0617876866109444
+          },
+          {
+            "milliseconds": 0.015317,
+            "name": "backward.layers.3.attention.k_proj.lora_B",
+            "percent": 0.0609206305645211
+          },
+          {
+            "milliseconds": 0.015217999999999999,
+            "name": "backward.layers.2.attention.k_proj.lora_B",
+            "percent": 0.06052687575444813
+          },
+          {
+            "milliseconds": 0.014488,
+            "name": "backward.layers.3.attention.o_proj.lora_A",
+            "percent": 0.05762343119532425
+          },
+          {
+            "milliseconds": 0.014148,
+            "name": "backward.layers.0.attention.k_proj.lora_A",
+            "percent": 0.056271141948609035
+          },
+          {
+            "milliseconds": 0.014089,
+            "name": "backward.layers.3.mlp.down_proj.base_lora_add",
+            "percent": 0.0560364799910908
+          },
+          {
+            "milliseconds": 0.01408,
+            "name": "backward.layers.2.mlp.up_proj.lora_A",
+            "percent": 0.05600068409926599
+          },
+          {
+            "milliseconds": 0.014044000000000001,
+            "name": "backward.layers.1.mlp.up_proj.lora_A",
+            "percent": 0.05585750053196673
+          },
+          {
+            "milliseconds": 0.013968000000000001,
+            "name": "backward.layers.3.mlp.up_proj.lora_A",
+            "percent": 0.055555224112112736
+          },
+          {
+            "milliseconds": 0.013968000000000001,
+            "name": "backward.layers.1.attention.q_proj.lora_A",
+            "percent": 0.055555224112112736
+          },
+          {
+            "milliseconds": 0.013951,
+            "name": "backward.layers.3.attention.k_proj.lora_A",
+            "percent": 0.055487609649776976
+          },
+          {
+            "milliseconds": 0.013727,
+            "name": "backward.layers.0.attention.q_proj.lora_A",
+            "percent": 0.05459668967547047
+          },
+          {
+            "milliseconds": 0.013688,
+            "name": "backward.layers.0.attention.v_proj.lora_A",
+            "percent": 0.05444157414422961
+          },
+          {
+            "milliseconds": 0.013627,
+            "name": "backward.layers.3.mlp.gate_proj.lora_A",
+            "percent": 0.05419895754408364
+          },
+          {
+            "milliseconds": 0.013626,
+            "name": "backward.layers.2.attention.value_matmul.lhs_grad",
+            "percent": 0.05419498022276977
+          },
+          {
+            "milliseconds": 0.013519,
+            "name": "backward.layers.1.mlp.gate_proj.lora_A",
+            "percent": 0.053769406842185855
+          },
+          {
+            "milliseconds": 0.013458000000000001,
+            "name": "backward.layers.2.attention.v_proj.lora_A",
+            "percent": 0.05352679024203989
+          },
+          {
+            "milliseconds": 0.013455,
+            "name": "backward.layers.3.attention.v_proj.lora_A",
+            "percent": 0.05351485827809828
+          },
+          {
+            "milliseconds": 0.013432,
+            "name": "backward.layers.1.attention.k_proj.lora_A",
+            "percent": 0.05342337988787931
+          },
+          {
+            "milliseconds": 0.013409999999999998,
+            "name": "backward.layers.1.attention.o_proj.lora_A",
+            "percent": 0.0533358788189742
+          },
+          {
+            "milliseconds": 0.013288999999999999,
+            "name": "backward.layers.0.mlp.gate_proj.lora_A",
+            "percent": 0.05285462293999614
+          },
+          {
+            "milliseconds": 0.013283,
+            "name": "backward.layers.2.attention.o_proj.lora_A",
+            "percent": 0.052830759012112934
+          },
+          {
+            "milliseconds": 0.013273,
+            "name": "backward.layers.2.attention.k_proj.lora_A",
+            "percent": 0.052790985798974246
+          },
+          {
+            "milliseconds": 0.013255,
+            "name": "backward.layers.3.attention.q_proj.lora_A",
+            "percent": 0.05271939401532461
+          },
+          {
+            "milliseconds": 0.013221,
+            "name": "backward.layers.2.mlp.gate_proj.lora_A",
+            "percent": 0.0525841650906531
+          },
+          {
+            "milliseconds": 0.013144,
+            "name": "backward.layers.0.mlp.up_proj.lora_A",
+            "percent": 0.052277911349485236
+          },
+          {
+            "milliseconds": 0.013075,
+            "name": "backward.layers.0.attention.value_matmul.lhs_grad",
+            "percent": 0.05200347617882831
+          },
+          {
+            "milliseconds": 0.013049999999999999,
+            "name": "backward.layers.0.attention.o_proj.lora_A",
+            "percent": 0.05190404314598161
+          },
+          {
+            "milliseconds": 0.012912,
+            "name": "backward.layers.2.attention.k_proj.base_lora_add",
+            "percent": 0.05135517280466778
+          },
+          {
+            "milliseconds": 0.012892,
+            "name": "backward.layers.3.attention.value_matmul.lhs_grad",
+            "percent": 0.05127562637839042
+          },
+          {
+            "milliseconds": 0.01269,
+            "name": "backward.layers.1.attention.k_proj.base_lora_add",
+            "percent": 0.050472207472989014
+          },
+          {
+            "milliseconds": 0.012671,
+            "name": "backward.layers.1.attention.q_proj.base_lora_add",
+            "percent": 0.05039663836802551
+          },
+          {
+            "milliseconds": 0.01265,
+            "name": "backward.layers.1.attention.value_matmul.lhs_grad",
+            "percent": 0.05031311462043428
+          },
+          {
+            "milliseconds": 0.012403,
+            "name": "backward.layers.0.attention.k_proj.base_lora_add",
+            "percent": 0.04933071625590882
+          },
+          {
+            "milliseconds": 0.012269,
+            "name": "backward.layers.3.mlp.gate_proj.base_lora_add",
+            "percent": 0.048797755199850454
+          },
+          {
+            "milliseconds": 0.012239,
+            "name": "backward.layers.3.attention.k_proj.base_lora_add",
+            "percent": 0.0486784355604344
+          },
+          {
+            "milliseconds": 0.012197,
+            "name": "backward.layers.2.mlp.gate_proj.base_lora_add",
+            "percent": 0.04851138806525193
+          },
+          {
+            "milliseconds": 0.011972,
+            "name": "backward.layers.1.mlp.gate_proj.base_lora_add",
+            "percent": 0.047616490769631564
+          },
+          {
+            "milliseconds": 0.011904,
+            "name": "backward.layers.0.attention.q_proj.base_lora_add",
+            "percent": 0.04734603292028851
+          },
+          {
+            "milliseconds": 0.011778,
+            "name": "backward.layers.1.attention.v_proj.base_lora_add",
+            "percent": 0.046844890434741104
+          },
+          {
+            "milliseconds": 0.011617,
+            "name": "backward.layers.3.mlp.residual_add",
+            "percent": 0.046204541703208306
+          },
+          {
+            "milliseconds": 0.011532,
+            "name": "backward.layers.2.attention.q_proj.base_lora_add",
+            "percent": 0.045866469391529496
+          },
+          {
+            "milliseconds": 0.011521,
+            "name": "backward.layers.0.attention.v_proj.base_lora_add",
+            "percent": 0.04582271885707694
+          },
+          {
+            "milliseconds": 0.011502,
+            "name": "backward.layers.0.mlp.up_proj.base_lora_add",
+            "percent": 0.045747149752113456
+          },
+          {
+            "milliseconds": 0.011468,
+            "name": "backward.layers.1.mlp.up_proj.base_lora_add",
+            "percent": 0.04561192082744193
+          },
+          {
+            "milliseconds": 0.011465,
+            "name": "backward.layers.3.attention.q_proj.base_lora_add",
+            "percent": 0.045599988863500314
+          },
+          {
+            "milliseconds": 0.011394,
+            "name": "backward.layers.2.mlp.up_proj.base_lora_add",
+            "percent": 0.04531759905021567
+          },
+          {
+            "milliseconds": 0.011357,
+            "name": "backward.layers.3.attention.v_proj.base_lora_add",
+            "percent": 0.04517043816160255
+          },
+          {
+            "milliseconds": 0.011282,
+            "name": "backward.layers.3.attention.o_proj.base_lora_add",
+            "percent": 0.04487213906306242
+          },
+          {
+            "milliseconds": 0.011195,
+            "name": "backward.layers.0.attention.o_proj.base_lora_add",
+            "percent": 0.04452611210875587
+          },
+          {
+            "milliseconds": 0.01118,
+            "name": "backward.layers.2.mlp.down_proj.base_lora_add",
+            "percent": 0.04446645228904785
+          },
+          {
+            "milliseconds": 0.011112,
+            "name": "backward.layers.0.attention.residual_add",
+            "percent": 0.0441959944397048
+          },
+          {
+            "milliseconds": 0.011089,
+            "name": "backward.layers.1.attention.scores_matmul.lhs_grad",
+            "percent": 0.04410451604948583
+          },
+          {
+            "milliseconds": 0.011061,
+            "name": "backward.layers.1.mlp.residual_add",
+            "percent": 0.043993151052697514
+          },
+          {
+            "milliseconds": 0.01103,
+            "name": "backward.layers.1.mlp.down_proj.base_lora_add",
+            "percent": 0.0438698540919676
+          },
+          {
+            "milliseconds": 0.010989,
+            "name": "backward.layers.3.attention.residual_add",
+            "percent": 0.043706783918099
+          },
+          {
+            "milliseconds": 0.010923,
+            "name": "backward.layers.2.attention.residual_add",
+            "percent": 0.04344428071138369
+          },
+          {
+            "milliseconds": 0.010902,
+            "name": "backward.layers.3.mlp.up_proj.base_lora_add",
+            "percent": 0.043360756963792456
+          },
+          {
+            "milliseconds": 0.010869,
+            "name": "backward.layers.2.attention.o_proj.base_lora_add",
+            "percent": 0.0432295053604348
+          },
+          {
+            "milliseconds": 0.01081,
+            "name": "backward.layers.0.mlp.residual_add",
+            "percent": 0.042994843402916566
+          },
+          {
+            "milliseconds": 0.010773,
+            "name": "backward.layers.0.mlp.down_proj.base_lora_add",
+            "percent": 0.04284768251430344
+          },
+          {
+            "milliseconds": 0.010647,
+            "name": "backward.layers.2.mlp.residual_add",
+            "percent": 0.042346540028756034
+          },
+          {
+            "milliseconds": 0.010637,
+            "name": "backward.layers.1.attention.o_proj.base_lora_add",
+            "percent": 0.042306766815617354
+          },
+          {
+            "milliseconds": 0.010459,
+            "name": "backward.layers.1.attention.residual_add",
+            "percent": 0.04159880362174879
+          },
+          {
+            "milliseconds": 0.009695,
+            "name": "backward.lm_head",
+            "percent": 0.03856013013795339
+          },
+          {
+            "milliseconds": 0.009042,
+            "name": "backward.layers.1.attention.scores_matmul.rhs_grad",
+            "percent": 0.035962939319997375
+          },
+          {
+            "milliseconds": 0.008748,
+            "name": "backward.layers.0.attention.scores_matmul.lhs_grad",
+            "percent": 0.03479360685372009
+          },
+          {
+            "milliseconds": 0.008681,
+            "name": "backward.layers.3.attention.scores_matmul.lhs_grad",
+            "percent": 0.03452712632569091
+          },
+          {
+            "milliseconds": 0.008651,
+            "name": "backward.layers.0.attention.value_matmul.rhs_grad",
+            "percent": 0.03440780668627486
+          },
+          {
+            "milliseconds": 0.008613,
+            "name": "backward.layers.0.mlp.down_proj.add_cast_scale",
+            "percent": 0.03425666847634787
+          },
+          {
+            "milliseconds": 0.008422,
+            "name": "backward.layers.2.attention.scores_matmul.lhs_grad",
+            "percent": 0.033497000105399015
+          },
+          {
+            "milliseconds": 0.008378,
+            "name": "backward.layers.2.attention.value_matmul.rhs_grad",
+            "percent": 0.03332199796758881
+          },
+          {
+            "milliseconds": 0.00825,
+            "name": "backward.layers.1.attention.value_matmul.rhs_grad",
+            "percent": 0.03281290083941366
+          },
+          {
+            "milliseconds": 0.008227,
+            "name": "backward.layers.0.attention.scores_matmul.rhs_grad",
+            "percent": 0.03272142244919469
+          },
+          {
+            "milliseconds": 0.008193,
+            "name": "backward.layers.3.attention.scores_matmul.rhs_grad",
+            "percent": 0.03258619352452317
+          },
+          {
+            "milliseconds": 0.008152,
+            "name": "backward.layers.0.mlp.gate_proj.add_cast_scale",
+            "percent": 0.032423123350654566
+          },
+          {
+            "milliseconds": 0.008125,
+            "name": "backward.layers.1.attention.k_proj.add_cast_scale",
+            "percent": 0.032315735675180125
+          },
+          {
+            "milliseconds": 0.008124,
+            "name": "backward.layers.0.attention.v_proj.add_cast_scale",
+            "percent": 0.03231175835386625
+          },
+          {
+            "milliseconds": 0.008086,
+            "name": "backward.layers.1.attention.q_proj.add_cast_scale",
+            "percent": 0.03216062014393926
+          },
+          {
+            "milliseconds": 0.008081,
+            "name": "backward.layers.3.attention.o_proj.add_cast_scale",
+            "percent": 0.03214073353736992
+          },
+          {
+            "milliseconds": 0.008,
+            "name": "backward.layers.3.attention.value_matmul.rhs_grad",
+            "percent": 0.03181857051094658
+          },
+          {
+            "milliseconds": 0.007964,
+            "name": "backward.layers.3.attention.q_proj.add_cast_scale",
+            "percent": 0.03167538694364733
+          },
+          {
+            "milliseconds": 0.007941,
+            "name": "backward.layers.1.mlp.gate_proj.add_cast_scale",
+            "percent": 0.03158390855342835
+          },
+          {
+            "milliseconds": 0.007911,
+            "name": "backward.layers.2.mlp.up_proj.add_cast_scale",
+            "percent": 0.0314645889140123
+          },
+          {
+            "milliseconds": 0.007899,
+            "name": "backward.layers.2.mlp.down_proj.add_cast_scale",
+            "percent": 0.03141686105824588
+          },
+          {
+            "milliseconds": 0.00783,
+            "name": "backward.layers.2.attention.scores_matmul.rhs_grad",
+            "percent": 0.03114242588758897
+          },
+          {
+            "milliseconds": 0.00782,
+            "name": "backward.layers.2.mlp.gate_proj.add_cast_scale",
+            "percent": 0.031102652674450285
+          },
+          {
+            "milliseconds": 0.007791,
+            "name": "backward.layers.1.attention.v_proj.add_cast_scale",
+            "percent": 0.030987310356348104
+          },
+          {
+            "milliseconds": 0.007785,
+            "name": "backward.layers.3.attention.v_proj.add_cast_scale",
+            "percent": 0.03096344642846489
+          },
+          {
+            "milliseconds": 0.007785,
+            "name": "backward.layers.1.attention.o_proj.add_cast_scale",
+            "percent": 0.03096344642846489
+          },
+          {
+            "milliseconds": 0.007773,
+            "name": "backward.layers.2.attention.v_proj.add_cast_scale",
+            "percent": 0.030915718572698474
+          },
+          {
+            "milliseconds": 0.007747,
+            "name": "backward.layers.0.attention.q_proj.add_cast_scale",
+            "percent": 0.0308123082185379
+          },
+          {
+            "milliseconds": 0.007732,
+            "name": "backward.layers.0.mlp.up_proj.add_cast_scale",
+            "percent": 0.030752648398829872
+          },
+          {
+            "milliseconds": 0.007732,
+            "name": "backward.layers.0.attention.k_proj.add_cast_scale",
+            "percent": 0.030752648398829872
+          },
+          {
+            "milliseconds": 0.007702,
+            "name": "backward.layers.3.mlp.down_proj.add_cast_scale",
+            "percent": 0.03063332875941382
+          },
+          {
+            "milliseconds": 0.007695,
+            "name": "backward.layers.3.mlp.up_proj.add_cast_scale",
+            "percent": 0.03060548751021674
+          },
+          {
+            "milliseconds": 0.007694,
+            "name": "backward.layers.3.mlp.gate_proj.add_cast_scale",
+            "percent": 0.030601510188902878
+          },
+          {
+            "milliseconds": 0.007691,
+            "name": "backward.layers.1.mlp.up_proj.add_cast_scale",
+            "percent": 0.03058957822496127
+          },
+          {
+            "milliseconds": 0.007668,
+            "name": "backward.layers.3.attention.k_proj.add_cast_scale",
+            "percent": 0.0304980998347423
+          },
+          {
+            "milliseconds": 0.007654,
+            "name": "backward.layers.0.attention.o_proj.add_cast_scale",
+            "percent": 0.030442417336348143
+          },
+          {
+            "milliseconds": 0.007619,
+            "name": "backward.layers.2.attention.o_proj.add_cast_scale",
+            "percent": 0.030303211090362752
+          },
+          {
+            "milliseconds": 0.007552,
+            "name": "backward.layers.2.attention.k_proj.add_cast_scale",
+            "percent": 0.030036730562333573
+          },
+          {
+            "milliseconds": 0.00754,
+            "name": "backward.layers.2.attention.q_proj.add_cast_scale",
+            "percent": 0.029989002706567153
+          },
+          {
+            "milliseconds": 0.007412,
+            "name": "backward.layers.1.mlp.down_proj.add_cast_scale",
+            "percent": 0.02947990557839201
+          }
+        ],
+        "total_milliseconds": 25.14255
+      },
+      "operation_kernel_time": {
+        "rows": [
+          {
+            "milliseconds": 0.054624000000000006,
+            "name": "backward.layers.3.mlp.down_proj.lora_B",
+            "percent": 0.21725719944874328
+          },
+          {
+            "milliseconds": 0.054368,
+            "name": "backward.layers.1.attention.o_proj.lora_B",
+            "percent": 0.21623900519239297
+          },
+          {
+            "milliseconds": 0.054336,
+            "name": "backward.layers.2.mlp.up_proj.lora_B",
+            "percent": 0.2161117309103492
+          },
+          {
+            "milliseconds": 0.054272,
+            "name": "backward.layers.3.attention.q_proj.lora_B",
+            "percent": 0.2158571823462616
+          },
+          {
+            "milliseconds": 0.054272,
+            "name": "backward.layers.0.attention.o_proj.lora_B",
+            "percent": 0.2158571823462616
+          },
+          {
+            "milliseconds": 0.054240000000000003,
+            "name": "backward.layers.3.attention.o_proj.lora_B",
+            "percent": 0.21572990806421785
+          },
+          {
+            "milliseconds": 0.054240000000000003,
+            "name": "backward.layers.3.attention.v_proj.lora_B",
+            "percent": 0.21572990806421785
+          },
+          {
+            "milliseconds": 0.054208000000000006,
+            "name": "backward.layers.1.attention.q_proj.lora_B",
+            "percent": 0.21560263378217406
+          },
+          {
+            "milliseconds": 0.054208,
+            "name": "backward.layers.3.mlp.up_proj.lora_B",
+            "percent": 0.21560263378217404
+          },
+          {
+            "milliseconds": 0.054208,
+            "name": "backward.layers.3.mlp.gate_proj.lora_B",
+            "percent": 0.21560263378217404
+          },
+          {
+            "milliseconds": 0.054112,
+            "name": "backward.layers.1.attention.k_proj.lora_B",
+            "percent": 0.21522081093604267
+          },
+          {
+            "milliseconds": 0.054112,
+            "name": "backward.layers.0.attention.k_proj.lora_B",
+            "percent": 0.21522081093604267
+          },
+          {
+            "milliseconds": 0.05408,
+            "name": "backward.layers.3.attention.k_proj.lora_B",
+            "percent": 0.2150935366539989
+          },
+          {
+            "milliseconds": 0.05408,
+            "name": "backward.layers.2.attention.v_proj.lora_B",
+            "percent": 0.2150935366539989
+          },
+          {
+            "milliseconds": 0.05408,
+            "name": "backward.layers.0.attention.q_proj.lora_B",
+            "percent": 0.2150935366539989
+          },
+          {
+            "milliseconds": 0.054079999999999996,
+            "name": "backward.layers.2.attention.o_proj.lora_B",
+            "percent": 0.21509353665399888
+          },
+          {
+            "milliseconds": 0.054079999999999996,
+            "name": "backward.layers.0.mlp.up_proj.lora_B",
+            "percent": 0.21509353665399888
+          },
+          {
+            "milliseconds": 0.054079999999999996,
+            "name": "backward.layers.0.attention.v_proj.lora_B",
+            "percent": 0.21509353665399888
+          },
+          {
+            "milliseconds": 0.054048,
+            "name": "backward.layers.0.mlp.gate_proj.lora_B",
+            "percent": 0.2149662623719551
+          },
+          {
+            "milliseconds": 0.054016,
+            "name": "backward.layers.2.attention.k_proj.lora_B",
+            "percent": 0.21483898808991134
+          },
+          {
+            "milliseconds": 0.054015999999999995,
+            "name": "backward.layers.2.mlp.down_proj.lora_B",
+            "percent": 0.2148389880899113
+          },
+          {
+            "milliseconds": 0.054015999999999995,
+            "name": "backward.layers.1.attention.v_proj.lora_B",
+            "percent": 0.2148389880899113
+          },
+          {
+            "milliseconds": 0.053984,
+            "name": "backward.layers.2.mlp.gate_proj.lora_B",
+            "percent": 0.21471171380786752
+          },
+          {
+            "milliseconds": 0.053984,
+            "name": "backward.layers.2.attention.q_proj.lora_B",
+            "percent": 0.21471171380786752
+          },
+          {
+            "milliseconds": 0.05392,
+            "name": "backward.layers.1.mlp.gate_proj.lora_B",
+            "percent": 0.21445716524377997
+          },
+          {
+            "milliseconds": 0.053888,
+            "name": "backward.layers.1.mlp.up_proj.lora_B",
+            "percent": 0.21432989096173619
+          },
+          {
+            "milliseconds": 0.053888,
+            "name": "backward.layers.0.mlp.down_proj.lora_B",
+            "percent": 0.21432989096173619
+          },
+          {
+            "milliseconds": 0.053856,
+            "name": "backward.layers.1.mlp.down_proj.lora_B",
+            "percent": 0.2142026166796924
+          },
+          {
+            "milliseconds": 0.053344,
+            "name": "backward.layers.2.mlp.up_proj.lora_A",
+            "percent": 0.21216622816699182
+          },
+          {
+            "milliseconds": 0.053152,
+            "name": "backward.layers.1.mlp.up_proj.lora_A",
+            "percent": 0.2114025824747291
+          },
+          {
+            "milliseconds": 0.05312,
+            "name": "backward.layers.2.mlp.gate_proj.lora_A",
+            "percent": 0.2112753081926853
+          },
+          {
+            "milliseconds": 0.053024,
+            "name": "backward.layers.3.mlp.up_proj.lora_A",
+            "percent": 0.21089348534655397
+          },
+          {
+            "milliseconds": 0.053024,
+            "name": "backward.layers.3.attention.k_proj.lora_A",
+            "percent": 0.21089348534655397
+          },
+          {
+            "milliseconds": 0.053024,
+            "name": "backward.layers.0.attention.o_proj.lora_A",
+            "percent": 0.21089348534655397
+          },
+          {
+            "milliseconds": 0.052992,
+            "name": "backward.layers.0.mlp.gate_proj.lora_A",
+            "percent": 0.21076621106451016
+          },
+          {
+            "milliseconds": 0.052928,
+            "name": "backward.layers.2.attention.q_proj.lora_A",
+            "percent": 0.2105116625004226
+          },
+          {
+            "milliseconds": 0.052928,
+            "name": "backward.layers.1.attention.o_proj.lora_A",
+            "percent": 0.2105116625004226
+          },
+          {
+            "milliseconds": 0.052927999999999996,
+            "name": "backward.layers.1.mlp.gate_proj.lora_A",
+            "percent": 0.21051166250042258
+          },
+          {
+            "milliseconds": 0.052896000000000006,
+            "name": "backward.layers.2.attention.v_proj.lora_A",
+            "percent": 0.21038438821837885
+          },
+          {
+            "milliseconds": 0.052896000000000006,
+            "name": "backward.layers.1.attention.v_proj.lora_A",
+            "percent": 0.21038438821837885
+          },
+          {
+            "milliseconds": 0.052896000000000006,
+            "name": "backward.layers.1.attention.q_proj.lora_A",
+            "percent": 0.21038438821837885
+          },
+          {
+            "milliseconds": 0.052896000000000006,
+            "name": "backward.layers.0.attention.v_proj.lora_A",
+            "percent": 0.21038438821837885
+          },
+          {
+            "milliseconds": 0.052896000000000006,
+            "name": "backward.layers.0.attention.q_proj.lora_A",
+            "percent": 0.21038438821837885
+          },
+          {
+            "milliseconds": 0.052896,
+            "name": "backward.layers.0.mlp.up_proj.lora_A",
+            "percent": 0.21038438821837882
+          },
+          {
+            "milliseconds": 0.052864,
+            "name": "backward.layers.3.attention.v_proj.lora_A",
+            "percent": 0.21025711393633503
+          },
+          {
+            "milliseconds": 0.052864,
+            "name": "backward.layers.3.attention.q_proj.lora_A",
+            "percent": 0.21025711393633503
+          },
+          {
+            "milliseconds": 0.0528,
+            "name": "backward.layers.3.mlp.gate_proj.lora_A",
+            "percent": 0.21000256537224746
+          },
+          {
+            "milliseconds": 0.0528,
+            "name": "backward.layers.3.attention.o_proj.lora_A",
+            "percent": 0.21000256537224746
+          },
+          {
+            "milliseconds": 0.0528,
+            "name": "backward.layers.2.attention.o_proj.lora_A",
+            "percent": 0.21000256537224746
+          },
+          {
+            "milliseconds": 0.0528,
+            "name": "backward.layers.1.attention.k_proj.lora_A",
+            "percent": 0.21000256537224746
+          },
+          {
+            "milliseconds": 0.052767999999999995,
+            "name": "backward.layers.0.attention.k_proj.lora_A",
+            "percent": 0.20987529109020364
+          },
+          {
+            "milliseconds": 0.052736,
+            "name": "backward.layers.2.attention.k_proj.lora_A",
+            "percent": 0.20974801680815988
+          },
+          {
+            "milliseconds": 0.01536,
+            "name": "backward.layers.1.mlp.gate_proj.base_dx_asymgemm",
+            "percent": 0.06109165538101744
+          },
+          {
+            "milliseconds": 0.014624,
+            "name": "backward.layers.0.mlp.up_proj.base_dx_asymgemm",
+            "percent": 0.05816434689401035
+          },
+          {
+            "milliseconds": 0.014048,
+            "name": "backward.layers.0.mlp.gate_proj.base_dx_asymgemm",
+            "percent": 0.0558734098172222
+          },
+          {
+            "milliseconds": 0.013952,
+            "name": "backward.layers.3.mlp.up_proj.base_dx_asymgemm",
+            "percent": 0.05549158697109084
+          },
+          {
+            "milliseconds": 0.013536,
+            "name": "backward.layers.3.mlp.layernorm",
+            "percent": 0.053837021304521615
+          },
+          {
+            "milliseconds": 0.013504,
+            "name": "backward.layers.3.mlp.gate_proj.base_dx_asymgemm",
+            "percent": 0.053709747022477834
+          },
+          {
+            "milliseconds": 0.013472,
+            "name": "backward.layers.1.mlp.up_proj.base_dx_asymgemm",
+            "percent": 0.053582472740434046
+          },
+          {
+            "milliseconds": 0.013376,
+            "name": "backward.final_norm",
+            "percent": 0.05320064989430269
+          },
+          {
+            "milliseconds": 0.013376,
+            "name": "backward.layers.0.attention.layernorm",
+            "percent": 0.05320064989430269
+          },
+          {
+            "milliseconds": 0.01328,
+            "name": "backward.layers.2.mlp.layernorm",
+            "percent": 0.05281882704817133
+          },
+          {
+            "milliseconds": 0.01328,
+            "name": "backward.layers.1.mlp.layernorm",
+            "percent": 0.05281882704817133
+          },
+          {
+            "milliseconds": 0.013184,
+            "name": "backward.layers.2.mlp.up_proj.base_dx_asymgemm",
+            "percent": 0.05243700420203997
+          },
+          {
+            "milliseconds": 0.01312,
+            "name": "backward.layers.0.mlp.layernorm",
+            "percent": 0.052182455637952395
+          },
+          {
+            "milliseconds": 0.013088,
+            "name": "backward.layers.3.attention.layernorm",
+            "percent": 0.05205518135590861
+          },
+          {
+            "milliseconds": 0.013056,
+            "name": "backward.layers.2.mlp.gate_proj.base_dx_asymgemm",
+            "percent": 0.051927907073864826
+          },
+          {
+            "milliseconds": 0.013056,
+            "name": "backward.layers.2.attention.layernorm",
+            "percent": 0.051927907073864826
+          },
+          {
+            "milliseconds": 0.013056,
+            "name": "backward.layers.1.attention.layernorm",
+            "percent": 0.051927907073864826
+          },
+          {
+            "milliseconds": 0.008416,
+            "name": "backward.layers.0.mlp.down_proj.base_dx_asymgemm",
+            "percent": 0.03347313617751581
+          },
+          {
+            "milliseconds": 0.008384,
+            "name": "backward.layers.2.mlp.down_proj.base_dx_asymgemm",
+            "percent": 0.03334586189547202
+          },
+          {
+            "milliseconds": 0.008192,
+            "name": "backward.layers.3.mlp.down_proj.base_dx_asymgemm",
+            "percent": 0.0325822162032093
+          },
+          {
+            "milliseconds": 0.008192,
+            "name": "backward.layers.1.mlp.down_proj.base_dx_asymgemm",
+            "percent": 0.0325822162032093
+          },
+          {
+            "milliseconds": 0.008096,
+            "name": "backward.layers.0.attention.o_proj.base_dx_asymgemm",
+            "percent": 0.032200393357077944
+          },
+          {
+            "milliseconds": 0.00784,
+            "name": "backward.layers.2.attention.q_proj.base_dx_asymgemm",
+            "percent": 0.031182199100727653
+          },
+          {
+            "milliseconds": 0.007776,
+            "name": "backward.layers.0.attention.q_proj.base_dx_asymgemm",
+            "percent": 0.030927650536640077
+          },
+          {
+            "milliseconds": 0.007744,
+            "name": "backward.layers.3.attention.q_proj.base_dx_asymgemm",
+            "percent": 0.030800376254596293
+          },
+          {
+            "milliseconds": 0.007744,
+            "name": "backward.layers.2.attention.v_proj.base_dx_asymgemm",
+            "percent": 0.030800376254596293
+          },
+          {
+            "milliseconds": 0.007744,
+            "name": "backward.layers.0.attention.v_proj.base_dx_asymgemm",
+            "percent": 0.030800376254596293
+          },
+          {
+            "milliseconds": 0.007712,
+            "name": "backward.layers.2.attention.k_proj.base_dx_asymgemm",
+            "percent": 0.030673101972552505
+          },
+          {
+            "milliseconds": 0.00768,
+            "name": "backward.layers.2.attention.o_proj.base_dx_asymgemm",
+            "percent": 0.03054582769050872
+          },
+          {
+            "milliseconds": 0.00768,
+            "name": "backward.layers.1.attention.v_proj.base_dx_asymgemm",
+            "percent": 0.03054582769050872
+          },
+          {
+            "milliseconds": 0.007648,
+            "name": "backward.layers.1.mlp.down_proj.lora_A",
+            "percent": 0.030418553408464933
+          },
+          {
+            "milliseconds": 0.007648,
+            "name": "backward.layers.1.attention.q_proj.base_dx_asymgemm",
+            "percent": 0.030418553408464933
+          },
+          {
+            "milliseconds": 0.007648,
+            "name": "backward.layers.0.attention.k_proj.base_dx_asymgemm",
+            "percent": 0.030418553408464933
+          },
+          {
+            "milliseconds": 0.007616,
+            "name": "backward.layers.3.attention.o_proj.base_dx_asymgemm",
+            "percent": 0.03029127912642115
+          },
+          {
+            "milliseconds": 0.0076159999999999995,
+            "name": "backward.layers.2.mlp.down_proj.lora_A",
+            "percent": 0.030291279126421145
+          },
+          {
+            "milliseconds": 0.007584,
+            "name": "backward.layers.3.attention.v_proj.base_dx_asymgemm",
+            "percent": 0.030164004844377357
+          },
+          {
+            "milliseconds": 0.007584,
+            "name": "backward.layers.1.attention.o_proj.base_dx_asymgemm",
+            "percent": 0.030164004844377357
+          },
+          {
+            "milliseconds": 0.007552,
+            "name": "backward.layers.3.attention.k_proj.base_dx_asymgemm",
+            "percent": 0.030036730562333573
+          },
+          {
+            "milliseconds": 0.007552,
+            "name": "backward.layers.1.attention.k_proj.base_dx_asymgemm",
+            "percent": 0.030036730562333573
+          },
+          {
+            "milliseconds": 0.007520000000000001,
+            "name": "backward.layers.0.mlp.down_proj.lora_A",
+            "percent": 0.029909456280289792
+          },
+          {
+            "milliseconds": 0.007455999999999999,
+            "name": "backward.layers.3.mlp.down_proj.lora_A",
+            "percent": 0.029654907716202213
+          },
+          {
+            "milliseconds": 0.006304,
+            "name": "backward.layers.1.mlp.silu_mul_activation",
+            "percent": 0.025073033562625906
+          },
+          {
+            "milliseconds": 0.00624,
+            "name": "backward.layers.3.mlp.silu_mul_activation",
+            "percent": 0.024818484998538334
+          },
+          {
+            "milliseconds": 0.00624,
+            "name": "backward.layers.2.mlp.silu_mul_activation",
+            "percent": 0.024818484998538334
+          },
+          {
+            "milliseconds": 0.006208,
+            "name": "backward.layers.0.mlp.silu_mul_activation",
+            "percent": 0.02469121071649455
+          },
+          {
+            "milliseconds": 0.005664,
+            "name": "backward.layers.2.attention.value_matmul.lhs_grad",
+            "percent": 0.02252754792175018
+          },
+          {
+            "milliseconds": 0.005664,
+            "name": "backward.layers.0.attention.value_matmul.lhs_grad",
+            "percent": 0.02252754792175018
+          },
+          {
+            "milliseconds": 0.005632,
+            "name": "backward.layers.3.attention.value_matmul.lhs_grad",
+            "percent": 0.022400273639706394
+          },
+          {
+            "milliseconds": 0.0056,
+            "name": "backward.layers.1.attention.value_matmul.lhs_grad",
+            "percent": 0.022272999357662606
+          },
+          {
+            "milliseconds": 0.00544,
+            "name": "backward.loss.cross_entropy",
+            "percent": 0.021636627947443678
+          },
+          {
+            "milliseconds": 0.005408,
+            "name": "backward.layers.2.attention.softmax",
+            "percent": 0.021509353665399886
+          },
+          {
+            "milliseconds": 0.005344,
+            "name": "backward.layers.1.attention.softmax",
+            "percent": 0.021254805101312318
+          },
+          {
+            "milliseconds": 0.005312,
+            "name": "backward.layers.3.attention.softmax",
+            "percent": 0.02112753081926853
+          },
+          {
+            "milliseconds": 0.005152,
+            "name": "backward.layers.0.attention.softmax",
+            "percent": 0.020491159409049598
+          },
+          {
+            "milliseconds": 0.004288,
+            "name": "backward.layers.3.attention.v_proj.base_lora_add",
+            "percent": 0.01705475379386737
+          },
+          {
+            "milliseconds": 0.004224,
+            "name": "backward.layers.2.attention.v_proj.base_lora_add",
+            "percent": 0.016800205229779798
+          },
+          {
+            "milliseconds": 0.004224,
+            "name": "backward.layers.1.attention.v_proj.base_lora_add",
+            "percent": 0.016800205229779798
+          },
+          {
+            "milliseconds": 0.00416,
+            "name": "backward.layers.3.mlp.gate_proj.base_lora_add",
+            "percent": 0.016545656665692222
+          },
+          {
+            "milliseconds": 0.00416,
+            "name": "backward.layers.0.attention.q_proj.base_lora_add",
+            "percent": 0.016545656665692222
+          },
+          {
+            "milliseconds": 0.004128,
+            "name": "backward.layers.2.mlp.gate_proj.base_lora_add",
+            "percent": 0.016418382383648435
+          },
+          {
+            "milliseconds": 0.004128,
+            "name": "backward.layers.2.attention.k_proj.base_lora_add",
+            "percent": 0.016418382383648435
+          },
+          {
+            "milliseconds": 0.004128,
+            "name": "backward.layers.2.attention.q_proj.base_lora_add",
+            "percent": 0.016418382383648435
+          },
+          {
+            "milliseconds": 0.004128,
+            "name": "backward.layers.1.attention.k_proj.base_lora_add",
+            "percent": 0.016418382383648435
+          },
+          {
+            "milliseconds": 0.004128,
+            "name": "backward.layers.0.attention.v_proj.base_lora_add",
+            "percent": 0.016418382383648435
+          },
+          {
+            "milliseconds": 0.004096,
+            "name": "backward.layers.1.attention.q_proj.base_lora_add",
+            "percent": 0.01629110810160465
+          },
+          {
+            "milliseconds": 0.004064,
+            "name": "backward.layers.3.attention.k_proj.base_lora_add",
+            "percent": 0.016163833819560863
+          },
+          {
+            "milliseconds": 0.004064,
+            "name": "backward.layers.3.attention.q_proj.base_lora_add",
+            "percent": 0.016163833819560863
+          },
+          {
+            "milliseconds": 0.004064,
+            "name": "backward.layers.1.mlp.gate_proj.base_lora_add",
+            "percent": 0.016163833819560863
+          },
+          {
+            "milliseconds": 0.004064,
+            "name": "backward.layers.0.mlp.gate_proj.base_lora_add",
+            "percent": 0.016163833819560863
+          },
+          {
+            "milliseconds": 0.003968,
+            "name": "backward.layers.3.attention.scores_matmul.lhs_grad",
+            "percent": 0.015782010973429506
+          },
+          {
+            "milliseconds": 0.003968,
+            "name": "backward.layers.0.mlp.residual_add",
+            "percent": 0.015782010973429506
+          },
+          {
+            "milliseconds": 0.003936,
+            "name": "backward.layers.3.mlp.residual_add",
+            "percent": 0.01565473669138572
+          },
+          {
+            "milliseconds": 0.003904,
+            "name": "backward.layers.2.mlp.residual_add",
+            "percent": 0.01552746240934193
+          },
+          {
+            "milliseconds": 0.003904,
+            "name": "backward.layers.1.attention.residual_add",
+            "percent": 0.01552746240934193
+          },
+          {
+            "milliseconds": 0.003904,
+            "name": "backward.layers.0.attention.scores_matmul.lhs_grad",
+            "percent": 0.01552746240934193
+          },
+          {
+            "milliseconds": 0.003904,
+            "name": "backward.layers.0.attention.k_proj.base_lora_add",
+            "percent": 0.01552746240934193
+          },
+          {
+            "milliseconds": 0.003872,
+            "name": "backward.layers.1.mlp.residual_add",
+            "percent": 0.015400188127298146
+          },
+          {
+            "milliseconds": 0.003872,
+            "name": "backward.layers.1.attention.scores_matmul.lhs_grad",
+            "percent": 0.015400188127298146
+          },
+          {
+            "milliseconds": 0.003872,
+            "name": "backward.layers.0.attention.residual_add",
+            "percent": 0.015400188127298146
+          },
+          {
+            "milliseconds": 0.00384,
+            "name": "backward.layers.3.attention.residual_add",
+            "percent": 0.01527291384525436
+          },
+          {
+            "milliseconds": 0.00384,
+            "name": "backward.layers.2.attention.residual_add",
+            "percent": 0.01527291384525436
+          },
+          {
+            "milliseconds": 0.00384,
+            "name": "backward.layers.2.attention.scores_matmul.lhs_grad",
+            "percent": 0.01527291384525436
+          },
+          {
+            "milliseconds": 0.003776,
+            "name": "backward.layers.3.mlp.up_proj.base_lora_add",
+            "percent": 0.015018365281166787
+          },
+          {
+            "milliseconds": 0.003776,
+            "name": "backward.layers.2.mlp.up_proj.base_lora_add",
+            "percent": 0.015018365281166787
+          },
+          {
+            "milliseconds": 0.003776,
+            "name": "backward.layers.1.mlp.up_proj.base_lora_add",
+            "percent": 0.015018365281166787
+          },
+          {
+            "milliseconds": 0.003776,
+            "name": "backward.layers.0.mlp.up_proj.base_lora_add",
+            "percent": 0.015018365281166787
+          },
+          {
+            "milliseconds": 0.003744,
+            "name": "backward.layers.3.attention.value_matmul.rhs_grad",
+            "percent": 0.014891090999123
+          },
+          {
+            "milliseconds": 0.003744,
+            "name": "backward.layers.2.mlp.down_proj.base_lora_add",
+            "percent": 0.014891090999123
+          },
+          {
+            "milliseconds": 0.003744,
+            "name": "backward.layers.2.attention.o_proj.base_lora_add",
+            "percent": 0.014891090999123
+          },
+          {
+            "milliseconds": 0.003744,
+            "name": "backward.layers.2.attention.value_matmul.rhs_grad",
+            "percent": 0.014891090999123
+          },
+          {
+            "milliseconds": 0.003744,
+            "name": "backward.layers.0.attention.o_proj.base_lora_add",
+            "percent": 0.014891090999123
+          },
+          {
+            "milliseconds": 0.003744,
+            "name": "backward.layers.0.attention.value_matmul.rhs_grad",
+            "percent": 0.014891090999123
+          },
+          {
+            "milliseconds": 0.003712,
+            "name": "backward.layers.3.mlp.down_proj.base_lora_add",
+            "percent": 0.014763816717079213
+          },
+          {
+            "milliseconds": 0.003712,
+            "name": "backward.layers.3.attention.o_proj.base_lora_add",
+            "percent": 0.014763816717079213
+          },
+          {
+            "milliseconds": 0.003712,
+            "name": "backward.layers.1.attention.o_proj.base_lora_add",
+            "percent": 0.014763816717079213
+          },
+          {
+            "milliseconds": 0.003712,
+            "name": "backward.layers.1.attention.value_matmul.rhs_grad",
+            "percent": 0.014763816717079213
+          },
+          {
+            "milliseconds": 0.003712,
+            "name": "backward.layers.0.mlp.down_proj.base_lora_add",
+            "percent": 0.014763816717079213
+          },
+          {
+            "milliseconds": 0.00368,
+            "name": "backward.layers.1.mlp.down_proj.base_lora_add",
+            "percent": 0.014636542435035428
+          },
+          {
+            "milliseconds": 0.003488,
+            "name": "backward.layers.3.attention.scores_matmul.rhs_grad",
+            "percent": 0.01387289674277271
+          },
+          {
+            "milliseconds": 0.003456,
+            "name": "backward.layers.1.attention.scores_matmul.rhs_grad",
+            "percent": 0.013745622460728923
+          },
+          {
+            "milliseconds": 0.003456,
+            "name": "backward.layers.0.attention.scores_matmul.rhs_grad",
+            "percent": 0.013745622460728923
+          },
+          {
+            "milliseconds": 0.003424,
+            "name": "backward.layers.2.attention.scores_matmul.rhs_grad",
+            "percent": 0.013618348178685137
+          },
+          {
+            "milliseconds": 0.002944,
+            "name": "backward.layers.3.mlp.gate_proj.add_cast_scale",
+            "percent": 0.011709233948028343
+          },
+          {
+            "milliseconds": 0.002912,
+            "name": "backward.layers.2.mlp.up_proj.add_cast_scale",
+            "percent": 0.011581959665984557
+          },
+          {
+            "milliseconds": 0.002912,
+            "name": "backward.layers.2.mlp.gate_proj.add_cast_scale",
+            "percent": 0.011581959665984557
+          },
+          {
+            "milliseconds": 0.002912,
+            "name": "backward.layers.2.attention.k_proj.add_cast_scale",
+            "percent": 0.011581959665984557
+          },
+          {
+            "milliseconds": 0.002912,
+            "name": "backward.layers.1.attention.k_proj.add_cast_scale",
+            "percent": 0.011581959665984557
+          },
+          {
+            "milliseconds": 0.00288,
+            "name": "backward.layers.3.mlp.down_proj.add_cast_scale",
+            "percent": 0.01145468538394077
+          },
+          {
+            "milliseconds": 0.00288,
+            "name": "backward.layers.3.attention.o_proj.add_cast_scale",
+            "percent": 0.01145468538394077
+          },
+          {
+            "milliseconds": 0.00288,
+            "name": "backward.layers.3.attention.k_proj.add_cast_scale",
+            "percent": 0.01145468538394077
+          },
+          {
+            "milliseconds": 0.00288,
+            "name": "backward.layers.2.mlp.down_proj.add_cast_scale",
+            "percent": 0.01145468538394077
+          },
+          {
+            "milliseconds": 0.00288,
+            "name": "backward.layers.2.attention.v_proj.add_cast_scale",
+            "percent": 0.01145468538394077
+          },
+          {
+            "milliseconds": 0.00288,
+            "name": "backward.layers.1.mlp.down_proj.add_cast_scale",
+            "percent": 0.01145468538394077
+          },
+          {
+            "milliseconds": 0.00288,
+            "name": "backward.layers.1.mlp.up_proj.add_cast_scale",
+            "percent": 0.01145468538394077
+          },
+          {
+            "milliseconds": 0.00288,
+            "name": "backward.layers.1.mlp.gate_proj.add_cast_scale",
+            "percent": 0.01145468538394077
+          },
+          {
+            "milliseconds": 0.00288,
+            "name": "backward.layers.1.attention.o_proj.add_cast_scale",
+            "percent": 0.01145468538394077
+          },
+          {
+            "milliseconds": 0.00288,
+            "name": "backward.layers.1.attention.v_proj.add_cast_scale",
+            "percent": 0.01145468538394077
+          },
+          {
+            "milliseconds": 0.00288,
+            "name": "backward.layers.0.mlp.up_proj.add_cast_scale",
+            "percent": 0.01145468538394077
+          },
+          {
+            "milliseconds": 0.00288,
+            "name": "backward.layers.0.mlp.gate_proj.add_cast_scale",
+            "percent": 0.01145468538394077
+          },
+          {
+            "milliseconds": 0.00288,
+            "name": "backward.layers.0.attention.v_proj.add_cast_scale",
+            "percent": 0.01145468538394077
+          },
+          {
+            "milliseconds": 0.002848,
+            "name": "backward.layers.3.attention.v_proj.add_cast_scale",
+            "percent": 0.011327411101896983
+          },
+          {
+            "milliseconds": 0.002848,
+            "name": "backward.layers.0.attention.k_proj.add_cast_scale",
+            "percent": 0.011327411101896983
+          },
+          {
+            "milliseconds": 0.002816,
+            "name": "backward.layers.3.mlp.up_proj.add_cast_scale",
+            "percent": 0.011200136819853197
+          },
+          {
+            "milliseconds": 0.002816,
+            "name": "backward.layers.2.attention.o_proj.add_cast_scale",
+            "percent": 0.011200136819853197
+          },
+          {
+            "milliseconds": 0.002816,
+            "name": "backward.layers.2.attention.q_proj.add_cast_scale",
+            "percent": 0.011200136819853197
+          },
+          {
+            "milliseconds": 0.002816,
+            "name": "backward.layers.1.attention.q_proj.add_cast_scale",
+            "percent": 0.011200136819853197
+          },
+          {
+            "milliseconds": 0.002816,
+            "name": "backward.layers.0.mlp.down_proj.add_cast_scale",
+            "percent": 0.011200136819853197
+          },
+          {
+            "milliseconds": 0.002816,
+            "name": "backward.layers.0.attention.o_proj.add_cast_scale",
+            "percent": 0.011200136819853197
+          },
+          {
+            "milliseconds": 0.002752,
+            "name": "backward.layers.3.attention.q_proj.add_cast_scale",
+            "percent": 0.010945588255765625
+          },
+          {
+            "milliseconds": 0.002752,
+            "name": "backward.layers.0.attention.q_proj.add_cast_scale",
+            "percent": 0.010945588255765625
+          },
+          {
+            "milliseconds": 0.00272,
+            "name": "backward.lm_head",
+            "percent": 0.010818313973721839
+          }
+        ],
+        "total_milliseconds": 25.14255
+      },
+      "stage": "step.backward",
+      "stage_breakdown": {
+        "rows": [
+          {
+            "milliseconds": 21.395253999999998,
+            "name": "gpu_no_kernel_time",
+            "percent": 85.09579974982648
+          },
+          {
+            "milliseconds": 3.697216,
+            "name": "cuda_kernel_busy_union",
+            "percent": 14.705015998774986
+          },
+          {
+            "milliseconds": 0.05008,
+            "name": "cuda_memcpy_union",
+            "percent": 0.1991842513985256
+          }
+        ],
+        "total_milliseconds": 25.14255
+      },
+      "top_kernels": [
+        {
+          "milliseconds": 2.650368,
+          "name": "sm80_xmma_gemm_f32f32_f32f32_f32_nn_n_tilesize32x128x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+          "percent": 10.541365135994559
+        },
+        {
+          "milliseconds": 0.174848,
+          "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>, (int)4, TrivialOffsetCalculator<(int)1, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)1>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+          "percent": 0.6954266770872485
+        },
+        {
+          "milliseconds": 0.155744,
+          "name": "sm80_xmma_gemm_f32f32_f32f32_f32_nt_n_tilesize32x32x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+          "percent": 0.619443930707108
+        },
+        {
+          "milliseconds": 0.109408,
+          "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)16, (unsigned int)128, (unsigned int)128, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)2, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "percent": 0.4351507703077055
+        },
+        {
+          "milliseconds": 0.1072,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.42636884484668425
+        },
+        {
+          "milliseconds": 0.104256,
+          "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)16, (unsigned int)128, (unsigned int)256, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)2, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "percent": 0.41465961089865583
+        },
+        {
+          "milliseconds": 0.055776,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.22183907360231958
+        },
+        {
+          "milliseconds": 0.042272,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+          "percent": 0.16812932657984173
+        },
+        {
+          "milliseconds": 0.03584,
+          "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::MeanOps<float, float, float, float>, unsigned int, float, (int)4, (int)4>>(T3)",
+          "percent": 0.14254719588904066
+        },
+        {
+          "milliseconds": 0.035424,
+          "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+          "percent": 0.14089263022247145
+        },
+        {
+          "milliseconds": 0.034432,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+          "percent": 0.13694712747911408
+        },
+        {
+          "milliseconds": 0.03152,
+          "name": "sm80_xmma_gemm_f32f32_f32f32_f32_nn_n_tilesize32x32x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+          "percent": 0.12536516781312954
+        },
+        {
+          "milliseconds": 0.030176,
+          "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)]>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+          "percent": 0.12001964796729052
+        },
+        {
+          "milliseconds": 0.029376,
+          "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)16, (unsigned int)256, (unsigned int)128, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)4, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "percent": 0.11683779091619584
+        },
+        {
+          "milliseconds": 0.0232,
+          "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 12)]::operator ()() const::[lambda(c10::BFloat16) (instance 1)]>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+          "percent": 0.09227385448174508
+        },
+        {
+          "milliseconds": 0.017344,
+          "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_add<float>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+          "percent": 0.06898266086773219
+        },
+        {
+          "milliseconds": 0.014304,
+          "name": "void cutlass::Kernel2<cutlass_80_simt_sgemm_128x32_8x5_nn_align1>(T1::Params)",
+          "percent": 0.056891604073572494
+        },
+        {
+          "milliseconds": 0.008256,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctor_add<float>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+          "percent": 0.03283676476729687
+        },
+        {
+          "milliseconds": 0.007712,
+          "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::native::sum_functor<float, float, float>::operator ()(at::TensorIterator &)::[lambda(float, float) (instance 1)]>, unsigned int, float, (int)4, (int)4>>(T3)",
+          "percent": 0.030673101972552505
+        },
+        {
+          "milliseconds": 0.005344,
+          "name": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+          "percent": 0.021254805101312318
+        }
+      ],
+      "total_milliseconds": 25.14255
+    }
+  ]
+}

@@ -1,0 +1,437 @@
+{
+  "source": "reports/test_base_dx_nsys2.sqlite",
+  "stages": [
+    {
+      "host_api_breakdown": {
+        "rows": [
+          {
+            "milliseconds": 0.279041,
+            "name": "cuda_runtime_api_sum_overlaps_gpu_timeline",
+            "percent": 14.423362206832671
+          },
+          {
+            "milliseconds": 0.029759,
+            "name": "cuda_synchronization_api_sum_overlaps_gpu_timeline",
+            "percent": 1.5382142262718865
+          }
+        ],
+        "total_milliseconds": 1.934646
+      },
+      "operation_cuda_api_time": {
+        "rows": [
+          {
+            "milliseconds": 0.064536,
+            "name": "forward.fc1.base_frozen_asymgemm",
+            "percent": 3.3358040695817217
+          },
+          {
+            "milliseconds": 0.049346,
+            "name": "forward.fc2.base_frozen_asymgemm",
+            "percent": 2.5506475086398233
+          },
+          {
+            "milliseconds": 0.043736,
+            "name": "forward.fc1.add_cast_scale",
+            "percent": 2.26067197823271
+          },
+          {
+            "milliseconds": 0.034987,
+            "name": "forward.fc2.add_cast_scale",
+            "percent": 1.808444542309032
+          },
+          {
+            "milliseconds": 0.030401,
+            "name": "forward.fc1.lora_A",
+            "percent": 1.5713985917837165
+          },
+          {
+            "milliseconds": 0.020801,
+            "name": "forward.fc2.lora_A",
+            "percent": 1.075183780391865
+          },
+          {
+            "milliseconds": 0.013112,
+            "name": "forward.fc2.lora_B",
+            "percent": 0.6777467298927039
+          },
+          {
+            "milliseconds": 0.008557,
+            "name": "forward.fc1.lora_B",
+            "percent": 0.442303139695841
+          },
+          {
+            "milliseconds": 0.006382,
+            "name": "forward.activation_relu",
+            "percent": 0.3298794714898746
+          }
+        ],
+        "total_milliseconds": 1.934646
+      },
+      "operation_kernel_time": {
+        "rows": [
+          {
+            "milliseconds": 0.056384,
+            "name": "forward.fc1.base_frozen_asymgemm",
+            "percent": 2.9144349922414743
+          },
+          {
+            "milliseconds": 0.022336,
+            "name": "forward.fc2.base_frozen_asymgemm",
+            "percent": 1.1545264611717079
+          },
+          {
+            "milliseconds": 0.009696,
+            "name": "forward.fc1.add_cast_scale",
+            "percent": 0.50117695950577
+          },
+          {
+            "milliseconds": 0.009504,
+            "name": "forward.fc2.add_cast_scale",
+            "percent": 0.491252663277933
+          },
+          {
+            "milliseconds": 0.007968,
+            "name": "forward.fc1.lora_A",
+            "percent": 0.4118582934552367
+          },
+          {
+            "milliseconds": 0.007936,
+            "name": "forward.fc2.lora_A",
+            "percent": 0.41020424408393064
+          },
+          {
+            "milliseconds": 0.007008,
+            "name": "forward.fc2.lora_B",
+            "percent": 0.36223681231605165
+          },
+          {
+            "milliseconds": 0.0024,
+            "name": "forward.fc1.lora_B",
+            "percent": 0.12405370284796287
+          },
+          {
+            "milliseconds": 0.001024,
+            "name": "forward.activation_relu",
+            "percent": 0.05292957988179749
+          }
+        ],
+        "total_milliseconds": 1.934646
+      },
+      "stage": "step.forward",
+      "stage_breakdown": {
+        "rows": [
+          {
+            "milliseconds": 1.807414,
+            "name": "gpu_no_kernel_time",
+            "percent": 93.42349969968666
+          },
+          {
+            "milliseconds": 0.124256,
+            "name": "cuda_kernel_busy_union",
+            "percent": 6.422673708781865
+          },
+          {
+            "milliseconds": 0.002976,
+            "name": "cuda_memcpy_union",
+            "percent": 0.15382659153147396
+          }
+        ],
+        "total_milliseconds": 1.934646
+      },
+      "top_kernels": [
+        {
+          "milliseconds": 0.05536,
+          "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)256, (unsigned int)512, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)4, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "percent": 2.861505412359677
+        },
+        {
+          "milliseconds": 0.021472,
+          "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)128, (unsigned int)512, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)2, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "percent": 1.1098671281464414
+        },
+        {
+          "milliseconds": 0.014496,
+          "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>, (int)4, TrivialOffsetCalculator<(int)1, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)1>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+          "percent": 0.7492843652016958
+        },
+        {
+          "milliseconds": 0.008544,
+          "name": "void cutlass::Kernel2<cutlass_80_simt_sgemm_32x128_8x5_tn_align1>(T1::Params)",
+          "percent": 0.4416311821387478
+        },
+        {
+          "milliseconds": 0.005536,
+          "name": "void cutlass::Kernel2<cutlass_80_simt_sgemm_128x128_8x4_tn_align1>(T1::Params)",
+          "percent": 0.28615054123596767
+        },
+        {
+          "milliseconds": 0.00544,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.2811883931220492
+        },
+        {
+          "milliseconds": 0.004096,
+          "name": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+          "percent": 0.21171831952718995
+        },
+        {
+          "milliseconds": 0.003904,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.20179402329935292
+        },
+        {
+          "milliseconds": 0.0024,
+          "name": "sm80_xmma_gemm_f32f32_f32f32_f32_tn_n_tilesize32x32x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+          "percent": 0.12405370284796287
+        },
+        {
+          "milliseconds": 0.001984,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctor_add<float>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+          "percent": 0.10255106102098266
+        },
+        {
+          "milliseconds": 0.001024,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::<unnamed>::launch_clamp_scalar(at::TensorIteratorBase &, c10::Scalar, c10::Scalar, at::native::detail::ClampLimits)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 9)]::operator ()() const::[lambda(c10::BFloat16) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.05292957988179749
+        }
+      ],
+      "total_milliseconds": 1.934646
+    },
+    {
+      "host_api_breakdown": {
+        "rows": [
+          {
+            "milliseconds": 0.336089,
+            "name": "cuda_runtime_api_sum_overlaps_gpu_timeline",
+            "percent": 14.339405771959722
+          },
+          {
+            "milliseconds": 0.028825,
+            "name": "cuda_synchronization_api_sum_overlaps_gpu_timeline",
+            "percent": 1.2298330840245855
+          }
+        ],
+        "total_milliseconds": 2.343814
+      },
+      "operation_cuda_api_time": {
+        "rows": [
+          {
+            "milliseconds": 0.053521,
+            "name": "backward.fc2.base_dx_asymgemm",
+            "percent": 2.2835003118848167
+          },
+          {
+            "milliseconds": 0.043706,
+            "name": "backward.fc1.base_dx_asymgemm",
+            "percent": 1.8647384135430543
+          },
+          {
+            "milliseconds": 0.040998,
+            "name": "backward.loss.mse",
+            "percent": 1.7492002351722449
+          },
+          {
+            "milliseconds": 0.026979,
+            "name": "backward.fc2.lora_B",
+            "percent": 1.151072568045075
+          },
+          {
+            "milliseconds": 0.021077,
+            "name": "backward.fc1.lora_B",
+            "percent": 0.8992607775190351
+          },
+          {
+            "milliseconds": 0.020735,
+            "name": "backward.fc2.lora_A",
+            "percent": 0.884669175967035
+          },
+          {
+            "milliseconds": 0.017444,
+            "name": "backward.fc2.base_lora_add",
+            "percent": 0.7442570101552427
+          },
+          {
+            "milliseconds": 0.016254,
+            "name": "backward.fc1.base_lora_add",
+            "percent": 0.69348506323454
+          },
+          {
+            "milliseconds": 0.016055,
+            "name": "backward.fc1.lora_A",
+            "percent": 0.6849946284133468
+          },
+          {
+            "milliseconds": 0.014394,
+            "name": "backward.activation_relu",
+            "percent": 0.6141272302324331
+          },
+          {
+            "milliseconds": 0.010432,
+            "name": "backward.fc2.add_cast_scale",
+            "percent": 0.44508651283762285
+          },
+          {
+            "milliseconds": 0.008952,
+            "name": "backward.fc1.add_cast_scale",
+            "percent": 0.3819415704488496
+          }
+        ],
+        "total_milliseconds": 2.343814
+      },
+      "operation_kernel_time": {
+        "rows": [
+          {
+            "milliseconds": 0.014048,
+            "name": "backward.fc1.base_dx_asymgemm",
+            "percent": 0.5993649666739767
+          },
+          {
+            "milliseconds": 0.008704,
+            "name": "backward.fc2.base_dx_asymgemm",
+            "percent": 0.3713605260485687
+          },
+          {
+            "milliseconds": 0.008256,
+            "name": "backward.fc2.lora_B",
+            "percent": 0.35224638132548053
+          },
+          {
+            "milliseconds": 0.008192,
+            "name": "backward.fc1.lora_B",
+            "percent": 0.3495157892221823
+          },
+          {
+            "milliseconds": 0.00736,
+            "name": "backward.fc2.lora_A",
+            "percent": 0.3140180918793044
+          },
+          {
+            "milliseconds": 0.007232,
+            "name": "backward.fc1.lora_A",
+            "percent": 0.30855690767270777
+          },
+          {
+            "milliseconds": 0.004768,
+            "name": "backward.activation_relu",
+            "percent": 0.20342911169572328
+          },
+          {
+            "milliseconds": 0.004704,
+            "name": "backward.fc1.base_lora_add",
+            "percent": 0.200698519592425
+          },
+          {
+            "milliseconds": 0.004256,
+            "name": "backward.fc2.base_lora_add",
+            "percent": 0.1815843748693369
+          },
+          {
+            "milliseconds": 0.003424,
+            "name": "backward.fc1.add_cast_scale",
+            "percent": 0.14608667752645899
+          },
+          {
+            "milliseconds": 0.003264,
+            "name": "backward.fc2.add_cast_scale",
+            "percent": 0.13926019726821326
+          },
+          {
+            "milliseconds": 0.002496,
+            "name": "backward.loss.mse",
+            "percent": 0.10649309202863366
+          }
+        ],
+        "total_milliseconds": 2.343814
+      },
+      "stage": "step.backward",
+      "stage_breakdown": {
+        "rows": [
+          {
+            "milliseconds": 2.25863,
+            "name": "gpu_no_kernel_time",
+            "percent": 96.36558191050996
+          },
+          {
+            "milliseconds": 0.082144,
+            "name": "cuda_kernel_busy_union",
+            "percent": 3.504714964583367
+          },
+          {
+            "milliseconds": 0.00304,
+            "name": "cuda_memcpy_union",
+            "percent": 0.12970312490666921
+          }
+        ],
+        "total_milliseconds": 2.343814
+      },
+      "top_kernels": [
+        {
+          "milliseconds": 0.01312,
+          "name": "sm80_xmma_gemm_f32f32_f32f32_f32_nt_n_tilesize32x32x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+          "percent": 0.5597713811761513
+        },
+        {
+          "milliseconds": 0.013088,
+          "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)128, (unsigned int)256, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)2, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "percent": 0.5584060851245022
+        },
+        {
+          "milliseconds": 0.012128,
+          "name": "void cutlass::Kernel2<cutlass_80_simt_sgemm_64x64_8x5_nn_align1>(T1::Params)",
+          "percent": 0.5174472035750277
+        },
+        {
+          "milliseconds": 0.00992,
+          "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>, (int)4, TrivialOffsetCalculator<(int)1, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)1>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+          "percent": 0.42324177601123636
+        },
+        {
+          "milliseconds": 0.007744,
+          "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)256, (unsigned int)128, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)4, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "percent": 0.3304016444990942
+        },
+        {
+          "milliseconds": 0.006688,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.2853468747946723
+        },
+        {
+          "milliseconds": 0.005792,
+          "name": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+          "percent": 0.2471185853484961
+        },
+        {
+          "milliseconds": 0.004832,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.2061597037990216
+        },
+        {
+          "milliseconds": 0.003808,
+          "name": "void at::native::unrolled_elementwise_kernel<at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)3>, (int)4, TrivialOffsetCalculator<(int)2, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)2>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+          "percent": 0.1624702301462488
+        },
+        {
+          "milliseconds": 0.001856,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+          "percent": 0.07918717099565067
+        },
+        {
+          "milliseconds": 0.001536,
+          "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+          "percent": 0.06553421047915918
+        },
+        {
+          "milliseconds": 0.00096,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, void at::native::compare_scalar_kernel<c10::BFloat16>(at::TensorIteratorBase &, at::native::<unnamed>::OpType, T1)::[lambda(c10::BFloat16) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.04095888154947449
+        },
+        {
+          "milliseconds": 0.000672,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<float>, std::array<char *, (unsigned long)1>>(int, T2, T3)",
+          "percent": 0.02867121708463214
+        }
+      ],
+      "total_milliseconds": 2.343814
+    }
+  ]
+}

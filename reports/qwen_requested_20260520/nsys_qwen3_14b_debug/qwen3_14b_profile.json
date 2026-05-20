@@ -1,0 +1,1078 @@
+{
+  "backward": {
+    "rows": [
+      {
+        "milliseconds": 0.13767904601991177,
+        "name": "backward.loss.cross_entropy.total",
+        "percent": 0.6426623100679956,
+        "seconds": 0.00013767904601991177
+      },
+      {
+        "milliseconds": 0.068214675411582,
+        "name": "backward.lm_head.total",
+        "percent": 0.31841447299253933,
+        "seconds": 6.821467541158199e-05
+      },
+      {
+        "milliseconds": 0.08994429372251034,
+        "name": "backward.final_norm.total",
+        "percent": 0.4198446259773107,
+        "seconds": 8.994429372251034e-05
+      },
+      {
+        "milliseconds": 0.036141183227300644,
+        "name": "backward.layers.0.mlp.residual_add.total",
+        "percent": 0.16870088058344476,
+        "seconds": 3.614118322730065e-05
+      },
+      {
+        "milliseconds": 0.16814419068396091,
+        "name": "backward.layers.0.mlp.down_proj.base_dx_asymgemm.total",
+        "percent": 0.7848684105048181,
+        "seconds": 0.00016814419068396093
+      },
+      {
+        "milliseconds": 0.031225942075252533,
+        "name": "backward.layers.0.mlp.down_proj.base_lora_add.total",
+        "percent": 0.1457573730226815,
+        "seconds": 3.122594207525253e-05
+      },
+      {
+        "milliseconds": 0.0226000789552927,
+        "name": "backward.layers.0.mlp.down_proj.add_cast_scale.total",
+        "percent": 0.10549331484347256,
+        "seconds": 2.2600078955292703e-05
+      },
+      {
+        "milliseconds": 0.08514178916811943,
+        "name": "backward.layers.0.mlp.down_proj.lora_B.total",
+        "percent": 0.3974273536307943,
+        "seconds": 8.514178916811943e-05
+      },
+      {
+        "milliseconds": 0.05422038957476616,
+        "name": "backward.layers.0.mlp.down_proj.lora_A.total",
+        "percent": 0.2530915329836494,
+        "seconds": 5.4220389574766156e-05
+      },
+      {
+        "milliseconds": 0.08383351378142834,
+        "name": "backward.layers.0.mlp.silu_mul_activation.total",
+        "percent": 0.39132054721019777,
+        "seconds": 8.383351378142834e-05
+      },
+      {
+        "milliseconds": 4.464421095326543,
+        "name": "backward.layers.0.mlp.up_proj.base_dx_asymgemm.total",
+        "percent": 20.83915640891282,
+        "seconds": 0.004464421095326543
+      },
+      {
+        "milliseconds": 0.03283102996647358,
+        "name": "backward.layers.0.mlp.up_proj.base_lora_add.total",
+        "percent": 0.15324964960255483,
+        "seconds": 3.283102996647358e-05
+      },
+      {
+        "milliseconds": 0.02270475961267948,
+        "name": "backward.layers.0.mlp.up_proj.add_cast_scale.total",
+        "percent": 0.1059819463022197,
+        "seconds": 2.270475961267948e-05
+      },
+      {
+        "milliseconds": 0.0737474299967289,
+        "name": "backward.layers.0.mlp.up_proj.lora_B.total",
+        "percent": 0.3442404279618639,
+        "seconds": 7.37474299967289e-05
+      },
+      {
+        "milliseconds": 0.05076541565358639,
+        "name": "backward.layers.0.mlp.up_proj.lora_A.total",
+        "percent": 0.23696430385475967,
+        "seconds": 5.0765415653586385e-05
+      },
+      {
+        "milliseconds": 4.240061296150088,
+        "name": "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.total",
+        "percent": 19.7918831237371,
+        "seconds": 0.004240061296150089
+      },
+      {
+        "milliseconds": 0.04190737381577492,
+        "name": "backward.layers.0.mlp.gate_proj.base_lora_add.total",
+        "percent": 0.19561647501126547,
+        "seconds": 4.1907373815774915e-05
+      },
+      {
+        "milliseconds": 0.02407282590866089,
+        "name": "backward.layers.0.mlp.gate_proj.add_cast_scale.total",
+        "percent": 0.11236784649195825,
+        "seconds": 2.407282590866089e-05
+      },
+      {
+        "milliseconds": 0.07188096642494202,
+        "name": "backward.layers.0.mlp.gate_proj.lora_B.total",
+        "percent": 0.33552809427436264,
+        "seconds": 7.188096642494202e-05
+      },
+      {
+        "milliseconds": 0.04908940754830838,
+        "name": "backward.layers.0.mlp.gate_proj.lora_A.total",
+        "percent": 0.22914098380884015,
+        "seconds": 4.908940754830838e-05
+      },
+      {
+        "milliseconds": 0.08766138926148415,
+        "name": "backward.layers.0.mlp.layernorm.total",
+        "percent": 0.40918841722949995,
+        "seconds": 8.766138926148414e-05
+      },
+      {
+        "milliseconds": 0.033338554203510284,
+        "name": "backward.layers.0.attention.residual_add.total",
+        "percent": 0.15561868619903393,
+        "seconds": 3.3338554203510284e-05
+      },
+      {
+        "milliseconds": 4.153910418972373,
+        "name": "backward.layers.0.attention.o_proj.base_dx_asymgemm.total",
+        "percent": 19.38974551934516,
+        "seconds": 0.004153910418972373
+      },
+      {
+        "milliseconds": 0.029257778078317642,
+        "name": "backward.layers.0.attention.o_proj.base_lora_add.total",
+        "percent": 0.13657031909234046,
+        "seconds": 2.925777807831764e-05
+      },
+      {
+        "milliseconds": 0.02134968526661396,
+        "name": "backward.layers.0.attention.o_proj.add_cast_scale.total",
+        "percent": 0.09965669031932743,
+        "seconds": 2.134968526661396e-05
+      },
+      {
+        "milliseconds": 0.07121632806956768,
+        "name": "backward.layers.0.attention.o_proj.lora_B.total",
+        "percent": 0.3324256757642657,
+        "seconds": 7.121632806956768e-05
+      },
+      {
+        "milliseconds": 0.04682028666138649,
+        "name": "backward.layers.0.attention.o_proj.lora_A.total",
+        "percent": 0.21854911443460104,
+        "seconds": 4.682028666138649e-05
+      },
+      {
+        "milliseconds": 0.09584110230207443,
+        "name": "backward.layers.0.attention.value_matmul.total",
+        "percent": 0.4473699229148226,
+        "seconds": 9.584110230207444e-05
+      },
+      {
+        "milliseconds": 0.052143121138215065,
+        "name": "backward.layers.0.attention.softmax.total",
+        "percent": 0.24339519813344868,
+        "seconds": 5.2143121138215065e-05
+      },
+      {
+        "milliseconds": 0.06752060726284982,
+        "name": "backward.layers.0.attention.scores_matmul.total",
+        "percent": 0.31517468122535697,
+        "seconds": 6.752060726284982e-05
+      },
+      {
+        "milliseconds": 0.6602383218705654,
+        "name": "backward.layers.0.attention.v_proj.base_dx_asymgemm.total",
+        "percent": 3.0818799039861786,
+        "seconds": 0.0006602383218705654
+      },
+      {
+        "milliseconds": 0.037714699283242226,
+        "name": "backward.layers.0.attention.v_proj.base_lora_add.total",
+        "percent": 0.1760457852197991,
+        "seconds": 3.7714699283242224e-05
+      },
+      {
+        "milliseconds": 0.02265051007270813,
+        "name": "backward.layers.0.attention.v_proj.add_cast_scale.total",
+        "percent": 0.10572871870015546,
+        "seconds": 2.265051007270813e-05
+      },
+      {
+        "milliseconds": 0.062067294493317604,
+        "name": "backward.layers.0.attention.v_proj.lora_B.total",
+        "percent": 0.28971954710506376,
+        "seconds": 6.20672944933176e-05
+      },
+      {
+        "milliseconds": 0.046216556802392,
+        "name": "backward.layers.0.attention.v_proj.lora_A.total",
+        "percent": 0.21573100639961137,
+        "seconds": 4.6216556802392e-05
+      },
+      {
+        "milliseconds": 1.048113964498043,
+        "name": "backward.layers.0.attention.k_proj.base_dx_asymgemm.total",
+        "percent": 4.8924172639997865,
+        "seconds": 0.001048113964498043
+      },
+      {
+        "milliseconds": 0.03996929153800011,
+        "name": "backward.layers.0.attention.k_proj.base_lora_add.total",
+        "percent": 0.18656983741648966,
+        "seconds": 3.9969291538000104e-05
+      },
+      {
+        "milliseconds": 0.022980105131864548,
+        "name": "backward.layers.0.attention.k_proj.add_cast_scale.total",
+        "percent": 0.10726721223441359,
+        "seconds": 2.298010513186455e-05
+      },
+      {
+        "milliseconds": 0.06733457557857037,
+        "name": "backward.layers.0.attention.k_proj.lora_B.total",
+        "percent": 0.3143063170448877,
+        "seconds": 6.733457557857036e-05
+      },
+      {
+        "milliseconds": 0.045983912423253066,
+        "name": "backward.layers.0.attention.k_proj.lora_A.total",
+        "percent": 0.21464506210784068,
+        "seconds": 4.5983912423253065e-05
+      },
+      {
+        "milliseconds": 1.088837767019868,
+        "name": "backward.layers.0.attention.q_proj.base_dx_asymgemm.total",
+        "percent": 5.08250903003108,
+        "seconds": 0.0010888377670198678
+      },
+      {
+        "milliseconds": 0.03753188066184521,
+        "name": "backward.layers.0.attention.q_proj.base_lora_add.total",
+        "percent": 0.17519241906898006,
+        "seconds": 3.753188066184521e-05
+      },
+      {
+        "milliseconds": 0.022444967180490494,
+        "name": "backward.layers.0.attention.q_proj.add_cast_scale.total",
+        "percent": 0.10476927952804252,
+        "seconds": 2.2444967180490492e-05
+      },
+      {
+        "milliseconds": 0.06496850401163101,
+        "name": "backward.layers.0.attention.q_proj.lora_B.total",
+        "percent": 0.3032618984281612,
+        "seconds": 6.4968504011631e-05
+      },
+      {
+        "milliseconds": 0.0463725533336401,
+        "name": "backward.layers.0.attention.q_proj.lora_A.total",
+        "percent": 0.21645917160726397,
+        "seconds": 4.63725533336401e-05
+      },
+      {
+        "milliseconds": 0.08547259494662285,
+        "name": "backward.layers.0.attention.layernorm.total",
+        "percent": 0.3989714985965148,
+        "seconds": 8.547259494662285e-05
+      },
+      {
+        "milliseconds": 3.516649827361107,
+        "name": "backward.python_autograd_dispatch_cuda_launch_and_sync",
+        "percent": 16.41512174209322,
+        "seconds": 0.003516649827361107
+      },
+      {
+        "milliseconds": 6.938893903907228e-15,
+        "name": "backward.accounting_gap",
+        "percent": 3.2389573537260115e-14,
+        "seconds": 6.938893903907228e-18
+      }
+    ],
+    "sum_percent": 100.00000000000003,
+    "sum_seconds": 0.021423233300447472,
+    "total_milliseconds": 21.423233300447464,
+    "total_seconds": 0.021423233300447465
+  },
+  "config": {
+    "batch_size": 1,
+    "hf_model_id": "Qwen/Qwen3-14B",
+    "hf_model_type": "qwen3",
+    "hf_num_hidden_layers": 40,
+    "hidden_size": 5120,
+    "intermediate_size": 17408,
+    "lora_alpha": 128.0,
+    "lora_rank": 64,
+    "num_attention_heads": 40,
+    "num_heads": 40,
+    "num_layers": 1,
+    "profiled_layers": 1,
+    "seq_len": 64,
+    "vocab_size": 151936,
+    "weight_source": "random_config_matched"
+  },
+  "device": "cuda:1",
+  "execution_stats": {
+    "asym_calls": 350,
+    "asym_dx_calls": 175,
+    "asym_forward_calls": 175,
+    "fallback_reasons": {},
+    "staged_calls": 0,
+    "staged_dx_calls": 0,
+    "staged_forward_calls": 0,
+    "torch_calls": 0,
+    "torch_dx_calls": 0,
+    "torch_forward_calls": 0
+  },
+  "forward": {
+    "rows": [
+      {
+        "milliseconds": 0.05276724696159363,
+        "name": "forward.embeddings",
+        "percent": 0.22598353260633514,
+        "seconds": 5.276724696159363e-05
+      },
+      {
+        "milliseconds": 0.19236411899328232,
+        "name": "forward.layers.0.attention.layernorm",
+        "percent": 0.8238277655161276,
+        "seconds": 0.0001923641189932823
+      },
+      {
+        "milliseconds": 0.10526818223297596,
+        "name": "forward.layers.0.attention.scores_matmul",
+        "percent": 0.4508265460460722,
+        "seconds": 0.00010526818223297597
+      },
+      {
+        "milliseconds": 0.07924078963696957,
+        "name": "forward.layers.0.attention.causal_mask",
+        "percent": 0.33936039114777883,
+        "seconds": 7.924078963696956e-05
+      },
+      {
+        "milliseconds": 0.037594838067889214,
+        "name": "forward.layers.0.attention.softmax",
+        "percent": 0.16100544946997836,
+        "seconds": 3.7594838067889215e-05
+      },
+      {
+        "milliseconds": 0.0871939118951559,
+        "name": "forward.layers.0.attention.value_matmul",
+        "percent": 0.3734208124629776,
+        "seconds": 8.71939118951559e-05
+      },
+      {
+        "milliseconds": 0.05323681980371475,
+        "name": "forward.layers.0.attention.residual_add",
+        "percent": 0.22799454769218497,
+        "seconds": 5.323681980371475e-05
+      },
+      {
+        "milliseconds": 0.2772645093500614,
+        "name": "forward.layers.0.attention.q_proj.base_frozen_asymgemm",
+        "percent": 1.187426233073972,
+        "seconds": 0.0002772645093500614
+      },
+      {
+        "milliseconds": 0.10221665725111961,
+        "name": "forward.layers.0.attention.q_proj.lora_A",
+        "percent": 0.4377579393829598,
+        "seconds": 0.00010221665725111962
+      },
+      {
+        "milliseconds": 0.06276159547269344,
+        "name": "forward.layers.0.attention.q_proj.lora_B",
+        "percent": 0.26878580698462673,
+        "seconds": 6.276159547269344e-05
+      },
+      {
+        "milliseconds": 0.10577668435871601,
+        "name": "forward.layers.0.attention.q_proj.add_cast_scale",
+        "percent": 0.4530042815416573,
+        "seconds": 0.00010577668435871602
+      },
+      {
+        "milliseconds": 1.261285226792097,
+        "name": "forward.layers.0.attention.k_proj.base_frozen_asymgemm",
+        "percent": 5.401640365701059,
+        "seconds": 0.001261285226792097
+      },
+      {
+        "milliseconds": 0.07480108179152012,
+        "name": "forward.layers.0.attention.k_proj.lora_A",
+        "percent": 0.32034668623751555,
+        "seconds": 7.480108179152012e-05
+      },
+      {
+        "milliseconds": 0.05270219407975674,
+        "name": "forward.layers.0.attention.k_proj.lora_B",
+        "percent": 0.2257049340269091,
+        "seconds": 5.270219407975674e-05
+      },
+      {
+        "milliseconds": 0.09858491830527782,
+        "name": "forward.layers.0.attention.k_proj.add_cast_scale",
+        "percent": 0.4222044806800131,
+        "seconds": 9.858491830527782e-05
+      },
+      {
+        "milliseconds": 1.2823359575122595,
+        "name": "forward.layers.0.attention.v_proj.base_frozen_asymgemm",
+        "percent": 5.491793230707441,
+        "seconds": 0.0012823359575122595
+      },
+      {
+        "milliseconds": 0.07092044688761234,
+        "name": "forward.layers.0.attention.v_proj.lora_A",
+        "percent": 0.30372729381443125,
+        "seconds": 7.092044688761234e-05
+      },
+      {
+        "milliseconds": 0.05179508589208126,
+        "name": "forward.layers.0.attention.v_proj.lora_B",
+        "percent": 0.2218201091684844,
+        "seconds": 5.1795085892081263e-05
+      },
+      {
+        "milliseconds": 0.09773964993655682,
+        "name": "forward.layers.0.attention.v_proj.add_cast_scale",
+        "percent": 0.4185844939844215,
+        "seconds": 9.773964993655681e-05
+      },
+      {
+        "milliseconds": 0.9478356689214706,
+        "name": "forward.layers.0.attention.o_proj.base_frozen_asymgemm",
+        "percent": 4.0592463152201885,
+        "seconds": 0.0009478356689214707
+      },
+      {
+        "milliseconds": 0.07110671140253544,
+        "name": "forward.layers.0.attention.o_proj.lora_A",
+        "percent": 0.3045249991241694,
+        "seconds": 7.110671140253544e-05
+      },
+      {
+        "milliseconds": 0.045498693361878395,
+        "name": "forward.layers.0.attention.o_proj.lora_B",
+        "percent": 0.1948548777307514,
+        "seconds": 4.5498693361878394e-05
+      },
+      {
+        "milliseconds": 0.12864102609455585,
+        "name": "forward.layers.0.attention.o_proj.add_cast_scale",
+        "percent": 0.5509242037226326,
+        "seconds": 0.00012864102609455585
+      },
+      {
+        "milliseconds": 0.1308696810156107,
+        "name": "forward.layers.0.mlp.layernorm",
+        "percent": 0.5604687477536493,
+        "seconds": 0.0001308696810156107
+      },
+      {
+        "milliseconds": 0.053146714344620705,
+        "name": "forward.layers.0.mlp.silu_mul_activation",
+        "percent": 0.22760865774859915,
+        "seconds": 5.31467143446207e-05
+      },
+      {
+        "milliseconds": 0.05132020451128483,
+        "name": "forward.layers.0.mlp.residual_add",
+        "percent": 0.21978635948130704,
+        "seconds": 5.132020451128483e-05
+      },
+      {
+        "milliseconds": 1.1393181513994932,
+        "name": "forward.layers.0.mlp.gate_proj.base_frozen_asymgemm",
+        "percent": 4.879298342078998,
+        "seconds": 0.0011393181513994933
+      },
+      {
+        "milliseconds": 0.07210047915577888,
+        "name": "forward.layers.0.mlp.gate_proj.lora_A",
+        "percent": 0.3087809563779498,
+        "seconds": 7.210047915577889e-05
+      },
+      {
+        "milliseconds": 0.04814984276890755,
+        "name": "forward.layers.0.mlp.gate_proj.lora_B",
+        "percent": 0.2062088168305817,
+        "seconds": 4.814984276890755e-05
+      },
+      {
+        "milliseconds": 0.08410578593611717,
+        "name": "forward.layers.0.mlp.gate_proj.add_cast_scale",
+        "percent": 0.36019545670650166,
+        "seconds": 8.410578593611717e-05
+      },
+      {
+        "milliseconds": 5.308142118155956,
+        "name": "forward.layers.0.mlp.up_proj.base_frozen_asymgemm",
+        "percent": 22.732903012932354,
+        "seconds": 0.0053081421181559564
+      },
+      {
+        "milliseconds": 0.06830967031419277,
+        "name": "forward.layers.0.mlp.up_proj.lora_A",
+        "percent": 0.2925462573404867,
+        "seconds": 6.830967031419277e-05
+      },
+      {
+        "milliseconds": 0.046027032658457756,
+        "name": "forward.layers.0.mlp.up_proj.lora_B",
+        "percent": 0.19711756884182363,
+        "seconds": 4.602703265845776e-05
+      },
+      {
+        "milliseconds": 0.08416217751801014,
+        "name": "forward.layers.0.mlp.up_proj.add_cast_scale",
+        "percent": 0.36043696198902486,
+        "seconds": 8.416217751801014e-05
+      },
+      {
+        "milliseconds": 5.270151328295469,
+        "name": "forward.layers.0.mlp.down_proj.base_frozen_asymgemm",
+        "percent": 22.570201841400202,
+        "seconds": 0.00527015132829547
+      },
+      {
+        "milliseconds": 0.06760787218809128,
+        "name": "forward.layers.0.mlp.down_proj.lora_A",
+        "percent": 0.28954070315972086,
+        "seconds": 6.760787218809127e-05
+      },
+      {
+        "milliseconds": 0.046463776379823685,
+        "name": "forward.layers.0.mlp.down_proj.lora_B",
+        "percent": 0.19898798836683212,
+        "seconds": 4.646377637982368e-05
+      },
+      {
+        "milliseconds": 0.08450280874967575,
+        "name": "forward.layers.0.mlp.down_proj.add_cast_scale",
+        "percent": 0.3618957655742085,
+        "seconds": 8.450280874967575e-05
+      },
+      {
+        "milliseconds": 0.13074902817606926,
+        "name": "forward.final_norm",
+        "percent": 0.5599520341392665,
+        "seconds": 0.00013074902817606927
+      },
+      {
+        "milliseconds": 0.0645048450678587,
+        "name": "forward.lm_head",
+        "percent": 0.2762515309784659,
+        "seconds": 6.45048450678587e-05
+      },
+      {
+        "milliseconds": 5.261477222666146,
+        "name": "forward.python_dispatch_cuda_launch_and_sync",
+        "percent": 22.533053702257344,
+        "seconds": 0.0052614772226661465
+      }
+    ],
+    "sum_percent": 100.0,
+    "sum_seconds": 0.023350040754303338,
+    "total_milliseconds": 23.350040754303336,
+    "total_seconds": 0.023350040754303338
+  },
+  "memory": {
+    "cpu": {
+      "pinned_total_bytes": 744488960,
+      "pinned_w_bytes": 744488960,
+      "pinned_w_t_bytes": 0,
+      "pinned_w_t_percent_of_host_weight": 0.0
+    },
+    "gpu": {
+      "buffer_bytes": 84541440,
+      "parameter_bytes": 27848704,
+      "peak_hbm_bytes": 298149888,
+      "unattributed_peak_bytes": 185759744
+    }
+  },
+  "notes": [
+    "Source-level rows are Python wall-clock range timings. In timing_mode=profile, inner ranges do not synchronize and should be treated as labels/CPU submission timing, not GPU execution timing.",
+    "Use timing_mode=profile under Nsight Systems for real GPU bubble analysis; inner ranges are NVTX/record_function labels and do not force per-op CUDA synchronization.",
+    "timing_mode=debug_sync is a debugging-only source coverage check that synchronizes every region and must not be used for performance claims.",
+    "All explicit tensor ops in the instrumented toy forward/backward are assigned named ranges. Source-level residual rows are non-tensor-op overhead: Python dispatch, PyTorch autograd engine scheduling, CUDA launch latency, and synchronization/profiler overhead.",
+    "pinned_w_t_bytes is an audit field and should remain zero after transpose_b=True dX."
+  ],
+  "raw_seconds_per_step": {
+    "backward.final_norm.grad": 8.994429372251034e-05,
+    "backward.final_norm.total": 8.994429372251034e-05,
+    "backward.layers.0.attention.k_proj.add_cast_scale.scale_cast_grad": 2.298010513186455e-05,
+    "backward.layers.0.attention.k_proj.add_cast_scale.total": 2.298010513186455e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_0": 5.219033919274807e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_1": 5.113743245601654e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_10": 5.14062587171793e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_11": 5.023120902478695e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_12": 5.175233818590641e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_13": 6.541777402162552e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_14": 5.149273201823235e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_15": 5.2171805873513224e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_16": 5.146521143615246e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_17": 6.481092423200607e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_18": 5.107312463223934e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_19": 5.04370778799057e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_2": 5.075992085039616e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_3": 5.0823669880628586e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_4": 5.193757824599743e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_5": 4.9471016973257063e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_6": 5.165524780750275e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_7": 5.2176695317029956e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_8": 5.009411834180355e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.call_9": 4.760948941111565e-05,
+    "backward.layers.0.attention.k_proj.base_dx_asymgemm.total": 0.001048113964498043,
+    "backward.layers.0.attention.k_proj.base_lora_add.grad": 3.9969291538000104e-05,
+    "backward.layers.0.attention.k_proj.base_lora_add.total": 3.9969291538000104e-05,
+    "backward.layers.0.attention.k_proj.lora_A.input_grad": 2.3558177053928377e-05,
+    "backward.layers.0.attention.k_proj.lora_A.total": 4.5983912423253065e-05,
+    "backward.layers.0.attention.k_proj.lora_A.weight_grad": 2.2425735369324685e-05,
+    "backward.layers.0.attention.k_proj.lora_B.input_grad": 3.6865798756480216e-05,
+    "backward.layers.0.attention.k_proj.lora_B.total": 6.733457557857036e-05,
+    "backward.layers.0.attention.k_proj.lora_B.weight_grad": 3.0468776822090148e-05,
+    "backward.layers.0.attention.layernorm.grad": 8.547259494662285e-05,
+    "backward.layers.0.attention.layernorm.total": 8.547259494662285e-05,
+    "backward.layers.0.attention.o_proj.add_cast_scale.scale_cast_grad": 2.134968526661396e-05,
+    "backward.layers.0.attention.o_proj.add_cast_scale.total": 2.134968526661396e-05,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_0": 0.00020570219494402408,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_1": 0.00020582186989486216,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_10": 0.00020511774346232414,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_11": 0.00020333509892225265,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_12": 0.00020544216968119145,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_13": 0.00020343177020549775,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_14": 0.00020568477921187878,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_15": 0.00020173736847937108,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_16": 0.00020670942030847072,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_17": 0.0002046257257461548,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_18": 0.0002031540498137474,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_19": 0.00020735608413815498,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_2": 0.00020553492940962316,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_3": 0.0002050447277724743,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_4": 0.00020627705380320548,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_5": 0.00026615508832037447,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_6": 0.00020462172105908393,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_7": 0.00020208093337714672,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_8": 0.00020150961354374884,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.call_9": 0.00020456807687878608,
+    "backward.layers.0.attention.o_proj.base_dx_asymgemm.total": 0.004153910418972373,
+    "backward.layers.0.attention.o_proj.base_lora_add.grad": 2.925777807831764e-05,
+    "backward.layers.0.attention.o_proj.base_lora_add.total": 2.925777807831764e-05,
+    "backward.layers.0.attention.o_proj.lora_A.input_grad": 2.466440200805664e-05,
+    "backward.layers.0.attention.o_proj.lora_A.total": 4.682028666138649e-05,
+    "backward.layers.0.attention.o_proj.lora_A.weight_grad": 2.215588465332985e-05,
+    "backward.layers.0.attention.o_proj.lora_B.input_grad": 3.73318325728178e-05,
+    "backward.layers.0.attention.o_proj.lora_B.total": 7.121632806956768e-05,
+    "backward.layers.0.attention.o_proj.lora_B.weight_grad": 3.3884495496749875e-05,
+    "backward.layers.0.attention.q_proj.add_cast_scale.scale_cast_grad": 2.2444967180490492e-05,
+    "backward.layers.0.attention.q_proj.add_cast_scale.total": 2.2444967180490492e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_0": 5.2362587302923204e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_1": 5.3368648514151575e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_10": 5.229855887591839e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_11": 5.14371320605278e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_12": 5.2177533507347104e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_13": 7.784864865243435e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_14": 5.2049197256565095e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_15": 5.145538598299027e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_16": 5.1870988681912425e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_17": 7.811728864908219e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_18": 5.1214126870036125e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_19": 5.260412581264973e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_2": 5.278303287923336e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_3": 5.2079511806368825e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_4": 5.100443959236145e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_5": 4.875343292951584e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_6": 5.200640298426151e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_7": 5.143214948475361e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_8": 5.243266932666302e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.call_9": 5.154190585017204e-05,
+    "backward.layers.0.attention.q_proj.base_dx_asymgemm.total": 0.0010888377670198678,
+    "backward.layers.0.attention.q_proj.base_lora_add.grad": 3.753188066184521e-05,
+    "backward.layers.0.attention.q_proj.base_lora_add.total": 3.753188066184521e-05,
+    "backward.layers.0.attention.q_proj.lora_A.input_grad": 2.4112360551953316e-05,
+    "backward.layers.0.attention.q_proj.lora_A.total": 4.63725533336401e-05,
+    "backward.layers.0.attention.q_proj.lora_A.weight_grad": 2.2260192781686784e-05,
+    "backward.layers.0.attention.q_proj.lora_B.input_grad": 3.500035963952541e-05,
+    "backward.layers.0.attention.q_proj.lora_B.total": 6.4968504011631e-05,
+    "backward.layers.0.attention.q_proj.lora_B.weight_grad": 2.9968144372105598e-05,
+    "backward.layers.0.attention.residual_add.grad": 3.3338554203510284e-05,
+    "backward.layers.0.attention.residual_add.total": 3.3338554203510284e-05,
+    "backward.layers.0.attention.scores_matmul.lhs_grad": 3.850464709103108e-05,
+    "backward.layers.0.attention.scores_matmul.rhs_grad": 2.9015960171818735e-05,
+    "backward.layers.0.attention.scores_matmul.total": 6.752060726284982e-05,
+    "backward.layers.0.attention.softmax.grad": 5.2143121138215065e-05,
+    "backward.layers.0.attention.softmax.total": 5.2143121138215065e-05,
+    "backward.layers.0.attention.v_proj.add_cast_scale.scale_cast_grad": 2.265051007270813e-05,
+    "backward.layers.0.attention.v_proj.add_cast_scale.total": 2.265051007270813e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_0": 3.120480105280876e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_1": 2.9744580388069153e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_10": 3.155539743602276e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_11": 3.3383909612894056e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_12": 3.3564679324626925e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_13": 3.3056968823075296e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_14": 3.3856695517897605e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_15": 3.2859435304999354e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_16": 3.416072577238083e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_17": 3.434787504374981e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_18": 3.2806769013404846e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_19": 3.3451011404395103e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_2": 3.441222943365574e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_3": 3.391564823687077e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_4": 3.348439931869507e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_5": 3.8306787610054015e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_6": 3.209649585187435e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_7": 3.266963176429272e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_8": 3.321198746562004e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.call_9": 2.8148293495178223e-05,
+    "backward.layers.0.attention.v_proj.base_dx_asymgemm.total": 0.0006602383218705654,
+    "backward.layers.0.attention.v_proj.base_lora_add.grad": 3.7714699283242224e-05,
+    "backward.layers.0.attention.v_proj.base_lora_add.total": 3.7714699283242224e-05,
+    "backward.layers.0.attention.v_proj.lora_A.input_grad": 2.4078693240880966e-05,
+    "backward.layers.0.attention.v_proj.lora_A.total": 4.6216556802392e-05,
+    "backward.layers.0.attention.v_proj.lora_A.weight_grad": 2.213786356151104e-05,
+    "backward.layers.0.attention.v_proj.lora_B.input_grad": 3.481423482298851e-05,
+    "backward.layers.0.attention.v_proj.lora_B.total": 6.20672944933176e-05,
+    "backward.layers.0.attention.v_proj.lora_B.weight_grad": 2.7253059670329094e-05,
+    "backward.layers.0.attention.value_matmul.lhs_grad": 6.304867565631866e-05,
+    "backward.layers.0.attention.value_matmul.rhs_grad": 3.2792426645755766e-05,
+    "backward.layers.0.attention.value_matmul.total": 9.584110230207444e-05,
+    "backward.layers.0.mlp.down_proj.add_cast_scale.scale_cast_grad": 2.2600078955292703e-05,
+    "backward.layers.0.mlp.down_proj.add_cast_scale.total": 2.2600078955292703e-05,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_0": 9.834207594394683e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_1": 2.5168899446725847e-05,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_10": 6.827758625149727e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_11": 8.263671770691871e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_12": 7.298914715647697e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_13": 6.8607274442911145e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_14": 7.4375420808792114e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_15": 7.1739312261343e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_16": 7.222732529044152e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_17": 7.179100066423416e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_18": 7.2927679866552355e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_19": 7.343478500843048e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_2": 7.117260247468949e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_3": 7.944507524371147e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_4": 7.038656622171402e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_5": 7.0445239543914795e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_6": 7.425947114825249e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_7": 9.332550689578056e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_8": 7.278239354491234e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.call_9": 7.0587731897830965e-06,
+    "backward.layers.0.mlp.down_proj.base_dx_asymgemm.total": 0.00016814419068396093,
+    "backward.layers.0.mlp.down_proj.base_lora_add.grad": 3.122594207525253e-05,
+    "backward.layers.0.mlp.down_proj.base_lora_add.total": 3.122594207525253e-05,
+    "backward.layers.0.mlp.down_proj.lora_A.input_grad": 2.8387224301695823e-05,
+    "backward.layers.0.mlp.down_proj.lora_A.total": 5.4220389574766156e-05,
+    "backward.layers.0.mlp.down_proj.lora_A.weight_grad": 2.5833165273070337e-05,
+    "backward.layers.0.mlp.down_proj.lora_B.input_grad": 4.293271340429783e-05,
+    "backward.layers.0.mlp.down_proj.lora_B.total": 8.514178916811943e-05,
+    "backward.layers.0.mlp.down_proj.lora_B.weight_grad": 4.22090757638216e-05,
+    "backward.layers.0.mlp.gate_proj.add_cast_scale.scale_cast_grad": 2.407282590866089e-05,
+    "backward.layers.0.mlp.gate_proj.add_cast_scale.total": 2.407282590866089e-05,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_0": 0.00021013678051531314,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_1": 0.00020906873978674412,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_10": 0.000210145628079772,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_11": 0.00021068695932626724,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_12": 0.00020854282192885875,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_13": 0.00021078786812722683,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_14": 0.00021078968420624734,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_15": 0.00021493462845683097,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_16": 0.00020874068140983582,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_17": 0.00021288790740072727,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_18": 0.00021266890689730644,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_19": 0.00021448456682264804,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_2": 0.00021332064643502234,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_3": 0.00021376637741923332,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_4": 0.00021267356351017952,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_5": 0.00022591184824705124,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_6": 0.0002125538419932127,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_7": 0.00020824875682592391,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_8": 0.00021215383894741536,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.call_9": 0.00020755724981427192,
+    "backward.layers.0.mlp.gate_proj.base_dx_asymgemm.total": 0.004240061296150089,
+    "backward.layers.0.mlp.gate_proj.base_lora_add.grad": 4.1907373815774915e-05,
+    "backward.layers.0.mlp.gate_proj.base_lora_add.total": 4.1907373815774915e-05,
+    "backward.layers.0.mlp.gate_proj.lora_A.input_grad": 2.5431811809539796e-05,
+    "backward.layers.0.mlp.gate_proj.lora_A.total": 4.908940754830838e-05,
+    "backward.layers.0.mlp.gate_proj.lora_A.weight_grad": 2.365759573876858e-05,
+    "backward.layers.0.mlp.gate_proj.lora_B.input_grad": 3.837933763861656e-05,
+    "backward.layers.0.mlp.gate_proj.lora_B.total": 7.188096642494202e-05,
+    "backward.layers.0.mlp.gate_proj.lora_B.weight_grad": 3.350162878632545e-05,
+    "backward.layers.0.mlp.layernorm.grad": 8.766138926148414e-05,
+    "backward.layers.0.mlp.layernorm.total": 8.766138926148414e-05,
+    "backward.layers.0.mlp.residual_add.grad": 3.614118322730065e-05,
+    "backward.layers.0.mlp.residual_add.total": 3.614118322730065e-05,
+    "backward.layers.0.mlp.silu_mul_activation.gate_activation_grad": 7.018330506980419e-05,
+    "backward.layers.0.mlp.silu_mul_activation.total": 8.383351378142834e-05,
+    "backward.layers.0.mlp.silu_mul_activation.up_mul_grad": 1.3650208711624145e-05,
+    "backward.layers.0.mlp.up_proj.add_cast_scale.scale_cast_grad": 2.270475961267948e-05,
+    "backward.layers.0.mlp.up_proj.add_cast_scale.total": 2.270475961267948e-05,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_0": 0.00020894180051982402,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_1": 0.00022167707793414594,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_10": 0.00022421288304030895,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_11": 0.00022366605699062348,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_12": 0.00022638090886175632,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_13": 0.00022475449368357657,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_14": 0.00022342042066156865,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_15": 0.00022579007782042027,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_16": 0.00022586039267480373,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_17": 0.0002238243818283081,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_18": 0.00022393218241631985,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_19": 0.0002244971226900816,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_2": 0.00022294665686786174,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_3": 0.00022241328842937947,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_4": 0.00022444790229201317,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_5": 0.0002241186797618866,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_6": 0.00022464627400040627,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_7": 0.00021778540685772895,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_8": 0.0002260716166347265,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.call_9": 0.00022503347136080266,
+    "backward.layers.0.mlp.up_proj.base_dx_asymgemm.total": 0.004464421095326543,
+    "backward.layers.0.mlp.up_proj.base_lora_add.grad": 3.283102996647358e-05,
+    "backward.layers.0.mlp.up_proj.base_lora_add.total": 3.283102996647358e-05,
+    "backward.layers.0.mlp.up_proj.lora_A.input_grad": 2.6579340919852255e-05,
+    "backward.layers.0.mlp.up_proj.lora_A.total": 5.0765415653586385e-05,
+    "backward.layers.0.mlp.up_proj.lora_A.weight_grad": 2.418607473373413e-05,
+    "backward.layers.0.mlp.up_proj.lora_B.input_grad": 3.915601409971714e-05,
+    "backward.layers.0.mlp.up_proj.lora_B.total": 7.37474299967289e-05,
+    "backward.layers.0.mlp.up_proj.lora_B.weight_grad": 3.459141589701176e-05,
+    "backward.lm_head.input_grad": 6.821467541158199e-05,
+    "backward.lm_head.total": 6.821467541158199e-05,
+    "backward.loss.cross_entropy.grad": 0.00013767904601991177,
+    "backward.loss.cross_entropy.total": 0.00013767904601991177,
+    "backward.python_autograd_dispatch_cuda_launch_and_sync": 0.003516649827361107,
+    "forward.base_frozen_asymgemm.call_0": 8.48015770316124e-06,
+    "forward.base_frozen_asymgemm.call_1": 5.826856940984726e-05,
+    "forward.base_frozen_asymgemm.call_10": 4.057283513247967e-05,
+    "forward.base_frozen_asymgemm.call_100": 6.037051789462566e-05,
+    "forward.base_frozen_asymgemm.call_101": 4.34262678027153e-05,
+    "forward.base_frozen_asymgemm.call_102": 5.3792772814631465e-05,
+    "forward.base_frozen_asymgemm.call_103": 0.00026230248622596266,
+    "forward.base_frozen_asymgemm.call_104": 0.0002621862571686506,
+    "forward.base_frozen_asymgemm.call_105": 7.91517086327076e-06,
+    "forward.base_frozen_asymgemm.call_106": 5.831257440149784e-05,
+    "forward.base_frozen_asymgemm.call_107": 5.9364503249526025e-05,
+    "forward.base_frozen_asymgemm.call_108": 4.3830927461385726e-05,
+    "forward.base_frozen_asymgemm.call_109": 5.589826032519341e-05,
+    "forward.base_frozen_asymgemm.call_11": 1.3406760990619659e-05,
+    "forward.base_frozen_asymgemm.call_110": 0.00026195370592176916,
+    "forward.base_frozen_asymgemm.call_111": 0.0002578633837401867,
+    "forward.base_frozen_asymgemm.call_112": 8.055474609136581e-06,
+    "forward.base_frozen_asymgemm.call_113": 5.8935675770044324e-05,
+    "forward.base_frozen_asymgemm.call_114": 5.9550581499934194e-05,
+    "forward.base_frozen_asymgemm.call_115": 4.2216014117002486e-05,
+    "forward.base_frozen_asymgemm.call_116": 5.410467274487018e-05,
+    "forward.base_frozen_asymgemm.call_117": 0.0002589578740298748,
+    "forward.base_frozen_asymgemm.call_118": 0.0002586930524557829,
+    "forward.base_frozen_asymgemm.call_119": 7.987720891833305e-06,
+    "forward.base_frozen_asymgemm.call_12": 0.0002589720766991377,
+    "forward.base_frozen_asymgemm.call_120": 5.877041257917881e-05,
+    "forward.base_frozen_asymgemm.call_121": 5.991198122501373e-05,
+    "forward.base_frozen_asymgemm.call_122": 4.0852464735507965e-05,
+    "forward.base_frozen_asymgemm.call_123": 5.492167547345161e-05,
+    "forward.base_frozen_asymgemm.call_124": 0.0002594723366200924,
+    "forward.base_frozen_asymgemm.call_125": 0.0002608266193419695,
+    "forward.base_frozen_asymgemm.call_126": 8.515594527125358e-06,
+    "forward.base_frozen_asymgemm.call_127": 5.875779315829277e-05,
+    "forward.base_frozen_asymgemm.call_128": 5.855457857251167e-05,
+    "forward.base_frozen_asymgemm.call_129": 4.3149711564183237e-05,
+    "forward.base_frozen_asymgemm.call_13": 0.0002596129663288593,
+    "forward.base_frozen_asymgemm.call_130": 5.506635643541813e-05,
+    "forward.base_frozen_asymgemm.call_131": 0.0002632263582199812,
+    "forward.base_frozen_asymgemm.call_132": 0.00025514960289001464,
+    "forward.base_frozen_asymgemm.call_133": 7.888674736022949e-06,
+    "forward.base_frozen_asymgemm.call_134": 5.8084167540073396e-05,
+    "forward.base_frozen_asymgemm.call_135": 5.959006957709789e-05,
+    "forward.base_frozen_asymgemm.call_136": 4.278896376490593e-05,
+    "forward.base_frozen_asymgemm.call_137": 5.552610382437706e-05,
+    "forward.base_frozen_asymgemm.call_138": 0.0002634586300700903,
+    "forward.base_frozen_asymgemm.call_139": 0.00025963480584323406,
+    "forward.base_frozen_asymgemm.call_14": 8.248630911111831e-06,
+    "forward.base_frozen_asymgemm.call_15": 5.8248406276106834e-05,
+    "forward.base_frozen_asymgemm.call_16": 5.9486133977770805e-05,
+    "forward.base_frozen_asymgemm.call_17": 4.1156122460961345e-05,
+    "forward.base_frozen_asymgemm.call_18": 5.483366549015045e-05,
+    "forward.base_frozen_asymgemm.call_19": 0.0002620091196149588,
+    "forward.base_frozen_asymgemm.call_2": 5.9216050431132317e-05,
+    "forward.base_frozen_asymgemm.call_20": 0.00025982605293393133,
+    "forward.base_frozen_asymgemm.call_21": 9.096646681427956e-06,
+    "forward.base_frozen_asymgemm.call_22": 5.742805078625679e-05,
+    "forward.base_frozen_asymgemm.call_23": 5.892454646527767e-05,
+    "forward.base_frozen_asymgemm.call_24": 4.1306065395474437e-05,
+    "forward.base_frozen_asymgemm.call_25": 5.454085767269135e-05,
+    "forward.base_frozen_asymgemm.call_26": 0.00026284963823854925,
+    "forward.base_frozen_asymgemm.call_27": 0.00025772866792976855,
+    "forward.base_frozen_asymgemm.call_28": 8.268514648079872e-06,
+    "forward.base_frozen_asymgemm.call_29": 5.7986797764897345e-05,
+    "forward.base_frozen_asymgemm.call_3": 4.170252941548824e-05,
+    "forward.base_frozen_asymgemm.call_30": 5.956627428531647e-05,
+    "forward.base_frozen_asymgemm.call_31": 4.271049983799458e-05,
+    "forward.base_frozen_asymgemm.call_32": 5.2760075777769086e-05,
+    "forward.base_frozen_asymgemm.call_33": 0.00025932826101779936,
+    "forward.base_frozen_asymgemm.call_34": 0.0002537331078201532,
+    "forward.base_frozen_asymgemm.call_35": 8.013006299734115e-06,
+    "forward.base_frozen_asymgemm.call_36": 5.7987868785858154e-05,
+    "forward.base_frozen_asymgemm.call_37": 5.9530045837163927e-05,
+    "forward.base_frozen_asymgemm.call_38": 4.310710355639458e-05,
+    "forward.base_frozen_asymgemm.call_39": 5.511799827218056e-05,
+    "forward.base_frozen_asymgemm.call_4": 5.549713969230652e-05,
+    "forward.base_frozen_asymgemm.call_40": 0.00025736247189342973,
+    "forward.base_frozen_asymgemm.call_41": 0.0002618006430566311,
+    "forward.base_frozen_asymgemm.call_42": 7.927557453513145e-06,
+    "forward.base_frozen_asymgemm.call_43": 5.87929505854845e-05,
+    "forward.base_frozen_asymgemm.call_44": 5.7680532336235046e-05,
+    "forward.base_frozen_asymgemm.call_45": 4.3335696682333945e-05,
+    "forward.base_frozen_asymgemm.call_46": 5.465354770421982e-05,
+    "forward.base_frozen_asymgemm.call_47": 0.0002595161087810993,
+    "forward.base_frozen_asymgemm.call_48": 0.00025967941619455817,
+    "forward.base_frozen_asymgemm.call_49": 8.369702845811844e-06,
+    "forward.base_frozen_asymgemm.call_5": 0.0002635314594954252,
+    "forward.base_frozen_asymgemm.call_50": 5.816207267343998e-05,
+    "forward.base_frozen_asymgemm.call_51": 6.102621555328369e-05,
+    "forward.base_frozen_asymgemm.call_52": 4.356899298727512e-05,
+    "forward.base_frozen_asymgemm.call_53": 5.354387685656548e-05,
+    "forward.base_frozen_asymgemm.call_54": 0.0002605668734759092,
+    "forward.base_frozen_asymgemm.call_55": 0.00025946754030883314,
+    "forward.base_frozen_asymgemm.call_56": 8.153170347213745e-06,
+    "forward.base_frozen_asymgemm.call_57": 5.762642249464989e-05,
+    "forward.base_frozen_asymgemm.call_58": 6.0631101951003076e-05,
+    "forward.base_frozen_asymgemm.call_59": 4.2809173464775085e-05,
+    "forward.base_frozen_asymgemm.call_6": 0.0002596180886030197,
+    "forward.base_frozen_asymgemm.call_60": 5.5034691467881205e-05,
+    "forward.base_frozen_asymgemm.call_61": 0.0002627888694405556,
+    "forward.base_frozen_asymgemm.call_62": 0.00025784368626773356,
+    "forward.base_frozen_asymgemm.call_63": 7.932912558317184e-06,
+    "forward.base_frozen_asymgemm.call_64": 5.819257348775864e-05,
+    "forward.base_frozen_asymgemm.call_65": 5.9098191559314725e-05,
+    "forward.base_frozen_asymgemm.call_66": 4.383036866784096e-05,
+    "forward.base_frozen_asymgemm.call_67": 5.4932152852416036e-05,
+    "forward.base_frozen_asymgemm.call_68": 0.0002588717266917229,
+    "forward.base_frozen_asymgemm.call_69": 0.0002607949543744326,
+    "forward.base_frozen_asymgemm.call_7": 8.081039413809777e-06,
+    "forward.base_frozen_asymgemm.call_70": 8.004484698176384e-06,
+    "forward.base_frozen_asymgemm.call_71": 5.889013409614563e-05,
+    "forward.base_frozen_asymgemm.call_72": 6.01121224462986e-05,
+    "forward.base_frozen_asymgemm.call_73": 4.203440621495247e-05,
+    "forward.base_frozen_asymgemm.call_74": 5.567441694438457e-05,
+    "forward.base_frozen_asymgemm.call_75": 0.00026331460103392603,
+    "forward.base_frozen_asymgemm.call_76": 0.0002595682628452778,
+    "forward.base_frozen_asymgemm.call_77": 7.97123648226261e-06,
+    "forward.base_frozen_asymgemm.call_78": 5.748053081333637e-05,
+    "forward.base_frozen_asymgemm.call_79": 5.92048279941082e-05,
+    "forward.base_frozen_asymgemm.call_8": 5.7366723194718364e-05,
+    "forward.base_frozen_asymgemm.call_80": 4.323800094425678e-05,
+    "forward.base_frozen_asymgemm.call_81": 5.466719157993793e-05,
+    "forward.base_frozen_asymgemm.call_82": 0.00026344116777181624,
+    "forward.base_frozen_asymgemm.call_83": 0.00026043648831546306,
+    "forward.base_frozen_asymgemm.call_84": 7.954239845275878e-06,
+    "forward.base_frozen_asymgemm.call_85": 5.879024975001812e-05,
+    "forward.base_frozen_asymgemm.call_86": 5.82096166908741e-05,
+    "forward.base_frozen_asymgemm.call_87": 4.4343015179038045e-05,
+    "forward.base_frozen_asymgemm.call_88": 5.421312525868416e-05,
+    "forward.base_frozen_asymgemm.call_89": 0.00026293108239769933,
+    "forward.base_frozen_asymgemm.call_9": 5.9411022812128066e-05,
+    "forward.base_frozen_asymgemm.call_90": 0.0002607867121696472,
+    "forward.base_frozen_asymgemm.call_91": 7.797172293066978e-06,
+    "forward.base_frozen_asymgemm.call_92": 5.908724851906299e-05,
+    "forward.base_frozen_asymgemm.call_93": 6.00022729486227e-05,
+    "forward.base_frozen_asymgemm.call_94": 4.296107217669487e-05,
+    "forward.base_frozen_asymgemm.call_95": 5.526854656636715e-05,
+    "forward.base_frozen_asymgemm.call_96": 0.0002619828097522259,
+    "forward.base_frozen_asymgemm.call_97": 0.00025858324952423575,
+    "forward.base_frozen_asymgemm.call_98": 7.91768543422222e-06,
+    "forward.base_frozen_asymgemm.call_99": 5.827164277434349e-05,
+    "forward.embeddings": 5.276724696159363e-05,
+    "forward.final_norm": 0.00013074902817606927,
+    "forward.layers.0.attention.causal_mask": 7.924078963696956e-05,
+    "forward.layers.0.attention.k_proj.add_cast_scale": 9.858491830527782e-05,
+    "forward.layers.0.attention.k_proj.base_frozen_asymgemm": 0.001261285226792097,
+    "forward.layers.0.attention.k_proj.lora_A": 7.480108179152012e-05,
+    "forward.layers.0.attention.k_proj.lora_B": 5.270219407975674e-05,
+    "forward.layers.0.attention.layernorm": 0.0001923641189932823,
+    "forward.layers.0.attention.o_proj.add_cast_scale": 0.00012864102609455585,
+    "forward.layers.0.attention.o_proj.base_frozen_asymgemm": 0.0009478356689214707,
+    "forward.layers.0.attention.o_proj.lora_A": 7.110671140253544e-05,
+    "forward.layers.0.attention.o_proj.lora_B": 4.5498693361878394e-05,
+    "forward.layers.0.attention.q_proj.add_cast_scale": 0.00010577668435871602,
+    "forward.layers.0.attention.q_proj.base_frozen_asymgemm": 0.0002772645093500614,
+    "forward.layers.0.attention.q_proj.lora_A": 0.00010221665725111962,
+    "forward.layers.0.attention.q_proj.lora_B": 6.276159547269344e-05,
+    "forward.layers.0.attention.residual_add": 5.323681980371475e-05,
+    "forward.layers.0.attention.scores_matmul": 0.00010526818223297597,
+    "forward.layers.0.attention.softmax": 3.7594838067889215e-05,
+    "forward.layers.0.attention.v_proj.add_cast_scale": 9.773964993655681e-05,
+    "forward.layers.0.attention.v_proj.base_frozen_asymgemm": 0.0012823359575122595,
+    "forward.layers.0.attention.v_proj.lora_A": 7.092044688761234e-05,
+    "forward.layers.0.attention.v_proj.lora_B": 5.1795085892081263e-05,
+    "forward.layers.0.attention.value_matmul": 8.71939118951559e-05,
+    "forward.layers.0.mlp.down_proj.add_cast_scale": 8.450280874967575e-05,
+    "forward.layers.0.mlp.down_proj.base_frozen_asymgemm": 0.00527015132829547,
+    "forward.layers.0.mlp.down_proj.lora_A": 6.760787218809127e-05,
+    "forward.layers.0.mlp.down_proj.lora_B": 4.646377637982368e-05,
+    "forward.layers.0.mlp.gate_proj.add_cast_scale": 8.410578593611717e-05,
+    "forward.layers.0.mlp.gate_proj.base_frozen_asymgemm": 0.0011393181513994933,
+    "forward.layers.0.mlp.gate_proj.lora_A": 7.210047915577889e-05,
+    "forward.layers.0.mlp.gate_proj.lora_B": 4.814984276890755e-05,
+    "forward.layers.0.mlp.layernorm": 0.0001308696810156107,
+    "forward.layers.0.mlp.residual_add": 5.132020451128483e-05,
+    "forward.layers.0.mlp.silu_mul_activation": 5.31467143446207e-05,
+    "forward.layers.0.mlp.up_proj.add_cast_scale": 8.416217751801014e-05,
+    "forward.layers.0.mlp.up_proj.base_frozen_asymgemm": 0.0053081421181559564,
+    "forward.layers.0.mlp.up_proj.lora_A": 6.830967031419277e-05,
+    "forward.layers.0.mlp.up_proj.lora_B": 4.602703265845776e-05,
+    "forward.lm_head": 6.45048450678587e-05,
+    "step.backward": 0.021423233300447465,
+    "step.forward": 0.023350040754303338,
+    "step.input_preparation": 0.0027639803010970354,
+    "step.loss": 0.00018890760838985443,
+    "step.optimizer": 0.0004140013828873634
+  },
+  "step": {
+    "rows": [
+      {
+        "milliseconds": 2.7639803010970354,
+        "name": "step.input_preparation",
+        "percent": 5.741526635808769,
+        "seconds": 0.0027639803010970354
+      },
+      {
+        "milliseconds": 23.350040754303336,
+        "name": "step.forward",
+        "percent": 48.504282351376375,
+        "seconds": 0.023350040754303338
+      },
+      {
+        "milliseconds": 0.18890760838985443,
+        "name": "step.loss",
+        "percent": 0.3924116481028435,
+        "seconds": 0.00018890760838985443
+      },
+      {
+        "milliseconds": 21.423233300447464,
+        "name": "step.backward",
+        "percent": 44.5017877192701,
+        "seconds": 0.021423233300447465
+      },
+      {
+        "milliseconds": 0.41400138288736343,
+        "name": "step.optimizer",
+        "percent": 0.8599916454419088,
+        "seconds": 0.0004140013828873634
+      },
+      {
+        "milliseconds": 0.0,
+        "name": "step.accounting_gap",
+        "percent": 0.0,
+        "seconds": 0.0
+      }
+    ],
+    "sum_percent": 100.0,
+    "sum_seconds": 0.04814016334712506,
+    "total_milliseconds": 48.14016334712506,
+    "total_seconds": 0.04814016334712506
+  },
+  "workload": "qwen3_14b"
+}

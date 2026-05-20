@@ -9,8 +9,17 @@ cd "$SCRIPT_DIR"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0a}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export DG_JIT_WITH_LINEINFO="${DG_JIT_WITH_LINEINFO:-1}"
+export DG_JIT_CLEAR_CACHE="${DG_JIT_CLEAR_CACHE:-0}"
 
 echo "==> Installing asym_gemm editable"
+echo "    DG_JIT_WITH_LINEINFO=${DG_JIT_WITH_LINEINFO}"
+echo "    DG_JIT_CLEAR_CACHE=${DG_JIT_CLEAR_CACHE}"
+if [[ "${DG_JIT_CLEAR_CACHE}" == "1" ]]; then
+  echo "==> Clearing AsymGEMM JIT cache: ${HOME}/.asym_gemm/cache"
+  rm -rf "${HOME}/.asym_gemm/cache"
+fi
+rm -rf build *.egg-info
 python3 -m pip uninstall -y asym_gemm || true
 python3 -m pip install -e . --no-build-isolation -v
 

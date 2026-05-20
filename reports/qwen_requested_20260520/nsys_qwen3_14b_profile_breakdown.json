@@ -1,0 +1,1187 @@
+{
+  "source": "reports/qwen_requested_20260520/nsys_qwen3_14b_profile.sqlite",
+  "stages": [
+    {
+      "host_api_breakdown": {
+        "rows": [
+          {
+            "milliseconds": 20.06881,
+            "name": "cuda_runtime_api_sum_overlaps_gpu_timeline",
+            "percent": 79.8570700498255
+          },
+          {
+            "milliseconds": 19.085331,
+            "name": "cuda_synchronization_api_sum_overlaps_gpu_timeline",
+            "percent": 75.94364661338197
+          }
+        ],
+        "total_milliseconds": 25.130912
+      },
+      "operation_cuda_api_time": {
+        "rows": [
+          {
+            "milliseconds": 5.32098,
+            "name": "forward.layers.0.mlp.up_proj.base_frozen_asymgemm",
+            "percent": 21.173047758871622
+          },
+          {
+            "milliseconds": 5.253654,
+            "name": "forward.layers.0.mlp.down_proj.base_frozen_asymgemm",
+            "percent": 20.90514661783862
+          },
+          {
+            "milliseconds": 1.122012,
+            "name": "forward.layers.0.attention.k_proj.base_frozen_asymgemm",
+            "percent": 4.464668850855871
+          },
+          {
+            "milliseconds": 1.115442,
+            "name": "forward.layers.0.attention.v_proj.base_frozen_asymgemm",
+            "percent": 4.438525748687513
+          },
+          {
+            "milliseconds": 0.90325,
+            "name": "forward.layers.0.mlp.gate_proj.base_frozen_asymgemm",
+            "percent": 3.5941791527502067
+          },
+          {
+            "milliseconds": 0.772733,
+            "name": "forward.layers.0.attention.o_proj.base_frozen_asymgemm",
+            "percent": 3.07483071048118
+          },
+          {
+            "milliseconds": 0.067869,
+            "name": "forward.layers.0.mlp.layernorm",
+            "percent": 0.27006182664600475
+          },
+          {
+            "milliseconds": 0.065788,
+            "name": "forward.layers.0.attention.layernorm",
+            "percent": 0.2617811880444291
+          },
+          {
+            "milliseconds": 0.058267,
+            "name": "forward.final_norm",
+            "percent": 0.23185390168092587
+          },
+          {
+            "milliseconds": 0.043825,
+            "name": "forward.layers.0.attention.q_proj.base_frozen_asymgemm",
+            "percent": 0.17438682686883789
+          },
+          {
+            "milliseconds": 0.033521,
+            "name": "forward.layers.0.attention.q_proj.add_cast_scale",
+            "percent": 0.1333855293433044
+          },
+          {
+            "milliseconds": 0.031646,
+            "name": "forward.layers.0.attention.o_proj.add_cast_scale",
+            "percent": 0.1259245983591841
+          },
+          {
+            "milliseconds": 0.031497,
+            "name": "forward.layers.0.mlp.up_proj.add_cast_scale",
+            "percent": 0.125331703043646
+          },
+          {
+            "milliseconds": 0.031412,
+            "name": "forward.layers.0.mlp.down_proj.add_cast_scale",
+            "percent": 0.12499347417236592
+          },
+          {
+            "milliseconds": 0.031349,
+            "name": "forward.layers.0.mlp.gate_proj.add_cast_scale",
+            "percent": 0.12474278689129946
+          },
+          {
+            "milliseconds": 0.030921,
+            "name": "forward.layers.0.attention.v_proj.add_cast_scale",
+            "percent": 0.12303970504532426
+          },
+          {
+            "milliseconds": 0.030912,
+            "name": "forward.layers.0.attention.k_proj.add_cast_scale",
+            "percent": 0.12300389257660048
+          },
+          {
+            "milliseconds": 0.02931,
+            "name": "forward.layers.0.attention.causal_mask",
+            "percent": 0.11662927314376813
+          },
+          {
+            "milliseconds": 0.021685,
+            "name": "forward.layers.0.attention.residual_add",
+            "percent": 0.08628815380834567
+          },
+          {
+            "milliseconds": 0.021622,
+            "name": "forward.layers.0.mlp.silu_mul_activation",
+            "percent": 0.08603746652727923
+          },
+          {
+            "milliseconds": 0.021214,
+            "name": "forward.layers.0.mlp.residual_add",
+            "percent": 0.08441396794513466
+          },
+          {
+            "milliseconds": 0.020203,
+            "name": "forward.layers.0.attention.scores_matmul",
+            "percent": 0.080391033958497
+          },
+          {
+            "milliseconds": 0.019069,
+            "name": "forward.layers.0.attention.q_proj.lora_A",
+            "percent": 0.07587866289930106
+          },
+          {
+            "milliseconds": 0.018926,
+            "name": "forward.layers.0.mlp.gate_proj.lora_A",
+            "percent": 0.07530964256291216
+          },
+          {
+            "milliseconds": 0.01878,
+            "name": "forward.layers.0.attention.o_proj.lora_A",
+            "percent": 0.07472868473694867
+          },
+          {
+            "milliseconds": 0.018164,
+            "name": "forward.layers.0.mlp.up_proj.lora_A",
+            "percent": 0.07227752021096569
+          },
+          {
+            "milliseconds": 0.017887,
+            "name": "forward.layers.0.mlp.down_proj.lora_A",
+            "percent": 0.07117529200691165
+          },
+          {
+            "milliseconds": 0.017477,
+            "name": "forward.layers.0.attention.k_proj.lora_A",
+            "percent": 0.06954383509838402
+          },
+          {
+            "milliseconds": 0.016689,
+            "name": "forward.layers.0.attention.v_proj.lora_A",
+            "percent": 0.06640825450345773
+          },
+          {
+            "milliseconds": 0.015198,
+            "name": "forward.layers.0.attention.value_matmul",
+            "percent": 0.0604753221848853
+          },
+          {
+            "milliseconds": 0.013327,
+            "name": "forward.embeddings",
+            "percent": 0.05303030785353115
+          },
+          {
+            "milliseconds": 0.009213,
+            "name": "forward.lm_head",
+            "percent": 0.036660030483573386
+          },
+          {
+            "milliseconds": 0.007057,
+            "name": "forward.layers.0.attention.k_proj.lora_B",
+            "percent": 0.028080954642632945
+          },
+          {
+            "milliseconds": 0.006725,
+            "name": "forward.layers.0.mlp.up_proj.lora_B",
+            "percent": 0.026759872463044718
+          },
+          {
+            "milliseconds": 0.006724,
+            "name": "forward.layers.0.attention.q_proj.lora_B",
+            "percent": 0.026755893299853187
+          },
+          {
+            "milliseconds": 0.006564,
+            "name": "forward.layers.0.mlp.down_proj.lora_B",
+            "percent": 0.02611922718920826
+          },
+          {
+            "milliseconds": 0.006563,
+            "name": "forward.layers.0.mlp.gate_proj.lora_B",
+            "percent": 0.026115248026016724
+          },
+          {
+            "milliseconds": 0.006177,
+            "name": "forward.layers.0.attention.o_proj.lora_B",
+            "percent": 0.02457929103408583
+          },
+          {
+            "milliseconds": 0.005886,
+            "name": "forward.layers.0.attention.v_proj.lora_B",
+            "percent": 0.023421354545350364
+          },
+          {
+            "milliseconds": 0.005081,
+            "name": "forward.layers.0.attention.softmax",
+            "percent": 0.02021812817616806
+          }
+        ],
+        "total_milliseconds": 25.130912
+      },
+      "operation_kernel_time": {
+        "rows": [
+          {
+            "milliseconds": 5.794629,
+            "name": "forward.layers.0.mlp.up_proj.base_frozen_asymgemm",
+            "percent": 23.057774425377
+          },
+          {
+            "milliseconds": 5.789508,
+            "name": "forward.layers.0.mlp.gate_proj.base_frozen_asymgemm",
+            "percent": 23.03739713067317
+          },
+          {
+            "milliseconds": 5.473348,
+            "name": "forward.layers.0.mlp.down_proj.base_frozen_asymgemm",
+            "percent": 21.77934489603879
+          },
+          {
+            "milliseconds": 1.623233,
+            "name": "forward.layers.0.attention.v_proj.base_frozen_asymgemm",
+            "percent": 6.459109004878136
+          },
+          {
+            "milliseconds": 1.619746,
+            "name": "forward.layers.0.attention.o_proj.base_frozen_asymgemm",
+            "percent": 6.445233662829267
+          },
+          {
+            "milliseconds": 1.616737,
+            "name": "forward.layers.0.attention.q_proj.base_frozen_asymgemm",
+            "percent": 6.433260360785952
+          },
+          {
+            "milliseconds": 1.614081,
+            "name": "forward.layers.0.attention.k_proj.base_frozen_asymgemm",
+            "percent": 6.422691703349247
+          },
+          {
+            "milliseconds": 0.045344,
+            "name": "forward.layers.0.attention.layernorm",
+            "percent": 0.1804311757567732
+          },
+          {
+            "milliseconds": 0.044576,
+            "name": "forward.layers.0.mlp.layernorm",
+            "percent": 0.1773751784256775
+          },
+          {
+            "milliseconds": 0.044448,
+            "name": "forward.final_norm",
+            "percent": 0.17686584553716156
+          },
+          {
+            "milliseconds": 0.023744,
+            "name": "forward.layers.0.mlp.down_proj.lora_A",
+            "percent": 0.09448125081970762
+          },
+          {
+            "milliseconds": 0.020512,
+            "name": "forward.layers.0.mlp.gate_proj.add_cast_scale",
+            "percent": 0.08162059538468003
+          },
+          {
+            "milliseconds": 0.020288,
+            "name": "forward.layers.0.mlp.up_proj.add_cast_scale",
+            "percent": 0.08072926282977713
+          },
+          {
+            "milliseconds": 0.017312,
+            "name": "forward.layers.0.mlp.silu_mul_activation",
+            "percent": 0.06888727317178144
+          },
+          {
+            "milliseconds": 0.01696,
+            "name": "forward.lm_head",
+            "percent": 0.06748660772836258
+          },
+          {
+            "milliseconds": 0.01392,
+            "name": "forward.layers.0.attention.q_proj.lora_A",
+            "percent": 0.055389951626108914
+          },
+          {
+            "milliseconds": 0.013792,
+            "name": "forward.layers.0.mlp.gate_proj.lora_A",
+            "percent": 0.05488061873759297
+          },
+          {
+            "milliseconds": 0.013632,
+            "name": "forward.layers.0.attention.o_proj.lora_A",
+            "percent": 0.05424395262694804
+          },
+          {
+            "milliseconds": 0.01344,
+            "name": "forward.layers.0.mlp.up_proj.lora_A",
+            "percent": 0.053479953294174126
+          },
+          {
+            "milliseconds": 0.013408,
+            "name": "forward.layers.0.attention.k_proj.lora_A",
+            "percent": 0.05335262007204514
+          },
+          {
+            "milliseconds": 0.013408,
+            "name": "forward.layers.0.attention.v_proj.lora_A",
+            "percent": 0.05335262007204514
+          },
+          {
+            "milliseconds": 0.01232,
+            "name": "forward.layers.0.mlp.down_proj.add_cast_scale",
+            "percent": 0.04902329051965962
+          },
+          {
+            "milliseconds": 0.01216,
+            "name": "forward.layers.0.attention.q_proj.add_cast_scale",
+            "percent": 0.048386624409014686
+          },
+          {
+            "milliseconds": 0.012096,
+            "name": "forward.layers.0.attention.scores_matmul",
+            "percent": 0.048131957964756715
+          },
+          {
+            "milliseconds": 0.012096,
+            "name": "forward.layers.0.attention.o_proj.add_cast_scale",
+            "percent": 0.048131957964756715
+          },
+          {
+            "milliseconds": 0.012064,
+            "name": "forward.layers.0.attention.k_proj.add_cast_scale",
+            "percent": 0.048004624742627726
+          },
+          {
+            "milliseconds": 0.012064,
+            "name": "forward.layers.0.attention.v_proj.add_cast_scale",
+            "percent": 0.048004624742627726
+          },
+          {
+            "milliseconds": 0.010432,
+            "name": "forward.layers.0.mlp.residual_add",
+            "percent": 0.04151063041404945
+          },
+          {
+            "milliseconds": 0.01024,
+            "name": "forward.layers.0.attention.value_matmul",
+            "percent": 0.040746631081275526
+          },
+          {
+            "milliseconds": 0.01008,
+            "name": "forward.layers.0.attention.residual_add",
+            "percent": 0.040109964970630595
+          },
+          {
+            "milliseconds": 0.009792,
+            "name": "forward.layers.0.mlp.gate_proj.lora_B",
+            "percent": 0.03896396597146972
+          },
+          {
+            "milliseconds": 0.00976,
+            "name": "forward.layers.0.mlp.up_proj.lora_B",
+            "percent": 0.03883663274934073
+          },
+          {
+            "milliseconds": 0.005504,
+            "name": "forward.layers.0.mlp.down_proj.lora_B",
+            "percent": 0.021901314206185594
+          },
+          {
+            "milliseconds": 0.00544,
+            "name": "forward.layers.0.attention.o_proj.lora_B",
+            "percent": 0.021646647761927623
+          },
+          {
+            "milliseconds": 0.005312,
+            "name": "forward.layers.0.attention.q_proj.lora_B",
+            "percent": 0.021137314873411677
+          },
+          {
+            "milliseconds": 0.005216,
+            "name": "forward.layers.0.attention.v_proj.lora_B",
+            "percent": 0.020755315207024724
+          },
+          {
+            "milliseconds": 0.005088,
+            "name": "forward.layers.0.attention.k_proj.lora_B",
+            "percent": 0.020245982318508774
+          },
+          {
+            "milliseconds": 0.004576,
+            "name": "forward.layers.0.attention.causal_mask",
+            "percent": 0.018208650764445
+          },
+          {
+            "milliseconds": 0.002464,
+            "name": "forward.layers.0.attention.softmax",
+            "percent": 0.009804658103931923
+          },
+          {
+            "milliseconds": 0.001728,
+            "name": "forward.embeddings",
+            "percent": 0.006875993994965244
+          }
+        ],
+        "total_milliseconds": 25.130912
+      },
+      "stage": "step.forward",
+      "stage_breakdown": {
+        "rows": [
+          {
+            "milliseconds": 24.00789,
+            "name": "cuda_kernel_busy_union",
+            "percent": 95.53131219432068
+          },
+          {
+            "milliseconds": 1.1096459999999988,
+            "name": "gpu_no_kernel_time",
+            "percent": 4.415462518829395
+          },
+          {
+            "milliseconds": 0.013376,
+            "name": "cuda_memcpy_union",
+            "percent": 0.05322528684991616
+          }
+        ],
+        "total_milliseconds": 25.130912
+      },
+      "top_kernels": [
+        {
+          "milliseconds": 11.578985,
+          "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)17408, (unsigned int)5120, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)91, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "percent": 46.07467090728741
+        },
+        {
+          "milliseconds": 6.467909,
+          "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)5120, (unsigned int)5120, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)80, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "percent": 25.73686541897087
+        },
+        {
+          "milliseconds": 5.471844,
+          "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)64, (unsigned int)5120, (unsigned int)17408, (unsigned int)64, (unsigned int)64, (unsigned int)512, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)80, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "percent": 21.77336023459873
+        },
+        {
+          "milliseconds": 0.121984,
+          "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>, (int)4, TrivialOffsetCalculator<(int)1, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)1>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+          "percent": 0.48539424275569465
+        },
+        {
+          "milliseconds": 0.065632,
+          "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::MeanOps<float, float, float, float>, unsigned int, float, (int)4, (int)4>>(T3)",
+          "percent": 0.2611604385865503
+        },
+        {
+          "milliseconds": 0.056704,
+          "name": "void cutlass::Kernel2<cutlass_80_simt_sgemm_64x64_8x5_tn_align1>(T1::Params)",
+          "percent": 0.22563446961256323
+        },
+        {
+          "milliseconds": 0.042912,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.17075385087497025
+        },
+        {
+          "milliseconds": 0.032192,
+          "name": "sm80_xmma_gemm_f32f32_f32f32_f32_tn_n_tilesize32x32x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+          "percent": 0.12809722146175992
+        },
+        {
+          "milliseconds": 0.028672,
+          "name": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+          "percent": 0.11409056702757146
+        },
+        {
+          "milliseconds": 0.02512,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.09995657937125402
+        },
+        {
+          "milliseconds": 0.019552,
+          "name": "sm80_xmma_gemm_f32f32_f32f32_f32_tn_n_tilesize32x64x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+          "percent": 0.07780059872081045
+        },
+        {
+          "milliseconds": 0.01696,
+          "name": "nvjet_tst_64x32_64x16_1x2_h_bz_TNT",
+          "percent": 0.06748660772836258
+        },
+        {
+          "milliseconds": 0.015808,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctor_add<float>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+          "percent": 0.06290261173171909
+        },
+        {
+          "milliseconds": 0.014208,
+          "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_add<float>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+          "percent": 0.056535950625269796
+        },
+        {
+          "milliseconds": 0.01408,
+          "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+          "percent": 0.05602661773675385
+        },
+        {
+          "milliseconds": 0.005056,
+          "name": "sm80_xmma_gemm_f32f32_f32f32_f32_nn_n_tilesize32x32x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+          "percent": 0.02011864909637979
+        },
+        {
+          "milliseconds": 0.004992,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+          "percent": 0.019863982652121817
+        },
+        {
+          "milliseconds": 0.004352,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, void at::native::<unnamed>::pow_tensor_scalar_kernel_impl<float, float>(at::TensorIteratorBase &, T2)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.017317318209542097
+        },
+        {
+          "milliseconds": 0.00304,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::rsqrt_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 2)]::operator ()() const::[lambda() (instance 2)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.012096656102253672
+        },
+        {
+          "milliseconds": 0.002784,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctorOnSelf_add<float>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.011077990325221783
+        }
+      ],
+      "total_milliseconds": 25.130912
+    },
+    {
+      "host_api_breakdown": {
+        "rows": [
+          {
+            "milliseconds": 17.718968,
+            "name": "cuda_runtime_api_sum_overlaps_gpu_timeline",
+            "percent": 75.37854613542059
+          },
+          {
+            "milliseconds": 16.634091,
+            "name": "cuda_synchronization_api_sum_overlaps_gpu_timeline",
+            "percent": 70.7633534788417
+          }
+        ],
+        "total_milliseconds": 23.506646
+      },
+      "operation_cuda_api_time": {
+        "rows": [
+          {
+            "milliseconds": 4.672021,
+            "name": "backward.layers.0.mlp.up_proj.base_dx_asymgemm",
+            "percent": 19.87531951602113
+          },
+          {
+            "milliseconds": 4.445276,
+            "name": "backward.layers.0.mlp.gate_proj.base_dx_asymgemm",
+            "percent": 18.910719972555846
+          },
+          {
+            "milliseconds": 4.247354,
+            "name": "backward.layers.0.attention.o_proj.base_dx_asymgemm",
+            "percent": 18.0687368159626
+          },
+          {
+            "milliseconds": 0.925206,
+            "name": "backward.layers.0.attention.q_proj.base_dx_asymgemm",
+            "percent": 3.93593369296496
+          },
+          {
+            "milliseconds": 0.906125,
+            "name": "backward.layers.0.attention.k_proj.base_dx_asymgemm",
+            "percent": 3.8547609046394795
+          },
+          {
+            "milliseconds": 0.409797,
+            "name": "backward.layers.0.attention.v_proj.base_dx_asymgemm",
+            "percent": 1.7433239944141756
+          },
+          {
+            "milliseconds": 0.047599,
+            "name": "backward.loss.cross_entropy",
+            "percent": 0.2024916698026592
+          },
+          {
+            "milliseconds": 0.046964,
+            "name": "backward.layers.0.mlp.down_proj.base_dx_asymgemm",
+            "percent": 0.19979030611172685
+          },
+          {
+            "milliseconds": 0.043199,
+            "name": "backward.layers.0.mlp.layernorm",
+            "percent": 0.1837735591883249
+          },
+          {
+            "milliseconds": 0.041451,
+            "name": "backward.final_norm",
+            "percent": 0.1763373643351757
+          },
+          {
+            "milliseconds": 0.038842,
+            "name": "backward.layers.0.attention.layernorm",
+            "percent": 0.16523837556408516
+          },
+          {
+            "milliseconds": 0.029785,
+            "name": "backward.layers.0.mlp.silu_mul_activation",
+            "percent": 0.1267088465108974
+          },
+          {
+            "milliseconds": 0.027046,
+            "name": "backward.layers.0.attention.v_proj.base_lora_add",
+            "percent": 0.11505682265347426
+          },
+          {
+            "milliseconds": 0.020357,
+            "name": "backward.layers.0.mlp.gate_proj.lora_B",
+            "percent": 0.08660104040363734
+          },
+          {
+            "milliseconds": 0.018866,
+            "name": "backward.layers.0.mlp.down_proj.lora_B",
+            "percent": 0.08025815337500722
+          },
+          {
+            "milliseconds": 0.018640999999999998,
+            "name": "backward.layers.0.attention.o_proj.lora_B",
+            "percent": 0.07930097726404693
+          },
+          {
+            "milliseconds": 0.018238,
+            "name": "backward.layers.0.attention.softmax",
+            "percent": 0.07758656849641588
+          },
+          {
+            "milliseconds": 0.017032,
+            "name": "backward.layers.0.attention.k_proj.lora_B",
+            "percent": 0.07245610454166876
+          },
+          {
+            "milliseconds": 0.01696,
+            "name": "backward.layers.0.mlp.up_proj.lora_B",
+            "percent": 0.07214980818616147
+          },
+          {
+            "milliseconds": 0.016625,
+            "name": "backward.layers.0.attention.v_proj.lora_B",
+            "percent": 0.07072467930984284
+          },
+          {
+            "milliseconds": 0.016463,
+            "name": "backward.layers.0.attention.q_proj.lora_B",
+            "percent": 0.07003551250995144
+          },
+          {
+            "milliseconds": 0.01397,
+            "name": "backward.layers.0.attention.k_proj.base_lora_add",
+            "percent": 0.05943000120051155
+          },
+          {
+            "milliseconds": 0.013549,
+            "name": "backward.layers.0.mlp.gate_proj.base_lora_add",
+            "percent": 0.05763901834400365
+          },
+          {
+            "milliseconds": 0.013413,
+            "name": "backward.layers.0.mlp.residual_add",
+            "percent": 0.057060458561378764
+          },
+          {
+            "milliseconds": 0.013358,
+            "name": "backward.layers.0.mlp.down_proj.base_lora_add",
+            "percent": 0.056826482178699594
+          },
+          {
+            "milliseconds": 0.013117,
+            "name": "backward.layers.0.attention.q_proj.base_lora_add",
+            "percent": 0.05580124021095992
+          },
+          {
+            "milliseconds": 0.013098,
+            "name": "backward.layers.0.attention.o_proj.base_lora_add",
+            "percent": 0.055720412006034385
+          },
+          {
+            "milliseconds": 0.012607,
+            "name": "backward.layers.0.mlp.up_proj.base_lora_add",
+            "percent": 0.05363164102611661
+          },
+          {
+            "milliseconds": 0.012375,
+            "name": "backward.layers.0.attention.residual_add",
+            "percent": 0.05264468610281535
+          },
+          {
+            "milliseconds": 0.011959000000000001,
+            "name": "backward.layers.0.mlp.down_proj.lora_A",
+            "percent": 0.05087497382655102
+          },
+          {
+            "milliseconds": 0.011563,
+            "name": "backward.layers.0.mlp.gate_proj.lora_A",
+            "percent": 0.04919034387126092
+          },
+          {
+            "milliseconds": 0.01147,
+            "name": "backward.layers.0.mlp.up_proj.lora_A",
+            "percent": 0.04879471107873067
+          },
+          {
+            "milliseconds": 0.010983,
+            "name": "backward.layers.0.attention.o_proj.lora_A",
+            "percent": 0.046722956563007755
+          },
+          {
+            "milliseconds": 0.01082,
+            "name": "backward.layers.0.attention.v_proj.lora_A",
+            "percent": 0.046029535647067646
+          },
+          {
+            "milliseconds": 0.010809,
+            "name": "backward.layers.0.attention.q_proj.lora_A",
+            "percent": 0.04598274037053181
+          },
+          {
+            "milliseconds": 0.010144,
+            "name": "backward.layers.0.attention.k_proj.lora_A",
+            "percent": 0.04315375319813809
+          },
+          {
+            "milliseconds": 0.009544,
+            "name": "backward.layers.0.attention.v_proj.add_cast_scale",
+            "percent": 0.040601283568910684
+          },
+          {
+            "milliseconds": 0.009455,
+            "name": "backward.lm_head",
+            "percent": 0.040222667240575286
+          },
+          {
+            "milliseconds": 0.009208,
+            "name": "backward.layers.0.attention.o_proj.add_cast_scale",
+            "percent": 0.03917190057654333
+          },
+          {
+            "milliseconds": 0.009181,
+            "name": "backward.layers.0.attention.k_proj.add_cast_scale",
+            "percent": 0.0390570394432281
+          },
+          {
+            "milliseconds": 0.009066,
+            "name": "backward.layers.0.mlp.gate_proj.add_cast_scale",
+            "percent": 0.038567816097626176
+          },
+          {
+            "milliseconds": 0.008881,
+            "name": "backward.layers.0.mlp.up_proj.add_cast_scale",
+            "percent": 0.03778080462861439
+          },
+          {
+            "milliseconds": 0.008701,
+            "name": "backward.layers.0.attention.q_proj.add_cast_scale",
+            "percent": 0.03701506373984617
+          },
+          {
+            "milliseconds": 0.008466,
+            "name": "backward.layers.0.mlp.down_proj.add_cast_scale",
+            "percent": 0.03601534646839876
+          },
+          {
+            "milliseconds": 0.006048,
+            "name": "backward.layers.0.attention.value_matmul.lhs_grad",
+            "percent": 0.0257288938626123
+          },
+          {
+            "milliseconds": 0.005773,
+            "name": "backward.layers.0.attention.scores_matmul.lhs_grad",
+            "percent": 0.024559011949216406
+          },
+          {
+            "milliseconds": 0.005207,
+            "name": "backward.layers.0.attention.value_matmul.rhs_grad",
+            "percent": 0.022151182265645213
+          },
+          {
+            "milliseconds": 0.005125,
+            "name": "backward.layers.0.attention.scores_matmul.rhs_grad",
+            "percent": 0.021802344749650805
+          }
+        ],
+        "total_milliseconds": 23.506646
+      },
+      "operation_kernel_time": {
+        "rows": [
+          {
+            "milliseconds": 5.307652,
+            "name": "backward.layers.0.mlp.down_proj.base_dx_asymgemm",
+            "percent": 22.579367554180212
+          },
+          {
+            "milliseconds": 4.997988,
+            "name": "backward.layers.0.mlp.gate_proj.base_dx_asymgemm",
+            "percent": 21.262020962071748
+          },
+          {
+            "milliseconds": 4.961732,
+            "name": "backward.layers.0.mlp.up_proj.base_dx_asymgemm",
+            "percent": 21.10778373060963
+          },
+          {
+            "milliseconds": 1.466145,
+            "name": "backward.layers.0.attention.k_proj.base_dx_asymgemm",
+            "percent": 6.23715097423937
+          },
+          {
+            "milliseconds": 1.466081,
+            "name": "backward.layers.0.attention.q_proj.base_dx_asymgemm",
+            "percent": 6.236878710812253
+          },
+          {
+            "milliseconds": 1.461217,
+            "name": "backward.layers.0.attention.o_proj.base_dx_asymgemm",
+            "percent": 6.216186690351316
+          },
+          {
+            "milliseconds": 1.460545,
+            "name": "backward.layers.0.attention.v_proj.base_dx_asymgemm",
+            "percent": 6.213327924366581
+          },
+          {
+            "milliseconds": 0.038432,
+            "name": "backward.final_norm",
+            "percent": 0.16349418798411308
+          },
+          {
+            "milliseconds": 0.03824,
+            "name": "backward.layers.0.mlp.layernorm",
+            "percent": 0.16267739770276032
+          },
+          {
+            "milliseconds": 0.037728,
+            "name": "backward.layers.0.attention.layernorm",
+            "percent": 0.16049929028581958
+          },
+          {
+            "milliseconds": 0.024576,
+            "name": "backward.layers.0.mlp.gate_proj.lora_B",
+            "percent": 0.10454915601315476
+          },
+          {
+            "milliseconds": 0.024384,
+            "name": "backward.layers.0.mlp.up_proj.lora_B",
+            "percent": 0.10373236573180199
+          },
+          {
+            "milliseconds": 0.020736,
+            "name": "backward.layers.0.mlp.silu_mul_activation",
+            "percent": 0.08821335038609932
+          },
+          {
+            "milliseconds": 0.017793,
+            "name": "backward.layers.0.mlp.down_proj.lora_A",
+            "percent": 0.07569348685473887
+          },
+          {
+            "milliseconds": 0.014816,
+            "name": "backward.layers.0.mlp.down_proj.lora_B",
+            "percent": 0.0630289833777222
+          },
+          {
+            "milliseconds": 0.01472,
+            "name": "backward.layers.0.attention.q_proj.lora_B",
+            "percent": 0.06262058823704582
+          },
+          {
+            "milliseconds": 0.014688,
+            "name": "backward.layers.0.attention.o_proj.lora_B",
+            "percent": 0.06248445652348701
+          },
+          {
+            "milliseconds": 0.014624,
+            "name": "backward.layers.0.attention.v_proj.lora_B",
+            "percent": 0.062212193096369425
+          },
+          {
+            "milliseconds": 0.013951999999999999,
+            "name": "backward.layers.0.attention.k_proj.lora_B",
+            "percent": 0.05935342711163473
+          },
+          {
+            "milliseconds": 0.011584,
+            "name": "backward.layers.0.mlp.up_proj.lora_A",
+            "percent": 0.049279680308283884
+          },
+          {
+            "milliseconds": 0.011552,
+            "name": "backward.lm_head",
+            "percent": 0.049143548594725084
+          },
+          {
+            "milliseconds": 0.011552,
+            "name": "backward.layers.0.mlp.gate_proj.lora_A",
+            "percent": 0.049143548594725084
+          },
+          {
+            "milliseconds": 0.011231999999999999,
+            "name": "backward.layers.0.attention.o_proj.lora_A",
+            "percent": 0.04778223145913713
+          },
+          {
+            "milliseconds": 0.011231999999999999,
+            "name": "backward.layers.0.attention.v_proj.lora_A",
+            "percent": 0.04778223145913713
+          },
+          {
+            "milliseconds": 0.011072,
+            "name": "backward.layers.0.attention.q_proj.lora_A",
+            "percent": 0.04710157289134315
+          },
+          {
+            "milliseconds": 0.010624000000000001,
+            "name": "backward.layers.0.attention.k_proj.lora_A",
+            "percent": 0.04519572890152003
+          },
+          {
+            "milliseconds": 0.009376,
+            "name": "backward.layers.0.mlp.gate_proj.base_lora_add",
+            "percent": 0.03988659207272701
+          },
+          {
+            "milliseconds": 0.009024,
+            "name": "backward.layers.0.mlp.up_proj.base_lora_add",
+            "percent": 0.038389143223580266
+          },
+          {
+            "milliseconds": 0.007424,
+            "name": "backward.layers.0.attention.softmax",
+            "percent": 0.031582557545640495
+          },
+          {
+            "milliseconds": 0.007136,
+            "name": "backward.loss.cross_entropy",
+            "percent": 0.03035737212361134
+          },
+          {
+            "milliseconds": 0.007104,
+            "name": "backward.layers.0.attention.value_matmul.lhs_grad",
+            "percent": 0.030221240410052547
+          },
+          {
+            "milliseconds": 0.00688,
+            "name": "backward.layers.0.mlp.up_proj.add_cast_scale",
+            "percent": 0.029268318415140975
+          },
+          {
+            "milliseconds": 0.00688,
+            "name": "backward.layers.0.mlp.gate_proj.add_cast_scale",
+            "percent": 0.029268318415140975
+          },
+          {
+            "milliseconds": 0.006144,
+            "name": "backward.layers.0.attention.scores_matmul.lhs_grad",
+            "percent": 0.02613728900328869
+          },
+          {
+            "milliseconds": 0.005632,
+            "name": "backward.layers.0.attention.scores_matmul.rhs_grad",
+            "percent": 0.023959181586347966
+          },
+          {
+            "milliseconds": 0.005504,
+            "name": "backward.layers.0.attention.q_proj.base_lora_add",
+            "percent": 0.023414654732112784
+          },
+          {
+            "milliseconds": 0.005472,
+            "name": "backward.layers.0.attention.v_proj.base_lora_add",
+            "percent": 0.023278523018553987
+          },
+          {
+            "milliseconds": 0.005376,
+            "name": "backward.layers.0.attention.k_proj.base_lora_add",
+            "percent": 0.0228701278778776
+          },
+          {
+            "milliseconds": 0.00528,
+            "name": "backward.layers.0.mlp.residual_add",
+            "percent": 0.022461732737201215
+          },
+          {
+            "milliseconds": 0.00528,
+            "name": "backward.layers.0.attention.value_matmul.rhs_grad",
+            "percent": 0.022461732737201215
+          },
+          {
+            "milliseconds": 0.005248,
+            "name": "backward.layers.0.attention.residual_add",
+            "percent": 0.022325601023642422
+          },
+          {
+            "milliseconds": 0.005184,
+            "name": "backward.layers.0.mlp.down_proj.base_lora_add",
+            "percent": 0.02205333759652483
+          },
+          {
+            "milliseconds": 0.005088,
+            "name": "backward.layers.0.attention.o_proj.base_lora_add",
+            "percent": 0.02164494245584844
+          },
+          {
+            "milliseconds": 0.004,
+            "name": "backward.layers.0.mlp.down_proj.add_cast_scale",
+            "percent": 0.017016464194849406
+          },
+          {
+            "milliseconds": 0.003904,
+            "name": "backward.layers.0.attention.q_proj.add_cast_scale",
+            "percent": 0.01660806905417302
+          },
+          {
+            "milliseconds": 0.003872,
+            "name": "backward.layers.0.attention.v_proj.add_cast_scale",
+            "percent": 0.016471937340614223
+          },
+          {
+            "milliseconds": 0.00384,
+            "name": "backward.layers.0.attention.o_proj.add_cast_scale",
+            "percent": 0.01633580562705543
+          },
+          {
+            "milliseconds": 0.00384,
+            "name": "backward.layers.0.attention.k_proj.add_cast_scale",
+            "percent": 0.01633580562705543
+          }
+        ],
+        "total_milliseconds": 23.506646
+      },
+      "stage": "step.backward",
+      "stage_breakdown": {
+        "rows": [
+          {
+            "milliseconds": 21.665714,
+            "name": "cuda_kernel_busy_union",
+            "percent": 92.16846163421188
+          },
+          {
+            "milliseconds": 1.8248039999999988,
+            "name": "gpu_no_kernel_time",
+            "percent": 7.762927982154489
+          },
+          {
+            "milliseconds": 0.016128,
+            "name": "cuda_memcpy_union",
+            "percent": 0.06861038363363281
+          }
+        ],
+        "total_milliseconds": 23.506646
+      },
+      "top_kernels": [
+        {
+          "milliseconds": 9.956744,
+          "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)5120, (unsigned int)17408, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)80, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "percent": 42.357144443320415
+        },
+        {
+          "milliseconds": 5.848036,
+          "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)5120, (unsigned int)5120, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)80, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "percent": 24.878223801047582
+        },
+        {
+          "milliseconds": 5.305028,
+          "name": "void asym_gemm::sm90_bf16_asym_gemm_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)1, (unsigned int)64, (unsigned int)17408, (unsigned int)5120, (unsigned int)64, (unsigned int)64, (unsigned int)64, (unsigned int)1, (unsigned int)128, (unsigned int)128, (unsigned int)0, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)0, (unsigned int)91, (asym_gemm::GemmType)1, (bool)0, float, (unsigned long)100>(unsigned int *, unsigned int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "percent": 22.568204753668386
+        },
+        {
+          "milliseconds": 0.06752,
+          "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>, (int)4, TrivialOffsetCalculator<(int)1, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)1>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+          "percent": 0.287237915609058
+        },
+        {
+          "milliseconds": 0.06576,
+          "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::MeanOps<float, float, float, float>, unsigned int, float, (int)4, (int)4>>(T3)",
+          "percent": 0.2797506713633242
+        },
+        {
+          "milliseconds": 0.063232,
+          "name": "sm80_xmma_gemm_f32f32_f32f32_f32_nt_n_tilesize32x32x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+          "percent": 0.2689962659921794
+        },
+        {
+          "milliseconds": 0.047648,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.20270012148904612
+        },
+        {
+          "milliseconds": 0.0456,
+          "name": "void cutlass::Kernel2<cutlass_80_simt_sgemm_64x64_8x5_nn_align1>(T1::Params)",
+          "percent": 0.19398769182128325
+        },
+        {
+          "milliseconds": 0.04544,
+          "name": "sm80_xmma_gemm_f32f32_f32f32_f32_nn_n_tilesize32x32x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+          "percent": 0.19330703325348927
+        },
+        {
+          "milliseconds": 0.030464,
+          "name": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+          "percent": 0.12959739130797307
+        },
+        {
+          "milliseconds": 0.025152,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)2>>(int, T2, T3)",
+          "percent": 0.10699952685721306
+        },
+        {
+          "milliseconds": 0.023712,
+          "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+          "percent": 0.10087359974706728
+        },
+        {
+          "milliseconds": 0.023616,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+          "percent": 0.1004652046063909
+        },
+        {
+          "milliseconds": 0.016992,
+          "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+          "percent": 0.07228593989972028
+        },
+        {
+          "milliseconds": 0.016416,
+          "name": "sm80_xmma_gemm_f32f32_f32f32_f32_nt_n_tilesize64x64x8_stage3_warpsize1x4x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+          "percent": 0.06983556905566196
+        },
+        {
+          "milliseconds": 0.011552,
+          "name": "nvjet_tst_64x64_64x13_4x1_v_bz_NNT",
+          "percent": 0.049143548594725084
+        },
+        {
+          "milliseconds": 0.009857,
+          "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 12)]::operator ()() const::[lambda(c10::BFloat16) (instance 1)]>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+          "percent": 0.04193282189215764
+        },
+        {
+          "milliseconds": 0.009472,
+          "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_add<float>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+          "percent": 0.04029498721340339
+        },
+        {
+          "milliseconds": 0.009056,
+          "name": "sm80_xmma_gemm_f32f32_f32f32_f32_nn_n_tilesize32x64x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+          "percent": 0.03852527493713905
+        },
+        {
+          "milliseconds": 0.008737,
+          "name": "sm80_xmma_gemm_f32f32_f32f32_f32_nt_n_tilesize32x64x8_stage3_warpsize1x2x1_ffma_aligna4_alignc4_execute_kernel__5x_cublas",
+          "percent": 0.037168211917599815
+        }
+      ],
+      "total_milliseconds": 23.506646
+    }
+  ]
+}
