@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import gc
 import json
 import sys
@@ -63,19 +63,36 @@ QWEN3_30B_A3B_CONFIG = {
 }
 
 
-MATRIX_1B_CONFIG = {
-    "tokens": 64,
-    "in_features": 32768,
-    "out_features": 32768,
+MM_CONFIGS = {
+    "mm_1b": {
+        "tokens": 64,
+        "in_features": 32768,
+        "out_features": 32768,
+    },
+    "mm_3b": {
+        "tokens": 64,
+        "in_features": 55296,
+        "out_features": 55296,
+    },
 }
+MATRIX_1B_CONFIG = MM_CONFIGS["mm_1b"]
 
 
-MLP_1B_CONFIG = {
-    "tokens": 64,
-    "in_features": 8192,
-    "hidden_features": 65536,
-    "out_features": 8192,
+MLP_CONFIGS = {
+    "mlp_1b": {
+        "tokens": 64,
+        "in_features": 8192,
+        "hidden_features": 65536,
+        "out_features": 8192,
+    },
+    "mlp_3b": {
+        "tokens": 64,
+        "in_features": 8192,
+        "hidden_features": 183040,
+        "out_features": 8192,
+    },
 }
+MLP_1B_CONFIG = MLP_CONFIGS["mlp_1b"]
 
 
 def sync(device: torch.device) -> None:
@@ -93,6 +110,11 @@ def clear(device: torch.device) -> None:
 
 def nbytes(tensor: torch.Tensor | None) -> int:
     return 0 if tensor is None else int(tensor.numel() * tensor.element_size())
+
+
+def requested_tokens(args: argparse.Namespace, default: int) -> int:
+    tokens = int(getattr(args, "real_tokens", 0) or 0)
+    return tokens if tokens > 0 else int(default)
 
 
 class StageBook:
@@ -680,7 +702,8 @@ def profile_mlp(args: argparse.Namespace, device: torch.device, dtype: torch.dty
 
     clear(device)
     stats = AsymExecutionStats()
-    tokens, in_features, hidden, out_features, rank = (64, 128, 256, 128, 8) if device.type == "cuda" else (4, 16, 32, 16, 4)
+    default_tokens, in_features, hidden, out_features, rank = (64, 128, 256, 128, 8) if device.type == "cuda" else (4, 16, 32, 16, 4)
+    tokens = requested_tokens(args, default_tokens)
     torch.manual_seed(0)
     model = AsymMLP(
         torch.randn(hidden, in_features, dtype=dtype),
@@ -797,16 +820,17 @@ def _fundamental_config(raw: dict[str, int]) -> dict[str, Any]:
         params = config["in_features"] * config["out_features"]
     config["base_parameter_count"] = int(params)
     config["base_parameter_billions"] = float(params) / 1_000_000_000.0
-    config["profile_goal"] = "fundamental_1b_parameter_asymgemm"
+    config["profile_goal"] = "fundamental_parameter_asymgemm"
     return config
 
 
-def profile_matrix_1b(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
+def profile_mm(args: argparse.Namespace, device: torch.device, dtype: torch.dtype, workload: str) -> dict[str, Any]:
     from asym_gemm.training.frozen_linear import AsymExecutionStats, AsymFrozenLinear
 
     clear(device)
     stats = AsymExecutionStats()
-    cfg = MATRIX_1B_CONFIG
+    cfg = dict(MATRIX_1B_CONFIG if workload == "matrix_1b" else MM_CONFIGS[workload])
+    cfg["tokens"] = requested_tokens(args, int(cfg["tokens"]))
     torch.manual_seed(101)
     weight = torch.randn(cfg["out_features"], cfg["in_features"], dtype=dtype)
     model = AsymFrozenLinear(weight, backend=args.backend, pin_memory=device.type == "cuda", stats=stats)
@@ -831,7 +855,7 @@ def profile_matrix_1b(args: argparse.Namespace, device: torch.device, dtype: tor
     run_fundamental_steps(book, make_batch, forward_fn, loss_fn, args, reset_stats=lambda: reset_execution_stats(stats))
     avg = average(book.values, args.measure_steps)
     return build_report(
-        "matrix_1b",
+        workload,
         model,
         device,
         avg,
@@ -842,7 +866,11 @@ def profile_matrix_1b(args: argparse.Namespace, device: torch.device, dtype: tor
     )
 
 
-def profile_mlp_1b(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
+def profile_matrix_1b(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
+    return profile_mm(args, device, dtype, "matrix_1b")
+
+
+def profile_mlp_fundamental(args: argparse.Namespace, device: torch.device, dtype: torch.dtype, workload: str) -> dict[str, Any]:
     from asym_gemm.training.frozen_linear import AsymExecutionStats, AsymFrozenLinear
 
     class FundamentalMLP(torch.nn.Module):
@@ -864,7 +892,8 @@ def profile_mlp_1b(args: argparse.Namespace, device: torch.device, dtype: torch.
 
     clear(device)
     stats = AsymExecutionStats()
-    cfg = MLP_1B_CONFIG
+    cfg = dict(MLP_CONFIGS[workload])
+    cfg["tokens"] = requested_tokens(args, int(cfg["tokens"]))
     model = FundamentalMLP(stats)
 
     def make_batch() -> tuple[torch.Tensor, torch.Tensor]:
@@ -890,7 +919,7 @@ def profile_mlp_1b(args: argparse.Namespace, device: torch.device, dtype: torch.
     run_fundamental_steps(book, make_batch, forward_fn, loss_fn, args, reset_stats=lambda: reset_execution_stats(stats))
     avg = average(book.values, args.measure_steps)
     return build_report(
-        "mlp_1b",
+        workload,
         model,
         device,
         avg,
@@ -908,6 +937,10 @@ def profile_mlp_1b(args: argparse.Namespace, device: torch.device, dtype: torch.
         ],
         config=_fundamental_config(cfg),
     )
+
+
+def profile_mlp_1b(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
+    return profile_mlp_fundamental(args, device, dtype, "mlp_1b")
 
 
 def set_profile_names(model: torch.nn.Module) -> None:
@@ -1155,6 +1188,14 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
 
     clear(device)
     config = getattr(args, "_dense_config_override", MICRO_DENSE_LLM_CONFIG)
+    if not hasattr(args, "_dense_config_override") and int(args.real_tokens or 0) > 0:
+        config = replace(
+            config,
+            batch_size=int(args.real_batch_size),
+            seq_len=int(args.real_seq_len),
+            lora_rank=int(args.real_lora_rank),
+            lora_alpha=float(args.real_lora_alpha),
+        )
     workload_name = str(getattr(args, "_workload_name_override", "m4_2_dense_llm"))
     config_extra = dict(getattr(args, "_config_extra", {}))
     stats = AsymExecutionStats()
@@ -1462,6 +1503,15 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
 
     clear(device)
     config = getattr(args, "_moe_config_override", MICRO_MOE_CONFIG)
+    if not hasattr(args, "_moe_config_override") and int(args.real_tokens or 0) > 0:
+        config = replace(
+            config,
+            batch_size=int(args.real_batch_size),
+            seq_len=int(args.real_seq_len),
+            logical_tokens=requested_tokens(args, int(config.logical_tokens)),
+            lora_rank=int(args.real_lora_rank),
+            lora_alpha=float(args.real_lora_alpha),
+        )
     workload_name = str(getattr(args, "_workload_name_override", "m4_3_moe"))
     config_extra = dict(getattr(args, "_config_extra", {}))
     model, _, _, stats = make_tiny_moe_pair(config=config, seed=3, device=device, base_dtype=dtype, backend=args.backend, pin_memory=device.type == "cuda")
@@ -1765,7 +1815,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--workload",
-        choices=["mlp", "dense", "moe", "qwen3_14b", "qwen3_30b_a3b", "matrix_1b", "mlp_1b"],
+        choices=["mlp", "dense", "moe", "qwen3_14b", "qwen3_30b_a3b", "matrix_1b", "mm_1b", "mm_3b", "mlp_1b", "mlp_3b"],
         default="mlp",
     )
     parser.add_argument("--device", default="cuda:1")
@@ -1813,8 +1863,12 @@ def main() -> None:
             return profile_moe(args, device, dtype)
         if args.workload == "matrix_1b":
             return profile_matrix_1b(args, device, dtype)
+        if args.workload in {"mm_1b", "mm_3b"}:
+            return profile_mm(args, device, dtype, args.workload)
         if args.workload == "mlp_1b":
             return profile_mlp_1b(args, device, dtype)
+        if args.workload == "mlp_3b":
+            return profile_mlp_fundamental(args, device, dtype, "mlp_3b")
         if args.workload == "qwen3_14b":
             args._dense_config_override = qwen3_14b_dense_config(args)
             args._workload_name_override = "qwen3_14b"

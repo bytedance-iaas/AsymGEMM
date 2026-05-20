@@ -20,11 +20,12 @@ NSYS_POSTPROCESS_SCRIPT = ROOT / "scripts" / "postprocess_nsys_m4.py"
 CPU_GAPS_SCRIPT = ROOT / "scripts" / "profile_nsys_cpu_gaps.py"
 NCU_SCRIPT = ROOT / "scripts" / "profile_ncu_asymgemm.py"
 
-WORKLOADS = ("mlp", "dense", "moe", "qwen3_14b", "qwen3_30b_a3b", "matrix_1b", "mlp_1b")
+WORKLOADS = ("mlp_1b", "mlp_3b", "mm_1b", "mm_3b", "mlp", "dense", "moe", "qwen3_14b", "qwen3_30b_a3b")
 WORKLOAD_ALIASES = {
     "toy": ("mlp", "dense", "moe"),
     "qwen": ("qwen3_14b", "qwen3_30b_a3b"),
-    "fundamental": ("matrix_1b", "mlp_1b"),
+    "fundamental": ("mlp_1b", "mlp_3b", "mm_1b", "mm_3b"),
+    "matrix_1b": ("mm_1b",),
     "all": WORKLOADS,
 }
 BACKENDS = ("asym_only", "torch_only")
@@ -35,7 +36,7 @@ PROFILER_ALIASES = {
     "profile": ("source",),
     "cpu_gaps": ("cpu",),
 }
-NCU_WORKLOADS = {"matrix_1b", "mlp_1b", "qwen3_14b", "qwen3_30b_a3b"}
+NCU_WORKLOADS = {"mm_1b", "mm_3b", "mlp_1b", "mlp_3b", "qwen3_14b", "qwen3_30b_a3b"}
 
 
 def _split_tokens(values: Iterable[str]) -> list[str]:

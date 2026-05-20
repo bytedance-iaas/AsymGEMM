@@ -11,11 +11,25 @@ from typing import Any
 
 
 EXPECTED_OPS = {
+    "mm_1b": [
+        "forward.matrix.base_frozen_asymgemm",
+        "backward.matrix.base_dx_asymgemm",
+    ],
+    "mm_3b": [
+        "forward.matrix.base_frozen_asymgemm",
+        "backward.matrix.base_dx_asymgemm",
+    ],
     "matrix_1b": [
         "forward.matrix.base_frozen_asymgemm",
         "backward.matrix.base_dx_asymgemm",
     ],
     "mlp_1b": [
+        "forward.fc1.base_frozen_asymgemm",
+        "forward.fc2.base_frozen_asymgemm",
+        "backward.fc2.base_dx_asymgemm",
+        "backward.fc1.base_dx_asymgemm",
+    ],
+    "mlp_3b": [
         "forward.fc1.base_frozen_asymgemm",
         "forward.fc2.base_frozen_asymgemm",
         "backward.fc2.base_dx_asymgemm",

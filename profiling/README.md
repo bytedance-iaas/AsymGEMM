@@ -7,8 +7,10 @@ and are kept as `debug.md` / `debug.json`.
 
 | Directory | Workload | Contents |
 |---|---|---|
-| `matrix_1b/` | Fundamental single 1.073B-parameter frozen matrix | Nsight GPU timeline/kernel/memcpy/no-kernel table |
+| `mm_1b/` | Fundamental single 1.073B-parameter frozen matrix | Nsight GPU timeline/kernel/memcpy/no-kernel table |
+| `mm_3b/` | Fundamental single 3.058B-parameter frozen matrix | Nsight GPU timeline/kernel/memcpy/no-kernel table |
 | `mlp_1b/` | Fundamental 1.073B-parameter two-layer MLP | Nsight GPU timeline/kernel/memcpy/no-kernel table |
+| `mlp_3b/` | Fundamental 2.999B-parameter two-layer MLP | Nsight GPU timeline/kernel/memcpy/no-kernel table |
 | `mlp/` | M4.1 MLP toy | Nsight GPU timeline/kernel/memcpy/no-kernel table |
 | `dense_llm/` | M4.2 dense LLM toy | Nsight GPU timeline/kernel/memcpy/no-kernel table |
 | `moe_contiguous/` | M4.3 MoE toy, contiguous routing | Nsight GPU timeline/kernel/memcpy/no-kernel table |
@@ -32,8 +34,10 @@ be used for paper timing claims.
 The fundamental selectors are:
 
 ```bash
-python scripts/profile_lora.py --workload matrix_1b --timing-mode profile
+python scripts/profile_lora.py --workload mm_1b --timing-mode profile
+python scripts/profile_lora.py --workload mm_3b --timing-mode profile
 python scripts/profile_lora.py --workload mlp_1b --timing-mode profile
+python scripts/profile_lora.py --workload mlp_3b --timing-mode profile
 ```
 
 LoRA-SFT workflow comparisons can run `asym_only` and `torch_only` over the
@@ -43,21 +47,21 @@ path; it is useful for sanity checks, but it is not a GPU-resident
 LLaMA-Factory baseline.
 
 ```bash
-scripts/profile_lora_driver.sh \
-  --gpus 2,3,4,5,6,7 \
-  --workloads qwen3_14b qwen3_30b_a3b \
-  --backends asym_only torch_only \
-  --profilers source nsys cpu ncu \
-  --profile-layers 1 --batch-size 1 --seq-len 64 \
-  --lora-rank 64 --lora-alpha 128 \
-  --precision bf16 --workflow lora_sft --mode auto
+scripts/profile_lora_driver.sh --gpus 2,3,4,5,6,7
 ```
+
+The user-editable defaults live at the top of `scripts/profile_lora_driver.sh`.
+By default it runs workloads `mlp_1b mlp_3b mm_1b mm_3b mlp dense moe
+qwen3_14b qwen3_30b_a3b`, backends `asym_only torch_only`, profiler modes
+`source nsys cpu ncu`, and common LoRA settings `--profile-layers 1
+--batch-size 32 --seq-len 64 --tokens 2048 --lora-rank 64 --lora-alpha 128`,
+with `--precision bf16 --workflow lora_sft --mode auto`.
 
 The shell driver launches one background Python driver job per workload/backend
 pair, assigns jobs across the GPU pool, writes logs under
 `profiling/driver_logs/`, waits for all jobs, and traps INT/TERM/ERR to stop
-the full process tree.  Use `python scripts/profile_lora_driver.py ...` only
-when a single foreground driver process is desired.
+the full process tree.  Treat `scripts/profile_lora_driver.sh` as the standard
+profiling entrypoint; `scripts/profile_lora_driver.py` is the internal worker.
 
 The driver stores directly in this `profiling/` tree by default.  Each workload
 gets its own group directory, matching the existing layout:
@@ -94,13 +98,13 @@ Driver profiler modes:
 | `ncu` | Nsight Compute kernel-internal metrics | `profiling/<workload>/<stem>/table.md`, `profile.json`, `report.ncu-rep` |
 
 `ncu` is run only for `asym_only` and supported AsymGEMM workloads
-(`matrix_1b`, `mlp_1b`, `qwen3_14b`, `qwen3_30b_a3b`); unsupported
+(`mm_1b`, `mm_3b`, `mlp_1b`, `mlp_3b`, `qwen3_14b`, `qwen3_30b_a3b`); unsupported
 combinations are recorded as skipped.
 
 The fundamental NCU selectors are:
 
 ```bash
-python scripts/profile_ncu_asymgemm.py --workload matrix_1b --preset paper
+python scripts/profile_ncu_asymgemm.py --workload mm_1b --preset paper
 python scripts/profile_ncu_asymgemm.py --workload mlp_1b --preset paper
 ```
 

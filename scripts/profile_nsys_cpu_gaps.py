@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
 from scripts.postprocess_nsys_cpu_gaps import markdown, summarize_cpu_gaps  # noqa: E402
 
 
-WORKLOADS = ["mlp", "dense", "moe", "matrix_1b", "mlp_1b", "qwen3_14b", "qwen3_30b_a3b"]
+WORKLOADS = ["mlp", "dense", "moe", "matrix_1b", "mm_1b", "mm_3b", "mlp_1b", "mlp_3b", "qwen3_14b", "qwen3_30b_a3b"]
 
 
 def main() -> None:
