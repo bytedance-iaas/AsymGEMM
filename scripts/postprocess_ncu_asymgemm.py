@@ -19,10 +19,6 @@ EXPECTED_OPS = {
         "forward.matrix.base_frozen_asymgemm",
         "backward.matrix.base_dx_asymgemm",
     ],
-    "matrix_1b": [
-        "forward.matrix.base_frozen_asymgemm",
-        "backward.matrix.base_dx_asymgemm",
-    ],
     "mlp_1b": [
         "forward.fc1.base_frozen_asymgemm",
         "forward.fc2.base_frozen_asymgemm",

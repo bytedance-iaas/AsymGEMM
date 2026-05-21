@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exclusive-ish M4.1-M4.3 toy profiling reports.
+"""LoRA-SFT profiling reports.
 
 This profiler intentionally reports additive tables.  Rows that cannot be
 split safely from PyTorch autograd are kept in explicit *_other buckets.
@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from contextlib import contextmanager
-from dataclasses import asdict, replace
+from contextlib import contextmanager, nullcontext
+from dataclasses import asdict, dataclass, replace
 import gc
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -34,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from asym_gemm.training.profile_ranges import profile_enabled
+from asym_gemm.training.profile_ranges import current_profile_range, profile_enabled
 
 
 QWEN3_14B_CONFIG = {
@@ -89,6 +90,12 @@ CUSTOM_MOE_3B_CONFIG = {
 }
 
 
+DEFAULT_LORA_BATCH_SIZE = 32
+DEFAULT_LORA_SEQ_LEN = 64
+DEFAULT_LORA_HIDDEN_DIM = 1024
+DEFAULT_LORA_MLP_EXPANSION = 4
+
+
 MM_CONFIGS = {
     "mm_1b": {
         "tokens": 64,
@@ -96,12 +103,14 @@ MM_CONFIGS = {
         "out_features": 32768,
     },
     "mm_3b": {
-        "tokens": 64,
-        "in_features": 55296,
-        "out_features": 55296,
+        "batch_size": DEFAULT_LORA_BATCH_SIZE,
+        "seq_len": DEFAULT_LORA_SEQ_LEN,
+        "tokens": DEFAULT_LORA_BATCH_SIZE * DEFAULT_LORA_SEQ_LEN,
+        "hidden_dim": DEFAULT_LORA_HIDDEN_DIM,
+        "in_features": DEFAULT_LORA_HIDDEN_DIM,
+        "out_features": DEFAULT_LORA_HIDDEN_DIM,
     },
 }
-MATRIX_1B_CONFIG = MM_CONFIGS["mm_1b"]
 
 
 MLP_CONFIGS = {
@@ -112,13 +121,129 @@ MLP_CONFIGS = {
         "out_features": 8192,
     },
     "mlp_3b": {
-        "tokens": 64,
-        "in_features": 8192,
-        "hidden_features": 183040,
-        "out_features": 8192,
+        "batch_size": DEFAULT_LORA_BATCH_SIZE,
+        "seq_len": DEFAULT_LORA_SEQ_LEN,
+        "tokens": DEFAULT_LORA_BATCH_SIZE * DEFAULT_LORA_SEQ_LEN,
+        "hidden_dim": DEFAULT_LORA_HIDDEN_DIM,
+        "in_features": DEFAULT_LORA_HIDDEN_DIM,
+        "hidden_features": DEFAULT_LORA_HIDDEN_DIM * DEFAULT_LORA_MLP_EXPANSION,
+        "out_features": DEFAULT_LORA_HIDDEN_DIM,
+        "mlp_expansion": DEFAULT_LORA_MLP_EXPANSION,
     },
 }
 MLP_1B_CONFIG = MLP_CONFIGS["mlp_1b"]
+
+
+WORKLOAD_CHOICES = (
+    "mlp",
+    "dense",
+    "moe",
+    "dense_3b",
+    "moe_3b",
+    "qwen3_14b",
+    "qwen3_30b_a3b",
+    "mm_1b",
+    "mm_3b",
+    "mlp_1b",
+    "mlp_3b",
+)
+
+LORA_FORWARD_OPS = ("base_frozen_asymgemm", "lora_A", "lora_B", "add_cast_scale")
+LORA_BACKWARD_OPS = ("base_dx_asymgemm", "base_lora_add", "add_cast_scale", "lora_B", "lora_A")
+DENSE_ATTENTION_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj")
+DENSE_MLP_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+DENSE_TARGET_MODES = ("mlp_only", "attention_only", "all")
+DEFAULT_DENSE_TARGET_MODE = "mlp_only"
+
+
+@dataclass(frozen=True)
+class LoRALinearProfile:
+    prefix: str
+
+    def forward_keys(self) -> list[str]:
+        return [f"forward.{self.prefix}.{op}" for op in LORA_FORWARD_OPS]
+
+    def backward_prefixes(self) -> list[str]:
+        return [f"backward.{self.prefix}.{op}" for op in LORA_BACKWARD_OPS]
+
+
+@dataclass(frozen=True)
+class RegressionBatchShape:
+    tokens: int
+    in_features: int
+    out_features: int
+    batch_size: int = 0
+    seq_len: int = 0
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> "RegressionBatchShape":
+        return cls(
+            tokens=int(config["tokens"]),
+            in_features=int(config["in_features"]),
+            out_features=int(config["out_features"]),
+            batch_size=int(config.get("batch_size", 0) or 0),
+            seq_len=int(config.get("seq_len", 0) or 0),
+        )
+
+    def input_shape(self) -> tuple[int, ...]:
+        if self.batch_size > 0 and self.seq_len > 0 and self.batch_size * self.seq_len == self.tokens:
+            return (self.batch_size, self.seq_len, self.in_features)
+        return (self.tokens, self.in_features)
+
+    def target_shape(self) -> tuple[int, ...]:
+        if self.batch_size > 0 and self.seq_len > 0 and self.batch_size * self.seq_len == self.tokens:
+            return (self.batch_size, self.seq_len, self.out_features)
+        return (self.tokens, self.out_features)
+
+
+@dataclass(frozen=True)
+class LoRAAdapterTensors:
+    a: torch.Tensor
+    b: torch.Tensor
+    scaling: float
+
+
+def lora_forward_keys(*prefixes: str) -> list[str]:
+    keys: list[str] = []
+    for prefix in prefixes:
+        keys.extend(LoRALinearProfile(prefix).forward_keys())
+    return keys
+
+
+def lora_backward_prefixes(*prefixes: str) -> list[str]:
+    keys: list[str] = []
+    for prefix in prefixes:
+        keys.extend(LoRALinearProfile(prefix).backward_prefixes())
+    return keys
+
+
+def mlp_lora_forward_keys(*, activation_prefix: str = "activation_relu") -> list[str]:
+    return [
+        *lora_forward_keys("fc1"),
+        f"forward.{activation_prefix}",
+        *lora_forward_keys("fc2"),
+    ]
+
+
+def mlp_lora_backward_prefixes(
+    *,
+    loss_prefix: str = "loss.mse",
+    activation_prefix: str = "activation_relu",
+) -> list[str]:
+    return [
+        f"backward.{loss_prefix}",
+        *lora_backward_prefixes("fc2"),
+        f"backward.{activation_prefix}",
+        *lora_backward_prefixes("fc1"),
+    ]
+
+
+def dense_targets_attention(target_mode: str) -> bool:
+    return target_mode in {"attention_only", "all"}
+
+
+def dense_targets_mlp(target_mode: str) -> bool:
+    return target_mode in {"mlp_only", "all"}
 
 
 def sync(device: torch.device) -> None:
@@ -148,9 +273,46 @@ class StageBook:
         self.device = device
         self.timing_mode = timing_mode
         self.values: dict[str, float] = defaultdict(float)
+        self.memory_values: dict[str, list[dict[str, int]]] = defaultdict(list)
+        self.range_stack: list[str] = []
+        self.saved_tensor_tracker: SavedTensorMemoryTracker | None = None
 
     def flush(self) -> None:
         sync(self.device)
+
+    def clear(self) -> None:
+        self.values.clear()
+        self.memory_values.clear()
+        if self.saved_tensor_tracker is not None:
+            self.saved_tensor_tracker.clear()
+
+    def current_range(self) -> str:
+        return self.range_stack[-1] if self.range_stack else ""
+
+    def memory_summary(self) -> dict[str, Any]:
+        rows: list[dict[str, Any]] = []
+        stage_order = {"step.forward": 0, "step.backward": 1}
+        for key, records in sorted(self.memory_values.items(), key=lambda item: (stage_order.get(item[0], 99), item[0])):
+            if not records:
+                continue
+            count = len(records)
+            def avg(field: str) -> float:
+                return float(sum(int(record[field]) for record in records)) / float(count)
+
+            rows.append(
+                {
+                    "name": key,
+                    "samples": count,
+                    "avg_allocated_start_bytes": avg("allocated_start_bytes"),
+                    "avg_allocated_end_bytes": avg("allocated_end_bytes"),
+                    "avg_allocated_delta_bytes": avg("allocated_delta_bytes"),
+                    "avg_reserved_start_bytes": avg("reserved_start_bytes"),
+                    "avg_reserved_end_bytes": avg("reserved_end_bytes"),
+                    "avg_reserved_delta_bytes": avg("reserved_delta_bytes"),
+                    "max_global_peak_after_bytes": max(int(record["global_peak_after_bytes"]) for record in records),
+                }
+            )
+        return {"rows": rows}
 
     @contextmanager
     def time(self, key: str) -> Iterator[None]:
@@ -158,17 +320,204 @@ class StageBook:
         if should_sync:
             sync(self.device)
         start = time.perf_counter()
-        with torch.autograd.profiler.record_function(key):
-            if self.device.type == "cuda":
-                torch.cuda.nvtx.range_push(key)
-            try:
-                yield
-            finally:
-                if should_sync:
-                    sync(self.device)
-                self.values[key] += time.perf_counter() - start
-                if self.device.type == "cuda":
-                    torch.cuda.nvtx.range_pop()
+        pushed = False
+        memory_record: dict[str, int] | None = None
+        self.range_stack.append(key)
+        if self.device.type == "cuda":
+            if key in {"step.forward", "step.backward"}:
+                memory_record = {
+                    "allocated_start_bytes": int(torch.cuda.memory_allocated(self.device)),
+                    "reserved_start_bytes": int(torch.cuda.memory_reserved(self.device)),
+                    "global_peak_start_bytes": int(torch.cuda.max_memory_allocated(self.device)),
+                }
+            torch.cuda.nvtx.range_push(key)
+            pushed = True
+        try:
+            yield
+        finally:
+            if should_sync:
+                sync(self.device)
+            if memory_record is not None:
+                allocated_end = int(torch.cuda.memory_allocated(self.device))
+                reserved_end = int(torch.cuda.memory_reserved(self.device))
+                memory_record.update(
+                    {
+                        "allocated_end_bytes": allocated_end,
+                        "allocated_delta_bytes": allocated_end - int(memory_record["allocated_start_bytes"]),
+                        "reserved_end_bytes": reserved_end,
+                        "reserved_delta_bytes": reserved_end - int(memory_record["reserved_start_bytes"]),
+                        "global_peak_after_bytes": int(torch.cuda.max_memory_allocated(self.device)),
+                    }
+                )
+                self.memory_values[key].append(memory_record)
+            self.values[key] += time.perf_counter() - start
+            if pushed:
+                torch.cuda.nvtx.range_pop()
+            self.range_stack.pop()
+
+
+def _tensor_storage_ptr(tensor: torch.Tensor) -> int:
+    try:
+        return int(tensor.untyped_storage().data_ptr())
+    except RuntimeError:
+        return int(tensor.data_ptr())
+
+
+def _tensor_unique_key(tensor: torch.Tensor) -> tuple[str, int, int, int, str]:
+    return (
+        str(tensor.device),
+        int(tensor.data_ptr()),
+        int(tensor.numel()),
+        int(tensor.element_size()),
+        str(tensor.dtype),
+    )
+
+
+def _persistent_storage_ptrs(model: torch.nn.Module) -> set[int]:
+    ptrs: set[int] = set()
+    for tensor in list(model.parameters()) + list(model.buffers()):
+        if isinstance(tensor, torch.Tensor) and tensor.device.type == "cuda" and tensor.numel() > 0:
+            ptrs.add(_tensor_storage_ptr(tensor))
+    return ptrs
+
+
+def _saved_tensor_bucket(owner: str) -> str:
+    text = owner or "unattributed"
+    lower = text.lower()
+    compact = re.sub(r"\blayers\.\d+\.", "", lower)
+    if "fc1" in compact:
+        return "fc1 base/LoRA"
+    if "fc2" in compact:
+        return "fc2 base/LoRA"
+    if "matrix" in compact:
+        return "matrix base/LoRA"
+    if "routed_expert" in compact:
+        if "gate" in compact:
+            return "routed gate"
+        if "up" in compact:
+            return "routed up"
+        if "down" in compact:
+            return "routed down"
+        if "activation" in compact or "silu" in compact:
+            return "routed activation"
+        return "routed gate/up/down"
+    if "shared_expert" in compact:
+        if "gate" in compact:
+            return "shared gate"
+        if "up" in compact:
+            return "shared up"
+        if "down" in compact:
+            return "shared down"
+        if "activation" in compact or "silu" in compact:
+            return "shared activation"
+        return "shared gate/up/down"
+    if any(part in compact for part in ("router", "route_metadata", "pack_tokens", "scatter_combine")):
+        return "router/pack/scatter"
+    if "attention" in compact:
+        return "attention"
+    if any(part in compact for part in ("activation", "silu", "relu", "softmax")):
+        return "activation"
+    if ".mlp." in compact or compact.startswith("forward.mlp"):
+        if "gate_proj" in compact:
+            return "dense MLP gate"
+        if "up_proj" in compact:
+            return "dense MLP up"
+        if "down_proj" in compact:
+            return "dense MLP down"
+        return "dense MLP"
+    if "lm_head" in compact:
+        return "lm_head"
+    if "embedding" in compact:
+        return "embeddings"
+    if "layernorm" in compact or "final_norm" in compact:
+        return "norm"
+    if "loss" in compact:
+        return "loss"
+    return text
+
+
+class SavedTensorMemoryTracker:
+    """Memory-only saved-tensor attribution; do not use its run for timing claims."""
+
+    def __init__(self, model: torch.nn.Module, book: StageBook) -> None:
+        self.book = book
+        self.persistent_storage_ptrs = _persistent_storage_ptrs(model)
+        self.unique_seen: dict[tuple[str, int, int, int, str], str] = {}
+        self.unique_bytes_by_owner: dict[str, int] = defaultdict(int)
+        self.reference_bytes_by_owner: dict[str, int] = defaultdict(int)
+        self.save_count_by_owner: dict[str, int] = defaultdict(int)
+        self.unique_count_by_owner: dict[str, int] = defaultdict(int)
+        self.skipped_persistent_bytes = 0
+        self.skipped_non_cuda_bytes = 0
+
+    def clear(self) -> None:
+        self.unique_seen.clear()
+        self.unique_bytes_by_owner.clear()
+        self.reference_bytes_by_owner.clear()
+        self.save_count_by_owner.clear()
+        self.unique_count_by_owner.clear()
+        self.skipped_persistent_bytes = 0
+        self.skipped_non_cuda_bytes = 0
+
+    def owner(self) -> str:
+        return current_profile_range() or self.book.current_range() or "unattributed"
+
+    def pack(self, tensor: torch.Tensor) -> torch.Tensor:
+        if not isinstance(tensor, torch.Tensor):
+            return tensor
+        tensor_bytes = nbytes(tensor)
+        if tensor_bytes <= 0:
+            return tensor
+        if tensor.device.type != "cuda":
+            self.skipped_non_cuda_bytes += tensor_bytes
+            return tensor
+        if _tensor_storage_ptr(tensor) in self.persistent_storage_ptrs:
+            self.skipped_persistent_bytes += tensor_bytes
+            return tensor
+
+        owner = self.owner()
+        bucket = _saved_tensor_bucket(owner)
+        key = _tensor_unique_key(tensor)
+        self.reference_bytes_by_owner[bucket] += tensor_bytes
+        self.save_count_by_owner[bucket] += 1
+        if key not in self.unique_seen:
+            self.unique_seen[key] = bucket
+            self.unique_bytes_by_owner[bucket] += tensor_bytes
+            self.unique_count_by_owner[bucket] += 1
+        return tensor
+
+    def unpack(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor
+
+    def summary(self) -> dict[str, Any]:
+        buckets = sorted(
+            set(self.reference_bytes_by_owner) | set(self.unique_bytes_by_owner),
+            key=lambda name: self.unique_bytes_by_owner.get(name, 0),
+            reverse=True,
+        )
+        rows = [
+            {
+                "owner": bucket,
+                "unique_bytes": int(self.unique_bytes_by_owner.get(bucket, 0)),
+                "reference_bytes": int(self.reference_bytes_by_owner.get(bucket, 0)),
+                "save_count": int(self.save_count_by_owner.get(bucket, 0)),
+                "unique_tensor_count": int(self.unique_count_by_owner.get(bucket, 0)),
+            }
+            for bucket in buckets
+        ]
+        return {
+            "enabled": True,
+            "rows": rows,
+            "total_unique_bytes": int(sum(row["unique_bytes"] for row in rows)),
+            "total_reference_bytes": int(sum(row["reference_bytes"] for row in rows)),
+            "skipped_persistent_bytes": int(self.skipped_persistent_bytes),
+            "skipped_non_cuda_bytes": int(self.skipped_non_cuda_bytes),
+            "notes": [
+                "Saved activation attribution is collected with torch.autograd.graph.saved_tensors_hooks in a memory-only source pass.",
+                "unique_bytes deduplicates repeated saves of the same CUDA tensor; reference_bytes shows repeated save references and can overcount live memory.",
+                "Persistent model parameters and buffers are excluded from saved activation rows.",
+            ],
+        }
 
 
 class _ProfiledLinear(torch.autograd.Function):
@@ -202,6 +551,35 @@ class _ProfiledLinear(torch.autograd.Function):
 
 def profiled_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, prefix: str, book: StageBook) -> torch.Tensor:
     return _ProfiledLinear.apply(x, weight, bias, prefix, book)
+
+
+class ProfileTorchFrozenLinear(torch.nn.Module):
+    def __init__(self, weight: torch.Tensor, *, device: torch.device, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.register_buffer("weight", weight.detach().to(device=device, dtype=dtype).contiguous())
+        self.in_features = int(weight.shape[1])
+        self.out_features = int(weight.shape[0])
+
+    @property
+    def pinned_cpu_bytes(self) -> int:
+        return 0
+
+    @property
+    def weight_hbm_saved_bytes(self) -> int:
+        return 0
+
+    @property
+    def cpu_resident_base_weight_bytes(self) -> int:
+        return 0
+
+    @property
+    def gpu_resident_base_weight_bytes(self) -> int:
+        return nbytes(self.weight)
+
+    def forward(self, x: torch.Tensor, *, backward_prefix: str | None = None, book: StageBook | None = None) -> torch.Tensor:
+        if backward_prefix is not None and book is not None:
+            return profiled_linear(x, self.weight, None, backward_prefix, book)
+        return F.linear(x, self.weight)
 
 
 class _ProfiledRelu(torch.autograd.Function):
@@ -649,6 +1027,123 @@ def memory_report(model: torch.nn.Module, device: torch.device) -> dict[str, Any
     }
 
 
+def tensor_tree_nbytes(value: Any, *, device_type: str | None = None) -> int:
+    if isinstance(value, torch.Tensor):
+        if device_type is not None and value.device.type != device_type:
+            return 0
+        return nbytes(value)
+    if isinstance(value, dict):
+        return sum(tensor_tree_nbytes(item, device_type=device_type) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return sum(tensor_tree_nbytes(item, device_type=device_type) for item in value)
+    return 0
+
+
+def memory_attribution_report(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    tracker: SavedTensorMemoryTracker | None,
+) -> dict[str, Any]:
+    mem = memory_report(model, device)
+    lora_trainable = 0
+    other_trainable = 0
+    frozen_cuda_params = 0
+    gradient_bytes = 0
+    for name, param in model.named_parameters():
+        param_bytes = nbytes(param) if param.device.type == "cuda" else 0
+        if param.requires_grad:
+            if "lora" in name.lower():
+                lora_trainable += param_bytes
+            else:
+                other_trainable += param_bytes
+            if isinstance(param.grad, torch.Tensor) and param.grad.device.type == "cuda":
+                gradient_bytes += nbytes(param.grad)
+        else:
+            frozen_cuda_params += param_bytes
+
+    frozen_cuda_buffers = int(mem["gpu"]["buffer_bytes"])
+    optimizer_state_bytes = tensor_tree_nbytes(optimizer.state, device_type="cuda")
+    saved = tracker.summary() if tracker is not None else {"enabled": False, "rows": [], "total_unique_bytes": 0, "total_reference_bytes": 0}
+    saved_unique = int(saved.get("total_unique_bytes", 0))
+    peak = int(mem["gpu"]["peak_hbm_bytes"])
+    known_hbm = frozen_cuda_params + frozen_cuda_buffers + lora_trainable + other_trainable + gradient_bytes + optimizer_state_bytes + saved_unique
+    residual = max(0, peak - known_hbm)
+
+    category_rows = [
+        {
+            "category": "frozen base weights on CPU pinned",
+            "bytes": int(mem["cpu"]["pinned_total_bytes"]),
+            "memory_space": "CPU pinned",
+            "accuracy": "exact",
+        },
+        {
+            "category": "frozen base weights on GPU buffers",
+            "bytes": int(frozen_cuda_params + frozen_cuda_buffers),
+            "memory_space": "GPU HBM",
+            "accuracy": "exact",
+        },
+        {
+            "category": "LoRA trainable params",
+            "bytes": int(lora_trainable),
+            "memory_space": "GPU HBM",
+            "accuracy": "exact",
+        },
+    ]
+    if other_trainable:
+        category_rows.append(
+            {
+                "category": "other trainable params",
+                "bytes": int(other_trainable),
+                "memory_space": "GPU HBM",
+                "accuracy": "exact",
+            }
+        )
+    category_rows.extend(
+        [
+            {
+                "category": "gradients",
+                "bytes": int(gradient_bytes),
+                "memory_space": "GPU HBM",
+                "accuracy": "exact after backward",
+            },
+            {
+                "category": "AdamW optimizer state",
+                "bytes": int(optimizer_state_bytes),
+                "memory_space": "GPU HBM",
+                "accuracy": "exact after optimizer step",
+            },
+            {
+                "category": "saved forward activations by semantic op",
+                "bytes": int(saved_unique),
+                "memory_space": "GPU HBM",
+                "accuracy": "hook-attributed unique saved tensors" if tracker is not None else "not collected",
+            },
+            {
+                "category": "allocator peak / unattributed",
+                "bytes": int(residual),
+                "memory_space": "GPU HBM",
+                "accuracy": "estimated residual",
+            },
+        ]
+    )
+    return {
+        "enabled": tracker is not None,
+        "categories": {
+            "rows": category_rows,
+            "known_hbm_bytes": int(known_hbm),
+            "peak_hbm_bytes": peak,
+            "unattributed_hbm_bytes": int(residual),
+        },
+        "saved_activations": saved,
+        "notes": [
+            "Model, gradient, and optimizer rows are tensor-size accounting.",
+            "Saved activation rows require --memory-attribution and are memory-only; do not use that pass for timing claims.",
+            "allocator peak / unattributed is a residual against torch.cuda.max_memory_allocated and includes temporaries, workspaces, allocator effects, inputs/targets, and phase overlap.",
+        ],
+    }
+
+
 @contextmanager
 def patch_base_dispatch(book: StageBook) -> Iterator[None]:
     import importlib
@@ -684,36 +1179,26 @@ def patch_mlp_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
     import asym_gemm.training.mlp as mlp
 
     originals: list[tuple[Any, str, Any]] = []
-    original = mlp.AsymLoRALinear.forward
     counter: dict[str, int] = defaultdict(int)
 
     def timed_forward(self: Any, x: torch.Tensor) -> torch.Tensor:
         idx = counter["linear"]
         counter["linear"] += 1
         prefix = "fc1" if idx % 2 == 0 else "fc2"
-        with book.time(f"forward.{prefix}.base_frozen_asymgemm"):
-            self.base.profile_name = prefix
-            base = self.base(x)
-        with book.time(f"forward.{prefix}.lora_A"):
-            low_rank = profiled_linear(x.float(), self.lora_a, None, f"{prefix}.lora_A", book)
-        with book.time(f"forward.{prefix}.lora_B"):
-            lora_raw = profiled_linear(low_rank, self.lora_b, None, f"{prefix}.lora_B", book)
-        with book.time(f"forward.{prefix}.add_cast_scale"):
-            lora = profiled_scale_cast(lora_raw, float(self.scaling), base.dtype, f"{prefix}.add_cast_scale", book)
-            return profiled_residual_add(base, lora, f"{prefix}.base_lora_add", book)
+        return profiled_lora_linear(self, x, prefix, book)
 
-    originals.append((mlp.AsymLoRALinear, "forward", original))
+    originals.append((mlp.AsymLoRALinear, "forward", mlp.AsymLoRALinear.forward))
     mlp.AsymLoRALinear.forward = timed_forward
-    mlp_original = mlp.AsymMLP.forward
+    originals.append((mlp.TorchLoRALinear, "forward", mlp.TorchLoRALinear.forward))
+    mlp.TorchLoRALinear.forward = timed_forward
 
     def timed_mlp_forward(self: Any, x: torch.Tensor) -> torch.Tensor:
-        hidden = self.fc1(x)
-        with book.time("forward.activation_relu"):
-            hidden = profiled_relu(hidden, "activation_relu", book)
-        return self.fc2(hidden)
+        return _profiled_mlp_lora_forward(self, x, book)
 
-    originals.append((mlp.AsymMLP, "forward", mlp_original))
+    originals.append((mlp.AsymMLP, "forward", mlp.AsymMLP.forward))
     mlp.AsymMLP.forward = timed_mlp_forward
+    originals.append((mlp.TorchMLP, "forward", mlp.TorchMLP.forward))
+    mlp.TorchMLP.forward = timed_mlp_forward
     return originals
 
 
@@ -722,27 +1207,88 @@ def restore(originals: list[tuple[Any, str, Any]]) -> None:
         setattr(obj, attr, original)
 
 
+def _lora_adapter_tensors(module: Any, prefix: str) -> LoRAAdapterTensors:
+    if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
+        return LoRAAdapterTensors(module.lora_a, module.lora_b, float(module.scaling))
+    if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+        return LoRAAdapterTensors(module.lora_A["default"].weight, module.lora_B["default"].weight, float(module.scaling))
+    raise TypeError(f"unsupported LoRA adapter layout for prefix={prefix!r}: {type(module).__name__}")
+
+
+def _profiled_lora_base(module: Any, x: torch.Tensor, prefix: str, book: StageBook) -> torch.Tensor:
+    with book.time(f"forward.{prefix}.base_frozen_asymgemm"):
+        if hasattr(module, "base"):
+            setattr(module.base, "profile_name", prefix)
+            return module.base(x)
+        elif hasattr(module, "base_layer") and hasattr(module.base_layer, "profile_name"):
+            module.base_layer.profile_name = prefix
+            return module.base_layer(x)
+        elif hasattr(module, "base_weight"):
+            return profiled_linear(x, module.base_weight, None, f"{prefix}.base_dx_asymgemm", book)
+        elif hasattr(module, "base_layer") and hasattr(module.base_layer, "weight"):
+            return profiled_linear(x, module.base_layer.weight, None, f"{prefix}.base_dx_asymgemm", book)
+    raise TypeError(f"unsupported LoRA base layout for prefix={prefix!r}: {type(module).__name__}")
+
+
+def profiled_lora_linear(module: Any, x: torch.Tensor, prefix: str, book: StageBook) -> torch.Tensor:
+    base = _profiled_lora_base(module, x, prefix, book)
+    adapter = _lora_adapter_tensors(module, prefix)
+    with book.time(f"forward.{prefix}.lora_A"):
+        low_rank = profiled_linear(x.float(), adapter.a, None, f"{prefix}.lora_A", book)
+    with book.time(f"forward.{prefix}.lora_B"):
+        lora_raw = profiled_linear(low_rank, adapter.b, None, f"{prefix}.lora_B", book)
+    with book.time(f"forward.{prefix}.add_cast_scale"):
+        lora = profiled_scale_cast(lora_raw, adapter.scaling, base.dtype, f"{prefix}.add_cast_scale", book)
+        return profiled_residual_add(base, lora, f"{prefix}.base_lora_add", book)
+
+
+def _profiled_mlp_lora_forward(model: Any, x: torch.Tensor, book: StageBook) -> torch.Tensor:
+    hidden = profiled_lora_linear(model.fc1, x, "fc1", book)
+    with book.time("forward.activation_relu"):
+        hidden = profiled_relu(hidden, "activation_relu", book)
+    return profiled_lora_linear(model.fc2, hidden, "fc2", book)
+
+
+def make_matrix_lora_forward_fn(book: StageBook) -> Callable[[torch.nn.Module, torch.Tensor], torch.Tensor]:
+    def forward_fn(model: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        return profiled_lora_linear(model, x, "matrix", book)
+
+    return forward_fn
+
+
+def make_mlp_lora_forward_fn(book: StageBook) -> Callable[[torch.nn.Module, torch.Tensor], torch.Tensor]:
+    def forward_fn(model: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        return _profiled_mlp_lora_forward(model, x, book)
+
+    return forward_fn
+
+
 def profile_mlp(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
     from asym_gemm.training.frozen_linear import AsymExecutionStats
-    from asym_gemm.training.mlp import AsymMLP, lora_parameters
+    from asym_gemm.training.mlp import AsymMLP, TorchMLP, lora_parameters
 
     clear(device)
     stats = AsymExecutionStats()
     default_tokens, in_features, hidden, out_features, rank = (64, 128, 256, 128, 8) if device.type == "cuda" else (4, 16, 32, 16, 4)
     tokens = requested_tokens(args, default_tokens)
     torch.manual_seed(0)
-    model = AsymMLP(
-        torch.randn(hidden, in_features, dtype=dtype),
-        torch.randn(out_features, hidden, dtype=dtype),
-        rank=rank,
-        alpha=16.0,
-        backend=args.backend,
-        stats=stats,
-        device=device,
-        dtype=dtype,
-        precision=args.precision,
-    )
-    optimizer = torch.optim.AdamW(lora_parameters(model), lr=1e-2)
+    w1 = torch.randn(hidden, in_features, dtype=dtype)
+    w2 = torch.randn(out_features, hidden, dtype=dtype)
+    if args.backend == "torch_only":
+        model = TorchMLP(w1, w2, rank=rank, alpha=16.0, device=device, dtype=dtype)
+    else:
+        model = AsymMLP(
+            w1,
+            w2,
+            rank=rank,
+            alpha=16.0,
+            backend=args.backend,
+            stats=stats,
+            device=device,
+            dtype=dtype,
+            precision=args.precision,
+        )
+    optimizer = make_lora_optimizer(model, lora_parameters)
 
     def make_batch() -> tuple[torch.Tensor, torch.Tensor]:
         return (
@@ -751,6 +1297,7 @@ def profile_mlp(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         )
 
     book = StageBook(device, timing_mode=args.timing_mode)
+
     def loss_fn(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return profiled_mse_loss(prediction.float(), target.float(), "loss.mse", book)
 
@@ -776,221 +1323,255 @@ def profile_mlp(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         device,
         avg,
         stats.as_dict(),
-        forward_keys=[
-            "forward.fc1.base_frozen_asymgemm",
-            "forward.fc1.lora_A",
-            "forward.fc1.lora_B",
-            "forward.fc1.add_cast_scale",
-            "forward.activation_relu",
-            "forward.fc2.base_frozen_asymgemm",
-            "forward.fc2.lora_A",
-            "forward.fc2.lora_B",
-            "forward.fc2.add_cast_scale",
-        ],
-        backward_group_prefixes=[
-            "backward.loss.mse",
-            "backward.fc2.base_dx_asymgemm",
-            "backward.fc2.base_lora_add",
-            "backward.fc2.add_cast_scale",
-            "backward.fc2.lora_B",
-            "backward.fc2.lora_A",
-            "backward.activation_relu",
-            "backward.fc1.base_dx_asymgemm",
-            "backward.fc1.base_lora_add",
-            "backward.fc1.add_cast_scale",
-            "backward.fc1.lora_B",
-            "backward.fc1.lora_A",
-        ],
+        forward_keys=mlp_lora_forward_keys(),
+        backward_group_prefixes=mlp_lora_backward_prefixes(),
         config={"tokens": tokens, "in_features": in_features, "hidden": hidden, "out_features": out_features, "rank": rank},
+        stage_memory=book.memory_summary(),
+        memory_attribution=memory_attribution_report(model, optimizer, device, book.saved_tensor_tracker),
     )
 
 
-def run_fundamental_steps(
-    book: StageBook,
-    make_batch: Callable[[], tuple[torch.Tensor, torch.Tensor]],
-    forward_fn: Callable[[torch.Tensor], torch.Tensor],
-    loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-    args: argparse.Namespace,
-    reset_stats: Callable[[], None] | None = None,
-) -> None:
-    with profile_enabled(True):
-        for _ in range(args.warmup_steps):
-            batch, target = make_batch()
-            loss = loss_fn(forward_fn(batch), target)
-            loss.backward()
-            sync(book.device)
-        if reset_stats is not None:
-            reset_stats()
-        book.values.clear()
-
-        with patch_base_dispatch(book):
-            for _ in range(args.measure_steps):
-                with book.time("step.input_preparation"):
-                    batch, target = make_batch()
-                with book.time("step.forward"):
-                    prediction = forward_fn(batch)
-                with book.time("step.loss"):
-                    loss = loss_fn(prediction, target)
-                with book.time("step.backward"):
-                    loss.backward()
-                with book.time("step.optimizer"):
-                    pass
-                sync(book.device)
-                book.flush()
-
-
-def _fundamental_config(raw: dict[str, int]) -> dict[str, Any]:
+def _lora_sft_config(raw: dict[str, Any], *, rank: int, alpha: float) -> dict[str, Any]:
     config = dict(raw)
     if "hidden_features" in config:
-        params = config["hidden_features"] * (config["in_features"] + config["out_features"])
+        base_params = config["hidden_features"] * (config["in_features"] + config["out_features"])
+        lora_params = rank * (config["in_features"] + config["hidden_features"])
+        lora_params += rank * (config["hidden_features"] + config["out_features"])
     else:
-        params = config["in_features"] * config["out_features"]
-    config["base_parameter_count"] = int(params)
-    config["base_parameter_billions"] = float(params) / 1_000_000_000.0
-    config["profile_goal"] = "fundamental_parameter_asymgemm"
+        base_params = config["in_features"] * config["out_features"]
+        lora_params = rank * (config["in_features"] + config["out_features"])
+    config.update(
+        {
+            "base_parameter_count": int(base_params),
+            "base_parameter_billions": float(base_params) / 1_000_000_000.0,
+            "lora_rank": int(rank),
+            "lora_alpha": float(alpha),
+            "trainable_lora_elements": int(lora_params),
+            "total_model_elements": int(base_params + lora_params),
+            "profile_goal": "lora_sft",
+        }
+    )
     return config
 
 
-def profile_mm(args: argparse.Namespace, device: torch.device, dtype: torch.dtype, workload: str) -> dict[str, Any]:
-    from asym_gemm.training.frozen_linear import AsymExecutionStats, AsymFrozenLinear
+def _positive_int(value: int, name: str) -> int:
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"{name} must be > 0, got {value}")
+    return value
+
+
+def _shape_args(args: argparse.Namespace) -> tuple[int, int, int]:
+    return (
+        int(getattr(args, "real_tokens", 0) or 0),
+        int(getattr(args, "real_batch_size", 0) or 0),
+        int(getattr(args, "real_seq_len", 0) or 0),
+    )
+
+
+def _resolve_regression_shape(args: argparse.Namespace, config: dict[str, Any]) -> None:
+    explicit_tokens, batch_size, seq_len = _shape_args(args)
+    if explicit_tokens > 0:
+        config["tokens"] = _positive_int(explicit_tokens, "tokens")
+        if batch_size > 0 and seq_len > 0 and batch_size * seq_len == explicit_tokens:
+            config["batch_size"] = batch_size
+            config["seq_len"] = seq_len
+        else:
+            config.pop("batch_size", None)
+            config.pop("seq_len", None)
+        return
+
+    if "batch_size" in config or "seq_len" in config:
+        batch = _positive_int(batch_size or int(config.get("batch_size", 0)), "batch_size")
+        seq = _positive_int(seq_len or int(config.get("seq_len", 0)), "seq_len")
+        config["batch_size"] = batch
+        config["seq_len"] = seq
+        config["tokens"] = batch * seq
+    else:
+        config["tokens"] = _positive_int(int(config["tokens"]), "tokens")
+
+
+def _synthetic_lora_config(args: argparse.Namespace, raw: dict[str, Any], workload: str) -> dict[str, Any]:
+    config = dict(raw)
+    _resolve_regression_shape(args, config)
+
+    hidden_dim = int(getattr(args, "real_hidden_dim", 0) or 0)
+    if hidden_dim > 0 and workload in {"mm_3b", "mlp_3b"}:
+        hidden_dim = _positive_int(hidden_dim, "hidden_dim")
+        config["hidden_dim"] = hidden_dim
+        config["in_features"] = hidden_dim
+        config["out_features"] = hidden_dim
+        if "hidden_features" in config:
+            intermediate_dim = int(getattr(args, "real_mlp_intermediate_dim", 0) or 0)
+            if intermediate_dim <= 0:
+                expansion = int(getattr(args, "real_mlp_expansion", DEFAULT_LORA_MLP_EXPANSION) or DEFAULT_LORA_MLP_EXPANSION)
+                expansion = _positive_int(expansion, "mlp_expansion")
+                intermediate_dim = hidden_dim * expansion
+            intermediate_dim = _positive_int(intermediate_dim, "mlp_intermediate_dim")
+            config["hidden_features"] = intermediate_dim
+            config["mlp_expansion"] = float(intermediate_dim) / float(hidden_dim)
+    return config
+
+
+def lora_hparams(args: argparse.Namespace) -> tuple[int, float]:
+    rank = _positive_int(int(args.real_lora_rank), "lora_rank")
+    alpha = float(args.real_lora_alpha)
+    if alpha <= 0.0:
+        raise ValueError(f"lora_alpha must be > 0, got {alpha}")
+    return rank, alpha
+
+
+def make_lora_optimizer(
+    model: torch.nn.Module,
+    lora_parameters_fn: Callable[[torch.nn.Module], list[torch.nn.Parameter]],
+) -> torch.optim.Optimizer:
+    return torch.optim.AdamW(lora_parameters_fn(model), lr=1e-2)
+
+
+class LoraMSEProfileRunner:
+    def __init__(self, args: argparse.Namespace, device: torch.device, dtype: torch.dtype, stats: Any) -> None:
+        self.args = args
+        self.device = device
+        self.dtype = dtype
+        self.stats = stats
+
+    def make_batch_fn(self, shape: RegressionBatchShape) -> Callable[[], tuple[torch.Tensor, torch.Tensor]]:
+        def make_batch() -> tuple[torch.Tensor, torch.Tensor]:
+            x = torch.randn(*shape.input_shape(), device=self.device, dtype=self.dtype, requires_grad=True)
+            target = torch.randn(*shape.target_shape(), device=self.device, dtype=self.dtype)
+            return x, target
+
+        return make_batch
+
+    def loss_fn(self, book: StageBook) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+        def loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+            return profiled_mse_loss(prediction.float(), target.float(), "loss.mse", book)
+
+        return loss
+
+    def profile(
+        self,
+        *,
+        workload: str,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        shape: RegressionBatchShape,
+        forward_fn_factory: Callable[[StageBook], Callable[[torch.nn.Module, torch.Tensor], torch.Tensor]],
+        forward_keys: list[str],
+        backward_group_prefixes: list[str],
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        book = StageBook(self.device, timing_mode=self.args.timing_mode)
+        forward_fn = forward_fn_factory(book)
+        run_profile_steps(
+            book,
+            model,
+            optimizer,
+            self.make_batch_fn(shape),
+            forward_fn,
+            self.loss_fn(book),
+            self.args,
+            reset_stats=lambda: reset_execution_stats(self.stats),
+        )
+        avg = average(book.values, self.args.measure_steps)
+        return build_report(
+            workload,
+            model,
+            self.device,
+            avg,
+            self.stats.as_dict(),
+            forward_keys=forward_keys,
+            backward_group_prefixes=backward_group_prefixes,
+            config=config,
+            stage_memory=book.memory_summary(),
+            memory_attribution=memory_attribution_report(model, optimizer, self.device, book.saved_tensor_tracker),
+        )
+
+
+def profile_mm_lora(args: argparse.Namespace, device: torch.device, dtype: torch.dtype, workload: str) -> dict[str, Any]:
+    from asym_gemm.training.frozen_linear import AsymExecutionStats
+    from asym_gemm.training.mlp import AsymLoRALinear, TorchLoRALinear, lora_parameters
 
     clear(device)
     stats = AsymExecutionStats()
-    cfg = dict(MATRIX_1B_CONFIG if workload == "matrix_1b" else MM_CONFIGS[workload])
-    cfg["tokens"] = requested_tokens(args, int(cfg["tokens"]))
+    cfg = _synthetic_lora_config(args, MM_CONFIGS[workload], workload)
+    rank, alpha = lora_hparams(args)
     torch.manual_seed(101)
     weight = torch.randn(cfg["out_features"], cfg["in_features"], dtype=dtype)
-    model = AsymFrozenLinear(
-        weight,
-        backend=args.backend,
-        pin_memory=device.type == "cuda",
-        stats=stats,
-        precision=args.precision,
-    )
-    model.profile_name = "matrix"
+    if args.backend == "torch_only":
+        model = TorchLoRALinear(weight, rank=rank, alpha=alpha, device=device, dtype=dtype)
+    else:
+        model = AsymLoRALinear(
+            weight,
+            rank=rank,
+            alpha=alpha,
+            backend=args.backend,
+            stats=stats,
+            device=device,
+            dtype=dtype,
+            precision=args.precision,
+        )
     del weight
-
-    def make_batch() -> tuple[torch.Tensor, torch.Tensor]:
-        x = torch.randn(cfg["tokens"], cfg["in_features"], device=device, dtype=dtype, requires_grad=True)
-        target = torch.randn(cfg["tokens"], cfg["out_features"], device=device, dtype=dtype)
-        return x, target
-
-    book = StageBook(device, timing_mode=args.timing_mode)
-
-    def forward_fn(x: torch.Tensor) -> torch.Tensor:
-        with book.time("forward.matrix.base_frozen_asymgemm"):
-            model.profile_name = "matrix"
-            return model(x)
-
-    def loss_fn(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return profiled_mse_loss(prediction.float(), target.float(), "loss.mse", book)
-
-    run_fundamental_steps(book, make_batch, forward_fn, loss_fn, args, reset_stats=lambda: reset_execution_stats(stats))
-    avg = average(book.values, args.measure_steps)
-    return build_report(
-        workload,
-        model,
-        device,
-        avg,
-        stats.as_dict(),
-        forward_keys=["forward.matrix.base_frozen_asymgemm"],
-        backward_group_prefixes=["backward.loss.mse", "backward.matrix.base_dx_asymgemm"],
-        config=_fundamental_config(cfg),
+    optimizer = make_lora_optimizer(model, lora_parameters)
+    return LoraMSEProfileRunner(args, device, dtype, stats).profile(
+        workload=workload,
+        model=model,
+        optimizer=optimizer,
+        shape=RegressionBatchShape.from_config(cfg),
+        forward_fn_factory=make_matrix_lora_forward_fn,
+        forward_keys=lora_forward_keys("matrix"),
+        backward_group_prefixes=["backward.loss.mse", *lora_backward_prefixes("matrix")],
+        config=_lora_sft_config(cfg, rank=rank, alpha=alpha),
     )
 
 
-def profile_matrix_1b(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
-    return profile_mm(args, device, dtype, "matrix_1b")
-
-
-def profile_mlp_fundamental(args: argparse.Namespace, device: torch.device, dtype: torch.dtype, workload: str) -> dict[str, Any]:
-    from asym_gemm.training.frozen_linear import AsymExecutionStats, AsymFrozenLinear
-
-    class FundamentalMLP(torch.nn.Module):
-        def __init__(self, stats: AsymExecutionStats) -> None:
-            super().__init__()
-            torch.manual_seed(202)
-            self.fc1 = AsymFrozenLinear(
-                torch.randn(cfg["hidden_features"], cfg["in_features"], dtype=dtype),
-                backend=args.backend,
-                pin_memory=device.type == "cuda",
-                stats=stats,
-                precision=args.precision,
-            )
-            self.fc2 = AsymFrozenLinear(
-                torch.randn(cfg["out_features"], cfg["hidden_features"], dtype=dtype),
-                backend=args.backend,
-                pin_memory=device.type == "cuda",
-                stats=stats,
-                precision=args.precision,
-            )
+def profile_mlp_lora(args: argparse.Namespace, device: torch.device, dtype: torch.dtype, workload: str) -> dict[str, Any]:
+    from asym_gemm.training.frozen_linear import AsymExecutionStats
+    from asym_gemm.training.mlp import AsymMLP, TorchMLP, lora_parameters
 
     clear(device)
     stats = AsymExecutionStats()
-    cfg = dict(MLP_CONFIGS[workload])
-    cfg["tokens"] = requested_tokens(args, int(cfg["tokens"]))
-    model = FundamentalMLP(stats)
+    cfg = _synthetic_lora_config(args, MLP_CONFIGS[workload], workload)
+    rank, alpha = lora_hparams(args)
+    torch.manual_seed(202)
+    w1 = torch.randn(cfg["hidden_features"], cfg["in_features"], dtype=dtype)
+    w2 = torch.randn(cfg["out_features"], cfg["hidden_features"], dtype=dtype)
+    if args.backend == "torch_only":
+        model = TorchMLP(w1, w2, rank=rank, alpha=alpha, device=device, dtype=dtype)
+    else:
+        model = AsymMLP(
+            w1,
+            w2,
+            rank=rank,
+            alpha=alpha,
+            backend=args.backend,
+            stats=stats,
+            device=device,
+            dtype=dtype,
+            precision=args.precision,
+        )
+    del w1, w2
+    optimizer = make_lora_optimizer(model, lora_parameters)
 
-    def make_batch() -> tuple[torch.Tensor, torch.Tensor]:
-        x = torch.randn(cfg["tokens"], cfg["in_features"], device=device, dtype=dtype, requires_grad=True)
-        target = torch.randn(cfg["tokens"], cfg["out_features"], device=device, dtype=dtype)
-        return x, target
-
-    book = StageBook(device, timing_mode=args.timing_mode)
-
-    def forward_fn(x: torch.Tensor) -> torch.Tensor:
-        with book.time("forward.fc1.base_frozen_asymgemm"):
-            model.fc1.profile_name = "fc1"
-            hidden = model.fc1(x)
-        with book.time("forward.activation_relu"):
-            hidden = profiled_relu(hidden, "activation_relu", book)
-        with book.time("forward.fc2.base_frozen_asymgemm"):
-            model.fc2.profile_name = "fc2"
-            return model.fc2(hidden)
-
-    def loss_fn(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return profiled_mse_loss(prediction.float(), target.float(), "loss.mse", book)
-
-    run_fundamental_steps(book, make_batch, forward_fn, loss_fn, args, reset_stats=lambda: reset_execution_stats(stats))
-    avg = average(book.values, args.measure_steps)
-    return build_report(
-        workload,
-        model,
-        device,
-        avg,
-        stats.as_dict(),
-        forward_keys=[
-            "forward.fc1.base_frozen_asymgemm",
-            "forward.activation_relu",
-            "forward.fc2.base_frozen_asymgemm",
-        ],
-        backward_group_prefixes=[
-            "backward.loss.mse",
-            "backward.fc2.base_dx_asymgemm",
-            "backward.activation_relu",
-            "backward.fc1.base_dx_asymgemm",
-        ],
-        config=_fundamental_config(cfg),
+    return LoraMSEProfileRunner(args, device, dtype, stats).profile(
+        workload=workload,
+        model=model,
+        optimizer=optimizer,
+        shape=RegressionBatchShape.from_config(cfg),
+        forward_fn_factory=make_mlp_lora_forward_fn,
+        forward_keys=mlp_lora_forward_keys(),
+        backward_group_prefixes=mlp_lora_backward_prefixes(),
+        config=_lora_sft_config(cfg, rank=rank, alpha=alpha),
     )
 
 
 def profile_mlp_1b(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
-    return profile_mlp_fundamental(args, device, dtype, "mlp_1b")
+    return profile_mlp_lora(args, device, dtype, "mlp_1b")
 
 
 def set_profile_names(model: torch.nn.Module) -> None:
     for name, module in model.named_modules():
         setattr(module, "_m4_profile_name", name)
-        if ".shared_experts." in name:
-            layer = _layer_prefix_from_module_name(name)
-            expert = name.rsplit(".", 1)[-1]
-            prefix = f"forward.{layer}.shared_expert.{expert}" if layer else f"forward.shared_expert.{expert}"
-            setattr(module, "_m4_profile_prefix", prefix)
-        elif ".experts." in name:
-            layer = _layer_prefix_from_module_name(name)
-            expert = name.rsplit(".", 1)[-1]
-            prefix = f"forward.{layer}.routed_expert.{expert}" if layer else f"forward.routed_expert.{expert}"
-            setattr(module, "_m4_profile_prefix", prefix)
 
 
 def _layer_prefix_from_module_name(name: str) -> str:
@@ -1019,21 +1600,21 @@ def patch_dense_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
     original_linear = dense.AsymLoRALinear.forward
 
     def timed_linear(self: Any, x: torch.Tensor) -> torch.Tensor:
-        prefix = linear_prefix(self)
-        with book.time(f"{prefix}.base_frozen_asymgemm"):
-            self.base_layer.profile_name = prefix.removeprefix("forward.")
-            base = self.base_layer(x)
-        with book.time(f"{prefix}.lora_A"):
-            low_rank = profiled_linear(x.float(), self.lora_A["default"].weight, None, f"{prefix.removeprefix('forward.')}.lora_A", book)
-        with book.time(f"{prefix}.lora_B"):
-            lora_raw = profiled_linear(low_rank, self.lora_B["default"].weight, None, f"{prefix.removeprefix('forward.')}.lora_B", book)
-        with book.time(f"{prefix}.add_cast_scale"):
-            bprefix = prefix.removeprefix("forward.")
-            lora = profiled_scale_cast(lora_raw, float(self.scaling), base.dtype, f"{bprefix}.add_cast_scale", book)
-            return profiled_residual_add(base, lora, f"{bprefix}.base_lora_add", book)
+        return profiled_lora_linear(self, x, linear_prefix(self).removeprefix("forward."), book)
 
     originals.append((dense.AsymLoRALinear, "forward", original_linear))
     dense.AsymLoRALinear.forward = timed_linear
+    originals.append((dense.TorchLoRALinear, "forward", dense.TorchLoRALinear.forward))
+    dense.TorchLoRALinear.forward = timed_linear
+
+    def profiled_projection(module: Any, x: torch.Tensor, prefix: str) -> torch.Tensor:
+        if hasattr(module, "lora_A") or hasattr(module, "lora_a"):
+            return module(x)
+        weight = getattr(module, "weight", None)
+        if isinstance(weight, torch.Tensor):
+            with book.time(f"forward.{prefix}.base_torch"):
+                return profiled_linear(x, weight, None, f"{prefix}.base_torch", book)
+        raise TypeError(f"unsupported dense projection for prefix={prefix!r}: {type(module).__name__}")
 
     original_attn = dense.TinySelfAttention.forward
 
@@ -1043,9 +1624,9 @@ def patch_dense_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
         prefix = f"forward.{layer}.attention" if layer else "forward.attention"
         bprefix = prefix.removeprefix("forward.")
         batch, seq, hidden = hidden_states.shape
-        q = self.q_proj(hidden_states).view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(hidden_states).view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
+        q = profiled_projection(self.q_proj, hidden_states, f"{bprefix}.q_proj").view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
+        k = profiled_projection(self.k_proj, hidden_states, f"{bprefix}.k_proj").view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
+        v = profiled_projection(self.v_proj, hidden_states, f"{bprefix}.v_proj").view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
         with book.time(f"{prefix}.scores_matmul"):
             scores = profiled_matmul(q.float(), k.float().transpose(-2, -1), f"{bprefix}.scores_matmul", book) / (float(self.head_dim) ** 0.5)
         with book.time(f"{prefix}.causal_mask"):
@@ -1055,7 +1636,7 @@ def patch_dense_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
             probs = profiled_softmax(scores, -1, f"{bprefix}.softmax", book)
         with book.time(f"{prefix}.value_matmul"):
             context = profiled_matmul(probs, v.float(), f"{bprefix}.value_matmul", book).transpose(1, 2).contiguous().view(batch, seq, hidden)
-        return self.o_proj(context.to(dtype=hidden_states.dtype))
+        return profiled_projection(self.o_proj, context.to(dtype=hidden_states.dtype), f"{bprefix}.o_proj")
 
     originals.append((dense.TinySelfAttention, "forward", original_attn))
     dense.TinySelfAttention.forward = timed_attn
@@ -1067,11 +1648,11 @@ def patch_dense_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
         layer = _layer_prefix_from_module_name(name)
         prefix = f"forward.{layer}.mlp" if layer else "forward.mlp"
         bprefix = prefix.removeprefix("forward.")
-        gate = self.gate_proj(hidden_states)
-        up = self.up_proj(hidden_states)
+        gate = profiled_projection(self.gate_proj, hidden_states, f"{bprefix}.gate_proj")
+        up = profiled_projection(self.up_proj, hidden_states, f"{bprefix}.up_proj")
         with book.time(f"{prefix}.silu_mul_activation"):
             activated = profiled_silu_mul(gate, up, f"{bprefix}.silu_mul_activation", book)
-        return self.down_proj(activated.to(dtype=hidden_states.dtype))
+        return profiled_projection(self.down_proj, activated.to(dtype=hidden_states.dtype), f"{bprefix}.down_proj")
 
     originals.append((dense.TinyMLP, "forward", original_mlp))
     dense.TinyMLP.forward = timed_mlp
@@ -1126,92 +1707,113 @@ def patch_dense_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
     return originals
 
 
-def dense_forward_keys(num_layers: int) -> list[str]:
+def dense_projection_forward_keys(layer: str, scope: str, projections: tuple[str, ...], *, lora_targeted: bool) -> list[str]:
+    prefixes = tuple(f"{layer}.{scope}.{proj}" for proj in projections)
+    if lora_targeted:
+        return lora_forward_keys(*prefixes)
+    return [f"forward.{prefix}.base_torch" for prefix in prefixes]
+
+
+def dense_projection_backward_prefixes(layer: str, scope: str, projections: tuple[str, ...], *, lora_targeted: bool) -> list[str]:
+    prefixes = tuple(f"{layer}.{scope}.{proj}" for proj in projections)
+    if lora_targeted:
+        return lora_backward_prefixes(*prefixes)
+    return [f"backward.{prefix}.base_torch" for prefix in prefixes]
+
+
+def dense_forward_keys(num_layers: int, target_mode: str) -> list[str]:
     keys = ["forward.embeddings"]
-    attention_ops = [
-        "layernorm",
-        "scores_matmul",
-        "causal_mask",
-        "softmax",
-        "value_matmul",
-        "residual_add",
-    ]
-    mlp_ops = ["layernorm", "silu_mul_activation", "residual_add"]
     for layer_idx in range(num_layers):
-        layer = f"forward.layers.{layer_idx}"
-        keys.extend(f"{layer}.attention.{op}" for op in attention_ops)
-        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            keys.extend(
-                [
-                    f"{layer}.attention.{proj}.base_frozen_asymgemm",
-                    f"{layer}.attention.{proj}.lora_A",
-                    f"{layer}.attention.{proj}.lora_B",
-                    f"{layer}.attention.{proj}.add_cast_scale",
-                ]
+        layer = f"layers.{layer_idx}"
+        attention_is_targeted = dense_targets_attention(target_mode)
+        mlp_is_targeted = dense_targets_mlp(target_mode)
+        keys.append(f"forward.{layer}.attention.layernorm")
+        keys.extend(
+            dense_projection_forward_keys(
+                layer,
+                "attention",
+                DENSE_ATTENTION_PROJECTIONS[:3],
+                lora_targeted=attention_is_targeted,
             )
-        keys.extend(f"{layer}.mlp.{op}" for op in mlp_ops)
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            keys.extend(
-                [
-                    f"{layer}.mlp.{proj}.base_frozen_asymgemm",
-                    f"{layer}.mlp.{proj}.lora_A",
-                    f"{layer}.mlp.{proj}.lora_B",
-                    f"{layer}.mlp.{proj}.add_cast_scale",
-                ]
+        )
+        keys.extend(
+            [
+                f"forward.{layer}.attention.scores_matmul",
+                f"forward.{layer}.attention.causal_mask",
+                f"forward.{layer}.attention.softmax",
+                f"forward.{layer}.attention.value_matmul",
+            ]
+        )
+        keys.extend(
+            dense_projection_forward_keys(
+                layer,
+                "attention",
+                DENSE_ATTENTION_PROJECTIONS[3:],
+                lora_targeted=attention_is_targeted,
             )
+        )
+        keys.append(f"forward.{layer}.attention.residual_add")
+        keys.append(f"forward.{layer}.mlp.layernorm")
+        keys.extend(
+            dense_projection_forward_keys(
+                layer,
+                "mlp",
+                DENSE_MLP_PROJECTIONS[:2],
+                lora_targeted=mlp_is_targeted,
+            )
+        )
+        keys.append(f"forward.{layer}.mlp.silu_mul_activation")
+        keys.extend(
+            dense_projection_forward_keys(
+                layer,
+                "mlp",
+                DENSE_MLP_PROJECTIONS[2:],
+                lora_targeted=mlp_is_targeted,
+            )
+        )
+        keys.append(f"forward.{layer}.mlp.residual_add")
     keys.extend(["forward.final_norm", "forward.lm_head"])
     return keys
 
 
-def dense_backward_prefixes(num_layers: int) -> list[str]:
+def dense_backward_prefixes(num_layers: int, target_mode: str) -> list[str]:
     keys = ["backward.loss.cross_entropy", "backward.lm_head", "backward.final_norm"]
     for layer_idx in reversed(range(num_layers)):
-        layer = f"backward.layers.{layer_idx}"
+        layer = f"layers.{layer_idx}"
         keys.extend(
             [
-                f"{layer}.mlp.residual_add",
-                f"{layer}.mlp.down_proj.base_dx_asymgemm",
-                f"{layer}.mlp.down_proj.base_lora_add",
-                f"{layer}.mlp.down_proj.add_cast_scale",
-                f"{layer}.mlp.down_proj.lora_B",
-                f"{layer}.mlp.down_proj.lora_A",
-                f"{layer}.mlp.silu_mul_activation",
-                f"{layer}.mlp.up_proj.base_dx_asymgemm",
-                f"{layer}.mlp.up_proj.base_lora_add",
-                f"{layer}.mlp.up_proj.add_cast_scale",
-                f"{layer}.mlp.up_proj.lora_B",
-                f"{layer}.mlp.up_proj.lora_A",
-                f"{layer}.mlp.gate_proj.base_dx_asymgemm",
-                f"{layer}.mlp.gate_proj.base_lora_add",
-                f"{layer}.mlp.gate_proj.add_cast_scale",
-                f"{layer}.mlp.gate_proj.lora_B",
-                f"{layer}.mlp.gate_proj.lora_A",
-                f"{layer}.mlp.layernorm",
-                f"{layer}.attention.residual_add",
-                f"{layer}.attention.o_proj.base_dx_asymgemm",
-                f"{layer}.attention.o_proj.base_lora_add",
-                f"{layer}.attention.o_proj.add_cast_scale",
-                f"{layer}.attention.o_proj.lora_B",
-                f"{layer}.attention.o_proj.lora_A",
-                f"{layer}.attention.value_matmul",
-                f"{layer}.attention.softmax",
-                f"{layer}.attention.scores_matmul",
-                f"{layer}.attention.v_proj.base_dx_asymgemm",
-                f"{layer}.attention.v_proj.base_lora_add",
-                f"{layer}.attention.v_proj.add_cast_scale",
-                f"{layer}.attention.v_proj.lora_B",
-                f"{layer}.attention.v_proj.lora_A",
-                f"{layer}.attention.k_proj.base_dx_asymgemm",
-                f"{layer}.attention.k_proj.base_lora_add",
-                f"{layer}.attention.k_proj.add_cast_scale",
-                f"{layer}.attention.k_proj.lora_B",
-                f"{layer}.attention.k_proj.lora_A",
-                f"{layer}.attention.q_proj.base_dx_asymgemm",
-                f"{layer}.attention.q_proj.base_lora_add",
-                f"{layer}.attention.q_proj.add_cast_scale",
-                f"{layer}.attention.q_proj.lora_B",
-                f"{layer}.attention.q_proj.lora_A",
-                f"{layer}.attention.layernorm",
+                f"backward.{layer}.mlp.residual_add",
+                *dense_projection_backward_prefixes(
+                    layer,
+                    "mlp",
+                    ("down_proj",),
+                    lora_targeted=dense_targets_mlp(target_mode),
+                ),
+                f"backward.{layer}.mlp.silu_mul_activation",
+                *dense_projection_backward_prefixes(
+                    layer,
+                    "mlp",
+                    ("up_proj", "gate_proj"),
+                    lora_targeted=dense_targets_mlp(target_mode),
+                ),
+                f"backward.{layer}.mlp.layernorm",
+                f"backward.{layer}.attention.residual_add",
+                *dense_projection_backward_prefixes(
+                    layer,
+                    "attention",
+                    ("o_proj",),
+                    lora_targeted=dense_targets_attention(target_mode),
+                ),
+                f"backward.{layer}.attention.value_matmul",
+                f"backward.{layer}.attention.softmax",
+                f"backward.{layer}.attention.scores_matmul",
+                *dense_projection_backward_prefixes(
+                    layer,
+                    "attention",
+                    ("v_proj", "k_proj", "q_proj"),
+                    lora_targeted=dense_targets_attention(target_mode),
+                ),
+                f"backward.{layer}.attention.layernorm",
             ]
         )
     return keys
@@ -1219,11 +1821,17 @@ def dense_backward_prefixes(num_layers: int) -> list[str]:
 
 def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
     from asym_gemm.training.frozen_linear import AsymExecutionStats
-    from asym_gemm.training.dense import AsymTinyDenseLLM, MICRO_DENSE_LLM_CONFIG, make_inputs, make_tiny_dense_weights
+    from asym_gemm.training.dense import (
+        AsymTinyDenseLLM,
+        MICRO_DENSE_LLM_CONFIG,
+        TorchTinyDenseLLM,
+        make_inputs,
+        make_tiny_dense_weights,
+    )
 
     clear(device)
     config = getattr(args, "_dense_config_override", MICRO_DENSE_LLM_CONFIG)
-    if not hasattr(args, "_dense_config_override") and int(args.real_tokens or 0) > 0:
+    if not hasattr(args, "_dense_config_override"):
         config = replace(
             config,
             batch_size=int(args.real_batch_size),
@@ -1233,19 +1841,34 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
         )
     workload_name = str(getattr(args, "_workload_name_override", "m4_2_dense_llm"))
     config_extra = dict(getattr(args, "_config_extra", {}))
+    target_mode = str(getattr(args, "dense_target_mode", DEFAULT_DENSE_TARGET_MODE))
+    if target_mode not in DENSE_TARGET_MODES:
+        raise ValueError(f"dense_target_mode={target_mode!r} must be one of {DENSE_TARGET_MODES}")
+    config_extra["target_mode"] = target_mode
+    config_extra["dense_offload_scope"] = "mlp_base_projections_only" if target_mode == "mlp_only" else target_mode
     stats = AsymExecutionStats()
     weights = make_tiny_dense_weights(config, seed=1, dtype=dtype)
-    model = AsymTinyDenseLLM(
-        weights,
-        config=config,
-        target_mode="all",
-        backend=args.backend,
-        stats=stats,
-        device=device,
-        dtype=dtype,
-        lora_seed=2,
-        precision=args.precision,
-    )
+    if args.backend == "torch_only":
+        model = TorchTinyDenseLLM(
+            weights,
+            config=config,
+            target_mode=target_mode,
+            device=device,
+            dtype=dtype,
+            lora_seed=2,
+        )
+    else:
+        model = AsymTinyDenseLLM(
+            weights,
+            config=config,
+            target_mode=target_mode,
+            backend=args.backend,
+            stats=stats,
+            device=device,
+            dtype=dtype,
+            lora_seed=2,
+            precision=args.precision,
+        )
     set_profile_names(model)
     optimizer = torch.optim.AdamW(model.lora_parameters(), lr=3e-3)
 
@@ -1275,9 +1898,11 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
         device,
         avg,
         stats.as_dict(),
-        forward_keys=dense_forward_keys(config.num_layers),
-        backward_group_prefixes=dense_backward_prefixes(config.num_layers),
+        forward_keys=dense_forward_keys(config.num_layers, target_mode),
+        backward_group_prefixes=dense_backward_prefixes(config.num_layers, target_mode),
         config={**asdict(config), **config_extra},
+        stage_memory=book.memory_summary(),
+        memory_attribution=memory_attribution_report(model, optimizer, device, book.saved_tensor_tracker),
     )
 
 
@@ -1320,48 +1945,6 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
     originals.append((moe.TinySelfAttention, "forward", original_attn))
     moe.TinySelfAttention.forward = timed_attn
 
-    original_expert = moe.AsymTinyExpert.forward
-
-    def timed_expert(self: Any, x: torch.Tensor) -> torch.Tensor:
-        prefix = str(getattr(self, "_m4_profile_prefix", "forward.routed_expert"))
-        bprefix = prefix.removeprefix("forward.")
-
-        def lora(name: str, value: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
-            a = getattr(self, f"{name}_lora_a")
-            b = getattr(self, f"{name}_lora_b")
-            with book.time(f"{prefix}.{name}_lora_A"):
-                low_rank = profiled_linear(value.float(), a, None, f"{bprefix}.{name}_lora_A", book)
-            with book.time(f"{prefix}.{name}_lora_B"):
-                out = profiled_linear(low_rank, b, None, f"{bprefix}.{name}_lora_B", book) * float(self.lora_scale)
-            with book.time(f"{prefix}.{name}_lora_scale_cast"):
-                return out.to(dtype=out_dtype)
-
-        if x.numel() == 0:
-            return x.new_empty((0, self.config.hidden_size))
-        with book.time(f"{prefix}.contiguous_input"):
-            x = x.contiguous()
-        with book.time(f"{prefix}.gate_base_asymgemm"):
-            self.gate_base.profile_name = f"{bprefix}.gate_base"
-            gate_base = self.gate_base(x)
-        gate_lora = lora("gate", x, x.dtype)
-        gate = profiled_residual_add(gate_base, gate_lora, f"{bprefix}.gate_base_lora_add", book)
-        with book.time(f"{prefix}.up_base_asymgemm"):
-            self.up_base.profile_name = f"{bprefix}.up_base"
-            up_base = self.up_base(x)
-        up_lora = lora("up", x, x.dtype)
-        up = profiled_residual_add(up_base, up_lora, f"{bprefix}.up_base_lora_add", book)
-        with book.time(f"{prefix}.activation_silu_mul"):
-            activated = profiled_silu_mul(gate, up, f"{bprefix}.activation_silu_mul", book).to(dtype=x.dtype)
-        with book.time(f"{prefix}.down_base_asymgemm"):
-            self.down_base.profile_name = f"{bprefix}.down_base"
-            down_base = self.down_base(activated.contiguous())
-        down_lora = lora("down", activated, x.dtype)
-        with book.time(f"{prefix}.add"):
-            return profiled_residual_add(down_base, down_lora, f"{bprefix}.down_base_lora_add", book)
-
-    originals.append((moe.AsymTinyExpert, "forward", original_expert))
-    moe.AsymTinyExpert.forward = timed_expert
-
     original_layer_forward = moe.AsymTinyMoELayer.forward
 
     def timed_layer_forward(self: Any, x: torch.Tensor, *, static_routing: Any = None, mode: str = "contiguous", return_details: bool = False) -> Any:
@@ -1396,18 +1979,18 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
         if mode == "contiguous":
             with book.time("forward.pack_tokens"):
                 packed = profiled_pack_tokens(flat, metadata, "contiguous", book)
-            with book.time("forward.routed_expert.dispatch_loop"):
+            with book.time("forward.routed_expert.grouped"):
                 expert_output = self._run_contiguous(packed, metadata)
             with book.time("forward.scatter_combine"):
                 routed_out = profiled_scatter_tokens(expert_output, metadata, "contiguous", book)
         else:
             with book.time("forward.pack_tokens"):
                 packed = profiled_pack_tokens(flat, metadata, "masked", book)
-            with book.time("forward.routed_expert.dispatch_loop"):
+            with book.time("forward.routed_expert.grouped"):
                 expert_output = self._run_masked(packed, metadata)
             with book.time("forward.scatter_combine"):
                 routed_out = profiled_scatter_tokens(expert_output, metadata, "masked", book)
-        with book.time("forward.shared_expert.dispatch_loop"):
+        with book.time("forward.shared_expert.grouped"):
             shared = self._run_shared(flat)
         with book.time("forward.moe.combine_shared_routed"):
             moe_out = profiled_residual_add(routed_out, shared, "moe.combine_shared_routed", book)
@@ -1467,31 +2050,13 @@ def moe_forward_keys(config: Any) -> list[str]:
         "forward.router",
         "forward.route_metadata",
         "forward.pack_tokens",
+        "forward.routed_expert.grouped",
         "forward.scatter_combine",
+        "forward.shared_expert.grouped",
+        "forward.moe.combine_shared_routed",
+        "forward.moe.residual_add",
+        "forward.final_norm",
     ]
-    expert_ops = [
-        "contiguous_input",
-        "gate_base_asymgemm",
-        "gate_lora_A",
-        "gate_lora_B",
-        "gate_lora_scale_cast",
-        "up_base_asymgemm",
-        "up_lora_A",
-        "up_lora_B",
-        "up_lora_scale_cast",
-        "activation_silu_mul",
-        "down_base_asymgemm",
-        "down_lora_A",
-        "down_lora_B",
-        "down_lora_scale_cast",
-        "add",
-    ]
-    for layer_idx in range(config.num_layers):
-        for expert_idx in range(config.num_experts):
-            keys.extend(f"forward.layers.{layer_idx}.routed_expert.{expert_idx}.{op}" for op in expert_ops)
-        for expert_idx in range(config.num_shared_experts):
-            keys.extend(f"forward.layers.{layer_idx}.shared_expert.{expert_idx}.{op}" for op in expert_ops)
-    keys.extend(["forward.moe.combine_shared_routed", "forward.moe.residual_add", "forward.final_norm"])
     return keys
 
 
@@ -1506,26 +2071,6 @@ def moe_backward_prefixes(config: Any) -> list[str]:
         "backward.route_metadata",
         "backward.router",
     ]
-    expert_ops = [
-        "down_base.base_dx_asymgemm",
-        "down_base_lora_add",
-        "down_lora_B",
-        "down_lora_A",
-        "activation_silu_mul",
-        "up_base.base_dx_asymgemm",
-        "up_base_lora_add",
-        "up_lora_B",
-        "up_lora_A",
-        "gate_base.base_dx_asymgemm",
-        "gate_base_lora_add",
-        "gate_lora_B",
-        "gate_lora_A",
-    ]
-    for layer_idx in reversed(range(config.num_layers)):
-        for expert_idx in range(config.num_experts):
-            keys.extend(f"backward.layers.{layer_idx}.routed_expert.{expert_idx}.{op}" for op in expert_ops)
-        for expert_idx in range(config.num_shared_experts):
-            keys.extend(f"backward.layers.{layer_idx}.shared_expert.{expert_idx}.{op}" for op in expert_ops)
     keys.extend(
         [
             "backward.moe.layernorm",
@@ -1544,11 +2089,16 @@ def moe_backward_prefixes(config: Any) -> list[str]:
 
 
 def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
-    from asym_gemm.training.moe import MICRO_MOE_CONFIG, make_static_routes, make_tiny_moe_pair
+    from asym_gemm.training.frozen_linear import AsymExecutionStats
+    from asym_gemm.training.moe import (
+        MICRO_MOE_CONFIG,
+        make_static_routes,
+        make_tiny_moe_pair,
+    )
 
     clear(device)
     config = getattr(args, "_moe_config_override", MICRO_MOE_CONFIG)
-    if not hasattr(args, "_moe_config_override") and int(args.real_tokens or 0) > 0:
+    if not hasattr(args, "_moe_config_override"):
         config = replace(
             config,
             batch_size=int(args.real_batch_size),
@@ -1601,6 +2151,8 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         forward_keys=moe_forward_keys(config),
         backward_group_prefixes=moe_backward_prefixes(config),
         config={**asdict(config), "moe_mode": args.moe_mode, **config_extra},
+        stage_memory=book.memory_summary(),
+        memory_attribution=memory_attribution_report(model, optimizer, device, book.saved_tensor_tracker),
     )
 
 
@@ -1624,23 +2176,33 @@ def run_profile_steps(
             sync(book.device)
         if reset_stats is not None:
             reset_stats()
-        book.values.clear()
+        if book.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(book.device)
+        if bool(getattr(args, "memory_attribution", False)):
+            book.saved_tensor_tracker = SavedTensorMemoryTracker(model, book)
+        book.clear()
 
+        hooks = (
+            torch.autograd.graph.saved_tensors_hooks(book.saved_tensor_tracker.pack, book.saved_tensor_tracker.unpack)
+            if book.saved_tensor_tracker is not None
+            else nullcontext()
+        )
         with patch_base_dispatch(book):
-            for _ in range(args.measure_steps):
-                with book.time("step.input_preparation"):
-                    batch, target = make_batch()
-                optimizer.zero_grad(set_to_none=True)
-                with book.time("step.forward"):
-                    prediction = forward_fn(model, batch)
-                with book.time("step.loss"):
-                    loss = loss_fn(prediction, target)
-                with book.time("step.backward"):
-                    loss.backward()
-                with book.time("step.optimizer"):
-                    optimizer.step()
-                sync(book.device)
-                book.flush()
+            with hooks:
+                for _ in range(args.measure_steps):
+                    with book.time("step.input_preparation"):
+                        batch, target = make_batch()
+                    optimizer.zero_grad(set_to_none=True)
+                    with book.time("step.forward"):
+                        prediction = forward_fn(model, batch)
+                    with book.time("step.loss"):
+                        loss = loss_fn(prediction, target)
+                    with book.time("step.backward"):
+                        loss.backward()
+                    with book.time("step.optimizer"):
+                        optimizer.step()
+                    sync(book.device)
+                    book.flush()
 
 
 def build_report(
@@ -1653,6 +2215,8 @@ def build_report(
     forward_keys: list[str],
     backward_group_prefixes: list[str],
     config: dict[str, Any],
+    stage_memory: dict[str, Any] | None = None,
+    memory_attribution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     forward_total = avg.get("step.forward", 0.0)
     backward_total = avg.get("step.backward", 0.0)
@@ -1680,6 +2244,8 @@ def build_report(
         "forward": table(forward_total, rows_from_keys(avg, forward_total, forward_keys, residual_name="forward.python_dispatch_cuda_launch_and_sync")),
         "backward": table(backward_total, rows_from_keys(avg, backward_total, backward_keys, residual_name="backward.accounting_gap")),
         "memory": memory_report(model, device),
+        "stage_memory": stage_memory or {"rows": []},
+        "memory_attribution": memory_attribution or {"enabled": False, "categories": {"rows": []}, "saved_activations": {"rows": []}},
         "raw_seconds_per_step": raw_seconds_without_individual_calls(avg),
         "raw_dispatch_call_group_seconds_per_step": call_group_seconds_per_step(avg),
         "notes": [
@@ -1708,6 +2274,9 @@ def write_report(report: dict[str, Any], output_dir: Path) -> None:
 
 
 def markdown(report: dict[str, Any]) -> str:
+    def fmt_mib(value: int | float) -> str:
+        return f"{float(value) / (1024.0 ** 2):.2f}"
+
     def emit_table(title: str, section: dict[str, Any]) -> list[str]:
         lines = [f"## {title}", "", "| Component | ms | % |", "|---|---:|---:|"]
         for row in section["rows"]:
@@ -1720,7 +2289,7 @@ def markdown(report: dict[str, Any]) -> str:
     lines = [
         f"# {report['workload']} Source-Label Coverage Report",
         "",
-        "This is not the GPU performance truth table. Use Nsight Systems plus `scripts/postprocess_nsys_m4.py` for kernel-busy, memcpy, and GPU no-kernel percentages.",
+        "This is not the GPU performance truth table. Use Nsight Systems plus `scripts/postprocess_nsys_lora.py` for kernel-busy, memcpy, and GPU no-kernel percentages.",
         "",
         "These source-label tables are for auditing range coverage. In `--timing-mode profile`, inner rows are asynchronous Python/NVTX range timings. In `--timing-mode debug_sync`, rows are synchronized debugging timings and carry profiler overhead.",
         "",
@@ -1734,19 +2303,79 @@ def markdown(report: dict[str, Any]) -> str:
         [
             "## Memory",
             "",
-            "| Component | bytes |",
-            "|---|---:|",
-            f"| peak_hbm | {mem['gpu']['peak_hbm_bytes']} |",
-            f"| gpu_parameters | {mem['gpu']['parameter_bytes']} |",
-            f"| gpu_buffers | {mem['gpu']['buffer_bytes']} |",
-            f"| host_W | {mem['cpu']['host_w_bytes']} |",
-            f"| host_W_T | {mem['cpu']['host_w_t_bytes']} |",
-            f"| pinned_W | {mem['cpu']['pinned_w_bytes']} |",
-            f"| pinned_W_T | {mem['cpu']['pinned_w_t_bytes']} |",
-            f"| pinned_total | {mem['cpu']['pinned_total_bytes']} |",
+            "| Component | bytes | MiB |",
+            "|---|---:|---:|",
+            f"| peak_hbm | {mem['gpu']['peak_hbm_bytes']} | {fmt_mib(mem['gpu']['peak_hbm_bytes'])} |",
+            f"| gpu_parameters | {mem['gpu']['parameter_bytes']} | {fmt_mib(mem['gpu']['parameter_bytes'])} |",
+            f"| gpu_buffers | {mem['gpu']['buffer_bytes']} | {fmt_mib(mem['gpu']['buffer_bytes'])} |",
+            f"| host_W | {mem['cpu']['host_w_bytes']} | {fmt_mib(mem['cpu']['host_w_bytes'])} |",
+            f"| host_W_T | {mem['cpu']['host_w_t_bytes']} | {fmt_mib(mem['cpu']['host_w_t_bytes'])} |",
+            f"| pinned_W | {mem['cpu']['pinned_w_bytes']} | {fmt_mib(mem['cpu']['pinned_w_bytes'])} |",
+            f"| pinned_W_T | {mem['cpu']['pinned_w_t_bytes']} | {fmt_mib(mem['cpu']['pinned_w_t_bytes'])} |",
+            f"| pinned_total | {mem['cpu']['pinned_total_bytes']} | {fmt_mib(mem['cpu']['pinned_total_bytes'])} |",
             "",
         ]
     )
+    stage_memory = report.get("stage_memory", {})
+    rows = stage_memory.get("rows") if isinstance(stage_memory, dict) else None
+    if isinstance(rows, list) and rows:
+        lines.extend(
+            [
+                "## Forward/Backward CUDA Allocator Memory",
+                "",
+                "| Stage | samples | allocated start MiB | allocated end MiB | allocated delta MiB | reserved start MiB | reserved end MiB | reserved delta MiB | global peak after MiB |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row in rows:
+            lines.append(
+                f"| {row['name']} | "
+                f"{row['samples']} | "
+                f"{fmt_mib(row['avg_allocated_start_bytes'])} | "
+                f"{fmt_mib(row['avg_allocated_end_bytes'])} | "
+                f"{fmt_mib(row['avg_allocated_delta_bytes'])} | "
+                f"{fmt_mib(row['avg_reserved_start_bytes'])} | "
+                f"{fmt_mib(row['avg_reserved_end_bytes'])} | "
+                f"{fmt_mib(row['avg_reserved_delta_bytes'])} | "
+                f"{fmt_mib(row['max_global_peak_after_bytes'])} |"
+            )
+        lines.append("")
+    attribution = report.get("memory_attribution", {})
+    categories = attribution.get("categories", {}) if isinstance(attribution, dict) else {}
+    category_rows = categories.get("rows") if isinstance(categories, dict) else None
+    if isinstance(category_rows, list) and category_rows:
+        lines.extend(
+            [
+                "## Fine-Grained Memory Attribution",
+                "",
+                "These rows are tensor-size accounting. Saved activation rows require `--memory-attribution` and are memory-only, not timing truth.",
+                "",
+                "| Category | Memory space | bytes | MiB | Accuracy |",
+                "|---|---|---:|---:|---|",
+            ]
+        )
+        for row in category_rows:
+            value = int(row["bytes"])
+            lines.append(f"| {row['category']} | {row['memory_space']} | {value} | {fmt_mib(value)} | {row['accuracy']} |")
+        lines.append("")
+    saved = attribution.get("saved_activations", {}) if isinstance(attribution, dict) else {}
+    saved_rows = saved.get("rows") if isinstance(saved, dict) else None
+    if isinstance(saved_rows, list) and saved_rows:
+        lines.extend(
+            [
+                "## Saved Activation Memory by Semantic Owner",
+                "",
+                "| Owner | unique bytes | unique MiB | reference bytes | saves | unique tensors |",
+                "|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row in saved_rows:
+            value = int(row["unique_bytes"])
+            lines.append(
+                f"| {row['owner']} | {value} | {fmt_mib(value)} | "
+                f"{int(row['reference_bytes'])} | {int(row['save_count'])} | {int(row['unique_tensor_count'])} |"
+            )
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -1827,89 +2456,144 @@ def profiler_backward_table(prof: Any, *, profiled_steps: int) -> dict[str, Any]
     return table(total, rows_from_keys(values, total, preferred))
 
 
-def qwen3_14b_dense_config(args: argparse.Namespace) -> Any:
+def dense_config_from_metadata(metadata: dict[str, Any], args: argparse.Namespace) -> Any:
     from asym_gemm.training.dense import TinyDenseLLMConfig
 
-    full = QWEN3_14B_CONFIG
     return TinyDenseLLMConfig(
-        vocab_size=min(int(full["vocab_size"]), int(args.real_vocab_rows)),
-        hidden_size=int(full["hidden_size"]),
-        num_layers=max(1, min(int(args.real_profile_layers), int(full["hf_num_hidden_layers"]))),
-        num_heads=int(full["num_attention_heads"]),
+        vocab_size=min(int(metadata["vocab_size"]), int(args.real_vocab_rows)),
+        hidden_size=int(metadata["hidden_size"]),
+        num_layers=max(1, min(int(args.real_profile_layers), int(metadata["hf_num_hidden_layers"]))),
+        num_heads=int(metadata["num_attention_heads"]),
         seq_len=int(args.real_seq_len),
         batch_size=int(args.real_batch_size),
-        intermediate_size=int(full["intermediate_size"]),
+        intermediate_size=int(metadata["intermediate_size"]),
         lora_rank=int(args.real_lora_rank),
         lora_alpha=float(args.real_lora_alpha),
     )
+
+
+def moe_config_from_metadata(metadata: dict[str, Any], args: argparse.Namespace) -> Any:
+    from asym_gemm.training.moe import TinyMoEConfig
+
+    return TinyMoEConfig(
+        num_layers=max(1, min(int(args.real_profile_layers), int(metadata["hf_num_hidden_layers"]))),
+        num_experts=int(metadata["num_experts"]),
+        top_k=int(metadata["num_experts_per_tok"]),
+        hidden_size=int(metadata["hidden_size"]),
+        intermediate_size=int(metadata["moe_intermediate_size"]),
+        logical_tokens=int(args.real_tokens or (int(args.real_seq_len) * int(args.real_batch_size))),
+        lora_rank=int(args.real_lora_rank),
+        lora_alpha=float(args.real_lora_alpha),
+        residual_scale=0.25,
+        num_shared_experts=int(metadata["num_shared_experts"]),
+        vocab_size=min(int(metadata["vocab_size"]), int(args.real_vocab_rows)),
+        num_heads=int(metadata["num_attention_heads"]),
+        batch_size=int(args.real_batch_size),
+        seq_len=int(args.real_seq_len),
+    )
+
+
+def qwen3_14b_dense_config(args: argparse.Namespace) -> Any:
+    return dense_config_from_metadata(QWEN3_14B_CONFIG, args)
 
 
 def custom_dense_3b_config(args: argparse.Namespace) -> Any:
-    from asym_gemm.training.dense import TinyDenseLLMConfig
-
-    full = CUSTOM_DENSE_3B_CONFIG
-    return TinyDenseLLMConfig(
-        vocab_size=min(int(full["vocab_size"]), int(args.real_vocab_rows)),
-        hidden_size=int(full["hidden_size"]),
-        num_layers=max(1, min(int(args.real_profile_layers), int(full["hf_num_hidden_layers"]))),
-        num_heads=int(full["num_attention_heads"]),
-        seq_len=int(args.real_seq_len),
-        batch_size=int(args.real_batch_size),
-        intermediate_size=int(full["intermediate_size"]),
-        lora_rank=int(args.real_lora_rank),
-        lora_alpha=float(args.real_lora_alpha),
-    )
+    return dense_config_from_metadata(CUSTOM_DENSE_3B_CONFIG, args)
 
 
 def qwen3_30b_a3b_moe_config(args: argparse.Namespace) -> Any:
-    from asym_gemm.training.moe import TinyMoEConfig
-
-    full = QWEN3_30B_A3B_CONFIG
-    return TinyMoEConfig(
-        num_layers=max(1, min(int(args.real_profile_layers), int(full["hf_num_hidden_layers"]))),
-        num_experts=int(full["num_experts"]),
-        top_k=int(full["num_experts_per_tok"]),
-        hidden_size=int(full["hidden_size"]),
-        intermediate_size=int(full["moe_intermediate_size"]),
-        logical_tokens=int(args.real_tokens or (int(args.real_seq_len) * int(args.real_batch_size))),
-        lora_rank=int(args.real_lora_rank),
-        lora_alpha=float(args.real_lora_alpha),
-        residual_scale=0.25,
-        num_shared_experts=int(full["num_shared_experts"]),
-        vocab_size=min(int(full["vocab_size"]), int(args.real_vocab_rows)),
-        num_heads=int(full["num_attention_heads"]),
-        batch_size=int(args.real_batch_size),
-        seq_len=int(args.real_seq_len),
-    )
+    return moe_config_from_metadata(QWEN3_30B_A3B_CONFIG, args)
 
 
 def custom_moe_3b_config(args: argparse.Namespace) -> Any:
-    from asym_gemm.training.moe import TinyMoEConfig
+    return moe_config_from_metadata(CUSTOM_MOE_3B_CONFIG, args)
 
-    full = CUSTOM_MOE_3B_CONFIG
-    return TinyMoEConfig(
-        num_layers=max(1, min(int(args.real_profile_layers), int(full["hf_num_hidden_layers"]))),
-        num_experts=int(full["num_experts"]),
-        top_k=int(full["num_experts_per_tok"]),
-        hidden_size=int(full["hidden_size"]),
-        intermediate_size=int(full["moe_intermediate_size"]),
-        logical_tokens=int(args.real_tokens or (int(args.real_seq_len) * int(args.real_batch_size))),
-        lora_rank=int(args.real_lora_rank),
-        lora_alpha=float(args.real_lora_alpha),
-        residual_scale=0.25,
-        num_shared_experts=int(full["num_shared_experts"]),
-        vocab_size=min(int(full["vocab_size"]), int(args.real_vocab_rows)),
-        num_heads=int(full["num_attention_heads"]),
-        batch_size=int(args.real_batch_size),
-        seq_len=int(args.real_seq_len),
-    )
+
+def _metadata_config_extra(metadata: dict[str, Any], profiled_layers: int) -> dict[str, Any]:
+    return {
+        **metadata,
+        "profiled_layers": int(profiled_layers),
+        "weight_source": "random_config_matched",
+    }
+
+
+def profile_dense_metadata_workload(
+    args: argparse.Namespace,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    workload_name: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    config = dense_config_from_metadata(metadata, args)
+    args._dense_config_override = config
+    args._workload_name_override = workload_name
+    args._config_extra = _metadata_config_extra(metadata, config.num_layers)
+    return profile_dense(args, device, dtype)
+
+
+def profile_moe_metadata_workload(
+    args: argparse.Namespace,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    workload_name: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    config = moe_config_from_metadata(metadata, args)
+    args._moe_config_override = config
+    args._workload_name_override = workload_name
+    args._config_extra = _metadata_config_extra(metadata, config.num_layers)
+    return profile_moe(args, device, dtype)
+
+
+def run_workload(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
+    simple_workloads: dict[str, Callable[[argparse.Namespace, torch.device, torch.dtype], dict[str, Any]]] = {
+        "mlp": profile_mlp,
+        "dense": profile_dense,
+        "moe": profile_moe,
+        "mlp_1b": profile_mlp_1b,
+    }
+    if args.workload in simple_workloads:
+        return simple_workloads[args.workload](args, device, dtype)
+    if args.workload in MM_CONFIGS:
+        return profile_mm_lora(args, device, dtype, args.workload)
+    if args.workload in MLP_CONFIGS:
+        return profile_mlp_lora(args, device, dtype, args.workload)
+
+    dense_metadata_workloads = {
+        "dense_3b": CUSTOM_DENSE_3B_CONFIG,
+        "qwen3_14b": QWEN3_14B_CONFIG,
+    }
+    if args.workload in dense_metadata_workloads:
+        return profile_dense_metadata_workload(
+            args,
+            device,
+            dtype,
+            workload_name=args.workload,
+            metadata=dense_metadata_workloads[args.workload],
+        )
+
+    moe_metadata_workloads = {
+        "moe_3b": CUSTOM_MOE_3B_CONFIG,
+        "qwen3_30b_a3b": QWEN3_30B_A3B_CONFIG,
+    }
+    if args.workload in moe_metadata_workloads:
+        return profile_moe_metadata_workload(
+            args,
+            device,
+            dtype,
+            workload_name=args.workload,
+            metadata=moe_metadata_workloads[args.workload],
+        )
+    raise AssertionError(args.workload)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--workload",
-        choices=["mlp", "dense", "moe", "dense_3b", "moe_3b", "qwen3_14b", "qwen3_30b_a3b", "matrix_1b", "mm_1b", "mm_3b", "mlp_1b", "mlp_3b"],
+        choices=WORKLOAD_CHOICES,
         default="mlp",
     )
     parser.add_argument("--device", default="cuda:1")
@@ -1917,10 +2601,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measure-steps", type=int, default=20)
     parser.add_argument("--moe-mode", choices=["contiguous", "masked"], default="contiguous")
+    parser.add_argument(
+        "--dense-target-mode",
+        choices=DENSE_TARGET_MODES,
+        default=DEFAULT_DENSE_TARGET_MODE,
+        help="Dense-model LoRA/AsymGEMM target scope. Default keeps dense comparable to MoE by offloading only MLP base projections.",
+    )
     parser.add_argument("--profile-layers", "--real-profile-layers", dest="real_profile_layers", metavar="N", type=int, default=1)
-    parser.add_argument("--batch-size", "--real-batch-size", dest="real_batch_size", metavar="N", type=int, default=1)
-    parser.add_argument("--seq-len", "--real-seq-len", dest="real_seq_len", metavar="N", type=int, default=64)
+    parser.add_argument("--batch-size", "--real-batch-size", dest="real_batch_size", metavar="N", type=int, default=DEFAULT_LORA_BATCH_SIZE)
+    parser.add_argument("--seq-len", "--real-seq-len", dest="real_seq_len", metavar="N", type=int, default=DEFAULT_LORA_SEQ_LEN)
     parser.add_argument("--tokens", "--real-tokens", dest="real_tokens", metavar="N", type=int, default=0)
+    parser.add_argument(
+        "--hidden-dim",
+        "--real-hidden-dim",
+        dest="real_hidden_dim",
+        metavar="N",
+        type=int,
+        default=DEFAULT_LORA_HIDDEN_DIM,
+        help="Model hidden width for synthetic mm_3b/mlp_3b LoRA profiles.",
+    )
+    parser.add_argument(
+        "--mlp-intermediate-dim",
+        "--real-mlp-intermediate-dim",
+        dest="real_mlp_intermediate_dim",
+        metavar="N",
+        type=int,
+        default=0,
+        help="Intermediate width for synthetic mlp_3b. Default is hidden_dim * mlp_expansion.",
+    )
+    parser.add_argument(
+        "--mlp-expansion",
+        "--real-mlp-expansion",
+        dest="real_mlp_expansion",
+        metavar="N",
+        type=int,
+        default=DEFAULT_LORA_MLP_EXPANSION,
+        help="MLP expansion used when --mlp-intermediate-dim is not set.",
+    )
     parser.add_argument("--lora-rank", "--real-lora-rank", dest="real_lora_rank", metavar="N", type=int, default=64)
     parser.add_argument("--lora-alpha", "--real-lora-alpha", dest="real_lora_alpha", metavar="FLOAT", type=float, default=128.0)
     parser.add_argument("--vocab-rows", "--real-vocab-rows", dest="real_vocab_rows", metavar="N", type=int, default=4096)
@@ -1940,6 +2657,11 @@ def parse_args() -> argparse.Namespace:
         default="profile",
         help="profile is the real low-overhead NVTX/Nsight mode; debug_sync synchronizes every range for source coverage debugging only.",
     )
+    parser.add_argument(
+        "--memory-attribution",
+        action="store_true",
+        help="Enable saved-tensor hooks for fine-grained activation memory attribution. This is memory-only and should not be used for timing claims.",
+    )
     return parser.parse_args()
 
 
@@ -1949,58 +2671,9 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.set_device(device)
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+
     def run() -> dict[str, Any]:
-        if args.workload == "mlp":
-            return profile_mlp(args, device, dtype)
-        if args.workload == "dense":
-            return profile_dense(args, device, dtype)
-        if args.workload == "moe":
-            return profile_moe(args, device, dtype)
-        if args.workload == "dense_3b":
-            args._dense_config_override = custom_dense_3b_config(args)
-            args._workload_name_override = "dense_3b"
-            args._config_extra = {
-                **CUSTOM_DENSE_3B_CONFIG,
-                "profiled_layers": args._dense_config_override.num_layers,
-                "weight_source": "random_config_matched",
-            }
-            return profile_dense(args, device, dtype)
-        if args.workload == "moe_3b":
-            args._moe_config_override = custom_moe_3b_config(args)
-            args._workload_name_override = "moe_3b"
-            args._config_extra = {
-                **CUSTOM_MOE_3B_CONFIG,
-                "profiled_layers": args._moe_config_override.num_layers,
-                "weight_source": "random_config_matched",
-            }
-            return profile_moe(args, device, dtype)
-        if args.workload == "matrix_1b":
-            return profile_matrix_1b(args, device, dtype)
-        if args.workload in {"mm_1b", "mm_3b"}:
-            return profile_mm(args, device, dtype, args.workload)
-        if args.workload == "mlp_1b":
-            return profile_mlp_1b(args, device, dtype)
-        if args.workload == "mlp_3b":
-            return profile_mlp_fundamental(args, device, dtype, "mlp_3b")
-        if args.workload == "qwen3_14b":
-            args._dense_config_override = qwen3_14b_dense_config(args)
-            args._workload_name_override = "qwen3_14b"
-            args._config_extra = {
-                **QWEN3_14B_CONFIG,
-                "profiled_layers": args._dense_config_override.num_layers,
-                "weight_source": "random_config_matched",
-            }
-            return profile_dense(args, device, dtype)
-        if args.workload == "qwen3_30b_a3b":
-            args._moe_config_override = qwen3_30b_a3b_moe_config(args)
-            args._workload_name_override = "qwen3_30b_a3b"
-            args._config_extra = {
-                **QWEN3_30B_A3B_CONFIG,
-                "profiled_layers": args._moe_config_override.num_layers,
-                "weight_source": "random_config_matched",
-            }
-            return profile_moe(args, device, dtype)
-        raise AssertionError(args.workload)
+        return run_workload(args, device, dtype)
 
     if args.export_torch_trace:
         activities = [ProfilerActivity.CPU]

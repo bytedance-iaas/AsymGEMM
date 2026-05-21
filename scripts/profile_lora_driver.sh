@@ -1,48 +1,101 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# =============================================================================
+# User-Specified Parameters
+# =============================================================================
+# Edit this section for the default run. CLI flags override these values.
+
+USER_GPU_POOL=(0 1 2 3)
+# USER_WORKLOADS=(mlp_3b mm_3b dense_3b moe_3b mlp dense moe qwen3_14b qwen3_30b_a3b)
+# USER_WORKLOADS=(dense_3b moe_3b)
+# USER_WORKLOADS=(mlp_3b mm_3b dense_3b moe_3b)
+USER_WORKLOADS=(qwen3_14b qwen3_30b_a3b)
+# USER_WORKLOADS=(mlp dense moe)
+USER_BACKENDS=(asym_only torch_only)
+# USER_BACKENDS=(torch_only)
+# USER_PROFILERS=(nsys cpu)
+USER_PROFILERS=(nsys)
+
+USER_JOBS_PER_GPU=1
+USER_OUTPUT_ROOT="profiling"
+USER_RUN_NAME=""
+USER_PRECISION="bf16"
+USER_WORKFLOW="lora_sft"
+USER_MODE="auto"
+
+USER_WARMUP_STEPS=5
+USER_MEASURE_STEPS=20
+USER_PROFILE_LAYERS=1
+USER_BATCH_SIZE=32
+USER_SEQ_LEN=64
+USER_HIDDEN_DIM=1024
+USER_MLP_INTERMEDIATE_DIM=0
+USER_MLP_EXPANSION=4
+USER_LORA_RANK=64
+USER_LORA_ALPHA=128
+USER_VOCAB_ROWS=4096
+USER_MOE_MODE="contiguous"
+USER_DENSE_TARGET_MODE="mlp_only"
+
+USER_NSYS_BIN="nsys"
+USER_NCU_BIN="ncu"
+USER_NCU_PRESET="paper"
+USER_NCU_CLEAR_JIT_CACHE=0
+USER_PYTHON_BIN="python3"
+
+# =============================================================================
+# Derived Parameters
+# =============================================================================
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PY_DRIVER="${ROOT}/scripts/profile_lora_driver.py"
 
-# User-editable defaults. CLI flags override these values.
-DEFAULT_GPU_POOL=(0 1 2 3)
-DEFAULT_WORKLOADS=(mlp_1b mlp_3b mm_1b mm_3b dense_3b moe_3b mlp dense moe qwen3_14b qwen3_30b_a3b)
-DEFAULT_BACKENDS=(asym_only torch_only)
-DEFAULT_PROFILERS=(nsys cpu)
-DEFAULT_JOBS_PER_GPU=1
-DEFAULT_OUTPUT_ROOT="profiling"
-DEFAULT_RUN_NAME=""
-DEFAULT_PRECISION="bf16"
-DEFAULT_WORKFLOW="lora_sft"
-DEFAULT_MODE="auto"
-DEFAULT_DRIVER_ARGS=(
-  --profile-layers 1
-  --batch-size 32
-  --seq-len 64
-  --tokens 2048
-  --lora-rank 64
-  --lora-alpha 128
+DRIVER_ARGS=(
+  --warmup-steps "${USER_WARMUP_STEPS}"
+  --measure-steps "${USER_MEASURE_STEPS}"
+  --profile-layers "${USER_PROFILE_LAYERS}"
+  --batch-size "${USER_BATCH_SIZE}"
+  --seq-len "${USER_SEQ_LEN}"
+  --hidden-dim "${USER_HIDDEN_DIM}"
+  --mlp-intermediate-dim "${USER_MLP_INTERMEDIATE_DIM}"
+  --mlp-expansion "${USER_MLP_EXPANSION}"
+  --lora-rank "${USER_LORA_RANK}"
+  --lora-alpha "${USER_LORA_ALPHA}"
+  --vocab-rows "${USER_VOCAB_ROWS}"
+  --moe-mode "${USER_MOE_MODE}"
+  --dense-target-mode "${USER_DENSE_TARGET_MODE}"
+  --nsys-bin "${USER_NSYS_BIN}"
+  --ncu-bin "${USER_NCU_BIN}"
+  --ncu-preset "${USER_NCU_PRESET}"
 )
+if ((USER_NCU_CLEAR_JIT_CACHE)); then
+  DRIVER_ARGS+=(--ncu-clear-jit-cache)
+fi
+
+# =============================================================================
+# Core Logic
+# =============================================================================
 
 usage() {
-  cat <<'USAGE'
+  cat <<USAGE
 Usage:
   scripts/profile_lora_driver.sh --gpus 2,3,4,5,6,7 [options]
 
 Required:
   --gpus, --gpu-pool, --cuda-devices  Physical GPU pool. Comma or space separated.
-                                      Not required if DEFAULT_GPU_POOL is set
+                                      Not required if USER_GPU_POOL is set
                                       at the top of this script.
 
 Shell-only options:
-  --jobs-per-gpu N                    Concurrent Python driver jobs per GPU. Default: 1.
+  --jobs-per-gpu N                    Concurrent Python driver jobs per GPU. Default: ${USER_JOBS_PER_GPU}.
   -h, --help                          Show this help.
 
 Default run matrix:
-  --workloads mlp_1b mlp_3b mm_1b mm_3b dense_3b moe_3b mlp dense moe qwen3_14b qwen3_30b_a3b
-  --backends asym_only torch_only
-  --profilers source nsys cpu ncu
+  --workloads ${USER_WORKLOADS[*]}
+  --backends ${USER_BACKENDS[*]}
+  --profilers ${USER_PROFILERS[*]}
 
 Common options:
   Defaults are defined at the top of this script and can be overridden with
@@ -79,9 +132,7 @@ expand_workloads() {
       toy) printf '%s\n' mlp dense moe ;;
       custom3b) printf '%s\n' dense_3b moe_3b ;;
       qwen) printf '%s\n' qwen3_14b qwen3_30b_a3b ;;
-      fundamental) printf '%s\n' mlp_1b mlp_3b mm_1b mm_3b ;;
       all) printf '%s\n' mlp_1b mlp_3b mm_1b mm_3b dense_3b moe_3b mlp dense moe qwen3_14b qwen3_30b_a3b ;;
-      matrix_1b) printf '%s\n' mm_1b ;;
       *) printf '%s\n' "${item}" ;;
     esac
   done
@@ -102,8 +153,6 @@ expand_profilers() {
   for item in "$@"; do
     case "${item}" in
       all) printf '%s\n' source nsys cpu ncu ;;
-      none|profile) printf '%s\n' source ;;
-      cpu_gaps) printf '%s\n' cpu ;;
       *) printf '%s\n' "${item}" ;;
     esac
   done
@@ -138,17 +187,17 @@ kill_tree_force() {
   kill -KILL "${pid}" 2>/dev/null || true
 }
 
-declare -a gpu_values=("${DEFAULT_GPU_POOL[@]}")
-declare -a workload_values=("${DEFAULT_WORKLOADS[@]}")
-declare -a backend_values=("${DEFAULT_BACKENDS[@]}")
-declare -a profiler_values=("${DEFAULT_PROFILERS[@]}")
+declare -a gpu_values=("${USER_GPU_POOL[@]}")
+declare -a workload_values=("${USER_WORKLOADS[@]}")
+declare -a backend_values=("${USER_BACKENDS[@]}")
+declare -a profiler_values=("${USER_PROFILERS[@]}")
 declare -a pass_args=()
-jobs_per_gpu="${DEFAULT_JOBS_PER_GPU}"
-output_root="${DEFAULT_OUTPUT_ROOT}"
-run_name="${DEFAULT_RUN_NAME}"
-precision="${DEFAULT_PRECISION}"
-workflow="${DEFAULT_WORKFLOW}"
-mode="${DEFAULT_MODE}"
+jobs_per_gpu="${USER_JOBS_PER_GPU}"
+output_root="${USER_OUTPUT_ROOT}"
+run_name="${USER_RUN_NAME}"
+precision="${USER_PRECISION}"
+workflow="${USER_WORKFLOW}"
+mode="${USER_MODE}"
 
 while (($#)); do
   case "$1" in
@@ -180,7 +229,7 @@ while (($#)); do
         shift
       done
       ;;
-    --profilers|--profile-modes)
+    --profilers)
       profiler_values=()
       shift
       while (($#)) && [[ "$1" != --* ]]; do
@@ -238,16 +287,6 @@ mapfile -t gpus < <(split_values "${gpu_values[@]}" | dedupe_lines)
 if ((${#gpus[@]} == 0)); then
   echo "error: empty GPU pool" >&2
   exit 2
-fi
-
-if ((${#workload_values[@]} == 0)); then
-  workload_values=(qwen)
-fi
-if ((${#backend_values[@]} == 0)); then
-  backend_values=(asym_only torch_only)
-fi
-if ((${#profiler_values[@]} == 0)); then
-  profiler_values=(source nsys cpu ncu)
 fi
 
 mapfile -t workloads < <(split_values "${workload_values[@]}" | xargs -r -n1 printf '%s\n' | while read -r x; do expand_workloads "$x"; done | dedupe_lines)
@@ -352,7 +391,7 @@ launch_job() {
   label="$(safe_label "${precision}_${workflow}_${workload}_${backend}_gpu${gpu}")"
   local log_file="${log_dir}/${label}.log"
   local cmd=(
-    python "${PY_DRIVER}"
+    "${USER_PYTHON_BIN}" "${PY_DRIVER}"
     --workloads "${workload}"
     --backends "${backend}"
     --profilers "${profilers[@]}"
@@ -362,7 +401,7 @@ launch_job() {
     --workflow "${workflow}"
     --mode "${mode}"
     --skip-summary
-    "${DEFAULT_DRIVER_ARGS[@]}"
+    "${DRIVER_ARGS[@]}"
     "${pass_args[@]}"
   )
   if [[ -n "${run_name}" ]]; then
@@ -404,5 +443,28 @@ if ((failures > 0)); then
   echo "${failures} profiling job(s) failed" >&2
   exit 1
 fi
+
+summary_cmd=(
+  "${USER_PYTHON_BIN}" "${PY_DRIVER}"
+  --workloads "${workloads[@]}"
+  --backends "${backends[@]}"
+  --profilers "${profilers[@]}"
+  --output-root "${output_root}"
+  --precision "${precision}"
+  --workflow "${workflow}"
+  --mode "${mode}"
+  --collect-existing
+  "${DRIVER_ARGS[@]}"
+  "${pass_args[@]}"
+)
+if [[ -n "${run_name}" ]]; then
+  summary_cmd+=(--run-name "${run_name}")
+fi
+
+echo "Writing aggregate summary..."
+(
+  cd "${ROOT}"
+  "${summary_cmd[@]}"
+)
 
 echo "All profiling jobs completed."

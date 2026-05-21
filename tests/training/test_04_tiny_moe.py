@@ -309,7 +309,7 @@ def test_tiny_moe_showcase_config_is_defensible_transformer_moe() -> None:
 
 
 def _lora_grad_worst_allow_missing(lhs: torch.nn.Module, rhs: torch.nn.Module) -> tuple[float, list[str]]:
-    return _grad_worst_allow_missing(lhs, rhs, _is_lora_name)
+    return tiny_moe.lora_grad_worst_error(lhs, rhs), []
 
 
 def _router_grad_worst(lhs: torch.nn.Module, rhs: torch.nn.Module) -> float:
@@ -362,6 +362,49 @@ def test_tiny_moe_asym_base_weights_are_grouped_host_stacks() -> None:
     assert any("shared_gate_base" in name for name in host_names)
     assert all(".experts." not in name for name in host_names)
     assert all(weight.device.type == "cpu" and not weight.requires_grad for _, weight in host_weights)
+
+
+def test_tiny_moe_asym_lora_weights_are_layer_packed() -> None:
+    config = MICRO_MOE_CONFIG
+    device = torch.device("cpu")
+    dtype = torch.float32
+    asym, _, _, _ = tiny_moe.make_tiny_moe_pair(
+        config=config,
+        seed=212,
+        device=device,
+        base_dtype=dtype,
+        backend="torch_only",
+        pin_memory=False,
+    )
+
+    params = dict(asym.named_parameters())
+    assert tuple(params["layers.0.expert_lora.gate_lora_a"].shape) == (
+        config.num_experts,
+        config.lora_rank,
+        config.hidden_size,
+    )
+    assert tuple(params["layers.0.expert_lora.gate_lora_b"].shape) == (
+        config.num_experts,
+        config.intermediate_size,
+        config.lora_rank,
+    )
+    assert tuple(params["layers.0.expert_lora.down_lora_a"].shape) == (
+        config.num_experts,
+        config.lora_rank,
+        config.intermediate_size,
+    )
+    assert tuple(params["layers.0.expert_lora.down_lora_b"].shape) == (
+        config.num_experts,
+        config.hidden_size,
+        config.lora_rank,
+    )
+    assert tuple(params["layers.0.shared_expert_lora.gate_lora_a"].shape) == (
+        config.num_shared_experts,
+        config.lora_rank,
+        config.hidden_size,
+    )
+    assert not any(".experts." in name and "lora" in name for name in params)
+    assert not any(".shared_experts." in name and "lora" in name for name in params)
 
 
 def _run_static_parity(pattern: str, mode: str) -> dict[str, Any]:
@@ -715,7 +758,7 @@ def test_tiny_moe_cpu_static_routing_patterns_and_grouped_modes(pattern: str, mo
             assert metadata["padded_routes"] >= 0
     elif pattern == "empty":
         assert metadata["empty_experts"] > 0
-        assert case["missing_lora_grad_names"]
+        assert case["missing_lora_grad_names"] == []
     elif pattern == "skewed":
         counts = metadata["expert_counts"]
         assert counts[0] > counts[1] > counts[2] > counts[3]

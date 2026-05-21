@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Nsight Compute on AsymGEMM kernels for fundamental workloads."""
+"""Run Nsight Compute on AsymGEMM kernels for LoRA-SFT workloads."""
 
 from __future__ import annotations
 
@@ -17,6 +17,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.postprocess_ncu_asymgemm import summarize, markdown
+
+DEFAULT_LORA_BATCH_SIZE = 32
+DEFAULT_LORA_SEQ_LEN = 64
+DEFAULT_LORA_HIDDEN_DIM = 1024
+DEFAULT_LORA_MLP_EXPANSION = 4
+DEFAULT_DENSE_TARGET_MODE = "mlp_only"
+DENSE_TARGET_MODES = ("mlp_only", "attention_only", "all")
 
 
 DEFAULT_SECTIONS = [
@@ -42,7 +49,6 @@ QUICK_SECTIONS = [
 DEFAULT_LAUNCH_SKIP = {
     "mm_1b": 2,
     "mm_3b": 2,
-    "matrix_1b": 2,
     "mlp_1b": 4,
     "mlp_3b": 4,
     "dense_3b": 14,
@@ -55,7 +61,6 @@ DEFAULT_LAUNCH_SKIP = {
 DEFAULT_LAUNCH_COUNT = {
     "mm_1b": 2,
     "mm_3b": 2,
-    "matrix_1b": 2,
     "mlp_1b": 4,
     "mlp_3b": 4,
     "dense_3b": 14,
@@ -73,10 +78,13 @@ def main() -> None:
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--measure-steps", type=int, default=1)
     parser.add_argument("--moe-mode", choices=["contiguous", "masked"], default="contiguous")
+    parser.add_argument("--dense-target-mode", choices=DENSE_TARGET_MODES, default=DEFAULT_DENSE_TARGET_MODE)
     parser.add_argument("--profile-layers", "--real-profile-layers", dest="profile_layers", type=int, default=1)
-    parser.add_argument("--batch-size", "--real-batch-size", dest="batch_size", type=int, default=1)
-    parser.add_argument("--seq-len", "--real-seq-len", dest="seq_len", type=int, default=64)
-    parser.add_argument("--tokens", "--real-tokens", dest="tokens", type=int, default=0)
+    parser.add_argument("--batch-size", "--real-batch-size", dest="batch_size", type=int, default=DEFAULT_LORA_BATCH_SIZE)
+    parser.add_argument("--seq-len", "--real-seq-len", dest="seq_len", type=int, default=DEFAULT_LORA_SEQ_LEN)
+    parser.add_argument("--hidden-dim", "--real-hidden-dim", dest="hidden_dim", type=int, default=DEFAULT_LORA_HIDDEN_DIM)
+    parser.add_argument("--mlp-intermediate-dim", "--real-mlp-intermediate-dim", dest="mlp_intermediate_dim", type=int, default=0)
+    parser.add_argument("--mlp-expansion", "--real-mlp-expansion", dest="mlp_expansion", type=int, default=DEFAULT_LORA_MLP_EXPANSION)
     parser.add_argument("--lora-rank", "--real-lora-rank", dest="lora_rank", type=int, default=64)
     parser.add_argument("--lora-alpha", "--real-lora-alpha", dest="lora_alpha", type=float, default=128.0)
     parser.add_argument("--vocab-rows", "--real-vocab-rows", dest="vocab_rows", type=int, default=4096)
@@ -146,18 +154,22 @@ def main() -> None:
         str(args.warmup_steps),
         "--measure-steps",
         str(args.measure_steps),
-        "--timing-mode",
-        "profile",
         "--moe-mode",
         args.moe_mode,
+        "--dense-target-mode",
+        args.dense_target_mode,
         "--profile-layers",
         str(args.profile_layers),
         "--batch-size",
         str(args.batch_size),
         "--seq-len",
         str(args.seq_len),
-        "--tokens",
-        str(args.tokens),
+        "--hidden-dim",
+        str(args.hidden_dim),
+        "--mlp-intermediate-dim",
+        str(args.mlp_intermediate_dim),
+        "--mlp-expansion",
+        str(args.mlp_expansion),
         "--lora-rank",
         str(args.lora_rank),
         "--lora-alpha",

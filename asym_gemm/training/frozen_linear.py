@@ -669,9 +669,8 @@ def _torch_nt(a: torch.Tensor, b_cpu: torch.Tensor, *, transpose_b: bool = False
     if a.device.type == "cpu":
         b = b_cpu.to(dtype=a.dtype)
         return a @ b if transpose_b else a @ b.t()
-    b = b_cpu.to(dtype=a.dtype)
-    out_cpu = a.to(device="cpu", non_blocking=False) @ (b if transpose_b else b.t())
-    return out_cpu.to(device=a.device, non_blocking=False)
+    b = b_cpu.to(device=a.device, dtype=a.dtype, non_blocking=b_cpu.is_pinned())
+    return a @ b if transpose_b else a @ b.t()
 
 
 def _torch_grouped_nt(
@@ -685,15 +684,8 @@ def _torch_grouped_nt(
     if a.device.type == "cpu":
         b = b_cpu.to(dtype=a.dtype)
         return _grouped_torch_chunks(a, b, offsets, experts, transpose_b=transpose_b)
-    b = b_cpu.to(dtype=a.dtype)
-    out_cpu = _grouped_torch_chunks(
-        a.to(device="cpu", non_blocking=False),
-        b,
-        offsets,
-        experts,
-        transpose_b=transpose_b,
-    )
-    return out_cpu.to(device=a.device, non_blocking=False)
+    b = b_cpu.to(device=a.device, dtype=a.dtype, non_blocking=b_cpu.is_pinned())
+    return _grouped_torch_chunks(a, b, offsets, experts, transpose_b=transpose_b)
 
 
 def _dispatch_nt(
@@ -999,7 +991,11 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
         input_shape = tuple(x.shape)
         x_2d = x.reshape(-1, int(host_weight.weight.shape[2])).contiguous()
         out_features = int(host_weight.weight.shape[1])
-        forward_range = "forward.grouped_base_frozen_asymgemm"
+        forward_range = (
+            "forward.grouped_base_frozen_asymgemm"
+            if not profile_name
+            else f"forward.{profile_name}.grouped_base_frozen_asymgemm"
+        )
         backward_range = "backward.grouped_base_dx_asymgemm" if not profile_name else f"backward.{profile_name}.grouped_base_dx_asymgemm"
         with prof_range(forward_range):
             y = _dispatch_grouped_nt(
@@ -1197,6 +1193,92 @@ class AsymGroupedFrozenLinear(nn.Module):
             f"num_groups={self.num_groups}, in_features={self.in_features}, "
             f"out_features={self.out_features}, backend={self.backend}, "
             f"precision={self.precision}, pinned={self.host_weight.metadata.pinned}"
+        )
+
+
+class TorchGroupedFrozenLinearFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        profile_name: str,
+    ) -> torch.Tensor:
+        if weight.dim() != 3:
+            raise ValueError(f"grouped torch weight must be 3D, got shape {tuple(weight.shape)}")
+        if x.shape[-1] != int(weight.shape[2]):
+            raise ValueError(f"expected input last dim {int(weight.shape[2])}, got {x.shape[-1]}")
+        input_shape = tuple(x.shape)
+        x_2d = x.reshape(-1, int(weight.shape[2])).contiguous()
+        out_features = int(weight.shape[1])
+        forward_range = "forward.grouped_base_torch" if not profile_name else f"forward.{profile_name}.grouped_base_torch"
+        backward_range = "backward.grouped_base_dx_torch" if not profile_name else f"backward.{profile_name}.grouped_base_dx_torch"
+        with prof_range(forward_range):
+            y = _grouped_torch_chunks(x_2d, weight, offsets, experts)
+
+        ctx.save_for_backward(weight, offsets, experts)
+        ctx.profile_backward_range = backward_range
+        ctx.profile_enabled = is_profile_enabled()
+        ctx.input_shape = input_shape
+        return y.reshape(*input_shape[:-1], out_features)
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        grad_output: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], None, None, None, None]:
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            weight, offsets, experts = ctx.saved_tensors
+            grad_output_2d = grad_output.reshape(-1, int(weight.shape[1])).contiguous()
+            with prof_range(ctx.profile_backward_range, enabled=ctx.profile_enabled):
+                grad_x = _grouped_torch_chunks(grad_output_2d, weight, offsets, experts, transpose_b=True)
+            grad_x = grad_x.reshape(ctx.input_shape)
+        return grad_x, None, None, None, None
+
+
+class TorchGroupedFrozenLinear(nn.Module):
+    """GPU-resident grouped frozen linear for the all-HBM torch baseline."""
+
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        if not isinstance(weight, torch.Tensor):
+            raise TypeError(f"weight must be a torch.Tensor, got {type(weight)!r}")
+        if weight.dim() != 3:
+            raise ValueError(f"TorchGroupedFrozenLinear expects [groups, out, in], got {tuple(weight.shape)}")
+        self.register_buffer("weight", weight.detach().to(device=device, dtype=dtype).contiguous())
+        self.profile_name = ""
+        self.num_groups = int(self.weight.shape[0])
+        self.out_features = int(self.weight.shape[1])
+        self.in_features = int(self.weight.shape[2])
+
+    @property
+    def pinned_cpu_bytes(self) -> int:
+        return 0
+
+    @property
+    def weight_hbm_saved_bytes(self) -> int:
+        return tensor_nbytes(self.weight)
+
+    @property
+    def gpu_resident_weight_bytes(self) -> int:
+        return tensor_nbytes(self.weight)
+
+    def forward(self, x: torch.Tensor, offsets: torch.Tensor, experts: torch.Tensor) -> torch.Tensor:
+        return TorchGroupedFrozenLinearFunction.apply(x, self.weight, offsets, experts, self.profile_name)
+
+    def extra_repr(self) -> str:
+        return (
+            f"num_groups={self.num_groups}, in_features={self.in_features}, "
+            f"out_features={self.out_features}, device={self.weight.device}, dtype={self.weight.dtype}"
         )
 
 

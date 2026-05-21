@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Postprocess Nsight Systems CPU-debug traces for GPU no-kernel gaps.
 
-This is a debug companion to ``postprocess_nsys_m4.py``.  The base M4
+This is a debug companion to ``postprocess_nsys_lora.py``.  The base LoRA-SFT
 postprocessor remains the low-overhead GPU timeline truth.  This script reads a
 Nsight Systems SQLite export captured with CUDA + NVTX + OS runtime + CPU
 sampling/context-switch tracing and explains the no-kernel gaps with:
@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.postprocess_nsys_m4 import (  # noqa: E402
+from scripts.postprocess_nsys_lora import (  # noqa: E402
     _correlated_intervals,
     _fetch_ranges,
     _kernel_events,

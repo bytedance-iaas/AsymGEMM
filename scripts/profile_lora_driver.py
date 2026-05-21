@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run LoRA-SFT profiling workloads for AsymGEMM and the Torch fallback path."""
+"""Run LoRA-SFT profiling workloads for AsymGEMM and a GPU-resident Torch baseline."""
 
 from __future__ import annotations
 
@@ -16,27 +16,25 @@ from typing import Any, Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE_SCRIPT = ROOT / "scripts" / "profile_lora.py"
-NSYS_POSTPROCESS_SCRIPT = ROOT / "scripts" / "postprocess_nsys_m4.py"
+NSYS_POSTPROCESS_SCRIPT = ROOT / "scripts" / "postprocess_nsys_lora.py"
 CPU_GAPS_SCRIPT = ROOT / "scripts" / "profile_nsys_cpu_gaps.py"
 NCU_SCRIPT = ROOT / "scripts" / "profile_ncu_asymgemm.py"
+DEFAULT_LORA_BATCH_SIZE = 32
+DEFAULT_LORA_SEQ_LEN = 64
+DEFAULT_LORA_HIDDEN_DIM = 1024
+DEFAULT_LORA_MLP_EXPANSION = 4
+DEFAULT_DENSE_TARGET_MODE = "mlp_only"
+DENSE_TARGET_MODES = ("mlp_only", "attention_only", "all")
 
 WORKLOADS = ("mlp_1b", "mlp_3b", "mm_1b", "mm_3b", "dense_3b", "moe_3b", "mlp", "dense", "moe", "qwen3_14b", "qwen3_30b_a3b")
 WORKLOAD_ALIASES = {
     "toy": ("mlp", "dense", "moe"),
     "custom3b": ("dense_3b", "moe_3b"),
     "qwen": ("qwen3_14b", "qwen3_30b_a3b"),
-    "fundamental": ("mlp_1b", "mlp_3b", "mm_1b", "mm_3b"),
-    "matrix_1b": ("mm_1b",),
     "all": WORKLOADS,
 }
 BACKENDS = ("asym_only", "torch_only")
 PROFILERS = ("source", "nsys", "cpu", "ncu")
-PROFILER_ALIASES = {
-    "all": PROFILERS,
-    "none": ("source",),
-    "profile": ("source",),
-    "cpu_gaps": ("cpu",),
-}
 NCU_WORKLOADS = {"mm_1b", "mm_3b", "mlp_1b", "mlp_3b", "dense_3b", "moe_3b", "qwen3_14b", "qwen3_30b_a3b"}
 
 
@@ -71,12 +69,12 @@ def _expand_backends(values: Iterable[str]) -> list[str]:
 def _expand_profilers(values: Iterable[str]) -> list[str]:
     expanded: list[str] = []
     for value in _split_tokens(values):
-        if value in PROFILER_ALIASES:
-            expanded.extend(PROFILER_ALIASES[value])
+        if value == "all":
+            expanded.extend(PROFILERS)
         elif value in PROFILERS:
             expanded.append(value)
         else:
-            allowed = ", ".join((*PROFILERS, *PROFILER_ALIASES))
+            allowed = ", ".join((*PROFILERS, "all"))
             raise SystemExit(f"unknown profiler {value!r}; allowed: {allowed}")
     return list(dict.fromkeys(expanded))
 
@@ -180,14 +178,20 @@ def _common_profile_args(args: argparse.Namespace, workload: str, backend: str, 
         str(args.measure_steps),
         "--moe-mode",
         args.moe_mode,
+        "--dense-target-mode",
+        args.dense_target_mode,
         "--profile-layers",
         str(args.profile_layers),
         "--batch-size",
         str(args.batch_size),
         "--seq-len",
         str(args.seq_len),
-        "--tokens",
-        str(args.tokens),
+        "--hidden-dim",
+        str(args.hidden_dim),
+        "--mlp-intermediate-dim",
+        str(args.mlp_intermediate_dim),
+        "--mlp-expansion",
+        str(args.mlp_expansion),
         "--lora-rank",
         str(args.lora_rank),
         "--lora-alpha",
@@ -275,13 +279,13 @@ def _markdown(summary: dict[str, Any]) -> str:
         f"Precision: `{summary.get('precision', '-')}`  ",
         f"Workflow: `{summary.get('workflow', '-')}`",
         "",
-        "`asym_only` measures the direct AsymGEMM host-weight path. `torch_only` keeps the same",
-        "host-weight wrapper and uses the PyTorch fallback path; it is not a GPU-resident",
-        "LLaMA-Factory baseline.",
+        "`asym_only` measures the direct AsymGEMM host-weight path. `torch_only` measures",
+        "a normal GPU-resident PyTorch LoRA baseline with frozen base weights stored as",
+        "CUDA buffers.",
         "",
         "## Runs",
         "",
-        "| Workload | Backend | Profiler | Status | Device | Step ms | Peak HBM | HBM saved | Pinned CPU | Result table | Output |",
+        "| Workload | Backend | Profiler | Status | Device | Step ms | Peak HBM | HBM saved | Pinned CPU | Summary | Output |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|",
     ]
     for row in summary["runs"]:
@@ -346,7 +350,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--profilers",
-        "--profile-modes",
         nargs="+",
         default=["source"],
         help=(
@@ -363,9 +366,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measure-steps", type=int, default=20)
     parser.add_argument("--profile-layers", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--seq-len", type=int, default=64)
-    parser.add_argument("--tokens", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_LORA_BATCH_SIZE)
+    parser.add_argument("--seq-len", type=int, default=DEFAULT_LORA_SEQ_LEN)
+    parser.add_argument("--hidden-dim", type=int, default=DEFAULT_LORA_HIDDEN_DIM)
+    parser.add_argument("--mlp-intermediate-dim", type=int, default=0)
+    parser.add_argument("--mlp-expansion", type=int, default=DEFAULT_LORA_MLP_EXPANSION)
     parser.add_argument("--lora-rank", type=int, default=64)
     parser.add_argument("--lora-alpha", type=float, default=128.0)
     parser.add_argument("--vocab-rows", type=int, default=4096)
@@ -377,15 +382,32 @@ def parse_args() -> argparse.Namespace:
         help="Result filename mode label. Default auto uses <backend-label>_<profiler>, e.g. asym-only_nsys.",
     )
     parser.add_argument("--moe-mode", choices=["contiguous", "masked"], default="contiguous")
-    parser.add_argument("--timing-mode", choices=["profile", "debug_sync"], default="profile")
+    parser.add_argument(
+        "--dense-target-mode",
+        choices=DENSE_TARGET_MODES,
+        default=DEFAULT_DENSE_TARGET_MODE,
+        help="Dense workload target scope. Default offloads only MLP base projections, matching MoE expert-MLP scope.",
+    )
     parser.add_argument("--nsys-bin", default="nsys")
     parser.add_argument("--ncu-bin", default="ncu")
     parser.add_argument("--ncu-preset", choices=["quick", "paper"], default="paper")
     parser.add_argument("--ncu-clear-jit-cache", action="store_true")
+    parser.add_argument(
+        "--skip-memory-attribution",
+        action="store_true",
+        help="For nsys runs, skip the separate source-only saved-activation memory attribution pass.",
+    )
+    parser.add_argument(
+        "--memory-attribution-steps",
+        type=int,
+        default=1,
+        help="Measured steps for the separate memory-only attribution pass. One step is enough for fixed-shape profiles.",
+    )
     parser.add_argument("--output-root", type=Path, default=Path("profiling"))
     parser.add_argument("--run-name", default="", help="Optional subdirectory under --output-root. Default writes directly into --output-root.")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--collect-existing", action="store_true", help="Build summaries from existing output directories without running profilers.")
     parser.add_argument("--skip-summary", action="store_true", help="Do not write run-level summary/commands files. Useful for parallel shell orchestration.")
     return parser.parse_args()
 
@@ -422,12 +444,11 @@ def main() -> None:
                             sys.executable,
                             str(PROFILE_SCRIPT),
                             *_common_profile_args(args, workload, backend, child_device, output_dir),
-                            "--timing-mode",
-                            args.timing_mode,
                         ]
                     ]
                 elif profiler == "nsys":
                     source_dir = output_dir / "source_debug"
+                    memory_dir = output_dir / "memory_debug"
                     report_prefix = output_dir / "trace"
                     sqlite_path = output_dir / "trace.sqlite"
                     commands_for_task = [
@@ -444,8 +465,6 @@ def main() -> None:
                             sys.executable,
                             str(PROFILE_SCRIPT),
                             *_common_profile_args(args, workload, backend, child_device, source_dir),
-                            "--timing-mode",
-                            "profile",
                         ],
                         [
                             args.nsys_bin,
@@ -455,16 +474,38 @@ def main() -> None:
                             f"--output={sqlite_path}",
                             str(output_dir / "trace.nsys-rep"),
                         ],
-                        [
+                    ]
+                    if not args.skip_memory_attribution:
+                        commands_for_task.append(
+                            [
+                                sys.executable,
+                                str(PROFILE_SCRIPT),
+                                *_common_profile_args(args, workload, backend, child_device, memory_dir),
+                                "--warmup-steps",
+                                "0",
+                                "--measure-steps",
+                                str(max(1, int(args.memory_attribution_steps))),
+                                "--memory-attribution",
+                            ]
+                        )
+                    postprocess_cmd = [
                             sys.executable,
                             str(NSYS_POSTPROCESS_SCRIPT),
                             str(sqlite_path),
+                            "--source-profile-dir",
+                            str(source_dir),
+                    ]
+                    if not args.skip_memory_attribution:
+                        postprocess_cmd.extend(["--memory-profile-dir", str(memory_dir)])
+                    postprocess_cmd.extend(
+                        [
                             "--output-json",
                             str(output_dir / "profile.json"),
                             "--output-md",
                             str(output_dir / "table.md"),
-                        ],
-                    ]
+                        ]
+                    )
+                    commands_for_task.append(postprocess_cmd)
                 elif profiler == "cpu":
                     commands_for_task = [
                         [
@@ -504,14 +545,20 @@ def main() -> None:
                             str(output_dir),
                             "--moe-mode",
                             args.moe_mode,
+                            "--dense-target-mode",
+                            args.dense_target_mode,
                             "--profile-layers",
                             str(args.profile_layers),
                             "--batch-size",
                             str(args.batch_size),
                             "--seq-len",
                             str(args.seq_len),
-                            "--tokens",
-                            str(args.tokens),
+                            "--hidden-dim",
+                            str(args.hidden_dim),
+                            "--mlp-intermediate-dim",
+                            str(args.mlp_intermediate_dim),
+                            "--mlp-expansion",
+                            str(args.mlp_expansion),
                             "--lora-rank",
                             str(args.lora_rank),
                             "--lora-alpha",
@@ -552,6 +599,27 @@ def main() -> None:
                     row["status"] = "skipped"
                     row["skip_reason"] = skip_reason
                     rows.append(row)
+                    task_index += 1
+                    continue
+
+                if args.collect_existing:
+                    profile, profile_path = _load_profile(output_dir)
+                    returncode = 0 if profile_path is not None else 1
+                    row = _summary_row(
+                        workload=workload,
+                        backend=backend,
+                        profiler=profiler,
+                        device=child_device,
+                        physical_cuda_device=physical_cuda_device,
+                        output_dir=output_dir,
+                        returncode=returncode,
+                        profile=profile,
+                    )
+                    row["profile_json"] = str(profile_path) if profile_path is not None else None
+                    row["result_aliases"] = _write_result_aliases(args, run_dir, row)
+                    rows.append(row)
+                    if returncode != 0 and not args.continue_on_error:
+                        break
                     task_index += 1
                     continue
 
@@ -608,7 +676,7 @@ def main() -> None:
         "mode": args.mode,
         "backend_semantics": {
             "asym_only": "direct AsymGEMM host-weight path",
-            "torch_only": "same host-weight wrapper with PyTorch fallback; not a GPU-resident LLaMA-Factory baseline",
+            "torch_only": "normal GPU-resident PyTorch LoRA baseline with frozen base weights stored as CUDA buffers",
         },
         "workloads": workloads,
         "backends": backends,

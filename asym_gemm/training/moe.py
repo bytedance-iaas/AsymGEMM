@@ -19,8 +19,15 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .frozen_linear import AsymExecutionStats, AsymGroupedFrozenLinear, VALID_ASYM_PRECISIONS, VALID_BACKENDS
+from .frozen_linear import (
+    AsymExecutionStats,
+    AsymGroupedFrozenLinear,
+    TorchGroupedFrozenLinear,
+    VALID_ASYM_PRECISIONS,
+    VALID_BACKENDS,
+)
 from .host_weight import tensor_nbytes
+from .profile_ranges import prof_range
 
 
 GroupedMode = Literal["contiguous", "masked"]
@@ -522,6 +529,74 @@ def _stack_expert_weight(expert_states: Sequence[Mapping[str, Any]], name: str) 
     return torch.stack([_state_tensor(expert_state, name) for expert_state in expert_states], dim=0).contiguous()
 
 
+def _grouped_lora_torch_mm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+) -> torch.Tensor | None:
+    if not hasattr(torch, "_grouped_mm"):
+        return None
+    if x.dtype != torch.bfloat16:
+        return None
+    if offsets.dim() != 1 or experts.dim() != 1 or int(offsets.numel()) != int(experts.numel()):
+        return None
+
+    starts = offsets[:-1]
+    ends = offsets[1:]
+    active = ends > starts
+    active_experts = experts[:-1].to(device=weight.device, dtype=torch.long, non_blocking=True)[active]
+    active_offsets = ends[active]
+    mat1 = x.contiguous()
+    mat2 = (
+        weight.index_select(0, active_experts)
+        .transpose(-1, -2)
+        .to(device=x.device, dtype=torch.bfloat16)
+        .contiguous()
+    )
+    try:
+        return torch._grouped_mm(mat1, mat2, offs=active_offsets.to(device=x.device, dtype=torch.int32).contiguous())
+    except RuntimeError:
+        return None
+
+
+def _grouped_lora_fallback(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+) -> torch.Tensor:
+    offsets_cpu = offsets.detach().to(device="cpu", dtype=torch.long).tolist()
+    experts_cpu = experts.detach().to(device="cpu", dtype=torch.long).tolist()
+    chunks: list[torch.Tensor] = []
+    for group_idx, expert_idx in enumerate(experts_cpu[:-1]):
+        start = int(offsets_cpu[group_idx])
+        end = int(offsets_cpu[group_idx + 1])
+        if end <= start:
+            continue
+        expert_weight = weight[int(expert_idx)].to(device=x.device, dtype=x.dtype)
+        chunks.append(F.linear(x[start:end], expert_weight))
+    if chunks:
+        return torch.cat(chunks, dim=0)
+    return x.new_empty((0, int(weight.shape[1])))
+
+
+def grouped_lora_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+) -> torch.Tensor:
+    """Run an expert-grouped LoRA projection with [E, out, in] weights."""
+
+    if x.numel() == 0:
+        return x.new_empty((0, int(weight.shape[1])))
+    fast = _grouped_lora_torch_mm(x, weight, offsets, experts)
+    if fast is not None:
+        return fast
+    return _grouped_lora_fallback(x, weight, offsets, experts)
+
+
 class FrozenTinyLinear(nn.Module):
     def __init__(self, weight: torch.Tensor, *, device: torch.device, dtype: torch.dtype) -> None:
         super().__init__()
@@ -644,6 +719,63 @@ class AsymTinyExpert(nn.Module):
         raise RuntimeError("AsymTinyExpert LoRA modules are executed through AsymTinyMoELayer grouped base GEMMs")
 
 
+class PackedExpertLoRA(nn.Module):
+    """Layer-local expert-indexed LoRA banks for grouped MoE execution."""
+
+    _LORA_NAMES = (
+        "gate_lora_a",
+        "gate_lora_b",
+        "up_lora_a",
+        "up_lora_b",
+        "down_lora_a",
+        "down_lora_b",
+    )
+
+    def __init__(
+        self,
+        expert_states: Sequence[Mapping[str, Any]],
+        *,
+        config: TinyMoEConfig,
+        device: torch.device,
+    ) -> None:
+        super().__init__()
+        if not expert_states:
+            raise ValueError("PackedExpertLoRA requires at least one expert")
+        self.config = config
+        self.num_experts = len(expert_states)
+        self.lora_scale = config.lora_scale
+        for name in self._LORA_NAMES:
+            self.register_parameter(
+                name,
+                nn.Parameter(_stack_expert_weight(expert_states, name).to(device=device, dtype=torch.float32).clone()),
+            )
+
+    def _weight(self, prefix: str, suffix: str) -> torch.Tensor:
+        return getattr(self, f"{prefix}_lora_{suffix}")
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        prefix: str,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if prefix not in {"gate", "up", "down"}:
+            raise ValueError(f"unsupported LoRA projection prefix {prefix!r}")
+        out_features = self.config.intermediate_size if prefix in {"gate", "up"} else self.config.hidden_size
+        if x.numel() == 0:
+            return x.new_empty((0, out_features))
+
+        compute_dtype = torch.bfloat16 if x.dtype == torch.bfloat16 else torch.float32
+        x_compute = x.to(dtype=compute_dtype)
+        a = self._weight(prefix, "a").to(device=x.device, dtype=compute_dtype)
+        b = self._weight(prefix, "b").to(device=x.device, dtype=compute_dtype)
+        low_rank = grouped_lora_linear(x_compute, a, offsets, experts)
+        out = grouped_lora_linear(low_rank, b, offsets, experts) * self.lora_scale
+        return out.to(dtype=out_dtype)
+
+
 class TorchTinyExpert(nn.Module):
     def __init__(
         self,
@@ -724,85 +856,43 @@ class AsymTinyMoELayer(nn.Module):
         self.router_weight = nn.Parameter(_state_tensor(layer_state, "router_weight").to(device=device, dtype=torch.float32).clone())
         expert_states = list(layer_state["experts"])
         shared_expert_states = list(layer_state.get("shared_experts", []))
-        self.expert_gate_base = AsymGroupedFrozenLinear(
-            _stack_expert_weight(expert_states, "gate_weight"),
-            backend=backend,
-            pin_memory=pin_memory,
-            stats=stats,
-            precision=self.precision,
-        )
-        self.expert_up_base = AsymGroupedFrozenLinear(
-            _stack_expert_weight(expert_states, "up_weight"),
-            backend=backend,
-            pin_memory=pin_memory,
-            stats=stats,
-            precision=self.precision,
-        )
-        self.expert_down_base = AsymGroupedFrozenLinear(
-            _stack_expert_weight(expert_states, "down_weight"),
-            backend=backend,
-            pin_memory=pin_memory,
-            stats=stats,
-            precision=self.precision,
-        )
-        self.shared_gate_base = (
-            AsymGroupedFrozenLinear(
-                _stack_expert_weight(shared_expert_states, "gate_weight"),
+        use_gpu_torch_base = backend == "torch_only" and device.type == "cuda"
+
+        def grouped_base(states: Sequence[Mapping[str, Any]], name: str) -> nn.Module:
+            weight = _stack_expert_weight(states, name)
+            if use_gpu_torch_base:
+                return TorchGroupedFrozenLinear(weight, device=device, dtype=base_dtype)
+            return AsymGroupedFrozenLinear(
+                weight,
                 backend=backend,
                 pin_memory=pin_memory,
                 stats=stats,
                 precision=self.precision,
             )
+
+        self.expert_gate_base = grouped_base(expert_states, "gate_weight")
+        self.expert_up_base = grouped_base(expert_states, "up_weight")
+        self.expert_down_base = grouped_base(expert_states, "down_weight")
+        self.shared_gate_base = (
+            grouped_base(shared_expert_states, "gate_weight")
             if shared_expert_states
             else None
         )
         self.shared_up_base = (
-            AsymGroupedFrozenLinear(
-                _stack_expert_weight(shared_expert_states, "up_weight"),
-                backend=backend,
-                pin_memory=pin_memory,
-                stats=stats,
-                precision=self.precision,
-            )
+            grouped_base(shared_expert_states, "up_weight")
             if shared_expert_states
             else None
         )
         self.shared_down_base = (
-            AsymGroupedFrozenLinear(
-                _stack_expert_weight(shared_expert_states, "down_weight"),
-                backend=backend,
-                pin_memory=pin_memory,
-                stats=stats,
-                precision=self.precision,
-            )
+            grouped_base(shared_expert_states, "down_weight")
             if shared_expert_states
             else None
         )
-        self.experts = nn.ModuleList(
-            [
-                AsymTinyExpert(
-                    expert_state,
-                    config=config,
-                    device=device,
-                    backend=backend,
-                    pin_memory=pin_memory,
-                    stats=stats,
-                )
-                for expert_state in expert_states
-            ]
-        )
-        self.shared_experts = nn.ModuleList(
-            [
-                AsymTinyExpert(
-                    expert_state,
-                    config=config,
-                    device=device,
-                    backend=backend,
-                    pin_memory=pin_memory,
-                    stats=stats,
-                )
-                for expert_state in shared_expert_states
-            ]
+        self.expert_lora = PackedExpertLoRA(expert_states, config=config, device=device)
+        self.shared_expert_lora = (
+            PackedExpertLoRA(shared_expert_states, config=config, device=device)
+            if shared_expert_states
+            else None
         )
 
     @property
@@ -853,16 +943,12 @@ class AsymTinyMoELayer(nn.Module):
         prefix: str,
         out_dtype: torch.dtype,
     ) -> torch.Tensor:
-        chunks: list[torch.Tensor] = []
-        for expert_idx, expert in enumerate(self.experts):
-            start = int(metadata.expert_offsets[expert_idx].item())
-            end = int(metadata.expert_offsets[expert_idx + 1].item())
-            if end > start:
-                chunks.append(expert.lora(packed[start:end].contiguous(), prefix, out_dtype))
-        if not chunks:
-            out_features = self.config.intermediate_size if prefix in {"gate", "up"} else self.config.hidden_size
-            return packed.new_empty((0, out_features))
-        return torch.cat(chunks, dim=0)
+        offsets, experts = self._dense_group_metadata(
+            metadata.expert_offsets,
+            num_groups=self.config.num_experts,
+            device=packed.device,
+        )
+        return self.expert_lora(packed, offsets, experts, prefix, out_dtype)
 
     def _lora_shared(
         self,
@@ -871,16 +957,11 @@ class AsymTinyMoELayer(nn.Module):
         prefix: str,
         out_dtype: torch.dtype,
     ) -> torch.Tensor:
-        chunks: list[torch.Tensor] = []
-        for expert_idx, expert in enumerate(self.shared_experts):
-            start = int(offsets[expert_idx].item())
-            end = int(offsets[expert_idx + 1].item())
-            if end > start:
-                chunks.append(expert.lora(packed[start:end].contiguous(), prefix, out_dtype))
-        if not chunks:
+        if self.shared_expert_lora is None:
             out_features = self.config.intermediate_size if prefix in {"gate", "up"} else self.config.hidden_size
             return packed.new_empty((0, out_features))
-        return torch.cat(chunks, dim=0)
+        _, experts = self._dense_group_metadata(offsets, num_groups=self.shared_expert_lora.num_experts, device=packed.device)
+        return self.shared_expert_lora(packed, offsets, experts, prefix, out_dtype)
 
     def _run_grouped_compact(
         self,
@@ -891,48 +972,46 @@ class AsymTinyMoELayer(nn.Module):
         gate_base: AsymGroupedFrozenLinear,
         up_base: AsymGroupedFrozenLinear,
         down_base: AsymGroupedFrozenLinear,
-        lora_modules: nn.ModuleList,
         shared: bool = False,
     ) -> torch.Tensor:
         if packed.numel() == 0:
             return packed.new_empty((0, self.config.hidden_size))
 
+        layer_name = str(getattr(self, "_m4_profile_name", ""))
+        expert_scope = "shared_expert" if shared else "routed_expert"
+        profile_prefix = f"{layer_name}.{expert_scope}" if layer_name else expert_scope
+        gate_base.profile_name = f"{profile_prefix}.gate_base"
+        up_base.profile_name = f"{profile_prefix}.up_base"
+        down_base.profile_name = f"{profile_prefix}.down_base"
+
         gate = gate_base(packed, offsets, experts)
         up = up_base(packed, offsets, experts)
+        range_prefix = f"forward.{profile_prefix}"
         if shared:
-            gate = gate + self._lora_shared(packed, offsets, "gate", packed.dtype)
-            up = up + self._lora_shared(packed, offsets, "up", packed.dtype)
+            with prof_range(f"{range_prefix}.gate_lora"):
+                gate_lora = self._lora_shared(packed, offsets, "gate", packed.dtype)
+            with prof_range(f"{range_prefix}.up_lora"):
+                up_lora = self._lora_shared(packed, offsets, "up", packed.dtype)
+            gate = gate + gate_lora
+            up = up + up_lora
         else:
-            metadata = ContiguousRouteMetadata(
-                token_indices=torch.empty((packed.shape[0],), device=packed.device, dtype=torch.long),
-                expert_indices=torch.empty((packed.shape[0],), device=packed.device, dtype=torch.long),
-                route_indices=torch.empty((packed.shape[0],), device=packed.device, dtype=torch.long),
-                routing_weights=torch.empty((packed.shape[0],), device=packed.device, dtype=torch.float32),
-                expert_offsets=offsets,
-                expert_counts=offsets[1:] - offsets[:-1],
-                num_tokens=packed.shape[0],
-                top_k=1,
-                num_experts=len(lora_modules),
-            )
-            gate = gate + self._lora_contiguous(packed, metadata, "gate", packed.dtype)
-            up = up + self._lora_contiguous(packed, metadata, "up", packed.dtype)
-        activated = (F.silu(gate.float()) * up.float()).to(dtype=packed.dtype)
+            with prof_range(f"{range_prefix}.gate_lora"):
+                gate_lora = self.expert_lora(packed, offsets, experts, "gate", packed.dtype)
+            with prof_range(f"{range_prefix}.up_lora"):
+                up_lora = self.expert_lora(packed, offsets, experts, "up", packed.dtype)
+            gate = gate + gate_lora
+            up = up + up_lora
+        with prof_range(f"{range_prefix}.activation_silu_mul"):
+            activated = (F.silu(gate.float()) * up.float()).to(dtype=packed.dtype)
         down = down_base(activated.contiguous(), offsets, experts)
         if shared:
-            down = down + self._lora_shared(activated, offsets, "down", packed.dtype)
+            with prof_range(f"{range_prefix}.down_lora"):
+                down_lora = self._lora_shared(activated, offsets, "down", packed.dtype)
+            down = down + down_lora
         else:
-            metadata = ContiguousRouteMetadata(
-                token_indices=torch.empty((packed.shape[0],), device=packed.device, dtype=torch.long),
-                expert_indices=torch.empty((packed.shape[0],), device=packed.device, dtype=torch.long),
-                route_indices=torch.empty((packed.shape[0],), device=packed.device, dtype=torch.long),
-                routing_weights=torch.empty((packed.shape[0],), device=packed.device, dtype=torch.float32),
-                expert_offsets=offsets,
-                expert_counts=offsets[1:] - offsets[:-1],
-                num_tokens=packed.shape[0],
-                top_k=1,
-                num_experts=len(lora_modules),
-            )
-            down = down + self._lora_contiguous(activated, metadata, "down", packed.dtype)
+            with prof_range(f"{range_prefix}.down_lora"):
+                down_lora = self.expert_lora(activated, offsets, experts, "down", packed.dtype)
+            down = down + down_lora
         return down
 
     def _run_contiguous(self, packed: torch.Tensor, metadata: ContiguousRouteMetadata) -> torch.Tensor:
@@ -948,7 +1027,6 @@ class AsymTinyMoELayer(nn.Module):
             gate_base=self.expert_gate_base,
             up_base=self.expert_up_base,
             down_base=self.expert_down_base,
-            lora_modules=self.experts,
         )
 
     def _run_masked(self, packed: torch.Tensor, metadata: MaskedRouteMetadata) -> torch.Tensor:
@@ -965,19 +1043,18 @@ class AsymTinyMoELayer(nn.Module):
             gate_base=self.expert_gate_base,
             up_base=self.expert_up_base,
             down_base=self.expert_down_base,
-            lora_modules=self.experts,
         )
         out = packed.new_zeros((metadata.num_experts, metadata.max_routes_per_expert, self.config.hidden_size))
         out[metadata.valid_mask] = compact_out
         return out
 
     def _run_shared(self, flat: torch.Tensor) -> torch.Tensor:
-        if not self.shared_experts:
+        if self.shared_expert_lora is None:
             return flat.new_zeros((flat.shape[0], self.config.hidden_size))
         assert self.shared_gate_base is not None
         assert self.shared_up_base is not None
         assert self.shared_down_base is not None
-        num_shared = len(self.shared_experts)
+        num_shared = self.shared_expert_lora.num_experts
         tokens = int(flat.shape[0])
         packed = flat.contiguous().repeat(num_shared, 1)
         offsets = torch.arange(
@@ -995,7 +1072,6 @@ class AsymTinyMoELayer(nn.Module):
             gate_base=self.shared_gate_base,
             up_base=self.shared_up_base,
             down_base=self.shared_down_base,
-            lora_modules=self.shared_experts,
             shared=True,
         )
         return out.reshape(num_shared, tokens, self.config.hidden_size).float().mean(dim=0).to(dtype=flat.dtype)
@@ -1606,17 +1682,44 @@ def lora_grad_worst_error(lhs: nn.Module, rhs: nn.Module) -> float:
     worst = 0.0
     found = False
     compared = False
+
+    def compare_grads(name: str, lhs_grad: torch.Tensor | None, rhs_grad: torch.Tensor | None) -> None:
+        nonlocal worst, compared
+        if lhs_grad is None and rhs_grad is None:
+            return
+        if lhs_grad is None or rhs_grad is None:
+            present = lhs_grad if lhs_grad is not None else rhs_grad
+            if present is not None and float(present.detach().float().abs().max().item()) == 0.0:
+                return
+            raise AssertionError(f"missing LoRA gradient for {name}")
+        compared = True
+        worst = max(worst, max_abs_error(lhs_grad, rhs_grad))
+
     for name, lhs_param in lhs_params.items():
         if "_lora_" not in name:
             continue
         found = True
-        rhs_param = rhs_params[name]
-        if lhs_param.grad is None and rhs_param.grad is None:
+        if name in rhs_params:
+            compare_grads(name, lhs_param.grad, rhs_params[name].grad)
             continue
-        if lhs_param.grad is None or rhs_param.grad is None:
-            raise AssertionError(f"missing LoRA gradient for {name}")
-        compared = True
-        worst = max(worst, max_abs_error(lhs_param.grad, rhs_param.grad))
+
+        packed_scope = None
+        ref_scope = None
+        if ".expert_lora." in name:
+            packed_scope = ".expert_lora."
+            ref_scope = ".experts."
+        elif ".shared_expert_lora." in name:
+            packed_scope = ".shared_expert_lora."
+            ref_scope = ".shared_experts."
+        if packed_scope is None or ref_scope is None:
+            raise KeyError(f"missing matching LoRA parameter in reference model: {name}")
+
+        layer_prefix, leaf_name = name.split(packed_scope, 1)
+        for expert_idx in range(int(lhs_param.shape[0])):
+            rhs_name = f"{layer_prefix}{ref_scope}{expert_idx}.{leaf_name}"
+            rhs_param = rhs_params[rhs_name]
+            lhs_grad = None if lhs_param.grad is None else lhs_param.grad[expert_idx]
+            compare_grads(f"{name}[{expert_idx}]", lhs_grad, rhs_param.grad)
     if not found:
         raise AssertionError("no LoRA parameters found")
     if not compared:
@@ -2370,6 +2473,7 @@ __all__ = [
     "GroupedMode",
     "MaskedRouteMetadata",
     "MICRO_MOE_CONFIG",
+    "PackedExpertLoRA",
     "RouteMetadata",
     "Routing",
     "SHOWCASE_MOE_CONFIG",
@@ -2387,6 +2491,7 @@ __all__ = [
     "default_tiny_moe_base_dtype",
     "default_tiny_moe_device",
     "estimate_tiny_moe_parameters",
+    "grouped_lora_linear",
     "lora_grad_worst_error",
     "make_balanced_static_routing",
     "make_empty_expert_static_routing",
