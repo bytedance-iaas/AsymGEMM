@@ -15,13 +15,22 @@ from .frozen_linear import (
     measure_gpu_weight_allocation,
 )
 from .host_weight import HostWeight, HostWeightMetadata, tensor_nbytes
-from .mlp import (
+from .lora import (
     AsymLoRALinear,
-    AsymMLP,
     TorchLoRALinear,
-    TorchMLP,
+    add_asym_lora,
     copy_lora,
+    freeze_non_lora_params,
+    get_lora_state_dict,
+    load_lora_state_dict,
     lora_parameters,
+    normalize_lora_dtype,
+    save_peft_adapter,
+    load_peft_adapter,
+)
+from .mlp import (
+    AsymMLP,
+    TorchMLP,
     optimizer_contains_only,
 )
 from .dense import (
@@ -37,6 +46,7 @@ from .moe import (
     SHOWCASE_MOE_CONFIG,
     TinyMoE,
     TinyMoEConfig,
+    VALID_MOE_BACKENDS,
     estimate_tiny_moe_parameters,
     run_tiny_moe_correctness_report,
     run_tiny_moe_memory_comparison,
@@ -76,6 +86,8 @@ __all__ = [
     "TorchMLP",
     "VALID_ASYM_PRECISIONS",
     "VALID_BACKENDS",
+    "VALID_MOE_BACKENDS",
+    "add_asym_lora",
     "asym_frozen_linear",
     "asym_grouped_frozen_linear",
     "can_use_direct_bf16",
@@ -84,13 +96,19 @@ __all__ = [
     "estimate_tiny_dense_llm_parameters",
     "estimate_tiny_moe_parameters",
     "frozen_linear",
+    "freeze_non_lora_params",
+    "get_lora_state_dict",
+    "load_lora_state_dict",
+    "load_peft_adapter",
     "lora_parameters",
     "measure_gpu_weight_allocation",
+    "normalize_lora_dtype",
     "optimizer_contains_only",
     "run_m3_report",
     "run_tiny_dense_llm_case",
     "run_tiny_moe_correctness_report",
     "run_tiny_moe_case",
     "run_tiny_moe_memory_comparison",
+    "save_peft_adapter",
     "tensor_nbytes",
 ]

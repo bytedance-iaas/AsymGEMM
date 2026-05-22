@@ -47,8 +47,8 @@ EXPECTED_OPS = {
         "backward.attention.k_proj.base_dx_asymgemm",
         "backward.attention.q_proj.base_dx_asymgemm",
     ],
-    "moe_3b": [],
-    "qwen3_14b": [
+    "moe-604m-a75m": [],
+    "dense_14b": [
         "forward.attention.q_proj.base_frozen_asymgemm",
         "forward.attention.k_proj.base_frozen_asymgemm",
         "forward.attention.v_proj.base_frozen_asymgemm",
@@ -64,7 +64,7 @@ EXPECTED_OPS = {
         "backward.attention.k_proj.base_dx_asymgemm",
         "backward.attention.q_proj.base_dx_asymgemm",
     ],
-    "qwen3_30b_a3b": [],
+    "moe-604m-a38m": [],
 }
 
 

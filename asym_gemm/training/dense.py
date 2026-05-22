@@ -5,7 +5,6 @@ from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import gc
-import hashlib
 import importlib.util
 import json
 import math
@@ -16,7 +15,7 @@ import sys
 import time
 import types
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import torch
 from torch import nn
@@ -25,6 +24,16 @@ from torch.utils.checkpoint import checkpoint
 
 try:
     from .frozen_linear import AsymExecutionStats, AsymFrozenLinear, VALID_ASYM_PRECISIONS
+    from .lora import (
+        AsymLoRALinear,
+        TorchLoRALinear,
+        adapter_state_dict,
+        adapter_state_hash,
+        adapter_state_names,
+        copy_adapter_state,
+        load_adapter_state_dict,
+        lora_parameters as collect_lora_parameters,
+    )
 except ImportError:
     import asym_gemm as _asym_gemm_pkg
 
@@ -51,9 +60,18 @@ except ImportError:
 
     _load_training_dependency("host_weight")
     _frozen_linear = _load_training_dependency("frozen_linear")
+    _lora = _load_training_dependency("lora")
     AsymExecutionStats = _frozen_linear.AsymExecutionStats
     AsymFrozenLinear = _frozen_linear.AsymFrozenLinear
     VALID_ASYM_PRECISIONS = _frozen_linear.VALID_ASYM_PRECISIONS
+    AsymLoRALinear = _lora.AsymLoRALinear
+    TorchLoRALinear = _lora.TorchLoRALinear
+    adapter_state_dict = _lora.adapter_state_dict
+    adapter_state_hash = _lora.adapter_state_hash
+    adapter_state_names = _lora.adapter_state_names
+    copy_adapter_state = _lora.copy_adapter_state
+    load_adapter_state_dict = _lora.load_adapter_state_dict
+    collect_lora_parameters = _lora.lora_parameters
     setattr(_training_pkg, "AsymExecutionStats", AsymExecutionStats)
     setattr(_training_pkg, "AsymFrozenLinear", AsymFrozenLinear)
     setattr(_training_pkg, "VALID_ASYM_PRECISIONS", VALID_ASYM_PRECISIONS)
@@ -63,6 +81,8 @@ TARGET_MODES = ("mlp_only", "attention_only", "all")
 ATTENTION_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj")
 MLP_TARGETS = ("gate_proj", "up_proj", "down_proj")
 ALL_TARGETS = ATTENTION_TARGETS + MLP_TARGETS
+DEFAULT_TARGET_MODULES = "all"
+DEFAULT_OFFLOAD_MODULES = "mlp"
 
 
 @dataclass(frozen=True)
@@ -120,6 +140,41 @@ def _target_names(target_mode: str) -> tuple[str, ...]:
     return ALL_TARGETS
 
 
+def _normalize_module_selector(selector: Sequence[str] | str | None, *, default: str, purpose: str) -> tuple[str, ...]:
+    if selector is None:
+        selector = default
+    if isinstance(selector, str):
+        key = selector.strip().lower().replace("-", "_")
+        if not key:
+            return ()
+        if "," in key:
+            raw_names = tuple(part.strip() for part in key.split(",") if part.strip())
+        elif key in {"all", "default"}:
+            return ALL_TARGETS
+        elif key in {"attention", "attention_only"}:
+            return ATTENTION_TARGETS
+        elif key in {"mlp", "mlp_only"}:
+            return MLP_TARGETS
+        elif key == "none":
+            return ()
+        else:
+            raw_names = (selector,)
+    else:
+        raw_names = tuple(str(target) for target in selector)
+
+    names: list[str] = []
+    valid = set(ALL_TARGETS)
+    for target in raw_names:
+        suffix = str(target).strip().rsplit(".", 1)[-1].replace("-", "_")
+        if not suffix:
+            continue
+        if suffix not in valid:
+            raise ValueError(f"unsupported dense {purpose} module {target!r}; expected suffix in {ALL_TARGETS}")
+        if suffix not in names:
+            names.append(suffix)
+    return tuple(names)
+
+
 MICRO_DENSE_LLM_CONFIG = TinyDenseLLMConfig.micro()
 SHOWCASE_DENSE_LLM_CONFIG = TinyDenseLLMConfig()
 
@@ -141,9 +196,12 @@ def estimate_tiny_dense_llm_parameters(
     config: TinyDenseLLMConfig = SHOWCASE_DENSE_LLM_CONFIG,
     *,
     target_mode: str = "all",
+    target_modules: Sequence[str] | str | None = None,
+    offload_modules: Sequence[str] | str | None = DEFAULT_OFFLOAD_MODULES,
     dtype: torch.dtype | str = torch.bfloat16,
 ) -> dict[str, int | float | str]:
-    target_names = set(_target_names(target_mode))
+    target_names = set(_normalize_module_selector(target_modules, default=target_mode, purpose="target"))
+    offload_names = set(_normalize_module_selector(offload_modules, default=DEFAULT_OFFLOAD_MODULES, purpose="offload"))
     h = int(config.hidden_size)
     inter = int(config.intermediate_size)
     layers = int(config.num_layers)
@@ -153,9 +211,9 @@ def estimate_tiny_dense_llm_parameters(
     attention_base_elements = layers * len(ATTENTION_TARGETS) * h * h
     mlp_base_elements = layers * len(MLP_TARGETS) * inter * h
     layer_projection_base_elements = attention_base_elements + mlp_base_elements
-    target_attention_elements = attention_base_elements if any(name in target_names for name in ATTENTION_TARGETS) else 0
-    target_mlp_elements = mlp_base_elements if any(name in target_names for name in MLP_TARGETS) else 0
-    cpu_resident_target_elements = target_attention_elements + target_mlp_elements
+    offload_attention_elements = attention_base_elements if any(name in offload_names for name in ATTENTION_TARGETS) else 0
+    offload_mlp_elements = mlp_base_elements if any(name in offload_names for name in MLP_TARGETS) else 0
+    cpu_resident_target_elements = offload_attention_elements + offload_mlp_elements
     gpu_resident_nontarget_elements = layer_projection_base_elements - cpu_resident_target_elements
 
     attention_lora_elements = (
@@ -182,6 +240,8 @@ def estimate_tiny_dense_llm_parameters(
     return {
         "config_name": "showcase" if config == SHOWCASE_DENSE_LLM_CONFIG else "custom",
         "target_mode": target_mode,
+        "target_modules": ",".join(target_names),
+        "offload_modules": ",".join(offload_names),
         "total_model_elements": total_model_elements,
         "layer_projection_base_elements": layer_projection_base_elements,
         "cpu_resident_target_elements": cpu_resident_target_elements,
@@ -253,98 +313,12 @@ class FrozenTorchLinear(nn.Module):
         return F.linear(x, self.weight)
 
 
-class AsymLoRALinear(nn.Module):
-    def __init__(
-        self,
-        weight: torch.Tensor,
-        *,
-        rank: int,
-        alpha: float,
-        backend: str,
-        stats: AsymExecutionStats,
-        device: torch.device,
-        dtype: torch.dtype,
-        lora_generator: torch.Generator,
-        precision: str = "bf16",
-    ) -> None:
-        super().__init__()
-        precision = str(precision).lower()
-        if precision not in VALID_ASYM_PRECISIONS:
-            raise ValueError(f"unsupported precision={precision!r}; expected one of {VALID_ASYM_PRECISIONS}")
-        self.base_layer = AsymFrozenLinear(
-            weight,
-            backend=backend,
-            pin_memory=device.type == "cuda",
-            stats=stats,
-            precision=precision,
-        )
-        self.lora_A = nn.ModuleDict({"default": nn.Linear(weight.shape[1], rank, bias=False, device=device, dtype=torch.float32)})
-        self.lora_B = nn.ModuleDict({"default": nn.Linear(rank, weight.shape[0], bias=False, device=device, dtype=torch.float32)})
-        self.scaling = float(alpha) / float(rank)
-        self.precision = precision
-        self._reset_lora(lora_generator)
-
-    def _reset_lora(self, generator: torch.Generator) -> None:
-        with torch.no_grad():
-            a = _randn(tuple(self.lora_A["default"].weight.shape), generator=generator, dtype=torch.float32, scale=0.01)
-            b = _randn(tuple(self.lora_B["default"].weight.shape), generator=generator, dtype=torch.float32, scale=0.01)
-            self.lora_A["default"].weight.copy_(a.to(device=self.lora_A["default"].weight.device))
-            self.lora_B["default"].weight.copy_(b.to(device=self.lora_B["default"].weight.device))
-
-    @property
-    def pinned_cpu_bytes(self) -> int:
-        return self.base_layer.pinned_cpu_bytes
-
-    @property
-    def cpu_resident_base_weight_bytes(self) -> int:
-        return self.base_layer.weight_hbm_saved_bytes
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base = self.base_layer(x)
-        lora = self.lora_B["default"](self.lora_A["default"](x.float())) * self.scaling
-        return base + lora.to(dtype=base.dtype)
-
-
-class TorchLoRALinear(nn.Module):
-    def __init__(
-        self,
-        weight: torch.Tensor,
-        *,
-        rank: int,
-        alpha: float,
-        device: torch.device,
-        dtype: torch.dtype,
-        lora_generator: torch.Generator,
-    ) -> None:
-        super().__init__()
-        self.base_layer = FrozenTorchLinear(weight, device=device, dtype=dtype)
-        self.lora_A = nn.ModuleDict({"default": nn.Linear(weight.shape[1], rank, bias=False, device=device, dtype=torch.float32)})
-        self.lora_B = nn.ModuleDict({"default": nn.Linear(rank, weight.shape[0], bias=False, device=device, dtype=torch.float32)})
-        self.scaling = float(alpha) / float(rank)
-        self._reset_lora(lora_generator)
-
-    def _reset_lora(self, generator: torch.Generator) -> None:
-        with torch.no_grad():
-            a = _randn(tuple(self.lora_A["default"].weight.shape), generator=generator, dtype=torch.float32, scale=0.01)
-            b = _randn(tuple(self.lora_B["default"].weight.shape), generator=generator, dtype=torch.float32, scale=0.01)
-            self.lora_A["default"].weight.copy_(a.to(device=self.lora_A["default"].weight.device))
-            self.lora_B["default"].weight.copy_(b.to(device=self.lora_B["default"].weight.device))
-
-    @property
-    def gpu_resident_base_weight_bytes(self) -> int:
-        return self.base_layer.weight_nbytes
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base = self.base_layer(x)
-        lora = self.lora_B["default"](self.lora_A["default"](x.float())) * self.scaling
-        return base + lora.to(dtype=base.dtype)
-
-
 def _make_projection(
     *,
     weight: torch.Tensor,
     name: str,
     target_names: tuple[str, ...],
+    offload_names: tuple[str, ...],
     use_asym: bool,
     rank: int,
     alpha: float,
@@ -353,10 +327,13 @@ def _make_projection(
     device: torch.device,
     dtype: torch.dtype,
     lora_generator: torch.Generator,
+    lora_dtype: torch.dtype | str = torch.bfloat16,
     precision: str = "bf16",
 ) -> nn.Module:
-    if name in target_names:
-        if use_asym:
+    targeted = name in target_names
+    offloaded = use_asym and name in offload_names
+    if targeted:
+        if offloaded:
             return AsymLoRALinear(
                 weight,
                 rank=rank,
@@ -366,6 +343,7 @@ def _make_projection(
                 device=device,
                 dtype=dtype,
                 lora_generator=lora_generator,
+                lora_dtype=lora_dtype,
                 precision=precision,
             )
         return TorchLoRALinear(
@@ -375,6 +353,15 @@ def _make_projection(
             device=device,
             dtype=dtype,
             lora_generator=lora_generator,
+            lora_dtype=lora_dtype,
+        )
+    if offloaded:
+        return AsymFrozenLinear(
+            weight.detach().to(dtype=dtype),
+            backend=backend,
+            pin_memory=device.type == "cuda",
+            stats=stats,
+            precision=precision,
         )
     return FrozenTorchLinear(weight, device=device, dtype=dtype)
 
@@ -386,17 +373,20 @@ class TinySelfAttention(nn.Module):
         *,
         config: TinyDenseLLMConfig,
         target_names: tuple[str, ...],
+        offload_names: tuple[str, ...],
         use_asym: bool,
         backend: str,
         stats: AsymExecutionStats,
         device: torch.device,
         dtype: torch.dtype,
         lora_generator: torch.Generator,
+        lora_dtype: torch.dtype | str = torch.bfloat16,
         precision: str = "bf16",
     ) -> None:
         super().__init__()
         kwargs = {
             "target_names": target_names,
+            "offload_names": offload_names,
             "use_asym": use_asym,
             "rank": config.lora_rank,
             "alpha": config.lora_alpha,
@@ -405,6 +395,7 @@ class TinySelfAttention(nn.Module):
             "device": device,
             "dtype": dtype,
             "lora_generator": lora_generator,
+            "lora_dtype": lora_dtype,
             "precision": precision,
         }
         self.q_proj = _make_projection(weight=layer_weights["q_proj"], name="q_proj", **kwargs)
@@ -435,17 +426,20 @@ class TinyMLP(nn.Module):
         *,
         config: TinyDenseLLMConfig,
         target_names: tuple[str, ...],
+        offload_names: tuple[str, ...],
         use_asym: bool,
         backend: str,
         stats: AsymExecutionStats,
         device: torch.device,
         dtype: torch.dtype,
         lora_generator: torch.Generator,
+        lora_dtype: torch.dtype | str = torch.bfloat16,
         precision: str = "bf16",
     ) -> None:
         super().__init__()
         kwargs = {
             "target_names": target_names,
+            "offload_names": offload_names,
             "use_asym": use_asym,
             "rank": config.lora_rank,
             "alpha": config.lora_alpha,
@@ -454,6 +448,7 @@ class TinyMLP(nn.Module):
             "device": device,
             "dtype": dtype,
             "lora_generator": lora_generator,
+            "lora_dtype": lora_dtype,
             "precision": precision,
         }
         self.gate_proj = _make_projection(weight=layer_weights["gate_proj"], name="gate_proj", **kwargs)
@@ -474,12 +469,14 @@ class TinyDecoderLayer(nn.Module):
         *,
         config: TinyDenseLLMConfig,
         target_names: tuple[str, ...],
+        offload_names: tuple[str, ...],
         use_asym: bool,
         backend: str,
         stats: AsymExecutionStats,
         device: torch.device,
         dtype: torch.dtype,
         lora_generator: torch.Generator,
+        lora_dtype: torch.dtype | str = torch.bfloat16,
         precision: str = "bf16",
     ) -> None:
         super().__init__()
@@ -499,24 +496,28 @@ class TinyDecoderLayer(nn.Module):
             layer_weights,
             config=config,
             target_names=target_names,
+            offload_names=offload_names,
             use_asym=use_asym,
             backend=backend,
             stats=stats,
             device=device,
             dtype=dtype,
             lora_generator=lora_generator,
+            lora_dtype=lora_dtype,
             precision=precision,
         )
         self.mlp = TinyMLP(
             layer_weights,
             config=config,
             target_names=target_names,
+            offload_names=offload_names,
             use_asym=use_asym,
             backend=backend,
             stats=stats,
             device=device,
             dtype=dtype,
             lora_generator=lora_generator,
+            lora_dtype=lora_dtype,
             precision=precision,
         )
 
@@ -538,6 +539,8 @@ class TinyDenseLLMBase(nn.Module):
         *,
         config: TinyDenseLLMConfig,
         target_mode: str,
+        target_modules: Sequence[str] | str | None = None,
+        offload_modules: Sequence[str] | str | None = DEFAULT_OFFLOAD_MODULES,
         use_asym: bool,
         backend: str,
         stats: Optional[AsymExecutionStats],
@@ -545,13 +548,19 @@ class TinyDenseLLMBase(nn.Module):
         dtype: torch.dtype,
         lora_seed: int,
         gradient_checkpointing: bool = False,
+        lora_dtype: torch.dtype | str = torch.bfloat16,
         precision: str = "bf16",
     ) -> None:
         super().__init__()
         _check_target_mode(target_mode)
         self.config = config
         self.target_mode = target_mode
-        self.target_names = _target_names(target_mode)
+        self.target_names = _normalize_module_selector(target_modules, default=target_mode, purpose="target")
+        self.offload_names = (
+            _normalize_module_selector(offload_modules, default=DEFAULT_OFFLOAD_MODULES, purpose="offload")
+            if use_asym
+            else ()
+        )
         self.use_asym = use_asym
         self.backend = backend
         self.precision = str(precision).lower()
@@ -562,6 +571,7 @@ class TinyDenseLLMBase(nn.Module):
         self.device_for_inputs = device
         self.dtype_for_inputs = dtype
         self.lora_seed = int(lora_seed)
+        self.lora_dtype = lora_dtype
 
         self.register_buffer("embed_tokens_weight", weights.token_embedding.detach().to(device=device, dtype=dtype).contiguous())
         self.register_buffer("position_embedding", weights.position_embedding.detach().to(device=device, dtype=dtype).contiguous())
@@ -574,12 +584,14 @@ class TinyDenseLLMBase(nn.Module):
                     layer_weights,
                     config=config,
                     target_names=self.target_names,
+                    offload_names=self.offload_names,
                     use_asym=use_asym,
                     backend=backend,
                     stats=self.stats,
                     device=device,
                     dtype=dtype,
                     lora_generator=lora_generator,
+                    lora_dtype=lora_dtype,
                     precision=self.precision,
                 )
                 for layer_weights in weights.layers
@@ -594,18 +606,34 @@ class TinyDenseLLMBase(nn.Module):
 
     @property
     def pinned_cpu_bytes(self) -> int:
-        return int(sum(module.pinned_cpu_bytes for module in self.modules() if isinstance(module, AsymLoRALinear)))
+        lora_modules = [module for module in self.modules() if isinstance(module, AsymLoRALinear)]
+        lora_base_ids = {id(module.base_layer) for module in lora_modules}
+        total = sum(module.pinned_cpu_bytes for module in lora_modules)
+        total += sum(
+            module.pinned_cpu_bytes
+            for module in self.modules()
+            if isinstance(module, AsymFrozenLinear) and id(module) not in lora_base_ids
+        )
+        return int(total)
 
     @property
     def cpu_resident_base_weight_bytes(self) -> int:
-        return int(sum(module.cpu_resident_base_weight_bytes for module in self.modules() if isinstance(module, AsymLoRALinear)))
+        lora_modules = [module for module in self.modules() if isinstance(module, AsymLoRALinear)]
+        lora_base_ids = {id(module.base_layer) for module in lora_modules}
+        total = sum(module.cpu_resident_base_weight_bytes for module in lora_modules)
+        total += sum(
+            module.weight_hbm_saved_bytes
+            for module in self.modules()
+            if isinstance(module, AsymFrozenLinear) and id(module) not in lora_base_ids
+        )
+        return int(total)
 
     @property
     def gpu_resident_target_weight_bytes(self) -> int:
         return int(sum(module.gpu_resident_base_weight_bytes for module in self.modules() if isinstance(module, TorchLoRALinear)))
 
     def lora_parameters(self) -> list[nn.Parameter]:
-        return [param for name, param in self.named_parameters() if ".lora_" in name]
+        return collect_lora_parameters(self)
 
     def forward(
         self,
@@ -652,18 +680,23 @@ class AsymTinyDenseLLM(TinyDenseLLMBase):
         *,
         config: TinyDenseLLMConfig = TinyDenseLLMConfig(),
         target_mode: str = "all",
-        backend: str = "asym_or_staged",
+        target_modules: Sequence[str] | str | None = None,
+        offload_modules: Sequence[str] | str | None = DEFAULT_OFFLOAD_MODULES,
+        backend: str = "asym",
         stats: Optional[AsymExecutionStats] = None,
         device: torch.device | str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         lora_seed: int = 1,
         gradient_checkpointing: bool = False,
+        lora_dtype: torch.dtype | str = torch.bfloat16,
         precision: str = "bf16",
     ) -> None:
         super().__init__(
             weights,
             config=config,
             target_mode=target_mode,
+            target_modules=target_modules,
+            offload_modules=offload_modules,
             use_asym=True,
             backend=backend,
             stats=stats,
@@ -671,6 +704,7 @@ class AsymTinyDenseLLM(TinyDenseLLMBase):
             dtype=dtype,
             lora_seed=lora_seed,
             gradient_checkpointing=gradient_checkpointing,
+            lora_dtype=lora_dtype,
             precision=precision,
         )
 
@@ -682,15 +716,20 @@ class TorchTinyDenseLLM(TinyDenseLLMBase):
         *,
         config: TinyDenseLLMConfig = TinyDenseLLMConfig(),
         target_mode: str = "all",
+        target_modules: Sequence[str] | str | None = None,
+        offload_modules: Sequence[str] | str | None = None,
         device: torch.device | str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         lora_seed: int = 1,
         gradient_checkpointing: bool = False,
+        lora_dtype: torch.dtype | str = torch.bfloat16,
     ) -> None:
         super().__init__(
             weights,
             config=config,
             target_mode=target_mode,
+            target_modules=target_modules,
+            offload_modules=offload_modules,
             use_asym=False,
             backend="torch_reference",
             stats=AsymExecutionStats(),
@@ -698,51 +737,12 @@ class TorchTinyDenseLLM(TinyDenseLLMBase):
             dtype=dtype,
             lora_seed=lora_seed,
             gradient_checkpointing=gradient_checkpointing,
+            lora_dtype=lora_dtype,
         )
 
 
 TinyDenseConfig = TinyDenseLLMConfig
 TinyDenseLM = AsymTinyDenseLLM
-
-
-def adapter_state_dict(model: nn.Module) -> OrderedDict[str, torch.Tensor]:
-    return OrderedDict(
-        (name, tensor.detach().clone())
-        for name, tensor in model.state_dict().items()
-        if ".lora_A." in name or ".lora_B." in name
-    )
-
-
-def adapter_state_names(model: nn.Module) -> list[str]:
-    return list(adapter_state_dict(model).keys())
-
-
-def adapter_state_hash(state: Mapping[str, torch.Tensor]) -> str:
-    digest = hashlib.sha256()
-    for name, tensor in state.items():
-        digest.update(name.encode("utf-8"))
-        cpu = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
-        digest.update(cpu.numpy().tobytes())
-    return digest.hexdigest()
-
-
-def load_adapter_state_dict(model: nn.Module, state: Mapping[str, torch.Tensor], *, strict: bool = True) -> None:
-    params = dict(model.named_parameters())
-    missing = [name for name in state if name not in params]
-    if missing:
-        raise KeyError(f"adapter state contains unknown keys: {missing}")
-    if strict:
-        expected = set(adapter_state_names(model))
-        provided = set(state.keys())
-        if expected != provided:
-            raise KeyError(f"adapter key mismatch: missing={sorted(expected - provided)}, unexpected={sorted(provided - expected)}")
-    with torch.no_grad():
-        for name, value in state.items():
-            params[name].copy_(value.to(device=params[name].device, dtype=params[name].dtype))
-
-
-def copy_adapter_state(src: nn.Module, dst: nn.Module) -> None:
-    load_adapter_state_dict(dst, adapter_state_dict(src), strict=True)
 
 
 def _max_abs(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -809,11 +809,14 @@ def build_model_pair(
     *,
     config: TinyDenseLLMConfig = TinyDenseLLMConfig(),
     target_mode: str = "all",
-    backend: str = "asym_or_staged",
+    target_modules: Sequence[str] | str | None = None,
+    offload_modules: Sequence[str] | str | None = DEFAULT_OFFLOAD_MODULES,
+    backend: str = "asym",
     device: torch.device | str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
     lora_seed: int = 1,
+    lora_dtype: torch.dtype | str = torch.bfloat16,
     gradient_checkpointing: bool = False,
 ) -> tuple[AsymTinyDenseLLM, TorchTinyDenseLLM]:
     dev = torch.device(device)
@@ -823,20 +826,26 @@ def build_model_pair(
         weights,
         config=config,
         target_mode=target_mode,
+        target_modules=target_modules,
+        offload_modules=offload_modules,
         backend=backend,
         stats=stats,
         device=dev,
         dtype=dtype,
         lora_seed=lora_seed,
+        lora_dtype=lora_dtype,
         gradient_checkpointing=gradient_checkpointing,
     )
     ref_model = TorchTinyDenseLLM(
         weights,
         config=config,
         target_mode=target_mode,
+        target_modules=target_modules,
+        offload_modules=None,
         device=dev,
         dtype=dtype,
         lora_seed=lora_seed,
+        lora_dtype=lora_dtype,
         gradient_checkpointing=gradient_checkpointing,
     )
     copy_adapter_state(asym_model, ref_model)
@@ -871,11 +880,12 @@ def run_parity_case(
     *,
     target_mode: str,
     checkpointing: bool,
-    backend: str = "asym_or_staged",
+    backend: str = "asym",
     device: torch.device | str | None = None,
     dtype: torch.dtype | str = torch.bfloat16,
     seed: int = 0,
     lora_seed: int = 1,
+    lora_dtype: torch.dtype | str = torch.bfloat16,
     input_seed: int = 2,
     config: TinyDenseLLMConfig = TinyDenseLLMConfig(),
 ) -> dict[str, Any]:
@@ -889,6 +899,7 @@ def run_parity_case(
         dtype=resolved_dtype,
         seed=seed,
         lora_seed=lora_seed,
+        lora_dtype=lora_dtype,
         gradient_checkpointing=checkpointing,
     )
     inputs, labels = make_inputs(config, seed=input_seed, device=dev, dtype=resolved_dtype)
@@ -1034,11 +1045,12 @@ def run_repeated_steps(
     *,
     target_mode: str = "all",
     checkpointing: bool = False,
-    backend: str = "asym_or_staged",
+    backend: str = "asym",
     device: torch.device | str | None = None,
     dtype: torch.dtype | str = torch.bfloat16,
     seed: int = 10,
     lora_seed: int = 11,
+    lora_dtype: torch.dtype | str = torch.bfloat16,
     input_seed: int = 12,
     steps: int = 5,
     lr: float = 3e-3,
@@ -1054,6 +1066,7 @@ def run_repeated_steps(
         dtype=resolved_dtype,
         seed=seed,
         lora_seed=lora_seed,
+        lora_dtype=lora_dtype,
         gradient_checkpointing=checkpointing,
     )
     inputs, labels = make_inputs(config, seed=input_seed, device=dev, dtype=resolved_dtype)
@@ -1138,12 +1151,13 @@ def run_repeated_steps(
 def run_adapter_reload_case(
     *,
     target_mode: str = "all",
-    backend: str = "torch_only",
+    backend: str = "torch",
     device: torch.device | str | None = "cpu",
     dtype: torch.dtype | str = torch.float32,
     seed: int = 20,
     lora_seed: int = 21,
     reload_lora_seed: int = 22,
+    lora_dtype: torch.dtype | str = torch.bfloat16,
     input_seed: int = 23,
     config: TinyDenseLLMConfig = TinyDenseLLMConfig(),
 ) -> dict[str, Any]:
@@ -1159,6 +1173,7 @@ def run_adapter_reload_case(
         device=dev,
         dtype=resolved_dtype,
         lora_seed=lora_seed,
+        lora_dtype=lora_dtype,
     )
     reloaded = AsymTinyDenseLLM(
         weights,
@@ -1169,6 +1184,7 @@ def run_adapter_reload_case(
         device=dev,
         dtype=resolved_dtype,
         lora_seed=reload_lora_seed,
+        lora_dtype=lora_dtype,
     )
     state = adapter_state_dict(model)
     inputs, labels = make_inputs(config, seed=input_seed, device=dev, dtype=resolved_dtype)
@@ -1200,6 +1216,7 @@ def _memory_probe(
     dtype: torch.dtype,
     seed: int,
     lora_seed: int,
+    lora_dtype: torch.dtype | str,
     input_seed: int,
     config: TinyDenseLLMConfig,
 ) -> dict[str, Any]:
@@ -1215,6 +1232,7 @@ def _memory_probe(
             device=device,
             dtype=dtype,
             lora_seed=lora_seed,
+            lora_dtype=lora_dtype,
         )
     elif mode == "asym_cpu_resident":
         model = AsymTinyDenseLLM(
@@ -1226,6 +1244,7 @@ def _memory_probe(
             device=device,
             dtype=dtype,
             lora_seed=lora_seed,
+            lora_dtype=lora_dtype,
         )
     else:
         raise ValueError(f"unknown memory mode: {mode}")
@@ -1275,11 +1294,12 @@ def _memory_probe(
 def run_memory_comparison(
     *,
     target_mode: str = "all",
-    backend: str = "asym_or_staged",
+    backend: str = "asym",
     device: torch.device | str | None = None,
     dtype: torch.dtype | str = torch.bfloat16,
     seed: int = 30,
     lora_seed: int = 31,
+    lora_dtype: torch.dtype | str = torch.bfloat16,
     input_seed: int = 32,
     config: TinyDenseLLMConfig = TinyDenseLLMConfig(),
 ) -> dict[str, Any]:
@@ -1293,6 +1313,7 @@ def run_memory_comparison(
         dtype=resolved_dtype,
         seed=seed,
         lora_seed=lora_seed,
+        lora_dtype=lora_dtype,
         input_seed=input_seed,
         config=config,
     )
@@ -1304,6 +1325,7 @@ def run_memory_comparison(
         dtype=resolved_dtype,
         seed=seed,
         lora_seed=lora_seed,
+        lora_dtype=lora_dtype,
         input_seed=input_seed,
         config=config,
     )
@@ -1401,7 +1423,7 @@ def _summarize_status(report: Mapping[str, Any]) -> str:
 
 def run_m3_report(
     *,
-    backend: str = "asym_or_staged",
+    backend: str = "asym",
     report_path: Optional[Path] = None,
     device: torch.device | str | None = None,
     dtype: torch.dtype | str = torch.bfloat16,
@@ -1441,7 +1463,7 @@ def run_m3_report(
             input_seed=seed + 12,
             config=config,
         )
-        adapter = run_adapter_reload_case(target_mode="all", backend="torch_only", device="cpu", dtype=torch.float32, config=config)
+        adapter = run_adapter_reload_case(target_mode="all", backend="torch", device="cpu", dtype=torch.float32, config=config)
         memory = run_memory_comparison(
             target_mode="all",
             backend=backend,
@@ -1501,7 +1523,7 @@ def run_m3_report(
 
 def run_tiny_dense_llm_case(
     *,
-    backend: str = "asym_or_staged",
+    backend: str = "asym",
     report_path: Optional[Path] = None,
     seed: int = 0,
     device: Optional[str] = None,
@@ -1518,7 +1540,7 @@ def run_tiny_dense_llm_case(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", default="asym_or_staged", choices=["asym_only", "asym_or_staged", "asym_or_torch", "torch_only"])
+    parser.add_argument("--backend", default="asym", choices=["asym", "torch"])
     parser.add_argument("--report", default="reports/m3_tiny_llm.json")
     parser.add_argument("--device", choices=["cuda", "cpu"], default=None)
     parser.add_argument("--dtype", choices=["bf16", "bfloat16", "fp32", "float32"], default="bf16")

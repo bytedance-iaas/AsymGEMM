@@ -260,7 +260,7 @@ def _warm_memory_paths(
 
 def _run_demo_impl(
     *,
-    backend: str = "asym_or_staged",
+    backend: str = "asym",
     asym_precision: str = "bf16",
     report_path: Optional[Path] = None,
     seed: int = 0,
@@ -274,8 +274,8 @@ def _run_demo_impl(
     else:
         dev = torch.device("cpu")
         dtype = torch.float32
-        if backend == "asym_only":
-            raise RuntimeError("asym_only requires CUDA SM90/SM100 direct execution")
+        if backend == "asym":
+            raise RuntimeError("asym requires CUDA SM90/SM100 direct execution")
 
     if dev.type == "cuda":
         torch.cuda.empty_cache()
@@ -420,7 +420,7 @@ def _run_demo_impl(
 
 def run_demo(
     *,
-    backend: str = "asym_or_staged",
+    backend: str = "asym",
     asym_precision: str = "bf16",
     report_path: Optional[Path] = None,
     seed: int = 0,
@@ -445,7 +445,7 @@ def run_demo(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", default="asym_or_staged", choices=["asym_only", "asym_or_staged", "asym_or_torch", "torch_only"])
+    parser.add_argument("--backend", default="asym", choices=["asym", "torch"])
     parser.add_argument("--asym-precision", default="bf16", choices=["bf16", "fp8", "fp4"])
     parser.add_argument("--report", default="reports/mlp_demo.json")
     parser.add_argument("--seed", type=int, default=0)

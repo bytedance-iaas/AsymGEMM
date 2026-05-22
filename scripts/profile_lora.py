@@ -35,10 +35,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from asym_gemm.training.kt_moe import KTBackendUnavailable
 from asym_gemm.training.profile_ranges import current_profile_range, profile_enabled
 
 
-QWEN3_14B_CONFIG = {
+DENSE_14B_CONFIG = {
     "hf_model_id": "Qwen/Qwen3-14B",
     "hf_model_type": "qwen3",
     "hf_num_hidden_layers": 40,
@@ -49,7 +50,11 @@ QWEN3_14B_CONFIG = {
 }
 
 
-QWEN3_30B_A3B_CONFIG = {
+# MoE public workload names describe one routed-expert layer, not the full
+# reference model depth: moe-<total routed expert params>m-a<active routed
+# expert params per token>m. Layer count is controlled separately by
+# --profile-layers or driver workload specs such as moe-604m-a75m|2.
+MOE_604M_A38M_CONFIG = {
     "hf_model_id": "Qwen/Qwen3-30B-A3B",
     "hf_model_type": "qwen3_moe",
     "hf_num_hidden_layers": 48,
@@ -75,9 +80,9 @@ CUSTOM_DENSE_3B_CONFIG = {
 }
 
 
-CUSTOM_MOE_3B_CONFIG = {
+MOE_604M_A75M_CONFIG = {
     "hf_model_id": "custom/moe-3b-active",
-    "hf_model_type": "moe_3b_active",
+    "hf_model_type": "moe-604m-a75m",
     "hf_num_hidden_layers": 32,
     "hidden_size": 2048,
     "intermediate_size": 1536,
@@ -139,21 +144,51 @@ WORKLOAD_CHOICES = (
     "dense",
     "moe",
     "dense_3b",
-    "moe_3b",
-    "qwen3_14b",
-    "qwen3_30b_a3b",
+    "dense_14b",
+    "moe-604m-a75m",
+    "moe-604m-a38m",
     "mm_1b",
     "mm_3b",
     "mlp_1b",
     "mlp_3b",
 )
+BACKEND_CHOICES = ("torch", "asym", "kt")
+KT_MOE_WORKLOADS = ("moe", "moe-604m-a75m", "moe-604m-a38m")
 
 LORA_FORWARD_OPS = ("base_frozen_asymgemm", "lora_A", "lora_B", "add_cast_scale")
 LORA_BACKWARD_OPS = ("base_dx_asymgemm", "base_lora_add", "add_cast_scale", "lora_B", "lora_A")
 DENSE_ATTENTION_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj")
 DENSE_MLP_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+DENSE_ALL_PROJECTIONS = DENSE_ATTENTION_PROJECTIONS + DENSE_MLP_PROJECTIONS
 DENSE_TARGET_MODES = ("mlp_only", "attention_only", "all")
-DEFAULT_DENSE_TARGET_MODE = "mlp_only"
+DEFAULT_DENSE_TARGET_MODE = "all"
+DEFAULT_TARGET_MODULES = "all"
+DEFAULT_DENSE_OFFLOAD_MODULES = "mlp"
+DEFAULT_MOE_OFFLOAD_MODULES = "routed_experts"
+LORA_DTYPE_CHOICES = ("bf16", "bfloat16", "fp16", "float16", "fp32", "float32")
+KT_LORA_DTYPE_CHOICES = ("bf16", "bfloat16")
+KT_METHOD_CHOICES = ("AMXBF16_SFT", "AMXINT8_SFT", "AMXINT4_SFT")
+
+
+def is_torch_backend(backend: str) -> bool:
+    return backend == "torch"
+
+
+def is_asym_backend(backend: str) -> bool:
+    return backend == "asym"
+
+
+def is_kt_backend(backend: str) -> bool:
+    return backend == "kt"
+
+
+def validate_backend_workload(args: argparse.Namespace) -> None:
+    if is_kt_backend(args.backend) and args.workload not in KT_MOE_WORKLOADS:
+        raise ValueError("backend=kt is only implemented for MoE LoRA SFT workloads.")
+    if is_kt_backend(args.backend):
+        lora_dtype = str(getattr(args, "lora_dtype", "bf16")).lower()
+        if lora_dtype not in KT_LORA_DTYPE_CHOICES:
+            raise ValueError("backend=kt currently supports BF16 LoRA buffers only.")
 
 
 @dataclass(frozen=True)
@@ -982,6 +1017,9 @@ def memory_report(model: torch.nn.Module, device: torch.device) -> dict[str, Any
     pinned = 0
     seen_host_weights: set[int] = set()
     for module in model.modules():
+        if hasattr(module, "kt_cpu_weight_bytes"):
+            host_w += int(getattr(module, "kt_cpu_weight_bytes", 0))
+            pinned += int(getattr(module, "pinned_cpu_bytes", 0))
         host_weight = getattr(module, "host_weight", None)
         if host_weight is None:
             base = getattr(module, "base", None) or getattr(module, "base_layer", None)
@@ -1216,25 +1254,29 @@ def _lora_adapter_tensors(module: Any, prefix: str) -> LoRAAdapterTensors:
 
 
 def _profiled_lora_base(module: Any, x: torch.Tensor, prefix: str, book: StageBook) -> torch.Tensor:
-    with book.time(f"forward.{prefix}.base_frozen_asymgemm"):
-        if hasattr(module, "base"):
+    if hasattr(module, "base"):
+        with book.time(f"forward.{prefix}.base_frozen_asymgemm"):
             setattr(module.base, "profile_name", prefix)
             return module.base(x)
-        elif hasattr(module, "base_layer") and hasattr(module.base_layer, "profile_name"):
+    if hasattr(module, "base_layer") and hasattr(module.base_layer, "profile_name"):
+        with book.time(f"forward.{prefix}.base_frozen_asymgemm"):
             module.base_layer.profile_name = prefix
             return module.base_layer(x)
-        elif hasattr(module, "base_weight"):
-            return profiled_linear(x, module.base_weight, None, f"{prefix}.base_dx_asymgemm", book)
-        elif hasattr(module, "base_layer") and hasattr(module.base_layer, "weight"):
-            return profiled_linear(x, module.base_layer.weight, None, f"{prefix}.base_dx_asymgemm", book)
+    if hasattr(module, "base_weight"):
+        with book.time(f"forward.{prefix}.base_torch"):
+            return profiled_linear(x, module.base_weight, None, f"{prefix}.base_torch", book)
+    if hasattr(module, "base_layer") and hasattr(module.base_layer, "weight"):
+        with book.time(f"forward.{prefix}.base_torch"):
+            return profiled_linear(x, module.base_layer.weight, None, f"{prefix}.base_torch", book)
     raise TypeError(f"unsupported LoRA base layout for prefix={prefix!r}: {type(module).__name__}")
 
 
 def profiled_lora_linear(module: Any, x: torch.Tensor, prefix: str, book: StageBook) -> torch.Tensor:
     base = _profiled_lora_base(module, x, prefix, book)
     adapter = _lora_adapter_tensors(module, prefix)
+    lora_input = x.to(dtype=adapter.a.dtype)
     with book.time(f"forward.{prefix}.lora_A"):
-        low_rank = profiled_linear(x.float(), adapter.a, None, f"{prefix}.lora_A", book)
+        low_rank = profiled_linear(lora_input, adapter.a, None, f"{prefix}.lora_A", book)
     with book.time(f"forward.{prefix}.lora_B"):
         lora_raw = profiled_linear(low_rank, adapter.b, None, f"{prefix}.lora_B", book)
     with book.time(f"forward.{prefix}.add_cast_scale"):
@@ -1274,8 +1316,9 @@ def profile_mlp(args: argparse.Namespace, device: torch.device, dtype: torch.dty
     torch.manual_seed(0)
     w1 = torch.randn(hidden, in_features, dtype=dtype)
     w2 = torch.randn(out_features, hidden, dtype=dtype)
-    if args.backend == "torch_only":
-        model = TorchMLP(w1, w2, rank=rank, alpha=16.0, device=device, dtype=dtype)
+    lora_dtype = profile_lora_dtype(args)
+    if args.backend == "torch":
+        model = TorchMLP(w1, w2, rank=rank, alpha=16.0, device=device, dtype=dtype, lora_dtype=lora_dtype)
     else:
         model = AsymMLP(
             w1,
@@ -1286,6 +1329,7 @@ def profile_mlp(args: argparse.Namespace, device: torch.device, dtype: torch.dty
             stats=stats,
             device=device,
             dtype=dtype,
+            lora_dtype=lora_dtype,
             precision=args.precision,
         )
     optimizer = make_lora_optimizer(model, lora_parameters)
@@ -1325,7 +1369,14 @@ def profile_mlp(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         stats.as_dict(),
         forward_keys=mlp_lora_forward_keys(),
         backward_group_prefixes=mlp_lora_backward_prefixes(),
-        config={"tokens": tokens, "in_features": in_features, "hidden": hidden, "out_features": out_features, "rank": rank},
+        config={
+            "tokens": tokens,
+            "in_features": in_features,
+            "hidden": hidden,
+            "out_features": out_features,
+            "rank": rank,
+            "lora_dtype": str(lora_dtype),
+        },
         stage_memory=book.memory_summary(),
         memory_attribution=memory_attribution_report(model, optimizer, device, book.saved_tensor_tracker),
     )
@@ -1421,6 +1472,75 @@ def lora_hparams(args: argparse.Namespace) -> tuple[int, float]:
     return rank, alpha
 
 
+def parse_target_modules(value: str | None) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    modules = tuple(dict.fromkeys(part.strip() for part in value.split(",") if part.strip()))
+    return modules or None
+
+
+def _split_module_selector(value: str | None) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    return tuple(dict.fromkeys(part.strip().replace("-", "_") for part in normalized.split(",") if part.strip()))
+
+
+def dense_selector_names(selector: str | None, *, default: str, purpose: str) -> set[str]:
+    selectors = _split_module_selector(selector) or (default,)
+    names: set[str] = set()
+    for raw in selectors:
+        key = raw.lower().replace("-", "_")
+        if key in {"all", "default"}:
+            names.update(DENSE_ALL_PROJECTIONS)
+        elif key in {"attention", "attention_only"}:
+            names.update(DENSE_ATTENTION_PROJECTIONS)
+        elif key in {"mlp", "mlp_only"}:
+            names.update(DENSE_MLP_PROJECTIONS)
+        elif key == "none":
+            continue
+        else:
+            names.add(raw.rsplit(".", 1)[-1].replace("-", "_"))
+    invalid = sorted(names - set(DENSE_ALL_PROJECTIONS))
+    if invalid:
+        raise ValueError(f"unsupported dense {purpose} module suffixes {invalid}; expected entries from {DENSE_ALL_PROJECTIONS}")
+    return names
+
+
+def moe_selector_groups(selector: str | None, *, default: str, purpose: str) -> set[str]:
+    selectors = _split_module_selector(selector) or (default,)
+    groups: set[str] = set()
+    for raw in selectors:
+        key = raw.lower().replace("-", "_")
+        if key in {"all", "mlp", "experts", "expert_mlp", "default"}:
+            groups.update(("routed_experts", "shared_experts"))
+        elif key in {"routed", "routed_expert", "routed_experts"}:
+            groups.add("routed_experts")
+        elif key in {"shared", "shared_expert", "shared_experts"}:
+            groups.add("shared_experts")
+        elif key == "none":
+            continue
+        else:
+            raise ValueError(
+                f"unsupported MoE {purpose} selector {raw!r}; expected all, mlp, routed_experts, shared_experts, or none"
+            )
+    return groups
+
+
+def profile_lora_dtype(args: argparse.Namespace) -> torch.dtype:
+    from asym_gemm.training.lora import normalize_lora_dtype
+
+    return normalize_lora_dtype(getattr(args, "lora_dtype", "bf16"))
+
+
+def lora_config_with_dtype(args: argparse.Namespace, raw: dict[str, Any], *, rank: int, alpha: float) -> dict[str, Any]:
+    config = _lora_sft_config(raw, rank=rank, alpha=alpha)
+    config["lora_dtype"] = str(profile_lora_dtype(args))
+    return config
+
+
 def make_lora_optimizer(
     model: torch.nn.Module,
     lora_parameters_fn: Callable[[torch.nn.Module], list[torch.nn.Parameter]],
@@ -1498,8 +1618,9 @@ def profile_mm_lora(args: argparse.Namespace, device: torch.device, dtype: torch
     rank, alpha = lora_hparams(args)
     torch.manual_seed(101)
     weight = torch.randn(cfg["out_features"], cfg["in_features"], dtype=dtype)
-    if args.backend == "torch_only":
-        model = TorchLoRALinear(weight, rank=rank, alpha=alpha, device=device, dtype=dtype)
+    lora_dtype = profile_lora_dtype(args)
+    if args.backend == "torch":
+        model = TorchLoRALinear(weight, rank=rank, alpha=alpha, device=device, dtype=dtype, lora_dtype=lora_dtype)
     else:
         model = AsymLoRALinear(
             weight,
@@ -1509,6 +1630,7 @@ def profile_mm_lora(args: argparse.Namespace, device: torch.device, dtype: torch
             stats=stats,
             device=device,
             dtype=dtype,
+            lora_dtype=lora_dtype,
             precision=args.precision,
         )
     del weight
@@ -1521,7 +1643,7 @@ def profile_mm_lora(args: argparse.Namespace, device: torch.device, dtype: torch
         forward_fn_factory=make_matrix_lora_forward_fn,
         forward_keys=lora_forward_keys("matrix"),
         backward_group_prefixes=["backward.loss.mse", *lora_backward_prefixes("matrix")],
-        config=_lora_sft_config(cfg, rank=rank, alpha=alpha),
+        config=lora_config_with_dtype(args, cfg, rank=rank, alpha=alpha),
     )
 
 
@@ -1536,8 +1658,9 @@ def profile_mlp_lora(args: argparse.Namespace, device: torch.device, dtype: torc
     torch.manual_seed(202)
     w1 = torch.randn(cfg["hidden_features"], cfg["in_features"], dtype=dtype)
     w2 = torch.randn(cfg["out_features"], cfg["hidden_features"], dtype=dtype)
-    if args.backend == "torch_only":
-        model = TorchMLP(w1, w2, rank=rank, alpha=alpha, device=device, dtype=dtype)
+    lora_dtype = profile_lora_dtype(args)
+    if args.backend == "torch":
+        model = TorchMLP(w1, w2, rank=rank, alpha=alpha, device=device, dtype=dtype, lora_dtype=lora_dtype)
     else:
         model = AsymMLP(
             w1,
@@ -1548,6 +1671,7 @@ def profile_mlp_lora(args: argparse.Namespace, device: torch.device, dtype: torc
             stats=stats,
             device=device,
             dtype=dtype,
+            lora_dtype=lora_dtype,
             precision=args.precision,
         )
     del w1, w2
@@ -1561,7 +1685,7 @@ def profile_mlp_lora(args: argparse.Namespace, device: torch.device, dtype: torc
         forward_fn_factory=make_mlp_lora_forward_fn,
         forward_keys=mlp_lora_forward_keys(),
         backward_group_prefixes=mlp_lora_backward_prefixes(),
-        config=_lora_sft_config(cfg, rank=rank, alpha=alpha),
+        config=lora_config_with_dtype(args, cfg, rank=rank, alpha=alpha),
     )
 
 
@@ -1610,6 +1734,10 @@ def patch_dense_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
     def profiled_projection(module: Any, x: torch.Tensor, prefix: str) -> torch.Tensor:
         if hasattr(module, "lora_A") or hasattr(module, "lora_a"):
             return module(x)
+        if hasattr(module, "host_weight") and hasattr(module, "profile_name"):
+            module.profile_name = prefix
+            with book.time(f"forward.{prefix}.base_frozen_asymgemm"):
+                return module(x)
         weight = getattr(module, "weight", None)
         if isinstance(weight, torch.Tensor):
             with book.time(f"forward.{prefix}.base_torch"):
@@ -1707,33 +1835,85 @@ def patch_dense_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
     return originals
 
 
-def dense_projection_forward_keys(layer: str, scope: str, projections: tuple[str, ...], *, lora_targeted: bool) -> list[str]:
-    prefixes = tuple(f"{layer}.{scope}.{proj}" for proj in projections)
-    if lora_targeted:
-        return lora_forward_keys(*prefixes)
-    return [f"forward.{prefix}.base_torch" for prefix in prefixes]
+def dense_lora_forward_keys(prefix: str, *, offloaded: bool) -> list[str]:
+    base_op = "base_frozen_asymgemm" if offloaded else "base_torch"
+    return [
+        f"forward.{prefix}.{base_op}",
+        f"forward.{prefix}.lora_A",
+        f"forward.{prefix}.lora_B",
+        f"forward.{prefix}.add_cast_scale",
+    ]
 
 
-def dense_projection_backward_prefixes(layer: str, scope: str, projections: tuple[str, ...], *, lora_targeted: bool) -> list[str]:
-    prefixes = tuple(f"{layer}.{scope}.{proj}" for proj in projections)
-    if lora_targeted:
-        return lora_backward_prefixes(*prefixes)
-    return [f"backward.{prefix}.base_torch" for prefix in prefixes]
+def dense_lora_backward_prefixes(prefix: str, *, offloaded: bool) -> list[str]:
+    base_op = "base_dx_asymgemm" if offloaded else "base_torch"
+    return [
+        f"backward.{prefix}.{base_op}",
+        f"backward.{prefix}.base_lora_add",
+        f"backward.{prefix}.add_cast_scale",
+        f"backward.{prefix}.lora_B",
+        f"backward.{prefix}.lora_A",
+    ]
 
 
-def dense_forward_keys(num_layers: int, target_mode: str) -> list[str]:
+def dense_base_forward_key(prefix: str, *, offloaded: bool) -> str:
+    return f"forward.{prefix}.{'base_frozen_asymgemm' if offloaded else 'base_torch'}"
+
+
+def dense_base_backward_prefix(prefix: str, *, offloaded: bool) -> str:
+    return f"backward.{prefix}.{'base_dx_asymgemm' if offloaded else 'base_torch'}"
+
+
+def dense_projection_forward_keys(
+    layer: str,
+    scope: str,
+    projections: tuple[str, ...],
+    *,
+    target_names: set[str],
+    offload_names: set[str],
+) -> list[str]:
+    keys: list[str] = []
+    for projection in projections:
+        prefix = f"{layer}.{scope}.{projection}"
+        offloaded = projection in offload_names
+        if projection in target_names:
+            keys.extend(dense_lora_forward_keys(prefix, offloaded=offloaded))
+        else:
+            keys.append(dense_base_forward_key(prefix, offloaded=offloaded))
+    return keys
+
+
+def dense_projection_backward_prefixes(
+    layer: str,
+    scope: str,
+    projections: tuple[str, ...],
+    *,
+    target_names: set[str],
+    offload_names: set[str],
+) -> list[str]:
+    keys: list[str] = []
+    for projection in projections:
+        prefix = f"{layer}.{scope}.{projection}"
+        offloaded = projection in offload_names
+        if projection in target_names:
+            keys.extend(dense_lora_backward_prefixes(prefix, offloaded=offloaded))
+        else:
+            keys.append(dense_base_backward_prefix(prefix, offloaded=offloaded))
+    return keys
+
+
+def dense_forward_keys(num_layers: int, target_names: set[str], offload_names: set[str]) -> list[str]:
     keys = ["forward.embeddings"]
     for layer_idx in range(num_layers):
         layer = f"layers.{layer_idx}"
-        attention_is_targeted = dense_targets_attention(target_mode)
-        mlp_is_targeted = dense_targets_mlp(target_mode)
         keys.append(f"forward.{layer}.attention.layernorm")
         keys.extend(
             dense_projection_forward_keys(
                 layer,
                 "attention",
                 DENSE_ATTENTION_PROJECTIONS[:3],
-                lora_targeted=attention_is_targeted,
+                target_names=target_names,
+                offload_names=offload_names,
             )
         )
         keys.extend(
@@ -1749,7 +1929,8 @@ def dense_forward_keys(num_layers: int, target_mode: str) -> list[str]:
                 layer,
                 "attention",
                 DENSE_ATTENTION_PROJECTIONS[3:],
-                lora_targeted=attention_is_targeted,
+                target_names=target_names,
+                offload_names=offload_names,
             )
         )
         keys.append(f"forward.{layer}.attention.residual_add")
@@ -1759,7 +1940,8 @@ def dense_forward_keys(num_layers: int, target_mode: str) -> list[str]:
                 layer,
                 "mlp",
                 DENSE_MLP_PROJECTIONS[:2],
-                lora_targeted=mlp_is_targeted,
+                target_names=target_names,
+                offload_names=offload_names,
             )
         )
         keys.append(f"forward.{layer}.mlp.silu_mul_activation")
@@ -1768,7 +1950,8 @@ def dense_forward_keys(num_layers: int, target_mode: str) -> list[str]:
                 layer,
                 "mlp",
                 DENSE_MLP_PROJECTIONS[2:],
-                lora_targeted=mlp_is_targeted,
+                target_names=target_names,
+                offload_names=offload_names,
             )
         )
         keys.append(f"forward.{layer}.mlp.residual_add")
@@ -1776,7 +1959,7 @@ def dense_forward_keys(num_layers: int, target_mode: str) -> list[str]:
     return keys
 
 
-def dense_backward_prefixes(num_layers: int, target_mode: str) -> list[str]:
+def dense_backward_prefixes(num_layers: int, target_names: set[str], offload_names: set[str]) -> list[str]:
     keys = ["backward.loss.cross_entropy", "backward.lm_head", "backward.final_norm"]
     for layer_idx in reversed(range(num_layers)):
         layer = f"layers.{layer_idx}"
@@ -1787,14 +1970,16 @@ def dense_backward_prefixes(num_layers: int, target_mode: str) -> list[str]:
                     layer,
                     "mlp",
                     ("down_proj",),
-                    lora_targeted=dense_targets_mlp(target_mode),
+                    target_names=target_names,
+                    offload_names=offload_names,
                 ),
                 f"backward.{layer}.mlp.silu_mul_activation",
                 *dense_projection_backward_prefixes(
                     layer,
                     "mlp",
                     ("up_proj", "gate_proj"),
-                    lora_targeted=dense_targets_mlp(target_mode),
+                    target_names=target_names,
+                    offload_names=offload_names,
                 ),
                 f"backward.{layer}.mlp.layernorm",
                 f"backward.{layer}.attention.residual_add",
@@ -1802,7 +1987,8 @@ def dense_backward_prefixes(num_layers: int, target_mode: str) -> list[str]:
                     layer,
                     "attention",
                     ("o_proj",),
-                    lora_targeted=dense_targets_attention(target_mode),
+                    target_names=target_names,
+                    offload_names=offload_names,
                 ),
                 f"backward.{layer}.attention.value_matmul",
                 f"backward.{layer}.attention.softmax",
@@ -1811,7 +1997,8 @@ def dense_backward_prefixes(num_layers: int, target_mode: str) -> list[str]:
                     layer,
                     "attention",
                     ("v_proj", "k_proj", "q_proj"),
-                    lora_targeted=dense_targets_attention(target_mode),
+                    target_names=target_names,
+                    offload_names=offload_names,
                 ),
                 f"backward.{layer}.attention.layernorm",
             ]
@@ -1841,32 +2028,48 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
         )
     workload_name = str(getattr(args, "_workload_name_override", "m4_2_dense_llm"))
     config_extra = dict(getattr(args, "_config_extra", {}))
-    target_mode = str(getattr(args, "dense_target_mode", DEFAULT_DENSE_TARGET_MODE))
+    target_mode = str(getattr(args, "target_preset", getattr(args, "dense_target_mode", DEFAULT_DENSE_TARGET_MODE)))
     if target_mode not in DENSE_TARGET_MODES:
-        raise ValueError(f"dense_target_mode={target_mode!r} must be one of {DENSE_TARGET_MODES}")
+        raise ValueError(f"target_preset={target_mode!r} must be one of {DENSE_TARGET_MODES}")
+    target_selector = str(getattr(args, "target_modules", DEFAULT_TARGET_MODULES) or DEFAULT_TARGET_MODULES)
+    offload_selector = str(getattr(args, "offload_modules", DEFAULT_DENSE_OFFLOAD_MODULES) or DEFAULT_DENSE_OFFLOAD_MODULES)
+    target_names = dense_selector_names(target_selector, default=target_mode, purpose="target")
+    offload_names = dense_selector_names(offload_selector, default=DEFAULT_DENSE_OFFLOAD_MODULES, purpose="offload")
+    lora_dtype = profile_lora_dtype(args)
     config_extra["target_mode"] = target_mode
-    config_extra["dense_offload_scope"] = "mlp_base_projections_only" if target_mode == "mlp_only" else target_mode
+    config_extra["target_preset"] = target_mode
+    config_extra["target_modules"] = target_selector
+    config_extra["offload_modules"] = offload_selector
+    config_extra["lora_dtype"] = str(lora_dtype)
+    config_extra["dense_target_names"] = sorted(target_names)
+    config_extra["dense_offload_names"] = sorted(offload_names)
+    config_extra["dense_offload_scope"] = offload_selector
     stats = AsymExecutionStats()
     weights = make_tiny_dense_weights(config, seed=1, dtype=dtype)
-    if args.backend == "torch_only":
+    if args.backend == "torch":
         model = TorchTinyDenseLLM(
             weights,
             config=config,
             target_mode=target_mode,
+            target_modules=target_selector,
             device=device,
             dtype=dtype,
             lora_seed=2,
+            lora_dtype=lora_dtype,
         )
     else:
         model = AsymTinyDenseLLM(
             weights,
             config=config,
             target_mode=target_mode,
+            target_modules=target_selector,
+            offload_modules=offload_selector,
             backend=args.backend,
             stats=stats,
             device=device,
             dtype=dtype,
             lora_seed=2,
+            lora_dtype=lora_dtype,
             precision=args.precision,
         )
     set_profile_names(model)
@@ -1898,8 +2101,8 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
         device,
         avg,
         stats.as_dict(),
-        forward_keys=dense_forward_keys(config.num_layers, target_mode),
-        backward_group_prefixes=dense_backward_prefixes(config.num_layers, target_mode),
+        forward_keys=dense_forward_keys(config.num_layers, target_names, offload_names),
+        backward_group_prefixes=dense_backward_prefixes(config.num_layers, target_names, offload_names),
         config={**asdict(config), **config_extra},
         stage_memory=book.memory_summary(),
         memory_attribution=memory_attribution_report(model, optimizer, device, book.saved_tensor_tracker),
@@ -1945,8 +2148,6 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
     originals.append((moe.TinySelfAttention, "forward", original_attn))
     moe.TinySelfAttention.forward = timed_attn
 
-    original_layer_forward = moe.AsymTinyMoELayer.forward
-
     def timed_layer_forward(self: Any, x: torch.Tensor, *, static_routing: Any = None, mode: str = "contiguous", return_details: bool = False) -> Any:
         residual = x
         with book.time("forward.attention.layernorm"):
@@ -1963,8 +2164,9 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
             return next_x
         return next_x, details
 
-    originals.append((moe.AsymTinyMoELayer, "forward", original_layer_forward))
-    moe.AsymTinyMoELayer.forward = timed_layer_forward
+    for layer_cls in (moe.AsymTinyMoELayer, moe.TorchTinyMoELayer, moe.KTTinyMoELayer):
+        originals.append((layer_cls, "forward", layer_cls.forward))
+        layer_cls.forward = timed_layer_forward
 
     original_run_moe = moe.AsymTinyMoELayer._run_moe
 
@@ -2003,6 +2205,32 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
 
     originals.append((moe.AsymTinyMoELayer, "_run_moe", original_run_moe))
     moe.AsymTinyMoELayer._run_moe = timed_run_moe
+
+    original_kt_run_moe = moe.KTTinyMoELayer._run_moe
+
+    def timed_kt_run_moe(self: Any, x: torch.Tensor, *, static_routing: Any, mode: str) -> tuple[torch.Tensor, dict[str, Any]]:
+        if mode != "contiguous":
+            raise ValueError("backend=kt only supports moe_mode=contiguous")
+        input_shape = x.shape
+        with book.time("forward.moe.flatten"):
+            flat = x.reshape(-1, self.config.hidden_size)
+        with book.time("forward.router"):
+            (topk_indices, routing_weights), logits = self._route(flat, static_routing)
+        with book.time("forward.route_metadata"):
+            metadata = moe.build_route_metadata(topk_indices, routing_weights, num_experts=self.config.num_experts, mode=mode)
+        with book.time("forward.kt_moe.forward_sft"):
+            routed_out = self.kt_moe(flat.contiguous(), topk_indices, routing_weights)
+        with book.time("forward.moe.combine_shared_routed"):
+            moe_out = routed_out
+        return moe_out.reshape(input_shape), {
+            "metadata": metadata,
+            "logits": logits,
+            "topk_indices": topk_indices,
+            "routing_weights": routing_weights,
+        }
+
+    originals.append((moe.KTTinyMoELayer, "_run_moe", original_kt_run_moe))
+    moe.KTTinyMoELayer._run_moe = timed_kt_run_moe
 
     original_model_forward = moe.TinyMoE.forward
 
@@ -2049,6 +2277,7 @@ def moe_forward_keys(config: Any) -> list[str]:
         "forward.moe.flatten",
         "forward.router",
         "forward.route_metadata",
+        "forward.kt_moe.forward_sft",
         "forward.pack_tokens",
         "forward.routed_expert.grouped",
         "forward.scatter_combine",
@@ -2070,6 +2299,7 @@ def moe_backward_prefixes(config: Any) -> list[str]:
         "backward.pack_tokens",
         "backward.route_metadata",
         "backward.router",
+        "backward.kt_moe.backward_sft",
     ]
     keys.extend(
         [
@@ -2107,8 +2337,30 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
             lora_rank=int(args.real_lora_rank),
             lora_alpha=float(args.real_lora_alpha),
         )
+    if int(config.num_shared_experts) != 0:
+        config = replace(config, num_shared_experts=0)
+        config_extra_shared_note = "forced_zero_for_kt_comparison"
+    else:
+        config_extra_shared_note = "already_zero"
     workload_name = str(getattr(args, "_workload_name_override", "m4_3_moe"))
     config_extra = dict(getattr(args, "_config_extra", {}))
+    lora_dtype = profile_lora_dtype(args)
+    target_selector = str(getattr(args, "target_modules", DEFAULT_TARGET_MODULES) or DEFAULT_TARGET_MODULES)
+    offload_selector = str(getattr(args, "offload_modules", DEFAULT_MOE_OFFLOAD_MODULES) or DEFAULT_MOE_OFFLOAD_MODULES)
+    target_groups = moe_selector_groups(target_selector, default=DEFAULT_TARGET_MODULES, purpose="target")
+    if target_groups != {"routed_experts", "shared_experts"}:
+        raise ValueError("toy MoE target_modules currently supports all/mlp only; use offload_modules for routed/shared CPU placement")
+    config_extra["lora_dtype"] = str(lora_dtype)
+    config_extra["target_modules"] = target_selector
+    config_extra["offload_modules"] = offload_selector
+    config_extra["shared_expert_policy"] = config_extra_shared_note
+    if is_kt_backend(args.backend):
+        config_extra["kt_method"] = args.kt_method
+        config_extra["kt_cpu_threads"] = int(args.kt_cpu_threads)
+        config_extra["kt_threadpool_count"] = int(args.kt_threadpool_count)
+        config_extra["kt_max_cache_depth"] = int(args.kt_max_cache_depth)
+    config_extra["moe_target_groups"] = sorted(target_groups)
+    config_extra["moe_offload_groups"] = sorted(moe_selector_groups(offload_selector, default=DEFAULT_MOE_OFFLOAD_MODULES, purpose="offload"))
     model, _, _, stats = make_tiny_moe_pair(
         config=config,
         seed=3,
@@ -2116,10 +2368,19 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         base_dtype=dtype,
         backend=args.backend,
         pin_memory=device.type == "cuda",
+        offload_modules=offload_selector,
+        lora_dtype=lora_dtype,
         precision=args.precision,
+        kt_method=args.kt_method,
+        kt_cpu_threads=args.kt_cpu_threads,
+        kt_threadpool_count=args.kt_threadpool_count,
+        kt_max_cache_depth=args.kt_max_cache_depth,
     )
     set_profile_names(model)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3, weight_decay=0.0)
+    optimizer_params = model.kt_lora_parameters() if is_kt_backend(args.backend) else list(model.parameters())
+    if not optimizer_params:
+        raise RuntimeError("optimizer parameter list is empty")
+    optimizer = torch.optim.AdamW(optimizer_params, lr=5e-3, weight_decay=0.0)
     static_routes = make_static_routes(config, device, pattern="balanced")
 
     def make_batch() -> tuple[torch.Tensor, torch.Tensor]:
@@ -2166,6 +2427,12 @@ def run_profile_steps(
     args: argparse.Namespace,
     reset_stats: Callable[[], None] | None = None,
 ) -> None:
+    def post_optimizer_step() -> None:
+        hook = getattr(model, "post_optimizer_step", None)
+        if callable(hook) and getattr(model, "backend", None) == "kt":
+            with book.time("optimizer.kt_lora_update"):
+                hook()
+
     with profile_enabled(True):
         for _ in range(args.warmup_steps):
             optimizer.zero_grad(set_to_none=True)
@@ -2173,6 +2440,7 @@ def run_profile_steps(
             loss = loss_fn(forward_fn(model, batch), target)
             loss.backward()
             optimizer.step()
+            post_optimizer_step()
             sync(book.device)
         if reset_stats is not None:
             reset_stats()
@@ -2201,6 +2469,7 @@ def run_profile_steps(
                         loss.backward()
                     with book.time("step.optimizer"):
                         optimizer.step()
+                        post_optimizer_step()
                     sync(book.device)
                     book.flush()
 
@@ -2493,20 +2762,20 @@ def moe_config_from_metadata(metadata: dict[str, Any], args: argparse.Namespace)
     )
 
 
-def qwen3_14b_dense_config(args: argparse.Namespace) -> Any:
-    return dense_config_from_metadata(QWEN3_14B_CONFIG, args)
+def dense_14b_config(args: argparse.Namespace) -> Any:
+    return dense_config_from_metadata(DENSE_14B_CONFIG, args)
 
 
 def custom_dense_3b_config(args: argparse.Namespace) -> Any:
     return dense_config_from_metadata(CUSTOM_DENSE_3B_CONFIG, args)
 
 
-def qwen3_30b_a3b_moe_config(args: argparse.Namespace) -> Any:
-    return moe_config_from_metadata(QWEN3_30B_A3B_CONFIG, args)
+def moe_604m_a38m_config(args: argparse.Namespace) -> Any:
+    return moe_config_from_metadata(MOE_604M_A38M_CONFIG, args)
 
 
-def custom_moe_3b_config(args: argparse.Namespace) -> Any:
-    return moe_config_from_metadata(CUSTOM_MOE_3B_CONFIG, args)
+def moe_604m_a75m_config(args: argparse.Namespace) -> Any:
+    return moe_config_from_metadata(MOE_604M_A75M_CONFIG, args)
 
 
 def _metadata_config_extra(metadata: dict[str, Any], profiled_layers: int) -> dict[str, Any]:
@@ -2548,6 +2817,7 @@ def profile_moe_metadata_workload(
 
 
 def run_workload(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
+    validate_backend_workload(args)
     simple_workloads: dict[str, Callable[[argparse.Namespace, torch.device, torch.dtype], dict[str, Any]]] = {
         "mlp": profile_mlp,
         "dense": profile_dense,
@@ -2563,7 +2833,7 @@ def run_workload(args: argparse.Namespace, device: torch.device, dtype: torch.dt
 
     dense_metadata_workloads = {
         "dense_3b": CUSTOM_DENSE_3B_CONFIG,
-        "qwen3_14b": QWEN3_14B_CONFIG,
+        "dense_14b": DENSE_14B_CONFIG,
     }
     if args.workload in dense_metadata_workloads:
         return profile_dense_metadata_workload(
@@ -2575,8 +2845,8 @@ def run_workload(args: argparse.Namespace, device: torch.device, dtype: torch.dt
         )
 
     moe_metadata_workloads = {
-        "moe_3b": CUSTOM_MOE_3B_CONFIG,
-        "qwen3_30b_a3b": QWEN3_30B_A3B_CONFIG,
+        "moe-604m-a75m": MOE_604M_A75M_CONFIG,
+        "moe-604m-a38m": MOE_604M_A38M_CONFIG,
     }
     if args.workload in moe_metadata_workloads:
         return profile_moe_metadata_workload(
@@ -2597,15 +2867,27 @@ def parse_args() -> argparse.Namespace:
         default="mlp",
     )
     parser.add_argument("--device", default="cuda:1")
-    parser.add_argument("--backend", choices=["asym_only", "asym_or_staged", "asym_or_torch", "torch_only"], default="asym_only")
+    parser.add_argument("--backend", choices=BACKEND_CHOICES, default="asym")
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measure-steps", type=int, default=20)
     parser.add_argument("--moe-mode", choices=["contiguous", "masked"], default="contiguous")
     parser.add_argument(
+        "--target-preset",
         "--dense-target-mode",
+        dest="target_preset",
         choices=DENSE_TARGET_MODES,
         default=DEFAULT_DENSE_TARGET_MODE,
-        help="Dense-model LoRA/AsymGEMM target scope. Default keeps dense comparable to MoE by offloading only MLP base projections.",
+        help="LoRA target preset for toy/HF-style projections. Default adapts all known target projections.",
+    )
+    parser.add_argument(
+        "--target-modules",
+        default=DEFAULT_TARGET_MODULES,
+        help="Target module selector or comma list. Examples: all, mlp, attention, q_proj,v_proj.",
+    )
+    parser.add_argument(
+        "--offload-modules",
+        default=None,
+        help="CPU/AsymGEMM base offload selector or comma list. Dense default is mlp; MoE default is routed_experts.",
     )
     parser.add_argument("--profile-layers", "--real-profile-layers", dest="real_profile_layers", metavar="N", type=int, default=1)
     parser.add_argument("--batch-size", "--real-batch-size", dest="real_batch_size", metavar="N", type=int, default=DEFAULT_LORA_BATCH_SIZE)
@@ -2640,8 +2922,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lora-rank", "--real-lora-rank", dest="real_lora_rank", metavar="N", type=int, default=64)
     parser.add_argument("--lora-alpha", "--real-lora-alpha", dest="real_lora_alpha", metavar="FLOAT", type=float, default=128.0)
+    parser.add_argument("--lora-dtype", choices=LORA_DTYPE_CHOICES, default="bf16")
     parser.add_argument("--vocab-rows", "--real-vocab-rows", dest="real_vocab_rows", metavar="N", type=int, default=4096)
     parser.add_argument("--precision", default="bf16", choices=["bf16", "fp8", "fp4"])
+    parser.add_argument("--kt-method", default="AMXBF16_SFT", choices=KT_METHOD_CHOICES)
+    parser.add_argument("--kt-cpu-threads", type=int, default=0, help="KT CPUInfer threads. 0 selects all available CPUs.")
+    parser.add_argument("--kt-threadpool-count", type=int, default=1)
+    parser.add_argument("--kt-max-cache-depth", type=int, default=1)
     parser.add_argument("--output-dir", type=Path, default=Path("reports"))
     parser.add_argument("--export-torch-trace", action="store_true", help="Export a PyTorch profiler Chrome trace for the measured run")
     parser.add_argument(
@@ -2662,7 +2949,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable saved-tensor hooks for fine-grained activation memory attribution. This is memory-only and should not be used for timing claims.",
     )
-    return parser.parse_args()
+    parsed = parser.parse_args()
+    parsed.dense_target_mode = parsed.target_preset
+    try:
+        validate_backend_workload(parsed)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return parsed
 
 
 def main() -> None:
@@ -2675,23 +2968,26 @@ def main() -> None:
     def run() -> dict[str, Any]:
         return run_workload(args, device, dtype)
 
-    if args.export_torch_trace:
-        activities = [ProfilerActivity.CPU]
-        if device.type == "cuda":
-            activities.append(ProfilerActivity.CUDA)
-        with profile(
-            activities=activities,
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=args.torch_profiler_with_stack,
-            with_modules=True,
-        ) as prof:
+    try:
+        if args.export_torch_trace:
+            activities = [ProfilerActivity.CPU]
+            if device.type == "cuda":
+                activities.append(ProfilerActivity.CUDA)
+            with profile(
+                activities=activities,
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=args.torch_profiler_with_stack,
+                with_modules=True,
+            ) as prof:
+                report = run()
+            report["torch_profiler_backward"] = profiler_backward_table(prof, profiled_steps=args.warmup_steps + args.measure_steps)
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+            prof.export_chrome_trace(str(args.output_dir / f"{report['workload']}_torch_trace.json"))
+        else:
             report = run()
-        report["torch_profiler_backward"] = profiler_backward_table(prof, profiled_steps=args.warmup_steps + args.measure_steps)
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        prof.export_chrome_trace(str(args.output_dir / f"{report['workload']}_torch_trace.json"))
-    else:
-        report = run()
+    except KTBackendUnavailable as exc:
+        raise SystemExit(str(exc)) from None
     write_report(report, args.output_dir)
     print(json.dumps({"workload": report["workload"], "step_ms": report["step"]["total_milliseconds"]}, indent=2))
 

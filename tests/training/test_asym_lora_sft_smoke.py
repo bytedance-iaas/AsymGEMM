@@ -157,12 +157,12 @@ def test_sm90_bf16_m_grouped_contiguous_forward_smoke() -> None:
     torch.testing.assert_close(d, expected, rtol=0, atol=0)
 
 
-def test_m0_docs_exist() -> None:
+def test_lora_sft_agent_notes_exist() -> None:
     root = Path(__file__).resolve().parents[2]
-    current_state = root / "agent" / "current_state.md"
-    decisions = root / "agent" / "decisions.md"
+    instructions = root / "agent" / "instructions.md"
+    action_items = root / "agent" / "action_items.md"
 
-    assert current_state.exists()
-    assert decisions.exists()
-    assert "H200" in current_state.read_text(encoding="utf-8")
-    assert "BF16 m-grouped contiguous" in decisions.read_text(encoding="utf-8")
+    assert instructions.exists()
+    assert action_items.exists()
+    assert "LoRA/SFT Precision Integration Plan" in instructions.read_text(encoding="utf-8")
+    assert "Unified Toy/HF Asym LoRA Integration" in action_items.read_text(encoding="utf-8")

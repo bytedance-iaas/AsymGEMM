@@ -7,13 +7,15 @@ set -Eeuo pipefail
 # Edit this section for the default run. CLI flags override these values.
 
 USER_GPU_POOL=(0 1 2 3)
-# USER_WORKLOADS=(mlp_3b mm_3b dense_3b moe_3b mlp dense moe qwen3_14b qwen3_30b_a3b)
-# USER_WORKLOADS=(dense_3b moe_3b)
-# USER_WORKLOADS=(mlp_3b mm_3b dense_3b moe_3b)
-USER_WORKLOADS=(qwen3_14b qwen3_30b_a3b)
+# Per-workload layers can be set as "workload|layers", for example "moe-604m-a75m|2".
+# Dense workload names are total-model labels; MoE workload names are per-layer routed-expert total/active labels.
+# USER_WORKLOADS=(mlp_3b mm_3b dense_3b moe-604m-a75m mlp dense moe dense_14b moe-604m-a38m)
+# USER_WORKLOADS=(dense_3b "moe-604m-a75m|2")
+# USER_WORKLOADS=(mlp_3b mm_3b dense_3b "moe-604m-a75m|4")
+USER_WORKLOADS=("moe-604m-a38m|1")
 # USER_WORKLOADS=(mlp dense moe)
-USER_BACKENDS=(asym_only torch_only)
-# USER_BACKENDS=(torch_only)
+USER_BACKENDS=(asym torch)
+# USER_BACKENDS=(torch)
 # USER_PROFILERS=(nsys cpu)
 USER_PROFILERS=(nsys)
 
@@ -21,7 +23,6 @@ USER_JOBS_PER_GPU=1
 USER_OUTPUT_ROOT="profiling"
 USER_RUN_NAME=""
 USER_PRECISION="bf16"
-USER_WORKFLOW="lora_sft"
 USER_MODE="auto"
 
 USER_WARMUP_STEPS=5
@@ -38,11 +39,16 @@ USER_VOCAB_ROWS=4096
 USER_MOE_MODE="contiguous"
 USER_DENSE_TARGET_MODE="mlp_only"
 
+USER_KT_METHOD="AMXBF16_SFT"
+USER_KT_CPU_THREADS=1
+USER_KT_THREADPOOL_COUNT=1
+USER_KT_MAX_CACHE_DEPTH=1
+
 USER_NSYS_BIN="nsys"
 USER_NCU_BIN="ncu"
 USER_NCU_PRESET="paper"
 USER_NCU_CLEAR_JIT_CACHE=0
-USER_PYTHON_BIN="python3"
+USER_PYTHON_BIN="${USER_PYTHON_BIN:-${PYTHON:-python3}}"
 
 # =============================================================================
 # Derived Parameters
@@ -66,6 +72,10 @@ DRIVER_ARGS=(
   --vocab-rows "${USER_VOCAB_ROWS}"
   --moe-mode "${USER_MOE_MODE}"
   --dense-target-mode "${USER_DENSE_TARGET_MODE}"
+  --kt-method "${USER_KT_METHOD}"
+  --kt-cpu-threads "${USER_KT_CPU_THREADS}"
+  --kt-threadpool-count "${USER_KT_THREADPOOL_COUNT}"
+  --kt-max-cache-depth "${USER_KT_MAX_CACHE_DEPTH}"
   --nsys-bin "${USER_NSYS_BIN}"
   --ncu-bin "${USER_NCU_BIN}"
   --ncu-preset "${USER_NCU_PRESET}"
@@ -90,6 +100,8 @@ Required:
 
 Shell-only options:
   --jobs-per-gpu N                    Concurrent Python driver jobs per GPU. Default: ${USER_JOBS_PER_GPU}.
+  --python-bin PATH                   Python interpreter used for the driver and profiled child process.
+                                      Default: USER_PYTHON_BIN, PYTHON, then python3.
   -h, --help                          Show this help.
 
 Default run matrix:
@@ -99,7 +111,7 @@ Default run matrix:
 
 Common options:
   Defaults are defined at the top of this script and can be overridden with
-  flags such as --precision, --workflow, --mode, and --output-root.
+  flags such as --precision, --mode, and --output-root.
 
 The shell launches one background Python driver job per workload/backend pair,
 assigns each job one GPU from the pool, waits for all jobs, and traps
@@ -128,11 +140,23 @@ dedupe_lines() {
 expand_workloads() {
   local item
   for item in "$@"; do
-    case "${item}" in
-      toy) printf '%s\n' mlp dense moe ;;
-      custom3b) printf '%s\n' dense_3b moe_3b ;;
-      qwen) printf '%s\n' qwen3_14b qwen3_30b_a3b ;;
-      all) printf '%s\n' mlp_1b mlp_3b mm_1b mm_3b dense_3b moe_3b mlp dense moe qwen3_14b qwen3_30b_a3b ;;
+    local base="${item}"
+    local suffix=""
+    if [[ "${item}" == *"|"* ]]; then
+      base="${item%%|*}"
+      suffix="|${item#*|}"
+    fi
+    case "${base}" in
+      toy) printf '%s\n' "mlp${suffix}" "dense${suffix}" "moe${suffix}" ;;
+      custom3b) printf '%s\n' "dense_3b${suffix}" "moe-604m-a75m${suffix}" ;;
+      qwen) printf '%s\n' "dense_14b${suffix}" "moe-604m-a38m${suffix}" ;;
+      all)
+        printf '%s\n' \
+          "mlp_1b${suffix}" "mlp_3b${suffix}" "mm_1b${suffix}" "mm_3b${suffix}" \
+          "dense_3b${suffix}" "dense_14b${suffix}" \
+          "moe-604m-a75m${suffix}" "moe-604m-a38m${suffix}" \
+          "mlp${suffix}" "dense${suffix}" "moe${suffix}"
+        ;;
       *) printf '%s\n' "${item}" ;;
     esac
   done
@@ -142,7 +166,7 @@ expand_backends() {
   local item
   for item in "$@"; do
     case "${item}" in
-      all) printf '%s\n' asym_only torch_only ;;
+      all) printf '%s\n' asym torch kt ;;
       *) printf '%s\n' "${item}" ;;
     esac
   done
@@ -167,6 +191,44 @@ abs_path() {
     /*) printf '%s\n' "$1" ;;
     *) printf '%s\n' "${ROOT}/$1" ;;
   esac
+}
+
+preflight_python() {
+  local python_bin="$1"
+  local python_executable
+  local python_report
+
+  if ! python_executable="$("${python_bin}" -c 'import sys; print(sys.executable)' 2>&1)"; then
+    echo "error: python interpreter failed: ${python_bin}" >&2
+    echo "${python_executable}" >&2
+    echo "hint: pass --python-bin /path/to/python or set PYTHON=/path/to/python." >&2
+    exit 2
+  fi
+  USER_PYTHON_BIN="${python_executable%%$'\n'*}"
+
+  if ((dry_run_requested)); then
+    echo "Using Python: ${USER_PYTHON_BIN}"
+    return
+  fi
+
+  if ! python_report="$("${USER_PYTHON_BIN}" - <<'PY' 2>&1
+import sys
+
+try:
+    import torch
+except Exception as exc:
+    print(f"{exc.__class__.__name__}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+print(f"{sys.executable} torch={getattr(torch, '__version__', 'unknown')}")
+PY
+)"; then
+    echo "error: ${USER_PYTHON_BIN} cannot import torch; profiling would fail inside nsys." >&2
+    echo "${python_report}" >&2
+    echo "hint: pass --python-bin /path/to/python from the environment where torch is installed." >&2
+    exit 2
+  fi
+  echo "Using Python: ${python_report}"
 }
 
 kill_tree() {
@@ -196,8 +258,8 @@ jobs_per_gpu="${USER_JOBS_PER_GPU}"
 output_root="${USER_OUTPUT_ROOT}"
 run_name="${USER_RUN_NAME}"
 precision="${USER_PRECISION}"
-workflow="${USER_WORKFLOW}"
 mode="${USER_MODE}"
+dry_run_requested=0
 
 while (($#)); do
   case "$1" in
@@ -241,6 +303,10 @@ while (($#)); do
       jobs_per_gpu="$2"
       shift 2
       ;;
+    --python-bin)
+      USER_PYTHON_BIN="$2"
+      shift 2
+      ;;
     --output-root)
       output_root="$2"
       shift 2
@@ -251,10 +317,6 @@ while (($#)); do
       ;;
     --precision)
       precision="$2"
-      shift 2
-      ;;
-    --workflow)
-      workflow="$2"
       shift 2
       ;;
     --mode)
@@ -273,6 +335,13 @@ while (($#)); do
   esac
 done
 
+for arg in "${pass_args[@]}"; do
+  if [[ "${arg}" == "--dry-run" ]]; then
+    dry_run_requested=1
+    break
+  fi
+done
+
 if ((${#gpu_values[@]} == 0)); then
   echo "error: specify a GPU pool with --gpus 2,3 or --gpu-pool 2 3" >&2
   exit 2
@@ -282,6 +351,8 @@ if ! [[ "${jobs_per_gpu}" =~ ^[0-9]+$ ]] || ((jobs_per_gpu < 1)); then
   echo "error: --jobs-per-gpu must be a positive integer" >&2
   exit 2
 fi
+
+preflight_python "${USER_PYTHON_BIN}"
 
 mapfile -t gpus < <(split_values "${gpu_values[@]}" | dedupe_lines)
 if ((${#gpus[@]} == 0)); then
@@ -302,7 +373,7 @@ run_root="$(abs_path "${output_root}")"
 [[ -n "${run_name}" ]] && run_root="${run_root}/${run_name}"
 log_dir="${run_root}/driver_logs"
 mkdir -p "${log_dir}"
-manifest="${log_dir}/$(safe_label "${precision}_${workflow}")_jobs.tsv"
+manifest="${log_dir}/$(safe_label "${precision}_lora_sft").tsv"
 printf 'status\tpid\tgpu\tworkload\tbackend\tlog\n' > "${manifest}"
 
 declare -a all_pids=()
@@ -388,7 +459,7 @@ launch_job() {
   local backend="$2"
   local gpu="$3"
   local label
-  label="$(safe_label "${precision}_${workflow}_${workload}_${backend}_gpu${gpu}")"
+  label="$(safe_label "${precision}_lora_sft_${workload}_${backend}_gpu${gpu}")"
   local log_file="${log_dir}/${label}.log"
   local cmd=(
     "${USER_PYTHON_BIN}" "${PY_DRIVER}"
@@ -398,7 +469,6 @@ launch_job() {
     --cuda-devices "${gpu}"
     --output-root "${output_root}"
     --precision "${precision}"
-    --workflow "${workflow}"
     --mode "${mode}"
     --skip-summary
     "${DRIVER_ARGS[@]}"
@@ -444,6 +514,11 @@ if ((failures > 0)); then
   exit 1
 fi
 
+if ((dry_run_requested)); then
+  echo "Dry run completed; skipping aggregate summary collection."
+  exit 0
+fi
+
 summary_cmd=(
   "${USER_PYTHON_BIN}" "${PY_DRIVER}"
   --workloads "${workloads[@]}"
@@ -451,7 +526,6 @@ summary_cmd=(
   --profilers "${profilers[@]}"
   --output-root "${output_root}"
   --precision "${precision}"
-  --workflow "${workflow}"
   --mode "${mode}"
   --collect-existing
   "${DRIVER_ARGS[@]}"

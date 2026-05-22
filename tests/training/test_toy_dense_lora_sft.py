@@ -22,6 +22,16 @@ def _direct_bf16_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] in {9, 10}
 
 
+def _placement_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _is_on_device(tensor: torch.Tensor, device: torch.device) -> bool:
+    if tensor.device.type != device.type:
+        return False
+    return device.index is None or tensor.device.index == device.index
+
+
 def _fmt_mib(value: int | float) -> str:
     return f"{float(value) / (1024 ** 2):.3f} MiB"
 
@@ -64,8 +74,9 @@ def test_tiny_dense_llm_showcase_config_is_few_hundred_million_params() -> None:
     assert config == SHOWCASE_DENSE_LLM_CONFIG
     assert config.lora_rank == 128
     assert counts["total_model_elements"] == 357_098_496
-    assert counts["cpu_resident_target_elements"] == 226_492_416
+    assert counts["cpu_resident_target_elements"] == 150_994_944
     assert counts["trainable_lora_elements"] == 29_884_416
+    assert set(counts["offload_modules"].split(",")) == {"gate_proj", "up_proj", "down_proj"}
     assert 300_000_000 <= counts["total_model_elements"] < 500_000_000
     assert counts["lora_trainable_fraction"] < 0.10
 
@@ -78,7 +89,7 @@ def test_tiny_dense_llm_parity_by_target_mode_and_checkpointing(target_mode: str
     case = run_parity_case(
         target_mode=target_mode,
         checkpointing=checkpointing,
-        backend="asym_only",
+        backend="asym",
         device="cuda",
         dtype=torch.bfloat16,
         config=MICRO_DENSE_LLM_CONFIG,
@@ -107,7 +118,7 @@ def test_tiny_dense_llm_repeated_steps_are_finite_and_track_torch() -> None:
     report = run_repeated_steps(
         target_mode="all",
         checkpointing=False,
-        backend="asym_only",
+        backend="asym",
         device="cuda",
         dtype=torch.bfloat16,
         steps=5,
@@ -152,7 +163,7 @@ def test_tiny_dense_llm_adapter_state_names_and_reload_cpu() -> None:
     asym_model, ref_model = build_model_pair(
         config=config,
         target_mode="all",
-        backend="torch_only",
+        backend="torch",
         device="cpu",
         dtype=torch.float32,
     )
@@ -176,7 +187,7 @@ def test_tiny_dense_llm_adapter_state_names_and_reload_cpu() -> None:
 
     reload_report = run_adapter_reload_case(
         target_mode="all",
-        backend="torch_only",
+        backend="torch",
         device="cpu",
         dtype=torch.float32,
         config=config,
@@ -194,11 +205,68 @@ def test_tiny_dense_llm_adapter_state_names_and_reload_cpu() -> None:
     assert reload_report["reload_matches_source_logits_max_abs"] <= 1e-6
 
 
+def test_tiny_dense_llm_lora_all_offload_mlp_placement() -> None:
+    config = MICRO_DENSE_LLM_CONFIG
+    device = _placement_device()
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    model, _ = build_model_pair(
+        config=config,
+        target_mode="all",
+        target_modules="all",
+        offload_modules="mlp",
+        backend="asym",
+        device=device,
+        dtype=dtype,
+        seed=124,
+        lora_seed=125,
+    )
+
+    assert model.target_names == tiny_dense_llm.ALL_TARGETS
+    assert model.offload_names == tiny_dense_llm.MLP_TARGETS
+    assert len(adapter_state_names(model)) == config.num_layers * len(tiny_dense_llm.ALL_TARGETS) * 2
+
+    for layer in model.layers:
+        attention_modules = (
+            layer.self_attn.q_proj,
+            layer.self_attn.k_proj,
+            layer.self_attn.v_proj,
+            layer.self_attn.o_proj,
+        )
+        mlp_modules = (
+            layer.mlp.gate_proj,
+            layer.mlp.up_proj,
+            layer.mlp.down_proj,
+        )
+        for module in attention_modules:
+            assert isinstance(module, tiny_dense_llm.TorchLoRALinear)
+            assert _is_on_device(module.base_layer.weight, device)
+            assert _is_on_device(module.lora_A["default"].weight, device)
+            assert _is_on_device(module.lora_B["default"].weight, device)
+            assert module.lora_A["default"].weight.dtype == torch.bfloat16
+            assert module.lora_B["default"].weight.dtype == torch.bfloat16
+        for module in mlp_modules:
+            assert isinstance(module, tiny_dense_llm.AsymLoRALinear)
+            assert module.base_layer.host_weight.weight.device.type == "cpu"
+            assert not module.base_layer.host_weight.weight.requires_grad
+            if device.type == "cuda":
+                assert module.base_layer.host_weight.weight.is_pinned()
+            assert _is_on_device(module.lora_A["default"].weight, device)
+            assert _is_on_device(module.lora_B["default"].weight, device)
+            assert module.lora_A["default"].weight.dtype == torch.bfloat16
+            assert module.lora_B["default"].weight.dtype == torch.bfloat16
+
+    dtype_bytes = torch.empty((), dtype=dtype).element_size()
+    expected_offloaded_mlp_bytes = config.num_layers * len(tiny_dense_llm.MLP_TARGETS) * config.intermediate_size * config.hidden_size * dtype_bytes
+    expected_gpu_attention_bytes = config.num_layers * len(tiny_dense_llm.ATTENTION_TARGETS) * config.hidden_size * config.hidden_size * dtype_bytes
+    assert model.cpu_resident_base_weight_bytes == expected_offloaded_mlp_bytes
+    assert model.gpu_resident_target_weight_bytes == expected_gpu_attention_bytes
+
+
 @pytest.mark.skipif(not _direct_bf16_available(), reason="CUDA SM90/SM100 required for M3 HBM direct-fetch accounting")
 def test_tiny_dense_llm_cpu_resident_targets_save_hbm() -> None:
     memory = run_memory_comparison(
         target_mode="all",
-        backend="asym_only",
+        backend="asym",
         device="cuda",
         dtype=torch.bfloat16,
         config=MICRO_DENSE_LLM_CONFIG,

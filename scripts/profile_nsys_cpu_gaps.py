@@ -18,14 +18,26 @@ if str(ROOT) not in sys.path:
 from scripts.postprocess_nsys_cpu_gaps import markdown, summarize_cpu_gaps  # noqa: E402
 
 
-WORKLOADS = ["mlp", "dense", "moe", "dense_3b", "moe_3b", "mm_1b", "mm_3b", "mlp_1b", "mlp_3b", "qwen3_14b", "qwen3_30b_a3b"]
+WORKLOADS = [
+    "mlp",
+    "dense",
+    "moe",
+    "dense_3b",
+    "dense_14b",
+    "moe-604m-a75m",
+    "moe-604m-a38m",
+    "mm_1b",
+    "mm_3b",
+    "mlp_1b",
+    "mlp_3b",
+]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workload", choices=WORKLOADS, required=True)
     parser.add_argument("--device", default="cuda:2")
-    parser.add_argument("--backend", default="asym_only")
+    parser.add_argument("--backend", default="asym")
     parser.add_argument("--precision", default="bf16", choices=["bf16", "fp8", "fp4"])
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--measure-steps", type=int, default=1)

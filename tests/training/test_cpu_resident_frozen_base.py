@@ -18,6 +18,7 @@ from asym_gemm.training import (
 )
 
 frozen_linear_impl = importlib.import_module("asym_gemm.training.frozen_linear")
+lora_impl = importlib.import_module("asym_gemm.training.lora")
 
 
 def _direct_bf16_available() -> bool:
@@ -33,6 +34,10 @@ def _direct_precision_available(precision: str) -> bool:
     if precision == "fp4":
         return arch == 10 and hasattr(asym_gemm, "m_grouped_fp4_asym_gemm_nt_contiguous")
     return False
+
+
+def _torch_grouped_mm_available() -> bool:
+    return torch.cuda.is_available()
 
 
 def _relative_max_diff(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -96,7 +101,7 @@ def test_fp64_reference_gradcheck_cpu() -> None:
     host_weight = HostWeight.from_tensor(weight, pin_memory=False)
 
     def func(inp: torch.Tensor) -> torch.Tensor:
-        return asym_frozen_linear(inp, host_weight, backend="torch_only")
+        return asym_frozen_linear(inp, host_weight, backend="torch")
 
     assert torch.autograd.gradcheck(func, (x,), eps=1e-6, atol=1e-4)
 
@@ -110,7 +115,7 @@ def test_bias_grad_matches_torch_for_batched_inputs_cpu() -> None:
     bias_ref = bias.detach().clone().requires_grad_(True)
     host_weight = HostWeight.from_tensor(weight, pin_memory=False)
 
-    y = asym_frozen_linear(x, host_weight, bias=bias, backend="torch_only")
+    y = asym_frozen_linear(x, host_weight, bias=bias, backend="torch")
     y_ref = torch.nn.functional.linear(x_ref, weight, bias_ref)
     loss = (y.square().mean() + y[..., :2].sum() * 0.03)
     loss_ref = (y_ref.square().mean() + y_ref[..., :2].sum() * 0.03)
@@ -129,7 +134,7 @@ def test_backward_does_not_materialize_host_weight_transpose_cpu() -> None:
     weight = torch.randn(7, 5, dtype=torch.float32)
     host_weight = HostWeight.from_tensor(weight, pin_memory=False)
 
-    y = asym_frozen_linear(x, host_weight, backend="torch_only")
+    y = asym_frozen_linear(x, host_weight, backend="torch")
     y.float().square().mean().backward()
 
     x_ref = x.detach().clone().requires_grad_(True)
@@ -145,7 +150,7 @@ def test_grouped_frozen_linear_cpu_forward_dx_and_no_dw() -> None:
     x = torch.randn(9, 5, dtype=torch.float64, requires_grad=True)
     x_ref = x.detach().clone().requires_grad_(True)
     weight = torch.randn(3, 7, 5, dtype=torch.float64)
-    grouped = AsymGroupedFrozenLinear(weight, backend="torch_only", pin_memory=False)
+    grouped = AsymGroupedFrozenLinear(weight, backend="torch", pin_memory=False)
     offsets = torch.tensor([0, 2, 5, 9], dtype=torch.long)
     experts = torch.tensor([0, 1, 2, -1], dtype=torch.long)
 
@@ -178,7 +183,7 @@ def test_grouped_frozen_linear_empty_group_cpu() -> None:
     offsets = torch.tensor([0, 2, 2, 4, 6], dtype=torch.long)
     experts = torch.tensor([0, 1, 2, 3, -1], dtype=torch.long)
 
-    y = asym_grouped_frozen_linear(x, host_weight, offsets, experts, backend="torch_only")
+    y = asym_grouped_frozen_linear(x, host_weight, offsets, experts, backend="torch")
     y_ref = torch.cat(
         [
             x_ref[0:2] @ weight[0].t(),
@@ -193,6 +198,153 @@ def test_grouped_frozen_linear_empty_group_cpu() -> None:
     torch.testing.assert_close(y, y_ref)
     torch.testing.assert_close(x.grad, x_ref.grad)
     assert host_weight.weight.grad is None
+
+
+@pytest.mark.skipif(not _torch_grouped_mm_available(), reason="torch grouped_mm requires CUDA and PyTorch grouped MM")
+def test_torch_grouped_frozen_linear_cuda_uses_grouped_mm_forward_and_dx(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(19)
+    k = 128
+    n = 64
+    counts = [128, 0, 256, 128]
+    offsets = torch.tensor([0, 128, 128, 384, 512], device="cuda", dtype=torch.long)
+    experts = torch.tensor([2, 0, 3, 1, -1], device="cuda", dtype=torch.long)
+    x = torch.randn(sum(counts), k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight = torch.randn(4, n, k, device="cuda", dtype=torch.bfloat16)
+    grouped = frozen_linear_impl.TorchGroupedFrozenLinear(weight, device=torch.device("cuda"), dtype=torch.bfloat16)
+
+    real_grouped_mm = frozen_linear_impl._TORCH_GROUPED_MM
+    calls: list[tuple[tuple[int, ...], tuple[int, ...], torch.dtype, bool]] = []
+
+    def counted_grouped_mm(mat1: torch.Tensor, mat2: torch.Tensor, *, offs: torch.Tensor) -> torch.Tensor:
+        calls.append((tuple(mat1.shape), tuple(mat2.shape), offs.dtype, mat2.is_contiguous()))
+        return real_grouped_mm(mat1, mat2, offs=offs)
+
+    monkeypatch.setattr(frozen_linear_impl, "_TORCH_GROUPED_MM", counted_grouped_mm)
+
+    y = grouped(x, offsets, experts)
+    y_ref = torch.cat(
+        [
+            x_ref[0:128] @ weight[2].t(),
+            x_ref[128:384] @ weight[3].t(),
+            x_ref[384:512] @ weight[1].t(),
+        ],
+        dim=0,
+    )
+    loss = y.float().square().mean()
+    loss_ref = y_ref.float().square().mean()
+    loss.backward()
+    loss_ref.backward()
+
+    torch.testing.assert_close(y, y_ref, atol=0.02, rtol=0.02)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=0.02, rtol=0.02)
+    assert calls == [
+        ((512, k), (3, k, n), torch.int32, False),
+        ((512, n), (3, n, k), torch.int32, True),
+    ]
+
+
+@pytest.mark.skipif(not _torch_grouped_mm_available(), reason="torch grouped_mm requires CUDA and PyTorch grouped MM")
+def test_torch_grouped_frozen_linear_dense_experts_avoids_weight_gather(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(22)
+    k = 128
+    n = 64
+    offsets = torch.tensor([0, 128, 128, 384, 512], device="cuda", dtype=torch.long)
+    experts = torch.tensor([0, 1, 2, 3, -1], device="cuda", dtype=torch.long)
+    x = torch.randn(512, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight = torch.randn(4, n, k, device="cuda", dtype=torch.bfloat16)
+    grouped = frozen_linear_impl.TorchGroupedFrozenLinear(weight, device=torch.device("cuda"), dtype=torch.bfloat16)
+
+    real_grouped_mm = frozen_linear_impl._TORCH_GROUPED_MM
+    calls: list[tuple[tuple[int, ...], tuple[int, ...], torch.dtype, bool]] = []
+
+    def counted_grouped_mm(mat1: torch.Tensor, mat2: torch.Tensor, *, offs: torch.Tensor) -> torch.Tensor:
+        calls.append((tuple(mat1.shape), tuple(mat2.shape), offs.dtype, mat2.is_contiguous()))
+        return real_grouped_mm(mat1, mat2, offs=offs)
+
+    monkeypatch.setattr(frozen_linear_impl, "_TORCH_GROUPED_MM", counted_grouped_mm)
+
+    y = grouped(x, offsets, experts, dense_experts=True)
+    y_ref = torch.cat(
+        [
+            x_ref[0:128] @ weight[0].t(),
+            x_ref[128:384] @ weight[2].t(),
+            x_ref[384:512] @ weight[3].t(),
+        ],
+        dim=0,
+    )
+    loss = y.float().square().mean()
+    loss_ref = y_ref.float().square().mean()
+    loss.backward()
+    loss_ref.backward()
+
+    torch.testing.assert_close(y, y_ref, atol=0.02, rtol=0.02)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=0.02, rtol=0.02)
+    assert calls == [
+        ((512, k), (4, k, n), torch.int32, False),
+        ((512, n), (4, n, k), torch.int32, True),
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for torch grouped_mm error path")
+def test_torch_grouped_frozen_linear_cuda_propagates_grouped_mm_shape_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(20)
+    x = torch.randn(5, 8, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(2, 6, 8, device="cuda", dtype=torch.bfloat16)
+    offsets = torch.tensor([0, 2, 5], device="cuda", dtype=torch.long)
+    experts = torch.tensor([1, 0, -1], device="cuda", dtype=torch.long)
+
+    def rejecting_grouped_mm(mat1: torch.Tensor, mat2: torch.Tensor, *, offs: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("strides should be multiple of 16 bytes")
+
+    monkeypatch.setattr(frozen_linear_impl, "_TORCH_GROUPED_MM", rejecting_grouped_mm)
+
+    with pytest.raises(RuntimeError, match="strides should be multiple of 16 bytes"):
+        frozen_linear_impl._grouped_torch_chunks(x, weight, offsets, experts)
+
+
+@pytest.mark.skipif(not _torch_grouped_mm_available(), reason="torch grouped_mm requires CUDA and PyTorch grouped MM")
+def test_grouped_expert_lora_cuda_uses_grouped_mm_without_transpose_copy(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(21)
+    k = 128
+    n = 16
+    offsets = torch.tensor([0, 128, 128, 384, 512], device="cuda", dtype=torch.long)
+    experts = torch.tensor([2, 0, 3, 1, -1], device="cuda", dtype=torch.long)
+    x = torch.randn(512, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight = torch.randn(4, n, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+
+    real_grouped_mm = lora_impl._TORCH_GROUPED_MM
+    calls: list[tuple[tuple[int, ...], tuple[int, ...], torch.dtype, bool]] = []
+
+    def counted_grouped_mm(mat1: torch.Tensor, mat2: torch.Tensor, *, offs: torch.Tensor) -> torch.Tensor:
+        calls.append((tuple(mat1.shape), tuple(mat2.shape), offs.dtype, mat2.is_contiguous()))
+        return real_grouped_mm(mat1, mat2, offs=offs)
+
+    monkeypatch.setattr(lora_impl, "_TORCH_GROUPED_MM", counted_grouped_mm)
+
+    y = lora_impl.grouped_expert_lora(x, weight, offsets, experts)
+    y_ref = torch.cat(
+        [
+            x_ref[0:128] @ weight_ref[2].t(),
+            x_ref[128:384] @ weight_ref[3].t(),
+            x_ref[384:512] @ weight_ref[1].t(),
+        ],
+        dim=0,
+    )
+    loss = y.float().square().mean()
+    loss_ref = y_ref.float().square().mean()
+    loss.backward()
+    loss_ref.backward()
+
+    torch.testing.assert_close(y, y_ref, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=0.02, rtol=0.02)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=0.02, rtol=0.02)
+    assert calls == [((512, k), (3, k, n), torch.int32, False)]
 
 
 def test_transpose_capability_check_uses_original_weight_without_copy() -> None:
@@ -224,7 +376,7 @@ def test_direct_bf16_forward_and_dx_match_torch() -> None:
     ok, reason = can_use_direct_bf16(x, host_weight)
     assert ok, reason
 
-    y = asym_frozen_linear(x, host_weight, backend="asym_only", stats=stats)
+    y = asym_frozen_linear(x, host_weight, backend="asym", stats=stats)
     y_ref = x_ref @ weight_cuda.t()
     torch.testing.assert_close(y, y_ref, atol=0.0, rtol=0.0)
 
@@ -260,7 +412,7 @@ def test_direct_grouped_bf16_forward_and_dx_match_torch() -> None:
     x_ref = x.detach().clone().requires_grad_(True)
     weight = torch.randn(len(counts), n, k, dtype=torch.bfloat16)
     weight_cuda = weight.to("cuda")
-    grouped = AsymGroupedFrozenLinear(weight, backend="asym_only", pin_memory=True, stats=AsymExecutionStats())
+    grouped = AsymGroupedFrozenLinear(weight, backend="asym", pin_memory=True, stats=AsymExecutionStats())
     offsets = torch.tensor([0, counts[0], counts[0] + counts[1], m], device="cuda", dtype=torch.long)
     experts = torch.tensor([0, 1, 2, -1], device="cuda", dtype=torch.long)
 
@@ -300,7 +452,7 @@ def test_direct_quantized_precision_forward_and_dx_match_quantized_reference(pre
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     weight = torch.randn(n, k, dtype=torch.bfloat16)
     stats = AsymExecutionStats()
-    base = AsymFrozenLinear(weight, backend="asym_only", pin_memory=True, stats=stats, precision=precision)
+    base = AsymFrozenLinear(weight, backend="asym", pin_memory=True, stats=stats, precision=precision)
 
     y = base(x)
     y_ref = _quantized_linear_reference(x, base.host_weight, precision)
@@ -340,7 +492,7 @@ def test_direct_grouped_quantized_precision_forward_and_dx_match_quantized_refer
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     weight = torch.randn(len(counts), n, k, dtype=torch.bfloat16)
     stats = AsymExecutionStats()
-    grouped = AsymGroupedFrozenLinear(weight, backend="asym_only", pin_memory=True, stats=stats, precision=precision)
+    grouped = AsymGroupedFrozenLinear(weight, backend="asym", pin_memory=True, stats=stats, precision=precision)
     offsets = torch.tensor([0, counts[0], m], device="cuda", dtype=torch.long)
     experts = torch.tensor([0, 1, -1], device="cuda", dtype=torch.long)
 
@@ -385,7 +537,7 @@ def test_lora_composition_gets_grads_and_base_stays_frozen() -> None:
     use_cuda = _direct_bf16_available()
     device = torch.device("cuda" if use_cuda else "cpu")
     dtype = torch.bfloat16 if use_cuda else torch.float32
-    backend = "asym_only" if use_cuda else "torch_only"
+    backend = "asym" if use_cuda else "torch"
     m = in_features = out_features = 128 if use_cuda else 8
     rank = 4
 
@@ -420,7 +572,7 @@ def test_lora_composition_quantized_precision_gets_grads_and_base_stays_frozen(p
     rank = 8
     x = torch.randn(m, in_features, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     weight = torch.randn(out_features, in_features, dtype=torch.bfloat16)
-    base = AsymFrozenLinear(weight, backend="asym_only", pin_memory=True, precision=precision)
+    base = AsymFrozenLinear(weight, backend="asym", pin_memory=True, precision=precision)
     lora_a = torch.nn.Parameter(torch.randn(rank, in_features, device="cuda", dtype=torch.float32) * 0.01)
     lora_b = torch.nn.Parameter(torch.randn(out_features, rank, device="cuda", dtype=torch.float32) * 0.01)
 
@@ -455,7 +607,7 @@ def test_lora_quantized_precision_gradients_match_quantized_reference_and_optimi
     x = torch.randn(m, in_features, device="cuda", dtype=torch.bfloat16)
     target = torch.randn(m, out_features, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(out_features, in_features, dtype=torch.bfloat16)
-    base = AsymFrozenLinear(weight, backend="asym_only", pin_memory=True, precision=precision)
+    base = AsymFrozenLinear(weight, backend="asym", pin_memory=True, precision=precision)
     lora_a = torch.nn.Parameter(torch.randn(rank, in_features, device="cuda", dtype=torch.float32) * 0.01)
     lora_b = torch.nn.Parameter(torch.randn(out_features, rank, device="cuda", dtype=torch.float32) * 0.01)
     lora_a_ref = torch.nn.Parameter(lora_a.detach().clone())
@@ -519,8 +671,7 @@ def test_cpu_resident_weight_avoids_gpu_hbm_allocation() -> None:
     assert host_weight.pinned_cpu_bytes >= expected_weight_bytes
 
 
-@pytest.mark.parametrize("backend", ["asym_or_staged", "asym_or_torch", "torch_only"])
-def test_fp32_fallback_backends_match_torch_output_loss_and_dx(backend: str) -> None:
+def test_torch_backend_matches_torch_output_loss_and_dx() -> None:
     torch.manual_seed(4)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     x = torch.randn(7, 11, device=device, dtype=torch.float32, requires_grad=True)
@@ -530,7 +681,7 @@ def test_fp32_fallback_backends_match_torch_output_loss_and_dx(backend: str) -> 
     host_weight = HostWeight.from_tensor(weight, pin_memory=torch.cuda.is_available())
     stats = AsymExecutionStats()
 
-    y = asym_frozen_linear(x, host_weight, bias=bias, backend=backend, stats=stats)
+    y = asym_frozen_linear(x, host_weight, bias=bias, backend="torch", stats=stats)
     loss = (y.square().mean() + y[:, :3].sum() * 0.01)
     dx = torch.autograd.grad(loss, x)[0]
 
@@ -544,13 +695,13 @@ def test_fp32_fallback_backends_match_torch_output_loss_and_dx(backend: str) -> 
     assert host_weight.weight.grad is None
     assert host_weight.weight.device.type == "cpu"
     assert stats.asym_calls == 0
+    assert stats.torch_calls == 2
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for BF16 staged fallback parity")
-def test_bf16_asym_or_staged_fallback_matches_torch_cuda() -> None:
+@pytest.mark.skipif(not _direct_bf16_available(), reason="direct BF16 AsymGEMM requires SM90/SM100")
+def test_bf16_asym_backend_raises_when_direct_kernel_is_unavailable_cuda() -> None:
     torch.manual_seed(5)
     x = torch.randn(17, 19, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    x_ref = x.detach().clone().requires_grad_(True)
     weight = torch.randn(23, 19, dtype=torch.bfloat16)
     bias = torch.randn(23, dtype=torch.bfloat16)
     host_weight = HostWeight.from_tensor(weight, pin_memory=True)
@@ -559,19 +710,12 @@ def test_bf16_asym_or_staged_fallback_matches_torch_cuda() -> None:
     ok, reason = can_use_direct_bf16(x, host_weight)
     assert not ok and reason == "requires_8_aligned_nk"
 
-    y = asym_frozen_linear(x, host_weight, bias=bias, backend="asym_or_staged", stats=stats)
-    loss = y.float().square().mean()
-    dx = torch.autograd.grad(loss, x)[0]
+    with pytest.raises(RuntimeError, match="direct BF16 AsymGEMM is unavailable: requires_8_aligned_nk"):
+        asym_frozen_linear(x, host_weight, bias=bias, backend="asym", stats=stats)
 
-    y_ref = torch.nn.functional.linear(x_ref, weight.to("cuda"), bias.to("cuda"))
-    loss_ref = y_ref.float().square().mean()
-    dx_ref = torch.autograd.grad(loss_ref, x_ref)[0]
-
-    torch.testing.assert_close(y.float(), y_ref.float(), atol=7e-2, rtol=3e-2)
-    torch.testing.assert_close(loss, loss_ref, atol=1e-2, rtol=1e-3)
-    torch.testing.assert_close(dx.float(), dx_ref.float(), atol=2e-3, rtol=2e-2)
-    assert stats.staged_forward_calls == 1
-    assert stats.staged_dx_calls == 1
+    assert stats.asym_calls == 0
+    assert stats.torch_calls == 0
+    assert stats.fallback_reasons == {"forward:requires_8_aligned_nk": 1}
     assert host_weight.weight.device.type == "cpu"
 
 
@@ -579,7 +723,7 @@ def test_bf16_asym_or_staged_fallback_matches_torch_cuda() -> None:
 def test_module_to_cuda_does_not_move_host_weight_or_register_it() -> None:
     torch.manual_seed(6)
     weight = torch.randn(9, 7, dtype=torch.float32)
-    module = AsymFrozenLinear(7, 9, weight, backend="torch_only")
+    module = AsymFrozenLinear(7, 9, weight, backend="torch")
     ptr_before = module.host_weight.weight.data_ptr()
 
     module = module.to("cuda")
@@ -609,7 +753,7 @@ def test_cpu_resident_forward_excludes_weight_bytes_from_peak_cuda_allocation() 
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    y_host = asym_frozen_linear(x, host_weight, backend="torch_only")
+    y_host = asym_frozen_linear(x, host_weight, backend="torch")
     torch.cuda.synchronize()
     host_peak = torch.cuda.max_memory_allocated()
     del y_host
@@ -627,4 +771,4 @@ def test_cpu_resident_forward_excludes_weight_bytes_from_peak_cuda_allocation() 
 
 
 def test_backend_names_are_stable() -> None:
-    assert VALID_BACKENDS == ("asym_only", "asym_or_staged", "asym_or_torch", "torch_only")
+    assert VALID_BACKENDS == ("asym", "torch")

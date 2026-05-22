@@ -4,6 +4,10 @@ from pathlib import Path
 import pytest
 import torch
 
+from asym_gemm.training.frozen_linear import AsymExecutionStats
+from asym_gemm.training.lora import AsymLoRALinear
+from asym_gemm.training.mlp import AsymMLP
+
 
 ROOT = Path(__file__).resolve().parents[2]
 DEMO_PATH = ROOT / "examples" / "asymgemm" / "mlp_lora_demo.py"
@@ -19,6 +23,16 @@ def _load_demo_module():
 
 def _direct_bf16_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] in {9, 10}
+
+
+def _placement_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _is_on_device(tensor: torch.Tensor, device: torch.device) -> bool:
+    if tensor.device.type != device.type:
+        return False
+    return device.index is None or tensor.device.index == device.index
 
 
 def _fmt_mib(value: int | float) -> str:
@@ -66,10 +80,70 @@ def _print_report_summary(report: dict) -> None:
     print(f"  direct_fetch_forward={report['direct_fetch_forward_used']}, direct_fetch_dx={report['direct_fetch_dx_used']}")
 
 
+def test_asym_mlp_lora_all_offloads_mlp_bases_and_defaults_to_bf16() -> None:
+    device = _placement_device()
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    backend = "asym" if device.type == "cuda" else "torch"
+    generator = torch.Generator(device="cpu").manual_seed(91)
+    w1 = torch.randn((16, 8), generator=generator, dtype=torch.float32).to(dtype=dtype)
+    w2 = torch.randn((8, 16), generator=generator, dtype=torch.float32).to(dtype=dtype)
+    model = AsymMLP(
+        w1,
+        w2,
+        rank=4,
+        alpha=8.0,
+        backend=backend,
+        stats=AsymExecutionStats(),
+        device=device,
+        dtype=dtype,
+    )
+
+    for module in (model.fc1, model.fc2):
+        assert isinstance(module, AsymLoRALinear)
+        assert module.base_layer.host_weight.weight.device.type == "cpu"
+        assert not module.base_layer.host_weight.weight.requires_grad
+        if device.type == "cuda":
+            assert module.base_layer.host_weight.weight.is_pinned()
+        assert _is_on_device(module.lora_A["default"].weight, device)
+        assert _is_on_device(module.lora_B["default"].weight, device)
+        assert module.lora_A["default"].weight.dtype == torch.bfloat16
+        assert module.lora_B["default"].weight.dtype == torch.bfloat16
+
+    dtype_bytes = torch.empty((), dtype=dtype).element_size()
+    assert model.cpu_resident_base_weight_bytes == (w1.numel() + w2.numel()) * dtype_bytes
+
+
+def test_asym_mm_lora_all_offloads_matrix_base_and_defaults_to_bf16() -> None:
+    device = _placement_device()
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    backend = "asym" if device.type == "cuda" else "torch"
+    generator = torch.Generator(device="cpu").manual_seed(92)
+    weight = torch.randn((12, 8), generator=generator, dtype=torch.float32).to(dtype=dtype)
+    linear = AsymLoRALinear(
+        weight,
+        rank=4,
+        alpha=8.0,
+        backend=backend,
+        stats=AsymExecutionStats(),
+        device=device,
+        dtype=dtype,
+    )
+
+    assert linear.base_layer.host_weight.weight.device.type == "cpu"
+    assert not linear.base_layer.host_weight.weight.requires_grad
+    if device.type == "cuda":
+        assert linear.base_layer.host_weight.weight.is_pinned()
+    assert _is_on_device(linear.lora_A["default"].weight, device)
+    assert _is_on_device(linear.lora_B["default"].weight, device)
+    assert linear.lora_A["default"].weight.dtype == torch.bfloat16
+    assert linear.lora_B["default"].weight.dtype == torch.bfloat16
+    assert linear.cpu_resident_base_weight_bytes == weight.numel() * torch.empty((), dtype=dtype).element_size()
+
+
 def test_mlp_demo_cpu_torch_path_emits_correct_report(tmp_path: Path) -> None:
     demo = _load_demo_module()
     report_path = tmp_path / "mlp_demo_cpu.json"
-    report = demo.run_demo(backend="torch_only", report_path=report_path, device="cpu")
+    report = demo.run_demo(backend="torch", report_path=report_path, device="cpu")
     _print_report_summary(report)
 
     assert report_path.exists()
@@ -92,7 +166,7 @@ def test_mlp_demo_cpu_torch_path_emits_correct_report(tmp_path: Path) -> None:
 def test_mlp_demo_direct_fetch_correctness_and_hbm_report(tmp_path: Path) -> None:
     demo = _load_demo_module()
     report_path = tmp_path / "mlp_demo_direct_bf16.json"
-    report = demo.run_demo(backend="asym_only", report_path=report_path, device="cuda")
+    report = demo.run_demo(backend="asym", report_path=report_path, device="cuda")
     _print_report_summary(report)
 
     assert report_path.exists()

@@ -22,8 +22,11 @@ DEFAULT_LORA_BATCH_SIZE = 32
 DEFAULT_LORA_SEQ_LEN = 64
 DEFAULT_LORA_HIDDEN_DIM = 1024
 DEFAULT_LORA_MLP_EXPANSION = 4
-DEFAULT_DENSE_TARGET_MODE = "mlp_only"
+DEFAULT_DENSE_TARGET_MODE = "all"
+DEFAULT_TARGET_MODULES = "all"
+DEFAULT_OFFLOAD_MODULES = ""
 DENSE_TARGET_MODES = ("mlp_only", "attention_only", "all")
+LORA_DTYPE_CHOICES = ("bf16", "bfloat16", "fp16", "float16", "fp32", "float32")
 
 
 DEFAULT_SECTIONS = [
@@ -52,9 +55,9 @@ DEFAULT_LAUNCH_SKIP = {
     "mlp_1b": 4,
     "mlp_3b": 4,
     "dense_3b": 14,
-    "moe_3b": 0,
-    "qwen3_14b": 14,
-    "qwen3_30b_a3b": 0,
+    "dense_14b": 14,
+    "moe-604m-a75m": 0,
+    "moe-604m-a38m": 0,
 }
 
 
@@ -64,9 +67,9 @@ DEFAULT_LAUNCH_COUNT = {
     "mlp_1b": 4,
     "mlp_3b": 4,
     "dense_3b": 14,
-    "moe_3b": 32,
-    "qwen3_14b": 14,
-    "qwen3_30b_a3b": 32,
+    "dense_14b": 14,
+    "moe-604m-a75m": 32,
+    "moe-604m-a38m": 32,
 }
 
 
@@ -74,11 +77,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workload", choices=sorted(DEFAULT_LAUNCH_SKIP), required=True)
     parser.add_argument("--device", default="cuda:1")
-    parser.add_argument("--backend", default="asym_only")
+    parser.add_argument("--backend", choices=["asym"], default="asym")
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--measure-steps", type=int, default=1)
     parser.add_argument("--moe-mode", choices=["contiguous", "masked"], default="contiguous")
-    parser.add_argument("--dense-target-mode", choices=DENSE_TARGET_MODES, default=DEFAULT_DENSE_TARGET_MODE)
+    parser.add_argument("--target-preset", "--dense-target-mode", dest="dense_target_mode", choices=DENSE_TARGET_MODES, default=DEFAULT_DENSE_TARGET_MODE)
+    parser.add_argument("--target-modules", default=DEFAULT_TARGET_MODULES)
+    parser.add_argument("--offload-modules", default=DEFAULT_OFFLOAD_MODULES)
     parser.add_argument("--profile-layers", "--real-profile-layers", dest="profile_layers", type=int, default=1)
     parser.add_argument("--batch-size", "--real-batch-size", dest="batch_size", type=int, default=DEFAULT_LORA_BATCH_SIZE)
     parser.add_argument("--seq-len", "--real-seq-len", dest="seq_len", type=int, default=DEFAULT_LORA_SEQ_LEN)
@@ -87,6 +92,7 @@ def main() -> None:
     parser.add_argument("--mlp-expansion", "--real-mlp-expansion", dest="mlp_expansion", type=int, default=DEFAULT_LORA_MLP_EXPANSION)
     parser.add_argument("--lora-rank", "--real-lora-rank", dest="lora_rank", type=int, default=64)
     parser.add_argument("--lora-alpha", "--real-lora-alpha", dest="lora_alpha", type=float, default=128.0)
+    parser.add_argument("--lora-dtype", choices=LORA_DTYPE_CHOICES, default="bf16")
     parser.add_argument("--vocab-rows", "--real-vocab-rows", dest="vocab_rows", type=int, default=4096)
     parser.add_argument("--launch-skip", type=int)
     parser.add_argument("--launch-count", type=int)
@@ -158,6 +164,10 @@ def main() -> None:
         args.moe_mode,
         "--dense-target-mode",
         args.dense_target_mode,
+        "--target-modules",
+        args.target_modules,
+        "--offload-modules",
+        args.offload_modules,
         "--profile-layers",
         str(args.profile_layers),
         "--batch-size",
@@ -174,6 +184,8 @@ def main() -> None:
         str(args.lora_rank),
         "--lora-alpha",
         str(args.lora_alpha),
+        "--lora-dtype",
+        args.lora_dtype,
         "--vocab-rows",
         str(args.vocab_rows),
         "--output-dir",

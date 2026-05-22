@@ -24,6 +24,16 @@ def _direct_bf16_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] in {9, 10}
 
 
+def _placement_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _is_on_device(tensor: torch.Tensor, device: torch.device) -> bool:
+    if tensor.device.type != device.type:
+        return False
+    return device.index is None or tensor.device.index == device.index
+
+
 def _fmt_mib(value: int | float) -> str:
     return f"{float(value) / (1024 ** 2):.3f} MiB"
 
@@ -328,7 +338,7 @@ def test_tiny_moe_micro_model_is_transformer_style_with_shared_and_routed_expert
         seed=210,
         device=device,
         base_dtype=dtype,
-        backend="torch_only",
+        backend="torch",
         pin_memory=False,
     )
 
@@ -346,22 +356,34 @@ def test_tiny_moe_asym_base_weights_are_grouped_host_stacks() -> None:
         seed=211,
         device=device,
         base_dtype=dtype,
-        backend="torch_only",
+        backend="torch",
         pin_memory=False,
     )
 
     host_weights = _host_weight_items(asym)
     host_names = [name for name, _ in host_weights]
-    expected_per_layer = 3 + (3 if config.num_shared_experts > 0 else 0)
+    expected_per_layer = 3
 
     assert len(host_weights) == config.num_layers * expected_per_layer
     assert all(weight.dim() == 3 for _, weight in host_weights)
     assert any("expert_gate_base" in name for name in host_names)
     assert any("expert_up_base" in name for name in host_names)
     assert any("expert_down_base" in name for name in host_names)
-    assert any("shared_gate_base" in name for name in host_names)
+    assert not any("shared_gate_base" in name for name in host_names)
     assert all(".experts." not in name for name in host_names)
     assert all(weight.device.type == "cpu" and not weight.requires_grad for _, weight in host_weights)
+
+    all_expert_mlp, _, _, _ = tiny_moe.make_tiny_moe_pair(
+        config=config,
+        seed=211,
+        device=device,
+        base_dtype=dtype,
+        backend="torch",
+        pin_memory=False,
+        offload_modules="mlp",
+    )
+    all_host_names = [name for name, _ in _host_weight_items(all_expert_mlp)]
+    assert any("shared_gate_base" in name for name in all_host_names)
 
 
 def test_tiny_moe_asym_lora_weights_are_layer_packed() -> None:
@@ -373,7 +395,7 @@ def test_tiny_moe_asym_lora_weights_are_layer_packed() -> None:
         seed=212,
         device=device,
         base_dtype=dtype,
-        backend="torch_only",
+        backend="torch",
         pin_memory=False,
     )
 
@@ -403,8 +425,71 @@ def test_tiny_moe_asym_lora_weights_are_layer_packed() -> None:
         config.lora_rank,
         config.hidden_size,
     )
+    assert params["layers.0.expert_lora.gate_lora_a"].dtype == torch.bfloat16
+    assert params["layers.0.expert_lora.gate_lora_b"].dtype == torch.bfloat16
     assert not any(".experts." in name and "lora" in name for name in params)
     assert not any(".shared_experts." in name and "lora" in name for name in params)
+
+
+def test_tiny_moe_lora_all_offload_routed_expert_placement() -> None:
+    config = MICRO_MOE_CONFIG
+    device = _placement_device()
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    backend = "asym" if device.type == "cuda" else "torch"
+    model, _, _, _ = tiny_moe.make_tiny_moe_pair(
+        config=config,
+        seed=214,
+        device=device,
+        base_dtype=dtype,
+        backend=backend,
+        pin_memory=device.type == "cuda",
+        offload_modules="routed_experts",
+    )
+
+    assert model.offload_groups == ("routed_experts",)
+    host_weights = _host_weight_items(model)
+    host_names = [name for name, _ in host_weights]
+    assert len(host_weights) == config.num_layers * 3
+    assert all("shared" not in name.lower() for name in host_names)
+
+    lora_parameter_names = [name for name, param in model.named_parameters() if "lora" in name.lower() and param.requires_grad]
+    assert len(lora_parameter_names) == config.num_layers * 2 * 6
+    assert any("expert_lora.gate_lora_a" in name for name in lora_parameter_names)
+    assert any("shared_expert_lora.gate_lora_a" in name for name in lora_parameter_names)
+
+    for layer in model.layers:
+        routed_bases = (layer.expert_gate_base, layer.expert_up_base, layer.expert_down_base)
+        shared_bases = (layer.shared_gate_base, layer.shared_up_base, layer.shared_down_base)
+        attention_bases = (
+            layer.self_attn.q_proj,
+            layer.self_attn.k_proj,
+            layer.self_attn.v_proj,
+            layer.self_attn.o_proj,
+        )
+        assert all(isinstance(base, tiny_moe.AsymGroupedFrozenLinear) for base in routed_bases)
+        assert all(isinstance(base, tiny_moe.TorchGroupedFrozenLinear) for base in shared_bases)
+        assert all(_is_on_device(base.weight, device) for base in attention_bases)
+        for base in routed_bases:
+            assert base.host_weight.weight.device.type == "cpu"
+            assert not base.host_weight.weight.requires_grad
+            if device.type == "cuda":
+                assert base.host_weight.weight.is_pinned()
+        for base in shared_bases:
+            assert base is not None
+            assert _is_on_device(base.weight, device)
+            assert not base.weight.requires_grad
+        assert isinstance(layer.expert_lora, tiny_moe.PackedExpertLoRA)
+        assert isinstance(layer.shared_expert_lora, tiny_moe.PackedExpertLoRA)
+        for packed_lora in (layer.expert_lora, layer.shared_expert_lora):
+            for name in ("gate_lora_a", "gate_lora_b", "up_lora_a", "up_lora_b", "down_lora_a", "down_lora_b"):
+                param = getattr(packed_lora, name)
+                assert _is_on_device(param, device)
+                assert param.dtype == torch.bfloat16
+                assert param.requires_grad
+
+    dtype_bytes = torch.empty((), dtype=dtype).element_size()
+    expected_routed_bytes = config.num_layers * 3 * config.num_experts * config.intermediate_size * config.hidden_size * dtype_bytes
+    assert model.frozen_weight_bytes == expected_routed_bytes
 
 
 def _run_static_parity(pattern: str, mode: str) -> dict[str, Any]:
@@ -416,8 +501,9 @@ def _run_static_parity(pattern: str, mode: str) -> dict[str, Any]:
         seed=300,
         device=device,
         base_dtype=dtype,
-        backend="torch_only",
+        backend="torch",
         pin_memory=False,
+        lora_dtype=torch.float32,
     )
     routes = tiny_moe.make_static_routes(config, device, pattern=pattern)
     labels = None
@@ -468,8 +554,9 @@ def _run_learned_router_parity(mode: str) -> dict[str, Any]:
         seed=310,
         device=device,
         base_dtype=dtype,
-        backend="torch_only",
+        backend="torch",
         pin_memory=False,
+        lora_dtype=torch.float32,
     )
     labels = None
     if _forward_accepts_transformer_inputs(asym):
@@ -788,7 +875,7 @@ def test_tiny_moe_cuda_trainable_state_on_gpu_and_frozen_experts_on_cpu() -> Non
     config = MICRO_MOE_CONFIG
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    backend = "asym_only" if _direct_bf16_available() else "asym_or_staged"
+    backend = "asym" if _direct_bf16_available() else "asym"
     model, _, _, _ = tiny_moe.make_tiny_moe_pair(
         config=config,
         seed=330,
@@ -810,7 +897,7 @@ def test_tiny_moe_cuda_trainable_state_on_gpu_and_frozen_experts_on_cpu() -> Non
     host_names = [name for name, _ in host_weights]
     named_param_ids = {id(param) for _, param in model.named_parameters()}
     assert host_weights
-    assert any("shared" in name.lower() for name in host_names), "shared expert base weights must use host storage"
+    assert not any("shared" in name.lower() for name in host_names), "shared expert base weights stay GPU-resident by default"
     assert any("expert" in name.lower() and "shared" not in name.lower() for name in host_names)
     for _, weight in host_weights:
         assert weight.device.type == "cpu"
@@ -842,7 +929,7 @@ def test_tiny_moe_direct_fetch_correctness_hbm_and_flags(tmp_path) -> None:
         report_path=tmp_path / "m4_tiny_moe_direct_bf16.json",
         config=MICRO_MOE_CONFIG,
         device="cuda",
-        backend="asym_only",
+        backend="asym",
         seed=320,
     )
     _print_report(report)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import os
@@ -23,19 +24,48 @@ DEFAULT_LORA_BATCH_SIZE = 32
 DEFAULT_LORA_SEQ_LEN = 64
 DEFAULT_LORA_HIDDEN_DIM = 1024
 DEFAULT_LORA_MLP_EXPANSION = 4
-DEFAULT_DENSE_TARGET_MODE = "mlp_only"
+DEFAULT_DENSE_TARGET_MODE = "all"
+DEFAULT_TARGET_MODULES = "all"
+DEFAULT_OFFLOAD_MODULES = ""
 DENSE_TARGET_MODES = ("mlp_only", "attention_only", "all")
+LORA_DTYPE_CHOICES = ("bf16", "bfloat16", "fp16", "float16", "fp32", "float32")
+WORKFLOW_LABEL = "lora_sft"
 
-WORKLOADS = ("mlp_1b", "mlp_3b", "mm_1b", "mm_3b", "dense_3b", "moe_3b", "mlp", "dense", "moe", "qwen3_14b", "qwen3_30b_a3b")
+WORKLOADS = (
+    "mlp_1b",
+    "mlp_3b",
+    "mm_1b",
+    "mm_3b",
+    "dense_3b",
+    "dense_14b",
+    "moe-604m-a75m",
+    "moe-604m-a38m",
+    "mlp",
+    "dense",
+    "moe",
+)
 WORKLOAD_ALIASES = {
     "toy": ("mlp", "dense", "moe"),
-    "custom3b": ("dense_3b", "moe_3b"),
-    "qwen": ("qwen3_14b", "qwen3_30b_a3b"),
+    "custom3b": ("dense_3b", "moe-604m-a75m"),
+    "qwen": ("dense_14b", "moe-604m-a38m"),
     "all": WORKLOADS,
 }
-BACKENDS = ("asym_only", "torch_only")
+BACKENDS = ("asym", "torch", "kt")
+KT_MOE_WORKLOADS = {"moe", "moe-604m-a75m", "moe-604m-a38m"}
 PROFILERS = ("source", "nsys", "cpu", "ncu")
-NCU_WORKLOADS = {"mm_1b", "mm_3b", "mlp_1b", "mlp_3b", "dense_3b", "moe_3b", "qwen3_14b", "qwen3_30b_a3b"}
+NCU_WORKLOADS = {"mm_1b", "mm_3b", "mlp_1b", "mlp_3b", "dense_3b", "dense_14b", "moe-604m-a75m", "moe-604m-a38m"}
+
+
+@dataclass(frozen=True)
+class WorkloadSpec:
+    name: str
+    profile_layers: int | None = None
+
+    @property
+    def label(self) -> str:
+        if self.profile_layers is None:
+            return self.name
+        return f"{self.name}-l{self.profile_layers}"
 
 
 def _split_tokens(values: Iterable[str]) -> list[str]:
@@ -45,17 +75,35 @@ def _split_tokens(values: Iterable[str]) -> list[str]:
     return tokens
 
 
-def _expand_workloads(values: Iterable[str]) -> list[str]:
-    expanded: list[str] = []
+def _parse_workload_token(value: str) -> tuple[str, int | None]:
+    if "|" not in value:
+        return value, None
+    name, layers_text = value.split("|", 1)
+    name = name.strip()
+    layers_text = layers_text.strip()
+    if not name or not layers_text:
+        raise SystemExit(f"invalid workload layer spec {value!r}; expected workload|layers")
+    try:
+        layers = int(layers_text)
+    except ValueError as exc:
+        raise SystemExit(f"invalid workload layer spec {value!r}; layers must be an integer") from exc
+    if layers <= 0:
+        raise SystemExit(f"invalid workload layer spec {value!r}; layers must be positive")
+    return name, layers
+
+
+def _expand_workloads(values: Iterable[str]) -> list[WorkloadSpec]:
+    expanded: list[WorkloadSpec] = []
     for value in _split_tokens(values):
-        if value in WORKLOAD_ALIASES:
-            expanded.extend(WORKLOAD_ALIASES[value])
-        elif value in WORKLOADS:
-            expanded.append(value)
+        name, layers = _parse_workload_token(value)
+        if name in WORKLOAD_ALIASES:
+            expanded.extend(WorkloadSpec(workload, layers) for workload in WORKLOAD_ALIASES[name])
+        elif name in WORKLOADS:
+            expanded.append(WorkloadSpec(name, layers))
         else:
             allowed = ", ".join((*WORKLOADS, *WORKLOAD_ALIASES))
-            raise SystemExit(f"unknown workload {value!r}; allowed: {allowed}")
-    return list(dict.fromkeys(expanded))
+            raise SystemExit(f"unknown workload {name!r}; allowed: {allowed}")
+    return list({spec.label: spec for spec in expanded}.values())
 
 
 def _expand_backends(values: Iterable[str]) -> list[str]:
@@ -93,6 +141,20 @@ def _timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
+def _preflight_runtime(args: argparse.Namespace) -> None:
+    if args.dry_run or args.collect_existing:
+        return
+    try:
+        import torch  # noqa: F401
+    except Exception as exc:
+        raise SystemExit(
+            "error: selected Python interpreter cannot import torch:\n"
+            f"  python: {sys.executable}\n"
+            f"  {exc.__class__.__name__}: {exc}\n"
+            "hint: run the shell wrapper with --python-bin /path/to/python, or invoke this script with a Python that has torch installed."
+        )
+
+
 def _safe_label(value: str) -> str:
     return "".join(ch.lower() if ch.isalnum() or ch == "-" else "_" for ch in value).strip("_-")
 
@@ -109,7 +171,7 @@ def _result_stem(args: argparse.Namespace, backend: str, profiler: str) -> str:
         part
         for part in (
             _safe_label(args.precision),
-            _safe_label(args.workflow),
+            _safe_label(WORKFLOW_LABEL),
             _safe_label(mode),
         )
         if part
@@ -164,7 +226,15 @@ def _write_result_aliases(args: argparse.Namespace, run_dir: Path, row: dict[str
     return aliases
 
 
-def _common_profile_args(args: argparse.Namespace, workload: str, backend: str, device: str, output_dir: Path) -> list[str]:
+def _common_profile_args(
+    args: argparse.Namespace,
+    workload: str,
+    backend: str,
+    device: str,
+    output_dir: Path,
+    *,
+    profile_layers: int,
+) -> list[str]:
     return [
         "--workload",
         workload,
@@ -180,8 +250,12 @@ def _common_profile_args(args: argparse.Namespace, workload: str, backend: str, 
         args.moe_mode,
         "--dense-target-mode",
         args.dense_target_mode,
+        "--target-modules",
+        args.target_modules,
+        "--offload-modules",
+        args.offload_modules,
         "--profile-layers",
-        str(args.profile_layers),
+        str(profile_layers),
         "--batch-size",
         str(args.batch_size),
         "--seq-len",
@@ -196,10 +270,20 @@ def _common_profile_args(args: argparse.Namespace, workload: str, backend: str, 
         str(args.lora_rank),
         "--lora-alpha",
         str(args.lora_alpha),
+        "--lora-dtype",
+        args.lora_dtype,
         "--vocab-rows",
         str(args.vocab_rows),
         "--precision",
         str(args.precision),
+        "--kt-method",
+        args.kt_method,
+        "--kt-cpu-threads",
+        str(args.kt_cpu_threads),
+        "--kt-threadpool-count",
+        str(args.kt_threadpool_count),
+        "--kt-max-cache-depth",
+        str(args.kt_max_cache_depth),
         "--output-dir",
         str(output_dir),
     ]
@@ -251,24 +335,39 @@ def _add_comparisons(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         by_workload.setdefault(key, {})[str(row["backend"])] = row
     comparisons: list[dict[str, Any]] = []
     for (workload, profiler), items in by_workload.items():
-        asym = items.get("asym_only")
-        torch = items.get("torch_only")
-        if not asym or not torch:
-            continue
-        asym_ms = asym.get("step_ms")
-        torch_ms = torch.get("step_ms")
-        if not isinstance(asym_ms, (int, float)) or not isinstance(torch_ms, (int, float)) or asym_ms <= 0:
-            continue
-        comparisons.append(
-            {
-                "workload": workload,
-                "profiler": profiler,
-                "asym_step_ms": asym_ms,
-                "torch_step_ms": torch_ms,
-                "asym_vs_torch_speedup": torch_ms / asym_ms,
-                "asym_vs_torch_step_ms_delta": asym_ms - torch_ms,
-            }
-        )
+        asym = items.get("asym")
+        torch = items.get("torch")
+        kt = items.get("kt")
+        if asym and torch:
+            asym_ms = asym.get("step_ms")
+            torch_ms = torch.get("step_ms")
+            if isinstance(asym_ms, (int, float)) and isinstance(torch_ms, (int, float)) and asym_ms > 0:
+                comparisons.append(
+                    {
+                        "workload": workload,
+                        "profiler": profiler,
+                        "comparison": "asym_vs_torch",
+                        "candidate_step_ms": asym_ms,
+                        "torch_step_ms": torch_ms,
+                        "torch_over_candidate_speedup": torch_ms / asym_ms,
+                        "candidate_minus_torch_ms": asym_ms - torch_ms,
+                    }
+                )
+        if kt and torch:
+            kt_ms = kt.get("step_ms")
+            torch_ms = torch.get("step_ms")
+            if isinstance(kt_ms, (int, float)) and isinstance(torch_ms, (int, float)) and kt_ms > 0:
+                comparisons.append(
+                    {
+                        "workload": workload,
+                        "profiler": profiler,
+                        "comparison": "kt_vs_torch",
+                        "candidate_step_ms": kt_ms,
+                        "torch_step_ms": torch_ms,
+                        "torch_over_candidate_speedup": torch_ms / kt_ms,
+                        "candidate_minus_torch_ms": kt_ms - torch_ms,
+                    }
+                )
     return comparisons
 
 
@@ -279,9 +378,9 @@ def _markdown(summary: dict[str, Any]) -> str:
         f"Precision: `{summary.get('precision', '-')}`  ",
         f"Workflow: `{summary.get('workflow', '-')}`",
         "",
-        "`asym_only` measures the direct AsymGEMM host-weight path. `torch_only` measures",
+        "`asym` measures the direct AsymGEMM host-weight path. `torch` measures",
         "a normal GPU-resident PyTorch LoRA baseline with frozen base weights stored as",
-        "CUDA buffers.",
+        "CUDA buffers. `kt` measures the KTransformers AMX SFT MoE path for MoE workloads.",
         "",
         "## Runs",
         "",
@@ -320,16 +419,16 @@ def _markdown(summary: dict[str, Any]) -> str:
     lines += ["", "## Comparisons", ""]
     if summary["comparisons"]:
         lines += [
-            "| Workload | Profiler | Asym step ms | Torch step ms | Torch/Asym speedup | Asym minus Torch ms |",
-            "|---|---:|---:|---:|---:|---:|",
+            "| Workload | Profiler | Comparison | Candidate step ms | Torch step ms | Torch/Candidate speedup | Candidate minus Torch ms |",
+            "|---|---:|---|---:|---:|---:|---:|",
         ]
         for row in summary["comparisons"]:
             lines.append(
-                "| {workload} | {profiler} | {asym_step_ms:.3f} | {torch_step_ms:.3f} | "
-                "{asym_vs_torch_speedup:.3f} | {asym_vs_torch_step_ms_delta:.3f} |".format(**row)
+                "| {workload} | {profiler} | {comparison} | {candidate_step_ms:.3f} | {torch_step_ms:.3f} | "
+                "{torch_over_candidate_speedup:.3f} | {candidate_minus_torch_ms:.3f} |".format(**row)
             )
     else:
-        lines.append("No paired `asym_only`/`torch_only` comparisons were available.")
+        lines.append("No paired comparisons against `torch` were available.")
     lines.append("")
     return "\n".join(lines)
 
@@ -340,13 +439,16 @@ def parse_args() -> argparse.Namespace:
         "--workloads",
         nargs="+",
         default=["qwen"],
-        help=f"Workload list or aliases. Workloads: {', '.join(WORKLOADS)}. Aliases: {', '.join(WORKLOAD_ALIASES)}.",
+        help=(
+            f"Workload list or aliases. Use workload|layers for per-workload depth, e.g. moe-604m-a75m|2. "
+            f"Workloads: {', '.join(WORKLOADS)}. Aliases: {', '.join(WORKLOAD_ALIASES)}."
+        ),
     )
     parser.add_argument(
         "--backends",
         nargs="+",
-        default=["asym_only", "torch_only"],
-        help="Backend list. Only asym_only and torch_only are accepted for clean comparison.",
+        default=["asym", "torch", "kt"],
+        help="Backend list. Allowed values: asym, torch, kt.",
     )
     parser.add_argument(
         "--profilers",
@@ -373,21 +475,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mlp-expansion", type=int, default=DEFAULT_LORA_MLP_EXPANSION)
     parser.add_argument("--lora-rank", type=int, default=64)
     parser.add_argument("--lora-alpha", type=float, default=128.0)
+    parser.add_argument("--lora-dtype", choices=LORA_DTYPE_CHOICES, default="bf16")
     parser.add_argument("--vocab-rows", type=int, default=4096)
     parser.add_argument("--precision", default="bf16", help="Experiment precision label used in result table filenames.")
-    parser.add_argument("--workflow", default="lora_sft", help="Experiment workflow label used in result table filenames.")
     parser.add_argument(
         "--mode",
         default="auto",
-        help="Result filename mode label. Default auto uses <backend-label>_<profiler>, e.g. asym-only_nsys.",
+        help="Result filename mode label. Default auto uses <backend-label>_<profiler>, e.g. asym_nsys.",
     )
     parser.add_argument("--moe-mode", choices=["contiguous", "masked"], default="contiguous")
+    parser.add_argument("--kt-method", default="AMXBF16_SFT", choices=["AMXBF16_SFT", "AMXINT8_SFT", "AMXINT4_SFT"])
+    parser.add_argument("--kt-cpu-threads", type=int, default=1)
+    parser.add_argument("--kt-threadpool-count", type=int, default=1)
+    parser.add_argument("--kt-max-cache-depth", type=int, default=1)
     parser.add_argument(
+        "--target-preset",
         "--dense-target-mode",
+        dest="dense_target_mode",
         choices=DENSE_TARGET_MODES,
         default=DEFAULT_DENSE_TARGET_MODE,
-        help="Dense workload target scope. Default offloads only MLP base projections, matching MoE expert-MLP scope.",
+        help="Dense workload target scope. Default adapts all known target projections.",
     )
+    parser.add_argument("--target-modules", default=DEFAULT_TARGET_MODULES)
+    parser.add_argument("--offload-modules", default=DEFAULT_OFFLOAD_MODULES)
     parser.add_argument("--nsys-bin", default="nsys")
     parser.add_argument("--ncu-bin", default="ncu")
     parser.add_argument("--ncu-preset", choices=["quick", "paper"], default="paper")
@@ -414,7 +524,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    workloads = _expand_workloads(args.workloads)
+    _preflight_runtime(args)
+    workload_specs = _expand_workloads(args.workloads)
     backends = _expand_backends(args.backends)
     profilers = _expand_profilers(args.profilers)
     cuda_devices = _cuda_devices(args.cuda_devices)
@@ -424,12 +535,15 @@ def main() -> None:
     rows: list[dict[str, Any]] = []
     commands: list[dict[str, Any]] = []
     task_index = 0
-    for workload in workloads:
+    for workload_spec in workload_specs:
+        workload = workload_spec.name
+        workload_label = workload_spec.label
+        profile_layers = int(workload_spec.profile_layers or args.profile_layers)
         for backend in backends:
             for profiler in profilers:
                 physical_cuda_device = cuda_devices[task_index % len(cuda_devices)] if cuda_devices else None
                 child_device = "cuda:0" if physical_cuda_device is not None else args.device
-                output_dir = _raw_output_dir(run_dir, workload, args, backend, profiler)
+                output_dir = _raw_output_dir(run_dir, workload_label, args, backend, profiler)
                 output_dir.mkdir(parents=True, exist_ok=True)
                 env = os.environ.copy()
                 env["PYTHONUNBUFFERED"] = "1"
@@ -438,12 +552,15 @@ def main() -> None:
 
                 commands_for_task: list[list[str]]
                 skip_reason = ""
-                if profiler == "source":
+                if backend == "kt" and workload not in KT_MOE_WORKLOADS:
+                    skip_reason = "backend=kt is only implemented for MoE LoRA SFT workloads"
+                    commands_for_task = []
+                elif profiler == "source":
                     commands_for_task = [
                         [
                             sys.executable,
                             str(PROFILE_SCRIPT),
-                            *_common_profile_args(args, workload, backend, child_device, output_dir),
+                            *_common_profile_args(args, workload, backend, child_device, output_dir, profile_layers=profile_layers),
                         ]
                     ]
                 elif profiler == "nsys":
@@ -464,7 +581,7 @@ def main() -> None:
                             f"--output={report_prefix}",
                             sys.executable,
                             str(PROFILE_SCRIPT),
-                            *_common_profile_args(args, workload, backend, child_device, source_dir),
+                            *_common_profile_args(args, workload, backend, child_device, source_dir, profile_layers=profile_layers),
                         ],
                         [
                             args.nsys_bin,
@@ -480,7 +597,7 @@ def main() -> None:
                             [
                                 sys.executable,
                                 str(PROFILE_SCRIPT),
-                                *_common_profile_args(args, workload, backend, child_device, memory_dir),
+                                *_common_profile_args(args, workload, backend, child_device, memory_dir, profile_layers=profile_layers),
                                 "--warmup-steps",
                                 "0",
                                 "--measure-steps",
@@ -511,14 +628,14 @@ def main() -> None:
                         [
                             sys.executable,
                             str(CPU_GAPS_SCRIPT),
-                            *_common_profile_args(args, workload, backend, child_device, output_dir),
+                            *_common_profile_args(args, workload, backend, child_device, output_dir, profile_layers=profile_layers),
                             "--nsys-bin",
                             args.nsys_bin,
                         ]
                     ]
                 elif profiler == "ncu":
-                    if backend != "asym_only":
-                        skip_reason = "ncu only profiles AsymGEMM kernels; torch_only has no matching AsymGEMM kernel"
+                    if backend != "asym":
+                        skip_reason = f"ncu only profiles AsymGEMM kernels; backend={backend} has no matching AsymGEMM kernel"
                         commands_for_task = []
                     elif workload not in NCU_WORKLOADS:
                         skip_reason = f"ncu wrapper supports {sorted(NCU_WORKLOADS)}, not {workload!r}"
@@ -547,8 +664,12 @@ def main() -> None:
                             args.moe_mode,
                             "--dense-target-mode",
                             args.dense_target_mode,
+                            "--target-modules",
+                            args.target_modules,
+                            "--offload-modules",
+                            args.offload_modules,
                             "--profile-layers",
-                            str(args.profile_layers),
+                            str(profile_layers),
                             "--batch-size",
                             str(args.batch_size),
                             "--seq-len",
@@ -563,6 +684,8 @@ def main() -> None:
                             str(args.lora_rank),
                             "--lora-alpha",
                             str(args.lora_alpha),
+                            "--lora-dtype",
+                            args.lora_dtype,
                             "--vocab-rows",
                             str(args.vocab_rows),
                         ]
@@ -573,7 +696,9 @@ def main() -> None:
                     raise AssertionError(profiler)
 
                 command_record = {
-                    "workload": workload,
+                    "workload": workload_label,
+                    "base_workload": workload,
+                    "profile_layers": profile_layers,
                     "backend": backend,
                     "profiler": profiler,
                     "device": child_device,
@@ -587,7 +712,7 @@ def main() -> None:
 
                 if skip_reason:
                     row = _summary_row(
-                        workload=workload,
+                        workload=workload_label,
                         backend=backend,
                         profiler=profiler,
                         device=child_device,
@@ -598,6 +723,8 @@ def main() -> None:
                     )
                     row["status"] = "skipped"
                     row["skip_reason"] = skip_reason
+                    row["base_workload"] = workload
+                    row["profile_layers"] = profile_layers
                     rows.append(row)
                     task_index += 1
                     continue
@@ -606,7 +733,7 @@ def main() -> None:
                     profile, profile_path = _load_profile(output_dir)
                     returncode = 0 if profile_path is not None else 1
                     row = _summary_row(
-                        workload=workload,
+                        workload=workload_label,
                         backend=backend,
                         profiler=profiler,
                         device=child_device,
@@ -616,6 +743,8 @@ def main() -> None:
                         profile=profile,
                     )
                     row["profile_json"] = str(profile_path) if profile_path is not None else None
+                    row["base_workload"] = workload
+                    row["profile_layers"] = profile_layers
                     row["result_aliases"] = _write_result_aliases(args, run_dir, row)
                     rows.append(row)
                     if returncode != 0 and not args.continue_on_error:
@@ -637,7 +766,7 @@ def main() -> None:
 
                 if args.dry_run:
                     row = _summary_row(
-                        workload=workload,
+                        workload=workload_label,
                         backend=backend,
                         profiler=profiler,
                         device=child_device,
@@ -646,10 +775,12 @@ def main() -> None:
                         returncode=0,
                         profile={},
                     )
+                    row["base_workload"] = workload
+                    row["profile_layers"] = profile_layers
                 else:
                     profile, profile_path = _load_profile(output_dir)
                     row = _summary_row(
-                        workload=workload,
+                        workload=workload_label,
                         backend=backend,
                         profiler=profiler,
                         device=child_device,
@@ -659,6 +790,8 @@ def main() -> None:
                         profile=profile,
                     )
                     row["profile_json"] = str(profile_path) if profile_path is not None else None
+                    row["base_workload"] = workload
+                    row["profile_layers"] = profile_layers
                     row["result_aliases"] = _write_result_aliases(args, run_dir, row)
                 rows.append(row)
                 if result.returncode != 0 and not args.continue_on_error:
@@ -672,13 +805,14 @@ def main() -> None:
     summary = {
         "run_dir": str(run_dir),
         "precision": args.precision,
-        "workflow": args.workflow,
+        "workflow": WORKFLOW_LABEL,
         "mode": args.mode,
         "backend_semantics": {
-            "asym_only": "direct AsymGEMM host-weight path",
-            "torch_only": "normal GPU-resident PyTorch LoRA baseline with frozen base weights stored as CUDA buffers",
+            "asym": "direct AsymGEMM host-weight path",
+            "torch": "normal GPU-resident PyTorch LoRA baseline with frozen base weights stored as CUDA buffers",
+            "kt": "KTransformers AMX SFT MoE path for MoE workloads",
         },
-        "workloads": workloads,
+        "workloads": [spec.label for spec in workload_specs],
         "backends": backends,
         "profilers": profilers,
         "commands": commands,
@@ -691,8 +825,8 @@ def main() -> None:
             raise SystemExit(1)
         return
 
-    summary_stem = "_".join(part for part in (_safe_label(args.precision), _safe_label(args.workflow), "summary") if part)
-    commands_path = run_dir / f"{_safe_label(args.precision)}_{_safe_label(args.workflow)}_commands.json"
+    summary_stem = "_".join(part for part in (_safe_label(args.precision), _safe_label(WORKFLOW_LABEL), "summary") if part)
+    commands_path = run_dir / f"{_safe_label(args.precision)}_{_safe_label(WORKFLOW_LABEL)}_commands.json"
     commands_path.write_text(json.dumps(commands, indent=2) + "\n", encoding="utf-8")
     (run_dir / f"{summary_stem}.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     (run_dir / f"{summary_stem}.md").write_text(_markdown(summary), encoding="utf-8")
