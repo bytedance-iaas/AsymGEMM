@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 from asym_gemm.training.kt_moe import KTBackendUnavailable, _import_kt_moe_wrapper
 
@@ -14,6 +15,7 @@ from asym_gemm.training.kt_moe import KTBackendUnavailable, _import_kt_moe_wrapp
 ROOT = Path(__file__).resolve().parents[2]
 PROFILE_LORA_PATH = ROOT / "scripts" / "profile_lora.py"
 PROFILE_LORA_DRIVER_PATH = ROOT / "scripts" / "profile_lora_driver.py"
+POSTPROCESS_NSYS_LORA_PATH = ROOT / "scripts" / "postprocess_nsys_lora.py"
 
 
 def _load_profile_lora_module():
@@ -27,6 +29,15 @@ def _load_profile_lora_module():
 
 def _load_profile_lora_driver_module():
     spec = importlib.util.spec_from_file_location("profile_lora_driver_under_test", PROFILE_LORA_DRIVER_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_postprocess_nsys_lora_module():
+    spec = importlib.util.spec_from_file_location("postprocess_nsys_lora_under_test", POSTPROCESS_NSYS_LORA_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -61,6 +72,375 @@ def test_profile_lora_driver_supports_workload_layer_specs() -> None:
         ("dense_14b", 4, "dense_14b-l4"),
         ("moe-604m-a38m", 4, "moe-604m-a38m-l4"),
     ]
+
+
+def test_profile_lora_driver_result_stem_includes_input_shape_and_recompute() -> None:
+    driver = _load_profile_lora_driver_module()
+
+    args = argparse.Namespace(mode="auto", precision="bf16", batch_size=16, seq_len=2048, activation_recompute=True)
+    assert driver._result_stem(args, "asym", "nsys") == "bf16_lora-sft_b16_s2048_recomp_asym_nsys"
+
+    args.activation_recompute = False
+    assert driver._result_stem(args, "torch", "source") == "bf16_lora-sft_b16_s2048_norecomp_torch_source"
+
+
+def test_profile_lora_driver_does_not_create_skipped_result_dirs(tmp_path: Path) -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            str(PROFILE_LORA_DRIVER_PATH),
+            "--workloads",
+            "mlp",
+            "--backends",
+            "kt",
+            "--profilers",
+            "source",
+            "--output-root",
+            str(tmp_path),
+            "--skip-summary",
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+
+    assert not list(tmp_path.rglob("*_kt_source"))
+
+
+def test_profile_lora_driver_summary_row_reads_nested_nsys_profile() -> None:
+    driver = _load_profile_lora_driver_module()
+    row = driver._summary_row(
+        workload="moe-604m-a38m-l1",
+        backend="asym",
+        profiler="nsys",
+        device="cuda:0",
+        physical_cuda_device=None,
+        output_dir=ROOT / "profiling" / "moe-604m-a38m-l1",
+        returncode=0,
+        profile={
+            "source_profile": {
+                "step": {"total_milliseconds": 12.5},
+                "memory": {
+                    "gpu": {"peak_hbm_bytes": 4 * 1024 * 1024},
+                    "cpu": {
+                        "host_w_bytes": 2 * 1024 * 1024,
+                        "pinned_total_bytes": 5 * 1024 * 1024,
+                    },
+                },
+            }
+        },
+    )
+
+    assert row["step_ms"] == pytest.approx(12.5)
+    assert row["peak_hbm_bytes"] == 4 * 1024 * 1024
+    assert row["expected_hbm_saved_bytes"] == 2 * 1024 * 1024
+    assert row["hbm_saved_percent"] == pytest.approx(100.0 / 3.0)
+    assert row["pinned_cpu_bytes"] == 5 * 1024 * 1024
+
+
+def test_profile_lora_driver_prefers_nsys_stage_timing_over_source_step() -> None:
+    driver = _load_profile_lora_driver_module()
+
+    assert driver._profile_step_milliseconds(
+        {
+            "stages": [
+                {"stage": "step.forward", "total_milliseconds": 7.0},
+                {"stage": "step.backward", "total_milliseconds": 11.0},
+            ],
+            "source_profile": {"step": {"total_milliseconds": 99.0}},
+        }
+    ) == pytest.approx(18.0)
+
+
+def test_profile_lora_driver_writes_descending_latency_and_memory_rankings() -> None:
+    driver = _load_profile_lora_driver_module()
+    summary = {
+        "precision": "bf16",
+        "workflow": "lora-sft",
+        "runs": [
+            {
+                "workload": "fast",
+                "backend": "asym",
+                "profiler": "source",
+                "status": "ok",
+                "device": "cuda:0",
+                "step_ms": 1.0,
+                "peak_hbm_bytes": 30,
+                "expected_hbm_saved_bytes": 0,
+                "pinned_cpu_bytes": 0,
+                "output_dir": "fast",
+            },
+            {
+                "workload": "slow",
+                "backend": "torch",
+                "profiler": "source",
+                "status": "ok",
+                "device": "cuda:0",
+                "step_ms": 3.0,
+                "peak_hbm_bytes": 10,
+                "expected_hbm_saved_bytes": 0,
+                "pinned_cpu_bytes": 0,
+                "output_dir": "slow",
+            },
+            {
+                "workload": "memory-heavy",
+                "backend": "asym",
+                "profiler": "nsys",
+                "status": "ok",
+                "device": "cuda:0",
+                "step_ms": 2.0,
+                "peak_hbm_bytes": 50,
+                "expected_hbm_saved_bytes": 0,
+                "pinned_cpu_bytes": 0,
+                "output_dir": "memory-heavy",
+            },
+        ],
+    }
+
+    latency_rows = [line for line in driver._latency_markdown(summary).splitlines() if line.startswith("| ") and not line.startswith("| Rank") and not line.startswith("|---")]
+    memory_rows = [line for line in driver._memory_markdown(summary).splitlines() if line.startswith("| ") and not line.startswith("| Rank") and not line.startswith("|---")]
+
+    assert [row.split("|")[2].strip() for row in latency_rows] == ["slow", "memory-heavy", "fast"]
+    assert [row.split("|")[2].strip() for row in memory_rows] == ["memory-heavy", "fast", "slow"]
+    assert "GPU HBM saved %" in driver._memory_markdown(summary)
+
+
+def test_profile_lora_saved_tensor_buckets_keep_semantic_leaf_owners() -> None:
+    profile_lora = _load_profile_lora_module()
+
+    assert profile_lora._saved_tensor_bucket("forward.layers.0.mlp.silu_mul_activation") == "mlp.silu_mul_activation"
+    assert profile_lora._saved_tensor_bucket("forward.layers.0.attention.softmax") == "attention.softmax"
+    assert profile_lora._saved_tensor_bucket("forward.layers.0.attention.q_proj.lora_A") == "attention.q_proj.lora_A"
+    assert profile_lora._saved_tensor_bucket("forward.layers.0.routed_expert.gate_lora") == "routed_expert.gate.lora"
+    assert profile_lora._saved_tensor_bucket("forward.layers.0.routed_expert.gate_up_lora") == "routed_expert.gate_up.lora"
+
+
+def test_postprocess_semantic_keys_keep_torch_base_and_gate_up_lora() -> None:
+    postprocess = _load_postprocess_nsys_lora_module()
+
+    assert postprocess._semantic_leaf_key("forward.layers.0.attention.q_proj_base") == "attention.q_proj.base_torch"
+    assert postprocess._semantic_leaf_key("attention.q_proj.base_asymgemm") == "attention.q_proj.base_torch"
+    assert postprocess._semantic_leaf_label("attention.q_proj.base_torch") == "Attention q_proj base torch"
+    assert postprocess._semantic_leaf_key("forward.layers.0.routed_expert.gate_up_lora") == "routed_expert.gate_up.lora"
+
+
+def test_profiled_causal_mask_backward_is_labeled_and_masks_gradients() -> None:
+    profile_lora = _load_profile_lora_module()
+    book = profile_lora.StageBook(torch.device("cpu"), timing_mode="profile")
+    base = torch.arange(9, dtype=torch.float32, requires_grad=True)
+    scores = base.reshape(1, 1, 3, 3)
+    mask = torch.triu(torch.ones(3, 3, dtype=torch.bool), diagonal=1)
+
+    masked = profile_lora.profiled_causal_mask(
+        scores,
+        mask,
+        torch.finfo(scores.dtype).min,
+        "attention.causal_mask",
+        book,
+    )
+    masked.sum().backward()
+
+    expected = (~mask).to(dtype=torch.float32).reshape(1, 1, 3, 3)
+    assert base.grad is not None
+    assert torch.equal(base.grad.reshape(1, 1, 3, 3), expected)
+    assert "backward.attention.causal_mask.grad" in book.values
+
+
+def test_postprocess_front_summary_uses_semantic_leaf_rows() -> None:
+    postprocess = _load_postprocess_nsys_lora_module()
+    report = {
+        "stages": [
+                {
+                    "stage": "step.forward",
+                    "total_milliseconds": 10.0,
+                    "stage_breakdown": {"rows": [{"name": "cuda_memcpy_union", "milliseconds": 0.0, "percent": 0.0}]},
+                "operation_kernel_classes": {
+                    "rows": [
+                        {
+                            "operation": "forward.layers.0.mlp.silu_mul_activation",
+                            "kernel_class": "Torch elementwise kernel",
+                            "milliseconds": 0.7,
+                        },
+                        {
+                            "operation": "forward.layers.0.attention.softmax",
+                            "kernel_class": "Torch softmax kernel",
+                            "milliseconds": 0.2,
+                        },
+                    ]
+                },
+                "gpu_no_kernel_gap_attribution": {
+                    "rows": [
+                        {
+                            "name": "no-kernel host/autograd/Python: attention softmax",
+                            "milliseconds": 0.05,
+                        }
+                    ]
+                },
+            },
+            {
+                "stage": "step.backward",
+                "total_milliseconds": 20.0,
+                "stage_breakdown": {"rows": [{"name": "cuda_memcpy_union", "milliseconds": 0.0}]},
+                "operation_kernel_classes": {
+                    "rows": [
+                        {
+                            "operation": "backward.layers.0.mlp.silu_mul_activation",
+                            "kernel_class": "Torch elementwise kernel",
+                            "milliseconds": 0.8,
+                        },
+                        {
+                            "operation": "backward.layers.0.attention.softmax",
+                            "kernel_class": "Torch softmax kernel",
+                            "milliseconds": 0.3,
+                        },
+                    ]
+                },
+                "gpu_no_kernel_gap_attribution": {"rows": []},
+            },
+        ],
+        "memory_profile": {
+            "memory_attribution": {
+                "saved_activations": {
+                    "rows": [
+                        {"owner": "mlp.silu_mul_activation", "unique_bytes": 1024 * 1024},
+                        {"owner": "attention.softmax", "unique_bytes": 2 * 1024 * 1024},
+                    ]
+                }
+            }
+        },
+    }
+
+    rows = {row["key"]: row for row in postprocess._semantic_timing_memory_rows(report)}
+
+    assert rows["mlp.silu_mul_activation"]["forward_gpu_ms"] == pytest.approx(0.7)
+    assert rows["mlp.silu_mul_activation"]["backward_gpu_ms"] == pytest.approx(0.8)
+    assert rows["mlp.silu_mul_activation"]["saved_activation_mib"] == pytest.approx(1.0)
+    assert rows["mlp.silu_mul_activation"]["saved_activation_percent"] == pytest.approx(100.0 / 3.0)
+    assert rows["attention.softmax"]["forward_gpu_ms"] == pytest.approx(0.2)
+    assert rows["attention.softmax"]["forward_gap_ms"] == pytest.approx(0.05)
+    assert rows["attention.softmax"]["saved_activation_mib"] == pytest.approx(2.0)
+    assert rows["attention.softmax"]["saved_activation_percent"] == pytest.approx(200.0 / 3.0)
+
+
+def test_postprocess_no_kernel_labels_are_canonical() -> None:
+    postprocess = _load_postprocess_nsys_lora_module()
+
+    assert postprocess._gap_semantic_key("No-kernel misc small gaps", "step.forward")[1] == "No-kernel forward misc small gaps"
+    assert postprocess._gap_semantic_key("no-kernel misc small gaps", "step.backward")[1] == "No-kernel backward misc small gaps"
+    assert (
+        postprocess._gap_semantic_key("No-kernel host/autograd/Python: routed MoE / grouped", "step.forward")[1]
+        == "No-kernel forward routed MoE / grouped"
+    )
+    assert (
+        postprocess._gap_semantic_key(
+            "No-kernel host/autograd/Python: forward unlabeled kernel chain (Torch copy/cast kernel -> Torch/CUTLASS GEMM kernel)",
+            "step.forward",
+        )[1]
+        == "No-kernel forward unlabeled kernel chain (Torch copy/cast kernel -> Torch/CUTLASS GEMM kernel)"
+    )
+
+
+def test_postprocess_writes_separate_latency_and_memory_markdown() -> None:
+    postprocess = _load_postprocess_nsys_lora_module()
+    mib = 1024 * 1024
+    empty_stage_details = {
+        "host_api_breakdown": {"rows": []},
+        "operation_kernel_time": {"rows": []},
+        "operation_cuda_api_time": {"rows": []},
+        "gpu_no_kernel_gap_attribution": {"rows": []},
+        "gpu_no_kernel_gaps": {"rows": []},
+    }
+    report = {
+        "source": "trace.sqlite",
+        "stages": [
+            {
+                "stage": "step.forward",
+                "total_milliseconds": 10.0,
+                "stage_breakdown": {"rows": [{"name": "cuda_memcpy_union", "milliseconds": 0.0, "percent": 0.0}]},
+                "operation_kernel_classes": {
+                    "rows": [
+                            {
+                                "operation": "forward.layers.0.attention.softmax",
+                                "kernel_class": "Torch softmax kernel",
+                                "milliseconds": 2.0,
+                                "percent": 20.0,
+                            }
+                    ]
+                },
+                **empty_stage_details,
+            },
+            {
+                "stage": "step.backward",
+                "total_milliseconds": 10.0,
+                "stage_breakdown": {"rows": [{"name": "cuda_memcpy_union", "milliseconds": 0.0, "percent": 0.0}]},
+                "operation_kernel_classes": {"rows": []},
+                **empty_stage_details,
+            },
+        ],
+        "source_profile": {
+            "memory": {
+                "gpu": {"peak_hbm_bytes": 4 * mib, "parameter_bytes": 1 * mib, "buffer_bytes": 0, "unattributed_peak_bytes": 3 * mib},
+                "cpu": {"pinned_total_bytes": 2 * mib},
+            },
+            "stage_memory": {"rows": []},
+        },
+        "memory_profile": {
+            "memory_attribution": {
+                "categories": {"rows": [{"category": "gpu saved", "memory_space": "GPU HBM", "bytes": 3 * mib, "accuracy": "exact"}]},
+                "saved_activations": {
+                    "rows": [
+                        {"owner": "attention.softmax", "unique_bytes": 5 * mib, "reference_bytes": 5 * mib, "save_count": 1, "unique_tensor_count": 1},
+                    ],
+                    "total_unique_bytes": 5 * mib,
+                },
+            }
+        },
+    }
+
+    latency_text = postprocess.latency_markdown(report)
+    memory_text = postprocess.memory_markdown(report)
+
+    assert "## Top Latency" in latency_text
+    assert "### Operation Kernel Classes" in latency_text
+    assert "## Top Memory" not in latency_text
+    assert "## Top Memory" in memory_text
+    assert "## Fine-Grained Memory Attribution" in memory_text
+    assert "### Operation Kernel Classes" not in memory_text
+    assert memory_text.index("| memory attribution pass saved activation | attention.softmax | GPU HBM | 5242880 | 5.00 |") < memory_text.index("| source timing pass | GPU peak HBM | GPU HBM | 4194304 | 4.00 |")
+
+
+def test_postprocess_memory_attribution_percentages_are_gpu_only() -> None:
+    postprocess = _load_postprocess_nsys_lora_module()
+    mib = 1024 * 1024
+    profile = {
+        "memory": {"gpu": {"peak_hbm_bytes": 4 * mib}},
+        "memory_attribution": {
+            "categories": {
+                "rows": [
+                    {"category": "cpu offload", "memory_space": "CPU pinned", "bytes": 20 * mib, "accuracy": "exact"},
+                    {"category": "gpu saved", "memory_space": "GPU HBM", "bytes": 3 * mib, "accuracy": "exact"},
+                    {"category": "gpu params", "memory_space": "GPU HBM", "bytes": 1 * mib, "accuracy": "exact"},
+                ]
+            },
+            "saved_activations": {
+                "rows": [
+                    {"owner": "attention.softmax", "unique_bytes": 2 * mib, "reference_bytes": 4 * mib, "save_count": 2, "unique_tensor_count": 1},
+                    {"owner": "mlp.silu_mul_activation", "unique_bytes": 1 * mib, "reference_bytes": 1 * mib, "save_count": 1, "unique_tensor_count": 1},
+                ],
+                "total_unique_bytes": 3 * mib,
+            },
+        }
+    }
+
+    text = "\n".join(postprocess._memory_attribution_markdown(profile))
+
+    assert "Percent denominator: memory-attribution pass peak HBM `4194304` bytes." in text
+    assert "| Category | Memory space | bytes | MiB | % peak HBM | Accuracy |" in text
+    assert "| cpu offload | CPU pinned | 20971520 | 20.00 | - | exact |" in text
+    assert "| gpu saved | GPU HBM | 3145728 | 3.00 | 75.00% | exact |" in text
+    assert "| gpu params | GPU HBM | 1048576 | 1.00 | 25.00% | exact |" in text
+    assert "| Owner | unique bytes | unique MiB | % saved GPU | reference bytes | reference MiB | saves | unique tensors |" in text
+    assert "| attention.softmax | 2097152 | 2.00 | 66.67% | 4194304 | 4.00 | 2 | 1 |" in text
+    assert "| mlp.silu_mul_activation | 1048576 | 1.00 | 33.33% | 1048576 | 1.00 | 1 | 1 |" in text
 
 
 def test_kt_backend_is_restricted_to_moe_workloads() -> None:

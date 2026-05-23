@@ -347,6 +347,67 @@ def test_tiny_moe_micro_model_is_transformer_style_with_shared_and_routed_expert
     _assert_transformer_forward_contract(asym, config, device=device, dtype=dtype)
 
 
+def test_tiny_moe_activation_recompute_uses_layer_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = TinyMoEConfig(
+        num_layers=2,
+        num_experts=2,
+        num_shared_experts=0,
+        top_k=1,
+        vocab_size=64,
+        hidden_size=32,
+        num_heads=4,
+        batch_size=1,
+        seq_len=4,
+        intermediate_size=64,
+        logical_tokens=4,
+        lora_rank=4,
+        lora_alpha=8.0,
+        residual_scale=0.25,
+    )
+    device = torch.device("cpu")
+    dtype = torch.float32
+    calls = 0
+    original_checkpoint = tiny_moe.checkpoint
+
+    def recording_checkpoint(function: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return original_checkpoint(function, *args, **kwargs)
+
+    monkeypatch.setattr(tiny_moe, "checkpoint", recording_checkpoint)
+    model, _, _, _ = tiny_moe.make_tiny_moe_pair(
+        config=config,
+        seed=213,
+        device=device,
+        base_dtype=dtype,
+        backend="torch",
+        pin_memory=False,
+        gradient_checkpointing=True,
+    )
+    layer_calls = [0 for _ in model.layers]
+    handles = []
+    for index, layer in enumerate(model.layers):
+        def count_layer_call(_module: torch.nn.Module, _args: tuple[Any, ...], *, index: int = index) -> None:
+            layer_calls[index] += 1
+
+        handles.append(layer.register_forward_pre_hook(count_layer_call))
+    static_routes = tiny_moe.make_static_routes(config, device, pattern="balanced")
+    inputs = _make_input(config, device=device, dtype=dtype, seed=214).requires_grad_(True)
+
+    try:
+        output = model(inputs, static_routing=static_routes, mode="contiguous")
+        assert isinstance(output, torch.Tensor)
+        _loss(output).backward()
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert calls == config.num_layers
+    assert layer_calls == [2 for _ in model.layers]
+    assert inputs.grad is not None
+    assert bool(torch.isfinite(inputs.grad).all().item())
+
+
 def test_tiny_moe_asym_base_weights_are_grouped_host_stacks() -> None:
     config = MICRO_MOE_CONFIG
     device = torch.device("cpu")

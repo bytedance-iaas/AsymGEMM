@@ -1,4 +1,5 @@
 import importlib
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -141,8 +142,19 @@ def test_backward_does_not_materialize_host_weight_transpose_cpu() -> None:
     y_ref = x_ref @ weight.t()
     y_ref.float().square().mean().backward()
 
-    assert getattr(host_weight, "_transpose") is None
+    assert host_weight.pinned_cpu_bytes == 0
     torch.testing.assert_close(x.grad, x_ref.grad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA pinning required")
+def test_host_weight_exposes_only_single_pinned_weight_copy() -> None:
+    torch.manual_seed(12)
+    weight = torch.randn(8, 16, dtype=torch.bfloat16)
+    host_weight = HostWeight.from_tensor(weight, pin_memory=True)
+    if not host_weight.weight.is_pinned():
+        pytest.skip("pin_memory unavailable")
+
+    assert host_weight.pinned_cpu_bytes == host_weight.weight_nbytes
 
 
 def test_grouped_frozen_linear_cpu_forward_dx_and_no_dw() -> None:
@@ -347,6 +359,99 @@ def test_grouped_expert_lora_cuda_uses_grouped_mm_without_transpose_copy(monkeyp
     assert calls == [((512, k), (3, k, n), torch.int32, False)]
 
 
+@pytest.mark.skipif(not _torch_grouped_mm_available(), reason="torch grouped_mm requires CUDA and PyTorch grouped MM")
+def test_grouped_expert_lora_dense_no_empty_uses_training_safe_full_stack() -> None:
+    torch.manual_seed(25)
+    k = 128
+    n = 16
+    offsets = torch.tensor([0, 128, 256, 384, 512], device="cuda", dtype=torch.long)
+    experts = torch.tensor([0, 1, 2, 3, -1], device="cuda", dtype=torch.long)
+    metadata = lora_impl.prepare_grouped_lora_metadata(offsets, experts, dense_experts=True)
+    assert metadata.dense_expert_weights
+
+    x = torch.randn(512, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight = torch.randn(4, n, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+
+    y = lora_impl.grouped_expert_lora(x, weight, offsets, experts, metadata=metadata)
+    y_ref = torch.cat(
+        [
+            x_ref[0:128] @ weight_ref[0].t(),
+            x_ref[128:256] @ weight_ref[1].t(),
+            x_ref[256:384] @ weight_ref[2].t(),
+            x_ref[384:512] @ weight_ref[3].t(),
+        ],
+        dim=0,
+    )
+    loss = y.float().square().mean()
+    loss_ref = y_ref.float().square().mean()
+    loss.backward()
+    loss_ref.backward()
+
+    torch.testing.assert_close(y, y_ref, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=0.02, rtol=0.02)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=0.02, rtol=0.02)
+
+
+@pytest.mark.skipif(not _torch_grouped_mm_available(), reason="torch grouped_mm requires CUDA and PyTorch grouped MM")
+def test_packed_expert_lora_gate_up_cuda_uses_two_grouped_mm_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(24)
+    hidden = 128
+    intermediate = 64
+    rank = 16
+    num_experts = 4
+    offsets = torch.tensor([0, 128, 128, 384, 512], device="cuda", dtype=torch.long)
+    experts = torch.tensor([2, 0, 3, 1, -1], device="cuda", dtype=torch.long)
+
+    def expert_state() -> dict[str, torch.Tensor]:
+        return {
+            "gate_lora_a": torch.randn(rank, hidden, dtype=torch.bfloat16) * 0.01,
+            "gate_lora_b": torch.randn(intermediate, rank, dtype=torch.bfloat16) * 0.01,
+            "up_lora_a": torch.randn(rank, hidden, dtype=torch.bfloat16) * 0.01,
+            "up_lora_b": torch.randn(intermediate, rank, dtype=torch.bfloat16) * 0.01,
+            "down_lora_a": torch.randn(rank, intermediate, dtype=torch.bfloat16) * 0.01,
+            "down_lora_b": torch.randn(hidden, rank, dtype=torch.bfloat16) * 0.01,
+        }
+
+    states = [expert_state() for _ in range(num_experts)]
+    config = SimpleNamespace(hidden_size=hidden, intermediate_size=intermediate, lora_scale=0.5)
+    fused = lora_impl.PackedExpertLoRA(states, config=config, device=torch.device("cuda"), lora_dtype=torch.bfloat16)
+    ref = lora_impl.PackedExpertLoRA(states, config=config, device=torch.device("cuda"), lora_dtype=torch.bfloat16)
+    x = torch.randn(512, hidden, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+
+    ref_metadata = ref.prepare_metadata(offsets, experts)
+    gate_ref = ref(x_ref, offsets, experts, "gate", torch.bfloat16, metadata=ref_metadata)
+    up_ref = ref(x_ref, offsets, experts, "up", torch.bfloat16, metadata=ref_metadata)
+    loss_ref = gate_ref.float().square().mean() + up_ref.float().square().mean()
+    loss_ref.backward()
+
+    real_grouped_mm = lora_impl._TORCH_GROUPED_MM
+    calls: list[tuple[tuple[int, ...], tuple[int, ...], torch.dtype, bool]] = []
+
+    def counted_grouped_mm(mat1: torch.Tensor, mat2: torch.Tensor, *, offs: torch.Tensor) -> torch.Tensor:
+        calls.append((tuple(mat1.shape), tuple(mat2.shape), offs.dtype, mat2.is_contiguous()))
+        return real_grouped_mm(mat1, mat2, offs=offs)
+
+    monkeypatch.setattr(lora_impl, "_TORCH_GROUPED_MM", counted_grouped_mm)
+
+    metadata = fused.prepare_metadata(offsets, experts)
+    gate, up = fused.forward_gate_up(x, offsets, experts, torch.bfloat16, metadata=metadata)
+    loss = gate.float().square().mean() + up.float().square().mean()
+    loss.backward()
+
+    torch.testing.assert_close(gate, gate_ref, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(up, up_ref, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=0.02, rtol=0.02)
+    for name in ("gate_lora_a", "gate_lora_b", "up_lora_a", "up_lora_b"):
+        torch.testing.assert_close(getattr(fused, name).grad, getattr(ref, name).grad, atol=0.02, rtol=0.02)
+    assert calls == [
+        ((512, hidden), (3, hidden, 2 * rank), torch.int32, False),
+        ((1024, rank), (6, rank, intermediate), torch.int32, False),
+    ]
+
+
 def test_transpose_capability_check_uses_original_weight_without_copy() -> None:
     torch.manual_seed(12)
     x = torch.randn(3, 7, dtype=torch.float32)
@@ -357,7 +462,7 @@ def test_transpose_capability_check_uses_original_weight_without_copy() -> None:
 
     assert not ok
     assert reason in {"cuda_unavailable", "input_not_cuda", "requires_bf16"}
-    assert getattr(host_weight, "_transpose") is None
+    assert host_weight.pinned_cpu_bytes == 0
 
 
 @pytest.mark.skipif(not _direct_bf16_available(), reason="direct BF16 AsymGEMM requires SM90/SM100")
@@ -394,7 +499,7 @@ def test_direct_bf16_forward_and_dx_match_torch() -> None:
     )
 
     torch.testing.assert_close(x.grad, x_ref.grad, atol=0.04, rtol=0.04)
-    assert getattr(host_weight, "_transpose") is None
+    assert host_weight.pinned_cpu_bytes == host_weight.weight_nbytes
     assert stats.asym_forward_calls == 1
     assert stats.asym_dx_calls == 1
     assert stats.staged_calls == 0
@@ -406,8 +511,8 @@ def test_direct_grouped_bf16_forward_and_dx_match_torch() -> None:
     torch.manual_seed(15)
     counts = [5, 7, 6]
     m = sum(counts)
-    n = 24
-    k = 16
+    n = 64
+    k = 64
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     x_ref = x.detach().clone().requires_grad_(True)
     weight = torch.randn(len(counts), n, k, dtype=torch.bfloat16)
@@ -434,6 +539,7 @@ def test_direct_grouped_bf16_forward_and_dx_match_torch() -> None:
     torch.testing.assert_close(x.grad, x_ref.grad, atol=0.04, rtol=0.04)
     assert grouped.host_weight.weight.device.type == "cpu"
     assert grouped.host_weight.weight.grad is None
+    assert grouped.host_weight.pinned_cpu_bytes == grouped.host_weight.weight_nbytes
     assert grouped.stats.asym_forward_calls == 1
     assert grouped.stats.asym_dx_calls == 1
     assert grouped.stats.staged_calls == 0

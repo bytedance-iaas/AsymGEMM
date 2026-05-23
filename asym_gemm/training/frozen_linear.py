@@ -304,6 +304,8 @@ def _direct_grouped_bf16_reason(a: torch.Tensor, b_cpu: torch.Tensor, *, transpo
         return "requires_positive_nk"
     if n % 8 != 0 or k % 8 != 0:
         return "requires_8_aligned_nk"
+    if transpose_b and k % 64 != 0:
+        return "transpose_b_requires_64_aligned_k"
 
     import asym_gemm
 
@@ -1106,8 +1108,8 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             grad_output_2d = grad_output.reshape(-1, int(ctx.host_weight.weight.shape[1])).contiguous()
             if ctx.precision == "bf16":
-                b_cpu = ctx.host_weight.transposed_tensor()
-                transpose_b = False
+                b_cpu = ctx.host_weight.weight
+                transpose_b = True
                 quantized_weight_t = None
             else:
                 b_cpu = ctx.host_weight.weight

@@ -18,6 +18,7 @@ from typing import Any, Literal, Mapping, Sequence
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .frozen_linear import (
     AsymExecutionStats,
@@ -29,7 +30,7 @@ from .frozen_linear import (
 )
 from .host_weight import tensor_nbytes
 from .kt_moe import DEFAULT_KT_METHOD, KTRoutedExpertMoE, normalize_kt_method
-from .lora import PackedExpertLoRA, grouped_expert_lora, normalize_lora_dtype
+from .lora import GroupedLoRAMetadata, PackedExpertLoRA, grouped_expert_lora, normalize_lora_dtype
 from .profile_ranges import prof_range
 
 
@@ -832,7 +833,8 @@ class AsymTinyMoELayer(nn.Module):
             num_groups=self.config.num_experts,
             device=packed.device,
         )
-        return self.expert_lora(packed, offsets, experts, prefix, out_dtype)
+        lora_metadata = self.expert_lora.prepare_metadata(offsets, experts, dense_experts=True)
+        return self.expert_lora(packed, offsets, experts, prefix, out_dtype, metadata=lora_metadata)
 
     def _lora_shared(
         self,
@@ -840,12 +842,18 @@ class AsymTinyMoELayer(nn.Module):
         offsets: torch.Tensor,
         prefix: str,
         out_dtype: torch.dtype,
+        *,
+        experts: torch.Tensor | None = None,
+        lora_metadata: GroupedLoRAMetadata | None = None,
     ) -> torch.Tensor:
         if self.shared_expert_lora is None:
             out_features = self.config.intermediate_size if prefix in {"gate", "up"} else self.config.hidden_size
             return packed.new_empty((0, out_features))
-        _, experts = self._dense_group_metadata(offsets, num_groups=self.shared_expert_lora.num_experts, device=packed.device)
-        return self.shared_expert_lora(packed, offsets, experts, prefix, out_dtype)
+        if experts is None:
+            _, experts = self._dense_group_metadata(offsets, num_groups=self.shared_expert_lora.num_experts, device=packed.device)
+        if lora_metadata is None:
+            lora_metadata = self.shared_expert_lora.prepare_metadata(offsets, experts)
+        return self.shared_expert_lora(packed, offsets, experts, prefix, out_dtype, metadata=lora_metadata)
 
     def _run_grouped_compact(
         self,
@@ -873,17 +881,28 @@ class AsymTinyMoELayer(nn.Module):
         up = up_base(packed, offsets, experts, dense_experts=dense_experts)
         range_prefix = f"forward.{profile_prefix}"
         if shared:
-            with prof_range(f"{range_prefix}.gate_lora"):
-                gate_lora = self._lora_shared(packed, offsets, "gate", packed.dtype)
-            with prof_range(f"{range_prefix}.up_lora"):
-                up_lora = self._lora_shared(packed, offsets, "up", packed.dtype)
+            assert self.shared_expert_lora is not None
+            lora_metadata = self.shared_expert_lora.prepare_metadata(offsets, experts, dense_experts=dense_experts)
+            with prof_range(f"{range_prefix}.gate_up_lora"):
+                gate_lora, up_lora = self.shared_expert_lora.forward_gate_up(
+                    packed,
+                    offsets,
+                    experts,
+                    packed.dtype,
+                    metadata=lora_metadata,
+                )
             gate = gate + gate_lora
             up = up + up_lora
         else:
-            with prof_range(f"{range_prefix}.gate_lora"):
-                gate_lora = self.expert_lora(packed, offsets, experts, "gate", packed.dtype)
-            with prof_range(f"{range_prefix}.up_lora"):
-                up_lora = self.expert_lora(packed, offsets, experts, "up", packed.dtype)
+            lora_metadata = self.expert_lora.prepare_metadata(offsets, experts, dense_experts=dense_experts)
+            with prof_range(f"{range_prefix}.gate_up_lora"):
+                gate_lora, up_lora = self.expert_lora.forward_gate_up(
+                    packed,
+                    offsets,
+                    experts,
+                    packed.dtype,
+                    metadata=lora_metadata,
+                )
             gate = gate + gate_lora
             up = up + up_lora
         with prof_range(f"{range_prefix}.activation_silu_mul"):
@@ -891,11 +910,18 @@ class AsymTinyMoELayer(nn.Module):
         down = down_base(activated.contiguous(), offsets, experts, dense_experts=dense_experts)
         if shared:
             with prof_range(f"{range_prefix}.down_lora"):
-                down_lora = self._lora_shared(activated, offsets, "down", packed.dtype)
+                down_lora = self._lora_shared(
+                    activated,
+                    offsets,
+                    "down",
+                    packed.dtype,
+                    experts=experts,
+                    lora_metadata=lora_metadata,
+                )
             down = down + down_lora
         else:
             with prof_range(f"{range_prefix}.down_lora"):
-                down_lora = self.expert_lora(activated, offsets, experts, "down", packed.dtype)
+                down_lora = self.expert_lora(activated, offsets, experts, "down", packed.dtype, metadata=lora_metadata)
             down = down + down_lora
         return down
 
@@ -1268,6 +1294,7 @@ class TinyMoE(nn.Module):
         kt_cpu_threads: int | None = None,
         kt_threadpool_count: int = 1,
         kt_max_cache_depth: int = 1,
+        gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         if backend not in VALID_MOE_BACKENDS:
@@ -1286,6 +1313,7 @@ class TinyMoE(nn.Module):
         self.kt_method = resolved_kt_method if backend == "kt" else None
         self.offload_groups = tuple(sorted(_normalize_moe_module_selector(offload_modules, default=DEFAULT_OFFLOAD_MODULES, purpose="offload")))
         self.lora_dtype = lora_dtype
+        self.gradient_checkpointing = bool(gradient_checkpointing)
         self.stats = stats if stats is not None else AsymExecutionStats()
         state = clone_tiny_moe_state(state or make_tiny_moe_state(config, base_dtype=base_dtype))
         self.register_buffer(
@@ -1404,17 +1432,26 @@ class TinyMoE(nn.Module):
         details: list[dict[str, Any]] = []
         hidden, token_api = self._prepare_hidden(x, input_ids, inputs_embeds)
         for layer_idx, layer in enumerate(self.layers):
-            result = layer(
-                hidden,
-                static_routing=_routing_for_layer(static_routing, layer_idx),
-                mode=mode,
-                return_details=return_details,
-            )
-            if return_details:
+            routing = _routing_for_layer(static_routing, layer_idx)
+            if self.gradient_checkpointing and hidden.requires_grad and not return_details:
+                def layer_forward(hidden_states: torch.Tensor, *, layer: nn.Module = layer, routing: Routing | None = routing) -> torch.Tensor:
+                    result = layer(hidden_states, static_routing=routing, mode=mode, return_details=False)
+                    assert isinstance(result, torch.Tensor)
+                    return result
+
+                hidden = checkpoint(layer_forward, hidden, use_reentrant=False)
+            else:
+                result = layer(
+                    hidden,
+                    static_routing=routing,
+                    mode=mode,
+                    return_details=return_details,
+                )
+                if not return_details:
+                    hidden = result  # type: ignore[assignment]
+                    continue
                 hidden, detail = result  # type: ignore[misc]
                 details.append(detail)
-            else:
-                hidden = result  # type: ignore[assignment]
         hidden = self.final_layernorm(hidden)
         if token_api or labels is not None:
             logits = self.lm_head(hidden)
@@ -1704,6 +1741,7 @@ def make_tiny_moe_pair(
     kt_cpu_threads: int | None = None,
     kt_threadpool_count: int = 1,
     kt_max_cache_depth: int = 1,
+    gradient_checkpointing: bool = False,
 ) -> tuple[TinyMoE, TorchTinyMoEReference, dict[str, Any], AsymExecutionStats]:
     resolved_device = torch.device(device) if device is not None else default_tiny_moe_device()
     resolved_dtype = base_dtype or default_tiny_moe_base_dtype(resolved_device)
@@ -1726,6 +1764,7 @@ def make_tiny_moe_pair(
         kt_cpu_threads=kt_cpu_threads,
         kt_threadpool_count=kt_threadpool_count,
         kt_max_cache_depth=kt_max_cache_depth,
+        gradient_checkpointing=gradient_checkpointing,
     )
     ref = TorchTinyMoEReference(
         state,

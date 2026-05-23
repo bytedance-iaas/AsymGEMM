@@ -551,39 +551,67 @@ def _stack_expert_weight(expert_states: Sequence[Mapping[str, Any]], name: str) 
     return torch.stack([_state_tensor(expert_state, name) for expert_state in expert_states], dim=0).contiguous()
 
 
-def _grouped_lora_torch_mm(
-    x: torch.Tensor,
-    weight: torch.Tensor,
+@dataclass(frozen=True)
+class GroupedLoRAMetadata:
+    offsets: torch.Tensor
+    experts: torch.Tensor
+    active_experts: torch.Tensor
+    active_offsets: torch.Tensor
+    dense_expert_weights: bool = False
+
+    @property
+    def active_groups(self) -> int:
+        return int(self.active_offsets.numel())
+
+
+def prepare_grouped_lora_metadata(
     offsets: torch.Tensor,
     experts: torch.Tensor,
-) -> torch.Tensor:
-    if x.device.type != "cuda" or weight.device.type != "cuda" or x.device != weight.device:
-        raise RuntimeError(
-            f"grouped LoRA torch path using {_TORCH_GROUPED_MM_NAME} "
-            "requires input and LoRA weight on the same CUDA device"
-        )
-    if offsets.device != x.device or experts.device != x.device:
-        raise RuntimeError("grouped LoRA torch path requires offsets and experts on the input CUDA device")
-    if x.dtype != weight.dtype:
-        raise RuntimeError(
-            f"grouped LoRA torch path requires matching input/weight dtype, got {x.dtype} and {weight.dtype}"
-        )
-    if x.dim() != 2 or weight.dim() != 3:
-        raise ValueError("grouped LoRA torch path expects x=[M,K] and weight=[E,N,K]")
-    if offsets.dim() != 1 or experts.dim() != 1 or int(offsets.numel()) != int(experts.numel()):
-        raise ValueError("grouped LoRA torch path expects cumulative offsets and experts with matching sentinel length")
-
+    *,
+    dense_experts: bool = False,
+) -> GroupedLoRAMetadata:
     starts = offsets[:-1]
     ends = offsets[1:]
     active = ends > starts
     active_experts = experts[:-1][active].to(dtype=torch.long)
     active_offsets = ends[active].to(dtype=torch.int32).contiguous()
-    if int(active_offsets.numel()) == 0:
+    dense_expert_weights = bool(dense_experts and int(active_offsets.numel()) == int(ends.numel()))
+    return GroupedLoRAMetadata(
+        offsets=offsets,
+        experts=experts,
+        active_experts=active_experts,
+        active_offsets=active_offsets,
+        dense_expert_weights=dense_expert_weights,
+    )
+
+
+def _metadata_or_prepare(
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    metadata: GroupedLoRAMetadata | None,
+) -> GroupedLoRAMetadata:
+    return prepare_grouped_lora_metadata(offsets, experts) if metadata is None else metadata
+
+
+def _grouped_lora_torch_mm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    *,
+    metadata: GroupedLoRAMetadata | None = None,
+) -> torch.Tensor:
+    metadata = _metadata_or_prepare(offsets, experts, metadata)
+    if int(metadata.active_offsets.numel()) == 0:
         return x.new_empty((0, int(weight.shape[1])))
 
     mat1 = x.contiguous()
-    mat2 = weight.index_select(0, active_experts).transpose(-1, -2)
-    return _TORCH_GROUPED_MM(mat1, mat2, offs=active_offsets)
+    if metadata.dense_expert_weights and int(weight.shape[0]) == metadata.active_groups:
+        selected = weight
+    else:
+        selected = weight.index_select(0, metadata.active_experts)
+    mat2 = selected.transpose(-1, -2)
+    return _TORCH_GROUPED_MM(mat1, mat2, offs=metadata.active_offsets)
 
 
 def _grouped_lora_fallback(
@@ -591,9 +619,12 @@ def _grouped_lora_fallback(
     weight: torch.Tensor,
     offsets: torch.Tensor,
     experts: torch.Tensor,
+    *,
+    metadata: GroupedLoRAMetadata | None = None,
 ) -> torch.Tensor:
-    offsets_cpu = offsets.detach().to(device="cpu", dtype=torch.long).tolist()
-    experts_cpu = experts.detach().to(device="cpu", dtype=torch.long).tolist()
+    metadata = _metadata_or_prepare(offsets, experts, metadata)
+    offsets_cpu = metadata.offsets.detach().to(device="cpu", dtype=torch.long).tolist()
+    experts_cpu = metadata.experts.detach().to(device="cpu", dtype=torch.long).tolist()
     chunks: list[torch.Tensor] = []
     for group_idx, expert_idx in enumerate(experts_cpu[:-1]):
         start = int(offsets_cpu[group_idx])
@@ -612,14 +643,55 @@ def grouped_expert_lora(
     weight: torch.Tensor,
     offsets: torch.Tensor,
     experts: torch.Tensor,
+    *,
+    metadata: GroupedLoRAMetadata | None = None,
 ) -> torch.Tensor:
     """Run an expert-grouped LoRA projection with [E, out, in] weights."""
 
     if x.numel() == 0:
         return x.new_empty((0, int(weight.shape[1])))
     if x.device.type == "cuda" or weight.device.type == "cuda":
-        return _grouped_lora_torch_mm(x, weight, offsets, experts)
-    return _grouped_lora_fallback(x, weight, offsets, experts)
+        return _grouped_lora_torch_mm(x, weight, offsets, experts, metadata=metadata)
+    return _grouped_lora_fallback(x, weight, offsets, experts, metadata=metadata)
+
+
+def grouped_expert_lora_pair(
+    x0: torch.Tensor,
+    x1: torch.Tensor,
+    weight0: torch.Tensor,
+    weight1: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    *,
+    metadata: GroupedLoRAMetadata | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run two same-routed expert LoRA projections as one grouped_mm on CUDA."""
+
+    if x0.numel() == 0:
+        empty = x0.new_empty((0, int(weight0.shape[1])))
+        return empty, empty
+    metadata = _metadata_or_prepare(offsets, experts, metadata)
+    if x0.device.type != "cuda" or weight0.device.type != "cuda":
+        return (
+            grouped_expert_lora(x0, weight0, offsets, experts, metadata=metadata),
+            grouped_expert_lora(x1, weight1, offsets, experts, metadata=metadata),
+        )
+    if int(metadata.active_offsets.numel()) == 0:
+        empty = x0.new_empty((0, int(weight0.shape[1])))
+        return empty, empty
+
+    rows = int(x0.shape[0])
+    if metadata.dense_expert_weights and int(weight0.shape[0]) == metadata.active_groups:
+        selected0 = weight0
+        selected1 = weight1
+    else:
+        selected0 = weight0.index_select(0, metadata.active_experts)
+        selected1 = weight1.index_select(0, metadata.active_experts)
+    mat1 = torch.cat((x0.contiguous(), x1.contiguous()), dim=0)
+    mat2 = torch.cat((selected0, selected1), dim=0).transpose(-1, -2)
+    offs = torch.cat((metadata.active_offsets, metadata.active_offsets + rows), dim=0).contiguous()
+    out = _TORCH_GROUPED_MM(mat1, mat2, offs=offs)
+    return out[:rows], out[rows:]
 
 
 class PackedExpertLoRA(nn.Module):
@@ -660,6 +732,67 @@ class PackedExpertLoRA(nn.Module):
     def _weight(self, prefix: str, suffix: str) -> torch.Tensor:
         return getattr(self, f"{prefix}_lora_{suffix}")
 
+    def prepare_metadata(
+        self,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        *,
+        dense_experts: bool = False,
+    ) -> GroupedLoRAMetadata:
+        return prepare_grouped_lora_metadata(offsets, experts, dense_experts=dense_experts)
+
+    def _prepare_compute(
+        self,
+        x: torch.Tensor,
+        weights: Sequence[torch.Tensor],
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        compute_dtype = self.lora_dtype
+        if x.device.type == "cuda":
+            return x, tuple(weights)
+        return (
+            x.to(dtype=compute_dtype),
+            tuple(weight.to(device=x.device, dtype=compute_dtype) for weight in weights),
+        )
+
+    def forward_gate_up(
+        self,
+        x: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        out_dtype: torch.dtype,
+        *,
+        metadata: GroupedLoRAMetadata | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if x.numel() == 0:
+            empty = x.new_empty((0, self.config.intermediate_size))
+            return empty, empty
+
+        gate_a = self.gate_lora_a
+        up_a = self.up_lora_a
+        gate_b = self.gate_lora_b
+        up_b = self.up_lora_b
+        x_compute, prepared = self._prepare_compute(x, (gate_a, up_a, gate_b, up_b))
+        gate_a, up_a, gate_b, up_b = prepared
+        metadata = self.prepare_metadata(offsets, experts) if metadata is None else metadata
+
+        rank = int(gate_a.shape[1])
+        gate_up_a = torch.cat((gate_a, up_a), dim=1)
+        low_rank = grouped_expert_lora(x_compute, gate_up_a, offsets, experts, metadata=metadata)
+        gate_low_rank, up_low_rank = low_rank.split(rank, dim=-1)
+        gate_out, up_out = grouped_expert_lora_pair(
+            gate_low_rank,
+            up_low_rank,
+            gate_b,
+            up_b,
+            offsets,
+            experts,
+            metadata=metadata,
+        )
+        if self.lora_scale != 1.0:
+            gate_out = gate_out.mul_(self.lora_scale)
+            up_out = up_out.mul_(self.lora_scale)
+        return gate_out.to(dtype=out_dtype), up_out.to(dtype=out_dtype)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -667,6 +800,8 @@ class PackedExpertLoRA(nn.Module):
         experts: torch.Tensor,
         prefix: str,
         out_dtype: torch.dtype,
+        *,
+        metadata: GroupedLoRAMetadata | None = None,
     ) -> torch.Tensor:
         if prefix not in {"gate", "up", "down"}:
             raise ValueError(f"unsupported LoRA projection prefix {prefix!r}")
@@ -674,29 +809,21 @@ class PackedExpertLoRA(nn.Module):
         if x.numel() == 0:
             return x.new_empty((0, out_features))
 
-        compute_dtype = self.lora_dtype
         a = self._weight(prefix, "a")
         b = self._weight(prefix, "b")
-        if x.device.type == "cuda":
-            if x.dtype != compute_dtype:
-                raise RuntimeError(f"CUDA grouped LoRA expects input dtype {compute_dtype}, got {x.dtype}")
-            if a.device != x.device or b.device != x.device:
-                raise RuntimeError("CUDA grouped LoRA expects LoRA parameters on the input device")
-            if a.dtype != compute_dtype or b.dtype != compute_dtype:
-                raise RuntimeError("CUDA grouped LoRA expects LoRA parameters in the configured LoRA dtype")
-            x_compute = x
-        else:
-            x_compute = x.to(dtype=compute_dtype)
-            a = a.to(device=x.device, dtype=compute_dtype)
-            b = b.to(device=x.device, dtype=compute_dtype)
-        low_rank = grouped_expert_lora(x_compute, a, offsets, experts)
-        out = grouped_expert_lora(low_rank, b, offsets, experts) * self.lora_scale
+        x_compute, (a, b) = self._prepare_compute(x, (a, b))
+        metadata = self.prepare_metadata(offsets, experts) if metadata is None else metadata
+        low_rank = grouped_expert_lora(x_compute, a, offsets, experts, metadata=metadata)
+        out = grouped_expert_lora(low_rank, b, offsets, experts, metadata=metadata)
+        if self.lora_scale != 1.0:
+            out = out.mul_(self.lora_scale)
         return out.to(dtype=out_dtype)
 
 
 __all__ = [
     "AsymLoRALinear",
     "FrozenTorchLinear",
+    "GroupedLoRAMetadata",
     "LoRASetupReport",
     "PackedExpertLoRA",
     "QWEN_TARGET_MODULES",
@@ -714,11 +841,13 @@ __all__ = [
     "get_lora_state_dict",
     "get_lora_state_names",
     "grouped_expert_lora",
+    "grouped_expert_lora_pair",
     "load_adapter_state_dict",
     "load_lora_state_dict",
     "load_peft_adapter",
     "lora_parameters",
     "lora_state_hash",
     "normalize_lora_dtype",
+    "prepare_grouped_lora_metadata",
     "save_peft_adapter",
 ]

@@ -29,6 +29,7 @@ if __name__ == "__main__":
 import torch
 import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
+from torch.utils.checkpoint import checkpoint
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -311,6 +312,7 @@ class StageBook:
         self.memory_values: dict[str, list[dict[str, int]]] = defaultdict(list)
         self.range_stack: list[str] = []
         self.saved_tensor_tracker: SavedTensorMemoryTracker | None = None
+        self.max_stage_peak_bytes = 0
 
     def flush(self) -> None:
         sync(self.device)
@@ -318,6 +320,7 @@ class StageBook:
     def clear(self) -> None:
         self.values.clear()
         self.memory_values.clear()
+        self.max_stage_peak_bytes = 0
         if self.saved_tensor_tracker is not None:
             self.saved_tensor_tracker.clear()
 
@@ -344,10 +347,13 @@ class StageBook:
                     "avg_reserved_start_bytes": avg("reserved_start_bytes"),
                     "avg_reserved_end_bytes": avg("reserved_end_bytes"),
                     "avg_reserved_delta_bytes": avg("reserved_delta_bytes"),
+                    "avg_local_peak_bytes": avg("local_peak_bytes"),
+                    "avg_local_peak_delta_bytes": avg("local_peak_delta_bytes"),
+                    "max_local_peak_bytes": max(int(record["local_peak_bytes"]) for record in records),
                     "max_global_peak_after_bytes": max(int(record["global_peak_after_bytes"]) for record in records),
                 }
             )
-        return {"rows": rows}
+        return {"rows": rows, "max_stage_peak_bytes": int(self.max_stage_peak_bytes)}
 
     @contextmanager
     def time(self, key: str) -> Iterator[None]:
@@ -365,6 +371,7 @@ class StageBook:
                     "reserved_start_bytes": int(torch.cuda.memory_reserved(self.device)),
                     "global_peak_start_bytes": int(torch.cuda.max_memory_allocated(self.device)),
                 }
+                torch.cuda.reset_peak_memory_stats(self.device)
             torch.cuda.nvtx.range_push(key)
             pushed = True
         try:
@@ -375,13 +382,17 @@ class StageBook:
             if memory_record is not None:
                 allocated_end = int(torch.cuda.memory_allocated(self.device))
                 reserved_end = int(torch.cuda.memory_reserved(self.device))
+                local_peak = int(torch.cuda.max_memory_allocated(self.device))
+                self.max_stage_peak_bytes = max(self.max_stage_peak_bytes, local_peak)
                 memory_record.update(
                     {
                         "allocated_end_bytes": allocated_end,
                         "allocated_delta_bytes": allocated_end - int(memory_record["allocated_start_bytes"]),
                         "reserved_end_bytes": reserved_end,
                         "reserved_delta_bytes": reserved_end - int(memory_record["reserved_start_bytes"]),
-                        "global_peak_after_bytes": int(torch.cuda.max_memory_allocated(self.device)),
+                        "local_peak_bytes": local_peak,
+                        "local_peak_delta_bytes": local_peak - int(memory_record["allocated_start_bytes"]),
+                        "global_peak_after_bytes": max(int(memory_record["global_peak_start_bytes"]), local_peak),
                     }
                 )
                 self.memory_values[key].append(memory_record)
@@ -416,58 +427,126 @@ def _persistent_storage_ptrs(model: torch.nn.Module) -> set[int]:
     return ptrs
 
 
-def _saved_tensor_bucket(owner: str) -> str:
+def _compact_profile_owner(owner: str) -> str:
     text = owner or "unattributed"
-    lower = text.lower()
-    compact = re.sub(r"\blayers\.\d+\.", "", lower)
-    if "fc1" in compact:
-        return "fc1 base/LoRA"
-    if "fc2" in compact:
-        return "fc2 base/LoRA"
-    if "matrix" in compact:
-        return "matrix base/LoRA"
-    if "routed_expert" in compact:
-        if "gate" in compact:
-            return "routed gate"
-        if "up" in compact:
-            return "routed up"
-        if "down" in compact:
-            return "routed down"
-        if "activation" in compact or "silu" in compact:
-            return "routed activation"
-        return "routed gate/up/down"
-    if "shared_expert" in compact:
-        if "gate" in compact:
-            return "shared gate"
-        if "up" in compact:
-            return "shared up"
-        if "down" in compact:
-            return "shared down"
-        if "activation" in compact or "silu" in compact:
-            return "shared activation"
-        return "shared gate/up/down"
-    if any(part in compact for part in ("router", "route_metadata", "pack_tokens", "scatter_combine")):
-        return "router/pack/scatter"
-    if "attention" in compact:
-        return "attention"
-    if any(part in compact for part in ("activation", "silu", "relu", "softmax")):
-        return "activation"
-    if ".mlp." in compact or compact.startswith("forward.mlp"):
-        if "gate_proj" in compact:
-            return "dense MLP gate"
-        if "up_proj" in compact:
-            return "dense MLP up"
-        if "down_proj" in compact:
-            return "dense MLP down"
-        return "dense MLP"
+    compact = text.lower()
+    compact = re.sub(r"^(forward|backward)\.", "", compact)
+    compact = re.sub(r"\blayers\.\d+\.", "", compact)
+    return compact
+
+
+def _projection_bucket(compact: str) -> str:
+    for name in ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"):
+        if name in compact:
+            return name
+    if "gate_up_lora" in compact:
+        return "gate_up"
+    for name in ("gate_base", "up_base", "down_base", "gate_lora", "up_lora", "down_lora"):
+        if name in compact:
+            return name.split("_", 1)[0]
+    for name in ("fc1", "fc2", "matrix"):
+        if name in compact:
+            return name
+    return ""
+
+
+def _operation_bucket(compact: str) -> str:
+    if "attention" in compact and (
+        "base_asymgemm" in compact or "base frozen asymgemm" in compact or "base_frozen_asymgemm" in compact
+    ):
+        return "base_torch"
+    if "base_asymgemm" in compact or "grouped_base_frozen_asymgemm" in compact or "base_frozen_asymgemm" in compact:
+        return "base_asymgemm"
+    if "grouped_base_dx_asymgemm" in compact or "base_dx_asymgemm" in compact:
+        return "base_asymgemm"
+    if "base_torch" in compact or "grouped_base_torch" in compact:
+        return "base_torch"
+    if "q_proj_base" in compact or "k_proj_base" in compact or "v_proj_base" in compact or "o_proj_base" in compact:
+        return "base_torch"
+    if "lora_a" in compact:
+        return "lora_A"
+    if "lora_b" in compact:
+        return "lora_B"
+    if "gate_up_lora" in compact or "gate_lora" in compact or "up_lora" in compact or "down_lora" in compact:
+        return "lora"
+    if "add_cast_scale" in compact:
+        return "add_cast_scale"
+    if "base_lora_add" in compact:
+        return "base_lora_add"
+    if "activation_silu_mul" in compact or "silu_mul_activation" in compact:
+        return "silu_mul_activation"
+    if "activation_relu" in compact or "relu" in compact:
+        return "relu_activation"
+    for name in (
+        "scores_matmul",
+        "value_matmul",
+        "causal_mask",
+        "softmax",
+        "layernorm",
+        "residual_add",
+        "route_metadata",
+        "pack_tokens",
+        "scatter_combine",
+        "combine_shared_routed",
+        "forward_sft",
+        "kt_lora_update",
+        "mse",
+        "cross_entropy",
+    ):
+        if name in compact:
+            return name
+    if "final_norm" in compact:
+        return "final_norm"
     if "lm_head" in compact:
         return "lm_head"
     if "embedding" in compact:
         return "embeddings"
-    if "layernorm" in compact or "final_norm" in compact:
-        return "norm"
+    if "router" in compact:
+        return "router"
     if "loss" in compact:
         return "loss"
+    return ""
+
+
+def _saved_tensor_bucket(owner: str) -> str:
+    text = owner or "unattributed"
+    compact = _compact_profile_owner(text)
+    projection = _projection_bucket(compact)
+    operation = _operation_bucket(compact)
+
+    if "routed_expert" in compact or "shared_expert" in compact:
+        expert = "routed_expert" if "routed_expert" in compact else "shared_expert"
+        parts = [expert]
+        if projection:
+            parts.append(projection)
+        if operation and operation != projection:
+            parts.append(operation)
+        return ".".join(parts)
+
+    if "attention" in compact:
+        parts = ["attention"]
+        if projection:
+            parts.append(projection)
+        if operation and operation != projection:
+            parts.append(operation)
+        return ".".join(parts)
+
+    if ".mlp." in compact or compact.startswith("mlp."):
+        parts = ["mlp"]
+        if projection:
+            parts.append(projection)
+        if operation and operation != projection:
+            parts.append(operation)
+        return ".".join(parts)
+
+    if projection:
+        parts = [projection]
+        if operation and operation != projection:
+            parts.append(operation)
+        return ".".join(parts)
+
+    if operation:
+        return operation
     return text
 
 
@@ -689,6 +768,26 @@ def profiled_softmax(x: torch.Tensor, dim: int, prefix: str, book: StageBook) ->
     return _ProfiledSoftmax.apply(x, dim, prefix, book)
 
 
+class _ProfiledCausalMask(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, scores: torch.Tensor, mask: torch.Tensor, fill_value: float, prefix: str, book: StageBook) -> torch.Tensor:
+        ctx.save_for_backward(mask)
+        ctx.prefix = prefix
+        ctx.book = book
+        return scores.masked_fill(mask, fill_value)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None, None]:
+        (mask,) = ctx.saved_tensors
+        with ctx.book.time(f"backward.{ctx.prefix}.grad"):
+            grad_scores = grad_output.masked_fill(mask, 0)
+        return grad_scores, None, None, None, None
+
+
+def profiled_causal_mask(scores: torch.Tensor, mask: torch.Tensor, fill_value: float, prefix: str, book: StageBook) -> torch.Tensor:
+    return _ProfiledCausalMask.apply(scores, mask, fill_value, prefix, book)
+
+
 class _ProfiledMatmul(torch.autograd.Function):
     @staticmethod
     def forward(ctx: Any, a: torch.Tensor, b: torch.Tensor, prefix: str, book: StageBook) -> torch.Tensor:
@@ -798,6 +897,93 @@ class _ProfiledScaleCast(torch.autograd.Function):
 
 def profiled_scale_cast(x: torch.Tensor, scale: float, dtype: torch.dtype, prefix: str, book: StageBook) -> torch.Tensor:
     return _ProfiledScaleCast.apply(x, scale, dtype, prefix, book)
+
+
+class _AutogradNodeRange:
+    def __init__(self, name: str, book: StageBook) -> None:
+        self.name = name
+        self.book = book
+        self.record: Any = None
+        self.pushed = False
+
+    def __enter__(self) -> "_AutogradNodeRange":
+        if self.book.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.nvtx.range_push(self.name)
+            self.pushed = True
+        else:
+            self.record = torch.autograd.profiler.record_function(self.name)
+            self.record.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.pushed:
+            torch.cuda.nvtx.range_pop()
+            self.pushed = False
+        elif self.record is not None:
+            self.record.__exit__(exc_type, exc, tb)
+            self.record = None
+
+
+def _iter_tensors(value: Any) -> Iterator[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            yield from _iter_tensors(item)
+
+
+def _attach_backward_nvtx_ranges(
+    outputs: Any,
+    name: str,
+    book: StageBook,
+    *,
+    stop_tensors: tuple[torch.Tensor, ...] = (),
+) -> None:
+    stop_fn_ids = {id(tensor.grad_fn) for tensor in stop_tensors if isinstance(tensor, torch.Tensor) and tensor.grad_fn is not None}
+    seen: set[int] = set()
+    stack = [tensor.grad_fn for tensor in _iter_tensors(outputs) if tensor.requires_grad and tensor.grad_fn is not None]
+
+    while stack:
+        node = stack.pop()
+        if node is None:
+            continue
+        node_id = id(node)
+        if node_id in seen or node_id in stop_fn_ids:
+            continue
+        seen.add(node_id)
+        if type(node).__name__ != "AccumulateGrad":
+            state: dict[str, _AutogradNodeRange] = {}
+
+            def prehook(grad_outputs: Any, *, state: dict[str, _AutogradNodeRange] = state) -> None:
+                active = _AutogradNodeRange(name, book)
+                active.__enter__()
+                state["active"] = active
+                return None
+
+            def posthook(grad_inputs: Any, grad_outputs: Any, *, state: dict[str, _AutogradNodeRange] = state) -> None:
+                active = state.pop("active", None)
+                if active is not None:
+                    active.__exit__(None, None, None)
+                return None
+
+            try:
+                node.register_prehook(prehook)
+                node.register_hook(posthook)
+            except (AttributeError, RuntimeError):
+                pass
+        for next_node, _ in getattr(node, "next_functions", ()):
+            if next_node is not None:
+                stack.append(next_node)
+
+
+def _backward_label_from_current_range(fallback: str) -> str:
+    current = current_profile_range()
+    if current.startswith("forward."):
+        suffix = current[len("forward.") :]
+        return f"backward.{suffix}.grad"
+    if current.startswith("backward."):
+        return f"{current}.grad"
+    return fallback
 
 
 class _ProfiledPackTokens(torch.autograd.Function):
@@ -1011,9 +1197,7 @@ def table(total: float, rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 def memory_report(model: torch.nn.Module, device: torch.device) -> dict[str, Any]:
     host_w = 0
-    host_w_t = 0
     pinned_w = 0
-    pinned_w_t = 0
     pinned = 0
     seen_host_weights: set[int] = set()
     for module in model.modules():
@@ -1031,17 +1215,11 @@ def memory_report(model: torch.nn.Module, device: torch.device) -> dict[str, Any
             continue
         seen_host_weights.add(host_id)
         weight = getattr(host_weight, "weight", None)
-        transpose = getattr(host_weight, "_transpose", None)
         if isinstance(weight, torch.Tensor):
             weight_bytes = nbytes(weight)
             host_w += weight_bytes
             if weight.is_pinned():
                 pinned_w += weight_bytes
-        if isinstance(transpose, torch.Tensor):
-            transpose_bytes = nbytes(transpose)
-            host_w_t += transpose_bytes
-            if transpose.is_pinned():
-                pinned_w_t += transpose_bytes
         pinned += int(getattr(host_weight, "pinned_cpu_bytes", 0))
     gpu_params = sum(nbytes(param) for param in model.parameters() if param.device.type == "cuda")
     gpu_buffers = sum(nbytes(buffer) for buffer in model.buffers() if buffer.device.type == "cuda")
@@ -1055,12 +1233,8 @@ def memory_report(model: torch.nn.Module, device: torch.device) -> dict[str, Any
         },
         "cpu": {
             "host_w_bytes": host_w,
-            "host_w_t_bytes": host_w_t,
             "pinned_w_bytes": pinned_w,
-            "pinned_w_t_bytes": pinned_w_t,
             "pinned_total_bytes": pinned,
-            "pinned_w_t_percent_of_host_weight": 0.0 if pinned_w + pinned_w_t <= 0 else pinned_w_t * 100.0 / (pinned_w + pinned_w_t),
-            "host_w_t_percent_of_host_weight": 0.0 if host_w + host_w_t <= 0 else host_w_t * 100.0 / (host_w + host_w_t),
         },
     }
 
@@ -1759,7 +1933,7 @@ def patch_dense_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
             scores = profiled_matmul(q.float(), k.float().transpose(-2, -1), f"{bprefix}.scores_matmul", book) / (float(self.head_dim) ** 0.5)
         with book.time(f"{prefix}.causal_mask"):
             mask = torch.triu(torch.ones(seq, seq, device=hidden_states.device, dtype=torch.bool), diagonal=1)
-            scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min)
+            scores = profiled_causal_mask(scores, mask, torch.finfo(scores.dtype).min, f"{bprefix}.causal_mask", book)
         with book.time(f"{prefix}.softmax"):
             probs = profiled_softmax(scores, -1, f"{bprefix}.softmax", book)
         with book.time(f"{prefix}.value_matmul"):
@@ -1821,7 +1995,10 @@ def patch_dense_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
             hidden_states = hidden_states + self.position_embedding[:seq].unsqueeze(0)
         activations = {}
         for index, layer in enumerate(self.layers):
-            hidden_states = layer(hidden_states)
+            if bool(getattr(self, "gradient_checkpointing", False)) and hidden_states.requires_grad:
+                hidden_states = checkpoint(layer, hidden_states, use_reentrant=False)
+            else:
+                hidden_states = layer(hidden_states)
             if return_activations:
                 activations[f"layers.{index}"] = hidden_states
         with book.time("forward.final_norm"):
@@ -1992,6 +2169,7 @@ def dense_backward_prefixes(num_layers: int, target_names: set[str], offload_nam
                 ),
                 f"backward.{layer}.attention.value_matmul",
                 f"backward.{layer}.attention.softmax",
+                f"backward.{layer}.attention.causal_mask",
                 f"backward.{layer}.attention.scores_matmul",
                 *dense_projection_backward_prefixes(
                     layer,
@@ -2044,6 +2222,7 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
     config_extra["dense_target_names"] = sorted(target_names)
     config_extra["dense_offload_names"] = sorted(offload_names)
     config_extra["dense_offload_scope"] = offload_selector
+    config_extra["activation_recompute"] = bool(getattr(args, "activation_recompute", False))
     stats = AsymExecutionStats()
     weights = make_tiny_dense_weights(config, seed=1, dtype=dtype)
     if args.backend == "torch":
@@ -2055,6 +2234,7 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
             device=device,
             dtype=dtype,
             lora_seed=2,
+            gradient_checkpointing=bool(getattr(args, "activation_recompute", False)),
             lora_dtype=lora_dtype,
         )
     else:
@@ -2069,6 +2249,7 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
             device=device,
             dtype=dtype,
             lora_seed=2,
+            gradient_checkpointing=bool(getattr(args, "activation_recompute", False)),
             lora_dtype=lora_dtype,
             precision=args.precision,
         )
@@ -2114,6 +2295,151 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
 
     originals: list[tuple[Any, str, Any]] = []
 
+    original_packed_gate_up = moe.PackedExpertLoRA.forward_gate_up
+    original_packed_forward = moe.PackedExpertLoRA.forward
+
+    def timed_packed_gate_up(
+        self: Any,
+        x: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        out_dtype: torch.dtype,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        gate_out, up_out = original_packed_gate_up(self, x, offsets, experts, out_dtype, *args, **kwargs)
+        _attach_backward_nvtx_ranges(
+            (gate_out, up_out),
+            _backward_label_from_current_range("backward.routed_expert.gate_up_lora.grad"),
+            book,
+            stop_tensors=(x, self.gate_lora_a, self.up_lora_a, self.gate_lora_b, self.up_lora_b),
+        )
+        return gate_out, up_out
+
+    def timed_packed_forward(
+        self: Any,
+        x: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        prefix: str,
+        out_dtype: torch.dtype,
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        out = original_packed_forward(self, x, offsets, experts, prefix, out_dtype, *args, **kwargs)
+        _attach_backward_nvtx_ranges(
+            out,
+            _backward_label_from_current_range(f"backward.routed_expert.{prefix}_lora.grad"),
+            book,
+            stop_tensors=(x, self._weight(prefix, "a"), self._weight(prefix, "b")),
+        )
+        return out
+
+    originals.append((moe.PackedExpertLoRA, "forward_gate_up", original_packed_gate_up))
+    moe.PackedExpertLoRA.forward_gate_up = timed_packed_gate_up
+    originals.append((moe.PackedExpertLoRA, "forward", original_packed_forward))
+    moe.PackedExpertLoRA.forward = timed_packed_forward
+
+    original_grouped_compact = moe.AsymTinyMoELayer._run_grouped_compact
+
+    def timed_grouped_compact(
+        self: Any,
+        packed: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        *,
+        gate_base: torch.nn.Module,
+        up_base: torch.nn.Module,
+        down_base: torch.nn.Module,
+        shared: bool = False,
+        dense_experts: bool = False,
+    ) -> torch.Tensor:
+        if packed.numel() == 0:
+            return packed.new_empty((0, self.config.hidden_size))
+
+        layer_name = str(getattr(self, "_m4_profile_name", ""))
+        expert_scope = "shared_expert" if shared else "routed_expert"
+        profile_prefix = f"{layer_name}.{expert_scope}" if layer_name else expert_scope
+        gate_base.profile_name = f"{profile_prefix}.gate_base"
+        up_base.profile_name = f"{profile_prefix}.up_base"
+        down_base.profile_name = f"{profile_prefix}.down_base"
+
+        gate = gate_base(packed, offsets, experts, dense_experts=dense_experts)
+        up = up_base(packed, offsets, experts, dense_experts=dense_experts)
+        range_prefix = f"forward.{profile_prefix}"
+        if shared:
+            assert self.shared_expert_lora is not None
+            lora_metadata = self.shared_expert_lora.prepare_metadata(offsets, experts, dense_experts=dense_experts)
+            with moe.prof_range(f"{range_prefix}.gate_up_lora"):
+                gate_lora, up_lora = self.shared_expert_lora.forward_gate_up(
+                    packed,
+                    offsets,
+                    experts,
+                    packed.dtype,
+                    metadata=lora_metadata,
+                )
+        else:
+            lora_metadata = self.expert_lora.prepare_metadata(offsets, experts, dense_experts=dense_experts)
+            with moe.prof_range(f"{range_prefix}.gate_up_lora"):
+                gate_lora, up_lora = self.expert_lora.forward_gate_up(
+                    packed,
+                    offsets,
+                    experts,
+                    packed.dtype,
+                    metadata=lora_metadata,
+                )
+        gate_base_out = gate
+        up_base_out = up
+        gate = gate + gate_lora
+        up = up + up_lora
+        _attach_backward_nvtx_ranges(
+            gate,
+            f"backward.{profile_prefix}.gate_base_lora_add.grad",
+            book,
+            stop_tensors=(gate_base_out, gate_lora),
+        )
+        _attach_backward_nvtx_ranges(
+            up,
+            f"backward.{profile_prefix}.up_base_lora_add.grad",
+            book,
+            stop_tensors=(up_base_out, up_lora),
+        )
+
+        with moe.prof_range(f"{range_prefix}.activation_silu_mul"):
+            activated = (F.silu(gate.float()) * up.float()).to(dtype=packed.dtype)
+            _attach_backward_nvtx_ranges(
+                activated,
+                _backward_label_from_current_range(f"backward.{profile_prefix}.activation_silu_mul.grad"),
+                book,
+                stop_tensors=(gate, up),
+            )
+        down = down_base(activated.contiguous(), offsets, experts, dense_experts=dense_experts)
+        if shared:
+            with moe.prof_range(f"{range_prefix}.down_lora"):
+                down_lora = self._lora_shared(
+                    activated,
+                    offsets,
+                    "down",
+                    packed.dtype,
+                    experts=experts,
+                    lora_metadata=lora_metadata,
+                )
+        else:
+            with moe.prof_range(f"{range_prefix}.down_lora"):
+                down_lora = self.expert_lora(activated, offsets, experts, "down", packed.dtype, metadata=lora_metadata)
+        down_base_out = down
+        down = down + down_lora
+        _attach_backward_nvtx_ranges(
+            down,
+            f"backward.{profile_prefix}.down_base_lora_add.grad",
+            book,
+            stop_tensors=(down_base_out, down_lora),
+        )
+        return down
+
+    originals.append((moe.AsymTinyMoELayer, "_run_grouped_compact", original_grouped_compact))
+    moe.AsymTinyMoELayer._run_grouped_compact = timed_grouped_compact
+
     original_attn = moe.TinySelfAttention.forward
 
     def timed_attn(self: Any, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -2136,7 +2462,7 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
             scores = profiled_matmul(q.float(), k.float().transpose(-2, -1), "attention.scores_matmul", book) / (float(self.head_dim) ** 0.5)
         with book.time("forward.attention.causal_mask"):
             mask = torch.triu(torch.ones(seq, seq, device=hidden_states.device, dtype=torch.bool), diagonal=1)
-            scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min)
+            scores = profiled_causal_mask(scores, mask, torch.finfo(scores.dtype).min, "attention.causal_mask", book)
         with book.time("forward.attention.softmax"):
             probs = profiled_softmax(scores, -1, "attention.softmax", book)
         with book.time("forward.attention.value_matmul"):
@@ -2239,12 +2565,21 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
         with book.time("forward.embeddings"):
             hidden, token_api = self._prepare_hidden(x, input_ids, inputs_embeds)
         for layer_idx, layer in enumerate(self.layers):
-            result = layer(hidden, static_routing=moe._routing_for_layer(static_routing, layer_idx), mode=mode, return_details=return_details)
-            if return_details:
+            routing = moe._routing_for_layer(static_routing, layer_idx)
+            if bool(getattr(self, "gradient_checkpointing", False)) and hidden.requires_grad and not return_details:
+                def layer_forward(hidden_states: torch.Tensor, *, layer: Any = layer, routing: Any = routing) -> torch.Tensor:
+                    result = layer(hidden_states, static_routing=routing, mode=mode, return_details=False)
+                    assert isinstance(result, torch.Tensor)
+                    return result
+
+                hidden = checkpoint(layer_forward, hidden, use_reentrant=False)
+            else:
+                result = layer(hidden, static_routing=routing, mode=mode, return_details=return_details)
+                if not return_details:
+                    hidden = result
+                    continue
                 hidden, detail = result
                 details.append(detail)
-            else:
-                hidden = result
         with book.time("forward.final_norm"):
             hidden = profiled_frozen_layer_norm(self.final_layernorm, hidden, "final_norm", book)
         if token_api or labels is not None:
@@ -2308,6 +2643,7 @@ def moe_backward_prefixes(config: Any) -> list[str]:
             "backward.attention.o_proj_base",
             "backward.attention.value_matmul",
             "backward.attention.softmax",
+            "backward.attention.causal_mask",
             "backward.attention.scores_matmul",
             "backward.attention.v_proj_base",
             "backward.attention.k_proj_base",
@@ -2329,11 +2665,14 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
     clear(device)
     config = getattr(args, "_moe_config_override", MICRO_MOE_CONFIG)
     if not hasattr(args, "_moe_config_override"):
+        batch_size = int(args.real_batch_size)
+        seq_len = int(args.real_seq_len)
         config = replace(
             config,
-            batch_size=int(args.real_batch_size),
-            seq_len=int(args.real_seq_len),
-            logical_tokens=requested_tokens(args, int(config.logical_tokens)),
+            num_layers=max(1, min(int(args.real_profile_layers), int(config.num_layers))),
+            batch_size=batch_size,
+            seq_len=seq_len,
+            logical_tokens=requested_tokens(args, batch_size * seq_len),
             lora_rank=int(args.real_lora_rank),
             lora_alpha=float(args.real_lora_alpha),
         )
@@ -2354,6 +2693,7 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
     config_extra["target_modules"] = target_selector
     config_extra["offload_modules"] = offload_selector
     config_extra["shared_expert_policy"] = config_extra_shared_note
+    config_extra["activation_recompute"] = bool(getattr(args, "activation_recompute", False))
     if is_kt_backend(args.backend):
         config_extra["kt_method"] = args.kt_method
         config_extra["kt_cpu_threads"] = int(args.kt_cpu_threads)
@@ -2375,6 +2715,7 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         kt_cpu_threads=args.kt_cpu_threads,
         kt_threadpool_count=args.kt_threadpool_count,
         kt_max_cache_depth=args.kt_max_cache_depth,
+        gradient_checkpointing=bool(getattr(args, "activation_recompute", False)),
     )
     set_profile_names(model)
     optimizer_params = model.kt_lora_parameters() if is_kt_backend(args.backend) else list(model.parameters())
@@ -2384,12 +2725,27 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
     static_routes = make_static_routes(config, device, pattern="balanced")
 
     def make_batch() -> tuple[torch.Tensor, torch.Tensor]:
-        x = torch.randn(config.logical_tokens, config.hidden_size, device=device, dtype=dtype, requires_grad=True) * 0.5
+        expected_tokens = int(config.batch_size) * int(config.seq_len)
+        if int(config.logical_tokens) != expected_tokens:
+            raise ValueError(
+                f"MoE profile expects logical_tokens=batch_size*seq_len for transformer-shaped inputs; "
+                f"got logical_tokens={config.logical_tokens}, batch_size={config.batch_size}, seq_len={config.seq_len}"
+            )
+        x = torch.randn(
+            int(config.batch_size),
+            int(config.seq_len),
+            int(config.hidden_size),
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        ) * 0.5
         target = torch.roll(x.detach().float(), shifts=1, dims=0) * 0.25
         return x, target
 
     def forward_fn(model_: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
-        y = model_(x, static_routing=static_routes, mode=args.moe_mode)
+        y = model_(inputs_embeds=x, static_routing=static_routes, mode=args.moe_mode)
+        if isinstance(y, dict):
+            y = y["hidden_states"]
         assert isinstance(y, torch.Tensor)
         return y
 
@@ -2498,6 +2854,11 @@ def build_report(
         backward_keys.append(key)
     avg["backward.python_autograd_dispatch_cuda_launch_and_sync"] = max(0.0, backward_total - sum(avg.get(key, 0.0) for key in backward_keys))
     backward_keys.append("backward.python_autograd_dispatch_cuda_launch_and_sync")
+    memory = memory_report(model, device)
+    max_stage_peak = int((stage_memory or {}).get("max_stage_peak_bytes", 0))
+    if max_stage_peak > 0:
+        memory["gpu"]["stage_local_peak_hbm_bytes"] = max_stage_peak
+        memory["gpu"]["peak_hbm_bytes"] = max(int(memory["gpu"]["peak_hbm_bytes"]), max_stage_peak)
 
     return {
         "workload": workload,
@@ -2512,7 +2873,7 @@ def build_report(
         ),
         "forward": table(forward_total, rows_from_keys(avg, forward_total, forward_keys, residual_name="forward.python_dispatch_cuda_launch_and_sync")),
         "backward": table(backward_total, rows_from_keys(avg, backward_total, backward_keys, residual_name="backward.accounting_gap")),
-        "memory": memory_report(model, device),
+        "memory": memory,
         "stage_memory": stage_memory or {"rows": []},
         "memory_attribution": memory_attribution or {"enabled": False, "categories": {"rows": []}, "saved_activations": {"rows": []}},
         "raw_seconds_per_step": raw_seconds_without_individual_calls(avg),
@@ -2522,7 +2883,6 @@ def build_report(
             "Use timing_mode=profile under Nsight Systems for real GPU bubble analysis; inner ranges are NVTX/record_function labels and do not force per-op CUDA synchronization.",
             "timing_mode=debug_sync is a debugging-only source coverage check that synchronizes every region and must not be used for performance claims.",
             "All explicit tensor ops in the instrumented toy forward/backward are assigned named ranges. Source-level residual rows are non-tensor-op overhead: Python dispatch, PyTorch autograd engine scheduling, CUDA launch latency, and synchronization/profiler overhead.",
-            "pinned_w_t_bytes is an audit field and should remain zero after transpose_b=True dX.",
             "The optional torch_profiler_backward table is a debug aid averaged over all profiled steps, including warmup; Nsight tables remain the performance truth.",
         ],
     }
@@ -2535,11 +2895,6 @@ def write_report(report: dict[str, Any], output_dir: Path) -> None:
     md_path = output_dir / f"{stem}_profile.md"
     json_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     md_path.write_text(markdown(report), encoding="utf-8")
-    moe_mode = report.get("config", {}).get("moe_mode")
-    if report["workload"] == "m4_3_moe" and moe_mode:
-        mode_stem = f"m4_3_moe_{moe_mode}"
-        (output_dir / f"{mode_stem}_profile.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        (output_dir / f"{mode_stem}_profile.md").write_text(markdown(report), encoding="utf-8")
 
 
 def markdown(report: dict[str, Any]) -> str:
@@ -2578,9 +2933,7 @@ def markdown(report: dict[str, Any]) -> str:
             f"| gpu_parameters | {mem['gpu']['parameter_bytes']} | {fmt_mib(mem['gpu']['parameter_bytes'])} |",
             f"| gpu_buffers | {mem['gpu']['buffer_bytes']} | {fmt_mib(mem['gpu']['buffer_bytes'])} |",
             f"| host_W | {mem['cpu']['host_w_bytes']} | {fmt_mib(mem['cpu']['host_w_bytes'])} |",
-            f"| host_W_T | {mem['cpu']['host_w_t_bytes']} | {fmt_mib(mem['cpu']['host_w_t_bytes'])} |",
             f"| pinned_W | {mem['cpu']['pinned_w_bytes']} | {fmt_mib(mem['cpu']['pinned_w_bytes'])} |",
-            f"| pinned_W_T | {mem['cpu']['pinned_w_t_bytes']} | {fmt_mib(mem['cpu']['pinned_w_t_bytes'])} |",
             f"| pinned_total | {mem['cpu']['pinned_total_bytes']} | {fmt_mib(mem['cpu']['pinned_total_bytes'])} |",
             "",
         ]
@@ -2592,8 +2945,8 @@ def markdown(report: dict[str, Any]) -> str:
             [
                 "## Forward/Backward CUDA Allocator Memory",
                 "",
-                "| Stage | samples | allocated start MiB | allocated end MiB | allocated delta MiB | reserved start MiB | reserved end MiB | reserved delta MiB | global peak after MiB |",
-                "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "| Stage | samples | allocated start MiB | allocated end MiB | allocated delta MiB | local peak MiB | local peak delta MiB | reserved start MiB | reserved end MiB | reserved delta MiB | global peak after MiB |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for row in rows:
@@ -2603,6 +2956,8 @@ def markdown(report: dict[str, Any]) -> str:
                 f"{fmt_mib(row['avg_allocated_start_bytes'])} | "
                 f"{fmt_mib(row['avg_allocated_end_bytes'])} | "
                 f"{fmt_mib(row['avg_allocated_delta_bytes'])} | "
+                f"{fmt_mib(row.get('avg_local_peak_bytes', row['max_global_peak_after_bytes']))} | "
+                f"{fmt_mib(row.get('avg_local_peak_delta_bytes', 0))} | "
                 f"{fmt_mib(row['avg_reserved_start_bytes'])} | "
                 f"{fmt_mib(row['avg_reserved_end_bytes'])} | "
                 f"{fmt_mib(row['avg_reserved_delta_bytes'])} | "
@@ -2948,6 +3303,11 @@ def parse_args() -> argparse.Namespace:
         "--memory-attribution",
         action="store_true",
         help="Enable saved-tensor hooks for fine-grained activation memory attribution. This is memory-only and should not be used for timing claims.",
+    )
+    parser.add_argument(
+        "--activation-recompute",
+        action="store_true",
+        help="Enable layer-level activation recomputation with torch.utils.checkpoint during training profiles.",
     )
     parsed = parser.parse_args()
     parsed.dense_target_mode = parsed.target_preset

@@ -5,19 +5,20 @@ set -Eeuo pipefail
 # User-Specified Parameters
 # =============================================================================
 # Edit this section for the default run. CLI flags override these values.
+# List defaults use the same comma-separated format accepted by CLI flags.
 
-USER_GPU_POOL=(0 1 2 3)
-# Per-workload layers can be set as "workload|layers", for example "moe-604m-a75m|2".
+USER_GPU_POOL="0,1,2,3"
+# Per-workload layers can be set as "workload|layers", e.g. "moe-604m-a75m|2".
 # Dense workload names are total-model labels; MoE workload names are per-layer routed-expert total/active labels.
-# USER_WORKLOADS=(mlp_3b mm_3b dense_3b moe-604m-a75m mlp dense moe dense_14b moe-604m-a38m)
-# USER_WORKLOADS=(dense_3b "moe-604m-a75m|2")
-# USER_WORKLOADS=(mlp_3b mm_3b dense_3b "moe-604m-a75m|4")
-USER_WORKLOADS=("moe-604m-a38m|1")
-# USER_WORKLOADS=(mlp dense moe)
-USER_BACKENDS=(asym torch)
-# USER_BACKENDS=(torch)
-# USER_PROFILERS=(nsys cpu)
-USER_PROFILERS=(nsys)
+# USER_WORKLOADS="mlp_3b,mm_3b,dense_3b,moe-604m-a75m,mlp,dense,moe,dense_14b,moe-604m-a38m"
+# USER_WORKLOADS="dense_3b,moe-604m-a75m|2"
+# USER_WORKLOADS="mlp_3b,mm_3b,dense_3b,moe-604m-a75m|4"
+USER_WORKLOADS="moe-604m-a38m|2"
+# USER_WORKLOADS="mlp,dense,moe"
+USER_BACKENDS="asym,torch"
+# USER_BACKENDS="torch"
+# USER_PROFILERS="nsys,cpu"
+USER_PROFILERS="nsys"
 
 USER_JOBS_PER_GPU=1
 USER_OUTPUT_ROOT="profiling"
@@ -27,9 +28,11 @@ USER_MODE="auto"
 
 USER_WARMUP_STEPS=5
 USER_MEASURE_STEPS=20
-USER_PROFILE_LAYERS=1
+USER_PROFILE_LAYERS=2
 USER_BATCH_SIZE=32
 USER_SEQ_LEN=64
+# USER_SEQ_LENS="64,128,256,512,640,768,896,1024,2048,4096,6144,8192,10240"
+USER_SEQ_LENS="256"
 USER_HIDDEN_DIM=1024
 USER_MLP_INTERMEDIATE_DIM=0
 USER_MLP_EXPANSION=4
@@ -50,140 +53,77 @@ USER_NCU_PRESET="paper"
 USER_NCU_CLEAR_JIT_CACHE=0
 USER_PYTHON_BIN="${USER_PYTHON_BIN:-${PYTHON:-python3}}"
 
-# =============================================================================
-# Derived Parameters
-# =============================================================================
+PLOT=true
+PLOT_OUTPUT_DIR=""
+RECOMPUTE="both"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PY_DRIVER="${ROOT}/scripts/profile_lora_driver.py"
-
-DRIVER_ARGS=(
-  --warmup-steps "${USER_WARMUP_STEPS}"
-  --measure-steps "${USER_MEASURE_STEPS}"
-  --profile-layers "${USER_PROFILE_LAYERS}"
-  --batch-size "${USER_BATCH_SIZE}"
-  --seq-len "${USER_SEQ_LEN}"
-  --hidden-dim "${USER_HIDDEN_DIM}"
-  --mlp-intermediate-dim "${USER_MLP_INTERMEDIATE_DIM}"
-  --mlp-expansion "${USER_MLP_EXPANSION}"
-  --lora-rank "${USER_LORA_RANK}"
-  --lora-alpha "${USER_LORA_ALPHA}"
-  --vocab-rows "${USER_VOCAB_ROWS}"
-  --moe-mode "${USER_MOE_MODE}"
-  --dense-target-mode "${USER_DENSE_TARGET_MODE}"
-  --kt-method "${USER_KT_METHOD}"
-  --kt-cpu-threads "${USER_KT_CPU_THREADS}"
-  --kt-threadpool-count "${USER_KT_THREADPOOL_COUNT}"
-  --kt-max-cache-depth "${USER_KT_MAX_CACHE_DEPTH}"
-  --nsys-bin "${USER_NSYS_BIN}"
-  --ncu-bin "${USER_NCU_BIN}"
-  --ncu-preset "${USER_NCU_PRESET}"
-)
-if ((USER_NCU_CLEAR_JIT_CACHE)); then
-  DRIVER_ARGS+=(--ncu-clear-jit-cache)
-fi
-
-# =============================================================================
-# Core Logic
-# =============================================================================
+PLOT_RECOMPUTE_SCRIPT="${ROOT}/scripts/plotting/plot_activation_recompute_sweep.py"
 
 usage() {
   cat <<USAGE
 Usage:
-  scripts/profile_lora_driver.sh --gpus 2,3,4,5,6,7 [options]
+  scripts/profile_lora_driver.sh [options]
 
-Required:
-  --gpus, --gpu-pool, --cuda-devices  Physical GPU pool. Comma or space separated.
-                                      Not required if USER_GPU_POOL is set
-                                      at the top of this script.
+Defaults:
+  --gpus ${USER_GPU_POOL}
+  --workloads ${USER_WORKLOADS}
+  --backends ${USER_BACKENDS}
+  --profilers ${USER_PROFILERS}
+  --seq-lens ${USER_SEQ_LENS}
+  --recompute ${RECOMPUTE}
 
-Shell-only options:
-  --jobs-per-gpu N                    Concurrent Python driver jobs per GPU. Default: ${USER_JOBS_PER_GPU}.
-  --python-bin PATH                   Python interpreter used for the driver and profiled child process.
-                                      Default: USER_PYTHON_BIN, PYTHON, then python3.
+Shell options:
+  --gpus LIST                         Physical GPU pool. Accepts 0,1 or "0 1".
+  --workloads LIST                    Workloads or aliases. Use workload|layers.
+  --backends LIST                     asym, torch, kt, or all.
+  --profilers LIST                    source, nsys, cpu, ncu, or all.
+  --seq-len N                         Single sequence length.
+  --seq-lens LIST                     Sequence lengths. Accepts 64,128 or "64 128".
+  --jobs-per-gpu N                    Concurrent Python driver jobs per GPU.
+  --python-bin PATH                   Python interpreter. Default: PYTHON or python3.
+  --output-root PATH                  Output root.
+  --run-name NAME                     Optional subdirectory under output root.
+  --precision NAME                    Result precision label.
+  --mode NAME                         Result filename mode.
+  --plot true|false                   Write recompute-vs-seq plots after profiling.
+  --plot-output-dir PATH              Plot output directory.
+  --recompute norecomp|recomp|both     Run without recompute, with recompute, or both.
   -h, --help                          Show this help.
 
-Default run matrix:
-  --workloads ${USER_WORKLOADS[*]}
-  --backends ${USER_BACKENDS[*]}
-  --profilers ${USER_PROFILERS[*]}
-
-Common options:
-  Defaults are defined at the top of this script and can be overridden with
-  flags such as --precision, --mode, and --output-root.
-
-The shell launches one background Python driver job per workload/backend pair,
-assigns each job one GPU from the pool, waits for all jobs, and traps
-INT/TERM/ERR to terminate the whole background process tree.
-The Python driver is an internal worker; use this shell script as the profiling
-entrypoint for the standard workflow.
+Unknown options are passed through to scripts/profile_lora_driver.py, so common
+driver flags such as --dry-run, --target-modules, and --skip-memory-attribution
+still work here.
 USAGE
 }
 
-split_values() {
+die() {
+  echo "error: $*" >&2
+  exit 2
+}
+
+need_value() {
+  local opt="$1"
+  local value="${2-}"
+  [[ -n "${value}" && "${value}" != --* ]] || die "${opt} requires a value"
+}
+
+tokens() (
+  set -f
   local value part
+  local -a parts
   for value in "$@"; do
-    IFS=',' read -r -a _parts <<< "${value}"
-    for part in "${_parts[@]}"; do
-      part="${part#"${part%%[![:space:]]*}"}"
-      part="${part%"${part##*[![:space:]]}"}"
-      [[ -n "${part}" ]] && printf '%s\n' "${part#cuda:}"
+    read -r -a parts <<< "${value//,/ }"
+    for part in "${parts[@]}"; do
+      [[ -n "${part}" ]] && printf '%s\n' "${part}"
     done
   done
-}
+)
 
-dedupe_lines() {
+dedupe() {
   awk '!seen[$0]++'
-}
-
-expand_workloads() {
-  local item
-  for item in "$@"; do
-    local base="${item}"
-    local suffix=""
-    if [[ "${item}" == *"|"* ]]; then
-      base="${item%%|*}"
-      suffix="|${item#*|}"
-    fi
-    case "${base}" in
-      toy) printf '%s\n' "mlp${suffix}" "dense${suffix}" "moe${suffix}" ;;
-      custom3b) printf '%s\n' "dense_3b${suffix}" "moe-604m-a75m${suffix}" ;;
-      qwen) printf '%s\n' "dense_14b${suffix}" "moe-604m-a38m${suffix}" ;;
-      all)
-        printf '%s\n' \
-          "mlp_1b${suffix}" "mlp_3b${suffix}" "mm_1b${suffix}" "mm_3b${suffix}" \
-          "dense_3b${suffix}" "dense_14b${suffix}" \
-          "moe-604m-a75m${suffix}" "moe-604m-a38m${suffix}" \
-          "mlp${suffix}" "dense${suffix}" "moe${suffix}"
-        ;;
-      *) printf '%s\n' "${item}" ;;
-    esac
-  done
-}
-
-expand_backends() {
-  local item
-  for item in "$@"; do
-    case "${item}" in
-      all) printf '%s\n' asym torch kt ;;
-      *) printf '%s\n' "${item}" ;;
-    esac
-  done
-}
-
-expand_profilers() {
-  local item
-  for item in "$@"; do
-    case "${item}" in
-      all) printf '%s\n' source nsys cpu ncu ;;
-      *) printf '%s\n' "${item}" ;;
-    esac
-  done
-}
-
-safe_label() {
-  printf '%s' "$1" | tr -cs '[:alnum:]_-' '_' | sed -e 's/^[_-]*//' -e 's/[_-]*$//'
 }
 
 abs_path() {
@@ -193,42 +133,152 @@ abs_path() {
   esac
 }
 
-preflight_python() {
-  local python_bin="$1"
-  local python_executable
-  local python_report
+safe_label() {
+  printf '%s' "$1" | tr -cs '[:alnum:]_-' '_' | sed -e 's/^[_-]*//' -e 's/[_-]*$//'
+}
 
-  if ! python_executable="$("${python_bin}" -c 'import sys; print(sys.executable)' 2>&1)"; then
-    echo "error: python interpreter failed: ${python_bin}" >&2
-    echo "${python_executable}" >&2
-    echo "hint: pass --python-bin /path/to/python or set PYTHON=/path/to/python." >&2
-    exit 2
+bool_value() {
+  case "${1,,}" in
+    1|true|yes|y|on) printf '1\n' ;;
+    0|false|no|n|off) printf '0\n' ;;
+    *) die "expected true or false, got '${1}'" ;;
+  esac
+}
+
+recompute_values() {
+  case "${1,,}" in
+    norecomp|no_recompute|no-recompute|off|false|0) printf 'norecomp\n' ;;
+    recomp|recompute|activation_recompute|activation-recompute|on|true|1) printf 'recomp\n' ;;
+    both) printf 'norecomp\nrecomp\n' ;;
+    *) die "expected recompute mode norecomp, recomp, or both; got '${1}'" ;;
+  esac
+}
+
+validate_recompute() {
+  case "${1,,}" in
+    norecomp|no_recompute|no-recompute|off|false|0|recomp|recompute|activation_recompute|activation-recompute|on|true|1|both) ;;
+    *) die "expected recompute mode norecomp, recomp, or both; got '${1}'" ;;
+  esac
+}
+
+expand_workload() {
+  local item="$1"
+  local base="${item}"
+  local suffix=""
+  if [[ "${item}" == *"|"* ]]; then
+    base="${item%%|*}"
+    suffix="|${item#*|}"
   fi
-  USER_PYTHON_BIN="${python_executable%%$'\n'*}"
+  case "${base}" in
+    toy) printf '%s\n' "mlp${suffix}" "dense${suffix}" "moe${suffix}" ;;
+    custom3b) printf '%s\n' "dense_3b${suffix}" "moe-604m-a75m${suffix}" ;;
+    qwen) printf '%s\n' "dense_14b${suffix}" "moe-604m-a38m${suffix}" ;;
+    all)
+      printf '%s\n' \
+        "mlp_1b${suffix}" "mlp_3b${suffix}" "mm_1b${suffix}" "mm_3b${suffix}" \
+        "dense_3b${suffix}" "dense_14b${suffix}" \
+        "moe-604m-a75m${suffix}" "moe-604m-a38m${suffix}" \
+        "mlp${suffix}" "dense${suffix}" "moe${suffix}"
+      ;;
+    *) printf '%s\n' "${item}" ;;
+  esac
+}
 
-  if ((dry_run_requested)); then
+expand_alias() {
+  local kind="$1"
+  local value="$2"
+  case "${kind}:${value}" in
+    backend:all) printf '%s\n' asym torch kt ;;
+    backend:*) printf '%s\n' "${value}" ;;
+    profiler:all) printf '%s\n' source nsys cpu ncu ;;
+    profiler:*) printf '%s\n' "${value}" ;;
+  esac
+}
+
+parse_gpu_list() {
+  local value
+  while read -r value; do
+    value="${value#cuda:}"
+    printf '%s\n' "${value}"
+  done < <(tokens "$@" | dedupe)
+}
+
+parse_seq_lens() {
+  tokens "$@" | dedupe
+}
+
+validate_gpu_ids() {
+  local value
+  for value in "$@"; do
+    [[ "${value}" =~ ^[0-9]+$ ]] || die "GPU IDs must be integers or cuda:<integer>; got ${value}"
+  done
+}
+
+validate_seq_lens() {
+  local value
+  for value in "$@"; do
+    [[ "${value}" =~ ^[0-9]+$ && "${value}" -gt 0 ]] || die "sequence lengths must be positive integers; got ${value}"
+  done
+}
+
+validate_backends() {
+  local value
+  for value in "$@"; do
+    case "${value}" in
+      asym|torch|kt) ;;
+      *) die "unknown backend '${value}'; allowed: asym, torch, kt, all" ;;
+    esac
+  done
+}
+
+validate_profilers() {
+  local value
+  for value in "$@"; do
+    case "${value}" in
+      source|nsys|cpu|ncu) ;;
+      *) die "unknown profiler '${value}'; allowed: source, nsys, cpu, ncu, all" ;;
+    esac
+  done
+}
+
+collect_values() {
+  local opt="$1"
+  shift
+  local -n out="$1"
+  shift
+  out=()
+  while (($#)) && [[ "$1" != --* ]]; do
+    out+=("$1")
+    shift
+  done
+  ((${#out[@]} > 0)) || die "${opt} requires at least one value"
+  REMAINING=("$@")
+}
+
+preflight_python() {
+  local report
+  if ! USER_PYTHON_BIN="$("${USER_PYTHON_BIN}" -c 'import sys; print(sys.executable)' 2>&1)"; then
+    die "python interpreter failed: ${USER_PYTHON_BIN}"
+  fi
+  USER_PYTHON_BIN="${USER_PYTHON_BIN%%$'\n'*}"
+  if ((dry_run)); then
     echo "Using Python: ${USER_PYTHON_BIN}"
     return
   fi
-
-  if ! python_report="$("${USER_PYTHON_BIN}" - <<'PY' 2>&1
+  if ! report="$("${USER_PYTHON_BIN}" - <<'PY' 2>&1
 import sys
-
 try:
     import torch
 except Exception as exc:
     print(f"{exc.__class__.__name__}: {exc}", file=sys.stderr)
     raise SystemExit(1)
-
 print(f"{sys.executable} torch={getattr(torch, '__version__', 'unknown')}")
 PY
 )"; then
-    echo "error: ${USER_PYTHON_BIN} cannot import torch; profiling would fail inside nsys." >&2
-    echo "${python_report}" >&2
-    echo "hint: pass --python-bin /path/to/python from the environment where torch is installed." >&2
-    exit 2
+    echo "${report}" >&2
+    die "${USER_PYTHON_BIN} cannot import torch; pass --python-bin from the profiling environment"
   fi
-  echo "Using Python: ${python_report}"
+  echo "Using Python: ${report}"
 }
 
 kill_tree() {
@@ -249,218 +299,157 @@ kill_tree_force() {
   kill -KILL "${pid}" 2>/dev/null || true
 }
 
-declare -a gpu_values=("${USER_GPU_POOL[@]}")
-declare -a workload_values=("${USER_WORKLOADS[@]}")
-declare -a backend_values=("${USER_BACKENDS[@]}")
-declare -a profiler_values=("${USER_PROFILERS[@]}")
-declare -a pass_args=()
+gpu_spec="${USER_GPU_POOL}"
+workload_spec="${USER_WORKLOADS}"
+backend_spec="${USER_BACKENDS}"
+profiler_spec="${USER_PROFILERS}"
+seq_spec="${USER_SEQ_LENS}"
 jobs_per_gpu="${USER_JOBS_PER_GPU}"
 output_root="${USER_OUTPUT_ROOT}"
 run_name="${USER_RUN_NAME}"
 precision="${USER_PRECISION}"
 mode="${USER_MODE}"
-dry_run_requested=0
+plot="$(bool_value "${PLOT}")"
+plot_output_dir="${PLOT_OUTPUT_DIR}"
+recompute_spec="${RECOMPUTE}"
+dry_run=0
+pass_args=()
 
 while (($#)); do
   case "$1" in
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    --gpus|--gpu-pool|--cuda-devices)
-      gpu_values=()
-      shift
-      while (($#)) && [[ "$1" != --* ]]; do
-        gpu_values+=("$1")
-        shift
-      done
-      ;;
-    --workloads)
-      workload_values=()
-      shift
-      while (($#)) && [[ "$1" != --* ]]; do
-        workload_values+=("$1")
-        shift
-      done
-      ;;
-    --backends)
-      backend_values=()
-      shift
-      while (($#)) && [[ "$1" != --* ]]; do
-        backend_values+=("$1")
-        shift
-      done
-      ;;
-    --profilers)
-      profiler_values=()
-      shift
-      while (($#)) && [[ "$1" != --* ]]; do
-        profiler_values+=("$1")
-        shift
-      done
-      ;;
-    --jobs-per-gpu)
-      jobs_per_gpu="$2"
-      shift 2
-      ;;
-    --python-bin)
-      USER_PYTHON_BIN="$2"
-      shift 2
-      ;;
-    --output-root)
-      output_root="$2"
-      shift 2
-      ;;
-    --run-name)
-      run_name="$2"
-      shift 2
-      ;;
-    --precision)
-      precision="$2"
-      shift 2
-      ;;
-    --mode)
-      mode="$2"
-      shift 2
-      ;;
-    --)
-      shift
-      pass_args+=("$@")
-      break
-      ;;
-    *)
-      pass_args+=("$1")
-      shift
-      ;;
+    -h|--help) usage; exit 0 ;;
+    --gpus=*|--gpu-pool=*|--cuda-devices=*) gpu_spec="${1#*=}"; shift ;;
+    --workloads=*) workload_spec="${1#*=}"; shift ;;
+    --backends=*) backend_spec="${1#*=}"; shift ;;
+    --profilers=*) profiler_spec="${1#*=}"; shift ;;
+    --seq-len=*|--real-seq-len=*) seq_spec="${1#*=}"; shift ;;
+    --seq-lens=*|--real-seq-lens=*) seq_spec="${1#*=}"; shift ;;
+    --jobs-per-gpu=*) jobs_per_gpu="${1#*=}"; shift ;;
+    --python-bin=*) USER_PYTHON_BIN="${1#*=}"; shift ;;
+    --output-root=*) output_root="${1#*=}"; shift ;;
+    --run-name=*) run_name="${1#*=}"; shift ;;
+    --precision=*) precision="${1#*=}"; shift ;;
+    --mode=*) mode="${1#*=}"; shift ;;
+    --plot=*) die "use '--plot true' or '--plot false' instead of --plot=..." ;;
+    --plot-output-dir=*) plot_output_dir="${1#*=}"; shift ;;
+    --recompute=*) recompute_spec="${1#*=}"; shift ;;
+    --gpus|--gpu-pool|--cuda-devices) collect_values "$1" vals "${@:2}"; gpu_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
+    --workloads) collect_values "$1" vals "${@:2}"; workload_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
+    --backends) collect_values "$1" vals "${@:2}"; backend_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
+    --profilers) collect_values "$1" vals "${@:2}"; profiler_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
+    --seq-len|--real-seq-len) need_value "$1" "${2-}"; seq_spec="$2"; shift 2 ;;
+    --seq-lens|--real-seq-lens) collect_values "$1" vals "${@:2}"; seq_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
+    --jobs-per-gpu) need_value "$1" "${2-}"; jobs_per_gpu="$2"; shift 2 ;;
+    --python-bin) need_value "$1" "${2-}"; USER_PYTHON_BIN="$2"; shift 2 ;;
+    --output-root) need_value "$1" "${2-}"; output_root="$2"; shift 2 ;;
+    --run-name) need_value "$1" "${2-}"; run_name="$2"; shift 2 ;;
+    --precision) need_value "$1" "${2-}"; precision="$2"; shift 2 ;;
+    --mode) need_value "$1" "${2-}"; mode="$2"; shift 2 ;;
+    --plot) need_value "$1" "${2-}"; plot="$(bool_value "$2")"; shift 2 ;;
+    --plot-output-dir) need_value "$1" "${2-}"; plot_output_dir="$2"; shift 2 ;;
+    --recompute) need_value "$1" "${2-}"; recompute_spec="$2"; shift 2 ;;
+    --activation-recompute) recompute_spec="recomp"; shift ;;
+    --no-plot|--plot-activation-recompute-sweep|--plot-recompute-sweep) die "use '--plot true' or '--plot false'" ;;
+    --) shift; pass_args+=("$@"); break ;;
+    *) pass_args+=("$1"); [[ "$1" == "--dry-run" ]] && dry_run=1; shift ;;
   esac
 done
 
 for arg in "${pass_args[@]}"; do
-  if [[ "${arg}" == "--dry-run" ]]; then
-    dry_run_requested=1
-    break
-  fi
+  [[ "${arg}" == "--dry-run" ]] && dry_run=1
 done
 
-if ((${#gpu_values[@]} == 0)); then
-  echo "error: specify a GPU pool with --gpus 2,3 or --gpu-pool 2 3" >&2
-  exit 2
-fi
+[[ -n "${USER_PYTHON_BIN}" ]] || die "--python-bin cannot be empty"
+[[ -n "${output_root}" ]] || die "--output-root cannot be empty"
+[[ -n "${precision}" ]] || die "--precision cannot be empty"
+[[ -n "${mode}" ]] || die "--mode cannot be empty"
+[[ "${jobs_per_gpu}" =~ ^[0-9]+$ && "${jobs_per_gpu}" -gt 0 ]] || die "--jobs-per-gpu must be a positive integer"
+validate_recompute "${recompute_spec}"
 
-if ! [[ "${jobs_per_gpu}" =~ ^[0-9]+$ ]] || ((jobs_per_gpu < 1)); then
-  echo "error: --jobs-per-gpu must be a positive integer" >&2
-  exit 2
-fi
+mapfile -t gpus < <(parse_gpu_list "${gpu_spec}")
+mapfile -t seq_lens < <(parse_seq_lens "${seq_spec}")
+mapfile -t workloads < <(tokens "${workload_spec}" | while read -r value; do expand_workload "${value}"; done | dedupe)
+mapfile -t backends < <(tokens "${backend_spec}" | while read -r value; do expand_alias backend "${value}"; done | dedupe)
+mapfile -t profilers < <(tokens "${profiler_spec}" | while read -r value; do expand_alias profiler "${value}"; done | dedupe)
+mapfile -t recompute_modes < <(recompute_values "${recompute_spec}")
 
-preflight_python "${USER_PYTHON_BIN}"
+((${#gpus[@]})) || die "GPU pool is empty"
+((${#seq_lens[@]})) || die "sequence length list is empty"
+((${#workloads[@]} && ${#backends[@]} && ${#profilers[@]} && ${#recompute_modes[@]})) || die "workloads/backends/profilers/recompute expanded to an empty list"
+validate_gpu_ids "${gpus[@]}"
+validate_seq_lens "${seq_lens[@]}"
+validate_backends "${backends[@]}"
+validate_profilers "${profilers[@]}"
 
-mapfile -t gpus < <(split_values "${gpu_values[@]}" | dedupe_lines)
-if ((${#gpus[@]} == 0)); then
-  echo "error: empty GPU pool" >&2
-  exit 2
-fi
+preflight_python
 
-mapfile -t workloads < <(split_values "${workload_values[@]}" | xargs -r -n1 printf '%s\n' | while read -r x; do expand_workloads "$x"; done | dedupe_lines)
-mapfile -t backends < <(split_values "${backend_values[@]}" | xargs -r -n1 printf '%s\n' | while read -r x; do expand_backends "$x"; done | dedupe_lines)
-mapfile -t profilers < <(split_values "${profiler_values[@]}" | xargs -r -n1 printf '%s\n' | while read -r x; do expand_profilers "$x"; done | dedupe_lines)
-
-if ((${#workloads[@]} == 0 || ${#backends[@]} == 0 || ${#profilers[@]} == 0)); then
-  echo "error: workloads/backends/profilers expanded to empty lists" >&2
-  exit 2
-fi
+driver_args=(
+  --warmup-steps "${USER_WARMUP_STEPS}"
+  --measure-steps "${USER_MEASURE_STEPS}"
+  --profile-layers "${USER_PROFILE_LAYERS}"
+  --batch-size "${USER_BATCH_SIZE}"
+  --hidden-dim "${USER_HIDDEN_DIM}"
+  --mlp-intermediate-dim "${USER_MLP_INTERMEDIATE_DIM}"
+  --mlp-expansion "${USER_MLP_EXPANSION}"
+  --lora-rank "${USER_LORA_RANK}"
+  --lora-alpha "${USER_LORA_ALPHA}"
+  --vocab-rows "${USER_VOCAB_ROWS}"
+  --moe-mode "${USER_MOE_MODE}"
+  --dense-target-mode "${USER_DENSE_TARGET_MODE}"
+  --kt-method "${USER_KT_METHOD}"
+  --kt-cpu-threads "${USER_KT_CPU_THREADS}"
+  --kt-threadpool-count "${USER_KT_THREADPOOL_COUNT}"
+  --kt-max-cache-depth "${USER_KT_MAX_CACHE_DEPTH}"
+  --nsys-bin "${USER_NSYS_BIN}"
+  --ncu-bin "${USER_NCU_BIN}"
+  --ncu-preset "${USER_NCU_PRESET}"
+  --seq-lens "${seq_lens[@]}"
+)
+((USER_NCU_CLEAR_JIT_CACHE)) && driver_args+=(--ncu-clear-jit-cache)
 
 run_root="$(abs_path "${output_root}")"
 [[ -n "${run_name}" ]] && run_root="${run_root}/${run_name}"
 log_dir="${run_root}/driver_logs"
 mkdir -p "${log_dir}"
-manifest="${log_dir}/$(safe_label "${precision}_lora_sft").tsv"
-printf 'status\tpid\tgpu\tworkload\tbackend\tlog\n' > "${manifest}"
+manifest="${log_dir}/$(safe_label "${precision}_lora-sft").tsv"
+printf 'status\tpid\tgpu\trecompute\tworkload\tbackend\tlog\n' > "${manifest}"
 
-declare -a all_pids=()
-declare -a active_pids=()
-declare -a active_gpus=()
-declare -a active_workloads=()
-declare -a active_backends=()
-declare -a active_logs=()
+declare -a all_pids=() active_pids=()
+declare -A pid_gpu=() pid_recompute=() pid_workload=() pid_backend=() pid_log=()
 failures=0
 
 cleanup_jobs() {
-  local pid
-  if ((${#all_pids[@]} == 0)); then
-    return
-  fi
+  ((${#all_pids[@]})) || return
   echo "Stopping background profiling jobs..." >&2
-  for pid in "${all_pids[@]}"; do
-    if kill -0 "${pid}" 2>/dev/null; then
-      kill_tree "${pid}"
-    fi
-  done
+  local pid
+  for pid in "${all_pids[@]}"; do kill_tree "${pid}"; done
   sleep 2
-  for pid in "${all_pids[@]}"; do
-    if kill -0 "${pid}" 2>/dev/null; then
-      kill_tree_force "${pid}"
-    fi
-  done
+  for pid in "${all_pids[@]}"; do kill_tree_force "${pid}"; done
 }
 
-on_signal() {
-  trap - INT TERM EXIT
-  cleanup_jobs
-  exit 130
-}
+trap 'trap - INT TERM EXIT; cleanup_jobs; exit 130' INT TERM
+trap 'status=$?; trap - EXIT; if ((status != 0)); then cleanup_jobs; fi; exit "${status}"' EXIT
 
-on_exit() {
-  local status=$?
-  trap - EXIT
-  if ((status != 0)); then
-    cleanup_jobs
-  fi
-}
-
-trap on_signal INT TERM
-trap on_exit EXIT
-
-pop_active_front() {
-  active_pids=("${active_pids[@]:1}")
-  active_gpus=("${active_gpus[@]:1}")
-  active_workloads=("${active_workloads[@]:1}")
-  active_backends=("${active_backends[@]:1}")
-  active_logs=("${active_logs[@]:1}")
-}
-
-wait_one() {
+finish_one() {
   local pid="${active_pids[0]}"
-  local gpu="${active_gpus[0]}"
-  local workload="${active_workloads[0]}"
-  local backend="${active_backends[0]}"
-  local log_file="${active_logs[0]}"
   local status=0
   if wait "${pid}"; then
-    status=0
-    echo "Finished pid=${pid} gpu=${gpu} workload=${workload} backend=${backend}"
+    echo "Finished pid=${pid} gpu=${pid_gpu[$pid]} recompute=${pid_recompute[$pid]} workload=${pid_workload[$pid]} backend=${pid_backend[$pid]}"
   else
     status=$?
     failures=$((failures + 1))
-    echo "FAILED pid=${pid} status=${status} gpu=${gpu} workload=${workload} backend=${backend}; log=${log_file}" >&2
+    echo "FAILED pid=${pid} status=${status} gpu=${pid_gpu[$pid]} recompute=${pid_recompute[$pid]} workload=${pid_workload[$pid]} backend=${pid_backend[$pid]}; log=${pid_log[$pid]}" >&2
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${status}" "${pid}" "${gpu}" "${workload}" "${backend}" "${log_file}" >> "${manifest}"
-  pop_active_front
-}
-
-wait_for_slot() {
-  local max_parallel=$(( ${#gpus[@]} * jobs_per_gpu ))
-  while ((${#active_pids[@]} >= max_parallel)); do
-    wait_one
-  done
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${status}" "${pid}" "${pid_gpu[$pid]}" "${pid_recompute[$pid]}" "${pid_workload[$pid]}" "${pid_backend[$pid]}" "${pid_log[$pid]}" >> "${manifest}"
+  active_pids=("${active_pids[@]:1}")
 }
 
 launch_job() {
-  local workload="$1"
-  local backend="$2"
-  local gpu="$3"
-  local label
-  label="$(safe_label "${precision}_lora_sft_${workload}_${backend}_gpu${gpu}")"
-  local log_file="${log_dir}/${label}.log"
+  local recompute="$1"
+  local workload="$2"
+  local backend="$3"
+  local gpu="$4"
+  local log_file="${log_dir}/$(safe_label "${precision}_lora-sft_${recompute}_${workload}_${backend}_gpu${gpu}").log"
   local cmd=(
     "${USER_PYTHON_BIN}" "${PY_DRIVER}"
     --workloads "${workload}"
@@ -471,42 +460,38 @@ launch_job() {
     --precision "${precision}"
     --mode "${mode}"
     --skip-summary
-    "${DRIVER_ARGS[@]}"
+    "${driver_args[@]}"
     "${pass_args[@]}"
   )
-  if [[ -n "${run_name}" ]]; then
-    cmd+=(--run-name "${run_name}")
-  fi
+  [[ -n "${run_name}" ]] && cmd+=(--run-name "${run_name}")
+  [[ "${recompute}" == "recomp" ]] && cmd+=(--activation-recompute)
 
-  echo "Launching gpu=${gpu} workload=${workload} backend=${backend}"
+  echo "Launching gpu=${gpu} recompute=${recompute} workload=${workload} backend=${backend}"
   echo "  log=${log_file}"
-  (
-    cd "${ROOT}"
-    exec "${cmd[@]}"
-  ) > "${log_file}" 2>&1 &
+  (cd "${ROOT}" && exec "${cmd[@]}") > "${log_file}" 2>&1 &
 
   local pid=$!
   all_pids+=("${pid}")
   active_pids+=("${pid}")
-  active_gpus+=("${gpu}")
-  active_workloads+=("${workload}")
-  active_backends+=("${backend}")
-  active_logs+=("${log_file}")
+  pid_gpu[$pid]="${gpu}"
+  pid_recompute[$pid]="${recompute}"
+  pid_workload[$pid]="${workload}"
+  pid_backend[$pid]="${backend}"
+  pid_log[$pid]="${log_file}"
 }
 
+max_parallel=$(( ${#gpus[@]} * jobs_per_gpu ))
 job_index=0
-for workload in "${workloads[@]}"; do
-  for backend in "${backends[@]}"; do
-    wait_for_slot
-    gpu="${gpus[$((job_index % ${#gpus[@]}))]}"
-    launch_job "${workload}" "${backend}" "${gpu}"
-    job_index=$((job_index + 1))
+for recompute in "${recompute_modes[@]}"; do
+  for workload in "${workloads[@]}"; do
+    for backend in "${backends[@]}"; do
+      while ((${#active_pids[@]} >= max_parallel)); do finish_one; done
+      launch_job "${recompute}" "${workload}" "${backend}" "${gpus[$((job_index % ${#gpus[@]}))]}"
+      job_index=$((job_index + 1))
+    done
   done
 done
-
-while ((${#active_pids[@]} > 0)); do
-  wait_one
-done
+while ((${#active_pids[@]})); do finish_one; done
 
 echo "Job manifest: ${manifest}"
 if ((failures > 0)); then
@@ -514,31 +499,36 @@ if ((failures > 0)); then
   exit 1
 fi
 
-if ((dry_run_requested)); then
+if ((dry_run)); then
   echo "Dry run completed; skipping aggregate summary collection."
   exit 0
 fi
 
-summary_cmd=(
-  "${USER_PYTHON_BIN}" "${PY_DRIVER}"
-  --workloads "${workloads[@]}"
-  --backends "${backends[@]}"
-  --profilers "${profilers[@]}"
-  --output-root "${output_root}"
-  --precision "${precision}"
-  --mode "${mode}"
-  --collect-existing
-  "${DRIVER_ARGS[@]}"
-  "${pass_args[@]}"
-)
-if [[ -n "${run_name}" ]]; then
-  summary_cmd+=(--run-name "${run_name}")
-fi
-
 echo "Writing aggregate summary..."
-(
-  cd "${ROOT}"
-  "${summary_cmd[@]}"
-)
+for recompute in "${recompute_modes[@]}"; do
+  summary_cmd=(
+    "${USER_PYTHON_BIN}" "${PY_DRIVER}"
+    --workloads "${workloads[@]}"
+    --backends "${backends[@]}"
+    --profilers "${profilers[@]}"
+    --output-root "${output_root}"
+    --precision "${precision}"
+    --mode "${mode}"
+    --collect-existing
+    "${driver_args[@]}"
+    "${pass_args[@]}"
+  )
+  [[ -n "${run_name}" ]] && summary_cmd+=(--run-name "${run_name}")
+  [[ "${recompute}" == "recomp" ]] && summary_cmd+=(--activation-recompute)
+  echo "  recompute=${recompute}"
+  (cd "${ROOT}" && "${summary_cmd[@]}")
+done
+
+if ((plot)); then
+  plot_cmd=("${USER_PYTHON_BIN}" "${PLOT_RECOMPUTE_SCRIPT}" --input-root "${run_root}" --precision "${precision}")
+  [[ -n "${plot_output_dir}" ]] && plot_cmd+=(--output-dir "$(abs_path "${plot_output_dir}")")
+  echo "Writing activation recompute sweep plots..."
+  (cd "${ROOT}" && "${plot_cmd[@]}")
+fi
 
 echo "All profiling jobs completed."
