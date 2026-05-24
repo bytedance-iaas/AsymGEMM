@@ -152,6 +152,26 @@ def _seq_lens(args: argparse.Namespace) -> list[int]:
     return list(dict.fromkeys(seq_lens))
 
 
+def _expert_recompute_thresholds(args: argparse.Namespace) -> list[int]:
+    values = getattr(args, "expert_recompute_thresholds", None)
+    if not values:
+        values = [str(getattr(args, "expert_recompute_threshold", 0) or 0)]
+    thresholds: list[int] = []
+    for value in _split_tokens(values):
+        try:
+            threshold = int(value)
+        except ValueError as exc:
+            raise SystemExit(
+                f"invalid --expert-recompute-thresholds value {value!r}; entries must be integers"
+            ) from exc
+        if threshold < 0:
+            raise SystemExit(
+                f"invalid --expert-recompute-thresholds value {value!r}; entries must be non-negative"
+            )
+        thresholds.append(threshold)
+    return list(dict.fromkeys(thresholds))
+
+
 def _timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
@@ -182,12 +202,15 @@ def _input_config_label(args: argparse.Namespace) -> str:
     batch = int(getattr(args, "batch_size", 0) or 0)
     seq = int(getattr(args, "seq_len", 0) or 0)
     recompute = "recomp" if bool(getattr(args, "activation_recompute", False)) else "norecomp"
+    expert_recompute_threshold = int(getattr(args, "expert_recompute_threshold", 0) or 0)
     parts = []
     if batch > 0:
         parts.append(f"b{batch}")
     if seq > 0:
         parts.append(f"s{seq}")
     parts.append(recompute)
+    if expert_recompute_threshold > 0:
+        parts.append(f"expertthr{expert_recompute_threshold}")
     return "_".join(parts)
 
 
@@ -217,6 +240,16 @@ def _load_profile(output_dir: Path) -> tuple[dict[str, Any], Path | None]:
         if path.exists():
             return json.loads(path.read_text(encoding="utf-8")), path
     return {}, None
+
+
+def _existing_profile(output_dir: Path) -> tuple[dict[str, Any], Path | None]:
+    try:
+        profile, profile_path = _load_profile(output_dir)
+    except (OSError, json.JSONDecodeError):
+        return {}, None
+    if profile_path is None or not profile:
+        return {}, None
+    return profile, profile_path
 
 
 def _find_markdown(output_dir: Path) -> Path | None:
@@ -277,6 +310,8 @@ def _common_profile_args(
         str(args.vocab_rows),
         "--precision",
         str(args.precision),
+        "--attention-impl",
+        str(args.attention_impl),
         "--kt-method",
         args.kt_method,
         "--kt-cpu-threads",
@@ -285,6 +320,8 @@ def _common_profile_args(
         str(args.kt_threadpool_count),
         "--kt-max-cache-depth",
         str(args.kt_max_cache_depth),
+        "--expert-recompute-threshold",
+        str(args.expert_recompute_threshold),
         "--output-dir",
         str(output_dir),
     ]
@@ -425,7 +462,7 @@ def _summary_row(
 
 
 def _add_comparisons(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_workload: dict[tuple[str, str, int | None, bool], dict[str, dict[str, Any]]] = {}
+    by_workload: dict[tuple[str, str, int | None, bool, int], dict[str, dict[str, Any]]] = {}
     for row in rows:
         if row.get("status") != "ok":
             continue
@@ -435,10 +472,11 @@ def _add_comparisons(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             str(row.get("profiler", "source")),
             int(seq_len) if isinstance(seq_len, int) else None,
             bool(row.get("activation_recompute", False)),
+            int(row.get("expert_recompute_threshold", 0) or 0),
         )
         by_workload.setdefault(key, {})[str(row["backend"])] = row
     comparisons: list[dict[str, Any]] = []
-    for (workload, profiler, seq_len, activation_recompute), items in by_workload.items():
+    for (workload, profiler, seq_len, activation_recompute, expert_recompute_threshold), items in by_workload.items():
         asym = items.get("asym")
         torch = items.get("torch")
         kt = items.get("kt")
@@ -452,6 +490,7 @@ def _add_comparisons(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "profiler": profiler,
                         "seq_len": seq_len,
                         "activation_recompute": activation_recompute,
+                        "expert_recompute_threshold": expert_recompute_threshold,
                         "comparison": "asym_vs_torch",
                         "candidate_step_ms": asym_ms,
                         "torch_step_ms": torch_ms,
@@ -469,6 +508,7 @@ def _add_comparisons(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "profiler": profiler,
                         "seq_len": seq_len,
                         "activation_recompute": activation_recompute,
+                        "expert_recompute_threshold": expert_recompute_threshold,
                         "comparison": "kt_vs_torch",
                         "candidate_step_ms": kt_ms,
                         "torch_step_ms": torch_ms,
@@ -704,6 +744,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vocab-rows", type=int, default=4096)
     parser.add_argument("--precision", default="bf16", help="Experiment precision label used in result table filenames.")
     parser.add_argument(
+        "--attention-impl",
+        choices=["sdpa", "fa2", "fa3", "fa4"],
+        default="sdpa",
+        help="Attention implementation passed to profile_lora.py. fa2/fa3/fa4 are placeholders until wired.",
+    )
+    parser.add_argument(
         "--mode",
         default="auto",
         help="Result filename mode label. Default auto uses <backend-label>_<profiler>, e.g. asym_nsys.",
@@ -728,9 +774,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Pass --activation-recompute to profile_lora.py for layer-level activation checkpointing.",
     )
-    parser.add_argument("--nsys-bin", default="nsys")
-    parser.add_argument("--ncu-bin", default="ncu")
-    parser.add_argument("--ncu-preset", choices=["quick", "paper"], default="paper")
+    parser.add_argument(
+        "--expert-recompute-threshold",
+        type=int,
+        default=0,
+        help="Checkpoint/recompute MoE routed experts with fewer than this many routed tokens. 0 disables it.",
+    )
+    parser.add_argument(
+        "--expert-recompute-thresholds",
+        nargs="+",
+        default=None,
+        help="Threshold sweep. Accepts space- or comma-separated non-negative values.",
+    )
     parser.add_argument("--ncu-clear-jit-cache", action="store_true")
     parser.add_argument(
         "--skip-memory-attribution",
@@ -748,6 +803,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--collect-existing", action="store_true", help="Build summaries from existing output directories without running profilers.")
+    parser.add_argument("--skip-existing", action="store_true", help="Skip profiler tasks whose final profile output already exists.")
+    parser.add_argument("--overwrite", action="store_true", help="Run profiler tasks even when final profile output already exists.")
     parser.add_argument("--skip-summary", action="store_true", help="Do not write run-level summary/commands files. Useful for parallel shell orchestration.")
     return parser.parse_args()
 
@@ -759,6 +816,7 @@ def main() -> None:
     backends = _expand_backends(args.backends)
     profilers = _expand_profilers(args.profilers)
     seq_lens = _seq_lens(args)
+    expert_recompute_thresholds = _expert_recompute_thresholds(args)
     cuda_devices = _cuda_devices(args.cuda_devices)
     run_dir = args.output_root / args.run_name if args.run_name else args.output_root
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -773,273 +831,311 @@ def main() -> None:
         profile_layers = int(workload_spec.profile_layers or args.profile_layers)
         for seq_len in seq_lens:
             args.seq_len = seq_len
-            for backend in backends:
-                for profiler in profilers:
-                    physical_cuda_device = cuda_devices[task_index % len(cuda_devices)] if cuda_devices else None
-                    child_device = "cuda:0" if physical_cuda_device is not None else args.device
-                    output_dir = _raw_output_dir(run_dir, workload_label, args, backend, profiler)
-                    env = os.environ.copy()
-                    env["PYTHONUNBUFFERED"] = "1"
-                    if physical_cuda_device is not None:
-                        env["CUDA_VISIBLE_DEVICES"] = physical_cuda_device
+            for expert_recompute_threshold in expert_recompute_thresholds:
+                args.expert_recompute_threshold = expert_recompute_threshold
+                for backend in backends:
+                    for profiler in profilers:
+                        physical_cuda_device = cuda_devices[task_index % len(cuda_devices)] if cuda_devices else None
+                        child_device = "cuda:0" if physical_cuda_device is not None else args.device
+                        output_dir = _raw_output_dir(run_dir, workload_label, args, backend, profiler)
+                        env = os.environ.copy()
+                        env["PYTHONUNBUFFERED"] = "1"
+                        if physical_cuda_device is not None:
+                            env["CUDA_VISIBLE_DEVICES"] = physical_cuda_device
 
-                    commands_for_task: list[list[str]]
-                    skip_reason = ""
-                    if backend == "kt" and workload not in KT_MOE_WORKLOADS:
-                        skip_reason = "backend=kt is only implemented for MoE LoRA SFT workloads"
-                        commands_for_task = []
-                    elif profiler == "source":
-                        commands_for_task = [
-                            [
-                                sys.executable,
-                                str(PROFILE_SCRIPT),
-                                *_common_profile_args(args, workload, backend, child_device, output_dir, profile_layers=profile_layers),
-                            ]
-                        ]
-                    elif profiler == "nsys":
-                        source_dir = output_dir / "source_debug"
-                        memory_dir = output_dir / "memory_debug"
-                        report_prefix = output_dir / "trace"
-                        sqlite_path = output_dir / "trace.sqlite"
-                        commands_for_task = [
-                            [
-                                args.nsys_bin,
-                                "profile",
-                                "--trace=cuda,nvtx",
-                                "--sample=none",
-                                "--cpuctxsw=none",
-                                "--resolve-symbols=false",
-                                "--wait=primary",
-                                "--force-overwrite=true",
-                                f"--output={report_prefix}",
-                                sys.executable,
-                                str(PROFILE_SCRIPT),
-                                *_common_profile_args(args, workload, backend, child_device, source_dir, profile_layers=profile_layers),
-                            ],
-                            [
-                                args.nsys_bin,
-                                "export",
-                                "--type=sqlite",
-                                "--force-overwrite=true",
-                                f"--output={sqlite_path}",
-                                str(output_dir / "trace.nsys-rep"),
-                            ],
-                        ]
-                        if not args.skip_memory_attribution:
-                            commands_for_task.append(
+                        commands_for_task: list[list[str]]
+                        skip_reason = ""
+                        if expert_recompute_threshold > 0 and workload not in KT_MOE_WORKLOADS:
+                            skip_reason = "per-expert activation recompute thresholds only apply to MoE workloads"
+                            commands_for_task = []
+                        elif backend == "kt" and workload not in KT_MOE_WORKLOADS:
+                            skip_reason = "backend=kt is only implemented for MoE LoRA SFT workloads"
+                            commands_for_task = []
+                        elif backend == "kt" and expert_recompute_threshold > 0:
+                            skip_reason = "backend=kt does not support per-expert activation recompute thresholds"
+                            commands_for_task = []
+                        elif profiler == "source":
+                            commands_for_task = [
                                 [
                                     sys.executable,
                                     str(PROFILE_SCRIPT),
-                                    *_common_profile_args(args, workload, backend, child_device, memory_dir, profile_layers=profile_layers),
-                                    "--warmup-steps",
-                                    "0",
-                                    "--measure-steps",
-                                    str(max(1, int(args.memory_attribution_steps))),
-                                    "--memory-attribution",
+                                    *_common_profile_args(args, workload, backend, child_device, output_dir, profile_layers=profile_layers),
+                                ]
+                            ]
+                        elif profiler == "nsys":
+                            source_dir = output_dir / "source_debug"
+                            memory_dir = output_dir / "memory_debug"
+                            report_prefix = output_dir / "trace"
+                            sqlite_path = output_dir / "trace.sqlite"
+                            commands_for_task = [
+                                [
+                                    "nsys",
+                                    "profile",
+                                    "--trace=cuda,nvtx",
+                                    "--sample=none",
+                                    "--cpuctxsw=none",
+                                    "--resolve-symbols=false",
+                                    "--wait=primary",
+                                    "--force-overwrite=true",
+                                    f"--output={report_prefix}",
+                                    sys.executable,
+                                    str(PROFILE_SCRIPT),
+                                    *_common_profile_args(args, workload, backend, child_device, source_dir, profile_layers=profile_layers),
+                                ],
+                                [
+                                    "nsys",
+                                    "export",
+                                    "--type=sqlite",
+                                    "--force-overwrite=true",
+                                    f"--output={sqlite_path}",
+                                    str(output_dir / "trace.nsys-rep"),
+                                ],
+                            ]
+                            if not args.skip_memory_attribution:
+                                commands_for_task.append(
+                                    [
+                                        sys.executable,
+                                        str(PROFILE_SCRIPT),
+                                        *_common_profile_args(args, workload, backend, child_device, memory_dir, profile_layers=profile_layers),
+                                        "--warmup-steps",
+                                        "0",
+                                        "--measure-steps",
+                                        str(max(1, int(args.memory_attribution_steps))),
+                                        "--memory-attribution",
+                                    ]
+                                )
+                            postprocess_cmd = [
+                                sys.executable,
+                                str(NSYS_POSTPROCESS_SCRIPT),
+                                str(sqlite_path),
+                                "--source-profile-dir",
+                                str(source_dir),
+                            ]
+                            if not args.skip_memory_attribution:
+                                postprocess_cmd.extend(["--memory-profile-dir", str(memory_dir)])
+                            postprocess_cmd.extend(
+                                [
+                                    "--output-json",
+                                    str(output_dir / "profile.json"),
+                                    "--output-md",
+                                    str(output_dir / "table.md"),
                                 ]
                             )
-                        postprocess_cmd = [
-                            sys.executable,
-                            str(NSYS_POSTPROCESS_SCRIPT),
-                            str(sqlite_path),
-                            "--source-profile-dir",
-                            str(source_dir),
-                        ]
-                        if not args.skip_memory_attribution:
-                            postprocess_cmd.extend(["--memory-profile-dir", str(memory_dir)])
-                        postprocess_cmd.extend(
-                            [
-                                "--output-json",
-                                str(output_dir / "profile.json"),
-                                "--output-md",
-                                str(output_dir / "table.md"),
+                            commands_for_task.append(postprocess_cmd)
+                        elif profiler == "cpu":
+                            commands_for_task = [
+                                [
+                                    sys.executable,
+                                    str(CPU_GAPS_SCRIPT),
+                                    *_common_profile_args(args, workload, backend, child_device, output_dir, profile_layers=profile_layers),
+                                ]
                             ]
-                        )
-                        commands_for_task.append(postprocess_cmd)
-                    elif profiler == "cpu":
-                        commands_for_task = [
-                            [
-                                sys.executable,
-                                str(CPU_GAPS_SCRIPT),
-                                *_common_profile_args(args, workload, backend, child_device, output_dir, profile_layers=profile_layers),
-                                "--nsys-bin",
-                                args.nsys_bin,
-                            ]
-                        ]
-                    elif profiler == "ncu":
-                        if backend != "asym":
-                            skip_reason = f"ncu only profiles AsymGEMM kernels; backend={backend} has no matching AsymGEMM kernel"
-                            commands_for_task = []
-                        elif workload not in NCU_WORKLOADS:
-                            skip_reason = f"ncu wrapper supports {sorted(NCU_WORKLOADS)}, not {workload!r}"
-                            commands_for_task = []
+                        elif profiler == "ncu":
+                            if backend != "asym":
+                                skip_reason = f"ncu only profiles AsymGEMM kernels; backend={backend} has no matching AsymGEMM kernel"
+                                commands_for_task = []
+                            elif workload not in NCU_WORKLOADS:
+                                skip_reason = f"ncu wrapper supports {sorted(NCU_WORKLOADS)}, not {workload!r}"
+                                commands_for_task = []
+                            else:
+                                ncu_cmd = [
+                                    sys.executable,
+                                    str(NCU_SCRIPT),
+                                    "--workload",
+                                    workload,
+                                    "--device",
+                                    child_device,
+                                    "--backend",
+                                    backend,
+                                    "--warmup-steps",
+                                    str(args.warmup_steps),
+                                    "--measure-steps",
+                                    str(args.measure_steps),
+                                    "--output-dir",
+                                    str(output_dir),
+                                    "--moe-mode",
+                                    args.moe_mode,
+                                    "--dense-target-mode",
+                                    args.dense_target_mode,
+                                    "--target-modules",
+                                    args.target_modules,
+                                    "--offload-modules",
+                                    args.offload_modules,
+                                    "--profile-layers",
+                                    str(profile_layers),
+                                    "--batch-size",
+                                    str(args.batch_size),
+                                    "--seq-len",
+                                    str(args.seq_len),
+                                    "--hidden-dim",
+                                    str(args.hidden_dim),
+                                    "--mlp-intermediate-dim",
+                                    str(args.mlp_intermediate_dim),
+                                    "--mlp-expansion",
+                                    str(args.mlp_expansion),
+                                    "--lora-rank",
+                                    str(args.lora_rank),
+                                    "--lora-alpha",
+                                    str(args.lora_alpha),
+                                    "--lora-dtype",
+                                    args.lora_dtype,
+                                    "--vocab-rows",
+                                    str(args.vocab_rows),
+                                    "--expert-recompute-threshold",
+                                    str(args.expert_recompute_threshold),
+                                ]
+                                if args.ncu_clear_jit_cache:
+                                    ncu_cmd.append("--clear-jit-cache")
+                                commands_for_task = [ncu_cmd]
                         else:
-                            ncu_cmd = [
-                                sys.executable,
-                                str(NCU_SCRIPT),
-                                "--workload",
-                                workload,
-                                "--device",
-                                child_device,
-                                "--backend",
-                                backend,
-                                "--warmup-steps",
-                                str(args.warmup_steps),
-                                "--measure-steps",
-                                str(args.measure_steps),
-                                "--preset",
-                                args.ncu_preset,
-                                "--ncu-bin",
-                                args.ncu_bin,
-                                "--output-dir",
-                                str(output_dir),
-                                "--moe-mode",
-                                args.moe_mode,
-                                "--dense-target-mode",
-                                args.dense_target_mode,
-                                "--target-modules",
-                                args.target_modules,
-                                "--offload-modules",
-                                args.offload_modules,
-                                "--profile-layers",
-                                str(profile_layers),
-                                "--batch-size",
-                                str(args.batch_size),
-                                "--seq-len",
-                                str(args.seq_len),
-                                "--hidden-dim",
-                                str(args.hidden_dim),
-                                "--mlp-intermediate-dim",
-                                str(args.mlp_intermediate_dim),
-                                "--mlp-expansion",
-                                str(args.mlp_expansion),
-                                "--lora-rank",
-                                str(args.lora_rank),
-                                "--lora-alpha",
-                                str(args.lora_alpha),
-                                "--lora-dtype",
-                                args.lora_dtype,
-                                "--vocab-rows",
-                                str(args.vocab_rows),
-                            ]
-                            if args.ncu_clear_jit_cache:
-                                ncu_cmd.append("--clear-jit-cache")
-                            commands_for_task = [ncu_cmd]
-                    else:
-                        raise AssertionError(profiler)
-
-                    command_record = {
-                        "workload": workload_label,
-                        "base_workload": workload,
-                        "profile_layers": profile_layers,
-                        "seq_len": seq_len,
-                        "activation_recompute": bool(args.activation_recompute),
-                        "backend": backend,
-                        "profiler": profiler,
-                        "device": child_device,
-                        "physical_cuda_device": physical_cuda_device,
-                        "output_dir": str(output_dir),
-                        "commands": commands_for_task,
-                        "command": commands_for_task[0] if commands_for_task else [],
-                        "skip_reason": skip_reason,
-                    }
-                    commands.append(command_record)
-
-                    if skip_reason:
-                        row = _summary_row(
-                            workload=workload_label,
-                            backend=backend,
-                            profiler=profiler,
-                            device=child_device,
-                            physical_cuda_device=physical_cuda_device,
-                            output_dir=output_dir,
-                            returncode=0,
-                            profile={},
-                        )
-                        row["status"] = "skipped"
-                        row["skip_reason"] = skip_reason
-                        row["base_workload"] = workload
-                        row["profile_layers"] = profile_layers
+                            raise AssertionError(profiler)
+    
+                        command_record = {
+                            "workload": workload_label,
+                            "base_workload": workload,
+                            "profile_layers": profile_layers,
+                            "seq_len": seq_len,
+                            "activation_recompute": bool(args.activation_recompute),
+                            "expert_recompute_threshold": expert_recompute_threshold,
+                            "backend": backend,
+                            "profiler": profiler,
+                            "device": child_device,
+                            "physical_cuda_device": physical_cuda_device,
+                            "output_dir": str(output_dir),
+                            "commands": commands_for_task,
+                            "command": commands_for_task[0] if commands_for_task else [],
+                            "skip_reason": skip_reason,
+                            "skipped_existing": False,
+                        }
+                        commands.append(command_record)
+    
+                        if skip_reason:
+                            row = _summary_row(
+                                workload=workload_label,
+                                backend=backend,
+                                profiler=profiler,
+                                device=child_device,
+                                physical_cuda_device=physical_cuda_device,
+                                output_dir=output_dir,
+                                returncode=0,
+                                profile={},
+                            )
+                            row["status"] = "skipped"
+                            row["skip_reason"] = skip_reason
+                            row["base_workload"] = workload
+                            row["profile_layers"] = profile_layers
+                            row["seq_len"] = seq_len
+                            row["activation_recompute"] = bool(args.activation_recompute)
+                            row["expert_recompute_threshold"] = expert_recompute_threshold
+                            rows.append(row)
+                            task_index += 1
+                            continue
+    
+                        if not args.dry_run and not args.collect_existing:
+                            output_dir.mkdir(parents=True, exist_ok=True)
+    
+                        if args.skip_existing and not args.overwrite and not args.dry_run and not args.collect_existing:
+                            profile, profile_path = _existing_profile(output_dir)
+                            if profile_path is not None:
+                                print(f"Skipping existing: {output_dir}", flush=True)
+                                command_record["skipped_existing"] = True
+                                row = _summary_row(
+                                    workload=workload_label,
+                                    backend=backend,
+                                    profiler=profiler,
+                                    device=child_device,
+                                    physical_cuda_device=physical_cuda_device,
+                                    output_dir=output_dir,
+                                    returncode=0,
+                                    profile=profile,
+                                )
+                                row["profile_json"] = str(profile_path)
+                                row["base_workload"] = workload
+                                row["profile_layers"] = profile_layers
+                                row["seq_len"] = seq_len
+                                row["activation_recompute"] = bool(args.activation_recompute)
+                                row["expert_recompute_threshold"] = expert_recompute_threshold
+                                row["skipped_existing"] = True
+                                rows.append(row)
+                                task_index += 1
+                                continue
+    
+                        if args.collect_existing:
+                            profile, profile_path = _load_profile(output_dir)
+                            returncode = 0 if profile_path is not None else 1
+                            row = _summary_row(
+                                workload=workload_label,
+                                backend=backend,
+                                profiler=profiler,
+                                device=child_device,
+                                physical_cuda_device=physical_cuda_device,
+                                output_dir=output_dir,
+                                returncode=returncode,
+                                profile=profile,
+                            )
+                            row["profile_json"] = str(profile_path) if profile_path is not None else None
+                            row["base_workload"] = workload
+                            row["profile_layers"] = profile_layers
+                            row["seq_len"] = seq_len
+                            row["activation_recompute"] = bool(args.activation_recompute)
+                            row["expert_recompute_threshold"] = expert_recompute_threshold
+                            rows.append(row)
+                            task_index += 1
+                            if returncode != 0 and not args.continue_on_error:
+                                stop_requested = True
+                                break
+                            continue
+    
+                        for cmd in commands_for_task:
+                            print("Running:", " ".join(cmd), flush=True)
+                            if physical_cuda_device is not None:
+                                print(f"  CUDA_VISIBLE_DEVICES={physical_cuda_device}", flush=True)
+                            if args.dry_run:
+                                continue
+                            result = subprocess.run(cmd, cwd=ROOT, env=env, check=False)
+                            if result.returncode != 0:
+                                break
+                        else:
+                            result = subprocess.CompletedProcess(commands_for_task[-1] if commands_for_task else [], 0)
+    
+                        if args.dry_run:
+                            row = _summary_row(
+                                workload=workload_label,
+                                backend=backend,
+                                profiler=profiler,
+                                device=child_device,
+                                physical_cuda_device=physical_cuda_device,
+                                output_dir=output_dir,
+                                returncode=0,
+                                profile={},
+                            )
+                            row["base_workload"] = workload
+                            row["profile_layers"] = profile_layers
+                            row["expert_recompute_threshold"] = expert_recompute_threshold
+                        else:
+                            profile, profile_path = _load_profile(output_dir)
+                            row = _summary_row(
+                                workload=workload_label,
+                                backend=backend,
+                                profiler=profiler,
+                                device=child_device,
+                                physical_cuda_device=physical_cuda_device,
+                                output_dir=output_dir,
+                                returncode=result.returncode,
+                                profile=profile,
+                            )
+                            row["profile_json"] = str(profile_path) if profile_path is not None else None
+                            row["base_workload"] = workload
+                            row["profile_layers"] = profile_layers
+                            row["expert_recompute_threshold"] = expert_recompute_threshold
                         row["seq_len"] = seq_len
                         row["activation_recompute"] = bool(args.activation_recompute)
                         rows.append(row)
                         task_index += 1
-                        continue
-
-                    if not args.dry_run and not args.collect_existing:
-                        output_dir.mkdir(parents=True, exist_ok=True)
-
-                    if args.collect_existing:
-                        profile, profile_path = _load_profile(output_dir)
-                        returncode = 0 if profile_path is not None else 1
-                        row = _summary_row(
-                            workload=workload_label,
-                            backend=backend,
-                            profiler=profiler,
-                            device=child_device,
-                            physical_cuda_device=physical_cuda_device,
-                            output_dir=output_dir,
-                            returncode=returncode,
-                            profile=profile,
-                        )
-                        row["profile_json"] = str(profile_path) if profile_path is not None else None
-                        row["base_workload"] = workload
-                        row["profile_layers"] = profile_layers
-                        row["seq_len"] = seq_len
-                        row["activation_recompute"] = bool(args.activation_recompute)
-                        rows.append(row)
-                        task_index += 1
-                        if returncode != 0 and not args.continue_on_error:
+                        if result.returncode != 0 and not args.continue_on_error:
                             stop_requested = True
                             break
-                        continue
-
-                    for cmd in commands_for_task:
-                        print("Running:", " ".join(cmd), flush=True)
-                        if physical_cuda_device is not None:
-                            print(f"  CUDA_VISIBLE_DEVICES={physical_cuda_device}", flush=True)
-                        if args.dry_run:
-                            continue
-                        result = subprocess.run(cmd, cwd=ROOT, env=env, check=False)
-                        if result.returncode != 0:
-                            break
-                    else:
-                        result = subprocess.CompletedProcess(commands_for_task[-1] if commands_for_task else [], 0)
-
-                    if args.dry_run:
-                        row = _summary_row(
-                            workload=workload_label,
-                            backend=backend,
-                            profiler=profiler,
-                            device=child_device,
-                            physical_cuda_device=physical_cuda_device,
-                            output_dir=output_dir,
-                            returncode=0,
-                            profile={},
-                        )
-                        row["base_workload"] = workload
-                        row["profile_layers"] = profile_layers
-                    else:
-                        profile, profile_path = _load_profile(output_dir)
-                        row = _summary_row(
-                            workload=workload_label,
-                            backend=backend,
-                            profiler=profiler,
-                            device=child_device,
-                            physical_cuda_device=physical_cuda_device,
-                            output_dir=output_dir,
-                            returncode=result.returncode,
-                            profile=profile,
-                        )
-                        row["profile_json"] = str(profile_path) if profile_path is not None else None
-                        row["base_workload"] = workload
-                        row["profile_layers"] = profile_layers
-                    row["seq_len"] = seq_len
-                    row["activation_recompute"] = bool(args.activation_recompute)
-                    rows.append(row)
-                    task_index += 1
-                    if result.returncode != 0 and not args.continue_on_error:
-                        stop_requested = True
+                    if stop_requested:
                         break
                 if stop_requested:
                     break
@@ -1062,6 +1158,7 @@ def main() -> None:
         "backends": backends,
         "profilers": profilers,
         "seq_lens": seq_lens,
+        "expert_recompute_thresholds": expert_recompute_thresholds,
         "commands": commands,
         "runs": rows,
         "comparisons": _add_comparisons(rows),

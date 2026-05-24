@@ -27,6 +27,7 @@ if __name__ == "__main__":
     sys.path = [entry for entry in sys.path if Path(entry or ".").resolve() != SCRIPT_DIR]
 
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
 from torch.utils.checkpoint import checkpoint
@@ -169,6 +170,15 @@ DEFAULT_MOE_OFFLOAD_MODULES = "routed_experts"
 LORA_DTYPE_CHOICES = ("bf16", "bfloat16", "fp16", "float16", "fp32", "float32")
 KT_LORA_DTYPE_CHOICES = ("bf16", "bfloat16")
 KT_METHOD_CHOICES = ("AMXBF16_SFT", "AMXINT8_SFT", "AMXINT4_SFT")
+ATTENTION_IMPL_CHOICES = ("sdpa", "fa2", "fa3", "fa4")
+FUSED_SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+
+
+def scaled_dot_product_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    if q.device.type == "cuda":
+        with sdpa_kernel(FUSED_SDPA_BACKENDS):
+            return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=True)
+    return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=True)
 
 
 def is_torch_backend(backend: str) -> bool:
@@ -186,6 +196,8 @@ def is_kt_backend(backend: str) -> bool:
 def validate_backend_workload(args: argparse.Namespace) -> None:
     if is_kt_backend(args.backend) and args.workload not in KT_MOE_WORKLOADS:
         raise ValueError("backend=kt is only implemented for MoE LoRA SFT workloads.")
+    if int(getattr(args, "expert_recompute_threshold", 0) or 0) > 0 and args.workload not in KT_MOE_WORKLOADS:
+        raise ValueError("--expert-recompute-threshold is only supported for MoE LoRA SFT workloads.")
     if is_kt_backend(args.backend):
         lora_dtype = str(getattr(args, "lora_dtype", "bf16")).lower()
         if lora_dtype not in KT_LORA_DTYPE_CHOICES:
@@ -478,10 +490,10 @@ def _operation_bucket(compact: str) -> str:
     if "activation_relu" in compact or "relu" in compact:
         return "relu_activation"
     for name in (
-        "scores_matmul",
-        "value_matmul",
-        "causal_mask",
-        "softmax",
+        "sdpa",
+        "fa2",
+        "fa3",
+        "fa4",
         "layernorm",
         "residual_add",
         "route_metadata",
@@ -744,73 +756,6 @@ class _ProfiledSiluMul(torch.autograd.Function):
 
 def profiled_silu_mul(gate: torch.Tensor, up: torch.Tensor, prefix: str, book: StageBook) -> torch.Tensor:
     return _ProfiledSiluMul.apply(gate, up, prefix, book)
-
-
-class _ProfiledSoftmax(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx: Any, x: torch.Tensor, dim: int, prefix: str, book: StageBook) -> torch.Tensor:
-        out = torch.softmax(x, dim=dim)
-        ctx.save_for_backward(out)
-        ctx.dim = dim
-        ctx.prefix = prefix
-        ctx.book = book
-        return out
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
-        (out,) = ctx.saved_tensors
-        with ctx.book.time(f"backward.{ctx.prefix}.grad"):
-            grad_x = out * (grad_output - (grad_output * out).sum(dim=ctx.dim, keepdim=True))
-        return grad_x, None, None, None
-
-
-def profiled_softmax(x: torch.Tensor, dim: int, prefix: str, book: StageBook) -> torch.Tensor:
-    return _ProfiledSoftmax.apply(x, dim, prefix, book)
-
-
-class _ProfiledCausalMask(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx: Any, scores: torch.Tensor, mask: torch.Tensor, fill_value: float, prefix: str, book: StageBook) -> torch.Tensor:
-        ctx.save_for_backward(mask)
-        ctx.prefix = prefix
-        ctx.book = book
-        return scores.masked_fill(mask, fill_value)
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None, None]:
-        (mask,) = ctx.saved_tensors
-        with ctx.book.time(f"backward.{ctx.prefix}.grad"):
-            grad_scores = grad_output.masked_fill(mask, 0)
-        return grad_scores, None, None, None, None
-
-
-def profiled_causal_mask(scores: torch.Tensor, mask: torch.Tensor, fill_value: float, prefix: str, book: StageBook) -> torch.Tensor:
-    return _ProfiledCausalMask.apply(scores, mask, fill_value, prefix, book)
-
-
-class _ProfiledMatmul(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx: Any, a: torch.Tensor, b: torch.Tensor, prefix: str, book: StageBook) -> torch.Tensor:
-        ctx.save_for_backward(a, b)
-        ctx.prefix = prefix
-        ctx.book = book
-        return torch.matmul(a, b)
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None, None, None]:
-        a, b = ctx.saved_tensors
-        grad_a = grad_b = None
-        if ctx.needs_input_grad[0]:
-            with ctx.book.time(f"backward.{ctx.prefix}.lhs_grad"):
-                grad_a = torch.matmul(grad_output, b.transpose(-2, -1))
-        if ctx.needs_input_grad[1]:
-            with ctx.book.time(f"backward.{ctx.prefix}.rhs_grad"):
-                grad_b = torch.matmul(a.transpose(-2, -1), grad_output)
-        return grad_a, grad_b, None, None
-
-
-def profiled_matmul(a: torch.Tensor, b: torch.Tensor, prefix: str, book: StageBook) -> torch.Tensor:
-    return _ProfiledMatmul.apply(a, b, prefix, book)
 
 
 class _ProfiledLayerNorm(torch.autograd.Function):
@@ -1918,7 +1863,7 @@ def patch_dense_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
                 return profiled_linear(x, weight, None, f"{prefix}.base_torch", book)
         raise TypeError(f"unsupported dense projection for prefix={prefix!r}: {type(module).__name__}")
 
-    original_attn = dense.TinySelfAttention.forward
+    original_attn = dense.SelfAttention.forward
 
     def timed_attn(self: Any, hidden_states: torch.Tensor) -> torch.Tensor:
         name = str(getattr(self, "_m4_profile_name", "attention"))
@@ -1929,21 +1874,17 @@ def patch_dense_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
         q = profiled_projection(self.q_proj, hidden_states, f"{bprefix}.q_proj").view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
         k = profiled_projection(self.k_proj, hidden_states, f"{bprefix}.k_proj").view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
         v = profiled_projection(self.v_proj, hidden_states, f"{bprefix}.v_proj").view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
-        with book.time(f"{prefix}.scores_matmul"):
-            scores = profiled_matmul(q.float(), k.float().transpose(-2, -1), f"{bprefix}.scores_matmul", book) / (float(self.head_dim) ** 0.5)
-        with book.time(f"{prefix}.causal_mask"):
-            mask = torch.triu(torch.ones(seq, seq, device=hidden_states.device, dtype=torch.bool), diagonal=1)
-            scores = profiled_causal_mask(scores, mask, torch.finfo(scores.dtype).min, f"{bprefix}.causal_mask", book)
-        with book.time(f"{prefix}.softmax"):
-            probs = profiled_softmax(scores, -1, f"{bprefix}.softmax", book)
-        with book.time(f"{prefix}.value_matmul"):
-            context = profiled_matmul(probs, v.float(), f"{bprefix}.value_matmul", book).transpose(1, 2).contiguous().view(batch, seq, hidden)
+        attention_impl = self.attention_impl
+        with book.time(f"{prefix}.{attention_impl}"):
+            context = scaled_dot_product_attention(q, k, v)
+        _attach_backward_nvtx_ranges(context, f"backward.{bprefix}.{attention_impl}", book, stop_tensors=(q, k, v))
+        context = context.transpose(1, 2).contiguous().view(batch, seq, hidden)
         return profiled_projection(self.o_proj, context.to(dtype=hidden_states.dtype), f"{bprefix}.o_proj")
 
-    originals.append((dense.TinySelfAttention, "forward", original_attn))
-    dense.TinySelfAttention.forward = timed_attn
+    originals.append((dense.SelfAttention, "forward", original_attn))
+    dense.SelfAttention.forward = timed_attn
 
-    original_mlp = dense.TinyMLP.forward
+    original_mlp = dense.MLP.forward
 
     def timed_mlp(self: Any, hidden_states: torch.Tensor) -> torch.Tensor:
         name = str(getattr(self, "_m4_profile_name", "mlp"))
@@ -1956,10 +1897,10 @@ def patch_dense_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
             activated = profiled_silu_mul(gate, up, f"{bprefix}.silu_mul_activation", book)
         return profiled_projection(self.down_proj, activated.to(dtype=hidden_states.dtype), f"{bprefix}.down_proj")
 
-    originals.append((dense.TinyMLP, "forward", original_mlp))
-    dense.TinyMLP.forward = timed_mlp
+    originals.append((dense.MLP, "forward", original_mlp))
+    dense.MLP.forward = timed_mlp
 
-    original_layer = dense.TinyDecoderLayer.forward
+    original_layer = dense.DecoderLayer.forward
 
     def timed_layer(self: Any, hidden_states: torch.Tensor) -> torch.Tensor:
         name = str(getattr(self, "_m4_profile_name", "layer"))
@@ -1978,10 +1919,10 @@ def patch_dense_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
         with book.time(f"{layer}.mlp.residual_add"):
             return profiled_residual_add(residual, mlp_out, f"{bprefix}.mlp.residual_add", book)
 
-    originals.append((dense.TinyDecoderLayer, "forward", original_layer))
-    dense.TinyDecoderLayer.forward = timed_layer
+    originals.append((dense.DecoderLayer, "forward", original_layer))
+    dense.DecoderLayer.forward = timed_layer
 
-    original_base = dense.TinyDenseLLMBase.forward
+    original_base = dense.DenseLLMBase.forward
 
     def timed_base(self: Any, *, input_ids: torch.Tensor | None = None, inputs_embeds: torch.Tensor | None = None, labels: torch.Tensor | None = None, return_activations: bool = False) -> dict[str, Any]:
         with book.time("forward.embeddings"):
@@ -2007,8 +1948,8 @@ def patch_dense_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
             logits = profiled_linear(hidden_states, self.lm_head.weight, None, "lm_head", book)
         return {"logits": logits, "loss": None, "activations": activations}
 
-    originals.append((dense.TinyDenseLLMBase, "forward", original_base))
-    dense.TinyDenseLLMBase.forward = timed_base
+    originals.append((dense.DenseLLMBase, "forward", original_base))
+    dense.DenseLLMBase.forward = timed_base
     return originals
 
 
@@ -2079,7 +2020,7 @@ def dense_projection_backward_prefixes(
     return keys
 
 
-def dense_forward_keys(num_layers: int, target_names: set[str], offload_names: set[str]) -> list[str]:
+def dense_forward_keys(num_layers: int, target_names: set[str], offload_names: set[str], attention_impl: str) -> list[str]:
     keys = ["forward.embeddings"]
     for layer_idx in range(num_layers):
         layer = f"layers.{layer_idx}"
@@ -2093,14 +2034,7 @@ def dense_forward_keys(num_layers: int, target_names: set[str], offload_names: s
                 offload_names=offload_names,
             )
         )
-        keys.extend(
-            [
-                f"forward.{layer}.attention.scores_matmul",
-                f"forward.{layer}.attention.causal_mask",
-                f"forward.{layer}.attention.softmax",
-                f"forward.{layer}.attention.value_matmul",
-            ]
-        )
+        keys.append(f"forward.{layer}.attention.{attention_impl}")
         keys.extend(
             dense_projection_forward_keys(
                 layer,
@@ -2136,7 +2070,7 @@ def dense_forward_keys(num_layers: int, target_names: set[str], offload_names: s
     return keys
 
 
-def dense_backward_prefixes(num_layers: int, target_names: set[str], offload_names: set[str]) -> list[str]:
+def dense_backward_prefixes(num_layers: int, target_names: set[str], offload_names: set[str], attention_impl: str) -> list[str]:
     keys = ["backward.loss.cross_entropy", "backward.lm_head", "backward.final_norm"]
     for layer_idx in reversed(range(num_layers)):
         layer = f"layers.{layer_idx}"
@@ -2167,10 +2101,7 @@ def dense_backward_prefixes(num_layers: int, target_names: set[str], offload_nam
                     target_names=target_names,
                     offload_names=offload_names,
                 ),
-                f"backward.{layer}.attention.value_matmul",
-                f"backward.{layer}.attention.softmax",
-                f"backward.{layer}.attention.causal_mask",
-                f"backward.{layer}.attention.scores_matmul",
+                f"backward.{layer}.attention.{attention_impl}",
                 *dense_projection_backward_prefixes(
                     layer,
                     "attention",
@@ -2187,11 +2118,11 @@ def dense_backward_prefixes(num_layers: int, target_names: set[str], offload_nam
 def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
     from asym_gemm.training.frozen_linear import AsymExecutionStats
     from asym_gemm.training.dense import (
-        AsymTinyDenseLLM,
+        AsymDenseLLM,
         MICRO_DENSE_LLM_CONFIG,
-        TorchTinyDenseLLM,
+        TorchDenseLLM,
         make_inputs,
-        make_tiny_dense_weights,
+        make_dense_weights,
     )
 
     clear(device)
@@ -2203,6 +2134,7 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
             seq_len=int(args.real_seq_len),
             lora_rank=int(args.real_lora_rank),
             lora_alpha=float(args.real_lora_alpha),
+            attention_impl=str(args.attention_impl),
         )
     workload_name = str(getattr(args, "_workload_name_override", "m4_2_dense_llm"))
     config_extra = dict(getattr(args, "_config_extra", {}))
@@ -2224,9 +2156,9 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
     config_extra["dense_offload_scope"] = offload_selector
     config_extra["activation_recompute"] = bool(getattr(args, "activation_recompute", False))
     stats = AsymExecutionStats()
-    weights = make_tiny_dense_weights(config, seed=1, dtype=dtype)
+    weights = make_dense_weights(config, seed=1, dtype=dtype)
     if args.backend == "torch":
-        model = TorchTinyDenseLLM(
+        model = TorchDenseLLM(
             weights,
             config=config,
             target_mode=target_mode,
@@ -2238,7 +2170,7 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
             lora_dtype=lora_dtype,
         )
     else:
-        model = AsymTinyDenseLLM(
+        model = AsymDenseLLM(
             weights,
             config=config,
             target_mode=target_mode,
@@ -2282,8 +2214,8 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
         device,
         avg,
         stats.as_dict(),
-        forward_keys=dense_forward_keys(config.num_layers, target_names, offload_names),
-        backward_group_prefixes=dense_backward_prefixes(config.num_layers, target_names, offload_names),
+        forward_keys=dense_forward_keys(config.num_layers, target_names, offload_names, args.attention_impl),
+        backward_group_prefixes=dense_backward_prefixes(config.num_layers, target_names, offload_names, args.attention_impl),
         config={**asdict(config), **config_extra},
         stage_memory=book.memory_summary(),
         memory_attribution=memory_attribution_report(model, optimizer, device, book.saved_tensor_tracker),
@@ -2340,7 +2272,7 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
     originals.append((moe.PackedExpertLoRA, "forward", original_packed_forward))
     moe.PackedExpertLoRA.forward = timed_packed_forward
 
-    original_grouped_compact = moe.AsymTinyMoELayer._run_grouped_compact
+    original_grouped_compact = moe.AsymMoELayer._run_grouped_compact_body
 
     def timed_grouped_compact(
         self: Any,
@@ -2437,10 +2369,10 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
         )
         return down
 
-    originals.append((moe.AsymTinyMoELayer, "_run_grouped_compact", original_grouped_compact))
-    moe.AsymTinyMoELayer._run_grouped_compact = timed_grouped_compact
+    originals.append((moe.AsymMoELayer, "_run_grouped_compact_body", original_grouped_compact))
+    moe.AsymMoELayer._run_grouped_compact_body = timed_grouped_compact
 
-    original_attn = moe.TinySelfAttention.forward
+    original_attn = moe.SelfAttention.forward
 
     def timed_attn(self: Any, hidden_states: torch.Tensor) -> torch.Tensor:
         original_dim = hidden_states.dim()
@@ -2458,21 +2390,17 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
         q = q_raw.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
         k = k_raw.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
         v = v_raw.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
-        with book.time("forward.attention.scores_matmul"):
-            scores = profiled_matmul(q.float(), k.float().transpose(-2, -1), "attention.scores_matmul", book) / (float(self.head_dim) ** 0.5)
-        with book.time("forward.attention.causal_mask"):
-            mask = torch.triu(torch.ones(seq, seq, device=hidden_states.device, dtype=torch.bool), diagonal=1)
-            scores = profiled_causal_mask(scores, mask, torch.finfo(scores.dtype).min, "attention.causal_mask", book)
-        with book.time("forward.attention.softmax"):
-            probs = profiled_softmax(scores, -1, "attention.softmax", book)
-        with book.time("forward.attention.value_matmul"):
-            context = profiled_matmul(probs, v.float(), "attention.value_matmul", book).transpose(1, 2).contiguous().view(batch, seq, hidden)
+        attention_impl = self.attention_impl
+        with book.time(f"forward.attention.{attention_impl}"):
+            context = scaled_dot_product_attention(q, k, v)
+        _attach_backward_nvtx_ranges(context, f"backward.attention.{attention_impl}", book, stop_tensors=(q, k, v))
+        context = context.transpose(1, 2).contiguous().view(batch, seq, hidden)
         with book.time("forward.attention.o_proj_base"):
             out = profiled_linear(context.to(dtype=hidden_states.dtype), self.o_proj.weight, None, "attention.o_proj_base", book)
         return out.squeeze(0) if original_dim == 2 else out
 
-    originals.append((moe.TinySelfAttention, "forward", original_attn))
-    moe.TinySelfAttention.forward = timed_attn
+    originals.append((moe.SelfAttention, "forward", original_attn))
+    moe.SelfAttention.forward = timed_attn
 
     def timed_layer_forward(self: Any, x: torch.Tensor, *, static_routing: Any = None, mode: str = "contiguous", return_details: bool = False) -> Any:
         residual = x
@@ -2490,11 +2418,11 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
             return next_x
         return next_x, details
 
-    for layer_cls in (moe.AsymTinyMoELayer, moe.TorchTinyMoELayer, moe.KTTinyMoELayer):
+    for layer_cls in (moe.AsymMoELayer, moe.TorchMoELayer, moe.KTMoELayer):
         originals.append((layer_cls, "forward", layer_cls.forward))
         layer_cls.forward = timed_layer_forward
 
-    original_run_moe = moe.AsymTinyMoELayer._run_moe
+    original_run_moe = moe.AsymMoELayer._run_moe
 
     def timed_run_moe(self: Any, x: torch.Tensor, *, static_routing: Any, mode: str) -> tuple[torch.Tensor, dict[str, Any]]:
         input_shape = x.shape
@@ -2529,10 +2457,10 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
             "routing_weights": routing_weights,
         }
 
-    originals.append((moe.AsymTinyMoELayer, "_run_moe", original_run_moe))
-    moe.AsymTinyMoELayer._run_moe = timed_run_moe
+    originals.append((moe.AsymMoELayer, "_run_moe", original_run_moe))
+    moe.AsymMoELayer._run_moe = timed_run_moe
 
-    original_kt_run_moe = moe.KTTinyMoELayer._run_moe
+    original_kt_run_moe = moe.KTMoELayer._run_moe
 
     def timed_kt_run_moe(self: Any, x: torch.Tensor, *, static_routing: Any, mode: str) -> tuple[torch.Tensor, dict[str, Any]]:
         if mode != "contiguous":
@@ -2555,10 +2483,10 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
             "routing_weights": routing_weights,
         }
 
-    originals.append((moe.KTTinyMoELayer, "_run_moe", original_kt_run_moe))
-    moe.KTTinyMoELayer._run_moe = timed_kt_run_moe
+    originals.append((moe.KTMoELayer, "_run_moe", original_kt_run_moe))
+    moe.KTMoELayer._run_moe = timed_kt_run_moe
 
-    original_model_forward = moe.TinyMoE.forward
+    original_model_forward = moe.MoE.forward
 
     def timed_model_forward(self: Any, x: torch.Tensor | None = None, *, input_ids: torch.Tensor | None = None, inputs_embeds: torch.Tensor | None = None, labels: torch.Tensor | None = None, static_routing: Any = None, mode: str = "contiguous", return_details: bool = False) -> Any:
         details = []
@@ -2590,22 +2518,19 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
             return hidden, details
         return hidden
 
-    originals.append((moe.TinyMoE, "forward", original_model_forward))
-    moe.TinyMoE.forward = timed_model_forward
+    originals.append((moe.MoE, "forward", original_model_forward))
+    moe.MoE.forward = timed_model_forward
     return originals
 
 
-def moe_forward_keys(config: Any) -> list[str]:
+def moe_forward_keys(config: Any, attention_impl: str) -> list[str]:
     keys = [
         "forward.embeddings",
         "forward.attention.layernorm",
         "forward.attention.q_proj_base",
         "forward.attention.k_proj_base",
         "forward.attention.v_proj_base",
-        "forward.attention.scores_matmul",
-        "forward.attention.causal_mask",
-        "forward.attention.softmax",
-        "forward.attention.value_matmul",
+        f"forward.attention.{attention_impl}",
         "forward.attention.o_proj_base",
         "forward.attention.residual_add",
         "forward.moe.layernorm",
@@ -2624,7 +2549,7 @@ def moe_forward_keys(config: Any) -> list[str]:
     return keys
 
 
-def moe_backward_prefixes(config: Any) -> list[str]:
+def moe_backward_prefixes(config: Any, attention_impl: str) -> list[str]:
     keys = [
         "backward.loss.mse",
         "backward.final_norm",
@@ -2641,10 +2566,7 @@ def moe_backward_prefixes(config: Any) -> list[str]:
             "backward.moe.layernorm",
             "backward.attention.residual_add",
             "backward.attention.o_proj_base",
-            "backward.attention.value_matmul",
-            "backward.attention.softmax",
-            "backward.attention.causal_mask",
-            "backward.attention.scores_matmul",
+            f"backward.attention.{attention_impl}",
             "backward.attention.v_proj_base",
             "backward.attention.k_proj_base",
             "backward.attention.q_proj_base",
@@ -2659,7 +2581,7 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
     from asym_gemm.training.moe import (
         MICRO_MOE_CONFIG,
         make_static_routes,
-        make_tiny_moe_pair,
+        make_moe_pair,
     )
 
     clear(device)
@@ -2675,6 +2597,7 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
             logical_tokens=requested_tokens(args, batch_size * seq_len),
             lora_rank=int(args.real_lora_rank),
             lora_alpha=float(args.real_lora_alpha),
+            attention_impl=str(args.attention_impl),
         )
     if int(config.num_shared_experts) != 0:
         config = replace(config, num_shared_experts=0)
@@ -2684,6 +2607,11 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
     workload_name = str(getattr(args, "_workload_name_override", "m4_3_moe"))
     config_extra = dict(getattr(args, "_config_extra", {}))
     lora_dtype = profile_lora_dtype(args)
+    expert_recompute_threshold = int(getattr(args, "expert_recompute_threshold", 0) or 0)
+    if expert_recompute_threshold < 0:
+        raise ValueError("--expert-recompute-threshold must be non-negative")
+    if is_kt_backend(args.backend) and expert_recompute_threshold > 0:
+        raise ValueError("backend=kt does not support --expert-recompute-threshold")
     target_selector = str(getattr(args, "target_modules", DEFAULT_TARGET_MODULES) or DEFAULT_TARGET_MODULES)
     offload_selector = str(getattr(args, "offload_modules", DEFAULT_MOE_OFFLOAD_MODULES) or DEFAULT_MOE_OFFLOAD_MODULES)
     target_groups = moe_selector_groups(target_selector, default=DEFAULT_TARGET_MODULES, purpose="target")
@@ -2694,6 +2622,7 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
     config_extra["offload_modules"] = offload_selector
     config_extra["shared_expert_policy"] = config_extra_shared_note
     config_extra["activation_recompute"] = bool(getattr(args, "activation_recompute", False))
+    config_extra["expert_recompute_threshold"] = expert_recompute_threshold
     if is_kt_backend(args.backend):
         config_extra["kt_method"] = args.kt_method
         config_extra["kt_cpu_threads"] = int(args.kt_cpu_threads)
@@ -2701,7 +2630,7 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         config_extra["kt_max_cache_depth"] = int(args.kt_max_cache_depth)
     config_extra["moe_target_groups"] = sorted(target_groups)
     config_extra["moe_offload_groups"] = sorted(moe_selector_groups(offload_selector, default=DEFAULT_MOE_OFFLOAD_MODULES, purpose="offload"))
-    model, _, _, stats = make_tiny_moe_pair(
+    model, _, _, stats = make_moe_pair(
         config=config,
         seed=3,
         device=device,
@@ -2716,6 +2645,7 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         kt_threadpool_count=args.kt_threadpool_count,
         kt_max_cache_depth=args.kt_max_cache_depth,
         gradient_checkpointing=bool(getattr(args, "activation_recompute", False)),
+        expert_recompute_threshold=expert_recompute_threshold,
     )
     set_profile_names(model)
     optimizer_params = model.kt_lora_parameters() if is_kt_backend(args.backend) else list(model.parameters())
@@ -2765,8 +2695,8 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         device,
         avg,
         stats.as_dict(),
-        forward_keys=moe_forward_keys(config),
-        backward_group_prefixes=moe_backward_prefixes(config),
+        forward_keys=moe_forward_keys(config, args.attention_impl),
+        backward_group_prefixes=moe_backward_prefixes(config, args.attention_impl),
         config={**asdict(config), "moe_mode": args.moe_mode, **config_extra},
         stage_memory=book.memory_summary(),
         memory_attribution=memory_attribution_report(model, optimizer, device, book.saved_tensor_tracker),
@@ -3081,9 +3011,9 @@ def profiler_backward_table(prof: Any, *, profiled_steps: int) -> dict[str, Any]
 
 
 def dense_config_from_metadata(metadata: dict[str, Any], args: argparse.Namespace) -> Any:
-    from asym_gemm.training.dense import TinyDenseLLMConfig
+    from asym_gemm.training.dense import DenseLLMConfig
 
-    return TinyDenseLLMConfig(
+    return DenseLLMConfig(
         vocab_size=min(int(metadata["vocab_size"]), int(args.real_vocab_rows)),
         hidden_size=int(metadata["hidden_size"]),
         num_layers=max(1, min(int(args.real_profile_layers), int(metadata["hf_num_hidden_layers"]))),
@@ -3093,13 +3023,14 @@ def dense_config_from_metadata(metadata: dict[str, Any], args: argparse.Namespac
         intermediate_size=int(metadata["intermediate_size"]),
         lora_rank=int(args.real_lora_rank),
         lora_alpha=float(args.real_lora_alpha),
+        attention_impl=str(args.attention_impl),
     )
 
 
 def moe_config_from_metadata(metadata: dict[str, Any], args: argparse.Namespace) -> Any:
-    from asym_gemm.training.moe import TinyMoEConfig
+    from asym_gemm.training.moe import MoEConfig
 
-    return TinyMoEConfig(
+    return MoEConfig(
         num_layers=max(1, min(int(args.real_profile_layers), int(metadata["hf_num_hidden_layers"]))),
         num_experts=int(metadata["num_experts"]),
         top_k=int(metadata["num_experts_per_tok"]),
@@ -3114,6 +3045,7 @@ def moe_config_from_metadata(metadata: dict[str, Any], args: argparse.Namespace)
         num_heads=int(metadata["num_attention_heads"]),
         batch_size=int(args.real_batch_size),
         seq_len=int(args.real_seq_len),
+        attention_impl=str(args.attention_impl),
     )
 
 
@@ -3280,6 +3212,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-dtype", choices=LORA_DTYPE_CHOICES, default="bf16")
     parser.add_argument("--vocab-rows", "--real-vocab-rows", dest="real_vocab_rows", metavar="N", type=int, default=4096)
     parser.add_argument("--precision", default="bf16", choices=["bf16", "fp8", "fp4"])
+    parser.add_argument(
+        "--attention-impl",
+        choices=ATTENTION_IMPL_CHOICES,
+        default="sdpa",
+        help="Attention implementation. fa2/fa3/fa4 are placeholders until their kernels are wired.",
+    )
     parser.add_argument("--kt-method", default="AMXBF16_SFT", choices=KT_METHOD_CHOICES)
     parser.add_argument("--kt-cpu-threads", type=int, default=0, help="KT CPUInfer threads. 0 selects all available CPUs.")
     parser.add_argument("--kt-threadpool-count", type=int, default=1)
@@ -3308,6 +3246,15 @@ def parse_args() -> argparse.Namespace:
         "--activation-recompute",
         action="store_true",
         help="Enable layer-level activation recomputation with torch.utils.checkpoint during training profiles.",
+    )
+    parser.add_argument(
+        "--expert-recompute-threshold",
+        type=int,
+        default=0,
+        help=(
+            "For MoE workloads, checkpoint/recompute routed experts whose per-step routed token count "
+            "is lower than this threshold. 0 disables fine-grained expert recompute."
+        ),
     )
     parsed = parser.parse_args()
     parsed.dense_target_mode = parsed.target_preset

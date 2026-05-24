@@ -36,28 +36,28 @@ from .mlp import (
 from .dense import (
     MICRO_DENSE_LLM_CONFIG,
     SHOWCASE_DENSE_LLM_CONFIG,
-    TinyDenseLLMBase,
-    TinyDenseLLMConfig,
-    estimate_tiny_dense_llm_parameters,
+    DenseLLMBase,
+    DenseLLMConfig,
+    estimate_dense_llm_parameters,
     run_m3_report,
 )
 from .moe import (
     MICRO_MOE_CONFIG,
     SHOWCASE_MOE_CONFIG,
-    TinyMoE,
-    TinyMoEConfig,
+    MoE,
+    MoEConfig,
     VALID_MOE_BACKENDS,
-    estimate_tiny_moe_parameters,
-    run_tiny_moe_correctness_report,
-    run_tiny_moe_memory_comparison,
+    estimate_moe_parameters,
+    run_moe_correctness_report,
+    run_moe_memory_comparison,
 )
 
 FrozenLinear = AsymFrozenLinear
-TinyDenseConfig = TinyDenseLLMConfig
-TinyDenseLM = TinyDenseLLMBase
-run_tiny_dense_llm_case = run_m3_report
-TinyMoEModel = TinyMoE
-run_tiny_moe_case = run_tiny_moe_correctness_report
+DenseConfig = DenseLLMConfig
+DenseLM = DenseLLMBase
+run_dense_llm_case = run_m3_report
+MoEModel = MoE
+run_moe_case = run_moe_correctness_report
 
 __all__ = [
     "AsymCapability",
@@ -75,13 +75,13 @@ __all__ = [
     "MICRO_MOE_CONFIG",
     "SHOWCASE_DENSE_LLM_CONFIG",
     "SHOWCASE_MOE_CONFIG",
-    "TinyDenseConfig",
-    "TinyDenseLLMBase",
-    "TinyDenseLLMConfig",
-    "TinyDenseLM",
-    "TinyMoEConfig",
-    "TinyMoE",
-    "TinyMoEModel",
+    "DenseConfig",
+    "DenseLLMBase",
+    "DenseLLMConfig",
+    "DenseLM",
+    "MoEConfig",
+    "MoE",
+    "MoEModel",
     "TorchLoRALinear",
     "TorchMLP",
     "VALID_ASYM_PRECISIONS",
@@ -93,8 +93,8 @@ __all__ = [
     "can_use_direct_bf16",
     "copy_lora",
     "direct_asym_capability",
-    "estimate_tiny_dense_llm_parameters",
-    "estimate_tiny_moe_parameters",
+    "estimate_dense_llm_parameters",
+    "estimate_moe_parameters",
     "frozen_linear",
     "freeze_non_lora_params",
     "get_lora_state_dict",
@@ -105,10 +105,10 @@ __all__ = [
     "normalize_lora_dtype",
     "optimizer_contains_only",
     "run_m3_report",
-    "run_tiny_dense_llm_case",
-    "run_tiny_moe_correctness_report",
-    "run_tiny_moe_case",
-    "run_tiny_moe_memory_comparison",
+    "run_dense_llm_case",
+    "run_moe_correctness_report",
+    "run_moe_case",
+    "run_moe_memory_comparison",
     "save_peft_adapter",
     "tensor_nbytes",
 ]

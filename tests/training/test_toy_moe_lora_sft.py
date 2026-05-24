@@ -9,13 +9,13 @@ import torch
 import torch.nn.functional as F
 
 from asym_gemm.training import AsymExecutionStats
-import asym_gemm.training.moe as tiny_moe
+import asym_gemm.training.moe as moe_module
 
 
-TinyMoEConfig = tiny_moe.TinyMoEConfig
-MICRO_MOE_CONFIG = tiny_moe.MICRO_MOE_CONFIG
-SHOWCASE_MOE_CONFIG = tiny_moe.SHOWCASE_MOE_CONFIG
-estimate_tiny_moe_parameters = tiny_moe.estimate_tiny_moe_parameters
+MoEConfig = moe_module.MoEConfig
+MICRO_MOE_CONFIG = moe_module.MICRO_MOE_CONFIG
+SHOWCASE_MOE_CONFIG = moe_module.SHOWCASE_MOE_CONFIG
+estimate_moe_parameters = moe_module.estimate_moe_parameters
 GROUPED_MODES = ("contiguous", "masked")
 STATIC_PATTERNS = ("balanced", "empty", "skewed", "repeated")
 
@@ -51,7 +51,7 @@ def _clear_cuda(device: torch.device) -> None:
         torch.cuda.reset_peak_memory_stats(device)
 
 
-def _make_input(config: TinyMoEConfig, *, device: torch.device, dtype: torch.dtype, seed: int) -> torch.Tensor:
+def _make_input(config: MoEConfig, *, device: torch.device, dtype: torch.dtype, seed: int) -> torch.Tensor:
     generator = torch.Generator(device="cpu").manual_seed(seed)
     x = torch.randn(_route_token_count(config), config.hidden_size, generator=generator, dtype=torch.float32) * 0.5
     return x.to(device=device, dtype=dtype)
@@ -61,17 +61,17 @@ def _loss(y: torch.Tensor) -> torch.Tensor:
     return y.float().square().mean() + y.float()[:, :4].sum() * 0.0003
 
 
-def _route_token_count(config: TinyMoEConfig) -> int:
+def _route_token_count(config: MoEConfig) -> int:
     if hasattr(config, "logical_tokens"):
         return int(config.logical_tokens)
     return int(config.batch_size) * int(config.seq_len)
 
 
-def _batch_size(config: TinyMoEConfig) -> int:
+def _batch_size(config: MoEConfig) -> int:
     return int(getattr(config, "batch_size", 1))
 
 
-def _seq_len(config: TinyMoEConfig) -> int:
+def _seq_len(config: MoEConfig) -> int:
     return int(getattr(config, "seq_len", _route_token_count(config) // _batch_size(config)))
 
 
@@ -87,14 +87,14 @@ def _is_trainable_moe_name(name: str) -> bool:
     return _is_lora_name(name) or _is_router_name(name)
 
 
-def _transformer_config_fields(config: TinyMoEConfig) -> tuple[str, ...]:
+def _transformer_config_fields(config: MoEConfig) -> tuple[str, ...]:
     return tuple(name for name in ("vocab_size", "batch_size", "seq_len", "num_heads", "head_dim") if hasattr(config, name))
 
 
-def _assert_transformer_config(config: TinyMoEConfig) -> None:
+def _assert_transformer_config(config: MoEConfig) -> None:
     required = ("vocab_size", "num_heads")
     missing = [name for name in required if not hasattr(config, name)]
-    assert not missing, f"TinyMoEConfig must mirror tiny_dense_llm transformer fields; missing={missing}"
+    assert not missing, f"MoEConfig must mirror dense_llm transformer fields; missing={missing}"
     assert hasattr(config, "logical_tokens") or (hasattr(config, "batch_size") and hasattr(config, "seq_len"))
     assert int(config.vocab_size) > 0
     assert _batch_size(config) > 0
@@ -104,7 +104,7 @@ def _assert_transformer_config(config: TinyMoEConfig) -> None:
 
 
 def _make_transformer_inputs(
-    config: TinyMoEConfig,
+    config: MoEConfig,
     *,
     device: torch.device,
     dtype: torch.dtype,
@@ -136,7 +136,7 @@ def _forward_accepts_transformer_inputs(model: torch.nn.Module) -> bool:
 def _call_model(
     model: torch.nn.Module,
     *,
-    config: TinyMoEConfig,
+    config: MoEConfig,
     inputs: torch.Tensor,
     labels: torch.Tensor | None,
     static_routing: Any,
@@ -188,7 +188,7 @@ def _loss_from_output(output: Any) -> torch.Tensor:
 def _max_abs_tensor(lhs: torch.Tensor | None, rhs: torch.Tensor | None) -> float:
     assert lhs is not None
     assert rhs is not None
-    return tiny_moe.max_abs_error(lhs, rhs)
+    return moe_module.max_abs_error(lhs, rhs)
 
 
 def _grad_worst_allow_missing(
@@ -209,7 +209,7 @@ def _grad_worst_allow_missing(
             missing.append(name)
             continue
         compared += 1
-        worst = max(worst, tiny_moe.max_abs_error(lhs_param.grad, rhs_param.grad))
+        worst = max(worst, moe_module.max_abs_error(lhs_param.grad, rhs_param.grad))
     if compared == 0:
         raise AssertionError("no active gradients found for requested parameter set")
     return worst, missing
@@ -225,9 +225,9 @@ def _host_weight_items(model: torch.nn.Module) -> list[tuple[str, torch.Tensor]]
     return items
 
 
-def _assert_transformer_moe_modules(model: torch.nn.Module, config: TinyMoEConfig) -> None:
+def _assert_transformer_moe_modules(model: torch.nn.Module, config: MoEConfig) -> None:
     _assert_transformer_config(config)
-    assert _forward_accepts_transformer_inputs(model), "TinyMoE forward must accept token-style transformer inputs"
+    assert _forward_accepts_transformer_inputs(model), "MoE forward must accept token-style transformer inputs"
 
     module_names = [name for name, _ in model.named_modules()]
     all_names = module_names + [name for name, _ in model.named_parameters()] + [name for name, _ in model.named_buffers()]
@@ -243,11 +243,11 @@ def _assert_transformer_moe_modules(model: torch.nn.Module, config: TinyMoEConfi
     assert any("expert" in name.lower() and "shared" not in name.lower() for name in all_names)
 
 
-def _assert_transformer_forward_contract(model: torch.nn.Module, config: TinyMoEConfig, *, device: torch.device, dtype: torch.dtype) -> None:
+def _assert_transformer_forward_contract(model: torch.nn.Module, config: MoEConfig, *, device: torch.device, dtype: torch.dtype) -> None:
     inputs, labels = _make_transformer_inputs(config, device=device, dtype=dtype, seed=219)
     inputs = inputs.detach().clone().requires_grad_(True)
     output = _call_model(model, config=config, inputs=inputs, labels=labels, static_routing=None, mode="contiguous")
-    assert isinstance(output, dict), "transformer-style TinyMoE should return a dict with logits/loss"
+    assert isinstance(output, dict), "transformer-style MoE should return a dict with logits/loss"
     logits = output.get("logits")
     assert isinstance(logits, torch.Tensor)
     assert tuple(logits.shape[:2]) == (_batch_size(config), _seq_len(config))
@@ -259,7 +259,7 @@ def _assert_transformer_forward_contract(model: torch.nn.Module, config: TinyMoE
     assert bool(torch.isfinite(inputs.grad.detach().float()).all().item())
 
 
-def _assert_tiny_moe_report_contract(report: dict[str, Any]) -> None:
+def _assert_moe_module_report_contract(report: dict[str, Any]) -> None:
     config = report["config"]
     for field in ("vocab_size", "num_heads", "hidden_size", "num_layers"):
         assert field in config, f"missing transformer config field in report: {field}"
@@ -286,9 +286,9 @@ def _assert_tiny_moe_report_contract(report: dict[str, Any]) -> None:
     assert int(architecture.get("routed_expert_count", 0)) > 0
 
 
-def test_tiny_moe_showcase_config_is_defensible_transformer_moe() -> None:
-    config = TinyMoEConfig()
-    counts = estimate_tiny_moe_parameters(config, dtype=torch.bfloat16)
+def test_moe_module_showcase_config_is_defensible_transformer_moe() -> None:
+    config = MoEConfig()
+    counts = estimate_moe_parameters(config, dtype=torch.bfloat16)
     _assert_transformer_config(config)
     shared_keys = [key for key in counts if "shared" in key and "expert" in key and "elements" in key]
     routed_keys = [
@@ -319,7 +319,7 @@ def test_tiny_moe_showcase_config_is_defensible_transformer_moe() -> None:
 
 
 def _lora_grad_worst_allow_missing(lhs: torch.nn.Module, rhs: torch.nn.Module) -> tuple[float, list[str]]:
-    return tiny_moe.lora_grad_worst_error(lhs, rhs), []
+    return moe_module.lora_grad_worst_error(lhs, rhs), []
 
 
 def _router_grad_worst(lhs: torch.nn.Module, rhs: torch.nn.Module) -> float:
@@ -329,11 +329,11 @@ def _router_grad_worst(lhs: torch.nn.Module, rhs: torch.nn.Module) -> float:
     return worst
 
 
-def test_tiny_moe_micro_model_is_transformer_style_with_shared_and_routed_experts() -> None:
+def test_moe_module_micro_model_is_transformer_style_with_shared_and_routed_experts() -> None:
     config = MICRO_MOE_CONFIG
     device = torch.device("cpu")
     dtype = torch.float32
-    asym, ref, _, _ = tiny_moe.make_tiny_moe_pair(
+    asym, ref, _, _ = moe_module.make_moe_pair(
         config=config,
         seed=210,
         device=device,
@@ -347,8 +347,8 @@ def test_tiny_moe_micro_model_is_transformer_style_with_shared_and_routed_expert
     _assert_transformer_forward_contract(asym, config, device=device, dtype=dtype)
 
 
-def test_tiny_moe_activation_recompute_uses_layer_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = TinyMoEConfig(
+def test_moe_module_activation_recompute_uses_layer_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = MoEConfig(
         num_layers=2,
         num_experts=2,
         num_shared_experts=0,
@@ -367,15 +367,15 @@ def test_tiny_moe_activation_recompute_uses_layer_checkpoint(monkeypatch: pytest
     device = torch.device("cpu")
     dtype = torch.float32
     calls = 0
-    original_checkpoint = tiny_moe.checkpoint
+    original_checkpoint = moe_module.checkpoint
 
     def recording_checkpoint(function: Any, *args: Any, **kwargs: Any) -> Any:
         nonlocal calls
         calls += 1
         return original_checkpoint(function, *args, **kwargs)
 
-    monkeypatch.setattr(tiny_moe, "checkpoint", recording_checkpoint)
-    model, _, _, _ = tiny_moe.make_tiny_moe_pair(
+    monkeypatch.setattr(moe_module, "checkpoint", recording_checkpoint)
+    model, _, _, _ = moe_module.make_moe_pair(
         config=config,
         seed=213,
         device=device,
@@ -391,7 +391,7 @@ def test_tiny_moe_activation_recompute_uses_layer_checkpoint(monkeypatch: pytest
             layer_calls[index] += 1
 
         handles.append(layer.register_forward_pre_hook(count_layer_call))
-    static_routes = tiny_moe.make_static_routes(config, device, pattern="balanced")
+    static_routes = moe_module.make_static_routes(config, device, pattern="balanced")
     inputs = _make_input(config, device=device, dtype=dtype, seed=214).requires_grad_(True)
 
     try:
@@ -408,11 +408,68 @@ def test_tiny_moe_activation_recompute_uses_layer_checkpoint(monkeypatch: pytest
     assert bool(torch.isfinite(inputs.grad).all().item())
 
 
-def test_tiny_moe_asym_base_weights_are_grouped_host_stacks() -> None:
+def test_moe_module_expert_threshold_recompute_checkpoints_small_routed_experts(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = MoEConfig(
+        num_layers=1,
+        num_experts=4,
+        num_shared_experts=0,
+        top_k=2,
+        vocab_size=64,
+        hidden_size=32,
+        num_heads=4,
+        batch_size=1,
+        seq_len=16,
+        intermediate_size=64,
+        logical_tokens=16,
+        lora_rank=4,
+        lora_alpha=8.0,
+        residual_scale=0.25,
+    )
+    device = torch.device("cpu")
+    dtype = torch.float32
+    calls = 0
+    original_checkpoint = moe_module.checkpoint
+
+    def recording_checkpoint(function: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return original_checkpoint(function, *args, **kwargs)
+
+    monkeypatch.setattr(moe_module, "checkpoint", recording_checkpoint)
+    model, _, _, _ = moe_module.make_moe_pair(
+        config=config,
+        seed=215,
+        device=device,
+        base_dtype=dtype,
+        backend="torch",
+        pin_memory=False,
+        expert_recompute_threshold=5,
+    )
+    static_routes = moe_module.make_static_routes(config, device, pattern="skewed")
+    metadata = moe_module.build_route_metadata(
+        static_routes[0][0],
+        static_routes[0][1],
+        num_experts=config.num_experts,
+        mode="contiguous",
+    )
+    assert metadata.expert_counts.tolist() == [16, 10, 4, 2]
+    inputs = _make_input(config, device=device, dtype=dtype, seed=216)
+
+    output = model(inputs, static_routing=static_routes, mode="contiguous")
+    assert isinstance(output, torch.Tensor)
+    _loss(output).backward()
+
+    assert calls == 1
+    lora_grads = [param.grad for name, param in model.named_parameters() if "lora" in name and param.grad is not None]
+    assert lora_grads
+    assert all(bool(torch.isfinite(grad).all().item()) for grad in lora_grads)
+
+
+def test_moe_module_asym_base_weights_are_grouped_host_stacks() -> None:
     config = MICRO_MOE_CONFIG
     device = torch.device("cpu")
     dtype = torch.float32
-    asym, _, _, _ = tiny_moe.make_tiny_moe_pair(
+    asym, _, _, _ = moe_module.make_moe_pair(
         config=config,
         seed=211,
         device=device,
@@ -434,7 +491,7 @@ def test_tiny_moe_asym_base_weights_are_grouped_host_stacks() -> None:
     assert all(".experts." not in name for name in host_names)
     assert all(weight.device.type == "cpu" and not weight.requires_grad for _, weight in host_weights)
 
-    all_expert_mlp, _, _, _ = tiny_moe.make_tiny_moe_pair(
+    all_expert_mlp, _, _, _ = moe_module.make_moe_pair(
         config=config,
         seed=211,
         device=device,
@@ -447,11 +504,11 @@ def test_tiny_moe_asym_base_weights_are_grouped_host_stacks() -> None:
     assert any("shared_gate_base" in name for name in all_host_names)
 
 
-def test_tiny_moe_asym_lora_weights_are_layer_packed() -> None:
+def test_moe_module_asym_lora_weights_are_layer_packed() -> None:
     config = MICRO_MOE_CONFIG
     device = torch.device("cpu")
     dtype = torch.float32
-    asym, _, _, _ = tiny_moe.make_tiny_moe_pair(
+    asym, _, _, _ = moe_module.make_moe_pair(
         config=config,
         seed=212,
         device=device,
@@ -492,12 +549,12 @@ def test_tiny_moe_asym_lora_weights_are_layer_packed() -> None:
     assert not any(".shared_experts." in name and "lora" in name for name in params)
 
 
-def test_tiny_moe_lora_all_offload_routed_expert_placement() -> None:
+def test_moe_module_lora_all_offload_routed_expert_placement() -> None:
     config = MICRO_MOE_CONFIG
     device = _placement_device()
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     backend = "asym" if device.type == "cuda" else "torch"
-    model, _, _, _ = tiny_moe.make_tiny_moe_pair(
+    model, _, _, _ = moe_module.make_moe_pair(
         config=config,
         seed=214,
         device=device,
@@ -527,8 +584,8 @@ def test_tiny_moe_lora_all_offload_routed_expert_placement() -> None:
             layer.self_attn.v_proj,
             layer.self_attn.o_proj,
         )
-        assert all(isinstance(base, tiny_moe.AsymGroupedFrozenLinear) for base in routed_bases)
-        assert all(isinstance(base, tiny_moe.TorchGroupedFrozenLinear) for base in shared_bases)
+        assert all(isinstance(base, moe_module.AsymGroupedFrozenLinear) for base in routed_bases)
+        assert all(isinstance(base, moe_module.TorchGroupedFrozenLinear) for base in shared_bases)
         assert all(_is_on_device(base.weight, device) for base in attention_bases)
         for base in routed_bases:
             assert base.host_weight.weight.device.type == "cpu"
@@ -539,8 +596,8 @@ def test_tiny_moe_lora_all_offload_routed_expert_placement() -> None:
             assert base is not None
             assert _is_on_device(base.weight, device)
             assert not base.weight.requires_grad
-        assert isinstance(layer.expert_lora, tiny_moe.PackedExpertLoRA)
-        assert isinstance(layer.shared_expert_lora, tiny_moe.PackedExpertLoRA)
+        assert isinstance(layer.expert_lora, moe_module.PackedExpertLoRA)
+        assert isinstance(layer.shared_expert_lora, moe_module.PackedExpertLoRA)
         for packed_lora in (layer.expert_lora, layer.shared_expert_lora):
             for name in ("gate_lora_a", "gate_lora_b", "up_lora_a", "up_lora_b", "down_lora_a", "down_lora_b"):
                 param = getattr(packed_lora, name)
@@ -557,7 +614,7 @@ def _run_static_parity(pattern: str, mode: str) -> dict[str, Any]:
     config = MICRO_MOE_CONFIG
     device = torch.device("cpu")
     dtype = torch.float32
-    asym, ref, _, stats = tiny_moe.make_tiny_moe_pair(
+    asym, ref, _, stats = moe_module.make_moe_pair(
         config=config,
         seed=300,
         device=device,
@@ -566,7 +623,7 @@ def _run_static_parity(pattern: str, mode: str) -> dict[str, Any]:
         pin_memory=False,
         lora_dtype=torch.float32,
     )
-    routes = tiny_moe.make_static_routes(config, device, pattern=pattern)
+    routes = moe_module.make_static_routes(config, device, pattern=pattern)
     labels = None
     if _forward_accepts_transformer_inputs(asym):
         x, labels = _make_transformer_inputs(config, device=device, dtype=dtype, seed=301)
@@ -583,19 +640,19 @@ def _run_static_parity(pattern: str, mode: str) -> dict[str, Any]:
     loss.backward()
     loss_ref.backward()
 
-    metadata = tiny_moe.build_route_metadata(
+    metadata = moe_module.build_route_metadata(
         routes[0][0],
         routes[0][1],
         num_experts=config.num_experts,
         mode=mode,
     )
-    summary = tiny_moe.route_metadata_summary(metadata)
+    summary = moe_module.route_metadata_summary(metadata)
     repeated_pairs = int((routes[0][0][:, 0] == routes[0][0][:, 1]).sum().item())
     lora_worst, missing_lora_grads = _lora_grad_worst_allow_missing(asym, ref)
     return {
         "pattern": pattern,
         "mode": mode,
-        "output_max_abs": tiny_moe.max_abs_error(y, y_ref),
+        "output_max_abs": moe_module.max_abs_error(y, y_ref),
         "loss_abs": abs(float(loss.item()) - float(loss_ref.item())),
         "input_grad_max_abs": _max_abs_tensor(x.grad, x_ref.grad),
         "lora_grad_worst_max_abs": lora_worst,
@@ -610,7 +667,7 @@ def _run_learned_router_parity(mode: str) -> dict[str, Any]:
     config = MICRO_MOE_CONFIG
     device = torch.device("cpu")
     dtype = torch.float32
-    asym, ref, _, stats = tiny_moe.make_tiny_moe_pair(
+    asym, ref, _, stats = moe_module.make_moe_pair(
         config=config,
         seed=310,
         device=device,
@@ -636,7 +693,7 @@ def _run_learned_router_parity(mode: str) -> dict[str, Any]:
     loss_ref.backward()
     return {
         "mode": mode,
-        "output_max_abs": tiny_moe.max_abs_error(y, y_ref),
+        "output_max_abs": moe_module.max_abs_error(y, y_ref),
         "loss_abs": abs(float(loss.item()) - float(loss_ref.item())),
         "input_grad_max_abs": _max_abs_tensor(x.grad, x_ref.grad),
         "lora_grad_worst_max_abs": _lora_grad_worst_allow_missing(asym, ref)[0],
@@ -649,7 +706,7 @@ def _memory_probe(
     *,
     model_kind: str,
     state: dict[str, Any],
-    config: TinyMoEConfig,
+    config: MoEConfig,
     backend: str,
     device: torch.device,
     dtype: torch.dtype,
@@ -658,9 +715,9 @@ def _memory_probe(
     hbm_before = int(torch.cuda.memory_allocated(device)) if device.type == "cuda" else 0
     stats = AsymExecutionStats()
     if model_kind == "normal_gpu_resident":
-        model = tiny_moe.TorchTinyMoEReference(state, config=config, device=device, base_dtype=dtype)
+        model = moe_module.TorchMoEReference(state, config=config, device=device, base_dtype=dtype)
     elif model_kind == "asym_cpu_resident":
-        model = tiny_moe.TinyMoE(
+        model = moe_module.MoE(
             state,
             config=config,
             device=device,
@@ -695,7 +752,7 @@ def _memory_probe(
 
 def _actual_memory_comparison(*, backend: str, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
     config = MICRO_MOE_CONFIG
-    state = tiny_moe.make_tiny_moe_state(config, seed=400, base_dtype=dtype)
+    state = moe_module.make_moe_state(config, seed=400, base_dtype=dtype)
     normal = _memory_probe(
         model_kind="normal_gpu_resident",
         state=state,
@@ -799,10 +856,10 @@ def _manual_route_scatter(topk: torch.Tensor, weights: torch.Tensor, route_value
 
 @pytest.mark.parametrize("pattern", STATIC_PATTERNS)
 @pytest.mark.parametrize("mode", GROUPED_MODES)
-def test_tiny_moe_route_pack_scatter_ops_cover_metadata_modes(pattern: str, mode: str) -> None:
+def test_moe_module_route_pack_scatter_ops_cover_metadata_modes(pattern: str, mode: str) -> None:
     config = MICRO_MOE_CONFIG
     device = _route_op_device()
-    topk, weights = tiny_moe.make_static_routes(config, device, pattern=pattern)[0]
+    topk, weights = moe_module.make_static_routes(config, device, pattern=pattern)[0]
     num_tokens = _route_token_count(config)
     hidden = torch.arange(num_tokens * 5, device=device, dtype=torch.float32).reshape(num_tokens, 5)
     route_values = torch.arange(num_tokens * config.top_k * 5, device=device, dtype=torch.float32).reshape(
@@ -811,36 +868,36 @@ def test_tiny_moe_route_pack_scatter_ops_cover_metadata_modes(pattern: str, mode
         5,
     )
 
-    metadata = tiny_moe.build_route_metadata(topk, weights, num_experts=config.num_experts, mode=mode)
-    summary = tiny_moe.route_metadata_summary(metadata)
+    metadata = moe_module.build_route_metadata(topk, weights, num_experts=config.num_experts, mode=mode)
+    summary = moe_module.route_metadata_summary(metadata)
     assert summary["active_routes"] == num_tokens * config.top_k
 
     if mode == "contiguous":
-        assert isinstance(metadata, tiny_moe.ContiguousRouteMetadata)
-        packed = tiny_moe.pack_tokens_contiguous(hidden, metadata)
+        assert isinstance(metadata, moe_module.ContiguousRouteMetadata)
+        packed = moe_module.pack_tokens_contiguous(hidden, metadata)
         torch.testing.assert_close(packed, hidden.index_select(0, metadata.token_indices))
         sorted_values = route_values.reshape(-1, 5).index_select(0, metadata.route_indices)
-        scattered = tiny_moe.scatter_contiguous(sorted_values, metadata)
+        scattered = moe_module.scatter_contiguous(sorted_values, metadata)
     else:
-        assert isinstance(metadata, tiny_moe.MaskedRouteMetadata)
-        packed = tiny_moe.pack_tokens_masked(hidden, metadata)
+        assert isinstance(metadata, moe_module.MaskedRouteMetadata)
+        packed = moe_module.pack_tokens_masked(hidden, metadata)
         assert bool((packed[~metadata.valid_mask] == 0).all())
         masked_values = torch.zeros((*metadata.token_indices.shape, 5), device=device, dtype=torch.float32)
         masked_values[metadata.valid_mask] = route_values.reshape(-1, 5).index_select(
             0,
             metadata.route_indices[metadata.valid_mask],
         )
-        scattered = tiny_moe.scatter_masked(masked_values, metadata)
+        scattered = moe_module.scatter_masked(masked_values, metadata)
 
     torch.testing.assert_close(scattered, _manual_route_scatter(topk, weights, route_values))
 
 
 @pytest.mark.parametrize("pattern", STATIC_PATTERNS)
 @pytest.mark.parametrize("mode", GROUPED_MODES)
-def test_tiny_moe_scatter_backward_matches_autograd_and_repeated_backward(pattern: str, mode: str) -> None:
+def test_moe_module_scatter_backward_matches_autograd_and_repeated_backward(pattern: str, mode: str) -> None:
     config = MICRO_MOE_CONFIG
     device = _route_op_device()
-    topk, weights = tiny_moe.make_static_routes(config, device, pattern=pattern)[0]
+    topk, weights = moe_module.make_static_routes(config, device, pattern=pattern)[0]
     weights = weights.detach().clone().requires_grad_(True)
     num_tokens = _route_token_count(config)
     feature = 7
@@ -849,19 +906,19 @@ def test_tiny_moe_scatter_backward_matches_autograd_and_repeated_backward(patter
         feature,
     )
 
-    metadata = tiny_moe.build_route_metadata(topk, weights, num_experts=config.num_experts, mode=mode)
+    metadata = moe_module.build_route_metadata(topk, weights, num_experts=config.num_experts, mode=mode)
     if mode == "contiguous":
-        assert isinstance(metadata, tiny_moe.ContiguousRouteMetadata)
+        assert isinstance(metadata, moe_module.ContiguousRouteMetadata)
         expert_output = torch.randn(metadata.num_routes, feature, device=device, dtype=torch.float32, requires_grad=True)
-        out = tiny_moe.scatter_contiguous(expert_output, metadata)
-        expected_expert_grad, expected_weight_grad = tiny_moe.scatter_backward_contiguous(
+        out = moe_module.scatter_contiguous(expert_output, metadata)
+        expected_expert_grad, expected_weight_grad = moe_module.scatter_backward_contiguous(
             grad_seed,
             expert_output.detach(),
             metadata,
         )
-        expected_weight_grad = tiny_moe.restore_contiguous_route_order(expected_weight_grad, metadata)
+        expected_weight_grad = moe_module.restore_contiguous_route_order(expected_weight_grad, metadata)
     else:
-        assert isinstance(metadata, tiny_moe.MaskedRouteMetadata)
+        assert isinstance(metadata, moe_module.MaskedRouteMetadata)
         expert_output = torch.randn(
             config.num_experts,
             metadata.max_routes_per_expert,
@@ -870,13 +927,13 @@ def test_tiny_moe_scatter_backward_matches_autograd_and_repeated_backward(patter
             dtype=torch.float32,
             requires_grad=True,
         )
-        out = tiny_moe.scatter_masked(expert_output, metadata)
-        expected_expert_grad, expected_weight_grad = tiny_moe.scatter_backward_masked(
+        out = moe_module.scatter_masked(expert_output, metadata)
+        expected_expert_grad, expected_weight_grad = moe_module.scatter_backward_masked(
             grad_seed,
             expert_output.detach(),
             metadata,
         )
-        expected_weight_grad = tiny_moe.restore_masked_route_order(expected_weight_grad, metadata)
+        expected_weight_grad = moe_module.restore_masked_route_order(expected_weight_grad, metadata)
 
     out.backward(grad_seed, retain_graph=True)
     out.backward(grad_seed)
@@ -886,7 +943,7 @@ def test_tiny_moe_scatter_backward_matches_autograd_and_repeated_backward(patter
 
 @pytest.mark.parametrize("pattern", STATIC_PATTERNS)
 @pytest.mark.parametrize("mode", GROUPED_MODES)
-def test_tiny_moe_cpu_static_routing_patterns_and_grouped_modes(pattern: str, mode: str) -> None:
+def test_moe_module_cpu_static_routing_patterns_and_grouped_modes(pattern: str, mode: str) -> None:
     case = _run_static_parity(pattern, mode)
     _print_static(case)
 
@@ -918,7 +975,7 @@ def test_tiny_moe_cpu_static_routing_patterns_and_grouped_modes(pattern: str, mo
 
 
 @pytest.mark.parametrize("mode", GROUPED_MODES)
-def test_tiny_moe_cpu_learned_router_gradients_match_torch(mode: str) -> None:
+def test_moe_module_cpu_learned_router_gradients_match_torch(mode: str) -> None:
     case = _run_learned_router_parity(mode)
     _print_learned(case)
 
@@ -932,12 +989,12 @@ def test_tiny_moe_cpu_learned_router_gradients_match_torch(mode: str) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for trainable-state placement checks")
-def test_tiny_moe_cuda_trainable_state_on_gpu_and_frozen_experts_on_cpu() -> None:
+def test_moe_module_cuda_trainable_state_on_gpu_and_frozen_experts_on_cpu() -> None:
     config = MICRO_MOE_CONFIG
     device = torch.device("cuda")
     dtype = torch.bfloat16
     backend = "asym" if _direct_bf16_available() else "asym"
-    model, _, _, _ = tiny_moe.make_tiny_moe_pair(
+    model, _, _, _ = moe_module.make_moe_pair(
         config=config,
         seed=330,
         device=device,
@@ -984,10 +1041,10 @@ def test_tiny_moe_cuda_trainable_state_on_gpu_and_frozen_experts_on_cpu() -> Non
     assert all(param.grad is not None and param.grad.device.type == "cuda" for _, param in active_trainable)
 
 
-@pytest.mark.skipif(not _direct_bf16_available(), reason="direct-fetch tiny MoE requires SM90/SM100")
-def test_tiny_moe_direct_fetch_correctness_hbm_and_flags(tmp_path) -> None:
-    report = tiny_moe.run_tiny_moe_correctness_report(
-        report_path=tmp_path / "m4_tiny_moe_direct_bf16.json",
+@pytest.mark.skipif(not _direct_bf16_available(), reason="direct-fetch MoE requires SM90/SM100")
+def test_moe_module_direct_fetch_correctness_hbm_and_flags(tmp_path) -> None:
+    report = moe_module.run_moe_correctness_report(
+        report_path=tmp_path / "m4_moe_module_direct_bf16.json",
         config=MICRO_MOE_CONFIG,
         device="cuda",
         backend="asym",
@@ -998,7 +1055,7 @@ def test_tiny_moe_direct_fetch_correctness_hbm_and_flags(tmp_path) -> None:
     _print_memory(memory)
 
     assert report["status"] == "pass"
-    _assert_tiny_moe_report_contract(report)
+    _assert_moe_module_report_contract(report)
     assert report["metadata_modes_tested"] == ["contiguous", "masked"]
     assert set(report["route_patterns_tested"]) == {"balanced", "empty", "skewed", "repeated"}
     assert report["toy_training"]["steps"] == 20

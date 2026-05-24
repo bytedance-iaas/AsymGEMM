@@ -1,4 +1,4 @@
-"""Deterministic tiny MoE training harness for route correctness tests."""
+"""Deterministic MoE training harness for route correctness tests."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from typing import Any, Literal, Mapping, Sequence
 
 import torch
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
@@ -38,7 +39,15 @@ GroupedMode = Literal["contiguous", "masked"]
 VALID_MOE_BACKENDS = ("torch", "asym", "kt")
 DEFAULT_TARGET_MODULES = "all"
 DEFAULT_OFFLOAD_MODULES = "routed_experts"
+FUSED_SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
 MOE_OFFLOAD_GROUPS = ("routed_experts", "shared_experts")
+
+
+def _scaled_dot_product_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    if q.device.type == "cuda":
+        with sdpa_kernel(FUSED_SDPA_BACKENDS):
+            return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=True)
+    return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=True)
 
 
 def _normalize_moe_module_selector(selector: Sequence[str] | str | None, *, default: str, purpose: str) -> set[str]:
@@ -69,7 +78,7 @@ def _normalize_moe_module_selector(selector: Sequence[str] | str | None, *, defa
 
 
 @dataclass(frozen=True)
-class TinyMoEConfig:
+class MoEConfig:
     num_layers: int = 6
     num_experts: int = 8
     top_k: int = 2
@@ -84,9 +93,10 @@ class TinyMoEConfig:
     num_heads: int = 8
     batch_size: int = 1
     seq_len: int = 16
+    attention_impl: str = "sdpa"
 
     @classmethod
-    def micro(cls) -> "TinyMoEConfig":
+    def micro(cls) -> "MoEConfig":
         return cls(
             num_layers=4,
             num_experts=4,
@@ -114,8 +124,8 @@ class TinyMoEConfig:
             raise ValueError("hidden_size must be divisible by num_heads")
         return self.hidden_size // self.num_heads
 
-MICRO_MOE_CONFIG = TinyMoEConfig.micro()
-SHOWCASE_MOE_CONFIG = TinyMoEConfig()
+MICRO_MOE_CONFIG = MoEConfig.micro()
+SHOWCASE_MOE_CONFIG = MoEConfig()
 
 
 def _element_size(dtype: torch.dtype | str) -> int:
@@ -129,8 +139,8 @@ def _element_size(dtype: torch.dtype | str) -> int:
     return torch.empty((), dtype=dtype).element_size()
 
 
-def estimate_tiny_moe_parameters(
-    config: TinyMoEConfig = SHOWCASE_MOE_CONFIG,
+def estimate_moe_parameters(
+    config: MoEConfig = SHOWCASE_MOE_CONFIG,
     *,
     offload_modules: Sequence[str] | str | None = DEFAULT_OFFLOAD_MODULES,
     dtype: torch.dtype | str = torch.bfloat16,
@@ -382,6 +392,13 @@ def route_metadata_summary(metadata: RouteMetadata) -> dict[str, Any]:
     }
 
 
+def normalize_expert_recompute_threshold(value: int | None) -> int:
+    threshold = int(value or 0)
+    if threshold < 0:
+        raise ValueError(f"expert_recompute_threshold must be non-negative, got {value}")
+    return threshold
+
+
 def pack_tokens_contiguous(hidden: torch.Tensor, metadata: ContiguousRouteMetadata) -> torch.Tensor:
     flat = hidden.reshape(metadata.num_tokens, -1)
     return flat.index_select(0, metadata.token_indices).reshape(metadata.num_routes, *hidden.shape[1:]).contiguous()
@@ -490,7 +507,7 @@ def topk_routing_from_logits(logits: torch.Tensor, top_k: int) -> Routing:
     return topk_indices.to(dtype=torch.long), routing_weights
 
 
-def clone_tiny_moe_state(state: Mapping[str, Any]) -> dict[str, Any]:
+def clone_moe_state(state: Mapping[str, Any]) -> dict[str, Any]:
     def clone_value(value: Any) -> Any:
         if isinstance(value, torch.Tensor):
             return value.detach().clone()
@@ -507,8 +524,8 @@ def _randn(generator: torch.Generator, shape: Sequence[int], std: float) -> torc
     return torch.randn(tuple(shape), generator=generator, dtype=torch.float32) * std
 
 
-def make_tiny_moe_state(
-    config: TinyMoEConfig = TinyMoEConfig(),
+def make_moe_state(
+    config: MoEConfig = MoEConfig(),
     *,
     seed: int = 0,
     base_dtype: torch.dtype = torch.float32,
@@ -573,7 +590,7 @@ def _stack_expert_weight(expert_states: Sequence[Mapping[str, Any]], name: str) 
     return torch.stack([_state_tensor(expert_state, name) for expert_state in expert_states], dim=0).contiguous()
 
 
-class FrozenTinyLinear(nn.Module):
+class FrozenLinear(nn.Module):
     def __init__(self, weight: torch.Tensor, *, device: torch.device, dtype: torch.dtype) -> None:
         super().__init__()
         self.register_buffer("weight", weight.detach().to(device=device, dtype=dtype).contiguous())
@@ -588,7 +605,7 @@ class FrozenTinyLinear(nn.Module):
         return F.linear(x, self.weight)
 
 
-class FrozenTinyLayerNorm(nn.LayerNorm):
+class FrozenLayerNorm(nn.LayerNorm):
     def __init__(self, weight: torch.Tensor, *, device: torch.device) -> None:
         super().__init__((int(weight.numel()),), elementwise_affine=False, device=device, dtype=torch.float32)
         self.register_buffer("frozen_weight", weight.detach().to(device=device, dtype=torch.float32).contiguous())
@@ -598,12 +615,12 @@ class FrozenTinyLayerNorm(nn.LayerNorm):
         return F.layer_norm(x.float(), self.normalized_shape, self.frozen_weight, self.frozen_bias, self.eps).to(dtype=x.dtype)
 
 
-class TinySelfAttention(nn.Module):
+class SelfAttention(nn.Module):
     def __init__(
         self,
         layer_state: Mapping[str, Any],
         *,
-        config: TinyMoEConfig,
+        config: MoEConfig,
         device: torch.device,
         base_dtype: torch.dtype,
     ) -> None:
@@ -611,10 +628,13 @@ class TinySelfAttention(nn.Module):
         self.config = config
         self.num_heads = config.num_heads
         self.head_dim = config.head_dim
-        self.q_proj = FrozenTinyLinear(_state_tensor(layer_state, "q_proj"), device=device, dtype=base_dtype)
-        self.k_proj = FrozenTinyLinear(_state_tensor(layer_state, "k_proj"), device=device, dtype=base_dtype)
-        self.v_proj = FrozenTinyLinear(_state_tensor(layer_state, "v_proj"), device=device, dtype=base_dtype)
-        self.o_proj = FrozenTinyLinear(_state_tensor(layer_state, "o_proj"), device=device, dtype=base_dtype)
+        self.q_proj = FrozenLinear(_state_tensor(layer_state, "q_proj"), device=device, dtype=base_dtype)
+        self.k_proj = FrozenLinear(_state_tensor(layer_state, "k_proj"), device=device, dtype=base_dtype)
+        self.v_proj = FrozenLinear(_state_tensor(layer_state, "v_proj"), device=device, dtype=base_dtype)
+        self.o_proj = FrozenLinear(_state_tensor(layer_state, "o_proj"), device=device, dtype=base_dtype)
+        self.attention_impl = config.attention_impl
+        if self.attention_impl != "sdpa":
+            raise NotImplementedError(f"attention_impl={self.attention_impl!r} is a placeholder and is not wired yet")
 
     @property
     def frozen_weight_bytes(self) -> int:
@@ -632,11 +652,8 @@ class TinySelfAttention(nn.Module):
         k = self.k_proj(hidden_states).view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(hidden_states).view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
 
-        scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) / math.sqrt(float(self.head_dim))
-        mask = torch.triu(torch.ones(seq, seq, device=hidden_states.device, dtype=torch.bool), diagonal=1)
-        scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min)
-        probs = torch.softmax(scores, dim=-1)
-        context = torch.matmul(probs, v.float()).transpose(1, 2).contiguous().view(batch, seq, hidden)
+        context = _scaled_dot_product_attention(q, k, v)
+        context = context.transpose(1, 2).contiguous().view(batch, seq, hidden)
         out = self.o_proj(context.to(dtype=hidden_states.dtype))
         return out.squeeze(0) if original_dim == 2 else out
 
@@ -649,14 +666,14 @@ def _normalize_static_routing(routing: Routing, *, device: torch.device) -> Rout
     )
 
 
-class TorchTinyExpert(nn.Module):
+class TorchExpert(nn.Module):
     """Single-expert torch reference used only for parity baselines."""
 
     def __init__(
         self,
         expert_state: Mapping[str, Any],
         *,
-        config: TinyMoEConfig,
+        config: MoEConfig,
         device: torch.device,
         base_dtype: torch.dtype,
         lora_dtype: torch.dtype | str = torch.bfloat16,
@@ -702,12 +719,12 @@ class TorchTinyExpert(nn.Module):
         return down
 
 
-class AsymTinyMoELayer(nn.Module):
+class AsymMoELayer(nn.Module):
     def __init__(
         self,
         layer_state: Mapping[str, Any],
         *,
-        config: TinyMoEConfig,
+        config: MoEConfig,
         device: torch.device,
         base_dtype: torch.dtype,
         backend: str,
@@ -717,6 +734,7 @@ class AsymTinyMoELayer(nn.Module):
         offload_modules: Sequence[str] | str | None = DEFAULT_OFFLOAD_MODULES,
         lora_dtype: torch.dtype | str = torch.bfloat16,
         precision: str = "bf16",
+        expert_recompute_threshold: int = 0,
     ) -> None:
         super().__init__()
         self.config = config
@@ -724,9 +742,10 @@ class AsymTinyMoELayer(nn.Module):
         self.precision = str(precision).lower()
         if self.precision not in VALID_ASYM_PRECISIONS:
             raise ValueError(f"unsupported precision={precision!r}; expected one of {VALID_ASYM_PRECISIONS}")
-        self.input_layernorm = FrozenTinyLayerNorm(_state_tensor(layer_state, "input_layernorm_weight"), device=device)
-        self.post_attention_layernorm = FrozenTinyLayerNorm(_state_tensor(layer_state, "post_attention_layernorm_weight"), device=device)
-        self.self_attn = TinySelfAttention(layer_state, config=config, device=device, base_dtype=base_dtype)
+        self.expert_recompute_threshold = normalize_expert_recompute_threshold(expert_recompute_threshold)
+        self.input_layernorm = FrozenLayerNorm(_state_tensor(layer_state, "input_layernorm_weight"), device=device)
+        self.post_attention_layernorm = FrozenLayerNorm(_state_tensor(layer_state, "post_attention_layernorm_weight"), device=device)
+        self.self_attn = SelfAttention(layer_state, config=config, device=device, base_dtype=base_dtype)
         self.router_weight = nn.Parameter(_state_tensor(layer_state, "router_weight").to(device=device, dtype=torch.float32).clone())
         expert_states = list(layer_state["experts"])
         shared_expert_states = list(layer_state.get("shared_experts", []))
@@ -855,7 +874,7 @@ class AsymTinyMoELayer(nn.Module):
             lora_metadata = self.shared_expert_lora.prepare_metadata(offsets, experts)
         return self.shared_expert_lora(packed, offsets, experts, prefix, out_dtype, metadata=lora_metadata)
 
-    def _run_grouped_compact(
+    def _run_grouped_compact_body(
         self,
         packed: torch.Tensor,
         offsets: torch.Tensor,
@@ -924,6 +943,143 @@ class AsymTinyMoELayer(nn.Module):
                 down_lora = self.expert_lora(activated, offsets, experts, "down", packed.dtype, metadata=lora_metadata)
             down = down + down_lora
         return down
+
+    def _grouped_subset(
+        self,
+        packed: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        group_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if not bool(group_mask.any().item()):
+            return None
+        group_indices = torch.nonzero(group_mask, as_tuple=False).flatten().to(device=offsets.device, dtype=torch.long)
+        counts = (offsets[1:] - offsets[:-1]).to(dtype=torch.long)
+        selected_counts = counts.index_select(0, group_indices)
+        total = int(selected_counts.sum().item())
+        if total <= 0:
+            return None
+
+        selected_offsets_long = torch.cat(
+            [
+                torch.zeros(1, device=offsets.device, dtype=torch.long),
+                torch.cumsum(selected_counts, dim=0),
+            ],
+            dim=0,
+        )
+        selected_offsets = selected_offsets_long.to(dtype=offsets.dtype)
+        group_starts = offsets.index_select(0, group_indices).to(dtype=torch.long)
+        route_indices = (
+            torch.repeat_interleave(group_starts, selected_counts)
+            + torch.arange(total, device=packed.device, dtype=torch.long)
+            - torch.repeat_interleave(selected_offsets_long[:-1], selected_counts)
+        )
+        selected_experts = experts[:-1].index_select(0, group_indices.to(device=experts.device))
+        sentinel = torch.full((1,), -1, device=experts.device, dtype=experts.dtype)
+        selected_experts = torch.cat([selected_experts, sentinel], dim=0)
+        return packed.index_select(0, route_indices), selected_offsets, selected_experts, route_indices
+
+    def _run_grouped_compact_thresholded(
+        self,
+        packed: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        *,
+        gate_base: nn.Module,
+        up_base: nn.Module,
+        down_base: nn.Module,
+        shared: bool = False,
+    ) -> torch.Tensor:
+        threshold = self.expert_recompute_threshold
+        counts = (offsets[1:] - offsets[:-1]).to(dtype=torch.long)
+        active = counts > 0
+        recompute_groups = active & (counts < threshold)
+        if not bool(recompute_groups.any().item()):
+            return self._run_grouped_compact_body(
+                packed,
+                offsets,
+                experts,
+                gate_base=gate_base,
+                up_base=up_base,
+                down_base=down_base,
+                shared=shared,
+                dense_experts=True,
+            )
+
+        keep_groups = active & ~recompute_groups
+        output = packed.new_empty((packed.shape[0], self.config.hidden_size))
+        keep_subset = self._grouped_subset(packed, offsets, experts, keep_groups)
+        if keep_subset is not None:
+            keep_packed, keep_offsets, keep_experts, keep_indices = keep_subset
+            keep_out = self._run_grouped_compact_body(
+                keep_packed,
+                keep_offsets,
+                keep_experts,
+                gate_base=gate_base,
+                up_base=up_base,
+                down_base=down_base,
+                shared=shared,
+                dense_experts=False,
+            )
+            output = output.index_copy(0, keep_indices, keep_out)
+
+        recompute_subset = self._grouped_subset(packed, offsets, experts, recompute_groups)
+        if recompute_subset is not None:
+            recompute_packed, recompute_offsets, recompute_experts, recompute_indices = recompute_subset
+
+            def recompute_forward(recompute_input: torch.Tensor) -> torch.Tensor:
+                return self._run_grouped_compact_body(
+                    recompute_input,
+                    recompute_offsets,
+                    recompute_experts,
+                    gate_base=gate_base,
+                    up_base=up_base,
+                    down_base=down_base,
+                    shared=shared,
+                    dense_experts=False,
+                )
+
+            recompute_out = checkpoint(recompute_forward, recompute_packed, use_reentrant=False)
+            output = output.index_copy(0, recompute_indices, recompute_out)
+        return output
+
+    def _run_grouped_compact(
+        self,
+        packed: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        *,
+        gate_base: nn.Module,
+        up_base: nn.Module,
+        down_base: nn.Module,
+        shared: bool = False,
+        dense_experts: bool = False,
+    ) -> torch.Tensor:
+        if (
+            self.expert_recompute_threshold <= 0
+            or shared
+            or not dense_experts
+            or not torch.is_grad_enabled()
+        ):
+            return self._run_grouped_compact_body(
+                packed,
+                offsets,
+                experts,
+                gate_base=gate_base,
+                up_base=up_base,
+                down_base=down_base,
+                shared=shared,
+                dense_experts=dense_experts,
+            )
+        return self._run_grouped_compact_thresholded(
+            packed,
+            offsets,
+            experts,
+            gate_base=gate_base,
+            up_base=up_base,
+            down_base=down_base,
+            shared=shared,
+        )
 
     def _run_contiguous(self, packed: torch.Tensor, metadata: ContiguousRouteMetadata) -> torch.Tensor:
         offsets, experts = self._dense_group_metadata(
@@ -1043,12 +1199,12 @@ class AsymTinyMoELayer(nn.Module):
         return next_x, details
 
 
-class TorchTinyMoELayer(nn.Module):
+class TorchMoELayer(nn.Module):
     def __init__(
         self,
         layer_state: Mapping[str, Any],
         *,
-        config: TinyMoEConfig,
+        config: MoEConfig,
         device: torch.device,
         base_dtype: torch.dtype,
         stats: AsymExecutionStats | None = None,
@@ -1057,19 +1213,19 @@ class TorchTinyMoELayer(nn.Module):
         super().__init__()
         self.config = config
         self.stats = stats
-        self.input_layernorm = FrozenTinyLayerNorm(_state_tensor(layer_state, "input_layernorm_weight"), device=device)
-        self.post_attention_layernorm = FrozenTinyLayerNorm(_state_tensor(layer_state, "post_attention_layernorm_weight"), device=device)
-        self.self_attn = TinySelfAttention(layer_state, config=config, device=device, base_dtype=base_dtype)
+        self.input_layernorm = FrozenLayerNorm(_state_tensor(layer_state, "input_layernorm_weight"), device=device)
+        self.post_attention_layernorm = FrozenLayerNorm(_state_tensor(layer_state, "post_attention_layernorm_weight"), device=device)
+        self.self_attn = SelfAttention(layer_state, config=config, device=device, base_dtype=base_dtype)
         self.router_weight = nn.Parameter(_state_tensor(layer_state, "router_weight").to(device=device, dtype=torch.float32).clone())
         self.experts = nn.ModuleList(
             [
-                TorchTinyExpert(expert_state, config=config, device=device, base_dtype=base_dtype, lora_dtype=lora_dtype)
+                TorchExpert(expert_state, config=config, device=device, base_dtype=base_dtype, lora_dtype=lora_dtype)
                 for expert_state in layer_state["experts"]
             ]
         )
         self.shared_experts = nn.ModuleList(
             [
-                TorchTinyExpert(expert_state, config=config, device=device, base_dtype=base_dtype, lora_dtype=lora_dtype)
+                TorchExpert(expert_state, config=config, device=device, base_dtype=base_dtype, lora_dtype=lora_dtype)
                 for expert_state in layer_state.get("shared_experts", [])
             ]
         )
@@ -1157,13 +1313,13 @@ class TorchTinyMoELayer(nn.Module):
         return next_x, details
 
 
-class KTTinyMoELayer(nn.Module):
+class KTMoELayer(nn.Module):
     def __init__(
         self,
         layer_state: Mapping[str, Any],
         *,
         layer_idx: int,
-        config: TinyMoEConfig,
+        config: MoEConfig,
         device: torch.device,
         base_dtype: torch.dtype,
         stats: AsymExecutionStats,
@@ -1178,9 +1334,9 @@ class KTTinyMoELayer(nn.Module):
         if shared_expert_states:
             raise ValueError("backend=kt requires num_shared_experts=0 for the first KT MoE SFT comparison")
         self.config = config
-        self.input_layernorm = FrozenTinyLayerNorm(_state_tensor(layer_state, "input_layernorm_weight"), device=device)
-        self.post_attention_layernorm = FrozenTinyLayerNorm(_state_tensor(layer_state, "post_attention_layernorm_weight"), device=device)
-        self.self_attn = TinySelfAttention(layer_state, config=config, device=device, base_dtype=base_dtype)
+        self.input_layernorm = FrozenLayerNorm(_state_tensor(layer_state, "input_layernorm_weight"), device=device)
+        self.post_attention_layernorm = FrozenLayerNorm(_state_tensor(layer_state, "post_attention_layernorm_weight"), device=device)
+        self.self_attn = SelfAttention(layer_state, config=config, device=device, base_dtype=base_dtype)
         self.router_weight = nn.Parameter(_state_tensor(layer_state, "router_weight").to(device=device, dtype=torch.float32).clone())
         self.kt_moe = KTRoutedExpertMoE(
             list(layer_state["experts"]),
@@ -1276,12 +1432,12 @@ def _routing_for_layer(
     return static_routing[layer_idx]
 
 
-class TinyMoE(nn.Module):
+class MoE(nn.Module):
     def __init__(
         self,
         state: Mapping[str, Any] | None = None,
         *,
-        config: TinyMoEConfig = TinyMoEConfig(),
+        config: MoEConfig = MoEConfig(),
         device: torch.device | str = "cpu",
         base_dtype: torch.dtype = torch.float32,
         backend: str = "torch",
@@ -1295,6 +1451,7 @@ class TinyMoE(nn.Module):
         kt_threadpool_count: int = 1,
         kt_max_cache_depth: int = 1,
         gradient_checkpointing: bool = False,
+        expert_recompute_threshold: int = 0,
     ) -> None:
         super().__init__()
         if backend not in VALID_MOE_BACKENDS:
@@ -1303,8 +1460,11 @@ class TinyMoE(nn.Module):
         if precision not in VALID_ASYM_PRECISIONS:
             raise ValueError(f"unsupported precision={precision!r}; expected one of {VALID_ASYM_PRECISIONS}")
         resolved_kt_method = normalize_kt_method(kt_method)
+        expert_recompute_threshold = normalize_expert_recompute_threshold(expert_recompute_threshold)
         if backend == "kt" and config.num_shared_experts != 0:
             raise ValueError("backend=kt requires num_shared_experts=0 for the first KT MoE SFT comparison")
+        if backend == "kt" and expert_recompute_threshold > 0:
+            raise ValueError("backend=kt does not support per-expert activation recompute thresholds")
         self.config = config
         self.device_hint = torch.device(device)
         self.base_dtype = base_dtype
@@ -1314,8 +1474,9 @@ class TinyMoE(nn.Module):
         self.offload_groups = tuple(sorted(_normalize_moe_module_selector(offload_modules, default=DEFAULT_OFFLOAD_MODULES, purpose="offload")))
         self.lora_dtype = lora_dtype
         self.gradient_checkpointing = bool(gradient_checkpointing)
+        self.expert_recompute_threshold = expert_recompute_threshold
         self.stats = stats if stats is not None else AsymExecutionStats()
-        state = clone_tiny_moe_state(state or make_tiny_moe_state(config, base_dtype=base_dtype))
+        state = clone_moe_state(state or make_moe_state(config, base_dtype=base_dtype))
         self.register_buffer(
             "embed_tokens_weight",
             _state_tensor(state, "token_embedding").detach().to(device=self.device_hint, dtype=base_dtype).contiguous(),
@@ -1324,12 +1485,12 @@ class TinyMoE(nn.Module):
             "position_embedding",
             _state_tensor(state, "position_embedding").detach().to(device=self.device_hint, dtype=base_dtype).contiguous(),
         )
-        self.lm_head = FrozenTinyLinear(_state_tensor(state, "lm_head"), device=self.device_hint, dtype=base_dtype)
+        self.lm_head = FrozenLinear(_state_tensor(state, "lm_head"), device=self.device_hint, dtype=base_dtype)
         if is_kt_backend(backend):
             layers = []
             for layer_idx, layer_state in enumerate(state["layers"]):
                 layers.append(
-                    KTTinyMoELayer(
+                    KTMoELayer(
                         layer_state,
                         layer_idx=layer_idx,
                         config=config,
@@ -1348,7 +1509,7 @@ class TinyMoE(nn.Module):
             layers = []
             for layer_state in state["layers"]:
                 layers.append(
-                    AsymTinyMoELayer(
+                    AsymMoELayer(
                         layer_state,
                         config=config,
                         device=self.device_hint,
@@ -1359,10 +1520,11 @@ class TinyMoE(nn.Module):
                         offload_modules=self.offload_groups,
                         lora_dtype=lora_dtype,
                         precision=self.precision,
+                        expert_recompute_threshold=self.expert_recompute_threshold,
                     )
                 )
             self.layers = nn.ModuleList(layers)
-        self.final_layernorm = FrozenTinyLayerNorm(_state_tensor(state, "final_layernorm_weight"), device=self.device_hint)
+        self.final_layernorm = FrozenLayerNorm(_state_tensor(state, "final_layernorm_weight"), device=self.device_hint)
 
     @property
     def frozen_weight_bytes(self) -> int:
@@ -1466,12 +1628,12 @@ class TinyMoE(nn.Module):
         return hidden
 
 
-class TorchTinyMoEReference(nn.Module):
+class TorchMoEReference(nn.Module):
     def __init__(
         self,
         state: Mapping[str, Any] | None = None,
         *,
-        config: TinyMoEConfig = TinyMoEConfig(),
+        config: MoEConfig = MoEConfig(),
         device: torch.device | str = "cpu",
         base_dtype: torch.dtype = torch.float32,
         lora_dtype: torch.dtype | str = torch.bfloat16,
@@ -1481,7 +1643,7 @@ class TorchTinyMoEReference(nn.Module):
         self.device_hint = torch.device(device)
         self.base_dtype = base_dtype
         self.lora_dtype = lora_dtype
-        state = clone_tiny_moe_state(state or make_tiny_moe_state(config, base_dtype=base_dtype))
+        state = clone_moe_state(state or make_moe_state(config, base_dtype=base_dtype))
         self.register_buffer(
             "embed_tokens_weight",
             _state_tensor(state, "token_embedding").detach().to(device=self.device_hint, dtype=base_dtype).contiguous(),
@@ -1490,14 +1652,14 @@ class TorchTinyMoEReference(nn.Module):
             "position_embedding",
             _state_tensor(state, "position_embedding").detach().to(device=self.device_hint, dtype=base_dtype).contiguous(),
         )
-        self.lm_head = FrozenTinyLinear(_state_tensor(state, "lm_head"), device=self.device_hint, dtype=base_dtype)
+        self.lm_head = FrozenLinear(_state_tensor(state, "lm_head"), device=self.device_hint, dtype=base_dtype)
         self.layers = nn.ModuleList(
             [
-                TorchTinyMoELayer(layer_state, config=config, device=self.device_hint, base_dtype=base_dtype, lora_dtype=lora_dtype)
+                TorchMoELayer(layer_state, config=config, device=self.device_hint, base_dtype=base_dtype, lora_dtype=lora_dtype)
                 for layer_state in state["layers"]
             ]
         )
-        self.final_layernorm = FrozenTinyLayerNorm(_state_tensor(state, "final_layernorm_weight"), device=self.device_hint)
+        self.final_layernorm = FrozenLayerNorm(_state_tensor(state, "final_layernorm_weight"), device=self.device_hint)
 
     @property
     def frozen_weight_bytes(self) -> int:
@@ -1629,7 +1791,7 @@ def make_repeated_expert_static_routing(
 
 
 def make_static_routes(
-    config: TinyMoEConfig,
+    config: MoEConfig,
     device: torch.device | str,
     pattern: str = "balanced",
 ) -> list[Routing]:
@@ -1699,15 +1861,15 @@ def _direct_bf16_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] in {9, 10}
 
 
-def default_tiny_moe_device() -> torch.device:
+def default_moe_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def default_tiny_moe_base_dtype(device: torch.device) -> torch.dtype:
+def default_moe_base_dtype(device: torch.device) -> torch.dtype:
     return torch.bfloat16 if device.type == "cuda" else torch.float32
 
 
-def default_tiny_moe_backend(device: torch.device) -> str:
+def default_moe_backend(device: torch.device) -> str:
     if device.type != "cuda":
         return "torch"
     return "asym" if _direct_bf16_available() else "torch"
@@ -1726,9 +1888,9 @@ def _clear_cuda(device: torch.device) -> None:
         torch.cuda.reset_peak_memory_stats(device)
 
 
-def make_tiny_moe_pair(
+def make_moe_pair(
     *,
-    config: TinyMoEConfig = TinyMoEConfig(),
+    config: MoEConfig = MoEConfig(),
     seed: int = 0,
     device: torch.device | str | None = None,
     base_dtype: torch.dtype | None = None,
@@ -1742,14 +1904,15 @@ def make_tiny_moe_pair(
     kt_threadpool_count: int = 1,
     kt_max_cache_depth: int = 1,
     gradient_checkpointing: bool = False,
-) -> tuple[TinyMoE, TorchTinyMoEReference, dict[str, Any], AsymExecutionStats]:
-    resolved_device = torch.device(device) if device is not None else default_tiny_moe_device()
-    resolved_dtype = base_dtype or default_tiny_moe_base_dtype(resolved_device)
-    resolved_backend = backend or default_tiny_moe_backend(resolved_device)
+    expert_recompute_threshold: int = 0,
+) -> tuple[MoE, TorchMoEReference, dict[str, Any], AsymExecutionStats]:
+    resolved_device = torch.device(device) if device is not None else default_moe_device()
+    resolved_dtype = base_dtype or default_moe_base_dtype(resolved_device)
+    resolved_backend = backend or default_moe_backend(resolved_device)
     resolved_pin = bool(pin_memory) if pin_memory is not None else resolved_device.type == "cuda"
-    state = make_tiny_moe_state(config, seed=seed, base_dtype=resolved_dtype)
+    state = make_moe_state(config, seed=seed, base_dtype=resolved_dtype)
     stats = AsymExecutionStats()
-    asym = TinyMoE(
+    asym = MoE(
         state,
         config=config,
         device=resolved_device,
@@ -1765,8 +1928,9 @@ def make_tiny_moe_pair(
         kt_threadpool_count=kt_threadpool_count,
         kt_max_cache_depth=kt_max_cache_depth,
         gradient_checkpointing=gradient_checkpointing,
+        expert_recompute_threshold=expert_recompute_threshold,
     )
-    ref = TorchTinyMoEReference(
+    ref = TorchMoEReference(
         state,
         config=config,
         device=resolved_device,
@@ -1849,7 +2013,7 @@ def router_grad_worst_error(lhs: nn.Module, rhs: nn.Module) -> float:
     return _grad_error_by_suffix(lhs, rhs, "router_weight")
 
 
-def _make_input(config: TinyMoEConfig, *, device: torch.device, dtype: torch.dtype, seed: int) -> torch.Tensor:
+def _make_input(config: MoEConfig, *, device: torch.device, dtype: torch.dtype, seed: int) -> torch.Tensor:
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
     x = torch.randn((config.logical_tokens, config.hidden_size), generator=generator, dtype=torch.float32) * 0.5
@@ -1858,7 +2022,7 @@ def _make_input(config: TinyMoEConfig, *, device: torch.device, dtype: torch.dty
 
 def _parity_once(
     *,
-    config: TinyMoEConfig,
+    config: MoEConfig,
     seed: int,
     x_seed: int,
     mode: GroupedMode,
@@ -1870,7 +2034,7 @@ def _parity_once(
     backend: str,
     pin_memory: bool,
 ) -> dict[str, Any]:
-    asym, ref, _, stats = make_tiny_moe_pair(
+    asym, ref, _, stats = make_moe_pair(
         config=config,
         seed=seed,
         device=device,
@@ -2056,7 +2220,7 @@ def _frozen_host_weight_summary(
 
 def run_toy_training_steps(
     *,
-    config: TinyMoEConfig,
+    config: MoEConfig,
     seed: int,
     steps: int,
     device: torch.device,
@@ -2065,7 +2229,7 @@ def run_toy_training_steps(
     pin_memory: bool,
     mode: GroupedMode = "contiguous",
 ) -> dict[str, Any]:
-    model, _, _, stats = make_tiny_moe_pair(
+    model, _, _, stats = make_moe_pair(
         config=config,
         seed=seed,
         device=device,
@@ -2135,7 +2299,7 @@ def _memory_probe(
     *,
     model_kind: str,
     state: Mapping[str, Any],
-    config: TinyMoEConfig,
+    config: MoEConfig,
     backend: str,
     device: torch.device,
     dtype: torch.dtype,
@@ -2145,9 +2309,9 @@ def _memory_probe(
     hbm_before = int(torch.cuda.memory_allocated(device)) if device.type == "cuda" else 0
     stats = AsymExecutionStats()
     if model_kind == "normal_gpu_resident":
-        model: nn.Module = TorchTinyMoEReference(state, config=config, device=device, base_dtype=dtype)
+        model: nn.Module = TorchMoEReference(state, config=config, device=device, base_dtype=dtype)
     elif model_kind == "asym_cpu_resident":
-        model = TinyMoE(
+        model = MoE(
             state,
             config=config,
             device=device,
@@ -2181,18 +2345,18 @@ def _memory_probe(
     return result
 
 
-def run_tiny_moe_memory_comparison(
+def run_moe_memory_comparison(
     *,
-    config: TinyMoEConfig = MICRO_MOE_CONFIG,
+    config: MoEConfig = MICRO_MOE_CONFIG,
     backend: str | None = None,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
     seed: int = 400,
 ) -> dict[str, Any]:
-    resolved_device = torch.device(device) if device is not None else default_tiny_moe_device()
-    resolved_dtype = dtype or default_tiny_moe_base_dtype(resolved_device)
-    resolved_backend = backend or default_tiny_moe_backend(resolved_device)
-    state = make_tiny_moe_state(config, seed=seed, base_dtype=resolved_dtype)
+    resolved_device = torch.device(device) if device is not None else default_moe_device()
+    resolved_dtype = dtype or default_moe_base_dtype(resolved_device)
+    resolved_backend = backend or default_moe_backend(resolved_device)
+    state = make_moe_state(config, seed=seed, base_dtype=resolved_dtype)
     normal = _memory_probe(
         model_kind="normal_gpu_resident",
         state=state,
@@ -2332,18 +2496,18 @@ def _summarize_m4_status(report: Mapping[str, Any]) -> str:
     return "pass"
 
 
-def run_tiny_moe_correctness_report(
+def run_moe_correctness_report(
     *,
     report_path: str | Path | None = None,
-    config: TinyMoEConfig = MICRO_MOE_CONFIG,
+    config: MoEConfig = MICRO_MOE_CONFIG,
     seed: int = 123,
     device: torch.device | str | None = None,
     backend: str | None = None,
     pin_memory: bool | None = None,
 ) -> dict[str, Any]:
-    resolved_device = torch.device(device) if device is not None else default_tiny_moe_device()
-    base_dtype = default_tiny_moe_base_dtype(resolved_device)
-    resolved_backend = backend or default_tiny_moe_backend(resolved_device)
+    resolved_device = torch.device(device) if device is not None else default_moe_device()
+    base_dtype = default_moe_base_dtype(resolved_device)
+    resolved_backend = backend or default_moe_backend(resolved_device)
     resolved_pin = bool(pin_memory) if pin_memory is not None else resolved_device.type == "cuda"
     if resolved_device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -2436,7 +2600,7 @@ def run_tiny_moe_correctness_report(
 
     peak_hbm = int(torch.cuda.max_memory_allocated(resolved_device)) if resolved_device.type == "cuda" else 0
     trainable_hbm = 0
-    sample_model, _, _, _ = make_tiny_moe_pair(
+    sample_model, _, _, _ = make_moe_pair(
         config=config,
         seed=seed + 11,
         device=resolved_device,
@@ -2462,7 +2626,7 @@ def run_tiny_moe_correctness_report(
 
     root = Path(__file__).resolve().parents[2]
     report = {
-        "milestone": "M4 Tiny MoE Correctness",
+        "milestone": "M4 MoE Correctness",
         "status": "unchecked",
         "config": {
             "num_layers": config.num_layers,
@@ -2496,7 +2660,7 @@ def run_tiny_moe_correctness_report(
             "attention_base_weight_device": "model_device",
             "trainable_parameter_kinds": ["lora", "router"],
         },
-        "parameter_accounting": estimate_tiny_moe_parameters(config, dtype=base_dtype),
+        "parameter_accounting": estimate_moe_parameters(config, dtype=base_dtype),
         "environment": _environment_report(root, resolved_device),
         "backend": resolved_backend,
         "base_dtype": str(base_dtype).replace("torch.", ""),
@@ -2531,7 +2695,7 @@ def run_tiny_moe_correctness_report(
         "peak_hbm_bytes": peak_hbm,
     }
     report["memory"].update(memory_compat)
-    memory_comparison = run_tiny_moe_memory_comparison(
+    memory_comparison = run_moe_memory_comparison(
         config=config,
         backend=resolved_backend,
         device=resolved_device,
@@ -2570,14 +2734,14 @@ def run_tiny_moe_correctness_report(
     return report
 
 
-def run_tiny_moe_case(
+def run_moe_case(
     *,
     backend: str | None = None,
     report_path: str | Path | None = None,
     device: torch.device | str | None = None,
     seed: int = 123,
 ) -> dict[str, Any]:
-    return run_tiny_moe_correctness_report(
+    return run_moe_correctness_report(
         report_path=report_path,
         seed=seed,
         device=device,
@@ -2585,35 +2749,35 @@ def run_tiny_moe_case(
     )
 
 
-TinyMoEModel = TinyMoE
+MoEModel = MoE
 
 
 __all__ = [
-    "AsymTinyMoELayer",
+    "AsymMoELayer",
     "ContiguousRouteMetadata",
     "GroupedMode",
-    "KTTinyMoELayer",
+    "KTMoELayer",
     "MaskedRouteMetadata",
     "MICRO_MOE_CONFIG",
     "PackedExpertLoRA",
     "RouteMetadata",
     "Routing",
     "SHOWCASE_MOE_CONFIG",
-    "TinyMoE",
-    "TinyMoEConfig",
-    "TorchTinyExpert",
-    "TorchTinyMoEReference",
+    "MoE",
+    "MoEConfig",
+    "TorchExpert",
+    "TorchMoEReference",
     "VALID_MOE_BACKENDS",
     "build_contiguous_route_metadata",
     "build_contiguous_metadata",
     "build_masked_route_metadata",
     "build_masked_metadata",
     "build_route_metadata",
-    "clone_tiny_moe_state",
-    "default_tiny_moe_backend",
-    "default_tiny_moe_base_dtype",
-    "default_tiny_moe_device",
-    "estimate_tiny_moe_parameters",
+    "clone_moe_state",
+    "default_moe_backend",
+    "default_moe_base_dtype",
+    "default_moe_device",
+    "estimate_moe_parameters",
     "grouped_expert_lora",
     "lora_grad_worst_error",
     "make_balanced_static_routing",
@@ -2621,8 +2785,8 @@ __all__ = [
     "make_repeated_expert_static_routing",
     "make_skewed_static_routing",
     "make_static_routes",
-    "make_tiny_moe_pair",
-    "make_tiny_moe_state",
+    "make_moe_pair",
+    "make_moe_state",
     "max_abs_error",
     "pack_tokens_contiguous",
     "pack_tokens_masked",
@@ -2630,14 +2794,14 @@ __all__ = [
     "restore_masked_route_order",
     "route_metadata_summary",
     "router_grad_worst_error",
-    "run_tiny_moe_correctness_report",
-    "run_tiny_moe_case",
-    "run_tiny_moe_memory_comparison",
+    "run_moe_correctness_report",
+    "run_moe_case",
+    "run_moe_memory_comparison",
     "run_toy_training_steps",
     "scatter_backward_contiguous",
     "scatter_backward_masked",
     "scatter_contiguous",
     "scatter_masked",
     "topk_routing_from_logits",
-    "TinyMoEModel",
+    "MoEModel",
 ]

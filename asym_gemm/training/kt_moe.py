@@ -187,7 +187,7 @@ class _KTRoutedMoEFunction(torch.autograd.Function):
 
 
 class KTRoutedExpertMoE(nn.Module):
-    """Local one-GPU KT SFT routed expert adapter for the tiny MoE benchmark."""
+    """Local one-GPU KT SFT routed expert adapter for the MoE benchmark."""
 
     def __init__(
         self,

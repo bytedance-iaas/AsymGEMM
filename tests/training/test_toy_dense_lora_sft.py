@@ -3,19 +3,19 @@ from __future__ import annotations
 import pytest
 import torch
 
-import asym_gemm.training.dense as tiny_dense_llm
+import asym_gemm.training.dense as dense_llm
 
-TARGET_MODES = tiny_dense_llm.TARGET_MODES
-TinyDenseLLMConfig = tiny_dense_llm.TinyDenseLLMConfig
-MICRO_DENSE_LLM_CONFIG = tiny_dense_llm.MICRO_DENSE_LLM_CONFIG
-SHOWCASE_DENSE_LLM_CONFIG = tiny_dense_llm.SHOWCASE_DENSE_LLM_CONFIG
-adapter_state_names = tiny_dense_llm.adapter_state_names
-build_model_pair = tiny_dense_llm.build_model_pair
-estimate_tiny_dense_llm_parameters = tiny_dense_llm.estimate_tiny_dense_llm_parameters
-run_adapter_reload_case = tiny_dense_llm.run_adapter_reload_case
-run_memory_comparison = tiny_dense_llm.run_memory_comparison
-run_parity_case = tiny_dense_llm.run_parity_case
-run_repeated_steps = tiny_dense_llm.run_repeated_steps
+TARGET_MODES = dense_llm.TARGET_MODES
+DenseLLMConfig = dense_llm.DenseLLMConfig
+MICRO_DENSE_LLM_CONFIG = dense_llm.MICRO_DENSE_LLM_CONFIG
+SHOWCASE_DENSE_LLM_CONFIG = dense_llm.SHOWCASE_DENSE_LLM_CONFIG
+adapter_state_names = dense_llm.adapter_state_names
+build_model_pair = dense_llm.build_model_pair
+estimate_dense_llm_parameters = dense_llm.estimate_dense_llm_parameters
+run_adapter_reload_case = dense_llm.run_adapter_reload_case
+run_memory_comparison = dense_llm.run_memory_comparison
+run_parity_case = dense_llm.run_parity_case
+run_repeated_steps = dense_llm.run_repeated_steps
 
 
 def _direct_bf16_available() -> bool:
@@ -58,9 +58,9 @@ def _print_parity(case: dict) -> None:
     )
 
 
-def test_tiny_dense_llm_showcase_config_is_few_hundred_million_params() -> None:
-    config = TinyDenseLLMConfig()
-    counts = estimate_tiny_dense_llm_parameters(config, target_mode="all", dtype=torch.bfloat16)
+def test_dense_llm_showcase_config_is_few_hundred_million_params() -> None:
+    config = DenseLLMConfig()
+    counts = estimate_dense_llm_parameters(config, target_mode="all", dtype=torch.bfloat16)
     print(
         "\n[M3 showcase parameter count] "
         f"config={config}, "
@@ -84,7 +84,7 @@ def test_tiny_dense_llm_showcase_config_is_few_hundred_million_params() -> None:
 @pytest.mark.skipif(not _direct_bf16_available(), reason="M3 BF16 direct-fetch parity requires SM90/SM100")
 @pytest.mark.parametrize("target_mode", TARGET_MODES)
 @pytest.mark.parametrize("checkpointing", [False, True])
-def test_tiny_dense_llm_parity_by_target_mode_and_checkpointing(target_mode: str, checkpointing: bool) -> None:
+def test_dense_llm_parity_by_target_mode_and_checkpointing(target_mode: str, checkpointing: bool) -> None:
     torch.manual_seed(0)
     case = run_parity_case(
         target_mode=target_mode,
@@ -114,7 +114,7 @@ def test_tiny_dense_llm_parity_by_target_mode_and_checkpointing(target_mode: str
 
 
 @pytest.mark.skipif(not _direct_bf16_available(), reason="M3 repeated-step BF16 check requires SM90/SM100")
-def test_tiny_dense_llm_repeated_steps_are_finite_and_track_torch() -> None:
+def test_dense_llm_repeated_steps_are_finite_and_track_torch() -> None:
     report = run_repeated_steps(
         target_mode="all",
         checkpointing=False,
@@ -158,7 +158,7 @@ def test_tiny_dense_llm_repeated_steps_are_finite_and_track_torch() -> None:
     assert report["execution_stats"]["torch_calls"] == 0
 
 
-def test_tiny_dense_llm_adapter_state_names_and_reload_cpu() -> None:
+def test_dense_llm_adapter_state_names_and_reload_cpu() -> None:
     config = MICRO_DENSE_LLM_CONFIG
     asym_model, ref_model = build_model_pair(
         config=config,
@@ -205,7 +205,7 @@ def test_tiny_dense_llm_adapter_state_names_and_reload_cpu() -> None:
     assert reload_report["reload_matches_source_logits_max_abs"] <= 1e-6
 
 
-def test_tiny_dense_llm_lora_all_offload_mlp_placement() -> None:
+def test_dense_llm_lora_all_offload_mlp_placement() -> None:
     config = MICRO_DENSE_LLM_CONFIG
     device = _placement_device()
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
@@ -221,9 +221,9 @@ def test_tiny_dense_llm_lora_all_offload_mlp_placement() -> None:
         lora_seed=125,
     )
 
-    assert model.target_names == tiny_dense_llm.ALL_TARGETS
-    assert model.offload_names == tiny_dense_llm.MLP_TARGETS
-    assert len(adapter_state_names(model)) == config.num_layers * len(tiny_dense_llm.ALL_TARGETS) * 2
+    assert model.target_names == dense_llm.ALL_TARGETS
+    assert model.offload_names == dense_llm.MLP_TARGETS
+    assert len(adapter_state_names(model)) == config.num_layers * len(dense_llm.ALL_TARGETS) * 2
 
     for layer in model.layers:
         attention_modules = (
@@ -238,14 +238,14 @@ def test_tiny_dense_llm_lora_all_offload_mlp_placement() -> None:
             layer.mlp.down_proj,
         )
         for module in attention_modules:
-            assert isinstance(module, tiny_dense_llm.TorchLoRALinear)
+            assert isinstance(module, dense_llm.TorchLoRALinear)
             assert _is_on_device(module.base_layer.weight, device)
             assert _is_on_device(module.lora_A["default"].weight, device)
             assert _is_on_device(module.lora_B["default"].weight, device)
             assert module.lora_A["default"].weight.dtype == torch.bfloat16
             assert module.lora_B["default"].weight.dtype == torch.bfloat16
         for module in mlp_modules:
-            assert isinstance(module, tiny_dense_llm.AsymLoRALinear)
+            assert isinstance(module, dense_llm.AsymLoRALinear)
             assert module.base_layer.host_weight.weight.device.type == "cpu"
             assert not module.base_layer.host_weight.weight.requires_grad
             if device.type == "cuda":
@@ -256,14 +256,14 @@ def test_tiny_dense_llm_lora_all_offload_mlp_placement() -> None:
             assert module.lora_B["default"].weight.dtype == torch.bfloat16
 
     dtype_bytes = torch.empty((), dtype=dtype).element_size()
-    expected_offloaded_mlp_bytes = config.num_layers * len(tiny_dense_llm.MLP_TARGETS) * config.intermediate_size * config.hidden_size * dtype_bytes
-    expected_gpu_attention_bytes = config.num_layers * len(tiny_dense_llm.ATTENTION_TARGETS) * config.hidden_size * config.hidden_size * dtype_bytes
+    expected_offloaded_mlp_bytes = config.num_layers * len(dense_llm.MLP_TARGETS) * config.intermediate_size * config.hidden_size * dtype_bytes
+    expected_gpu_attention_bytes = config.num_layers * len(dense_llm.ATTENTION_TARGETS) * config.hidden_size * config.hidden_size * dtype_bytes
     assert model.cpu_resident_base_weight_bytes == expected_offloaded_mlp_bytes
     assert model.gpu_resident_target_weight_bytes == expected_gpu_attention_bytes
 
 
 @pytest.mark.skipif(not _direct_bf16_available(), reason="CUDA SM90/SM100 required for M3 HBM direct-fetch accounting")
-def test_tiny_dense_llm_cpu_resident_targets_save_hbm() -> None:
+def test_dense_llm_cpu_resident_targets_save_hbm() -> None:
     memory = run_memory_comparison(
         target_mode="all",
         backend="asym",

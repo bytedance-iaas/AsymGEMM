@@ -49,6 +49,7 @@ def main() -> None:
     parser.add_argument("--lora-rank", "--real-lora-rank", dest="real_lora_rank", metavar="N", type=int, default=64)
     parser.add_argument("--lora-alpha", "--real-lora-alpha", dest="real_lora_alpha", metavar="FLOAT", type=float, default=128.0)
     parser.add_argument("--vocab-rows", "--real-vocab-rows", dest="real_vocab_rows", metavar="N", type=int, default=4096)
+    parser.add_argument("--expert-recompute-threshold", type=int, default=0)
     parser.add_argument("--output-root", type=Path, default=Path("profiling"))
     parser.add_argument("--output-dir", type=Path, help="Exact output directory. Overrides --output-root/<workload>/cpu_gaps.")
     parser.add_argument("--nsys-bin", default="nsys")
@@ -126,6 +127,8 @@ def main() -> None:
         str(args.real_lora_alpha),
         "--vocab-rows",
         str(args.real_vocab_rows),
+        "--expert-recompute-threshold",
+        str(args.expert_recompute_threshold),
         "--output-dir",
         str(source_dir),
     ]

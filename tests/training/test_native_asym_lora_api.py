@@ -7,7 +7,7 @@ from torch import nn
 from asym_gemm.training.lora import AsymLoRALinear, add_asym_lora, freeze_non_lora_params, get_lora_state_dict
 
 
-class TinyProjectionBlock(nn.Module):
+class ProjectionBlock(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.q_proj = nn.Linear(4, 4, bias=True)
@@ -19,7 +19,7 @@ class TinyProjectionBlock(nn.Module):
 
 
 def test_add_asym_lora_with_exact_target_list() -> None:
-    model = TinyProjectionBlock()
+    model = ProjectionBlock()
 
     report = add_asym_lora(
         model,
@@ -43,7 +43,7 @@ def test_add_asym_lora_with_exact_target_list() -> None:
 
 
 def test_add_asym_lora_accepts_explicit_lora_dtype() -> None:
-    model = TinyProjectionBlock()
+    model = ProjectionBlock()
 
     add_asym_lora(
         model,
@@ -61,7 +61,7 @@ def test_add_asym_lora_accepts_explicit_lora_dtype() -> None:
 
 
 def test_add_asym_lora_with_regex_targeting() -> None:
-    model = TinyProjectionBlock()
+    model = ProjectionBlock()
 
     report = add_asym_lora(
         model,
@@ -78,7 +78,7 @@ def test_add_asym_lora_with_regex_targeting() -> None:
 
 
 def test_add_asym_lora_defaults_to_all_preset() -> None:
-    model = TinyProjectionBlock()
+    model = ProjectionBlock()
 
     report = add_asym_lora(model, rank=2, alpha=4.0, backend="torch", precision="bf16")
 
@@ -86,7 +86,7 @@ def test_add_asym_lora_defaults_to_all_preset() -> None:
 
 
 def test_add_asym_lora_strict_no_match_raises() -> None:
-    model = TinyProjectionBlock()
+    model = ProjectionBlock()
 
     with pytest.raises(ValueError, match="no target modules"):
         add_asym_lora(
@@ -100,7 +100,7 @@ def test_add_asym_lora_strict_no_match_raises() -> None:
 
 
 def test_add_asym_lora_strict_non_linear_match_raises() -> None:
-    model = TinyProjectionBlock()
+    model = ProjectionBlock()
 
     with pytest.raises(TypeError, match="nn.Linear"):
         add_asym_lora(
@@ -114,7 +114,7 @@ def test_add_asym_lora_strict_non_linear_match_raises() -> None:
 
 
 def test_freeze_non_lora_params_only_leaves_adapter_trainable() -> None:
-    model = TinyProjectionBlock()
+    model = ProjectionBlock()
     add_asym_lora(
         model,
         rank=2,
@@ -131,7 +131,7 @@ def test_freeze_non_lora_params_only_leaves_adapter_trainable() -> None:
 
 
 def test_lora_state_dict_filters_base_weights() -> None:
-    model = TinyProjectionBlock()
+    model = ProjectionBlock()
     add_asym_lora(
         model,
         rank=2,

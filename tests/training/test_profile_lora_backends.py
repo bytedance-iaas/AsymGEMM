@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PROFILE_LORA_PATH = ROOT / "scripts" / "profile_lora.py"
 PROFILE_LORA_DRIVER_PATH = ROOT / "scripts" / "profile_lora_driver.py"
 POSTPROCESS_NSYS_LORA_PATH = ROOT / "scripts" / "postprocess_nsys_lora.py"
+PLOT_ACTIVATION_SWEEP_PATH = ROOT / "scripts" / "plotting" / "plot_activation_recompute_sweep.py"
 
 
 def _load_profile_lora_module():
@@ -45,10 +46,32 @@ def _load_postprocess_nsys_lora_module():
     return module
 
 
+def _load_activation_sweep_plot_module():
+    spec = importlib.util.spec_from_file_location("plot_activation_recompute_sweep_under_test", PLOT_ACTIVATION_SWEEP_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_profile_lora_public_backends_are_canonical() -> None:
     profile_lora = _load_profile_lora_module()
 
     assert profile_lora.BACKEND_CHOICES == ("torch", "asym", "kt")
+
+
+def test_profile_lora_rejects_expert_threshold_for_non_moe_workload() -> None:
+    profile_lora = _load_profile_lora_module()
+    args = argparse.Namespace(
+        backend="torch",
+        workload="dense",
+        lora_dtype="bf16",
+        expert_recompute_threshold=8,
+    )
+
+    with pytest.raises(ValueError, match="only supported for MoE"):
+        profile_lora.validate_backend_workload(args)
 
 
 def test_profile_lora_public_workload_names_are_blockwise_for_moe() -> None:
@@ -82,6 +105,31 @@ def test_profile_lora_driver_result_stem_includes_input_shape_and_recompute() ->
 
     args.activation_recompute = False
     assert driver._result_stem(args, "torch", "source") == "bf16_lora-sft_b16_s2048_norecomp_torch_source"
+
+    args.expert_recompute_threshold = 64
+    assert driver._result_stem(args, "asym", "source") == "bf16_lora-sft_b16_s2048_norecomp_expertthr64_asym_source"
+
+
+def test_profile_lora_driver_expands_expert_recompute_thresholds() -> None:
+    driver = _load_profile_lora_driver_module()
+
+    args = argparse.Namespace(expert_recompute_threshold=0, expert_recompute_thresholds=["0,16", "32", "16"])
+
+    assert driver._expert_recompute_thresholds(args) == [0, 16, 32]
+
+
+def test_activation_sweep_plot_parses_expert_threshold_result_dirs() -> None:
+    plotter = _load_activation_sweep_plot_module()
+
+    meta = plotter.parse_result_dir(
+        Path("/tmp/profiling/moe-604m-a38m-l2/bf16_lora-sft_b8_s256_norecomp_expertthr64_asym_nsys")
+    )
+
+    assert meta is not None
+    assert meta["workload"] == "moe-604m-a38m-l2"
+    assert meta["seq_len"] == 256
+    assert meta["mode"] == "no_recompute"
+    assert meta["expert_recompute_threshold"] == 64
 
 
 def test_profile_lora_driver_does_not_create_skipped_result_dirs(tmp_path: Path) -> None:
@@ -208,7 +256,7 @@ def test_profile_lora_saved_tensor_buckets_keep_semantic_leaf_owners() -> None:
     profile_lora = _load_profile_lora_module()
 
     assert profile_lora._saved_tensor_bucket("forward.layers.0.mlp.silu_mul_activation") == "mlp.silu_mul_activation"
-    assert profile_lora._saved_tensor_bucket("forward.layers.0.attention.softmax") == "attention.softmax"
+    assert profile_lora._saved_tensor_bucket("forward.layers.0.attention.sdpa") == "attention.sdpa"
     assert profile_lora._saved_tensor_bucket("forward.layers.0.attention.q_proj.lora_A") == "attention.q_proj.lora_A"
     assert profile_lora._saved_tensor_bucket("forward.layers.0.routed_expert.gate_lora") == "routed_expert.gate.lora"
     assert profile_lora._saved_tensor_bucket("forward.layers.0.routed_expert.gate_up_lora") == "routed_expert.gate_up.lora"
@@ -221,28 +269,6 @@ def test_postprocess_semantic_keys_keep_torch_base_and_gate_up_lora() -> None:
     assert postprocess._semantic_leaf_key("attention.q_proj.base_asymgemm") == "attention.q_proj.base_torch"
     assert postprocess._semantic_leaf_label("attention.q_proj.base_torch") == "Attention q_proj base torch"
     assert postprocess._semantic_leaf_key("forward.layers.0.routed_expert.gate_up_lora") == "routed_expert.gate_up.lora"
-
-
-def test_profiled_causal_mask_backward_is_labeled_and_masks_gradients() -> None:
-    profile_lora = _load_profile_lora_module()
-    book = profile_lora.StageBook(torch.device("cpu"), timing_mode="profile")
-    base = torch.arange(9, dtype=torch.float32, requires_grad=True)
-    scores = base.reshape(1, 1, 3, 3)
-    mask = torch.triu(torch.ones(3, 3, dtype=torch.bool), diagonal=1)
-
-    masked = profile_lora.profiled_causal_mask(
-        scores,
-        mask,
-        torch.finfo(scores.dtype).min,
-        "attention.causal_mask",
-        book,
-    )
-    masked.sum().backward()
-
-    expected = (~mask).to(dtype=torch.float32).reshape(1, 1, 3, 3)
-    assert base.grad is not None
-    assert torch.equal(base.grad.reshape(1, 1, 3, 3), expected)
-    assert "backward.attention.causal_mask.grad" in book.values
 
 
 def test_postprocess_front_summary_uses_semantic_leaf_rows() -> None:

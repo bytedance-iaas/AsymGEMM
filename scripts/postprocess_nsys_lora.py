@@ -167,6 +167,10 @@ def _display_operation_name(name: str) -> str:
         "scores_matmul": "scores matmul",
         "value_matmul": "value matmul",
         "causal_mask": "causal mask",
+        "sdpa": "SDPA",
+        "fa2": "FA2",
+        "fa3": "FA3",
+        "fa4": "FA4",
         "route_metadata": "route metadata",
         "pack_tokens": "pack tokens",
         "scatter_combine": "scatter combine",
@@ -200,6 +204,8 @@ def _display_kernel_name(name: str) -> str:
         return "Torch/CUTLASS GEMM kernel"
     if "cublas" in lower:
         return "cuBLAS/cuBLASLt GEMM kernel"
+    if "flash" in lower or "scaled_dot_product" in lower or "efficient_attention" in lower:
+        return "Torch SDPA/FlashAttention kernel"
     if "softmax" in lower:
         return "Torch softmax kernel"
     if "layer_norm" in lower or "layernorm" in lower:
@@ -316,6 +322,14 @@ def _attention_scope(op: str) -> str:
         return "scores matmul"
     if "value_matmul" in op:
         return "value matmul"
+    if "sdpa" in op:
+        return "SDPA"
+    if "fa2" in op:
+        return "FA2"
+    if "fa3" in op:
+        return "FA3"
+    if "fa4" in op:
+        return "FA4"
     if "softmax" in op:
         return "softmax"
     if "causal_mask" in op:
@@ -372,6 +386,8 @@ def _kernel_family(kernel: str) -> str:
         return "copy/cast"
     if "mul elementwise" in kernel or "add elementwise" in kernel or "elementwise" in kernel:
         return "elementwise"
+    if "sdpa" in kernel.lower() or "flashattention" in kernel.lower() or "attention kernel" in kernel.lower():
+        return "attention"
     if "softmax" in kernel:
         return "softmax"
     if "layernorm" in kernel:
@@ -982,6 +998,10 @@ def _semantic_operation(compact: str) -> str:
         ("scores matmul", "scores_matmul"),
         ("value matmul", "value_matmul"),
         ("causal mask", "causal_mask"),
+        ("sdpa", "sdpa"),
+        ("fa2", "fa2"),
+        ("fa3", "fa3"),
+        ("fa4", "fa4"),
         ("softmax", "softmax"),
         ("layernorm", "layernorm"),
         ("residual add", "residual_add"),
@@ -1108,6 +1128,10 @@ def _semantic_leaf_label(key: str) -> str:
         "scores_matmul": "scores matmul",
         "value_matmul": "value matmul",
         "causal_mask": "causal mask",
+        "sdpa": "SDPA",
+        "fa2": "FA2",
+        "fa3": "FA3",
+        "fa4": "FA4",
         "softmax": "softmax",
         "layernorm": "LayerNorm",
         "residual_add": "residual add",

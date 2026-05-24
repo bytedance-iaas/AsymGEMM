@@ -19,6 +19,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import torch
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
@@ -83,10 +84,18 @@ MLP_TARGETS = ("gate_proj", "up_proj", "down_proj")
 ALL_TARGETS = ATTENTION_TARGETS + MLP_TARGETS
 DEFAULT_TARGET_MODULES = "all"
 DEFAULT_OFFLOAD_MODULES = "mlp"
+FUSED_SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+
+
+def _scaled_dot_product_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    if q.device.type == "cuda":
+        with sdpa_kernel(FUSED_SDPA_BACKENDS):
+            return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=True)
+    return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=True)
 
 
 @dataclass(frozen=True)
-class TinyDenseLLMConfig:
+class DenseLLMConfig:
     vocab_size: int = 32768
     hidden_size: int = 1536
     num_layers: int = 8
@@ -96,9 +105,10 @@ class TinyDenseLLMConfig:
     intermediate_size: int = 4096
     lora_rank: int = 128
     lora_alpha: float = 256.0
+    attention_impl: str = "sdpa"
 
     @classmethod
-    def micro(cls) -> "TinyDenseLLMConfig":
+    def micro(cls) -> "DenseLLMConfig":
         return cls(
             vocab_size=512,
             hidden_size=128,
@@ -119,7 +129,7 @@ class TinyDenseLLMConfig:
 
 
 @dataclass(frozen=True)
-class TinyDenseWeights:
+class DenseWeights:
     token_embedding: torch.Tensor
     position_embedding: torch.Tensor
     lm_head: torch.Tensor
@@ -175,8 +185,8 @@ def _normalize_module_selector(selector: Sequence[str] | str | None, *, default:
     return tuple(names)
 
 
-MICRO_DENSE_LLM_CONFIG = TinyDenseLLMConfig.micro()
-SHOWCASE_DENSE_LLM_CONFIG = TinyDenseLLMConfig()
+MICRO_DENSE_LLM_CONFIG = DenseLLMConfig.micro()
+SHOWCASE_DENSE_LLM_CONFIG = DenseLLMConfig()
 
 
 def _dtype_from_name(name: str) -> torch.dtype:
@@ -192,8 +202,8 @@ def _element_size(dtype: torch.dtype | str) -> int:
     return torch.empty((), dtype=resolved_dtype).element_size()
 
 
-def estimate_tiny_dense_llm_parameters(
-    config: TinyDenseLLMConfig = SHOWCASE_DENSE_LLM_CONFIG,
+def estimate_dense_llm_parameters(
+    config: DenseLLMConfig = SHOWCASE_DENSE_LLM_CONFIG,
     *,
     target_mode: str = "all",
     target_modules: Sequence[str] | str | None = None,
@@ -266,12 +276,12 @@ def _randn(shape: tuple[int, ...], *, generator: torch.Generator, dtype: torch.d
     return (torch.randn(shape, generator=generator, dtype=torch.float32) * scale).to(dtype=dtype).contiguous()
 
 
-def make_tiny_dense_weights(
-    config: TinyDenseLLMConfig,
+def make_dense_weights(
+    config: DenseLLMConfig,
     *,
     seed: int = 0,
     dtype: torch.dtype = torch.bfloat16,
-) -> TinyDenseWeights:
+) -> DenseWeights:
     generator = torch.Generator(device="cpu").manual_seed(seed)
     hidden = config.hidden_size
     inter = config.intermediate_size
@@ -290,7 +300,7 @@ def make_tiny_dense_weights(
                 "post_attention_layernorm_weight": torch.ones(hidden, dtype=dtype),
             }
         )
-    return TinyDenseWeights(
+    return DenseWeights(
         token_embedding=_randn((config.vocab_size, hidden), generator=generator, dtype=dtype, scale=0.02),
         position_embedding=_randn((config.seq_len, hidden), generator=generator, dtype=dtype, scale=0.02),
         lm_head=_randn((config.vocab_size, hidden), generator=generator, dtype=dtype, scale=0.02),
@@ -366,12 +376,12 @@ def _make_projection(
     return FrozenTorchLinear(weight, device=device, dtype=dtype)
 
 
-class TinySelfAttention(nn.Module):
+class SelfAttention(nn.Module):
     def __init__(
         self,
         layer_weights: Mapping[str, torch.Tensor],
         *,
-        config: TinyDenseLLMConfig,
+        config: DenseLLMConfig,
         target_names: tuple[str, ...],
         offload_names: tuple[str, ...],
         use_asym: bool,
@@ -404,6 +414,9 @@ class TinySelfAttention(nn.Module):
         self.o_proj = _make_projection(weight=layer_weights["o_proj"], name="o_proj", **kwargs)
         self.num_heads = config.num_heads
         self.head_dim = config.head_dim
+        self.attention_impl = config.attention_impl
+        if self.attention_impl != "sdpa":
+            raise NotImplementedError(f"attention_impl={self.attention_impl!r} is a placeholder and is not wired yet")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch, seq, hidden = hidden_states.shape
@@ -411,20 +424,17 @@ class TinySelfAttention(nn.Module):
         k = self.k_proj(hidden_states).view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(hidden_states).view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
 
-        scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) / math.sqrt(float(self.head_dim))
-        mask = torch.triu(torch.ones(seq, seq, device=hidden_states.device, dtype=torch.bool), diagonal=1)
-        scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min)
-        probs = torch.softmax(scores, dim=-1)
-        context = torch.matmul(probs, v.float()).transpose(1, 2).contiguous().view(batch, seq, hidden)
+        context = _scaled_dot_product_attention(q, k, v)
+        context = context.transpose(1, 2).contiguous().view(batch, seq, hidden)
         return self.o_proj(context.to(dtype=hidden_states.dtype))
 
 
-class TinyMLP(nn.Module):
+class MLP(nn.Module):
     def __init__(
         self,
         layer_weights: Mapping[str, torch.Tensor],
         *,
-        config: TinyDenseLLMConfig,
+        config: DenseLLMConfig,
         target_names: tuple[str, ...],
         offload_names: tuple[str, ...],
         use_asym: bool,
@@ -462,12 +472,12 @@ class TinyMLP(nn.Module):
         return self.down_proj(activated.to(dtype=hidden_states.dtype))
 
 
-class TinyDecoderLayer(nn.Module):
+class DecoderLayer(nn.Module):
     def __init__(
         self,
         layer_weights: Mapping[str, torch.Tensor],
         *,
-        config: TinyDenseLLMConfig,
+        config: DenseLLMConfig,
         target_names: tuple[str, ...],
         offload_names: tuple[str, ...],
         use_asym: bool,
@@ -492,7 +502,7 @@ class TinyDecoderLayer(nn.Module):
         for param in self.post_attention_layernorm.parameters():
             param.requires_grad_(False)
 
-        self.self_attn = TinySelfAttention(
+        self.self_attn = SelfAttention(
             layer_weights,
             config=config,
             target_names=target_names,
@@ -506,7 +516,7 @@ class TinyDecoderLayer(nn.Module):
             lora_dtype=lora_dtype,
             precision=precision,
         )
-        self.mlp = TinyMLP(
+        self.mlp = MLP(
             layer_weights,
             config=config,
             target_names=target_names,
@@ -532,12 +542,12 @@ class TinyDecoderLayer(nn.Module):
         return hidden_states
 
 
-class TinyDenseLLMBase(nn.Module):
+class DenseLLMBase(nn.Module):
     def __init__(
         self,
-        weights: TinyDenseWeights,
+        weights: DenseWeights,
         *,
-        config: TinyDenseLLMConfig,
+        config: DenseLLMConfig,
         target_mode: str,
         target_modules: Sequence[str] | str | None = None,
         offload_modules: Sequence[str] | str | None = DEFAULT_OFFLOAD_MODULES,
@@ -580,7 +590,7 @@ class TinyDenseLLMBase(nn.Module):
         lora_generator = torch.Generator(device="cpu").manual_seed(lora_seed)
         self.layers = nn.ModuleList(
             [
-                TinyDecoderLayer(
+                DecoderLayer(
                     layer_weights,
                     config=config,
                     target_names=self.target_names,
@@ -673,12 +683,12 @@ class TinyDenseLLMBase(nn.Module):
         return {"logits": logits, "loss": loss, "activations": activations}
 
 
-class AsymTinyDenseLLM(TinyDenseLLMBase):
+class AsymDenseLLM(DenseLLMBase):
     def __init__(
         self,
-        weights: TinyDenseWeights,
+        weights: DenseWeights,
         *,
-        config: TinyDenseLLMConfig = TinyDenseLLMConfig(),
+        config: DenseLLMConfig = DenseLLMConfig(),
         target_mode: str = "all",
         target_modules: Sequence[str] | str | None = None,
         offload_modules: Sequence[str] | str | None = DEFAULT_OFFLOAD_MODULES,
@@ -709,12 +719,12 @@ class AsymTinyDenseLLM(TinyDenseLLMBase):
         )
 
 
-class TorchTinyDenseLLM(TinyDenseLLMBase):
+class TorchDenseLLM(DenseLLMBase):
     def __init__(
         self,
-        weights: TinyDenseWeights,
+        weights: DenseWeights,
         *,
-        config: TinyDenseLLMConfig = TinyDenseLLMConfig(),
+        config: DenseLLMConfig = DenseLLMConfig(),
         target_mode: str = "all",
         target_modules: Sequence[str] | str | None = None,
         offload_modules: Sequence[str] | str | None = None,
@@ -741,8 +751,8 @@ class TorchTinyDenseLLM(TinyDenseLLMBase):
         )
 
 
-TinyDenseConfig = TinyDenseLLMConfig
-TinyDenseLM = AsymTinyDenseLLM
+DenseConfig = DenseLLMConfig
+DenseLM = AsymDenseLLM
 
 
 def _max_abs(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -782,7 +792,7 @@ def _finite_named_tensors(tensors: Iterable[tuple[str, torch.Tensor]]) -> bool:
 
 
 def make_inputs(
-    config: TinyDenseLLMConfig,
+    config: DenseLLMConfig,
     *,
     seed: int,
     device: torch.device,
@@ -807,7 +817,7 @@ def make_inputs(
 
 def build_model_pair(
     *,
-    config: TinyDenseLLMConfig = TinyDenseLLMConfig(),
+    config: DenseLLMConfig = DenseLLMConfig(),
     target_mode: str = "all",
     target_modules: Sequence[str] | str | None = None,
     offload_modules: Sequence[str] | str | None = DEFAULT_OFFLOAD_MODULES,
@@ -818,11 +828,11 @@ def build_model_pair(
     lora_seed: int = 1,
     lora_dtype: torch.dtype | str = torch.bfloat16,
     gradient_checkpointing: bool = False,
-) -> tuple[AsymTinyDenseLLM, TorchTinyDenseLLM]:
+) -> tuple[AsymDenseLLM, TorchDenseLLM]:
     dev = torch.device(device)
-    weights = make_tiny_dense_weights(config, seed=seed, dtype=dtype)
+    weights = make_dense_weights(config, seed=seed, dtype=dtype)
     stats = AsymExecutionStats()
-    asym_model = AsymTinyDenseLLM(
+    asym_model = AsymDenseLLM(
         weights,
         config=config,
         target_mode=target_mode,
@@ -836,7 +846,7 @@ def build_model_pair(
         lora_dtype=lora_dtype,
         gradient_checkpointing=gradient_checkpointing,
     )
-    ref_model = TorchTinyDenseLLM(
+    ref_model = TorchDenseLLM(
         weights,
         config=config,
         target_mode=target_mode,
@@ -887,7 +897,7 @@ def run_parity_case(
     lora_seed: int = 1,
     lora_dtype: torch.dtype | str = torch.bfloat16,
     input_seed: int = 2,
-    config: TinyDenseLLMConfig = TinyDenseLLMConfig(),
+    config: DenseLLMConfig = DenseLLMConfig(),
 ) -> dict[str, Any]:
     dev = _device_from_name(str(device) if device is not None else None)
     resolved_dtype = _dtype_from_name(dtype) if isinstance(dtype, str) else dtype
@@ -972,7 +982,7 @@ def run_parity_case(
     }
 
 
-def _optimizer_contains_only_lora(model: TinyDenseLLMBase, optimizer: torch.optim.Optimizer) -> bool:
+def _optimizer_contains_only_lora(model: DenseLLMBase, optimizer: torch.optim.Optimizer) -> bool:
     expected = {id(param) for param in model.lora_parameters()}
     actual = {id(param) for group in optimizer.param_groups for param in group["params"]}
     return actual == expected
@@ -1054,7 +1064,7 @@ def run_repeated_steps(
     input_seed: int = 12,
     steps: int = 5,
     lr: float = 3e-3,
-    config: TinyDenseLLMConfig = TinyDenseLLMConfig(),
+    config: DenseLLMConfig = DenseLLMConfig(),
 ) -> dict[str, Any]:
     dev = _device_from_name(str(device) if device is not None else None)
     resolved_dtype = _dtype_from_name(dtype) if isinstance(dtype, str) else dtype
@@ -1159,12 +1169,12 @@ def run_adapter_reload_case(
     reload_lora_seed: int = 22,
     lora_dtype: torch.dtype | str = torch.bfloat16,
     input_seed: int = 23,
-    config: TinyDenseLLMConfig = TinyDenseLLMConfig(),
+    config: DenseLLMConfig = DenseLLMConfig(),
 ) -> dict[str, Any]:
     dev = _device_from_name(str(device) if device is not None else None)
     resolved_dtype = _dtype_from_name(dtype) if isinstance(dtype, str) else dtype
-    weights = make_tiny_dense_weights(config, seed=seed, dtype=resolved_dtype)
-    model = AsymTinyDenseLLM(
+    weights = make_dense_weights(config, seed=seed, dtype=resolved_dtype)
+    model = AsymDenseLLM(
         weights,
         config=config,
         target_mode=target_mode,
@@ -1175,7 +1185,7 @@ def run_adapter_reload_case(
         lora_seed=lora_seed,
         lora_dtype=lora_dtype,
     )
-    reloaded = AsymTinyDenseLLM(
+    reloaded = AsymDenseLLM(
         weights,
         config=config,
         target_mode=target_mode,
@@ -1218,14 +1228,14 @@ def _memory_probe(
     lora_seed: int,
     lora_dtype: torch.dtype | str,
     input_seed: int,
-    config: TinyDenseLLMConfig,
+    config: DenseLLMConfig,
 ) -> dict[str, Any]:
     _clear_cuda(device)
     hbm_before = int(torch.cuda.memory_allocated(device)) if device.type == "cuda" else 0
     rss_before = _process_rss_bytes()
-    weights = make_tiny_dense_weights(config, seed=seed, dtype=dtype)
+    weights = make_dense_weights(config, seed=seed, dtype=dtype)
     if mode == "normal_gpu_resident":
-        model: TinyDenseLLMBase = TorchTinyDenseLLM(
+        model: DenseLLMBase = TorchDenseLLM(
             weights,
             config=config,
             target_mode=target_mode,
@@ -1235,7 +1245,7 @@ def _memory_probe(
             lora_dtype=lora_dtype,
         )
     elif mode == "asym_cpu_resident":
-        model = AsymTinyDenseLLM(
+        model = AsymDenseLLM(
             weights,
             config=config,
             target_mode=target_mode,
@@ -1301,7 +1311,7 @@ def run_memory_comparison(
     lora_seed: int = 31,
     lora_dtype: torch.dtype | str = torch.bfloat16,
     input_seed: int = 32,
-    config: TinyDenseLLMConfig = TinyDenseLLMConfig(),
+    config: DenseLLMConfig = DenseLLMConfig(),
 ) -> dict[str, Any]:
     dev = _device_from_name(str(device) if device is not None else None)
     resolved_dtype = _dtype_from_name(dtype) if isinstance(dtype, str) else dtype
@@ -1428,7 +1438,7 @@ def run_m3_report(
     device: torch.device | str | None = None,
     dtype: torch.dtype | str = torch.bfloat16,
     seed: int = 0,
-    config: TinyDenseLLMConfig = MICRO_DENSE_LLM_CONFIG,
+    config: DenseLLMConfig = MICRO_DENSE_LLM_CONFIG,
 ) -> dict[str, Any]:
     prior_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
     prior_cudnn_tf32 = torch.backends.cudnn.allow_tf32
@@ -1475,7 +1485,7 @@ def run_m3_report(
             config=config,
         )
         report: dict[str, Any] = {
-            "milestone": "M3 Tiny Dense LLM Correctness",
+            "milestone": "M3 Dense LLM Correctness",
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "command_line": sys.argv,
             "backend_requested": backend,
@@ -1486,12 +1496,12 @@ def run_m3_report(
                 or (not torch.backends.cuda.matmul.allow_tf32 and not torch.backends.cudnn.allow_tf32)
             ),
             "config": asdict(config),
-            "parameter_accounting": estimate_tiny_dense_llm_parameters(
+            "parameter_accounting": estimate_dense_llm_parameters(
                 config,
                 target_mode="all",
                 dtype=resolved_dtype,
             ),
-            "showcase_parameter_accounting": estimate_tiny_dense_llm_parameters(
+            "showcase_parameter_accounting": estimate_dense_llm_parameters(
                 SHOWCASE_DENSE_LLM_CONFIG,
                 target_mode="all",
                 dtype=resolved_dtype,
@@ -1521,7 +1531,7 @@ def run_m3_report(
         torch.backends.cudnn.allow_tf32 = prior_cudnn_tf32
 
 
-def run_tiny_dense_llm_case(
+def run_dense_llm_case(
     *,
     backend: str = "asym",
     report_path: Optional[Path] = None,
@@ -1541,7 +1551,7 @@ def run_tiny_dense_llm_case(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", default="asym", choices=["asym", "torch"])
-    parser.add_argument("--report", default="reports/m3_tiny_llm.json")
+    parser.add_argument("--report", default="reports/m3_llm.json")
     parser.add_argument("--device", choices=["cuda", "cpu"], default=None)
     parser.add_argument("--dtype", choices=["bf16", "bfloat16", "fp32", "float32"], default="bf16")
     parser.add_argument("--seed", type=int, default=0)
