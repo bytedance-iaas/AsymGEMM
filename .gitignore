@@ -2,7 +2,6 @@ cmake-build-*
 .idea
 .DS_Store
 build
-tests
 demo
 dist
 *.egg-info
@@ -35,4 +34,3 @@ extern/
 external/
 vendor/
 submodules/
-tests/
