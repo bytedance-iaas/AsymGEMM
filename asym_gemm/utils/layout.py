@@ -1,3 +1,7 @@
+# Copyright (c) 2025 DeepSeek. Licensed under the MIT License.
+# Modified by Bytedance Inc., 2026.
+# Original: https://github.com/deepseek-ai/DeepGEMM
+
 from .._C import (
     get_tma_aligned_size,
     get_mk_alignment_for_contiguous_layout,

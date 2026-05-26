@@ -94,7 +94,7 @@ offsets = torch.tensor(list(itertools.accumulate(token_counts)),
                        dtype=torch.int32, device="cuda")
 experts = torch.arange(num_experts, dtype=torch.int32, device="cuda")
 
-asym_gemm.m_grouped_fp8_asym_gemm_sm80(
+asym_gemm.m_grouped_fp8_asym_gemm_sm89(
     a, b, d, offsets, experts, num_experts,
     scale_a=1.0, scale_b=1.0
 )

@@ -45,7 +45,7 @@ typedef struct {
     float    scale_b;
     const float* scale_a_ptr;   // [total_tokens] per-token scales, or nullptr
     const float* scale_b_ptr;   // [num_experts] per-expert scales, or nullptr
-} SM80MoEFP8Params;
+} SM89MoEFP8Params;
 
 /*
  * Masked FP8 params for SM89 native FP8 MMA.
@@ -70,7 +70,7 @@ typedef struct {
     float    scale_b;
     const float* scale_a_ptr;   // [num_groups * M_max] per-token scales, or nullptr
     const float* scale_b_ptr;   // [num_groups] per-expert scales, or nullptr
-} SM80MoEFP8MaskedParams;
+} SM89MoEFP8MaskedParams;
 
 #ifdef __cplusplus
 }  // namespace asym_gemm

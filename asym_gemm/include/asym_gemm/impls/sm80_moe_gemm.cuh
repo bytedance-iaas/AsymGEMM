@@ -413,7 +413,7 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
 //   divisible by BLOCK_K (which is a multiple of 32).
 // ──────────────────────────────────────────────────────────────────────────────
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t NWARPS>
-__global__ void sm80_moe_fp8_gemm_impl(SM80MoEFP8Params params) {
+__global__ void sm89_moe_fp8_gemm_impl(SM89MoEFP8Params params) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
 
     static_assert(BLOCK_K >= 32,       "BLOCK_K must be >= 32 (SM89 FP8 MMA K-atom)");
@@ -771,7 +771,7 @@ __global__ void sm80_moe_fp8_gemm_impl(SM80MoEFP8Params params) {
 
 #else
     if (blockIdx.x == 0 && threadIdx.x == 0)
-        printf("sm80_moe_fp8_gemm_impl: requires __CUDA_ARCH__ >= 890\n");
+        printf("sm89_moe_fp8_gemm_impl: requires __CUDA_ARCH__ >= 890\n");
 #endif
 }
 
@@ -786,7 +786,7 @@ __global__ void sm80_moe_fp8_gemm_impl(SM80MoEFP8Params params) {
 // expert, then processes only those rows. Experts with 0 valid rows early-exit.
 // ──────────────────────────────────────────────────────────────────────────────
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t NWARPS>
-__global__ void sm80_moe_fp8_gemm_masked_impl(SM80MoEFP8MaskedParams params) {
+__global__ void sm89_moe_fp8_gemm_masked_impl(SM89MoEFP8MaskedParams params) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
 
     static_assert(BLOCK_K >= 32,       "BLOCK_K must be >= 32 (SM89 FP8 MMA K-atom)");
@@ -1102,7 +1102,7 @@ __global__ void sm80_moe_fp8_gemm_masked_impl(SM80MoEFP8MaskedParams params) {
 
 #else
     if (blockIdx.x == 0 && threadIdx.x == 0)
-        printf("sm80_moe_fp8_gemm_masked_impl: requires __CUDA_ARCH__ >= 890\n");
+        printf("sm89_moe_fp8_gemm_masked_impl: requires __CUDA_ARCH__ >= 890\n");
 #endif
 }
 

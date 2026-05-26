@@ -86,7 +86,7 @@ NVFP4 asymmetric grouped GEMM with masked layout.
 
 These kernels use native SM89 FP8 MMA with per-tensor scalar scales. Weights may reside in CPU-pinned memory or GPU HBM.
 
-#### `asym_gemm.m_grouped_fp8_asym_gemm_sm80(a, b, d, offsets, experts, list_size, scale_a=1.0, scale_b=1.0)`
+#### `asym_gemm.m_grouped_fp8_asym_gemm_sm89(a, b, d, offsets, experts, list_size, scale_a=1.0, scale_b=1.0)`
 
 FP8 MoE GEMM with contiguous layout and per-tensor scalar scales.
 
@@ -103,7 +103,7 @@ FP8 MoE GEMM with contiguous layout and per-tensor scalar scales.
 
 **Alignment:** `K % 32 == 0`, `N % 32 == 0`, `K >= 32`.
 
-#### `asym_gemm.m_grouped_fp8_asym_gemm_sm80_masked(a, b, d, masked_m, expected_m, scale_a=1.0, scale_b=1.0)`
+#### `asym_gemm.m_grouped_fp8_asym_gemm_sm89_masked(a, b, d, masked_m, expected_m, scale_a=1.0, scale_b=1.0)`
 
 FP8 MoE GEMM with masked (padded) layout.
 

@@ -105,12 +105,12 @@ static void sm80_m_grouped_moe_gemm_contiguous(
 // ──────────────────────────────────────────────────────────────────────────────
 // FP8 JIT runtime — SM89 native FP8 MMA
 // ──────────────────────────────────────────────────────────────────────────────
-class SM80MoEFP8GemmRuntime final : public LaunchRuntime<SM80MoEFP8GemmRuntime> {
+class SM89MoEFP8GemmRuntime final : public LaunchRuntime<SM89MoEFP8GemmRuntime> {
 public:
     struct Args {
         sm80::SM80GemmConfig gemm_config;
         LaunchArgs           launch_args;
-        SM80MoEFP8Params     params;
+        SM89MoEFP8Params     params;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -120,7 +120,7 @@ public:
 using namespace asym_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(
-        &sm80_moe_fp8_gemm_impl<{}, {}, {}, {}>);
+        &sm89_moe_fp8_gemm_impl<{}, {}, {}, {}>);
 }};
 )",
             c.block_m, c.block_n, c.block_k, c.nwarps);
@@ -132,7 +132,7 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm80_m_grouped_fp8_moe_gemm_contiguous(
+static void sm89_m_grouped_fp8_moe_gemm_contiguous(
     const torch::Tensor& a,
     const torch::Tensor& b,
     const torch::Tensor& d,
@@ -149,7 +149,7 @@ static void sm80_m_grouped_fp8_moe_gemm_contiguous(
                                                    static_cast<int>(N),
                                                    static_cast<int>(K));
 
-    const SM80MoEFP8Params params {
+    const SM89MoEFP8Params params {
         .x_ptr       = a.data_ptr(),
         .w_ptr       = b.data_ptr(),
         .o_ptr       = d.data_ptr(),
@@ -169,7 +169,7 @@ static void sm80_m_grouped_fp8_moe_gemm_contiguous(
 
     const int smem_bytes = sm80::smem_bytes_fp8(cfg.block_m, cfg.block_n, cfg.block_k);
 
-    const SM80MoEFP8GemmRuntime::Args runtime_args {
+    const SM89MoEFP8GemmRuntime::Args runtime_args {
         .gemm_config = cfg,
         .launch_args = LaunchArgs({cfg.grid_x(static_cast<int>(N)), list_size},
                                   cfg.num_threads(),
@@ -177,23 +177,23 @@ static void sm80_m_grouped_fp8_moe_gemm_contiguous(
         .params      = params,
     };
 
-    const std::string kernel_name = fmt::format("sm80_moe_fp8_gemm_bm{}_bn{}_bk{}",
+    const std::string kernel_name = fmt::format("sm89_moe_fp8_gemm_bm{}_bn{}_bk{}",
         cfg.block_m, cfg.block_n, cfg.block_k);
 
-    const auto& code    = SM80MoEFP8GemmRuntime::generate(runtime_args);
+    const auto& code    = SM89MoEFP8GemmRuntime::generate(runtime_args);
     const auto& runtime = compiler->build(kernel_name, code);
-    SM80MoEFP8GemmRuntime::launch(runtime, runtime_args);
+    SM89MoEFP8GemmRuntime::launch(runtime, runtime_args);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Masked FP8 JIT runtime — SM89 native FP8 MMA, padded [G, M_max, K] layout
 // ──────────────────────────────────────────────────────────────────────────────
-class SM80MoEFP8MaskedGemmRuntime final : public LaunchRuntime<SM80MoEFP8MaskedGemmRuntime> {
+class SM89MoEFP8MaskedGemmRuntime final : public LaunchRuntime<SM89MoEFP8MaskedGemmRuntime> {
 public:
     struct Args {
         sm80::SM80GemmConfig gemm_config;
         LaunchArgs           launch_args;
-        SM80MoEFP8MaskedParams params;
+        SM89MoEFP8MaskedParams params;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -203,7 +203,7 @@ public:
 using namespace asym_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(
-        &sm80_moe_fp8_gemm_masked_impl<{}, {}, {}, {}>);
+        &sm89_moe_fp8_gemm_masked_impl<{}, {}, {}, {}>);
 }};
 )",
             c.block_m, c.block_n, c.block_k, c.nwarps);
@@ -215,7 +215,7 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm80_m_grouped_fp8_moe_gemm_masked(
+static void sm89_m_grouped_fp8_moe_gemm_masked(
     const torch::Tensor& a,
     const torch::Tensor& b,
     const torch::Tensor& d,
@@ -231,7 +231,7 @@ static void sm80_m_grouped_fp8_moe_gemm_masked(
                                                    static_cast<int>(N),
                                                    static_cast<int>(K));
 
-    const SM80MoEFP8MaskedParams params {
+    const SM89MoEFP8MaskedParams params {
         .x_ptr       = a.data_ptr(),
         .w_ptr       = b.data_ptr(),
         .o_ptr       = d.data_ptr(),
@@ -250,7 +250,7 @@ static void sm80_m_grouped_fp8_moe_gemm_masked(
 
     const int smem_bytes = sm80::smem_bytes_fp8(cfg.block_m, cfg.block_n, cfg.block_k);
 
-    const SM80MoEFP8MaskedGemmRuntime::Args runtime_args {
+    const SM89MoEFP8MaskedGemmRuntime::Args runtime_args {
         .gemm_config = cfg,
         .launch_args = LaunchArgs({cfg.grid_x(static_cast<int>(N)), num_groups},
                                   cfg.num_threads(),
@@ -258,12 +258,12 @@ static void sm80_m_grouped_fp8_moe_gemm_masked(
         .params      = params,
     };
 
-    const std::string kernel_name = fmt::format("sm80_moe_fp8_gemm_masked_bm{}_bn{}_bk{}",
+    const std::string kernel_name = fmt::format("sm89_moe_fp8_gemm_masked_bm{}_bn{}_bk{}",
         cfg.block_m, cfg.block_n, cfg.block_k);
 
-    const auto& code    = SM80MoEFP8MaskedGemmRuntime::generate(runtime_args);
+    const auto& code    = SM89MoEFP8MaskedGemmRuntime::generate(runtime_args);
     const auto& runtime = compiler->build(kernel_name, code);
-    SM80MoEFP8MaskedGemmRuntime::launch(runtime, runtime_args);
+    SM89MoEFP8MaskedGemmRuntime::launch(runtime, runtime_args);
 }
 
 }  // namespace asym_gemm
