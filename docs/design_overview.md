@@ -10,7 +10,7 @@ Large MoE models (hundreds of billions of parameters) require many GPUs simply t
 
 ### Our Approach
 
-AsymGEMM eliminates this waste by keeping expert weights in CPU DRAM and fetching only active weight tiles into GPU shared memory on demand. The kernel issues direct loads from CPU memory (PCIe `cp.async` on SM89, NVLink-C2C TMA on SM100) — no host-side orchestration, no staging copies, no CPU involvement at runtime. The GPU drives the entire data movement autonomously at hardware-peak bandwidth.
+AsymGEMM eliminates this waste by keeping expert weights in CPU DRAM and fetching only active weight tiles into GPU shared memory on demand. The kernel issues direct loads from CPU memory (PCIe `cp.async` on SM89, NVLink-C2C TMA on SM100) — no host-side orchestration, no staging copies, no CPU involvement at runtime. The GPU drives the entire data movement autonomously at peak hardware bandwidth.
 
 To sustain high compute utilization despite the lower CPU→GPU bandwidth, we designed a **K-outer, M-inner kernel loop** that loads each weight tile exactly once and reuses it across all tokens assigned to that expert. The longer the input sequence, the more compute we extract per byte fetched from CPU — making the GPU nearly as efficient as if the weights were local.
 
@@ -18,7 +18,7 @@ To sustain high compute utilization despite the lower CPU→GPU bandwidth, we de
 
 The result is a fundamentally better cost-performance point for MoE serving:
 
-- **Significantly fewer GPUs** — MoE expert weights are offloaded to CPU DRAM, freeing GPU HBM for activations and KV cache. The GPU count needed to serve large MoE model drops substantially.
+- **Significantly fewer GPUs** — MoE expert weights are offloaded to CPU DRAM, freeing GPU HBM for activations and KV cache. Serving a large MoE model requires substantially fewer GPUs.
 - **Higher per-GPU throughput** — Each GPU spends its compute on active experts rather than wasting HBM bandwidth on idle parameters.
 - **CPU memory becomes a first-class resource** — Servers with large DRAM (which is 10× cheaper per GB than HBM) become viable inference platforms for models previously out of reach.
 
