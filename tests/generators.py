@@ -7,7 +7,7 @@ import random
 import torch
 from typing import Generator, List, Optional, Tuple
 
-from deep_gemm.testing import get_arch_major
+from asym_gemm.testing import get_arch_major
 from asym_gemm.utils import (
     align, ceil_div,
     per_token_cast_to_fp8, per_channel_cast_to_fp8, per_block_cast_to_fp8,
@@ -383,3 +383,63 @@ def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, major_a: Majo
         assert (major_a, major_b) == (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
 
     return k, a_fp8, b_fp8, c, d, ref_d
+
+
+def build_offsets_experts_from_m_indices(m_indices: torch.Tensor, num_groups: int):
+    """Convert 1D expert-id array (contiguous layout) to offset list + expert list.
+
+    Each distinct segment in m_indices (ignoring -1 padding) becomes one entry.
+    offsets[i] is the start row-index of segment i; the last entry is the total M.
+    experts[i] is the expert id for segment i; the last entry is -1 (sentinel).
+    """
+    m_indices_cpu = m_indices.to('cpu', torch.int32).contiguous()
+    m_list = m_indices_cpu.tolist()
+    m = len(m_list)
+    capacity = num_groups + 1
+
+    offsets: list = []
+    experts: list = []
+    if m > 0:
+        if m_list[0] != -1:
+            offsets.append(0)
+            experts.append(m_list[0])
+        for i in range(1, m):
+            if m_list[i] != m_list[i - 1] and m_list[i] != -1:
+                offsets.append(i)
+                experts.append(m_list[i])
+
+    offsets.append(m)
+    experts.append(-1)
+
+    offsets = offsets[:capacity]
+    experts = experts[:capacity]
+    list_size_t = torch.tensor([len(offsets)], dtype=torch.int32, device=m_indices.device)
+    offsets_t   = torch.tensor(offsets, dtype=torch.int32, device=m_indices.device)
+    experts_t   = torch.tensor(experts, dtype=torch.int32, device=m_indices.device)
+    return offsets_t, experts_t, list_size_t
+
+
+def build_offsets_experts_from_masked_m(masked_m: torch.Tensor, num_groups: int, max_m: int,
+                                         block_m: int = 128):
+    """Build start/end offset pairs and expert list for fixed-stride masked GEMM.
+
+    The input tensor 'a' has shape [num_groups, max_m, k]; group g starts at
+    absolute row g * max_m.  Only groups with masked_m[g] > 0 are included.
+    Each active group contributes a (start, end) pair to offsets.
+    """
+    offsets: list = []
+    experts: list = []
+    for g in range(num_groups):
+        v = int(masked_m[g].item())
+        if v > 0:
+            start = g * max_m
+            end   = start + ((v + block_m - 1) // block_m) * block_m
+            offsets.append(start)
+            offsets.append(end)
+            experts.append(g)
+    experts.append(-1)
+    return (
+        torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
+        torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
+        torch.tensor([len(experts)], dtype=torch.int32, device=masked_m.device),
+    )

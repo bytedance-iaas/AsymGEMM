@@ -481,7 +481,7 @@ static void m_grouped_moe_gemm_nt_contiguous(
         element_type_str);
 }
 
-static void m_grouped_fp8_asym_gemm_sm80(
+static void m_grouped_fp8_asym_gemm_sm89(
     const torch::Tensor& a,        // [total_tokens, K]   float8_e4m3fn  (HBM)
     const torch::Tensor& b,        // [num_experts, N, K] float8_e4m3fn  (CPU pinned or HBM)
     const torch::Tensor& d,        // [total_tokens, N]   bfloat16       (HBM)
@@ -521,7 +521,7 @@ static void m_grouped_fp8_asym_gemm_sm80(
     DG_HOST_ASSERT(K % 32 == 0 && K >= 32);   // SM89 FP8 MMA K-atom = 32
     DG_HOST_ASSERT(N % 32 == 0);
 
-    sm80_m_grouped_fp8_moe_gemm_contiguous(
+    sm89_m_grouped_fp8_moe_gemm_contiguous(
         a, b, d, experts, offsets,
         N, K,
         static_cast<int32_t>(num_experts),
@@ -530,7 +530,7 @@ static void m_grouped_fp8_asym_gemm_sm80(
         scale_a_tensor, scale_b_tensor);
 }
 
-static void m_grouped_fp8_asym_gemm_sm80_masked(
+static void m_grouped_fp8_asym_gemm_sm89_masked(
     const torch::Tensor& a,        // [num_groups, M_max, K]  float8_e4m3fn
     const torch::Tensor& b,        // [num_groups, N, K]      float8_e4m3fn
     const torch::Tensor& d,        // [num_groups, M_max, N]  bfloat16
@@ -567,7 +567,7 @@ static void m_grouped_fp8_asym_gemm_sm80_masked(
     DG_HOST_ASSERT(K % 32 == 0 && K >= 32);
     DG_HOST_ASSERT(N % 32 == 0);
 
-    sm80_m_grouped_fp8_moe_gemm_masked(
+    sm89_m_grouped_fp8_moe_gemm_masked(
         a, b, d, masked_m,
         M_max, N, K,
         static_cast<int32_t>(num_groups),
@@ -642,13 +642,13 @@ static void register_apis(pybind11::module_& m) {
 #endif
 
     // SM89 FP8 MoE GEMM — masked variant (padded [G, M_max, K] layout)
-    m.def("m_grouped_fp8_asym_gemm_sm80_masked",
+    m.def("m_grouped_fp8_asym_gemm_sm89_masked",
           static_cast<void(*)(const torch::Tensor&, const torch::Tensor&,
                               const torch::Tensor&, const torch::Tensor&,
                               const int&, const float&, const float&,
                               const std::optional<torch::Tensor>&,
                               const std::optional<torch::Tensor>&)>(
-              &m_grouped_fp8_asym_gemm_sm80_masked),
+              &m_grouped_fp8_asym_gemm_sm89_masked),
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("masked_m"), py::arg("expected_m"),
           py::arg("scale_a") = 1.0f,
@@ -657,14 +657,14 @@ static void register_apis(pybind11::module_& m) {
           py::arg("scale_b_tensor") = py::none());
 
     // SM89 FP8 MoE GEMM (native FP8 MMA, K-outer M-inner, W may be CPU-pinned)
-    m.def("m_grouped_fp8_asym_gemm_sm80",
+    m.def("m_grouped_fp8_asym_gemm_sm89",
           static_cast<void(*)(const torch::Tensor&, const torch::Tensor&,
                               const torch::Tensor&, const torch::Tensor&,
                               const torch::Tensor&, const int&,
                               const float&, const float&,
                               const std::optional<torch::Tensor>&,
                               const std::optional<torch::Tensor>&)>(
-              &m_grouped_fp8_asym_gemm_sm80),
+              &m_grouped_fp8_asym_gemm_sm89),
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
           py::arg("scale_a") = 1.0f,
