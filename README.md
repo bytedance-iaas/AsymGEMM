@@ -41,9 +41,9 @@ at install time.
 - **K-outer M-inner scheduling**: each weight tile is fetched once from CPU DRAM and reused
   across all tokens assigned to that expert, amortizing the fetch cost.
 - **asymScheduler**: a per-expert CTA ownership model that eliminates atomic contention and
-  maximises utilization of the CPU–GPU interconnect, whether NVLink-C2C or PCIe.
+  maximizes utilization of the CPU-GPU interconnect, whether NVLink-C2C or PCIe.
 - **JIT compilation**: kernels are compiled on first call and cached under `~/.asym_gemm`
-  (overrideable via `DG_JIT_CACHE_DIR`); no ahead-of-time build step.
+  (overridable via `DG_JIT_CACHE_DIR`); no ahead-of-time build step.
 - **Flexible deployment**: runs on high-end Blackwell Superchips (GB200 NVL72) over NVLink-C2C
   and on consumer-grade Ada Lovelace GPUs (RTX 4090) over PCIe, covering a wide range of
   deployment environments.
@@ -59,7 +59,7 @@ clusters. By keeping all expert weight matrices in CPU DRAM and fetching them on
 a single GPU can serve models such as **DeepSeek V3** and **Qwen3-235B** that would
 otherwise require expensive multi-node tensor-parallel setups.
 
-### Prefill-Optimised Inference
+### Prefill-Optimized Inference
 
 AsymGEMM is primarily designed for the **prefill phase**, where the token batch is large
 enough to amortize the cost of fetching each weight tile from CPU DRAM across many tokens.
@@ -78,7 +78,7 @@ changing the calling API.
 The same library runs on:
 - **GB200 NVL72** (Blackwell Superchip) — weights fetched via NVLink-C2C at ≥ 900 GB/s.
 - **RTX 4090** (Ada Lovelace, consumer PCIe) — weights fetched via PCIe, making asymmetric
-  inference accessible without dedicated data-centre hardware.
+  inference accessible without dedicated data-center hardware.
 
 ---
 
@@ -117,41 +117,39 @@ The same library runs on:
 
 ### Installation
 
-We use [UV](https://docs.astral.sh/uv/) to manage the Python environment.
-
 ```bash
 # Clone with submodules (CUTLASS, fmt)
 git clone --recurse-submodules https://github.com/bytedance-iaas/AsymGEMM.git
 cd AsymGEMM
 
-# Create virtual environment and install
-uv sync
+# Create and activate a virtual environment
+python3 -m venv .venv
 source .venv/bin/activate
 
-# Verify
-python -c "import asym_gemm; print('AsymGEMM', asym_gemm.__version__)"
+# Install AsymGEMM
+bash scripts/install.sh
 ```
+
+`scripts/install.sh` installs dependencies from `requirements.txt`, cleans previous local build
+artifacts, installs AsymGEMM in editable mode, and verifies that `asym_gemm` can be imported.
 
 Kernels are compiled on first use and cached in `~/.asym_gemm/` (override with
 `DG_JIT_CACHE_DIR`). The initial call for a new shape/dtype combination may take a few seconds.
 
 ### Running the Tests
 
+The tests require a CUDA-capable machine with a supported NVIDIA GPU.
+
 ```bash
-cd tests/
+bash scripts/test.sh
 
-# FP8 asymmetric GEMM — contiguous + masked, correctness + throughput
-python test_fp8_asym_gemm.py
-
-# BF16 asymmetric GEMM
-python test_bf16_asym_gemm.py
-
-# FP4 (NVFP4) asymmetric GEMM
-python test_fp4_asym_gemm.py
-
-# SM89 MoE path
-python test_sm89_moe.py
 ```
+
+### Running with SGLang
+
+AsymGEMM integrates with a downstreaming fork of [SGLang](https://github.com/bytedance-iaas/sglang/tree/asym_gemm_integration) as a MoE runner backend.
+
+Please refer to [Quick Start](docs/quick_start.md) for detailed instructions.
 
 ---
 
@@ -193,7 +191,7 @@ The CTA grid has shape `(ceil(N / BLOCK_N), num_active_experts)` — the M dimen
 from the grid. Each CTA owns a fixed **(N-tile, expert)** pair and iterates over the full M
 extent for its expert by reading the token range from the `offsets/experts` pair list. This
 design eliminates atomic contention between CTAs and ensures each CTA fetches weight tiles only
-for its assigned expert, maximising reuse.
+for its assigned expert, maximizing reuse.
 
 ### Token Layout Protocols
 
@@ -385,7 +383,7 @@ AsymGEMM builds on the following open-source projects:
 
 ## License
 
-AsymGEMM is released under the [MIT License](LICENSE).  
+AsymGEMM is released under the [MIT License](LICENSE).
 Copyright © 2026 Bytedance Inc.
 
 Files adapted from DeepGEMM retain their original copyright notice:
