@@ -157,7 +157,7 @@ FP8 tensor contraction (einsum-style interface).
 | `SGLANG_ENABLE_JIT_ASYMGEMM` | `True` | Enable AsymGEMM JIT compilation in SGLang |
 | `SGLANG_JIT_ASYMGEMM_PRECOMPILE` | `True` | Pre-compile kernel variants at startup |
 | `SGLANG_JIT_ASYMGEMM_FAST_WARMUP` | `False` | Faster but less thorough precompile |
-| `SGLANG_AG_CACHE_DIR` | `~/.asym_gemm/cache/` | JIT kernel cache directory |
+| `DG_JIT_CACHE_DIR` | `~/.asym_gemm/` | JIT kernel cache directory |
 | `SGLANG_MASKED_GEMM_CHUNK_SIZE` | `0` | Expert group chunk size (0 = no chunking) |
 | `SGLANG_MASKED_GEMM_FAST_ACT` | `False` | Fused SiLU + quantization path |
 | `SGLANG_ASYMGEMM_SANITY_CHECK` | `False` | Enable input validation checks |

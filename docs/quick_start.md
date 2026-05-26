@@ -2,10 +2,10 @@
 
 ## Requirements
 
-- NVIDIA GPU: SM80 (A100), SM89 (RTX 4090 / L40S), or SM100 (GB200)
+- NVIDIA GPU: SM89 (RTX 4090 / L40S) or SM100 (GB200)
 - Python 3.8+
 - C++17 compiler
-- CUDA Toolkit 12.1+ (SM100 kernels require CUDA 12.8+)
+- CUDA Toolkit 12.1+ for SM89; CUDA Toolkit 12.9+ for SM100 / FP4
 - PyTorch 2.1+
 - CUTLASS (included as Git submodule)
 
@@ -16,15 +16,16 @@
 git clone --recurse-submodules https://github.com/bytedance-iaas/AsymGEMM.git
 cd AsymGEMM
 
-# Install
-bash install.sh
+# Create and activate a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install AsymGEMM
+bash scripts/install.sh
 ```
 
-Verify:
-
-```bash
-python -c "import asym_gemm; print(asym_gemm.__version__)"
-```
+`scripts/install.sh` installs dependencies from `requirements.txt`, cleans previous local build
+artifacts, installs AsymGEMM in editable mode, and verifies that `asym_gemm` can be imported.
 
 ## Usage with SGLang
 
@@ -108,9 +109,9 @@ pytest tests/ -v
 
 ## JIT Compilation Notes
 
-The first call to any kernel variant triggers JIT compilation via NVCC (~5–30 seconds depending on complexity). Compiled CUBINs are cached at `~/.asym_gemm/cache/` — subsequent calls with the same configuration are near-instant.
+The first call to any kernel variant triggers JIT compilation via NVRTC (~5–30 seconds depending on complexity). Compiled kernels are cached under `~/.asym_gemm/` — subsequent calls with the same configuration are near-instant.
 
-To pre-compile kernels at server startup (recommended for production):
+To precompile kernels at server startup (recommended for production):
 
 ```bash
 # SGLang handles this automatically with:
