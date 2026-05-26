@@ -11,4 +11,8 @@ fi
 
 export PYTHONPATH="$ROOT_DIR:$TEST_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
-python tests/generators.py
+shopt -s nullglob
+for test_file in tests/test*.py; do
+  python "$test_file"
+done
+shopt -u nullglob
