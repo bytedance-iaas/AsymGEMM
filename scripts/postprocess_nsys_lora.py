@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Postprocess an Nsight Systems SQLite export for LoRA-SFT profiling.
 
-Run the workload with `scripts/profile_lora.py --timing-mode profile` or
+Run the workload with `scripts/profile_lora_e2e.py --timing-mode profile` or
 with the same `asym_gemm.training.profile_ranges.prof_range()` NVTX labels in a
 larger integration such as LLaMA-Factory.  This postprocessor reads the Nsight
 Systems database and reports, per `step.forward` / `step.backward`:
@@ -17,7 +17,9 @@ Systems database and reports, per `step.forward` / `step.backward`:
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
+import heapq
 import json
 import re
 import sqlite3
@@ -68,6 +70,33 @@ def _overlap_ns(start: int, end: int, intervals: list[tuple[int, int]]) -> int:
         if overlap > 0:
             total += overlap
     return total
+
+
+def _overlap_query(intervals: list[tuple[int, int]]):
+    merged = _merged_intervals(intervals)
+    starts = [start for start, _ in merged]
+    ends = [end for _, end in merged]
+    prefix = [0]
+    for start, end in merged:
+        prefix.append(prefix[-1] + end - start)
+
+    def query(start: int, end: int) -> int:
+        if end <= start or not merged:
+            return 0
+        left = bisect_right(ends, start)
+        right = bisect_left(starts, end)
+        if left >= right:
+            return 0
+        total = prefix[right] - prefix[left]
+        first_start, first_end = merged[left]
+        if first_start < start:
+            total -= min(first_end, end) - first_start
+        last_start, last_end = merged[right - 1]
+        if last_end > end:
+            total -= last_end - max(last_start, start)
+        return max(0, total)
+
+    return query
 
 
 def _percent(value: float, total: float) -> float:
@@ -690,45 +719,62 @@ def _sync_intervals(con: sqlite3.Connection, start: int, end: int) -> list[tuple
 def _correlated_intervals(con: sqlite3.Connection, table: str, correlation_ids: set[int]) -> list[tuple[int, int]]:
     if not correlation_ids or not _table_exists(con, table):
         return []
-    placeholders = ",".join("?" for _ in correlation_ids)
-    return [
-        (int(s), int(e))
-        for s, e in con.execute(
+    rows: list[tuple[int, int]] = []
+    ids = list(correlation_ids)
+    for offset in range(0, len(ids), 900):
+        chunk = ids[offset : offset + 900]
+        placeholders = ",".join("?" for _ in chunk)
+        rows.extend(
+            (int(s), int(e))
+            for s, e in con.execute(
             f"select start,end from {table} where correlationId in ({placeholders})",
-            tuple(correlation_ids),
+                tuple(chunk),
+            )
         )
-    ]
+    return rows
 
 
 def _kernel_events(con: sqlite3.Connection, correlation_ids: set[int]) -> list[dict[str, Any]]:
     if not correlation_ids or not _table_exists(con, "CUPTI_ACTIVITY_KIND_KERNEL"):
         return []
-    placeholders = ",".join("?" for _ in correlation_ids)
-    query = f"""
-        select k.start,k.end,k.correlationId,coalesce(s.value, '<unknown>')
-        from CUPTI_ACTIVITY_KIND_KERNEL k
-        left join StringIds s on s.id = k.demangledName
-        where k.correlationId in ({placeholders})
-        order by k.start
-    """
-    return [
-        {"start": int(start), "end": int(end), "correlation_id": int(corr), "name": str(name)}
-        for start, end, corr, name in con.execute(query, tuple(correlation_ids))
-    ]
+    rows: list[dict[str, Any]] = []
+    ids = list(correlation_ids)
+    for offset in range(0, len(ids), 900):
+        chunk = ids[offset : offset + 900]
+        placeholders = ",".join("?" for _ in chunk)
+        query = f"""
+            select k.start,k.end,k.correlationId,coalesce(s.value, '<unknown>')
+            from CUPTI_ACTIVITY_KIND_KERNEL k
+            left join StringIds s on s.id = k.demangledName
+            where k.correlationId in ({placeholders})
+            order by k.start
+        """
+        rows.extend(
+            {"start": int(start), "end": int(end), "correlation_id": int(corr), "name": str(name)}
+            for start, end, corr, name in con.execute(query, tuple(chunk))
+        )
+    rows.sort(key=lambda row: int(row["start"]))
+    return rows
 
 
 def _kernel_name_rows(con: sqlite3.Connection, correlation_ids: set[int]) -> dict[str, float]:
     if not correlation_ids or not _table_exists(con, "CUPTI_ACTIVITY_KIND_KERNEL"):
         return {}
-    placeholders = ",".join("?" for _ in correlation_ids)
-    query = f"""
-        select coalesce(s.value, '<unknown>'), sum(k.end-k.start)/1000000.0
-        from CUPTI_ACTIVITY_KIND_KERNEL k
-        left join StringIds s on s.id = k.demangledName
-        where k.correlationId in ({placeholders})
-        group by s.value
-    """
-    return {str(name): float(ms or 0.0) for name, ms in con.execute(query, tuple(correlation_ids))}
+    values: dict[str, float] = defaultdict(float)
+    ids = list(correlation_ids)
+    for offset in range(0, len(ids), 900):
+        chunk = ids[offset : offset + 900]
+        placeholders = ",".join("?" for _ in chunk)
+        query = f"""
+            select coalesce(s.value, '<unknown>'), sum(k.end-k.start)/1000000.0
+            from CUPTI_ACTIVITY_KIND_KERNEL k
+            left join StringIds s on s.id = k.demangledName
+            where k.correlationId in ({placeholders})
+            group by s.value
+        """
+        for name, ms in con.execute(query, tuple(chunk)):
+            values[str(name)] += float(ms or 0.0)
+    return dict(values)
 
 
 def _enclosing_range(gap_start: int, gap_end: int, ranges: list[tuple[int, int, str]], fallback: str) -> str:
@@ -742,6 +788,34 @@ def _enclosing_range(gap_start: int, gap_end: int, ranges: list[tuple[int, int, 
         return fallback
     enclosing.sort(key=lambda item: item[0])
     return enclosing[0][1]
+
+
+def _enclosing_ranges_for_intervals(
+    intervals: list[tuple[int, int]],
+    ranges: list[tuple[int, int, str]],
+    fallback: str,
+) -> list[str]:
+    if not intervals:
+        return []
+    prepared = sorted(
+        (start, end, end - start, name)
+        for start, end, text in ranges
+        if end > start and (name := _normalize_range_name(text)) is not None
+    )
+    indexed_intervals = sorted(enumerate(intervals), key=lambda item: item[1][0])
+    names = [fallback] * len(intervals)
+    active: list[tuple[int, int, str]] = []
+    range_idx = 0
+    for interval_idx, (start, end) in indexed_intervals:
+        while range_idx < len(prepared) and prepared[range_idx][0] <= start:
+            _, range_end, duration, name = prepared[range_idx]
+            heapq.heappush(active, (duration, range_end, name))
+            range_idx += 1
+        while active and active[0][1] < end:
+            heapq.heappop(active)
+        if active:
+            names[interval_idx] = active[0][2]
+    return names
 
 
 def _kernel_before(kernel_events: list[dict[str, Any]], gap_start: int) -> str:
@@ -784,21 +858,36 @@ def _no_kernel_gaps(
     if cursor < stage_end:
         gaps.append((cursor, stage_end))
 
-    runtime_intervals = [(start, end) for start, end, _ in runtime]
+    runtime_overlap = _overlap_query([(start, end) for start, end, _ in runtime])
+    sync_overlap = _overlap_query(sync_intervals)
+    gap_names = _enclosing_ranges_for_intervals(gaps, ranges, stage_name)
+    ended_kernels = sorted((int(event["end"]), str(event["name"])) for event in kernel_events)
+    started_kernels = sorted((int(event["start"]), str(event["name"])) for event in kernel_events)
+    ended_times = [end for end, _ in ended_kernels]
+    started_times = [start for start, _ in started_kernels]
+
+    def kernel_before(gap_start: int) -> str:
+        idx = bisect_right(ended_times, gap_start) - 1
+        return ended_kernels[idx][1] if idx >= 0 else "<stage_start>"
+
+    def kernel_after(gap_end: int) -> str:
+        idx = bisect_left(started_times, gap_end)
+        return started_kernels[idx][1] if idx < len(started_kernels) else "<stage_end>"
+
     rows: list[dict[str, Any]] = []
-    for gap_start, gap_end in gaps:
+    for (gap_start, gap_end), gap_name in zip(gaps, gap_names):
         gap_ms = _ms(gap_end - gap_start)
         if gap_ms <= 0.0:
             continue
         rows.append(
             {
-                "previous_kernel": _kernel_before(kernel_events, gap_start),
-                "next_kernel": _kernel_after(kernel_events, gap_end),
+                "previous_kernel": kernel_before(gap_start),
+                "next_kernel": kernel_after(gap_end),
                 "gap_milliseconds": gap_ms,
                 "percent": _percent(gap_ms, total_ms),
-                "enclosing_nvtx": _enclosing_range(gap_start, gap_end, ranges, stage_name),
-                "cuda_api_overlap_milliseconds": _ms(_overlap_ns(gap_start, gap_end, runtime_intervals)),
-                "sync_overlap_milliseconds": _ms(_overlap_ns(gap_start, gap_end, sync_intervals)),
+                "enclosing_nvtx": gap_name,
+                "cuda_api_overlap_milliseconds": _ms(runtime_overlap(gap_start, gap_end)),
+                "sync_overlap_milliseconds": _ms(sync_overlap(gap_start, gap_end)),
                 "start_offset_milliseconds": _ms(gap_start - stage_start),
                 "end_offset_milliseconds": _ms(gap_end - stage_start),
             }
@@ -827,16 +916,19 @@ def summarize_stage(con: sqlite3.Connection, stage_name: str) -> dict[str, Any]:
     op_kernel: dict[str, float] = defaultdict(float)
     op_api: dict[str, float] = defaultdict(float)
     ranges = _fetch_ranges(con, prefix)
-    runtime_operations = _runtime_operation_map(runtime, ranges, stage_name)
-    for r_start, r_end, text in ranges:
-        if r_start < start or r_end > end:
-            continue
-        name = _normalize_range_name(text)
-        if name is None or name == stage_name:
-            continue
-        corr = {corr for s, e, corr in runtime if s >= r_start and e <= r_end}
-        op_api[name] += _ms(sum(e - s for s, e, corr_id in runtime if corr_id in corr))
-        op_kernel[name] += _ms(_interval_union(_correlated_intervals(con, "CUPTI_ACTIVITY_KIND_KERNEL", corr)))
+    runtime_names = _enclosing_ranges_for_intervals([(s, e) for s, e, _ in runtime], ranges, stage_name)
+    runtime_operations = {int(corr): name for (_, _, corr), name in zip(runtime, runtime_names)}
+    for start_ns, end_ns, corr in runtime:
+        name = runtime_operations.get(int(corr), stage_name)
+        if name != stage_name:
+            op_api[name] += _ms(end_ns - start_ns)
+    op_kernel_intervals: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for event in kernel_events:
+        name = runtime_operations.get(int(event["correlation_id"]), stage_name)
+        if name != stage_name:
+            op_kernel_intervals[name].append((int(event["start"]), int(event["end"])))
+    for name, intervals in op_kernel_intervals.items():
+        op_kernel[name] += _ms(_interval_union(intervals))
 
     no_kernel_gap_rows = _no_kernel_gaps(
         stage_start=start,
@@ -1497,7 +1589,7 @@ def _overall_memory_markdown(source_profile: dict[str, Any]) -> list[str]:
         return [
             "## Overall Memory Summary",
             "",
-            "No source memory report found. Rerun the profile with the current `scripts/profile_lora.py` and postprocess with `--source-profile-json` or `--source-profile-dir`.",
+            "No source memory report found. Rerun the profile with the current `scripts/profile_lora_e2e.py` and postprocess with `--source-profile-json` or `--source-profile-dir`.",
             "",
         ]
     gpu = memory.get("gpu", {}) if isinstance(memory.get("gpu", {}), dict) else {}

@@ -24,6 +24,10 @@ if _TORCH_GROUPED_MM is None:
 if _TORCH_GROUPED_MM is None:
     raise RuntimeError("PyTorch grouped torch baseline requires torch.nn.functional.grouped_mm or torch._grouped_mm")
 
+_SINGLE_GROUP_LAUNCH_TENSOR_CACHE: dict[
+    tuple[str, int], tuple[torch.Tensor, torch.Tensor]
+] = {}
+
 
 @dataclass(frozen=True)
 class AsymCapability:
@@ -468,6 +472,23 @@ def _unpad_grouped_output(
     return out
 
 
+def _single_group_launch_tensors(
+    device: torch.device, m: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (str(device), int(m))
+    cached = _SINGLE_GROUP_LAUNCH_TENSOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "single-group AsymGEMM launch tensors must be initialized before CUDA graph capture"
+        )
+    offsets = torch.tensor([0, int(m)], device=device, dtype=torch.int32)
+    experts = torch.tensor([0, -1], device=device, dtype=torch.int32)
+    _SINGLE_GROUP_LAUNCH_TENSOR_CACHE[key] = (offsets, experts)
+    return offsets, experts
+
+
 def _asym_bf16_nt(
     a: torch.Tensor,
     b_cpu: torch.Tensor,
@@ -486,8 +507,7 @@ def _asym_bf16_nt(
     # Use FP32 D so multi-K-block kernels reduce partial K tiles in FP32.
     # The public training contract still returns BF16 activations/gradients.
     d = torch.empty((m, n), device=a.device, dtype=torch.float32)
-    offsets = torch.tensor([0, m], device=a.device, dtype=torch.int32)
-    experts = torch.tensor([0, -1], device=a.device, dtype=torch.int32)
+    offsets, experts = _single_group_launch_tensors(a.device, m)
     b_group = b_cpu.unsqueeze(0)
     asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous(
         a, b_group, d, offsets, experts, 2, compiled_dims, transpose_b
@@ -558,8 +578,7 @@ def _asym_quantized_nt(
     a_quantized = _quantize_activation_for_precision(a, precision=precision)
     b_group = (qweight.values.unsqueeze(0), qweight.scales.unsqueeze(0))
     d = torch.empty((m, n), device=a.device, dtype=_quantized_output_dtype(a, precision=precision))
-    offsets = torch.tensor([0, m], device=a.device, dtype=torch.int32)
-    experts = torch.tensor([0, -1], device=a.device, dtype=torch.int32)
+    offsets, experts = _single_group_launch_tensors(a.device, m)
 
     if precision == "fp8":
         asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(

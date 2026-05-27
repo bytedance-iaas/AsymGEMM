@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run LoRA-SFT profiling workloads for AsymGEMM and a GPU-resident Torch baseline."""
+"""Run end-to-end LoRA-SFT profiling workloads for AsymGEMM and a GPU-resident Torch baseline."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from typing import Any, Iterable
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PROFILE_SCRIPT = ROOT / "scripts" / "profile_lora.py"
+PROFILE_SCRIPT = ROOT / "scripts" / "profile_lora_e2e.py"
 NSYS_POSTPROCESS_SCRIPT = ROOT / "scripts" / "postprocess_nsys_lora.py"
 CPU_GAPS_SCRIPT = ROOT / "scripts" / "profile_nsys_cpu_gaps.py"
 NCU_SCRIPT = ROOT / "scripts" / "profile_ncu_asymgemm.py"
@@ -46,7 +46,7 @@ WORKLOADS = (
 WORKLOAD_ALIASES = {
     "toy": ("mlp", "dense", "moe"),
     "custom3b": ("dense_3b", "moe-604m-a75m"),
-    "qwen": ("dense_14b", "moe-604m-a38m"),
+    "qwen": ("dense_14b", "Qwen/Qwen3-30B-A3B"),
     "all": WORKLOADS,
 }
 BACKENDS = ("asym", "torch", "kt")
@@ -58,13 +58,22 @@ NCU_WORKLOADS = {"mm_1b", "mm_3b", "mlp_1b", "mlp_3b", "dense_3b", "dense_14b", 
 @dataclass(frozen=True)
 class WorkloadSpec:
     name: str
-    profile_layers: int | None = None
+    profile_layers: int | str | None = None
 
     @property
     def label(self) -> str:
+        name = _safe_label(self.name)
         if self.profile_layers is None:
-            return self.name
-        return f"{self.name}-l{self.profile_layers}"
+            return name
+        return f"{name}-l{self.profile_layers}"
+
+
+def _is_hf_model_workload(workload: str) -> bool:
+    return "/" in workload
+
+
+def _is_moe_workload(workload: str) -> bool:
+    return workload in KT_MOE_WORKLOADS or _is_hf_model_workload(workload)
 
 
 def _split_tokens(values: Iterable[str]) -> list[str]:
@@ -74,7 +83,7 @@ def _split_tokens(values: Iterable[str]) -> list[str]:
     return tokens
 
 
-def _parse_workload_token(value: str) -> tuple[str, int | None]:
+def _parse_workload_token(value: str) -> tuple[str, int | str | None]:
     if "|" not in value:
         return value, None
     name, layers_text = value.split("|", 1)
@@ -82,12 +91,15 @@ def _parse_workload_token(value: str) -> tuple[str, int | None]:
     layers_text = layers_text.strip()
     if not name or not layers_text:
         raise SystemExit(f"invalid workload layer spec {value!r}; expected workload|layers")
-    try:
-        layers = int(layers_text)
-    except ValueError as exc:
-        raise SystemExit(f"invalid workload layer spec {value!r}; layers must be an integer") from exc
-    if layers <= 0:
-        raise SystemExit(f"invalid workload layer spec {value!r}; layers must be positive")
+    if layers_text.lower() == "all":
+        layers = "all"
+    else:
+        try:
+            layers = int(layers_text)
+        except ValueError as exc:
+            raise SystemExit(f"invalid workload layer spec {value!r}; layers must be a positive integer or 'all'") from exc
+        if layers <= 0:
+            raise SystemExit(f"invalid workload layer spec {value!r}; layers must be positive")
     return name, layers
 
 
@@ -97,11 +109,11 @@ def _expand_workloads(values: Iterable[str]) -> list[WorkloadSpec]:
         name, layers = _parse_workload_token(value)
         if name in WORKLOAD_ALIASES:
             expanded.extend(WorkloadSpec(workload, layers) for workload in WORKLOAD_ALIASES[name])
-        elif name in WORKLOADS:
+        elif name in WORKLOADS or _is_hf_model_workload(name):
             expanded.append(WorkloadSpec(name, layers))
         else:
             allowed = ", ".join((*WORKLOADS, *WORKLOAD_ALIASES))
-            raise SystemExit(f"unknown workload {name!r}; allowed: {allowed}")
+            raise SystemExit(f"unknown workload {name!r}; allowed: {allowed}, or any HF model id containing '/'")
     return list({spec.label: spec for spec in expanded}.values())
 
 
@@ -170,6 +182,10 @@ def _expert_recompute_thresholds(args: argparse.Namespace) -> list[int]:
             )
         thresholds.append(threshold)
     return list(dict.fromkeys(thresholds))
+
+
+def _effective_activation_recompute(requested_activation_recompute: bool, expert_recompute_threshold: int) -> bool:
+    return bool(requested_activation_recompute) and int(expert_recompute_threshold) == 0
 
 
 def _timestamp() -> str:
@@ -252,6 +268,34 @@ def _existing_profile(output_dir: Path) -> tuple[dict[str, Any], Path | None]:
     return profile, profile_path
 
 
+def _profile_config(profile: dict[str, Any]) -> dict[str, Any]:
+    for view in _profile_views(profile):
+        config = view.get("config")
+        if isinstance(config, dict):
+            return config
+    return {}
+
+
+def _existing_profile_matches_request(profile: dict[str, Any], args: argparse.Namespace, workload: str) -> bool:
+    if not _is_moe_workload(workload):
+        return True
+    config = _profile_config(profile)
+    if str(config.get("moe_route_pattern", "")) != str(args.moe_route_pattern):
+        return False
+    if int(config.get("profile_seed", -1)) != int(args.profile_seed):
+        return False
+    if _is_hf_model_workload(workload):
+        if str(config.get("weight_source", "")) != "hf-qwen_moe_block":
+            return False
+        if str(config.get("model_type", "")) != "qwen3_moe":
+            return False
+        if int(config.get("hf_layer_index", -1)) != int(args.hf_layer_index):
+            return False
+    elif str(config.get("weight_source", "")) == "hf-qwen_moe_block":
+        return False
+    return True
+
+
 def _find_markdown(output_dir: Path) -> Path | None:
     candidates = [output_dir / "table.md", *sorted(output_dir.glob("*_profile.md"))]
     for path in candidates:
@@ -267,7 +311,7 @@ def _common_profile_args(
     device: str,
     output_dir: Path,
     *,
-    profile_layers: int,
+    profile_layers: int | str,
 ) -> list[str]:
     profile_args = [
         "--workload",
@@ -282,6 +326,8 @@ def _common_profile_args(
         str(args.measure_steps),
         "--moe-mode",
         args.moe_mode,
+        "--moe-route-pattern",
+        args.moe_route_pattern,
         "--dense-target-mode",
         args.dense_target_mode,
         "--target-modules",
@@ -322,9 +368,17 @@ def _common_profile_args(
         str(args.kt_max_cache_depth),
         "--expert-recompute-threshold",
         str(args.expert_recompute_threshold),
+        "--hf-layer-index",
+        str(args.hf_layer_index),
+        "--profile-seed",
+        str(args.profile_seed),
         "--output-dir",
         str(output_dir),
     ]
+    if args.hf_cache_dir:
+        profile_args.extend(["--hf-cache-dir", str(args.hf_cache_dir)])
+    if bool(getattr(args, "hf_local_files_only", False)):
+        profile_args.append("--hf-local-files-only")
     if bool(getattr(args, "activation_recompute", False)):
         profile_args.append("--activation-recompute")
     return profile_args
@@ -700,7 +754,8 @@ def parse_args() -> argparse.Namespace:
         default=["qwen"],
         help=(
             f"Workload list or aliases. Use workload|layers for per-workload depth, e.g. moe-604m-a75m|2. "
-            f"Workloads: {', '.join(WORKLOADS)}. Aliases: {', '.join(WORKLOAD_ALIASES)}."
+            f"Workloads: {', '.join(WORKLOADS)}. Aliases: {', '.join(WORKLOAD_ALIASES)}. "
+            f"HF model ids are accepted when they contain '/'."
         ),
     )
     parser.add_argument(
@@ -714,15 +769,15 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=["source"],
         help=(
-            "Profiler list or aliases. source=profile_lora.py, nsys=Nsight Systems truth table, "
+            "Profiler list or aliases. source=profile_lora_e2e.py, nsys=Nsight Systems truth table, "
             "cpu=Nsight CPU-gap debug, ncu=Nsight Compute kernel metrics. Alias: all."
         ),
     )
-    parser.add_argument("--device", default="cuda:0", help="Device passed to profile_lora.py when --cuda-devices is not set.")
+    parser.add_argument("--device", default="cuda:0", help="Device passed to profile_lora_e2e.py when --cuda-devices is not set.")
     parser.add_argument(
         "--cuda-devices",
         default="",
-        help="Optional physical CUDA devices, e.g. 2,3,4. Each run gets CUDA_VISIBLE_DEVICES=<id> and profile_lora.py sees cuda:0.",
+        help="Optional physical CUDA devices, e.g. 2,3,4. Each run gets CUDA_VISIBLE_DEVICES=<id> and profile_lora_e2e.py sees cuda:0.",
     )
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measure-steps", type=int, default=20)
@@ -747,7 +802,7 @@ def parse_args() -> argparse.Namespace:
         "--attention-impl",
         choices=["sdpa", "fa2", "fa3", "fa4"],
         default="sdpa",
-        help="Attention implementation passed to profile_lora.py. fa2/fa3/fa4 are placeholders until wired.",
+        help="Attention implementation passed to profile_lora_e2e.py. fa2/fa3/fa4 are placeholders until wired.",
     )
     parser.add_argument(
         "--mode",
@@ -755,6 +810,16 @@ def parse_args() -> argparse.Namespace:
         help="Result filename mode label. Default auto uses <backend-label>_<profiler>, e.g. asym_nsys.",
     )
     parser.add_argument("--moe-mode", choices=["contiguous", "masked"], default="contiguous")
+    parser.add_argument(
+        "--moe-route-pattern",
+        choices=["balanced", "learned"],
+        default="balanced",
+        help="MoE routing used by profiles. balanced is deterministic; learned uses the router so expert counts vary.",
+    )
+    parser.add_argument("--hf-layer-index", type=int, default=0)
+    parser.add_argument("--hf-cache-dir", default="")
+    parser.add_argument("--hf-local-files-only", action="store_true")
+    parser.add_argument("--profile-seed", type=int, default=1234)
     parser.add_argument("--kt-method", default="AMXBF16_SFT", choices=["AMXBF16_SFT", "AMXINT8_SFT", "AMXINT4_SFT"])
     parser.add_argument("--kt-cpu-threads", type=int, default=1)
     parser.add_argument("--kt-threadpool-count", type=int, default=1)
@@ -772,7 +837,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--activation-recompute",
         action="store_true",
-        help="Pass --activation-recompute to profile_lora.py for layer-level activation checkpointing.",
+        help="Pass --activation-recompute to profile_lora_e2e.py for layer-level activation checkpointing.",
     )
     parser.add_argument(
         "--expert-recompute-threshold",
@@ -821,6 +886,7 @@ def main() -> None:
     run_dir = args.output_root / args.run_name if args.run_name else args.output_root
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    requested_activation_recompute = bool(args.activation_recompute)
     rows: list[dict[str, Any]] = []
     commands: list[dict[str, Any]] = []
     task_index = 0
@@ -828,11 +894,12 @@ def main() -> None:
     for workload_spec in workload_specs:
         workload = workload_spec.name
         workload_label = workload_spec.label
-        profile_layers = int(workload_spec.profile_layers or args.profile_layers)
+        profile_layers = workload_spec.profile_layers if workload_spec.profile_layers is not None else int(args.profile_layers)
         for seq_len in seq_lens:
             args.seq_len = seq_len
             for expert_recompute_threshold in expert_recompute_thresholds:
                 args.expert_recompute_threshold = expert_recompute_threshold
+                args.activation_recompute = _effective_activation_recompute(requested_activation_recompute, expert_recompute_threshold)
                 for backend in backends:
                     for profiler in profilers:
                         physical_cuda_device = cuda_devices[task_index % len(cuda_devices)] if cuda_devices else None
@@ -845,10 +912,10 @@ def main() -> None:
 
                         commands_for_task: list[list[str]]
                         skip_reason = ""
-                        if expert_recompute_threshold > 0 and workload not in KT_MOE_WORKLOADS:
+                        if expert_recompute_threshold > 0 and not _is_moe_workload(workload):
                             skip_reason = "per-expert activation recompute thresholds only apply to MoE workloads"
                             commands_for_task = []
-                        elif backend == "kt" and workload not in KT_MOE_WORKLOADS:
+                        elif backend == "kt" and not _is_moe_workload(workload):
                             skip_reason = "backend=kt is only implemented for MoE LoRA SFT workloads"
                             commands_for_task = []
                         elif backend == "kt" and expert_recompute_threshold > 0:
@@ -934,6 +1001,9 @@ def main() -> None:
                             if backend != "asym":
                                 skip_reason = f"ncu only profiles AsymGEMM kernels; backend={backend} has no matching AsymGEMM kernel"
                                 commands_for_task = []
+                            elif _is_hf_model_workload(workload):
+                                skip_reason = "ncu wrapper supports built-in workload names; HF model ids are supported by source/nsys/cpu profiling"
+                                commands_for_task = []
                             elif workload not in NCU_WORKLOADS:
                                 skip_reason = f"ncu wrapper supports {sorted(NCU_WORKLOADS)}, not {workload!r}"
                                 commands_for_task = []
@@ -955,6 +1025,8 @@ def main() -> None:
                                     str(output_dir),
                                     "--moe-mode",
                                     args.moe_mode,
+                                    "--moe-route-pattern",
+                                    args.moe_route_pattern,
                                     "--dense-target-mode",
                                     args.dense_target_mode,
                                     "--target-modules",
@@ -983,7 +1055,15 @@ def main() -> None:
                                     str(args.vocab_rows),
                                     "--expert-recompute-threshold",
                                     str(args.expert_recompute_threshold),
+                                    "--hf-layer-index",
+                                    str(args.hf_layer_index),
+                                    "--profile-seed",
+                                    str(args.profile_seed),
                                 ]
+                                if args.hf_cache_dir:
+                                    ncu_cmd.extend(["--hf-cache-dir", str(args.hf_cache_dir)])
+                                if args.hf_local_files_only:
+                                    ncu_cmd.append("--hf-local-files-only")
                                 if args.ncu_clear_jit_cache:
                                     ncu_cmd.append("--clear-jit-cache")
                                 commands_for_task = [ncu_cmd]
@@ -992,7 +1072,6 @@ def main() -> None:
     
                         command_record = {
                             "workload": workload_label,
-                            "base_workload": workload,
                             "profile_layers": profile_layers,
                             "seq_len": seq_len,
                             "activation_recompute": bool(args.activation_recompute),
@@ -1022,7 +1101,6 @@ def main() -> None:
                             )
                             row["status"] = "skipped"
                             row["skip_reason"] = skip_reason
-                            row["base_workload"] = workload
                             row["profile_layers"] = profile_layers
                             row["seq_len"] = seq_len
                             row["activation_recompute"] = bool(args.activation_recompute)
@@ -1037,28 +1115,29 @@ def main() -> None:
                         if args.skip_existing and not args.overwrite and not args.dry_run and not args.collect_existing:
                             profile, profile_path = _existing_profile(output_dir)
                             if profile_path is not None:
-                                print(f"Skipping existing: {output_dir}", flush=True)
-                                command_record["skipped_existing"] = True
-                                row = _summary_row(
-                                    workload=workload_label,
-                                    backend=backend,
-                                    profiler=profiler,
-                                    device=child_device,
-                                    physical_cuda_device=physical_cuda_device,
-                                    output_dir=output_dir,
-                                    returncode=0,
-                                    profile=profile,
-                                )
-                                row["profile_json"] = str(profile_path)
-                                row["base_workload"] = workload
-                                row["profile_layers"] = profile_layers
-                                row["seq_len"] = seq_len
-                                row["activation_recompute"] = bool(args.activation_recompute)
-                                row["expert_recompute_threshold"] = expert_recompute_threshold
-                                row["skipped_existing"] = True
-                                rows.append(row)
-                                task_index += 1
-                                continue
+                                if _existing_profile_matches_request(profile, args, workload):
+                                    print(f"Skipping existing: {output_dir}", flush=True)
+                                    command_record["skipped_existing"] = True
+                                    row = _summary_row(
+                                        workload=workload_label,
+                                        backend=backend,
+                                        profiler=profiler,
+                                        device=child_device,
+                                        physical_cuda_device=physical_cuda_device,
+                                        output_dir=output_dir,
+                                        returncode=0,
+                                        profile=profile,
+                                    )
+                                    row["profile_json"] = str(profile_path)
+                                    row["profile_layers"] = profile_layers
+                                    row["seq_len"] = seq_len
+                                    row["activation_recompute"] = bool(args.activation_recompute)
+                                    row["expert_recompute_threshold"] = expert_recompute_threshold
+                                    row["skipped_existing"] = True
+                                    rows.append(row)
+                                    task_index += 1
+                                    continue
+                                print(f"Re-running existing with different MoE config: {output_dir}", flush=True)
     
                         if args.collect_existing:
                             profile, profile_path = _load_profile(output_dir)
@@ -1074,7 +1153,6 @@ def main() -> None:
                                 profile=profile,
                             )
                             row["profile_json"] = str(profile_path) if profile_path is not None else None
-                            row["base_workload"] = workload
                             row["profile_layers"] = profile_layers
                             row["seq_len"] = seq_len
                             row["activation_recompute"] = bool(args.activation_recompute)
@@ -1109,7 +1187,6 @@ def main() -> None:
                                 returncode=0,
                                 profile={},
                             )
-                            row["base_workload"] = workload
                             row["profile_layers"] = profile_layers
                             row["expert_recompute_threshold"] = expert_recompute_threshold
                         else:
@@ -1125,7 +1202,6 @@ def main() -> None:
                                 profile=profile,
                             )
                             row["profile_json"] = str(profile_path) if profile_path is not None else None
-                            row["base_workload"] = workload
                             row["profile_layers"] = profile_layers
                             row["expert_recompute_threshold"] = expert_recompute_threshold
                         row["seq_len"] = seq_len
@@ -1165,7 +1241,7 @@ def main() -> None:
     }
     if args.skip_summary:
         failed = [row for row in rows if row["returncode"] != 0]
-        if failed:
+        if failed and not args.continue_on_error:
             raise SystemExit(1)
         return
 
@@ -1185,7 +1261,7 @@ def main() -> None:
     print(f"Wrote {commands_path}")
 
     failed = [row for row in rows if row["returncode"] != 0]
-    if failed:
+    if failed and not args.continue_on_error:
         raise SystemExit(1)
 
 

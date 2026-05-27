@@ -408,7 +408,7 @@ def test_moe_module_activation_recompute_uses_layer_checkpoint(monkeypatch: pyte
     assert bool(torch.isfinite(inputs.grad).all().item())
 
 
-def test_moe_module_expert_threshold_recompute_checkpoints_small_routed_experts(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_moe_module_expert_threshold_recompute_uses_custom_grouped_backward(monkeypatch: pytest.MonkeyPatch) -> None:
     config = MoEConfig(
         num_layers=1,
         num_experts=4,
@@ -459,10 +459,114 @@ def test_moe_module_expert_threshold_recompute_checkpoints_small_routed_experts(
     assert isinstance(output, torch.Tensor)
     _loss(output).backward()
 
-    assert calls == 1
+    assert calls == 0
     lora_grads = [param.grad for name, param in model.named_parameters() if "lora" in name and param.grad is not None]
     assert lora_grads
     assert all(bool(torch.isfinite(grad).all().item()) for grad in lora_grads)
+
+
+def test_moe_module_expert_threshold_recompute_is_disabled_in_eval(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = MoEConfig(
+        num_layers=1,
+        num_experts=4,
+        num_shared_experts=0,
+        top_k=2,
+        vocab_size=64,
+        hidden_size=32,
+        num_heads=4,
+        batch_size=1,
+        seq_len=16,
+        intermediate_size=64,
+        logical_tokens=16,
+        lora_rank=4,
+        lora_alpha=8.0,
+        residual_scale=0.25,
+    )
+    device = torch.device("cpu")
+    dtype = torch.float32
+    calls = 0
+    original_checkpoint = moe_module.checkpoint
+
+    def recording_checkpoint(function: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return original_checkpoint(function, *args, **kwargs)
+
+    monkeypatch.setattr(moe_module, "checkpoint", recording_checkpoint)
+    model, _, _, _ = moe_module.make_moe_pair(
+        config=config,
+        seed=217,
+        device=device,
+        base_dtype=dtype,
+        backend="torch",
+        pin_memory=False,
+        expert_recompute_threshold=5,
+    )
+    model.eval()
+    inputs = _make_input(config, device=device, dtype=dtype, seed=218)
+    output = model(inputs, static_routing=moe_module.make_static_routes(config, device, pattern="skewed"), mode="contiguous")
+
+    assert isinstance(output, torch.Tensor)
+    assert calls == 0
+
+
+def test_moe_module_expert_threshold_recompute_matches_plain_training() -> None:
+    config = MoEConfig(
+        num_layers=1,
+        num_experts=4,
+        num_shared_experts=0,
+        top_k=2,
+        vocab_size=64,
+        hidden_size=32,
+        num_heads=4,
+        batch_size=1,
+        seq_len=16,
+        intermediate_size=64,
+        logical_tokens=16,
+        lora_rank=4,
+        lora_alpha=8.0,
+        residual_scale=0.25,
+    )
+    device = torch.device("cpu")
+    dtype = torch.float32
+    routes = moe_module.make_static_routes(config, device, pattern="skewed")
+    inputs = _make_input(config, device=device, dtype=dtype, seed=219)
+    plain, _, _, _ = moe_module.make_moe_pair(
+        config=config,
+        seed=220,
+        device=device,
+        base_dtype=dtype,
+        backend="torch",
+        pin_memory=False,
+        expert_recompute_threshold=0,
+    )
+    thresholded, _, _, _ = moe_module.make_moe_pair(
+        config=config,
+        seed=220,
+        device=device,
+        base_dtype=dtype,
+        backend="torch",
+        pin_memory=False,
+        expert_recompute_threshold=5,
+    )
+
+    plain_out = plain(inputs, static_routing=routes, mode="contiguous")
+    thresholded_out = thresholded(inputs, static_routing=routes, mode="contiguous")
+    assert isinstance(plain_out, torch.Tensor)
+    assert isinstance(thresholded_out, torch.Tensor)
+    torch.testing.assert_close(thresholded_out, plain_out, rtol=1e-5, atol=1e-5)
+
+    _loss(plain_out).backward()
+    _loss(thresholded_out).backward()
+    plain_params = dict(plain.named_parameters())
+    thresholded_params = dict(thresholded.named_parameters())
+    for name, plain_param in plain_params.items():
+        if "lora" not in name:
+            continue
+        thresholded_grad = thresholded_params[name].grad
+        assert plain_param.grad is not None
+        assert thresholded_grad is not None
+        torch.testing.assert_close(thresholded_grad, plain_param.grad, rtol=1e-5, atol=1e-5)
 
 
 def test_moe_module_asym_base_weights_are_grouped_host_stacks() -> None:

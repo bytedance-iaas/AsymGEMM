@@ -9,11 +9,12 @@ set -Eeuo pipefail
 
 GPU_POOL="0,1,2,3"
 # Per-workload layers can be set as "workload|layers", e.g. "moe-604m-a75m|2".
+# Use "workload|all" to profile the full configured/HF model depth.
 # Dense workload names are total-model labels; MoE workload names are per-layer routed-expert total/active labels.
 # WORKLOADS="mlp_3b,mm_3b,dense_3b,moe-604m-a75m,mlp,dense,moe,dense_14b,moe-604m-a38m"
 # WORKLOADS="dense_3b,moe-604m-a75m|2"
 # WORKLOADS="mlp_3b,mm_3b,dense_3b,moe-604m-a75m|4"
-WORKLOADS="moe-604m-a38m|2"
+WORKLOADS="Qwen/Qwen3-30B-A3B|4"
 # WORKLOADS="mlp,dense,moe"
 BACKENDS="asym,torch"
 # BACKENDS="torch"
@@ -29,12 +30,13 @@ MODE="auto"
 
 WARMUP_STEPS=10
 MEASURE_STEPS=20
-PROFILE_LAYERS=2
+PROFILE_LAYERS=1
 BATCH_SIZE=8
-SEQ_LENS="64,128,256,512,640,768,896,1024,2048,3072,4096,6144,8192,10240,16384,20480"
-# SEQ_LENS="256"
-EXPERT_RECOMPUTE_THRESHOLDS="0"
-# EXPERT_RECOMPUTE_THRESHOLDS="0,16,32,64,128"
+# SEQ_LENS="64,128,256,512,640,768,896,1024,2048,3072,4096,6144,8192,10240,16384,20480"
+SEQ_LENS="1024,2048"
+# These thresholds span the default b8, top_k=8, 128-expert Qwen MoE route
+# counts; learned routing uses the real router so per-expert counts can vary.
+EXPERT_RECOMPUTE_THRESHOLDS="0,128,256,512,768,1024,1536,2048,2560,3072,3584,4096"
 HIDDEN_DIM=1024
 MLP_INTERMEDIATE_DIM=0
 MLP_EXPANSION=4
@@ -42,6 +44,11 @@ LORA_RANK=64
 LORA_ALPHA=128
 VOCAB_ROWS=4096
 MOE_MODE="contiguous"
+MOE_ROUTE_PATTERN="learned"
+HF_LAYER_INDEX=0
+HF_CACHE_DIR=""
+HF_LOCAL_FILES_ONLY=false
+PROFILE_SEED=1234
 DENSE_TARGET_MODE="mlp_only"
 
 KT_METHOD="AMXBF16_SFT"
@@ -55,16 +62,17 @@ PLOT=true
 PLOT_OUTPUT_DIR=""
 RECOMPUTE="both"
 OVERWRITE=false
+CONTINUE_ON_ERROR=true
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PY_DRIVER="${ROOT}/scripts/profile_lora_driver.py"
+PY_DRIVER="${ROOT}/scripts/profile_lora_e2e_driver.py"
 PLOT_RECOMPUTE_SCRIPT="${ROOT}/scripts/plotting/plot_activation_recompute_sweep.py"
 
 usage() {
   cat <<USAGE
 Usage:
-  scripts/profile_lora_driver.sh [options]
+  scripts/profile_lora_e2e_driver.sh [options]
 
 Defaults:
   --gpus ${GPU_POOL}
@@ -73,12 +81,16 @@ Defaults:
   --profilers ${PROFILERS}
   --seq-lens ${SEQ_LENS}
   --expert-recompute-thresholds ${EXPERT_RECOMPUTE_THRESHOLDS}
+  --moe-route-pattern ${MOE_ROUTE_PATTERN}
+  --hf-layer-index ${HF_LAYER_INDEX}
+  --profile-seed ${PROFILE_SEED}
   --recompute ${RECOMPUTE}
   --overwrite ${OVERWRITE}
+  --continue-on-error ${CONTINUE_ON_ERROR}
 
 Shell options:
   --gpus LIST                         Physical GPU pool. Accepts 0,1 or "0 1".
-  --workloads LIST                    Workloads or aliases. Use workload|layers.
+  --workloads LIST                    Workloads, aliases, or HF model ids. Use workload|layers.
   --backends LIST                     asym, torch, kt, or all.
   --profilers LIST                    source, nsys, cpu, ncu, or all.
   --seq-lens LIST                     Sequence lengths. Accepts 64,128 or "64 128".
@@ -90,13 +102,20 @@ Shell options:
   --precision NAME                    Result precision label.
   --attention-impl NAME               Attention implementation: sdpa, fa2, fa3, or fa4.
   --mode NAME                         Result filename mode.
+  --moe-route-pattern balanced|learned MoE routing for profiles.
+  --hf-layer-index N                  Qwen decoder layer used by Qwen MoE workloads.
+  --hf-cache-dir PATH                 Optional Hugging Face cache directory.
+  --hf-local-files-only true|false     Do not download missing Hugging Face files.
+  --profile-seed N                    Seed for generated profiling batches and learned routing.
   --plot true|false                   Write recompute-vs-seq plots after profiling.
   --plot-output-dir PATH              Plot output directory.
   --recompute norecomp|recomp|both     Run without recompute, with recompute, or both.
+                                      Positive expert thresholds run expert-only recompute; layer recompute is only used at threshold 0.
   --overwrite true|false              Re-run completed result dirs. Default false skips them.
+  --continue-on-error true|false      Keep sweeping if a point OOMs or fails. Default true records failed rows.
   -h, --help                          Show this help.
 
-Unknown options are passed through to scripts/profile_lora_driver.py, so common
+Unknown options are passed through to scripts/profile_lora_e2e_driver.py, so common
 driver flags such as --dry-run, --target-modules, and --skip-memory-attribution
 still work here.
 USAGE
@@ -137,7 +156,7 @@ abs_path() {
 }
 
 safe_label() {
-  printf '%s' "$1" | tr -cs '[:alnum:]_-' '_' | sed -e 's/^[_-]*//' -e 's/[_-]*$//'
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]_-' '_' | sed -e 's/^[_-]*//' -e 's/[_-]*$//'
 }
 
 bool_value() {
@@ -168,7 +187,7 @@ expand_workload() {
   case "${base}" in
     toy) printf '%s\n' "mlp${suffix}" "dense${suffix}" "moe${suffix}" ;;
     custom3b) printf '%s\n' "dense_3b${suffix}" "moe-604m-a75m${suffix}" ;;
-    qwen) printf '%s\n' "dense_14b${suffix}" "moe-604m-a38m${suffix}" ;;
+    qwen) printf '%s\n' "dense_14b${suffix}" "Qwen/Qwen3-30B-A3B${suffix}" ;;
     all)
       printf '%s\n' \
         "mlp_1b${suffix}" "mlp_3b${suffix}" "mm_1b${suffix}" "mm_3b${suffix}" \
@@ -182,9 +201,10 @@ expand_workload() {
 
 workload_label() {
   if [[ "$1" == *"|"* ]]; then
-    printf '%s-l%s\n' "${1%%|*}" "${1#*|}"
+    printf '%s-l%s\n' "$(safe_label "${1%%|*}")" "${1#*|}"
   else
-    printf '%s\n' "$1"
+    safe_label "$1"
+    printf '\n'
   fi
 }
 
@@ -290,10 +310,16 @@ run_name="${RUN_NAME}"
 precision="${PRECISION}"
 attention_impl="${ATTENTION_IMPL}"
 mode="${MODE}"
+moe_route_pattern="${MOE_ROUTE_PATTERN}"
+hf_layer_index="${HF_LAYER_INDEX}"
+hf_cache_dir="${HF_CACHE_DIR}"
+hf_local_files_only="$(bool_value "${HF_LOCAL_FILES_ONLY}")"
+profile_seed="${PROFILE_SEED}"
 plot="$(bool_value "${PLOT}")"
 plot_output_dir="${PLOT_OUTPUT_DIR}"
 recompute_spec="${RECOMPUTE}"
 overwrite="$(bool_value "${OVERWRITE}")"
+continue_on_error="$(bool_value "${CONTINUE_ON_ERROR}")"
 dry_run=0
 pass_args=()
 
@@ -317,10 +343,16 @@ while (($#)); do
     --precision=*) precision="${1#*=}"; shift ;;
     --attention-impl=*) attention_impl="${1#*=}"; shift ;;
     --mode=*) mode="${1#*=}"; shift ;;
+    --moe-route-pattern=*) moe_route_pattern="${1#*=}"; shift ;;
+    --hf-layer-index=*) hf_layer_index="${1#*=}"; shift ;;
+    --hf-cache-dir=*) hf_cache_dir="${1#*=}"; shift ;;
+    --hf-local-files-only=*) die "use '--hf-local-files-only true' or '--hf-local-files-only false' instead of --hf-local-files-only=..." ;;
+    --profile-seed=*) profile_seed="${1#*=}"; shift ;;
     --plot=*) die "use '--plot true' or '--plot false' instead of --plot=..." ;;
     --plot-output-dir=*) plot_output_dir="${1#*=}"; shift ;;
     --recompute=*) recompute_spec="${1#*=}"; shift ;;
     --overwrite=*) die "use '--overwrite true' or '--overwrite false' instead of --overwrite=..." ;;
+    --continue-on-error=*) die "use '--continue-on-error true' or '--continue-on-error false' instead of --continue-on-error=..." ;;
     --gpus) collect_values "$1" vals "${@:2}"; gpu_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
     --gpu-pool|--cuda-devices) die "use --gpus; this wrapper keeps one option per setting" ;;
     --workloads) collect_values "$1" vals "${@:2}"; workload_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
@@ -338,10 +370,16 @@ while (($#)); do
     --precision) need_value "$1" "${2-}"; precision="$2"; shift 2 ;;
     --attention-impl) need_value "$1" "${2-}"; attention_impl="$2"; shift 2 ;;
     --mode) need_value "$1" "${2-}"; mode="$2"; shift 2 ;;
+    --moe-route-pattern) need_value "$1" "${2-}"; moe_route_pattern="$2"; shift 2 ;;
+    --hf-layer-index) need_value "$1" "${2-}"; hf_layer_index="$2"; shift 2 ;;
+    --hf-cache-dir) need_value "$1" "${2-}"; hf_cache_dir="$2"; shift 2 ;;
+    --hf-local-files-only) need_value "$1" "${2-}"; hf_local_files_only="$(bool_value "$2")"; shift 2 ;;
+    --profile-seed) need_value "$1" "${2-}"; profile_seed="$2"; shift 2 ;;
     --plot) need_value "$1" "${2-}"; plot="$(bool_value "$2")"; shift 2 ;;
     --plot-output-dir) need_value "$1" "${2-}"; plot_output_dir="$2"; shift 2 ;;
     --recompute) need_value "$1" "${2-}"; recompute_spec="$2"; shift 2 ;;
     --overwrite) need_value "$1" "${2-}"; overwrite="$(bool_value "$2")"; shift 2 ;;
+    --continue-on-error) need_value "$1" "${2-}"; continue_on_error="$(bool_value "$2")"; shift 2 ;;
     --activation-recompute) die "use --recompute recomp; this wrapper keeps one option per setting" ;;
     --) shift; pass_args+=("$@"); break ;;
     *) pass_args+=("$1"); [[ "$1" == "--dry-run" ]] && dry_run=1; shift ;;
@@ -357,6 +395,9 @@ done
 [[ -n "${precision}" ]] || die "--precision cannot be empty"
 [[ -n "${attention_impl}" ]] || die "--attention-impl cannot be empty"
 [[ -n "${mode}" ]] || die "--mode cannot be empty"
+case "${moe_route_pattern}" in balanced|learned) ;; *) die "--moe-route-pattern must be balanced or learned" ;; esac
+[[ "${hf_layer_index}" =~ ^[0-9]+$ ]] || die "--hf-layer-index must be a non-negative integer"
+[[ "${profile_seed}" =~ ^-?[0-9]+$ ]] || die "--profile-seed must be an integer"
 [[ "${jobs_per_gpu}" =~ ^[0-9]+$ && "${jobs_per_gpu}" -gt 0 ]] || die "--jobs-per-gpu must be a positive integer"
 
 mapfile -t gpus < <(parse_gpu_list "${gpu_spec}")
@@ -388,6 +429,9 @@ driver_args=(
   --vocab-rows "${VOCAB_ROWS}"
   --attention-impl "${attention_impl}"
   --moe-mode "${MOE_MODE}"
+  --moe-route-pattern "${moe_route_pattern}"
+  --hf-layer-index "${hf_layer_index}"
+  --profile-seed "${profile_seed}"
   --dense-target-mode "${DENSE_TARGET_MODE}"
   --kt-method "${KT_METHOD}"
   --kt-cpu-threads "${KT_CPU_THREADS}"
@@ -395,11 +439,14 @@ driver_args=(
   --kt-max-cache-depth "${KT_MAX_CACHE_DEPTH}"
   --seq-lens "${seq_lens[@]}"
 )
+[[ -n "${hf_cache_dir}" ]] && driver_args+=(--hf-cache-dir "${hf_cache_dir}")
+((hf_local_files_only)) && driver_args+=(--hf-local-files-only)
 if ((overwrite)); then
   driver_args+=(--overwrite)
 else
   driver_args+=(--skip-existing)
 fi
+((continue_on_error)) && driver_args+=(--continue-on-error)
 
 run_root="$(abs_path "${output_root}")"
 [[ -n "${run_name}" ]] && run_root="${run_root}/${run_name}"
@@ -408,7 +455,7 @@ mkdir -p "${log_dir}"
 manifest="${log_dir}/$(safe_label "${precision}_lora-sft").tsv"
 printf 'status\tpid\tgpu\trecompute\texpert_threshold\tworkload\tbackend\tlog\n' > "${manifest}"
 
-declare -a all_pids=() active_pids=()
+declare -a all_pids=() active_pids=() available_gpus=()
 declare -A pid_gpu=() pid_recompute=() pid_expert_threshold=() pid_workload=() pid_backend=() pid_log=()
 failures=0
 
@@ -425,17 +472,28 @@ trap 'trap - INT TERM EXIT; cleanup_jobs; exit 130' INT TERM
 trap 'status=$?; trap - EXIT; if ((status != 0)); then cleanup_jobs; fi; exit "${status}"' EXIT
 
 finish_one() {
-  local pid="${active_pids[0]}"
+  local pid=""
   local status=0
-  if wait "${pid}"; then
-    echo "Finished pid=${pid} gpu=${pid_gpu[$pid]} recompute=${pid_recompute[$pid]} expert_threshold=${pid_expert_threshold[$pid]} workload=${pid_workload[$pid]} backend=${pid_backend[$pid]}"
+  if wait -n -p pid "${active_pids[@]}"; then
+    status=0
   else
     status=$?
+  fi
+  [[ -n "${pid}" ]] || pid="${active_pids[0]}"
+  if ((status == 0)); then
+    echo "Finished pid=${pid} gpu=${pid_gpu[$pid]} recompute=${pid_recompute[$pid]} expert_threshold=${pid_expert_threshold[$pid]} workload=${pid_workload[$pid]} backend=${pid_backend[$pid]}"
+  else
     failures=$((failures + 1))
     echo "FAILED pid=${pid} status=${status} gpu=${pid_gpu[$pid]} recompute=${pid_recompute[$pid]} expert_threshold=${pid_expert_threshold[$pid]} workload=${pid_workload[$pid]} backend=${pid_backend[$pid]}; log=${pid_log[$pid]}" >&2
   fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${status}" "${pid}" "${pid_gpu[$pid]}" "${pid_recompute[$pid]}" "${pid_expert_threshold[$pid]}" "${pid_workload[$pid]}" "${pid_backend[$pid]}" "${pid_log[$pid]}" >> "${manifest}"
-  active_pids=("${active_pids[@]:1}")
+  local -a remaining=()
+  local active_pid
+  for active_pid in "${active_pids[@]}"; do
+    [[ "${active_pid}" != "${pid}" ]] && remaining+=("${active_pid}")
+  done
+  active_pids=("${remaining[@]}")
+  available_gpus+=("${pid_gpu[$pid]}")
 }
 
 launch_job() {
@@ -479,15 +537,22 @@ launch_job() {
   pid_log[$pid]="${log_file}"
 }
 
-max_parallel=$(( ${#gpus[@]} * jobs_per_gpu ))
-job_index=0
+for gpu in "${gpus[@]}"; do
+  for ((slot = 0; slot < jobs_per_gpu; slot++)); do
+    available_gpus+=("${gpu}")
+  done
+done
 for expert_threshold in "${expert_recompute_thresholds[@]}"; do
   for recompute in "${recompute_modes[@]}"; do
+    if ((expert_threshold > 0)) && [[ "${recompute}" == "recomp" ]]; then
+      continue
+    fi
     for workload in "${workloads[@]}"; do
       for backend in "${backends[@]}"; do
-        while ((${#active_pids[@]} >= max_parallel)); do finish_one; done
-        launch_job "${recompute}" "${expert_threshold}" "${workload}" "${backend}" "${gpus[$((job_index % ${#gpus[@]}))]}"
-        job_index=$((job_index + 1))
+        while ((${#available_gpus[@]} == 0)); do finish_one; done
+        run_gpu="${available_gpus[0]}"
+        available_gpus=("${available_gpus[@]:1}")
+        launch_job "${recompute}" "${expert_threshold}" "${workload}" "${backend}" "${run_gpu}"
       done
     done
   done
@@ -508,6 +573,9 @@ fi
 echo "Writing aggregate summary..."
 for expert_threshold in "${expert_recompute_thresholds[@]}"; do
   for recompute in "${recompute_modes[@]}"; do
+    if ((expert_threshold > 0)) && [[ "${recompute}" == "recomp" ]]; then
+      continue
+    fi
     summary_cmd=(
       "${PYTHON_BIN}" "${PY_DRIVER}"
       --workloads "${workloads[@]}"

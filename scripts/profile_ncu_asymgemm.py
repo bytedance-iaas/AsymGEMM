@@ -81,6 +81,11 @@ def main() -> None:
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--measure-steps", type=int, default=1)
     parser.add_argument("--moe-mode", choices=["contiguous", "masked"], default="contiguous")
+    parser.add_argument("--moe-route-pattern", choices=["balanced", "learned"], default="balanced")
+    parser.add_argument("--hf-layer-index", type=int, default=0)
+    parser.add_argument("--hf-cache-dir", default="")
+    parser.add_argument("--hf-local-files-only", action="store_true")
+    parser.add_argument("--profile-seed", type=int, default=1234)
     parser.add_argument("--target-preset", "--dense-target-mode", dest="dense_target_mode", choices=DENSE_TARGET_MODES, default=DEFAULT_DENSE_TARGET_MODE)
     parser.add_argument("--target-modules", default=DEFAULT_TARGET_MODULES)
     parser.add_argument("--offload-modules", default=DEFAULT_OFFLOAD_MODULES)
@@ -150,7 +155,7 @@ def main() -> None:
     cmd += args.extra_ncu_arg
     cmd += [
         sys.executable,
-        str(ROOT / "scripts/profile_lora.py"),
+        str(ROOT / "scripts/profile_lora_e2e.py"),
         "--workload",
         args.workload,
         "--device",
@@ -163,6 +168,12 @@ def main() -> None:
         str(args.measure_steps),
         "--moe-mode",
         args.moe_mode,
+        "--moe-route-pattern",
+        args.moe_route_pattern,
+        "--hf-layer-index",
+        str(args.hf_layer_index),
+        "--profile-seed",
+        str(args.profile_seed),
         "--dense-target-mode",
         args.dense_target_mode,
         "--target-modules",
@@ -194,6 +205,10 @@ def main() -> None:
         "--output-dir",
         str(source_dir),
     ]
+    if args.hf_cache_dir:
+        cmd.extend(["--hf-cache-dir", str(args.hf_cache_dir)])
+    if args.hf_local_files_only:
+        cmd.append("--hf-local-files-only")
 
     print("Running:", " ".join(cmd), flush=True)
     subprocess.run(cmd, cwd=ROOT, env=env, check=True)

@@ -28,6 +28,8 @@ SUBLINEAR_ALPHA = 0.055
 ROOT_OUTPUT_FILES = (
     "activation_recompute_sweep_index.csv",
     "activation_recompute_sweep_index.json",
+)
+COMBINED_OUTPUT_FILES = (
     "combined_forward_end_memory_vs_seq.png",
     "combined_forward_peak_memory_vs_seq.png",
     "combined_backward_start_memory_vs_seq.png",
@@ -39,6 +41,7 @@ ROOT_OUTPUT_FILES = (
     "combined_backward_start_memory_vs_expert_threshold.png",
     "combined_backward_peak_memory_vs_expert_threshold.png",
     "combined_peak_hbm_vs_expert_threshold.png",
+    "combined_timing_vs_expert_threshold.png",
 )
 GROUP_OUTPUT_FILES = (
     "sweep_summary.csv",
@@ -175,6 +178,30 @@ def numeric_float(value: Any, default: float = 0.0) -> float:
     return default
 
 
+def numeric_int(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float) and math.isfinite(value):
+        return int(value)
+    return default
+
+
+def nested_float(mapping: dict[str, Any], section: str, key: str, default: float = 0.0) -> float:
+    value = mapping.get(section)
+    if not isinstance(value, dict):
+        return default
+    return numeric_float(value.get(key), default)
+
+
+def nested_int(mapping: dict[str, Any], section: str, key: str, default: int = 0) -> int:
+    value = mapping.get(section)
+    if not isinstance(value, dict):
+        return default
+    return numeric_int(value.get(key), default)
+
+
 def to_mib(value: Any) -> float:
     return numeric_float(value) / MIB
 
@@ -229,6 +256,10 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
     meta = parse_result_dir(result_dir)
     if meta is None or not passes_filters(args, meta):
         return None
+    if int(meta["expert_recompute_threshold"]) > 0 and bool(meta["activation_recompute"]):
+        # Current driver semantics reserve layer recompute for threshold 0.
+        # Ignore stale dirs from older runs that combined layer and expert recompute.
+        return None
     profile_path = profile_json_path(result_dir)
     if profile_path is None:
         return None
@@ -241,6 +272,10 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
     if not isinstance(memory_gpu, dict):
         memory_gpu = {}
     batch_size = int(config.get("batch_size", meta["batch_size"]))
+    route_stats = first_dict(profile, "expert_token_distribution")
+    threshold_effect = route_stats.get("threshold_effect", {})
+    if not isinstance(threshold_effect, dict):
+        threshold_effect = {}
     return {
         "workload": meta["workload"],
         "precision": meta["precision"],
@@ -267,6 +302,78 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         "backward_alloc_delta_mib": to_mib(backward.get("avg_allocated_delta_bytes")),
         "backward_local_peak_mib": to_mib(backward.get("avg_local_peak_bytes")),
         "backward_local_peak_delta_mib": to_mib(backward.get("avg_local_peak_delta_bytes")),
+        "route_samples": numeric_int(route_stats.get("samples")),
+        "route_num_tokens": numeric_int(route_stats.get("num_tokens")),
+        "route_top_k": numeric_int(route_stats.get("top_k")),
+        "route_num_experts": numeric_int(route_stats.get("num_experts")),
+        "route_all_expert_tokens_avg": nested_float(route_stats, "all_expert_tokens", "avg"),
+        "route_all_expert_tokens_median": nested_float(route_stats, "all_expert_tokens", "median"),
+        "route_all_expert_tokens_min": nested_int(route_stats, "all_expert_tokens", "min"),
+        "route_all_expert_tokens_max": nested_int(route_stats, "all_expert_tokens", "max"),
+        "route_all_expert_tokens_p0": nested_float(route_stats, "all_expert_tokens", "p0"),
+        "route_all_expert_tokens_p25": nested_float(route_stats, "all_expert_tokens", "p25"),
+        "route_all_expert_tokens_p50": nested_float(route_stats, "all_expert_tokens", "p50"),
+        "route_all_expert_tokens_p75": nested_float(route_stats, "all_expert_tokens", "p75"),
+        "route_all_expert_tokens_p90": nested_float(route_stats, "all_expert_tokens", "p90"),
+        "route_all_expert_tokens_p100": nested_float(route_stats, "all_expert_tokens", "p100"),
+        "route_active_expert_tokens_avg": nested_float(route_stats, "active_expert_tokens", "avg"),
+        "route_active_expert_tokens_median": nested_float(route_stats, "active_expert_tokens", "median"),
+        "route_active_expert_tokens_min": nested_int(route_stats, "active_expert_tokens", "min"),
+        "route_active_expert_tokens_max": nested_int(route_stats, "active_expert_tokens", "max"),
+        "route_active_expert_tokens_p0": nested_float(route_stats, "active_expert_tokens", "p0"),
+        "route_active_expert_tokens_p25": nested_float(route_stats, "active_expert_tokens", "p25"),
+        "route_active_expert_tokens_p50": nested_float(route_stats, "active_expert_tokens", "p50"),
+        "route_active_expert_tokens_p75": nested_float(route_stats, "active_expert_tokens", "p75"),
+        "route_active_expert_tokens_p90": nested_float(route_stats, "active_expert_tokens", "p90"),
+        "route_active_expert_tokens_p100": nested_float(route_stats, "active_expert_tokens", "p100"),
+        "route_active_experts_avg": nested_float(route_stats, "active_experts", "avg"),
+        "route_active_experts_median": nested_float(route_stats, "active_experts", "median"),
+        "route_active_experts_min": nested_int(route_stats, "active_experts", "min"),
+        "route_active_experts_max": nested_int(route_stats, "active_experts", "max"),
+        "route_active_experts_p0": nested_float(route_stats, "active_experts", "p0"),
+        "route_active_experts_p25": nested_float(route_stats, "active_experts", "p25"),
+        "route_active_experts_p50": nested_float(route_stats, "active_experts", "p50"),
+        "route_active_experts_p75": nested_float(route_stats, "active_experts", "p75"),
+        "route_active_experts_p90": nested_float(route_stats, "active_experts", "p90"),
+        "route_active_experts_p100": nested_float(route_stats, "active_experts", "p100"),
+        "route_samples_with_recompute": numeric_int(threshold_effect.get("samples_with_recompute")),
+        "route_samples_all_active_recomputed": numeric_int(threshold_effect.get("samples_all_active_recomputed")),
+        "route_recomputed_experts_avg": numeric_float(threshold_effect.get("recomputed_experts_avg")),
+        "route_recomputed_experts_min": numeric_int(threshold_effect.get("recomputed_experts_min")),
+        "route_recomputed_experts_max": numeric_int(threshold_effect.get("recomputed_experts_max")),
+        "route_recomputed_experts_p0": numeric_float(threshold_effect.get("recomputed_experts_p0")),
+        "route_recomputed_experts_p25": numeric_float(threshold_effect.get("recomputed_experts_p25")),
+        "route_recomputed_experts_p50": numeric_float(threshold_effect.get("recomputed_experts_p50")),
+        "route_recomputed_experts_p75": numeric_float(threshold_effect.get("recomputed_experts_p75")),
+        "route_recomputed_experts_p90": numeric_float(threshold_effect.get("recomputed_experts_p90")),
+        "route_recomputed_experts_p100": numeric_float(threshold_effect.get("recomputed_experts_p100")),
+        "route_kept_experts_avg": numeric_float(threshold_effect.get("kept_experts_avg")),
+        "route_kept_experts_min": numeric_int(threshold_effect.get("kept_experts_min")),
+        "route_kept_experts_max": numeric_int(threshold_effect.get("kept_experts_max")),
+        "route_kept_experts_p0": numeric_float(threshold_effect.get("kept_experts_p0")),
+        "route_kept_experts_p25": numeric_float(threshold_effect.get("kept_experts_p25")),
+        "route_kept_experts_p50": numeric_float(threshold_effect.get("kept_experts_p50")),
+        "route_kept_experts_p75": numeric_float(threshold_effect.get("kept_experts_p75")),
+        "route_kept_experts_p90": numeric_float(threshold_effect.get("kept_experts_p90")),
+        "route_kept_experts_p100": numeric_float(threshold_effect.get("kept_experts_p100")),
+        "route_recomputed_routes_avg": numeric_float(threshold_effect.get("recomputed_routes_avg")),
+        "route_recomputed_routes_min": numeric_int(threshold_effect.get("recomputed_routes_min")),
+        "route_recomputed_routes_max": numeric_int(threshold_effect.get("recomputed_routes_max")),
+        "route_recomputed_routes_p0": numeric_float(threshold_effect.get("recomputed_routes_p0")),
+        "route_recomputed_routes_p25": numeric_float(threshold_effect.get("recomputed_routes_p25")),
+        "route_recomputed_routes_p50": numeric_float(threshold_effect.get("recomputed_routes_p50")),
+        "route_recomputed_routes_p75": numeric_float(threshold_effect.get("recomputed_routes_p75")),
+        "route_recomputed_routes_p90": numeric_float(threshold_effect.get("recomputed_routes_p90")),
+        "route_recomputed_routes_p100": numeric_float(threshold_effect.get("recomputed_routes_p100")),
+        "route_kept_routes_avg": numeric_float(threshold_effect.get("kept_routes_avg")),
+        "route_kept_routes_min": numeric_int(threshold_effect.get("kept_routes_min")),
+        "route_kept_routes_max": numeric_int(threshold_effect.get("kept_routes_max")),
+        "route_kept_routes_p0": numeric_float(threshold_effect.get("kept_routes_p0")),
+        "route_kept_routes_p25": numeric_float(threshold_effect.get("kept_routes_p25")),
+        "route_kept_routes_p50": numeric_float(threshold_effect.get("kept_routes_p50")),
+        "route_kept_routes_p75": numeric_float(threshold_effect.get("kept_routes_p75")),
+        "route_kept_routes_p90": numeric_float(threshold_effect.get("kept_routes_p90")),
+        "route_kept_routes_p100": numeric_float(threshold_effect.get("kept_routes_p100")),
         "output_dir": str(result_dir),
         "profile_json": str(profile_path),
     }
@@ -370,13 +477,20 @@ def write_table(rows: list[dict[str, Any]], output_dir: Path, name: str) -> None
 def clean_output_dir(output_dir: Path) -> None:
     if not output_dir.exists():
         return
-    for name in ROOT_OUTPUT_FILES:
+    # Combined plots used to be written at the root. Remove those legacy files
+    # so the root only contains the sweep index.
+    for name in ROOT_OUTPUT_FILES + COMBINED_OUTPUT_FILES:
         path = output_dir / name
         if path.is_file():
             path.unlink()
     for child in output_dir.iterdir():
         if not child.is_dir():
             continue
+        if child.name == "_combined":
+            for name in COMBINED_OUTPUT_FILES:
+                path = child / name
+                if path.is_file():
+                    path.unlink()
         for name in GROUP_OUTPUT_FILES:
             path = child / name
             if path.is_file():
@@ -822,24 +936,24 @@ def write_group_threshold_plots(
     plot_threshold_metric(
         rows,
         output_dir,
-        f"backward_peak_memory_vs_expert_threshold_s{seq_len}.png",
-        f"{title_base} backward local peak{suffix}",
-        "Backward local peak allocation (GiB)",
-        "backward_local_peak_mib",
-        scale=1024.0,
-    )
-    plot_threshold_metric(
-        rows,
-        output_dir,
         f"peak_hbm_vs_expert_threshold_s{seq_len}.png",
         f"{title_base} whole-step peak HBM{suffix}",
         "Peak HBM allocation (GiB)",
         "peak_hbm_mib",
         scale=1024.0,
     )
+    plot_threshold_metric(
+        rows,
+        output_dir,
+        f"timing_vs_expert_threshold_s{seq_len}.png",
+        f"{title_base} step time vs expert threshold{suffix}",
+        "Step time (ms)",
+        "step_ms",
+    )
 
 
 def write_combined_plots(rows: list[dict[str, Any]], output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
     plot_combined_metric(
         rows,
         output_dir,
@@ -896,6 +1010,7 @@ def write_combined_plots(rows: list[dict[str, Any]], output_dir: Path) -> None:
 
 
 def write_combined_threshold_plots(rows: list[dict[str, Any]], output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
     plot_combined_threshold_metric(
         rows,
         output_dir,
@@ -926,20 +1041,19 @@ def write_combined_threshold_plots(rows: list[dict[str, Any]], output_dir: Path)
     plot_combined_threshold_metric(
         rows,
         output_dir,
-        "combined_backward_peak_memory_vs_expert_threshold.png",
-        "All workloads: backward local peak vs expert threshold",
-        "Backward local peak allocation (GiB)",
-        "backward_local_peak_mib",
-        scale=1024.0,
-    )
-    plot_combined_threshold_metric(
-        rows,
-        output_dir,
         "combined_peak_hbm_vs_expert_threshold.png",
         "All workloads: whole-step peak HBM vs expert threshold",
         "Peak HBM allocation (GiB)",
         "peak_hbm_mib",
         scale=1024.0,
+    )
+    plot_combined_threshold_metric(
+        rows,
+        output_dir,
+        "combined_timing_vs_expert_threshold.png",
+        "All workloads: step time vs expert threshold",
+        "Step time (ms)",
+        "step_ms",
     )
 
 
@@ -956,7 +1070,8 @@ def main() -> None:
 
     seq_rows = [row for row in rows if int(row["expert_recompute_threshold"]) == 0]
     if seq_rows:
-        write_combined_plots(seq_rows, root)
+        combined_dir = root / "_combined"
+        write_combined_plots(seq_rows, combined_dir)
 
     groups: dict[tuple[str, str, int, str, str], list[dict[str, Any]]] = {}
     for row in seq_rows:
@@ -970,7 +1085,8 @@ def main() -> None:
 
     threshold_rows = threshold_sweep_rows(rows)
     if threshold_rows:
-        write_combined_threshold_plots(threshold_rows, root)
+        combined_dir = root / "_combined"
+        write_combined_threshold_plots(threshold_rows, combined_dir)
         threshold_groups: dict[tuple[tuple[str, str, int, str, str], int], list[dict[str, Any]]] = {}
         for row in threshold_rows:
             threshold_groups.setdefault((group_key(row), int(row["seq_len"])), []).append(row)

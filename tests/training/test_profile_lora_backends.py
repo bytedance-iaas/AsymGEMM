@@ -13,14 +13,14 @@ from asym_gemm.training.kt_moe import KTBackendUnavailable, _import_kt_moe_wrapp
 
 
 ROOT = Path(__file__).resolve().parents[2]
-PROFILE_LORA_PATH = ROOT / "scripts" / "profile_lora.py"
-PROFILE_LORA_DRIVER_PATH = ROOT / "scripts" / "profile_lora_driver.py"
+PROFILE_LORA_E2E_PATH = ROOT / "scripts" / "profile_lora_e2e.py"
+PROFILE_LORA_E2E_DRIVER_PATH = ROOT / "scripts" / "profile_lora_e2e_driver.py"
 POSTPROCESS_NSYS_LORA_PATH = ROOT / "scripts" / "postprocess_nsys_lora.py"
 PLOT_ACTIVATION_SWEEP_PATH = ROOT / "scripts" / "plotting" / "plot_activation_recompute_sweep.py"
 
 
-def _load_profile_lora_module():
-    spec = importlib.util.spec_from_file_location("profile_lora_under_test", PROFILE_LORA_PATH)
+def _load_profile_lora_e2e_module():
+    spec = importlib.util.spec_from_file_location("profile_lora_e2e_under_test", PROFILE_LORA_E2E_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -28,8 +28,8 @@ def _load_profile_lora_module():
     return module
 
 
-def _load_profile_lora_driver_module():
-    spec = importlib.util.spec_from_file_location("profile_lora_driver_under_test", PROFILE_LORA_DRIVER_PATH)
+def _load_profile_lora_e2e_driver_module():
+    spec = importlib.util.spec_from_file_location("profile_lora_e2e_driver_under_test", PROFILE_LORA_E2E_DRIVER_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -55,14 +55,14 @@ def _load_activation_sweep_plot_module():
     return module
 
 
-def test_profile_lora_public_backends_are_canonical() -> None:
-    profile_lora = _load_profile_lora_module()
+def test_profile_lora_e2e_public_backends_are_canonical() -> None:
+    profile_lora = _load_profile_lora_e2e_module()
 
     assert profile_lora.BACKEND_CHOICES == ("torch", "asym", "kt")
 
 
-def test_profile_lora_rejects_expert_threshold_for_non_moe_workload() -> None:
-    profile_lora = _load_profile_lora_module()
+def test_profile_lora_e2e_rejects_expert_threshold_for_non_moe_workload() -> None:
+    profile_lora = _load_profile_lora_e2e_module()
     args = argparse.Namespace(
         backend="torch",
         workload="dense",
@@ -74,31 +74,36 @@ def test_profile_lora_rejects_expert_threshold_for_non_moe_workload() -> None:
         profile_lora.validate_backend_workload(args)
 
 
-def test_profile_lora_public_workload_names_are_blockwise_for_moe() -> None:
-    profile_lora = _load_profile_lora_module()
+def test_profile_lora_e2e_public_workload_names_are_blockwise_for_moe() -> None:
+    profile_lora = _load_profile_lora_e2e_module()
 
     assert "dense_14b" in profile_lora.WORKLOAD_CHOICES
     assert "moe-604m-a75m" in profile_lora.WORKLOAD_CHOICES
     assert "moe-604m-a38m" in profile_lora.WORKLOAD_CHOICES
     legacy_names = {"moe" + "_3b", "qwen3" + "_30b" + "_a3b"}
     assert not legacy_names.intersection(profile_lora.WORKLOAD_CHOICES)
+    assert "Qwen/Qwen3-30B-A3B" not in profile_lora.WORKLOAD_CHOICES
     assert profile_lora.KT_MOE_WORKLOADS == ("moe", "moe-604m-a75m", "moe-604m-a38m")
+    assert profile_lora.is_hf_model_workload("Qwen/Qwen3-30B-A3B")
+    assert profile_lora.is_moe_workload_name("Qwen/Qwen3-30B-A3B")
 
 
-def test_profile_lora_driver_supports_workload_layer_specs() -> None:
-    driver = _load_profile_lora_driver_module()
+def test_profile_lora_e2e_driver_supports_workload_layer_specs() -> None:
+    driver = _load_profile_lora_e2e_driver_module()
 
-    specs = driver._expand_workloads(["moe-604m-a75m|2", "qwen|4"])
+    specs = driver._expand_workloads(["moe-604m-a75m|2", "qwen|4", "Qwen/Qwen3-30B-A3B|1", "Qwen/Qwen3-30B-A3B|all"])
 
     assert [(spec.name, spec.profile_layers, spec.label) for spec in specs] == [
         ("moe-604m-a75m", 2, "moe-604m-a75m-l2"),
         ("dense_14b", 4, "dense_14b-l4"),
-        ("moe-604m-a38m", 4, "moe-604m-a38m-l4"),
+        ("Qwen/Qwen3-30B-A3B", 4, "qwen_qwen3-30b-a3b-l4"),
+        ("Qwen/Qwen3-30B-A3B", 1, "qwen_qwen3-30b-a3b-l1"),
+        ("Qwen/Qwen3-30B-A3B", "all", "qwen_qwen3-30b-a3b-lall"),
     ]
 
 
-def test_profile_lora_driver_result_stem_includes_input_shape_and_recompute() -> None:
-    driver = _load_profile_lora_driver_module()
+def test_profile_lora_e2e_driver_result_stem_includes_input_shape_and_recompute() -> None:
+    driver = _load_profile_lora_e2e_driver_module()
 
     args = argparse.Namespace(mode="auto", precision="bf16", batch_size=16, seq_len=2048, activation_recompute=True)
     assert driver._result_stem(args, "asym", "nsys") == "bf16_lora-sft_b16_s2048_recomp_asym_nsys"
@@ -110,12 +115,20 @@ def test_profile_lora_driver_result_stem_includes_input_shape_and_recompute() ->
     assert driver._result_stem(args, "asym", "source") == "bf16_lora-sft_b16_s2048_norecomp_expertthr64_asym_source"
 
 
-def test_profile_lora_driver_expands_expert_recompute_thresholds() -> None:
-    driver = _load_profile_lora_driver_module()
+def test_profile_lora_e2e_driver_expands_expert_recompute_thresholds() -> None:
+    driver = _load_profile_lora_e2e_driver_module()
 
     args = argparse.Namespace(expert_recompute_threshold=0, expert_recompute_thresholds=["0,16", "32", "16"])
 
     assert driver._expert_recompute_thresholds(args) == [0, 16, 32]
+
+
+def test_profile_lora_e2e_driver_layer_recompute_only_applies_at_zero_expert_threshold() -> None:
+    driver = _load_profile_lora_e2e_driver_module()
+
+    assert driver._effective_activation_recompute(True, 0)
+    assert not driver._effective_activation_recompute(True, 16)
+    assert not driver._effective_activation_recompute(False, 0)
 
 
 def test_activation_sweep_plot_parses_expert_threshold_result_dirs() -> None:
@@ -132,11 +145,11 @@ def test_activation_sweep_plot_parses_expert_threshold_result_dirs() -> None:
     assert meta["expert_recompute_threshold"] == 64
 
 
-def test_profile_lora_driver_does_not_create_skipped_result_dirs(tmp_path: Path) -> None:
+def test_profile_lora_e2e_driver_does_not_create_skipped_result_dirs(tmp_path: Path) -> None:
     subprocess.run(
         [
             sys.executable,
-            str(PROFILE_LORA_DRIVER_PATH),
+            str(PROFILE_LORA_E2E_DRIVER_PATH),
             "--workloads",
             "mlp",
             "--backends",
@@ -154,8 +167,8 @@ def test_profile_lora_driver_does_not_create_skipped_result_dirs(tmp_path: Path)
     assert not list(tmp_path.rglob("*_kt_source"))
 
 
-def test_profile_lora_driver_summary_row_reads_nested_nsys_profile() -> None:
-    driver = _load_profile_lora_driver_module()
+def test_profile_lora_e2e_driver_summary_row_reads_nested_nsys_profile() -> None:
+    driver = _load_profile_lora_e2e_driver_module()
     row = driver._summary_row(
         workload="moe-604m-a38m-l1",
         backend="asym",
@@ -185,8 +198,8 @@ def test_profile_lora_driver_summary_row_reads_nested_nsys_profile() -> None:
     assert row["pinned_cpu_bytes"] == 5 * 1024 * 1024
 
 
-def test_profile_lora_driver_prefers_nsys_stage_timing_over_source_step() -> None:
-    driver = _load_profile_lora_driver_module()
+def test_profile_lora_e2e_driver_prefers_nsys_stage_timing_over_source_step() -> None:
+    driver = _load_profile_lora_e2e_driver_module()
 
     assert driver._profile_step_milliseconds(
         {
@@ -199,8 +212,8 @@ def test_profile_lora_driver_prefers_nsys_stage_timing_over_source_step() -> Non
     ) == pytest.approx(18.0)
 
 
-def test_profile_lora_driver_writes_descending_latency_and_memory_rankings() -> None:
-    driver = _load_profile_lora_driver_module()
+def test_profile_lora_e2e_driver_writes_descending_latency_and_memory_rankings() -> None:
+    driver = _load_profile_lora_e2e_driver_module()
     summary = {
         "precision": "bf16",
         "workflow": "lora-sft",
@@ -252,8 +265,8 @@ def test_profile_lora_driver_writes_descending_latency_and_memory_rankings() -> 
     assert "GPU HBM saved %" in driver._memory_markdown(summary)
 
 
-def test_profile_lora_saved_tensor_buckets_keep_semantic_leaf_owners() -> None:
-    profile_lora = _load_profile_lora_module()
+def test_profile_lora_e2e_saved_tensor_buckets_keep_semantic_leaf_owners() -> None:
+    profile_lora = _load_profile_lora_e2e_module()
 
     assert profile_lora._saved_tensor_bucket("forward.layers.0.mlp.silu_mul_activation") == "mlp.silu_mul_activation"
     assert profile_lora._saved_tensor_bucket("forward.layers.0.attention.sdpa") == "attention.sdpa"
@@ -470,7 +483,7 @@ def test_postprocess_memory_attribution_percentages_are_gpu_only() -> None:
 
 
 def test_kt_backend_is_restricted_to_moe_workloads() -> None:
-    profile_lora = _load_profile_lora_module()
+    profile_lora = _load_profile_lora_e2e_module()
 
     with pytest.raises(ValueError, match="backend=kt is only implemented for MoE LoRA SFT workloads"):
         profile_lora.validate_backend_workload(argparse.Namespace(backend="kt", workload="mlp", lora_dtype="bf16"))
@@ -479,17 +492,17 @@ def test_kt_backend_is_restricted_to_moe_workloads() -> None:
 
 
 def test_kt_backend_rejects_non_bf16_lora_dtype() -> None:
-    profile_lora = _load_profile_lora_module()
+    profile_lora = _load_profile_lora_e2e_module()
 
     with pytest.raises(ValueError, match="backend=kt currently supports BF16 LoRA buffers only"):
         profile_lora.validate_backend_workload(argparse.Namespace(backend="kt", workload="moe", lora_dtype="fp16"))
 
 
-def test_profile_lora_cli_rejects_kt_for_non_moe_workload(tmp_path: Path) -> None:
+def test_profile_lora_e2e_cli_rejects_kt_for_non_moe_workload(tmp_path: Path) -> None:
     result = subprocess.run(
         [
             sys.executable,
-            str(PROFILE_LORA_PATH),
+            str(PROFILE_LORA_E2E_PATH),
             "--workload",
             "mlp",
             "--backend",
