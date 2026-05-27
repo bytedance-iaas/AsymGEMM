@@ -25,6 +25,7 @@ at install time.
 
 ## News
 
+- **2026.05**: AsymGEMM **v0.1.0** is internally released! See the [release notes](docs/release_notes/v0.1.0.md).
 - **2026.05**: AsymGEMM now supports **NVFP4 (E2M1 + E4M3 scales)** asymmetric GEMM for SM100.
 - **2026.05**: AsymGEMM now supports **FP8 (E4M3)** asymmetric GEMM for SM100 and SM89.
 - **2026.02**: AsymGEMM released with **BF16** MoE GEMM support.
