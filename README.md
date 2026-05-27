@@ -139,12 +139,25 @@ Kernels are compiled on first use and cached in `~/.asym_gemm/` (override with
 
 ### Running the Tests
 
-The tests require a CUDA-capable machine with a supported NVIDIA GPU.
+The tests require a CUDA-capable machine. One command runs the subset of
+tests applicable to the current GPU:
 
 ```bash
 bash scripts/test.sh
-
 ```
+
+The script detects compute capability via `torch.cuda.get_device_capability`
+and selects:
+
+| Compute cap | Test files                                                                                       |
+| ----------- | ------------------------------------------------------------------------------------------------ |
+| sm_89       | `tests/test_sm89_moe.py`                                                                         |
+| sm_90       | `tests/test_bf16_asym_gemm.py`, `tests/test_fp8_asym_gemm.py`                                    |
+| sm_100      | `tests/test_bf16_asym_gemm.py`, `tests/test_fp8_asym_gemm.py`, `tests/test_fp4_asym_gemm.py`     |
+
+It prints a pass/fail summary at the end and exits non-zero if any test
+fails. For per-format accuracy thresholds and the most recent measured
+numbers, see [`docs/accuracy.md`](docs/accuracy.md).
 
 ### Running with SGLang
 
@@ -202,9 +215,10 @@ for its assigned expert, maximizing reuse.
 sentinel.
 
 **Masked layout** — Each expert occupies a fixed-stride slice at `g * max_m` of a buffer of
-shape `[num_groups * max_m, K]`. The `masked_m[g]` tensor records the actual valid token count
-for expert `g`. The `offsets/experts/list_size` triple is derived from `masked_m` via the
-`build_offsets_experts_from_masked_m` helper in `tests/generators.py`.
+shape `[num_groups, max_m, K]`. The `masked_m[g]` tensor records the actual valid token count
+for expert `g`; `masked_m[g] == 0` marks an inactive expert and the kernel skips that CTA.
+The masked APIs (`m_grouped_{bf16,fp8,fp4}_asym_gemm_nt_masked`) consume `masked_m` directly —
+no offsets/experts/list_size triple is needed for this layout.
 
 ---
 

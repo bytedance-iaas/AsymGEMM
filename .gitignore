@@ -25,6 +25,9 @@ asym_gemm/include/cutlass
 /.clang*
 /.cache
 
+# Claude Code session state
+.claude/
+
 # Generated stub files
 stubs/
 

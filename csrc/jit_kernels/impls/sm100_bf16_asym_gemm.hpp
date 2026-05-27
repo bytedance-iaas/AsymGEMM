@@ -354,8 +354,7 @@ static void __instantiate_kernel() {{
 static void sm100_m_grouped_bf16_asym_gemm_masked(const torch::Tensor& a,
                                              const torch::Tensor& b,
                                              const torch::Tensor& d,
-                                             const torch::Tensor& offsets_t,
-                                             const torch::Tensor& experts_t,
+                                             const torch::Tensor& masked_m,
                                              const int& grid_y,
                                              const int& expected_m,
                                              const int& num_groups, const int& m, const int& n, const int& k,
@@ -401,7 +400,11 @@ static void sm100_m_grouped_bf16_asym_gemm_masked(const torch::Tensor& a,
     if (grid_y <= 0)
         return;
 
-    // Launch with masked configuration
+    // Launch with masked configuration.
+    // The kernel scheduler (asymScheduler.cuh, MGroupedMasked branch) reads
+    // `offsets[blockIdx.y]` as `masked_m[blockIdx.y]` and ignores `experts`,
+    // so we pass `masked_m` as `offsets` and `nullptr` as `experts` — matches
+    // the FP8/FP4 masked dispatchers.
     const SM100BF16AsymGemmMaskedRuntime::Args& args = {
         .m = m, .n = n, .k = aligned_k,
         .compiled_dims = compiled_dims,
@@ -409,8 +412,8 @@ static void sm100_m_grouped_bf16_asym_gemm_masked(const torch::Tensor& a,
         .launch_args = LaunchArgs({ceil_div(n, config.block_n), grid_y}, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .offsets = offsets_t.data_ptr<int>(),
-        .experts = experts_t.data_ptr<int>(),
+        .offsets = masked_m.data_ptr<int>(),
+        .experts = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd

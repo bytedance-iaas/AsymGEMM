@@ -371,11 +371,9 @@ static void m_grouped_bf16_asym_gemm_nt_contiguous(const torch::Tensor& a, const
 
 static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const torch::Tensor& b,
                                                const torch::Tensor& d,
-                                               const torch::Tensor& offsets, const torch::Tensor& experts,
-                                               const torch::Tensor& list_size_t,
+                                               const torch::Tensor& masked_m,
                                                const int& expected_m,
                                                const std::string& compiled_dims) {
-    check_list_size_tensor(list_size_t);
     // Shape must be `[G, M, K] @ [G, N, K].mT`
     const auto& major_a = get_major_type_ab(a);
     const auto& major_b = get_major_type_ab(b);
@@ -392,11 +390,10 @@ static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const tor
     DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
 
-    DG_HOST_ASSERT(offsets.is_cuda() && experts.is_cuda());
-    DG_HOST_ASSERT(offsets.is_contiguous() && experts.is_contiguous());
-    DG_HOST_ASSERT(offsets.scalar_type() == torch::kInt && experts.scalar_type() == torch::kInt);
-    // Dense per-group layout: offsets is num_groups pairs, experts is num_groups + terminator.
-    DG_HOST_ASSERT(offsets.numel() >= 2 * num_groups && experts.numel() >= num_groups + 1);
+    // masked_m: int32 GPU tensor of shape [num_groups] with per-group token counts.
+    DG_HOST_ASSERT(masked_m.is_cuda() && masked_m.is_contiguous());
+    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(masked_m.numel() == num_groups);
 
     // D must be N-major (per-group)
     check_major_type_cd(d);
@@ -405,8 +402,8 @@ static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const tor
     if (m == 0 or expected_m == 0)
         return;
 
-    // Dispatch implementation. Grid Y = num_groups; sentinel blocks early-exit in-kernel.
-    sm100_m_grouped_bf16_asym_gemm_masked(a, b, d, offsets, experts, /*grid_y=*/num_groups, expected_m,
+    // Dispatch implementation. Grid Y = num_groups; inactive groups early-exit in-kernel.
+    sm100_m_grouped_bf16_asym_gemm_masked(a, b, d, masked_m, /*grid_y=*/num_groups, expected_m,
                                           num_groups, m, n, k, major_a, major_b, compiled_dims);
 }
 #endif
@@ -634,10 +631,10 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk");
     m.def("m_grouped_bf16_asym_gemm_nt_masked",
           static_cast<void(*)(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
-                              const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const int&, const std::string&)>(
+                              const torch::Tensor&, const int&, const std::string&)>(
               &m_grouped_bf16_asym_gemm_nt_masked),
           py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("offsets"), py::arg("experts"), py::arg("list_size"), py::arg("expected_m"),
+          py::arg("masked_m"), py::arg("expected_m"),
           py::arg("compiled_dims") = "nk");
 #endif
 
