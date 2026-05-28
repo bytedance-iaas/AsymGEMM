@@ -650,9 +650,16 @@ static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const tor
     if (m == 0 or expected_m == 0)
         return;
 
-    // Dispatch implementation. Grid Y = num_groups; sentinel blocks early-exit in-kernel.
-    sm100_m_grouped_bf16_asym_gemm_masked(a, b, d, offsets, experts, /*grid_y=*/num_groups, expected_m,
-                                          num_groups, m, n, k, major_a, major_b, compiled_dims);
+    const auto& arch_major = device_runtime->get_arch_major();
+    if (arch_major == 9) {
+        sm90_m_grouped_bf16_asym_gemm_masked(a, b, d, masked_m, expected_m,
+                                             num_groups, m, n, k, major_a, major_b, compiled_dims);
+    } else if (arch_major == 10) {
+        sm100_m_grouped_bf16_asym_gemm_masked(a, b, d, masked_m, /*grid_y=*/num_groups, expected_m,
+                                              num_groups, m, n, k, major_a, major_b, compiled_dims);
+    } else {
+        DG_HOST_ASSERT(false && "unsupported BF16 asym GEMM architecture");
+    }
 }
 #endif
 
@@ -919,13 +926,6 @@ static void register_apis(pybind11::module_& m) {
           py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
           py::arg("compiled_dims") = "nk",
           py::arg("transpose_b") = false);
-    m.def("m_grouped_bf16_asym_gemm_nt_masked",
-          static_cast<void(*)(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
-                              const torch::Tensor&, const int&, const std::string&)>(
-              &m_grouped_bf16_asym_gemm_nt_masked),
-          py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("masked_m"), py::arg("expected_m"),
-          py::arg("compiled_dims") = "nk");
     m.def("m_grouped_bf16_asym_gemm_nt_masked",
           static_cast<void(*)(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
                               const torch::Tensor&, const int&, const std::string&)>(
