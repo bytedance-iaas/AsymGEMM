@@ -14,6 +14,7 @@ from .profile_ranges import is_profile_enabled, prof_range
 
 VALID_BACKENDS = ("asym", "torch")
 VALID_ASYM_PRECISIONS = ("bf16", "fp8", "fp4")
+VALID_BF16_OUTPUT_DTYPES = ("bf16", "bfloat16", "fp32", "float32")
 _FP8_RECIPE = (1, 128, 128)
 _FP4_RECIPE = (1, 1, 16)
 _TORCH_GROUPED_MM = getattr(torch.nn.functional, "grouped_mm", None)
@@ -126,6 +127,19 @@ def _normalize_precision(precision: str) -> str:
     if normalized not in VALID_ASYM_PRECISIONS:
         raise ValueError(f"unsupported precision={precision!r}; expected one of {VALID_ASYM_PRECISIONS}")
     return normalized
+
+
+def _normalize_bf16_output_dtype(dtype: torch.dtype | str) -> torch.dtype:
+    if isinstance(dtype, torch.dtype):
+        if dtype in {torch.bfloat16, torch.float32}:
+            return dtype
+        raise ValueError("BF16 AsymGEMM output dtype must be torch.bfloat16 or torch.float32")
+    normalized = str(dtype).lower().removeprefix("torch.")
+    if normalized in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if normalized in {"fp32", "float32"}:
+        return torch.float32
+    raise ValueError(f"unsupported BF16 AsymGEMM output dtype {dtype!r}; expected one of {VALID_BF16_OUTPUT_DTYPES}")
 
 
 def _pin_cpu_tensor(tensor: torch.Tensor, *, pin_memory: bool) -> torch.Tensor:
@@ -495,6 +509,7 @@ def _asym_bf16_nt(
     *,
     compiled_dims: str = "mnk",
     transpose_b: bool = False,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     import asym_gemm
 
@@ -504,15 +519,13 @@ def _asym_bf16_nt(
 
     m = int(a.shape[0])
     n = int(b_cpu.shape[1] if transpose_b else b_cpu.shape[0])
-    # Use FP32 D so multi-K-block kernels reduce partial K tiles in FP32.
-    # The public training contract still returns BF16 activations/gradients.
-    d = torch.empty((m, n), device=a.device, dtype=torch.float32)
+    d = torch.empty((m, n), device=a.device, dtype=output_dtype)
     offsets, experts = _single_group_launch_tensors(a.device, m)
     b_group = b_cpu.unsqueeze(0)
     asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous(
         a, b_group, d, offsets, experts, 2, compiled_dims, transpose_b
     )
-    return d.to(dtype=torch.bfloat16)
+    return d if d.dtype == torch.bfloat16 else d.to(dtype=torch.bfloat16)
 
 
 def _asym_grouped_bf16_nt(
@@ -523,6 +536,7 @@ def _asym_grouped_bf16_nt(
     *,
     compiled_dims: str = "mnk",
     transpose_b: bool = False,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     import asym_gemm
 
@@ -533,13 +547,13 @@ def _asym_grouped_bf16_nt(
     m = int(a.shape[0])
     n = int(b_cpu.shape[2] if transpose_b else b_cpu.shape[1])
     a_kernel, offsets_kernel, unpad = _pad_grouped_input_for_asym(a, offsets, experts)
-    d = torch.empty((int(a_kernel.shape[0]), n), device=a.device, dtype=torch.float32)
+    d = torch.empty((int(a_kernel.shape[0]), n), device=a.device, dtype=output_dtype)
     offsets_i32, experts_i32, list_size = _group_metadata_tensors(offsets_kernel, experts, device=a.device)
     asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous(
         a_kernel, b_cpu, d, offsets_i32, experts_i32, list_size, compiled_dims, transpose_b
     )
     d = _unpad_grouped_output(d, unpad, output_m=m)
-    return d.to(dtype=torch.bfloat16)
+    return d if d.dtype == torch.bfloat16 else d.to(dtype=torch.bfloat16)
 
 
 def _quantize_activation_for_precision(
@@ -807,6 +821,7 @@ def _dispatch_nt(
     precision: str = "bf16",
     quantized_weight: Optional[QuantizedHostWeight] = None,
     profile_label: str = "",
+    bf16_output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     _check_backend(backend)
     precision = _normalize_precision(precision)
@@ -820,7 +835,13 @@ def _dispatch_nt(
         if reason is None:
             try:
                 if precision == "bf16":
-                    out = _asym_bf16_nt(a, b_cpu, compiled_dims=compiled_dims, transpose_b=transpose_b)
+                    out = _asym_bf16_nt(
+                        a,
+                        b_cpu,
+                        compiled_dims=compiled_dims,
+                        transpose_b=transpose_b,
+                        output_dtype=bf16_output_dtype,
+                    )
                 else:
                     assert quantized_weight is not None
                     out = _asym_quantized_nt(
@@ -866,6 +887,7 @@ def _dispatch_grouped_nt(
     precision: str = "bf16",
     quantized_weight: Optional[QuantizedHostWeight] = None,
     dense_experts: bool = False,
+    bf16_output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     _check_backend(backend)
     precision = _normalize_precision(precision)
@@ -886,6 +908,7 @@ def _dispatch_grouped_nt(
                         experts,
                         compiled_dims=compiled_dims,
                         transpose_b=transpose_b,
+                        output_dtype=bf16_output_dtype,
                     )
                 else:
                     assert quantized_weight is not None
@@ -933,8 +956,10 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
         profile_name: str,
         precision: str,
         quantized_weight: Optional[QuantizedHostWeight],
+        bf16_output_dtype: torch.dtype,
     ) -> torch.Tensor:
         precision = _normalize_precision(precision)
+        bf16_output_dtype = _normalize_bf16_output_dtype(bf16_output_dtype)
         if x.shape[-1] != host_weight.in_features:
             raise ValueError(f"expected input last dim {host_weight.in_features}, got {x.shape[-1]}")
         input_shape = tuple(x.shape)
@@ -952,6 +977,7 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
                 precision=precision,
                 quantized_weight=quantized_weight,
                 profile_label=forward_range,
+                bf16_output_dtype=bf16_output_dtype,
             )
         if bias is not None:
             y = y + bias.to(device=y.device, dtype=y.dtype)
@@ -961,6 +987,7 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
         ctx.stats = stats
         ctx.compiled_dims = compiled_dims
         ctx.precision = precision
+        ctx.bf16_output_dtype = bf16_output_dtype
         ctx.profile_backward_range = backward_range
         ctx.profile_enabled = is_profile_enabled()
         ctx.has_bias = bias is not None
@@ -973,7 +1000,7 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
     def backward(
         ctx: Any,
         grad_output: torch.Tensor,
-    ) -> Tuple[Optional[torch.Tensor], None, Optional[torch.Tensor], None, None, None, None, None, None]:
+    ) -> Tuple[Optional[torch.Tensor], None, Optional[torch.Tensor], None, None, None, None, None, None, None]:
         grad_x = None
         if ctx.needs_input_grad[0]:
             grad_output_2d = grad_output.reshape(-1, ctx.host_weight.out_features).contiguous()
@@ -994,6 +1021,7 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
                     precision=ctx.precision,
                     quantized_weight=quantized_weight_t,
                     profile_label=ctx.profile_backward_range,
+                    bf16_output_dtype=ctx.bf16_output_dtype,
                 )
             grad_x = grad_x.reshape(ctx.input_shape)
 
@@ -1004,7 +1032,7 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
                 .sum(dim=0)
                 .to(device=ctx.bias_device, dtype=ctx.bias_dtype)
             )
-        return grad_x, None, grad_bias, None, None, None, None, None, None
+        return grad_x, None, grad_bias, None, None, None, None, None, None, None
 
 
 def asym_frozen_linear(
@@ -1017,8 +1045,10 @@ def asym_frozen_linear(
     compiled_dims: str = "mnk",
     profile_name: str = "",
     precision: str = "bf16",
+    bf16_output_dtype: torch.dtype | str = torch.bfloat16,
 ) -> torch.Tensor:
     precision = _normalize_precision(precision)
+    bf16_output_dtype = _normalize_bf16_output_dtype(bf16_output_dtype)
     quantized_weight = (
         _get_quantized_host_weight(host_weight, precision, transpose=False)
         if backend != "torch" and precision != "bf16"
@@ -1034,6 +1064,7 @@ def asym_frozen_linear(
         profile_name,
         precision,
         quantized_weight,
+        bf16_output_dtype,
     )
 
 
@@ -1047,6 +1078,7 @@ def frozen_linear(
     compiled_dims: str = "mnk",
     profile_name: str = "",
     precision: str = "bf16",
+    bf16_output_dtype: torch.dtype | str = torch.bfloat16,
 ) -> torch.Tensor:
     return asym_frozen_linear(
         x,
@@ -1057,6 +1089,7 @@ def frozen_linear(
         compiled_dims=compiled_dims,
         profile_name=profile_name,
         precision=precision,
+        bf16_output_dtype=bf16_output_dtype,
     )
 
 
@@ -1075,8 +1108,10 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
         precision: str,
         quantized_weight: Optional[QuantizedHostWeight],
         dense_experts: bool,
+        bf16_output_dtype: torch.dtype,
     ) -> torch.Tensor:
         precision = _normalize_precision(precision)
+        bf16_output_dtype = _normalize_bf16_output_dtype(bf16_output_dtype)
         if host_weight.weight.dim() != 3:
             raise ValueError(f"grouped host weight must be 3D, got shape {tuple(host_weight.weight.shape)}")
         if x.shape[-1] != int(host_weight.weight.shape[2]):
@@ -1103,6 +1138,7 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
                 precision=precision,
                 quantized_weight=quantized_weight,
                 dense_experts=dense_experts,
+                bf16_output_dtype=bf16_output_dtype,
             )
 
         ctx.host_weight = host_weight
@@ -1112,6 +1148,7 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
         ctx.stats = stats
         ctx.compiled_dims = compiled_dims
         ctx.precision = precision
+        ctx.bf16_output_dtype = bf16_output_dtype
         ctx.dense_experts = bool(dense_experts)
         ctx.profile_backward_range = backward_range
         ctx.profile_enabled = is_profile_enabled()
@@ -1122,7 +1159,7 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
     def backward(
         ctx: Any,
         grad_output: torch.Tensor,
-    ) -> Tuple[Optional[torch.Tensor], None, None, None, None, None, None, None, None, None, None]:
+    ) -> Tuple[Optional[torch.Tensor], None, None, None, None, None, None, None, None, None, None, None]:
         grad_x = None
         if ctx.needs_input_grad[0]:
             grad_output_2d = grad_output.reshape(-1, int(ctx.host_weight.weight.shape[1])).contiguous()
@@ -1152,9 +1189,10 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
                     precision=ctx.precision,
                     quantized_weight=quantized_weight_t,
                     dense_experts=ctx.dense_experts,
+                    bf16_output_dtype=ctx.bf16_output_dtype,
                 )
             grad_x = grad_x.reshape(ctx.input_shape)
-        return grad_x, None, None, None, None, None, None, None, None, None, None
+        return grad_x, None, None, None, None, None, None, None, None, None, None, None
 
 
 def asym_grouped_frozen_linear(
@@ -1169,8 +1207,10 @@ def asym_grouped_frozen_linear(
     profile_name: str = "",
     precision: str = "bf16",
     dense_experts: bool = False,
+    bf16_output_dtype: torch.dtype | str = torch.bfloat16,
 ) -> torch.Tensor:
     precision = _normalize_precision(precision)
+    bf16_output_dtype = _normalize_bf16_output_dtype(bf16_output_dtype)
     quantized_weight = (
         _get_quantized_host_weight(host_weight, precision, transpose=False)
         if backend != "torch" and precision != "bf16"
@@ -1188,6 +1228,7 @@ def asym_grouped_frozen_linear(
         precision,
         quantized_weight,
         dense_experts,
+        bf16_output_dtype,
     )
 
 
@@ -1201,6 +1242,7 @@ class AsymGroupedFrozenLinear(nn.Module):
         stats: Optional[AsymExecutionStats] = None,
         compiled_dims: str = "mnk",
         precision: str = "bf16",
+        bf16_output_dtype: torch.dtype | str = torch.bfloat16,
     ) -> None:
         super().__init__()
         if not isinstance(weight, torch.Tensor):
@@ -1209,11 +1251,13 @@ class AsymGroupedFrozenLinear(nn.Module):
             raise ValueError(f"AsymGroupedFrozenLinear expects [groups, out, in], got {tuple(weight.shape)}")
         _check_backend(backend)
         precision = _normalize_precision(precision)
+        bf16_output_dtype = _normalize_bf16_output_dtype(bf16_output_dtype)
         self.host_weight = HostWeight(weight, pin_memory=pin_memory, clone=True, require_2d=False)
         self.backend = backend
         self.stats = stats if stats is not None else AsymExecutionStats()
         self.compiled_dims = compiled_dims
         self.precision = precision
+        self.bf16_output_dtype = bf16_output_dtype
         self.profile_name = ""
         self.num_groups = int(self.host_weight.weight.shape[0])
         self.out_features = int(self.host_weight.weight.shape[1])
@@ -1243,6 +1287,7 @@ class AsymGroupedFrozenLinear(nn.Module):
             profile_name=self.profile_name,
             precision=self.precision,
             dense_experts=dense_experts,
+            bf16_output_dtype=self.bf16_output_dtype,
         )
 
     def _save_to_state_dict(self, destination: Dict[str, torch.Tensor], prefix: str, keep_vars: bool) -> None:
@@ -1291,7 +1336,9 @@ class AsymGroupedFrozenLinear(nn.Module):
         return (
             f"num_groups={self.num_groups}, in_features={self.in_features}, "
             f"out_features={self.out_features}, backend={self.backend}, "
-            f"precision={self.precision}, pinned={self.host_weight.metadata.pinned}"
+            f"precision={self.precision}, "
+            f"bf16_output_dtype={str(self.bf16_output_dtype).removeprefix('torch.')}, "
+            f"pinned={self.host_weight.metadata.pinned}"
         )
 
 
@@ -1410,6 +1457,7 @@ class AsymFrozenLinear(nn.Module):
         stats: Optional[AsymExecutionStats] = None,
         compiled_dims: str = "mnk",
         precision: str = "bf16",
+        bf16_output_dtype: torch.dtype | str = torch.bfloat16,
     ) -> None:
         super().__init__()
         if len(args) == 1:
@@ -1426,6 +1474,7 @@ class AsymFrozenLinear(nn.Module):
             raise TypeError(f"weight must be a torch.Tensor, got {type(weight)!r}")
         _check_backend(backend)
         precision = _normalize_precision(precision)
+        bf16_output_dtype = _normalize_bf16_output_dtype(bf16_output_dtype)
         self.host_weight = HostWeight.from_tensor(weight, dtype=weight.dtype, pin_memory=pin_memory)
         self.bias_cpu = None if bias is None else bias.detach().to("cpu", dtype=weight.dtype).contiguous()
         if self.bias_cpu is not None and pin_memory:
@@ -1437,6 +1486,7 @@ class AsymFrozenLinear(nn.Module):
         self.stats = stats if stats is not None else AsymExecutionStats()
         self.compiled_dims = compiled_dims
         self.precision = precision
+        self.bf16_output_dtype = bf16_output_dtype
         self.profile_name = ""
         self.in_features = self.host_weight.in_features
         self.out_features = self.host_weight.out_features
@@ -1451,6 +1501,7 @@ class AsymFrozenLinear(nn.Module):
         stats: Optional[AsymExecutionStats] = None,
         compiled_dims: str = "mnk",
         precision: str = "bf16",
+        bf16_output_dtype: torch.dtype | str = torch.bfloat16,
     ) -> "AsymFrozenLinear":
         return cls(
             linear.weight.detach(),
@@ -1460,6 +1511,7 @@ class AsymFrozenLinear(nn.Module):
             stats=stats,
             compiled_dims=compiled_dims,
             precision=precision,
+            bf16_output_dtype=bf16_output_dtype,
         )
 
     @classmethod
@@ -1472,6 +1524,7 @@ class AsymFrozenLinear(nn.Module):
         stats: Optional[AsymExecutionStats] = None,
         compiled_dims: str = "mnk",
         precision: str = "bf16",
+        bf16_output_dtype: torch.dtype | str = torch.bfloat16,
     ) -> "AsymFrozenLinear":
         return cls.from_gpu_linear(
             linear,
@@ -1480,6 +1533,7 @@ class AsymFrozenLinear(nn.Module):
             stats=stats,
             compiled_dims=compiled_dims,
             precision=precision,
+            bf16_output_dtype=bf16_output_dtype,
         )
 
     @property
@@ -1511,6 +1565,7 @@ class AsymFrozenLinear(nn.Module):
             compiled_dims=self.compiled_dims,
             profile_name=self.profile_name,
             precision=self.precision,
+            bf16_output_dtype=self.bf16_output_dtype,
         )
 
     def _save_to_state_dict(self, destination: Dict[str, torch.Tensor], prefix: str, keep_vars: bool) -> None:
@@ -1579,7 +1634,9 @@ class AsymFrozenLinear(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"backend={self.backend}, precision={self.precision}, pinned={self.host_weight.metadata.pinned}"
+            f"backend={self.backend}, precision={self.precision}, "
+            f"bf16_output_dtype={str(self.bf16_output_dtype).removeprefix('torch.')}, "
+            f"pinned={self.host_weight.metadata.pinned}"
         )
 
 

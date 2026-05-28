@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import Any, Iterable
@@ -62,10 +63,19 @@ class WorkloadSpec:
 
     @property
     def label(self) -> str:
-        name = _safe_label(self.name)
+        name = _workload_label(self.name)
         if self.profile_layers is None:
             return name
         return f"{name}-l{self.profile_layers}"
+
+
+@dataclass(frozen=True)
+class ExpertRecomputePolicySpec:
+    raw: str
+    label: str
+    policy: str
+    token_threshold: int
+    util_threshold: float
 
 
 def _is_hf_model_workload(workload: str) -> bool:
@@ -184,8 +194,113 @@ def _expert_recompute_thresholds(args: argparse.Namespace) -> list[int]:
     return list(dict.fromkeys(thresholds))
 
 
-def _effective_activation_recompute(requested_activation_recompute: bool, expert_recompute_threshold: int) -> bool:
-    return bool(requested_activation_recompute) and int(expert_recompute_threshold) == 0
+def _parse_util_threshold_token(value: str) -> float:
+    text = value.strip().lower()
+    if not text:
+        raise SystemExit("invalid util policy; missing threshold")
+    if "." in text:
+        try:
+            util = float(text)
+        except ValueError as exc:
+            raise SystemExit(f"invalid util threshold {value!r}") from exc
+    elif text == "1":
+        util = 1.0
+    elif text == "0":
+        util = 0.0
+    elif text.startswith("0") and len(text) > 1:
+        util = float(f"0.{text[1:]}")
+    else:
+        try:
+            util = int(text) / 100.0
+        except ValueError as exc:
+            raise SystemExit(f"invalid util threshold {value!r}") from exc
+    if util < 0.0 or util > 1.0:
+        raise SystemExit(f"invalid util threshold {value!r}; expected a value in [0, 1]")
+    return util
+
+
+def _util_policy_label(util: float) -> str:
+    return f"util{int(round(float(util) * 100)):03d}"
+
+
+def parse_expert_recompute_policy_spec(value: str) -> ExpertRecomputePolicySpec:
+    raw = str(value).strip()
+    spec = raw.lower().replace("_", "-")
+    if spec in {"", "none", "off", "false", "0"}:
+        return ExpertRecomputePolicySpec(raw=raw, label="none", policy="none", token_threshold=0, util_threshold=0.0)
+
+    token_threshold: int | None = None
+    util_threshold: float | None = None
+    parts = spec.split("-")
+    if len(parts) > 2:
+        raise SystemExit(f"invalid expert recompute policy {value!r}; expected none, tokXX, utilXX, or tokXX-utilXX")
+    for part in parts:
+        if match := re.fullmatch(r"tok([0-9]+)", part):
+            if token_threshold is not None:
+                raise SystemExit(f"invalid expert recompute policy {value!r}; duplicate token threshold")
+            token_threshold = int(match.group(1))
+        elif match := re.fullmatch(r"util([0-9]+(?:\.[0-9]+)?)", part):
+            if util_threshold is not None:
+                raise SystemExit(f"invalid expert recompute policy {value!r}; duplicate util threshold")
+            util_threshold = _parse_util_threshold_token(match.group(1))
+        else:
+            raise SystemExit(f"invalid expert recompute policy {value!r}; expected none, tokXX, utilXX, or tokXX-utilXX")
+
+    token_threshold = int(token_threshold or 0)
+    util_threshold = float(util_threshold or 0.0)
+    if token_threshold <= 0 and util_threshold <= 0.0:
+        return ExpertRecomputePolicySpec(raw=raw, label="none", policy="none", token_threshold=0, util_threshold=0.0)
+    if token_threshold > 0 and util_threshold > 0.0:
+        return ExpertRecomputePolicySpec(
+            raw=raw,
+            label=f"tok{token_threshold}-{_util_policy_label(util_threshold)}",
+            policy="tok_util",
+            token_threshold=token_threshold,
+            util_threshold=util_threshold,
+        )
+    if token_threshold > 0:
+        return ExpertRecomputePolicySpec(
+            raw=raw,
+            label=f"tok{token_threshold}",
+            policy="tok",
+            token_threshold=token_threshold,
+            util_threshold=0.0,
+        )
+    return ExpertRecomputePolicySpec(
+        raw=raw,
+        label=_util_policy_label(util_threshold),
+        policy="util",
+        token_threshold=0,
+        util_threshold=util_threshold,
+    )
+
+
+def _expert_recompute_policies(args: argparse.Namespace) -> list[ExpertRecomputePolicySpec]:
+    values = getattr(args, "expert_recompute_policies", None)
+    if values:
+        specs = [parse_expert_recompute_policy_spec(value) for value in _split_tokens(values)]
+    else:
+        single = getattr(args, "expert_recompute_policy", None)
+        if single:
+            specs = [parse_expert_recompute_policy_spec(str(single))]
+        else:
+            specs = [
+                parse_expert_recompute_policy_spec("none" if threshold == 0 else f"tok{threshold}")
+                for threshold in _expert_recompute_thresholds(args)
+            ]
+    deduped: dict[str, ExpertRecomputePolicySpec] = {}
+    for spec in specs:
+        deduped.setdefault(spec.label, spec)
+    return list(deduped.values())
+
+
+def _effective_activation_recompute(
+    requested_activation_recompute: bool,
+    expert_recompute_policy: ExpertRecomputePolicySpec | int,
+) -> bool:
+    if isinstance(expert_recompute_policy, int):
+        return bool(requested_activation_recompute) and int(expert_recompute_policy) == 0
+    return bool(requested_activation_recompute) and expert_recompute_policy.policy == "none"
 
 
 def _timestamp() -> str:
@@ -210,6 +325,11 @@ def _safe_label(value: str) -> str:
     return "".join(ch.lower() if ch.isalnum() or ch == "-" else "_" for ch in value).strip("_-")
 
 
+def _workload_label(value: str) -> str:
+    name = str(value).rstrip("/").rsplit("/", 1)[-1]
+    return _safe_label(name)
+
+
 def _backend_label(backend: str) -> str:
     return backend.replace("_", "-")
 
@@ -219,13 +339,16 @@ def _input_config_label(args: argparse.Namespace) -> str:
     seq = int(getattr(args, "seq_len", 0) or 0)
     recompute = "recomp" if bool(getattr(args, "activation_recompute", False)) else "norecomp"
     expert_recompute_threshold = int(getattr(args, "expert_recompute_threshold", 0) or 0)
+    expert_recompute_policy_spec = str(getattr(args, "expert_recompute_policy_spec", "") or "")
     parts = []
     if batch > 0:
         parts.append(f"b{batch}")
     if seq > 0:
         parts.append(f"s{seq}")
     parts.append(recompute)
-    if expert_recompute_threshold > 0:
+    if expert_recompute_policy_spec and expert_recompute_policy_spec != "none":
+        parts.append(f"expertpolicy{expert_recompute_policy_spec}")
+    elif expert_recompute_threshold > 0:
         parts.append(f"expertthr{expert_recompute_threshold}")
     return "_".join(parts)
 
@@ -247,6 +370,8 @@ def _result_stem(args: argparse.Namespace, backend: str, profiler: str) -> str:
 
 
 def _raw_output_dir(run_dir: Path, workload: str, args: argparse.Namespace, backend: str, profiler: str) -> Path:
+    if bool(getattr(args, "flat_output", False)):
+        return run_dir / f"s{int(args.seq_len)}"
     return run_dir / workload / _result_stem(args, backend, profiler)
 
 
@@ -283,6 +408,13 @@ def _existing_profile_matches_request(profile: dict[str, Any], args: argparse.Na
     if str(config.get("moe_route_pattern", "")) != str(args.moe_route_pattern):
         return False
     if int(config.get("profile_seed", -1)) != int(args.profile_seed):
+        return False
+    requested_policy_spec = str(getattr(args, "expert_recompute_policy_spec", "") or "")
+    existing_policy_spec = str(config.get("expert_recompute_policy_spec", "") or "")
+    if not existing_policy_spec:
+        existing_threshold = int(config.get("expert_recompute_threshold", 0) or 0)
+        existing_policy_spec = "none" if existing_threshold == 0 else f"tok{existing_threshold}"
+    if requested_policy_spec and existing_policy_spec != requested_policy_spec:
         return False
     if _is_hf_model_workload(workload):
         if str(config.get("weight_source", "")) != "hf-qwen_moe_block":
@@ -368,6 +500,12 @@ def _common_profile_args(
         str(args.kt_max_cache_depth),
         "--expert-recompute-threshold",
         str(args.expert_recompute_threshold),
+        "--expert-recompute-policy",
+        str(getattr(args, "expert_recompute_policy", "tok")),
+        "--expert-recompute-util-threshold",
+        str(getattr(args, "expert_recompute_util_threshold", 0.0)),
+        "--expert-recompute-policy-spec",
+        str(getattr(args, "expert_recompute_policy_spec", "")),
         "--hf-layer-index",
         str(args.hf_layer_index),
         "--profile-seed",
@@ -516,7 +654,7 @@ def _summary_row(
 
 
 def _add_comparisons(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_workload: dict[tuple[str, str, int | None, bool, int], dict[str, dict[str, Any]]] = {}
+    by_workload: dict[tuple[str, str, int | None, bool, str], dict[str, dict[str, Any]]] = {}
     for row in rows:
         if row.get("status") != "ok":
             continue
@@ -526,11 +664,11 @@ def _add_comparisons(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             str(row.get("profiler", "source")),
             int(seq_len) if isinstance(seq_len, int) else None,
             bool(row.get("activation_recompute", False)),
-            int(row.get("expert_recompute_threshold", 0) or 0),
+            str(row.get("expert_recompute_policy_spec", "none") or "none"),
         )
         by_workload.setdefault(key, {})[str(row["backend"])] = row
     comparisons: list[dict[str, Any]] = []
-    for (workload, profiler, seq_len, activation_recompute, expert_recompute_threshold), items in by_workload.items():
+    for (workload, profiler, seq_len, activation_recompute, expert_recompute_policy_spec), items in by_workload.items():
         asym = items.get("asym")
         torch = items.get("torch")
         kt = items.get("kt")
@@ -544,7 +682,8 @@ def _add_comparisons(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "profiler": profiler,
                         "seq_len": seq_len,
                         "activation_recompute": activation_recompute,
-                        "expert_recompute_threshold": expert_recompute_threshold,
+                        "expert_recompute_policy_spec": expert_recompute_policy_spec,
+                        "expert_recompute_threshold": int(asym.get("expert_recompute_threshold", 0) or 0),
                         "comparison": "asym_vs_torch",
                         "candidate_step_ms": asym_ms,
                         "torch_step_ms": torch_ms,
@@ -562,7 +701,8 @@ def _add_comparisons(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "profiler": profiler,
                         "seq_len": seq_len,
                         "activation_recompute": activation_recompute,
-                        "expert_recompute_threshold": expert_recompute_threshold,
+                        "expert_recompute_policy_spec": expert_recompute_policy_spec,
+                        "expert_recompute_threshold": int(kt.get("expert_recompute_threshold", 0) or 0),
                         "comparison": "kt_vs_torch",
                         "candidate_step_ms": kt_ms,
                         "torch_step_ms": torch_ms,
@@ -843,13 +983,24 @@ def parse_args() -> argparse.Namespace:
         "--expert-recompute-threshold",
         type=int,
         default=0,
-        help="Checkpoint/recompute MoE routed experts with fewer than this many routed tokens. 0 disables it.",
+        help="Legacy token policy threshold. tokN recomputes MoE routed experts with routed tokens <= N.",
     )
     parser.add_argument(
         "--expert-recompute-thresholds",
         nargs="+",
         default=None,
-        help="Threshold sweep. Accepts space- or comma-separated non-negative values.",
+        help="Legacy threshold sweep. Accepts space- or comma-separated non-negative values; maps N to tokN.",
+    )
+    parser.add_argument(
+        "--expert-recompute-policy",
+        default=None,
+        help="Single expert recompute policy spec: none, tok128, util075, or tok128-util075.",
+    )
+    parser.add_argument(
+        "--expert-recompute-policies",
+        nargs="+",
+        default=None,
+        help="Policy sweep. Accepts space- or comma-separated specs such as none,tok128,util075,tok128-util075.",
     )
     parser.add_argument("--ncu-clear-jit-cache", action="store_true")
     parser.add_argument(
@@ -871,6 +1022,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-existing", action="store_true", help="Skip profiler tasks whose final profile output already exists.")
     parser.add_argument("--overwrite", action="store_true", help="Run profiler tasks even when final profile output already exists.")
     parser.add_argument("--skip-summary", action="store_true", help="Do not write run-level summary/commands files. Useful for parallel shell orchestration.")
+    parser.add_argument(
+        "--flat-output",
+        action="store_true",
+        help="Write sequence result directories directly as s<seq_len> under --output-root.",
+    )
     return parser.parse_args()
 
 
@@ -881,7 +1037,7 @@ def main() -> None:
     backends = _expand_backends(args.backends)
     profilers = _expand_profilers(args.profilers)
     seq_lens = _seq_lens(args)
-    expert_recompute_thresholds = _expert_recompute_thresholds(args)
+    expert_recompute_policies = _expert_recompute_policies(args)
     cuda_devices = _cuda_devices(args.cuda_devices)
     run_dir = args.output_root / args.run_name if args.run_name else args.output_root
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -897,9 +1053,13 @@ def main() -> None:
         profile_layers = workload_spec.profile_layers if workload_spec.profile_layers is not None else int(args.profile_layers)
         for seq_len in seq_lens:
             args.seq_len = seq_len
-            for expert_recompute_threshold in expert_recompute_thresholds:
-                args.expert_recompute_threshold = expert_recompute_threshold
-                args.activation_recompute = _effective_activation_recompute(requested_activation_recompute, expert_recompute_threshold)
+            for expert_policy in expert_recompute_policies:
+                args.expert_recompute_policy = expert_policy.policy
+                args.expert_recompute_threshold = expert_policy.token_threshold
+                args.expert_recompute_util_threshold = expert_policy.util_threshold
+                args.expert_recompute_policy_spec = expert_policy.label
+                expert_recompute_threshold = expert_policy.token_threshold
+                args.activation_recompute = _effective_activation_recompute(requested_activation_recompute, expert_policy)
                 for backend in backends:
                     for profiler in profilers:
                         physical_cuda_device = cuda_devices[task_index % len(cuda_devices)] if cuda_devices else None
@@ -912,14 +1072,15 @@ def main() -> None:
 
                         commands_for_task: list[list[str]]
                         skip_reason = ""
-                        if expert_recompute_threshold > 0 and not _is_moe_workload(workload):
-                            skip_reason = "per-expert activation recompute thresholds only apply to MoE workloads"
+                        expert_policy_active = expert_policy.policy != "none"
+                        if expert_policy_active and not _is_moe_workload(workload):
+                            skip_reason = "per-expert activation recompute policies only apply to MoE workloads"
                             commands_for_task = []
                         elif backend == "kt" and not _is_moe_workload(workload):
                             skip_reason = "backend=kt is only implemented for MoE LoRA SFT workloads"
                             commands_for_task = []
-                        elif backend == "kt" and expert_recompute_threshold > 0:
-                            skip_reason = "backend=kt does not support per-expert activation recompute thresholds"
+                        elif backend == "kt" and expert_policy_active:
+                            skip_reason = "backend=kt does not support per-expert activation recompute policies"
                             commands_for_task = []
                         elif profiler == "source":
                             commands_for_task = [
@@ -1055,6 +1216,12 @@ def main() -> None:
                                     str(args.vocab_rows),
                                     "--expert-recompute-threshold",
                                     str(args.expert_recompute_threshold),
+                                    "--expert-recompute-policy",
+                                    str(args.expert_recompute_policy),
+                                    "--expert-recompute-util-threshold",
+                                    str(args.expert_recompute_util_threshold),
+                                    "--expert-recompute-policy-spec",
+                                    str(args.expert_recompute_policy_spec),
                                     "--hf-layer-index",
                                     str(args.hf_layer_index),
                                     "--profile-seed",
@@ -1075,7 +1242,10 @@ def main() -> None:
                             "profile_layers": profile_layers,
                             "seq_len": seq_len,
                             "activation_recompute": bool(args.activation_recompute),
+                            "expert_recompute_policy": expert_policy.policy,
+                            "expert_recompute_policy_spec": expert_policy.label,
                             "expert_recompute_threshold": expert_recompute_threshold,
+                            "expert_recompute_util_threshold": expert_policy.util_threshold,
                             "backend": backend,
                             "profiler": profiler,
                             "device": child_device,
@@ -1104,7 +1274,10 @@ def main() -> None:
                             row["profile_layers"] = profile_layers
                             row["seq_len"] = seq_len
                             row["activation_recompute"] = bool(args.activation_recompute)
+                            row["expert_recompute_policy"] = expert_policy.policy
+                            row["expert_recompute_policy_spec"] = expert_policy.label
                             row["expert_recompute_threshold"] = expert_recompute_threshold
+                            row["expert_recompute_util_threshold"] = expert_policy.util_threshold
                             rows.append(row)
                             task_index += 1
                             continue
@@ -1132,7 +1305,10 @@ def main() -> None:
                                     row["profile_layers"] = profile_layers
                                     row["seq_len"] = seq_len
                                     row["activation_recompute"] = bool(args.activation_recompute)
+                                    row["expert_recompute_policy"] = expert_policy.policy
+                                    row["expert_recompute_policy_spec"] = expert_policy.label
                                     row["expert_recompute_threshold"] = expert_recompute_threshold
+                                    row["expert_recompute_util_threshold"] = expert_policy.util_threshold
                                     row["skipped_existing"] = True
                                     rows.append(row)
                                     task_index += 1
@@ -1156,7 +1332,10 @@ def main() -> None:
                             row["profile_layers"] = profile_layers
                             row["seq_len"] = seq_len
                             row["activation_recompute"] = bool(args.activation_recompute)
+                            row["expert_recompute_policy"] = expert_policy.policy
+                            row["expert_recompute_policy_spec"] = expert_policy.label
                             row["expert_recompute_threshold"] = expert_recompute_threshold
+                            row["expert_recompute_util_threshold"] = expert_policy.util_threshold
                             rows.append(row)
                             task_index += 1
                             if returncode != 0 and not args.continue_on_error:
@@ -1188,7 +1367,10 @@ def main() -> None:
                                 profile={},
                             )
                             row["profile_layers"] = profile_layers
+                            row["expert_recompute_policy"] = expert_policy.policy
+                            row["expert_recompute_policy_spec"] = expert_policy.label
                             row["expert_recompute_threshold"] = expert_recompute_threshold
+                            row["expert_recompute_util_threshold"] = expert_policy.util_threshold
                         else:
                             profile, profile_path = _load_profile(output_dir)
                             row = _summary_row(
@@ -1203,7 +1385,10 @@ def main() -> None:
                             )
                             row["profile_json"] = str(profile_path) if profile_path is not None else None
                             row["profile_layers"] = profile_layers
+                            row["expert_recompute_policy"] = expert_policy.policy
+                            row["expert_recompute_policy_spec"] = expert_policy.label
                             row["expert_recompute_threshold"] = expert_recompute_threshold
+                            row["expert_recompute_util_threshold"] = expert_policy.util_threshold
                         row["seq_len"] = seq_len
                         row["activation_recompute"] = bool(args.activation_recompute)
                         rows.append(row)
@@ -1234,7 +1419,8 @@ def main() -> None:
         "backends": backends,
         "profilers": profilers,
         "seq_lens": seq_lens,
-        "expert_recompute_thresholds": expert_recompute_thresholds,
+        "expert_recompute_policies": [spec.label for spec in expert_recompute_policies],
+        "expert_recompute_thresholds": [spec.token_threshold for spec in expert_recompute_policies],
         "commands": commands,
         "runs": rows,
         "comparisons": _add_comparisons(rows),

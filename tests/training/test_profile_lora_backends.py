@@ -123,12 +123,32 @@ def test_profile_lora_e2e_driver_expands_expert_recompute_thresholds() -> None:
     assert driver._expert_recompute_thresholds(args) == [0, 16, 32]
 
 
+def test_profile_lora_e2e_driver_parses_expert_recompute_policies() -> None:
+    driver = _load_profile_lora_e2e_driver_module()
+
+    specs = [
+        driver.parse_expert_recompute_policy_spec(value)
+        for value in ("none", "tok128", "util075", "util75", "util0.75", "tok128-util075")
+    ]
+
+    assert [(spec.label, spec.policy, spec.token_threshold, spec.util_threshold) for spec in specs] == [
+        ("none", "none", 0, 0.0),
+        ("tok128", "tok", 128, 0.0),
+        ("util075", "util", 0, 0.75),
+        ("util075", "util", 0, 0.75),
+        ("util075", "util", 0, 0.75),
+        ("tok128-util075", "tok_util", 128, 0.75),
+    ]
+
+
 def test_profile_lora_e2e_driver_layer_recompute_only_applies_at_zero_expert_threshold() -> None:
     driver = _load_profile_lora_e2e_driver_module()
 
     assert driver._effective_activation_recompute(True, 0)
     assert not driver._effective_activation_recompute(True, 16)
     assert not driver._effective_activation_recompute(False, 0)
+    assert driver._effective_activation_recompute(True, driver.parse_expert_recompute_policy_spec("none"))
+    assert not driver._effective_activation_recompute(True, driver.parse_expert_recompute_policy_spec("util075"))
 
 
 def test_activation_sweep_plot_parses_expert_threshold_result_dirs() -> None:
@@ -143,6 +163,27 @@ def test_activation_sweep_plot_parses_expert_threshold_result_dirs() -> None:
     assert meta["seq_len"] == 256
     assert meta["mode"] == "no_recompute"
     assert meta["expert_recompute_threshold"] == 64
+    assert meta["expert_recompute_policy_spec"] == "tok64"
+
+
+def test_activation_sweep_plot_parses_expert_policy_flat_dirs() -> None:
+    plotter = _load_activation_sweep_plot_module()
+
+    util_meta = plotter.parse_result_dir(
+        Path("/tmp/profiling/lora_e2e_bf16/moe-604m-a38m-l2__b8_s1024_r64_a128/asym__nsys__norecomp__polutil075/s1024")
+    )
+    combined_meta = plotter.parse_result_dir(
+        Path("/tmp/profiling/lora_e2e_bf16/moe-604m-a38m-l2__b8_s1024_r64_a128/asym__nsys__norecomp__poltok128-util075/s1024")
+    )
+
+    assert util_meta is not None
+    assert util_meta["expert_recompute_policy_spec"] == "util075"
+    assert util_meta["expert_recompute_policy"] == "util"
+    assert util_meta["expert_recompute_util_threshold"] == pytest.approx(0.75)
+    assert combined_meta is not None
+    assert combined_meta["expert_recompute_policy_spec"] == "tok128-util075"
+    assert combined_meta["expert_recompute_policy"] == "tok_util"
+    assert combined_meta["expert_recompute_threshold"] == 128
 
 
 def test_profile_lora_e2e_driver_does_not_create_skipped_result_dirs(tmp_path: Path) -> None:

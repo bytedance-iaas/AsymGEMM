@@ -549,24 +549,67 @@ def test_moe_module_expert_threshold_recompute_matches_plain_training() -> None:
         pin_memory=False,
         expert_recompute_threshold=5,
     )
+    util_policy, _, _, _ = moe_module.make_moe_pair(
+        config=config,
+        seed=220,
+        device=device,
+        base_dtype=dtype,
+        backend="torch",
+        pin_memory=False,
+        expert_recompute_policy="util",
+        expert_recompute_util_threshold=0.03,
+    )
 
     plain_out = plain(inputs, static_routing=routes, mode="contiguous")
     thresholded_out = thresholded(inputs, static_routing=routes, mode="contiguous")
+    util_out = util_policy(inputs, static_routing=routes, mode="contiguous")
     assert isinstance(plain_out, torch.Tensor)
     assert isinstance(thresholded_out, torch.Tensor)
+    assert isinstance(util_out, torch.Tensor)
     torch.testing.assert_close(thresholded_out, plain_out, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(util_out, plain_out, rtol=1e-5, atol=1e-5)
 
     _loss(plain_out).backward()
     _loss(thresholded_out).backward()
+    _loss(util_out).backward()
     plain_params = dict(plain.named_parameters())
     thresholded_params = dict(thresholded.named_parameters())
+    util_params = dict(util_policy.named_parameters())
     for name, plain_param in plain_params.items():
         if "lora" not in name:
             continue
         thresholded_grad = thresholded_params[name].grad
+        util_grad = util_params[name].grad
         assert plain_param.grad is not None
         assert thresholded_grad is not None
+        assert util_grad is not None
         torch.testing.assert_close(thresholded_grad, plain_param.grad, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(util_grad, plain_param.grad, rtol=1e-5, atol=1e-5)
+
+
+def test_moe_module_expert_recompute_policy_group_selection() -> None:
+    counts = torch.tensor([1, 32, 96, 127, 129, 192, 255], dtype=torch.long)
+
+    util_mask = moe_module.expert_recompute_group_mask(
+        counts,
+        policy="util",
+        util_threshold=0.75,
+    )
+    tok_mask = moe_module.expert_recompute_group_mask(
+        counts,
+        policy="tok",
+        token_threshold=128,
+    )
+    combined_mask = moe_module.expert_recompute_group_mask(
+        counts,
+        policy="tok_util",
+        token_threshold=128,
+        util_threshold=0.75,
+    )
+
+    assert counts[util_mask].tolist() == [96, 127, 192, 255]
+    assert counts[tok_mask].tolist() == [1, 32, 96, 127]
+    assert counts[combined_mask].tolist() == [96, 127]
 
 
 def test_moe_module_asym_base_weights_are_grouped_host_stacks() -> None:

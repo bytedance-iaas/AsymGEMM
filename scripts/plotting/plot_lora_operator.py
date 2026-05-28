@@ -55,13 +55,19 @@ DTYPE_ALIASES = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-root", type=Path, default=ROOT / "profiling" / "lora_operator")
+    parser.add_argument("--input-root", type=Path, default=None)
     parser.add_argument("--input-csv", action="append", type=Path, default=[], help="Specific result CSV to include.")
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
-        help="Default: profiling/lora_operator_plots.",
+        help="Default: profiling/lora_ops_<precision>/plots.",
+    )
+    parser.add_argument(
+        "--combined-output-dir",
+        type=Path,
+        default=None,
+        help="Default: profiling/lora_ops_<precision>/combined unless --output-dir is set, then <output-dir>/combined.",
     )
     parser.add_argument("--operation", action="append", default=[])
     parser.add_argument("--backend", action="append", default=[])
@@ -80,6 +86,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Remove generated files only from the selected output subdirectories before writing them.",
     )
+    parser.add_argument(
+        "--flat-output",
+        action="store_true",
+        help="When there is one plot group, write its files directly into --output-dir.",
+    )
+    parser.add_argument(
+        "--skip-combined",
+        action="store_true",
+        help="Do not write combined plots/index.",
+    )
+    parser.add_argument(
+        "--combined-only",
+        action="store_true",
+        help="Only write combined plots/index.",
+    )
     return parser.parse_args()
 
 
@@ -87,14 +108,35 @@ def resolve_path(path: Path) -> Path:
     return path if path.is_absolute() else ROOT / path
 
 
+def safe_label(value: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() or ch in ".=-" else "_" for ch in value).strip("_")
+
+
+def precision_label(args: argparse.Namespace) -> str:
+    values: list[str] = []
+    for value in args.precision:
+        values.extend(part for part in value.replace(",", " ").split() if part)
+    return safe_label(values[0]) if values else "bf16"
+
+
+def input_root(args: argparse.Namespace) -> Path:
+    if args.input_root is not None:
+        return resolve_path(args.input_root)
+    return ROOT / "profiling" / f"lora_ops_{precision_label(args)}"
+
+
 def output_root(args: argparse.Namespace) -> Path:
     if args.output_dir is not None:
         return resolve_path(args.output_dir)
-    return ROOT / "profiling" / "lora_operator_plots"
+    return ROOT / "profiling" / f"lora_ops_{precision_label(args)}" / "plots"
 
 
-def safe_label(value: str) -> str:
-    return "".join(ch.lower() if ch.isalnum() or ch in ".=-" else "_" for ch in value).strip("_")
+def combined_output_root(args: argparse.Namespace, root: Path) -> Path:
+    if args.combined_output_dir is not None:
+        return resolve_path(args.combined_output_dir)
+    if args.output_dir is None:
+        return ROOT / "profiling" / f"lora_ops_{precision_label(args)}" / "combined"
+    return root / "combined"
 
 
 def split_values(values: list[str]) -> list[str]:
@@ -141,7 +183,7 @@ def result_csv_paths(input_root: Path) -> list[Path]:
 def read_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
     paths = [resolve_path(path) for path in args.input_csv]
     if not paths:
-        paths = result_csv_paths(resolve_path(args.input_root))
+        paths = result_csv_paths(input_root(args))
     rows: list[dict[str, Any]] = []
     for path in paths:
         rows.extend(read_csv(path))
@@ -195,7 +237,7 @@ def passes_filters(args: argparse.Namespace, row: dict[str, Any]) -> bool:
         return False
     if args.dtype and canonical_dtype(str(row["dtype"])) not in {canonical_dtype(value) for value in args.dtype}:
         return False
-    if args.precision and str(row["precision"]) not in set(args.precision):
+    if args.precision and str(row["precision"]).lower() not in {value.lower() for value in args.precision}:
         return False
     if args.dropout_p and not float_matches(float(row["dropout_p"]), args.dropout_p):
         return False
@@ -426,20 +468,31 @@ def main() -> None:
     args = parse_args()
     rows = read_rows(args)
     if not rows:
-        raise SystemExit(f"no matching result.csv files found under {resolve_path(args.input_root)}")
-
-    root = output_root(args)
-    combined_dir = root / "_combined"
-    write_combined_outputs(rows, combined_dir, clean=args.clean_output)
+        raise SystemExit(f"no matching result.csv files found under {input_root(args)}")
 
     groups: dict[tuple[str, int, int, str, str, float, float, str], list[dict[str, Any]]] = {}
     for row in rows:
         groups.setdefault(group_key(row), []).append(row)
-    for key, group_rows in sorted(groups.items(), key=lambda item: group_label(item[0])):
+
+    root = output_root(args)
+    combined_dir = combined_output_root(args, root)
+    if not args.skip_combined:
+        write_combined_outputs(rows, combined_dir, clean=args.clean_output)
+        print(f"wrote {combined_dir}", flush=True)
+    if args.combined_only:
+        return
+
+    sorted_groups = sorted(groups.items(), key=lambda item: group_label(item[0]))
+    if args.flat_output and len(sorted_groups) == 1:
+        key, group_rows = sorted_groups[0]
+        write_group_outputs(group_rows, root, key, clean=args.clean_output)
+        print(f"wrote {root}", flush=True)
+        return
+
+    for key, group_rows in sorted_groups:
         group_dir = root / safe_label(group_label(key))
         write_group_outputs(group_rows, group_dir, key, clean=args.clean_output)
         print(f"wrote {group_dir}", flush=True)
-    print(f"wrote {combined_dir}", flush=True)
 
 
 if __name__ == "__main__":

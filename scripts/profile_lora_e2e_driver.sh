@@ -15,7 +15,7 @@ GPU_POOL="0,1,2,3"
 # WORKLOADS="dense_3b,moe-604m-a75m|2"
 # WORKLOADS="mlp_3b,mm_3b,dense_3b,moe-604m-a75m|4"
 WORKLOADS="Qwen/Qwen3-30B-A3B|4"
-# WORKLOADS="mlp,dense,moe"
+# WORKLOADS="Qwen/Qwen3-30B-A3B|all"
 BACKENDS="asym,torch"
 # BACKENDS="torch"
 # PROFILERS="nsys,cpu"
@@ -33,10 +33,12 @@ MEASURE_STEPS=20
 PROFILE_LAYERS=1
 BATCH_SIZE=8
 # SEQ_LENS="64,128,256,512,640,768,896,1024,2048,3072,4096,6144,8192,10240,16384,20480"
-SEQ_LENS="1024,2048"
-# These thresholds span the default b8, top_k=8, 128-expert Qwen MoE route
-# counts; learned routing uses the real router so per-expert counts can vary.
-EXPERT_RECOMPUTE_THRESHOLDS="0,128,256,512,768,1024,1536,2048,2560,3072,3584,4096"
+SEQ_LENS="2048"
+# Expert recompute policy specs:
+#   none, tok128, util075, tok128-util075
+# Legacy EXPERT_RECOMPUTE_THRESHOLDS maps 0 -> none and N -> tokN.
+EXPERT_RECOMPUTE_POLICIES="util030,util075,tok128"
+EXPERT_RECOMPUTE_THRESHOLDS=""
 HIDDEN_DIM=1024
 MLP_INTERMEDIATE_DIM=0
 MLP_EXPANSION=4
@@ -80,7 +82,7 @@ Defaults:
   --backends ${BACKENDS}
   --profilers ${PROFILERS}
   --seq-lens ${SEQ_LENS}
-  --expert-recompute-thresholds ${EXPERT_RECOMPUTE_THRESHOLDS}
+  --expert-recompute-policies ${EXPERT_RECOMPUTE_POLICIES}
   --moe-route-pattern ${MOE_ROUTE_PATTERN}
   --hf-layer-index ${HF_LAYER_INDEX}
   --profile-seed ${PROFILE_SEED}
@@ -94,12 +96,14 @@ Shell options:
   --backends LIST                     asym, torch, kt, or all.
   --profilers LIST                    source, nsys, cpu, ncu, or all.
   --seq-lens LIST                     Sequence lengths. Accepts 64,128 or "64 128".
-  --expert-recompute-thresholds LIST   MoE expert token thresholds. 0 disables fine-grained recompute.
+  --expert-recompute-policies LIST     MoE expert recompute policies: none,tok128,util075,tok128-util075.
+  --expert-recompute-thresholds LIST   Legacy token thresholds. 0 maps to none; N maps to tokN.
   --jobs-per-gpu N                    Concurrent Python driver jobs per GPU.
   --python-bin PATH                   Python interpreter. Default: PYTHON or python3.
-  --output-root PATH                  Output root.
-  --run-name NAME                     Optional subdirectory under output root.
-  --precision NAME                    Result precision label.
+  --output-root PATH                  Base output root. Default: profiling.
+                                      Default layout: <root>/lora_e2e_<precision>/<workload>__b<batch>_s<seqs>_r<rank>_a<alpha>
+  --run-name NAME                     Optional config directory under lora_e2e_<precision>.
+  --precision NAME                    Result precision label and output precision directory suffix.
   --attention-impl NAME               Attention implementation: sdpa, fa2, fa3, or fa4.
   --mode NAME                         Result filename mode.
   --moe-route-pattern balanced|learned MoE routing for profiles.
@@ -110,7 +114,7 @@ Shell options:
   --plot true|false                   Write recompute-vs-seq plots after profiling.
   --plot-output-dir PATH              Plot output directory.
   --recompute norecomp|recomp|both     Run without recompute, with recompute, or both.
-                                      Positive expert thresholds run expert-only recompute; layer recompute is only used at threshold 0.
+                                      Active expert policies run expert-only recompute; layer recompute is only used for policy none.
   --overwrite true|false              Re-run completed result dirs. Default false skips them.
   --continue-on-error true|false      Keep sweeping if a point OOMs or fails. Default true records failed rows.
   -h, --help                          Show this help.
@@ -156,7 +160,58 @@ abs_path() {
 }
 
 safe_label() {
-  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]_-' '_' | sed -e 's/^[_-]*//' -e 's/[_-]*$//'
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]_-' '_' | sed -e 's/^[_-]*//' -e 's/[_-]*$//'
+}
+
+workload_label() {
+  local value="$1"
+  local base="${value}"
+  local layers=""
+  local label
+  if [[ "${value}" == *"|"* ]]; then
+    base="${value%%|*}"
+    layers="${value#*|}"
+  fi
+  base="${base%/}"
+  base="${base##*/}"
+  label="$(safe_label "${base}")"
+  if [[ -n "${layers}" && "${layers}" != "all" ]]; then
+    label="${label}-l$(safe_label "${layers}")"
+  fi
+  printf '%s\n' "${label}"
+}
+
+seq_sweep_label() {
+  local joined=""
+  local seq
+  for seq in "${seq_lens[@]}"; do
+    if [[ -z "${joined}" ]]; then
+      joined="${seq}"
+    else
+      joined="${joined}-${seq}"
+    fi
+  done
+  printf '%s\n' "$(safe_label "${joined}")"
+}
+
+config_root_path() {
+  local workload="$1"
+  local config_label
+  if [[ -n "${run_name}" ]]; then
+    config_label="$(safe_label "${run_name}")"
+  else
+    config_label="$(safe_label "$(workload_label "${workload}")__b${batch_size}_s$(seq_sweep_label)_r${LORA_RANK}_a${LORA_ALPHA}")"
+  fi
+  printf '%s/%s\n' "${precision_root}" "${config_label}"
+}
+
+job_root_path() {
+  local config_root="$1"
+  local backend="$2"
+  local profiler="$3"
+  local recompute="$4"
+  local expert_policy="$5"
+  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}")"
 }
 
 bool_value() {
@@ -199,15 +254,6 @@ expand_workload() {
   esac
 }
 
-workload_label() {
-  if [[ "$1" == *"|"* ]]; then
-    printf '%s-l%s\n' "$(safe_label "${1%%|*}")" "${1#*|}"
-  else
-    safe_label "$1"
-    printf '\n'
-  fi
-}
-
 expand_alias() {
   local kind="$1"
   local value="$2"
@@ -236,6 +282,73 @@ parse_expert_recompute_thresholds() {
   while read -r value; do
     [[ "${value}" =~ ^[0-9]+$ ]] || die "expert recompute thresholds must be non-negative integers; got '${value}'"
     printf '%s\n' "${value}"
+  done < <(tokens "$@" | dedupe)
+}
+
+normalize_util_label() {
+  local suffix="$1"
+  local digits
+  case "${suffix}" in
+    1|1.0|1.00|1.000) printf '%s\n' "util100"; return ;;
+    0|0.0|0.00|0.000) printf '%s\n' "util000"; return ;;
+  esac
+  if [[ "${suffix}" =~ ^0\.([0-9]+)$ ]]; then
+    digits="${BASH_REMATCH[1]}"
+    [[ "${#digits}" -eq 1 ]] && digits="${digits}0"
+    printf 'util%03d\n' "$((10#${digits:0:3}))"
+  elif [[ "${suffix}" =~ ^0([0-9]+)$ ]]; then
+    digits="${BASH_REMATCH[1]}"
+    printf 'util%03d\n' "$((10#${digits}))"
+  elif [[ "${suffix}" =~ ^[0-9]+$ ]]; then
+    [[ "${suffix}" == "1" ]] && { printf '%s\n' "util100"; return; }
+    printf 'util%03d\n' "$((10#${suffix}))"
+  else
+    die "invalid util policy threshold '${suffix}'"
+  fi
+}
+
+normalize_expert_recompute_policy() {
+  local raw="${1,,}"
+  raw="${raw//_/-}"
+  case "${raw}" in
+    ""|none|off|false|0) printf '%s\n' "none"; return ;;
+  esac
+  if [[ "${raw}" =~ ^tok([0-9]+)$ ]]; then
+    if [[ "${BASH_REMATCH[1]}" == "0" ]]; then
+      printf '%s\n' "none"
+    else
+      printf 'tok%d\n' "$((10#${BASH_REMATCH[1]}))"
+    fi
+    return
+  fi
+  if [[ "${raw}" =~ ^util(.+)$ ]]; then
+    normalize_util_label "${BASH_REMATCH[1]}"
+    return
+  fi
+  if [[ "${raw}" =~ ^tok([0-9]+)-util(.+)$ ]]; then
+    local tok="$((10#${BASH_REMATCH[1]}))"
+    ((tok > 0)) || { printf '%s\n' "none"; return; }
+    printf 'tok%d-%s\n' "${tok}" "$(normalize_util_label "${BASH_REMATCH[2]}")"
+    return
+  fi
+  die "invalid expert recompute policy '${1}'; expected none, tokXX, utilXX, or tokXX-utilXX"
+}
+
+thresholds_to_expert_recompute_policies() {
+  local threshold
+  while read -r threshold; do
+    if [[ "${threshold}" == "0" ]]; then
+      printf '%s\n' "none"
+    else
+      printf 'tok%d\n' "$((10#${threshold}))"
+    fi
+  done < <(parse_expert_recompute_thresholds "$@")
+}
+
+parse_expert_recompute_policies() {
+  local value
+  while read -r value; do
+    normalize_expert_recompute_policy "${value}"
   done < <(tokens "$@" | dedupe)
 }
 
@@ -302,7 +415,9 @@ workload_spec="${WORKLOADS}"
 backend_spec="${BACKENDS}"
 profiler_spec="${PROFILERS}"
 seq_spec="${SEQ_LENS}"
+expert_recompute_policy_spec="${EXPERT_RECOMPUTE_POLICIES}"
 expert_recompute_threshold_spec="${EXPERT_RECOMPUTE_THRESHOLDS}"
+expert_recompute_policy_explicit=0
 batch_size="${BATCH_SIZE}"
 jobs_per_gpu="${JOBS_PER_GPU}"
 output_root="${OUTPUT_ROOT}"
@@ -333,6 +448,8 @@ while (($#)); do
     --profilers=*) profiler_spec="${1#*=}"; shift ;;
     --seq-len=*) die "use --seq-lens; this wrapper keeps one option per setting" ;;
     --seq-lens=*) seq_spec="${1#*=}"; shift ;;
+    --expert-recompute-policy=*) die "use --expert-recompute-policies; this wrapper keeps one option per setting" ;;
+    --expert-recompute-policies=*) expert_recompute_policy_spec="${1#*=}"; expert_recompute_policy_explicit=1; shift ;;
     --expert-recompute-threshold=*) die "use --expert-recompute-thresholds; this wrapper keeps one option per setting" ;;
     --expert-recompute-thresholds=*) expert_recompute_threshold_spec="${1#*=}"; shift ;;
     --batch-size=*) batch_size="${1#*=}"; shift ;;
@@ -360,6 +477,8 @@ while (($#)); do
     --profilers) collect_values "$1" vals "${@:2}"; profiler_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
     --seq-len) die "use --seq-lens; this wrapper keeps one option per setting" ;;
     --seq-lens) collect_values "$1" vals "${@:2}"; seq_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
+    --expert-recompute-policy) die "use --expert-recompute-policies; this wrapper keeps one option per setting" ;;
+    --expert-recompute-policies) collect_values "$1" vals "${@:2}"; expert_recompute_policy_spec="${vals[*]}"; expert_recompute_policy_explicit=1; set -- "${REMAINING[@]}" ;;
     --expert-recompute-threshold) die "use --expert-recompute-thresholds; this wrapper keeps one option per setting" ;;
     --expert-recompute-thresholds) collect_values "$1" vals "${@:2}"; expert_recompute_threshold_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
     --batch-size) need_value "$1" "${2-}"; batch_size="$2"; shift 2 ;;
@@ -399,10 +518,13 @@ case "${moe_route_pattern}" in balanced|learned) ;; *) die "--moe-route-pattern 
 [[ "${hf_layer_index}" =~ ^[0-9]+$ ]] || die "--hf-layer-index must be a non-negative integer"
 [[ "${profile_seed}" =~ ^-?[0-9]+$ ]] || die "--profile-seed must be an integer"
 [[ "${jobs_per_gpu}" =~ ^[0-9]+$ && "${jobs_per_gpu}" -gt 0 ]] || die "--jobs-per-gpu must be a positive integer"
+if ((!expert_recompute_policy_explicit)) && [[ -n "${expert_recompute_threshold_spec}" ]]; then
+  expert_recompute_policy_spec="$(thresholds_to_expert_recompute_policies "${expert_recompute_threshold_spec}" | paste -sd, -)"
+fi
 
 mapfile -t gpus < <(parse_gpu_list "${gpu_spec}")
 mapfile -t seq_lens < <(parse_seq_lens "${seq_spec}")
-mapfile -t expert_recompute_thresholds < <(parse_expert_recompute_thresholds "${expert_recompute_threshold_spec}")
+mapfile -t expert_recompute_policies < <(parse_expert_recompute_policies "${expert_recompute_policy_spec}" | dedupe)
 mapfile -t workloads < <(tokens "${workload_spec}" | while read -r value; do expand_workload "${value}"; done | dedupe)
 mapfile -t plot_workloads < <(printf '%s\n' "${workloads[@]}" | while read -r value; do workload_label "${value}"; done | dedupe)
 mapfile -t backends < <(tokens "${backend_spec}" | while read -r value; do expand_alias backend "${value}"; done | dedupe)
@@ -411,7 +533,7 @@ mapfile -t recompute_modes < <(recompute_values "${recompute_spec}")
 
 ((${#gpus[@]})) || die "GPU pool is empty"
 ((${#seq_lens[@]})) || die "sequence length list is empty"
-((${#expert_recompute_thresholds[@]} > 0)) || die "expert recompute threshold list is empty"
+((${#expert_recompute_policies[@]} > 0)) || die "expert recompute policy list is empty"
 ((${#workloads[@]} && ${#backends[@]} && ${#profilers[@]} && ${#recompute_modes[@]})) || die "workloads/backends/profilers/recompute expanded to an empty list"
 
 preflight_python
@@ -448,15 +570,15 @@ else
 fi
 ((continue_on_error)) && driver_args+=(--continue-on-error)
 
-run_root="$(abs_path "${output_root}")"
-[[ -n "${run_name}" ]] && run_root="${run_root}/${run_name}"
-log_dir="${run_root}/driver_logs"
-mkdir -p "${log_dir}"
-manifest="${log_dir}/$(safe_label "${precision}_lora-sft").tsv"
-printf 'status\tpid\tgpu\trecompute\texpert_threshold\tworkload\tbackend\tlog\n' > "${manifest}"
+base_output_root="$(abs_path "${output_root}")"
+precision_label="$(safe_label "${precision}")"
+precision_root="${base_output_root}/lora_e2e_${precision_label}"
+mkdir -p "${precision_root}"
+echo "Output precision root: ${precision_root}"
 
 declare -a all_pids=() active_pids=() available_gpus=()
-declare -A pid_gpu=() pid_recompute=() pid_expert_threshold=() pid_workload=() pid_backend=() pid_log=()
+declare -A pid_gpu=() pid_recompute=() pid_expert_policy=() pid_workload=() pid_backend=() pid_profiler=() pid_log=() pid_config_root=() pid_job_root=()
+declare -A plot_roots=()
 failures=0
 
 cleanup_jobs() {
@@ -481,12 +603,15 @@ finish_one() {
   fi
   [[ -n "${pid}" ]] || pid="${active_pids[0]}"
   if ((status == 0)); then
-    echo "Finished pid=${pid} gpu=${pid_gpu[$pid]} recompute=${pid_recompute[$pid]} expert_threshold=${pid_expert_threshold[$pid]} workload=${pid_workload[$pid]} backend=${pid_backend[$pid]}"
+    echo "Finished pid=${pid} gpu=${pid_gpu[$pid]} recompute=${pid_recompute[$pid]} expert_policy=${pid_expert_policy[$pid]} workload=${pid_workload[$pid]} backend=${pid_backend[$pid]} profiler=${pid_profiler[$pid]}"
   else
     failures=$((failures + 1))
-    echo "FAILED pid=${pid} status=${status} gpu=${pid_gpu[$pid]} recompute=${pid_recompute[$pid]} expert_threshold=${pid_expert_threshold[$pid]} workload=${pid_workload[$pid]} backend=${pid_backend[$pid]}; log=${pid_log[$pid]}" >&2
+    echo "FAILED pid=${pid} status=${status} gpu=${pid_gpu[$pid]} recompute=${pid_recompute[$pid]} expert_policy=${pid_expert_policy[$pid]} workload=${pid_workload[$pid]} backend=${pid_backend[$pid]} profiler=${pid_profiler[$pid]}; log=${pid_log[$pid]}" >&2
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${status}" "${pid}" "${pid_gpu[$pid]}" "${pid_recompute[$pid]}" "${pid_expert_threshold[$pid]}" "${pid_workload[$pid]}" "${pid_backend[$pid]}" "${pid_log[$pid]}" >> "${manifest}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${status}" "${pid}" "${pid_gpu[$pid]}" "${pid_recompute[$pid]}" "${pid_expert_policy[$pid]}" \
+    "${pid_workload[$pid]}" "${pid_backend[$pid]}" "${pid_profiler[$pid]}" "${pid_job_root[$pid]}" "${pid_log[$pid]}" \
+    >> "${pid_config_root[$pid]}/jobs.tsv"
   local -a remaining=()
   local active_pid
   for active_pid in "${active_pids[@]}"; do
@@ -498,31 +623,48 @@ finish_one() {
 
 launch_job() {
   local recompute="$1"
-  local expert_threshold="$2"
+  local expert_policy="$2"
   local workload="$3"
   local backend="$4"
-  local gpu="$5"
-  local threshold_label=""
-  ((expert_threshold > 0)) && threshold_label="_expertthr${expert_threshold}"
-  local log_file="${log_dir}/$(safe_label "${precision}_lora-sft_${recompute}${threshold_label}_${workload}_${backend}_gpu${gpu}").log"
+  local profiler="$5"
+  local gpu="$6"
+  local config_root
+  local job_root
+  config_root="$(config_root_path "${workload}")"
+  job_root="$(job_root_path "${config_root}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}")"
+  mkdir -p "${job_root}"
+  if [[ ! -e "${config_root}/jobs.tsv" ]]; then
+    printf 'status\tpid\tgpu\trecompute\texpert_policy\tworkload\tbackend\tprofiler\tjob_dir\tlog\n' > "${config_root}/jobs.tsv"
+  fi
+  plot_roots["${config_root}"]="1"
+  local log_file="${job_root}/job.log"
+  local command_file="${job_root}/command.txt"
   local cmd=(
     "${PYTHON_BIN}" "${PY_DRIVER}"
     --workloads "${workload}"
     --backends "${backend}"
-    --profilers "${profilers[@]}"
+    --profilers "${profiler}"
     --cuda-devices "${gpu}"
-    --output-root "${output_root}"
+    --output-root "${job_root}"
     --precision "${precision}"
     --mode "${mode}"
-    --expert-recompute-threshold "${expert_threshold}"
+    --expert-recompute-policy "${expert_policy}"
     --skip-summary
+    --flat-output
     "${driver_args[@]}"
     "${pass_args[@]}"
   )
-  [[ -n "${run_name}" ]] && cmd+=(--run-name "${run_name}")
   [[ "${recompute}" == "recomp" ]] && cmd+=(--activation-recompute)
 
-  echo "Launching gpu=${gpu} recompute=${recompute} expert_threshold=${expert_threshold} workload=${workload} backend=${backend}"
+  {
+    printf 'cd %q\n' "${ROOT}"
+    printf 'CUDA_VISIBLE_DEVICES=%q' "${gpu}"
+    printf ' %q' "${cmd[@]}"
+    printf '\n'
+  } > "${command_file}"
+
+  echo "Launching gpu=${gpu} recompute=${recompute} expert_policy=${expert_policy} workload=${workload} backend=${backend} profiler=${profiler}"
+  echo "  job=${job_root}"
   echo "  log=${log_file}"
   (cd "${ROOT}" && exec "${cmd[@]}") > "${log_file}" 2>&1 &
 
@@ -531,10 +673,13 @@ launch_job() {
   active_pids+=("${pid}")
   pid_gpu[$pid]="${gpu}"
   pid_recompute[$pid]="${recompute}"
-  pid_expert_threshold[$pid]="${expert_threshold}"
+  pid_expert_policy[$pid]="${expert_policy}"
   pid_workload[$pid]="${workload}"
   pid_backend[$pid]="${backend}"
+  pid_profiler[$pid]="${profiler}"
   pid_log[$pid]="${log_file}"
+  pid_config_root[$pid]="${config_root}"
+  pid_job_root[$pid]="${job_root}"
 }
 
 for gpu in "${gpus[@]}"; do
@@ -542,71 +687,55 @@ for gpu in "${gpus[@]}"; do
     available_gpus+=("${gpu}")
   done
 done
-for expert_threshold in "${expert_recompute_thresholds[@]}"; do
+for expert_policy in "${expert_recompute_policies[@]}"; do
   for recompute in "${recompute_modes[@]}"; do
-    if ((expert_threshold > 0)) && [[ "${recompute}" == "recomp" ]]; then
+    if [[ "${expert_policy}" != "none" && "${recompute}" == "recomp" ]]; then
       continue
     fi
     for workload in "${workloads[@]}"; do
       for backend in "${backends[@]}"; do
-        while ((${#available_gpus[@]} == 0)); do finish_one; done
-        run_gpu="${available_gpus[0]}"
-        available_gpus=("${available_gpus[@]:1}")
-        launch_job "${recompute}" "${expert_threshold}" "${workload}" "${backend}" "${run_gpu}"
+        for profiler in "${profilers[@]}"; do
+          while ((${#available_gpus[@]} == 0)); do finish_one; done
+          run_gpu="${available_gpus[0]}"
+          available_gpus=("${available_gpus[@]:1}")
+          launch_job "${recompute}" "${expert_policy}" "${workload}" "${backend}" "${profiler}" "${run_gpu}"
+        done
       done
     done
   done
 done
 while ((${#active_pids[@]})); do finish_one; done
 
-echo "Job manifest: ${manifest}"
 if ((failures > 0)); then
   echo "${failures} profiling job(s) failed" >&2
   exit 1
 fi
 
 if ((dry_run)); then
-  echo "Dry run completed; skipping aggregate summary collection."
+  echo "Dry run completed; skipping plots."
   exit 0
 fi
 
-echo "Writing aggregate summary..."
-for expert_threshold in "${expert_recompute_thresholds[@]}"; do
-  for recompute in "${recompute_modes[@]}"; do
-    if ((expert_threshold > 0)) && [[ "${recompute}" == "recomp" ]]; then
-      continue
-    fi
-    summary_cmd=(
-      "${PYTHON_BIN}" "${PY_DRIVER}"
-      --workloads "${workloads[@]}"
-      --backends "${backends[@]}"
-      --profilers "${profilers[@]}"
-      --output-root "${output_root}"
-      --precision "${precision}"
-      --mode "${mode}"
-      --expert-recompute-threshold "${expert_threshold}"
-      --collect-existing
-      "${driver_args[@]}"
-      "${pass_args[@]}"
-    )
-    [[ -n "${run_name}" ]] && summary_cmd+=(--run-name "${run_name}")
-    [[ "${recompute}" == "recomp" ]] && summary_cmd+=(--activation-recompute)
-    echo "  recompute=${recompute} expert_threshold=${expert_threshold}"
-    (cd "${ROOT}" && "${summary_cmd[@]}")
-  done
-done
-
 if ((plot)); then
-  plot_cmd=("${PYTHON_BIN}" "${PLOT_RECOMPUTE_SCRIPT}" --input-root "${run_root}" --precision "${precision}" --clean-output)
-  for workload in "${plot_workloads[@]}"; do plot_cmd+=(--workload "${workload}"); done
-  for backend in "${backends[@]}"; do plot_cmd+=(--backend "${backend}"); done
-  for profiler in "${profilers[@]}"; do plot_cmd+=(--profiler "${profiler}"); done
-  for recompute in "${recompute_modes[@]}"; do plot_cmd+=(--recompute "${recompute}"); done
-  plot_cmd+=(--expert-recompute-thresholds "${expert_recompute_thresholds[@]}")
-  plot_cmd+=(--batch-size "${batch_size}" --seq-lens "${seq_lens[@]}")
-  [[ -n "${plot_output_dir}" ]] && plot_cmd+=(--output-dir "$(abs_path "${plot_output_dir}")")
-  echo "Writing activation recompute sweep plots..."
-  (cd "${ROOT}" && "${plot_cmd[@]}")
+  for config_root in "${!plot_roots[@]}"; do
+    plot_root="${config_root}/plots"
+    [[ -n "${plot_output_dir}" ]] && plot_root="$(abs_path "${plot_output_dir}")"
+    plot_cmd=(
+      "${PYTHON_BIN}" "${PLOT_RECOMPUTE_SCRIPT}"
+      --input-root "${config_root}"
+      --output-dir "${plot_root}"
+      --combined-output-dir "${plot_root}"
+      --precision "${precision}"
+      --clean-output
+    )
+    for backend in "${backends[@]}"; do plot_cmd+=(--backend "${backend}"); done
+    for profiler in "${profilers[@]}"; do plot_cmd+=(--profiler "${profiler}"); done
+    for recompute in "${recompute_modes[@]}"; do plot_cmd+=(--recompute "${recompute}"); done
+    plot_cmd+=(--expert-recompute-policies "${expert_recompute_policies[@]}")
+    plot_cmd+=(--batch-size "${batch_size}" --seq-lens "${seq_lens[@]}")
+    echo "Writing activation recompute sweep plots: ${plot_root}"
+    (cd "${ROOT}" && "${plot_cmd[@]}")
+  done
 fi
 
 echo "All profiling jobs completed."

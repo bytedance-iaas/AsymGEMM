@@ -47,6 +47,7 @@ CSV_FIELDS = [
     "scale",
     "dtype",
     "precision",
+    "asym_bf16_output_dtype",
     "dropout_p",
     "warmup",
     "iters",
@@ -85,7 +86,13 @@ def nvtx_pop(pushed: bool) -> None:
         torch.cuda.nvtx.range_pop()
 
 
-def make_asym_base(weight: torch.Tensor, *, pin_memory: bool, precision: str) -> torch.nn.Module:
+def make_asym_base(
+    weight: torch.Tensor,
+    *,
+    pin_memory: bool,
+    precision: str,
+    bf16_output_dtype: str,
+) -> torch.nn.Module:
     from asym_gemm.training.frozen_linear import AsymExecutionStats, AsymFrozenLinear
 
     base = AsymFrozenLinear(
@@ -94,6 +101,7 @@ def make_asym_base(weight: torch.Tensor, *, pin_memory: bool, precision: str) ->
         pin_memory=pin_memory,
         stats=AsymExecutionStats(),
         precision=precision,
+        bf16_output_dtype=bf16_output_dtype,
     )
     base.profile_name = "lora_kernel"
     return base
@@ -120,12 +128,25 @@ class LoRAInputs:
             generator=generator,
         )
         self.a = torch.randn(args.rank, args.in_features, device=self.device, dtype=self.dtype, generator=generator)
-        self.s = torch.randn(self.tokens, args.rank, device=self.device, dtype=self.dtype, generator=generator)
+        self.s: torch.Tensor | None = (
+            torch.randn(self.tokens, args.rank, device=self.device, dtype=self.dtype, generator=generator)
+            if args.operation == "xw_sb"
+            else None
+        )
         self.b = torch.randn(args.out_features, args.rank, device=self.device, dtype=self.dtype, generator=generator)
-        self.grad = torch.randn(self.tokens, args.out_features, device=self.device, dtype=self.dtype, generator=generator)
+        self.grad: torch.Tensor | None = (
+            torch.randn(self.tokens, args.out_features, device=self.device, dtype=self.dtype, generator=generator)
+            if args.backward
+            else None
+        )
         self.base = None
         if args.backend == "asym":
-            self.base = make_asym_base(self.w, pin_memory=self.device.type == "cuda", precision=args.precision)
+            self.base = make_asym_base(
+                self.w,
+                pin_memory=self.device.type == "cuda",
+                precision=args.precision,
+                bf16_output_dtype=args.asym_bf16_output_dtype,
+            )
             self.w = None
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -133,13 +154,15 @@ class LoRAInputs:
     def enable_backward(self) -> None:
         self.x.requires_grad_(True)
         self.a.requires_grad_(True)
-        self.s.requires_grad_(True)
+        if self.s is not None:
+            self.s.requires_grad_(True)
         self.b.requires_grad_(True)
 
     def clear_grads(self) -> None:
         self.x.grad = None
         self.a.grad = None
-        self.s.grad = None
+        if self.s is not None:
+            self.s.grad = None
         self.b.grad = None
 
 
@@ -152,6 +175,7 @@ def base_linear(inputs: LoRAInputs) -> torch.Tensor:
 
 def xw_sb(inputs: LoRAInputs, scale: float, dropout_p: float = 0.0) -> torch.Tensor:
     del dropout_p
+    assert inputs.s is not None
     base = base_linear(inputs)
     lora = inputs.s @ inputs.b.T
     return base + (lora * scale).to(dtype=base.dtype)
@@ -244,7 +268,17 @@ def parse_args() -> argparse.Namespace:
         help="Dropout probability applied before X @ A.T for full_lora.",
     )
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
-    parser.add_argument("--precision", choices=["bf16", "fp8", "fp4"], default="bf16")
+    parser.add_argument(
+        "--precision",
+        default="bf16",
+        help="AsymGEMM execution precision and result label. Common values: bf16, fp8, fp4.",
+    )
+    parser.add_argument(
+        "--asym-bf16-output-dtype",
+        choices=["bf16", "bfloat16", "fp32", "float32"],
+        default="bf16",
+        help="Output buffer dtype for direct BF16 AsymGEMM before returning BF16. Default: bf16.",
+    )
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--backward", action="store_true")
@@ -285,6 +319,7 @@ def build_result(args: argparse.Namespace, inputs: LoRAInputs, times: list[float
         "scale": float(args.scale),
         "dtype": str(inputs.dtype).removeprefix("torch."),
         "precision": str(args.precision),
+        "asym_bf16_output_dtype": str(args.asym_bf16_output_dtype),
         "dropout_p": float(args.dropout_p),
         "warmup": int(args.warmup),
         "iters": int(args.iters),
@@ -352,6 +387,7 @@ def main() -> None:
         try:
             out = op(inputs, float(args.scale), float(args.dropout_p))
             if args.backward:
+                assert inputs.grad is not None
                 out.backward(inputs.grad)
                 inputs.clear_grads()
         finally:

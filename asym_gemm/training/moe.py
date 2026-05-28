@@ -402,6 +402,89 @@ def normalize_expert_recompute_threshold(value: int | None) -> int:
     return threshold
 
 
+EXPERT_RECOMPUTE_TILE_ROWS = 128
+VALID_EXPERT_RECOMPUTE_POLICIES = ("none", "tok", "util", "tok_util")
+
+
+def normalize_expert_recompute_policy(value: str | None) -> str:
+    policy = str(value or "tok").strip().lower().replace("-", "_")
+    aliases = {
+        "off": "none",
+        "false": "none",
+        "0": "none",
+        "token": "tok",
+        "tokens": "tok",
+        "threshold": "tok",
+        "tokutil": "tok_util",
+        "token_util": "tok_util",
+        "tokens_util": "tok_util",
+    }
+    policy = aliases.get(policy, policy)
+    if policy not in VALID_EXPERT_RECOMPUTE_POLICIES:
+        raise ValueError(
+            f"expert_recompute_policy must be one of {VALID_EXPERT_RECOMPUTE_POLICIES}, got {value!r}"
+        )
+    return policy
+
+
+def normalize_expert_recompute_util_threshold(value: float | None) -> float:
+    threshold = float(value or 0.0)
+    if threshold < 0.0 or threshold > 1.0:
+        raise ValueError(f"expert_recompute_util_threshold must be in [0, 1], got {value}")
+    return threshold
+
+
+def expert_recompute_policy_enabled(
+    policy: str,
+    *,
+    token_threshold: int = 0,
+    util_threshold: float = 0.0,
+) -> bool:
+    normalized = normalize_expert_recompute_policy(policy)
+    token_threshold = normalize_expert_recompute_threshold(token_threshold)
+    util_threshold = normalize_expert_recompute_util_threshold(util_threshold)
+    if normalized == "none":
+        return False
+    if normalized == "tok":
+        return token_threshold > 0
+    if normalized == "util":
+        return util_threshold > 0.0
+    if normalized == "tok_util":
+        return token_threshold > 0 and util_threshold > 0.0
+    return False
+
+
+def expert_recompute_group_mask(
+    counts: torch.Tensor,
+    *,
+    policy: str = "tok",
+    token_threshold: int = 0,
+    util_threshold: float = 0.0,
+    tile_rows: int = EXPERT_RECOMPUTE_TILE_ROWS,
+) -> torch.Tensor:
+    if tile_rows <= 0:
+        raise ValueError(f"tile_rows must be positive, got {tile_rows}")
+    policy = normalize_expert_recompute_policy(policy)
+    token_threshold = normalize_expert_recompute_threshold(token_threshold)
+    util_threshold = normalize_expert_recompute_util_threshold(util_threshold)
+    counts_long = counts.to(dtype=torch.long)
+    active = counts_long > 0
+    if policy == "none":
+        return torch.zeros_like(active)
+    recompute = active
+    if policy in {"tok", "tok_util"}:
+        if token_threshold <= 0:
+            return torch.zeros_like(active)
+        recompute = recompute & (counts_long <= token_threshold)
+    if policy in {"util", "tok_util"}:
+        if util_threshold <= 0.0:
+            return torch.zeros_like(active)
+        paid_rows = ((counts_long + tile_rows - 1) // tile_rows) * tile_rows
+        util = counts_long.to(dtype=torch.float32) / paid_rows.clamp_min(1).to(dtype=torch.float32)
+        recompute = recompute & (util >= util_threshold)
+    return recompute
+
+
 def pack_tokens_contiguous(hidden: torch.Tensor, metadata: ContiguousRouteMetadata) -> torch.Tensor:
     flat = hidden.reshape(metadata.num_tokens, -1)
     return flat.index_select(0, metadata.token_indices).reshape(metadata.num_routes, *hidden.shape[1:]).contiguous()
@@ -1074,6 +1157,8 @@ class AsymMoELayer(nn.Module):
         lora_dtype: torch.dtype | str = torch.bfloat16,
         precision: str = "bf16",
         expert_recompute_threshold: int = 0,
+        expert_recompute_policy: str = "tok",
+        expert_recompute_util_threshold: float = 0.0,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1082,6 +1167,8 @@ class AsymMoELayer(nn.Module):
         if self.precision not in VALID_ASYM_PRECISIONS:
             raise ValueError(f"unsupported precision={precision!r}; expected one of {VALID_ASYM_PRECISIONS}")
         self.expert_recompute_threshold = normalize_expert_recompute_threshold(expert_recompute_threshold)
+        self.expert_recompute_policy = normalize_expert_recompute_policy(expert_recompute_policy)
+        self.expert_recompute_util_threshold = normalize_expert_recompute_util_threshold(expert_recompute_util_threshold)
         self.input_layernorm = _make_frozen_norm(layer_state, "input_layernorm_weight", device=device)
         self.post_attention_layernorm = _make_frozen_norm(layer_state, "post_attention_layernorm_weight", device=device)
         self.self_attn = SelfAttention(layer_state, config=config, device=device, base_dtype=base_dtype)
@@ -1379,6 +1466,21 @@ class AsymMoELayer(nn.Module):
         selected_experts = torch.cat([selected_experts, sentinel], dim=0)
         return packed.index_select(0, route_indices), selected_offsets, selected_experts, route_indices
 
+    def _expert_recompute_enabled(self) -> bool:
+        return expert_recompute_policy_enabled(
+            self.expert_recompute_policy,
+            token_threshold=self.expert_recompute_threshold,
+            util_threshold=self.expert_recompute_util_threshold,
+        )
+
+    def _expert_recompute_groups(self, counts: torch.Tensor) -> torch.Tensor:
+        return expert_recompute_group_mask(
+            counts,
+            policy=self.expert_recompute_policy,
+            token_threshold=self.expert_recompute_threshold,
+            util_threshold=self.expert_recompute_util_threshold,
+        )
+
     def _run_grouped_compact_thresholded(
         self,
         packed: torch.Tensor,
@@ -1390,10 +1492,8 @@ class AsymMoELayer(nn.Module):
         down_base: nn.Module,
         shared: bool = False,
     ) -> torch.Tensor:
-        threshold = self.expert_recompute_threshold
         counts = (offsets[1:] - offsets[:-1]).to(dtype=torch.long)
-        active = counts > 0
-        recompute_groups = active & (counts < threshold)
+        recompute_groups = self._expert_recompute_groups(counts)
         if not bool(recompute_groups.any().item()):
             return self._run_grouped_compact_body(
                 packed,
@@ -1436,7 +1536,7 @@ class AsymMoELayer(nn.Module):
         dense_experts: bool = False,
     ) -> torch.Tensor:
         if (
-            self.expert_recompute_threshold <= 0
+            not self._expert_recompute_enabled()
             or shared
             or not dense_experts
             or not self.training
@@ -1833,6 +1933,8 @@ class MoE(nn.Module):
         kt_max_cache_depth: int = 1,
         gradient_checkpointing: bool = False,
         expert_recompute_threshold: int = 0,
+        expert_recompute_policy: str = "tok",
+        expert_recompute_util_threshold: float = 0.0,
     ) -> None:
         super().__init__()
         if backend not in VALID_MOE_BACKENDS:
@@ -1842,10 +1944,17 @@ class MoE(nn.Module):
             raise ValueError(f"unsupported precision={precision!r}; expected one of {VALID_ASYM_PRECISIONS}")
         resolved_kt_method = normalize_kt_method(kt_method)
         expert_recompute_threshold = normalize_expert_recompute_threshold(expert_recompute_threshold)
+        expert_recompute_policy = normalize_expert_recompute_policy(expert_recompute_policy)
+        expert_recompute_util_threshold = normalize_expert_recompute_util_threshold(expert_recompute_util_threshold)
+        expert_recompute_enabled = expert_recompute_policy_enabled(
+            expert_recompute_policy,
+            token_threshold=expert_recompute_threshold,
+            util_threshold=expert_recompute_util_threshold,
+        )
         if backend == "kt" and config.num_shared_experts != 0:
             raise ValueError("backend=kt requires num_shared_experts=0 for the first KT MoE SFT comparison")
-        if backend == "kt" and expert_recompute_threshold > 0:
-            raise ValueError("backend=kt does not support per-expert activation recompute thresholds")
+        if backend == "kt" and expert_recompute_enabled:
+            raise ValueError("backend=kt does not support per-expert activation recompute policies")
         self.config = config
         self.device_hint = torch.device(device)
         self.base_dtype = base_dtype
@@ -1856,6 +1965,8 @@ class MoE(nn.Module):
         self.lora_dtype = lora_dtype
         self.gradient_checkpointing = bool(gradient_checkpointing)
         self.expert_recompute_threshold = expert_recompute_threshold
+        self.expert_recompute_policy = expert_recompute_policy
+        self.expert_recompute_util_threshold = expert_recompute_util_threshold
         self.stats = stats if stats is not None else AsymExecutionStats()
         state = clone_moe_state(state or make_moe_state(config, base_dtype=base_dtype))
         self.register_buffer(
@@ -1902,6 +2013,8 @@ class MoE(nn.Module):
                         lora_dtype=lora_dtype,
                         precision=self.precision,
                         expert_recompute_threshold=self.expert_recompute_threshold,
+                        expert_recompute_policy=self.expert_recompute_policy,
+                        expert_recompute_util_threshold=self.expert_recompute_util_threshold,
                     )
                 )
             self.layers = nn.ModuleList(layers)
@@ -2287,6 +2400,8 @@ def make_moe_pair(
     kt_max_cache_depth: int = 1,
     gradient_checkpointing: bool = False,
     expert_recompute_threshold: int = 0,
+    expert_recompute_policy: str = "tok",
+    expert_recompute_util_threshold: float = 0.0,
 ) -> tuple[MoE, TorchMoEReference, dict[str, Any], AsymExecutionStats]:
     resolved_device = torch.device(device) if device is not None else default_moe_device()
     resolved_dtype = base_dtype or default_moe_base_dtype(resolved_device)
@@ -2311,6 +2426,8 @@ def make_moe_pair(
         kt_max_cache_depth=kt_max_cache_depth,
         gradient_checkpointing=gradient_checkpointing,
         expert_recompute_threshold=expert_recompute_threshold,
+        expert_recompute_policy=expert_recompute_policy,
+        expert_recompute_util_threshold=expert_recompute_util_threshold,
     )
     ref = TorchMoEReference(
         state,

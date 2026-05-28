@@ -16,8 +16,11 @@ ROOT = Path(__file__).resolve().parents[2]
 MIB = 1024.0**2
 RESULT_RE = re.compile(
     r"^(?P<precision>.+?)_lora-sft_b(?P<batch_size>[0-9]+)_s(?P<seq_len>[0-9]+)_"
-    r"(?P<recompute>recomp|norecomp)(?:_expertthr(?P<expert_threshold>[0-9]+))?_(?P<tail>.+)$"
+    r"(?P<recompute>recomp|norecomp)"
+    r"(?:(?:_expertthr(?P<expert_threshold>[0-9]+))|(?:_expertpolicy(?P<expert_policy>[A-Za-z0-9_.-]+)))?"
+    r"_(?P<tail>.+)$"
 )
+FLAT_SEQ_RE = re.compile(r"^s(?P<seq_len>[0-9]+)$")
 PROFILERS = ("source", "nsys", "cpu", "ncu")
 LINEAR_REGION_R2_THRESHOLD = 0.99
 LINEAR_REGION_RATIO_CV_THRESHOLD = 0.08
@@ -42,6 +45,24 @@ COMBINED_OUTPUT_FILES = (
     "combined_backward_peak_memory_vs_expert_threshold.png",
     "combined_peak_hbm_vs_expert_threshold.png",
     "combined_timing_vs_expert_threshold.png",
+    "combined_forward_end_memory_vs_expert_tok_threshold.png",
+    "combined_forward_peak_memory_vs_expert_tok_threshold.png",
+    "combined_backward_start_memory_vs_expert_tok_threshold.png",
+    "combined_backward_peak_memory_vs_expert_tok_threshold.png",
+    "combined_peak_hbm_vs_expert_tok_threshold.png",
+    "combined_timing_vs_expert_tok_threshold.png",
+    "combined_forward_end_memory_vs_expert_util_threshold.png",
+    "combined_forward_peak_memory_vs_expert_util_threshold.png",
+    "combined_backward_start_memory_vs_expert_util_threshold.png",
+    "combined_backward_peak_memory_vs_expert_util_threshold.png",
+    "combined_peak_hbm_vs_expert_util_threshold.png",
+    "combined_timing_vs_expert_util_threshold.png",
+    "combined_forward_end_memory_vs_expert_tok_util_threshold.png",
+    "combined_forward_peak_memory_vs_expert_tok_util_threshold.png",
+    "combined_backward_start_memory_vs_expert_tok_util_threshold.png",
+    "combined_backward_peak_memory_vs_expert_tok_util_threshold.png",
+    "combined_peak_hbm_vs_expert_tok_util_threshold.png",
+    "combined_timing_vs_expert_tok_util_threshold.png",
 )
 GROUP_OUTPUT_FILES = (
     "sweep_summary.csv",
@@ -64,6 +85,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Default: <input-root>/activation_recompute_plots.",
     )
+    parser.add_argument(
+        "--combined-output-dir",
+        type=Path,
+        default=None,
+        help="Default: <output-dir>/combined.",
+    )
     parser.add_argument("--precision", default="")
     parser.add_argument("--workload", action="append", default=[], help="Workload label to include, e.g. moe-604m-a38m-l2.")
     parser.add_argument("--backend", action="append", default=[], choices=["asym", "torch", "kt"])
@@ -85,6 +112,13 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Expert threshold filter. 0 means no fine-grained expert recompute.",
     )
+    parser.add_argument("--expert-recompute-policy", action="append", default=[])
+    parser.add_argument(
+        "--expert-recompute-policies",
+        nargs="+",
+        default=[],
+        help="Expert policy filter. Accepts none, tok128, util075, tok128-util075.",
+    )
     parser.add_argument(
         "--clean-output",
         action="store_true",
@@ -97,6 +131,13 @@ def safe_label(value: str) -> str:
     return "".join(ch.lower() if ch.isalnum() or ch == "-" else "_" for ch in value).strip("_-")
 
 
+def split_tokens(values: list[str]) -> list[str]:
+    tokens: list[str] = []
+    for value in values:
+        tokens.extend(part.strip() for part in str(value).split(",") if part.strip())
+    return tokens
+
+
 def resolve_path(path: Path) -> Path:
     return path if path.is_absolute() else ROOT / path
 
@@ -107,10 +148,143 @@ def output_root(args: argparse.Namespace) -> Path:
     return resolve_path(args.input_root) / "activation_recompute_plots"
 
 
+def combined_output_root(args: argparse.Namespace, root: Path) -> Path:
+    if args.combined_output_dir is not None:
+        return resolve_path(args.combined_output_dir)
+    return root / "combined"
+
+
+def precision_from_path(path: Path) -> str:
+    for parent in (path, *path.parents):
+        if parent.name.startswith("lora_e2e_"):
+            return parent.name.removeprefix("lora_e2e_")
+    return ""
+
+
+def parse_util_threshold_token(value: str) -> float:
+    text = value.strip().lower()
+    if "." in text:
+        util = float(text)
+    elif text == "1":
+        util = 1.0
+    elif text == "0":
+        util = 0.0
+    elif text.startswith("0") and len(text) > 1:
+        util = float(f"0.{text[1:]}")
+    else:
+        util = int(text) / 100.0
+    if util < 0.0 or util > 1.0:
+        raise ValueError(f"util threshold must be in [0, 1], got {value!r}")
+    return util
+
+
+def util_policy_label(util: float) -> str:
+    return f"util{int(round(float(util) * 100)):03d}"
+
+
+def parse_expert_policy_spec(value: str | None, *, legacy_threshold: int | None = None) -> dict[str, Any]:
+    if value is None or value == "":
+        threshold = int(legacy_threshold or 0)
+        if threshold <= 0:
+            return {
+                "expert_recompute_policy_spec": "none",
+                "expert_recompute_policy": "none",
+                "expert_recompute_threshold": 0,
+                "expert_recompute_util_threshold": 0.0,
+            }
+        return {
+            "expert_recompute_policy_spec": f"tok{threshold}",
+            "expert_recompute_policy": "tok",
+            "expert_recompute_threshold": threshold,
+            "expert_recompute_util_threshold": 0.0,
+        }
+    spec = str(value).strip().lower().replace("_", "-")
+    if spec in {"none", "off", "false", "0"}:
+        return {
+            "expert_recompute_policy_spec": "none",
+            "expert_recompute_policy": "none",
+            "expert_recompute_threshold": 0,
+            "expert_recompute_util_threshold": 0.0,
+        }
+    token_threshold: int | None = None
+    util_threshold: float | None = None
+    for part in spec.split("-"):
+        if match := re.fullmatch(r"tok([0-9]+)", part):
+            token_threshold = int(match.group(1))
+        elif match := re.fullmatch(r"util([0-9]+(?:\.[0-9]+)?)", part):
+            util_threshold = parse_util_threshold_token(match.group(1))
+        else:
+            raise ValueError(f"invalid expert recompute policy spec {value!r}")
+    token_threshold = int(token_threshold or 0)
+    util_threshold = float(util_threshold or 0.0)
+    if token_threshold <= 0 and util_threshold <= 0.0:
+        return {
+            "expert_recompute_policy_spec": "none",
+            "expert_recompute_policy": "none",
+            "expert_recompute_threshold": 0,
+            "expert_recompute_util_threshold": 0.0,
+        }
+    if token_threshold > 0 and util_threshold > 0.0:
+        return {
+            "expert_recompute_policy_spec": f"tok{token_threshold}-{util_policy_label(util_threshold)}",
+            "expert_recompute_policy": "tok_util",
+            "expert_recompute_threshold": token_threshold,
+            "expert_recompute_util_threshold": util_threshold,
+        }
+    if token_threshold > 0:
+        return {
+            "expert_recompute_policy_spec": f"tok{token_threshold}",
+            "expert_recompute_policy": "tok",
+            "expert_recompute_threshold": token_threshold,
+            "expert_recompute_util_threshold": 0.0,
+        }
+    return {
+        "expert_recompute_policy_spec": util_policy_label(util_threshold),
+        "expert_recompute_policy": "util",
+        "expert_recompute_threshold": 0,
+        "expert_recompute_util_threshold": util_threshold,
+    }
+
+
+def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
+    seq_match = FLAT_SEQ_RE.match(path.name)
+    if seq_match is None:
+        return None
+    job_dir = path.parent
+    parts = job_dir.name.split("__")
+    if len(parts) != 4:
+        return None
+    backend, profiler, recompute, policy_part = parts
+    if profiler not in PROFILERS or recompute not in {"recomp", "norecomp"}:
+        return None
+    if policy_part.startswith("thr") and policy_part[3:].isdigit():
+        policy_meta = parse_expert_policy_spec(None, legacy_threshold=int(policy_part[3:]))
+    elif policy_part.startswith("pol"):
+        try:
+            policy_meta = parse_expert_policy_spec(policy_part[3:])
+        except ValueError:
+            return None
+    else:
+        return None
+    config_name = job_dir.parent.name
+    batch_match = re.search(r"(?:^|__)b(?P<batch>[0-9]+)_", config_name)
+    return {
+        "precision": precision_from_path(path),
+        "batch_size": int(batch_match.group("batch")) if batch_match is not None else 0,
+        "seq_len": int(seq_match.group("seq_len")),
+        "mode": "recompute" if recompute == "recomp" else "no_recompute",
+        "activation_recompute": recompute == "recomp",
+        "backend": backend,
+        "profiler": profiler,
+        "workload": config_name.split("__", 1)[0],
+        **policy_meta,
+    }
+
+
 def parse_result_dir(path: Path) -> dict[str, Any] | None:
     match = RESULT_RE.match(path.name)
     if match is None:
-        return None
+        return parse_flat_result_dir(path)
     tail = match.group("tail")
     profiler = next((candidate for candidate in PROFILERS if tail.endswith(f"_{candidate}")), "")
     if not profiler:
@@ -118,16 +292,23 @@ def parse_result_dir(path: Path) -> dict[str, Any] | None:
     backend = tail[: -(len(profiler) + 1)]
     if not backend:
         return None
+    try:
+        policy_meta = parse_expert_policy_spec(
+            match.group("expert_policy"),
+            legacy_threshold=int(match.group("expert_threshold") or 0),
+        )
+    except ValueError:
+        return None
     return {
         "precision": match.group("precision"),
         "batch_size": int(match.group("batch_size")),
         "seq_len": int(match.group("seq_len")),
         "mode": "recompute" if match.group("recompute") == "recomp" else "no_recompute",
         "activation_recompute": match.group("recompute") == "recomp",
-        "expert_recompute_threshold": int(match.group("expert_threshold") or 0),
         "backend": backend,
         "profiler": profiler,
         "workload": path.parent.name,
+        **policy_meta,
     }
 
 
@@ -228,7 +409,7 @@ def passes_filters(args: argparse.Namespace, meta: dict[str, Any]) -> bool:
         {"norecomp": "no_recompute", "recomp": "recompute"}.get(mode, mode)
         for mode in args.recompute
     }
-    if args.precision and meta["precision"] != args.precision:
+    if args.precision and str(meta["precision"]).lower() != str(args.precision).lower():
         return False
     if args.workload and meta["workload"] not in set(args.workload):
         return False
@@ -238,25 +419,36 @@ def passes_filters(args: argparse.Namespace, meta: dict[str, Any]) -> bool:
         return False
     if recompute_modes and meta["mode"] not in recompute_modes:
         return False
-    if args.batch_size and meta["batch_size"] not in set(args.batch_size):
+    if args.batch_size and int(meta["batch_size"]) != 0 and meta["batch_size"] not in set(args.batch_size):
         return False
     if args.seq_lens and meta["seq_len"] not in set(args.seq_lens):
         return False
     threshold_filter = set(args.expert_recompute_threshold) | set(args.expert_recompute_thresholds)
     if threshold_filter and int(meta["expert_recompute_threshold"]) not in threshold_filter:
         return False
+    policy_values = split_tokens(list(args.expert_recompute_policy) + list(args.expert_recompute_policies))
+    if policy_values:
+        policy_filter = {parse_expert_policy_spec(value)["expert_recompute_policy_spec"] for value in policy_values}
+        if str(meta["expert_recompute_policy_spec"]) not in policy_filter:
+            return False
     return True
 
 
 def result_dirs(input_root: Path) -> list[Path]:
-    return sorted(path for path in input_root.rglob("*_lora-sft_*") if path.is_dir())
+    legacy_dirs = [path for path in input_root.rglob("*_lora-sft_*") if path.is_dir()]
+    flat_dirs = [
+        path
+        for path in input_root.rglob("s*")
+        if path.is_dir() and FLAT_SEQ_RE.match(path.name) and profile_json_path(path) is not None
+    ]
+    return sorted({*legacy_dirs, *flat_dirs})
 
 
 def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str, Any] | None:
     meta = parse_result_dir(result_dir)
     if meta is None or not passes_filters(args, meta):
         return None
-    if int(meta["expert_recompute_threshold"]) > 0 and bool(meta["activation_recompute"]):
+    if str(meta["expert_recompute_policy"]) != "none" and bool(meta["activation_recompute"]):
         # Current driver semantics reserve layer recompute for threshold 0.
         # Ignore stale dirs from older runs that combined layer and expert recompute.
         return None
@@ -272,6 +464,8 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
     if not isinstance(memory_gpu, dict):
         memory_gpu = {}
     batch_size = int(config.get("batch_size", meta["batch_size"]))
+    if args.batch_size and batch_size not in set(args.batch_size):
+        return None
     route_stats = first_dict(profile, "expert_token_distribution")
     threshold_effect = route_stats.get("threshold_effect", {})
     if not isinstance(threshold_effect, dict):
@@ -284,7 +478,18 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         "logical_tokens": int(config.get("logical_tokens", batch_size * int(meta["seq_len"]))),
         "mode": meta["mode"],
         "activation_recompute": bool(meta["activation_recompute"]),
+        "expert_recompute_policy_spec": str(meta["expert_recompute_policy_spec"]),
+        "expert_recompute_policy": str(meta["expert_recompute_policy"]),
         "expert_recompute_threshold": int(meta["expert_recompute_threshold"]),
+        "expert_recompute_util_threshold": float(meta["expert_recompute_util_threshold"]),
+        "expert_recompute_sweep_x": float(
+            meta["expert_recompute_threshold"]
+            if meta["expert_recompute_policy"] == "tok"
+            else meta["expert_recompute_util_threshold"]
+        ),
+        "expert_recompute_sweep_x_name": (
+            "token_threshold" if meta["expert_recompute_policy"] == "tok" else "util_threshold"
+        ),
         "backend": meta["backend"],
         "profiler": meta["profiler"],
         "step_ms": step_ms(profile),
@@ -374,6 +579,14 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         "route_kept_routes_p75": numeric_float(threshold_effect.get("kept_routes_p75")),
         "route_kept_routes_p90": numeric_float(threshold_effect.get("kept_routes_p90")),
         "route_kept_routes_p100": numeric_float(threshold_effect.get("kept_routes_p100")),
+        "route_recomputed_paid_rows_avg": numeric_float(threshold_effect.get("recomputed_paid_rows_avg")),
+        "route_recomputed_paid_rows_min": numeric_int(threshold_effect.get("recomputed_paid_rows_min")),
+        "route_recomputed_paid_rows_max": numeric_int(threshold_effect.get("recomputed_paid_rows_max")),
+        "route_kept_paid_rows_avg": numeric_float(threshold_effect.get("kept_paid_rows_avg")),
+        "route_kept_paid_rows_min": numeric_int(threshold_effect.get("kept_paid_rows_min")),
+        "route_kept_paid_rows_max": numeric_int(threshold_effect.get("kept_paid_rows_max")),
+        "route_recomputed_util_avg": numeric_float(threshold_effect.get("recomputed_util_avg")),
+        "route_kept_util_avg": numeric_float(threshold_effect.get("kept_util_avg")),
         "output_dir": str(result_dir),
         "profile_json": str(profile_path),
     }
@@ -391,7 +604,9 @@ def collect_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["profiler"],
             row["seq_len"],
             row["mode"],
+            row["expert_recompute_policy"],
             row["expert_recompute_threshold"],
+            row["expert_recompute_util_threshold"],
         ),
     )
 
@@ -486,7 +701,7 @@ def clean_output_dir(output_dir: Path) -> None:
     for child in output_dir.iterdir():
         if not child.is_dir():
             continue
-        if child.name == "_combined":
+        if child.name in {"_combined", "combined"}:
             for name in COMBINED_OUTPUT_FILES:
                 path = child / name
                 if path.is_file():
@@ -500,6 +715,12 @@ def clean_output_dir(output_dir: Path) -> None:
         for path in child.glob("expert_threshold_summary_s*.json"):
             path.unlink()
         for path in child.glob("*_vs_expert_threshold_s*.png"):
+            path.unlink()
+        for path in child.glob("expert_*_threshold_summary_s*.csv"):
+            path.unlink()
+        for path in child.glob("expert_*_threshold_summary_s*.json"):
+            path.unlink()
+        for path in child.glob("*_vs_expert_*_threshold_s*.png"):
             path.unlink()
         try:
             child.rmdir()
@@ -743,10 +964,63 @@ def plot_combined_metric(
 
 def threshold_sweep_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_series: dict[tuple[tuple[str, str, int, int, str, str], str], set[int]] = {}
-    for row in rows:
+    token_rows = [row for row in rows if str(row.get("expert_recompute_policy", "none")) in {"none", "tok"}]
+    for row in token_rows:
         by_series.setdefault((threshold_group_key(row), str(row["mode"])), set()).add(int(row["expert_recompute_threshold"]))
     eligible = {key for key, thresholds in by_series.items() if len(thresholds) >= 2}
-    return [row for row in rows if (threshold_group_key(row), str(row["mode"])) in eligible]
+    return [row for row in token_rows if (threshold_group_key(row), str(row["mode"])) in eligible]
+
+
+def policy_family_rows(rows: list[dict[str, Any]], family: str) -> list[dict[str, Any]]:
+    if family == "tok":
+        return [row for row in rows if str(row.get("expert_recompute_policy", "none")) in {"none", "tok"}]
+    if family == "util":
+        return [row for row in rows if str(row.get("expert_recompute_policy", "none")) in {"none", "util"}]
+    if family == "tok_util":
+        return [row for row in rows if str(row.get("expert_recompute_policy", "none")) == "tok_util"]
+    return []
+
+
+def policy_sweep_x(row: dict[str, Any], family: str) -> float:
+    if str(row.get("expert_recompute_policy", "none")) == "none":
+        return 0.0
+    if family == "tok":
+        return float(row["expert_recompute_threshold"])
+    return float(row["expert_recompute_util_threshold"])
+
+
+def policy_series_suffix(row: dict[str, Any], family: str) -> int:
+    if family == "tok_util":
+        return int(row["expert_recompute_threshold"])
+    return 0
+
+
+def policy_sweep_rows(rows: list[dict[str, Any]], family: str) -> list[dict[str, Any]]:
+    family_rows = policy_family_rows(rows, family)
+    by_series: dict[tuple[tuple[str, str, int, int, str, str], str, int], set[float]] = {}
+    for row in family_rows:
+        key = (threshold_group_key(row), str(row["mode"]), policy_series_suffix(row, family))
+        by_series.setdefault(key, set()).add(policy_sweep_x(row, family))
+    eligible = {key for key, xs in by_series.items() if len(xs) >= 2}
+    return [
+        row
+        for row in family_rows
+        if (threshold_group_key(row), str(row["mode"]), policy_series_suffix(row, family)) in eligible
+    ]
+
+
+def policy_x_label(family: str) -> str:
+    if family == "tok":
+        return "Expert recompute threshold (tokens)"
+    return "Expert recompute tile utilization threshold"
+
+
+def policy_filename_suffix(family: str) -> str:
+    return {
+        "tok": "expert_tok_threshold",
+        "util": "expert_util_threshold",
+        "tok_util": "expert_tok_util_threshold",
+    }[family]
 
 
 def plot_threshold_metric(
@@ -830,6 +1104,102 @@ def plot_combined_threshold_metric(
         return
     ax.set_title(title)
     ax.set_xlabel("Expert recompute threshold (tokens)")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.35)
+    ax.legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(output_dir / filename)
+    plt.close(fig)
+
+
+def plot_policy_metric(
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+    filename: str,
+    title: str,
+    ylabel: str,
+    key: str,
+    *,
+    family: str,
+    scale: float = 1.0,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    series: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for row in rows:
+        series.setdefault((str(row["mode"]), policy_series_suffix(row, family)), []).append(row)
+    labels = {"no_recompute": "No layer recompute", "recompute": "Layer recompute"}
+
+    fig, ax = plt.subplots(figsize=(8, 5), dpi=160)
+    plotted = False
+    for (mode, token_cap), series_rows in sorted(series.items()):
+        sorted_rows = sorted(series_rows, key=lambda row: policy_sweep_x(row, family))
+        if len({policy_sweep_x(row, family) for row in sorted_rows}) < 2:
+            continue
+        label = labels.get(mode, mode)
+        if family == "tok_util":
+            label = f"{label}, tok<={token_cap}"
+        ax.plot(
+            [policy_sweep_x(row, family) for row in sorted_rows],
+            [float(row[key]) / scale for row in sorted_rows],
+            marker="o",
+            linewidth=2,
+            label=label,
+        )
+        plotted = True
+    if not plotted:
+        plt.close(fig)
+        return
+    ax.set_title(title)
+    ax.set_xlabel(policy_x_label(family))
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.35)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / filename)
+    plt.close(fig)
+
+
+def plot_combined_policy_metric(
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+    filename: str,
+    title: str,
+    ylabel: str,
+    key: str,
+    *,
+    family: str,
+    scale: float = 1.0,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    series: dict[tuple[tuple[str, str, int, int, str, str], str, int], list[dict[str, Any]]] = {}
+    for row in rows:
+        series.setdefault((threshold_group_key(row), str(row["mode"]), policy_series_suffix(row, family)), []).append(row)
+    varied = varied_threshold_fields(rows)
+
+    fig, ax = plt.subplots(figsize=(11, 6), dpi=160)
+    plotted = False
+    for (group, mode, token_cap), group_rows in sorted(series.items()):
+        sorted_rows = sorted(group_rows, key=lambda row: policy_sweep_x(row, family))
+        if len({policy_sweep_x(row, family) for row in sorted_rows}) < 2:
+            continue
+        label = combined_threshold_label(group, mode, varied)
+        if family == "tok_util":
+            label = f"{label} / tok<={token_cap}"
+        ax.plot(
+            [policy_sweep_x(row, family) for row in sorted_rows],
+            [float(row[key]) / scale for row in sorted_rows],
+            marker="o",
+            linewidth=1.8,
+            label=label,
+        )
+        plotted = True
+    if not plotted:
+        plt.close(fig)
+        return
+    ax.set_title(title)
+    ax.set_xlabel(policy_x_label(family))
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
     ax.legend(fontsize=7)
@@ -952,6 +1322,83 @@ def write_group_threshold_plots(
     )
 
 
+def write_group_policy_plots(
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+    key: tuple[str, str, int, str, str],
+    seq_len: int,
+    family: str,
+) -> None:
+    workload, precision, batch_size, backend, profiler = key
+    title_base = f"{workload} LoRA SFT"
+    suffix = f", batch size {batch_size}, seq {seq_len}, {precision}, {backend}/{profiler}"
+    name = policy_filename_suffix(family)
+    title = {
+        "tok": "expert token threshold",
+        "util": "expert utilization threshold",
+        "tok_util": "expert token+util threshold",
+    }[family]
+    plot_policy_metric(
+        rows,
+        output_dir,
+        f"forward_end_memory_vs_{name}_s{seq_len}.png",
+        f"{title_base} memory after forward vs {title}{suffix}",
+        "GPU allocated after forward (GiB)",
+        "forward_alloc_end_mib",
+        family=family,
+        scale=1024.0,
+    )
+    plot_policy_metric(
+        rows,
+        output_dir,
+        f"forward_peak_memory_vs_{name}_s{seq_len}.png",
+        f"{title_base} forward local peak vs {title}{suffix}",
+        "Forward local peak allocation (GiB)",
+        "forward_local_peak_mib",
+        family=family,
+        scale=1024.0,
+    )
+    plot_policy_metric(
+        rows,
+        output_dir,
+        f"backward_start_memory_vs_{name}_s{seq_len}.png",
+        f"{title_base} memory carried into backward vs {title}{suffix}",
+        "GPU allocated at backward start (GiB)",
+        "backward_alloc_start_mib",
+        family=family,
+        scale=1024.0,
+    )
+    plot_policy_metric(
+        rows,
+        output_dir,
+        f"backward_peak_memory_vs_{name}_s{seq_len}.png",
+        f"{title_base} backward local peak vs {title}{suffix}",
+        "Backward local peak allocation (GiB)",
+        "backward_local_peak_mib",
+        family=family,
+        scale=1024.0,
+    )
+    plot_policy_metric(
+        rows,
+        output_dir,
+        f"peak_hbm_vs_{name}_s{seq_len}.png",
+        f"{title_base} whole-step peak HBM vs {title}{suffix}",
+        "Peak HBM allocation (GiB)",
+        "peak_hbm_mib",
+        family=family,
+        scale=1024.0,
+    )
+    plot_policy_metric(
+        rows,
+        output_dir,
+        f"timing_vs_{name}_s{seq_len}.png",
+        f"{title_base} step time vs {title}{suffix}",
+        "Step time (ms)",
+        "step_ms",
+        family=family,
+    )
+
+
 def write_combined_plots(rows: list[dict[str, Any]], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_combined_metric(
@@ -1057,6 +1504,75 @@ def write_combined_threshold_plots(rows: list[dict[str, Any]], output_dir: Path)
     )
 
 
+def write_combined_policy_plots(rows: list[dict[str, Any]], output_dir: Path, family: str) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    name = policy_filename_suffix(family)
+    title = {
+        "tok": "expert token threshold",
+        "util": "expert utilization threshold",
+        "tok_util": "expert token+util threshold",
+    }[family]
+    plot_combined_policy_metric(
+        rows,
+        output_dir,
+        f"combined_forward_end_memory_vs_{name}.png",
+        f"All workloads: memory after forward vs {title}",
+        "GPU allocated after forward (GiB)",
+        "forward_alloc_end_mib",
+        family=family,
+        scale=1024.0,
+    )
+    plot_combined_policy_metric(
+        rows,
+        output_dir,
+        f"combined_forward_peak_memory_vs_{name}.png",
+        f"All workloads: forward local peak vs {title}",
+        "Forward local peak allocation (GiB)",
+        "forward_local_peak_mib",
+        family=family,
+        scale=1024.0,
+    )
+    plot_combined_policy_metric(
+        rows,
+        output_dir,
+        f"combined_backward_start_memory_vs_{name}.png",
+        f"All workloads: memory carried into backward vs {title}",
+        "GPU allocated at backward start (GiB)",
+        "backward_alloc_start_mib",
+        family=family,
+        scale=1024.0,
+    )
+    plot_combined_policy_metric(
+        rows,
+        output_dir,
+        f"combined_backward_peak_memory_vs_{name}.png",
+        f"All workloads: backward local peak vs {title}",
+        "Backward local peak allocation (GiB)",
+        "backward_local_peak_mib",
+        family=family,
+        scale=1024.0,
+    )
+    plot_combined_policy_metric(
+        rows,
+        output_dir,
+        f"combined_peak_hbm_vs_{name}.png",
+        f"All workloads: whole-step peak HBM vs {title}",
+        "Peak HBM allocation (GiB)",
+        "peak_hbm_mib",
+        family=family,
+        scale=1024.0,
+    )
+    plot_combined_policy_metric(
+        rows,
+        output_dir,
+        f"combined_timing_vs_{name}.png",
+        f"All workloads: step time vs {title}",
+        "Step time (ms)",
+        "step_ms",
+        family=family,
+    )
+
+
 def main() -> None:
     args = parse_args()
     rows = collect_rows(args)
@@ -1064,13 +1580,14 @@ def main() -> None:
         raise SystemExit(f"no driver result directories found under {resolve_path(args.input_root)}")
 
     root = output_root(args)
+    combined_dir = combined_output_root(args, root)
     if args.clean_output:
         clean_output_dir(root)
+        clean_output_dir(combined_dir)
     write_table(rows, root, "activation_recompute_sweep_index")
 
-    seq_rows = [row for row in rows if int(row["expert_recompute_threshold"]) == 0]
+    seq_rows = [row for row in rows if str(row.get("expert_recompute_policy", "none")) == "none"]
     if seq_rows:
-        combined_dir = root / "_combined"
         write_combined_plots(seq_rows, combined_dir)
 
     groups: dict[tuple[str, str, int, str, str], list[dict[str, Any]]] = {}
@@ -1085,7 +1602,6 @@ def main() -> None:
 
     threshold_rows = threshold_sweep_rows(rows)
     if threshold_rows:
-        combined_dir = root / "_combined"
         write_combined_threshold_plots(threshold_rows, combined_dir)
         threshold_groups: dict[tuple[tuple[str, str, int, str, str], int], list[dict[str, Any]]] = {}
         for row in threshold_rows:
@@ -1096,6 +1612,21 @@ def main() -> None:
             write_table(group_rows, group_dir, f"expert_threshold_summary_s{seq_len}")
             write_group_threshold_plots(group_rows, group_dir, key, seq_len)
             print(f"wrote {group_dir} expert threshold s{seq_len}", flush=True)
+    for family in ("tok", "util", "tok_util"):
+        family_rows = policy_sweep_rows(rows, family)
+        if not family_rows:
+            continue
+        write_combined_policy_plots(family_rows, combined_dir, family)
+        family_groups: dict[tuple[tuple[str, str, int, str, str], int], list[dict[str, Any]]] = {}
+        for row in family_rows:
+            family_groups.setdefault((group_key(row), int(row["seq_len"])), []).append(row)
+        suffix = policy_filename_suffix(family)
+        for (key, seq_len), group_rows in sorted(family_groups.items()):
+            workload, precision, batch_size, backend, profiler = key
+            group_dir = root / safe_label(f"{workload}-b{batch_size}-{precision}-{backend}-{profiler}")
+            write_table(group_rows, group_dir, f"{suffix}_summary_s{seq_len}")
+            write_group_policy_plots(group_rows, group_dir, key, seq_len, family)
+            print(f"wrote {group_dir} {suffix} s{seq_len}", flush=True)
     print(f"wrote {root / 'activation_recompute_sweep_index.json'}", flush=True)
 
 

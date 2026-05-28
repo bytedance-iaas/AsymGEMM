@@ -100,6 +100,9 @@ def main() -> None:
     parser.add_argument("--lora-dtype", choices=LORA_DTYPE_CHOICES, default="bf16")
     parser.add_argument("--vocab-rows", "--real-vocab-rows", dest="vocab_rows", type=int, default=4096)
     parser.add_argument("--expert-recompute-threshold", type=int, default=0)
+    parser.add_argument("--expert-recompute-policy", choices=["none", "tok", "util", "tok_util"], default="tok")
+    parser.add_argument("--expert-recompute-util-threshold", type=float, default=0.0)
+    parser.add_argument("--expert-recompute-policy-spec", default="")
     parser.add_argument("--launch-skip", type=int)
     parser.add_argument("--launch-count", type=int)
     parser.add_argument("--preset", choices=["quick", "paper"], default="paper")
@@ -202,6 +205,12 @@ def main() -> None:
         str(args.vocab_rows),
         "--expert-recompute-threshold",
         str(args.expert_recompute_threshold),
+        "--expert-recompute-policy",
+        str(args.expert_recompute_policy),
+        "--expert-recompute-util-threshold",
+        str(args.expert_recompute_util_threshold),
+        "--expert-recompute-policy-spec",
+        str(args.expert_recompute_policy_spec),
         "--output-dir",
         str(source_dir),
     ]
