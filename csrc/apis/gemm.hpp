@@ -16,7 +16,9 @@
 #endif
 
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
+#include "../jit_kernels/impls/sm89_bf16_moe_gemm_masked.hpp"
 #include "../jit_kernels/impls/sm80_moe_gemm.hpp"
+#include "../jit_kernels/impls/sm89_fp8_moe_gemm.hpp"
 
 #include "layout.hpp"
 
@@ -401,6 +403,20 @@ static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const tor
     // Do nothing if empty
     if (m == 0 or expected_m == 0)
         return;
+
+    const auto& [arch_major, arch_minor] = device_runtime->get_arch_pair();
+    if (arch_major == 8 and arch_minor == 9) {
+        sm89_m_grouped_bf16_moe_gemm_masked(
+            a,
+            b,
+            d,
+            masked_m,
+            m,
+            n,
+            k,
+            static_cast<int32_t>(num_groups));
+        return;
+    }
 
     // Dispatch implementation. Grid Y = num_groups; inactive groups early-exit in-kernel.
     sm100_m_grouped_bf16_asym_gemm_masked(a, b, d, masked_m, /*grid_y=*/num_groups, expected_m,

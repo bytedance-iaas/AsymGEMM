@@ -258,8 +258,8 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
                                 : static_cast<int64_t>(params.index_list[expert_e - 1]);
         const int64_t len       = static_cast<int64_t>(params.index_list[expert_e]) - len_start;
 
-        // Early exit for zero-token experts (no barriers have been armed yet)
-        if (len == 0) return;
+        // Early exit for zero-token experts or gap segments before any barriers.
+        if (expert_id < 0 || len == 0) return;
 
         // Typed pointers for this expert's slice
         const Element* x_e = x_g + len_start * K;                 // [len, K]
