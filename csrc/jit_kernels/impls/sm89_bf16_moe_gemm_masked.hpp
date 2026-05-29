@@ -34,10 +34,10 @@ static void sm89_m_grouped_bf16_moe_gemm_masked(
     auto gap_ids = torch::full({num_groups}, -1, opts_i32);
     auto experts = torch::stack({group_ids, gap_ids}, 1).reshape({2 * num_groups});
 
-    auto masked_m_i32 = masked_m.to(torch::kInt32);
-    auto base = group_ids * static_cast<int32_t>(M_max);
-    auto valid_ends = base + masked_m_i32;
-    auto gap_ends = (group_ids + 1) * static_cast<int32_t>(M_max);
+    const auto m_max_i32 = static_cast<int32_t>(M_max);
+    auto base = group_ids * m_max_i32;
+    auto valid_ends = base + masked_m;
+    auto gap_ends = base + m_max_i32;
     auto index_list = torch::stack({valid_ends, gap_ends}, 1).reshape({2 * num_groups});
 
     auto total_rows = static_cast<int64_t>(num_groups) * M_max;
