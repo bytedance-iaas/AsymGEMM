@@ -43,6 +43,8 @@ submodules/
 
 # Local profiling/report artifacts
 agent/
-profiling*/
-!profiling/README.md
+/profiling*/*
+# !/profiling/transpose_ncu/
+# !/profiling/transpose_ncu/**
 reports/
+third-party/

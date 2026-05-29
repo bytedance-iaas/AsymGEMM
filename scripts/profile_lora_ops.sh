@@ -2,15 +2,17 @@
 set -Eeuo pipefail
 
 DEVICE="cuda:0"
-MODEL="Qwen/Qwen3-30B-A3B"
 BACKENDS="torch,asym"
 OPERATIONS="full_lora"
 # OPERATIONS="xw_sb"
 # BATCH_SIZES="8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32"
-BATCH_SIZES="8"
-SEQ_LENS="1024"
-# MoE expert projections from Qwen/Qwen3-30B-A3B:
-# gate/up: hidden -> expert intermediate, down: expert intermediate -> hidden.
+BATCH_SIZES="1"
+SEQ_LENS="2048"
+# Same default tensor sizes as scripts/profile_transpose.sh, expressed as
+# LoRA feature pairs IN|OUT with tokens=M=2048:
+#   gate/up: X[M,H] @ W[I,H].T -> Y[M,I]
+#   down:    X[M,I] @ W[H,I].T -> Y[M,H]
+# FEATURE_DIMS="2048|768,768|2048,4096|1536,1536|4096"
 FEATURE_DIMS="2048|768,768|2048"
 RANK=16
 SCALE=16
@@ -44,8 +46,6 @@ Usage:
 
 Options:
   --device NAME
-  --model NAME         model id/path label; basename is used in result folders
-  --model-name NAME    alias for --model
   --backends LIST
   --operation LIST      xw_sb and/or full_lora; comma or quoted whitespace separated
   --operations LIST     alias for --operation
@@ -65,7 +65,7 @@ Options:
   --backward true|false|both
   --cuda-graph true|false
   --output-root DIR     base output root; default: third_party/AsymGEMM/profiling
-                       default layout: <root>/lora_ops_<precision>/<model>__<operation>__b<batch>_s<seq>_r<rank>
+                       default layout: <root>/lora_ops_<precision>/<operation>__b<batch>_s<seq>_r<rank>
   --output-dir DIR      exact config root; overrides the default config directory
   --run-name NAME       optional config directory under lora_ops_<precision>
   --plot true|false     default: true
@@ -76,6 +76,13 @@ Options:
   --no-save             only print the terminal table; disables plots
   --verbose             print each profile_lora_ops.py command before running it
   -h, --help
+
+Default MoE-shaped LoRA tensors:
+  tokens = batch_size * seq_len = 1 * 2048 = 2048
+  gate/up: 2048|768 and 4096|1536
+  down:    768|2048 and 1536|4096
+  These correspond to profile_transpose.sh shapes:
+    2048|2048|768 2048|4096|1536 2048|768|2048 2048|1536|4096
 USAGE
 }
 
@@ -175,30 +182,11 @@ pass_label() {
   esac
 }
 
-model_label() {
-  local value="$1"
-  local base="${value}"
-  local layers=""
-  local label
-  if [[ "${value}" == *"|"* ]]; then
-    base="${value%%|*}"
-    layers="${value#*|}"
-  fi
-  base="${base%/}"
-  base="${base##*/}"
-  label="$(safe_label "${base}")"
-  if [[ -n "${layers}" && "${layers}" != "all" ]]; then
-    label="${label}-l$(safe_label "${layers}")"
-  fi
-  printf '%s\n' "${label}"
-}
-
 default_config_label() {
   local operation="$1"
   local batch_size="$2"
   local seq_len="$3"
-  printf '%s__%s__b%s_s%s_r%s\n' \
-    "$(model_label "${MODEL}")" \
+  printf '%s__b%s_s%s_r%s\n' \
     "$(safe_label "${operation}")" \
     "$(safe_label "${batch_size}")" \
     "$(safe_label "${seq_len}")" \
@@ -291,8 +279,6 @@ while (($#)); do
   case "$1" in
     --device) need_value "$1" "${2-}"; DEVICE="$2"; shift 2 ;;
     --device=*) DEVICE="${1#*=}"; shift ;;
-    --model|--model-name) need_value "$1" "${2-}"; MODEL="$2"; shift 2 ;;
-    --model=*|--model-name=*) MODEL="${1#*=}"; shift ;;
     --backends) need_value "$1" "${2-}"; BACKENDS="$2"; shift 2 ;;
     --backends=*) BACKENDS="${1#*=}"; shift ;;
     --operation|--operations) need_value "$1" "${2-}"; OPERATIONS="$2"; shift 2 ;;
@@ -367,7 +353,7 @@ if [[ "${SAVE_RESULTS}" == "true" ]]; then
     PRECISION_ROOT="$(resolve_dir "${OUTPUT_ROOT}/lora_ops_${PRECISION_LABEL}")"
   fi
   COMBINED_ROOT="$(resolve_dir "${PRECISION_ROOT}/combined")"
-  printf 'LoRA operator profile\nPrecision root: %s\nModel: %s\n\n' "${PRECISION_ROOT}" "$(model_label "${MODEL}")"
+  printf 'LoRA operator profile\nPrecision root: %s\n\n' "${PRECISION_ROOT}"
 else
   printf 'LoRA operator profile\nData: not saved (--no-save)\n\n'
 fi

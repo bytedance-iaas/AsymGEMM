@@ -41,8 +41,12 @@ if str(ROOT) not in sys.path:
 from asym_gemm.training.kt_moe import KTBackendUnavailable
 from asym_gemm.training.moe import (
     EXPERT_RECOMPUTE_TILE_ROWS,
+    expert_activation_drop_group_mask,
+    expert_activation_save_policy_enabled,
     expert_recompute_group_mask,
     expert_recompute_policy_enabled,
+    normalize_expert_activation_save_policy,
+    normalize_expert_activation_save_threshold,
     normalize_expert_recompute_policy,
     normalize_expert_recompute_threshold,
     normalize_expert_recompute_util_threshold,
@@ -219,15 +223,29 @@ def validate_backend_workload(args: argparse.Namespace) -> None:
     expert_policy = normalize_expert_recompute_policy(getattr(args, "expert_recompute_policy", "tok"))
     expert_threshold = normalize_expert_recompute_threshold(getattr(args, "expert_recompute_threshold", 0))
     expert_util_threshold = normalize_expert_recompute_util_threshold(getattr(args, "expert_recompute_util_threshold", 0.0))
+    activation_save_policy = normalize_expert_activation_save_policy(
+        getattr(args, "expert_activation_save_policy", "save_all")
+    )
+    activation_save_threshold = normalize_expert_activation_save_threshold(
+        getattr(args, "expert_activation_save_threshold", 0)
+    )
     expert_recompute_active = expert_recompute_policy_enabled(
         expert_policy,
         token_threshold=expert_threshold,
         util_threshold=expert_util_threshold,
     )
+    expert_activation_save_active = expert_activation_save_policy_enabled(
+        activation_save_policy,
+        token_threshold=activation_save_threshold,
+    )
     if is_kt_backend(args.backend) and not is_moe_workload_name(args.workload):
         raise ValueError("backend=kt is only implemented for MoE LoRA SFT workloads.")
     if expert_recompute_active and not is_moe_workload_name(args.workload):
         raise ValueError("--expert-recompute-policy is only supported for MoE LoRA SFT workloads.")
+    if expert_activation_save_active and not is_moe_workload_name(args.workload):
+        raise ValueError("--expert-activation-save-policy is only supported for MoE LoRA SFT workloads.")
+    if is_kt_backend(args.backend) and expert_activation_save_active:
+        raise ValueError("backend=kt does not support --expert-activation-save-policy")
     if is_kt_backend(args.backend):
         lora_dtype = str(getattr(args, "lora_dtype", "bf16")).lower()
         if lora_dtype not in KT_LORA_DTYPE_CHOICES:
@@ -407,6 +425,11 @@ class StageBook:
         expert_recompute_threshold: int = 0,
         expert_recompute_util_threshold: float = 0.0,
         expert_recompute_policy_spec: str = "",
+        expert_activation_save_policy: str = "save_all",
+        expert_activation_save_threshold: int = 0,
+        expert_policy_label: str = "",
+        intermediate_size: int = 0,
+        dtype_bytes: int = 2,
     ) -> None:
         counts_tensor = getattr(metadata, "expert_counts", None)
         if not isinstance(counts_tensor, torch.Tensor):
@@ -417,18 +440,27 @@ class StageBook:
         policy = normalize_expert_recompute_policy(expert_recompute_policy)
         threshold = normalize_expert_recompute_threshold(expert_recompute_threshold)
         util_threshold = normalize_expert_recompute_util_threshold(expert_recompute_util_threshold)
+        activation_policy = normalize_expert_activation_save_policy(expert_activation_save_policy)
+        activation_threshold = normalize_expert_activation_save_threshold(expert_activation_save_threshold)
         recompute_mask = expert_recompute_group_mask(
             counts_cpu,
             policy=policy,
             token_threshold=threshold,
             util_threshold=util_threshold,
         )
+        activation_drop_mask = expert_activation_drop_group_mask(
+            counts_cpu,
+            policy=activation_policy,
+            token_threshold=activation_threshold,
+        ) & ~recompute_mask
         recompute_flags = [bool(v) for v in recompute_mask.tolist()]
+        activation_drop_flags = [bool(v) for v in activation_drop_mask.tolist()]
         tile_rows = int(EXPERT_RECOMPUTE_TILE_ROWS)
         paid_rows = [int(math.ceil(value / float(tile_rows)) * tile_rows) if value > 0 else 0 for value in counts]
         utils = [float(value) / float(paid) if paid > 0 else 0.0 for value, paid in zip(counts, paid_rows)]
         recompute_counts = [value for value, flag in zip(counts, recompute_flags) if flag]
         keep_counts = [value for value, flag in zip(counts, recompute_flags) if value > 0 and not flag]
+        activation_drop_counts = [value for value, flag in zip(counts, activation_drop_flags) if flag]
         recompute_paid_rows = [value for value, flag in zip(paid_rows, recompute_flags) if flag]
         keep_paid_rows = [value for count, value, flag in zip(counts, paid_rows, recompute_flags) if count > 0 and not flag]
         recompute_utils = [value for value, flag in zip(utils, recompute_flags) if flag]
@@ -446,6 +478,15 @@ class StageBook:
                 expert_recompute_policy_spec = f"util{int(round(util_threshold * 100)):03d}"
             else:
                 expert_recompute_policy_spec = f"tok{threshold}-util{int(round(util_threshold * 100)):03d}"
+        if not expert_policy_label:
+            expert_policy_label = str(expert_recompute_policy_spec)
+            if activation_policy == "all_act":
+                expert_policy_label = "all-act" if expert_policy_label == "none" else f"{expert_policy_label}-all-act"
+            elif activation_policy == "tok_act":
+                expert_policy_label = f"tok{activation_threshold}-act" if expert_policy_label == "none" else f"{expert_policy_label}-tok{activation_threshold}-act"
+        estimated_activated_saved_bytes = (
+            int(sum(activation_drop_counts)) * max(0, int(intermediate_size)) * max(0, int(dtype_bytes))
+        )
         self.route_count_records.append(
             {
                 "mode": str(getattr(metadata, "mode", "")),
@@ -456,6 +497,9 @@ class StageBook:
                 "expert_recompute_threshold": threshold,
                 "expert_recompute_util_threshold": util_threshold,
                 "expert_recompute_policy_spec": str(expert_recompute_policy_spec),
+                "expert_activation_save_policy": activation_policy,
+                "expert_activation_save_threshold": activation_threshold,
+                "expert_policy_label": str(expert_policy_label),
                 "counts": counts,
                 "paid_rows": paid_rows,
                 "utils": utils,
@@ -466,6 +510,9 @@ class StageBook:
                 "kept_experts": int(len(keep_counts)),
                 "recomputed_routes": int(sum(recompute_counts)),
                 "kept_routes": int(sum(keep_counts)),
+                "activated_drop_experts": int(len(activation_drop_counts)),
+                "activated_drop_routes": int(sum(activation_drop_counts)),
+                "estimated_activated_saved_bytes": int(estimated_activated_saved_bytes),
                 "recomputed_paid_rows": int(sum(recompute_paid_rows)),
                 "kept_paid_rows": int(sum(keep_paid_rows)),
                 "recomputed_util_avg": _mean_float(recompute_utils),
@@ -499,10 +546,16 @@ class StageBook:
         policy_spec = str(first.get("expert_recompute_policy_spec", "none"))
         threshold = int(first.get("expert_recompute_threshold", 0) or 0)
         util_threshold = float(first.get("expert_recompute_util_threshold", 0.0) or 0.0)
+        activation_policy = str(first.get("expert_activation_save_policy", "save_all"))
+        activation_threshold = int(first.get("expert_activation_save_threshold", 0) or 0)
+        expert_policy_label = str(first.get("expert_policy_label", policy_spec))
         recomputed_experts = [int(record["recomputed_experts"]) for record in records]
         kept_experts = [int(record["kept_experts"]) for record in records]
         recomputed_routes = [int(record["recomputed_routes"]) for record in records]
         kept_routes = [int(record["kept_routes"]) for record in records]
+        activated_drop_experts = [int(record.get("activated_drop_experts", 0)) for record in records]
+        activated_drop_routes = [int(record.get("activated_drop_routes", 0)) for record in records]
+        estimated_activated_saved_bytes = [int(record.get("estimated_activated_saved_bytes", 0)) for record in records]
         recomputed_paid_rows = [int(record.get("recomputed_paid_rows", 0)) for record in records]
         kept_paid_rows = [int(record.get("kept_paid_rows", 0)) for record in records]
         recomputed_utils = [float(record.get("recomputed_util_avg", 0.0)) for record in records]
@@ -518,6 +571,9 @@ class StageBook:
             "expert_recompute_threshold": threshold,
             "expert_recompute_util_threshold": util_threshold,
             "expert_recompute_policy_spec": policy_spec,
+            "expert_activation_save_policy": activation_policy,
+            "expert_activation_save_threshold": activation_threshold,
+            "expert_policy_label": expert_policy_label,
             "all_expert_tokens": _token_stats(all_counts),
             "active_expert_tokens": _token_stats(active_counts),
             "active_experts": _token_stats(active_experts),
@@ -542,6 +598,17 @@ class StageBook:
                 "kept_routes_min": _min_int(kept_routes),
                 "kept_routes_max": _max_int(kept_routes),
                 **{f"kept_routes_{key}": value for key, value in _standard_percentiles(kept_routes).items()},
+                "activated_drop_experts_avg": _mean_float(activated_drop_experts),
+                "activated_drop_experts_min": _min_int(activated_drop_experts),
+                "activated_drop_experts_max": _max_int(activated_drop_experts),
+                **{f"activated_drop_experts_{key}": value for key, value in _standard_percentiles(activated_drop_experts).items()},
+                "activated_drop_routes_avg": _mean_float(activated_drop_routes),
+                "activated_drop_routes_min": _min_int(activated_drop_routes),
+                "activated_drop_routes_max": _max_int(activated_drop_routes),
+                **{f"activated_drop_routes_{key}": value for key, value in _standard_percentiles(activated_drop_routes).items()},
+                "estimated_activated_saved_bytes_avg": _mean_float(estimated_activated_saved_bytes),
+                "estimated_activated_saved_bytes_min": _min_int(estimated_activated_saved_bytes),
+                "estimated_activated_saved_bytes_max": _max_int(estimated_activated_saved_bytes),
                 "recomputed_paid_rows_avg": _mean_float(recomputed_paid_rows),
                 "recomputed_paid_rows_min": _min_int(recomputed_paid_rows),
                 "recomputed_paid_rows_max": _max_int(recomputed_paid_rows),
@@ -2698,6 +2765,11 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
                 expert_recompute_policy=str(getattr(self, "expert_recompute_policy", "tok")),
                 expert_recompute_threshold=int(getattr(self, "expert_recompute_threshold", 0) or 0),
                 expert_recompute_util_threshold=float(getattr(self, "expert_recompute_util_threshold", 0.0) or 0.0),
+                expert_activation_save_policy=str(getattr(self, "expert_activation_save_policy", "save_all")),
+                expert_activation_save_threshold=int(getattr(self, "expert_activation_save_threshold", 0) or 0),
+                expert_policy_label=str(getattr(self, "expert_policy_label", "")),
+                intermediate_size=int(getattr(self.config, "intermediate_size", 0)),
+                dtype_bytes=int(moe_in.element_size()),
             )
         with book.time("forward.moe.residual_add"):
             next_x = profiled_residual_add(hidden, moe_out, "moe.residual_add", book, scale=float(self.config.residual_scale))
@@ -2905,22 +2977,21 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         token_threshold=expert_recompute_threshold,
         util_threshold=expert_recompute_util_threshold,
     )
+    expert_activation_save_policy = normalize_expert_activation_save_policy(
+        getattr(args, "expert_activation_save_policy", "save_all")
+    )
+    expert_activation_save_threshold = normalize_expert_activation_save_threshold(
+        getattr(args, "expert_activation_save_threshold", 0)
+    )
+    expert_activation_save_active = expert_activation_save_policy_enabled(
+        expert_activation_save_policy,
+        token_threshold=expert_activation_save_threshold,
+    )
     if is_kt_backend(args.backend) and expert_recompute_active:
         raise ValueError("backend=kt does not support --expert-recompute-policy")
-    target_selector = str(getattr(args, "target_modules", DEFAULT_TARGET_MODULES) or DEFAULT_TARGET_MODULES)
-    offload_selector = str(getattr(args, "offload_modules", DEFAULT_MOE_OFFLOAD_MODULES) or DEFAULT_MOE_OFFLOAD_MODULES)
-    target_groups = moe_selector_groups(target_selector, default=DEFAULT_TARGET_MODULES, purpose="target")
-    if target_groups != {"routed_experts", "shared_experts"}:
-        raise ValueError("toy MoE target_modules currently supports all/mlp only; use offload_modules for routed/shared CPU placement")
-    config_extra["lora_dtype"] = str(lora_dtype)
-    config_extra["target_modules"] = target_selector
-    config_extra["offload_modules"] = offload_selector
-    config_extra["shared_expert_policy"] = config_extra_shared_note
-    config_extra["activation_recompute"] = bool(getattr(args, "activation_recompute", False))
-    config_extra["expert_recompute_policy"] = expert_recompute_policy
-    config_extra["expert_recompute_threshold"] = expert_recompute_threshold
-    config_extra["expert_recompute_util_threshold"] = expert_recompute_util_threshold
-    config_extra["expert_recompute_policy_spec"] = str(
+    if is_kt_backend(args.backend) and expert_activation_save_active:
+        raise ValueError("backend=kt does not support --expert-activation-save-policy")
+    expert_recompute_policy_spec = str(
         getattr(args, "expert_recompute_policy_spec", "")
         or (
             "none"
@@ -2936,6 +3007,31 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
             )
         )
     )
+    expert_policy_label = str(getattr(args, "expert_policy_label", "") or expert_recompute_policy_spec)
+    if not expert_policy_label:
+        expert_policy_label = "none"
+    if expert_activation_save_active and expert_policy_label == "none":
+        if expert_activation_save_policy == "all_act":
+            expert_policy_label = "all-act"
+        elif expert_activation_save_policy == "tok_act":
+            expert_policy_label = f"tok{expert_activation_save_threshold}-act"
+    target_selector = str(getattr(args, "target_modules", DEFAULT_TARGET_MODULES) or DEFAULT_TARGET_MODULES)
+    offload_selector = str(getattr(args, "offload_modules", DEFAULT_MOE_OFFLOAD_MODULES) or DEFAULT_MOE_OFFLOAD_MODULES)
+    target_groups = moe_selector_groups(target_selector, default=DEFAULT_TARGET_MODULES, purpose="target")
+    if target_groups != {"routed_experts", "shared_experts"}:
+        raise ValueError("toy MoE target_modules currently supports all/mlp only; use offload_modules for routed/shared CPU placement")
+    config_extra["lora_dtype"] = str(lora_dtype)
+    config_extra["target_modules"] = target_selector
+    config_extra["offload_modules"] = offload_selector
+    config_extra["shared_expert_policy"] = config_extra_shared_note
+    config_extra["activation_recompute"] = bool(getattr(args, "activation_recompute", False))
+    config_extra["expert_recompute_policy"] = expert_recompute_policy
+    config_extra["expert_recompute_threshold"] = expert_recompute_threshold
+    config_extra["expert_recompute_util_threshold"] = expert_recompute_util_threshold
+    config_extra["expert_recompute_policy_spec"] = expert_recompute_policy_spec
+    config_extra["expert_activation_save_policy"] = expert_activation_save_policy
+    config_extra["expert_activation_save_threshold"] = expert_activation_save_threshold
+    config_extra["expert_policy_label"] = expert_policy_label
     config_extra["profile_seed"] = int(getattr(args, "profile_seed", 1234))
     if is_kt_backend(args.backend):
         config_extra["kt_method"] = args.kt_method
@@ -2975,6 +3071,8 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
             expert_recompute_threshold=expert_recompute_threshold,
             expert_recompute_policy=expert_recompute_policy,
             expert_recompute_util_threshold=expert_recompute_util_threshold,
+            expert_activation_save_policy=expert_activation_save_policy,
+            expert_activation_save_threshold=expert_activation_save_threshold,
         )
     else:
         stats = AsymExecutionStats()
@@ -2997,8 +3095,12 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
             expert_recompute_threshold=expert_recompute_threshold,
             expert_recompute_policy=expert_recompute_policy,
             expert_recompute_util_threshold=expert_recompute_util_threshold,
+            expert_activation_save_policy=expert_activation_save_policy,
+            expert_activation_save_threshold=expert_activation_save_threshold,
         )
         del state
+    for layer in getattr(model, "layers", []):
+        setattr(layer, "expert_policy_label", expert_policy_label)
     set_profile_names(model)
     optimizer_params = model.kt_lora_parameters() if is_kt_backend(args.backend) else list(model.parameters())
     if not optimizer_params:
@@ -3273,9 +3375,12 @@ def markdown(report: dict[str, Any]) -> str:
                 f"| samples | {int(route_stats.get('samples', 0))} |",
                 f"| num experts | {int(route_stats.get('num_experts', 0))} |",
                 f"| top k | {int(route_stats.get('top_k', 0))} |",
+                f"| expert policy label | {str(route_stats.get('expert_policy_label', route_stats.get('expert_recompute_policy_spec', 'none')))} |",
                 f"| expert recompute policy | {str(route_stats.get('expert_recompute_policy_spec', 'none'))} |",
                 f"| expert recompute threshold | {int(route_stats.get('expert_recompute_threshold', 0))} |",
                 f"| expert recompute util threshold | {float(route_stats.get('expert_recompute_util_threshold', 0.0)):.3f} |",
+                f"| expert activation-save policy | {str(route_stats.get('expert_activation_save_policy', 'save_all'))} |",
+                f"| expert activation-save threshold | {int(route_stats.get('expert_activation_save_threshold', 0))} |",
                 f"| all-expert avg tokens | {float(all_tokens.get('avg', 0.0)):.2f} |",
                 f"| all-expert p0 tokens | {float(all_tokens.get('p0', all_tokens.get('min', 0.0))):.2f} |",
                 f"| all-expert p25 tokens | {float(all_tokens.get('p25', 0.0)):.2f} |",
@@ -3310,6 +3415,9 @@ def markdown(report: dict[str, Any]) -> str:
                 f"| kept routes avg | {float(threshold_effect.get('kept_routes_avg', 0.0)):.2f} |",
                 f"| kept routes p50 | {float(threshold_effect.get('kept_routes_p50', threshold_effect.get('kept_routes_avg', 0.0))):.2f} |",
                 f"| kept routes p90 | {float(threshold_effect.get('kept_routes_p90', 0.0)):.2f} |",
+                f"| activated-drop experts avg | {float(threshold_effect.get('activated_drop_experts_avg', 0.0)):.2f} |",
+                f"| activated-drop routes avg | {float(threshold_effect.get('activated_drop_routes_avg', 0.0)):.2f} |",
+                f"| estimated activated saved MiB avg | {fmt_mib(threshold_effect.get('estimated_activated_saved_bytes_avg', 0))} |",
                 f"| kept paid rows avg | {float(threshold_effect.get('kept_paid_rows_avg', 0.0)):.2f} |",
                 f"| kept util avg | {float(threshold_effect.get('kept_util_avg', 0.0)):.3f} |",
                 "",
@@ -3980,6 +4088,22 @@ def parse_args() -> argparse.Namespace:
         help="For util policies, recompute expert groups with tokens / ceil_to_128(tokens) at least this value.",
     )
     parser.add_argument("--expert-recompute-policy-spec", default="", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--expert-activation-save-policy",
+        choices=["save_all", "all_act", "tok_act"],
+        default="save_all",
+        help=(
+            "MoE activation-save policy. save_all keeps normal expert activations; tok_act saves gate/up but "
+            "drops silu(gate)*up for experts whose routed tokens are <= --expert-activation-save-threshold."
+        ),
+    )
+    parser.add_argument(
+        "--expert-activation-save-threshold",
+        type=int,
+        default=0,
+        help="Token threshold used by --expert-activation-save-policy tok_act. 0 disables tok_act.",
+    )
+    parser.add_argument("--expert-policy-label", default="", help=argparse.SUPPRESS)
     parser.add_argument("--hf-layer-index", type=int, default=0)
     parser.add_argument("--hf-cache-dir", default=None)
     parser.add_argument("--hf-local-files-only", action="store_true")

@@ -126,13 +126,20 @@ static void sm100_m_grouped_bf16_asym_gemm_contiguous(const torch::Tensor& a,
                                                  const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                  const std::string& compiled_dims,
                                                  const int b_outer_stride = -1) {
-    const int block_m = 64;
+    const int block_m = (major_b == cute::UMMA::Major::MN)
+        ? get_env<int>("DG_BF16_TRANSPOSE_BLOCK_M", 64)
+        : get_env<int>("DG_BF16_BLOCK_M", 64);
     // SM100 legality requires block_n <= 128 when k <= 256.
     // const int block_n = (k <= 256) ? 128 : 256;
     // const int block_k = 64;
 
-    const int block_n = 64;
-    const int block_k = (major_b == cute::UMMA::Major::MN) ? 64 : 512;
+    const int block_n = (major_b == cute::UMMA::Major::MN)
+        ? get_env<int>("DG_BF16_TRANSPOSE_BLOCK_N", 64)
+        : get_env<int>("DG_BF16_BLOCK_N", 64);
+    const int default_transpose_block_k = (k >= 768) ? 256 : 64;
+    const int block_k = (major_b == cute::UMMA::Major::MN)
+        ? get_env<int>("DG_BF16_TRANSPOSE_BLOCK_K", default_transpose_block_k)
+        : get_env<int>("DG_BF16_BLOCK_K", 512);
     const auto& aligned_k = align(k, block_k);
 
     const bool use_manual_config = block_m > 0 or block_n > 0 or block_k > 0;

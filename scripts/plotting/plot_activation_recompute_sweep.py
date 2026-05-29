@@ -63,6 +63,12 @@ COMBINED_OUTPUT_FILES = (
     "combined_backward_peak_memory_vs_expert_tok_util_threshold.png",
     "combined_peak_hbm_vs_expert_tok_util_threshold.png",
     "combined_timing_vs_expert_tok_util_threshold.png",
+    "combined_forward_end_memory_vs_expert_tok_act_threshold.png",
+    "combined_forward_peak_memory_vs_expert_tok_act_threshold.png",
+    "combined_backward_start_memory_vs_expert_tok_act_threshold.png",
+    "combined_backward_peak_memory_vs_expert_tok_act_threshold.png",
+    "combined_peak_hbm_vs_expert_tok_act_threshold.png",
+    "combined_timing_vs_expert_tok_act_threshold.png",
 )
 GROUP_OUTPUT_FILES = (
     "sweep_summary.csv",
@@ -117,12 +123,22 @@ def parse_args() -> argparse.Namespace:
         "--expert-recompute-policies",
         nargs="+",
         default=[],
-        help="Expert policy filter. Accepts none, tok128, util075, tok128-util075.",
+        help="Expert policy filter. Accepts none, tok128, util075, tok128-util075, tok128-act.",
     )
     parser.add_argument(
         "--clean-output",
         action="store_true",
         help="Remove previously generated plot artifacts from the output directory before writing this filtered run.",
+    )
+    parser.add_argument(
+        "--skip-combined",
+        action="store_true",
+        help="Do not write combined plots.",
+    )
+    parser.add_argument(
+        "--combined-only",
+        action="store_true",
+        help="Only write the combined index and combined plots.",
     )
     return parser.parse_args()
 
@@ -188,61 +204,97 @@ def parse_expert_policy_spec(value: str | None, *, legacy_threshold: int | None 
         if threshold <= 0:
             return {
                 "expert_recompute_policy_spec": "none",
+                "expert_policy_label": "none",
                 "expert_recompute_policy": "none",
                 "expert_recompute_threshold": 0,
                 "expert_recompute_util_threshold": 0.0,
+                "expert_activation_save_policy": "save_all",
+                "expert_activation_save_threshold": 0,
             }
         return {
             "expert_recompute_policy_spec": f"tok{threshold}",
+            "expert_policy_label": f"tok{threshold}",
             "expert_recompute_policy": "tok",
             "expert_recompute_threshold": threshold,
             "expert_recompute_util_threshold": 0.0,
+            "expert_activation_save_policy": "save_all",
+            "expert_activation_save_threshold": 0,
         }
     spec = str(value).strip().lower().replace("_", "-")
     if spec in {"none", "off", "false", "0"}:
         return {
             "expert_recompute_policy_spec": "none",
+            "expert_policy_label": "none",
             "expert_recompute_policy": "none",
             "expert_recompute_threshold": 0,
             "expert_recompute_util_threshold": 0.0,
+            "expert_activation_save_policy": "save_all",
+            "expert_activation_save_threshold": 0,
         }
     token_threshold: int | None = None
     util_threshold: float | None = None
+    activation_drop = False
     for part in spec.split("-"):
         if match := re.fullmatch(r"tok([0-9]+)", part):
             token_threshold = int(match.group(1))
         elif match := re.fullmatch(r"util([0-9]+(?:\.[0-9]+)?)", part):
             util_threshold = parse_util_threshold_token(match.group(1))
+        elif part == "act":
+            activation_drop = True
         else:
             raise ValueError(f"invalid expert recompute policy spec {value!r}")
     token_threshold = int(token_threshold or 0)
     util_threshold = float(util_threshold or 0.0)
-    if token_threshold <= 0 and util_threshold <= 0.0:
+    if activation_drop:
+        if token_threshold <= 0 or util_threshold > 0.0:
+            raise ValueError(f"invalid expert recompute policy spec {value!r}; act suffix requires tokXX-act")
         return {
-            "expert_recompute_policy_spec": "none",
+            "expert_recompute_policy_spec": f"tok{token_threshold}-act",
+            "expert_policy_label": f"tok{token_threshold}-act",
             "expert_recompute_policy": "none",
             "expert_recompute_threshold": 0,
             "expert_recompute_util_threshold": 0.0,
+            "expert_activation_save_policy": "tok_act",
+            "expert_activation_save_threshold": token_threshold,
+        }
+    if token_threshold <= 0 and util_threshold <= 0.0:
+        return {
+            "expert_recompute_policy_spec": "none",
+            "expert_policy_label": "none",
+            "expert_recompute_policy": "none",
+            "expert_recompute_threshold": 0,
+            "expert_recompute_util_threshold": 0.0,
+            "expert_activation_save_policy": "save_all",
+            "expert_activation_save_threshold": 0,
         }
     if token_threshold > 0 and util_threshold > 0.0:
         return {
             "expert_recompute_policy_spec": f"tok{token_threshold}-{util_policy_label(util_threshold)}",
+            "expert_policy_label": f"tok{token_threshold}-{util_policy_label(util_threshold)}",
             "expert_recompute_policy": "tok_util",
             "expert_recompute_threshold": token_threshold,
             "expert_recompute_util_threshold": util_threshold,
+            "expert_activation_save_policy": "save_all",
+            "expert_activation_save_threshold": 0,
         }
     if token_threshold > 0:
         return {
             "expert_recompute_policy_spec": f"tok{token_threshold}",
+            "expert_policy_label": f"tok{token_threshold}",
             "expert_recompute_policy": "tok",
             "expert_recompute_threshold": token_threshold,
             "expert_recompute_util_threshold": 0.0,
+            "expert_activation_save_policy": "save_all",
+            "expert_activation_save_threshold": 0,
         }
     return {
         "expert_recompute_policy_spec": util_policy_label(util_threshold),
+        "expert_policy_label": util_policy_label(util_threshold),
         "expert_recompute_policy": "util",
         "expert_recompute_threshold": 0,
         "expert_recompute_util_threshold": util_threshold,
+        "expert_activation_save_policy": "save_all",
+        "expert_activation_save_threshold": 0,
     }
 
 
@@ -428,18 +480,40 @@ def passes_filters(args: argparse.Namespace, meta: dict[str, Any]) -> bool:
         return False
     policy_values = split_tokens(list(args.expert_recompute_policy) + list(args.expert_recompute_policies))
     if policy_values:
-        policy_filter = {parse_expert_policy_spec(value)["expert_recompute_policy_spec"] for value in policy_values}
-        if str(meta["expert_recompute_policy_spec"]) not in policy_filter:
+        parsed_policy_filter = [parse_expert_policy_spec(value) for value in policy_values]
+        policy_filter = {
+            str(policy["expert_recompute_policy_spec"])
+            for policy in parsed_policy_filter
+        } | {
+            str(policy["expert_policy_label"])
+            for policy in parsed_policy_filter
+        }
+        if str(meta["expert_recompute_policy_spec"]) not in policy_filter and str(meta.get("expert_policy_label", "")) not in policy_filter:
             return False
     return True
 
 
+def skip_search_path(path: Path, input_root: Path) -> bool:
+    try:
+        parts = path.relative_to(input_root).parts
+    except ValueError:
+        parts = path.parts
+    return any(part in {"_combined", "combined"} or part.startswith("_") for part in parts)
+
+
 def result_dirs(input_root: Path) -> list[Path]:
-    legacy_dirs = [path for path in input_root.rglob("*_lora-sft_*") if path.is_dir()]
+    legacy_dirs = [
+        path
+        for path in input_root.rglob("*_lora-sft_*")
+        if path.is_dir() and not skip_search_path(path, input_root)
+    ]
     flat_dirs = [
         path
         for path in input_root.rglob("s*")
-        if path.is_dir() and FLAT_SEQ_RE.match(path.name) and profile_json_path(path) is not None
+        if path.is_dir()
+        and FLAT_SEQ_RE.match(path.name)
+        and not skip_search_path(path, input_root)
+        and profile_json_path(path) is not None
     ]
     return sorted({*legacy_dirs, *flat_dirs})
 
@@ -470,6 +544,45 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
     threshold_effect = route_stats.get("threshold_effect", {})
     if not isinstance(threshold_effect, dict):
         threshold_effect = {}
+    expert_recompute_policy_spec = str(
+        route_stats.get("expert_recompute_policy_spec", config.get("expert_recompute_policy_spec", meta["expert_recompute_policy_spec"]))
+    )
+    expert_policy_label = str(
+        route_stats.get("expert_policy_label", config.get("expert_policy_label", meta.get("expert_policy_label", expert_recompute_policy_spec)))
+    )
+    expert_recompute_policy = str(
+        route_stats.get("expert_recompute_policy", config.get("expert_recompute_policy", meta["expert_recompute_policy"]))
+    )
+    expert_recompute_threshold = numeric_int(
+        route_stats.get("expert_recompute_threshold", config.get("expert_recompute_threshold", meta["expert_recompute_threshold"]))
+    )
+    expert_recompute_util_threshold = numeric_float(
+        route_stats.get(
+            "expert_recompute_util_threshold",
+            config.get("expert_recompute_util_threshold", meta["expert_recompute_util_threshold"]),
+        )
+    )
+    expert_activation_save_policy = str(
+        route_stats.get(
+            "expert_activation_save_policy",
+            config.get("expert_activation_save_policy", meta.get("expert_activation_save_policy", "save_all")),
+        )
+    )
+    expert_activation_save_threshold = numeric_int(
+        route_stats.get(
+            "expert_activation_save_threshold",
+            config.get("expert_activation_save_threshold", meta.get("expert_activation_save_threshold", 0)),
+        )
+    )
+    if expert_activation_save_policy == "tok_act":
+        expert_recompute_sweep_x = float(expert_activation_save_threshold)
+        expert_recompute_sweep_x_name = "activation_token_threshold"
+    elif expert_recompute_policy == "tok":
+        expert_recompute_sweep_x = float(expert_recompute_threshold)
+        expert_recompute_sweep_x_name = "token_threshold"
+    else:
+        expert_recompute_sweep_x = float(expert_recompute_util_threshold)
+        expert_recompute_sweep_x_name = "util_threshold"
     return {
         "workload": meta["workload"],
         "precision": meta["precision"],
@@ -478,18 +591,15 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         "logical_tokens": int(config.get("logical_tokens", batch_size * int(meta["seq_len"]))),
         "mode": meta["mode"],
         "activation_recompute": bool(meta["activation_recompute"]),
-        "expert_recompute_policy_spec": str(meta["expert_recompute_policy_spec"]),
-        "expert_recompute_policy": str(meta["expert_recompute_policy"]),
-        "expert_recompute_threshold": int(meta["expert_recompute_threshold"]),
-        "expert_recompute_util_threshold": float(meta["expert_recompute_util_threshold"]),
-        "expert_recompute_sweep_x": float(
-            meta["expert_recompute_threshold"]
-            if meta["expert_recompute_policy"] == "tok"
-            else meta["expert_recompute_util_threshold"]
-        ),
-        "expert_recompute_sweep_x_name": (
-            "token_threshold" if meta["expert_recompute_policy"] == "tok" else "util_threshold"
-        ),
+        "expert_recompute_policy_spec": expert_recompute_policy_spec,
+        "expert_policy_label": expert_policy_label,
+        "expert_recompute_policy": expert_recompute_policy,
+        "expert_recompute_threshold": expert_recompute_threshold,
+        "expert_recompute_util_threshold": expert_recompute_util_threshold,
+        "expert_activation_save_policy": expert_activation_save_policy,
+        "expert_activation_save_threshold": expert_activation_save_threshold,
+        "expert_recompute_sweep_x": expert_recompute_sweep_x,
+        "expert_recompute_sweep_x_name": expert_recompute_sweep_x_name,
         "backend": meta["backend"],
         "profiler": meta["profiler"],
         "step_ms": step_ms(profile),
@@ -579,6 +689,15 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         "route_kept_routes_p75": numeric_float(threshold_effect.get("kept_routes_p75")),
         "route_kept_routes_p90": numeric_float(threshold_effect.get("kept_routes_p90")),
         "route_kept_routes_p100": numeric_float(threshold_effect.get("kept_routes_p100")),
+        "route_activated_drop_experts_avg": numeric_float(threshold_effect.get("activated_drop_experts_avg")),
+        "route_activated_drop_experts_min": numeric_int(threshold_effect.get("activated_drop_experts_min")),
+        "route_activated_drop_experts_max": numeric_int(threshold_effect.get("activated_drop_experts_max")),
+        "route_activated_drop_routes_avg": numeric_float(threshold_effect.get("activated_drop_routes_avg")),
+        "route_activated_drop_routes_min": numeric_int(threshold_effect.get("activated_drop_routes_min")),
+        "route_activated_drop_routes_max": numeric_int(threshold_effect.get("activated_drop_routes_max")),
+        "route_estimated_activated_saved_mib_avg": to_mib(threshold_effect.get("estimated_activated_saved_bytes_avg")),
+        "route_estimated_activated_saved_mib_min": to_mib(threshold_effect.get("estimated_activated_saved_bytes_min")),
+        "route_estimated_activated_saved_mib_max": to_mib(threshold_effect.get("estimated_activated_saved_bytes_max")),
         "route_recomputed_paid_rows_avg": numeric_float(threshold_effect.get("recomputed_paid_rows_avg")),
         "route_recomputed_paid_rows_min": numeric_int(threshold_effect.get("recomputed_paid_rows_min")),
         "route_recomputed_paid_rows_max": numeric_int(threshold_effect.get("recomputed_paid_rows_max")),
@@ -607,6 +726,9 @@ def collect_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["expert_recompute_policy"],
             row["expert_recompute_threshold"],
             row["expert_recompute_util_threshold"],
+            row["expert_activation_save_policy"],
+            row["expert_activation_save_threshold"],
+            row["expert_policy_label"],
         ),
     )
 
@@ -964,7 +1086,12 @@ def plot_combined_metric(
 
 def threshold_sweep_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_series: dict[tuple[tuple[str, str, int, int, str, str], str], set[int]] = {}
-    token_rows = [row for row in rows if str(row.get("expert_recompute_policy", "none")) in {"none", "tok"}]
+    token_rows = [
+        row
+        for row in rows
+        if str(row.get("expert_recompute_policy", "none")) in {"none", "tok"}
+        and str(row.get("expert_activation_save_policy", "save_all")) == "save_all"
+    ]
     for row in token_rows:
         by_series.setdefault((threshold_group_key(row), str(row["mode"])), set()).add(int(row["expert_recompute_threshold"]))
     eligible = {key for key, thresholds in by_series.items() if len(thresholds) >= 2}
@@ -973,15 +1100,39 @@ def threshold_sweep_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def policy_family_rows(rows: list[dict[str, Any]], family: str) -> list[dict[str, Any]]:
     if family == "tok":
-        return [row for row in rows if str(row.get("expert_recompute_policy", "none")) in {"none", "tok"}]
+        return [
+            row
+            for row in rows
+            if str(row.get("expert_recompute_policy", "none")) in {"none", "tok"}
+            and str(row.get("expert_activation_save_policy", "save_all")) == "save_all"
+        ]
     if family == "util":
-        return [row for row in rows if str(row.get("expert_recompute_policy", "none")) in {"none", "util"}]
+        return [
+            row
+            for row in rows
+            if str(row.get("expert_recompute_policy", "none")) in {"none", "util"}
+            and str(row.get("expert_activation_save_policy", "save_all")) == "save_all"
+        ]
     if family == "tok_util":
         return [row for row in rows if str(row.get("expert_recompute_policy", "none")) == "tok_util"]
+    if family == "tok_act":
+        return [
+            row
+            for row in rows
+            if (
+                str(row.get("expert_policy_label", "none")) == "none"
+                and str(row.get("expert_activation_save_policy", "save_all")) == "save_all"
+            )
+            or str(row.get("expert_activation_save_policy", "save_all")) == "tok_act"
+        ]
     return []
 
 
 def policy_sweep_x(row: dict[str, Any], family: str) -> float:
+    if family == "tok_act":
+        if str(row.get("expert_activation_save_policy", "save_all")) == "tok_act":
+            return float(row["expert_activation_save_threshold"])
+        return 0.0
     if str(row.get("expert_recompute_policy", "none")) == "none":
         return 0.0
     if family == "tok":
@@ -1012,6 +1163,8 @@ def policy_sweep_rows(rows: list[dict[str, Any]], family: str) -> list[dict[str,
 def policy_x_label(family: str) -> str:
     if family == "tok":
         return "Expert recompute threshold (tokens)"
+    if family == "tok_act":
+        return "Expert activated-drop threshold (tokens)"
     return "Expert recompute tile utilization threshold"
 
 
@@ -1020,6 +1173,7 @@ def policy_filename_suffix(family: str) -> str:
         "tok": "expert_tok_threshold",
         "util": "expert_util_threshold",
         "tok_util": "expert_tok_util_threshold",
+        "tok_act": "expert_tok_act_threshold",
     }[family]
 
 
@@ -1337,6 +1491,7 @@ def write_group_policy_plots(
         "tok": "expert token threshold",
         "util": "expert utilization threshold",
         "tok_util": "expert token+util threshold",
+        "tok_act": "expert activated-drop threshold",
     }[family]
     plot_policy_metric(
         rows,
@@ -1511,6 +1666,7 @@ def write_combined_policy_plots(rows: list[dict[str, Any]], output_dir: Path, fa
         "tok": "expert token threshold",
         "util": "expert utilization threshold",
         "tok_util": "expert token+util threshold",
+        "tok_act": "expert activated-drop threshold",
     }[family]
     plot_combined_policy_metric(
         rows,
@@ -1575,6 +1731,8 @@ def write_combined_policy_plots(rows: list[dict[str, Any]], output_dir: Path, fa
 
 def main() -> None:
     args = parse_args()
+    if args.skip_combined and args.combined_only:
+        raise SystemExit("--skip-combined and --combined-only cannot be used together")
     rows = collect_rows(args)
     if not rows:
         raise SystemExit(f"no driver result directories found under {resolve_path(args.input_root)}")
@@ -1582,41 +1740,40 @@ def main() -> None:
     root = output_root(args)
     combined_dir = combined_output_root(args, root)
     if args.clean_output:
-        clean_output_dir(root)
-        clean_output_dir(combined_dir)
+        if not args.combined_only:
+            clean_output_dir(root)
+        if not args.skip_combined:
+            clean_output_dir(combined_dir)
     write_table(rows, root, "activation_recompute_sweep_index")
 
-    seq_rows = [row for row in rows if str(row.get("expert_recompute_policy", "none")) == "none"]
-    if seq_rows:
+    seq_rows = [
+        row
+        for row in rows
+        if str(row.get("expert_recompute_policy", "none")) == "none"
+        and str(row.get("expert_activation_save_policy", "save_all")) == "save_all"
+    ]
+    if seq_rows and not args.skip_combined:
         write_combined_plots(seq_rows, combined_dir)
 
-    groups: dict[tuple[str, str, int, str, str], list[dict[str, Any]]] = {}
-    for row in seq_rows:
-        groups.setdefault(group_key(row), []).append(row)
-    for key, group_rows in sorted(groups.items()):
-        workload, precision, batch_size, backend, profiler = key
-        group_dir = root / safe_label(f"{workload}-b{batch_size}-{precision}-{backend}-{profiler}")
-        write_table(group_rows, group_dir, "sweep_summary")
-        write_group_plots(group_rows, group_dir, key)
-        print(f"wrote {group_dir}", flush=True)
-
-    threshold_rows = threshold_sweep_rows(rows)
-    if threshold_rows:
-        write_combined_threshold_plots(threshold_rows, combined_dir)
-        threshold_groups: dict[tuple[tuple[str, str, int, str, str], int], list[dict[str, Any]]] = {}
-        for row in threshold_rows:
-            threshold_groups.setdefault((group_key(row), int(row["seq_len"])), []).append(row)
-        for (key, seq_len), group_rows in sorted(threshold_groups.items()):
+    if not args.combined_only:
+        groups: dict[tuple[str, str, int, str, str], list[dict[str, Any]]] = {}
+        for row in seq_rows:
+            groups.setdefault(group_key(row), []).append(row)
+        for key, group_rows in sorted(groups.items()):
             workload, precision, batch_size, backend, profiler = key
             group_dir = root / safe_label(f"{workload}-b{batch_size}-{precision}-{backend}-{profiler}")
-            write_table(group_rows, group_dir, f"expert_threshold_summary_s{seq_len}")
-            write_group_threshold_plots(group_rows, group_dir, key, seq_len)
-            print(f"wrote {group_dir} expert threshold s{seq_len}", flush=True)
-    for family in ("tok", "util", "tok_util"):
+            write_table(group_rows, group_dir, "sweep_summary")
+            write_group_plots(group_rows, group_dir, key)
+            print(f"wrote {group_dir}", flush=True)
+
+    for family in ("tok", "util", "tok_util", "tok_act"):
         family_rows = policy_sweep_rows(rows, family)
         if not family_rows:
             continue
-        write_combined_policy_plots(family_rows, combined_dir, family)
+        if not args.skip_combined:
+            write_combined_policy_plots(family_rows, combined_dir, family)
+        if args.combined_only:
+            continue
         family_groups: dict[tuple[tuple[str, str, int, str, str], int], list[dict[str, Any]]] = {}
         for row in family_rows:
             family_groups.setdefault((group_key(row), int(row["seq_len"])), []).append(row)
