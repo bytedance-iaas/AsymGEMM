@@ -206,6 +206,52 @@ def is_moe_workload_name(workload: str) -> bool:
     return workload in KT_MOE_WORKLOADS or is_hf_model_workload(workload)
 
 
+def apply_expert_recompute_policy_label(args: argparse.Namespace) -> None:
+    raw = str(getattr(args, "expert_recompute_policy", "tok") or "tok").strip()
+    spec = raw.lower().replace("_", "-")
+    if spec in {"none", "split", "tok", "util", "tok-util"}:
+        if spec == "tok-util":
+            args.expert_recompute_policy = "tok_util"
+        return
+    if match := re.fullmatch(r"split([0-9]+)", spec):
+        threshold = int(match.group(1))
+        args.expert_recompute_policy = "split"
+        args.expert_recompute_threshold = threshold
+        args.expert_recompute_util_threshold = 0.0
+        args.expert_recompute_policy_spec = f"split{threshold}"
+        args.expert_activation_save_policy = "save_all"
+        args.expert_activation_save_threshold = 0
+        args.expert_policy_label = f"split{threshold}"
+        return
+    if match := re.fullmatch(r"tok([0-9]+)-ckpt", spec):
+        threshold = int(match.group(1))
+        args.expert_recompute_policy = "tok"
+        args.expert_recompute_threshold = threshold
+        args.expert_recompute_util_threshold = 0.0
+        args.expert_recompute_policy_spec = f"tok{threshold}-ckpt"
+        args.expert_activation_save_policy = "save_all"
+        args.expert_activation_save_threshold = 0
+        args.expert_policy_label = f"tok{threshold}-ckpt"
+        return
+    if match := re.fullmatch(r"tok([0-9]+)-act-ckpt", spec):
+        threshold = int(match.group(1))
+        args.expert_recompute_policy = "none"
+        args.expert_recompute_threshold = 0
+        args.expert_recompute_util_threshold = 0.0
+        args.expert_recompute_policy_spec = f"tok{threshold}-act-ckpt"
+        args.expert_activation_save_policy = "tok_act"
+        args.expert_activation_save_threshold = threshold
+        args.expert_policy_label = f"tok{threshold}-act-ckpt"
+        return
+    if re.fullmatch(r"tok[0-9]+(?:-act)?", spec):
+        raise ValueError(
+            f"invalid --expert-recompute-policy {raw!r}; use tokXX-ckpt or tokXX-act-ckpt"
+        )
+    raise ValueError(
+        f"invalid --expert-recompute-policy {raw!r}; expected none, splitXX, tokXX-ckpt, tokXX-act-ckpt, or low-level split/tok"
+    )
+
+
 def profile_layer_count(args: argparse.Namespace, *, max_layers: int) -> int:
     requested = str(getattr(args, "real_profile_layers", 1)).strip().lower()
     if requested == "all":
@@ -425,6 +471,7 @@ class StageBook:
         expert_recompute_threshold: int = 0,
         expert_recompute_util_threshold: float = 0.0,
         expert_recompute_policy_spec: str = "",
+        expert_recompute_impl: str = "checkpoint",
         expert_activation_save_policy: str = "save_all",
         expert_activation_save_threshold: int = 0,
         expert_policy_label: str = "",
@@ -472,6 +519,8 @@ class StageBook:
                 util_threshold=util_threshold,
             ):
                 expert_recompute_policy_spec = "none"
+            elif policy == "split":
+                expert_recompute_policy_spec = f"split{threshold}"
             elif policy == "tok":
                 expert_recompute_policy_spec = f"tok{threshold}"
             elif policy == "util":
@@ -483,7 +532,11 @@ class StageBook:
             if activation_policy == "all_act":
                 expert_policy_label = "all-act" if expert_policy_label == "none" else f"{expert_policy_label}-all-act"
             elif activation_policy == "tok_act":
-                expert_policy_label = f"tok{activation_threshold}-act" if expert_policy_label == "none" else f"{expert_policy_label}-tok{activation_threshold}-act"
+                expert_policy_label = (
+                    f"tok{activation_threshold}-act-ckpt"
+                    if expert_policy_label == "none"
+                    else f"{expert_policy_label}-tok{activation_threshold}-act-ckpt"
+                )
         estimated_activated_saved_bytes = (
             int(sum(activation_drop_counts)) * max(0, int(intermediate_size)) * max(0, int(dtype_bytes))
         )
@@ -497,6 +550,7 @@ class StageBook:
                 "expert_recompute_threshold": threshold,
                 "expert_recompute_util_threshold": util_threshold,
                 "expert_recompute_policy_spec": str(expert_recompute_policy_spec),
+                "expert_recompute_impl": str(expert_recompute_impl or "checkpoint"),
                 "expert_activation_save_policy": activation_policy,
                 "expert_activation_save_threshold": activation_threshold,
                 "expert_policy_label": str(expert_policy_label),
@@ -544,6 +598,7 @@ class StageBook:
         first = records[0]
         policy = str(first.get("expert_recompute_policy", "tok"))
         policy_spec = str(first.get("expert_recompute_policy_spec", "none"))
+        expert_recompute_impl = str(first.get("expert_recompute_impl", "checkpoint"))
         threshold = int(first.get("expert_recompute_threshold", 0) or 0)
         util_threshold = float(first.get("expert_recompute_util_threshold", 0.0) or 0.0)
         activation_policy = str(first.get("expert_activation_save_policy", "save_all"))
@@ -571,6 +626,7 @@ class StageBook:
             "expert_recompute_threshold": threshold,
             "expert_recompute_util_threshold": util_threshold,
             "expert_recompute_policy_spec": policy_spec,
+            "expert_recompute_impl": expert_recompute_impl,
             "expert_activation_save_policy": activation_policy,
             "expert_activation_save_threshold": activation_threshold,
             "expert_policy_label": expert_policy_label,
@@ -2765,6 +2821,8 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
                 expert_recompute_policy=str(getattr(self, "expert_recompute_policy", "tok")),
                 expert_recompute_threshold=int(getattr(self, "expert_recompute_threshold", 0) or 0),
                 expert_recompute_util_threshold=float(getattr(self, "expert_recompute_util_threshold", 0.0) or 0.0),
+                expert_recompute_policy_spec=str(getattr(self, "expert_recompute_policy_spec", "")),
+                expert_recompute_impl=str(getattr(self, "expert_recompute_impl", "checkpoint")),
                 expert_activation_save_policy=str(getattr(self, "expert_activation_save_policy", "save_all")),
                 expert_activation_save_threshold=int(getattr(self, "expert_activation_save_threshold", 0) or 0),
                 expert_policy_label=str(getattr(self, "expert_policy_label", "")),
@@ -2997,12 +3055,16 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
             "none"
             if not expert_recompute_active
             else (
-                f"tok{expert_recompute_threshold}"
-                if expert_recompute_policy == "tok"
+                f"split{expert_recompute_threshold}"
+                if expert_recompute_policy == "split"
                 else (
-                    f"util{int(round(expert_recompute_util_threshold * 100)):03d}"
-                    if expert_recompute_policy == "util"
-                    else f"tok{expert_recompute_threshold}-util{int(round(expert_recompute_util_threshold * 100)):03d}"
+                    f"tok{expert_recompute_threshold}"
+                    if expert_recompute_policy == "tok"
+                    else (
+                        f"util{int(round(expert_recompute_util_threshold * 100)):03d}"
+                        if expert_recompute_policy == "util"
+                        else f"tok{expert_recompute_threshold}-util{int(round(expert_recompute_util_threshold * 100)):03d}"
+                    )
                 )
             )
         )
@@ -3014,7 +3076,7 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         if expert_activation_save_policy == "all_act":
             expert_policy_label = "all-act"
         elif expert_activation_save_policy == "tok_act":
-            expert_policy_label = f"tok{expert_activation_save_threshold}-act"
+            expert_policy_label = f"tok{expert_activation_save_threshold}-act-ckpt"
     target_selector = str(getattr(args, "target_modules", DEFAULT_TARGET_MODULES) or DEFAULT_TARGET_MODULES)
     offload_selector = str(getattr(args, "offload_modules", DEFAULT_MOE_OFFLOAD_MODULES) or DEFAULT_MOE_OFFLOAD_MODULES)
     target_groups = moe_selector_groups(target_selector, default=DEFAULT_TARGET_MODULES, purpose="target")
@@ -3029,6 +3091,7 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
     config_extra["expert_recompute_threshold"] = expert_recompute_threshold
     config_extra["expert_recompute_util_threshold"] = expert_recompute_util_threshold
     config_extra["expert_recompute_policy_spec"] = expert_recompute_policy_spec
+    config_extra["expert_recompute_impl"] = "checkpoint"
     config_extra["expert_activation_save_policy"] = expert_activation_save_policy
     config_extra["expert_activation_save_threshold"] = expert_activation_save_threshold
     config_extra["expert_policy_label"] = expert_policy_label
@@ -3100,6 +3163,8 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
         )
         del state
     for layer in getattr(model, "layers", []):
+        setattr(layer, "expert_recompute_impl", "checkpoint")
+        setattr(layer, "expert_recompute_policy_spec", expert_recompute_policy_spec)
         setattr(layer, "expert_policy_label", expert_policy_label)
     set_profile_names(model)
     optimizer_params = model.kt_lora_parameters() if is_kt_backend(args.backend) else list(model.parameters())
@@ -3376,6 +3441,7 @@ def markdown(report: dict[str, Any]) -> str:
                 f"| num experts | {int(route_stats.get('num_experts', 0))} |",
                 f"| top k | {int(route_stats.get('top_k', 0))} |",
                 f"| expert policy label | {str(route_stats.get('expert_policy_label', route_stats.get('expert_recompute_policy_spec', 'none')))} |",
+                f"| expert recompute impl | {str(route_stats.get('expert_recompute_impl', 'checkpoint'))} |",
                 f"| expert recompute policy | {str(route_stats.get('expert_recompute_policy_spec', 'none'))} |",
                 f"| expert recompute threshold | {int(route_stats.get('expert_recompute_threshold', 0))} |",
                 f"| expert recompute util threshold | {float(route_stats.get('expert_recompute_util_threshold', 0.0)):.3f} |",
@@ -4077,9 +4143,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--expert-recompute-policy",
-        choices=["none", "tok", "util", "tok_util"],
         default="tok",
-        help="MoE expert recompute policy. tok uses --expert-recompute-threshold; util uses --expert-recompute-util-threshold.",
+        help="MoE expert checkpoint policy: none, splitXX, tokXX-ckpt, tokXX-act-ckpt, or low-level split/tok.",
     )
     parser.add_argument(
         "--expert-recompute-util-threshold",
@@ -4116,6 +4181,7 @@ def parse_args() -> argparse.Namespace:
     parsed = parser.parse_args()
     parsed.dense_target_mode = parsed.target_preset
     try:
+        apply_expert_recompute_policy_label(parsed)
         validate_backend_workload(parsed)
     except ValueError as exc:
         parser.error(str(exc))

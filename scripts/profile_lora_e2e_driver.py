@@ -76,6 +76,7 @@ class ExpertRecomputePolicySpec:
     policy: str
     token_threshold: int
     util_threshold: float
+    impl: str = "checkpoint"
     activation_save_policy: str = "save_all"
     activation_save_threshold: int = 0
 
@@ -231,66 +232,37 @@ def parse_expert_recompute_policy_spec(value: str) -> ExpertRecomputePolicySpec:
     if spec in {"", "none", "off", "false", "0"}:
         return ExpertRecomputePolicySpec(raw=raw, label="none", policy="none", token_threshold=0, util_threshold=0.0)
 
-    token_threshold: int | None = None
-    util_threshold: float | None = None
-    activation_drop = False
-    parts = spec.split("-")
-    if len(parts) > 3:
-        raise SystemExit(f"invalid expert recompute policy {value!r}; expected none, tokXX, utilXX, tokXX-utilXX, or tokXX-act")
-    for part in parts:
-        if match := re.fullmatch(r"tok([0-9]+)", part):
-            if token_threshold is not None:
-                raise SystemExit(f"invalid expert recompute policy {value!r}; duplicate token threshold")
-            token_threshold = int(match.group(1))
-        elif match := re.fullmatch(r"util([0-9]+(?:\.[0-9]+)?)", part):
-            if util_threshold is not None:
-                raise SystemExit(f"invalid expert recompute policy {value!r}; duplicate util threshold")
-            util_threshold = _parse_util_threshold_token(match.group(1))
-        elif part == "act":
-            if activation_drop:
-                raise SystemExit(f"invalid expert recompute policy {value!r}; duplicate act suffix")
-            activation_drop = True
-        else:
-            raise SystemExit(f"invalid expert recompute policy {value!r}; expected none, tokXX, utilXX, tokXX-utilXX, or tokXX-act")
-
-    token_threshold = int(token_threshold or 0)
-    util_threshold = float(util_threshold or 0.0)
-    if activation_drop:
-        if token_threshold <= 0 or util_threshold > 0.0:
-            raise SystemExit(f"invalid expert recompute policy {value!r}; act suffix is only supported as tokXX-act")
+    if match := re.fullmatch(r"split([0-9]+)", spec):
+        token_threshold = int(match.group(1))
         return ExpertRecomputePolicySpec(
             raw=raw,
-            label=f"tok{token_threshold}-act",
+            label=f"split{token_threshold}",
+            policy="split",
+            token_threshold=token_threshold,
+            util_threshold=0.0,
+        )
+    if match := re.fullmatch(r"tok([0-9]+)-ckpt", spec):
+        token_threshold = int(match.group(1))
+        return ExpertRecomputePolicySpec(
+            raw=raw,
+            label=f"tok{token_threshold}-ckpt",
+            policy="tok",
+            token_threshold=token_threshold,
+            util_threshold=0.0,
+        )
+    if match := re.fullmatch(r"tok([0-9]+)-act-ckpt", spec):
+        token_threshold = int(match.group(1))
+        return ExpertRecomputePolicySpec(
+            raw=raw,
+            label=f"tok{token_threshold}-act-ckpt",
             policy="none",
             token_threshold=0,
             util_threshold=0.0,
             activation_save_policy="tok_act",
             activation_save_threshold=token_threshold,
         )
-    if token_threshold <= 0 and util_threshold <= 0.0:
-        return ExpertRecomputePolicySpec(raw=raw, label="none", policy="none", token_threshold=0, util_threshold=0.0)
-    if token_threshold > 0 and util_threshold > 0.0:
-        return ExpertRecomputePolicySpec(
-            raw=raw,
-            label=f"tok{token_threshold}-{_util_policy_label(util_threshold)}",
-            policy="tok_util",
-            token_threshold=token_threshold,
-            util_threshold=util_threshold,
-        )
-    if token_threshold > 0:
-        return ExpertRecomputePolicySpec(
-            raw=raw,
-            label=f"tok{token_threshold}",
-            policy="tok",
-            token_threshold=token_threshold,
-            util_threshold=0.0,
-        )
-    return ExpertRecomputePolicySpec(
-        raw=raw,
-        label=_util_policy_label(util_threshold),
-        policy="util",
-        token_threshold=0,
-        util_threshold=util_threshold,
+    raise SystemExit(
+        f"invalid expert recompute policy {value!r}; expected none, splitXX, tokXX-ckpt, or tokXX-act-ckpt"
     )
 
 
@@ -304,7 +276,7 @@ def _expert_recompute_policies(args: argparse.Namespace) -> list[ExpertRecompute
             specs = [parse_expert_recompute_policy_spec(str(single))]
         else:
             specs = [
-                parse_expert_recompute_policy_spec("none" if threshold == 0 else f"tok{threshold}")
+                parse_expert_recompute_policy_spec("none" if threshold == 0 else f"tok{threshold}-ckpt")
                 for threshold in _expert_recompute_thresholds(args)
             ]
     deduped: dict[str, ExpertRecomputePolicySpec] = {}
@@ -1023,13 +995,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expert-recompute-policy",
         default=None,
-        help="Single expert policy spec: none, tok128, util075, tok128-util075, or tok128-act.",
+        help="Single expert policy spec: none, split128, tok128-ckpt, or tok128-act-ckpt.",
     )
     parser.add_argument(
         "--expert-recompute-policies",
         nargs="+",
         default=None,
-        help="Policy sweep. Accepts space- or comma-separated specs such as none,tok128,util075,tok128-util075,tok128-act.",
+        help="Policy sweep. Accepts space- or comma-separated specs such as none,split128,tok128-ckpt,tok128-act-ckpt.",
     )
     parser.add_argument("--expert-activation-save-policy", choices=["save_all", "all_act", "tok_act"], default="save_all", help=argparse.SUPPRESS)
     parser.add_argument("--expert-activation-save-threshold", type=int, default=0, help=argparse.SUPPRESS)
@@ -1287,6 +1259,7 @@ def main() -> None:
                             "seq_len": seq_len,
                             "activation_recompute": bool(args.activation_recompute),
                             "expert_recompute_policy": expert_policy.policy,
+                            "expert_recompute_impl": expert_policy.impl,
                             "expert_recompute_policy_spec": expert_policy.label,
                             "expert_recompute_threshold": expert_recompute_threshold,
                             "expert_recompute_util_threshold": expert_policy.util_threshold,
@@ -1322,6 +1295,7 @@ def main() -> None:
                             row["seq_len"] = seq_len
                             row["activation_recompute"] = bool(args.activation_recompute)
                             row["expert_recompute_policy"] = expert_policy.policy
+                            row["expert_recompute_impl"] = expert_policy.impl
                             row["expert_recompute_policy_spec"] = expert_policy.label
                             row["expert_recompute_threshold"] = expert_recompute_threshold
                             row["expert_recompute_util_threshold"] = expert_policy.util_threshold
@@ -1356,6 +1330,7 @@ def main() -> None:
                                     row["seq_len"] = seq_len
                                     row["activation_recompute"] = bool(args.activation_recompute)
                                     row["expert_recompute_policy"] = expert_policy.policy
+                                    row["expert_recompute_impl"] = expert_policy.impl
                                     row["expert_recompute_policy_spec"] = expert_policy.label
                                     row["expert_recompute_threshold"] = expert_recompute_threshold
                                     row["expert_recompute_util_threshold"] = expert_policy.util_threshold
@@ -1386,6 +1361,7 @@ def main() -> None:
                             row["seq_len"] = seq_len
                             row["activation_recompute"] = bool(args.activation_recompute)
                             row["expert_recompute_policy"] = expert_policy.policy
+                            row["expert_recompute_impl"] = expert_policy.impl
                             row["expert_recompute_policy_spec"] = expert_policy.label
                             row["expert_recompute_threshold"] = expert_recompute_threshold
                             row["expert_recompute_util_threshold"] = expert_policy.util_threshold
@@ -1424,6 +1400,7 @@ def main() -> None:
                             )
                             row["profile_layers"] = profile_layers
                             row["expert_recompute_policy"] = expert_policy.policy
+                            row["expert_recompute_impl"] = expert_policy.impl
                             row["expert_recompute_policy_spec"] = expert_policy.label
                             row["expert_recompute_threshold"] = expert_recompute_threshold
                             row["expert_recompute_util_threshold"] = expert_policy.util_threshold
@@ -1445,6 +1422,7 @@ def main() -> None:
                             row["profile_json"] = str(profile_path) if profile_path is not None else None
                             row["profile_layers"] = profile_layers
                             row["expert_recompute_policy"] = expert_policy.policy
+                            row["expert_recompute_impl"] = expert_policy.impl
                             row["expert_recompute_policy_spec"] = expert_policy.label
                             row["expert_recompute_threshold"] = expert_recompute_threshold
                             row["expert_recompute_util_threshold"] = expert_policy.util_threshold
@@ -1482,6 +1460,7 @@ def main() -> None:
         "profilers": profilers,
         "seq_lens": seq_lens,
         "expert_recompute_policies": [spec.label for spec in expert_recompute_policies],
+        "expert_recompute_impls": [spec.impl for spec in expert_recompute_policies],
         "expert_recompute_thresholds": [spec.token_threshold for spec in expert_recompute_policies],
         "expert_activation_save_policies": [spec.activation_save_policy for spec in expert_recompute_policies],
         "expert_activation_save_thresholds": [spec.activation_save_threshold for spec in expert_recompute_policies],

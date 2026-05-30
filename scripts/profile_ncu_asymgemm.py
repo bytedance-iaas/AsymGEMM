@@ -100,7 +100,7 @@ def main() -> None:
     parser.add_argument("--lora-dtype", choices=LORA_DTYPE_CHOICES, default="bf16")
     parser.add_argument("--vocab-rows", "--real-vocab-rows", dest="vocab_rows", type=int, default=4096)
     parser.add_argument("--expert-recompute-threshold", type=int, default=0)
-    parser.add_argument("--expert-recompute-policy", choices=["none", "tok", "util", "tok_util"], default="tok")
+    parser.add_argument("--expert-recompute-policy", choices=["none", "split", "tok", "util", "tok_util"], default="tok")
     parser.add_argument("--expert-recompute-util-threshold", type=float, default=0.0)
     parser.add_argument("--expert-recompute-policy-spec", default="")
     parser.add_argument("--expert-activation-save-policy", choices=["save_all", "all_act", "tok_act"], default="save_all")

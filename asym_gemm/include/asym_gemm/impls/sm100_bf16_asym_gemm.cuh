@@ -367,8 +367,11 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
         constexpr uint32_t NUM_K_ATOMS = BLOCK_ATOM_K / DESC_ATOM_K;  // 2 for block_k=128, 1 for block_k=64
         constexpr uint32_t UMMA_ITERS_PER_ATOM = DESC_ATOM_K / UMMA_K;  // 4 (64/16)
 
+        // MN-major B stores multiple N swizzle atoms separated by the full TMA K span.
+        // K-major B can keep the descriptor local to one K atom.
+        constexpr uint32_t B_DESC_K = (kMajorB == cute::UMMA::Major::MN) ? BLOCK_K : DESC_ATOM_K;
         auto a_desc = make_umma_desc<kMajorA, LOAD_BLOCK_M, DESC_ATOM_K, kSwizzleAMode>(smem_a[0], 0, 0);
-        auto b_desc = make_umma_desc<kMajorB, LOAD_BLOCK_N, DESC_ATOM_K, kSwizzleBMode>(smem_b[0], 0, 0);
+        auto b_desc = make_umma_desc<kMajorB, LOAD_BLOCK_N, B_DESC_K, kSwizzleBMode>(smem_b[0], 0, 0);
         uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
         uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
         
@@ -513,8 +516,8 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                     }
 
                     // Two-level loop: outer over K-atoms, inner over UMMA_K steps per atom.
-                    // TMA loads each K-atom at smem offset: atom * BLOCK_OUTER * DESC_ATOM_K elements.
-                    // We rebase the descriptor start address for each atom.
+                    // K-major B rebases the descriptor per K atom. MN-major B keeps the full-K
+                    // descriptor span because multiple N swizzle atoms are laid out full-K apart.
                     #pragma unroll
                     for (uint32_t atom = 0; atom < NUM_K_ATOMS; ++atom) {
                         // Rebase B descriptor to where TMA placed this K-atom
@@ -533,7 +536,13 @@ sm100_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
 
                         #pragma unroll
                         for (uint32_t ki = 0; ki < UMMA_ITERS_PER_ATOM; ++ki) {
-                            b_desc.lo = advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kSwizzleBMode, cutlass::bfloat16_t>(b_atom_base, 0, ki * UMMA_K);
+                            if constexpr (kMajorB == cute::UMMA::Major::MN) {
+                                b_desc.lo = advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kSwizzleBMode, cutlass::bfloat16_t>(
+                                    b_desc_base_lo, 0, atom * DESC_ATOM_K + ki * UMMA_K);
+                            } else {
+                                b_desc.lo = advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kSwizzleBMode, cutlass::bfloat16_t>(
+                                    b_atom_base, 0, ki * UMMA_K);
+                            }
                             #pragma unroll
                             for (uint32_t w = 0; w < kNumMWaves; ++w) {
                                 DG_STATIC_ASSERT((WAVE_BLOCK_M * BLOCK_K) % 128 == 0, "Invalid swizzling offset");

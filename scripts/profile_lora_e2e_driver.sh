@@ -35,9 +35,11 @@ BATCH_SIZE=8
 # SEQ_LENS="64,128,256,512,640,768,896,1024,2048,3072,4096,6144,8192,10240,16384,20480"
 SEQ_LENS="2048,4096"
 # Expert recompute policy specs:
-#   none, tok128, util075, tok128-util075, tok128-act
-# tokXX-act saves gate/up but drops only silu(gate)*up for experts with <= XX routed tokens.
-EXPERT_RECOMPUTE_POLICIES="none,tok128,tok256,tok512,tok640,tok768,tok896,tok1024,tok2048,tok128-act,tok256-act,tok512-act,tok640-act,tok768-act,tok896-act,tok1024-act,tok2048-act"
+#   none, splitXX, tokXX-ckpt, tokXX-act-ckpt
+# splitXX measures split/merge overhead only.
+# tokXX-ckpt checkpoints the full selected expert body.
+# tokXX-act-ckpt saves gate/up and checkpoints activation/down only.
+EXPERT_RECOMPUTE_POLICIES="none,split0,tok0-ckpt,tok0-act-ckpt,split512,tok512-ckpt,tok512-act-ckpt"
 MLP_INTERMEDIATE_DIM=0
 MLP_EXPANSION=4
 LORA_RANK=64
@@ -94,7 +96,7 @@ Shell options:
   --backends LIST                     asym, torch, kt, or all.
   --profilers LIST                    source, nsys, cpu, ncu, or all.
   --seq-lens LIST                     Sequence lengths. Accepts 64,128 or "64 128".
-  --expert-recompute-policies LIST     MoE expert policies: none,tok128,util075,tok128-util075,tok128-act.
+  --expert-recompute-policies LIST     MoE expert policies: none,split128,tok128-ckpt,tok128-act-ckpt.
   --jobs-per-gpu N                    Concurrent Python driver jobs per GPU.
   --python-bin PATH                   Python interpreter. Default: PYTHON or python3.
   --output-root PATH                  Base output root. Default: profiling.
@@ -111,7 +113,7 @@ Shell options:
   --plot true|false                   Write per-config plots and a top-level combined plot directory after profiling.
   --plot-output-dir PATH              Plot output directory.
   --recompute norecomp|recomp|both     Run without recompute, with recompute, or both.
-                                      Active expert policies run expert-only recompute; layer recompute is only used for policy none.
+                                      Active expert policies run checkpoint expert recompute; layer recompute is only used for policy none.
   --overwrite true|false              Re-run completed result dirs. Default false skips them.
   --continue-on-error true|false      Keep sweeping if a point OOMs or fails. Default true records failed rows.
   -h, --help                          Show this help.
@@ -294,31 +296,19 @@ normalize_expert_recompute_policy() {
   case "${raw}" in
     ""|none|off|false|0) printf '%s\n' "none"; return ;;
   esac
-  if [[ "${raw}" =~ ^tok([0-9]+)$ ]]; then
-    if [[ "${BASH_REMATCH[1]}" == "0" ]]; then
-      printf '%s\n' "none"
-    else
-      printf 'tok%d\n' "$((10#${BASH_REMATCH[1]}))"
-    fi
+  if [[ "${raw}" =~ ^split([0-9]+)$ ]]; then
+    printf 'split%d\n' "$((10#${BASH_REMATCH[1]}))"
     return
   fi
-  if [[ "${raw}" =~ ^tok([0-9]+)-act$ ]]; then
-    local tok="$((10#${BASH_REMATCH[1]}))"
-    ((tok > 0)) || { printf '%s\n' "none"; return; }
-    printf 'tok%d-act\n' "${tok}"
+  if [[ "${raw}" =~ ^tok([0-9]+)-ckpt$ ]]; then
+    printf 'tok%d-ckpt\n' "$((10#${BASH_REMATCH[1]}))"
     return
   fi
-  if [[ "${raw}" =~ ^util(.+)$ ]]; then
-    normalize_util_label "${BASH_REMATCH[1]}"
+  if [[ "${raw}" =~ ^tok([0-9]+)-act-ckpt$ ]]; then
+    printf 'tok%d-act-ckpt\n' "$((10#${BASH_REMATCH[1]}))"
     return
   fi
-  if [[ "${raw}" =~ ^tok([0-9]+)-util(.+)$ ]]; then
-    local tok="$((10#${BASH_REMATCH[1]}))"
-    ((tok > 0)) || { printf '%s\n' "none"; return; }
-    printf 'tok%d-%s\n' "${tok}" "$(normalize_util_label "${BASH_REMATCH[2]}")"
-    return
-  fi
-  die "invalid expert recompute policy '${1}'; expected none, tokXX, utilXX, tokXX-utilXX, or tokXX-act"
+  die "invalid expert recompute policy '${1}'; expected none, splitXX, tokXX-ckpt, or tokXX-act-ckpt"
 }
 
 parse_expert_recompute_policies() {
@@ -424,7 +414,7 @@ while (($#)); do
     --seq-lens=*) seq_spec="${1#*=}"; shift ;;
     --expert-recompute-policy=*) die "use --expert-recompute-policies; this wrapper keeps one option per setting" ;;
     --expert-recompute-policies=*) expert_recompute_policy_spec="${1#*=}"; shift ;;
-    --expert-recompute-threshold=*|--expert-recompute-thresholds=*) die "legacy threshold flags were removed; use --expert-recompute-policies none,tok128,tok128-act" ;;
+    --expert-recompute-threshold=*|--expert-recompute-thresholds=*) die "legacy threshold flags were removed; use --expert-recompute-policies none,split128,tok128-ckpt,tok128-act-ckpt" ;;
     --batch-size=*) batch_size="${1#*=}"; shift ;;
     --jobs-per-gpu=*) jobs_per_gpu="${1#*=}"; shift ;;
     --python-bin=*) PYTHON_BIN="${1#*=}"; shift ;;
@@ -452,7 +442,7 @@ while (($#)); do
     --seq-lens) collect_values "$1" vals "${@:2}"; seq_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
     --expert-recompute-policy) die "use --expert-recompute-policies; this wrapper keeps one option per setting" ;;
     --expert-recompute-policies) collect_values "$1" vals "${@:2}"; expert_recompute_policy_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
-    --expert-recompute-threshold|--expert-recompute-thresholds) die "legacy threshold flags were removed; use --expert-recompute-policies none,tok128,tok128-act" ;;
+    --expert-recompute-threshold|--expert-recompute-thresholds) die "legacy threshold flags were removed; use --expert-recompute-policies none,split128,tok128-ckpt,tok128-act-ckpt" ;;
     --batch-size) need_value "$1" "${2-}"; batch_size="$2"; shift 2 ;;
     --jobs-per-gpu) need_value "$1" "${2-}"; jobs_per_gpu="$2"; shift 2 ;;
     --python-bin) need_value "$1" "${2-}"; PYTHON_BIN="$2"; shift 2 ;;

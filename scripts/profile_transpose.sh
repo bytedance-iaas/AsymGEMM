@@ -5,12 +5,14 @@ PYTHON_BIN="${PYTHON_BIN:-${PYTHON:-python3}}"
 
 export PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}"
 
-MODE="${MODE:-timing}"
+MODE="${MODE:-ncu}"
 # MODE="${MODE:-timing}"
 DEVICE="${DEVICE:-cuda:0}"
 PRECISION="${PRECISION:-bf16}"
-SHAPES="${SHAPES:-2048|2048|768 2048|768|2048 2048|4096|1536 2048|1536|4096}"
+# SHAPES="${SHAPES:-2048|2048|768 2048|768|2048 2048|4096|1536 2048|1536|4096}"
 # SHAPES="${SHAPES:-2048|2048|768}"
+SHAPES="${SHAPES:-8192|8192|8192 4096|4096|4096}"
+
 SEED="${SEED:-1234}"
 SCALE="${SCALE:-0.1}"
 ATOL="${ATOL:-0.5}"
@@ -19,16 +21,25 @@ SLOW_THRESHOLD="${SLOW_THRESHOLD:-1.25}"
 COMPILED_DIMS="${COMPILED_DIMS:-mnk}"
 JSON_OUTPUT="${JSON_OUTPUT:-}"
 TRANSPOSE_BLOCK_K="${TRANSPOSE_BLOCK_K:-}"
+# BF16_BLOCK_M="${BF16_BLOCK_M:-${DG_BF16_BLOCK_M:-128}}"
+# BF16_BLOCK_N="${BF16_BLOCK_N:-${DG_BF16_BLOCK_N:-32}}"
+# BF16_BLOCK_K="${BF16_BLOCK_K:-${DG_BF16_BLOCK_K:-256}}"
+# BF16_TRANSPOSE_BLOCK_M="${BF16_TRANSPOSE_BLOCK_M:-${DG_BF16_TRANSPOSE_BLOCK_M:-128}}"
+# BF16_TRANSPOSE_BLOCK_N="${BF16_TRANSPOSE_BLOCK_N:-${DG_BF16_TRANSPOSE_BLOCK_N:-64}}"
+# BF16_TRANSPOSE_BLOCK_K="${BF16_TRANSPOSE_BLOCK_K:-${DG_BF16_TRANSPOSE_BLOCK_K:-256}}"
 BF16_BLOCK_M="${BF16_BLOCK_M:-${DG_BF16_BLOCK_M:-128}}"
-BF16_BLOCK_N="${BF16_BLOCK_N:-${DG_BF16_BLOCK_N:-32}}"
-BF16_BLOCK_K="${BF16_BLOCK_K:-${DG_BF16_BLOCK_K:-256}}"
+BF16_BLOCK_N="${BF16_BLOCK_N:-${DG_BF16_BLOCK_N:-128}}"
+BF16_BLOCK_K="${BF16_BLOCK_K:-${DG_BF16_BLOCK_K:-128}}"
 BF16_TRANSPOSE_BLOCK_M="${BF16_TRANSPOSE_BLOCK_M:-${DG_BF16_TRANSPOSE_BLOCK_M:-128}}"
-BF16_TRANSPOSE_BLOCK_N="${BF16_TRANSPOSE_BLOCK_N:-${DG_BF16_TRANSPOSE_BLOCK_N:-64}}"
-BF16_TRANSPOSE_BLOCK_K="${BF16_TRANSPOSE_BLOCK_K:-${DG_BF16_TRANSPOSE_BLOCK_K:-256}}"
+BF16_TRANSPOSE_BLOCK_N="${BF16_TRANSPOSE_BLOCK_N:-${DG_BF16_TRANSPOSE_BLOCK_N:-128}}"
+BF16_TRANSPOSE_BLOCK_K="${BF16_TRANSPOSE_BLOCK_K:-${DG_BF16_TRANSPOSE_BLOCK_K:-128}}"
 NCU_BIN="${NCU_BIN:-ncu}"
 NCU_OUTPUT_DIR="${NCU_OUTPUT_DIR:-profiling/transpose_ncu}"
 NCU_KERNEL_REGEX="${NCU_KERNEL_REGEX:-regex:.*sm(90|100).*(bf16|fp8|fp4).*asym_gemm.*impl.*}"
-NCU_SECTIONS="${NCU_SECTIONS:-SpeedOfLight MemoryWorkloadAnalysis MemoryWorkloadAnalysis_Tables LaunchStats Occupancy SchedulerStats}"
+NCU_SET="${NCU_SET:-full}"
+NCU_REPLAY_MODE="${NCU_REPLAY_MODE:-kernel}"
+NCU_CLOCK_CONTROL="${NCU_CLOCK_CONTROL:-none}"
+NCU_SECTIONS="${NCU_SECTIONS:-MemoryWorkloadAnalysis_Chart SpeedOfLight MemoryWorkloadAnalysis MemoryWorkloadAnalysis_Tables LaunchStats Occupancy SchedulerStats}"
 NCU_LAUNCH_SKIP="${NCU_LAUNCH_SKIP:-0}"
 NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-}"
 
@@ -81,6 +92,11 @@ Options:
   --ncu-bin PATH
   --ncu-output-dir DIR
   --ncu-kernel-regex REGEX
+  --ncu-set NAME      NCU section set, default: ${NCU_SET}; set NCU_SET="" to disable.
+  --ncu-replay-mode MODE
+                      NCU replay mode, default: ${NCU_REPLAY_MODE}; set NCU_REPLAY_MODE="" to disable.
+  --ncu-clock-control MODE
+                      NCU clock control, default: ${NCU_CLOCK_CONTROL}; set NCU_CLOCK_CONTROL="" to disable.
   --ncu-section NAME   repeatable; default: ${NCU_SECTIONS}
   --ncu-launch-skip N
   --ncu-launch-count N
@@ -93,6 +109,15 @@ need_value() {
   local opt="$1"
   local value="${2-}"
   [[ -n "${value}" && "${value}" != --* ]] || {
+    echo "error: ${opt} requires a value" >&2
+    exit 2
+  }
+}
+
+need_any_value() {
+  local opt="$1"
+  local value="${2-}"
+  [[ -n "${value}" ]] || {
     echo "error: ${opt} requires a value" >&2
     exit 2
   }
@@ -134,10 +159,13 @@ while [[ $# -gt 0 ]]; do
     --ncu-bin) need_value "$1" "${2-}"; NCU_BIN="$2"; shift 2 ;;
     --ncu-output-dir) need_value "$1" "${2-}"; NCU_OUTPUT_DIR="$2"; shift 2 ;;
     --ncu-kernel-regex) need_value "$1" "${2-}"; NCU_KERNEL_REGEX="$2"; shift 2 ;;
+    --ncu-set) need_value "$1" "${2-}"; NCU_SET="$2"; shift 2 ;;
+    --ncu-replay-mode) need_value "$1" "${2-}"; NCU_REPLAY_MODE="$2"; shift 2 ;;
+    --ncu-clock-control) need_value "$1" "${2-}"; NCU_CLOCK_CONTROL="$2"; shift 2 ;;
     --ncu-section) need_value "$1" "${2-}"; NCU_SECTION_ARGS+=("$2"); shift 2 ;;
     --ncu-launch-skip) need_value "$1" "${2-}"; NCU_LAUNCH_SKIP="$2"; shift 2 ;;
     --ncu-launch-count) need_value "$1" "${2-}"; NCU_LAUNCH_COUNT="$2"; shift 2 ;;
-    --extra-ncu-arg) need_value "$1" "${2-}"; NCU_EXTRA_ARGS+=("$2"); shift 2 ;;
+    --extra-ncu-arg) need_any_value "$1" "${2-}"; NCU_EXTRA_ARGS+=("$2"); shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --)
       shift
@@ -333,6 +361,15 @@ for shape in "${shape_entries[@]}"; do
       --export "${report_prefix}"
       --force-overwrite
     )
+    if [[ -n "${NCU_SET}" ]]; then
+      ncu_cmd+=(--set "${NCU_SET}")
+    fi
+    if [[ -n "${NCU_REPLAY_MODE}" ]]; then
+      ncu_cmd+=(--replay-mode "${NCU_REPLAY_MODE}")
+    fi
+    if [[ -n "${NCU_CLOCK_CONTROL}" ]]; then
+      ncu_cmd+=(--clock-control "${NCU_CLOCK_CONTROL}")
+    fi
     if [[ -n "${NCU_LAUNCH_SKIP}" ]]; then
       ncu_cmd+=(--launch-skip "${NCU_LAUNCH_SKIP}")
     fi
