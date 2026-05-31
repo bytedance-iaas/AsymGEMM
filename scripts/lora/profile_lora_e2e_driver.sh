@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # =============================================================================
-# User-Specified Parameters
+# User Parameters
 # =============================================================================
 # Edit this section for the default run. CLI flags override these values.
 # List defaults use the same comma-separated format accepted by CLI flags.
@@ -68,9 +68,15 @@ RECOMPUTE="both"
 OVERWRITE=false
 CONTINUE_ON_ERROR=true
 
+# =============================================================================
+# Derived Parameters
+# =============================================================================
 PY_DRIVER="${ROOT}/scripts/lora/profile_lora_e2e_driver.py"
 PLOT_RECOMPUTE_SCRIPT="${ROOT}/scripts/plotting/plot_activation_recompute_sweep.py"
 
+# =============================================================================
+# Main Logic
+# =============================================================================
 usage() {
   cat <<USAGE
 Usage:

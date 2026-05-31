@@ -1,22 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# User parameters.
+# =============================================================================
+# User Parameters
+# =============================================================================
 ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
 LF_DIR=${LF_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/LlamaFactory}
-ASYM_DIR=${ASYM_DIR:-${ROOT}}
 LF_REPO_URL=${LF_REPO_URL:-https://github.com/hiyouga/LLaMA-Factory.git}
 LF_BRANCH=${LF_BRANCH:-main_kevin}
 ASYM_BRANCH=${ASYM_BRANCH:-main_kevin}
-ENV_DIR=${ENV_DIR:-${LF_DIR}/.venv}
 PYTHON_VERSION=${PYTHON_VERSION:-3.11}
 RECREATE_ENV=${RECREATE_ENV:-0}
 TORCH_INSTALL_CMD=${TORCH_INSTALL_CMD:-}
-
-# Derived parameters.
 CONDA_EXE=${CONDA_EXE:-conda}
 
-# Main logic.
+# =============================================================================
+# Derived Parameters
+# =============================================================================
+ASYM_DIR=${ASYM_DIR:-${ROOT}}
+ENV_DIR=${ENV_DIR:-${LF_DIR}/.venv}
+
+# =============================================================================
+# Main Logic
+# =============================================================================
 checkout_branch_or_keep() {
   local repo_dir=$1
   local branch=$2

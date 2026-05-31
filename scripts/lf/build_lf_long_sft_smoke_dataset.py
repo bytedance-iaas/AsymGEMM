@@ -82,6 +82,47 @@ def _repeat_to_length(ids: list[int], length: int) -> list[int]:
     return repeated
 
 
+def _percentile(sorted_values: list[int], pct: float) -> float:
+    if not sorted_values:
+        raise ValueError("cannot compute percentile of an empty dataset")
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+
+    pos = (len(sorted_values) - 1) * pct / 100.0
+    lo = int(pos)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = pos - lo
+    return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac
+
+
+def _record_text(record: dict[str, str]) -> str:
+    return "\n".join(
+        value
+        for value in (
+            record.get("instruction", ""),
+            record.get("input", ""),
+            record.get("output", ""),
+        )
+        if value
+    )
+
+
+def _print_length_stats(dataset_name: str, out_path: Path, model_name_or_path: str, lengths: list[int]) -> None:
+    sorted_lengths = sorted(lengths)
+    print(f"dataset={dataset_name}")
+    print(f"file={out_path}")
+    print(f"model_name_or_path={model_name_or_path}")
+    print("length_definition=tokenizer(prompt + query + response, add_special_tokens=False)")
+    print(f"count={len(sorted_lengths)}")
+    print(f"min={sorted_lengths[0]}")
+    print(f"avg={mean(sorted_lengths):.2f}")
+    print(f"p25={_percentile(sorted_lengths, 25):.2f}")
+    print(f"p50={_percentile(sorted_lengths, 50):.2f}")
+    print(f"p75={_percentile(sorted_lengths, 75):.2f}")
+    print(f"p90={_percentile(sorted_lengths, 90):.2f}")
+    print(f"max={sorted_lengths[-1]}")
+
+
 def _write_dataset_info(lf_dir: Path, dataset_name: str) -> None:
     info_path = lf_dir / "data" / "dataset_info.json"
     info = json.loads(info_path.read_text(encoding="utf-8")) if info_path.exists() else {}
@@ -139,12 +180,12 @@ def main() -> None:
                 "input": tokenizer.decode(prompt_ids, skip_special_tokens=True),
                 "output": tokenizer.decode(response_ids, skip_special_tokens=True),
             }
-            lengths.append(len(tokenizer.encode(record["input"] + record["output"], add_special_tokens=False)))
+            lengths.append(len(tokenizer.encode(_record_text(record), add_special_tokens=False)))
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     _write_dataset_info(lf_dir, args.dataset_name)
     print(f"wrote {out_path}")
-    print(f"token lengths: min={min(lengths)} mean={mean(lengths):.1f} max={max(lengths)}")
+    _print_length_stats(args.dataset_name, out_path, args.model_name_or_path, lengths)
 
 
 if __name__ == "__main__":

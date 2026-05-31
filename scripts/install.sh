@@ -3,9 +3,9 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${ROOT_DIR}"
-
+# =============================================================================
+# User Parameters
+# =============================================================================
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0a}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -13,6 +13,17 @@ export DG_JIT_WITH_LINEINFO="${DG_JIT_WITH_LINEINFO:-1}"
 export DG_JIT_CLEAR_CACHE="${DG_JIT_CLEAR_CACHE:-0}"
 
 CUTLASS_REF="${CUTLASS_REF:-v4.5.0}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+# =============================================================================
+# Derived Parameters
+# =============================================================================
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# =============================================================================
+# Main Logic
+# =============================================================================
+cd "${ROOT_DIR}"
 
 log() {
   echo
@@ -45,11 +56,11 @@ prepare_submodules() {
 
 install_package() {
   log "Installing Python requirements"
-  require_cmd python3
-  python3 -m pip install -r requirements.txt
+  require_cmd "${PYTHON_BIN}"
+  "${PYTHON_BIN}" -m pip install -r requirements.txt
 
   log "Checking Python/CUDA environment"
-  python3 - <<'PY'
+  "${PYTHON_BIN}" - <<'PY'
 import torch
 from torch.utils.cpp_extension import CUDA_HOME
 
@@ -66,9 +77,9 @@ PY
     log "Clearing AsymGEMM JIT cache: ${HOME}/.asym_gemm/cache"
     rm -rf "${HOME}/.asym_gemm/cache"
   fi
-  python3 -m pip install --no-build-isolation -e .
+  "${PYTHON_BIN}" -m pip install --no-build-isolation -e .
 
-  python3 - <<'PY'
+  "${PYTHON_BIN}" - <<'PY'
 import asym_gemm
 
 print("AsymGEMM", asym_gemm.__version__)

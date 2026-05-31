@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# User parameters.
+# =============================================================================
+# User Parameters
+# =============================================================================
 ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
 PYTHON_BIN="${PYTHON_BIN:-${PYTHON:-python3}}"
-
-export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 MODE="${MODE:-ncu}"
 # MODE="${MODE:-timing}"
@@ -45,6 +45,15 @@ NCU_SECTIONS="${NCU_SECTIONS:-MemoryWorkloadAnalysis_Chart SpeedOfLight MemoryWo
 NCU_LAUNCH_SKIP="${NCU_LAUNCH_SKIP:-0}"
 NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-}"
 
+# =============================================================================
+# Derived Parameters
+# =============================================================================
+PROFILE_SCRIPT="${ROOT}/scripts/lora/profile_transpose.py"
+export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
+# =============================================================================
+# Main Logic
+# =============================================================================
 usage() {
   cat <<USAGE
 Usage:
@@ -327,7 +336,7 @@ for shape in "${shape_entries[@]}"; do
   print_shape_header "${run_count}" "${total_count}" "${shape_m}" "${shape_k}" "${shape_n}"
 
   cmd=(
-    "${PYTHON_BIN}" "${ROOT}/scripts/lora/profile_transpose.py"
+    "${PYTHON_BIN}" "${PROFILE_SCRIPT}"
     --device "${DEVICE}"
     --precision "${PRECISION}"
     --m "${shape_m}"

@@ -31,14 +31,27 @@ SUBLINEAR_ALPHA = 0.055
 ROOT_OUTPUT_FILES = (
     "activation_recompute_sweep_index.csv",
     "activation_recompute_sweep_index.json",
+    "step_samples_index.csv",
+    "step_samples_index.json",
 )
 COMBINED_OUTPUT_FILES = (
+    "combined_step_samples_index.csv",
+    "combined_step_samples_index.json",
     "combined_forward_end_memory_vs_seq.png",
     "combined_forward_peak_memory_vs_seq.png",
     "combined_backward_start_memory_vs_seq.png",
     "combined_backward_peak_memory_vs_seq.png",
     "combined_peak_hbm_vs_seq.png",
     "combined_timing_vs_seq.png",
+    "combined_forward_end_memory_vs_step.png",
+    "combined_forward_peak_memory_vs_step.png",
+    "combined_backward_start_memory_vs_step.png",
+    "combined_backward_peak_memory_vs_step.png",
+    "combined_peak_hbm_vs_step.png",
+    "combined_timing_vs_step.png",
+    "combined_forward_timing_vs_step.png",
+    "combined_backward_timing_vs_step.png",
+    "combined_loss_vs_step.png",
     "combined_forward_end_memory_vs_expert_threshold.png",
     "combined_forward_peak_memory_vs_expert_threshold.png",
     "combined_backward_start_memory_vs_expert_threshold.png",
@@ -79,12 +92,23 @@ COMBINED_OUTPUT_FILES = (
 GROUP_OUTPUT_FILES = (
     "sweep_summary.csv",
     "sweep_summary.json",
+    "step_samples.csv",
+    "step_samples.json",
     "forward_end_memory_vs_seq.png",
     "forward_peak_memory_vs_seq.png",
     "backward_start_memory_vs_seq.png",
     "backward_peak_memory_vs_seq.png",
     "peak_hbm_vs_seq.png",
     "timing_vs_seq.png",
+    "forward_end_memory_vs_step.png",
+    "forward_peak_memory_vs_step.png",
+    "backward_start_memory_vs_step.png",
+    "backward_peak_memory_vs_step.png",
+    "peak_hbm_vs_step.png",
+    "timing_vs_step.png",
+    "forward_timing_vs_step.png",
+    "backward_timing_vs_step.png",
+    "loss_vs_step.png",
 )
 
 
@@ -178,8 +202,9 @@ def combined_output_root(args: argparse.Namespace, root: Path) -> Path:
 
 def precision_from_path(path: Path) -> str:
     for parent in (path, *path.parents):
-        if parent.name.startswith("lora_e2e_"):
-            return parent.name.removeprefix("lora_e2e_")
+        for prefix in ("lora_e2e_", "lora_lf_"):
+            if parent.name.startswith(prefix):
+                return parent.name.removeprefix(prefix)
     return ""
 
 
@@ -365,6 +390,19 @@ def numeric_float(value: Any, default: float = 0.0) -> float:
     return default
 
 
+def optional_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        result = float(value)
+        return result if math.isfinite(result) else None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
 def numeric_int(value: Any, default: int = 0) -> int:
     if isinstance(value, bool):
         return default
@@ -391,6 +429,19 @@ def nested_int(mapping: dict[str, Any], section: str, key: str, default: int = 0
 
 def to_mib(value: Any) -> float:
     return numeric_float(value) / MIB
+
+
+def optional_mib(value: Any) -> float | None:
+    result = optional_float(value)
+    return None if result is None else result / MIB
+
+
+def first_optional(mapping: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        result = optional_float(mapping.get(key))
+        if result is not None:
+            return result
+    return None
 
 
 def step_ms(profile: dict[str, Any]) -> float:
@@ -687,6 +738,123 @@ def collect_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["expert_activation_save_policy"],
             row["expert_activation_save_threshold"],
             row["expert_policy_label"],
+        ),
+    )
+
+
+def profile_step_samples(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates = [profile, profile.get("source_profile"), profile.get("memory_profile")]
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        step_samples = candidate.get("step_samples", {})
+        rows = step_samples.get("rows", []) if isinstance(step_samples, dict) else []
+        if isinstance(rows, list) and rows:
+            return [row for row in rows if isinstance(row, dict)]
+    return []
+
+
+def sample_mib(sample: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        result = optional_mib(sample.get(key))
+        if result is not None:
+            return result
+    return None
+
+
+def add_optional_ms(row: dict[str, Any], output_key: str, sample: dict[str, Any], *keys: str) -> None:
+    row[output_key] = first_optional(sample, *keys)
+
+
+def step_rows_from_result_dir(args: argparse.Namespace, result_dir: Path) -> list[dict[str, Any]]:
+    base = row_from_result_dir(args, result_dir)
+    if base is None:
+        return []
+    profile = load_json(Path(str(base["profile_json"])))
+    samples = profile_step_samples(profile)
+    rows: list[dict[str, Any]] = []
+    for sample in samples:
+        step = numeric_int(sample.get("step"))
+        if step <= 0:
+            continue
+        row = dict(base)
+        row["step"] = step
+        row["loss"] = first_optional(sample, "loss")
+        add_optional_ms(row, "forward_ms", sample, "forward_milliseconds", "forward_ms")
+        add_optional_ms(row, "backward_ms", sample, "backward_milliseconds", "backward_ms")
+        step_value = first_optional(sample, "step_milliseconds", "step_ms")
+        if step_value is None:
+            forward_ms = optional_float(row.get("forward_ms"))
+            backward_ms = optional_float(row.get("backward_ms"))
+            if forward_ms is not None or backward_ms is not None:
+                step_value = (forward_ms or 0.0) + (backward_ms or 0.0)
+        row["step_ms"] = step_value
+        add_optional_ms(row, "step_wall_ms", sample, "wall_milliseconds", "wall_ms")
+        row["forward_cuda_kernel_busy_ms"] = first_optional(
+            sample,
+            "forward_cuda_kernel_busy_milliseconds",
+            "forward_cuda_kernel_busy_ms",
+        )
+        row["backward_cuda_kernel_busy_ms"] = first_optional(
+            sample,
+            "backward_cuda_kernel_busy_milliseconds",
+            "backward_cuda_kernel_busy_ms",
+        )
+        row["forward_cuda_memcpy_ms"] = first_optional(sample, "forward_cuda_memcpy_milliseconds", "forward_cuda_memcpy_ms")
+        row["backward_cuda_memcpy_ms"] = first_optional(sample, "backward_cuda_memcpy_milliseconds", "backward_cuda_memcpy_ms")
+        row["forward_cuda_runtime_api_ms"] = first_optional(
+            sample,
+            "forward_cuda_runtime_api_milliseconds",
+            "forward_cuda_runtime_api_ms",
+        )
+        row["backward_cuda_runtime_api_ms"] = first_optional(
+            sample,
+            "backward_cuda_runtime_api_milliseconds",
+            "backward_cuda_runtime_api_ms",
+        )
+        row["forward_gpu_no_kernel_ms"] = first_optional(sample, "forward_gpu_no_kernel_milliseconds", "forward_gpu_no_kernel_ms")
+        row["backward_gpu_no_kernel_ms"] = first_optional(sample, "backward_gpu_no_kernel_milliseconds", "backward_gpu_no_kernel_ms")
+        row["cuda_kernel_busy_ms"] = (
+            (row["forward_cuda_kernel_busy_ms"] or 0.0) + (row["backward_cuda_kernel_busy_ms"] or 0.0)
+            if row["forward_cuda_kernel_busy_ms"] is not None or row["backward_cuda_kernel_busy_ms"] is not None
+            else None
+        )
+        row["peak_hbm_mib"] = sample_mib(sample, "peak_hbm_bytes", "global_peak_after_bytes")
+        row["forward_alloc_start_mib"] = sample_mib(sample, "forward_allocated_start_bytes", "forward_alloc_start_bytes")
+        row["forward_alloc_end_mib"] = sample_mib(sample, "forward_allocated_end_bytes", "forward_alloc_end_bytes")
+        row["forward_live_delta_mib"] = sample_mib(sample, "forward_allocated_delta_bytes", "forward_live_delta_bytes")
+        row["forward_local_peak_mib"] = sample_mib(sample, "forward_local_peak_bytes", "forward_local_peak_hbm_bytes")
+        row["forward_local_peak_delta_mib"] = sample_mib(sample, "forward_local_peak_delta_bytes")
+        row["backward_alloc_start_mib"] = sample_mib(sample, "backward_allocated_start_bytes", "backward_alloc_start_bytes")
+        row["backward_alloc_end_mib"] = sample_mib(sample, "backward_allocated_end_bytes", "backward_alloc_end_bytes")
+        row["backward_alloc_delta_mib"] = sample_mib(sample, "backward_allocated_delta_bytes", "backward_alloc_delta_bytes")
+        row["backward_local_peak_mib"] = sample_mib(sample, "backward_local_peak_bytes", "backward_local_peak_hbm_bytes")
+        row["backward_local_peak_delta_mib"] = sample_mib(sample, "backward_local_peak_delta_bytes")
+        rows.append(row)
+    return rows
+
+
+def collect_step_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
+    input_root = resolve_path(args.input_root)
+    rows: list[dict[str, Any]] = []
+    for path in result_dirs(input_root):
+        rows.extend(step_rows_from_result_dir(args, path))
+    return sorted(
+        rows,
+        key=lambda row: (
+            row["workload"],
+            row["batch_size"],
+            row["backend"],
+            row["profiler"],
+            row["seq_len"],
+            row["mode"],
+            row["expert_recompute_policy"],
+            row["expert_recompute_threshold"],
+            row["expert_recompute_util_threshold"],
+            row["expert_activation_save_policy"],
+            row["expert_activation_save_threshold"],
+            row["expert_policy_label"],
+            row["step"],
         ),
     )
 
@@ -1042,6 +1210,151 @@ def plot_combined_metric(
     plt.close(fig)
 
 
+def step_series_label(row: dict[str, Any]) -> str:
+    mode_labels = {"no_recompute": "No recompute", "recompute": "Activation recompute"}
+    parts = [f"s{row['seq_len']}", mode_labels.get(str(row["mode"]), str(row["mode"]))]
+    policy = str(row.get("expert_policy_label", "none"))
+    if policy != "none":
+        parts.append(policy)
+    return " / ".join(parts)
+
+
+def combined_step_series_label(row: dict[str, Any], varied: set[str]) -> str:
+    label = combined_label(group_key(row), str(row["mode"]), varied)
+    parts = [label, f"s{row['seq_len']}"]
+    policy = str(row.get("expert_policy_label", "none"))
+    if policy != "none":
+        parts.append(policy)
+    return " / ".join(parts)
+
+
+def step_plot_specs(*, combined: bool) -> list[tuple[str, str, str, str, float]]:
+    prefix = "combined_" if combined else ""
+    title_prefix = "All workloads: " if combined else ""
+    return [
+        (
+            f"{prefix}forward_end_memory_vs_step.png",
+            f"{title_prefix}memory after forward over steps",
+            "GPU allocated after forward (GiB)",
+            "forward_alloc_end_mib",
+            1024.0,
+        ),
+        (
+            f"{prefix}forward_peak_memory_vs_step.png",
+            f"{title_prefix}forward local peak over steps",
+            "Forward local peak allocation (GiB)",
+            "forward_local_peak_mib",
+            1024.0,
+        ),
+        (
+            f"{prefix}backward_start_memory_vs_step.png",
+            f"{title_prefix}memory carried into backward over steps",
+            "GPU allocated at backward start (GiB)",
+            "backward_alloc_start_mib",
+            1024.0,
+        ),
+        (
+            f"{prefix}backward_peak_memory_vs_step.png",
+            f"{title_prefix}backward local peak over steps",
+            "Backward local peak allocation (GiB)",
+            "backward_local_peak_mib",
+            1024.0,
+        ),
+        (
+            f"{prefix}peak_hbm_vs_step.png",
+            f"{title_prefix}whole-step peak HBM over steps",
+            "Peak HBM allocation (GiB)",
+            "peak_hbm_mib",
+            1024.0,
+        ),
+        (
+            f"{prefix}timing_vs_step.png",
+            f"{title_prefix}step time over steps",
+            "Step time (ms)",
+            "step_ms",
+            1.0,
+        ),
+        (
+            f"{prefix}forward_timing_vs_step.png",
+            f"{title_prefix}forward time over steps",
+            "Forward time (ms)",
+            "forward_ms",
+            1.0,
+        ),
+        (
+            f"{prefix}backward_timing_vs_step.png",
+            f"{title_prefix}backward time over steps",
+            "Backward time (ms)",
+            "backward_ms",
+            1.0,
+        ),
+        (
+            f"{prefix}loss_vs_step.png",
+            f"{title_prefix}loss over steps",
+            "Loss",
+            "loss",
+            1.0,
+        ),
+    ]
+
+
+def plot_step_metric(
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+    filename: str,
+    title: str,
+    ylabel: str,
+    key: str,
+    *,
+    scale: float = 1.0,
+    combined: bool = False,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    series: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for row in rows:
+        value = optional_float(row.get(key))
+        if value is None:
+            continue
+        if combined:
+            series_key = (
+                group_key(row),
+                int(row["seq_len"]),
+                str(row["mode"]),
+                str(row.get("expert_policy_label", "none")),
+            )
+        else:
+            series_key = (
+                int(row["seq_len"]),
+                str(row["mode"]),
+                str(row.get("expert_policy_label", "none")),
+            )
+        series.setdefault(series_key, []).append(row)
+    if not series:
+        return
+
+    varied = varied_fields(rows)
+    fig, ax = plt.subplots(figsize=(11 if combined else 8, 5.5), dpi=160)
+    for _, series_rows in sorted(series.items()):
+        sorted_rows = sorted(series_rows, key=lambda row: int(row["step"]))
+        label = combined_step_series_label(sorted_rows[0], varied) if combined else step_series_label(sorted_rows[0])
+        ax.plot(
+            [int(row["step"]) for row in sorted_rows],
+            [float(row[key]) / scale for row in sorted_rows],
+            marker="o",
+            linewidth=1.8,
+            label=label,
+        )
+    ax.set_title(title)
+    ax.set_xlabel("Step")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.35)
+    ax.legend(fontsize=7 if combined else None)
+    fig.tight_layout()
+    fig.savefig(output_dir / filename)
+    plt.close(fig)
+
+
 def threshold_sweep_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_series: dict[tuple[tuple[str, str, int, int, str, str], str], set[int]] = {}
     token_rows = [
@@ -1391,6 +1704,26 @@ def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[s
     )
 
 
+def write_group_step_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, str, int, str, str]) -> None:
+    if not rows:
+        return
+    workload, precision, batch_size, backend, profiler = key
+    title_base = f"{workload} LoRA SFT"
+    suffix = f", batch size {batch_size}, {precision}, {backend}/{profiler}"
+    write_table(rows, output_dir, "step_samples")
+    for filename, title, ylabel, metric_key, scale in step_plot_specs(combined=False):
+        plot_step_metric(
+            rows,
+            output_dir,
+            filename,
+            f"{title_base} {title}{suffix}",
+            ylabel,
+            metric_key,
+            scale=scale,
+            combined=False,
+        )
+
+
 def write_group_threshold_plots(
     rows: list[dict[str, Any]],
     output_dir: Path,
@@ -1582,6 +1915,24 @@ def write_combined_plots(rows: list[dict[str, Any]], output_dir: Path) -> None:
     )
 
 
+def write_combined_step_plots(rows: list[dict[str, Any]], output_dir: Path) -> None:
+    if not rows:
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_table(rows, output_dir, "combined_step_samples_index")
+    for filename, title, ylabel, metric_key, scale in step_plot_specs(combined=True):
+        plot_step_metric(
+            rows,
+            output_dir,
+            filename,
+            title,
+            ylabel,
+            metric_key,
+            scale=scale,
+            combined=True,
+        )
+
+
 def write_combined_threshold_plots(rows: list[dict[str, Any]], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_combined_threshold_metric(
@@ -1708,6 +2059,7 @@ def main() -> None:
     rows = collect_rows(args)
     if not rows:
         raise SystemExit(f"no driver result directories found under {resolve_path(args.input_root)}")
+    step_rows = collect_step_rows(args)
 
     root = output_root(args)
     combined_dir = combined_output_root(args, root)
@@ -1717,6 +2069,8 @@ def main() -> None:
         if not args.skip_combined:
             clean_output_dir(combined_dir)
     write_table(rows, root, "activation_recompute_sweep_index")
+    if step_rows:
+        write_table(step_rows, root, "step_samples_index")
 
     seq_rows = [
         row
@@ -1724,18 +2078,34 @@ def main() -> None:
         if str(row.get("expert_recompute_policy", "none")) == "none"
         and str(row.get("expert_activation_save_policy", "save_all")) == "save_all"
     ]
+    seq_step_rows = [
+        row
+        for row in step_rows
+        if str(row.get("expert_recompute_policy", "none")) == "none"
+        and str(row.get("expert_activation_save_policy", "save_all")) == "save_all"
+    ]
     if seq_rows and not args.skip_combined:
         write_combined_plots(seq_rows, combined_dir)
+    if seq_step_rows and not args.skip_combined:
+        write_combined_step_plots(seq_step_rows, combined_dir)
 
     if not args.combined_only:
         groups: dict[tuple[str, str, int, str, str], list[dict[str, Any]]] = {}
         for row in seq_rows:
             groups.setdefault(group_key(row), []).append(row)
-        for key, group_rows in sorted(groups.items()):
+        step_groups: dict[tuple[str, str, int, str, str], list[dict[str, Any]]] = {}
+        for row in seq_step_rows:
+            step_groups.setdefault(group_key(row), []).append(row)
+        for key in sorted(set(groups) | set(step_groups)):
+            group_rows = groups.get(key, [])
+            group_step_rows = step_groups.get(key, [])
             workload, precision, batch_size, backend, profiler = key
             group_dir = root / safe_label(f"{workload}-b{batch_size}-{precision}-{backend}-{profiler}")
-            write_table(group_rows, group_dir, "sweep_summary")
-            write_group_plots(group_rows, group_dir, key)
+            if group_rows:
+                write_table(group_rows, group_dir, "sweep_summary")
+                write_group_plots(group_rows, group_dir, key)
+            if group_step_rows:
+                write_group_step_plots(group_step_rows, group_dir, key)
             print(f"wrote {group_dir}", flush=True)
 
     for family in ("split", "tok", "util", "tok_util", "tok_act"):

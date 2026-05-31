@@ -3,14 +3,25 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$SCRIPT_DIR"
-
+# =============================================================================
+# User Parameters
+# =============================================================================
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0a}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export DG_JIT_WITH_LINEINFO="${DG_JIT_WITH_LINEINFO:-1}"
 export DG_JIT_CLEAR_CACHE="${DG_JIT_CLEAR_CACHE:-0}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+# =============================================================================
+# Derived Parameters
+# =============================================================================
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# =============================================================================
+# Main Logic
+# =============================================================================
+cd "$ROOT_DIR"
 
 echo "==> Installing asym_gemm editable"
 echo "    DG_JIT_WITH_LINEINFO=${DG_JIT_WITH_LINEINFO}"
@@ -20,12 +31,12 @@ if [[ "${DG_JIT_CLEAR_CACHE}" == "1" ]]; then
   rm -rf "${HOME}/.asym_gemm/cache"
 fi
 rm -rf build *.egg-info
-python3 -m pip uninstall -y asym_gemm || true
-python3 -m pip install -e . --no-build-isolation -v
+"${PYTHON_BIN}" -m pip uninstall -y asym_gemm || true
+"${PYTHON_BIN}" -m pip install -e . --no-build-isolation -v
 
 echo
 echo "==> Verifying editable install"
-python3 - <<'PY'
+"${PYTHON_BIN}" - <<'PY'
 import asym_gemm
 
 print("asym_gemm:", asym_gemm.__file__)

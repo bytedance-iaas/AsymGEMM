@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
+import csv
 import heapq
 import json
 import re
@@ -692,6 +693,69 @@ def _last_step(con: sqlite3.Connection, name: str) -> tuple[int, int]:
     return int(row[0]), int(row[1])
 
 
+def _all_steps(con: sqlite3.Connection, name: str) -> list[tuple[int, int]]:
+    return [
+        (int(start), int(end))
+        for start, end in con.execute(
+            "select start,end from NVTX_EVENTS where text=? and end is not null order by start",
+            (name,),
+        )
+    ]
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _source_step_rows_by_step(source_profile: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    step_samples = source_profile.get("step_samples", {})
+    rows = step_samples.get("rows", []) if isinstance(step_samples, dict) else []
+    by_step: dict[int, dict[str, Any]] = {}
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            step = _safe_int(row.get("step"))
+            if step is not None:
+                by_step[step] = row
+
+    trainer = source_profile.get("trainer", {})
+    losses = trainer.get("losses", []) if isinstance(trainer, dict) else []
+    if isinstance(losses, list):
+        for loss_row in losses:
+            if not isinstance(loss_row, dict):
+                continue
+            step = _safe_int(loss_row.get("step"))
+            if step is None or loss_row.get("loss") is None:
+                continue
+            by_step.setdefault(step, {"step": step})["loss"] = loss_row.get("loss")
+    return by_step
+
+
+def _stage_timing_sample(con: sqlite3.Connection, start: int, end: int) -> dict[str, Any]:
+    total_ms = _ms(end - start)
+    runtime = _runtime_rows(con, start, end)
+    runtime_corr = {corr for _, _, corr in runtime if corr is not None}
+    kernel_intervals = _correlated_intervals(con, "CUPTI_ACTIVITY_KIND_KERNEL", runtime_corr)
+    memcpy_intervals = _correlated_intervals(con, "CUPTI_ACTIVITY_KIND_MEMCPY", runtime_corr)
+    sync_intervals = _sync_intervals(con, start, end)
+    kernel_ms = _ms(_interval_union(kernel_intervals))
+    memcpy_ms = _ms(_interval_union(memcpy_intervals))
+    runtime_ms = _ms(sum(runtime_end - runtime_start for runtime_start, runtime_end, _ in runtime))
+    sync_ms = _ms(sum(sync_end - sync_start for sync_start, sync_end in sync_intervals))
+    return {
+        "milliseconds": total_ms,
+        "cuda_kernel_busy_milliseconds": kernel_ms,
+        "cuda_memcpy_milliseconds": memcpy_ms,
+        "cuda_runtime_api_milliseconds": runtime_ms,
+        "cuda_synchronization_api_milliseconds": sync_ms,
+        "gpu_no_kernel_milliseconds": max(0.0, total_ms - kernel_ms - memcpy_ms),
+    }
+
+
 def _runtime_rows(con: sqlite3.Connection, start: int, end: int) -> list[tuple[int, int, int]]:
     if not _table_exists(con, "CUPTI_ACTIVITY_KIND_RUNTIME"):
         return []
@@ -1004,6 +1068,83 @@ def summarize_stage(con: sqlite3.Connection, stage_name: str) -> dict[str, Any]:
         "rows": _semantic_stage_summary(summary),
     }
     return summary
+
+
+def summarize_step_samples(con: sqlite3.Connection, source_profile: dict[str, Any]) -> dict[str, Any]:
+    forward_ranges = _all_steps(con, "step.forward")
+    backward_ranges = _all_steps(con, "step.backward")
+    source_rows = _source_step_rows_by_step(source_profile)
+    sample_count = max(len(forward_ranges), len(backward_ranges), len(source_rows))
+    rows: list[dict[str, Any]] = []
+
+    def add_stage(row: dict[str, Any], prefix: str, timing: dict[str, Any]) -> None:
+        row[f"{prefix}_milliseconds"] = timing["milliseconds"]
+        row[f"{prefix}_cuda_kernel_busy_milliseconds"] = timing["cuda_kernel_busy_milliseconds"]
+        row[f"{prefix}_cuda_memcpy_milliseconds"] = timing["cuda_memcpy_milliseconds"]
+        row[f"{prefix}_cuda_runtime_api_milliseconds"] = timing["cuda_runtime_api_milliseconds"]
+        row[f"{prefix}_cuda_synchronization_api_milliseconds"] = timing["cuda_synchronization_api_milliseconds"]
+        row[f"{prefix}_gpu_no_kernel_milliseconds"] = timing["gpu_no_kernel_milliseconds"]
+
+    for index in range(sample_count):
+        step = index + 1
+        row: dict[str, Any] = {"step": step}
+        forward_start = forward_end = backward_start = backward_end = None
+        forward_ms = backward_ms = 0.0
+
+        if index < len(forward_ranges):
+            forward_start, forward_end = forward_ranges[index]
+            forward_timing = _stage_timing_sample(con, forward_start, forward_end)
+            add_stage(row, "forward", forward_timing)
+            forward_ms = float(forward_timing["milliseconds"])
+        if index < len(backward_ranges):
+            backward_start, backward_end = backward_ranges[index]
+            backward_timing = _stage_timing_sample(con, backward_start, backward_end)
+            add_stage(row, "backward", backward_timing)
+            backward_ms = float(backward_timing["milliseconds"])
+
+        row["step_milliseconds"] = forward_ms + backward_ms
+        range_starts = [value for value in (forward_start, backward_start) if value is not None]
+        range_ends = [value for value in (forward_end, backward_end) if value is not None]
+        if range_starts and range_ends:
+            row["wall_milliseconds"] = _ms(max(range_ends) - min(range_starts))
+
+        source_row = source_rows.get(step, {})
+        if isinstance(source_row, dict):
+            for key, value in source_row.items():
+                if key == "step":
+                    continue
+                if key == "loss" or key.endswith("_bytes"):
+                    row[key] = value
+                elif key.endswith("_milliseconds"):
+                    row[f"source_{key}"] = value
+        rows.append(row)
+
+    return {
+        "source": "nsys_nvtx_step_ranges",
+        "forward_ranges": len(forward_ranges),
+        "backward_ranges": len(backward_ranges),
+        "rows": rows,
+    }
+
+
+def write_step_sample_artifacts(report: dict[str, Any], output_dir: Path) -> None:
+    step_samples = report.get("step_samples", {})
+    rows = step_samples.get("rows", []) if isinstance(step_samples, dict) else []
+    if not isinstance(rows, list) or not rows:
+        return
+    normalized_rows = [row for row in rows if isinstance(row, dict)]
+    if not normalized_rows:
+        return
+    fieldnames = list(normalized_rows[0].keys())
+    for row in normalized_rows[1:]:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
+    (output_dir / "step_samples.json").write_text(json.dumps(normalized_rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with (output_dir / "step_samples.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(normalized_rows)
 
 
 def _semantic_rows(stage: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1953,6 +2094,7 @@ def main() -> None:
         "source_profile": source_profile,
         "memory_profile": memory_profile,
         "stages": [summarize_stage(con, "step.forward"), summarize_stage(con, "step.backward")],
+        "step_samples": summarize_step_samples(con, source_profile),
     }
     if args.output_json:
         args.output_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1960,6 +2102,9 @@ def main() -> None:
         args.output_md.write_text(markdown(report), encoding="utf-8")
         args.output_md.with_name("lat.md").write_text(latency_markdown(report), encoding="utf-8")
         args.output_md.with_name("memory.md").write_text(memory_markdown(report), encoding="utf-8")
+    artifact_dir = args.output_json.parent if args.output_json else args.output_md.parent if args.output_md else None
+    if artifact_dir is not None:
+        write_step_sample_artifacts(report, artifact_dir)
     if not args.output_json and not args.output_md:
         print(json.dumps(report, indent=2, sort_keys=True))
 

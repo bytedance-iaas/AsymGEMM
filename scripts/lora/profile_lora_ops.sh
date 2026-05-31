@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# User parameters.
+# =============================================================================
+# User Parameters
+# =============================================================================
 ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
 
 DEVICE="cuda:0"
@@ -40,6 +42,15 @@ CLEAN_PLOTS=true
 OVERWRITE=false
 VERBOSE=false
 
+# =============================================================================
+# Derived Parameters
+# =============================================================================
+PROFILE_SCRIPT="${ROOT}/scripts/lora/profile_lora_ops.py"
+PLOT_SCRIPT="${ROOT}/scripts/plotting/plot_lora_operator.py"
+
+# =============================================================================
+# Main Logic
+# =============================================================================
 usage() {
   cat <<USAGE
 Usage:
@@ -405,7 +416,7 @@ while read -r in_features out_features; do
             fi
 
             cmd=(
-              "${PYTHON_BIN}" "${ROOT}/scripts/lora/profile_lora_ops.py"
+              "${PYTHON_BIN}" "${PROFILE_SCRIPT}"
               --operation "${operation}"
               --backend "${backend}"
               --device "${DEVICE}"
@@ -488,7 +499,7 @@ if [[ "${SAVE_RESULTS}" == "true" && "${PLOT}" == "true" ]]; then
       PLOT_ROOT="$(resolve_dir "${config_root}/plots")"
     fi
     plot_cmd=(
-      "${PYTHON_BIN}" "${ROOT}/scripts/plotting/plot_lora_operator.py"
+      "${PYTHON_BIN}" "${PLOT_SCRIPT}"
       --input-root "${config_root}"
       --output-dir "${PLOT_ROOT}"
       --skip-combined
@@ -521,7 +532,7 @@ if [[ "${SAVE_RESULTS}" == "true" && "${PLOT}" == "true" ]]; then
 
   if ((${#plot_csvs[@]})); then
     combined_cmd=(
-      "${PYTHON_BIN}" "${ROOT}/scripts/plotting/plot_lora_operator.py"
+      "${PYTHON_BIN}" "${PLOT_SCRIPT}"
       --combined-output-dir "${COMBINED_ROOT}"
       --combined-only
       --rank "${RANK}"
