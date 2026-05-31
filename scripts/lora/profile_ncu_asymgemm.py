@@ -12,11 +12,11 @@ import subprocess
 import sys
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.postprocess_ncu_asymgemm import summarize, markdown
+from scripts.lora.postprocess_ncu_asymgemm import summarize, markdown
 
 DEFAULT_LORA_BATCH_SIZE = 32
 DEFAULT_LORA_SEQ_LEN = 64
@@ -161,7 +161,7 @@ def main() -> None:
     cmd += args.extra_ncu_arg
     cmd += [
         sys.executable,
-        str(ROOT / "scripts/profile_lora_e2e.py"),
+        str(ROOT / "scripts/lora/profile_lora_e2e.py"),
         "--workload",
         args.workload,
         "--device",

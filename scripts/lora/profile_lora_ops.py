@@ -2,7 +2,7 @@
 """Isolated LoRA operator profiler.
 
 This script measures the LoRA operator path independently from the end-to-end
-training-step profiler in `scripts/profile_lora_e2e.py`.
+training-step profiler in `scripts/lora/profile_lora_e2e.py`.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from typing import Callable
 import torch
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

@@ -845,21 +845,24 @@ def test_module_to_cuda_does_not_move_host_weight_or_register_it() -> None:
         module.host_weight.cuda()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for peak HBM accounting")
+@pytest.mark.skipif(not _direct_bf16_available(), reason="direct BF16 AsymGEMM required for peak HBM accounting")
 def test_cpu_resident_forward_excludes_weight_bytes_from_peak_cuda_allocation() -> None:
     torch.manual_seed(7)
     device = torch.device("cuda")
-    batch = 4
+    batch = 128
     in_features = 2048
     out_features = 2048
 
-    x = torch.randn(batch, in_features, device=device, dtype=torch.float32)
-    weight_cpu = torch.randn(out_features, in_features, dtype=torch.float32)
+    x = torch.randn(batch, in_features, device=device, dtype=torch.bfloat16)
+    weight_cpu = torch.randn(out_features, in_features, dtype=torch.bfloat16)
     host_weight = HostWeight.from_tensor(weight_cpu, pin_memory=True)
+    stats = AsymExecutionStats()
+    ok, reason = can_use_direct_bf16(x, host_weight)
+    assert ok, reason
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    y_host = asym_frozen_linear(x, host_weight, backend="torch")
+    y_host = asym_frozen_linear(x, host_weight, backend="asym", stats=stats)
     torch.cuda.synchronize()
     host_peak = torch.cuda.max_memory_allocated()
     del y_host
@@ -873,6 +876,8 @@ def test_cpu_resident_forward_excludes_weight_bytes_from_peak_cuda_allocation() 
     del y_gpu, weight_gpu
 
     assert host_weight.weight.device.type == "cpu"
+    assert stats.asym_forward_calls == 1
+    assert stats.torch_forward_calls == 0
     assert gpu_peak - host_peak >= int(host_weight.weight_nbytes * 0.8)
 
 

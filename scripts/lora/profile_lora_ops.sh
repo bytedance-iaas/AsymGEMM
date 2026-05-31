@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# User parameters.
+ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
+
 DEVICE="cuda:0"
 BACKENDS="torch,asym"
 OPERATIONS="full_lora"
@@ -8,7 +11,7 @@ OPERATIONS="full_lora"
 # BATCH_SIZES="8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32"
 BATCH_SIZES="1"
 SEQ_LENS="2048"
-# Same default tensor sizes as scripts/profile_transpose.sh, expressed as
+# Same default tensor sizes as scripts/lora/profile_transpose.sh, expressed as
 # LoRA feature pairs IN|OUT with tokens=M=2048:
 #   gate/up: X[M,H] @ W[I,H].T -> Y[M,I]
 #   down:    X[M,I] @ W[H,I].T -> Y[M,H]
@@ -25,8 +28,6 @@ ITERS=200
 BACKWARD="both"
 CUDA_GRAPH=true
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${PYTHON:-python3}}"
 OUTPUT_ROOT="${ROOT}/profiling"
 OUTPUT_DIR=""
@@ -42,7 +43,7 @@ VERBOSE=false
 usage() {
   cat <<USAGE
 Usage:
-  scripts/profile_lora_ops.sh [options] [extra profile_lora_ops.py args]
+  scripts/lora/profile_lora_ops.sh [options] [extra profile_lora_ops.py args]
 
 Options:
   --device NAME
@@ -404,7 +405,7 @@ while read -r in_features out_features; do
             fi
 
             cmd=(
-              "${PYTHON_BIN}" "${ROOT}/scripts/profile_lora_ops.py"
+              "${PYTHON_BIN}" "${ROOT}/scripts/lora/profile_lora_ops.py"
               --operation "${operation}"
               --backend "${backend}"
               --device "${DEVICE}"

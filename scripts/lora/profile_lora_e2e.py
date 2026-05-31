@@ -34,7 +34,7 @@ from torch.profiler import ProfilerActivity, profile
 from torch.utils.checkpoint import checkpoint
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -3374,7 +3374,7 @@ def markdown(report: dict[str, Any]) -> str:
     lines = [
         f"# {report['workload']} Source-Label Coverage Report",
         "",
-        "This is not the GPU performance truth table. Use Nsight Systems plus `scripts/postprocess_nsys_lora.py` for kernel-busy, memcpy, and GPU no-kernel percentages.",
+        "This is not the GPU performance truth table. Use Nsight Systems plus `scripts/lora/postprocess_nsys_lora.py` for kernel-busy, memcpy, and GPU no-kernel percentages.",
         "",
         "These source-label tables are for auditing range coverage. In `--timing-mode profile`, inner rows are asynchronous Python/NVTX range timings. In `--timing-mode debug_sync`, rows are synchronized debugging timings and carry profiler overhead.",
         "",

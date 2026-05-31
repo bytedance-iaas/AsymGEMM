@@ -17,14 +17,21 @@ from .frozen_linear import (
 from .host_weight import HostWeight, HostWeightMetadata, tensor_nbytes
 from .lora import (
     AsymLoRALinear,
+    GroupedLoRAMetadata,
+    PackedExpertLoRA,
     TorchLoRALinear,
     add_asym_lora,
     copy_lora,
     freeze_non_lora_params,
     get_lora_state_dict,
+    get_lora_state_names,
+    grouped_expert_lora,
+    grouped_expert_lora_pair,
     load_lora_state_dict,
     lora_parameters,
+    lora_state_hash,
     normalize_lora_dtype,
+    prepare_grouped_lora_metadata,
     save_peft_adapter,
     load_peft_adapter,
 )
@@ -48,9 +55,11 @@ from .moe import (
     MoEConfig,
     VALID_MOE_BACKENDS,
     estimate_moe_parameters,
+    make_dense_group_metadata,
     run_moe_correctness_report,
     run_moe_memory_comparison,
 )
+from .qwen3_moe import AsymQwen3Experts, Qwen3ExpertReport, is_qwen3_experts, wrap_qwen3_experts
 
 FrozenLinear = AsymFrozenLinear
 DenseConfig = DenseLLMConfig
@@ -68,7 +77,9 @@ __all__ = [
     "AsymGroupedFrozenLinearFunction",
     "AsymLoRALinear",
     "AsymMLP",
+    "AsymQwen3Experts",
     "FrozenLinear",
+    "GroupedLoRAMetadata",
     "HostWeight",
     "HostWeightMetadata",
     "MICRO_DENSE_LLM_CONFIG",
@@ -82,6 +93,8 @@ __all__ = [
     "MoEConfig",
     "MoE",
     "MoEModel",
+    "PackedExpertLoRA",
+    "Qwen3ExpertReport",
     "TorchLoRALinear",
     "TorchMLP",
     "VALID_ASYM_PRECISIONS",
@@ -98,9 +111,15 @@ __all__ = [
     "frozen_linear",
     "freeze_non_lora_params",
     "get_lora_state_dict",
+    "get_lora_state_names",
+    "grouped_expert_lora",
+    "grouped_expert_lora_pair",
+    "is_qwen3_experts",
     "load_lora_state_dict",
     "load_peft_adapter",
     "lora_parameters",
+    "lora_state_hash",
+    "make_dense_group_metadata",
     "measure_gpu_weight_allocation",
     "normalize_lora_dtype",
     "optimizer_contains_only",
@@ -110,5 +129,7 @@ __all__ = [
     "run_moe_case",
     "run_moe_memory_comparison",
     "save_peft_adapter",
+    "prepare_grouped_lora_metadata",
     "tensor_nbytes",
+    "wrap_qwen3_experts",
 ]

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Postprocess an Nsight Systems SQLite export for LoRA-SFT profiling.
 
-Run the workload with `scripts/profile_lora_e2e.py --timing-mode profile` or
+Run the workload with `scripts/lora/profile_lora_e2e.py --timing-mode profile` or
 with the same `asym_gemm.training.profile_ranges.prof_range()` NVTX labels in a
 larger integration such as LLaMA-Factory.  This postprocessor reads the Nsight
 Systems database and reports, per `step.forward` / `step.backward`:
@@ -1589,7 +1589,7 @@ def _overall_memory_markdown(source_profile: dict[str, Any]) -> list[str]:
         return [
             "## Overall Memory Summary",
             "",
-            "No source memory report found. Rerun the profile with the current `scripts/profile_lora_e2e.py` and postprocess with `--source-profile-json` or `--source-profile-dir`.",
+            "No source memory report found. Rerun the profile with the current `scripts/lora/profile_lora_e2e.py` and postprocess with `--source-profile-json` or `--source-profile-dir`.",
             "",
         ]
     gpu = memory.get("gpu", {}) if isinstance(memory.get("gpu", {}), dict) else {}

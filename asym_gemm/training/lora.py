@@ -4,9 +4,10 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 import torch
 from torch import nn
@@ -16,8 +17,7 @@ from .frozen_linear import (
     AsymExecutionStats,
     AsymFrozenLinear,
     VALID_ASYM_PRECISIONS,
-    _TORCH_GROUPED_MM,
-    _TORCH_GROUPED_MM_NAME,
+    _TORCH_GROUPED_MM as _FROZEN_TORCH_GROUPED_MM,
 )
 
 
@@ -48,6 +48,14 @@ TARGET_MODULE_PRESETS: dict[str, tuple[str, ...]] = {
         )
     ),
 }
+
+_TORCH_GROUPED_MM = _FROZEN_TORCH_GROUPED_MM
+
+
+def _require_lora_grouped_mm():
+    if _TORCH_GROUPED_MM is None:
+        raise RuntimeError("PyTorch grouped LoRA path requires torch.nn.functional.grouped_mm or torch._grouped_mm")
+    return _TORCH_GROUPED_MM
 
 
 LORA_DTYPE_NAMES: dict[str, torch.dtype] = {
@@ -80,6 +88,26 @@ def _randn(
     scale: float,
 ) -> torch.Tensor:
     return (torch.randn(shape, generator=generator, dtype=torch.float32) * scale).to(dtype=dtype).contiguous()
+
+
+def _reset_lora_weights(
+    a_weight: torch.Tensor,
+    b_weight: torch.Tensor,
+    *,
+    init_lora_weights: Literal["asym", "peft"],
+    generator: torch.Generator | None,
+) -> None:
+    if init_lora_weights == "asym":
+        a = _randn(tuple(a_weight.shape), generator=generator, dtype=a_weight.dtype, scale=0.01)
+        b = _randn(tuple(b_weight.shape), generator=generator, dtype=b_weight.dtype, scale=0.01)
+        a_weight.copy_(a.to(device=a_weight.device))
+        b_weight.copy_(b.to(device=b_weight.device))
+        return
+    if init_lora_weights == "peft":
+        nn.init.kaiming_uniform_(a_weight, a=math.sqrt(5))
+        nn.init.zeros_(b_weight)
+        return
+    raise ValueError("init_lora_weights must be 'asym' or 'peft'")
 
 
 def normalize_lora_dtype(dtype: torch.dtype | str | None) -> torch.dtype:
@@ -161,10 +189,14 @@ class AsymLoRALinear(nn.Module):
         precision: str = "bf16",
         adapter_name: str = "default",
         pin_memory: bool | None = None,
+        init_lora_weights: Literal["asym", "peft"] = "asym",
+        lora_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if rank <= 0:
             raise ValueError(f"rank must be positive, got {rank}")
+        if not 0.0 <= float(lora_dropout) <= 1.0:
+            raise ValueError(f"lora_dropout must be in [0, 1], got {lora_dropout}")
         precision = str(precision).lower()
         if precision not in VALID_ASYM_PRECISIONS:
             raise ValueError(f"unsupported precision={precision!r}; expected one of {VALID_ASYM_PRECISIONS}")
@@ -190,7 +222,8 @@ class AsymLoRALinear(nn.Module):
         self.lora_dtype = resolved_lora_dtype
         self.scaling = float(alpha) / float(rank)
         self.precision = precision
-        self._reset_lora(adapter_name, lora_generator)
+        self.lora_dropout = nn.Dropout(p=float(lora_dropout)) if float(lora_dropout) > 0.0 else nn.Identity()
+        self._reset_lora(adapter_name, lora_generator, init_lora_weights=init_lora_weights)
 
     @property
     def base(self) -> AsymFrozenLinear:
@@ -204,14 +237,17 @@ class AsymLoRALinear(nn.Module):
     def lora_b(self) -> torch.nn.Parameter:
         return self.lora_B[self.active_adapter].weight
 
-    def _reset_lora(self, adapter_name: str, generator: torch.Generator | None) -> None:
+    def _reset_lora(
+        self,
+        adapter_name: str,
+        generator: torch.Generator | None,
+        *,
+        init_lora_weights: Literal["asym", "peft"],
+    ) -> None:
         with torch.no_grad():
             a_weight = self.lora_A[adapter_name].weight
             b_weight = self.lora_B[adapter_name].weight
-            a = _randn(tuple(a_weight.shape), generator=generator, dtype=a_weight.dtype, scale=0.01)
-            b = _randn(tuple(b_weight.shape), generator=generator, dtype=b_weight.dtype, scale=0.01)
-            a_weight.copy_(a.to(device=a_weight.device))
-            b_weight.copy_(b.to(device=b_weight.device))
+            _reset_lora_weights(a_weight, b_weight, init_lora_weights=init_lora_weights, generator=generator)
 
     @property
     def pinned_cpu_bytes(self) -> int:
@@ -223,7 +259,7 @@ class AsymLoRALinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base = self.base_layer(x)
-        lora_input = x.to(dtype=self.lora_dtype)
+        lora_input = self.lora_dropout(x).to(dtype=self.lora_dtype)
         lora = self.lora_B[self.active_adapter](self.lora_A[self.active_adapter](lora_input)) * self.scaling
         return base + lora.to(dtype=base.dtype)
 
@@ -240,10 +276,14 @@ class TorchLoRALinear(nn.Module):
         lora_generator: torch.Generator | None = None,
         lora_dtype: torch.dtype | str | None = torch.bfloat16,
         adapter_name: str = "default",
+        init_lora_weights: Literal["asym", "peft"] = "asym",
+        lora_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if rank <= 0:
             raise ValueError(f"rank must be positive, got {rank}")
+        if not 0.0 <= float(lora_dropout) <= 1.0:
+            raise ValueError(f"lora_dropout must be in [0, 1], got {lora_dropout}")
         resolved_device, resolved_dtype = _resolve_device_dtype(source, device=device, dtype=dtype)
         resolved_lora_dtype = normalize_lora_dtype(lora_dtype)
         weight = _source_weight(source)
@@ -257,7 +297,8 @@ class TorchLoRALinear(nn.Module):
         self.active_adapter = adapter_name
         self.lora_dtype = resolved_lora_dtype
         self.scaling = float(alpha) / float(rank)
-        self._reset_lora(adapter_name, lora_generator)
+        self.lora_dropout = nn.Dropout(p=float(lora_dropout)) if float(lora_dropout) > 0.0 else nn.Identity()
+        self._reset_lora(adapter_name, lora_generator, init_lora_weights=init_lora_weights)
 
     @property
     def base_weight(self) -> torch.Tensor:
@@ -271,14 +312,17 @@ class TorchLoRALinear(nn.Module):
     def lora_b(self) -> torch.nn.Parameter:
         return self.lora_B[self.active_adapter].weight
 
-    def _reset_lora(self, adapter_name: str, generator: torch.Generator | None) -> None:
+    def _reset_lora(
+        self,
+        adapter_name: str,
+        generator: torch.Generator | None,
+        *,
+        init_lora_weights: Literal["asym", "peft"],
+    ) -> None:
         with torch.no_grad():
             a_weight = self.lora_A[adapter_name].weight
             b_weight = self.lora_B[adapter_name].weight
-            a = _randn(tuple(a_weight.shape), generator=generator, dtype=a_weight.dtype, scale=0.01)
-            b = _randn(tuple(b_weight.shape), generator=generator, dtype=b_weight.dtype, scale=0.01)
-            a_weight.copy_(a.to(device=a_weight.device))
-            b_weight.copy_(b.to(device=b_weight.device))
+            _reset_lora_weights(a_weight, b_weight, init_lora_weights=init_lora_weights, generator=generator)
 
     @property
     def gpu_resident_base_weight_bytes(self) -> int:
@@ -286,7 +330,7 @@ class TorchLoRALinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base = self.base_layer(x)
-        lora_input = x.to(dtype=self.lora_dtype)
+        lora_input = self.lora_dropout(x).to(dtype=self.lora_dtype)
         lora = self.lora_B[self.active_adapter](self.lora_A[self.active_adapter](lora_input)) * self.scaling
         return base + lora.to(dtype=base.dtype)
 
@@ -427,6 +471,11 @@ def add_asym_lora(
     precision: str = "bf16",
     adapter_name: str = "default",
     lora_dtype: torch.dtype | str | None = torch.bfloat16,
+    lora_dropout: float = 0.0,
+    init_lora_weights: Literal["asym", "peft"] = "asym",
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+    pin_memory: bool | None = None,
     module_filter: Callable[[str, nn.Module], bool] | None = None,
     stats: AsymExecutionStats | None = None,
     strict: bool = True,
@@ -462,7 +511,11 @@ def add_asym_lora(
             precision=precision,
             adapter_name=adapter_name,
             lora_dtype=lora_dtype,
-            pin_memory=module.weight.device.type == "cuda",
+            lora_dropout=lora_dropout,
+            init_lora_weights=init_lora_weights,
+            device=device,
+            dtype=dtype,
+            pin_memory=module.weight.device.type == "cuda" if pin_memory is None else pin_memory,
         )
         replacements.append((name, module, wrapped))
 
@@ -611,7 +664,8 @@ def _grouped_lora_torch_mm(
     else:
         selected = weight.index_select(0, metadata.active_experts)
     mat2 = selected.transpose(-1, -2)
-    return _TORCH_GROUPED_MM(mat1, mat2, offs=metadata.active_offsets)
+    grouped_mm = _require_lora_grouped_mm()
+    return grouped_mm(mat1, mat2, offs=metadata.active_offsets)
 
 
 def _grouped_lora_fallback(
@@ -690,7 +744,8 @@ def grouped_expert_lora_pair(
     mat1 = torch.cat((x0.contiguous(), x1.contiguous()), dim=0)
     mat2 = torch.cat((selected0, selected1), dim=0).transpose(-1, -2)
     offs = torch.cat((metadata.active_offsets, metadata.active_offsets + rows), dim=0).contiguous()
-    out = _TORCH_GROUPED_MM(mat1, mat2, offs=offs)
+    grouped_mm = _require_lora_grouped_mm()
+    out = grouped_mm(mat1, mat2, offs=offs)
     return out[:rows], out[rows:]
 
 

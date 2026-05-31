@@ -11,11 +11,11 @@ import subprocess
 import sys
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.postprocess_nsys_cpu_gaps import markdown, summarize_cpu_gaps  # noqa: E402
+from scripts.lora.postprocess_nsys_cpu_gaps import markdown, summarize_cpu_gaps  # noqa: E402
 
 
 WORKLOADS = [
@@ -103,7 +103,7 @@ def main() -> None:
         f"--output={report_prefix}",
         *args.extra_nsys_arg,
         sys.executable,
-        str(ROOT / "scripts/profile_lora_e2e.py"),
+        str(ROOT / "scripts/lora/profile_lora_e2e.py"),
         "--workload",
         args.workload,
         "--device",

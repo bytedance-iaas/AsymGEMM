@@ -23,11 +23,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.postprocess_nsys_lora import (  # noqa: E402
+from scripts.lora.postprocess_nsys_lora import (  # noqa: E402
     _correlated_intervals,
     _fetch_ranges,
     _kernel_events,

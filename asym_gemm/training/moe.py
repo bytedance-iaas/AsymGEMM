@@ -253,6 +253,24 @@ RouteMetadata = ContiguousRouteMetadata | MaskedRouteMetadata
 Routing = tuple[torch.Tensor, torch.Tensor]
 
 
+def make_dense_group_metadata(
+    offsets: torch.Tensor,
+    *,
+    num_groups: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build dense grouped metadata with one group per expert plus sentinel."""
+
+    if offsets.dim() != 1:
+        raise ValueError(f"offsets must be 1D, got shape {tuple(offsets.shape)}")
+    expected = int(num_groups) + 1
+    if int(offsets.numel()) != expected:
+        raise ValueError(f"dense grouped metadata expects {expected} offsets, got {int(offsets.numel())}")
+    experts = torch.arange(expected, device=device, dtype=torch.long)
+    experts[-1] = -1
+    return offsets.to(device=device, dtype=torch.long), experts
+
+
 def _validate_route_inputs(
     topk_indices: torch.Tensor,
     routing_weights: torch.Tensor | None,
@@ -1020,9 +1038,7 @@ class AsymMoELayer(nn.Module):
         num_groups: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        experts = torch.arange(num_groups + 1, device=device, dtype=torch.long)
-        experts[-1] = -1
-        return offsets.to(device=device, dtype=torch.long), experts
+        return make_dense_group_metadata(offsets, num_groups=num_groups, device=device)
 
     def _lora_contiguous(
         self,
@@ -3259,6 +3275,7 @@ __all__ = [
     "grouped_expert_lora",
     "lora_grad_worst_error",
     "make_balanced_static_routing",
+    "make_dense_group_metadata",
     "make_empty_expert_static_routing",
     "make_repeated_expert_static_routing",
     "make_skewed_static_routing",

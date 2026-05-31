@@ -15,11 +15,11 @@ import sys
 from typing import Any, Iterable
 
 
-ROOT = Path(__file__).resolve().parents[1]
-PROFILE_SCRIPT = ROOT / "scripts" / "profile_lora_e2e.py"
-NSYS_POSTPROCESS_SCRIPT = ROOT / "scripts" / "postprocess_nsys_lora.py"
-CPU_GAPS_SCRIPT = ROOT / "scripts" / "profile_nsys_cpu_gaps.py"
-NCU_SCRIPT = ROOT / "scripts" / "profile_ncu_asymgemm.py"
+ROOT = Path(__file__).resolve().parents[2]
+PROFILE_SCRIPT = ROOT / "scripts" / "lora" / "profile_lora_e2e.py"
+NSYS_POSTPROCESS_SCRIPT = ROOT / "scripts" / "lora" / "postprocess_nsys_lora.py"
+CPU_GAPS_SCRIPT = ROOT / "scripts" / "lora" / "profile_nsys_cpu_gaps.py"
+NCU_SCRIPT = ROOT / "scripts" / "lora" / "profile_ncu_asymgemm.py"
 DEFAULT_LORA_BATCH_SIZE = 32
 DEFAULT_LORA_SEQ_LEN = 64
 DEFAULT_LORA_HIDDEN_DIM = 1024

@@ -22,12 +22,16 @@ _TORCH_GROUPED_MM_NAME = "torch.nn.functional.grouped_mm"
 if _TORCH_GROUPED_MM is None:
     _TORCH_GROUPED_MM = getattr(torch, "_grouped_mm", None)
     _TORCH_GROUPED_MM_NAME = "torch._grouped_mm"
-if _TORCH_GROUPED_MM is None:
-    raise RuntimeError("PyTorch grouped torch baseline requires torch.nn.functional.grouped_mm or torch._grouped_mm")
 
 _SINGLE_GROUP_LAUNCH_TENSOR_CACHE: dict[
     tuple[str, int], tuple[torch.Tensor, torch.Tensor]
 ] = {}
+
+
+def _require_torch_grouped_mm():
+    if _TORCH_GROUPED_MM is None:
+        raise RuntimeError("PyTorch grouped torch baseline requires torch.nn.functional.grouped_mm or torch._grouped_mm")
+    return _TORCH_GROUPED_MM
 
 
 @dataclass(frozen=True)
@@ -574,6 +578,19 @@ def _quantized_output_dtype(a: torch.Tensor, *, precision: str) -> torch.dtype:
     return torch.bfloat16
 
 
+def _quantized_compiled_dims(compiled_dims: str) -> str:
+    # The FP8/FP4 contiguous kernels are specialized around N/K by default.
+    # Reusing the BF16 training default "mnk" can compile a numerically invalid
+    # SM100 path for these quantized kernels.
+    return "nk" if compiled_dims == "mnk" else compiled_dims
+
+
+def _stage_quantized_tensor_for_kernel(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if tensor.device == device:
+        return tensor.contiguous()
+    return tensor.to(device=device, non_blocking=tensor.device.type == "cpu" and tensor.is_pinned()).contiguous()
+
+
 def _asym_quantized_nt(
     a: torch.Tensor,
     qweight: QuantizedHostWeight,
@@ -590,9 +607,15 @@ def _asym_quantized_nt(
     m = int(a.shape[0])
     n = int(qweight.out_features)
     a_quantized = _quantize_activation_for_precision(a, precision=precision)
-    b_group = (qweight.values.unsqueeze(0), qweight.scales.unsqueeze(0))
+    # The BF16 path is the CPU-resident training path. Quantized kernels are
+    # currently more reliable when the packed cache tensors are staged to CUDA
+    # before launch; the source cache remains CPU-resident and frozen.
+    b_values = _stage_quantized_tensor_for_kernel(qweight.values, a.device)
+    b_scales = _stage_quantized_tensor_for_kernel(qweight.scales, a.device)
+    b_group = (b_values.unsqueeze(0), b_scales.unsqueeze(0))
     d = torch.empty((m, n), device=a.device, dtype=_quantized_output_dtype(a, precision=precision))
     offsets, experts = _single_group_launch_tensors(a.device, m)
+    kernel_compiled_dims = _quantized_compiled_dims(compiled_dims)
 
     if precision == "fp8":
         asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(
@@ -603,7 +626,7 @@ def _asym_quantized_nt(
             experts,
             2,
             recipe=_FP8_RECIPE,
-            compiled_dims=compiled_dims,
+            compiled_dims=kernel_compiled_dims,
             disable_ue8m0_cast=False,
         )
     elif precision == "fp4":
@@ -615,7 +638,7 @@ def _asym_quantized_nt(
             experts,
             2,
             recipe=_FP4_RECIPE,
-            compiled_dims=compiled_dims,
+            compiled_dims=kernel_compiled_dims,
             disable_ue8m0_cast=True,
         )
     else:
@@ -642,35 +665,38 @@ def _asym_grouped_quantized_nt(
     n = int(qweight.out_features)
     a_kernel, offsets_kernel, unpad = _pad_grouped_input_for_asym(a, offsets, experts)
     a_quantized = _quantize_activation_for_precision(a_kernel, precision=precision)
+    b_values = _stage_quantized_tensor_for_kernel(qweight.values, a.device)
+    b_scales = _stage_quantized_tensor_for_kernel(qweight.scales, a.device)
     d = torch.empty(
         (int(a_kernel.shape[0]), n),
         device=a.device,
         dtype=_quantized_output_dtype(a, precision=precision),
     )
     offsets_i32, experts_i32, list_size = _group_metadata_tensors(offsets_kernel, experts, device=a.device)
+    kernel_compiled_dims = _quantized_compiled_dims(compiled_dims)
 
     if precision == "fp8":
         asym_gemm.m_grouped_fp8_asym_gemm_nt_contiguous(
             a_quantized,
-            (qweight.values, qweight.scales),
+            (b_values, b_scales),
             d,
             offsets_i32,
             experts_i32,
             list_size,
             recipe=_FP8_RECIPE,
-            compiled_dims=compiled_dims,
+            compiled_dims=kernel_compiled_dims,
             disable_ue8m0_cast=False,
         )
     elif precision == "fp4":
         asym_gemm.m_grouped_fp4_asym_gemm_nt_contiguous(
             a_quantized,
-            (qweight.values, qweight.scales),
+            (b_values, b_scales),
             d,
             offsets_i32,
             experts_i32,
             list_size,
             recipe=_FP4_RECIPE,
-            compiled_dims=compiled_dims,
+            compiled_dims=kernel_compiled_dims,
             disable_ue8m0_cast=True,
         )
     else:
@@ -755,7 +781,8 @@ def _grouped_torch_mm(
     # This is the torch baseline for grouped expert base weights: one grouped
     # GEMM per projection, not fusion across gate/up/down or activation.
     mat2 = selected if transpose_b else selected.transpose(-1, -2)
-    return _TORCH_GROUPED_MM(mat1, mat2, offs=active_offsets)
+    grouped_mm = _require_torch_grouped_mm()
+    return grouped_mm(mat1, mat2, offs=active_offsets)
 
 
 def _grouped_torch_chunks(

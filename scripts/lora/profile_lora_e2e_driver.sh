@@ -7,6 +7,8 @@ set -Eeuo pipefail
 # Edit this section for the default run. CLI flags override these values.
 # List defaults use the same comma-separated format accepted by CLI flags.
 
+ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
+
 GPU_POOL="0,1,3"
 # Per-workload layers can be set as "workload|layers", e.g. "moe-604m-a75m|2".
 # Use "workload|all" to profile the full configured/HF model depth.
@@ -66,15 +68,13 @@ RECOMPUTE="both"
 OVERWRITE=false
 CONTINUE_ON_ERROR=true
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PY_DRIVER="${ROOT}/scripts/profile_lora_e2e_driver.py"
+PY_DRIVER="${ROOT}/scripts/lora/profile_lora_e2e_driver.py"
 PLOT_RECOMPUTE_SCRIPT="${ROOT}/scripts/plotting/plot_activation_recompute_sweep.py"
 
 usage() {
   cat <<USAGE
 Usage:
-  scripts/profile_lora_e2e_driver.sh [options]
+  scripts/lora/profile_lora_e2e_driver.sh [options]
 
 Defaults:
   --gpus ${GPU_POOL}
@@ -118,7 +118,7 @@ Shell options:
   --continue-on-error true|false      Keep sweeping if a point OOMs or fails. Default true records failed rows.
   -h, --help                          Show this help.
 
-Unknown options are passed through to scripts/profile_lora_e2e_driver.py, so common
+Unknown options are passed through to scripts/lora/profile_lora_e2e_driver.py, so common
 driver flags such as --dry-run, --target-modules, and --skip-memory-attribution
 still work here.
 USAGE

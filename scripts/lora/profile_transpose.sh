@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# User parameters.
+ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
 PYTHON_BIN="${PYTHON_BIN:-${PYTHON:-python3}}"
 
-export PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 MODE="${MODE:-ncu}"
 # MODE="${MODE:-timing}"
@@ -46,7 +48,7 @@ NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-}"
 usage() {
   cat <<USAGE
 Usage:
-  scripts/profile_transpose.sh [options] [extra profile_transpose.py args]
+  scripts/lora/profile_transpose.sh [options] [extra profile_transpose.py args]
 
 Compares:
   torch_nontranspose: X[M,K] @ W[N,K].T
@@ -325,7 +327,7 @@ for shape in "${shape_entries[@]}"; do
   print_shape_header "${run_count}" "${total_count}" "${shape_m}" "${shape_k}" "${shape_n}"
 
   cmd=(
-    "${PYTHON_BIN}" "scripts/profile_transpose.py"
+    "${PYTHON_BIN}" "${ROOT}/scripts/lora/profile_transpose.py"
     --device "${DEVICE}"
     --precision "${PRECISION}"
     --m "${shape_m}"
