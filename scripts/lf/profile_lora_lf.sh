@@ -29,6 +29,7 @@ LORA_RANK=${LORA_RANK:-8}
 LORA_ALPHA=${LORA_ALPHA:-16}
 LORA_DROPOUT=${LORA_DROPOUT:-0.0}
 RECOMPUTE="norecomp"
+EXPERT_POLICIES=${EXPERT_POLICIES:-none}
 
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
 ASYM_STRICT=${ASYM_STRICT:-true}
@@ -74,6 +75,7 @@ Options:
   --profilers LIST               source and/or nsys.
   --seq-lens LIST                LF cutoff lengths. Accepts 2048,4096 or "2048 4096".
   --recompute norecomp|recomp|both
+  --expert-policies LIST         AsymGEMM expert policies: none, splitN, tokN-ckpt, tokN-act-ckpt.
   --model-name-or-path NAME
   --dataset NAME
   --template NAME
@@ -196,7 +198,8 @@ job_root_path() {
   local backend="$2"
   local profiler="$3"
   local recompute="$4"
-  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__polnone")"
+  local expert_policy="$5"
+  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}")"
 }
 
 plot_workload_from_config_root() {
@@ -216,6 +219,7 @@ backend_spec="${BACKENDS}"
 profiler_spec="${PROFILERS}"
 seq_spec="${SEQ_LENS}"
 recompute_spec="${RECOMPUTE}"
+expert_policy_spec="${EXPERT_POLICIES}"
 output_root="${OUTPUT_ROOT}"
 run_name="${RUN_NAME}"
 batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}"
@@ -233,6 +237,8 @@ while (($#)); do
     --seq-lens=*) seq_spec="${1#*=}"; shift ;;
     --recompute) need_value "$1" "${2-}"; recompute_spec="$2"; shift 2 ;;
     --recompute=*) recompute_spec="${1#*=}"; shift ;;
+    --expert-policies) need_value "$1" "${2-}"; expert_policy_spec="$2"; shift 2 ;;
+    --expert-policies=*) expert_policy_spec="${1#*=}"; shift ;;
     --model-name-or-path) need_value "$1" "${2-}"; MODEL_NAME_OR_PATH="$2"; MODEL_TAG=$(basename "${MODEL_NAME_OR_PATH}" | tr '/:' '__'); shift 2 ;;
     --model-name-or-path=*) MODEL_NAME_OR_PATH="${1#*=}"; MODEL_TAG=$(basename "${MODEL_NAME_OR_PATH}" | tr '/:' '__'); shift ;;
     --dataset) need_value "$1" "${2-}"; DATASET="$2"; shift 2 ;;
@@ -280,11 +286,13 @@ mapfile -t backends < <(tokens "${backend_spec}" | while read -r value; do backe
 mapfile -t profilers < <(tokens "${profiler_spec}" | while read -r value; do profiler_label "${value}"; done | dedupe)
 mapfile -t seq_lens < <(tokens "${seq_spec}" | dedupe)
 mapfile -t recompute_modes < <(recompute_values "${recompute_spec}")
+mapfile -t expert_policies < <(tokens "${expert_policy_spec}" | dedupe)
 
 ((${#gpus[@]})) || die "GPU pool is empty"
 ((${#backends[@]})) || die "backend list is empty"
 ((${#profilers[@]})) || die "profiler list is empty"
 ((${#seq_lens[@]})) || die "sequence length list is empty"
+((${#expert_policies[@]})) || die "expert policy list is empty"
 [[ -f "${RUN_LF_SCRIPT}" ]] || die "missing ${RUN_LF_SCRIPT}"
 [[ -f "${SOURCE_POSTPROCESS_SCRIPT}" ]] || die "missing ${SOURCE_POSTPROCESS_SCRIPT}"
 [[ -f "${NSYS_POSTPROCESS_SCRIPT}" ]] || die "missing ${NSYS_POSTPROCESS_SCRIPT}"
@@ -307,17 +315,18 @@ run_job() {
   local recompute="$3"
   local seq_len="$4"
   local gpu="$5"
+  local expert_policy="$6"
   local gradient_checkpointing=false
   [[ "${recompute}" == "recomp" ]] && gradient_checkpointing=true
 
   local config_root job_root seq_root source_profile lf_out log_file run_id profile_json
   config_root="$(config_root_path "${seq_len}")"
-  job_root="$(job_root_path "${config_root}" "${backend}" "${profiler}" "${recompute}")"
+  job_root="$(job_root_path "${config_root}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}")"
   seq_root="${job_root}/s${seq_len}"
   source_profile="${seq_root}/source_profile.json"
   lf_out="${seq_root}/lf_run"
   log_file="${seq_root}/train.log"
-  run_id="lf_${backend}_${profiler}_${recompute}_s${seq_len}"
+  run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_s${seq_len}"
   profile_json="${seq_root}/profile.json"
 
   plot_roots["${config_root}"]="${seq_len}"
@@ -326,10 +335,10 @@ run_job() {
     echo "Skipping existing: ${profile_json}"
     mkdir -p "${config_root}"
     if [[ ! -e "${config_root}/jobs.tsv" ]]; then
-      printf 'status\tgpu\tseq_len\trecompute\tbackend\tprofiler\tjob_dir\tprofile_json\tlog\n' > "${config_root}/jobs.tsv"
+      printf 'status\tgpu\tseq_len\trecompute\texpert_policy\tbackend\tprofiler\tjob_dir\tprofile_json\tlog\n' > "${config_root}/jobs.tsv"
     fi
-    printf 'skipped\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "${gpu}" "${seq_len}" "${recompute}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}" \
+    printf 'skipped\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}" \
       >> "${config_root}/jobs.tsv"
     return 0
   fi
@@ -368,6 +377,7 @@ run_job() {
     GRADIENT_CHECKPOINTING="${gradient_checkpointing}"
     ASYM_PRECISION="${PRECISION}"
     ASYM_OFFLOAD_MODULES="${ASYM_OFFLOAD_MODULES}"
+    ASYM_EXPERT_RECOMPUTE_POLICY="${expert_policy}"
     ASYM_STRICT="${ASYM_STRICT}"
     PROFILE=1
     PROFILE_PROFILER="${profiler}"
@@ -375,7 +385,7 @@ run_job() {
     PROFILE_NSYS_PREFIX="${seq_root}/trace"
     PROFILE_WORKLOAD_LABEL="${workload_label}"
     PROFILE_BACKEND_LABEL="${backend}"
-    PROFILE_EXPERT_POLICY="none"
+    PROFILE_EXPERT_POLICY="${expert_policy}"
     OUT_DIR="${lf_out}"
     LOG_FILE="${log_file}"
     LOSS_LOG_COPY="${seq_root}/loss.trainer_log.jsonl"
@@ -384,7 +394,7 @@ run_job() {
 
   local -a run_cmd=(env "${run_env[@]}" "${RUN_LF_SCRIPT}")
 
-  echo "Running backend=${backend} profiler=${profiler} recompute=${recompute} seq=${seq_len} gpu=${gpu}"
+  echo "Running backend=${backend} profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} seq=${seq_len} gpu=${gpu}"
   echo "  dir=${seq_root}"
   if [[ "${DRY_RUN}" == "true" ]]; then
     print_command "${run_cmd[@]}"
@@ -393,7 +403,7 @@ run_job() {
 
   mkdir -p "${seq_root}"
   if [[ ! -e "${config_root}/jobs.tsv" ]]; then
-    printf 'status\tgpu\tseq_len\trecompute\tbackend\tprofiler\tjob_dir\tprofile_json\tlog\n' > "${config_root}/jobs.tsv"
+    printf 'status\tgpu\tseq_len\trecompute\texpert_policy\tbackend\tprofiler\tjob_dir\tprofile_json\tlog\n' > "${config_root}/jobs.tsv"
   fi
   {
     print_command "${run_cmd[@]}"
@@ -423,29 +433,31 @@ run_job() {
   fi
 
   if ((status == 0)); then
-    printf 'ok\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "${gpu}" "${seq_len}" "${recompute}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}" \
+    printf 'ok\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}" \
       >> "${config_root}/jobs.tsv"
   else
-    printf 'failed:%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "${status}" "${gpu}" "${seq_len}" "${recompute}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}" \
+    printf 'failed:%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${status}" "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}" \
       >> "${config_root}/jobs.tsv"
   fi
   return "${status}"
 }
 
-for recompute in "${recompute_modes[@]}"; do
-  for seq_len in "${seq_lens[@]}"; do
-    for backend in "${backends[@]}"; do
-      for profiler in "${profilers[@]}"; do
-        gpu="${gpus[$((job_index % ${#gpus[@]}))]}"
-        job_index=$((job_index + 1))
-        if ! run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}"; then
-          failures=$((failures + 1))
-          if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
-            exit 1
+for expert_policy in "${expert_policies[@]}"; do
+  for recompute in "${recompute_modes[@]}"; do
+    for seq_len in "${seq_lens[@]}"; do
+      for backend in "${backends[@]}"; do
+        for profiler in "${profilers[@]}"; do
+          gpu="${gpus[$((job_index % ${#gpus[@]}))]}"
+          job_index=$((job_index + 1))
+          if ! run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}" "${expert_policy}"; then
+            failures=$((failures + 1))
+            if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
+              exit 1
+            fi
           fi
-        fi
+        done
       done
     done
   done
@@ -477,7 +489,7 @@ if [[ "${PLOT}" == "true" ]]; then
       --skip-combined
       --batch-size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
       --seq-lens "${seq_len}"
-      --expert-recompute-policies none
+      --expert-recompute-policies "${expert_policies[@]}"
     )
     for backend in "${backends[@]}"; do plot_cmd+=(--backend "${backend}"); done
     for profiler in "${profilers[@]}"; do plot_cmd+=(--profiler "${profiler}"); done
@@ -502,7 +514,7 @@ if [[ "${PLOT}" == "true" ]]; then
     --combined-only
     --batch-size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
     --seq-lens "${seq_lens[@]}"
-    --expert-recompute-policies none
+    --expert-recompute-policies "${expert_policies[@]}"
   )
   for workload in "${!combined_workloads[@]}"; do combined_plot_cmd+=(--workload "${workload}"); done
   for backend in "${backends[@]}"; do combined_plot_cmd+=(--backend "${backend}"); done

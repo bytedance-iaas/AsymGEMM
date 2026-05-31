@@ -31,7 +31,9 @@ GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
 
 ASYM_PRECISION=${ASYM_PRECISION:-bf16}
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
+ASYM_EXPERT_RECOMPUTE_POLICY=${ASYM_EXPERT_RECOMPUTE_POLICY:-none}
 ASYM_STRICT=${ASYM_STRICT:-true}
+CHECK_ASYM_CALLS=${CHECK_ASYM_CALLS:-1}
 
 PROFILE=${PROFILE:-0}
 PROFILE_PROFILER=${PROFILE_PROFILER:-source} # source | nsys
@@ -40,7 +42,7 @@ PROFILE_SOURCE_JSON=${PROFILE_SOURCE_JSON:-}
 PROFILE_NSYS_PREFIX=${PROFILE_NSYS_PREFIX:-}
 PROFILE_WORKLOAD_LABEL=${PROFILE_WORKLOAD_LABEL:-}
 PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-}
-PROFILE_EXPERT_POLICY=${PROFILE_EXPERT_POLICY:-none}
+PROFILE_EXPERT_POLICY=${PROFILE_EXPERT_POLICY:-${ASYM_EXPERT_RECOMPUTE_POLICY}}
 
 # =============================================================================
 # Derived Parameters
@@ -49,8 +51,9 @@ ASYM_DIR=${ASYM_DIR:-${ROOT}}
 ENV_DIR=${ENV_DIR:-${LF_DIR}/.venv}
 ENV_PYTHON=${ENV_PYTHON:-${ENV_DIR}/bin/python}
 MODEL_TAG=$(basename "${MODEL_NAME_OR_PATH}" | tr '/:' '__')
+EXPERT_POLICY_TAG=$(printf '%s' "${ASYM_EXPERT_RECOMPUTE_POLICY}" | tr '/:' '__' | tr -c '[:alnum:]_-' '_')
 RUN_TS=$(date -u +%Y%m%dT%H%M%SZ)
-DEFAULT_RUN_ID="${RUN_TS}_${MODEL_TAG}_${BACKEND}_${ASYM_PRECISION}_ctx${CUTOFF_LEN}_bs${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_r${LORA_RANK}_a${LORA_ALPHA}_steps${MAX_STEPS}_offload${ASYM_OFFLOAD_MODULES}"
+DEFAULT_RUN_ID="${RUN_TS}_${MODEL_TAG}_${BACKEND}_${ASYM_PRECISION}_ctx${CUTOFF_LEN}_bs${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_r${LORA_RANK}_a${LORA_ALPHA}_steps${MAX_STEPS}_offload${ASYM_OFFLOAD_MODULES}_pol${EXPERT_POLICY_TAG}"
 RUN_ID=${RUN_ID:-${DEFAULT_RUN_ID}}
 OUT_DIR=${OUT_DIR:-${LF_DIR}/saves/asymgemm_smoke/${RUN_ID}}
 LOG_FILE=${LOG_FILE:-${OUT_DIR}/train_${RUN_ID}.log}
@@ -68,6 +71,11 @@ fi
 
 if [[ "${PROFILE}" != "0" && "${PROFILE}" != "1" ]]; then
   echo "PROFILE must be 0 or 1" >&2
+  exit 2
+fi
+
+if [[ "${CHECK_ASYM_CALLS}" != "0" && "${CHECK_ASYM_CALLS}" != "1" ]]; then
+  echo "CHECK_ASYM_CALLS must be 0 or 1" >&2
   exit 2
 fi
 
@@ -177,13 +185,16 @@ esac
 if [[ "${BACKEND}" == "asym_torch" ]]; then
   CMD+=(--use_asym_gemm true --asym_backend torch --asym_precision "${ASYM_PRECISION}")
   CMD+=(--asym_offload_modules "${ASYM_OFFLOAD_MODULES}" --asym_strict "${ASYM_STRICT}")
+  CMD+=(--asym_expert_recompute_policy "${ASYM_EXPERT_RECOMPUTE_POLICY}")
 elif [[ "${BACKEND}" == "asym" ]]; then
   CMD+=(--use_asym_gemm true --asym_backend asym --asym_precision "${ASYM_PRECISION}")
   CMD+=(--asym_offload_modules "${ASYM_OFFLOAD_MODULES}" --asym_strict "${ASYM_STRICT}")
+  CMD+=(--asym_expert_recompute_policy "${ASYM_EXPERT_RECOMPUTE_POLICY}")
 fi
 
 echo "RUN_ID=${RUN_ID}" | tee "${LOG_FILE}"
 echo "OUT_DIR=${OUT_DIR}" | tee -a "${LOG_FILE}"
+echo "ASYM_EXPERT_RECOMPUTE_POLICY=${ASYM_EXPERT_RECOMPUTE_POLICY}" | tee -a "${LOG_FILE}"
 echo "PROFILE=${PROFILE}" | tee -a "${LOG_FILE}"
 if [[ "${PROFILE}" == "1" ]]; then
   echo "PROFILE_PROFILER=${PROFILE_PROFILER}" | tee -a "${LOG_FILE}"
@@ -198,7 +209,7 @@ RUN_ENV=(
 if [[ "${BACKEND}" == "hf" ]]; then
   :
 else
-  RUN_ENV+=(USE_ASYM_GEMM=1)
+  RUN_ENV+=(USE_ASYM_GEMM=1 ASYM_GEMM_LF_LOG_RUNTIME_STATS=1)
 fi
 
 if [[ "${PROFILE}" == "1" ]]; then
@@ -227,6 +238,34 @@ if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "nsys" ]]; then
     "${CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"
 else
   env "${RUN_ENV[@]}" "${CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"
+fi
+
+if [[ "${BACKEND}" == "asym" && "${CHECK_ASYM_CALLS}" == "1" ]]; then
+  ASYM_CALL_CHECK_OUTPUT=$(python3 - "${LOG_FILE}" <<'PY'
+import re
+import sys
+
+log_file = sys.argv[1]
+text = open(log_file, encoding="utf-8").read()
+matches = list(
+    re.finditer(
+        r"AsymGEMM LoRA-SFT runtime: .*?asym_forward_calls=(\d+), asym_dx_calls=(\d+)",
+        text,
+    )
+)
+if not matches:
+    raise SystemExit(f"Missing AsymGEMM runtime call report in {log_file}")
+forward_calls = int(matches[-1].group(1))
+dx_calls = int(matches[-1].group(2))
+if forward_calls <= 0 or dx_calls <= 0:
+    raise SystemExit(
+        f"Expected positive AsymGEMM forward and dx calls, got "
+        f"asym_forward_calls={forward_calls} asym_dx_calls={dx_calls}"
+    )
+print(f"Verified AsymGEMM runtime calls: asym_forward_calls={forward_calls} asym_dx_calls={dx_calls}")
+PY
+  )
+  echo "${ASYM_CALL_CHECK_OUTPUT}" | tee -a "${LOG_FILE}"
 fi
 
 if [[ -f "${OUT_DIR}/trainer_log.jsonl" ]]; then

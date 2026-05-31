@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import socket
 import subprocess
 import sys
@@ -253,6 +254,12 @@ RouteMetadata = ContiguousRouteMetadata | MaskedRouteMetadata
 Routing = tuple[torch.Tensor, torch.Tensor]
 
 
+def _validate_route_range_on_device(topk_indices: torch.Tensor) -> bool:
+    if topk_indices.device.type != "cuda":
+        return True
+    return os.getenv("ASYM_GEMM_VALIDATE_ROUTES", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def make_dense_group_metadata(
     offsets: torch.Tensor,
     *,
@@ -282,10 +289,11 @@ def _validate_route_inputs(
         topk_indices = topk_indices.to(dtype=torch.long)
     if topk_indices.numel() == 0:
         raise ValueError("routing requires at least one route")
-    min_expert = int(topk_indices.min().item())
-    max_expert = int(topk_indices.max().item())
-    if min_expert < 0 or max_expert >= num_experts:
-        raise ValueError(f"expert id out of range [0, {num_experts}): min={min_expert}, max={max_expert}")
+    if _validate_route_range_on_device(topk_indices):
+        min_expert = int(topk_indices.min().item())
+        max_expert = int(topk_indices.max().item())
+        if min_expert < 0 or max_expert >= num_experts:
+            raise ValueError(f"expert id out of range [0, {num_experts}): min={min_expert}, max={max_expert}")
     if routing_weights is None:
         return torch.ones(topk_indices.shape, device=topk_indices.device, dtype=torch.float32)
     if routing_weights.shape != topk_indices.shape:
@@ -568,6 +576,102 @@ def expert_activation_drop_group_mask(
             return torch.zeros_like(active)
         return active & (counts_long <= token_threshold)
     return torch.zeros_like(active)
+
+
+@dataclass(frozen=True)
+class ExpertRecomputeConfig:
+    policy: Literal["none", "split", "tok"]
+    token_threshold: int
+    util_threshold: float
+    activation_save_policy: Literal["save_all", "tok_act"]
+    activation_save_threshold: int
+    label: str
+
+    @property
+    def recompute_enabled(self) -> bool:
+        return expert_recompute_policy_enabled(
+            self.policy,
+            token_threshold=self.token_threshold,
+            util_threshold=self.util_threshold,
+        )
+
+    @property
+    def activation_drop_enabled(self) -> bool:
+        return expert_activation_save_policy_enabled(
+            self.activation_save_policy,
+            token_threshold=self.activation_save_threshold,
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.recompute_enabled or self.activation_drop_enabled
+
+
+def parse_expert_recompute_policy_spec(spec: str | None) -> ExpertRecomputeConfig:
+    raw = "none" if spec is None else str(spec).strip().lower().replace("_", "-")
+    aliases = {
+        "": "none",
+        "0": "none",
+        "false": "none",
+        "off": "none",
+        "no": "none",
+        "n": "none",
+    }
+    raw = aliases.get(raw, raw)
+    if raw == "none":
+        return ExpertRecomputeConfig(
+            policy="none",
+            token_threshold=0,
+            util_threshold=0.0,
+            activation_save_policy="save_all",
+            activation_save_threshold=0,
+            label="none",
+        )
+
+    match = re.fullmatch(r"split([1-9][0-9]*)", raw)
+    if match:
+        threshold = int(match.group(1))
+        return ExpertRecomputeConfig(
+            policy="split",
+            token_threshold=threshold,
+            util_threshold=0.0,
+            activation_save_policy="save_all",
+            activation_save_threshold=0,
+            label=f"split{threshold}",
+        )
+
+    match = re.fullmatch(r"tok([1-9][0-9]*)-ckpt", raw)
+    if match:
+        threshold = int(match.group(1))
+        return ExpertRecomputeConfig(
+            policy="tok",
+            token_threshold=threshold,
+            util_threshold=0.0,
+            activation_save_policy="save_all",
+            activation_save_threshold=0,
+            label=f"tok{threshold}-ckpt",
+        )
+
+    match = re.fullmatch(r"tok([1-9][0-9]*)-act-ckpt", raw)
+    if match:
+        threshold = int(match.group(1))
+        return ExpertRecomputeConfig(
+            policy="none",
+            token_threshold=0,
+            util_threshold=0.0,
+            activation_save_policy="tok_act",
+            activation_save_threshold=threshold,
+            label=f"tok{threshold}-act-ckpt",
+        )
+
+    if re.fullmatch(r"tok[1-9][0-9]*", raw):
+        raise ValueError(
+            f"ambiguous expert recompute policy {spec!r}; use `tokN-ckpt` or `tokN-act-ckpt`"
+        )
+
+    raise ValueError(
+        f"unsupported expert recompute policy {spec!r}; expected none, splitN, tokN-ckpt, or tokN-act-ckpt"
+    )
 
 
 def pack_tokens_contiguous(hidden: torch.Tensor, metadata: ContiguousRouteMetadata) -> torch.Tensor:
@@ -3245,6 +3349,7 @@ MoEModel = MoE
 __all__ = [
     "AsymMoELayer",
     "ContiguousRouteMetadata",
+    "ExpertRecomputeConfig",
     "GroupedMode",
     "KTMoELayer",
     "MaskedRouteMetadata",
@@ -3260,8 +3365,12 @@ __all__ = [
     "VALID_MOE_BACKENDS",
     "expert_activation_drop_group_mask",
     "expert_activation_save_policy_enabled",
+    "expert_recompute_group_mask",
+    "expert_recompute_policy_enabled",
     "normalize_expert_activation_save_policy",
     "normalize_expert_activation_save_threshold",
+    "normalize_expert_recompute_policy",
+    "normalize_expert_recompute_threshold",
     "build_contiguous_route_metadata",
     "build_contiguous_metadata",
     "build_masked_route_metadata",
@@ -3285,6 +3394,7 @@ __all__ = [
     "max_abs_error",
     "pack_tokens_contiguous",
     "pack_tokens_masked",
+    "parse_expert_recompute_policy_spec",
     "restore_contiguous_route_order",
     "restore_masked_route_order",
     "route_metadata_summary",

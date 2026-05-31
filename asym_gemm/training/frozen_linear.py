@@ -109,6 +109,12 @@ class QuantizedHostWeight:
         return total
 
 
+@dataclass(frozen=True)
+class _GroupedPadding:
+    padded_rows: torch.Tensor
+    original_rows: torch.Tensor
+
+
 def _check_backend(backend: str) -> None:
     if backend not in VALID_BACKENDS:
         raise ValueError(f"unsupported backend={backend!r}; expected one of {VALID_BACKENDS}")
@@ -447,46 +453,61 @@ def _pad_grouped_input_for_asym(
     experts: torch.Tensor,
     *,
     block_m: int = 128,
-) -> tuple[torch.Tensor, torch.Tensor, tuple[list[int], list[int], list[int], list[int]] | None]:
+) -> tuple[torch.Tensor, torch.Tensor, _GroupedPadding | None]:
     if offsets.numel() != experts.numel():
         return a, offsets, None
 
-    offsets_cpu = offsets.detach().to(device="cpu", dtype=torch.long).tolist()
     num_groups = int(experts.numel() - 1)
-    starts = [int(offsets_cpu[i]) for i in range(num_groups)]
-    ends = [int(offsets_cpu[i + 1]) for i in range(num_groups)]
-    counts = [max(0, end - start) for start, end in zip(starts, ends)]
+    offsets_long = offsets.to(device=a.device, dtype=torch.long, non_blocking=True)
+    starts = offsets_long[:-1]
+    counts = (offsets_long[1:] - starts).clamp_min(0)
+    padded_counts = torch.div(counts + int(block_m) - 1, int(block_m), rounding_mode="floor") * int(block_m)
+    padded_offsets_long = torch.cat(
+        (
+            torch.zeros(1, device=a.device, dtype=torch.long),
+            torch.cumsum(padded_counts, dim=0),
+        ),
+        dim=0,
+    )
 
-    padded_offsets = [0]
-    for count in counts:
-        padded = ((count + block_m - 1) // block_m) * block_m if count > 0 else 0
-        padded_offsets.append(padded_offsets[-1] + padded)
-
-    if padded_offsets == offsets_cpu:
+    # PyTorch allocations still require a Python integer shape. Keep this to one
+    # scalar read instead of the previous full offsets D2H copy and Python loops.
+    total_padded = int(padded_offsets_long[-1].item())
+    if total_padded == int(a.shape[0]):
         return a, offsets, None
 
-    total_padded = int(padded_offsets[-1])
-    padded = a.new_zeros((total_padded, a.shape[1]))
-    for start, end, padded_start, count in zip(starts, ends, padded_offsets[:-1], counts):
-        if count > 0:
-            padded[padded_start : padded_start + count].copy_(a[start:end])
-    padded_offsets_t = torch.tensor(padded_offsets, device=a.device, dtype=offsets.dtype)
-    return padded, padded_offsets_t, (starts, ends, padded_offsets[:-1], counts)
+    padded_rows = torch.arange(total_padded, device=a.device, dtype=torch.long)
+    group_idx = torch.bucketize(padded_rows, padded_offsets_long[1:], right=True)
+    group_idx = group_idx.clamp_max(max(num_groups - 1, 0))
+    group_starts = starts.index_select(0, group_idx)
+    group_counts = counts.index_select(0, group_idx)
+    local_rows = padded_rows - padded_offsets_long.index_select(0, group_idx)
+    valid_rows = local_rows < group_counts
+    source_rows = group_starts + local_rows
+    safe_source_rows = torch.where(valid_rows, source_rows, torch.zeros_like(source_rows))
+    padded = a.index_select(0, safe_source_rows)
+    if padded.numel() > 0:
+        padded = padded * valid_rows.reshape(-1, *([1] * (padded.dim() - 1))).to(dtype=padded.dtype)
+
+    valid_padded_rows = torch.nonzero(valid_rows, as_tuple=False).flatten()
+    original_rows = source_rows.index_select(0, valid_padded_rows)
+    return (
+        padded,
+        padded_offsets_long.to(device=offsets.device, dtype=offsets.dtype),
+        _GroupedPadding(padded_rows=valid_padded_rows, original_rows=original_rows),
+    )
 
 
 def _unpad_grouped_output(
     padded: torch.Tensor,
-    unpad: tuple[list[int], list[int], list[int], list[int]] | None,
+    unpad: _GroupedPadding | None,
     *,
     output_m: int,
 ) -> torch.Tensor:
     if unpad is None:
         return padded
-    starts, ends, padded_starts, counts = unpad
     out = padded.new_empty((output_m, padded.shape[1]))
-    for start, end, padded_start, count in zip(starts, ends, padded_starts, counts):
-        if count > 0:
-            out[start:end].copy_(padded[padded_start : padded_start + count])
+    out.index_copy_(0, unpad.original_rows, padded.index_select(0, unpad.padded_rows))
     return out
 
 
@@ -820,6 +841,21 @@ def _torch_nt(a: torch.Tensor, b_cpu: torch.Tensor, *, transpose_b: bool = False
     return a @ b if transpose_b else a @ b.t()
 
 
+def _asym_unavailable_message(
+    *,
+    precision: str,
+    reason: str,
+    grouped: bool,
+    phase: str,
+    transpose_b: bool,
+) -> str:
+    grouped_label = "grouped " if grouped else ""
+    return (
+        f"direct {grouped_label}{precision.upper()} AsymGEMM is unavailable "
+        f"during phase={phase} transpose_b={transpose_b}: {reason}"
+    )
+
+
 def _torch_grouped_nt(
     a: torch.Tensor,
     b_cpu: torch.Tensor,
@@ -890,7 +926,15 @@ def _dispatch_nt(
         if stats is not None:
             stats.record_fallback(f"{phase}:{reason}")
         if backend == "asym":
-            raise RuntimeError(f"direct {precision.upper()} AsymGEMM is unavailable: {reason}")
+            raise RuntimeError(
+                _asym_unavailable_message(
+                    precision=precision,
+                    reason=reason,
+                    grouped=False,
+                    phase=phase,
+                    transpose_b=transpose_b,
+                )
+            )
 
     if stats is not None:
         if phase == "forward":
@@ -960,7 +1004,15 @@ def _dispatch_grouped_nt(
         if stats is not None:
             stats.record_fallback(f"{phase}:{reason}")
         if backend == "asym":
-            raise RuntimeError(f"direct grouped {precision.upper()} AsymGEMM is unavailable: {reason}")
+            raise RuntimeError(
+                _asym_unavailable_message(
+                    precision=precision,
+                    reason=reason,
+                    grouped=True,
+                    phase=phase,
+                    transpose_b=transpose_b,
+                )
+            )
 
     if stats is not None:
         if phase == "forward":
@@ -971,6 +1023,13 @@ def _dispatch_grouped_nt(
 
 
 class AsymFrozenLinearFunction(torch.autograd.Function):
+    """Autograd node for a CPU-resident frozen base linear.
+
+    Only the input and optional bias are differentiable. The host weight is
+    intentionally data, not a trainable parameter, so backward returns no weight
+    gradient and computes only dX with the configured backend.
+    """
+
     @staticmethod
     def forward(
         ctx: Any,
@@ -1121,6 +1180,13 @@ def frozen_linear(
 
 
 class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
+    """Autograd node for CPU-resident frozen grouped expert linears.
+
+    Route metadata and host weights are non-differentiable. Backward computes
+    only grouped dX; expert/base weights, offsets, and expert ids receive no
+    gradients.
+    """
+
     @staticmethod
     def forward(
         ctx: Any,
@@ -1143,6 +1209,8 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
             raise ValueError(f"grouped host weight must be 3D, got shape {tuple(host_weight.weight.shape)}")
         if x.shape[-1] != int(host_weight.weight.shape[2]):
             raise ValueError(f"expected input last dim {int(host_weight.weight.shape[2])}, got {x.shape[-1]}")
+        offsets = offsets.detach().contiguous()
+        experts = experts.detach().contiguous()
         input_shape = tuple(x.shape)
         x_2d = x.reshape(-1, int(host_weight.weight.shape[2])).contiguous()
         out_features = int(host_weight.weight.shape[1])
@@ -1302,7 +1370,16 @@ class AsymGroupedFrozenLinear(nn.Module):
     def weight(self) -> torch.Tensor:
         return self.host_weight.weight
 
-    def forward(self, x: torch.Tensor, offsets: torch.Tensor, experts: torch.Tensor, *, dense_experts: bool = False) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        *,
+        dense_experts: bool = False,
+        profile_name: str | None = None,
+    ) -> torch.Tensor:
+        effective_profile_name = self.profile_name if profile_name is None else profile_name
         return asym_grouped_frozen_linear(
             x,
             self.host_weight,
@@ -1311,7 +1388,7 @@ class AsymGroupedFrozenLinear(nn.Module):
             backend=self.backend,
             stats=self.stats,
             compiled_dims=self.compiled_dims,
-            profile_name=self.profile_name,
+            profile_name=effective_profile_name,
             precision=self.precision,
             dense_experts=dense_experts,
             bf16_output_dtype=self.bf16_output_dtype,
@@ -1454,8 +1531,17 @@ class TorchGroupedFrozenLinear(nn.Module):
     def gpu_resident_weight_bytes(self) -> int:
         return tensor_nbytes(self.weight)
 
-    def forward(self, x: torch.Tensor, offsets: torch.Tensor, experts: torch.Tensor, *, dense_experts: bool = False) -> torch.Tensor:
-        return TorchGroupedFrozenLinearFunction.apply(x, self.weight, offsets, experts, self.profile_name, dense_experts)
+    def forward(
+        self,
+        x: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        *,
+        dense_experts: bool = False,
+        profile_name: str | None = None,
+    ) -> torch.Tensor:
+        effective_profile_name = self.profile_name if profile_name is None else profile_name
+        return TorchGroupedFrozenLinearFunction.apply(x, self.weight, offsets, experts, effective_profile_name, dense_experts)
 
     def extra_repr(self) -> str:
         return (
@@ -1582,7 +1668,8 @@ class AsymFrozenLinear(nn.Module):
     def bias(self) -> Optional[torch.Tensor]:
         return self.bias_cpu
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, profile_name: str | None = None) -> torch.Tensor:
+        effective_profile_name = self.profile_name if profile_name is None else profile_name
         return asym_frozen_linear(
             x,
             self.host_weight,
@@ -1590,7 +1677,7 @@ class AsymFrozenLinear(nn.Module):
             backend=self.backend,
             stats=self.stats,
             compiled_dims=self.compiled_dims,
-            profile_name=self.profile_name,
+            profile_name=effective_profile_name,
             precision=self.precision,
             bf16_output_dtype=self.bf16_output_dtype,
         )

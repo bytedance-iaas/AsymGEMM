@@ -13,6 +13,7 @@ from typing import Any, Iterator
 
 import torch
 
+from asym_gemm.training.moe import parse_expert_recompute_policy_spec
 from asym_gemm.training.profile_ranges import prof_range, set_profile_enabled
 
 
@@ -89,6 +90,7 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
     max_steps = _safe_int(_option_value(args, "--max_steps"))
     asym_backend = _option_value(args, "--asym_backend")
     backend = os.environ.get("ASYM_GEMM_LF_CONFIG_BACKEND") or ("torch" if asym_backend == "torch" else asym_backend or "hf")
+    expert_policy = parse_expert_recompute_policy_spec(os.environ.get("ASYM_GEMM_LF_CONFIG_EXPERT_POLICY", "none"))
     config = {
         "workflow": "lora_lf_sft",
         "workload": os.environ.get("ASYM_GEMM_LF_CONFIG_WORKLOAD", model_label),
@@ -108,13 +110,13 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "lora_dropout": _safe_float(_option_value(args, "--lora_dropout")),
         "activation_recompute": os.environ.get("ASYM_GEMM_LF_CONFIG_ACTIVATION_RECOMPUTE", "false").lower()
         in {"1", "true", "yes", "on"},
-        "expert_recompute_policy_spec": os.environ.get("ASYM_GEMM_LF_CONFIG_EXPERT_POLICY", "none"),
-        "expert_recompute_policy": "none",
-        "expert_recompute_threshold": 0,
-        "expert_recompute_util_threshold": 0.0,
-        "expert_activation_save_policy": "save_all",
-        "expert_activation_save_threshold": 0,
-        "expert_policy_label": os.environ.get("ASYM_GEMM_LF_CONFIG_EXPERT_POLICY", "none"),
+        "expert_recompute_policy_spec": expert_policy.label,
+        "expert_recompute_policy": expert_policy.policy,
+        "expert_recompute_threshold": expert_policy.token_threshold,
+        "expert_recompute_util_threshold": expert_policy.util_threshold,
+        "expert_activation_save_policy": expert_policy.activation_save_policy,
+        "expert_activation_save_threshold": expert_policy.activation_save_threshold,
+        "expert_policy_label": expert_policy.label,
         "output_dir": _option_value(args, "--output_dir"),
     }
     for key, value in _env_config().items():

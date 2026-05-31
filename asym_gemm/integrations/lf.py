@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import atexit
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Literal
@@ -9,6 +11,7 @@ from torch import nn
 
 from asym_gemm.training.frozen_linear import AsymExecutionStats
 from asym_gemm.training.lora import TorchLoRALinear, freeze_non_lora_params, lora_parameters
+from asym_gemm.training.moe import parse_expert_recompute_policy_spec
 from asym_gemm.training.qwen3_moe import AsymQwen3Experts, is_qwen3_experts, wrap_qwen3_experts
 
 
@@ -19,7 +22,9 @@ class LFAsymReport:
     trainable_lora_params: int = 0
     cpu_resident_base_bytes: int = 0
     gpu_resident_base_bytes: int = 0
+    expert_recompute_policy: str = "none"
     skipped: list[str] = field(default_factory=list)
+    stats: AsymExecutionStats | None = field(default=None, repr=False)
 
     def to_log_string(self) -> str:
         skipped = "; ".join(self.skipped) if self.skipped else "none"
@@ -30,8 +35,41 @@ class LFAsymReport:
             f"trainable_lora_params={self.trainable_lora_params}, "
             f"cpu_resident_base_bytes={self.cpu_resident_base_bytes}, "
             f"gpu_resident_base_bytes={self.gpu_resident_base_bytes}, "
+            f"expert_recompute_policy={self.expert_recompute_policy}, "
             f"skipped={skipped}"
         )
+
+    def runtime_log_string(self) -> str:
+        if self.stats is None:
+            return "AsymGEMM LoRA-SFT runtime: stats=unavailable"
+        fallbacks = (
+            ";".join(f"{reason}:{count}" for reason, count in sorted(self.stats.fallback_reasons.items()))
+            if self.stats.fallback_reasons
+            else "none"
+        )
+        return (
+            "AsymGEMM LoRA-SFT runtime: "
+            f"asym_forward_calls={self.stats.asym_forward_calls}, "
+            f"asym_dx_calls={self.stats.asym_dx_calls}, "
+            f"torch_forward_calls={self.stats.torch_forward_calls}, "
+            f"torch_dx_calls={self.stats.torch_dx_calls}, "
+            f"expert_recompute_policy={self.expert_recompute_policy}, "
+            f"fallback_reasons={fallbacks}"
+        )
+
+
+def _env_true(value: str | None) -> bool:
+    return value is not None and value.lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _register_runtime_report(report: LFAsymReport) -> None:
+    if not _env_true(os.environ.get("ASYM_GEMM_LF_LOG_RUNTIME_STATS")):
+        return
+
+    def _emit() -> None:
+        print(report.runtime_log_string(), flush=True)
+
+    atexit.register(_emit)
 
 
 def _as_list(values: Sequence[str] | str | None) -> list[str]:
@@ -111,7 +149,8 @@ def apply_lf_asym_lora(
     backend: Literal["asym", "torch"],
     precision: Literal["bf16"],
     offload_modules: Literal["routed_experts", "none"],
-    strict: bool,
+    expert_recompute_policy: str = "none",
+    strict: bool = True,
 ) -> tuple[nn.Module, LFAsymReport]:
     if backend not in {"asym", "torch"}:
         raise ValueError("backend must be 'asym' or 'torch'")
@@ -120,8 +159,10 @@ def apply_lf_asym_lora(
     if offload_modules not in {"routed_experts", "none"}:
         raise ValueError("offload_modules must be 'routed_experts' or 'none'")
 
-    report = LFAsymReport()
+    recompute_config = parse_expert_recompute_policy_spec(expert_recompute_policy)
+    report = LFAsymReport(expert_recompute_policy=recompute_config.label)
     stats = AsymExecutionStats()
+    report.stats = stats
     wrap_experts = _targets_experts(raw_lora_target)
     offload_experts = backend == "asym" and offload_modules == "routed_experts"
 
@@ -138,6 +179,7 @@ def apply_lf_asym_lora(
                     lora_alpha=lora_alpha,
                     lora_dropout=lora_dropout,
                     lora_dtype=torch.bfloat16,
+                    expert_recompute_policy=recompute_config.label,
                     stats=stats,
                     strict=strict,
                 )
@@ -197,6 +239,7 @@ def apply_lf_asym_lora(
     report.trainable_lora_params = sum(param.numel() for param in lora_parameters(model))
     if report.trainable_lora_params == 0 and strict:
         raise ValueError("AsymGEMM setup produced zero trainable LoRA parameters.")
+    _register_runtime_report(report)
     return model, report
 
 

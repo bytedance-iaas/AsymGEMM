@@ -48,6 +48,27 @@ def _relative_max_diff(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a_f - b_f).abs().max().item() / denom)
 
 
+def test_grouped_asym_padding_and_unpadding_preserve_rows_cpu() -> None:
+    x = torch.arange(10 * 3, dtype=torch.float32).reshape(10, 3)
+    offsets = torch.tensor([0, 3, 3, 10], dtype=torch.long)
+    experts = torch.tensor([0, 1, 2, -1], dtype=torch.long)
+
+    padded, padded_offsets, unpad = frozen_linear_impl._pad_grouped_input_for_asym(
+        x,
+        offsets,
+        experts,
+        block_m=4,
+    )
+
+    assert padded_offsets.tolist() == [0, 4, 4, 12]
+    assert padded.shape == (12, 3)
+    assert unpad is not None
+    restored = frozen_linear_impl._unpad_grouped_output(padded, unpad, output_m=x.shape[0])
+    torch.testing.assert_close(restored, x)
+    torch.testing.assert_close(padded[3], torch.zeros_like(padded[3]))
+    torch.testing.assert_close(padded[4:11], x[3:10])
+
+
 def _expand_last_dim_scales(scales: torch.Tensor, cols: int, gran_k: int) -> torch.Tensor:
     return scales.float().repeat_interleave(gran_k, dim=-1)[..., :cols]
 
@@ -816,13 +837,40 @@ def test_bf16_asym_backend_raises_when_direct_kernel_is_unavailable_cuda() -> No
     ok, reason = can_use_direct_bf16(x, host_weight)
     assert not ok and reason == "requires_8_aligned_nk"
 
-    with pytest.raises(RuntimeError, match="direct BF16 AsymGEMM is unavailable: requires_8_aligned_nk"):
+    with pytest.raises(
+        RuntimeError,
+        match="direct BF16 AsymGEMM is unavailable during phase=forward transpose_b=False: requires_8_aligned_nk",
+    ):
         asym_frozen_linear(x, host_weight, bias=bias, backend="asym", stats=stats)
 
     assert stats.asym_calls == 0
     assert stats.torch_calls == 0
     assert stats.fallback_reasons == {"forward:requires_8_aligned_nk": 1}
     assert host_weight.weight.device.type == "cpu"
+
+
+@pytest.mark.skipif(not _direct_bf16_available(), reason="direct grouped BF16 AsymGEMM requires SM90/SM100")
+def test_bf16_grouped_asym_dx_error_includes_backward_phase_cuda() -> None:
+    torch.manual_seed(7)
+    x = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(2, 16, 64, dtype=torch.bfloat16)
+    stats = AsymExecutionStats()
+    grouped = AsymGroupedFrozenLinear(weight, backend="asym", pin_memory=True, stats=stats)
+    offsets = torch.tensor([0, 64, 128], device="cuda", dtype=torch.long)
+    experts = torch.tensor([0, 1, -1], device="cuda", dtype=torch.long)
+
+    y = grouped(x, offsets, experts)
+    assert stats.asym_forward_calls == 1
+
+    with pytest.raises(
+        RuntimeError,
+        match="direct grouped BF16 AsymGEMM is unavailable during phase=dx transpose_b=True: transpose_b_requires_64_aligned_k",
+    ):
+        y.float().sum().backward()
+
+    assert stats.asym_dx_calls == 0
+    assert stats.fallback_reasons == {"dx:transpose_b_requires_64_aligned_k": 1}
+    assert grouped.host_weight.weight.grad is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for module.to('cuda') residency check")
