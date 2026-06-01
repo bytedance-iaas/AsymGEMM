@@ -25,7 +25,7 @@ import json
 import re
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 def _table_exists(con: sqlite3.Connection, name: str) -> bool:
@@ -301,6 +301,30 @@ def _operation_kernel_class_rows(
     ]
 
 
+def _clip_intervals(intervals: Iterable[tuple[int, int]], start: int, end: int) -> list[tuple[int, int]]:
+    clipped: list[tuple[int, int]] = []
+    for interval_start, interval_end in intervals:
+        clipped_start = max(start, int(interval_start))
+        clipped_end = min(end, int(interval_end))
+        if clipped_end > clipped_start:
+            clipped.append((clipped_start, clipped_end))
+    return clipped
+
+
+def _clip_kernel_events(kernel_events: Iterable[dict[str, Any]], start: int, end: int) -> list[dict[str, Any]]:
+    clipped: list[dict[str, Any]] = []
+    for event in kernel_events:
+        clipped_start = max(start, int(event["start"]))
+        clipped_end = min(end, int(event["end"]))
+        if clipped_end <= clipped_start:
+            continue
+        row = dict(event)
+        row["start"] = clipped_start
+        row["end"] = clipped_end
+        clipped.append(row)
+    return clipped
+
+
 def _runtime_operation_map(
     runtime: list[tuple[int, int, int]],
     ranges: list[tuple[int, int, str]],
@@ -376,13 +400,17 @@ def _semantic_operation_scope(op: str) -> str:
     projection = _projection_scope(op)
     if projection:
         return f"{expert}{projection}".strip()
+    if "feed_forward.experts" in op or "feed forward experts" in op:
+        return "routed expert"
+    if "feed_forward" in op or "feed forward" in op:
+        return "MLP"
     if ".fc1." in op or op.endswith(".fc1"):
         return "fc1"
     if ".fc2." in op or op.endswith(".fc2"):
         return "fc2"
     if ".matrix." in op or op.endswith(".matrix"):
         return "matrix"
-    if "attention" in op:
+    if _is_attention_scope(op):
         return f"attention {_attention_scope(op)}"
     if "lm_head" in op:
         return "LM-head"
@@ -431,6 +459,17 @@ def _kernel_family(kernel: str) -> str:
     return "other CUDA"
 
 
+def _top_level_kernel_bucket(operation: str, kernel_class: str, stage_name: str) -> tuple[str, str] | None:
+    if operation != stage_name:
+        return None
+    stage = "backward" if stage_name == "step.backward" else "forward"
+    family = _kernel_family(kernel_class).lower().replace("/", "_").replace(" ", "_")
+    label_family = _kernel_family(kernel_class)
+    key = f"top_level_unscoped.{stage}.{family}"
+    label = f"top-level {stage} {label_family} kernels (unscoped)"
+    return key, label
+
+
 def _gap_operation_bucket(operation: str, stage_name: str) -> str:
     op = operation.lower()
     if operation == stage_name:
@@ -442,6 +481,9 @@ def _gap_operation_bucket(operation: str, stage_name: str) -> str:
     projection = _projection_scope(op)
     scope = _semantic_operation_scope(op)
 
+    if "route_metadata" in op:
+        label = "route metadata LoRA" if "lora" in op else "route metadata"
+        return label
     if "lora" in op:
         return _scoped_label(scope or f"{expert}{projection}".strip(), "LoRA")
     if "grouped_base_dx_asymgemm" in op or "base_dx_asymgemm" in op:
@@ -450,12 +492,10 @@ def _gap_operation_bucket(operation: str, stage_name: str) -> str:
         return _scoped_label(scope or f"{expert}{projection}".strip(), "base AsymGEMM")
     if "activation_silu" in op or "silu_mul" in op:
         return f"{expert}activation/silu".strip()
-    if "attention" in op:
+    if _is_attention_scope(op):
         return f"attention {_attention_scope(op)}"
     if "router" in op:
         return "router"
-    if "route_metadata" in op:
-        return "route metadata"
     if "pack_tokens" in op:
         return "pack tokens"
     if "scatter_combine" in op:
@@ -477,7 +517,7 @@ def _top_level_gap_operation_bucket(row: dict[str, Any], stage_name: str) -> str
     prev_kernel = _display_kernel_name(str(row["previous_kernel"]))
     next_kernel = _display_kernel_name(str(row["next_kernel"]))
     stage = "backward" if stage_name == "step.backward" else "forward"
-    return f"{stage} unlabeled kernel chain ({prev_kernel} -> {next_kernel})"
+    return f"{stage} top-level host/runtime gap ({prev_kernel} -> {next_kernel})"
 
 
 def _stage_direction(stage_name: str) -> str:
@@ -513,7 +553,7 @@ def _compact_no_kernel_gap_rows(
         else:
             misc_ms += ms
     if misc_ms > 0.0:
-        compacted["No-kernel misc small gaps"] = misc_ms
+        compacted["No-kernel misc small gaps"] = compacted.get("No-kernel misc small gaps", 0.0) + misc_ms
 
     return [
         {
@@ -560,6 +600,10 @@ def _no_kernel_gap_attribution_rows(
 
 
 def _semantic_kernel_bucket(operation: str, kernel_class: str, stage_name: str) -> str:
+    top_level = _top_level_kernel_bucket(operation, kernel_class, stage_name)
+    if top_level is not None:
+        return top_level[1]
+
     op = operation.lower()
     kernel = kernel_class.lower()
 
@@ -581,10 +625,14 @@ def _semantic_kernel_bucket(operation: str, kernel_class: str, stage_name: str) 
     if "activation_silu" in op or "silu_mul" in op:
         return f"{expert}activation/silu kernels".strip()
 
+    if "route_metadata" in op:
+        label = f"route metadata LoRA torch {family} kernels" if "lora" in op else f"route metadata torch {family} kernels"
+        return label
+
     if "lora" in op:
         return _scoped_label(scope or f"{expert}{projection}".strip(), f"LoRA torch {family} kernels")
 
-    if "attention" in op:
+    if _is_attention_scope(op):
         return _scoped_label(scope, f"torch {family} kernels")
 
     if "lm_head" in op:
@@ -592,9 +640,6 @@ def _semantic_kernel_bucket(operation: str, kernel_class: str, stage_name: str) 
 
     if "router" in op:
         return f"router torch {family} kernels"
-
-    if "route_metadata" in op:
-        return f"route metadata torch {family} kernels"
 
     if "pack_tokens" in op:
         return f"pack tokens torch {family} kernels"
@@ -606,7 +651,7 @@ def _semantic_kernel_bucket(operation: str, kernel_class: str, stage_name: str) 
         return f"{expert}{projection}base support torch {family} kernels".strip()
 
     if "gemm kernel" in kernel:
-        if "attention" in op:
+        if _is_attention_scope(op):
             return _scoped_label(scope, "torch GEMM kernels")
         if "lm_head" in op:
             return "LM-head torch GEMM kernels"
@@ -633,6 +678,11 @@ def _semantic_stage_summary(stage: dict[str, Any]) -> list[dict[str, Any]]:
     for row in stage["operation_kernel_classes"]["rows"]:
         bucket = _semantic_kernel_bucket(str(row["operation"]), str(row["kernel_class"]), str(stage["stage"]))
         buckets[bucket] += float(row["milliseconds"])
+
+    raw_kernel_ms = sum(ms for ms in buckets.values() if ms > 0.0)
+    if raw_kernel_ms > kernel_busy_ms > 0.0:
+        scale = kernel_busy_ms / raw_kernel_ms
+        buckets = defaultdict(float, {name: ms * scale for name, ms in buckets.items()})
 
     explicit = {name: ms for name, ms in buckets.items() if name != "other CUDA kernels" and ms > 0.0}
     explicit_ms = sum(explicit.values())
@@ -718,7 +768,7 @@ def _source_step_rows_by_step(source_profile: dict[str, Any]) -> dict[int, dict[
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            step = _safe_int(row.get("step"))
+            step = _safe_int(row.get("raw_step", row.get("step")))
             if step is not None:
                 by_step[step] = row
 
@@ -728,22 +778,42 @@ def _source_step_rows_by_step(source_profile: dict[str, Any]) -> dict[int, dict[
         for loss_row in losses:
             if not isinstance(loss_row, dict):
                 continue
-            step = _safe_int(loss_row.get("step"))
+            step = _safe_int(loss_row.get("raw_step", loss_row.get("step")))
             if step is None or loss_row.get("loss") is None:
                 continue
             by_step.setdefault(step, {"step": step})["loss"] = loss_row.get("loss")
     return by_step
 
 
+def _source_warmup_steps(source_profile: dict[str, Any]) -> int:
+    config = source_profile.get("config", {})
+    step_samples = source_profile.get("step_samples", {})
+    value = None
+    if isinstance(step_samples, dict):
+        value = step_samples.get("warmup_steps")
+    if value is None and isinstance(config, dict):
+        value = config.get("warmup_steps")
+    return max(_safe_int(value) or 0, 0)
+
+
+def _source_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
 def _stage_timing_sample(con: sqlite3.Connection, start: int, end: int) -> dict[str, Any]:
     total_ms = _ms(end - start)
     runtime = _runtime_rows(con, start, end)
     runtime_corr = {corr for _, _, corr in runtime if corr is not None}
-    kernel_intervals = _correlated_intervals(con, "CUPTI_ACTIVITY_KIND_KERNEL", runtime_corr)
-    memcpy_intervals = _correlated_intervals(con, "CUPTI_ACTIVITY_KIND_MEMCPY", runtime_corr)
+    kernel_intervals = _clip_intervals(_correlated_intervals(con, "CUPTI_ACTIVITY_KIND_KERNEL", runtime_corr), start, end)
+    memcpy_intervals = _clip_intervals(_correlated_intervals(con, "CUPTI_ACTIVITY_KIND_MEMCPY", runtime_corr), start, end)
     sync_intervals = _sync_intervals(con, start, end)
     kernel_ms = _ms(_interval_union(kernel_intervals))
     memcpy_ms = _ms(_interval_union(memcpy_intervals))
+    no_kernel_ms = _ms((end - start) - _interval_union(_merged_intervals(kernel_intervals + memcpy_intervals)))
     runtime_ms = _ms(sum(runtime_end - runtime_start for runtime_start, runtime_end, _ in runtime))
     sync_ms = _ms(sum(sync_end - sync_start for sync_start, sync_end in sync_intervals))
     return {
@@ -752,7 +822,7 @@ def _stage_timing_sample(con: sqlite3.Connection, start: int, end: int) -> dict[
         "cuda_memcpy_milliseconds": memcpy_ms,
         "cuda_runtime_api_milliseconds": runtime_ms,
         "cuda_synchronization_api_milliseconds": sync_ms,
-        "gpu_no_kernel_milliseconds": max(0.0, total_ms - kernel_ms - memcpy_ms),
+        "gpu_no_kernel_milliseconds": max(0.0, no_kernel_ms),
     }
 
 
@@ -959,22 +1029,22 @@ def _no_kernel_gaps(
     return rows
 
 
-def summarize_stage(con: sqlite3.Connection, stage_name: str) -> dict[str, Any]:
-    start, end = _last_step(con, stage_name)
+def _summarize_stage_range(con: sqlite3.Connection, stage_name: str, start: int, end: int) -> dict[str, Any]:
     total_ms = _ms(end - start)
     runtime = _runtime_rows(con, start, end)
     runtime_corr = {corr for _, _, corr in runtime if corr is not None}
-    kernel_intervals = _correlated_intervals(con, "CUPTI_ACTIVITY_KIND_KERNEL", runtime_corr)
-    memcpy_intervals = _correlated_intervals(con, "CUPTI_ACTIVITY_KIND_MEMCPY", runtime_corr)
+    kernel_intervals = _clip_intervals(_correlated_intervals(con, "CUPTI_ACTIVITY_KIND_KERNEL", runtime_corr), start, end)
+    memcpy_intervals = _clip_intervals(_correlated_intervals(con, "CUPTI_ACTIVITY_KIND_MEMCPY", runtime_corr), start, end)
     sync_intervals = _sync_intervals(con, start, end)
     sync_ns = sum(sync_end - sync_start for sync_start, sync_end in sync_intervals)
-    kernel_events = _kernel_events(con, runtime_corr)
+    kernel_events = _clip_kernel_events(_kernel_events(con, runtime_corr), start, end)
 
     kernel_ms = _ms(_interval_union(kernel_intervals))
     memcpy_ms = _ms(_interval_union(memcpy_intervals))
     runtime_ms = _ms(sum(e - s for s, e, _ in runtime))
     sync_ms = _ms(sync_ns)
-    gpu_idle_or_no_kernel_ms = max(0.0, total_ms - kernel_ms - memcpy_ms)
+    busy_union_ms = _ms(_interval_union(_merged_intervals(kernel_intervals + memcpy_intervals)))
+    gpu_idle_or_no_kernel_ms = max(0.0, total_ms - busy_union_ms)
 
     prefix = stage_name.replace("step.", "") + ".%"
     op_kernel: dict[str, float] = defaultdict(float)
@@ -1070,10 +1140,112 @@ def summarize_stage(con: sqlite3.Connection, stage_name: str) -> dict[str, Any]:
     return summary
 
 
+def _average_named_rows(summaries: list[dict[str, Any]], section: str, total_ms: float) -> dict[str, Any]:
+    values: dict[str, float] = defaultdict(float)
+    samples = float(len(summaries))
+    for summary in summaries:
+        value = summary.get(section, {})
+        rows = value.get("rows", []) if isinstance(value, dict) else value
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, dict) and row.get("name"):
+                values[str(row["name"])] += float(row.get("milliseconds") or 0.0) / samples
+    return {"total_milliseconds": total_ms, "rows": _rows(values, total_ms)}
+
+
+def _average_operation_kernel_class_rows(summaries: list[dict[str, Any]], total_ms: float) -> dict[str, Any]:
+    values: dict[tuple[str, str], float] = defaultdict(float)
+    samples = float(len(summaries))
+    for summary in summaries:
+        rows = summary.get("operation_kernel_classes", {}).get("rows", [])
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            operation = str(row.get("operation", ""))
+            kernel_class = str(row.get("kernel_class", ""))
+            if operation and kernel_class:
+                values[(operation, kernel_class)] += float(row.get("milliseconds") or 0.0) / samples
+    rows = [
+        {
+            "operation": operation,
+            "kernel_class": kernel_class,
+            "milliseconds": milliseconds,
+            "percent": _percent(milliseconds, total_ms),
+        }
+        for (operation, kernel_class), milliseconds in sorted(values.items(), key=lambda item: item[1], reverse=True)
+        if milliseconds > 0.0
+    ]
+    return {"total_milliseconds": total_ms, "rows": rows}
+
+
+def _average_no_kernel_gap_rows(summaries: list[dict[str, Any]], total_ms: float, no_kernel_ms: float) -> dict[str, Any]:
+    values: dict[str, float] = defaultdict(float)
+    samples = float(len(summaries))
+    for summary in summaries:
+        rows = summary.get("gpu_no_kernel_gap_attribution", {}).get("rows", [])
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, dict) and row.get("name"):
+                values[str(row["name"])] += float(row.get("milliseconds") or 0.0) / samples
+    return {
+        "total_milliseconds": no_kernel_ms,
+        "rows": _compact_no_kernel_gap_rows(values, total_ms=total_ms, no_kernel_ms=no_kernel_ms),
+    }
+
+
+def summarize_stage(con: sqlite3.Connection, stage_name: str, source_profile: dict[str, Any] | None = None) -> dict[str, Any]:
+    ranges = _all_steps(con, stage_name)
+    warmup_steps = _source_warmup_steps(source_profile or {})
+    measured_ranges = ranges[min(warmup_steps, len(ranges)) :]
+    if not measured_ranges:
+        measured_ranges = ranges[-1:] if ranges else []
+    if not measured_ranges:
+        raise RuntimeError(f"missing NVTX range {stage_name!r}")
+
+    summaries = [_summarize_stage_range(con, stage_name, start, end) for start, end in measured_ranges]
+    samples = float(len(summaries))
+    total_ms = sum(float(summary.get("total_milliseconds") or 0.0) for summary in summaries) / samples
+    stage_breakdown = _average_named_rows(summaries, "stage_breakdown", total_ms)
+    no_kernel_ms = 0.0
+    for row in stage_breakdown["rows"]:
+        if row.get("name") == "gpu_no_kernel_time":
+            no_kernel_ms = float(row.get("milliseconds") or 0.0)
+            break
+    summary = {
+        "stage": stage_name,
+        "total_milliseconds": total_ms,
+        "sampled_steps": len(measured_ranges),
+        "warmup_steps_skipped": min(warmup_steps, len(ranges)),
+        "raw_step_start": min(warmup_steps, len(ranges)) + 1,
+        "raw_step_end": min(warmup_steps, len(ranges)) + len(measured_ranges),
+        "stage_breakdown": stage_breakdown,
+        "host_api_breakdown": _average_named_rows(summaries, "host_api_breakdown", total_ms),
+        "operation_kernel_time": _average_named_rows(summaries, "operation_kernel_time", total_ms),
+        "operation_kernel_classes": _average_operation_kernel_class_rows(summaries, total_ms),
+        "operation_cuda_api_time": _average_named_rows(summaries, "operation_cuda_api_time", total_ms),
+        "top_kernels": _average_named_rows(summaries, "top_kernels", total_ms),
+        "gpu_no_kernel_gap_attribution": _average_no_kernel_gap_rows(summaries, total_ms, no_kernel_ms),
+        "gpu_no_kernel_gaps": {
+            "total_milliseconds": no_kernel_ms,
+            "rows": [],
+        },
+    }
+    summary["semantic_stage_summary"] = {
+        "total_milliseconds": total_ms,
+        "rows": _semantic_stage_summary(summary),
+    }
+    return summary
+
+
 def summarize_step_samples(con: sqlite3.Connection, source_profile: dict[str, Any]) -> dict[str, Any]:
     forward_ranges = _all_steps(con, "step.forward")
     backward_ranges = _all_steps(con, "step.backward")
     source_rows = _source_step_rows_by_step(source_profile)
+    warmup_steps = _source_warmup_steps(source_profile)
     sample_count = max(len(forward_ranges), len(backward_ranges), len(source_rows))
     rows: list[dict[str, Any]] = []
 
@@ -1086,8 +1258,18 @@ def summarize_step_samples(con: sqlite3.Connection, source_profile: dict[str, An
         row[f"{prefix}_gpu_no_kernel_milliseconds"] = timing["gpu_no_kernel_milliseconds"]
 
     for index in range(sample_count):
-        step = index + 1
-        row: dict[str, Any] = {"step": step}
+        raw_step = index + 1
+        source_row = source_rows.get(raw_step, {})
+        measured_step = _safe_int(source_row.get("measured_step")) if isinstance(source_row, dict) else None
+        if measured_step is None:
+            measured_step = max(raw_step - warmup_steps, 0)
+        is_warmup = _source_bool(source_row.get("is_warmup")) if isinstance(source_row, dict) else raw_step <= warmup_steps
+        row: dict[str, Any] = {
+            "step": measured_step if measured_step > 0 else raw_step,
+            "raw_step": raw_step,
+            "measured_step": measured_step,
+            "is_warmup": is_warmup,
+        }
         forward_start = forward_end = backward_start = backward_end = None
         forward_ms = backward_ms = 0.0
 
@@ -1108,10 +1290,9 @@ def summarize_step_samples(con: sqlite3.Connection, source_profile: dict[str, An
         if range_starts and range_ends:
             row["wall_milliseconds"] = _ms(max(range_ends) - min(range_starts))
 
-        source_row = source_rows.get(step, {})
         if isinstance(source_row, dict):
             for key, value in source_row.items():
-                if key == "step":
+                if key in {"step", "raw_step", "measured_step", "is_warmup"}:
                     continue
                 if key == "loss" or key.endswith("_bytes"):
                     row[key] = value
@@ -1121,6 +1302,8 @@ def summarize_step_samples(con: sqlite3.Connection, source_profile: dict[str, An
 
     return {
         "source": "nsys_nvtx_step_ranges",
+        "warmup_steps": warmup_steps,
+        "measure_steps": max(sample_count - warmup_steps, 0),
         "forward_ranges": len(forward_ranges),
         "backward_ranges": len(backward_ranges),
         "rows": rows,
@@ -1171,6 +1354,11 @@ def _compact_semantic_text(text: str) -> str:
     return compact
 
 
+def _is_attention_scope(text: str) -> bool:
+    normalized = text.lower().replace("_", " ")
+    return "attention" in normalized or "self attn" in normalized
+
+
 def _semantic_projection(compact: str) -> str:
     patterns = [
         ("q proj", "q_proj"),
@@ -1201,7 +1389,7 @@ def _semantic_projection(compact: str) -> str:
 
 
 def _semantic_operation(compact: str) -> str:
-    if "attention" in compact and (
+    if _is_attention_scope(compact) and (
         "base asymgemm" in compact or "base frozen asymgemm" in compact or "base dx asymgemm" in compact
     ):
         return "base_torch"
@@ -1217,6 +1405,10 @@ def _semantic_operation(compact: str) -> str:
         return "add_cast_scale"
     if "base lora add" in compact:
         return "base_lora_add"
+    if "route metadata" in compact and "lora" in compact:
+        return "route_metadata_lora"
+    if "route metadata" in compact:
+        return "route_metadata"
     if "lora a" in compact:
         return "lora_A"
     if "lora b" in compact:
@@ -1238,7 +1430,6 @@ def _semantic_operation(compact: str) -> str:
         ("softmax", "softmax"),
         ("layernorm", "layernorm"),
         ("residual add", "residual_add"),
-        ("route metadata", "route_metadata"),
         ("pack tokens", "pack_tokens"),
         ("scatter combine", "scatter_combine"),
         ("combine shared routed", "combine_shared_routed"),
@@ -1280,7 +1471,7 @@ def _semantic_leaf_key(text: str, *, stage_name: str | None = None) -> str:
             parts.append(operation)
         return ".".join(parts)
 
-    if "attention" in compact:
+    if _is_attention_scope(compact):
         parts = ["attention"]
         if projection:
             parts.append(projection)
@@ -1288,7 +1479,15 @@ def _semantic_leaf_key(text: str, *, stage_name: str | None = None) -> str:
             parts.append(operation)
         return ".".join(parts)
 
-    if "mlp" in compact or projection in {"gate_proj", "up_proj", "down_proj"}:
+    if "feed forward experts" in compact:
+        parts = ["routed_expert"]
+        if projection:
+            parts.append(projection)
+        if operation and operation != projection:
+            parts.append(operation)
+        return ".".join(parts)
+
+    if "mlp" in compact or "feed forward" in compact or projection in {"gate_proj", "up_proj", "down_proj"}:
         parts = ["mlp"]
         if projection:
             parts.append(projection)
@@ -1369,6 +1568,7 @@ def _semantic_leaf_label(key: str) -> str:
         "layernorm": "LayerNorm",
         "residual_add": "residual add",
         "route_metadata": "route metadata",
+        "route_metadata_lora": "route metadata LoRA",
         "pack_tokens": "pack tokens",
         "scatter_combine": "scatter/combine",
         "combine_shared_routed": "combine shared+routed",
@@ -1436,11 +1636,33 @@ def _semantic_timing_memory_rows(report: dict[str, Any]) -> list[dict[str, Any]]
             continue
         stage_name = str(stage.get("stage", ""))
         prefix = "backward" if stage_name == "step.backward" else "forward"
-        for row in stage.get("operation_kernel_classes", {}).get("rows", []):
-            key = _semantic_leaf_key(str(row.get("operation", "")), stage_name=stage_name)
-            entry = _summary_entry(rows, key)
-            entry[f"{prefix}_gpu_ms"] += float(row.get("milliseconds", 0.0))
-            entry["kernel_classes"].add(str(row.get("kernel_class", "-")))
+        kernel_rows = stage.get("operation_kernel_classes", {}).get("rows", [])
+        raw_kernel_ms = sum(float(row.get("milliseconds", 0.0)) for row in kernel_rows if isinstance(row, dict))
+        kernel_busy_ms = _stage_breakdown_ms(stage, "cuda_kernel_busy_union")
+        kernel_scale = (kernel_busy_ms / raw_kernel_ms) if raw_kernel_ms > kernel_busy_ms > 0.0 else 1.0
+        scaled_kernel_ms = 0.0
+        for row in kernel_rows:
+            if not isinstance(row, dict):
+                continue
+            operation = str(row.get("operation", ""))
+            kernel_class = str(row.get("kernel_class", "-"))
+            top_level = _top_level_kernel_bucket(operation, kernel_class, stage_name)
+            if top_level is None:
+                key = _semantic_leaf_key(operation, stage_name=stage_name)
+                label = None
+            else:
+                key, label = top_level
+            entry = _summary_entry(rows, key, label)
+            milliseconds = float(row.get("milliseconds", 0.0)) * kernel_scale
+            entry[f"{prefix}_gpu_ms"] += milliseconds
+            scaled_kernel_ms += milliseconds
+            entry["kernel_classes"].add(kernel_class)
+
+        other_kernel_ms = max(0.0, kernel_busy_ms - scaled_kernel_ms)
+        if other_kernel_ms > 0.0:
+            entry = _summary_entry(rows, "cuda.other_cuda", "other CUDA kernels")
+            entry[f"{prefix}_gpu_ms"] += other_kernel_ms
+            entry["kernel_classes"].add("Other CUDA kernel")
 
         memcpy_ms = _stage_breakdown_ms(stage, "cuda_memcpy_union")
         if memcpy_ms > 0.0:
@@ -1536,6 +1758,8 @@ def _timing_summary_markdown(report: dict[str, Any], stage_name: str, title: str
         f"## {title} Timing Summary",
         "",
         f"Total: `{float(stage['total_milliseconds']):.4f} ms`",
+        f"Averaged measured raw steps: `{stage.get('raw_step_start', '-')}`-`{stage.get('raw_step_end', '-')}` "
+        f"(`{stage.get('sampled_steps', '-')}` samples, `{stage.get('warmup_steps_skipped', 0)}` warmup skipped)",
         "",
         "| Semantic op | GPU ms | no-kernel gap ms | total ms | % stage | Kernel classes |",
         "|---|---:|---:|---:|---:|---|",
@@ -1802,6 +2026,32 @@ def _memory_attribution_markdown(profile: dict[str, Any]) -> list[str]:
         ]
     categories = attribution.get("categories", {}) if isinstance(attribution.get("categories", {}), dict) else {}
     category_rows = categories.get("rows") if isinstance(categories, dict) else None
+    if not isinstance(category_rows, list) or not category_rows:
+        flat_rows = attribution.get("rows")
+        if isinstance(flat_rows, list):
+            category_rows = []
+            for row in flat_rows:
+                if not isinstance(row, dict):
+                    continue
+                device = str(row.get("device", "")).lower()
+                category = str(row.get("category", ""))
+                if device.startswith("cuda") or device == "gpu":
+                    memory_space = "GPU HBM"
+                elif "pinned" in category.lower() or "pinned" in device:
+                    memory_space = "CPU pinned"
+                elif device == "cpu":
+                    memory_space = "CPU host"
+                else:
+                    memory_space = str(row.get("memory_space", "-"))
+                category_rows.append(
+                    {
+                        "category": category or "-",
+                        "component": row.get("component", "-"),
+                        "memory_space": memory_space,
+                        "bytes": row.get("bytes", 0),
+                        "accuracy": row.get("accuracy", "tensor-size accounting"),
+                    }
+                )
     lines = [
         "## Fine-Grained Memory Attribution",
         "",
@@ -1816,7 +2066,12 @@ def _memory_attribution_markdown(profile: dict[str, Any]) -> list[str]:
             gpu_peak_hbm = sum(int(row.get("bytes", 0)) for row in category_rows if row.get("memory_space") == "GPU HBM")
         if gpu_peak_hbm > 0:
             lines.extend([f"Percent denominator: memory-attribution pass peak HBM `{gpu_peak_hbm}` bytes.", ""])
-        lines.extend(["| Category | Memory space | bytes | MiB | % peak HBM | Accuracy |", "|---|---|---:|---:|---:|---|"])
+        lines.extend(
+            [
+                "| Category | Component | Memory space | bytes | MiB | % peak HBM | Accuracy |",
+                "|---|---|---|---:|---:|---:|---|",
+            ]
+        )
         for row in sorted(category_rows, key=lambda item: int(item.get("bytes", 0)), reverse=True):
             value = int(row.get("bytes", 0))
             if value <= 0:
@@ -1824,7 +2079,7 @@ def _memory_attribution_markdown(profile: dict[str, Any]) -> list[str]:
             memory_space = row.get("memory_space", "-")
             gpu_percent = f"{_percent(value, gpu_peak_hbm):.2f}%" if memory_space == "GPU HBM" else "-"
             lines.append(
-                f"| {row.get('category', '-')} | {memory_space} | "
+                f"| {row.get('category', '-')} | {row.get('component', '-')} | {memory_space} | "
                 f"{value} | {_fmt_mib(value)} | {gpu_percent} | {row.get('accuracy', '-')} |"
             )
         lines.append("")
@@ -1836,10 +2091,13 @@ def _memory_attribution_markdown(profile: dict[str, Any]) -> list[str]:
 
     saved = attribution.get("saved_activations", {}) if isinstance(attribution.get("saved_activations", {}), dict) else {}
     saved_rows = saved.get("rows") if isinstance(saved, dict) else None
+    if not isinstance(saved_rows, list) or not saved_rows:
+        saved = attribution.get("saved_tensors", {}) if isinstance(attribution.get("saved_tensors", {}), dict) else {}
+        saved_rows = saved.get("by_owner") if isinstance(saved, dict) else None
     if isinstance(saved_rows, list) and saved_rows:
-        saved_total_unique = int(saved.get("total_unique_bytes", 0))
+        saved_total_unique = int(saved.get("total_unique_bytes", 0) or 0)
         if saved_total_unique <= 0:
-            saved_total_unique = sum(int(row.get("unique_bytes", 0)) for row in saved_rows)
+            saved_total_unique = sum(int(row.get("unique_bytes", row.get("bytes", 0))) for row in saved_rows)
         lines.extend(
             [
                 "## Saved Activation Memory by Semantic Owner",
@@ -1850,16 +2108,17 @@ def _memory_attribution_markdown(profile: dict[str, Any]) -> list[str]:
                 "|---|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
-        for row in sorted(saved_rows, key=lambda item: int(item.get("unique_bytes", 0)), reverse=True):
-            unique = int(row.get("unique_bytes", 0))
+        for row in sorted(saved_rows, key=lambda item: int(item.get("unique_bytes", item.get("bytes", 0))), reverse=True):
+            unique = int(row.get("unique_bytes", row.get("bytes", 0)))
             if unique <= 0:
                 continue
-            refs = int(row.get("reference_bytes", 0))
+            refs = int(row.get("reference_bytes", row.get("bytes", 0)))
             owner = _semantic_leaf_key(str(row.get("owner", "-")))
             lines.append(
                 f"| {owner} | {unique} | {_fmt_mib(unique)} | "
                 f"{_percent(unique, saved_total_unique):.2f}% | "
-                f"{refs} | {_fmt_mib(refs)} | {int(row.get('save_count', 0))} | {int(row.get('unique_tensor_count', 0))} |"
+                f"{refs} | {_fmt_mib(refs)} | {int(row.get('save_count', row.get('references', 0)))} | "
+                f"{int(row.get('unique_tensor_count', 0))} |"
             )
         lines.append("")
     elif not bool(attribution.get("enabled", False)):
@@ -2093,13 +2352,21 @@ def main() -> None:
         "source": str(args.sqlite_path),
         "source_profile": source_profile,
         "memory_profile": memory_profile,
-        "stages": [summarize_stage(con, "step.forward"), summarize_stage(con, "step.backward")],
+        "stages": [
+            summarize_stage(con, "step.forward", source_profile),
+            summarize_stage(con, "step.backward", source_profile),
+        ],
         "step_samples": summarize_step_samples(con, source_profile),
     }
     if args.output_json:
         args.output_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if args.output_md:
-        args.output_md.write_text(markdown(report), encoding="utf-8")
+        summary_text = markdown(report)
+        args.output_md.write_text(summary_text, encoding="utf-8")
+        for sibling_name in ("summary.md", "table.md"):
+            sibling = args.output_md.with_name(sibling_name)
+            if sibling != args.output_md:
+                sibling.write_text(summary_text, encoding="utf-8")
         args.output_md.with_name("lat.md").write_text(latency_markdown(report), encoding="utf-8")
         args.output_md.with_name("memory.md").write_text(memory_markdown(report), encoding="utf-8")
     artifact_dir = args.output_json.parent if args.output_json else args.output_md.parent if args.output_md else None

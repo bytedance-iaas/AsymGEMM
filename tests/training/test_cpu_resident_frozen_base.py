@@ -490,7 +490,7 @@ def test_transpose_capability_check_uses_original_weight_without_copy() -> None:
 def test_direct_bf16_forward_and_dx_match_torch() -> None:
     torch.manual_seed(1)
     m = 17
-    n = 24
+    n = 64
     k = 16
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     x_ref = x.detach().clone().requires_grad_(True)
@@ -849,6 +849,28 @@ def test_bf16_asym_backend_raises_when_direct_kernel_is_unavailable_cuda() -> No
     assert host_weight.weight.device.type == "cpu"
 
 
+@pytest.mark.skipif(not _direct_bf16_available(), reason="direct BF16 AsymGEMM requires SM90/SM100")
+def test_bf16_dense_asym_dx_error_includes_backward_phase_cuda() -> None:
+    torch.manual_seed(7)
+    x = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(16, 64, dtype=torch.bfloat16)
+    stats = AsymExecutionStats()
+    layer = AsymFrozenLinear(weight, backend="asym", pin_memory=True, stats=stats)
+
+    y = layer(x)
+    assert stats.asym_forward_calls == 1
+
+    with pytest.raises(
+        RuntimeError,
+        match="direct BF16 AsymGEMM is unavailable during phase=dx transpose_b=True: transpose_b_requires_64_aligned_k",
+    ):
+        y.float().sum().backward()
+
+    assert stats.asym_dx_calls == 0
+    assert stats.fallback_reasons == {"dx:transpose_b_requires_64_aligned_k": 1}
+    assert layer.host_weight.weight.grad is None
+
+
 @pytest.mark.skipif(not _direct_bf16_available(), reason="direct grouped BF16 AsymGEMM requires SM90/SM100")
 def test_bf16_grouped_asym_dx_error_includes_backward_phase_cuda() -> None:
     torch.manual_seed(7)
@@ -871,6 +893,66 @@ def test_bf16_grouped_asym_dx_error_includes_backward_phase_cuda() -> None:
     assert stats.asym_dx_calls == 0
     assert stats.fallback_reasons == {"dx:transpose_b_requires_64_aligned_k": 1}
     assert grouped.host_weight.weight.grad is None
+
+
+@pytest.mark.skipif(not _direct_bf16_available(), reason="direct BF16 AsymGEMM requires SM90/SM100")
+def test_bf16_dense_asym_output_dtype_float32_cuda() -> None:
+    torch.manual_seed(8)
+    x = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight = torch.randn(64, 64, dtype=torch.bfloat16)
+    stats = AsymExecutionStats()
+    layer = AsymFrozenLinear(
+        weight,
+        backend="asym",
+        pin_memory=True,
+        stats=stats,
+        bf16_output_dtype=torch.float32,
+    )
+
+    y = layer(x)
+    expected = x_ref.float() @ weight.cuda().float().t()
+
+    assert y.dtype == torch.float32
+    torch.testing.assert_close(y, expected, atol=5e-2, rtol=5e-2)
+    y.square().mean().backward()
+    expected.square().mean().backward()
+    assert x.grad is not None
+    torch.testing.assert_close(x.grad.float(), x_ref.grad.float(), atol=5e-2, rtol=5e-2)
+    assert stats.asym_forward_calls == 1
+    assert stats.asym_dx_calls == 1
+
+
+@pytest.mark.skipif(not _direct_bf16_available(), reason="direct grouped BF16 AsymGEMM requires SM90/SM100")
+def test_bf16_grouped_asym_output_dtype_float32_cuda() -> None:
+    torch.manual_seed(9)
+    x = torch.randn(256, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight = torch.randn(2, 64, 64, dtype=torch.bfloat16)
+    stats = AsymExecutionStats()
+    grouped = AsymGroupedFrozenLinear(
+        weight,
+        backend="asym",
+        pin_memory=True,
+        stats=stats,
+        bf16_output_dtype=torch.float32,
+    )
+    offsets = torch.tensor([0, 128, 256], device="cuda", dtype=torch.long)
+    experts = torch.tensor([0, 1, -1], device="cuda", dtype=torch.long)
+
+    y = grouped(x, offsets, experts)
+    expected = torch.empty_like(y)
+    expected[:128] = x_ref[:128].float() @ weight[0].cuda().float().t()
+    expected[128:] = x_ref[128:].float() @ weight[1].cuda().float().t()
+
+    assert y.dtype == torch.float32
+    torch.testing.assert_close(y, expected, atol=5e-2, rtol=5e-2)
+    y.square().mean().backward()
+    expected.square().mean().backward()
+    assert x.grad is not None
+    torch.testing.assert_close(x.grad.float(), x_ref.grad.float(), atol=5e-2, rtol=5e-2)
+    assert stats.asym_forward_calls == 1
+    assert stats.asym_dx_calls == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for module.to('cuda') residency check")

@@ -60,6 +60,8 @@ from .moe import (
     run_moe_memory_comparison,
 )
 from .qwen3_moe import AsymQwen3Experts, Qwen3ExpertReport, is_qwen3_experts, wrap_qwen3_experts
+from .llama4_moe import AsymLlama4Moe, Llama4MoeReport, is_llama4_moe, wrap_llama4_moe
+from .packed_moe import AsymPackedExperts, PackedExpertSource, PackedMoELayout, wrap_packed_experts
 
 FrozenLinear = AsymFrozenLinear
 DenseConfig = DenseLLMConfig
@@ -77,11 +79,14 @@ __all__ = [
     "AsymGroupedFrozenLinearFunction",
     "AsymLoRALinear",
     "AsymMLP",
+    "AsymLlama4Moe",
+    "AsymPackedExperts",
     "AsymQwen3Experts",
     "FrozenLinear",
     "GroupedLoRAMetadata",
     "HostWeight",
     "HostWeightMetadata",
+    "Llama4MoeReport",
     "MICRO_DENSE_LLM_CONFIG",
     "MICRO_MOE_CONFIG",
     "SHOWCASE_DENSE_LLM_CONFIG",
@@ -94,6 +99,8 @@ __all__ = [
     "MoE",
     "MoEModel",
     "PackedExpertLoRA",
+    "PackedExpertSource",
+    "PackedMoELayout",
     "Qwen3ExpertReport",
     "TorchLoRALinear",
     "TorchMLP",
@@ -115,6 +122,7 @@ __all__ = [
     "grouped_expert_lora",
     "grouped_expert_lora_pair",
     "is_qwen3_experts",
+    "is_llama4_moe",
     "load_lora_state_dict",
     "load_peft_adapter",
     "lora_parameters",
@@ -132,4 +140,6 @@ __all__ = [
     "prepare_grouped_lora_metadata",
     "tensor_nbytes",
     "wrap_qwen3_experts",
+    "wrap_llama4_moe",
+    "wrap_packed_experts",
 ]

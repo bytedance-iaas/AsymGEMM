@@ -291,6 +291,8 @@ def _direct_bf16_reason(a: torch.Tensor, b_cpu: torch.Tensor, *, transpose_b: bo
         return "requires_positive_nk"
     if n % 8 != 0 or k % 8 != 0:
         return "requires_8_aligned_nk"
+    if transpose_b and k % 64 != 0:
+        return "transpose_b_requires_64_aligned_k"
 
     import asym_gemm
 
@@ -550,7 +552,7 @@ def _asym_bf16_nt(
     asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous(
         a, b_group, d, offsets, experts, 2, compiled_dims, transpose_b
     )
-    return d if d.dtype == torch.bfloat16 else d.to(dtype=torch.bfloat16)
+    return d
 
 
 def _asym_grouped_bf16_nt(
@@ -578,7 +580,7 @@ def _asym_grouped_bf16_nt(
         a_kernel, b_cpu, d, offsets_i32, experts_i32, list_size, compiled_dims, transpose_b
     )
     d = _unpad_grouped_output(d, unpad, output_m=m)
-    return d if d.dtype == torch.bfloat16 else d.to(dtype=torch.bfloat16)
+    return d
 
 
 def _quantize_activation_for_precision(
@@ -1080,6 +1082,7 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
         ctx.bias_device = bias.device if bias is not None else None
         ctx.bias_dtype = bias.dtype if bias is not None else None
         ctx.input_shape = input_shape
+        ctx.input_dtype = x.dtype
         return y.reshape(*input_shape[:-1], host_weight.out_features)
 
     @staticmethod
@@ -1090,6 +1093,8 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
         grad_x = None
         if ctx.needs_input_grad[0]:
             grad_output_2d = grad_output.reshape(-1, ctx.host_weight.out_features).contiguous()
+            if ctx.precision == "bf16" and ctx.backend != "torch" and grad_output_2d.dtype != ctx.host_weight.weight.dtype:
+                grad_output_2d = grad_output_2d.to(dtype=ctx.host_weight.weight.dtype)
             quantized_weight_t = (
                 _get_quantized_host_weight(ctx.host_weight, ctx.precision, transpose=True)
                 if ctx.backend != "torch" and ctx.precision != "bf16"
@@ -1107,7 +1112,7 @@ class AsymFrozenLinearFunction(torch.autograd.Function):
                     precision=ctx.precision,
                     quantized_weight=quantized_weight_t,
                     profile_label=ctx.profile_backward_range,
-                    bf16_output_dtype=ctx.bf16_output_dtype,
+                    bf16_output_dtype=ctx.input_dtype if ctx.precision == "bf16" else ctx.bf16_output_dtype,
                 )
             grad_x = grad_x.reshape(ctx.input_shape)
 
@@ -1248,6 +1253,7 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
         ctx.profile_backward_range = backward_range
         ctx.profile_enabled = is_profile_enabled()
         ctx.input_shape = input_shape
+        ctx.input_dtype = x.dtype
         return y.reshape(*input_shape[:-1], out_features)
 
     @staticmethod
@@ -1258,6 +1264,8 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
         grad_x = None
         if ctx.needs_input_grad[0]:
             grad_output_2d = grad_output.reshape(-1, int(ctx.host_weight.weight.shape[1])).contiguous()
+            if ctx.precision == "bf16" and ctx.backend != "torch" and grad_output_2d.dtype != ctx.host_weight.weight.dtype:
+                grad_output_2d = grad_output_2d.to(dtype=ctx.host_weight.weight.dtype)
             if ctx.precision == "bf16":
                 b_cpu = ctx.host_weight.weight
                 transpose_b = True
@@ -1284,7 +1292,7 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
                     precision=ctx.precision,
                     quantized_weight=quantized_weight_t,
                     dense_experts=ctx.dense_experts,
-                    bf16_output_dtype=ctx.bf16_output_dtype,
+                    bf16_output_dtype=ctx.input_dtype if ctx.precision == "bf16" else ctx.bf16_output_dtype,
                 )
             grad_x = grad_x.reshape(ctx.input_shape)
         return grad_x, None, None, None, None, None, None, None, None, None, None, None

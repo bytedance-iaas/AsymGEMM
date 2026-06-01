@@ -428,27 +428,12 @@ def normalize_expert_recompute_threshold(value: int | None) -> int:
     return threshold
 
 
-EXPERT_RECOMPUTE_TILE_ROWS = 128
-VALID_EXPERT_RECOMPUTE_POLICIES = ("none", "split", "tok", "util", "tok_util")
+VALID_EXPERT_RECOMPUTE_POLICIES = ("none", "tok")
 VALID_EXPERT_ACTIVATION_SAVE_POLICIES = ("save_all", "all_act", "tok_act")
 
 
 def normalize_expert_recompute_policy(value: str | None) -> str:
-    policy = str(value or "tok").strip().lower().replace("-", "_")
-    aliases = {
-        "off": "none",
-        "false": "none",
-        "0": "none",
-        "token": "tok",
-        "tokens": "tok",
-        "threshold": "tok",
-        "split_control": "split",
-        "split-control": "split",
-        "tokutil": "tok_util",
-        "token_util": "tok_util",
-        "tokens_util": "tok_util",
-    }
-    policy = aliases.get(policy, policy)
+    policy = "none" if value is None else str(value).strip()
     if policy not in VALID_EXPERT_RECOMPUTE_POLICIES:
         raise ValueError(
             f"expert_recompute_policy must be one of {VALID_EXPERT_RECOMPUTE_POLICIES}, got {value!r}"
@@ -456,81 +441,67 @@ def normalize_expert_recompute_policy(value: str | None) -> str:
     return policy
 
 
-def normalize_expert_recompute_util_threshold(value: float | None) -> float:
-    threshold = float(value or 0.0)
-    if threshold < 0.0 or threshold > 1.0:
-        raise ValueError(f"expert_recompute_util_threshold must be in [0, 1], got {value}")
-    return threshold
-
-
 def expert_recompute_policy_enabled(
     policy: str,
     *,
     token_threshold: int = 0,
-    util_threshold: float = 0.0,
+    token_min: int = 1,
+    token_max: int | None = None,
 ) -> bool:
     normalized = normalize_expert_recompute_policy(policy)
     token_threshold = normalize_expert_recompute_threshold(token_threshold)
-    util_threshold = normalize_expert_recompute_util_threshold(util_threshold)
+    token_min = normalize_expert_recompute_threshold(token_min)
+    token_max = None if token_max is None else normalize_expert_recompute_threshold(token_max)
     if normalized == "none":
         return False
-    if normalized in {"split", "tok"}:
-        return token_threshold > 0
-    if normalized == "util":
-        return util_threshold > 0.0
-    if normalized == "tok_util":
-        return token_threshold > 0 and util_threshold > 0.0
+    if normalized == "tok":
+        return token_threshold > 0 or token_max is not None or token_min > 1
     return False
+
+
+def expert_token_range_mask(
+    counts: torch.Tensor,
+    *,
+    token_min: int = 1,
+    token_max: int | None = None,
+) -> torch.Tensor:
+    token_min = normalize_expert_recompute_threshold(token_min)
+    token_max = None if token_max is None else normalize_expert_recompute_threshold(token_max)
+    if token_max is not None and token_min > token_max:
+        raise ValueError(f"token_min must be <= token_max, got token_min={token_min} token_max={token_max}")
+    counts_long = counts.to(dtype=torch.long)
+    active = counts_long > 0
+    mask = active & (counts_long >= max(1, token_min))
+    if token_max is not None:
+        mask = mask & (counts_long <= token_max)
+    return mask
 
 
 def expert_recompute_group_mask(
     counts: torch.Tensor,
     *,
-    policy: str = "tok",
+    policy: str = "none",
     token_threshold: int = 0,
-    util_threshold: float = 0.0,
-    tile_rows: int = EXPERT_RECOMPUTE_TILE_ROWS,
+    token_min: int = 1,
+    token_max: int | None = None,
 ) -> torch.Tensor:
-    if tile_rows <= 0:
-        raise ValueError(f"tile_rows must be positive, got {tile_rows}")
     policy = normalize_expert_recompute_policy(policy)
     token_threshold = normalize_expert_recompute_threshold(token_threshold)
-    util_threshold = normalize_expert_recompute_util_threshold(util_threshold)
+    if token_max is None and token_threshold > 0:
+        token_max = token_threshold
     counts_long = counts.to(dtype=torch.long)
     active = counts_long > 0
     if policy == "none":
         return torch.zeros_like(active)
-    recompute = active
-    if policy in {"split", "tok", "tok_util"}:
-        if token_threshold <= 0:
+    if policy == "tok":
+        if token_max is None and token_threshold <= 0 and token_min <= 1:
             return torch.zeros_like(active)
-        recompute = recompute & (counts_long <= token_threshold)
-    if policy in {"util", "tok_util"}:
-        if util_threshold <= 0.0:
-            return torch.zeros_like(active)
-        paid_rows = ((counts_long + tile_rows - 1) // tile_rows) * tile_rows
-        util = counts_long.to(dtype=torch.float32) / paid_rows.clamp_min(1).to(dtype=torch.float32)
-        recompute = recompute & (util >= util_threshold)
-    return recompute
+        return expert_token_range_mask(counts_long, token_min=token_min, token_max=token_max)
+    return active
 
 
 def normalize_expert_activation_save_policy(value: str | None) -> str:
-    policy = str(value or "save_all").strip().lower().replace("-", "_")
-    aliases = {
-        "all": "save_all",
-        "none": "save_all",
-        "off": "save_all",
-        "false": "save_all",
-        "0": "save_all",
-        "drop_activated": "all_act",
-        "drop_act": "all_act",
-        "act": "all_act",
-        "allact": "all_act",
-        "tokact": "tok_act",
-        "token_act": "tok_act",
-        "tokens_act": "tok_act",
-    }
-    policy = aliases.get(policy, policy)
+    policy = "save_all" if value is None else str(value).strip()
     if policy not in VALID_EXPERT_ACTIVATION_SAVE_POLICIES:
         raise ValueError(
             f"expert_activation_save_policy must be one of {VALID_EXPERT_ACTIVATION_SAVE_POLICIES}, got {value!r}"
@@ -545,15 +516,23 @@ def normalize_expert_activation_save_threshold(value: int | None) -> int:
     return threshold
 
 
-def expert_activation_save_policy_enabled(policy: str, *, token_threshold: int = 0) -> bool:
+def expert_activation_save_policy_enabled(
+    policy: str,
+    *,
+    token_threshold: int = 0,
+    token_min: int = 1,
+    token_max: int | None = None,
+) -> bool:
     normalized = normalize_expert_activation_save_policy(policy)
     token_threshold = normalize_expert_activation_save_threshold(token_threshold)
+    token_min = normalize_expert_activation_save_threshold(token_min)
+    token_max = None if token_max is None else normalize_expert_activation_save_threshold(token_max)
     if normalized == "save_all":
         return False
     if normalized == "all_act":
         return True
     if normalized == "tok_act":
-        return token_threshold > 0
+        return token_threshold > 0 or token_max is not None or token_min > 1
     return False
 
 
@@ -562,9 +541,13 @@ def expert_activation_drop_group_mask(
     *,
     policy: str = "save_all",
     token_threshold: int = 0,
+    token_min: int = 1,
+    token_max: int | None = None,
 ) -> torch.Tensor:
     policy = normalize_expert_activation_save_policy(policy)
     token_threshold = normalize_expert_activation_save_threshold(token_threshold)
+    if token_max is None and token_threshold > 0:
+        token_max = token_threshold
     counts_long = counts.to(dtype=torch.long)
     active = counts_long > 0
     if policy == "save_all":
@@ -572,27 +555,32 @@ def expert_activation_drop_group_mask(
     if policy == "all_act":
         return active
     if policy == "tok_act":
-        if token_threshold <= 0:
+        if token_max is None and token_threshold <= 0 and token_min <= 1:
             return torch.zeros_like(active)
-        return active & (counts_long <= token_threshold)
+        return expert_token_range_mask(counts_long, token_min=token_min, token_max=token_max)
     return torch.zeros_like(active)
 
 
 @dataclass(frozen=True)
 class ExpertRecomputeConfig:
-    policy: Literal["none", "split", "tok"]
+    policy: Literal["none", "tok"]
     token_threshold: int
-    util_threshold: float
     activation_save_policy: Literal["save_all", "tok_act"]
     activation_save_threshold: int
     label: str
+    token_min: int = 1
+    token_max: int | None = None
+    activation_save_min: int = 1
+    activation_save_max: int | None = None
+    force_custom_autograd: bool = False
 
     @property
     def recompute_enabled(self) -> bool:
         return expert_recompute_policy_enabled(
             self.policy,
             token_threshold=self.token_threshold,
-            util_threshold=self.util_threshold,
+            token_min=self.token_min,
+            token_max=self.token_max,
         )
 
     @property
@@ -600,77 +588,120 @@ class ExpertRecomputeConfig:
         return expert_activation_save_policy_enabled(
             self.activation_save_policy,
             token_threshold=self.activation_save_threshold,
+            token_min=self.activation_save_min,
+            token_max=self.activation_save_max,
         )
 
     @property
     def enabled(self) -> bool:
-        return self.recompute_enabled or self.activation_drop_enabled
+        return self.recompute_enabled or self.activation_drop_enabled or self.force_custom_autograd
 
 
 def parse_expert_recompute_policy_spec(spec: str | None) -> ExpertRecomputeConfig:
-    raw = "none" if spec is None else str(spec).strip().lower().replace("_", "-")
-    aliases = {
-        "": "none",
-        "0": "none",
-        "false": "none",
-        "off": "none",
-        "no": "none",
-        "n": "none",
-    }
-    raw = aliases.get(raw, raw)
+    raw = "none" if spec is None else str(spec).strip()
     if raw == "none":
         return ExpertRecomputeConfig(
             policy="none",
             token_threshold=0,
-            util_threshold=0.0,
             activation_save_policy="save_all",
             activation_save_threshold=0,
             label="none",
+            token_min=1,
+            token_max=None,
+            activation_save_min=1,
+            activation_save_max=None,
         )
-
-    match = re.fullmatch(r"split([1-9][0-9]*)", raw)
-    if match:
-        threshold = int(match.group(1))
-        return ExpertRecomputeConfig(
-            policy="split",
-            token_threshold=threshold,
-            util_threshold=0.0,
-            activation_save_policy="save_all",
-            activation_save_threshold=0,
-            label=f"split{threshold}",
-        )
-
-    match = re.fullmatch(r"tok([1-9][0-9]*)-ckpt", raw)
-    if match:
-        threshold = int(match.group(1))
-        return ExpertRecomputeConfig(
-            policy="tok",
-            token_threshold=threshold,
-            util_threshold=0.0,
-            activation_save_policy="save_all",
-            activation_save_threshold=0,
-            label=f"tok{threshold}-ckpt",
-        )
-
-    match = re.fullmatch(r"tok([1-9][0-9]*)-act-ckpt", raw)
-    if match:
-        threshold = int(match.group(1))
+    if raw in {"tok-le0", "tok-le0-act"}:
         return ExpertRecomputeConfig(
             policy="none",
             token_threshold=0,
-            util_threshold=0.0,
-            activation_save_policy="tok_act",
-            activation_save_threshold=threshold,
-            label=f"tok{threshold}-act-ckpt",
+            activation_save_policy="save_all",
+            activation_save_threshold=0,
+            label=raw,
+            token_min=1,
+            token_max=None,
+            activation_save_min=1,
+            activation_save_max=None,
+            force_custom_autograd=True,
         )
 
-    if re.fullmatch(r"tok[1-9][0-9]*", raw):
-        raise ValueError(
-            f"ambiguous expert recompute policy {spec!r}; use `tokN-ckpt` or `tokN-act-ckpt`"
+    def _range_from_match(kind: str, first: str, second: str | None = None) -> tuple[int, int | None, str]:
+        if kind == "le":
+            upper = int(first)
+            return 1, upper, f"tok-le{upper}"
+        if kind == "ge":
+            lower = int(first)
+            return lower, None, f"tok-ge{lower}"
+        lower = int(first)
+        upper = int(second or 0)
+        if lower > upper:
+            raise ValueError(
+                f"invalid expert recompute token range tok{lower}-{upper}: lower bound exceeds upper bound"
+            )
+        return lower, upper, f"tok{lower}-{upper}"
+
+    range_match = None
+    range_kind = ""
+    if match := re.fullmatch(r"tok-le([1-9][0-9]*)", raw):
+        range_match = match
+        range_kind = "le"
+    elif match := re.fullmatch(r"tok-ge([1-9][0-9]*)", raw):
+        range_match = match
+        range_kind = "ge"
+    elif match := re.fullmatch(r"tok([1-9][0-9]*)-([1-9][0-9]*)", raw):
+        range_match = match
+        range_kind = "range"
+
+    if range_match:
+        lower, upper, label = _range_from_match(
+            range_kind,
+            range_match.group(1),
+            range_match.group(2) if range_kind == "range" else None,
+        )
+        return ExpertRecomputeConfig(
+            policy="tok",
+            token_threshold=upper or 0,
+            activation_save_policy="save_all",
+            activation_save_threshold=0,
+            label=label,
+            token_min=lower,
+            token_max=upper,
+            activation_save_min=1,
+            activation_save_max=None,
+        )
+
+    act_match = None
+    act_kind = ""
+    if match := re.fullmatch(r"tok-le([1-9][0-9]*)-act", raw):
+        act_match = match
+        act_kind = "le"
+    elif match := re.fullmatch(r"tok-ge([1-9][0-9]*)-act", raw):
+        act_match = match
+        act_kind = "ge"
+    elif match := re.fullmatch(r"tok([1-9][0-9]*)-([1-9][0-9]*)-act", raw):
+        act_match = match
+        act_kind = "range"
+
+    if act_match:
+        lower, upper, label = _range_from_match(
+            act_kind,
+            act_match.group(1),
+            act_match.group(2) if act_kind == "range" else None,
+        )
+        return ExpertRecomputeConfig(
+            policy="none",
+            token_threshold=0,
+            activation_save_policy="tok_act",
+            activation_save_threshold=upper or 0,
+            label=f"{label}-act",
+            token_min=1,
+            token_max=None,
+            activation_save_min=lower,
+            activation_save_max=upper,
         )
 
     raise ValueError(
-        f"unsupported expert recompute policy {spec!r}; expected none, splitN, tokN-ckpt, or tokN-act-ckpt"
+        f"unsupported expert recompute policy {spec!r}; expected none, tok-leN, tok-geN, tokA-B, or -act variants"
     )
 
 
@@ -1012,10 +1043,6 @@ class TorchExpert(nn.Module):
         down = F.linear(activated, self.down_weight) + self._lora(activated, "down", x.dtype)
         return down
 
-
-# Checkpointed expert recompute is the only supported fine-grained recompute path.
-
-
 class AsymMoELayer(nn.Module):
     def __init__(
         self,
@@ -1031,11 +1058,6 @@ class AsymMoELayer(nn.Module):
         offload_modules: Sequence[str] | str | None = DEFAULT_OFFLOAD_MODULES,
         lora_dtype: torch.dtype | str = torch.bfloat16,
         precision: str = "bf16",
-        expert_recompute_threshold: int = 0,
-        expert_recompute_policy: str = "tok",
-        expert_recompute_util_threshold: float = 0.0,
-        expert_activation_save_policy: str = "save_all",
-        expert_activation_save_threshold: int = 0,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1043,12 +1065,6 @@ class AsymMoELayer(nn.Module):
         self.precision = str(precision).lower()
         if self.precision not in VALID_ASYM_PRECISIONS:
             raise ValueError(f"unsupported precision={precision!r}; expected one of {VALID_ASYM_PRECISIONS}")
-        self.expert_recompute_threshold = normalize_expert_recompute_threshold(expert_recompute_threshold)
-        self.expert_recompute_policy = normalize_expert_recompute_policy(expert_recompute_policy)
-        self.expert_recompute_util_threshold = normalize_expert_recompute_util_threshold(expert_recompute_util_threshold)
-        self.expert_recompute_impl = "checkpoint"
-        self.expert_activation_save_policy = normalize_expert_activation_save_policy(expert_activation_save_policy)
-        self.expert_activation_save_threshold = normalize_expert_activation_save_threshold(expert_activation_save_threshold)
         self.input_layernorm = _make_frozen_norm(layer_state, "input_layernorm_weight", device=device)
         self.post_attention_layernorm = _make_frozen_norm(layer_state, "post_attention_layernorm_weight", device=device)
         self.self_attn = SelfAttention(layer_state, config=config, device=device, base_dtype=base_dtype)
@@ -1380,225 +1396,6 @@ class AsymMoELayer(nn.Module):
             down = down + down_lora
         return down, {"gate": gate, "up": up, "activated": activated}
 
-    def _grouped_subset(
-        self,
-        packed: torch.Tensor,
-        offsets: torch.Tensor,
-        experts: torch.Tensor,
-        group_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        if not bool(group_mask.any().item()):
-            return None
-        group_indices = torch.nonzero(group_mask, as_tuple=False).flatten().to(device=offsets.device, dtype=torch.long)
-        counts = (offsets[1:] - offsets[:-1]).to(dtype=torch.long)
-        selected_counts = counts.index_select(0, group_indices)
-        total = int(selected_counts.sum().item())
-        if total <= 0:
-            return None
-
-        selected_offsets_long = torch.cat(
-            [
-                torch.zeros(1, device=offsets.device, dtype=torch.long),
-                torch.cumsum(selected_counts, dim=0),
-            ],
-            dim=0,
-        )
-        selected_offsets = selected_offsets_long.to(dtype=offsets.dtype)
-        group_starts = offsets.index_select(0, group_indices).to(dtype=torch.long)
-        route_indices = (
-            torch.repeat_interleave(group_starts, selected_counts)
-            + torch.arange(total, device=packed.device, dtype=torch.long)
-            - torch.repeat_interleave(selected_offsets_long[:-1], selected_counts)
-        )
-        selected_experts = experts[:-1].index_select(0, group_indices.to(device=experts.device))
-        sentinel = torch.full((1,), -1, device=experts.device, dtype=experts.dtype)
-        selected_experts = torch.cat([selected_experts, sentinel], dim=0)
-        return packed.index_select(0, route_indices), selected_offsets, selected_experts, route_indices
-
-    def _expert_recompute_enabled(self) -> bool:
-        return expert_recompute_policy_enabled(
-            self.expert_recompute_policy,
-            token_threshold=self.expert_recompute_threshold,
-            util_threshold=self.expert_recompute_util_threshold,
-        )
-
-    def _expert_recompute_groups(self, counts: torch.Tensor) -> torch.Tensor:
-        return expert_recompute_group_mask(
-            counts,
-            policy=self.expert_recompute_policy,
-            token_threshold=self.expert_recompute_threshold,
-            util_threshold=self.expert_recompute_util_threshold,
-        )
-
-    def _expert_activation_drop_enabled(self) -> bool:
-        return expert_activation_save_policy_enabled(
-            self.expert_activation_save_policy,
-            token_threshold=self.expert_activation_save_threshold,
-        )
-
-    def _expert_activation_drop_groups(self, counts: torch.Tensor) -> torch.Tensor:
-        return expert_activation_drop_group_mask(
-            counts,
-            policy=self.expert_activation_save_policy,
-            token_threshold=self.expert_activation_save_threshold,
-        )
-
-    def _run_grouped_subset_body(
-        self,
-        subset: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
-        *,
-        gate_base: nn.Module,
-        up_base: nn.Module,
-        down_base: nn.Module,
-        shared: bool,
-        checkpoint_body: bool = False,
-        checkpoint_activation_down: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        if subset is None:
-            return None
-        subset_packed, subset_offsets, subset_experts, route_indices = subset
-        if checkpoint_body and checkpoint_activation_down:
-            raise ValueError("checkpoint_body and checkpoint_activation_down are mutually exclusive")
-
-        if checkpoint_body:
-            def body_fn(x: torch.Tensor) -> torch.Tensor:
-                return self._run_grouped_compact_body(
-                    x,
-                    subset_offsets,
-                    subset_experts,
-                    gate_base=gate_base,
-                    up_base=up_base,
-                    down_base=down_base,
-                    shared=shared,
-                    dense_experts=False,
-                )
-
-            if subset_packed.requires_grad:
-                output = checkpoint(body_fn, subset_packed, use_reentrant=False, preserve_rng_state=False)
-            else:
-                output = body_fn(subset_packed)
-            return route_indices, output
-
-        if checkpoint_activation_down:
-            gate, up, lora_metadata = self._run_grouped_gate_up(
-                subset_packed,
-                subset_offsets,
-                subset_experts,
-                gate_base=gate_base,
-                up_base=up_base,
-                shared=shared,
-                dense_experts=False,
-            )
-
-            def activation_down_fn(gate_arg: torch.Tensor, up_arg: torch.Tensor) -> torch.Tensor:
-                return self._run_grouped_activation_down(
-                    gate_arg,
-                    up_arg,
-                    subset_offsets,
-                    subset_experts,
-                    down_base=down_base,
-                    lora_metadata=lora_metadata,
-                    shared=shared,
-                    dense_experts=False,
-                )
-
-            if gate.requires_grad or up.requires_grad:
-                output = checkpoint(activation_down_fn, gate, up, use_reentrant=False, preserve_rng_state=False)
-            else:
-                output = activation_down_fn(gate, up)
-            return route_indices, output
-
-        output = self._run_grouped_compact_body(
-            subset_packed,
-            subset_offsets,
-            subset_experts,
-            gate_base=gate_base,
-            up_base=up_base,
-            down_base=down_base,
-            shared=shared,
-            dense_experts=False,
-        )
-        return route_indices, output
-
-    def _run_grouped_compact_checkpointed(
-        self,
-        packed: torch.Tensor,
-        offsets: torch.Tensor,
-        experts: torch.Tensor,
-        *,
-        gate_base: nn.Module,
-        up_base: nn.Module,
-        down_base: nn.Module,
-        shared: bool = False,
-    ) -> torch.Tensor:
-        counts = (offsets[1:] - offsets[:-1]).to(dtype=torch.long)
-        active_groups = counts > 0
-        selected_by_recompute_policy = self._expert_recompute_groups(counts)
-        split_control_groups = (
-            selected_by_recompute_policy
-            if self.expert_recompute_policy == "split"
-            else torch.zeros_like(selected_by_recompute_policy)
-        )
-        recompute_groups = (
-            selected_by_recompute_policy
-            if self.expert_recompute_policy != "split"
-            else torch.zeros_like(selected_by_recompute_policy)
-        )
-        activation_drop_groups = self._expert_activation_drop_groups(counts) & ~(recompute_groups | split_control_groups)
-        selected_groups = recompute_groups | activation_drop_groups | split_control_groups
-        if not bool(selected_groups.any().item()):
-            return self._run_grouped_compact_body(
-                packed,
-                offsets,
-                experts,
-                gate_base=gate_base,
-                up_base=up_base,
-                down_base=down_base,
-                shared=shared,
-                dense_experts=True,
-            )
-
-        kept_groups = active_groups & ~selected_groups
-        output = packed.new_empty((packed.shape[0], self.config.hidden_size))
-        pieces = (
-            self._run_grouped_subset_body(
-                self._grouped_subset(packed, offsets, experts, kept_groups),
-                gate_base=gate_base,
-                up_base=up_base,
-                down_base=down_base,
-                shared=shared,
-            ),
-            self._run_grouped_subset_body(
-                self._grouped_subset(packed, offsets, experts, split_control_groups),
-                gate_base=gate_base,
-                up_base=up_base,
-                down_base=down_base,
-                shared=shared,
-            ),
-            self._run_grouped_subset_body(
-                self._grouped_subset(packed, offsets, experts, recompute_groups),
-                gate_base=gate_base,
-                up_base=up_base,
-                down_base=down_base,
-                shared=shared,
-                checkpoint_body=True,
-            ),
-            self._run_grouped_subset_body(
-                self._grouped_subset(packed, offsets, experts, activation_drop_groups),
-                gate_base=gate_base,
-                up_base=up_base,
-                down_base=down_base,
-                shared=shared,
-                checkpoint_activation_down=True,
-            ),
-        )
-        for piece in pieces:
-            if piece is None:
-                continue
-            route_indices, values = piece
-            output.index_copy_(0, route_indices, values)
-        return output
-
     def _run_grouped_compact(
         self,
         packed: torch.Tensor,
@@ -1611,24 +1408,7 @@ class AsymMoELayer(nn.Module):
         shared: bool = False,
         dense_experts: bool = False,
     ) -> torch.Tensor:
-        if (
-            not (self._expert_recompute_enabled() or self._expert_activation_drop_enabled())
-            or shared
-            or not dense_experts
-            or not self.training
-            or not torch.is_grad_enabled()
-        ):
-            return self._run_grouped_compact_body(
-                packed,
-                offsets,
-                experts,
-                gate_base=gate_base,
-                up_base=up_base,
-                down_base=down_base,
-                shared=shared,
-                dense_experts=dense_experts,
-            )
-        return self._run_grouped_compact_checkpointed(
+        return self._run_grouped_compact_body(
             packed,
             offsets,
             experts,
@@ -1636,6 +1416,7 @@ class AsymMoELayer(nn.Module):
             up_base=up_base,
             down_base=down_base,
             shared=shared,
+            dense_experts=dense_experts,
         )
 
     def _run_contiguous(self, packed: torch.Tensor, metadata: ContiguousRouteMetadata) -> torch.Tensor:
@@ -2008,11 +1789,6 @@ class MoE(nn.Module):
         kt_threadpool_count: int = 1,
         kt_max_cache_depth: int = 1,
         gradient_checkpointing: bool = False,
-        expert_recompute_threshold: int = 0,
-        expert_recompute_policy: str = "tok",
-        expert_recompute_util_threshold: float = 0.0,
-        expert_activation_save_policy: str = "save_all",
-        expert_activation_save_threshold: int = 0,
     ) -> None:
         super().__init__()
         if backend not in VALID_MOE_BACKENDS:
@@ -2021,26 +1797,8 @@ class MoE(nn.Module):
         if precision not in VALID_ASYM_PRECISIONS:
             raise ValueError(f"unsupported precision={precision!r}; expected one of {VALID_ASYM_PRECISIONS}")
         resolved_kt_method = normalize_kt_method(kt_method)
-        expert_recompute_threshold = normalize_expert_recompute_threshold(expert_recompute_threshold)
-        expert_recompute_policy = normalize_expert_recompute_policy(expert_recompute_policy)
-        expert_recompute_util_threshold = normalize_expert_recompute_util_threshold(expert_recompute_util_threshold)
-        expert_activation_save_policy = normalize_expert_activation_save_policy(expert_activation_save_policy)
-        expert_activation_save_threshold = normalize_expert_activation_save_threshold(expert_activation_save_threshold)
-        expert_recompute_enabled = expert_recompute_policy_enabled(
-            expert_recompute_policy,
-            token_threshold=expert_recompute_threshold,
-            util_threshold=expert_recompute_util_threshold,
-        )
-        expert_activation_save_enabled = expert_activation_save_policy_enabled(
-            expert_activation_save_policy,
-            token_threshold=expert_activation_save_threshold,
-        )
         if backend == "kt" and config.num_shared_experts != 0:
             raise ValueError("backend=kt requires num_shared_experts=0 for the first KT MoE SFT comparison")
-        if backend == "kt" and expert_recompute_enabled:
-            raise ValueError("backend=kt does not support per-expert activation recompute policies")
-        if backend == "kt" and expert_activation_save_enabled:
-            raise ValueError("backend=kt does not support per-expert activation save policies")
         self.config = config
         self.device_hint = torch.device(device)
         self.base_dtype = base_dtype
@@ -2050,12 +1808,6 @@ class MoE(nn.Module):
         self.offload_groups = tuple(sorted(_normalize_moe_module_selector(offload_modules, default=DEFAULT_OFFLOAD_MODULES, purpose="offload")))
         self.lora_dtype = lora_dtype
         self.gradient_checkpointing = bool(gradient_checkpointing)
-        self.expert_recompute_threshold = expert_recompute_threshold
-        self.expert_recompute_policy = expert_recompute_policy
-        self.expert_recompute_util_threshold = expert_recompute_util_threshold
-        self.expert_recompute_impl = "checkpoint"
-        self.expert_activation_save_policy = expert_activation_save_policy
-        self.expert_activation_save_threshold = expert_activation_save_threshold
         self.stats = stats if stats is not None else AsymExecutionStats()
         state = clone_moe_state(state or make_moe_state(config, base_dtype=base_dtype))
         self.register_buffer(
@@ -2101,11 +1853,6 @@ class MoE(nn.Module):
                         offload_modules=self.offload_groups,
                         lora_dtype=lora_dtype,
                         precision=self.precision,
-                        expert_recompute_threshold=self.expert_recompute_threshold,
-                        expert_recompute_policy=self.expert_recompute_policy,
-                        expert_recompute_util_threshold=self.expert_recompute_util_threshold,
-                        expert_activation_save_policy=self.expert_activation_save_policy,
-                        expert_activation_save_threshold=self.expert_activation_save_threshold,
                     )
                 )
             self.layers = nn.ModuleList(layers)
@@ -2490,11 +2237,6 @@ def make_moe_pair(
     kt_threadpool_count: int = 1,
     kt_max_cache_depth: int = 1,
     gradient_checkpointing: bool = False,
-    expert_recompute_threshold: int = 0,
-    expert_recompute_policy: str = "tok",
-    expert_recompute_util_threshold: float = 0.0,
-    expert_activation_save_policy: str = "save_all",
-    expert_activation_save_threshold: int = 0,
 ) -> tuple[MoE, TorchMoEReference, dict[str, Any], AsymExecutionStats]:
     resolved_device = torch.device(device) if device is not None else default_moe_device()
     resolved_dtype = base_dtype or default_moe_base_dtype(resolved_device)
@@ -2518,11 +2260,6 @@ def make_moe_pair(
         kt_threadpool_count=kt_threadpool_count,
         kt_max_cache_depth=kt_max_cache_depth,
         gradient_checkpointing=gradient_checkpointing,
-        expert_recompute_threshold=expert_recompute_threshold,
-        expert_recompute_policy=expert_recompute_policy,
-        expert_recompute_util_threshold=expert_recompute_util_threshold,
-        expert_activation_save_policy=expert_activation_save_policy,
-        expert_activation_save_threshold=expert_activation_save_threshold,
     )
     ref = TorchMoEReference(
         state,

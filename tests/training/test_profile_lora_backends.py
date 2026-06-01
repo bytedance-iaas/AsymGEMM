@@ -13,9 +13,9 @@ from asym_gemm.training.kt_moe import KTBackendUnavailable, _import_kt_moe_wrapp
 
 
 ROOT = Path(__file__).resolve().parents[2]
-PROFILE_LORA_E2E_PATH = ROOT / "scripts" / "profile_lora_e2e.py"
-PROFILE_LORA_E2E_DRIVER_PATH = ROOT / "scripts" / "profile_lora_e2e_driver.py"
-POSTPROCESS_NSYS_LORA_PATH = ROOT / "scripts" / "postprocess_nsys_lora.py"
+PROFILE_LORA_E2E_PATH = ROOT / "scripts" / "lora" / "profile_lora_e2e.py"
+PROFILE_LORA_E2E_DRIVER_PATH = ROOT / "scripts" / "lora" / "profile_lora_e2e_driver.py"
+POSTPROCESS_NSYS_LORA_PATH = ROOT / "scripts" / "lora" / "postprocess_nsys_lora.py"
 PLOT_ACTIVATION_SWEEP_PATH = ROOT / "scripts" / "plotting" / "plot_activation_recompute_sweep.py"
 
 
@@ -67,7 +67,14 @@ def test_profile_lora_e2e_rejects_expert_threshold_for_non_moe_workload() -> Non
         backend="torch",
         workload="dense",
         lora_dtype="bf16",
+        expert_recompute_policy="tok",
         expert_recompute_threshold=8,
+        expert_recompute_token_min=1,
+        expert_recompute_token_max=8,
+        expert_activation_save_policy="save_all",
+        expert_activation_save_threshold=0,
+        expert_activation_save_token_min=1,
+        expert_activation_save_token_max=None,
     )
 
     with pytest.raises(ValueError, match="only supported for MoE"):
@@ -96,9 +103,9 @@ def test_profile_lora_e2e_driver_supports_workload_layer_specs() -> None:
     assert [(spec.name, spec.profile_layers, spec.label) for spec in specs] == [
         ("moe-604m-a75m", 2, "moe-604m-a75m-l2"),
         ("dense_14b", 4, "dense_14b-l4"),
-        ("Qwen/Qwen3-30B-A3B", 4, "qwen_qwen3-30b-a3b-l4"),
-        ("Qwen/Qwen3-30B-A3B", 1, "qwen_qwen3-30b-a3b-l1"),
-        ("Qwen/Qwen3-30B-A3B", "all", "qwen_qwen3-30b-a3b-lall"),
+        ("Qwen/Qwen3-30B-A3B", 4, "qwen3-30b-a3b-l4"),
+        ("Qwen/Qwen3-30B-A3B", 1, "qwen3-30b-a3b-l1"),
+        ("Qwen/Qwen3-30B-A3B", "all", "qwen3-30b-a3b-lall"),
     ]
 
 
@@ -111,16 +118,19 @@ def test_profile_lora_e2e_driver_result_stem_includes_input_shape_and_recompute(
     args.activation_recompute = False
     assert driver._result_stem(args, "torch", "source") == "bf16_lora-sft_b16_s2048_norecomp_torch_source"
 
-    args.expert_recompute_threshold = 64
-    assert driver._result_stem(args, "asym", "source") == "bf16_lora-sft_b16_s2048_norecomp_expertthr64_asym_source"
+    args.expert_recompute_policy_spec = "tok-le64"
+    assert driver._result_stem(args, "asym", "source") == "bf16_lora-sft_b16_s2048_norecomp_expertpolicytok-le64_asym_source"
 
 
-def test_profile_lora_e2e_driver_expands_expert_recompute_thresholds() -> None:
+def test_profile_lora_e2e_driver_expands_expert_recompute_policies() -> None:
     driver = _load_profile_lora_e2e_driver_module()
 
-    args = argparse.Namespace(expert_recompute_threshold=0, expert_recompute_thresholds=["0,16", "32", "16"])
+    args = argparse.Namespace(
+        expert_recompute_policy=None,
+        expert_recompute_policies=["none,tok-le16", "tok-ge32", "tok-le16"],
+    )
 
-    assert driver._expert_recompute_thresholds(args) == [0, 16, 32]
+    assert [spec.label for spec in driver._expert_recompute_policies(args)] == ["none", "tok-le16", "tok-ge32"]
 
 
 def test_profile_lora_e2e_driver_parses_expert_recompute_policies() -> None:
@@ -128,62 +138,74 @@ def test_profile_lora_e2e_driver_parses_expert_recompute_policies() -> None:
 
     specs = [
         driver.parse_expert_recompute_policy_spec(value)
-        for value in ("none", "tok128", "util075", "util75", "util0.75", "tok128-util075")
+        for value in ("none", "tok-le0", "tok-le0-act", "tok-le128", "tok-ge128", "tok64-256", "tok-ge128-act")
     ]
 
-    assert [(spec.label, spec.policy, spec.token_threshold, spec.util_threshold) for spec in specs] == [
-        ("none", "none", 0, 0.0),
-        ("tok128", "tok", 128, 0.0),
-        ("util075", "util", 0, 0.75),
-        ("util075", "util", 0, 0.75),
-        ("util075", "util", 0, 0.75),
-        ("tok128-util075", "tok_util", 128, 0.75),
+    assert [
+        (
+            spec.label,
+            spec.policy,
+            spec.token_threshold,
+            spec.token_min,
+            spec.token_max,
+            spec.activation_save_policy,
+            spec.activation_save_threshold,
+            spec.activation_save_min,
+            spec.activation_save_max,
+            spec.force_custom_autograd,
+        )
+        for spec in specs
+    ] == [
+        ("none", "none", 0, 1, None, "save_all", 0, 1, None, False),
+        ("tok-le0", "none", 0, 1, None, "save_all", 0, 1, None, True),
+        ("tok-le0-act", "none", 0, 1, None, "save_all", 0, 1, None, True),
+        ("tok-le128", "tok", 128, 1, 128, "save_all", 0, 1, None, False),
+        ("tok-ge128", "tok", 0, 128, None, "save_all", 0, 1, None, False),
+        ("tok64-256", "tok", 256, 64, 256, "save_all", 0, 1, None, False),
+        ("tok-ge128-act", "none", 0, 1, None, "tok_act", 0, 128, None, False),
     ]
 
 
 def test_profile_lora_e2e_driver_layer_recompute_only_applies_at_zero_expert_threshold() -> None:
     driver = _load_profile_lora_e2e_driver_module()
 
-    assert driver._effective_activation_recompute(True, 0)
-    assert not driver._effective_activation_recompute(True, 16)
-    assert not driver._effective_activation_recompute(False, 0)
     assert driver._effective_activation_recompute(True, driver.parse_expert_recompute_policy_spec("none"))
-    assert not driver._effective_activation_recompute(True, driver.parse_expert_recompute_policy_spec("util075"))
+    assert not driver._effective_activation_recompute(True, driver.parse_expert_recompute_policy_spec("tok-le0"))
+    assert not driver._effective_activation_recompute(True, driver.parse_expert_recompute_policy_spec("tok-ge16"))
 
 
-def test_activation_sweep_plot_parses_expert_threshold_result_dirs() -> None:
+def test_activation_sweep_plot_rejects_legacy_expert_threshold_result_dirs() -> None:
     plotter = _load_activation_sweep_plot_module()
 
     meta = plotter.parse_result_dir(
         Path("/tmp/profiling/moe-604m-a38m-l2/bf16_lora-sft_b8_s256_norecomp_expertthr64_asym_nsys")
     )
 
-    assert meta is not None
-    assert meta["workload"] == "moe-604m-a38m-l2"
-    assert meta["seq_len"] == 256
-    assert meta["mode"] == "no_recompute"
-    assert meta["expert_recompute_threshold"] == 64
-    assert meta["expert_recompute_policy_spec"] == "tok64"
+    assert meta is None
 
 
 def test_activation_sweep_plot_parses_expert_policy_flat_dirs() -> None:
     plotter = _load_activation_sweep_plot_module()
 
-    util_meta = plotter.parse_result_dir(
-        Path("/tmp/profiling/lora_e2e_bf16/moe-604m-a38m-l2__b8_s1024_r64_a128/asym__nsys__norecomp__polutil075/s1024")
+    ge_meta = plotter.parse_result_dir(
+        Path("/tmp/profiling/lora_e2e_bf16/moe-604m-a38m-l2__b8_s1024_r64_a128/asym__nsys__norecomp__poltok-ge128/s1024")
     )
-    combined_meta = plotter.parse_result_dir(
-        Path("/tmp/profiling/lora_e2e_bf16/moe-604m-a38m-l2__b8_s1024_r64_a128/asym__nsys__norecomp__poltok128-util075/s1024")
+    bounded_meta = plotter.parse_result_dir(
+        Path("/tmp/profiling/lora_e2e_bf16/moe-604m-a38m-l2__b8_s1024_r64_a128/asym__nsys__norecomp__poltok64-256/s1024")
     )
 
-    assert util_meta is not None
-    assert util_meta["expert_recompute_policy_spec"] == "util075"
-    assert util_meta["expert_recompute_policy"] == "util"
-    assert util_meta["expert_recompute_util_threshold"] == pytest.approx(0.75)
-    assert combined_meta is not None
-    assert combined_meta["expert_recompute_policy_spec"] == "tok128-util075"
-    assert combined_meta["expert_recompute_policy"] == "tok_util"
-    assert combined_meta["expert_recompute_threshold"] == 128
+    assert ge_meta is not None
+    assert ge_meta["expert_recompute_policy_spec"] == "tok-ge128"
+    assert ge_meta["expert_recompute_policy"] == "tok"
+    assert ge_meta["expert_recompute_threshold"] == 0
+    assert ge_meta["expert_recompute_token_min"] == 128
+    assert ge_meta["expert_recompute_token_max"] is None
+    assert bounded_meta is not None
+    assert bounded_meta["expert_recompute_policy_spec"] == "tok64-256"
+    assert bounded_meta["expert_recompute_policy"] == "tok"
+    assert bounded_meta["expert_recompute_threshold"] == 256
+    assert bounded_meta["expert_recompute_token_min"] == 64
+    assert bounded_meta["expert_recompute_token_max"] == 256
 
 
 def test_profile_lora_e2e_driver_does_not_create_skipped_result_dirs(tmp_path: Path) -> None:
@@ -514,10 +536,10 @@ def test_postprocess_memory_attribution_percentages_are_gpu_only() -> None:
     text = "\n".join(postprocess._memory_attribution_markdown(profile))
 
     assert "Percent denominator: memory-attribution pass peak HBM `4194304` bytes." in text
-    assert "| Category | Memory space | bytes | MiB | % peak HBM | Accuracy |" in text
-    assert "| cpu offload | CPU pinned | 20971520 | 20.00 | - | exact |" in text
-    assert "| gpu saved | GPU HBM | 3145728 | 3.00 | 75.00% | exact |" in text
-    assert "| gpu params | GPU HBM | 1048576 | 1.00 | 25.00% | exact |" in text
+    assert "| Category | Component | Memory space | bytes | MiB | % peak HBM | Accuracy |" in text
+    assert "| cpu offload | - | CPU pinned | 20971520 | 20.00 | - | exact |" in text
+    assert "| gpu saved | - | GPU HBM | 3145728 | 3.00 | 75.00% | exact |" in text
+    assert "| gpu params | - | GPU HBM | 1048576 | 1.00 | 25.00% | exact |" in text
     assert "| Owner | unique bytes | unique MiB | % saved GPU | reference bytes | reference MiB | saves | unique tensors |" in text
     assert "| attention.softmax | 2097152 | 2.00 | 66.67% | 4194304 | 4.00 | 2 | 1 |" in text
     assert "| mlp.silu_mul_activation | 1048576 | 1.00 | 33.33% | 1048576 | 1.00 | 1 | 1 |" in text

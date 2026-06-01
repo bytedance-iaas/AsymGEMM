@@ -75,10 +75,14 @@ class ExpertRecomputePolicySpec:
     label: str
     policy: str
     token_threshold: int
-    util_threshold: float
-    impl: str = "checkpoint"
+    impl: str = "none"
+    token_min: int = 1
+    token_max: int | None = None
     activation_save_policy: str = "save_all"
     activation_save_threshold: int = 0
+    activation_save_min: int = 1
+    activation_save_max: int | None = None
+    force_custom_autograd: bool = False
 
 
 def _is_hf_model_workload(workload: str) -> bool:
@@ -177,92 +181,74 @@ def _seq_lens(args: argparse.Namespace) -> list[int]:
     return list(dict.fromkeys(seq_lens))
 
 
-def _expert_recompute_thresholds(args: argparse.Namespace) -> list[int]:
-    values = getattr(args, "expert_recompute_thresholds", None)
-    if not values:
-        values = [str(getattr(args, "expert_recompute_threshold", 0) or 0)]
-    thresholds: list[int] = []
-    for value in _split_tokens(values):
-        try:
-            threshold = int(value)
-        except ValueError as exc:
-            raise SystemExit(
-                f"invalid --expert-recompute-thresholds value {value!r}; entries must be integers"
-            ) from exc
-        if threshold < 0:
-            raise SystemExit(
-                f"invalid --expert-recompute-thresholds value {value!r}; entries must be non-negative"
-            )
-        thresholds.append(threshold)
-    return list(dict.fromkeys(thresholds))
-
-
-def _parse_util_threshold_token(value: str) -> float:
-    text = value.strip().lower()
-    if not text:
-        raise SystemExit("invalid util policy; missing threshold")
-    if "." in text:
-        try:
-            util = float(text)
-        except ValueError as exc:
-            raise SystemExit(f"invalid util threshold {value!r}") from exc
-    elif text == "1":
-        util = 1.0
-    elif text == "0":
-        util = 0.0
-    elif text.startswith("0") and len(text) > 1:
-        util = float(f"0.{text[1:]}")
-    else:
-        try:
-            util = int(text) / 100.0
-        except ValueError as exc:
-            raise SystemExit(f"invalid util threshold {value!r}") from exc
-    if util < 0.0 or util > 1.0:
-        raise SystemExit(f"invalid util threshold {value!r}; expected a value in [0, 1]")
-    return util
-
-
-def _util_policy_label(util: float) -> str:
-    return f"util{int(round(float(util) * 100)):03d}"
-
-
 def parse_expert_recompute_policy_spec(value: str) -> ExpertRecomputePolicySpec:
     raw = str(value).strip()
-    spec = raw.lower().replace("_", "-")
-    if spec in {"", "none", "off", "false", "0"}:
-        return ExpertRecomputePolicySpec(raw=raw, label="none", policy="none", token_threshold=0, util_threshold=0.0)
+    spec = raw
+    if spec == "none":
+        return ExpertRecomputePolicySpec(raw=raw, label="none", policy="none", token_threshold=0)
+    if spec == "tok-le0":
+        return ExpertRecomputePolicySpec(
+            raw=raw, label="tok-le0", policy="none", token_threshold=0, force_custom_autograd=True
+        )
+    if spec == "tok-le0-act":
+        return ExpertRecomputePolicySpec(
+            raw=raw, label="tok-le0-act", policy="none", token_threshold=0, force_custom_autograd=True
+        )
 
-    if match := re.fullmatch(r"split([0-9]+)", spec):
-        token_threshold = int(match.group(1))
+    def parse_range(kind: str, first: str, second: str | None = None) -> tuple[int, int | None, str]:
+        if kind == "le":
+            upper = int(first)
+            return 1, upper, f"tok-le{upper}"
+        if kind == "ge":
+            lower = int(first)
+            return lower, None, f"tok-ge{lower}"
+        lower = int(first)
+        upper = int(second or 0)
+        if lower > upper:
+            raise SystemExit(f"invalid expert recompute policy {value!r}; lower bound exceeds upper bound")
+        return lower, upper, f"tok{lower}-{upper}"
+
+    match = re.fullmatch(r"tok-le([1-9][0-9]*)", spec)
+    kind = "le" if match else ""
+    if match is None:
+        match = re.fullmatch(r"tok-ge([1-9][0-9]*)", spec)
+        kind = "ge" if match else kind
+    if match is None:
+        match = re.fullmatch(r"tok([1-9][0-9]*)-([1-9][0-9]*)", spec)
+        kind = "range" if match else kind
+    if match is not None:
+        lower, upper, label = parse_range(kind, match.group(1), match.group(2) if kind == "range" else None)
         return ExpertRecomputePolicySpec(
             raw=raw,
-            label=f"split{token_threshold}",
-            policy="split",
-            token_threshold=token_threshold,
-            util_threshold=0.0,
-        )
-    if match := re.fullmatch(r"tok([0-9]+)-ckpt", spec):
-        token_threshold = int(match.group(1))
-        return ExpertRecomputePolicySpec(
-            raw=raw,
-            label=f"tok{token_threshold}-ckpt",
+            label=label,
             policy="tok",
-            token_threshold=token_threshold,
-            util_threshold=0.0,
+            token_threshold=upper or 0,
+            token_min=lower,
+            token_max=upper,
         )
-    if match := re.fullmatch(r"tok([0-9]+)-act-ckpt", spec):
-        token_threshold = int(match.group(1))
+
+    match = re.fullmatch(r"tok-le([1-9][0-9]*)-act", spec)
+    kind = "le" if match else ""
+    if match is None:
+        match = re.fullmatch(r"tok-ge([1-9][0-9]*)-act", spec)
+        kind = "ge" if match else kind
+    if match is None:
+        match = re.fullmatch(r"tok([1-9][0-9]*)-([1-9][0-9]*)-act", spec)
+        kind = "range" if match else kind
+    if match is not None:
+        lower, upper, label = parse_range(kind, match.group(1), match.group(2) if kind == "range" else None)
         return ExpertRecomputePolicySpec(
             raw=raw,
-            label=f"tok{token_threshold}-act-ckpt",
+            label=f"{label}-act",
             policy="none",
             token_threshold=0,
-            util_threshold=0.0,
             activation_save_policy="tok_act",
-            activation_save_threshold=token_threshold,
+            activation_save_threshold=upper or 0,
+            activation_save_min=lower,
+            activation_save_max=upper,
         )
     raise SystemExit(
-        f"invalid expert recompute policy {value!r}; expected none, splitXX, tokXX-ckpt, or tokXX-act-ckpt"
+        f"invalid expert recompute policy {value!r}; expected none, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, or -act variants"
     )
 
 
@@ -270,15 +256,14 @@ def _expert_recompute_policies(args: argparse.Namespace) -> list[ExpertRecompute
     values = getattr(args, "expert_recompute_policies", None)
     if values:
         specs = [parse_expert_recompute_policy_spec(value) for value in _split_tokens(values)]
+        if not specs:
+            raise SystemExit("expert recompute policy list is empty")
     else:
         single = getattr(args, "expert_recompute_policy", None)
-        if single:
+        if single is not None:
             specs = [parse_expert_recompute_policy_spec(str(single))]
         else:
-            specs = [
-                parse_expert_recompute_policy_spec("none" if threshold == 0 else f"tok{threshold}-ckpt")
-                for threshold in _expert_recompute_thresholds(args)
-            ]
+            specs = [parse_expert_recompute_policy_spec("none")]
     deduped: dict[str, ExpertRecomputePolicySpec] = {}
     for spec in specs:
         deduped.setdefault(spec.label, spec)
@@ -290,11 +275,12 @@ def _effective_activation_recompute(
     expert_recompute_policy: ExpertRecomputePolicySpec | int,
 ) -> bool:
     if isinstance(expert_recompute_policy, int):
-        return bool(requested_activation_recompute) and int(expert_recompute_policy) == 0
+        raise TypeError("expert_recompute_policy must be ExpertRecomputePolicySpec")
     return (
         bool(requested_activation_recompute)
         and expert_recompute_policy.policy == "none"
         and expert_recompute_policy.activation_save_policy == "save_all"
+        and not expert_recompute_policy.force_custom_autograd
     )
 
 
@@ -333,7 +319,6 @@ def _input_config_label(args: argparse.Namespace) -> str:
     batch = int(getattr(args, "batch_size", 0) or 0)
     seq = int(getattr(args, "seq_len", 0) or 0)
     recompute = "recomp" if bool(getattr(args, "activation_recompute", False)) else "norecomp"
-    expert_recompute_threshold = int(getattr(args, "expert_recompute_threshold", 0) or 0)
     expert_recompute_policy_spec = str(getattr(args, "expert_recompute_policy_spec", "") or "")
     parts = []
     if batch > 0:
@@ -343,8 +328,6 @@ def _input_config_label(args: argparse.Namespace) -> str:
     parts.append(recompute)
     if expert_recompute_policy_spec and expert_recompute_policy_spec != "none":
         parts.append(f"expertpolicy{expert_recompute_policy_spec}")
-    elif expert_recompute_threshold > 0:
-        parts.append(f"expertthr{expert_recompute_threshold}")
     return "_".join(parts)
 
 
@@ -406,9 +389,6 @@ def _existing_profile_matches_request(profile: dict[str, Any], args: argparse.Na
         return False
     requested_policy_spec = str(getattr(args, "expert_recompute_policy_spec", "") or "")
     existing_policy_spec = str(config.get("expert_recompute_policy_spec", "") or "")
-    if not existing_policy_spec:
-        existing_threshold = int(config.get("expert_recompute_threshold", 0) or 0)
-        existing_policy_spec = "none" if existing_threshold == 0 else f"tok{existing_threshold}"
     if requested_policy_spec and existing_policy_spec != requested_policy_spec:
         return False
     if _is_hf_model_workload(workload):
@@ -491,20 +471,8 @@ def _common_profile_args(
         str(args.kt_threadpool_count),
         "--kt-max-cache-depth",
         str(args.kt_max_cache_depth),
-        "--expert-recompute-threshold",
-        str(args.expert_recompute_threshold),
         "--expert-recompute-policy",
-        str(getattr(args, "expert_recompute_policy", "tok")),
-        "--expert-recompute-util-threshold",
-        str(getattr(args, "expert_recompute_util_threshold", 0.0)),
-        "--expert-recompute-policy-spec",
         str(getattr(args, "expert_recompute_policy_spec", "")),
-        "--expert-activation-save-policy",
-        str(getattr(args, "expert_activation_save_policy", "save_all")),
-        "--expert-activation-save-threshold",
-        str(getattr(args, "expert_activation_save_threshold", 0)),
-        "--expert-policy-label",
-        str(getattr(args, "expert_policy_label", "")),
         "--hf-layer-index",
         str(args.hf_layer_index),
         "--profile-seed",
@@ -981,31 +949,16 @@ def parse_args() -> argparse.Namespace:
         help="Pass --activation-recompute to profile_lora_e2e.py for layer-level activation checkpointing.",
     )
     parser.add_argument(
-        "--expert-recompute-threshold",
-        type=int,
-        default=0,
-        help="Legacy token policy threshold. tokN recomputes MoE routed experts with routed tokens <= N.",
-    )
-    parser.add_argument(
-        "--expert-recompute-thresholds",
-        nargs="+",
-        default=None,
-        help="Legacy threshold sweep. Accepts space- or comma-separated non-negative values; maps N to tokN.",
-    )
-    parser.add_argument(
         "--expert-recompute-policy",
         default=None,
-        help="Single expert policy spec: none, split128, tok128-ckpt, or tok128-act-ckpt.",
+        help="Single expert policy spec: none, tok-le0, tok-le128, tok-ge128, tok64-256, or -act variants.",
     )
     parser.add_argument(
         "--expert-recompute-policies",
         nargs="+",
         default=None,
-        help="Policy sweep. Accepts space- or comma-separated specs such as none,split128,tok128-ckpt,tok128-act-ckpt.",
+        help="Policy sweep. Accepts space- or comma-separated specs such as none,tok-le0,tok-le128,tok-ge128,tok64-256.",
     )
-    parser.add_argument("--expert-activation-save-policy", choices=["save_all", "all_act", "tok_act"], default="save_all", help=argparse.SUPPRESS)
-    parser.add_argument("--expert-activation-save-threshold", type=int, default=0, help=argparse.SUPPRESS)
-    parser.add_argument("--expert-policy-label", default="", help=argparse.SUPPRESS)
     parser.add_argument("--ncu-clear-jit-cache", action="store_true")
     parser.add_argument(
         "--skip-memory-attribution",
@@ -1060,10 +1013,13 @@ def main() -> None:
             for expert_policy in expert_recompute_policies:
                 args.expert_recompute_policy = expert_policy.policy
                 args.expert_recompute_threshold = expert_policy.token_threshold
-                args.expert_recompute_util_threshold = expert_policy.util_threshold
+                args.expert_recompute_token_min = expert_policy.token_min
+                args.expert_recompute_token_max = expert_policy.token_max
                 args.expert_recompute_policy_spec = expert_policy.label
                 args.expert_activation_save_policy = expert_policy.activation_save_policy
                 args.expert_activation_save_threshold = expert_policy.activation_save_threshold
+                args.expert_activation_save_token_min = expert_policy.activation_save_min
+                args.expert_activation_save_token_max = expert_policy.activation_save_max
                 args.expert_policy_label = expert_policy.label
                 expert_recompute_threshold = expert_policy.token_threshold
                 args.activation_recompute = _effective_activation_recompute(requested_activation_recompute, expert_policy)
@@ -1222,20 +1178,8 @@ def main() -> None:
                                     args.lora_dtype,
                                     "--vocab-rows",
                                     str(args.vocab_rows),
-                                    "--expert-recompute-threshold",
-                                    str(args.expert_recompute_threshold),
                                     "--expert-recompute-policy",
-                                    str(args.expert_recompute_policy),
-                                    "--expert-recompute-util-threshold",
-                                    str(args.expert_recompute_util_threshold),
-                                    "--expert-recompute-policy-spec",
                                     str(args.expert_recompute_policy_spec),
-                                    "--expert-activation-save-policy",
-                                    str(args.expert_activation_save_policy),
-                                    "--expert-activation-save-threshold",
-                                    str(args.expert_activation_save_threshold),
-                                    "--expert-policy-label",
-                                    str(args.expert_policy_label),
                                     "--hf-layer-index",
                                     str(args.hf_layer_index),
                                     "--profile-seed",
@@ -1262,7 +1206,6 @@ def main() -> None:
                             "expert_recompute_impl": expert_policy.impl,
                             "expert_recompute_policy_spec": expert_policy.label,
                             "expert_recompute_threshold": expert_recompute_threshold,
-                            "expert_recompute_util_threshold": expert_policy.util_threshold,
                             "expert_activation_save_policy": expert_policy.activation_save_policy,
                             "expert_activation_save_threshold": expert_policy.activation_save_threshold,
                             "expert_policy_label": expert_policy.label,
@@ -1298,7 +1241,6 @@ def main() -> None:
                             row["expert_recompute_impl"] = expert_policy.impl
                             row["expert_recompute_policy_spec"] = expert_policy.label
                             row["expert_recompute_threshold"] = expert_recompute_threshold
-                            row["expert_recompute_util_threshold"] = expert_policy.util_threshold
                             row["expert_activation_save_policy"] = expert_policy.activation_save_policy
                             row["expert_activation_save_threshold"] = expert_policy.activation_save_threshold
                             row["expert_policy_label"] = expert_policy.label
@@ -1333,7 +1275,6 @@ def main() -> None:
                                     row["expert_recompute_impl"] = expert_policy.impl
                                     row["expert_recompute_policy_spec"] = expert_policy.label
                                     row["expert_recompute_threshold"] = expert_recompute_threshold
-                                    row["expert_recompute_util_threshold"] = expert_policy.util_threshold
                                     row["expert_activation_save_policy"] = expert_policy.activation_save_policy
                                     row["expert_activation_save_threshold"] = expert_policy.activation_save_threshold
                                     row["expert_policy_label"] = expert_policy.label
@@ -1364,7 +1305,6 @@ def main() -> None:
                             row["expert_recompute_impl"] = expert_policy.impl
                             row["expert_recompute_policy_spec"] = expert_policy.label
                             row["expert_recompute_threshold"] = expert_recompute_threshold
-                            row["expert_recompute_util_threshold"] = expert_policy.util_threshold
                             row["expert_activation_save_policy"] = expert_policy.activation_save_policy
                             row["expert_activation_save_threshold"] = expert_policy.activation_save_threshold
                             row["expert_policy_label"] = expert_policy.label
@@ -1403,7 +1343,6 @@ def main() -> None:
                             row["expert_recompute_impl"] = expert_policy.impl
                             row["expert_recompute_policy_spec"] = expert_policy.label
                             row["expert_recompute_threshold"] = expert_recompute_threshold
-                            row["expert_recompute_util_threshold"] = expert_policy.util_threshold
                             row["expert_activation_save_policy"] = expert_policy.activation_save_policy
                             row["expert_activation_save_threshold"] = expert_policy.activation_save_threshold
                             row["expert_policy_label"] = expert_policy.label
@@ -1425,7 +1364,6 @@ def main() -> None:
                             row["expert_recompute_impl"] = expert_policy.impl
                             row["expert_recompute_policy_spec"] = expert_policy.label
                             row["expert_recompute_threshold"] = expert_recompute_threshold
-                            row["expert_recompute_util_threshold"] = expert_policy.util_threshold
                             row["expert_activation_save_policy"] = expert_policy.activation_save_policy
                             row["expert_activation_save_threshold"] = expert_policy.activation_save_threshold
                             row["expert_policy_label"] = expert_policy.label
@@ -1461,7 +1399,7 @@ def main() -> None:
         "seq_lens": seq_lens,
         "expert_recompute_policies": [spec.label for spec in expert_recompute_policies],
         "expert_recompute_impls": [spec.impl for spec in expert_recompute_policies],
-        "expert_recompute_thresholds": [spec.token_threshold for spec in expert_recompute_policies],
+        "expert_policy_token_thresholds": [spec.token_threshold for spec in expert_recompute_policies],
         "expert_activation_save_policies": [spec.activation_save_policy for spec in expert_recompute_policies],
         "expert_activation_save_thresholds": [spec.activation_save_threshold for spec in expert_recompute_policies],
         "expert_policy_labels": [spec.label for spec in expert_recompute_policies],

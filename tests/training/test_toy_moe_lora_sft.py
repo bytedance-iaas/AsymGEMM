@@ -408,109 +408,7 @@ def test_moe_module_activation_recompute_uses_layer_checkpoint(monkeypatch: pyte
     assert bool(torch.isfinite(inputs.grad).all().item())
 
 
-def test_moe_module_expert_threshold_recompute_uses_custom_grouped_backward(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = MoEConfig(
-        num_layers=1,
-        num_experts=4,
-        num_shared_experts=0,
-        top_k=2,
-        vocab_size=64,
-        hidden_size=32,
-        num_heads=4,
-        batch_size=1,
-        seq_len=16,
-        intermediate_size=64,
-        logical_tokens=16,
-        lora_rank=4,
-        lora_alpha=8.0,
-        residual_scale=0.25,
-    )
-    device = torch.device("cpu")
-    dtype = torch.float32
-    calls = 0
-    original_checkpoint = moe_module.checkpoint
-
-    def recording_checkpoint(function: Any, *args: Any, **kwargs: Any) -> Any:
-        nonlocal calls
-        calls += 1
-        return original_checkpoint(function, *args, **kwargs)
-
-    monkeypatch.setattr(moe_module, "checkpoint", recording_checkpoint)
-    model, _, _, _ = moe_module.make_moe_pair(
-        config=config,
-        seed=215,
-        device=device,
-        base_dtype=dtype,
-        backend="torch",
-        pin_memory=False,
-        expert_recompute_threshold=5,
-    )
-    static_routes = moe_module.make_static_routes(config, device, pattern="skewed")
-    metadata = moe_module.build_route_metadata(
-        static_routes[0][0],
-        static_routes[0][1],
-        num_experts=config.num_experts,
-        mode="contiguous",
-    )
-    assert metadata.expert_counts.tolist() == [16, 10, 4, 2]
-    inputs = _make_input(config, device=device, dtype=dtype, seed=216)
-
-    output = model(inputs, static_routing=static_routes, mode="contiguous")
-    assert isinstance(output, torch.Tensor)
-    _loss(output).backward()
-
-    assert calls == 0
-    lora_grads = [param.grad for name, param in model.named_parameters() if "lora" in name and param.grad is not None]
-    assert lora_grads
-    assert all(bool(torch.isfinite(grad).all().item()) for grad in lora_grads)
-
-
-def test_moe_module_expert_threshold_recompute_is_disabled_in_eval(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = MoEConfig(
-        num_layers=1,
-        num_experts=4,
-        num_shared_experts=0,
-        top_k=2,
-        vocab_size=64,
-        hidden_size=32,
-        num_heads=4,
-        batch_size=1,
-        seq_len=16,
-        intermediate_size=64,
-        logical_tokens=16,
-        lora_rank=4,
-        lora_alpha=8.0,
-        residual_scale=0.25,
-    )
-    device = torch.device("cpu")
-    dtype = torch.float32
-    calls = 0
-    original_checkpoint = moe_module.checkpoint
-
-    def recording_checkpoint(function: Any, *args: Any, **kwargs: Any) -> Any:
-        nonlocal calls
-        calls += 1
-        return original_checkpoint(function, *args, **kwargs)
-
-    monkeypatch.setattr(moe_module, "checkpoint", recording_checkpoint)
-    model, _, _, _ = moe_module.make_moe_pair(
-        config=config,
-        seed=217,
-        device=device,
-        base_dtype=dtype,
-        backend="torch",
-        pin_memory=False,
-        expert_recompute_threshold=5,
-    )
-    model.eval()
-    inputs = _make_input(config, device=device, dtype=dtype, seed=218)
-    output = model(inputs, static_routing=moe_module.make_static_routes(config, device, pattern="skewed"), mode="contiguous")
-
-    assert isinstance(output, torch.Tensor)
-    assert calls == 0
-
-
-def test_moe_module_expert_threshold_recompute_matches_plain_training() -> None:
+def test_moe_module_still_trains() -> None:
     config = MoEConfig(
         num_layers=1,
         num_experts=4,
@@ -538,78 +436,52 @@ def test_moe_module_expert_threshold_recompute_matches_plain_training() -> None:
         base_dtype=dtype,
         backend="torch",
         pin_memory=False,
-        expert_recompute_threshold=0,
     )
-    thresholded, _, _, _ = moe_module.make_moe_pair(
-        config=config,
-        seed=220,
-        device=device,
-        base_dtype=dtype,
-        backend="torch",
-        pin_memory=False,
-        expert_recompute_threshold=5,
-    )
-    util_policy, _, _, _ = moe_module.make_moe_pair(
-        config=config,
-        seed=220,
-        device=device,
-        base_dtype=dtype,
-        backend="torch",
-        pin_memory=False,
-        expert_recompute_policy="util",
-        expert_recompute_util_threshold=0.03,
-    )
-
     plain_out = plain(inputs, static_routing=routes, mode="contiguous")
-    thresholded_out = thresholded(inputs, static_routing=routes, mode="contiguous")
-    util_out = util_policy(inputs, static_routing=routes, mode="contiguous")
     assert isinstance(plain_out, torch.Tensor)
-    assert isinstance(thresholded_out, torch.Tensor)
-    assert isinstance(util_out, torch.Tensor)
-    torch.testing.assert_close(thresholded_out, plain_out, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(util_out, plain_out, rtol=1e-5, atol=1e-5)
 
     _loss(plain_out).backward()
-    _loss(thresholded_out).backward()
-    _loss(util_out).backward()
-    plain_params = dict(plain.named_parameters())
-    thresholded_params = dict(thresholded.named_parameters())
-    util_params = dict(util_policy.named_parameters())
-    for name, plain_param in plain_params.items():
+    for name, plain_param in plain.named_parameters():
         if "lora" not in name:
             continue
-        thresholded_grad = thresholded_params[name].grad
-        util_grad = util_params[name].grad
         assert plain_param.grad is not None
-        assert thresholded_grad is not None
-        assert util_grad is not None
-        torch.testing.assert_close(thresholded_grad, plain_param.grad, rtol=1e-5, atol=1e-5)
-        torch.testing.assert_close(util_grad, plain_param.grad, rtol=1e-5, atol=1e-5)
+        assert torch.isfinite(plain_param.grad).all()
 
 
 def test_moe_module_expert_recompute_policy_group_selection() -> None:
-    counts = torch.tensor([1, 32, 96, 127, 129, 192, 255], dtype=torch.long)
+    counts = torch.tensor([1, 32, 96, 127, 128, 129, 192, 255], dtype=torch.long)
 
-    util_mask = moe_module.expert_recompute_group_mask(
-        counts,
-        policy="util",
-        util_threshold=0.75,
-    )
-    tok_mask = moe_module.expert_recompute_group_mask(
+    legacy_tok_mask = moe_module.expert_recompute_group_mask(
         counts,
         policy="tok",
         token_threshold=128,
     )
-    combined_mask = moe_module.expert_recompute_group_mask(
+    tok_ge_mask = moe_module.expert_recompute_group_mask(
         counts,
-        policy="tok_util",
-        token_threshold=128,
-        util_threshold=0.75,
+        policy="tok",
+        token_min=128,
     )
+    tok_range_mask = moe_module.expert_recompute_group_mask(
+        counts,
+        policy="tok",
+        token_min=64,
+        token_max=192,
+    )
+    act_range_mask = moe_module.expert_activation_drop_group_mask(
+        counts,
+        policy="tok_act",
+        token_min=64,
+        token_max=192,
+    )
+    none_mask = moe_module.expert_recompute_group_mask(counts, policy="none")
 
-    assert counts[util_mask].tolist() == [96, 127, 192, 255]
-    assert counts[tok_mask].tolist() == [1, 32, 96, 127]
-    assert counts[combined_mask].tolist() == [96, 127]
+    assert counts[legacy_tok_mask].tolist() == [1, 32, 96, 127, 128]
+    assert counts[tok_ge_mask].tolist() == [128, 129, 192, 255]
+    assert counts[tok_range_mask].tolist() == [96, 127, 128, 129, 192]
+    assert counts[act_range_mask].tolist() == [96, 127, 128, 129, 192]
+    assert not none_mask.any()
+    with pytest.raises(ValueError):
+        moe_module.expert_recompute_group_mask(counts, policy="bad_policy")
 
 
 def test_moe_module_asym_base_weights_are_grouped_host_stacks() -> None:

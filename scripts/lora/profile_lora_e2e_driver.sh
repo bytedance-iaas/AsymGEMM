@@ -16,8 +16,8 @@ GPU_POOL="0,1,3"
 # WORKLOADS="mlp_3b,mm_3b,dense_3b,moe-604m-a75m,mlp,dense,moe,dense_14b,moe-604m-a38m"
 # WORKLOADS="dense_3b,moe-604m-a75m|2"
 # WORKLOADS="mlp_3b,mm_3b,dense_3b,moe-604m-a75m|4"
-WORKLOADS="Qwen/Qwen3-30B-A3B|4,Qwen/Qwen3-235B-A22B-Instruct-2507|4"
-# WORKLOADS="Qwen/Qwen3-30B-A3B|all"
+# WORKLOADS="Qwen/Qwen3-30B-A3B|4,Qwen/Qwen3-235B-A22B-Instruct-2507|4"
+WORKLOADS="Qwen/Qwen3-30B-A3B|4"
 BACKENDS="asym,torch"
 # BACKENDS="torch"
 # PROFILERS="nsys,cpu"
@@ -35,13 +35,13 @@ MEASURE_STEPS=20
 PROFILE_LAYERS=1
 BATCH_SIZE=8
 # SEQ_LENS="64,128,256,512,640,768,896,1024,2048,3072,4096,6144,8192,10240,16384,20480"
-SEQ_LENS="2048,4096"
+SEQ_LENS="2048"
 # Expert recompute policy specs:
-#   none, splitXX, tokXX-ckpt, tokXX-act-ckpt
-# splitXX measures split/merge overhead only.
-# tokXX-ckpt checkpoints the full selected expert body.
-# tokXX-act-ckpt saves gate/up and checkpoints activation/down only.
-EXPERT_RECOMPUTE_POLICIES="none,split0,tok0-ckpt,tok0-act-ckpt,split512,tok512-ckpt,tok512-act-ckpt"
+#   none, tok-le0, tok-le0-act, tok-leXX, tok-geXX, tokA-B, and -act variants.
+# tok-leXX/tok-geXX/tokA-B drop gate/up/activated for selected experts and recompute them in backward.
+# -act variants save gate/up and drop only activated for selected experts.
+# EXPERT_RECOMPUTE_POLICIES="none,tok-le512,tok-le512-act"
+EXPERT_RECOMPUTE_POLICIES="none,tok-le512"
 MLP_INTERMEDIATE_DIM=0
 MLP_EXPANSION=4
 LORA_RANK=64
@@ -102,7 +102,7 @@ Shell options:
   --backends LIST                     asym, torch, kt, or all.
   --profilers LIST                    source, nsys, cpu, ncu, or all.
   --seq-lens LIST                     Sequence lengths. Accepts 64,128 or "64 128".
-  --expert-recompute-policies LIST     MoE expert policies: none,split128,tok128-ckpt,tok128-act-ckpt.
+  --expert-recompute-policies LIST     MoE expert policies: none,tok-le128,tok-ge128,tok64-256, and -act variants.
   --jobs-per-gpu N                    Concurrent Python driver jobs per GPU.
   --python-bin PATH                   Python interpreter. Default: PYTHON or python3.
   --output-root PATH                  Base output root. Default: profiling.
@@ -119,7 +119,7 @@ Shell options:
   --plot true|false                   Write per-config plots and a top-level combined plot directory after profiling.
   --plot-output-dir PATH              Plot output directory.
   --recompute norecomp|recomp|both     Run without recompute, with recompute, or both.
-                                      Active expert policies run checkpoint expert recompute; layer recompute is only used for policy none.
+                                      Active expert policies use their own expert policy; layer recompute is only used for policy none.
   --overwrite true|false              Re-run completed result dirs. Default false skips them.
   --continue-on-error true|false      Keep sweeping if a point OOMs or fails. Default true records failed rows.
   -h, --help                          Show this help.
@@ -274,47 +274,28 @@ parse_seq_lens() {
   tokens "$@" | dedupe
 }
 
-normalize_util_label() {
-  local suffix="$1"
-  local digits
-  case "${suffix}" in
-    1|1.0|1.00|1.000) printf '%s\n' "util100"; return ;;
-    0|0.0|0.00|0.000) printf '%s\n' "util000"; return ;;
-  esac
-  if [[ "${suffix}" =~ ^0\.([0-9]+)$ ]]; then
-    digits="${BASH_REMATCH[1]}"
-    [[ "${#digits}" -eq 1 ]] && digits="${digits}0"
-    printf 'util%03d\n' "$((10#${digits:0:3}))"
-  elif [[ "${suffix}" =~ ^0([0-9]+)$ ]]; then
-    digits="${BASH_REMATCH[1]}"
-    printf 'util%03d\n' "$((10#${digits}))"
-  elif [[ "${suffix}" =~ ^[0-9]+$ ]]; then
-    [[ "${suffix}" == "1" ]] && { printf '%s\n' "util100"; return; }
-    printf 'util%03d\n' "$((10#${suffix}))"
-  else
-    die "invalid util policy threshold '${suffix}'"
-  fi
-}
-
 normalize_expert_recompute_policy() {
-  local raw="${1,,}"
-  raw="${raw//_/-}"
+  local raw="$1"
   case "${raw}" in
-    ""|none|off|false|0) printf '%s\n' "none"; return ;;
+    none) printf '%s\n' "none"; return ;;
+    tok-le0|tok-le0-act) printf '%s\n' "${raw}"; return ;;
   esac
-  if [[ "${raw}" =~ ^split([0-9]+)$ ]]; then
-    printf 'split%d\n' "$((10#${BASH_REMATCH[1]}))"
+  if [[ "${raw}" =~ ^tok-le([1-9][0-9]*)(-act)?$ ]]; then
+    printf 'tok-le%d%s\n' "$((10#${BASH_REMATCH[1]}))" "${BASH_REMATCH[2]}"
     return
   fi
-  if [[ "${raw}" =~ ^tok([0-9]+)-ckpt$ ]]; then
-    printf 'tok%d-ckpt\n' "$((10#${BASH_REMATCH[1]}))"
+  if [[ "${raw}" =~ ^tok-ge([1-9][0-9]*)(-act)?$ ]]; then
+    printf 'tok-ge%d%s\n' "$((10#${BASH_REMATCH[1]}))" "${BASH_REMATCH[2]}"
     return
   fi
-  if [[ "${raw}" =~ ^tok([0-9]+)-act-ckpt$ ]]; then
-    printf 'tok%d-act-ckpt\n' "$((10#${BASH_REMATCH[1]}))"
+  if [[ "${raw}" =~ ^tok([1-9][0-9]*)-([1-9][0-9]*)(-act)?$ ]]; then
+    local lower="$((10#${BASH_REMATCH[1]}))"
+    local upper="$((10#${BASH_REMATCH[2]}))"
+    ((lower <= upper)) || die "invalid expert recompute policy '${1}'; lower bound exceeds upper bound"
+    printf 'tok%d-%d%s\n' "${lower}" "${upper}" "${BASH_REMATCH[3]}"
     return
   fi
-  die "invalid expert recompute policy '${1}'; expected none, splitXX, tokXX-ckpt, or tokXX-act-ckpt"
+  die "invalid expert recompute policy '${1}'; expected none, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, or -act variants"
 }
 
 parse_expert_recompute_policies() {
@@ -420,7 +401,6 @@ while (($#)); do
     --seq-lens=*) seq_spec="${1#*=}"; shift ;;
     --expert-recompute-policy=*) die "use --expert-recompute-policies; this wrapper keeps one option per setting" ;;
     --expert-recompute-policies=*) expert_recompute_policy_spec="${1#*=}"; shift ;;
-    --expert-recompute-threshold=*|--expert-recompute-thresholds=*) die "legacy threshold flags were removed; use --expert-recompute-policies none,split128,tok128-ckpt,tok128-act-ckpt" ;;
     --batch-size=*) batch_size="${1#*=}"; shift ;;
     --jobs-per-gpu=*) jobs_per_gpu="${1#*=}"; shift ;;
     --python-bin=*) PYTHON_BIN="${1#*=}"; shift ;;
@@ -448,7 +428,6 @@ while (($#)); do
     --seq-lens) collect_values "$1" vals "${@:2}"; seq_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
     --expert-recompute-policy) die "use --expert-recompute-policies; this wrapper keeps one option per setting" ;;
     --expert-recompute-policies) collect_values "$1" vals "${@:2}"; expert_recompute_policy_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
-    --expert-recompute-threshold|--expert-recompute-thresholds) die "legacy threshold flags were removed; use --expert-recompute-policies none,split128,tok128-ckpt,tok128-act-ckpt" ;;
     --batch-size) need_value "$1" "${2-}"; batch_size="$2"; shift 2 ;;
     --jobs-per-gpu) need_value "$1" "${2-}"; jobs_per_gpu="$2"; shift 2 ;;
     --python-bin) need_value "$1" "${2-}"; PYTHON_BIN="$2"; shift 2 ;;

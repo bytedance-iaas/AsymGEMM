@@ -46,6 +46,7 @@ agent/
 /profiling*/*
 # !/profiling/transpose_ncu/
 # !/profiling/transpose_ncu/**
+results/
 reports/
 third-party/
 
