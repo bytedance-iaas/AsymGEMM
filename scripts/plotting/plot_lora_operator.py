@@ -51,6 +51,61 @@ DTYPE_ALIASES = {
     "fp32": "float32",
     "float32": "float32",
 }
+STYLE_PALETTE = (
+    "#0072B2",  # blue
+    "#D55E00",  # vermillion
+    "#009E73",  # green
+    "#CC79A7",  # reddish purple
+    "#E69F00",  # orange
+    "#000000",  # black
+    "#6A3D9A",  # purple
+    "#A6761D",  # brown
+    "#E31A1C",  # red
+    "#17BECF",  # cyan
+    "#F0E442",  # yellow
+    "#7F7F7F",  # gray
+    "#1B9E77",  # teal
+    "#E7298A",  # magenta
+    "#8DD3C7",
+    "#FB8072",
+    "#80B1D3",
+    "#FDB462",
+    "#B3DE69",
+    "#FCCDE5",
+    "#BC80BD",
+    "#CCEBC5",
+    "#FFED6F",
+    "#1F78B4",
+    "#33A02C",
+    "#E31A1C",
+    "#FF7F00",
+    "#6A3D9A",
+    "#B15928",
+    "#A6CEE3",
+    "#B2DF8A",
+    "#FB9A99",
+    "#FDBF6F",
+    "#CAB2D6",
+    "#FFFF99",
+    "#8C564B",
+    "#17BECF",
+    "#7F7F7F",
+    "#AEC7E8",
+    "#FFBB78",
+    "#98DF8A",
+    "#FF9896",
+    "#C5B0D5",
+)
+BACKEND_MARKERS = {
+    "asym": "^",
+    "torch": "o",
+    "kt": "s",
+}
+BACKEND_HATCHES = {
+    "asym": "//",
+    "torch": "",
+    "kt": "xx",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -329,6 +384,26 @@ def pyplot() -> Any:
     return plt
 
 
+def series_color_map(labels: list[str]) -> dict[str, str]:
+    return {label: STYLE_PALETTE[index % len(STYLE_PALETTE)] for index, label in enumerate(labels)}
+
+
+def backend_from_label(label: str) -> str:
+    parts = label.split()
+    for part in parts:
+        if part in BACKEND_MARKERS:
+            return part
+    return ""
+
+
+def marker_for_label(label: str) -> str:
+    return BACKEND_MARKERS.get(backend_from_label(label), "D")
+
+
+def hatch_for_label(label: str) -> str:
+    return BACKEND_HATCHES.get(backend_from_label(label), "")
+
+
 def plot_by_shape(
     rows: list[dict[str, Any]],
     output_dir: Path,
@@ -353,10 +428,20 @@ def plot_by_shape(
     x_positions = list(range(len(categories)))
     width = min(0.8, 0.8 / max(1, len(series)))
     offset0 = -0.5 * width * (len(series) - 1)
+    color_by_label = series_color_map(series)
     for index, label in enumerate(series):
         offsets = [x + offset0 + index * width for x in x_positions]
         y_values = [average(values.get((label, category), [])) for category in categories]
-        ax.bar(offsets, y_values, width=width, label=label)
+        ax.bar(
+            offsets,
+            y_values,
+            width=width,
+            label=label,
+            color=color_by_label[label],
+            edgecolor="#222222",
+            linewidth=0.45,
+            hatch=hatch_for_label(label),
+        )
 
     ax.set_title(title)
     ax.set_xlabel("Operator shape")
@@ -393,13 +478,24 @@ def plot_by_tokens(
         values.setdefault((token_series_key(row, include_group=include_group), int(row["tokens"])), []).append(float(row[value_key]))
 
     fig, ax = plt.subplots(figsize=(9, 5), dpi=160)
+    color_by_label = series_color_map(series)
     for label in series:
         points = sorted((tokens, average(items)) for (series_name, tokens), items in values.items() if series_name == label)
         if not points:
             continue
         x_values = [tokens for tokens, _ in points]
         y_values = [value for _, value in points]
-        ax.plot(x_values, y_values, marker="o", linewidth=1.8, label=label)
+        ax.plot(
+            x_values,
+            y_values,
+            marker=marker_for_label(label),
+            color=color_by_label[label],
+            linewidth=1.8,
+            markersize=6,
+            markeredgewidth=0.9,
+            markeredgecolor="#222222",
+            label=label,
+        )
 
     ax.set_title(title)
     ax.set_xlabel("Tokens")

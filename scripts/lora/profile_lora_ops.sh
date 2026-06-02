@@ -12,13 +12,14 @@ OPERATIONS="full_lora"
 # OPERATIONS="xw_sb"
 # BATCH_SIZES="8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32"
 BATCH_SIZES="1"
-SEQ_LENS="2048"
+SEQ_LENS="4096"
 # Same default tensor sizes as scripts/lora/profile_transpose.sh, expressed as
 # LoRA feature pairs IN|OUT with tokens=M=2048:
 #   gate/up: X[M,H] @ W[I,H].T -> Y[M,I]
 #   down:    X[M,I] @ W[H,I].T -> Y[M,H]
 # FEATURE_DIMS="2048|768,768|2048,4096|1536,1536|4096"
-FEATURE_DIMS="2048|768,768|2048"
+# FEATURE_DIMS="2048|768,768|2048"
+FEATURE_DIMS="4096|4096"
 RANK=16
 SCALE=16
 DROPOUT_P=0.1

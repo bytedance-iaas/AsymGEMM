@@ -7,9 +7,9 @@ set -Eeuo pipefail
 ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
 PYTHON_BIN="${PYTHON_BIN:-${PYTHON:-python3}}"
 
-MODE="${MODE:-ncu}"
-# MODE="${MODE:-timing}"
-DEVICE="${DEVICE:-cuda:0}"
+# MODE="${MODE:-ncu}"
+MODE="${MODE:-timing}"
+DEVICE="${DEVICE:-cuda:3}"
 PRECISION="${PRECISION:-bf16}"
 # SHAPES="${SHAPES:-2048|2048|768 2048|768|2048 2048|4096|1536 2048|1536|4096}"
 # SHAPES="${SHAPES:-2048|2048|768}"
@@ -36,7 +36,7 @@ BF16_TRANSPOSE_BLOCK_M="${BF16_TRANSPOSE_BLOCK_M:-${DG_BF16_TRANSPOSE_BLOCK_M:-1
 BF16_TRANSPOSE_BLOCK_N="${BF16_TRANSPOSE_BLOCK_N:-${DG_BF16_TRANSPOSE_BLOCK_N:-128}}"
 BF16_TRANSPOSE_BLOCK_K="${BF16_TRANSPOSE_BLOCK_K:-${DG_BF16_TRANSPOSE_BLOCK_K:-128}}"
 NCU_BIN="${NCU_BIN:-ncu}"
-NCU_OUTPUT_DIR="${NCU_OUTPUT_DIR:-profiling/transpose_ncu}"
+NCU_OUTPUT_DIR="${NCU_OUTPUT_DIR:-profiling/mm_ncu}"
 NCU_KERNEL_REGEX="${NCU_KERNEL_REGEX:-regex:.*sm(90|100).*(bf16|fp8|fp4).*asym_gemm.*impl.*}"
 NCU_SET="${NCU_SET:-full}"
 NCU_REPLAY_MODE="${NCU_REPLAY_MODE:-kernel}"
@@ -48,7 +48,7 @@ NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-}"
 # =============================================================================
 # Derived Parameters
 # =============================================================================
-PROFILE_SCRIPT="${ROOT}/scripts/lora/profile_transpose.py"
+PROFILE_SCRIPT="${ROOT}/scripts/lora/profile_mm.py"
 export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 # =============================================================================
@@ -57,7 +57,7 @@ export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 usage() {
   cat <<USAGE
 Usage:
-  scripts/lora/profile_transpose.sh [options] [extra profile_transpose.py args]
+  scripts/lora/profile_mm.sh [options] [extra profile_mm.py args]
 
 Compares:
   torch_nontranspose: X[M,K] @ W[N,K].T
@@ -206,9 +206,9 @@ done
 case "${MODE}" in
   timing)
     MODE="timing"
-    WARMUP=50
+    WARMUP=10
     ITERS=100
-    REPEATS=50
+    REPEATS=1
     ;;
   ncu)
     MODE="ncu"
@@ -317,7 +317,7 @@ ncu_report_prefix_for_shape() {
   local k="$4"
   local n="$5"
   mkdir -p "${output_dir}"
-  printf '%s/profile_transpose_%s_m%s_k%s_n%s\n' "${output_dir%/}" "${precision}" "${m}" "${k}" "${n}"
+  printf '%s/profile_mm_%s_m%s_k%s_n%s\n' "${output_dir%/}" "${precision}" "${m}" "${k}" "${n}"
 }
 
 run_count=0

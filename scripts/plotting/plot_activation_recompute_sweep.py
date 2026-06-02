@@ -29,6 +29,56 @@ MIN_LINEAR_REGION_POINTS = 4
 SUBLINEAR_SLOPE_TOLERANCE = 0.08
 SUBLINEAR_COLOR = "green"
 SUBLINEAR_ALPHA = 0.055
+STYLE_PALETTE = (
+    "#0072B2",
+    "#D55E00",
+    "#009E73",
+    "#CC79A7",
+    "#E69F00",
+    "#000000",
+    "#6A3D9A",
+    "#A6761D",
+    "#E31A1C",
+    "#17BECF",
+    "#F0E442",
+    "#7F7F7F",
+    "#1B9E77",
+    "#E7298A",
+    "#8DD3C7",
+    "#FB8072",
+    "#80B1D3",
+    "#FDB462",
+    "#B3DE69",
+    "#FCCDE5",
+    "#BC80BD",
+    "#CCEBC5",
+    "#FFED6F",
+    "#1F78B4",
+    "#33A02C",
+    "#E31A1C",
+    "#FF7F00",
+    "#6A3D9A",
+    "#B15928",
+    "#A6CEE3",
+    "#B2DF8A",
+    "#FB9A99",
+    "#FDBF6F",
+    "#CAB2D6",
+    "#FFFF99",
+    "#8C564B",
+    "#17BECF",
+    "#7F7F7F",
+    "#AEC7E8",
+    "#FFBB78",
+    "#98DF8A",
+    "#FF9896",
+    "#C5B0D5",
+)
+BACKEND_MARKERS = {
+    "asym": "^",
+    "torch": "o",
+    "kt": "s",
+}
 ROOT_OUTPUT_FILES = (
     "activation_recompute_sweep_index.csv",
     "activation_recompute_sweep_index.json",
@@ -171,7 +221,10 @@ def output_root(args: argparse.Namespace) -> Path:
 
 def combined_output_root(args: argparse.Namespace, root: Path) -> Path:
     if args.combined_output_dir is not None:
-        return resolve_path(args.combined_output_dir)
+        combined_dir = resolve_path(args.combined_output_dir)
+        if combined_dir.name == "combined" and combined_dir.parent.name == "_combined":
+            return combined_dir.parent
+        return combined_dir
     return root / "combined"
 
 
@@ -569,6 +622,18 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
             config.get("expert_activation_save_threshold", meta.get("expert_activation_save_threshold", 0)),
         )
     )
+    # Expert-policy sweeps are an AsymGEMM feature.  Torch/KT comparison runs
+    # may live under policy-named directories for pairing, but the policy is not
+    # applied to those backends.  Canonicalize them to one baseline series so
+    # plots do not imply torch changes with AsymGEMM expert recompute policy.
+    if str(meta["backend"]) != "asym":
+        expert_recompute_policy_spec = "none"
+        expert_policy_label = "none"
+        expert_recompute_policy = "none"
+        expert_recompute_impl = "none"
+        expert_recompute_threshold = 0
+        expert_activation_save_policy = "save_all"
+        expert_activation_save_threshold = 0
     if expert_activation_save_policy == "tok_act":
         expert_recompute_sweep_x = float(expert_activation_save_threshold)
         expert_recompute_sweep_x_name = "activation_token_threshold"
@@ -709,6 +774,24 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
 def collect_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
     input_root = resolve_path(args.input_root)
     rows = [row for path in result_dirs(input_root) if (row := row_from_result_dir(args, path)) is not None]
+    deduped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        key = (
+            row["workload"],
+            row["precision"],
+            row["batch_size"],
+            row["seq_len"],
+            row["backend"],
+            row["profiler"],
+            row["mode"],
+            row["expert_recompute_policy"],
+            row["expert_recompute_threshold"],
+            row["expert_activation_save_policy"],
+            row["expert_activation_save_threshold"],
+            row["expert_policy_label"],
+        )
+        deduped.setdefault(key, row)
+    rows = list(deduped.values())
     return sorted(
         rows,
         key=lambda row: (
@@ -781,12 +864,14 @@ def step_rows_from_result_dir(args: argparse.Namespace, result_dir: Path) -> lis
         row["loss"] = first_optional(sample, "loss")
         add_optional_ms(row, "forward_ms", sample, "forward_milliseconds", "forward_ms")
         add_optional_ms(row, "backward_ms", sample, "backward_milliseconds", "backward_ms")
+        forward_ms = optional_float(row.get("forward_ms"))
+        backward_ms = optional_float(row.get("backward_ms"))
         step_value = first_optional(sample, "step_milliseconds", "step_ms")
         if step_value is None:
-            forward_ms = optional_float(row.get("forward_ms"))
-            backward_ms = optional_float(row.get("backward_ms"))
             if forward_ms is not None or backward_ms is not None:
                 step_value = (forward_ms or 0.0) + (backward_ms or 0.0)
+        if forward_ms is None and backward_ms is None:
+            continue
         row["step_ms"] = step_value
         add_optional_ms(row, "step_wall_ms", sample, "wall_milliseconds", "wall_ms")
         row["forward_cuda_kernel_busy_ms"] = first_optional(
@@ -838,6 +923,25 @@ def collect_step_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for path in result_dirs(input_root):
         rows.extend(step_rows_from_result_dir(args, path))
+    deduped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        key = (
+            row["workload"],
+            row["precision"],
+            row["batch_size"],
+            row["seq_len"],
+            row["backend"],
+            row["profiler"],
+            row["mode"],
+            row["expert_recompute_policy"],
+            row["expert_recompute_threshold"],
+            row["expert_activation_save_policy"],
+            row["expert_activation_save_threshold"],
+            row["expert_policy_label"],
+            row["raw_step"],
+        )
+        deduped.setdefault(key, row)
+    rows = list(deduped.values())
     return sorted(
         rows,
         key=lambda row: (
@@ -1124,6 +1228,37 @@ def add_legend(ax: Any, *, sublinear_region: bool, fontsize: int | None = None) 
     ax.legend(handles, labels, fontsize=fontsize)
 
 
+def series_color_map(labels: list[str]) -> dict[str, str]:
+    return {label: STYLE_PALETTE[index % len(STYLE_PALETTE)] for index, label in enumerate(labels)}
+
+
+def marker_for_backend(backend: Any) -> str:
+    return BACKEND_MARKERS.get(str(backend), "D")
+
+
+def plot_line(
+    ax: Any,
+    x_values: list[Any],
+    y_values: list[float],
+    *,
+    label: str,
+    backend: Any,
+    linewidth: float,
+    color: str,
+) -> None:
+    ax.plot(
+        x_values,
+        y_values,
+        marker=marker_for_backend(backend),
+        color=color,
+        linewidth=linewidth,
+        markersize=6,
+        markeredgewidth=0.9,
+        markeredgecolor="#222222",
+        label=label,
+    )
+
+
 def plot_metric(
     rows: list[dict[str, Any]],
     output_dir: Path,
@@ -1141,18 +1276,22 @@ def plot_metric(
         "recompute": sorted((row for row in rows if row["mode"] == "recompute"), key=lambda row: row["seq_len"]),
     }
     labels = {"no_recompute": "No recompute", "recompute": "Activation recompute"}
+    color_by_label = series_color_map([labels[mode] for mode, mode_rows in by_mode.items() if mode_rows])
 
     fig, ax = plt.subplots(figsize=(8, 5), dpi=160)
     sublinear_spans: list[tuple[float, float]] = []
     for mode, mode_rows in by_mode.items():
         if not mode_rows:
             continue
-        ax.plot(
+        label = labels[mode]
+        plot_line(
+            ax,
             [row["seq_len"] for row in mode_rows],
             [float(row[key]) / scale for row in mode_rows],
-            marker="o",
+            label=label,
+            backend=mode_rows[0].get("backend", ""),
             linewidth=2,
-            label=labels[mode],
+            color=color_by_label[label],
         )
         sublinear_spans.extend(sublinear_regions(mode_rows, key, scale=scale))
     has_sublinear_region = draw_sublinear_regions(ax, sublinear_spans)
@@ -1182,18 +1321,23 @@ def plot_combined_metric(
     for row in rows:
         series.setdefault((group_key(row), str(row["mode"])), []).append(row)
     varied = varied_fields(rows)
+    series_items: list[tuple[str, list[dict[str, Any]]]] = []
+    for (group, mode), group_rows in sorted(series.items()):
+        sorted_rows = sorted(group_rows, key=lambda row: row["seq_len"])
+        series_items.append((combined_label(group, mode, varied), sorted_rows))
+    color_by_label = series_color_map([label for label, _ in series_items])
 
     fig, ax = plt.subplots(figsize=(11, 6), dpi=160)
     sublinear_spans: list[tuple[float, float]] = []
-    for (group, mode), group_rows in sorted(series.items()):
-        sorted_rows = sorted(group_rows, key=lambda row: row["seq_len"])
-        label = combined_label(group, mode, varied)
-        ax.plot(
+    for label, sorted_rows in series_items:
+        plot_line(
+            ax,
             [row["seq_len"] for row in sorted_rows],
             [float(row[key]) / scale for row in sorted_rows],
-            marker="o",
-            linewidth=1.8,
             label=label,
+            backend=sorted_rows[0].get("backend", ""),
+            linewidth=1.8,
+            color=color_by_label[label],
         )
         sublinear_spans.extend(sublinear_regions(sorted_rows, key, scale=scale))
     has_sublinear_region = draw_sublinear_regions(ax, sublinear_spans)
@@ -1331,16 +1475,23 @@ def plot_step_metric(
         return
 
     varied = varied_fields(rows)
-    fig, ax = plt.subplots(figsize=(11 if combined else 8, 5.5), dpi=160)
+    series_items: list[tuple[str, list[dict[str, Any]]]] = []
     for _, series_rows in sorted(series.items()):
         sorted_rows = sorted(series_rows, key=lambda row: numeric_int(row.get("raw_step"), int(row["step"])))
         label = combined_step_series_label(sorted_rows[0], varied) if combined else step_series_label(sorted_rows[0])
-        ax.plot(
+        series_items.append((label, sorted_rows))
+    color_by_label = series_color_map([label for label, _ in series_items])
+
+    fig, ax = plt.subplots(figsize=(11 if combined else 8, 5.5), dpi=160)
+    for label, sorted_rows in series_items:
+        plot_line(
+            ax,
             [numeric_int(row.get("raw_step"), int(row["step"])) for row in sorted_rows],
             [float(row[key]) / scale for row in sorted_rows],
-            marker="o",
-            linewidth=1.8,
             label=label,
+            backend=sorted_rows[0].get("backend", ""),
+            linewidth=1.8,
+            color=color_by_label[label],
         )
     ax.set_title(title)
     ax.set_xlabel("Raw trainer step")
@@ -1449,18 +1600,28 @@ def plot_threshold_metric(
         "recompute": sorted((row for row in rows if row["mode"] == "recompute"), key=lambda row: row["expert_recompute_threshold"]),
     }
     labels = {"no_recompute": "No layer recompute", "recompute": "Layer recompute"}
+    color_by_label = series_color_map(
+        [
+            labels[mode]
+            for mode, mode_rows in by_mode.items()
+            if len({int(row["expert_recompute_threshold"]) for row in mode_rows}) >= 2
+        ]
+    )
 
     fig, ax = plt.subplots(figsize=(8, 5), dpi=160)
     plotted = False
     for mode, mode_rows in by_mode.items():
         if len({int(row["expert_recompute_threshold"]) for row in mode_rows}) < 2:
             continue
-        ax.plot(
+        label = labels[mode]
+        plot_line(
+            ax,
             [row["expert_recompute_threshold"] for row in mode_rows],
             [float(row[key]) / scale for row in mode_rows],
-            marker="o",
+            label=label,
+            backend=mode_rows[0].get("backend", ""),
             linewidth=2,
-            label=labels[mode],
+            color=color_by_label[label],
         )
         plotted = True
     if not plotted:
@@ -1492,20 +1653,24 @@ def plot_combined_threshold_metric(
     for row in rows:
         series.setdefault((threshold_group_key(row), str(row["mode"])), []).append(row)
     varied = varied_threshold_fields(rows)
+    series_items: list[tuple[str, list[dict[str, Any]]]] = []
+    for (group, mode), group_rows in sorted(series.items()):
+        sorted_rows = sorted(group_rows, key=lambda row: row["expert_recompute_threshold"])
+        if len({int(row["expert_recompute_threshold"]) for row in sorted_rows}) >= 2:
+            series_items.append((combined_threshold_label(group, mode, varied), sorted_rows))
+    color_by_label = series_color_map([label for label, _ in series_items])
 
     fig, ax = plt.subplots(figsize=(11, 6), dpi=160)
     plotted = False
-    for (group, mode), group_rows in sorted(series.items()):
-        sorted_rows = sorted(group_rows, key=lambda row: row["expert_recompute_threshold"])
-        if len({int(row["expert_recompute_threshold"]) for row in sorted_rows}) < 2:
-            continue
-        label = combined_threshold_label(group, mode, varied)
-        ax.plot(
+    for label, sorted_rows in series_items:
+        plot_line(
+            ax,
             [row["expert_recompute_threshold"] for row in sorted_rows],
             [float(row[key]) / scale for row in sorted_rows],
-            marker="o",
-            linewidth=1.8,
             label=label,
+            backend=sorted_rows[0].get("backend", ""),
+            linewidth=1.8,
+            color=color_by_label[label],
         )
         plotted = True
     if not plotted:
@@ -1538,20 +1703,24 @@ def plot_policy_metric(
     for row in rows:
         series.setdefault((str(row["mode"]), policy_series_suffix(row, family)), []).append(row)
     labels = {"no_recompute": "No layer recompute", "recompute": "Layer recompute"}
+    series_items: list[tuple[str, list[dict[str, Any]]]] = []
+    for (mode, token_cap), series_rows in sorted(series.items()):
+        sorted_rows = sorted(series_rows, key=lambda row: policy_sweep_x(row, family))
+        if len({policy_sweep_x(row, family) for row in sorted_rows}) >= 2:
+            series_items.append((labels.get(mode, mode), sorted_rows))
+    color_by_label = series_color_map([label for label, _ in series_items])
 
     fig, ax = plt.subplots(figsize=(8, 5), dpi=160)
     plotted = False
-    for (mode, token_cap), series_rows in sorted(series.items()):
-        sorted_rows = sorted(series_rows, key=lambda row: policy_sweep_x(row, family))
-        if len({policy_sweep_x(row, family) for row in sorted_rows}) < 2:
-            continue
-        label = labels.get(mode, mode)
-        ax.plot(
+    for label, sorted_rows in series_items:
+        plot_line(
+            ax,
             [policy_sweep_x(row, family) for row in sorted_rows],
             [float(row[key]) / scale for row in sorted_rows],
-            marker="o",
-            linewidth=2,
             label=label,
+            backend=sorted_rows[0].get("backend", ""),
+            linewidth=2,
+            color=color_by_label[label],
         )
         plotted = True
     if not plotted:
@@ -1584,20 +1753,24 @@ def plot_combined_policy_metric(
     for row in rows:
         series.setdefault((threshold_group_key(row), str(row["mode"]), policy_series_suffix(row, family)), []).append(row)
     varied = varied_threshold_fields(rows)
+    series_items: list[tuple[str, list[dict[str, Any]]]] = []
+    for (group, mode, token_cap), group_rows in sorted(series.items()):
+        sorted_rows = sorted(group_rows, key=lambda row: policy_sweep_x(row, family))
+        if len({policy_sweep_x(row, family) for row in sorted_rows}) >= 2:
+            series_items.append((combined_threshold_label(group, mode, varied), sorted_rows))
+    color_by_label = series_color_map([label for label, _ in series_items])
 
     fig, ax = plt.subplots(figsize=(11, 6), dpi=160)
     plotted = False
-    for (group, mode, token_cap), group_rows in sorted(series.items()):
-        sorted_rows = sorted(group_rows, key=lambda row: policy_sweep_x(row, family))
-        if len({policy_sweep_x(row, family) for row in sorted_rows}) < 2:
-            continue
-        label = combined_threshold_label(group, mode, varied)
-        ax.plot(
+    for label, sorted_rows in series_items:
+        plot_line(
+            ax,
             [policy_sweep_x(row, family) for row in sorted_rows],
             [float(row[key]) / scale for row in sorted_rows],
-            marker="o",
-            linewidth=1.8,
             label=label,
+            backend=sorted_rows[0].get("backend", ""),
+            linewidth=1.8,
+            color=color_by_label[label],
         )
         plotted = True
     if not plotted:
@@ -2048,15 +2221,15 @@ def main() -> None:
     ]
     if seq_rows and not args.skip_combined:
         write_combined_plots(seq_rows, combined_dir)
-    if seq_step_rows and not args.skip_combined:
-        write_combined_step_plots(seq_step_rows, combined_dir)
+    if step_rows and not args.skip_combined:
+        write_combined_step_plots(step_rows, combined_dir)
 
     if not args.combined_only:
         groups: dict[tuple[str, str, int, str, str], list[dict[str, Any]]] = {}
         for row in seq_rows:
             groups.setdefault(group_key(row), []).append(row)
         step_groups: dict[tuple[str, str, int, str, str], list[dict[str, Any]]] = {}
-        for row in seq_step_rows:
+        for row in step_rows:
             step_groups.setdefault(group_key(row), []).append(row)
         for key in sorted(set(groups) | set(step_groups)):
             group_rows = groups.get(key, [])

@@ -50,12 +50,16 @@ PROFILE_MODULE_FILTER=${PROFILE_MODULE_FILTER:-attention,mlp,experts,lora,optimi
 PROFILE_SOURCE_JSON=${PROFILE_SOURCE_JSON:-}
 PROFILE_NSYS_PREFIX=${PROFILE_NSYS_PREFIX:-}
 PROFILE_NSYS_SQLITE=${PROFILE_NSYS_SQLITE:-}
+PROFILE_NSYS_CAPTURE_RANGE=${PROFILE_NSYS_CAPTURE_RANGE:-cudaProfilerApi} # cudaProfilerApi | none
 PROFILE_JSON=${PROFILE_JSON:-}
 PROFILE_SUMMARY_MD=${PROFILE_SUMMARY_MD:-}
 PROFILE_OUTPUT_DIR=${PROFILE_OUTPUT_DIR:-}
 PROFILE_WORKLOAD_LABEL=${PROFILE_WORKLOAD_LABEL:-}
 PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-}
 PROFILE_EXPERT_POLICY=${PROFILE_EXPERT_POLICY:-${ASYM_EXPERT_RECOMPUTE_POLICY}}
+if [[ "${BACKEND}" == "torch" ]]; then
+  PROFILE_EXPERT_POLICY=none
+fi
 
 # =============================================================================
 # Derived Parameters
@@ -166,8 +170,6 @@ if [[ ! -d "${ENV_DIR}" ]]; then
   echo "Missing env ${ENV_DIR}. Run ${ASYM_DIR}/scripts/lf/bootstrap_lf_asym_env.sh first." >&2
   exit 2
 fi
-
-mkdir -p "${OUT_DIR}"
 
 if [[ "${PROFILE}" == "1" && ! -f "${PROFILE_LAUNCHER}" ]]; then
   echo "Missing profile launcher ${PROFILE_LAUNCHER}" >&2
@@ -323,6 +325,7 @@ if [[ "${PROFILE}" == "1" ]]; then
   echo "PROFILE_SUMMARY_MD=${PROFILE_SUMMARY_MD}" | tee -a "${LOG_FILE}"
   [[ -n "${PROFILE_NSYS_PREFIX}" ]] && echo "PROFILE_NSYS_PREFIX=${PROFILE_NSYS_PREFIX}" | tee -a "${LOG_FILE}"
   [[ -n "${PROFILE_NSYS_SQLITE}" ]] && echo "PROFILE_NSYS_SQLITE=${PROFILE_NSYS_SQLITE}" | tee -a "${LOG_FILE}"
+  [[ "${PROFILE_PROFILER}" == "nsys" ]] && echo "PROFILE_NSYS_CAPTURE_RANGE=${PROFILE_NSYS_CAPTURE_RANGE}" | tee -a "${LOG_FILE}"
 fi
 
 RUN_ENV=(
@@ -368,6 +371,9 @@ if [[ "${PROFILE}" == "1" ]]; then
     ASYM_GEMM_LF_CONFIG_EXPERT_POLICY="${PROFILE_EXPERT_POLICY}"
     ASYM_GEMM_LF_CONFIG_PROFILE_LEVEL="${PROFILE_LEVEL}"
   )
+  if [[ "${PROFILE_PROFILER}" == "nsys" && "${PROFILE_NSYS_CAPTURE_RANGE}" == "cudaProfilerApi" ]]; then
+    RUN_ENV+=(ASYM_GEMM_LF_NSYS_CAPTURE_RANGE=1)
+  fi
 fi
 
 if [[ "${PROFILE}" == "1" ]]; then
@@ -439,6 +445,9 @@ if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "nsys" ]]; then
     --force-overwrite=true
     "--output=${PROFILE_NSYS_PREFIX}"
   )
+  if [[ "${PROFILE_NSYS_CAPTURE_RANGE}" == "cudaProfilerApi" ]]; then
+    NSYS_CMD+=(--capture-range=cudaProfilerApi --capture-range-end=stop)
+  fi
   env "${RUN_ENV[@]}" "${NSYS_CMD[@]}" "${LAUNCH_CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"
 else
   env "${RUN_ENV[@]}" "${LAUNCH_CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"

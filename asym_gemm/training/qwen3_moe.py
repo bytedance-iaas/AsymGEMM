@@ -709,8 +709,7 @@ class AsymQwen3Experts(nn.Module):
         if self.lora_dropout_p > 0.0:
             raise NotImplementedError("Qwen3 expert recompute requires lora_dropout=0.0; no slow checkpoint fallback is used")
         if not _is_silu_activation(self.act_fn):
-            raise NotImplementedError("Qwen3 expert recompute currently supports only SiLU activation")
-
+            raise NotImplementedError("AsymGEMM expert recompute supports only SiLU expert activation")
         with prof_range(self._forward_range("expert_policy")):
             counts = metadata.expert_counts.to(device=packed.device, dtype=torch.long)
             empty_groups = torch.zeros_like(counts, dtype=torch.bool)

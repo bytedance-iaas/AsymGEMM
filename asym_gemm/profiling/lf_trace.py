@@ -64,9 +64,18 @@ class LFTraceConfig:
     module_filter: str = "attention,mlp,experts,lora,optimizer"
     memory_attribution: bool = False
     sync: bool = False
+    nsys_capture_range: bool = False
+    warmup_steps: int = 0
+    total_steps: int = 0
 
     @classmethod
     def from_env(cls, env: dict[str, str]) -> "LFTraceConfig":
+        def env_int(name: str) -> int:
+            try:
+                return max(int(env.get(name, "0")), 0)
+            except ValueError:
+                return 0
+
         return cls(
             level=env.get("ASYM_GEMM_LF_PROFILE_LEVEL", "stage").strip().lower(),
             layers=env.get("ASYM_GEMM_LF_PROFILE_LAYERS", "all").strip().lower(),
@@ -76,6 +85,9 @@ class LFTraceConfig:
             ),
             memory_attribution=_parse_bool(env.get("ASYM_GEMM_LF_PROFILE_MEMORY_ATTRIBUTION", "0")),
             sync=_parse_bool(env.get("ASYM_GEMM_LF_PROFILE_SYNC", "0")),
+            nsys_capture_range=_parse_bool(env.get("ASYM_GEMM_LF_NSYS_CAPTURE_RANGE", "0")),
+            warmup_steps=env_int("ASYM_GEMM_LF_CONFIG_WARMUP_STEPS"),
+            total_steps=env_int("ASYM_GEMM_LF_CONFIG_TOTAL_STEPS"),
         )
 
     def __post_init__(self) -> None:
@@ -245,6 +257,48 @@ def _stage(handle: LFTraceHandle, name: str):
     return prof_range(name)
 
 
+def _cuda_profiler_start_once(handle: LFTraceHandle) -> None:
+    if getattr(handle, "_asym_lf_cuda_profiler_started", False):
+        return
+    setattr(handle, "_asym_lf_cuda_profiler_started", True)
+    try:
+        torch.cuda.cudart().cudaProfilerStart()
+    except Exception as exc:
+        warnings.warn(f"failed to start CUDA profiler capture: {exc}", RuntimeWarning)
+
+
+def _cuda_profiler_stop_once(handle: LFTraceHandle) -> None:
+    if getattr(handle, "_asym_lf_cuda_profiler_stopped", False):
+        return
+    setattr(handle, "_asym_lf_cuda_profiler_stopped", True)
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+    except Exception as exc:
+        warnings.warn(f"failed to stop CUDA profiler capture: {exc}", RuntimeWarning)
+
+
+def _maybe_start_nsys_capture(handle: LFTraceHandle) -> None:
+    if not handle.config.nsys_capture_range:
+        return
+    raw_step = int(getattr(handle, "_asym_lf_forward_raw_step", 0)) + 1
+    setattr(handle, "_asym_lf_forward_raw_step", raw_step)
+    start_step = max(int(handle.config.warmup_steps), 0) + 1
+    if raw_step == start_step:
+        _cuda_profiler_start_once(handle)
+
+
+def _maybe_stop_nsys_capture(handle: LFTraceHandle) -> None:
+    if not handle.config.nsys_capture_range:
+        return
+    raw_step = int(getattr(handle, "_asym_lf_backward_raw_step", 0)) + 1
+    setattr(handle, "_asym_lf_backward_raw_step", raw_step)
+    total_steps = int(handle.config.total_steps)
+    if total_steps > 0 and raw_step >= total_steps:
+        _cuda_profiler_stop_once(handle)
+
+
 @contextmanager
 def _range(handle: LFTraceHandle, name: str) -> Iterator[None]:
     with _stage(handle, name):
@@ -319,6 +373,7 @@ def _patch_training_phases(handle: LFTraceHandle) -> None:
             if getattr(self, "_asym_lf_in_compute_loss_profile", False):
                 return original(self, *args, **kwargs)
             setattr(self, "_asym_lf_in_compute_loss_profile", True)
+            _maybe_start_nsys_capture(handle)
             with _range(handle, "step.forward"):
                 try:
                     with prof_range("lf.forward_loss"):
@@ -371,7 +426,10 @@ def _patch_training_phases(handle: LFTraceHandle) -> None:
         def backward_with_profile(self: Any, *args: Any, **kwargs: Any) -> Any:
             with _range(handle, "step.backward"):
                 with prof_range("lf.backward"):
-                    return original(self, *args, **kwargs)
+                    try:
+                        return original(self, *args, **kwargs)
+                    finally:
+                        _maybe_stop_nsys_capture(handle)
 
         return backward_with_profile
 

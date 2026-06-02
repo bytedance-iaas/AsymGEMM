@@ -24,12 +24,43 @@ import heapq
 import json
 import re
 import sqlite3
+import sys
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
 
 def _table_exists(con: sqlite3.Connection, name: str) -> bool:
     return con.execute("select 1 from sqlite_master where type='table' and name=?", (name,)).fetchone() is not None
+
+
+def _prepare_sqlite_for_profile_queries(con: sqlite3.Connection) -> None:
+    con.execute("pragma temp_store=memory")
+    con.execute("pragma cache_size=-262144")
+    con.execute("pragma mmap_size=2147483648")
+    index_specs = [
+        ("NVTX_EVENTS", "idx_asym_nvtx_text_start_end", "text,start,end"),
+        ("NVTX_EVENTS", "idx_asym_nvtx_start_end", "start,end"),
+        ("CUPTI_ACTIVITY_KIND_RUNTIME", "idx_asym_runtime_start_end", "start,end"),
+        ("CUPTI_ACTIVITY_KIND_RUNTIME", "idx_asym_runtime_corr", "correlationId"),
+        ("CUPTI_ACTIVITY_KIND_KERNEL", "idx_asym_kernel_corr", "correlationId"),
+        ("CUPTI_ACTIVITY_KIND_KERNEL", "idx_asym_kernel_start_end", "start,end"),
+        ("CUPTI_ACTIVITY_KIND_MEMCPY", "idx_asym_memcpy_corr", "correlationId"),
+        ("CUPTI_ACTIVITY_KIND_SYNCHRONIZATION", "idx_asym_sync_start_end", "start,end"),
+    ]
+    for table, index_name, columns in index_specs:
+        if _table_exists(con, table):
+            con.execute(f"create index if not exists {index_name} on {table}({columns})")
+    con.commit()
+
+
+def _log_timing(message: str, start: float | None = None) -> float:
+    now = time.perf_counter()
+    if start is None:
+        print(message, file=sys.stderr, flush=True)
+    else:
+        print(f"{message}: {now - start:.2f}s", file=sys.stderr, flush=True)
+    return now
 
 
 def _interval_union(intervals: list[tuple[int, int]]) -> int:
@@ -2345,22 +2376,33 @@ def main() -> None:
     parser.add_argument("--memory-profile-dir", type=Path, help="Directory containing a memory-only source profiler *_profile.json report.")
     args = parser.parse_args()
 
+    total_start = time.perf_counter()
     con = sqlite3.connect(str(args.sqlite_path))
+    phase_start = _log_timing("Preparing Nsight SQLite indexes")
+    _prepare_sqlite_for_profile_queries(con)
+    phase_start = _log_timing("Prepared Nsight SQLite indexes", phase_start)
     source_profile = _load_source_profile(args.source_profile_json) or _load_source_profile(args.source_profile_dir)
     memory_profile = _load_source_profile(args.memory_profile_json) or _load_source_profile(args.memory_profile_dir)
+    phase_start = _log_timing("Summarizing Nsight stages")
+    forward_stage = summarize_stage(con, "step.forward", source_profile)
+    backward_stage = summarize_stage(con, "step.backward", source_profile)
+    phase_start = _log_timing("Summarized Nsight stages", phase_start)
+    phase_start = _log_timing("Summarizing per-step samples")
+    step_samples = summarize_step_samples(con, source_profile)
+    _log_timing("Summarized per-step samples", phase_start)
     report = {
         "source": str(args.sqlite_path),
         "source_profile": source_profile,
         "memory_profile": memory_profile,
-        "stages": [
-            summarize_stage(con, "step.forward", source_profile),
-            summarize_stage(con, "step.backward", source_profile),
-        ],
-        "step_samples": summarize_step_samples(con, source_profile),
+        "stages": [forward_stage, backward_stage],
+        "step_samples": step_samples,
     }
     if args.output_json:
+        phase_start = _log_timing("Writing Nsight JSON report")
         args.output_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _log_timing("Wrote Nsight JSON report", phase_start)
     if args.output_md:
+        phase_start = _log_timing("Writing Nsight markdown reports")
         summary_text = markdown(report)
         args.output_md.write_text(summary_text, encoding="utf-8")
         for sibling_name in ("summary.md", "table.md"):
@@ -2369,11 +2411,15 @@ def main() -> None:
                 sibling.write_text(summary_text, encoding="utf-8")
         args.output_md.with_name("lat.md").write_text(latency_markdown(report), encoding="utf-8")
         args.output_md.with_name("memory.md").write_text(memory_markdown(report), encoding="utf-8")
+        _log_timing("Wrote Nsight markdown reports", phase_start)
     artifact_dir = args.output_json.parent if args.output_json else args.output_md.parent if args.output_md else None
     if artifact_dir is not None:
+        phase_start = _log_timing("Writing Nsight CSV/sample artifacts")
         write_step_sample_artifacts(report, artifact_dir)
+        _log_timing("Wrote Nsight CSV/sample artifacts", phase_start)
     if not args.output_json and not args.output_md:
         print(json.dumps(report, indent=2, sort_keys=True))
+    _log_timing("Finished Nsight postprocess total", total_start)
 
 
 if __name__ == "__main__":

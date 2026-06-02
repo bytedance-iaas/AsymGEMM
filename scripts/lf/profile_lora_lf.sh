@@ -14,11 +14,11 @@ GPU_POOL=${GPU_POOL:-0,1}
 # MODEL_SPECS=${MODEL_SPECS:-Qwen/Qwen3-30B-A3B|1}
 # MODEL_SPECS=${MODEL_SPECS:-Qwen/Qwen3-235B-A22B|2}
 # MODEL_SPECS=${MODEL_SPECS:-google/gemma-4-26B-A4B|1}
-MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1 google/gemma-4-26B-A4B|1 meta-llama/Llama-4-Scout-17B-16E|2"}
-# MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|2"}
+MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1 meta-llama/Llama-4-Scout-17B-16E|2"}
+# MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|2 google/gemma-4-26B-A4B|1"}
 
-BACKENDS=${BACKENDS:-asym,torch}
-# BACKENDS=${BACKENDS:-torch}
+# BACKENDS=${BACKENDS:-asym,torch}
+BACKENDS=${BACKENDS:-torch}
 PROFILERS=${PROFILERS:-nsys}
 PRECISION=${PRECISION:-bf16}
 
@@ -36,7 +36,9 @@ LORA_ALPHA=${LORA_ALPHA:-16}
 LORA_DROPOUT=${LORA_DROPOUT:-0.0}
 RECOMPUTE=${RECOMPUTE:-norecomp}
 # EXPERT_POLICIES=${EXPERT_POLICIES-"tok-le0 tok-le256 tok-le512 tok-le1024 tok-le2048"}
-EXPERT_POLICIES=${EXPERT_POLICIES-"tok-le0 tok-le512 tok-le1024 tok-le2048 tok-le0-act tok-le512-act tok-le1024-act tok-le2048-act tok-le4096 tok-le4096-act tok-le256 tok-le256-act"}
+# EXPERT_POLICIES=${EXPERT_POLICIES-"tok-le0 tok-le512 tok-le1024 tok-le2048 tok-le0-act tok-le512-act tok-le1024-act tok-le2048-act tok-le256 tok-le256-act"}
+EXPERT_POLICIES=${EXPERT_POLICIES-"none"}
+
 
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
 ASYM_STRICT=${ASYM_STRICT:-true}
@@ -516,6 +518,19 @@ declare -A compare_group_config_roots=()
 declare -A compare_group_labels=()
 declare -a compare_group_keys=()
 failures=0
+interrupted=false
+current_child_pid=""
+
+handle_interrupt() {
+  interrupted=true
+  echo "Interrupted; stopping LF profiling sweep." >&2
+  if [[ -n "${current_child_pid}" ]]; then
+    kill -INT "-${current_child_pid}" 2>/dev/null || true
+    kill -INT "${current_child_pid}" 2>/dev/null || true
+  fi
+}
+
+trap handle_interrupt INT TERM
 
 run_job() {
   local backend="$1"
@@ -648,7 +663,19 @@ run_job() {
   } > "${seq_root}/command.txt"
 
   local status=0
-  "${run_cmd[@]}" || status=$?
+  current_child_pid=""
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "${run_cmd[@]}" &
+  else
+    "${run_cmd[@]}" &
+  fi
+  current_child_pid=$!
+  wait "${current_child_pid}" || status=$?
+  current_child_pid=""
+  if [[ "${interrupted}" == "true" || "${status}" == "130" || "${status}" == "143" ]]; then
+    echo "Interrupted run; exiting without scheduling more jobs." >&2
+    exit 130
+  fi
   if ((status == 0)); then
     if [[ ! -f "${profile_json}" ]]; then
       echo "Missing expected profile artifact: ${profile_json}" >&2
@@ -661,6 +688,8 @@ run_job() {
     printf 'ok\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}" \
       >> "${config_root}/jobs.tsv"
+    plot_single_run "${config_root}" "${seq_len}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${seq_root}"
+    plot_running_combined "${config_root}" "${seq_len}" "${seq_root}"
   else
     printf 'failed:%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "${status}" "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}" \
@@ -759,6 +788,68 @@ plot_config_root() {
   for recompute in "${recompute_modes[@]}"; do plot_cmd+=(--recompute "${recompute}"); done
   echo "Writing LF profile plots: ${plot_root}"
   "${plot_cmd[@]}"
+}
+
+plot_running_combined() {
+  local config_root="$1"
+  local seq_len="$2"
+  local seq_root="$3"
+  local plot_root
+  [[ "${PLOT}" == "true" ]] || return 0
+
+  plot_root="${seq_root}/plots/_combined"
+  local -a plot_cmd=(
+    "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PLOT_SCRIPT}"
+    --input-root "${config_root}"
+    --output-dir "${plot_root}"
+    --combined-output-dir "${plot_root}"
+    --precision "${PRECISION}"
+    --clean-output
+    --combined-only
+    --batch-size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
+    --seq-lens "${seq_len}"
+    --expert-recompute-policies "${expert_policies[@]}"
+  )
+  for backend in "${backends[@]}"; do plot_cmd+=(--backend "${backend}"); done
+  for profiler in "${profilers[@]}"; do plot_cmd+=(--profiler "${profiler}"); done
+  for recompute in "${recompute_modes[@]}"; do plot_cmd+=(--recompute "${recompute}"); done
+  echo "Writing LF running combined plots: ${plot_root}"
+  if ! "${plot_cmd[@]}"; then
+    echo "warning: failed to write running combined plots for ${seq_root}" >&2
+  fi
+}
+
+plot_single_run() {
+  local config_root="$1"
+  local seq_len="$2"
+  local backend="$3"
+  local profiler="$4"
+  local recompute="$5"
+  local expert_policy="$6"
+  local seq_root="$7"
+  local plot_root
+  [[ "${PLOT}" == "true" ]] || return 0
+
+  plot_root="${seq_root}/plots"
+  local -a plot_cmd=(
+    "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PLOT_SCRIPT}"
+    --input-root "${config_root}"
+    --output-dir "${plot_root}"
+    --combined-output-dir "${plot_root}/combined"
+    --precision "${PRECISION}"
+    --clean-output
+    --skip-combined
+    --batch-size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
+    --seq-lens "${seq_len}"
+    --expert-recompute-policies "${expert_policy}"
+    --backend "${backend}"
+    --profiler "${profiler}"
+    --recompute "${recompute}"
+  )
+  echo "Writing LF per-run plots: ${plot_root}"
+  if ! "${plot_cmd[@]}"; then
+    echo "warning: failed to write per-run plots for ${seq_root}" >&2
+  fi
 }
 
 for model_spec_entry in "${model_specs[@]}"; do
