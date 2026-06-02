@@ -1386,6 +1386,7 @@ class AsymGroupedFrozenLinear(nn.Module):
         *,
         dense_experts: bool = False,
         profile_name: str | None = None,
+        compiled_dims: str | None = None,
     ) -> torch.Tensor:
         effective_profile_name = self.profile_name if profile_name is None else profile_name
         return asym_grouped_frozen_linear(
@@ -1395,7 +1396,7 @@ class AsymGroupedFrozenLinear(nn.Module):
             experts,
             backend=self.backend,
             stats=self.stats,
-            compiled_dims=self.compiled_dims,
+            compiled_dims=self.compiled_dims if compiled_dims is None else compiled_dims,
             profile_name=effective_profile_name,
             precision=self.precision,
             dense_experts=dense_experts,

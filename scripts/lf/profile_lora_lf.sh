@@ -17,8 +17,8 @@ GPU_POOL=${GPU_POOL:-0,1}
 MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1 meta-llama/Llama-4-Scout-17B-16E|2"}
 # MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|2 google/gemma-4-26B-A4B|1"}
 
-# BACKENDS=${BACKENDS:-asym,torch}
-BACKENDS=${BACKENDS:-torch}
+BACKENDS=${BACKENDS:-asym,torch}
+# BACKENDS=${BACKENDS:-torch}
 PROFILERS=${PROFILERS:-nsys}
 PRECISION=${PRECISION:-bf16}
 
@@ -37,7 +37,9 @@ LORA_DROPOUT=${LORA_DROPOUT:-0.0}
 RECOMPUTE=${RECOMPUTE:-norecomp}
 # EXPERT_POLICIES=${EXPERT_POLICIES-"tok-le0 tok-le256 tok-le512 tok-le1024 tok-le2048"}
 # EXPERT_POLICIES=${EXPERT_POLICIES-"tok-le0 tok-le512 tok-le1024 tok-le2048 tok-le0-act tok-le512-act tok-le1024-act tok-le2048-act tok-le256 tok-le256-act"}
-EXPERT_POLICIES=${EXPERT_POLICIES-"none"}
+EXPERT_POLICIES=${EXPERT_POLICIES-"none tok-le0 tok-le512 tok-le1024 tok-le2048 tok-le0-act tok-le512-act tok-le1024-act tok-le2048-act"}
+# EXPERT_POLICIES=${EXPERT_POLICIES-"none"}
+
 
 
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
