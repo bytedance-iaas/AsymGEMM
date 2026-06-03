@@ -625,6 +625,14 @@ def prepare_grouped_lora_metadata(
 ) -> GroupedLoRAMetadata:
     starts = offsets[:-1]
     ends = offsets[1:]
+    if dense_experts:
+        return GroupedLoRAMetadata(
+            offsets=offsets,
+            experts=experts,
+            active_experts=experts[:-1].to(dtype=torch.long),
+            active_offsets=ends.to(dtype=torch.int32).contiguous(),
+            dense_expert_weights=True,
+        )
     active = ends > starts
     active_experts = experts[:-1][active].to(dtype=torch.long)
     active_offsets = ends[active].to(dtype=torch.int32).contiguous()

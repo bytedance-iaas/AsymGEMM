@@ -997,7 +997,6 @@ def main() -> None:
     expert_recompute_policies = _expert_recompute_policies(args)
     cuda_devices = _cuda_devices(args.cuda_devices)
     run_dir = args.output_root / args.run_name if args.run_name else args.output_root
-    run_dir.mkdir(parents=True, exist_ok=True)
 
     requested_activation_recompute = bool(args.activation_recompute)
     rows: list[dict[str, Any]] = []
@@ -1407,12 +1406,13 @@ def main() -> None:
         "runs": rows,
         "comparisons": _add_comparisons(rows),
     }
-    if args.skip_summary:
+    if args.skip_summary or args.dry_run:
         failed = [row for row in rows if row["returncode"] != 0]
         if failed and not args.continue_on_error:
             raise SystemExit(1)
         return
 
+    run_dir.mkdir(parents=True, exist_ok=True)
     summary_stem = "_".join(part for part in (_safe_label(args.precision), _safe_label(WORKFLOW_LABEL), "summary") if part)
     commands_path = run_dir / f"{_safe_label(args.precision)}_{_safe_label(WORKFLOW_LABEL)}_commands.json"
     latency_path = run_dir / "lat.md"

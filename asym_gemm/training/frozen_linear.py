@@ -51,10 +51,15 @@ class AsymExecutionStats:
     kt_forward_calls: int = 0
     kt_backward_calls: int = 0
     kt_lora_update_calls: int = 0
+    reference_fallback_count: int = 0
     fallback_reasons: Dict[str, int] = field(default_factory=dict)
 
     def record_fallback(self, reason: str) -> None:
         self.fallback_reasons[reason] = self.fallback_reasons.get(reason, 0) + 1
+
+    def record_reference_fallback(self, reason: str) -> None:
+        self.reference_fallback_count += 1
+        self.record_fallback(f"reference:{reason}")
 
     @property
     def asym_calls(self) -> int:

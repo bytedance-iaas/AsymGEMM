@@ -86,6 +86,10 @@ def _model_tag(model_name_or_path: str) -> str:
     return _safe_label(Path(model_name_or_path).name)
 
 
+def _dataset_family(train_name: str) -> str:
+    return _safe_label(train_name.split("__", 1)[0])
+
+
 def _infer_template(model_name_or_path: str) -> str:
     base = Path(model_name_or_path).name.lower()
     if base.startswith("gemma-4-") or base.startswith("gemma4-"):
@@ -488,13 +492,14 @@ def _write_results(
 ) -> Path:
     results_root = Path(args.results_root) if args.results_root else Path(args.asym_dir) / "results"
     model_tag = _model_tag(args.model_name_or_path)
+    dataset_root = f"{_dataset_family(args.train_name)}__lora__lf__{args.precision}"
     config = (
         f"{model_tag}__{args.train_name}__b{args.batch_size}_s{args.cutoff_len}_"
         f"r{args.lora_rank}_a{args.lora_alpha}"
     )
-    config_root = results_root / f"lora_lf_{args.precision}" / config
+    config_root = results_root / dataset_root / config
     dataset_dir = config_root / "dataset"
-    combined_dir = results_root / f"lora_lf_{args.precision}" / "combined"
+    combined_dir = results_root / dataset_root / "combined"
 
     _write_json(dataset_dir / "manifest.json", manifest)
     _write_json(dataset_dir / "token_stats.json", token_stats)
@@ -695,14 +700,25 @@ def main() -> None:
         "train": asdict(_token_stats(train_lengths, args.cutoff_len, args.min_tokens)),
         "eval": asdict(_token_stats(eval_lengths, args.cutoff_len, args.min_tokens)),
     }
+    length_errors = []
+    for split, stats in token_stats.items():
+        if stats["at_or_above_min_filter"] < stats["count"]:
+            length_errors.append(
+                f"{split}: {stats['at_or_above_min_filter']}/{stats['count']} rows have "
+                f">= {args.min_tokens} tokens for model {args.model_name_or_path}"
+            )
     train_validation = _validate_jsonl(train_path)
     eval_validation = _validate_jsonl(eval_path)
     dataset_info_validation = _validate_dataset_info(lf_dir, args.train_name, args.eval_name)
     validation: dict[str, Any] = {
-        "ok": train_validation["ok"] and eval_validation["ok"] and dataset_info_validation["ok"],
+        "ok": train_validation["ok"]
+        and eval_validation["ok"]
+        and dataset_info_validation["ok"]
+        and not length_errors,
         "train": train_validation,
         "eval": eval_validation,
         "dataset_info": dataset_info_validation,
+        "length": {"ok": not length_errors, "errors": length_errors},
         "lf_preprocess": {"ok": None, "skipped": True},
     }
 

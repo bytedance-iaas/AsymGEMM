@@ -48,9 +48,6 @@ try:
                 )
             return _raise_missing
 
-        def _export_kernel_alias(alias_name, target_name):
-            globals()[alias_name] = globals().get(target_name, _missing_kernel(target_name))
-
         # DeepGEMM Kernels (may vary by build flags / arch)
         _maybe_import_from_C([
             # FP8 GEMMs
@@ -80,13 +77,6 @@ try:
             "transform_sf_into_required_layout",
             "get_mk_alignment_for_contiguous_layout",
         ])
-
-        # Some alias for legacy supports
-        # TODO: remove these later
-        _export_kernel_alias("fp8_m_grouped_asym_gemm_nt_masked", "m_grouped_fp8_asym_gemm_nt_masked")
-        _export_kernel_alias("fp8_m_grouped_gemm_nt_masked", "m_grouped_fp8_asym_gemm_nt_masked")
-        _export_kernel_alias("bf16_m_grouped_asym_gemm_nt_masked", "m_grouped_bf16_asym_gemm_nt_masked")
-        _export_kernel_alias("bf16_m_grouped_gemm_nt_masked", "m_grouped_bf16_asym_gemm_nt_masked")
 
     # Initialize CPP modules
     def _find_cuda_home() -> str:

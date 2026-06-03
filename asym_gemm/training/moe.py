@@ -455,7 +455,7 @@ def expert_recompute_policy_enabled(
     if normalized == "none":
         return False
     if normalized == "tok":
-        return token_threshold > 0 or token_max is not None or token_min > 1
+        return True
     return False
 
 
@@ -494,8 +494,6 @@ def expert_recompute_group_mask(
     if policy == "none":
         return torch.zeros_like(active)
     if policy == "tok":
-        if token_max is None and token_threshold <= 0 and token_min <= 1:
-            return torch.zeros_like(active)
         return expert_token_range_mask(counts_long, token_min=token_min, token_max=token_max)
     return active
 
@@ -532,7 +530,7 @@ def expert_activation_save_policy_enabled(
     if normalized == "all_act":
         return True
     if normalized == "tok_act":
-        return token_threshold > 0 or token_max is not None or token_min > 1
+        return True
     return False
 
 
@@ -555,8 +553,6 @@ def expert_activation_drop_group_mask(
     if policy == "all_act":
         return active
     if policy == "tok_act":
-        if token_max is None and token_threshold <= 0 and token_min <= 1:
-            return torch.zeros_like(active)
         return expert_token_range_mask(counts_long, token_min=token_min, token_max=token_max)
     return torch.zeros_like(active)
 

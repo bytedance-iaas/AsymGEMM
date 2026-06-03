@@ -383,13 +383,15 @@ def _expert_scope(op: str) -> str:
 
 
 def _projection_scope(op: str) -> str:
+    if "gate_up" in op or "gate.up" in op or "gate up" in op:
+        return "gate+up "
     if "gate_up_lora" in op:
         return "gate/up "
-    if "gate_base" in op or "gate_lora" in op or "gate_proj" in op:
+    if "gate_base" in op or "gate.base" in op or "gate_lora" in op or "gate.lora" in op or "gate_proj" in op:
         return "gate "
-    if "up_base" in op or "up_lora" in op or "up_proj" in op:
+    if "up_base" in op or "up.base" in op or "up_lora" in op or "up.lora" in op or "up_proj" in op:
         return "up "
-    if "down_base" in op or "down_lora" in op or "down_proj" in op:
+    if "down_base" in op or "down.base" in op or "down_lora" in op or "down.lora" in op or "down_proj" in op:
         return "down "
     return ""
 
@@ -1380,7 +1382,7 @@ def _compact_semantic_text(text: str) -> str:
     compact = text.lower()
     compact = re.sub(r"^(forward|backward)\.", "", compact)
     compact = re.sub(r"\blayers\.\d+\.", "", compact)
-    compact = compact.replace("/", " ").replace(".", " ")
+    compact = compact.replace("/", " ").replace(".", " ").replace("+", " ")
     compact = re.sub(r"[_\s]+", " ", compact).strip()
     return compact
 
@@ -1392,6 +1394,9 @@ def _is_attention_scope(text: str) -> bool:
 
 def _semantic_projection(compact: str) -> str:
     patterns = [
+        ("gate up base", "gate_up"),
+        ("gate up lora", "gate_up"),
+        ("gate up", "gate_up"),
         ("q proj", "q_proj"),
         ("k proj", "k_proj"),
         ("v proj", "v_proj"),
@@ -1405,7 +1410,6 @@ def _semantic_projection(compact: str) -> str:
         ("gate base", "gate"),
         ("up base", "up"),
         ("down base", "down"),
-        ("gate up lora", "gate_up"),
         ("gate lora", "gate"),
         ("up lora", "up"),
         ("down lora", "down"),
@@ -1420,6 +1424,8 @@ def _semantic_projection(compact: str) -> str:
 
 
 def _semantic_operation(compact: str) -> str:
+    if "base dx asymgemm" in compact or "grouped base dx asymgemm" in compact:
+        return "base_dx_asymgemm"
     if _is_attention_scope(compact) and (
         "base asymgemm" in compact or "base frozen asymgemm" in compact or "base dx asymgemm" in compact
     ):
@@ -1484,8 +1490,44 @@ def _semantic_operation(compact: str) -> str:
     return ""
 
 
+def _expert_policy_leaf_key(compact: str) -> str | None:
+    if "expert policy" not in compact:
+        return None
+    mappings = [
+        ("recompute gate up selected", "mlp.gate_up.recompute_selected"),
+        ("gate up base dx", "mlp.gate_up.base_dx_prep"),
+        ("save gate up plan", "mlp.gate_up.save_plan"),
+        ("pack recompute selected", "mlp.gate_up.pack_recompute_selected"),
+        ("save activated plan", "mlp.activation.save_plan"),
+        ("save activation rebuild plan", "mlp.activation_rebuild.save_plan"),
+        ("rebuild activation selected", "mlp.activation.rebuild_selected"),
+        ("activation grad silu", "mlp.activation.silu_grad"),
+        ("save recompute plan", "mlp.recompute.save_plan"),
+        ("down base dx", "mlp.down_proj.base_dx"),
+        ("down lora backward", "mlp.down_proj.lora_backward"),
+        ("gate lora backward", "mlp.gate_proj.lora_backward"),
+        ("up lora backward", "mlp.up_proj.lora_backward"),
+        ("restore saved", "mlp.saved_activation.restore"),
+        ("merge lora dx", "mlp.lora.merge_dx"),
+        ("prepare masks", "mlp.expert_policy.prepare_masks"),
+        ("save context", "mlp.expert_policy.save_context"),
+        ("body with intermediates", "mlp.expert_policy.body"),
+    ]
+    for pattern, key in mappings:
+        if pattern in compact:
+            return key
+    return "mlp.expert_policy.wrapper"
+
+
 def _semantic_leaf_key(text: str, *, stage_name: str | None = None) -> str:
     compact = _compact_semantic_text(text)
+    expert_policy_key = _expert_policy_leaf_key(compact)
+    if expert_policy_key is not None:
+        return expert_policy_key
+
+    if compact == "mlp":
+        return "mlp.wrapper"
+
     projection = _semantic_projection(compact)
     operation = _semantic_operation(compact)
 
@@ -1500,6 +1542,8 @@ def _semantic_leaf_key(text: str, *, stage_name: str | None = None) -> str:
             parts.append(projection)
         if operation and operation != projection:
             parts.append(operation)
+        if parts == [domain]:
+            parts.append("wrapper")
         return ".".join(parts)
 
     if _is_attention_scope(compact):
@@ -1516,13 +1560,28 @@ def _semantic_leaf_key(text: str, *, stage_name: str | None = None) -> str:
             parts.append(projection)
         if operation and operation != projection:
             parts.append(operation)
+        if parts == ["routed_expert"]:
+            parts.append("wrapper")
         return ".".join(parts)
 
     if "mlp" in compact or "feed forward" in compact or projection in {"gate_proj", "up_proj", "down_proj"}:
         parts = ["mlp"]
         if projection:
-            parts.append(projection)
+            if projection == "gate_up":
+                parts.append("gate_up")
+            elif projection in {"gate", "up", "down"}:
+                parts.append(f"{projection}_proj")
+            else:
+                parts.append(projection)
         if operation and operation != projection:
+            parts.append(operation)
+        if parts == ["mlp"]:
+            parts.append("wrapper")
+        return ".".join(parts)
+
+    if projection == "gate_up":
+        parts = ["mlp", "gate_up"]
+        if operation:
             parts.append(operation)
         return ".".join(parts)
 
@@ -1537,6 +1596,9 @@ def _semantic_leaf_key(text: str, *, stage_name: str | None = None) -> str:
         if operation and operation != projection:
             parts.append(operation)
         return ".".join(parts)
+
+    if operation in {"route_metadata", "route_metadata_lora"}:
+        return f"mlp.{operation}"
 
     if operation:
         return operation
@@ -1579,7 +1641,9 @@ def _semantic_leaf_label(key: str) -> str:
         "gate_proj": "gate_proj",
         "up_proj": "up_proj",
         "down_proj": "down_proj",
+        "gate_up": "gate+up",
         "base_asymgemm": "base AsymGEMM",
+        "base_dx_asymgemm": "base dX AsymGEMM",
         "base_torch": "base torch",
         "lora_A": "LoRA A",
         "lora_B": "LoRA B",
@@ -1600,6 +1664,24 @@ def _semantic_leaf_label(key: str) -> str:
         "residual_add": "residual add",
         "route_metadata": "route metadata",
         "route_metadata_lora": "route metadata LoRA",
+        "expert_policy": "expert-policy",
+        "body": "body/setup",
+        "prepare_masks": "prepare masks",
+        "save_plan": "save plan",
+        "save_context": "save context",
+        "wrapper": "wrapper overhead",
+        "recompute": "recompute",
+        "recompute_selected": "selected recompute",
+        "pack_recompute_selected": "pack selected recompute",
+        "activation_rebuild": "activation rebuild",
+        "rebuild_selected": "rebuild selected",
+        "saved_activation": "saved activation",
+        "restore": "restore",
+        "base_dx": "base dX",
+        "base_dx_prep": "base dX prep",
+        "lora_backward": "LoRA backward",
+        "silu_grad": "SiLU grad",
+        "merge_dx": "merge dX",
         "pack_tokens": "pack tokens",
         "scatter_combine": "scatter/combine",
         "combine_shared_routed": "combine shared+routed",

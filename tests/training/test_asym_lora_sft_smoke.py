@@ -26,13 +26,6 @@ PACKAGE_MIRRORED_C_BINDINGS = {
     "get_mk_alignment_for_contiguous_layout",
 }
 
-LEGACY_ALIASES = {
-    "fp8_m_grouped_asym_gemm_nt_masked": "m_grouped_fp8_asym_gemm_nt_masked",
-    "fp8_m_grouped_gemm_nt_masked": "m_grouped_fp8_asym_gemm_nt_masked",
-    "bf16_m_grouped_asym_gemm_nt_masked": "m_grouped_bf16_asym_gemm_nt_masked",
-    "bf16_m_grouped_gemm_nt_masked": "m_grouped_bf16_asym_gemm_nt_masked",
-}
-
 BF16_M_GROUPED_CONTIGUOUS = "m_grouped_bf16_asym_gemm_nt_contiguous"
 
 
@@ -102,12 +95,6 @@ def test_c_extension_bindings_match_package_exports(record_property) -> None:
     print(f"_C-only exports: {sorted(c_names - package_names)}")
 
     assert not missing_mirrors
-
-    for alias_name, target_name in LEGACY_ALIASES.items():
-        if hasattr(c_extension, target_name):
-            assert getattr(asym_gemm, alias_name) is getattr(asym_gemm, target_name)
-        else:
-            assert hasattr(asym_gemm, alias_name)
 
 
 def test_hardware_scope_reports_h200_when_cuda_is_available() -> None:

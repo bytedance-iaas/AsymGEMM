@@ -230,9 +230,9 @@ def combined_output_root(args: argparse.Namespace, root: Path) -> Path:
 
 def precision_from_path(path: Path) -> str:
     for parent in (path, *path.parents):
-        for prefix in ("lora_e2e_", "lora_lf_"):
-            if parent.name.startswith(prefix):
-                return parent.name.removeprefix(prefix)
+        for marker in ("__lora__e2e__", "lora__e2e__", "__lora__lf__"):
+            if marker in parent.name:
+                return parent.name.rsplit(marker, 1)[1]
     return ""
 
 

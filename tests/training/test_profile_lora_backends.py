@@ -188,10 +188,10 @@ def test_activation_sweep_plot_parses_expert_policy_flat_dirs() -> None:
     plotter = _load_activation_sweep_plot_module()
 
     ge_meta = plotter.parse_result_dir(
-        Path("/tmp/profiling/lora_e2e_bf16/moe-604m-a38m-l2__b8_s1024_r64_a128/asym__nsys__norecomp__poltok-ge128/s1024")
+        Path("/tmp/profiling/lora__e2e__bf16/moe-604m-a38m-l2__b8_s1024_r64_a128/asym__nsys__norecomp__poltok-ge128/s1024")
     )
     bounded_meta = plotter.parse_result_dir(
-        Path("/tmp/profiling/lora_e2e_bf16/moe-604m-a38m-l2__b8_s1024_r64_a128/asym__nsys__norecomp__poltok64-256/s1024")
+        Path("/tmp/profiling/lora__e2e__bf16/moe-604m-a38m-l2__b8_s1024_r64_a128/asym__nsys__norecomp__poltok64-256/s1024")
     )
 
     assert ge_meta is not None

@@ -106,8 +106,8 @@ Shell options:
   --jobs-per-gpu N                    Concurrent Python driver jobs per GPU.
   --python-bin PATH                   Python interpreter. Default: PYTHON or python3.
   --output-root PATH                  Base output root. Default: profiling.
-                                      Default layout: <root>/lora_e2e_<precision>/<workload>__b<batch>_s<seqs>_r<rank>_a<alpha>
-  --run-name NAME                     Optional config directory under lora_e2e_<precision>.
+                                      Default layout: <root>/lora__e2e__<precision>/<workload>__b<batch>_s<seqs>_r<rank>_a<alpha>
+  --run-name NAME                     Optional config directory under lora__e2e__<precision>.
   --precision NAME                    Result precision label and output precision directory suffix.
   --attention-impl NAME               Attention implementation: sdpa, fa2, fa3, or fa4.
   --mode NAME                         Result filename mode.
@@ -514,8 +514,10 @@ fi
 
 base_output_root="$(abs_path "${output_root}")"
 precision_label="$(safe_label "${precision}")"
-precision_root="${base_output_root}/lora_e2e_${precision_label}"
-mkdir -p "${precision_root}"
+precision_root="${base_output_root}/lora__e2e__${precision_label}"
+if ((!dry_run)); then
+  mkdir -p "${precision_root}"
+fi
 echo "Output precision root: ${precision_root}"
 
 declare -a all_pids=() active_pids=() available_gpus=()
@@ -575,12 +577,6 @@ launch_job() {
   local job_root
   config_root="$(config_root_path "${workload}" "${seq_len}")"
   job_root="$(job_root_path "${config_root}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}")"
-  mkdir -p "${job_root}"
-  if [[ ! -e "${config_root}/jobs.tsv" ]]; then
-    printf 'status\tpid\tgpu\tseq_len\trecompute\texpert_policy\tworkload\tbackend\tprofiler\tjob_dir\tlog\n' > "${config_root}/jobs.tsv"
-  fi
-  plot_roots["${config_root}"]="1"
-  plot_seq_lens["${config_root}"]="${seq_len}"
   local log_file="${job_root}/job.log"
   local command_file="${job_root}/command.txt"
   local cmd=(
@@ -601,6 +597,25 @@ launch_job() {
   )
   [[ "${recompute}" == "recomp" ]] && cmd+=(--activation-recompute)
 
+  echo "Launching gpu=${gpu} seq=${seq_len} recompute=${recompute} expert_policy=${expert_policy} workload=${workload} backend=${backend} profiler=${profiler}"
+  echo "  job=${job_root}"
+  echo "  log=${log_file}"
+  if ((dry_run)); then
+    printf '+ cd %q\n' "${ROOT}"
+    printf '+ CUDA_VISIBLE_DEVICES=%q' "${gpu}"
+    printf ' %q' "${cmd[@]}"
+    printf '\n'
+    available_gpus+=("${gpu}")
+    return
+  fi
+
+  mkdir -p "${job_root}"
+  if [[ ! -e "${config_root}/jobs.tsv" ]]; then
+    printf 'status\tpid\tgpu\tseq_len\trecompute\texpert_policy\tworkload\tbackend\tprofiler\tjob_dir\tlog\n' > "${config_root}/jobs.tsv"
+  fi
+  plot_roots["${config_root}"]="1"
+  plot_seq_lens["${config_root}"]="${seq_len}"
+
   {
     printf 'cd %q\n' "${ROOT}"
     printf 'CUDA_VISIBLE_DEVICES=%q' "${gpu}"
@@ -608,9 +623,6 @@ launch_job() {
     printf '\n'
   } > "${command_file}"
 
-  echo "Launching gpu=${gpu} seq=${seq_len} recompute=${recompute} expert_policy=${expert_policy} workload=${workload} backend=${backend} profiler=${profiler}"
-  echo "  job=${job_root}"
-  echo "  log=${log_file}"
   (cd "${ROOT}" && exec "${cmd[@]}") > "${log_file}" 2>&1 &
 
   local pid=$!

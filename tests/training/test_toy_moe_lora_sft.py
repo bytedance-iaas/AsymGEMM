@@ -451,7 +451,7 @@ def test_moe_module_still_trains() -> None:
 def test_moe_module_expert_recompute_policy_group_selection() -> None:
     counts = torch.tensor([1, 32, 96, 127, 128, 129, 192, 255], dtype=torch.long)
 
-    legacy_tok_mask = moe_module.expert_recompute_group_mask(
+    tok_le_mask = moe_module.expert_recompute_group_mask(
         counts,
         policy="tok",
         token_threshold=128,
@@ -475,7 +475,7 @@ def test_moe_module_expert_recompute_policy_group_selection() -> None:
     )
     none_mask = moe_module.expert_recompute_group_mask(counts, policy="none")
 
-    assert counts[legacy_tok_mask].tolist() == [1, 32, 96, 127, 128]
+    assert counts[tok_le_mask].tolist() == [1, 32, 96, 127, 128]
     assert counts[tok_ge_mask].tolist() == [128, 129, 192, 255]
     assert counts[tok_range_mask].tolist() == [96, 127, 128, 129, 192]
     assert counts[act_range_mask].tolist() == [96, 127, 128, 129, 192]

@@ -73,6 +73,7 @@ class LFAsymReport:
             f"torch_forward_calls={self.stats.torch_forward_calls}, "
             f"torch_dx_calls={self.stats.torch_dx_calls}, "
             f"expert_recompute_policy={self.expert_recompute_policy}, "
+            f"reference_fallback_count={self.stats.reference_fallback_count}, "
             f"fallback_reasons={fallbacks}"
         )
 

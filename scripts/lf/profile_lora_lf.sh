@@ -9,20 +9,23 @@ LF_DIR=${LF_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/LlamaFactory}
 CONDA_EXE=${CONDA_EXE:-conda}
 NSYS_BIN=${NSYS_BIN:-nsys}
 
-GPU_POOL=${GPU_POOL:-0,1}
-# MODEL_SPECS=${MODEL_SPECS:-meta-llama/Llama-4-Scout-17B-16E|2}
-# MODEL_SPECS=${MODEL_SPECS:-Qwen/Qwen3-30B-A3B|1}
-# MODEL_SPECS=${MODEL_SPECS:-Qwen/Qwen3-235B-A22B|2}
-# MODEL_SPECS=${MODEL_SPECS:-google/gemma-4-26B-A4B|1}
-MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1 meta-llama/Llama-4-Scout-17B-16E|2"}
-# MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|2 google/gemma-4-26B-A4B|1"}
+GPU_POOL=${GPU_POOL:-1,2}
+# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1 meta-llama/Llama-4-Scout-17B-16E|2"}
+MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
+
+RECOMPUTE=${RECOMPUTE:-recomp}
+EXPERT_POLICIES=${EXPERT_POLICIES-"none tok-le0 tok-le512 tok-le1024 tok-le512-act tok-le1024-act"}
 
 BACKENDS=${BACKENDS:-asym,torch}
 # BACKENDS=${BACKENDS:-torch}
 PROFILERS=${PROFILERS:-nsys}
-PRECISION=${PRECISION:-bf16}
+PRECISION=${PRECISION:-bf16} 
 
 DATASET=${DATASET:-asym_long_sft_smoke}
+PREPARE_DATASETS=${PREPARE_DATASETS:-true}
+DATASET_MIN_TOKENS=${DATASET_MIN_TOKENS:-auto}
+DATASET_EVAL_ROWS=${DATASET_EVAL_ROWS:-128}
+DATASET_OVERWRITE=${DATASET_OVERWRITE:-false}
 TEMPLATE=${TEMPLATE:-auto}
 SEQ_LENS=${SEQ_LENS:-4096}
 MAX_SAMPLES=${MAX_SAMPLES:-128}
@@ -31,23 +34,17 @@ WARMUP_STEPS=${WARMUP_STEPS:-5}
 PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-1}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
-LORA_RANK=${LORA_RANK:-8}
+LORA_RANK=${LORA_RANK:-64}
 LORA_ALPHA=${LORA_ALPHA:-16}
-LORA_DROPOUT=${LORA_DROPOUT:-0.0}
-RECOMPUTE=${RECOMPUTE:-norecomp}
-# EXPERT_POLICIES=${EXPERT_POLICIES-"tok-le0 tok-le256 tok-le512 tok-le1024 tok-le2048"}
-# EXPERT_POLICIES=${EXPERT_POLICIES-"tok-le0 tok-le512 tok-le1024 tok-le2048 tok-le0-act tok-le512-act tok-le1024-act tok-le2048-act tok-le256 tok-le256-act"}
-EXPERT_POLICIES=${EXPERT_POLICIES-"none tok-le0 tok-le512 tok-le1024 tok-le2048 tok-le0-act tok-le512-act tok-le1024-act tok-le2048-act"}
-# EXPERT_POLICIES=${EXPERT_POLICIES-"none"}
-
-
+LORA_DROPOUT=${LORA_DROPOUT:-0.1}
 
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
 ASYM_STRICT=${ASYM_STRICT:-true}
 REQUIRE_SM100=${REQUIRE_SM100:-1}
 TORCH_DISTRIBUTED_BACKEND=${TORCH_DISTRIBUTED_BACKEND:-deepspeed}
 TORCH_FSDP_CONFIG=${TORCH_FSDP_CONFIG:-${LF_DIR}/examples/accelerate/fsdp2_config.yaml}
-TORCH_DEEPSPEED_CONFIG=${TORCH_DEEPSPEED_CONFIG:-${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json}
+# TORCH_DEEPSPEED_CONFIG=${TORCH_DEEPSPEED_CONFIG:-${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json}
+TORCH_DEEPSPEED_CONFIG=${TORCH_DEEPSPEED_CONFIG:-${LF_DIR}/examples/deepspeed/ds_z3_config.json}
 
 # Optional output/profile controls
 OUTPUT_ROOT=${OUTPUT_ROOT:-profiling}
@@ -72,6 +69,7 @@ OVERWRITE=${OVERWRITE:-false}
 CONTINUE_ON_ERROR=${CONTINUE_ON_ERROR:-true}
 DRY_RUN=${DRY_RUN:-false}
 COLLECT_EXISTING=${COLLECT_EXISTING:-false}
+INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
 
 # Empty optional user parameters
 RUN_NAME=${RUN_NAME:-}
@@ -83,7 +81,9 @@ PLOT_OUTPUT_DIR=${PLOT_OUTPUT_DIR:-}
 # =============================================================================
 ASYM_DIR=${ASYM_DIR:-${ROOT}}
 ENV_DIR=${ENV_DIR:-${LF_DIR}/.venv}
+ENV_PYTHON=${ENV_PYTHON:-${ENV_DIR}/bin/python}
 RUN_LF_SCRIPT="${ASYM_DIR}/scripts/lf/run_lf_lora_sft.sh"
+BUILD_DATASET_SCRIPT="${ASYM_DIR}/scripts/lf/build_lf_sft_eval_pair.py"
 PROFILE_POSTPROCESS_SCRIPT="${ASYM_DIR}/scripts/lf/postprocess_lf_profile_artifacts.py"
 PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_activation_recompute_sweep.py"
 
@@ -110,10 +110,14 @@ Options:
                                  meta-llama/Llama-4-Scout-17B-16E|1 meta-llama/Llama-4-Maverick-17B-128E|4
   --backends LIST                asym and/or torch. torch uses pure LF/HF torch; asym uses AsymGEMM.
   --profilers LIST               source and/or nsys.
-  --seq-lens LIST                LF cutoff lengths. Accepts 2048,4096 or "2048 4096".
-  --recompute norecomp|recomp|both
+  --seq-lens LIST                LF cutoff lengths. Accepts positive integers, e.g. 4096,8192 or "4096 8192".
+  --recompute norecomp|recomp|both  recomp enables LF/HF gradient checkpointing.
   --expert-policies LIST         AsymGEMM expert policies: none, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, and -act variants.
   --dataset NAME
+  --prepare-datasets true|false  Build/audit model+length-specific LF datasets before training.
+  --dataset-min-tokens N|auto    Minimum source tokens for generated/audited rows. auto uses the seq length.
+  --dataset-eval-rows N
+  --dataset-overwrite true|false Rewrite existing generated dataset files.
   --template NAME
   --max-samples N
   --max-steps N                 Measured steps kept in plots/summaries.
@@ -139,8 +143,8 @@ Options:
   --compare-min-steps N
   --compare-first-step-rel-tol VALUE
   --compare-max-rel-tol VALUE
-  --output-root DIR              Default layout: <root>/lora_lf_<precision>/<model>__b<batch>_s<seq>_r<rank>_a<alpha>
-  --run-name NAME                Optional config directory under lora_lf_<precision>.
+  --output-root DIR              Default layout: <root>/<dataset>__lora__lf__<precision>/<model>__b<batch>_s<seq>_r<rank>_a<alpha>
+  --run-name NAME                Optional config directory under <dataset>__lora__lf__<precision>.
   --plot true|false
   --plot-output-dir DIR
   --overwrite true|false
@@ -300,14 +304,6 @@ backend_label() {
   esac
 }
 
-lf_backend() {
-  case "${1}" in
-    asym) printf 'asym\n' ;;
-    torch) printf 'torch\n' ;;
-    *) die "internal backend label must be asym or torch, got '${1}'" ;;
-  esac
-}
-
 profiler_label() {
   case "${1,,}" in
     source|nsys) printf '%s\n' "${1,,}" ;;
@@ -352,6 +348,98 @@ print_command() {
   printf '\n'
 }
 
+ensure_jobs_tsv() {
+  local config_root="$1"
+  mkdir -p "${config_root}"
+  if [[ ! -e "${config_root}/jobs.tsv" ]]; then
+    printf 'status\tgpu\tseq_len\trecompute\texpert_policy\tbackend\tprofiler\tjob_dir\tprofile_json\tlog\n' > "${config_root}/jobs.tsv"
+  fi
+}
+
+append_job_record() {
+  local config_root="$1"
+  local status="$2"
+  shift 2
+  ensure_jobs_tsv "${config_root}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${status}" "$@" >> "${config_root}/jobs.tsv"
+}
+
+plot_cmd_base() {
+  local -n cmd_ref="$1"
+  local input_root="$2"
+  local output_dir="$3"
+  local combined_output_dir="$4"
+  local seq_len="$5"
+  cmd_ref=(
+    "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PLOT_SCRIPT}"
+    --input-root "${input_root}"
+    --output-dir "${output_dir}"
+    --combined-output-dir "${combined_output_dir}"
+    --precision "${PRECISION}"
+    --clean-output
+    --batch-size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
+    --seq-lens "${seq_len}"
+  )
+}
+
+append_sweep_plot_filters() {
+  local -n cmd_ref="$1"
+  local backend profiler recompute
+  for backend in "${backends[@]}"; do cmd_ref+=(--backend "${backend}"); done
+  for profiler in "${profilers[@]}"; do cmd_ref+=(--profiler "${profiler}"); done
+  for recompute in "${recompute_modes[@]}"; do cmd_ref+=(--recompute "${recompute}"); done
+}
+
+dataset_name_for_seq() {
+  local seq_len="$1"
+  safe_label "${DATASET}__${workload_label}__s${seq_len}"
+}
+
+dataset_min_tokens_for_seq() {
+  local seq_len="$1"
+  if [[ "${DATASET_MIN_TOKENS}" == "auto" ]]; then
+    printf '%s\n' "${seq_len}"
+  else
+    printf '%s\n' "${DATASET_MIN_TOKENS}"
+  fi
+}
+
+prepare_dataset_for_seq() {
+  local seq_len="$1"
+  local dataset_name="$2"
+  local min_tokens
+  min_tokens="$(dataset_min_tokens_for_seq "${seq_len}")"
+
+  local -a dataset_cmd=(
+    "${ENV_PYTHON}" "${BUILD_DATASET_SCRIPT}"
+    --lf-dir "${LF_DIR}"
+    --asym-dir "${ASYM_DIR}"
+    --model-name-or-path "${current_model_name}"
+    --template "${TEMPLATE}"
+    --train-name "${dataset_name}"
+    --eval-name "${dataset_name}__eval"
+    --train-rows "${MAX_SAMPLES}"
+    --eval-rows "${DATASET_EVAL_ROWS}"
+    --cutoff-len "${seq_len}"
+    --min-tokens "${min_tokens}"
+    --precision "${PRECISION}"
+    --batch-size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
+    --lora-rank "${LORA_RANK}"
+    --lora-alpha "${LORA_ALPHA}"
+    --skip-lf-preprocess-check
+  )
+  if [[ "${DATASET_OVERWRITE}" == "true" ]]; then
+    dataset_cmd+=(--overwrite)
+  fi
+
+  echo "Preparing LF dataset=${dataset_name} model=${current_model_name} seq=${seq_len} min_tokens=${min_tokens}"
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    print_command "${dataset_cmd[@]}"
+    return 0
+  fi
+  run_tracked_command "${dataset_cmd[@]}"
+}
+
 gpu_spec="${GPU_POOL}"
 model_spec="${MODEL_SPECS}"
 backend_spec="${BACKENDS}"
@@ -383,6 +471,14 @@ while (($#)); do
     --expert-policies=*) expert_policy_spec="${1#*=}"; shift ;;
     --dataset) need_value "$1" "${2-}"; DATASET="$2"; shift 2 ;;
     --dataset=*) DATASET="${1#*=}"; shift ;;
+    --prepare-datasets) need_value "$1" "${2-}"; PREPARE_DATASETS="$(bool_value "$2")"; shift 2 ;;
+    --prepare-datasets=*) PREPARE_DATASETS="$(bool_value "${1#*=}")"; shift ;;
+    --dataset-min-tokens) need_value "$1" "${2-}"; DATASET_MIN_TOKENS="$2"; shift 2 ;;
+    --dataset-min-tokens=*) DATASET_MIN_TOKENS="${1#*=}"; shift ;;
+    --dataset-eval-rows) need_value "$1" "${2-}"; DATASET_EVAL_ROWS="$2"; shift 2 ;;
+    --dataset-eval-rows=*) DATASET_EVAL_ROWS="${1#*=}"; shift ;;
+    --dataset-overwrite) need_value "$1" "${2-}"; DATASET_OVERWRITE="$(bool_value "$2")"; shift 2 ;;
+    --dataset-overwrite=*) DATASET_OVERWRITE="$(bool_value "${1#*=}")"; shift ;;
     --template) need_value "$1" "${2-}"; template_spec="$2"; TEMPLATE="$2"; shift 2 ;;
     --template=*) template_spec="${1#*=}"; TEMPLATE="${1#*=}"; shift ;;
     --max-samples) need_value "$1" "${2-}"; MAX_SAMPLES="$2"; shift 2 ;;
@@ -453,11 +549,19 @@ done
 
 nonnegative_int "--max-steps" "${MAX_STEPS}"
 nonnegative_int "--warmup-steps" "${WARMUP_STEPS}"
+nonnegative_int "INTERRUPT_GRACE_SECONDS" "${INTERRUPT_GRACE_SECONDS}"
 TOTAL_STEPS=$((MAX_STEPS + WARMUP_STEPS))
 if [[ -z "${COMPARE_MIN_STEPS}" ]]; then
   COMPARE_MIN_STEPS="${MAX_STEPS}"
 fi
 nonnegative_int "--compare-min-steps" "${COMPARE_MIN_STEPS}"
+PREPARE_DATASETS=$(bool_value "${PREPARE_DATASETS}")
+DATASET_OVERWRITE=$(bool_value "${DATASET_OVERWRITE}")
+DATASET_MIN_TOKENS="${DATASET_MIN_TOKENS,,}"
+positive_int "--dataset-eval-rows" "${DATASET_EVAL_ROWS}"
+if [[ "${DATASET_MIN_TOKENS}" != "auto" ]]; then
+  positive_int "--dataset-min-tokens" "${DATASET_MIN_TOKENS}"
+fi
 
 mapfile -t gpus < <(tokens "${gpu_spec}" | sed 's/^cuda://' | dedupe)
 mapfile -t model_specs < <(tokens "${model_spec}" | dedupe)
@@ -485,17 +589,17 @@ esac
 ((${#backends[@]})) || die "backend list is empty"
 ((${#profilers[@]})) || die "profiler list is empty"
 ((${#seq_lens[@]})) || die "sequence length list is empty"
-((${#expert_policies[@]})) || die "expert policy list is empty"
-for recompute in "${recompute_modes[@]}"; do
-  [[ "${recompute}" == "recomp" ]] || continue
-  for expert_policy in "${expert_policies[@]}"; do
-    [[ "${expert_policy}" == "none" ]] && continue
-    die "expert policy '${expert_policy}' conflicts with --recompute ${recompute_spec}; use --recompute norecomp when sweeping expert policies"
-  done
+for seq_len in "${seq_lens[@]}"; do
+  positive_int "--seq-lens item" "${seq_len}"
 done
+((${#expert_policies[@]})) || die "expert policy list is empty"
 [[ -f "${RUN_LF_SCRIPT}" ]] || die "missing ${RUN_LF_SCRIPT}"
+[[ -f "${BUILD_DATASET_SCRIPT}" ]] || die "missing ${BUILD_DATASET_SCRIPT}"
 [[ -f "${PROFILE_POSTPROCESS_SCRIPT}" ]] || die "missing ${PROFILE_POSTPROCESS_SCRIPT}"
 [[ -f "${PLOT_SCRIPT}" ]] || die "missing ${PLOT_SCRIPT}"
+if [[ "${PREPARE_DATASETS}" == "true" && "${DRY_RUN}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
+  [[ -x "${ENV_PYTHON}" ]] || die "missing executable LF Python at ${ENV_PYTHON}"
+fi
 if [[ "${TORCH_DISTRIBUTED_BACKEND}" == "fsdp2" ]]; then
   [[ -f "${TORCH_FSDP_CONFIG}" ]] || die "missing torch FSDP2 accelerate config ${TORCH_FSDP_CONFIG}"
 fi
@@ -509,8 +613,12 @@ compare_candidate_backend="$(backend_label "${COMPARE_CANDIDATE_BACKEND}")"
 
 base_output_root="$(abs_path "${output_root}")"
 precision_label="$(safe_label "${PRECISION}")"
-precision_root="${base_output_root}/lora_lf_${precision_label}"
-mkdir -p "${precision_root}"
+dataset_root_label="$(safe_label "${DATASET}")"
+[[ -n "${dataset_root_label}" ]] || die "--dataset must not be empty"
+precision_root="${base_output_root}/${dataset_root_label}__lora__lf__${precision_label}"
+if [[ "${DRY_RUN}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
+  mkdir -p "${precision_root}"
+fi
 echo "Output precision root: ${precision_root}"
 
 declare -A plot_roots=()
@@ -521,18 +629,115 @@ declare -A compare_group_labels=()
 declare -a compare_group_keys=()
 failures=0
 interrupted=false
+interrupt_exit_status=130
 current_child_pid=""
+current_child_pid_file=""
 
-handle_interrupt() {
-  interrupted=true
-  echo "Interrupted; stopping LF profiling sweep." >&2
-  if [[ -n "${current_child_pid}" ]]; then
-    kill -INT "-${current_child_pid}" 2>/dev/null || true
-    kill -INT "${current_child_pid}" 2>/dev/null || true
-  fi
+child_process_alive() {
+  local pid="$1"
+  kill -0 "-${pid}" 2>/dev/null || kill -0 "${pid}" 2>/dev/null
 }
 
-trap handle_interrupt INT TERM
+kill_current_child() {
+  local base_pid="${current_child_pid:-}"
+  local file_pid="" target_pid
+  if [[ -n "${current_child_pid_file:-}" && -s "${current_child_pid_file}" ]]; then
+    IFS= read -r file_pid < "${current_child_pid_file}" || true
+  fi
+  rm -f "${current_child_pid_file:-}" 2>/dev/null || true
+
+  [[ -n "${base_pid}" || -n "${file_pid}" ]] || return 0
+
+  for target_pid in "${base_pid}" "${file_pid}"; do
+    [[ -n "${target_pid}" ]] || continue
+    kill -INT "-${target_pid}" 2>/dev/null || true
+    kill -INT "${target_pid}" 2>/dev/null || true
+  done
+
+  if [[ "${INTERRUPT_GRACE_SECONDS}" != "0" ]]; then
+    sleep "${INTERRUPT_GRACE_SECONDS}" || true
+  fi
+
+  for target_pid in "${base_pid}" "${file_pid}"; do
+    [[ -n "${target_pid}" ]] || continue
+    child_process_alive "${target_pid}" || continue
+    kill -TERM "-${target_pid}" 2>/dev/null || true
+    kill -TERM "${target_pid}" 2>/dev/null || true
+  done
+
+  if [[ "${INTERRUPT_GRACE_SECONDS}" != "0" ]]; then
+    sleep "${INTERRUPT_GRACE_SECONDS}" || true
+  fi
+
+  for target_pid in "${base_pid}" "${file_pid}"; do
+    [[ -n "${target_pid}" ]] || continue
+    child_process_alive "${target_pid}" || continue
+    kill -KILL "-${target_pid}" 2>/dev/null || true
+    kill -KILL "${target_pid}" 2>/dev/null || true
+  done
+}
+
+run_tracked_command() {
+  local status=0 wait_pid="" child_pid="" pid_file="" attempt
+  current_child_pid=""
+  if command -v setsid >/dev/null 2>&1 && setsid --help 2>&1 | grep -q -- '--wait'; then
+    pid_file="$(mktemp "${TMPDIR:-/tmp}/profile_lora_lf_child.XXXXXX")"
+    current_child_pid_file="${pid_file}"
+    setsid --wait bash -c 'pid_file="$1"; shift; echo "$$" > "${pid_file}"; exec "$@"' _ "${pid_file}" "$@" &
+    wait_pid=$!
+    current_child_pid="${wait_pid}"
+    for ((attempt = 0; attempt < 100; attempt++)); do
+      if [[ -s "${pid_file}" ]]; then
+        IFS= read -r child_pid < "${pid_file}" || true
+        if [[ -n "${child_pid}" ]]; then
+          current_child_pid="${child_pid}"
+          break
+        fi
+      fi
+      kill -0 "${wait_pid}" 2>/dev/null || break
+      sleep 0.02
+    done
+  else
+    "$@" &
+    wait_pid=$!
+    current_child_pid="${wait_pid}"
+  fi
+  wait "${wait_pid}" || status=$?
+  [[ -z "${pid_file}" ]] || rm -f "${pid_file}" 2>/dev/null || true
+  current_child_pid=""
+  current_child_pid_file=""
+  if [[ "${interrupted}" == "true" ]]; then
+    echo "Interrupted command; exiting without scheduling more jobs." >&2
+    exit "${interrupt_exit_status}"
+  fi
+  if [[ "${status}" == "130" || "${status}" == "143" ]]; then
+    echo "Interrupted command; exiting without scheduling more jobs." >&2
+    exit "${status}"
+  fi
+  return "${status}"
+}
+
+run_tracked_command_logged() {
+  local log_file="$1"
+  shift
+  run_tracked_command bash -o pipefail -c 'log_file="$1"; shift; "$@" 2>&1 | tee -a "${log_file}"' _ "${log_file}" "$@"
+}
+
+handle_interrupt() {
+  local signal="${1:-INT}"
+  case "${signal}" in
+    TERM) interrupt_exit_status=143 ;;
+    *) interrupt_exit_status=130 ;;
+  esac
+  interrupted=true
+  echo "Interrupted; stopping LF profiling sweep." >&2
+  trap - INT TERM
+  kill_current_child
+  exit "${interrupt_exit_status}"
+}
+
+trap 'handle_interrupt INT' INT
+trap 'handle_interrupt TERM' TERM
 
 run_job() {
   local backend="$1"
@@ -542,6 +747,7 @@ run_job() {
   local gpu="$5"
   local gpu_count="$6"
   local expert_policy="$7"
+  local dataset_name="$8"
   local gradient_checkpointing=false
   [[ "${recompute}" == "recomp" ]] && gradient_checkpointing=true
 
@@ -564,20 +770,15 @@ run_job() {
     compare_group_labels["${group_key}"]="profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} seq_len=${seq_len}"
   fi
 
-  if [[ -e "${profile_json}" && "${OVERWRITE}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
+  if [[ "${DRY_RUN}" != "true" && -e "${profile_json}" && "${OVERWRITE}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
     echo "Skipping existing: ${profile_json}"
     run_dirs["${group_key}|${backend}"]="${lf_out}"
-    mkdir -p "${config_root}"
-    if [[ ! -e "${config_root}/jobs.tsv" ]]; then
-      printf 'status\tgpu\tseq_len\trecompute\texpert_policy\tbackend\tprofiler\tjob_dir\tprofile_json\tlog\n' > "${config_root}/jobs.tsv"
-    fi
-    printf 'skipped\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}" \
-      >> "${config_root}/jobs.tsv"
+    append_job_record "${config_root}" skipped \
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
     return 0
   fi
 
-  if [[ "${COLLECT_EXISTING}" == "true" ]]; then
+  if [[ "${DRY_RUN}" != "true" && "${COLLECT_EXISTING}" == "true" ]]; then
     if [[ -e "${profile_json}" ]]; then
       echo "Found existing: ${profile_json}"
       run_dirs["${group_key}|${backend}"]="${lf_out}"
@@ -596,14 +797,14 @@ run_job() {
     CONDA_EXE="${CONDA_EXE}"
     NSYS_BIN="${NSYS_BIN}"
     MODEL_NAME_OR_PATH="${current_model_name}"
-    BACKEND="$(lf_backend "${backend}")"
+    BACKEND="${backend}"
     GPU_ID="${gpu}"
     NUM_GPUS="${gpu_count}"
     REQUIRE_SM100="${REQUIRE_SM100}"
     TORCH_DISTRIBUTED_BACKEND="${TORCH_DISTRIBUTED_BACKEND}"
     TORCH_FSDP_CONFIG="${TORCH_FSDP_CONFIG}"
     TORCH_DEEPSPEED_CONFIG="${TORCH_DEEPSPEED_CONFIG}"
-    DATASET="${DATASET}"
+    DATASET="${dataset_name}"
     TEMPLATE="${TEMPLATE}"
     CUTOFF_LEN="${seq_len}"
     MAX_SAMPLES="${MAX_SAMPLES}"
@@ -657,26 +858,20 @@ run_job() {
   fi
 
   mkdir -p "${seq_root}"
-  if [[ ! -e "${config_root}/jobs.tsv" ]]; then
-    printf 'status\tgpu\tseq_len\trecompute\texpert_policy\tbackend\tprofiler\tjob_dir\tprofile_json\tlog\n' > "${config_root}/jobs.tsv"
-  fi
+  ensure_jobs_tsv "${config_root}"
   {
     print_command "${run_cmd[@]}"
   } > "${seq_root}/command.txt"
 
   local status=0
-  current_child_pid=""
-  if command -v setsid >/dev/null 2>&1; then
-    setsid "${run_cmd[@]}" &
-  else
-    "${run_cmd[@]}" &
-  fi
-  current_child_pid=$!
-  wait "${current_child_pid}" || status=$?
-  current_child_pid=""
-  if [[ "${interrupted}" == "true" || "${status}" == "130" || "${status}" == "143" ]]; then
+  run_tracked_command "${run_cmd[@]}" || status=$?
+  if [[ "${interrupted}" == "true" ]]; then
     echo "Interrupted run; exiting without scheduling more jobs." >&2
-    exit 130
+    exit "${interrupt_exit_status}"
+  fi
+  if [[ "${status}" == "130" || "${status}" == "143" ]]; then
+    echo "Interrupted run; exiting without scheduling more jobs." >&2
+    exit "${status}"
   fi
   if ((status == 0)); then
     if [[ ! -f "${profile_json}" ]]; then
@@ -687,15 +882,13 @@ run_job() {
 
   if ((status == 0)); then
     run_dirs["${group_key}|${backend}"]="${lf_out}"
-    printf 'ok\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}" \
-      >> "${config_root}/jobs.tsv"
+    append_job_record "${config_root}" ok \
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
     plot_single_run "${config_root}" "${seq_len}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${seq_root}"
     plot_running_combined "${config_root}" "${seq_len}" "${seq_root}"
   else
-    printf 'failed:%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "${status}" "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}" \
-      >> "${config_root}/jobs.tsv"
+    append_job_record "${config_root}" "failed:${status}" \
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
   fi
   return "${status}"
 }
@@ -710,6 +903,7 @@ done
 compare_config_root() {
   local target_config_root="$1"
   local group_key baseline_dir candidate_dir config_root compare_dir compare_tsv compare_log status
+  local group_tail group_expert_policy
 
   [[ "${COMPARE_LOSSES}" == "true" ]] || return 0
   if [[ "${baseline_selected}" != "true" || "${candidate_selected}" != "true" ]]; then
@@ -720,6 +914,12 @@ compare_config_root() {
   for group_key in "${compare_group_keys[@]}"; do
     config_root="${compare_group_config_roots[${group_key}]}"
     [[ "${config_root}" == "${target_config_root}" ]] || continue
+    group_tail="${group_key%|*}"
+    group_expert_policy="${group_tail##*|}"
+    if [[ "${group_expert_policy}" != "none" && ( "${compare_baseline_backend}" == torch* || "${compare_candidate_backend}" == torch* ) ]]; then
+      echo "Skipping loss comparison for ${compare_group_labels[${group_key}]}; torch baseline is policy-independent."
+      continue
+    fi
     baseline_dir="${run_dirs[${group_key}|${compare_baseline_backend}]-}"
     candidate_dir="${run_dirs[${group_key}|${compare_candidate_backend}]-}"
     compare_dir="${config_root}/comparisons"
@@ -743,13 +943,16 @@ compare_config_root() {
     fi
 
     echo "Comparing losses: ${compare_group_labels[${group_key}]} ${compare_baseline_backend} vs ${compare_candidate_backend}" | tee "${compare_log}"
-    if "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PROFILE_POSTPROCESS_SCRIPT}" \
-      --baseline-dir "${baseline_dir}" \
-      --candidate-dir "${candidate_dir}" \
-      --min-steps "${COMPARE_MIN_STEPS}" \
-      --warmup-steps "${WARMUP_STEPS}" \
-      --first-step-rel-tol "${COMPARE_FIRST_STEP_REL_TOL}" \
-      --max-rel-tol "${COMPARE_MAX_REL_TOL}" 2>&1 | tee -a "${compare_log}"; then
+    local -a compare_cmd=(
+      "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PROFILE_POSTPROCESS_SCRIPT}"
+      --baseline-dir "${baseline_dir}"
+      --candidate-dir "${candidate_dir}"
+      --min-steps "${COMPARE_MIN_STEPS}"
+      --warmup-steps "${WARMUP_STEPS}"
+      --first-step-rel-tol "${COMPARE_FIRST_STEP_REL_TOL}"
+      --max-rel-tol "${COMPARE_MAX_REL_TOL}"
+    )
+    if run_tracked_command_logged "${compare_log}" "${compare_cmd[@]}"; then
       printf 'ok\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "${compare_baseline_backend}" "${compare_candidate_backend}" "${baseline_dir}" "${candidate_dir}" "${compare_log}" "${compare_group_labels[${group_key}]}" \
         >> "${compare_tsv}"
@@ -774,22 +977,12 @@ plot_config_root() {
 
   plot_root="${config_root}/plots"
   [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")"
-  local -a plot_cmd=(
-    "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PLOT_SCRIPT}"
-    --input-root "${config_root}"
-    --output-dir "${plot_root}"
-    --combined-output-dir "${plot_root}"
-    --precision "${PRECISION}"
-    --clean-output
-    --batch-size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
-    --seq-lens "${seq_len}"
-    --expert-recompute-policies "${expert_policies[@]}"
-  )
-  for backend in "${backends[@]}"; do plot_cmd+=(--backend "${backend}"); done
-  for profiler in "${profilers[@]}"; do plot_cmd+=(--profiler "${profiler}"); done
-  for recompute in "${recompute_modes[@]}"; do plot_cmd+=(--recompute "${recompute}"); done
+  local -a plot_cmd
+  plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${plot_root}" "${seq_len}"
+  plot_cmd+=(--expert-recompute-policies "${expert_policies[@]}")
+  append_sweep_plot_filters plot_cmd
   echo "Writing LF profile plots: ${plot_root}"
-  "${plot_cmd[@]}"
+  run_tracked_command "${plot_cmd[@]}"
 }
 
 plot_running_combined() {
@@ -800,23 +993,12 @@ plot_running_combined() {
   [[ "${PLOT}" == "true" ]] || return 0
 
   plot_root="${seq_root}/plots/_combined"
-  local -a plot_cmd=(
-    "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PLOT_SCRIPT}"
-    --input-root "${config_root}"
-    --output-dir "${plot_root}"
-    --combined-output-dir "${plot_root}"
-    --precision "${PRECISION}"
-    --clean-output
-    --combined-only
-    --batch-size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
-    --seq-lens "${seq_len}"
-    --expert-recompute-policies "${expert_policies[@]}"
-  )
-  for backend in "${backends[@]}"; do plot_cmd+=(--backend "${backend}"); done
-  for profiler in "${profilers[@]}"; do plot_cmd+=(--profiler "${profiler}"); done
-  for recompute in "${recompute_modes[@]}"; do plot_cmd+=(--recompute "${recompute}"); done
+  local -a plot_cmd
+  plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${plot_root}" "${seq_len}"
+  plot_cmd+=(--combined-only --expert-recompute-policies "${expert_policies[@]}")
+  append_sweep_plot_filters plot_cmd
   echo "Writing LF running combined plots: ${plot_root}"
-  if ! "${plot_cmd[@]}"; then
+  if ! run_tracked_command "${plot_cmd[@]}"; then
     echo "warning: failed to write running combined plots for ${seq_root}" >&2
   fi
 }
@@ -833,23 +1015,17 @@ plot_single_run() {
   [[ "${PLOT}" == "true" ]] || return 0
 
   plot_root="${seq_root}/plots"
-  local -a plot_cmd=(
-    "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PLOT_SCRIPT}"
-    --input-root "${config_root}"
-    --output-dir "${plot_root}"
-    --combined-output-dir "${plot_root}/combined"
-    --precision "${PRECISION}"
-    --clean-output
+  local -a plot_cmd
+  plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${plot_root}/combined" "${seq_len}"
+  plot_cmd+=(
     --skip-combined
-    --batch-size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
-    --seq-lens "${seq_len}"
     --expert-recompute-policies "${expert_policy}"
     --backend "${backend}"
     --profiler "${profiler}"
     --recompute "${recompute}"
   )
   echo "Writing LF per-run plots: ${plot_root}"
-  if ! "${plot_cmd[@]}"; then
+  if ! run_tracked_command "${plot_cmd[@]}"; then
     echo "warning: failed to write per-run plots for ${seq_root}" >&2
   fi
 }
@@ -867,14 +1043,35 @@ for model_spec_entry in "${model_specs[@]}"; do
   echo "Using template: ${TEMPLATE} for model ${current_model_name} requesting ${current_model_gpu_count} GPU(s)"
 
   for seq_len in "${seq_lens[@]}"; do
+    current_dataset="${DATASET}"
+    if [[ "${PREPARE_DATASETS}" == "true" ]]; then
+      current_dataset="$(dataset_name_for_seq "${seq_len}")"
+      if [[ "${COLLECT_EXISTING}" != "true" ]]; then
+        if ! prepare_dataset_for_seq "${seq_len}" "${current_dataset}"; then
+          failures=$((failures + 1))
+          if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
+            exit 1
+          fi
+          continue
+        fi
+      fi
+    fi
     config_root="$(config_root_path "${seq_len}")"
     for expert_policy in "${expert_policies[@]}"; do
       for recompute in "${recompute_modes[@]}"; do
         for backend in "${backends[@]}"; do
           for profiler in "${profilers[@]}"; do
+            if [[ "${recompute}" == "recomp" && "${expert_policy}" != "none" ]]; then
+              echo "Skipping expert_policy=${expert_policy} recompute=recomp; LF gradient checkpointing is only swept for expert_policy=none."
+              continue
+            fi
+            if [[ "${backend}" == torch* && "${expert_policy}" != "none" ]]; then
+              echo "Skipping backend=${backend} expert_policy=${expert_policy}; torch baseline is policy-independent."
+              continue
+            fi
             gpu_count="$(backend_gpu_count "${backend}" "${current_model_gpu_count}")"
             gpu="$(gpu_slice "${gpu_count}")"
-            if ! run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}"; then
+            if ! run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${current_dataset}"; then
               failures=$((failures + 1))
               if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
                 exit 1
@@ -927,7 +1124,7 @@ if [[ "${PLOT}" == "true" ]]; then
   for profiler in "${profilers[@]}"; do combined_plot_cmd+=(--profiler "${profiler}"); done
   for recompute in "${recompute_modes[@]}"; do combined_plot_cmd+=(--recompute "${recompute}"); done
   echo "Writing combined LF profile plots: ${combined_plot_root}"
-  "${combined_plot_cmd[@]}"
+  run_tracked_command "${combined_plot_cmd[@]}"
 fi
 
 echo "LF profiling completed. Results: ${precision_root}"

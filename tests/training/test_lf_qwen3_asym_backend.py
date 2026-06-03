@@ -274,10 +274,12 @@ def test_parse_expert_recompute_policy_spec() -> None:
     lower = parse_expert_recompute_policy_spec("tok-le2")
     zero = parse_expert_recompute_policy_spec("tok-le0")
     upper = parse_expert_recompute_policy_spec("tok-ge2")
+    upper_all = parse_expert_recompute_policy_spec("tok-ge1")
     bounded = parse_expert_recompute_policy_spec("tok2-4")
     activation = parse_expert_recompute_policy_spec("tok-le2-act")
     activation_zero = parse_expert_recompute_policy_spec("tok-le0-act")
     activation_upper = parse_expert_recompute_policy_spec("tok-ge2-act")
+    activation_upper_all = parse_expert_recompute_policy_spec("tok-ge1-act")
     activation_bounded = parse_expert_recompute_policy_spec("tok2-4-act")
 
     assert none.label == "none"
@@ -293,6 +295,9 @@ def test_parse_expert_recompute_policy_spec() -> None:
     assert upper.token_threshold == 0
     assert upper.token_min == 2
     assert upper.token_max is None
+    assert upper_all.recompute_enabled
+    assert upper_all.token_min == 1
+    assert upper_all.token_max is None
     assert bounded.label == "tok2-4"
     assert bounded.token_threshold == 4
     assert bounded.token_min == 2
@@ -310,6 +315,9 @@ def test_parse_expert_recompute_policy_spec() -> None:
     assert activation_upper.activation_save_threshold == 0
     assert activation_upper.activation_save_min == 2
     assert activation_upper.activation_save_max is None
+    assert activation_upper_all.activation_drop_enabled
+    assert activation_upper_all.activation_save_min == 1
+    assert activation_upper_all.activation_save_max is None
     assert activation_bounded.label == "tok2-4-act"
     assert activation_bounded.activation_save_threshold == 4
     assert activation_bounded.activation_save_min == 2
