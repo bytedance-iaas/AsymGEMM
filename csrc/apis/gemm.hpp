@@ -216,6 +216,12 @@ static void m_grouped_fp4_asym_gemm_nt_contiguous(const std::pair<torch::Tensor,
                                              std::optional<std::tuple<int, int, int>> recipe,
                                              const std::string& compiled_dims,
                                              const bool& disable_ue8m0_cast) {
+    // FP4 (NVFP4) asym GEMM uses the Blackwell TMA/UMMA block-scaled path only.
+    // There is no SM90 (Hopper/H20) FP4 kernel, so fail loudly rather than fall
+    // through to the SM100 kernel (which cannot launch on other archs).
+    if (device_runtime->get_arch_major() != 10)
+        DG_HOST_UNREACHABLE("FP4 (NVFP4) asym GEMM is only supported on SM100 (Blackwell)");
+
     const auto& major_a = get_major_type_ab(a.first);
     const auto& major_b = get_major_type_ab(b.first);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
@@ -275,6 +281,10 @@ static void m_grouped_fp4_asym_gemm_nt_masked(const std::pair<torch::Tensor, tor
                                          std::optional<std::tuple<int, int, int>> recipe,
                                          const std::string& compiled_dims,
                                          const bool& disable_ue8m0_cast) {
+    // FP4 (NVFP4) asym GEMM is Blackwell-only; no SM90 (Hopper/H20) kernel exists.
+    if (device_runtime->get_arch_major() != 10)
+        DG_HOST_UNREACHABLE("FP4 (NVFP4) asym GEMM is only supported on SM100 (Blackwell)");
+
     const auto& major_a = get_major_type_ab(a.first);
     const auto& major_b = get_major_type_ab(b.first);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
@@ -366,9 +376,20 @@ static void m_grouped_bf16_asym_gemm_nt_contiguous(const torch::Tensor& a, const
 
     // Grid Y = num_groups; sentinel blocks early-exit in-kernel.
     const auto& arch_major = device_runtime->get_arch_major();
-    sm100_m_grouped_bf16_asym_gemm_contiguous(a, b, d,
-                                            offsets, experts, /*grid_y=*/num_groups,
-                                            num_groups, m, n, k, major_a, major_b, compiled_dims);
+    if (arch_major == 10) {
+        sm100_m_grouped_bf16_asym_gemm_contiguous(a, b, d,
+                                                offsets, experts, /*grid_y=*/num_groups,
+                                                num_groups, m, n, k, major_a, major_b, compiled_dims);
+        return;
+    }
+    // SM90 (Hopper/H20): the contiguous BF16 layout is only reached via DeepEP-normal
+    // dispatch. The native SM90 BF16 asym kernel (sm90_bf16_asym_gemm.cuh) is not yet
+    // numerically correct, and the contiguous offset layout is not compatible with the
+    // SM80-style kernel used by the masked path, so this combination is unsupported for
+    // now. Fail loudly rather than silently produce wrong results.
+    DG_HOST_UNREACHABLE("BF16 contiguous asym GEMM is not supported on this architecture "
+                        "(only SM100 has a verified kernel; the standard serving path uses "
+                        "the masked dispatcher, which is supported on SM90)");
 }
 
 static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const torch::Tensor& b,
@@ -405,7 +426,12 @@ static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const tor
         return;
 
     const auto& [arch_major, arch_minor] = device_runtime->get_arch_pair();
-    if (arch_major == 8 and arch_minor == 9) {
+    // Ada (SM89) and Hopper (SM90/H20) both use the arch-aware SM80-style grouped
+    // MoE kernel (native SM90 WGMMA asym kernel exists in sm90_bf16_asym_gemm.cuh
+    // but is not yet numerically correct). It flattens the padded [G, M_max, K]
+    // masked layout and skips padding rows in-kernel, all via GPU tensor ops so it
+    // is CUDA-graph capturable.
+    if (arch_major == 9 or (arch_major == 8 and arch_minor == 9)) {
         sm89_m_grouped_bf16_moe_gemm_masked(
             a,
             b,
@@ -418,9 +444,16 @@ static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const tor
         return;
     }
 
-    // Dispatch implementation. Grid Y = num_groups; inactive groups early-exit in-kernel.
-    sm100_m_grouped_bf16_asym_gemm_masked(a, b, d, masked_m, /*grid_y=*/num_groups, expected_m,
-                                          num_groups, m, n, k, major_a, major_b, compiled_dims);
+    // Blackwell (SM100): native TMA/UMMA asym kernel.
+    // Grid Y = num_groups; inactive groups early-exit in-kernel.
+    if (arch_major == 10) {
+        sm100_m_grouped_bf16_asym_gemm_masked(a, b, d, masked_m, /*grid_y=*/num_groups, expected_m,
+                                              num_groups, m, n, k, major_a, major_b, compiled_dims);
+        return;
+    }
+
+    DG_HOST_UNREACHABLE("BF16 masked asym GEMM is not supported on this architecture "
+                        "(supported: SM89, SM90/H20, SM100)");
 }
 #endif
 
