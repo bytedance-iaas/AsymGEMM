@@ -67,6 +67,9 @@ try:
             # SM89 FP8 MoE GEMM (native FP8 MMA, JIT)
             "m_grouped_fp8_asym_gemm_sm89",
             "m_grouped_fp8_asym_gemm_sm89_masked",
+            # SM90 INT8 asym GEMM (native S8 WGMMA, JIT)
+            "m_grouped_int8_asym_gemm_sm90_masked",
+            "m_grouped_int8_asym_gemm_sm90_contiguous",
             # Einsum kernels
             "einsum",
             "fp8_einsum",
@@ -92,9 +95,13 @@ try:
             supported_dtypes,
             m_grouped_fp8_asym_gemm_nt_contiguous,
             m_grouped_fp8_asym_gemm_nt_masked,
+            m_grouped_int8_asym_gemm_nt_contiguous,
+            m_grouped_int8_asym_gemm_nt_masked,
         )
         globals()["m_grouped_fp8_asym_gemm_nt_contiguous"] = m_grouped_fp8_asym_gemm_nt_contiguous
         globals()["m_grouped_fp8_asym_gemm_nt_masked"] = m_grouped_fp8_asym_gemm_nt_masked
+        globals()["m_grouped_int8_asym_gemm_nt_contiguous"] = m_grouped_int8_asym_gemm_nt_contiguous
+        globals()["m_grouped_int8_asym_gemm_nt_masked"] = m_grouped_int8_asym_gemm_nt_masked
 
         # Some alias for legacy supports
         # TODO: remove these later
@@ -125,6 +132,20 @@ try:
 except ImportError:
     import warnings
     warnings.warn("CUDA extension (_C) not available. CUDA kernels will not be accessible.")
+
+# Unified MoE sub-package (CPU AMX via _cpu_C + GPU INT8 via torch._int_mm).
+# Independent of the CUDA extension above: a host without CUDA still gets the
+# CPU bucket; a host without AMX gets a clear error at first use.
+try:
+    from . import _cpu_C            # noqa: F401 — register the CPU extension
+    from . import unified_moe       # noqa: F401 — Layer + helpers
+except ImportError as _e:
+    import warnings
+    warnings.warn(
+        "asym_gemm CPU extension (_cpu_C) not available — unified_moe disabled. "
+        f"Cause: {_e}"
+    )
+    unified_moe = None              # explicit sentinel for callers
 
 from importlib.metadata import version as _get_version
 __version__ = _get_version('asym_gemm')

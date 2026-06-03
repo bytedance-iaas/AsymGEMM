@@ -41,6 +41,8 @@ __all__ = [
     "supported_archs",
     "m_grouped_fp8_asym_gemm_nt_contiguous",
     "m_grouped_fp8_asym_gemm_nt_masked",
+    "m_grouped_int8_asym_gemm_nt_contiguous",
+    "m_grouped_int8_asym_gemm_nt_masked",
 ]
 
 # Architecture support matrix for the grouped-MoE GEMM kernels, keyed by the
@@ -208,4 +210,76 @@ def m_grouped_fp8_asym_gemm_nt_masked(
         1.0,
         _flatten_scale(a_scale),
         b_scale,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# INT8 SM90 (Hopper / H20) asymmetric grouped GEMM
+#
+# Inputs are int8 with FP32 per-token (A) / per-channel (B) scales at 128-element
+# K-block granularity. The kernel's TMA descriptors read the scales in a transposed
+# layout (K-block major, MN contiguous), so we transpose here before calling _C.
+# --------------------------------------------------------------------------- #
+def _sm90_only(name: str) -> None:
+    if get_arch_major() != 9:
+        raise RuntimeError(
+            f"`{name}` is only implemented on SM90 (Hopper/H20); "
+            f"current arch major is {get_arch_major()}."
+        )
+
+
+def m_grouped_int8_asym_gemm_nt_masked(
+    a: Tuple[torch.Tensor, torch.Tensor],
+    b: Tuple[torch.Tensor, torch.Tensor],
+    d: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    recipe: Optional[Tuple[int, int, int]] = None,
+    compiled_dims: str = "nk",
+) -> None:
+    """Masked INT8 grouped GEMM ``[G, M, K] @ [G, N, K].mT -> [G, M, N]`` (FP32 out).
+
+    ``a``/``b`` are ``(int8_data, fp32_scale)`` pairs. ``a``'s scale is per-token
+    ``[G, M, K//128]``; ``b``'s scale is per-channel ``[G, N, K//128]``.
+    """
+    _sm90_only("m_grouped_int8_asym_gemm_nt_masked")
+    a_data, sfa = a
+    b_data, sfb = b
+    num_groups, n = b_data.size(0), b_data.size(1)
+    kb = sfa.size(-1)
+    # sfa: [G, M, Kb] -> [G, Kb, M]; sfb: [G, N, Kb] -> [Kb, G*N]
+    # Both scales stay on device; only the weights B may be host-pinned.
+    sfa_k = sfa.transpose(1, 2).contiguous()
+    sfb_k = sfb.permute(2, 0, 1).reshape(kb, num_groups * n).contiguous()
+    _C.m_grouped_int8_asym_gemm_sm90_masked(
+        a_data, b_data, d, masked_m, expected_m, sfa_k, sfb_k
+    )
+
+
+def m_grouped_int8_asym_gemm_nt_contiguous(
+    a: Tuple[torch.Tensor, torch.Tensor],
+    b: Tuple[torch.Tensor, torch.Tensor],
+    d: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    list_size,
+    recipe: Optional[Tuple[int, int, int]] = None,
+    compiled_dims: str = "nk",
+) -> None:
+    """Contiguous INT8 grouped GEMM ``[M, K] @ [G, N, K].mT -> [M, N]`` (FP32 out).
+
+    ``a``'s scale is per-token ``[M, K//128]``; ``b``'s scale is per-channel
+    ``[G, N, K//128]``.
+    """
+    _sm90_only("m_grouped_int8_asym_gemm_nt_contiguous")
+    a_data, sfa = a
+    b_data, sfb = b
+    num_groups, n = b_data.size(0), b_data.size(1)
+    kb = sfa.size(-1)
+    # sfa: [M, Kb] -> [Kb, M]; sfb: [G, N, Kb] -> [Kb, G*N]
+    # Both scales stay on device; only the weights B may be host-pinned.
+    sfa_k = sfa.transpose(0, 1).contiguous()
+    sfb_k = sfb.permute(2, 0, 1).reshape(kb, num_groups * n).contiguous()
+    _C.m_grouped_int8_asym_gemm_sm90_contiguous(
+        a_data, b_data, d, offsets, experts, _as_int(list_size), sfa_k, sfb_k
     )
