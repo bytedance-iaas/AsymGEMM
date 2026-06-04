@@ -36,9 +36,33 @@ __all__ = [
     "get_arch_pair",
     "get_arch_major",
     "is_blackwell",
+    "supported_dtypes",
+    "is_dtype_supported",
+    "supported_archs",
     "m_grouped_fp8_asym_gemm_nt_contiguous",
     "m_grouped_fp8_asym_gemm_nt_masked",
 ]
+
+# Architecture support matrix for the grouped-MoE GEMM kernels, keyed by the
+# logical input dtype family. This is the single source of truth for "can
+# AsymGEMM run this dtype on this GPU?" and MUST be kept in sync with the
+# per-arch dispatch in csrc/apis/gemm.hpp.
+#
+# Each entry maps a dtype family to the SM targets that have a working kernel:
+#   * "bf16" / "fp8" — SM89 (Ada), SM90 (Hopper/H20), SM100+ (Blackwell)
+#   * "fp4"  (NVFP4) — SM100+ (Blackwell) only; the block-scaled TMA/UMMA path
+#                      has no SM89/SM90 implementation.
+# SM targets are encoded as ``major * 10 + minor`` (89, 90) for pre-Blackwell,
+# and by major alone for Blackwell+ (any minor of SM100/SM120 counts).
+_SUPPORTED_PRE_BLACKWELL_SM = (89, 90)
+
+
+def _arch_supports(dtype: str, major: int, minor: int) -> bool:
+    if dtype == "fp4":
+        return major >= 10  # NVFP4 is Blackwell-only
+    if dtype in ("bf16", "fp8"):
+        return major >= 10 or (major * 10 + minor) in _SUPPORTED_PRE_BLACKWELL_SM
+    return False
 
 
 def get_arch_pair() -> Tuple[int, int]:
@@ -65,6 +89,37 @@ def is_blackwell() -> bool:
     and share the ``*_sm89`` FP8 grouped-GEMM kernels.
     """
     return get_arch_major() >= 10
+
+
+def supported_dtypes() -> Tuple[str, ...]:
+    """The dtype families AsymGEMM can run on *the current* GPU.
+
+    Returns a subset of ``("bf16", "fp8", "fp4")``. Intended for callers (e.g.
+    SGLang) to fail fast when a model's GEMM dtype has no kernel on this arch,
+    instead of aborting deep inside the first forward pass.
+    """
+    major, minor = get_arch_pair()
+    return tuple(d for d in ("bf16", "fp8", "fp4") if _arch_supports(d, major, minor))
+
+
+def is_dtype_supported(dtype: str) -> bool:
+    """Whether AsymGEMM has a working grouped-MoE kernel for ``dtype`` on the
+    current GPU. ``dtype`` is one of ``"bf16"``, ``"fp8"``, ``"fp4"``.
+    """
+    major, minor = get_arch_pair()
+    return _arch_supports(dtype, major, minor)
+
+
+def supported_archs(dtype: str) -> Tuple[str, ...]:
+    """Human-readable SM targets that support ``dtype`` (for error messages),
+    e.g. ``("SM100 (Blackwell)",)`` for fp4 or
+    ``("SM89", "SM90", "SM100 (Blackwell)")`` for bf16/fp8. Arch-independent.
+    """
+    if dtype == "fp4":
+        return ("SM100 (Blackwell)",)
+    if dtype in ("bf16", "fp8"):
+        return ("SM89", "SM90/H20", "SM100 (Blackwell)")
+    return ()
 
 
 def _flatten_scale(scale: torch.Tensor) -> torch.Tensor:
