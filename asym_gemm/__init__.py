@@ -87,6 +87,9 @@ try:
             get_arch_major,
             get_arch_pair,
             is_blackwell,
+            is_dtype_supported,
+            supported_archs,
+            supported_dtypes,
             m_grouped_fp8_asym_gemm_nt_contiguous,
             m_grouped_fp8_asym_gemm_nt_masked,
         )
