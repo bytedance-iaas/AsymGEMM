@@ -45,7 +45,7 @@ GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 LORA_RANK=${LORA_RANK:-64}
 LORA_ALPHA=${LORA_ALPHA:-16}
-LORA_DROPOUT=${LORA_DROPOUT:-0.10}
+LORA_DROPOUT=${LORA_DROPOUT:-0.1}
 
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
 ASYM_STRICT=${ASYM_STRICT:-true}
@@ -137,7 +137,7 @@ Options:
   --learning-rate VALUE
   --lora-rank N
   --lora-alpha VALUE
-  --lora-dropout VALUE             LoRA dropout probability in fixed 0.xx format, e.g. 0.10.
+  --lora-dropout VALUE
   --precision NAME
   --profile-level stage|module|op|deep
   --profile-layers all|first,last|0,1,2|every4
@@ -153,7 +153,7 @@ Options:
   --compare-min-steps N
   --compare-first-step-rel-tol VALUE
   --compare-max-rel-tol VALUE
-  --output-root DIR              Default layout: <root>/<dataset>__lora__lf__<precision>/<model>__b<batch>_s<seq>_w<warmup>_s<steps>_r<rank>_a<alpha>_drop<dropout>
+  --output-root DIR              Default layout: <root>/<dataset>__lora__lf__<precision>/<model>__b<batch>_s<seq>_r<rank>_a<alpha>
   --run-name NAME                Optional config directory under <dataset>__lora__lf__<precision>.
   --plot true|false
   --plot-output-dir DIR
@@ -223,12 +223,6 @@ abs_path() {
 
 safe_label() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]_-' '_' | sed -e 's/^[_-]*//' -e 's/[_-]*$//'
-}
-
-lora_dropout_label() {
-  local value="$1"
-  [[ "${value}" =~ ^0\.[0-9][0-9]$ ]] || die "LORA_DROPOUT must use fixed 0.xx format, e.g. 0.10; got '${value}'"
-  printf 'drop0%s\n' "${value#*.}"
 }
 
 infer_template() {
@@ -379,17 +373,16 @@ profiler_label() {
 
 config_root_path() {
   local seq_len="$1"
-  local config_label step_label dropout_label
+  local config_label step_label
   step_label="w${WARMUP_STEPS}_s${MAX_STEPS}"
-  dropout_label="${lora_dropout_label_value}"
   if [[ -n "${run_name}" ]]; then
     if ((${#seq_lens[@]} > 1)); then
-      config_label="$(safe_label "${run_name}__s${seq_len}_${dropout_label}")"
+      config_label="$(safe_label "${run_name}__s${seq_len}")"
     else
-      config_label="$(safe_label "${run_name}__${dropout_label}")"
+      config_label="$(safe_label "${run_name}")"
     fi
   else
-    config_label="$(safe_label "${workload_label}__b${batch_size}_s${seq_len}_${step_label}_r${LORA_RANK}_a${LORA_ALPHA}_${dropout_label}")"
+    config_label="$(safe_label "${workload_label}__b${batch_size}_s${seq_len}_${step_label}_r${LORA_RANK}_a${LORA_ALPHA}")"
   fi
   printf '%s/%s\n' "${precision_root}" "${config_label}"
 }
@@ -626,7 +619,6 @@ fi
 nonnegative_int "--max-steps" "${MAX_STEPS}"
 nonnegative_int "--warmup-steps" "${WARMUP_STEPS}"
 nonnegative_int "INTERRUPT_GRACE_SECONDS" "${INTERRUPT_GRACE_SECONDS}"
-lora_dropout_label_value="$(lora_dropout_label "${LORA_DROPOUT}")"
 TOTAL_STEPS=$((MAX_STEPS + WARMUP_STEPS))
 if [[ -z "${COMPARE_MIN_STEPS}" ]]; then
   COMPARE_MIN_STEPS="${MAX_STEPS}"

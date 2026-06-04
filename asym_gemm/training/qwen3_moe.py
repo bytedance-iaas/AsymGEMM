@@ -185,6 +185,144 @@ def _restore_saved_rows(
     return restored
 
 
+def _empty_packed_mask(device: torch.device) -> torch.Tensor:
+    return torch.empty((0, 0), device=device, dtype=torch.uint8)
+
+
+def _pack_bool_mask_2d(mask_bool: torch.Tensor) -> torch.Tensor:
+    if mask_bool.dtype != torch.bool or mask_bool.dim() != 2:
+        raise ValueError(f"mask_bool must be a 2D bool tensor, got shape={tuple(mask_bool.shape)} dtype={mask_bool.dtype}")
+    if mask_bool.device.type == "cuda":
+        import asym_gemm
+
+        pack = getattr(getattr(asym_gemm, "_C", None), "pack_bool_mask_2d", None)
+        if pack is not None:
+            return pack(mask_bool.contiguous())
+    mask_u8 = mask_bool.contiguous().to(dtype=torch.uint8)
+    rows, width = int(mask_u8.shape[0]), int(mask_u8.shape[1])
+    packed_width = (width + 7) // 8
+    if packed_width == 0:
+        return torch.empty((rows, 0), device=mask_bool.device, dtype=torch.uint8)
+    padded_width = packed_width * 8
+    if padded_width != width:
+        mask_u8 = F.pad(mask_u8, (0, padded_width - width))
+    bits = (1 << torch.arange(8, device=mask_bool.device, dtype=torch.uint8)).view(1, 1, 8)
+    return mask_u8.view(rows, packed_width, 8).mul(bits).sum(dim=-1).to(dtype=torch.uint8)
+
+
+def _unpack_bool_mask_2d(mask_packed: torch.Tensor, width: int) -> torch.Tensor:
+    if mask_packed.dtype != torch.uint8 or mask_packed.dim() != 2:
+        raise ValueError(f"mask_packed must be a 2D uint8 tensor, got shape={tuple(mask_packed.shape)} dtype={mask_packed.dtype}")
+    if width < 0:
+        raise ValueError(f"width must be non-negative, got {width}")
+    expected = (int(width) + 7) // 8
+    if int(mask_packed.shape[1]) != expected:
+        raise ValueError(f"mask_packed width mismatch: got {int(mask_packed.shape[1])}, expected {expected}")
+    if mask_packed.device.type == "cuda":
+        import asym_gemm
+
+        unpack = getattr(getattr(asym_gemm, "_C", None), "unpack_bool_mask_2d", None)
+        if unpack is not None:
+            return unpack(mask_packed.contiguous(), int(width))
+    if width == 0:
+        return torch.empty((int(mask_packed.shape[0]), 0), device=mask_packed.device, dtype=torch.bool)
+    bit_ids = torch.arange(8, device=mask_packed.device, dtype=torch.long).view(1, 1, 8)
+    unpacked = ((mask_packed.contiguous().unsqueeze(-1).to(dtype=torch.long) >> bit_ids) & 1).to(dtype=torch.bool)
+    return unpacked.reshape(int(mask_packed.shape[0]), expected * 8)[:, : int(width)]
+
+
+def _apply_saved_dropout(
+    x: torch.Tensor,
+    mask_packed: torch.Tensor | None,
+    dropout_p: float,
+    *,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    if dropout_p == 0.0 or mask_packed is None or int(mask_packed.numel()) == 0:
+        return x if x.dtype == out_dtype else x.to(dtype=out_dtype)
+    if not (0.0 < float(dropout_p) < 1.0):
+        raise ValueError(f"dropout_p must satisfy 0.0 < p < 1.0 when a mask is provided, got {dropout_p}")
+    x_out = x if x.dtype == out_dtype else x.to(dtype=out_dtype)
+    if x_out.device.type == "cuda":
+        import asym_gemm
+
+        apply = getattr(getattr(asym_gemm, "_C", None), "apply_packed_dropout", None)
+        if apply is not None:
+            return apply(x_out.contiguous(), mask_packed.contiguous(), float(dropout_p))
+    mask = _unpack_bool_mask_2d(mask_packed, int(x_out.shape[1]))
+    scale = 1.0 / (1.0 - float(dropout_p))
+    return torch.where(mask, x_out * scale, torch.zeros((), device=x_out.device, dtype=x_out.dtype))
+
+
+def _apply_saved_dropout_(
+    x: torch.Tensor,
+    mask_packed: torch.Tensor | None,
+    dropout_p: float,
+) -> torch.Tensor:
+    if dropout_p == 0.0 or mask_packed is None or int(mask_packed.numel()) == 0:
+        return x
+    if x.device.type == "cuda":
+        import asym_gemm
+
+        apply_inplace = getattr(getattr(asym_gemm, "_C", None), "apply_packed_dropout_", None)
+        if apply_inplace is not None and x.is_contiguous():
+            return apply_inplace(x, mask_packed.contiguous(), float(dropout_p))
+    mask = _unpack_bool_mask_2d(mask_packed, int(x.shape[1]))
+    x.mul_(mask.to(dtype=x.dtype)).mul_(1.0 / (1.0 - float(dropout_p)))
+    return x
+
+
+def _native_dropout_with_packed_mask(
+    x: torch.Tensor,
+    p: float,
+    *,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if p == 0.0:
+        return x.to(dtype=out_dtype), _empty_packed_mask(x.device)
+    if not (0.0 < float(p) < 1.0):
+        raise ValueError(f"lora_dropout must satisfy 0.0 <= p < 1.0 in the custom expert path, got {p}")
+    x_drop, mask_bool = torch.ops.aten.native_dropout(x, float(p), True)
+    return x_drop.to(dtype=out_dtype), _pack_bool_mask_2d(mask_bool)
+
+
+def _forward_gate_up_with_saved_low_rank(
+    layer: "AsymQwen3Experts",
+    packed: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    gate_low_rank: torch.Tensor,
+    up_low_rank: torch.Tensor,
+    gate_lora_B: torch.Tensor,
+    up_lora_B: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if int(packed.shape[0]) == 0:
+        empty = packed.new_empty((0, layer.intermediate_dim))
+        return empty, empty
+    gate_up_kwargs = {
+        "dense_experts": False,
+        "profile_name": layer._profile_name("gate_up", "base"),
+    }
+    if isinstance(layer.gate_up_base, AsymGroupedFrozenLinear):
+        gate_up_kwargs["compiled_dims"] = "nk"
+    gate_up = layer.gate_up_base(packed, offsets, experts, **gate_up_kwargs)
+    gate, up = gate_up.chunk(2, dim=-1)
+    metadata = layer._lora_metadata(offsets, experts, dense_experts=False)
+    gate_delta, up_delta = grouped_expert_lora_pair(
+        gate_low_rank,
+        up_low_rank,
+        gate_lora_B,
+        up_lora_B,
+        offsets,
+        experts,
+        metadata=metadata,
+    )
+    if layer.lora_scale != 1.0:
+        gate_delta = gate_delta.mul(layer.lora_scale)
+        up_delta = up_delta.mul(layer.lora_scale)
+    return gate + gate_delta.to(dtype=gate.dtype), up + up_delta.to(dtype=up.dtype)
+
+
 def _forward_gate_up_selected_or_empty(
     layer: "AsymQwen3Experts",
     packed: torch.Tensor,
@@ -280,14 +418,19 @@ def _lora_backward_group(
     scale: float,
     need_grad_x: bool,
     precomputed_low_rank: torch.Tensor | None = None,
+    dropout_mask_packed: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
-    x_lora = x.to(dtype=a_weight.dtype)
+    x_lora = _apply_saved_dropout(x, dropout_mask_packed, dropout_p, out_dtype=a_weight.dtype)
     grad_lora = grad_y.to(dtype=b_weight.dtype)
     low_rank = F.linear(x_lora, a_weight) if precomputed_low_rank is None else precomputed_low_rank.to(dtype=a_weight.dtype)
     grad_b = grad_lora.transpose(0, 1).matmul(low_rank).mul(scale).to(dtype=b_weight.dtype)
     grad_low_rank = grad_lora.matmul(b_weight).mul(scale)
     grad_a = grad_low_rank.transpose(0, 1).matmul(x_lora).to(dtype=a_weight.dtype)
-    grad_x = grad_low_rank.matmul(a_weight).to(dtype=x.dtype) if need_grad_x else None
+    grad_x = None
+    if need_grad_x:
+        grad_x_raw = grad_low_rank.matmul(a_weight)
+        grad_x = _apply_saved_dropout(grad_x_raw, dropout_mask_packed, dropout_p, out_dtype=x.dtype)
     return grad_x, grad_a, grad_b
 
 
@@ -307,6 +450,8 @@ def _grouped_lora_backward(
     scale: float,
     need_grad_x: bool,
     precomputed_low_rank: torch.Tensor | None = None,
+    dropout_mask_packed: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
     grad_x = torch.zeros_like(x) if need_grad_x else None
     grad_a = torch.zeros_like(a_weight)
@@ -327,6 +472,8 @@ def _grouped_lora_backward(
             scale=scale,
             need_grad_x=need_grad_x,
             precomputed_low_rank=None if precomputed_low_rank is None else precomputed_low_rank[start:end],
+            dropout_mask_packed=None if dropout_mask_packed is None or int(dropout_mask_packed.numel()) == 0 else dropout_mask_packed[start:end],
+            dropout_p=dropout_p,
         )
         if grad_x is not None and grad_x_group is not None:
             grad_x[start:end].add_(grad_x_group)
@@ -419,6 +566,8 @@ def _grouped_lora_backward_loop_free(
     scale: float,
     need_grad_x: bool,
     precomputed_low_rank: torch.Tensor | None = None,
+    dropout_mask_packed: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
     metadata: GroupedLoRAMetadata | None = None,
     stats: AsymExecutionStats | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
@@ -434,6 +583,8 @@ def _grouped_lora_backward_loop_free(
             scale=scale,
             need_grad_x=need_grad_x,
             precomputed_low_rank=precomputed_low_rank,
+            dropout_mask_packed=dropout_mask_packed,
+            dropout_p=dropout_p,
         )
     if (int(a_weight.shape[1]) * int(a_weight.element_size())) % 16 != 0:
         _record_reference_fallback(stats, "lora_backward_unaligned")
@@ -447,9 +598,11 @@ def _grouped_lora_backward_loop_free(
             scale=scale,
             need_grad_x=need_grad_x,
             precomputed_low_rank=precomputed_low_rank,
+            dropout_mask_packed=dropout_mask_packed,
+            dropout_p=dropout_p,
         )
 
-    x_lora = x if x.dtype == a_weight.dtype else x.to(dtype=a_weight.dtype)
+    x_lora = _apply_saved_dropout(x, dropout_mask_packed, dropout_p, out_dtype=a_weight.dtype)
     grad_lora = grad_y if grad_y.dtype == b_weight.dtype else grad_y.to(dtype=b_weight.dtype)
     lora_metadata = prepare_grouped_lora_metadata(offsets, experts, dense_experts=True) if metadata is None else metadata
     low_rank = (
@@ -486,13 +639,14 @@ def _grouped_lora_backward_loop_free(
     )
     grad_x = None
     if need_grad_x:
-        grad_x = grouped_expert_lora(
+        grad_x_raw = grouped_expert_lora(
             grad_low_rank,
             a_weight.transpose(-1, -2),
             offsets,
             experts,
             metadata=lora_metadata,
-        ).to(dtype=x.dtype)
+        )
+        grad_x = _apply_saved_dropout_(grad_x_raw.contiguous(), dropout_mask_packed, dropout_p).to(dtype=x.dtype)
     return grad_x, grad_a, grad_b
 
 
@@ -514,7 +668,18 @@ class _ThresholdedQwen3ExpertFunction(torch.autograd.Function):
         layer: "AsymQwen3Experts",
     ) -> torch.Tensor:
         with prof_range("forward.mlp.expert_policy.body_with_intermediates"):
-            output, gate, up, activated, gate_low_rank, up_low_rank, down_low_rank = layer._forward_expert_body_with_intermediates(
+            (
+                output,
+                gate,
+                up,
+                activated,
+                gate_low_rank,
+                up_low_rank,
+                down_low_rank,
+                gate_mask_packed,
+                up_mask_packed,
+                down_mask_packed,
+            ) = layer._forward_expert_body_with_intermediates(
                 packed,
                 offsets,
                 experts,
@@ -580,8 +745,8 @@ class _ThresholdedQwen3ExpertFunction(torch.autograd.Function):
                 mode_hint=gate_up_mode_hint,
             )
             up_saved = _save_values_for_plan(up, gate_saved_rows, gate_saved_mode)
-            gate_low_rank_saved = _save_values_for_plan(gate_low_rank, gate_saved_rows, gate_saved_mode)
-            up_low_rank_saved = _save_values_for_plan(up_low_rank, gate_saved_rows, gate_saved_mode)
+            gate_low_rank_saved = gate_low_rank.detach()
+            up_low_rank_saved = up_low_rank.detach()
         with prof_range("forward.mlp.expert_policy.save_activated_plan"):
             activated_saved, _, _, activated_saved_rows, activated_saved_mode = _make_group_row_plan(
                 activated.detach(),
@@ -591,7 +756,7 @@ class _ThresholdedQwen3ExpertFunction(torch.autograd.Function):
                 active_groups,
                 mode_hint=activated_mode_hint,
             )
-            down_low_rank_saved = _save_values_for_plan(down_low_rank, activated_saved_rows, activated_saved_mode)
+            down_low_rank_saved = down_low_rank.detach()
         with prof_range("forward.mlp.expert_policy.save_recompute_plan"):
             recompute_offsets, recompute_experts, recompute_rows, recompute_mode = _make_group_plan(
                 offsets,
@@ -616,6 +781,7 @@ class _ThresholdedQwen3ExpertFunction(torch.autograd.Function):
         ctx.activated_saved_mode = activated_saved_mode
         ctx.recompute_mode = recompute_mode
         ctx.activation_rebuild_mode = activation_rebuild_mode
+        ctx.lora_dropout_p = float(layer.lora_dropout_p)
         with prof_range("forward.mlp.expert_policy.save_context"):
             ctx.save_for_backward(
                 packed.detach(),
@@ -635,6 +801,9 @@ class _ThresholdedQwen3ExpertFunction(torch.autograd.Function):
                 gate_low_rank_saved,
                 up_low_rank_saved,
                 down_low_rank_saved,
+                gate_mask_packed,
+                up_mask_packed,
+                down_mask_packed,
                 gate_lora_A,
                 gate_lora_B,
                 up_lora_A,
@@ -664,6 +833,9 @@ class _ThresholdedQwen3ExpertFunction(torch.autograd.Function):
             gate_low_rank_saved,
             up_low_rank_saved,
             down_low_rank_saved,
+            gate_mask_packed,
+            up_mask_packed,
+            down_mask_packed,
             gate_lora_A,
             gate_lora_B,
             up_lora_A,
@@ -715,88 +887,50 @@ class _ThresholdedQwen3ExpertFunction(torch.autograd.Function):
                 device=packed.device,
                 dtype=grad_output.dtype,
             )
-            gate_low_rank_full = _restore_saved_rows(
-                gate_low_rank_saved,
-                gate_saved_rows,
-                ctx.gate_saved_mode,
-                rows_total=rows_total,
-                width=layer.lora_rank,
-                device=packed.device,
-                dtype=gate_lora_A.dtype,
-            )
-            up_low_rank_full = _restore_saved_rows(
-                up_low_rank_saved,
-                gate_saved_rows,
-                ctx.gate_saved_mode,
-                rows_total=rows_total,
-                width=layer.lora_rank,
-                device=packed.device,
-                dtype=up_lora_A.dtype,
-            )
-            down_low_rank_full = _restore_saved_rows(
-                down_low_rank_saved,
-                activated_saved_rows,
-                ctx.activated_saved_mode,
-                rows_total=rows_total,
-                width=layer.lora_rank,
-                device=packed.device,
-                dtype=down_lora_A.dtype,
-            )
+            gate_low_rank_full = gate_low_rank_saved
+            up_low_rank_full = up_low_rank_saved
+            down_low_rank_full = down_low_rank_saved
 
         with prof_range("backward.mlp.expert_policy.pack_recompute_selected"):
             if ctx.recompute_mode == SAVE_FULL:
                 recompute_packed = packed
+                gate_low_rank_recompute = gate_low_rank_full
+                up_low_rank_recompute = up_low_rank_full
             elif ctx.recompute_mode == SAVE_COMPACT:
                 recompute_packed = packed.index_select(0, recompute_rows)
+                gate_low_rank_recompute = gate_low_rank_full.index_select(0, recompute_rows)
+                up_low_rank_recompute = up_low_rank_full.index_select(0, recompute_rows)
             else:
                 recompute_packed = packed.new_empty((0, packed.shape[-1]))
+                gate_low_rank_recompute = gate_low_rank_full.new_empty((0, layer.lora_rank))
+                up_low_rank_recompute = up_low_rank_full.new_empty((0, layer.lora_rank))
         with prof_range("backward.mlp.expert_policy.recompute_gate_up_selected"):
             if ctx.recompute_mode != SAVE_EMPTY:
-                gate_recompute, up_recompute, gate_low_rank_recompute, up_low_rank_recompute = _forward_gate_up_selected_or_empty(
+                gate_recompute, up_recompute = _forward_gate_up_with_saved_low_rank(
                     layer,
                     recompute_packed,
                     recompute_offsets,
                     recompute_experts,
+                    gate_low_rank_recompute,
+                    up_low_rank_recompute,
+                    gate_lora_B,
+                    up_lora_B,
                 )
                 if ctx.recompute_mode == SAVE_FULL:
                     gate_full = gate_recompute
                     up_full = up_recompute
-                    gate_low_rank_full = gate_low_rank_recompute
-                    up_low_rank_full = up_low_rank_recompute
                 elif int(recompute_rows.shape[0]) > 0:
                     gate_full[recompute_rows] = gate_recompute
                     up_full[recompute_rows] = up_recompute
-                    gate_low_rank_full[recompute_rows] = gate_low_rank_recompute
-                    up_low_rank_full[recompute_rows] = up_low_rank_recompute
 
         with prof_range("backward.mlp.expert_policy.rebuild_activation_selected"):
             if ctx.activation_rebuild_mode == SAVE_FULL:
                 activated_full = layer.act_fn(gate_full) * up_full
-                down_low_rank_full = grouped_expert_lora(
-                    activated_full.to(dtype=down_lora_A.dtype),
-                    down_lora_A,
-                    activation_offsets,
-                    activation_experts,
-                    metadata=lora_metadata,
-                )
             elif ctx.activation_rebuild_mode == SAVE_COMPACT and int(activation_rows.shape[0]) > 0:
                 gate_need = gate_full.index_select(0, activation_rows)
                 up_need = up_full.index_select(0, activation_rows)
                 activated_need = layer.act_fn(gate_need) * up_need
                 activated_full[activation_rows] = activated_need
-                activation_lora_metadata = prepare_grouped_lora_metadata(
-                    activation_offsets,
-                    activation_experts,
-                    dense_experts=False,
-                )
-                down_low_rank_need = grouped_expert_lora(
-                    activated_need.to(dtype=down_lora_A.dtype),
-                    down_lora_A,
-                    activation_offsets,
-                    activation_experts,
-                    metadata=activation_lora_metadata,
-                )
-                down_low_rank_full[activation_rows] = down_low_rank_need
 
         with prof_range("backward.mlp.expert_policy.down_lora_backward"):
             grad_down_lora_x, grad_down_lora_A, grad_down_lora_B = _grouped_lora_backward_loop_free(
@@ -809,6 +943,8 @@ class _ThresholdedQwen3ExpertFunction(torch.autograd.Function):
                 scale=layer.lora_scale,
                 need_grad_x=True,
                 precomputed_low_rank=down_low_rank_full,
+                dropout_mask_packed=down_mask_packed,
+                dropout_p=ctx.lora_dropout_p,
                 metadata=lora_metadata,
                 stats=layer.stats,
             )
@@ -854,6 +990,8 @@ class _ThresholdedQwen3ExpertFunction(torch.autograd.Function):
                 scale=layer.lora_scale,
                 need_grad_x=need_grad_packed,
                 precomputed_low_rank=gate_low_rank_full,
+                dropout_mask_packed=gate_mask_packed,
+                dropout_p=ctx.lora_dropout_p,
                 metadata=lora_metadata,
                 stats=layer.stats,
             )
@@ -868,6 +1006,8 @@ class _ThresholdedQwen3ExpertFunction(torch.autograd.Function):
                 scale=layer.lora_scale,
                 need_grad_x=need_grad_packed,
                 precomputed_low_rank=up_low_rank_full,
+                dropout_mask_packed=up_mask_packed,
+                dropout_p=ctx.lora_dropout_p,
                 metadata=lora_metadata,
                 stats=layer.stats,
             )
@@ -1040,16 +1180,36 @@ class AsymQwen3Experts(nn.Module):
         metadata,
         *,
         return_low_rank: bool = False,
+        return_dropout_state: bool = False,
     ):
         if self.lora_dropout_p == 0.0:
             x_lora = x.to(dtype=self.lora_dtype)
+            gate_mask_packed = _empty_packed_mask(x.device)
+            up_mask_packed = _empty_packed_mask(x.device)
             gate_up_a = torch.cat((self.gate_lora_A, self.up_lora_A), dim=1)
             with prof_range(self._forward_range("gate_up", "lora_a")):
                 low_rank = grouped_expert_lora(x_lora, gate_up_a, offsets, experts, metadata=metadata)
             gate_low_rank, up_low_rank = low_rank.split(self.lora_rank, dim=-1)
+        elif return_dropout_state:
+            gate_input, gate_mask_packed = _native_dropout_with_packed_mask(
+                x,
+                self.lora_dropout_p,
+                out_dtype=self.lora_dtype,
+            )
+            up_input, up_mask_packed = _native_dropout_with_packed_mask(
+                x,
+                self.lora_dropout_p,
+                out_dtype=self.lora_dtype,
+            )
+            with prof_range(self._forward_range("gate_up", "gate_lora_a")):
+                gate_low_rank = grouped_expert_lora(gate_input, self.gate_lora_A, offsets, experts, metadata=metadata)
+            with prof_range(self._forward_range("gate_up", "up_lora_a")):
+                up_low_rank = grouped_expert_lora(up_input, self.up_lora_A, offsets, experts, metadata=metadata)
         else:
             gate_input = self.lora_dropout(x).to(dtype=self.lora_dtype)
             up_input = self.lora_dropout(x).to(dtype=self.lora_dtype)
+            gate_mask_packed = _empty_packed_mask(x.device)
+            up_mask_packed = _empty_packed_mask(x.device)
             with prof_range(self._forward_range("gate_up", "gate_lora_a")):
                 gate_low_rank = grouped_expert_lora(gate_input, self.gate_lora_A, offsets, experts, metadata=metadata)
             with prof_range(self._forward_range("gate_up", "up_lora_a")):
@@ -1067,6 +1227,8 @@ class AsymQwen3Experts(nn.Module):
         if self.lora_scale != 1.0:
             gate_delta = gate_delta.mul(self.lora_scale)
             up_delta = up_delta.mul(self.lora_scale)
+        if return_dropout_state:
+            return gate_delta, up_delta, gate_low_rank, up_low_rank, gate_mask_packed, up_mask_packed
         if return_low_rank:
             return gate_delta, up_delta, gate_low_rank, up_low_rank
         return gate_delta, up_delta
@@ -1079,14 +1241,25 @@ class AsymQwen3Experts(nn.Module):
         metadata,
         *,
         return_low_rank: bool = False,
+        return_dropout_state: bool = False,
     ):
-        x_lora = self.lora_dropout(x).to(dtype=self.lora_dtype)
+        if return_dropout_state:
+            x_lora, mask_packed = _native_dropout_with_packed_mask(
+                x,
+                self.lora_dropout_p,
+                out_dtype=self.lora_dtype,
+            )
+        else:
+            x_lora = self.lora_dropout(x).to(dtype=self.lora_dtype)
+            mask_packed = _empty_packed_mask(x.device)
         with prof_range(self._forward_range("down", "lora_a")):
             low_rank = grouped_expert_lora(x_lora, self.down_lora_A, offsets, experts, metadata=metadata)
         with prof_range(self._forward_range("down", "lora_b")):
             delta = grouped_expert_lora(low_rank, self.down_lora_B, offsets, experts, metadata=metadata)
         if self.lora_scale != 1.0:
             delta = delta.mul(self.lora_scale)
+        if return_dropout_state:
+            return delta, low_rank, mask_packed
         if return_low_rank:
             return delta, low_rank
         return delta
@@ -1110,6 +1283,7 @@ class AsymQwen3Experts(nn.Module):
         dense_experts: bool,
         compiled_dims: str | None = None,
         return_low_rank: bool = False,
+        return_dropout_state: bool = False,
     ):
         lora_metadata = self._lora_metadata(offsets, experts, dense_experts=dense_experts)
         gate_up_kwargs = {
@@ -1126,13 +1300,18 @@ class AsymQwen3Experts(nn.Module):
             experts,
             lora_metadata,
             return_low_rank=return_low_rank,
+            return_dropout_state=return_dropout_state,
         )
-        if return_low_rank:
+        if return_dropout_state:
+            gate_delta, up_delta, gate_low_rank, up_low_rank, gate_mask_packed, up_mask_packed = gate_up_lora
+        elif return_low_rank:
             gate_delta, up_delta, gate_low_rank, up_low_rank = gate_up_lora
         else:
             gate_delta, up_delta = gate_up_lora
         gate = gate + gate_delta.to(dtype=gate.dtype)
         up = up + up_delta.to(dtype=up.dtype)
+        if return_dropout_state:
+            return gate, up, lora_metadata, gate_low_rank, up_low_rank, gate_mask_packed, up_mask_packed
         if return_low_rank:
             return gate, up, lora_metadata, gate_low_rank, up_low_rank
         return gate, up, lora_metadata
@@ -1192,12 +1371,13 @@ class AsymQwen3Experts(nn.Module):
         *,
         dense_experts: bool,
     ):
-        gate, up, lora_metadata, gate_low_rank, up_low_rank = self._forward_gate_up(
+        gate, up, lora_metadata, gate_low_rank, up_low_rank, gate_mask_packed, up_mask_packed = self._forward_gate_up(
             packed,
             offsets,
             experts,
             dense_experts=dense_experts,
             return_low_rank=True,
+            return_dropout_state=True,
         )
         with prof_range(self._forward_range("activation_silu_mul")):
             activated = self.act_fn(gate) * up
@@ -1208,14 +1388,26 @@ class AsymQwen3Experts(nn.Module):
             dense_experts=dense_experts,
             profile_name=self._profile_name("down", "base"),
         )
-        down_delta, down_low_rank = self._forward_down_lora(
+        down_delta, down_low_rank, down_mask_packed = self._forward_down_lora(
             activated,
             offsets,
             experts,
             lora_metadata,
             return_low_rank=True,
+            return_dropout_state=True,
         )
-        return down + down_delta.to(dtype=down.dtype), gate, up, activated, gate_low_rank, up_low_rank, down_low_rank
+        return (
+            down + down_delta.to(dtype=down.dtype),
+            gate,
+            up,
+            activated,
+            gate_low_rank,
+            up_low_rank,
+            down_low_rank,
+            gate_mask_packed,
+            up_mask_packed,
+            down_mask_packed,
+        )
 
     def _uses_expert_recompute(self) -> bool:
         return bool(self.expert_recompute_config.enabled and self.training and torch.is_grad_enabled())
@@ -1228,8 +1420,8 @@ class AsymQwen3Experts(nn.Module):
         metadata,
     ) -> torch.Tensor:
         config: ExpertRecomputeConfig = self.expert_recompute_config
-        if self.lora_dropout_p > 0.0:
-            raise NotImplementedError("Qwen3 expert recompute requires lora_dropout=0.0; no slow checkpoint fallback is used")
+        if self.lora_dropout_p >= 1.0:
+            raise NotImplementedError("Qwen3 expert recompute supports 0.0 <= lora_dropout < 1.0")
         if not _is_silu_activation(self.act_fn):
             raise NotImplementedError("AsymGEMM expert recompute supports only SiLU expert activation")
         with prof_range(self._forward_range("expert_policy")):

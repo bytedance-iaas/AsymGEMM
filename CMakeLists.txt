@@ -26,7 +26,7 @@ include_directories(${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/include ${TORC
 link_directories(${TORCH_INSTALL_PREFIX}/lib ${CUDA_TOOLKIT_ROOT_DIR}/lib64 ${CUDA_TOOLKIT_ROOT_DIR}/lib64/stubs)
 
 # The main Python API entrance
-pybind11_add_module(_C csrc/python_api.cpp)
+pybind11_add_module(_C csrc/python_api.cpp csrc/dropout/dropout_mask.cu)
 target_link_libraries(_C PRIVATE ${TORCH_LIBRARIES} torch_python)
 
 # Enable kernel code indexing with CMake-based IDEs

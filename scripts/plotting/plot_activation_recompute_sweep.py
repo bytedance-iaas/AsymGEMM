@@ -494,6 +494,14 @@ def first_optional(mapping: dict[str, Any], *keys: str) -> float | None:
     return None
 
 
+def dropout_label(value: Any) -> str:
+    result = optional_float(value)
+    if result is None:
+        return "drop?"
+    scaled = int(round(result * 100.0))
+    return f"drop{scaled:03d}"
+
+
 def step_ms(profile: dict[str, Any]) -> float:
     stages = profile.get("stages")
     if isinstance(stages, list):
@@ -589,6 +597,9 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
     if not isinstance(memory_gpu, dict):
         memory_gpu = {}
     batch_size = int(config.get("batch_size", meta["batch_size"]))
+    lora_dropout = optional_float(config.get("lora_dropout"))
+    if lora_dropout is None:
+        lora_dropout = 0.0
     if args.batch_size and batch_size not in set(args.batch_size):
         return None
     route_stats = first_dict(profile, "expert_token_distribution")
@@ -647,6 +658,7 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         "workload": meta["workload"],
         "precision": meta["precision"],
         "batch_size": batch_size,
+        "lora_dropout": lora_dropout,
         "seq_len": int(meta["seq_len"]),
         "logical_tokens": int(config.get("logical_tokens", batch_size * int(meta["seq_len"]))),
         "mode": meta["mode"],
@@ -780,6 +792,7 @@ def collect_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["workload"],
             row["precision"],
             row["batch_size"],
+            row["lora_dropout"],
             row["seq_len"],
             row["backend"],
             row["profiler"],
@@ -797,6 +810,7 @@ def collect_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
         key=lambda row: (
             row["workload"],
             row["batch_size"],
+            row["lora_dropout"],
             row["backend"],
             row["profiler"],
             row["seq_len"],
@@ -929,6 +943,7 @@ def collect_step_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["workload"],
             row["precision"],
             row["batch_size"],
+            row["lora_dropout"],
             row["seq_len"],
             row["backend"],
             row["profiler"],
@@ -947,6 +962,7 @@ def collect_step_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
         key=lambda row: (
             row["workload"],
             row["batch_size"],
+            row["lora_dropout"],
             row["backend"],
             row["profiler"],
             row["seq_len"],
@@ -961,15 +977,23 @@ def collect_step_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
     )
 
 
-def group_key(row: dict[str, Any]) -> tuple[str, str, int, str, str]:
-    return (str(row["workload"]), str(row["precision"]), int(row["batch_size"]), str(row["backend"]), str(row["profiler"]))
-
-
-def threshold_group_key(row: dict[str, Any]) -> tuple[str, str, int, int, str, str]:
+def group_key(row: dict[str, Any]) -> tuple[str, str, int, float, str, str]:
     return (
         str(row["workload"]),
         str(row["precision"]),
         int(row["batch_size"]),
+        numeric_float(row.get("lora_dropout")),
+        str(row["backend"]),
+        str(row["profiler"]),
+    )
+
+
+def threshold_group_key(row: dict[str, Any]) -> tuple[str, str, int, float, int, str, str]:
+    return (
+        str(row["workload"]),
+        str(row["precision"]),
+        int(row["batch_size"]),
+        numeric_float(row.get("lora_dropout")),
         int(row["seq_len"]),
         str(row["backend"]),
         str(row["profiler"]),
@@ -977,23 +1001,25 @@ def threshold_group_key(row: dict[str, Any]) -> tuple[str, str, int, int, str, s
 
 
 def varied_fields(rows: list[dict[str, Any]]) -> set[str]:
-    fields = ("workload", "precision", "batch_size", "backend", "profiler", "mode")
+    fields = ("workload", "precision", "batch_size", "lora_dropout", "backend", "profiler", "mode")
     return {field for field in fields if len({row[field] for row in rows}) > 1}
 
 
 def varied_threshold_fields(rows: list[dict[str, Any]]) -> set[str]:
-    fields = ("workload", "precision", "batch_size", "seq_len", "backend", "profiler", "mode")
+    fields = ("workload", "precision", "batch_size", "lora_dropout", "seq_len", "backend", "profiler", "mode")
     return {field for field in fields if len({row[field] for row in rows}) > 1}
 
 
-def combined_label(group: tuple[str, str, int, str, str], mode: str, varied: set[str]) -> str:
-    workload, precision, batch_size, backend, profiler = group
+def combined_label(group: tuple[str, str, int, float, str, str], mode: str, varied: set[str]) -> str:
+    workload, precision, batch_size, lora_dropout, backend, profiler = group
     mode_labels = {"no_recompute": "No recompute", "recompute": "Activation recompute"}
     parts: list[str] = []
     if "workload" in varied:
         parts.append(workload)
     if "batch_size" in varied:
         parts.append(f"b{batch_size}")
+    if "lora_dropout" in varied:
+        parts.append(dropout_label(lora_dropout))
     if "precision" in varied:
         parts.append(precision)
     if "backend" in varied:
@@ -1007,14 +1033,16 @@ def combined_label(group: tuple[str, str, int, str, str], mode: str, varied: set
     return f"{backend} / {mode_labels.get(mode, mode)}"
 
 
-def combined_threshold_label(group: tuple[str, str, int, int, str, str], mode: str, varied: set[str]) -> str:
-    workload, precision, batch_size, seq_len, backend, profiler = group
+def combined_threshold_label(group: tuple[str, str, int, float, int, str, str], mode: str, varied: set[str]) -> str:
+    workload, precision, batch_size, lora_dropout, seq_len, backend, profiler = group
     mode_labels = {"no_recompute": "No layer recompute", "recompute": "Layer recompute"}
     parts: list[str] = []
     if "workload" in varied:
         parts.append(workload)
     if "batch_size" in varied:
         parts.append(f"b{batch_size}")
+    if "lora_dropout" in varied:
+        parts.append(dropout_label(lora_dropout))
     if "seq_len" in varied:
         parts.append(f"s{seq_len}")
     if "precision" in varied:
@@ -1317,7 +1345,7 @@ def plot_combined_metric(
 ) -> None:
     import matplotlib.pyplot as plt
 
-    series: dict[tuple[tuple[str, str, int, str, str], str], list[dict[str, Any]]] = {}
+    series: dict[tuple[tuple[str, str, int, float, str, str], str], list[dict[str, Any]]] = {}
     for row in rows:
         series.setdefault((group_key(row), str(row["mode"])), []).append(row)
     varied = varied_fields(rows)
@@ -1504,7 +1532,7 @@ def plot_step_metric(
 
 
 def threshold_sweep_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_series: dict[tuple[tuple[str, str, int, int, str, str], str], set[int]] = {}
+    by_series: dict[tuple[tuple[str, str, int, float, int, str, str], str], set[int]] = {}
     token_rows = [
         row
         for row in rows
@@ -1556,7 +1584,7 @@ def policy_series_suffix(row: dict[str, Any], family: str) -> int:
 
 def policy_sweep_rows(rows: list[dict[str, Any]], family: str) -> list[dict[str, Any]]:
     family_rows = policy_family_rows(rows, family)
-    by_series: dict[tuple[tuple[str, str, int, int, str, str], str, int], set[float]] = {}
+    by_series: dict[tuple[tuple[str, str, int, float, int, str, str], str, int], set[float]] = {}
     for row in family_rows:
         key = (threshold_group_key(row), str(row["mode"]), policy_series_suffix(row, family))
         by_series.setdefault(key, set()).add(policy_sweep_x(row, family))
@@ -1649,7 +1677,7 @@ def plot_combined_threshold_metric(
 ) -> None:
     import matplotlib.pyplot as plt
 
-    series: dict[tuple[tuple[str, str, int, int, str, str], str], list[dict[str, Any]]] = {}
+    series: dict[tuple[tuple[str, str, int, float, int, str, str], str], list[dict[str, Any]]] = {}
     for row in rows:
         series.setdefault((threshold_group_key(row), str(row["mode"])), []).append(row)
     varied = varied_threshold_fields(rows)
@@ -1749,7 +1777,7 @@ def plot_combined_policy_metric(
 ) -> None:
     import matplotlib.pyplot as plt
 
-    series: dict[tuple[tuple[str, str, int, int, str, str], str, int], list[dict[str, Any]]] = {}
+    series: dict[tuple[tuple[str, str, int, float, int, str, str], str, int], list[dict[str, Any]]] = {}
     for row in rows:
         series.setdefault((threshold_group_key(row), str(row["mode"]), policy_series_suffix(row, family)), []).append(row)
     varied = varied_threshold_fields(rows)
@@ -1786,10 +1814,10 @@ def plot_combined_policy_metric(
     plt.close(fig)
 
 
-def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, str, int, str, str]) -> None:
-    workload, precision, batch_size, backend, profiler = key
+def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, str, int, float, str, str]) -> None:
+    workload, precision, batch_size, lora_dropout, backend, profiler = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, {precision}, {backend}/{profiler}"
+    suffix = f", batch size {batch_size}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}"
     plot_metric(
         rows,
         output_dir,
@@ -1845,12 +1873,12 @@ def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[s
     )
 
 
-def write_group_step_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, str, int, str, str]) -> None:
+def write_group_step_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, str, int, float, str, str]) -> None:
     if not rows:
         return
-    workload, precision, batch_size, backend, profiler = key
+    workload, precision, batch_size, lora_dropout, backend, profiler = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, {precision}, {backend}/{profiler}"
+    suffix = f", batch size {batch_size}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}"
     write_table(rows, output_dir, "step_samples")
     for filename, title, ylabel, metric_key, scale in step_plot_specs(combined=False):
         plot_step_metric(
@@ -1868,12 +1896,12 @@ def write_group_step_plots(rows: list[dict[str, Any]], output_dir: Path, key: tu
 def write_group_threshold_plots(
     rows: list[dict[str, Any]],
     output_dir: Path,
-    key: tuple[str, str, int, str, str],
+    key: tuple[str, str, int, float, str, str],
     seq_len: int,
 ) -> None:
-    workload, precision, batch_size, backend, profiler = key
+    workload, precision, batch_size, lora_dropout, backend, profiler = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, seq {seq_len}, {precision}, {backend}/{profiler}"
+    suffix = f", batch size {batch_size}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}"
     plot_threshold_metric(
         rows,
         output_dir,
@@ -1923,13 +1951,13 @@ def write_group_threshold_plots(
 def write_group_policy_plots(
     rows: list[dict[str, Any]],
     output_dir: Path,
-    key: tuple[str, str, int, str, str],
+    key: tuple[str, str, int, float, str, str],
     seq_len: int,
     family: str,
 ) -> None:
-    workload, precision, batch_size, backend, profiler = key
+    workload, precision, batch_size, lora_dropout, backend, profiler = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, seq {seq_len}, {precision}, {backend}/{profiler}"
+    suffix = f", batch size {batch_size}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}"
     name = policy_filename_suffix(family)
     title = {
         "tok": "expert token threshold",
@@ -2225,17 +2253,19 @@ def main() -> None:
         write_combined_step_plots(step_rows, combined_dir)
 
     if not args.combined_only:
-        groups: dict[tuple[str, str, int, str, str], list[dict[str, Any]]] = {}
+        groups: dict[tuple[str, str, int, float, str, str], list[dict[str, Any]]] = {}
         for row in seq_rows:
             groups.setdefault(group_key(row), []).append(row)
-        step_groups: dict[tuple[str, str, int, str, str], list[dict[str, Any]]] = {}
+        step_groups: dict[tuple[str, str, int, float, str, str], list[dict[str, Any]]] = {}
         for row in step_rows:
             step_groups.setdefault(group_key(row), []).append(row)
         for key in sorted(set(groups) | set(step_groups)):
             group_rows = groups.get(key, [])
             group_step_rows = step_groups.get(key, [])
-            workload, precision, batch_size, backend, profiler = key
-            group_dir = root / safe_label(f"{workload}-b{batch_size}-{precision}-{backend}-{profiler}")
+            workload, precision, batch_size, lora_dropout, backend, profiler = key
+            group_dir = root / safe_label(
+                f"{workload}-b{batch_size}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}"
+            )
             if group_rows:
                 write_table(group_rows, group_dir, "sweep_summary")
                 write_group_plots(group_rows, group_dir, key)
@@ -2251,13 +2281,15 @@ def main() -> None:
             write_combined_policy_plots(family_rows, combined_dir, family)
         if args.combined_only:
             continue
-        family_groups: dict[tuple[tuple[str, str, int, str, str], int], list[dict[str, Any]]] = {}
+        family_groups: dict[tuple[tuple[str, str, int, float, str, str], int], list[dict[str, Any]]] = {}
         for row in family_rows:
             family_groups.setdefault((group_key(row), int(row["seq_len"])), []).append(row)
         suffix = policy_filename_suffix(family)
         for (key, seq_len), group_rows in sorted(family_groups.items()):
-            workload, precision, batch_size, backend, profiler = key
-            group_dir = root / safe_label(f"{workload}-b{batch_size}-{precision}-{backend}-{profiler}")
+            workload, precision, batch_size, lora_dropout, backend, profiler = key
+            group_dir = root / safe_label(
+                f"{workload}-b{batch_size}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}"
+            )
             write_table(group_rows, group_dir, f"{suffix}_summary_s{seq_len}")
             write_group_policy_plots(group_rows, group_dir, key, seq_len, family)
             print(f"wrote {group_dir} {suffix} s{seq_len}", flush=True)

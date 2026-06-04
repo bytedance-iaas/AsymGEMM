@@ -526,7 +526,7 @@ def test_qwen3_tok_act_does_not_run_subset_gate_up_recompute() -> None:
     assert subset_gate_up_calls == 0
 
 
-def test_qwen3_tok_policy_runs_subset_gate_up_recompute() -> None:
+def test_qwen3_tok_policy_uses_saved_low_rank_without_subset_lora_a_recompute() -> None:
     torch.manual_seed(38)
     source = FakeQwen3Experts()
     wrapped = AsymQwen3Experts(
@@ -555,7 +555,64 @@ def test_qwen3_tok_policy_runs_subset_gate_up_recompute() -> None:
     loss = wrapped(x, top_k_index, top_k_weights).float().square().mean()
     loss.backward()
 
-    assert subset_gate_up_calls > 0
+    assert subset_gate_up_calls == 0
+
+
+@pytest.mark.parametrize("policy", ["tok-le0", "tok-le2", "tok-le2-act"])
+def test_asym_qwen3_experts_torch_recompute_lora_dropout_matches_none(policy: str) -> None:
+    torch.manual_seed(39)
+    source_ref = FakeQwen3Experts()
+    source_policy = FakeQwen3Experts()
+    source_policy.load_state_dict(source_ref.state_dict())
+    reference = AsymQwen3Experts(
+        source_ref,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.5,
+        expert_recompute_policy="none",
+        init_lora_weights="peft",
+    )
+    candidate = AsymQwen3Experts(
+        source_policy,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.5,
+        expert_recompute_policy=policy,
+        init_lora_weights="peft",
+    )
+    _copy_random_lora_params(reference, candidate)
+    reference.train()
+    candidate.train()
+
+    top_k_index, top_k_weights = _routing()
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(191)
+    x_ref = torch.randn(5, source_ref.hidden_dim, dtype=torch.bfloat16, generator=generator, requires_grad=True)
+    x_candidate = x_ref.detach().clone().requires_grad_(True)
+
+    torch.manual_seed(313)
+    out_ref = reference(x_ref, top_k_index, top_k_weights)
+    torch.manual_seed(313)
+    out_candidate = candidate(x_candidate, top_k_index, top_k_weights)
+    _assert_tensor_close_l2(f"{policy} dropout output", out_candidate, out_ref)
+
+    loss_ref = out_ref.float().square().mean() / 2.0
+    loss_candidate = out_candidate.float().square().mean() / 2.0
+    loss_ref.backward()
+    loss_candidate.backward()
+    _assert_grad_close(f"{policy} dropout input", x_candidate.grad, x_ref.grad)
+
+    candidate_params = dict(candidate.named_parameters())
+    for name, param in reference.named_parameters():
+        if "lora_" not in name:
+            continue
+        _assert_grad_close(f"{policy} dropout {name}", candidate_params[name].grad, param.grad)
 
 
 def test_apply_lf_asym_lora_wraps_experts_dense_and_freezes_router() -> None:
@@ -884,6 +941,104 @@ def test_asym_qwen3_experts_sm100_recompute_policies_match_none(policy: str) -> 
     assert reference.stats.asym_forward_calls > 0
     assert candidate.stats.asym_forward_calls > 0
     assert candidate.stats.asym_dx_calls > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] < 10, reason="requires SM100-class CUDA")
+@pytest.mark.parametrize("policy", ["tok-le0", "tok-le2", "tok-le2-act"])
+def test_asym_qwen3_experts_sm100_recompute_lora_dropout_matches_none(policy: str) -> None:
+    torch.manual_seed(23)
+    source_ref = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128).cuda()
+    source_policy = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128).cuda()
+    source_policy.load_state_dict(source_ref.state_dict())
+    reference = AsymQwen3Experts(
+        source_ref,
+        backend="asym",
+        precision="bf16",
+        offload=True,
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.1,
+        expert_recompute_policy="none",
+        init_lora_weights="peft",
+    )
+    candidate = AsymQwen3Experts(
+        source_policy,
+        backend="asym",
+        precision="bf16",
+        offload=True,
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.1,
+        expert_recompute_policy=policy,
+        init_lora_weights="peft",
+    )
+    _copy_random_lora_params(reference, candidate)
+    reference.train()
+    candidate.train()
+
+    top_k_index, top_k_weights = _routing()
+    top_k_index = top_k_index.cuda()
+    top_k_weights = top_k_weights.cuda()
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(47)
+    x_ref = torch.randn(5, source_ref.hidden_dim, device="cuda", dtype=torch.bfloat16, generator=generator, requires_grad=True)
+    x_candidate = x_ref.detach().clone().requires_grad_(True)
+
+    torch.manual_seed(557)
+    out_ref = reference(x_ref, top_k_index, top_k_weights)
+    torch.manual_seed(557)
+    out_candidate = candidate(x_candidate, top_k_index, top_k_weights)
+    _assert_tensor_close_l2(f"{policy} dropout output", out_candidate, out_ref, max_abs_tol=6e-3, rel_l2_tol=2e-2)
+
+    loss_ref = out_ref.float().square().mean() / 2.0
+    loss_candidate = out_candidate.float().square().mean() / 2.0
+    loss_ref.backward()
+    loss_candidate.backward()
+    _assert_grad_close(f"{policy} dropout input", x_candidate.grad, x_ref.grad)
+
+    candidate_params = dict(candidate.named_parameters())
+    for name, param in reference.named_parameters():
+        if "lora_" not in name:
+            continue
+        _assert_grad_close(f"{policy} dropout {name}", candidate_params[name].grad, param.grad)
+    assert reference.stats.asym_forward_calls > 0
+    assert candidate.stats.asym_forward_calls > 0
+    assert candidate.stats.asym_dx_calls > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] < 10, reason="requires SM100-class CUDA")
+def test_asym_qwen3_experts_sm100_recompute_lora_dropout_backward_consumes_no_rng() -> None:
+    torch.manual_seed(29)
+    source = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128).cuda()
+    wrapped = AsymQwen3Experts(
+        source,
+        backend="asym",
+        precision="bf16",
+        offload=True,
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.1,
+        expert_recompute_policy="tok-le2",
+        init_lora_weights="peft",
+    )
+    _copy_random_lora_params(wrapped, wrapped)
+    top_k_index, top_k_weights = _routing()
+    top_k_index = top_k_index.cuda()
+    top_k_weights = top_k_weights.cuda()
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(59)
+    x = torch.randn(5, source.hidden_dim, device="cuda", dtype=torch.bfloat16, generator=generator, requires_grad=True)
+
+    torch.manual_seed(701)
+    out = wrapped(x, top_k_index, top_k_weights)
+    loss = out.float().square().mean()
+    rng_before = torch.cuda.get_rng_state()
+    loss.backward()
+    rng_after = torch.cuda.get_rng_state()
+
+    assert torch.equal(rng_before, rng_after)
+    assert x.grad is not None
+    assert torch.isfinite(x.grad.float()).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] < 10, reason="requires SM100-class CUDA")

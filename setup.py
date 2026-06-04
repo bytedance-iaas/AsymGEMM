@@ -11,8 +11,9 @@ from setuptools.command.build_py import build_py
 from pathlib import Path
 
 try:
-    from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 except ImportError:
+    BuildExtension = None
     CUDAExtension = None
     CUDA_HOME = None
 
@@ -38,17 +39,26 @@ def get_ext_modules():
 
     return [CUDAExtension(
         name='asym_gemm._C',
-        sources=['csrc/python_api.cpp'],
+        sources=[
+            os.path.join(current_dir, 'csrc/python_api.cpp'),
+            os.path.join(current_dir, 'csrc/dropout/dropout_mask.cu'),
+        ],
         include_dirs=[
             f'{CUDA_HOME}/include',
             f'{CUDA_HOME}/include/cccl',
-            'asym_gemm/include',
-            'third-party/cutlass/include',
-            'third-party/fmt/include',
+            os.path.join(current_dir, 'asym_gemm/include'),
+            os.path.join(current_dir, 'third-party/cutlass/include'),
+            os.path.join(current_dir, 'third-party/fmt/include'),
         ],
         libraries=['cudart', 'nvrtc'],
         library_dirs=[f'{CUDA_HOME}/lib64'],
-        extra_compile_args=cxx_flags,
+        extra_compile_args={
+            'cxx': cxx_flags,
+            'nvcc': [
+                '-std=c++17', '-O3', '-Xcompiler', '-fPIC',
+                f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}',
+            ],
+        },
     )]
 
 
@@ -110,5 +120,8 @@ if __name__ == '__main__':
         packages=find_packages(),
         ext_modules=get_ext_modules(),
         package_data={'asym_gemm': ['include/**/*']},
-        cmdclass={'build_py': CustomBuildPy},
+        cmdclass={
+            'build_py': CustomBuildPy,
+            **({'build_ext': BuildExtension} if BuildExtension is not None else {}),
+        },
     )
