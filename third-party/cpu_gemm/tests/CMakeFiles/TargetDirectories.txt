@@ -1,0 +1,4 @@
+/workspace/cpu_gemm/tests/CMakeFiles/test_avx2_bf16.dir
+/workspace/cpu_gemm/tests/CMakeFiles/test_runtime.dir
+/workspace/cpu_gemm/tests/CMakeFiles/edit_cache.dir
+/workspace/cpu_gemm/tests/CMakeFiles/rebuild_cache.dir

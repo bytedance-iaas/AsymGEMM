@@ -20,6 +20,10 @@
 #include "../jit_kernels/impls/sm80_moe_gemm.hpp"
 #include "../jit_kernels/impls/sm89_fp8_moe_gemm.hpp"
 
+#if DG_TENSORMAP_COMPATIBLE
+#include "../jit_kernels/impls/sm90_int8_asym_gemm_1d1d.hpp"
+#endif
+
 #include "layout.hpp"
 
 namespace asym_gemm::gemm {
@@ -661,6 +665,93 @@ static void m_grouped_fp8_asym_gemm_sm89_masked(
         scale_a_block, scale_b_block);
 }
 
+#if DG_TENSORMAP_COMPATIBLE
+// SM90 (Hopper / H20) INT8 asymmetric grouped GEMM. INT8 inputs + FP32 per-token (A)
+// / per-channel (B) scales, FP32 output. Scale tensors must arrive pre-transposed
+// into the TMA SF layout (done in the Python dispatch layer):
+//   sfa: [num_groups, ceil(k/128), m]   (float32)
+//   sfb: [ceil(k/128), num_groups * n]  (float32)
+static void m_grouped_int8_asym_gemm_sm90_masked(
+        const torch::Tensor& a,         // [G, M_max, K] int8
+        const torch::Tensor& b,         // [G, N, K]     int8
+        const torch::Tensor& d,         // [G, M_max, N] float32
+        const torch::Tensor& masked_m,  // [G]           int32
+        const int& expected_m,
+        const torch::Tensor& sfa,       // [G, ceil(K/128), M_max] float32
+        const torch::Tensor& sfb) {     // [ceil(K/128), G*N]      float32
+    DG_HOST_ASSERT(a.dim() == 3 and b.dim() == 3 and d.dim() == 3);
+    const int64_t num_groups = a.size(0);
+    const int64_t m = a.size(1);
+    const int64_t k = a.size(2);
+    const int64_t n = b.size(1);
+    DG_HOST_ASSERT(b.size(0) == num_groups and b.size(2) == k);
+    DG_HOST_ASSERT(d.size(0) == num_groups and d.size(1) == m and d.size(2) == n);
+
+    DG_HOST_ASSERT(a.scalar_type() == torch::kChar and b.scalar_type() == torch::kChar);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(sfa.scalar_type() == torch::kFloat and sfb.scalar_type() == torch::kFloat);
+    // Activations (A), output (D), and both scale tensors (SFA, SFB) live in device memory.
+    DG_HOST_ASSERT(a.is_cuda() and d.is_cuda() and sfa.is_cuda() and sfb.is_cuda());
+    // Only the expert weights (B) may be PCIe/host-resident: Hopper TMA can fetch
+    // directly from CUDA-pinned host memory over the UVA address space.
+    DG_HOST_ASSERT(b.is_cuda() or b.is_pinned());
+    DG_HOST_ASSERT(a.is_contiguous() and b.is_contiguous() and d.is_contiguous());
+    DG_HOST_ASSERT(sfa.is_contiguous() and sfb.is_contiguous());
+    DG_HOST_ASSERT(masked_m.is_cuda() and masked_m.is_contiguous());
+    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt and masked_m.numel() == num_groups);
+
+    if (m == 0 or n == 0 or k == 0 or expected_m == 0) return;
+
+    const auto& major_a = get_major_type_ab(a);
+    const auto& major_b = get_major_type_ab(b);
+    sm90_m_grouped_int8_asym_gemm_masked_1d1d(a, sfa, b, sfb, d, masked_m, expected_m,
+                                              static_cast<int>(num_groups),
+                                              static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+                                              major_a, major_b, "nk");
+}
+
+static void m_grouped_int8_asym_gemm_sm90_contiguous(
+        const torch::Tensor& a,         // [M, K]    int8
+        const torch::Tensor& b,         // [G, N, K] int8
+        const torch::Tensor& d,         // [M, N]    float32
+        const torch::Tensor& offsets,   // [>=2*G]   int32 (start,end) pairs
+        const torch::Tensor& experts,   // [>=G+1]   int32 (with -1 terminator)
+        const int& list_size,
+        const torch::Tensor& sfa,       // [ceil(K/128), M]   float32
+        const torch::Tensor& sfb) {     // [ceil(K/128), G*N] float32
+    DG_HOST_ASSERT(a.dim() == 2 and b.dim() == 3 and d.dim() == 2);
+    const int64_t m = a.size(0);
+    const int64_t k = a.size(1);
+    const int64_t num_groups = b.size(0);
+    const int64_t n = b.size(1);
+    DG_HOST_ASSERT(b.size(2) == k);
+    DG_HOST_ASSERT(d.size(0) == m and d.size(1) == n);
+
+    DG_HOST_ASSERT(a.scalar_type() == torch::kChar and b.scalar_type() == torch::kChar);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(sfa.scalar_type() == torch::kFloat and sfb.scalar_type() == torch::kFloat);
+    // Activations (A), output (D), and both scale tensors (SFA, SFB) live in device memory.
+    DG_HOST_ASSERT(a.is_cuda() and d.is_cuda() and sfa.is_cuda() and sfb.is_cuda());
+    // Only the expert weights (B) may be PCIe/host-resident: Hopper TMA can fetch
+    // directly from CUDA-pinned host memory over the UVA address space.
+    DG_HOST_ASSERT(b.is_cuda() or b.is_pinned());
+    DG_HOST_ASSERT(a.is_contiguous() and b.is_contiguous() and d.is_contiguous());
+    DG_HOST_ASSERT(sfa.is_contiguous() and sfb.is_contiguous());
+    DG_HOST_ASSERT(offsets.is_cuda() and experts.is_cuda());
+    DG_HOST_ASSERT(offsets.scalar_type() == torch::kInt and experts.scalar_type() == torch::kInt);
+
+    if (m == 0 or n == 0 or k == 0) return;
+
+    const auto& major_a = get_major_type_ab(a);
+    const auto& major_b = get_major_type_ab(b);
+    sm90_m_grouped_int8_asym_gemm_contiguous_1d1d(a, sfa, b, sfb, d, offsets, experts,
+                                                  /*grid_y=*/list_size - 1,
+                                                  static_cast<int>(num_groups),
+                                                  static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+                                                  major_a, major_b, "nk");
+}
+#endif
+
 static void register_apis(pybind11::module_& m) {
 
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
@@ -725,6 +816,26 @@ static void register_apis(pybind11::module_& m) {
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("masked_m"), py::arg("expected_m"),
           py::arg("compiled_dims") = "nk");
+#endif
+
+#if DG_TENSORMAP_COMPATIBLE
+    // SM90 (Hopper / H20) INT8 asymmetric grouped GEMM (native S8 WGMMA, FP32 output)
+    m.def("m_grouped_int8_asym_gemm_sm90_masked",
+          static_cast<void(*)(const torch::Tensor&, const torch::Tensor&,
+                              const torch::Tensor&, const torch::Tensor&,
+                              const int&, const torch::Tensor&, const torch::Tensor&)>(
+              &m_grouped_int8_asym_gemm_sm90_masked),
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("masked_m"), py::arg("expected_m"),
+          py::arg("sfa"), py::arg("sfb"));
+    m.def("m_grouped_int8_asym_gemm_sm90_contiguous",
+          static_cast<void(*)(const torch::Tensor&, const torch::Tensor&,
+                              const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+                              const int&, const torch::Tensor&, const torch::Tensor&)>(
+              &m_grouped_int8_asym_gemm_sm90_contiguous),
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
+          py::arg("sfa"), py::arg("sfb"));
 #endif
 
     // SM89 FP8 MoE GEMM — masked variant (padded [G, M_max, K] layout)

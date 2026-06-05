@@ -81,6 +81,62 @@ struct FP8MMASelector {
     using type = decltype(select_type());
 };
 
+// INT8 WGMMA wrapper: S32S8S8 atoms produce int32 (S32) accumulators.
+// Mirrors FP8MMA but the cute fma takes uint32_t& registers, so we reinterpret
+// the int32_t accumulator storage. M=64, K=32 (same K-atom as FP8).
+template <int N_, typename MMA>
+struct INT8MMA {
+
+    template <size_t ...Idx>
+    __forceinline__ __device__ static void call_fma_impl(uint64_t const& desc_a, uint64_t const& desc_b, int32_t* d, bool scale_d, cute::index_sequence<Idx...>) {
+        using namespace cute::SM90::GMMA;
+        MMA::fma(desc_a, desc_b, reinterpret_cast<uint32_t&>(d[Idx])..., (scale_d ? ScaleOut::One : ScaleOut::Zero));
+    }
+
+    __forceinline__ __device__ static void wgmma(uint64_t const& desc_a, uint64_t const& desc_b, int32_t* d, bool scale_d) {
+        call_fma_impl(desc_a, desc_b, d, scale_d, cute::make_index_sequence<N_/2>{});
+    }
+
+    static constexpr int M = 64;
+    static constexpr int N = N_;
+    static constexpr int K = 32;
+    static constexpr int kNumAccum = M * N / 128;
+};
+
+template <int N>
+struct INT8MMASelector {
+
+    static constexpr auto select_mma() {
+        using namespace cute::SM90::GMMA;
+        // INT8 GMMA supports N in {8,16,24,32,48,64,80,96,112,128,144,160,
+        // 176,192,208,224,240,256} — note this is narrower than FP8 (no 40/56/...).
+        if constexpr (N == 8)   return MMA_64x8x32_S32S8S8_SS_TN();
+        if constexpr (N == 16)  return MMA_64x16x32_S32S8S8_SS_TN();
+        if constexpr (N == 24)  return MMA_64x24x32_S32S8S8_SS_TN();
+        if constexpr (N == 32)  return MMA_64x32x32_S32S8S8_SS_TN();
+        if constexpr (N == 48)  return MMA_64x48x32_S32S8S8_SS_TN();
+        if constexpr (N == 64)  return MMA_64x64x32_S32S8S8_SS_TN();
+        if constexpr (N == 80)  return MMA_64x80x32_S32S8S8_SS_TN();
+        if constexpr (N == 96)  return MMA_64x96x32_S32S8S8_SS_TN();
+        if constexpr (N == 112) return MMA_64x112x32_S32S8S8_SS_TN();
+        if constexpr (N == 128) return MMA_64x128x32_S32S8S8_SS_TN();
+        if constexpr (N == 144) return MMA_64x144x32_S32S8S8_SS_TN();
+        if constexpr (N == 160) return MMA_64x160x32_S32S8S8_SS_TN();
+        if constexpr (N == 176) return MMA_64x176x32_S32S8S8_SS_TN();
+        if constexpr (N == 192) return MMA_64x192x32_S32S8S8_SS_TN();
+        if constexpr (N == 208) return MMA_64x208x32_S32S8S8_SS_TN();
+        if constexpr (N == 224) return MMA_64x224x32_S32S8S8_SS_TN();
+        if constexpr (N == 240) return MMA_64x240x32_S32S8S8_SS_TN();
+        if constexpr (N == 256) return MMA_64x256x32_S32S8S8_SS_TN();
+    }
+
+    static constexpr auto select_type() {
+        return INT8MMA<N, decltype(select_mma())>();
+    }
+
+    using type = decltype(select_type());
+};
+
 template <int N_, typename MMA>
 struct BF16MMA {
 
@@ -195,6 +251,10 @@ __forceinline__ __device__ void warpgroup_commit_batch() {
 
 __forceinline__ __device__ void warpgroup_fence_operand(float& reg) {
     asm volatile("" : "+f"(reg) :: "memory");
+}
+
+__forceinline__ __device__ void warpgroup_fence_operand(int32_t& reg) {
+    asm volatile("" : "+r"(reg) :: "memory");
 }
 
 template <int N>
