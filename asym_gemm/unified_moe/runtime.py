@@ -1,29 +1,54 @@
-"""Unified INT8 MoE layer (asym_gemm.unified_moe.Layer).
+"""Unified INT8 MoE layer (asym_gemm.unified_moe.Layer) — v2.
 
-One pinned-host INT8 weight slab, per-expert dispatch on routed token
-count, CPU path via cpu_gemm (AMX), GPU path via torch._int_mm
-(CUTLASS-backed). Both backends compute the same INT8 → INT32 → FP32
-dequant — verified by tests/test_unified_moe.py.
+Per-expert dispatch on routed token count:
+- m_e <= m_cpu  → CPU AMX INT8 path (cpu_gemm)
+- m_e >  m_cpu  → SM90 INT8 grouped-MoE WGMMA kernel (asym_gemm)
 
-This is the v1 implementation. The hand-written SM90 INT8 WGMMA kernel
-(see docs/unified_moe.md milestone 0b) is the eventual GPU backend;
-until it lands, _int_mm gives us the same arithmetic at a possibly
-lower throughput (the qualitative dispatch result still holds).
+**All expert parameters live in pinned host memory** — no VRAM weight mirror.
+The GPU path reads weights from pinned host via Hopper TMA over PCIe (UVA).
+The CPU path reads from the AMX blocked-VNNI permutation of the same bytes,
+also page-locked.
+
+Both backends compute the same INT8 → INT32 → FP32 dequant contract:
+
+    sA[i]       = amax_row_i / 127
+    sB[n]       = amax_col_n / 127
+    C_int32     = A_int8 @ B_int8.T
+    C_fp32      = sA · sB · C_int32       (outer broadcast)
+
+The SM90 kernel expects per-K-block scales (granularity `GRAN_K=128`); we
+satisfy this by broadcasting our per-row / per-channel scales across the
+K-block dimension — mathematically identical because the scales are
+constant along K.
+
+See docs unified_kernel_pinned_CPU_memory.md for the full design.
 """
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
 import torch
 
+import asym_gemm
 from .. import _cpu_C as _C
+
+# Granularity required by sm90_int8_asym_gemm_1d1d (one scale per 128 K elems).
+GRAN_K = 128
+# Per-expert M alignment for the SM90 INT8 1D1D contiguous-layout kernel.
+# The kernel's asymScheduler computes m_start/m_end = ceil_div(offsets/BLOCK_M),
+# so each expert's offset range must be a multiple of the kernel-chosen BLOCK_M
+# or adjacent expert ranges collapse together. SM90 INT8 heuristic candidates
+# are {64, 128, 256} — we pad to the maximum so the layout is safe regardless
+# of which the heuristic picks for the live (M, N, K) shape.
+BLOCK_M = 256
 
 
 # ---------------------------------------------------------------------------
-# Quantization helpers (the §5 contract)
+# Quantization helpers (the unified INT8 contract)
 # ---------------------------------------------------------------------------
 
 def quantize_per_channel_int8(
@@ -40,20 +65,6 @@ def quantize_per_channel_int8(
     return q.numpy(force=True), scales.to(torch.float32).numpy(force=True)
 
 
-def quantize_per_token_int8_cpu(
-    x_bf16_bits: np.ndarray,  # [M, K] uint16
-) -> tuple[np.ndarray, np.ndarray]:
-    """A-side per-row quant on CPU. Used for the GPU bucket's host-staged path
-    (the GPU bucket actually re-quantizes on GPU via the helper below; this
-    one is a reference for tests)."""
-    x_fp32 = bf16_bits_to_fp32(x_bf16_bits)
-    amax = np.abs(x_fp32).max(axis=1)
-    scales = np.maximum(amax / 127.0, 1e-12).astype(np.float32)
-    inv = (1.0 / scales)[:, None]
-    q = np.clip(np.round(x_fp32 * inv), -127, 127).astype(np.int8)
-    return q, scales
-
-
 def quantize_per_token_int8_gpu(
     x_bf16: torch.Tensor,  # [M, K] BF16 on CUDA
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -68,40 +79,72 @@ def quantize_per_token_int8_gpu(
 
 
 # ---------------------------------------------------------------------------
-# BF16 <-> FP32 helpers (BF16 carried as uint16 bit pattern)
+# BF16 ↔ FP32 helpers (BF16 carried as uint16 bit pattern for CPU path)
 # ---------------------------------------------------------------------------
 
 def fp32_to_bf16_bits(x: np.ndarray) -> np.ndarray:
     """Round-to-nearest-even fp32 → bf16. Returns uint16."""
     x = np.ascontiguousarray(x, dtype=np.float32)
     u32 = x.view(np.uint32)
-    # RTE: add (0x7FFF + (lower-half lsb of upper-half)) before truncation.
     rounding_bias = 0x7FFF + ((u32 >> 16) & 1)
-    u32_rounded = u32 + rounding_bias
-    return (u32_rounded >> 16).astype(np.uint16)
+    return ((u32 + rounding_bias) >> 16).astype(np.uint16)
 
 
 def bf16_bits_to_fp32(u16: np.ndarray) -> np.ndarray:
-    """uint16 bit pattern → fp32 (exact upcast)."""
     u16 = np.ascontiguousarray(u16, dtype=np.uint16)
     u32 = (u16.astype(np.uint32) << 16)
     return u32.view(np.float32)
 
 
 def torch_bf16_to_np_bits(t: torch.Tensor) -> np.ndarray:
-    """Torch BF16 tensor (CPU) → uint16 numpy view of the same bytes."""
     assert t.dtype == torch.bfloat16 and not t.is_cuda
-    # bfloat16 storage is 2 bytes per elem; reinterpret as uint16.
     return t.contiguous().view(torch.uint16).numpy(force=True)
 
 
+def silu_fp32(x: np.ndarray) -> np.ndarray:
+    return x / (1.0 + np.exp(-x))
+
+
 # ---------------------------------------------------------------------------
-# SwiGLU
+# Pinning (page-locking) AMX-packed numpy buffers via torch's libcudart bridge.
+# Avoids adding a CUDA build dependency to _cpu_C — torch already has libcudart
+# loaded and exposes ctypes-friendly wrappers via torch.cuda.cudart().
 # ---------------------------------------------------------------------------
 
-def silu_fp32(x: np.ndarray) -> np.ndarray:
-    # numerically safe: silu(x) = x * sigmoid(x)
-    return x / (1.0 + np.exp(-x))
+class _PinnedAmxBuffer:
+    """Wraps a numpy array whose backing memory has been cudaHostRegister'd.
+
+    Holds a reference to the numpy array so the buffer outlives any kernel
+    launch, and runs cudaHostUnregister in __del__ so the pin is released
+    when the layer is torn down."""
+
+    __slots__ = ("arr", "_ptr", "_size", "_unregister")
+
+    def __init__(self, arr: np.ndarray):
+        assert arr.dtype == np.uint8 and arr.ndim == 1 and arr.flags["C_CONTIGUOUS"]
+        self.arr = arr
+        self._ptr = int(arr.ctypes.data)
+        self._size = int(arr.nbytes)
+        # torch.cuda.cudart() is a module-like object; calls return cudaError enum.
+        cudart = torch.cuda.cudart()
+        err = cudart.cudaHostRegister(self._ptr, self._size, 0)  # cudaHostRegisterDefault
+        if int(err) != 0:
+            # 712 (cudaErrorHostMemoryAlreadyRegistered) is benign here.
+            if int(err) != 712:
+                raise RuntimeError(f"cudaHostRegister failed with code {int(err)}")
+        self._unregister = cudart.cudaHostUnregister
+
+    def __del__(self):
+        try:
+            if self._unregister is not None and self._ptr:
+                self._unregister(self._ptr)
+                self._ptr = 0
+        except Exception:
+            pass
+
+
+def _pin_amx_buffer(arr: np.ndarray) -> _PinnedAmxBuffer:
+    return _PinnedAmxBuffer(arr)
 
 
 # ---------------------------------------------------------------------------
@@ -110,55 +153,76 @@ def silu_fp32(x: np.ndarray) -> np.ndarray:
 
 @dataclass
 class ExpertSlab:
-    """One MoE layer's three projections (gate, up, down), quantized INT8,
-    each stored row-major in pinned host memory plus an AMX-packed twin.
+    """One MoE layer's three projections, INT8 quantized, all in pinned host.
 
-    Shapes (per expert):
-        gate, up: [N_inter, K_hidden]  (B is N-major)
-        down:    [K_hidden, N_inter]
+    Per expert weight bytes have TWO views (same content, different layout):
+      *_int8 / *_scales   — row-major torch tensors, pinned via pin_memory().
+                            Consumed directly by the SM90 INT8 GPU kernel
+                            via Hopper TMA UVA fetches over PCIe.
+      *_packed            — AMX blocked-VNNI uint8 buffers (cudaHostRegister'd).
+                            Consumed by cpu_gemm AMX INT8.
 
-    The AMX path consumes the *_packed buffers; the GPU path reads the
-    row-major *_int8 + scales (mirrored to VRAM on first GPU use of each
-    expert).
+    Plus the per-K-block scale broadcast on device:
+      *_sfb [G, N, K//128] fp32  — small device tensor, built once at load,
+                                   consumed by the GPU kernel.
+
+    The "two pinned views" invariant: pack_b_int8_amx is a byte-level
+    permutation of (q, s) — no re-quantization. Backed by parity test
+    test_cpu_vs_gpu_single_expert (cpu_vs_gpu ≈ 0 historically).
     """
     num_experts: int
     hidden: int
     inter: int
+    kb_hidden: int                      # hidden // GRAN_K
+    kb_inter:  int                      # inter  // GRAN_K
 
-    # row-major INT8 (host, pinned via torch). [G, N, K] shaped tensors.
-    gate_int8: torch.Tensor      # int8, pinned, [G, inter, hidden]
-    gate_scales: torch.Tensor    # float32, pinned, [G, inter]
-    up_int8: torch.Tensor        # int8, pinned, [G, inter, hidden]
-    up_scales: torch.Tensor      # float32, pinned, [G, inter]
-    down_int8: torch.Tensor      # int8, pinned, [G, hidden, inter]
-    down_scales: torch.Tensor    # float32, pinned, [G, hidden]
+    # row-major INT8 in pinned host (one source of truth for GPU TMA reads)
+    gate_int8: torch.Tensor             # int8, pinned, [G, inter, hidden]
+    gate_scales: torch.Tensor           # float32, pinned, [G, inter]
+    up_int8: torch.Tensor               # int8, pinned, [G, inter, hidden]
+    up_scales: torch.Tensor             # float32, pinned, [G, inter]
+    down_int8: torch.Tensor             # int8, pinned, [G, hidden, inter]
+    down_scales: torch.Tensor           # float32, pinned, [G, hidden]
 
-    # AMX-packed twins (uint8 numpy arrays, 64-byte aligned, per expert).
-    gate_packed: list = field(default_factory=list)  # list[np.ndarray]
+    # AMX-packed twins (pinned page-locked uint8, per expert)
+    gate_packed: list = field(default_factory=list)   # list[_PinnedAmxBuffer]
     up_packed: list   = field(default_factory=list)
     down_packed: list = field(default_factory=list)
 
-    # GPU mirror cache (expert_idx → {"gate": int8 tensor, "gate_s": fp32, …}).
-    gpu_cache: dict = field(default_factory=dict)
+    # Device-resident SFB broadcasts for the SM90 kernel
+    gate_sfb: Optional[torch.Tensor] = None   # [G, inter, kb_hidden] fp32 on CUDA
+    up_sfb:   Optional[torch.Tensor] = None   # [G, inter, kb_hidden] fp32 on CUDA
+    down_sfb: Optional[torch.Tensor] = None   # [G, hidden, kb_inter] fp32 on CUDA
+
+    def packed_array(self, kind: str, e: int) -> np.ndarray:
+        """Return the underlying numpy view of a packed expert buffer."""
+        return {"gate": self.gate_packed, "up": self.up_packed,
+                "down": self.down_packed}[kind][e].arr
 
 
 # ---------------------------------------------------------------------------
-# The unified layer
+# Layer
 # ---------------------------------------------------------------------------
 
 class Layer:
-    """Unified INT8 MoE layer.
+    """Unified INT8 MoE layer with pinned-CPU weight residency.
 
     Construct via ``Layer.from_bf16(...)``. Forward signature:
 
         y = layer.forward(x_bf16, expert_ids, route_w)
 
     where:
-        x_bf16     : (T, hidden) torch.bfloat16, cuda or cpu
+        x_bf16     : (T, hidden) torch.bfloat16, cuda
         expert_ids : (T, top_k) torch.int64 / int32
         route_w    : (T, top_k) torch.float32
         y          : (T, hidden) torch.bfloat16 on the same device as x
+
+    ``hidden`` and ``inter`` must each be multiples of ``GRAN_K=128`` (the
+    K-block granularity required by sm90_int8_asym_gemm_1d1d).
     """
+
+    weight_residency = "pinned_host"
+    gpu_backend = "asym_gemm_sm90_int8_1d1d"
 
     def __init__(
         self,
@@ -197,7 +261,17 @@ class Layer:
         for t in (gate, up, down):
             assert t.dtype == torch.bfloat16
 
-        # Quantize all experts.
+        # SM90 INT8 kernel requires K % 128 == 0 on every K dim it sees.
+        # In our layer that's both `hidden` (gate/up's K, down's N) and
+        # `inter` (gate/up's N, down's K).
+        assert K_hidden % GRAN_K == 0, \
+            f"hidden ({K_hidden}) must be a multiple of {GRAN_K}"
+        assert N_inter % GRAN_K == 0, \
+            f"inter ({N_inter}) must be a multiple of {GRAN_K}"
+        kb_h = K_hidden // GRAN_K
+        kb_i = N_inter  // GRAN_K
+
+        # --- pinned host: row-major INT8 + per-channel FP32 scales ---
         gate_int8 = torch.empty(G, N_inter, K_hidden, dtype=torch.int8).pin_memory()
         gate_s    = torch.empty(G, N_inter,            dtype=torch.float32).pin_memory()
         up_int8   = torch.empty_like(gate_int8).pin_memory()
@@ -205,127 +279,220 @@ class Layer:
         down_int8 = torch.empty(G, K_hidden, N_inter, dtype=torch.int8).pin_memory()
         down_s    = torch.empty(G, K_hidden,           dtype=torch.float32).pin_memory()
 
+        # --- pinned host: AMX-packed twins ---
         gate_packed, up_packed, down_packed = [], [], []
         for g in range(G):
             q, s = quantize_per_channel_int8(gate[g])
             gate_int8[g] = torch.from_numpy(q)
             gate_s[g]    = torch.from_numpy(s)
-            gate_packed.append(_C.pack_b_int8_amx(q, s))
+            gate_packed.append(_pin_amx_buffer(_C.pack_b_int8_amx(q, s)))
 
             q, s = quantize_per_channel_int8(up[g])
             up_int8[g] = torch.from_numpy(q)
             up_s[g]    = torch.from_numpy(s)
-            up_packed.append(_C.pack_b_int8_amx(q, s))
+            up_packed.append(_pin_amx_buffer(_C.pack_b_int8_amx(q, s)))
 
             q, s = quantize_per_channel_int8(down[g])
             down_int8[g] = torch.from_numpy(q)
             down_s[g]    = torch.from_numpy(s)
-            down_packed.append(_C.pack_b_int8_amx(q, s))
+            down_packed.append(_pin_amx_buffer(_C.pack_b_int8_amx(q, s)))
+
+        # --- device-resident SFB broadcasts ---
+        # Build on whatever CUDA device the user picked.
+        if torch.cuda.is_available():
+            dev = f"cuda:{cuda_device}"
+            # gate_sfb: per-channel scale broadcast over K-blocks. K_dim = hidden.
+            gate_sfb = gate_s.to(dev).unsqueeze(-1).expand(G, N_inter, kb_h).contiguous()
+            up_sfb   = up_s  .to(dev).unsqueeze(-1).expand(G, N_inter, kb_h).contiguous()
+            # down_sfb: K_dim = inter
+            down_sfb = down_s.to(dev).unsqueeze(-1).expand(G, K_hidden, kb_i).contiguous()
+        else:
+            gate_sfb = up_sfb = down_sfb = None
 
         slab = ExpertSlab(
             num_experts=G, hidden=K_hidden, inter=N_inter,
+            kb_hidden=kb_h, kb_inter=kb_i,
             gate_int8=gate_int8, gate_scales=gate_s,
             up_int8=up_int8,     up_scales=up_s,
             down_int8=down_int8, down_scales=down_s,
             gate_packed=gate_packed, up_packed=up_packed, down_packed=down_packed,
+            gate_sfb=gate_sfb, up_sfb=up_sfb, down_sfb=down_sfb,
         )
         return cls(slab, top_k=top_k, cpu_threads=cpu_threads,
                    cuda_device=cuda_device, m_cpu=m_cpu)
-
-    # -----------------------------------------------------------
-    # dispatch knobs (debug/eval)
-    # -----------------------------------------------------------
 
     def set_m_cpu(self, m_cpu: int) -> None:
         self.m_cpu = int(m_cpu)
 
     # -----------------------------------------------------------
-    # the per-expert backend kernels
+    # CPU bucket — unchanged from v1
     # -----------------------------------------------------------
 
     def _cpu_expert_forward(
         self,
         e: int,
-        x_bf16_bits: np.ndarray,    # [m_e, hidden] uint16 (rows for this expert)
+        x_bf16_bits: np.ndarray,    # [m_e, hidden] uint16
     ) -> np.ndarray:                # [m_e, hidden] fp32
-        """One expert's gate-up-SwiGLU-down on CPU via AMX INT8."""
         slab = self.slab
         m_e = x_bf16_bits.shape[0]
         H, I = slab.hidden, slab.inter
 
-        # gate, up: BF16 @ INT8.T → FP32. C is [m_e, inter].
         c_gate = np.empty((m_e, I), dtype=np.float32)
         c_up   = np.empty((m_e, I), dtype=np.float32)
-        _C.gemm_bf16_int8_packed(self.rt, x_bf16_bits, slab.gate_packed[e],
+        _C.gemm_bf16_int8_packed(self.rt, x_bf16_bits, slab.packed_array("gate", e),
                                   c_gate, I, H, 1.0, 0.0)
-        _C.gemm_bf16_int8_packed(self.rt, x_bf16_bits, slab.up_packed[e],
+        _C.gemm_bf16_int8_packed(self.rt, x_bf16_bits, slab.packed_array("up", e),
                                   c_up,   I, H, 1.0, 0.0)
 
-        # SwiGLU: silu(gate) * up. FP32 throughout.
-        act = silu_fp32(c_gate) * c_up      # [m_e, inter] fp32
-
-        # Down: need BF16 input → re-quantize.  Convert FP32 act to BF16 bits.
+        act = silu_fp32(c_gate) * c_up
         act_bf16_bits = fp32_to_bf16_bits(act)
+
         c_down = np.empty((m_e, H), dtype=np.float32)
-        _C.gemm_bf16_int8_packed(self.rt, act_bf16_bits, slab.down_packed[e],
+        _C.gemm_bf16_int8_packed(self.rt, act_bf16_bits, slab.packed_array("down", e),
                                   c_down, H, I, 1.0, 0.0)
         return c_down
 
-    def _ensure_gpu_expert(self, e: int) -> dict:
-        """Lazy-mirror the expert's INT8 weights to VRAM. Cached."""
-        if e in self.slab.gpu_cache:
-            return self.slab.gpu_cache[e]
-        dev = f"cuda:{self.cuda_device}"
-        entry = {
-            "gate":   self.slab.gate_int8[e].to(dev, non_blocking=True),
-            "gate_s": self.slab.gate_scales[e].to(dev, non_blocking=True),
-            "up":     self.slab.up_int8[e].to(dev, non_blocking=True),
-            "up_s":   self.slab.up_scales[e].to(dev, non_blocking=True),
-            "down":   self.slab.down_int8[e].to(dev, non_blocking=True),
-            "down_s": self.slab.down_scales[e].to(dev, non_blocking=True),
-        }
-        self.slab.gpu_cache[e] = entry
-        return entry
+    # -----------------------------------------------------------
+    # GPU bucket — grouped INT8 over pinned weights, one launch / projection
+    # -----------------------------------------------------------
 
-    @staticmethod
-    def _int_mm_padded(a: torch.Tensor, b_t: torch.Tensor) -> torch.Tensor:
-        """torch._int_mm requires M > 16. Pad with zero rows if needed and
-        slice the result. This is only hit when m_cpu is overridden low
-        (e.g. =0 for dispatch-invariance tests); the production path keeps
-        m_e > m_cpu >= 16, so the pad is dead code at default settings."""
-        m, k = a.shape
-        if m > 16:
-            return torch._int_mm(a, b_t)
-        pad = 17 - m
-        a_pad = torch.nn.functional.pad(a, (0, 0, 0, pad))  # zero rows
-        out = torch._int_mm(a_pad, b_t)
-        return out[:m]
-
-    def _gpu_expert_forward(
+    def _build_contiguous_layout(
         self,
-        e: int,
-        x_bf16: torch.Tensor,   # [m_e, hidden] BF16 on CUDA
-    ) -> torch.Tensor:           # [m_e, hidden] BF16 on CUDA
-        """One expert's gate-up-SwiGLU-down on GPU via _int_mm."""
-        w = self._ensure_gpu_expert(e)
-        # A-side per-token quant.
-        a_int8, sA = quantize_per_token_int8_gpu(x_bf16)
-        # gate: A_int8 @ gate.T → INT32, then scale.
-        c_gate_int = self._int_mm_padded(a_int8, w["gate"].t())     # [m_e, inter]
-        c_up_int   = self._int_mm_padded(a_int8, w["up"].t())       # [m_e, inter]
-        c_gate = c_gate_int.float() * sA[:, None] * w["gate_s"][None, :]
-        c_up   = c_up_int.float()   * sA[:, None] * w["up_s"][None, :]
+        gpu_experts: list[int],
+        per_expert: list[list[int]],
+        per_expert_slot: list[list[int]],
+        device: torch.device,
+        block_m: int = BLOCK_M,
+    ):
+        """Pack the GPU-bucket experts into the AsymGEMM contiguous layout.
+
+        Returns:
+            M_grouped     : total padded row count
+            idx_to_orig   : [M_grouped] long device — original token row per
+                            grouped row (-1 if padding)
+            slot_to_orig  : [M_grouped] long device — original top-k slot per
+                            grouped row (-1 if padding)
+            offsets       : [2*K] int32 device — flat (start, end) per expert
+            experts       : [K+1] int32 device — expert ids + -1 sentinel
+            list_size     : int                   — len(experts)
+
+        Each expert's m_e is padded up to a multiple of block_m so the kernel's
+        per-expert row range satisfies its alignment requirement.
+        """
+        idx_list:  list[int] = []
+        slot_list: list[int] = []
+        offsets:   list[int] = []
+        experts:   list[int] = []
+        cur = 0
+        for e in gpu_experts:
+            rows  = per_expert[e]
+            slots = per_expert_slot[e]
+            m_e = len(rows)
+            if m_e == 0:
+                continue
+            m_padded = ((m_e + block_m - 1) // block_m) * block_m
+            idx_list.extend(rows)
+            slot_list.extend(slots)
+            if m_padded > m_e:
+                idx_list.extend([-1] * (m_padded - m_e))
+                slot_list.extend([-1] * (m_padded - m_e))
+            offsets.append(cur)
+            offsets.append(cur + m_padded)
+            experts.append(e)
+            cur += m_padded
+        experts.append(-1)
+
+        if cur == 0:
+            empty = torch.empty(0, dtype=torch.long, device=device)
+            return (0, empty, empty,
+                    torch.empty(0, dtype=torch.int32, device=device),
+                    torch.tensor([-1], dtype=torch.int32, device=device), 1)
+
+        return (
+            cur,
+            torch.tensor(idx_list,  dtype=torch.long, device=device),
+            torch.tensor(slot_list, dtype=torch.long, device=device),
+            torch.tensor(offsets,   dtype=torch.int32, device=device),
+            torch.tensor(experts,   dtype=torch.int32, device=device),
+            len(experts),
+        )
+
+    def _gpu_grouped_forward(
+        self,
+        x_gpu: torch.Tensor,        # [T, H] bf16 device
+        gpu_experts: list[int],
+        per_expert: list[list[int]],
+        per_expert_slot: list[list[int]],
+        route_w_gpu: torch.Tensor,  # [T, top_k] fp32 device
+    ):
+        """Run gate/up/down for all GPU-bucket experts in three grouped calls.
+
+        Returns (orig_rows_for_valid, y_weighted_fp32) where
+        orig_rows_for_valid is a [n_valid] long tensor of source rows in the
+        original [T, H] activations, and y_weighted_fp32 is [n_valid, H] fp32
+        ready for ``out_fp32.index_add_(0, orig_rows, y_weighted_fp32)``.
+        """
+        slab = self.slab
+        dev = x_gpu.device
+        H, I = slab.hidden, slab.inter
+        kb_h, kb_i = slab.kb_hidden, slab.kb_inter
+
+        M_grouped, idx_to_orig, slot_to_orig, offsets, experts, list_size = (
+            self._build_contiguous_layout(gpu_experts, per_expert,
+                                          per_expert_slot, dev))
+        if M_grouped == 0:
+            return None, None
+
+        # Gather activations into the contiguous layout. Padding rows (idx=-1)
+        # stay zero so their activation amax → 0 → scale clamped to 1e-12.
+        valid_mask = (idx_to_orig >= 0)
+        a_bf16 = torch.zeros(M_grouped, H, device=dev, dtype=torch.bfloat16)
+        valid_idx = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+        a_bf16.index_copy_(0, valid_idx,
+                            x_gpu.index_select(0, idx_to_orig[valid_idx]))
+
+        # Per-token A quant.
+        a_int8, sA = quantize_per_token_int8_gpu(a_bf16)
+        # SFA for gate/up: broadcast per-token scale across kb_h K-blocks.
+        sfa_h = sA.unsqueeze(1).expand(M_grouped, kb_h).contiguous()
+
+        # gate  — pinned B (slab.gate_int8), device SFB (slab.gate_sfb)
+        d_gate = torch.empty(M_grouped, I, device=dev, dtype=torch.float32)
+        asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
+            (a_int8, sfa_h), (slab.gate_int8, slab.gate_sfb),
+            d_gate, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
+        )
+
+        # up
+        d_up = torch.empty(M_grouped, I, device=dev, dtype=torch.float32)
+        asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
+            (a_int8, sfa_h), (slab.up_int8, slab.up_sfb),
+            d_up, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
+        )
+
         # SwiGLU
-        act = torch.nn.functional.silu(c_gate) * c_up
-        # Down GEMM: re-quantize act (bf16 cast first to mirror CPU path).
+        act = torch.nn.functional.silu(d_gate) * d_up
+
+        # Down: re-quantize act (BF16 round-trip to match the CPU path).
         act_bf16 = act.to(torch.bfloat16)
         a2_int8, sA2 = quantize_per_token_int8_gpu(act_bf16)
-        c_down_int = self._int_mm_padded(a2_int8, w["down"].t())    # [m_e, hidden]
-        c_down = c_down_int.float() * sA2[:, None] * w["down_s"][None, :]
-        return c_down.to(torch.bfloat16)
+        sfa_i = sA2.unsqueeze(1).expand(M_grouped, kb_i).contiguous()
+
+        d_down = torch.empty(M_grouped, H, device=dev, dtype=torch.float32)
+        asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
+            (a2_int8, sfa_i), (slab.down_int8, slab.down_sfb),
+            d_down, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
+        )
+
+        # Apply routing weights, return for scatter-add.
+        orig_rows  = idx_to_orig[valid_idx]
+        orig_slots = slot_to_orig[valid_idx]
+        w = route_w_gpu[orig_rows, orig_slots]              # [n_valid]
+        y_w = d_down[valid_idx] * w[:, None]
+        return orig_rows, y_w
 
     # -----------------------------------------------------------
-    # main forward (dispatch + scatter/gather + weighted reduce)
+    # main forward
     # -----------------------------------------------------------
 
     def forward(
@@ -340,12 +507,10 @@ class Layer:
         assert route_w.shape    == (T, self.top_k)
         in_device = x_bf16.device
 
-        # Move routing to CPU for dispatch decisions.
+        # Per-expert token / slot lists (host-side dispatch decisions).
         expert_ids_cpu = expert_ids.to("cpu").to(torch.int64)
-        # Per-expert token lists. token_slot[(t, j)] = (expert, original-row, slot-id).
-        per_expert: list[list[int]] = [[] for _ in range(self.slab.num_experts)]
+        per_expert:      list[list[int]] = [[] for _ in range(self.slab.num_experts)]
         per_expert_slot: list[list[int]] = [[] for _ in range(self.slab.num_experts)]
-        # Each (t, j) routes one (token, expert) edge.
         ei = expert_ids_cpu.numpy()
         for t in range(T):
             for j in range(self.top_k):
@@ -353,51 +518,40 @@ class Layer:
                 per_expert[e].append(t)
                 per_expert_slot[e].append(j)
 
-        # Bucket experts by m_e against the threshold.
         cpu_experts, gpu_experts = [], []
         for e, rows in enumerate(per_expert):
             if not rows:
                 continue
             (cpu_experts if len(rows) <= self.m_cpu else gpu_experts).append(e)
 
-        # Output accumulator on the input's device (we'll write FP32 then cast).
         out_fp32 = torch.zeros((T, H), dtype=torch.float32, device=in_device)
 
-        # ---- CPU bucket ----
+        # ---- CPU bucket (unchanged from v1) ----
         if cpu_experts:
-            # Stage inputs on CPU.
             x_cpu_bf16 = x_bf16.to("cpu", dtype=torch.bfloat16).contiguous()
-            x_bits_all = torch_bf16_to_np_bits(x_cpu_bf16)             # [T, H] uint16
-            route_w_cpu = route_w.to("cpu", dtype=torch.float32).numpy()  # [T, top_k]
-            cpu_results: list[tuple[int, list[int], list[int], np.ndarray]] = []
-            for e in cpu_experts:
-                rows = per_expert[e]
-                slots = per_expert_slot[e]
-                gathered = np.ascontiguousarray(x_bits_all[rows])     # [m_e, H]
-                y = self._cpu_expert_forward(e, gathered)              # [m_e, H] fp32
-                cpu_results.append((e, rows, slots, y))
-            # Scatter + weighted-reduce on CPU then push to device.
+            x_bits_all = torch_bf16_to_np_bits(x_cpu_bf16)
+            route_w_cpu = route_w.to("cpu", dtype=torch.float32).numpy()
+
             cpu_out = np.zeros((T, H), dtype=np.float32)
-            for e, rows, slots, y in cpu_results:
-                w = route_w_cpu[rows, slots][:, None]                   # [m_e, 1]
+            for e in cpu_experts:
+                rows  = per_expert[e]
+                slots = per_expert_slot[e]
+                gathered = np.ascontiguousarray(x_bits_all[rows])
+                y = self._cpu_expert_forward(e, gathered)
+                w = route_w_cpu[rows, slots][:, None]
                 np.add.at(cpu_out, rows, y * w)
             out_fp32 += torch.from_numpy(cpu_out).to(in_device, non_blocking=True)
 
-        # ---- GPU bucket ----
+        # ---- GPU bucket (grouped INT8 over pinned weights) ----
         if gpu_experts:
+            if not torch.cuda.is_available():
+                raise RuntimeError("GPU bucket non-empty but no CUDA device available.")
             x_gpu_bf16 = x_bf16.to(in_device, dtype=torch.bfloat16).contiguous()
-            for e in gpu_experts:
-                rows = per_expert[e]
-                slots = per_expert_slot[e]
-                idx = torch.tensor(rows, device=in_device, dtype=torch.long)
-                gathered = x_gpu_bf16.index_select(0, idx)             # [m_e, H] bf16
-                y_bf16 = self._gpu_expert_forward(e, gathered)         # [m_e, H] bf16
-                # Weight + scatter-add.
-                w = route_w.to(in_device, dtype=torch.float32)[
-                    torch.tensor(rows, device=in_device, dtype=torch.long),
-                    torch.tensor(slots, device=in_device, dtype=torch.long),
-                ]                                                       # [m_e]
-                y_w = y_bf16.float() * w[:, None]
-                out_fp32.index_add_(0, idx, y_w)
+            route_w_gpu = route_w.to(in_device, dtype=torch.float32)
+            orig_rows, y_w = self._gpu_grouped_forward(
+                x_gpu_bf16, gpu_experts, per_expert, per_expert_slot, route_w_gpu,
+            )
+            if orig_rows is not None:
+                out_fp32.index_add_(0, orig_rows, y_w)
 
         return out_fp32.to(torch.bfloat16)
