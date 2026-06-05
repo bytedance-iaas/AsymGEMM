@@ -232,6 +232,91 @@ def test_mixed_bucket_parity():
     assert r <= 1.5e-2, f"mixed-bucket scale_rel {r:.3e} > 1.5e-2"
 
 
+# --------------------------------------------------------------------------- #
+# Pinned-residency tests (added with the SM90 INT8 grouped backend switch).
+#
+# The unified Layer keeps every expert byte in pinned host memory: the GPU
+# kernel reads weights via Hopper TMA over PCIe (no VRAM mirror), and the
+# AMX-packed twins are cudaHostRegister'd. These tests pin (pun intended)
+# the contract that this is what is actually happening.
+# --------------------------------------------------------------------------- #
+
+def test_pinned_weight_pointer_identity():
+    """The GPU kernel reads expert weights directly from the pinned host
+    tensor — no VRAM copy. We prove this by mutating the pinned tensor
+    between two otherwise-identical forwards and observing the output
+    changes accordingly. If the kernel were reading a VRAM mirror, the
+    second forward would be unaffected by the host mutation."""
+    torch.manual_seed(11)
+    G, H, I, top_k = 2, 256, 512, 1
+    gate = torch.randn(G, I, H, dtype=torch.bfloat16) * 0.07
+    up   = torch.randn(G, I, H, dtype=torch.bfloat16) * 0.07
+    down = torch.randn(G, H, I, dtype=torch.bfloat16) * 0.05
+    layer = Layer.from_bf16(gate, up, down, top_k=top_k, cpu_threads=8, m_cpu=0)
+    T = 64
+    x = torch.randn(T, H, dtype=torch.bfloat16, device="cuda")
+    expert_ids = torch.zeros(T, 1, dtype=torch.int64, device="cuda")
+    route_w    = torch.ones(T, 1, dtype=torch.float32, device="cuda")
+
+    y_before = layer.forward(x, expert_ids, route_w).clone()
+
+    # Mutate the pinned host tensor in place. If the GPU is reading from
+    # VRAM the second forward will be unchanged; if it reads from the
+    # pinned tensor, the output flips sign of the perturbed channels.
+    with torch.no_grad():
+        layer.slab.gate_int8[0].neg_()        # ← in-place on pinned host
+
+    y_after = layer.forward(x, expert_ids, route_w)
+    diff = (y_before.float() - y_after.float()).abs().mean()
+    print(f"  [test_pinned_weight_pointer_identity] mean abs diff after host "
+          f"mutation = {diff:.3e}  (must be > 0 — proves no VRAM mirror)")
+    assert diff > 1e-3, (
+        f"GPU appears to be reading from a VRAM cache, not pinned host "
+        f"(mean diff after host mutation = {diff:.3e})"
+    )
+
+
+def test_no_vram_weight_residency():
+    """Weight bytes (G·N·K) must not appear in VRAM after Layer construction.
+    The only device-resident weight-adjacent tensors are the SFB broadcasts
+    (G·N·K_blocks·4 bytes — much smaller). We check that the post-construction
+    VRAM delta is well under the row-major weight size."""
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    base_alloc = torch.cuda.memory_allocated()
+
+    torch.manual_seed(12)
+    G, H, I, top_k = 4, 256, 512, 2
+    gate = torch.randn(G, I, H, dtype=torch.bfloat16) * 0.07
+    up   = torch.randn(G, I, H, dtype=torch.bfloat16) * 0.07
+    down = torch.randn(G, H, I, dtype=torch.bfloat16) * 0.05
+    layer = Layer.from_bf16(gate, up, down, top_k=top_k, cpu_threads=8, m_cpu=0)
+
+    torch.cuda.synchronize()
+    after_alloc = torch.cuda.memory_allocated()
+    delta = after_alloc - base_alloc
+
+    # Reference sizes
+    weight_bytes_per_proj = G * I * H * 1       # int8
+    weight_bytes_total = 3 * weight_bytes_per_proj
+    # SFB allocations only (3 projections × G × N × kb × 4 bytes).
+    sfb_bytes = (layer.slab.gate_sfb.numel() + layer.slab.up_sfb.numel()
+                 + layer.slab.down_sfb.numel()) * 4
+
+    print(f"  [test_no_vram_weight_residency] VRAM delta = {delta} bytes  "
+          f"(SFB only = {sfb_bytes}, weight bytes if mirrored = {weight_bytes_total})")
+    # Sanity: the VRAM delta should be no more than ~1.2× the SFB size
+    # (slack for allocator overhead). It must be << weight bytes.
+    assert delta < weight_bytes_total // 4, (
+        f"VRAM grew by {delta} bytes after Layer construction — looks like "
+        f"weights may be resident in VRAM (weight_bytes={weight_bytes_total})"
+    )
+
+    # Confirm the user-visible markers reflect the v2 contract.
+    assert layer.weight_residency == "pinned_host"
+    assert layer.gpu_backend == "asym_gemm_sm90_int8_1d1d"
+
+
 # -- Self-run convention (AsymGEMM scripts/test.sh runs `python <file>`) ----
 
 if __name__ == "__main__":
@@ -242,4 +327,6 @@ if __name__ == "__main__":
     test_cpu_vs_gpu_single_expert()
     test_dispatch_invariance()
     test_mixed_bucket_parity()
-    print("All unified_moe parity tests passed.")
+    test_pinned_weight_pointer_identity()
+    test_no_vram_weight_residency()
+    print("All unified_moe parity + pinned-residency tests passed.")
