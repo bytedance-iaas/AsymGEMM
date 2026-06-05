@@ -45,6 +45,9 @@ case "$SM" in
     ;;
 esac
 
+# Unified MoE parity tests — always run; internal-skip when AMX is absent.
+TESTS+=(tests/test_unified_moe.py)
+
 echo "Detected sm_${SM} — running ${#TESTS[@]} test file(s):"
 printf "  - %s\n" "${TESTS[@]}"
 
