@@ -1,0 +1,1 @@
+/usr/bin/c++ -rdynamic -Wl,--dependency-file,CMakeFiles/test_avx2_bf16.dir/link.d CMakeFiles/test_avx2_bf16.dir/test_avx2_bf16.o -o test_avx2_bf16  -lcpu_gemm
