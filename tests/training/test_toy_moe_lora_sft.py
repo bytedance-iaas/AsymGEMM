@@ -499,16 +499,17 @@ def test_moe_module_asym_base_weights_are_grouped_host_stacks() -> None:
 
     host_weights = _host_weight_items(asym)
     host_names = [name for name, _ in host_weights]
-    expected_per_layer = 3
+    expected_per_layer = 2
 
     assert len(host_weights) == config.num_layers * expected_per_layer
     assert all(weight.dim() == 3 for _, weight in host_weights)
-    assert any("expert_gate_base" in name for name in host_names)
-    assert any("expert_up_base" in name for name in host_names)
+    assert any("expert_gate_up_base" in name for name in host_names)
     assert any("expert_down_base" in name for name in host_names)
-    assert not any("shared_gate_base" in name for name in host_names)
+    assert not any("shared_gate_up_base" in name for name in host_names)
     assert all(".experts." not in name for name in host_names)
     assert all(weight.device.type == "cpu" and not weight.requires_grad for _, weight in host_weights)
+    gate_up_weight = dict(host_weights)["layers.0.expert_gate_up_base"]
+    assert tuple(gate_up_weight.shape) == (config.num_experts, 2 * config.intermediate_size, config.hidden_size)
 
     all_expert_mlp, _, _, _ = moe_module.make_moe_pair(
         config=config,
@@ -520,7 +521,7 @@ def test_moe_module_asym_base_weights_are_grouped_host_stacks() -> None:
         offload_modules="mlp",
     )
     all_host_names = [name for name, _ in _host_weight_items(all_expert_mlp)]
-    assert any("shared_gate_base" in name for name in all_host_names)
+    assert any("shared_gate_up_base" in name for name in all_host_names)
 
 
 def test_moe_module_asym_lora_weights_are_layer_packed() -> None:
@@ -586,7 +587,7 @@ def test_moe_module_lora_all_offload_routed_expert_placement() -> None:
     assert model.offload_groups == ("routed_experts",)
     host_weights = _host_weight_items(model)
     host_names = [name for name, _ in host_weights]
-    assert len(host_weights) == config.num_layers * 3
+    assert len(host_weights) == config.num_layers * 2
     assert all("shared" not in name.lower() for name in host_names)
 
     lora_parameter_names = [name for name, param in model.named_parameters() if "lora" in name.lower() and param.requires_grad]
@@ -595,8 +596,8 @@ def test_moe_module_lora_all_offload_routed_expert_placement() -> None:
     assert any("shared_expert_lora.gate_lora_a" in name for name in lora_parameter_names)
 
     for layer in model.layers:
-        routed_bases = (layer.expert_gate_base, layer.expert_up_base, layer.expert_down_base)
-        shared_bases = (layer.shared_gate_base, layer.shared_up_base, layer.shared_down_base)
+        routed_bases = (layer.expert_gate_up_base, layer.expert_down_base)
+        shared_bases = (layer.shared_gate_up_base, layer.shared_down_base)
         attention_bases = (
             layer.self_attn.q_proj,
             layer.self_attn.k_proj,
@@ -605,6 +606,9 @@ def test_moe_module_lora_all_offload_routed_expert_placement() -> None:
         )
         assert all(isinstance(base, moe_module.AsymGroupedFrozenLinear) for base in routed_bases)
         assert all(isinstance(base, moe_module.TorchGroupedFrozenLinear) for base in shared_bases)
+        assert layer.expert_gate_up_base.out_features == 2 * config.intermediate_size
+        assert layer.shared_gate_up_base is not None
+        assert layer.shared_gate_up_base.out_features == 2 * config.intermediate_size
         assert all(_is_on_device(base.weight, device) for base in attention_bases)
         for base in routed_bases:
             assert base.host_weight.weight.device.type == "cpu"

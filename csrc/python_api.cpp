@@ -9,6 +9,7 @@
 // #include "apis/asym_gemm.hpp"
 #include "apis/dropout.hpp"
 #include "apis/layout.hpp"
+#include "apis/qwen3_moe.hpp"
 #include "apis/runtime.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
@@ -21,5 +22,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     asym_gemm::dropout::register_apis(m);
     asym_gemm::gemm::register_apis(m);
     asym_gemm::layout::register_apis(m);
+    asym_gemm::qwen3_moe::register_apis(m);
     asym_gemm::runtime::register_apis(m);
 }

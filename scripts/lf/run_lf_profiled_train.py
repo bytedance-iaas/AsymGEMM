@@ -23,9 +23,13 @@ PROFILE_MEMORY_ENV = "ASYM_GEMM_LF_PROFILE_MEMORY"
 PROFILE_LEVEL_ENV = "ASYM_GEMM_LF_PROFILE_LEVEL"
 PROFILE_LAYERS_ENV = "ASYM_GEMM_LF_PROFILE_LAYERS"
 PROFILE_MEMORY_ATTRIBUTION_ENV = "ASYM_GEMM_LF_PROFILE_MEMORY_ATTRIBUTION"
+PROFILE_MEMORY_BREAKDOWN_ENV = "ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN"
+PROFILE_MEMORY_BREAKDOWN_OUTPUT_ENV = "ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_OUTPUT"
 PROFILE_SYNC_ENV = "ASYM_GEMM_LF_PROFILE_SYNC"
 PROFILE_MODULE_FILTER_ENV = "ASYM_GEMM_LF_PROFILE_MODULE_FILTER"
 CONFIG_ENV_PREFIX = "ASYM_GEMM_LF_CONFIG_"
+
+_LAST_LF_MODEL: Any | None = None
 
 
 def _env_enabled(name: str, default: bool = False) -> bool:
@@ -116,6 +120,7 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "workload": os.environ.get("ASYM_GEMM_LF_CONFIG_WORKLOAD", model_label),
         "model_name_or_path": model_name,
         "backend": backend,
+        "kt_backend": os.environ.get("ASYM_GEMM_LF_CONFIG_KT_BACKEND") or _option_value(args, "--kt_backend"),
         "precision": os.environ.get("ASYM_GEMM_LF_CONFIG_PRECISION") or _option_value(args, "--asym_precision") or "bf16",
         "dataset": _option_value(args, "--dataset"),
         "template": _option_value(args, "--template"),
@@ -147,6 +152,7 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "profile_level": os.environ.get(PROFILE_LEVEL_ENV, "stage"),
         "profile_layers": os.environ.get(PROFILE_LAYERS_ENV, "all"),
         "profile_memory_attribution": os.environ.get(PROFILE_MEMORY_ATTRIBUTION_ENV, "0"),
+        "profile_memory_breakdown": os.environ.get(PROFILE_MEMORY_BREAKDOWN_ENV, "0"),
         "profile_sync": os.environ.get(PROFILE_SYNC_ENV, "0"),
         "profile_module_filter": os.environ.get(PROFILE_MODULE_FILTER_ENV, ""),
         "output_dir": _option_value(args, "--output_dir"),
@@ -154,6 +160,250 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
     for key, value in env_config.items():
         config.setdefault(key, value)
     return {key: value for key, value in config.items() if value not in {"", None}}
+
+
+def _capture_loaded_model(model: Any) -> Any:
+    global _LAST_LF_MODEL
+    _LAST_LF_MODEL = model
+    return model
+
+
+def _install_model_capture_hook() -> None:
+    try:
+        import llamafactory.model as model_module
+        import llamafactory.model.loader as loader_module
+    except Exception:
+        return
+
+    original_load_model = getattr(model_module, "load_model", None)
+    if original_load_model is None:
+        return
+    if getattr(original_load_model, "_asym_gemm_profile_capture", False):
+        return
+
+    def wrapped_load_model(*args: Any, **kwargs: Any) -> Any:
+        return _capture_loaded_model(original_load_model(*args, **kwargs))
+
+    wrapped_load_model._asym_gemm_profile_capture = True  # type: ignore[attr-defined]
+    model_module.load_model = wrapped_load_model
+    loader_module.load_model = wrapped_load_model
+
+    for module_name in (
+        "llamafactory.train.sft.workflow",
+        "llamafactory.train.tuner",
+        "llamafactory.train.trainer_utils",
+    ):
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "load_model"):
+            setattr(module, "load_model", wrapped_load_model)
+
+    try:
+        import llamafactory.train.sft.workflow as sft_workflow
+
+        sft_workflow.load_model = wrapped_load_model
+    except Exception:
+        pass
+
+
+def _model_and_base_model() -> tuple[Any | None, Any | None]:
+    model = _LAST_LF_MODEL
+    base_model = None
+    if model is not None and hasattr(model, "get_base_model"):
+        try:
+            base_model = model.get_base_model()
+        except Exception:
+            base_model = None
+    return model, base_model
+
+
+def _find_kt_wrappers(model: Any | None, base_model: Any | None) -> list[Any] | None:
+    for candidate in (model, base_model):
+        wrappers = getattr(candidate, "_kt_wrappers", None)
+        if wrappers is not None:
+            return list(wrappers)
+    return None
+
+
+def _kt_counters_from_model() -> dict[str, Any]:
+    model, base_model = _model_and_base_model()
+    if model is None:
+        return {"available": False, "reason": "model hook did not capture a model"}
+
+    wrappers = _find_kt_wrappers(model, base_model)
+    rows: list[dict[str, Any]] = []
+    for index, layer in enumerate(wrappers or []):
+        wrapper = getattr(layer, "wrapper", None)
+        rows.append(
+            {
+                "index": index,
+                "layer_idx": getattr(layer, "layer_idx", index),
+                "method": getattr(wrapper, "method", ""),
+                "forward_calls": int(getattr(wrapper, "_kt_forward_calls", 0) or 0),
+                "backward_calls": int(getattr(wrapper, "_kt_backward_calls", 0) or 0),
+                "lora_initialized": bool(getattr(wrapper, "_lora_initialized", False)),
+            }
+        )
+
+    return {
+        "available": wrappers is not None,
+        "wrapper_count": len(wrappers or []),
+        "rows": rows,
+        "total_forward_calls": sum(int(row["forward_calls"]) for row in rows),
+        "total_backward_calls": sum(int(row["backward_calls"]) for row in rows),
+    }
+
+
+def _iter_unique_parameters(value: Any) -> list[torch.nn.Parameter]:
+    params: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+
+    def add(param: Any) -> None:
+        if not isinstance(param, torch.nn.Parameter):
+            return
+        key = id(param)
+        if key in seen:
+            return
+        seen.add(key)
+        params.append(param)
+
+    def visit(obj: Any) -> None:
+        if isinstance(obj, torch.nn.Parameter):
+            add(obj)
+        elif isinstance(obj, torch.nn.ModuleDict):
+            for module in obj.values():
+                visit(module)
+        elif isinstance(obj, torch.nn.ParameterDict):
+            for param in obj.values():
+                visit(param)
+        elif isinstance(obj, torch.nn.ParameterList):
+            for param in obj:
+                visit(param)
+        elif isinstance(obj, torch.nn.Module):
+            for param in obj.parameters(recurse=True):
+                visit(param)
+        elif isinstance(obj, dict):
+            for item in obj.values():
+                visit(item)
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                visit(item)
+
+    visit(value)
+    return params
+
+
+def _lora_counters_from_model() -> dict[str, Any]:
+    model, base_model = _model_and_base_model()
+    if model is None:
+        return {"available": False, "reason": "model hook did not capture a model"}
+
+    trainable_params = 0
+    all_params = 0
+    peft_lora_params = 0
+    for name, param in model.named_parameters():
+        numel = int(param.numel())
+        all_params += numel
+        if param.requires_grad:
+            trainable_params += numel
+        if ("lora_A" in name or "lora_B" in name) and param.requires_grad:
+            peft_lora_params += numel
+
+    lf_fused_modules = 0
+    lf_fused_tensors = 0
+    lf_fused_params = 0
+    kt_peft_expert_modules = 0
+    kt_peft_expert_tensors = 0
+    kt_peft_expert_params = 0
+    kt_fused_modules = 0
+    kt_fused_tensors = 0
+    kt_fused_params = 0
+    kt_expert_modules = 0
+    kt_expert_tensors = 0
+    kt_expert_params = 0
+
+    module_roots = [root for root in (model, base_model) if root is not None]
+    seen_modules: set[int] = set()
+    for root in module_roots:
+        for module in root.modules():
+            module_key = id(module)
+            if module_key in seen_modules:
+                continue
+            seen_modules.add(module_key)
+
+            lf_params = _iter_unique_parameters(getattr(module, "_lf_fused_lora_params", None))
+            if lf_params:
+                lf_fused_modules += 1
+                lf_fused_tensors += len(lf_params)
+                lf_fused_params += sum(int(param.numel()) for param in lf_params)
+
+    wrappers = _find_kt_wrappers(model, base_model) or []
+    seen_kt_params: set[int] = set()
+
+    def add_kt_param(bucket: list[torch.nn.Parameter], param: Any) -> None:
+        if isinstance(param, torch.nn.Parameter) and param.requires_grad:
+            bucket.append(param)
+
+    for layer in wrappers:
+        layer_peft_params: list[torch.nn.Parameter] = []
+        peft_lora_modules = getattr(layer, "_peft_lora_modules", None)
+        if isinstance(peft_lora_modules, dict):
+            for expert_loras in peft_lora_modules.values():
+                if not isinstance(expert_loras, dict):
+                    continue
+                for pair in expert_loras.values():
+                    if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                        continue
+                    lora_a, lora_b = pair
+                    add_kt_param(layer_peft_params, getattr(lora_a, "weight", None))
+                    add_kt_param(layer_peft_params, getattr(lora_b, "weight", None))
+
+        layer_fused_params = _iter_unique_parameters(getattr(layer, "_fused_expert_lora_params", None))
+
+        def unique_new(params: list[torch.nn.Parameter]) -> list[torch.nn.Parameter]:
+            unique: list[torch.nn.Parameter] = []
+            for param in params:
+                key = id(param)
+                if key in seen_kt_params:
+                    continue
+                seen_kt_params.add(key)
+                unique.append(param)
+            return unique
+
+        layer_peft_params = unique_new(layer_peft_params)
+        layer_fused_params = unique_new(layer_fused_params)
+        layer_kt_params = layer_peft_params + layer_fused_params
+
+        if layer_peft_params:
+            kt_peft_expert_modules += 1
+            kt_peft_expert_tensors += len(layer_peft_params)
+            kt_peft_expert_params += sum(int(param.numel()) for param in layer_peft_params)
+        if layer_fused_params:
+            kt_fused_modules += 1
+            kt_fused_tensors += len(layer_fused_params)
+            kt_fused_params += sum(int(param.numel()) for param in layer_fused_params)
+        if layer_kt_params:
+            kt_expert_modules += 1
+            kt_expert_tensors += len(layer_kt_params)
+            kt_expert_params += sum(int(param.numel()) for param in layer_kt_params)
+
+    return {
+        "available": True,
+        "trainable_parameters": trainable_params,
+        "all_parameters": all_params,
+        "peft_lora_parameters": peft_lora_params,
+        "lf_fused_expert_lora_modules": lf_fused_modules,
+        "lf_fused_expert_lora_tensors": lf_fused_tensors,
+        "lf_fused_expert_lora_parameters": lf_fused_params,
+        "kt_peft_expert_lora_modules": kt_peft_expert_modules,
+        "kt_peft_expert_lora_tensors": kt_peft_expert_tensors,
+        "kt_peft_expert_lora_parameters": kt_peft_expert_params,
+        "kt_fused_expert_lora_modules": kt_fused_modules,
+        "kt_fused_expert_lora_tensors": kt_fused_tensors,
+        "kt_fused_expert_lora_parameters": kt_fused_params,
+        "kt_expert_lora_modules": kt_expert_modules,
+        "kt_expert_lora_tensors": kt_expert_tensors,
+        "kt_expert_lora_parameters": kt_expert_params,
+    }
 
 
 @dataclass
@@ -403,6 +653,7 @@ class LFProfileRecorder:
                 if trace_handle is not None
                 else {"enabled": False, "rows": []}
             ),
+            "memory_breakdown": {"enabled": False},
             "step_samples": {
                 "source": "lf_source_recorder",
                 "warmup_steps": self._warmup_steps(),
@@ -415,6 +666,8 @@ class LFProfileRecorder:
                 "records": len(trainer_records),
                 "losses": losses,
             },
+            "lora": _lora_counters_from_model(),
+            "kt": _kt_counters_from_model(),
             "expert_token_distribution": {"samples": 0, "per_expert": []},
             "notes": [
                 "LF source timings are host wall-clock ranges without per-range CUDA synchronization.",
@@ -441,6 +694,7 @@ def main() -> None:
 
     set_profile_enabled(True)
     trace_handle = install_lf_trace(trace_config, recorder=recorder)
+    _install_model_capture_hook()
 
     try:
         from llamafactory.train.tuner import run_exp
@@ -451,7 +705,27 @@ def main() -> None:
         if source_json and _is_rank0():
             path = Path(source_json)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(recorder.report(trace_handle), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            report = recorder.report(trace_handle)
+            memory_breakdown = trace_handle.memory_breakdown_report()
+            if memory_breakdown.get("enabled"):
+                output_base = os.environ.get(PROFILE_MEMORY_BREAKDOWN_OUTPUT_ENV, "memory_breakdown").strip() or "memory_breakdown"
+                breakdown_jsonl = path.parent / f"{output_base}.jsonl"
+                breakdown_summary_json = path.parent / f"{output_base}_summary.json"
+                rows = memory_breakdown.get("rows", [])
+                row_items = rows if isinstance(rows, list) else []
+                with breakdown_jsonl.open("w", encoding="utf-8") as handle:
+                    for row in row_items:
+                        handle.write(json.dumps(row, sort_keys=True) + "\n")
+                summary = memory_breakdown.get("summary", {})
+                breakdown_summary_json.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                report["memory_breakdown"] = {
+                    "enabled": True,
+                    "jsonl": str(breakdown_jsonl),
+                    "summary_json": str(breakdown_summary_json),
+                    "summary": summary,
+                    "rows": len(row_items),
+                }
+            path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         uninstall_lf_trace(trace_handle)
 
 

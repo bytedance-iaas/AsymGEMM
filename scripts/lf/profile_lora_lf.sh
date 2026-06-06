@@ -6,14 +6,17 @@ set -Eeuo pipefail
 # =============================================================================
 ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
 LF_DIR=${LF_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/LlamaFactory}
+KT_KERNEL_DIR=${KT_KERNEL_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/ktransformers/kt-kernel}
 CONDA_EXE=${CONDA_EXE:-conda}
 NSYS_BIN=${NSYS_BIN:-nsys}
 
-GPU_POOL=${GPU_POOL:-1,2}
-MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1 meta-llama/Llama-4-Scout-17B-16E|2"}
-# MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
+GPU_POOL=${GPU_POOL:-0}
+# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|2,meta-llama/Llama-4-Scout-17B-16E|1"}
+MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
 
-EXPERT_POLICIES=${EXPERT_POLICIES-"none tok-le0 tok-le512 tok-le1024 tok-le512-act tok-le1024-act"}
+# EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le0,tok-le512,tok-le1024,tok-le512-act,tok-le1024-act"}
+EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le0,tok-le64,tok-le64-act,tok-le256,tok-le256-act,tok-le512,tok-le512-act"}
+
 
 # Primary backend sweep axis. Each entry is backend|recompute; recompute aliases
 # such as recompute/norecompute normalize to recomp/norecomp internally.
@@ -21,11 +24,12 @@ if [[ -z "${BACKEND_SPECS+x}" ]]; then
   if [[ -n "${BACKENDS+x}" || -n "${RECOMPUTE+x}" ]]; then
     BACKEND_SPECS=
   else
-    BACKEND_SPECS="asym|norecompute,torch|norecompute,torch|recompute"
+    # BACKEND_SPECS="asym|norecompute,torch|norecompute,torch|recompute"
+    BACKEND_SPECS="asym|recompute,torch|recompute"
   fi
 fi
 BACKENDS=${BACKENDS:-asym,torch}  # legacy; used only when BACKEND_SPECS is empty or --backends/--recompute is passed
-RECOMPUTE=${RECOMPUTE:-norecomp}  # legacy; use BACKEND_SPECS for new sweeps
+RECOMPUTE=${RECOMPUTE:-recomp}  # legacy; use BACKEND_SPECS for new sweeps
 # BACKEND_SPECS=${BACKEND_SPECS:-"asym|norecompute,torch|recompute"}
 PROFILERS=${PROFILERS:-nsys}
 PRECISION=${PRECISION:-bf16} 
@@ -45,23 +49,41 @@ GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 LORA_RANK=${LORA_RANK:-64}
 LORA_ALPHA=${LORA_ALPHA:-16}
+# LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
 LORA_DROPOUT=${LORA_DROPOUT:-0.10}
+SEED=${SEED:-42}
 
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
 ASYM_STRICT=${ASYM_STRICT:-true}
+TORCH_USE_ASYM_GEMM_LORA=${TORCH_USE_ASYM_GEMM_LORA:-true}
 REQUIRE_SM100=${REQUIRE_SM100:-1}
 TORCH_DISTRIBUTED_BACKEND=${TORCH_DISTRIBUTED_BACKEND:-deepspeed}
 TORCH_FSDP_CONFIG=${TORCH_FSDP_CONFIG:-${LF_DIR}/examples/accelerate/fsdp2_config.yaml}
 # TORCH_DEEPSPEED_CONFIG=${TORCH_DEEPSPEED_CONFIG:-${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json}
 TORCH_DEEPSPEED_CONFIG=${TORCH_DEEPSPEED_CONFIG:-${LF_DIR}/examples/deepspeed/ds_z3_config.json}
 
-# Optional output/profile controls
-OUTPUT_ROOT=${OUTPUT_ROOT:-profiling}
+# Optional output/profile controls. When unset, KT-only sweeps write beside the
+# production KT repo; normal AsymGEMM sweeps write under the AsymGEMM repo.
+OUTPUT_ROOT=${OUTPUT_ROOT:-}
 PROFILE_LEVEL=${PROFILE_LEVEL:-op}
 PROFILE_LAYERS=${PROFILE_LAYERS:-all}
-PROFILE_MEMORY_ATTRIBUTION=${PROFILE_MEMORY_ATTRIBUTION:-0}
+PROFILE_MEMORY_ATTRIBUTION=${PROFILE_MEMORY_ATTRIBUTION:-auto}
+PROFILE_MEMORY_BREAKDOWN=${PROFILE_MEMORY_BREAKDOWN:-auto}
+PROFILE_MEMORY_BREAKDOWN_INTERVAL=${PROFILE_MEMORY_BREAKDOWN_INTERVAL:-1}
+PROFILE_MEMORY_BREAKDOWN_STEPS=${PROFILE_MEMORY_BREAKDOWN_STEPS:-}
+PROFILE_MEMORY_BREAKDOWN_MODULES=${PROFILE_MEMORY_BREAKDOWN_MODULES:-attention,mlp,experts,lora,embedding,loss}
 PROFILE_SYNC=${PROFILE_SYNC:-0}
-PROFILE_MODULE_FILTER=${PROFILE_MODULE_FILTER:-attention,mlp,experts,lora,optimizer}
+PROFILE_MODULE_FILTER=${PROFILE_MODULE_FILTER:-attention,mlp,experts,lora,optimizer,kt}
+
+KT_NUM_THREADS=${KT_NUM_THREADS:-}
+KT_THREADPOOL_COUNT=${KT_THREADPOOL_COUNT:-}
+KT_MAX_CACHE_DEPTH=${KT_MAX_CACHE_DEPTH:-2}
+KT_TP_ENABLED=${KT_TP_ENABLED:-false}
+KT_TORCHBF16_SFT_DEVICE=${KT_TORCHBF16_SFT_DEVICE:-cuda}
+KT_ARM_OMP_NUM_THREADS=${KT_ARM_OMP_NUM_THREADS:-64}
+KT_ARM_OMP_PROC_BIND=${KT_ARM_OMP_PROC_BIND:-close}
+KT_ARM_OMP_PLACES=${KT_ARM_OMP_PLACES:-cores}
+CHECK_KT_CALLS=${CHECK_KT_CALLS:-1}
 
 # Optional loss-comparison controls
 COMPARE_LOSSES=${COMPARE_LOSSES:-true}
@@ -72,6 +94,8 @@ COMPARE_MAX_REL_TOL=${COMPARE_MAX_REL_TOL:-0.10}
 
 # Optional plotting controls
 PLOT=${PLOT:-true}
+PLOT_MEMORY_BREAKDOWN=${PLOT_MEMORY_BREAKDOWN:-true}
+MEMORY_BREAKDOWN_PLOT_Y_SCALE=${MEMORY_BREAKDOWN_PLOT_Y_SCALE:-shared}
 
 # Optional execution controls
 OVERWRITE=${OVERWRITE:-false}
@@ -89,12 +113,16 @@ PLOT_OUTPUT_DIR=${PLOT_OUTPUT_DIR:-}
 # Derived Parameters
 # =============================================================================
 ASYM_DIR=${ASYM_DIR:-${ROOT}}
+KT_TOOLS_DIR=${KT_TOOLS_DIR:-${ASYM_DIR}}
+KT_REPO_DIR=${KT_REPO_DIR:-$(dirname "${KT_KERNEL_DIR}")}
 ENV_DIR=${ENV_DIR:-${LF_DIR}/.venv}
 ENV_PYTHON=${ENV_PYTHON:-${ENV_DIR}/bin/python}
 RUN_LF_SCRIPT="${ASYM_DIR}/scripts/lf/run_lf_lora_sft.sh"
 BUILD_DATASET_SCRIPT="${ASYM_DIR}/scripts/lf/build_lf_sft_eval_pair.py"
 PROFILE_POSTPROCESS_SCRIPT="${ASYM_DIR}/scripts/lf/postprocess_lf_profile_artifacts.py"
 PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_activation_recompute_sweep.py"
+MEMORY_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_memory_breakdown.py"
+INTERCONNECT_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_interconnect_ctc.py"
 
 # =============================================================================
 # Main Logic
@@ -112,15 +140,16 @@ Defaults:
   --output-root ${OUTPUT_ROOT}
 
 Options:
-  --gpus LIST                    Physical GPU pool. Accepts 0,1 or "0 1".
+  List values must be comma-separated with no spaces.
+
+  --gpus LIST                    Physical GPU pool, e.g. 0,1.
   --models LIST                  Model specs. Each item is model_name_or_path|num_gpus.
-                                 Accepts comma/space-separated values, for example:
-                                 meta-llama/Llama-4-Scout-17B-16E|1 meta-llama/Llama-4-Maverick-17B-128E|4
-  --backend-specs LIST           Backend/recompute specs, e.g. 'asym|norecompute,torch|recompute'.
+                                 Example: meta-llama/Llama-4-Scout-17B-16E|1,meta-llama/Llama-4-Maverick-17B-128E|4
+  --backend-specs LIST           Backend/recompute specs, e.g. 'asym|norecompute,torch|recompute,kt_armbf16|norecompute'.
                                  Accepts recompute/norecompute or recomp/norecomp.
-  --backends LIST                Legacy: asym and/or torch. Combined with --recompute.
+  --backends LIST                Legacy: asym, torch, kt_torchbf16, and/or kt_armbf16. Combined with --recompute.
   --profilers LIST               source and/or nsys.
-  --seq-lens LIST                LF cutoff lengths. Accepts positive integers, e.g. 4096,8192 or "4096 8192".
+  --seq-lens LIST                LF cutoff lengths. Accepts positive integers, e.g. 4096,8192.
   --recompute norecomp|recomp|both  Legacy: expands every backend to the selected recompute mode(s).
   --expert-policies LIST         AsymGEMM expert policies: none, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, and -act variants.
   --dataset NAME
@@ -137,25 +166,35 @@ Options:
   --learning-rate VALUE
   --lora-rank N
   --lora-alpha VALUE
-  --lora-dropout VALUE             LoRA dropout probability in fixed 0.xx format, e.g. 0.10.
+  --lora-dropout LIST           LoRA dropout probabilities in fixed 0.xx format, e.g. 0.00,0.10.
+  --seed N
   --precision NAME
   --profile-level stage|module|op|deep
   --profile-layers all|first,last|0,1,2|every4
-  --profile-memory-attribution true|false
+  --profile-memory-attribution auto|true|false
+  --profile-memory-breakdown auto|true|false
+  --profile-memory-breakdown-interval N
+  --profile-memory-breakdown-steps LIST
+  --profile-memory-breakdown-modules LIST
   --profile-sync true|false
   --profile-module-filter LIST
+  --torch-use-asym-gemm-lora true|false
+                                 For BACKEND=torch, attach packed-expert LoRA through the AsymGEMM torch backend.
+                                 Default true so torch/asym/KT train the same LF LoRA target=all modules.
   --torch-distributed-backend fsdp2|deepspeed|ddp
   --torch-fsdp-config PATH       Accelerate config for torch FSDP2. Defaults to LF's examples/accelerate/fsdp2_config.yaml.
   --torch-deepspeed-config PATH  DeepSpeed config for torch backend. Defaults to LF's examples/deepspeed/ds_z3_config.json.
   --compare-losses true|false
-  --compare-baseline-backend torch|asym
-  --compare-candidate-backend torch|asym
+  --compare-baseline-backend torch|asym|kt_torchbf16|kt_armbf16
+  --compare-candidate-backend LIST   One or more comma-separated candidate backends.
   --compare-min-steps N
   --compare-first-step-rel-tol VALUE
   --compare-max-rel-tol VALUE
-  --output-root DIR              Default layout: <root>/<dataset>__lora__lf__<precision>/<model>__b<batch>_s<seq>_w<warmup>_s<steps>_r<rank>_a<alpha>_drop<dropout>
+  --output-root DIR              Default layout: <root>/<dataset>__lora__lf__<precision>/<model>__gpus<model_gpus>__b<batch>_s<seq>_w<warmup>_s<steps>_r<rank>_a<alpha>_drop0xx
   --run-name NAME                Optional config directory under <dataset>__lora__lf__<precision>.
   --plot true|false
+  --plot-memory-breakdown true|false
+  --memory-breakdown-plot-y-scale shared|per-plot|global
   --plot-output-dir DIR
   --overwrite true|false
   --continue-on-error true|false
@@ -201,6 +240,14 @@ tokens() (
     done
   done
 )
+
+require_comma_list() {
+  local name="$1"
+  local value="$2"
+  if [[ -n "${value}" && "${value}" =~ [[:space:]] ]]; then
+    die "${name} must be comma-separated with no spaces, got '${value}'"
+  fi
+}
 
 dedupe() {
   awk '!seen[$0]++'
@@ -284,7 +331,8 @@ backend_gpu_count() {
   case "${backend}" in
     asym) printf '1\n' ;;
     torch) printf '%s\n' "${model_gpu_count}" ;;
-    *) die "internal backend label must be asym or torch, got '${backend}'" ;;
+    kt_torchbf16|kt_armbf16) printf '1\n' ;;
+    *) die "internal backend label must be asym, torch, kt_torchbf16, or kt_armbf16, got '${backend}'" ;;
   esac
 }
 
@@ -324,7 +372,9 @@ backend_label() {
   case "${1,,}" in
     asym) printf 'asym\n' ;;
     torch|asym_torch) printf 'torch\n' ;;
-    *) die "backend must be asym or torch, got '${1}'" ;;
+    kt|kt_torch|kt_torchbf16|torchbf16|torchsft|torchbf16_sft|torchbf16-sft) printf 'kt_torchbf16\n' ;;
+    kt_arm|kt_armbf16|armbf16|armbf16_sft|armbf16-sft|kt_armbf16_sft) printf 'kt_armbf16\n' ;;
+    *) die "backend must be asym, torch, kt_torchbf16, or kt_armbf16, got '${1}'" ;;
   esac
 }
 
@@ -377,6 +427,38 @@ profiler_label() {
   esac
 }
 
+memory_attribution_for_profiler() {
+  local profiler="$1"
+  case "${PROFILE_MEMORY_ATTRIBUTION,,}" in
+    auto)
+      if [[ "${profiler}" == "source" ]]; then
+        printf 'true\n'
+      else
+        printf 'false\n'
+      fi
+      ;;
+    1|true|yes|y|on) printf 'true\n' ;;
+    0|false|no|n|off) printf 'false\n' ;;
+    *) die "--profile-memory-attribution must be auto, true, or false; got '${PROFILE_MEMORY_ATTRIBUTION}'" ;;
+  esac
+}
+
+memory_breakdown_for_profiler() {
+  local profiler="$1"
+  case "${PROFILE_MEMORY_BREAKDOWN,,}" in
+    auto)
+      if [[ "${profiler}" == "source" ]]; then
+        printf 'true\n'
+      else
+        printf 'false\n'
+      fi
+      ;;
+    1|true|yes|y|on) printf 'true\n' ;;
+    0|false|no|n|off) printf 'false\n' ;;
+    *) die "--profile-memory-breakdown must be auto, true, or false; got '${PROFILE_MEMORY_BREAKDOWN}'" ;;
+  esac
+}
+
 config_root_path() {
   local seq_len="$1"
   local config_label step_label dropout_label
@@ -389,7 +471,7 @@ config_root_path() {
       config_label="$(safe_label "${run_name}__${dropout_label}")"
     fi
   else
-    config_label="$(safe_label "${workload_label}__b${batch_size}_s${seq_len}_${step_label}_r${LORA_RANK}_a${LORA_ALPHA}_${dropout_label}")"
+    config_label="$(safe_label "${workload_label}__gpus${current_model_gpu_count}__b${batch_size}_s${seq_len}_${step_label}_r${LORA_RANK}_a${LORA_ALPHA}_${dropout_label}")"
   fi
   printf '%s/%s\n' "${precision_root}" "${config_label}"
 }
@@ -404,6 +486,17 @@ job_root_path() {
 }
 
 plot_workload_from_config_root() {
+  local config_name workload
+  config_name="$(basename "$1")"
+  workload="${config_name%%__*}"
+  if [[ "${config_name}" =~ (^|__)gpus([1-9][0-9]*)(__|$) ]]; then
+    printf '%s gpus%s\n' "${workload}" "${BASH_REMATCH[2]}"
+  else
+    printf '%s\n' "${workload}"
+  fi
+}
+
+plot_workload_base_from_config_root() {
   local config_name
   config_name="$(basename "$1")"
   printf '%s\n' "${config_name%%__*}"
@@ -453,8 +546,17 @@ append_sweep_plot_filters() {
   local -n cmd_ref="$1"
   local backend profiler recompute
   for backend in "${backends[@]}"; do cmd_ref+=(--backend "${backend}"); done
-  for profiler in "${profilers[@]}"; do cmd_ref+=(--profiler "${profiler}"); done
+  for profiler in "${plot_profilers[@]}"; do cmd_ref+=(--profiler "${profiler}"); done
   for recompute in "${recompute_modes[@]}"; do cmd_ref+=(--recompute "${recompute}"); done
+}
+
+profiler_selected_for_plots() {
+  local profiler="$1"
+  local selected
+  for selected in "${plot_profilers[@]}"; do
+    [[ "${selected}" == "${profiler}" ]] && return 0
+  done
+  return 1
 }
 
 dataset_name_for_seq() {
@@ -477,10 +579,15 @@ prepare_dataset_for_seq() {
   local min_tokens
   min_tokens="$(dataset_min_tokens_for_seq "${seq_len}")"
 
+  local -a tools_dir_arg=(--asym-dir "${ASYM_DIR}")
+  if [[ "${selected_has_kt:-false}" == "true" && "${selected_has_asym:-false}" != "true" ]]; then
+    tools_dir_arg=(--kt-tools-dir "${KT_TOOLS_DIR}")
+  fi
+
   local -a dataset_cmd=(
     "${ENV_PYTHON}" "${BUILD_DATASET_SCRIPT}"
     --lf-dir "${LF_DIR}"
-    --asym-dir "${ASYM_DIR}"
+    "${tools_dir_arg[@]}"
     --model-name-or-path "${current_model_name}"
     --template "${TEMPLATE}"
     --train-name "${dataset_name}"
@@ -515,6 +622,7 @@ profiler_spec="${PROFILERS}"
 seq_spec="${SEQ_LENS}"
 recompute_spec="${RECOMPUTE}"
 expert_policy_spec="${EXPERT_POLICIES}"
+lora_dropout_spec="${LORA_DROPOUT}"
 output_root="${OUTPUT_ROOT}"
 run_name="${RUN_NAME}"
 batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}"
@@ -569,8 +677,10 @@ while (($#)); do
     --lora-rank=*) LORA_RANK="${1#*=}"; shift ;;
     --lora-alpha) need_value "$1" "${2-}"; LORA_ALPHA="$2"; shift 2 ;;
     --lora-alpha=*) LORA_ALPHA="${1#*=}"; shift ;;
-    --lora-dropout) need_value "$1" "${2-}"; LORA_DROPOUT="$2"; shift 2 ;;
-    --lora-dropout=*) LORA_DROPOUT="${1#*=}"; shift ;;
+    --seed) need_value "$1" "${2-}"; SEED="$2"; shift 2 ;;
+    --seed=*) SEED="${1#*=}"; shift ;;
+    --lora-dropout) collect_values "$1" vals "${@:2}"; lora_dropout_spec="${vals[*]}"; LORA_DROPOUT="${lora_dropout_spec}"; set -- "${REMAINING[@]}" ;;
+    --lora-dropout=*) lora_dropout_spec="${1#*=}"; LORA_DROPOUT="${lora_dropout_spec}"; shift ;;
     --precision) need_value "$1" "${2-}"; PRECISION="$2"; shift 2 ;;
     --precision=*) PRECISION="${1#*=}"; shift ;;
     --profile-level) need_value "$1" "${2-}"; PROFILE_LEVEL="$2"; shift 2 ;;
@@ -579,10 +689,20 @@ while (($#)); do
     --profile-layers=*) PROFILE_LAYERS="${1#*=}"; shift ;;
     --profile-memory-attribution) need_value "$1" "${2-}"; PROFILE_MEMORY_ATTRIBUTION="$2"; shift 2 ;;
     --profile-memory-attribution=*) PROFILE_MEMORY_ATTRIBUTION="${1#*=}"; shift ;;
+    --profile-memory-breakdown) need_value "$1" "${2-}"; PROFILE_MEMORY_BREAKDOWN="$2"; shift 2 ;;
+    --profile-memory-breakdown=*) PROFILE_MEMORY_BREAKDOWN="${1#*=}"; shift ;;
+    --profile-memory-breakdown-interval) need_value "$1" "${2-}"; PROFILE_MEMORY_BREAKDOWN_INTERVAL="$2"; shift 2 ;;
+    --profile-memory-breakdown-interval=*) PROFILE_MEMORY_BREAKDOWN_INTERVAL="${1#*=}"; shift ;;
+    --profile-memory-breakdown-steps) need_value "$1" "${2-}"; PROFILE_MEMORY_BREAKDOWN_STEPS="$2"; shift 2 ;;
+    --profile-memory-breakdown-steps=*) PROFILE_MEMORY_BREAKDOWN_STEPS="${1#*=}"; shift ;;
+    --profile-memory-breakdown-modules) need_value "$1" "${2-}"; PROFILE_MEMORY_BREAKDOWN_MODULES="$2"; shift 2 ;;
+    --profile-memory-breakdown-modules=*) PROFILE_MEMORY_BREAKDOWN_MODULES="${1#*=}"; shift ;;
     --profile-sync) need_value "$1" "${2-}"; PROFILE_SYNC="$2"; shift 2 ;;
     --profile-sync=*) PROFILE_SYNC="${1#*=}"; shift ;;
     --profile-module-filter) need_value "$1" "${2-}"; PROFILE_MODULE_FILTER="$2"; shift 2 ;;
     --profile-module-filter=*) PROFILE_MODULE_FILTER="${1#*=}"; shift ;;
+    --torch-use-asym-gemm-lora) need_value "$1" "${2-}"; TORCH_USE_ASYM_GEMM_LORA="$(bool_value "$2")"; shift 2 ;;
+    --torch-use-asym-gemm-lora=*) TORCH_USE_ASYM_GEMM_LORA="$(bool_value "${1#*=}")"; shift ;;
     --torch-distributed-backend) need_value "$1" "${2-}"; TORCH_DISTRIBUTED_BACKEND="$2"; shift 2 ;;
     --torch-distributed-backend=*) TORCH_DISTRIBUTED_BACKEND="${1#*=}"; shift ;;
     --torch-fsdp-config) need_value "$1" "${2-}"; TORCH_FSDP_CONFIG="$2"; shift 2 ;;
@@ -607,6 +727,10 @@ while (($#)); do
     --run-name=*) run_name="${1#*=}"; shift ;;
     --plot) need_value "$1" "${2-}"; PLOT="$(bool_value "$2")"; shift 2 ;;
     --plot=*) PLOT="$(bool_value "${1#*=}")"; shift ;;
+    --plot-memory-breakdown) need_value "$1" "${2-}"; PLOT_MEMORY_BREAKDOWN="$(bool_value "$2")"; shift 2 ;;
+    --plot-memory-breakdown=*) PLOT_MEMORY_BREAKDOWN="$(bool_value "${1#*=}")"; shift ;;
+    --memory-breakdown-plot-y-scale) need_value "$1" "${2-}"; MEMORY_BREAKDOWN_PLOT_Y_SCALE="$2"; shift 2 ;;
+    --memory-breakdown-plot-y-scale=*) MEMORY_BREAKDOWN_PLOT_Y_SCALE="${1#*=}"; shift ;;
     --plot-output-dir) need_value "$1" "${2-}"; PLOT_OUTPUT_DIR="$2"; shift 2 ;;
     --plot-output-dir=*) PLOT_OUTPUT_DIR="${1#*=}"; shift ;;
     --overwrite) need_value "$1" "${2-}"; OVERWRITE="$(bool_value "$2")"; shift 2 ;;
@@ -623,9 +747,29 @@ if [[ "${backend_specs_cli_set}" == "true" && "${legacy_backend_axes_cli_set}" =
   die "--backend-specs cannot be combined with --backends or --recompute"
 fi
 
+require_comma_list "--gpus/GPU_POOL" "${gpu_spec}"
+require_comma_list "--models/MODEL_SPECS" "${model_spec}"
+require_comma_list "--backend-specs/BACKEND_SPECS" "${backend_specs_spec}"
+require_comma_list "--backends/BACKENDS" "${backend_spec}"
+require_comma_list "--profilers/PROFILERS" "${profiler_spec}"
+require_comma_list "--seq-lens/SEQ_LENS" "${seq_spec}"
+require_comma_list "--expert-policies/EXPERT_POLICIES" "${expert_policy_spec}"
+require_comma_list "--lora-dropout/LORA_DROPOUT" "${lora_dropout_spec}"
+
 nonnegative_int "--max-steps" "${MAX_STEPS}"
 nonnegative_int "--warmup-steps" "${WARMUP_STEPS}"
 nonnegative_int "INTERRUPT_GRACE_SECONDS" "${INTERRUPT_GRACE_SECONDS}"
+positive_int "--profile-memory-breakdown-interval" "${PROFILE_MEMORY_BREAKDOWN_INTERVAL}"
+case "${MEMORY_BREAKDOWN_PLOT_Y_SCALE}" in
+  shared|per-plot|global) ;;
+  *) die "--memory-breakdown-plot-y-scale must be shared, per-plot, or global; got '${MEMORY_BREAKDOWN_PLOT_Y_SCALE}'" ;;
+esac
+mapfile -t lora_dropouts < <(tokens "${lora_dropout_spec}" | dedupe)
+((${#lora_dropouts[@]})) || die "LoRA dropout list is empty"
+for value in "${lora_dropouts[@]}"; do
+  lora_dropout_label "${value}" >/dev/null
+done
+LORA_DROPOUT="${lora_dropouts[0]}"
 lora_dropout_label_value="$(lora_dropout_label "${LORA_DROPOUT}")"
 TOTAL_STEPS=$((MAX_STEPS + WARMUP_STEPS))
 if [[ -z "${COMPARE_MIN_STEPS}" ]]; then
@@ -634,6 +778,7 @@ fi
 nonnegative_int "--compare-min-steps" "${COMPARE_MIN_STEPS}"
 PREPARE_DATASETS=$(bool_value "${PREPARE_DATASETS}")
 DATASET_OVERWRITE=$(bool_value "${DATASET_OVERWRITE}")
+TORCH_USE_ASYM_GEMM_LORA=$(bool_value "${TORCH_USE_ASYM_GEMM_LORA}")
 DATASET_MIN_TOKENS="${DATASET_MIN_TOKENS,,}"
 positive_int "--dataset-eval-rows" "${DATASET_EVAL_ROWS}"
 if [[ "${DATASET_MIN_TOKENS}" != "auto" ]]; then
@@ -645,11 +790,36 @@ mapfile -t model_specs < <(tokens "${model_spec}" | dedupe)
 if [[ -n "${backend_specs_spec}" ]]; then
   mapfile -t backend_specs < <(tokens "${backend_specs_spec}" | while read -r value; do expand_backend_spec "${value}"; done | dedupe)
 else
-  mapfile -t backend_specs < <(expand_legacy_backend_specs "${backend_spec}" "${recompute_spec}" | dedupe)
+mapfile -t backend_specs < <(expand_legacy_backend_specs "${backend_spec}" "${recompute_spec}" | dedupe)
 fi
 mapfile -t backends < <(printf '%s\n' "${backend_specs[@]}" | cut -d '|' -f1 | dedupe)
 mapfile -t recompute_modes < <(printf '%s\n' "${backend_specs[@]}" | cut -d '|' -f2 | dedupe)
+selected_has_asym=false
+selected_has_kt=false
+for backend in "${backends[@]}"; do
+  case "${backend}" in
+    asym) selected_has_asym=true ;;
+    kt_*) selected_has_kt=true ;;
+  esac
+done
+if [[ -z "${output_root}" ]]; then
+  if [[ "${selected_has_kt}" == "true" && "${selected_has_asym}" != "true" ]]; then
+    output_root="${KT_REPO_DIR}/profiling_kt"
+  else
+    output_root="${ASYM_DIR}/profiling"
+  fi
+fi
 mapfile -t profilers < <(tokens "${profiler_spec}" | while read -r value; do profiler_label "${value}"; done | dedupe)
+if printf '%s\n' "${profilers[@]}" | grep -qx 'nsys'; then
+  plot_profilers=(nsys)
+else
+  plot_profilers=()
+  for profiler in "${profilers[@]}"; do
+    if [[ "$(memory_breakdown_for_profiler "${profiler}")" != "true" ]]; then
+      plot_profilers+=("${profiler}")
+    fi
+  done
+fi
 mapfile -t seq_lens < <(tokens "${seq_spec}" | dedupe)
 mapfile -t raw_expert_policies < <(tokens "${expert_policy_spec}" | dedupe)
 ((${#raw_expert_policies[@]} > 0)) || die "expert policies must include at least one explicit policy"
@@ -677,9 +847,18 @@ for seq_len in "${seq_lens[@]}"; do
 done
 ((${#expert_policies[@]})) || die "expert policy list is empty"
 [[ -f "${RUN_LF_SCRIPT}" ]] || die "missing ${RUN_LF_SCRIPT}"
+if [[ "${selected_has_kt}" == "true" ]]; then
+  [[ -d "${KT_KERNEL_DIR}" ]] || die "missing integrated kt-kernel dir ${KT_KERNEL_DIR}"
+fi
 [[ -f "${BUILD_DATASET_SCRIPT}" ]] || die "missing ${BUILD_DATASET_SCRIPT}"
 [[ -f "${PROFILE_POSTPROCESS_SCRIPT}" ]] || die "missing ${PROFILE_POSTPROCESS_SCRIPT}"
 [[ -f "${PLOT_SCRIPT}" ]] || die "missing ${PLOT_SCRIPT}"
+if [[ "${PLOT_MEMORY_BREAKDOWN}" == "true" ]]; then
+  [[ -f "${MEMORY_PLOT_SCRIPT}" ]] || die "missing ${MEMORY_PLOT_SCRIPT}"
+fi
+if [[ "${PLOT}" == "true" ]] && printf '%s\n' "${profilers[@]}" | grep -qx 'nsys'; then
+  [[ -f "${INTERCONNECT_PLOT_SCRIPT}" ]] || die "missing ${INTERCONNECT_PLOT_SCRIPT}"
+fi
 if [[ "${PREPARE_DATASETS}" == "true" && "${DRY_RUN}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
   [[ -x "${ENV_PYTHON}" ]] || die "missing executable LF Python at ${ENV_PYTHON}"
 fi
@@ -690,6 +869,7 @@ if [[ "${TORCH_DISTRIBUTED_BACKEND}" == "deepspeed" ]]; then
   [[ -f "${TORCH_DEEPSPEED_CONFIG}" ]] || die "missing torch DeepSpeed config ${TORCH_DEEPSPEED_CONFIG}"
 fi
 COMPARE_LOSSES=$(bool_value "${COMPARE_LOSSES}")
+PLOT_MEMORY_BREAKDOWN=$(bool_value "${PLOT_MEMORY_BREAKDOWN}")
 compare_baseline_backend="$(backend_label "${COMPARE_BASELINE_BACKEND}")"
 compare_candidate_backend="$(backend_label "${COMPARE_CANDIDATE_BACKEND}")"
 [[ "${compare_baseline_backend}" != "${compare_candidate_backend}" ]] || die "compare backends must differ"
@@ -705,6 +885,8 @@ fi
 echo "Output precision root: ${precision_root}"
 
 declare -A plot_roots=()
+declare -A memory_plot_roots=()
+declare -A interconnect_plot_roots=()
 declare -A run_dirs=()
 declare -A compare_groups=()
 declare -A compare_group_config_roots=()
@@ -715,6 +897,7 @@ interrupted=false
 interrupt_exit_status=130
 current_child_pid=""
 current_child_pid_file=""
+current_wait_pid=""
 
 child_process_alive() {
   local pid="$1"
@@ -723,15 +906,16 @@ child_process_alive() {
 
 kill_current_child() {
   local base_pid="${current_child_pid:-}"
+  local wait_pid="${current_wait_pid:-}"
   local file_pid="" target_pid
   if [[ -n "${current_child_pid_file:-}" && -s "${current_child_pid_file}" ]]; then
     IFS= read -r file_pid < "${current_child_pid_file}" || true
   fi
   rm -f "${current_child_pid_file:-}" 2>/dev/null || true
 
-  [[ -n "${base_pid}" || -n "${file_pid}" ]] || return 0
+  [[ -n "${base_pid}" || -n "${file_pid}" || -n "${wait_pid}" ]] || return 0
 
-  for target_pid in "${base_pid}" "${file_pid}"; do
+  for target_pid in "${base_pid}" "${file_pid}" "${wait_pid}"; do
     [[ -n "${target_pid}" ]] || continue
     kill -INT "-${target_pid}" 2>/dev/null || true
     kill -INT "${target_pid}" 2>/dev/null || true
@@ -741,7 +925,7 @@ kill_current_child() {
     sleep "${INTERRUPT_GRACE_SECONDS}" || true
   fi
 
-  for target_pid in "${base_pid}" "${file_pid}"; do
+  for target_pid in "${base_pid}" "${file_pid}" "${wait_pid}"; do
     [[ -n "${target_pid}" ]] || continue
     child_process_alive "${target_pid}" || continue
     kill -TERM "-${target_pid}" 2>/dev/null || true
@@ -752,7 +936,7 @@ kill_current_child() {
     sleep "${INTERRUPT_GRACE_SECONDS}" || true
   fi
 
-  for target_pid in "${base_pid}" "${file_pid}"; do
+  for target_pid in "${base_pid}" "${file_pid}" "${wait_pid}"; do
     [[ -n "${target_pid}" ]] || continue
     child_process_alive "${target_pid}" || continue
     kill -KILL "-${target_pid}" 2>/dev/null || true
@@ -760,14 +944,22 @@ kill_current_child() {
   done
 }
 
+cleanup_on_exit() {
+  if [[ -n "${current_child_pid:-}" || -n "${current_wait_pid:-}" || -n "${current_child_pid_file:-}" ]]; then
+    kill_current_child
+  fi
+}
+
 run_tracked_command() {
   local status=0 wait_pid="" child_pid="" pid_file="" attempt
   current_child_pid=""
+  current_wait_pid=""
   if command -v setsid >/dev/null 2>&1 && setsid --help 2>&1 | grep -q -- '--wait'; then
     pid_file="$(mktemp "${TMPDIR:-/tmp}/profile_lora_lf_child.XXXXXX")"
     current_child_pid_file="${pid_file}"
     setsid --wait bash -c 'pid_file="$1"; shift; echo "$$" > "${pid_file}"; exec "$@"' _ "${pid_file}" "$@" &
     wait_pid=$!
+    current_wait_pid="${wait_pid}"
     current_child_pid="${wait_pid}"
     for ((attempt = 0; attempt < 100; attempt++)); do
       if [[ -s "${pid_file}" ]]; then
@@ -783,20 +975,32 @@ run_tracked_command() {
   else
     "$@" &
     wait_pid=$!
+    current_wait_pid="${wait_pid}"
     current_child_pid="${wait_pid}"
   fi
   wait "${wait_pid}" || status=$?
-  [[ -z "${pid_file}" ]] || rm -f "${pid_file}" 2>/dev/null || true
-  current_child_pid=""
-  current_child_pid_file=""
   if [[ "${interrupted}" == "true" ]]; then
+    kill_current_child
+    wait "${wait_pid}" 2>/dev/null || true
+    current_child_pid=""
+    current_child_pid_file=""
+    current_wait_pid=""
     echo "Interrupted command; exiting without scheduling more jobs." >&2
     exit "${interrupt_exit_status}"
   fi
   if [[ "${status}" == "130" || "${status}" == "143" ]]; then
+    kill_current_child
+    wait "${wait_pid}" 2>/dev/null || true
+    current_child_pid=""
+    current_child_pid_file=""
+    current_wait_pid=""
     echo "Interrupted command; exiting without scheduling more jobs." >&2
     exit "${status}"
   fi
+  [[ -z "${pid_file}" ]] || rm -f "${pid_file}" 2>/dev/null || true
+  current_child_pid=""
+  current_child_pid_file=""
+  current_wait_pid=""
   return "${status}"
 }
 
@@ -821,6 +1025,7 @@ handle_interrupt() {
 
 trap 'handle_interrupt INT' INT
 trap 'handle_interrupt TERM' TERM
+trap 'cleanup_on_exit' EXIT
 
 run_job() {
   local backend="$1"
@@ -841,16 +1046,30 @@ run_job() {
   source_profile="${seq_root}/source_profile.json"
   lf_out="${seq_root}/lf_run"
   log_file="${seq_root}/train.log"
-  run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_s${seq_len}"
+  run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_s${seq_len}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
   local group_key="${config_root}|${profiler}|${recompute}|${expert_policy}|${seq_len}"
+  local profile_memory_attribution profile_memory_breakdown
+  local kt_backend=""
+  profile_memory_attribution="$(memory_attribution_for_profiler "${profiler}")"
+  profile_memory_breakdown="$(memory_breakdown_for_profiler "${profiler}")"
+  case "${backend}" in
+    kt_torchbf16) kt_backend=TORCHBF16 ;;
+    kt_armbf16) kt_backend=ARMBF16 ;;
+  esac
 
   plot_roots["${config_root}"]="${seq_len}"
+  if [[ "${profile_memory_breakdown}" == "true" ]]; then
+    memory_plot_roots["${config_root}"]="${seq_len}"
+  fi
+  if [[ "${profiler}" == "nsys" ]]; then
+    interconnect_plot_roots["${config_root}"]="${seq_len}"
+  fi
   if [[ -z "${compare_groups[${group_key}]+set}" ]]; then
     compare_groups["${group_key}"]=1
     compare_group_keys+=("${group_key}")
     compare_group_config_roots["${group_key}"]="${config_root}"
-    compare_group_labels["${group_key}"]="profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} seq_len=${seq_len}"
+    compare_group_labels["${group_key}"]="dropout=${LORA_DROPOUT} profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} seq_len=${seq_len}"
   fi
 
   if [[ "${DRY_RUN}" != "true" && -e "${profile_json}" && "${OVERWRITE}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
@@ -871,11 +1090,13 @@ run_job() {
     return 1
   fi
 
-  local -a run_env=(
-    ROOT="${ROOT}"
-    LF_DIR="${LF_DIR}"
-    ASYM_DIR="${ASYM_DIR}"
-    BACKENDS=
+	  local -a run_env=(
+	    ROOT="${ROOT}"
+	    LF_DIR="${LF_DIR}"
+	    ASYM_DIR="${ASYM_DIR}"
+	    KT_TOOLS_DIR="${KT_TOOLS_DIR}"
+	    KT_KERNEL_DIR="${KT_KERNEL_DIR}"
+	    BACKENDS=
     ENV_DIR="${ENV_DIR}"
     CONDA_EXE="${CONDA_EXE}"
     NSYS_BIN="${NSYS_BIN}"
@@ -895,24 +1116,42 @@ run_job() {
     PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE}"
     GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS}"
     LEARNING_RATE="${LEARNING_RATE}"
-    LORA_RANK="${LORA_RANK}"
-    LORA_ALPHA="${LORA_ALPHA}"
-    LORA_DROPOUT="${LORA_DROPOUT}"
-    GRADIENT_CHECKPOINTING="${gradient_checkpointing}"
-    ASYM_PRECISION="${PRECISION}"
-    ASYM_OFFLOAD_MODULES="${ASYM_OFFLOAD_MODULES}"
+	    LORA_RANK="${LORA_RANK}"
+	    LORA_ALPHA="${LORA_ALPHA}"
+	    LORA_DROPOUT="${LORA_DROPOUT}"
+	    SEED="${SEED}"
+	    GRADIENT_CHECKPOINTING="${gradient_checkpointing}"
+	    ASYM_PRECISION="${PRECISION}"
+	    KT_PRECISION="${PRECISION}"
+	    KT_BACKEND="${kt_backend}"
+	    KT_NUM_THREADS="${KT_NUM_THREADS}"
+	    KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT}"
+	    KT_MAX_CACHE_DEPTH="${KT_MAX_CACHE_DEPTH}"
+	    KT_TP_ENABLED="${KT_TP_ENABLED}"
+	    KT_TORCHBF16_SFT_DEVICE="${KT_TORCHBF16_SFT_DEVICE}"
+	    KT_ARM_OMP_NUM_THREADS="${KT_ARM_OMP_NUM_THREADS}"
+	    KT_ARM_OMP_PROC_BIND="${KT_ARM_OMP_PROC_BIND}"
+	    KT_ARM_OMP_PLACES="${KT_ARM_OMP_PLACES}"
+	    CHECK_KT_CALLS="${CHECK_KT_CALLS}"
+	    ASYM_OFFLOAD_MODULES="${ASYM_OFFLOAD_MODULES}"
     ASYM_EXPERT_RECOMPUTE_POLICY="${expert_policy}"
     ASYM_STRICT="${ASYM_STRICT}"
+    TORCH_USE_ASYM_GEMM_LORA="${TORCH_USE_ASYM_GEMM_LORA}"
     PROFILE=1
     PROFILE_PROFILER="${profiler}"
     PROFILE_LEVEL="${PROFILE_LEVEL}"
     PROFILE_LAYERS="${PROFILE_LAYERS}"
-    PROFILE_MEMORY_ATTRIBUTION="${PROFILE_MEMORY_ATTRIBUTION}"
+    PROFILE_MEMORY_ATTRIBUTION="${profile_memory_attribution}"
+    PROFILE_MEMORY_BREAKDOWN="${profile_memory_breakdown}"
+    PROFILE_MEMORY_BREAKDOWN_INTERVAL="${PROFILE_MEMORY_BREAKDOWN_INTERVAL}"
+    PROFILE_MEMORY_BREAKDOWN_STEPS="${PROFILE_MEMORY_BREAKDOWN_STEPS}"
+    PROFILE_MEMORY_BREAKDOWN_MODULES="${PROFILE_MEMORY_BREAKDOWN_MODULES}"
     PROFILE_SYNC="${PROFILE_SYNC}"
     PROFILE_MODULE_FILTER="${PROFILE_MODULE_FILTER}"
     PROFILE_SOURCE_JSON="${source_profile}"
     PROFILE_NSYS_PREFIX="${seq_root}/trace"
     PROFILE_NSYS_SQLITE="${seq_root}/trace.sqlite"
+    PROFILE_NSYS_GPU_METRICS_DEVICES="${gpu}"
     PROFILE_JSON="${profile_json}"
     PROFILE_OUTPUT_DIR="${seq_root}"
     PROFILE_SUMMARY_MD="${seq_root}/summary.md"
@@ -933,7 +1172,7 @@ run_job() {
 
   local -a run_cmd=(env "${run_env[@]}" "${RUN_LF_SCRIPT}")
 
-  echo "Running backend=${backend} profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} seq=${seq_len} gpu=${gpu} num_gpus=${gpu_count}"
+  echo "Running backend=${backend} profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} seq=${seq_len} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
   echo "  dir=${seq_root}"
   if [[ "${DRY_RUN}" == "true" ]]; then
     print_command "${run_cmd[@]}"
@@ -967,8 +1206,14 @@ run_job() {
     run_dirs["${group_key}|${backend}"]="${lf_out}"
     append_job_record "${config_root}" ok \
       "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
-    plot_single_run "${config_root}" "${seq_len}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${seq_root}"
-    plot_running_combined "${config_root}" "${seq_len}" "${seq_root}"
+    if profiler_selected_for_plots "${profiler}"; then
+      plot_single_run "${config_root}" "${seq_len}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${seq_root}"
+      plot_running_combined "${config_root}" "${seq_len}" "${seq_root}"
+    fi
+    if [[ "${profile_memory_breakdown}" == "true" ]]; then
+      plot_memory_single_run "${seq_root}"
+      plot_memory_running_combined "${config_root}" "${seq_len}" "${seq_root}"
+    fi
   else
     append_job_record "${config_root}" "failed:${status}" \
       "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
@@ -994,24 +1239,23 @@ compare_config_root() {
     return 0
   fi
 
+  compare_dir="${target_config_root}/comparisons"
+  compare_tsv="${compare_dir}/loss_compare.tsv"
+  mkdir -p "${compare_dir}"
+  printf 'status\tbaseline_backend\tcandidate_backend\tbaseline_dir\tcandidate_dir\tlog\tlabel\n' > "${compare_tsv}"
+
   for group_key in "${compare_group_keys[@]}"; do
     config_root="${compare_group_config_roots[${group_key}]}"
     [[ "${config_root}" == "${target_config_root}" ]] || continue
     group_tail="${group_key%|*}"
     group_expert_policy="${group_tail##*|}"
-    if [[ "${group_expert_policy}" != "none" && ( "${compare_baseline_backend}" == torch* || "${compare_candidate_backend}" == torch* ) ]]; then
-      echo "Skipping loss comparison for ${compare_group_labels[${group_key}]}; torch baseline is policy-independent."
+	    if [[ "${group_expert_policy}" != "none" && ( "${compare_baseline_backend}" == torch* || "${compare_candidate_backend}" == torch* || "${compare_baseline_backend}" == kt_* || "${compare_candidate_backend}" == kt_* ) ]]; then
+	      echo "Skipping loss comparison for ${compare_group_labels[${group_key}]}; torch/KT backends are policy-independent."
       continue
     fi
     baseline_dir="${run_dirs[${group_key}|${compare_baseline_backend}]-}"
     candidate_dir="${run_dirs[${group_key}|${compare_candidate_backend}]-}"
-    compare_dir="${config_root}/comparisons"
-    compare_tsv="${compare_dir}/loss_compare.tsv"
     compare_log="${compare_dir}/$(safe_label "${compare_group_labels[${group_key}]} ${compare_baseline_backend} vs ${compare_candidate_backend}").log"
-    mkdir -p "${compare_dir}"
-    if [[ ! -e "${compare_tsv}" ]]; then
-      printf 'status\tbaseline_backend\tcandidate_backend\tbaseline_dir\tcandidate_dir\tlog\tlabel\n' > "${compare_tsv}"
-    fi
 
     if [[ -z "${baseline_dir}" || -z "${candidate_dir}" ]]; then
       echo "Missing loss comparison input for ${compare_group_labels[${group_key}]}" | tee "${compare_log}"
@@ -1057,15 +1301,17 @@ plot_config_root() {
   local seq_len="$2"
   local plot_root
   [[ "${PLOT}" == "true" ]] || return 0
+  ((${#plot_profilers[@]})) || return 0
 
-  plot_root="${config_root}/plots"
-  [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")"
+  plot_root="${config_root}/combined"
+  [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")/combined"
   local -a plot_cmd
   plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${plot_root}" "${seq_len}"
   plot_cmd+=(--expert-recompute-policies "${expert_policies[@]}")
   append_sweep_plot_filters plot_cmd
-  echo "Writing LF profile plots: ${plot_root}"
+  echo "Writing LF config combined plots: ${plot_root}"
   run_tracked_command "${plot_cmd[@]}"
+  cleanup_legacy_config_plot_root "${config_root}"
 }
 
 plot_running_combined() {
@@ -1074,6 +1320,7 @@ plot_running_combined() {
   local seq_root="$3"
   local plot_root
   [[ "${PLOT}" == "true" ]] || return 0
+  ((${#plot_profilers[@]})) || return 0
 
   plot_root="${seq_root}/plots/_combined"
   local -a plot_cmd
@@ -1096,6 +1343,7 @@ plot_single_run() {
   local seq_root="$7"
   local plot_root
   [[ "${PLOT}" == "true" ]] || return 0
+  ((${#plot_profilers[@]})) || return 0
 
   plot_root="${seq_root}/plots"
   local -a plot_cmd
@@ -1110,6 +1358,175 @@ plot_single_run() {
   echo "Writing LF per-run plots: ${plot_root}"
   if ! run_tracked_command "${plot_cmd[@]}"; then
     echo "warning: failed to write per-run plots for ${seq_root}" >&2
+  fi
+}
+
+memory_plot_filters() {
+  local -n cmd_ref="$1"
+  local backend
+  for backend in "${backends[@]}"; do cmd_ref+=(--backend "${backend}"); done
+  cmd_ref+=(--profiler source)
+}
+
+plot_memory_single_run() {
+  local seq_root="$1"
+  local plot_root
+  [[ "${PLOT}" == "true" && "${PLOT_MEMORY_BREAKDOWN}" == "true" ]] || return 0
+
+  plot_root="${seq_root}/memory_plots"
+  local -a plot_cmd=(
+    "${CONDA_EXE}" run -p "${ENV_DIR}" python "${MEMORY_PLOT_SCRIPT}"
+    --run-dir "${seq_root}"
+    --output-dir "${plot_root}"
+    --clean-output
+    --y-scale "${MEMORY_BREAKDOWN_PLOT_Y_SCALE}"
+  )
+  echo "Writing LF source memory plots: ${plot_root}"
+  if ! run_tracked_command "${plot_cmd[@]}"; then
+    echo "warning: failed to write source memory plots for ${seq_root}" >&2
+  fi
+}
+
+plot_memory_running_combined() {
+  local config_root="$1"
+  local seq_len="$2"
+  local seq_root="$3"
+  local plot_root
+  [[ "${PLOT}" == "true" && "${PLOT_MEMORY_BREAKDOWN}" == "true" ]] || return 0
+
+  plot_root="${seq_root}/memory_plots/_combined"
+  local -a plot_cmd=(
+    "${CONDA_EXE}" run -p "${ENV_DIR}" python "${MEMORY_PLOT_SCRIPT}"
+    --input-root "${config_root}"
+    --output-dir "${plot_root}"
+    --clean-output
+    --combined-only
+    --y-scale "${MEMORY_BREAKDOWN_PLOT_Y_SCALE}"
+    --seq-lens "${seq_len}"
+    --expert-recompute-policies "${expert_policies[@]}"
+  )
+  memory_plot_filters plot_cmd
+  echo "Writing LF running source-memory combined plots: ${plot_root}"
+  if ! run_tracked_command "${plot_cmd[@]}"; then
+    echo "warning: failed to write running source-memory combined plots for ${seq_root}" >&2
+  fi
+}
+
+plot_memory_config_root() {
+  local config_root="$1"
+  local seq_len="$2"
+  local plot_root
+  [[ "${PLOT}" == "true" && "${PLOT_MEMORY_BREAKDOWN}" == "true" ]] || return 0
+
+  plot_root="${config_root}/memory_combined"
+  [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")/memory_combined"
+  local -a plot_cmd=(
+    "${CONDA_EXE}" run -p "${ENV_DIR}" python "${MEMORY_PLOT_SCRIPT}"
+    --input-root "${config_root}"
+    --output-dir "${plot_root}"
+    --clean-output
+    --combined-only
+    --y-scale "${MEMORY_BREAKDOWN_PLOT_Y_SCALE}"
+    --seq-lens "${seq_len}"
+    --expert-recompute-policies "${expert_policies[@]}"
+  )
+  memory_plot_filters plot_cmd
+  echo "Writing LF source-memory combined plots: ${plot_root}"
+  if ! run_tracked_command "${plot_cmd[@]}"; then
+    echo "warning: failed to write source-memory combined plots for ${config_root}" >&2
+  fi
+}
+
+cleanup_legacy_config_plot_root() {
+  local config_root="$1"
+  local legacy_root="${config_root}/plots"
+  [[ -d "${legacy_root}" ]] || return 0
+  echo "Removing legacy config-level plot folder: ${legacy_root}"
+  rm -rf -- "${legacy_root}"
+}
+
+write_missing_combined_readme() {
+  local output_dir="$1"
+  local title="$2"
+  local reason="$3"
+  mkdir -p "${output_dir}"
+  cat > "${output_dir}/README.md" <<EOF
+# ${title}
+
+No plots were generated here.
+
+${reason}
+EOF
+}
+
+write_config_artifact_readme() {
+  local config_root="$1"
+  mkdir -p "${config_root}"
+  cat > "${config_root}/ARTIFACTS.md" <<EOF
+# LF Profiling Artifacts
+
+This config root is organized as follows:
+
+- \`combined/\`: config-level LF timing and allocator-summary plots from \`profile.json\`.
+- \`memory_combined/\`: config-level source-memory breakdown plots. If no source-memory rows were collected, this folder contains a README explaining why.
+- \`c2c_combined/\`: config-level C2C/CTC saturation plots from Nsight GPU metrics. If old traces lack GPU metrics, this folder contains a README explaining why.
+- \`comparisons/\`: loss comparison artifacts, when loss comparison is enabled.
+- \`<backend>__<profiler>__<recompute>__pol<policy>/s<seq>/\`: per-run artifacts.
+
+If \`PLOT_OUTPUT_DIR\` is set, combined plot folders are written under that external plot output root instead of this config root.
+
+Per-run nsys folders contain \`profile.json\`, markdown summaries, \`plots/\` for per-run LF plots, and \`interconnect_ctc_*.png/csv\` when C2C GPU metrics are available.
+EOF
+}
+
+write_precision_artifact_readme() {
+  local precision_root="$1"
+  mkdir -p "${precision_root}"
+  cat > "${precision_root}/ARTIFACTS.md" <<EOF
+# LF Profiling Precision Root
+
+This precision root is organized as follows:
+
+- \`combined/\`: global LF timing and allocator-summary plots across config roots.
+- \`memory_combined/\`: global source-memory breakdown plots across config roots. If no source-memory rows were collected, this folder contains a README explaining why.
+- \`c2c_combined/\`: global C2C/CTC saturation plots across config roots. If old traces lack Nsight GPU metrics, this folder contains a README explaining why.
+- \`<config_root>/\`: one workload/configuration root. Each config root has its own \`combined/\`, \`memory_combined/\`, \`c2c_combined/\`, optional \`comparisons/\`, and per-run backend/profiler folders.
+
+If \`PLOT_OUTPUT_DIR\` is set, global combined plot folders are written under that external plot output root instead of this precision root.
+
+Fresh nsys runs collect C2C GPU metrics at 100 Hz. Existing traces created without Nsight \`GPU_METRICS\` tables cannot be converted into C2C saturation plots.
+EOF
+}
+
+interconnect_plot_filters() {
+  local -n cmd_ref="$1"
+  local backend recompute
+  for backend in "${backends[@]}"; do cmd_ref+=(--backend "${backend}"); done
+  cmd_ref+=(--profiler nsys)
+  for recompute in "${recompute_modes[@]}"; do cmd_ref+=(--recompute "${recompute}"); done
+}
+
+plot_interconnect_config_root() {
+  local config_root="$1"
+  local seq_len="$2"
+  local plot_root
+  [[ "${PLOT}" == "true" ]] || return 0
+
+  plot_root="${config_root}/c2c_combined"
+  [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")/c2c_combined"
+  local -a plot_cmd=(
+    "${CONDA_EXE}" run -p "${ENV_DIR}" python "${INTERCONNECT_PLOT_SCRIPT}"
+    --input-root "${config_root}"
+    --output-dir "${plot_root}"
+    --clean-output
+    --combined-only
+    --seq-lens "${seq_len}"
+    --expert-recompute-policies "${expert_policies[@]}"
+  )
+  interconnect_plot_filters plot_cmd
+  echo "Writing LF C2C combined plots: ${plot_root}"
+  if ! run_tracked_command "${plot_cmd[@]}"; then
+    echo "warning: failed to write C2C combined plots for ${config_root}" >&2
   fi
 }
 
@@ -1139,35 +1556,58 @@ for model_spec_entry in "${model_specs[@]}"; do
         fi
       fi
     fi
-    config_root="$(config_root_path "${seq_len}")"
-    for expert_policy in "${expert_policies[@]}"; do
-      for backend_recompute in "${backend_specs[@]}"; do
-        backend="${backend_recompute%%|*}"
-        recompute="${backend_recompute##*|}"
-        for profiler in "${profilers[@]}"; do
-          if [[ "${recompute}" == "recomp" && "${expert_policy}" != "none" ]]; then
-            echo "Skipping backend=${backend} expert_policy=${expert_policy} recompute=recomp; LF gradient checkpointing is only swept for expert_policy=none."
-            continue
-          fi
-          if [[ "${backend}" == torch* && "${expert_policy}" != "none" ]]; then
-            echo "Skipping backend=${backend} expert_policy=${expert_policy}; torch baseline is policy-independent."
-            continue
-          fi
-          gpu_count="$(backend_gpu_count "${backend}" "${current_model_gpu_count}")"
-          gpu="$(gpu_slice "${gpu_count}")"
-          if ! run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${current_dataset}"; then
-            failures=$((failures + 1))
-            if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
-              exit 1
+    for lora_dropout in "${lora_dropouts[@]}"; do
+      LORA_DROPOUT="${lora_dropout}"
+      lora_dropout_label_value="$(lora_dropout_label "${LORA_DROPOUT}")"
+      config_root="$(config_root_path "${seq_len}")"
+      for expert_policy in "${expert_policies[@]}"; do
+        for backend_recompute in "${backend_specs[@]}"; do
+          backend="${backend_recompute%%|*}"
+          recompute="${backend_recompute##*|}"
+          for profiler in "${profilers[@]}"; do
+	            if [[ ( "${backend}" == torch* || "${backend}" == kt_* ) && "${expert_policy}" != "none" ]]; then
+	              echo "Skipping backend=${backend} expert_policy=${expert_policy}; torch/KT backends are policy-independent."
+              continue
             fi
-          fi
+            gpu_count="$(backend_gpu_count "${backend}" "${current_model_gpu_count}")"
+            gpu="$(gpu_slice "${gpu_count}")"
+            if ! run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${current_dataset}"; then
+              failures=$((failures + 1))
+              if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
+                exit 1
+              fi
+            fi
+          done
         done
       done
+      if [[ "${DRY_RUN}" != "true" ]]; then
+        compare_config_root "${config_root}"
+        plot_config_root "${config_root}" "${seq_len}"
+        if [[ -z "${PLOT_OUTPUT_DIR}" && ! -d "${config_root}/combined" ]]; then
+          write_missing_combined_readme \
+            "${config_root}/combined" \
+            "LF Config Combined Artifacts" \
+            "No config-level LF timing plots were generated for this config. This can happen when plotting is disabled or no matching profile rows are available."
+        fi
+        if [[ -n "${memory_plot_roots[${config_root}]+set}" ]]; then
+          plot_memory_config_root "${config_root}" "${seq_len}"
+        else
+          write_missing_combined_readme \
+            "${config_root}/memory_combined" \
+            "LF Source Memory Combined Artifacts" \
+            "No source-memory breakdown rows were collected for this config. Include the source profiler in PROFILERS, or set PROFILE_MEMORY_BREAKDOWN=true for a run where source-memory hook overhead is acceptable."
+        fi
+        if [[ -n "${interconnect_plot_roots[${config_root}]+set}" ]]; then
+          plot_interconnect_config_root "${config_root}" "${seq_len}"
+        else
+          write_missing_combined_readme \
+            "${config_root}/c2c_combined" \
+            "LF C2C / CTC Combined Artifacts" \
+            "No nsys profiler run was selected for this config, so no Nsight C2C/CTC GPU metric samples can be summarized."
+        fi
+        write_config_artifact_readme "${config_root}"
+      fi
     done
-    if [[ "${DRY_RUN}" != "true" ]]; then
-      compare_config_root "${config_root}"
-      plot_config_root "${config_root}" "${seq_len}"
-    fi
   done
 done
 
@@ -1184,11 +1624,14 @@ if [[ "${DRY_RUN}" == "true" ]]; then
 fi
 
 if [[ "${PLOT}" == "true" ]]; then
+  if ((${#plot_profilers[@]})); then
   combined_plot_root="${precision_root}/combined"
   [[ -n "${PLOT_OUTPUT_DIR}" ]] && combined_plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/combined"
   declare -A combined_workloads=()
+  declare -A combined_workload_bases=()
   for config_root in "${!plot_roots[@]}"; do
     combined_workloads["$(plot_workload_from_config_root "${config_root}")"]=1
+    combined_workload_bases["$(plot_workload_base_from_config_root "${config_root}")"]=1
   done
   combined_plot_cmd=(
     "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PLOT_SCRIPT}"
@@ -1204,10 +1647,139 @@ if [[ "${PLOT}" == "true" ]]; then
   )
   for workload in "${!combined_workloads[@]}"; do combined_plot_cmd+=(--workload "${workload}"); done
   for backend in "${backends[@]}"; do combined_plot_cmd+=(--backend "${backend}"); done
-  for profiler in "${profilers[@]}"; do combined_plot_cmd+=(--profiler "${profiler}"); done
+  for profiler in "${plot_profilers[@]}"; do combined_plot_cmd+=(--profiler "${profiler}"); done
   for recompute in "${recompute_modes[@]}"; do combined_plot_cmd+=(--recompute "${recompute}"); done
   echo "Writing combined LF profile plots: ${combined_plot_root}"
   run_tracked_command "${combined_plot_cmd[@]}"
+
+  for workload_base in "${!combined_workload_bases[@]}"; do
+    model_combined_plot_root="${combined_plot_root}/$(safe_label "${workload_base}")"
+    model_combined_plot_cmd=(
+      "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PLOT_SCRIPT}"
+      --input-root "${precision_root}"
+      --output-dir "${model_combined_plot_root}"
+      --combined-output-dir "${model_combined_plot_root}"
+      --precision "${PRECISION}"
+      --clean-output
+      --combined-only
+      --batch-size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
+      --seq-lens "${seq_lens[@]}"
+      --expert-recompute-policies "${expert_policies[@]}"
+      --workload "${workload_base}"
+    )
+    for backend in "${backends[@]}"; do model_combined_plot_cmd+=(--backend "${backend}"); done
+    for profiler in "${plot_profilers[@]}"; do model_combined_plot_cmd+=(--profiler "${profiler}"); done
+    for recompute in "${recompute_modes[@]}"; do model_combined_plot_cmd+=(--recompute "${recompute}"); done
+    echo "Writing model-split combined LF profile plots: ${model_combined_plot_root}"
+    run_tracked_command "${model_combined_plot_cmd[@]}"
+  done
+  elif [[ -z "${PLOT_OUTPUT_DIR}" ]]; then
+    combined_plot_root="${precision_root}/combined"
+    write_missing_combined_readme \
+      "${combined_plot_root}" \
+      "LF Global Combined Artifacts" \
+      "No global LF timing plots were generated. This can happen when plotting is disabled or no matching profile rows are available."
+  fi
+
+  if [[ "${PLOT_MEMORY_BREAKDOWN}" == "true" && "${#memory_plot_roots[@]}" -gt 0 ]]; then
+    combined_memory_plot_root="${precision_root}/memory_combined"
+    [[ -n "${PLOT_OUTPUT_DIR}" ]] && combined_memory_plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/memory_combined"
+    declare -A memory_combined_workload_bases=()
+    for config_root in "${!memory_plot_roots[@]}"; do
+      memory_combined_workload_bases["$(plot_workload_base_from_config_root "${config_root}")"]=1
+    done
+    combined_memory_plot_cmd=(
+      "${CONDA_EXE}" run -p "${ENV_DIR}" python "${MEMORY_PLOT_SCRIPT}"
+      --input-root "${precision_root}"
+      --output-dir "${combined_memory_plot_root}"
+      --clean-output
+      --combined-only
+      --y-scale "${MEMORY_BREAKDOWN_PLOT_Y_SCALE}"
+      --seq-lens "${seq_lens[@]}"
+      --expert-recompute-policies "${expert_policies[@]}"
+    )
+    memory_plot_filters combined_memory_plot_cmd
+    echo "Writing combined LF source-memory plots: ${combined_memory_plot_root}"
+    run_tracked_command "${combined_memory_plot_cmd[@]}"
+
+    for workload_base in "${!memory_combined_workload_bases[@]}"; do
+      model_memory_plot_root="${combined_memory_plot_root}/$(safe_label "${workload_base}")"
+      model_memory_plot_cmd=(
+        "${CONDA_EXE}" run -p "${ENV_DIR}" python "${MEMORY_PLOT_SCRIPT}"
+        --input-root "${precision_root}"
+        --output-dir "${model_memory_plot_root}"
+        --clean-output
+        --combined-only
+        --y-scale "${MEMORY_BREAKDOWN_PLOT_Y_SCALE}"
+        --seq-lens "${seq_lens[@]}"
+        --expert-recompute-policies "${expert_policies[@]}"
+        --workload "${workload_base}"
+      )
+      memory_plot_filters model_memory_plot_cmd
+      echo "Writing model-split combined LF source-memory plots: ${model_memory_plot_root}"
+      run_tracked_command "${model_memory_plot_cmd[@]}"
+    done
+  elif [[ "${PLOT_MEMORY_BREAKDOWN}" == "true" ]]; then
+    combined_memory_plot_root="${precision_root}/memory_combined"
+    [[ -n "${PLOT_OUTPUT_DIR}" ]] && combined_memory_plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/memory_combined"
+    write_missing_combined_readme \
+      "${combined_memory_plot_root}" \
+      "LF Source Memory Combined Artifacts" \
+      "No source-memory breakdown rows were collected in this sweep. Include the source profiler in PROFILERS, or set PROFILE_MEMORY_BREAKDOWN=true for a run where source-memory hook overhead is acceptable."
+  fi
+
+  if [[ "${#interconnect_plot_roots[@]}" -gt 0 ]]; then
+    combined_interconnect_plot_root="${precision_root}/c2c_combined"
+    [[ -n "${PLOT_OUTPUT_DIR}" ]] && combined_interconnect_plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/c2c_combined"
+    declare -A interconnect_combined_workload_bases=()
+    for config_root in "${!interconnect_plot_roots[@]}"; do
+      interconnect_combined_workload_bases["$(plot_workload_base_from_config_root "${config_root}")"]=1
+    done
+    combined_interconnect_plot_cmd=(
+      "${CONDA_EXE}" run -p "${ENV_DIR}" python "${INTERCONNECT_PLOT_SCRIPT}"
+      --input-root "${precision_root}"
+      --output-dir "${combined_interconnect_plot_root}"
+      --clean-output
+      --combined-only
+      --seq-lens "${seq_lens[@]}"
+      --expert-recompute-policies "${expert_policies[@]}"
+    )
+    interconnect_plot_filters combined_interconnect_plot_cmd
+    echo "Writing combined LF C2C plots: ${combined_interconnect_plot_root}"
+    if ! run_tracked_command "${combined_interconnect_plot_cmd[@]}"; then
+      echo "warning: failed to write combined LF C2C plots" >&2
+    fi
+
+    for workload_base in "${!interconnect_combined_workload_bases[@]}"; do
+      model_interconnect_plot_root="${combined_interconnect_plot_root}/$(safe_label "${workload_base}")"
+      model_interconnect_plot_cmd=(
+        "${CONDA_EXE}" run -p "${ENV_DIR}" python "${INTERCONNECT_PLOT_SCRIPT}"
+        --input-root "${precision_root}"
+        --output-dir "${model_interconnect_plot_root}"
+        --clean-output
+        --combined-only
+        --seq-lens "${seq_lens[@]}"
+        --expert-recompute-policies "${expert_policies[@]}"
+        --workload "${workload_base}"
+      )
+      interconnect_plot_filters model_interconnect_plot_cmd
+      echo "Writing model-split combined LF C2C plots: ${model_interconnect_plot_root}"
+      if ! run_tracked_command "${model_interconnect_plot_cmd[@]}"; then
+        echo "warning: failed to write model-split combined LF C2C plots for ${workload_base}" >&2
+      fi
+    done
+  else
+    combined_interconnect_plot_root="${precision_root}/c2c_combined"
+    [[ -n "${PLOT_OUTPUT_DIR}" ]] && combined_interconnect_plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/c2c_combined"
+    write_missing_combined_readme \
+      "${combined_interconnect_plot_root}" \
+      "LF C2C / CTC Combined Artifacts" \
+      "No nsys profiler runs were selected in this sweep, so no Nsight C2C/CTC GPU metric samples can be summarized."
+  fi
+fi
+
+if [[ "${DRY_RUN}" != "true" ]]; then
+  write_precision_artifact_readme "${precision_root}"
 fi
 
 echo "LF profiling completed. Results: ${precision_root}"

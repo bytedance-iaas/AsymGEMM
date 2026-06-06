@@ -30,6 +30,21 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+_INTERCONNECT_METRICS = {
+    "CTC RX Throughput [Throughput %]": {"key": "ctc_rx", "label": "CTC RX", "family": "ctc"},
+    "CTC TX Throughput [Throughput %]": {"key": "ctc_tx", "label": "CTC TX", "family": "ctc"},
+    "NVLink RX Requests User Data [Throughput %]": {"key": "nvlink_rx_requests_user", "label": "NVLink RX requests user", "family": "nvlink"},
+    "NVLink RX Requests Protocol Data [Throughput %]": {"key": "nvlink_rx_requests_protocol", "label": "NVLink RX requests protocol", "family": "nvlink"},
+    "NVLink RX Responses User Data [Throughput %]": {"key": "nvlink_rx_responses_user", "label": "NVLink RX responses user", "family": "nvlink"},
+    "NVLink RX Responses Protocol Data [Throughput %]": {"key": "nvlink_rx_responses_protocol", "label": "NVLink RX responses protocol", "family": "nvlink"},
+    "NVLink TX Requests User Data [Throughput %]": {"key": "nvlink_tx_requests_user", "label": "NVLink TX requests user", "family": "nvlink"},
+    "NVLink TX Requests Protocol Data [Throughput %]": {"key": "nvlink_tx_requests_protocol", "label": "NVLink TX requests protocol", "family": "nvlink"},
+    "NVLink TX Responses User Data [Throughput %]": {"key": "nvlink_tx_responses_user", "label": "NVLink TX responses user", "family": "nvlink"},
+    "NVLink TX Responses Protocol Data [Throughput %]": {"key": "nvlink_tx_responses_protocol", "label": "NVLink TX responses protocol", "family": "nvlink"},
+}
+_CTC_METRIC_KEYS = {"ctc_rx", "ctc_tx"}
+
+
 def _table_exists(con: sqlite3.Connection, name: str) -> bool:
     return con.execute("select 1 from sqlite_master where type='table' and name=?", (name,)).fetchone() is not None
 
@@ -47,6 +62,8 @@ def _prepare_sqlite_for_profile_queries(con: sqlite3.Connection) -> None:
         ("CUPTI_ACTIVITY_KIND_KERNEL", "idx_asym_kernel_start_end", "start,end"),
         ("CUPTI_ACTIVITY_KIND_MEMCPY", "idx_asym_memcpy_corr", "correlationId"),
         ("CUPTI_ACTIVITY_KIND_SYNCHRONIZATION", "idx_asym_sync_start_end", "start,end"),
+        ("GPU_METRICS", "idx_asym_gpu_metrics_type_metric_time", "typeId,metricId,timestamp"),
+        ("TARGET_INFO_GPU_METRICS", "idx_asym_target_gpu_metrics_name", "metricName,typeId,metricId"),
     ]
     for table, index_name, columns in index_specs:
         if _table_exists(con, table):
@@ -215,8 +232,7 @@ def _display_operation_name(name: str) -> str:
         "grouped_base_dx_torch": "grouped base dX torch",
         "routed_expert": "routed MoE",
         "shared_expert": "shared MoE",
-        "gate_base": "gate base",
-        "up_base": "up base",
+        "gate_up_base": "gate/up base",
         "down_base": "down base",
         "gate_proj": "gate proj",
         "up_proj": "up proj",
@@ -387,9 +403,9 @@ def _projection_scope(op: str) -> str:
         return "gate+up "
     if "gate_up_lora" in op:
         return "gate/up "
-    if "gate_base" in op or "gate.base" in op or "gate_lora" in op or "gate.lora" in op or "gate_proj" in op:
+    if "gate_lora" in op or "gate.lora" in op or "gate_proj" in op:
         return "gate "
-    if "up_base" in op or "up.base" in op or "up_lora" in op or "up.lora" in op or "up_proj" in op:
+    if "up_lora" in op or "up.lora" in op or "up_proj" in op:
         return "up "
     if "down_base" in op or "down.base" in op or "down_lora" in op or "down.lora" in op or "down_proj" in op:
         return "down "
@@ -1343,6 +1359,219 @@ def summarize_step_samples(con: sqlite3.Connection, source_profile: dict[str, An
     }
 
 
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * percentile / 100.0
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _metric_stats(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {
+            "samples": 0,
+            "avg_percent": 0.0,
+            "p50_percent": 0.0,
+            "p95_percent": 0.0,
+            "max_percent": 0.0,
+        }
+    return {
+        "samples": len(values),
+        "avg_percent": sum(values) / len(values),
+        "p50_percent": _percentile(values, 50.0),
+        "p95_percent": _percentile(values, 95.0),
+        "max_percent": max(values),
+    }
+
+
+def _interconnect_samples(con: sqlite3.Connection) -> tuple[list[dict[str, Any]], str | None]:
+    required_tables = ("GPU_METRICS", "TARGET_INFO_GPU_METRICS")
+    missing = [table for table in required_tables if not _table_exists(con, table)]
+    if missing:
+        return [], f"missing Nsight GPU metric table(s): {', '.join(missing)}"
+
+    metric_names = tuple(_INTERCONNECT_METRICS.keys())
+    placeholders = ",".join("?" for _ in metric_names)
+    has_gpu_info = _table_exists(con, "TARGET_INFO_GPU")
+    if has_gpu_info:
+        query = f"""
+            select m.timestamp, m.typeId, m.metricId, i.metricName, m.value,
+                   g.name, g.busLocation
+            from GPU_METRICS m
+            join TARGET_INFO_GPU_METRICS i
+              on m.typeId = i.typeId and m.metricId = i.metricId
+            left join TARGET_INFO_GPU g
+              on g.id = (m.typeId & 255)
+            where i.metricName in ({placeholders})
+            order by m.timestamp, m.typeId, m.metricId
+        """
+    else:
+        query = f"""
+            select m.timestamp, m.typeId, m.metricId, i.metricName, m.value,
+                   '' as name, '' as busLocation
+            from GPU_METRICS m
+            join TARGET_INFO_GPU_METRICS i
+              on m.typeId = i.typeId and m.metricId = i.metricId
+            where i.metricName in ({placeholders})
+            order by m.timestamp, m.typeId, m.metricId
+        """
+
+    rows: list[dict[str, Any]] = []
+    for timestamp, type_id, metric_id, metric_name, value, gpu_name, bus_location in con.execute(query, metric_names):
+        metric_info = _INTERCONNECT_METRICS.get(str(metric_name))
+        if metric_info is None:
+            continue
+        gpu_id = int(type_id) & 255
+        rows.append(
+            {
+                "timestamp_ns": int(timestamp),
+                "timestamp_ms": _ms(int(timestamp)),
+                "gpu_id": gpu_id,
+                "gpu": f"{bus_location} - {gpu_name}".strip(" -") if gpu_name or bus_location else str(gpu_id),
+                "metric_id": int(metric_id),
+                "metric_key": metric_info["key"],
+                "metric_name": metric_info["label"],
+                "metric_family": metric_info["family"],
+                "raw_metric_name": str(metric_name),
+                "value_percent": float(value),
+            }
+        )
+    if not rows:
+        return [], "no CTC/NVLink GPU metric samples found"
+    return rows, None
+
+
+def _interconnect_ranges(con: sqlite3.Connection) -> list[dict[str, Any]]:
+    if not _table_exists(con, "NVTX_EVENTS"):
+        return []
+    forward_ranges = _all_steps(con, "step.forward")
+    backward_ranges = _all_steps(con, "step.backward")
+    ranges: list[dict[str, Any]] = []
+    sample_count = max(len(forward_ranges), len(backward_ranges))
+    for index in range(sample_count):
+        step = index + 1
+        step_starts: list[int] = []
+        step_ends: list[int] = []
+        if index < len(forward_ranges):
+            start, end = forward_ranges[index]
+            ranges.append({"scope": "phase", "phase": "forward", "step": step, "start_ns": start, "end_ns": end})
+            step_starts.append(start)
+            step_ends.append(end)
+        if index < len(backward_ranges):
+            start, end = backward_ranges[index]
+            ranges.append({"scope": "phase", "phase": "backward", "step": step, "start_ns": start, "end_ns": end})
+            step_starts.append(start)
+            step_ends.append(end)
+        if step_starts and step_ends:
+            ranges.append({"scope": "step", "phase": "step", "step": step, "start_ns": min(step_starts), "end_ns": max(step_ends)})
+    return ranges
+
+
+def _interconnect_summary_rows(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[int, str], list[float]] = defaultdict(list)
+    metadata: dict[tuple[int, str], dict[str, Any]] = {}
+    for sample in samples:
+        key = (int(sample["gpu_id"]), str(sample["metric_key"]))
+        grouped[key].append(float(sample["value_percent"]))
+        metadata.setdefault(key, sample)
+
+    rows: list[dict[str, Any]] = []
+    for key, values in sorted(grouped.items()):
+        sample = metadata[key]
+        stats = _metric_stats(values)
+        if sample["metric_key"] not in _CTC_METRIC_KEYS and float(stats["max_percent"]) <= 0.0:
+            continue
+        rows.append(
+            {
+                "gpu_id": sample["gpu_id"],
+                "gpu": sample["gpu"],
+                "metric": sample["metric_key"],
+                "metric_name": sample["metric_name"],
+                "metric_family": sample["metric_family"],
+                **stats,
+            }
+        )
+    return rows
+
+
+def _interconnect_range_summary_rows(samples: list[dict[str, Any]], ranges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for current_range in ranges:
+        start = int(current_range["start_ns"])
+        end = int(current_range["end_ns"])
+        grouped: dict[tuple[int, str], list[float]] = defaultdict(list)
+        metadata: dict[tuple[int, str], dict[str, Any]] = {}
+        for sample in samples:
+            timestamp = int(sample["timestamp_ns"])
+            if timestamp < start or timestamp > end:
+                continue
+            key = (int(sample["gpu_id"]), str(sample["metric_key"]))
+            grouped[key].append(float(sample["value_percent"]))
+            metadata.setdefault(key, sample)
+        for key, values in sorted(grouped.items()):
+            sample = metadata[key]
+            if sample["metric_key"] not in _CTC_METRIC_KEYS:
+                continue
+            rows.append(
+                {
+                    "scope": current_range["scope"],
+                    "phase": current_range["phase"],
+                    "step": current_range["step"],
+                    "start_ns": start,
+                    "end_ns": end,
+                    "milliseconds": _ms(end - start),
+                    "gpu_id": sample["gpu_id"],
+                    "gpu": sample["gpu"],
+                    "metric": sample["metric_key"],
+                    "metric_name": sample["metric_name"],
+                    **_metric_stats(values),
+                }
+            )
+    return rows
+
+
+def summarize_interconnect_metrics(con: sqlite3.Connection) -> dict[str, Any]:
+    samples, reason = _interconnect_samples(con)
+    if not samples:
+        return {
+            "available": False,
+            "reason": reason or "no interconnect GPU metric samples found",
+            "notes": [
+                "CTC/NVLink saturation requires Nsight Systems GPU metric sampling.",
+            ],
+        }
+
+    ctc_samples = [row for row in samples if row["metric_key"] in _CTC_METRIC_KEYS]
+    ranges = _interconnect_ranges(con)
+    return {
+        "available": True,
+        "units": "percent_of_peak_throughput",
+        "summary": {"rows": _interconnect_summary_rows(samples)},
+        "range_summary": {"rows": _interconnect_range_summary_rows(samples, ranges)},
+        "ranges": ranges,
+        "timeseries": {"rows": ctc_samples},
+        "artifacts": {
+            "timeseries_csv": "interconnect_ctc_timeseries.csv",
+            "range_summary_csv": "interconnect_ctc_step_summary.csv",
+            "summary_csv": "interconnect_metric_summary.csv",
+            "timeline_plot": "interconnect_ctc_timeline.png",
+            "by_step_plot": "interconnect_ctc_by_step.png",
+            "by_phase_plot": "interconnect_ctc_by_phase.png",
+        },
+        "notes": [
+            "Values are Nsight GPU metric throughput percentages, not absolute GB/s.",
+            "Per-step plots aggregate by taking the maximum per-GPU saturation statistic, so one saturated GPU is not hidden by idle GPUs.",
+            "At 100 Hz sampling, sub-10 ms bursts can be missed; sustained saturation should still be visible.",
+        ],
+    }
+
+
 def write_step_sample_artifacts(report: dict[str, Any], output_dir: Path) -> None:
     step_samples = report.get("step_samples", {})
     rows = step_samples.get("rows", []) if isinstance(step_samples, dict) else []
@@ -1361,6 +1590,186 @@ def write_step_sample_artifacts(report: dict[str, Any], output_dir: Path) -> Non
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(normalized_rows)
+
+
+def _write_dict_rows_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not isinstance(rows, list):
+        return
+    normalized_rows = [row for row in rows if isinstance(row, dict)]
+    if not normalized_rows:
+        return
+    fieldnames: list[str] = []
+    for row in normalized_rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(normalized_rows)
+
+
+def _matplotlib_pyplot():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    return plt
+
+
+def _aggregate_max_by_timestamp(rows: list[dict[str, Any]]) -> dict[str, dict[int, float]]:
+    series: dict[str, dict[int, float]] = defaultdict(dict)
+    for row in rows:
+        metric = str(row.get("metric_key") or row.get("metric"))
+        timestamp = int(row["timestamp_ns"])
+        value = float(row["value_percent"])
+        current = series[metric].get(timestamp)
+        if current is None or value > current:
+            series[metric][timestamp] = value
+    return series
+
+
+def _aggregate_range_rows(rows: list[dict[str, Any]], scope: str) -> dict[tuple[int, str], dict[str, float]]:
+    aggregated: dict[tuple[int, str], dict[str, float]] = {}
+    for row in rows:
+        if row.get("scope") != scope:
+            continue
+        metric = str(row.get("metric"))
+        if metric not in _CTC_METRIC_KEYS:
+            continue
+        key = (int(row.get("step", 0)), metric)
+        entry = aggregated.setdefault(key, {"p95_percent": 0.0, "max_percent": 0.0})
+        entry["p95_percent"] = max(entry["p95_percent"], float(row.get("p95_percent", 0.0) or 0.0))
+        entry["max_percent"] = max(entry["max_percent"], float(row.get("max_percent", 0.0) or 0.0))
+    return aggregated
+
+
+def _aggregate_phase_rows(rows: list[dict[str, Any]]) -> dict[tuple[int, str, str], float]:
+    aggregated: dict[tuple[int, str, str], float] = {}
+    for row in rows:
+        if row.get("scope") != "phase":
+            continue
+        metric = str(row.get("metric"))
+        if metric not in _CTC_METRIC_KEYS:
+            continue
+        key = (int(row.get("step", 0)), str(row.get("phase")), metric)
+        aggregated[key] = max(aggregated.get(key, 0.0), float(row.get("p95_percent", 0.0) or 0.0))
+    return aggregated
+
+
+def _plot_interconnect_timeline(metrics: dict[str, Any], output_dir: Path) -> None:
+    rows = metrics.get("timeseries", {}).get("rows", [])
+    if not isinstance(rows, list) or not rows:
+        return
+    plt = _matplotlib_pyplot()
+    series = _aggregate_max_by_timestamp([row for row in rows if isinstance(row, dict)])
+    timestamps = [int(row["timestamp_ns"]) for row in rows if isinstance(row, dict)]
+    if not timestamps:
+        return
+    first_timestamp = min(timestamps)
+
+    fig, ax = plt.subplots(figsize=(11.0, 4.8), dpi=160, constrained_layout=True)
+    colors = {"ctc_rx": "#1f77b4", "ctc_tx": "#d62728"}
+    labels = {"ctc_rx": "CTC RX", "ctc_tx": "CTC TX"}
+    for metric in ("ctc_rx", "ctc_tx"):
+        metric_points = series.get(metric, {})
+        if not metric_points:
+            continue
+        xs = [_ms(timestamp - first_timestamp) for timestamp in sorted(metric_points)]
+        ys = [metric_points[timestamp] for timestamp in sorted(metric_points)]
+        ax.plot(xs, ys, label=labels[metric], color=colors[metric], linewidth=1.6)
+
+    for current_range in metrics.get("ranges", [])[:120]:
+        if not isinstance(current_range, dict) or current_range.get("scope") != "phase":
+            continue
+        start_ms = _ms(int(current_range["start_ns"]) - first_timestamp)
+        end_ms = _ms(int(current_range["end_ns"]) - first_timestamp)
+        color = "#1f77b4" if current_range.get("phase") == "forward" else "#ff7f0e"
+        ax.axvspan(start_ms, end_ms, color=color, alpha=0.045, linewidth=0)
+
+    ax.axhline(90.0, color="#444444", linestyle="--", linewidth=1.0, label="90%")
+    ax.set_title("CTC Throughput Saturation Timeline")
+    ax.set_xlabel("Time from first CTC sample (ms)")
+    ax.set_ylabel("Throughput saturation (%)")
+    ax.set_ylim(bottom=0.0, top=max(100.0, ax.get_ylim()[1]))
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.legend(loc="upper right", ncols=3)
+    fig.savefig(output_dir / "interconnect_ctc_timeline.png", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_interconnect_by_step(metrics: dict[str, Any], output_dir: Path) -> None:
+    rows = metrics.get("range_summary", {}).get("rows", [])
+    if not isinstance(rows, list) or not rows:
+        return
+    aggregated = _aggregate_range_rows([row for row in rows if isinstance(row, dict)], "step")
+    steps = sorted({step for step, _ in aggregated})
+    if not steps:
+        return
+    plt = _matplotlib_pyplot()
+    fig, ax = plt.subplots(figsize=(9.5, 4.8), dpi=160, constrained_layout=True)
+    colors = {"ctc_rx": "#1f77b4", "ctc_tx": "#d62728"}
+    labels = {"ctc_rx": "CTC RX", "ctc_tx": "CTC TX"}
+    for metric in ("ctc_rx", "ctc_tx"):
+        p95 = [aggregated.get((step, metric), {}).get("p95_percent", 0.0) for step in steps]
+        max_values = [aggregated.get((step, metric), {}).get("max_percent", 0.0) for step in steps]
+        if not any(p95) and not any(max_values):
+            continue
+        ax.plot(steps, p95, label=f"{labels[metric]} p95", color=colors[metric], linewidth=1.8)
+        ax.plot(steps, max_values, label=f"{labels[metric]} max", color=colors[metric], linestyle=":", linewidth=1.4)
+    ax.axhline(90.0, color="#444444", linestyle="--", linewidth=1.0, label="90%")
+    ax.set_title("CTC Saturation by Measured Step")
+    ax.set_xlabel("Measured step")
+    ax.set_ylabel("Throughput saturation (%)")
+    ax.set_ylim(bottom=0.0, top=max(100.0, ax.get_ylim()[1]))
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.legend(loc="upper right", ncols=3)
+    fig.savefig(output_dir / "interconnect_ctc_by_step.png", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_interconnect_by_phase(metrics: dict[str, Any], output_dir: Path) -> None:
+    rows = metrics.get("range_summary", {}).get("rows", [])
+    if not isinstance(rows, list) or not rows:
+        return
+    aggregated = _aggregate_phase_rows([row for row in rows if isinstance(row, dict)])
+    steps = sorted({step for step, _, _ in aggregated})
+    if not steps:
+        return
+    plt = _matplotlib_pyplot()
+    fig, axes = plt.subplots(2, 1, figsize=(9.5, 6.2), dpi=160, sharex=True, constrained_layout=True)
+    phase_colors = {"forward": "#1f77b4", "backward": "#ff7f0e"}
+    metric_titles = {"ctc_rx": "CTC RX p95 by phase", "ctc_tx": "CTC TX p95 by phase"}
+    for ax, metric in zip(axes, ("ctc_rx", "ctc_tx")):
+        for phase in ("forward", "backward"):
+            values = [aggregated.get((step, phase, metric), 0.0) for step in steps]
+            if any(values):
+                ax.plot(steps, values, label=phase, color=phase_colors[phase], linewidth=1.8)
+        ax.axhline(90.0, color="#444444", linestyle="--", linewidth=1.0)
+        ax.set_title(metric_titles[metric])
+        ax.set_ylabel("Saturation (%)")
+        ax.set_ylim(bottom=0.0, top=max(100.0, ax.get_ylim()[1]))
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.legend(loc="upper right")
+    axes[-1].set_xlabel("Measured step")
+    fig.savefig(output_dir / "interconnect_ctc_by_phase.png", bbox_inches="tight")
+    plt.close(fig)
+
+
+def write_interconnect_artifacts(report: dict[str, Any], output_dir: Path) -> None:
+    metrics = report.get("interconnect_metrics")
+    if not isinstance(metrics, dict) or not metrics.get("available"):
+        return
+    _write_dict_rows_csv(output_dir / "interconnect_ctc_timeseries.csv", metrics.get("timeseries", {}).get("rows", []))
+    _write_dict_rows_csv(output_dir / "interconnect_ctc_step_summary.csv", metrics.get("range_summary", {}).get("rows", []))
+    _write_dict_rows_csv(output_dir / "interconnect_metric_summary.csv", metrics.get("summary", {}).get("rows", []))
+    try:
+        _plot_interconnect_timeline(metrics, output_dir)
+        _plot_interconnect_by_step(metrics, output_dir)
+        _plot_interconnect_by_phase(metrics, output_dir)
+    except Exception as exc:
+        print(f"warning: failed to write interconnect CTC plots: {exc}", file=sys.stderr, flush=True)
 
 
 def _semantic_rows(stage: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2001,7 +2410,7 @@ def _top_memory_rows(source_profile: dict[str, Any], memory_profile: dict[str, A
             for row in category_rows:
                 rows.append(
                     {
-                        "source": "memory attribution pass",
+                        "source": "persistent tensor accounting pass",
                         "item": str(row.get("category", "-")),
                         "memory_space": str(row.get("memory_space", "-")),
                         "bytes": int(row.get("bytes", 0)),
@@ -2014,7 +2423,7 @@ def _top_memory_rows(source_profile: dict[str, Any], memory_profile: dict[str, A
             for row in saved_rows:
                 rows.append(
                     {
-                        "source": "memory attribution pass saved activation",
+                        "source": "saved-tensor hook pass",
                         "item": _semantic_leaf_key(str(row.get("owner", "-"))),
                         "memory_space": "GPU HBM",
                         "bytes": int(row.get("unique_bytes", 0)),
@@ -2128,13 +2537,62 @@ def _stage_memory_markdown(source_profile: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _memory_breakdown_summary(profile: dict[str, Any]) -> dict[str, Any]:
+    breakdown = profile.get("memory_breakdown") if isinstance(profile, dict) else None
+    if isinstance(breakdown, dict):
+        summary = breakdown.get("summary")
+        if isinstance(summary, dict):
+            return summary
+    summary = profile.get("memory_breakdown_summary") if isinstance(profile, dict) else None
+    return summary if isinstance(summary, dict) else {}
+
+
+def _memory_breakdown_markdown(profile: dict[str, Any]) -> list[str]:
+    summary = _memory_breakdown_summary(profile)
+    rows = summary.get("breakdown_rows")
+    if not isinstance(rows, list) or not rows:
+        return []
+    peak_hbm = int(summary.get("peak_hbm_bytes", 0) or 0)
+    closure_error = int(summary.get("closure_error_bytes", 0) or 0)
+    lines = [
+        "## Source Memory Breakdown",
+        "",
+        "This section comes from the source memory-breakdown pass. It is independent of Nsight timing attribution.",
+        "",
+        f"Selected step: `{summary.get('selected_step', '-')}`  ",
+        f"Selected phase: `{summary.get('selected_phase', '-')}`  ",
+        f"Peak HBM denominator: `{peak_hbm}` bytes / `{_fmt_mib(peak_hbm)} MiB`  ",
+        f"Closure error: `{closure_error}` bytes / `{_fmt_mib(closure_error)} MiB`  ",
+        f"Closure OK: `{bool(summary.get('closure_ok', False))}`",
+        "",
+        "| Group | Component | Kind | Memory space | bytes | MiB | % peak HBM | Method | Accuracy |",
+        "|---|---|---|---|---:|---:|---:|---|---|",
+    ]
+    for row in sorted(
+        (row for row in rows if isinstance(row, dict)),
+        key=lambda item: (str(item.get("memory_space", "")) != "GPU HBM", -int(item.get("bytes", 0) or 0)),
+    ):
+        value = int(row.get("bytes", 0) or 0)
+        if value <= 0:
+            continue
+        memory_space = row.get("memory_space", "-")
+        pct = f"{_percent(value, peak_hbm):.2f}%" if memory_space == "GPU HBM" and peak_hbm > 0 else "-"
+        lines.append(
+            f"| {row.get('group', '-')} | {row.get('component', '-')} | {row.get('kind', '-')} | "
+            f"{memory_space} | {value} | {_fmt_mib(value)} | {pct} | "
+            f"{row.get('method', '-')} | {row.get('accuracy', '-')} |"
+        )
+    lines.append("")
+    return lines
+
+
 def _memory_attribution_markdown(profile: dict[str, Any]) -> list[str]:
     attribution = profile.get("memory_attribution") if isinstance(profile, dict) else None
     if not isinstance(attribution, dict):
         return [
-            "## Fine-Grained Memory Attribution",
+            "## Persistent Tensor Accounting",
             "",
-            "No memory attribution report found. Rerun the driver with memory attribution enabled.",
+            "No persistent tensor accounting report found. Rerun the driver with memory accounting enabled.",
             "",
         ]
     categories = attribution.get("categories", {}) if isinstance(attribution.get("categories", {}), dict) else {}
@@ -2166,9 +2624,9 @@ def _memory_attribution_markdown(profile: dict[str, Any]) -> list[str]:
                     }
                 )
     lines = [
-        "## Fine-Grained Memory Attribution",
+        "## Persistent Tensor Accounting",
         "",
-        "Model, gradient, and optimizer rows are tensor-size accounting. Saved activation attribution is collected in a separate memory-only source pass and must not be used for timing claims.",
+        "Model, gradient, and optimizer rows are tensor-size accounting. Use `Source Memory Breakdown` for the peak-HBM stack when it is present.",
         "",
     ]
     if isinstance(category_rows, list) and category_rows:
@@ -2200,7 +2658,7 @@ def _memory_attribution_markdown(profile: dict[str, Any]) -> list[str]:
         lines.extend(["No category rows found.", ""])
     source_path = profile.get("_source_profile_path") if isinstance(profile, dict) else None
     if source_path:
-        lines.extend([f"Memory attribution report: `{source_path}`", ""])
+        lines.extend([f"Persistent tensor report: `{source_path}`", ""])
 
     saved = attribution.get("saved_activations", {}) if isinstance(attribution.get("saved_activations", {}), dict) else {}
     saved_rows = saved.get("rows") if isinstance(saved, dict) else None
@@ -2246,6 +2704,53 @@ def _memory_attribution_markdown(profile: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _interconnect_markdown(report: dict[str, Any]) -> list[str]:
+    metrics = report.get("interconnect_metrics")
+    if not isinstance(metrics, dict) or not metrics.get("available"):
+        return []
+    summary_rows = metrics.get("summary", {}).get("rows", [])
+    if not isinstance(summary_rows, list) or not summary_rows:
+        return []
+    display_rows = [
+        row
+        for row in summary_rows
+        if isinstance(row, dict) and (row.get("metric") in _CTC_METRIC_KEYS or float(row.get("max_percent", 0.0) or 0.0) > 0.0)
+    ]
+    if not display_rows:
+        return []
+    lines = [
+        "## NVLink-C2C / CTC Saturation",
+        "",
+        "Values are Nsight GPU metric throughput percentages. The CTC plots use max-across-GPUs aggregation so one saturated GPU is not hidden.",
+        "",
+        "| GPU | Metric | avg % | p50 % | p95 % | max % | samples |",
+        "|---|---|---:|---:|---:|---:|---:|",
+    ]
+    for row in sorted(display_rows, key=lambda item: (int(item.get("gpu_id", 0) or 0), str(item.get("metric_name", "")))):
+        lines.append(
+            f"| {row.get('gpu', row.get('gpu_id', '-'))} | "
+            f"{row.get('metric_name', '-')} | "
+            f"{float(row.get('avg_percent', 0.0) or 0.0):.2f} | "
+            f"{float(row.get('p50_percent', 0.0) or 0.0):.2f} | "
+            f"{float(row.get('p95_percent', 0.0) or 0.0):.2f} | "
+            f"{float(row.get('max_percent', 0.0) or 0.0):.2f} | "
+            f"{int(row.get('samples', 0) or 0)} |"
+        )
+    artifacts = metrics.get("artifacts", {})
+    if isinstance(artifacts, dict):
+        lines += [
+            "",
+            "Plots: "
+            f"`{artifacts.get('timeline_plot', 'interconnect_ctc_timeline.png')}`, "
+            f"`{artifacts.get('by_step_plot', 'interconnect_ctc_by_step.png')}`, "
+            f"`{artifacts.get('by_phase_plot', 'interconnect_ctc_by_phase.png')}`.",
+            "",
+        ]
+    else:
+        lines.append("")
+    return lines
+
+
 def _front_summary_markdown(report: dict[str, Any]) -> list[str]:
     source_profile = report.get("source_profile", {})
     memory_profile = report.get("memory_profile", {})
@@ -2254,9 +2759,11 @@ def _front_summary_markdown(report: dict[str, Any]) -> list[str]:
     lines: list[str] = []
     lines.extend(_semantic_timing_memory_markdown(report))
     lines.extend(_top_bottlenecks_markdown(report))
+    lines.extend(_interconnect_markdown(report))
     lines.extend(_timing_summary_markdown(report, "step.forward", "Forward"))
     lines.extend(_timing_summary_markdown(report, "step.backward", "Backward"))
     lines.extend(_stage_memory_markdown(source_profile if isinstance(source_profile, dict) else {}))
+    lines.extend(_memory_breakdown_markdown(memory_profile if isinstance(memory_profile, dict) else {}))
     lines.extend(_memory_attribution_markdown(memory_profile if isinstance(memory_profile, dict) else {}))
     lines.extend(_overall_memory_markdown(source_profile if isinstance(source_profile, dict) else {}))
     return lines
@@ -2358,6 +2865,7 @@ def memory_markdown(report: dict[str, Any]) -> str:
     lines = [f"# Nsight LoRA Memory: {report['source']}", ""]
     lines.extend(_top_memory_markdown(source_profile, memory_profile))
     lines.extend(_stage_memory_markdown(source_profile))
+    lines.extend(_memory_breakdown_markdown(memory_profile))
     lines.extend(_memory_attribution_markdown(memory_profile))
     lines.extend(_overall_memory_markdown(source_profile))
     return "\n".join(lines)
@@ -2472,12 +2980,16 @@ def main() -> None:
     phase_start = _log_timing("Summarizing per-step samples")
     step_samples = summarize_step_samples(con, source_profile)
     _log_timing("Summarized per-step samples", phase_start)
+    phase_start = _log_timing("Summarizing interconnect GPU metrics")
+    interconnect_metrics = summarize_interconnect_metrics(con)
+    _log_timing("Summarized interconnect GPU metrics", phase_start)
     report = {
         "source": str(args.sqlite_path),
         "source_profile": source_profile,
         "memory_profile": memory_profile,
         "stages": [forward_stage, backward_stage],
         "step_samples": step_samples,
+        "interconnect_metrics": interconnect_metrics,
     }
     if args.output_json:
         phase_start = _log_timing("Writing Nsight JSON report")
@@ -2498,6 +3010,7 @@ def main() -> None:
     if artifact_dir is not None:
         phase_start = _log_timing("Writing Nsight CSV/sample artifacts")
         write_step_sample_artifacts(report, artifact_dir)
+        write_interconnect_artifacts(report, artifact_dir)
         _log_timing("Wrote Nsight CSV/sample artifacts", phase_start)
     if not args.output_json and not args.output_md:
         print(json.dumps(report, indent=2, sort_keys=True))

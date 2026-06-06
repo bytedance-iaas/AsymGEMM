@@ -33,6 +33,13 @@ class TokenStats:
     min_token_filter: int
     at_or_above_min_filter: int
     above_cutoff_len: int
+    capped_min: int
+    capped_avg: float
+    capped_p25: float
+    capped_p50: float
+    capped_p75: float
+    capped_p90: float
+    capped_max: int
 
 
 def _parse_args() -> argparse.Namespace:
@@ -41,6 +48,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lf-dir", required=True)
     parser.add_argument("--asym-dir", default=str(Path(__file__).resolve().parents[2]))
+    parser.add_argument(
+        "--kt-tools-dir",
+        dest="asym_dir",
+        default=argparse.SUPPRESS,
+        help="Alias for --asym-dir when the dataset builder is used by KT profiling scripts.",
+    )
     parser.add_argument("--results-root", default="")
     parser.add_argument("--model-name-or-path", default="Qwen/Qwen3-30B-A3B")
     parser.add_argument("--template", default="auto")
@@ -117,6 +130,7 @@ def _token_stats(lengths: list[int], cutoff_len: int, min_tokens: int) -> TokenS
     if not lengths:
         raise ValueError("cannot compute token stats for an empty dataset")
     sorted_lengths = sorted(lengths)
+    sorted_capped_lengths = sorted(min(length, cutoff_len) for length in lengths)
     return TokenStats(
         count=len(lengths),
         min=sorted_lengths[0],
@@ -130,6 +144,13 @@ def _token_stats(lengths: list[int], cutoff_len: int, min_tokens: int) -> TokenS
         min_token_filter=min_tokens,
         at_or_above_min_filter=sum(length >= min_tokens for length in lengths),
         above_cutoff_len=sum(length > cutoff_len for length in lengths),
+        capped_min=sorted_capped_lengths[0],
+        capped_avg=mean(sorted_capped_lengths),
+        capped_p25=_percentile(sorted_capped_lengths, 25),
+        capped_p50=_percentile(sorted_capped_lengths, 50),
+        capped_p75=_percentile(sorted_capped_lengths, 75),
+        capped_p90=_percentile(sorted_capped_lengths, 90),
+        capped_max=sorted_capped_lengths[-1],
     )
 
 
@@ -263,6 +284,147 @@ def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _stats_txt_path(dataset_path: Path) -> Path:
+    return dataset_path.with_suffix(".stats.txt")
+
+
+def _fmt_stat(value: Any) -> str:
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    return str(value)
+
+
+def _dataset_stats_text(
+    *,
+    dataset_name: str,
+    split: str,
+    dataset_path: Path,
+    args: argparse.Namespace,
+    stats: dict[str, Any],
+    validation_ok: bool | None,
+) -> str:
+    lines = [
+        "# LF Dataset Token Stats",
+        "",
+        f"dataset: {dataset_name}",
+        f"split: {split}",
+        f"file: {dataset_path}",
+        f"model_name_or_path: {args.model_name_or_path}",
+        f"template: {args.template}",
+        f"source: {args.source_dataset}/{args.source_config}",
+        f"cutoff_len: {args.cutoff_len}",
+        f"min_tokens: {args.min_tokens}",
+        f"validation_ok: {validation_ok}",
+        "",
+        "raw_token_length:",
+    ]
+    for key in ("count", "min", "avg", "p25", "p50", "p75", "p90", "max"):
+        lines.append(f"  {key}: {_fmt_stat(stats[key])}")
+    lines.extend(
+        [
+            f"  above_cutoff_len: {_fmt_stat(stats['above_cutoff_len'])}",
+            f"  at_or_above_min_filter: {_fmt_stat(stats['at_or_above_min_filter'])}",
+            "",
+            "capped_token_length:",
+            "  note: min(raw_token_length, cutoff_len); LF preprocessing also template-tokenizes and truncates to cutoff_len.",
+        ]
+    )
+    for key in ("min", "avg", "p25", "p50", "p75", "p90", "max"):
+        lines.append(f"  {key}: {_fmt_stat(stats[f'capped_{key}'])}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _pair_stats_text(
+    *,
+    args: argparse.Namespace,
+    train_path: Path,
+    eval_path: Path,
+    token_stats: dict[str, dict[str, Any]],
+    validation_ok: bool | None,
+) -> str:
+    lines = [
+        "# LF Dataset Pair Token Stats",
+        "",
+        f"train_dataset: {args.train_name}",
+        f"eval_dataset: {args.eval_name}",
+        f"train_file: {train_path}",
+        f"eval_file: {eval_path}",
+        f"model_name_or_path: {args.model_name_or_path}",
+        f"template: {args.template}",
+        f"source: {args.source_dataset}/{args.source_config}",
+        f"cutoff_len: {args.cutoff_len}",
+        f"min_tokens: {args.min_tokens}",
+        f"validation_ok: {validation_ok}",
+        "",
+    ]
+    for split in ("train", "eval"):
+        stats = token_stats[split]
+        lines.append(f"[{split}.raw_token_length]")
+        for key in ("count", "min", "avg", "p25", "p50", "p75", "p90", "max"):
+            lines.append(f"{key}: {_fmt_stat(stats[key])}")
+        lines.append(f"above_cutoff_len: {_fmt_stat(stats['above_cutoff_len'])}")
+        lines.append(f"at_or_above_min_filter: {_fmt_stat(stats['at_or_above_min_filter'])}")
+        lines.append("")
+        lines.append(f"[{split}.capped_token_length]")
+        lines.append("note: min(raw_token_length, cutoff_len); LF preprocessing also template-tokenizes and truncates to cutoff_len.")
+        for key in ("min", "avg", "p25", "p50", "p75", "p90", "max"):
+            lines.append(f"{key}: {_fmt_stat(stats[f'capped_{key}'])}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _write_stats_files(
+    *,
+    args: argparse.Namespace,
+    train_path: Path,
+    eval_path: Path,
+    token_stats: dict[str, dict[str, Any]],
+    validation_ok: bool | None,
+) -> dict[str, str]:
+    train_stats_path = _stats_txt_path(train_path)
+    eval_stats_path = _stats_txt_path(eval_path)
+    pair_stats_path = train_path.with_name(f"{args.train_name}__pair.stats.txt")
+
+    train_stats_path.write_text(
+        _dataset_stats_text(
+            dataset_name=args.train_name,
+            split="train",
+            dataset_path=train_path,
+            args=args,
+            stats=token_stats["train"],
+            validation_ok=validation_ok,
+        ),
+        encoding="utf-8",
+    )
+    eval_stats_path.write_text(
+        _dataset_stats_text(
+            dataset_name=args.eval_name,
+            split="eval",
+            dataset_path=eval_path,
+            args=args,
+            stats=token_stats["eval"],
+            validation_ok=validation_ok,
+        ),
+        encoding="utf-8",
+    )
+    pair_stats_path.write_text(
+        _pair_stats_text(
+            args=args,
+            train_path=train_path,
+            eval_path=eval_path,
+            token_stats=token_stats,
+            validation_ok=validation_ok,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "train_stats_file": str(train_stats_path),
+        "eval_stats_file": str(eval_stats_path),
+        "pair_stats_file": str(pair_stats_path),
+    }
 
 
 def _update_dataset_info(lf_dir: Path, train_name: str, eval_name: str) -> None:
@@ -729,6 +891,14 @@ def main() -> None:
             validation["lf_preprocess"] = {"ok": False, "error": repr(exc)}
         validation["ok"] = validation["ok"] and bool(validation["lf_preprocess"].get("ok"))
 
+    stats_files = _write_stats_files(
+        args=args,
+        train_path=train_path,
+        eval_path=eval_path,
+        token_stats=token_stats,
+        validation_ok=validation["ok"],
+    )
+
     manifest = {
         "train_name": args.train_name,
         "eval_name": args.eval_name,
@@ -741,6 +911,7 @@ def main() -> None:
         "eval_rows": len(eval_records),
         "train_file": str(train_path),
         "eval_file": str(eval_path),
+        **stats_files,
         "formatting": train_validation.get("formats", ["unknown"])[0]
         if train_validation.get("formats")
         else "unknown",

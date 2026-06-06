@@ -892,6 +892,24 @@ def _stack_expert_weight(expert_states: Sequence[Mapping[str, Any]], name: str) 
     return torch.stack([_state_tensor(expert_state, name) for expert_state in expert_states], dim=0).contiguous()
 
 
+def _stack_expert_gate_up_weight(expert_states: Sequence[Mapping[str, Any]]) -> torch.Tensor:
+    if not expert_states:
+        raise ValueError("cannot build grouped expert gate/up weight from an empty expert list")
+    return torch.stack(
+        [
+            torch.cat(
+                (
+                    _state_tensor(expert_state, "gate_weight"),
+                    _state_tensor(expert_state, "up_weight"),
+                ),
+                dim=0,
+            )
+            for expert_state in expert_states
+        ],
+        dim=0,
+    ).contiguous()
+
+
 class FrozenLinear(nn.Module):
     def __init__(self, weight: torch.Tensor, *, device: torch.device, dtype: torch.dtype) -> None:
         super().__init__()
@@ -1084,18 +1102,24 @@ class AsymMoELayer(nn.Module):
                 precision=self.precision,
             )
 
+        def grouped_gate_up_base(states: Sequence[Mapping[str, Any]], *, offload: bool) -> nn.Module:
+            weight = _stack_expert_gate_up_weight(states)
+            if not offload or use_gpu_torch_base:
+                return TorchGroupedFrozenLinear(weight, device=device, dtype=base_dtype)
+            return AsymGroupedFrozenLinear(
+                weight,
+                backend=backend,
+                pin_memory=pin_memory,
+                stats=stats,
+                precision=self.precision,
+            )
+
         offload_routed = "routed_experts" in offload_groups
         offload_shared = "shared_experts" in offload_groups
-        self.expert_gate_base = grouped_base(expert_states, "gate_weight", offload=offload_routed)
-        self.expert_up_base = grouped_base(expert_states, "up_weight", offload=offload_routed)
+        self.expert_gate_up_base = grouped_gate_up_base(expert_states, offload=offload_routed)
         self.expert_down_base = grouped_base(expert_states, "down_weight", offload=offload_routed)
-        self.shared_gate_base = (
-            grouped_base(shared_expert_states, "gate_weight", offload=offload_shared)
-            if shared_expert_states
-            else None
-        )
-        self.shared_up_base = (
-            grouped_base(shared_expert_states, "up_weight", offload=offload_shared)
+        self.shared_gate_up_base = (
+            grouped_gate_up_base(shared_expert_states, offload=offload_shared)
             if shared_expert_states
             else None
         )
@@ -1116,11 +1140,9 @@ class AsymMoELayer(nn.Module):
         return sum(
             base.weight_hbm_saved_bytes
             for base in (
-                self.expert_gate_base,
-                self.expert_up_base,
+                self.expert_gate_up_base,
                 self.expert_down_base,
-                self.shared_gate_base,
-                self.shared_up_base,
+                self.shared_gate_up_base,
                 self.shared_down_base,
             )
             if isinstance(base, AsymGroupedFrozenLinear)
@@ -1131,11 +1153,9 @@ class AsymMoELayer(nn.Module):
         return sum(
             base.pinned_cpu_bytes
             for base in (
-                self.expert_gate_base,
-                self.expert_up_base,
+                self.expert_gate_up_base,
                 self.expert_down_base,
-                self.shared_gate_base,
-                self.shared_up_base,
+                self.shared_gate_up_base,
                 self.shared_down_base,
             )
             if isinstance(base, AsymGroupedFrozenLinear)
@@ -1196,24 +1216,24 @@ class AsymMoELayer(nn.Module):
         offsets: torch.Tensor,
         experts: torch.Tensor,
         *,
-        gate_base: nn.Module,
-        up_base: nn.Module,
+        gate_up_base: nn.Module,
         shared: bool = False,
         dense_experts: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, GroupedLoRAMetadata]:
         if packed.numel() == 0:
             empty = packed.new_empty((0, self.config.intermediate_size))
-            empty_metadata = self.expert_lora.prepare_metadata(offsets, experts, dense_experts=dense_experts)
+            packed_lora = self.shared_expert_lora if shared else self.expert_lora
+            assert packed_lora is not None
+            empty_metadata = packed_lora.prepare_metadata(offsets, experts, dense_experts=dense_experts)
             return empty, empty, empty_metadata
 
         layer_name = str(getattr(self, "_m4_profile_name", ""))
         expert_scope = "shared_expert" if shared else "routed_expert"
         profile_prefix = f"{layer_name}.{expert_scope}" if layer_name else expert_scope
-        gate_base.profile_name = f"{profile_prefix}.gate_base"
-        up_base.profile_name = f"{profile_prefix}.up_base"
+        gate_up_base.profile_name = f"{profile_prefix}.gate_up_base"
 
-        gate = gate_base(packed, offsets, experts, dense_experts=dense_experts)
-        up = up_base(packed, offsets, experts, dense_experts=dense_experts)
+        gate_up = gate_up_base(packed, offsets, experts, dense_experts=dense_experts)
+        gate, up = gate_up.chunk(2, dim=-1)
         range_prefix = f"forward.{profile_prefix}"
         if shared:
             assert self.shared_expert_lora is not None
@@ -1246,8 +1266,7 @@ class AsymMoELayer(nn.Module):
         offsets: torch.Tensor,
         experts: torch.Tensor,
         *,
-        gate_base: nn.Module,
-        up_base: nn.Module,
+        gate_up_base: nn.Module,
         shared: bool = False,
         dense_experts: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, GroupedLoRAMetadata]:
@@ -1255,8 +1274,7 @@ class AsymMoELayer(nn.Module):
             packed,
             offsets,
             experts,
-            gate_base=gate_base,
-            up_base=up_base,
+            gate_up_base=gate_up_base,
             shared=shared,
             dense_experts=dense_experts,
         )
@@ -1318,8 +1336,7 @@ class AsymMoELayer(nn.Module):
         offsets: torch.Tensor,
         experts: torch.Tensor,
         *,
-        gate_base: nn.Module,
-        up_base: nn.Module,
+        gate_up_base: nn.Module,
         down_base: nn.Module,
         shared: bool = False,
         dense_experts: bool = False,
@@ -1328,8 +1345,7 @@ class AsymMoELayer(nn.Module):
             packed,
             offsets,
             experts,
-            gate_base=gate_base,
-            up_base=up_base,
+            gate_up_base=gate_up_base,
             down_base=down_base,
             shared=shared,
             dense_experts=dense_experts,
@@ -1342,8 +1358,7 @@ class AsymMoELayer(nn.Module):
         offsets: torch.Tensor,
         experts: torch.Tensor,
         *,
-        gate_base: nn.Module,
-        up_base: nn.Module,
+        gate_up_base: nn.Module,
         down_base: nn.Module,
         shared: bool = False,
         dense_experts: bool = False,
@@ -1368,8 +1383,7 @@ class AsymMoELayer(nn.Module):
             packed,
             offsets,
             experts,
-            gate_base=gate_base,
-            up_base=up_base,
+            gate_up_base=gate_up_base,
             shared=shared,
             dense_experts=dense_experts,
         )
@@ -1398,8 +1412,7 @@ class AsymMoELayer(nn.Module):
         offsets: torch.Tensor,
         experts: torch.Tensor,
         *,
-        gate_base: nn.Module,
-        up_base: nn.Module,
+        gate_up_base: nn.Module,
         down_base: nn.Module,
         shared: bool = False,
         dense_experts: bool = False,
@@ -1408,8 +1421,7 @@ class AsymMoELayer(nn.Module):
             packed,
             offsets,
             experts,
-            gate_base=gate_base,
-            up_base=up_base,
+            gate_up_base=gate_up_base,
             down_base=down_base,
             shared=shared,
             dense_experts=dense_experts,
@@ -1425,8 +1437,7 @@ class AsymMoELayer(nn.Module):
             packed.contiguous(),
             offsets,
             experts,
-            gate_base=self.expert_gate_base,
-            up_base=self.expert_up_base,
+            gate_up_base=self.expert_gate_up_base,
             down_base=self.expert_down_base,
             dense_experts=True,
         )
@@ -1442,8 +1453,7 @@ class AsymMoELayer(nn.Module):
             compact,
             offsets,
             experts,
-            gate_base=self.expert_gate_base,
-            up_base=self.expert_up_base,
+            gate_up_base=self.expert_gate_up_base,
             down_base=self.expert_down_base,
             dense_experts=True,
         )
@@ -1454,8 +1464,7 @@ class AsymMoELayer(nn.Module):
     def _run_shared(self, flat: torch.Tensor) -> torch.Tensor:
         if self.shared_expert_lora is None:
             return flat.new_zeros((flat.shape[0], self.config.hidden_size))
-        assert self.shared_gate_base is not None
-        assert self.shared_up_base is not None
+        assert self.shared_gate_up_base is not None
         assert self.shared_down_base is not None
         num_shared = self.shared_expert_lora.num_experts
         tokens = int(flat.shape[0])
@@ -1472,8 +1481,7 @@ class AsymMoELayer(nn.Module):
             packed,
             offsets,
             experts,
-            gate_base=self.shared_gate_base,
-            up_base=self.shared_up_base,
+            gate_up_base=self.shared_gate_up_base,
             down_base=self.shared_down_base,
             shared=True,
             dense_experts=True,

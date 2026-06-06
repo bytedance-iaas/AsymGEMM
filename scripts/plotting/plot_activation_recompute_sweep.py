@@ -350,6 +350,7 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
         return None
     config_name = job_dir.parent.name
     batch_match = re.search(r"(?:^|__)b(?P<batch>[0-9]+)_", config_name)
+    workload_meta = config_workload_meta(config_name)
     return {
         "precision": precision_from_path(path),
         "batch_size": int(batch_match.group("batch")) if batch_match is not None else 0,
@@ -358,7 +359,7 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
         "activation_recompute": recompute == "recomp",
         "backend": backend,
         "profiler": profiler,
-        "workload": config_name.split("__", 1)[0],
+        **workload_meta,
         **policy_meta,
     }
 
@@ -380,6 +381,7 @@ def parse_result_dir(path: Path) -> dict[str, Any] | None:
         )
     except ValueError:
         return None
+    workload_meta = config_workload_meta(path.parent.name)
     return {
         "precision": match.group("precision"),
         "batch_size": int(match.group("batch_size")),
@@ -388,13 +390,15 @@ def parse_result_dir(path: Path) -> dict[str, Any] | None:
         "activation_recompute": match.group("recompute") == "recomp",
         "backend": backend,
         "profiler": profiler,
-        "workload": path.parent.name,
+        **workload_meta,
         **policy_meta,
     }
 
 
-def profile_json_path(result_dir: Path) -> Path | None:
-    candidates = [result_dir / "profile.json", *sorted(result_dir.glob("*_profile.json"))]
+def profile_json_path(result_dir: Path, profiler: str | None = None) -> Path | None:
+    candidates = [result_dir / "profile.json"]
+    if profiler in {None, "source"}:
+        candidates.extend(sorted(result_dir.glob("*_profile.json")))
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -502,6 +506,17 @@ def dropout_label(value: Any) -> str:
     return f"drop{scaled:03d}"
 
 
+def config_workload_meta(config_name: str) -> dict[str, str]:
+    parts = config_name.split("__")
+    workload_base = parts[0] if parts else config_name
+    model_gpus = next((part for part in parts[1:] if re.fullmatch(r"gpus[1-9][0-9]*", part)), "")
+    return {
+        "workload": f"{workload_base} {model_gpus}" if model_gpus else workload_base,
+        "workload_base": workload_base,
+        "model_gpus": model_gpus,
+    }
+
+
 def step_ms(profile: dict[str, Any]) -> float:
     stages = profile.get("stages")
     if isinstance(stages, list):
@@ -526,8 +541,15 @@ def passes_filters(args: argparse.Namespace, meta: dict[str, Any]) -> bool:
     }
     if args.precision and str(meta["precision"]).lower() != str(args.precision).lower():
         return False
-    if args.workload and meta["workload"] not in set(args.workload):
-        return False
+    if args.workload:
+        workload_filter = set(args.workload)
+        workload_candidates = {
+            str(meta["workload"]),
+            str(meta.get("workload_base", "")),
+            str(meta.get("model_gpus", "")),
+        }
+        if workload_filter.isdisjoint(workload_candidates):
+            return False
     if args.backend and meta["backend"] not in set(args.backend):
         return False
     if args.profiler and meta["profiler"] not in set(args.profiler):
@@ -567,14 +589,15 @@ def result_dirs(input_root: Path) -> list[Path]:
         for path in input_root.rglob("*_lora-sft_*")
         if path.is_dir() and not skip_search_path(path, input_root)
     ]
-    flat_dirs = [
-        path
-        for path in input_root.rglob("s*")
-        if path.is_dir()
-        and FLAT_SEQ_RE.match(path.name)
-        and not skip_search_path(path, input_root)
-        and profile_json_path(path) is not None
-    ]
+    flat_dirs = []
+    for path in input_root.rglob("s*"):
+        if not path.is_dir() or FLAT_SEQ_RE.match(path.name) is None or skip_search_path(path, input_root):
+            continue
+        meta = parse_result_dir(path)
+        if meta is None:
+            continue
+        if profile_json_path(path, str(meta.get("profiler", ""))) is not None:
+            flat_dirs.append(path)
     return sorted({*root_named_dirs, *flat_dirs})
 
 
@@ -582,10 +605,7 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
     meta = parse_result_dir(result_dir)
     if meta is None or not passes_filters(args, meta):
         return None
-    if str(meta["expert_recompute_policy"]) != "none" and bool(meta["activation_recompute"]):
-        # Current driver semantics reserve layer recompute for threshold 0.
-        return None
-    profile_path = profile_json_path(result_dir)
+    profile_path = profile_json_path(result_dir, str(meta["profiler"]))
     if profile_path is None:
         return None
     profile = load_json(profile_path)
@@ -656,6 +676,8 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         expert_recompute_sweep_x_name = "none"
     return {
         "workload": meta["workload"],
+        "workload_base": meta.get("workload_base", meta["workload"]),
+        "model_gpus": meta.get("model_gpus", ""),
         "precision": meta["precision"],
         "batch_size": batch_size,
         "lora_dropout": lora_dropout,

@@ -61,6 +61,13 @@ try:
             # BF16 GEMMs
             "m_grouped_bf16_asym_gemm_nt_contiguous",
             "m_grouped_bf16_asym_gemm_nt_masked",
+            # Qwen3 selected-recompute backward
+            "qwen3_gate_up_recompute_bwd_sm100_bf16_windowed",
+            # Dropout mask helpers
+            "pack_bool_mask_2d",
+            "unpack_bool_mask_2d",
+            "apply_packed_dropout",
+            "apply_packed_dropout_",
             # SM80 MoE GEMM (FP16 + BF16, JIT)
             "m_grouped_moe_gemm_nt_contiguous",
             # SM89 FP8 MoE GEMM (native FP8 MMA, JIT)

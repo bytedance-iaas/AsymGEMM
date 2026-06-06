@@ -65,6 +65,12 @@ def _fmt_mib(value: Any) -> str:
     return "-"
 
 
+def _fmt_pct(value: Any, total: Any) -> str:
+    if isinstance(value, (int, float)) and isinstance(total, (int, float)) and float(total) > 0.0:
+        return f"{float(value) * 100.0 / float(total):.2f}%"
+    return "-"
+
+
 def _stage_memory_row(profile: dict[str, Any], name: str) -> dict[str, Any]:
     rows = profile.get("stage_memory", {}).get("rows", [])
     if not isinstance(rows, list):
@@ -75,6 +81,22 @@ def _stage_memory_row(profile: dict[str, Any], name: str) -> dict[str, Any]:
     return {}
 
 
+def _kt_counter_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    kt = profile.get("kt", {})
+    if not isinstance(kt, dict):
+        return []
+    rows = kt.get("rows", [])
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def _lora_counter_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    lora = profile.get("lora", {})
+    if not isinstance(lora, dict):
+        return []
+    row = {key: value for key, value in lora.items() if not isinstance(value, (dict, list))}
+    return [row] if row else []
+
+
 def _source_summary_markdown(profile: dict[str, Any]) -> str:
     config = profile.get("config", {})
     warmup_steps = int(config.get("warmup_steps", 0) or 0)
@@ -82,6 +104,8 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
     memory = profile.get("memory", {})
     gpu = memory.get("gpu", {}) if isinstance(memory, dict) else {}
     trainer = profile.get("trainer", {})
+    kt = profile.get("kt", {})
+    lora = profile.get("lora", {})
     forward_ms = profile.get("forward", {}).get("total_milliseconds")
     backward_ms = profile.get("backward", {}).get("total_milliseconds")
     lines = [
@@ -114,6 +138,30 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
         f"Trainer log: `{trainer.get('trainer_log', '')}`",
         "",
     ]
+    if isinstance(kt, dict) or isinstance(lora, dict):
+        lines += [
+            "## KT / LoRA Counters",
+            "",
+            "| Metric | Value |",
+            "|---|---:|",
+        ]
+        if isinstance(kt, dict):
+            lines += [
+                f"| KT backend | {config.get('kt_backend', '-')} |",
+                f"| KT wrappers | {kt.get('wrapper_count', 0)} |",
+                f"| KT forward calls | {kt.get('total_forward_calls', 0)} |",
+                f"| KT backward calls | {kt.get('total_backward_calls', 0)} |",
+            ]
+        if isinstance(lora, dict):
+            lines += [
+                f"| trainable params | {lora.get('trainable_parameters', '-')} |",
+                f"| PEFT LoRA params | {lora.get('peft_lora_parameters', '-')} |",
+                f"| LF fused expert LoRA params | {lora.get('lf_fused_expert_lora_parameters', '-')} |",
+                f"| KT expert LoRA params | {lora.get('kt_expert_lora_parameters', '-')} |",
+                f"| KT PEFT-view expert LoRA params | {lora.get('kt_peft_expert_lora_parameters', '-')} |",
+                f"| KT fused expert LoRA params | {lora.get('kt_fused_expert_lora_parameters', '-')} |",
+            ]
+        lines.append("")
     losses = trainer.get("losses", [])
     if isinstance(losses, list) and losses:
         measured_losses = [row for row in losses if isinstance(row, dict) and not row.get("is_warmup")]
@@ -147,6 +195,96 @@ def _source_latency_markdown(profile: dict[str, Any]) -> str:
     )
 
 
+def _memory_breakdown_summary(profile: dict[str, Any]) -> dict[str, Any]:
+    breakdown = profile.get("memory_breakdown", {})
+    if isinstance(breakdown, dict):
+        summary = breakdown.get("summary", {})
+        if isinstance(summary, dict):
+            return summary
+    summary = profile.get("memory_breakdown_summary", {})
+    return summary if isinstance(summary, dict) else {}
+
+
+def _memory_breakdown_csv_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = summary.get("breakdown_rows", [])
+    if not isinstance(rows, list):
+        return []
+    peak = int(summary.get("peak_hbm_bytes", 0) or 0)
+    selected_step = summary.get("selected_step", "")
+    selected_phase = summary.get("selected_phase", "")
+    closure_error = int(summary.get("closure_error_bytes", 0) or 0)
+    closure_ok = bool(summary.get("closure_ok", False))
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        value = int(row.get("bytes", 0) or 0)
+        memory_space = row.get("memory_space", "-")
+        normalized.append(
+            {
+                "selected_step": selected_step,
+                "selected_phase": selected_phase,
+                "memory_space": memory_space,
+                "group": row.get("group", "-"),
+                "component": row.get("component", "-"),
+                "kind": row.get("kind", "-"),
+                "bytes": value,
+                "mib": value / (1024.0 ** 2),
+                "percent_peak_hbm": (value * 100.0 / peak) if peak > 0 and memory_space == "GPU HBM" else "",
+                "method": row.get("method", "-"),
+                "accuracy": row.get("accuracy", "-"),
+                "closure_ok": closure_ok,
+                "closure_error_bytes": closure_error,
+            }
+        )
+    return normalized
+
+
+def _source_memory_breakdown_markdown(profile: dict[str, Any], *, top_level: bool = False) -> str:
+    summary = _memory_breakdown_summary(profile)
+    rows = _memory_breakdown_csv_rows(summary)
+    if not rows:
+        return ""
+    peak = int(summary.get("peak_hbm_bytes", 0) or 0)
+    closure_error = int(summary.get("closure_error_bytes", 0) or 0)
+    title = "# LF LoRA-SFT Memory Breakdown" if top_level else "## Peak HBM Breakdown"
+    lines = [
+        title,
+        "",
+        f"Selected step: `{summary.get('selected_step', '-')}`  ",
+        f"Selected phase: `{summary.get('selected_phase', '-')}`  ",
+        f"Peak HBM denominator: `{_fmt_mib(peak)} MiB`  ",
+        f"Closure error: `{_fmt_mib(closure_error)} MiB`  ",
+        f"Closure OK: `{bool(summary.get('closure_ok', False))}`",
+        "",
+        "GPU HBM rows are stacked to close to the allocated peak. `GPU reserved` rows are allocator-reserved-but-unallocated memory and are reported separately.",
+        "",
+        "| Group | Component | Kind | Memory space | MiB | % peak HBM | Method | Accuracy |",
+        "|---|---|---|---|---:|---:|---|---|",
+    ]
+    for row in sorted(rows, key=lambda item: (str(item["memory_space"]) != "GPU HBM", -float(item["bytes"]))):
+        value = int(row["bytes"])
+        lines.append(
+            "| {group} | {component} | {kind} | {memory_space} | {mib} | {pct} | {method} | {accuracy} |".format(
+                group=row["group"],
+                component=row["component"],
+                kind=row["kind"],
+                memory_space=row["memory_space"],
+                mib=_fmt_mib(value),
+                pct=_fmt_pct(value, peak) if row["memory_space"] == "GPU HBM" else "-",
+                method=row["method"],
+                accuracy=row["accuracy"],
+            )
+        )
+    notes = summary.get("notes", [])
+    if isinstance(notes, list) and notes:
+        lines += ["", "Notes:"]
+        for note in notes:
+            lines.append(f"- {note}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _source_memory_markdown(profile: dict[str, Any]) -> str:
     memory = profile.get("memory", {})
     gpu = memory.get("gpu", {}) if isinstance(memory, dict) else {}
@@ -163,9 +301,14 @@ def _source_memory_markdown(profile: dict[str, Any]) -> str:
         f"| stage_local_peak_hbm_bytes | {_fmt_mib(gpu.get('stage_local_peak_hbm_bytes'))} |",
         "",
     ]
+    breakdown_markdown = _source_memory_breakdown_markdown(profile)
+    if breakdown_markdown:
+        lines.append(breakdown_markdown)
     if isinstance(category_rows, list) and category_rows:
         lines += [
-            "## Tensor Categories",
+            "## Persistent Tensor Accounting",
+            "",
+            "These rows are exact tensor-size accounting for parameters, buffers, gradients, and host/pinned tensors. They are not a full peak-HBM attribution by themselves.",
             "",
             "| Category | Component | Device | MiB |",
             "|---|---|---|---:|",
@@ -433,6 +576,17 @@ def _write_source_artifacts(source_profile_json: Path, output_dir: Path, profile
     (output_dir / "table.md").write_text(summary, encoding="utf-8")
     (output_dir / "lat.md").write_text(_source_latency_markdown(profile), encoding="utf-8")
     (output_dir / "memory.md").write_text(_source_memory_markdown(profile), encoding="utf-8")
+    breakdown = _source_memory_breakdown_markdown(profile, top_level=True)
+    breakdown_rows = _memory_breakdown_csv_rows(_memory_breakdown_summary(profile))
+    if breakdown and breakdown_rows:
+        (output_dir / "memory_breakdown.md").write_text(breakdown, encoding="utf-8")
+        _write_csv(output_dir / "memory_breakdown.csv", breakdown_rows)
+    kt_rows = _kt_counter_rows(profile)
+    if kt_rows:
+        _write_csv(output_dir / "kt_counters.csv", kt_rows)
+    lora_rows = _lora_counter_rows(profile)
+    if lora_rows:
+        _write_csv(output_dir / "lora_counters.csv", lora_rows)
     _write_step_samples(profile, output_dir)
 
 
@@ -448,6 +602,15 @@ def _write_profile_csv_artifacts(profile_json: Path, output_dir: Path) -> None:
     _write_csv(output_dir / "kernel_by_op.csv", _kernel_by_op(profile))
     _write_csv(output_dir / "memory_by_category.csv", _memory_by_category(profile))
     _write_csv(output_dir / "memory_by_module.csv", _memory_by_module(profile))
+    breakdown_rows = _memory_breakdown_csv_rows(_memory_breakdown_summary(profile))
+    if breakdown_rows:
+        _write_csv(output_dir / "memory_breakdown.csv", breakdown_rows)
+    kt_rows = _kt_counter_rows(profile)
+    if kt_rows:
+        _write_csv(output_dir / "kt_counters.csv", kt_rows)
+    lora_rows = _lora_counter_rows(profile)
+    if lora_rows:
+        _write_csv(output_dir / "lora_counters.csv", lora_rows)
     _write_csv(output_dir / "unattributed_timing.csv", _unattributed(profile))
 
 

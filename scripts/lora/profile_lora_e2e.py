@@ -818,9 +818,9 @@ def _projection_bucket(compact: str) -> str:
     for name in ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"):
         if name in compact:
             return name
-    if "gate_up_lora" in compact:
+    if "gate_up_base" in compact or "gate_up_lora" in compact:
         return "gate_up"
-    for name in ("gate_base", "up_base", "down_base", "gate_lora", "up_lora", "down_lora"):
+    for name in ("down_base", "gate_lora", "up_lora", "down_lora"):
         if name in compact:
             return name.split("_", 1)[0]
     for name in ("fc1", "fc2", "matrix"):
@@ -2678,8 +2678,7 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
         offsets: torch.Tensor,
         experts: torch.Tensor,
         *,
-        gate_base: torch.nn.Module,
-        up_base: torch.nn.Module,
+        gate_up_base: torch.nn.Module,
         down_base: torch.nn.Module,
         shared: bool = False,
         dense_experts: bool = False,
@@ -2690,12 +2689,11 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
         layer_name = str(getattr(self, "_m4_profile_name", ""))
         expert_scope = "shared_expert" if shared else "routed_expert"
         profile_prefix = f"{layer_name}.{expert_scope}" if layer_name else expert_scope
-        gate_base.profile_name = f"{profile_prefix}.gate_base"
-        up_base.profile_name = f"{profile_prefix}.up_base"
+        gate_up_base.profile_name = f"{profile_prefix}.gate_up_base"
         down_base.profile_name = f"{profile_prefix}.down_base"
 
-        gate = gate_base(packed, offsets, experts, dense_experts=dense_experts)
-        up = up_base(packed, offsets, experts, dense_experts=dense_experts)
+        gate_up = gate_up_base(packed, offsets, experts, dense_experts=dense_experts)
+        gate, up = gate_up.chunk(2, dim=-1)
         range_prefix = f"forward.{profile_prefix}"
         if shared:
             assert self.shared_expert_lora is not None
@@ -2718,21 +2716,21 @@ def patch_moe_forward(book: StageBook) -> list[tuple[Any, str, Any]]:
                     packed.dtype,
                     metadata=lora_metadata,
                 )
-        gate_base_out = gate
-        up_base_out = up
+        gate_pre_lora = gate
+        up_pre_lora = up
         gate = gate + gate_lora
         up = up + up_lora
         _attach_backward_nvtx_ranges(
             gate,
-            f"backward.{profile_prefix}.gate_base_lora_add.grad",
+            f"backward.{profile_prefix}.gate_lora_add.grad",
             book,
-            stop_tensors=(gate_base_out, gate_lora),
+            stop_tensors=(gate_pre_lora, gate_lora),
         )
         _attach_backward_nvtx_ranges(
             up,
-            f"backward.{profile_prefix}.up_base_lora_add.grad",
+            f"backward.{profile_prefix}.up_lora_add.grad",
             book,
-            stop_tensors=(up_base_out, up_lora),
+            stop_tensors=(up_pre_lora, up_lora),
         )
 
         with moe.prof_range(f"{range_prefix}.activation_silu_mul"):

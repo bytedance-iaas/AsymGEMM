@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -505,9 +506,9 @@ def test_postprocess_writes_separate_latency_and_memory_markdown() -> None:
     assert "### Operation Kernel Classes" in latency_text
     assert "## Top Memory" not in latency_text
     assert "## Top Memory" in memory_text
-    assert "## Fine-Grained Memory Attribution" in memory_text
+    assert "## Persistent Tensor Accounting" in memory_text
     assert "### Operation Kernel Classes" not in memory_text
-    assert memory_text.index("| memory attribution pass saved activation | attention.softmax | GPU HBM | 5242880 | 5.00 |") < memory_text.index("| source timing pass | GPU peak HBM | GPU HBM | 4194304 | 4.00 |")
+    assert memory_text.index("| saved-tensor hook pass | attention.softmax | GPU HBM | 5242880 | 5.00 |") < memory_text.index("| source timing pass | GPU peak HBM | GPU HBM | 4194304 | 4.00 |")
 
 
 def test_postprocess_memory_attribution_percentages_are_gpu_only() -> None:
@@ -543,6 +544,64 @@ def test_postprocess_memory_attribution_percentages_are_gpu_only() -> None:
     assert "| Owner | unique bytes | unique MiB | % saved GPU | reference bytes | reference MiB | saves | unique tensors |" in text
     assert "| attention.softmax | 2097152 | 2.00 | 66.67% | 4194304 | 4.00 | 2 | 1 |" in text
     assert "| mlp.silu_mul_activation | 1048576 | 1.00 | 33.33% | 1048576 | 1.00 | 1 | 1 |" in text
+
+
+def test_postprocess_summarizes_ctc_gpu_metrics_by_step() -> None:
+    postprocess = _load_postprocess_nsys_lora_module()
+    con = sqlite3.connect(":memory:")
+    con.executescript(
+        """
+        create table GPU_METRICS(timestamp integer, typeId integer, metricId integer, value integer);
+        create table TARGET_INFO_GPU_METRICS(typeId integer, sourceId integer, typeName text, metricId integer, metricName text);
+        create table TARGET_INFO_GPU(id integer, name text, busLocation text);
+        create table NVTX_EVENTS(start integer, end integer, text text);
+        """
+    )
+    con.executemany(
+        "insert into TARGET_INFO_GPU_METRICS values (0, 0, '', ?, ?)",
+        [
+            (19, "CTC RX Throughput [Throughput %]"),
+            (20, "CTC TX Throughput [Throughput %]"),
+        ],
+    )
+    con.execute("insert into TARGET_INFO_GPU values (0, 'NVIDIA GB200', '0008:01:00.0')")
+    con.executemany(
+        "insert into NVTX_EVENTS values (?, ?, ?)",
+        [
+            (100, 300, "step.forward"),
+            (400, 600, "step.backward"),
+        ],
+    )
+    con.executemany(
+        "insert into GPU_METRICS values (?, 0, ?, ?)",
+        [
+            (100, 19, 10),
+            (200, 19, 80),
+            (300, 19, 100),
+            (400, 19, 40),
+            (500, 19, 60),
+            (600, 19, 90),
+            (100, 20, 5),
+            (200, 20, 15),
+            (300, 20, 25),
+        ],
+    )
+
+    metrics = postprocess.summarize_interconnect_metrics(con)
+
+    assert metrics["available"] is True
+    rx_summary = next(row for row in metrics["summary"]["rows"] if row["metric"] == "ctc_rx")
+    assert rx_summary["max_percent"] == pytest.approx(100.0)
+    forward_rx = next(
+        row
+        for row in metrics["range_summary"]["rows"]
+        if row["scope"] == "phase" and row["phase"] == "forward" and row["metric"] == "ctc_rx"
+    )
+    assert forward_rx["samples"] == 3
+    assert forward_rx["p95_percent"] == pytest.approx(98.0)
+    step_rx = next(row for row in metrics["range_summary"]["rows"] if row["scope"] == "step" and row["metric"] == "ctc_rx")
+    assert step_rx["max_percent"] == pytest.approx(100.0)
+    assert len(metrics["timeseries"]["rows"]) == 9
 
 
 def test_kt_backend_is_restricted_to_moe_workloads() -> None:
