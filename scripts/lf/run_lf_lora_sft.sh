@@ -321,6 +321,9 @@ if [[ "${PROFILE}" == "1" && -z "${PROFILE_SUMMARY_MD}" ]]; then
   PROFILE_SUMMARY_MD="${OUT_DIR}/summary.md"
 fi
 
+mkdir -p "${OUT_DIR}" "$(dirname "${LOG_FILE}")"
+: > "${LOG_FILE}"
+
 PY_CHECK='import torch, sys
 if not torch.cuda.is_available():
     raise SystemExit("CUDA is not available")
@@ -425,7 +428,7 @@ elif [[ "${BACKEND}" == kt_* ]]; then
   CMD_ARGS+=(--kt_tp_enabled "${KT_TP_ENABLED}")
 fi
 
-echo "RUN_ID=${RUN_ID}" | tee "${LOG_FILE}"
+echo "RUN_ID=${RUN_ID}" | tee -a "${LOG_FILE}"
 echo "OUT_DIR=${OUT_DIR}" | tee -a "${LOG_FILE}"
 echo "MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH}" | tee -a "${LOG_FILE}"
 echo "TEMPLATE=${TEMPLATE}" | tee -a "${LOG_FILE}"

@@ -49,6 +49,7 @@ GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 LORA_RANK=${LORA_RANK:-64}
 LORA_ALPHA=${LORA_ALPHA:-16}
+LORA_DROPOUT_ENV_SET=${LORA_DROPOUT+x}
 # LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
 LORA_DROPOUT=${LORA_DROPOUT:-0.10}
 SEED=${SEED:-42}
@@ -62,8 +63,8 @@ TORCH_FSDP_CONFIG=${TORCH_FSDP_CONFIG:-${LF_DIR}/examples/accelerate/fsdp2_confi
 # TORCH_DEEPSPEED_CONFIG=${TORCH_DEEPSPEED_CONFIG:-${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json}
 TORCH_DEEPSPEED_CONFIG=${TORCH_DEEPSPEED_CONFIG:-${LF_DIR}/examples/deepspeed/ds_z3_config.json}
 
-# Optional output/profile controls. When unset, KT-only sweeps write beside the
-# production KT repo; normal AsymGEMM sweeps write under the AsymGEMM repo.
+# Optional output/profile controls. When unset, sweeps that include KT write
+# beside the production KT repo; normal AsymGEMM sweeps write under this repo.
 OUTPUT_ROOT=${OUTPUT_ROOT:-}
 PROFILE_LEVEL=${PROFILE_LEVEL:-op}
 PROFILE_LAYERS=${PROFILE_LAYERS:-all}
@@ -88,7 +89,7 @@ CHECK_KT_CALLS=${CHECK_KT_CALLS:-1}
 # Optional loss-comparison controls
 COMPARE_LOSSES=${COMPARE_LOSSES:-true}
 COMPARE_BASELINE_BACKEND=${COMPARE_BASELINE_BACKEND:-torch}
-COMPARE_CANDIDATE_BACKEND=${COMPARE_CANDIDATE_BACKEND:-asym}
+COMPARE_CANDIDATE_BACKEND=${COMPARE_CANDIDATE_BACKEND:-asym,kt_torchbf16,kt_armbf16}
 COMPARE_FIRST_STEP_REL_TOL=${COMPARE_FIRST_STEP_REL_TOL:-0.02}
 COMPARE_MAX_REL_TOL=${COMPARE_MAX_REL_TOL:-0.10}
 
@@ -629,6 +630,8 @@ batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}"
 template_spec="${TEMPLATE}"
 backend_specs_cli_set=false
 legacy_backend_axes_cli_set=false
+lora_dropout_user_set=false
+[[ -n "${LORA_DROPOUT_ENV_SET}" ]] && lora_dropout_user_set=true
 
 while (($#)); do
   case "$1" in
@@ -679,8 +682,8 @@ while (($#)); do
     --lora-alpha=*) LORA_ALPHA="${1#*=}"; shift ;;
     --seed) need_value "$1" "${2-}"; SEED="$2"; shift 2 ;;
     --seed=*) SEED="${1#*=}"; shift ;;
-    --lora-dropout) collect_values "$1" vals "${@:2}"; lora_dropout_spec="${vals[*]}"; LORA_DROPOUT="${lora_dropout_spec}"; set -- "${REMAINING[@]}" ;;
-    --lora-dropout=*) lora_dropout_spec="${1#*=}"; LORA_DROPOUT="${lora_dropout_spec}"; shift ;;
+    --lora-dropout) collect_values "$1" vals "${@:2}"; lora_dropout_spec="${vals[*]}"; LORA_DROPOUT="${lora_dropout_spec}"; lora_dropout_user_set=true; set -- "${REMAINING[@]}" ;;
+    --lora-dropout=*) lora_dropout_spec="${1#*=}"; LORA_DROPOUT="${lora_dropout_spec}"; lora_dropout_user_set=true; shift ;;
     --precision) need_value "$1" "${2-}"; PRECISION="$2"; shift 2 ;;
     --precision=*) PRECISION="${1#*=}"; shift ;;
     --profile-level) need_value "$1" "${2-}"; PROFILE_LEVEL="$2"; shift 2 ;;
@@ -803,11 +806,22 @@ for backend in "${backends[@]}"; do
   esac
 done
 if [[ -z "${output_root}" ]]; then
-  if [[ "${selected_has_kt}" == "true" && "${selected_has_asym}" != "true" ]]; then
+  if [[ "${selected_has_kt}" == "true" ]]; then
     output_root="${KT_REPO_DIR}/profiling_kt"
   else
     output_root="${ASYM_DIR}/profiling"
   fi
+fi
+if [[ "${selected_has_kt}" == "true" && "${lora_dropout_user_set}" != "true" ]]; then
+  lora_dropout_spec="0.00"
+  mapfile -t lora_dropouts < <(tokens "${lora_dropout_spec}" | dedupe)
+  LORA_DROPOUT="${lora_dropouts[0]}"
+  lora_dropout_label_value="$(lora_dropout_label "${LORA_DROPOUT}")"
+fi
+if [[ "${selected_has_kt}" == "true" ]]; then
+  for value in "${lora_dropouts[@]}"; do
+    [[ "${value}" == "0.00" ]] || die "KT SFT profiling currently requires --lora-dropout 0.00; got '${value}'"
+  done
 fi
 mapfile -t profilers < <(tokens "${profiler_spec}" | while read -r value; do profiler_label "${value}"; done | dedupe)
 if printf '%s\n' "${profilers[@]}" | grep -qx 'nsys'; then
@@ -871,8 +885,11 @@ fi
 COMPARE_LOSSES=$(bool_value "${COMPARE_LOSSES}")
 PLOT_MEMORY_BREAKDOWN=$(bool_value "${PLOT_MEMORY_BREAKDOWN}")
 compare_baseline_backend="$(backend_label "${COMPARE_BASELINE_BACKEND}")"
-compare_candidate_backend="$(backend_label "${COMPARE_CANDIDATE_BACKEND}")"
-[[ "${compare_baseline_backend}" != "${compare_candidate_backend}" ]] || die "compare backends must differ"
+mapfile -t compare_candidate_backends < <(tokens "${COMPARE_CANDIDATE_BACKEND}" | while read -r value; do backend_label "${value}"; done | dedupe)
+((${#compare_candidate_backends[@]} > 0)) || die "compare candidate backend list is empty"
+for compare_candidate_backend in "${compare_candidate_backends[@]}"; do
+  [[ "${compare_baseline_backend}" != "${compare_candidate_backend}" ]] || die "compare backends must differ"
+done
 
 base_output_root="$(abs_path "${output_root}")"
 precision_label="$(safe_label "${PRECISION}")"
@@ -1222,20 +1239,25 @@ run_job() {
 }
 
 baseline_selected=false
-candidate_selected=false
+declare -A candidate_backend_selected=()
+for compare_candidate_backend in "${compare_candidate_backends[@]}"; do
+  candidate_backend_selected["${compare_candidate_backend}"]=false
+done
 for backend in "${backends[@]}"; do
   [[ "${backend}" == "${compare_baseline_backend}" ]] && baseline_selected=true
-  [[ "${backend}" == "${compare_candidate_backend}" ]] && candidate_selected=true
+  for compare_candidate_backend in "${compare_candidate_backends[@]}"; do
+    [[ "${backend}" == "${compare_candidate_backend}" ]] && candidate_backend_selected["${compare_candidate_backend}"]=true
+  done
 done
 
 compare_config_root() {
   local target_config_root="$1"
   local group_key baseline_dir candidate_dir config_root compare_dir compare_tsv compare_log status
-  local group_tail group_expert_policy
+  local group_tail group_expert_policy compare_candidate_backend
 
   [[ "${COMPARE_LOSSES}" == "true" ]] || return 0
-  if [[ "${baseline_selected}" != "true" || "${candidate_selected}" != "true" ]]; then
-    echo "Skipping loss comparison because selected backends do not include both ${compare_baseline_backend} and ${compare_candidate_backend}."
+  if [[ "${baseline_selected}" != "true" ]]; then
+    echo "Skipping loss comparison because selected backends do not include baseline ${compare_baseline_backend}."
     return 0
   fi
 
@@ -1244,55 +1266,62 @@ compare_config_root() {
   mkdir -p "${compare_dir}"
   printf 'status\tbaseline_backend\tcandidate_backend\tbaseline_dir\tcandidate_dir\tlog\tlabel\n' > "${compare_tsv}"
 
-  for group_key in "${compare_group_keys[@]}"; do
-    config_root="${compare_group_config_roots[${group_key}]}"
-    [[ "${config_root}" == "${target_config_root}" ]] || continue
-    group_tail="${group_key%|*}"
-    group_expert_policy="${group_tail##*|}"
-	    if [[ "${group_expert_policy}" != "none" && ( "${compare_baseline_backend}" == torch* || "${compare_candidate_backend}" == torch* || "${compare_baseline_backend}" == kt_* || "${compare_candidate_backend}" == kt_* ) ]]; then
-	      echo "Skipping loss comparison for ${compare_group_labels[${group_key}]}; torch/KT backends are policy-independent."
-      continue
-    fi
-    baseline_dir="${run_dirs[${group_key}|${compare_baseline_backend}]-}"
-    candidate_dir="${run_dirs[${group_key}|${compare_candidate_backend}]-}"
-    compare_log="${compare_dir}/$(safe_label "${compare_group_labels[${group_key}]} ${compare_baseline_backend} vs ${compare_candidate_backend}").log"
-
-    if [[ -z "${baseline_dir}" || -z "${candidate_dir}" ]]; then
-      echo "Missing loss comparison input for ${compare_group_labels[${group_key}]}" | tee "${compare_log}"
-      printf 'missing\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "${compare_baseline_backend}" "${compare_candidate_backend}" "${baseline_dir}" "${candidate_dir}" "${compare_log}" "${compare_group_labels[${group_key}]}" \
-        >> "${compare_tsv}"
-      failures=$((failures + 1))
-      if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
-        exit 1
-      fi
+  for compare_candidate_backend in "${compare_candidate_backends[@]}"; do
+    if [[ "${candidate_backend_selected[${compare_candidate_backend}]}" != "true" ]]; then
+      echo "Skipping loss comparison for candidate ${compare_candidate_backend}; selected backends do not include it."
       continue
     fi
 
-    echo "Comparing losses: ${compare_group_labels[${group_key}]} ${compare_baseline_backend} vs ${compare_candidate_backend}" | tee "${compare_log}"
-    local -a compare_cmd=(
-      "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PROFILE_POSTPROCESS_SCRIPT}"
-      --baseline-dir "${baseline_dir}"
-      --candidate-dir "${candidate_dir}"
-      --min-steps "${COMPARE_MIN_STEPS}"
-      --warmup-steps "${WARMUP_STEPS}"
-      --first-step-rel-tol "${COMPARE_FIRST_STEP_REL_TOL}"
-      --max-rel-tol "${COMPARE_MAX_REL_TOL}"
-    )
-    if run_tracked_command_logged "${compare_log}" "${compare_cmd[@]}"; then
-      printf 'ok\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "${compare_baseline_backend}" "${compare_candidate_backend}" "${baseline_dir}" "${candidate_dir}" "${compare_log}" "${compare_group_labels[${group_key}]}" \
-        >> "${compare_tsv}"
-    else
-      status=$?
-      printf 'failed:%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "${status}" "${compare_baseline_backend}" "${compare_candidate_backend}" "${baseline_dir}" "${candidate_dir}" "${compare_log}" "${compare_group_labels[${group_key}]}" \
-        >> "${compare_tsv}"
-      failures=$((failures + 1))
-      if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
-        exit 1
+    for group_key in "${compare_group_keys[@]}"; do
+      config_root="${compare_group_config_roots[${group_key}]}"
+      [[ "${config_root}" == "${target_config_root}" ]] || continue
+      group_tail="${group_key%|*}"
+      group_expert_policy="${group_tail##*|}"
+      if [[ "${group_expert_policy}" != "none" && ( "${compare_baseline_backend}" == torch* || "${compare_candidate_backend}" == torch* || "${compare_baseline_backend}" == kt_* || "${compare_candidate_backend}" == kt_* ) ]]; then
+        echo "Skipping loss comparison for ${compare_group_labels[${group_key}]}; torch/KT backends are policy-independent."
+        continue
       fi
-    fi
+      baseline_dir="${run_dirs[${group_key}|${compare_baseline_backend}]-}"
+      candidate_dir="${run_dirs[${group_key}|${compare_candidate_backend}]-}"
+      compare_log="${compare_dir}/$(safe_label "${compare_group_labels[${group_key}]} ${compare_baseline_backend} vs ${compare_candidate_backend}").log"
+
+      if [[ -z "${baseline_dir}" || -z "${candidate_dir}" ]]; then
+        echo "Missing loss comparison input for ${compare_group_labels[${group_key}]}" | tee "${compare_log}"
+        printf 'missing\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "${compare_baseline_backend}" "${compare_candidate_backend}" "${baseline_dir}" "${candidate_dir}" "${compare_log}" "${compare_group_labels[${group_key}]}" \
+          >> "${compare_tsv}"
+        failures=$((failures + 1))
+        if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
+          exit 1
+        fi
+        continue
+      fi
+
+      echo "Comparing losses: ${compare_group_labels[${group_key}]} ${compare_baseline_backend} vs ${compare_candidate_backend}" | tee "${compare_log}"
+      local -a compare_cmd=(
+        "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PROFILE_POSTPROCESS_SCRIPT}"
+        --baseline-dir "${baseline_dir}"
+        --candidate-dir "${candidate_dir}"
+        --min-steps "${COMPARE_MIN_STEPS}"
+        --warmup-steps "${WARMUP_STEPS}"
+        --first-step-rel-tol "${COMPARE_FIRST_STEP_REL_TOL}"
+        --max-rel-tol "${COMPARE_MAX_REL_TOL}"
+      )
+      if run_tracked_command_logged "${compare_log}" "${compare_cmd[@]}"; then
+        printf 'ok\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "${compare_baseline_backend}" "${compare_candidate_backend}" "${baseline_dir}" "${candidate_dir}" "${compare_log}" "${compare_group_labels[${group_key}]}" \
+          >> "${compare_tsv}"
+      else
+        status=$?
+        printf 'failed:%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "${status}" "${compare_baseline_backend}" "${compare_candidate_backend}" "${baseline_dir}" "${candidate_dir}" "${compare_log}" "${compare_group_labels[${group_key}]}" \
+          >> "${compare_tsv}"
+        failures=$((failures + 1))
+        if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
+          exit 1
+        fi
+      fi
+    done
   done
 }
 
