@@ -17,16 +17,7 @@ EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le0,tok-le512,tok-le1024,tok-le512-a
 
 # Primary backend sweep axis. Each entry is backend|recompute; recompute aliases
 # such as recompute/norecompute normalize to recomp/norecomp internally.
-if [[ -z "${BACKEND_SPECS+x}" ]]; then
-  if [[ -n "${BACKENDS+x}" || -n "${RECOMPUTE+x}" ]]; then
-    BACKEND_SPECS=
-  else
-    BACKEND_SPECS="asym|norecompute,torch|norecompute,torch|recompute"
-  fi
-fi
-BACKENDS=${BACKENDS:-asym,torch}  # legacy; used only when BACKEND_SPECS is empty or --backends/--recompute is passed
-RECOMPUTE=${RECOMPUTE:-norecomp}  # legacy; use BACKEND_SPECS for new sweeps
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym|norecompute,torch|recompute"}
+BACKEND_SPECS=${BACKEND_SPECS:-"asym|norecompute,torch|norecompute,torch|recompute"}
 PROFILERS=${PROFILERS:-nsys}
 PRECISION=${PRECISION:-bf16} 
 
@@ -114,7 +105,7 @@ Usage:
 
 Defaults:
   --gpus ${GPU_POOL}
-  --backend-specs ${BACKEND_SPECS:-"<legacy: ${BACKENDS}|${RECOMPUTE}>"}
+  --backend-specs ${BACKEND_SPECS}
   --profilers ${PROFILERS}
   --seq-lens ${SEQ_LENS}
   --output-root ${OUTPUT_ROOT}
@@ -127,10 +118,8 @@ Options:
                                  Example: meta-llama/Llama-4-Scout-17B-16E|1,meta-llama/Llama-4-Maverick-17B-128E|4
   --backend-specs LIST           Backend/recompute specs, e.g. 'asym|norecompute,torch|recompute'.
                                  Accepts recompute/norecompute or recomp/norecomp.
-  --backends LIST                Legacy: asym and/or torch. Combined with --recompute.
   --profilers LIST               source and/or nsys.
   --seq-lens LIST                LF cutoff lengths. Accepts positive integers, e.g. 4096,8192.
-  --recompute norecomp|recomp|both  Legacy: expands every backend to the selected recompute mode(s).
   --expert-policies LIST         AsymGEMM expert policies: none, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, and -act variants.
   --dataset NAME
   --prepare-datasets true|false  Build/audit model+length-specific LF datasets before training.
@@ -349,7 +338,7 @@ normalize_expert_policy() {
 backend_label() {
   case "${1,,}" in
     asym) printf 'asym\n' ;;
-    torch|asym_torch) printf 'torch\n' ;;
+    torch) printf 'torch\n' ;;
     *) die "backend must be asym or torch, got '${1}'" ;;
   esac
 }
@@ -359,13 +348,9 @@ expand_backend_spec() {
   local backend_part recompute_part backend recompute_token recompute_mode
   local -a recompute_tokens recompute_modes_for_spec
 
-  if [[ "${raw}" == *"|"* ]]; then
-    backend_part="${raw%%|*}"
-    recompute_part="${raw#*|}"
-  else
-    backend_part="${raw}"
-    recompute_part="norecomp"
-  fi
+  [[ "${raw}" == *"|"* ]] || die "backend spec must be backend|recompute, got '${raw}'"
+  backend_part="${raw%%|*}"
+  recompute_part="${raw#*|}"
 
   [[ -n "${backend_part}" ]] || die "empty backend in backend spec '${raw}'"
   [[ -n "${recompute_part}" ]] || die "empty recompute mode in backend spec '${raw}'"
@@ -377,21 +362,6 @@ expand_backend_spec() {
     mapfile -t recompute_modes_for_spec < <(recompute_values "${recompute_token}")
     for recompute_mode in "${recompute_modes_for_spec[@]}"; do
       printf '%s|%s\n' "${backend}" "${recompute_mode}"
-    done
-  done
-}
-
-expand_legacy_backend_specs() {
-  local backend_spec="$1"
-  local recompute_spec="$2"
-  local backend recompute
-  local -a legacy_backends legacy_recompute_modes
-
-  mapfile -t legacy_backends < <(tokens "${backend_spec}" | while read -r backend; do backend_label "${backend}"; done | dedupe)
-  mapfile -t legacy_recompute_modes < <(recompute_values "${recompute_spec}")
-  for backend in "${legacy_backends[@]}"; do
-    for recompute in "${legacy_recompute_modes[@]}"; do
-      printf '%s|%s\n' "${backend}" "${recompute}"
     done
   done
 }
@@ -588,18 +558,14 @@ prepare_dataset_for_seq() {
 gpu_spec="${GPU_POOL}"
 model_spec="${MODEL_SPECS}"
 backend_specs_spec="${BACKEND_SPECS}"
-backend_spec="${BACKENDS}"
 profiler_spec="${PROFILERS}"
 seq_spec="${SEQ_LENS}"
-recompute_spec="${RECOMPUTE}"
 expert_policy_spec="${EXPERT_POLICIES}"
 lora_dropout_spec="${LORA_DROPOUT}"
 output_root="${OUTPUT_ROOT}"
 run_name="${RUN_NAME}"
 batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}"
 template_spec="${TEMPLATE}"
-backend_specs_cli_set=false
-legacy_backend_axes_cli_set=false
 
 while (($#)); do
   case "$1" in
@@ -608,16 +574,12 @@ while (($#)); do
     --gpus=*) gpu_spec="${1#*=}"; shift ;;
     --models|--model-specs) collect_values "$1" vals "${@:2}"; model_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
     --models=*|--model-specs=*) model_spec="${1#*=}"; shift ;;
-    --backend-specs|--backend-spec) collect_values "$1" vals "${@:2}"; backend_specs_spec="${vals[*]}"; backend_specs_cli_set=true; set -- "${REMAINING[@]}" ;;
-    --backend-specs=*|--backend-spec=*) backend_specs_spec="${1#*=}"; backend_specs_cli_set=true; shift ;;
-    --backends) need_value "$1" "${2-}"; backend_spec="$2"; backend_specs_spec=""; legacy_backend_axes_cli_set=true; shift 2 ;;
-    --backends=*) backend_spec="${1#*=}"; backend_specs_spec=""; legacy_backend_axes_cli_set=true; shift ;;
+    --backend-specs) collect_values "$1" vals "${@:2}"; backend_specs_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
+    --backend-specs=*) backend_specs_spec="${1#*=}"; shift ;;
     --profilers) need_value "$1" "${2-}"; profiler_spec="$2"; shift 2 ;;
     --profilers=*) profiler_spec="${1#*=}"; shift ;;
     --seq-lens) need_value "$1" "${2-}"; seq_spec="$2"; shift 2 ;;
     --seq-lens=*) seq_spec="${1#*=}"; shift ;;
-    --recompute) need_value "$1" "${2-}"; recompute_spec="$2"; backend_specs_spec=""; legacy_backend_axes_cli_set=true; shift 2 ;;
-    --recompute=*) recompute_spec="${1#*=}"; backend_specs_spec=""; legacy_backend_axes_cli_set=true; shift ;;
     --expert-policies) need_value "$1" "${2-}"; expert_policy_spec="$2"; shift 2 ;;
     --expert-policies=*) expert_policy_spec="${1#*=}"; shift ;;
     --dataset) need_value "$1" "${2-}"; DATASET="$2"; shift 2 ;;
@@ -712,14 +674,9 @@ while (($#)); do
   esac
 done
 
-if [[ "${backend_specs_cli_set}" == "true" && "${legacy_backend_axes_cli_set}" == "true" ]]; then
-  die "--backend-specs cannot be combined with --backends or --recompute"
-fi
-
 require_comma_list "--gpus/GPU_POOL" "${gpu_spec}"
 require_comma_list "--models/MODEL_SPECS" "${model_spec}"
 require_comma_list "--backend-specs/BACKEND_SPECS" "${backend_specs_spec}"
-require_comma_list "--backends/BACKENDS" "${backend_spec}"
 require_comma_list "--profilers/PROFILERS" "${profiler_spec}"
 require_comma_list "--seq-lens/SEQ_LENS" "${seq_spec}"
 require_comma_list "--expert-policies/EXPERT_POLICIES" "${expert_policy_spec}"
@@ -756,11 +713,8 @@ fi
 
 mapfile -t gpus < <(tokens "${gpu_spec}" | sed 's/^cuda://' | dedupe)
 mapfile -t model_specs < <(tokens "${model_spec}" | dedupe)
-if [[ -n "${backend_specs_spec}" ]]; then
-  mapfile -t backend_specs < <(tokens "${backend_specs_spec}" | while read -r value; do expand_backend_spec "${value}"; done | dedupe)
-else
-  mapfile -t backend_specs < <(expand_legacy_backend_specs "${backend_spec}" "${recompute_spec}" | dedupe)
-fi
+mapfile -t backend_specs < <(tokens "${backend_specs_spec}" | while read -r value; do expand_backend_spec "${value}"; done | dedupe)
+((${#backend_specs[@]} > 0)) || die "BACKEND_SPECS must include at least one backend|recompute spec"
 mapfile -t backends < <(printf '%s\n' "${backend_specs[@]}" | cut -d '|' -f1 | dedupe)
 mapfile -t recompute_modes < <(printf '%s\n' "${backend_specs[@]}" | cut -d '|' -f2 | dedupe)
 mapfile -t profilers < <(tokens "${profiler_spec}" | while read -r value; do profiler_label "${value}"; done | dedupe)
@@ -1033,7 +987,6 @@ run_job() {
     ROOT="${ROOT}"
     LF_DIR="${LF_DIR}"
     ASYM_DIR="${ASYM_DIR}"
-    BACKENDS=
     ENV_DIR="${ENV_DIR}"
     CONDA_EXE="${CONDA_EXE}"
     NSYS_BIN="${NSYS_BIN}"
