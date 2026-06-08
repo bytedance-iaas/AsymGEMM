@@ -2,6 +2,12 @@
 set -euo pipefail
 set -o pipefail
 
+if (($# > 0)); then
+  echo "run_lf_lora_sft.sh does not accept command-line arguments; set environment variables or use profile_lora_lf.sh." >&2
+  echo "Unexpected arguments: $*" >&2
+  exit 2
+fi
+
 # =============================================================================
 # User Parameters
 # =============================================================================
@@ -13,7 +19,7 @@ KT_KERNEL_DIR=${KT_KERNEL_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/k
 DEEPSPEED_DIR=${DEEPSPEED_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/deepspeed}
 CONDA_EXE=${CONDA_EXE:-conda}
 NSYS_BIN=${NSYS_BIN:-nsys}
-DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun} # torchrun | accelerate
+DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun} # torchrun | accelerate | deepspeed
 
 # Workload and placement
 MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-Qwen/Qwen3-30B-A3B}
@@ -54,7 +60,6 @@ KT_NUM_THREADS=${KT_NUM_THREADS:-}
 KT_THREADPOOL_COUNT=${KT_THREADPOOL_COUNT:-}
 KT_MAX_CACHE_DEPTH=${KT_MAX_CACHE_DEPTH:-2}
 KT_SHARE_BACKWARD_BB=${KT_SHARE_BACKWARD_BB:-}
-KT_SHARE_CACHE_POOL=${KT_SHARE_CACHE_POOL:-}
 KT_TP_ENABLED=${KT_TP_ENABLED:-false}
 KT_NUM_GPU_EXPERTS=${KT_NUM_GPU_EXPERTS:-}
 KT_WEIGHT_PATH=${KT_WEIGHT_PATH:-}
@@ -80,8 +85,11 @@ PROFILE_MEMORY_ATTRIBUTION=${PROFILE_MEMORY_ATTRIBUTION:-auto}
 PROFILE_MEMORY_BREAKDOWN=${PROFILE_MEMORY_BREAKDOWN:-auto}
 PROFILE_MEMORY_BREAKDOWN_INTERVAL=${PROFILE_MEMORY_BREAKDOWN_INTERVAL:-1}
 PROFILE_MEMORY_BREAKDOWN_STEPS=${PROFILE_MEMORY_BREAKDOWN_STEPS:-}
-PROFILE_MEMORY_BREAKDOWN_MODULES=${PROFILE_MEMORY_BREAKDOWN_MODULES:-attention,router,mlp,experts,lora,embedding,loss}
+PROFILE_MEMORY_BREAKDOWN_MODULES=${PROFILE_MEMORY_BREAKDOWN_MODULES:-attention,router,mlp,experts,shared_experts,lora,embedding,loss}
 PROFILE_MEMORY_BREAKDOWN_OUTPUT=${PROFILE_MEMORY_BREAKDOWN_OUTPUT:-memory_breakdown}
+PROFILE_MEMORY_SNAPSHOT=${PROFILE_MEMORY_SNAPSHOT:-false}
+PROFILE_MEMORY_SNAPSHOT_PATH=${PROFILE_MEMORY_SNAPSHOT_PATH:-}
+PROFILE_EXTERNAL_MEMORY=${PROFILE_EXTERNAL_MEMORY:-false}
 PROFILE_SYNC=${PROFILE_SYNC:-0}
 PROFILE_MODULE_FILTER=${PROFILE_MODULE_FILTER:-attention,router,mlp,experts,lora,optimizer,kt}
 PROFILE_SOURCE_JSON=${PROFILE_SOURCE_JSON:-}
@@ -104,8 +112,10 @@ ASYM_DIR=${ASYM_DIR:-${ROOT}}
 KT_TOOLS_DIR=${KT_TOOLS_DIR:-${ASYM_DIR}}
 ENV_DIR=${ENV_DIR:-${LF_DIR}/.venv}
 ENV_PYTHON=${ENV_PYTHON:-${ENV_DIR}/bin/python}
+LF_CLI_BIN=${LF_CLI_BIN:-${ENV_DIR}/bin/llamafactory-cli}
 TORCHRUN_BIN=${TORCHRUN_BIN:-${ENV_DIR}/bin/torchrun}
 ACCELERATE_BIN=${ACCELERATE_BIN:-${ENV_DIR}/bin/accelerate}
+DEEPSPEED_BIN=${DEEPSPEED_BIN:-${ENV_DIR}/bin/deepspeed}
 CHECK_SUPEROFFLOAD_SCRIPT=${CHECK_SUPEROFFLOAD_SCRIPT:-${ASYM_DIR}/scripts/lf/check_superoffload_run.py}
 unset KT_BACKEND                      # Not user-facing; derive the KT enum only from BACKEND.
 KT_BACKEND_INTERNAL=""
@@ -113,6 +123,7 @@ ZERO_BACKEND_LABEL=""
 TORCH_DEEPSPEED_CONFIG=""
 TORCHRUN_CMD=()
 ACCELERATE_CMD=()
+DEEPSPEED_CMD=()
 
 zero_deepspeed_config() {
   case "${1}" in
@@ -169,7 +180,8 @@ esac
 case "${DIST_LAUNCHER,,}" in
   torchrun) DIST_LAUNCHER=torchrun ;;
   accelerate|accelerate_launch) DIST_LAUNCHER=accelerate ;;
-  *) echo "DIST_LAUNCHER must be torchrun or accelerate, got '${DIST_LAUNCHER}'" >&2; exit 2 ;;
+  deepspeed|ds) DIST_LAUNCHER=deepspeed ;;
+  *) echo "DIST_LAUNCHER must be torchrun, accelerate, or deepspeed, got '${DIST_LAUNCHER}'" >&2; exit 2 ;;
 esac
 
 if [[ "${BACKEND}" == "torch" || "${BACKEND}" == kt_* ]]; then
@@ -342,6 +354,8 @@ esac
 
 PROFILE_MEMORY_ATTRIBUTION="$(profile_memory_flag PROFILE_MEMORY_ATTRIBUTION "${PROFILE_MEMORY_ATTRIBUTION}" "${PROFILE_PROFILER}")"
 PROFILE_MEMORY_BREAKDOWN="$(profile_memory_flag PROFILE_MEMORY_BREAKDOWN "${PROFILE_MEMORY_BREAKDOWN}" "${PROFILE_PROFILER}")"
+PROFILE_MEMORY_SNAPSHOT="$(profile_memory_flag PROFILE_MEMORY_SNAPSHOT "${PROFILE_MEMORY_SNAPSHOT}" "${PROFILE_PROFILER}")"
+PROFILE_EXTERNAL_MEMORY="$(profile_memory_flag PROFILE_EXTERNAL_MEMORY "${PROFILE_EXTERNAL_MEMORY}" "${PROFILE_PROFILER}")"
 
 case "${ASYM_ROUTER_MODE,,}" in
   hf) ASYM_ROUTER_MODE=hf ;;
@@ -363,7 +377,6 @@ if [[ "${BACKEND}" == kt_* ]]; then
   CHECK_KT_CALLS="$(bool_01 CHECK_KT_CALLS "${CHECK_KT_CALLS}")"
   KT_TP_ENABLED="$(bool_string KT_TP_ENABLED "${KT_TP_ENABLED}")"
   KT_SHARE_BACKWARD_BB="$(optional_bool_string KT_SHARE_BACKWARD_BB "${KT_SHARE_BACKWARD_BB}")"
-  KT_SHARE_CACHE_POOL="$(optional_bool_string KT_SHARE_CACHE_POOL "${KT_SHARE_CACHE_POOL}")"
   KT_USE_LORA_EXPERTS="$(optional_bool_string KT_USE_LORA_EXPERTS "${KT_USE_LORA_EXPERTS}")"
   [[ -z "${KT_NUM_THREADS}" ]] || positive_int_value KT_NUM_THREADS "${KT_NUM_THREADS}"
   [[ -z "${KT_THREADPOOL_COUNT}" ]] || positive_int_value KT_THREADPOOL_COUNT "${KT_THREADPOOL_COUNT}"
@@ -400,6 +413,10 @@ if [[ ! -x "${ENV_PYTHON}" ]]; then
   echo "Missing environment Python ${ENV_PYTHON}" >&2
   exit 2
 fi
+if [[ "${PROFILE}" != "1" ]] && ! is_torch_run && [[ ! -x "${LF_CLI_BIN}" ]]; then
+  echo "Missing LlamaFactory CLI ${LF_CLI_BIN}" >&2
+  exit 2
+fi
 
 if is_torch_run && [[ "${DIST_LAUNCHER}" == "torchrun" ]]; then
   if [[ -x "${TORCHRUN_BIN}" ]]; then
@@ -418,6 +435,16 @@ if is_torch_run && [[ "${DIST_LAUNCHER}" == "accelerate" ]]; then
     ACCELERATE_CMD=(accelerate)
   else
     echo "Missing accelerate executable ${ACCELERATE_BIN}" >&2
+    exit 2
+  fi
+fi
+if is_torch_run && [[ "${DIST_LAUNCHER}" == "deepspeed" ]]; then
+  if [[ -x "${DEEPSPEED_BIN}" ]]; then
+    DEEPSPEED_CMD=("${DEEPSPEED_BIN}")
+  elif command -v deepspeed >/dev/null 2>&1; then
+    DEEPSPEED_CMD=(deepspeed)
+  else
+    echo "Missing deepspeed executable ${DEEPSPEED_BIN}" >&2
     exit 2
   fi
 fi
@@ -594,7 +621,8 @@ log_kv() {
 }
 
 log_kv_if_set() {
-  [[ -n "$2" ]] && log_kv "$1" "$2"
+  [[ -z "$2" ]] || log_kv "$1" "$2"
+  return 0
 }
 
 handle_managed_interrupt() {
@@ -745,7 +773,6 @@ if [[ "${BACKEND}" == kt_* ]]; then
   log_kv_if_set KT_MAX_CACHE_DEPTH "${KT_MAX_CACHE_DEPTH}"
   log_kv KT_TP_ENABLED "${KT_TP_ENABLED}"
   log_kv_if_set KT_SHARE_BACKWARD_BB "${KT_SHARE_BACKWARD_BB}"
-  log_kv_if_set KT_SHARE_CACHE_POOL "${KT_SHARE_CACHE_POOL}"
   log_kv_if_set KT_NUM_GPU_EXPERTS "${KT_NUM_GPU_EXPERTS}"
   log_kv_if_set KT_WEIGHT_PATH "${KT_WEIGHT_PATH}"
   log_kv_if_set KT_EXPERT_CHECKPOINT_PATH "${KT_EXPERT_CHECKPOINT_PATH}"
@@ -756,22 +783,22 @@ fi
 if is_zero_backend_run; then
   log_kv ZERO_BACKEND_LABEL "${ZERO_BACKEND_LABEL}"
   log_kv TORCH_DEEPSPEED_CONFIG "${TORCH_DEEPSPEED_CONFIG}"
-  if [[ "${DIST_LAUNCHER}" == "torchrun" ]]; then
-    log_kv TORCHRUN_CMD "${TORCHRUN_CMD[*]}"
-  else
-    log_kv ACCELERATE_CMD "${ACCELERATE_CMD[*]}"
-  fi
+  case "${DIST_LAUNCHER}" in
+    torchrun) log_kv TORCHRUN_CMD "${TORCHRUN_CMD[*]}" ;;
+    accelerate) log_kv ACCELERATE_CMD "${ACCELERATE_CMD[*]}" ;;
+    deepspeed) log_kv DEEPSPEED_CMD "${DEEPSPEED_CMD[*]}" ;;
+  esac
   log_kv MASTER_PORT "${MASTER_PORT_VALUE}"
   if is_superoffload_zero_run; then
     log_kv DEEPSPEED_DIR "${DEEPSPEED_DIR}"
     log_kv CHECK_SUPEROFFLOAD "${CHECK_SUPEROFFLOAD}"
   fi
 elif is_plain_torch_run; then
-  if [[ "${DIST_LAUNCHER}" == "torchrun" ]]; then
-    log_kv TORCHRUN_CMD "${TORCHRUN_CMD[*]}"
-  else
-    log_kv ACCELERATE_CMD "${ACCELERATE_CMD[*]}"
-  fi
+  case "${DIST_LAUNCHER}" in
+    torchrun) log_kv TORCHRUN_CMD "${TORCHRUN_CMD[*]}" ;;
+    accelerate) log_kv ACCELERATE_CMD "${ACCELERATE_CMD[*]}" ;;
+    deepspeed) log_kv DEEPSPEED_CMD "${DEEPSPEED_CMD[*]}" ;;
+  esac
   log_kv MASTER_PORT "${MASTER_PORT_VALUE}"
 fi
 log_kv ASYM_EXPERT_RECOMPUTE_POLICY "${ASYM_EXPERT_RECOMPUTE_POLICY}"
@@ -787,6 +814,9 @@ if [[ "${PROFILE}" == "1" ]]; then
   log_kv_if_set PROFILE_MEMORY_BREAKDOWN_STEPS "${PROFILE_MEMORY_BREAKDOWN_STEPS}"
   log_kv PROFILE_MEMORY_BREAKDOWN_MODULES "${PROFILE_MEMORY_BREAKDOWN_MODULES}"
   log_kv PROFILE_MEMORY_BREAKDOWN_OUTPUT "${PROFILE_MEMORY_BREAKDOWN_OUTPUT}"
+  log_kv PROFILE_MEMORY_SNAPSHOT "${PROFILE_MEMORY_SNAPSHOT}"
+  log_kv_if_set PROFILE_MEMORY_SNAPSHOT_PATH "${PROFILE_MEMORY_SNAPSHOT_PATH}"
+  log_kv PROFILE_EXTERNAL_MEMORY "${PROFILE_EXTERNAL_MEMORY}"
   log_kv PROFILE_SYNC "${PROFILE_SYNC}"
   log_kv PROFILE_MODULE_FILTER "${PROFILE_MODULE_FILTER}"
   log_kv PROFILE_SOURCE_JSON "${PROFILE_SOURCE_JSON}"
@@ -809,10 +839,15 @@ elif [[ "${BACKEND}" == kt_* ]]; then
 fi
 
 RUN_ENV=(
-  CUDA_VISIBLE_DEVICES="${GPU_ID}"
   PATH="${ENV_DIR}/bin:${PATH}"
   PYTHONPATH="${RUN_PYTHONPATH}"
 )
+ENV_CMD=(env)
+if ! { is_torch_run && [[ "${DIST_LAUNCHER}" == "deepspeed" ]]; }; then
+  RUN_ENV=(CUDA_VISIBLE_DEVICES="${GPU_ID}" "${RUN_ENV[@]}")
+else
+  ENV_CMD+=( -u CUDA_VISIBLE_DEVICES )
+fi
 if [[ "${BACKEND}" == kt_* ]]; then
   RUN_ENV+=(
     USE_KT=1
@@ -839,7 +874,6 @@ if [[ "${BACKEND}" == kt_* ]]; then
   [[ -z "${KT_THREADPOOL_COUNT}" ]] || RUN_ENV+=(ACCELERATE_KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT}")
   [[ -z "${KT_MAX_CACHE_DEPTH}" ]] || RUN_ENV+=(ACCELERATE_KT_MAX_CACHE_DEPTH="${KT_MAX_CACHE_DEPTH}")
   [[ -z "${KT_SHARE_BACKWARD_BB}" ]] || RUN_ENV+=(ACCELERATE_KT_SHARE_BACKWARD_BB="${KT_SHARE_BACKWARD_BB}")
-  [[ -z "${KT_SHARE_CACHE_POOL}" ]] || RUN_ENV+=(ACCELERATE_KT_SHARE_CACHE_POOL="${KT_SHARE_CACHE_POOL}")
   [[ -z "${KT_NUM_GPU_EXPERTS}" ]] || RUN_ENV+=(ACCELERATE_KT_NUM_GPU_EXPERTS="${KT_NUM_GPU_EXPERTS}")
   [[ -z "${KT_WEIGHT_PATH}" ]] || RUN_ENV+=(ACCELERATE_KT_WEIGHT_PATH="${KT_WEIGHT_PATH}")
   [[ -z "${KT_EXPERT_CHECKPOINT_PATH}" ]] || RUN_ENV+=(ACCELERATE_KT_EXPERT_CHECKPOINT_PATH="${KT_EXPERT_CHECKPOINT_PATH}")
@@ -889,6 +923,9 @@ if [[ "${PROFILE}" == "1" ]]; then
     ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_STEPS="${PROFILE_MEMORY_BREAKDOWN_STEPS}"
     ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_MODULES="${PROFILE_MEMORY_BREAKDOWN_MODULES}"
     ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_OUTPUT="${PROFILE_MEMORY_BREAKDOWN_OUTPUT}"
+    ASYM_GEMM_LF_PROFILE_MEMORY_SNAPSHOT="${PROFILE_MEMORY_SNAPSHOT}"
+    ASYM_GEMM_LF_PROFILE_MEMORY_SNAPSHOT_PATH="${PROFILE_MEMORY_SNAPSHOT_PATH}"
+    ASYM_GEMM_LF_PROFILE_EXTERNAL_MEMORY="${PROFILE_EXTERNAL_MEMORY}"
     ASYM_GEMM_LF_PROFILE_SYNC="${PROFILE_SYNC}"
     ASYM_GEMM_LF_PROFILE_MODULE_FILTER="${PROFILE_MODULE_FILTER}"
     ASYM_GEMM_LF_CONFIG_WORKLOAD="${PROFILE_WORKLOAD_LABEL:-${MODEL_TAG}}"
@@ -913,7 +950,6 @@ if [[ "${PROFILE}" == "1" ]]; then
       ASYM_GEMM_LF_CONFIG_KT_MAX_CACHE_DEPTH="${KT_MAX_CACHE_DEPTH}"
       ASYM_GEMM_LF_CONFIG_KT_TP_ENABLED="${KT_TP_ENABLED}"
       ASYM_GEMM_LF_CONFIG_KT_SHARE_BACKWARD_BB="${KT_SHARE_BACKWARD_BB}"
-      ASYM_GEMM_LF_CONFIG_KT_SHARE_CACHE_POOL="${KT_SHARE_CACHE_POOL}"
       ASYM_GEMM_LF_CONFIG_KT_NUM_GPU_EXPERTS="${KT_NUM_GPU_EXPERTS}"
       ASYM_GEMM_LF_CONFIG_KT_WEIGHT_PATH="${KT_WEIGHT_PATH}"
       ASYM_GEMM_LF_CONFIG_KT_EXPERT_CHECKPOINT_PATH="${KT_EXPERT_CHECKPOINT_PATH}"
@@ -930,21 +966,39 @@ fi
 if [[ "${PROFILE}" == "1" ]]; then
   LAUNCH_CMD=("${ENV_PYTHON}" "${PROFILE_LAUNCHER}" "${CMD_ARGS[@]}")
 else
-  LAUNCH_CMD=("${CONDA_EXE}" run -p "${ENV_DIR}" llamafactory-cli train "${CMD_ARGS[@]}")
+  LAUNCH_CMD=("${LF_CLI_BIN}" train "${CMD_ARGS[@]}")
 fi
 
 if is_torch_run; then
   launch_entry="${LF_DIR}/src/train.py"
   [[ "${PROFILE}" == "1" ]] && launch_entry="${PROFILE_LAUNCHER}"
-  if [[ "${DIST_LAUNCHER}" == "accelerate" ]]; then
+  if [[ "${DIST_LAUNCHER}" == "deepspeed" ]]; then
+    if [[ "${NNODES:-1}" != "1" ]]; then
+      echo "DIST_LAUNCHER=deepspeed currently supports single-node launches only; got NNODES=${NNODES:-1}" >&2
+      exit 2
+    fi
     LAUNCH_CMD=(
-      "${ACCELERATE_CMD[@]}" launch
-      --multi_gpu
+      "${DEEPSPEED_CMD[@]}"
+      --include "localhost:${GPU_ID}"
+      --master_addr "${MASTER_ADDR:-127.0.0.1}"
+      --master_port "${MASTER_PORT_VALUE}"
+      "${launch_entry}"
+      "${CMD_ARGS[@]}"
+    )
+  elif [[ "${DIST_LAUNCHER}" == "accelerate" ]]; then
+    ACCELERATE_LAUNCH_ARGS=(
       --num_processes "${NUM_GPUS}"
       --num_machines "${NNODES:-1}"
       --machine_rank "${NODE_RANK:-0}"
       --main_process_ip "${MASTER_ADDR:-127.0.0.1}"
       --main_process_port "${MASTER_PORT_VALUE}"
+    )
+    if ((NUM_GPUS > 1)); then
+      ACCELERATE_LAUNCH_ARGS=(--multi_gpu "${ACCELERATE_LAUNCH_ARGS[@]}")
+    fi
+    LAUNCH_CMD=(
+      "${ACCELERATE_CMD[@]}" launch
+      "${ACCELERATE_LAUNCH_ARGS[@]}"
       "${launch_entry}"
       "${CMD_ARGS[@]}"
     )
@@ -991,9 +1045,9 @@ if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "nsys" ]]; then
   if [[ "${PROFILE_NSYS_CAPTURE_RANGE}" == "cudaProfilerApi" ]]; then
     NSYS_CMD+=(--capture-range=cudaProfilerApi --capture-range-end=stop)
   fi
-  run_logged_command env "${RUN_ENV[@]}" "${NSYS_CMD[@]}" "${LAUNCH_CMD[@]}"
+  run_logged_command "${ENV_CMD[@]}" "${RUN_ENV[@]}" "${NSYS_CMD[@]}" "${LAUNCH_CMD[@]}"
 else
-  run_logged_command env "${RUN_ENV[@]}" "${LAUNCH_CMD[@]}"
+  run_logged_command "${ENV_CMD[@]}" "${RUN_ENV[@]}" "${LAUNCH_CMD[@]}"
 fi
 
 if is_superoffload_zero_run && [[ "${CHECK_SUPEROFFLOAD}" == "1" ]]; then
@@ -1105,7 +1159,7 @@ if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "source" ]]; then
     echo "Missing profile postprocess script ${PROFILE_POSTPROCESS_SCRIPT}" >&2
     exit 2
   fi
-  "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PROFILE_POSTPROCESS_SCRIPT}" \
+  "${ENV_PYTHON}" "${PROFILE_POSTPROCESS_SCRIPT}" \
     --source-profile-json "${PROFILE_SOURCE_JSON}" \
     --profile-json "${PROFILE_JSON}" \
     --output-dir "${PROFILE_OUTPUT_DIR}" 2>&1 | tee -a "${LOG_FILE}"
@@ -1126,12 +1180,12 @@ if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "nsys" ]]; then
     echo "Missing Nsight postprocess script ${PROFILE_NSYS_POSTPROCESS_SCRIPT}" >&2
     exit 2
   fi
-  "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PROFILE_NSYS_POSTPROCESS_SCRIPT}" \
+  "${ENV_PYTHON}" "${PROFILE_NSYS_POSTPROCESS_SCRIPT}" \
     "${PROFILE_NSYS_SQLITE}" \
     --source-profile-json "${PROFILE_SOURCE_JSON}" \
     --output-json "${PROFILE_JSON}" \
     --output-md "${PROFILE_SUMMARY_MD}" 2>&1 | tee -a "${LOG_FILE}"
-  "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PROFILE_POSTPROCESS_SCRIPT}" \
+  "${ENV_PYTHON}" "${PROFILE_POSTPROCESS_SCRIPT}" \
     --profile-json "${PROFILE_JSON}" \
     --output-dir "${PROFILE_OUTPUT_DIR}" 2>&1 | tee -a "${LOG_FILE}"
   echo "Wrote Nsight profile artifacts to ${PROFILE_JSON} and ${PROFILE_SUMMARY_MD}" | tee -a "${LOG_FILE}"

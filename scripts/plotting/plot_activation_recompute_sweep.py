@@ -14,7 +14,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 MIB = 1024.0**2
-FLAT_SEQ_RE = re.compile(r"^s(?P<seq_len>[0-9]+)$")
+FLAT_SEQ_RE = re.compile(r"^(?:b(?P<batch_size>[0-9]+)_)?s(?P<seq_len>[0-9]+)$")
 PROFILERS = ("source", "nsys", "cpu", "ncu")
 BACKENDS = (
     "torch",
@@ -100,60 +100,50 @@ ROOT_OUTPUT_FILES = (
 COMBINED_OUTPUT_FILES = (
     "combined_step_samples_index.csv",
     "combined_step_samples_index.json",
-    "combined_forward_end_memory_vs_seq.png",
-    "combined_forward_peak_memory_vs_seq.png",
-    "combined_backward_start_memory_vs_seq.png",
-    "combined_backward_peak_memory_vs_seq.png",
-    "combined_peak_hbm_vs_seq.png",
-    "combined_timing_vs_seq.png",
-    "combined_forward_end_memory_vs_step.png",
-    "combined_forward_peak_memory_vs_step.png",
-    "combined_backward_start_memory_vs_step.png",
-    "combined_backward_peak_memory_vs_step.png",
-    "combined_peak_hbm_vs_step.png",
-    "combined_timing_vs_step.png",
-    "combined_forward_timing_vs_step.png",
-    "combined_backward_timing_vs_step.png",
-    "combined_loss_vs_step.png",
-    "combined_forward_end_memory_vs_expert_threshold.png",
-    "combined_forward_peak_memory_vs_expert_threshold.png",
-    "combined_backward_start_memory_vs_expert_threshold.png",
-    "combined_backward_peak_memory_vs_expert_threshold.png",
-    "combined_peak_hbm_vs_expert_threshold.png",
-    "combined_timing_vs_expert_threshold.png",
-    "combined_forward_end_memory_vs_expert_tok_threshold.png",
-    "combined_forward_peak_memory_vs_expert_tok_threshold.png",
-    "combined_backward_start_memory_vs_expert_tok_threshold.png",
-    "combined_backward_peak_memory_vs_expert_tok_threshold.png",
-    "combined_peak_hbm_vs_expert_tok_threshold.png",
-    "combined_timing_vs_expert_tok_threshold.png",
-    "combined_forward_end_memory_vs_expert_tok_act_threshold.png",
-    "combined_forward_peak_memory_vs_expert_tok_act_threshold.png",
-    "combined_backward_start_memory_vs_expert_tok_act_threshold.png",
-    "combined_backward_peak_memory_vs_expert_tok_act_threshold.png",
-    "combined_peak_hbm_vs_expert_tok_act_threshold.png",
-    "combined_timing_vs_expert_tok_act_threshold.png",
+    "combined_forward_peak_allocated_hbm_vs_seq.png",
+    "combined_forward_peak_reserved_hbm_vs_seq.png",
+    "combined_backward_peak_allocated_hbm_vs_seq.png",
+    "combined_backward_peak_reserved_hbm_vs_seq.png",
+    "combined_peak_allocated_hbm_vs_seq.png",
+    "combined_peak_reserved_hbm_vs_seq.png",
+    "combined_reserved_unallocated_hbm_vs_seq.png",
+    "combined_forward_peak_allocated_hbm_vs_step.png",
+    "combined_forward_peak_reserved_hbm_vs_step.png",
+    "combined_backward_peak_allocated_hbm_vs_step.png",
+    "combined_backward_peak_reserved_hbm_vs_step.png",
+    "combined_peak_allocated_hbm_vs_step.png",
+    "combined_peak_reserved_hbm_vs_step.png",
+    "combined_reserved_unallocated_hbm_vs_step.png",
+    "combined_forward_peak_allocated_hbm_vs_expert_tok_threshold.png",
+    "combined_forward_peak_reserved_hbm_vs_expert_tok_threshold.png",
+    "combined_backward_peak_allocated_hbm_vs_expert_tok_threshold.png",
+    "combined_backward_peak_reserved_hbm_vs_expert_tok_threshold.png",
+    "combined_peak_allocated_hbm_vs_expert_tok_threshold.png",
+    "combined_peak_reserved_hbm_vs_expert_tok_threshold.png",
+    "combined_reserved_unallocated_hbm_vs_expert_tok_threshold.png",
+    "combined_forward_peak_allocated_hbm_vs_expert_tok_act_threshold.png",
+    "combined_forward_peak_reserved_hbm_vs_expert_tok_act_threshold.png",
+    "combined_backward_peak_allocated_hbm_vs_expert_tok_act_threshold.png",
+    "combined_backward_peak_reserved_hbm_vs_expert_tok_act_threshold.png",
+    "combined_peak_allocated_hbm_vs_expert_tok_act_threshold.png",
+    "combined_peak_reserved_hbm_vs_expert_tok_act_threshold.png",
+    "combined_reserved_unallocated_hbm_vs_expert_tok_act_threshold.png",
 )
 GROUP_OUTPUT_FILES = (
     "sweep_summary.csv",
     "sweep_summary.json",
     "step_samples.csv",
     "step_samples.json",
-    "forward_end_memory_vs_seq.png",
-    "forward_peak_memory_vs_seq.png",
-    "backward_start_memory_vs_seq.png",
-    "backward_peak_memory_vs_seq.png",
-    "peak_hbm_vs_seq.png",
-    "timing_vs_seq.png",
-    "forward_end_memory_vs_step.png",
-    "forward_peak_memory_vs_step.png",
-    "backward_start_memory_vs_step.png",
-    "backward_peak_memory_vs_step.png",
-    "peak_hbm_vs_step.png",
-    "timing_vs_step.png",
-    "forward_timing_vs_step.png",
-    "backward_timing_vs_step.png",
-    "loss_vs_step.png",
+    "forward_peak_hbm_vs_seq.png",
+    "backward_peak_hbm_vs_seq.png",
+    "peak_allocated_hbm_vs_seq.png",
+    "peak_reserved_hbm_vs_seq.png",
+    "reserved_unallocated_hbm_vs_seq.png",
+    "forward_peak_hbm_vs_step.png",
+    "backward_peak_hbm_vs_step.png",
+    "peak_allocated_hbm_vs_step.png",
+    "peak_reserved_hbm_vs_step.png",
+    "reserved_unallocated_hbm_vs_step.png",
 )
 
 
@@ -373,10 +363,16 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
         return None
     config_name = job_dir.parent.name
     batch_match = re.search(r"(?:^|__)b(?P<batch>[0-9]+)_", config_name)
+    batch_from_leaf = seq_match.group("batch_size")
+    batch_size = 0
+    if batch_from_leaf is not None:
+        batch_size = int(batch_from_leaf)
+    elif batch_match is not None:
+        batch_size = int(batch_match.group("batch"))
     workload_meta = config_workload_meta(config_name)
     return {
         "precision": precision_from_path(path),
-        "batch_size": int(batch_match.group("batch")) if batch_match is not None else 0,
+        "batch_size": batch_size,
         "seq_len": int(seq_match.group("seq_len")),
         "mode": "recompute" if recompute == "recomp" else "no_recompute",
         "activation_recompute": recompute == "recomp",
@@ -584,14 +580,15 @@ def skip_search_path(path: Path, input_root: Path) -> bool:
 
 def result_dirs(input_root: Path) -> list[Path]:
     flat_dirs = []
-    for path in input_root.rglob("s*"):
-        if not path.is_dir() or FLAT_SEQ_RE.match(path.name) is None or skip_search_path(path, input_root):
-            continue
-        meta = parse_result_dir(path)
-        if meta is None:
-            continue
-        if profile_json_path(path, str(meta.get("profiler", ""))) is not None:
-            flat_dirs.append(path)
+    for pattern in ("s*", "b*_s*"):
+        for path in input_root.rglob(pattern):
+            if not path.is_dir() or FLAT_SEQ_RE.match(path.name) is None or skip_search_path(path, input_root):
+                continue
+            meta = parse_result_dir(path)
+            if meta is None:
+                continue
+            if profile_json_path(path, str(meta.get("profiler", ""))) is not None:
+                flat_dirs.append(path)
     return sorted(set(flat_dirs))
 
 
@@ -697,18 +694,23 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         "step_ms": step_ms(profile),
         "forward_ms": numeric_float(first_dict(profile, "forward").get("total_milliseconds")),
         "backward_ms": numeric_float(first_dict(profile, "backward").get("total_milliseconds")),
-        "peak_hbm_mib": to_mib(memory_gpu.get("peak_hbm_bytes")),
-        "stage_local_peak_hbm_mib": to_mib(memory_gpu.get("stage_local_peak_hbm_bytes")),
+        "peak_allocated_hbm_mib": to_mib(memory_gpu.get("peak_allocated_hbm_bytes")),
+        "peak_reserved_hbm_mib": to_mib(memory_gpu.get("peak_reserved_hbm_bytes")),
+        "reserved_unallocated_mib": to_mib(memory_gpu.get("reserved_unallocated_bytes")),
         "forward_alloc_start_mib": to_mib(forward.get("avg_allocated_start_bytes")),
         "forward_alloc_end_mib": to_mib(forward.get("avg_allocated_end_bytes")),
         "forward_live_delta_mib": to_mib(forward.get("avg_allocated_delta_bytes")),
-        "forward_local_peak_mib": to_mib(forward.get("avg_local_peak_bytes")),
-        "forward_local_peak_delta_mib": to_mib(forward.get("avg_local_peak_delta_bytes")),
+        "forward_peak_allocated_mib": to_mib(forward.get("avg_peak_allocated_bytes")),
+        "forward_peak_allocated_delta_mib": to_mib(forward.get("avg_peak_allocated_delta_bytes")),
+        "forward_peak_reserved_mib": to_mib(forward.get("avg_peak_reserved_bytes")),
+        "forward_peak_reserved_delta_mib": to_mib(forward.get("avg_peak_reserved_delta_bytes")),
         "backward_alloc_start_mib": to_mib(backward.get("avg_allocated_start_bytes")),
         "backward_alloc_end_mib": to_mib(backward.get("avg_allocated_end_bytes")),
         "backward_alloc_delta_mib": to_mib(backward.get("avg_allocated_delta_bytes")),
-        "backward_local_peak_mib": to_mib(backward.get("avg_local_peak_bytes")),
-        "backward_local_peak_delta_mib": to_mib(backward.get("avg_local_peak_delta_bytes")),
+        "backward_peak_allocated_mib": to_mib(backward.get("avg_peak_allocated_bytes")),
+        "backward_peak_allocated_delta_mib": to_mib(backward.get("avg_peak_allocated_delta_bytes")),
+        "backward_peak_reserved_mib": to_mib(backward.get("avg_peak_reserved_bytes")),
+        "backward_peak_reserved_delta_mib": to_mib(backward.get("avg_peak_reserved_delta_bytes")),
         "route_samples": numeric_int(route_stats.get("samples")),
         "route_num_tokens": numeric_int(route_stats.get("num_tokens")),
         "route_top_k": numeric_int(route_stats.get("top_k")),
@@ -939,17 +941,23 @@ def step_rows_from_result_dir(args: argparse.Namespace, result_dir: Path) -> lis
             if row["forward_cuda_kernel_busy_ms"] is not None or row["backward_cuda_kernel_busy_ms"] is not None
             else None
         )
-        row["peak_hbm_mib"] = sample_mib(sample, "peak_hbm_bytes", "global_peak_after_bytes")
+        row["peak_allocated_hbm_mib"] = sample_mib(sample, "peak_allocated_hbm_bytes")
+        row["peak_reserved_hbm_mib"] = sample_mib(sample, "peak_reserved_hbm_bytes")
+        row["reserved_unallocated_mib"] = sample_mib(sample, "reserved_unallocated_bytes")
         row["forward_alloc_start_mib"] = sample_mib(sample, "forward_allocated_start_bytes", "forward_alloc_start_bytes")
         row["forward_alloc_end_mib"] = sample_mib(sample, "forward_allocated_end_bytes", "forward_alloc_end_bytes")
         row["forward_live_delta_mib"] = sample_mib(sample, "forward_allocated_delta_bytes", "forward_live_delta_bytes")
-        row["forward_local_peak_mib"] = sample_mib(sample, "forward_local_peak_bytes", "forward_local_peak_hbm_bytes")
-        row["forward_local_peak_delta_mib"] = sample_mib(sample, "forward_local_peak_delta_bytes")
+        row["forward_peak_allocated_mib"] = sample_mib(sample, "forward_peak_allocated_bytes")
+        row["forward_peak_allocated_delta_mib"] = sample_mib(sample, "forward_peak_allocated_delta_bytes")
+        row["forward_peak_reserved_mib"] = sample_mib(sample, "forward_peak_reserved_bytes")
+        row["forward_peak_reserved_delta_mib"] = sample_mib(sample, "forward_peak_reserved_delta_bytes")
         row["backward_alloc_start_mib"] = sample_mib(sample, "backward_allocated_start_bytes", "backward_alloc_start_bytes")
         row["backward_alloc_end_mib"] = sample_mib(sample, "backward_allocated_end_bytes", "backward_alloc_end_bytes")
         row["backward_alloc_delta_mib"] = sample_mib(sample, "backward_allocated_delta_bytes", "backward_alloc_delta_bytes")
-        row["backward_local_peak_mib"] = sample_mib(sample, "backward_local_peak_bytes", "backward_local_peak_hbm_bytes")
-        row["backward_local_peak_delta_mib"] = sample_mib(sample, "backward_local_peak_delta_bytes")
+        row["backward_peak_allocated_mib"] = sample_mib(sample, "backward_peak_allocated_bytes")
+        row["backward_peak_allocated_delta_mib"] = sample_mib(sample, "backward_peak_allocated_delta_bytes")
+        row["backward_peak_reserved_mib"] = sample_mib(sample, "backward_peak_reserved_bytes")
+        row["backward_peak_reserved_delta_mib"] = sample_mib(sample, "backward_peak_reserved_delta_bytes")
         rows.append(row)
     return rows
 
@@ -1303,12 +1311,14 @@ def plot_line(
     backend: Any,
     linewidth: float,
     color: str,
+    linestyle: str = "-",
 ) -> None:
     ax.plot(
         x_values,
         y_values,
         marker=marker_for_backend(backend),
         color=color,
+        linestyle=linestyle,
         linewidth=linewidth,
         markersize=6,
         markeredgewidth=0.9,
@@ -1358,6 +1368,66 @@ def plot_metric(
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
     add_legend(ax, sublinear_region=has_sublinear_region)
+    fig.tight_layout()
+    fig.savefig(output_dir / filename)
+    plt.close(fig)
+
+
+def plot_paired_metric(
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+    filename: str,
+    title: str,
+    ylabel: str,
+    allocated_key: str,
+    reserved_key: str,
+    *,
+    scale: float = 1.0,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    by_mode = {
+        "no_recompute": sorted((row for row in rows if row["mode"] == "no_recompute"), key=lambda row: row["seq_len"]),
+        "recompute": sorted((row for row in rows if row["mode"] == "recompute"), key=lambda row: row["seq_len"]),
+    }
+    labels = {"no_recompute": "No recompute", "recompute": "Activation recompute"}
+    color_by_label = series_color_map([labels[mode] for mode, mode_rows in by_mode.items() if mode_rows])
+
+    fig, ax = plt.subplots(figsize=(8, 5), dpi=160)
+    plotted = False
+    for mode, mode_rows in by_mode.items():
+        if not mode_rows:
+            continue
+        label = labels[mode]
+        color = color_by_label[label]
+        plot_line(
+            ax,
+            [row["seq_len"] for row in mode_rows],
+            [float(row[allocated_key]) / scale for row in mode_rows],
+            label=f"{label} allocated",
+            backend=mode_rows[0].get("backend", ""),
+            linewidth=2,
+            color=color,
+        )
+        plot_line(
+            ax,
+            [row["seq_len"] for row in mode_rows],
+            [float(row[reserved_key]) / scale for row in mode_rows],
+            label=f"{label} reserved",
+            backend=mode_rows[0].get("backend", ""),
+            linewidth=2,
+            color=color,
+            linestyle="--",
+        )
+        plotted = True
+    if not plotted:
+        plt.close(fig)
+        return
+    ax.set_title(title)
+    ax.set_xlabel("Sequence length")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.35)
+    ax.legend()
     fig.tight_layout()
     fig.savefig(output_dir / filename)
     plt.close(fig)
@@ -1430,71 +1500,66 @@ def combined_step_series_label(row: dict[str, Any], varied: set[str]) -> str:
 def step_plot_specs(*, combined: bool) -> list[tuple[str, str, str, str, float]]:
     prefix = "combined_" if combined else ""
     title_prefix = "All workloads: " if combined else ""
-    return [
-        (
-            f"{prefix}forward_end_memory_vs_step.png",
-            f"{title_prefix}memory after forward over steps",
-            "GPU allocated after forward (GiB)",
-            "forward_alloc_end_mib",
-            1024.0,
-        ),
-        (
-            f"{prefix}forward_peak_memory_vs_step.png",
-            f"{title_prefix}forward local peak over steps",
-            "Forward local peak allocation (GiB)",
-            "forward_local_peak_mib",
-            1024.0,
-        ),
-        (
-            f"{prefix}backward_start_memory_vs_step.png",
-            f"{title_prefix}memory carried into backward over steps",
-            "GPU allocated at backward start (GiB)",
-            "backward_alloc_start_mib",
-            1024.0,
-        ),
-        (
-            f"{prefix}backward_peak_memory_vs_step.png",
-            f"{title_prefix}backward local peak over steps",
-            "Backward local peak allocation (GiB)",
-            "backward_local_peak_mib",
-            1024.0,
-        ),
-        (
-            f"{prefix}peak_hbm_vs_step.png",
-            f"{title_prefix}whole-step peak HBM over steps",
-            "Peak HBM allocation (GiB)",
-            "peak_hbm_mib",
-            1024.0,
-        ),
-        (
-            f"{prefix}timing_vs_step.png",
-            f"{title_prefix}step time over steps",
-            "Step time (ms)",
-            "step_ms",
-            1.0,
-        ),
-        (
-            f"{prefix}forward_timing_vs_step.png",
-            f"{title_prefix}forward time over steps",
-            "Forward time (ms)",
-            "forward_ms",
-            1.0,
-        ),
-        (
-            f"{prefix}backward_timing_vs_step.png",
-            f"{title_prefix}backward time over steps",
-            "Backward time (ms)",
-            "backward_ms",
-            1.0,
-        ),
-        (
-            f"{prefix}loss_vs_step.png",
-            f"{title_prefix}loss over steps",
-            "Loss",
-            "loss",
-            1.0,
-        ),
-    ]
+    specs: list[tuple[str, str, str, str, float]] = []
+    if combined:
+        specs.extend(
+            [
+                (
+                    "combined_forward_peak_allocated_hbm_vs_step.png",
+                    "All workloads: forward peak allocated HBM over steps",
+                    "Forward peak allocated HBM (GiB)",
+                    "forward_peak_allocated_mib",
+                    1024.0,
+                ),
+                (
+                    "combined_forward_peak_reserved_hbm_vs_step.png",
+                    "All workloads: forward peak reserved HBM over steps",
+                    "Forward peak reserved HBM (GiB)",
+                    "forward_peak_reserved_mib",
+                    1024.0,
+                ),
+                (
+                    "combined_backward_peak_allocated_hbm_vs_step.png",
+                    "All workloads: backward peak allocated HBM over steps",
+                    "Backward peak allocated HBM (GiB)",
+                    "backward_peak_allocated_mib",
+                    1024.0,
+                ),
+                (
+                    "combined_backward_peak_reserved_hbm_vs_step.png",
+                    "All workloads: backward peak reserved HBM over steps",
+                    "Backward peak reserved HBM (GiB)",
+                    "backward_peak_reserved_mib",
+                    1024.0,
+                ),
+            ]
+        )
+    specs.extend(
+        [
+            (
+                f"{prefix}peak_allocated_hbm_vs_step.png",
+                f"{title_prefix}whole-step peak allocated HBM over steps",
+                "Peak allocated HBM (GiB)",
+                "peak_allocated_hbm_mib",
+                1024.0,
+            ),
+            (
+                f"{prefix}peak_reserved_hbm_vs_step.png",
+                f"{title_prefix}whole-step peak reserved HBM over steps",
+                "Peak reserved HBM (GiB)",
+                "peak_reserved_hbm_mib",
+                1024.0,
+            ),
+            (
+                f"{prefix}reserved_unallocated_hbm_vs_step.png",
+                f"{title_prefix}reserved but unallocated HBM over steps",
+                "Reserved but unallocated HBM (GiB)",
+                "reserved_unallocated_mib",
+                1024.0,
+            ),
+        ]
+    )
+    return specs
 
 
 def plot_step_metric(
@@ -1556,6 +1621,70 @@ def plot_step_metric(
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
     ax.legend(fontsize=7 if combined else None)
+    fig.tight_layout()
+    fig.savefig(output_dir / filename)
+    plt.close(fig)
+
+
+def plot_paired_step_metric(
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+    filename: str,
+    title: str,
+    ylabel: str,
+    allocated_key: str,
+    reserved_key: str,
+    *,
+    scale: float = 1.0,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    series: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for row in rows:
+        if optional_float(row.get(allocated_key)) is None or optional_float(row.get(reserved_key)) is None:
+            continue
+        series_key = (
+            int(row["seq_len"]),
+            str(row["mode"]),
+            str(row.get("expert_policy_label", "none")),
+        )
+        series.setdefault(series_key, []).append(row)
+    if not series:
+        return
+
+    series_items: list[tuple[str, list[dict[str, Any]]]] = []
+    for _, series_rows in sorted(series.items()):
+        sorted_rows = sorted(series_rows, key=lambda row: numeric_int(row.get("raw_step"), int(row["step"])))
+        series_items.append((step_series_label(sorted_rows[0]), sorted_rows))
+    color_by_label = series_color_map([label for label, _ in series_items])
+
+    fig, ax = plt.subplots(figsize=(8, 5.5), dpi=160)
+    for label, sorted_rows in series_items:
+        color = color_by_label[label]
+        plot_line(
+            ax,
+            [numeric_int(row.get("raw_step"), int(row["step"])) for row in sorted_rows],
+            [float(row[allocated_key]) / scale for row in sorted_rows],
+            label=f"{label} allocated",
+            backend=sorted_rows[0].get("backend", ""),
+            linewidth=1.8,
+            color=color,
+        )
+        plot_line(
+            ax,
+            [numeric_int(row.get("raw_step"), int(row["step"])) for row in sorted_rows],
+            [float(row[reserved_key]) / scale for row in sorted_rows],
+            label=f"{label} reserved",
+            backend=sorted_rows[0].get("backend", ""),
+            linewidth=1.8,
+            color=color,
+            linestyle="--",
+        )
+    ax.set_title(title)
+    ax.set_xlabel("Raw trainer step")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.35)
+    ax.legend()
     fig.tight_layout()
     fig.savefig(output_dir / filename)
     plt.close(fig)
@@ -1695,6 +1824,72 @@ def plot_threshold_metric(
     plt.close(fig)
 
 
+def plot_paired_threshold_metric(
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+    filename: str,
+    title: str,
+    ylabel: str,
+    allocated_key: str,
+    reserved_key: str,
+    *,
+    scale: float = 1.0,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    by_mode = {
+        "no_recompute": sorted((row for row in rows if row["mode"] == "no_recompute"), key=lambda row: row["expert_recompute_threshold"]),
+        "recompute": sorted((row for row in rows if row["mode"] == "recompute"), key=lambda row: row["expert_recompute_threshold"]),
+    }
+    labels = {"no_recompute": "No layer recompute", "recompute": "Layer recompute"}
+    color_by_label = series_color_map(
+        [
+            labels[mode]
+            for mode, mode_rows in by_mode.items()
+            if len({int(row["expert_recompute_threshold"]) for row in mode_rows}) >= 2
+        ]
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 5), dpi=160)
+    plotted = False
+    for mode, mode_rows in by_mode.items():
+        if len({int(row["expert_recompute_threshold"]) for row in mode_rows}) < 2:
+            continue
+        label = labels[mode]
+        color = color_by_label[label]
+        plot_line(
+            ax,
+            [row["expert_recompute_threshold"] for row in mode_rows],
+            [float(row[allocated_key]) / scale for row in mode_rows],
+            label=f"{label} allocated",
+            backend=mode_rows[0].get("backend", ""),
+            linewidth=2,
+            color=color,
+        )
+        plot_line(
+            ax,
+            [row["expert_recompute_threshold"] for row in mode_rows],
+            [float(row[reserved_key]) / scale for row in mode_rows],
+            label=f"{label} reserved",
+            backend=mode_rows[0].get("backend", ""),
+            linewidth=2,
+            color=color,
+            linestyle="--",
+        )
+        plotted = True
+    if not plotted:
+        plt.close(fig)
+        return
+    ax.set_title(title)
+    ax.set_xlabel("Expert recompute threshold (tokens)")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.35)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / filename)
+    plt.close(fig)
+
+
 def plot_combined_threshold_metric(
     rows: list[dict[str, Any]],
     output_dir: Path,
@@ -1794,6 +1989,70 @@ def plot_policy_metric(
     plt.close(fig)
 
 
+def plot_paired_policy_metric(
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+    filename: str,
+    title: str,
+    ylabel: str,
+    allocated_key: str,
+    reserved_key: str,
+    *,
+    family: str,
+    scale: float = 1.0,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    series: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for row in rows:
+        if optional_float(row.get(allocated_key)) is None or optional_float(row.get(reserved_key)) is None:
+            continue
+        series.setdefault((str(row["mode"]), policy_series_suffix(row, family)), []).append(row)
+    labels = {"no_recompute": "No layer recompute", "recompute": "Layer recompute"}
+    series_items: list[tuple[str, list[dict[str, Any]]]] = []
+    for (mode, token_cap), series_rows in sorted(series.items()):
+        sorted_rows = sorted(series_rows, key=lambda row: policy_sweep_x(row, family))
+        if len({policy_sweep_x(row, family) for row in sorted_rows}) >= 2:
+            series_items.append((labels.get(mode, mode), sorted_rows))
+    color_by_label = series_color_map([label for label, _ in series_items])
+
+    fig, ax = plt.subplots(figsize=(8, 5), dpi=160)
+    plotted = False
+    for label, sorted_rows in series_items:
+        color = color_by_label[label]
+        plot_line(
+            ax,
+            [policy_sweep_x(row, family) for row in sorted_rows],
+            [float(row[allocated_key]) / scale for row in sorted_rows],
+            label=f"{label} allocated",
+            backend=sorted_rows[0].get("backend", ""),
+            linewidth=2,
+            color=color,
+        )
+        plot_line(
+            ax,
+            [policy_sweep_x(row, family) for row in sorted_rows],
+            [float(row[reserved_key]) / scale for row in sorted_rows],
+            label=f"{label} reserved",
+            backend=sorted_rows[0].get("backend", ""),
+            linewidth=2,
+            color=color,
+            linestyle="--",
+        )
+        plotted = True
+    if not plotted:
+        plt.close(fig)
+        return
+    ax.set_title(title)
+    ax.set_xlabel(policy_x_label(family))
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.35)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / filename)
+    plt.close(fig)
+
+
 def plot_combined_policy_metric(
     rows: list[dict[str, Any]],
     output_dir: Path,
@@ -1848,58 +2107,52 @@ def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[s
     workload, precision, batch_size, lora_dropout, backend, router_mode, profiler = key
     title_base = f"{workload} LoRA SFT"
     suffix = f", batch size {batch_size}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}"
-    plot_metric(
+    plot_paired_metric(
         rows,
         output_dir,
-        "forward_end_memory_vs_seq.png",
-        f"{title_base} memory after forward{suffix}",
-        "GPU allocated after forward (GiB)",
-        "forward_alloc_end_mib",
+        "forward_peak_hbm_vs_seq.png",
+        f"{title_base} forward peak HBM{suffix}",
+        "Forward peak HBM (GiB)",
+        "forward_peak_allocated_mib",
+        "forward_peak_reserved_mib",
+        scale=1024.0,
+    )
+    plot_paired_metric(
+        rows,
+        output_dir,
+        "backward_peak_hbm_vs_seq.png",
+        f"{title_base} backward peak HBM{suffix}",
+        "Backward peak HBM (GiB)",
+        "backward_peak_allocated_mib",
+        "backward_peak_reserved_mib",
         scale=1024.0,
     )
     plot_metric(
         rows,
         output_dir,
-        "forward_peak_memory_vs_seq.png",
-        f"{title_base} forward local peak{suffix}",
-        "Forward local peak allocation (GiB)",
-        "forward_local_peak_mib",
+        "peak_allocated_hbm_vs_seq.png",
+        f"{title_base} whole-step peak allocated HBM{suffix}",
+        "Peak allocated HBM (GiB)",
+        "peak_allocated_hbm_mib",
         scale=1024.0,
     )
     plot_metric(
         rows,
         output_dir,
-        "backward_start_memory_vs_seq.png",
-        f"{title_base} memory carried into backward{suffix}",
-        "GPU allocated at backward start (GiB)",
-        "backward_alloc_start_mib",
+        "peak_reserved_hbm_vs_seq.png",
+        f"{title_base} whole-step peak reserved HBM{suffix}",
+        "Peak reserved HBM (GiB)",
+        "peak_reserved_hbm_mib",
         scale=1024.0,
     )
     plot_metric(
         rows,
         output_dir,
-        "backward_peak_memory_vs_seq.png",
-        f"{title_base} backward local peak{suffix}",
-        "Backward local peak allocation (GiB)",
-        "backward_local_peak_mib",
+        "reserved_unallocated_hbm_vs_seq.png",
+        f"{title_base} reserved but unallocated HBM{suffix}",
+        "Reserved but unallocated HBM (GiB)",
+        "reserved_unallocated_mib",
         scale=1024.0,
-    )
-    plot_metric(
-        rows,
-        output_dir,
-        "peak_hbm_vs_seq.png",
-        f"{title_base} whole-step peak HBM{suffix}",
-        "Peak HBM allocation (GiB)",
-        "peak_hbm_mib",
-        scale=1024.0,
-    )
-    plot_metric(
-        rows,
-        output_dir,
-        "timing_vs_seq.png",
-        f"{title_base} step time{suffix}",
-        "Step time (ms)",
-        "step_ms",
     )
 
 
@@ -1910,6 +2163,26 @@ def write_group_step_plots(rows: list[dict[str, Any]], output_dir: Path, key: tu
     title_base = f"{workload} LoRA SFT"
     suffix = f", batch size {batch_size}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}"
     write_table(rows, output_dir, "step_samples")
+    plot_paired_step_metric(
+        rows,
+        output_dir,
+        "forward_peak_hbm_vs_step.png",
+        f"{title_base} forward peak HBM over steps{suffix}",
+        "Forward peak HBM (GiB)",
+        "forward_peak_allocated_mib",
+        "forward_peak_reserved_mib",
+        scale=1024.0,
+    )
+    plot_paired_step_metric(
+        rows,
+        output_dir,
+        "backward_peak_hbm_vs_step.png",
+        f"{title_base} backward peak HBM over steps{suffix}",
+        "Backward peak HBM (GiB)",
+        "backward_peak_allocated_mib",
+        "backward_peak_reserved_mib",
+        scale=1024.0,
+    )
     for filename, title, ylabel, metric_key, scale in step_plot_specs(combined=False):
         plot_step_metric(
             rows,
@@ -1932,49 +2205,52 @@ def write_group_threshold_plots(
     workload, precision, batch_size, lora_dropout, backend, router_mode, profiler = key
     title_base = f"{workload} LoRA SFT"
     suffix = f", batch size {batch_size}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}"
-    plot_threshold_metric(
+    plot_paired_threshold_metric(
         rows,
         output_dir,
-        f"forward_end_memory_vs_expert_threshold_s{seq_len}.png",
-        f"{title_base} memory after forward{suffix}",
-        "GPU allocated after forward (GiB)",
-        "forward_alloc_end_mib",
+        f"forward_peak_hbm_vs_expert_threshold_s{seq_len}.png",
+        f"{title_base} forward peak HBM{suffix}",
+        "Forward peak HBM (GiB)",
+        "forward_peak_allocated_mib",
+        "forward_peak_reserved_mib",
+        scale=1024.0,
+    )
+    plot_paired_threshold_metric(
+        rows,
+        output_dir,
+        f"backward_peak_hbm_vs_expert_threshold_s{seq_len}.png",
+        f"{title_base} backward peak HBM{suffix}",
+        "Backward peak HBM (GiB)",
+        "backward_peak_allocated_mib",
+        "backward_peak_reserved_mib",
         scale=1024.0,
     )
     plot_threshold_metric(
         rows,
         output_dir,
-        f"forward_peak_memory_vs_expert_threshold_s{seq_len}.png",
-        f"{title_base} forward local peak{suffix}",
-        "Forward local peak allocation (GiB)",
-        "forward_local_peak_mib",
+        f"peak_allocated_hbm_vs_expert_threshold_s{seq_len}.png",
+        f"{title_base} whole-step peak allocated HBM{suffix}",
+        "Peak allocated HBM (GiB)",
+        "peak_allocated_hbm_mib",
         scale=1024.0,
     )
     plot_threshold_metric(
         rows,
         output_dir,
-        f"backward_start_memory_vs_expert_threshold_s{seq_len}.png",
-        f"{title_base} memory carried into backward{suffix}",
-        "GPU allocated at backward start (GiB)",
-        "backward_alloc_start_mib",
+        f"peak_reserved_hbm_vs_expert_threshold_s{seq_len}.png",
+        f"{title_base} whole-step peak reserved HBM{suffix}",
+        "Peak reserved HBM (GiB)",
+        "peak_reserved_hbm_mib",
         scale=1024.0,
     )
     plot_threshold_metric(
         rows,
         output_dir,
-        f"peak_hbm_vs_expert_threshold_s{seq_len}.png",
-        f"{title_base} whole-step peak HBM{suffix}",
-        "Peak HBM allocation (GiB)",
-        "peak_hbm_mib",
+        f"reserved_unallocated_hbm_vs_expert_threshold_s{seq_len}.png",
+        f"{title_base} reserved but unallocated HBM{suffix}",
+        "Reserved but unallocated HBM (GiB)",
+        "reserved_unallocated_mib",
         scale=1024.0,
-    )
-    plot_threshold_metric(
-        rows,
-        output_dir,
-        f"timing_vs_expert_threshold_s{seq_len}.png",
-        f"{title_base} step time vs expert threshold{suffix}",
-        "Step time (ms)",
-        "step_ms",
     )
 
 
@@ -1993,64 +2269,57 @@ def write_group_policy_plots(
         "tok": "expert token threshold",
         "tok_act": "expert activated-drop threshold",
     }[family]
-    plot_policy_metric(
+    plot_paired_policy_metric(
         rows,
         output_dir,
-        f"forward_end_memory_vs_{name}_s{seq_len}.png",
-        f"{title_base} memory after forward vs {title}{suffix}",
-        "GPU allocated after forward (GiB)",
-        "forward_alloc_end_mib",
+        f"forward_peak_hbm_vs_{name}_s{seq_len}.png",
+        f"{title_base} forward peak HBM vs {title}{suffix}",
+        "Forward peak HBM (GiB)",
+        "forward_peak_allocated_mib",
+        "forward_peak_reserved_mib",
+        family=family,
+        scale=1024.0,
+    )
+    plot_paired_policy_metric(
+        rows,
+        output_dir,
+        f"backward_peak_hbm_vs_{name}_s{seq_len}.png",
+        f"{title_base} backward peak HBM vs {title}{suffix}",
+        "Backward peak HBM (GiB)",
+        "backward_peak_allocated_mib",
+        "backward_peak_reserved_mib",
         family=family,
         scale=1024.0,
     )
     plot_policy_metric(
         rows,
         output_dir,
-        f"forward_peak_memory_vs_{name}_s{seq_len}.png",
-        f"{title_base} forward local peak vs {title}{suffix}",
-        "Forward local peak allocation (GiB)",
-        "forward_local_peak_mib",
+        f"peak_allocated_hbm_vs_{name}_s{seq_len}.png",
+        f"{title_base} whole-step peak allocated HBM vs {title}{suffix}",
+        "Peak allocated HBM (GiB)",
+        "peak_allocated_hbm_mib",
         family=family,
         scale=1024.0,
     )
     plot_policy_metric(
         rows,
         output_dir,
-        f"backward_start_memory_vs_{name}_s{seq_len}.png",
-        f"{title_base} memory carried into backward vs {title}{suffix}",
-        "GPU allocated at backward start (GiB)",
-        "backward_alloc_start_mib",
+        f"peak_reserved_hbm_vs_{name}_s{seq_len}.png",
+        f"{title_base} whole-step peak reserved HBM vs {title}{suffix}",
+        "Peak reserved HBM (GiB)",
+        "peak_reserved_hbm_mib",
         family=family,
         scale=1024.0,
     )
     plot_policy_metric(
         rows,
         output_dir,
-        f"backward_peak_memory_vs_{name}_s{seq_len}.png",
-        f"{title_base} backward local peak vs {title}{suffix}",
-        "Backward local peak allocation (GiB)",
-        "backward_local_peak_mib",
+        f"reserved_unallocated_hbm_vs_{name}_s{seq_len}.png",
+        f"{title_base} reserved but unallocated HBM vs {title}{suffix}",
+        "Reserved but unallocated HBM (GiB)",
+        "reserved_unallocated_mib",
         family=family,
         scale=1024.0,
-    )
-    plot_policy_metric(
-        rows,
-        output_dir,
-        f"peak_hbm_vs_{name}_s{seq_len}.png",
-        f"{title_base} whole-step peak HBM vs {title}{suffix}",
-        "Peak HBM allocation (GiB)",
-        "peak_hbm_mib",
-        family=family,
-        scale=1024.0,
-    )
-    plot_policy_metric(
-        rows,
-        output_dir,
-        f"timing_vs_{name}_s{seq_len}.png",
-        f"{title_base} step time vs {title}{suffix}",
-        "Step time (ms)",
-        "step_ms",
-        family=family,
     )
 
 
@@ -2059,55 +2328,65 @@ def write_combined_plots(rows: list[dict[str, Any]], output_dir: Path) -> None:
     plot_combined_metric(
         rows,
         output_dir,
-        "combined_forward_end_memory_vs_seq.png",
-        "All workloads: memory after forward",
-        "GPU allocated after forward (GiB)",
-        "forward_alloc_end_mib",
+        "combined_forward_peak_allocated_hbm_vs_seq.png",
+        "All workloads: forward peak allocated HBM",
+        "Forward peak allocated HBM (GiB)",
+        "forward_peak_allocated_mib",
         scale=1024.0,
     )
     plot_combined_metric(
         rows,
         output_dir,
-        "combined_forward_peak_memory_vs_seq.png",
-        "All workloads: forward local peak",
-        "Forward local peak allocation (GiB)",
-        "forward_local_peak_mib",
+        "combined_forward_peak_reserved_hbm_vs_seq.png",
+        "All workloads: forward peak reserved HBM",
+        "Forward peak reserved HBM (GiB)",
+        "forward_peak_reserved_mib",
         scale=1024.0,
     )
     plot_combined_metric(
         rows,
         output_dir,
-        "combined_backward_start_memory_vs_seq.png",
-        "All workloads: memory carried into backward",
-        "GPU allocated at backward start (GiB)",
-        "backward_alloc_start_mib",
+        "combined_backward_peak_allocated_hbm_vs_seq.png",
+        "All workloads: backward peak allocated HBM",
+        "Backward peak allocated HBM (GiB)",
+        "backward_peak_allocated_mib",
         scale=1024.0,
     )
     plot_combined_metric(
         rows,
         output_dir,
-        "combined_backward_peak_memory_vs_seq.png",
-        "All workloads: backward local peak",
-        "Backward local peak allocation (GiB)",
-        "backward_local_peak_mib",
+        "combined_backward_peak_reserved_hbm_vs_seq.png",
+        "All workloads: backward peak reserved HBM",
+        "Backward peak reserved HBM (GiB)",
+        "backward_peak_reserved_mib",
         scale=1024.0,
     )
     plot_combined_metric(
         rows,
         output_dir,
-        "combined_peak_hbm_vs_seq.png",
-        "All workloads: whole-step peak HBM",
-        "Peak HBM allocation (GiB)",
-        "peak_hbm_mib",
+        "combined_peak_allocated_hbm_vs_seq.png",
+        "All workloads: whole-step peak allocated HBM",
+        "Peak allocated HBM (GiB)",
+        "peak_allocated_hbm_mib",
         scale=1024.0,
     )
     plot_combined_metric(
         rows,
         output_dir,
-        "combined_timing_vs_seq.png",
-        "All workloads: step time",
-        "Step time (ms)",
-        "step_ms",
+        "combined_peak_reserved_hbm_vs_seq.png",
+        "All workloads: whole-step peak reserved HBM",
+        "Peak reserved HBM (GiB)",
+        "peak_reserved_hbm_mib",
+        scale=1024.0,
+    )
+    plot_combined_metric(
+        rows,
+        output_dir,
+        "combined_reserved_unallocated_hbm_vs_seq.png",
+        "All workloads: reserved but unallocated HBM",
+        "Reserved but unallocated HBM (GiB)",
+        "reserved_unallocated_mib",
+        scale=1024.0,
     )
 
 
@@ -2134,46 +2413,65 @@ def write_combined_threshold_plots(rows: list[dict[str, Any]], output_dir: Path)
     plot_combined_threshold_metric(
         rows,
         output_dir,
-        "combined_forward_end_memory_vs_expert_threshold.png",
-        "All workloads: memory after forward vs expert threshold",
-        "GPU allocated after forward (GiB)",
-        "forward_alloc_end_mib",
+        "combined_forward_peak_allocated_hbm_vs_expert_threshold.png",
+        "All workloads: forward peak allocated HBM vs expert threshold",
+        "Forward peak allocated HBM (GiB)",
+        "forward_peak_allocated_mib",
         scale=1024.0,
     )
     plot_combined_threshold_metric(
         rows,
         output_dir,
-        "combined_forward_peak_memory_vs_expert_threshold.png",
-        "All workloads: forward local peak vs expert threshold",
-        "Forward local peak allocation (GiB)",
-        "forward_local_peak_mib",
+        "combined_forward_peak_reserved_hbm_vs_expert_threshold.png",
+        "All workloads: forward peak reserved HBM vs expert threshold",
+        "Forward peak reserved HBM (GiB)",
+        "forward_peak_reserved_mib",
         scale=1024.0,
     )
     plot_combined_threshold_metric(
         rows,
         output_dir,
-        "combined_backward_start_memory_vs_expert_threshold.png",
-        "All workloads: memory carried into backward vs expert threshold",
-        "GPU allocated at backward start (GiB)",
-        "backward_alloc_start_mib",
+        "combined_backward_peak_allocated_hbm_vs_expert_threshold.png",
+        "All workloads: backward peak allocated HBM vs expert threshold",
+        "Backward peak allocated HBM (GiB)",
+        "backward_peak_allocated_mib",
         scale=1024.0,
     )
     plot_combined_threshold_metric(
         rows,
         output_dir,
-        "combined_peak_hbm_vs_expert_threshold.png",
-        "All workloads: whole-step peak HBM vs expert threshold",
-        "Peak HBM allocation (GiB)",
-        "peak_hbm_mib",
+        "combined_backward_peak_reserved_hbm_vs_expert_threshold.png",
+        "All workloads: backward peak reserved HBM vs expert threshold",
+        "Backward peak reserved HBM (GiB)",
+        "backward_peak_reserved_mib",
         scale=1024.0,
     )
     plot_combined_threshold_metric(
         rows,
         output_dir,
-        "combined_timing_vs_expert_threshold.png",
-        "All workloads: step time vs expert threshold",
-        "Step time (ms)",
-        "step_ms",
+        "combined_peak_allocated_hbm_vs_expert_threshold.png",
+        "All workloads: whole-step peak allocated HBM vs expert threshold",
+        "Peak allocated HBM (GiB)",
+        "peak_allocated_hbm_mib",
+        scale=1024.0,
+    )
+    plot_combined_threshold_metric(
+        rows,
+        output_dir,
+        "combined_peak_reserved_hbm_vs_expert_threshold.png",
+        "All workloads: whole-step peak reserved HBM vs expert threshold",
+        "Peak reserved HBM (GiB)",
+        "peak_reserved_hbm_mib",
+        scale=1024.0,
+    )
+    plot_combined_threshold_metric(
+        rows,
+        output_dir,
+        "combined_reserved_unallocated_hbm_vs_expert_threshold.png",
+        "All workloads: reserved but unallocated HBM vs expert threshold",
+        "Reserved but unallocated HBM (GiB)",
+        "reserved_unallocated_mib",
+        scale=1024.0,
     )
 
 
@@ -2187,61 +2485,72 @@ def write_combined_policy_plots(rows: list[dict[str, Any]], output_dir: Path, fa
     plot_combined_policy_metric(
         rows,
         output_dir,
-        f"combined_forward_end_memory_vs_{name}.png",
-        f"All workloads: memory after forward vs {title}",
-        "GPU allocated after forward (GiB)",
-        "forward_alloc_end_mib",
+        f"combined_forward_peak_allocated_hbm_vs_{name}.png",
+        f"All workloads: forward peak allocated HBM vs {title}",
+        "Forward peak allocated HBM (GiB)",
+        "forward_peak_allocated_mib",
         family=family,
         scale=1024.0,
     )
     plot_combined_policy_metric(
         rows,
         output_dir,
-        f"combined_forward_peak_memory_vs_{name}.png",
-        f"All workloads: forward local peak vs {title}",
-        "Forward local peak allocation (GiB)",
-        "forward_local_peak_mib",
+        f"combined_forward_peak_reserved_hbm_vs_{name}.png",
+        f"All workloads: forward peak reserved HBM vs {title}",
+        "Forward peak reserved HBM (GiB)",
+        "forward_peak_reserved_mib",
         family=family,
         scale=1024.0,
     )
     plot_combined_policy_metric(
         rows,
         output_dir,
-        f"combined_backward_start_memory_vs_{name}.png",
-        f"All workloads: memory carried into backward vs {title}",
-        "GPU allocated at backward start (GiB)",
-        "backward_alloc_start_mib",
+        f"combined_backward_peak_allocated_hbm_vs_{name}.png",
+        f"All workloads: backward peak allocated HBM vs {title}",
+        "Backward peak allocated HBM (GiB)",
+        "backward_peak_allocated_mib",
         family=family,
         scale=1024.0,
     )
     plot_combined_policy_metric(
         rows,
         output_dir,
-        f"combined_backward_peak_memory_vs_{name}.png",
-        f"All workloads: backward local peak vs {title}",
-        "Backward local peak allocation (GiB)",
-        "backward_local_peak_mib",
+        f"combined_backward_peak_reserved_hbm_vs_{name}.png",
+        f"All workloads: backward peak reserved HBM vs {title}",
+        "Backward peak reserved HBM (GiB)",
+        "backward_peak_reserved_mib",
         family=family,
         scale=1024.0,
     )
     plot_combined_policy_metric(
         rows,
         output_dir,
-        f"combined_peak_hbm_vs_{name}.png",
-        f"All workloads: whole-step peak HBM vs {title}",
-        "Peak HBM allocation (GiB)",
-        "peak_hbm_mib",
+        f"combined_peak_allocated_hbm_vs_{name}.png",
+        f"All workloads: whole-step peak allocated HBM vs {title}",
+        "Peak allocated HBM (GiB)",
+        "peak_allocated_hbm_mib",
         family=family,
         scale=1024.0,
     )
     plot_combined_policy_metric(
         rows,
         output_dir,
-        f"combined_timing_vs_{name}.png",
-        f"All workloads: step time vs {title}",
-        "Step time (ms)",
-        "step_ms",
+        f"combined_peak_reserved_hbm_vs_{name}.png",
+        f"All workloads: whole-step peak reserved HBM vs {title}",
+        "Peak reserved HBM (GiB)",
+        "peak_reserved_hbm_mib",
         family=family,
+        scale=1024.0,
+    )
+    plot_combined_policy_metric(
+        rows,
+        output_dir,
+        f"combined_reserved_unallocated_hbm_vs_{name}.png",
+        f"All workloads: reserved but unallocated HBM vs {title}",
+        "Reserved but unallocated HBM (GiB)",
+        "reserved_unallocated_mib",
+        family=family,
+        scale=1024.0,
     )
 
 

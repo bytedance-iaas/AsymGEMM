@@ -25,6 +25,9 @@ PROFILE_LAYERS_ENV = "ASYM_GEMM_LF_PROFILE_LAYERS"
 PROFILE_MEMORY_ATTRIBUTION_ENV = "ASYM_GEMM_LF_PROFILE_MEMORY_ATTRIBUTION"
 PROFILE_MEMORY_BREAKDOWN_ENV = "ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN"
 PROFILE_MEMORY_BREAKDOWN_OUTPUT_ENV = "ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_OUTPUT"
+PROFILE_MEMORY_SNAPSHOT_ENV = "ASYM_GEMM_LF_PROFILE_MEMORY_SNAPSHOT"
+PROFILE_MEMORY_SNAPSHOT_PATH_ENV = "ASYM_GEMM_LF_PROFILE_MEMORY_SNAPSHOT_PATH"
+PROFILE_EXTERNAL_MEMORY_ENV = "ASYM_GEMM_LF_PROFILE_EXTERNAL_MEMORY"
 PROFILE_SYNC_ENV = "ASYM_GEMM_LF_PROFILE_SYNC"
 PROFILE_MODULE_FILTER_ENV = "ASYM_GEMM_LF_PROFILE_MODULE_FILTER"
 CONFIG_ENV_PREFIX = "ASYM_GEMM_LF_CONFIG_"
@@ -155,12 +158,16 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "profile_layers": os.environ.get(PROFILE_LAYERS_ENV, "all"),
         "profile_memory_attribution": os.environ.get(PROFILE_MEMORY_ATTRIBUTION_ENV, "0"),
         "profile_memory_breakdown": os.environ.get(PROFILE_MEMORY_BREAKDOWN_ENV, "0"),
+        "profile_memory_snapshot": os.environ.get(PROFILE_MEMORY_SNAPSHOT_ENV, "0"),
+        "profile_external_memory": os.environ.get(PROFILE_EXTERNAL_MEMORY_ENV, "0"),
         "profile_sync": os.environ.get(PROFILE_SYNC_ENV, "0"),
         "profile_module_filter": os.environ.get(PROFILE_MODULE_FILTER_ENV, ""),
+        "nsys_capture_range": _env_enabled("ASYM_GEMM_LF_NSYS_CAPTURE_RANGE"),
         "superoffload_config": os.environ.get("ASYM_GEMM_LF_CONFIG_SUPEROFFLOAD_CONFIG")
         if is_superoffload_backend
         else None,
         "deepspeed_dir": os.environ.get("ASYM_GEMM_LF_CONFIG_DEEPSPEED_DIR"),
+        "pytorch_cuda_alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""),
         "output_dir": _option_value(args, "--output_dir"),
     }
     for key, value in env_config.items():
@@ -332,6 +339,33 @@ def _install_deepspeed_optimizer_capture_hook() -> None:
     DeepSpeedEngine._configure_optimizer = wrapped_configure_optimizer
 
 
+def _start_memory_snapshot_recording(enabled: bool) -> dict[str, Any]:
+    if not enabled:
+        return {"enabled": False}
+    if not torch.cuda.is_available():
+        return {"enabled": True, "record_started": False, "error": "cuda unavailable"}
+    try:
+        torch.cuda.memory._record_memory_history()  # type: ignore[attr-defined]
+    except Exception as exc:
+        return {"enabled": True, "record_started": False, "error": str(exc)}
+    return {"enabled": True, "record_started": True}
+
+
+def _dump_memory_snapshot(snapshot_info: dict[str, Any], path: Path) -> dict[str, Any]:
+    if not snapshot_info.get("record_started"):
+        return snapshot_info
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        torch.cuda.memory._dump_snapshot(str(path))  # type: ignore[attr-defined]
+    except Exception as exc:
+        result = dict(snapshot_info)
+        result.update({"path": str(path), "dumped": False, "error": str(exc)})
+        return result
+    result = dict(snapshot_info)
+    result.update({"path": str(path), "dumped": True})
+    return result
+
+
 def _iter_unique_parameters(value: Any) -> list[torch.nn.Parameter]:
     params: list[torch.nn.Parameter] = []
     seen: set[int] = set()
@@ -492,8 +526,10 @@ class StageRecord:
     allocated_end_bytes: int
     reserved_start_bytes: int
     reserved_end_bytes: int
-    local_peak_bytes: int
-    global_peak_after_bytes: int
+    peak_allocated_bytes: int
+    peak_reserved_bytes: int
+    global_peak_allocated_after_bytes: int
+    global_peak_reserved_after_bytes: int
 
     @property
     def allocated_delta_bytes(self) -> int:
@@ -504,16 +540,26 @@ class StageRecord:
         return self.reserved_end_bytes - self.reserved_start_bytes
 
     @property
-    def local_peak_delta_bytes(self) -> int:
-        return self.local_peak_bytes - self.allocated_start_bytes
+    def peak_allocated_delta_bytes(self) -> int:
+        return self.peak_allocated_bytes - self.allocated_start_bytes
+
+    @property
+    def peak_reserved_delta_bytes(self) -> int:
+        return self.peak_reserved_bytes - self.reserved_start_bytes
+
+    @property
+    def reserved_unallocated_bytes(self) -> int:
+        return max(0, self.peak_reserved_bytes - self.peak_allocated_bytes)
 
 
 @dataclass
 class LFProfileRecorder:
     config: dict[str, Any]
     measure_memory: bool = True
+    reset_stage_peak_stats: bool = True
     records: dict[str, list[StageRecord]] = field(default_factory=dict)
-    global_peak_bytes: int = 0
+    global_peak_allocated_bytes: int = 0
+    global_peak_reserved_bytes: int = 0
 
     @contextmanager
     def stage(self, name: str, *, sync: bool = False) -> Iterator[None]:
@@ -525,10 +571,11 @@ class LFProfileRecorder:
         if cuda_available:
             allocated_start = int(torch.cuda.memory_allocated())
             reserved_start = int(torch.cuda.memory_reserved())
-            try:
-                torch.cuda.reset_peak_memory_stats()
-            except RuntimeError:
-                pass
+            if self.reset_stage_peak_stats:
+                try:
+                    torch.cuda.reset_peak_memory_stats()
+                except RuntimeError:
+                    pass
         try:
             with prof_range(name):
                 yield
@@ -536,13 +583,17 @@ class LFProfileRecorder:
             if sync and torch.cuda.is_available():
                 torch.cuda.synchronize()
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-            allocated_end = reserved_end = local_peak = global_peak = 0
+            allocated_end = reserved_end = peak_allocated = peak_reserved = 0
+            global_peak_allocated = global_peak_reserved = 0
             if cuda_available:
                 allocated_end = int(torch.cuda.memory_allocated())
                 reserved_end = int(torch.cuda.memory_reserved())
-                local_peak = int(torch.cuda.max_memory_allocated())
-                global_peak = max(local_peak, allocated_end)
-                self.global_peak_bytes = max(self.global_peak_bytes, global_peak)
+                peak_allocated = int(torch.cuda.max_memory_allocated())
+                peak_reserved = int(torch.cuda.max_memory_reserved())
+                global_peak_allocated = max(peak_allocated, allocated_end)
+                global_peak_reserved = max(peak_reserved, reserved_end)
+                self.global_peak_allocated_bytes = max(self.global_peak_allocated_bytes, global_peak_allocated)
+                self.global_peak_reserved_bytes = max(self.global_peak_reserved_bytes, global_peak_reserved)
             self.records.setdefault(name, []).append(
                 StageRecord(
                     milliseconds=elapsed_ms,
@@ -550,8 +601,10 @@ class LFProfileRecorder:
                     allocated_end_bytes=allocated_end,
                     reserved_start_bytes=reserved_start,
                     reserved_end_bytes=reserved_end,
-                    local_peak_bytes=local_peak,
-                    global_peak_after_bytes=global_peak,
+                    peak_allocated_bytes=peak_allocated,
+                    peak_reserved_bytes=peak_reserved,
+                    global_peak_allocated_after_bytes=global_peak_allocated,
+                    global_peak_reserved_after_bytes=global_peak_reserved,
                 )
             )
 
@@ -595,10 +648,19 @@ class LFProfileRecorder:
                     "avg_reserved_start_bytes": avg("reserved_start_bytes"),
                     "avg_reserved_end_bytes": avg("reserved_end_bytes"),
                     "avg_reserved_delta_bytes": avg("reserved_delta_bytes"),
-                    "avg_local_peak_bytes": avg("local_peak_bytes"),
-                    "avg_local_peak_delta_bytes": avg("local_peak_delta_bytes"),
-                    "max_local_peak_bytes": max(record.local_peak_bytes for record in records),
-                    "max_global_peak_after_bytes": max(record.global_peak_after_bytes for record in records),
+                    "avg_peak_allocated_bytes": avg("peak_allocated_bytes"),
+                    "max_peak_allocated_bytes": max(record.peak_allocated_bytes for record in records),
+                    "avg_peak_allocated_delta_bytes": avg("peak_allocated_delta_bytes"),
+                    "avg_peak_reserved_bytes": avg("peak_reserved_bytes"),
+                    "max_peak_reserved_bytes": max(record.peak_reserved_bytes for record in records),
+                    "avg_peak_reserved_delta_bytes": avg("peak_reserved_delta_bytes"),
+                    "max_global_peak_allocated_after_bytes": max(
+                        record.global_peak_allocated_after_bytes for record in records
+                    ),
+                    "max_global_peak_reserved_after_bytes": max(
+                        record.global_peak_reserved_after_bytes for record in records
+                    ),
+                    "avg_reserved_unallocated_bytes": avg("reserved_unallocated_bytes"),
                 }
             )
         return rows
@@ -625,9 +687,13 @@ class LFProfileRecorder:
                     f"{prefix}_reserved_start_bytes": record.reserved_start_bytes,
                     f"{prefix}_reserved_end_bytes": record.reserved_end_bytes,
                     f"{prefix}_reserved_delta_bytes": record.reserved_delta_bytes,
-                    f"{prefix}_local_peak_bytes": record.local_peak_bytes,
-                    f"{prefix}_local_peak_delta_bytes": record.local_peak_delta_bytes,
-                    f"{prefix}_global_peak_after_bytes": record.global_peak_after_bytes,
+                    f"{prefix}_peak_allocated_bytes": record.peak_allocated_bytes,
+                    f"{prefix}_peak_allocated_delta_bytes": record.peak_allocated_delta_bytes,
+                    f"{prefix}_peak_reserved_bytes": record.peak_reserved_bytes,
+                    f"{prefix}_peak_reserved_delta_bytes": record.peak_reserved_delta_bytes,
+                    f"{prefix}_global_peak_allocated_after_bytes": record.global_peak_allocated_after_bytes,
+                    f"{prefix}_global_peak_reserved_after_bytes": record.global_peak_reserved_after_bytes,
+                    f"{prefix}_reserved_unallocated_bytes": record.reserved_unallocated_bytes,
                 }
             )
 
@@ -655,11 +721,14 @@ class LFProfileRecorder:
             row["step_milliseconds"] = sum(
                 record.milliseconds for record in (forward, backward) if record is not None
             )
-            row["peak_hbm_bytes"] = max(
-                [record.local_peak_bytes for record in (forward, backward) if record is not None] or [0]
+            row["peak_allocated_hbm_bytes"] = max(
+                [record.peak_allocated_bytes for record in (forward, backward) if record is not None] or [0]
             )
-            row["global_peak_after_bytes"] = max(
-                [record.global_peak_after_bytes for record in (forward, backward) if record is not None] or [0]
+            row["peak_reserved_hbm_bytes"] = max(
+                [record.peak_reserved_bytes for record in (forward, backward) if record is not None] or [0]
+            )
+            row["reserved_unallocated_bytes"] = max(
+                0, int(row["peak_reserved_hbm_bytes"]) - int(row["peak_allocated_hbm_bytes"])
             )
             rows.append(row)
         return rows
@@ -718,14 +787,20 @@ class LFProfileRecorder:
             "backward": {"total_milliseconds": backward_ms, "rows": []},
             "memory": {
                 "gpu": {
-                    "peak_hbm_bytes": self.global_peak_bytes,
-                    "stage_local_peak_hbm_bytes": self.global_peak_bytes,
+                    "peak_allocated_hbm_bytes": self.global_peak_allocated_bytes,
+                    "peak_reserved_hbm_bytes": self.global_peak_reserved_bytes,
+                    "reserved_unallocated_bytes": max(
+                        0, self.global_peak_reserved_bytes - self.global_peak_allocated_bytes
+                    ),
                 },
-                "peak_hbm_bytes": self.global_peak_bytes,
+                "peak_allocated_hbm_bytes": self.global_peak_allocated_bytes,
+                "peak_reserved_hbm_bytes": self.global_peak_reserved_bytes,
+                "reserved_unallocated_bytes": max(0, self.global_peak_reserved_bytes - self.global_peak_allocated_bytes),
             },
             "stage_memory": {
                 "rows": self._stage_memory_rows(),
-                "max_stage_peak_bytes": self.global_peak_bytes,
+                "max_stage_peak_allocated_bytes": self.global_peak_allocated_bytes,
+                "max_stage_peak_reserved_bytes": self.global_peak_reserved_bytes,
             },
             "memory_attribution": (
                 trace_handle.memory_summary(trace_handle.model)
@@ -769,8 +844,14 @@ def main() -> None:
 
     config = _config_from_args(lf_args)
     trace_config = LFTraceConfig.from_env(os.environ)
-    recorder = LFProfileRecorder(config=config, measure_memory=_env_enabled(PROFILE_MEMORY_ENV, default=True))
+    recorder = LFProfileRecorder(
+        config=config,
+        measure_memory=_env_enabled(PROFILE_MEMORY_ENV, default=True),
+        reset_stage_peak_stats=not trace_config.memory_breakdown,
+    )
     source_json = os.environ.get(PROFILE_SOURCE_JSON_ENV)
+    snapshot_enabled = _env_enabled(PROFILE_MEMORY_SNAPSHOT_ENV, default=False) and _is_rank0()
+    snapshot_info = _start_memory_snapshot_recording(snapshot_enabled)
 
     set_profile_enabled(True)
     trace_handle = install_lf_trace(trace_config, recorder=recorder)
@@ -786,7 +867,12 @@ def main() -> None:
         if source_json and _is_rank0():
             path = Path(source_json)
             path.parent.mkdir(parents=True, exist_ok=True)
+            snapshot_path_raw = os.environ.get(PROFILE_MEMORY_SNAPSHOT_PATH_ENV, "").strip()
+            snapshot_path = Path(snapshot_path_raw) if snapshot_path_raw else path.parent / "memory_snapshot.pickle"
+            snapshot_info = _dump_memory_snapshot(snapshot_info, snapshot_path)
             report = recorder.report(trace_handle)
+            if snapshot_info.get("enabled"):
+                report["memory_snapshot"] = snapshot_info
             memory_breakdown = trace_handle.memory_breakdown_report()
             if memory_breakdown.get("enabled"):
                 output_base = os.environ.get(PROFILE_MEMORY_BREAKDOWN_OUTPUT_ENV, "memory_breakdown").strip() or "memory_breakdown"

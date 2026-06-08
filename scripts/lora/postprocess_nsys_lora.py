@@ -845,6 +845,33 @@ def _source_warmup_steps(source_profile: dict[str, Any]) -> int:
     return max(_safe_int(value) or 0, 0)
 
 
+def _source_measure_steps(source_profile: dict[str, Any]) -> int:
+    config = source_profile.get("config", {})
+    step_samples = source_profile.get("step_samples", {})
+    value = None
+    if isinstance(step_samples, dict):
+        value = step_samples.get("measure_steps")
+    if value is None and isinstance(config, dict):
+        value = config.get("measure_steps", config.get("max_steps"))
+    return max(_safe_int(value) or 0, 0)
+
+
+def _nsys_ranges_start_after_warmup(source_profile: dict[str, Any], range_count: int) -> bool:
+    warmup_steps = _source_warmup_steps(source_profile)
+    if warmup_steps <= 0 or range_count <= 0:
+        return False
+
+    config = source_profile.get("config", {})
+    if isinstance(config, dict) and _source_bool(config.get("nsys_capture_range")):
+        return True
+
+    measure_steps = _source_measure_steps(source_profile)
+    source_rows = _source_step_rows_by_step(source_profile)
+    if measure_steps > 0 and range_count <= measure_steps and len(source_rows) >= warmup_steps + range_count:
+        return True
+    return False
+
+
 def _source_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -1248,8 +1275,11 @@ def _average_no_kernel_gap_rows(summaries: list[dict[str, Any]], total_ms: float
 
 def summarize_stage(con: sqlite3.Connection, stage_name: str, source_profile: dict[str, Any] | None = None) -> dict[str, Any]:
     ranges = _all_steps(con, stage_name)
-    warmup_steps = _source_warmup_steps(source_profile or {})
-    measured_ranges = ranges[min(warmup_steps, len(ranges)) :]
+    source_profile = source_profile or {}
+    warmup_steps = _source_warmup_steps(source_profile)
+    capture_offset = warmup_steps if _nsys_ranges_start_after_warmup(source_profile, len(ranges)) else 0
+    ranges_to_skip = 0 if capture_offset else min(warmup_steps, len(ranges))
+    measured_ranges = ranges[ranges_to_skip:]
     if not measured_ranges:
         measured_ranges = ranges[-1:] if ranges else []
     if not measured_ranges:
@@ -1268,9 +1298,11 @@ def summarize_stage(con: sqlite3.Connection, stage_name: str, source_profile: di
         "stage": stage_name,
         "total_milliseconds": total_ms,
         "sampled_steps": len(measured_ranges),
-        "warmup_steps_skipped": min(warmup_steps, len(ranges)),
-        "raw_step_start": min(warmup_steps, len(ranges)) + 1,
-        "raw_step_end": min(warmup_steps, len(ranges)) + len(measured_ranges),
+        "warmup_steps_skipped": warmup_steps if capture_offset else ranges_to_skip,
+        "captured_range_offset": capture_offset,
+        "nsys_capture_post_warmup": bool(capture_offset),
+        "raw_step_start": capture_offset + ranges_to_skip + 1,
+        "raw_step_end": capture_offset + ranges_to_skip + len(measured_ranges),
         "stage_breakdown": stage_breakdown,
         "host_api_breakdown": _average_named_rows(summaries, "host_api_breakdown", total_ms),
         "operation_kernel_time": _average_named_rows(summaries, "operation_kernel_time", total_ms),
@@ -1295,7 +1327,9 @@ def summarize_step_samples(con: sqlite3.Connection, source_profile: dict[str, An
     backward_ranges = _all_steps(con, "step.backward")
     source_rows = _source_step_rows_by_step(source_profile)
     warmup_steps = _source_warmup_steps(source_profile)
-    sample_count = max(len(forward_ranges), len(backward_ranges), len(source_rows))
+    range_count = max(len(forward_ranges), len(backward_ranges))
+    capture_offset = warmup_steps if _nsys_ranges_start_after_warmup(source_profile, range_count) else 0
+    sample_count = max(capture_offset + range_count, len(source_rows))
     rows: list[dict[str, Any]] = []
 
     def add_stage(row: dict[str, Any], prefix: str, timing: dict[str, Any]) -> None:
@@ -1321,14 +1355,15 @@ def summarize_step_samples(con: sqlite3.Connection, source_profile: dict[str, An
         }
         forward_start = forward_end = backward_start = backward_end = None
         forward_ms = backward_ms = 0.0
+        range_index = raw_step - 1 - capture_offset
 
-        if index < len(forward_ranges):
-            forward_start, forward_end = forward_ranges[index]
+        if 0 <= range_index < len(forward_ranges):
+            forward_start, forward_end = forward_ranges[range_index]
             forward_timing = _stage_timing_sample(con, forward_start, forward_end)
             add_stage(row, "forward", forward_timing)
             forward_ms = float(forward_timing["milliseconds"])
-        if index < len(backward_ranges):
-            backward_start, backward_end = backward_ranges[index]
+        if 0 <= range_index < len(backward_ranges):
+            backward_start, backward_end = backward_ranges[range_index]
             backward_timing = _stage_timing_sample(con, backward_start, backward_end)
             add_stage(row, "backward", backward_timing)
             backward_ms = float(backward_timing["milliseconds"])
@@ -1352,7 +1387,9 @@ def summarize_step_samples(con: sqlite3.Connection, source_profile: dict[str, An
     return {
         "source": "nsys_nvtx_step_ranges",
         "warmup_steps": warmup_steps,
-        "measure_steps": max(sample_count - warmup_steps, 0),
+        "measure_steps": _source_measure_steps(source_profile) or max(sample_count - warmup_steps, 0),
+        "captured_range_offset": capture_offset,
+        "nsys_capture_post_warmup": bool(capture_offset),
         "forward_ranges": len(forward_ranges),
         "backward_ranges": len(backward_ranges),
         "rows": rows,
@@ -2434,8 +2471,17 @@ def _top_memory_rows(source_profile: dict[str, Any], memory_profile: dict[str, A
     if isinstance(memory, dict):
         gpu = memory.get("gpu", {}) if isinstance(memory.get("gpu", {}), dict) else {}
         cpu = memory.get("cpu", {}) if isinstance(memory.get("cpu", {}), dict) else {}
+        gpu_peak_rows: list[tuple[str, str, Any]]
+        if "peak_allocated_hbm_bytes" in gpu or "peak_reserved_hbm_bytes" in gpu:
+            gpu_peak_rows = [
+                ("GPU peak allocated HBM", "GPU HBM", gpu.get("peak_allocated_hbm_bytes", 0)),
+                ("GPU peak reserved HBM", "GPU reserved", gpu.get("peak_reserved_hbm_bytes", 0)),
+                ("GPU reserved but unallocated", "GPU reserved", gpu.get("reserved_unallocated_bytes", 0)),
+            ]
+        else:
+            gpu_peak_rows = [("GPU peak HBM", "GPU HBM", gpu.get("peak_hbm_bytes", 0))]
         for item, memory_space, value in [
-            ("GPU peak HBM", "GPU HBM", gpu.get("peak_hbm_bytes", 0)),
+            *gpu_peak_rows,
             ("GPU parameters", "GPU HBM", gpu.get("parameter_bytes", 0)),
             ("GPU buffers", "GPU HBM", gpu.get("buffer_bytes", 0)),
             ("GPU unattributed peak", "GPU HBM", gpu.get("unattributed_peak_bytes", 0)),
@@ -2481,8 +2527,16 @@ def _overall_memory_markdown(source_profile: dict[str, Any]) -> list[str]:
         ]
     gpu = memory.get("gpu", {}) if isinstance(memory.get("gpu", {}), dict) else {}
     cpu = memory.get("cpu", {}) if isinstance(memory.get("cpu", {}), dict) else {}
+    if "peak_allocated_hbm_bytes" in gpu or "peak_reserved_hbm_bytes" in gpu:
+        gpu_peak_rows = [
+            ("GPU peak allocated HBM", gpu.get("peak_allocated_hbm_bytes", 0)),
+            ("GPU peak reserved HBM", gpu.get("peak_reserved_hbm_bytes", 0)),
+            ("GPU reserved but unallocated", gpu.get("reserved_unallocated_bytes", 0)),
+        ]
+    else:
+        gpu_peak_rows = [("GPU peak HBM", gpu.get("peak_hbm_bytes", 0))]
     rows = [
-        ("GPU peak HBM", gpu.get("peak_hbm_bytes", 0)),
+        *gpu_peak_rows,
         ("GPU parameters", gpu.get("parameter_bytes", 0)),
         ("GPU buffers", gpu.get("buffer_bytes", 0)),
         ("GPU unattributed peak", gpu.get("unattributed_peak_bytes", 0)),
@@ -2513,10 +2567,10 @@ def _stage_memory_markdown(source_profile: dict[str, Any]) -> list[str]:
     lines = [
         "## Forward/Backward Memory Summary",
         "",
-        "CUDA allocator snapshots are averaged over measured steps. `global peak after` is the process-wide CUDA allocated peak observed after that stage.",
+        "CUDA allocator snapshots are averaged over measured steps. Global peak columns are process-wide CUDA allocated/reserved peaks observed after that stage.",
         "",
-        "| Stage | samples | alloc start MiB | alloc end MiB | alloc delta MiB | local peak MiB | local peak delta MiB | reserved start MiB | reserved end MiB | reserved delta MiB | global peak after MiB |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Stage | samples | alloc start MiB | alloc end MiB | alloc delta MiB | peak allocated MiB | peak allocated delta MiB | reserved start MiB | reserved end MiB | reserved delta MiB | peak reserved MiB | peak reserved delta MiB | reserved but unallocated MiB | global peak allocated after MiB | global peak reserved after MiB |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     stage_order = {"step.forward": 0, "step.backward": 1}
     for row in sorted(rows, key=lambda item: (stage_order.get(str(item.get("name", "")), 99), str(item.get("name", "")))):
@@ -2526,12 +2580,16 @@ def _stage_memory_markdown(source_profile: dict[str, Any]) -> list[str]:
             f"{_fmt_mib(row['avg_allocated_start_bytes'])} | "
             f"{_fmt_mib(row['avg_allocated_end_bytes'])} | "
             f"{_fmt_mib(row['avg_allocated_delta_bytes'])} | "
-            f"{_fmt_mib(row.get('avg_local_peak_bytes', row['max_global_peak_after_bytes']))} | "
-            f"{_fmt_mib(row.get('avg_local_peak_delta_bytes', 0))} | "
+            f"{_fmt_mib(row['avg_peak_allocated_bytes'])} | "
+            f"{_fmt_mib(row['avg_peak_allocated_delta_bytes'])} | "
             f"{_fmt_mib(row['avg_reserved_start_bytes'])} | "
             f"{_fmt_mib(row['avg_reserved_end_bytes'])} | "
             f"{_fmt_mib(row['avg_reserved_delta_bytes'])} | "
-            f"{_fmt_mib(row['max_global_peak_after_bytes'])} |"
+            f"{_fmt_mib(row['avg_peak_reserved_bytes'])} | "
+            f"{_fmt_mib(row['avg_peak_reserved_delta_bytes'])} | "
+            f"{_fmt_mib(row['avg_reserved_unallocated_bytes'])} | "
+            f"{_fmt_mib(row['max_global_peak_allocated_after_bytes'])} | "
+            f"{_fmt_mib(row['max_global_peak_reserved_after_bytes'])} |"
         )
     lines.append("")
     return lines
@@ -2552,20 +2610,37 @@ def _memory_breakdown_markdown(profile: dict[str, Any]) -> list[str]:
     rows = summary.get("breakdown_rows")
     if not isinstance(rows, list) or not rows:
         return []
-    peak_hbm = int(summary.get("peak_hbm_bytes", 0) or 0)
-    closure_error = int(summary.get("closure_error_bytes", 0) or 0)
+    peak_allocated = int(summary.get("peak_allocated_hbm_bytes", 0) or 0)
+    peak_reserved = int(summary.get("peak_reserved_hbm_bytes", 0) or 0)
+    reserved_unallocated = int(summary.get("reserved_unallocated_bytes", 0) or 0)
+    external_cuda = int(summary.get("external_cuda_or_driver_bytes", 0) or 0)
+    allocated_closure_error = int(summary.get("allocated_closure_error_bytes", 0) or 0)
+    reserved_closure_error = int(summary.get("reserved_closure_error_bytes", 0) or 0)
     lines = [
         "## Source Memory Breakdown",
         "",
-        "This section comes from the source memory-breakdown pass. It is independent of Nsight timing attribution.",
+        "This section comes from the source memory-breakdown pass. Nsight supplies timing and CUDA timeline context, not semantic model-memory attribution.",
         "",
+        f"Schema version: `{summary.get('schema_version', '-')}`  ",
+        f"Selected metric: `{summary.get('selected_metric', '-')}`  ",
         f"Selected step: `{summary.get('selected_step', '-')}`  ",
         f"Selected phase: `{summary.get('selected_phase', '-')}`  ",
-        f"Peak HBM denominator: `{peak_hbm}` bytes / `{_fmt_mib(peak_hbm)} MiB`  ",
-        f"Closure error: `{closure_error}` bytes / `{_fmt_mib(closure_error)} MiB`  ",
-        f"Closure OK: `{bool(summary.get('closure_ok', False))}`",
+        f"Peak allocated HBM: `{peak_allocated}` bytes / `{_fmt_mib(peak_allocated)} MiB`  ",
+        f"Peak reserved HBM: `{peak_reserved}` bytes / `{_fmt_mib(peak_reserved)} MiB`  ",
+        f"Reserved but unallocated: `{reserved_unallocated}` bytes / `{_fmt_mib(reserved_unallocated)} MiB`  ",
+        f"External CUDA/driver diagnostic: `{external_cuda}` bytes / `{_fmt_mib(external_cuda)} MiB`  ",
+        f"Allocated stack sum: `{summary.get('allocated_stack_sum_bytes', 0)}` bytes / `{_fmt_mib(summary.get('allocated_stack_sum_bytes', 0))} MiB`  ",
+        f"Reserved stack sum: `{summary.get('reserved_stack_sum_bytes', 0)}` bytes / `{_fmt_mib(summary.get('reserved_stack_sum_bytes', 0))} MiB`  ",
+        f"Saved activations at peak: `{summary.get('saved_activation_hbm_bytes_at_peak', 0)}` bytes / `{_fmt_mib(summary.get('saved_activation_hbm_bytes_at_peak', 0))} MiB`  ",
+        f"Unattributed allocated peak: `{summary.get('unattributed_allocated_peak_bytes', 0)}` bytes / `{_fmt_mib(summary.get('unattributed_allocated_peak_bytes', 0))} MiB`  ",
+        f"Allocated closure error: `{allocated_closure_error}` bytes / `{_fmt_mib(allocated_closure_error)} MiB`  ",
+        f"Allocated closure OK: `{bool(summary.get('allocated_closure_ok', False))}`  ",
+        f"Reserved closure error: `{reserved_closure_error}` bytes / `{_fmt_mib(reserved_closure_error)} MiB`  ",
+        f"Reserved closure OK: `{bool(summary.get('reserved_closure_ok', False))}`",
         "",
-        "| Group | Component | Kind | Memory space | bytes | MiB | % peak HBM | Method | Accuracy |",
+        "GPU HBM semantic rows close to peak allocated HBM; allocator reserved-unallocated extends that stack to peak reserved HBM. External CUDA/driver diagnostics are separate.",
+        "",
+        "| Group | Component | Kind | Memory space | bytes | MiB | % peak reserved HBM | Method | Accuracy |",
         "|---|---|---|---|---:|---:|---:|---|---|",
     ]
     for row in sorted(
@@ -2576,7 +2651,8 @@ def _memory_breakdown_markdown(profile: dict[str, Any]) -> list[str]:
         if value <= 0:
             continue
         memory_space = row.get("memory_space", "-")
-        pct = f"{_percent(value, peak_hbm):.2f}%" if memory_space == "GPU HBM" and peak_hbm > 0 else "-"
+        is_reserved_stack_row = memory_space == "GPU HBM" or row.get("component") == "allocator_reserved_unallocated"
+        pct = f"{_percent(value, peak_reserved):.2f}%" if is_reserved_stack_row and peak_reserved > 0 else "-"
         lines.append(
             f"| {row.get('group', '-')} | {row.get('component', '-')} | {row.get('kind', '-')} | "
             f"{memory_space} | {value} | {_fmt_mib(value)} | {pct} | "
@@ -2626,20 +2702,24 @@ def _memory_attribution_markdown(profile: dict[str, Any]) -> list[str]:
     lines = [
         "## Persistent Tensor Accounting",
         "",
-        "Model, gradient, and optimizer rows are tensor-size accounting. Use `Source Memory Breakdown` for the peak-HBM stack when it is present.",
+        "Model, gradient, and optimizer rows are tensor-size accounting. Use `Source Reserved-Capacity Memory Breakdown` for the reserved-capacity stack when it is present.",
         "",
     ]
     if isinstance(category_rows, list) and category_rows:
         memory = profile.get("memory") if isinstance(profile, dict) else None
         gpu = memory.get("gpu", {}) if isinstance(memory, dict) and isinstance(memory.get("gpu", {}), dict) else {}
-        gpu_peak_hbm = int(gpu.get("peak_hbm_bytes", 0) or 0)
-        if gpu_peak_hbm <= 0:
-            gpu_peak_hbm = sum(int(row.get("bytes", 0)) for row in category_rows if row.get("memory_space") == "GPU HBM")
-        if gpu_peak_hbm > 0:
-            lines.extend([f"Percent denominator: memory-attribution pass peak HBM `{gpu_peak_hbm}` bytes.", ""])
+        gpu_peak_allocated = int(gpu.get("peak_allocated_hbm_bytes", 0) or 0)
+        peak_label = "peak allocated HBM"
+        if gpu_peak_allocated <= 0 and int(gpu.get("peak_hbm_bytes", 0) or 0) > 0:
+            gpu_peak_allocated = int(gpu.get("peak_hbm_bytes", 0) or 0)
+            peak_label = "peak HBM"
+        if gpu_peak_allocated <= 0:
+            gpu_peak_allocated = sum(int(row.get("bytes", 0)) for row in category_rows if row.get("memory_space") == "GPU HBM")
+        if gpu_peak_allocated > 0:
+            lines.extend([f"Percent denominator: memory-attribution pass {peak_label} `{gpu_peak_allocated}` bytes.", ""])
         lines.extend(
             [
-                "| Category | Component | Memory space | bytes | MiB | % peak HBM | Accuracy |",
+                f"| Category | Component | Memory space | bytes | MiB | % {peak_label} | Accuracy |",
                 "|---|---|---|---:|---:|---:|---|",
             ]
         )
@@ -2648,7 +2728,7 @@ def _memory_attribution_markdown(profile: dict[str, Any]) -> list[str]:
             if value <= 0:
                 continue
             memory_space = row.get("memory_space", "-")
-            gpu_percent = f"{_percent(value, gpu_peak_hbm):.2f}%" if memory_space == "GPU HBM" else "-"
+            gpu_percent = f"{_percent(value, gpu_peak_allocated):.2f}%" if memory_space == "GPU HBM" else "-"
             lines.append(
                 f"| {row.get('category', '-')} | {row.get('component', '-')} | {memory_space} | "
                 f"{value} | {_fmt_mib(value)} | {gpu_percent} | {row.get('accuracy', '-')} |"

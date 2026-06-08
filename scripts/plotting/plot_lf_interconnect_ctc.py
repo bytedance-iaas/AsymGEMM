@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -87,6 +88,7 @@ METRIC_COLORS = {
     "ctc_rx": "#1f77b4",
     "ctc_tx": "#d62728",
 }
+RUN_DIR_RE = re.compile(r"^(?:b(?P<batch_size>[0-9]+)_)?s(?P<seq_len>[0-9]+)$")
 
 
 @dataclass(frozen=True)
@@ -157,6 +159,11 @@ def _filter_values(values: list[str]) -> set[str]:
     return result
 
 
+def _seq_len_from_run_dir_name(name: str) -> str:
+    match = RUN_DIR_RE.match(name)
+    return match.group("seq_len") if match is not None else ""
+
+
 def _find_profile_paths(input_roots: list[Path], run_dirs: list[Path]) -> list[Path]:
     paths: list[Path] = []
     for run_dir in run_dirs:
@@ -210,8 +217,8 @@ def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, st
         return None
 
     seq_len = str(config.get("seq_len") or config.get("cutoff_len") or "")
-    if not seq_len and run_dir.name.startswith("s") and run_dir.name[1:].isdigit():
-        seq_len = run_dir.name[1:]
+    if not seq_len:
+        seq_len = _seq_len_from_run_dir_name(run_dir.name)
 
     metadata = {
         "workload": str(config.get("workload") or config_root.name.split("__", 1)[0]),

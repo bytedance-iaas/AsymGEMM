@@ -110,24 +110,27 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
         f"Seq len: `{config.get('seq_len', '-')}`",
         f"Steps: `{warmup_steps}` warmup + `{measure_steps}` measured",
         "",
-        "| Stage | host ms | avg start MiB | avg end MiB | avg local peak MiB | samples |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| Stage | host ms | avg allocated start MiB | avg allocated end MiB | avg peak allocated MiB | avg peak reserved MiB | samples |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for name, total_ms in (("step.forward", forward_ms), ("step.backward", backward_ms)):
         row = _stage_memory_row(profile, name)
         lines.append(
-            "| {name} | {ms} | {start} | {end} | {peak} | {samples} |".format(
+            "| {name} | {ms} | {start} | {end} | {peak_allocated} | {peak_reserved} | {samples} |".format(
                 name=name,
                 ms=_fmt_ms(total_ms),
                 start=_fmt_mib(row.get("avg_allocated_start_bytes")),
                 end=_fmt_mib(row.get("avg_allocated_end_bytes")),
-                peak=_fmt_mib(row.get("avg_local_peak_bytes")),
+                peak_allocated=_fmt_mib(row.get("avg_peak_allocated_bytes")),
+                peak_reserved=_fmt_mib(row.get("avg_peak_reserved_bytes")),
                 samples=row.get("samples", "-"),
             )
         )
     lines += [
         "",
-        f"Peak HBM: `{_fmt_mib(gpu.get('peak_hbm_bytes'))} MiB`",
+        f"Peak allocated HBM: `{_fmt_mib(gpu.get('peak_allocated_hbm_bytes'))} MiB`",
+        f"Peak reserved HBM: `{_fmt_mib(gpu.get('peak_reserved_hbm_bytes'))} MiB`",
+        f"Reserved but unallocated: `{_fmt_mib(gpu.get('reserved_unallocated_bytes'))} MiB`",
         f"Trainer log: `{trainer.get('trainer_log', '')}`",
         "",
     ]
@@ -202,32 +205,56 @@ def _memory_breakdown_csv_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
     rows = summary.get("breakdown_rows", [])
     if not isinstance(rows, list):
         return []
-    peak = int(summary.get("peak_hbm_bytes", 0) or 0)
+    peak_allocated = int(summary.get("peak_allocated_hbm_bytes", 0) or 0)
+    peak_reserved = int(summary.get("peak_reserved_hbm_bytes", 0) or 0)
+    reserved_unallocated = int(summary.get("reserved_unallocated_bytes", 0) or 0)
+    external_cuda = int(summary.get("external_cuda_or_driver_bytes", 0) or 0)
     selected_step = summary.get("selected_step", "")
     selected_phase = summary.get("selected_phase", "")
-    closure_error = int(summary.get("closure_error_bytes", 0) or 0)
-    closure_ok = bool(summary.get("closure_ok", False))
+    allocated_closure_error = int(summary.get("allocated_closure_error_bytes", 0) or 0)
+    reserved_closure_error = int(summary.get("reserved_closure_error_bytes", 0) or 0)
+    allocated_closure_ok = bool(summary.get("allocated_closure_ok", False))
+    reserved_closure_ok = bool(summary.get("reserved_closure_ok", False))
     normalized: list[dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
         value = int(row.get("bytes", 0) or 0)
         memory_space = row.get("memory_space", "-")
+        is_reserved_stack_row = memory_space == "GPU HBM" or row.get("component") == "allocator_reserved_unallocated"
         normalized.append(
             {
                 "selected_step": selected_step,
                 "selected_phase": selected_phase,
+                "schema_version": summary.get("schema_version", ""),
+                "selected_metric": summary.get("selected_metric", ""),
+                "peak_allocated_hbm_bytes": peak_allocated,
+                "peak_reserved_hbm_bytes": peak_reserved,
+                "reserved_unallocated_bytes": reserved_unallocated,
+                "external_cuda_or_driver_bytes": external_cuda,
+                "allocated_stack_sum_bytes": int(summary.get("allocated_stack_sum_bytes", 0) or 0),
+                "reserved_stack_sum_bytes": int(summary.get("reserved_stack_sum_bytes", 0) or 0),
+                "saved_activation_hbm_bytes_at_peak": int(
+                    summary.get("saved_activation_hbm_bytes_at_peak", 0) or 0
+                ),
+                "unattributed_allocated_peak_bytes": int(
+                    summary.get("unattributed_allocated_peak_bytes", 0) or 0
+                ),
                 "memory_space": memory_space,
                 "group": row.get("group", "-"),
                 "component": row.get("component", "-"),
                 "kind": row.get("kind", "-"),
                 "bytes": value,
                 "mib": value / (1024.0 ** 2),
-                "percent_peak_hbm": (value * 100.0 / peak) if peak > 0 and memory_space == "GPU HBM" else "",
+                "percent_peak_reserved_hbm": (value * 100.0 / peak_reserved)
+                if peak_reserved > 0 and is_reserved_stack_row
+                else "",
                 "method": row.get("method", "-"),
                 "accuracy": row.get("accuracy", "-"),
-                "closure_ok": closure_ok,
-                "closure_error_bytes": closure_error,
+                "allocated_closure_ok": allocated_closure_ok,
+                "reserved_closure_ok": reserved_closure_ok,
+                "allocated_closure_error_bytes": allocated_closure_error,
+                "reserved_closure_error_bytes": reserved_closure_error,
             }
         )
     return normalized
@@ -238,25 +265,50 @@ def _source_memory_breakdown_markdown(profile: dict[str, Any], *, top_level: boo
     rows = _memory_breakdown_csv_rows(summary)
     if not rows:
         return ""
-    peak = int(summary.get("peak_hbm_bytes", 0) or 0)
-    closure_error = int(summary.get("closure_error_bytes", 0) or 0)
-    title = "# LF LoRA-SFT Memory Breakdown" if top_level else "## Peak HBM Breakdown"
+    peak_allocated = int(summary.get("peak_allocated_hbm_bytes", 0) or 0)
+    peak_reserved = int(summary.get("peak_reserved_hbm_bytes", 0) or 0)
+    reserved_unallocated = int(summary.get("reserved_unallocated_bytes", 0) or 0)
+    external_cuda = int(summary.get("external_cuda_or_driver_bytes", 0) or 0)
+    allocated_closure_error = int(summary.get("allocated_closure_error_bytes", 0) or 0)
+    reserved_closure_error = int(summary.get("reserved_closure_error_bytes", 0) or 0)
+    title = "# LF LoRA-SFT Source Memory Breakdown" if top_level else "## Source Memory Breakdown"
     lines = [
         title,
         "",
+        f"Schema version: `{summary.get('schema_version', '-')}`  ",
+        f"Selected metric: `{summary.get('selected_metric', '-')}`  ",
         f"Selected step: `{summary.get('selected_step', '-')}`  ",
         f"Selected phase: `{summary.get('selected_phase', '-')}`  ",
-        f"Peak HBM denominator: `{_fmt_mib(peak)} MiB`  ",
-        f"Closure error: `{_fmt_mib(closure_error)} MiB`  ",
-        f"Closure OK: `{bool(summary.get('closure_ok', False))}`",
+        f"Peak allocated HBM: `{_fmt_mib(peak_allocated)} MiB`  ",
+        f"Peak reserved HBM: `{_fmt_mib(peak_reserved)} MiB`  ",
+        f"Reserved but unallocated: `{_fmt_mib(reserved_unallocated)} MiB`  ",
+        f"External CUDA/driver diagnostic: `{_fmt_mib(external_cuda)} MiB`  ",
+        f"Allocated stack sum: `{_fmt_mib(summary.get('allocated_stack_sum_bytes'))} MiB`  ",
+        f"Reserved stack sum: `{_fmt_mib(summary.get('reserved_stack_sum_bytes'))} MiB`  ",
+        f"Saved activations at peak: `{_fmt_mib(summary.get('saved_activation_hbm_bytes_at_peak'))} MiB`  ",
+        f"Unattributed allocated peak: `{_fmt_mib(summary.get('unattributed_allocated_peak_bytes'))} MiB`  ",
+        f"Allocated closure error: `{_fmt_mib(allocated_closure_error)} MiB`  ",
+        f"Allocated closure OK: `{bool(summary.get('allocated_closure_ok', False))}`  ",
+        f"Reserved closure error: `{_fmt_mib(reserved_closure_error)} MiB`  ",
+        f"Reserved closure OK: `{bool(summary.get('reserved_closure_ok', False))}`",
         "",
-        "GPU HBM rows are stacked to close to the allocated peak. `GPU reserved` rows are allocator-reserved-but-unallocated memory and are reported separately.",
+        "GPU HBM semantic rows close to peak allocated HBM. The allocator reserved-unallocated row extends peak allocated HBM to peak reserved HBM. External CUDA/driver diagnostics are separate and excluded from both closures.",
         "",
-        "| Group | Component | Kind | Memory space | MiB | % peak HBM | Method | Accuracy |",
+        "| Group | Component | Kind | Memory space | MiB | % peak reserved HBM | Method | Accuracy |",
         "|---|---|---|---|---:|---:|---|---|",
     ]
-    for row in sorted(rows, key=lambda item: (str(item["memory_space"]) != "GPU HBM", -float(item["bytes"]))):
+    for row in sorted(
+        rows,
+        key=lambda item: (
+            str(item["memory_space"]) not in {"GPU HBM", "GPU reserved"},
+            str(item["memory_space"]) == "GPU reserved",
+            -float(item["bytes"]),
+        ),
+    ):
         value = int(row["bytes"])
+        is_reserved_stack_row = (
+            row["memory_space"] == "GPU HBM" or row["component"] == "allocator_reserved_unallocated"
+        )
         lines.append(
             "| {group} | {component} | {kind} | {memory_space} | {mib} | {pct} | {method} | {accuracy} |".format(
                 group=row["group"],
@@ -264,7 +316,7 @@ def _source_memory_breakdown_markdown(profile: dict[str, Any], *, top_level: boo
                 kind=row["kind"],
                 memory_space=row["memory_space"],
                 mib=_fmt_mib(value),
-                pct=_fmt_pct(value, peak) if row["memory_space"] == "GPU HBM" else "-",
+                pct=_fmt_pct(value, peak_reserved) if is_reserved_stack_row else "-",
                 method=row["method"],
                 accuracy=row["accuracy"],
             )
@@ -274,6 +326,16 @@ def _source_memory_breakdown_markdown(profile: dict[str, Any], *, top_level: boo
         lines += ["", "Notes:"]
         for note in notes:
             lines.append(f"- {note}")
+    snapshot = profile.get("memory_snapshot", {})
+    if isinstance(snapshot, dict) and snapshot.get("enabled"):
+        lines += [
+            "",
+            "Snapshot validation:",
+            f"- dumped: `{bool(snapshot.get('dumped', False))}`",
+            f"- path: `{snapshot.get('path', '')}`",
+        ]
+        if snapshot.get("error"):
+            lines.append(f"- error: `{snapshot.get('error')}`")
     lines.append("")
     return "\n".join(lines)
 
@@ -290,8 +352,9 @@ def _source_memory_markdown(profile: dict[str, Any]) -> str:
         "",
         "| Metric | MiB |",
         "|---|---:|",
-        f"| peak_hbm_bytes | {_fmt_mib(gpu.get('peak_hbm_bytes'))} |",
-        f"| stage_local_peak_hbm_bytes | {_fmt_mib(gpu.get('stage_local_peak_hbm_bytes'))} |",
+        f"| peak_allocated_hbm_bytes | {_fmt_mib(gpu.get('peak_allocated_hbm_bytes'))} |",
+        f"| peak_reserved_hbm_bytes | {_fmt_mib(gpu.get('peak_reserved_hbm_bytes'))} |",
+        f"| reserved_unallocated_bytes | {_fmt_mib(gpu.get('reserved_unallocated_bytes'))} |",
         "",
     ]
     breakdown_markdown = _source_memory_breakdown_markdown(profile)
@@ -301,7 +364,7 @@ def _source_memory_markdown(profile: dict[str, Any]) -> str:
         lines += [
             "## Persistent Tensor Accounting",
             "",
-            "These rows are exact tensor-size accounting for parameters, buffers, gradients, and host/pinned tensors. They are not a full peak-HBM attribution by themselves.",
+            "These rows are exact tensor-size accounting for parameters, buffers, gradients, and host/pinned tensors. They are not a full peak allocated HBM attribution by themselves.",
             "",
             "| Category | Component | Device | MiB |",
             "|---|---|---|---:|",

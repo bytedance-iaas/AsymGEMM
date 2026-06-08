@@ -292,6 +292,79 @@ def test_run_lf_lora_sft_uses_deepspeed_for_single_gpu_zero3_offload(tmp_path: P
     assert args[args.index("--deepspeed") + 1] == str(ds_config)
 
 
+def test_run_lf_lora_sft_deepspeed_launcher_uses_include_and_unsets_cuda_visible_devices(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    fake_env = tmp_path / "env"
+    fake_env.joinpath("bin").mkdir(parents=True)
+    fake_python = fake_env / "bin/python"
+    fake_deepspeed = fake_env / "bin/deepspeed"
+    ds_args_log = tmp_path / "deepspeed_args.txt"
+    ds_env_log = tmp_path / "deepspeed_env.txt"
+    fake_python.write_text("#!/usr/bin/env bash\ncat >/dev/null\nexit 0\n", encoding="utf-8")
+    fake_python.chmod(0o755)
+    fake_deepspeed.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "printf 'CUDA_VISIBLE_DEVICES=%s\\n' \"${CUDA_VISIBLE_DEVICES-__unset__}\" > \"$FAKE_DEEPSPEED_ENV_LOG\"",
+                "printf '%s\\n' \"$@\" > \"$FAKE_DEEPSPEED_ARGS_LOG\"",
+                "out_dir=",
+                "prev=",
+                "for arg in \"$@\"; do",
+                "  if [[ \"$prev\" == \"--output_dir\" ]]; then",
+                "    out_dir=\"$arg\"",
+                "    break",
+                "  fi",
+                "  prev=\"$arg\"",
+                "done",
+                "if [[ -n \"$out_dir\" ]]; then",
+                "  mkdir -p \"$out_dir\"",
+                "  printf '%s\\n' '{\"loss\":1.0}' > \"$out_dir/trainer_log.jsonl\"",
+                "fi",
+                "exit 0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_deepspeed.chmod(0o755)
+
+    ds_config = lf_dir / "examples/deepspeed/ds_z3_offload_config.json"
+    run_cmd(
+        ["scripts/lf/run_lf_lora_sft.sh"],
+        env={
+            "LF_DIR": str(lf_dir),
+            "ENV_DIR": str(fake_env),
+            "ENV_PYTHON": str(fake_python),
+            "DEEPSPEED_BIN": str(fake_deepspeed),
+            "FAKE_DEEPSPEED_ARGS_LOG": str(ds_args_log),
+            "FAKE_DEEPSPEED_ENV_LOG": str(ds_env_log),
+            "BACKEND": "zero3_offload",
+            "DIST_LAUNCHER": "deepspeed",
+            "CUDA_VISIBLE_DEVICES": "9",
+            "GPU_ID": "2",
+            "NUM_GPUS": "1",
+            "PROFILE": "0",
+            "DATASET": "dummy",
+            "TEMPLATE": "qwen3_nothink",
+            "CUTOFF_LEN": "128",
+            "MAX_SAMPLES": "1",
+            "MAX_STEPS": "1",
+            "LORA_RANK": "8",
+            "LORA_ALPHA": "16",
+            "LORA_DROPOUT": "0.00",
+            "TORCH_USE_ASYM_GEMM_LORA": "false",
+        },
+    )
+
+    args = ds_args_log.read_text(encoding="utf-8").splitlines()
+    assert "--include" in args
+    assert args[args.index("--include") + 1] == "localhost:2"
+    assert "--deepspeed" in args
+    assert args[args.index("--deepspeed") + 1] == str(ds_config)
+    assert ds_env_log.read_text(encoding="utf-8").strip() == "CUDA_VISIBLE_DEVICES=__unset__"
+
+
 def test_run_lf_lora_sft_uses_deepspeed_for_single_gpu_superoffload(tmp_path: Path) -> None:
     lf_dir = make_fake_lf(tmp_path)
     deepspeed_dir = make_fake_deepspeed(tmp_path)

@@ -3,6 +3,7 @@ set -euo pipefail
 
 ACTION="${1:-start}"
 GPU_POOL="${GPU_POOL:-${GPUS:-0}}"
+SERVE_MODE="${SERVE_MODE:-auto}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}"
 BASE_PORT="${BASE_PORT:-30000}"
 HOST="${HOST:-0.0.0.0}"
@@ -15,7 +16,11 @@ LOAD_PID_DIR="${LOAD_PID_DIR:-${RUN_DIR}/load-pids}"
 LOG_DIR="${LOG_DIR:-${RUN_DIR}/logs}"
 LOAD_LOG_DIR="${LOAD_LOG_DIR:-${RUN_DIR}/load-logs}"
 READY_TIMEOUT_SEC="${READY_TIMEOUT_SEC:-600}"
-LOAD_ENABLE="${LOAD_ENABLE:-1}"
+BLOCK_ON_START="${BLOCK_ON_START:-1}"
+FOREGROUND_CHECK_SEC="${FOREGROUND_CHECK_SEC:-5}"
+STOP_TERM_GRACE_SEC="${STOP_TERM_GRACE_SEC:-30}"
+STOP_KILL_GRACE_SEC="${STOP_KILL_GRACE_SEC:-5}"
+LOAD_ENABLE="${LOAD_ENABLE:-0}"
 LOAD_WORKERS_PER_SERVER="${LOAD_WORKERS_PER_SERVER:-32}"
 LOAD_MAX_NEW_TOKENS="${LOAD_MAX_NEW_TOKENS:-128}"
 LOAD_TIMEOUT_SEC="${LOAD_TIMEOUT_SEC:-120}"
@@ -31,6 +36,11 @@ SGLANG_PYTHONPATH="${SGLANG_SOURCE}:${SGL_KERNEL_OVERLAY}:${SITE_PACKAGES}${EXTR
 mkdir -p "${PID_DIR}" "${LOAD_PID_DIR}" "${LOG_DIR}" "${LOAD_LOG_DIR}"
 
 read -r -a GPU_IDS <<< "${GPU_POOL//,/ }"
+
+die() {
+  echo "error: $*" >&2
+  exit 2
+}
 
 prepare_kernel_overlay() {
   if [[ -f "${SGL_KERNEL_OVERLAY}/sgl_kernel/__init__.py" ]] &&
@@ -75,9 +85,54 @@ gpu_port() {
   return 1
 }
 
-kill_group_from_file() {
+handle_foreground_signal() {
+  local signal="$1"
+  local exit_code="$2"
+
+  echo
+  echo "received ${signal}; stopping GPU pool"
+  trap - INT TERM
+  stop_all || echo "warning: some GPU pool processes did not exit"
+  exit "${exit_code}"
+}
+
+process_group_has_members() {
+  local pgid="$1"
+  ps -eo pgid= | awk -v pgid="${pgid}" '$1 == pgid {found=1} END {exit !found}'
+}
+
+print_process_group() {
+  local pgid="$1"
+  ps -eo pid,ppid,pgid,sid,stat,etime,comm,args | awk -v pgid="${pgid}" '$3 == pgid'
+}
+
+resolve_process_group() {
+  local pid="$1"
+  local pgid=""
+
+  pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d '[:space:]' || true)"
+  echo "${pgid:-${pid}}"
+}
+
+wait_process_group_exit() {
+  local pgid="$1"
+  local timeout_sec="$2"
+  local waited=0
+
+  while process_group_has_members "${pgid}"; do
+    if (( waited >= timeout_sec )); then
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+}
+
+stop_group_from_file() {
   local label="$1"
   local pid_file="$2"
+  local term_grace="${3:-${STOP_TERM_GRACE_SEC}}"
+  local kill_grace="${4:-${STOP_KILL_GRACE_SEC}}"
 
   if [[ ! -s "${pid_file}" ]]; then
     echo "${label}: no pid file"
@@ -86,26 +141,159 @@ kill_group_from_file() {
 
   local pid
   pid="$(cat "${pid_file}")"
-  if kill -0 "${pid}" 2>/dev/null; then
-    echo "${label}: stopping process group ${pid}"
-    kill -- "-${pid}" 2>/dev/null || kill "${pid}" 2>/dev/null || true
-  else
-    echo "${label}: pid ${pid} is not running"
+  if [[ ! "${pid}" =~ ^[0-9]+$ ]]; then
+    echo "${label}: invalid pid file ${pid_file}: ${pid}"
+    return 1
   fi
-  rm -f "${pid_file}"
+
+  local pgid
+  pgid="$(resolve_process_group "${pid}")"
+  if ! process_group_has_members "${pgid}"; then
+    echo "${label}: process group ${pgid} is not running"
+    rm -f "${pid_file}"
+    return 0
+  fi
+
+  echo "${label}: TERM process group ${pgid}"
+  kill -TERM -- "-${pgid}" 2>/dev/null || true
+  if wait_process_group_exit "${pgid}" "${term_grace}"; then
+    echo "${label}: process group ${pgid} exited"
+    rm -f "${pid_file}"
+    return 0
+  fi
+
+  echo "${label}: process group ${pgid} did not exit after ${term_grace}s; sending KILL"
+  kill -KILL -- "-${pgid}" 2>/dev/null || true
+  if wait_process_group_exit "${pgid}" "${kill_grace}"; then
+    echo "${label}: process group ${pgid} killed"
+    rm -f "${pid_file}"
+    return 0
+  fi
+
+  echo "${label}: process group ${pgid} still running after KILL:"
+  print_process_group "${pgid}"
+  return 1
 }
 
 stop_gpu() {
   local gpu="$1"
-  kill_group_from_file "GPU ${gpu} load" "${LOAD_PID_DIR}/gpu_${gpu}.pid"
-  kill_group_from_file "GPU ${gpu} server" "${PID_DIR}/gpu_${gpu}.pid"
+  local status=0
+
+  stop_group_from_file "GPU ${gpu} load" "${LOAD_PID_DIR}/gpu_${gpu}.pid" || status=1
+  stop_group_from_file "GPU ${gpu} server" "${PID_DIR}/gpu_${gpu}.pid" || status=1
+  return "${status}"
 }
 
 stop_all() {
   local gpu
+  local status=0
+
   for gpu in "${GPU_IDS[@]}"; do
-    stop_gpu "${gpu}"
+    stop_group_from_file "GPU ${gpu} load" "${LOAD_PID_DIR}/gpu_${gpu}.pid" || status=1
   done
+  for gpu in "${GPU_IDS[@]}"; do
+    stop_group_from_file "GPU ${gpu} server" "${PID_DIR}/gpu_${gpu}.pid" || status=1
+  done
+  return "${status}"
+}
+
+require_pid_running() {
+  local label="$1"
+  local pid_file="$2"
+
+  if [[ ! -s "${pid_file}" ]]; then
+    echo "${label}: pid file missing"
+    return 1
+  fi
+
+  local pid
+  pid="$(cat "${pid_file}")"
+  if kill -0 "${pid}" 2>/dev/null; then
+    return 0
+  fi
+
+  echo "${label}: pid ${pid} is not running"
+  return 1
+}
+
+block_foreground() {
+  local gpu
+
+  echo
+  echo "foreground mode: blocking; press Ctrl-C to stop server and load workers"
+  echo "server logs: ${LOG_DIR}"
+  if [[ "${LOAD_ENABLE}" == "1" ]]; then
+    echo "load logs: ${LOAD_LOG_DIR}"
+  fi
+
+  while true; do
+    for gpu in "${GPU_IDS[@]}"; do
+      if ! require_pid_running "GPU ${gpu} server" "${PID_DIR}/gpu_${gpu}.pid"; then
+        echo "foreground mode: stopping remaining processes"
+        stop_all || true
+        return 1
+      fi
+
+      if [[ "${LOAD_ENABLE}" == "1" ]] &&
+        ! require_pid_running "GPU ${gpu} load" "${LOAD_PID_DIR}/gpu_${gpu}.pid"; then
+        echo "foreground mode: stopping remaining processes"
+        stop_all || true
+        return 1
+      fi
+    done
+
+    sleep "${FOREGROUND_CHECK_SEC}"
+  done
+}
+
+server_argv() {
+  local port="$1"
+  local served_model_name="$2"
+
+  printf '%s\0' \
+    python3 -S -m sglang.launch_server \
+    --model-path "${MODEL_PATH}" \
+    --load-format dummy \
+    --mem-fraction-static "${MEM_FRACTION_STATIC}" \
+    --host "${HOST}" \
+    --port "${port}" \
+    --served-model-name "${served_model_name}"
+}
+
+start_plain_server() {
+  if (( ${#GPU_IDS[@]} != 1 )); then
+    die "plain serve mode supports exactly one GPU; set SERVE_MODE=managed for multiple GPUs"
+  fi
+  if [[ "${LOAD_ENABLE}" == "1" ]]; then
+    die "plain serve mode does not start load workers; set LOAD_ENABLE=0 or SERVE_MODE=managed"
+  fi
+
+  local gpu="${GPU_IDS[0]}"
+  local port="${BASE_PORT}"
+  local pid_file="${PID_DIR}/gpu_${gpu}.pid"
+  local served_model_name="${SERVED_MODEL_PREFIX}-${gpu}"
+
+  if [[ -s "${pid_file}" ]] && kill -0 "$(cat "${pid_file}")" 2>/dev/null; then
+    echo "GPU ${gpu}: server already running with pid $(cat "${pid_file}") on port ${port}"
+    return 0
+  fi
+
+  prepare_kernel_overlay
+
+  rm -f "${pid_file}"
+  echo "$$" > "${pid_file}"
+  echo "GPU ${gpu}: exec SGLang server on port ${port} in the foreground"
+  echo "GPU ${gpu}: press Ctrl-C to send SIGINT directly to SGLang"
+
+  local -a argv=()
+  while IFS= read -r -d '' arg; do
+    argv+=("${arg}")
+  done < <(server_argv "${port}" "${served_model_name}")
+
+  exec env \
+    CUDA_VISIBLE_DEVICES="${gpu}" \
+    PYTHONPATH="${SGLANG_PYTHONPATH}" \
+    "${argv[@]}"
 }
 
 start_server() {
@@ -122,16 +310,15 @@ start_server() {
 
   rm -f "${pid_file}"
   echo "GPU ${gpu}: starting SGLang server on port ${port}"
+  local -a argv=()
+  while IFS= read -r -d '' arg; do
+    argv+=("${arg}")
+  done < <(server_argv "${port}" "${served_model_name}")
+
   setsid env \
     CUDA_VISIBLE_DEVICES="${gpu}" \
     PYTHONPATH="${SGLANG_PYTHONPATH}" \
-    python3 -S -m sglang.launch_server \
-      --model-path "${MODEL_PATH}" \
-      --load-format dummy \
-      --mem-fraction-static "${MEM_FRACTION_STATIC}" \
-      --host "${HOST}" \
-      --port "${port}" \
-      --served-model-name "${served_model_name}" \
+    "${argv[@]}" \
       >"${log_file}" 2>&1 &
 
   echo "$!" > "${pid_file}"
@@ -227,6 +414,11 @@ start_all() {
   local idx=0
   local gpu
 
+  if [[ "${BLOCK_ON_START}" == "1" ]]; then
+    trap 'handle_foreground_signal INT 130' INT
+    trap 'handle_foreground_signal TERM 143' TERM
+  fi
+
   prepare_kernel_overlay
 
   for gpu in "${GPU_IDS[@]}"; do
@@ -249,6 +441,30 @@ start_all() {
   fi
 
   status
+
+  if [[ "${BLOCK_ON_START}" == "1" ]]; then
+    block_foreground
+  else
+    echo
+    echo "detached mode: use '$0 stop' to stop server and load workers"
+  fi
+}
+
+use_plain_server() {
+  case "${SERVE_MODE}" in
+    plain)
+      return 0
+      ;;
+    managed)
+      return 1
+      ;;
+    auto)
+      [[ "${LOAD_ENABLE}" != "1" ]] && (( ${#GPU_IDS[@]} == 1 ))
+      ;;
+    *)
+      die "SERVE_MODE must be auto, plain, or managed"
+      ;;
+  esac
 }
 
 status() {
@@ -276,16 +492,28 @@ status() {
   nvidia-smi --query-gpu=index,name,memory.used,utilization.gpu --format=csv,noheader
 }
 
+usage() {
+  echo "usage: $0 [start|stop|stop-gpu <gpu-id>|status]" >&2
+  echo "env: SERVE_MODE=auto|plain|managed; auto uses plain mode for one GPU with LOAD_ENABLE=0" >&2
+  echo "env: LOAD_ENABLE=1 starts managed request loops instead of plain serving" >&2
+  echo "env: BLOCK_ON_START=0 keeps start detached after readiness checks" >&2
+  echo "env: STOP_TERM_GRACE_SEC=N and STOP_KILL_GRACE_SEC=N tune stop timeouts" >&2
+}
+
 case "${ACTION}" in
   start)
-    start_all
+    if use_plain_server; then
+      start_plain_server
+    else
+      start_all
+    fi
     ;;
   stop)
     stop_all
     ;;
   stop-gpu)
     if [[ $# -ne 2 ]]; then
-      echo "usage: $0 stop-gpu <gpu-id>" >&2
+      usage
       exit 2
     fi
     stop_gpu "$2"
@@ -294,7 +522,7 @@ case "${ACTION}" in
     status
     ;;
   *)
-    echo "usage: $0 [start|stop|stop-gpu <gpu-id>|status]" >&2
+    usage
     exit 2
     ;;
 esac

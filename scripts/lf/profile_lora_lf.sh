@@ -12,25 +12,35 @@ KT_KERNEL_DIR=${KT_KERNEL_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/k
 DEEPSPEED_DIR=${DEEPSPEED_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/deepspeed}
 CONDA_EXE=${CONDA_EXE:-conda}
 NSYS_BIN=${NSYS_BIN:-nsys}
-DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun}
+# DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun}
+DIST_LAUNCHER=${DIST_LAUNCHER:-deepspeed}
+RUN_POSTSERVE=${RUN_POSTSERVE:-true}
 
 # Sweep axes
-GPU_POOL=${GPU_POOL:-3}
+GPU_POOL=${GPU_POOL:-0}
 # MODEL_SPECS entries are model|num_gpus. Recompute belongs only in BACKEND_SPECS.
 MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
-# EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le0,tok-le512,tok-le512-act"}
-EXPERT_POLICIES=${EXPERT_POLICIES-"none"}
-# Primary backend sweep axis. Each entry is backend|recompute.  Torch is plain
-# distributed launch. Zero backends add the matching DeepSpeed config.
-# BACKEND_SPECS=${BACKEND_SPECS:-"zero2|norecomp,zero2|recomp,zero3_offload|norecomp,zero3_offload|recomp"}
-BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp"}
 ROUTER_MODES=${ROUTER_MODES:-whole}
-# PROFILERS=${PROFILERS:-nsys,source}
-PROFILERS=${PROFILERS:-nsys}
+PROFILERS=${PROFILERS:-nsys,source}
+# PROFILERS=${PROFILERS:-source}
 PRECISION=${PRECISION:-bf16}
-SEQ_LENS=${SEQ_LENS:-4096}
 # LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
-LORA_DROPOUT=${LORA_DROPOUT:-0.00}
+LORA_DROPOUT=${LORA_DROPOUT:-0.10}
+# BACKEND_SPECS=${BACKEND_SPECS:-"zero2|norecomp,zero2|recomp,zero3_offload|norecomp,zero3_offload|recomp"}
+BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp"}
+# EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le0,tok-le512,tok-le512-act"}
+EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le1"}
+
+# Training
+SEQ_LENS=${SEQ_LENS:-8192}
+PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-4}
+GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
+MAX_STEPS=${MAX_STEPS:-10}
+WARMUP_STEPS=${WARMUP_STEPS:-5}
+LEARNING_RATE=${LEARNING_RATE:-1e-4}
+LORA_RANK=${LORA_RANK:-64}
+LORA_ALPHA=${LORA_ALPHA:-16}
+SEED=${SEED:-42}
 
 # Dataset
 DATASET=${DATASET:-asym_long_sft_smoke}
@@ -40,16 +50,6 @@ DATASET_EVAL_ROWS=${DATASET_EVAL_ROWS:-128}
 DATASET_OVERWRITE=${DATASET_OVERWRITE:-false}
 TEMPLATE=${TEMPLATE:-auto}
 MAX_SAMPLES=${MAX_SAMPLES:-128}
-
-# Training
-MAX_STEPS=${MAX_STEPS:-10}
-WARMUP_STEPS=${WARMUP_STEPS:-5}
-PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-1}
-GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
-LEARNING_RATE=${LEARNING_RATE:-1e-4}
-LORA_RANK=${LORA_RANK:-64}
-LORA_ALPHA=${LORA_ALPHA:-16}
-SEED=${SEED:-42}
 
 # Backend checks and AsymGEMM options
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
@@ -64,7 +64,10 @@ PROFILE_MEMORY_ATTRIBUTION=${PROFILE_MEMORY_ATTRIBUTION:-auto}
 PROFILE_MEMORY_BREAKDOWN=${PROFILE_MEMORY_BREAKDOWN:-auto}
 PROFILE_MEMORY_BREAKDOWN_INTERVAL=${PROFILE_MEMORY_BREAKDOWN_INTERVAL:-1}
 PROFILE_MEMORY_BREAKDOWN_STEPS=${PROFILE_MEMORY_BREAKDOWN_STEPS:-}
-PROFILE_MEMORY_BREAKDOWN_MODULES=${PROFILE_MEMORY_BREAKDOWN_MODULES:-attention,router,mlp,experts,lora,embedding,loss}
+PROFILE_MEMORY_BREAKDOWN_MODULES=${PROFILE_MEMORY_BREAKDOWN_MODULES:-attention,router,mlp,experts,shared_experts,lora,embedding,loss}
+PROFILE_MEMORY_SNAPSHOT=${PROFILE_MEMORY_SNAPSHOT:-false}
+PROFILE_MEMORY_SNAPSHOT_PATH=${PROFILE_MEMORY_SNAPSHOT_PATH:-}
+PROFILE_EXTERNAL_MEMORY=${PROFILE_EXTERNAL_MEMORY:-false}
 PROFILE_SYNC=${PROFILE_SYNC:-0}
 PROFILE_MODULE_FILTER=${PROFILE_MODULE_FILTER:-attention,router,mlp,experts,lora,optimizer,kt}
 
@@ -78,7 +81,6 @@ KT_ARM_OMP_NUM_THREADS=${KT_ARM_OMP_NUM_THREADS:-64}
 KT_ARM_OMP_PROC_BIND=${KT_ARM_OMP_PROC_BIND:-close}
 KT_ARM_OMP_PLACES=${KT_ARM_OMP_PLACES:-cores}
 KT_SHARE_BACKWARD_BB=${KT_SHARE_BACKWARD_BB:-}
-KT_SHARE_CACHE_POOL=${KT_SHARE_CACHE_POOL:-}
 KT_NUM_GPU_EXPERTS=${KT_NUM_GPU_EXPERTS:-}
 KT_WEIGHT_PATH=${KT_WEIGHT_PATH:-}
 KT_EXPERT_CHECKPOINT_PATH=${KT_EXPERT_CHECKPOINT_PATH:-}
@@ -116,6 +118,7 @@ ENV_PYTHON=${ENV_PYTHON:-${ENV_DIR}/bin/python}
 RUN_LF_SCRIPT="${ASYM_DIR}/scripts/lf/run_lf_lora_sft.sh"
 BUILD_DATASET_SCRIPT="${ASYM_DIR}/scripts/lf/build_lf_sft_eval_pair.py"
 PROFILE_POSTPROCESS_SCRIPT="${ASYM_DIR}/scripts/lf/postprocess_lf_profile_artifacts.py"
+MEMORY_SCHEMA_VALIDATOR="${ASYM_DIR}/scripts/lf/validate_lf_memory_capacity_schema.py"
 PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_activation_recompute_sweep.py"
 MEMORY_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_memory_breakdown.py"
 INTERCONNECT_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_interconnect_ctc.py"
@@ -141,7 +144,7 @@ Options:
 
   Sweep:
   --gpus LIST                    Physical GPU pool, e.g. 0,1.
-  --dist-launcher torchrun|accelerate
+  --dist-launcher torchrun|accelerate|deepspeed
                                  Launcher for torch/zero/SuperOffload jobs. Default ${DIST_LAUNCHER}.
   --models LIST                  Model specs. Each item is model_name_or_path|num_gpus.
                                  Example: meta-llama/Llama-4-Scout-17B-16E|1,meta-llama/Llama-4-Maverick-17B-128E|4
@@ -163,7 +166,7 @@ Options:
 
   Training:
   --max-steps N                  Measured steps kept in plots/summaries.
-  --warmup-steps N               Extra initial steps to run but exclude from plots/summaries.
+  --warmup-steps N               Extra initial steps to run but exclude from plots/summaries. Minimum 5.
   --batch-size N
   --gradient-accumulation-steps N
   --learning-rate VALUE
@@ -182,6 +185,9 @@ Options:
   --profile-memory-breakdown-interval N
   --profile-memory-breakdown-steps LIST
   --profile-memory-breakdown-modules LIST
+  --profile-memory-snapshot auto|true|false
+  --profile-memory-snapshot-path PATH
+  --profile-external-memory auto|true|false
   --profile-sync true|false
   --profile-module-filter LIST
 
@@ -198,7 +204,6 @@ Options:
   --kt-arm-omp-proc-bind VALUE
   --kt-arm-omp-places VALUE
   --kt-share-backward-bb true|false
-  --kt-share-cache-pool true|false
   --kt-num-gpu-experts N
   --kt-weight-path PATH
   --kt-expert-checkpoint-path PATH
@@ -213,7 +218,7 @@ Options:
 
   Outputs and plotting:
   --output-root DIR              Default config layout: <root>/<dataset>__lora__lf__<precision>/<model>__gpus<model_gpus>__b<batch>_s<seq>_w<warmup>_s<steps>_r<rank>_a<alpha>_drop0xx
-                                 Per-run dirs add <backend>__<profiler>__<recompute>__pol<policy>__router<mode>/s<seq>.
+                                 Per-run dirs add <backend>__<profiler>__<recompute>__pol<policy>__router<mode>/b<batch>_s<seq>.
   --run-name NAME                Optional config directory under <dataset>__lora__lf__<precision>.
   --plot true|false
   --plot-memory-breakdown true|false
@@ -491,7 +496,8 @@ dist_launcher_label() {
   case "${1,,}" in
     torchrun) printf 'torchrun\n' ;;
     accelerate|accelerate_launch) printf 'accelerate\n' ;;
-    *) die "dist launcher must be torchrun or accelerate, got '${1}'" ;;
+    deepspeed|ds) printf 'deepspeed\n' ;;
+    *) die "dist launcher must be torchrun, accelerate, or deepspeed, got '${1}'" ;;
   esac
 }
 
@@ -511,6 +517,14 @@ profile_memory_flag_for_profiler() {
     0|false|no|n|off) printf 'false\n' ;;
     *) die "${option} must be auto, true, or false; got '${value}'" ;;
   esac
+}
+
+existing_memory_breakdown_valid() {
+  local seq_root="$1"
+  local summary_json="${seq_root}/memory_breakdown_summary.json"
+  [[ -f "${summary_json}" ]] || return 1
+  "${ENV_PYTHON}" "${MEMORY_SCHEMA_VALIDATOR}" \
+    --memory-breakdown-summary "${summary_json}" >/dev/null 2>&1
 }
 
 config_root_path() {
@@ -597,7 +611,7 @@ plot_cmd_base() {
   shift 4
   (($# > 0)) || die "plot_cmd_base requires at least one sequence length"
   _cmd_ref=(
-    "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PLOT_SCRIPT}"
+    "${ENV_PYTHON}" "${PLOT_SCRIPT}"
     --input-root "${input_root}"
     --output-dir "${output_dir}"
     --combined-output-dir "${combined_output_dir}"
@@ -615,7 +629,7 @@ memory_combined_plot_cmd_base() {
   shift 3
   (($# > 0)) || die "memory_combined_plot_cmd_base requires at least one sequence length"
   _cmd_ref=(
-    "${CONDA_EXE}" run -p "${ENV_DIR}" python "${MEMORY_PLOT_SCRIPT}"
+    "${ENV_PYTHON}" "${MEMORY_PLOT_SCRIPT}"
     --input-root "${input_root}"
     --output-dir "${output_dir}"
     --clean-output
@@ -633,7 +647,7 @@ interconnect_combined_plot_cmd_base() {
   shift 3
   (($# > 0)) || die "interconnect_combined_plot_cmd_base requires at least one sequence length"
   _cmd_ref=(
-    "${CONDA_EXE}" run -p "${ENV_DIR}" python "${INTERCONNECT_PLOT_SCRIPT}"
+    "${ENV_PYTHON}" "${INTERCONNECT_PLOT_SCRIPT}"
     --input-root "${input_root}"
     --output-dir "${output_dir}"
     --clean-output
@@ -839,6 +853,12 @@ while (($#)); do
     --profile-memory-breakdown-steps=*) PROFILE_MEMORY_BREAKDOWN_STEPS="${1#*=}"; shift ;;
     --profile-memory-breakdown-modules) need_value "$1" "${2-}"; PROFILE_MEMORY_BREAKDOWN_MODULES="$2"; shift 2 ;;
     --profile-memory-breakdown-modules=*) PROFILE_MEMORY_BREAKDOWN_MODULES="${1#*=}"; shift ;;
+    --profile-memory-snapshot) need_value "$1" "${2-}"; PROFILE_MEMORY_SNAPSHOT="$2"; shift 2 ;;
+    --profile-memory-snapshot=*) PROFILE_MEMORY_SNAPSHOT="${1#*=}"; shift ;;
+    --profile-memory-snapshot-path) need_value "$1" "${2-}"; PROFILE_MEMORY_SNAPSHOT_PATH="$2"; shift 2 ;;
+    --profile-memory-snapshot-path=*) PROFILE_MEMORY_SNAPSHOT_PATH="${1#*=}"; shift ;;
+    --profile-external-memory) need_value "$1" "${2-}"; PROFILE_EXTERNAL_MEMORY="$2"; shift 2 ;;
+    --profile-external-memory=*) PROFILE_EXTERNAL_MEMORY="${1#*=}"; shift ;;
     --profile-sync) need_value "$1" "${2-}"; PROFILE_SYNC="$2"; shift 2 ;;
     --profile-sync=*) PROFILE_SYNC="${1#*=}"; shift ;;
     --profile-module-filter) need_value "$1" "${2-}"; PROFILE_MODULE_FILTER="$2"; shift 2 ;;
@@ -867,8 +887,6 @@ while (($#)); do
     --kt-arm-omp-places=*) KT_ARM_OMP_PLACES="${1#*=}"; shift ;;
     --kt-share-backward-bb) need_value "$1" "${2-}"; KT_SHARE_BACKWARD_BB="$(bool_value "$2")"; shift 2 ;;
     --kt-share-backward-bb=*) KT_SHARE_BACKWARD_BB="$(bool_value "${1#*=}")"; shift ;;
-    --kt-share-cache-pool) need_value "$1" "${2-}"; KT_SHARE_CACHE_POOL="$(bool_value "$2")"; shift 2 ;;
-    --kt-share-cache-pool=*) KT_SHARE_CACHE_POOL="$(bool_value "${1#*=}")"; shift ;;
     --kt-num-gpu-experts) need_value "$1" "${2-}"; KT_NUM_GPU_EXPERTS="$2"; shift 2 ;;
     --kt-num-gpu-experts=*) KT_NUM_GPU_EXPERTS="${1#*=}"; shift ;;
     --kt-weight-path) need_value "$1" "${2-}"; KT_WEIGHT_PATH="$2"; shift 2 ;;
@@ -922,6 +940,9 @@ require_comma_list "--lora-dropout/LORA_DROPOUT" "${lora_dropout_spec}"
 
 nonnegative_int "--max-steps" "${MAX_STEPS}"
 nonnegative_int "--warmup-steps" "${WARMUP_STEPS}"
+if ((WARMUP_STEPS < 5)) && [[ "$(bool_value "${DRY_RUN}")" != "true" && "$(bool_value "${COLLECT_EXISTING}")" != "true" ]]; then
+  die "--warmup-steps must be at least 5 so profiling only measures after a stable warmup"
+fi
 nonnegative_int "INTERRUPT_GRACE_SECONDS" "${INTERRUPT_GRACE_SECONDS}"
 positive_int "--profile-memory-breakdown-interval" "${PROFILE_MEMORY_BREAKDOWN_INTERVAL}"
 case "${MEMORY_BREAKDOWN_PLOT_Y_SCALE}" in
@@ -945,6 +966,7 @@ CONTINUE_ON_ERROR=$(bool_value "${CONTINUE_ON_ERROR}")
 DRY_RUN=$(bool_value "${DRY_RUN}")
 COLLECT_EXISTING=$(bool_value "${COLLECT_EXISTING}")
 CHECK_SUPEROFFLOAD=$(bool_value "${CHECK_SUPEROFFLOAD}")
+RUN_POSTSERVE=$(bool_value "${RUN_POSTSERVE}")
 DATASET_MIN_TOKENS="${DATASET_MIN_TOKENS,,}"
 positive_int "--dataset-eval-rows" "${DATASET_EVAL_ROWS}"
 if [[ "${DATASET_MIN_TOKENS}" != "auto" ]]; then
@@ -1000,7 +1022,6 @@ if [[ "${selected_has_kt}" == "true" ]]; then
   KT_TP_ENABLED=$(bool_value "${KT_TP_ENABLED}")
   CHECK_KT_CALLS=$(bool_value "${CHECK_KT_CALLS}")
   KT_SHARE_BACKWARD_BB="$(optional_bool_value "${KT_SHARE_BACKWARD_BB}")"
-  KT_SHARE_CACHE_POOL="$(optional_bool_value "${KT_SHARE_CACHE_POOL}")"
   KT_USE_LORA_EXPERTS="$(optional_bool_value "${KT_USE_LORA_EXPERTS}")"
   [[ -z "${KT_NUM_THREADS}" ]] || positive_int "--kt-num-threads" "${KT_NUM_THREADS}"
   [[ -z "${KT_THREADPOOL_COUNT}" ]] || positive_int "--kt-threadpool-count" "${KT_THREADPOOL_COUNT}"
@@ -1057,6 +1078,7 @@ if [[ "${selected_has_kt}" == "true" ]]; then
 fi
 [[ -f "${BUILD_DATASET_SCRIPT}" ]] || die "missing ${BUILD_DATASET_SCRIPT}"
 [[ -f "${PROFILE_POSTPROCESS_SCRIPT}" ]] || die "missing ${PROFILE_POSTPROCESS_SCRIPT}"
+[[ -f "${MEMORY_SCHEMA_VALIDATOR}" ]] || die "missing ${MEMORY_SCHEMA_VALIDATOR}"
 [[ -f "${PLOT_SCRIPT}" ]] || die "missing ${PLOT_SCRIPT}"
 if [[ "${PLOT_MEMORY_BREAKDOWN}" == "true" ]]; then
   [[ -f "${MEMORY_PLOT_SCRIPT}" ]] || die "missing ${MEMORY_PLOT_SCRIPT}"
@@ -1064,7 +1086,7 @@ fi
 if [[ "${PLOT}" == "true" ]] && printf '%s\n' "${profilers[@]}" | grep -qx 'nsys'; then
   [[ -f "${INTERCONNECT_PLOT_SCRIPT}" ]] || die "missing ${INTERCONNECT_PLOT_SCRIPT}"
 fi
-if [[ "${PREPARE_DATASETS}" == "true" && "${DRY_RUN}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
+if [[ "${DRY_RUN}" != "true" && ( "${PLOT}" == "true" || ( "${PREPARE_DATASETS}" == "true" && "${COLLECT_EXISTING}" != "true" ) ) ]]; then
   [[ -x "${ENV_PYTHON}" ]] || die "missing executable LF Python at ${ENV_PYTHON}"
 fi
 if [[ "${selected_has_zero}" == "true" ]]; then
@@ -1251,11 +1273,11 @@ run_job() {
   local config_root job_root seq_root source_profile lf_out log_file run_id profile_json
   config_root="$(config_root_path "${seq_len}")"
   job_root="$(job_root_path "${config_root}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${router_mode}")"
-  seq_root="${job_root}/s${seq_len}"
+  seq_root="${job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
   source_profile="${seq_root}/source_profile.json"
   lf_out="${seq_root}/lf_run"
   log_file="${seq_root}/train.log"
-  run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_router${router_mode}_s${seq_len}_${lora_dropout_label_value}"
+  run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_router${router_mode}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
   local profile_memory_attribution profile_memory_breakdown
   local master_port
@@ -1274,14 +1296,21 @@ run_job() {
     interconnect_plot_roots["${config_root}"]="${seq_len}"
   fi
   if [[ "${DRY_RUN}" != "true" && -e "${profile_json}" && "${OVERWRITE}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
-    echo "Skipping existing: ${profile_json}"
-    append_job_record "${config_root}" skipped \
-      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
-    return 0
+    if [[ "${profile_memory_breakdown}" != "true" ]] || existing_memory_breakdown_valid "${seq_root}"; then
+      echo "Skipping existing: ${profile_json}"
+      append_job_record "${config_root}" skipped \
+        "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
+      return 0
+    fi
+    echo "Existing profile has missing or stale schema-v2 source-memory breakdown; rerunning: ${profile_json}" >&2
   fi
 
   if [[ "${DRY_RUN}" != "true" && "${COLLECT_EXISTING}" == "true" ]]; then
     if [[ -e "${profile_json}" ]]; then
+      if [[ "${profile_memory_breakdown}" == "true" ]] && ! existing_memory_breakdown_valid "${seq_root}"; then
+        echo "Existing profile lacks a valid schema-v2 source-memory breakdown: ${profile_json}" >&2
+        return 1
+      fi
       echo "Found existing: ${profile_json}"
       return 0
     fi
@@ -1331,6 +1360,9 @@ run_job() {
     PROFILE_MEMORY_BREAKDOWN_INTERVAL="${PROFILE_MEMORY_BREAKDOWN_INTERVAL}"
     PROFILE_MEMORY_BREAKDOWN_STEPS="${PROFILE_MEMORY_BREAKDOWN_STEPS}"
     PROFILE_MEMORY_BREAKDOWN_MODULES="${PROFILE_MEMORY_BREAKDOWN_MODULES}"
+    PROFILE_MEMORY_SNAPSHOT="${PROFILE_MEMORY_SNAPSHOT}"
+    PROFILE_MEMORY_SNAPSHOT_PATH="${PROFILE_MEMORY_SNAPSHOT_PATH}"
+    PROFILE_EXTERNAL_MEMORY="${PROFILE_EXTERNAL_MEMORY}"
     PROFILE_SYNC="${PROFILE_SYNC}"
     PROFILE_MODULE_FILTER="${PROFILE_MODULE_FILTER}"
     PROFILE_SOURCE_JSON="${source_profile}"
@@ -1366,7 +1398,6 @@ run_job() {
       KT_MAX_CACHE_DEPTH="${KT_MAX_CACHE_DEPTH}"
       KT_TP_ENABLED="${KT_TP_ENABLED}"
       KT_SHARE_BACKWARD_BB="${KT_SHARE_BACKWARD_BB}"
-      KT_SHARE_CACHE_POOL="${KT_SHARE_CACHE_POOL}"
       KT_NUM_GPU_EXPERTS="${KT_NUM_GPU_EXPERTS}"
       KT_WEIGHT_PATH="${KT_WEIGHT_PATH}"
       KT_EXPERT_CHECKPOINT_PATH="${KT_EXPERT_CHECKPOINT_PATH}"
@@ -1511,7 +1542,7 @@ plot_memory_single_run() {
 
   plot_root="${seq_root}/memory_plots"
   local -a plot_cmd=(
-    "${CONDA_EXE}" run -p "${ENV_DIR}" python "${MEMORY_PLOT_SCRIPT}"
+    "${ENV_PYTHON}" "${MEMORY_PLOT_SCRIPT}"
     --run-dir "${seq_root}"
     --output-dir "${plot_root}"
     --clean-output
@@ -1582,7 +1613,7 @@ This config root is organized as follows:
 - \`combined/\`: config-level LF timing and allocator-summary plots from \`profile.json\`.
 - \`memory_combined/\`: config-level source-memory breakdown plots. If no source-memory rows were collected, this folder contains a README explaining why.
 - \`c2c_combined/\`: config-level C2C/CTC saturation plots from Nsight GPU metrics. If old traces lack GPU metrics, this folder contains a README explaining why.
-- \`<backend>__<profiler>__<recompute>__pol<policy>__router<mode>/s<seq>/\`: per-run artifacts.
+- \`<backend>__<profiler>__<recompute>__pol<policy>__router<mode>/b<batch>_s<seq>/\`: per-run artifacts.
 
 If \`PLOT_OUTPUT_DIR\` is set, combined plot folders are written under that external plot output root instead of this config root.
 
@@ -1910,3 +1941,8 @@ if [[ "${DRY_RUN}" != "true" ]]; then
 fi
 
 echo "LF profiling completed. Results: ${precision_root}"
+
+
+if [[ "${RUN_POSTSERVE}" == "true" ]]; then
+  bash scripts/testing/serve.sh
+fi

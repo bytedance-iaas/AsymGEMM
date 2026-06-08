@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import re
 import time
 import warnings
+from collections import Counter
 from typing import Any, Callable, Iterator
 
 import torch
@@ -71,8 +72,9 @@ class LFTraceConfig:
     memory_breakdown: bool = False
     memory_breakdown_interval: int = 1
     memory_breakdown_steps: str = ""
-    memory_breakdown_modules: str = "attention,router,mlp,experts,lora,embedding,loss"
+    memory_breakdown_modules: str = "attention,router,mlp,experts,shared_experts,lora,embedding,loss"
     memory_breakdown_output: str = "memory_breakdown"
+    external_memory_diagnostics: bool = False
     sync: bool = False
     nsys_capture_range: bool = False
     warmup_steps: int = 0
@@ -99,13 +101,16 @@ class LFTraceConfig:
             memory_breakdown_steps=env.get("ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_STEPS", "").strip(),
             memory_breakdown_modules=env.get(
                 "ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_MODULES",
-                "attention,mlp,experts,lora,embedding,loss",
+                "attention,router,mlp,experts,shared_experts,lora,embedding,loss",
             ),
             memory_breakdown_output=env.get(
                 "ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_OUTPUT",
                 "memory_breakdown",
             ).strip()
             or "memory_breakdown",
+            external_memory_diagnostics=_parse_bool(
+                env.get("ASYM_GEMM_LF_PROFILE_EXTERNAL_MEMORY", "0")
+            ),
             sync=_parse_bool(env.get("ASYM_GEMM_LF_PROFILE_SYNC", "0")),
             nsys_capture_range=_parse_bool(env.get("ASYM_GEMM_LF_NSYS_CAPTURE_RANGE", "0")),
             warmup_steps=env_int("ASYM_GEMM_LF_CONFIG_WARMUP_STEPS"),
@@ -264,14 +269,28 @@ class LFTraceHandle:
 
     @contextmanager
     def saved_tensor_context(self) -> Iterator[None]:
-        if not self.config.memory_attribution:
+        if not self.config.memory_attribution and self.memory_breakdown_profiler is None:
             yield
             return
-        self.saved_tensor_tracker = SavedTensorTracker()
-        with torch.autograd.graph.saved_tensors_hooks(
-            self.saved_tensor_tracker.pack,
-            self.saved_tensor_tracker.unpack,
-        ):
+        if self.config.memory_attribution:
+            self.saved_tensor_tracker = SavedTensorTracker()
+
+        def pack(tensor: torch.Tensor) -> torch.Tensor:
+            result = tensor
+            if self.saved_tensor_tracker is not None:
+                result = self.saved_tensor_tracker.pack(result)
+            if self.memory_breakdown_profiler is not None:
+                result = self.memory_breakdown_profiler.saved_tensor_pack(result)
+            return result
+
+        def unpack(tensor: torch.Tensor) -> torch.Tensor:
+            if self.memory_breakdown_profiler is not None:
+                self.memory_breakdown_profiler.saved_tensor_unpack(tensor)
+            if self.saved_tensor_tracker is not None:
+                return self.saved_tensor_tracker.unpack(tensor)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
             yield
 
 
@@ -306,12 +325,14 @@ def _device_space(device: torch.device | str) -> str:
 def _component_from_param_name(name: str) -> str:
     lower = name.lower()
     if "lora" in lower:
+        if "shared_expert" in lower or "shared_experts" in lower:
+            return "shared_experts"
         if "self_attn" in lower or any(part in lower for part in ("q_proj", "k_proj", "v_proj", "o_proj")):
-            return "lora_attention"
+            return "attention"
         if "expert" in lower:
-            return "lora_experts"
+            return "routed_experts"
         if "mlp" in lower or any(part in lower for part in ("gate_proj", "up_proj", "down_proj")):
-            return "lora_mlp"
+            return "mlp_dense"
         return "lora"
     if "embed" in lower:
         return "embedding"
@@ -319,6 +340,8 @@ def _component_from_param_name(name: str) -> str:
         return "lm_head"
     if "self_attn" in lower or any(part in lower for part in ("q_proj", "k_proj", "v_proj", "o_proj")):
         return "attention"
+    if "shared_expert" in lower or "shared_experts" in lower:
+        return "shared_experts"
     if "expert" in lower:
         return "routed_experts"
     if "mlp" in lower or any(part in lower for part in ("gate_proj", "up_proj", "down_proj")):
@@ -338,6 +361,8 @@ def _component_from_module_name(name: str) -> str | None:
         return "router"
     if lower.endswith(".self_attn") or lower.endswith(".attention"):
         return "attention"
+    if lower.endswith(".shared_expert") or lower.endswith(".shared_experts") or ".shared_expert." in lower:
+        return "shared_experts"
     if lower.endswith(".mlp.experts") or lower.endswith(".experts"):
         return "routed_experts"
     if lower.endswith(".mlp"):
@@ -356,6 +381,8 @@ def _component_from_module_name(name: str) -> str | None:
 def _component_filter_token(component: str) -> str:
     if component == "routed_experts":
         return "experts"
+    if component == "shared_experts":
+        return "shared_experts"
     if component == "mlp_dense":
         return "mlp"
     if component in {"lora_attention", "lora_mlp", "lora_experts"}:
@@ -369,6 +396,44 @@ def _tensor_bytes(tensor: torch.Tensor) -> int:
     return int(tensor.numel() * tensor.element_size())
 
 
+def _saved_tensor_storage_key(tensor: torch.Tensor) -> tuple[str, int, int, str] | None:
+    if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+        return None
+    storage = tensor.untyped_storage()
+    return (str(tensor.device), int(storage.data_ptr()), int(storage.nbytes()), str(tensor.dtype))
+
+
+_PHASE_PRIORITY = {
+    "after_backward": 60,
+    "before_optimizer_step": 50,
+    "after_forward": 40,
+    "after_optimizer_step": 30,
+    "step_begin": 0,
+}
+
+
+def _memory_breakdown_selection_key(row: dict[str, Any]) -> tuple[int, int, int, int]:
+    return (
+        int(row.get("peak_allocated_since_step_begin") or row.get("allocated_bytes") or 0),
+        _PHASE_PRIORITY.get(str(row.get("phase") or ""), 10),
+        int(row.get("allocated_bytes") or 0),
+        int(row.get("step") or 0),
+    )
+
+
+def _external_device_memory_used_bytes() -> int | None:
+    if not torch.cuda.is_available():
+        return None
+    try:
+        value = torch.cuda.device_memory_used(torch.cuda.current_device())
+    except Exception:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class LFMemoryBreakdownProfiler:
     def __init__(self, config: LFTraceConfig) -> None:
         self.config = config
@@ -380,6 +445,7 @@ class LFMemoryBreakdownProfiler:
             "router",
             "mlp",
             "experts",
+            "shared_experts",
             "lora",
             "embedding",
             "loss",
@@ -387,9 +453,15 @@ class LFMemoryBreakdownProfiler:
         self.rows: list[dict[str, Any]] = []
         self._step = 0
         self._active = False
-        self._current_activation_bytes: dict[str, int] = {}
+        self._component_stack: list[str] = []
+        self._saved_refcounts: Counter[tuple[str, int, int, str]] = Counter()
+        self._saved_components: dict[tuple[str, int, int, str], str] = {}
+        self._saved_bytes: dict[tuple[str, int, int, str], int] = {}
+        self._saved_activation_bytes_at_peak: dict[str, int] = {}
+        self._saved_activation_peak_allocated = 0
         self._current_peak_allocated = 0
         self._current_peak_reserved = 0
+        self._external_memory_at_peak: dict[str, int] = {}
         self._model: nn.Module | None = None
         self._optimizer: Any | None = None
         self._hooks: list[Any] = []
@@ -401,6 +473,11 @@ class LFMemoryBreakdownProfiler:
             except Exception:
                 pass
         self._hooks.clear()
+        if self._model is not None and getattr(self._model, _MEMORY_HOOK_ATTR, False):
+            try:
+                setattr(self._model, _MEMORY_HOOK_ATTR, False)
+            except Exception:
+                pass
 
     def set_optimizer(self, optimizer: Any | None) -> None:
         if optimizer is not None:
@@ -436,7 +513,7 @@ class LFMemoryBreakdownProfiler:
             def forward_pre(_module: nn.Module, _args: tuple[Any, ...], *, _component: str = component) -> None:
                 if not self._active or not torch.cuda.is_available():
                     return
-                setattr(_module, "_asym_lf_memory_alloc_pre", int(torch.cuda.memory_allocated()))
+                self._component_stack.append(_component)
 
             def forward_post(
                 _module: nn.Module,
@@ -447,13 +524,21 @@ class LFMemoryBreakdownProfiler:
             ) -> None:
                 if not self._active or not torch.cuda.is_available():
                     return
-                before = int(getattr(_module, "_asym_lf_memory_alloc_pre", torch.cuda.memory_allocated()))
                 after = int(torch.cuda.memory_allocated())
-                self._current_peak_allocated = max(self._current_peak_allocated, after, int(torch.cuda.max_memory_allocated()))
-                self._current_peak_reserved = max(self._current_peak_reserved, int(torch.cuda.memory_reserved()))
-                delta = after - before
-                if delta > 0:
-                    self._current_activation_bytes[_component] = self._current_activation_bytes.get(_component, 0) + int(delta)
+                try:
+                    peak_allocated = int(torch.cuda.max_memory_allocated())
+                    peak_reserved = int(torch.cuda.max_memory_reserved())
+                except RuntimeError:
+                    peak_allocated = after
+                    peak_reserved = int(torch.cuda.memory_reserved())
+                self._current_peak_allocated = max(self._current_peak_allocated, after, peak_allocated)
+                self._current_peak_reserved = max(
+                    self._current_peak_reserved,
+                    int(torch.cuda.memory_reserved()),
+                    peak_reserved,
+                )
+                if self._component_stack:
+                    self._component_stack.pop()
 
             self._hooks.append(module.register_forward_pre_hook(forward_pre))
             self._hooks.append(module.register_forward_hook(forward_post))
@@ -466,10 +551,24 @@ class LFMemoryBreakdownProfiler:
         self.set_optimizer(optimizer)
         self._step += 1
         self._active = self.should_record_step(self._step)
-        self._current_activation_bytes = {}
+        self._component_stack = []
+        self._saved_refcounts.clear()
+        self._saved_components.clear()
+        self._saved_bytes.clear()
+        self._saved_activation_bytes_at_peak = {}
+        self._saved_activation_peak_allocated = 0
+        self._external_memory_at_peak = {}
+        if self._active and torch.cuda.is_available():
+            if self.config.sync:
+                torch.cuda.synchronize()
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except RuntimeError:
+                pass
         allocated, reserved, peak_allocated, peak_reserved = self._snapshot_values()
         self._current_peak_allocated = max(allocated, peak_allocated)
         self._current_peak_reserved = max(reserved, peak_reserved)
+        self._capture_saved_activation_peak(self._current_peak_allocated)
         if self._active:
             self.record_phase("step_begin", model=model, optimizer=optimizer)
 
@@ -483,10 +582,13 @@ class LFMemoryBreakdownProfiler:
         allocated, reserved, peak_allocated, peak_reserved = self._snapshot_values()
         self._current_peak_allocated = max(self._current_peak_allocated, allocated, peak_allocated)
         self._current_peak_reserved = max(self._current_peak_reserved, reserved, peak_reserved)
+        self._capture_saved_activation_peak(self._current_peak_allocated)
         persistent = self._collect_persistent_bytes(self._model, self._optimizer)
-        activation = dict(sorted(self._current_activation_bytes.items()))
+        saved_activation = dict(sorted(self._live_saved_activation_bytes().items()))
+        saved_activation_at_peak = dict(sorted(self._saved_activation_bytes_at_peak.items()))
+        external_memory = dict(self._external_memory_at_peak) or self._external_memory_snapshot(self._current_peak_reserved)
         row = {
-            "schema_version": 1,
+            "schema_version": 2,
             "rank": _distributed_rank(),
             "world_size": _distributed_world_size(),
             "step": self._step,
@@ -498,22 +600,92 @@ class LFMemoryBreakdownProfiler:
             "peak_allocated_since_step_begin": self._current_peak_allocated,
             "peak_reserved_since_step_begin": self._current_peak_reserved,
             "persistent_bytes": persistent,
-            "activation_bytes": activation,
+            "saved_activation_bytes": saved_activation,
+            "saved_activation_bytes_at_peak": saved_activation_at_peak,
+            "saved_activation_peak_allocated_bytes": self._saved_activation_peak_allocated,
+            "external_memory": external_memory,
             "closure_bytes": self._closure_bytes(
                 self._current_peak_allocated,
-                allocated,
-                reserved,
+                self._current_peak_reserved,
                 persistent,
-                activation,
+                saved_activation_at_peak,
+                external_memory,
             ),
             "methods": {
                 "persistent_bytes": "exact tensor size",
-                "activation_bytes": "measured forward allocated delta",
-                "framework_temp_workspace": "inferred residual to peak",
-                "allocator_reserved_unallocated": "reserved - allocated snapshot",
+                "saved_activation_bytes": "autograd saved tensor live unique storage",
+                "saved_activation_bytes_at_peak": "autograd saved tensor live unique storage at allocated peak",
+                "unattributed_allocated_peak": "residual to peak allocated",
+                "allocator_reserved_unallocated": "peak reserved - peak allocated",
+                "external_cuda_or_driver": "device used - PyTorch peak reserved",
             },
         }
         self.rows.append(row)
+
+    def _live_saved_activation_bytes(self) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for key, count in self._saved_refcounts.items():
+            if count <= 0:
+                continue
+            component = self._saved_components.get(key, "unknown_saved_activation")
+            result[component] = result.get(component, 0) + int(self._saved_bytes.get(key, key[2]))
+        return result
+
+    def _capture_saved_activation_peak(self, allocated: int | None = None) -> None:
+        if not self._active:
+            return
+        if allocated is None:
+            allocated = int(torch.cuda.memory_allocated()) if torch.cuda.is_available() else 0
+        if int(allocated) >= int(self._saved_activation_peak_allocated):
+            self._saved_activation_peak_allocated = int(allocated)
+            self._saved_activation_bytes_at_peak = self._live_saved_activation_bytes()
+            self._external_memory_at_peak = self._external_memory_snapshot(self._current_peak_reserved)
+
+    def _external_memory_snapshot(self, peak_reserved: int | None = None) -> dict[str, int]:
+        if not self.config.external_memory_diagnostics:
+            return {}
+        device_used = _external_device_memory_used_bytes()
+        if device_used is None:
+            return {}
+        reserved = int(peak_reserved if peak_reserved is not None else torch.cuda.memory_reserved())
+        return {
+            "device_memory_used_bytes": int(device_used),
+            "external_cuda_or_driver_bytes": max(0, int(device_used) - int(reserved)),
+        }
+
+    def _refresh_peak_snapshot(self) -> None:
+        allocated, reserved, peak_allocated, peak_reserved = self._snapshot_values()
+        self._current_peak_allocated = max(self._current_peak_allocated, allocated, peak_allocated)
+        self._current_peak_reserved = max(self._current_peak_reserved, reserved, peak_reserved)
+        self._capture_saved_activation_peak(self._current_peak_allocated)
+
+    def saved_tensor_pack(self, tensor: torch.Tensor) -> torch.Tensor:
+        if not self.enabled or not self._active:
+            return tensor
+        key = _saved_tensor_storage_key(tensor)
+        if key is None:
+            return tensor
+        component = self._component_stack[-1] if self._component_stack else "unknown_saved_activation"
+        self._saved_refcounts[key] += 1
+        self._saved_components.setdefault(key, component)
+        self._saved_bytes[key] = key[2]
+        self._refresh_peak_snapshot()
+        return tensor
+
+    def saved_tensor_unpack(self, tensor: torch.Tensor) -> torch.Tensor:
+        if not self.enabled or not self._active:
+            return tensor
+        key = _saved_tensor_storage_key(tensor)
+        if key is None:
+            return tensor
+        self._refresh_peak_snapshot()
+        if key in self._saved_refcounts:
+            self._saved_refcounts[key] -= 1
+            if self._saved_refcounts[key] <= 0:
+                self._saved_refcounts.pop(key, None)
+                self._saved_components.pop(key, None)
+                self._saved_bytes.pop(key, None)
+        return tensor
 
     def _snapshot_values(self) -> tuple[int, int, int, int]:
         if not torch.cuda.is_available():
@@ -531,13 +703,25 @@ class LFMemoryBreakdownProfiler:
     def _collect_persistent_bytes(self, model: nn.Module | None, optimizer: Any | None) -> dict[str, dict[str, int]]:
         result: dict[str, dict[str, int]] = {}
 
+        seen_storages: set[tuple[str, int, int, str]] = set()
+
         def add(component: str, kind: str, tensor: torch.Tensor) -> None:
+            try:
+                storage = tensor.untyped_storage()
+                storage_bytes = int(storage.nbytes())
+                storage_key = (str(tensor.device), int(storage.data_ptr()), storage_bytes, str(tensor.dtype))
+            except Exception:
+                storage_bytes = _tensor_bytes(tensor)
+                storage_key = (str(tensor.device), id(tensor), storage_bytes, str(tensor.dtype))
+            if storage_key in seen_storages:
+                return
+            seen_storages.add(storage_key)
             space = _device_space(tensor.device)
             key = kind if space == "GPU HBM" else f"{kind}_cpu"
             bucket = result.setdefault(component, {})
-            bucket[key] = bucket.get(key, 0) + _tensor_bytes(tensor)
+            bucket[key] = bucket.get(key, 0) + storage_bytes
             if space != "GPU HBM" and tensor.is_pinned():
-                bucket[f"{kind}_cpu_pinned"] = bucket.get(f"{kind}_cpu_pinned", 0) + _tensor_bytes(tensor)
+                bucket[f"{kind}_cpu_pinned"] = bucket.get(f"{kind}_cpu_pinned", 0) + storage_bytes
 
         param_names: dict[int, str] = {}
         if model is not None:
@@ -586,17 +770,18 @@ class LFMemoryBreakdownProfiler:
     def _closure_bytes(
         self,
         peak_allocated: int,
-        allocated: int,
-        reserved: int,
+        peak_reserved: int,
         persistent: dict[str, dict[str, int]],
-        activation: dict[str, int],
+        saved_activation: dict[str, int],
+        external_memory: dict[str, int] | None = None,
     ) -> dict[str, int]:
         persistent_gpu = self._persistent_gpu_bytes(persistent)
-        activation_gpu = sum(max(int(value), 0) for value in activation.values())
-        known_allocated = persistent_gpu + activation_gpu
+        saved_activation_gpu = sum(max(int(value), 0) for value in saved_activation.values())
+        known_allocated = persistent_gpu + saved_activation_gpu
         return {
-            "framework_temp_workspace": max(0, int(peak_allocated) - known_allocated),
-            "allocator_reserved_unallocated": max(0, int(reserved) - int(allocated)),
+            "unattributed_allocated_peak": max(0, int(peak_allocated) - known_allocated),
+            "allocator_reserved_unallocated": max(0, int(peak_reserved) - int(peak_allocated)),
+            "external_cuda_or_driver": int((external_memory or {}).get("external_cuda_or_driver_bytes") or 0),
         }
 
     def report(self) -> dict[str, Any]:
@@ -626,15 +811,30 @@ def _distributed_world_size() -> int:
     return 1
 
 
-def _flatten_memory_breakdown_row(row: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
-    peak = int(row.get("peak_allocated_since_step_begin") or row.get("allocated_bytes") or 0)
+def _flatten_memory_breakdown_row(row: dict[str, Any]) -> tuple[list[dict[str, Any]], int, int]:
+    peak_allocated = int(row.get("peak_allocated_since_step_begin") or row.get("allocated_bytes") or 0)
+    peak_reserved = int(row.get("peak_reserved_since_step_begin") or row.get("reserved_bytes") or 0)
+    peak_reserved = max(peak_reserved, peak_allocated)
     persistent = row.get("persistent_bytes", {})
-    activation = row.get("activation_bytes", {})
+    saved_activation = row.get("saved_activation_bytes_at_peak", {})
+    if not isinstance(saved_activation, dict) or not saved_activation:
+        saved_activation = row.get("saved_activation_bytes", {})
     closure = row.get("closure_bytes", {})
+    external_memory = row.get("external_memory", {})
     rows: list[dict[str, Any]] = []
 
-    def add(memory_space: str, group: str, component: str, kind: str, value: int, method: str, accuracy: str) -> None:
-        if int(value) <= 0:
+    def add(
+        memory_space: str,
+        group: str,
+        component: str,
+        kind: str,
+        value: int,
+        method: str,
+        accuracy: str,
+        *,
+        keep_zero: bool = False,
+    ) -> None:
+        if int(value) < 0 or (int(value) == 0 and not keep_zero):
             return
         rows.append(
             {
@@ -657,51 +857,47 @@ def _flatten_memory_breakdown_row(row: dict[str, Any]) -> tuple[list[dict[str, A
                 if value_int <= 0:
                     continue
                 if str(kind).endswith("_cpu") or str(kind).endswith("_cpu_pinned"):
-                    add("CPU host", "host", str(component), str(kind), value_int, "exact tensor size", "exact")
+                    space = "CPU pinned subset" if str(kind).endswith("_cpu_pinned") else "CPU host"
+                    add(space, "host", str(component), str(kind), value_int, "unique tensor storage size", "exact")
                 elif kind in {"weight", "frozen_weight", "buffer"}:
-                    add("GPU HBM", "weights", str(component), str(kind), value_int, "exact tensor size", "exact")
+                    add("GPU HBM", "weights", str(component), str(kind), value_int, "unique tensor storage size", "exact")
                 elif kind == "grad":
-                    add("GPU HBM", "gradients", str(component), str(kind), value_int, "exact tensor size", "exact")
+                    add("GPU HBM", "gradients", str(component), str(kind), value_int, "unique tensor storage size", "exact")
                 elif kind == "optimizer_state":
-                    add("GPU HBM", "optimizer", str(component), str(kind), value_int, "exact tensor size", "exact")
+                    add("GPU HBM", "optimizer", str(component), str(kind), value_int, "unique tensor storage size", "exact")
                 else:
-                    add("GPU HBM", "persistent", str(component), str(kind), value_int, "exact tensor size", "exact")
+                    add("GPU HBM", "persistent", str(component), str(kind), value_int, "unique tensor storage size", "exact")
 
-    allocated_known = sum(int(item["bytes"]) for item in rows if item.get("memory_space") == "GPU HBM")
-    activation_items = [
+    saved_activation_items = [
         (str(component), int(value or 0))
-        for component, value in (activation.items() if isinstance(activation, dict) else [])
+        for component, value in (saved_activation.items() if isinstance(saved_activation, dict) else [])
         if int(value or 0) > 0
     ]
-    activation_total = sum(value for _component, value in activation_items)
-    activation_scale = 1.0
-    if activation_total > 0:
-        available = max(0, peak - allocated_known)
-        if activation_total > available:
-            activation_scale = float(available) / float(activation_total) if activation_total else 0.0
-    for component, value in activation_items:
-        scaled = int(round(value * activation_scale))
-        method = "measured forward allocated delta"
-        if activation_scale < 0.999:
-            method = "measured forward allocated delta, scaled to peak closure"
-        add("GPU HBM", "activations", component, "activation", scaled, method, "approximate")
+    for component, value in saved_activation_items:
+        add(
+            "GPU HBM",
+            "saved_activations",
+            component,
+            "saved_activation",
+            value,
+            "autograd saved tensor live unique storage at allocated peak",
+            "exact live storage",
+        )
 
     allocated_known = sum(int(item["bytes"]) for item in rows if item.get("memory_space") == "GPU HBM")
-    framework_value = max(0, peak - allocated_known)
+    unattributed_value = max(0, peak_allocated - allocated_known)
     if isinstance(closure, dict):
-        framework_value = max(framework_value, int(closure.get("framework_temp_workspace") or 0))
-        framework_value = min(framework_value, max(0, peak - allocated_known))
-        reserved_unallocated = int(closure.get("allocator_reserved_unallocated") or 0)
-    else:
-        reserved_unallocated = 0
+        unattributed_value = max(unattributed_value, int(closure.get("unattributed_allocated_peak") or 0))
+        unattributed_value = min(unattributed_value, max(0, peak_allocated - allocated_known))
+    reserved_unallocated = max(0, peak_reserved - peak_allocated)
     add(
         "GPU HBM",
-        "temp_workspace",
-        "framework_temp_workspace",
-        "temp_workspace",
-        framework_value,
+        "unattributed_allocated_peak",
+        "unattributed_allocated_peak",
+        "allocated_residual",
+        unattributed_value,
         "inferred residual to peak",
-        "approximate",
+        "residual",
     )
     add(
         "GPU reserved",
@@ -709,39 +905,100 @@ def _flatten_memory_breakdown_row(row: dict[str, Any]) -> tuple[list[dict[str, A
         "allocator_reserved_unallocated",
         "reserved_unallocated",
         reserved_unallocated,
-        "reserved - allocated snapshot",
+        "peak reserved - peak allocated",
         "exact allocator snapshot",
+        keep_zero=True,
     )
-    return rows, peak
+    external_value = 0
+    if isinstance(external_memory, dict):
+        external_value = int(external_memory.get("external_cuda_or_driver_bytes") or 0)
+    if isinstance(closure, dict):
+        external_value = max(external_value, int(closure.get("external_cuda_or_driver") or 0))
+    add(
+        "External CUDA",
+        "external",
+        "external_cuda_or_driver",
+        "process_or_driver_gap",
+        external_value,
+        "device used - PyTorch peak reserved",
+        "diagnostic",
+    )
+    return rows, peak_allocated, peak_reserved
 
 
 def build_memory_breakdown_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if not rows:
-        return {"enabled": False, "breakdown_rows": [], "closure_ok": False, "closure_error_bytes": 0}
+        return {
+            "enabled": False,
+            "breakdown_rows": [],
+            "schema_version": 2,
+            "allocated_closure_ok": False,
+            "reserved_closure_ok": False,
+            "allocated_closure_error_bytes": 0,
+            "reserved_closure_error_bytes": 0,
+        }
     candidates = [row for row in rows if not row.get("is_warmup")]
     if not candidates:
         candidates = rows
-    selected = max(candidates, key=lambda row: int(row.get("peak_allocated_since_step_begin") or 0))
-    breakdown_rows, peak = _flatten_memory_breakdown_row(selected)
-    gpu_sum = sum(int(row.get("bytes") or 0) for row in breakdown_rows if row.get("memory_space") == "GPU HBM")
-    closure_error = int(peak) - int(gpu_sum)
+    selected = max(candidates, key=_memory_breakdown_selection_key)
+    breakdown_rows, peak_allocated, peak_reserved = _flatten_memory_breakdown_row(selected)
+    allocated_sum = sum(int(row.get("bytes") or 0) for row in breakdown_rows if row.get("memory_space") == "GPU HBM")
+    reserved_gap_sum = sum(
+        int(row.get("bytes") or 0)
+        for row in breakdown_rows
+        if row.get("component") == "allocator_reserved_unallocated"
+    )
+    reserved_stack_sum = int(allocated_sum) + int(reserved_gap_sum)
+    allocated_closure_error = int(peak_allocated) - int(allocated_sum)
+    reserved_closure_error = int(peak_reserved) - int(reserved_stack_sum)
+    saved_activation_sum = sum(
+        int(row.get("bytes") or 0)
+        for row in breakdown_rows
+        if row.get("memory_space") == "GPU HBM" and row.get("group") == "saved_activations"
+    )
+    unattributed_sum = sum(
+        int(row.get("bytes") or 0)
+        for row in breakdown_rows
+        if row.get("memory_space") == "GPU HBM" and row.get("group") == "unattributed_allocated_peak"
+    )
+    external_sum = sum(
+        int(row.get("bytes") or 0)
+        for row in breakdown_rows
+        if row.get("component") == "external_cuda_or_driver"
+    )
     return {
         "enabled": True,
-        "schema_version": 1,
-        "peak_hbm_bytes": int(peak),
+        "schema_version": 2,
+        "selected_metric": "peak_allocated_hbm_bytes",
+        "peak_allocated_hbm_bytes": int(peak_allocated),
+        "peak_reserved_hbm_bytes": int(peak_reserved),
+        "reserved_unallocated_bytes": max(0, int(peak_reserved) - int(peak_allocated)),
+        "external_cuda_or_driver_bytes": int(external_sum),
+        "allocated_stack_sum_bytes": int(allocated_sum),
+        "reserved_stack_sum_bytes": int(reserved_stack_sum),
+        "saved_activation_hbm_bytes_at_peak": int(saved_activation_sum),
+        "unattributed_allocated_peak_bytes": int(unattributed_sum),
         "selected_phase": selected.get("phase", ""),
         "selected_step": selected.get("step", 0),
         "rank_count": _distributed_world_size(),
         "breakdown_rows": breakdown_rows,
-        "closure_ok": abs(closure_error) <= max(1024 * 1024, int(peak * 0.01)),
-        "closure_error_bytes": closure_error,
+        "allocated_closure_ok": abs(allocated_closure_error)
+        <= max(1024 * 1024, int(peak_allocated * 0.01)),
+        "reserved_closure_ok": abs(reserved_closure_error) <= max(1024 * 1024, int(peak_reserved * 0.01)),
+        "allocated_closure_error_bytes": allocated_closure_error,
+        "reserved_closure_error_bytes": reserved_closure_error,
         "reserved_bytes": int(selected.get("reserved_bytes") or 0),
         "allocated_bytes": int(selected.get("allocated_bytes") or 0),
         "notes": [
-            "GPU HBM rows close to torch.cuda.max_memory_allocated-style allocated peak.",
-            "GPU reserved allocator rows are reported separately from allocated HBM closure.",
+            "Selected row is the non-warmup phase with the highest peak allocated HBM; phase priority breaks ties.",
+            "Weights, gradients, optimizer states, buffers, and host tensors are unique tensor-storage accounting.",
+            "Saved activation rows are live autograd saved-tensor storage at the selected allocated peak.",
+            "Unattributed allocated peak is the residual from known GPU HBM rows to peak allocated HBM.",
+            "GPU HBM rows plus allocator reserved-unallocated close to torch.cuda.max_memory_reserved-style reserved peak.",
         ],
     }
+
+
 def _record_original(handle: LFTraceHandle, owner: Any, attr: str) -> Any:
     original = getattr(owner, attr)
     handle.originals.append((owner, attr, original))
