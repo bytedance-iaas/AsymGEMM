@@ -24,10 +24,10 @@ DEFAULT_LORA_BATCH_SIZE = 32
 DEFAULT_LORA_SEQ_LEN = 64
 DEFAULT_LORA_HIDDEN_DIM = 1024
 DEFAULT_LORA_MLP_EXPANSION = 4
-DEFAULT_DENSE_TARGET_MODE = "all"
+DEFAULT_TARGET_PRESET = "all"
 DEFAULT_TARGET_MODULES = "all"
 DEFAULT_OFFLOAD_MODULES = ""
-DENSE_TARGET_MODES = ("mlp_only", "attention_only", "all")
+TARGET_PRESETS = ("mlp_only", "attention_only", "all")
 LORA_DTYPE_CHOICES = ("bf16", "bfloat16", "fp16", "float16", "fp32", "float32")
 WORKFLOW_LABEL = "lora-sft"
 
@@ -435,8 +435,8 @@ def _common_profile_args(
         args.moe_mode,
         "--moe-route-pattern",
         args.moe_route_pattern,
-        "--dense-target-mode",
-        args.dense_target_mode,
+        "--target-preset",
+        args.target_preset,
         "--target-modules",
         args.target_modules,
         "--offload-modules",
@@ -935,10 +935,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kt-max-cache-depth", type=int, default=1)
     parser.add_argument(
         "--target-preset",
-        "--dense-target-mode",
-        dest="dense_target_mode",
-        choices=DENSE_TARGET_MODES,
-        default=DEFAULT_DENSE_TARGET_MODE,
+        choices=TARGET_PRESETS,
+        default=DEFAULT_TARGET_PRESET,
         help="Dense workload target scope. Default adapts all known target projections.",
     )
     parser.add_argument("--target-modules", default=DEFAULT_TARGET_MODULES)
@@ -1153,8 +1151,8 @@ def main() -> None:
                                     args.moe_mode,
                                     "--moe-route-pattern",
                                     args.moe_route_pattern,
-                                    "--dense-target-mode",
-                                    args.dense_target_mode,
+                                    "--target-preset",
+                                    args.target_preset,
                                     "--target-modules",
                                     args.target_modules,
                                     "--offload-modules",

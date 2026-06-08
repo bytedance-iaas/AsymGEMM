@@ -7,12 +7,9 @@ set -Eeuo pipefail
 ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
 PYTHON_BIN="${PYTHON_BIN:-${PYTHON:-python3}}"
 
-# MODE="${MODE:-ncu}"
 MODE="${MODE:-timing}"
 DEVICE="${DEVICE:-cuda:3}"
 PRECISION="${PRECISION:-bf16}"
-# SHAPES="${SHAPES:-2048|2048|768 2048|768|2048 2048|4096|1536 2048|1536|4096}"
-# SHAPES="${SHAPES:-2048|2048|768}"
 SHAPES="${SHAPES:-8192|8192|8192 4096|4096|4096}"
 
 SEED="${SEED:-1234}"
@@ -22,13 +19,6 @@ RTOL="${RTOL:-0.05}"
 SLOW_THRESHOLD="${SLOW_THRESHOLD:-1.25}"
 COMPILED_DIMS="${COMPILED_DIMS:-mnk}"
 JSON_OUTPUT="${JSON_OUTPUT:-}"
-TRANSPOSE_BLOCK_K="${TRANSPOSE_BLOCK_K:-}"
-# BF16_BLOCK_M="${BF16_BLOCK_M:-${DG_BF16_BLOCK_M:-128}}"
-# BF16_BLOCK_N="${BF16_BLOCK_N:-${DG_BF16_BLOCK_N:-32}}"
-# BF16_BLOCK_K="${BF16_BLOCK_K:-${DG_BF16_BLOCK_K:-256}}"
-# BF16_TRANSPOSE_BLOCK_M="${BF16_TRANSPOSE_BLOCK_M:-${DG_BF16_TRANSPOSE_BLOCK_M:-128}}"
-# BF16_TRANSPOSE_BLOCK_N="${BF16_TRANSPOSE_BLOCK_N:-${DG_BF16_TRANSPOSE_BLOCK_N:-64}}"
-# BF16_TRANSPOSE_BLOCK_K="${BF16_TRANSPOSE_BLOCK_K:-${DG_BF16_TRANSPOSE_BLOCK_K:-256}}"
 BF16_BLOCK_M="${BF16_BLOCK_M:-${DG_BF16_BLOCK_M:-128}}"
 BF16_BLOCK_N="${BF16_BLOCK_N:-${DG_BF16_BLOCK_N:-128}}"
 BF16_BLOCK_K="${BF16_BLOCK_K:-${DG_BF16_BLOCK_K:-128}}"
@@ -92,8 +82,6 @@ Options:
   --slow-threshold FLOAT
   --compiled-dims STR
   --json-output PATH
-  --transpose-block-k K
-                      Deprecated alias for --bf16-transpose-block-k.
   --bf16-block-m N
   --bf16-block-n N
   --bf16-block-k N
@@ -146,11 +134,11 @@ while [[ $# -gt 0 ]]; do
     --shapes) need_value "$1" "${2-}"; SHAPES="$2"; shift 2 ;;
     --shape) need_value "$1" "${2-}"; SHAPE_ARGS+=("$2"); shift 2 ;;
     --m|--k|--n)
-      echo "error: ${1} was removed; use --shape M|K|N instead" >&2
+      echo "error: ${1} is managed by profile_mm.sh; use --shape M|K|N" >&2
       exit 2
       ;;
     --warmup|--iters|--repeats)
-      echo "error: ${1} is set automatically by --mode" >&2
+      echo "error: ${1} is managed by --mode" >&2
       exit 2
       ;;
     --seed) need_value "$1" "${2-}"; SEED="$2"; shift 2 ;;
@@ -160,7 +148,6 @@ while [[ $# -gt 0 ]]; do
     --slow-threshold) need_value "$1" "${2-}"; SLOW_THRESHOLD="$2"; shift 2 ;;
     --compiled-dims) need_value "$1" "${2-}"; COMPILED_DIMS="$2"; shift 2 ;;
     --json-output) need_value "$1" "${2-}"; JSON_OUTPUT="$2"; shift 2 ;;
-    --transpose-block-k) need_value "$1" "${2-}"; TRANSPOSE_BLOCK_K="$2"; shift 2 ;;
     --bf16-block-m) need_value "$1" "${2-}"; BF16_BLOCK_M="$2"; shift 2 ;;
     --bf16-block-n) need_value "$1" "${2-}"; BF16_BLOCK_N="$2"; shift 2 ;;
     --bf16-block-k) need_value "$1" "${2-}"; BF16_BLOCK_K="$2"; shift 2 ;;
@@ -193,11 +180,11 @@ done
 for extra_arg in "${EXTRA_ARGS[@]}"; do
   case "${extra_arg}" in
     --m|--m=*|--k|--k=*|--n|--n=*)
-      echo "error: ${extra_arg%%=*} was removed; use --shape M|K|N instead" >&2
+      echo "error: ${extra_arg%%=*} is managed by profile_mm.sh; use --shape M|K|N" >&2
       exit 2
       ;;
     --warmup|--warmup=*|--iters|--iters=*|--repeats|--repeats=*)
-      echo "error: ${extra_arg%%=*} is set automatically by --mode" >&2
+      echo "error: ${extra_arg%%=*} is managed by --mode" >&2
       exit 2
       ;;
   esac
@@ -236,9 +223,6 @@ else
   read -r -a NCU_SECTIONS_FINAL <<< "${NCU_SECTIONS}"
 fi
 
-if [[ -n "${TRANSPOSE_BLOCK_K}" ]]; then
-  BF16_TRANSPOSE_BLOCK_K="${TRANSPOSE_BLOCK_K}"
-fi
 export DG_BF16_BLOCK_M="${BF16_BLOCK_M}"
 export DG_BF16_BLOCK_N="${BF16_BLOCK_N}"
 export DG_BF16_BLOCK_K="${BF16_BLOCK_K}"

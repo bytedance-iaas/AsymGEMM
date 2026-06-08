@@ -7,20 +7,23 @@ set -Eeuo pipefail
 ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
 LF_DIR=${LF_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/LlamaFactory}
 KT_KERNEL_DIR=${KT_KERNEL_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/ktransformers/kt-kernel}
+DEEPSPEED_DIR=${DEEPSPEED_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/deepspeed}
 CONDA_EXE=${CONDA_EXE:-conda}
 NSYS_BIN=${NSYS_BIN:-nsys}
+DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun}
 
-GPU_POOL=${GPU_POOL:-2}
+GPU_POOL=${GPU_POOL:-3}
 # MODEL_SPECS entries are model|num_gpus. Recompute belongs only in BACKEND_SPECS.
-# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|2"}
-MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
+MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
 
-# EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le0,tok-le512,tok-le1024,tok-le512-act,tok-le1024-act"}
-EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le0,tok-le64,tok-le64-act,tok-le256,tok-le256-act,tok-le512,tok-le512-act"}
+# EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le0,tok-le512,tok-le512-act"}
+EXPERT_POLICIES=${EXPERT_POLICIES-"none"}
 
-
-# Primary backend sweep axis. Each entry is backend|recompute.
-BACKEND_SPECS=${BACKEND_SPECS:-"asym|recompute,torch|recompute"}
+# Primary backend sweep axis. Each entry is backend|recompute.  Torch is plain
+# distributed launch. Zero backends add the matching DeepSpeed config.
+# BACKEND_SPECS=${BACKEND_SPECS:-"zero2|norecomp,zero2|recomp,zero3_offload|norecomp,zero3_offload|recomp"}
+BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp"}
+ROUTER_MODES=${ROUTER_MODES:-whole}
 PROFILERS=${PROFILERS:-nsys,source}
 PRECISION=${PRECISION:-bf16}
 
@@ -39,19 +42,13 @@ GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 LORA_RANK=${LORA_RANK:-64}
 LORA_ALPHA=${LORA_ALPHA:-16}
-LORA_DROPOUT_ENV_SET=${LORA_DROPOUT+x}
-# LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
-LORA_DROPOUT=${LORA_DROPOUT:-0.10}
+LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
 SEED=${SEED:-42}
 
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
 ASYM_STRICT=${ASYM_STRICT:-true}
-TORCH_USE_ASYM_GEMM_LORA=${TORCH_USE_ASYM_GEMM_LORA:-true}
+TORCH_USE_ASYM_GEMM_LORA=${TORCH_USE_ASYM_GEMM_LORA:-false}
 REQUIRE_SM100=${REQUIRE_SM100:-1}
-TORCH_DISTRIBUTED_BACKEND=${TORCH_DISTRIBUTED_BACKEND:-deepspeed}
-TORCH_FSDP_CONFIG=${TORCH_FSDP_CONFIG:-${LF_DIR}/examples/accelerate/fsdp2_config.yaml}
-# TORCH_DEEPSPEED_CONFIG=${TORCH_DEEPSPEED_CONFIG:-${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json}
-TORCH_DEEPSPEED_CONFIG=${TORCH_DEEPSPEED_CONFIG:-${LF_DIR}/examples/deepspeed/ds_z3_config.json}
 
 # Optional output/profile controls. When unset, sweeps that include KT write
 # beside the production KT repo; normal AsymGEMM sweeps write under this repo.
@@ -62,9 +59,9 @@ PROFILE_MEMORY_ATTRIBUTION=${PROFILE_MEMORY_ATTRIBUTION:-auto}
 PROFILE_MEMORY_BREAKDOWN=${PROFILE_MEMORY_BREAKDOWN:-auto}
 PROFILE_MEMORY_BREAKDOWN_INTERVAL=${PROFILE_MEMORY_BREAKDOWN_INTERVAL:-1}
 PROFILE_MEMORY_BREAKDOWN_STEPS=${PROFILE_MEMORY_BREAKDOWN_STEPS:-}
-PROFILE_MEMORY_BREAKDOWN_MODULES=${PROFILE_MEMORY_BREAKDOWN_MODULES:-attention,mlp,experts,lora,embedding,loss}
+PROFILE_MEMORY_BREAKDOWN_MODULES=${PROFILE_MEMORY_BREAKDOWN_MODULES:-attention,router,mlp,experts,lora,embedding,loss}
 PROFILE_SYNC=${PROFILE_SYNC:-0}
-PROFILE_MODULE_FILTER=${PROFILE_MODULE_FILTER:-attention,mlp,experts,lora,optimizer,kt}
+PROFILE_MODULE_FILTER=${PROFILE_MODULE_FILTER:-attention,router,mlp,experts,lora,optimizer,kt}
 
 KT_NUM_THREADS=${KT_NUM_THREADS:-}
 KT_THREADPOOL_COUNT=${KT_THREADPOOL_COUNT:-}
@@ -83,10 +80,13 @@ KT_USE_LORA_EXPERTS=${KT_USE_LORA_EXPERTS:-}
 KT_LORA_EXPERT_NUM=${KT_LORA_EXPERT_NUM:-}
 KT_LORA_EXPERT_INTERMEDIATE_SIZE=${KT_LORA_EXPERT_INTERMEDIATE_SIZE:-}
 CHECK_KT_CALLS=${CHECK_KT_CALLS:-1}
+SUPER_OFFLOAD_DEEPSPEED_CONFIG=${SUPER_OFFLOAD_DEEPSPEED_CONFIG:-}
+SUPER_OFFLOAD_CPUADAM_CORES_PERC=${SUPER_OFFLOAD_CPUADAM_CORES_PERC:-0.8}
+CHECK_SUPEROFFLOAD=${CHECK_SUPEROFFLOAD:-1}
 
 # Optional loss-comparison controls
 COMPARE_LOSSES=${COMPARE_LOSSES:-true}
-COMPARE_BASELINE_BACKEND=${COMPARE_BASELINE_BACKEND:-torch}
+COMPARE_BASELINE_BACKEND=${COMPARE_BASELINE_BACKEND:-zero3}
 COMPARE_CANDIDATE_BACKEND=${COMPARE_CANDIDATE_BACKEND:-asym,kt_torchbf16,kt_armbf16}
 COMPARE_FIRST_STEP_REL_TOL=${COMPARE_FIRST_STEP_REL_TOL:-0.02}
 COMPARE_MAX_REL_TOL=${COMPARE_MAX_REL_TOL:-0.10}
@@ -123,6 +123,7 @@ PROFILE_POSTPROCESS_SCRIPT="${ASYM_DIR}/scripts/lf/postprocess_lf_profile_artifa
 PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_activation_recompute_sweep.py"
 MEMORY_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_memory_breakdown.py"
 INTERCONNECT_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_interconnect_ctc.py"
+SUPER_OFFLOAD_CONFIG_RENDERER="${ASYM_DIR}/scripts/lf/render_superoffload_deepspeed_config.py"
 
 # =============================================================================
 # Main Logic
@@ -134,6 +135,7 @@ Usage:
 
 Defaults:
   --gpus ${GPU_POOL}
+  --dist-launcher ${DIST_LAUNCHER}
   --backend-specs ${BACKEND_SPECS}
   --profilers ${PROFILERS}
   --seq-lens ${SEQ_LENS}
@@ -143,10 +145,13 @@ Options:
   List values must be comma-separated with no spaces.
 
   --gpus LIST                    Physical GPU pool, e.g. 0,1.
+  --dist-launcher torchrun|accelerate
+                                 Launcher for torch/zero/SuperOffload jobs. Default ${DIST_LAUNCHER}.
   --models LIST                  Model specs. Each item is model_name_or_path|num_gpus.
                                  Example: meta-llama/Llama-4-Scout-17B-16E|1,meta-llama/Llama-4-Maverick-17B-128E|4
-  --backend-specs LIST           Backend/recompute specs, e.g. 'asym|norecompute,torch|recompute,kt_armbf16|norecompute'.
-                                 Accepts recompute/norecompute or recomp/norecomp.
+  --backend-specs LIST           Backend/recompute specs, e.g. 'torch|recomp,asym|norecomp,zero2|recomp,zero3|recomp,zero3_offload|recomp,superoffload|both,kt_armbf16|norecomp'.
+                                 Use canonical recompute labels: norecomp or recomp. Use both to expand to both modes.
+  --router-modes LIST            AsymGEMM router modes: hf, whole. Default ${ROUTER_MODES}.
   --profilers LIST               source and/or nsys.
   --seq-lens LIST                LF cutoff lengths. Accepts positive integers, e.g. 4096,8192.
   --expert-policies LIST         AsymGEMM expert policies: none, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, and -act variants.
@@ -165,6 +170,7 @@ Options:
   --lora-rank N
   --lora-alpha VALUE
   --lora-dropout LIST           LoRA dropout probabilities in fixed 0.xx format, e.g. 0.00,0.10.
+                                 KT supports nonzero dropout for validated kt_torchbf16 and kt_armbf16 SFT backends.
   --seed N
   --precision NAME
   --profile-level stage|module|op|deep
@@ -177,11 +183,8 @@ Options:
   --profile-sync true|false
   --profile-module-filter LIST
   --torch-use-asym-gemm-lora true|false
-                                 For BACKEND=torch, attach packed-expert LoRA through the AsymGEMM torch backend.
-                                 Default true so torch/asym/KT train the same LF LoRA target=all modules.
-  --torch-distributed-backend fsdp2|deepspeed|ddp
-  --torch-fsdp-config PATH       Accelerate config for torch FSDP2. Defaults to LF's examples/accelerate/fsdp2_config.yaml.
-  --torch-deepspeed-config PATH  DeepSpeed config for torch backend. Defaults to LF's examples/deepspeed/ds_z3_config.json.
+                                 For zero* backends, attach packed-expert LoRA through the AsymGEMM torch backend.
+                                 Prefer BACKEND=asym_torch for wrapper-backed torch expert runs.
   --kt-kernel-dir DIR            Integrated kt-kernel source tree.
   --kt-tools-dir DIR             Helper source tree to put on PYTHONPATH for KT jobs. Defaults to ROOT.
   --kt-repo-dir DIR              KT artifact root owner. Defaults to dirname(--kt-kernel-dir).
@@ -202,14 +205,20 @@ Options:
   --kt-lora-expert-num N
   --kt-lora-expert-intermediate-size N
   --check-kt-calls true|false
+  --deepspeed-dir DIR            Local DeepSpeed/SuperOffload source tree to put before site-packages.
+  --super-offload-deepspeed-config PATH
+                                 Optional rendered DeepSpeed config path. Defaults under --output-root.
+  --super-offload-cpuadam-cores-perc VALUE
+                                 CPU core fraction for SuperOffload CPUAdam, 0.0 to 1.0. Default ${SUPER_OFFLOAD_CPUADAM_CORES_PERC}.
+  --check-superoffload true|false
   --compare-losses true|false
-  --compare-baseline-backend torch|asym|kt_torchbf16|kt_armbf16
+  --compare-baseline-backend torch|zero2|zero3|zero3_offload|superoffload|asym_torch|asym|kt_torchbf16|kt_armbf16
   --compare-candidate-backend LIST   One or more comma-separated candidate backends.
   --compare-min-steps N
   --compare-first-step-rel-tol VALUE
   --compare-max-rel-tol VALUE
   --output-root DIR              Default config layout: <root>/<dataset>__lora__lf__<precision>/<model>__gpus<model_gpus>__b<batch>_s<seq>_w<warmup>_s<steps>_r<rank>_a<alpha>_drop0xx
-                                 Per-run dirs add <backend>__<profiler>__<recompute>__pol<policy>/s<seq>.
+                                 Per-run dirs add <backend>__<profiler>__<recompute>__pol<policy>__router<mode>/s<seq>.
   --run-name NAME                Optional config directory under <dataset>__lora__lf__<precision>.
   --plot true|false
   --plot-memory-breakdown true|false
@@ -326,6 +335,23 @@ positive_int() {
   [[ "${value}" =~ ^[1-9][0-9]*$ ]] || die "${name} must be a positive integer, got '${value}'"
 }
 
+fraction_0_1() {
+  local name="$1"
+  local value="$2"
+  python3 - "${name}" "${value}" <<'PY'
+import math
+import sys
+
+name, raw = sys.argv[1:3]
+try:
+    value = float(raw)
+except ValueError:
+    raise SystemExit(f"{name} must be a number between 0 and 1, got {raw!r}")
+if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+    raise SystemExit(f"{name} must be between 0 and 1, got {raw!r}")
+PY
+}
+
 parse_model_spec() {
   local spec="$1"
   local -a fields
@@ -361,27 +387,42 @@ backend_gpu_count() {
   local backend="$1"
   local model_gpu_count="$2"
   case "${backend}" in
-    asym) printf '1\n' ;;
-    torch) printf '%s\n' "${model_gpu_count}" ;;
+    asym|asym_torch) printf '1\n' ;;
+    torch|zero2|zero3|zero3_offload|superoffload) printf '%s\n' "${model_gpu_count}" ;;
     kt_torchbf16|kt_armbf16) printf '1\n' ;;
-    *) die "internal backend label must be asym, torch, kt_torchbf16, or kt_armbf16, got '${backend}'" ;;
+    *) die "internal backend label must be torch, asym, asym_torch, zero2, zero3, zero3_offload, superoffload, kt_torchbf16, or kt_armbf16, got '${backend}'" ;;
+  esac
+}
+
+zero_deepspeed_config() {
+  case "${1}" in
+    zero2) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z2_config.json" ;;
+    zero3) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_config.json" ;;
+    zero3_offload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json" ;;
+    *) return 1 ;;
+  esac
+}
+
+is_zero_backend() {
+  case "${1}" in
+    zero2|zero3|zero3_offload|superoffload) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_policy_independent_backend() {
+  case "${1}" in
+    torch|zero2|zero3|zero3_offload|superoffload|kt_*) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
 recompute_label() {
   case "${1,,}" in
-    norecomp|norecompute|no-recompute|no_recompute|false|0|off) printf 'norecomp\n' ;;
-    recomp|recompute|true|1|on) printf 'recomp\n' ;;
-    both) printf 'both\n' ;;
-    *) die "expected recompute mode norecomp/recomp, norecompute/recompute, or both; got '${1}'" ;;
-  esac
-}
-
-recompute_values() {
-  case "$(recompute_label "$1")" in
-    norecomp) printf 'norecomp\n' ;;
-    recomp) printf 'recomp\n' ;;
-    both) printf 'norecomp\nrecomp\n' ;;
+    norecomp|recomp) printf '%s\n' "${1,,}" ;;
+    norecompute|no_recompute|no-recompute) printf 'norecomp\n' ;;
+    recompute) printf 'recomp\n' ;;
+    *) die "expected recompute mode norecomp/recomp or norecompute/recompute; got '${1}'" ;;
   esac
 }
 
@@ -402,18 +443,30 @@ normalize_expert_policy() {
 
 backend_label() {
   case "${1,,}" in
-    asym) printf 'asym\n' ;;
     torch) printf 'torch\n' ;;
+    asym) printf 'asym\n' ;;
+    asym_torch) printf 'asym_torch\n' ;;
+    zero2) printf 'zero2\n' ;;
+    zero3) printf 'zero3\n' ;;
+    zero3_offload) printf 'zero3_offload\n' ;;
+    superoffload|super_offload|so|ds_superoffload) printf 'superoffload\n' ;;
     kt_torchbf16) printf 'kt_torchbf16\n' ;;
     kt_armbf16) printf 'kt_armbf16\n' ;;
-    *) die "backend must be asym, torch, kt_torchbf16, or kt_armbf16, got '${1}'" ;;
+    *) die "backend must be torch, asym, asym_torch, zero2, zero3, zero3_offload, superoffload, kt_torchbf16, or kt_armbf16, got '${1}'" ;;
   esac
 }
 
-expand_backend_spec() {
+router_mode_label() {
+  case "${1,,}" in
+    hf|whole) printf '%s\n' "${1,,}" ;;
+    *) die "router mode must be hf or whole, got '${1}'" ;;
+  esac
+}
+
+append_backend_spec() {
   local raw="$1"
   local backend_part recompute_part backend recompute_token recompute_mode
-  local -a recompute_tokens recompute_modes_for_spec
+  local -a recompute_tokens
 
   [[ "${raw}" == *"|"* ]] || die "backend spec must be backend|recompute, got '${raw}'"
   backend_part="${raw%%|*}"
@@ -422,20 +475,27 @@ expand_backend_spec() {
   [[ -n "${backend_part}" ]] || die "empty backend in backend spec '${raw}'"
   [[ -n "${recompute_part}" ]] || die "empty recompute mode in backend spec '${raw}'"
   case "${backend_part,,}" in
-    asym) backend=asym ;;
     torch) backend=torch ;;
+    asym) backend=asym ;;
+    asym_torch) backend=asym_torch ;;
+    zero2) backend=zero2 ;;
+    zero3) backend=zero3 ;;
+    zero3_offload) backend=zero3_offload ;;
+    superoffload|super_offload|so|ds_superoffload) backend=superoffload ;;
     kt_torchbf16) backend=kt_torchbf16 ;;
     kt_armbf16) backend=kt_armbf16 ;;
-    *) die "backend must be asym, torch, kt_torchbf16, or kt_armbf16, got '${backend_part}'" ;;
+    *) die "backend must be torch, asym, asym_torch, zero2, zero3, zero3_offload, superoffload, kt_torchbf16, or kt_armbf16, got '${backend_part}'" ;;
   esac
 
-  mapfile -t recompute_tokens < <(tokens "${recompute_part//\//,}")
+  mapfile -t recompute_tokens < <(tokens "${recompute_part}")
   ((${#recompute_tokens[@]} > 0)) || die "empty recompute mode in backend spec '${raw}'"
   for recompute_token in "${recompute_tokens[@]}"; do
-    mapfile -t recompute_modes_for_spec < <(recompute_values "${recompute_token}")
-    for recompute_mode in "${recompute_modes_for_spec[@]}"; do
-      printf '%s|%s\n' "${backend}" "${recompute_mode}"
-    done
+    if [[ "${recompute_token,,}" == "both" ]]; then
+      backend_specs_raw+=("${backend}|norecomp" "${backend}|recomp")
+      continue
+    fi
+    recompute_mode="$(recompute_label "${recompute_token}")"
+    backend_specs_raw+=("${backend}|${recompute_mode}")
   done
 }
 
@@ -443,6 +503,14 @@ profiler_label() {
   case "${1,,}" in
     source|nsys) printf '%s\n' "${1,,}" ;;
     *) die "profiler must be source or nsys, got '${1}'" ;;
+  esac
+}
+
+dist_launcher_label() {
+  case "${1,,}" in
+    torchrun) printf 'torchrun\n' ;;
+    accelerate|accelerate_launch) printf 'accelerate\n' ;;
+    *) die "dist launcher must be torchrun or accelerate, got '${1}'" ;;
   esac
 }
 
@@ -487,7 +555,8 @@ job_root_path() {
   local profiler="$3"
   local recompute="$4"
   local expert_policy="$5"
-  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}")"
+  local router_mode="$6"
+  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}")"
 }
 
 plot_workload_from_config_root() {
@@ -513,11 +582,21 @@ print_command() {
   printf '\n'
 }
 
+find_free_port() {
+  python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+}
+
 ensure_jobs_tsv() {
   local config_root="$1"
   mkdir -p "${config_root}"
   if [[ ! -e "${config_root}/jobs.tsv" ]]; then
-    printf 'status\tgpu\tseq_len\trecompute\texpert_policy\tbackend\tprofiler\tjob_dir\tprofile_json\tlog\n' > "${config_root}/jobs.tsv"
+    printf 'status\tgpu\tseq_len\trecompute\texpert_policy\trouter_mode\tbackend\tprofiler\tjob_dir\tprofile_json\tlog\n' > "${config_root}/jobs.tsv"
   fi
 }
 
@@ -526,7 +605,7 @@ append_job_record() {
   local status="$2"
   shift 2
   ensure_jobs_tsv "${config_root}"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${status}" "$@" >> "${config_root}/jobs.tsv"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${status}" "$@" >> "${config_root}/jobs.tsv"
 }
 
 plot_cmd_base() {
@@ -601,6 +680,12 @@ append_recompute_filters() {
   for recompute in "${recompute_modes[@]}"; do _cmd_ref+=(--recompute "${recompute}"); done
 }
 
+append_router_mode_filters() {
+  local -n _cmd_ref="$1"
+  local router_mode
+  for router_mode in "${plot_router_modes[@]}"; do _cmd_ref+=(--router-mode "${router_mode}"); done
+}
+
 append_fixed_profiler_filter() {
   local -n _cmd_ref="$1"
   local profiler="$2"
@@ -611,17 +696,20 @@ append_sweep_plot_filters() {
   append_backend_filters "$1"
   append_plot_profiler_filters "$1"
   append_recompute_filters "$1"
+  append_router_mode_filters "$1"
 }
 
 memory_plot_filters() {
   append_backend_filters "$1"
   append_fixed_profiler_filter "$1" source
+  append_router_mode_filters "$1"
 }
 
 interconnect_plot_filters() {
   append_backend_filters "$1"
   append_fixed_profiler_filter "$1" nsys
   append_recompute_filters "$1"
+  append_router_mode_filters "$1"
 }
 
 profiler_selected_for_plots() {
@@ -655,7 +743,7 @@ prepare_dataset_for_seq() {
 
   local -a tools_dir_arg=(--asym-dir "${ASYM_DIR}")
   if [[ "${selected_has_kt:-false}" == "true" && "${selected_has_asym:-false}" != "true" ]]; then
-    tools_dir_arg=(--kt-tools-dir "${KT_TOOLS_DIR}")
+    tools_dir_arg=(--asym-dir "${KT_TOOLS_DIR}")
   fi
 
   local -a dataset_cmd=(
@@ -691,6 +779,7 @@ prepare_dataset_for_seq() {
 gpu_spec="${GPU_POOL}"
 model_spec="${MODEL_SPECS}"
 backend_specs_spec="${BACKEND_SPECS}"
+router_mode_spec="${ROUTER_MODES}"
 profiler_spec="${PROFILERS}"
 seq_spec="${SEQ_LENS}"
 expert_policy_spec="${EXPERT_POLICIES}"
@@ -699,8 +788,6 @@ output_root="${OUTPUT_ROOT}"
 run_name="${RUN_NAME}"
 batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}"
 template_spec="${TEMPLATE}"
-lora_dropout_user_set=false
-[[ -n "${LORA_DROPOUT_ENV_SET}" ]] && lora_dropout_user_set=true
 kt_repo_dir_user_set=false
 [[ -n "${KT_REPO_DIR_ENV_SET}" ]] && kt_repo_dir_user_set=true
 
@@ -709,10 +796,14 @@ while (($#)); do
     -h|--help) usage; exit 0 ;;
     --gpus) need_value "$1" "${2-}"; gpu_spec="$2"; shift 2 ;;
     --gpus=*) gpu_spec="${1#*=}"; shift ;;
+    --dist-launcher) need_value "$1" "${2-}"; DIST_LAUNCHER="$(dist_launcher_label "$2")"; shift 2 ;;
+    --dist-launcher=*) DIST_LAUNCHER="$(dist_launcher_label "${1#*=}")"; shift ;;
     --models|--model-specs) collect_values "$1" vals "${@:2}"; model_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
     --models=*|--model-specs=*) model_spec="${1#*=}"; shift ;;
     --backend-specs) collect_values "$1" vals "${@:2}"; backend_specs_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
     --backend-specs=*) backend_specs_spec="${1#*=}"; shift ;;
+    --router-modes) need_value "$1" "${2-}"; router_mode_spec="$2"; ROUTER_MODES="$2"; shift 2 ;;
+    --router-modes=*) router_mode_spec="${1#*=}"; ROUTER_MODES="${1#*=}"; shift ;;
     --profilers) need_value "$1" "${2-}"; profiler_spec="$2"; shift 2 ;;
     --profilers=*) profiler_spec="${1#*=}"; shift ;;
     --seq-lens) need_value "$1" "${2-}"; seq_spec="$2"; shift 2 ;;
@@ -749,8 +840,8 @@ while (($#)); do
     --lora-alpha=*) LORA_ALPHA="${1#*=}"; shift ;;
     --seed) need_value "$1" "${2-}"; SEED="$2"; shift 2 ;;
     --seed=*) SEED="${1#*=}"; shift ;;
-    --lora-dropout) collect_values "$1" vals "${@:2}"; lora_dropout_spec="${vals[*]}"; LORA_DROPOUT="${lora_dropout_spec}"; lora_dropout_user_set=true; set -- "${REMAINING[@]}" ;;
-    --lora-dropout=*) lora_dropout_spec="${1#*=}"; LORA_DROPOUT="${lora_dropout_spec}"; lora_dropout_user_set=true; shift ;;
+    --lora-dropout) collect_values "$1" vals "${@:2}"; lora_dropout_spec="${vals[*]}"; LORA_DROPOUT="${lora_dropout_spec}"; set -- "${REMAINING[@]}" ;;
+    --lora-dropout=*) lora_dropout_spec="${1#*=}"; LORA_DROPOUT="${lora_dropout_spec}"; shift ;;
     --precision) need_value "$1" "${2-}"; PRECISION="$2"; shift 2 ;;
     --precision=*) PRECISION="${1#*=}"; shift ;;
     --profile-level) need_value "$1" "${2-}"; PROFILE_LEVEL="$2"; shift 2 ;;
@@ -773,12 +864,6 @@ while (($#)); do
     --profile-module-filter=*) PROFILE_MODULE_FILTER="${1#*=}"; shift ;;
     --torch-use-asym-gemm-lora) need_value "$1" "${2-}"; TORCH_USE_ASYM_GEMM_LORA="$(bool_value "$2")"; shift 2 ;;
     --torch-use-asym-gemm-lora=*) TORCH_USE_ASYM_GEMM_LORA="$(bool_value "${1#*=}")"; shift ;;
-    --torch-distributed-backend) need_value "$1" "${2-}"; TORCH_DISTRIBUTED_BACKEND="$2"; shift 2 ;;
-    --torch-distributed-backend=*) TORCH_DISTRIBUTED_BACKEND="${1#*=}"; shift ;;
-    --torch-fsdp-config) need_value "$1" "${2-}"; TORCH_FSDP_CONFIG="$2"; shift 2 ;;
-    --torch-fsdp-config=*) TORCH_FSDP_CONFIG="${1#*=}"; shift ;;
-    --torch-deepspeed-config) need_value "$1" "${2-}"; TORCH_DEEPSPEED_CONFIG="$2"; shift 2 ;;
-    --torch-deepspeed-config=*) TORCH_DEEPSPEED_CONFIG="${1#*=}"; shift ;;
     --kt-kernel-dir) need_value "$1" "${2-}"; KT_KERNEL_DIR="$2"; shift 2 ;;
     --kt-kernel-dir=*) KT_KERNEL_DIR="${1#*=}"; shift ;;
     --kt-tools-dir) need_value "$1" "${2-}"; KT_TOOLS_DIR="$2"; shift 2 ;;
@@ -819,6 +904,14 @@ while (($#)); do
     --kt-lora-expert-intermediate-size=*) KT_LORA_EXPERT_INTERMEDIATE_SIZE="${1#*=}"; shift ;;
     --check-kt-calls) need_value "$1" "${2-}"; CHECK_KT_CALLS="$(bool_value "$2")"; shift 2 ;;
     --check-kt-calls=*) CHECK_KT_CALLS="$(bool_value "${1#*=}")"; shift ;;
+    --deepspeed-dir) need_value "$1" "${2-}"; DEEPSPEED_DIR="$2"; shift 2 ;;
+    --deepspeed-dir=*) DEEPSPEED_DIR="${1#*=}"; shift ;;
+    --super-offload-deepspeed-config) need_value "$1" "${2-}"; SUPER_OFFLOAD_DEEPSPEED_CONFIG="$2"; shift 2 ;;
+    --super-offload-deepspeed-config=*) SUPER_OFFLOAD_DEEPSPEED_CONFIG="${1#*=}"; shift ;;
+    --super-offload-cpuadam-cores-perc) need_value "$1" "${2-}"; SUPER_OFFLOAD_CPUADAM_CORES_PERC="$2"; shift 2 ;;
+    --super-offload-cpuadam-cores-perc=*) SUPER_OFFLOAD_CPUADAM_CORES_PERC="${1#*=}"; shift ;;
+    --check-superoffload) need_value "$1" "${2-}"; CHECK_SUPEROFFLOAD="$(bool_value "$2")"; shift 2 ;;
+    --check-superoffload=*) CHECK_SUPEROFFLOAD="$(bool_value "${1#*=}")"; shift ;;
     --compare-losses) need_value "$1" "${2-}"; COMPARE_LOSSES="$(bool_value "$2")"; shift 2 ;;
     --compare-losses=*) COMPARE_LOSSES="$(bool_value "${1#*=}")"; shift ;;
     --compare-baseline-backend) need_value "$1" "${2-}"; COMPARE_BASELINE_BACKEND="$2"; shift 2 ;;
@@ -853,9 +946,12 @@ while (($#)); do
   esac
 done
 
+DIST_LAUNCHER="$(dist_launcher_label "${DIST_LAUNCHER}")"
+
 require_comma_list "--gpus/GPU_POOL" "${gpu_spec}"
 require_comma_list "--models/MODEL_SPECS" "${model_spec}"
 require_comma_list "--backend-specs/BACKEND_SPECS" "${backend_specs_spec}"
+require_comma_list "--router-modes/ROUTER_MODES" "${router_mode_spec}"
 require_comma_list "--profilers/PROFILERS" "${profiler_spec}"
 require_comma_list "--seq-lens/SEQ_LENS" "${seq_spec}"
 require_comma_list "--expert-policies/EXPERT_POLICIES" "${expert_policy_spec}"
@@ -891,6 +987,8 @@ OVERWRITE=$(bool_value "${OVERWRITE}")
 CONTINUE_ON_ERROR=$(bool_value "${CONTINUE_ON_ERROR}")
 DRY_RUN=$(bool_value "${DRY_RUN}")
 COLLECT_EXISTING=$(bool_value "${COLLECT_EXISTING}")
+CHECK_SUPEROFFLOAD=$(bool_value "${CHECK_SUPEROFFLOAD}")
+fraction_0_1 "--super-offload-cpuadam-cores-perc" "${SUPER_OFFLOAD_CPUADAM_CORES_PERC}"
 DATASET_MIN_TOKENS="${DATASET_MIN_TOKENS,,}"
 positive_int "--dataset-eval-rows" "${DATASET_EVAL_ROWS}"
 if [[ "${DATASET_MIN_TOKENS}" != "auto" ]]; then
@@ -903,10 +1001,7 @@ backend_specs_raw=()
 mapfile -t raw_backend_spec_tokens < <(tokens "${backend_specs_spec}")
 ((${#raw_backend_spec_tokens[@]} > 0)) || die "BACKEND_SPECS must include at least one backend|recompute spec"
 for value in "${raw_backend_spec_tokens[@]}"; do
-  expanded_backend_specs="$(expand_backend_spec "${value}")" || exit $?
-  while IFS= read -r expanded_backend_spec; do
-    [[ -n "${expanded_backend_spec}" ]] && backend_specs_raw+=("${expanded_backend_spec}")
-  done <<< "${expanded_backend_specs}"
+  append_backend_spec "${value}"
 done
 if ((${#backend_specs_raw[@]})); then
   mapfile -t backend_specs < <(printf '%s\n' "${backend_specs_raw[@]}" | dedupe)
@@ -916,26 +1011,35 @@ fi
 mapfile -t backends < <(printf '%s\n' "${backend_specs[@]}" | cut -d '|' -f1 | dedupe)
 mapfile -t backend_recompute_modes < <(printf '%s\n' "${backend_specs[@]}" | cut -d '|' -f2 | dedupe)
 recompute_modes=("${backend_recompute_modes[@]}")
+mapfile -t router_modes < <(tokens "${router_mode_spec}" | while read -r value; do router_mode_label "${value}"; done | dedupe)
+router_hf_selected=false
+router_whole_selected=false
+for router_mode in "${router_modes[@]}"; do
+  [[ "${router_mode}" == "hf" ]] && router_hf_selected=true
+  [[ "${router_mode}" == "whole" ]] && router_whole_selected=true
+done
 selected_has_asym=false
 selected_has_kt=false
-selected_has_torch=false
+selected_has_zero=false
+selected_has_superoffload=false
+selected_has_non_asym=false
 for backend in "${backends[@]}"; do
   case "${backend}" in
-    asym) selected_has_asym=true ;;
-    torch) selected_has_torch=true ;;
+    asym|asym_torch) selected_has_asym=true ;;
+    zero2|zero3|zero3_offload) selected_has_zero=true ;;
+    superoffload) selected_has_zero=true; selected_has_superoffload=true ;;
     kt_*) selected_has_kt=true ;;
   esac
+  case "${backend}" in
+    asym|asym_torch) ;;
+    *) selected_has_non_asym=true ;;
+  esac
 done
-selected_has_torch_multigpu=false
-if [[ "${selected_has_torch}" == "true" ]]; then
-  for model_spec_entry in "${model_specs[@]}"; do
-    parse_model_spec "${model_spec_entry}"
-    if ((parsed_model_gpu_count > 1)); then
-      selected_has_torch_multigpu=true
-      break
-    fi
-  done
+plot_router_modes=("${router_modes[@]}")
+if [[ "${router_whole_selected}" == "true" && "${selected_has_non_asym}" == "true" ]]; then
+  plot_router_modes+=("hf")
 fi
+mapfile -t plot_router_modes < <(printf '%s\n' "${plot_router_modes[@]}" | dedupe)
 if [[ "${selected_has_kt}" == "true" ]]; then
   KT_TP_ENABLED=$(bool_value "${KT_TP_ENABLED}")
   CHECK_KT_CALLS=$(bool_value "${CHECK_KT_CALLS}")
@@ -960,17 +1064,6 @@ if [[ -z "${output_root}" ]]; then
     output_root="${ASYM_DIR}/profiling"
   fi
 fi
-if [[ "${selected_has_kt}" == "true" && "${lora_dropout_user_set}" != "true" ]]; then
-  lora_dropout_spec="0.00"
-  mapfile -t lora_dropouts < <(tokens "${lora_dropout_spec}" | dedupe)
-  LORA_DROPOUT="${lora_dropouts[0]}"
-  lora_dropout_label_value="$(lora_dropout_label "${LORA_DROPOUT}")"
-fi
-if [[ "${selected_has_kt}" == "true" ]]; then
-  for value in "${lora_dropouts[@]}"; do
-    [[ "${value}" == "0.00" ]] || die "KT SFT profiling currently requires --lora-dropout 0.00; got '${value}'"
-  done
-fi
 mapfile -t profilers < <(tokens "${profiler_spec}" | while read -r value; do profiler_label "${value}"; done | dedupe)
 if printf '%s\n' "${profilers[@]}" | grep -qx 'nsys'; then
   plot_profilers=(nsys)
@@ -991,17 +1084,11 @@ for value in "${raw_expert_policies[@]}"; do
 done
 mapfile -t expert_policies < <(printf '%s\n' "${expert_policies[@]}" | dedupe)
 
-case "${TORCH_DISTRIBUTED_BACKEND,,}" in
-  fsdp2) TORCH_DISTRIBUTED_BACKEND=fsdp2 ;;
-  deepspeed|ds|zero3|z3) TORCH_DISTRIBUTED_BACKEND=deepspeed ;;
-  ddp) TORCH_DISTRIBUTED_BACKEND=ddp ;;
-  *) die "--torch-distributed-backend must be fsdp2, deepspeed, or ddp, got '${TORCH_DISTRIBUTED_BACKEND}'" ;;
-esac
-
 ((${#gpus[@]})) || die "GPU pool is empty"
 ((${#model_specs[@]})) || die "model spec list is empty"
 ((${#backend_specs[@]})) || die "backend spec list is empty"
 ((${#backends[@]})) || die "backend list is empty"
+((${#router_modes[@]})) || die "router mode list is empty"
 ((${#profilers[@]})) || die "profiler list is empty"
 ((${#seq_lens[@]})) || die "sequence length list is empty"
 for seq_len in "${seq_lens[@]}"; do
@@ -1024,11 +1111,12 @@ fi
 if [[ "${PREPARE_DATASETS}" == "true" && "${DRY_RUN}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
   [[ -x "${ENV_PYTHON}" ]] || die "missing executable LF Python at ${ENV_PYTHON}"
 fi
-if [[ "${selected_has_torch_multigpu}" == "true" && "${TORCH_DISTRIBUTED_BACKEND}" == "fsdp2" ]]; then
-  [[ -f "${TORCH_FSDP_CONFIG}" ]] || die "missing torch FSDP2 accelerate config ${TORCH_FSDP_CONFIG}"
-fi
-if [[ "${selected_has_torch_multigpu}" == "true" && "${TORCH_DISTRIBUTED_BACKEND}" == "deepspeed" ]]; then
-  [[ -f "${TORCH_DEEPSPEED_CONFIG}" ]] || die "missing torch DeepSpeed config ${TORCH_DEEPSPEED_CONFIG}"
+if [[ "${selected_has_zero}" == "true" ]]; then
+  for backend in "${backends[@]}"; do
+    if is_zero_backend "${backend}" && [[ "${backend}" != "superoffload" ]]; then
+      [[ -f "$(zero_deepspeed_config "${backend}")" ]] || die "missing DeepSpeed config for ${backend}: $(zero_deepspeed_config "${backend}")"
+    fi
+  done
 fi
 compare_baseline_backend="$(backend_label "${COMPARE_BASELINE_BACKEND}")"
 mapfile -t compare_candidate_backends < <(tokens "${COMPARE_CANDIDATE_BACKEND}" | while read -r value; do backend_label "${value}"; done | dedupe)
@@ -1038,6 +1126,21 @@ for compare_candidate_backend in "${compare_candidate_backends[@]}"; do
 done
 
 base_output_root="$(abs_path "${output_root}")"
+if [[ "${selected_has_superoffload}" == "true" ]]; then
+  [[ -f "${SUPER_OFFLOAD_CONFIG_RENDERER}" ]] || die "missing ${SUPER_OFFLOAD_CONFIG_RENDERER}"
+  [[ -f "$(zero_deepspeed_config zero3_offload)" ]] || die "missing base DeepSpeed offload config: $(zero_deepspeed_config zero3_offload)"
+  [[ -f "${DEEPSPEED_DIR}/deepspeed/runtime/superoffload/superoffload_stage3.py" ]] || die "missing local SuperOffload DeepSpeed tree at ${DEEPSPEED_DIR}"
+  if [[ -z "${SUPER_OFFLOAD_DEEPSPEED_CONFIG}" ]]; then
+    SUPER_OFFLOAD_DEEPSPEED_CONFIG="${base_output_root}/deepspeed/ds_z3_superoffload_config.json"
+  else
+    SUPER_OFFLOAD_DEEPSPEED_CONFIG="$(abs_path "${SUPER_OFFLOAD_DEEPSPEED_CONFIG}")"
+  fi
+  python3 "${SUPER_OFFLOAD_CONFIG_RENDERER}" \
+    --base "$(zero_deepspeed_config zero3_offload)" \
+    --output "${SUPER_OFFLOAD_DEEPSPEED_CONFIG}" \
+    --cpuadam-cores-perc "${SUPER_OFFLOAD_CPUADAM_CORES_PERC}"
+  [[ -f "${SUPER_OFFLOAD_DEEPSPEED_CONFIG}" ]] || die "failed to render ${SUPER_OFFLOAD_DEEPSPEED_CONFIG}"
+fi
 precision_label="$(safe_label "${PRECISION}")"
 dataset_root_label="$(safe_label "${DATASET}")"
 [[ -n "${dataset_root_label}" ]] || die "--dataset must not be empty"
@@ -1063,48 +1166,58 @@ current_child_pid_file=""
 current_wait_pid=""
 
 child_process_alive() {
-  local pid="$1"
-  kill -0 "-${pid}" 2>/dev/null || kill -0 "${pid}" 2>/dev/null
+  local target_pid
+  for target_pid in "$@"; do
+    [[ "${target_pid}" =~ ^[0-9]+$ ]] || continue
+    if kill -0 "-${target_pid}" 2>/dev/null || kill -0 "${target_pid}" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
 }
 
-kill_current_child() {
-  local base_pid="${current_child_pid:-}"
-  local wait_pid="${current_wait_pid:-}"
+signal_child_targets() {
+  local signal_name="$1"
+  shift
+  local target_pid
+  for target_pid in "$@"; do
+    [[ "${target_pid}" =~ ^[0-9]+$ ]] || continue
+    kill "-${signal_name}" "-${target_pid}" 2>/dev/null || true
+    kill "-${signal_name}" "${target_pid}" 2>/dev/null || true
+  done
+}
+
+current_child_targets() {
   local file_pid="" target_pid
   if [[ -n "${current_child_pid_file:-}" && -s "${current_child_pid_file}" ]]; then
     IFS= read -r file_pid < "${current_child_pid_file}" || true
   fi
+  for target_pid in "${file_pid}" "${current_child_pid:-}" "${current_wait_pid:-}"; do
+    [[ "${target_pid}" =~ ^[0-9]+$ ]] && printf '%s\n' "${target_pid}"
+  done | awk 'NF && !seen[$0]++'
+}
+
+kill_current_child() {
+  local -a target_pids=()
+  mapfile -t target_pids < <(current_child_targets)
   rm -f "${current_child_pid_file:-}" 2>/dev/null || true
 
-  [[ -n "${base_pid}" || -n "${file_pid}" || -n "${wait_pid}" ]] || return 0
-
-  for target_pid in "${base_pid}" "${file_pid}" "${wait_pid}"; do
-    [[ -n "${target_pid}" ]] || continue
-    kill -INT "-${target_pid}" 2>/dev/null || true
-    kill -INT "${target_pid}" 2>/dev/null || true
-  done
+  ((${#target_pids[@]} > 0)) || return 0
+  signal_child_targets INT "${target_pids[@]}"
 
   if [[ "${INTERRUPT_GRACE_SECONDS}" != "0" ]]; then
     sleep "${INTERRUPT_GRACE_SECONDS}" || true
   fi
-
-  for target_pid in "${base_pid}" "${file_pid}" "${wait_pid}"; do
-    [[ -n "${target_pid}" ]] || continue
-    child_process_alive "${target_pid}" || continue
-    kill -TERM "-${target_pid}" 2>/dev/null || true
-    kill -TERM "${target_pid}" 2>/dev/null || true
-  done
+  if child_process_alive "${target_pids[@]}"; then
+    signal_child_targets TERM "${target_pids[@]}"
+  fi
 
   if [[ "${INTERRUPT_GRACE_SECONDS}" != "0" ]]; then
     sleep "${INTERRUPT_GRACE_SECONDS}" || true
   fi
-
-  for target_pid in "${base_pid}" "${file_pid}" "${wait_pid}"; do
-    [[ -n "${target_pid}" ]] || continue
-    child_process_alive "${target_pid}" || continue
-    kill -KILL "-${target_pid}" 2>/dev/null || true
-    kill -KILL "${target_pid}" 2>/dev/null || true
-  done
+  if child_process_alive "${target_pids[@]}"; then
+    signal_child_targets KILL "${target_pids[@]}"
+  fi
 }
 
 cleanup_on_exit() {
@@ -1117,10 +1230,10 @@ run_tracked_command() {
   local status=0 wait_pid="" child_pid="" pid_file="" attempt
   current_child_pid=""
   current_wait_pid=""
-  if command -v setsid >/dev/null 2>&1 && setsid --help 2>&1 | grep -q -- '--wait'; then
+  if command -v setsid >/dev/null 2>&1 && setsid --help 2>&1 | grep -q -- '--wait' && setsid --help 2>&1 | grep -q -- '--fork'; then
     pid_file="$(mktemp "${TMPDIR:-/tmp}/profile_lora_lf_child.XXXXXX")"
     current_child_pid_file="${pid_file}"
-    setsid --wait bash -c 'pid_file="$1"; shift; echo "$$" > "${pid_file}"; exec "$@"' _ "${pid_file}" "$@" &
+    setsid --fork --wait bash -c 'pid_file="$1"; shift; echo "$$" > "${pid_file}"; exec "$@"' _ "${pid_file}" "$@" &
     wait_pid=$!
     current_wait_pid="${wait_pid}"
     current_child_pid="${wait_pid}"
@@ -1170,7 +1283,7 @@ run_tracked_command() {
 run_tracked_command_logged() {
   local log_file="$1"
   shift
-  run_tracked_command bash -o pipefail -c 'log_file="$1"; shift; "$@" 2>&1 | tee -a "${log_file}"' _ "${log_file}" "$@"
+  run_tracked_command "$@" > >(tee -a "${log_file}") 2>&1
 }
 
 handle_interrupt() {
@@ -1198,23 +1311,29 @@ run_job() {
   local gpu="$5"
   local gpu_count="$6"
   local expert_policy="$7"
-  local dataset_name="$8"
+  local router_mode="$8"
+  local dataset_name="$9"
   local gradient_checkpointing=false
   [[ "${recompute}" == "recomp" ]] && gradient_checkpointing=true
 
   local config_root job_root seq_root source_profile lf_out log_file run_id profile_json
   config_root="$(config_root_path "${seq_len}")"
-  job_root="$(job_root_path "${config_root}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}")"
+  job_root="$(job_root_path "${config_root}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${router_mode}")"
   seq_root="${job_root}/s${seq_len}"
   source_profile="${seq_root}/source_profile.json"
   lf_out="${seq_root}/lf_run"
   log_file="${seq_root}/train.log"
-  run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_s${seq_len}_${lora_dropout_label_value}"
+  run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_router${router_mode}_s${seq_len}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
-  local group_key="${config_root}|${profiler}|${recompute}|${expert_policy}|${seq_len}"
+  local group_key="${config_root}|${profiler}|${recompute}|${expert_policy}|${router_mode}|${seq_len}"
   local profile_memory_attribution profile_memory_breakdown
+  local master_port
   profile_memory_attribution="$(profile_memory_flag_for_profiler "--profile-memory-attribution" "${PROFILE_MEMORY_ATTRIBUTION}" "${profiler}")"
   profile_memory_breakdown="$(profile_memory_flag_for_profiler "--profile-memory-breakdown" "${PROFILE_MEMORY_BREAKDOWN}" "${profiler}")"
+  master_port="${MASTER_PORT:-}"
+  if [[ -z "${master_port}" ]]; then
+    master_port="$(find_free_port)"
+  fi
 
   plot_roots["${config_root}"]="${seq_len}"
   if [[ "${profile_memory_breakdown}" == "true" ]]; then
@@ -1227,14 +1346,14 @@ run_job() {
     compare_groups["${group_key}"]=1
     compare_group_keys+=("${group_key}")
     compare_group_config_roots["${group_key}"]="${config_root}"
-    compare_group_labels["${group_key}"]="dropout=${LORA_DROPOUT} profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} seq_len=${seq_len}"
+    compare_group_labels["${group_key}"]="dropout=${LORA_DROPOUT} profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} router_mode=${router_mode} seq_len=${seq_len}"
   fi
 
   if [[ "${DRY_RUN}" != "true" && -e "${profile_json}" && "${OVERWRITE}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
     echo "Skipping existing: ${profile_json}"
     run_dirs["${group_key}|${backend}"]="${lf_out}"
     append_job_record "${config_root}" skipped \
-      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
     return 0
   fi
 
@@ -1255,6 +1374,11 @@ run_job() {
     ENV_DIR="${ENV_DIR}"
     CONDA_EXE="${CONDA_EXE}"
     NSYS_BIN="${NSYS_BIN}"
+    DIST_LAUNCHER="${DIST_LAUNCHER}"
+    DEEPSPEED_DIR="${DEEPSPEED_DIR}"
+    SUPER_OFFLOAD_DEEPSPEED_CONFIG="${SUPER_OFFLOAD_DEEPSPEED_CONFIG}"
+    SUPER_OFFLOAD_CPUADAM_CORES_PERC="${SUPER_OFFLOAD_CPUADAM_CORES_PERC}"
+    CHECK_SUPEROFFLOAD="${CHECK_SUPEROFFLOAD}"
     MODEL_NAME_OR_PATH="${current_model_name}"
     BACKEND="${backend}"
     GPU_ID="${gpu}"
@@ -1276,6 +1400,7 @@ run_job() {
     ASYM_PRECISION="${PRECISION}"
     ASYM_OFFLOAD_MODULES="${ASYM_OFFLOAD_MODULES}"
     ASYM_EXPERT_RECOMPUTE_POLICY="${expert_policy}"
+    ASYM_ROUTER_MODE="${router_mode}"
     ASYM_STRICT="${ASYM_STRICT}"
     TORCH_USE_ASYM_GEMM_LORA="${TORCH_USE_ASYM_GEMM_LORA}"
     PROFILE=1
@@ -1299,24 +1424,22 @@ run_job() {
     PROFILE_WORKLOAD_LABEL="${workload_label}"
     PROFILE_BACKEND_LABEL="${backend}"
     PROFILE_EXPERT_POLICY="${expert_policy}"
+    INTERRUPT_GRACE_SECONDS="${INTERRUPT_GRACE_SECONDS}"
     PROFILE_WARMUP_STEPS="${WARMUP_STEPS}"
     PROFILE_MEASURE_STEPS="${MAX_STEPS}"
     PROFILE_TOTAL_STEPS="${TOTAL_STEPS}"
+    MASTER_PORT="${master_port}"
     ASYM_GEMM_LF_CONFIG_WARMUP_STEPS="${WARMUP_STEPS}"
     ASYM_GEMM_LF_CONFIG_MEASURE_STEPS="${MAX_STEPS}"
     ASYM_GEMM_LF_CONFIG_TOTAL_STEPS="${TOTAL_STEPS}"
+    ASYM_GEMM_LF_CONFIG_DEEPSPEED_DIR="${DEEPSPEED_DIR}"
+    ASYM_GEMM_LF_CONFIG_SUPEROFFLOAD_CONFIG="${SUPER_OFFLOAD_DEEPSPEED_CONFIG}"
+    ASYM_GEMM_LF_CONFIG_SUPEROFFLOAD_CPUADAM_CORES_PERC="${SUPER_OFFLOAD_CPUADAM_CORES_PERC}"
     OUT_DIR="${lf_out}"
     LOG_FILE="${log_file}"
     LOSS_LOG_COPY="${seq_root}/loss.trainer_log.jsonl"
     RUN_ID="${run_id}"
   )
-  if [[ "${backend}" == "torch" ]]; then
-    run_env+=(
-      TORCH_DISTRIBUTED_BACKEND="${TORCH_DISTRIBUTED_BACKEND}"
-      TORCH_FSDP_CONFIG="${TORCH_FSDP_CONFIG}"
-      TORCH_DEEPSPEED_CONFIG="${TORCH_DEEPSPEED_CONFIG}"
-    )
-  fi
   if [[ "${backend}" == kt_* ]]; then
     run_env+=(
       KT_TOOLS_DIR="${KT_TOOLS_DIR}"
@@ -1344,10 +1467,18 @@ run_job() {
 
   local -a run_cmd=(env "${run_env[@]}" "${RUN_LF_SCRIPT}")
 
-  echo "Running backend=${backend} profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} seq=${seq_len} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
+  echo "Running backend=${backend} profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} router_mode=${router_mode} seq=${seq_len} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
   echo "  dir=${seq_root}"
   if [[ "${DRY_RUN}" == "true" ]]; then
     print_command "${run_cmd[@]}"
+    mkdir -p "${seq_root}"
+    ensure_jobs_tsv "${config_root}"
+    {
+      print_command "${run_cmd[@]}"
+    } > "${seq_root}/command.txt"
+    run_dirs["${group_key}|${backend}"]="${lf_out}"
+    append_job_record "${config_root}" dry-run \
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
     return 0
   fi
 
@@ -1377,9 +1508,9 @@ run_job() {
   if ((status == 0)); then
     run_dirs["${group_key}|${backend}"]="${lf_out}"
     append_job_record "${config_root}" ok \
-      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
     if profiler_selected_for_plots "${profiler}"; then
-      plot_single_run "${config_root}" "${seq_len}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${seq_root}"
+      plot_single_run "${config_root}" "${seq_len}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${seq_root}"
       plot_running_combined "${config_root}" "${seq_len}" "${seq_root}"
     fi
     if [[ "${profile_memory_breakdown}" == "true" ]]; then
@@ -1388,7 +1519,7 @@ run_job() {
     fi
   else
     append_job_record "${config_root}" "failed:${status}" \
-      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
   fi
   return "${status}"
 }
@@ -1431,9 +1562,10 @@ compare_config_root() {
       config_root="${compare_group_config_roots[${group_key}]}"
       [[ "${config_root}" == "${target_config_root}" ]] || continue
       group_tail="${group_key%|*}"
+      group_tail="${group_tail%|*}"
       group_expert_policy="${group_tail##*|}"
-      if [[ "${group_expert_policy}" != "none" && ( "${compare_baseline_backend}" == torch* || "${compare_candidate_backend}" == torch* || "${compare_baseline_backend}" == kt_* || "${compare_candidate_backend}" == kt_* ) ]]; then
-        echo "Skipping loss comparison for ${compare_group_labels[${group_key}]}; torch/KT backends are policy-independent."
+      if [[ "${group_expert_policy}" != "none" ]] && { is_policy_independent_backend "${compare_baseline_backend}" || is_policy_independent_backend "${compare_candidate_backend}"; }; then
+        echo "Skipping loss comparison for ${compare_group_labels[${group_key}]}; torch/zero/SuperOffload/KT backends are policy-independent."
         continue
       fi
       baseline_dir="${run_dirs[${group_key}|${compare_baseline_backend}]-}"
@@ -1523,7 +1655,8 @@ plot_single_run() {
   local profiler="$4"
   local recompute="$5"
   local expert_policy="$6"
-  local seq_root="$7"
+  local router_mode="$7"
+  local seq_root="$8"
   local plot_root
   [[ "${PLOT}" == "true" ]] || return 0
   ((${#plot_profilers[@]})) || return 0
@@ -1537,6 +1670,7 @@ plot_single_run() {
     --backend "${backend}"
     --profiler "${profiler}"
     --recompute "${recompute}"
+    --router-mode "${router_mode}"
   )
   echo "Writing LF per-run plots: ${plot_root}"
   if ! run_tracked_command "${plot_cmd[@]}"; then
@@ -1623,7 +1757,7 @@ This config root is organized as follows:
 - \`memory_combined/\`: config-level source-memory breakdown plots. If no source-memory rows were collected, this folder contains a README explaining why.
 - \`c2c_combined/\`: config-level C2C/CTC saturation plots from Nsight GPU metrics. If old traces lack GPU metrics, this folder contains a README explaining why.
 - \`comparisons/\`: loss comparison artifacts, when loss comparison is enabled.
-- \`<backend>__<profiler>__<recompute>__pol<policy>/s<seq>/\`: per-run artifacts.
+- \`<backend>__<profiler>__<recompute>__pol<policy>__router<mode>/s<seq>/\`: per-run artifacts.
 
 If \`PLOT_OUTPUT_DIR\` is set, combined plot folders are written under that external plot output root instead of this config root.
 
@@ -1867,23 +2001,34 @@ for model_spec_entry in "${model_specs[@]}"; do
       LORA_DROPOUT="${lora_dropout}"
       lora_dropout_label_value="$(lora_dropout_label "${LORA_DROPOUT}")"
       config_root="$(config_root_path "${seq_len}")"
-      for expert_policy in "${expert_policies[@]}"; do
-        for backend_recompute in "${backend_specs[@]}"; do
-          backend="${backend_recompute%%|*}"
-          recompute="${backend_recompute##*|}"
-          for profiler in "${profilers[@]}"; do
-            if [[ ( "${backend}" == torch* || "${backend}" == kt_* ) && "${expert_policy}" != "none" ]]; then
-              echo "Skipping backend=${backend} expert_policy=${expert_policy}; torch/KT backends are policy-independent."
-              continue
-            fi
-            gpu_count="$(backend_gpu_count "${backend}" "${current_model_gpu_count}")"
-            gpu="$(gpu_slice "${gpu_count}")"
-            if ! run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${current_dataset}"; then
-              failures=$((failures + 1))
-              if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
-                exit 1
+      for router_mode in "${router_modes[@]}"; do
+        for expert_policy in "${expert_policies[@]}"; do
+          for backend_recompute in "${backend_specs[@]}"; do
+            backend="${backend_recompute%%|*}"
+            recompute="${backend_recompute##*|}"
+            for profiler in "${profilers[@]}"; do
+              job_router_mode="${router_mode}"
+              if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" ]]; then
+                if [[ "${router_hf_selected}" != "true" ]]; then
+                  job_router_mode=hf
+                else
+                  echo "Skipping backend=${backend} router_mode=${router_mode}; owned routing requires an AsymGEMM backend."
+                  continue
+                fi
               fi
-            fi
+              if is_policy_independent_backend "${backend}" && [[ "${expert_policy}" != "none" ]]; then
+                echo "Skipping backend=${backend} expert_policy=${expert_policy}; torch/zero/SuperOffload/KT backends are policy-independent."
+                continue
+              fi
+              gpu_count="$(backend_gpu_count "${backend}" "${current_model_gpu_count}")"
+              gpu="$(gpu_slice "${gpu_count}")"
+              if ! run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}"; then
+                failures=$((failures + 1))
+                if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
+                  exit 1
+                fi
+              fi
+            done
           done
         done
       done

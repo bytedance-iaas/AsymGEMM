@@ -21,7 +21,14 @@ from asym_gemm.training.lora import (
     lora_parameters,
 )
 from asym_gemm.training.moe import parse_expert_recompute_policy_spec
-from asym_gemm.training.qwen3_moe import AsymQwen3Experts, is_qwen3_experts, wrap_qwen3_experts
+from asym_gemm.training.qwen3_moe import (
+    AsymQwen3Experts,
+    AsymQwen3MoeBlock,
+    is_qwen3_experts,
+    is_qwen3_moe_block,
+    wrap_qwen3_experts,
+    wrap_qwen3_moe_block,
+)
 from asym_gemm.training.llama4_moe import AsymLlama4Moe, is_llama4_moe, wrap_llama4_moe
 
 
@@ -31,12 +38,15 @@ ASYM_LF_ADAPTER_FORMAT = "asym_gemm_lf_v1"
 @dataclass
 class LFAsymReport:
     packed_experts_wrapped: int = 0
+    qwen3_moes_wrapped: int = 0
     llama4_moes_wrapped: int = 0
     dense_lora_wrapped: int = 0
     trainable_lora_params: int = 0
     cpu_resident_base_bytes: int = 0
     gpu_resident_base_bytes: int = 0
     expert_recompute_policy: str = "none"
+    router_mode: str = "whole"
+    router_no_grad: bool = False
     skipped: list[str] = field(default_factory=list)
     stats: AsymExecutionStats | None = field(default=None, repr=False)
 
@@ -55,6 +65,9 @@ class LFAsymReport:
             f"cpu_resident_base_bytes={self.cpu_resident_base_bytes}, "
             f"gpu_resident_base_bytes={self.gpu_resident_base_bytes}, "
             f"expert_recompute_policy={self.expert_recompute_policy}, "
+            f"router_mode={self.router_mode}, "
+            f"router_no_grad={self.router_no_grad}, "
+            f"qwen3_moes_wrapped={self.qwen3_moes_wrapped}, "
             f"skipped={skipped}"
         )
 
@@ -73,6 +86,8 @@ class LFAsymReport:
             f"torch_forward_calls={self.stats.torch_forward_calls}, "
             f"torch_dx_calls={self.stats.torch_dx_calls}, "
             f"expert_recompute_policy={self.expert_recompute_policy}, "
+            f"router_mode={self.router_mode}, "
+            f"router_no_grad={self.router_no_grad}, "
             f"reference_fallback_count={self.stats.reference_fallback_count}, "
             f"fallback_reasons={fallbacks}"
         )
@@ -207,7 +222,9 @@ def count_lora_wrapped_modules(model: nn.Module) -> int:
     return sum(
         1
         for module in model.modules()
-        if hasattr(module, "lora_A") and hasattr(module, "lora_B") and not isinstance(module, AsymQwen3Experts)
+        if hasattr(module, "lora_A")
+        and hasattr(module, "lora_B")
+        and not isinstance(module, (AsymQwen3Experts, AsymQwen3MoeBlock))
     )
 
 
@@ -223,6 +240,7 @@ def apply_lf_asym_lora(
     precision: Literal["bf16"],
     offload_modules: Literal["routed_experts", "none"],
     expert_recompute_policy: str = "none",
+    router_mode: Literal["hf", "whole"] = "whole",
     wrap_dense: bool = True,
     preexisting_dense_lora_wrapped: int = 0,
     strict: bool = True,
@@ -233,9 +251,17 @@ def apply_lf_asym_lora(
         raise ValueError("AsymGEMM LLaMA-Factory integration supports bf16 only")
     if offload_modules not in {"routed_experts", "none"}:
         raise ValueError("offload_modules must be 'routed_experts' or 'none'")
+    if router_mode not in {"hf", "whole"}:
+        raise ValueError("router_mode must be 'hf' or 'whole'")
+    if router_mode == "whole" and bool(getattr(getattr(model, "config", None), "output_router_logits", False)):
+        raise ValueError("asym_router_mode=whole requires output_router_logits=False.")
 
     recompute_config = parse_expert_recompute_policy_spec(expert_recompute_policy)
-    report = LFAsymReport(expert_recompute_policy=recompute_config.label)
+    report = LFAsymReport(
+        expert_recompute_policy=recompute_config.label,
+        router_mode=router_mode,
+        router_no_grad=router_mode == "whole",
+    )
     report.dense_lora_wrapped = int(preexisting_dense_lora_wrapped)
     stats = AsymExecutionStats()
     report.stats = stats
@@ -244,45 +270,88 @@ def apply_lf_asym_lora(
 
     expert_replacements: list[tuple[str, nn.Module, nn.Module, str]] = []
     if wrap_experts:
-        for name, module in list(model.named_modules()):
-            if is_qwen3_experts(module):
-                family = _packed_expert_family(module)
-                wrapped = wrap_qwen3_experts(
-                    module,
-                    backend=backend,
-                    precision=precision,
-                    offload=offload_experts,
-                    lora_rank=lora_rank,
-                    lora_alpha=lora_alpha,
-                    lora_dropout=lora_dropout,
-                    lora_dtype=torch.bfloat16,
-                    expert_recompute_policy=recompute_config.label,
-                    stats=stats,
-                    strict=strict,
-                )
-                wrapped.asym_expert_family = family
-                if family == "gemma4":
-                    wrapped.profile_prefix = _gemma4_profile_prefix_from_module_name(name)
-                else:
-                    wrapped.profile_prefix = _qwen3_profile_prefix_from_module_name(name)
-                expert_replacements.append((name, module, wrapped, name))
-            elif is_llama4_moe(module):
-                wrapped = wrap_llama4_moe(
-                    module,
-                    backend=backend,
-                    precision=precision,
-                    offload=offload_experts,
-                    lora_rank=lora_rank,
-                    lora_alpha=lora_alpha,
-                    lora_dropout=lora_dropout,
-                    lora_dtype=torch.bfloat16,
-                    expert_recompute_policy=recompute_config.label,
-                    stats=stats,
-                    strict=strict,
-                )
-                wrapped.profile_prefix = _llama4_profile_prefix_from_module_name(name)
-                wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
-                expert_replacements.append((name, module, wrapped, f"{name}.experts"))
+        if router_mode == "whole":
+            for name, module in list(model.named_modules()):
+                if is_qwen3_moe_block(module):
+                    wrapped = wrap_qwen3_moe_block(
+                        module,
+                        backend=backend,
+                        precision=precision,
+                        offload=offload_experts,
+                        lora_rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=lora_dropout,
+                        lora_dtype=torch.bfloat16,
+                        expert_recompute_policy=recompute_config.label,
+                        router_mode="whole",
+                        router_debug_grad=False,
+                        stats=stats,
+                        strict=strict,
+                    )
+                    wrapped.profile_prefix = _layer_profile_prefix_from_module_name(name, "mlp")
+                    wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
+                    expert_replacements.append((name, module, wrapped, f"{name}.experts"))
+                elif is_llama4_moe(module):
+                    wrapped = wrap_llama4_moe(
+                        module,
+                        backend=backend,
+                        precision=precision,
+                        offload=offload_experts,
+                        lora_rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=lora_dropout,
+                        lora_dtype=torch.bfloat16,
+                        expert_recompute_policy=recompute_config.label,
+                        router_mode="whole",
+                        router_debug_grad=False,
+                        stats=stats,
+                        strict=strict,
+                    )
+                    wrapped.profile_prefix = _llama4_profile_prefix_from_module_name(name)
+                    wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
+                    expert_replacements.append((name, module, wrapped, f"{name}.experts"))
+        else:
+            for name, module in list(model.named_modules()):
+                if is_qwen3_experts(module):
+                    family = _packed_expert_family(module)
+                    wrapped = wrap_qwen3_experts(
+                        module,
+                        backend=backend,
+                        precision=precision,
+                        offload=offload_experts,
+                        lora_rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=lora_dropout,
+                        lora_dtype=torch.bfloat16,
+                        expert_recompute_policy=recompute_config.label,
+                        stats=stats,
+                        strict=strict,
+                    )
+                    wrapped.asym_expert_family = family
+                    if family == "gemma4":
+                        wrapped.profile_prefix = _gemma4_profile_prefix_from_module_name(name)
+                    else:
+                        wrapped.profile_prefix = _qwen3_profile_prefix_from_module_name(name)
+                    expert_replacements.append((name, module, wrapped, name))
+                elif is_llama4_moe(module):
+                    wrapped = wrap_llama4_moe(
+                        module,
+                        backend=backend,
+                        precision=precision,
+                        offload=offload_experts,
+                        lora_rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=lora_dropout,
+                        lora_dtype=torch.bfloat16,
+                        expert_recompute_policy=recompute_config.label,
+                        router_mode="hf",
+                        router_debug_grad=False,
+                        stats=stats,
+                        strict=strict,
+                    )
+                    wrapped.profile_prefix = _llama4_profile_prefix_from_module_name(name)
+                    wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
+                    expert_replacements.append((name, module, wrapped, f"{name}.experts"))
 
         if not expert_replacements and strict:
             raise ValueError("AsymGEMM requested routed expert LoRA but found no supported packed expert/MoE modules.")
@@ -292,6 +361,8 @@ def apply_lf_asym_lora(
             _replace_child(parent, child_name, new_module)
             if isinstance(new_module, AsymLlama4Moe):
                 report.llama4_moes_wrapped += 1
+            elif isinstance(new_module, AsymQwen3MoeBlock):
+                report.qwen3_moes_wrapped += 1
             else:
                 report.packed_experts_wrapped += 1
             report.cpu_resident_base_bytes += new_module.cpu_resident_base_bytes
@@ -371,12 +442,29 @@ def _infer_adapter_config(model: nn.Module, metadata: Mapping[str, Any] | None) 
         "asym_adapter_format": ASYM_LF_ADAPTER_FORMAT,
     }
     for module in model.modules():
+        if isinstance(module, AsymQwen3MoeBlock):
+            config.update(
+                {
+                    "asym_expert_format": "qwen3_owned_moe",
+                    "asym_expert_family": "qwen3",
+                    "asym_router_mode": "whole",
+                    "r": module.experts.lora_rank,
+                    "lora_alpha": module.experts.lora_alpha,
+                    "lora_dropout": module.experts.lora_dropout_p,
+                    "asym_backend": module.backend,
+                    "asym_precision": module.precision,
+                    "asym_offload_modules": "routed_experts" if module.offload else "none",
+                    "asym_expert_recompute_policy": module.experts.expert_recompute_config.label,
+                }
+            )
+            break
         if isinstance(module, AsymQwen3Experts):
             family = getattr(module, "asym_expert_family", "qwen3")
             config.update(
                 {
                     "asym_expert_format": "packed_gate_up_down",
                     "asym_expert_family": family,
+                    "asym_router_mode": "hf",
                     "r": module.lora_rank,
                     "lora_alpha": module.lora_alpha,
                     "lora_dropout": module.lora_dropout_p,
@@ -392,6 +480,7 @@ def _infer_adapter_config(model: nn.Module, metadata: Mapping[str, Any] | None) 
                 {
                     "asym_expert_format": "llama4_packed_moe",
                     "asym_expert_family": "llama4",
+                    "asym_router_mode": module.router_mode,
                     "r": module.experts.lora_rank,
                     "lora_alpha": module.experts.lora_alpha,
                     "lora_dropout": module.experts.lora_dropout_p,

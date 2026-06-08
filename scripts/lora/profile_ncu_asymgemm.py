@@ -22,10 +22,10 @@ DEFAULT_LORA_BATCH_SIZE = 32
 DEFAULT_LORA_SEQ_LEN = 64
 DEFAULT_LORA_HIDDEN_DIM = 1024
 DEFAULT_LORA_MLP_EXPANSION = 4
-DEFAULT_DENSE_TARGET_MODE = "all"
+DEFAULT_TARGET_PRESET = "all"
 DEFAULT_TARGET_MODULES = "all"
 DEFAULT_OFFLOAD_MODULES = ""
-DENSE_TARGET_MODES = ("mlp_only", "attention_only", "all")
+TARGET_PRESETS = ("mlp_only", "attention_only", "all")
 LORA_DTYPE_CHOICES = ("bf16", "bfloat16", "fp16", "float16", "fp32", "float32")
 
 
@@ -86,19 +86,19 @@ def main() -> None:
     parser.add_argument("--hf-cache-dir", default="")
     parser.add_argument("--hf-local-files-only", action="store_true")
     parser.add_argument("--profile-seed", type=int, default=1234)
-    parser.add_argument("--target-preset", "--dense-target-mode", dest="dense_target_mode", choices=DENSE_TARGET_MODES, default=DEFAULT_DENSE_TARGET_MODE)
+    parser.add_argument("--target-preset", choices=TARGET_PRESETS, default=DEFAULT_TARGET_PRESET)
     parser.add_argument("--target-modules", default=DEFAULT_TARGET_MODULES)
     parser.add_argument("--offload-modules", default=DEFAULT_OFFLOAD_MODULES)
-    parser.add_argument("--profile-layers", "--real-profile-layers", dest="profile_layers", type=int, default=1)
-    parser.add_argument("--batch-size", "--real-batch-size", dest="batch_size", type=int, default=DEFAULT_LORA_BATCH_SIZE)
-    parser.add_argument("--seq-len", "--real-seq-len", dest="seq_len", type=int, default=DEFAULT_LORA_SEQ_LEN)
-    parser.add_argument("--hidden-dim", "--real-hidden-dim", dest="hidden_dim", type=int, default=DEFAULT_LORA_HIDDEN_DIM)
-    parser.add_argument("--mlp-intermediate-dim", "--real-mlp-intermediate-dim", dest="mlp_intermediate_dim", type=int, default=0)
-    parser.add_argument("--mlp-expansion", "--real-mlp-expansion", dest="mlp_expansion", type=int, default=DEFAULT_LORA_MLP_EXPANSION)
-    parser.add_argument("--lora-rank", "--real-lora-rank", dest="lora_rank", type=int, default=64)
-    parser.add_argument("--lora-alpha", "--real-lora-alpha", dest="lora_alpha", type=float, default=128.0)
+    parser.add_argument("--profile-layers", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_LORA_BATCH_SIZE)
+    parser.add_argument("--seq-len", type=int, default=DEFAULT_LORA_SEQ_LEN)
+    parser.add_argument("--hidden-dim", type=int, default=DEFAULT_LORA_HIDDEN_DIM)
+    parser.add_argument("--mlp-intermediate-dim", type=int, default=0)
+    parser.add_argument("--mlp-expansion", type=int, default=DEFAULT_LORA_MLP_EXPANSION)
+    parser.add_argument("--lora-rank", type=int, default=64)
+    parser.add_argument("--lora-alpha", type=float, default=128.0)
     parser.add_argument("--lora-dtype", choices=LORA_DTYPE_CHOICES, default="bf16")
-    parser.add_argument("--vocab-rows", "--real-vocab-rows", dest="vocab_rows", type=int, default=4096)
+    parser.add_argument("--vocab-rows", type=int, default=4096)
     parser.add_argument("--expert-recompute-policy", default="none")
     parser.add_argument("--launch-skip", type=int)
     parser.add_argument("--launch-count", type=int)
@@ -174,8 +174,8 @@ def main() -> None:
         str(args.hf_layer_index),
         "--profile-seed",
         str(args.profile_seed),
-        "--dense-target-mode",
-        args.dense_target_mode,
+        "--target-preset",
+        args.target_preset,
         "--target-modules",
         args.target_modules,
         "--offload-modules",

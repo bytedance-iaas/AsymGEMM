@@ -8,17 +8,16 @@ set -o pipefail
 ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
 LF_DIR=${LF_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/LlamaFactory}
 KT_KERNEL_DIR=${KT_KERNEL_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/ktransformers/kt-kernel}
+DEEPSPEED_DIR=${DEEPSPEED_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/deepspeed}
 CONDA_EXE=${CONDA_EXE:-conda}
 NSYS_BIN=${NSYS_BIN:-nsys}
+DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun} # torchrun | accelerate
 
 MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-Qwen/Qwen3-30B-A3B}
-BACKEND=${BACKEND:-asym}              # torch | asym | kt_torchbf16 | kt_armbf16
+BACKEND=${BACKEND:-asym}              # torch | zero2 | zero3 | zero3_offload | superoffload | asym_torch | asym | kt_torchbf16 | kt_armbf16
 GPU_ID=${GPU_ID:-0}
 NUM_GPUS=${NUM_GPUS:-1}
 REQUIRE_SM100=${REQUIRE_SM100:-1}
-TORCH_DISTRIBUTED_BACKEND=${TORCH_DISTRIBUTED_BACKEND:-deepspeed} # deepspeed | fsdp2 | ddp
-TORCH_FSDP_CONFIG=${TORCH_FSDP_CONFIG:-${LF_DIR}/examples/accelerate/fsdp2_config.yaml}
-TORCH_DEEPSPEED_CONFIG=${TORCH_DEEPSPEED_CONFIG:-${LF_DIR}/examples/deepspeed/ds_z3_config.json}
 
 DATASET=${DATASET:-asym_long_sft_smoke}
 TEMPLATE=${TEMPLATE:-auto}
@@ -39,6 +38,7 @@ ASYM_PRECISION=${ASYM_PRECISION:-bf16}
 KT_PRECISION=${KT_PRECISION:-${ASYM_PRECISION}}
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
 ASYM_EXPERT_RECOMPUTE_POLICY=${ASYM_EXPERT_RECOMPUTE_POLICY:-none}
+ASYM_ROUTER_MODE=${ASYM_ROUTER_MODE:-whole}
 ASYM_STRICT=${ASYM_STRICT:-true}
 CHECK_ASYM_CALLS=${CHECK_ASYM_CALLS:-1}
 TORCH_USE_ASYM_GEMM_LORA=${TORCH_USE_ASYM_GEMM_LORA:-false}
@@ -59,6 +59,9 @@ KT_TORCHBF16_SFT_DEVICE=${KT_TORCHBF16_SFT_DEVICE:-cuda}
 KT_ARM_OMP_NUM_THREADS=${KT_ARM_OMP_NUM_THREADS:-64}
 KT_ARM_OMP_PROC_BIND=${KT_ARM_OMP_PROC_BIND:-close}
 KT_ARM_OMP_PLACES=${KT_ARM_OMP_PLACES:-cores}
+SUPER_OFFLOAD_DEEPSPEED_CONFIG=${SUPER_OFFLOAD_DEEPSPEED_CONFIG:-}
+SUPER_OFFLOAD_CPUADAM_CORES_PERC=${SUPER_OFFLOAD_CPUADAM_CORES_PERC:-0.8}
+CHECK_SUPEROFFLOAD=${CHECK_SUPEROFFLOAD:-1}
 
 PROFILE=${PROFILE:-0}
 PROFILE_PROFILER=${PROFILE_PROFILER:-source} # source | nsys
@@ -69,10 +72,10 @@ PROFILE_MEMORY_ATTRIBUTION=${PROFILE_MEMORY_ATTRIBUTION:-auto}
 PROFILE_MEMORY_BREAKDOWN=${PROFILE_MEMORY_BREAKDOWN:-auto}
 PROFILE_MEMORY_BREAKDOWN_INTERVAL=${PROFILE_MEMORY_BREAKDOWN_INTERVAL:-1}
 PROFILE_MEMORY_BREAKDOWN_STEPS=${PROFILE_MEMORY_BREAKDOWN_STEPS:-}
-PROFILE_MEMORY_BREAKDOWN_MODULES=${PROFILE_MEMORY_BREAKDOWN_MODULES:-attention,mlp,experts,lora,embedding,loss}
+PROFILE_MEMORY_BREAKDOWN_MODULES=${PROFILE_MEMORY_BREAKDOWN_MODULES:-attention,router,mlp,experts,lora,embedding,loss}
 PROFILE_MEMORY_BREAKDOWN_OUTPUT=${PROFILE_MEMORY_BREAKDOWN_OUTPUT:-memory_breakdown}
 PROFILE_SYNC=${PROFILE_SYNC:-0}
-PROFILE_MODULE_FILTER=${PROFILE_MODULE_FILTER:-attention,mlp,experts,lora,optimizer,kt}
+PROFILE_MODULE_FILTER=${PROFILE_MODULE_FILTER:-attention,router,mlp,experts,lora,optimizer,kt}
 PROFILE_SOURCE_JSON=${PROFILE_SOURCE_JSON:-}
 PROFILE_NSYS_PREFIX=${PROFILE_NSYS_PREFIX:-}
 PROFILE_NSYS_SQLITE=${PROFILE_NSYS_SQLITE:-}
@@ -84,6 +87,7 @@ PROFILE_OUTPUT_DIR=${PROFILE_OUTPUT_DIR:-}
 PROFILE_WORKLOAD_LABEL=${PROFILE_WORKLOAD_LABEL:-}
 PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-}
 PROFILE_EXPERT_POLICY=${PROFILE_EXPERT_POLICY:-${ASYM_EXPERT_RECOMPUTE_POLICY}}
+INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
 
 # =============================================================================
 # Derived Parameters
@@ -94,10 +98,54 @@ ENV_DIR=${ENV_DIR:-${LF_DIR}/.venv}
 ENV_PYTHON=${ENV_PYTHON:-${ENV_DIR}/bin/python}
 TORCHRUN_BIN=${TORCHRUN_BIN:-${ENV_DIR}/bin/torchrun}
 ACCELERATE_BIN=${ACCELERATE_BIN:-${ENV_DIR}/bin/accelerate}
+CHECK_SUPEROFFLOAD_SCRIPT=${CHECK_SUPEROFFLOAD_SCRIPT:-${ASYM_DIR}/scripts/lf/check_superoffload_run.py}
 unset KT_BACKEND                      # Not user-facing; derive the KT enum only from BACKEND.
 KT_BACKEND_INTERNAL=""
+ZERO_BACKEND_LABEL=""
+TORCH_DEEPSPEED_CONFIG=""
+TORCHRUN_CMD=()
+ACCELERATE_CMD=()
+
+zero_deepspeed_config() {
+  case "${1}" in
+    zero2) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z2_config.json" ;;
+    zero3) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_config.json" ;;
+    zero3_offload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json" ;;
+    superoffload) printf '%s\n' "${SUPER_OFFLOAD_DEEPSPEED_CONFIG}" ;;
+    *) return 1 ;;
+  esac
+}
+
 case "${BACKEND,,}" in
-  torch) BACKEND=torch ;;
+  torch)
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-torch}
+    BACKEND=torch
+    ;;
+  zero2)
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-zero2}
+    ZERO_BACKEND_LABEL=zero2
+    BACKEND=torch
+    TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero2)"
+    ;;
+  zero3)
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-zero3}
+    ZERO_BACKEND_LABEL=zero3
+    BACKEND=torch
+    TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero3)"
+    ;;
+  zero3_offload)
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-zero3_offload}
+    ZERO_BACKEND_LABEL=zero3_offload
+    BACKEND=torch
+    TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero3_offload)"
+    ;;
+  superoffload|super_offload|so|ds_superoffload)
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-superoffload}
+    ZERO_BACKEND_LABEL=superoffload
+    BACKEND=torch
+    TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config superoffload)"
+    ;;
+  asym_torch) BACKEND=asym_torch ;;
   asym) BACKEND=asym ;;
   kt_torchbf16)
     BACKEND=kt_torchbf16
@@ -107,7 +155,13 @@ case "${BACKEND,,}" in
     BACKEND=kt_armbf16
     KT_BACKEND_INTERNAL=ARMBF16
     ;;
-  *) echo "BACKEND must be one of: torch, asym, kt_torchbf16, kt_armbf16; got '${BACKEND}'" >&2; exit 2 ;;
+  *) echo "BACKEND must be one of: torch, zero2, zero3, zero3_offload, superoffload, asym_torch, asym, kt_torchbf16, kt_armbf16; got '${BACKEND}'" >&2; exit 2 ;;
+esac
+
+case "${DIST_LAUNCHER,,}" in
+  torchrun) DIST_LAUNCHER=torchrun ;;
+  accelerate|accelerate_launch) DIST_LAUNCHER=accelerate ;;
+  *) echo "DIST_LAUNCHER must be torchrun or accelerate, got '${DIST_LAUNCHER}'" >&2; exit 2 ;;
 esac
 
 if [[ "${BACKEND}" == "torch" || "${BACKEND}" == kt_* ]]; then
@@ -124,12 +178,7 @@ if [[ ! "${NUM_GPUS}" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
-case "${TORCH_DISTRIBUTED_BACKEND,,}" in
-  fsdp2) TORCH_DISTRIBUTED_BACKEND=fsdp2 ;;
-  deepspeed|ds|zero3|z3) TORCH_DISTRIBUTED_BACKEND=deepspeed ;;
-  ddp) TORCH_DISTRIBUTED_BACKEND=ddp ;;
-  *) echo "TORCH_DISTRIBUTED_BACKEND must be one of: fsdp2, deepspeed, ddp; got '${TORCH_DISTRIBUTED_BACKEND}'" >&2; exit 2 ;;
-esac
+RUN_BACKEND_LABEL="${PROFILE_BACKEND_LABEL:-${BACKEND}}"
 
 infer_template() {
   local model="$1"
@@ -155,7 +204,7 @@ if [[ "${BACKEND}" == kt_* ]]; then
   KT_BACKEND_TAG="${KT_BACKEND_INTERNAL:-none}"
   DEFAULT_RUN_ID="${RUN_TS}_${MODEL_TAG}_${BACKEND}_${KT_BACKEND_TAG}_${KT_PRECISION}_ctx${CUTOFF_LEN}_bs${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_r${LORA_RANK}_a${LORA_ALPHA}_steps${MAX_STEPS}_${PROFILE_TAG}"
 else
-  DEFAULT_RUN_ID="${RUN_TS}_${MODEL_TAG}_${BACKEND}_${ASYM_PRECISION}_ctx${CUTOFF_LEN}_bs${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_r${LORA_RANK}_a${LORA_ALPHA}_steps${MAX_STEPS}_offload${ASYM_OFFLOAD_MODULES}_pol${EXPERT_POLICY_TAG}_${PROFILE_TAG}"
+  DEFAULT_RUN_ID="${RUN_TS}_${MODEL_TAG}_${RUN_BACKEND_LABEL}_${ASYM_PRECISION}_ctx${CUTOFF_LEN}_bs${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_r${LORA_RANK}_a${LORA_ALPHA}_steps${MAX_STEPS}_offload${ASYM_OFFLOAD_MODULES}_pol${EXPERT_POLICY_TAG}_router${ASYM_ROUTER_MODE}_${PROFILE_TAG}"
 fi
 RUN_ID=${RUN_ID:-${DEFAULT_RUN_ID}}
 if [[ "${BACKEND}" == kt_* ]]; then
@@ -195,6 +244,24 @@ optional_bool_string() {
   bool_string "$1" "$2"
 }
 
+profile_memory_flag() {
+  local name="$1"
+  local value="${2,,}"
+  local profiler="$3"
+  case "${value}" in
+    auto)
+      if [[ "${profiler}" == "source" ]]; then
+        printf 'true\n'
+      else
+        printf 'false\n'
+      fi
+      ;;
+    1|true|yes|y|on) printf 'true\n' ;;
+    0|false|no|n|off) printf 'false\n' ;;
+    *) echo "${name} must be auto, true, or false" >&2; exit 2 ;;
+  esac
+}
+
 positive_int_value() {
   local name="$1"
   local value="$2"
@@ -207,17 +274,58 @@ nonnegative_int_value() {
   [[ "${value}" =~ ^[0-9]+$ ]] || { echo "${name} must be a non-negative integer, got '${value}'" >&2; exit 2; }
 }
 
-is_torch_distributed_run() {
-  [[ "${BACKEND}" == "torch" && "${NUM_GPUS}" -gt 1 ]]
+find_free_port() {
+  python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+}
+
+fraction_0_1_value() {
+  local name="$1"
+  local value="$2"
+  python3 - "${name}" "${value}" <<'PY'
+import math
+import sys
+
+name, raw = sys.argv[1:3]
+try:
+    value = float(raw)
+except ValueError:
+    raise SystemExit(f"{name} must be a number between 0 and 1, got {raw!r}")
+if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+    raise SystemExit(f"{name} must be between 0 and 1, got {raw!r}")
+PY
+}
+
+is_torch_run() {
+  [[ "${BACKEND}" == "torch" ]]
+}
+
+is_zero_backend_run() {
+  [[ "${BACKEND}" == "torch" && -n "${ZERO_BACKEND_LABEL}" ]]
+}
+
+is_superoffload_zero_run() {
+  [[ "${ZERO_BACKEND_LABEL}" == "superoffload" ]]
+}
+
+is_plain_torch_run() {
+  [[ "${BACKEND}" == "torch" && -z "${ZERO_BACKEND_LABEL}" ]]
 }
 
 assert_deepspeed_scope() {
   local arg
-  [[ "${BACKEND}" == "torch" ]] && return 0
   for arg in "${CMD_ARGS[@]}"; do
     if [[ "${arg}" == "--deepspeed" ]]; then
-      echo "internal error: --deepspeed was added for BACKEND=${BACKEND}; DeepSpeed is restricted to BACKEND=torch" >&2
-      exit 2
+      if ! is_zero_backend_run; then
+        echo "internal error: --deepspeed was added for BACKEND=${RUN_BACKEND_LABEL}; DeepSpeed is restricted to zero-policy runs" >&2
+        exit 2
+      fi
+      return 0
     fi
   done
 }
@@ -242,38 +350,13 @@ case "${PROFILE_LEVEL}" in
   *) echo "PROFILE_LEVEL must be one of: stage, module, op, deep" >&2; exit 2 ;;
 esac
 
-case "${PROFILE_MEMORY_ATTRIBUTION,,}" in
-  auto|0|1|true|false|yes|no|y|n|on|off) ;;
-  *) echo "PROFILE_MEMORY_ATTRIBUTION must be auto, true, or false" >&2; exit 2 ;;
-esac
+PROFILE_MEMORY_ATTRIBUTION="$(profile_memory_flag PROFILE_MEMORY_ATTRIBUTION "${PROFILE_MEMORY_ATTRIBUTION}" "${PROFILE_PROFILER}")"
+PROFILE_MEMORY_BREAKDOWN="$(profile_memory_flag PROFILE_MEMORY_BREAKDOWN "${PROFILE_MEMORY_BREAKDOWN}" "${PROFILE_PROFILER}")"
 
-case "${PROFILE_MEMORY_ATTRIBUTION,,}" in
-  auto)
-    if [[ "${PROFILE_PROFILER}" == "source" ]]; then
-      PROFILE_MEMORY_ATTRIBUTION=true
-    else
-      PROFILE_MEMORY_ATTRIBUTION=false
-    fi
-    ;;
-  1|true|yes|y|on) PROFILE_MEMORY_ATTRIBUTION=true ;;
-  0|false|no|n|off) PROFILE_MEMORY_ATTRIBUTION=false ;;
-esac
-
-case "${PROFILE_MEMORY_BREAKDOWN,,}" in
-  auto|0|1|true|false|yes|no|y|n|on|off) ;;
-  *) echo "PROFILE_MEMORY_BREAKDOWN must be auto, true, or false" >&2; exit 2 ;;
-esac
-
-case "${PROFILE_MEMORY_BREAKDOWN,,}" in
-  auto)
-    if [[ "${PROFILE_PROFILER}" == "source" ]]; then
-      PROFILE_MEMORY_BREAKDOWN=true
-    else
-      PROFILE_MEMORY_BREAKDOWN=false
-    fi
-    ;;
-  1|true|yes|y|on) PROFILE_MEMORY_BREAKDOWN=true ;;
-  0|false|no|n|off) PROFILE_MEMORY_BREAKDOWN=false ;;
+case "${ASYM_ROUTER_MODE,,}" in
+  hf) ASYM_ROUTER_MODE=hf ;;
+  whole) ASYM_ROUTER_MODE=whole ;;
+  *) echo "ASYM_ROUTER_MODE must be hf or whole, got '${ASYM_ROUTER_MODE}'" >&2; exit 2 ;;
 esac
 
 if [[ ! "${PROFILE_MEMORY_BREAKDOWN_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
@@ -286,6 +369,8 @@ case "${PROFILE_SYNC}" in
   *) echo "PROFILE_SYNC must be true or false" >&2; exit 2 ;;
 esac
 TORCH_USE_ASYM_GEMM_LORA="$(bool_string TORCH_USE_ASYM_GEMM_LORA "${TORCH_USE_ASYM_GEMM_LORA}")"
+CHECK_SUPEROFFLOAD="$(bool_01 CHECK_SUPEROFFLOAD "${CHECK_SUPEROFFLOAD}")"
+fraction_0_1_value SUPER_OFFLOAD_CPUADAM_CORES_PERC "${SUPER_OFFLOAD_CPUADAM_CORES_PERC}"
 if [[ "${BACKEND}" == kt_* ]]; then
   CHECK_KT_CALLS="$(bool_01 CHECK_KT_CALLS "${CHECK_KT_CALLS}")"
   KT_TP_ENABLED="$(bool_string KT_TP_ENABLED "${KT_TP_ENABLED}")"
@@ -323,36 +408,54 @@ if [[ "${PROFILE}" == "1" && ! -f "${PROFILE_LAUNCHER}" ]]; then
   exit 2
 fi
 
-if [[ "${PROFILE}" == "1" && ! -x "${ENV_PYTHON}" ]]; then
+if [[ ! -x "${ENV_PYTHON}" ]]; then
   echo "Missing environment Python ${ENV_PYTHON}" >&2
   exit 2
 fi
 
-if [[ "${PROFILE}" == "1" ]] && is_torch_distributed_run && [[ "${TORCH_DISTRIBUTED_BACKEND}" == "ddp" && ! -x "${TORCHRUN_BIN}" ]]; then
-  echo "Missing torchrun executable ${TORCHRUN_BIN}" >&2
-  exit 2
+if is_torch_run && [[ "${DIST_LAUNCHER}" == "torchrun" ]]; then
+  if [[ -x "${TORCHRUN_BIN}" ]]; then
+    TORCHRUN_CMD=("${TORCHRUN_BIN}")
+  elif [[ -x "${ENV_PYTHON}" ]]; then
+    TORCHRUN_CMD=("${ENV_PYTHON}" -m torch.distributed.run)
+  else
+    echo "Missing torchrun executable ${TORCHRUN_BIN} and environment Python ${ENV_PYTHON}" >&2
+    exit 2
+  fi
+fi
+if is_torch_run && [[ "${DIST_LAUNCHER}" == "accelerate" ]]; then
+  if [[ -x "${ACCELERATE_BIN}" ]]; then
+    ACCELERATE_CMD=("${ACCELERATE_BIN}")
+  elif command -v accelerate >/dev/null 2>&1; then
+    ACCELERATE_CMD=(accelerate)
+  else
+    echo "Missing accelerate executable ${ACCELERATE_BIN}" >&2
+    exit 2
+  fi
 fi
 
-if is_torch_distributed_run && [[ "${TORCH_DISTRIBUTED_BACKEND}" == "fsdp2" ]]; then
-  if [[ ! -x "${ACCELERATE_BIN}" ]]; then
-    echo "Missing accelerate executable ${ACCELERATE_BIN}" >&2
-    exit 2
-  fi
-  if [[ ! -f "${TORCH_FSDP_CONFIG}" ]]; then
-    echo "Missing FSDP2 accelerate config ${TORCH_FSDP_CONFIG}" >&2
-    exit 2
-  fi
-fi
-if is_torch_distributed_run && [[ "${TORCH_DISTRIBUTED_BACKEND}" == "deepspeed" ]]; then
-  if [[ ! -x "${ACCELERATE_BIN}" ]]; then
-    echo "Missing accelerate executable ${ACCELERATE_BIN}" >&2
-    exit 2
-  fi
+if is_zero_backend_run; then
   if [[ ! -f "${TORCH_DEEPSPEED_CONFIG}" ]]; then
     echo "Missing DeepSpeed config ${TORCH_DEEPSPEED_CONFIG}" >&2
     exit 2
   fi
+  if is_superoffload_zero_run; then
+    if [[ ! -f "${DEEPSPEED_DIR}/deepspeed/runtime/superoffload/superoffload_stage3.py" ]]; then
+      echo "Missing local SuperOffload DeepSpeed tree at ${DEEPSPEED_DIR}" >&2
+      exit 2
+    fi
+    if [[ ! -f "${CHECK_SUPEROFFLOAD_SCRIPT}" ]]; then
+      echo "Missing SuperOffload checker ${CHECK_SUPEROFFLOAD_SCRIPT}" >&2
+      exit 2
+    fi
+  fi
 fi
+
+MASTER_PORT_VALUE="${MASTER_PORT:-}"
+if is_torch_run && [[ -z "${MASTER_PORT_VALUE}" ]]; then
+  MASTER_PORT_VALUE="$(find_free_port)"
+fi
+MASTER_PORT_VALUE="${MASTER_PORT_VALUE:-29500}"
 
 if [[ "${PROFILE}" == "1" && -z "${PROFILE_SOURCE_JSON}" ]]; then
   PROFILE_SOURCE_JSON="${OUT_DIR}/source_profile.json"
@@ -377,13 +480,151 @@ fi
 mkdir -p "${OUT_DIR}" "$(dirname "${LOG_FILE}")"
 : > "${LOG_FILE}"
 
+managed_interrupted=false
+managed_interrupt_exit_status=130
+managed_child_pid=""
+managed_child_pid_file=""
+managed_wait_pid=""
+
+managed_process_alive() {
+  local target_pid
+  for target_pid in "$@"; do
+    [[ "${target_pid}" =~ ^[0-9]+$ ]] || continue
+    if kill -0 "-${target_pid}" 2>/dev/null || kill -0 "${target_pid}" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+signal_managed_targets() {
+  local signal_name="$1"
+  shift
+  local target_pid
+  for target_pid in "$@"; do
+    [[ "${target_pid}" =~ ^[0-9]+$ ]] || continue
+    kill "-${signal_name}" "-${target_pid}" 2>/dev/null || true
+    kill "-${signal_name}" "${target_pid}" 2>/dev/null || true
+  done
+}
+
+managed_child_targets() {
+  local file_pid="" target_pid
+  if [[ -n "${managed_child_pid_file:-}" && -s "${managed_child_pid_file}" ]]; then
+    IFS= read -r file_pid < "${managed_child_pid_file}" || true
+  fi
+  for target_pid in "${file_pid}" "${managed_child_pid:-}" "${managed_wait_pid:-}"; do
+    [[ "${target_pid}" =~ ^[0-9]+$ ]] && printf '%s\n' "${target_pid}"
+  done | awk 'NF && !seen[$0]++'
+}
+
+kill_managed_child() {
+  local -a target_pids=()
+  mapfile -t target_pids < <(managed_child_targets)
+  rm -f "${managed_child_pid_file:-}" 2>/dev/null || true
+
+  ((${#target_pids[@]} > 0)) || return 0
+  signal_managed_targets INT "${target_pids[@]}"
+
+  if [[ "${INTERRUPT_GRACE_SECONDS}" != "0" ]]; then
+    sleep "${INTERRUPT_GRACE_SECONDS}" || true
+  fi
+  if managed_process_alive "${target_pids[@]}"; then
+    signal_managed_targets TERM "${target_pids[@]}"
+  fi
+
+  if [[ "${INTERRUPT_GRACE_SECONDS}" != "0" ]]; then
+    sleep "${INTERRUPT_GRACE_SECONDS}" || true
+  fi
+  if managed_process_alive "${target_pids[@]}"; then
+    signal_managed_targets KILL "${target_pids[@]}"
+  fi
+}
+
+cleanup_managed_child() {
+  if [[ -n "${managed_child_pid:-}" || -n "${managed_wait_pid:-}" || -n "${managed_child_pid_file:-}" ]]; then
+    kill_managed_child
+  fi
+}
+
+run_managed_command() {
+  local status=0 wait_pid="" child_pid="" pid_file="" attempt
+  managed_child_pid=""
+  managed_wait_pid=""
+  managed_child_pid_file=""
+  if command -v setsid >/dev/null 2>&1 && setsid --help 2>&1 | grep -q -- '--wait' && setsid --help 2>&1 | grep -q -- '--fork'; then
+    pid_file="$(mktemp "${TMPDIR:-/tmp}/run_lf_lora_sft_child.XXXXXX")"
+    managed_child_pid_file="${pid_file}"
+    setsid --fork --wait bash -c 'pid_file="$1"; shift; echo "$$" > "${pid_file}"; exec "$@"' _ "${pid_file}" "$@" &
+    wait_pid=$!
+    managed_wait_pid="${wait_pid}"
+    managed_child_pid="${wait_pid}"
+    for ((attempt = 0; attempt < 100; attempt++)); do
+      if [[ -s "${pid_file}" ]]; then
+        IFS= read -r child_pid < "${pid_file}" || true
+        if [[ -n "${child_pid}" ]]; then
+          managed_child_pid="${child_pid}"
+          break
+        fi
+      fi
+      kill -0 "${wait_pid}" 2>/dev/null || break
+      sleep 0.02
+    done
+  else
+    "$@" &
+    wait_pid=$!
+    managed_wait_pid="${wait_pid}"
+    managed_child_pid="${wait_pid}"
+  fi
+
+  wait "${wait_pid}" || status=$?
+  if [[ "${managed_interrupted}" == "true" ]]; then
+    kill_managed_child
+    wait "${wait_pid}" 2>/dev/null || true
+    managed_child_pid=""
+    managed_child_pid_file=""
+    managed_wait_pid=""
+    exit "${managed_interrupt_exit_status}"
+  fi
+  if [[ "${status}" == "130" || "${status}" == "143" ]]; then
+    kill_managed_child
+    wait "${wait_pid}" 2>/dev/null || true
+  fi
+  [[ -z "${pid_file}" ]] || rm -f "${pid_file}" 2>/dev/null || true
+  managed_child_pid=""
+  managed_child_pid_file=""
+  managed_wait_pid=""
+  return "${status}"
+}
+
+run_logged_command() {
+  run_managed_command "$@" > >(tee -a "${LOG_FILE}") 2>&1
+}
+
+handle_managed_interrupt() {
+  local signal_name="${1:-INT}"
+  case "${signal_name}" in
+    TERM) managed_interrupt_exit_status=143 ;;
+    *) managed_interrupt_exit_status=130 ;;
+  esac
+  managed_interrupted=true
+  echo "Interrupted; stopping LF training command." >&2
+  trap - INT TERM
+  kill_managed_child
+  exit "${managed_interrupt_exit_status}"
+}
+
+trap 'handle_managed_interrupt INT' INT
+trap 'handle_managed_interrupt TERM' TERM
+trap 'cleanup_managed_child' EXIT
+
 PY_CHECK='import torch, sys
 if not torch.cuda.is_available():
     raise SystemExit("CUDA is not available")
 major, minor = torch.cuda.get_device_capability(0)
 print(f"CUDA device: {torch.cuda.get_device_name(0)} capability=sm_{major}{minor}")
 '
-CUDA_VISIBLE_DEVICES=${GPU_ID} "${CONDA_EXE}" run -p "${ENV_DIR}" python - <<PY
+CUDA_VISIBLE_DEVICES=${GPU_ID} "${ENV_PYTHON}" - <<PY
 ${PY_CHECK}
 if "${BACKEND}" == "asym" and "${REQUIRE_SM100}" == "1":
     import torch
@@ -447,7 +688,7 @@ CMD_ARGS=(
   --bf16 true
 )
 
-if [[ "${BACKEND}" == "torch" && "${NUM_GPUS}" -gt 1 && "${TORCH_DISTRIBUTED_BACKEND}" == "deepspeed" ]]; then
+if is_zero_backend_run; then
   CMD_ARGS+=(--pure_bf16 false)
 else
   CMD_ARGS+=(--pure_bf16 true)
@@ -463,15 +704,18 @@ if [[ "${BACKEND}" == "torch" && "${TORCH_USE_ASYM_GEMM_LORA}" == "true" ]]; the
   CMD_ARGS+=(--use_asym_gemm true --asym_backend torch --asym_precision "${ASYM_PRECISION}")
   CMD_ARGS+=(--asym_offload_modules "${ASYM_OFFLOAD_MODULES}" --asym_strict "${ASYM_STRICT}")
   CMD_ARGS+=(--asym_expert_recompute_policy "${ASYM_EXPERT_RECOMPUTE_POLICY}")
+  CMD_ARGS+=(--asym_router_mode "${ASYM_ROUTER_MODE}")
+elif [[ "${BACKEND}" == "asym_torch" ]]; then
+  CMD_ARGS+=(--use_asym_gemm true --asym_backend torch --asym_precision "${ASYM_PRECISION}")
+  CMD_ARGS+=(--asym_offload_modules "${ASYM_OFFLOAD_MODULES}" --asym_strict "${ASYM_STRICT}")
+  CMD_ARGS+=(--asym_expert_recompute_policy "${ASYM_EXPERT_RECOMPUTE_POLICY}")
+  CMD_ARGS+=(--asym_router_mode "${ASYM_ROUTER_MODE}")
 elif [[ "${BACKEND}" == "asym" ]]; then
   CMD_ARGS+=(--use_asym_gemm true --asym_backend asym --asym_precision "${ASYM_PRECISION}")
   CMD_ARGS+=(--asym_offload_modules "${ASYM_OFFLOAD_MODULES}" --asym_strict "${ASYM_STRICT}")
   CMD_ARGS+=(--asym_expert_recompute_policy "${ASYM_EXPERT_RECOMPUTE_POLICY}")
+  CMD_ARGS+=(--asym_router_mode "${ASYM_ROUTER_MODE}")
 elif [[ "${BACKEND}" == kt_* ]]; then
-  case "${LORA_DROPOUT}" in
-    0|0.0|0.00) ;;
-    *) echo "KT SFT profiling requires LORA_DROPOUT=0.0 in the first ARM path; got ${LORA_DROPOUT}" >&2; exit 2 ;;
-  esac
   CMD_ARGS+=(--use_kt true --kt_backend "${KT_BACKEND_INTERNAL}")
   [[ -z "${KT_NUM_THREADS}" ]] || CMD_ARGS+=(--kt_num_threads "${KT_NUM_THREADS}")
   [[ -z "${KT_THREADPOOL_COUNT}" ]] || CMD_ARGS+=(--kt_threadpool_count "${KT_THREADPOOL_COUNT}")
@@ -490,8 +734,10 @@ echo "OUT_DIR=${OUT_DIR}" | tee -a "${LOG_FILE}"
 echo "MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH}" | tee -a "${LOG_FILE}"
 echo "TEMPLATE=${TEMPLATE}" | tee -a "${LOG_FILE}"
 echo "BACKEND=${BACKEND}" | tee -a "${LOG_FILE}"
+[[ -n "${PROFILE_BACKEND_LABEL}" ]] && echo "PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL}" | tee -a "${LOG_FILE}"
 echo "GPU_ID=${GPU_ID}" | tee -a "${LOG_FILE}"
 echo "NUM_GPUS=${NUM_GPUS}" | tee -a "${LOG_FILE}"
+is_torch_run && echo "DIST_LAUNCHER=${DIST_LAUNCHER}" | tee -a "${LOG_FILE}"
 echo "SEED=${SEED}" | tee -a "${LOG_FILE}"
 if [[ "${BACKEND}" == kt_* ]]; then
   echo "KT_BACKEND=${KT_BACKEND_INTERNAL}" | tee -a "${LOG_FILE}"
@@ -516,12 +762,31 @@ if [[ "${BACKEND}" == kt_* ]]; then
   [[ -n "${KT_LORA_EXPERT_NUM}" ]] && echo "KT_LORA_EXPERT_NUM=${KT_LORA_EXPERT_NUM}" | tee -a "${LOG_FILE}"
   [[ -n "${KT_LORA_EXPERT_INTERMEDIATE_SIZE}" ]] && echo "KT_LORA_EXPERT_INTERMEDIATE_SIZE=${KT_LORA_EXPERT_INTERMEDIATE_SIZE}" | tee -a "${LOG_FILE}"
 fi
-if is_torch_distributed_run; then
-  echo "TORCH_DISTRIBUTED_BACKEND=${TORCH_DISTRIBUTED_BACKEND}" | tee -a "${LOG_FILE}"
-  [[ "${TORCH_DISTRIBUTED_BACKEND}" == "fsdp2" ]] && echo "TORCH_FSDP_CONFIG=${TORCH_FSDP_CONFIG}" | tee -a "${LOG_FILE}"
-  [[ "${TORCH_DISTRIBUTED_BACKEND}" == "deepspeed" ]] && echo "TORCH_DEEPSPEED_CONFIG=${TORCH_DEEPSPEED_CONFIG}" | tee -a "${LOG_FILE}"
+if is_zero_backend_run; then
+  echo "ZERO_BACKEND_LABEL=${ZERO_BACKEND_LABEL}" | tee -a "${LOG_FILE}"
+  echo "TORCH_DEEPSPEED_CONFIG=${TORCH_DEEPSPEED_CONFIG}" | tee -a "${LOG_FILE}"
+  if [[ "${DIST_LAUNCHER}" == "torchrun" ]]; then
+    echo "TORCHRUN_CMD=${TORCHRUN_CMD[*]}" | tee -a "${LOG_FILE}"
+  else
+    echo "ACCELERATE_CMD=${ACCELERATE_CMD[*]}" | tee -a "${LOG_FILE}"
+  fi
+  echo "MASTER_PORT=${MASTER_PORT_VALUE}" | tee -a "${LOG_FILE}"
+  if is_superoffload_zero_run; then
+    echo "DEEPSPEED_DIR=${DEEPSPEED_DIR}" | tee -a "${LOG_FILE}"
+    echo "SUPER_OFFLOAD_DEEPSPEED_CONFIG=${SUPER_OFFLOAD_DEEPSPEED_CONFIG}" | tee -a "${LOG_FILE}"
+    echo "SUPER_OFFLOAD_CPUADAM_CORES_PERC=${SUPER_OFFLOAD_CPUADAM_CORES_PERC}" | tee -a "${LOG_FILE}"
+    echo "CHECK_SUPEROFFLOAD=${CHECK_SUPEROFFLOAD}" | tee -a "${LOG_FILE}"
+  fi
+elif is_plain_torch_run; then
+  if [[ "${DIST_LAUNCHER}" == "torchrun" ]]; then
+    echo "TORCHRUN_CMD=${TORCHRUN_CMD[*]}" | tee -a "${LOG_FILE}"
+  else
+    echo "ACCELERATE_CMD=${ACCELERATE_CMD[*]}" | tee -a "${LOG_FILE}"
+  fi
+  echo "MASTER_PORT=${MASTER_PORT_VALUE}" | tee -a "${LOG_FILE}"
 fi
 echo "ASYM_EXPERT_RECOMPUTE_POLICY=${ASYM_EXPERT_RECOMPUTE_POLICY}" | tee -a "${LOG_FILE}"
+echo "ASYM_ROUTER_MODE=${ASYM_ROUTER_MODE}" | tee -a "${LOG_FILE}"
 echo "TORCH_USE_ASYM_GEMM_LORA=${TORCH_USE_ASYM_GEMM_LORA}" | tee -a "${LOG_FILE}"
 echo "PROFILE=${PROFILE}" | tee -a "${LOG_FILE}"
 if [[ "${PROFILE}" == "1" ]]; then
@@ -549,7 +814,9 @@ if [[ "${PROFILE}" == "1" ]]; then
 fi
 
 RUN_PYTHONPATH="${ASYM_DIR}:${LF_DIR}/src:${PYTHONPATH:-}"
-if [[ "${BACKEND}" == kt_* ]]; then
+if is_superoffload_zero_run; then
+  RUN_PYTHONPATH="${DEEPSPEED_DIR}:${ASYM_DIR}:${LF_DIR}/src:${PYTHONPATH:-}"
+elif [[ "${BACKEND}" == kt_* ]]; then
   RUN_PYTHONPATH="${KT_TOOLS_DIR}:${ASYM_DIR}:${KT_KERNEL_DIR}:${LF_DIR}/src:${PYTHONPATH:-}"
 fi
 
@@ -597,18 +864,26 @@ else
   RUN_ENV+=(USE_ASYM_GEMM=1 ASYM_GEMM_LF_LOG_RUNTIME_STATS=1)
 fi
 
-if is_torch_distributed_run; then
+if is_torch_run; then
   RUN_ENV+=(
     FORCE_TORCHRUN=1
     NNODES="${NNODES:-1}"
     NODE_RANK="${NODE_RANK:-0}"
     NPROC_PER_NODE="${NUM_GPUS}"
     MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-    MASTER_PORT="${MASTER_PORT:-29500}"
+    MASTER_PORT="${MASTER_PORT_VALUE}"
   )
 fi
 
-if is_torch_distributed_run && [[ "${TORCH_DISTRIBUTED_BACKEND}" == "deepspeed" ]]; then
+if is_superoffload_zero_run; then
+  RUN_ENV+=(
+    ASYM_GEMM_LF_CONFIG_DEEPSPEED_DIR="${DEEPSPEED_DIR}"
+    ASYM_GEMM_LF_CONFIG_SUPEROFFLOAD_CONFIG="${SUPER_OFFLOAD_DEEPSPEED_CONFIG}"
+    ASYM_GEMM_LF_CONFIG_SUPEROFFLOAD_CPUADAM_CORES_PERC="${SUPER_OFFLOAD_CPUADAM_CORES_PERC}"
+  )
+fi
+
+if is_zero_backend_run; then
   CMD_ARGS+=(--deepspeed "${TORCH_DEEPSPEED_CONFIG}")
 fi
 assert_deepspeed_scope
@@ -617,46 +892,48 @@ if [[ "${PROFILE}" == "1" ]]; then
   profile_precision="${ASYM_PRECISION}"
   [[ "${BACKEND}" == kt_* ]] && profile_precision="${KT_PRECISION}"
   RUN_ENV+=(
-      ASYM_GEMM_LF_PROFILE_SOURCE_JSON="${PROFILE_SOURCE_JSON}"
-      ASYM_GEMM_LF_PROFILE_MEMORY="${PROFILE_MEMORY}"
-      ASYM_GEMM_LF_PROFILE_LEVEL="${PROFILE_LEVEL}"
-      ASYM_GEMM_LF_PROFILE_LAYERS="${PROFILE_LAYERS}"
-      ASYM_GEMM_LF_PROFILE_MEMORY_ATTRIBUTION="${PROFILE_MEMORY_ATTRIBUTION}"
-      ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN="${PROFILE_MEMORY_BREAKDOWN}"
-      ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_INTERVAL="${PROFILE_MEMORY_BREAKDOWN_INTERVAL}"
-      ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_STEPS="${PROFILE_MEMORY_BREAKDOWN_STEPS}"
-      ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_MODULES="${PROFILE_MEMORY_BREAKDOWN_MODULES}"
-      ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_OUTPUT="${PROFILE_MEMORY_BREAKDOWN_OUTPUT}"
-      ASYM_GEMM_LF_PROFILE_SYNC="${PROFILE_SYNC}"
-      ASYM_GEMM_LF_PROFILE_MODULE_FILTER="${PROFILE_MODULE_FILTER}"
-	    ASYM_GEMM_LF_CONFIG_WORKLOAD="${PROFILE_WORKLOAD_LABEL:-${MODEL_TAG}}"
-	    ASYM_GEMM_LF_CONFIG_BACKEND="${PROFILE_BACKEND_LABEL:-${BACKEND}}"
-	    ASYM_GEMM_LF_CONFIG_PRECISION="${profile_precision}"
-	    ASYM_GEMM_LF_CONFIG_SEQ_LEN="${CUTOFF_LEN}"
-	    ASYM_GEMM_LF_CONFIG_ACTIVATION_RECOMPUTE="${GRADIENT_CHECKPOINTING}"
-	    ASYM_GEMM_LF_CONFIG_EXPERT_POLICY="${PROFILE_EXPERT_POLICY}"
-	    ASYM_GEMM_LF_CONFIG_PROFILE_LEVEL="${PROFILE_LEVEL}"
-	    ASYM_GEMM_LF_CONFIG_WARMUP_STEPS="${PROFILE_WARMUP_STEPS:-0}"
-	    ASYM_GEMM_LF_CONFIG_MEASURE_STEPS="${PROFILE_MEASURE_STEPS:-${MAX_STEPS}}"
-	    ASYM_GEMM_LF_CONFIG_TOTAL_STEPS="${PROFILE_TOTAL_STEPS:-${MAX_STEPS}}"
-	  )
+    ASYM_GEMM_LF_PROFILE_SOURCE_JSON="${PROFILE_SOURCE_JSON}"
+    ASYM_GEMM_LF_PROFILE_MEMORY="${PROFILE_MEMORY}"
+    ASYM_GEMM_LF_PROFILE_LEVEL="${PROFILE_LEVEL}"
+    ASYM_GEMM_LF_PROFILE_LAYERS="${PROFILE_LAYERS}"
+    ASYM_GEMM_LF_PROFILE_MEMORY_ATTRIBUTION="${PROFILE_MEMORY_ATTRIBUTION}"
+    ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN="${PROFILE_MEMORY_BREAKDOWN}"
+    ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_INTERVAL="${PROFILE_MEMORY_BREAKDOWN_INTERVAL}"
+    ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_STEPS="${PROFILE_MEMORY_BREAKDOWN_STEPS}"
+    ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_MODULES="${PROFILE_MEMORY_BREAKDOWN_MODULES}"
+    ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_OUTPUT="${PROFILE_MEMORY_BREAKDOWN_OUTPUT}"
+    ASYM_GEMM_LF_PROFILE_SYNC="${PROFILE_SYNC}"
+    ASYM_GEMM_LF_PROFILE_MODULE_FILTER="${PROFILE_MODULE_FILTER}"
+    ASYM_GEMM_LF_CONFIG_WORKLOAD="${PROFILE_WORKLOAD_LABEL:-${MODEL_TAG}}"
+    ASYM_GEMM_LF_CONFIG_BACKEND="${PROFILE_BACKEND_LABEL:-${BACKEND}}"
+    ASYM_GEMM_LF_CONFIG_DIST_LAUNCHER="${DIST_LAUNCHER}"
+    ASYM_GEMM_LF_CONFIG_ROUTER_MODE="${ASYM_ROUTER_MODE}"
+    ASYM_GEMM_LF_CONFIG_PRECISION="${profile_precision}"
+    ASYM_GEMM_LF_CONFIG_SEQ_LEN="${CUTOFF_LEN}"
+    ASYM_GEMM_LF_CONFIG_ACTIVATION_RECOMPUTE="${GRADIENT_CHECKPOINTING}"
+    ASYM_GEMM_LF_CONFIG_EXPERT_POLICY="${PROFILE_EXPERT_POLICY}"
+    ASYM_GEMM_LF_CONFIG_PROFILE_LEVEL="${PROFILE_LEVEL}"
+    ASYM_GEMM_LF_CONFIG_WARMUP_STEPS="${PROFILE_WARMUP_STEPS:-0}"
+    ASYM_GEMM_LF_CONFIG_MEASURE_STEPS="${PROFILE_MEASURE_STEPS:-${MAX_STEPS}}"
+    ASYM_GEMM_LF_CONFIG_TOTAL_STEPS="${PROFILE_TOTAL_STEPS:-${MAX_STEPS}}"
+  )
   if [[ "${BACKEND}" == kt_* ]]; then
     RUN_ENV+=(
-	    ASYM_GEMM_LF_CONFIG_KT_BACKEND="${KT_BACKEND_INTERNAL:-}"
-	    ASYM_GEMM_LF_CONFIG_KT_KERNEL_DIR="${KT_KERNEL_DIR}"
-	    ASYM_GEMM_LF_CONFIG_KT_NUM_THREADS="${KT_NUM_THREADS}"
-	    ASYM_GEMM_LF_CONFIG_KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT}"
-	    ASYM_GEMM_LF_CONFIG_KT_MAX_CACHE_DEPTH="${KT_MAX_CACHE_DEPTH}"
-	    ASYM_GEMM_LF_CONFIG_KT_TP_ENABLED="${KT_TP_ENABLED}"
-	    ASYM_GEMM_LF_CONFIG_KT_SHARE_BACKWARD_BB="${KT_SHARE_BACKWARD_BB}"
-	    ASYM_GEMM_LF_CONFIG_KT_SHARE_CACHE_POOL="${KT_SHARE_CACHE_POOL}"
-	    ASYM_GEMM_LF_CONFIG_KT_NUM_GPU_EXPERTS="${KT_NUM_GPU_EXPERTS}"
-	    ASYM_GEMM_LF_CONFIG_KT_WEIGHT_PATH="${KT_WEIGHT_PATH}"
-	    ASYM_GEMM_LF_CONFIG_KT_EXPERT_CHECKPOINT_PATH="${KT_EXPERT_CHECKPOINT_PATH}"
-	    ASYM_GEMM_LF_CONFIG_KT_USE_LORA_EXPERTS="${KT_USE_LORA_EXPERTS}"
-	    ASYM_GEMM_LF_CONFIG_KT_LORA_EXPERT_NUM="${KT_LORA_EXPERT_NUM}"
-	    ASYM_GEMM_LF_CONFIG_KT_LORA_EXPERT_INTERMEDIATE_SIZE="${KT_LORA_EXPERT_INTERMEDIATE_SIZE}"
-	  )
+      ASYM_GEMM_LF_CONFIG_KT_BACKEND="${KT_BACKEND_INTERNAL:-}"
+      ASYM_GEMM_LF_CONFIG_KT_KERNEL_DIR="${KT_KERNEL_DIR}"
+      ASYM_GEMM_LF_CONFIG_KT_NUM_THREADS="${KT_NUM_THREADS}"
+      ASYM_GEMM_LF_CONFIG_KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT}"
+      ASYM_GEMM_LF_CONFIG_KT_MAX_CACHE_DEPTH="${KT_MAX_CACHE_DEPTH}"
+      ASYM_GEMM_LF_CONFIG_KT_TP_ENABLED="${KT_TP_ENABLED}"
+      ASYM_GEMM_LF_CONFIG_KT_SHARE_BACKWARD_BB="${KT_SHARE_BACKWARD_BB}"
+      ASYM_GEMM_LF_CONFIG_KT_SHARE_CACHE_POOL="${KT_SHARE_CACHE_POOL}"
+      ASYM_GEMM_LF_CONFIG_KT_NUM_GPU_EXPERTS="${KT_NUM_GPU_EXPERTS}"
+      ASYM_GEMM_LF_CONFIG_KT_WEIGHT_PATH="${KT_WEIGHT_PATH}"
+      ASYM_GEMM_LF_CONFIG_KT_EXPERT_CHECKPOINT_PATH="${KT_EXPERT_CHECKPOINT_PATH}"
+      ASYM_GEMM_LF_CONFIG_KT_USE_LORA_EXPERTS="${KT_USE_LORA_EXPERTS}"
+      ASYM_GEMM_LF_CONFIG_KT_LORA_EXPERT_NUM="${KT_LORA_EXPERT_NUM}"
+      ASYM_GEMM_LF_CONFIG_KT_LORA_EXPERT_INTERMEDIATE_SIZE="${KT_LORA_EXPERT_INTERMEDIATE_SIZE}"
+    )
   fi
   if [[ "${PROFILE_PROFILER}" == "nsys" && "${PROFILE_NSYS_CAPTURE_RANGE}" == "cudaProfilerApi" ]]; then
     RUN_ENV+=(ASYM_GEMM_LF_NSYS_CAPTURE_RANGE=1)
@@ -669,55 +946,44 @@ else
   LAUNCH_CMD=("${CONDA_EXE}" run -p "${ENV_DIR}" llamafactory-cli train "${CMD_ARGS[@]}")
 fi
 
-if is_torch_distributed_run && [[ "${TORCH_DISTRIBUTED_BACKEND}" == "fsdp2" ]]; then
-  if [[ "${PROFILE}" == "1" ]]; then
+if is_torch_run; then
+  launch_entry="${LF_DIR}/src/train.py"
+  [[ "${PROFILE}" == "1" ]] && launch_entry="${PROFILE_LAUNCHER}"
+  if [[ "${DIST_LAUNCHER}" == "accelerate" ]]; then
     LAUNCH_CMD=(
-      "${ACCELERATE_BIN}" launch
-      --config_file "${TORCH_FSDP_CONFIG}"
+      "${ACCELERATE_CMD[@]}" launch
+      --multi_gpu
       --num_processes "${NUM_GPUS}"
-      --main_process_port "${MASTER_PORT:-29500}"
+      --num_machines "${NNODES:-1}"
+      --machine_rank "${NODE_RANK:-0}"
+      --main_process_ip "${MASTER_ADDR:-127.0.0.1}"
+      --main_process_port "${MASTER_PORT_VALUE}"
+      "${launch_entry}"
+      "${CMD_ARGS[@]}"
+    )
+  elif [[ "${PROFILE}" == "1" ]]; then
+    LAUNCH_CMD=(
+      "${TORCHRUN_CMD[@]}"
+      --nnodes "${NNODES:-1}"
+      --node_rank "${NODE_RANK:-0}"
+      --nproc_per_node "${NUM_GPUS}"
+      --master_addr "${MASTER_ADDR:-127.0.0.1}"
+      --master_port "${MASTER_PORT_VALUE}"
       "${PROFILE_LAUNCHER}"
       "${CMD_ARGS[@]}"
     )
   else
     LAUNCH_CMD=(
-      "${ACCELERATE_BIN}" launch
-      --config_file "${TORCH_FSDP_CONFIG}"
-      --num_processes "${NUM_GPUS}"
-      --main_process_port "${MASTER_PORT:-29500}"
+      "${TORCHRUN_CMD[@]}"
+      --nnodes "${NNODES:-1}"
+      --node_rank "${NODE_RANK:-0}"
+      --nproc_per_node "${NUM_GPUS}"
+      --master_addr "${MASTER_ADDR:-127.0.0.1}"
+      --master_port "${MASTER_PORT_VALUE}"
       "${LF_DIR}/src/train.py"
       "${CMD_ARGS[@]}"
     )
   fi
-elif is_torch_distributed_run && [[ "${TORCH_DISTRIBUTED_BACKEND}" == "deepspeed" ]]; then
-  if [[ "${PROFILE}" == "1" ]]; then
-    LAUNCH_CMD=(
-      "${ACCELERATE_BIN}" launch
-      --num_processes "${NUM_GPUS}"
-      --main_process_port "${MASTER_PORT:-29500}"
-      "${PROFILE_LAUNCHER}"
-      "${CMD_ARGS[@]}"
-    )
-  else
-    LAUNCH_CMD=(
-      "${ACCELERATE_BIN}" launch
-      --num_processes "${NUM_GPUS}"
-      --main_process_port "${MASTER_PORT:-29500}"
-      "${LF_DIR}/src/train.py"
-      "${CMD_ARGS[@]}"
-    )
-  fi
-elif [[ "${PROFILE}" == "1" ]] && is_torch_distributed_run; then
-  LAUNCH_CMD=(
-    "${TORCHRUN_BIN}"
-    --nnodes "${NNODES:-1}"
-    --node_rank "${NODE_RANK:-0}"
-    --nproc_per_node "${NUM_GPUS}"
-    --master_addr "${MASTER_ADDR:-127.0.0.1}"
-    --master_port "${MASTER_PORT:-29500}"
-    "${PROFILE_LAUNCHER}"
-    "${CMD_ARGS[@]}"
-  )
 fi
 
 if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "nsys" ]]; then
@@ -738,9 +1004,21 @@ if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "nsys" ]]; then
   if [[ "${PROFILE_NSYS_CAPTURE_RANGE}" == "cudaProfilerApi" ]]; then
     NSYS_CMD+=(--capture-range=cudaProfilerApi --capture-range-end=stop)
   fi
-  env "${RUN_ENV[@]}" "${NSYS_CMD[@]}" "${LAUNCH_CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"
+  run_logged_command env "${RUN_ENV[@]}" "${NSYS_CMD[@]}" "${LAUNCH_CMD[@]}"
 else
-  env "${RUN_ENV[@]}" "${LAUNCH_CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"
+  run_logged_command env "${RUN_ENV[@]}" "${LAUNCH_CMD[@]}"
+fi
+
+if is_superoffload_zero_run && [[ "${CHECK_SUPEROFFLOAD}" == "1" ]]; then
+  SUPER_OFFLOAD_CHECK_ARGS=(--train-log "${LOG_FILE}" --require-enabled)
+  if [[ -n "${PROFILE_SOURCE_JSON}" && -f "${PROFILE_SOURCE_JSON}" ]]; then
+    SUPER_OFFLOAD_CHECK_ARGS=(--profile-json "${PROFILE_SOURCE_JSON}" "${SUPER_OFFLOAD_CHECK_ARGS[@]}")
+  fi
+  SUPER_OFFLOAD_CHECK_OUTPUT=$("${ENV_PYTHON}" "${CHECK_SUPEROFFLOAD_SCRIPT}" "${SUPER_OFFLOAD_CHECK_ARGS[@]}") || {
+      echo "backend=superoffload completed without a SuperOffload runtime marker; inspect ${LOG_FILE}" | tee -a "${LOG_FILE}"
+      exit 1
+    }
+  echo "${SUPER_OFFLOAD_CHECK_OUTPUT}" | tee -a "${LOG_FILE}"
 fi
 
 if [[ "${BACKEND}" == "asym" && "${CHECK_ASYM_CALLS}" == "1" ]]; then

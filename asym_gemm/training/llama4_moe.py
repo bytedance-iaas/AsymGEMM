@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Literal
 
@@ -71,6 +72,8 @@ class AsymLlama4Moe(nn.Module):
         lora_dropout: float,
         lora_dtype: torch.dtype | str | None = torch.bfloat16,
         expert_recompute_policy: str = "none",
+        router_mode: Literal["hf", "whole"] = "whole",
+        router_debug_grad: bool = False,
         stats: AsymExecutionStats | None = None,
         strict: bool = True,
     ) -> None:
@@ -81,6 +84,8 @@ class AsymLlama4Moe(nn.Module):
             raise ValueError("backend must be 'asym' or 'torch'")
         if precision != "bf16":
             raise ValueError("AsymLlama4Moe first pass supports bf16 only")
+        if router_mode not in {"hf", "whole"}:
+            raise ValueError(f"router_mode must be 'hf' or 'whole', got {router_mode!r}")
 
         source_experts = getattr(source, "experts")
         gate_up = getattr(source_experts, "gate_up_proj").detach()
@@ -94,7 +99,10 @@ class AsymLlama4Moe(nn.Module):
         self.backend = backend
         self.precision = precision
         self.offload = bool(offload)
+        self.router_mode = router_mode
+        self.router_debug_grad = bool(router_debug_grad)
         self.profile_prefix = "layers.unknown.feed_forward"
+        self.router.requires_grad_(False)
 
         layout = PackedMoELayout(
             family="llama4",
@@ -157,12 +165,26 @@ class AsymLlama4Moe(nn.Module):
     def _forward_range(self, *parts: object) -> str:
         return scoped_name("forward", self.profile_prefix, *parts)
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        flat = hidden_states.reshape(-1, self.hidden_dim)
-        with prof_range(self._forward_range("router")):
+    def _compute_routing(self, flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        no_grad_router = self.router_mode == "whole" and not self.router_debug_grad
+        context = torch.no_grad() if no_grad_router else nullcontext()
+        with context, prof_range(self._forward_range("router")):
             router_scores, router_logits = self.router(flat)
             _top_values, top_k_index = torch.topk(router_logits, self.top_k, dim=1)
             input_weights = router_scores.gather(1, top_k_index)
+        if no_grad_router:
+            router_logits = router_logits.detach()
+            top_k_index = top_k_index.detach()
+            input_weights = input_weights.detach()
+        return top_k_index, input_weights, router_logits
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if hidden_states.dim() != 3:
+            raise ValueError(f"AsymLlama4Moe expects [batch, seq, hidden], got {tuple(hidden_states.shape)}")
+        flat = hidden_states.view(-1, self.hidden_dim)
+        top_k_index, input_weights, router_logits = self._compute_routing(flat)
+        if self.router_mode == "whole" and not self.router_debug_grad and input_weights.requires_grad:
+            raise RuntimeError("Llama 4 router no-grad mode produced differentiable input_weights")
         with prof_range(self._forward_range("shared_expert")):
             out = self.shared_expert(flat)
         with prof_range(self._forward_range("experts")):
@@ -181,6 +203,8 @@ def wrap_llama4_moe(
     lora_dropout: float,
     lora_dtype: torch.dtype | str | None = torch.bfloat16,
     expert_recompute_policy: str = "none",
+    router_mode: Literal["hf", "whole"] = "whole",
+    router_debug_grad: bool = False,
     stats: AsymExecutionStats | None = None,
     strict: bool = True,
 ) -> AsymLlama4Moe:
@@ -194,6 +218,8 @@ def wrap_llama4_moe(
         lora_dropout=lora_dropout,
         lora_dtype=lora_dtype,
         expert_recompute_policy=expert_recompute_policy,
+        router_mode=router_mode,
+        router_debug_grad=router_debug_grad,
         stats=stats,
         strict=strict,
     )

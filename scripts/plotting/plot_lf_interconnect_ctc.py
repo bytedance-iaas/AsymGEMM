@@ -20,6 +20,7 @@ CTC_METRICS = ("ctc_rx", "ctc_tx")
 SUMMARY_FIELDS = [
     "workload",
     "backend",
+    "router_mode",
     "profiler",
     "recompute",
     "expert_policy",
@@ -44,6 +45,7 @@ SUMMARY_FIELDS = [
 STEP_FIELDS = [
     "workload",
     "backend",
+    "router_mode",
     "profiler",
     "recompute",
     "expert_policy",
@@ -65,6 +67,7 @@ STEP_FIELDS = [
 INDEX_FIELDS = [
     "workload",
     "backend",
+    "router_mode",
     "profiler",
     "recompute",
     "expert_policy",
@@ -98,6 +101,7 @@ class RunRecord:
         parts = [
             self.metadata.get("workload", ""),
             self.metadata.get("backend", ""),
+            f"router={self.metadata.get('router_mode', '')}" if self.metadata.get("router_mode") else "",
             self.metadata.get("recompute", ""),
             self.metadata.get("expert_policy", ""),
             f"s{self.metadata.get('seq_len', '')}" if self.metadata.get("seq_len") else "",
@@ -115,6 +119,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--workload", action="append", default=[])
     parser.add_argument("--backend", action="append", default=[])
     parser.add_argument("--profiler", action="append", default=[])
+    parser.add_argument("--router-mode", action="append", default=[], choices=["hf", "whole"])
     parser.add_argument("--recompute", action="append", default=[])
     parser.add_argument("--seq-lens", nargs="+", default=[])
     parser.add_argument("--expert-recompute-policies", nargs="+", default=[])
@@ -185,32 +190,36 @@ def _source_config(run_dir: Path, profile: dict[str, Any]) -> dict[str, Any]:
     return config if isinstance(config, dict) else {}
 
 
-def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, str]:
+def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, str] | None:
     run_dir = profile_path.parent
     job_root = run_dir.parent
     config_root = job_root.parent
     job_parts = job_root.name.split("__")
     config = _source_config(run_dir, profile)
+    if len(job_parts) != 5:
+        return None
+    backend_part, profiler_part, recompute_part, policy_part, router_part = job_parts
+    if not policy_part.startswith("pol") or not router_part.startswith("router"):
+        return None
+    if recompute_part not in {"norecomp", "recomp"}:
+        return None
 
-    expert_policy = str(config.get("expert_policy") or "")
-    for part in job_parts:
-        if part.startswith("pol") and not expert_policy:
-            expert_policy = part[len("pol") :]
+    expert_policy = str(config.get("expert_policy") or policy_part[len("pol") :] or "none")
+    router_mode = str(config.get("router_mode") or router_part[len("router") :])
+    if router_mode not in {"hf", "whole"}:
+        return None
 
     seq_len = str(config.get("seq_len") or config.get("cutoff_len") or "")
     if not seq_len and run_dir.name.startswith("s") and run_dir.name[1:].isdigit():
         seq_len = run_dir.name[1:]
 
-    recompute = str(job_parts[2] if len(job_parts) > 2 else "")
-    if not recompute:
-        recompute = "recomp" if bool(config.get("activation_recompute", False)) else "norecomp"
-
     metadata = {
         "workload": str(config.get("workload") or config_root.name.split("__", 1)[0]),
-        "backend": str(config.get("backend") or (job_parts[0] if len(job_parts) > 0 else "")),
-        "profiler": str(job_parts[1] if len(job_parts) > 1 else "nsys"),
-        "recompute": recompute,
-        "expert_policy": expert_policy or "none",
+        "backend": str(config.get("backend") or backend_part),
+        "router_mode": router_mode,
+        "profiler": str(profiler_part),
+        "recompute": recompute_part,
+        "expert_policy": expert_policy,
         "seq_len": seq_len,
         "precision": str(config.get("precision") or ""),
         "lora_dropout": str(config.get("lora_dropout") if config.get("lora_dropout") is not None else ""),
@@ -224,6 +233,7 @@ def _matches_filters(record: RunRecord, args: argparse.Namespace) -> bool:
         "workload": _filter_values(args.workload),
         "backend": _filter_values(args.backend),
         "profiler": _filter_values(args.profiler),
+        "router_mode": _filter_values(args.router_mode),
         "recompute": _filter_values(args.recompute),
         "seq_len": _filter_values(args.seq_lens),
         "expert_policy": _filter_values(args.expert_recompute_policies),
@@ -281,10 +291,13 @@ def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
         by_step = _aggregate_step_rows(rows)
         if not by_step:
             continue
+        metadata = _infer_metadata(profile_path, profile)
+        if metadata is None:
+            continue
         record = RunRecord(
             run_dir=profile_path.parent,
             profile_path=profile_path,
-            metadata=_infer_metadata(profile_path, profile),
+            metadata=metadata,
             by_step=by_step,
         )
         if _matches_filters(record, args):
@@ -295,6 +308,7 @@ def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
             run.metadata.get("workload", ""),
             int(run.metadata.get("seq_len") or 0),
             run.metadata.get("backend", ""),
+            run.metadata.get("router_mode", ""),
             run.metadata.get("recompute", ""),
             run.metadata.get("expert_policy", ""),
             str(run.run_dir),

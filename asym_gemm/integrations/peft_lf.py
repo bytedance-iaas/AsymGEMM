@@ -20,6 +20,7 @@ def adapt_lf_asym_peft_lora(
     precision: Literal["bf16"],
     offload_modules: Literal["routed_experts", "none"],
     expert_recompute_policy: str = "none",
+    router_mode: Literal["hf", "whole"] = "whole",
     strict: bool = True,
 ) -> tuple[nn.Module, LFAsymReport]:
     """Adapt packed experts after PEFT has attached ordinary dense LoRA modules."""
@@ -35,6 +36,7 @@ def adapt_lf_asym_peft_lora(
         precision=precision,
         offload_modules=offload_modules,
         expert_recompute_policy=expert_recompute_policy,
+        router_mode=router_mode,
         wrap_dense=False,
         preexisting_dense_lora_wrapped=count_lora_wrapped_modules(model),
         strict=strict,

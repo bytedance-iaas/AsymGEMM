@@ -113,6 +113,7 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
         "",
         f"Workload: `{profile.get('workload', '-')}`  ",
         f"Backend: `{config.get('backend', '-')}`  ",
+        f"Router mode: `{config.get('router_mode', '-')}`  ",
         f"Precision: `{config.get('precision', '-')}`  ",
         f"Seq len: `{config.get('seq_len', '-')}`",
         f"Steps: `{warmup_steps}` warmup + `{measure_steps}` measured",

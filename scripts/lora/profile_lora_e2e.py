@@ -165,8 +165,8 @@ LORA_BACKWARD_OPS = ("base_dx_asymgemm", "base_lora_add", "add_cast_scale", "lor
 DENSE_ATTENTION_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj")
 DENSE_MLP_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 DENSE_ALL_PROJECTIONS = DENSE_ATTENTION_PROJECTIONS + DENSE_MLP_PROJECTIONS
-DENSE_TARGET_MODES = ("mlp_only", "attention_only", "all")
-DEFAULT_DENSE_TARGET_MODE = "all"
+TARGET_PRESETS = ("mlp_only", "attention_only", "all")
+DEFAULT_TARGET_PRESET = "all"
 DEFAULT_TARGET_MODULES = "all"
 DEFAULT_DENSE_OFFLOAD_MODULES = "mlp"
 DEFAULT_MOE_OFFLOAD_MODULES = "routed_experts"
@@ -228,7 +228,7 @@ def apply_expert_recompute_policy_label(args: argparse.Namespace) -> None:
 
 
 def profile_layer_count(args: argparse.Namespace, *, max_layers: int) -> int:
-    requested = str(getattr(args, "real_profile_layers", 1)).strip().lower()
+    requested = str(getattr(args, "profile_layers", 1)).strip().lower()
     if requested == "all":
         return int(max_layers)
     try:
@@ -391,7 +391,7 @@ def nbytes(tensor: torch.Tensor | None) -> int:
 
 
 def requested_tokens(args: argparse.Namespace, default: int) -> int:
-    tokens = int(getattr(args, "real_tokens", 0) or 0)
+    tokens = int(getattr(args, "tokens", 0) or 0)
     return tokens if tokens > 0 else int(default)
 
 
@@ -1931,9 +1931,9 @@ def _positive_int(value: int, name: str) -> int:
 
 def _shape_args(args: argparse.Namespace) -> tuple[int, int, int]:
     return (
-        int(getattr(args, "real_tokens", 0) or 0),
-        int(getattr(args, "real_batch_size", 0) or 0),
-        int(getattr(args, "real_seq_len", 0) or 0),
+        int(getattr(args, "tokens", 0) or 0),
+        int(getattr(args, "batch_size", 0) or 0),
+        int(getattr(args, "seq_len", 0) or 0),
     )
 
 
@@ -1963,16 +1963,16 @@ def _synthetic_lora_config(args: argparse.Namespace, raw: dict[str, Any], worklo
     config = dict(raw)
     _resolve_regression_shape(args, config)
 
-    hidden_dim = int(getattr(args, "real_hidden_dim", 0) or 0)
+    hidden_dim = int(getattr(args, "hidden_dim", 0) or 0)
     if hidden_dim > 0 and workload in {"mm_3b", "mlp_3b"}:
         hidden_dim = _positive_int(hidden_dim, "hidden_dim")
         config["hidden_dim"] = hidden_dim
         config["in_features"] = hidden_dim
         config["out_features"] = hidden_dim
         if "hidden_features" in config:
-            intermediate_dim = int(getattr(args, "real_mlp_intermediate_dim", 0) or 0)
+            intermediate_dim = int(getattr(args, "mlp_intermediate_dim", 0) or 0)
             if intermediate_dim <= 0:
-                expansion = int(getattr(args, "real_mlp_expansion", DEFAULT_LORA_MLP_EXPANSION) or DEFAULT_LORA_MLP_EXPANSION)
+                expansion = int(getattr(args, "mlp_expansion", DEFAULT_LORA_MLP_EXPANSION) or DEFAULT_LORA_MLP_EXPANSION)
                 expansion = _positive_int(expansion, "mlp_expansion")
                 intermediate_dim = hidden_dim * expansion
             intermediate_dim = _positive_int(intermediate_dim, "mlp_intermediate_dim")
@@ -1982,8 +1982,8 @@ def _synthetic_lora_config(args: argparse.Namespace, raw: dict[str, Any], worklo
 
 
 def lora_hparams(args: argparse.Namespace) -> tuple[int, float]:
-    rank = _positive_int(int(args.real_lora_rank), "lora_rank")
-    alpha = float(args.real_lora_alpha)
+    rank = _positive_int(int(args.lora_rank), "lora_rank")
+    alpha = float(args.lora_alpha)
     if alpha <= 0.0:
         raise ValueError(f"lora_alpha must be > 0, got {alpha}")
     return rank, alpha
@@ -2528,17 +2528,17 @@ def profile_dense(args: argparse.Namespace, device: torch.device, dtype: torch.d
     if not hasattr(args, "_dense_config_override"):
         config = replace(
             config,
-            batch_size=int(args.real_batch_size),
-            seq_len=int(args.real_seq_len),
-            lora_rank=int(args.real_lora_rank),
-            lora_alpha=float(args.real_lora_alpha),
+            batch_size=int(args.batch_size),
+            seq_len=int(args.seq_len),
+            lora_rank=int(args.lora_rank),
+            lora_alpha=float(args.lora_alpha),
             attention_impl=str(args.attention_impl),
         )
     workload_name = str(getattr(args, "_workload_name_override", "m4_2_dense_llm"))
     config_extra = dict(getattr(args, "_config_extra", {}))
-    target_mode = str(getattr(args, "target_preset", getattr(args, "dense_target_mode", DEFAULT_DENSE_TARGET_MODE)))
-    if target_mode not in DENSE_TARGET_MODES:
-        raise ValueError(f"target_preset={target_mode!r} must be one of {DENSE_TARGET_MODES}")
+    target_mode = str(args.target_preset)
+    if target_mode not in TARGET_PRESETS:
+        raise ValueError(f"target_preset={target_mode!r} must be one of {TARGET_PRESETS}")
     target_selector = str(getattr(args, "target_modules", DEFAULT_TARGET_MODULES) or DEFAULT_TARGET_MODULES)
     offload_selector = str(getattr(args, "offload_modules", DEFAULT_DENSE_OFFLOAD_MODULES) or DEFAULT_DENSE_OFFLOAD_MODULES)
     target_names = dense_selector_names(target_selector, default=target_mode, purpose="target")
@@ -2997,16 +2997,16 @@ def profile_moe(args: argparse.Namespace, device: torch.device, dtype: torch.dty
     clear(device)
     config = getattr(args, "_moe_config_override", MICRO_MOE_CONFIG)
     if not hasattr(args, "_moe_config_override"):
-        batch_size = int(args.real_batch_size)
-        seq_len = int(args.real_seq_len)
+        batch_size = int(args.batch_size)
+        seq_len = int(args.seq_len)
         config = replace(
             config,
             num_layers=profile_layer_count(args, max_layers=int(config.num_layers)),
             batch_size=batch_size,
             seq_len=seq_len,
             logical_tokens=requested_tokens(args, batch_size * seq_len),
-            lora_rank=int(args.real_lora_rank),
-            lora_alpha=float(args.real_lora_alpha),
+            lora_rank=int(args.lora_rank),
+            lora_alpha=float(args.lora_alpha),
             attention_impl=str(args.attention_impl),
         )
     if int(config.num_shared_experts) != 0:
@@ -3605,15 +3605,15 @@ def dense_config_from_metadata(metadata: dict[str, Any], args: argparse.Namespac
     from asym_gemm.training.dense import DenseLLMConfig
 
     return DenseLLMConfig(
-        vocab_size=min(int(metadata["vocab_size"]), int(args.real_vocab_rows)),
+        vocab_size=min(int(metadata["vocab_size"]), int(args.vocab_rows)),
         hidden_size=int(metadata["hidden_size"]),
         num_layers=profile_layer_count(args, max_layers=int(metadata["num_hidden_layers"])),
         num_heads=int(metadata["num_attention_heads"]),
-        seq_len=int(args.real_seq_len),
-        batch_size=int(args.real_batch_size),
+        seq_len=int(args.seq_len),
+        batch_size=int(args.batch_size),
         intermediate_size=int(metadata["intermediate_size"]),
-        lora_rank=int(args.real_lora_rank),
-        lora_alpha=float(args.real_lora_alpha),
+        lora_rank=int(args.lora_rank),
+        lora_alpha=float(args.lora_alpha),
         attention_impl=str(args.attention_impl),
     )
 
@@ -3627,15 +3627,15 @@ def moe_config_from_metadata(metadata: dict[str, Any], args: argparse.Namespace)
         top_k=int(metadata["num_experts_per_tok"]),
         hidden_size=int(metadata["hidden_size"]),
         intermediate_size=int(metadata["moe_intermediate_size"]),
-        logical_tokens=int(args.real_tokens or (int(args.real_seq_len) * int(args.real_batch_size))),
-        lora_rank=int(args.real_lora_rank),
-        lora_alpha=float(args.real_lora_alpha),
+        logical_tokens=int(args.tokens or (int(args.seq_len) * int(args.batch_size))),
+        lora_rank=int(args.lora_rank),
+        lora_alpha=float(args.lora_alpha),
         residual_scale=0.25,
         num_shared_experts=int(metadata["num_shared_experts"]),
-        vocab_size=min(int(metadata["vocab_size"]), int(args.real_vocab_rows)),
+        vocab_size=min(int(metadata["vocab_size"]), int(args.vocab_rows)),
         num_heads=int(metadata["num_attention_heads"]),
-        batch_size=int(args.real_batch_size),
-        seq_len=int(args.real_seq_len),
+        batch_size=int(args.batch_size),
+        seq_len=int(args.seq_len),
         attention_impl=str(args.attention_impl),
     )
 
@@ -4016,10 +4016,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--target-preset",
-        "--dense-target-mode",
-        dest="target_preset",
-        choices=DENSE_TARGET_MODES,
-        default=DEFAULT_DENSE_TARGET_MODE,
+        choices=TARGET_PRESETS,
+        default=DEFAULT_TARGET_PRESET,
         help="LoRA target preset for toy/HF-style projections. Default adapts all known target projections.",
     )
     parser.add_argument(
@@ -4032,14 +4030,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="CPU/AsymGEMM base offload selector or comma list. Dense default is mlp; MoE default is routed_experts.",
     )
-    parser.add_argument("--profile-layers", "--real-profile-layers", dest="real_profile_layers", metavar="N|all", default="1")
-    parser.add_argument("--batch-size", "--real-batch-size", dest="real_batch_size", metavar="N", type=int, default=DEFAULT_LORA_BATCH_SIZE)
-    parser.add_argument("--seq-len", "--real-seq-len", dest="real_seq_len", metavar="N", type=int, default=DEFAULT_LORA_SEQ_LEN)
-    parser.add_argument("--tokens", "--real-tokens", dest="real_tokens", metavar="N", type=int, default=0)
+    parser.add_argument("--profile-layers", metavar="N|all", default="1")
+    parser.add_argument("--batch-size", metavar="N", type=int, default=DEFAULT_LORA_BATCH_SIZE)
+    parser.add_argument("--seq-len", metavar="N", type=int, default=DEFAULT_LORA_SEQ_LEN)
+    parser.add_argument("--tokens", metavar="N", type=int, default=0)
     parser.add_argument(
         "--hidden-dim",
-        "--real-hidden-dim",
-        dest="real_hidden_dim",
         metavar="N",
         type=int,
         default=DEFAULT_LORA_HIDDEN_DIM,
@@ -4047,8 +4043,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mlp-intermediate-dim",
-        "--real-mlp-intermediate-dim",
-        dest="real_mlp_intermediate_dim",
         metavar="N",
         type=int,
         default=0,
@@ -4056,17 +4050,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mlp-expansion",
-        "--real-mlp-expansion",
-        dest="real_mlp_expansion",
         metavar="N",
         type=int,
         default=DEFAULT_LORA_MLP_EXPANSION,
         help="MLP expansion used when --mlp-intermediate-dim is not set.",
     )
-    parser.add_argument("--lora-rank", "--real-lora-rank", dest="real_lora_rank", metavar="N", type=int, default=64)
-    parser.add_argument("--lora-alpha", "--real-lora-alpha", dest="real_lora_alpha", metavar="FLOAT", type=float, default=128.0)
+    parser.add_argument("--lora-rank", metavar="N", type=int, default=64)
+    parser.add_argument("--lora-alpha", metavar="FLOAT", type=float, default=128.0)
     parser.add_argument("--lora-dtype", choices=LORA_DTYPE_CHOICES, default="bf16")
-    parser.add_argument("--vocab-rows", "--real-vocab-rows", dest="real_vocab_rows", metavar="N", type=int, default=4096)
+    parser.add_argument("--vocab-rows", metavar="N", type=int, default=4096)
     parser.add_argument(
         "--precision",
         default="bf16",
@@ -4086,8 +4078,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--export-torch-trace", action="store_true", help="Export a PyTorch profiler Chrome trace for the measured run")
     parser.add_argument(
         "--torch-profiler-with-stack",
-        "--torch-profiler-stack-debug",
-        dest="torch_profiler_with_stack",
         action="store_true",
         help="Enable PyTorch profiler stack capture when exporting a trace. This is debug-only and adds noticeable overhead.",
     )
@@ -4122,7 +4112,6 @@ def parse_args() -> argparse.Namespace:
         help="Seed for generated profiling batches. Keeps learned MoE routing comparable across policy sweeps.",
     )
     parsed = parser.parse_args()
-    parsed.dense_target_mode = parsed.target_preset
     try:
         apply_expert_recompute_policy_label(parsed)
         validate_backend_workload(parsed)

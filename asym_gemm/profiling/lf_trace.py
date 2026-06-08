@@ -41,8 +41,12 @@ def _semantic_module_name(name: str) -> str | None:
         return None
     if name.endswith(".self_attn"):
         return f"layers.{layer}.self_attn"
+    if name.endswith(".mlp.gate") or name.endswith(".feed_forward.router"):
+        return f"layers.{layer}.router"
     if name.endswith(".mlp.experts") or name.endswith(".experts"):
         return f"layers.{layer}.mlp.experts"
+    if name.endswith(".feed_forward.shared_expert"):
+        return f"layers.{layer}.mlp"
     if name.endswith(".mlp"):
         return f"layers.{layer}.mlp"
     return None
@@ -62,12 +66,12 @@ def _filter_token(semantic_name: str) -> str:
 class LFTraceConfig:
     level: str = "stage"
     layers: str = "all"
-    module_filter: str = "attention,mlp,experts,lora,optimizer"
+    module_filter: str = "attention,router,mlp,experts,lora,optimizer"
     memory_attribution: bool = False
     memory_breakdown: bool = False
     memory_breakdown_interval: int = 1
     memory_breakdown_steps: str = ""
-    memory_breakdown_modules: str = "attention,mlp,experts,lora,embedding,loss"
+    memory_breakdown_modules: str = "attention,router,mlp,experts,lora,embedding,loss"
     memory_breakdown_output: str = "memory_breakdown"
     sync: bool = False
     nsys_capture_range: bool = False
@@ -87,7 +91,7 @@ class LFTraceConfig:
             layers=env.get("ASYM_GEMM_LF_PROFILE_LAYERS", "all").strip().lower(),
             module_filter=env.get(
                 "ASYM_GEMM_LF_PROFILE_MODULE_FILTER",
-                "attention,mlp,experts,lora,optimizer",
+                "attention,router,mlp,experts,lora,optimizer",
             ),
             memory_attribution=_parse_bool(env.get("ASYM_GEMM_LF_PROFILE_MEMORY_ATTRIBUTION", "0")),
             memory_breakdown=_parse_bool(env.get("ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN", "0")),
@@ -330,6 +334,8 @@ def _component_from_module_name(name: str) -> str | None:
     lower = name.lower()
     if not lower:
         return None
+    if lower.endswith(".mlp.gate") or lower.endswith(".feed_forward.router") or lower.endswith(".router"):
+        return "router"
     if lower.endswith(".self_attn") or lower.endswith(".attention"):
         return "attention"
     if lower.endswith(".mlp.experts") or lower.endswith(".experts"):
@@ -371,6 +377,7 @@ class LFMemoryBreakdownProfiler:
         self.step_filter = _parse_step_set(config.memory_breakdown_steps)
         self.module_filter = _csv_set(config.memory_breakdown_modules) or {
             "attention",
+            "router",
             "mlp",
             "experts",
             "lora",

@@ -59,7 +59,15 @@ from .moe import (
     run_moe_correctness_report,
     run_moe_memory_comparison,
 )
-from .qwen3_moe import AsymQwen3Experts, Qwen3ExpertReport, is_qwen3_experts, wrap_qwen3_experts
+from .qwen3_moe import (
+    AsymQwen3Experts,
+    AsymQwen3MoeBlock,
+    Qwen3ExpertReport,
+    is_qwen3_experts,
+    is_qwen3_moe_block,
+    wrap_qwen3_experts,
+    wrap_qwen3_moe_block,
+)
 from .llama4_moe import AsymLlama4Moe, Llama4MoeReport, is_llama4_moe, wrap_llama4_moe
 from .packed_moe import AsymPackedExperts, PackedExpertSource, PackedMoELayout, wrap_packed_experts
 
@@ -82,6 +90,7 @@ __all__ = [
     "AsymLlama4Moe",
     "AsymPackedExperts",
     "AsymQwen3Experts",
+    "AsymQwen3MoeBlock",
     "FrozenLinear",
     "GroupedLoRAMetadata",
     "HostWeight",
@@ -122,6 +131,7 @@ __all__ = [
     "grouped_expert_lora",
     "grouped_expert_lora_pair",
     "is_qwen3_experts",
+    "is_qwen3_moe_block",
     "is_llama4_moe",
     "load_lora_state_dict",
     "load_peft_adapter",
@@ -140,6 +150,7 @@ __all__ = [
     "prepare_grouped_lora_metadata",
     "tensor_nbytes",
     "wrap_qwen3_experts",
+    "wrap_qwen3_moe_block",
     "wrap_llama4_moe",
     "wrap_packed_experts",
 ]

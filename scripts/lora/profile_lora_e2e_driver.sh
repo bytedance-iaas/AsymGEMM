@@ -13,14 +13,8 @@ GPU_POOL="0,1,3"
 # Per-workload layers can be set as "workload|layers", e.g. "moe-604m-a75m|2".
 # Use "workload|all" to profile the full configured/HF model depth.
 # Dense workload names are total-model labels; MoE workload names are per-layer routed-expert total/active labels.
-# WORKLOADS="mlp_3b,mm_3b,dense_3b,moe-604m-a75m,mlp,dense,moe,dense_14b,moe-604m-a38m"
-# WORKLOADS="dense_3b,moe-604m-a75m|2"
-# WORKLOADS="mlp_3b,mm_3b,dense_3b,moe-604m-a75m|4"
-# WORKLOADS="Qwen/Qwen3-30B-A3B|4,Qwen/Qwen3-235B-A22B-Instruct-2507|4"
 WORKLOADS="Qwen/Qwen3-30B-A3B|4"
 BACKENDS="asym,torch"
-# BACKENDS="torch"
-# PROFILERS="nsys,cpu"
 PROFILERS="nsys"
 
 JOBS_PER_GPU=1
@@ -34,13 +28,11 @@ WARMUP_STEPS=10
 MEASURE_STEPS=20
 PROFILE_LAYERS=1
 BATCH_SIZE=8
-# SEQ_LENS="64,128,256,512,640,768,896,1024,2048,3072,4096,6144,8192,10240,16384,20480"
 SEQ_LENS="2048"
 # Expert recompute policy specs:
 #   none, tok-le0, tok-le0-act, tok-leXX, tok-geXX, tokA-B, and -act variants.
 # tok-leXX/tok-geXX/tokA-B drop gate/up/activated for selected experts and recompute them in backward.
 # -act variants save gate/up and drop only activated for selected experts.
-# EXPERT_RECOMPUTE_POLICIES="none,tok-le512,tok-le512-act"
 EXPERT_RECOMPUTE_POLICIES="none,tok-le512"
 MLP_INTERMEDIATE_DIM=0
 MLP_EXPANSION=4
@@ -53,7 +45,7 @@ HF_LAYER_INDEX=0
 HF_CACHE_DIR=""
 HF_LOCAL_FILES_ONLY=false
 PROFILE_SEED=1234
-DENSE_TARGET_MODE="mlp_only"
+TARGET_PRESET="mlp_only"
 
 KT_METHOD="AMXBF16_SFT"
 KT_CPU_THREADS=1
@@ -92,6 +84,7 @@ Defaults:
   --moe-route-pattern ${MOE_ROUTE_PATTERN}
   --hf-layer-index ${HF_LAYER_INDEX}
   --profile-seed ${PROFILE_SEED}
+  --target-preset ${TARGET_PRESET}
   --recompute ${RECOMPUTE}
   --overwrite ${OVERWRITE}
   --continue-on-error ${CONTINUE_ON_ERROR}
@@ -116,6 +109,7 @@ Shell options:
   --hf-cache-dir PATH                 Optional Hugging Face cache directory.
   --hf-local-files-only true|false     Do not download missing Hugging Face files.
   --profile-seed N                    Seed for generated profiling batches and learned routing.
+  --target-preset NAME                Dense target scope: mlp_only, attention_only, or all.
   --plot true|false                   Write per-config plots and a top-level combined plot directory after profiling.
   --plot-output-dir PATH              Plot output directory.
   --recompute norecomp|recomp|both     Run without recompute, with recompute, or both.
@@ -381,6 +375,7 @@ hf_layer_index="${HF_LAYER_INDEX}"
 hf_cache_dir="${HF_CACHE_DIR}"
 hf_local_files_only="$(bool_value "${HF_LOCAL_FILES_ONLY}")"
 profile_seed="${PROFILE_SEED}"
+target_preset="${TARGET_PRESET}"
 plot="$(bool_value "${PLOT}")"
 plot_output_dir="${PLOT_OUTPUT_DIR}"
 recompute_spec="${RECOMPUTE}"
@@ -414,6 +409,7 @@ while (($#)); do
     --hf-cache-dir=*) hf_cache_dir="${1#*=}"; shift ;;
     --hf-local-files-only=*) die "use '--hf-local-files-only true' or '--hf-local-files-only false' instead of --hf-local-files-only=..." ;;
     --profile-seed=*) profile_seed="${1#*=}"; shift ;;
+    --target-preset=*) target_preset="${1#*=}"; shift ;;
     --plot=*) die "use '--plot true' or '--plot false' instead of --plot=..." ;;
     --plot-output-dir=*) plot_output_dir="${1#*=}"; shift ;;
     --recompute=*) recompute_spec="${1#*=}"; shift ;;
@@ -441,6 +437,7 @@ while (($#)); do
     --hf-cache-dir) need_value "$1" "${2-}"; hf_cache_dir="$2"; shift 2 ;;
     --hf-local-files-only) need_value "$1" "${2-}"; hf_local_files_only="$(bool_value "$2")"; shift 2 ;;
     --profile-seed) need_value "$1" "${2-}"; profile_seed="$2"; shift 2 ;;
+    --target-preset) need_value "$1" "${2-}"; target_preset="$2"; shift 2 ;;
     --plot) need_value "$1" "${2-}"; plot="$(bool_value "$2")"; shift 2 ;;
     --plot-output-dir) need_value "$1" "${2-}"; plot_output_dir="$2"; shift 2 ;;
     --recompute) need_value "$1" "${2-}"; recompute_spec="$2"; shift 2 ;;
@@ -464,6 +461,7 @@ done
 case "${moe_route_pattern}" in balanced|learned) ;; *) die "--moe-route-pattern must be balanced or learned" ;; esac
 [[ "${hf_layer_index}" =~ ^[0-9]+$ ]] || die "--hf-layer-index must be a non-negative integer"
 [[ "${profile_seed}" =~ ^-?[0-9]+$ ]] || die "--profile-seed must be an integer"
+case "${target_preset}" in mlp_only|attention_only|all) ;; *) die "--target-preset must be mlp_only, attention_only, or all" ;; esac
 [[ "${jobs_per_gpu}" =~ ^[0-9]+$ && "${jobs_per_gpu}" -gt 0 ]] || die "--jobs-per-gpu must be a positive integer"
 
 mapfile -t gpus < <(parse_gpu_list "${gpu_spec}")
@@ -497,7 +495,7 @@ driver_args=(
   --moe-route-pattern "${moe_route_pattern}"
   --hf-layer-index "${hf_layer_index}"
   --profile-seed "${profile_seed}"
-  --dense-target-mode "${DENSE_TARGET_MODE}"
+  --target-preset "${target_preset}"
   --kt-method "${KT_METHOD}"
   --kt-cpu-threads "${KT_CPU_THREADS}"
   --kt-threadpool-count "${KT_THREADPOOL_COUNT}"

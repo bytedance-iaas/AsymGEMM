@@ -30,6 +30,7 @@ PROFILE_MODULE_FILTER_ENV = "ASYM_GEMM_LF_PROFILE_MODULE_FILTER"
 CONFIG_ENV_PREFIX = "ASYM_GEMM_LF_CONFIG_"
 
 _LAST_LF_MODEL: Any | None = None
+_DEEPSPEED_RUNTIME_MARKER: dict[str, Any] = {}
 
 
 def _env_enabled(name: str, default: bool = False) -> bool:
@@ -115,6 +116,7 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
     asym_backend = _option_value(args, "--asym_backend")
     backend = os.environ.get("ASYM_GEMM_LF_CONFIG_BACKEND") or ("torch" if asym_backend == "torch" else asym_backend or "hf")
     expert_policy = parse_expert_recompute_policy_spec(os.environ.get("ASYM_GEMM_LF_CONFIG_EXPERT_POLICY", "none"))
+    is_superoffload_backend = backend == "superoffload"
     config = {
         "workflow": "lora_lf_sft",
         "workload": os.environ.get("ASYM_GEMM_LF_CONFIG_WORKLOAD", model_label),
@@ -155,6 +157,13 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "profile_memory_breakdown": os.environ.get(PROFILE_MEMORY_BREAKDOWN_ENV, "0"),
         "profile_sync": os.environ.get(PROFILE_SYNC_ENV, "0"),
         "profile_module_filter": os.environ.get(PROFILE_MODULE_FILTER_ENV, ""),
+        "superoffload_config": os.environ.get("ASYM_GEMM_LF_CONFIG_SUPEROFFLOAD_CONFIG")
+        if is_superoffload_backend
+        else None,
+        "superoffload_cpuadam_cores_perc": os.environ.get("ASYM_GEMM_LF_CONFIG_SUPEROFFLOAD_CPUADAM_CORES_PERC")
+        if is_superoffload_backend
+        else None,
+        "deepspeed_dir": os.environ.get("ASYM_GEMM_LF_CONFIG_DEEPSPEED_DIR"),
         "output_dir": _option_value(args, "--output_dir"),
     }
     for key, value in env_config.items():
@@ -251,6 +260,81 @@ def _kt_counters_from_model() -> dict[str, Any]:
         "total_forward_calls": sum(int(row["forward_calls"]) for row in rows),
         "total_backward_calls": sum(int(row["backward_calls"]) for row in rows),
     }
+
+
+def _superoffload_summary_from_config(config: dict[str, Any]) -> dict[str, Any]:
+    is_superoffload_backend = str(config.get("backend") or "").lower() == "superoffload"
+    config_path = str(config.get("superoffload_config") or "") if is_superoffload_backend else ""
+    config_super_offload = False
+    cpuadam_cores_perc = (
+        _safe_float(config.get("superoffload_cpuadam_cores_perc")) if is_superoffload_backend else None
+    )
+    if config_path:
+        path = Path(config_path)
+        if path.is_file():
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    ds_config = json.load(handle)
+                zero = ds_config.get("zero_optimization", {}) if isinstance(ds_config, dict) else {}
+                optimizer = zero.get("offload_optimizer", {}) if isinstance(zero, dict) else {}
+                if isinstance(optimizer, dict):
+                    config_super_offload = optimizer.get("super_offload") is True
+                    cpuadam_cores_perc = _safe_float(optimizer.get("cpuadam_cores_perc")) or cpuadam_cores_perc
+            except (OSError, json.JSONDecodeError):
+                config_super_offload = False
+
+    optimizer_class = _DEEPSPEED_RUNTIME_MARKER.get("optimizer_class")
+    runtime_verified = optimizer_class == "SuperOffloadOptimizer_Stage3"
+    return {
+        "enabled": bool(config_super_offload or runtime_verified),
+        "runtime_verified": bool(runtime_verified),
+        "optimizer_class": optimizer_class,
+        "engine_class": _DEEPSPEED_RUNTIME_MARKER.get("engine_class"),
+        "engine_super_offload": _DEEPSPEED_RUNTIME_MARKER.get("engine_super_offload"),
+        "config_super_offload": bool(config_super_offload),
+        "cpuadam_cores_perc": cpuadam_cores_perc,
+        "deepspeed_config": config_path or None,
+        "deepspeed_dir": config.get("deepspeed_dir"),
+        "marker_source": _DEEPSPEED_RUNTIME_MARKER.get("marker_source"),
+    }
+
+
+def _install_deepspeed_optimizer_capture_hook() -> None:
+    try:
+        from deepspeed.runtime.engine import DeepSpeedEngine
+    except Exception:
+        return
+
+    original_configure_optimizer = getattr(DeepSpeedEngine, "_configure_optimizer", None)
+    if original_configure_optimizer is None:
+        return
+    if getattr(original_configure_optimizer, "_asym_gemm_superoffload_capture", False):
+        return
+
+    def wrapped_configure_optimizer(self: Any, client_optimizer: Any, model_parameters: Any) -> Any:
+        result = original_configure_optimizer(self, client_optimizer, model_parameters)
+        optimizer = getattr(self, "optimizer", None)
+        optimizer_class = optimizer.__class__.__name__ if optimizer is not None else None
+        try:
+            engine_super_offload = bool(self.super_offload())
+        except Exception:
+            engine_super_offload = None
+        _DEEPSPEED_RUNTIME_MARKER.update(
+            {
+                "optimizer_class": optimizer_class,
+                "engine_class": self.__class__.__name__,
+                "engine_super_offload": engine_super_offload,
+                "marker_source": "deepspeed_engine_hook",
+            }
+        )
+        if _is_rank0() and optimizer_class:
+            print(f"DeepSpeed Final Optimizer = {optimizer_class}", flush=True)
+            if engine_super_offload:
+                print("DeepSpeed SuperOffload runtime enabled = true", flush=True)
+        return result
+
+    wrapped_configure_optimizer._asym_gemm_superoffload_capture = True  # type: ignore[attr-defined]
+    DeepSpeedEngine._configure_optimizer = wrapped_configure_optimizer
 
 
 def _iter_unique_parameters(value: Any) -> list[torch.nn.Parameter]:
@@ -668,6 +752,7 @@ class LFProfileRecorder:
             },
             "lora": _lora_counters_from_model(),
             "kt": _kt_counters_from_model(),
+            "superoffload": _superoffload_summary_from_config(self.config),
             "expert_token_distribution": {"samples": 0, "per_expert": []},
             "notes": [
                 "LF source timings are host wall-clock ranges without per-range CUDA synchronization.",
@@ -695,6 +780,7 @@ def main() -> None:
     set_profile_enabled(True)
     trace_handle = install_lf_trace(trace_config, recorder=recorder)
     _install_model_capture_hook()
+    _install_deepspeed_optimizer_capture_hook()
 
     try:
         from llamafactory.train.tuner import run_exp

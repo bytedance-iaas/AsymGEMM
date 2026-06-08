@@ -56,6 +56,7 @@ class RunRecord:
         parts = [
             self.metadata.get("workload", ""),
             self.metadata.get("backend", ""),
+            f"router={self.metadata.get('router_mode', '')}" if self.metadata.get("router_mode") else "",
             self.metadata.get("recompute", ""),
             self.metadata.get("expert_policy", ""),
             self.metadata.get("seq_len", ""),
@@ -75,6 +76,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--workload", action="append", default=[])
     parser.add_argument("--backend", action="append", default=[])
     parser.add_argument("--profiler", action="append", default=[])
+    parser.add_argument("--router-mode", action="append", default=[], choices=["hf", "whole"])
     parser.add_argument("--seq-lens", nargs="+", default=[])
     parser.add_argument("--expert-recompute-policies", nargs="+", default=[])
     return parser.parse_args()
@@ -111,31 +113,36 @@ def _first_existing(paths: list[Path]) -> Path | None:
     return None
 
 
-def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str]:
+def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | None:
     source_profile = _safe_read_json(run_dir / "source_profile.json")
     config = source_profile.get("config", {}) if isinstance(source_profile.get("config"), dict) else {}
     job_root = run_dir.parent
     config_root = job_root.parent
     job_parts = job_root.name.split("__")
+    if len(job_parts) != 5:
+        return None
+    backend_part, profiler_part, recompute_part, policy_part, router_part = job_parts
+    if not policy_part.startswith("pol") or not router_part.startswith("router"):
+        return None
+    router_mode = str(config.get("router_mode") or router_part[len("router") :])
+    if router_mode not in {"hf", "whole"}:
+        return None
+    expert_policy = str(config.get("expert_policy") or policy_part[len("pol") :] or "none")
 
     metadata = {
         "workload": str(config.get("workload") or config_root.name.split("__")[0]),
-        "backend": str(config.get("backend") or (job_parts[0] if len(job_parts) > 0 else "")),
-        "profiler": str(job_parts[1] if len(job_parts) > 1 else "source"),
-        "recompute": str(job_parts[2] if len(job_parts) > 2 else ""),
-        "expert_policy": str(config.get("expert_policy") or ""),
+        "backend": str(config.get("backend") or backend_part),
+        "profiler": str(profiler_part),
+        "recompute": str(recompute_part),
+        "expert_policy": expert_policy,
+        "router_mode": router_mode,
         "seq_len": str(config.get("seq_len") or ""),
         "config": config_root.name,
     }
-    for part in job_parts:
-        if part.startswith("pol") and not metadata["expert_policy"]:
-            metadata["expert_policy"] = part[len("pol") :]
     if not metadata["seq_len"] and run_dir.name.startswith("s") and run_dir.name[1:].isdigit():
         metadata["seq_len"] = run_dir.name[1:]
     if not metadata["profiler"]:
         metadata["profiler"] = "source"
-    if not metadata["expert_policy"]:
-        metadata["expert_policy"] = "none"
     return metadata
 
 
@@ -183,6 +190,8 @@ def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
             ]
         )
         metadata = _infer_metadata(run_dir, summary)
+        if metadata is None:
+            continue
         record = RunRecord(run_dir=run_dir, summary_path=summary_path, jsonl_path=jsonl_path, summary=summary, metadata=metadata)
         if not _matches_filters(record, args):
             continue
@@ -204,6 +213,7 @@ def _matches_filters(run: RunRecord, args: argparse.Namespace) -> bool:
         "workload": _filter_values(args.workload),
         "backend": _filter_values(args.backend),
         "profiler": _filter_values(args.profiler),
+        "router_mode": _filter_values(args.router_mode),
         "seq_len": _filter_values(args.seq_lens),
         "expert_policy": _filter_values(args.expert_recompute_policies),
     }

@@ -47,13 +47,13 @@ def main() -> None:
     parser.add_argument("--hf-cache-dir", default="")
     parser.add_argument("--hf-local-files-only", action="store_true")
     parser.add_argument("--profile-seed", type=int, default=1234)
-    parser.add_argument("--profile-layers", "--real-profile-layers", dest="real_profile_layers", metavar="N", type=int, default=1)
-    parser.add_argument("--batch-size", "--real-batch-size", dest="real_batch_size", metavar="N", type=int, default=1)
-    parser.add_argument("--seq-len", "--real-seq-len", dest="real_seq_len", metavar="N", type=int, default=64)
-    parser.add_argument("--tokens", "--real-tokens", dest="real_tokens", metavar="N", type=int, default=0)
-    parser.add_argument("--lora-rank", "--real-lora-rank", dest="real_lora_rank", metavar="N", type=int, default=64)
-    parser.add_argument("--lora-alpha", "--real-lora-alpha", dest="real_lora_alpha", metavar="FLOAT", type=float, default=128.0)
-    parser.add_argument("--vocab-rows", "--real-vocab-rows", dest="real_vocab_rows", metavar="N", type=int, default=4096)
+    parser.add_argument("--profile-layers", metavar="N", type=int, default=1)
+    parser.add_argument("--batch-size", metavar="N", type=int, default=1)
+    parser.add_argument("--seq-len", metavar="N", type=int, default=64)
+    parser.add_argument("--tokens", metavar="N", type=int, default=0)
+    parser.add_argument("--lora-rank", metavar="N", type=int, default=64)
+    parser.add_argument("--lora-alpha", metavar="FLOAT", type=float, default=128.0)
+    parser.add_argument("--vocab-rows", metavar="N", type=int, default=4096)
     parser.add_argument("--expert-recompute-policy", default="none")
     parser.add_argument("--output-root", type=Path, default=Path("profiling"))
     parser.add_argument("--output-dir", type=Path, help="Exact output directory. Overrides --output-root/<workload>/cpu_gaps.")
@@ -125,19 +125,19 @@ def main() -> None:
         "--profile-seed",
         str(args.profile_seed),
         "--profile-layers",
-        str(args.real_profile_layers),
+        str(args.profile_layers),
         "--batch-size",
-        str(args.real_batch_size),
+        str(args.batch_size),
         "--seq-len",
-        str(args.real_seq_len),
+        str(args.seq_len),
         "--tokens",
-        str(args.real_tokens),
+        str(args.tokens),
         "--lora-rank",
-        str(args.real_lora_rank),
+        str(args.lora_rank),
         "--lora-alpha",
-        str(args.real_lora_alpha),
+        str(args.lora_alpha),
         "--vocab-rows",
-        str(args.real_vocab_rows),
+        str(args.vocab_rows),
         "--expert-recompute-policy",
         str(args.expert_recompute_policy),
         "--output-dir",

@@ -14,15 +14,20 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 MIB = 1024.0**2
-RESULT_RE = re.compile(
-    r"^(?P<precision>.+?)_lora-sft_b(?P<batch_size>[0-9]+)_s(?P<seq_len>[0-9]+)_"
-    r"(?P<recompute>recomp|norecomp)"
-    r"(?:_expertpolicy(?P<expert_policy>[A-Za-z0-9.-]+))?"
-    r"_(?P<tail>.+)$"
-)
 FLAT_SEQ_RE = re.compile(r"^s(?P<seq_len>[0-9]+)$")
 PROFILERS = ("source", "nsys", "cpu", "ncu")
-BACKENDS = ("asym", "torch", "kt")
+BACKENDS = (
+    "torch",
+    "asym",
+    "asym_torch",
+    "zero2",
+    "zero3",
+    "zero3_offload",
+    "superoffload",
+    "kt",
+    "kt_torchbf16",
+    "kt_armbf16",
+)
 LINEAR_REGION_R2_THRESHOLD = 0.99
 LINEAR_REGION_RATIO_CV_THRESHOLD = 0.08
 MIN_LINEAR_REGION_POINTS = 4
@@ -75,9 +80,16 @@ STYLE_PALETTE = (
     "#C5B0D5",
 )
 BACKEND_MARKERS = {
+    "torch": "x",
     "asym": "^",
-    "torch": "o",
+    "asym_torch": "v",
+    "zero2": "o",
+    "zero3": "D",
+    "zero3_offload": "P",
+    "superoffload": "X",
     "kt": "s",
+    "kt_torchbf16": "s",
+    "kt_armbf16": "s",
 }
 ROOT_OUTPUT_FILES = (
     "activation_recompute_sweep_index.csv",
@@ -163,17 +175,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precision", default="")
     parser.add_argument("--workload", action="append", default=[], help="Workload label to include, e.g. moe-604m-a38m-l2.")
     parser.add_argument("--backend", action="append", default=[], choices=list(BACKENDS))
+    parser.add_argument("--router-mode", action="append", default=[], choices=["hf", "whole"])
     parser.add_argument("--profiler", action="append", default=[], choices=list(PROFILERS))
     parser.add_argument(
         "--recompute",
         action="append",
         default=[],
-        choices=["norecomp", "recomp", "no_recompute", "recompute"],
+        choices=["norecomp", "recomp"],
         help="Activation recompute mode to include. Repeat for both.",
     )
     parser.add_argument("--batch-size", action="append", type=int, default=[])
-    parser.add_argument("--seq-len", "--seq-lens", dest="seq_lens", nargs="+", type=int, default=[])
-    parser.add_argument("--expert-recompute-policy", action="append", default=[])
+    parser.add_argument("--seq-lens", nargs="+", type=int, default=[])
     parser.add_argument(
         "--expert-recompute-policies",
         nargs="+",
@@ -336,10 +348,21 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
         return None
     job_dir = path.parent
     parts = job_dir.name.split("__")
-    if len(parts) != 4:
+    if len(parts) == 4:
+        backend, profiler, recompute, policy_part = parts
+        router_mode = "hf"
+    elif len(parts) == 5:
+        backend, profiler, recompute, policy_part, router_part = parts
+        if not router_part.startswith("router"):
+            return None
+        router_mode = router_part[len("router") :]
+    else:
         return None
-    backend, profiler, recompute, policy_part = parts
+    if router_mode not in {"hf", "whole"}:
+        return None
     if profiler not in PROFILERS or recompute not in {"recomp", "norecomp"}:
+        return None
+    if backend not in BACKENDS:
         return None
     if policy_part.startswith("pol"):
         try:
@@ -358,6 +381,7 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
         "mode": "recompute" if recompute == "recomp" else "no_recompute",
         "activation_recompute": recompute == "recomp",
         "backend": backend,
+        "router_mode": router_mode,
         "profiler": profiler,
         **workload_meta,
         **policy_meta,
@@ -365,34 +389,7 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
 
 
 def parse_result_dir(path: Path) -> dict[str, Any] | None:
-    match = RESULT_RE.match(path.name)
-    if match is None:
-        return parse_flat_result_dir(path)
-    tail = match.group("tail")
-    profiler = next((candidate for candidate in PROFILERS if tail.endswith(f"_{candidate}")), "")
-    if not profiler:
-        return None
-    backend = tail[: -(len(profiler) + 1)]
-    if backend not in BACKENDS:
-        return None
-    try:
-        policy_meta = parse_expert_policy_spec(
-            match.group("expert_policy"),
-        )
-    except ValueError:
-        return None
-    workload_meta = config_workload_meta(path.parent.name)
-    return {
-        "precision": match.group("precision"),
-        "batch_size": int(match.group("batch_size")),
-        "seq_len": int(match.group("seq_len")),
-        "mode": "recompute" if match.group("recompute") == "recomp" else "no_recompute",
-        "activation_recompute": match.group("recompute") == "recomp",
-        "backend": backend,
-        "profiler": profiler,
-        **workload_meta,
-        **policy_meta,
-    }
+    return parse_flat_result_dir(path)
 
 
 def profile_json_path(result_dir: Path, profiler: str | None = None) -> Path | None:
@@ -552,6 +549,8 @@ def passes_filters(args: argparse.Namespace, meta: dict[str, Any]) -> bool:
             return False
     if args.backend and meta["backend"] not in set(args.backend):
         return False
+    if args.router_mode and meta["router_mode"] not in set(args.router_mode):
+        return False
     if args.profiler and meta["profiler"] not in set(args.profiler):
         return False
     if recompute_modes and meta["mode"] not in recompute_modes:
@@ -560,7 +559,7 @@ def passes_filters(args: argparse.Namespace, meta: dict[str, Any]) -> bool:
         return False
     if args.seq_lens and meta["seq_len"] not in set(args.seq_lens):
         return False
-    policy_values = split_tokens(list(args.expert_recompute_policy) + list(args.expert_recompute_policies))
+    policy_values = split_tokens(list(args.expert_recompute_policies))
     if policy_values:
         parsed_policy_filter = [parse_expert_policy_spec(value) for value in policy_values]
         policy_filter = {
@@ -584,11 +583,6 @@ def skip_search_path(path: Path, input_root: Path) -> bool:
 
 
 def result_dirs(input_root: Path) -> list[Path]:
-    root_named_dirs = [
-        path
-        for path in input_root.rglob("*_lora-sft_*")
-        if path.is_dir() and not skip_search_path(path, input_root)
-    ]
     flat_dirs = []
     for path in input_root.rglob("s*"):
         if not path.is_dir() or FLAT_SEQ_RE.match(path.name) is None or skip_search_path(path, input_root):
@@ -598,7 +592,7 @@ def result_dirs(input_root: Path) -> list[Path]:
             continue
         if profile_json_path(path, str(meta.get("profiler", ""))) is not None:
             flat_dirs.append(path)
-    return sorted({*root_named_dirs, *flat_dirs})
+    return sorted(set(flat_dirs))
 
 
 def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str, Any] | None:
@@ -653,11 +647,14 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
             config.get("expert_activation_save_threshold", meta.get("expert_activation_save_threshold", 0)),
         )
     )
-    # Expert-policy sweeps are an AsymGEMM feature.  Torch/KT comparison runs
+    router_mode = str(config.get("router_mode", meta["router_mode"]))
+    if router_mode not in {"hf", "whole"}:
+        return None
+    # Expert-policy sweeps are an AsymGEMM feature.  Zero/KT comparison runs
     # may live under policy-named directories for pairing, but the policy is not
     # applied to those backends.  Canonicalize them to one baseline series so
-    # plots do not imply torch changes with AsymGEMM expert recompute policy.
-    if str(meta["backend"]) != "asym":
+    # plots do not imply Zero-policy changes with AsymGEMM expert recompute policy.
+    if str(meta["backend"]) not in {"asym", "asym_torch"}:
         expert_recompute_policy_spec = "none"
         expert_policy_label = "none"
         expert_recompute_policy = "none"
@@ -695,6 +692,7 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         "expert_recompute_sweep_x": expert_recompute_sweep_x,
         "expert_recompute_sweep_x_name": expert_recompute_sweep_x_name,
         "backend": meta["backend"],
+        "router_mode": router_mode,
         "profiler": meta["profiler"],
         "step_ms": step_ms(profile),
         "forward_ms": numeric_float(first_dict(profile, "forward").get("total_milliseconds")),
@@ -817,6 +815,7 @@ def collect_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["lora_dropout"],
             row["seq_len"],
             row["backend"],
+            row["router_mode"],
             row["profiler"],
             row["mode"],
             row["expert_recompute_policy"],
@@ -834,6 +833,7 @@ def collect_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["batch_size"],
             row["lora_dropout"],
             row["backend"],
+            row["router_mode"],
             row["profiler"],
             row["seq_len"],
             row["mode"],
@@ -968,6 +968,7 @@ def collect_step_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["lora_dropout"],
             row["seq_len"],
             row["backend"],
+            row["router_mode"],
             row["profiler"],
             row["mode"],
             row["expert_recompute_policy"],
@@ -986,6 +987,7 @@ def collect_step_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["batch_size"],
             row["lora_dropout"],
             row["backend"],
+            row["router_mode"],
             row["profiler"],
             row["seq_len"],
             row["mode"],
@@ -999,18 +1001,19 @@ def collect_step_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
     )
 
 
-def group_key(row: dict[str, Any]) -> tuple[str, str, int, float, str, str]:
+def group_key(row: dict[str, Any]) -> tuple[str, str, int, float, str, str, str]:
     return (
         str(row["workload"]),
         str(row["precision"]),
         int(row["batch_size"]),
         numeric_float(row.get("lora_dropout")),
         str(row["backend"]),
+        str(row["router_mode"]),
         str(row["profiler"]),
     )
 
 
-def threshold_group_key(row: dict[str, Any]) -> tuple[str, str, int, float, int, str, str]:
+def threshold_group_key(row: dict[str, Any]) -> tuple[str, str, int, float, int, str, str, str]:
     return (
         str(row["workload"]),
         str(row["precision"]),
@@ -1018,22 +1021,23 @@ def threshold_group_key(row: dict[str, Any]) -> tuple[str, str, int, float, int,
         numeric_float(row.get("lora_dropout")),
         int(row["seq_len"]),
         str(row["backend"]),
+        str(row["router_mode"]),
         str(row["profiler"]),
     )
 
 
 def varied_fields(rows: list[dict[str, Any]]) -> set[str]:
-    fields = ("workload", "precision", "batch_size", "lora_dropout", "backend", "profiler", "mode")
+    fields = ("workload", "precision", "batch_size", "lora_dropout", "backend", "router_mode", "profiler", "mode")
     return {field for field in fields if len({row[field] for row in rows}) > 1}
 
 
 def varied_threshold_fields(rows: list[dict[str, Any]]) -> set[str]:
-    fields = ("workload", "precision", "batch_size", "lora_dropout", "seq_len", "backend", "profiler", "mode")
+    fields = ("workload", "precision", "batch_size", "lora_dropout", "seq_len", "backend", "router_mode", "profiler", "mode")
     return {field for field in fields if len({row[field] for row in rows}) > 1}
 
 
-def combined_label(group: tuple[str, str, int, float, str, str], mode: str, varied: set[str]) -> str:
-    workload, precision, batch_size, lora_dropout, backend, profiler = group
+def combined_label(group: tuple[str, str, int, float, str, str, str], mode: str, varied: set[str]) -> str:
+    workload, precision, batch_size, lora_dropout, backend, router_mode, profiler = group
     mode_labels = {"no_recompute": "No recompute", "recompute": "Activation recompute"}
     parts: list[str] = []
     if "workload" in varied:
@@ -1046,17 +1050,19 @@ def combined_label(group: tuple[str, str, int, float, str, str], mode: str, vari
         parts.append(precision)
     if "backend" in varied:
         parts.append(backend)
+    if "router_mode" in varied:
+        parts.append(f"router={router_mode}")
     if "profiler" in varied:
         parts.append(profiler)
     if "mode" in varied:
         parts.append(mode_labels.get(mode, mode))
     if parts:
         return " / ".join(parts)
-    return f"{backend} / {mode_labels.get(mode, mode)}"
+    return f"{backend} / router={router_mode} / {mode_labels.get(mode, mode)}"
 
 
-def combined_threshold_label(group: tuple[str, str, int, float, int, str, str], mode: str, varied: set[str]) -> str:
-    workload, precision, batch_size, lora_dropout, seq_len, backend, profiler = group
+def combined_threshold_label(group: tuple[str, str, int, float, int, str, str, str], mode: str, varied: set[str]) -> str:
+    workload, precision, batch_size, lora_dropout, seq_len, backend, router_mode, profiler = group
     mode_labels = {"no_recompute": "No layer recompute", "recompute": "Layer recompute"}
     parts: list[str] = []
     if "workload" in varied:
@@ -1071,13 +1077,15 @@ def combined_threshold_label(group: tuple[str, str, int, float, int, str, str], 
         parts.append(precision)
     if "backend" in varied:
         parts.append(backend)
+    if "router_mode" in varied:
+        parts.append(f"router={router_mode}")
     if "profiler" in varied:
         parts.append(profiler)
     if "mode" in varied:
         parts.append(mode_labels.get(mode, mode))
     if parts:
         return " / ".join(parts)
-    return f"s{seq_len} / {backend} / {mode_labels.get(mode, mode)}"
+    return f"s{seq_len} / {backend} / router={router_mode} / {mode_labels.get(mode, mode)}"
 
 
 def write_table(rows: list[dict[str, Any]], output_dir: Path, name: str) -> None:
@@ -1367,7 +1375,7 @@ def plot_combined_metric(
 ) -> None:
     import matplotlib.pyplot as plt
 
-    series: dict[tuple[tuple[str, str, int, float, str, str], str], list[dict[str, Any]]] = {}
+    series: dict[tuple[tuple[str, str, int, float, str, str, str], str], list[dict[str, Any]]] = {}
     for row in rows:
         series.setdefault((group_key(row), str(row["mode"])), []).append(row)
     varied = varied_fields(rows)
@@ -1554,7 +1562,7 @@ def plot_step_metric(
 
 
 def threshold_sweep_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_series: dict[tuple[tuple[str, str, int, float, int, str, str], str], set[int]] = {}
+    by_series: dict[tuple[tuple[str, str, int, float, int, str, str, str], str], set[int]] = {}
     token_rows = [
         row
         for row in rows
@@ -1606,7 +1614,7 @@ def policy_series_suffix(row: dict[str, Any], family: str) -> int:
 
 def policy_sweep_rows(rows: list[dict[str, Any]], family: str) -> list[dict[str, Any]]:
     family_rows = policy_family_rows(rows, family)
-    by_series: dict[tuple[tuple[str, str, int, float, int, str, str], str, int], set[float]] = {}
+    by_series: dict[tuple[tuple[str, str, int, float, int, str, str, str], str, int], set[float]] = {}
     for row in family_rows:
         key = (threshold_group_key(row), str(row["mode"]), policy_series_suffix(row, family))
         by_series.setdefault(key, set()).add(policy_sweep_x(row, family))
@@ -1699,7 +1707,7 @@ def plot_combined_threshold_metric(
 ) -> None:
     import matplotlib.pyplot as plt
 
-    series: dict[tuple[tuple[str, str, int, float, int, str, str], str], list[dict[str, Any]]] = {}
+    series: dict[tuple[tuple[str, str, int, float, int, str, str, str], str], list[dict[str, Any]]] = {}
     for row in rows:
         series.setdefault((threshold_group_key(row), str(row["mode"])), []).append(row)
     varied = varied_threshold_fields(rows)
@@ -1799,7 +1807,7 @@ def plot_combined_policy_metric(
 ) -> None:
     import matplotlib.pyplot as plt
 
-    series: dict[tuple[tuple[str, str, int, float, int, str, str], str, int], list[dict[str, Any]]] = {}
+    series: dict[tuple[tuple[str, str, int, float, int, str, str, str], str, int], list[dict[str, Any]]] = {}
     for row in rows:
         series.setdefault((threshold_group_key(row), str(row["mode"]), policy_series_suffix(row, family)), []).append(row)
     varied = varied_threshold_fields(rows)
@@ -1836,10 +1844,10 @@ def plot_combined_policy_metric(
     plt.close(fig)
 
 
-def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, str, int, float, str, str]) -> None:
-    workload, precision, batch_size, lora_dropout, backend, profiler = key
+def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, str, int, float, str, str, str]) -> None:
+    workload, precision, batch_size, lora_dropout, backend, router_mode, profiler = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}"
+    suffix = f", batch size {batch_size}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}"
     plot_metric(
         rows,
         output_dir,
@@ -1895,12 +1903,12 @@ def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[s
     )
 
 
-def write_group_step_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, str, int, float, str, str]) -> None:
+def write_group_step_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, str, int, float, str, str, str]) -> None:
     if not rows:
         return
-    workload, precision, batch_size, lora_dropout, backend, profiler = key
+    workload, precision, batch_size, lora_dropout, backend, router_mode, profiler = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}"
+    suffix = f", batch size {batch_size}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}"
     write_table(rows, output_dir, "step_samples")
     for filename, title, ylabel, metric_key, scale in step_plot_specs(combined=False):
         plot_step_metric(
@@ -1918,12 +1926,12 @@ def write_group_step_plots(rows: list[dict[str, Any]], output_dir: Path, key: tu
 def write_group_threshold_plots(
     rows: list[dict[str, Any]],
     output_dir: Path,
-    key: tuple[str, str, int, float, str, str],
+    key: tuple[str, str, int, float, str, str, str],
     seq_len: int,
 ) -> None:
-    workload, precision, batch_size, lora_dropout, backend, profiler = key
+    workload, precision, batch_size, lora_dropout, backend, router_mode, profiler = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}"
+    suffix = f", batch size {batch_size}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}"
     plot_threshold_metric(
         rows,
         output_dir,
@@ -1973,13 +1981,13 @@ def write_group_threshold_plots(
 def write_group_policy_plots(
     rows: list[dict[str, Any]],
     output_dir: Path,
-    key: tuple[str, str, int, float, str, str],
+    key: tuple[str, str, int, float, str, str, str],
     seq_len: int,
     family: str,
 ) -> None:
-    workload, precision, batch_size, lora_dropout, backend, profiler = key
+    workload, precision, batch_size, lora_dropout, backend, router_mode, profiler = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}"
+    suffix = f", batch size {batch_size}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}"
     name = policy_filename_suffix(family)
     title = {
         "tok": "expert token threshold",
@@ -2275,18 +2283,18 @@ def main() -> None:
         write_combined_step_plots(step_rows, combined_dir)
 
     if not args.combined_only:
-        groups: dict[tuple[str, str, int, float, str, str], list[dict[str, Any]]] = {}
+        groups: dict[tuple[str, str, int, float, str, str, str], list[dict[str, Any]]] = {}
         for row in seq_rows:
             groups.setdefault(group_key(row), []).append(row)
-        step_groups: dict[tuple[str, str, int, float, str, str], list[dict[str, Any]]] = {}
+        step_groups: dict[tuple[str, str, int, float, str, str, str], list[dict[str, Any]]] = {}
         for row in step_rows:
             step_groups.setdefault(group_key(row), []).append(row)
         for key in sorted(set(groups) | set(step_groups)):
             group_rows = groups.get(key, [])
             group_step_rows = step_groups.get(key, [])
-            workload, precision, batch_size, lora_dropout, backend, profiler = key
+            workload, precision, batch_size, lora_dropout, backend, router_mode, profiler = key
             group_dir = root / safe_label(
-                f"{workload}-b{batch_size}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}"
+                f"{workload}-b{batch_size}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}"
             )
             if group_rows:
                 write_table(group_rows, group_dir, "sweep_summary")
@@ -2303,14 +2311,14 @@ def main() -> None:
             write_combined_policy_plots(family_rows, combined_dir, family)
         if args.combined_only:
             continue
-        family_groups: dict[tuple[tuple[str, str, int, float, str, str], int], list[dict[str, Any]]] = {}
+        family_groups: dict[tuple[tuple[str, str, int, float, str, str, str], int], list[dict[str, Any]]] = {}
         for row in family_rows:
             family_groups.setdefault((group_key(row), int(row["seq_len"])), []).append(row)
         suffix = policy_filename_suffix(family)
         for (key, seq_len), group_rows in sorted(family_groups.items()):
-            workload, precision, batch_size, lora_dropout, backend, profiler = key
+            workload, precision, batch_size, lora_dropout, backend, router_mode, profiler = key
             group_dir = root / safe_label(
-                f"{workload}-b{batch_size}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}"
+                f"{workload}-b{batch_size}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}"
             )
             write_table(group_rows, group_dir, f"{suffix}_summary_s{seq_len}")
             write_group_policy_plots(group_rows, group_dir, key, seq_len, family)

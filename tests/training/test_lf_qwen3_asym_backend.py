@@ -23,7 +23,7 @@ from asym_gemm.training.moe import (
     pack_tokens_contiguous,
     parse_expert_recompute_policy_spec,
 )
-from asym_gemm.training.qwen3_moe import AsymQwen3Experts, is_qwen3_experts
+from asym_gemm.training.qwen3_moe import AsymQwen3Experts, AsymQwen3MoeBlock, is_qwen3_experts, is_qwen3_moe_block
 
 
 class FakeQwen3Experts(nn.Module):
@@ -56,6 +56,37 @@ class FakeGemma4TextExperts(FakeQwen3Experts):
     pass
 
 
+class FakeQwen3Gate(nn.Linear):
+    def __init__(self, *, hidden_dim: int = 8, num_experts: int = 4, top_k: int = 2) -> None:
+        super().__init__(hidden_dim, num_experts, bias=False, dtype=torch.bfloat16)
+        self.hidden_dim = hidden_dim
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.norm_topk_prob = True
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        router_logits = super().forward(hidden_states)
+        router_probs = torch.softmax(router_logits, dtype=torch.float, dim=-1)
+        router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)
+        if self.norm_topk_prob:
+            router_top_value = router_top_value / router_top_value.sum(dim=-1, keepdim=True)
+        router_top_value = router_top_value.to(router_logits.dtype)
+        return router_logits, router_top_value, router_indices
+
+
+class FakeQwen3Moe(nn.Module):
+    def __init__(self, *, hidden_dim: int = 8, intermediate_dim: int = 8, num_experts: int = 4, top_k: int = 2) -> None:
+        super().__init__()
+        self.gate = FakeQwen3Gate(hidden_dim=hidden_dim, num_experts=num_experts, top_k=top_k)
+        self.experts = FakeQwen3Experts(num_experts=num_experts, hidden_dim=hidden_dim, intermediate_dim=intermediate_dim)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_shape = hidden_states.shape
+        flat = hidden_states.view(-1, input_shape[-1])
+        _router_logits, weights, indices = self.gate(flat)
+        return self.experts(flat, indices, weights).view(input_shape)
+
+
 class FakeBlock(nn.Module):
     def __init__(self, *, hidden_dim: int = 8, intermediate_dim: int = 8) -> None:
         super().__init__()
@@ -63,9 +94,7 @@ class FakeBlock(nn.Module):
         self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
         self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
         self.o_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
-        self.mlp = nn.Module()
-        self.mlp.gate = nn.Linear(hidden_dim, 4, bias=False, dtype=torch.bfloat16)
-        self.mlp.experts = FakeQwen3Experts(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim)
+        self.mlp = FakeQwen3Moe(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim)
 
 
 class FakeModel(nn.Module):
@@ -264,6 +293,11 @@ def test_is_qwen3_experts_accepts_packed_fake_and_rejects_linear() -> None:
     assert not is_qwen3_experts(nn.Linear(8, 8))
 
 
+def test_is_qwen3_moe_block_accepts_fake_and_rejects_experts() -> None:
+    assert is_qwen3_moe_block(FakeQwen3Moe())
+    assert not is_qwen3_moe_block(FakeQwen3Experts())
+
+
 def test_is_llama4_moe_accepts_fake_and_rejects_qwen3_experts() -> None:
     assert is_llama4_moe(FakeLlama4Moe())
     assert not is_llama4_moe(FakeQwen3Experts())
@@ -354,6 +388,65 @@ def test_asym_qwen3_experts_torch_matches_eager_at_zero_delta() -> None:
     assert torch.count_nonzero(wrapped.down_lora_B) == 0
 
 
+def test_asym_qwen3_owned_moe_torch_matches_eager_at_zero_delta() -> None:
+    torch.manual_seed(13)
+    source = FakeQwen3Moe()
+    wrapped = AsymQwen3MoeBlock(
+        source,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+    )
+    x = torch.randn(2, 5, source.gate.hidden_dim, dtype=torch.bfloat16)
+
+    expected = source(x)
+    actual = wrapped(x)
+
+    _assert_tensor_close_l2("qwen3 owned moe output", actual, expected, max_abs_tol=3e-3, rel_l2_tol=2e-2)
+    assert list(wrapped._modules)[:2] == ["gate", "experts"]
+    assert not any(name == "source" for name, _module in wrapped.named_modules())
+    assert all(not param.requires_grad for param in wrapped.gate.parameters())
+    assert torch.count_nonzero(wrapped.experts.gate_lora_B) == 0
+    assert torch.count_nonzero(wrapped.experts.up_lora_B) == 0
+    assert torch.count_nonzero(wrapped.experts.down_lora_B) == 0
+
+
+def test_asym_qwen3_owned_moe_router_no_grad_and_debug_grad() -> None:
+    torch.manual_seed(17)
+    source = FakeQwen3Moe()
+    wrapped = AsymQwen3MoeBlock(
+        source,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+    )
+    x = torch.randn(2, 5, source.gate.hidden_dim, dtype=torch.bfloat16, requires_grad=True)
+    flat = x.view(-1, x.shape[-1])
+    indices, weights, _ = wrapped._compute_routing(flat)
+    assert not weights.requires_grad
+    assert not indices.requires_grad
+
+    debug_source = FakeQwen3Moe()
+    debug = AsymQwen3MoeBlock(
+        debug_source,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        router_debug_grad=True,
+    )
+    _debug_indices, debug_weights, _ = debug._compute_routing(flat)
+    assert debug_weights.requires_grad
+
+
 def test_asym_qwen3_experts_torch_backward_trains_only_lora() -> None:
     source = FakeQwen3Experts()
     wrapped = AsymQwen3Experts(
@@ -404,6 +497,55 @@ def test_asym_llama4_moe_torch_matches_eager_at_zero_delta() -> None:
     assert torch.count_nonzero(wrapped.experts.gate_lora_B) == 0
     assert torch.count_nonzero(wrapped.experts.up_lora_B) == 0
     assert torch.count_nonzero(wrapped.experts.down_lora_B) == 0
+
+
+def test_asym_llama4_moe_whole_matches_eager_at_zero_delta_and_detaches_router() -> None:
+    torch.manual_seed(4)
+    source = FakeLlama4Moe()
+    wrapped = AsymLlama4Moe(
+        source,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        router_mode="whole",
+    )
+    x = torch.randn(2, 5, source.hidden_dim, dtype=torch.bfloat16, requires_grad=True)
+
+    expected, expected_logits = source(x)
+    actual, actual_logits = wrapped(x)
+
+    _assert_tensor_close_l2("llama4 whole moe output", actual, expected, max_abs_tol=3e-3, rel_l2_tol=2e-2)
+    torch.testing.assert_close(actual_logits, expected_logits)
+    assert not actual_logits.requires_grad
+    flat = x.view(-1, source.hidden_dim)
+    _indices, input_weights, router_logits = wrapped._compute_routing(flat)
+    assert not input_weights.requires_grad
+    assert not router_logits.requires_grad
+    assert list(wrapped._modules)[:3] == ["router", "shared_expert", "experts"]
+    assert all(not param.requires_grad for param in wrapped.router.parameters())
+
+
+def test_asym_llama4_moe_hf_keeps_router_input_grad_path() -> None:
+    torch.manual_seed(6)
+    source = FakeLlama4Moe()
+    wrapped = AsymLlama4Moe(
+        source,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        router_mode="hf",
+    )
+    x = torch.randn(2, 5, source.hidden_dim, dtype=torch.bfloat16, requires_grad=True)
+    _indices, input_weights, router_logits = wrapped._compute_routing(x.view(-1, source.hidden_dim))
+    assert input_weights.requires_grad
+    assert router_logits.requires_grad
+    assert all(not param.requires_grad for param in wrapped.router.parameters())
 
 
 @pytest.mark.parametrize("policy", ["tok-le2", "tok-le2-act"])
@@ -628,6 +770,7 @@ def test_apply_lf_asym_lora_wraps_experts_dense_and_freezes_router() -> None:
         precision="bf16",
         offload_modules="none",
         expert_recompute_policy="tok-le2-act",
+        router_mode="hf",
         strict=True,
     )
 
@@ -644,6 +787,59 @@ def test_apply_lf_asym_lora_wraps_experts_dense_and_freezes_router() -> None:
     assert all("lora_" in name or ".lora_A." in name or ".lora_B." in name for name in trainable)
 
 
+def test_apply_lf_asym_lora_whole_wraps_qwen3_moe_and_freezes_router() -> None:
+    model = FakeModel()
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["all"],
+        dense_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="torch",
+        precision="bf16",
+        offload_modules="none",
+        expert_recompute_policy="tok-le2-act",
+        router_mode="whole",
+        strict=True,
+    )
+
+    assert report.router_mode == "whole"
+    assert report.router_no_grad
+    assert report.qwen3_moes_wrapped == 2
+    assert report.qwen3_experts_wrapped == 0
+    assert report.llama4_moes_wrapped == 0
+    assert report.dense_lora_wrapped == 8
+    assert "router_mode=whole" in report.to_log_string()
+    assert isinstance(model.layers[0].mlp, AsymQwen3MoeBlock)
+    assert isinstance(model.layers[0].mlp.experts, AsymQwen3Experts)
+    assert model.layers[0].mlp.router_mode == "whole"
+    assert model.layers[0].mlp.experts.profile_prefix == "layers.0.mlp.experts"
+    assert list(model.layers[0].mlp._modules)[:2] == ["gate", "experts"]
+    router_trainable = [name for name, param in model.named_parameters() if ".mlp.gate." in name and param.requires_grad]
+    assert router_trainable == []
+    assert sum(1 for module in model.modules() if isinstance(module, AsymQwen3Experts)) == 2
+
+
+def test_apply_lf_asym_lora_whole_rejects_router_logits_config() -> None:
+    model = FakeModel()
+    model.config = type("Config", (), {"output_router_logits": True})()
+    with pytest.raises(ValueError, match="output_router_logits=False"):
+        apply_lf_asym_lora(
+            model,
+            raw_lora_target=["all"],
+            dense_target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            lora_rank=2,
+            lora_alpha=4.0,
+            lora_dropout=0.0,
+            backend="torch",
+            precision="bf16",
+            offload_modules="none",
+            router_mode="whole",
+            strict=True,
+        )
+
+
 def test_apply_lf_asym_lora_tags_gemma4_packed_experts() -> None:
     model = FakeGemma4Model()
     model, report = apply_lf_asym_lora(
@@ -656,6 +852,7 @@ def test_apply_lf_asym_lora_tags_gemma4_packed_experts() -> None:
         backend="torch",
         precision="bf16",
         offload_modules="none",
+        router_mode="hf",
         strict=True,
     )
 
@@ -681,6 +878,7 @@ def test_apply_lf_asym_lora_skips_gemma4_router_proj_target() -> None:
         backend="torch",
         precision="bf16",
         offload_modules="none",
+        router_mode="hf",
         strict=True,
     )
 
@@ -719,6 +917,34 @@ def test_apply_lf_asym_lora_wraps_llama4_moe_and_dense_without_router_lora() -> 
     assert all("lora_" in name or ".lora_A." in name or ".lora_B." in name for name in trainable)
 
 
+def test_apply_lf_asym_lora_whole_wraps_llama4_moe_and_reports_router_mode() -> None:
+    model = FakeLlama4Model()
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["all"],
+        dense_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="torch",
+        precision="bf16",
+        offload_modules="none",
+        expert_recompute_policy="tok-le2-act",
+        router_mode="whole",
+        strict=True,
+    )
+
+    assert report.qwen3_moes_wrapped == 0
+    assert report.llama4_moes_wrapped == 2
+    assert report.router_mode == "whole"
+    assert report.router_no_grad
+    assert isinstance(model.layers[0].feed_forward, AsymLlama4Moe)
+    assert model.layers[0].feed_forward.router_mode == "whole"
+    assert model.layers[0].feed_forward.experts.profile_prefix == "layers.0.feed_forward.experts"
+    router_trainable = [name for name, param in model.named_parameters() if "router" in name and param.requires_grad]
+    assert router_trainable == []
+
+
 def test_adapt_lf_asym_peft_lora_only_wraps_packed_experts_after_dense_peft() -> None:
     model = FakeModel()
     model, report = adapt_lf_asym_peft_lora(
@@ -731,6 +957,7 @@ def test_adapt_lf_asym_peft_lora_only_wraps_packed_experts_after_dense_peft() ->
         backend="torch",
         precision="bf16",
         offload_modules="none",
+        router_mode="hf",
         strict=True,
     )
 
@@ -756,6 +983,7 @@ def test_asym_lf_adapter_state_saves_only_lora_and_loads(tmp_path) -> None:
         backend="torch",
         precision="bf16",
         offload_modules="none",
+        router_mode="hf",
         strict=True,
     )
     assert report.trainable_lora_params > 0
@@ -786,6 +1014,7 @@ def test_asym_lf_adapter_state_saves_only_lora_and_loads(tmp_path) -> None:
     assert config["asym_adapter_format"] == "asym_gemm_lf_v1"
     assert config["asym_expert_format"] == "packed_gate_up_down"
     assert config["asym_expert_family"] == "qwen3"
+    assert config["asym_router_mode"] == "hf"
     assert config["base_model_name_or_path"] == "fake-qwen3"
 
     reloaded = FakeModel()
@@ -799,6 +1028,7 @@ def test_asym_lf_adapter_state_saves_only_lora_and_loads(tmp_path) -> None:
         backend="torch",
         precision="bf16",
         offload_modules="none",
+        router_mode="hf",
         strict=True,
     )
     load_asym_peft_adapter(reloaded, tmp_path)
@@ -806,6 +1036,52 @@ def test_asym_lf_adapter_state_saves_only_lora_and_loads(tmp_path) -> None:
     assert list(reloaded_state) == list(state)
     for name, tensor in state.items():
         torch.testing.assert_close(reloaded_state[name], tensor)
+
+
+def test_asym_lf_whole_adapter_config_records_owned_router(tmp_path) -> None:
+    pytest.importorskip("safetensors.torch")
+    model = FakeModel()
+    model, _ = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["all"],
+        dense_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="torch",
+        precision="bf16",
+        offload_modules="none",
+        router_mode="whole",
+        strict=True,
+    )
+    save_asym_peft_adapter(model, tmp_path, metadata={"base_model_name_or_path": "fake-qwen3"})
+    config = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert config["asym_expert_format"] == "qwen3_owned_moe"
+    assert config["asym_expert_family"] == "qwen3"
+    assert config["asym_router_mode"] == "whole"
+
+
+def test_asym_lf_llama4_adapter_config_records_router_mode(tmp_path) -> None:
+    pytest.importorskip("safetensors.torch")
+    model = FakeLlama4Model()
+    model, _ = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["all"],
+        dense_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="torch",
+        precision="bf16",
+        offload_modules="none",
+        router_mode="whole",
+        strict=True,
+    )
+    save_asym_peft_adapter(model, tmp_path, metadata={"base_model_name_or_path": "fake-llama4"})
+    config = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert config["asym_expert_format"] == "llama4_packed_moe"
+    assert config["asym_expert_family"] == "llama4"
+    assert config["asym_router_mode"] == "whole"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] < 10, reason="requires SM100-class CUDA")
@@ -1083,6 +1359,7 @@ def test_apply_lf_asym_lora_sm100_accumulates_and_optimizer_updates_only_lora() 
         backend="asym",
         precision="bf16",
         offload_modules="routed_experts",
+        router_mode="hf",
         strict=True,
     )
     assert report.qwen3_experts_wrapped == 2

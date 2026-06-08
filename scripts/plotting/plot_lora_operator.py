@@ -128,7 +128,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", action="append", default=[])
     parser.add_argument("--pass", dest="passes", action="append", default=[], choices=["forward", "backward"])
     parser.add_argument("--batch-size", action="append", type=int, default=[])
-    parser.add_argument("--seq-len", "--seq-lens", dest="seq_lens", action="append", nargs="+", type=int, default=[])
+    parser.add_argument("--seq-lens", action="append", nargs="+", type=int, default=[])
     parser.add_argument("--feature-dims", action="append", default=[], help="IN|OUT pairs. Repeat or pass comma-separated pairs.")
     parser.add_argument("--rank", action="append", type=int, default=[])
     parser.add_argument("--dtype", action="append", default=[])

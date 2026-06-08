@@ -9,16 +9,12 @@ ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
 DEVICE="cuda:0"
 BACKENDS="torch,asym"
 OPERATIONS="full_lora"
-# OPERATIONS="xw_sb"
-# BATCH_SIZES="8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32"
 BATCH_SIZES="1"
 SEQ_LENS="4096"
 # Same default tensor sizes as scripts/lora/profile_transpose.sh, expressed as
 # LoRA feature pairs IN|OUT with tokens=M=2048:
 #   gate/up: X[M,H] @ W[I,H].T -> Y[M,I]
 #   down:    X[M,I] @ W[H,I].T -> Y[M,H]
-# FEATURE_DIMS="2048|768,768|2048,4096|1536,1536|4096"
-# FEATURE_DIMS="2048|768,768|2048"
 FEATURE_DIMS="4096|4096"
 RANK=16
 SCALE=16
@@ -61,8 +57,6 @@ Options:
   --device NAME
   --backends LIST
   --operation LIST      xw_sb and/or full_lora; comma or quoted whitespace separated
-  --operations LIST     alias for --operation
-  --batch-size LIST     alias for --batch-sizes
   --batch-sizes LIST
   --seq-lens LIST
   --feature-dims LIST   in|out feature pairs, e.g. '4096|4096,4096|11008,11008|4096'
@@ -294,10 +288,11 @@ while (($#)); do
     --device=*) DEVICE="${1#*=}"; shift ;;
     --backends) need_value "$1" "${2-}"; BACKENDS="$2"; shift 2 ;;
     --backends=*) BACKENDS="${1#*=}"; shift ;;
-    --operation|--operations) need_value "$1" "${2-}"; OPERATIONS="$2"; shift 2 ;;
-    --operation=*|--operations=*) OPERATIONS="${1#*=}"; shift ;;
-    --batch-size|--batch-sizes) need_value "$1" "${2-}"; BATCH_SIZES="$2"; shift 2 ;;
-    --batch-size=*|--batch-sizes=*) BATCH_SIZES="${1#*=}"; shift ;;
+    --operation) need_value "$1" "${2-}"; OPERATIONS="$2"; shift 2 ;;
+    --operation=*) OPERATIONS="${1#*=}"; shift ;;
+    --batch-sizes) need_value "$1" "${2-}"; BATCH_SIZES="$2"; shift 2 ;;
+    --batch-sizes=*) BATCH_SIZES="${1#*=}"; shift ;;
+    --batch-size|--batch-size=*) die "use --batch-sizes for wrapper sweeps" ;;
     --seq-lens) need_value "$1" "${2-}"; SEQ_LENS="$2"; shift 2 ;;
     --seq-lens=*) SEQ_LENS="${1#*=}"; shift ;;
     --feature-dims) need_value "$1" "${2-}"; FEATURE_DIMS="$2"; shift 2 ;;
@@ -507,7 +502,7 @@ if [[ "${SAVE_RESULTS}" == "true" && "${PLOT}" == "true" ]]; then
       --flat-output
       --operation "${cfg_operation}"
       --batch-size "${cfg_batch_size}"
-      --seq-len "${cfg_seq_len}"
+      --seq-lens "${cfg_seq_len}"
       --rank "${RANK}"
       --dtype "${DTYPE}"
       --precision "${PRECISION}"
@@ -547,7 +542,7 @@ if [[ "${SAVE_RESULTS}" == "true" && "${PLOT}" == "true" ]]; then
     for csv_path in "${plot_csvs[@]}"; do combined_cmd+=(--input-csv "${csv_path}"); done
     for operation in $(tokens "${OPERATIONS}"); do combined_cmd+=(--operation "${operation}"); done
     for batch_size in $(tokens "${BATCH_SIZES}"); do combined_cmd+=(--batch-size "${batch_size}"); done
-    for seq_len in $(tokens "${SEQ_LENS}"); do combined_cmd+=(--seq-len "${seq_len}"); done
+    for seq_len in $(tokens "${SEQ_LENS}"); do combined_cmd+=(--seq-lens "${seq_len}"); done
     for backend in $(tokens "${BACKENDS}"); do combined_cmd+=(--backend "${backend}"); done
     for backward in $(backward_values "${BACKWARD}"); do
       if [[ "${backward}" == "true" ]]; then

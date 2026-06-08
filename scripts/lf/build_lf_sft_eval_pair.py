@@ -48,12 +48,6 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lf-dir", required=True)
     parser.add_argument("--asym-dir", default=str(Path(__file__).resolve().parents[2]))
-    parser.add_argument(
-        "--kt-tools-dir",
-        dest="asym_dir",
-        default=argparse.SUPPRESS,
-        help="Alias for --asym-dir when the dataset builder is used by KT profiling scripts.",
-    )
     parser.add_argument("--results-root", default="")
     parser.add_argument("--model-name-or-path", default="Qwen/Qwen3-30B-A3B")
     parser.add_argument("--template", default="auto")
