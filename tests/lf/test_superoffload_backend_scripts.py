@@ -31,19 +31,25 @@ def make_fake_lf(tmp_path: Path) -> Path:
     lf_dir.joinpath("data/dummy.jsonl").write_text('{"messages":[]}\n', encoding="utf-8")
     lf_dir.joinpath("src/train.py").write_text("", encoding="utf-8")
     for name in ("ds_z2_config.json", "ds_z3_config.json", "ds_z3_offload_config.json"):
-        lf_dir.joinpath("examples/deepspeed", name).write_text(
-            json.dumps(
-                {
-                    "zero_optimization": {
-                        "stage": 3,
-                        "offload_optimizer": {"device": "cpu"},
-                        "offload_param": {"device": "cpu"},
-                    }
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+        config = {
+            "zero_optimization": {
+                "stage": 3,
+                "offload_optimizer": {"device": "cpu"},
+                "offload_param": {"device": "cpu"},
+            }
+        }
+        lf_dir.joinpath("examples/deepspeed", name).write_text(json.dumps(config) + "\n", encoding="utf-8")
+    super_config = {
+        "zero_optimization": {
+            "stage": 3,
+            "offload_optimizer": {"device": "cpu", "super_offload": True, "cpuadam_cores_perc": 0.8},
+            "offload_param": {"device": "cpu"},
+        }
+    }
+    lf_dir.joinpath("examples/deepspeed/ds_z3_superoffload_config.json").write_text(
+        json.dumps(super_config) + "\n",
+        encoding="utf-8",
+    )
     return lf_dir
 
 
@@ -55,38 +61,6 @@ def make_fake_deepspeed(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return deepspeed_dir
-
-
-def test_render_superoffload_config_sets_deepspeed_keys(tmp_path: Path) -> None:
-    base = tmp_path / "base.json"
-    output = tmp_path / "ds_z3_superoffload_config.json"
-    base.write_text(
-        json.dumps({"zero_optimization": {"stage": 3, "offload_optimizer": {}, "offload_param": {}}}) + "\n",
-        encoding="utf-8",
-    )
-
-    run_cmd(
-        [
-            sys.executable,
-            "scripts/lf/render_superoffload_deepspeed_config.py",
-            "--base",
-            str(base),
-            "--output",
-            str(output),
-            "--cpuadam-cores-perc",
-            "0.7",
-        ]
-    )
-
-    config = json.loads(output.read_text(encoding="utf-8"))
-    zero = config["zero_optimization"]
-    assert zero["stage"] == 3
-    assert zero["offload_optimizer"]["device"] == "cpu"
-    assert zero["offload_optimizer"]["pin_memory"] is True
-    assert zero["offload_optimizer"]["super_offload"] is True
-    assert zero["offload_optimizer"]["cpuadam_cores_perc"] == 0.7
-    assert zero["offload_param"]["device"] == "cpu"
-    assert zero["offload_param"]["pin_memory"] is True
 
 
 def test_check_superoffload_run_accepts_profile_and_log_marker(tmp_path: Path) -> None:
@@ -177,7 +151,7 @@ def test_profile_lora_lf_dry_run_accepts_superoffload(tmp_path: Path) -> None:
         env={
             "LF_DIR": str(lf_dir),
             "DEEPSPEED_DIR": str(deepspeed_dir),
-            "BACKEND_SPECS": "ds_superoffload|norecompute",
+            "BACKEND_SPECS": "superoffload|norecompute",
             "GPU_POOL": "0,1",
             "PROFILERS": "source",
             "SEQ_LENS": "128",
@@ -192,8 +166,8 @@ def test_profile_lora_lf_dry_run_accepts_superoffload(tmp_path: Path) -> None:
         },
     )
 
-    rendered = output_root / "deepspeed" / "ds_z3_superoffload_config.json"
-    assert json.loads(rendered.read_text(encoding="utf-8"))["zero_optimization"]["offload_optimizer"][
+    static_config = lf_dir / "examples/deepspeed/ds_z3_superoffload_config.json"
+    assert json.loads(static_config.read_text(encoding="utf-8"))["zero_optimization"]["offload_optimizer"][
         "super_offload"
     ] is True
     jobs = list(output_root.rglob("jobs.tsv"))
@@ -202,12 +176,52 @@ def test_profile_lora_lf_dry_run_accepts_superoffload(tmp_path: Path) -> None:
     command_files = list(output_root.rglob("command.txt"))
     assert command_files
     command = command_files[0].read_text(encoding="utf-8")
-    assert "SUPER_OFFLOAD_DEEPSPEED_CONFIG=" in command
+    assert "BACKEND=superoffload" in command
+    assert "SUPER_OFFLOAD_DEEPSPEED_CONFIG=" not in command
     assert "--deepspeed" not in command
     assert "--use_asym_gemm" not in command
     assert "--asym_backend" not in command
     assert "--use_kt" not in command
     assert "--kt_backend" not in command
+
+
+def test_profile_lora_lf_rejects_legacy_superoffload_alias(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    deepspeed_dir = make_fake_deepspeed(tmp_path)
+    result = subprocess.run(
+        [
+            "scripts/lf/profile_lora_lf.sh",
+            "--model-specs",
+            "Qwen/Qwen3-30B-A3B|1",
+            "--output-root",
+            str(tmp_path / "dryrun"),
+        ],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "ROOT": str(ROOT),
+            "ASYM_DIR": str(ROOT),
+            "LF_DIR": str(lf_dir),
+            "DEEPSPEED_DIR": str(deepspeed_dir),
+            "BACKEND_SPECS": "ds_superoffload|norecomp",
+            "GPU_POOL": "0",
+            "PROFILERS": "source",
+            "SEQ_LENS": "128",
+            "MAX_STEPS": "1",
+            "WARMUP_STEPS": "0",
+            "PREPARE_DATASETS": "false",
+            "DRY_RUN": "true",
+            "LORA_DROPOUT": "0.00",
+            "EXPERT_POLICIES": "none",
+            "PLOT": "false",
+            "PLOT_MEMORY_BREAKDOWN": "false",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "backend must be" in result.stderr
 
 
 def test_run_lf_lora_sft_uses_deepspeed_for_single_gpu_zero3_offload(tmp_path: Path) -> None:
@@ -320,20 +334,7 @@ def test_run_lf_lora_sft_uses_deepspeed_for_single_gpu_superoffload(tmp_path: Pa
     )
     fake_python.chmod(0o755)
 
-    super_config = tmp_path / "ds_z3_superoffload_config.json"
-    super_config.write_text(
-        json.dumps(
-            {
-                "zero_optimization": {
-                    "stage": 3,
-                    "offload_optimizer": {"device": "cpu", "super_offload": True, "cpuadam_cores_perc": 0.8},
-                    "offload_param": {"device": "cpu"},
-                }
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    super_config = lf_dir / "examples/deepspeed/ds_z3_superoffload_config.json"
 
     run_cmd(
         ["scripts/lf/run_lf_lora_sft.sh"],
@@ -344,7 +345,6 @@ def test_run_lf_lora_sft_uses_deepspeed_for_single_gpu_superoffload(tmp_path: Pa
             "ENV_PYTHON": str(fake_python),
             "FAKE_TORCHRUN_LOG": str(torchrun_log),
             "BACKEND": "superoffload",
-            "SUPER_OFFLOAD_DEEPSPEED_CONFIG": str(super_config),
             "CHECK_SUPEROFFLOAD": "1",
             "GPU_ID": "0",
             "NUM_GPUS": "1",

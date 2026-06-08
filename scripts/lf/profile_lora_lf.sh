@@ -4,6 +4,8 @@ set -Eeuo pipefail
 # =============================================================================
 # User Parameters
 # =============================================================================
+
+# Paths and tools
 ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
 LF_DIR=${LF_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/LlamaFactory}
 KT_KERNEL_DIR=${KT_KERNEL_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/ktransformers/kt-kernel}
@@ -12,29 +14,34 @@ CONDA_EXE=${CONDA_EXE:-conda}
 NSYS_BIN=${NSYS_BIN:-nsys}
 DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun}
 
+# Sweep axes
 GPU_POOL=${GPU_POOL:-3}
 # MODEL_SPECS entries are model|num_gpus. Recompute belongs only in BACKEND_SPECS.
 MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
-
 # EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le0,tok-le512,tok-le512-act"}
 EXPERT_POLICIES=${EXPERT_POLICIES-"none"}
-
 # Primary backend sweep axis. Each entry is backend|recompute.  Torch is plain
 # distributed launch. Zero backends add the matching DeepSpeed config.
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero2|norecomp,zero2|recomp,zero3_offload|norecomp,zero3_offload|recomp"}
 BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp"}
 ROUTER_MODES=${ROUTER_MODES:-whole}
-PROFILERS=${PROFILERS:-nsys,source}
+# PROFILERS=${PROFILERS:-nsys,source}
+PROFILERS=${PROFILERS:-nsys}
 PRECISION=${PRECISION:-bf16}
+SEQ_LENS=${SEQ_LENS:-4096}
+# LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
+LORA_DROPOUT=${LORA_DROPOUT:-0.00}
 
+# Dataset
 DATASET=${DATASET:-asym_long_sft_smoke}
 PREPARE_DATASETS=${PREPARE_DATASETS:-true}
 DATASET_MIN_TOKENS=${DATASET_MIN_TOKENS:-auto}
 DATASET_EVAL_ROWS=${DATASET_EVAL_ROWS:-128}
 DATASET_OVERWRITE=${DATASET_OVERWRITE:-false}
 TEMPLATE=${TEMPLATE:-auto}
-SEQ_LENS=${SEQ_LENS:-4096}
 MAX_SAMPLES=${MAX_SAMPLES:-128}
+
+# Training
 MAX_STEPS=${MAX_STEPS:-10}
 WARMUP_STEPS=${WARMUP_STEPS:-5}
 PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-1}
@@ -42,16 +49,14 @@ GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 LORA_RANK=${LORA_RANK:-64}
 LORA_ALPHA=${LORA_ALPHA:-16}
-LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
 SEED=${SEED:-42}
 
+# Backend checks and AsymGEMM options
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
 ASYM_STRICT=${ASYM_STRICT:-true}
-TORCH_USE_ASYM_GEMM_LORA=${TORCH_USE_ASYM_GEMM_LORA:-false}
 REQUIRE_SM100=${REQUIRE_SM100:-1}
 
-# Optional output/profile controls. When unset, sweeps that include KT write
-# beside the production KT repo; normal AsymGEMM sweeps write under this repo.
+# Output and profiling
 OUTPUT_ROOT=${OUTPUT_ROOT:-}
 PROFILE_LEVEL=${PROFILE_LEVEL:-op}
 PROFILE_LAYERS=${PROFILE_LAYERS:-all}
@@ -63,6 +68,7 @@ PROFILE_MEMORY_BREAKDOWN_MODULES=${PROFILE_MEMORY_BREAKDOWN_MODULES:-attention,r
 PROFILE_SYNC=${PROFILE_SYNC:-0}
 PROFILE_MODULE_FILTER=${PROFILE_MODULE_FILTER:-attention,router,mlp,experts,lora,optimizer,kt}
 
+# KT backend
 KT_NUM_THREADS=${KT_NUM_THREADS:-}
 KT_THREADPOOL_COUNT=${KT_THREADPOOL_COUNT:-}
 KT_MAX_CACHE_DEPTH=${KT_MAX_CACHE_DEPTH:-2}
@@ -80,33 +86,23 @@ KT_USE_LORA_EXPERTS=${KT_USE_LORA_EXPERTS:-}
 KT_LORA_EXPERT_NUM=${KT_LORA_EXPERT_NUM:-}
 KT_LORA_EXPERT_INTERMEDIATE_SIZE=${KT_LORA_EXPERT_INTERMEDIATE_SIZE:-}
 CHECK_KT_CALLS=${CHECK_KT_CALLS:-1}
-SUPER_OFFLOAD_DEEPSPEED_CONFIG=${SUPER_OFFLOAD_DEEPSPEED_CONFIG:-}
-SUPER_OFFLOAD_CPUADAM_CORES_PERC=${SUPER_OFFLOAD_CPUADAM_CORES_PERC:-0.8}
+
+# SuperOffload backend
 CHECK_SUPEROFFLOAD=${CHECK_SUPEROFFLOAD:-1}
 
-# Optional loss-comparison controls
-COMPARE_LOSSES=${COMPARE_LOSSES:-true}
-COMPARE_BASELINE_BACKEND=${COMPARE_BASELINE_BACKEND:-zero3}
-COMPARE_CANDIDATE_BACKEND=${COMPARE_CANDIDATE_BACKEND:-asym,kt_torchbf16,kt_armbf16}
-COMPARE_FIRST_STEP_REL_TOL=${COMPARE_FIRST_STEP_REL_TOL:-0.02}
-COMPARE_MAX_REL_TOL=${COMPARE_MAX_REL_TOL:-0.10}
-
-# Optional plotting controls
+# Plotting
 PLOT=${PLOT:-true}
 PLOT_MEMORY_BREAKDOWN=${PLOT_MEMORY_BREAKDOWN:-true}
 MEMORY_BREAKDOWN_PLOT_Y_SCALE=${MEMORY_BREAKDOWN_PLOT_Y_SCALE:-shared}
+PLOT_OUTPUT_DIR=${PLOT_OUTPUT_DIR:-}
 
-# Optional execution controls
+# Execution
 OVERWRITE=${OVERWRITE:-false}
 CONTINUE_ON_ERROR=${CONTINUE_ON_ERROR:-true}
 DRY_RUN=${DRY_RUN:-false}
 COLLECT_EXISTING=${COLLECT_EXISTING:-false}
 INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
-
-# Empty optional user parameters
 RUN_NAME=${RUN_NAME:-}
-COMPARE_MIN_STEPS=${COMPARE_MIN_STEPS:-}
-PLOT_OUTPUT_DIR=${PLOT_OUTPUT_DIR:-}
 
 # =============================================================================
 # Derived Parameters
@@ -123,7 +119,6 @@ PROFILE_POSTPROCESS_SCRIPT="${ASYM_DIR}/scripts/lf/postprocess_lf_profile_artifa
 PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_activation_recompute_sweep.py"
 MEMORY_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_memory_breakdown.py"
 INTERCONNECT_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_interconnect_ctc.py"
-SUPER_OFFLOAD_CONFIG_RENDERER="${ASYM_DIR}/scripts/lf/render_superoffload_deepspeed_config.py"
 
 # =============================================================================
 # Main Logic
@@ -144,17 +139,20 @@ Defaults:
 Options:
   List values must be comma-separated with no spaces.
 
+  Sweep:
   --gpus LIST                    Physical GPU pool, e.g. 0,1.
   --dist-launcher torchrun|accelerate
                                  Launcher for torch/zero/SuperOffload jobs. Default ${DIST_LAUNCHER}.
   --models LIST                  Model specs. Each item is model_name_or_path|num_gpus.
                                  Example: meta-llama/Llama-4-Scout-17B-16E|1,meta-llama/Llama-4-Maverick-17B-128E|4
-  --backend-specs LIST           Backend/recompute specs, e.g. 'torch|recomp,asym|norecomp,zero2|recomp,zero3|recomp,zero3_offload|recomp,superoffload|both,kt_armbf16|norecomp'.
+  --backend-specs LIST           Backend/recompute specs, e.g. 'torch|recomp,asym|norecomp,zero3_offload|recomp'.
                                  Use canonical recompute labels: norecomp or recomp. Use both to expand to both modes.
   --router-modes LIST            AsymGEMM router modes: hf, whole. Default ${ROUTER_MODES}.
   --profilers LIST               source and/or nsys.
   --seq-lens LIST                LF cutoff lengths. Accepts positive integers, e.g. 4096,8192.
   --expert-policies LIST         AsymGEMM expert policies: none, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, and -act variants.
+
+  Dataset:
   --dataset NAME
   --prepare-datasets true|false  Build/audit model+length-specific LF datasets before training.
   --dataset-min-tokens N|auto    Minimum source tokens for generated/audited rows. auto uses the seq length.
@@ -162,8 +160,10 @@ Options:
   --dataset-overwrite true|false Rewrite existing generated dataset files.
   --template NAME
   --max-samples N
-  --max-steps N                 Measured steps kept in plots/summaries.
-  --warmup-steps N              Extra initial steps to run but exclude from plots/summaries.
+
+  Training:
+  --max-steps N                  Measured steps kept in plots/summaries.
+  --warmup-steps N               Extra initial steps to run but exclude from plots/summaries.
   --batch-size N
   --gradient-accumulation-steps N
   --learning-rate VALUE
@@ -173,6 +173,8 @@ Options:
                                  KT supports nonzero dropout for validated kt_torchbf16 and kt_armbf16 SFT backends.
   --seed N
   --precision NAME
+
+  Profiling:
   --profile-level stage|module|op|deep
   --profile-layers all|first,last|0,1,2|every4
   --profile-memory-attribution auto|true|false
@@ -182,9 +184,8 @@ Options:
   --profile-memory-breakdown-modules LIST
   --profile-sync true|false
   --profile-module-filter LIST
-  --torch-use-asym-gemm-lora true|false
-                                 For zero* backends, attach packed-expert LoRA through the AsymGEMM torch backend.
-                                 Prefer BACKEND=asym_torch for wrapper-backed torch expert runs.
+
+  KT:
   --kt-kernel-dir DIR            Integrated kt-kernel source tree.
   --kt-tools-dir DIR             Helper source tree to put on PYTHONPATH for KT jobs. Defaults to ROOT.
   --kt-repo-dir DIR              KT artifact root owner. Defaults to dirname(--kt-kernel-dir).
@@ -205,18 +206,12 @@ Options:
   --kt-lora-expert-num N
   --kt-lora-expert-intermediate-size N
   --check-kt-calls true|false
+
+  SuperOffload:
   --deepspeed-dir DIR            Local DeepSpeed/SuperOffload source tree to put before site-packages.
-  --super-offload-deepspeed-config PATH
-                                 Optional rendered DeepSpeed config path. Defaults under --output-root.
-  --super-offload-cpuadam-cores-perc VALUE
-                                 CPU core fraction for SuperOffload CPUAdam, 0.0 to 1.0. Default ${SUPER_OFFLOAD_CPUADAM_CORES_PERC}.
   --check-superoffload true|false
-  --compare-losses true|false
-  --compare-baseline-backend torch|zero2|zero3|zero3_offload|superoffload|asym_torch|asym|kt_torchbf16|kt_armbf16
-  --compare-candidate-backend LIST   One or more comma-separated candidate backends.
-  --compare-min-steps N
-  --compare-first-step-rel-tol VALUE
-  --compare-max-rel-tol VALUE
+
+  Outputs and plotting:
   --output-root DIR              Default config layout: <root>/<dataset>__lora__lf__<precision>/<model>__gpus<model_gpus>__b<batch>_s<seq>_w<warmup>_s<steps>_r<rank>_a<alpha>_drop0xx
                                  Per-run dirs add <backend>__<profiler>__<recompute>__pol<policy>__router<mode>/s<seq>.
   --run-name NAME                Optional config directory under <dataset>__lora__lf__<precision>.
@@ -224,6 +219,8 @@ Options:
   --plot-memory-breakdown true|false
   --memory-breakdown-plot-y-scale shared|per-plot|global
   --plot-output-dir DIR
+
+  Execution:
   --overwrite true|false
   --continue-on-error true|false
   --collect-existing             Skip training and regenerate plots from existing profile.json files.
@@ -335,23 +332,6 @@ positive_int() {
   [[ "${value}" =~ ^[1-9][0-9]*$ ]] || die "${name} must be a positive integer, got '${value}'"
 }
 
-fraction_0_1() {
-  local name="$1"
-  local value="$2"
-  python3 - "${name}" "${value}" <<'PY'
-import math
-import sys
-
-name, raw = sys.argv[1:3]
-try:
-    value = float(raw)
-except ValueError:
-    raise SystemExit(f"{name} must be a number between 0 and 1, got {raw!r}")
-if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-    raise SystemExit(f"{name} must be between 0 and 1, got {raw!r}")
-PY
-}
-
 parse_model_spec() {
   local spec="$1"
   local -a fields
@@ -399,6 +379,7 @@ zero_deepspeed_config() {
     zero2) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z2_config.json" ;;
     zero3) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_config.json" ;;
     zero3_offload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json" ;;
+    superoffload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_config.json" ;;
     *) return 1 ;;
   esac
 }
@@ -449,7 +430,7 @@ backend_label() {
     zero2) printf 'zero2\n' ;;
     zero3) printf 'zero3\n' ;;
     zero3_offload) printf 'zero3_offload\n' ;;
-    superoffload|super_offload|so|ds_superoffload) printf 'superoffload\n' ;;
+    superoffload) printf 'superoffload\n' ;;
     kt_torchbf16) printf 'kt_torchbf16\n' ;;
     kt_armbf16) printf 'kt_armbf16\n' ;;
     *) die "backend must be torch, asym, asym_torch, zero2, zero3, zero3_offload, superoffload, kt_torchbf16, or kt_armbf16, got '${1}'" ;;
@@ -481,7 +462,7 @@ append_backend_spec() {
     zero2) backend=zero2 ;;
     zero3) backend=zero3 ;;
     zero3_offload) backend=zero3_offload ;;
-    superoffload|super_offload|so|ds_superoffload) backend=superoffload ;;
+    superoffload) backend=superoffload ;;
     kt_torchbf16) backend=kt_torchbf16 ;;
     kt_armbf16) backend=kt_armbf16 ;;
     *) die "backend must be torch, asym, asym_torch, zero2, zero3, zero3_offload, superoffload, kt_torchbf16, or kt_armbf16, got '${backend_part}'" ;;
@@ -862,8 +843,6 @@ while (($#)); do
     --profile-sync=*) PROFILE_SYNC="${1#*=}"; shift ;;
     --profile-module-filter) need_value "$1" "${2-}"; PROFILE_MODULE_FILTER="$2"; shift 2 ;;
     --profile-module-filter=*) PROFILE_MODULE_FILTER="${1#*=}"; shift ;;
-    --torch-use-asym-gemm-lora) need_value "$1" "${2-}"; TORCH_USE_ASYM_GEMM_LORA="$(bool_value "$2")"; shift 2 ;;
-    --torch-use-asym-gemm-lora=*) TORCH_USE_ASYM_GEMM_LORA="$(bool_value "${1#*=}")"; shift ;;
     --kt-kernel-dir) need_value "$1" "${2-}"; KT_KERNEL_DIR="$2"; shift 2 ;;
     --kt-kernel-dir=*) KT_KERNEL_DIR="${1#*=}"; shift ;;
     --kt-tools-dir) need_value "$1" "${2-}"; KT_TOOLS_DIR="$2"; shift 2 ;;
@@ -906,24 +885,8 @@ while (($#)); do
     --check-kt-calls=*) CHECK_KT_CALLS="$(bool_value "${1#*=}")"; shift ;;
     --deepspeed-dir) need_value "$1" "${2-}"; DEEPSPEED_DIR="$2"; shift 2 ;;
     --deepspeed-dir=*) DEEPSPEED_DIR="${1#*=}"; shift ;;
-    --super-offload-deepspeed-config) need_value "$1" "${2-}"; SUPER_OFFLOAD_DEEPSPEED_CONFIG="$2"; shift 2 ;;
-    --super-offload-deepspeed-config=*) SUPER_OFFLOAD_DEEPSPEED_CONFIG="${1#*=}"; shift ;;
-    --super-offload-cpuadam-cores-perc) need_value "$1" "${2-}"; SUPER_OFFLOAD_CPUADAM_CORES_PERC="$2"; shift 2 ;;
-    --super-offload-cpuadam-cores-perc=*) SUPER_OFFLOAD_CPUADAM_CORES_PERC="${1#*=}"; shift ;;
     --check-superoffload) need_value "$1" "${2-}"; CHECK_SUPEROFFLOAD="$(bool_value "$2")"; shift 2 ;;
     --check-superoffload=*) CHECK_SUPEROFFLOAD="$(bool_value "${1#*=}")"; shift ;;
-    --compare-losses) need_value "$1" "${2-}"; COMPARE_LOSSES="$(bool_value "$2")"; shift 2 ;;
-    --compare-losses=*) COMPARE_LOSSES="$(bool_value "${1#*=}")"; shift ;;
-    --compare-baseline-backend) need_value "$1" "${2-}"; COMPARE_BASELINE_BACKEND="$2"; shift 2 ;;
-    --compare-baseline-backend=*) COMPARE_BASELINE_BACKEND="${1#*=}"; shift ;;
-    --compare-candidate-backend) need_value "$1" "${2-}"; COMPARE_CANDIDATE_BACKEND="$2"; shift 2 ;;
-    --compare-candidate-backend=*) COMPARE_CANDIDATE_BACKEND="${1#*=}"; shift ;;
-    --compare-min-steps) need_value "$1" "${2-}"; COMPARE_MIN_STEPS="$2"; shift 2 ;;
-    --compare-min-steps=*) COMPARE_MIN_STEPS="${1#*=}"; shift ;;
-    --compare-first-step-rel-tol) need_value "$1" "${2-}"; COMPARE_FIRST_STEP_REL_TOL="$2"; shift 2 ;;
-    --compare-first-step-rel-tol=*) COMPARE_FIRST_STEP_REL_TOL="${1#*=}"; shift ;;
-    --compare-max-rel-tol) need_value "$1" "${2-}"; COMPARE_MAX_REL_TOL="$2"; shift 2 ;;
-    --compare-max-rel-tol=*) COMPARE_MAX_REL_TOL="${1#*=}"; shift ;;
     --output-root) need_value "$1" "${2-}"; output_root="$2"; shift 2 ;;
     --output-root=*) output_root="${1#*=}"; shift ;;
     --run-name) need_value "$1" "${2-}"; run_name="$2"; shift 2 ;;
@@ -973,14 +936,8 @@ done
 LORA_DROPOUT="${lora_dropouts[0]}"
 lora_dropout_label_value="$(lora_dropout_label "${LORA_DROPOUT}")"
 TOTAL_STEPS=$((MAX_STEPS + WARMUP_STEPS))
-if [[ -z "${COMPARE_MIN_STEPS}" ]]; then
-  COMPARE_MIN_STEPS="${MAX_STEPS}"
-fi
-nonnegative_int "--compare-min-steps" "${COMPARE_MIN_STEPS}"
 PREPARE_DATASETS=$(bool_value "${PREPARE_DATASETS}")
 DATASET_OVERWRITE=$(bool_value "${DATASET_OVERWRITE}")
-TORCH_USE_ASYM_GEMM_LORA=$(bool_value "${TORCH_USE_ASYM_GEMM_LORA}")
-COMPARE_LOSSES=$(bool_value "${COMPARE_LOSSES}")
 PLOT=$(bool_value "${PLOT}")
 PLOT_MEMORY_BREAKDOWN=$(bool_value "${PLOT_MEMORY_BREAKDOWN}")
 OVERWRITE=$(bool_value "${OVERWRITE}")
@@ -988,7 +945,6 @@ CONTINUE_ON_ERROR=$(bool_value "${CONTINUE_ON_ERROR}")
 DRY_RUN=$(bool_value "${DRY_RUN}")
 COLLECT_EXISTING=$(bool_value "${COLLECT_EXISTING}")
 CHECK_SUPEROFFLOAD=$(bool_value "${CHECK_SUPEROFFLOAD}")
-fraction_0_1 "--super-offload-cpuadam-cores-perc" "${SUPER_OFFLOAD_CPUADAM_CORES_PERC}"
 DATASET_MIN_TOKENS="${DATASET_MIN_TOKENS,,}"
 positive_int "--dataset-eval-rows" "${DATASET_EVAL_ROWS}"
 if [[ "${DATASET_MIN_TOKENS}" != "auto" ]]; then
@@ -1113,33 +1069,14 @@ if [[ "${PREPARE_DATASETS}" == "true" && "${DRY_RUN}" != "true" && "${COLLECT_EX
 fi
 if [[ "${selected_has_zero}" == "true" ]]; then
   for backend in "${backends[@]}"; do
-    if is_zero_backend "${backend}" && [[ "${backend}" != "superoffload" ]]; then
+    if is_zero_backend "${backend}"; then
       [[ -f "$(zero_deepspeed_config "${backend}")" ]] || die "missing DeepSpeed config for ${backend}: $(zero_deepspeed_config "${backend}")"
     fi
   done
 fi
-compare_baseline_backend="$(backend_label "${COMPARE_BASELINE_BACKEND}")"
-mapfile -t compare_candidate_backends < <(tokens "${COMPARE_CANDIDATE_BACKEND}" | while read -r value; do backend_label "${value}"; done | dedupe)
-((${#compare_candidate_backends[@]} > 0)) || die "compare candidate backend list is empty"
-for compare_candidate_backend in "${compare_candidate_backends[@]}"; do
-  [[ "${compare_baseline_backend}" != "${compare_candidate_backend}" ]] || die "compare backends must differ"
-done
-
 base_output_root="$(abs_path "${output_root}")"
 if [[ "${selected_has_superoffload}" == "true" ]]; then
-  [[ -f "${SUPER_OFFLOAD_CONFIG_RENDERER}" ]] || die "missing ${SUPER_OFFLOAD_CONFIG_RENDERER}"
-  [[ -f "$(zero_deepspeed_config zero3_offload)" ]] || die "missing base DeepSpeed offload config: $(zero_deepspeed_config zero3_offload)"
   [[ -f "${DEEPSPEED_DIR}/deepspeed/runtime/superoffload/superoffload_stage3.py" ]] || die "missing local SuperOffload DeepSpeed tree at ${DEEPSPEED_DIR}"
-  if [[ -z "${SUPER_OFFLOAD_DEEPSPEED_CONFIG}" ]]; then
-    SUPER_OFFLOAD_DEEPSPEED_CONFIG="${base_output_root}/deepspeed/ds_z3_superoffload_config.json"
-  else
-    SUPER_OFFLOAD_DEEPSPEED_CONFIG="$(abs_path "${SUPER_OFFLOAD_DEEPSPEED_CONFIG}")"
-  fi
-  python3 "${SUPER_OFFLOAD_CONFIG_RENDERER}" \
-    --base "$(zero_deepspeed_config zero3_offload)" \
-    --output "${SUPER_OFFLOAD_DEEPSPEED_CONFIG}" \
-    --cpuadam-cores-perc "${SUPER_OFFLOAD_CPUADAM_CORES_PERC}"
-  [[ -f "${SUPER_OFFLOAD_DEEPSPEED_CONFIG}" ]] || die "failed to render ${SUPER_OFFLOAD_DEEPSPEED_CONFIG}"
 fi
 precision_label="$(safe_label "${PRECISION}")"
 dataset_root_label="$(safe_label "${DATASET}")"
@@ -1153,11 +1090,6 @@ echo "Output precision root: ${precision_root}"
 declare -A plot_roots=()
 declare -A memory_plot_roots=()
 declare -A interconnect_plot_roots=()
-declare -A run_dirs=()
-declare -A compare_groups=()
-declare -A compare_group_config_roots=()
-declare -A compare_group_labels=()
-declare -a compare_group_keys=()
 failures=0
 interrupted=false
 interrupt_exit_status=130
@@ -1325,7 +1257,6 @@ run_job() {
   log_file="${seq_root}/train.log"
   run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_router${router_mode}_s${seq_len}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
-  local group_key="${config_root}|${profiler}|${recompute}|${expert_policy}|${router_mode}|${seq_len}"
   local profile_memory_attribution profile_memory_breakdown
   local master_port
   profile_memory_attribution="$(profile_memory_flag_for_profiler "--profile-memory-attribution" "${PROFILE_MEMORY_ATTRIBUTION}" "${profiler}")"
@@ -1342,16 +1273,8 @@ run_job() {
   if [[ "${profiler}" == "nsys" ]]; then
     interconnect_plot_roots["${config_root}"]="${seq_len}"
   fi
-  if [[ -z "${compare_groups[${group_key}]+set}" ]]; then
-    compare_groups["${group_key}"]=1
-    compare_group_keys+=("${group_key}")
-    compare_group_config_roots["${group_key}"]="${config_root}"
-    compare_group_labels["${group_key}"]="dropout=${LORA_DROPOUT} profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} router_mode=${router_mode} seq_len=${seq_len}"
-  fi
-
   if [[ "${DRY_RUN}" != "true" && -e "${profile_json}" && "${OVERWRITE}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
     echo "Skipping existing: ${profile_json}"
-    run_dirs["${group_key}|${backend}"]="${lf_out}"
     append_job_record "${config_root}" skipped \
       "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
     return 0
@@ -1360,7 +1283,6 @@ run_job() {
   if [[ "${DRY_RUN}" != "true" && "${COLLECT_EXISTING}" == "true" ]]; then
     if [[ -e "${profile_json}" ]]; then
       echo "Found existing: ${profile_json}"
-      run_dirs["${group_key}|${backend}"]="${lf_out}"
       return 0
     fi
     echo "Missing existing profile: ${profile_json}" >&2
@@ -1376,8 +1298,6 @@ run_job() {
     NSYS_BIN="${NSYS_BIN}"
     DIST_LAUNCHER="${DIST_LAUNCHER}"
     DEEPSPEED_DIR="${DEEPSPEED_DIR}"
-    SUPER_OFFLOAD_DEEPSPEED_CONFIG="${SUPER_OFFLOAD_DEEPSPEED_CONFIG}"
-    SUPER_OFFLOAD_CPUADAM_CORES_PERC="${SUPER_OFFLOAD_CPUADAM_CORES_PERC}"
     CHECK_SUPEROFFLOAD="${CHECK_SUPEROFFLOAD}"
     MODEL_NAME_OR_PATH="${current_model_name}"
     BACKEND="${backend}"
@@ -1402,7 +1322,6 @@ run_job() {
     ASYM_EXPERT_RECOMPUTE_POLICY="${expert_policy}"
     ASYM_ROUTER_MODE="${router_mode}"
     ASYM_STRICT="${ASYM_STRICT}"
-    TORCH_USE_ASYM_GEMM_LORA="${TORCH_USE_ASYM_GEMM_LORA}"
     PROFILE=1
     PROFILE_PROFILER="${profiler}"
     PROFILE_LEVEL="${PROFILE_LEVEL}"
@@ -1433,11 +1352,8 @@ run_job() {
     ASYM_GEMM_LF_CONFIG_MEASURE_STEPS="${MAX_STEPS}"
     ASYM_GEMM_LF_CONFIG_TOTAL_STEPS="${TOTAL_STEPS}"
     ASYM_GEMM_LF_CONFIG_DEEPSPEED_DIR="${DEEPSPEED_DIR}"
-    ASYM_GEMM_LF_CONFIG_SUPEROFFLOAD_CONFIG="${SUPER_OFFLOAD_DEEPSPEED_CONFIG}"
-    ASYM_GEMM_LF_CONFIG_SUPEROFFLOAD_CPUADAM_CORES_PERC="${SUPER_OFFLOAD_CPUADAM_CORES_PERC}"
     OUT_DIR="${lf_out}"
     LOG_FILE="${log_file}"
-    LOSS_LOG_COPY="${seq_root}/loss.trainer_log.jsonl"
     RUN_ID="${run_id}"
   )
   if [[ "${backend}" == kt_* ]]; then
@@ -1476,7 +1392,6 @@ run_job() {
     {
       print_command "${run_cmd[@]}"
     } > "${seq_root}/command.txt"
-    run_dirs["${group_key}|${backend}"]="${lf_out}"
     append_job_record "${config_root}" dry-run \
       "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
     return 0
@@ -1506,7 +1421,6 @@ run_job() {
   fi
 
   if ((status == 0)); then
-    run_dirs["${group_key}|${backend}"]="${lf_out}"
     append_job_record "${config_root}" ok \
       "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
     if profiler_selected_for_plots "${profiler}"; then
@@ -1522,94 +1436,6 @@ run_job() {
       "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
   fi
   return "${status}"
-}
-
-baseline_selected=false
-declare -A candidate_backend_selected=()
-for compare_candidate_backend in "${compare_candidate_backends[@]}"; do
-  candidate_backend_selected["${compare_candidate_backend}"]=false
-done
-for backend in "${backends[@]}"; do
-  [[ "${backend}" == "${compare_baseline_backend}" ]] && baseline_selected=true
-  for compare_candidate_backend in "${compare_candidate_backends[@]}"; do
-    [[ "${backend}" == "${compare_candidate_backend}" ]] && candidate_backend_selected["${compare_candidate_backend}"]=true
-  done
-done
-
-compare_config_root() {
-  local target_config_root="$1"
-  local group_key baseline_dir candidate_dir config_root compare_dir compare_tsv compare_log status
-  local group_tail group_expert_policy compare_candidate_backend
-
-  [[ "${COMPARE_LOSSES}" == "true" ]] || return 0
-  if [[ "${baseline_selected}" != "true" ]]; then
-    echo "Skipping loss comparison because selected backends do not include baseline ${compare_baseline_backend}."
-    return 0
-  fi
-
-  compare_dir="${target_config_root}/comparisons"
-  compare_tsv="${compare_dir}/loss_compare.tsv"
-  mkdir -p "${compare_dir}"
-  printf 'status\tbaseline_backend\tcandidate_backend\tbaseline_dir\tcandidate_dir\tlog\tlabel\n' > "${compare_tsv}"
-
-  for compare_candidate_backend in "${compare_candidate_backends[@]}"; do
-    if [[ "${candidate_backend_selected[${compare_candidate_backend}]}" != "true" ]]; then
-      echo "Skipping loss comparison for candidate ${compare_candidate_backend}; selected backends do not include it."
-      continue
-    fi
-
-    for group_key in "${compare_group_keys[@]}"; do
-      config_root="${compare_group_config_roots[${group_key}]}"
-      [[ "${config_root}" == "${target_config_root}" ]] || continue
-      group_tail="${group_key%|*}"
-      group_tail="${group_tail%|*}"
-      group_expert_policy="${group_tail##*|}"
-      if [[ "${group_expert_policy}" != "none" ]] && { is_policy_independent_backend "${compare_baseline_backend}" || is_policy_independent_backend "${compare_candidate_backend}"; }; then
-        echo "Skipping loss comparison for ${compare_group_labels[${group_key}]}; torch/zero/SuperOffload/KT backends are policy-independent."
-        continue
-      fi
-      baseline_dir="${run_dirs[${group_key}|${compare_baseline_backend}]-}"
-      candidate_dir="${run_dirs[${group_key}|${compare_candidate_backend}]-}"
-      compare_log="${compare_dir}/$(safe_label "${compare_group_labels[${group_key}]} ${compare_baseline_backend} vs ${compare_candidate_backend}").log"
-
-      if [[ -z "${baseline_dir}" || -z "${candidate_dir}" ]]; then
-        echo "Missing loss comparison input for ${compare_group_labels[${group_key}]}" | tee "${compare_log}"
-        printf 'missing\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-          "${compare_baseline_backend}" "${compare_candidate_backend}" "${baseline_dir}" "${candidate_dir}" "${compare_log}" "${compare_group_labels[${group_key}]}" \
-          >> "${compare_tsv}"
-        failures=$((failures + 1))
-        if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
-          exit 1
-        fi
-        continue
-      fi
-
-      echo "Comparing losses: ${compare_group_labels[${group_key}]} ${compare_baseline_backend} vs ${compare_candidate_backend}" | tee "${compare_log}"
-      local -a compare_cmd=(
-        "${CONDA_EXE}" run -p "${ENV_DIR}" python "${PROFILE_POSTPROCESS_SCRIPT}"
-        --baseline-dir "${baseline_dir}"
-        --candidate-dir "${candidate_dir}"
-        --min-steps "${COMPARE_MIN_STEPS}"
-        --warmup-steps "${WARMUP_STEPS}"
-        --first-step-rel-tol "${COMPARE_FIRST_STEP_REL_TOL}"
-        --max-rel-tol "${COMPARE_MAX_REL_TOL}"
-      )
-      if run_tracked_command_logged "${compare_log}" "${compare_cmd[@]}"; then
-        printf 'ok\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-          "${compare_baseline_backend}" "${compare_candidate_backend}" "${baseline_dir}" "${candidate_dir}" "${compare_log}" "${compare_group_labels[${group_key}]}" \
-          >> "${compare_tsv}"
-      else
-        status=$?
-        printf 'failed:%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-          "${status}" "${compare_baseline_backend}" "${compare_candidate_backend}" "${baseline_dir}" "${candidate_dir}" "${compare_log}" "${compare_group_labels[${group_key}]}" \
-          >> "${compare_tsv}"
-        failures=$((failures + 1))
-        if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
-          exit 1
-        fi
-      fi
-    done
-  done
 }
 
 plot_config_root() {
@@ -1756,7 +1582,6 @@ This config root is organized as follows:
 - \`combined/\`: config-level LF timing and allocator-summary plots from \`profile.json\`.
 - \`memory_combined/\`: config-level source-memory breakdown plots. If no source-memory rows were collected, this folder contains a README explaining why.
 - \`c2c_combined/\`: config-level C2C/CTC saturation plots from Nsight GPU metrics. If old traces lack GPU metrics, this folder contains a README explaining why.
-- \`comparisons/\`: loss comparison artifacts, when loss comparison is enabled.
 - \`<backend>__<profiler>__<recompute>__pol<policy>__router<mode>/s<seq>/\`: per-run artifacts.
 
 If \`PLOT_OUTPUT_DIR\` is set, combined plot folders are written under that external plot output root instead of this config root.
@@ -1776,7 +1601,7 @@ This precision root is organized as follows:
 - \`combined/\`: global LF timing and allocator-summary plots across config roots.
 - \`memory_combined/\`: global source-memory breakdown plots across config roots. If no source-memory rows were collected, this folder contains a README explaining why.
 - \`c2c_combined/\`: global C2C/CTC saturation plots across config roots. If old traces lack Nsight GPU metrics, this folder contains a README explaining why.
-- \`<config_root>/\`: one workload/configuration root. Each config root has its own \`combined/\`, \`memory_combined/\`, \`c2c_combined/\`, optional \`comparisons/\`, and per-run backend/profiler folders.
+- \`<config_root>/\`: one workload/configuration root. Each config root has its own \`combined/\`, \`memory_combined/\`, \`c2c_combined/\`, and per-run backend/profiler folders.
 
 If \`PLOT_OUTPUT_DIR\` is set, global combined plot folders are written under that external plot output root instead of this precision root.
 
@@ -2033,7 +1858,6 @@ for model_spec_entry in "${model_specs[@]}"; do
         done
       done
       if [[ "${DRY_RUN}" != "true" ]]; then
-        compare_config_root "${config_root}"
         plot_config_root "${config_root}" "${seq_len}"
         if [[ -z "${PLOT_OUTPUT_DIR}" && ! -d "${config_root}/combined" ]]; then
           write_missing_combined_readme \

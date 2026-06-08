@@ -4,11 +4,15 @@ set -euo pipefail
 # =============================================================================
 # User Parameters
 # =============================================================================
+
+# Repositories
 ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
 LF_DIR=${LF_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/LlamaFactory}
 LF_REPO_URL=${LF_REPO_URL:-https://github.com/hiyouga/LLaMA-Factory.git}
 LF_BRANCH=${LF_BRANCH:-main_kevin}
 ASYM_BRANCH=${ASYM_BRANCH:-main_kevin}
+
+# Environment
 PYTHON_VERSION=${PYTHON_VERSION:-3.11}
 RECREATE_ENV=${RECREATE_ENV:-0}
 TORCH_INSTALL_CMD=${TORCH_INSTALL_CMD:-}

@@ -4,30 +4,22 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import re
 from pathlib import Path
 from typing import Any
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Write LF profile artifacts and compare LF smoke losses.")
-    parser.add_argument("--profile-json", type=Path, help="Profile JSON to convert into CSV artifacts.")
-    parser.add_argument("--source-profile-json", type=Path, help="Source-profile JSON to convert into markdown artifacts.")
-    parser.add_argument("--output-dir", type=Path, help="Directory for profile artifacts.")
-    parser.add_argument("--baseline-dir", type=Path, help="Baseline LF run dir for loss comparison.")
-    parser.add_argument("--candidate-dir", type=Path, help="Candidate LF run dir for loss comparison.")
-    parser.add_argument("--min-steps", type=int, default=10)
-    parser.add_argument("--warmup-steps", type=int, default=0)
-    parser.add_argument("--first-step-rel-tol", type=float, default=0.02)
-    parser.add_argument("--max-rel-tol", type=float, default=0.10)
+    parser = argparse.ArgumentParser(description="Write LF profile artifacts.")
+    artifacts = parser.add_argument_group("artifact output")
+    artifacts.add_argument("--profile-json", type=Path, help="Profile JSON to convert into CSV artifacts.")
+    artifacts.add_argument("--source-profile-json", type=Path, help="Source-profile JSON to convert into markdown artifacts.")
+    artifacts.add_argument("--output-dir", type=Path, help="Directory for profile artifacts.")
     args = parser.parse_args()
-    if not any((args.profile_json, args.source_profile_json, args.baseline_dir, args.candidate_dir)):
-        parser.error("provide --profile-json, --source-profile-json, or --baseline-dir/--candidate-dir")
-    if (args.profile_json or args.source_profile_json) and args.output_dir is None:
-        parser.error("--output-dir is required for profile artifact output")
-    if bool(args.baseline_dir) != bool(args.candidate_dir):
-        parser.error("--baseline-dir and --candidate-dir must be provided together")
+    if not any((args.profile_json, args.source_profile_json)):
+        parser.error("provide --profile-json or --source-profile-json")
+    if args.output_dir is None:
+        parser.error("--output-dir is required")
     return args
 
 
@@ -615,73 +607,12 @@ def _write_profile_csv_artifacts(profile_json: Path, output_dir: Path) -> None:
     _write_csv(output_dir / "unattributed_timing.csv", _unattributed(profile))
 
 
-def _find_loss_log(run_dir: Path) -> Path:
-    candidates = [run_dir / "trainer_log.jsonl", *sorted(run_dir.glob("loss_*.trainer_log.jsonl"))]
-    for path in candidates:
-        if path.exists():
-            return path
-    raise FileNotFoundError(f"no trainer loss log found in {run_dir}")
-
-
-def _read_losses(run_dir: Path, *, warmup_steps: int = 0) -> list[tuple[int, float]]:
-    log_path = _find_loss_log(run_dir)
-    losses: list[tuple[int, float]] = []
-    for line_no, line in enumerate(log_path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        record = json.loads(line)
-        if "loss" not in record:
-            continue
-        loss = float(record["loss"])
-        if not math.isfinite(loss):
-            raise ValueError(f"{log_path}:{line_no} has non-finite loss {loss}")
-        step = int(record.get("current_steps", record.get("step", len(losses) + 1)))
-        if step <= warmup_steps:
-            continue
-        step -= warmup_steps
-        losses.append((step, loss))
-    if not losses:
-        raise ValueError(f"{log_path} has no loss records")
-    return losses
-
-
-def _rel_diff(a: float, b: float) -> float:
-    denom = max(abs(a), abs(b), 1e-12)
-    return abs(a - b) / denom
-
-
-def _compare_losses(args: argparse.Namespace) -> None:
-    baseline = _read_losses(args.baseline_dir, warmup_steps=max(args.warmup_steps, 0))
-    candidate = _read_losses(args.candidate_dir, warmup_steps=max(args.warmup_steps, 0))
-    if len(baseline) < args.min_steps:
-        raise SystemExit(f"baseline has {len(baseline)} loss records, expected at least {args.min_steps}")
-    if len(candidate) < args.min_steps:
-        raise SystemExit(f"candidate has {len(candidate)} loss records, expected at least {args.min_steps}")
-
-    baseline = baseline[: args.min_steps]
-    candidate = candidate[: args.min_steps]
-    first_rel = _rel_diff(baseline[0][1], candidate[0][1])
-    max_rel = max(_rel_diff(base_loss, cand_loss) for (_, base_loss), (_, cand_loss) in zip(baseline, candidate))
-
-    print(f"baseline_first={baseline[0][1]:.6f}")
-    print(f"candidate_first={candidate[0][1]:.6f}")
-    print(f"first_step_rel_diff={first_rel:.6f}")
-    print(f"max_{args.min_steps}_step_rel_diff={max_rel:.6f}")
-
-    if first_rel > args.first_step_rel_tol:
-        raise SystemExit(f"first-step relative diff {first_rel:.6f} exceeds {args.first_step_rel_tol:.6f}")
-    if max_rel > args.max_rel_tol:
-        raise SystemExit(f"max relative diff {max_rel:.6f} exceeds {args.max_rel_tol:.6f}")
-
-
 def main() -> None:
     args = _parse_args()
     if args.source_profile_json:
         _write_source_artifacts(args.source_profile_json, args.output_dir, args.profile_json)
     if args.profile_json:
         _write_profile_csv_artifacts(args.profile_json, args.output_dir)
-    if args.baseline_dir:
-        _compare_losses(args)
 
 
 if __name__ == "__main__":

@@ -160,9 +160,6 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "superoffload_config": os.environ.get("ASYM_GEMM_LF_CONFIG_SUPEROFFLOAD_CONFIG")
         if is_superoffload_backend
         else None,
-        "superoffload_cpuadam_cores_perc": os.environ.get("ASYM_GEMM_LF_CONFIG_SUPEROFFLOAD_CPUADAM_CORES_PERC")
-        if is_superoffload_backend
-        else None,
         "deepspeed_dir": os.environ.get("ASYM_GEMM_LF_CONFIG_DEEPSPEED_DIR"),
         "output_dir": _option_value(args, "--output_dir"),
     }
@@ -266,9 +263,7 @@ def _superoffload_summary_from_config(config: dict[str, Any]) -> dict[str, Any]:
     is_superoffload_backend = str(config.get("backend") or "").lower() == "superoffload"
     config_path = str(config.get("superoffload_config") or "") if is_superoffload_backend else ""
     config_super_offload = False
-    cpuadam_cores_perc = (
-        _safe_float(config.get("superoffload_cpuadam_cores_perc")) if is_superoffload_backend else None
-    )
+    cpuadam_cores_perc = None
     if config_path:
         path = Path(config_path)
         if path.is_file():

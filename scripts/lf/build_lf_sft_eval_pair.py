@@ -46,39 +46,48 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build and validate one LF-compatible train/eval SFT dataset pair."
     )
-    parser.add_argument("--lf-dir", required=True)
-    parser.add_argument("--asym-dir", default=str(Path(__file__).resolve().parents[2]))
-    parser.add_argument("--results-root", default="")
-    parser.add_argument("--model-name-or-path", default="Qwen/Qwen3-30B-A3B")
-    parser.add_argument("--template", default="auto")
-    parser.add_argument("--source-dataset", default="HuggingFaceTB/smoltalk")
-    parser.add_argument("--source-config", default="longalign")
-    parser.add_argument("--train-split", default="train")
-    parser.add_argument("--eval-split", default="test")
-    parser.add_argument("--train-name", default="lf_smoltalk_small_train")
-    parser.add_argument("--eval-name", default="lf_smoltalk_small_eval")
-    parser.add_argument("--train-rows", type=int, default=1000)
-    parser.add_argument("--eval-rows", type=int, default=128)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--cutoff-len", type=int, default=4096)
-    parser.add_argument("--min-tokens", type=int, default=2048)
-    parser.add_argument("--precision", default="bf16")
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--lora-rank", type=int, default=8)
-    parser.add_argument("--lora-alpha", type=int, default=16)
-    parser.add_argument("--lf-preprocess-samples", type=int, default=8)
-    parser.add_argument("--skip-lf-preprocess-check", action="store_true")
-    parser.add_argument(
+    paths = parser.add_argument_group("paths")
+    paths.add_argument("--lf-dir", required=True)
+    paths.add_argument("--asym-dir", default=str(Path(__file__).resolve().parents[2]))
+    paths.add_argument("--results-root", default="")
+
+    model = parser.add_argument_group("model")
+    model.add_argument("--model-name-or-path", default="Qwen/Qwen3-30B-A3B")
+    model.add_argument("--template", default="auto")
+    model.add_argument("--precision", default="bf16")
+    model.add_argument("--batch-size", type=int, default=1)
+    model.add_argument("--lora-rank", type=int, default=8)
+    model.add_argument("--lora-alpha", type=int, default=16)
+
+    source = parser.add_argument_group("source dataset")
+    source.add_argument("--source-dataset", default="HuggingFaceTB/smoltalk")
+    source.add_argument("--source-config", default="longalign")
+    source.add_argument("--train-split", default="train")
+    source.add_argument("--eval-split", default="test")
+
+    output = parser.add_argument_group("output dataset")
+    output.add_argument("--train-name", default="lf_smoltalk_small_train")
+    output.add_argument("--eval-name", default="lf_smoltalk_small_eval")
+    output.add_argument("--train-rows", type=int, default=1000)
+    output.add_argument("--eval-rows", type=int, default=128)
+    output.add_argument("--seed", type=int, default=0)
+    output.add_argument("--cutoff-len", type=int, default=4096)
+    output.add_argument("--min-tokens", type=int, default=2048)
+    output.add_argument(
         "--overwrite",
         action="store_true",
         help="Rewrite existing train/eval files. By default existing complete pairs are audited without rewriting.",
     )
-    parser.add_argument(
+    output.add_argument(
         "--audit-only",
         action="store_true",
         help="Require existing train/eval files and only reprint validation/stats/results.",
     )
-    parser.add_argument("--print-samples", type=int, default=3, help="Print compact examples from each split.")
+
+    validation = parser.add_argument_group("validation")
+    validation.add_argument("--lf-preprocess-samples", type=int, default=8)
+    validation.add_argument("--skip-lf-preprocess-check", action="store_true")
+    validation.add_argument("--print-samples", type=int, default=3, help="Print compact examples from each split.")
     return parser.parse_args()
 
 
