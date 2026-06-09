@@ -32,6 +32,15 @@ static void register_apis(pybind11::module_& m) {
         return compile_mode;
     });
 
+    // Architecture query — lets the Python facade centralize SM89/SM90/SM100
+    // dispatch instead of callers computing the arch from raw SM numbers.
+    m.def("get_arch_pair", [&]() {
+        return device_runtime->get_arch_pair();
+    });
+    m.def("get_arch_major", [&]() {
+        return device_runtime->get_arch_major();
+    });
+
     m.def("init", [&](const std::string& library_root_path, const std::string& cuda_home_path_by_python) {
         Compiler::prepare_init(library_root_path, cuda_home_path_by_python);
         KernelRuntime::prepare_init(cuda_home_path_by_python);

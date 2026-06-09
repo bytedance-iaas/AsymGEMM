@@ -79,6 +79,23 @@ try:
             "get_mk_alignment_for_contiguous_layout",
         ])
 
+        # Architecture dispatch (facade layer). These unified entry points route
+        # to the native-FP8 (SM89/SM90) or TMA/UMMA (SM100) kernels internally, so
+        # callers issue one call regardless of GPU. They intentionally override the
+        # raw ``_C`` imports of the same name pulled in above.
+        from .dispatch import (  # noqa: F401
+            get_arch_major,
+            get_arch_pair,
+            is_blackwell,
+            is_dtype_supported,
+            supported_archs,
+            supported_dtypes,
+            m_grouped_fp8_asym_gemm_nt_contiguous,
+            m_grouped_fp8_asym_gemm_nt_masked,
+        )
+        globals()["m_grouped_fp8_asym_gemm_nt_contiguous"] = m_grouped_fp8_asym_gemm_nt_contiguous
+        globals()["m_grouped_fp8_asym_gemm_nt_masked"] = m_grouped_fp8_asym_gemm_nt_masked
+
         # Some alias for legacy supports
         # TODO: remove these later
         _export_kernel_alias("fp8_m_grouped_asym_gemm_nt_masked", "m_grouped_fp8_asym_gemm_nt_masked")

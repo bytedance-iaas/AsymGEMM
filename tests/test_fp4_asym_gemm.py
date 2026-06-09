@@ -483,6 +483,7 @@ def test_m_grouped_nvfp4_masked_cpp_flow() -> None:
     b_fp4_pinned = b_fp4.cpu().pin_memory()
     sfb_pinned = sfb.cpu().pin_memory()
 
+    # warm up
     d_kernel = torch.empty((num_groups, max_m, n), device="cuda", dtype=torch.bfloat16)
     asym_gemm.m_grouped_fp4_asym_gemm_nt_masked(
         (a_fp4, sfa),
