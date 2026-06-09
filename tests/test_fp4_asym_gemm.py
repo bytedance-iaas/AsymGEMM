@@ -484,12 +484,6 @@ def test_m_grouped_nvfp4_masked_cpp_flow() -> None:
     sfb_pinned = sfb.cpu().pin_memory()
 
     # warm up
-    expected_m_per_group = 1
-    masked_m = torch.zeros(
-        (num_groups,), dtype=torch.int32, device="cuda"
-    )
-    import ipdb; ipdb.set_trace()
-
     d_kernel = torch.empty((num_groups, max_m, n), device="cuda", dtype=torch.bfloat16)
     asym_gemm.m_grouped_fp4_asym_gemm_nt_masked(
         (a_fp4, sfa),
@@ -502,7 +496,6 @@ def test_m_grouped_nvfp4_masked_cpp_flow() -> None:
     )
     torch.cuda.synchronize()
 
-    import ipdb; ipdb.set_trace()
     # Manual reference per group (dequant NVFP4+E4M3 -> fp32 matmul) for the
     # valid rows only. Ground truth uses original BF16 a/b for the same rows.
     print(
