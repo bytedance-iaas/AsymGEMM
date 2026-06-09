@@ -201,12 +201,21 @@ def _memory_breakdown_summary(profile: dict[str, Any]) -> dict[str, Any]:
     return summary if isinstance(summary, dict) else {}
 
 
+def _memory_breakdown_component(component: Any) -> str:
+    component_str = str(component or "").strip()
+    if component_str in {"", "unknown_saved_activation"}:
+        return "other_saved_activations"
+    return component_str
+
+
 def _memory_breakdown_csv_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
     rows = summary.get("breakdown_rows", [])
     if not isinstance(rows, list):
         return []
     peak_allocated = int(summary.get("peak_allocated_hbm_bytes", 0) or 0)
     peak_reserved = int(summary.get("peak_reserved_hbm_bytes", 0) or 0)
+    actual_peak_allocated = int(summary.get("actual_peak_allocated_hbm_bytes", peak_allocated) or 0)
+    actual_peak_reserved = int(summary.get("actual_peak_reserved_hbm_bytes", peak_reserved) or 0)
     reserved_unallocated = int(summary.get("reserved_unallocated_bytes", 0) or 0)
     external_cuda = int(summary.get("external_cuda_or_driver_bytes", 0) or 0)
     selected_step = summary.get("selected_step", "")
@@ -226,8 +235,12 @@ def _memory_breakdown_csv_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 "selected_step": selected_step,
                 "selected_phase": selected_phase,
+                "actual_peak_step": summary.get("actual_peak_step", ""),
+                "actual_peak_phase": summary.get("actual_peak_phase", ""),
                 "schema_version": summary.get("schema_version", ""),
                 "selected_metric": summary.get("selected_metric", ""),
+                "actual_peak_allocated_hbm_bytes": actual_peak_allocated,
+                "actual_peak_reserved_hbm_bytes": actual_peak_reserved,
                 "peak_allocated_hbm_bytes": peak_allocated,
                 "peak_reserved_hbm_bytes": peak_reserved,
                 "reserved_unallocated_bytes": reserved_unallocated,
@@ -237,12 +250,17 @@ def _memory_breakdown_csv_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 "saved_activation_hbm_bytes_at_peak": int(
                     summary.get("saved_activation_hbm_bytes_at_peak", 0) or 0
                 ),
+                "live_activation_hbm_bytes_at_peak": int(summary.get("live_activation_hbm_bytes_at_peak", 0) or 0),
+                "activation_hbm_bytes_at_peak": int(summary.get("activation_hbm_bytes_at_peak", 0) or 0),
+                "temporary_workspace_hbm_bytes_at_peak": int(
+                    summary.get("temporary_workspace_hbm_bytes_at_peak", 0) or 0
+                ),
                 "unattributed_allocated_peak_bytes": int(
                     summary.get("unattributed_allocated_peak_bytes", 0) or 0
                 ),
                 "memory_space": memory_space,
                 "group": row.get("group", "-"),
-                "component": row.get("component", "-"),
+                "component": _memory_breakdown_component(row.get("component", "-")),
                 "kind": row.get("kind", "-"),
                 "bytes": value,
                 "mib": value / (1024.0 ** 2),
@@ -260,6 +278,53 @@ def _memory_breakdown_csv_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
     return normalized
 
 
+def _actual_peak_memory_breakdown_csv_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = summary.get("actual_peak_breakdown_rows", [])
+    if not isinstance(rows, list) or not rows:
+        rows = summary.get("breakdown_rows", [])
+    if not isinstance(rows, list):
+        return []
+    actual_peak_allocated = int(summary.get("actual_peak_allocated_hbm_bytes", summary.get("peak_allocated_hbm_bytes", 0)) or 0)
+    actual_peak_reserved = int(summary.get("actual_peak_reserved_hbm_bytes", summary.get("peak_reserved_hbm_bytes", 0)) or 0)
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        value = int(row.get("bytes", 0) or 0)
+        memory_space = row.get("memory_space", "-")
+        is_reserved_stack_row = memory_space == "GPU HBM" or row.get("component") == "allocator_reserved_unallocated"
+        normalized.append(
+            {
+                "actual_peak_step": summary.get("actual_peak_step", ""),
+                "actual_peak_phase": summary.get("actual_peak_phase", ""),
+                "schema_version": summary.get("schema_version", ""),
+                "actual_peak_allocated_hbm_bytes": actual_peak_allocated,
+                "actual_peak_reserved_hbm_bytes": actual_peak_reserved,
+                "actual_peak_reserved_unallocated_bytes": int(
+                    summary.get("actual_peak_reserved_unallocated_bytes", max(0, actual_peak_reserved - actual_peak_allocated)) or 0
+                ),
+                "memory_space": memory_space,
+                "group": row.get("group", "-"),
+                "component": _memory_breakdown_component(row.get("component", "-")),
+                "kind": row.get("kind", "-"),
+                "bytes": value,
+                "mib": value / (1024.0 ** 2),
+                "percent_actual_peak_reserved_hbm": (value * 100.0 / actual_peak_reserved)
+                if actual_peak_reserved > 0 and is_reserved_stack_row
+                else "",
+                "method": row.get("method", "-"),
+                "accuracy": row.get("accuracy", "-"),
+                "actual_peak_allocated_closure_error_bytes": int(
+                    summary.get("actual_peak_allocated_closure_error_bytes", 0) or 0
+                ),
+                "actual_peak_reserved_closure_error_bytes": int(
+                    summary.get("actual_peak_reserved_closure_error_bytes", 0) or 0
+                ),
+            }
+        )
+    return normalized
+
+
 def _source_memory_breakdown_markdown(profile: dict[str, Any], *, top_level: bool = False) -> str:
     summary = _memory_breakdown_summary(profile)
     rows = _memory_breakdown_csv_rows(summary)
@@ -267,6 +332,8 @@ def _source_memory_breakdown_markdown(profile: dict[str, Any], *, top_level: boo
         return ""
     peak_allocated = int(summary.get("peak_allocated_hbm_bytes", 0) or 0)
     peak_reserved = int(summary.get("peak_reserved_hbm_bytes", 0) or 0)
+    actual_peak_allocated = int(summary.get("actual_peak_allocated_hbm_bytes", peak_allocated) or 0)
+    actual_peak_reserved = int(summary.get("actual_peak_reserved_hbm_bytes", peak_reserved) or 0)
     reserved_unallocated = int(summary.get("reserved_unallocated_bytes", 0) or 0)
     external_cuda = int(summary.get("external_cuda_or_driver_bytes", 0) or 0)
     allocated_closure_error = int(summary.get("allocated_closure_error_bytes", 0) or 0)
@@ -279,20 +346,27 @@ def _source_memory_breakdown_markdown(profile: dict[str, Any], *, top_level: boo
         f"Selected metric: `{summary.get('selected_metric', '-')}`  ",
         f"Selected step: `{summary.get('selected_step', '-')}`  ",
         f"Selected phase: `{summary.get('selected_phase', '-')}`  ",
-        f"Peak allocated HBM: `{_fmt_mib(peak_allocated)} MiB`  ",
-        f"Peak reserved HBM: `{_fmt_mib(peak_reserved)} MiB`  ",
+        f"Selected-attribution peak allocated HBM: `{_fmt_mib(peak_allocated)} MiB`  ",
+        f"Selected-attribution peak reserved HBM: `{_fmt_mib(peak_reserved)} MiB`  ",
+        f"Actual peak step: `{summary.get('actual_peak_step', '-')}`  ",
+        f"Actual peak phase: `{summary.get('actual_peak_phase', '-')}`  ",
+        f"Actual peak allocated HBM: `{_fmt_mib(actual_peak_allocated)} MiB`  ",
+        f"Actual peak reserved HBM: `{_fmt_mib(actual_peak_reserved)} MiB`  ",
         f"Reserved but unallocated: `{_fmt_mib(reserved_unallocated)} MiB`  ",
         f"External CUDA/driver diagnostic: `{_fmt_mib(external_cuda)} MiB`  ",
         f"Allocated stack sum: `{_fmt_mib(summary.get('allocated_stack_sum_bytes'))} MiB`  ",
         f"Reserved stack sum: `{_fmt_mib(summary.get('reserved_stack_sum_bytes'))} MiB`  ",
-        f"Saved activations at peak: `{_fmt_mib(summary.get('saved_activation_hbm_bytes_at_peak'))} MiB`  ",
+        f"Activations at peak: `{_fmt_mib(summary.get('activation_hbm_bytes_at_peak', summary.get('saved_activation_hbm_bytes_at_peak')))} MiB`  ",
+        f"Saved-for-backward activations at peak: `{_fmt_mib(summary.get('saved_activation_hbm_bytes_at_peak'))} MiB`  ",
+        f"Live-output activations at peak: `{_fmt_mib(summary.get('live_activation_hbm_bytes_at_peak'))} MiB`  ",
+        f"Temporary/workspace at peak: `{_fmt_mib(summary.get('temporary_workspace_hbm_bytes_at_peak'))} MiB`  ",
         f"Unattributed allocated peak: `{_fmt_mib(summary.get('unattributed_allocated_peak_bytes'))} MiB`  ",
         f"Allocated closure error: `{_fmt_mib(allocated_closure_error)} MiB`  ",
         f"Allocated closure OK: `{bool(summary.get('allocated_closure_ok', False))}`  ",
         f"Reserved closure error: `{_fmt_mib(reserved_closure_error)} MiB`  ",
         f"Reserved closure OK: `{bool(summary.get('reserved_closure_ok', False))}`",
         "",
-        "GPU HBM semantic rows close to peak allocated HBM. The allocator reserved-unallocated row extends peak allocated HBM to peak reserved HBM. External CUDA/driver diagnostics are separate and excluded from both closures.",
+        "GPU HBM semantic rows below are the selected-attribution rows. Actual peak rows are emitted separately in memory_actual_peak_breakdown.csv. The allocator reserved-unallocated row extends allocated HBM to reserved HBM. External CUDA/driver diagnostics are separate and excluded from both closures.",
         "",
         "| Group | Component | Kind | Memory space | MiB | % peak reserved HBM | Method | Accuracy |",
         "|---|---|---|---|---:|---:|---|---|",
@@ -633,10 +707,14 @@ def _write_source_artifacts(source_profile_json: Path, output_dir: Path, profile
     (output_dir / "lat.md").write_text(_source_latency_markdown(profile), encoding="utf-8")
     (output_dir / "memory.md").write_text(_source_memory_markdown(profile), encoding="utf-8")
     breakdown = _source_memory_breakdown_markdown(profile, top_level=True)
-    breakdown_rows = _memory_breakdown_csv_rows(_memory_breakdown_summary(profile))
+    memory_breakdown_summary = _memory_breakdown_summary(profile)
+    breakdown_rows = _memory_breakdown_csv_rows(memory_breakdown_summary)
+    actual_breakdown_rows = _actual_peak_memory_breakdown_csv_rows(memory_breakdown_summary)
     if breakdown and breakdown_rows:
         (output_dir / "memory_breakdown.md").write_text(breakdown, encoding="utf-8")
         _write_csv(output_dir / "memory_breakdown.csv", breakdown_rows)
+    if actual_breakdown_rows:
+        _write_csv(output_dir / "memory_actual_peak_breakdown.csv", actual_breakdown_rows)
     kt_rows = _kt_counter_rows(profile)
     if kt_rows:
         _write_csv(output_dir / "kt_counters.csv", kt_rows)
@@ -658,9 +736,13 @@ def _write_profile_csv_artifacts(profile_json: Path, output_dir: Path) -> None:
     _write_csv(output_dir / "kernel_by_op.csv", _kernel_by_op(profile))
     _write_csv(output_dir / "memory_by_category.csv", _memory_by_category(profile))
     _write_csv(output_dir / "memory_by_module.csv", _memory_by_module(profile))
-    breakdown_rows = _memory_breakdown_csv_rows(_memory_breakdown_summary(profile))
+    memory_breakdown_summary = _memory_breakdown_summary(profile)
+    breakdown_rows = _memory_breakdown_csv_rows(memory_breakdown_summary)
     if breakdown_rows:
         _write_csv(output_dir / "memory_breakdown.csv", breakdown_rows)
+    actual_breakdown_rows = _actual_peak_memory_breakdown_csv_rows(memory_breakdown_summary)
+    if actual_breakdown_rows:
+        _write_csv(output_dir / "memory_actual_peak_breakdown.csv", actual_breakdown_rows)
     kt_rows = _kt_counter_rows(profile)
     if kt_rows:
         _write_csv(output_dir / "kt_counters.csv", kt_rows)

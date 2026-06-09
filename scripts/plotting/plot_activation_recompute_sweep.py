@@ -106,28 +106,31 @@ COMBINED_OUTPUT_FILES = (
     "combined_backward_peak_reserved_hbm_vs_seq.png",
     "combined_peak_allocated_hbm_vs_seq.png",
     "combined_peak_reserved_hbm_vs_seq.png",
-    "combined_reserved_unallocated_hbm_vs_seq.png",
+    "combined_timing_vs_seq.png",
     "combined_forward_peak_allocated_hbm_vs_step.png",
     "combined_forward_peak_reserved_hbm_vs_step.png",
     "combined_backward_peak_allocated_hbm_vs_step.png",
     "combined_backward_peak_reserved_hbm_vs_step.png",
     "combined_peak_allocated_hbm_vs_step.png",
     "combined_peak_reserved_hbm_vs_step.png",
-    "combined_reserved_unallocated_hbm_vs_step.png",
+    "combined_timing_vs_step.png",
+    "combined_forward_timing_vs_step.png",
+    "combined_backward_timing_vs_step.png",
+    "combined_timing_vs_expert_threshold.png",
     "combined_forward_peak_allocated_hbm_vs_expert_tok_threshold.png",
     "combined_forward_peak_reserved_hbm_vs_expert_tok_threshold.png",
     "combined_backward_peak_allocated_hbm_vs_expert_tok_threshold.png",
     "combined_backward_peak_reserved_hbm_vs_expert_tok_threshold.png",
     "combined_peak_allocated_hbm_vs_expert_tok_threshold.png",
     "combined_peak_reserved_hbm_vs_expert_tok_threshold.png",
-    "combined_reserved_unallocated_hbm_vs_expert_tok_threshold.png",
+    "combined_timing_vs_expert_tok_threshold.png",
     "combined_forward_peak_allocated_hbm_vs_expert_tok_act_threshold.png",
     "combined_forward_peak_reserved_hbm_vs_expert_tok_act_threshold.png",
     "combined_backward_peak_allocated_hbm_vs_expert_tok_act_threshold.png",
     "combined_backward_peak_reserved_hbm_vs_expert_tok_act_threshold.png",
     "combined_peak_allocated_hbm_vs_expert_tok_act_threshold.png",
     "combined_peak_reserved_hbm_vs_expert_tok_act_threshold.png",
-    "combined_reserved_unallocated_hbm_vs_expert_tok_act_threshold.png",
+    "combined_timing_vs_expert_tok_act_threshold.png",
 )
 GROUP_OUTPUT_FILES = (
     "sweep_summary.csv",
@@ -138,12 +141,14 @@ GROUP_OUTPUT_FILES = (
     "backward_peak_hbm_vs_seq.png",
     "peak_allocated_hbm_vs_seq.png",
     "peak_reserved_hbm_vs_seq.png",
-    "reserved_unallocated_hbm_vs_seq.png",
+    "timing_vs_seq.png",
     "forward_peak_hbm_vs_step.png",
     "backward_peak_hbm_vs_step.png",
     "peak_allocated_hbm_vs_step.png",
     "peak_reserved_hbm_vs_step.png",
-    "reserved_unallocated_hbm_vs_step.png",
+    "timing_vs_step.png",
+    "forward_timing_vs_step.png",
+    "backward_timing_vs_step.png",
 )
 
 
@@ -1113,6 +1118,10 @@ def clean_output_dir(output_dir: Path) -> None:
         path = output_dir / name
         if path.is_file():
             path.unlink()
+    for path in output_dir.glob("combined_reserved_unallocated_hbm_vs*.png"):
+        path.unlink()
+    for path in output_dir.glob("reserved_unallocated_hbm_vs*.png"):
+        path.unlink()
     for child in output_dir.iterdir():
         if not child.is_dir():
             continue
@@ -1121,10 +1130,16 @@ def clean_output_dir(output_dir: Path) -> None:
                 path = child / name
                 if path.is_file():
                     path.unlink()
+            for path in child.glob("combined_reserved_unallocated_hbm_vs*.png"):
+                path.unlink()
         for name in GROUP_OUTPUT_FILES:
             path = child / name
             if path.is_file():
                 path.unlink()
+        for path in child.glob("reserved_unallocated_hbm_vs*.png"):
+            path.unlink()
+        for path in child.glob("combined_reserved_unallocated_hbm_vs*.png"):
+            path.unlink()
         for path in child.glob("expert_threshold_summary_s*.csv"):
             path.unlink()
         for path in child.glob("expert_threshold_summary_s*.json"):
@@ -1551,11 +1566,25 @@ def step_plot_specs(*, combined: bool) -> list[tuple[str, str, str, str, float]]
                 1024.0,
             ),
             (
-                f"{prefix}reserved_unallocated_hbm_vs_step.png",
-                f"{title_prefix}reserved but unallocated HBM over steps",
-                "Reserved but unallocated HBM (GiB)",
-                "reserved_unallocated_mib",
-                1024.0,
+                f"{prefix}timing_vs_step.png",
+                f"{title_prefix}step time over steps",
+                "Step time (ms)",
+                "step_ms",
+                1.0,
+            ),
+            (
+                f"{prefix}forward_timing_vs_step.png",
+                f"{title_prefix}forward time over steps",
+                "Forward time (ms)",
+                "forward_ms",
+                1.0,
+            ),
+            (
+                f"{prefix}backward_timing_vs_step.png",
+                f"{title_prefix}backward time over steps",
+                "Backward time (ms)",
+                "backward_ms",
+                1.0,
             ),
         ]
     )
@@ -2148,11 +2177,10 @@ def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[s
     plot_metric(
         rows,
         output_dir,
-        "reserved_unallocated_hbm_vs_seq.png",
-        f"{title_base} reserved but unallocated HBM{suffix}",
-        "Reserved but unallocated HBM (GiB)",
-        "reserved_unallocated_mib",
-        scale=1024.0,
+        "timing_vs_seq.png",
+        f"{title_base} step time{suffix}",
+        "Step time (ms)",
+        "step_ms",
     )
 
 
@@ -2246,11 +2274,10 @@ def write_group_threshold_plots(
     plot_threshold_metric(
         rows,
         output_dir,
-        f"reserved_unallocated_hbm_vs_expert_threshold_s{seq_len}.png",
-        f"{title_base} reserved but unallocated HBM{suffix}",
-        "Reserved but unallocated HBM (GiB)",
-        "reserved_unallocated_mib",
-        scale=1024.0,
+        f"timing_vs_expert_threshold_s{seq_len}.png",
+        f"{title_base} step time vs expert threshold{suffix}",
+        "Step time (ms)",
+        "step_ms",
     )
 
 
@@ -2314,12 +2341,11 @@ def write_group_policy_plots(
     plot_policy_metric(
         rows,
         output_dir,
-        f"reserved_unallocated_hbm_vs_{name}_s{seq_len}.png",
-        f"{title_base} reserved but unallocated HBM vs {title}{suffix}",
-        "Reserved but unallocated HBM (GiB)",
-        "reserved_unallocated_mib",
+        f"timing_vs_{name}_s{seq_len}.png",
+        f"{title_base} step time vs {title}{suffix}",
+        "Step time (ms)",
+        "step_ms",
         family=family,
-        scale=1024.0,
     )
 
 
@@ -2382,11 +2408,10 @@ def write_combined_plots(rows: list[dict[str, Any]], output_dir: Path) -> None:
     plot_combined_metric(
         rows,
         output_dir,
-        "combined_reserved_unallocated_hbm_vs_seq.png",
-        "All workloads: reserved but unallocated HBM",
-        "Reserved but unallocated HBM (GiB)",
-        "reserved_unallocated_mib",
-        scale=1024.0,
+        "combined_timing_vs_seq.png",
+        "All workloads: step time",
+        "Step time (ms)",
+        "step_ms",
     )
 
 
@@ -2467,11 +2492,10 @@ def write_combined_threshold_plots(rows: list[dict[str, Any]], output_dir: Path)
     plot_combined_threshold_metric(
         rows,
         output_dir,
-        "combined_reserved_unallocated_hbm_vs_expert_threshold.png",
-        "All workloads: reserved but unallocated HBM vs expert threshold",
-        "Reserved but unallocated HBM (GiB)",
-        "reserved_unallocated_mib",
-        scale=1024.0,
+        "combined_timing_vs_expert_threshold.png",
+        "All workloads: step time vs expert threshold",
+        "Step time (ms)",
+        "step_ms",
     )
 
 
@@ -2545,12 +2569,11 @@ def write_combined_policy_plots(rows: list[dict[str, Any]], output_dir: Path, fa
     plot_combined_policy_metric(
         rows,
         output_dir,
-        f"combined_reserved_unallocated_hbm_vs_{name}.png",
-        f"All workloads: reserved but unallocated HBM vs {title}",
-        "Reserved but unallocated HBM (GiB)",
-        "reserved_unallocated_mib",
+        f"combined_timing_vs_{name}.png",
+        f"All workloads: step time vs {title}",
+        "Step time (ms)",
+        "step_ms",
         family=family,
-        scale=1024.0,
     )
 
 

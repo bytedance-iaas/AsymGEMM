@@ -10,7 +10,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from asym_gemm.profiling.lf_trace import LFMemoryBreakdownProfiler, LFTraceConfig, build_memory_breakdown_summary  # noqa: E402
+from asym_gemm.profiling.lf_trace import (  # noqa: E402
+    LFMemoryBreakdownProfiler,
+    LFTraceConfig,
+    _component_from_range_name,
+    _component_from_module_name,
+    _component_from_param_name,
+    build_memory_breakdown_summary,
+)
 from scripts.lf.validate_lf_memory_capacity_schema import validate_breakdown  # noqa: E402
 from scripts.lf import run_lf_profiled_train as lf_profiled_train  # noqa: E402
 
@@ -32,17 +39,21 @@ def _row(
     peak_reserved: int,
     persistent: dict[str, dict[str, int]] | None = None,
     saved: dict[str, int] | None = None,
+    live: dict[str, int] | None = None,
+    peak_growth: dict[str, int] | None = None,
     external: dict[str, int] | None = None,
 ) -> dict:
     persistent = persistent or {}
     saved = saved or {}
+    live = live or {}
+    peak_growth = peak_growth or {}
     external = external or {}
     known = sum(
         int(value)
         for kinds in persistent.values()
         for kind, value in kinds.items()
         if not str(kind).endswith("_cpu") and not str(kind).endswith("_cpu_pinned")
-    ) + sum(int(value) for value in saved.values())
+    ) + sum(int(value) for value in saved.values()) + sum(int(value) for value in live.values())
     return {
         "schema_version": 2,
         "step": 1,
@@ -54,6 +65,8 @@ def _row(
         "peak_reserved_since_step_begin": peak_reserved,
         "persistent_bytes": persistent,
         "saved_activation_bytes_at_peak": saved,
+        "live_activation_bytes_at_peak": live,
+        "peak_growth_bytes_at_peak": peak_growth,
         "external_memory": external,
         "closure_bytes": {
             "unattributed_allocated_peak": max(0, peak_allocated - known),
@@ -94,6 +107,9 @@ def test_breakdown_selects_allocated_peak_not_reserved_tie() -> None:
     assert summary["allocated_stack_sum_bytes"] == 80
     assert summary["reserved_stack_sum_bytes"] == 100
     assert summary["saved_activation_hbm_bytes_at_peak"] == 20
+    assert summary["live_activation_hbm_bytes_at_peak"] == 0
+    assert summary["activation_hbm_bytes_at_peak"] == 20
+    assert summary["temporary_workspace_hbm_bytes_at_peak"] == 0
     assert summary["unattributed_allocated_peak_bytes"] == 30
     assert summary["allocated_closure_ok"] is True
     assert summary["reserved_closure_ok"] is True
@@ -101,6 +117,25 @@ def test_breakdown_selects_allocated_peak_not_reserved_tie() -> None:
     groups = {row["group"] for row in summary["breakdown_rows"]}
     assert "activations" not in groups
     assert {"weights", "gradients", "optimizer", "saved_activations", "unattributed_allocated_peak"}.issubset(groups)
+
+
+def test_qwen_moe_component_classification_separates_router_dense_and_experts() -> None:
+    assert _component_from_param_name("model.layers.0.self_attn.q_proj.weight") == "attention"
+    assert _component_from_param_name("model.layers.0.mlp.gate.weight") == "router"
+    assert _component_from_param_name("model.layers.0.mlp.gate_proj.weight") == "mlp_dense"
+    assert _component_from_param_name("model.layers.0.mlp.experts.3.down_proj.weight") == "routed_experts"
+    assert _component_from_param_name("model.layers.0.mlp.shared_expert.down_proj.weight") == "shared_experts"
+    assert _component_from_param_name("model.layers.0.mlp.experts.3.lora_A.default.weight") == "routed_experts"
+
+    assert _component_from_module_name("model.layers.0.self_attn") == "attention"
+    assert _component_from_module_name("model.layers.0.mlp.gate") == "router"
+    assert _component_from_module_name("model.layers.0.mlp") == "mlp_dense"
+    assert _component_from_module_name("model.layers.0.mlp.experts.3") == "routed_experts"
+    assert _component_from_module_name("model.layers.0.mlp.shared_expert") == "shared_experts"
+
+    assert _component_from_range_name("lf.forward_loss") == "loss"
+    assert _component_from_range_name("forward.mlp.expert_policy.scatter_combine") == "routed_experts"
+    assert _component_from_range_name("backward.layers.0.self_attn.q_proj") == "attention"
 
 
 def test_external_memory_is_diagnostic_not_reserved_closure() -> None:
@@ -121,6 +156,27 @@ def test_external_memory_is_diagnostic_not_reserved_closure() -> None:
     assert summary["reserved_stack_sum_bytes"] == 100
     assert summary["external_cuda_or_driver_bytes"] == 30
     assert validate_breakdown(summary) == []
+
+
+def test_legacy_unknown_saved_activation_is_reported_as_other() -> None:
+    plotter = _load_plotter()
+    row = _row(
+        phase="after_forward",
+        peak_allocated=80,
+        peak_reserved=100,
+        persistent={"attention": {"weight": 10}},
+        saved={"unknown_saved_activation": 20},
+    )
+
+    summary = build_memory_breakdown_summary([row])
+    summary_components = {item["component"] for item in summary["breakdown_rows"]}
+    assert "other_saved_activations" in summary_components
+    assert "unknown_saved_activation" not in summary_components
+
+    plot_rows, _peak_allocated, _peak_reserved = plotter._flatten_row(row)
+    plot_components = {item["component"] for item in plot_rows}
+    assert "other_saved_activations" in plot_components
+    assert "unknown_saved_activation" not in plot_components
 
 
 def test_zero_reserved_gap_keeps_allocator_row_for_schema_closure() -> None:
@@ -145,6 +201,39 @@ def test_zero_reserved_gap_keeps_allocator_row_for_schema_closure() -> None:
     assert allocator_rows[0]["bytes"] == 0
     assert summary["reserved_stack_sum_bytes"] == 80
     assert validate_breakdown(summary) == []
+
+
+def test_live_activations_and_peak_workspace_reduce_unattributed_residual() -> None:
+    summary = build_memory_breakdown_summary(
+        [
+            _row(
+                phase="after_forward",
+                peak_allocated=100,
+                peak_reserved=120,
+                persistent={"attention": {"weight": 10}},
+                saved={"attention": 20},
+                live={"attention": 15},
+                peak_growth={"attention": 65},
+            )
+        ]
+    )
+
+    assert summary["saved_activation_hbm_bytes_at_peak"] == 20
+    assert summary["live_activation_hbm_bytes_at_peak"] == 15
+    assert summary["activation_hbm_bytes_at_peak"] == 35
+    assert summary["temporary_workspace_hbm_bytes_at_peak"] == 55
+    assert summary["unattributed_allocated_peak_bytes"] == 0
+    assert summary["allocated_stack_sum_bytes"] == 100
+    assert validate_breakdown(summary) == []
+
+    rows = {
+        (row["group"], row["kind"], row["component"]): row["bytes"]
+        for row in summary["breakdown_rows"]
+        if row.get("memory_space") == "GPU HBM"
+    }
+    assert rows[("saved_activations", "saved_activation", "attention")] == 20
+    assert rows[("saved_activations", "live_activation", "attention")] == 15
+    assert rows[("temporary_workspace", "inferred_peak_workspace", "attention")] == 55
 
 
 def test_cpu_host_rows_do_not_affect_gpu_closure() -> None:
@@ -196,6 +285,35 @@ def test_warmup_rows_do_not_select_peak_summary() -> None:
 
     assert summary["selected_step"] == 2
     assert summary["peak_allocated_hbm_bytes"] == 80
+    assert validate_breakdown(summary) == []
+
+
+def test_summary_selects_same_step_saved_activation_row_for_stale_residual_peak() -> None:
+    after_forward = _row(
+        phase="after_forward",
+        peak_allocated=80,
+        peak_reserved=100,
+        persistent={"attention": {"weight": 10}},
+        saved={"attention": 20},
+    )
+    after_backward = _row(
+        phase="after_backward",
+        peak_allocated=100,
+        peak_reserved=120,
+        persistent={"attention": {"weight": 10}},
+        saved={},
+    )
+
+    summary = build_memory_breakdown_summary([after_forward, after_backward])
+
+    assert summary["selected_phase"] == "after_forward"
+    assert summary["peak_allocated_hbm_bytes"] == 80
+    assert summary["saved_activation_hbm_bytes_at_peak"] == 20
+    assert summary["unattributed_allocated_peak_bytes"] == 50
+    assert summary["actual_peak_phase"] == "after_backward"
+    assert summary["actual_peak_allocated_hbm_bytes"] == 100
+    assert summary["actual_peak_reserved_hbm_bytes"] == 120
+    assert summary["actual_peak_allocated_closure_error_bytes"] == 0
     assert validate_breakdown(summary) == []
 
 
@@ -280,6 +398,178 @@ def test_plotter_step_series_uses_component_group_segments(tmp_path: Path) -> No
     assert all("activations" != key for key in series)
 
 
+def test_plotter_phase_rows_expose_optimizer_weights_gradients_and_saved_activations(tmp_path: Path) -> None:
+    plotter = _load_plotter()
+    rows = [
+        _row(
+            phase="after_forward",
+            peak_allocated=180,
+            peak_reserved=220,
+            persistent={
+                "attention": {"weight": 10},
+                "router": {"weight": 5},
+                "mlp_dense": {"weight": 11},
+                "routed_experts": {"weight": 13},
+                "shared_experts": {"weight": 17},
+            },
+            saved={
+                "attention": 19,
+                "router": 3,
+                "mlp_dense": 23,
+                "routed_experts": 29,
+                "shared_experts": 31,
+            },
+        ),
+        _row(
+            phase="after_backward",
+            peak_allocated=210,
+            peak_reserved=240,
+            persistent={
+                "attention": {"weight": 10, "grad": 10},
+                "router": {"weight": 5, "grad": 5},
+                "mlp_dense": {"weight": 11, "grad": 11},
+                "routed_experts": {"weight": 13, "grad": 13},
+                "shared_experts": {"weight": 17, "grad": 17},
+            },
+        ),
+        _row(
+            phase="after_optimizer_step",
+            peak_allocated=260,
+            peak_reserved=300,
+            persistent={
+                "attention": {"weight": 10, "optimizer_state": 20},
+                "router": {"weight": 5, "optimizer_state": 10},
+                "mlp_dense": {"weight": 11, "optimizer_state": 22},
+                "routed_experts": {"weight": 13, "optimizer_state": 26},
+                "shared_experts": {"weight": 17, "optimizer_state": 34},
+            },
+        ),
+    ]
+    summary = build_memory_breakdown_summary(rows)
+    jsonl_path = tmp_path / "memory_breakdown.jsonl"
+    jsonl_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    record = plotter.RunRecord(
+        run_dir=tmp_path,
+        summary_path=tmp_path / "memory_breakdown_summary.json",
+        jsonl_path=jsonl_path,
+        summary=summary,
+        metadata={"backend": "source_smoke", "profiler": "source", "seq_len": "128"},
+    )
+
+    phase_rows = plotter._phase_csv_rows(record)
+    pairs = {(row["component"], row["group"]) for row in phase_rows if row["memory_space"] == "GPU HBM"}
+
+    for component in {"attention", "router", "mlp_dense", "routed_experts", "shared_experts"}:
+        assert (component, "weights") in pairs
+        assert (component, "saved_activations") in pairs
+        assert (component, "gradients") in pairs
+        assert (component, "optimizer") in pairs
+
+    labels, series, peaks = plotter._phase_plot_data(record)
+    assert labels == ["after_forward", "after_backward", "after_optimizer_step"]
+    assert "attention:saved_activations" in series
+    assert "routed_experts:optimizer" in series
+    assert len(peaks) == 3
+
+    actual_rows = plotter._actual_peak_csv_rows(record)
+    assert actual_rows
+    assert {row["component"] for row in actual_rows if row["memory_space"] == "GPU HBM"} >= {
+        "attention",
+        "router",
+        "mlp_dense",
+        "routed_experts",
+        "shared_experts",
+    }
+    assert all("actual_peak_allocated_hbm_bytes" in row for row in actual_rows)
+
+
+def test_plotter_phase_rows_include_live_activations_and_temporary_workspace(tmp_path: Path) -> None:
+    plotter = _load_plotter()
+    rows = [
+        _row(
+            phase="after_forward",
+            peak_allocated=100,
+            peak_reserved=120,
+            persistent={"attention": {"weight": 10}},
+            saved={"attention": 20},
+            live={"attention": 15},
+            peak_growth={"attention": 65},
+        )
+    ]
+    summary = build_memory_breakdown_summary(rows)
+    jsonl_path = tmp_path / "memory_breakdown.jsonl"
+    jsonl_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    record = plotter.RunRecord(
+        run_dir=tmp_path,
+        summary_path=tmp_path / "memory_breakdown_summary.json",
+        jsonl_path=jsonl_path,
+        summary=summary,
+        metadata={"backend": "source_smoke", "profiler": "source", "seq_len": "128"},
+    )
+
+    phase_rows = plotter._phase_csv_rows(record)
+    pairs = {
+        (row["component"], row["group"], row["kind"]): row["bytes"]
+        for row in phase_rows
+        if row["memory_space"] == "GPU HBM"
+    }
+
+    assert pairs[("attention", "saved_activations", "saved_activation")] == 20
+    assert pairs[("attention", "saved_activations", "live_activation")] == 15
+    assert pairs[("attention", "temporary_workspace", "inferred_peak_workspace")] == 55
+    assert ("unattributed_allocated_peak", "unattributed_allocated_peak", "allocated_residual") not in pairs
+    assert plotter._segment_label("attention:saved_activations") == "Attention activations"
+    assert plotter._segment_label("attention:temporary_workspace") == "Attention temporary workspace"
+
+
+def test_plotter_uses_distinct_colors_and_tight_small_peak_ylim() -> None:
+    plotter = _load_plotter()
+    required_keys = [
+        f"{component}:{group}"
+        for component in ["attention", "router", "mlp_dense", "routed_experts", "shared_experts"]
+        for group in ["weights", "gradients", "optimizer", "saved_activations"]
+    ]
+    colors = [plotter._segment_color(key) for key in required_keys]
+
+    assert len(set(colors)) == len(required_keys)
+    assert plotter._segment_color("allocator_reserved_unallocated") == "#4f46e5"
+    assert plotter._segment_label("other_saved_activations:saved_activations") == "Other activations"
+    assert plotter._nice_y_limit_gib(29_360_128) == 0.05
+
+
+def test_plotter_disambiguates_duplicate_combined_labels() -> None:
+    plotter = _load_plotter()
+
+    def record(config: str) -> object:
+        run_dir = Path("/tmp") / config / "zero3_offload__source__recomp__polnone__routerhf" / "b4_s8192"
+        return plotter.RunRecord(
+            run_dir=run_dir,
+            summary_path=run_dir / "memory_breakdown_summary.json",
+            jsonl_path=run_dir / "memory_breakdown.jsonl",
+            summary={"enabled": True, "schema_version": 2},
+            metadata={
+                "workload": "qwen3-30b-a3b",
+                "backend": "zero3_offload",
+                "profiler": "source",
+                "recompute": "recomp",
+                "expert_policy": "none",
+                "router_mode": "hf",
+                "seq_len": "8192",
+                "config": config,
+            },
+        )
+
+    labels = plotter._run_plot_labels(
+        [
+            record("qwen3-30b-a3b__gpus1__b4_s8192_w5_s10_r64_a16_drop010"),
+            record("qwen3-30b-a3b__gpus1__b4_s8192_w5_s1_r64_a16_drop010"),
+        ]
+    )
+
+    assert "w5_s10" in labels[0]
+    assert "w5_s1" in labels[1]
+
+
 def test_plotter_reports_legacy_schema_when_no_v2_runs_match(tmp_path: Path) -> None:
     plotter = _load_plotter()
     run_dir = tmp_path / "config" / "zero3_offload__source__recomp__polnone__routerhf" / "b1_s4096"
@@ -317,6 +607,54 @@ def test_plotter_reports_legacy_schema_when_no_v2_runs_match(tmp_path: Path) -> 
     message = plotter._no_runs_message(args)
     assert "legacy/non-v2" in message
     assert "schema_version 2" in message
+
+
+def test_plotter_repairs_stale_summary_from_jsonl(tmp_path: Path) -> None:
+    plotter = _load_plotter()
+    run_dir = tmp_path / "config" / "zero3_offload__source__recomp__polnone__routerhf" / "b1_s4096"
+    run_dir.mkdir(parents=True)
+    after_forward = _row(
+        phase="after_forward",
+        peak_allocated=80,
+        peak_reserved=100,
+        persistent={"attention": {"weight": 10}},
+        saved={"attention": 20},
+    )
+    after_backward = _row(
+        phase="after_backward",
+        peak_allocated=100,
+        peak_reserved=120,
+        persistent={"attention": {"weight": 10}},
+        saved={},
+    )
+    (run_dir / "memory_breakdown.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in [after_forward, after_backward]) + "\n",
+        encoding="utf-8",
+    )
+    bad_summary = build_memory_breakdown_summary([after_backward])
+    (run_dir / "memory_breakdown_summary.json").write_text(json.dumps(bad_summary), encoding="utf-8")
+
+    args = type(
+        "Args",
+        (),
+        {
+            "input_root": [tmp_path],
+            "run_dir": [],
+            "include_non_source": False,
+            "workload": [],
+            "backend": [],
+            "profiler": [],
+            "router_mode": [],
+            "seq_lens": [],
+            "expert_recompute_policies": [],
+        },
+    )()
+
+    runs = plotter._load_runs(args)
+
+    assert len(runs) == 1
+    assert runs[0].summary["saved_activation_hbm_bytes_at_peak"] == 20
+    assert runs[0].summary["unattributed_allocated_peak_bytes"] == 50
 
 
 def test_source_recorder_can_preserve_step_peak_counter(monkeypatch) -> None:
@@ -357,3 +695,27 @@ def test_memory_breakdown_restore_clears_hook_marker() -> None:
     profiler.restore()
 
     assert getattr(model, "_asym_lf_memory_breakdown_hooks_installed") is False
+
+
+def test_saved_activation_peak_snapshot_is_not_cleared_by_stale_capture() -> None:
+    profiler = LFMemoryBreakdownProfiler(LFTraceConfig(memory_breakdown=True))
+    profiler._active = True
+    key = ("cuda:0", 1234, 4096, "torch.bfloat16")
+    profiler._saved_refcounts[key] = 1
+    profiler._saved_components[key] = "attention"
+    profiler._saved_bytes[key] = 4096
+
+    profiler._capture_saved_activation_peak(100)
+
+    assert profiler._saved_activation_peak_allocated == 100
+    assert profiler._saved_activation_bytes_at_peak == {"attention": 4096}
+
+    profiler._saved_refcounts.clear()
+    profiler._saved_components.clear()
+    profiler._saved_bytes.clear()
+
+    profiler._capture_saved_activation_peak(100)
+    profiler._capture_saved_activation_peak(90)
+
+    assert profiler._saved_activation_peak_allocated == 100
+    assert profiler._saved_activation_bytes_at_peak == {"attention": 4096}

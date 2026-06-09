@@ -43,7 +43,8 @@ submodules/
 
 # Local profiling/report artifacts
 agent/
-/profiling*/*
+/profiling*/
+test_profiling*/
 # !/profiling/transpose_ncu/
 # !/profiling/transpose_ncu/**
 results/

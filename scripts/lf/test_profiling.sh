@@ -17,7 +17,7 @@ DIST_LAUNCHER=${DIST_LAUNCHER:-deepspeed}
 RUN_POSTSERVE=${RUN_POSTSERVE:-false}
 
 # Sweep axes
-GPU_POOL=${GPU_POOL:-3}
+GPU_POOL=${GPU_POOL:-0}
 # MODEL_SPECS entries are model|num_gpus. Recompute belongs only in BACKEND_SPECS.
 MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
 ROUTER_MODES=${ROUTER_MODES:-whole}
@@ -27,19 +27,18 @@ PRECISION=${PRECISION:-bf16}
 # LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
 LORA_DROPOUT=${LORA_DROPOUT:-0.10}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero2|norecomp,zero2|recomp,zero3_offload|norecomp,zero3_offload|recomp"}
-BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym|recomp"}
+BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp"}
 # EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le0,tok-le512,tok-le512-act"}
 # EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le1"}
-# EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le1,tok-ge1"}
 EXPERT_POLICIES=${EXPERT_POLICIES-"none"}
 
 # Training
 SEQ_LENS=${SEQ_LENS:-8192}
 PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-4}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
-MAX_STEPS=${MAX_STEPS:-10}
+MAX_STEPS=${MAX_STEPS:-100000}
 WARMUP_STEPS=${WARMUP_STEPS:-5}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 LORA_RANK=${LORA_RANK:-64}
@@ -1039,7 +1038,11 @@ if [[ "${selected_has_kt}" == "true" ]]; then
   fi
 fi
 if [[ -z "${output_root}" ]]; then
-  output_root="${ASYM_DIR}/profiling"
+  if [[ "${selected_has_kt}" == "true" ]]; then
+    output_root="${KT_REPO_DIR}/profiling_kt"
+  else
+    output_root="${ASYM_DIR}/test_profiling"
+  fi
 fi
 mapfile -t profilers < <(tokens "${profiler_spec}" | while read -r value; do profiler_label "${value}"; done | dedupe)
 if printf '%s\n' "${profilers[@]}" | grep -qx 'nsys'; then
@@ -1611,8 +1614,8 @@ write_config_artifact_readme() {
 This config root is organized as follows:
 
 - \`combined/\`: config-level LF timing and allocator-summary plots from \`profile.json\`.
-- \`memory_combined/\`: config-level source-memory breakdown plots plus per-group subfolders split by workload/backend/profiler/router/recompute/policy. If no source-memory rows were collected, this folder contains a README explaining why.
-- \`c2c_combined/\`: config-level C2C/CTC saturation plots plus per-group subfolders split by workload/backend/profiler/router/recompute/policy. If old traces lack GPU metrics, this folder contains a README explaining why.
+- \`memory_combined/\`: config-level source-memory breakdown plots. If no source-memory rows were collected, this folder contains a README explaining why.
+- \`c2c_combined/\`: config-level C2C/CTC saturation plots from Nsight GPU metrics. If old traces lack GPU metrics, this folder contains a README explaining why.
 - \`<backend>__<profiler>__<recompute>__pol<policy>__router<mode>/b<batch>_s<seq>/\`: per-run artifacts.
 
 If \`PLOT_OUTPUT_DIR\` is set, combined plot folders are written under that external plot output root instead of this config root.
@@ -1630,8 +1633,8 @@ write_precision_artifact_readme() {
 This precision root is organized as follows:
 
 - \`combined/\`: global LF timing and allocator-summary plots across config roots.
-- \`memory_combined/\`: global source-memory breakdown plots across config roots plus per-group subfolders split by workload/backend/profiler/router/recompute/policy. If no source-memory rows were collected, this folder contains a README explaining why.
-- \`c2c_combined/\`: global C2C/CTC saturation plots across config roots plus per-group subfolders split by workload/backend/profiler/router/recompute/policy. If old traces lack Nsight GPU metrics, this folder contains a README explaining why.
+- \`memory_combined/\`: global source-memory breakdown plots across config roots. If no source-memory rows were collected, this folder contains a README explaining why.
+- \`c2c_combined/\`: global C2C/CTC saturation plots across config roots. If old traces lack Nsight GPU metrics, this folder contains a README explaining why.
 - \`<config_root>/\`: one workload/configuration root. Each config root has its own \`combined/\`, \`memory_combined/\`, \`c2c_combined/\`, and per-run backend/profiler folders.
 
 If \`PLOT_OUTPUT_DIR\` is set, global combined plot folders are written under that external plot output root instead of this precision root.
@@ -1944,5 +1947,5 @@ echo "LF profiling completed. Results: ${precision_root}"
 
 
 if [[ "${RUN_POSTSERVE}" == "true" ]]; then
-  bash scripts/testing/serve.sh
+  bash scripts/lf/test.sh
 fi

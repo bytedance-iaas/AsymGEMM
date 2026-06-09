@@ -8,6 +8,7 @@ import json
 import math
 import re
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,17 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from asym_gemm.profiling.lf_trace import build_memory_breakdown_summary
+except Exception:  # pragma: no cover - plotting still works with existing summary files.
+    build_memory_breakdown_summary = None
 
 
 GIB = 1024.0**3
@@ -31,9 +43,10 @@ COMPONENT_ORDER = [
     "norms",
     "loss",
     "other",
-    "unknown_saved_activation",
+    "other_saved_activations",
+    "source_runtime",
 ]
-GROUP_ORDER = ["weights", "gradients", "optimizer", "saved_activations", "persistent"]
+GROUP_ORDER = ["weights", "gradients", "optimizer", "saved_activations", "temporary_workspace", "persistent"]
 COMPONENT_LABELS = {
     "attention": "Attention",
     "router": "Router",
@@ -46,13 +59,16 @@ COMPONENT_LABELS = {
     "norms": "Norms",
     "loss": "Loss",
     "other": "Other",
-    "unknown_saved_activation": "Unknown saved activations",
+    "other_saved_activations": "Other activations",
+    "unknown_saved_activation": "Other activations",
+    "source_runtime": "Source/runtime",
 }
 GROUP_LABELS = {
     "weights": "weights",
     "gradients": "gradients",
     "optimizer": "optimizer",
-    "saved_activations": "saved activations",
+    "saved_activations": "activations",
+    "temporary_workspace": "temporary workspace",
     "persistent": "persistent",
 }
 SPECIAL_SEGMENT_LABELS = {
@@ -60,35 +76,86 @@ SPECIAL_SEGMENT_LABELS = {
     "allocator_reserved_unallocated": "Reserved but unallocated",
 }
 SPECIAL_SEGMENT_COLORS = {
-    "unattributed_allocated_peak": "#72b7b2",
-    "allocator_reserved_unallocated": "#9d9da1",
-    "external_cuda_or_driver": "#666666",
-}
-GROUP_BASE_COLORS = {
-    "weights": "#4c78a8",
-    "gradients": "#f58518",
-    "optimizer": "#54a24b",
-    "saved_activations": "#e45756",
-    "persistent": "#b279a2",
+    "unattributed_allocated_peak": "#00a6a6",
+    "allocator_reserved_unallocated": "#4f46e5",
+    "external_cuda_or_driver": "#111827",
 }
 SEGMENT_PALETTE = [
-    "#4c78a8",
-    "#f58518",
-    "#54a24b",
-    "#e45756",
-    "#72b7b2",
-    "#b279a2",
-    "#ff9da6",
-    "#9d755d",
-    "#bab0ac",
-    "#8cd17d",
-    "#b6992d",
-    "#499894",
-    "#86bcb6",
-    "#fabfd2",
-    "#d37295",
-    "#a0cbe8",
+    "#005f73",
+    "#ca6702",
+    "#2a9d8f",
+    "#d62828",
+    "#7b2cbf",
+    "#118ab2",
+    "#9b5de5",
+    "#f15bb5",
+    "#386641",
+    "#f77f00",
+    "#06d6a0",
+    "#ef476f",
+    "#264653",
+    "#e76f51",
+    "#3a86ff",
+    "#ffbe0b",
+    "#8338ec",
+    "#fb5607",
+    "#0081a7",
+    "#c1121f",
+    "#588157",
+    "#ff006e",
+    "#4361ee",
+    "#ffb703",
 ]
+SEGMENT_COLORS = {
+    "attention:weights": "#005f73",
+    "attention:gradients": "#ca6702",
+    "attention:optimizer": "#2a9d8f",
+    "attention:saved_activations": "#d62828",
+    "attention:temporary_workspace": "#ef4444",
+    "router:weights": "#7b2cbf",
+    "router:gradients": "#118ab2",
+    "router:optimizer": "#9b5de5",
+    "router:saved_activations": "#f15bb5",
+    "router:temporary_workspace": "#db2777",
+    "shared_experts:weights": "#386641",
+    "shared_experts:gradients": "#f77f00",
+    "shared_experts:optimizer": "#06d6a0",
+    "shared_experts:saved_activations": "#ef476f",
+    "shared_experts:temporary_workspace": "#84cc16",
+    "routed_experts:weights": "#264653",
+    "routed_experts:gradients": "#e76f51",
+    "routed_experts:optimizer": "#3a86ff",
+    "routed_experts:saved_activations": "#ffbe0b",
+    "routed_experts:temporary_workspace": "#f97316",
+    "mlp_dense:weights": "#8338ec",
+    "mlp_dense:gradients": "#fb5607",
+    "mlp_dense:optimizer": "#0081a7",
+    "mlp_dense:saved_activations": "#c1121f",
+    "mlp_dense:temporary_workspace": "#dc2626",
+    "lora:weights": "#588157",
+    "lora:gradients": "#ff006e",
+    "lora:optimizer": "#4361ee",
+    "lora:saved_activations": "#ffb703",
+    "lora:temporary_workspace": "#eab308",
+    "other_saved_activations:saved_activations": "#a855f7",
+    "other_saved_activations:temporary_workspace": "#9333ea",
+    "embedding:weights": "#0f766e",
+    "lm_head:weights": "#ea580c",
+    "lm_head:gradients": "#facc15",
+    "lm_head:optimizer": "#14b8a6",
+    "lm_head:saved_activations": "#f43f5e",
+    "lm_head:temporary_workspace": "#fb923c",
+    "norms:weights": "#2563eb",
+    "norms:gradients": "#0891b2",
+    "norms:optimizer": "#7c3aed",
+    "norms:saved_activations": "#22c55e",
+    "norms:temporary_workspace": "#65a30d",
+    "loss:persistent": "#dc2626",
+    "loss:saved_activations": "#ec4899",
+    "loss:temporary_workspace": "#be123c",
+    "other:persistent": "#16a34a",
+    "source_runtime:temporary_workspace": "#0f172a",
+}
 RUN_DIR_RE = re.compile(r"^(?:b(?P<batch_size>[0-9]+)_)?s(?P<seq_len>[0-9]+)$")
 PHASE_PRIORITY = {
     "after_backward": 60,
@@ -97,6 +164,12 @@ PHASE_PRIORITY = {
     "after_optimizer_step": 30,
     "step_begin": 0,
 }
+PHASE_ORDER = ["step_begin", "after_forward", "after_backward", "before_optimizer_step", "after_optimizer_step"]
+STANDARD_BAR_WIDTH = 0.78
+MIN_BAR_SLOTS = 4
+BAR_SLOT_INCHES = 0.95
+PLOT_EXTRA_INCHES = 3.9
+PEAK_LINE_COLOR = "#111827"
 
 
 @dataclass(frozen=True)
@@ -118,6 +191,39 @@ class RunRecord:
             self.metadata.get("seq_len", ""),
         ]
         return " ".join(part for part in parts if part)
+
+
+CONFIG_SUFFIX_RE = re.compile(
+    r"(?:^|__)gpus(?P<gpus>[0-9]+)__b(?P<batch>[0-9]+)_s(?P<seq>[0-9]+)_"
+    r"w(?P<warmup>[0-9]+)_s(?P<steps>[0-9]+)_r(?P<rank>[0-9]+)_a(?P<alpha>[^_]+)_(?P<drop>drop[0-9]+)"
+)
+
+
+def _run_config_label(run: RunRecord) -> str:
+    config = str(run.metadata.get("config") or run.run_dir.parent.parent.name)
+    match = CONFIG_SUFFIX_RE.search(config)
+    if match is None:
+        return config
+    return (
+        f"gpus{match.group('gpus')} b{match.group('batch')} s{match.group('seq')} "
+        f"w{match.group('warmup')}_s{match.group('steps')} "
+        f"r{match.group('rank')} a{match.group('alpha')} {match.group('drop')}"
+    )
+
+
+def _run_plot_label(run: RunRecord) -> str:
+    return run.label or run.run_dir.name
+
+
+def _run_plot_labels(runs: list[RunRecord]) -> list[str]:
+    base_labels = [_run_plot_label(run) for run in runs]
+    counts: dict[str, int] = {}
+    for label in base_labels:
+        counts[label] = counts.get(label, 0) + 1
+    return [
+        f"{label}\n{_run_config_label(run)}" if counts.get(label, 0) > 1 else label
+        for run, label in zip(runs, base_labels)
+    ]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -162,6 +268,39 @@ def _load_jsonl(path: Path | None) -> list[dict[str, Any]]:
     return rows
 
 
+def _saved_activation_component(component: Any) -> str:
+    component_str = str(component or "").strip()
+    if component_str in {"", "unknown_saved_activation"}:
+        return "other_saved_activations"
+    return component_str
+
+
+def _repair_summary_from_jsonl(summary: dict[str, Any], jsonl_path: Path | None) -> dict[str, Any]:
+    if build_memory_breakdown_summary is None or jsonl_path is None or not jsonl_path.exists():
+        return summary
+    rows = _load_jsonl(jsonl_path)
+    if not rows:
+        return summary
+    rebuilt = build_memory_breakdown_summary(rows)
+    if int(rebuilt.get("schema_version") or 0) != 2 or not rebuilt.get("enabled", False):
+        return summary
+    old_saved = int(summary.get("saved_activation_hbm_bytes_at_peak", 0) or 0)
+    new_saved = int(rebuilt.get("saved_activation_hbm_bytes_at_peak", 0) or 0)
+    old_unattributed = int(summary.get("unattributed_allocated_peak_bytes", 0) or 0)
+    new_unattributed = int(rebuilt.get("unattributed_allocated_peak_bytes", 0) or 0)
+    required_fields = {
+        "live_activation_hbm_bytes_at_peak",
+        "activation_hbm_bytes_at_peak",
+        "temporary_workspace_hbm_bytes_at_peak",
+        "actual_peak_breakdown_rows",
+    }
+    if any(field not in summary for field in required_fields):
+        return rebuilt
+    if new_saved > old_saved or new_unattributed < old_unattributed:
+        return rebuilt
+    return summary
+
+
 def _first_existing(paths: list[Path]) -> Path | None:
     for path in paths:
         if path.exists():
@@ -172,6 +311,13 @@ def _first_existing(paths: list[Path]) -> Path | None:
 def _seq_len_from_run_dir_name(name: str) -> str:
     match = RUN_DIR_RE.match(name)
     return match.group("seq_len") if match is not None else ""
+
+
+def _safe_label(value: str) -> str:
+    cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in value).strip("_")
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned or "run"
 
 
 def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | None:
@@ -198,6 +344,9 @@ def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | 
         "expert_policy": expert_policy,
         "router_mode": router_mode,
         "seq_len": str(config.get("seq_len") or ""),
+        "precision": str(config.get("precision") or ""),
+        "batch_size": str(config.get("batch_size") or ""),
+        "lora_dropout": str(config.get("lora_dropout") if config.get("lora_dropout") is not None else ""),
         "config": config_root.name,
     }
     if not metadata["seq_len"]:
@@ -252,6 +401,7 @@ def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
                 run_dir / f"{summary_path.stem.removesuffix('_summary')}.jsonl",
             ]
         )
+        summary = _repair_summary_from_jsonl(summary, jsonl_path)
         metadata = _infer_metadata(run_dir, summary)
         if metadata is None:
             continue
@@ -402,6 +552,8 @@ def _segment_label(key: str) -> str:
         return SPECIAL_SEGMENT_LABELS[key]
     if key == "external_cuda_or_driver":
         return "External CUDA/driver"
+    if key == "other_saved_activations:saved_activations":
+        return "Other activations"
     component, _, group = key.partition(":")
     component_label = COMPONENT_LABELS.get(component, component.replace("_", " "))
     group_label = GROUP_LABELS.get(group, group.replace("_", " "))
@@ -411,8 +563,80 @@ def _segment_label(key: str) -> str:
 def _segment_color(key: str) -> str:
     if key in SPECIAL_SEGMENT_COLORS:
         return SPECIAL_SEGMENT_COLORS[key]
+    if key in SEGMENT_COLORS:
+        return SEGMENT_COLORS[key]
     digest = hashlib.md5(key.encode("utf-8")).hexdigest()
     return SEGMENT_PALETTE[int(digest[:8], 16) % len(SEGMENT_PALETTE)]
+
+
+def _positive_segment_keys(series: dict[str, list[int]] | dict[str, int]) -> list[str]:
+    keys: list[str] = []
+    for key, values in series.items():
+        if isinstance(values, list):
+            if any(int(value or 0) > 0 for value in values):
+                keys.append(key)
+        elif int(values or 0) > 0:
+            keys.append(key)
+    return sorted(keys, key=_segment_sort_key)
+
+
+def _bar_axis_slots(n_bars: int, *, min_slots: int = MIN_BAR_SLOTS) -> int:
+    return max(int(n_bars), int(min_slots), 1)
+
+
+def _bar_plot_width(n_bars: int, *, min_slots: int = MIN_BAR_SLOTS) -> float:
+    slots = _bar_axis_slots(n_bars, min_slots=min_slots)
+    return max(7.0, min(36.0, PLOT_EXTRA_INCHES + BAR_SLOT_INCHES * slots))
+
+
+def _subplot_plot_width(n_bars: int, *, min_slots: int = MIN_BAR_SLOTS) -> float:
+    slots = _bar_axis_slots(n_bars, min_slots=min_slots)
+    return max(6.0, min(18.0, 2.6 + BAR_SLOT_INCHES * slots))
+
+
+def _set_standard_bar_geometry(ax: Any, n_bars: int, *, min_slots: int = MIN_BAR_SLOTS) -> None:
+    slots = _bar_axis_slots(n_bars, min_slots=min_slots)
+    side_padding = max(0.5, (slots - int(n_bars)) / 2.0 + 0.5)
+    ax.set_xlim(-side_padding, max(int(n_bars) - 1, 0) + side_padding)
+
+
+def _nice_y_limit_gib(peak_bytes: int) -> float:
+    peak_gib = max(float(peak_bytes) / GIB, 0.0)
+    if peak_gib <= 0.0:
+        return 1.0
+    target = peak_gib * 1.08
+    if target >= 1.0:
+        return float(math.ceil(target))
+    magnitude = 10.0 ** math.floor(math.log10(target))
+    for multiplier in (1.0, 2.0, 2.5, 5.0, 10.0):
+        candidate = multiplier * magnitude
+        if candidate >= target:
+            return candidate
+    return 10.0 * magnitude
+
+
+def _legend_handles(keys: list[str], *, include_peak: bool = True) -> list[Any]:
+    handles: list[Any] = [
+        Patch(facecolor=_segment_color(key), edgecolor="#ffffff", linewidth=0.4, label=_segment_label(key))
+        for key in keys
+    ]
+    if include_peak:
+        handles.append(Line2D([0], [0], color=PEAK_LINE_COLOR, linestyle="--", linewidth=1.2, label="Peak allocated"))
+    return handles
+
+
+def _plot_legend(ax: Any, keys: list[str], *, include_peak: bool = True) -> None:
+    handles = _legend_handles(keys, include_peak=include_peak)
+    ax.legend(
+        handles=handles,
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        frameon=True,
+        fontsize=8,
+        labelspacing=0.35,
+        handlelength=1.4,
+        borderaxespad=0.0,
+    )
 
 
 def _aggregate_rows(rows: list[dict[str, Any]], *, include_external: bool = False) -> dict[str, int]:
@@ -436,6 +660,24 @@ def _aggregate_summary(summary: dict[str, Any]) -> dict[str, int]:
     return _aggregate_rows(rows)
 
 
+def _aggregate_actual_peak_summary(summary: dict[str, Any]) -> dict[str, int]:
+    rows = summary.get("actual_peak_breakdown_rows", [])
+    if not isinstance(rows, list) or not rows:
+        rows = summary.get("breakdown_rows", [])
+    if not isinstance(rows, list):
+        return {}
+    return _aggregate_rows(rows)
+
+
+def _measured_jsonl_rows(run: RunRecord) -> list[dict[str, Any]]:
+    rows = []
+    for row in _load_jsonl(run.jsonl_path):
+        if not isinstance(row, dict) or row.get("is_warmup") or int(row.get("schema_version") or 0) != 2:
+            continue
+        rows.append(row)
+    return rows
+
+
 def _flatten_row(row: dict[str, Any]) -> tuple[list[dict[str, Any]], int, int]:
     peak_allocated = int(row.get("peak_allocated_since_step_begin") or row.get("allocated_bytes") or 0)
     peak_reserved = int(row.get("peak_reserved_since_step_begin") or row.get("reserved_bytes") or 0)
@@ -444,6 +686,12 @@ def _flatten_row(row: dict[str, Any]) -> tuple[list[dict[str, Any]], int, int]:
     saved_activation = row.get("saved_activation_bytes_at_peak", {})
     if not isinstance(saved_activation, dict) or not saved_activation:
         saved_activation = row.get("saved_activation_bytes", {})
+    live_activation = row.get("live_activation_bytes_at_peak", {})
+    if not isinstance(live_activation, dict) or not live_activation:
+        live_activation = row.get("live_activation_bytes", {})
+    peak_growth = row.get("peak_growth_bytes_at_peak", {})
+    if not isinstance(peak_growth, dict) or not peak_growth:
+        peak_growth = row.get("peak_growth_bytes", {})
     closure = row.get("closure_bytes", {})
     external_memory = row.get("external_memory", {})
     rows: list[dict[str, Any]] = []
@@ -472,20 +720,56 @@ def _flatten_row(row: dict[str, Any]) -> tuple[list[dict[str, Any]], int, int]:
                 else:
                     add("GPU HBM", "persistent", str(component), kind_str, value_int)
 
-    saved_activation_items = [
-        (str(component), int(value or 0))
-        for component, value in (saved_activation.items() if isinstance(saved_activation, dict) else [])
-        if int(value or 0) > 0
-    ]
+    saved_activation_totals: dict[str, int] = {}
+    for component, value in saved_activation.items() if isinstance(saved_activation, dict) else []:
+        value_int = int(value or 0)
+        if value_int <= 0:
+            continue
+        component_name = _saved_activation_component(component)
+        saved_activation_totals[component_name] = saved_activation_totals.get(component_name, 0) + value_int
+    saved_activation_items = sorted(saved_activation_totals.items())
     for component, value in saved_activation_items:
         add("GPU HBM", "saved_activations", component, "saved_activation", value)
+
+    live_activation_totals: dict[str, int] = {}
+    for component, value in live_activation.items() if isinstance(live_activation, dict) else []:
+        value_int = int(value or 0)
+        if value_int <= 0:
+            continue
+        component_name = _saved_activation_component(component)
+        live_activation_totals[component_name] = live_activation_totals.get(component_name, 0) + value_int
+    for component, value in sorted(live_activation_totals.items()):
+        add("GPU HBM", "saved_activations", component, "live_activation", value)
+
+    known_before_workspace = sum(int(item["bytes"]) for item in rows if item["memory_space"] == "GPU HBM")
+    workspace_residual = max(0, peak_allocated - known_before_workspace)
+    if isinstance(closure, dict):
+        workspace_residual = min(workspace_residual, max(0, int(closure.get("unattributed_allocated_peak") or 0)))
+    peak_growth_totals: dict[str, int] = {}
+    for component, value in peak_growth.items() if isinstance(peak_growth, dict) else []:
+        value_int = int(value or 0)
+        if value_int <= 0:
+            continue
+        component_name = _saved_activation_component(component)
+        peak_growth_totals[component_name] = peak_growth_totals.get(component_name, 0) + value_int
+    total_peak_growth = sum(peak_growth_totals.values())
+    if workspace_residual > 0 and total_peak_growth > 0:
+        remaining = int(workspace_residual)
+        growth_items = sorted(peak_growth_totals.items(), key=lambda item: int(item[1]), reverse=True)
+        for index, (component, growth_bytes) in enumerate(growth_items):
+            if remaining <= 0:
+                break
+            if index == len(growth_items) - 1:
+                value = remaining
+            else:
+                value = min(remaining, int(round(workspace_residual * (int(growth_bytes) / total_peak_growth))))
+            if value <= 0:
+                continue
+            add("GPU HBM", "temporary_workspace", component, "inferred_peak_workspace", value)
+            remaining -= value
+
     known = sum(int(item["bytes"]) for item in rows if item["memory_space"] == "GPU HBM")
     unattributed = max(0, peak_allocated - known)
-    if isinstance(closure, dict):
-        unattributed = min(
-            max(unattributed, int(closure.get("unattributed_allocated_peak") or 0)),
-            max(0, peak_allocated - known),
-        )
     add("GPU HBM", "unattributed_allocated_peak", "unattributed_allocated_peak", "allocated_residual", unattributed)
     add(
         "GPU reserved",
@@ -502,6 +786,129 @@ def _flatten_row(row: dict[str, Any]) -> tuple[list[dict[str, Any]], int, int]:
         external_value = max(external_value, int(closure.get("external_cuda_or_driver") or 0))
     add("External CUDA", "external", "external_cuda_or_driver", "process_or_driver_gap", external_value)
     return rows, peak_allocated, peak_reserved
+
+
+def _phase_sort_key(phase: str) -> tuple[int, str]:
+    try:
+        return (PHASE_ORDER.index(phase), phase)
+    except ValueError:
+        return (len(PHASE_ORDER), phase)
+
+
+def _phase_csv_rows(run: RunRecord) -> list[dict[str, Any]]:
+    source_rows = _measured_jsonl_rows(run)
+    if not source_rows:
+        source_rows = [
+            {
+                "schema_version": run.summary.get("schema_version", 2),
+                "step": run.summary.get("selected_step", 0),
+                "raw_step": run.summary.get("selected_step", 0),
+                "phase": run.summary.get("selected_phase", "selected"),
+                "peak_allocated_since_step_begin": run.summary.get("peak_allocated_hbm_bytes", 0),
+                "peak_reserved_since_step_begin": run.summary.get("peak_reserved_hbm_bytes", 0),
+                "allocated_bytes": run.summary.get("allocated_bytes", 0),
+                "reserved_bytes": run.summary.get("reserved_bytes", 0),
+                "persistent_bytes": {},
+                "saved_activation_bytes_at_peak": {},
+                "live_activation_bytes_at_peak": {},
+                "peak_growth_bytes_at_peak": {},
+            }
+        ]
+    result: list[dict[str, Any]] = []
+    selected_step = str(run.summary.get("selected_step", ""))
+    selected_phase = str(run.summary.get("selected_phase", ""))
+    for source_row in sorted(
+        source_rows,
+        key=lambda row: (int(row.get("step") or 0), _phase_sort_key(str(row.get("phase") or ""))),
+    ):
+        flat_rows, peak_allocated, peak_reserved = _flatten_row(source_row)
+        phase = str(source_row.get("phase") or "")
+        step = str(source_row.get("step") or "")
+        reserved_unallocated = max(0, peak_reserved - peak_allocated)
+        allocated_sum = sum(int(row.get("bytes") or 0) for row in flat_rows if row.get("memory_space") == "GPU HBM")
+        reserved_gap_sum = sum(
+            int(row.get("bytes") or 0)
+            for row in flat_rows
+            if row.get("component") == "allocator_reserved_unallocated"
+        )
+        for row in flat_rows:
+            if not isinstance(row, dict):
+                continue
+            value = int(row.get("bytes", 0) or 0)
+            is_reserved_stack_row = (
+                row.get("memory_space") == "GPU HBM" or row.get("component") == "allocator_reserved_unallocated"
+            )
+            result.append(
+                {
+                    **run.metadata,
+                    "run_dir": str(run.run_dir),
+                    "schema_version": source_row.get("schema_version", ""),
+                    "step": step,
+                    "raw_step": source_row.get("raw_step", step),
+                    "phase": phase,
+                    "is_selected_summary_phase": str(step) == selected_step and phase == selected_phase,
+                    "allocated_bytes": int(source_row.get("allocated_bytes", 0) or 0),
+                    "reserved_bytes": int(source_row.get("reserved_bytes", 0) or 0),
+                    "peak_allocated_hbm_bytes": peak_allocated,
+                    "peak_reserved_hbm_bytes": peak_reserved,
+                    "reserved_unallocated_bytes": reserved_unallocated,
+                    "allocated_stack_sum_bytes": int(allocated_sum),
+                    "reserved_stack_sum_bytes": int(allocated_sum + reserved_gap_sum),
+                    "memory_space": row.get("memory_space", "-"),
+                    "group": row.get("group", "-"),
+                    "component": row.get("component", "-"),
+                    "kind": row.get("kind", "-"),
+                    "bytes": value,
+                    "gib": value / GIB,
+                    "percent_peak_reserved_hbm": (value * 100.0 / peak_reserved)
+                    if peak_reserved > 0 and is_reserved_stack_row
+                    else "",
+                    "method": row.get("method", "-"),
+                    "accuracy": row.get("accuracy", "-"),
+                    "allocated_closure_error_bytes": int(peak_allocated) - int(allocated_sum),
+                    "reserved_closure_error_bytes": int(peak_reserved) - int(allocated_sum + reserved_gap_sum),
+                }
+            )
+    return result
+
+
+def _representative_phase_rows(run: RunRecord) -> list[dict[str, Any]]:
+    by_phase: dict[str, dict[str, Any]] = {}
+    for row in _measured_jsonl_rows(run):
+        phase = str(row.get("phase") or "")
+        current = by_phase.get(phase)
+        if current is None or _selection_key(row) > _selection_key(current):
+            by_phase[phase] = row
+    return [by_phase[phase] for phase in sorted(by_phase, key=_phase_sort_key)]
+
+
+def _phase_plot_data(run: RunRecord) -> tuple[list[str], dict[str, list[int]], list[int]]:
+    rows = _representative_phase_rows(run)
+    if not rows:
+        values = _aggregate_summary(run.summary)
+        return (
+            [str(run.summary.get("selected_phase", "selected") or "selected")],
+            {key: [value] for key, value in values.items()},
+            [int(run.summary.get("peak_allocated_hbm_bytes", 0) or 0)],
+        )
+    labels: list[str] = []
+    per_phase_values: list[dict[str, int]] = []
+    peak_allocated_values: list[int] = []
+    keys: set[str] = set()
+    for row in rows:
+        phase = str(row.get("phase") or "")
+        labels.append(phase)
+        flat, peak_allocated, _peak_reserved = _flatten_row(row)
+        values = _aggregate_rows(flat)
+        per_phase_values.append(values)
+        peak_allocated_values.append(peak_allocated)
+        keys.update(values)
+    ordered_keys = sorted(keys, key=_segment_sort_key)
+    series = {key: [] for key in ordered_keys}
+    for values in per_phase_values:
+        for key in ordered_keys:
+            series[key].append(values.get(key, 0))
+    return labels, series, peak_allocated_values
 
 
 def _step_series(run: RunRecord) -> tuple[list[int], dict[str, list[int]], list[int]]:
@@ -563,6 +970,8 @@ def _summary_csv_rows(run: RunRecord) -> list[dict[str, Any]]:
         return []
     peak_allocated = int(run.summary.get("peak_allocated_hbm_bytes", 0) or 0)
     peak_reserved = int(run.summary.get("peak_reserved_hbm_bytes", 0) or 0)
+    actual_peak_allocated = int(run.summary.get("actual_peak_allocated_hbm_bytes", peak_allocated) or 0)
+    actual_peak_reserved = int(run.summary.get("actual_peak_reserved_hbm_bytes", peak_reserved) or 0)
     reserved_unallocated = int(run.summary.get("reserved_unallocated_bytes", 0) or 0)
     external_cuda = int(run.summary.get("external_cuda_or_driver_bytes", 0) or 0)
     result: list[dict[str, Any]] = []
@@ -579,6 +988,10 @@ def _summary_csv_rows(run: RunRecord) -> list[dict[str, Any]]:
                 "selected_metric": run.summary.get("selected_metric", ""),
                 "selected_step": run.summary.get("selected_step", ""),
                 "selected_phase": run.summary.get("selected_phase", ""),
+                "actual_peak_step": run.summary.get("actual_peak_step", ""),
+                "actual_peak_phase": run.summary.get("actual_peak_phase", ""),
+                "actual_peak_allocated_hbm_bytes": actual_peak_allocated,
+                "actual_peak_reserved_hbm_bytes": actual_peak_reserved,
                 "peak_allocated_hbm_bytes": peak_allocated,
                 "peak_reserved_hbm_bytes": peak_reserved,
                 "reserved_unallocated_bytes": reserved_unallocated,
@@ -587,6 +1000,15 @@ def _summary_csv_rows(run: RunRecord) -> list[dict[str, Any]]:
                 "reserved_stack_sum_bytes": int(run.summary.get("reserved_stack_sum_bytes", 0) or 0),
                 "saved_activation_hbm_bytes_at_peak": int(
                     run.summary.get("saved_activation_hbm_bytes_at_peak", 0) or 0
+                ),
+                "live_activation_hbm_bytes_at_peak": int(
+                    run.summary.get("live_activation_hbm_bytes_at_peak", 0) or 0
+                ),
+                "activation_hbm_bytes_at_peak": int(
+                    run.summary.get("activation_hbm_bytes_at_peak", 0) or 0
+                ),
+                "temporary_workspace_hbm_bytes_at_peak": int(
+                    run.summary.get("temporary_workspace_hbm_bytes_at_peak", 0) or 0
                 ),
                 "unattributed_allocated_peak_bytes": int(
                     run.summary.get("unattributed_allocated_peak_bytes", 0) or 0
@@ -611,6 +1033,54 @@ def _summary_csv_rows(run: RunRecord) -> list[dict[str, Any]]:
     return result
 
 
+def _actual_peak_csv_rows(run: RunRecord) -> list[dict[str, Any]]:
+    rows = run.summary.get("actual_peak_breakdown_rows", [])
+    if not isinstance(rows, list) or not rows:
+        rows = run.summary.get("breakdown_rows", [])
+    if not isinstance(rows, list):
+        return []
+    actual_peak_allocated = int(run.summary.get("actual_peak_allocated_hbm_bytes", run.summary.get("peak_allocated_hbm_bytes", 0)) or 0)
+    actual_peak_reserved = int(run.summary.get("actual_peak_reserved_hbm_bytes", run.summary.get("peak_reserved_hbm_bytes", 0)) or 0)
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        value = int(row.get("bytes", 0) or 0)
+        is_reserved_stack_row = row.get("memory_space") == "GPU HBM" or row.get("component") == "allocator_reserved_unallocated"
+        result.append(
+            {
+                **run.metadata,
+                "run_dir": str(run.run_dir),
+                "schema_version": run.summary.get("schema_version", ""),
+                "actual_peak_step": run.summary.get("actual_peak_step", ""),
+                "actual_peak_phase": run.summary.get("actual_peak_phase", ""),
+                "actual_peak_allocated_hbm_bytes": actual_peak_allocated,
+                "actual_peak_reserved_hbm_bytes": actual_peak_reserved,
+                "actual_peak_reserved_unallocated_bytes": int(
+                    run.summary.get("actual_peak_reserved_unallocated_bytes", max(0, actual_peak_reserved - actual_peak_allocated)) or 0
+                ),
+                "memory_space": row.get("memory_space", "-"),
+                "group": row.get("group", "-"),
+                "component": row.get("component", "-"),
+                "kind": row.get("kind", "-"),
+                "bytes": value,
+                "gib": value / GIB,
+                "percent_actual_peak_reserved_hbm": (value * 100.0 / actual_peak_reserved)
+                if actual_peak_reserved > 0 and is_reserved_stack_row
+                else "",
+                "method": row.get("method", "-"),
+                "accuracy": row.get("accuracy", "-"),
+                "actual_peak_allocated_closure_error_bytes": int(
+                    run.summary.get("actual_peak_allocated_closure_error_bytes", 0) or 0
+                ),
+                "actual_peak_reserved_closure_error_bytes": int(
+                    run.summary.get("actual_peak_reserved_closure_error_bytes", 0) or 0
+                ),
+            }
+        )
+    return result
+
+
 def _prepare_output(path: Path, clean: bool) -> None:
     if clean and path.exists():
         shutil.rmtree(path)
@@ -618,103 +1088,240 @@ def _prepare_output(path: Path, clean: bool) -> None:
 
 
 def _peak_ylim_gib(runs: list[RunRecord]) -> float:
-    peak = max((int(run.summary.get("peak_reserved_hbm_bytes", 0) or 0) for run in runs), default=0)
-    if peak <= 0:
-        return 1.0
-    return max(1.0, math.ceil((peak / GIB) * 1.08))
+    peak = 0
+    for run in runs:
+        peak = max(
+            peak,
+            int(run.summary.get("peak_reserved_hbm_bytes", 0) or 0),
+            int(run.summary.get("actual_peak_reserved_hbm_bytes", 0) or 0),
+        )
+    return _nice_y_limit_gib(peak)
 
 
-def _plot_single_peak(run: RunRecord, out_dir: Path, y_limit_gib: float | None) -> None:
-    values = _aggregate_summary(run.summary)
-    fig, ax = plt.subplots(figsize=(8.0, 5.0), constrained_layout=True)
+def _phase_ylim_gib(runs: list[RunRecord]) -> float:
+    peak = 0
+    for run in runs:
+        for row in _representative_phase_rows(run):
+            peak = max(peak, int(row.get("peak_reserved_since_step_begin") or row.get("reserved_bytes") or 0))
+        peak = max(peak, int(run.summary.get("peak_reserved_hbm_bytes", 0) or 0))
+    return _nice_y_limit_gib(peak)
+
+
+def _plot_single_peak(run: RunRecord, out_dir: Path, y_limit_gib: float | None, *, actual: bool = False) -> None:
+    values = _aggregate_actual_peak_summary(run.summary) if actual else _aggregate_summary(run.summary)
+    keys = _positive_segment_keys(values)
+    fig, ax = plt.subplots(figsize=(_bar_plot_width(1), 5.8), constrained_layout=True)
     bottom = 0.0
     x_label = run.metadata.get("backend", "run")
-    for key in sorted(values, key=_segment_sort_key):
+    for key in keys:
         value = values[key] / GIB
         if value <= 0:
             continue
-        ax.bar([x_label], [value], bottom=bottom, label=_segment_label(key), color=_segment_color(key))
+        ax.bar(
+            [0],
+            [value],
+            bottom=bottom,
+            width=STANDARD_BAR_WIDTH,
+            color=_segment_color(key),
+            edgecolor="#ffffff",
+            linewidth=0.35,
+        )
         bottom += value
-    peak_allocated = int(run.summary.get("peak_allocated_hbm_bytes", 0) or 0) / GIB
+    peak_allocated_key = "actual_peak_allocated_hbm_bytes" if actual else "peak_allocated_hbm_bytes"
+    peak_allocated = int(run.summary.get(peak_allocated_key, 0) or 0) / GIB
     if peak_allocated > 0:
-        ax.axhline(peak_allocated, color="#222222", linestyle="--", linewidth=1.0, label="Peak allocated")
+        ax.hlines(
+            peak_allocated,
+            -STANDARD_BAR_WIDTH / 2.0,
+            STANDARD_BAR_WIDTH / 2.0,
+            colors=PEAK_LINE_COLOR,
+            linestyles="--",
+            linewidth=1.2,
+        )
+    _set_standard_bar_geometry(ax, 1)
+    ax.set_xticks([0])
+    ax.set_xticklabels([x_label])
     ax.set_ylabel("Memory (GiB)")
-    ax.set_title(run.label or run.run_dir.name)
+    ax.set_title((run.label or run.run_dir.name) + (" actual CUDA peak" if actual else " selected attribution"))
     if y_limit_gib is not None:
         ax.set_ylim(0, y_limit_gib)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
-    fig.savefig(out_dir / "memory_peak_stack.png", dpi=180, bbox_inches="tight")
+    ax.grid(axis="y", color="#d1d5db", linewidth=0.6, alpha=0.8)
+    _plot_legend(ax, keys, include_peak=peak_allocated > 0)
+    fig.savefig(out_dir / ("memory_actual_peak_stack.png" if actual else "memory_peak_stack.png"), dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
-def _plot_step_stacked_bar(ax: Any, steps: list[int], series: dict[str, list[int]], peak_allocated: list[int]) -> None:
-    label = str(steps[0]) if steps else "step"
-    bottom = 0.0
-    for key in sorted(series, key=_segment_sort_key):
+def _plot_step_stacked_bars_on_axis(
+    ax: Any,
+    steps: list[int],
+    series: dict[str, list[int]],
+    peak_allocated: list[int],
+) -> None:
+    labels = [str(step) for step in steps] or ["step"]
+    x_positions = list(range(len(labels)))
+    bottoms = [0.0 for _label in labels]
+    keys = _positive_segment_keys(series)
+    for key in keys:
         values = series.get(key, [])
-        value = (values[0] / GIB) if values else 0.0
-        if value <= 0.0:
+        values_gib = [(int(value or 0) / GIB) for value in values]
+        if not any(value > 0.0 for value in values_gib):
             continue
-        ax.bar([label], [value], bottom=bottom, width=0.55, label=_segment_label(key), color=_segment_color(key))
-        bottom += value
-    if peak_allocated:
-        ax.axhline(peak_allocated[0] / GIB, color="#222222", linestyle="--", linewidth=1.0, label="Peak allocated")
+        ax.bar(
+            x_positions,
+            values_gib,
+            bottom=bottoms,
+            width=STANDARD_BAR_WIDTH,
+            color=_segment_color(key),
+            edgecolor="#ffffff",
+            linewidth=0.35,
+        )
+        bottoms = [bottom + value for bottom, value in zip(bottoms, values_gib)]
+    for x_position, value in zip(x_positions, peak_allocated):
+        peak_gib = int(value or 0) / GIB
+        if peak_gib <= 0:
+            continue
+        ax.hlines(
+            peak_gib,
+            x_position - STANDARD_BAR_WIDTH / 2.0,
+            x_position + STANDARD_BAR_WIDTH / 2.0,
+            colors=PEAK_LINE_COLOR,
+            linestyles="--",
+            linewidth=1.2,
+        )
+    _set_standard_bar_geometry(ax, len(labels))
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(labels)
+    ax.grid(axis="y", color="#d1d5db", linewidth=0.6, alpha=0.8)
+
+
+def _plot_step_stacked_bar(ax: Any, steps: list[int], series: dict[str, list[int]], peak_allocated: list[int]) -> None:
+    _plot_step_stacked_bars_on_axis(ax, steps[:1], {key: values[:1] for key, values in series.items()}, peak_allocated[:1])
 
 
 def _plot_single_steps(run: RunRecord, out_dir: Path, y_limit_gib: float | None) -> None:
     steps, series, peak_allocated = _step_series(run)
-    fig, ax = plt.subplots(figsize=(9.0, 5.0), constrained_layout=True)
-    if len(steps) == 1:
-        _plot_step_stacked_bar(ax, steps, series, peak_allocated)
-    else:
-        keys = sorted(series, key=_segment_sort_key)
-        stacks = [[value / GIB for value in series[key]] for key in keys]
-        ax.stackplot(steps, stacks, labels=[_segment_label(key) for key in keys], colors=[_segment_color(key) for key in keys])
-        if peak_allocated:
-            ax.plot(steps, [value / GIB for value in peak_allocated], color="#222222", linestyle="--", linewidth=1.0, label="Peak allocated")
+    fig, ax = plt.subplots(figsize=(_bar_plot_width(max(len(steps), 1)), 5.8), constrained_layout=True)
+    keys = _positive_segment_keys(series)
+    _plot_step_stacked_bars_on_axis(ax, steps, series, peak_allocated)
     ax.set_xlabel("Measured step")
     ax.set_ylabel("Memory (GiB)")
     ax.set_title(run.label or run.run_dir.name)
     if y_limit_gib is not None:
         ax.set_ylim(0, y_limit_gib)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    _plot_legend(ax, keys, include_peak=bool(peak_allocated))
     fig.savefig(out_dir / "memory_over_steps_stacked.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_phase_stacks_on_axis(ax: Any, labels: list[str], series: dict[str, list[int]], peak_allocated: list[int]) -> None:
+    x_positions = list(range(len(labels)))
+    bottoms = [0.0 for _label in labels]
+    for key in _positive_segment_keys(series):
+        values = [value / GIB for value in series.get(key, [])]
+        if not any(value > 0.0 for value in values):
+            continue
+        ax.bar(
+            x_positions,
+            values,
+            bottom=bottoms,
+            width=STANDARD_BAR_WIDTH,
+            color=_segment_color(key),
+            edgecolor="#ffffff",
+            linewidth=0.35,
+        )
+        bottoms = [bottom + value for bottom, value in zip(bottoms, values)]
+    for x_position, value in zip(x_positions, peak_allocated):
+        value_gib = value / GIB
+        if value_gib > 0:
+            ax.hlines(
+                value_gib,
+                x_position - STANDARD_BAR_WIDTH / 2.0,
+                x_position + STANDARD_BAR_WIDTH / 2.0,
+                colors=PEAK_LINE_COLOR,
+                linestyles="--",
+                linewidth=1.2,
+            )
+    _set_standard_bar_geometry(ax, len(labels), min_slots=5)
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.grid(axis="y", color="#d1d5db", linewidth=0.6, alpha=0.8)
+
+
+def _plot_single_phases(run: RunRecord, out_dir: Path, y_limit_gib: float | None) -> None:
+    labels, series, peak_allocated = _phase_plot_data(run)
+    fig, ax = plt.subplots(figsize=(_bar_plot_width(len(labels), min_slots=5), 5.8), constrained_layout=True)
+    _plot_phase_stacks_on_axis(ax, labels, series, peak_allocated)
+    ax.set_xlabel("Phase")
+    ax.set_ylabel("Memory (GiB)")
+    ax.set_title(f"{run.label or run.run_dir.name} phase memory attribution")
+    if y_limit_gib is not None:
+        ax.set_ylim(0, y_limit_gib)
+    _plot_legend(ax, _positive_segment_keys(series), include_peak=bool(peak_allocated))
+    fig.savefig(out_dir / "memory_by_phase_stacked.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
 def _write_per_run(run: RunRecord, out_dir: Path, clean: bool, y_limit_gib: float | None) -> None:
     _prepare_output(out_dir, clean)
     _write_csv(out_dir / "memory_breakdown.csv", _summary_csv_rows(run))
+    _write_csv(out_dir / "memory_actual_peak_breakdown.csv", _actual_peak_csv_rows(run))
+    _write_csv(out_dir / "memory_breakdown_by_phase.csv", _phase_csv_rows(run))
     (out_dir / "memory_breakdown_index.json").write_text(
         json.dumps({"run_dir": str(run.run_dir), "summary_path": str(run.summary_path), "jsonl_path": str(run.jsonl_path or "")}, indent=2) + "\n",
         encoding="utf-8",
     )
     _plot_single_peak(run, out_dir, y_limit_gib)
+    _plot_single_peak(run, out_dir, y_limit_gib, actual=True)
     _plot_single_steps(run, out_dir, y_limit_gib)
+    phase_y_limit = max(y_limit_gib or 0.0, _phase_ylim_gib([run])) if y_limit_gib is not None else None
+    _plot_single_phases(run, out_dir, phase_y_limit)
 
 
-def _plot_combined_peak(runs: list[RunRecord], out_dir: Path, y_limit_gib: float) -> None:
-    labels = [run.label or run.run_dir.name for run in runs]
+def _plot_combined_peak(runs: list[RunRecord], out_dir: Path, y_limit_gib: float, *, actual: bool = False) -> None:
+    labels = _run_plot_labels(runs)
     x_positions = list(range(len(runs)))
-    fig_width = max(9.0, min(28.0, 1.2 * len(runs) + 5.0))
-    fig, ax = plt.subplots(figsize=(fig_width, 6.0), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(_bar_plot_width(len(runs)), 6.2), constrained_layout=True)
     bottoms = [0.0 for _run in runs]
-    keys = sorted({key for run in runs for key in _aggregate_summary(run.summary)}, key=_segment_sort_key)
+    aggregate = _aggregate_actual_peak_summary if actual else _aggregate_summary
+    per_run_values = [aggregate(run.summary) for run in runs]
+    keys = sorted({key for values in per_run_values for key, value in values.items() if int(value or 0) > 0}, key=_segment_sort_key)
     for key in keys:
-        values = [_aggregate_summary(run.summary).get(key, 0) / GIB for run in runs]
-        ax.bar(x_positions, values, bottom=bottoms, label=_segment_label(key), color=_segment_color(key))
+        values = [run_values.get(key, 0) / GIB for run_values in per_run_values]
+        ax.bar(
+            x_positions,
+            values,
+            bottom=bottoms,
+            width=STANDARD_BAR_WIDTH,
+            color=_segment_color(key),
+            edgecolor="#ffffff",
+            linewidth=0.35,
+        )
         bottoms = [bottom + value for bottom, value in zip(bottoms, values)]
     for x_position, run in zip(x_positions, runs):
-        peak_allocated = int(run.summary.get("peak_allocated_hbm_bytes", 0) or 0) / GIB
+        peak_allocated_key = "actual_peak_allocated_hbm_bytes" if actual else "peak_allocated_hbm_bytes"
+        peak_allocated = int(run.summary.get(peak_allocated_key, 0) or 0) / GIB
         if peak_allocated > 0:
-            ax.hlines(peak_allocated, x_position - 0.35, x_position + 0.35, colors="#222222", linestyles="--", linewidth=1.0)
+            ax.hlines(
+                peak_allocated,
+                x_position - STANDARD_BAR_WIDTH / 2.0,
+                x_position + STANDARD_BAR_WIDTH / 2.0,
+                colors=PEAK_LINE_COLOR,
+                linestyles="--",
+                linewidth=1.2,
+            )
     ax.set_ylabel("Memory (GiB)")
     ax.set_ylim(0, y_limit_gib)
+    _set_standard_bar_geometry(ax, len(runs))
     ax.set_xticks(x_positions)
     ax.set_xticklabels(labels, rotation=30, ha="right")
-    ax.set_title("LF Source Reserved-Capacity Memory Breakdown")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0))
-    fig.savefig(out_dir / "combined_memory_peak_stack.png", dpi=180, bbox_inches="tight")
+    ax.set_title(
+        "LF Source Actual CUDA-Peak Memory Breakdown"
+        if actual
+        else "LF Source Selected-Attribution Memory Breakdown"
+    )
+    ax.grid(axis="y", color="#d1d5db", linewidth=0.6, alpha=0.8)
+    _plot_legend(ax, keys, include_peak=True)
+    fig.savefig(out_dir / ("combined_memory_actual_peak_stack.png" if actual else "combined_memory_peak_stack.png"), dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -722,37 +1329,135 @@ def _plot_combined_steps(runs: list[RunRecord], out_dir: Path, y_limit_gib: floa
     n_runs = len(runs)
     ncols = 2 if n_runs > 3 else 1
     nrows = math.ceil(n_runs / ncols)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(8.0 * ncols, 3.2 * nrows), sharey=True, squeeze=False, constrained_layout=True)
+    plot_data = [(run, *_step_series(run)) for run in runs]
+    max_step_count = max((len(steps) for _run, steps, _series, _peak_allocated in plot_data), default=1)
+    legend_keys = sorted(
+        {
+            key
+            for _run, _steps, series, _peak_allocated in plot_data
+            for key in _positive_segment_keys(series)
+        },
+        key=_segment_sort_key,
+    )
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(_subplot_plot_width(max_step_count) * ncols, 4.0 * nrows),
+        sharey=True,
+        squeeze=False,
+        constrained_layout=True,
+    )
     for idx, run in enumerate(runs):
         ax = axes[idx // ncols][idx % ncols]
-        steps, series, peak_allocated = _step_series(run)
-        if len(steps) == 1:
-            _plot_step_stacked_bar(ax, steps, series, peak_allocated)
-        else:
-            keys = sorted(series, key=_segment_sort_key)
-            stacks = [[value / GIB for value in series[key]] for key in keys]
-            ax.stackplot(steps, stacks, labels=[_segment_label(key) for key in keys], colors=[_segment_color(key) for key in keys])
-            if peak_allocated:
-                ax.plot(steps, [value / GIB for value in peak_allocated], color="#222222", linestyle="--", linewidth=1.0, label="Peak allocated")
-        ax.set_title(run.label or run.run_dir.name, fontsize=9)
+        _run, steps, series, peak_allocated = plot_data[idx]
+        _plot_step_stacked_bars_on_axis(ax, steps, series, peak_allocated)
+        ax.set_title(_run_plot_labels(runs)[idx], fontsize=9)
         ax.set_xlabel("Measured step")
         ax.set_ylim(0, y_limit_gib)
         if idx % ncols == 0:
             ax.set_ylabel("Memory (GiB)")
     for idx in range(n_runs, nrows * ncols):
         axes[idx // ncols][idx % ncols].axis("off")
-    handles, labels = axes[0][0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="center left", bbox_to_anchor=(1.01, 0.5))
+    fig.legend(
+        handles=_legend_handles(legend_keys, include_peak=True),
+        loc="center left",
+        bbox_to_anchor=(1.01, 0.5),
+        frameon=True,
+        fontsize=8,
+        labelspacing=0.35,
+        handlelength=1.4,
+    )
     fig.savefig(out_dir / "combined_memory_over_steps_stacked.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
-def _write_combined(runs: list[RunRecord], out_dir: Path, clean: bool, y_limit_gib: float) -> None:
+def _plot_combined_phases(runs: list[RunRecord], out_dir: Path, y_limit_gib: float) -> None:
+    n_runs = len(runs)
+    ncols = 2 if n_runs > 3 else 1
+    nrows = math.ceil(n_runs / ncols)
+    plot_data = [(run, *_phase_plot_data(run)) for run in runs]
+    max_phase_count = max((len(labels) for _run, labels, _series, _peak_allocated in plot_data), default=1)
+    legend_keys = sorted(
+        {
+            key
+            for _run, _labels, series, _peak_allocated in plot_data
+            for key in _positive_segment_keys(series)
+        },
+        key=_segment_sort_key,
+    )
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(_subplot_plot_width(max_phase_count, min_slots=5) * ncols, 4.3 * nrows),
+        sharey=True,
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for idx, run in enumerate(runs):
+        ax = axes[idx // ncols][idx % ncols]
+        _run, phase_labels, series, peak_allocated = plot_data[idx]
+        _plot_phase_stacks_on_axis(ax, phase_labels, series, peak_allocated)
+        ax.set_title(_run_plot_labels(runs)[idx], fontsize=9)
+        ax.set_xlabel("Phase")
+        ax.set_ylim(0, y_limit_gib)
+        if idx % ncols == 0:
+            ax.set_ylabel("Memory (GiB)")
+    for idx in range(n_runs, nrows * ncols):
+        axes[idx // ncols][idx % ncols].axis("off")
+    fig.legend(
+        handles=_legend_handles(legend_keys, include_peak=True),
+        loc="center left",
+        bbox_to_anchor=(1.01, 0.5),
+        frameon=True,
+        fontsize=8,
+        labelspacing=0.35,
+        handlelength=1.4,
+    )
+    fig.savefig(out_dir / "combined_memory_by_phase_stacked.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _group_label(run: RunRecord) -> str:
+    metadata = run.metadata
+    parts = [
+        metadata.get("workload", ""),
+        f"b{metadata.get('batch_size', '')}" if metadata.get("batch_size") else "",
+        f"drop{metadata.get('lora_dropout', '').replace('.', '')}" if metadata.get("lora_dropout") else "",
+        metadata.get("precision", ""),
+        metadata.get("backend", ""),
+        metadata.get("profiler", ""),
+        f"router{metadata.get('router_mode', '')}" if metadata.get("router_mode") else "",
+        metadata.get("recompute", ""),
+        f"pol{metadata.get('expert_policy', '')}" if metadata.get("expert_policy") else "",
+    ]
+    return _safe_label("-".join(part for part in parts if part))
+
+
+def _write_grouped_combined(runs: list[RunRecord], out_dir: Path, clean: bool, y_limit_gib: float) -> None:
+    groups: dict[str, list[RunRecord]] = {}
+    for run in runs:
+        groups.setdefault(_group_label(run), []).append(run)
+    for label, group_runs in sorted(groups.items()):
+        _write_combined(group_runs, out_dir / label, clean, y_limit_gib, write_groups=False)
+
+
+def _write_combined(
+    runs: list[RunRecord],
+    out_dir: Path,
+    clean: bool,
+    y_limit_gib: float,
+    *,
+    write_groups: bool = True,
+) -> None:
     _prepare_output(out_dir, clean)
     all_rows: list[dict[str, Any]] = []
+    actual_rows: list[dict[str, Any]] = []
+    phase_rows: list[dict[str, Any]] = []
     index_rows: list[dict[str, Any]] = []
     for run in runs:
         all_rows.extend(_summary_csv_rows(run))
+        actual_rows.extend(_actual_peak_csv_rows(run))
+        phase_rows.extend(_phase_csv_rows(run))
         index_rows.append(
             {
                 **run.metadata,
@@ -763,17 +1468,32 @@ def _write_combined(runs: list[RunRecord], out_dir: Path, clean: bool, y_limit_g
                 "selected_metric": run.summary.get("selected_metric", ""),
                 "peak_allocated_hbm_bytes": int(run.summary.get("peak_allocated_hbm_bytes", 0) or 0),
                 "peak_reserved_hbm_bytes": int(run.summary.get("peak_reserved_hbm_bytes", 0) or 0),
+                "actual_peak_step": run.summary.get("actual_peak_step", ""),
+                "actual_peak_phase": run.summary.get("actual_peak_phase", ""),
+                "actual_peak_allocated_hbm_bytes": int(run.summary.get("actual_peak_allocated_hbm_bytes", 0) or 0),
+                "actual_peak_reserved_hbm_bytes": int(run.summary.get("actual_peak_reserved_hbm_bytes", 0) or 0),
                 "reserved_unallocated_bytes": int(run.summary.get("reserved_unallocated_bytes", 0) or 0),
                 "external_cuda_or_driver_bytes": int(run.summary.get("external_cuda_or_driver_bytes", 0) or 0),
                 "allocated_stack_sum_bytes": int(run.summary.get("allocated_stack_sum_bytes", 0) or 0),
                 "reserved_stack_sum_bytes": int(run.summary.get("reserved_stack_sum_bytes", 0) or 0),
+                "activation_hbm_bytes_at_peak": int(run.summary.get("activation_hbm_bytes_at_peak", 0) or 0),
+                "temporary_workspace_hbm_bytes_at_peak": int(
+                    run.summary.get("temporary_workspace_hbm_bytes_at_peak", 0) or 0
+                ),
+                "unattributed_allocated_peak_bytes": int(run.summary.get("unattributed_allocated_peak_bytes", 0) or 0),
             }
         )
     _write_csv(out_dir / "combined_memory_breakdown.csv", all_rows)
+    _write_csv(out_dir / "combined_memory_actual_peak_breakdown.csv", actual_rows)
+    _write_csv(out_dir / "combined_memory_breakdown_by_phase.csv", phase_rows)
     _write_csv(out_dir / "memory_breakdown_index.csv", index_rows)
     (out_dir / "memory_breakdown_index.json").write_text(json.dumps(index_rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _plot_combined_peak(runs, out_dir, y_limit_gib)
+    _plot_combined_peak(runs, out_dir, y_limit_gib, actual=True)
     _plot_combined_steps(runs, out_dir, y_limit_gib)
+    _plot_combined_phases(runs, out_dir, _phase_ylim_gib(runs))
+    if write_groups:
+        _write_grouped_combined(runs, out_dir, clean, y_limit_gib)
 
 
 def main() -> None:

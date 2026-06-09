@@ -57,9 +57,19 @@ BREAKDOWN_FIELDS = {
     "peak_allocated_hbm_bytes",
     "peak_reserved_hbm_bytes",
     "reserved_unallocated_bytes",
+    "actual_peak_allocated_hbm_bytes",
+    "actual_peak_reserved_hbm_bytes",
+    "actual_peak_reserved_unallocated_bytes",
+    "actual_peak_allocated_stack_sum_bytes",
+    "actual_peak_reserved_stack_sum_bytes",
+    "actual_peak_allocated_closure_error_bytes",
+    "actual_peak_reserved_closure_error_bytes",
     "allocated_stack_sum_bytes",
     "reserved_stack_sum_bytes",
     "saved_activation_hbm_bytes_at_peak",
+    "live_activation_hbm_bytes_at_peak",
+    "activation_hbm_bytes_at_peak",
+    "temporary_workspace_hbm_bytes_at_peak",
     "unattributed_allocated_peak_bytes",
     "allocated_bytes",
     "reserved_bytes",
@@ -247,11 +257,23 @@ def validate_breakdown(summary: dict[str, Any]) -> list[str]:
     missing = _missing(summary, BREAKDOWN_FIELDS)
     if missing:
         errors.append(f"memory_breakdown_summary: missing {', '.join(missing)}")
-        return errors
     if int(summary.get("schema_version") or 0) != 2:
         errors.append("memory_breakdown_summary: schema_version must be 2")
     if summary.get("selected_metric") != "peak_allocated_hbm_bytes":
         errors.append("memory_breakdown_summary: selected_metric must be peak_allocated_hbm_bytes")
+    rows = summary.get("breakdown_rows")
+    if isinstance(rows, list):
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            if row.get("group") == "activations":
+                errors.append(f"memory_breakdown_summary.breakdown_rows[{index}]: old activations group is not allowed")
+            if row.get("component") == "framework_temp_workspace":
+                errors.append(
+                    f"memory_breakdown_summary.breakdown_rows[{index}]: old framework_temp_workspace component is not allowed"
+                )
+    if missing:
+        return errors
     errors.extend(
         _validate_gap(
             summary,
@@ -261,17 +283,18 @@ def validate_breakdown(summary: dict[str, Any]) -> list[str]:
             "reserved_unallocated_bytes",
         )
     )
-    rows = summary.get("breakdown_rows")
+    errors.extend(
+        _validate_gap(
+            summary,
+            "memory_breakdown_summary.actual_peak",
+            "actual_peak_allocated_hbm_bytes",
+            "actual_peak_reserved_hbm_bytes",
+            "actual_peak_reserved_unallocated_bytes",
+        )
+    )
     if not isinstance(rows, list) or not rows:
         errors.append("memory_breakdown_summary.breakdown_rows: missing or empty")
         return errors
-    for index, row in enumerate(rows):
-        if not isinstance(row, dict):
-            continue
-        if row.get("group") == "activations":
-            errors.append(f"memory_breakdown_summary.breakdown_rows[{index}]: old activations group is not allowed")
-        if row.get("component") == "framework_temp_workspace":
-            errors.append(f"memory_breakdown_summary.breakdown_rows[{index}]: old framework_temp_workspace component is not allowed")
     allocator_rows = [
         row
         for row in rows
@@ -291,6 +314,29 @@ def validate_breakdown(summary: dict[str, Any]) -> list[str]:
         if isinstance(row, dict)
         and row.get("memory_space") == "GPU HBM"
         and row.get("group") == "saved_activations"
+        and row.get("kind") == "saved_activation"
+    )
+    live_activation_sum = sum(
+        int(row.get("bytes", 0) or 0)
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("memory_space") == "GPU HBM"
+        and row.get("group") == "saved_activations"
+        and row.get("kind") == "live_activation"
+    )
+    activation_sum = sum(
+        int(row.get("bytes", 0) or 0)
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("memory_space") == "GPU HBM"
+        and row.get("group") == "saved_activations"
+    )
+    temporary_workspace_sum = sum(
+        int(row.get("bytes", 0) or 0)
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("memory_space") == "GPU HBM"
+        and row.get("group") == "temporary_workspace"
     )
     unattributed_sum = sum(
         int(row.get("bytes", 0) or 0)
@@ -313,7 +359,13 @@ def validate_breakdown(summary: dict[str, Any]) -> list[str]:
     if allocated_sum + reserved_gap_sum != int(summary.get("reserved_stack_sum_bytes", -1)):
         errors.append("memory_breakdown_summary: reserved_stack_sum_bytes does not match GPU HBM rows plus allocator gap")
     if saved_activation_sum != int(summary.get("saved_activation_hbm_bytes_at_peak", -1)):
-        errors.append("memory_breakdown_summary: saved_activation_hbm_bytes_at_peak does not match saved_activations rows")
+        errors.append("memory_breakdown_summary: saved_activation_hbm_bytes_at_peak does not match saved activation rows")
+    if live_activation_sum != int(summary.get("live_activation_hbm_bytes_at_peak", -1)):
+        errors.append("memory_breakdown_summary: live_activation_hbm_bytes_at_peak does not match live activation rows")
+    if activation_sum != int(summary.get("activation_hbm_bytes_at_peak", -1)):
+        errors.append("memory_breakdown_summary: activation_hbm_bytes_at_peak does not match activation rows")
+    if temporary_workspace_sum != int(summary.get("temporary_workspace_hbm_bytes_at_peak", -1)):
+        errors.append("memory_breakdown_summary: temporary_workspace_hbm_bytes_at_peak does not match temporary workspace rows")
     if unattributed_sum != int(summary.get("unattributed_allocated_peak_bytes", -1)):
         errors.append("memory_breakdown_summary: unattributed_allocated_peak_bytes does not match unattributed row")
     if "external_cuda_or_driver_bytes" in summary and external_sum != int(summary.get("external_cuda_or_driver_bytes") or 0):
@@ -326,6 +378,38 @@ def validate_breakdown(summary: dict[str, Any]) -> list[str]:
         errors.append("memory_breakdown_summary: allocated_closure_ok is not true")
     if bool(summary.get("reserved_closure_ok")) is not True:
         errors.append("memory_breakdown_summary: reserved_closure_ok is not true")
+
+    actual_rows = summary.get("actual_peak_breakdown_rows")
+    if not isinstance(actual_rows, list) or not actual_rows:
+        errors.append("memory_breakdown_summary.actual_peak_breakdown_rows: missing or empty")
+    else:
+        actual_allocator_rows = [
+            row
+            for row in actual_rows
+            if isinstance(row, dict) and row.get("component") == "allocator_reserved_unallocated"
+        ]
+        if not actual_allocator_rows:
+            errors.append("memory_breakdown_summary.actual_peak_breakdown_rows: missing allocator_reserved_unallocated row")
+        actual_allocated_sum = sum(
+            int(row.get("bytes", 0) or 0)
+            for row in actual_rows
+            if isinstance(row, dict) and row.get("memory_space") == "GPU HBM"
+        )
+        actual_reserved_gap_sum = sum(int(row.get("bytes", 0) or 0) for row in actual_allocator_rows)
+        actual_allocated_error = int(summary["actual_peak_allocated_hbm_bytes"]) - actual_allocated_sum
+        actual_reserved_error = (
+            int(summary["actual_peak_reserved_hbm_bytes"]) - actual_allocated_sum - actual_reserved_gap_sum
+        )
+        if actual_allocated_sum != int(summary.get("actual_peak_allocated_stack_sum_bytes", -1)):
+            errors.append("memory_breakdown_summary: actual_peak_allocated_stack_sum_bytes does not match actual rows")
+        if actual_allocated_sum + actual_reserved_gap_sum != int(
+            summary.get("actual_peak_reserved_stack_sum_bytes", -1)
+        ):
+            errors.append("memory_breakdown_summary: actual_peak_reserved_stack_sum_bytes does not match actual rows plus allocator gap")
+        if actual_allocated_error != int(summary.get("actual_peak_allocated_closure_error_bytes", 0)):
+            errors.append("memory_breakdown_summary: actual_peak_allocated_closure_error_bytes does not match actual rows")
+        if actual_reserved_error != int(summary.get("actual_peak_reserved_closure_error_bytes", 0)):
+            errors.append("memory_breakdown_summary: actual_peak_reserved_closure_error_bytes does not match actual rows")
     return errors
 
 

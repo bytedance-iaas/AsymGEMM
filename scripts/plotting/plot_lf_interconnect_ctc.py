@@ -27,6 +27,7 @@ SUMMARY_FIELDS = [
     "expert_policy",
     "seq_len",
     "precision",
+    "batch_size",
     "lora_dropout",
     "config",
     "metric",
@@ -52,6 +53,7 @@ STEP_FIELDS = [
     "expert_policy",
     "seq_len",
     "precision",
+    "batch_size",
     "lora_dropout",
     "config",
     "metric",
@@ -74,6 +76,7 @@ INDEX_FIELDS = [
     "expert_policy",
     "seq_len",
     "precision",
+    "batch_size",
     "lora_dropout",
     "config",
     "run_label",
@@ -229,6 +232,7 @@ def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, st
         "expert_policy": expert_policy,
         "seq_len": seq_len,
         "precision": str(config.get("precision") or ""),
+        "batch_size": str(config.get("batch_size") or ""),
         "lora_dropout": str(config.get("lora_dropout") if config.get("lora_dropout") is not None else ""),
         "config": config_root.name,
     }
@@ -528,7 +532,31 @@ def _write_empty_outputs(out_dir: Path, clean: bool, reason: str) -> None:
     _write_readme(out_dir, runs=[], reason=reason)
 
 
-def _write_outputs(runs: list[RunRecord], out_dir: Path, clean: bool) -> None:
+def _group_label(run: RunRecord) -> str:
+    metadata = run.metadata
+    parts = [
+        metadata.get("workload", ""),
+        f"b{metadata.get('batch_size', '')}" if metadata.get("batch_size") else "",
+        f"drop{metadata.get('lora_dropout', '').replace('.', '')}" if metadata.get("lora_dropout") else "",
+        metadata.get("precision", ""),
+        metadata.get("backend", ""),
+        metadata.get("profiler", ""),
+        f"router{metadata.get('router_mode', '')}" if metadata.get("router_mode") else "",
+        metadata.get("recompute", ""),
+        f"pol{metadata.get('expert_policy', '')}" if metadata.get("expert_policy") else "",
+    ]
+    return _safe_label("-".join(part for part in parts if part))
+
+
+def _write_grouped_outputs(runs: list[RunRecord], out_dir: Path, clean: bool) -> None:
+    groups: dict[str, list[RunRecord]] = {}
+    for run in runs:
+        groups.setdefault(_group_label(run), []).append(run)
+    for label, group_runs in sorted(groups.items()):
+        _write_outputs(group_runs, out_dir / label, clean, write_groups=False)
+
+
+def _write_outputs(runs: list[RunRecord], out_dir: Path, clean: bool, *, write_groups: bool = True) -> None:
     _prepare_output(out_dir, clean)
     summary_rows = _summary_rows(runs)
     step_rows = _step_rows(runs)
@@ -548,6 +576,8 @@ def _write_outputs(runs: list[RunRecord], out_dir: Path, clean: bool) -> None:
     _plot_by_step(runs, out_dir)
     _plot_peak_summary(runs, out_dir)
     _write_readme(out_dir, runs=runs)
+    if write_groups:
+        _write_grouped_outputs(runs, out_dir, clean)
 
 
 def main() -> None:
