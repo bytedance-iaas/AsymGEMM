@@ -344,7 +344,7 @@ sm90_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                 cutlass::arch::NamedBarrier::sync(kNumWGMMAStoreThreads, 0);
 
                 // warp_idx within warp-group for STSM offset computation
-                const uint32_t wg_local_warp_idx = warp_idx % 4;
+                const uint32_t wg_local_warp_idx = warp_idx;
 
                 if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
                     // Write back to shared memory using STSM
