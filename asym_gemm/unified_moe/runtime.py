@@ -232,11 +232,15 @@ class Layer:
         cpu_threads: int = 0,
         cuda_device: int = 0,
         m_cpu: int = 16,
+        runtime: Optional["_C.Runtime"] = None,
     ):
         self.slab = slab
         self.top_k = top_k
         self.cuda_device = cuda_device
-        self.rt = _C.Runtime(cpu_threads)
+        # A Runtime owns a worker pool of `cpu_threads - 1` OS threads, so
+        # callers constructing many Layers (e.g. one per model MoE layer)
+        # should build a single Runtime and pass it to every Layer.
+        self.rt = runtime if runtime is not None else _C.Runtime(cpu_threads)
         self.m_cpu = m_cpu
 
     # -----------------------------------------------------------
@@ -254,6 +258,7 @@ class Layer:
         cpu_threads: int = 0,
         cuda_device: int = 0,
         m_cpu: int = 16,
+        runtime: Optional["_C.Runtime"] = None,
     ) -> "Layer":
         assert gate.shape == up.shape
         G, N_inter, K_hidden = gate.shape
@@ -319,7 +324,7 @@ class Layer:
             gate_sfb=gate_sfb, up_sfb=up_sfb, down_sfb=down_sfb,
         )
         return cls(slab, top_k=top_k, cpu_threads=cpu_threads,
-                   cuda_device=cuda_device, m_cpu=m_cpu)
+                   cuda_device=cuda_device, m_cpu=m_cpu, runtime=runtime)
 
     def set_m_cpu(self, m_cpu: int) -> None:
         self.m_cpu = int(m_cpu)
