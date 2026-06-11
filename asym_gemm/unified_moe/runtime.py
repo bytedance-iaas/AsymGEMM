@@ -384,8 +384,8 @@ class Layer:
         Each expert's m_e is padded up to a multiple of block_m so the kernel's
         per-expert row range satisfies its alignment requirement.
         """
-        idx_list:  list[int] = []
-        slot_list: list[int] = []
+        idx_chunks:  list[np.ndarray] = []
+        slot_chunks: list[np.ndarray] = []
         offsets:   list[int] = []
         experts:   list[int] = []
         cur = 0
@@ -396,11 +396,12 @@ class Layer:
             if m_e == 0:
                 continue
             m_padded = ((m_e + block_m - 1) // block_m) * block_m
-            idx_list.extend(rows)
-            slot_list.extend(slots)
-            if m_padded > m_e:
-                idx_list.extend([-1] * (m_padded - m_e))
-                slot_list.extend([-1] * (m_padded - m_e))
+            idx = np.full(m_padded, -1, dtype=np.int64)
+            idx[:m_e] = rows
+            slt = np.full(m_padded, -1, dtype=np.int64)
+            slt[:m_e] = slots
+            idx_chunks.append(idx)
+            slot_chunks.append(slt)
             offsets.append(cur)
             offsets.append(cur + m_padded)
             experts.append(e)
@@ -415,8 +416,8 @@ class Layer:
 
         return (
             cur,
-            torch.tensor(idx_list,  dtype=torch.long, device=device),
-            torch.tensor(slot_list, dtype=torch.long, device=device),
+            torch.from_numpy(np.concatenate(idx_chunks)).to(device),
+            torch.from_numpy(np.concatenate(slot_chunks)).to(device),
             torch.tensor(offsets,   dtype=torch.int32, device=device),
             torch.tensor(experts,   dtype=torch.int32, device=device),
             len(experts),
@@ -513,21 +514,25 @@ class Layer:
         in_device = x_bf16.device
 
         # Per-expert token / slot lists (host-side dispatch decisions).
-        expert_ids_cpu = expert_ids.to("cpu").to(torch.int64)
-        per_expert:      list[list[int]] = [[] for _ in range(self.slab.num_experts)]
-        per_expert_slot: list[list[int]] = [[] for _ in range(self.slab.num_experts)]
-        ei = expert_ids_cpu.numpy()
-        for t in range(T):
-            for j in range(self.top_k):
-                e = int(ei[t, j])
-                per_expert[e].append(t)
-                per_expert_slot[e].append(j)
+        # Vectorized: one D2H of expert_ids, then numpy argsort/bincount —
+        # no Python loop over T*top_k routed tokens.
+        G = self.slab.num_experts
+        ei_np = expert_ids.reshape(-1).to("cpu", torch.int64).numpy()
+        order = np.argsort(ei_np, kind="stable")
+        counts = np.bincount(ei_np, minlength=G)
+        rows_sorted = order // self.top_k
+        slots_sorted = order % self.top_k
+        seg_end = np.cumsum(counts)
+        seg_start = seg_end - counts
+
+        per_expert = [rows_sorted[seg_start[e]:seg_end[e]] for e in range(G)]
+        per_expert_slot = [slots_sorted[seg_start[e]:seg_end[e]] for e in range(G)]
 
         cpu_experts, gpu_experts = [], []
-        for e, rows in enumerate(per_expert):
-            if not rows:
+        for e in range(G):
+            if counts[e] == 0:
                 continue
-            (cpu_experts if len(rows) <= self.m_cpu else gpu_experts).append(e)
+            (cpu_experts if counts[e] <= self.m_cpu else gpu_experts).append(e)
 
         out_fp32 = torch.zeros((T, H), dtype=torch.float32, device=in_device)
 
