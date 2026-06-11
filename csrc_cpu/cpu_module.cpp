@@ -11,9 +11,13 @@
  * on the Python boundary (auto-converting where safe; rejecting otherwise).
  * Arrays are required C-contiguous via py::array::c_style.
  */
+#include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
+#include <vector>
 
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -21,6 +25,11 @@
 
 #include "cpu_gemm/cpu_gemm.h"
 #include "cpu_gemm/cpu_gemm.hpp"
+
+// Internal cpu_gemm headers (vendored in this repo): the MoE batch entry
+// below fans per-expert work out over the runtime's worker pool directly.
+#include "runtime/runtime_impl.h"
+#include "runtime/worker_pool.h"
 
 namespace py = pybind11;
 
@@ -33,13 +42,30 @@ void check(cg_status_t s, const char* where) {
 
 struct RuntimeHandle {
   cg_runtime_t* rt = nullptr;
+  // One single-thread runtime per concurrent MoE work item. A 1-thread
+  // runtime executes cg_gemm fully inline (no pool wake) and owns its own
+  // scratch arena, so concurrent use from distinct pool workers is safe.
+  std::vector<std::unique_ptr<RuntimeHandle>> serial_rts;
+
   explicit RuntimeHandle(int n_threads) {
     rt = cg_runtime_create(n_threads);
     if (!rt) throw std::runtime_error("cg_runtime_create returned NULL");
   }
   ~RuntimeHandle() { if (rt) cg_runtime_destroy(rt); }
   int threads() const { return cg_runtime_threads(rt); }
+
+  void ensure_serial(size_t count) {
+    while (serial_rts.size() < count)
+      serial_rts.emplace_back(std::make_unique<RuntimeHandle>(1));
+  }
 };
+
+inline uint16_t fp32_to_bf16_rne(float v) {
+  uint32_t u;
+  std::memcpy(&u, &v, 4);
+  uint32_t rounding_bias = 0x7FFFu + ((u >> 16) & 1u);
+  return (uint16_t)((u + rounding_bias) >> 16);
+}
 
 py::dict caps_dict() {
   cg_caps_t c = cg_query_caps();
@@ -149,6 +175,118 @@ void gemm_bf16_int8_packed_py(
   check(cg_gemm(rt.rt, &d), "cg_gemm (BF16xINT8_PACKED)");
 }
 
+/*
+ * One MoE layer's whole CPU bucket in a single worker-pool job.
+ *
+ * For each expert e (work item): gate GEMM -> up GEMM -> SwiGLU (with the
+ * same fp32->bf16 round-trip the GPU bucket applies) -> down GEMM. Each item
+ * runs its GEMMs inline on a per-item 1-thread runtime, so the layer costs
+ * ONE parallel_for wake instead of (experts x 3 GEMMs x 3 stages).
+ *
+ * x_cat / out_cat are the per-expert token rows concatenated in expert order
+ * (offsets in m_offsets, [E+1]); *_packed are the per-expert AMX-packed
+ * weight buffers (pack_b_int8_amx layout).
+ */
+void moe_expert_forward_batch_py(
+    RuntimeHandle& rt,
+    py::array_t<uint16_t, py::array::c_style> x_cat,      // [sum_m, hidden] bf16 bits
+    py::array_t<int64_t,  py::array::c_style | py::array::forcecast> m_offsets,
+    py::list gate_packed,                                 // E x uint8[packed]
+    py::list up_packed,
+    py::list down_packed,
+    py::array_t<float, py::array::c_style> out_cat,       // [sum_m, hidden] fp32
+    size_t inter, size_t hidden) {
+  if (x_cat.ndim() != 2 || out_cat.ndim() != 2 || m_offsets.ndim() != 1)
+    throw std::invalid_argument("bad rank");
+  const ssize_t sum_m = x_cat.shape(0);
+  if ((size_t)x_cat.shape(1) != hidden) throw std::invalid_argument("x_cat k mismatch");
+  if (out_cat.shape(0) != sum_m || (size_t)out_cat.shape(1) != hidden)
+    throw std::invalid_argument("out_cat shape mismatch");
+  if (!out_cat.writeable()) throw std::invalid_argument("out_cat must be writeable");
+
+  const ssize_t E = m_offsets.shape(0) - 1;
+  if (E < 0 || (ssize_t)gate_packed.size() != E ||
+      (ssize_t)up_packed.size() != E || (ssize_t)down_packed.size() != E)
+    throw std::invalid_argument("expert list length mismatch");
+  if (E == 0) return;
+
+  const size_t gateup_bytes = cg_pack_b_int8_amx_size(inter, hidden);
+  const size_t down_bytes   = cg_pack_b_int8_amx_size(hidden, inter);
+
+  struct Item {
+    const uint16_t* x;
+    float*          out;
+    const void *gate, *up, *down;
+    ssize_t m;
+  };
+  std::vector<Item> items((size_t)E);
+
+  const int64_t* off = m_offsets.data();
+  const uint16_t* x_base = x_cat.data();
+  float* out_base = out_cat.mutable_data();
+
+  for (ssize_t e = 0; e < E; ++e) {
+    if (off[e] < 0 || off[e + 1] < off[e] || off[e + 1] > sum_m)
+      throw std::invalid_argument("m_offsets not monotone / out of range");
+    auto gp = py::cast<py::array_t<uint8_t, py::array::c_style>>(gate_packed[e]);
+    auto up = py::cast<py::array_t<uint8_t, py::array::c_style>>(up_packed[e]);
+    auto dp = py::cast<py::array_t<uint8_t, py::array::c_style>>(down_packed[e]);
+    if ((size_t)gp.shape(0) != gateup_bytes || (size_t)up.shape(0) != gateup_bytes ||
+        (size_t)dp.shape(0) != down_bytes)
+      throw std::invalid_argument("packed buffer size mismatch");
+    items[e] = Item{
+        x_base + off[e] * (ssize_t)hidden,
+        out_base + off[e] * (ssize_t)hidden,
+        gp.data(), up.data(), dp.data(),
+        off[e + 1] - off[e],
+    };
+  }
+
+  rt.ensure_serial((size_t)E);
+  std::atomic<int> first_err{-1};
+
+  {
+    py::gil_scoped_release rel;
+    rt.rt->pool->parallel_for((int)E, [&](int e) {
+      const Item& it = items[(size_t)e];
+      if (it.m == 0) return;
+      cg_runtime_t* srt = rt.serial_rts[(size_t)e]->rt;
+      const size_t mi = (size_t)it.m * inter;
+
+      std::vector<float>    c_gate(mi), c_up(mi);
+      std::vector<uint16_t> act(mi);
+
+      auto d = cpu_gemm::make_desc();
+      d.m = (size_t)it.m; d.k = hidden; d.n = inter;
+      d.alpha = 1.0f; d.beta = 0.0f;
+      d.a = it.x; d.lda = hidden; d.dtype_a = CG_BF16;
+      d.ldb = hidden; d.dtype_b = CG_INT8_PACKED_AMX; d.b_scales = nullptr;
+      d.ldc = inter; d.dtype_c = CG_F32;
+
+      d.b = it.gate; d.c = c_gate.data();
+      if (cg_gemm(srt, &d) != CG_OK) { first_err.store(e); return; }
+      d.b = it.up; d.c = c_up.data();
+      if (cg_gemm(srt, &d) != CG_OK) { first_err.store(e); return; }
+
+      for (size_t i = 0; i < mi; ++i) {
+        float g = c_gate[i];
+        float a = (g / (1.0f + std::exp(-g))) * c_up[i];
+        act[i] = fp32_to_bf16_rne(a);
+      }
+
+      d.m = (size_t)it.m; d.k = inter; d.n = hidden;
+      d.a = act.data(); d.lda = inter;
+      d.b = it.down; d.ldb = inter;
+      d.c = it.out; d.ldc = hidden;
+      if (cg_gemm(srt, &d) != CG_OK) { first_err.store(e); return; }
+    });
+  }
+
+  if (first_err.load() >= 0)
+    throw std::runtime_error("moe_expert_forward_batch: cg_gemm failed for expert item " +
+                             std::to_string(first_err.load()));
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_cpu_C, m) {
@@ -174,4 +312,9 @@ PYBIND11_MODULE(_cpu_C, m) {
         py::arg("rt"), py::arg("a_bf16"), py::arg("b_packed"),
         py::arg("c_fp32"), py::arg("n"), py::arg("k"),
         py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f);
+
+  m.def("moe_expert_forward_batch", &moe_expert_forward_batch_py,
+        py::arg("rt"), py::arg("x_cat"), py::arg("m_offsets"),
+        py::arg("gate_packed"), py::arg("up_packed"), py::arg("down_packed"),
+        py::arg("out_cat"), py::arg("inter"), py::arg("hidden"));
 }
