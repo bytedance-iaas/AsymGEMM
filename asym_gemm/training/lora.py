@@ -19,6 +19,7 @@ from .frozen_linear import (
     VALID_ASYM_PRECISIONS,
     _TORCH_GROUPED_MM as _FROZEN_TORCH_GROUPED_MM,
 )
+from .host_weight import HostWeight
 
 
 QWEN_TARGET_MODULES: dict[str, tuple[str, ...]] = {
@@ -224,6 +225,56 @@ class AsymLoRALinear(nn.Module):
         self.precision = precision
         self.lora_dropout = nn.Dropout(p=float(lora_dropout)) if float(lora_dropout) > 0.0 else nn.Identity()
         self._reset_lora(adapter_name, lora_generator, init_lora_weights=init_lora_weights)
+
+    @classmethod
+    def from_host_weight(
+        cls,
+        host_weight: HostWeight,
+        *,
+        bias: torch.Tensor | None = None,
+        rank: int,
+        alpha: float,
+        backend: str,
+        stats: AsymExecutionStats | None = None,
+        device: torch.device | None = None,
+        lora_generator: torch.Generator | None = None,
+        lora_dtype: torch.dtype | str | None = torch.bfloat16,
+        precision: str = "bf16",
+        adapter_name: str = "default",
+        init_lora_weights: Literal["asym", "peft"] = "asym",
+        lora_dropout: float = 0.0,
+    ) -> "AsymLoRALinear":
+        if rank <= 0:
+            raise ValueError(f"rank must be positive, got {rank}")
+        if not 0.0 <= float(lora_dropout) <= 1.0:
+            raise ValueError(f"lora_dropout must be in [0, 1], got {lora_dropout}")
+        precision = str(precision).lower()
+        if precision not in VALID_ASYM_PRECISIONS:
+            raise ValueError(f"unsupported precision={precision!r}; expected one of {VALID_ASYM_PRECISIONS}")
+        obj = cls.__new__(cls)
+        nn.Module.__init__(obj)
+        resolved_device = device if device is not None else torch.device("cpu")
+        resolved_lora_dtype = normalize_lora_dtype(lora_dtype)
+        obj.base_layer = AsymFrozenLinear.from_host_weight(
+            host_weight,
+            bias=bias,
+            backend=backend,
+            stats=stats,
+            precision=precision,
+        )
+        obj.lora_A = nn.ModuleDict(
+            {adapter_name: nn.Linear(host_weight.in_features, rank, bias=False, device=resolved_device, dtype=resolved_lora_dtype)}
+        )
+        obj.lora_B = nn.ModuleDict(
+            {adapter_name: nn.Linear(rank, host_weight.out_features, bias=False, device=resolved_device, dtype=resolved_lora_dtype)}
+        )
+        obj.active_adapter = adapter_name
+        obj.lora_dtype = resolved_lora_dtype
+        obj.scaling = float(alpha) / float(rank)
+        obj.precision = precision
+        obj.lora_dropout = nn.Dropout(p=float(lora_dropout)) if float(lora_dropout) > 0.0 else nn.Identity()
+        obj._reset_lora(adapter_name, lora_generator, init_lora_weights=init_lora_weights)
+        return obj
 
     @property
     def base(self) -> AsymFrozenLinear:

@@ -15,6 +15,16 @@ from .frozen_linear import (
     measure_gpu_weight_allocation,
 )
 from .host_weight import HostWeight, HostWeightMetadata, tensor_nbytes
+from .offload import (
+    AsymFrozenEmbedding,
+    AsymFrozenLayerNorm,
+    AsymFrozenRMSNorm,
+    OffloadResidencyRow,
+    adopt_host_weight,
+    collect_lf_offload_residency,
+    storage_key,
+    validate_lf_offload_residency,
+)
 from .lora import (
     AsymLoRALinear,
     GroupedLoRAMetadata,
@@ -62,13 +72,20 @@ from .moe import (
 from .qwen3_moe import (
     AsymQwen3Experts,
     AsymQwen3MoeBlock,
+    AsymQwen3Router,
     Qwen3ExpertReport,
     is_qwen3_experts,
     is_qwen3_moe_block,
     wrap_qwen3_experts,
     wrap_qwen3_moe_block,
 )
-from .llama4_moe import AsymLlama4Moe, Llama4MoeReport, is_llama4_moe, wrap_llama4_moe
+from .qwen35_moe import (
+    AsymQwen35MoeBlock,
+    Qwen35MoeReport,
+    is_qwen35_moe_block,
+    wrap_qwen35_moe_block,
+)
+from .llama4_moe import AsymLlama4Moe, AsymLlama4Router, Llama4MoeReport, is_llama4_moe, wrap_llama4_moe
 from .packed_moe import AsymPackedExperts, PackedExpertSource, PackedMoELayout, wrap_packed_experts
 
 FrozenLinear = AsymFrozenLinear
@@ -83,14 +100,20 @@ __all__ = [
     "AsymExecutionStats",
     "AsymFrozenLinear",
     "AsymFrozenLinearFunction",
+    "AsymFrozenEmbedding",
+    "AsymFrozenLayerNorm",
+    "AsymFrozenRMSNorm",
     "AsymGroupedFrozenLinear",
     "AsymGroupedFrozenLinearFunction",
     "AsymLoRALinear",
     "AsymMLP",
     "AsymLlama4Moe",
+    "AsymLlama4Router",
     "AsymPackedExperts",
     "AsymQwen3Experts",
     "AsymQwen3MoeBlock",
+    "AsymQwen3Router",
+    "AsymQwen35MoeBlock",
     "FrozenLinear",
     "GroupedLoRAMetadata",
     "HostWeight",
@@ -107,20 +130,24 @@ __all__ = [
     "MoEConfig",
     "MoE",
     "MoEModel",
+    "OffloadResidencyRow",
     "PackedExpertLoRA",
     "PackedExpertSource",
     "PackedMoELayout",
     "Qwen3ExpertReport",
+    "Qwen35MoeReport",
     "TorchLoRALinear",
     "TorchMLP",
     "VALID_ASYM_PRECISIONS",
     "VALID_BACKENDS",
     "VALID_MOE_BACKENDS",
     "add_asym_lora",
+    "adopt_host_weight",
     "asym_frozen_linear",
     "asym_grouped_frozen_linear",
     "can_use_direct_bf16",
     "copy_lora",
+    "collect_lf_offload_residency",
     "direct_asym_capability",
     "estimate_dense_llm_parameters",
     "estimate_moe_parameters",
@@ -132,6 +159,7 @@ __all__ = [
     "grouped_expert_lora_pair",
     "is_qwen3_experts",
     "is_qwen3_moe_block",
+    "is_qwen35_moe_block",
     "is_llama4_moe",
     "load_lora_state_dict",
     "load_peft_adapter",
@@ -147,10 +175,13 @@ __all__ = [
     "run_moe_case",
     "run_moe_memory_comparison",
     "save_peft_adapter",
+    "storage_key",
     "prepare_grouped_lora_metadata",
     "tensor_nbytes",
+    "validate_lf_offload_residency",
     "wrap_qwen3_experts",
     "wrap_qwen3_moe_block",
+    "wrap_qwen35_moe_block",
     "wrap_llama4_moe",
     "wrap_packed_experts",
 ]

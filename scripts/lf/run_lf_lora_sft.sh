@@ -13,19 +13,24 @@ fi
 # =============================================================================
 
 # Paths and tools
-ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
-LF_DIR=${LF_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/LlamaFactory}
-KT_KERNEL_DIR=${KT_KERNEL_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/ktransformers/kt-kernel}
-DEEPSPEED_DIR=${DEEPSPEED_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/deepspeed}
+SFT_ROOT=${SFT_ROOT:-/home/kevinni/AsymGEMM-SFT}
+ROOT=${ROOT:-${SFT_ROOT}/third_party/AsymGEMM}
+LF_DIR=${LF_DIR:-${SFT_ROOT}/third_party/LlamaFactory}
+KT_KERNEL_DIR=${KT_KERNEL_DIR:-${SFT_ROOT}/third_party/ktransformers/kt-kernel}
+DEEPSPEED_DIR=${DEEPSPEED_DIR:-${SFT_ROOT}/third_party/deepspeed}
 CONDA_EXE=${CONDA_EXE:-conda}
 NSYS_BIN=${NSYS_BIN:-nsys}
 DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun} # torchrun | accelerate | deepspeed
 
 # Workload and placement
 MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-Qwen/Qwen3-30B-A3B}
-BACKEND=${BACKEND:-asym}              # torch | zero2 | zero3 | zero3_offload | superoffload | asym_torch | asym | kt_torchbf16 | kt_armbf16
+BACKEND=${BACKEND:-asym}              # torch | zero2 | zero3 | zero3_offload | zero3_offload_mem | superoffload | asym_torch | asym | kt_torchbf16 | kt_armbf16
 GPU_ID=${GPU_ID:-0}
 NUM_GPUS=${NUM_GPUS:-1}
+NUMACTL_ENABLE=${NUMACTL_ENABLE:-1}
+NUMACTL_BIN=${NUMACTL_BIN:-numactl}
+NUMACTL_MEMBIND=${NUMACTL_MEMBIND:-0,1}
+NUMACTL_CPUNODEBIND=${NUMACTL_CPUNODEBIND:-0,1}
 REQUIRE_SM100=${REQUIRE_SM100:-1}
 
 # Dataset
@@ -44,6 +49,9 @@ LORA_ALPHA=${LORA_ALPHA:-16}
 LORA_DROPOUT=${LORA_DROPOUT:-0.0}
 SEED=${SEED:-42}
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
+MAX_GRAD_NORM=${MAX_GRAD_NORM:-}
+PREPROCESSING_NUM_WORKERS=${PREPROCESSING_NUM_WORKERS:-}
+DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-}
 
 # AsymGEMM
 ASYM_PRECISION=${ASYM_PRECISION:-bf16}
@@ -52,6 +60,7 @@ ASYM_EXPERT_RECOMPUTE_POLICY=${ASYM_EXPERT_RECOMPUTE_POLICY:-none}
 ASYM_ROUTER_MODE=${ASYM_ROUTER_MODE:-whole}
 ASYM_STRICT=${ASYM_STRICT:-true}
 CHECK_ASYM_CALLS=${CHECK_ASYM_CALLS:-1}
+CHECK_TRAINABLE_SURFACE=${CHECK_TRAINABLE_SURFACE:-1}
 
 # KT
 KT_PRECISION=${KT_PRECISION:-${ASYM_PRECISION}}
@@ -67,10 +76,23 @@ KT_EXPERT_CHECKPOINT_PATH=${KT_EXPERT_CHECKPOINT_PATH:-}
 KT_USE_LORA_EXPERTS=${KT_USE_LORA_EXPERTS:-}
 KT_LORA_EXPERT_NUM=${KT_LORA_EXPERT_NUM:-}
 KT_LORA_EXPERT_INTERMEDIATE_SIZE=${KT_LORA_EXPERT_INTERMEDIATE_SIZE:-}
+KT_REQUIRE_STARTUP=${KT_REQUIRE_STARTUP:-}
+KT_REQUIRE_FUSED_LORA_STARTUP=${KT_REQUIRE_FUSED_LORA_STARTUP:-}
 KT_TORCHBF16_SFT_DEVICE=${KT_TORCHBF16_SFT_DEVICE:-cuda}
 KT_ARM_OMP_NUM_THREADS=${KT_ARM_OMP_NUM_THREADS:-64}
 KT_ARM_OMP_PROC_BIND=${KT_ARM_OMP_PROC_BIND:-close}
 KT_ARM_OMP_PLACES=${KT_ARM_OMP_PLACES:-cores}
+KT_SFT_PROGRESS=${KT_SFT_PROGRESS:-}
+KT_ARM_SFT_PROFILE=${KT_ARM_SFT_PROFILE:-}
+KT_ARM_SFT_POOL_LOG=${KT_ARM_SFT_POOL_LOG:-}
+KT_ARM_SFT_TOP_K=${KT_ARM_SFT_TOP_K:-8}
+KT_ARM_SFT_MAX_ROUTE_RANK_WORK=${KT_ARM_SFT_MAX_ROUTE_RANK_WORK:-}
+KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK=${KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK:-1048576}
+KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK=${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK:-0}
+KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK=${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK:-0}
+KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK=${KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK:-0}
+KT_ARM_SOURCE_OK_PROFILE_JSON=${KT_ARM_SOURCE_OK_PROFILE_JSON:-}
+KT_ARM_FIRST_STEP_TIMEOUT_SECONDS=${KT_ARM_FIRST_STEP_TIMEOUT_SECONDS:-0}
 
 # SuperOffload
 CHECK_SUPEROFFLOAD=${CHECK_SUPEROFFLOAD:-1}
@@ -99,6 +121,8 @@ PROFILE_NSYS_CAPTURE_RANGE=${PROFILE_NSYS_CAPTURE_RANGE:-cudaProfilerApi} # cuda
 PROFILE_NSYS_GPU_METRICS_DEVICES=${PROFILE_NSYS_GPU_METRICS_DEVICES:-${GPU_ID}}
 PROFILE_JSON=${PROFILE_JSON:-}
 PROFILE_SUMMARY_MD=${PROFILE_SUMMARY_MD:-}
+PROFILE_HEARTBEAT_JSON=${PROFILE_HEARTBEAT_JSON:-}
+PROFILE_PARTIAL_INTERVAL_SECONDS=${PROFILE_PARTIAL_INTERVAL_SECONDS:-5}
 PROFILE_OUTPUT_DIR=${PROFILE_OUTPUT_DIR:-}
 PROFILE_WORKLOAD_LABEL=${PROFILE_WORKLOAD_LABEL:-}
 PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-}
@@ -110,7 +134,14 @@ INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
 # =============================================================================
 ASYM_DIR=${ASYM_DIR:-${ROOT}}
 KT_TOOLS_DIR=${KT_TOOLS_DIR:-${ASYM_DIR}}
-ENV_DIR=${ENV_DIR:-${LF_DIR}/.venv}
+KT_REPO_DIR=${KT_REPO_DIR:-$(dirname "${KT_KERNEL_DIR}")}
+KT_GGUF_PY_DIR=${KT_GGUF_PY_DIR:-${KT_REPO_DIR}/third_party/llama.cpp/gguf-py}
+KT_GGUF_PYTHONPATH_ENTRY=""
+if [[ -f "${KT_GGUF_PY_DIR}/gguf/gguf_reader.py" ]]; then
+  KT_GGUF_PYTHONPATH_ENTRY="${KT_GGUF_PY_DIR}:"
+fi
+KT_RUN_PYTHONPATH="${KT_TOOLS_DIR}:${ASYM_DIR}:${KT_KERNEL_DIR}:${KT_GGUF_PYTHONPATH_ENTRY}${LF_DIR}/src:${PYTHONPATH:-}"
+ENV_DIR=${ENV_DIR:-${ASYM_DIR}/.venv}
 ENV_PYTHON=${ENV_PYTHON:-${ENV_DIR}/bin/python}
 LF_CLI_BIN=${LF_CLI_BIN:-${ENV_DIR}/bin/llamafactory-cli}
 TORCHRUN_BIN=${TORCHRUN_BIN:-${ENV_DIR}/bin/torchrun}
@@ -130,6 +161,7 @@ zero_deepspeed_config() {
     zero2) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z2_config.json" ;;
     zero3) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_config.json" ;;
     zero3_offload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json" ;;
+    zero3_offload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_config.json" ;;
     superoffload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_config.json" ;;
     *) return 1 ;;
   esac
@@ -158,6 +190,12 @@ case "${BACKEND,,}" in
     BACKEND=torch
     TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero3_offload)"
     ;;
+  zero3_offload_mem)
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-zero3_offload_mem}
+    ZERO_BACKEND_LABEL=zero3_offload_mem
+    BACKEND=torch
+    TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero3_offload_mem)"
+    ;;
   superoffload)
     PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-superoffload}
     ZERO_BACKEND_LABEL=superoffload
@@ -174,7 +212,7 @@ case "${BACKEND,,}" in
     BACKEND=kt_armbf16
     KT_BACKEND_INTERNAL=ARMBF16
     ;;
-  *) echo "BACKEND must be one of: torch, zero2, zero3, zero3_offload, superoffload, asym_torch, asym, kt_torchbf16, kt_armbf16; got '${BACKEND}'" >&2; exit 2 ;;
+  *) echo "BACKEND must be one of: torch, zero2, zero3, zero3_offload, zero3_offload_mem, superoffload, asym_torch, asym, kt_torchbf16, kt_armbf16; got '${BACKEND}'" >&2; exit 2 ;;
 esac
 
 case "${DIST_LAUNCHER,,}" in
@@ -191,6 +229,33 @@ fi
 if [[ "${BACKEND}" == kt_* && "${NUM_GPUS}" != "1" ]]; then
   echo "KT SFT profiling is single-process/single-GPU for this script; got NUM_GPUS=${NUM_GPUS}" >&2
   exit 2
+fi
+
+if [[ "${BACKEND}" == "kt_armbf16" && -z "${KT_NUM_THREADS}" ]]; then
+  KT_NUM_THREADS="${KT_ARM_OMP_NUM_THREADS}"
+fi
+
+if [[ -z "${PREPROCESSING_NUM_WORKERS}" ]]; then
+  if [[ "${BACKEND}" == "kt_armbf16" ]]; then
+    PREPROCESSING_NUM_WORKERS=1
+  else
+    PREPROCESSING_NUM_WORKERS=4
+  fi
+fi
+if [[ -z "${DATALOADER_NUM_WORKERS}" ]]; then
+  if [[ "${BACKEND}" == "kt_armbf16" ]]; then
+    DATALOADER_NUM_WORKERS=0
+  else
+    DATALOADER_NUM_WORKERS=2
+  fi
+fi
+if [[ "${BACKEND}" == "kt_armbf16" && -z "${MAX_GRAD_NORM}" ]]; then
+  MAX_GRAD_NORM=0
+fi
+if [[ "${BACKEND}" == "kt_armbf16" && "${PROFILE}" == "1" ]]; then
+  KT_SFT_PROGRESS=${KT_SFT_PROGRESS:-1}
+  KT_ARM_SFT_PROFILE=${KT_ARM_SFT_PROFILE:-1}
+  KT_ARM_SFT_POOL_LOG=${KT_ARM_SFT_POOL_LOG:-1}
 fi
 
 if [[ ! "${NUM_GPUS}" =~ ^[1-9][0-9]*$ ]]; then
@@ -231,6 +296,9 @@ if [[ "${BACKEND}" == kt_* ]]; then
   OUT_DIR=${OUT_DIR:-${LF_DIR}/saves/kt_smoke/${RUN_ID}}
 else
   OUT_DIR=${OUT_DIR:-${LF_DIR}/saves/asymgemm_smoke/${RUN_ID}}
+fi
+if [[ "${BACKEND}" == kt_* && -z "${TRITON_CACHE_DIR:-}" ]]; then
+  TRITON_CACHE_DIR="${TMPDIR:-/tmp}/asymgemm_triton_cache/${RUN_ID}"
 fi
 LOG_FILE=${LOG_FILE:-${OUT_DIR}/train_${RUN_ID}.log}
 DATASET_FILE="${LF_DIR}/data/${DATASET}.jsonl"
@@ -357,6 +425,66 @@ PROFILE_MEMORY_BREAKDOWN="$(profile_memory_flag PROFILE_MEMORY_BREAKDOWN "${PROF
 PROFILE_MEMORY_SNAPSHOT="$(profile_memory_flag PROFILE_MEMORY_SNAPSHOT "${PROFILE_MEMORY_SNAPSHOT}" "${PROFILE_PROFILER}")"
 PROFILE_EXTERNAL_MEMORY="$(profile_memory_flag PROFILE_EXTERNAL_MEMORY "${PROFILE_EXTERNAL_MEMORY}" "${PROFILE_PROFILER}")"
 
+validate_kt_arm_source_ok_profile() {
+  local profile_json="$1"
+  [[ -f "${profile_json}" ]] || {
+    echo "KT_ARM_SOURCE_OK_PROFILE_JSON does not exist: ${profile_json}" >&2
+    return 1
+  }
+  python3 - "${profile_json}" "${MODEL_NAME_OR_PATH}" "${CUTOFF_LEN}" <<'PY'
+import json
+import sys
+
+profile_path, expected_model, expected_seq = sys.argv[1:4]
+profile = json.load(open(profile_path, encoding="utf-8"))
+source_profile = profile.get("source_profile", {})
+source_profile = source_profile if isinstance(source_profile, dict) and source_profile else profile
+if profile.get("partial") is True or source_profile.get("partial") is True:
+    raise SystemExit("source-ok profile is partial")
+heartbeat = source_profile.get("heartbeat", {})
+latest = heartbeat.get("latest", {}) if isinstance(heartbeat, dict) else {}
+stage = latest.get("stage") if isinstance(latest, dict) else None
+if stage is not None and stage not in {"source_profile_written", "trainer_end", "kt_lora_pointer_refresh_end"}:
+    raise SystemExit(f"source-ok profile heartbeat is incomplete: {stage}")
+config = source_profile.get("config", {})
+if not isinstance(config, dict):
+    raise SystemExit("source-ok profile missing config")
+if str(config.get("backend") or "") != "kt_armbf16":
+    raise SystemExit("source-ok profile backend is not kt_armbf16")
+if str(config.get("model_name_or_path") or "") != expected_model:
+    raise SystemExit("source-ok profile model does not match this run")
+try:
+    if int(config.get("seq_len")) != int(expected_seq):
+        raise SystemExit("source-ok profile seq_len does not match this run")
+except (TypeError, ValueError):
+    raise SystemExit("source-ok profile seq_len missing or invalid")
+lora_target = str(config.get("lora_target") or "").lower()
+if lora_target not in {"all", "all-linear", "all_linear"}:
+    raise SystemExit("source-ok profile lora_target is not all")
+kt = source_profile.get("kt", {})
+if not isinstance(kt, dict):
+    raise SystemExit("source-ok profile missing kt counters")
+def int_value(container, key):
+    try:
+        return int(container.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+if int_value(kt, "wrapper_count") <= 0:
+    raise SystemExit("source-ok profile has no KT wrappers")
+if int_value(kt, "total_forward_calls") <= 0 or int_value(kt, "total_backward_calls") <= 0:
+    raise SystemExit("source-ok profile has no completed KT forward/backward step")
+lora = source_profile.get("lora", {})
+fused_lora_params = int_value(lora, "kt_fused_expert_lora_parameters") if isinstance(lora, dict) else 0
+if "qwen3" in expected_model.lower() and fused_lora_params <= 0:
+    raise SystemExit("source-ok Qwen3 profile has no captured fused expert LoRA params")
+if fused_lora_params > 0:
+    optimizer_memory = source_profile.get("optimizer_memory", {})
+    health = optimizer_memory.get("kt_lora_update_health", {}) if isinstance(optimizer_memory, dict) else {}
+    if not isinstance(health, dict) or health.get("available") is not True or health.get("passed") is not True:
+        raise SystemExit("source-ok profile missing passed KT fused LoRA update health")
+PY
+}
+
 case "${ASYM_ROUTER_MODE,,}" in
   hf) ASYM_ROUTER_MODE=hf ;;
   whole) ASYM_ROUTER_MODE=whole ;;
@@ -374,7 +502,22 @@ case "${PROFILE_SYNC}" in
 esac
 CHECK_SUPEROFFLOAD="$(bool_01 CHECK_SUPEROFFLOAD "${CHECK_SUPEROFFLOAD}")"
 if [[ "${BACKEND}" == kt_* ]]; then
+  if [[ "${BACKEND}" == "kt_armbf16" ]]; then
+    [[ -n "${KT_REQUIRE_STARTUP}" ]] || KT_REQUIRE_STARTUP=1
+    if [[ -z "${KT_REQUIRE_FUSED_LORA_STARTUP}" ]]; then
+      if [[ "${MODEL_NAME_OR_PATH,,}" == *"qwen3"* ]]; then
+        KT_REQUIRE_FUSED_LORA_STARTUP=1
+      else
+        KT_REQUIRE_FUSED_LORA_STARTUP=0
+      fi
+    fi
+  else
+    [[ -n "${KT_REQUIRE_STARTUP}" ]] || KT_REQUIRE_STARTUP=0
+    [[ -n "${KT_REQUIRE_FUSED_LORA_STARTUP}" ]] || KT_REQUIRE_FUSED_LORA_STARTUP=0
+  fi
   CHECK_KT_CALLS="$(bool_01 CHECK_KT_CALLS "${CHECK_KT_CALLS}")"
+  KT_REQUIRE_STARTUP="$(bool_01 KT_REQUIRE_STARTUP "${KT_REQUIRE_STARTUP}")"
+  KT_REQUIRE_FUSED_LORA_STARTUP="$(bool_01 KT_REQUIRE_FUSED_LORA_STARTUP "${KT_REQUIRE_FUSED_LORA_STARTUP}")"
   KT_TP_ENABLED="$(bool_string KT_TP_ENABLED "${KT_TP_ENABLED}")"
   KT_SHARE_BACKWARD_BB="$(optional_bool_string KT_SHARE_BACKWARD_BB "${KT_SHARE_BACKWARD_BB}")"
   KT_USE_LORA_EXPERTS="$(optional_bool_string KT_USE_LORA_EXPERTS "${KT_USE_LORA_EXPERTS}")"
@@ -382,11 +525,93 @@ if [[ "${BACKEND}" == kt_* ]]; then
   [[ -z "${KT_THREADPOOL_COUNT}" ]] || positive_int_value KT_THREADPOOL_COUNT "${KT_THREADPOOL_COUNT}"
   positive_int_value KT_MAX_CACHE_DEPTH "${KT_MAX_CACHE_DEPTH}"
   positive_int_value KT_ARM_OMP_NUM_THREADS "${KT_ARM_OMP_NUM_THREADS}"
+  positive_int_value KT_ARM_SFT_TOP_K "${KT_ARM_SFT_TOP_K}"
+  positive_int_value KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK "${KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK}"
+  [[ -z "${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}" ]] || positive_int_value KT_ARM_SFT_MAX_ROUTE_RANK_WORK "${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}"
+  nonnegative_int_value KT_ARM_FIRST_STEP_TIMEOUT_SECONDS "${KT_ARM_FIRST_STEP_TIMEOUT_SECONDS}"
+  KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK="$(bool_01 KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK "${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK}")"
+  KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK="$(bool_01 KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK "${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}")"
+  KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK="$(bool_01 KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK "${KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK}")"
   [[ -z "${KT_NUM_GPU_EXPERTS}" ]] || nonnegative_int_value KT_NUM_GPU_EXPERTS "${KT_NUM_GPU_EXPERTS}"
   [[ -z "${KT_LORA_EXPERT_NUM}" ]] || positive_int_value KT_LORA_EXPERT_NUM "${KT_LORA_EXPERT_NUM}"
   [[ -z "${KT_LORA_EXPERT_INTERMEDIATE_SIZE}" ]] || positive_int_value KT_LORA_EXPERT_INTERMEDIATE_SIZE "${KT_LORA_EXPERT_INTERMEDIATE_SIZE}"
+  if [[ "${BACKEND}" == "kt_armbf16" ]]; then
+    if [[ "${KT_TP_ENABLED}" != "false" ]]; then
+      echo "BACKEND=kt_armbf16 does not support KT_TP_ENABLED=true" >&2
+      exit 2
+    fi
+    if [[ -n "${KT_THREADPOOL_COUNT}" && "${KT_THREADPOOL_COUNT}" != "1" ]]; then
+      echo "BACKEND=kt_armbf16 requires KT_THREADPOOL_COUNT empty or 1, got ${KT_THREADPOOL_COUNT}" >&2
+      exit 2
+    fi
+    if [[ -n "${KT_NUM_GPU_EXPERTS}" && "${KT_NUM_GPU_EXPERTS}" != "0" ]]; then
+      echo "BACKEND=kt_armbf16 does not support GPU experts; set KT_NUM_GPU_EXPERTS=0 or leave it empty" >&2
+      exit 2
+    fi
+    if [[ "${GRADIENT_ACCUMULATION_STEPS}" != "1" ]]; then
+      echo "BACKEND=kt_armbf16 requires GRADIENT_ACCUMULATION_STEPS=1 until native expert-LoRA gradient accumulation is fixed" >&2
+      exit 2
+    fi
+    if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "nsys" ]]; then
+      if [[ -n "${KT_ARM_SOURCE_OK_PROFILE_JSON}" ]]; then
+        if ! validate_kt_arm_source_ok_profile "${KT_ARM_SOURCE_OK_PROFILE_JSON}"; then
+          echo "BACKEND=kt_armbf16 PROFILE_PROFILER=nsys requires a matching completed source profile" >&2
+          exit 2
+        fi
+      elif [[ "${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}" != "1" || "${KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK}" != "1" ]]; then
+        echo "BACKEND=kt_armbf16 requires PROFILE_PROFILER=source before nsys; set KT_ARM_SOURCE_OK_PROFILE_JSON to a completed same-shape source profile, or set both KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK=1 and KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK=1 only for raw validation." >&2
+        exit 2
+      fi
+    fi
+  fi
 else
   CHECK_KT_CALLS=0
+fi
+
+nonnegative_int_value PREPROCESSING_NUM_WORKERS "${PREPROCESSING_NUM_WORKERS}"
+nonnegative_int_value DATALOADER_NUM_WORKERS "${DATALOADER_NUM_WORKERS}"
+if [[ -n "${MAX_GRAD_NORM}" ]]; then
+  python3 - "${MAX_GRAD_NORM}" <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except ValueError as exc:
+    raise SystemExit(f"MAX_GRAD_NORM must be a non-negative float, got {sys.argv[1]!r}") from exc
+if not math.isfinite(value) or value < 0:
+    raise SystemExit(f"MAX_GRAD_NORM must be a non-negative finite float, got {sys.argv[1]!r}")
+PY
+fi
+if [[ "${BACKEND}" == "kt_armbf16" && -n "${MAX_GRAD_NORM}" ]]; then
+  python3 - "${MAX_GRAD_NORM}" "${KT_ALLOW_UNVALIDATED_GRAD_CLIP:-}" <<'PY'
+import sys
+
+value = float(sys.argv[1])
+allow = sys.argv[2].strip().lower() in {"1", "true", "yes", "on"}
+if value > 0.0 and not allow:
+    raise SystemExit(
+        "BACKEND=kt_armbf16 requires MAX_GRAD_NORM=0 until KT-aware clipping is validated; "
+        "set KT_ALLOW_UNVALIDATED_GRAD_CLIP=1 only for validation runs"
+    )
+PY
+fi
+
+PROFILE_LOGICAL_QLEN=$((PER_DEVICE_TRAIN_BATCH_SIZE * CUTOFF_LEN))
+PROFILE_GLOBAL_BATCH_SIZE=$((PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * NUM_GPUS))
+KT_ARM_LOGICAL_QLEN=""
+KT_ARM_ROUTE_RANK_WORK=""
+if [[ "${BACKEND}" == "kt_armbf16" ]]; then
+  if [[ -z "${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}" && "${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK}" != "1" ]]; then
+    KT_ARM_SFT_MAX_ROUTE_RANK_WORK="${KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK}"
+  fi
+  KT_ARM_LOGICAL_QLEN="${PROFILE_LOGICAL_QLEN}"
+  KT_ARM_ROUTE_RANK_WORK=$((KT_ARM_LOGICAL_QLEN * KT_ARM_SFT_TOP_K * LORA_RANK))
+  if [[ -n "${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}" && "${KT_ARM_ROUTE_RANK_WORK}" -gt "${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}" ]]; then
+    echo "BACKEND=kt_armbf16 route-rank work ${KT_ARM_ROUTE_RANK_WORK} exceeds KT_ARM_SFT_MAX_ROUTE_RANK_WORK=${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}" >&2
+    echo "Reduce PER_DEVICE_TRAIN_BATCH_SIZE, CUTOFF_LEN, LORA_RANK, raise the explicit limit, or set KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK=1 only for validation." >&2
+    exit 2
+  fi
 fi
 
 if [[ ! -f "${DATASET_FILE}" ]]; then
@@ -400,7 +625,7 @@ if [[ ! -f "${DATASET_FILE}" ]]; then
 fi
 
 if [[ ! -d "${ENV_DIR}" ]]; then
-  echo "Missing env ${ENV_DIR}. Run ${ASYM_DIR}/scripts/lf/bootstrap_lf_asym_env.sh first." >&2
+  echo "Missing env ${ENV_DIR}. Run ${ASYM_DIR}/scripts/lf/bootstrap_lf_venv.sh first." >&2
   exit 2
 fi
 
@@ -475,6 +700,9 @@ MASTER_PORT_VALUE="${MASTER_PORT_VALUE:-29500}"
 if [[ "${PROFILE}" == "1" && -z "${PROFILE_SOURCE_JSON}" ]]; then
   PROFILE_SOURCE_JSON="${OUT_DIR}/source_profile.json"
 fi
+if [[ "${PROFILE}" == "1" && -z "${PROFILE_HEARTBEAT_JSON}" ]]; then
+  PROFILE_HEARTBEAT_JSON="${OUT_DIR}/heartbeat.jsonl"
+fi
 
 if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "nsys" && -z "${PROFILE_NSYS_PREFIX}" ]]; then
   PROFILE_NSYS_PREFIX="${OUT_DIR}/lf_trace"
@@ -493,6 +721,20 @@ if [[ "${PROFILE}" == "1" && -z "${PROFILE_SUMMARY_MD}" ]]; then
 fi
 
 mkdir -p "${OUT_DIR}" "$(dirname "${LOG_FILE}")"
+if [[ "${PROFILE}" == "1" ]]; then
+  mkdir -p "$(dirname "${PROFILE_SOURCE_JSON}")" "$(dirname "${PROFILE_JSON}")" "${PROFILE_OUTPUT_DIR}"
+  rm -f \
+    "${PROFILE_SOURCE_JSON}" \
+    "$(dirname "${PROFILE_SOURCE_JSON}")/source_profile.partial.json" \
+    "${PROFILE_JSON}" \
+    "$(dirname "${PROFILE_JSON}")/partial_profile.json" \
+    "${PROFILE_HEARTBEAT_JSON}" \
+    "${PROFILE_HEARTBEAT_JSON%.*}.latest.json" \
+    2>/dev/null || true
+fi
+if [[ -n "${TRITON_CACHE_DIR:-}" ]]; then
+  mkdir -p "${TRITON_CACHE_DIR}"
+fi
 : > "${LOG_FILE}"
 
 managed_interrupted=false
@@ -510,6 +752,48 @@ managed_process_alive() {
     fi
   done
   return 1
+}
+
+heartbeat_latest_json_path() {
+  [[ -n "${PROFILE_HEARTBEAT_JSON}" ]] || return 1
+  printf '%s.latest.json\n' "${PROFILE_HEARTBEAT_JSON%.*}"
+}
+
+heartbeat_latest_stage() {
+  local latest_path
+  latest_path="$(heartbeat_latest_json_path)" || return 1
+  [[ -f "${latest_path}" ]] || return 1
+  python3 - "${latest_path}" <<'PY'
+import json
+import sys
+
+try:
+    payload = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+print(payload.get("stage", ""))
+PY
+}
+
+first_step_watchdog_enabled() {
+  [[ "${BACKEND}" == "kt_armbf16" ]] || return 1
+  [[ "${PROFILE}" == "1" ]] || return 1
+  [[ "${KT_ARM_FIRST_STEP_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${KT_ARM_FIRST_STEP_TIMEOUT_SECONDS}" != "0" ]] || return 1
+}
+
+is_first_step_started_stage() {
+  case "$1" in
+    trainer_start|dataloader_batch_fetch_start|dataloader_batch_fetch_end|training_step_start|model_forward_enter|model_forward_exit|training_step_end|grad_clip_start|grad_clip_end|optimizer_step_start|optimizer_step_end|kt_lora_pointer_refresh_start|kt_sft_*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_first_step_completed_stage() {
+  case "$1" in
+    kt_lora_pointer_refresh_end|trainer_end|source_profile_written) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 signal_managed_targets() {
@@ -564,6 +848,7 @@ cleanup_managed_child() {
 
 run_managed_command() {
   local status=0 wait_pid="" child_pid="" pid_file="" attempt
+  local watchdog_started_at=0 watchdog_status=0 watchdog_stage=""
   managed_child_pid=""
   managed_wait_pid=""
   managed_child_pid_file=""
@@ -592,7 +877,31 @@ run_managed_command() {
     managed_child_pid="${wait_pid}"
   fi
 
+  if first_step_watchdog_enabled; then
+    while kill -0 "${wait_pid}" 2>/dev/null; do
+      local wait_state
+      wait_state="$(ps -o stat= -p "${wait_pid}" 2>/dev/null || true)"
+      [[ "${wait_state}" == *Z* ]] && break
+      watchdog_stage="$(heartbeat_latest_stage 2>/dev/null || true)"
+      if is_first_step_completed_stage "${watchdog_stage}"; then
+        watchdog_started_at=0
+      elif is_first_step_started_stage "${watchdog_stage}"; then
+        if [[ "${watchdog_started_at}" == "0" ]]; then
+          watchdog_started_at="$(date +%s)"
+        elif (( $(date +%s) - watchdog_started_at >= KT_ARM_FIRST_STEP_TIMEOUT_SECONDS )); then
+          echo "BACKEND=kt_armbf16 did not complete the first optimizer step within KT_ARM_FIRST_STEP_TIMEOUT_SECONDS=${KT_ARM_FIRST_STEP_TIMEOUT_SECONDS}; latest heartbeat stage=${watchdog_stage}" >&2
+          kill_managed_child
+          watchdog_status=124
+          break
+        fi
+      fi
+      sleep 1
+    done
+  fi
   wait "${wait_pid}" || status=$?
+  if [[ "${watchdog_status}" != "0" ]]; then
+    status="${watchdog_status}"
+  fi
   if [[ "${managed_interrupted}" == "true" ]]; then
     kill_managed_child
     wait "${wait_pid}" 2>/dev/null || true
@@ -614,6 +923,81 @@ run_managed_command() {
 
 run_logged_command() {
   run_managed_command "$@" > >(tee -a "${LOG_FILE}") 2>&1
+}
+
+postprocess_source_profile_if_available() {
+  local source_json="${PROFILE_SOURCE_JSON}"
+  local profile_json="${PROFILE_JSON}"
+  local partial_source=0
+  local force_partial="${1:-0}"
+  if [[ "${force_partial}" == "1" && -f "${source_json}" ]]; then
+    profile_json="$(dirname "${PROFILE_JSON}")/partial_profile.json"
+    partial_source=1
+    echo "Training failed; postprocessing source profile as partial artifact ${profile_json}" | tee -a "${LOG_FILE}"
+  elif [[ ! -f "${source_json}" ]]; then
+    local partial_json
+    partial_json="$(dirname "${PROFILE_SOURCE_JSON}")/source_profile.partial.json"
+    if [[ -f "${partial_json}" ]]; then
+      source_json="${partial_json}"
+      profile_json="$(dirname "${PROFILE_JSON}")/partial_profile.json"
+      partial_source=1
+      echo "Final source profile is missing; postprocessing partial profile ${partial_json}" | tee -a "${LOG_FILE}"
+    else
+      echo "No source profile artifact found at ${PROFILE_SOURCE_JSON} or ${partial_json}" | tee -a "${LOG_FILE}"
+      return 1
+    fi
+  fi
+  if [[ ! -f "${PROFILE_POSTPROCESS_SCRIPT}" ]]; then
+    echo "Missing profile postprocess script ${PROFILE_POSTPROCESS_SCRIPT}" >&2
+    return 2
+  fi
+  "${ENV_PYTHON}" "${PROFILE_POSTPROCESS_SCRIPT}" \
+    --source-profile-json "${source_json}" \
+    --profile-json "${profile_json}" \
+    --output-dir "${PROFILE_OUTPUT_DIR}" 2>&1 | tee -a "${LOG_FILE}"
+  if [[ "${partial_source}" == "1" ]]; then
+    echo "Partial source profile artifacts were written to ${profile_json}; canonical profile.json was not created." | tee -a "${LOG_FILE}"
+  fi
+}
+
+check_trainable_surface_if_requested() {
+  [[ "${CHECK_TRAINABLE_SURFACE}" == "1" ]] || return 0
+  [[ "${PROFILE}" == "1" ]] || return 0
+  [[ -f "${PROFILE_JSON}" ]] || return 0
+  "${ENV_PYTHON}" - "${PROFILE_JSON}" <<'PY'
+import json
+import sys
+
+profile_path = sys.argv[1]
+profile = json.load(open(profile_path, encoding="utf-8"))
+source_profile = profile.get("source_profile", {})
+if isinstance(source_profile, dict) and source_profile:
+    profile = source_profile
+config = profile.get("config", {}) if isinstance(profile.get("config"), dict) else {}
+model_name = str(config.get("model_name_or_path") or "")
+lora_target = str(config.get("lora_target") or "").lower()
+if "qwen3" not in model_name.lower() or lora_target not in {"all", "all-linear", "all_linear"}:
+    raise SystemExit(0)
+
+surface = profile.get("trainable_surface", {})
+lora = profile.get("lora", {}) if isinstance(profile.get("lora"), dict) else {}
+expert = surface.get("expert_lora_parameters")
+if expert is None:
+    expert = lora.get("kt_expert_lora_parameters", 0) or lora.get("lf_fused_expert_lora_parameters", 0)
+try:
+    expert = int(expert or 0)
+except (TypeError, ValueError):
+    expert = 0
+if expert <= 0:
+    available = lora.get("available", "unknown")
+    reason = lora.get("reason", "")
+    raise SystemExit(
+        "Qwen3 lora_target=all profile has no captured expert LoRA parameters "
+        f"(available={available}, reason={reason!r}). This is not comparable to KT expert-LoRA runs. "
+        "Set CHECK_TRAINABLE_SURFACE=0 only for historical artifact collection."
+    )
+print(f"Verified trainable surface: expert_lora_parameters={expert}")
+PY
 }
 
 log_kv() {
@@ -648,7 +1032,7 @@ if not torch.cuda.is_available():
 major, minor = torch.cuda.get_device_capability(0)
 print(f"CUDA device: {torch.cuda.get_device_name(0)} capability=sm_{major}{minor}")
 '
-CUDA_VISIBLE_DEVICES=${GPU_ID} "${ENV_PYTHON}" - <<PY
+CUDA_VISIBLE_DEVICES=${GPU_ID} NVIDIA_VISIBLE_DEVICES=${GPU_ID} "${ENV_PYTHON}" - <<PY
 ${PY_CHECK}
 if "${BACKEND}" == "asym" and "${REQUIRE_SM100}" == "1":
     import torch
@@ -662,8 +1046,17 @@ if [[ "${BACKEND}" == kt_* ]]; then
     echo "Missing integrated kt-kernel source: ${KT_KERNEL_DIR}" >&2
     exit 2
   fi
+  if [[ ! -f "${KT_GGUF_PY_DIR}/gguf/gguf_reader.py" ]]; then
+    if ! PYTHONPATH="${KT_RUN_PYTHONPATH}" "${ENV_PYTHON}" - <<'PY' >/dev/null 2>&1; then
+from gguf.gguf_reader import GGUFReader
+PY
+      echo "Missing KT gguf dependency; set KT_GGUF_PY_DIR to vendored gguf-py or install the gguf package." >&2
+      exit 2
+    fi
+  fi
   env CUDA_VISIBLE_DEVICES="${GPU_ID}" \
-    PYTHONPATH="${KT_TOOLS_DIR}:${KT_KERNEL_DIR}:${LF_DIR}/src:${PYTHONPATH:-}" \
+    NVIDIA_VISIBLE_DEVICES="${GPU_ID}" \
+    PYTHONPATH="${KT_RUN_PYTHONPATH}" \
     "${ENV_PYTHON}" - <<'PY' | tee -a "${LOG_FILE}"
 import kt_kernel
 import torch
@@ -692,8 +1085,8 @@ CMD_ARGS=(
   --cutoff_len "${CUTOFF_LEN}"
   --max_samples "${MAX_SAMPLES}"
   --overwrite_cache true
-  --preprocessing_num_workers 4
-  --dataloader_num_workers 2
+  --preprocessing_num_workers "${PREPROCESSING_NUM_WORKERS}"
+  --dataloader_num_workers "${DATALOADER_NUM_WORKERS}"
   --output_dir "${OUT_DIR}"
   --logging_steps 1
   --logging_first_step true
@@ -711,6 +1104,7 @@ CMD_ARGS=(
   --seed "${SEED}"
   --bf16 true
 )
+[[ -z "${MAX_GRAD_NORM}" ]] || CMD_ARGS+=(--max_grad_norm "${MAX_GRAD_NORM}")
 
 if is_zero_backend_run; then
   CMD_ARGS+=(--pure_bf16 false)
@@ -756,17 +1150,40 @@ log_kv BACKEND "${BACKEND}"
 log_kv_if_set PROFILE_BACKEND_LABEL "${PROFILE_BACKEND_LABEL}"
 log_kv GPU_ID "${GPU_ID}"
 log_kv NUM_GPUS "${NUM_GPUS}"
+log_kv NUMACTL_ENABLE "${NUMACTL_ENABLE}"
+if [[ "${NUMACTL_ENABLE}" == "1" ]]; then
+  log_kv NUMACTL_MEMBIND "${NUMACTL_MEMBIND}"
+  log_kv NUMACTL_CPUNODEBIND "${NUMACTL_CPUNODEBIND}"
+fi
 is_torch_run && log_kv DIST_LAUNCHER "${DIST_LAUNCHER}"
 log_kv SEED "${SEED}"
+log_kv PREPROCESSING_NUM_WORKERS "${PREPROCESSING_NUM_WORKERS}"
+log_kv DATALOADER_NUM_WORKERS "${DATALOADER_NUM_WORKERS}"
+log_kv_if_set MAX_GRAD_NORM "${MAX_GRAD_NORM}"
 if [[ "${BACKEND}" == kt_* ]]; then
   log_kv KT_BACKEND "${KT_BACKEND_INTERNAL}"
   log_kv KT_KERNEL_DIR "${KT_KERNEL_DIR}"
+  log_kv KT_REPO_DIR "${KT_REPO_DIR}"
+  log_kv KT_GGUF_PY_DIR "${KT_GGUF_PY_DIR}"
   log_kv CHECK_KT_CALLS "${CHECK_KT_CALLS}"
+  log_kv KT_REQUIRE_STARTUP "${KT_REQUIRE_STARTUP}"
+  log_kv KT_REQUIRE_FUSED_LORA_STARTUP "${KT_REQUIRE_FUSED_LORA_STARTUP}"
   [[ "${BACKEND}" == "kt_torchbf16" ]] && log_kv KT_TORCHBF16_SFT_DEVICE "${KT_TORCHBF16_SFT_DEVICE}"
   if [[ "${BACKEND}" == "kt_armbf16" ]]; then
     log_kv KT_ARM_OMP_NUM_THREADS "${KT_ARM_OMP_NUM_THREADS}"
     log_kv KT_ARM_OMP_PROC_BIND "${KT_ARM_OMP_PROC_BIND}"
     log_kv KT_ARM_OMP_PLACES "${KT_ARM_OMP_PLACES}"
+    log_kv KT_SFT_PROGRESS "${KT_SFT_PROGRESS}"
+    log_kv KT_ARM_SFT_PROFILE "${KT_ARM_SFT_PROFILE}"
+    log_kv KT_ARM_SFT_POOL_LOG "${KT_ARM_SFT_POOL_LOG}"
+    log_kv KT_ARM_SFT_TOP_K "${KT_ARM_SFT_TOP_K}"
+    log_kv KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK "${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK}"
+    log_kv KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK "${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}"
+    log_kv KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK "${KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK}"
+    log_kv_if_set KT_ARM_SOURCE_OK_PROFILE_JSON "${KT_ARM_SOURCE_OK_PROFILE_JSON}"
+    log_kv KT_ARM_LOGICAL_QLEN "${KT_ARM_LOGICAL_QLEN}"
+    log_kv KT_ARM_ROUTE_RANK_WORK "${KT_ARM_ROUTE_RANK_WORK}"
+    log_kv_if_set KT_ARM_SFT_MAX_ROUTE_RANK_WORK "${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}"
   fi
   log_kv_if_set KT_NUM_THREADS "${KT_NUM_THREADS}"
   log_kv_if_set KT_THREADPOOL_COUNT "${KT_THREADPOOL_COUNT}"
@@ -820,9 +1237,14 @@ if [[ "${PROFILE}" == "1" ]]; then
   log_kv PROFILE_SYNC "${PROFILE_SYNC}"
   log_kv PROFILE_MODULE_FILTER "${PROFILE_MODULE_FILTER}"
   log_kv PROFILE_SOURCE_JSON "${PROFILE_SOURCE_JSON}"
+  log_kv PROFILE_HEARTBEAT_JSON "${PROFILE_HEARTBEAT_JSON}"
+  log_kv PROFILE_PARTIAL_INTERVAL_SECONDS "${PROFILE_PARTIAL_INTERVAL_SECONDS}"
   log_kv PROFILE_JSON "${PROFILE_JSON}"
   log_kv PROFILE_OUTPUT_DIR "${PROFILE_OUTPUT_DIR}"
   log_kv PROFILE_SUMMARY_MD "${PROFILE_SUMMARY_MD}"
+  log_kv PER_DEVICE_TRAIN_BATCH_SIZE "${PER_DEVICE_TRAIN_BATCH_SIZE}"
+  log_kv GLOBAL_BATCH_SIZE "${PROFILE_GLOBAL_BATCH_SIZE}"
+  log_kv LOGICAL_QLEN "${PROFILE_LOGICAL_QLEN}"
   log_kv_if_set PROFILE_NSYS_PREFIX "${PROFILE_NSYS_PREFIX}"
   log_kv_if_set PROFILE_NSYS_SQLITE "${PROFILE_NSYS_SQLITE}"
   if [[ "${PROFILE_PROFILER}" == "nsys" ]]; then
@@ -835,24 +1257,31 @@ RUN_PYTHONPATH="${ASYM_DIR}:${LF_DIR}/src:${PYTHONPATH:-}"
 if is_superoffload_zero_run; then
   RUN_PYTHONPATH="${DEEPSPEED_DIR}:${ASYM_DIR}:${LF_DIR}/src:${PYTHONPATH:-}"
 elif [[ "${BACKEND}" == kt_* ]]; then
-  RUN_PYTHONPATH="${KT_TOOLS_DIR}:${ASYM_DIR}:${KT_KERNEL_DIR}:${LF_DIR}/src:${PYTHONPATH:-}"
+  RUN_PYTHONPATH="${KT_RUN_PYTHONPATH}"
 fi
 
 RUN_ENV=(
   PATH="${ENV_DIR}/bin:${PATH}"
   PYTHONPATH="${RUN_PYTHONPATH}"
 )
+if [[ -n "${TRITON_CACHE_DIR:-}" ]]; then
+  RUN_ENV+=(TRITON_CACHE_DIR="${TRITON_CACHE_DIR}")
+fi
 ENV_CMD=(env)
 if ! { is_torch_run && [[ "${DIST_LAUNCHER}" == "deepspeed" ]]; }; then
-  RUN_ENV=(CUDA_VISIBLE_DEVICES="${GPU_ID}" "${RUN_ENV[@]}")
+  RUN_ENV=(CUDA_VISIBLE_DEVICES="${GPU_ID}" NVIDIA_VISIBLE_DEVICES="${GPU_ID}" "${RUN_ENV[@]}")
 else
-  ENV_CMD+=( -u CUDA_VISIBLE_DEVICES )
+  ENV_CMD+=( -u CUDA_VISIBLE_DEVICES -u NVIDIA_VISIBLE_DEVICES )
 fi
 if [[ "${BACKEND}" == kt_* ]]; then
   RUN_ENV+=(
     USE_KT=1
     ACCELERATE_KT_BACKEND="${KT_BACKEND_INTERNAL}"
     ACCELERATE_KT_TP_ENABLED="${KT_TP_ENABLED}"
+    ASYM_GEMM_LF_REQUIRE_KT_STARTUP="${KT_REQUIRE_STARTUP}"
+    ASYM_GEMM_LF_REQUIRE_KT_FUSED_LORA_STARTUP="${KT_REQUIRE_FUSED_LORA_STARTUP}"
+    ASYM_GEMM_LF_CONFIG_KT_REQUIRE_STARTUP="${KT_REQUIRE_STARTUP}"
+    ASYM_GEMM_LF_CONFIG_KT_REQUIRE_FUSED_LORA_STARTUP="${KT_REQUIRE_FUSED_LORA_STARTUP}"
   )
   if [[ "${BACKEND}" == "kt_torchbf16" ]]; then
     RUN_ENV+=(
@@ -865,9 +1294,22 @@ if [[ "${BACKEND}" == kt_* ]]; then
       OMP_NUM_THREADS="${KT_ARM_OMP_NUM_THREADS}"
       OMP_PROC_BIND="${KT_ARM_OMP_PROC_BIND}"
       OMP_PLACES="${KT_ARM_OMP_PLACES}"
+      KT_SFT_PROGRESS="${KT_SFT_PROGRESS}"
+      KT_ARM_SFT_PROFILE="${KT_ARM_SFT_PROFILE}"
+      KT_ARM_SFT_POOL_LOG="${KT_ARM_SFT_POOL_LOG}"
       ASYM_GEMM_LF_CONFIG_KT_ARM_OMP_NUM_THREADS="${KT_ARM_OMP_NUM_THREADS}"
       ASYM_GEMM_LF_CONFIG_KT_ARM_OMP_PROC_BIND="${KT_ARM_OMP_PROC_BIND}"
       ASYM_GEMM_LF_CONFIG_KT_ARM_OMP_PLACES="${KT_ARM_OMP_PLACES}"
+      ASYM_GEMM_LF_CONFIG_KT_SFT_PROGRESS="${KT_SFT_PROGRESS}"
+      ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_PROFILE="${KT_ARM_SFT_PROFILE}"
+      ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_POOL_LOG="${KT_ARM_SFT_POOL_LOG}"
+      ASYM_GEMM_LF_CONFIG_KT_ARM_LOGICAL_QLEN="${KT_ARM_LOGICAL_QLEN}"
+      ASYM_GEMM_LF_CONFIG_KT_ARM_ROUTE_RANK_WORK="${KT_ARM_ROUTE_RANK_WORK}"
+      ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_MAX_ROUTE_RANK_WORK="${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}"
+      ASYM_GEMM_LF_CONFIG_KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK="${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK}"
+      ASYM_GEMM_LF_CONFIG_KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK="${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}"
+      ASYM_GEMM_LF_CONFIG_KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK="${KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK}"
+      ASYM_GEMM_LF_CONFIG_KT_ARM_SOURCE_OK_PROFILE_JSON="${KT_ARM_SOURCE_OK_PROFILE_JSON}"
     )
   fi
   [[ -z "${KT_NUM_THREADS}" ]] || RUN_ENV+=(ACCELERATE_KT_NUM_THREADS="${KT_NUM_THREADS}")
@@ -928,23 +1370,35 @@ if [[ "${PROFILE}" == "1" ]]; then
     ASYM_GEMM_LF_PROFILE_EXTERNAL_MEMORY="${PROFILE_EXTERNAL_MEMORY}"
     ASYM_GEMM_LF_PROFILE_SYNC="${PROFILE_SYNC}"
     ASYM_GEMM_LF_PROFILE_MODULE_FILTER="${PROFILE_MODULE_FILTER}"
+    ASYM_GEMM_LF_HEARTBEAT_JSON="${PROFILE_HEARTBEAT_JSON}"
+    ASYM_GEMM_LF_PROFILE_PARTIAL_INTERVAL_SECONDS="${PROFILE_PARTIAL_INTERVAL_SECONDS}"
     ASYM_GEMM_LF_CONFIG_WORKLOAD="${PROFILE_WORKLOAD_LABEL:-${MODEL_TAG}}"
     ASYM_GEMM_LF_CONFIG_BACKEND="${PROFILE_BACKEND_LABEL:-${BACKEND}}"
     ASYM_GEMM_LF_CONFIG_DIST_LAUNCHER="${DIST_LAUNCHER}"
     ASYM_GEMM_LF_CONFIG_ROUTER_MODE="${ASYM_ROUTER_MODE}"
     ASYM_GEMM_LF_CONFIG_PRECISION="${profile_precision}"
     ASYM_GEMM_LF_CONFIG_SEQ_LEN="${CUTOFF_LEN}"
+    ASYM_GEMM_LF_CONFIG_PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE}"
+    ASYM_GEMM_LF_CONFIG_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE}"
+    ASYM_GEMM_LF_CONFIG_GLOBAL_BATCH_SIZE="${PROFILE_GLOBAL_BATCH_SIZE}"
+    ASYM_GEMM_LF_CONFIG_GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS}"
+    ASYM_GEMM_LF_CONFIG_LOGICAL_QLEN="${PROFILE_LOGICAL_QLEN}"
     ASYM_GEMM_LF_CONFIG_ACTIVATION_RECOMPUTE="${GRADIENT_CHECKPOINTING}"
     ASYM_GEMM_LF_CONFIG_EXPERT_POLICY="${PROFILE_EXPERT_POLICY}"
     ASYM_GEMM_LF_CONFIG_PROFILE_LEVEL="${PROFILE_LEVEL}"
     ASYM_GEMM_LF_CONFIG_WARMUP_STEPS="${PROFILE_WARMUP_STEPS:-0}"
     ASYM_GEMM_LF_CONFIG_MEASURE_STEPS="${PROFILE_MEASURE_STEPS:-${MAX_STEPS}}"
     ASYM_GEMM_LF_CONFIG_TOTAL_STEPS="${PROFILE_TOTAL_STEPS:-${MAX_STEPS}}"
+    ASYM_GEMM_LF_CONFIG_PREPROCESSING_NUM_WORKERS="${PREPROCESSING_NUM_WORKERS}"
+    ASYM_GEMM_LF_CONFIG_DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS}"
+    ASYM_GEMM_LF_CONFIG_MAX_GRAD_NORM="${MAX_GRAD_NORM}"
   )
   if [[ "${BACKEND}" == kt_* ]]; then
     RUN_ENV+=(
       ASYM_GEMM_LF_CONFIG_KT_BACKEND="${KT_BACKEND_INTERNAL:-}"
       ASYM_GEMM_LF_CONFIG_KT_KERNEL_DIR="${KT_KERNEL_DIR}"
+      ASYM_GEMM_LF_CONFIG_KT_REPO_DIR="${KT_REPO_DIR}"
+      ASYM_GEMM_LF_CONFIG_KT_GGUF_PY_DIR="${KT_GGUF_PY_DIR}"
       ASYM_GEMM_LF_CONFIG_KT_NUM_THREADS="${KT_NUM_THREADS}"
       ASYM_GEMM_LF_CONFIG_KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT}"
       ASYM_GEMM_LF_CONFIG_KT_MAX_CACHE_DEPTH="${KT_MAX_CACHE_DEPTH}"
@@ -961,6 +1415,19 @@ if [[ "${PROFILE}" == "1" ]]; then
   if [[ "${PROFILE_PROFILER}" == "nsys" && "${PROFILE_NSYS_CAPTURE_RANGE}" == "cudaProfilerApi" ]]; then
     RUN_ENV+=(ASYM_GEMM_LF_NSYS_CAPTURE_RANGE=1)
   fi
+fi
+
+NUMACTL_CMD=()
+if [[ "${NUMACTL_ENABLE}" == "1" ]]; then
+  if ! command -v "${NUMACTL_BIN}" >/dev/null 2>&1; then
+    echo "NUMACTL_ENABLE=1 but numactl binary not found: ${NUMACTL_BIN}" >&2
+    exit 2
+  fi
+  NUMACTL_CMD=(
+    "${NUMACTL_BIN}"
+    "--membind=${NUMACTL_MEMBIND}"
+    "--cpunodebind=${NUMACTL_CPUNODEBIND}"
+  )
 fi
 
 if [[ "${PROFILE}" == "1" ]]; then
@@ -1027,6 +1494,8 @@ if is_torch_run; then
   fi
 fi
 
+TRAIN_STATUS=0
+SOURCE_PROFILE_POSTPROCESSED=0
 if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "nsys" ]]; then
   NSYS_CMD=(
     "${NSYS_BIN}"
@@ -1045,9 +1514,45 @@ if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "nsys" ]]; then
   if [[ "${PROFILE_NSYS_CAPTURE_RANGE}" == "cudaProfilerApi" ]]; then
     NSYS_CMD+=(--capture-range=cudaProfilerApi --capture-range-end=stop)
   fi
-  run_logged_command "${ENV_CMD[@]}" "${RUN_ENV[@]}" "${NSYS_CMD[@]}" "${LAUNCH_CMD[@]}"
+  set +e
+  run_logged_command "${ENV_CMD[@]}" "${RUN_ENV[@]}" "${NUMACTL_CMD[@]}" "${NSYS_CMD[@]}" "${LAUNCH_CMD[@]}"
+  TRAIN_STATUS=$?
+  set -e
 else
-  run_logged_command "${ENV_CMD[@]}" "${RUN_ENV[@]}" "${LAUNCH_CMD[@]}"
+  set +e
+  run_logged_command "${ENV_CMD[@]}" "${RUN_ENV[@]}" "${NUMACTL_CMD[@]}" "${LAUNCH_CMD[@]}"
+  TRAIN_STATUS=$?
+  set -e
+fi
+
+if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "source" ]]; then
+  POSTPROCESS_STATUS=0
+  if [[ "${TRAIN_STATUS}" == "0" ]]; then
+    postprocess_source_profile_if_available || POSTPROCESS_STATUS=$?
+  else
+    postprocess_source_profile_if_available 1 || POSTPROCESS_STATUS=$?
+  fi
+  if [[ "${POSTPROCESS_STATUS}" == "0" ]]; then
+    SOURCE_PROFILE_POSTPROCESSED=1
+    echo "Wrote source profile artifacts under ${PROFILE_OUTPUT_DIR}" | tee -a "${LOG_FILE}"
+    if [[ "${TRAIN_STATUS}" == "0" && ! -f "${PROFILE_SOURCE_JSON}" ]]; then
+      echo "Training completed but final source profile is missing at ${PROFILE_SOURCE_JSON}; refusing to accept partial profile as complete." | tee -a "${LOG_FILE}"
+      exit 1
+    fi
+    if [[ "${TRAIN_STATUS}" == "0" ]]; then
+      check_trainable_surface_if_requested 2>&1 | tee -a "${LOG_FILE}"
+    fi
+  elif [[ "${TRAIN_STATUS}" == "0" ]]; then
+    exit "${POSTPROCESS_STATUS}"
+  fi
+fi
+
+if [[ "${TRAIN_STATUS}" != "0" ]]; then
+  if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" != "source" ]]; then
+    postprocess_source_profile_if_available || true
+  fi
+  echo "Training command failed with status ${TRAIN_STATUS}" | tee -a "${LOG_FILE}"
+  exit "${TRAIN_STATUS}"
 fi
 
 if is_superoffload_zero_run && [[ "${CHECK_SUPEROFFLOAD}" == "1" ]]; then
@@ -1099,15 +1604,40 @@ import sys
 profile = json.load(open(sys.argv[1], encoding="utf-8"))
 kt_backend = sys.argv[2]
 kt = profile.get("kt", {})
+lora = profile.get("lora", {})
+optimizer_memory = profile.get("optimizer_memory", {})
 wrappers = int(kt.get("wrapper_count", 0) or 0)
 fw = int(kt.get("total_forward_calls", 0) or 0)
 bw = int(kt.get("total_backward_calls", 0) or 0)
 methods = sorted({str(row.get("method", "")) for row in kt.get("rows", []) if isinstance(row, dict)})
+fused_lora_params = int(lora.get("kt_fused_expert_lora_parameters", 0) or 0) if isinstance(lora, dict) else 0
 if wrappers <= 0:
     raise SystemExit(f"Expected positive KT wrapper_count in {sys.argv[1]}, got {wrappers}")
 if fw <= 0 or bw <= 0:
     raise SystemExit(f"Expected positive KT forward/backward calls in {sys.argv[1]}, got fw={fw} bw={bw}")
-print(f"Verified KT source counters: backend={kt_backend} wrappers={wrappers} fw={fw} bw={bw} methods={methods}")
+if fused_lora_params > 0:
+    health = {}
+    if isinstance(optimizer_memory, dict):
+        health = optimizer_memory.get("kt_lora_update_health", {}) or {}
+    if not isinstance(health, dict) or not health.get("available", False):
+        raise SystemExit(
+            f"KT fused expert LoRA params are present ({fused_lora_params}) but optimizer update health is missing"
+        )
+    passed = health.get("passed")
+    if passed is None:
+        rows = [row for row in health.get("rows", []) if isinstance(row, dict)]
+        grad_nonzero = int(health.get("grad_nonzero_tensors", 0) or 0)
+        grad_nonzero_unchanged = sum(
+            int(bool(row.get("grad_nonzero_before_step")) and not bool(row.get("param_changed_after_step")))
+            for row in rows
+        )
+        passed = bool(rows) and grad_nonzero > 0 and grad_nonzero_unchanged == 0
+    if passed is not True:
+        raise SystemExit(f"KT fused expert LoRA optimizer update health failed: {health}")
+print(
+    f"Verified KT source counters: backend={kt_backend} wrappers={wrappers} fw={fw} bw={bw} "
+    f"methods={methods} fused_lora_params={fused_lora_params}"
+)
 PY
     )
   else
@@ -1154,16 +1684,10 @@ if [[ "${PROFILE}" == "1" && -f "${PROFILE_SOURCE_JSON}" ]]; then
   echo "Wrote LF source profile to ${PROFILE_SOURCE_JSON}" | tee -a "${LOG_FILE}"
 fi
 
-if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "source" ]]; then
-  if [[ ! -f "${PROFILE_POSTPROCESS_SCRIPT}" ]]; then
-    echo "Missing profile postprocess script ${PROFILE_POSTPROCESS_SCRIPT}" >&2
-    exit 2
-  fi
-  "${ENV_PYTHON}" "${PROFILE_POSTPROCESS_SCRIPT}" \
-    --source-profile-json "${PROFILE_SOURCE_JSON}" \
-    --profile-json "${PROFILE_JSON}" \
-    --output-dir "${PROFILE_OUTPUT_DIR}" 2>&1 | tee -a "${LOG_FILE}"
+if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "source" && "${SOURCE_PROFILE_POSTPROCESSED}" != "1" ]]; then
+  postprocess_source_profile_if_available
   echo "Wrote source profile artifacts under ${PROFILE_OUTPUT_DIR}" | tee -a "${LOG_FILE}"
+  check_trainable_surface_if_requested 2>&1 | tee -a "${LOG_FILE}"
 fi
 
 if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "nsys" ]]; then
@@ -1188,5 +1712,6 @@ if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "nsys" ]]; then
   "${ENV_PYTHON}" "${PROFILE_POSTPROCESS_SCRIPT}" \
     --profile-json "${PROFILE_JSON}" \
     --output-dir "${PROFILE_OUTPUT_DIR}" 2>&1 | tee -a "${LOG_FILE}"
+  check_trainable_surface_if_requested 2>&1 | tee -a "${LOG_FILE}"
   echo "Wrote Nsight profile artifacts to ${PROFILE_JSON} and ${PROFILE_SUMMARY_MD}" | tee -a "${LOG_FILE}"
 fi

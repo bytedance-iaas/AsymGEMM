@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from torch import nn
 
-from asym_gemm.utils import per_block_cast_to_fp8, per_token_cast_to_fp8, per_token_cast_to_nvfp4_e4m3
+from asym_gemm.utils.math import per_block_cast_to_fp8, per_token_cast_to_fp8, per_token_cast_to_nvfp4_e4m3
 
 from .host_weight import HostWeight, tensor_nbytes
 from .profile_ranges import is_profile_enabled, prof_range
@@ -1347,12 +1347,16 @@ class AsymGroupedFrozenLinear(nn.Module):
         *,
         backend: str = "asym",
         pin_memory: bool = True,
+        clone: bool = True,
         stats: Optional[AsymExecutionStats] = None,
         compiled_dims: str = "mnk",
         precision: str = "bf16",
         bf16_output_dtype: torch.dtype | str = torch.bfloat16,
     ) -> None:
         super().__init__()
+        adopted_host_weight = weight if isinstance(weight, HostWeight) else None
+        if adopted_host_weight is not None:
+            weight = adopted_host_weight.weight
         if not isinstance(weight, torch.Tensor):
             raise TypeError(f"weight must be a torch.Tensor, got {type(weight)!r}")
         if weight.dim() != 3:
@@ -1360,7 +1364,7 @@ class AsymGroupedFrozenLinear(nn.Module):
         _check_backend(backend)
         precision = _normalize_precision(precision)
         bf16_output_dtype = _normalize_bf16_output_dtype(bf16_output_dtype)
-        self.host_weight = HostWeight(weight, pin_memory=pin_memory, clone=True, require_2d=False)
+        self.host_weight = adopted_host_weight or HostWeight(weight, pin_memory=pin_memory, clone=clone, require_2d=False)
         self.backend = backend
         self.stats = stats if stats is not None else AsymExecutionStats()
         self.compiled_dims = compiled_dims
@@ -1574,6 +1578,38 @@ def direct_asym_capability(
     return AsymCapability(supported=supported, reason=reason)
 
 
+def _prepare_frozen_bias(
+    bias: Optional[torch.Tensor],
+    *,
+    dtype: torch.dtype,
+    pin_memory: bool,
+    strict_no_copy: bool,
+) -> Optional[torch.Tensor]:
+    if bias is None:
+        return None
+    bias_cpu = bias.detach()
+    if strict_no_copy:
+        if bias_cpu.device.type != "cpu":
+            raise RuntimeError(f"frozen bias selected for CPU offload but source tensor is on {bias_cpu.device}")
+        if bias_cpu.dtype != dtype:
+            raise RuntimeError(f"frozen bias selected for CPU offload has dtype {bias_cpu.dtype}, expected {dtype}")
+        if not bias_cpu.is_contiguous():
+            raise RuntimeError("frozen bias selected for CPU offload is non-contiguous and would require a CPU copy")
+        bias_cpu.requires_grad_(False)
+        return bias_cpu
+
+    bias_cpu = bias_cpu.to("cpu", dtype=dtype)
+    if not bias_cpu.is_contiguous():
+        bias_cpu = bias_cpu.contiguous()
+    if pin_memory:
+        try:
+            bias_cpu = bias_cpu.pin_memory()
+        except RuntimeError:
+            pass
+    bias_cpu.requires_grad_(False)
+    return bias_cpu
+
+
 class AsymFrozenLinear(nn.Module):
     def __init__(
         self,
@@ -1585,6 +1621,7 @@ class AsymFrozenLinear(nn.Module):
         compiled_dims: str = "mnk",
         precision: str = "bf16",
         bf16_output_dtype: torch.dtype | str = torch.bfloat16,
+        strict_no_copy_bias: bool = False,
     ) -> None:
         super().__init__()
         if len(args) == 1:
@@ -1597,18 +1634,21 @@ class AsymFrozenLinear(nn.Module):
                 )
         else:
             raise TypeError("AsymFrozenLinear expects weight or (in_features, out_features, weight)")
+        adopted_host_weight = weight if isinstance(weight, HostWeight) else None
+        if adopted_host_weight is not None:
+            weight = adopted_host_weight.weight
         if not isinstance(weight, torch.Tensor):
             raise TypeError(f"weight must be a torch.Tensor, got {type(weight)!r}")
         _check_backend(backend)
         precision = _normalize_precision(precision)
         bf16_output_dtype = _normalize_bf16_output_dtype(bf16_output_dtype)
-        self.host_weight = HostWeight.from_tensor(weight, dtype=weight.dtype, pin_memory=pin_memory)
-        self.bias_cpu = None if bias is None else bias.detach().to("cpu", dtype=weight.dtype).contiguous()
-        if self.bias_cpu is not None and pin_memory:
-            try:
-                self.bias_cpu = self.bias_cpu.pin_memory()
-            except RuntimeError:
-                pass
+        self.host_weight = adopted_host_weight or HostWeight.from_tensor(weight, dtype=weight.dtype, pin_memory=pin_memory)
+        self.bias_cpu = _prepare_frozen_bias(
+            bias,
+            dtype=weight.dtype,
+            pin_memory=pin_memory,
+            strict_no_copy=strict_no_copy_bias,
+        )
         self.backend = backend
         self.stats = stats if stats is not None else AsymExecutionStats()
         self.compiled_dims = compiled_dims
@@ -1663,6 +1703,30 @@ class AsymFrozenLinear(nn.Module):
             bf16_output_dtype=bf16_output_dtype,
         )
 
+    @classmethod
+    def from_host_weight(
+        cls,
+        host_weight: HostWeight,
+        *,
+        bias: Optional[torch.Tensor] = None,
+        backend: str = "asym",
+        stats: Optional[AsymExecutionStats] = None,
+        compiled_dims: str = "mnk",
+        precision: str = "bf16",
+        bf16_output_dtype: torch.dtype | str = torch.bfloat16,
+    ) -> "AsymFrozenLinear":
+        return cls(
+            host_weight,
+            bias=bias,
+            backend=backend,
+            pin_memory=False,
+            stats=stats,
+            compiled_dims=compiled_dims,
+            precision=precision,
+            bf16_output_dtype=bf16_output_dtype,
+            strict_no_copy_bias=True,
+        )
+
     @property
     def pinned_cpu_bytes(self) -> int:
         total = self.host_weight.pinned_cpu_bytes + _quantized_cache_pinned_bytes(self.host_weight, self.precision)
@@ -1673,6 +1737,14 @@ class AsymFrozenLinear(nn.Module):
     @property
     def weight_hbm_saved_bytes(self) -> int:
         return self.host_weight.weight_nbytes
+
+    @property
+    def cpu_resident_base_weight_bytes(self) -> int:
+        return self.host_weight.weight_nbytes
+
+    @property
+    def gpu_resident_base_weight_bytes(self) -> int:
+        return 0
 
     @property
     def weight(self) -> torch.Tensor:

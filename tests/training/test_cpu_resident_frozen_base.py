@@ -23,7 +23,11 @@ lora_impl = importlib.import_module("asym_gemm.training.lora")
 
 
 def _direct_bf16_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] in {9, 10}
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability(0)[0] in {9, 10}
+        and hasattr(asym_gemm, "m_grouped_bf16_asym_gemm_nt_contiguous")
+    )
 
 
 def _direct_precision_available(precision: str) -> bool:

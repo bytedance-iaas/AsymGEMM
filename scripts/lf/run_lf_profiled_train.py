@@ -30,10 +30,19 @@ PROFILE_MEMORY_SNAPSHOT_PATH_ENV = "ASYM_GEMM_LF_PROFILE_MEMORY_SNAPSHOT_PATH"
 PROFILE_EXTERNAL_MEMORY_ENV = "ASYM_GEMM_LF_PROFILE_EXTERNAL_MEMORY"
 PROFILE_SYNC_ENV = "ASYM_GEMM_LF_PROFILE_SYNC"
 PROFILE_MODULE_FILTER_ENV = "ASYM_GEMM_LF_PROFILE_MODULE_FILTER"
+PROFILE_HEARTBEAT_ENV = "ASYM_GEMM_LF_HEARTBEAT_JSON"
+PROFILE_PARTIAL_INTERVAL_ENV = "ASYM_GEMM_LF_PROFILE_PARTIAL_INTERVAL_SECONDS"
 CONFIG_ENV_PREFIX = "ASYM_GEMM_LF_CONFIG_"
+KT_LORA_HEALTH_MAX_TENSORS_ENV = "ASYM_GEMM_LF_KT_LORA_HEALTH_MAX_TENSORS"
+KT_LORA_HEALTH_MAX_ELEMENTS_ENV = "ASYM_GEMM_LF_KT_LORA_HEALTH_MAX_ELEMENTS"
 
 _LAST_LF_MODEL: Any | None = None
 _DEEPSPEED_RUNTIME_MARKER: dict[str, Any] = {}
+_OPTIMIZER_MEMORY_MARKER: dict[str, Any] = {}
+_MODEL_CAPTURE_HEARTBEAT: Any | None = None
+_MODEL_CAPTURE_PARTIAL_WRITER: Any | None = None
+KT_REQUIRE_STARTUP_ENV = "ASYM_GEMM_LF_REQUIRE_KT_STARTUP"
+KT_REQUIRE_FUSED_LORA_STARTUP_ENV = "ASYM_GEMM_LF_REQUIRE_KT_FUSED_LORA_STARTUP"
 
 
 def _env_enabled(name: str, default: bool = False) -> bool:
@@ -49,6 +58,127 @@ def _is_rank0() -> bool:
         return int(rank) == 0
     except ValueError:
         return True
+
+
+def _utc_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _atomic_write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _unlink_if_exists(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+
+def _process_memory_snapshot() -> dict[str, Any]:
+    status_path = Path("/proc/self/status")
+    if not status_path.is_file():
+        return {"available": False, "reason": "/proc/self/status unavailable"}
+    keys = {
+        "VmRSS": "rss_bytes",
+        "VmHWM": "rss_peak_bytes",
+        "VmSize": "virtual_memory_bytes",
+        "VmData": "data_bytes",
+        "VmStk": "stack_bytes",
+    }
+    snapshot: dict[str, Any] = {"available": True, "source": str(status_path)}
+    try:
+        for line in status_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            label, _, raw_value = line.partition(":")
+            key = keys.get(label)
+            if key is None:
+                continue
+            parts = raw_value.strip().split()
+            if not parts:
+                continue
+            value = _safe_int(parts[0])
+            if value is not None:
+                snapshot[key] = value * 1024
+    except OSError as exc:
+        return {"available": False, "reason": repr(exc)}
+    return snapshot
+
+
+def _process_memory_value(snapshot: dict[str, Any], key: str) -> int:
+    value = snapshot.get(key)
+    return int(value) if isinstance(value, (int, float)) else 0
+
+
+class LFHeartbeat:
+    def __init__(self, path: str | None, config: dict[str, Any]):
+        self.path = Path(path) if path and _is_rank0() else None
+        self.latest_path = self.path.with_name(f"{self.path.stem}.latest.json") if self.path is not None else None
+        self.started = time.perf_counter()
+        self.config = config
+        self.counts: dict[str, int] = {}
+        self.latest: dict[str, Any] | None = None
+
+    def emit(self, stage: str, **fields: Any) -> None:
+        if self.path is None:
+            return
+        count = self.counts.get(stage, 0) + 1
+        self.counts[stage] = count
+        record = {
+            "timestamp": _utc_timestamp(),
+            "elapsed_seconds": round(time.perf_counter() - self.started, 6),
+            "pid": os.getpid(),
+            "stage": stage,
+            "count": count,
+            "backend": self.config.get("backend"),
+            "kt_backend": self.config.get("kt_backend"),
+            **fields,
+        }
+        self.latest = record
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        if self.latest_path is not None:
+            _atomic_write_json(self.latest_path, record)
+
+
+class PartialProfileWriter:
+    def __init__(
+        self,
+        source_json: str | None,
+        recorder: "LFProfileRecorder",
+        trace_handle: LFTraceHandle,
+        heartbeat: LFHeartbeat,
+    ):
+        self.path = Path(source_json).with_name("source_profile.partial.json") if source_json and _is_rank0() else None
+        self.recorder = recorder
+        self.trace_handle = trace_handle
+        self.heartbeat = heartbeat
+        self.last_write = 0.0
+        self.interval_seconds = max(_safe_float(os.environ.get(PROFILE_PARTIAL_INTERVAL_ENV)) or 5.0, 0.0)
+
+    def write(self, reason: str, *, force: bool = False, extra: dict[str, Any] | None = None) -> None:
+        if self.path is None:
+            return
+        now = time.perf_counter()
+        if not force and now - self.last_write < self.interval_seconds:
+            return
+        self.last_write = now
+        try:
+            report = self.recorder.report(self.trace_handle)
+        except Exception as exc:
+            report = {"partial_report_error": repr(exc)}
+        report["partial"] = True
+        report["partial_reason"] = reason
+        report["partial_timestamp"] = _utc_timestamp()
+        report["heartbeat_latest"] = self.heartbeat.latest
+        if extra:
+            report["partial_extra"] = extra
+        _atomic_write_json(self.path, report)
 
 
 def _option_value(args: list[str], name: str) -> str:
@@ -77,6 +207,38 @@ def _safe_int(value: Any) -> int | None:
     return result
 
 
+def _kt_lora_health_max_tensors() -> int:
+    raw = os.environ.get(KT_LORA_HEALTH_MAX_TENSORS_ENV, "12").strip().lower()
+    if raw in {"", "default"}:
+        return 12
+    if raw in {"all", "full", "exhaustive", "0"}:
+        return 0
+    value = _safe_int(raw)
+    if value is None:
+        raise ValueError(
+            f"{KT_LORA_HEALTH_MAX_TENSORS_ENV} must be a positive integer, 0, or 'all', got {raw!r}"
+        )
+    if value < 0:
+        raise ValueError(
+            f"{KT_LORA_HEALTH_MAX_TENSORS_ENV} must be a positive integer, 0, or 'all', got {raw!r}"
+        )
+    return value
+
+
+def _kt_lora_health_max_elements() -> int:
+    raw = os.environ.get(KT_LORA_HEALTH_MAX_ELEMENTS_ENV, "4096").strip().lower()
+    if raw in {"", "default"}:
+        return 4096
+    if raw in {"all", "full", "exhaustive", "0"}:
+        return 0
+    value = _safe_int(raw)
+    if value is None or value < 0:
+        raise ValueError(
+            f"{KT_LORA_HEALTH_MAX_ELEMENTS_ENV} must be a positive integer, 0, or 'all', got {raw!r}"
+        )
+    return value
+
+
 def _trainer_log_records(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -102,12 +264,45 @@ def _env_config() -> dict[str, Any]:
     return config
 
 
+def _format_cpu_ranges(cpus: list[int]) -> str:
+    if not cpus:
+        return ""
+    ranges: list[str] = []
+    start = prev = cpus[0]
+    for cpu in cpus[1:]:
+        if cpu == prev + 1:
+            prev = cpu
+            continue
+        ranges.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = cpu
+    ranges.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(ranges)
+
+
+def _cpu_affinity_summary() -> dict[str, Any]:
+    get_affinity = getattr(os, "sched_getaffinity", None)
+    if get_affinity is None:
+        return {"available": False, "reason": "os.sched_getaffinity unavailable"}
+    try:
+        cpus = sorted(int(cpu) for cpu in get_affinity(0))
+    except Exception as exc:
+        return {"available": False, "reason": repr(exc)}
+    return {
+        "available": True,
+        "count": len(cpus),
+        "cpus": _format_cpu_ranges(cpus),
+    }
+
+
 def _config_from_args(args: list[str]) -> dict[str, Any]:
     env_config = _env_config()
+    cpu_affinity = _cpu_affinity_summary()
     model_name = _option_value(args, "--model_name_or_path")
     model_label = model_name.rstrip("/").rsplit("/", 1)[-1] if model_name else "lf"
     batch_size = _safe_int(_option_value(args, "--per_device_train_batch_size"))
     cutoff_len = _safe_int(_option_value(args, "--cutoff_len"))
+    gradient_accumulation_steps = _safe_int(_option_value(args, "--gradient_accumulation_steps"))
+    logical_qlen = batch_size * cutoff_len if batch_size is not None and cutoff_len is not None else None
     lora_rank = _safe_int(_option_value(args, "--lora_rank"))
     lora_alpha = _safe_float(_option_value(args, "--lora_alpha"))
     max_steps = _safe_int(_option_value(args, "--max_steps"))
@@ -120,6 +315,7 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
     backend = os.environ.get("ASYM_GEMM_LF_CONFIG_BACKEND") or ("torch" if asym_backend == "torch" else asym_backend or "hf")
     expert_policy = parse_expert_recompute_policy_spec(os.environ.get("ASYM_GEMM_LF_CONFIG_EXPERT_POLICY", "none"))
     is_superoffload_backend = backend == "superoffload"
+    is_deepspeed_backend = backend in {"zero2", "zero3", "zero3_offload", "zero3_offload_mem", "superoffload"}
     config = {
         "workflow": "lora_lf_sft",
         "workload": os.environ.get("ASYM_GEMM_LF_CONFIG_WORKLOAD", model_label),
@@ -130,15 +326,18 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "dataset": _option_value(args, "--dataset"),
         "template": _option_value(args, "--template"),
         "batch_size": batch_size,
+        "per_device_train_batch_size": batch_size,
         "seq_len": _safe_int(os.environ.get("ASYM_GEMM_LF_CONFIG_SEQ_LEN")) or cutoff_len,
         "cutoff_len": cutoff_len,
+        "logical_qlen": _safe_int(env_config.get("logical_qlen")) or logical_qlen,
         "max_samples": _safe_int(_option_value(args, "--max_samples")),
         "max_steps": measure_steps,
         "measure_steps": measure_steps,
         "warmup_steps": warmup_steps,
         "total_steps": total_steps,
         "trainer_max_steps": max_steps,
-        "gradient_accumulation_steps": _safe_int(_option_value(args, "--gradient_accumulation_steps")),
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "lora_target": _option_value(args, "--lora_target"),
         "lora_rank": lora_rank,
         "lora_alpha": lora_alpha,
         "lora_dropout": _safe_float(_option_value(args, "--lora_dropout")),
@@ -162,22 +361,157 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "profile_external_memory": os.environ.get(PROFILE_EXTERNAL_MEMORY_ENV, "0"),
         "profile_sync": os.environ.get(PROFILE_SYNC_ENV, "0"),
         "profile_module_filter": os.environ.get(PROFILE_MODULE_FILTER_ENV, ""),
+        "cpu_affinity": cpu_affinity,
+        "cpu_affinity_count": cpu_affinity.get("count"),
+        "omp_num_threads": os.environ.get("OMP_NUM_THREADS", ""),
+        "omp_proc_bind": os.environ.get("OMP_PROC_BIND", ""),
+        "omp_places": os.environ.get("OMP_PLACES", ""),
+        "kt_lora_health_max_tensors": os.environ.get(KT_LORA_HEALTH_MAX_TENSORS_ENV, "12"),
+        "kt_lora_health_max_elements": os.environ.get(KT_LORA_HEALTH_MAX_ELEMENTS_ENV, "4096"),
         "nsys_capture_range": _env_enabled("ASYM_GEMM_LF_NSYS_CAPTURE_RANGE"),
         "superoffload_config": os.environ.get("ASYM_GEMM_LF_CONFIG_SUPEROFFLOAD_CONFIG")
         if is_superoffload_backend
         else None,
-        "deepspeed_dir": os.environ.get("ASYM_GEMM_LF_CONFIG_DEEPSPEED_DIR"),
+        "deepspeed_dir": os.environ.get("ASYM_GEMM_LF_CONFIG_DEEPSPEED_DIR") if is_deepspeed_backend else None,
         "pytorch_cuda_alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""),
+        "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR", ""),
         "output_dir": _option_value(args, "--output_dir"),
     }
     for key, value in env_config.items():
         config.setdefault(key, value)
-    return {key: value for key, value in config.items() if value not in {"", None}}
+    return {key: value for key, value in config.items() if value is not None and value != ""}
+
+
+def _kt_startup_validation_errors(kt: dict[str, Any], lora: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if _env_enabled(KT_REQUIRE_STARTUP_ENV):
+        wrapper_count = _safe_int(kt.get("wrapper_count")) or 0
+        if not kt.get("available", False):
+            errors.append(f"KT startup counters unavailable: {kt.get('reason', 'unknown')}")
+        elif wrapper_count <= 0:
+            errors.append(f"KT startup wrapper_count must be positive, got {wrapper_count}")
+    if _env_enabled(KT_REQUIRE_FUSED_LORA_STARTUP_ENV):
+        fused_lora_params = _safe_int(lora.get("kt_fused_expert_lora_parameters")) or 0
+        if not lora.get("available", False):
+            errors.append(f"KT fused LoRA startup counters unavailable: {lora.get('reason', 'unknown')}")
+        elif fused_lora_params <= 0:
+            errors.append(f"KT fused expert LoRA params must be positive at startup, got {fused_lora_params}")
+    return errors
+
+
+def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not isinstance(lora, dict) or lora.get("available") is False:
+        return {
+            "available": False,
+            "reason": f"lora counters unavailable: {lora.get('reason', 'unknown') if isinstance(lora, dict) else 'missing'}",
+        }
+
+    trainable_params = _safe_int(lora.get("trainable_parameters"))
+    if trainable_params is None:
+        return {
+            "available": False,
+            "reason": "lora counter trainable_parameters is missing or non-numeric",
+        }
+
+    kt_fused_params = _safe_int(lora.get("kt_fused_expert_lora_parameters"))
+    kt_expert_params = _safe_int(lora.get("kt_expert_lora_parameters"))
+    peft_lora_params = _safe_int(lora.get("peft_lora_parameters"))
+    kt_peft_expert_params = _safe_int(lora.get("kt_peft_expert_lora_parameters"))
+    non_expert_peft_params = (
+        max(0, peft_lora_params - (kt_peft_expert_params or 0)) if peft_lora_params is not None else None
+    )
+
+    def bf16_bytes(params: int) -> int:
+        return int(params) * 2
+
+    def fp32_bytes(params: int) -> int:
+        return int(params) * 4
+
+    adamw_bf16_moments_bytes = 2 * bf16_bytes(trainable_params)
+    adamw_fp32_moments_bytes = 2 * fp32_bytes(trainable_params)
+    param_bf16_bytes = bf16_bytes(trainable_params)
+    grad_bf16_bytes = bf16_bytes(trainable_params)
+    total_bf16_moment_policy = param_bf16_bytes + grad_bf16_bytes + adamw_bf16_moments_bytes
+    total_fp32_moment_policy = param_bf16_bytes + grad_bf16_bytes + adamw_fp32_moments_bytes
+    total_fp32_moment_master_policy = total_fp32_moment_policy + fp32_bytes(trainable_params)
+
+    return {
+        "available": True,
+        "source": "lora_counters_pre_optimizer_step",
+        "assumed_param_dtype": "bf16",
+        "trainable_parameters": trainable_params,
+        "kt_fused_expert_lora_parameters": kt_fused_params,
+        "kt_expert_lora_parameters": kt_expert_params,
+        "non_expert_peft_lora_parameters": non_expert_peft_params,
+        "param_bf16_bytes": param_bf16_bytes,
+        "grad_bf16_bytes": grad_bf16_bytes,
+        "adamw_bf16_moments_bytes": adamw_bf16_moments_bytes,
+        "adamw_fp32_moments_bytes": adamw_fp32_moments_bytes,
+        "adamw_fp32_master_bytes": fp32_bytes(trainable_params),
+        "total_bf16_params_grads_adamw_bf16_moments_bytes": total_bf16_moment_policy,
+        "total_bf16_params_grads_adamw_fp32_moments_bytes": total_fp32_moment_policy,
+        "total_bf16_params_grads_adamw_fp32_moments_master_bytes": total_fp32_moment_master_policy,
+        "large_surface_warning": bool(
+            trainable_params >= 1_000_000_000
+            or (kt_fused_params is not None and kt_fused_params >= 1_000_000_000)
+        ),
+        "logical_qlen": _safe_int((config or {}).get("logical_qlen")),
+        "lora_rank": _safe_int((config or {}).get("lora_rank")),
+    }
 
 
 def _capture_loaded_model(model: Any) -> Any:
     global _LAST_LF_MODEL
     _LAST_LF_MODEL = model
+    heartbeat = _MODEL_CAPTURE_HEARTBEAT
+    partial_writer = _MODEL_CAPTURE_PARTIAL_WRITER
+    if heartbeat is not None:
+        try:
+            kt = _kt_counters_from_model()
+            lora = _lora_counters_from_model()
+            optimizer_memory_preflight = _kt_optimizer_memory_preflight(lora, getattr(heartbeat, "config", {}))
+        except Exception as exc:
+            heartbeat.emit("model_loaded_summary_exception", error=repr(exc))
+            if partial_writer is not None:
+                partial_writer.write("model_loaded_summary_exception", force=True, extra={"error": repr(exc)})
+            if _env_enabled(KT_REQUIRE_STARTUP_ENV) or _env_enabled(KT_REQUIRE_FUSED_LORA_STARTUP_ENV):
+                raise
+            return model
+
+        heartbeat.emit(
+            "model_loaded",
+            kt_available=kt.get("available"),
+            kt_wrappers=kt.get("wrapper_count"),
+            kt_forward_calls=kt.get("total_forward_calls"),
+            kt_backward_calls=kt.get("total_backward_calls"),
+            trainable_parameters=lora.get("trainable_parameters"),
+            kt_expert_lora_parameters=lora.get("kt_expert_lora_parameters"),
+            kt_fused_expert_lora_parameters=lora.get("kt_fused_expert_lora_parameters"),
+            optimizer_preflight_total_bf16_moments_bytes=optimizer_memory_preflight.get(
+                "total_bf16_params_grads_adamw_bf16_moments_bytes"
+            ),
+            optimizer_preflight_total_fp32_moments_master_bytes=optimizer_memory_preflight.get(
+                "total_bf16_params_grads_adamw_fp32_moments_master_bytes"
+            ),
+        )
+        if partial_writer is not None:
+            partial_writer.write(
+                "model_loaded",
+                force=True,
+                extra={"kt": kt, "lora": lora, "optimizer_memory_preflight": optimizer_memory_preflight},
+            )
+
+        validation_errors = _kt_startup_validation_errors(kt, lora)
+        if validation_errors:
+            message = "; ".join(validation_errors)
+            heartbeat.emit("model_loaded_startup_validation_failed", error=message)
+            if partial_writer is not None:
+                partial_writer.write(
+                    "model_loaded_startup_validation_failed",
+                    force=True,
+                    extra={"error": message, "kt": kt, "lora": lora},
+                )
+            raise RuntimeError(message)
     return model
 
 
@@ -254,6 +588,23 @@ def _kt_counters_from_model() -> dict[str, Any]:
                 "forward_calls": int(getattr(wrapper, "_kt_forward_calls", 0) or 0),
                 "backward_calls": int(getattr(wrapper, "_kt_backward_calls", 0) or 0),
                 "lora_initialized": bool(getattr(wrapper, "_lora_initialized", False)),
+                "cache_depth": int(getattr(wrapper, "_cache_depth", 0) or 0),
+                "max_cache_depth": int(getattr(wrapper, "max_cache_depth", 0) or 0),
+                "max_cache_depth_observed": int(getattr(wrapper, "_max_cache_depth_observed", 0) or 0),
+                "staging_buffer_scope": "wrapper",
+                "staging_buffer_capacity_qlen": int(getattr(getattr(wrapper, "_buffer", None), "qlen", 0) or 0),
+                "staging_buffer_allocation_count": int(getattr(wrapper, "_buffer_allocation_count", 0) or 0),
+                "native_cache_stack_depth": int(getattr(wrapper, "cache_stack_depth", 0) or 0),
+                "native_max_cache_stack_depth_observed": int(
+                    getattr(wrapper, "max_cache_stack_depth_observed", 0) or 0
+                ),
+                "native_cache_save_count": int(getattr(wrapper, "cache_save_count", 0) or 0),
+                "native_cache_pop_count": int(getattr(wrapper, "cache_pop_count", 0) or 0),
+                "native_last_cache_entry_bytes": int(getattr(wrapper, "last_cache_entry_bytes", 0) or 0),
+                "native_total_cache_entry_bytes_saved": int(
+                    getattr(wrapper, "total_cache_entry_bytes_saved", 0) or 0
+                ),
+                "timing": dict(getattr(wrapper, "_kt_timing", {}) or {}),
             }
         )
 
@@ -339,6 +690,237 @@ def _install_deepspeed_optimizer_capture_hook() -> None:
     DeepSpeedEngine._configure_optimizer = wrapped_configure_optimizer
 
 
+def _should_install_deepspeed_hook(args: list[str], config: dict[str, Any]) -> bool:
+    if _option_value(args, "--deepspeed"):
+        return True
+    backend = str(config.get("backend") or "").lower()
+    if backend in {"zero2", "zero3", "zero3_offload", "zero3_offload_mem", "superoffload"}:
+        return True
+    return bool(config.get("superoffload_config"))
+
+
+def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: PartialProfileWriter) -> None:
+    try:
+        from transformers import Trainer
+    except Exception:
+        return
+
+    if not getattr(Trainer.train, "_asym_gemm_heartbeat", False):
+        original_train = Trainer.train
+
+        def wrapped_train(self: Any, *args: Any, **kwargs: Any) -> Any:
+            heartbeat.emit("trainer_start", trainer_class=self.__class__.__name__)
+            partial_writer.write("trainer_start", force=True)
+            try:
+                result = original_train(self, *args, **kwargs)
+            except BaseException as exc:
+                heartbeat.emit("trainer_exception", trainer_class=self.__class__.__name__, error=repr(exc))
+                partial_writer.write("trainer_exception", force=True, extra={"error": repr(exc)})
+                raise
+            heartbeat.emit("trainer_end", trainer_class=self.__class__.__name__)
+            partial_writer.write("trainer_end", force=True)
+            return result
+
+        wrapped_train._asym_gemm_heartbeat = True  # type: ignore[attr-defined]
+        Trainer.train = wrapped_train
+
+    if hasattr(Trainer, "get_batch_samples") and not getattr(Trainer.get_batch_samples, "_asym_gemm_heartbeat", False):
+        original_get_batch_samples = Trainer.get_batch_samples
+
+        def wrapped_get_batch_samples(self: Any, *args: Any, **kwargs: Any) -> Any:
+            heartbeat.emit("dataloader_batch_fetch_start", trainer_class=self.__class__.__name__)
+            partial_writer.write("dataloader_batch_fetch_start")
+            result = original_get_batch_samples(self, *args, **kwargs)
+            batch_samples = result[0] if isinstance(result, tuple) and result else result
+            batch_count = len(batch_samples) if hasattr(batch_samples, "__len__") else None
+            heartbeat.emit(
+                "dataloader_batch_fetch_end",
+                trainer_class=self.__class__.__name__,
+                batch_count=batch_count,
+            )
+            partial_writer.write("dataloader_batch_fetch_end")
+            return result
+
+        wrapped_get_batch_samples._asym_gemm_heartbeat = True  # type: ignore[attr-defined]
+        Trainer.get_batch_samples = wrapped_get_batch_samples
+
+    if not getattr(Trainer.training_step, "_asym_gemm_heartbeat", False):
+        original_training_step = Trainer.training_step
+
+        def wrapped_training_step(self: Any, model: Any, inputs: Any, *args: Any, **kwargs: Any) -> Any:
+            step = getattr(getattr(self, "state", None), "global_step", None)
+            heartbeat.emit("training_step_start", trainer_class=self.__class__.__name__, global_step=step)
+            partial_writer.write("training_step_start", force=True)
+            try:
+                result = original_training_step(self, model, inputs, *args, **kwargs)
+            except BaseException as exc:
+                heartbeat.emit(
+                    "training_step_exception",
+                    trainer_class=self.__class__.__name__,
+                    global_step=step,
+                    error=repr(exc),
+                )
+                partial_writer.write("training_step_exception", force=True, extra={"error": repr(exc)})
+                raise
+            heartbeat.emit("training_step_end", trainer_class=self.__class__.__name__, global_step=step)
+            partial_writer.write("training_step_end")
+            return result
+
+        wrapped_training_step._asym_gemm_heartbeat = True  # type: ignore[attr-defined]
+        Trainer.training_step = wrapped_training_step
+
+    if not getattr(Trainer._clip_grad_norm, "_asym_gemm_heartbeat", False):
+        original_clip_grad_norm = Trainer._clip_grad_norm
+
+        def wrapped_clip_grad_norm(self: Any, model: Any) -> Any:
+            step = getattr(getattr(self, "state", None), "global_step", None)
+            heartbeat.emit("grad_clip_start", trainer_class=self.__class__.__name__, global_step=step)
+            partial_writer.write("grad_clip_start", force=True)
+            result = original_clip_grad_norm(self, model)
+            heartbeat.emit("grad_clip_end", trainer_class=self.__class__.__name__, global_step=step)
+            partial_writer.write("grad_clip_end")
+            return result
+
+        wrapped_clip_grad_norm._asym_gemm_heartbeat = True  # type: ignore[attr-defined]
+        Trainer._clip_grad_norm = wrapped_clip_grad_norm
+
+    if not getattr(Trainer.create_optimizer, "_asym_gemm_heartbeat", False):
+        original_create_optimizer = Trainer.create_optimizer
+
+        def wrapped_create_optimizer(self: Any, *args: Any, **kwargs: Any) -> Any:
+            optimizer = original_create_optimizer(self, *args, **kwargs)
+            target_optimizer = getattr(self, "optimizer", optimizer)
+            if target_optimizer is not None and not getattr(target_optimizer.step, "_asym_gemm_heartbeat", False):
+                original_step = target_optimizer.step
+
+                def wrapped_optimizer_step(*step_args: Any, **step_kwargs: Any) -> Any:
+                    global _OPTIMIZER_MEMORY_MARKER
+                    step = getattr(getattr(self, "state", None), "global_step", None)
+                    process_memory_at_start = _process_memory_snapshot()
+                    heartbeat.emit(
+                        "optimizer_step_start",
+                        trainer_class=self.__class__.__name__,
+                        global_step=step,
+                        process_rss_bytes=process_memory_at_start.get("rss_bytes"),
+                        process_rss_peak_bytes=process_memory_at_start.get("rss_peak_bytes"),
+                    )
+                    partial_writer.write("optimizer_step_start", force=True)
+                    kt_lora_health_max_tensors = _kt_lora_health_max_tensors()
+                    kt_lora_health_max_elements = _kt_lora_health_max_elements()
+                    kt_lora_before = _kt_fused_lora_update_snapshot(
+                        getattr(self, "model", None),
+                        max_tensors=kt_lora_health_max_tensors,
+                        max_elements=kt_lora_health_max_elements,
+                    )
+                    process_memory_before = _process_memory_snapshot()
+                    try:
+                        result = original_step(*step_args, **step_kwargs)
+                    except BaseException as exc:
+                        process_memory_after = _process_memory_snapshot()
+                        try:
+                            summary = _optimizer_memory_summary(target_optimizer, getattr(self, "model", None))
+                        except BaseException as summary_exc:
+                            summary = {
+                                "available": False,
+                                "reason": f"optimizer memory summary failed after optimizer.step exception: {summary_exc!r}",
+                            }
+                        summary["process_memory_at_start"] = process_memory_at_start
+                        summary["process_memory_before_step"] = process_memory_before
+                        summary["process_memory_after_step"] = process_memory_after
+                        start_rss = _process_memory_value(process_memory_at_start, "rss_bytes")
+                        before_rss = _process_memory_value(process_memory_before, "rss_bytes")
+                        after_rss = _process_memory_value(process_memory_after, "rss_bytes")
+                        summary["process_rss_pre_step_overhead_delta_bytes"] = before_rss - start_rss
+                        summary["process_rss_delta_bytes"] = after_rss - before_rss
+                        summary["kt_lora_update_health"] = {
+                            "available": False,
+                            "passed": False,
+                            "reason": f"optimizer.step raised before after-step fused LoRA snapshot: {exc!r}",
+                            "before": kt_lora_before,
+                        }
+                        summary.update(
+                            {
+                                "timestamp": _utc_timestamp(),
+                                "trainer_class": self.__class__.__name__,
+                                "global_step": step,
+                                "error": repr(exc),
+                                "exception_type": exc.__class__.__name__,
+                            }
+                        )
+                        _OPTIMIZER_MEMORY_MARKER = summary
+                        heartbeat.emit("optimizer_step_exception", **summary)
+                        partial_writer.write(
+                            "optimizer_step_exception",
+                            force=True,
+                            extra={"optimizer_memory": summary, "error": repr(exc)},
+                        )
+                        raise
+                    process_memory_after = _process_memory_snapshot()
+                    kt_lora_after = _kt_fused_lora_update_snapshot(
+                        getattr(self, "model", None),
+                        max_tensors=kt_lora_health_max_tensors,
+                        max_elements=kt_lora_health_max_elements,
+                    )
+                    summary = _optimizer_memory_summary(target_optimizer, getattr(self, "model", None))
+                    summary["process_memory_at_start"] = process_memory_at_start
+                    summary["process_memory_before_step"] = process_memory_before
+                    summary["process_memory_after_step"] = process_memory_after
+                    start_rss = _process_memory_value(process_memory_at_start, "rss_bytes")
+                    before_rss = _process_memory_value(process_memory_before, "rss_bytes")
+                    after_rss = _process_memory_value(process_memory_after, "rss_bytes")
+                    summary["process_rss_pre_step_overhead_delta_bytes"] = before_rss - start_rss
+                    summary["process_rss_delta_bytes"] = after_rss - before_rss
+                    summary["kt_lora_update_health"] = _kt_fused_lora_update_health(kt_lora_before, kt_lora_after)
+                    summary.update(
+                        {
+                            "timestamp": _utc_timestamp(),
+                            "trainer_class": self.__class__.__name__,
+                            "global_step": step,
+                        }
+                    )
+                    _OPTIMIZER_MEMORY_MARKER = summary
+                    heartbeat.emit("optimizer_step_end", **summary)
+                    partial_writer.write("optimizer_step_end", force=True, extra={"optimizer_memory": summary})
+                    return result
+
+                wrapped_optimizer_step._asym_gemm_heartbeat = True  # type: ignore[attr-defined]
+                target_optimizer.step = wrapped_optimizer_step
+            return optimizer
+
+        wrapped_create_optimizer._asym_gemm_heartbeat = True  # type: ignore[attr-defined]
+        Trainer.create_optimizer = wrapped_create_optimizer
+
+    try:
+        from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
+    except Exception:
+        return
+
+    if not getattr(CustomSeq2SeqTrainer.compute_loss, "_asym_gemm_heartbeat", False):
+        original_compute_loss = CustomSeq2SeqTrainer.compute_loss
+
+        def wrapped_compute_loss(self: Any, model: Any, inputs: Any, *args: Any, **kwargs: Any) -> Any:
+            step = getattr(getattr(self, "state", None), "global_step", None)
+            heartbeat.emit("model_forward_enter", trainer_class=self.__class__.__name__, global_step=step)
+            partial_writer.write("model_forward_enter", force=True)
+            try:
+                result = original_compute_loss(self, model, inputs, *args, **kwargs)
+            except BaseException as exc:
+                heartbeat.emit(
+                    "model_forward_exception",
+                    trainer_class=self.__class__.__name__,
+                    global_step=step,
+                    error=repr(exc),
+                )
+                partial_writer.write("model_forward_exception", force=True, extra={"error": repr(exc)})
+                raise
+            heartbeat.emit("model_forward_exit", trainer_class=self.__class__.__name__, global_step=step)
+            partial_writer.write("model_forward_exit")
+            return result
+
+        wrapped_compute_loss._asym_gemm_heartbeat = True  # type: ignore[attr-defined]
+        CustomSeq2SeqTrainer.compute_loss = wrapped_compute_loss
+
+
 def _start_memory_snapshot_recording(enabled: bool) -> dict[str, Any]:
     if not enabled:
         return {"enabled": False}
@@ -403,6 +985,353 @@ def _iter_unique_parameters(value: Any) -> list[torch.nn.Parameter]:
 
     visit(value)
     return params
+
+
+def _tensor_nbytes(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        return int(value.numel()) * int(value.element_size())
+    return 0
+
+
+def _optimizer_memory_summary(optimizer: Any, model: Any | None = None) -> dict[str, Any]:
+    param_count = 0
+    trainable_param_count = 0
+    param_bytes = 0
+    trainable_param_bytes = 0
+    grad_bytes = 0
+    cpu_param_bytes = 0
+    cpu_grad_bytes = 0
+    cuda_param_bytes = 0
+    cuda_grad_bytes = 0
+
+    params = list(model.parameters()) if isinstance(model, torch.nn.Module) else []
+    seen_params: set[int] = set()
+    for param in params:
+        key = id(param)
+        if key in seen_params:
+            continue
+        seen_params.add(key)
+        param_count += int(param.numel())
+        bytes_ = _tensor_nbytes(param)
+        param_bytes += bytes_
+        if param.device.type == "cpu":
+            cpu_param_bytes += bytes_
+        elif param.device.type == "cuda":
+            cuda_param_bytes += bytes_
+        if param.requires_grad:
+            trainable_param_count += int(param.numel())
+            trainable_param_bytes += bytes_
+        if param.grad is not None:
+            grad_nbytes = _tensor_nbytes(param.grad)
+            grad_bytes += grad_nbytes
+            if param.grad.device.type == "cpu":
+                cpu_grad_bytes += grad_nbytes
+            elif param.grad.device.type == "cuda":
+                cuda_grad_bytes += grad_nbytes
+
+    state_tensor_count = 0
+    state_bytes = 0
+    cpu_state_bytes = 0
+    cuda_state_bytes = 0
+    state = getattr(optimizer, "state", None)
+    if isinstance(state, dict):
+        for state_value in state.values():
+            values = state_value.values() if isinstance(state_value, dict) else []
+            for item in values:
+                if isinstance(item, torch.Tensor):
+                    state_tensor_count += 1
+                    nbytes = _tensor_nbytes(item)
+                    state_bytes += nbytes
+                    if item.device.type == "cpu":
+                        cpu_state_bytes += nbytes
+                    elif item.device.type == "cuda":
+                        cuda_state_bytes += nbytes
+
+    return {
+        "param_count": param_count,
+        "trainable_param_count": trainable_param_count,
+        "param_bytes": param_bytes,
+        "trainable_param_bytes": trainable_param_bytes,
+        "grad_bytes": grad_bytes,
+        "cpu_param_bytes": cpu_param_bytes,
+        "cpu_grad_bytes": cpu_grad_bytes,
+        "cuda_param_bytes": cuda_param_bytes,
+        "cuda_grad_bytes": cuda_grad_bytes,
+        "optimizer_state_tensor_count": state_tensor_count,
+        "optimizer_state_bytes": state_bytes,
+        "cpu_optimizer_state_bytes": cpu_state_bytes,
+        "cuda_optimizer_state_bytes": cuda_state_bytes,
+    }
+
+
+def _sample_reduction_stats(sample: torch.Tensor) -> dict[str, Any]:
+    sample_count = int(sample.numel())
+    if sample_count == 0:
+        return {
+            "sample_count": 0,
+            "sample_sum": 0.0,
+            "sample_abs_sum": 0.0,
+            "sample_weighted_sum": 0.0,
+            "sample_max_abs": 0.0,
+        }
+
+    sample_sum = 0.0
+    sample_abs_sum = 0.0
+    sample_weighted_sum = 0.0
+    sample_max_abs = 0.0
+    chunk_size = 1_048_576
+    for offset in range(0, sample_count, chunk_size):
+        chunk = sample[offset : offset + chunk_size].float()
+        sample_sum += float(chunk.sum().item())
+        abs_chunk = chunk.abs()
+        sample_abs_sum += float(abs_chunk.sum().item())
+        sample_max_abs = max(sample_max_abs, float(abs_chunk.max().item()))
+        weights = torch.arange(offset + 1, offset + 1 + int(chunk.numel()), device=chunk.device, dtype=chunk.dtype)
+        sample_weighted_sum += float((chunk * weights).sum().item())
+    return {
+        "sample_count": sample_count,
+        "sample_sum": sample_sum,
+        "sample_abs_sum": sample_abs_sum,
+        "sample_weighted_sum": sample_weighted_sum,
+        "sample_max_abs": sample_max_abs,
+    }
+
+
+def _sample_tensor_stats(tensor: torch.Tensor, *, max_samples: int = 4096) -> dict[str, Any]:
+    flat = tensor.detach().reshape(-1)
+    numel = int(flat.numel())
+    if numel == 0:
+        return {
+            "numel": 0,
+            "max_samples": "all" if max_samples <= 0 else max_samples,
+            "sample_count": 0,
+            "sample_all_elements": True,
+            "sample_sum": 0.0,
+            "sample_abs_sum": 0.0,
+            "sample_weighted_sum": 0.0,
+            "sample_max_abs": 0.0,
+        }
+    if max_samples <= 0 or numel <= max_samples:
+        sample = flat
+        sample_all_elements = True
+    else:
+        if max_samples == 1:
+            indices = torch.tensor([numel - 1], device=flat.device, dtype=torch.long)
+        else:
+            indices = torch.arange(max_samples, device=flat.device, dtype=torch.long)
+            indices = torch.div(indices * (numel - 1), max_samples - 1, rounding_mode="floor")
+            indices[-1] = numel - 1
+        sample = flat[indices]
+        sample_all_elements = False
+    stats = _sample_reduction_stats(sample)
+    return {
+        "numel": numel,
+        "max_samples": "all" if max_samples <= 0 else max_samples,
+        "sample_all_elements": sample_all_elements,
+        **stats,
+    }
+
+
+def _kt_fused_lora_update_snapshot(
+    model: Any | None, *, max_tensors: int | None = None, max_elements: int | None = None
+) -> dict[str, Any]:
+    if not isinstance(model, torch.nn.Module):
+        return {"available": False, "reason": "model unavailable"}
+    if max_tensors is None:
+        max_tensors = _kt_lora_health_max_tensors()
+    if max_elements is None:
+        max_elements = _kt_lora_health_max_elements()
+    limit = int(max_tensors)
+    element_limit = int(max_elements)
+    unlimited = limit <= 0
+    base_model = None
+    if hasattr(model, "get_base_model"):
+        try:
+            base_model = model.get_base_model()
+        except Exception:
+            base_model = None
+    wrappers = _find_kt_wrappers(model, base_model)
+    if wrappers is None:
+        return {"available": False, "reason": "KT wrappers unavailable"}
+
+    rows: list[dict[str, Any]] = []
+    total_fused_tensors = 0
+    for layer_index, layer in enumerate(wrappers):
+        params = _iter_unique_parameters(getattr(layer, "_fused_expert_lora_params", None))
+        total_fused_tensors += len(params)
+        for param_index, param in enumerate(params):
+            if not unlimited and len(rows) >= limit:
+                break
+            row = {
+                "layer_index": layer_index,
+                "layer_idx": getattr(layer, "layer_idx", layer_index),
+                "param_index": param_index,
+                "shape": list(param.shape),
+                "device": str(param.device),
+                "requires_grad": bool(param.requires_grad),
+                "param": _sample_tensor_stats(param, max_samples=element_limit),
+                "grad": _sample_tensor_stats(param.grad, max_samples=element_limit)
+                if isinstance(param.grad, torch.Tensor)
+                else None,
+            }
+            rows.append(row)
+        if not unlimited and len(rows) >= limit:
+            continue
+
+    exhaustive = total_fused_tensors > 0 and len(rows) == total_fused_tensors
+    exhaustive_elements = exhaustive and all(
+        bool((row.get("param") or {}).get("sample_all_elements"))
+        and (row.get("grad") is None or bool((row.get("grad") or {}).get("sample_all_elements")))
+        for row in rows
+    )
+    return {
+        "available": True,
+        "sampled_tensors": len(rows),
+        "total_fused_tensors": total_fused_tensors,
+        "requested_max_tensors": "all" if unlimited else limit,
+        "requested_max_elements": "all" if element_limit <= 0 else element_limit,
+        "exhaustive": exhaustive,
+        "exhaustive_elements": exhaustive_elements,
+        "rows": rows,
+    }
+
+
+def _kt_fused_lora_update_health(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    if not before.get("available") or not after.get("available"):
+        before_reason = before.get("reason")
+        after_reason = after.get("reason")
+        return {
+            "available": False,
+            "passed": False,
+            "reason": f"before unavailable: {before_reason}; after unavailable: {after_reason}",
+            "before_reason": before_reason,
+            "after_reason": after_reason,
+        }
+
+    def key(row: dict[str, Any]) -> tuple[Any, Any, Any]:
+        return (row.get("layer_idx"), row.get("layer_index"), row.get("param_index"))
+
+    before_row_items = [row for row in before.get("rows", []) if isinstance(row, dict)]
+    after_row_items = [row for row in after.get("rows", []) if isinstance(row, dict)]
+    before_keys = {key(row) for row in before_row_items}
+    after_keys = {key(row) for row in after_row_items}
+    missing_after_keys = sorted(str(item) for item in (before_keys - after_keys))
+    unexpected_after_keys = sorted(str(item) for item in (after_keys - before_keys))
+    after_rows = {key(row): row for row in after_row_items}
+    changed_tensors = 0
+    grad_nonzero_tensors = 0
+    updated_grad_tensors = 0
+    grad_nonzero_unchanged_tensors = 0
+    compared_tensors = 0
+    rows: list[dict[str, Any]] = []
+    for before_row in before_row_items:
+        after_row = after_rows.get(key(before_row))
+        if after_row is None:
+            continue
+        compared_tensors += 1
+        before_param = before_row.get("param") or {}
+        after_param = after_row.get("param") or {}
+        before_grad = before_row.get("grad") or {}
+        param_abs_delta = abs(float(after_param.get("sample_sum", 0.0)) - float(before_param.get("sample_sum", 0.0)))
+        param_abs_sum_delta = abs(
+            float(after_param.get("sample_abs_sum", 0.0)) - float(before_param.get("sample_abs_sum", 0.0))
+        )
+        param_weighted_sum_delta = abs(
+            float(after_param.get("sample_weighted_sum", 0.0))
+            - float(before_param.get("sample_weighted_sum", 0.0))
+        )
+        param_max_abs_delta = abs(
+            float(after_param.get("sample_max_abs", 0.0)) - float(before_param.get("sample_max_abs", 0.0))
+        )
+        grad_abs_sum = float(before_grad.get("sample_abs_sum", 0.0))
+        changed = (
+            param_abs_delta > 0.0
+            or param_abs_sum_delta > 0.0
+            or param_weighted_sum_delta > 0.0
+            or param_max_abs_delta > 0.0
+        )
+        grad_nonzero = grad_abs_sum > 0.0
+        changed_tensors += int(changed)
+        grad_nonzero_tensors += int(grad_nonzero)
+        updated_grad_tensors += int(grad_nonzero and changed)
+        grad_nonzero_unchanged_tensors += int(grad_nonzero and not changed)
+        rows.append(
+            {
+                "layer_idx": before_row.get("layer_idx"),
+                "param_index": before_row.get("param_index"),
+                "shape": before_row.get("shape"),
+                "grad_sample_abs_sum_before_step": grad_abs_sum,
+                "param_sample_sum_delta": param_abs_delta,
+                "param_sample_abs_sum_delta": param_abs_sum_delta,
+                "param_sample_weighted_sum_delta": param_weighted_sum_delta,
+                "param_sample_max_abs_delta": param_max_abs_delta,
+                "grad_nonzero_before_step": grad_nonzero,
+                "param_changed_after_step": changed,
+                "nonzero_grad_changed_after_step": grad_nonzero and changed,
+            }
+        )
+
+    sampled_tensors = int(before.get("sampled_tensors", len(before_row_items)) or 0)
+    total_fused_tensors = int(before.get("total_fused_tensors", 0) or 0)
+    after_sampled_tensors = int(after.get("sampled_tensors", len(after_row_items)) or 0)
+    after_total_fused_tensors = int(after.get("total_fused_tensors", 0) or 0)
+    exhaustive = bool(before.get("exhaustive")) and bool(after.get("exhaustive"))
+    exhaustive_elements = bool(before.get("exhaustive_elements")) and bool(after.get("exhaustive_elements"))
+
+    if missing_after_keys or unexpected_after_keys:
+        passed = False
+        reason = (
+            "sampled fused LoRA tensor set changed between before/after optimizer snapshots "
+            f"(missing_after={missing_after_keys[:3]}, unexpected_after={unexpected_after_keys[:3]})"
+        )
+    elif sampled_tensors != after_sampled_tensors or total_fused_tensors != after_total_fused_tensors:
+        passed = False
+        reason = (
+            "fused LoRA tensor counts changed between before/after optimizer snapshots "
+            f"(sampled {sampled_tensors}->{after_sampled_tensors}, total {total_fused_tensors}->{after_total_fused_tensors})"
+        )
+    elif exhaustive and compared_tensors != sampled_tensors:
+        passed = False
+        reason = f"exhaustive fused LoRA health compared {compared_tensors} of {sampled_tensors} tensors"
+    elif compared_tensors <= 0:
+        passed = False
+        reason = "no sampled fused LoRA tensors were comparable"
+    elif grad_nonzero_tensors <= 0:
+        passed = False
+        reason = "no sampled fused LoRA tensors had nonzero gradients before optimizer step"
+    elif grad_nonzero_unchanged_tensors > 0:
+        passed = False
+        reason = "one or more sampled nonzero-gradient fused LoRA tensors did not change after optimizer step"
+    else:
+        passed = True
+        if exhaustive_elements:
+            reason = "all nonzero-gradient fused LoRA tensors changed after optimizer step with full-element checksums"
+        elif exhaustive:
+            reason = "all nonzero-gradient fused LoRA tensors changed after optimizer step"
+        else:
+            reason = "all sampled nonzero-gradient fused LoRA tensors changed after optimizer step"
+
+    return {
+        "available": True,
+        "passed": passed,
+        "reason": reason,
+        "sampled_tensors": sampled_tensors,
+        "total_fused_tensors": total_fused_tensors,
+        "after_sampled_tensors": after_sampled_tensors,
+        "after_total_fused_tensors": after_total_fused_tensors,
+        "requested_max_tensors": before.get("requested_max_tensors"),
+        "requested_max_elements": before.get("requested_max_elements"),
+        "exhaustive": exhaustive,
+        "exhaustive_elements": exhaustive_elements,
+        "compared_tensors": compared_tensors,
+        "missing_after_tensors": len(missing_after_keys),
+        "unexpected_after_tensors": len(unexpected_after_keys),
+        "grad_nonzero_tensors": grad_nonzero_tensors,
+        "changed_tensors": changed_tensors,
+        "updated_grad_tensors": updated_grad_tensors,
+        "grad_nonzero_unchanged_tensors": grad_nonzero_unchanged_tensors,
+        "rows": rows,
+    }
 
 
 def _lora_counters_from_model() -> dict[str, Any]:
@@ -530,6 +1459,12 @@ class StageRecord:
     peak_reserved_bytes: int
     global_peak_allocated_after_bytes: int
     global_peak_reserved_after_bytes: int
+    process_rss_start_bytes: int
+    process_rss_end_bytes: int
+    process_rss_peak_start_bytes: int
+    process_rss_peak_end_bytes: int
+    process_virtual_memory_start_bytes: int
+    process_virtual_memory_end_bytes: int
 
     @property
     def allocated_delta_bytes(self) -> int:
@@ -551,6 +1486,14 @@ class StageRecord:
     def reserved_unallocated_bytes(self) -> int:
         return max(0, self.peak_reserved_bytes - self.peak_allocated_bytes)
 
+    @property
+    def process_rss_delta_bytes(self) -> int:
+        return self.process_rss_end_bytes - self.process_rss_start_bytes
+
+    @property
+    def process_virtual_memory_delta_bytes(self) -> int:
+        return self.process_virtual_memory_end_bytes - self.process_virtual_memory_start_bytes
+
 
 @dataclass
 class LFProfileRecorder:
@@ -566,6 +1509,7 @@ class LFProfileRecorder:
         if sync and torch.cuda.is_available():
             torch.cuda.synchronize()
         start_time = time.perf_counter()
+        process_memory_start = _process_memory_snapshot()
         cuda_available = self.measure_memory and torch.cuda.is_available()
         allocated_start = reserved_start = 0
         if cuda_available:
@@ -583,6 +1527,7 @@ class LFProfileRecorder:
             if sync and torch.cuda.is_available():
                 torch.cuda.synchronize()
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+            process_memory_end = _process_memory_snapshot()
             allocated_end = reserved_end = peak_allocated = peak_reserved = 0
             global_peak_allocated = global_peak_reserved = 0
             if cuda_available:
@@ -605,6 +1550,14 @@ class LFProfileRecorder:
                     peak_reserved_bytes=peak_reserved,
                     global_peak_allocated_after_bytes=global_peak_allocated,
                     global_peak_reserved_after_bytes=global_peak_reserved,
+                    process_rss_start_bytes=_process_memory_value(process_memory_start, "rss_bytes"),
+                    process_rss_end_bytes=_process_memory_value(process_memory_end, "rss_bytes"),
+                    process_rss_peak_start_bytes=_process_memory_value(process_memory_start, "rss_peak_bytes"),
+                    process_rss_peak_end_bytes=_process_memory_value(process_memory_end, "rss_peak_bytes"),
+                    process_virtual_memory_start_bytes=_process_memory_value(
+                        process_memory_start, "virtual_memory_bytes"
+                    ),
+                    process_virtual_memory_end_bytes=_process_memory_value(process_memory_end, "virtual_memory_bytes"),
                 )
             )
 
@@ -661,6 +1614,17 @@ class LFProfileRecorder:
                         record.global_peak_reserved_after_bytes for record in records
                     ),
                     "avg_reserved_unallocated_bytes": avg("reserved_unallocated_bytes"),
+                    "avg_process_rss_start_bytes": avg("process_rss_start_bytes"),
+                    "avg_process_rss_end_bytes": avg("process_rss_end_bytes"),
+                    "avg_process_rss_delta_bytes": avg("process_rss_delta_bytes"),
+                    "max_process_rss_end_bytes": max(record.process_rss_end_bytes for record in records),
+                    "max_process_rss_peak_end_bytes": max(record.process_rss_peak_end_bytes for record in records),
+                    "avg_process_virtual_memory_start_bytes": avg("process_virtual_memory_start_bytes"),
+                    "avg_process_virtual_memory_end_bytes": avg("process_virtual_memory_end_bytes"),
+                    "avg_process_virtual_memory_delta_bytes": avg("process_virtual_memory_delta_bytes"),
+                    "max_process_virtual_memory_end_bytes": max(
+                        record.process_virtual_memory_end_bytes for record in records
+                    ),
                 }
             )
         return rows
@@ -694,6 +1658,13 @@ class LFProfileRecorder:
                     f"{prefix}_global_peak_allocated_after_bytes": record.global_peak_allocated_after_bytes,
                     f"{prefix}_global_peak_reserved_after_bytes": record.global_peak_reserved_after_bytes,
                     f"{prefix}_reserved_unallocated_bytes": record.reserved_unallocated_bytes,
+                    f"{prefix}_process_rss_start_bytes": record.process_rss_start_bytes,
+                    f"{prefix}_process_rss_end_bytes": record.process_rss_end_bytes,
+                    f"{prefix}_process_rss_delta_bytes": record.process_rss_delta_bytes,
+                    f"{prefix}_process_rss_peak_end_bytes": record.process_rss_peak_end_bytes,
+                    f"{prefix}_process_virtual_memory_start_bytes": record.process_virtual_memory_start_bytes,
+                    f"{prefix}_process_virtual_memory_end_bytes": record.process_virtual_memory_end_bytes,
+                    f"{prefix}_process_virtual_memory_delta_bytes": record.process_virtual_memory_delta_bytes,
                 }
             )
 
@@ -730,6 +1701,10 @@ class LFProfileRecorder:
             row["reserved_unallocated_bytes"] = max(
                 0, int(row["peak_reserved_hbm_bytes"]) - int(row["peak_allocated_hbm_bytes"])
             )
+            rss_values = [record.process_rss_end_bytes for record in (forward, backward) if record is not None]
+            peak_rss_values = [record.process_rss_peak_end_bytes for record in (forward, backward) if record is not None]
+            row["process_rss_end_bytes"] = max(rss_values or [0])
+            row["process_rss_peak_bytes"] = max(peak_rss_values or [0])
             rows.append(row)
         return rows
 
@@ -770,6 +1745,9 @@ class LFProfileRecorder:
         trainer_log = output_dir / "trainer_log.jsonl" if output_dir is not None else None
         trainer_records = _trainer_log_records(trainer_log) if trainer_log is not None else []
         losses = self._loss_rows(trainer_records)
+        lora = _lora_counters_from_model()
+        kt = _kt_counters_from_model()
+        process_memory = _process_memory_snapshot()
         return {
             "workload": self.config.get("workload", "lf"),
             "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -793,6 +1771,7 @@ class LFProfileRecorder:
                         0, self.global_peak_reserved_bytes - self.global_peak_allocated_bytes
                     ),
                 },
+                "process": process_memory,
                 "peak_allocated_hbm_bytes": self.global_peak_allocated_bytes,
                 "peak_reserved_hbm_bytes": self.global_peak_reserved_bytes,
                 "reserved_unallocated_bytes": max(0, self.global_peak_reserved_bytes - self.global_peak_allocated_bytes),
@@ -820,8 +1799,10 @@ class LFProfileRecorder:
                 "records": len(trainer_records),
                 "losses": losses,
             },
-            "lora": _lora_counters_from_model(),
-            "kt": _kt_counters_from_model(),
+            "lora": lora,
+            "kt": kt,
+            "optimizer_memory_preflight": _kt_optimizer_memory_preflight(lora, self.config),
+            "optimizer_memory": _OPTIMIZER_MEMORY_MARKER,
             "superoffload": _superoffload_summary_from_config(self.config),
             "expert_token_distribution": {"samples": 0, "per_expert": []},
             "notes": [
@@ -832,6 +1813,8 @@ class LFProfileRecorder:
 
 
 def main() -> None:
+    global _MODEL_CAPTURE_HEARTBEAT, _MODEL_CAPTURE_PARTIAL_WRITER
+
     lf_args = sys.argv[1:]
     if lf_args and lf_args[0] == "train":
         lf_args = lf_args[1:]
@@ -850,34 +1833,69 @@ def main() -> None:
         reset_stage_peak_stats=not trace_config.memory_breakdown,
     )
     source_json = os.environ.get(PROFILE_SOURCE_JSON_ENV)
+    heartbeat_path = os.environ.get(PROFILE_HEARTBEAT_ENV)
+    if source_json and _is_rank0():
+        source_path = Path(source_json)
+        _unlink_if_exists(source_path)
+        _unlink_if_exists(source_path.with_name("source_profile.partial.json"))
+    if heartbeat_path and _is_rank0():
+        heartbeat_file = Path(heartbeat_path)
+        _unlink_if_exists(heartbeat_file)
+        _unlink_if_exists(heartbeat_file.with_name(f"{heartbeat_file.stem}.latest.json"))
     snapshot_enabled = _env_enabled(PROFILE_MEMORY_SNAPSHOT_ENV, default=False) and _is_rank0()
     snapshot_info = _start_memory_snapshot_recording(snapshot_enabled)
 
     set_profile_enabled(True)
     trace_handle = install_lf_trace(trace_config, recorder=recorder)
+    heartbeat = LFHeartbeat(heartbeat_path, config)
+    partial_writer = PartialProfileWriter(source_json, recorder, trace_handle, heartbeat)
+    _MODEL_CAPTURE_HEARTBEAT = heartbeat
+    _MODEL_CAPTURE_PARTIAL_WRITER = partial_writer
+    heartbeat.emit("profile_launcher_start", source_json=source_json, partial_json=str(partial_writer.path or ""))
+    partial_writer.write("profile_launcher_start", force=True)
     _install_model_capture_hook()
-    _install_deepspeed_optimizer_capture_hook()
+    _install_trainer_heartbeat_hooks(heartbeat, partial_writer)
+    if _should_install_deepspeed_hook(lf_args, config):
+        _install_deepspeed_optimizer_capture_hook()
 
+    run_succeeded = False
+    run_exception: BaseException | None = None
     try:
         from llamafactory.train.tuner import run_exp
 
         with trace_handle.saved_tensor_context():
+            heartbeat.emit("run_exp_enter")
+            partial_writer.write("run_exp_enter", force=True)
             run_exp(lf_args)
+        run_succeeded = True
+    except BaseException as exc:
+        run_exception = exc
+        heartbeat.emit("profile_launcher_exception", error=repr(exc))
+        partial_writer.write("profile_launcher_exception", force=True, extra={"error": repr(exc)})
+        raise
     finally:
+        heartbeat.emit("profile_launcher_finally", success=run_succeeded)
+        partial_writer.write("profile_launcher_finally", force=True)
         if source_json and _is_rank0():
             path = Path(source_json)
-            path.parent.mkdir(parents=True, exist_ok=True)
+            write_path = path if run_succeeded else path.with_name("source_profile.partial.json")
+            write_path.parent.mkdir(parents=True, exist_ok=True)
             snapshot_path_raw = os.environ.get(PROFILE_MEMORY_SNAPSHOT_PATH_ENV, "").strip()
-            snapshot_path = Path(snapshot_path_raw) if snapshot_path_raw else path.parent / "memory_snapshot.pickle"
+            snapshot_path = Path(snapshot_path_raw) if snapshot_path_raw else write_path.parent / "memory_snapshot.pickle"
             snapshot_info = _dump_memory_snapshot(snapshot_info, snapshot_path)
             report = recorder.report(trace_handle)
+            if not run_succeeded:
+                report["partial"] = True
+                report["partial_reason"] = "profile_launcher_exception"
+                if run_exception is not None:
+                    report["error"] = repr(run_exception)
             if snapshot_info.get("enabled"):
                 report["memory_snapshot"] = snapshot_info
             memory_breakdown = trace_handle.memory_breakdown_report()
             if memory_breakdown.get("enabled"):
                 output_base = os.environ.get(PROFILE_MEMORY_BREAKDOWN_OUTPUT_ENV, "memory_breakdown").strip() or "memory_breakdown"
-                breakdown_jsonl = path.parent / f"{output_base}.jsonl"
-                breakdown_summary_json = path.parent / f"{output_base}_summary.json"
+                breakdown_jsonl = write_path.parent / f"{output_base}.jsonl"
+                breakdown_summary_json = write_path.parent / f"{output_base}_summary.json"
                 rows = memory_breakdown.get("rows", [])
                 row_items = rows if isinstance(rows, list) else []
                 with breakdown_jsonl.open("w", encoding="utf-8") as handle:
@@ -892,7 +1910,17 @@ def main() -> None:
                     "summary": summary,
                     "rows": len(row_items),
                 }
-            path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            if run_succeeded:
+                heartbeat.emit("source_profile_written", source_json=str(path))
+            else:
+                heartbeat.emit("source_profile_partial_written", source_json=str(write_path), error=repr(run_exception))
+            report["heartbeat"] = {
+                "jsonl": str(heartbeat.path) if heartbeat.path is not None else "",
+                "latest": heartbeat.latest,
+            }
+            write_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _MODEL_CAPTURE_HEARTBEAT = None
+        _MODEL_CAPTURE_PARTIAL_WRITER = None
         uninstall_lf_trace(trace_handle)
 
 

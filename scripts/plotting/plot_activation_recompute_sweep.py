@@ -23,6 +23,7 @@ BACKENDS = (
     "zero2",
     "zero3",
     "zero3_offload",
+    "zero3_offload_mem",
     "superoffload",
     "kt",
     "kt_torchbf16",
@@ -86,6 +87,7 @@ BACKEND_MARKERS = {
     "zero2": "o",
     "zero3": "D",
     "zero3_offload": "P",
+    "zero3_offload_mem": "*",
     "superoffload": "X",
     "kt": "s",
     "kt_torchbf16": "s",
@@ -201,6 +203,11 @@ def parse_args() -> argparse.Namespace:
         "--combined-only",
         action="store_true",
         help="Only write the combined index and combined plots.",
+    )
+    parser.add_argument(
+        "--allow-mismatched-trainable-surface",
+        action="store_true",
+        help="Allow cross-backend tables when trainable parameter surfaces are missing or mismatched.",
     )
     return parser.parse_args()
 
@@ -465,6 +472,19 @@ def numeric_int(value: Any, default: int = 0) -> int:
     return default
 
 
+def optional_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float) and math.isfinite(value):
+        return int(value)
+    try:
+        return int(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
 def nested_float(mapping: dict[str, Any], section: str, key: str, default: float = 0.0) -> float:
     value = mapping.get(section)
     if not isinstance(value, dict):
@@ -673,6 +693,14 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
     else:
         expert_recompute_sweep_x = 0.0
         expert_recompute_sweep_x_name = "none"
+    trainable_surface = first_dict(profile, "trainable_surface")
+    lora = first_dict(profile, "lora")
+    trainable_parameters = optional_int(trainable_surface.get("trainable_parameters"))
+    if trainable_parameters is None:
+        trainable_parameters = optional_int(lora.get("trainable_parameters"))
+    trainable_surface_available = bool(trainable_surface.get("available")) if trainable_surface else False
+    trainable_surface_label = str(trainable_surface.get("surface") or "unknown")
+    trainable_surface_note = str(trainable_surface.get("comparison_note") or "")
     return {
         "workload": meta["workload"],
         "workload_base": meta.get("workload_base", meta["workload"]),
@@ -696,6 +724,19 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         "backend": meta["backend"],
         "router_mode": router_mode,
         "profiler": meta["profiler"],
+        "trainable_surface_available": trainable_surface_available,
+        "trainable_surface": trainable_surface_label,
+        "trainable_parameters": trainable_parameters if trainable_parameters is not None else "",
+        "expert_lora_parameters": optional_int(trainable_surface.get("expert_lora_parameters"))
+        if trainable_surface
+        else "",
+        "non_expert_peft_lora_parameters": optional_int(trainable_surface.get("non_expert_peft_lora_parameters"))
+        if trainable_surface
+        else "",
+        "trainable_surface_note": trainable_surface_note,
+        "same_trainable_surface": "",
+        "trainable_surface_group_backends": "",
+        "trainable_surface_group_note": "",
         "step_ms": step_ms(profile),
         "forward_ms": numeric_float(first_dict(profile, "forward").get("total_milliseconds")),
         "backward_ms": numeric_float(first_dict(profile, "backward").get("total_milliseconds")),
@@ -810,6 +851,56 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
     }
 
 
+def trainable_surface_comparison_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        row["workload"],
+        row["precision"],
+        row["batch_size"],
+        row["lora_dropout"],
+        row["seq_len"],
+        row["router_mode"],
+        row["profiler"],
+        row["mode"],
+        row["expert_policy_label"],
+    )
+
+
+def annotate_trainable_surface_groups(rows: list[dict[str, Any]]) -> None:
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for row in rows:
+        groups.setdefault(trainable_surface_comparison_key(row), []).append(row)
+
+    for group_rows in groups.values():
+        backends = sorted({str(row.get("backend", "")) for row in group_rows})
+        comparable = len(backends) > 1
+        available = all(bool(row.get("trainable_surface_available")) for row in group_rows)
+        params = [optional_int(row.get("trainable_parameters")) for row in group_rows]
+        surfaces = [str(row.get("trainable_surface") or "unknown") for row in group_rows]
+        matched = bool(comparable and available and all(param is not None for param in params) and len(set(params)) == 1 and len(set(surfaces)) == 1)
+        if not comparable:
+            note = "single backend in comparison group"
+            same_value: bool | str = True
+        elif matched:
+            note = "matched trainable surface across backends"
+            same_value = True
+        else:
+            note = "missing or mismatched trainable surface across backends"
+            same_value = False
+        for row in group_rows:
+            row["same_trainable_surface"] = same_value
+            row["trainable_surface_group_backends"] = ",".join(backends)
+            row["trainable_surface_group_note"] = note
+
+
+def trainable_surface_mismatch_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in rows
+        if "," in str(row.get("trainable_surface_group_backends", ""))
+        and row.get("same_trainable_surface") is not True
+    ]
+
+
 def collect_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
     input_root = resolve_path(args.input_root)
     rows = [row for path in result_dirs(input_root) if (row := row_from_result_dir(args, path)) is not None]
@@ -833,6 +924,7 @@ def collect_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
         )
         deduped.setdefault(key, row)
     rows = list(deduped.values())
+    annotate_trainable_surface_groups(rows)
     return sorted(
         rows,
         key=lambda row: (
@@ -2593,6 +2685,17 @@ def main() -> None:
             clean_output_dir(root)
         if not args.skip_combined:
             clean_output_dir(combined_dir)
+    mismatch_rows = trainable_surface_mismatch_rows(rows)
+    if mismatch_rows:
+        write_table(mismatch_rows, root, "trainable_surface_mismatches")
+        if not getattr(args, "allow_mismatched_trainable_surface", False):
+            first = mismatch_rows[0]
+            raise SystemExit(
+                "cross-backend trainable surfaces are missing or mismatched; "
+                f"first mismatch workload={first.get('workload')} seq={first.get('seq_len')} "
+                f"profiler={first.get('profiler')} backends={first.get('trainable_surface_group_backends')}. "
+                "Use --allow-mismatched-trainable-surface only for historical artifact collection."
+            )
     write_table(rows, root, "activation_recompute_sweep_index")
     if step_rows:
         write_table(step_rows, root, "step_samples_index")

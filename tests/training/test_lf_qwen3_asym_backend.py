@@ -8,22 +8,41 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+import asym_gemm
 from asym_gemm.integrations.lf import (
     apply_lf_asym_lora,
+    classify_lf_component,
     get_asym_lora_state_dict,
     load_asym_peft_adapter,
+    parse_lf_offload_modules,
     save_asym_peft_adapter,
 )
 from asym_gemm.integrations.peft_lf import adapt_lf_asym_peft_lora
-from asym_gemm.training.frozen_linear import TorchGroupedFrozenLinear
-from asym_gemm.training.llama4_moe import AsymLlama4Moe, is_llama4_moe
+from asym_gemm.training.frozen_linear import AsymFrozenLinear, TorchGroupedFrozenLinear
+from asym_gemm.training.llama4_moe import AsymLlama4Moe, AsymLlama4Router, is_llama4_moe
+from asym_gemm.training.lora import AsymLoRALinear
 from asym_gemm.training.moe import (
     build_contiguous_route_metadata,
     make_dense_group_metadata,
     pack_tokens_contiguous,
     parse_expert_recompute_policy_spec,
 )
-from asym_gemm.training.qwen3_moe import AsymQwen3Experts, AsymQwen3MoeBlock, is_qwen3_experts, is_qwen3_moe_block
+from asym_gemm.training.offload import AsymFrozenEmbedding, AsymFrozenLayerNorm, AsymFrozenRMSNorm
+from asym_gemm.training.qwen3_moe import (
+    AsymQwen3Experts,
+    AsymQwen3MoeBlock,
+    AsymQwen3Router,
+    is_qwen3_experts,
+    is_qwen3_moe_block,
+)
+
+
+def _sm100_bf16_available() -> bool:
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability(0)[0] >= 10
+        and hasattr(asym_gemm, "m_grouped_bf16_asym_gemm_nt_contiguous")
+    )
 
 
 class FakeQwen3Experts(nn.Module):
@@ -88,20 +107,27 @@ class FakeQwen3Moe(nn.Module):
 
 
 class FakeBlock(nn.Module):
-    def __init__(self, *, hidden_dim: int = 8, intermediate_dim: int = 8) -> None:
+    def __init__(self, *, hidden_dim: int = 8, intermediate_dim: int = 8, num_experts: int = 4) -> None:
         super().__init__()
         self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
         self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
         self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
         self.o_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
-        self.mlp = FakeQwen3Moe(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim)
+        self.mlp = FakeQwen3Moe(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim, num_experts=num_experts)
 
 
 class FakeModel(nn.Module):
-    def __init__(self, *, hidden_dim: int = 8, intermediate_dim: int = 8, num_layers: int = 2) -> None:
+    def __init__(
+        self,
+        *,
+        hidden_dim: int = 8,
+        intermediate_dim: int = 8,
+        num_layers: int = 2,
+        num_experts: int = 4,
+    ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
-            [FakeBlock(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim) for _ in range(num_layers)]
+            [FakeBlock(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim, num_experts=num_experts) for _ in range(num_layers)]
         )
         self.lm_head = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
 
@@ -111,6 +137,58 @@ class FakeModel(nn.Module):
             routed = layer.mlp.experts(hidden_states, top_k_index, top_k_weights)
             hidden_states = (hidden_states + dense.mul(0.125).to(hidden_states.dtype) + routed).to(dtype=hidden_states.dtype)
         return self.lm_head(hidden_states)
+
+
+class FakeTiedHeadModel(FakeModel):
+    def __init__(self, *, hidden_dim: int = 8, intermediate_dim: int = 8, num_layers: int = 2) -> None:
+        super().__init__(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim, num_layers=num_layers)
+        self.embed_tokens = nn.Embedding(hidden_dim, hidden_dim, dtype=torch.bfloat16)
+        self.lm_head.weight = self.embed_tokens.weight
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
+
+    def get_output_embeddings(self) -> nn.Linear:
+        return self.lm_head
+
+
+class FakeEmbeddingModel(FakeModel):
+    def __init__(self, *, hidden_dim: int = 8, intermediate_dim: int = 8, num_layers: int = 2) -> None:
+        super().__init__(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim, num_layers=num_layers)
+        self.embed_tokens = nn.Embedding(hidden_dim, hidden_dim, dtype=torch.bfloat16)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
+
+    def get_output_embeddings(self) -> nn.Linear:
+        return self.lm_head
+
+
+class FakeRMSNorm(nn.Module):
+    def __init__(self, hidden_dim: int = 8, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_dim, dtype=torch.bfloat16))
+        self.variance_epsilon = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        variance = x.float().pow(2).mean(-1, keepdim=True)
+        return (x.float() * torch.rsqrt(variance + self.variance_epsilon) * self.weight.float()).to(dtype=x.dtype)
+
+
+class FakeStatelessL2Norm(nn.Module):
+    def __init__(self, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)).to(dtype=x.dtype)
+
+
+class FakeNormModel(FakeModel):
+    def __init__(self, *, hidden_dim: int = 8, intermediate_dim: int = 8, num_layers: int = 2) -> None:
+        super().__init__(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim, num_layers=num_layers)
+        self.input_layernorm = nn.LayerNorm(hidden_dim, dtype=torch.bfloat16)
+        self.norm = FakeRMSNorm(hidden_dim)
 
 
 class FakeGemma4Block(nn.Module):
@@ -209,6 +287,8 @@ class FakeLlama4Moe(nn.Module):
 class FakeLlama4Block(nn.Module):
     def __init__(self, *, hidden_size: int = 8, intermediate_size: int = 8) -> None:
         super().__init__()
+        self.self_attn = nn.Module()
+        self.self_attn.qk_norm = FakeStatelessL2Norm()
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False, dtype=torch.bfloat16)
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False, dtype=torch.bfloat16)
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False, dtype=torch.bfloat16)
@@ -246,6 +326,13 @@ def _routing() -> tuple[torch.Tensor, torch.Tensor]:
         dtype=torch.bfloat16,
     )
     return indices, weights
+
+
+def _assert_cpu_owner_adopted_or_pinned_replacement(tensor: torch.Tensor, source_data_ptr: int) -> None:
+    assert tensor.device.type == "cpu"
+    if torch.cuda.is_available() and tensor.is_pinned():
+        return
+    assert tensor.untyped_storage().data_ptr() == source_data_ptr
 
 
 def _copy_random_lora_params(lhs: nn.Module, rhs: nn.Module, *, seed: int = 99) -> None:
@@ -286,6 +373,71 @@ def _assert_grad_close(name: str, actual: torch.Tensor | None, expected: torch.T
     assert torch.isfinite(actual.float()).all(), f"{name} actual grad has non-finite values"
     assert torch.isfinite(expected.float()).all(), f"{name} expected grad has non-finite values"
     _assert_tensor_close_l2(name, actual, expected)
+
+
+def test_lf_offload_module_parser_stage1_contract() -> None:
+    assert parse_lf_offload_modules(None).routed_experts
+    assert not parse_lf_offload_modules("").any_cpu_offload
+    assert not parse_lf_offload_modules("none").any_cpu_offload
+    assert parse_lf_offload_modules("routed,experts").implemented_components == frozenset({"routed_experts"})
+    assert parse_lf_offload_modules("attention").implemented_components == frozenset({"attention"})
+    assert parse_lf_offload_modules("router").implemented_components == frozenset({"router"})
+    assert parse_lf_offload_modules("shared_experts").implemented_components == frozenset({"shared_experts"})
+    assert parse_lf_offload_modules("embed_tokens").implemented_components == frozenset({"embed_tokens"})
+    assert parse_lf_offload_modules("lm_head").implemented_components == frozenset({"lm_head"})
+    assert parse_lf_offload_modules("norms").implemented_components == frozenset({"norms"})
+    assert parse_lf_offload_modules("q_proj").attention_targets == frozenset({"q_proj"})
+    assert parse_lf_offload_modules("all").implemented_components == frozenset(
+        {"routed_experts", "router", "shared_experts", "attention", "embed_tokens", "lm_head", "norms"}
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        parse_lf_offload_modules("none,routed_experts")
+    with pytest.raises(ValueError, match="unknown"):
+        parse_lf_offload_modules("mlp_dense")
+
+
+@pytest.mark.parametrize(
+    ("name", "component"),
+    [
+        ("model.layers.0.mlp.experts", "routed_experts"),
+        ("model.layers.0.mlp.experts.gate_up_proj", "routed_experts"),
+        ("model.layers.0.mlp.experts.down_proj", "routed_experts"),
+        ("model.layers.0.mlp.gate", "router"),
+        ("model.layers.0.mlp.gate.weight", "router"),
+        ("model.layers.0.mlp.shared_expert.gate_proj.weight", "shared_experts"),
+        ("model.layers.0.mlp.shared_expert_gate.weight", "shared_experts"),
+        ("model.layers.0.self_attn.q_proj.weight", "attention"),
+        ("q_proj", "attention"),
+        ("model.layers.0.q_proj.weight", "attention"),
+        ("embed_tokens", "embed_tokens"),
+        ("model.embed_tokens.weight", "embed_tokens"),
+        ("lm_head", "lm_head"),
+        ("model.lm_head.weight", "lm_head"),
+        ("model.layers.0.input_layernorm.weight", "norms"),
+        ("model.layers.0.post_attention_layernorm.weight", "norms"),
+        ("model.layers.0.feed_forward.experts.gate_up_proj", "routed_experts"),
+        ("model.layers.0.feed_forward.experts.down_proj", "routed_experts"),
+        ("model.layers.0.feed_forward.router", "router"),
+        ("model.layers.0.feed_forward.router.weight", "router"),
+        ("model.layers.0.feed_forward.shared_expert.down_proj.weight", "shared_experts"),
+    ],
+)
+def test_lf_component_classifier_covers_qwen3_qwen35_llama4_names(name: str, component: str) -> None:
+    assert classify_lf_component(name) == component
+
+
+def test_lf_trace_model_memory_summary_attributes_host_weights_by_component() -> None:
+    from asym_gemm.profiling.lf_trace import _model_memory_summary
+    from asym_gemm.training.offload import AsymFrozenEmbedding
+
+    model = nn.Module()
+    model.embed_tokens = AsymFrozenEmbedding(nn.Embedding(8, 4, dtype=torch.bfloat16))
+
+    summary = _model_memory_summary(model)
+    host_rows = [row for row in summary["rows"] if row["category"] == "host_weight"]
+    assert any(row["component"] == "embed_tokens" and row["bytes"] > 0 for row in host_rows)
+    assert not any(row["component"] == "routed_experts" for row in host_rows)
 
 
 def test_is_qwen3_experts_accepts_packed_fake_and_rejects_linear() -> None:
@@ -445,6 +597,327 @@ def test_asym_qwen3_owned_moe_router_no_grad_and_debug_grad() -> None:
     )
     _debug_indices, debug_weights, _ = debug._compute_routing(flat)
     assert debug_weights.requires_grad
+
+
+def test_apply_lf_asym_lora_adopts_cpu_expert_storage_without_clone() -> None:
+    model = FakeModel()
+    first_experts = model.layers[0].mlp.experts
+    gate_up_key = first_experts.gate_up_proj.untyped_storage().data_ptr()
+    down_key = first_experts.down_proj.untyped_storage().data_ptr()
+
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["experts"],
+        dense_target_modules=[],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="routed_experts",
+        router_mode="hf",
+        strict=True,
+    )
+
+    wrapped = model.layers[0].mlp.experts
+    assert isinstance(wrapped, AsymQwen3Experts)
+    _assert_cpu_owner_adopted_or_pinned_replacement(wrapped.gate_up_base.host_weight.weight, gate_up_key)
+    _assert_cpu_owner_adopted_or_pinned_replacement(wrapped.down_base.host_weight.weight, down_key)
+    assert report.cpu_resident_base_bytes_by_component["routed_experts"] > 0
+    assert report.selected_gpu_resident_base_bytes_by_component == {}
+    assert not any("gate_up_proj" in name or "down_proj" in name for name, _param in model.named_parameters())
+
+
+def test_apply_lf_asym_lora_attention_lora_adopts_cpu_storage_without_clone() -> None:
+    model = FakeModel()
+    q_proj_key = model.layers[0].q_proj.weight.untyped_storage().data_ptr()
+
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj"],
+        dense_target_modules=["q_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="q_proj",
+        router_mode="hf",
+        strict=True,
+    )
+
+    wrapped = model.layers[0].q_proj
+    assert isinstance(wrapped, AsymLoRALinear)
+    _assert_cpu_owner_adopted_or_pinned_replacement(wrapped.base_layer.host_weight.weight, q_proj_key)
+    assert report.cpu_resident_base_bytes_by_component["attention"] > 0
+    assert report.selected_gpu_resident_base_bytes_by_component == {}
+    assert not any(name == "layers.0.q_proj.weight" for name, _param in model.named_parameters())
+
+
+def test_apply_lf_asym_lora_attention_frozen_base_adopts_cpu_storage_without_clone() -> None:
+    model = FakeModel()
+    q_proj_key = model.layers[0].q_proj.weight.untyped_storage().data_ptr()
+
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["experts"],
+        dense_target_modules=[],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="q_proj",
+        router_mode="hf",
+        strict=True,
+    )
+
+    wrapped = model.layers[0].q_proj
+    assert isinstance(wrapped, AsymFrozenLinear)
+    _assert_cpu_owner_adopted_or_pinned_replacement(wrapped.host_weight.weight, q_proj_key)
+    assert report.cpu_resident_base_bytes_by_component["attention"] > 0
+    assert report.selected_gpu_resident_base_bytes_by_component == {}
+
+
+def test_apply_lf_asym_lora_qwen3_router_adopts_cpu_storage_without_clone() -> None:
+    model = FakeModel()
+    router_key = model.layers[0].mlp.gate.weight.untyped_storage().data_ptr()
+
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj"],
+        dense_target_modules=["q_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="router",
+        router_mode="hf",
+        strict=True,
+    )
+
+    wrapped = model.layers[0].mlp.gate
+    assert isinstance(wrapped, AsymQwen3Router)
+    _assert_cpu_owner_adopted_or_pinned_replacement(wrapped.proj.host_weight.weight, router_key)
+    assert report.cpu_resident_base_bytes_by_component["router"] > 0
+    assert report.selected_gpu_resident_base_bytes_by_component == {}
+    assert not any(".mlp.gate.weight" in name for name, _param in model.named_parameters())
+
+
+def test_apply_lf_asym_lora_lm_head_adopts_cpu_storage_without_clone() -> None:
+    model = FakeModel()
+    lm_head_key = model.lm_head.weight.untyped_storage().data_ptr()
+
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj"],
+        dense_target_modules=["q_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="lm_head",
+        router_mode="hf",
+        strict=True,
+    )
+
+    assert isinstance(model.lm_head, AsymFrozenLinear)
+    _assert_cpu_owner_adopted_or_pinned_replacement(model.lm_head.host_weight.weight, lm_head_key)
+    assert report.cpu_resident_base_bytes_by_component["lm_head"] > 0
+    assert report.selected_gpu_resident_base_bytes_by_component == {}
+    assert not any(name == "lm_head.weight" for name, _param in model.named_parameters())
+
+
+def test_apply_lf_asym_lora_lm_head_rejects_tied_input_output_embeddings() -> None:
+    model = FakeTiedHeadModel()
+    with pytest.raises(ValueError, match="tied embed/lm_head"):
+        apply_lf_asym_lora(
+            model,
+            raw_lora_target=["q_proj"],
+            dense_target_modules=["q_proj"],
+            lora_rank=2,
+            lora_alpha=4.0,
+            lora_dropout=0.0,
+            backend="asym",
+            precision="bf16",
+            offload_modules="lm_head",
+            router_mode="hf",
+            strict=True,
+        )
+
+
+def test_apply_lf_asym_lora_embed_tokens_adopts_cpu_storage_without_clone() -> None:
+    model = FakeEmbeddingModel()
+    embed_key = model.embed_tokens.weight.untyped_storage().data_ptr()
+    input_ids = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.long)
+    expected = model.embed_tokens(input_ids)
+
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj"],
+        dense_target_modules=["q_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="embed_tokens",
+        router_mode="hf",
+        strict=True,
+    )
+
+    assert isinstance(model.embed_tokens, AsymFrozenEmbedding)
+    assert not isinstance(model.embed_tokens, (AsymFrozenLinear, AsymLoRALinear))
+    assert model.embed_tokens.host_weight.weight.untyped_storage().data_ptr() == embed_key
+    torch.testing.assert_close(model.embed_tokens(input_ids), expected)
+    assert report.cpu_resident_base_bytes_by_component["embed_tokens"] > 0
+    assert report.selected_gpu_resident_base_bytes_by_component == {}
+    assert not any(name == "embed_tokens.weight" for name, _param in model.named_parameters())
+
+
+def test_apply_lf_asym_lora_embed_tokens_rejects_tied_input_output_embeddings() -> None:
+    model = FakeTiedHeadModel()
+    with pytest.raises(ValueError, match="tied embed/lm_head"):
+        apply_lf_asym_lora(
+            model,
+            raw_lora_target=["q_proj"],
+            dense_target_modules=["q_proj"],
+            lora_rank=2,
+            lora_alpha=4.0,
+            lora_dropout=0.0,
+            backend="asym",
+            precision="bf16",
+            offload_modules="embed_tokens",
+            router_mode="hf",
+            strict=True,
+        )
+
+
+def test_apply_lf_asym_lora_layernorm_adopts_cpu_storage_without_clone() -> None:
+    model = FakeNormModel()
+    norm_key = model.input_layernorm.weight.untyped_storage().data_ptr()
+    bias_key = model.input_layernorm.bias.untyped_storage().data_ptr()
+    x = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+    expected = model.input_layernorm(x)
+
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj"],
+        dense_target_modules=["q_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="norms",
+        router_mode="hf",
+        strict=True,
+    )
+
+    assert isinstance(model.input_layernorm, AsymFrozenLayerNorm)
+    assert not isinstance(model.input_layernorm, (AsymFrozenLinear, AsymLoRALinear))
+    assert model.input_layernorm.host_weight.weight.untyped_storage().data_ptr() == norm_key
+    assert model.input_layernorm.bias.untyped_storage().data_ptr() == bias_key
+    torch.testing.assert_close(model.input_layernorm(x), expected)
+    assert report.cpu_resident_base_bytes_by_component["norms"] > 0
+    assert report.selected_gpu_resident_base_bytes_by_component == {}
+    assert not any(name == "input_layernorm.weight" for name, _param in model.named_parameters())
+    assert not any(name == "input_layernorm.bias" for name, _param in model.named_parameters())
+
+
+def test_apply_lf_asym_lora_rmsnorm_adopts_cpu_storage_without_clone() -> None:
+    model = FakeNormModel()
+    norm_key = model.norm.weight.untyped_storage().data_ptr()
+    x = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+    expected = model.norm(x)
+
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj"],
+        dense_target_modules=["q_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="norms",
+        router_mode="hf",
+        strict=True,
+    )
+
+    assert isinstance(model.norm, AsymFrozenRMSNorm)
+    assert not isinstance(model.norm, (AsymFrozenLinear, AsymLoRALinear))
+    assert model.norm.host_weight.weight.untyped_storage().data_ptr() == norm_key
+    torch.testing.assert_close(model.norm(x), expected)
+    assert report.cpu_resident_base_bytes_by_component["norms"] > 0
+    assert report.selected_gpu_resident_base_bytes_by_component == {}
+    assert not any(name == "norm.weight" for name, _param in model.named_parameters())
+
+
+def test_apply_lf_asym_lora_norms_allows_stateless_llama4_qk_norm() -> None:
+    model = FakeLlama4Model()
+    qk_norm = model.layers[0].self_attn.qk_norm
+    x = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+    expected = qk_norm(x)
+
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj"],
+        dense_target_modules=["q_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="norms",
+        router_mode="hf",
+        strict=True,
+    )
+
+    assert isinstance(model.layers[0].self_attn.qk_norm, FakeStatelessL2Norm)
+    torch.testing.assert_close(model.layers[0].self_attn.qk_norm(x), expected)
+    assert "norms" not in report.cpu_resident_base_bytes_by_component
+    assert report.selected_gpu_resident_base_bytes_by_component == {}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_apply_lf_asym_lora_strict_cpu_offload_rejects_cuda_source() -> None:
+    model = FakeModel().cuda()
+    with pytest.raises(RuntimeError, match="CPU-first model loading"):
+        apply_lf_asym_lora(
+            model,
+            raw_lora_target=["experts"],
+            dense_target_modules=[],
+            lora_rank=2,
+            lora_alpha=4.0,
+            lora_dropout=0.0,
+            backend="asym",
+            precision="bf16",
+            offload_modules="routed_experts",
+            router_mode="hf",
+            strict=True,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_apply_lf_asym_lora_strict_attention_offload_rejects_cuda_source() -> None:
+    model = FakeModel().cuda()
+    with pytest.raises(RuntimeError, match="selected for CPU offload"):
+        apply_lf_asym_lora(
+            model,
+            raw_lora_target=["q_proj"],
+            dense_target_modules=["q_proj"],
+            lora_rank=2,
+            lora_alpha=4.0,
+            lora_dropout=0.0,
+            backend="asym",
+            precision="bf16",
+            offload_modules="q_proj",
+            router_mode="hf",
+            strict=True,
+        )
 
 
 def test_asym_qwen3_experts_torch_backward_trains_only_lora() -> None:
@@ -945,6 +1418,88 @@ def test_apply_lf_asym_lora_whole_wraps_llama4_moe_and_reports_router_mode() -> 
     assert router_trainable == []
 
 
+def test_apply_lf_asym_lora_llama4_replaces_source_experts_with_single_cpu_owner() -> None:
+    model = FakeLlama4Model()
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["experts"],
+        dense_target_modules=[],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="routed_experts",
+        router_mode="hf",
+        strict=True,
+    )
+
+    wrapped = model.layers[0].feed_forward
+    assert isinstance(wrapped, AsymLlama4Moe)
+    assert wrapped.experts.gate_up_base.host_weight.weight.device.type == "cpu"
+    assert wrapped.experts.down_base.host_weight.weight.device.type == "cpu"
+    assert report.cpu_resident_base_bytes_by_component["routed_experts"] > 0
+    assert report.selected_gpu_resident_base_bytes_by_component == {}
+    assert not any(
+        ".feed_forward.experts.gate_up_proj" in name or ".feed_forward.experts.down_proj" in name
+        for name, _param in model.named_parameters()
+    )
+
+
+def test_apply_lf_asym_lora_llama4_shared_experts_adopt_cpu_storage_without_clone() -> None:
+    model = FakeLlama4Model()
+    gate_proj_key = model.layers[0].feed_forward.shared_expert.gate_proj.weight.untyped_storage().data_ptr()
+
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["gate_proj"],
+        dense_target_modules=["gate_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="shared_experts",
+        router_mode="hf",
+        strict=True,
+    )
+
+    wrapped = model.layers[0].feed_forward.shared_expert.gate_proj
+    assert isinstance(wrapped, AsymLoRALinear)
+    _assert_cpu_owner_adopted_or_pinned_replacement(wrapped.base_layer.host_weight.weight, gate_proj_key)
+    assert report.cpu_resident_base_bytes_by_component["shared_experts"] > 0
+    assert report.selected_gpu_resident_base_bytes_by_component == {}
+    assert not any(
+        ".feed_forward.shared_expert.gate_proj.weight" in name for name, _param in model.named_parameters()
+    )
+
+
+def test_apply_lf_asym_lora_llama4_router_adopts_cpu_storage_without_clone() -> None:
+    model = FakeLlama4Model()
+    router_key = model.layers[0].feed_forward.router.weight.untyped_storage().data_ptr()
+
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj"],
+        dense_target_modules=["q_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="router",
+        router_mode="hf",
+        strict=True,
+    )
+
+    wrapped = model.layers[0].feed_forward.router
+    assert isinstance(wrapped, AsymLlama4Router)
+    _assert_cpu_owner_adopted_or_pinned_replacement(wrapped.proj.host_weight.weight, router_key)
+    assert report.cpu_resident_base_bytes_by_component["router"] > 0
+    assert report.selected_gpu_resident_base_bytes_by_component == {}
+    assert not any(".feed_forward.router.weight" in name for name, _param in model.named_parameters())
+
+
 def test_adapt_lf_asym_peft_lora_only_wraps_packed_experts_after_dense_peft() -> None:
     model = FakeModel()
     model, report = adapt_lf_asym_peft_lora(
@@ -1084,9 +1639,9 @@ def test_asym_lf_llama4_adapter_config_records_router_mode(tmp_path) -> None:
     assert config["asym_router_mode"] == "whole"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] < 10, reason="requires SM100-class CUDA")
+@pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")
 def test_asym_qwen3_experts_sm100_smoke() -> None:
-    source = FakeQwen3Experts(hidden_dim=64, intermediate_dim=64).cuda()
+    source = FakeQwen3Experts(hidden_dim=64, intermediate_dim=64)
     wrapped = AsymQwen3Experts(
         source,
         backend="asym",
@@ -1097,6 +1652,9 @@ def test_asym_qwen3_experts_sm100_smoke() -> None:
         lora_dropout=0.0,
         init_lora_weights="peft",
     )
+    assert wrapped.gate_up_base.host_weight.weight.is_pinned()
+    assert wrapped.down_base.host_weight.weight.is_pinned()
+    wrapped.cuda()
     x = torch.randn(5, source.hidden_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     top_k_index, top_k_weights = _routing()
     loss = wrapped(x, top_k_index.cuda(), top_k_weights.cuda()).float().square().mean()
@@ -1105,11 +1663,143 @@ def test_asym_qwen3_experts_sm100_smoke() -> None:
     assert wrapped.stats.asym_calls > 0
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] < 10, reason="requires SM100-class CUDA")
+@pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")
+@pytest.mark.parametrize("is_lora_target", [True, False])
+def test_apply_lf_asym_lora_sm100_attention_uses_asymgemm(is_lora_target: bool) -> None:
+    model = FakeModel(hidden_dim=64, intermediate_dim=64, num_layers=1)
+    raw_lora_target = ["q_proj"] if is_lora_target else ["experts"]
+    dense_target_modules = ["q_proj"] if is_lora_target else []
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=raw_lora_target,
+        dense_target_modules=dense_target_modules,
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="q_proj",
+        router_mode="hf",
+        strict=True,
+    )
+    module = model.layers[0].q_proj
+    base = module.base_layer if isinstance(module, AsymLoRALinear) else module
+    assert isinstance(base, AsymFrozenLinear)
+    assert base.host_weight.weight.is_pinned()
+    model.cuda()
+
+    x = torch.randn(9, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    loss = module(x).float().square().mean()
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert report.stats is not None
+    assert report.stats.asym_forward_calls > 0
+    assert report.stats.asym_dx_calls > 0
+    assert base.host_weight.weight.grad is None
+
+
+@pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")
+def test_apply_lf_asym_lora_sm100_shared_experts_use_asymgemm() -> None:
+    model = FakeLlama4Model(hidden_size=64, intermediate_size=64, num_layers=1)
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["gate_proj"],
+        dense_target_modules=["gate_proj"],
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="shared_experts",
+        router_mode="hf",
+        strict=True,
+    )
+    module = model.layers[0].feed_forward.shared_expert.gate_proj
+    assert isinstance(module, AsymLoRALinear)
+    assert module.base_layer.host_weight.weight.is_pinned()
+    model.cuda()
+
+    x = torch.randn(9, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    loss = module(x).float().square().mean()
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert report.stats is not None
+    assert report.stats.asym_forward_calls > 0
+    assert report.stats.asym_dx_calls > 0
+    assert module.base_layer.host_weight.weight.grad is None
+
+
+@pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")
+def test_apply_lf_asym_lora_sm100_router_uses_asymgemm() -> None:
+    model = FakeModel(hidden_dim=64, intermediate_dim=64, num_layers=1, num_experts=64)
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj"],
+        dense_target_modules=["q_proj"],
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="router",
+        router_mode="hf",
+        strict=True,
+    )
+    module = model.layers[0].mlp.gate
+    assert isinstance(module, AsymQwen3Router)
+    assert module.proj.host_weight.weight.is_pinned()
+    model.cuda()
+
+    x = torch.randn(9, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    router_logits, _top_k_weights, _top_k_index = module(x)
+    loss = router_logits.float().square().mean()
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert report.stats is not None
+    assert report.stats.asym_forward_calls > 0
+    assert report.stats.asym_dx_calls > 0
+    assert module.proj.host_weight.weight.grad is None
+
+
+@pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")
+def test_apply_lf_asym_lora_sm100_lm_head_uses_asymgemm() -> None:
+    model = FakeModel(hidden_dim=64, intermediate_dim=64, num_layers=1)
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj"],
+        dense_target_modules=["q_proj"],
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="lm_head",
+        router_mode="hf",
+        strict=True,
+    )
+    assert isinstance(model.lm_head, AsymFrozenLinear)
+    assert model.lm_head.host_weight.weight.is_pinned()
+    model.cuda()
+
+    x = torch.randn(9, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    loss = model.lm_head(x).float().square().mean()
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert report.stats is not None
+    assert report.stats.asym_forward_calls > 0
+    assert report.stats.asym_dx_calls > 0
+    assert model.lm_head.host_weight.weight.grad is None
+
+
+@pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")
 def test_asym_qwen3_experts_sm100_backward_matches_torch_backend() -> None:
     torch.manual_seed(7)
     source_torch = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128).cuda()
-    source_asym = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128).cuda()
+    source_asym = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128)
     source_asym.load_state_dict(source_torch.state_dict())
     torch_backend = AsymQwen3Experts(
         source_torch,
@@ -1131,6 +1821,7 @@ def test_asym_qwen3_experts_sm100_backward_matches_torch_backend() -> None:
         lora_dropout=0.0,
         init_lora_weights="peft",
     )
+    asym_backend.cuda()
     _copy_random_lora_params(torch_backend, asym_backend)
 
     x_torch = torch.randn(5, source_torch.hidden_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -1160,12 +1851,12 @@ def test_asym_qwen3_experts_sm100_backward_matches_torch_backend() -> None:
     assert asym_backend.stats.asym_dx_calls >= 2
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] < 10, reason="requires SM100-class CUDA")
+@pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")
 @pytest.mark.parametrize("policy", ["tok-le2", "tok-le2-act"])
 def test_asym_qwen3_experts_sm100_recompute_policies_match_none(policy: str) -> None:
     torch.manual_seed(17)
-    source_ref = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128).cuda()
-    source_policy = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128).cuda()
+    source_ref = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128)
+    source_policy = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128)
     source_policy.load_state_dict(source_ref.state_dict())
     reference = AsymQwen3Experts(
         source_ref,
@@ -1189,6 +1880,8 @@ def test_asym_qwen3_experts_sm100_recompute_policies_match_none(policy: str) -> 
         expert_recompute_policy=policy,
         init_lora_weights="peft",
     )
+    reference.cuda()
+    candidate.cuda()
     _copy_random_lora_params(reference, candidate)
 
     top_k_index, top_k_weights = _routing()
@@ -1219,12 +1912,12 @@ def test_asym_qwen3_experts_sm100_recompute_policies_match_none(policy: str) -> 
     assert candidate.stats.asym_dx_calls > 0
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] < 10, reason="requires SM100-class CUDA")
+@pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")
 @pytest.mark.parametrize("policy", ["tok-le0", "tok-le2", "tok-le2-act"])
 def test_asym_qwen3_experts_sm100_recompute_lora_dropout_matches_none(policy: str) -> None:
     torch.manual_seed(23)
-    source_ref = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128).cuda()
-    source_policy = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128).cuda()
+    source_ref = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128)
+    source_policy = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128)
     source_policy.load_state_dict(source_ref.state_dict())
     reference = AsymQwen3Experts(
         source_ref,
@@ -1248,6 +1941,8 @@ def test_asym_qwen3_experts_sm100_recompute_lora_dropout_matches_none(policy: st
         expert_recompute_policy=policy,
         init_lora_weights="peft",
     )
+    reference.cuda()
+    candidate.cuda()
     _copy_random_lora_params(reference, candidate)
     reference.train()
     candidate.train()
@@ -1282,10 +1977,10 @@ def test_asym_qwen3_experts_sm100_recompute_lora_dropout_matches_none(policy: st
     assert candidate.stats.asym_dx_calls > 0
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] < 10, reason="requires SM100-class CUDA")
+@pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")
 def test_asym_qwen3_experts_sm100_recompute_lora_dropout_backward_consumes_no_rng() -> None:
     torch.manual_seed(29)
-    source = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128).cuda()
+    source = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128)
     wrapped = AsymQwen3Experts(
         source,
         backend="asym",
@@ -1297,6 +1992,7 @@ def test_asym_qwen3_experts_sm100_recompute_lora_dropout_backward_consumes_no_rn
         expert_recompute_policy="tok-le2",
         init_lora_weights="peft",
     )
+    wrapped.cuda()
     _copy_random_lora_params(wrapped, wrapped)
     top_k_index, top_k_weights = _routing()
     top_k_index = top_k_index.cuda()
@@ -1317,10 +2013,10 @@ def test_asym_qwen3_experts_sm100_recompute_lora_dropout_backward_consumes_no_rn
     assert torch.isfinite(x.grad.float()).all()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] < 10, reason="requires SM100-class CUDA")
+@pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")
 def test_asym_qwen3_experts_sm100_recompute_offload_uses_custom_dense_path() -> None:
     torch.manual_seed(19)
-    source = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128).cuda()
+    source = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128)
     wrapped = AsymQwen3Experts(
         source,
         backend="asym",
@@ -1332,6 +2028,7 @@ def test_asym_qwen3_experts_sm100_recompute_offload_uses_custom_dense_path() -> 
         expert_recompute_policy="tok-le2",
         init_lora_weights="peft",
     )
+    wrapped.cuda()
     assert not hasattr(wrapped, "_run_subset_body")
     assert not hasattr(wrapped, "_forward_expert_policy_subset")
 
@@ -1345,10 +2042,10 @@ def test_asym_qwen3_experts_sm100_recompute_offload_uses_custom_dense_path() -> 
     assert wrapped.stats.asym_dx_calls > 0
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] < 10, reason="requires SM100-class CUDA")
+@pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")
 def test_apply_lf_asym_lora_sm100_accumulates_and_optimizer_updates_only_lora() -> None:
     torch.manual_seed(11)
-    model = FakeModel(hidden_dim=128, intermediate_dim=128).cuda()
+    model = FakeModel(hidden_dim=128, intermediate_dim=128)
     model, report = apply_lf_asym_lora(
         model,
         raw_lora_target=["all"],
@@ -1362,6 +2059,7 @@ def test_apply_lf_asym_lora_sm100_accumulates_and_optimizer_updates_only_lora() 
         router_mode="hf",
         strict=True,
     )
+    model.cuda()
     assert report.qwen3_experts_wrapped == 2
     assert report.trainable_lora_params > 0
 
@@ -1379,6 +2077,10 @@ def test_apply_lf_asym_lora_sm100_accumulates_and_optimizer_updates_only_lora() 
         x = torch.randn(5, 128, device="cuda", dtype=torch.bfloat16, generator=generator)
         loss = model(x, top_k_index, top_k_weights).float().square().mean() / 2.0
         loss.backward()
+
+    assert report.stats is not None
+    assert report.stats.asym_forward_calls > 0
+    assert report.stats.asym_dx_calls > 0
 
     active_grads = [(name, param.grad) for name, param in trainable if param.grad is not None]
     assert active_grads
@@ -1398,10 +2100,10 @@ def test_apply_lf_asym_lora_sm100_accumulates_and_optimizer_updates_only_lora() 
     assert all("lora_" in name or ".lora_A." in name or ".lora_B." in name for name in changed)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] < 10, reason="requires SM100-class CUDA")
+@pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")
 def test_asym_qwen3_experts_sm100_checkpoint_and_anomaly_smoke() -> None:
     torch.manual_seed(13)
-    source = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128).cuda()
+    source = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128)
     wrapped = AsymQwen3Experts(
         source,
         backend="asym",
@@ -1412,6 +2114,7 @@ def test_asym_qwen3_experts_sm100_checkpoint_and_anomaly_smoke() -> None:
         lora_dropout=0.0,
         init_lora_weights="peft",
     )
+    wrapped.cuda()
     x = torch.randn(5, source.hidden_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     top_k_index, top_k_weights = _routing()
     top_k_index = top_k_index.cuda()

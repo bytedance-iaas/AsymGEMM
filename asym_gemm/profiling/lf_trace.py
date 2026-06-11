@@ -74,7 +74,7 @@ class LFTraceConfig:
     memory_breakdown: bool = False
     memory_breakdown_interval: int = 1
     memory_breakdown_steps: str = ""
-    memory_breakdown_modules: str = "attention,router,mlp,experts,shared_experts,lora,embedding,norms,loss"
+    memory_breakdown_modules: str = "attention,router,mlp,experts,shared_experts,lora,embedding,embed_tokens,norms,loss"
     memory_breakdown_output: str = "memory_breakdown"
     external_memory_diagnostics: bool = False
     sync: bool = False
@@ -103,7 +103,7 @@ class LFTraceConfig:
             memory_breakdown_steps=env.get("ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_STEPS", "").strip(),
             memory_breakdown_modules=env.get(
                 "ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_MODULES",
-                "attention,router,mlp,experts,shared_experts,lora,embedding,norms,loss",
+                "attention,router,mlp,experts,shared_experts,lora,embedding,embed_tokens,norms,loss",
             ),
             memory_breakdown_output=env.get(
                 "ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_OUTPUT",
@@ -354,6 +354,15 @@ def _is_dense_mlp_name(lower: str) -> bool:
 
 
 def _component_from_param_name(name: str) -> str:
+    try:
+        from asym_gemm.integrations.lf import classify_lf_component
+
+        component = classify_lf_component(name)
+        if component != "other":
+            return component
+    except Exception:
+        pass
+
     lower = name.lower()
     if "lora" in lower:
         if _is_shared_expert_name(lower):
@@ -368,7 +377,7 @@ def _component_from_param_name(name: str) -> str:
             return "mlp_dense"
         return "lora"
     if "embed" in lower:
-        return "embedding"
+        return "embed_tokens"
     if "lm_head" in lower:
         return "lm_head"
     if _is_attention_name(lower):
@@ -387,6 +396,15 @@ def _component_from_param_name(name: str) -> str:
 
 
 def _component_from_module_name(name: str) -> str | None:
+    try:
+        from asym_gemm.integrations.lf import classify_lf_component
+
+        component = classify_lf_component(name)
+        if component != "other":
+            return component
+    except Exception:
+        pass
+
     lower = name.lower()
     if not lower:
         return None
@@ -401,7 +419,7 @@ def _component_from_module_name(name: str) -> str | None:
     if lower.endswith(".mlp") or lower.endswith(".dense_mlp") or lower.endswith(".mlp_dense"):
         return "mlp_dense"
     if lower.endswith(".embed_tokens") or lower.endswith(".embed_in") or lower.endswith(".wte"):
-        return "embedding"
+        return "embed_tokens"
     if lower.endswith(".lm_head"):
         return "lm_head"
     if lower.endswith(".norm") or lower.endswith(".input_layernorm") or lower.endswith(".post_attention_layernorm"):
@@ -418,6 +436,8 @@ def _component_filter_token(component: str) -> str:
         return "shared_experts"
     if component == "mlp_dense":
         return "mlp"
+    if component in {"embed_tokens", "embedding"}:
+        return "embedding"
     if component in {"lora_attention", "lora_mlp", "lora_experts"}:
         return "lora"
     if component in {"lm_head", "loss_logits"}:
@@ -434,7 +454,7 @@ def _component_from_range_name(name: str | None) -> str | None:
     if "lm_head" in lower:
         return "lm_head"
     if "embed" in lower:
-        return "embedding"
+        return "embed_tokens"
     if "norm" in lower:
         return "norms"
     if _is_attention_name(lower):
@@ -454,6 +474,17 @@ def _component_from_range_name(name: str | None) -> str | None:
 
 def _tensor_bytes(tensor: torch.Tensor) -> int:
     return int(tensor.numel() * tensor.element_size())
+
+
+def _tensor_storage_key(tensor: torch.Tensor) -> tuple[str, int, int, int, str]:
+    storage = tensor.untyped_storage()
+    return (
+        str(tensor.device),
+        int(storage.data_ptr()),
+        int(storage.nbytes()),
+        int(tensor.storage_offset()),
+        str(tensor.dtype),
+    )
 
 
 def _saved_tensor_storage_key(tensor: torch.Tensor) -> tuple[str, int, int, str] | None:
@@ -641,8 +672,13 @@ class LFMemoryBreakdownProfiler:
             "shared_experts",
             "lora",
             "embedding",
+            "embed_tokens",
             "loss",
         }
+        if "embedding" in self.module_filter:
+            self.module_filter.add("embed_tokens")
+        if "embed_tokens" in self.module_filter:
+            self.module_filter.add("embedding")
         self.rows: list[dict[str, Any]] = []
         self._step = 0
         self._active = False
@@ -1050,12 +1086,13 @@ class LFMemoryBreakdownProfiler:
             for name, buffer in model.named_buffers():
                 if isinstance(buffer, torch.Tensor):
                     add(_component_from_param_name(name), "buffer", buffer)
-            for module in model.modules():
+            for module_name, module in model.named_modules():
+                component = _component_from_module_name(module_name) or _component_from_param_name(module_name)
                 for attr in ("host_weight", "weight_host"):
                     host = getattr(module, attr, None)
                     tensor = getattr(host, "tensor", None)
                     if isinstance(tensor, torch.Tensor):
-                        add("routed_experts", "host_weight", tensor)
+                        add(component, "host_weight", tensor)
 
         if optimizer is not None:
             try:
@@ -1746,18 +1783,8 @@ def _install_module_hooks_once(handle: LFTraceHandle, model: nn.Module | None) -
 
 
 def _component_from_name(name: str, param: nn.Parameter) -> str:
-    lower = name.lower()
-    if "lora" in lower:
-        return "lora"
-    if "optimizer" in lower:
-        return "optimizer"
-    if "embed" in lower:
-        return "embedding"
-    if "self_attn" in lower or any(part in lower for part in ("q_proj", "k_proj", "v_proj", "o_proj")):
-        return "attention"
-    if "expert" in lower or "mlp" in lower:
-        return "mlp_or_experts"
-    return "other_model"
+    component = _component_from_param_name(name)
+    return "other_model" if component == "other" else component
 
 
 def _model_memory_summary(model: nn.Module | None) -> dict[str, Any]:
@@ -1780,25 +1807,27 @@ def _model_memory_summary(model: nn.Module | None) -> dict[str, Any]:
         {"category": category, "component": component, "device": device, "bytes": bytes_value}
         for (category, component, device), bytes_value in sorted(rows_by_category.items(), key=lambda item: item[1], reverse=True)
     ]
-    host_bytes = 0
-    pinned_bytes = 0
-    for module in model.modules():
-        for attr in ("cpu_resident_base_bytes", "gpu_resident_base_bytes", "weight_hbm_saved_bytes"):
-            value = getattr(module, attr, 0)
-            if isinstance(value, int):
-                host_bytes += value if attr != "gpu_resident_base_bytes" else 0
+    host_bytes_by_component: dict[str, int] = {}
+    pinned_bytes_by_component: dict[str, int] = {}
+    seen_host_keys: set[tuple[str, int, int, int, str]] = set()
+    for module_name, module in model.named_modules():
+        component = _component_from_module_name(module_name) or _component_from_param_name(module_name)
         for attr in ("host_weight", "weight_host"):
             host = getattr(module, attr, None)
             tensor = getattr(host, "tensor", None)
             if isinstance(tensor, torch.Tensor):
-                bytes_value = int(tensor.numel() * tensor.element_size())
-                host_bytes += bytes_value
+                storage_key = _tensor_storage_key(tensor)
+                if storage_key in seen_host_keys:
+                    continue
+                seen_host_keys.add(storage_key)
+                bytes_value = _tensor_bytes(tensor)
+                host_bytes_by_component[component] = host_bytes_by_component.get(component, 0) + bytes_value
                 if tensor.is_pinned():
-                    pinned_bytes += bytes_value
-    if host_bytes:
-        rows.append({"category": "host_weight", "component": "routed_experts", "device": "cpu", "bytes": host_bytes})
-    if pinned_bytes:
-        rows.append({"category": "pinned_host_weight", "component": "routed_experts", "device": "cpu", "bytes": pinned_bytes})
+                    pinned_bytes_by_component[component] = pinned_bytes_by_component.get(component, 0) + bytes_value
+    for component, bytes_value in sorted(host_bytes_by_component.items()):
+        rows.append({"category": "host_weight", "component": component, "device": "cpu", "bytes": bytes_value})
+    for component, bytes_value in sorted(pinned_bytes_by_component.items()):
+        rows.append({"category": "pinned_host_weight", "component": component, "device": "cpu", "bytes": bytes_value})
     return {"enabled": True, "total_parameter_bytes": total, "rows": rows}
 
 

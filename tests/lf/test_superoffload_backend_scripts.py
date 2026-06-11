@@ -135,6 +135,556 @@ def test_check_superoffload_run_rejects_missing_marker(tmp_path: Path) -> None:
     assert json.loads(result.stdout)["enabled"] is False
 
 
+def _run_lf_launcher_expect_failure(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    merged_env = os.environ.copy()
+    merged_env.update({"ROOT": str(ROOT), "ASYM_DIR": str(ROOT), **env})
+    return subprocess.run(
+        ["bash", "scripts/lf/run_lf_lora_sft.sh"],
+        cwd=ROOT,
+        env=merged_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_run_lf_lora_sft_rejects_kt_arm_nsys_without_source_ok() -> None:
+    result = _run_lf_launcher_expect_failure(
+        {"BACKEND": "kt_armbf16", "PROFILE": "1", "PROFILE_PROFILER": "nsys"}
+    )
+
+    assert result.returncode == 2
+    assert "requires PROFILE_PROFILER=source before nsys" in result.stderr
+
+
+def test_run_lf_lora_sft_rejects_kt_arm_nsys_legacy_override_without_source_profile() -> None:
+    result = _run_lf_launcher_expect_failure(
+        {
+            "BACKEND": "kt_armbf16",
+            "PROFILE": "1",
+            "PROFILE_PROFILER": "nsys",
+            "KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK": "1",
+        }
+    )
+
+    assert result.returncode == 2
+    assert "KT_ARM_SOURCE_OK_PROFILE_JSON" in result.stderr
+    assert "KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK=1" in result.stderr
+
+
+def test_run_lf_lora_sft_rejects_kt_arm_tensor_parallel() -> None:
+    result = _run_lf_launcher_expect_failure({"BACKEND": "kt_armbf16", "KT_TP_ENABLED": "true"})
+
+    assert result.returncode == 2
+    assert "does not support KT_TP_ENABLED=true" in result.stderr
+
+
+def test_run_lf_lora_sft_rejects_kt_arm_threadpool_count() -> None:
+    result = _run_lf_launcher_expect_failure({"BACKEND": "kt_armbf16", "KT_THREADPOOL_COUNT": "2"})
+
+    assert result.returncode == 2
+    assert "requires KT_THREADPOOL_COUNT empty or 1" in result.stderr
+
+
+def test_run_lf_lora_sft_rejects_kt_arm_gpu_experts() -> None:
+    result = _run_lf_launcher_expect_failure({"BACKEND": "kt_armbf16", "KT_NUM_GPU_EXPERTS": "1"})
+
+    assert result.returncode == 2
+    assert "does not support GPU experts" in result.stderr
+
+
+def test_run_lf_lora_sft_rejects_kt_arm_gradient_accumulation() -> None:
+    result = _run_lf_launcher_expect_failure({"BACKEND": "kt_armbf16", "GRADIENT_ACCUMULATION_STEPS": "2"})
+
+    assert result.returncode == 2
+    assert "requires GRADIENT_ACCUMULATION_STEPS=1" in result.stderr
+
+
+def test_run_lf_lora_sft_rejects_kt_arm_max_grad_norm() -> None:
+    result = _run_lf_launcher_expect_failure({"BACKEND": "kt_armbf16", "MAX_GRAD_NORM": "1.0"})
+
+    assert result.returncode == 1
+    assert "requires MAX_GRAD_NORM=0" in result.stderr
+
+
+def test_run_lf_lora_sft_rejects_kt_arm_route_rank_limit() -> None:
+    result = _run_lf_launcher_expect_failure(
+        {"BACKEND": "kt_armbf16", "KT_ARM_SFT_MAX_ROUTE_RANK_WORK": "1"}
+    )
+
+    assert result.returncode == 2
+    assert "route-rank work" in result.stderr
+
+
+def test_run_lf_lora_sft_rejects_kt_arm_default_unvalidated_large_route_rank() -> None:
+    result = _run_lf_launcher_expect_failure(
+        {
+            "BACKEND": "kt_armbf16",
+            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
+            "CUTOFF_LEN": "7168",
+            "LORA_RANK": "64",
+        }
+    )
+
+    assert result.returncode == 2
+    assert "route-rank work 14680064 exceeds KT_ARM_SFT_MAX_ROUTE_RANK_WORK=1048576" in result.stderr
+    assert "KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK=1" in result.stderr
+
+
+def test_run_lf_lora_sft_preserves_partial_source_profile_without_canonical_profile(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    fake_env = tmp_path / "env"
+    fake_env.joinpath("bin").mkdir(parents=True)
+    fake_python = fake_env / "bin/python"
+    fake_python.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "if [[ \"${1-}\" == *postprocess_lf_profile_artifacts.py ]]; then",
+                "  exec /usr/bin/python3 \"$@\"",
+                "fi",
+                "if [[ \"${1-}\" == *run_lf_profiled_train.py ]] || [[ \"${1-}\" == \"-m\" && \"${2-}\" == \"torch.distributed.run\" ]]; then",
+                "  partial=\"$(dirname \"$ASYM_GEMM_LF_PROFILE_SOURCE_JSON\")/source_profile.partial.json\"",
+                "  mkdir -p \"$(dirname \"$partial\")\"",
+                "  cat > \"$partial\" <<'JSON'",
+                "{\"workload\":\"unit\",\"config\":{\"backend\":\"torch\",\"precision\":\"bf16\",\"seq_len\":128,\"warmup_steps\":0,\"measure_steps\":1},\"memory\":{\"gpu\":{}},\"trainer\":{},\"forward\":{\"total_milliseconds\":0},\"backward\":{\"total_milliseconds\":0},\"stage_memory\":{\"rows\":[]},\"kt\":{\"available\":false,\"reason\":\"not kt\"},\"lora\":{\"available\":false,\"reason\":\"failure before model capture\"}}",
+                "JSON",
+                "  exit 7",
+                "fi",
+                "cat >/dev/null",
+                "exit 0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    out_dir = tmp_path / "out"
+
+    result = subprocess.run(
+        ["bash", "scripts/lf/run_lf_lora_sft.sh"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "ROOT": str(ROOT),
+            "ASYM_DIR": str(ROOT),
+            "LF_DIR": str(lf_dir),
+            "ENV_DIR": str(fake_env),
+            "ENV_PYTHON": str(fake_python),
+            "BACKEND": "torch",
+            "GPU_ID": "0",
+            "NUM_GPUS": "1",
+            "PROFILE": "1",
+            "PROFILE_PROFILER": "source",
+            "PROFILE_OUTPUT_DIR": str(out_dir),
+            "PROFILE_SOURCE_JSON": str(out_dir / "source_profile.json"),
+            "PROFILE_JSON": str(out_dir / "profile.json"),
+            "OUT_DIR": str(out_dir / "lf_run"),
+            "LOG_FILE": str(out_dir / "train.log"),
+            "DATASET": "dummy",
+            "TEMPLATE": "qwen3_nothink",
+            "MODEL_NAME_OR_PATH": "unit/unit",
+            "CUTOFF_LEN": "128",
+            "MAX_SAMPLES": "1",
+            "MAX_STEPS": "1",
+            "LORA_RANK": "8",
+            "LORA_ALPHA": "16",
+            "LORA_DROPOUT": "0.00",
+            "CHECK_TRAINABLE_SURFACE": "0",
+            "TORCH_USE_ASYM_GEMM_LORA": "false",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 7
+    assert not (out_dir / "profile.json").exists()
+    assert (out_dir / "partial_profile.json").is_file()
+    assert (out_dir / "summary.md").is_file()
+    log_text = (out_dir / "train.log").read_text(encoding="utf-8")
+    assert "postprocessing partial profile" in log_text
+    assert "canonical profile.json was not created" in log_text
+
+
+def test_run_lf_lora_sft_failed_final_source_profile_is_not_canonical(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    fake_env = tmp_path / "env"
+    fake_env.joinpath("bin").mkdir(parents=True)
+    fake_python = fake_env / "bin/python"
+    fake_python.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "if [[ \"${1-}\" == *postprocess_lf_profile_artifacts.py ]]; then",
+                "  exec /usr/bin/python3 \"$@\"",
+                "fi",
+                "if [[ \"${1-}\" == *run_lf_profiled_train.py ]] || [[ \"${1-}\" == \"-m\" && \"${2-}\" == \"torch.distributed.run\" ]]; then",
+                "  mkdir -p \"$(dirname \"$ASYM_GEMM_LF_PROFILE_SOURCE_JSON\")\"",
+                "  cat > \"$ASYM_GEMM_LF_PROFILE_SOURCE_JSON\" <<'JSON'",
+                "{\"workload\":\"unit\",\"config\":{\"backend\":\"torch\",\"precision\":\"bf16\",\"seq_len\":128,\"warmup_steps\":0,\"measure_steps\":1},\"memory\":{\"gpu\":{}},\"trainer\":{},\"forward\":{\"total_milliseconds\":0},\"backward\":{\"total_milliseconds\":0},\"stage_memory\":{\"rows\":[]},\"kt\":{\"available\":false,\"reason\":\"not kt\"},\"lora\":{\"available\":false,\"reason\":\"failed after final write\"}}",
+                "JSON",
+                "  exit 7",
+                "fi",
+                "cat >/dev/null",
+                "exit 0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    out_dir = tmp_path / "out"
+
+    result = subprocess.run(
+        ["bash", "scripts/lf/run_lf_lora_sft.sh"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "ROOT": str(ROOT),
+            "ASYM_DIR": str(ROOT),
+            "LF_DIR": str(lf_dir),
+            "ENV_DIR": str(fake_env),
+            "ENV_PYTHON": str(fake_python),
+            "BACKEND": "torch",
+            "GPU_ID": "0",
+            "NUM_GPUS": "1",
+            "PROFILE": "1",
+            "PROFILE_PROFILER": "source",
+            "PROFILE_OUTPUT_DIR": str(out_dir),
+            "PROFILE_SOURCE_JSON": str(out_dir / "source_profile.json"),
+            "PROFILE_JSON": str(out_dir / "profile.json"),
+            "OUT_DIR": str(out_dir / "lf_run"),
+            "LOG_FILE": str(out_dir / "train.log"),
+            "DATASET": "dummy",
+            "TEMPLATE": "qwen3_nothink",
+            "MODEL_NAME_OR_PATH": "unit/unit",
+            "CUTOFF_LEN": "128",
+            "MAX_SAMPLES": "1",
+            "MAX_STEPS": "1",
+            "LORA_RANK": "8",
+            "LORA_ALPHA": "16",
+            "LORA_DROPOUT": "0.00",
+            "CHECK_TRAINABLE_SURFACE": "0",
+            "TORCH_USE_ASYM_GEMM_LORA": "false",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 7
+    assert not (out_dir / "profile.json").exists()
+    assert (out_dir / "partial_profile.json").is_file()
+    log_text = (out_dir / "train.log").read_text(encoding="utf-8")
+    assert "Training failed; postprocessing source profile as partial artifact" in log_text
+
+
+def test_run_lf_lora_sft_kt_arm_first_step_watchdog_preserves_partial_profile(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    fake_env = tmp_path / "env"
+    fake_env.joinpath("bin").mkdir(parents=True)
+    fake_python = fake_env / "bin/python"
+    fake_python.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "if [[ \"${1-}\" == *postprocess_lf_profile_artifacts.py ]]; then",
+                "  exec /usr/bin/python3 \"$@\"",
+                "fi",
+                "if [[ \"${1-}\" == *run_lf_profiled_train.py ]] || [[ \"${1-}\" == \"-m\" && \"${2-}\" == \"torch.distributed.run\" ]]; then",
+                "  partial=\"$(dirname \"$ASYM_GEMM_LF_PROFILE_SOURCE_JSON\")/source_profile.partial.json\"",
+                "  latest=\"${ASYM_GEMM_LF_HEARTBEAT_JSON%.*}.latest.json\"",
+                "  mkdir -p \"$(dirname \"$partial\")\"",
+                "  printf '%s\\n' '{\"stage\":\"trainer_start\"}' > \"$latest\"",
+                "  cat > \"$partial\" <<'JSON'",
+                "{\"workload\":\"unit\",\"config\":{\"backend\":\"kt_armbf16\",\"kt_backend\":\"ARMBF16\",\"precision\":\"bf16\",\"seq_len\":128,\"warmup_steps\":0,\"measure_steps\":1},\"memory\":{\"gpu\":{}},\"trainer\":{},\"forward\":{\"total_milliseconds\":0},\"backward\":{\"total_milliseconds\":0},\"stage_memory\":{\"rows\":[]},\"kt\":{\"available\":false,\"reason\":\"watchdog\"},\"lora\":{\"available\":false,\"reason\":\"watchdog\"}}",
+                "JSON",
+                "  sleep 30",
+                "  exit 0",
+                "fi",
+                "cat >/dev/null",
+                "exit 0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    out_dir = tmp_path / "out"
+
+    result = subprocess.run(
+        ["bash", "scripts/lf/run_lf_lora_sft.sh"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "ROOT": str(ROOT),
+            "ASYM_DIR": str(ROOT),
+            "LF_DIR": str(lf_dir),
+            "ENV_DIR": str(fake_env),
+            "ENV_PYTHON": str(fake_python),
+            "BACKEND": "kt_armbf16",
+            "GPU_ID": "0",
+            "NUM_GPUS": "1",
+            "NUMACTL_ENABLE": "0",
+            "PROFILE": "1",
+            "PROFILE_PROFILER": "source",
+            "PROFILE_OUTPUT_DIR": str(out_dir),
+            "PROFILE_SOURCE_JSON": str(out_dir / "source_profile.json"),
+            "PROFILE_HEARTBEAT_JSON": str(out_dir / "heartbeat.jsonl"),
+            "PROFILE_JSON": str(out_dir / "profile.json"),
+            "OUT_DIR": str(out_dir / "lf_run"),
+            "LOG_FILE": str(out_dir / "train.log"),
+            "DATASET": "dummy",
+            "TEMPLATE": "qwen3_nothink",
+            "MODEL_NAME_OR_PATH": "unit/unit",
+            "CUTOFF_LEN": "128",
+            "MAX_SAMPLES": "1",
+            "MAX_STEPS": "1",
+            "LORA_RANK": "8",
+            "LORA_ALPHA": "16",
+            "LORA_DROPOUT": "0.00",
+            "CHECK_TRAINABLE_SURFACE": "0",
+            "CHECK_KT_CALLS": "0",
+            "KT_ARM_FIRST_STEP_TIMEOUT_SECONDS": "1",
+            "INTERRUPT_GRACE_SECONDS": "0",
+            "TORCH_USE_ASYM_GEMM_LORA": "false",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 124
+    assert not (out_dir / "profile.json").exists()
+    assert (out_dir / "partial_profile.json").is_file()
+    log_text = (out_dir / "train.log").read_text(encoding="utf-8")
+    assert "did not complete the first optimizer step" in log_text
+    assert "postprocessing partial profile" in log_text
+    assert "canonical profile.json was not created" in log_text
+
+
+def test_run_lf_lora_sft_requires_kt_fused_lora_update_health(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    fake_env = tmp_path / "env"
+    fake_env.joinpath("bin").mkdir(parents=True)
+    fake_python = fake_env / "bin/python"
+    fake_python.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "if [[ \"${1-}\" == *postprocess_lf_profile_artifacts.py ]]; then",
+                "  exec /usr/bin/python3 \"$@\"",
+                "fi",
+                "if [[ \"${1-}\" == \"-\" ]]; then",
+                "  exec /usr/bin/python3 \"$@\"",
+                "fi",
+                "if [[ \"${1-}\" == *run_lf_profiled_train.py ]]; then",
+                "  /usr/bin/python3 - <<'PY'",
+                "import json, os",
+                "profile = os.environ['ASYM_GEMM_LF_PROFILE_SOURCE_JSON']",
+                "payload = {",
+                "    'workload': 'unit',",
+                "    'config': {'backend': 'kt_armbf16', 'kt_backend': 'ARMBF16', 'precision': 'bf16', 'seq_len': 128, 'warmup_steps': 0, 'measure_steps': 1},",
+                "    'memory': {'gpu': {}},",
+                "    'trainer': {},",
+                "    'forward': {'total_milliseconds': 1},",
+                "    'backward': {'total_milliseconds': 1},",
+                "    'stage_memory': {'rows': []},",
+                "    'kt': {'available': True, 'wrapper_count': 1, 'total_forward_calls': 1, 'total_backward_calls': 1, 'rows': [{'method': 'ARMBF16_SFT'}]},",
+                "    'lora': {'available': True, 'trainable_parameters': 8, 'peft_lora_parameters': 0, 'lf_fused_expert_lora_parameters': 0, 'kt_expert_lora_parameters': 8, 'kt_peft_expert_lora_parameters': 0, 'kt_fused_expert_lora_parameters': 8},",
+                "    'optimizer_memory': {},",
+                "    'heartbeat': {'latest': {'stage': 'source_profile_written'}},",
+                "}",
+                "with open(profile, 'w', encoding='utf-8') as handle:",
+                "    json.dump(payload, handle)",
+                "PY",
+                "  exit 0",
+                "fi",
+                "cat >/dev/null",
+                "exit 0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    out_dir = tmp_path / "out"
+
+    result = subprocess.run(
+        ["bash", "scripts/lf/run_lf_lora_sft.sh"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "ROOT": str(ROOT),
+            "ASYM_DIR": str(ROOT),
+            "LF_DIR": str(lf_dir),
+            "ENV_DIR": str(fake_env),
+            "ENV_PYTHON": str(fake_python),
+            "BACKEND": "kt_armbf16",
+            "GPU_ID": "0",
+            "NUM_GPUS": "1",
+            "NUMACTL_ENABLE": "0",
+            "PROFILE": "1",
+            "PROFILE_PROFILER": "source",
+            "PROFILE_OUTPUT_DIR": str(out_dir),
+            "PROFILE_SOURCE_JSON": str(out_dir / "source_profile.json"),
+            "PROFILE_JSON": str(out_dir / "profile.json"),
+            "OUT_DIR": str(out_dir / "lf_run"),
+            "LOG_FILE": str(out_dir / "train.log"),
+            "DATASET": "dummy",
+            "TEMPLATE": "qwen3_nothink",
+            "MODEL_NAME_OR_PATH": "unit/unit",
+            "CUTOFF_LEN": "128",
+            "MAX_SAMPLES": "1",
+            "MAX_STEPS": "1",
+            "LORA_RANK": "8",
+            "LORA_ALPHA": "16",
+            "LORA_DROPOUT": "0.00",
+            "CHECK_TRAINABLE_SURFACE": "0",
+            "CHECK_KT_CALLS": "1",
+            "TORCH_USE_ASYM_GEMM_LORA": "false",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "optimizer update health is missing" in (result.stdout + result.stderr)
+
+
+def test_run_lf_lora_sft_kt_arm_profile_env_records_shape_and_triton_cache(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    fake_env = tmp_path / "env"
+    fake_env.joinpath("bin").mkdir(parents=True)
+    fake_python = fake_env / "bin/python"
+    env_log = tmp_path / "child_env.json"
+    fake_python.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "if [[ \"${1-}\" == *postprocess_lf_profile_artifacts.py ]]; then",
+                "  exec /usr/bin/python3 \"$@\"",
+                "fi",
+                "if [[ \"${1-}\" == *run_lf_profiled_train.py ]]; then",
+                "  /usr/bin/python3 - <<'PY'",
+                "import json, os",
+                "path = os.environ['FAKE_ENV_LOG']",
+                "keys = [",
+                "    'TRITON_CACHE_DIR',",
+                "    'ASYM_GEMM_LF_CONFIG_PER_DEVICE_TRAIN_BATCH_SIZE',",
+                "    'ASYM_GEMM_LF_CONFIG_BATCH_SIZE',",
+                "    'ASYM_GEMM_LF_CONFIG_GLOBAL_BATCH_SIZE',",
+                "    'ASYM_GEMM_LF_CONFIG_GRADIENT_ACCUMULATION_STEPS',",
+                "    'ASYM_GEMM_LF_CONFIG_LOGICAL_QLEN',",
+                "    'ASYM_GEMM_LF_CONFIG_PREPROCESSING_NUM_WORKERS',",
+                "    'ASYM_GEMM_LF_CONFIG_DATALOADER_NUM_WORKERS',",
+                "    'ASYM_GEMM_LF_CONFIG_MAX_GRAD_NORM',",
+                "    'ASYM_GEMM_LF_REQUIRE_KT_STARTUP',",
+                "    'ASYM_GEMM_LF_REQUIRE_KT_FUSED_LORA_STARTUP',",
+                "    'ASYM_GEMM_LF_CONFIG_KT_REQUIRE_STARTUP',",
+                "    'ASYM_GEMM_LF_CONFIG_KT_REQUIRE_FUSED_LORA_STARTUP',",
+                "    'ASYM_GEMM_LF_CONFIG_KT_ARM_LOGICAL_QLEN',",
+                "    'ASYM_GEMM_LF_CONFIG_KT_ARM_ROUTE_RANK_WORK',",
+                "    'ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_MAX_ROUTE_RANK_WORK',",
+                "    'ASYM_GEMM_LF_CONFIG_KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK',",
+                "]",
+                "with open(path, 'w', encoding='utf-8') as handle:",
+                "    json.dump({key: os.environ.get(key) for key in keys}, handle, sort_keys=True)",
+                "profile = os.environ['ASYM_GEMM_LF_PROFILE_SOURCE_JSON']",
+                "payload = {",
+                "    'workload': 'unit',",
+                "    'config': {",
+                "        'backend': 'kt_armbf16',",
+                "        'kt_backend': 'ARMBF16',",
+                "        'precision': 'bf16',",
+                "        'seq_len': 128,",
+                "        'per_device_train_batch_size': 2,",
+                "        'logical_qlen': 256,",
+                "        'warmup_steps': 0,",
+                "        'measure_steps': 1,",
+                "    },",
+                "    'memory': {'gpu': {}},",
+                "    'trainer': {},",
+                "    'forward': {'total_milliseconds': 0},",
+                "    'backward': {'total_milliseconds': 0},",
+                "    'stage_memory': {'rows': []},",
+                "    'kt': {'available': False, 'reason': 'unit'},",
+                "    'lora': {'available': False, 'reason': 'unit'},",
+                "}",
+                "with open(profile, 'w', encoding='utf-8') as handle:",
+                "    json.dump(payload, handle)",
+                "PY",
+                "  exit 0",
+                "fi",
+                "cat >/dev/null",
+                "exit 0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    out_dir = tmp_path / "out"
+
+    run_cmd(
+        ["scripts/lf/run_lf_lora_sft.sh"],
+        env={
+            "LF_DIR": str(lf_dir),
+            "ENV_DIR": str(fake_env),
+            "ENV_PYTHON": str(fake_python),
+            "FAKE_ENV_LOG": str(env_log),
+            "TMPDIR": str(tmp_path / "tmp"),
+            "RUN_ID": "unit_kt_env",
+            "BACKEND": "kt_armbf16",
+            "GPU_ID": "0",
+            "NUM_GPUS": "1",
+            "NUMACTL_ENABLE": "0",
+            "PROFILE": "1",
+            "PROFILE_PROFILER": "source",
+            "PROFILE_OUTPUT_DIR": str(out_dir),
+            "PROFILE_SOURCE_JSON": str(out_dir / "source_profile.json"),
+            "PROFILE_JSON": str(out_dir / "profile.json"),
+            "OUT_DIR": str(out_dir / "lf_run"),
+            "LOG_FILE": str(out_dir / "train.log"),
+            "DATASET": "dummy",
+            "TEMPLATE": "qwen3_nothink",
+            "MODEL_NAME_OR_PATH": "unit/unit",
+            "CUTOFF_LEN": "128",
+            "MAX_SAMPLES": "1",
+            "MAX_STEPS": "1",
+            "PER_DEVICE_TRAIN_BATCH_SIZE": "2",
+            "LORA_RANK": "8",
+            "LORA_ALPHA": "16",
+            "LORA_DROPOUT": "0.00",
+            "CHECK_TRAINABLE_SURFACE": "0",
+            "CHECK_KT_CALLS": "0",
+            "TORCH_USE_ASYM_GEMM_LORA": "false",
+        },
+    )
+
+    child_env = json.loads(env_log.read_text(encoding="utf-8"))
+    assert child_env["ASYM_GEMM_LF_CONFIG_PER_DEVICE_TRAIN_BATCH_SIZE"] == "2"
+    assert child_env["ASYM_GEMM_LF_CONFIG_BATCH_SIZE"] == "2"
+    assert child_env["ASYM_GEMM_LF_CONFIG_GLOBAL_BATCH_SIZE"] == "2"
+    assert child_env["ASYM_GEMM_LF_CONFIG_GRADIENT_ACCUMULATION_STEPS"] == "1"
+    assert child_env["ASYM_GEMM_LF_CONFIG_LOGICAL_QLEN"] == "256"
+    assert child_env["ASYM_GEMM_LF_CONFIG_PREPROCESSING_NUM_WORKERS"] == "1"
+    assert child_env["ASYM_GEMM_LF_CONFIG_DATALOADER_NUM_WORKERS"] == "0"
+    assert child_env["ASYM_GEMM_LF_CONFIG_MAX_GRAD_NORM"] == "0"
+    assert child_env["ASYM_GEMM_LF_REQUIRE_KT_STARTUP"] == "1"
+    assert child_env["ASYM_GEMM_LF_REQUIRE_KT_FUSED_LORA_STARTUP"] == "0"
+    assert child_env["ASYM_GEMM_LF_CONFIG_KT_REQUIRE_STARTUP"] == "1"
+    assert child_env["ASYM_GEMM_LF_CONFIG_KT_REQUIRE_FUSED_LORA_STARTUP"] == "0"
+    assert child_env["ASYM_GEMM_LF_CONFIG_KT_ARM_LOGICAL_QLEN"] == "256"
+    assert child_env["ASYM_GEMM_LF_CONFIG_KT_ARM_ROUTE_RANK_WORK"] == str(256 * 8 * 8)
+    assert child_env["ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_MAX_ROUTE_RANK_WORK"] == "1048576"
+    assert child_env["ASYM_GEMM_LF_CONFIG_KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK"] == "0"
+    assert child_env["TRITON_CACHE_DIR"] == str(tmp_path / "tmp" / "asymgemm_triton_cache" / "unit_kt_env")
+
+
 def test_profile_lora_lf_dry_run_accepts_superoffload(tmp_path: Path) -> None:
     lf_dir = make_fake_lf(tmp_path)
     deepspeed_dir = make_fake_deepspeed(tmp_path)
@@ -183,6 +733,198 @@ def test_profile_lora_lf_dry_run_accepts_superoffload(tmp_path: Path) -> None:
     assert "--asym_backend" not in command
     assert "--use_kt" not in command
     assert "--kt_backend" not in command
+
+
+def test_profile_lora_lf_skips_kt_arm_nsys_without_source_ok(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    output_root = tmp_path / "dryrun"
+
+    result = run_cmd(
+        [
+            "scripts/lf/profile_lora_lf.sh",
+            "--model-specs",
+            "Qwen/Qwen3-30B-A3B|1",
+            "--output-root",
+            str(output_root),
+        ],
+        env={
+            "LF_DIR": str(lf_dir),
+            "BACKEND_SPECS": "kt_armbf16|recomp",
+            "GPU_POOL": "0",
+            "PROFILERS": "nsys",
+            "SEQ_LENS": "128",
+            "MAX_STEPS": "1",
+            "WARMUP_STEPS": "0",
+            "PREPARE_DATASETS": "false",
+            "DRY_RUN": "true",
+            "LORA_DROPOUT": "0.00",
+            "EXPERT_POLICIES": "none",
+            "PLOT": "false",
+            "PLOT_MEMORY_BREAKDOWN": "false",
+        },
+    )
+
+    assert "Skipping backend=kt_armbf16 profiler=nsys" in result.stdout
+    assert not list(output_root.rglob("command.txt"))
+
+
+def test_profile_lora_lf_skips_kt_arm_nsys_without_matching_source_profile(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    output_root = tmp_path / "dryrun"
+
+    result = run_cmd(
+        [
+            "scripts/lf/profile_lora_lf.sh",
+            "--model-specs",
+            "Qwen/Qwen3-30B-A3B|1",
+            "--output-root",
+            str(output_root),
+        ],
+        env={
+            "LF_DIR": str(lf_dir),
+            "BACKEND_SPECS": "kt_armbf16|recomp",
+            "GPU_POOL": "0",
+            "PROFILERS": "nsys",
+            "SEQ_LENS": "128",
+            "MAX_STEPS": "1",
+            "WARMUP_STEPS": "0",
+            "PREPARE_DATASETS": "false",
+            "DRY_RUN": "true",
+            "KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK": "1",
+            "LORA_DROPOUT": "0.00",
+            "EXPERT_POLICIES": "none",
+            "PLOT": "false",
+            "PLOT_MEMORY_BREAKDOWN": "false",
+        },
+    )
+
+    assert "matching source profile is missing, incomplete, or stale" in result.stdout
+    assert not list(output_root.rglob("command.txt"))
+
+
+def test_profile_lora_lf_dry_run_rejects_kt_arm_large_route_rank(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    output_root = tmp_path / "dryrun"
+
+    result = subprocess.run(
+        [
+            "scripts/lf/profile_lora_lf.sh",
+            "--model-specs",
+            "Qwen/Qwen3-30B-A3B|1",
+            "--output-root",
+            str(output_root),
+        ],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "ROOT": str(ROOT),
+            "ASYM_DIR": str(ROOT),
+            "LF_DIR": str(lf_dir),
+            "BACKEND_SPECS": "kt_armbf16|recomp",
+            "GPU_POOL": "0",
+            "PROFILERS": "source",
+            "SEQ_LENS": "7168",
+            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
+            "LORA_RANK": "64",
+            "MAX_STEPS": "1",
+            "WARMUP_STEPS": "0",
+            "PREPARE_DATASETS": "false",
+            "DRY_RUN": "true",
+            "LORA_DROPOUT": "0.00",
+            "EXPERT_POLICIES": "none",
+            "PLOT": "false",
+            "PLOT_MEMORY_BREAKDOWN": "false",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "route-rank work 14680064 exceeds KT_ARM_SFT_MAX_ROUTE_RANK_WORK=1048576" in result.stderr
+    assert not list(output_root.rglob("command.txt"))
+
+
+def test_profile_lora_lf_rejects_stale_kt_profile_missing_update_health(tmp_path: Path) -> None:
+    profile = tmp_path / "profile.json"
+    profile.write_text(
+        json.dumps(
+            {
+                "config": {"backend": "kt_armbf16"},
+                "heartbeat": {"latest": {"stage": "source_profile_written"}},
+                "lora": {"kt_fused_expert_lora_parameters": 8},
+                "optimizer_memory_preflight": {"available": True},
+                "optimizer_memory": {},
+                "trainable_surface": {"surface": "attention+expert LoRA"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    check_script = tmp_path / "check_existing_profile.sh"
+    check_script.write_text(
+        "\n".join(
+            [
+                "set -Eeuo pipefail",
+                "eval \"$(awk '/^existing_profile_complete\\(\\)/,/^kt_arm_route_rank_limit\\(\\)/ { if ($0 !~ /^kt_arm_route_rank_limit\\(\\)/) print }' scripts/lf/profile_lora_lf.sh)\"",
+                "existing_profile_complete \"$1\"",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bash", str(check_script), str(profile)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+
+
+def test_profile_lora_lf_rejects_existing_profile_backend_mismatch(tmp_path: Path) -> None:
+    profile = tmp_path / "profile.json"
+    profile.write_text(
+        json.dumps(
+            {
+                "config": {
+                    "backend": "zero3_offload",
+                    "seq_len": 128,
+                    "model_name_or_path": "Qwen/Qwen3-30B-A3B",
+                    "lora_target": "all",
+                },
+                "heartbeat": {"latest": {"stage": "source_profile_written"}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    check_script = tmp_path / "check_existing_profile.sh"
+    check_script.write_text(
+        "\n".join(
+            [
+                "set -Eeuo pipefail",
+                f"ENV_PYTHON={sys.executable!r}",
+                "eval \"$(awk '/^existing_profile_complete\\(\\)/,/^kt_arm_route_rank_limit\\(\\)/ { if ($0 !~ /^kt_arm_route_rank_limit\\(\\)/) print }' scripts/lf/profile_lora_lf.sh)\"",
+                "existing_profile_complete \"$1\" kt_armbf16 128 Qwen/Qwen3-30B-A3B all",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bash", str(check_script), str(profile)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
 
 
 def test_profile_lora_lf_rejects_legacy_superoffload_alias(tmp_path: Path) -> None:

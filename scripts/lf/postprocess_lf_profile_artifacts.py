@@ -89,6 +89,379 @@ def _lora_counter_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
     return [row] if row else []
 
 
+def _source_profile_for_artifacts(profile: dict[str, Any]) -> dict[str, Any]:
+    source_profile = profile.get("source_profile", {})
+    return source_profile if isinstance(source_profile, dict) else profile
+
+
+def _counter_value(container: Any, key: str, default: Any = "-") -> Any:
+    if not isinstance(container, dict):
+        return "missing"
+    if container.get("available") is False:
+        reason = container.get("reason")
+        return f"missing ({reason})" if reason else "missing"
+    if key not in container:
+        return default
+    value = container.get(key)
+    return default if value is None else value
+
+
+def _trainer_log_trainable_params(profile: dict[str, Any]) -> int | None:
+    trainer = profile.get("trainer", {})
+    if not isinstance(trainer, dict):
+        return None
+    log_path = str(trainer.get("trainer_log") or "").strip()
+    if not log_path:
+        return None
+    path = Path(log_path)
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    patterns = (
+        r"trainable params:\s*([0-9][0-9,]*)",
+        r"Number of trainable parameters\s*=\s*([0-9][0-9,]*)",
+    )
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        if matches:
+            return int(matches[-1].replace(",", ""))
+    return None
+
+
+def _trainable_param_value(profile: dict[str, Any]) -> int | None:
+    value = _int_counter(profile.get("lora", {}), "trainable_parameters")
+    return value if value is not None else _trainer_log_trainable_params(profile)
+
+
+def _trainable_param_display(profile: dict[str, Any]) -> Any:
+    value = _int_counter(profile.get("lora", {}), "trainable_parameters")
+    if value is not None:
+        return value
+    fallback = _trainer_log_trainable_params(profile)
+    if fallback is not None:
+        return f"{fallback} (trainer log fallback)"
+    return _counter_value(profile.get("lora", {}), "trainable_parameters")
+
+
+def _int_counter(container: Any, key: str) -> int | None:
+    if not isinstance(container, dict) or container.get("available") is False:
+        return None
+    value = container.get(key)
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def _trainable_surface_summary(profile: dict[str, Any]) -> dict[str, Any]:
+    config = profile.get("config", {})
+    lora = profile.get("lora", {})
+
+    def unknown_surface(reason: str, fallback_trainable: int | None = None, source: str | None = None) -> dict[str, Any]:
+        if fallback_trainable is None:
+            fallback_trainable = _trainer_log_trainable_params(profile)
+        structured_trainable = _int_counter(lora, "trainable_parameters") if isinstance(lora, dict) else None
+        if fallback_trainable is None:
+            fallback_trainable = structured_trainable
+        if source is None:
+            if structured_trainable is not None:
+                source = "structured_lora"
+            elif fallback_trainable is not None:
+                source = "trainer_log"
+            else:
+                source = "missing"
+        return {
+            "available": fallback_trainable is not None,
+            "reason": reason,
+            "surface": "unknown",
+            "comparison_note": "only trainer-log trainable parameter count is available"
+            if source == "trainer_log"
+            else "structured trainable parameter count is available but LoRA surface counters are incomplete"
+            if source == "structured_lora"
+            else reason,
+            "trainable_parameters": fallback_trainable,
+            "trainable_parameters_source": source,
+        }
+
+    if not isinstance(lora, dict):
+        return unknown_surface("missing lora counters")
+    if not lora:
+        return unknown_surface("missing lora counters")
+    if lora.get("available") is False:
+        reason = str(lora.get("reason") or "lora counters unavailable")
+        return unknown_surface(reason, source="trainer_log" if _trainer_log_trainable_params(profile) is not None else None)
+
+    peft_lora = _int_counter(lora, "peft_lora_parameters")
+    surface_counter_keys = (
+        "peft_lora_parameters",
+        "kt_peft_expert_lora_parameters",
+        "kt_expert_lora_parameters",
+        "lf_fused_expert_lora_parameters",
+        "kt_fused_expert_lora_parameters",
+    )
+    if not any(_int_counter(lora, key) is not None for key in surface_counter_keys):
+        return unknown_surface("missing LoRA surface counters")
+
+    kt_peft_expert = _int_counter(lora, "kt_peft_expert_lora_parameters") or 0
+    kt_expert = _int_counter(lora, "kt_expert_lora_parameters") or 0
+    lf_fused_expert = _int_counter(lora, "lf_fused_expert_lora_parameters") or 0
+    expert_lora = kt_expert + lf_fused_expert
+    non_expert_peft = None if peft_lora is None else max(0, peft_lora - kt_peft_expert)
+
+    if expert_lora > 0 and (non_expert_peft or 0) > 0:
+        surface = "attention+expert LoRA"
+    elif expert_lora > 0:
+        surface = "expert LoRA"
+    elif (non_expert_peft or 0) > 0:
+        surface = "attention-only LoRA"
+    else:
+        surface = "no trainable LoRA detected"
+
+    backend = str(config.get("backend") or "")
+    is_kt = backend.startswith("kt_") or str(config.get("kt_backend") or "").strip() not in {"", "-"}
+    if expert_lora > 0:
+        comparison_note = "requires a baseline that also trains expert LoRA"
+    elif (non_expert_peft or 0) > 0:
+        comparison_note = "attention-only surface; do not compare directly to expert-LoRA KT runs"
+    elif is_kt:
+        comparison_note = "KT run has no captured expert LoRA; verify the adapter surface before comparison"
+    else:
+        comparison_note = "no trainable LoRA surface captured"
+
+    return {
+        "available": True,
+        "surface": surface,
+        "comparison_note": comparison_note,
+        "trainable_parameters": _trainable_param_value(profile),
+        "trainable_parameters_source": "structured_lora"
+        if _int_counter(lora, "trainable_parameters") is not None
+        else "trainer_log",
+        "peft_lora_parameters": peft_lora,
+        "non_expert_peft_lora_parameters": non_expert_peft,
+        "expert_lora_parameters": expert_lora,
+        "lf_fused_expert_lora_parameters": lf_fused_expert,
+        "kt_expert_lora_parameters": kt_expert,
+        "kt_peft_expert_lora_parameters": kt_peft_expert,
+        "kt_fused_expert_lora_parameters": _int_counter(lora, "kt_fused_expert_lora_parameters") or 0,
+    }
+
+
+def _trainable_surface_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    return [_trainable_surface_summary(profile)]
+
+
+def _kt_lora_update_health(profile: dict[str, Any]) -> dict[str, Any]:
+    optimizer_memory = profile.get("optimizer_memory", {})
+    if not isinstance(optimizer_memory, dict):
+        return {}
+    health = optimizer_memory.get("kt_lora_update_health", {})
+    if not isinstance(health, dict):
+        return {}
+    return _normalize_kt_lora_update_health(health)
+
+
+def _normalize_kt_lora_update_health(health: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(health)
+    if "passed" in normalized:
+        normalized.setdefault("input_passed", normalized.get("passed"))
+    if "reason" in normalized:
+        normalized.setdefault("input_reason", normalized.get("reason"))
+    rows = normalized.get("rows", [])
+    row_dicts = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    updated_grad_tensors = sum(
+        int(
+            bool(row.get("nonzero_grad_changed_after_step"))
+            or (bool(row.get("grad_nonzero_before_step")) and bool(row.get("param_changed_after_step")))
+        )
+        for row in row_dicts
+    )
+    grad_nonzero_unchanged_tensors = sum(
+        int(bool(row.get("grad_nonzero_before_step")) and not bool(row.get("param_changed_after_step")))
+        for row in row_dicts
+    )
+
+    normalized["updated_grad_tensors"] = int(normalized.get("updated_grad_tensors", updated_grad_tensors) or 0)
+    normalized["grad_nonzero_unchanged_tensors"] = int(
+        normalized.get("grad_nonzero_unchanged_tensors", grad_nonzero_unchanged_tensors) or 0
+    )
+    compared_tensors = int(normalized.get("compared_tensors", len(row_dicts)) or 0)
+    grad_nonzero_tensors = int(normalized.get("grad_nonzero_tensors", 0) or 0)
+    sampled_tensors = int(normalized.get("sampled_tensors", len(row_dicts)) or 0)
+    total_fused_tensors = int(normalized.get("total_fused_tensors", 0) or 0)
+    after_sampled_tensors = normalized.get("after_sampled_tensors")
+    after_total_fused_tensors = normalized.get("after_total_fused_tensors")
+    after_sampled_tensors_int = int(after_sampled_tensors) if isinstance(after_sampled_tensors, (int, float)) else None
+    after_total_fused_tensors_int = (
+        int(after_total_fused_tensors) if isinstance(after_total_fused_tensors, (int, float)) else None
+    )
+    missing_after_tensors = int(normalized.get("missing_after_tensors", 0) or 0)
+    unexpected_after_tensors = int(normalized.get("unexpected_after_tensors", 0) or 0)
+    normalized.setdefault("exhaustive", bool(total_fused_tensors > 0 and sampled_tensors == total_fused_tensors))
+    normalized.setdefault("exhaustive_elements", False)
+    if normalized.get("available") is False:
+        derived_passed = False
+        derived_reason = "KT fused LoRA update health unavailable"
+    elif missing_after_tensors > 0 or unexpected_after_tensors > 0:
+        derived_passed = False
+        derived_reason = (
+            "sampled fused LoRA tensor set changed between before/after optimizer snapshots "
+            f"(missing_after={missing_after_tensors}, unexpected_after={unexpected_after_tensors})"
+        )
+    elif (
+        after_sampled_tensors_int is not None
+        and after_total_fused_tensors_int is not None
+        and (sampled_tensors != after_sampled_tensors_int or total_fused_tensors != after_total_fused_tensors_int)
+    ):
+        derived_passed = False
+        derived_reason = (
+            "fused LoRA tensor counts changed between before/after optimizer snapshots "
+            f"(sampled {sampled_tensors}->{after_sampled_tensors_int}, "
+            f"total {total_fused_tensors}->{after_total_fused_tensors_int})"
+        )
+    elif normalized.get("exhaustive") and compared_tensors != sampled_tensors:
+        derived_passed = False
+        derived_reason = f"exhaustive fused LoRA health compared {compared_tensors} of {sampled_tensors} tensors"
+    elif compared_tensors <= 0:
+        derived_passed = False
+        derived_reason = "no sampled fused LoRA tensors were comparable"
+    elif grad_nonzero_tensors <= 0:
+        derived_passed = False
+        derived_reason = "no sampled fused LoRA tensors had nonzero gradients before optimizer step"
+    elif normalized["grad_nonzero_unchanged_tensors"] > 0:
+        derived_passed = False
+        derived_reason = "one or more sampled nonzero-gradient fused LoRA tensors did not change after optimizer step"
+    else:
+        derived_passed = True
+        if normalized.get("exhaustive_elements"):
+            derived_reason = "all nonzero-gradient fused LoRA tensors changed after optimizer step with full-element checksums"
+        elif normalized.get("exhaustive"):
+            derived_reason = "all nonzero-gradient fused LoRA tensors changed after optimizer step"
+        else:
+            derived_reason = "all sampled nonzero-gradient fused LoRA tensors changed after optimizer step"
+
+    if normalized.get("input_passed") is False and derived_passed:
+        normalized["passed"] = False
+        normalized["reason"] = str(normalized.get("input_reason") or "input KT fused LoRA update health failed")
+    else:
+        normalized["passed"] = derived_passed
+        normalized["reason"] = derived_reason
+    return normalized
+
+
+def _kt_lora_update_health_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    health = _kt_lora_update_health(profile)
+    if not health:
+        return []
+    summary = {
+        "available": health.get("available"),
+        "passed": health.get("passed"),
+        "reason": health.get("reason"),
+        "sampled_tensors": health.get("sampled_tensors"),
+        "total_fused_tensors": health.get("total_fused_tensors"),
+        "after_sampled_tensors": health.get("after_sampled_tensors"),
+        "after_total_fused_tensors": health.get("after_total_fused_tensors"),
+        "exhaustive": health.get("exhaustive"),
+        "exhaustive_elements": health.get("exhaustive_elements"),
+        "requested_max_tensors": health.get("requested_max_tensors"),
+        "requested_max_elements": health.get("requested_max_elements"),
+        "compared_tensors": health.get("compared_tensors"),
+        "missing_after_tensors": health.get("missing_after_tensors"),
+        "unexpected_after_tensors": health.get("unexpected_after_tensors"),
+        "grad_nonzero_tensors": health.get("grad_nonzero_tensors"),
+        "updated_grad_tensors": health.get("updated_grad_tensors"),
+        "grad_nonzero_unchanged_tensors": health.get("grad_nonzero_unchanged_tensors"),
+        "changed_tensors": health.get("changed_tensors"),
+        "input_passed": health.get("input_passed"),
+        "input_reason": health.get("input_reason"),
+    }
+    rows = health.get("rows", [])
+    if not isinstance(rows, list) or not rows:
+        return [summary]
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if isinstance(row, dict):
+            normalized.append({**summary, **row})
+    return normalized or [summary]
+
+
+def _optimizer_memory_preflight(profile: dict[str, Any]) -> dict[str, Any]:
+    preflight = profile.get("optimizer_memory_preflight", {})
+    if isinstance(preflight, dict):
+        return preflight
+    return {}
+
+
+def _optimizer_memory_preflight_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    preflight = _optimizer_memory_preflight(profile)
+    if not preflight:
+        return []
+    return [{key: value for key, value in preflight.items() if not isinstance(value, (dict, list))}]
+
+
+def _process_memory(profile: dict[str, Any]) -> dict[str, Any]:
+    memory = profile.get("memory", {})
+    process = memory.get("process", {}) if isinstance(memory, dict) else {}
+    return process if isinstance(process, dict) else {}
+
+
+def _process_memory_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    process = _process_memory(profile)
+    if process:
+        rows.append({"name": "report", **{key: value for key, value in process.items() if not isinstance(value, (dict, list))}})
+    stage_rows = profile.get("stage_memory", {}).get("rows", [])
+    if isinstance(stage_rows, list):
+        for row in stage_rows:
+            if not isinstance(row, dict):
+                continue
+            process_items = {
+                key: value
+                for key, value in row.items()
+                if key == "name" or key.startswith("avg_process_") or key.startswith("max_process_")
+            }
+            if len(process_items) > 1:
+                rows.append(process_items)
+    optimizer_memory = profile.get("optimizer_memory", {})
+    if isinstance(optimizer_memory, dict):
+        at_start = optimizer_memory.get("process_memory_at_start", {})
+        before = optimizer_memory.get("process_memory_before_step", {})
+        after = optimizer_memory.get("process_memory_after_step", {})
+        if isinstance(at_start, dict) and at_start:
+            rows.append(
+                {
+                    "name": "optimizer_step_start",
+                    "process_rss_pre_step_overhead_delta_bytes": optimizer_memory.get(
+                        "process_rss_pre_step_overhead_delta_bytes"
+                    ),
+                    **{key: value for key, value in at_start.items() if not isinstance(value, (dict, list))},
+                }
+            )
+        if isinstance(before, dict) and before:
+            rows.append(
+                {
+                    "name": "optimizer_step_before",
+                    "process_rss_pre_step_overhead_delta_bytes": optimizer_memory.get(
+                        "process_rss_pre_step_overhead_delta_bytes"
+                    ),
+                    **{key: value for key, value in before.items() if not isinstance(value, (dict, list))},
+                }
+            )
+        if isinstance(after, dict) and after:
+            rows.append(
+                {
+                    "name": "optimizer_step_after",
+                    "process_rss_delta_bytes": optimizer_memory.get("process_rss_delta_bytes"),
+                    **{key: value for key, value in after.items() if not isinstance(value, (dict, list))},
+                }
+            )
+    return rows
+
+
 def _source_summary_markdown(profile: dict[str, Any]) -> str:
     config = profile.get("config", {})
     warmup_steps = int(config.get("warmup_steps", 0) or 0)
@@ -98,6 +471,11 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
     trainer = profile.get("trainer", {})
     kt = profile.get("kt", {})
     lora = profile.get("lora", {})
+    trainable_surface = _trainable_surface_summary(profile)
+    kt_lora_update_health = _kt_lora_update_health(profile)
+    optimizer_memory_preflight = _optimizer_memory_preflight(profile)
+    process_memory = _process_memory(profile)
+    process_memory_rows = _process_memory_rows(profile)
     forward_ms = profile.get("forward", {}).get("total_milliseconds")
     backward_ms = profile.get("backward", {}).get("total_milliseconds")
     lines = [
@@ -134,6 +512,36 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
         f"Trainer log: `{trainer.get('trainer_log', '')}`",
         "",
     ]
+    if process_memory:
+        lines += [
+            "## Process Memory",
+            "",
+            "| Metric | Value |",
+            "|---|---:|",
+            f"| available | {process_memory.get('available', '-')} |",
+            f"| RSS bytes | {process_memory.get('rss_bytes', '-')} |",
+            f"| RSS MiB | {_fmt_mib(process_memory.get('rss_bytes'))} |",
+            f"| RSS peak bytes | {process_memory.get('rss_peak_bytes', '-')} |",
+            f"| RSS peak MiB | {_fmt_mib(process_memory.get('rss_peak_bytes'))} |",
+            f"| virtual memory bytes | {process_memory.get('virtual_memory_bytes', '-')} |",
+            f"| source | {process_memory.get('source', '-')} |",
+            "",
+        ]
+        if process_memory_rows:
+            lines += [
+                "| Sample | RSS bytes | RSS peak bytes | virtual memory bytes | RSS delta bytes |",
+                "|---|---:|---:|---:|---:|",
+            ]
+            for row in process_memory_rows:
+                name = row.get("name", "-")
+                rss_bytes = row.get("rss_bytes", row.get("avg_process_rss_end_bytes", "-"))
+                rss_peak_bytes = row.get("rss_peak_bytes", row.get("max_process_rss_peak_end_bytes", "-"))
+                virtual_memory_bytes = row.get(
+                    "virtual_memory_bytes", row.get("avg_process_virtual_memory_end_bytes", "-")
+                )
+                rss_delta_bytes = row.get("process_rss_delta_bytes", row.get("avg_process_rss_delta_bytes", "-"))
+                lines.append(f"| {name} | {rss_bytes} | {rss_peak_bytes} | {virtual_memory_bytes} | {rss_delta_bytes} |")
+            lines.append("")
     if isinstance(kt, dict) or isinstance(lora, dict):
         lines += [
             "## KT / LoRA Counters",
@@ -144,20 +552,83 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
         if isinstance(kt, dict):
             lines += [
                 f"| KT backend | {config.get('kt_backend', '-')} |",
-                f"| KT wrappers | {kt.get('wrapper_count', 0)} |",
-                f"| KT forward calls | {kt.get('total_forward_calls', 0)} |",
-                f"| KT backward calls | {kt.get('total_backward_calls', 0)} |",
+                f"| KT wrappers | {_counter_value(kt, 'wrapper_count')} |",
+                f"| KT forward calls | {_counter_value(kt, 'total_forward_calls')} |",
+                f"| KT backward calls | {_counter_value(kt, 'total_backward_calls')} |",
             ]
         if isinstance(lora, dict):
             lines += [
-                f"| trainable params | {lora.get('trainable_parameters', '-')} |",
-                f"| PEFT LoRA params | {lora.get('peft_lora_parameters', '-')} |",
-                f"| LF fused expert LoRA params | {lora.get('lf_fused_expert_lora_parameters', '-')} |",
-                f"| KT expert LoRA params | {lora.get('kt_expert_lora_parameters', '-')} |",
-                f"| KT PEFT-view expert LoRA params | {lora.get('kt_peft_expert_lora_parameters', '-')} |",
-                f"| KT fused expert LoRA params | {lora.get('kt_fused_expert_lora_parameters', '-')} |",
+                f"| trainable params | {_trainable_param_display(profile)} |",
+                f"| PEFT LoRA params | {_counter_value(lora, 'peft_lora_parameters')} |",
+                f"| LF fused expert LoRA params | {_counter_value(lora, 'lf_fused_expert_lora_parameters')} |",
+                f"| LF fused expert LoRA tensors | {_counter_value(lora, 'lf_fused_expert_lora_tensors')} |",
+                f"| KT expert LoRA params | {_counter_value(lora, 'kt_expert_lora_parameters')} |",
+                f"| KT PEFT-view expert LoRA params | {_counter_value(lora, 'kt_peft_expert_lora_parameters')} |",
+                f"| KT fused expert LoRA params | {_counter_value(lora, 'kt_fused_expert_lora_parameters')} |",
+                f"| KT fused expert LoRA tensors | {_counter_value(lora, 'kt_fused_expert_lora_tensors')} |",
+                f"| KT fused expert LoRA sidecar expected tensors | {_counter_value(lora, 'kt_fused_expert_lora_tensors')} |",
+                f"| KT fused expert LoRA sidecar expected params | {_counter_value(lora, 'kt_fused_expert_lora_parameters')} |",
+            ]
+            lines += [
+                f"| trainable surface | {trainable_surface.get('surface', '-')} |",
+                f"| non-expert PEFT LoRA params | {trainable_surface.get('non_expert_peft_lora_parameters', '-')} |",
+                f"| expert LoRA params | {trainable_surface.get('expert_lora_parameters', '-')} |",
+                f"| backend comparison note | {trainable_surface.get('comparison_note', '-')} |",
             ]
         lines.append("")
+    if optimizer_memory_preflight:
+        lines += [
+            "## Optimizer Memory Preflight",
+            "",
+            "| Metric | Value |",
+            "|---|---:|",
+            f"| available | {optimizer_memory_preflight.get('available', '-')} |",
+            f"| source | {optimizer_memory_preflight.get('source', '-')} |",
+            f"| reason | {optimizer_memory_preflight.get('reason', '-')} |",
+            f"| assumed param dtype | {optimizer_memory_preflight.get('assumed_param_dtype', '-')} |",
+            f"| logical qlen | {optimizer_memory_preflight.get('logical_qlen', '-')} |",
+            f"| LoRA rank | {optimizer_memory_preflight.get('lora_rank', '-')} |",
+            f"| trainable params | {optimizer_memory_preflight.get('trainable_parameters', '-')} |",
+            f"| KT fused expert LoRA params | {optimizer_memory_preflight.get('kt_fused_expert_lora_parameters', '-')} |",
+            f"| KT expert LoRA params | {optimizer_memory_preflight.get('kt_expert_lora_parameters', '-')} |",
+            f"| non-expert PEFT LoRA params | {optimizer_memory_preflight.get('non_expert_peft_lora_parameters', '-')} |",
+            f"| BF16 param bytes | {optimizer_memory_preflight.get('param_bf16_bytes', '-')} |",
+            f"| BF16 grad bytes | {optimizer_memory_preflight.get('grad_bf16_bytes', '-')} |",
+            f"| AdamW BF16 moments bytes | {optimizer_memory_preflight.get('adamw_bf16_moments_bytes', '-')} |",
+            f"| AdamW FP32 moments bytes | {optimizer_memory_preflight.get('adamw_fp32_moments_bytes', '-')} |",
+            f"| FP32 master bytes | {optimizer_memory_preflight.get('adamw_fp32_master_bytes', '-')} |",
+            f"| total BF16 params/grads + BF16 moments bytes | {optimizer_memory_preflight.get('total_bf16_params_grads_adamw_bf16_moments_bytes', '-')} |",
+            f"| total BF16 params/grads + FP32 moments bytes | {optimizer_memory_preflight.get('total_bf16_params_grads_adamw_fp32_moments_bytes', '-')} |",
+            f"| total with FP32 moments + master bytes | {optimizer_memory_preflight.get('total_bf16_params_grads_adamw_fp32_moments_master_bytes', '-')} |",
+            f"| large surface warning | {optimizer_memory_preflight.get('large_surface_warning', '-')} |",
+            "",
+        ]
+    if kt_lora_update_health:
+        lines += [
+            "## KT Fused LoRA Update Health",
+            "",
+            "| Metric | Value |",
+            "|---|---:|",
+            f"| available | {kt_lora_update_health.get('available', '-')} |",
+            f"| passed | {kt_lora_update_health.get('passed', '-')} |",
+            f"| reason | {kt_lora_update_health.get('reason', '-')} |",
+            f"| total fused tensors | {kt_lora_update_health.get('total_fused_tensors', '-')} |",
+            f"| sampled tensors | {kt_lora_update_health.get('sampled_tensors', '-')} |",
+            f"| after total fused tensors | {kt_lora_update_health.get('after_total_fused_tensors', '-')} |",
+            f"| after sampled tensors | {kt_lora_update_health.get('after_sampled_tensors', '-')} |",
+            f"| exhaustive | {kt_lora_update_health.get('exhaustive', '-')} |",
+            f"| exhaustive elements | {kt_lora_update_health.get('exhaustive_elements', '-')} |",
+            f"| requested max tensors | {kt_lora_update_health.get('requested_max_tensors', '-')} |",
+            f"| requested max elements | {kt_lora_update_health.get('requested_max_elements', '-')} |",
+            f"| compared tensors | {kt_lora_update_health.get('compared_tensors', '-')} |",
+            f"| missing after tensors | {kt_lora_update_health.get('missing_after_tensors', '-')} |",
+            f"| unexpected after tensors | {kt_lora_update_health.get('unexpected_after_tensors', '-')} |",
+            f"| nonzero-gradient sampled tensors | {kt_lora_update_health.get('grad_nonzero_tensors', '-')} |",
+            f"| nonzero-gradient tensors changed | {kt_lora_update_health.get('updated_grad_tensors', '-')} |",
+            f"| nonzero-gradient tensors unchanged | {kt_lora_update_health.get('grad_nonzero_unchanged_tensors', '-')} |",
+            f"| changed sampled tensors | {kt_lora_update_health.get('changed_tensors', '-')} |",
+            "",
+        ]
     losses = trainer.get("losses", [])
     if isinstance(losses, list) and losses:
         measured_losses = [row for row in losses if isinstance(row, dict) and not row.get("is_warmup")]
@@ -698,6 +1169,10 @@ def _memory_by_module(profile: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _write_source_artifacts(source_profile_json: Path, output_dir: Path, profile_json: Path | None) -> None:
     profile = json.loads(source_profile_json.read_text(encoding="utf-8"))
+    profile["trainable_surface"] = _trainable_surface_summary(profile)
+    kt_lora_health = _kt_lora_update_health(profile)
+    if kt_lora_health and isinstance(profile.get("optimizer_memory"), dict):
+        profile["optimizer_memory"]["kt_lora_update_health"] = kt_lora_health
     output_dir.mkdir(parents=True, exist_ok=True)
     target_profile = profile_json or output_dir / "profile.json"
     target_profile.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -715,17 +1190,34 @@ def _write_source_artifacts(source_profile_json: Path, output_dir: Path, profile
         _write_csv(output_dir / "memory_breakdown.csv", breakdown_rows)
     if actual_breakdown_rows:
         _write_csv(output_dir / "memory_actual_peak_breakdown.csv", actual_breakdown_rows)
+    process_memory_rows = _process_memory_rows(profile)
+    if process_memory_rows:
+        _write_csv(output_dir / "process_memory.csv", process_memory_rows)
     kt_rows = _kt_counter_rows(profile)
     if kt_rows:
         _write_csv(output_dir / "kt_counters.csv", kt_rows)
     lora_rows = _lora_counter_rows(profile)
     if lora_rows:
         _write_csv(output_dir / "lora_counters.csv", lora_rows)
+    trainable_surface_rows = _trainable_surface_rows(profile)
+    if trainable_surface_rows:
+        _write_csv(output_dir / "trainable_surface.csv", trainable_surface_rows)
+    kt_lora_health_rows = _kt_lora_update_health_rows(profile)
+    if kt_lora_health_rows:
+        _write_csv(output_dir / "kt_lora_update_health.csv", kt_lora_health_rows)
+    optimizer_preflight_rows = _optimizer_memory_preflight_rows(profile)
+    if optimizer_preflight_rows:
+        _write_csv(output_dir / "optimizer_memory_preflight.csv", optimizer_preflight_rows)
     _write_step_samples(profile, output_dir)
 
 
 def _write_profile_csv_artifacts(profile_json: Path, output_dir: Path) -> None:
     profile = json.loads(profile_json.read_text(encoding="utf-8"))
+    source_profile = _source_profile_for_artifacts(profile)
+    source_profile.setdefault("trainable_surface", _trainable_surface_summary(source_profile))
+    kt_lora_health = _kt_lora_update_health(source_profile)
+    if kt_lora_health and isinstance(source_profile.get("optimizer_memory"), dict):
+        source_profile["optimizer_memory"]["kt_lora_update_health"] = kt_lora_health
     output_dir.mkdir(parents=True, exist_ok=True)
     stage_rows = _timing_by_stage(profile)
     op_rows = _timing_by_op(profile)
@@ -743,12 +1235,24 @@ def _write_profile_csv_artifacts(profile_json: Path, output_dir: Path) -> None:
     actual_breakdown_rows = _actual_peak_memory_breakdown_csv_rows(memory_breakdown_summary)
     if actual_breakdown_rows:
         _write_csv(output_dir / "memory_actual_peak_breakdown.csv", actual_breakdown_rows)
-    kt_rows = _kt_counter_rows(profile)
+    process_memory_rows = _process_memory_rows(source_profile)
+    if process_memory_rows:
+        _write_csv(output_dir / "process_memory.csv", process_memory_rows)
+    kt_rows = _kt_counter_rows(source_profile)
     if kt_rows:
         _write_csv(output_dir / "kt_counters.csv", kt_rows)
-    lora_rows = _lora_counter_rows(profile)
+    lora_rows = _lora_counter_rows(source_profile)
     if lora_rows:
         _write_csv(output_dir / "lora_counters.csv", lora_rows)
+    trainable_surface_rows = _trainable_surface_rows(source_profile)
+    if trainable_surface_rows:
+        _write_csv(output_dir / "trainable_surface.csv", trainable_surface_rows)
+    kt_lora_health_rows = _kt_lora_update_health_rows(source_profile)
+    if kt_lora_health_rows:
+        _write_csv(output_dir / "kt_lora_update_health.csv", kt_lora_health_rows)
+    optimizer_preflight_rows = _optimizer_memory_preflight_rows(source_profile)
+    if optimizer_preflight_rows:
+        _write_csv(output_dir / "optimizer_memory_preflight.csv", optimizer_preflight_rows)
     _write_csv(output_dir / "unattributed_timing.csv", _unattributed(profile))
 
 

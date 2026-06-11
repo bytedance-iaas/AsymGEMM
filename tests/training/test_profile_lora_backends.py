@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.util
+import json
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -18,6 +21,7 @@ PROFILE_LORA_E2E_PATH = ROOT / "scripts" / "lora" / "profile_lora_e2e.py"
 PROFILE_LORA_E2E_DRIVER_PATH = ROOT / "scripts" / "lora" / "profile_lora_e2e_driver.py"
 POSTPROCESS_NSYS_LORA_PATH = ROOT / "scripts" / "lora" / "postprocess_nsys_lora.py"
 PLOT_ACTIVATION_SWEEP_PATH = ROOT / "scripts" / "plotting" / "plot_activation_recompute_sweep.py"
+KT_KERNEL_ROOT = ROOT.parent / "ktransformers" / "kt-kernel"
 
 
 def _load_profile_lora_e2e_module():
@@ -274,6 +278,64 @@ def test_profile_lora_e2e_driver_prefers_nsys_stage_timing_over_source_step() ->
             "source_profile": {"step": {"total_milliseconds": 99.0}},
         }
     ) == pytest.approx(18.0)
+
+
+def test_activation_sweep_rows_flag_mismatched_trainable_surfaces(tmp_path: Path) -> None:
+    plotter = _load_activation_sweep_plot_module()
+    input_root = tmp_path / "profiling"
+    config_root = input_root / "qwen3-30b-a3b__lora__lf__bf16" / "qwen3-30b-a3b__gpus1__b1_s128_w0_s1_r8_a16_drop000"
+
+    def write_profile(backend: str, surface: str, trainable_params: int) -> None:
+        run_dir = config_root / f"{backend}__source__recomp__polnone__routerhf" / "b1_s128"
+        run_dir.mkdir(parents=True)
+        profile = {
+            "config": {
+                "backend": backend,
+                "batch_size": 1,
+                "seq_len": 128,
+                "logical_tokens": 128,
+                "lora_dropout": 0.0,
+                "router_mode": "hf",
+            },
+            "forward": {"total_milliseconds": 1.0},
+            "backward": {"total_milliseconds": 2.0},
+            "memory": {"gpu": {}},
+            "stage_memory": {"rows": []},
+            "trainable_surface": {
+                "available": True,
+                "surface": surface,
+                "trainable_parameters": trainable_params,
+                "expert_lora_parameters": max(0, trainable_params - 10),
+                "non_expert_peft_lora_parameters": min(10, trainable_params),
+            },
+        }
+        (run_dir / "profile.json").write_text(json.dumps(profile) + "\n", encoding="utf-8")
+
+    write_profile("zero3_offload", "attention-only LoRA", 10)
+    write_profile("kt_armbf16", "attention+expert LoRA", 100)
+
+    args = argparse.Namespace(
+        input_root=input_root,
+        precision="",
+        workload=[],
+        backend=[],
+        router_mode=[],
+        profiler=[],
+        recompute=[],
+        batch_size=[],
+        seq_lens=[],
+        expert_recompute_policies=[],
+    )
+
+    rows = plotter.collect_rows(args)
+
+    assert len(rows) == 2
+    assert {row["backend"] for row in rows} == {"zero3_offload", "kt_armbf16"}
+    assert {row["same_trainable_surface"] for row in rows} == {False}
+    assert {row["trainable_surface_group_backends"] for row in rows} == {"kt_armbf16,zero3_offload"}
+    assert {row["trainable_surface_group_note"] for row in rows} == {
+        "missing or mismatched trainable surface across backends"
+    }
 
 
 def test_profile_lora_e2e_driver_writes_descending_latency_and_memory_rankings() -> None:
@@ -655,3 +717,150 @@ def test_kt_moe_wrapper_import_reports_clear_availability() -> None:
         assert "backend=kt requires kt-kernel with SFT AMX support" in str(exc)
     else:
         assert wrapper_cls.__name__ == "KTMoEWrapper"
+
+
+def test_arm_bf16_native_capacity_preflight_reports_grouped_fields() -> None:
+    sys.path.insert(0, str(KT_KERNEL_ROOT))
+    arm = importlib.import_module("python.sft.arm")
+
+    wrapper = object.__new__(arm.ArmBF16SFTMoEWrapper)
+    wrapper.chunked_prefill_size = 8
+    wrapper.group_max_len = 16
+    wrapper.num_experts_per_tok = 8
+    wrapper.layer_idx = 3
+
+    wrapper._validate_native_capacity(torch.empty((16, 4)))
+    with pytest.raises(ValueError) as exc_info:
+        wrapper._validate_native_capacity(torch.empty((17, 4)))
+
+    message = str(exc_info.value)
+    assert "qlen=17" in message
+    assert "max_len=8" in message
+    assert "group_max_len=16" in message
+    assert "max_possible_qlen=16" in message
+    assert "topk=8" in message
+    assert "layer=3" in message
+
+
+def test_sft_base_uses_per_wrapper_staging_buffers_for_overlap() -> None:
+    sys.path.insert(0, str(KT_KERNEL_ROOT))
+    base = importlib.import_module("python.sft.base")
+
+    class FakeCPUInfer:
+        def __init__(self) -> None:
+            self.tasks: list = []
+            self.lock = threading.Lock()
+
+        def submit(self, task) -> None:
+            with self.lock:
+                self.tasks.append(task)
+
+        def sync(self) -> None:
+            while True:
+                with self.lock:
+                    if not self.tasks:
+                        return
+                    task = self.tasks.pop(0)
+                task()
+
+    class FakeWrapper(base.BaseSFTMoEWrapper):
+        cpu_infer = FakeCPUInfer()
+
+        @classmethod
+        def _get_cpu_infer(cls, cpuinfer_threads: int, threadpool_count: int, numa_nodes=None):
+            return cls.cpu_infer
+
+        def _make_forward_task(self, buffer, save_for_backward, dropout_enabled, dropout_seed):
+            offset = float(self.layer_idx)
+
+            def task() -> None:
+                qlen = int(buffer.bsz_tensor[0].item())
+                buffer.output_cpu[:qlen].copy_(buffer.input_cpu[:qlen] + offset)
+
+            return task
+
+        def _make_backward_task(self, buffer):
+            def task() -> None:
+                qlen = int(buffer.bsz_tensor[0].item())
+                buffer.grad_input_cpu[:qlen].copy_(buffer.grad_output_cpu[:qlen])
+                buffer.grad_weights[:qlen].fill_(1.0)
+
+            return task
+
+        def load_weights(self, physical_to_logical_map_cpu: torch.Tensor) -> None:
+            self._weights_loaded = True
+
+        def init_lora_weights(self, *args, **kwargs) -> None:
+            self._lora_initialized = True
+
+        def update_lora_weights(self) -> None:
+            return None
+
+    def make_wrapper(layer_idx: int):
+        wrapper = FakeWrapper(
+            layer_idx=layer_idx,
+            num_experts=2,
+            num_experts_per_tok=1,
+            hidden_size=3,
+            moe_intermediate_size=4,
+            num_gpu_experts=0,
+            cpuinfer_threads=1,
+            threadpool_count=1,
+            weight_path="",
+            chunked_prefill_size=4,
+            lora_rank=2,
+            lora_alpha=4.0,
+            lora_dropout=0.0,
+            max_cache_depth=2,
+        )
+        wrapper._weights_loaded = True
+        wrapper._lora_initialized = True
+        return wrapper
+
+    wrapper_a = make_wrapper(10)
+    wrapper_b = make_wrapper(20)
+    hidden_a = torch.full((2, 3), 1.0, dtype=torch.bfloat16)
+    hidden_b = torch.full((2, 3), 7.0, dtype=torch.bfloat16)
+    expert_ids = torch.zeros((2, 1), dtype=torch.int64)
+    weights = torch.ones((2, 1), dtype=torch.float32)
+
+    wrapper_a.submit_forward(hidden_a, expert_ids, weights, save_for_backward=True)
+    submit_b_done = threading.Event()
+    allow_b_sync = threading.Event()
+    submit_b_error: list[BaseException] = []
+    output_b_holder: list[torch.Tensor] = []
+
+    def submit_b() -> None:
+        try:
+            wrapper_b.submit_forward(hidden_b, expert_ids, weights, save_for_backward=True)
+            submit_b_done.set()
+            allow_b_sync.wait(timeout=5.0)
+            output_b_holder.append(wrapper_b.sync_forward())
+        except BaseException as exc:  # pragma: no cover - makes thread failures visible.
+            submit_b_error.append(exc)
+        finally:
+            submit_b_done.set()
+
+    thread = threading.Thread(target=submit_b, daemon=True)
+    thread.start()
+    if not submit_b_done.wait(timeout=2.0):
+        wrapper_a.sync_forward()
+        thread.join(timeout=2.0)
+        pytest.fail("second SFT wrapper submit blocked on a class-global operation lock")
+    if submit_b_error:
+        raise submit_b_error[0]
+
+    output_a = wrapper_a.sync_forward()
+    allow_b_sync.set()
+    thread.join(timeout=5.0)
+    if thread.is_alive():
+        pytest.fail("second SFT wrapper sync did not finish")
+    if submit_b_error:
+        raise submit_b_error[0]
+    output_b = output_b_holder[0]
+
+    assert output_a.float().tolist() == torch.full((2, 3), 11.0).tolist()
+    assert output_b.float().tolist() == torch.full((2, 3), 27.0).tolist()
+    assert wrapper_a._buffer is not wrapper_b._buffer
+    assert wrapper_a._buffer_allocation_count == 1
+    assert wrapper_b._buffer_allocation_count == 1

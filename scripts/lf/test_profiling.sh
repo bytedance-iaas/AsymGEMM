@@ -12,6 +12,13 @@ KT_KERNEL_DIR=${KT_KERNEL_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/k
 DEEPSPEED_DIR=${DEEPSPEED_DIR:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/deepspeed}
 CONDA_EXE=${CONDA_EXE:-conda}
 NSYS_BIN=${NSYS_BIN:-nsys}
+
+if [[ "${TEST_PROFILING_ALLOW_UNMAINTAINED:-0}" != "1" ]]; then
+  echo "test_profiling.sh is an unmaintained diagnostic helper and can bypass maintained LF profiling guards." >&2
+  echo "Use scripts/lf/profile_lora_lf.sh, or set TEST_PROFILING_ALLOW_UNMAINTAINED=1 only for isolated debugging." >&2
+  exit 2
+fi
+
 # DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun}
 DIST_LAUNCHER=${DIST_LAUNCHER:-deepspeed}
 RUN_POSTSERVE=${RUN_POSTSERVE:-false}
@@ -26,7 +33,7 @@ PROFILERS=${PROFILERS:-nsys,source}
 PRECISION=${PRECISION:-bf16}
 # LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
 LORA_DROPOUT=${LORA_DROPOUT:-0.10}
-# BACKEND_SPECS=${BACKEND_SPECS:-"zero2|norecomp,zero2|recomp,zero3_offload|norecomp,zero3_offload|recomp"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"zero2|norecomp,zero2|recomp,zero3_offload|norecomp,zero3_offload_mem|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp"}
 BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp"}
@@ -151,7 +158,7 @@ Options:
                                  Launcher for torch/zero/SuperOffload jobs. Default ${DIST_LAUNCHER}.
   --models LIST                  Model specs. Each item is model_name_or_path|num_gpus.
                                  Example: meta-llama/Llama-4-Scout-17B-16E|1,meta-llama/Llama-4-Maverick-17B-128E|4
-  --backend-specs LIST           Backend/recompute specs, e.g. 'torch|recomp,asym|norecomp,zero3_offload|recomp'.
+  --backend-specs LIST           Backend/recompute specs, e.g. 'torch|recomp,asym|norecomp,zero3_offload_mem|recomp'.
                                  Use canonical recompute labels: norecomp or recomp. Use both to expand to both modes.
   --router-modes LIST            AsymGEMM router modes: hf, whole. Default ${ROUTER_MODES}.
   --profilers LIST               source and/or nsys.
@@ -376,9 +383,9 @@ backend_gpu_count() {
   local model_gpu_count="$2"
   case "${backend}" in
     asym|asym_torch) printf '1\n' ;;
-    torch|zero2|zero3|zero3_offload|superoffload) printf '%s\n' "${model_gpu_count}" ;;
+    torch|zero2|zero3|zero3_offload|zero3_offload_mem|superoffload) printf '%s\n' "${model_gpu_count}" ;;
     kt_torchbf16|kt_armbf16) printf '1\n' ;;
-    *) die "internal backend label must be torch, asym, asym_torch, zero2, zero3, zero3_offload, superoffload, kt_torchbf16, or kt_armbf16, got '${backend}'" ;;
+    *) die "internal backend label must be torch, asym, asym_torch, zero2, zero3, zero3_offload, zero3_offload_mem, superoffload, kt_torchbf16, or kt_armbf16, got '${backend}'" ;;
   esac
 }
 
@@ -387,6 +394,7 @@ zero_deepspeed_config() {
     zero2) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z2_config.json" ;;
     zero3) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_config.json" ;;
     zero3_offload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json" ;;
+    zero3_offload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_config.json" ;;
     superoffload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_config.json" ;;
     *) return 1 ;;
   esac
@@ -394,14 +402,14 @@ zero_deepspeed_config() {
 
 is_zero_backend() {
   case "${1}" in
-    zero2|zero3|zero3_offload|superoffload) return 0 ;;
+    zero2|zero3|zero3_offload|zero3_offload_mem|superoffload) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 is_policy_independent_backend() {
   case "${1}" in
-    torch|zero2|zero3|zero3_offload|superoffload|kt_*) return 0 ;;
+    torch|zero2|zero3|zero3_offload|zero3_offload_mem|superoffload|kt_*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -438,10 +446,11 @@ backend_label() {
     zero2) printf 'zero2\n' ;;
     zero3) printf 'zero3\n' ;;
     zero3_offload) printf 'zero3_offload\n' ;;
+    zero3_offload_mem) printf 'zero3_offload_mem\n' ;;
     superoffload) printf 'superoffload\n' ;;
     kt_torchbf16) printf 'kt_torchbf16\n' ;;
     kt_armbf16) printf 'kt_armbf16\n' ;;
-    *) die "backend must be torch, asym, asym_torch, zero2, zero3, zero3_offload, superoffload, kt_torchbf16, or kt_armbf16, got '${1}'" ;;
+    *) die "backend must be torch, asym, asym_torch, zero2, zero3, zero3_offload, zero3_offload_mem, superoffload, kt_torchbf16, or kt_armbf16, got '${1}'" ;;
   esac
 }
 
@@ -470,10 +479,11 @@ append_backend_spec() {
     zero2) backend=zero2 ;;
     zero3) backend=zero3 ;;
     zero3_offload) backend=zero3_offload ;;
+    zero3_offload_mem) backend=zero3_offload_mem ;;
     superoffload) backend=superoffload ;;
     kt_torchbf16) backend=kt_torchbf16 ;;
     kt_armbf16) backend=kt_armbf16 ;;
-    *) die "backend must be torch, asym, asym_torch, zero2, zero3, zero3_offload, superoffload, kt_torchbf16, or kt_armbf16, got '${backend_part}'" ;;
+    *) die "backend must be torch, asym, asym_torch, zero2, zero3, zero3_offload, zero3_offload_mem, superoffload, kt_torchbf16, or kt_armbf16, got '${backend_part}'" ;;
   esac
 
   mapfile -t recompute_tokens < <(tokens "${recompute_part}")
@@ -1007,7 +1017,7 @@ selected_has_non_asym=false
 for backend in "${backends[@]}"; do
   case "${backend}" in
     asym|asym_torch) selected_has_asym=true ;;
-    zero2|zero3|zero3_offload) selected_has_zero=true ;;
+    zero2|zero3|zero3_offload|zero3_offload_mem) selected_has_zero=true ;;
     superoffload) selected_has_zero=true; selected_has_superoffload=true ;;
     kt_*) selected_has_kt=true ;;
   esac

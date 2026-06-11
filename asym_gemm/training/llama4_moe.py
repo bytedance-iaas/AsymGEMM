@@ -7,7 +7,8 @@ from typing import Literal
 import torch
 from torch import nn
 
-from .frozen_linear import AsymExecutionStats
+from .frozen_linear import AsymExecutionStats, AsymFrozenLinear
+from .offload import adopt_host_weight
 from .packed_moe import AsymPackedExperts, PackedExpertSource, PackedMoELayout, wrap_packed_experts
 from .profile_ranges import prof_range, scoped_name
 
@@ -57,6 +58,61 @@ def is_llama4_moe(module: nn.Module) -> bool:
     )
 
 
+class AsymLlama4Router(nn.Module):
+    """Llama 4 router with a CPU-resident frozen projection."""
+
+    def __init__(
+        self,
+        source: nn.Module,
+        *,
+        backend: Literal["asym", "torch"],
+        precision: Literal["bf16"],
+        stats: AsymExecutionStats | None = None,
+        strict: bool = True,
+    ) -> None:
+        super().__init__()
+        weight = getattr(source, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
+            raise TypeError(f"AsymLlama4Router requires a 2D router weight, got {type(source).__name__}")
+        if strict and weight.device.type != "cpu":
+            raise RuntimeError("Llama 4 router CPU offload requires CPU-first model loading")
+        if strict and weight.dtype != torch.bfloat16:
+            raise RuntimeError(f"Llama 4 router CPU offload requires bf16 source weight, got {weight.dtype}")
+        host_weight = adopt_host_weight(
+            "router.weight",
+            weight,
+            "router",
+            require_2d=True,
+            pin_memory_policy="auto",
+            strict=strict,
+        )
+        bias = getattr(source, "bias", None)
+        self.proj = AsymFrozenLinear.from_host_weight(
+            host_weight,
+            bias=None if bias is None else bias.detach(),
+            backend=backend,
+            stats=stats,
+            precision=precision,
+        )
+        self.num_experts = int(getattr(source, "num_experts", self.proj.out_features))
+        self.top_k = int(getattr(source, "top_k"))
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.proj.weight
+
+    @property
+    def bias(self) -> torch.Tensor | None:
+        return self.proj.bias
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        router_logits = self.proj(hidden_states)
+        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=1)
+        router_scores = torch.full_like(router_logits, float("-inf")).scatter_(1, router_indices, router_top_value)
+        router_scores = torch.sigmoid(router_scores.float()).to(router_scores.dtype)
+        return router_scores, router_logits
+
+
 class AsymLlama4Moe(nn.Module):
     """Llama 4 MoE wrapper using the shared packed expert LoRA path."""
 
@@ -73,6 +129,7 @@ class AsymLlama4Moe(nn.Module):
         lora_dtype: torch.dtype | str | None = torch.bfloat16,
         expert_recompute_policy: str = "none",
         router_mode: Literal["hf", "whole"] = "whole",
+        offload_router: bool = False,
         router_debug_grad: bool = False,
         stats: AsymExecutionStats | None = None,
         strict: bool = True,
@@ -90,11 +147,24 @@ class AsymLlama4Moe(nn.Module):
         source_experts = getattr(source, "experts")
         gate_up = getattr(source_experts, "gate_up_proj").detach()
         down = getattr(source_experts, "down_proj").detach()
+        if backend == "asym" and offload and strict:
+            if gate_up.device.type != "cpu" or down.device.type != "cpu":
+                raise RuntimeError("Llama 4 expert CPU offload requires CPU-first model loading")
+            if gate_up.dtype != torch.bfloat16 or down.dtype != torch.bfloat16:
+                raise RuntimeError(
+                    "Llama 4 expert CPU offload requires bf16 source weights: "
+                    f"gate_up={gate_up.dtype}, down={down.dtype}"
+                )
         self.config = getattr(source, "config", None)
         self.top_k = int(getattr(source, "top_k"))
         self.hidden_dim = int(getattr(source, "hidden_dim"))
         self.num_experts = int(getattr(source, "num_experts"))
-        self.router = getattr(source, "router")
+        source_router = getattr(source, "router")
+        self.router = (
+            AsymLlama4Router(source_router, backend=backend, precision=precision, stats=stats, strict=strict)
+            if backend == "asym" and offload_router
+            else source_router
+        )
         self.shared_expert = getattr(source, "shared_expert")
         self.backend = backend
         self.precision = precision
@@ -138,14 +208,19 @@ class AsymLlama4Moe(nn.Module):
             expert_recompute_policy=expert_recompute_policy,
             stats=stats,
         )
+        if backend == "asym" and offload and strict and torch.cuda.is_available():
+            if not self.experts.gate_up_base.host_weight.weight.is_pinned() or not self.experts.down_base.host_weight.weight.is_pinned():
+                raise RuntimeError("Llama 4 expert CPU offload requires pinned CPU HostWeights for AsymGEMM")
 
     @property
     def cpu_resident_base_bytes(self) -> int:
-        return int(self.experts.cpu_resident_base_bytes)
+        router_bytes = int(getattr(getattr(self.router, "proj", None), "cpu_resident_base_weight_bytes", 0))
+        return int(self.experts.cpu_resident_base_bytes) + router_bytes
 
     @property
     def gpu_resident_base_bytes(self) -> int:
-        return int(self.experts.gpu_resident_base_bytes)
+        router_bytes = int(getattr(getattr(self.router, "proj", None), "gpu_resident_base_weight_bytes", 0))
+        return int(self.experts.gpu_resident_base_bytes) + router_bytes
 
     @property
     def trainable_lora_params(self) -> int:
@@ -204,6 +279,7 @@ def wrap_llama4_moe(
     lora_dtype: torch.dtype | str | None = torch.bfloat16,
     expert_recompute_policy: str = "none",
     router_mode: Literal["hf", "whole"] = "whole",
+    offload_router: bool = False,
     router_debug_grad: bool = False,
     stats: AsymExecutionStats | None = None,
     strict: bool = True,
@@ -219,10 +295,11 @@ def wrap_llama4_moe(
         lora_dtype=lora_dtype,
         expert_recompute_policy=expert_recompute_policy,
         router_mode=router_mode,
+        offload_router=offload_router,
         router_debug_grad=router_debug_grad,
         stats=stats,
         strict=strict,
     )
 
 
-__all__ = ["AsymLlama4Moe", "Llama4MoeReport", "is_llama4_moe", "wrap_llama4_moe"]
+__all__ = ["AsymLlama4Moe", "AsymLlama4Router", "Llama4MoeReport", "is_llama4_moe", "wrap_llama4_moe"]

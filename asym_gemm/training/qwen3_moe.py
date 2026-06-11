@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from .frozen_linear import (
     AsymExecutionStats,
+    AsymFrozenLinear,
     AsymGroupedFrozenLinear,
     TorchGroupedFrozenLinear,
     _dispatch_grouped_nt,
@@ -27,6 +28,7 @@ from .lora import (
     normalize_lora_dtype,
     prepare_grouped_lora_metadata,
 )
+from .offload import adopt_host_weight
 from .moe import (
     ExpertRecomputeConfig,
     build_contiguous_route_metadata,
@@ -86,6 +88,8 @@ def is_qwen3_experts(module: nn.Module) -> bool:
 
 def is_qwen3_moe_block(module: nn.Module) -> bool:
     if getattr(module, "_is_asym_qwen3_moe_block", False):
+        return False
+    if hasattr(module, "shared_expert") or hasattr(module, "shared_expert_gate"):
         return False
     gate = getattr(module, "gate", None)
     experts = getattr(module, "experts", None)
@@ -1418,18 +1422,32 @@ class AsymQwen3Experts(nn.Module):
 
         base_dtype = torch.bfloat16
         if backend == "asym" and self.offload:
+            if strict and (gate_up.device.type != "cpu" or down.device.type != "cpu"):
+                raise RuntimeError("Qwen3 expert CPU offload requires CPU-first model loading")
+            if strict and (gate_up.dtype != base_dtype or down.dtype != base_dtype):
+                raise RuntimeError(
+                    "Qwen3 expert CPU offload requires bf16 source weights: "
+                    f"gate_up={gate_up.dtype}, down={down.dtype}"
+                )
             self.gate_up_base = AsymGroupedFrozenLinear(
                 gate_up.to(dtype=base_dtype),
                 backend="asym",
+                pin_memory=torch.cuda.is_available(),
+                clone=False,
                 precision=precision,
                 stats=self.stats,
             )
             self.down_base = AsymGroupedFrozenLinear(
                 down.to(dtype=base_dtype),
                 backend="asym",
+                pin_memory=torch.cuda.is_available(),
+                clone=False,
                 precision=precision,
                 stats=self.stats,
             )
+            if strict and torch.cuda.is_available():
+                if not self.gate_up_base.host_weight.weight.is_pinned() or not self.down_base.host_weight.weight.is_pinned():
+                    raise RuntimeError("Qwen3 expert CPU offload requires pinned CPU HostWeights for AsymGEMM")
         else:
             device = _resolve_device(gate_up)
             self.gate_up_base = TorchGroupedFrozenLinear(gate_up, device=device, dtype=base_dtype)
@@ -1838,6 +1856,65 @@ class AsymQwen3Experts(nn.Module):
             return _scatter_contiguous_sum(down, metadata).to(dtype=input_dtype)
 
 
+class AsymQwen3Router(nn.Module):
+    """Qwen3/Qwen3.5 top-k router with a CPU-resident frozen projection."""
+
+    def __init__(
+        self,
+        source: nn.Module,
+        *,
+        backend: Literal["asym", "torch"],
+        precision: Literal["bf16"],
+        stats: AsymExecutionStats | None = None,
+        strict: bool = True,
+    ) -> None:
+        super().__init__()
+        weight = getattr(source, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
+            raise TypeError(f"AsymQwen3Router requires a 2D router weight, got {type(source).__name__}")
+        if strict and weight.device.type != "cpu":
+            raise RuntimeError("Qwen3 router CPU offload requires CPU-first model loading")
+        if strict and weight.dtype != torch.bfloat16:
+            raise RuntimeError(f"Qwen3 router CPU offload requires bf16 source weight, got {weight.dtype}")
+        host_weight = adopt_host_weight(
+            "router.weight",
+            weight,
+            "router",
+            require_2d=True,
+            pin_memory_policy="auto",
+            strict=strict,
+        )
+        bias = getattr(source, "bias", None)
+        self.proj = AsymFrozenLinear.from_host_weight(
+            host_weight,
+            bias=None if bias is None else bias.detach(),
+            backend=backend,
+            stats=stats,
+            precision=precision,
+        )
+        self.hidden_dim = int(getattr(source, "hidden_dim", self.proj.in_features))
+        self.num_experts = int(getattr(source, "num_experts", self.proj.out_features))
+        self.top_k = int(getattr(source, "top_k"))
+        self.norm_topk_prob = bool(getattr(source, "norm_topk_prob", True))
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.proj.weight
+
+    @property
+    def bias(self) -> torch.Tensor | None:
+        return self.proj.bias
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        router_logits = self.proj(hidden_states)
+        router_probs = torch.softmax(router_logits, dtype=torch.float, dim=-1)
+        router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)
+        if self.norm_topk_prob:
+            router_top_value = router_top_value / router_top_value.sum(dim=-1, keepdim=True)
+        router_top_value = router_top_value.to(router_logits.dtype)
+        return router_logits, router_top_value, router_indices
+
+
 class AsymQwen3MoeBlock(nn.Module):
     """Qwen3 MoE block wrapper that owns frozen router execution."""
 
@@ -1856,6 +1933,7 @@ class AsymQwen3MoeBlock(nn.Module):
         lora_dtype: torch.dtype | str | None = torch.bfloat16,
         expert_recompute_policy: str = "none",
         router_mode: Literal["whole"] = "whole",
+        offload_router: bool = False,
         router_debug_grad: bool = False,
         stats: AsymExecutionStats | None = None,
         strict: bool = True,
@@ -1879,7 +1957,12 @@ class AsymQwen3MoeBlock(nn.Module):
         self.profile_prefix = "layers.unknown.mlp"
 
         # Preserve the installed Qwen3 module order: gate first, experts second.
-        self.gate = getattr(source, "gate")
+        source_gate = getattr(source, "gate")
+        self.gate = (
+            AsymQwen3Router(source_gate, backend=backend, precision=precision, stats=stats, strict=strict)
+            if backend == "asym" and offload_router
+            else source_gate
+        )
         self.experts = wrap_qwen3_experts(
             getattr(source, "experts"),
             backend=backend,
@@ -1901,11 +1984,13 @@ class AsymQwen3MoeBlock(nn.Module):
 
     @property
     def cpu_resident_base_bytes(self) -> int:
-        return int(self.experts.cpu_resident_base_bytes)
+        gate_bytes = int(getattr(getattr(self.gate, "proj", None), "cpu_resident_base_weight_bytes", 0))
+        return int(self.experts.cpu_resident_base_bytes) + gate_bytes
 
     @property
     def gpu_resident_base_bytes(self) -> int:
-        return int(self.experts.gpu_resident_base_bytes)
+        gate_bytes = int(getattr(getattr(self.gate, "proj", None), "gpu_resident_base_weight_bytes", 0))
+        return int(self.experts.gpu_resident_base_bytes) + gate_bytes
 
     @property
     def trainable_lora_params(self) -> int:
@@ -1990,6 +2075,7 @@ def wrap_qwen3_moe_block(
     lora_dtype: torch.dtype | str | None = torch.bfloat16,
     expert_recompute_policy: str = "none",
     router_mode: Literal["whole"] = "whole",
+    offload_router: bool = False,
     router_debug_grad: bool = False,
     stats: AsymExecutionStats | None = None,
     strict: bool = True,
@@ -2005,6 +2091,7 @@ def wrap_qwen3_moe_block(
         lora_dtype=lora_dtype,
         expert_recompute_policy=expert_recompute_policy,
         router_mode=router_mode,
+        offload_router=offload_router,
         router_debug_grad=router_debug_grad,
         stats=stats,
         strict=strict,
@@ -2014,6 +2101,7 @@ def wrap_qwen3_moe_block(
 __all__ = [
     "AsymQwen3Experts",
     "AsymQwen3MoeBlock",
+    "AsymQwen3Router",
     "Qwen3ExpertReport",
     "is_qwen3_experts",
     "is_qwen3_moe_block",

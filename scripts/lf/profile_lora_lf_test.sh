@@ -13,6 +13,13 @@ KT_KERNEL_DIR=${KT_KERNEL_DIR:-${SFT_ROOT}/third_party/ktransformers/kt-kernel}
 DEEPSPEED_DIR=${DEEPSPEED_DIR:-${SFT_ROOT}/third_party/deepspeed}
 CONDA_EXE=${CONDA_EXE:-conda}
 NSYS_BIN=${NSYS_BIN:-nsys}
+
+if [[ "${PROFILE_LORA_LF_TEST_ALLOW_UNMAINTAINED:-0}" != "1" ]]; then
+  echo "profile_lora_lf_test.sh is an unmaintained diagnostic helper and can bypass KT ARM source-first/stale-artifact guards." >&2
+  echo "Use scripts/lf/profile_lora_lf.sh, or set PROFILE_LORA_LF_TEST_ALLOW_UNMAINTAINED=1 only for isolated debugging." >&2
+  exit 2
+fi
+
 # DIST_LAUNCHER=${DIST_LAUNCHER:-accelerate}
 DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun}
 # DIST_LAUNCHER=${DIST_LAUNCHER:-deepspeed}
@@ -23,22 +30,20 @@ GPU_POOL=${GPU_POOL:-0}
 # MODEL_SPECS entries are model|num_gpus. Recompute belongs only in BACKEND_SPECS.
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
-MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
-# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1,Qwen/Qwen3.5-122B-A10B|1"}
+# MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
+MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1,Qwen/Qwen3.5-122B-A10B|1"}
 ROUTER_MODES=${ROUTER_MODES:-whole}
 # PROFILERS=${PROFILERS:-nsys,source}
-PROFILERS=${PROFILERS:-nsys}
+PROFILERS=${PROFILERS:-nsys,source}
 PRECISION=${PRECISION:-bf16}
 # LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
-LORA_DROPOUT=${LORA_DROPOUT:-0.08}
+LORA_DROPOUT=${LORA_DROPOUT:-0.10}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero2|norecomp,zero2|recomp,zero3_offload|norecomp,zero3_offload_mem|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"kt_armbf16|recomp"}
+BACKEND_SPECS=${BACKEND_SPECS:-"kt_armbf16|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
-BACKEND_SPECS=${BACKEND_SPECS:-"asym|recomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload_mem|recomp"}
-
+# BACKEND_SPECS=${BACKEND_SPECS:-"asym|recomp"}
 # EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le0,tok-le512,tok-le512-act"}
 # EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le1"}
 # EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le1,tok-ge1"}
@@ -46,8 +51,8 @@ EXPERT_POLICIES=${EXPERT_POLICIES-"none"}
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
 
 # Training
-SEQ_LENS=${SEQ_LENS:-8192}
-# SEQ_LENS=${SEQ_LENS:-7168}
+# SEQ_LENS=${SEQ_LENS:-8192}
+SEQ_LENS=${SEQ_LENS:-7168}
 PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-4}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 MAX_STEPS=${MAX_STEPS:-10}
@@ -67,8 +72,7 @@ TEMPLATE=${TEMPLATE:-auto}
 MAX_SAMPLES=${MAX_SAMPLES:-128}
 
 # Backend checks and AsymGEMM options
-# ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
-ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-all}
+ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
 ASYM_STRICT=${ASYM_STRICT:-true}
 REQUIRE_SM100=${REQUIRE_SM100:-1}
 
@@ -97,10 +101,6 @@ KT_TORCHBF16_SFT_DEVICE=${KT_TORCHBF16_SFT_DEVICE:-cuda}
 KT_ARM_OMP_NUM_THREADS=${KT_ARM_OMP_NUM_THREADS:-64}
 KT_ARM_OMP_PROC_BIND=${KT_ARM_OMP_PROC_BIND:-close}
 KT_ARM_OMP_PLACES=${KT_ARM_OMP_PLACES:-cores}
-KT_ARM_SFT_TOP_K=${KT_ARM_SFT_TOP_K:-8}
-KT_ARM_SFT_MAX_ROUTE_RANK_WORK=${KT_ARM_SFT_MAX_ROUTE_RANK_WORK:-}
-KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK=${KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK:-1048576}
-KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK=${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK:-0}
 KT_SHARE_BACKWARD_BB=${KT_SHARE_BACKWARD_BB:-}
 KT_NUM_GPU_EXPERTS=${KT_NUM_GPU_EXPERTS:-}
 KT_WEIGHT_PATH=${KT_WEIGHT_PATH:-}
@@ -108,8 +108,6 @@ KT_EXPERT_CHECKPOINT_PATH=${KT_EXPERT_CHECKPOINT_PATH:-}
 KT_USE_LORA_EXPERTS=${KT_USE_LORA_EXPERTS:-}
 KT_LORA_EXPERT_NUM=${KT_LORA_EXPERT_NUM:-}
 KT_LORA_EXPERT_INTERMEDIATE_SIZE=${KT_LORA_EXPERT_INTERMEDIATE_SIZE:-}
-KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK=${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK:-0}
-KT_ARM_FIRST_STEP_TIMEOUT_SECONDS=${KT_ARM_FIRST_STEP_TIMEOUT_SECONDS:-0}
 CHECK_KT_CALLS=${CHECK_KT_CALLS:-1}
 
 # SuperOffload backend
@@ -596,117 +594,6 @@ existing_memory_breakdown_valid() {
     --memory-breakdown-summary "${summary_json}" >/dev/null 2>&1
 }
 
-existing_profile_complete() {
-  local profile_json="$1"
-  local expected_backend="${2:-}"
-  local expected_seq_len="${3:-}"
-  local expected_model_name="${4:-}"
-  local expected_lora_target="${5:-}"
-  [[ -f "${profile_json}" ]] || return 1
-  "${ENV_PYTHON}" - "${profile_json}" "${expected_backend}" "${expected_seq_len}" "${expected_model_name}" "${expected_lora_target}" <<'PY' >/dev/null 2>&1
-import json
-import sys
-
-profile = json.load(open(sys.argv[1], encoding="utf-8"))
-expected_backend = sys.argv[2]
-expected_seq_len = sys.argv[3]
-expected_model_name = sys.argv[4]
-expected_lora_target = sys.argv[5]
-if profile.get("partial") is True:
-    raise SystemExit("partial profile")
-heartbeat = profile.get("heartbeat", {})
-latest = heartbeat.get("latest", {}) if isinstance(heartbeat, dict) else {}
-stage = latest.get("stage") if isinstance(latest, dict) else None
-if stage is not None and stage not in {"source_profile_written", "trainer_end", "kt_lora_pointer_refresh_end"}:
-    raise SystemExit(f"incomplete heartbeat stage: {stage}")
-source_profile = profile.get("source_profile", {})
-source_profile = source_profile if isinstance(source_profile, dict) else profile
-config = source_profile.get("config", {})
-backend = str(config.get("backend") or "")
-if expected_backend and backend != expected_backend:
-    raise SystemExit(f"profile backend mismatch: expected {expected_backend}, got {backend or '<missing>'}")
-if expected_seq_len:
-    try:
-        actual_seq_len = int(config.get("seq_len"))
-        wanted_seq_len = int(expected_seq_len)
-    except (TypeError, ValueError):
-        raise SystemExit("profile seq_len missing or invalid")
-    if actual_seq_len != wanted_seq_len:
-        raise SystemExit(f"profile seq_len mismatch: expected {wanted_seq_len}, got {actual_seq_len}")
-if expected_model_name:
-    model_name = str(config.get("model_name_or_path") or "")
-    if model_name != expected_model_name:
-        raise SystemExit(f"profile model mismatch: expected {expected_model_name}, got {model_name or '<missing>'}")
-if expected_lora_target:
-    lora_target = str(config.get("lora_target") or "")
-    if lora_target != expected_lora_target:
-        raise SystemExit(f"profile lora_target mismatch: expected {expected_lora_target}, got {lora_target or '<missing>'}")
-if backend.startswith("kt_"):
-    kt = source_profile.get("kt", {})
-    if not isinstance(kt, dict):
-        raise SystemExit("KT profile missing kt counters")
-    def int_value(container, key):
-        try:
-            return int(container.get(key, 0) or 0)
-        except (TypeError, ValueError):
-            return 0
-    if int_value(kt, "wrapper_count") <= 0:
-        raise SystemExit("KT profile has no KT wrappers")
-    if int_value(kt, "total_forward_calls") <= 0:
-        raise SystemExit("KT profile has no KT forward calls")
-    if int_value(kt, "total_backward_calls") <= 0:
-        raise SystemExit("KT profile has no KT backward calls")
-    preflight = source_profile.get("optimizer_memory_preflight", {})
-    if not isinstance(preflight, dict) or preflight.get("available") is not True:
-        raise SystemExit("KT profile missing optimizer_memory_preflight")
-    lora = source_profile.get("lora", {})
-    fused_lora_params = 0
-    if isinstance(lora, dict):
-        try:
-            fused_lora_params = int(lora.get("kt_fused_expert_lora_parameters", 0) or 0)
-        except (TypeError, ValueError):
-            fused_lora_params = 0
-    model_name = str(config.get("model_name_or_path") or "")
-    lora_target = str(config.get("lora_target") or "")
-    if "qwen3" in model_name.lower() and lora_target in {"all", "all-linear", "all_linear"} and fused_lora_params <= 0:
-        raise SystemExit("Qwen3 KT lora_target=all profile has no fused expert LoRA params")
-    if fused_lora_params > 0:
-        optimizer_memory = source_profile.get("optimizer_memory", {})
-        health = optimizer_memory.get("kt_lora_update_health", {}) if isinstance(optimizer_memory, dict) else {}
-        if not isinstance(health, dict) or health.get("available") is not True or health.get("passed") is not True:
-            raise SystemExit("KT fused LoRA update health missing or failed")
-    surface = source_profile.get("trainable_surface", {})
-    if not isinstance(surface, dict) or not surface.get("surface"):
-        raise SystemExit("KT profile missing trainable_surface")
-PY
-}
-
-kt_arm_route_rank_limit() {
-  if [[ -n "${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}" ]]; then
-    positive_int "KT_ARM_SFT_MAX_ROUTE_RANK_WORK" "${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}"
-    printf '%s\n' "${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}"
-    return
-  fi
-  if [[ "$(bool_value "${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK}")" == "true" ]]; then
-    printf '\n'
-    return
-  fi
-  positive_int "KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK" "${KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK}"
-  printf '%s\n' "${KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK}"
-}
-
-check_kt_arm_route_rank_for_sweep() {
-  local seq_len="$1"
-  local logical_qlen route_rank_work limit
-  positive_int "KT_ARM_SFT_TOP_K" "${KT_ARM_SFT_TOP_K}"
-  logical_qlen=$((PER_DEVICE_TRAIN_BATCH_SIZE * seq_len))
-  route_rank_work=$((logical_qlen * KT_ARM_SFT_TOP_K * LORA_RANK))
-  limit="$(kt_arm_route_rank_limit)"
-  if [[ -n "${limit}" && "${route_rank_work}" -gt "${limit}" ]]; then
-    die "BACKEND=kt_armbf16 route-rank work ${route_rank_work} exceeds KT_ARM_SFT_MAX_ROUTE_RANK_WORK=${limit}; reduce batch/seq/rank, raise the explicit limit, or set KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK=1 only for validation"
-  fi
-}
-
 config_root_path() {
   local seq_len="$1"
   local config_label step_label dropout_label
@@ -732,21 +619,6 @@ job_root_path() {
   local expert_policy="$5"
   local router_mode="$6"
   printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}")"
-}
-
-kt_arm_matching_source_profile_complete() {
-  local config_root="$1"
-  local backend="$2"
-  local recompute="$3"
-  local expert_policy="$4"
-  local router_mode="$5"
-  local seq_len="$6"
-  local model_name="$7"
-  local source_job_root source_seq_root source_profile_json
-  source_job_root="$(job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}")"
-  source_seq_root="${source_job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
-  source_profile_json="${source_seq_root}/profile.json"
-  existing_profile_complete "${source_profile_json}" "${backend}" "${seq_len}" "${model_name}" "all"
 }
 
 plot_workload_from_config_root() {
@@ -1482,14 +1354,10 @@ run_job() {
   log_file="${seq_root}/train.log"
   run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_router${router_mode}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
-  local profile_memory_attribution profile_memory_breakdown deepspeed_dir_for_profile
+  local profile_memory_attribution profile_memory_breakdown
   local master_port
   profile_memory_attribution="$(profile_memory_flag_for_profiler "--profile-memory-attribution" "${PROFILE_MEMORY_ATTRIBUTION}" "${profiler}")"
   profile_memory_breakdown="$(profile_memory_flag_for_profiler "--profile-memory-breakdown" "${PROFILE_MEMORY_BREAKDOWN}" "${profiler}")"
-  deepspeed_dir_for_profile=""
-  if [[ "${backend}" == zero* || "${backend}" == "superoffload" ]]; then
-    deepspeed_dir_for_profile="${DEEPSPEED_DIR}"
-  fi
   master_port="${MASTER_PORT:-}"
   if [[ -z "${master_port}" ]]; then
     master_port="$(find_free_port)"
@@ -1502,25 +1370,18 @@ run_job() {
   if [[ "${profiler}" == "nsys" ]]; then
     interconnect_plot_roots["${config_root}"]="${seq_len}"
   fi
-  if [[ "${backend}" == "kt_armbf16" ]]; then
-    check_kt_arm_route_rank_for_sweep "${seq_len}"
-  fi
   if [[ "${DRY_RUN}" != "true" && -e "${profile_json}" && "${OVERWRITE}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
-    if existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" && { [[ "${profile_memory_breakdown}" != "true" ]] || existing_memory_breakdown_valid "${seq_root}"; }; then
+    if [[ "${profile_memory_breakdown}" != "true" ]] || existing_memory_breakdown_valid "${seq_root}"; then
       echo "Skipping existing: ${profile_json}"
       append_job_record "${config_root}" skipped \
         "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
       return 0
     fi
-    echo "Existing profile is incomplete, partial, or has missing/stale schema-v2 source-memory breakdown; rerunning: ${profile_json}" >&2
+    echo "Existing profile has missing or stale schema-v2 source-memory breakdown; rerunning: ${profile_json}" >&2
   fi
 
   if [[ "${DRY_RUN}" != "true" && "${COLLECT_EXISTING}" == "true" ]]; then
     if [[ -e "${profile_json}" ]]; then
-      if ! existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all"; then
-        echo "Existing profile is incomplete or partial: ${profile_json}" >&2
-        return 1
-      fi
       if [[ "${profile_memory_breakdown}" == "true" ]] && ! existing_memory_breakdown_valid "${seq_root}"; then
         echo "Existing profile lacks a valid schema-v2 source-memory breakdown: ${profile_json}" >&2
         return 1
@@ -1599,7 +1460,7 @@ run_job() {
     ASYM_GEMM_LF_CONFIG_WARMUP_STEPS="${WARMUP_STEPS}"
     ASYM_GEMM_LF_CONFIG_MEASURE_STEPS="${MAX_STEPS}"
     ASYM_GEMM_LF_CONFIG_TOTAL_STEPS="${TOTAL_STEPS}"
-    ASYM_GEMM_LF_CONFIG_DEEPSPEED_DIR="${deepspeed_dir_for_profile}"
+    ASYM_GEMM_LF_CONFIG_DEEPSPEED_DIR="${DEEPSPEED_DIR}"
     OUT_DIR="${lf_out}"
     LOG_FILE="${log_file}"
     RUN_ID="${run_id}"
@@ -1630,12 +1491,6 @@ run_job() {
       KT_ARM_OMP_NUM_THREADS="${KT_ARM_OMP_NUM_THREADS}"
       KT_ARM_OMP_PROC_BIND="${KT_ARM_OMP_PROC_BIND}"
       KT_ARM_OMP_PLACES="${KT_ARM_OMP_PLACES}"
-      KT_ARM_SFT_TOP_K="${KT_ARM_SFT_TOP_K}"
-      KT_ARM_SFT_MAX_ROUTE_RANK_WORK="${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}"
-      KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK="${KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK}"
-      KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK="${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK}"
-      KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK="${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}"
-      KT_ARM_FIRST_STEP_TIMEOUT_SECONDS="${KT_ARM_FIRST_STEP_TIMEOUT_SECONDS}"
       CHECK_KT_CALLS="${CHECK_KT_CALLS}"
     )
   fi
@@ -1675,9 +1530,6 @@ run_job() {
   if ((status == 0)); then
     if [[ ! -f "${profile_json}" ]]; then
       echo "Missing expected profile artifact: ${profile_json}" >&2
-      status=1
-    elif ! existing_profile_complete "${profile_json}"; then
-      echo "Expected completed profile artifact but found incomplete/partial profile: ${profile_json}" >&2
       status=1
     fi
   fi
@@ -2094,10 +1946,6 @@ for model_spec_entry in "${model_specs[@]}"; do
             backend="${backend_recompute%%|*}"
             recompute="${backend_recompute##*|}"
             for profiler in "${profilers[@]}"; do
-              if [[ "${backend}" == "kt_armbf16" && "${profiler}" == "nsys" && "${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}" != "1" ]]; then
-                echo "Skipping backend=kt_armbf16 profiler=nsys; run profiler=source first and set KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK=1 only after one source step completes."
-                continue
-              fi
               job_router_mode="${router_mode}"
               if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" ]]; then
                 if [[ "${router_hf_selected}" != "true" ]]; then
@@ -2110,12 +1958,6 @@ for model_spec_entry in "${model_specs[@]}"; do
               if is_policy_independent_backend "${backend}" && [[ "${expert_policy}" != "none" ]]; then
                 echo "Skipping backend=${backend} expert_policy=${expert_policy}; torch/zero/SuperOffload/KT backends are policy-independent."
                 continue
-              fi
-              if [[ "${backend}" == "kt_armbf16" && "${profiler}" == "nsys" ]]; then
-                if ! kt_arm_matching_source_profile_complete "${config_root}" "${backend}" "${recompute}" "${expert_policy}" "${job_router_mode}" "${seq_len}" "${current_model_name}"; then
-                  echo "Skipping backend=kt_armbf16 profiler=nsys; matching source profile is missing, incomplete, or stale for seq=${seq_len} recompute=${recompute} expert_policy=${expert_policy} router_mode=${job_router_mode}."
-                  continue
-                fi
               fi
               gpu_count="$(backend_gpu_count "${backend}" "${current_model_gpu_count}")"
               gpu="$(gpu_slice "${gpu_count}")"
