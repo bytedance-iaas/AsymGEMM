@@ -931,6 +931,8 @@ def apply_lf_asym_lora(
             if not is_lora_target and not selected_cpu_offload:
                 continue
             if not isinstance(module, nn.Linear):
+                if selected_cpu_offload and not is_lora_target and _is_stateless_module(module):
+                    continue
                 report.skipped.append(f"{name}:not_nn_linear:{type(module).__name__}")
                 continue
             dense_replacements.append(

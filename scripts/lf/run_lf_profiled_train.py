@@ -39,6 +39,7 @@ KT_LORA_HEALTH_MAX_ELEMENTS_ENV = "ASYM_GEMM_LF_KT_LORA_HEALTH_MAX_ELEMENTS"
 _LAST_LF_MODEL: Any | None = None
 _DEEPSPEED_RUNTIME_MARKER: dict[str, Any] = {}
 _OPTIMIZER_MEMORY_MARKER: dict[str, Any] = {}
+_GRAD_CLIP_MARKER: dict[str, Any] = {}
 _MODEL_CAPTURE_HEARTBEAT: Any | None = None
 _MODEL_CAPTURE_PARTIAL_WRITER: Any | None = None
 KT_REQUIRE_STARTUP_ENV = "ASYM_GEMM_LF_REQUIRE_KT_STARTUP"
@@ -176,6 +177,8 @@ class PartialProfileWriter:
         report["partial_reason"] = reason
         report["partial_timestamp"] = _utc_timestamp()
         report["heartbeat_latest"] = self.heartbeat.latest
+        if _GRAD_CLIP_MARKER:
+            report["grad_clip"] = _GRAD_CLIP_MARKER
         if extra:
             report["partial_extra"] = extra
         _atomic_write_json(self.path, report)
@@ -341,6 +344,9 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "lora_rank": lora_rank,
         "lora_alpha": lora_alpha,
         "lora_dropout": _safe_float(_option_value(args, "--lora_dropout")),
+        "max_grad_norm": _safe_float(env_config.get("max_grad_norm"))
+        if _safe_float(env_config.get("max_grad_norm")) is not None
+        else _safe_float(_option_value(args, "--max_grad_norm")),
         "activation_recompute": os.environ.get("ASYM_GEMM_LF_CONFIG_ACTIVATION_RECOMPUTE", "false").lower()
         in {"1", "true", "yes", "on"},
         "expert_recompute_policy_spec": expert_policy.label,
@@ -368,6 +374,7 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "omp_places": os.environ.get("OMP_PLACES", ""),
         "kt_lora_health_max_tensors": os.environ.get(KT_LORA_HEALTH_MAX_TENSORS_ENV, "12"),
         "kt_lora_health_max_elements": os.environ.get(KT_LORA_HEALTH_MAX_ELEMENTS_ENV, "4096"),
+        "kt_grad_clip_chunk_elements": os.environ.get("ASYM_GEMM_LF_KT_GRAD_CLIP_CHUNK_ELEMENTS", ""),
         "nsys_capture_range": _env_enabled("ASYM_GEMM_LF_NSYS_CAPTURE_RANGE"),
         "superoffload_config": os.environ.get("ASYM_GEMM_LF_CONFIG_SUPEROFFLOAD_CONFIG")
         if is_superoffload_backend
@@ -457,6 +464,12 @@ def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] 
         ),
         "logical_qlen": _safe_int((config or {}).get("logical_qlen")),
         "lora_rank": _safe_int((config or {}).get("lora_rank")),
+        "kt_arm_sft_top_k": _safe_int((config or {}).get("kt_arm_sft_top_k")),
+        "kt_arm_sft_token_chunk_size": _safe_int((config or {}).get("kt_arm_sft_token_chunk_size")),
+        "kt_arm_effective_route_qlen": _safe_int((config or {}).get("kt_arm_effective_route_qlen")),
+        "kt_arm_token_chunks": _safe_int((config or {}).get("kt_arm_token_chunks")),
+        "kt_arm_route_rank_work": _safe_int((config or {}).get("kt_arm_route_rank_work")),
+        "kt_arm_sft_max_route_rank_work": _safe_int((config or {}).get("kt_arm_sft_max_route_rank_work")),
     }
 
 
@@ -593,6 +606,9 @@ def _kt_counters_from_model() -> dict[str, Any]:
                 "max_cache_depth_observed": int(getattr(wrapper, "_max_cache_depth_observed", 0) or 0),
                 "staging_buffer_scope": "wrapper",
                 "staging_buffer_capacity_qlen": int(getattr(getattr(wrapper, "_buffer", None), "qlen", 0) or 0),
+                "staging_buffer_capacity_bytes": int(
+                    getattr(getattr(wrapper, "_buffer", None), "capacity_bytes", lambda: 0)() or 0
+                ),
                 "staging_buffer_allocation_count": int(getattr(wrapper, "_buffer_allocation_count", 0) or 0),
                 "native_cache_stack_depth": int(getattr(wrapper, "cache_stack_depth", 0) or 0),
                 "native_max_cache_stack_depth_observed": int(
@@ -705,6 +721,84 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
     except Exception:
         return
 
+    def _result_to_float(result: Any) -> Any:
+        if hasattr(result, "item"):
+            try:
+                return float(result.item())
+            except (TypeError, ValueError):
+                return result
+        return result
+
+    def _wrap_grad_norm_method(owner: Any, method_name: str, fallback_operation: str) -> None:
+        original = getattr(owner, method_name, None)
+        if original is None or getattr(original, "_asym_gemm_heartbeat", False):
+            return
+
+        def wrapped_grad_norm_method(self: Any, model: Any, *args: Any, **kwargs: Any) -> Any:
+            depth = int(getattr(self, "_asym_gemm_grad_norm_heartbeat_depth", 0) or 0)
+            if depth > 0:
+                return original(self, model, *args, **kwargs)
+
+            global _GRAD_CLIP_MARKER
+            step = getattr(getattr(self, "state", None), "global_step", None)
+            started = time.perf_counter()
+            start_record = {
+                "trainer_class": self.__class__.__name__,
+                "global_step": step,
+                "operation": fallback_operation,
+                "method": f"{owner.__name__}.{method_name}",
+            }
+            heartbeat.emit("grad_clip_start", **start_record)
+            partial_writer.write("grad_clip_start", force=True, extra={"grad_clip": start_record})
+            setattr(self, "_asym_gemm_grad_norm_heartbeat_depth", depth + 1)
+            try:
+                result = original(self, model, *args, **kwargs)
+            except BaseException as exc:
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                record = {
+                    **start_record,
+                    "available": False,
+                    "elapsed_ms": elapsed_ms,
+                    "error": repr(exc),
+                    "exception_type": exc.__class__.__name__,
+                    "timestamp": _utc_timestamp(),
+                }
+                _GRAD_CLIP_MARKER = record
+                heartbeat.emit("grad_clip_exception", **record)
+                partial_writer.write("grad_clip_exception", force=True, extra={"grad_clip": record, "error": repr(exc)})
+                raise
+            finally:
+                if depth:
+                    setattr(self, "_asym_gemm_grad_norm_heartbeat_depth", depth)
+                else:
+                    try:
+                        delattr(self, "_asym_gemm_grad_norm_heartbeat_depth")
+                    except AttributeError:
+                        pass
+
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            record = dict(start_record)
+            summary = getattr(self, "_kt_grad_clip_last_summary", None)
+            if isinstance(summary, dict):
+                record.update(summary)
+            else:
+                record.update({"enabled": False, "path": "default"})
+            record.update(
+                {
+                    "available": True,
+                    "elapsed_ms": elapsed_ms,
+                    "result_norm": _result_to_float(result),
+                    "timestamp": _utc_timestamp(),
+                }
+            )
+            _GRAD_CLIP_MARKER = record
+            heartbeat.emit("grad_clip_end", **record)
+            partial_writer.write("grad_clip_end", force=True, extra={"grad_clip": record})
+            return result
+
+        wrapped_grad_norm_method._asym_gemm_heartbeat = True  # type: ignore[attr-defined]
+        setattr(owner, method_name, wrapped_grad_norm_method)
+
     if not getattr(Trainer.train, "_asym_gemm_heartbeat", False):
         original_train = Trainer.train
 
@@ -769,22 +863,10 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
         wrapped_training_step._asym_gemm_heartbeat = True  # type: ignore[attr-defined]
         Trainer.training_step = wrapped_training_step
 
-    if not getattr(Trainer._clip_grad_norm, "_asym_gemm_heartbeat", False):
-        original_clip_grad_norm = Trainer._clip_grad_norm
+    _wrap_grad_norm_method(Trainer, "_clip_grad_norm", "clip")
+    _wrap_grad_norm_method(Trainer, "_get_grad_norm", "norm")
 
-        def wrapped_clip_grad_norm(self: Any, model: Any) -> Any:
-            step = getattr(getattr(self, "state", None), "global_step", None)
-            heartbeat.emit("grad_clip_start", trainer_class=self.__class__.__name__, global_step=step)
-            partial_writer.write("grad_clip_start", force=True)
-            result = original_clip_grad_norm(self, model)
-            heartbeat.emit("grad_clip_end", trainer_class=self.__class__.__name__, global_step=step)
-            partial_writer.write("grad_clip_end")
-            return result
-
-        wrapped_clip_grad_norm._asym_gemm_heartbeat = True  # type: ignore[attr-defined]
-        Trainer._clip_grad_norm = wrapped_clip_grad_norm
-
-    if not getattr(Trainer.create_optimizer, "_asym_gemm_heartbeat", False):
+    if hasattr(Trainer, "create_optimizer") and not getattr(Trainer.create_optimizer, "_asym_gemm_heartbeat", False):
         original_create_optimizer = Trainer.create_optimizer
 
         def wrapped_create_optimizer(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -894,6 +976,9 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
         from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
     except Exception:
         return
+
+    _wrap_grad_norm_method(CustomSeq2SeqTrainer, "_clip_grad_norm", "clip")
+    _wrap_grad_norm_method(CustomSeq2SeqTrainer, "_get_grad_norm", "norm")
 
     if not getattr(CustomSeq2SeqTrainer.compute_loss, "_asym_gemm_heartbeat", False):
         original_compute_loss = CustomSeq2SeqTrainer.compute_loss
@@ -1801,6 +1886,7 @@ class LFProfileRecorder:
             },
             "lora": lora,
             "kt": kt,
+            "grad_clip": _GRAD_CLIP_MARKER,
             "optimizer_memory_preflight": _kt_optimizer_memory_preflight(lora, self.config),
             "optimizer_memory": _OPTIMIZER_MEMORY_MARKER,
             "superoffload": _superoffload_summary_from_config(self.config),
@@ -1813,7 +1899,7 @@ class LFProfileRecorder:
 
 
 def main() -> None:
-    global _MODEL_CAPTURE_HEARTBEAT, _MODEL_CAPTURE_PARTIAL_WRITER
+    global _GRAD_CLIP_MARKER, _MODEL_CAPTURE_HEARTBEAT, _MODEL_CAPTURE_PARTIAL_WRITER
 
     lf_args = sys.argv[1:]
     if lf_args and lf_args[0] == "train":
@@ -1825,6 +1911,7 @@ def main() -> None:
         print("Set ASYM_GEMM_LF_PROFILE_SOURCE_JSON to write the source profile JSON.")
         return
 
+    _GRAD_CLIP_MARKER = {}
     config = _config_from_args(lf_args)
     trace_config = LFTraceConfig.from_env(os.environ)
     recorder = LFProfileRecorder(

@@ -86,9 +86,14 @@ KT_SFT_PROGRESS=${KT_SFT_PROGRESS:-}
 KT_ARM_SFT_PROFILE=${KT_ARM_SFT_PROFILE:-}
 KT_ARM_SFT_POOL_LOG=${KT_ARM_SFT_POOL_LOG:-}
 KT_ARM_SFT_TOP_K=${KT_ARM_SFT_TOP_K:-8}
+KT_ARM_SFT_TOKEN_CHUNK_SIZE=${KT_ARM_SFT_TOKEN_CHUNK_SIZE:-}
 KT_ARM_SFT_MAX_ROUTE_RANK_WORK=${KT_ARM_SFT_MAX_ROUTE_RANK_WORK:-}
 KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK=${KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK:-1048576}
+KT_ARM_SFT_BACKWARD_THREADS=${KT_ARM_SFT_BACKWARD_THREADS:-}
+KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES=${KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES:-}
+KT_ARM_SFT_DEFAULT_MAX_BACKWARD_SCRATCH_BYTES=${KT_ARM_SFT_DEFAULT_MAX_BACKWARD_SCRATCH_BYTES:-34359738368}
 KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK=${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK:-0}
+KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH=${KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH:-0}
 KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK=${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK:-0}
 KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK=${KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK:-0}
 KT_ARM_SOURCE_OK_PROFILE_JSON=${KT_ARM_SOURCE_OK_PROFILE_JSON:-}
@@ -431,11 +436,27 @@ validate_kt_arm_source_ok_profile() {
     echo "KT_ARM_SOURCE_OK_PROFILE_JSON does not exist: ${profile_json}" >&2
     return 1
   }
-  python3 - "${profile_json}" "${MODEL_NAME_OR_PATH}" "${CUTOFF_LEN}" <<'PY'
+  python3 - "${profile_json}" "${MODEL_NAME_OR_PATH}" "${CUTOFF_LEN}" "${PER_DEVICE_TRAIN_BATCH_SIZE}" \
+    "${LORA_RANK}" "${LORA_DROPOUT}" "${KT_ARM_SFT_TOP_K}" "${KT_ARM_SFT_TOKEN_CHUNK_SIZE}" \
+    "${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}" "${KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK}" \
+    "${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK}" <<'PY'
 import json
+import math
 import sys
 
-profile_path, expected_model, expected_seq = sys.argv[1:4]
+(
+    profile_path,
+    expected_model,
+    expected_seq,
+    expected_batch,
+    expected_rank,
+    expected_dropout,
+    expected_top_k,
+    expected_token_chunk,
+    expected_limit,
+    expected_default_limit,
+    allow_unvalidated,
+) = sys.argv[1:12]
 profile = json.load(open(profile_path, encoding="utf-8"))
 source_profile = profile.get("source_profile", {})
 source_profile = source_profile if isinstance(source_profile, dict) and source_profile else profile
@@ -458,17 +479,54 @@ try:
         raise SystemExit("source-ok profile seq_len does not match this run")
 except (TypeError, ValueError):
     raise SystemExit("source-ok profile seq_len missing or invalid")
+def int_value(container, key):
+    try:
+        return int(container.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+def require_int_config(key, expected):
+    try:
+        actual = int(config.get(key))
+    except (TypeError, ValueError):
+        raise SystemExit(f"source-ok profile {key} missing or invalid")
+    if actual != int(expected):
+        raise SystemExit(f"source-ok profile {key} mismatch: expected {expected}, got {actual}")
+require_int_config("per_device_train_batch_size", expected_batch)
+require_int_config("lora_rank", expected_rank)
+try:
+    actual_dropout = float(config.get("lora_dropout"))
+    wanted_dropout = float(expected_dropout)
+except (TypeError, ValueError):
+    raise SystemExit("source-ok profile lora_dropout missing or invalid")
+if not math.isclose(actual_dropout, wanted_dropout, rel_tol=0.0, abs_tol=1e-9):
+    raise SystemExit(f"source-ok profile lora_dropout mismatch: expected {wanted_dropout}, got {actual_dropout}")
+logical_qlen = int(expected_seq) * int(expected_batch)
+token_chunk = int(expected_token_chunk) if str(expected_token_chunk).strip() else None
+effective_route_qlen = min(logical_qlen, token_chunk) if token_chunk is not None else logical_qlen
+token_chunks = (logical_qlen + token_chunk - 1) // token_chunk if token_chunk is not None and token_chunk < logical_qlen else 1
+route_rank_work = effective_route_qlen * int(expected_top_k) * int(expected_rank)
+normalized_limit = None
+if str(expected_limit).strip():
+    normalized_limit = int(expected_limit)
+elif str(allow_unvalidated).strip() != "1":
+    normalized_limit = int(expected_default_limit)
+require_int_config("kt_arm_sft_top_k", expected_top_k)
+if token_chunk is None:
+    if str(config.get("kt_arm_sft_token_chunk_size") or "").strip():
+        raise SystemExit("source-ok profile token chunk size mismatch: expected unset")
+else:
+    require_int_config("kt_arm_sft_token_chunk_size", token_chunk)
+require_int_config("kt_arm_effective_route_qlen", effective_route_qlen)
+require_int_config("kt_arm_token_chunks", token_chunks)
+require_int_config("kt_arm_route_rank_work", route_rank_work)
+if normalized_limit is not None:
+    require_int_config("kt_arm_sft_max_route_rank_work", normalized_limit)
 lora_target = str(config.get("lora_target") or "").lower()
 if lora_target not in {"all", "all-linear", "all_linear"}:
     raise SystemExit("source-ok profile lora_target is not all")
 kt = source_profile.get("kt", {})
 if not isinstance(kt, dict):
     raise SystemExit("source-ok profile missing kt counters")
-def int_value(container, key):
-    try:
-        return int(container.get(key, 0) or 0)
-    except (TypeError, ValueError):
-        return 0
 if int_value(kt, "wrapper_count") <= 0:
     raise SystemExit("source-ok profile has no KT wrappers")
 if int_value(kt, "total_forward_calls") <= 0 or int_value(kt, "total_backward_calls") <= 0:
@@ -526,10 +584,15 @@ if [[ "${BACKEND}" == kt_* ]]; then
   positive_int_value KT_MAX_CACHE_DEPTH "${KT_MAX_CACHE_DEPTH}"
   positive_int_value KT_ARM_OMP_NUM_THREADS "${KT_ARM_OMP_NUM_THREADS}"
   positive_int_value KT_ARM_SFT_TOP_K "${KT_ARM_SFT_TOP_K}"
+  [[ -z "${KT_ARM_SFT_TOKEN_CHUNK_SIZE}" ]] || positive_int_value KT_ARM_SFT_TOKEN_CHUNK_SIZE "${KT_ARM_SFT_TOKEN_CHUNK_SIZE}"
   positive_int_value KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK "${KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK}"
   [[ -z "${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}" ]] || positive_int_value KT_ARM_SFT_MAX_ROUTE_RANK_WORK "${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}"
+  [[ -z "${KT_ARM_SFT_BACKWARD_THREADS}" ]] || positive_int_value KT_ARM_SFT_BACKWARD_THREADS "${KT_ARM_SFT_BACKWARD_THREADS}"
+  positive_int_value KT_ARM_SFT_DEFAULT_MAX_BACKWARD_SCRATCH_BYTES "${KT_ARM_SFT_DEFAULT_MAX_BACKWARD_SCRATCH_BYTES}"
+  [[ -z "${KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES}" ]] || positive_int_value KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES "${KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES}"
   nonnegative_int_value KT_ARM_FIRST_STEP_TIMEOUT_SECONDS "${KT_ARM_FIRST_STEP_TIMEOUT_SECONDS}"
   KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK="$(bool_01 KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK "${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK}")"
+  KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH="$(bool_01 KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH "${KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH}")"
   KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK="$(bool_01 KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK "${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}")"
   KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK="$(bool_01 KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK "${KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK}")"
   [[ -z "${KT_NUM_GPU_EXPERTS}" ]] || nonnegative_int_value KT_NUM_GPU_EXPERTS "${KT_NUM_GPU_EXPERTS}"
@@ -583,33 +646,33 @@ if not math.isfinite(value) or value < 0:
     raise SystemExit(f"MAX_GRAD_NORM must be a non-negative finite float, got {sys.argv[1]!r}")
 PY
 fi
-if [[ "${BACKEND}" == "kt_armbf16" && -n "${MAX_GRAD_NORM}" ]]; then
-  python3 - "${MAX_GRAD_NORM}" "${KT_ALLOW_UNVALIDATED_GRAD_CLIP:-}" <<'PY'
-import sys
-
-value = float(sys.argv[1])
-allow = sys.argv[2].strip().lower() in {"1", "true", "yes", "on"}
-if value > 0.0 and not allow:
-    raise SystemExit(
-        "BACKEND=kt_armbf16 requires MAX_GRAD_NORM=0 until KT-aware clipping is validated; "
-        "set KT_ALLOW_UNVALIDATED_GRAD_CLIP=1 only for validation runs"
-    )
-PY
-fi
-
 PROFILE_LOGICAL_QLEN=$((PER_DEVICE_TRAIN_BATCH_SIZE * CUTOFF_LEN))
 PROFILE_GLOBAL_BATCH_SIZE=$((PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * NUM_GPUS))
 KT_ARM_LOGICAL_QLEN=""
+KT_ARM_EFFECTIVE_ROUTE_QLEN=""
+KT_ARM_TOKEN_CHUNKS=""
 KT_ARM_ROUTE_RANK_WORK=""
 if [[ "${BACKEND}" == "kt_armbf16" ]]; then
   if [[ -z "${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}" && "${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK}" != "1" ]]; then
     KT_ARM_SFT_MAX_ROUTE_RANK_WORK="${KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK}"
   fi
+  if [[ -z "${KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES}" && "${KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH}" != "1" ]]; then
+    KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES="${KT_ARM_SFT_DEFAULT_MAX_BACKWARD_SCRATCH_BYTES}"
+  fi
   KT_ARM_LOGICAL_QLEN="${PROFILE_LOGICAL_QLEN}"
-  KT_ARM_ROUTE_RANK_WORK=$((KT_ARM_LOGICAL_QLEN * KT_ARM_SFT_TOP_K * LORA_RANK))
+  KT_ARM_EFFECTIVE_ROUTE_QLEN="${KT_ARM_LOGICAL_QLEN}"
+  KT_ARM_TOKEN_CHUNKS=1
+  if [[ -n "${KT_ARM_SFT_TOKEN_CHUNK_SIZE}" ]]; then
+    positive_int_value KT_ARM_SFT_TOKEN_CHUNK_SIZE "${KT_ARM_SFT_TOKEN_CHUNK_SIZE}"
+    if [[ "${KT_ARM_SFT_TOKEN_CHUNK_SIZE}" -lt "${KT_ARM_LOGICAL_QLEN}" ]]; then
+      KT_ARM_EFFECTIVE_ROUTE_QLEN="${KT_ARM_SFT_TOKEN_CHUNK_SIZE}"
+      KT_ARM_TOKEN_CHUNKS=$(((KT_ARM_LOGICAL_QLEN + KT_ARM_SFT_TOKEN_CHUNK_SIZE - 1) / KT_ARM_SFT_TOKEN_CHUNK_SIZE))
+    fi
+  fi
+  KT_ARM_ROUTE_RANK_WORK=$((KT_ARM_EFFECTIVE_ROUTE_QLEN * KT_ARM_SFT_TOP_K * LORA_RANK))
   if [[ -n "${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}" && "${KT_ARM_ROUTE_RANK_WORK}" -gt "${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}" ]]; then
     echo "BACKEND=kt_armbf16 route-rank work ${KT_ARM_ROUTE_RANK_WORK} exceeds KT_ARM_SFT_MAX_ROUTE_RANK_WORK=${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}" >&2
-    echo "Reduce PER_DEVICE_TRAIN_BATCH_SIZE, CUTOFF_LEN, LORA_RANK, raise the explicit limit, or set KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK=1 only for validation." >&2
+    echo "Reduce PER_DEVICE_TRAIN_BATCH_SIZE, CUTOFF_LEN, LORA_RANK, set KT_ARM_SFT_TOKEN_CHUNK_SIZE, raise the explicit limit, or set KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK=1 only for validation." >&2
     exit 2
   fi
 fi
@@ -1177,13 +1240,19 @@ if [[ "${BACKEND}" == kt_* ]]; then
     log_kv KT_ARM_SFT_PROFILE "${KT_ARM_SFT_PROFILE}"
     log_kv KT_ARM_SFT_POOL_LOG "${KT_ARM_SFT_POOL_LOG}"
     log_kv KT_ARM_SFT_TOP_K "${KT_ARM_SFT_TOP_K}"
+    log_kv_if_set KT_ARM_SFT_TOKEN_CHUNK_SIZE "${KT_ARM_SFT_TOKEN_CHUNK_SIZE}"
     log_kv KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK "${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK}"
+    log_kv KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH "${KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH}"
     log_kv KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK "${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}"
     log_kv KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK "${KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK}"
     log_kv_if_set KT_ARM_SOURCE_OK_PROFILE_JSON "${KT_ARM_SOURCE_OK_PROFILE_JSON}"
     log_kv KT_ARM_LOGICAL_QLEN "${KT_ARM_LOGICAL_QLEN}"
+    log_kv KT_ARM_EFFECTIVE_ROUTE_QLEN "${KT_ARM_EFFECTIVE_ROUTE_QLEN}"
+    log_kv KT_ARM_TOKEN_CHUNKS "${KT_ARM_TOKEN_CHUNKS}"
     log_kv KT_ARM_ROUTE_RANK_WORK "${KT_ARM_ROUTE_RANK_WORK}"
     log_kv_if_set KT_ARM_SFT_MAX_ROUTE_RANK_WORK "${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}"
+    log_kv_if_set KT_ARM_SFT_BACKWARD_THREADS "${KT_ARM_SFT_BACKWARD_THREADS}"
+    log_kv_if_set KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES "${KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES}"
   fi
   log_kv_if_set KT_NUM_THREADS "${KT_NUM_THREADS}"
   log_kv_if_set KT_THREADPOOL_COUNT "${KT_THREADPOOL_COUNT}"
@@ -1297,20 +1366,34 @@ if [[ "${BACKEND}" == kt_* ]]; then
       KT_SFT_PROGRESS="${KT_SFT_PROGRESS}"
       KT_ARM_SFT_PROFILE="${KT_ARM_SFT_PROFILE}"
       KT_ARM_SFT_POOL_LOG="${KT_ARM_SFT_POOL_LOG}"
+      KT_ARM_SFT_TOP_K="${KT_ARM_SFT_TOP_K}"
+      KT_ARM_SFT_MAX_ROUTE_RANK_WORK="${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}"
+      KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK="${KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK}"
+      KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK="${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK}"
       ASYM_GEMM_LF_CONFIG_KT_ARM_OMP_NUM_THREADS="${KT_ARM_OMP_NUM_THREADS}"
       ASYM_GEMM_LF_CONFIG_KT_ARM_OMP_PROC_BIND="${KT_ARM_OMP_PROC_BIND}"
       ASYM_GEMM_LF_CONFIG_KT_ARM_OMP_PLACES="${KT_ARM_OMP_PLACES}"
       ASYM_GEMM_LF_CONFIG_KT_SFT_PROGRESS="${KT_SFT_PROGRESS}"
       ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_PROFILE="${KT_ARM_SFT_PROFILE}"
       ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_POOL_LOG="${KT_ARM_SFT_POOL_LOG}"
+      ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_TOP_K="${KT_ARM_SFT_TOP_K}"
       ASYM_GEMM_LF_CONFIG_KT_ARM_LOGICAL_QLEN="${KT_ARM_LOGICAL_QLEN}"
+      ASYM_GEMM_LF_CONFIG_KT_ARM_EFFECTIVE_ROUTE_QLEN="${KT_ARM_EFFECTIVE_ROUTE_QLEN}"
+      ASYM_GEMM_LF_CONFIG_KT_ARM_TOKEN_CHUNKS="${KT_ARM_TOKEN_CHUNKS}"
       ASYM_GEMM_LF_CONFIG_KT_ARM_ROUTE_RANK_WORK="${KT_ARM_ROUTE_RANK_WORK}"
+      ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_TOKEN_CHUNK_SIZE="${KT_ARM_SFT_TOKEN_CHUNK_SIZE}"
       ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_MAX_ROUTE_RANK_WORK="${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}"
+      ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_BACKWARD_THREADS="${KT_ARM_SFT_BACKWARD_THREADS}"
+      ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES="${KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES}"
       ASYM_GEMM_LF_CONFIG_KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK="${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK}"
+      ASYM_GEMM_LF_CONFIG_KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH="${KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH}"
       ASYM_GEMM_LF_CONFIG_KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK="${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}"
       ASYM_GEMM_LF_CONFIG_KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK="${KT_ARM_ALLOW_RAW_NSYS_WITHOUT_SOURCE_OK}"
       ASYM_GEMM_LF_CONFIG_KT_ARM_SOURCE_OK_PROFILE_JSON="${KT_ARM_SOURCE_OK_PROFILE_JSON}"
     )
+    [[ -z "${KT_ARM_SFT_TOKEN_CHUNK_SIZE}" ]] || RUN_ENV+=(KT_ARM_SFT_TOKEN_CHUNK_SIZE="${KT_ARM_SFT_TOKEN_CHUNK_SIZE}")
+    [[ -z "${KT_ARM_SFT_BACKWARD_THREADS}" ]] || RUN_ENV+=(KT_ARM_SFT_BACKWARD_THREADS="${KT_ARM_SFT_BACKWARD_THREADS}")
+    [[ -z "${KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES}" ]] || RUN_ENV+=(KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES="${KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES}")
   fi
   [[ -z "${KT_NUM_THREADS}" ]] || RUN_ENV+=(ACCELERATE_KT_NUM_THREADS="${KT_NUM_THREADS}")
   [[ -z "${KT_THREADPOOL_COUNT}" ]] || RUN_ENV+=(ACCELERATE_KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT}")

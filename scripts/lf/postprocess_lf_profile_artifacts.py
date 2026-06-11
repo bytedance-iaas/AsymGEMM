@@ -90,8 +90,8 @@ def _lora_counter_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _source_profile_for_artifacts(profile: dict[str, Any]) -> dict[str, Any]:
-    source_profile = profile.get("source_profile", {})
-    return source_profile if isinstance(source_profile, dict) else profile
+    source_profile = profile.get("source_profile")
+    return source_profile if isinstance(source_profile, dict) and source_profile else profile
 
 
 def _counter_value(container: Any, key: str, default: Any = "-") -> Any:
@@ -403,6 +403,18 @@ def _optimizer_memory_preflight_rows(profile: dict[str, Any]) -> list[dict[str, 
     return [{key: value for key, value in preflight.items() if not isinstance(value, (dict, list))}]
 
 
+def _grad_clip_summary(profile: dict[str, Any]) -> dict[str, Any]:
+    grad_clip = profile.get("grad_clip", {})
+    return grad_clip if isinstance(grad_clip, dict) else {}
+
+
+def _grad_clip_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    grad_clip = _grad_clip_summary(profile)
+    if not grad_clip:
+        return []
+    return [{key: value for key, value in grad_clip.items() if not isinstance(value, (dict, list))}]
+
+
 def _process_memory(profile: dict[str, Any]) -> dict[str, Any]:
     memory = profile.get("memory", {})
     process = memory.get("process", {}) if isinstance(memory, dict) else {}
@@ -474,6 +486,7 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
     trainable_surface = _trainable_surface_summary(profile)
     kt_lora_update_health = _kt_lora_update_health(profile)
     optimizer_memory_preflight = _optimizer_memory_preflight(profile)
+    grad_clip = _grad_clip_summary(profile)
     process_memory = _process_memory(profile)
     process_memory_rows = _process_memory_rows(profile)
     forward_ms = profile.get("forward", {}).get("total_milliseconds")
@@ -542,6 +555,32 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
                 rss_delta_bytes = row.get("process_rss_delta_bytes", row.get("avg_process_rss_delta_bytes", "-"))
                 lines.append(f"| {name} | {rss_bytes} | {rss_peak_bytes} | {virtual_memory_bytes} | {rss_delta_bytes} |")
             lines.append("")
+    if grad_clip:
+        lines += [
+            "## Gradient Clipping",
+            "",
+            "| Metric | Value |",
+            "|---|---:|",
+            f"| available | {grad_clip.get('available', '-')} |",
+            f"| path | {grad_clip.get('path', '-')} |",
+            f"| operation | {grad_clip.get('operation', '-')} |",
+            f"| method | {grad_clip.get('method', '-')} |",
+            f"| max norm | {grad_clip.get('max_norm', '-')} |",
+            f"| total norm | {grad_clip.get('total_norm', '-')} |",
+            f"| result norm | {grad_clip.get('result_norm', '-')} |",
+            f"| clip coefficient | {grad_clip.get('clip_coef', '-')} |",
+            f"| clipped | {grad_clip.get('clipped', '-')} |",
+            f"| nonfinite | {grad_clip.get('nonfinite', '-')} |",
+            f"| elapsed ms | {_fmt_ms(grad_clip.get('elapsed_ms'))} |",
+            f"| unique grad tensors | {grad_clip.get('unique_grad_tensors', '-')} |",
+            f"| duplicate grad tensors | {grad_clip.get('duplicate_grad_tensors', '-')} |",
+            f"| CPU grad tensors | {grad_clip.get('cpu_grad_tensors', '-')} |",
+            f"| CPU grad elements | {grad_clip.get('cpu_grad_numel', '-')} |",
+            f"| CUDA grad tensors | {grad_clip.get('cuda_grad_tensors', '-')} |",
+            f"| CUDA grad elements | {grad_clip.get('cuda_grad_numel', '-')} |",
+            f"| chunk elements | {grad_clip.get('chunk_elements', '-')} |",
+            "",
+        ]
     if isinstance(kt, dict) or isinstance(lora, dict):
         lines += [
             "## KT / LoRA Counters",
@@ -588,6 +627,12 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
             f"| assumed param dtype | {optimizer_memory_preflight.get('assumed_param_dtype', '-')} |",
             f"| logical qlen | {optimizer_memory_preflight.get('logical_qlen', '-')} |",
             f"| LoRA rank | {optimizer_memory_preflight.get('lora_rank', '-')} |",
+            f"| KT ARM top-k | {optimizer_memory_preflight.get('kt_arm_sft_top_k', '-')} |",
+            f"| KT ARM token chunk size | {optimizer_memory_preflight.get('kt_arm_sft_token_chunk_size', '-')} |",
+            f"| KT ARM effective route qlen | {optimizer_memory_preflight.get('kt_arm_effective_route_qlen', '-')} |",
+            f"| KT ARM token chunks | {optimizer_memory_preflight.get('kt_arm_token_chunks', '-')} |",
+            f"| KT ARM route-rank work | {optimizer_memory_preflight.get('kt_arm_route_rank_work', '-')} |",
+            f"| KT ARM route-rank cap | {optimizer_memory_preflight.get('kt_arm_sft_max_route_rank_work', '-')} |",
             f"| trainable params | {optimizer_memory_preflight.get('trainable_parameters', '-')} |",
             f"| KT fused expert LoRA params | {optimizer_memory_preflight.get('kt_fused_expert_lora_parameters', '-')} |",
             f"| KT expert LoRA params | {optimizer_memory_preflight.get('kt_expert_lora_parameters', '-')} |",
@@ -1202,6 +1247,9 @@ def _write_source_artifacts(source_profile_json: Path, output_dir: Path, profile
     trainable_surface_rows = _trainable_surface_rows(profile)
     if trainable_surface_rows:
         _write_csv(output_dir / "trainable_surface.csv", trainable_surface_rows)
+    grad_clip_rows = _grad_clip_rows(profile)
+    if grad_clip_rows:
+        _write_csv(output_dir / "grad_clip.csv", grad_clip_rows)
     kt_lora_health_rows = _kt_lora_update_health_rows(profile)
     if kt_lora_health_rows:
         _write_csv(output_dir / "kt_lora_update_health.csv", kt_lora_health_rows)
@@ -1247,6 +1295,9 @@ def _write_profile_csv_artifacts(profile_json: Path, output_dir: Path) -> None:
     trainable_surface_rows = _trainable_surface_rows(source_profile)
     if trainable_surface_rows:
         _write_csv(output_dir / "trainable_surface.csv", trainable_surface_rows)
+    grad_clip_rows = _grad_clip_rows(source_profile)
+    if grad_clip_rows:
+        _write_csv(output_dir / "grad_clip.csv", grad_clip_rows)
     kt_lora_health_rows = _kt_lora_update_health_rows(source_profile)
     if kt_lora_health_rows:
         _write_csv(output_dir / "kt_lora_update_health.csv", kt_lora_health_rows)

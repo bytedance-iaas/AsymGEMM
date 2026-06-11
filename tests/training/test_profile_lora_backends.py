@@ -864,3 +864,5 @@ def test_sft_base_uses_per_wrapper_staging_buffers_for_overlap() -> None:
     assert wrapper_a._buffer is not wrapper_b._buffer
     assert wrapper_a._buffer_allocation_count == 1
     assert wrapper_b._buffer_allocation_count == 1
+    assert wrapper_a._buffer.capacity_bytes() == wrapper_b._buffer.capacity_bytes()
+    assert wrapper_a._buffer.capacity_bytes() > 0

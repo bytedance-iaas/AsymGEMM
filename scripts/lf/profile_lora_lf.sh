@@ -98,6 +98,7 @@ KT_ARM_OMP_NUM_THREADS=${KT_ARM_OMP_NUM_THREADS:-64}
 KT_ARM_OMP_PROC_BIND=${KT_ARM_OMP_PROC_BIND:-close}
 KT_ARM_OMP_PLACES=${KT_ARM_OMP_PLACES:-cores}
 KT_ARM_SFT_TOP_K=${KT_ARM_SFT_TOP_K:-8}
+KT_ARM_SFT_TOKEN_CHUNK_SIZE=${KT_ARM_SFT_TOKEN_CHUNK_SIZE:-}
 KT_ARM_SFT_MAX_ROUTE_RANK_WORK=${KT_ARM_SFT_MAX_ROUTE_RANK_WORK:-}
 KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK=${KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK:-1048576}
 KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK=${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK:-0}
@@ -231,6 +232,7 @@ Options:
   --kt-arm-omp-num-threads N
   --kt-arm-omp-proc-bind VALUE
   --kt-arm-omp-places VALUE
+  --kt-arm-sft-token-chunk-size N
   --kt-share-backward-bb true|false
   --kt-num-gpu-experts N
   --kt-weight-path PATH
@@ -602,9 +604,21 @@ existing_profile_complete() {
   local expected_seq_len="${3:-}"
   local expected_model_name="${4:-}"
   local expected_lora_target="${5:-}"
+  local current_batch="${PER_DEVICE_TRAIN_BATCH_SIZE:-}"
+  local current_lora_rank="${LORA_RANK:-}"
+  local current_lora_dropout="${LORA_DROPOUT:-}"
+  local current_top_k="${KT_ARM_SFT_TOP_K:-}"
+  local current_token_chunk_size="${KT_ARM_SFT_TOKEN_CHUNK_SIZE:-}"
+  local current_route_rank_limit="${KT_ARM_SFT_MAX_ROUTE_RANK_WORK:-}"
+  local current_default_route_rank_limit="${KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK:-}"
+  local current_allow_unvalidated_route_rank="${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK:-0}"
   [[ -f "${profile_json}" ]] || return 1
-  "${ENV_PYTHON}" - "${profile_json}" "${expected_backend}" "${expected_seq_len}" "${expected_model_name}" "${expected_lora_target}" <<'PY' >/dev/null 2>&1
+  "${ENV_PYTHON}" - "${profile_json}" "${expected_backend}" "${expected_seq_len}" "${expected_model_name}" \
+    "${expected_lora_target}" "${current_batch}" "${current_lora_rank}" "${current_lora_dropout}" \
+    "${current_top_k}" "${current_token_chunk_size}" "${current_route_rank_limit}" \
+    "${current_default_route_rank_limit}" "${current_allow_unvalidated_route_rank}" <<'PY' >/dev/null 2>&1
 import json
+import math
 import sys
 
 profile = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -612,6 +626,14 @@ expected_backend = sys.argv[2]
 expected_seq_len = sys.argv[3]
 expected_model_name = sys.argv[4]
 expected_lora_target = sys.argv[5]
+expected_batch = sys.argv[6]
+expected_rank = sys.argv[7]
+expected_dropout = sys.argv[8]
+expected_top_k = sys.argv[9]
+expected_token_chunk = sys.argv[10]
+expected_limit = sys.argv[11]
+expected_default_limit = sys.argv[12]
+allow_unvalidated = sys.argv[13]
 if profile.get("partial") is True:
     raise SystemExit("partial profile")
 heartbeat = profile.get("heartbeat", {})
@@ -641,6 +663,48 @@ if expected_lora_target:
     lora_target = str(config.get("lora_target") or "")
     if lora_target != expected_lora_target:
         raise SystemExit(f"profile lora_target mismatch: expected {expected_lora_target}, got {lora_target or '<missing>'}")
+if backend == "kt_armbf16" and expected_seq_len and expected_batch and expected_rank:
+    def require_int_config(key, expected):
+        try:
+            actual = int(config.get(key))
+        except (TypeError, ValueError):
+            raise SystemExit(f"profile {key} missing or invalid")
+        if actual != int(expected):
+            raise SystemExit(f"profile {key} mismatch: expected {expected}, got {actual}")
+    require_int_config("per_device_train_batch_size", expected_batch)
+    require_int_config("lora_rank", expected_rank)
+    try:
+        actual_dropout = float(config.get("lora_dropout"))
+        wanted_dropout = float(expected_dropout)
+    except (TypeError, ValueError):
+        raise SystemExit("profile lora_dropout missing or invalid")
+    if not math.isclose(actual_dropout, wanted_dropout, rel_tol=0.0, abs_tol=1e-9):
+        raise SystemExit(f"profile lora_dropout mismatch: expected {wanted_dropout}, got {actual_dropout}")
+    logical_qlen = int(expected_seq_len) * int(expected_batch)
+    token_chunk = int(expected_token_chunk) if str(expected_token_chunk).strip() else None
+    effective_route_qlen = min(logical_qlen, token_chunk) if token_chunk is not None else logical_qlen
+    token_chunks = (
+        (logical_qlen + token_chunk - 1) // token_chunk
+        if token_chunk is not None and token_chunk < logical_qlen
+        else 1
+    )
+    route_rank_work = effective_route_qlen * int(expected_top_k) * int(expected_rank)
+    normalized_limit = None
+    if str(expected_limit).strip():
+        normalized_limit = int(expected_limit)
+    elif str(allow_unvalidated).strip() != "1":
+        normalized_limit = int(expected_default_limit)
+    require_int_config("kt_arm_sft_top_k", expected_top_k)
+    if token_chunk is None:
+        if str(config.get("kt_arm_sft_token_chunk_size") or "").strip():
+            raise SystemExit("profile token chunk size mismatch: expected unset")
+    else:
+        require_int_config("kt_arm_sft_token_chunk_size", token_chunk)
+    require_int_config("kt_arm_effective_route_qlen", effective_route_qlen)
+    require_int_config("kt_arm_token_chunks", token_chunks)
+    require_int_config("kt_arm_route_rank_work", route_rank_work)
+    if normalized_limit is not None:
+        require_int_config("kt_arm_sft_max_route_rank_work", normalized_limit)
 if backend.startswith("kt_"):
     kt = source_profile.get("kt", {})
     if not isinstance(kt, dict):
@@ -697,13 +761,20 @@ kt_arm_route_rank_limit() {
 
 check_kt_arm_route_rank_for_sweep() {
   local seq_len="$1"
-  local logical_qlen route_rank_work limit
+  local logical_qlen effective_route_qlen route_rank_work limit
   positive_int "KT_ARM_SFT_TOP_K" "${KT_ARM_SFT_TOP_K}"
   logical_qlen=$((PER_DEVICE_TRAIN_BATCH_SIZE * seq_len))
-  route_rank_work=$((logical_qlen * KT_ARM_SFT_TOP_K * LORA_RANK))
+  effective_route_qlen="${logical_qlen}"
+  if [[ -n "${KT_ARM_SFT_TOKEN_CHUNK_SIZE}" ]]; then
+    positive_int "KT_ARM_SFT_TOKEN_CHUNK_SIZE" "${KT_ARM_SFT_TOKEN_CHUNK_SIZE}"
+    if [[ "${KT_ARM_SFT_TOKEN_CHUNK_SIZE}" -lt "${logical_qlen}" ]]; then
+      effective_route_qlen="${KT_ARM_SFT_TOKEN_CHUNK_SIZE}"
+    fi
+  fi
+  route_rank_work=$((effective_route_qlen * KT_ARM_SFT_TOP_K * LORA_RANK))
   limit="$(kt_arm_route_rank_limit)"
   if [[ -n "${limit}" && "${route_rank_work}" -gt "${limit}" ]]; then
-    die "BACKEND=kt_armbf16 route-rank work ${route_rank_work} exceeds KT_ARM_SFT_MAX_ROUTE_RANK_WORK=${limit}; reduce batch/seq/rank, raise the explicit limit, or set KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK=1 only for validation"
+    die "BACKEND=kt_armbf16 route-rank work ${route_rank_work} exceeds KT_ARM_SFT_MAX_ROUTE_RANK_WORK=${limit}; reduce batch/seq/rank, set KT_ARM_SFT_TOKEN_CHUNK_SIZE, raise the explicit limit, or set KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK=1 only for validation"
   fi
 }
 
@@ -1086,6 +1157,8 @@ while (($#)); do
     --kt-arm-omp-proc-bind=*) KT_ARM_OMP_PROC_BIND="${1#*=}"; shift ;;
     --kt-arm-omp-places) need_value "$1" "${2-}"; KT_ARM_OMP_PLACES="$2"; shift 2 ;;
     --kt-arm-omp-places=*) KT_ARM_OMP_PLACES="${1#*=}"; shift ;;
+    --kt-arm-sft-token-chunk-size) need_value "$1" "${2-}"; KT_ARM_SFT_TOKEN_CHUNK_SIZE="$2"; shift 2 ;;
+    --kt-arm-sft-token-chunk-size=*) KT_ARM_SFT_TOKEN_CHUNK_SIZE="${1#*=}"; shift ;;
     --kt-share-backward-bb) need_value "$1" "${2-}"; KT_SHARE_BACKWARD_BB="$(bool_value "$2")"; shift 2 ;;
     --kt-share-backward-bb=*) KT_SHARE_BACKWARD_BB="$(bool_value "${1#*=}")"; shift ;;
     --kt-num-gpu-experts) need_value "$1" "${2-}"; KT_NUM_GPU_EXPERTS="$2"; shift 2 ;;
@@ -1230,6 +1303,7 @@ if [[ "${selected_has_kt}" == "true" ]]; then
   [[ -z "${KT_THREADPOOL_COUNT}" ]] || positive_int "--kt-threadpool-count" "${KT_THREADPOOL_COUNT}"
   positive_int "--kt-max-cache-depth" "${KT_MAX_CACHE_DEPTH}"
   positive_int "--kt-arm-omp-num-threads" "${KT_ARM_OMP_NUM_THREADS}"
+  [[ -z "${KT_ARM_SFT_TOKEN_CHUNK_SIZE}" ]] || positive_int "--kt-arm-sft-token-chunk-size" "${KT_ARM_SFT_TOKEN_CHUNK_SIZE}"
   [[ -z "${KT_NUM_GPU_EXPERTS}" ]] || nonnegative_int "--kt-num-gpu-experts" "${KT_NUM_GPU_EXPERTS}"
   [[ -z "${KT_LORA_EXPERT_NUM}" ]] || positive_int "--kt-lora-expert-num" "${KT_LORA_EXPERT_NUM}"
   [[ -z "${KT_LORA_EXPERT_INTERMEDIATE_SIZE}" ]] || positive_int "--kt-lora-expert-intermediate-size" "${KT_LORA_EXPERT_INTERMEDIATE_SIZE}"
@@ -1631,6 +1705,7 @@ run_job() {
       KT_ARM_OMP_PROC_BIND="${KT_ARM_OMP_PROC_BIND}"
       KT_ARM_OMP_PLACES="${KT_ARM_OMP_PLACES}"
       KT_ARM_SFT_TOP_K="${KT_ARM_SFT_TOP_K}"
+      KT_ARM_SFT_TOKEN_CHUNK_SIZE="${KT_ARM_SFT_TOKEN_CHUNK_SIZE}"
       KT_ARM_SFT_MAX_ROUTE_RANK_WORK="${KT_ARM_SFT_MAX_ROUTE_RANK_WORK}"
       KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK="${KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK}"
       KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK="${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK}"

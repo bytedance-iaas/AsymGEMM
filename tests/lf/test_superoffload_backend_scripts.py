@@ -200,11 +200,18 @@ def test_run_lf_lora_sft_rejects_kt_arm_gradient_accumulation() -> None:
     assert "requires GRADIENT_ACCUMULATION_STEPS=1" in result.stderr
 
 
-def test_run_lf_lora_sft_rejects_kt_arm_max_grad_norm() -> None:
-    result = _run_lf_launcher_expect_failure({"BACKEND": "kt_armbf16", "MAX_GRAD_NORM": "1.0"})
+def test_run_lf_lora_sft_allows_kt_arm_max_grad_norm_before_route_rank_guard() -> None:
+    result = _run_lf_launcher_expect_failure(
+        {
+            "BACKEND": "kt_armbf16",
+            "MAX_GRAD_NORM": "1.0",
+            "KT_ARM_SFT_MAX_ROUTE_RANK_WORK": "1",
+        }
+    )
 
-    assert result.returncode == 1
-    assert "requires MAX_GRAD_NORM=0" in result.stderr
+    assert result.returncode == 2
+    assert "route-rank work" in result.stderr
+    assert "MAX_GRAD_NORM=0" not in result.stderr
 
 
 def test_run_lf_lora_sft_rejects_kt_arm_route_rank_limit() -> None:
@@ -586,10 +593,24 @@ def test_run_lf_lora_sft_kt_arm_profile_env_records_shape_and_triton_cache(tmp_p
                 "    'ASYM_GEMM_LF_REQUIRE_KT_FUSED_LORA_STARTUP',",
                 "    'ASYM_GEMM_LF_CONFIG_KT_REQUIRE_STARTUP',",
                 "    'ASYM_GEMM_LF_CONFIG_KT_REQUIRE_FUSED_LORA_STARTUP',",
+                "    'ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_TOP_K',",
                 "    'ASYM_GEMM_LF_CONFIG_KT_ARM_LOGICAL_QLEN',",
+                "    'ASYM_GEMM_LF_CONFIG_KT_ARM_EFFECTIVE_ROUTE_QLEN',",
+                "    'ASYM_GEMM_LF_CONFIG_KT_ARM_TOKEN_CHUNKS',",
                 "    'ASYM_GEMM_LF_CONFIG_KT_ARM_ROUTE_RANK_WORK',",
+                "    'ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_TOKEN_CHUNK_SIZE',",
                 "    'ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_MAX_ROUTE_RANK_WORK',",
+                "    'ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_BACKWARD_THREADS',",
+                "    'ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES',",
                 "    'ASYM_GEMM_LF_CONFIG_KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK',",
+                "    'ASYM_GEMM_LF_CONFIG_KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH',",
+                "    'KT_ARM_SFT_TOP_K',",
+                "    'KT_ARM_SFT_TOKEN_CHUNK_SIZE',",
+                "    'KT_ARM_SFT_MAX_ROUTE_RANK_WORK',",
+                "    'KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK',",
+                "    'KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK',",
+                "    'KT_ARM_SFT_BACKWARD_THREADS',",
+                "    'KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES',",
                 "]",
                 "with open(path, 'w', encoding='utf-8') as handle:",
                 "    json.dump({key: os.environ.get(key) for key in keys}, handle, sort_keys=True)",
@@ -656,6 +677,7 @@ def test_run_lf_lora_sft_kt_arm_profile_env_records_shape_and_triton_cache(tmp_p
             "MAX_SAMPLES": "1",
             "MAX_STEPS": "1",
             "PER_DEVICE_TRAIN_BATCH_SIZE": "2",
+            "KT_ARM_SFT_TOKEN_CHUNK_SIZE": "128",
             "LORA_RANK": "8",
             "LORA_ALPHA": "16",
             "LORA_DROPOUT": "0.00",
@@ -678,10 +700,24 @@ def test_run_lf_lora_sft_kt_arm_profile_env_records_shape_and_triton_cache(tmp_p
     assert child_env["ASYM_GEMM_LF_REQUIRE_KT_FUSED_LORA_STARTUP"] == "0"
     assert child_env["ASYM_GEMM_LF_CONFIG_KT_REQUIRE_STARTUP"] == "1"
     assert child_env["ASYM_GEMM_LF_CONFIG_KT_REQUIRE_FUSED_LORA_STARTUP"] == "0"
+    assert child_env["ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_TOP_K"] == "8"
     assert child_env["ASYM_GEMM_LF_CONFIG_KT_ARM_LOGICAL_QLEN"] == "256"
-    assert child_env["ASYM_GEMM_LF_CONFIG_KT_ARM_ROUTE_RANK_WORK"] == str(256 * 8 * 8)
+    assert child_env["ASYM_GEMM_LF_CONFIG_KT_ARM_EFFECTIVE_ROUTE_QLEN"] == "128"
+    assert child_env["ASYM_GEMM_LF_CONFIG_KT_ARM_TOKEN_CHUNKS"] == "2"
+    assert child_env["ASYM_GEMM_LF_CONFIG_KT_ARM_ROUTE_RANK_WORK"] == str(128 * 8 * 8)
+    assert child_env["ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_TOKEN_CHUNK_SIZE"] == "128"
     assert child_env["ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_MAX_ROUTE_RANK_WORK"] == "1048576"
+    assert child_env["ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_BACKWARD_THREADS"] == ""
+    assert child_env["ASYM_GEMM_LF_CONFIG_KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES"] == "34359738368"
     assert child_env["ASYM_GEMM_LF_CONFIG_KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK"] == "0"
+    assert child_env["ASYM_GEMM_LF_CONFIG_KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH"] == "0"
+    assert child_env["KT_ARM_SFT_TOP_K"] == "8"
+    assert child_env["KT_ARM_SFT_TOKEN_CHUNK_SIZE"] == "128"
+    assert child_env["KT_ARM_SFT_MAX_ROUTE_RANK_WORK"] == "1048576"
+    assert child_env["KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK"] == "1048576"
+    assert child_env["KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK"] == "0"
+    assert child_env["KT_ARM_SFT_BACKWARD_THREADS"] is None
+    assert child_env["KT_ARM_SFT_MAX_BACKWARD_SCRATCH_BYTES"] == "34359738368"
     assert child_env["TRITON_CACHE_DIR"] == str(tmp_path / "tmp" / "asymgemm_triton_cache" / "unit_kt_env")
 
 
@@ -746,6 +782,8 @@ def test_profile_lora_lf_skips_kt_arm_nsys_without_source_ok(tmp_path: Path) -> 
             "Qwen/Qwen3-30B-A3B|1",
             "--output-root",
             str(output_root),
+            "--kt-arm-sft-token-chunk-size",
+            "2048",
         ],
         env={
             "LF_DIR": str(lf_dir),
@@ -779,6 +817,8 @@ def test_profile_lora_lf_skips_kt_arm_nsys_without_matching_source_profile(tmp_p
             "Qwen/Qwen3-30B-A3B|1",
             "--output-root",
             str(output_root),
+            "--kt-arm-sft-token-chunk-size",
+            "2048",
         ],
         env={
             "LF_DIR": str(lf_dir),
@@ -845,6 +885,52 @@ def test_profile_lora_lf_dry_run_rejects_kt_arm_large_route_rank(tmp_path: Path)
     assert not list(output_root.rglob("command.txt"))
 
 
+def test_profile_lora_lf_dry_run_allows_kt_arm_large_route_rank_with_token_chunk(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    output_root = tmp_path / "dryrun"
+
+    result = subprocess.run(
+        [
+            "scripts/lf/profile_lora_lf.sh",
+            "--model-specs",
+            "Qwen/Qwen3-30B-A3B|1",
+            "--output-root",
+            str(output_root),
+            "--kt-arm-sft-token-chunk-size",
+            "2048",
+        ],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "ROOT": str(ROOT),
+            "ASYM_DIR": str(ROOT),
+            "LF_DIR": str(lf_dir),
+            "BACKEND_SPECS": "kt_armbf16|recomp",
+            "GPU_POOL": "0",
+            "PROFILERS": "source",
+            "SEQ_LENS": "7168",
+            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
+            "LORA_RANK": "64",
+            "MAX_STEPS": "1",
+            "WARMUP_STEPS": "0",
+            "PREPARE_DATASETS": "false",
+            "DRY_RUN": "true",
+            "LORA_DROPOUT": "0.00",
+            "EXPERT_POLICIES": "none",
+            "PLOT": "false",
+            "PLOT_MEMORY_BREAKDOWN": "false",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    command_files = list(output_root.rglob("command.txt"))
+    assert command_files
+    assert "KT_ARM_SFT_TOKEN_CHUNK_SIZE=2048" in command_files[0].read_text(encoding="utf-8")
+
+
 def test_profile_lora_lf_rejects_stale_kt_profile_missing_update_health(tmp_path: Path) -> None:
     profile = tmp_path / "profile.json"
     profile.write_text(
@@ -868,6 +954,70 @@ def test_profile_lora_lf_rejects_stale_kt_profile_missing_update_health(tmp_path
                 "set -Eeuo pipefail",
                 "eval \"$(awk '/^existing_profile_complete\\(\\)/,/^kt_arm_route_rank_limit\\(\\)/ { if ($0 !~ /^kt_arm_route_rank_limit\\(\\)/) print }' scripts/lf/profile_lora_lf.sh)\"",
                 "existing_profile_complete \"$1\"",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bash", str(check_script), str(profile)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+
+
+def test_profile_lora_lf_rejects_kt_arm_profile_token_chunk_mismatch(tmp_path: Path) -> None:
+    profile = tmp_path / "profile.json"
+    profile.write_text(
+        json.dumps(
+            {
+                "config": {
+                    "backend": "kt_armbf16",
+                    "seq_len": 7168,
+                    "model_name_or_path": "Qwen/Qwen3-30B-A3B",
+                    "lora_target": "all",
+                    "per_device_train_batch_size": 4,
+                    "lora_rank": 64,
+                    "lora_dropout": 0.0,
+                    "kt_arm_sft_top_k": 8,
+                    "kt_arm_sft_token_chunk_size": 1024,
+                    "kt_arm_effective_route_qlen": 1024,
+                    "kt_arm_token_chunks": 28,
+                    "kt_arm_route_rank_work": 524288,
+                    "kt_arm_sft_max_route_rank_work": 1048576,
+                },
+                "heartbeat": {"latest": {"stage": "source_profile_written"}},
+                "kt": {"wrapper_count": 48, "total_forward_calls": 96, "total_backward_calls": 48},
+                "lora": {"kt_fused_expert_lora_parameters": 8},
+                "optimizer_memory_preflight": {"available": True},
+                "optimizer_memory": {"kt_lora_update_health": {"available": True, "passed": True}},
+                "trainable_surface": {"surface": "attention+expert LoRA"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    check_script = tmp_path / "check_existing_profile.sh"
+    check_script.write_text(
+        "\n".join(
+            [
+                "set -Eeuo pipefail",
+                f"ENV_PYTHON={sys.executable!r}",
+                "PER_DEVICE_TRAIN_BATCH_SIZE=4",
+                "LORA_RANK=64",
+                "LORA_DROPOUT=0.00",
+                "KT_ARM_SFT_TOP_K=8",
+                "KT_ARM_SFT_TOKEN_CHUNK_SIZE=2048",
+                "KT_ARM_SFT_MAX_ROUTE_RANK_WORK=",
+                "KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK=1048576",
+                "KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK=0",
+                "eval \"$(awk '/^existing_profile_complete\\(\\)/,/^kt_arm_route_rank_limit\\(\\)/ { if ($0 !~ /^kt_arm_route_rank_limit\\(\\)/) print }' scripts/lf/profile_lora_lf.sh)\"",
+                "existing_profile_complete \"$1\" kt_armbf16 7168 Qwen/Qwen3-30B-A3B all",
                 "",
             ]
         ),

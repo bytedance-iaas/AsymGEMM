@@ -30,6 +30,7 @@ def _write_source_profile(
     kt: dict,
     lora: dict,
     trainer_log: Path | None = None,
+    grad_clip: dict | None = None,
     optimizer_memory: dict | None = None,
     optimizer_memory_preflight: dict | None = None,
     process_memory: dict | None = None,
@@ -54,6 +55,7 @@ def _write_source_profile(
                 "stage_memory": {"rows": stage_memory_rows or []},
                 "kt": kt,
                 "lora": lora,
+                "grad_clip": grad_clip or {},
                 "optimizer_memory_preflight": optimizer_memory_preflight or {},
                 "optimizer_memory": optimizer_memory or {},
             }
@@ -126,7 +128,7 @@ def test_kt_counters_include_native_cache_observability() -> None:
         _cache_depth=1,
         max_cache_depth=2,
         _max_cache_depth_observed=2,
-        _buffer=SimpleNamespace(qlen=4096),
+        _buffer=SimpleNamespace(qlen=4096, capacity_bytes=lambda: 123456),
         _buffer_allocation_count=2,
         cache_stack_depth=1,
         max_cache_stack_depth_observed=2,
@@ -147,6 +149,7 @@ def test_kt_counters_include_native_cache_observability() -> None:
     row = counters["rows"][0]
     assert row["staging_buffer_scope"] == "wrapper"
     assert row["staging_buffer_capacity_qlen"] == 4096
+    assert row["staging_buffer_capacity_bytes"] == 123456
     assert row["staging_buffer_allocation_count"] == 2
     assert row["native_cache_stack_depth"] == 1
     assert row["native_max_cache_stack_depth_observed"] == 2
@@ -459,7 +462,19 @@ def test_kt_optimizer_memory_preflight_estimates_adamw_policies() -> None:
         "kt_fused_expert_lora_parameters": 6,
     }
 
-    preflight = module._kt_optimizer_memory_preflight(lora, {"logical_qlen": 256, "lora_rank": 8})
+    preflight = module._kt_optimizer_memory_preflight(
+        lora,
+        {
+            "logical_qlen": 256,
+            "lora_rank": 8,
+            "kt_arm_sft_top_k": 8,
+            "kt_arm_sft_token_chunk_size": 128,
+            "kt_arm_effective_route_qlen": 128,
+            "kt_arm_token_chunks": 2,
+            "kt_arm_route_rank_work": 8192,
+            "kt_arm_sft_max_route_rank_work": 1048576,
+        },
+    )
 
     assert preflight["available"] is True
     assert preflight["trainable_parameters"] == 10
@@ -474,6 +489,12 @@ def test_kt_optimizer_memory_preflight_estimates_adamw_policies() -> None:
     assert preflight["total_bf16_params_grads_adamw_fp32_moments_master_bytes"] == 160
     assert preflight["logical_qlen"] == 256
     assert preflight["lora_rank"] == 8
+    assert preflight["kt_arm_sft_top_k"] == 8
+    assert preflight["kt_arm_sft_token_chunk_size"] == 128
+    assert preflight["kt_arm_effective_route_qlen"] == 128
+    assert preflight["kt_arm_token_chunks"] == 2
+    assert preflight["kt_arm_route_rank_work"] == 8192
+    assert preflight["kt_arm_sft_max_route_rank_work"] == 1048576
 
 
 def test_kt_optimizer_memory_preflight_rejects_missing_trainable_counter() -> None:
@@ -494,6 +515,58 @@ def test_process_memory_snapshot_reports_rss_when_procfs_available() -> None:
     if snapshot["available"]:
         assert snapshot["rss_bytes"] > 0
         assert snapshot["virtual_memory_bytes"] >= snapshot["rss_bytes"]
+
+
+def test_grad_clip_hook_records_kt_summary(monkeypatch) -> None:
+    module = _load_profile_launcher_module()
+    events: list[tuple[str, dict]] = []
+    writes: list[tuple[str, dict | None]] = []
+
+    class DummyHeartbeat:
+        def emit(self, stage: str, **fields) -> None:
+            events.append((stage, fields))
+
+    class DummyPartialWriter:
+        def write(self, reason: str, *, force: bool = False, extra: dict | None = None) -> None:
+            writes.append((reason, extra))
+
+    class DummyTrainer:
+        def __init__(self) -> None:
+            self.state = SimpleNamespace(global_step=5)
+
+        def train(self, *args, **kwargs):
+            return None
+
+        def training_step(self, model, inputs, *args, **kwargs):
+            return torch.tensor(0.0)
+
+        def _clip_grad_norm(self, model):
+            self._kt_grad_clip_last_summary = {
+                "path": "kt_aware_dense",
+                "operation": "clip",
+                "total_norm": 4.0,
+                "clip_coef": 0.5,
+                "clipped": True,
+                "cpu_grad_tensors": 2,
+                "cpu_grad_numel": 16,
+            }
+            return torch.tensor(4.0)
+
+    fake_transformers = ModuleType("transformers")
+    fake_transformers.Trainer = DummyTrainer
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    module._GRAD_CLIP_MARKER = {}
+    module._install_trainer_heartbeat_hooks(DummyHeartbeat(), DummyPartialWriter())
+
+    result = DummyTrainer()._clip_grad_norm(torch.nn.Linear(1, 1))
+
+    assert float(result) == 4.0
+    assert [stage for stage, _ in events] == ["grad_clip_start", "grad_clip_end"]
+    assert [reason for reason, _ in writes] == ["grad_clip_start", "grad_clip_end"]
+    assert module._GRAD_CLIP_MARKER["path"] == "kt_aware_dense"
+    assert module._GRAD_CLIP_MARKER["operation"] == "clip"
+    assert module._GRAD_CLIP_MARKER["cpu_grad_numel"] == 16
 
 
 def test_optimizer_step_hook_brackets_rss_around_original_step(monkeypatch) -> None:
@@ -921,6 +994,65 @@ def test_source_summary_and_csv_include_kt_lora_update_health(tmp_path: Path) ->
     assert "all nonzero-gradient fused LoRA tensors changed after optimizer step" in csv_text
 
 
+def test_source_profile_with_profile_json_does_not_overwrite_source_csvs(tmp_path: Path) -> None:
+    source_profile = tmp_path / "source_profile.json"
+    output_dir = tmp_path / "out"
+    profile_json = output_dir / "profile.json"
+    _write_source_profile(
+        source_profile,
+        kt={"available": True, "wrapper_count": 1, "total_forward_calls": 2, "total_backward_calls": 1},
+        lora={
+            "available": True,
+            "trainable_parameters": 10,
+            "peft_lora_parameters": 4,
+            "lf_fused_expert_lora_parameters": 0,
+            "kt_expert_lora_parameters": 6,
+            "kt_peft_expert_lora_parameters": 1,
+            "kt_fused_expert_lora_parameters": 6,
+        },
+        optimizer_memory={
+            "kt_lora_update_health": {
+                "available": True,
+                "sampled_tensors": 1,
+                "total_fused_tensors": 1,
+                "after_sampled_tensors": 1,
+                "after_total_fused_tensors": 1,
+                "compared_tensors": 1,
+                "grad_nonzero_tensors": 1,
+                "rows": [
+                    {
+                        "layer_idx": 0,
+                        "param_index": 0,
+                        "grad_nonzero_before_step": True,
+                        "param_changed_after_step": True,
+                    }
+                ],
+            }
+        },
+    )
+
+    subprocess.run(
+        [
+            sys.executable,
+            "scripts/lf/postprocess_lf_profile_artifacts.py",
+            "--source-profile-json",
+            str(source_profile),
+            "--profile-json",
+            str(profile_json),
+            "--output-dir",
+            str(output_dir),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+
+    assert "attention+expert LoRA" in (output_dir / "trainable_surface.csv").read_text(encoding="utf-8")
+    health_csv = (output_dir / "kt_lora_update_health.csv").read_text(encoding="utf-8")
+    assert "True" in health_csv
+    assert "no sampled fused LoRA tensors were comparable" not in health_csv
+    assert "nonzero-gradient fused LoRA tensors changed after optimizer step" in health_csv
+
+
 def test_source_summary_recomputes_stale_kt_lora_update_health_fail_closed(tmp_path: Path) -> None:
     output_dir = _run_postprocess_output_with_optimizer_memory(
         tmp_path,
@@ -1028,6 +1160,12 @@ def test_source_summary_and_csv_include_optimizer_memory_preflight(tmp_path: Pat
             "assumed_param_dtype": "bf16",
             "logical_qlen": 256,
             "lora_rank": 8,
+            "kt_arm_sft_top_k": 8,
+            "kt_arm_sft_token_chunk_size": 128,
+            "kt_arm_effective_route_qlen": 128,
+            "kt_arm_token_chunks": 2,
+            "kt_arm_route_rank_work": 8192,
+            "kt_arm_sft_max_route_rank_work": 1048576,
             "trainable_parameters": 10,
             "kt_fused_expert_lora_parameters": 6,
             "kt_expert_lora_parameters": 6,
@@ -1052,9 +1190,63 @@ def test_source_summary_and_csv_include_optimizer_memory_preflight(tmp_path: Pat
     assert "| assumed param dtype | bf16 |" in summary
     assert "| logical qlen | 256 |" in summary
     assert "| LoRA rank | 8 |" in summary
+    assert "| KT ARM token chunk size | 128 |" in summary
+    assert "| KT ARM route-rank work | 8192 |" in summary
     assert "| non-expert PEFT LoRA params | 3 |" in summary
+    assert "kt_arm_sft_token_chunk_size" in csv_text
     assert "| total with FP32 moments + master bytes | 160 |" in summary
     assert "lora_counters_pre_optimizer_step" in csv_text
+
+
+def test_source_summary_and_csv_include_grad_clip(tmp_path: Path) -> None:
+    source_profile = tmp_path / "source_profile.json"
+    output_dir = tmp_path / "out"
+    _write_source_profile(
+        source_profile,
+        kt={"available": True, "wrapper_count": 1, "total_forward_calls": 0, "total_backward_calls": 0},
+        lora={"available": True, "trainable_parameters": 10},
+        grad_clip={
+            "available": True,
+            "path": "kt_aware_dense",
+            "operation": "norm_only",
+            "method": "CustomSeq2SeqTrainer._get_grad_norm",
+            "max_norm": "inf",
+            "total_norm": 7.5,
+            "result_norm": 7.5,
+            "clip_coef": 1.0,
+            "clipped": False,
+            "nonfinite": False,
+            "elapsed_ms": 12.25,
+            "unique_grad_tensors": 4,
+            "duplicate_grad_tensors": 1,
+            "cpu_grad_tensors": 3,
+            "cpu_grad_numel": 128,
+            "cuda_grad_tensors": 1,
+            "cuda_grad_numel": 16,
+            "chunk_elements": 1024,
+        },
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "scripts/lf/postprocess_lf_profile_artifacts.py",
+            "--source-profile-json",
+            str(source_profile),
+            "--output-dir",
+            str(output_dir),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+
+    summary = (output_dir / "summary.md").read_text(encoding="utf-8")
+    csv_text = (output_dir / "grad_clip.csv").read_text(encoding="utf-8")
+    assert "## Gradient Clipping" in summary
+    assert "| path | kt_aware_dense |" in summary
+    assert "| operation | norm_only |" in summary
+    assert "| CPU grad elements | 128 |" in summary
+    assert "cpu_grad_numel" in csv_text
+    assert "kt_aware_dense" in csv_text
 
 
 def test_source_summary_and_csv_include_process_memory(tmp_path: Path) -> None:
