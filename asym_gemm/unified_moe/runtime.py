@@ -536,20 +536,31 @@ class Layer:
 
         out_fp32 = torch.zeros((T, H), dtype=torch.float32, device=in_device)
 
-        # ---- CPU bucket (unchanged from v1) ----
+        # ---- CPU bucket: all experts in one worker-pool job ----
         if cpu_experts:
             x_cpu_bf16 = x_bf16.to("cpu", dtype=torch.bfloat16).contiguous()
             x_bits_all = torch_bf16_to_np_bits(x_cpu_bf16)
             route_w_cpu = route_w.to("cpu", dtype=torch.float32).numpy()
+            slab = self.slab
+
+            rows_cat  = np.concatenate([per_expert[e] for e in cpu_experts])
+            slots_cat = np.concatenate([per_expert_slot[e] for e in cpu_experts])
+            m_offsets = np.zeros(len(cpu_experts) + 1, dtype=np.int64)
+            np.cumsum([len(per_expert[e]) for e in cpu_experts], out=m_offsets[1:])
+
+            x_cat = np.ascontiguousarray(x_bits_all[rows_cat])
+            out_cat = np.empty((rows_cat.shape[0], H), dtype=np.float32)
+            _C.moe_expert_forward_batch(
+                self.rt, x_cat, m_offsets,
+                [slab.gate_packed[e].arr for e in cpu_experts],
+                [slab.up_packed[e].arr for e in cpu_experts],
+                [slab.down_packed[e].arr for e in cpu_experts],
+                out_cat, slab.inter, slab.hidden,
+            )
 
             cpu_out = np.zeros((T, H), dtype=np.float32)
-            for e in cpu_experts:
-                rows  = per_expert[e]
-                slots = per_expert_slot[e]
-                gathered = np.ascontiguousarray(x_bits_all[rows])
-                y = self._cpu_expert_forward(e, gathered)
-                w = route_w_cpu[rows, slots][:, None]
-                np.add.at(cpu_out, rows, y * w)
+            w = route_w_cpu[rows_cat, slots_cat][:, None]
+            np.add.at(cpu_out, rows_cat, out_cat * w)
             out_fp32 += torch.from_numpy(cpu_out).to(in_device, non_blocking=True)
 
         # ---- GPU bucket (grouped INT8 over pinned weights) ----
