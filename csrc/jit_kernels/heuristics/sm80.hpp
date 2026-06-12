@@ -83,7 +83,7 @@ inline SM80GemmConfig select_sm80_config(int arch_major, int arch_minor, int N, 
 inline int smem_bytes_fp8(uint32_t block_m, uint32_t block_n, uint32_t block_k) {
     return static_cast<int>((block_m + block_n) * block_k          // sX+sW: FP8
                             + block_m * block_n * 2                // sO: BF16
-                            + block_m * 4);                        // smem_sa: per-token scales
+                            + block_m * 8);                        // smem_sa + smem_rcs
 }
 
 // Max BLOCK_K for the FP8 kernel given the arch's smem limit.
@@ -94,12 +94,17 @@ inline int max_block_k_fp8(int arch_major, int arch_minor) {
 
 // Config selector for the FP8 kernel.
 // BLOCK_K min = 32 (SM89 FP8 MMA K-atom = 32, must be a multiple of 32).
+// block_scale: 1x128/128x128 block-scale mode — BLOCK_K is capped at 128 so a
+// K-tile never straddles a scale k-group (128 % BLOCK_K == 0 for 128/64/32).
 inline SM80GemmConfig select_sm80_fp8_config(int arch_major, int arch_minor,
-                                             int N, int K) {
+                                             int N, int K,
+                                             bool block_scale = false) {
     const int smem_cap = smem_limit(arch_major, arch_minor);
 
     // Start at arch max, halve until K is divisible; floor at 32
     uint32_t block_k = static_cast<uint32_t>(max_block_k_fp8(arch_major, arch_minor));
+    if (block_scale)
+        block_k = 128u;
     while (block_k > 32u && K % static_cast<int>(block_k) != 0)
         block_k /= 2u;
 

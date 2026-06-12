@@ -527,6 +527,32 @@ static void m_grouped_moe_gemm_nt_contiguous(
         element_type_str);
 }
 
+// Validate block-scale tensors shared by the contiguous and masked SM89 APIs.
+// rows: total_tokens (contiguous) or num_groups * M_max (masked).
+static void check_sm89_block_scales(
+    const std::optional<torch::Tensor>& scale_a_block,
+    const std::optional<torch::Tensor>& scale_b_block,
+    const std::optional<torch::Tensor>& scale_a_tensor,
+    const std::optional<torch::Tensor>& scale_b_tensor,
+    int64_t rows, int64_t num_experts, int64_t N, int64_t K)
+{
+    DG_HOST_ASSERT(scale_a_block.has_value() == scale_b_block.has_value());
+    if (!scale_a_block.has_value())
+        return;
+    DG_HOST_ASSERT(!scale_a_tensor.has_value() && !scale_b_tensor.has_value());
+
+    const int64_t kg = (K + 127) / 128;
+    const int64_t ng = (N + 127) / 128;
+    const auto& sa = *scale_a_block;
+    const auto& sb = *scale_b_block;
+    DG_HOST_ASSERT(sa.is_cuda() && sa.is_contiguous());
+    DG_HOST_ASSERT(sb.is_cuda() && sb.is_contiguous());
+    DG_HOST_ASSERT(sa.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(sb.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(sa.numel() == rows * kg);
+    DG_HOST_ASSERT(sb.numel() == num_experts * ng * kg);
+}
+
 static void m_grouped_fp8_asym_gemm_sm89(
     const torch::Tensor& a,        // [total_tokens, K]   float8_e4m3fn  (HBM)
     const torch::Tensor& b,        // [num_experts, N, K] float8_e4m3fn  (CPU pinned or HBM)
@@ -537,7 +563,9 @@ static void m_grouped_fp8_asym_gemm_sm89(
     const float&         scale_a,
     const float&         scale_b,
     const std::optional<torch::Tensor>& scale_a_tensor = std::nullopt,
-    const std::optional<torch::Tensor>& scale_b_tensor = std::nullopt)
+    const std::optional<torch::Tensor>& scale_b_tensor = std::nullopt,
+    const std::optional<torch::Tensor>& scale_a_block = std::nullopt,  // [total_tokens, ceil(K/128)] f32
+    const std::optional<torch::Tensor>& scale_b_block = std::nullopt)  // [num_experts, ceil(N/128), ceil(K/128)] f32
 {
     DG_HOST_ASSERT(a.dim() == 2 && b.dim() == 3 && d.dim() == 2);
 
@@ -562,6 +590,10 @@ static void m_grouped_fp8_asym_gemm_sm89(
     DG_HOST_ASSERT(experts.scalar_type() == torch::kInt32);
     DG_HOST_ASSERT(offsets.numel() >= list_size && experts.numel() >= list_size);
 
+    check_sm89_block_scales(scale_a_block, scale_b_block,
+                            scale_a_tensor, scale_b_tensor,
+                            total_tokens, num_experts, N, K);
+
     if (total_tokens == 0 || N == 0 || K == 0) return;
 
     DG_HOST_ASSERT(K % 32 == 0 && K >= 32);   // SM89 FP8 MMA K-atom = 32
@@ -573,7 +605,8 @@ static void m_grouped_fp8_asym_gemm_sm89(
         static_cast<int32_t>(num_experts),
         static_cast<int32_t>(list_size),
         scale_a, scale_b,
-        scale_a_tensor, scale_b_tensor);
+        scale_a_tensor, scale_b_tensor,
+        scale_a_block, scale_b_block);
 }
 
 static void m_grouped_fp8_asym_gemm_sm89_masked(
@@ -585,7 +618,9 @@ static void m_grouped_fp8_asym_gemm_sm89_masked(
     const float&         scale_a,
     const float&         scale_b,
     const std::optional<torch::Tensor>& scale_a_tensor = std::nullopt,
-    const std::optional<torch::Tensor>& scale_b_tensor = std::nullopt)
+    const std::optional<torch::Tensor>& scale_b_tensor = std::nullopt,
+    const std::optional<torch::Tensor>& scale_a_block = std::nullopt,  // [num_groups, M_max, ceil(K/128)] f32
+    const std::optional<torch::Tensor>& scale_b_block = std::nullopt)  // [num_groups, ceil(N/128), ceil(K/128)] f32
 {
     DG_HOST_ASSERT(a.dim() == 3 && b.dim() == 3 && d.dim() == 3);
 
@@ -608,6 +643,10 @@ static void m_grouped_fp8_asym_gemm_sm89_masked(
     DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt32);
     DG_HOST_ASSERT(masked_m.numel() == num_groups);
 
+    check_sm89_block_scales(scale_a_block, scale_b_block,
+                            scale_a_tensor, scale_b_tensor,
+                            num_groups * M_max, num_groups, N, K);
+
     if (M_max == 0 || N == 0 || K == 0 || expected_m == 0) return;
 
     DG_HOST_ASSERT(K % 32 == 0 && K >= 32);
@@ -618,7 +657,8 @@ static void m_grouped_fp8_asym_gemm_sm89_masked(
         M_max, N, K,
         static_cast<int32_t>(num_groups),
         scale_a, scale_b,
-        scale_a_tensor, scale_b_tensor);
+        scale_a_tensor, scale_b_tensor,
+        scale_a_block, scale_b_block);
 }
 
 static void register_apis(pybind11::module_& m) {
@@ -693,6 +733,8 @@ static void register_apis(pybind11::module_& m) {
                               const torch::Tensor&, const torch::Tensor&,
                               const int&, const float&, const float&,
                               const std::optional<torch::Tensor>&,
+                              const std::optional<torch::Tensor>&,
+                              const std::optional<torch::Tensor>&,
                               const std::optional<torch::Tensor>&)>(
               &m_grouped_fp8_asym_gemm_sm89_masked),
           py::arg("a"), py::arg("b"), py::arg("d"),
@@ -700,7 +742,9 @@ static void register_apis(pybind11::module_& m) {
           py::arg("scale_a") = 1.0f,
           py::arg("scale_b") = 1.0f,
           py::arg("scale_a_tensor") = py::none(),
-          py::arg("scale_b_tensor") = py::none());
+          py::arg("scale_b_tensor") = py::none(),
+          py::arg("scale_a_block") = py::none(),
+          py::arg("scale_b_block") = py::none());
 
     // SM89 FP8 MoE GEMM (native FP8 MMA, K-outer M-inner, W may be CPU-pinned)
     m.def("m_grouped_fp8_asym_gemm_sm89",
@@ -709,6 +753,8 @@ static void register_apis(pybind11::module_& m) {
                               const torch::Tensor&, const int&,
                               const float&, const float&,
                               const std::optional<torch::Tensor>&,
+                              const std::optional<torch::Tensor>&,
+                              const std::optional<torch::Tensor>&,
                               const std::optional<torch::Tensor>&)>(
               &m_grouped_fp8_asym_gemm_sm89),
           py::arg("a"), py::arg("b"), py::arg("d"),
@@ -716,7 +762,9 @@ static void register_apis(pybind11::module_& m) {
           py::arg("scale_a") = 1.0f,
           py::arg("scale_b") = 1.0f,
           py::arg("scale_a_tensor") = py::none(),
-          py::arg("scale_b_tensor") = py::none());
+          py::arg("scale_b_tensor") = py::none(),
+          py::arg("scale_a_block") = py::none(),
+          py::arg("scale_b_block") = py::none());
 
     // SM80 MoE GEMM (FP16 + BF16, no arch guard needed: uses >= SM80 primitives)
     m.def("m_grouped_moe_gemm_nt_contiguous",
