@@ -7,7 +7,7 @@ gate_base, up_base = split(gate_up_base)                # [M,I], [M,I] Temp
 S_gate = X @ A_gate.T                                   # [M,r] HBM
 S_up   = X @ A_up.T                                     # [M,r] HBM
 
-X_cpu      = offload(X)
+X_cpu      = offload(X)                                 # [M,H] CPU
 
 LoRA_gate = scale * (S_gate @ B_gate.T)                 # [M,I] Temp
 gate = gate_base + LoRA_gate                            # [M,I] HBM
@@ -16,16 +16,16 @@ up   = up_base   + LoRA_up                              # [M,I] HBM
 
 gate_cpu   = offload(gate)                              # Can later fuse as   gate_cpu = offload(gate_base + LoRA_gate)
 up_cpu     = offload(up)                                # Can later fuse as   up_cpu   = offload(up_base   + LoRA_up)
-S_gate_cpu = offload(S_gate)                            # save for dB_gate
-S_up_cpu   = offload(S_up)                              # save for dB_up
+S_gate_cpu = offload(S_gate)                            # [M,r] CPU, save for dB_gate
+S_up_cpu   = offload(S_up)                              # [M,r] CPU, save for dB_up
 
 sig_cpu = sigmoid(gate_cpu)                           # [M, I] CPU
 silu_gate_cpu = sig_cpu * gate_cpu                    # [M, I] CPU
 act_cpu       = silu_gate_cpu * up_cpu                # [M, I] CPU
 
-S_down    = act_cpu @^^ A_down.T                      # [M, r] HBM
-LoRA_down = scale * (S_down @ B_down.T)               # [M, H] Temp
-S_down_cpu = offload(S_down)
+S_down_T  = A_down @^ act_cpu                         # [r, M] HBM, uses act_cpu.T via @^ transpose mode
+LoRA_down = scale * (S_down_T.T @ B_down.T)           # [M, H] Temp
+S_down_T_cpu = offload(S_down_T)                      # [r,M] CPU, save for dB_down
 
 act = stage(act_cpu)
 Y_down = act @^ W_down_cpu.T + LoRA_down               # [M, H] HBM
@@ -46,10 +46,10 @@ dact = dact_base + dact_lora                         # [M, I] Temp
 
 dact_cpu = offload(dact)
 
-# S_down = act_cpu @^^ A_down.T                          # [M, r] Recomp/Reuse S_down_cpu
+# S_down_T = A_down @^ act_cpu                        # [r, M] Recomp/Reuse S_down_T_cpu
 
 dA_down = dS_down.T @^ act_cpu                        # [r, I] Grad
-dB_down = scale * (dY.T @^ S_down_cpu)                    # [H, r] Grad
+dB_down = scale * (dY.T @^ S_down_T_cpu.T)            # [H, r] Grad
 
 
 # ---------------- activation backward ----------------
@@ -72,7 +72,7 @@ dX = dgate_up @^ W_gate_up_cpu                        # [M, H] HBM
 
 # ---------------- gate LoRA backward ----------------
 
-# S_gate = X_cpu @^^ A_gate.T                         # [M, r] Recomp / Reuse S_gate_cpu. Not needed.
+# S_gate = (A_gate @^ X_cpu).T                        # [M, r] Recomp / Reuse S_gate_cpu. Not needed.
 
 dS_gate      = scale * (dgate @ B_gate)               # [M, r] Temp
 dX_gate_lora = dS_gate @ A_gate                       # [M, H] Temp
@@ -84,7 +84,7 @@ dB_gate = scale * (dgate.T @^ S_gate_cpu)             # [I, r] Grad
 
 # ---------------- up LoRA backward ----------------
 
-# S_up = X_cpu @^^ A_up.T                             # [M, r] Recomp / Reuse S_up_cpu. Not needed.
+# S_up = (A_up @^ X_cpu).T                            # [M, r] Recomp / Reuse S_up_cpu. Not needed.
 
 dS_up      = scale * (dup @ B_up)                     # [M, r] Temp
 dX_up_lora = dS_up @ A_up                             # [M, H] Temp
