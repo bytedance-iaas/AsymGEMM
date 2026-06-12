@@ -70,6 +70,7 @@ MAX_SAMPLES=${MAX_SAMPLES:-128}
 # Backend checks and AsymGEMM options
 # ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-all}
+ASYMM_EXPERT_ACT_OFFLOAD=${ASYMM_EXPERT_ACT_OFFLOAD:-false}
 ASYM_STRICT=${ASYM_STRICT:-true}
 REQUIRE_SM100=${REQUIRE_SM100:-1}
 USE_ASYM_CPU_ADAMW=${USE_ASYM_CPU_ADAMW:-false}
@@ -224,6 +225,8 @@ Options:
   --profile-module-filter LIST
   --expandable-seg true|false   Set PYTORCH_CUDA_ALLOC_CONF expandable_segments for training jobs.
                                  Default ${EXPANDABLE_SEG}.
+  --asymm-expert-act-offload true|false
+                                 Enable Qwen3 routed-expert activation offload. Adds expact1/expact0 to run identities.
   --use-asym-cpu-adamw true|false
                                  Low-level forwarding control; prefer BACKEND_SPECS=asym_cpuadamwtorch|... or asym_cpuadamwds|...
   --asym-cpu-adamw-backend torch|deepspeed
@@ -333,6 +336,13 @@ bool_value() {
     1|true|yes|y|on) printf 'true\n' ;;
     0|false|no|n|off) printf 'false\n' ;;
     *) die "expected true or false, got '${1}'" ;;
+  esac
+}
+
+expact_tag() {
+  case "$(bool_value "$1")" in
+    true) printf 'expact1\n' ;;
+    false) printf 'expact0\n' ;;
   esac
 }
 
@@ -633,6 +643,7 @@ existing_profile_complete() {
   local expected_lora_target="${5:-}"
   local expected_recompute="${6:-}"
   local expected_offload_modules="${7:-}"
+  local expected_expact="${8:-}"
   local current_batch="${PER_DEVICE_TRAIN_BATCH_SIZE:-}"
   local current_lora_rank="${LORA_RANK:-}"
   local current_lora_dropout="${LORA_DROPOUT:-}"
@@ -647,7 +658,7 @@ existing_profile_complete() {
     "${expected_lora_target}" "${expected_recompute}" "${current_batch}" "${current_lora_rank}" \
     "${current_lora_dropout}" "${current_cache_depth}" "${current_top_k}" "${current_token_chunk_size}" \
     "${current_route_rank_limit}" "${current_default_route_rank_limit}" \
-    "${current_allow_unvalidated_route_rank}" "${expected_offload_modules}" <<'PY' >/dev/null 2>&1
+    "${current_allow_unvalidated_route_rank}" "${expected_offload_modules}" "${expected_expact}" <<'PY' >/dev/null 2>&1
 import json
 import math
 import sys
@@ -668,6 +679,7 @@ expected_limit = sys.argv[13]
 expected_default_limit = sys.argv[14]
 allow_unvalidated = sys.argv[15]
 expected_offload_modules = sys.argv[16]
+expected_expact = sys.argv[17]
 source_profile = profile.get("source_profile", {})
 source_profile = source_profile if isinstance(source_profile, dict) and source_profile else profile
 if profile.get("partial") is True:
@@ -724,6 +736,23 @@ if expected_offload_modules and backend in {"asym", "asym_torch", "asym_cpuadamw
         raise SystemExit(
             "profile asym_offload_modules mismatch: "
             f"expected {expected_offload_modules}, got {actual_offload or '<missing>'}"
+        )
+if expected_expact:
+    def normalize_bool(value):
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return "true"
+        if text in {"0", "false", "no", "n", "off"}:
+            return "false"
+        return ""
+    actual_expact = normalize_bool(config.get("asymm_expert_act_offload"))
+    wanted_expact = normalize_bool(expected_expact)
+    if not actual_expact:
+        raise SystemExit("profile asymm_expert_act_offload missing or invalid")
+    if actual_expact != wanted_expact:
+        raise SystemExit(
+            "profile asymm_expert_act_offload mismatch: "
+            f"expected {wanted_expact}, got {actual_expact}"
         )
 if backend == "kt_armbf16" and expected_seq_len and expected_batch and expected_rank:
     def require_int_config(key, expected):
@@ -787,11 +816,13 @@ if backend.startswith("kt_"):
     kt = source_profile.get("kt", {})
     if not isinstance(kt, dict):
         raise SystemExit("KT profile missing kt counters")
+
     def int_value(container, key):
         try:
             return int(container.get(key, 0) or 0)
         except (TypeError, ValueError):
             return 0
+
     def optional_int(value):
         if value is None or value == "":
             return None
@@ -799,6 +830,7 @@ if backend.startswith("kt_"):
             return int(value)
         except (TypeError, ValueError):
             return None
+
     def kt_lora_health_passed(health):
         if not isinstance(health, dict) or not health:
             return False, "missing KT fused LoRA update health"
@@ -829,13 +861,23 @@ if backend.startswith("kt_"):
         input_passed = health.get("passed") if "passed" in health else None
         if health.get("available") is not True:
             return False, "KT fused LoRA update health unavailable"
+        missing_snapshot_fields = [
+            key
+            for key in (
+                "after_sampled_tensors",
+                "after_total_fused_tensors",
+                "missing_after_tensors",
+                "unexpected_after_tensors",
+            )
+            if key not in health or health.get(key) in (None, "")
+        ]
+        if missing_snapshot_fields:
+            return False, "KT fused LoRA update health missing after-step snapshot fields: " + ", ".join(missing_snapshot_fields)
+        if after_sampled_tensors is None or after_total_fused_tensors is None:
+            return False, "KT fused LoRA update health has invalid after-step snapshot counts"
         if missing_after_tensors > 0 or unexpected_after_tensors > 0:
             return False, "sampled fused LoRA tensor set changed between before/after optimizer snapshots"
-        if (
-            after_sampled_tensors is not None
-            and after_total_fused_tensors is not None
-            and (sampled_tensors != after_sampled_tensors or total_fused_tensors != after_total_fused_tensors)
-        ):
+        if sampled_tensors != after_sampled_tensors or total_fused_tensors != after_total_fused_tensors:
             return False, "fused LoRA tensor counts changed between before/after optimizer snapshots"
         if exhaustive and compared_tensors != sampled_tensors:
             return False, f"exhaustive fused LoRA health compared {compared_tensors} of {sampled_tensors} tensors"
@@ -850,6 +892,21 @@ if backend.startswith("kt_"):
         if input_passed is False:
             return False, str(health.get("reason") or "input KT fused LoRA update health failed")
         return True, "all sampled nonzero-gradient fused LoRA tensors changed after optimizer step"
+
+    def optimizer_process_memory_passed(optimizer_memory):
+        if not isinstance(optimizer_memory, dict) or not optimizer_memory:
+            return False, "missing optimizer_memory"
+        for key in ("process_memory_at_start", "process_memory_before_step", "process_memory_after_step"):
+            snapshot = optimizer_memory.get(key)
+            if not isinstance(snapshot, dict) or not snapshot:
+                return False, f"missing {key}"
+            if optional_int(snapshot.get("rss_bytes")) is None:
+                return False, f"{key}.rss_bytes missing or invalid"
+        for key in ("process_rss_pre_step_overhead_delta_bytes", "process_rss_delta_bytes"):
+            if key not in optimizer_memory or optional_int(optimizer_memory.get(key)) is None:
+                return False, f"{key} missing or invalid"
+        return True, "optimizer process RSS snapshots are present"
+
     if int_value(kt, "wrapper_count") <= 0:
         raise SystemExit("KT profile has no KT wrappers")
     if int_value(kt, "total_forward_calls") <= 0:
@@ -866,6 +923,11 @@ if backend.startswith("kt_"):
     preflight = source_profile.get("optimizer_memory_preflight", {})
     if not isinstance(preflight, dict) or preflight.get("available") is not True:
         raise SystemExit("KT profile missing optimizer_memory_preflight")
+    optimizer_memory = source_profile.get("optimizer_memory", {})
+    if backend == "kt_armbf16":
+        memory_ok, memory_reason = optimizer_process_memory_passed(optimizer_memory)
+        if not memory_ok:
+            raise SystemExit(f"KT ARM profile missing optimizer process memory evidence: {memory_reason}")
     lora = source_profile.get("lora", {})
     fused_lora_params = 0
     if isinstance(lora, dict):
@@ -878,7 +940,6 @@ if backend.startswith("kt_"):
     if "qwen3" in model_name.lower() and lora_target in {"all", "all-linear", "all_linear"} and fused_lora_params <= 0:
         raise SystemExit("Qwen3 KT lora_target=all profile has no fused expert LoRA params")
     if fused_lora_params > 0:
-        optimizer_memory = source_profile.get("optimizer_memory", {})
         health = optimizer_memory.get("kt_lora_update_health", {}) if isinstance(optimizer_memory, dict) else {}
         health_ok, health_reason = kt_lora_health_passed(health)
         if not health_ok:
@@ -946,7 +1007,7 @@ job_root_path() {
   local recompute="$4"
   local expert_policy="$5"
   local router_mode="$6"
-  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}")"
+  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}")"
 }
 
 kt_arm_matching_source_profile_complete() {
@@ -959,7 +1020,7 @@ kt_arm_matching_source_profile_complete() {
   local model_name="$7"
   local source_profile_json
   source_profile_json="$(kt_arm_matching_source_profile_json "${config_root}" "${backend}" "${recompute}" "${expert_policy}" "${router_mode}" "${seq_len}")"
-  existing_profile_complete "${source_profile_json}" "${backend}" "${seq_len}" "${model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}"
+  existing_profile_complete "${source_profile_json}" "${backend}" "${seq_len}" "${model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}"
 }
 
 kt_arm_matching_source_profile_json() {
@@ -1288,6 +1349,8 @@ while (($#)); do
     --profile-module-filter=*) PROFILE_MODULE_FILTER="${1#*=}"; shift ;;
     --expandable-seg|--expandable-segments) need_value "$1" "${2-}"; EXPANDABLE_SEG="$(bool_value "$2")"; shift 2 ;;
     --expandable-seg=*|--expandable-segments=*) EXPANDABLE_SEG="$(bool_value "${1#*=}")"; shift ;;
+    --asymm-expert-act-offload) need_value "$1" "${2-}"; ASYMM_EXPERT_ACT_OFFLOAD="$(bool_value "$2")"; shift 2 ;;
+    --asymm-expert-act-offload=*) ASYMM_EXPERT_ACT_OFFLOAD="$(bool_value "${1#*=}")"; shift ;;
     --use-asym-cpu-adamw) need_value "$1" "${2-}"; USE_ASYM_CPU_ADAMW="$(bool_value "$2")"; shift 2 ;;
     --use-asym-cpu-adamw=*) USE_ASYM_CPU_ADAMW="$(bool_value "${1#*=}")"; shift ;;
     --asym-cpu-adamw-backend) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_BACKEND="$2"; shift 2 ;;
@@ -1408,6 +1471,8 @@ CHECK_SUPEROFFLOAD=$(bool_value "${CHECK_SUPEROFFLOAD}")
 CHECK_CPUADAM=$(bool_value "${CHECK_CPUADAM}")
 RUN_POSTSERVE=$(bool_value "${RUN_POSTSERVE}")
 EXPANDABLE_SEG=$(bool_value "${EXPANDABLE_SEG}")
+ASYMM_EXPERT_ACT_OFFLOAD=$(bool_value "${ASYMM_EXPERT_ACT_OFFLOAD}")
+expact_label="$(expact_tag "${ASYMM_EXPERT_ACT_OFFLOAD}")"
 USE_ASYM_CPU_ADAMW=$(bool_value "${USE_ASYM_CPU_ADAMW}")
 ASYM_CPU_ADAMW_PIN_MEMORY=$(bool_value "${ASYM_CPU_ADAMW_PIN_MEMORY}")
 ASYM_CPU_ADAMW_FP32_MASTER=$(bool_value "${ASYM_CPU_ADAMW_FP32_MASTER}")
@@ -1729,7 +1794,7 @@ run_job() {
   source_profile="${seq_root}/source_profile.json"
   lf_out="${seq_root}/lf_run"
   log_file="${seq_root}/train.log"
-  run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_router${router_mode}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_${lora_dropout_label_value}"
+  run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
   local profile_memory_attribution profile_memory_breakdown deepspeed_dir_for_profile
   local profile_backend_label job_use_asym_cpu_adamw job_asym_cpu_adamw_backend cpuadam_backend
@@ -1777,7 +1842,7 @@ run_job() {
     fi
   fi
   if [[ "${DRY_RUN}" != "true" && -e "${profile_json}" && "${OVERWRITE}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
-    if existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" && { [[ "${profile_memory_breakdown}" != "true" ]] || existing_memory_breakdown_valid "${seq_root}"; }; then
+    if existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" && { [[ "${profile_memory_breakdown}" != "true" ]] || existing_memory_breakdown_valid "${seq_root}"; }; then
       echo "Skipping existing: ${profile_json}"
       append_job_record "${config_root}" skipped \
         "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
@@ -1788,7 +1853,7 @@ run_job() {
 
   if [[ "${DRY_RUN}" != "true" && "${COLLECT_EXISTING}" == "true" ]]; then
     if [[ -e "${profile_json}" ]]; then
-      if ! existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}"; then
+      if ! existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}"; then
         echo "Existing profile is incomplete or partial: ${profile_json}" >&2
         return 1
       fi
@@ -1840,6 +1905,7 @@ run_job() {
     GRADIENT_CHECKPOINTING="${gradient_checkpointing}"
     ASYM_PRECISION="${PRECISION}"
     ASYM_OFFLOAD_MODULES="${ASYM_OFFLOAD_MODULES}"
+    ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}"
     ASYM_EXPERT_RECOMPUTE_POLICY="${expert_policy}"
     ASYM_ROUTER_MODE="${router_mode}"
     ASYM_STRICT="${ASYM_STRICT}"
@@ -1872,6 +1938,7 @@ run_job() {
     PROFILE_MEASURE_STEPS="${MAX_STEPS}"
     PROFILE_TOTAL_STEPS="${TOTAL_STEPS}"
     MASTER_PORT="${master_port}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_WARMUP_STEPS="${WARMUP_STEPS}"
     ASYM_GEMM_LF_CONFIG_MEASURE_STEPS="${MAX_STEPS}"
     ASYM_GEMM_LF_CONFIG_TOTAL_STEPS="${TOTAL_STEPS}"
@@ -1920,7 +1987,7 @@ run_job() {
 
   local -a run_cmd=(env "${run_env[@]}" "${RUN_LF_SCRIPT}")
 
-  echo "Running backend=${backend} profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} router_mode=${router_mode} seq=${seq_len} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
+  echo "Running backend=${backend} profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} router_mode=${router_mode} ${expact_label} seq=${seq_len} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
   echo "  dir=${seq_root}"
   if [[ "${DRY_RUN}" == "true" ]]; then
     print_command "${run_cmd[@]}"
@@ -1954,7 +2021,7 @@ run_job() {
     if [[ ! -f "${profile_json}" ]]; then
       echo "Missing expected profile artifact: ${profile_json}" >&2
       status=1
-    elif ! existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}"; then
+    elif ! existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}"; then
       echo "Expected completed profile artifact but found incomplete/partial profile: ${profile_json}" >&2
       status=1
     fi
@@ -2037,6 +2104,7 @@ plot_single_run() {
     --profiler "${profiler}"
     --recompute "${recompute}"
     --router-mode "${router_mode}"
+    --expact "${expact_label}"
   )
   echo "Writing LF per-run plots: ${plot_root}"
   if ! run_tracked_command "${plot_cmd[@]}"; then

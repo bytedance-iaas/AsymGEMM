@@ -780,6 +780,33 @@ def grouped_expert_lora(
     return _grouped_lora_fallback(x, weight, offsets, experts, metadata=metadata)
 
 
+def grouped_expert_lora_cpu_left(
+    x_cpu: torch.Tensor,
+    weight: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    *,
+    metadata: GroupedLoRAMetadata | None = None,
+    compiled_dims: str = "nk",
+    output_dtype: torch.dtype | str = torch.bfloat16,
+    stats: AsymExecutionStats | None = None,
+) -> torch.Tensor:
+    """Run expert LoRA-A with a pinned CPU left operand and CUDA weights."""
+
+    from .cpu_left import grouped_expert_lora_cpu_left as _impl
+
+    return _impl(
+        x_cpu,
+        weight,
+        offsets,
+        experts,
+        metadata=metadata,
+        compiled_dims=compiled_dims,
+        output_dtype=output_dtype,
+        stats=stats,
+    )
+
+
 def grouped_expert_lora_pair(
     x0: torch.Tensor,
     x1: torch.Tensor,
@@ -967,6 +994,7 @@ __all__ = [
     "get_lora_state_dict",
     "get_lora_state_names",
     "grouped_expert_lora",
+    "grouped_expert_lora_cpu_left",
     "grouped_expert_lora_pair",
     "load_adapter_state_dict",
     "load_lora_state_dict",

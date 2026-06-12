@@ -17,9 +17,11 @@ from .frozen_linear import (
     AsymGroupedFrozenLinear,
     TorchGroupedFrozenLinear,
     _dispatch_grouped_nt,
+    _dispatch_nt,
     _get_quantized_host_weight,
     _grouped_torch_chunks,
 )
+from .activation_offload import ActivationOffloadManager, CPUActivationHandle
 from .lora import (
     GroupedLoRAMetadata,
     _require_lora_grouped_mm,
@@ -821,6 +823,568 @@ def _grouped_down_lora_backward_split_loop_free(
     return grad_x, grad_a, grad_b, dS_down
 
 
+def _align_up(value: int, alignment: int) -> int:
+    return ((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment)
+
+
+def _group_bounds(offsets: torch.Tensor, experts: torch.Tensor) -> tuple[list[int], list[int]]:
+    offsets_cpu = offsets.detach().to(device="cpu", dtype=torch.long).tolist()
+    experts_cpu = experts.detach().to(device="cpu", dtype=torch.long).tolist()
+    return offsets_cpu, experts_cpu
+
+
+def _activation_offload_lora_a_forward(
+    layer: "AsymQwen3Experts",
+    source: CPUActivationHandle,
+    lora_a: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    manager: ActivationOffloadManager,
+    *,
+    tag: str,
+) -> torch.Tensor:
+    rows_total = int(source.tensor.shape[0])
+    rank = int(lora_a.shape[1])
+    if rows_total == 0:
+        return lora_a.new_empty((0, rank))
+    offsets_cpu, experts_cpu = _group_bounds(offsets, experts)
+    chunks: list[torch.Tensor] = []
+    for group_idx, expert_idx in enumerate(experts_cpu[:-1]):
+        start = int(offsets_cpu[group_idx])
+        end = int(offsets_cpu[group_idx + 1])
+        rows = end - start
+        if rows <= 0:
+            continue
+        expert = int(expert_idx)
+        source_group = source.tensor[start:end]
+        padded_rows = _align_up(rows, 8)
+        right_handle = manager.empty_cpu(
+            (int(source_group.shape[1]), padded_rows),
+            source_group.dtype,
+            source.original_device,
+            f"{tag}_cpu_right",
+        )
+        right = right_handle.tensor
+        with torch.no_grad():
+            right.zero_()
+            right[:, :rows].copy_(source_group.transpose(0, 1), non_blocking=False)
+        left = lora_a[expert]
+        if not left.is_contiguous():
+            left = left.contiguous()
+        with prof_range(layer._forward_range(tag, "lora_a_cpu_right")):
+            out_t = _dispatch_nt(
+                left,
+                right,
+                backend=layer.backend,
+                stats=layer.stats,
+                phase="forward",
+                compiled_dims="nk",
+                transpose_b=True,
+                precision=layer.precision,
+                bf16_output_dtype=lora_a.dtype,
+            )
+        if hasattr(layer.stats, "cpu_left_lora_a_calls"):
+            layer.stats.cpu_left_lora_a_calls += 1
+        chunks.append(out_t[:, :rows].transpose(0, 1).contiguous())
+        manager.release_cpu(right_handle)
+    if not chunks:
+        return lora_a.new_empty((0, rank))
+    return torch.cat(chunks, dim=0)
+
+
+def _activation_offload_lora_a_pair_forward(
+    layer: "AsymQwen3Experts",
+    source: CPUActivationHandle,
+    lora_a0: torch.Tensor,
+    lora_a1: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    manager: ActivationOffloadManager,
+    *,
+    tag: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows_total = int(source.tensor.shape[0])
+    rank = int(lora_a0.shape[1])
+    if rows_total == 0:
+        empty = lora_a0.new_empty((0, rank))
+        return empty, empty
+    offsets_cpu, experts_cpu = _group_bounds(offsets, experts)
+    chunks0: list[torch.Tensor] = []
+    chunks1: list[torch.Tensor] = []
+    for group_idx, expert_idx in enumerate(experts_cpu[:-1]):
+        start = int(offsets_cpu[group_idx])
+        end = int(offsets_cpu[group_idx + 1])
+        rows = end - start
+        if rows <= 0:
+            continue
+        expert = int(expert_idx)
+        source_group = source.tensor[start:end]
+        padded_rows = _align_up(rows, 8)
+        right_handle = manager.empty_cpu(
+            (int(source_group.shape[1]), padded_rows),
+            source_group.dtype,
+            source.original_device,
+            f"{tag}_cpu_right",
+        )
+        right = right_handle.tensor
+        with torch.no_grad():
+            right.zero_()
+            right[:, :rows].copy_(source_group.transpose(0, 1), non_blocking=False)
+        left = torch.cat((lora_a0[expert], lora_a1[expert]), dim=0).contiguous()
+        with prof_range(layer._forward_range(tag, "lora_a_pair_cpu_right")):
+            out_t = _dispatch_nt(
+                left,
+                right,
+                backend=layer.backend,
+                stats=layer.stats,
+                phase="forward",
+                compiled_dims="nk",
+                transpose_b=True,
+                precision=layer.precision,
+                bf16_output_dtype=lora_a0.dtype,
+            )
+        if hasattr(layer.stats, "cpu_left_lora_a_calls"):
+            layer.stats.cpu_left_lora_a_calls += 1
+        out = out_t[:, :rows].transpose(0, 1).contiguous()
+        chunks0.append(out[:, :rank])
+        chunks1.append(out[:, rank:])
+        manager.release_cpu(right_handle)
+    if not chunks0:
+        empty = lora_a0.new_empty((0, rank))
+        return empty, empty
+    return torch.cat(chunks0, dim=0).contiguous(), torch.cat(chunks1, dim=0).contiguous()
+
+
+def _activation_offload_lora_a_grad(
+    layer: "AsymQwen3Experts",
+    grad_low_rank: torch.Tensor,
+    source: CPUActivationHandle,
+    lora_a: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    manager: ActivationOffloadManager,
+    *,
+    tag: str,
+) -> torch.Tensor:
+    grad = torch.zeros_like(lora_a)
+    if int(grad_low_rank.shape[0]) == 0:
+        return grad
+    offsets_cpu, experts_cpu = _group_bounds(offsets, experts)
+    source_cpu = source.tensor
+    with torch.no_grad():
+        for group_idx, expert_idx in enumerate(experts_cpu[:-1]):
+            start = int(offsets_cpu[group_idx])
+            end = int(offsets_cpu[group_idx + 1])
+            rows = end - start
+            if rows <= 0:
+                continue
+            padded_rows = _align_up(rows, 64)
+            right_handle = manager.empty_cpu(
+                (padded_rows, int(source_cpu.shape[1])),
+                source_cpu.dtype,
+                source.original_device,
+                f"{tag}_dA_cpu_right",
+            )
+            right = right_handle.tensor
+            right.zero_()
+            right[:rows].copy_(source_cpu[start:end], non_blocking=False)
+            left = grad_low_rank.new_zeros((int(grad_low_rank.shape[1]), padded_rows))
+            left[:, :rows].copy_(grad_low_rank[start:end].transpose(0, 1))
+            with prof_range(f"backward.{layer._profile_name(tag, 'lora_a_grad_cpu_right')}"):
+                grad_group = _dispatch_nt(
+                    left.contiguous(),
+                    right,
+                    backend=layer.backend,
+                    stats=layer.stats,
+                    phase="dx",
+                    compiled_dims="nk",
+                    transpose_b=True,
+                    precision=layer.precision,
+                    bf16_output_dtype=lora_a.dtype,
+                )
+            grad[int(expert_idx)].add_(grad_group.to(dtype=grad.dtype))
+            manager.release_cpu(right_handle)
+    return grad
+
+
+def _activation_offload_cpu_lora_b_grad(
+    grad_out: CPUActivationHandle,
+    low_rank: CPUActivationHandle,
+    lora_b: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    *,
+    scale: float,
+) -> torch.Tensor:
+    grad_cpu = torch.zeros(tuple(lora_b.shape), device="cpu", dtype=torch.float32)
+    if int(grad_out.tensor.shape[0]) == 0:
+        return grad_cpu.to(device=lora_b.device, dtype=lora_b.dtype)
+    offsets_cpu, experts_cpu = _group_bounds(offsets, experts)
+    grad_out_cpu = grad_out.tensor
+    low_rank_cpu = low_rank.tensor
+    with torch.no_grad():
+        for group_idx, expert_idx in enumerate(experts_cpu[:-1]):
+            start = int(offsets_cpu[group_idx])
+            end = int(offsets_cpu[group_idx + 1])
+            if end <= start:
+                continue
+            grad_cpu[int(expert_idx)].add_(
+                grad_out_cpu[start:end].to(dtype=torch.float32).transpose(0, 1).matmul(
+                    low_rank_cpu[start:end].to(dtype=torch.float32)
+                )
+            )
+        if scale != 1.0:
+            grad_cpu.mul_(float(scale))
+    return grad_cpu.to(device=lora_b.device, dtype=lora_b.dtype)
+
+
+def _activation_offload_cpu_silu_mul(
+    gate: CPUActivationHandle,
+    up: CPUActivationHandle,
+    manager: ActivationOffloadManager,
+    *,
+    tag: str,
+) -> CPUActivationHandle:
+    out = manager.empty_cpu(tuple(gate.tensor.shape), gate.tensor.dtype, gate.original_device, tag)
+    with torch.no_grad():
+        activated = F.silu(gate.tensor.to(dtype=torch.float32)).mul_(up.tensor.to(dtype=torch.float32))
+        out.tensor.copy_(activated.to(dtype=gate.tensor.dtype), non_blocking=False)
+    return out
+
+
+def _activation_offload_cpu_silu_backward(
+    gate: CPUActivationHandle,
+    up: CPUActivationHandle,
+    grad_act: CPUActivationHandle,
+    manager: ActivationOffloadManager,
+) -> tuple[CPUActivationHandle, CPUActivationHandle]:
+    grad_gate = manager.empty_cpu(tuple(gate.tensor.shape), gate.tensor.dtype, gate.original_device, "dgate")
+    grad_up = manager.empty_cpu(tuple(up.tensor.shape), up.tensor.dtype, up.original_device, "dup")
+    with torch.no_grad():
+        gate_f = gate.tensor.to(dtype=torch.float32)
+        up_f = up.tensor.to(dtype=torch.float32)
+        dact_f = grad_act.tensor.to(dtype=torch.float32)
+        silu = F.silu(gate_f)
+        sigmoid = torch.sigmoid(gate_f)
+        silu_grad = sigmoid * (1.0 + gate_f * (1.0 - sigmoid))
+        grad_up.tensor.copy_((dact_f * silu).to(dtype=grad_up.tensor.dtype), non_blocking=False)
+        grad_gate.tensor.copy_((dact_f * up_f * silu_grad).to(dtype=grad_gate.tensor.dtype), non_blocking=False)
+    return grad_gate, grad_up
+
+
+class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        packed: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        gate_lora_A: torch.Tensor,
+        gate_lora_B: torch.Tensor,
+        up_lora_A: torch.Tensor,
+        up_lora_B: torch.Tensor,
+        down_lora_A: torch.Tensor,
+        down_lora_B: torch.Tensor,
+        layer: "AsymQwen3Experts",
+    ) -> torch.Tensor:
+        manager = ActivationOffloadManager(pin_memory=True)
+        offsets = offsets.detach().contiguous()
+        experts = experts.detach().contiguous()
+        lora_metadata = prepare_grouped_lora_metadata(offsets, experts, dense_experts=True)
+
+        with prof_range(layer._forward_range("activation_offload", "x_to_cpu")):
+            x_cpu = manager.offload(packed, "X")
+
+        with prof_range(layer._forward_range("activation_offload", "gate_up_base")):
+            gate_up = layer.gate_up_base(
+                packed,
+                offsets,
+                experts,
+                dense_experts=True,
+                compiled_dims="nk",
+                profile_name=layer._profile_name("gate_up", "base"),
+            )
+            gate, up = gate_up.chunk(2, dim=-1)
+
+        with prof_range(layer._forward_range("activation_offload", "gate_up_lora_a")):
+            gate_low_rank, up_low_rank = _activation_offload_lora_a_pair_forward(
+                layer,
+                x_cpu,
+                gate_lora_A,
+                up_lora_A,
+                offsets,
+                experts,
+                manager,
+                tag="gate_up",
+            )
+
+        with prof_range(layer._forward_range("activation_offload", "gate_up_lora_b")):
+            gate_delta, up_delta = grouped_expert_lora_pair(
+                gate_low_rank,
+                up_low_rank,
+                gate_lora_B,
+                up_lora_B,
+                offsets,
+                experts,
+                metadata=lora_metadata,
+            )
+            if layer.lora_scale != 1.0:
+                gate_delta = gate_delta.mul(layer.lora_scale)
+                up_delta = up_delta.mul(layer.lora_scale)
+            gate.add_(gate_delta.to(dtype=gate.dtype))
+            up.add_(up_delta.to(dtype=up.dtype))
+            del gate_delta, up_delta
+
+        with prof_range(layer._forward_range("activation_offload", "save_gate_up_cpu")):
+            gate_cpu = manager.offload(gate, "gate")
+            up_cpu = manager.offload(up, "up")
+            gate_low_rank_cpu = manager.offload(gate_low_rank, "S_gate")
+            up_low_rank_cpu = manager.offload(up_low_rank, "S_up")
+            del gate, up, gate_up, gate_low_rank, up_low_rank
+
+        with prof_range(layer._forward_range("activation_offload", "activation_cpu")):
+            act_cpu = _activation_offload_cpu_silu_mul(gate_cpu, up_cpu, manager, tag="act")
+
+        with prof_range(layer._forward_range("activation_offload", "down_lora_a")):
+            down_low_rank = _activation_offload_lora_a_forward(
+                layer,
+                act_cpu,
+                down_lora_A,
+                offsets,
+                experts,
+                manager,
+                tag="down",
+            )
+        with prof_range(layer._forward_range("activation_offload", "down_lora_b")):
+            down_delta = grouped_expert_lora(down_low_rank, down_lora_B, offsets, experts, metadata=lora_metadata)
+            if layer.lora_scale != 1.0:
+                down_delta = down_delta.mul(layer.lora_scale)
+            down_low_rank_cpu = manager.offload(down_low_rank, "S_down")
+            del down_low_rank
+
+        with prof_range(layer._forward_range("activation_offload", "down_base_stage")):
+            act_stage = manager.stage(act_cpu, tag="act_for_down_base")
+            output = layer.down_base(
+                act_stage,
+                offsets,
+                experts,
+                dense_experts=True,
+                profile_name=layer._profile_name("down", "base"),
+            )
+            manager.release_stage(act_stage, drop_cache=True)
+            output.add_(down_delta.to(dtype=output.dtype))
+            del down_delta, act_stage
+
+        ctx.layer = layer
+        ctx.manager = manager
+        ctx.x_cpu = x_cpu
+        ctx.gate_cpu = gate_cpu
+        ctx.up_cpu = up_cpu
+        ctx.act_cpu = act_cpu
+        ctx.gate_low_rank_cpu = gate_low_rank_cpu
+        ctx.up_low_rank_cpu = up_low_rank_cpu
+        ctx.down_low_rank_cpu = down_low_rank_cpu
+        ctx.input_dtype = packed.dtype
+        ctx.lora_dropout_p = float(layer.lora_dropout_p)
+        ctx.save_for_backward(
+            offsets,
+            experts,
+            gate_lora_A,
+            gate_lora_B,
+            up_lora_A,
+            up_lora_B,
+            down_lora_A,
+            down_lora_B,
+        )
+        layer._last_activation_offload_stats = manager.snapshot()
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (
+            offsets,
+            experts,
+            gate_lora_A,
+            gate_lora_B,
+            up_lora_A,
+            up_lora_B,
+            down_lora_A,
+            down_lora_B,
+        ) = ctx.saved_tensors
+        layer: AsymQwen3Experts = ctx.layer
+        manager: ActivationOffloadManager = ctx.manager
+        need_grad_packed = ctx.needs_input_grad[0]
+        lora_metadata = prepare_grouped_lora_metadata(offsets, experts, dense_experts=True)
+
+        with prof_range("backward.mlp.activation_offload.down_lora"):
+            grad_lora = grad_output if grad_output.dtype == down_lora_B.dtype else grad_output.to(dtype=down_lora_B.dtype)
+            dS_down = grouped_expert_lora(
+                grad_lora,
+                down_lora_B.transpose(-1, -2),
+                offsets,
+                experts,
+                metadata=lora_metadata,
+            ).mul_(layer.lora_scale)
+            grad_down_lora_x = grouped_expert_lora(
+                dS_down,
+                down_lora_A.transpose(-1, -2),
+                offsets,
+                experts,
+                metadata=lora_metadata,
+            )
+            grad_output_cpu = manager.offload(grad_output, "dY")
+            grad_down_lora_A = _activation_offload_lora_a_grad(
+                layer,
+                dS_down,
+                ctx.act_cpu,
+                down_lora_A,
+                offsets,
+                experts,
+                manager,
+                tag="down",
+            )
+            grad_down_lora_B = _activation_offload_cpu_lora_b_grad(
+                grad_output_cpu,
+                ctx.down_low_rank_cpu,
+                down_lora_B,
+                offsets,
+                experts,
+                scale=layer.lora_scale,
+            )
+
+        with prof_range("backward.mlp.activation_offload.down_base_dx"):
+            grad_act = _grouped_base_dx(
+                layer.down_base,
+                grad_output,
+                offsets,
+                experts,
+                dense_experts=True,
+                input_dtype=ctx.input_dtype,
+                profile_name=layer._profile_name("down", "base"),
+            )
+            grad_act.add_(grad_down_lora_x.to(dtype=grad_act.dtype))
+            del grad_down_lora_x
+            grad_act_cpu = manager.offload(grad_act, "dact")
+            del grad_act
+
+        with prof_range("backward.mlp.activation_offload.activation_cpu"):
+            grad_gate_cpu, grad_up_cpu = _activation_offload_cpu_silu_backward(
+                ctx.gate_cpu,
+                ctx.up_cpu,
+                grad_act_cpu,
+                manager,
+            )
+
+        grad_packed = None
+        with prof_range("backward.mlp.activation_offload.gate_up_stage"):
+            grad_gate_up = manager.stage_concat_columns(grad_gate_cpu, grad_up_cpu, tag="dgate_up_for_gate_up_base")
+
+        if need_grad_packed:
+            with prof_range("backward.mlp.activation_offload.gate_up_base_dx"):
+                grad_packed = _grouped_base_dx(
+                    layer.gate_up_base,
+                    grad_gate_up,
+                    offsets,
+                    experts,
+                    dense_experts=True,
+                    input_dtype=ctx.input_dtype,
+                    profile_name=layer._profile_name("gate_up", "base"),
+                )
+
+        grad_gate_stage = grad_gate_up[:, : layer.intermediate_dim]
+        grad_up_stage = grad_gate_up[:, layer.intermediate_dim :]
+
+        with prof_range("backward.mlp.activation_offload.gate_lora"):
+            dS_gate = grouped_expert_lora(
+                grad_gate_stage,
+                gate_lora_B.transpose(-1, -2),
+                offsets,
+                experts,
+                metadata=lora_metadata,
+            ).mul_(layer.lora_scale)
+            grad_gate_lora_A = _activation_offload_lora_a_grad(
+                layer,
+                dS_gate,
+                ctx.x_cpu,
+                gate_lora_A,
+                offsets,
+                experts,
+                manager,
+                tag="gate",
+            )
+            grad_gate_lora_B = _activation_offload_cpu_lora_b_grad(
+                grad_gate_cpu,
+                ctx.gate_low_rank_cpu,
+                gate_lora_B,
+                offsets,
+                experts,
+                scale=layer.lora_scale,
+            )
+            if need_grad_packed:
+                grad_gate_lora_x = grouped_expert_lora(
+                    dS_gate,
+                    gate_lora_A.transpose(-1, -2),
+                    offsets,
+                    experts,
+                    metadata=lora_metadata,
+                )
+                grad_packed.add_(grad_gate_lora_x.to(dtype=grad_packed.dtype))
+                del grad_gate_lora_x
+
+        with prof_range("backward.mlp.activation_offload.up_lora"):
+            dS_up = grouped_expert_lora(
+                grad_up_stage,
+                up_lora_B.transpose(-1, -2),
+                offsets,
+                experts,
+                metadata=lora_metadata,
+            ).mul_(layer.lora_scale)
+            grad_up_lora_A = _activation_offload_lora_a_grad(
+                layer,
+                dS_up,
+                ctx.x_cpu,
+                up_lora_A,
+                offsets,
+                experts,
+                manager,
+                tag="up",
+            )
+            grad_up_lora_B = _activation_offload_cpu_lora_b_grad(
+                grad_up_cpu,
+                ctx.up_low_rank_cpu,
+                up_lora_B,
+                offsets,
+                experts,
+                scale=layer.lora_scale,
+            )
+            if need_grad_packed:
+                grad_up_lora_x = grouped_expert_lora(
+                    dS_up,
+                    up_lora_A.transpose(-1, -2),
+                    offsets,
+                    experts,
+                    metadata=lora_metadata,
+                )
+                grad_packed.add_(grad_up_lora_x.to(dtype=grad_packed.dtype))
+                del grad_up_lora_x
+
+        manager.release_stage(grad_gate_up, drop_cache=True)
+        layer._last_activation_offload_stats = manager.snapshot()
+
+        return (
+            grad_packed,
+            None,
+            None,
+            grad_gate_lora_A,
+            grad_gate_lora_B,
+            grad_up_lora_A,
+            grad_up_lora_B,
+            grad_down_lora_A,
+            grad_down_lora_B,
+            None,
+        )
+
+
 class _ThresholdedQwen3ExpertFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1419,6 +1983,7 @@ class AsymQwen3Experts(nn.Module):
         self.stats = stats if stats is not None else AsymExecutionStats()
         self.expert_recompute_config = parse_expert_recompute_policy_spec(expert_recompute_policy)
         self.profile_prefix = "layers.unknown.mlp.experts"
+        self._last_activation_offload_stats: dict[str, object] = {}
 
         base_dtype = torch.bfloat16
         if backend == "asym" and self.offload:
@@ -1743,6 +2308,86 @@ class AsymQwen3Experts(nn.Module):
     def _uses_expert_recompute(self) -> bool:
         return bool(self.expert_recompute_config.enabled and self.training and torch.is_grad_enabled())
 
+    def _activation_offload_requested(self) -> bool:
+        return _env_flag("ASYMM_EXPERT_ACT_OFFLOAD", False)
+
+    def _uses_activation_offload(self) -> bool:
+        return bool(self._activation_offload_requested() and self.training and torch.is_grad_enabled())
+
+    def _activation_offload_unsupported_reasons(self, packed: torch.Tensor) -> list[str]:
+        reasons: list[str] = []
+        if self.backend != "asym" or not self.offload:
+            reasons.append("requires backend='asym' with expert base CPU offload")
+        if not isinstance(self.gate_up_base, AsymGroupedFrozenLinear) or not isinstance(self.down_base, AsymGroupedFrozenLinear):
+            reasons.append("requires AsymGroupedFrozenLinear gate/up and down bases")
+        if self.expert_recompute_config.enabled:
+            reasons.append("expert recompute/activation-drop policy must be disabled")
+        if self.lora_dropout_p != 0.0:
+            reasons.append("v0 supports lora_dropout=0.0 only")
+        if not _is_silu_activation(self.act_fn):
+            reasons.append("requires SiLU activation")
+        if packed.device.type != "cuda":
+            reasons.append("requires CUDA packed expert input")
+        if packed.dtype != torch.bfloat16:
+            reasons.append(f"requires bf16 packed expert input, got {packed.dtype}")
+        if not packed.is_contiguous():
+            reasons.append("requires contiguous packed expert input")
+        if self.lora_dtype != packed.dtype:
+            reasons.append(f"requires LoRA dtype to match packed dtype, got {self.lora_dtype} vs {packed.dtype}")
+        if self.hidden_dim % 64 != 0 or self.intermediate_dim % 64 != 0:
+            reasons.append("requires hidden_dim and intermediate_dim multiples of 64 for CPU-right transpose AsymGEMM")
+        for name, param in (
+            ("gate_lora_A", self.gate_lora_A),
+            ("gate_lora_B", self.gate_lora_B),
+            ("up_lora_A", self.up_lora_A),
+            ("up_lora_B", self.up_lora_B),
+            ("down_lora_A", self.down_lora_A),
+            ("down_lora_B", self.down_lora_B),
+        ):
+            if param.device != packed.device:
+                reasons.append(f"{name} must be on {packed.device}, got {param.device}")
+            if param.dtype != packed.dtype:
+                reasons.append(f"{name} must have dtype {packed.dtype}, got {param.dtype}")
+            if not param.is_contiguous():
+                reasons.append(f"{name} must be contiguous")
+        if isinstance(self.gate_up_base, AsymGroupedFrozenLinear):
+            if self.gate_up_base.precision != "bf16" or self.gate_up_base.backend != "asym":
+                reasons.append("gate/up base must use direct bf16 AsymGEMM")
+            if torch.cuda.is_available() and not self.gate_up_base.host_weight.weight.is_pinned():
+                reasons.append("gate/up host weight must be pinned CPU memory")
+        if isinstance(self.down_base, AsymGroupedFrozenLinear):
+            if self.down_base.precision != "bf16" or self.down_base.backend != "asym":
+                reasons.append("down base must use direct bf16 AsymGEMM")
+            if torch.cuda.is_available() and not self.down_base.host_weight.weight.is_pinned():
+                reasons.append("down host weight must be pinned CPU memory")
+        return reasons
+
+    def _check_activation_offload_supported(self, packed: torch.Tensor) -> None:
+        reasons = self._activation_offload_unsupported_reasons(packed)
+        if reasons:
+            joined = "; ".join(dict.fromkeys(reasons))
+            raise NotImplementedError(f"Qwen3 expert activation offload is unsupported for this configuration: {joined}")
+
+    def _forward_expert_activation_offload(
+        self,
+        packed: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+    ) -> torch.Tensor:
+        self._check_activation_offload_supported(packed)
+        return _ActivationOffloadQwen3ExpertFunction.apply(
+            packed,
+            offsets,
+            experts,
+            self.gate_lora_A,
+            self.gate_lora_B,
+            self.up_lora_A,
+            self.up_lora_B,
+            self.down_lora_A,
+            self.down_lora_B,
+            self,
+        )
+
     def _forward_expert_policy(
         self,
         packed: torch.Tensor,
@@ -1809,7 +2454,9 @@ class AsymQwen3Experts(nn.Module):
                 num_groups=self.num_experts,
                 device=packed.device,
             )
-        if self._uses_expert_recompute():
+        if self._uses_activation_offload():
+            down = self._forward_expert_activation_offload(packed, offsets, experts)
+        elif self._uses_expert_recompute():
             down = self._forward_expert_policy(packed, offsets, experts, metadata)
         else:
             down = self._forward_expert_body(packed, offsets, experts, dense_experts=True)
@@ -1848,7 +2495,9 @@ class AsymQwen3Experts(nn.Module):
                 num_groups=self.num_experts,
                 device=packed.device,
             )
-        if self._uses_expert_recompute():
+        if self._uses_activation_offload():
+            down = self._forward_expert_activation_offload(packed, offsets, experts)
+        elif self._uses_expert_recompute():
             down = self._forward_expert_policy(packed, offsets, experts, metadata)
         else:
             down = self._forward_expert_body(packed, offsets, experts, dense_experts=True)

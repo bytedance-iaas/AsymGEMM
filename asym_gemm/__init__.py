@@ -61,6 +61,7 @@ try:
             # BF16 GEMMs
             "m_grouped_bf16_asym_gemm_nt_contiguous",
             "m_grouped_bf16_asym_gemm_nt_masked",
+            "sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous",
             # Qwen3 selected-recompute backward
             "qwen3_gate_up_recompute_bwd_sm100_bf16_windowed",
             # Dropout mask helpers

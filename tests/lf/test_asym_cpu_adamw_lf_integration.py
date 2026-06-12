@@ -280,6 +280,65 @@ def test_lf_peft_lora_all_does_not_add_adapter_to_qwen_moe_routers() -> None:
 
 
 @requires_lf_adapter
+def test_lf_full_tuning_keeps_qwen_moe_routers_trainable() -> None:
+    from llamafactory.model.adapter import _setup_full_tuning
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM
+    from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+
+    def router_trainable_names(model: nn.Module) -> list[str]:
+        return [name for name, param in model.named_parameters() if name.endswith(".mlp.gate.weight") and param.requires_grad]
+
+    qwen3 = Qwen3MoeForCausalLM(
+        Qwen3MoeConfig(
+            vocab_size=64,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            moe_intermediate_size=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            output_router_logits=False,
+            tie_word_embeddings=False,
+        )
+    )
+    qwen35 = Qwen3_5MoeForCausalLM(
+        Qwen3_5MoeTextConfig(
+            vocab_size=64,
+            hidden_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            moe_intermediate_size=8,
+            shared_expert_intermediate_size=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            output_router_logits=False,
+            tie_word_embeddings=False,
+        )
+    )
+    args = SimpleNamespace(
+        freeze_vision_tower=False,
+        freeze_multi_modal_projector=True,
+        freeze_language_model=False,
+    )
+
+    for model in (qwen3, qwen35):
+        assert router_trainable_names(model) == ["model.layers.0.mlp.gate.weight"]
+        _setup_full_tuning(model, args, is_trainable=True, cast_trainable_params_to_fp32=False)
+        assert router_trainable_names(model) == ["model.layers.0.mlp.gate.weight"]
+
+
+@requires_lf_adapter
 def test_split_asym_peft_dense_targets_skips_router_targets_but_keeps_dense_lora_targets() -> None:
     from asym_gemm.integrations.lf import parse_lf_offload_modules
     from llamafactory.model.adapter import split_asym_peft_dense_targets

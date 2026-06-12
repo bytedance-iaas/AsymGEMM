@@ -56,6 +56,7 @@ DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-}
 # AsymGEMM
 ASYM_PRECISION=${ASYM_PRECISION:-bf16}
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
+ASYMM_EXPERT_ACT_OFFLOAD=${ASYMM_EXPERT_ACT_OFFLOAD:-false}
 ASYM_EXPERT_RECOMPUTE_POLICY=${ASYM_EXPERT_RECOMPUTE_POLICY:-none}
 ASYM_ROUTER_MODE=${ASYM_ROUTER_MODE:-whole}
 ASYM_STRICT=${ASYM_STRICT:-true}
@@ -318,6 +319,11 @@ fi
 
 MODEL_TAG=$(basename "${MODEL_NAME_OR_PATH}" | tr '/:' '__')
 EXPERT_POLICY_TAG=$(printf '%s' "${ASYM_EXPERT_RECOMPUTE_POLICY}" | tr '/:' '__' | tr -c '[:alnum:]_-' '_')
+case "${ASYMM_EXPERT_ACT_OFFLOAD,,}" in
+  1|true|yes|y|on) ASYMM_EXPERT_ACT_OFFLOAD=true; EXP_ACT_OFFLOAD_TAG=expact1 ;;
+  0|false|no|n|off) ASYMM_EXPERT_ACT_OFFLOAD=false; EXP_ACT_OFFLOAD_TAG=expact0 ;;
+  *) echo "ASYMM_EXPERT_ACT_OFFLOAD must be true or false, got '${ASYMM_EXPERT_ACT_OFFLOAD}'" >&2; exit 2 ;;
+esac
 RUN_TS=$(date -u +%Y%m%dT%H%M%SZ)
 PROFILE_TAG="prof${PROFILE}_${PROFILE_PROFILER}_${PROFILE_LEVEL}"
 uses_asym_deepspeed_cpuadam=false
@@ -329,7 +335,7 @@ if [[ "${BACKEND}" == kt_* ]]; then
   KT_BACKEND_TAG="${KT_BACKEND_INTERNAL:-none}"
   DEFAULT_RUN_ID="${RUN_TS}_${MODEL_TAG}_${BACKEND}_${KT_BACKEND_TAG}_${KT_PRECISION}_ctx${CUTOFF_LEN}_bs${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_r${LORA_RANK}_a${LORA_ALPHA}_steps${MAX_STEPS}_${PROFILE_TAG}"
 else
-  DEFAULT_RUN_ID="${RUN_TS}_${MODEL_TAG}_${RUN_BACKEND_LABEL}_${ASYM_PRECISION}_ctx${CUTOFF_LEN}_bs${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_r${LORA_RANK}_a${LORA_ALPHA}_steps${MAX_STEPS}_offload${ASYM_OFFLOAD_MODULES}_pol${EXPERT_POLICY_TAG}_router${ASYM_ROUTER_MODE}_${PROFILE_TAG}"
+  DEFAULT_RUN_ID="${RUN_TS}_${MODEL_TAG}_${RUN_BACKEND_LABEL}_${ASYM_PRECISION}_ctx${CUTOFF_LEN}_bs${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_r${LORA_RANK}_a${LORA_ALPHA}_steps${MAX_STEPS}_offload${ASYM_OFFLOAD_MODULES}_pol${EXPERT_POLICY_TAG}_router${ASYM_ROUTER_MODE}_${EXP_ACT_OFFLOAD_TAG}_${PROFILE_TAG}"
 fi
 RUN_ID=${RUN_ID:-${DEFAULT_RUN_ID}}
 if [[ "${BACKEND}" == kt_* ]]; then
@@ -591,13 +597,23 @@ def kt_lora_health_passed(health):
     input_passed = health.get("passed") if "passed" in health else None
     if health.get("available") is not True:
         return False, "KT fused LoRA update health unavailable"
+    missing_snapshot_fields = [
+        key
+        for key in (
+            "after_sampled_tensors",
+            "after_total_fused_tensors",
+            "missing_after_tensors",
+            "unexpected_after_tensors",
+        )
+        if key not in health or health.get(key) in (None, "")
+    ]
+    if missing_snapshot_fields:
+        return False, "KT fused LoRA update health missing after-step snapshot fields: " + ", ".join(missing_snapshot_fields)
+    if after_sampled_tensors is None or after_total_fused_tensors is None:
+        return False, "KT fused LoRA update health has invalid after-step snapshot counts"
     if missing_after_tensors > 0 or unexpected_after_tensors > 0:
         return False, "sampled fused LoRA tensor set changed between before/after optimizer snapshots"
-    if (
-        after_sampled_tensors is not None
-        and after_total_fused_tensors is not None
-        and (sampled_tensors != after_sampled_tensors or total_fused_tensors != after_total_fused_tensors)
-    ):
+    if sampled_tensors != after_sampled_tensors or total_fused_tensors != after_total_fused_tensors:
         return False, "fused LoRA tensor counts changed between before/after optimizer snapshots"
     if exhaustive and compared_tensors != sampled_tensors:
         return False, f"exhaustive fused LoRA health compared {compared_tensors} of {sampled_tensors} tensors"
@@ -612,6 +628,19 @@ def kt_lora_health_passed(health):
     if input_passed is False:
         return False, str(health.get("reason") or "input KT fused LoRA update health failed")
     return True, "all sampled nonzero-gradient fused LoRA tensors changed after optimizer step"
+def optimizer_process_memory_passed(optimizer_memory):
+    if not isinstance(optimizer_memory, dict) or not optimizer_memory:
+        return False, "missing optimizer_memory"
+    for key in ("process_memory_at_start", "process_memory_before_step", "process_memory_after_step"):
+        snapshot = optimizer_memory.get(key)
+        if not isinstance(snapshot, dict) or not snapshot:
+            return False, f"missing {key}"
+        if _optional_int(snapshot.get("rss_bytes")) is None:
+            return False, f"{key}.rss_bytes missing or invalid"
+    for key in ("process_rss_pre_step_overhead_delta_bytes", "process_rss_delta_bytes"):
+        if key not in optimizer_memory or _optional_int(optimizer_memory.get(key)) is None:
+            return False, f"{key} missing or invalid"
+    return True, "optimizer process RSS snapshots are present"
 def require_int_config(key, expected):
     try:
         actual = int(config.get(key))
@@ -673,6 +702,10 @@ if int_value(kt, "total_forward_calls") <= 0 or int_value(kt, "total_backward_ca
 preflight = source_profile.get("optimizer_memory_preflight", {})
 if not isinstance(preflight, dict) or preflight.get("available") is not True:
     raise SystemExit("source-ok profile missing optimizer_memory_preflight")
+optimizer_memory = source_profile.get("optimizer_memory", {})
+memory_ok, memory_reason = optimizer_process_memory_passed(optimizer_memory)
+if not memory_ok:
+    raise SystemExit(f"source-ok profile missing optimizer process memory evidence: {memory_reason}")
 surface = source_profile.get("trainable_surface", {})
 if not isinstance(surface, dict) or not surface.get("surface"):
     lora_for_surface = source_profile.get("lora", {})
@@ -710,7 +743,6 @@ fused_lora_params = int_value(lora, "kt_fused_expert_lora_parameters") if isinst
 if "qwen3" in expected_model.lower() and fused_lora_params <= 0:
     raise SystemExit("source-ok Qwen3 profile has no captured fused expert LoRA params")
 if fused_lora_params > 0:
-    optimizer_memory = source_profile.get("optimizer_memory", {})
     health = optimizer_memory.get("kt_lora_update_health", {}) if isinstance(optimizer_memory, dict) else {}
     health_ok, health_reason = kt_lora_health_passed(health)
     if not health_ok:
@@ -1572,6 +1604,7 @@ elif is_plain_torch_run; then
 fi
 log_kv ASYM_EXPERT_RECOMPUTE_POLICY "${ASYM_EXPERT_RECOMPUTE_POLICY}"
 log_kv ASYM_ROUTER_MODE "${ASYM_ROUTER_MODE}"
+log_kv ASYMM_EXPERT_ACT_OFFLOAD "${ASYMM_EXPERT_ACT_OFFLOAD}"
 if [[ "${BACKEND}" == "asym" || "${BACKEND}" == "asym_torch" ]]; then
   log_kv USE_ASYM_CPU_ADAMW "${USE_ASYM_CPU_ADAMW}"
   log_kv ASYM_CPU_ADAMW_BACKEND "${ASYM_CPU_ADAMW_BACKEND}"
@@ -1624,6 +1657,7 @@ fi
 RUN_ENV=(
   PATH="${ENV_DIR}/bin:${PATH}"
   PYTHONPATH="${RUN_PYTHONPATH}"
+  ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}"
 )
 if [[ -n "${TRITON_CACHE_DIR:-}" ]]; then
   RUN_ENV+=(TRITON_CACHE_DIR="${TRITON_CACHE_DIR}")
@@ -1768,6 +1802,7 @@ if [[ "${PROFILE}" == "1" ]]; then
     ASYM_GEMM_LF_CONFIG_BACKEND="${PROFILE_BACKEND_LABEL:-${BACKEND}}"
     ASYM_GEMM_LF_CONFIG_DIST_LAUNCHER="${DIST_LAUNCHER}"
     ASYM_GEMM_LF_CONFIG_ASYM_OFFLOAD_MODULES="${ASYM_OFFLOAD_MODULES}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ROUTER_MODE="${ASYM_ROUTER_MODE}"
     ASYM_GEMM_LF_CONFIG_PRECISION="${profile_precision}"
     ASYM_GEMM_LF_CONFIG_SEQ_LEN="${CUTOFF_LEN}"
@@ -2070,13 +2105,23 @@ def kt_lora_health_passed(health):
     input_passed = health.get("passed") if "passed" in health else None
     if health.get("available") is not True:
         return False, "KT fused LoRA update health unavailable"
+    missing_snapshot_fields = [
+        key
+        for key in (
+            "after_sampled_tensors",
+            "after_total_fused_tensors",
+            "missing_after_tensors",
+            "unexpected_after_tensors",
+        )
+        if key not in health or health.get(key) in (None, "")
+    ]
+    if missing_snapshot_fields:
+        return False, "KT fused LoRA update health missing after-step snapshot fields: " + ", ".join(missing_snapshot_fields)
+    if after_sampled_tensors is None or after_total_fused_tensors is None:
+        return False, "KT fused LoRA update health has invalid after-step snapshot counts"
     if missing_after_tensors > 0 or unexpected_after_tensors > 0:
         return False, "sampled fused LoRA tensor set changed between before/after optimizer snapshots"
-    if (
-        after_sampled_tensors is not None
-        and after_total_fused_tensors is not None
-        and (sampled_tensors != after_sampled_tensors or total_fused_tensors != after_total_fused_tensors)
-    ):
+    if sampled_tensors != after_sampled_tensors or total_fused_tensors != after_total_fused_tensors:
         return False, "fused LoRA tensor counts changed between before/after optimizer snapshots"
     if exhaustive and compared_tensors != sampled_tensors:
         return False, f"exhaustive fused LoRA health compared {compared_tensors} of {sampled_tensors} tensors"
@@ -2091,6 +2136,19 @@ def kt_lora_health_passed(health):
     if input_passed is False:
         return False, str(health.get("reason") or "input KT fused LoRA update health failed")
     return True, "all sampled nonzero-gradient fused LoRA tensors changed after optimizer step"
+def optimizer_process_memory_passed(optimizer_memory):
+    if not isinstance(optimizer_memory, dict) or not optimizer_memory:
+        return False, "missing optimizer_memory"
+    for key in ("process_memory_at_start", "process_memory_before_step", "process_memory_after_step"):
+        snapshot = optimizer_memory.get(key)
+        if not isinstance(snapshot, dict) or not snapshot:
+            return False, f"missing {key}"
+        if optional_int(snapshot.get("rss_bytes")) is None:
+            return False, f"{key}.rss_bytes missing or invalid"
+    for key in ("process_rss_pre_step_overhead_delta_bytes", "process_rss_delta_bytes"):
+        if key not in optimizer_memory or optional_int(optimizer_memory.get(key)) is None:
+            return False, f"{key} missing or invalid"
+    return True, "optimizer process RSS snapshots are present"
 wrappers = int(kt.get("wrapper_count", 0) or 0)
 fw = int(kt.get("total_forward_calls", 0) or 0)
 bw = int(kt.get("total_backward_calls", 0) or 0)
@@ -2108,6 +2166,9 @@ if fused_lora_params > 0:
         raise SystemExit(
             f"KT fused expert LoRA params are present ({fused_lora_params}) but optimizer update health is missing"
         )
+    memory_ok, memory_reason = optimizer_process_memory_passed(optimizer_memory)
+    if not memory_ok:
+        raise SystemExit(f"KT fused expert LoRA optimizer process memory evidence missing: {memory_reason}")
     health_ok, health_reason = kt_lora_health_passed(health)
     if not health_ok:
         raise SystemExit(f"KT fused expert LoRA optimizer update health failed: {health_reason}; {health}")

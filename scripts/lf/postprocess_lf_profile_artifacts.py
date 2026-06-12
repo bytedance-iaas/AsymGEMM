@@ -578,28 +578,48 @@ def _normalize_kt_lora_update_health(health: dict[str, Any]) -> dict[str, Any]:
     total_fused_tensors = int(normalized.get("total_fused_tensors", 0) or 0)
     after_sampled_tensors = normalized.get("after_sampled_tensors")
     after_total_fused_tensors = normalized.get("after_total_fused_tensors")
-    after_sampled_tensors_int = int(after_sampled_tensors) if isinstance(after_sampled_tensors, (int, float)) else None
-    after_total_fused_tensors_int = (
-        int(after_total_fused_tensors) if isinstance(after_total_fused_tensors, (int, float)) else None
-    )
+    try:
+        after_sampled_tensors_int = int(after_sampled_tensors) if after_sampled_tensors not in (None, "") else None
+    except (TypeError, ValueError):
+        after_sampled_tensors_int = None
+    try:
+        after_total_fused_tensors_int = (
+            int(after_total_fused_tensors) if after_total_fused_tensors not in (None, "") else None
+        )
+    except (TypeError, ValueError):
+        after_total_fused_tensors_int = None
     missing_after_tensors = int(normalized.get("missing_after_tensors", 0) or 0)
     unexpected_after_tensors = int(normalized.get("unexpected_after_tensors", 0) or 0)
+    missing_snapshot_fields = [
+        key
+        for key in (
+            "after_sampled_tensors",
+            "after_total_fused_tensors",
+            "missing_after_tensors",
+            "unexpected_after_tensors",
+        )
+        if key not in normalized or normalized.get(key) in (None, "")
+    ]
     normalized.setdefault("exhaustive", bool(total_fused_tensors > 0 and sampled_tensors == total_fused_tensors))
     normalized.setdefault("exhaustive_elements", False)
     if normalized.get("available") is False:
         derived_passed = False
         derived_reason = "KT fused LoRA update health unavailable"
+    elif missing_snapshot_fields:
+        derived_passed = False
+        derived_reason = (
+            "KT fused LoRA update health missing after-step snapshot fields: " + ", ".join(missing_snapshot_fields)
+        )
+    elif after_sampled_tensors_int is None or after_total_fused_tensors_int is None:
+        derived_passed = False
+        derived_reason = "KT fused LoRA update health has invalid after-step snapshot counts"
     elif missing_after_tensors > 0 or unexpected_after_tensors > 0:
         derived_passed = False
         derived_reason = (
             "sampled fused LoRA tensor set changed between before/after optimizer snapshots "
             f"(missing_after={missing_after_tensors}, unexpected_after={unexpected_after_tensors})"
         )
-    elif (
-        after_sampled_tensors_int is not None
-        and after_total_fused_tensors_int is not None
-        and (sampled_tensors != after_sampled_tensors_int or total_fused_tensors != after_total_fused_tensors_int)
-    ):
+    elif sampled_tensors != after_sampled_tensors_int or total_fused_tensors != after_total_fused_tensors_int:
         derived_passed = False
         derived_reason = (
             "fused LoRA tensor counts changed between before/after optimizer snapshots "
@@ -785,6 +805,7 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
         f"Workload: `{profile.get('workload', '-')}`  ",
         f"Backend: `{config.get('backend', '-')}`  ",
         f"Router mode: `{config.get('router_mode', '-')}`  ",
+        f"Expert activation offload: `{config.get('asymm_expert_act_offload', '-')}`  ",
         f"Precision: `{config.get('precision', '-')}`  ",
         f"Seq len: `{config.get('seq_len', '-')}`",
         f"Steps: `{warmup_steps}` warmup + `{measure_steps}` measured",
@@ -1701,6 +1722,8 @@ def _write_profile_csv_artifacts(profile_json: Path, output_dir: Path) -> None:
     _write_csv(output_dir / "memory_by_category.csv", _memory_by_category(profile))
     _write_csv(output_dir / "memory_by_module.csv", _memory_by_module(profile))
     memory_breakdown_summary = _memory_breakdown_summary(profile)
+    if not _memory_breakdown_csv_rows(memory_breakdown_summary):
+        memory_breakdown_summary = _memory_breakdown_summary(source_profile)
     breakdown_rows = _memory_breakdown_csv_rows(memory_breakdown_summary)
     if breakdown_rows:
         _write_csv(output_dir / "memory_breakdown.csv", breakdown_rows)

@@ -22,6 +22,8 @@ SUMMARY_FIELDS = [
     "workload",
     "backend",
     "router_mode",
+    "asymm_expert_act_offload",
+    "expact",
     "profiler",
     "recompute",
     "expert_policy",
@@ -48,6 +50,8 @@ STEP_FIELDS = [
     "workload",
     "backend",
     "router_mode",
+    "asymm_expert_act_offload",
+    "expact",
     "profiler",
     "recompute",
     "expert_policy",
@@ -71,6 +75,8 @@ INDEX_FIELDS = [
     "workload",
     "backend",
     "router_mode",
+    "asymm_expert_act_offload",
+    "expact",
     "profiler",
     "recompute",
     "expert_policy",
@@ -107,6 +113,7 @@ class RunRecord:
             self.metadata.get("workload", ""),
             self.metadata.get("backend", ""),
             f"router={self.metadata.get('router_mode', '')}" if self.metadata.get("router_mode") else "",
+            self.metadata.get("expact", ""),
             self.metadata.get("recompute", ""),
             self.metadata.get("expert_policy", ""),
             f"s{self.metadata.get('seq_len', '')}" if self.metadata.get("seq_len") else "",
@@ -125,6 +132,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", action="append", default=[])
     parser.add_argument("--profiler", action="append", default=[])
     parser.add_argument("--router-mode", action="append", default=[], choices=["hf", "whole"])
+    parser.add_argument("--expact", action="append", default=[], choices=["expact0", "expact1"])
     parser.add_argument("--recompute", action="append", default=[])
     parser.add_argument("--seq-lens", nargs="+", default=[])
     parser.add_argument("--expert-recompute-policies", nargs="+", default=[])
@@ -151,6 +159,28 @@ def _safe_label(value: str) -> str:
     while "__" in cleaned:
         cleaned = cleaned.replace("__", "_")
     return cleaned or "run"
+
+
+def _normalize_bool_config(value: Any, default: str = "false") -> str:
+    text = str(value if value is not None else default).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return "true"
+    if text in {"0", "false", "no", "n", "off"}:
+        return "false"
+    return default
+
+
+def _expact_label(value: Any) -> str:
+    return "expact1" if _normalize_bool_config(value) == "true" else "expact0"
+
+
+def _parse_expact_part(part: str) -> tuple[str, str] | None:
+    value = part.strip().lower()
+    if value in {"expact1", "expacttrue"}:
+        return "true", "expact1"
+    if value in {"expact0", "expactfalse"}:
+        return "false", "expact0"
+    return None
 
 
 def _filter_values(values: list[str]) -> set[str]:
@@ -206,9 +236,18 @@ def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, st
     config_root = job_root.parent
     job_parts = job_root.name.split("__")
     config = _source_config(run_dir, profile)
-    if len(job_parts) != 5:
+    if len(job_parts) == 5:
+        backend_part, profiler_part, recompute_part, policy_part, router_part = job_parts
+        expact_value = "false"
+        expact = "expact0"
+    elif len(job_parts) == 6:
+        backend_part, profiler_part, recompute_part, policy_part, router_part, expact_part = job_parts
+        parsed_expact = _parse_expact_part(expact_part)
+        if parsed_expact is None:
+            return None
+        expact_value, expact = parsed_expact
+    else:
         return None
-    backend_part, profiler_part, recompute_part, policy_part, router_part = job_parts
     if not policy_part.startswith("pol") or not router_part.startswith("router"):
         return None
     if recompute_part not in {"norecomp", "recomp"}:
@@ -222,11 +261,15 @@ def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, st
     seq_len = str(config.get("seq_len") or config.get("cutoff_len") or "")
     if not seq_len:
         seq_len = _seq_len_from_run_dir_name(run_dir.name)
+    expact_value = _normalize_bool_config(config.get("asymm_expert_act_offload", expact_value))
+    expact = _expact_label(expact_value)
 
     metadata = {
         "workload": str(config.get("workload") or config_root.name.split("__", 1)[0]),
         "backend": str(config.get("backend") or backend_part),
         "router_mode": router_mode,
+        "asymm_expert_act_offload": expact_value,
+        "expact": expact,
         "profiler": str(profiler_part),
         "recompute": recompute_part,
         "expert_policy": expert_policy,
@@ -245,6 +288,7 @@ def _matches_filters(record: RunRecord, args: argparse.Namespace) -> bool:
         "backend": _filter_values(args.backend),
         "profiler": _filter_values(args.profiler),
         "router_mode": _filter_values(args.router_mode),
+        "expact": _filter_values(args.expact),
         "recompute": _filter_values(args.recompute),
         "seq_len": _filter_values(args.seq_lens),
         "expert_policy": _filter_values(args.expert_recompute_policies),
@@ -542,6 +586,7 @@ def _group_label(run: RunRecord) -> str:
         metadata.get("backend", ""),
         metadata.get("profiler", ""),
         f"router{metadata.get('router_mode', '')}" if metadata.get("router_mode") else "",
+        metadata.get("expact", ""),
         metadata.get("recompute", ""),
         f"pol{metadata.get('expert_policy', '')}" if metadata.get("expert_policy") else "",
     ]

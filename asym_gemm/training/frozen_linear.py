@@ -51,6 +51,7 @@ class AsymExecutionStats:
     kt_forward_calls: int = 0
     kt_backward_calls: int = 0
     kt_lora_update_calls: int = 0
+    cpu_left_lora_a_calls: int = 0
     reference_fallback_count: int = 0
     fallback_reasons: Dict[str, int] = field(default_factory=dict)
 

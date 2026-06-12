@@ -18,6 +18,7 @@ from asym_gemm.integrations.lf import (
     save_asym_peft_adapter,
 )
 from asym_gemm.integrations.peft_lf import adapt_lf_asym_peft_lora
+from asym_gemm.training.activation_offload import ActivationOffloadManager
 from asym_gemm.training.frozen_linear import AsymFrozenLinear, TorchGroupedFrozenLinear
 from asym_gemm.training.llama4_moe import AsymLlama4Moe, AsymLlama4Router, is_llama4_moe
 from asym_gemm.training.lora import AsymLoRALinear
@@ -474,6 +475,27 @@ def test_is_qwen3_moe_block_accepts_fake_and_rejects_experts() -> None:
 def test_is_llama4_moe_accepts_fake_and_rejects_qwen3_experts() -> None:
     assert is_llama4_moe(FakeLlama4Moe())
     assert not is_llama4_moe(FakeQwen3Experts())
+
+
+def test_activation_offload_manager_tracks_cpu_owners_and_stage_reuse() -> None:
+    manager = ActivationOffloadManager(pin_memory=False)
+    x = torch.randn(3, 4, dtype=torch.bfloat16)
+    handle = manager.offload(x, "x")
+    assert handle.tensor.device.type == "cpu"
+    assert manager.snapshot()["cpu_owned_bytes"] == x.numel() * x.element_size()
+
+    stage0 = manager.stage(handle, tag="x_stage")
+    ptr0 = int(stage0.data_ptr())
+    manager.release_stage(stage0)
+    stage1 = manager.stage(handle, tag="x_stage")
+    assert int(stage1.data_ptr()) == ptr0
+    manager.release_stage(stage1)
+
+    stats = manager.snapshot()
+    assert stats["max_stage_bytes_live"] == x.numel() * x.element_size()
+    assert stats["stage_peak_by_tag"]["x_stage"] == x.numel() * x.element_size()
+    manager.release_cpu(handle)
+    assert manager.snapshot()["cpu_owned_bytes"] == 0
 
 
 def test_parse_expert_recompute_policy_spec() -> None:
@@ -1934,6 +1956,70 @@ def test_asym_qwen3_experts_sm100_backward_matches_torch_backend() -> None:
     assert asym_backend.down_base.host_weight.weight.grad is None
     assert asym_backend.stats.asym_forward_calls >= 2
     assert asym_backend.stats.asym_dx_calls >= 2
+
+
+@pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")
+def test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend(monkeypatch) -> None:
+    torch.manual_seed(71)
+    source_torch = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128).cuda()
+    source_asym = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128)
+    source_asym.load_state_dict(source_torch.state_dict())
+    torch_backend = AsymQwen3Experts(
+        source_torch,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        init_lora_weights="peft",
+    )
+    asym_backend = AsymQwen3Experts(
+        source_asym,
+        backend="asym",
+        precision="bf16",
+        offload=True,
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        init_lora_weights="peft",
+    )
+    asym_backend.cuda()
+    _copy_random_lora_params(torch_backend, asym_backend)
+
+    x_torch = torch.randn(5, source_torch.hidden_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_asym = x_torch.detach().clone().requires_grad_(True)
+    top_k_index, top_k_weights = _routing()
+    top_k_index = top_k_index.cuda()
+    top_k_weights = top_k_weights.cuda()
+
+    monkeypatch.delenv("ASYMM_EXPERT_ACT_OFFLOAD", raising=False)
+    out_torch = torch_backend(x_torch, top_k_index, top_k_weights)
+    monkeypatch.setenv("ASYMM_EXPERT_ACT_OFFLOAD", "1")
+    out_asym = asym_backend(x_asym, top_k_index, top_k_weights)
+    _assert_tensor_close_l2("qwen3 activation offload output", out_asym, out_torch, max_abs_tol=6e-3, rel_l2_tol=2e-2)
+
+    grad_out = torch.randn_like(out_torch)
+    out_torch.backward(grad_out)
+    out_asym.backward(grad_out)
+
+    _assert_tensor_close_l2("qwen3 activation offload input grad", x_asym.grad, x_torch.grad, max_abs_tol=8e-3, rel_l2_tol=3e-2)
+    asym_params = dict(asym_backend.named_parameters())
+    for name, param in torch_backend.named_parameters():
+        if "lora_" not in name:
+            continue
+        _assert_tensor_close_l2(f"qwen3 activation offload {name}", asym_params[name].grad, param.grad, max_abs_tol=8e-3, rel_l2_tol=3e-2)
+
+    stats = asym_backend._last_activation_offload_stats
+    assert stats["offload_bytes_by_tag"]["X"] > 0
+    assert stats["offload_bytes_by_tag"]["gate"] > 0
+    assert stats["offload_bytes_by_tag"]["up"] > 0
+    assert stats["offload_bytes_by_tag"]["S_gate"] > 0
+    assert stats["offload_bytes_by_tag"]["S_up"] > 0
+    assert stats["offload_bytes_by_tag"]["S_down"] > 0
+    assert stats["stage_peak_by_tag"]["act_for_down_base"] > 0
+    assert stats["stage_peak_by_tag"]["dgate_up_for_gate_up_base"] > 0
+    assert asym_backend.stats.cpu_left_lora_a_calls > 0
 
 
 @pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")

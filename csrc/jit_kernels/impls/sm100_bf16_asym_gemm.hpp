@@ -238,6 +238,23 @@ static void sm100_m_grouped_bf16_asym_gemm_contiguous(const torch::Tensor& a,
     SM100BF16AsymGemmRuntime::launch(runtime, args);
 }
 
+static void sm100_m_grouped_bf16_cpu_left_asym_gemm_contiguous(const torch::Tensor& a,
+                                                 const torch::Tensor& b,
+                                                 const torch::Tensor& d,
+                                                 const torch::Tensor& offsets_t,
+                                                 const torch::Tensor& experts_t,
+                                                 const int& grid_y,
+                                                 const int& num_groups, const int& m, const int& n, const int& k,
+                                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                                 const std::string& compiled_dims,
+                                                 const int b_outer_stride = -1) {
+    sm100_m_grouped_bf16_asym_gemm_contiguous(a, b, d,
+                                              offsets_t, experts_t, grid_y,
+                                              num_groups, m, n, k,
+                                              major_a, major_b, compiled_dims,
+                                              b_outer_stride);
+}
+
 // static void sm100_m_grouped_bf16_asym_gemm_contiguous_with_offsets(const torch::Tensor& a,
 //                                                 const torch::Tensor& b,
 //                                                 const torch::Tensor& d,

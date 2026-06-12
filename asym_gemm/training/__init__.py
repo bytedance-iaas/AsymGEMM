@@ -36,6 +36,7 @@ from .lora import (
     get_lora_state_dict,
     get_lora_state_names,
     grouped_expert_lora,
+    grouped_expert_lora_cpu_left,
     grouped_expert_lora_pair,
     load_lora_state_dict,
     lora_parameters,
@@ -45,6 +46,10 @@ from .lora import (
     prepare_grouped_lora_metadata,
     save_peft_adapter,
     load_peft_adapter,
+)
+from .cpu_left import (
+    CPU_LEFT_BF16_BINDING,
+    cpu_left_grouped_bf16_reason,
 )
 from .cpu_adam import AsymCPUAdamW
 from .mlp import (
@@ -158,7 +163,10 @@ __all__ = [
     "freeze_non_lora_params",
     "get_lora_state_dict",
     "get_lora_state_names",
+    "CPU_LEFT_BF16_BINDING",
+    "cpu_left_grouped_bf16_reason",
     "grouped_expert_lora",
+    "grouped_expert_lora_cpu_left",
     "grouped_expert_lora_pair",
     "is_qwen3_experts",
     "is_qwen3_moe_block",

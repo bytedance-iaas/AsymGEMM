@@ -1385,6 +1385,8 @@ def test_source_profile_with_profile_json_does_not_overwrite_source_csvs(tmp_pat
                 "after_sampled_tensors": 1,
                 "after_total_fused_tensors": 1,
                 "compared_tensors": 1,
+                "missing_after_tensors": 0,
+                "unexpected_after_tensors": 0,
                 "grad_nonzero_tensors": 1,
                 "rows": [
                     {
@@ -1443,6 +1445,8 @@ def test_source_summary_recomputes_stale_kt_lora_update_health_fail_closed(tmp_p
                 "after_sampled_tensors": 1,
                 "after_total_fused_tensors": 1,
                 "compared_tensors": 0,
+                "missing_after_tensors": 0,
+                "unexpected_after_tensors": 0,
                 "grad_nonzero_tensors": 0,
                 "rows": [],
             }
@@ -1484,6 +1488,8 @@ def test_source_summary_rejects_kt_lora_health_with_no_updated_grad_tensors(tmp_
                 "after_sampled_tensors": 1,
                 "after_total_fused_tensors": 1,
                 "compared_tensors": 1,
+                "missing_after_tensors": 0,
+                "unexpected_after_tensors": 0,
                 "grad_nonzero_tensors": 1,
                 "updated_grad_tensors": 0,
                 "grad_nonzero_unchanged_tensors": 0,
@@ -1747,6 +1753,11 @@ def test_profile_json_csvs_include_nested_source_profile_artifacts(tmp_path: Pat
                 "passed": True,
                 "sampled_tensors": 1,
                 "total_fused_tensors": 1,
+                "after_sampled_tensors": 1,
+                "after_total_fused_tensors": 1,
+                "missing_after_tensors": 0,
+                "unexpected_after_tensors": 0,
+                "compared_tensors": 1,
                 "grad_nonzero_tensors": 1,
                 "rows": [
                     {
@@ -1754,6 +1765,37 @@ def test_profile_json_csvs_include_nested_source_profile_artifacts(tmp_path: Pat
                         "param_index": 0,
                         "grad_nonzero_before_step": True,
                         "param_changed_after_step": True,
+                    }
+                ],
+            }
+        },
+        "memory_breakdown": {
+            "summary": {
+                "schema_version": 1,
+                "selected_step": 0,
+                "selected_phase": "backward",
+                "actual_peak_step": 0,
+                "actual_peak_phase": "backward",
+                "peak_allocated_hbm_bytes": 2048,
+                "peak_reserved_hbm_bytes": 4096,
+                "actual_peak_allocated_hbm_bytes": 2048,
+                "actual_peak_reserved_hbm_bytes": 4096,
+                "breakdown_rows": [
+                    {
+                        "memory_space": "GPU HBM",
+                        "group": "activations",
+                        "component": "saved_activation",
+                        "kind": "measured",
+                        "bytes": 1024,
+                    }
+                ],
+                "actual_peak_breakdown_rows": [
+                    {
+                        "memory_space": "GPU HBM",
+                        "group": "activations",
+                        "component": "saved_activation",
+                        "kind": "measured",
+                        "bytes": 1024,
                     }
                 ],
             }
@@ -1797,6 +1839,8 @@ def test_profile_json_csvs_include_nested_source_profile_artifacts(tmp_path: Pat
         encoding="utf-8"
     )
     assert "param_changed_after_step" in (output_dir / "kt_lora_update_health.csv").read_text(encoding="utf-8")
+    assert "saved_activation" in (output_dir / "memory_breakdown.csv").read_text(encoding="utf-8")
+    assert "saved_activation" in (output_dir / "memory_actual_peak_breakdown.csv").read_text(encoding="utf-8")
     assert "DeepSpeedCPUAdam" in (output_dir / "cpuadam.csv").read_text(encoding="utf-8")
     assert "cpu_master_bytes" in (output_dir / "asym_cpu_adamw.csv").read_text(encoding="utf-8")
     persisted = json.loads(profile_json.read_text(encoding="utf-8"))
