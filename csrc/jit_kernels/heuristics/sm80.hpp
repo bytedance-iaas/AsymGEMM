@@ -80,10 +80,21 @@ inline SM80GemmConfig select_sm80_config(int arch_major, int arch_minor, int N, 
 // For BLOCK_M=BLOCK_N=128:
 //   Total = (128+128)*BLOCK_K + 128*128*2 = 256*BLOCK_K + 32768
 //   SM89 (96 KB = 98304 B): BLOCK_K ≤ (98304-32768)/256 = 256
-inline int smem_bytes_fp8(uint32_t block_m, uint32_t block_n, uint32_t block_k) {
+// Scale smem floats per row: legacy needs smem_sa only; block-scale mode adds
+// smem_rcs + (k-groups - 1) inter-group ratios. Keeping the legacy footprint
+// untouched matters for occupancy: on SM90, +2KB pushes the bk=512/bn=64
+// config from 2 CTAs/SM to 1.
+inline uint32_t scale_smem_floats(uint32_t block_k, bool block_scale) {
+    if (!block_scale) return 1u;
+    const uint32_t groups = block_k >= 128u ? block_k / 128u : 1u;
+    return groups + 1u;
+}
+
+inline int smem_bytes_fp8(uint32_t block_m, uint32_t block_n, uint32_t block_k,
+                          bool block_scale = false) {
     return static_cast<int>((block_m + block_n) * block_k          // sX+sW: FP8
                             + block_m * block_n * 2                // sO: BF16
-                            + block_m * 8);                        // smem_sa + smem_rcs
+                            + block_m * 4 * scale_smem_floats(block_k, block_scale));
 }
 
 // Max BLOCK_K for the FP8 kernel given the arch's smem limit.
@@ -94,8 +105,11 @@ inline int max_block_k_fp8(int arch_major, int arch_minor) {
 
 // Config selector for the FP8 kernel.
 // BLOCK_K min = 32 (SM89 FP8 MMA K-atom = 32, must be a multiple of 32).
-// block_scale: 1x128/128x128 block-scale mode — BLOCK_K is capped at 128 so a
-// K-tile never straddles a scale k-group (128 % BLOCK_K == 0 for 128/64/32).
+// Block-scale mode: BLOCK_K starts at 256 (2 scale k-groups per K-tile via
+// per-group MMA + inter-group rescale). 512 would force BLOCK_N down to 64
+// and drop SM90 occupancy to 1 CTA/SM; 256 keeps BLOCK_N=128 and 2 CTAs/SM.
+// The halving sequence keeps BLOCK_K either a multiple of 128 or a divisor
+// of 128 (single scale group).
 inline SM80GemmConfig select_sm80_fp8_config(int arch_major, int arch_minor,
                                              int N, int K,
                                              bool block_scale = false) {
@@ -103,8 +117,8 @@ inline SM80GemmConfig select_sm80_fp8_config(int arch_major, int arch_minor,
 
     // Start at arch max, halve until K is divisible; floor at 32
     uint32_t block_k = static_cast<uint32_t>(max_block_k_fp8(arch_major, arch_minor));
-    if (block_scale)
-        block_k = 128u;
+    if (block_scale && block_k > 256u)
+        block_k = 256u;
     while (block_k > 32u && K % static_cast<int>(block_k) != 0)
         block_k /= 2u;
 
@@ -112,7 +126,7 @@ inline SM80GemmConfig select_sm80_fp8_config(int arch_major, int arch_minor,
     uint32_t block_n = 32u;
     for (uint32_t bn : {128u, 64u, 32u}) {
         if (N % static_cast<int>(bn) != 0) continue;
-        if (smem_bytes_fp8(128u, bn, block_k) <= smem_cap) {
+        if (smem_bytes_fp8(128u, bn, block_k, block_scale) <= smem_cap) {
             block_n = bn;
             break;
         }
