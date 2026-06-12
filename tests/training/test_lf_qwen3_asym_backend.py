@@ -164,6 +164,13 @@ class FakeEmbeddingModel(FakeModel):
         return self.lm_head
 
 
+class FakeQwen3WholeOffloadModel(FakeEmbeddingModel):
+    def __init__(self, *, hidden_dim: int = 8, intermediate_dim: int = 8, num_layers: int = 2) -> None:
+        super().__init__(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim, num_layers=num_layers)
+        self.input_layernorm = nn.LayerNorm(hidden_dim, dtype=torch.bfloat16)
+        self.norm = FakeRMSNorm(hidden_dim)
+
+
 class FakeRMSNorm(nn.Module):
     def __init__(self, hidden_dim: int = 8, eps: float = 1e-6) -> None:
         super().__init__()
@@ -302,6 +309,20 @@ class FakeLlama4Model(nn.Module):
         self.layers = nn.ModuleList(
             [FakeLlama4Block(hidden_size=hidden_size, intermediate_size=intermediate_size) for _ in range(num_layers)]
         )
+
+
+class FakeLlama4WholeOffloadModel(FakeLlama4Model):
+    def __init__(self, *, hidden_size: int = 8, intermediate_size: int = 8, num_layers: int = 2) -> None:
+        super().__init__(hidden_size=hidden_size, intermediate_size=intermediate_size, num_layers=num_layers)
+        self.embed_tokens = nn.Embedding(hidden_size, hidden_size, dtype=torch.bfloat16)
+        self.lm_head = nn.Linear(hidden_size, hidden_size, bias=False, dtype=torch.bfloat16)
+        self.norm = FakeRMSNorm(hidden_size)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
+
+    def get_output_embeddings(self) -> nn.Linear:
+        return self.lm_head
 
 
 def _routing() -> tuple[torch.Tensor, torch.Tensor]:
@@ -880,6 +901,34 @@ def test_apply_lf_asym_lora_norms_allows_stateless_llama4_qk_norm() -> None:
     torch.testing.assert_close(model.layers[0].self_attn.qk_norm(x), expected)
     assert "norms" not in report.cpu_resident_base_bytes_by_component
     assert report.selected_gpu_resident_base_bytes_by_component == {}
+
+
+def test_apply_lf_asym_lora_qwen3_all_selector_covers_available_buckets() -> None:
+    model = FakeQwen3WholeOffloadModel()
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["all"],
+        dense_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="all",
+        router_mode="whole",
+        strict=True,
+    )
+
+    expected_components = {"routed_experts", "router", "attention", "embed_tokens", "lm_head", "norms"}
+    assert expected_components <= set(report.cpu_resident_base_bytes_by_component)
+    assert all(report.cpu_resident_base_bytes_by_component[component] > 0 for component in expected_components)
+    assert report.selected_gpu_resident_base_bytes_by_component == {}
+    assert isinstance(model.layers[0].mlp, AsymQwen3MoeBlock)
+    assert isinstance(model.layers[0].q_proj, AsymLoRALinear)
+    assert isinstance(model.embed_tokens, AsymFrozenEmbedding)
+    assert isinstance(model.input_layernorm, AsymFrozenLayerNorm)
+    assert isinstance(model.norm, AsymFrozenRMSNorm)
+    assert isinstance(model.lm_head, AsymFrozenLinear)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1498,6 +1547,42 @@ def test_apply_lf_asym_lora_llama4_router_adopts_cpu_storage_without_clone() -> 
     assert report.cpu_resident_base_bytes_by_component["router"] > 0
     assert report.selected_gpu_resident_base_bytes_by_component == {}
     assert not any(".feed_forward.router.weight" in name for name, _param in model.named_parameters())
+
+
+def test_apply_lf_asym_lora_llama4_all_selector_covers_available_buckets() -> None:
+    model = FakeLlama4WholeOffloadModel()
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["all"],
+        dense_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="all",
+        router_mode="whole",
+        strict=True,
+    )
+
+    expected_components = {
+        "routed_experts",
+        "router",
+        "shared_experts",
+        "attention",
+        "embed_tokens",
+        "lm_head",
+        "norms",
+    }
+    assert expected_components <= set(report.cpu_resident_base_bytes_by_component)
+    assert all(report.cpu_resident_base_bytes_by_component[component] > 0 for component in expected_components)
+    assert report.selected_gpu_resident_base_bytes_by_component == {}
+    assert isinstance(model.layers[0].feed_forward, AsymLlama4Moe)
+    assert isinstance(model.layers[0].feed_forward.router, AsymLlama4Router)
+    assert isinstance(model.layers[0].q_proj, AsymLoRALinear)
+    assert isinstance(model.embed_tokens, AsymFrozenEmbedding)
+    assert isinstance(model.norm, AsymFrozenRMSNorm)
+    assert isinstance(model.lm_head, AsymFrozenLinear)
 
 
 def test_adapt_lf_asym_peft_lora_only_wraps_packed_experts_after_dense_peft() -> None:

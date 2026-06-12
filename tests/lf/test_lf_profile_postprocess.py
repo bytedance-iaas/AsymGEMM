@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import csv
 import json
 import subprocess
 import sys
@@ -35,6 +36,10 @@ def _write_source_profile(
     optimizer_memory_preflight: dict | None = None,
     process_memory: dict | None = None,
     stage_memory_rows: list[dict] | None = None,
+    trainer_timing: dict | None = None,
+    step_rows: list[dict] | None = None,
+    step_sample_rows: list[dict] | None = None,
+    heartbeat_jsonl: Path | None = None,
 ) -> None:
     path.write_text(
         json.dumps(
@@ -50,6 +55,15 @@ def _write_source_profile(
                 },
                 "memory": {"gpu": {}, "process": process_memory or {}},
                 "trainer": {"trainer_log": str(trainer_log or "")},
+                "heartbeat": {"jsonl": str(heartbeat_jsonl or "")},
+                "step_samples": {"rows": step_sample_rows or []},
+                "step": {
+                    "rows": step_rows
+                    or [
+                        {"name": "lf.step.total", "milliseconds": 3.2},
+                        {"name": "lf.optimizer.step", "milliseconds": 0.7},
+                    ]
+                },
                 "forward": {"total_milliseconds": 1.0},
                 "backward": {"total_milliseconds": 2.0},
                 "stage_memory": {"rows": stage_memory_rows or []},
@@ -63,6 +77,10 @@ def _write_source_profile(
         + "\n",
         encoding="utf-8",
     )
+    if trainer_timing is not None:
+        profile = json.loads(path.read_text(encoding="utf-8"))
+        profile["trainer"]["timing"] = trainer_timing
+        path.write_text(json.dumps(profile) + "\n", encoding="utf-8")
 
 
 def test_model_capture_emits_startup_kt_lora_summary() -> None:
@@ -117,6 +135,106 @@ def test_model_capture_emits_startup_kt_lora_summary() -> None:
     assert writes[0][1]["lora"]["kt_fused_expert_lora_parameters"] == 5
 
 
+def test_trainer_timing_summary_derives_measured_e2e_after_warmup() -> None:
+    module = _load_profile_launcher_module()
+    timing = module._trainer_timing_summary(
+        [
+            {"current_steps": 5, "total_steps": 15, "elapsed_time": "0:01:40"},
+            {"current_steps": 15, "total_steps": 15, "elapsed_time": "0:04:20"},
+        ],
+        {"warmup_steps": 5},
+    )
+
+    assert timing["available"] is True
+    assert timing["total_e2e_step_milliseconds"] == pytest.approx(260000.0 / 15.0)
+    assert timing["measured_steps"] == 10
+    assert timing["measured_e2e_step_milliseconds"] == pytest.approx(16000.0)
+
+
+def test_profile_config_preserves_deepspeed_dir_for_asym_cpuadamwds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_profile_launcher_module()
+    deepspeed_dir = tmp_path / "deepspeed"
+    deepspeed_dir.mkdir()
+
+    monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_BACKEND", "asym_cpuadamwds")
+    monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_USE_ASYM_CPU_ADAMW", "true")
+    monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_BACKEND", "deepspeed")
+    monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_DEEPSPEED_DIR", str(deepspeed_dir))
+
+    config = module._config_from_args(
+        [
+            "--model_name_or_path",
+            "Qwen/Qwen3.5-122B-A10B",
+            "--per_device_train_batch_size",
+            "4",
+            "--cutoff_len",
+            "8192",
+            "--gradient_accumulation_steps",
+            "1",
+            "--lora_rank",
+            "64",
+            "--lora_alpha",
+            "16",
+            "--max_steps",
+            "1",
+            "--asym_backend",
+            "asym",
+            "--output_dir",
+            str(tmp_path / "out"),
+        ]
+    )
+
+    assert config["backend"] == "asym_cpuadamwds"
+    assert config["use_asym_cpu_adamw"] == "true"
+    assert config["asym_cpu_adamw_backend"] == "deepspeed"
+    assert config["deepspeed_dir"] == str(deepspeed_dir)
+
+
+def test_heartbeat_timing_summary_derives_high_resolution_step_intervals() -> None:
+    module = _load_profile_launcher_module()
+    timing = module._heartbeat_timing_summary(
+        [
+            {"stage": "dataloader_batch_fetch_start", "count": 1, "elapsed_seconds": 10.0},
+            {"stage": "dataloader_batch_fetch_start", "count": 2, "elapsed_seconds": 28.25},
+            {"stage": "trainer_end", "elapsed_seconds": 47.75},
+        ],
+        {"warmup_steps": 1},
+    )
+
+    assert timing is not None
+    assert timing["source"] == "heartbeat_dataloader_interval"
+    assert timing["total_e2e_step_milliseconds"] == pytest.approx(18875.0)
+    assert timing["measured_steps"] == 1
+    assert timing["measured_e2e_step_milliseconds"] == pytest.approx(19500.0)
+
+
+def test_heartbeat_interval_rows_use_earliest_start_and_latest_end_duplicates() -> None:
+    module = _load_profile_launcher_module()
+    rows = module._heartbeat_step_interval_rows(
+        [
+            {"stage": "dataloader_batch_fetch_start", "count": 1, "elapsed_seconds": 10.0},
+            {"stage": "dataloader_batch_fetch_start", "count": 1, "elapsed_seconds": 10.4},
+            {"stage": "training_step_start", "count": 1, "global_step": 0, "elapsed_seconds": 10.2},
+            {"stage": "training_step_start", "count": 1, "global_step": 0, "elapsed_seconds": 10.3},
+            {"stage": "training_step_end", "count": 1, "global_step": 0, "elapsed_seconds": 20.0},
+            {"stage": "training_step_end", "count": 1, "global_step": 0, "elapsed_seconds": 20.5},
+            {"stage": "optimizer_step_start", "count": 1, "global_step": 0, "elapsed_seconds": 20.6},
+            {"stage": "optimizer_step_start", "count": 1, "global_step": 0, "elapsed_seconds": 20.8},
+            {"stage": "optimizer_step_end", "count": 1, "global_step": 0, "elapsed_seconds": 21.0},
+            {"stage": "optimizer_step_end", "count": 1, "global_step": 0, "elapsed_seconds": 21.2},
+            {"stage": "dataloader_batch_fetch_start", "count": 2, "elapsed_seconds": 28.0},
+            {"stage": "dataloader_batch_fetch_start", "count": 2, "elapsed_seconds": 27.8},
+            {"stage": "trainer_end", "elapsed_seconds": 30.0},
+        ]
+    )
+
+    assert rows[0]["trainer_e2e_step_milliseconds"] == pytest.approx(17800.0)
+    assert rows[0]["heartbeat_training_step_milliseconds"] == pytest.approx(10300.0)
+    assert rows[0]["heartbeat_optimizer_step_milliseconds"] == pytest.approx(600.0)
+
+
 def test_kt_counters_include_native_cache_observability() -> None:
     module = _load_profile_launcher_module()
 
@@ -126,7 +244,7 @@ def test_kt_counters_include_native_cache_observability() -> None:
         _kt_backward_calls=2,
         _lora_initialized=True,
         _cache_depth=1,
-        max_cache_depth=2,
+        max_cache_depth=8,
         _max_cache_depth_observed=2,
         _buffer=SimpleNamespace(qlen=4096, capacity_bytes=lambda: 123456),
         _buffer_allocation_count=2,
@@ -136,13 +254,24 @@ def test_kt_counters_include_native_cache_observability() -> None:
         cache_pop_count=2,
         last_cache_entry_bytes=1234,
         total_cache_entry_bytes_saved=5678,
+        last_cache_route_bytes=432,
+        total_cache_route_bytes_saved=876,
         _kt_timing={},
     )
     model = SimpleNamespace(_kt_wrappers=[SimpleNamespace(layer_idx=7, wrapper=wrapper)])
     old_model = module._LAST_LF_MODEL
     module._LAST_LF_MODEL = model
     try:
-        counters = module._kt_counters_from_model()
+        counters = module._kt_counters_from_model(
+            {
+                "logical_qlen": 512,
+                "kt_max_cache_depth": 2,
+                "kt_arm_sft_token_chunk_size": 128,
+                "kt_arm_effective_route_qlen": 128,
+                "kt_arm_token_chunks": 4,
+                "kt_arm_route_rank_work": 8192,
+            }
+        )
     finally:
         module._LAST_LF_MODEL = old_model
 
@@ -151,12 +280,53 @@ def test_kt_counters_include_native_cache_observability() -> None:
     assert row["staging_buffer_capacity_qlen"] == 4096
     assert row["staging_buffer_capacity_bytes"] == 123456
     assert row["staging_buffer_allocation_count"] == 2
+    assert row["logical_max_cache_depth"] == 2
+    assert row["effective_max_cache_depth"] == 8
+    assert row["expected_effective_max_cache_depth"] == 8
+    assert row["kt_arm_logical_qlen"] == 512
+    assert row["kt_arm_sft_token_chunk_size"] == 128
+    assert row["kt_arm_effective_route_qlen"] == 128
+    assert row["kt_arm_token_chunks"] == 4
+    assert row["kt_arm_route_rank_work"] == 8192
     assert row["native_cache_stack_depth"] == 1
     assert row["native_max_cache_stack_depth_observed"] == 2
     assert row["native_cache_save_count"] == 3
     assert row["native_cache_pop_count"] == 2
     assert row["native_last_cache_entry_bytes"] == 1234
     assert row["native_total_cache_entry_bytes_saved"] == 5678
+    assert row["native_last_cache_route_bytes"] == 432
+    assert row["native_total_cache_route_bytes_saved"] == 876
+
+
+def test_lora_counters_count_peft_expert_lora_by_parameter_name() -> None:
+    module = _load_profile_launcher_module()
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layers = torch.nn.ModuleList([torch.nn.Module()])
+            self.layers[0].mlp = torch.nn.Module()
+            self.layers[0].mlp.experts = torch.nn.Module()
+            self.layers[0].mlp.experts.gate_lora_A = torch.nn.Parameter(torch.ones(2, 3))
+            self.layers[0].mlp.experts.gate_lora_B = torch.nn.Parameter(torch.ones(3, 2))
+            self.layers[0].mlp.shared_expert = torch.nn.Module()
+            self.layers[0].mlp.shared_expert.gate_proj = torch.nn.Module()
+            self.layers[0].mlp.shared_expert.gate_proj.lora_A = torch.nn.Parameter(torch.ones(2, 4))
+            self.layers[0].self_attn = torch.nn.Module()
+            self.layers[0].self_attn.q_proj = torch.nn.Module()
+            self.layers[0].self_attn.q_proj.lora_A = torch.nn.Parameter(torch.ones(2, 5))
+
+    old_model = module._LAST_LF_MODEL
+    module._LAST_LF_MODEL = DummyModel()
+    try:
+        counters = module._lora_counters_from_model()
+    finally:
+        module._LAST_LF_MODEL = old_model
+
+    assert counters["available"] is True
+    assert counters["peft_lora_parameters"] == 2 * 3 + 3 * 2 + 2 * 4 + 2 * 5
+    assert counters["peft_expert_lora_tensors"] == 3
+    assert counters["peft_expert_lora_parameters"] == 2 * 3 + 3 * 2 + 2 * 4
 
 
 def test_model_capture_startup_validation_rejects_missing_kt_wrappers(monkeypatch) -> None:
@@ -744,6 +914,176 @@ def _run_postprocess_output(tmp_path: Path, *, kt: dict, lora: dict) -> Path:
     return output_dir
 
 
+def test_source_latency_markdown_reports_optimizer_inclusive_e2e_step(tmp_path: Path) -> None:
+    source_profile = tmp_path / "source_profile.json"
+    output_dir = tmp_path / "out"
+    _write_source_profile(
+        source_profile,
+        kt={"available": True, "wrapper_count": 0, "total_forward_calls": 0, "total_backward_calls": 0},
+        lora={"available": True, "trainable_parameters": 3, "peft_lora_parameters": 3},
+        trainer_timing={
+            "available": True,
+            "measured_e2e_step_milliseconds": 5.5,
+            "total_e2e_step_milliseconds": 6.0,
+        },
+        step_rows=[
+            {"name": "lf.step.total", "milliseconds": 3.2},
+            {"name": "lf.grad_clip", "milliseconds": 0.1},
+            {"name": "lf.optimizer.step", "milliseconds": 0.7},
+            {"name": "lf.scheduler.step", "milliseconds": 0.05},
+        ],
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "scripts/lf/postprocess_lf_profile_artifacts.py",
+            "--source-profile-json",
+            str(source_profile),
+            "--output-dir",
+            str(output_dir),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+
+    lat = (output_dir / "lat.md").read_text(encoding="utf-8")
+    assert "| trainer e2e measured step incl optimizer | 5.500 |" in lat
+    assert "| optimizer/update side = e2e measured - fwd/bwd | 2.500 |" in lat
+    assert "| step.forward + step.backward | 3.000 |" in lat
+    assert "| lf.optimizer.step substage | 0.700 |" in lat
+
+
+def test_step_samples_mark_trainer_e2e_source_when_trainer_log_is_available(tmp_path: Path) -> None:
+    trainer_log = tmp_path / "trainer_log.jsonl"
+    trainer_log.write_text(
+        "\n".join(
+            [
+                json.dumps({"current_steps": 1, "elapsed_time": "0:00:20"}),
+                json.dumps({"current_steps": 2, "elapsed_time": "0:00:39"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    source_profile = tmp_path / "source_profile.json"
+    output_dir = tmp_path / "out"
+    _write_source_profile(
+        source_profile,
+        kt={"available": True, "wrapper_count": 0, "total_forward_calls": 0, "total_backward_calls": 0},
+        lora={"available": True, "trainable_parameters": 3, "peft_lora_parameters": 3},
+        trainer_log=trainer_log,
+        step_sample_rows=[
+            {"raw_step": 1, "step": 1, "forward_milliseconds": 5.0, "backward_milliseconds": 7.0},
+            {"raw_step": 2, "step": 2, "forward_milliseconds": 6.0, "backward_milliseconds": 8.0},
+        ],
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "scripts/lf/postprocess_lf_profile_artifacts.py",
+            "--source-profile-json",
+            str(source_profile),
+            "--output-dir",
+            str(output_dir),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+
+    with (output_dir / "step_samples.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert rows[0]["step_milliseconds_source"] == "trainer_log_elapsed_time"
+    assert float(rows[0]["step_milliseconds"]) == pytest.approx(20000.0)
+    assert float(rows[0]["forward_backward_milliseconds"]) == pytest.approx(12.0)
+    assert rows[1]["step_milliseconds_source"] == "trainer_log_elapsed_time"
+    assert float(rows[1]["step_milliseconds"]) == pytest.approx(19000.0)
+    assert float(rows[1]["trainer_e2e_step_milliseconds"]) == pytest.approx(19000.0)
+    assert float(rows[1]["forward_backward_milliseconds"]) == pytest.approx(14.0)
+    assert float(rows[1]["optimizer_update_side_milliseconds"]) == pytest.approx(18986.0)
+
+    profile = json.loads((output_dir / "profile.json").read_text(encoding="utf-8"))
+    profile_rows = profile["step_samples"]["rows"]
+    assert profile_rows[1]["step_milliseconds_source"] == "trainer_log_elapsed_time"
+    assert profile_rows[1]["step_milliseconds"] == pytest.approx(19000.0)
+
+
+def test_step_samples_prefer_high_resolution_heartbeat_intervals(tmp_path: Path) -> None:
+    heartbeat = tmp_path / "heartbeat.jsonl"
+    heartbeat.write_text(
+        "\n".join(
+            [
+                json.dumps({"stage": "dataloader_batch_fetch_start", "count": 1, "elapsed_seconds": 10.0}),
+                json.dumps({"stage": "training_step_start", "count": 1, "global_step": 0, "elapsed_seconds": 10.2}),
+                json.dumps({"stage": "training_step_end", "count": 1, "global_step": 0, "elapsed_seconds": 25.0}),
+                json.dumps({"stage": "optimizer_step_start", "count": 1, "global_step": 0, "elapsed_seconds": 25.4}),
+                json.dumps({"stage": "optimizer_step_end", "count": 1, "global_step": 0, "elapsed_seconds": 26.1}),
+                json.dumps({"stage": "dataloader_batch_fetch_start", "count": 2, "elapsed_seconds": 28.0}),
+                json.dumps({"stage": "training_step_start", "count": 2, "global_step": 1, "elapsed_seconds": 28.1}),
+                json.dumps({"stage": "training_step_end", "count": 2, "global_step": 1, "elapsed_seconds": 44.0}),
+                json.dumps({"stage": "optimizer_step_start", "count": 2, "global_step": 1, "elapsed_seconds": 44.3}),
+                json.dumps({"stage": "optimizer_step_end", "count": 2, "global_step": 1, "elapsed_seconds": 45.2}),
+                json.dumps({"stage": "trainer_end", "elapsed_seconds": 47.0}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    trainer_log = tmp_path / "trainer_log.jsonl"
+    trainer_log.write_text(
+        "\n".join(
+            [
+                json.dumps({"current_steps": 1, "elapsed_time": "0:00:20"}),
+                json.dumps({"current_steps": 2, "elapsed_time": "0:00:39"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    source_profile = tmp_path / "source_profile.json"
+    output_dir = tmp_path / "out"
+    _write_source_profile(
+        source_profile,
+        kt={"available": True, "wrapper_count": 0, "total_forward_calls": 0, "total_backward_calls": 0},
+        lora={"available": True, "trainable_parameters": 3, "peft_lora_parameters": 3},
+        trainer_log=trainer_log,
+        heartbeat_jsonl=heartbeat,
+        step_sample_rows=[
+            {"raw_step": 1, "step": 1, "forward_milliseconds": 5.0, "backward_milliseconds": 7.0},
+            {"raw_step": 2, "step": 2, "forward_milliseconds": 6.0, "backward_milliseconds": 8.0},
+        ],
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "scripts/lf/postprocess_lf_profile_artifacts.py",
+            "--source-profile-json",
+            str(source_profile),
+            "--output-dir",
+            str(output_dir),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+
+    with (output_dir / "step_samples.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["step_milliseconds_source"] == "heartbeat_dataloader_interval"
+    assert float(rows[0]["step_milliseconds"]) == pytest.approx(18000.0)
+    assert float(rows[0]["heartbeat_optimizer_step_milliseconds"]) == pytest.approx(700.0)
+    assert rows[1]["step_milliseconds_source"] == "heartbeat_dataloader_interval"
+    assert float(rows[1]["step_milliseconds"]) == pytest.approx(19000.0)
+    assert float(rows[1]["optimizer_update_side_milliseconds"]) == pytest.approx(18986.0)
+
+    profile = json.loads((output_dir / "profile.json").read_text(encoding="utf-8"))
+    timing = profile["trainer"]["timing"]
+    assert timing["source"] == "heartbeat_dataloader_interval"
+    assert timing["measured_e2e_step_milliseconds"] == pytest.approx(18500.0)
+    assert "| trainer e2e measured step incl optimizer | 18500.000 |" in (
+        output_dir / "lat.md"
+    ).read_text(encoding="utf-8")
+
+
 def _run_postprocess_output_with_optimizer_memory(
     tmp_path: Path,
     *,
@@ -897,6 +1237,33 @@ def test_source_summary_flags_kt_attention_plus_expert_surface(tmp_path: Path) -
     assert profile["trainable_surface"]["expert_lora_parameters"] == 3_321_888_768
     assert "attention+expert LoRA" in surface_csv
     assert "requires a baseline that also trains expert LoRA" in surface_csv
+
+
+def test_source_summary_flags_peft_expert_surface_without_kt_wrappers(tmp_path: Path) -> None:
+    output_dir = _run_postprocess_output(
+        tmp_path,
+        kt={"available": True, "wrapper_count": 0, "total_forward_calls": 0, "total_backward_calls": 0},
+        lora={
+            "available": True,
+            "trainable_parameters": 100,
+            "peft_lora_parameters": 100,
+            "peft_expert_lora_parameters": 80,
+            "lf_fused_expert_lora_parameters": 0,
+            "kt_expert_lora_parameters": 0,
+            "kt_peft_expert_lora_parameters": 0,
+            "kt_fused_expert_lora_parameters": 0,
+        },
+    )
+
+    summary = (output_dir / "summary.md").read_text(encoding="utf-8")
+    profile = json.loads((output_dir / "profile.json").read_text(encoding="utf-8"))
+    surface_csv = (output_dir / "trainable_surface.csv").read_text(encoding="utf-8")
+    assert "| trainable surface | attention+expert LoRA |" in summary
+    assert "| non-expert PEFT LoRA params | 20 |" in summary
+    assert "| PEFT expert LoRA params | 80 |" in summary
+    assert "| expert LoRA params | 80 |" in summary
+    assert profile["trainable_surface"]["expert_lora_parameters"] == 80
+    assert "attention+expert LoRA" in surface_csv
 
 
 def test_source_summary_flags_attention_only_surface(tmp_path: Path) -> None:
@@ -1092,6 +1459,46 @@ def test_source_summary_recomputes_stale_kt_lora_update_health_fail_closed(tmp_p
     assert health["passed"] is False
     assert "input_passed" in csv_text
     assert "stale pass from an older profiler" in csv_text
+
+
+def test_source_summary_rejects_kt_lora_health_with_no_updated_grad_tensors(tmp_path: Path) -> None:
+    output_dir = _run_postprocess_output_with_optimizer_memory(
+        tmp_path,
+        kt={"available": True, "wrapper_count": 1, "total_forward_calls": 2, "total_backward_calls": 1},
+        lora={
+            "available": True,
+            "trainable_parameters": 8,
+            "peft_lora_parameters": 0,
+            "lf_fused_expert_lora_parameters": 0,
+            "kt_expert_lora_parameters": 8,
+            "kt_peft_expert_lora_parameters": 0,
+            "kt_fused_expert_lora_parameters": 8,
+        },
+        optimizer_memory={
+            "kt_lora_update_health": {
+                "available": True,
+                "passed": True,
+                "reason": "stale pass from an older profiler",
+                "sampled_tensors": 1,
+                "total_fused_tensors": 1,
+                "after_sampled_tensors": 1,
+                "after_total_fused_tensors": 1,
+                "compared_tensors": 1,
+                "grad_nonzero_tensors": 1,
+                "updated_grad_tensors": 0,
+                "grad_nonzero_unchanged_tensors": 0,
+                "rows": [],
+            }
+        },
+    )
+
+    summary = (output_dir / "summary.md").read_text(encoding="utf-8")
+    profile = json.loads((output_dir / "profile.json").read_text(encoding="utf-8"))
+    health = profile["optimizer_memory"]["kt_lora_update_health"]
+    assert "| passed | False |" in summary
+    assert "no sampled nonzero-gradient fused LoRA tensors changed after optimizer step" in summary
+    assert health["input_passed"] is True
+    assert health["passed"] is False
 
 
 def test_source_summary_reports_kt_lora_tensor_set_mismatch_fields(tmp_path: Path) -> None:
@@ -1351,6 +1758,21 @@ def test_profile_json_csvs_include_nested_source_profile_artifacts(tmp_path: Pat
                 ],
             }
         },
+        "cpuadam": {
+            "enabled": True,
+            "runtime_verified": True,
+            "optimizer_wrapper_class": "DeepSpeedZeroOptimizer_Stage3",
+            "basic_optimizer_class": "DeepSpeedCPUAdam",
+            "config_optimizer_type": "AdamW",
+            "config_offload_optimizer_device": "cpu",
+        },
+        "asym_cpu_adamw": {
+            "enabled": True,
+            "backend": "torch",
+            "param_count": 2,
+            "cpu_master_bytes": 32,
+            "optimizer_state_cpu_bytes": 64,
+        },
     }
     profile_json = tmp_path / "profile.json"
     output_dir = tmp_path / "out"
@@ -1375,3 +1797,9 @@ def test_profile_json_csvs_include_nested_source_profile_artifacts(tmp_path: Pat
         encoding="utf-8"
     )
     assert "param_changed_after_step" in (output_dir / "kt_lora_update_health.csv").read_text(encoding="utf-8")
+    assert "DeepSpeedCPUAdam" in (output_dir / "cpuadam.csv").read_text(encoding="utf-8")
+    assert "cpu_master_bytes" in (output_dir / "asym_cpu_adamw.csv").read_text(encoding="utf-8")
+    persisted = json.loads(profile_json.read_text(encoding="utf-8"))
+    persisted_source = persisted["source_profile"]
+    assert persisted_source["trainable_surface"]["surface"] == "attention+expert LoRA"
+    assert persisted_source["optimizer_memory"]["kt_lora_update_health"]["passed"] is True

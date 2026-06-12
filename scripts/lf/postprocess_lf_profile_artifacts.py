@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,237 @@ def _fmt_pct(value: Any, total: Any) -> str:
     return "-"
 
 
+def _float_value(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _int_value(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _duration_to_seconds(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        result = float(value)
+        return result if math.isfinite(result) else None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    try:
+        if len(parts) == 3:
+            hours = float(parts[0])
+            minutes = float(parts[1])
+            seconds = float(parts[2])
+            result = hours * 3600.0 + minutes * 60.0 + seconds
+        elif len(parts) == 2:
+            minutes = float(parts[0])
+            seconds = float(parts[1])
+            result = minutes * 60.0 + seconds
+        else:
+            result = float(text)
+    except ValueError:
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _trainer_log_records_for_timing(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    trainer = profile.get("trainer", {})
+    if not isinstance(trainer, dict):
+        return []
+    records = trainer.get("records")
+    if isinstance(records, list):
+        return [record for record in records if isinstance(record, dict)]
+    log_path = str(trainer.get("trainer_log") or "").strip()
+    if not log_path:
+        return []
+    path = Path(log_path)
+    if not path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            rows.append(record)
+    return rows
+
+
+def _trainer_elapsed_by_step(profile: dict[str, Any]) -> dict[int, float]:
+    elapsed_by_step: dict[int, float] = {}
+    for record in _trainer_log_records_for_timing(profile):
+        step = _int_value(record.get("current_steps", record.get("step")))
+        elapsed_seconds = _duration_to_seconds(record.get("elapsed_time"))
+        if step is None or step <= 0 or elapsed_seconds is None:
+            continue
+        elapsed_by_step[step] = max(elapsed_seconds, elapsed_by_step.get(step, 0.0))
+    return elapsed_by_step
+
+
+def _heartbeat_records_for_timing(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    heartbeat = profile.get("heartbeat", {})
+    if not isinstance(heartbeat, dict):
+        return []
+    path = Path(str(heartbeat.get("jsonl") or "").strip())
+    if not path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            rows.append(record)
+    return rows
+
+
+def _record_elapsed_seconds(record: dict[str, Any]) -> float | None:
+    return _float_value(record.get("elapsed_seconds"))
+
+
+def _heartbeat_step_interval_rows(
+    profile: dict[str, Any], records: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
+    if records is None:
+        records = _heartbeat_records_for_timing(profile)
+    if not records:
+        return []
+
+    dataloader_start: dict[int, float] = {}
+    dataloader_end: dict[int, float] = {}
+    training_start: dict[int, float] = {}
+    training_end: dict[int, float] = {}
+    optimizer_start: dict[int, float] = {}
+    optimizer_end: dict[int, float] = {}
+    trainer_end: float | None = None
+
+    stage_maps: dict[str, dict[int, float]] = {
+        "dataloader_batch_fetch_start": dataloader_start,
+        "dataloader_batch_fetch_end": dataloader_end,
+        "training_step_start": training_start,
+        "training_step_end": training_end,
+        "optimizer_step_start": optimizer_start,
+        "optimizer_step_end": optimizer_end,
+    }
+    start_stages = {"dataloader_batch_fetch_start", "training_step_start", "optimizer_step_start"}
+    for record in records:
+        stage = record.get("stage")
+        elapsed_seconds = _record_elapsed_seconds(record)
+        if elapsed_seconds is None:
+            continue
+        if stage == "trainer_end":
+            trainer_end = max(elapsed_seconds, trainer_end or 0.0)
+            continue
+        stage_map = stage_maps.get(str(stage))
+        if stage_map is None:
+            continue
+        step = _int_value(record.get("count"))
+        if step is None or step <= 0:
+            global_step = _int_value(record.get("global_step"))
+            step = global_step + 1 if global_step is not None and global_step >= 0 else None
+        if step is None or step <= 0:
+            continue
+        previous = stage_map.get(step)
+        if previous is None:
+            stage_map[step] = elapsed_seconds
+        elif str(stage) in start_stages:
+            stage_map[step] = min(previous, elapsed_seconds)
+        else:
+            stage_map[step] = max(previous, elapsed_seconds)
+
+    if not dataloader_start:
+        return []
+    rows: list[dict[str, Any]] = []
+    for raw_step in sorted(dataloader_start):
+        start = dataloader_start[raw_step]
+        end = dataloader_start.get(raw_step + 1)
+        end_source = "next_dataloader_batch_fetch_start"
+        if end is None:
+            end = trainer_end
+            end_source = "trainer_end"
+        if end is None or end < start:
+            continue
+        row: dict[str, Any] = {
+            "raw_step": raw_step,
+            "trainer_elapsed_seconds": end,
+            "trainer_e2e_step_milliseconds": (end - start) * 1000.0,
+            "trainer_e2e_start_seconds": start,
+            "trainer_e2e_end_seconds": end,
+            "trainer_e2e_end_source": end_source,
+            "step_milliseconds_source": "heartbeat_dataloader_interval",
+        }
+        fetch_end = dataloader_end.get(raw_step)
+        if fetch_end is not None and fetch_end >= start:
+            row["heartbeat_dataloader_fetch_milliseconds"] = (fetch_end - start) * 1000.0
+        train_start = training_start.get(raw_step)
+        train_end = training_end.get(raw_step)
+        if train_start is not None and train_end is not None and train_end >= train_start:
+            row["heartbeat_training_step_milliseconds"] = (train_end - train_start) * 1000.0
+        opt_start = optimizer_start.get(raw_step)
+        opt_end = optimizer_end.get(raw_step)
+        if opt_start is not None and opt_end is not None and opt_end >= opt_start:
+            row["heartbeat_optimizer_step_milliseconds"] = (opt_end - opt_start) * 1000.0
+        rows.append(row)
+    return rows
+
+
+def _heartbeat_step_intervals_by_step(
+    profile: dict[str, Any], rows: list[dict[str, Any]] | None = None
+) -> dict[int, dict[str, Any]]:
+    if rows is None:
+        rows = _heartbeat_step_interval_rows(profile)
+    return {int(row["raw_step"]): row for row in rows if row.get("raw_step") is not None}
+
+
+def _heartbeat_timing(profile: dict[str, Any], rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    if rows is None:
+        rows = _heartbeat_step_interval_rows(profile)
+    if not rows:
+        return {}
+    config = profile.get("config", {})
+    warmup_steps = max(_int_value(config.get("warmup_steps")) or 0, 0) if isinstance(config, dict) else 0
+    measured_rows = [row for row in rows if (_int_value(row.get("raw_step")) or 0) > warmup_steps]
+    total_ms = sum(float(row["trainer_e2e_step_milliseconds"]) for row in rows)
+    measured_ms = sum(float(row["trainer_e2e_step_milliseconds"]) for row in measured_rows)
+    return {
+        "available": True,
+        "source": "heartbeat_dataloader_interval",
+        "final_steps": len(rows),
+        "final_elapsed_seconds": total_ms / 1000.0,
+        "total_e2e_step_milliseconds": total_ms / float(len(rows)),
+        "warmup_steps": warmup_steps,
+        "measured_steps": len(measured_rows),
+        "measured_elapsed_seconds": measured_ms / 1000.0,
+        "measured_e2e_step_milliseconds": measured_ms / float(len(measured_rows)) if measured_rows else None,
+        "note": "batch-fetch-start to next-batch-fetch-start intervals; final step ends at trainer_end",
+    }
+
+
 def _stage_memory_row(profile: dict[str, Any], name: str) -> dict[str, Any]:
     rows = profile.get("stage_memory", {}).get("rows", [])
     if not isinstance(rows, list):
@@ -71,6 +303,35 @@ def _stage_memory_row(profile: dict[str, Any], name: str) -> dict[str, Any]:
         if isinstance(row, dict) and row.get("name") == name:
             return row
     return {}
+
+
+def _stage_timing_ms(profile: dict[str, Any], name: str) -> float | None:
+    step = profile.get("step", {})
+    rows = step.get("rows", []) if isinstance(step, dict) else []
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, dict) and row.get("name") == name:
+                value = row.get("milliseconds")
+                if isinstance(value, (int, float)):
+                    return float(value)
+    row = _stage_memory_row(profile, name)
+    value = row.get("milliseconds")
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _trainer_timing(profile: dict[str, Any]) -> dict[str, Any]:
+    trainer = profile.get("trainer", {})
+    if not isinstance(trainer, dict):
+        return {}
+    timing = trainer.get("timing", {})
+    if isinstance(timing, dict) and timing.get("available") and timing.get("source") == "heartbeat_dataloader_interval":
+        return timing
+    heartbeat_timing = _heartbeat_timing(profile)
+    if heartbeat_timing.get("available"):
+        return heartbeat_timing
+    return timing if isinstance(timing, dict) else {}
 
 
 def _kt_counter_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
@@ -86,6 +347,22 @@ def _lora_counter_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(lora, dict):
         return []
     row = {key: value for key, value in lora.items() if not isinstance(value, (dict, list))}
+    return [row] if row else []
+
+
+def _cpuadam_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    cpuadam = profile.get("cpuadam", {})
+    if not isinstance(cpuadam, dict):
+        return []
+    row = {key: value for key, value in cpuadam.items() if not isinstance(value, (dict, list))}
+    return [row] if row else []
+
+
+def _asym_cpu_adamw_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    cpuadamw = profile.get("asym_cpu_adamw", {})
+    if not isinstance(cpuadamw, dict):
+        return []
+    row = {key: value for key, value in cpuadamw.items() if not isinstance(value, (dict, list))}
     return [row] if row else []
 
 
@@ -198,6 +475,7 @@ def _trainable_surface_summary(profile: dict[str, Any]) -> dict[str, Any]:
     peft_lora = _int_counter(lora, "peft_lora_parameters")
     surface_counter_keys = (
         "peft_lora_parameters",
+        "peft_expert_lora_parameters",
         "kt_peft_expert_lora_parameters",
         "kt_expert_lora_parameters",
         "lf_fused_expert_lora_parameters",
@@ -206,11 +484,15 @@ def _trainable_surface_summary(profile: dict[str, Any]) -> dict[str, Any]:
     if not any(_int_counter(lora, key) is not None for key in surface_counter_keys):
         return unknown_surface("missing LoRA surface counters")
 
+    peft_expert = _int_counter(lora, "peft_expert_lora_parameters")
     kt_peft_expert = _int_counter(lora, "kt_peft_expert_lora_parameters") or 0
+    if peft_expert is None:
+        peft_expert = kt_peft_expert
+    peft_expert = peft_expert or 0
     kt_expert = _int_counter(lora, "kt_expert_lora_parameters") or 0
     lf_fused_expert = _int_counter(lora, "lf_fused_expert_lora_parameters") or 0
-    expert_lora = kt_expert + lf_fused_expert
-    non_expert_peft = None if peft_lora is None else max(0, peft_lora - kt_peft_expert)
+    expert_lora = max(kt_expert, peft_expert + lf_fused_expert)
+    non_expert_peft = None if peft_lora is None else max(0, peft_lora - peft_expert)
 
     if expert_lora > 0 and (non_expert_peft or 0) > 0:
         surface = "attention+expert LoRA"
@@ -243,6 +525,7 @@ def _trainable_surface_summary(profile: dict[str, Any]) -> dict[str, Any]:
         "peft_lora_parameters": peft_lora,
         "non_expert_peft_lora_parameters": non_expert_peft,
         "expert_lora_parameters": expert_lora,
+        "peft_expert_lora_parameters": peft_expert,
         "lf_fused_expert_lora_parameters": lf_fused_expert,
         "kt_expert_lora_parameters": kt_expert,
         "kt_peft_expert_lora_parameters": kt_peft_expert,
@@ -335,6 +618,9 @@ def _normalize_kt_lora_update_health(health: dict[str, Any]) -> dict[str, Any]:
     elif normalized["grad_nonzero_unchanged_tensors"] > 0:
         derived_passed = False
         derived_reason = "one or more sampled nonzero-gradient fused LoRA tensors did not change after optimizer step"
+    elif normalized["updated_grad_tensors"] <= 0:
+        derived_passed = False
+        derived_reason = "no sampled nonzero-gradient fused LoRA tensors changed after optimizer step"
     else:
         derived_passed = True
         if normalized.get("exhaustive_elements"):
@@ -489,8 +775,10 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
     grad_clip = _grad_clip_summary(profile)
     process_memory = _process_memory(profile)
     process_memory_rows = _process_memory_rows(profile)
-    forward_ms = profile.get("forward", {}).get("total_milliseconds")
-    backward_ms = profile.get("backward", {}).get("total_milliseconds")
+    timing = _trainer_timing(profile)
+    forward_ms = _float_value(profile.get("forward", {}).get("total_milliseconds"))
+    backward_ms = _float_value(profile.get("backward", {}).get("total_milliseconds"))
+    forward_backward_ms = forward_ms + backward_ms if forward_ms is not None and backward_ms is not None else None
     lines = [
         "# LF LoRA-SFT Source Profile",
         "",
@@ -504,8 +792,27 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
         "| Stage | host ms | avg allocated start MiB | avg allocated end MiB | avg peak allocated MiB | avg peak reserved MiB | samples |",
         "|---|---:|---:|---:|---:|---:|---:|",
     ]
-    for name, total_ms in (("step.forward", forward_ms), ("step.backward", backward_ms)):
+    stage_names: list[tuple[str, Any]] = [
+        ("trainer.e2e.measured_step", timing.get("measured_e2e_step_milliseconds")),
+        ("trainer.e2e.total_step", timing.get("total_e2e_step_milliseconds")),
+        ("lf.training_step.total", _stage_timing_ms(profile, "lf.step.total")),
+        ("step.forward + step.backward", forward_backward_ms),
+        ("step.forward", forward_ms),
+        ("step.backward", backward_ms),
+        ("lf.grad_clip", _stage_timing_ms(profile, "lf.grad_clip")),
+        ("lf.optimizer.step", _stage_timing_ms(profile, "lf.optimizer.step")),
+        ("lf.scheduler.step", _stage_timing_ms(profile, "lf.scheduler.step")),
+    ]
+    seen_stage_names: set[str] = set()
+    for name, total_ms in stage_names:
+        if name in seen_stage_names:
+            continue
+        seen_stage_names.add(name)
+        if total_ms is None:
+            continue
         row = _stage_memory_row(profile, name)
+        if not row and name == "lf.training_step.total":
+            row = _stage_memory_row(profile, "lf.step.total")
         lines.append(
             "| {name} | {ms} | {start} | {end} | {peak_allocated} | {peak_reserved} | {samples} |".format(
                 name=name,
@@ -522,6 +829,7 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
         f"Peak allocated HBM: `{_fmt_mib(gpu.get('peak_allocated_hbm_bytes'))} MiB`",
         f"Peak reserved HBM: `{_fmt_mib(gpu.get('peak_reserved_hbm_bytes'))} MiB`",
         f"Reserved but unallocated: `{_fmt_mib(gpu.get('reserved_unallocated_bytes'))} MiB`",
+        f"Timing source: `{timing.get('source', '-')}`",
         f"Trainer log: `{trainer.get('trainer_log', '')}`",
         "",
     ]
@@ -611,6 +919,7 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
             lines += [
                 f"| trainable surface | {trainable_surface.get('surface', '-')} |",
                 f"| non-expert PEFT LoRA params | {trainable_surface.get('non_expert_peft_lora_parameters', '-')} |",
+                f"| PEFT expert LoRA params | {trainable_surface.get('peft_expert_lora_parameters', '-')} |",
                 f"| expert LoRA params | {trainable_surface.get('expert_lora_parameters', '-')} |",
                 f"| backend comparison note | {trainable_surface.get('comparison_note', '-')} |",
             ]
@@ -690,18 +999,43 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
 
 
 def _source_latency_markdown(profile: dict[str, Any]) -> str:
-    step_ms = profile.get("step", {}).get("total_milliseconds")
+    timing = _trainer_timing(profile)
+    e2e_measured_ms = timing.get("measured_e2e_step_milliseconds")
+    e2e_total_ms = timing.get("total_e2e_step_milliseconds")
+    training_step_ms = _stage_timing_ms(profile, "lf.step.total")
+    optimizer_ms = _stage_timing_ms(profile, "lf.optimizer.step")
+    grad_clip_ms = _stage_timing_ms(profile, "lf.grad_clip")
+    scheduler_ms = _stage_timing_ms(profile, "lf.scheduler.step")
     forward_ms = profile.get("forward", {}).get("total_milliseconds")
     backward_ms = profile.get("backward", {}).get("total_milliseconds")
+    forward_backward_ms = (
+        float(forward_ms) + float(backward_ms)
+        if isinstance(forward_ms, (int, float)) and isinstance(backward_ms, (int, float))
+        else None
+    )
+    optimizer_side_ms = (
+        float(e2e_measured_ms) - float(forward_backward_ms)
+        if isinstance(e2e_measured_ms, (int, float)) and isinstance(forward_backward_ms, (int, float))
+        else None
+    )
     return "\n".join(
         [
             "# LF LoRA-SFT Latency",
             "",
             "| Metric | ms |",
             "|---|---:|",
-            f"| step.forward + step.backward | {_fmt_ms(step_ms)} |",
+            f"| trainer e2e measured step incl optimizer | {_fmt_ms(e2e_measured_ms)} |",
+            f"| trainer e2e total step incl warmup | {_fmt_ms(e2e_total_ms)} |",
+            f"| optimizer/update side = e2e measured - fwd/bwd | {_fmt_ms(optimizer_side_ms)} |",
+            f"| lf.training_step.total | {_fmt_ms(training_step_ms)} |",
+            f"| step.forward + step.backward | {_fmt_ms(forward_backward_ms)} |",
             f"| step.forward | {_fmt_ms(forward_ms)} |",
             f"| step.backward | {_fmt_ms(backward_ms)} |",
+            f"| lf.grad_clip | {_fmt_ms(grad_clip_ms)} |",
+            f"| lf.optimizer.step substage | {_fmt_ms(optimizer_ms)} |",
+            f"| lf.scheduler.step | {_fmt_ms(scheduler_ms)} |",
+            "",
+            f"Timing source: `{timing.get('source', '-')}`",
             "",
         ]
     )
@@ -1022,6 +1356,87 @@ def _write_step_samples(profile: dict[str, Any], output_dir: Path) -> None:
         writer.writerows(normalized_rows)
 
 
+def _augment_step_sample_rows(
+    profile: dict[str, Any], heartbeat_rows: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
+    step_samples = profile.get("step_samples", {})
+    rows = step_samples.get("rows", []) if isinstance(step_samples, dict) else []
+    if not isinstance(rows, list):
+        return []
+
+    heartbeat_by_step = _heartbeat_step_intervals_by_step(profile, heartbeat_rows)
+    elapsed_by_step = _trainer_elapsed_by_step(profile)
+    normalized_rows: list[dict[str, Any]] = []
+    for raw_row in rows:
+        if not isinstance(raw_row, dict):
+            continue
+        row = dict(raw_row)
+        raw_step = _int_value(row.get("raw_step", row.get("step")))
+
+        forward_ms = _float_value(row.get("forward_milliseconds"))
+        backward_ms = _float_value(row.get("backward_milliseconds"))
+        forward_backward_ms = _float_value(row.get("forward_backward_milliseconds"))
+        if forward_backward_ms is None and (forward_ms is not None or backward_ms is not None):
+            forward_backward_ms = (forward_ms or 0.0) + (backward_ms or 0.0)
+        if forward_backward_ms is None and row.get("step_milliseconds_source") in (None, "", "forward_plus_backward_only"):
+            forward_backward_ms = _float_value(row.get("step_milliseconds"))
+        if forward_backward_ms is not None:
+            row["forward_backward_milliseconds"] = forward_backward_ms
+
+        profiled_training_step_ms = _float_value(row.get("profiled_training_step_milliseconds"))
+        if profiled_training_step_ms is None:
+            profiled_training_step_ms = _float_value(row.get("training_step_milliseconds"))
+        if profiled_training_step_ms is not None:
+            row["profiled_training_step_milliseconds"] = profiled_training_step_ms
+
+        heartbeat_row = heartbeat_by_step.get(raw_step) if raw_step is not None else None
+        elapsed_seconds = elapsed_by_step.get(raw_step) if raw_step is not None else None
+        previous_elapsed_seconds = None
+        if raw_step is not None:
+            previous_elapsed_seconds = 0.0 if raw_step == 1 else elapsed_by_step.get(raw_step - 1)
+        if heartbeat_row is not None:
+            trainer_step_ms = _float_value(heartbeat_row.get("trainer_e2e_step_milliseconds"))
+            if trainer_step_ms is not None:
+                row.update(heartbeat_row)
+                if forward_backward_ms is not None:
+                    row["optimizer_update_side_milliseconds"] = trainer_step_ms - forward_backward_ms
+                row["step_milliseconds"] = trainer_step_ms
+                row["step_milliseconds_source"] = "heartbeat_dataloader_interval"
+        elif elapsed_seconds is not None and previous_elapsed_seconds is not None:
+            trainer_step_ms = max(0.0, elapsed_seconds - previous_elapsed_seconds) * 1000.0
+            row["trainer_elapsed_seconds"] = elapsed_seconds
+            row["trainer_e2e_step_milliseconds"] = trainer_step_ms
+            if forward_backward_ms is not None:
+                row["optimizer_update_side_milliseconds"] = trainer_step_ms - forward_backward_ms
+            row["step_milliseconds"] = trainer_step_ms
+            row["step_milliseconds_source"] = "trainer_log_elapsed_time"
+        else:
+            if row.get("step_milliseconds_source") != "trainer_log_elapsed_time":
+                if forward_backward_ms is not None:
+                    row["step_milliseconds"] = forward_backward_ms
+                row["step_milliseconds_source"] = "forward_plus_backward_only"
+        normalized_rows.append(row)
+    return normalized_rows
+
+
+def _install_augmented_step_samples(profile: dict[str, Any]) -> None:
+    heartbeat_records = _heartbeat_records_for_timing(profile)
+    heartbeat_rows = _heartbeat_step_interval_rows(profile, heartbeat_records)
+    heartbeat_timing = _heartbeat_timing(profile, heartbeat_rows)
+    if heartbeat_timing.get("available"):
+        trainer = profile.get("trainer", {})
+        if not isinstance(trainer, dict):
+            trainer = {}
+        profile["trainer"] = {**trainer, "timing": heartbeat_timing}
+    rows = _augment_step_sample_rows(profile, heartbeat_rows)
+    if not rows:
+        return
+    step_samples = profile.get("step_samples", {})
+    if not isinstance(step_samples, dict):
+        step_samples = {}
+    profile["step_samples"] = {**step_samples, "rows": rows}
+
+
 def _stage_value(stage: dict[str, Any], name: str) -> float:
     for row in _as_rows(stage.get("stage_breakdown", {})):
         if row.get("name") == name:
@@ -1218,6 +1633,7 @@ def _write_source_artifacts(source_profile_json: Path, output_dir: Path, profile
     kt_lora_health = _kt_lora_update_health(profile)
     if kt_lora_health and isinstance(profile.get("optimizer_memory"), dict):
         profile["optimizer_memory"]["kt_lora_update_health"] = kt_lora_health
+    _install_augmented_step_samples(profile)
     output_dir.mkdir(parents=True, exist_ok=True)
     target_profile = profile_json or output_dir / "profile.json"
     target_profile.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1244,6 +1660,12 @@ def _write_source_artifacts(source_profile_json: Path, output_dir: Path, profile
     lora_rows = _lora_counter_rows(profile)
     if lora_rows:
         _write_csv(output_dir / "lora_counters.csv", lora_rows)
+    cpuadam_rows = _cpuadam_rows(profile)
+    if cpuadam_rows:
+        _write_csv(output_dir / "cpuadam.csv", cpuadam_rows)
+    asym_cpu_adamw_rows = _asym_cpu_adamw_rows(profile)
+    if asym_cpu_adamw_rows:
+        _write_csv(output_dir / "asym_cpu_adamw.csv", asym_cpu_adamw_rows)
     trainable_surface_rows = _trainable_surface_rows(profile)
     if trainable_surface_rows:
         _write_csv(output_dir / "trainable_surface.csv", trainable_surface_rows)
@@ -1266,6 +1688,8 @@ def _write_profile_csv_artifacts(profile_json: Path, output_dir: Path) -> None:
     kt_lora_health = _kt_lora_update_health(source_profile)
     if kt_lora_health and isinstance(source_profile.get("optimizer_memory"), dict):
         source_profile["optimizer_memory"]["kt_lora_update_health"] = kt_lora_health
+    _install_augmented_step_samples(source_profile)
+    profile_json.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     output_dir.mkdir(parents=True, exist_ok=True)
     stage_rows = _timing_by_stage(profile)
     op_rows = _timing_by_op(profile)
@@ -1292,6 +1716,12 @@ def _write_profile_csv_artifacts(profile_json: Path, output_dir: Path) -> None:
     lora_rows = _lora_counter_rows(source_profile)
     if lora_rows:
         _write_csv(output_dir / "lora_counters.csv", lora_rows)
+    cpuadam_rows = _cpuadam_rows(source_profile)
+    if cpuadam_rows:
+        _write_csv(output_dir / "cpuadam.csv", cpuadam_rows)
+    asym_cpu_adamw_rows = _asym_cpu_adamw_rows(source_profile)
+    if asym_cpu_adamw_rows:
+        _write_csv(output_dir / "asym_cpu_adamw.csv", asym_cpu_adamw_rows)
     trainable_surface_rows = _trainable_surface_rows(source_profile)
     if trainable_surface_rows:
         _write_csv(output_dir / "trainable_surface.csv", trainable_surface_rows)
@@ -1304,6 +1734,7 @@ def _write_profile_csv_artifacts(profile_json: Path, output_dir: Path) -> None:
     optimizer_preflight_rows = _optimizer_memory_preflight_rows(source_profile)
     if optimizer_preflight_rows:
         _write_csv(output_dir / "optimizer_memory_preflight.csv", optimizer_preflight_rows)
+    _write_step_samples(source_profile, output_dir)
     _write_csv(output_dir / "unattributed_timing.csv", _unattributed(profile))
 
 

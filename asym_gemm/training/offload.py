@@ -342,6 +342,7 @@ class AsymFrozenRMSNorm(nn.Module):
         weight = getattr(source, "weight", None)
         if not isinstance(weight, torch.Tensor):
             raise TypeError("AsymFrozenRMSNorm requires a weight tensor")
+        source_class = source.__class__.__name__
         self.host_weight = host_weight or adopt_host_weight(
             "rms_norm",
             weight,
@@ -350,16 +351,29 @@ class AsymFrozenRMSNorm(nn.Module):
             pin_memory_policy="none" if not pin_memory else "none",
         )
         self.eps = float(getattr(source, "variance_epsilon", getattr(source, "eps", 1e-6)))
+        self.shifted_weight = source_class == "Qwen3_5MoeRMSNorm"
+        self.gated = source_class == "Qwen3_5MoeRMSNormGated"
 
     @property
     def weight(self) -> torch.Tensor:
         return self.host_weight.weight
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
         weight = self.host_weight.weight.to(device=x.device, non_blocking=True)
+        if self.gated or gate is not None:
+            if gate is None:
+                raise TypeError("AsymFrozenRMSNorm gated mode requires gate")
+            input_dtype = x.dtype
+            out = x.to(torch.float32)
+            variance = out.pow(2).mean(-1, keepdim=True)
+            out = out * torch.rsqrt(variance + self.eps)
+            out = weight * out.to(input_dtype)
+            out = out * F.silu(gate.to(torch.float32))
+            return out.to(dtype=input_dtype)
         variance = x.float().pow(2).mean(-1, keepdim=True)
         out = x.float() * torch.rsqrt(variance + self.eps)
-        return (out * weight.float()).to(dtype=x.dtype)
+        scale = 1.0 + weight.float() if self.shifted_weight else weight.float()
+        return (out * scale).to(dtype=x.dtype)
 
 
 class AsymFrozenLayerNorm(nn.Module):

@@ -42,7 +42,11 @@ submodules/
 # tests/
 
 # Local profiling/report artifacts
-agent/
+agent/*
+!agent/
+!agent/mlp_math.md
+!agent/contribs.md
+!agent/status.md
 /profiling*/
 test_profiling*/
 # !/profiling/transpose_ncu/

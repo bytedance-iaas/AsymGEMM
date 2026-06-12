@@ -242,6 +242,8 @@ class LFTraceHandle:
     saved_tensor_tracker: SavedTensorTracker | None = None
     memory_breakdown_profiler: "LFMemoryBreakdownProfiler | None" = None
     model: nn.Module | None = None
+    prepared_optimizer: Any | None = None
+    optimizer: Any | None = None
 
     def restore(self) -> None:
         if self.memory_breakdown_profiler is not None:
@@ -719,7 +721,7 @@ class LFMemoryBreakdownProfiler:
 
     def set_optimizer(self, optimizer: Any | None) -> None:
         if optimizer is not None:
-            self._optimizer = optimizer
+            self._optimizer = _unwrap_optimizer_for_introspection(optimizer)
 
     def should_record_step(self, step: int) -> bool:
         if not self.enabled:
@@ -1056,18 +1058,23 @@ class LFMemoryBreakdownProfiler:
 
         seen_storages: set[tuple[str, int, int, str]] = set()
         persistent_storage_keys: set[tuple[str, int, int, str]] = set()
+        cpu_master_storage_keys: set[tuple[str, int, int, str]] = set()
 
-        def add(component: str, kind: str, tensor: torch.Tensor) -> None:
+        def storage_key_for(tensor: torch.Tensor) -> tuple[str, int, int, str]:
             try:
                 storage = tensor.untyped_storage()
                 storage_bytes = int(storage.nbytes())
-                storage_key = (str(tensor.device), int(storage.data_ptr()), storage_bytes, str(tensor.dtype))
+                return (str(tensor.device), int(storage.data_ptr()), storage_bytes, str(tensor.dtype))
             except Exception:
                 storage_bytes = _tensor_bytes(tensor)
-                storage_key = (str(tensor.device), id(tensor), storage_bytes, str(tensor.dtype))
+                return (str(tensor.device), id(tensor), storage_bytes, str(tensor.dtype))
+
+        def add(component: str, kind: str, tensor: torch.Tensor) -> tuple[str, int, int, str]:
+            storage_key = storage_key_for(tensor)
+            storage_bytes = int(storage_key[2])
             persistent_storage_keys.add(storage_key)
             if storage_key in seen_storages:
-                return
+                return storage_key
             seen_storages.add(storage_key)
             space = _device_space(tensor.device)
             key = kind if space == "GPU HBM" else f"{kind}_cpu"
@@ -1075,6 +1082,7 @@ class LFMemoryBreakdownProfiler:
             bucket[key] = bucket.get(key, 0) + storage_bytes
             if space != "GPU HBM" and tensor.is_pinned():
                 bucket[f"{kind}_cpu_pinned"] = bucket.get(f"{kind}_cpu_pinned", 0) + storage_bytes
+            return storage_key
 
         param_names: dict[int, str] = {}
         if model is not None:
@@ -1095,20 +1103,43 @@ class LFMemoryBreakdownProfiler:
                         add(component, "host_weight", tensor)
 
         if optimizer is not None:
+            cpu_param_names: dict[int, str] = {}
+            name_map = getattr(optimizer, "asym_cpu_param_name_map", None)
+            if callable(name_map):
+                try:
+                    cpu_param_names = {int(key): str(value) for key, value in name_map().items()}
+                except Exception:
+                    cpu_param_names = {}
+            master_params = getattr(optimizer, "asym_cpu_master_params", None)
+            if callable(master_params):
+                try:
+                    for cpu_param in master_params():
+                        if isinstance(cpu_param, torch.Tensor):
+                            name = cpu_param_names.get(id(cpu_param), "optimizer")
+                            component = _component_from_param_name(name)
+                            cpu_master_storage_keys.add(add(component, "cpu_master_weight", cpu_param))
+                except Exception:
+                    pass
             try:
                 state_items = list(optimizer.state.items())
             except Exception:
                 state_items = []
             for param, state in state_items:
-                component = _component_from_param_name(param_names.get(id(param), "optimizer"))
+                component = _component_from_param_name(
+                    param_names.get(id(param), cpu_param_names.get(id(param), "optimizer"))
+                )
                 if not isinstance(state, dict):
                     continue
                 for value in state.values():
                     if isinstance(value, torch.Tensor):
+                        if storage_key_for(value) in cpu_master_storage_keys:
+                            continue
                         add(component, "optimizer_state", value)
                     elif isinstance(value, dict):
                         for nested in value.values():
                             if isinstance(nested, torch.Tensor):
+                                if storage_key_for(nested) in cpu_master_storage_keys:
+                                    continue
                                 add(component, "optimizer_state", nested)
         self._persistent_storage_keys = persistent_storage_keys
         return result
@@ -1541,11 +1572,40 @@ def _wrap_callable_once(owner: Any, attr: str, name: str, handle: LFTraceHandle,
         seen.discard(key)
 
 
+def _unwrap_optimizer_for_introspection(optimizer: Any | None) -> Any | None:
+    if optimizer is None:
+        return None
+    if callable(getattr(optimizer, "asym_cpu_adamw_summary", None)) or callable(
+        getattr(optimizer, "asym_cpu_master_params", None)
+    ):
+        return optimizer
+    seen = {id(optimizer)}
+    current = optimizer
+    for _ in range(4):
+        next_optimizer = None
+        for attr in ("optimizer", "inner_optimizer", "base_optimizer"):
+            candidate = getattr(current, attr, None)
+            if candidate is not None and id(candidate) not in seen:
+                next_optimizer = candidate
+                break
+        if next_optimizer is None:
+            return optimizer
+        if callable(getattr(next_optimizer, "asym_cpu_adamw_summary", None)) or callable(
+            getattr(next_optimizer, "asym_cpu_master_params", None)
+        ):
+            return next_optimizer
+        seen.add(id(next_optimizer))
+        current = next_optimizer
+    return optimizer
+
+
 def _patch_optimizer_objects(handle: LFTraceHandle, trainer: Any) -> None:
     optimizer = getattr(trainer, "optimizer", None)
     if optimizer is not None:
+        handle.prepared_optimizer = optimizer
+        handle.optimizer = _unwrap_optimizer_for_introspection(optimizer)
         if handle.memory_breakdown_profiler is not None:
-            handle.memory_breakdown_profiler.set_optimizer(optimizer)
+            handle.memory_breakdown_profiler.set_optimizer(handle.optimizer)
         _wrap_callable_once(optimizer, "step", "lf.optimizer.step", handle, handle.patched_optimizers)
         _wrap_callable_once(optimizer, "zero_grad", "lf.optimizer.zero_grad", handle, handle.patched_optimizers)
     scheduler = getattr(trainer, "lr_scheduler", None)

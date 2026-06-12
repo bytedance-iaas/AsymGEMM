@@ -20,6 +20,7 @@ from asym_gemm.profiling.lf_trace import (  # noqa: E402
 )
 from scripts.lf.validate_lf_memory_capacity_schema import validate_breakdown  # noqa: E402
 from scripts.lf import run_lf_profiled_train as lf_profiled_train  # noqa: E402
+import torch  # noqa: E402
 
 
 def _load_plotter():
@@ -719,3 +720,58 @@ def test_saved_activation_peak_snapshot_is_not_cleared_by_stale_capture() -> Non
 
     assert profiler._saved_activation_peak_allocated == 100
     assert profiler._saved_activation_bytes_at_peak == {"attention": 4096}
+
+
+def test_memory_breakdown_labels_asym_cpu_adamw_master_and_state_once() -> None:
+    name = "model.layers.0.mlp.experts.3.lora_A.default.weight"
+    cpu_master = torch.nn.Parameter(torch.ones(2, 2, dtype=torch.float32))
+    exp_avg = torch.full((2, 2), 0.5, dtype=torch.float32)
+
+    class SyntheticAsymCPUAdamW:
+        def __init__(self) -> None:
+            self.state = {cpu_master: {"cpu_master": cpu_master.data, "exp_avg": exp_avg}}
+
+        def asym_cpu_master_params(self):
+            return [cpu_master]
+
+        def asym_cpu_param_name_map(self):
+            return {id(cpu_master): name}
+
+        def asym_cpu_adamw_summary(self):
+            return {"enabled": True, "backend": "torch"}
+
+    profiler = LFMemoryBreakdownProfiler(LFTraceConfig(memory_breakdown=True))
+    persistent = profiler._collect_persistent_bytes(None, SyntheticAsymCPUAdamW())
+
+    routed = persistent["routed_experts"]
+    assert routed["cpu_master_weight_cpu"] == cpu_master.untyped_storage().nbytes()
+    assert routed["optimizer_state_cpu"] == exp_avg.untyped_storage().nbytes()
+    assert routed.get("optimizer_state_cpu", 0) != cpu_master.untyped_storage().nbytes() + exp_avg.untyped_storage().nbytes()
+
+
+def test_source_profile_asym_cpu_adamw_summary_and_warmup_stage_rows() -> None:
+    class SyntheticOptimizer:
+        def asym_cpu_adamw_summary(self):
+            return {
+                "enabled": True,
+                "backend": "torch",
+                "param_count": 2,
+                "cpu_master_bytes": 32,
+                "optimizer_state_cpu_bytes": 64,
+            }
+
+    handle = type("Handle", (), {"optimizer": SyntheticOptimizer(), "prepared_optimizer": SyntheticOptimizer()})()
+    summary = lf_profiled_train._asym_cpu_adamw_summary_from_trace(handle)
+    assert summary["enabled"] is True
+    assert summary["backend"] == "torch"
+    assert summary["cpu_master_bytes"] == 32
+
+    recorder = lf_profiled_train.LFProfileRecorder(config={"warmup_steps": 1}, reset_stage_peak_stats=False)
+    with recorder.stage("lf.optimizer.step"):
+        pass
+    with recorder.stage("lf.optimizer.step"):
+        pass
+    row = next(row for row in recorder._stage_rows() if row["name"] == "lf.optimizer.step")
+    assert row["samples"] == 1
+    assert row["raw_samples"] == 2
+    assert row["warmup_samples_skipped"] == 1

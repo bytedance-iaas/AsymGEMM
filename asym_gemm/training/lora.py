@@ -392,8 +392,20 @@ def _is_lora_parameter_name(name: str, *, adapter_name: str = "default") -> bool
     return "lora_" in name.lower()
 
 
+def named_lora_parameters(model: nn.Module, *, adapter_name: str = "default") -> list[tuple[str, torch.nn.Parameter]]:
+    try:
+        named_params = model.named_parameters(remove_duplicate=False)
+    except TypeError:
+        named_params = model.named_parameters()
+    return [
+        (name, param)
+        for name, param in named_params
+        if _is_lora_parameter_name(name, adapter_name=adapter_name)
+    ]
+
+
 def lora_parameters(model: nn.Module, *, adapter_name: str = "default") -> list[torch.nn.Parameter]:
-    return [param for name, param in model.named_parameters() if _is_lora_parameter_name(name, adapter_name=adapter_name)]
+    return [param for _, param in named_lora_parameters(model, adapter_name=adapter_name)]
 
 
 def freeze_non_lora_params(model: nn.Module, *, adapter_name: str = "default") -> None:
@@ -961,6 +973,7 @@ __all__ = [
     "load_peft_adapter",
     "lora_parameters",
     "lora_state_hash",
+    "named_lora_parameters",
     "normalize_lora_dtype",
     "prepare_grouped_lora_metadata",
     "save_peft_adapter",

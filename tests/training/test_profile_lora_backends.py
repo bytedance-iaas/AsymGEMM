@@ -213,6 +213,57 @@ def test_activation_sweep_plot_parses_expert_policy_flat_dirs() -> None:
     assert bounded_meta["expert_recompute_token_max"] == 256
 
 
+def test_activation_sweep_plot_accepts_cpuadam_backend_labels(tmp_path: Path) -> None:
+    plotter = _load_activation_sweep_plot_module()
+    args = argparse.Namespace(
+        precision="",
+        workload=[],
+        backend=[],
+        router_mode=[],
+        profiler=[],
+        recompute=[],
+        batch_size=[],
+        seq_lens=[],
+        expert_recompute_policies=[],
+    )
+    config_root = tmp_path / "profiling" / "unit__lora__lf__bf16" / "unit__gpus1__b1_s128_w0_s1_r8_a16_drop000"
+
+    def write_profile(backend: str) -> Path:
+        run_dir = config_root / f"{backend}__source__recomp__poltok-le64__routerwhole" / "b1_s128"
+        run_dir.mkdir(parents=True)
+        profile = {
+            "config": {
+                "backend": backend,
+                "batch_size": 1,
+                "seq_len": 128,
+                "logical_tokens": 128,
+                "lora_dropout": 0.0,
+                "router_mode": "whole",
+            },
+            "forward": {"total_milliseconds": 1.0},
+            "backward": {"total_milliseconds": 2.0},
+            "memory": {"gpu": {}},
+            "stage_memory": {"rows": []},
+            "trainable_surface": {"available": True, "surface": "attention+expert LoRA", "trainable_parameters": 10},
+        }
+        (run_dir / "profile.json").write_text(json.dumps(profile) + "\n", encoding="utf-8")
+        return run_dir
+
+    torch_row = plotter.row_from_result_dir(args, write_profile("asym_cpuadamwtorch"))
+    ds_row = plotter.row_from_result_dir(args, write_profile("asym_cpuadamwds"))
+    zero_row = plotter.row_from_result_dir(args, write_profile("zero3_cpuadam"))
+
+    assert torch_row is not None
+    assert torch_row["backend"] == "asym_cpuadamwtorch"
+    assert torch_row["expert_policy_label"] == "tok-le64"
+    assert ds_row is not None
+    assert ds_row["backend"] == "asym_cpuadamwds"
+    assert ds_row["expert_policy_label"] == "tok-le64"
+    assert zero_row is not None
+    assert zero_row["backend"] == "zero3_cpuadam"
+    assert zero_row["expert_policy_label"] == "none"
+
+
 def test_profile_lora_e2e_driver_does_not_create_skipped_result_dirs(tmp_path: Path) -> None:
     subprocess.run(
         [

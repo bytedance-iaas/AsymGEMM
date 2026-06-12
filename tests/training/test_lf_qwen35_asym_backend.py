@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from asym_gemm.integrations.lf import apply_lf_asym_lora, get_asym_lora_state_dict, load_asym_peft_adapter, save_asym_peft_adapter
 from asym_gemm.integrations.peft_lf import adapt_lf_asym_peft_lora
-from asym_gemm.training.offload import AsymFrozenEmbedding, AsymFrozenLayerNorm
+from asym_gemm.training.offload import AsymFrozenEmbedding, AsymFrozenLayerNorm, AsymFrozenRMSNorm
 from asym_gemm.training.lora import AsymLoRALinear, TorchLoRALinear
 from asym_gemm.training.qwen3_moe import AsymQwen3Experts, AsymQwen3Router, is_qwen3_moe_block
 from asym_gemm.training.qwen35_moe import AsymQwen35MoeBlock, is_qwen35_moe_block
@@ -216,6 +216,47 @@ def test_real_transformers_qwen35_sparse_moe_block_matches_wrapper() -> None:
     _assert_close("real transformers qwen35 sparse moe", actual, expected)
 
 
+def test_asym_frozen_qwen35_rmsnorm_matches_shifted_weight_formula() -> None:
+    modeling = pytest.importorskip("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe")
+
+    torch.manual_seed(19)
+    source = modeling.Qwen3_5MoeRMSNorm(8).to(dtype=torch.bfloat16)
+    with torch.no_grad():
+        source.weight.normal_(mean=0.0, std=0.1)
+    source_key = source.weight.untyped_storage().data_ptr()
+    x = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+    expected = source(x)
+
+    wrapped = AsymFrozenRMSNorm(source)
+    actual = wrapped(x)
+
+    assert wrapped.host_weight.weight.untyped_storage().data_ptr() == source_key
+    assert wrapped.shifted_weight
+    assert not wrapped.gated
+    torch.testing.assert_close(actual, expected)
+
+
+def test_asym_frozen_qwen35_gated_rmsnorm_matches_transformers() -> None:
+    modeling = pytest.importorskip("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe")
+
+    torch.manual_seed(23)
+    source = modeling.Qwen3_5MoeRMSNormGated(8).to(dtype=torch.bfloat16)
+    with torch.no_grad():
+        source.weight.normal_(mean=1.0, std=0.1)
+    source_key = source.weight.untyped_storage().data_ptr()
+    x = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+    gate = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+    expected = source(x, gate)
+
+    wrapped = AsymFrozenRMSNorm(source)
+    actual = wrapped(x, gate)
+
+    assert wrapped.host_weight.weight.untyped_storage().data_ptr() == source_key
+    assert wrapped.gated
+    assert not wrapped.shifted_weight
+    torch.testing.assert_close(actual, expected)
+
+
 def test_asym_qwen35_moe_keeps_shared_branch_when_routed_experts_are_zero() -> None:
     torch.manual_seed(11)
     source = FakeQwen3_5MoeBlock()
@@ -357,6 +398,38 @@ def test_apply_lf_asym_lora_qwen35_shared_experts_adopt_cpu_storage_without_clon
     assert report.selected_gpu_resident_base_bytes_by_component == {}
     assert not any(".mlp.shared_expert.gate_proj.weight" in name for name, _param in model.named_parameters())
     assert not any(".mlp.shared_expert_gate.weight" in name for name, _param in model.named_parameters())
+
+
+def test_qwen35_shared_expert_gate_uses_torch_cpu_fetch_when_shape_is_not_direct_bf16_compatible() -> None:
+    model = FakeQwen3_5Model(hidden_dim=64, intermediate_dim=64)
+    gate_proj_key = model.layers[0].mlp.shared_expert.gate_proj.weight.untyped_storage().data_ptr()
+    shared_gate_key = model.layers[0].mlp.shared_expert_gate.weight.untyped_storage().data_ptr()
+
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["gate_proj", "shared_expert_gate"],
+        dense_target_modules=["gate_proj", "shared_expert_gate"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="shared_experts",
+        router_mode="whole",
+        strict=True,
+    )
+
+    gate_proj = model.layers[0].mlp.shared_expert.gate_proj
+    shared_gate = model.layers[0].mlp.shared_expert_gate
+    assert isinstance(gate_proj, AsymLoRALinear)
+    assert isinstance(shared_gate, AsymLoRALinear)
+    assert gate_proj.base_layer.backend == "asym"
+    assert shared_gate.base_layer.backend == "torch"
+    _assert_cpu_owner_adopted_or_pinned_replacement(gate_proj.base_layer.host_weight.weight, gate_proj_key)
+    _assert_cpu_owner_adopted_or_pinned_replacement(shared_gate.base_layer.host_weight.weight, shared_gate_key)
+    assert any(
+        "shared_expert_gate:torch_cpu_fetched:requires_8_aligned_nk" in skipped for skipped in report.skipped
+    )
 
 
 def test_apply_lf_asym_lora_qwen35_router_adopts_cpu_storage_without_clone() -> None:

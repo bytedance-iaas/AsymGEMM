@@ -40,11 +40,13 @@ from .lora import (
     load_lora_state_dict,
     lora_parameters,
     lora_state_hash,
+    named_lora_parameters,
     normalize_lora_dtype,
     prepare_grouped_lora_metadata,
     save_peft_adapter,
     load_peft_adapter,
 )
+from .cpu_adam import AsymCPUAdamW
 from .mlp import (
     AsymMLP,
     TorchMLP,
@@ -106,6 +108,7 @@ __all__ = [
     "AsymGroupedFrozenLinear",
     "AsymGroupedFrozenLinearFunction",
     "AsymLoRALinear",
+    "AsymCPUAdamW",
     "AsymMLP",
     "AsymLlama4Moe",
     "AsymLlama4Router",
@@ -165,6 +168,7 @@ __all__ = [
     "load_peft_adapter",
     "lora_parameters",
     "lora_state_hash",
+    "named_lora_parameters",
     "make_dense_group_metadata",
     "measure_gpu_weight_allocation",
     "normalize_lora_dtype",

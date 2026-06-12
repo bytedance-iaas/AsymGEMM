@@ -20,10 +20,13 @@ BACKENDS = (
     "torch",
     "asym",
     "asym_torch",
+    "asym_cpuadamwtorch",
+    "asym_cpuadamwds",
     "zero2",
     "zero3",
     "zero3_offload",
     "zero3_offload_mem",
+    "zero3_cpuadam",
     "superoffload",
     "kt",
     "kt_torchbf16",
@@ -84,10 +87,13 @@ BACKEND_MARKERS = {
     "torch": "x",
     "asym": "^",
     "asym_torch": "v",
+    "asym_cpuadamwtorch": "^",
+    "asym_cpuadamwds": "^",
     "zero2": "o",
     "zero3": "D",
     "zero3_offload": "P",
     "zero3_offload_mem": "*",
+    "zero3_cpuadam": "h",
     "superoffload": "X",
     "kt": "s",
     "kt_torchbf16": "s",
@@ -676,7 +682,7 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
     # may live under policy-named directories for pairing, but the policy is not
     # applied to those backends.  Canonicalize them to one baseline series so
     # plots do not imply Zero-policy changes with AsymGEMM expert recompute policy.
-    if str(meta["backend"]) not in {"asym", "asym_torch"}:
+    if str(meta["backend"]) not in {"asym", "asym_torch", "asym_cpuadamwtorch", "asym_cpuadamwds"}:
         expert_recompute_policy_spec = "none"
         expert_policy_label = "none"
         expert_recompute_policy = "none"

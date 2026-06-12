@@ -195,6 +195,8 @@ def _option_value(args: list[str], name: str) -> str:
 
 
 def _safe_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
         result = float(value)
     except (TypeError, ValueError):
@@ -203,6 +205,8 @@ def _safe_float(value: Any) -> float | None:
 
 
 def _safe_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
     try:
         result = int(value)
     except (TypeError, ValueError):
@@ -256,6 +260,193 @@ def _trainer_log_records(path: Path) -> list[dict[str, Any]]:
         if isinstance(record, dict):
             records.append(record)
     return records
+
+
+def _heartbeat_records(path: Path | None) -> list[dict[str, Any]]:
+    if path is None or not path.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def _duration_to_seconds(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        result = float(value)
+        return result if math.isfinite(result) else None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    try:
+        if len(parts) == 3:
+            hours = float(parts[0])
+            minutes = float(parts[1])
+            seconds = float(parts[2])
+            return hours * 3600.0 + minutes * 60.0 + seconds
+        if len(parts) == 2:
+            minutes = float(parts[0])
+            seconds = float(parts[1])
+            return minutes * 60.0 + seconds
+        seconds = float(text)
+    except ValueError:
+        return None
+    return seconds if math.isfinite(seconds) else None
+
+
+def _heartbeat_step_interval_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    dataloader_start: dict[int, float] = {}
+    dataloader_end: dict[int, float] = {}
+    training_start: dict[int, float] = {}
+    training_end: dict[int, float] = {}
+    optimizer_start: dict[int, float] = {}
+    optimizer_end: dict[int, float] = {}
+    trainer_end: float | None = None
+    stage_maps: dict[str, dict[int, float]] = {
+        "dataloader_batch_fetch_start": dataloader_start,
+        "dataloader_batch_fetch_end": dataloader_end,
+        "training_step_start": training_start,
+        "training_step_end": training_end,
+        "optimizer_step_start": optimizer_start,
+        "optimizer_step_end": optimizer_end,
+    }
+    start_stages = {"dataloader_batch_fetch_start", "training_step_start", "optimizer_step_start"}
+    for record in records:
+        elapsed_seconds = _safe_float(record.get("elapsed_seconds"))
+        if elapsed_seconds is None:
+            continue
+        stage = str(record.get("stage") or "")
+        if stage == "trainer_end":
+            trainer_end = max(elapsed_seconds, trainer_end or 0.0)
+            continue
+        stage_map = stage_maps.get(stage)
+        if stage_map is None:
+            continue
+        step = _safe_int(record.get("count"))
+        if step is None or step <= 0:
+            global_step = _safe_int(record.get("global_step"))
+            step = global_step + 1 if global_step is not None and global_step >= 0 else None
+        if step is None or step <= 0:
+            continue
+        previous = stage_map.get(step)
+        if previous is None:
+            stage_map[step] = elapsed_seconds
+        elif stage in start_stages:
+            stage_map[step] = min(previous, elapsed_seconds)
+        else:
+            stage_map[step] = max(previous, elapsed_seconds)
+
+    rows: list[dict[str, Any]] = []
+    for raw_step in sorted(dataloader_start):
+        start = dataloader_start[raw_step]
+        end = dataloader_start.get(raw_step + 1)
+        end_source = "next_dataloader_batch_fetch_start"
+        if end is None:
+            end = trainer_end
+            end_source = "trainer_end"
+        if end is None or end < start:
+            continue
+        row: dict[str, Any] = {
+            "raw_step": raw_step,
+            "trainer_elapsed_seconds": end,
+            "trainer_e2e_step_milliseconds": (end - start) * 1000.0,
+            "trainer_e2e_start_seconds": start,
+            "trainer_e2e_end_seconds": end,
+            "trainer_e2e_end_source": end_source,
+            "step_milliseconds_source": "heartbeat_dataloader_interval",
+        }
+        fetch_end = dataloader_end.get(raw_step)
+        if fetch_end is not None and fetch_end >= start:
+            row["heartbeat_dataloader_fetch_milliseconds"] = (fetch_end - start) * 1000.0
+        train_start = training_start.get(raw_step)
+        train_end = training_end.get(raw_step)
+        if train_start is not None and train_end is not None and train_end >= train_start:
+            row["heartbeat_training_step_milliseconds"] = (train_end - train_start) * 1000.0
+        opt_start = optimizer_start.get(raw_step)
+        opt_end = optimizer_end.get(raw_step)
+        if opt_start is not None and opt_end is not None and opt_end >= opt_start:
+            row["heartbeat_optimizer_step_milliseconds"] = (opt_end - opt_start) * 1000.0
+        rows.append(row)
+    return rows
+
+
+def _heartbeat_timing_summary(
+    records: list[dict[str, Any]],
+    config: dict[str, Any],
+    rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    if rows is None:
+        rows = _heartbeat_step_interval_rows(records)
+    if not rows:
+        return None
+    warmup_steps = max(_safe_int(config.get("warmup_steps")) or 0, 0)
+    measured_rows = [row for row in rows if int(row["raw_step"]) > warmup_steps]
+    total_ms = sum(float(row["trainer_e2e_step_milliseconds"]) for row in rows)
+    measured_ms = sum(float(row["trainer_e2e_step_milliseconds"]) for row in measured_rows)
+    return {
+        "available": True,
+        "source": "heartbeat_dataloader_interval",
+        "final_steps": len(rows),
+        "final_elapsed_seconds": total_ms / 1000.0,
+        "total_e2e_step_milliseconds": total_ms / float(len(rows)),
+        "warmup_steps": warmup_steps,
+        "measured_steps": len(measured_rows),
+        "measured_elapsed_seconds": measured_ms / 1000.0,
+        "measured_e2e_step_milliseconds": measured_ms / float(len(measured_rows)) if measured_rows else None,
+        "note": "batch-fetch-start to next-batch-fetch-start intervals; final step ends at trainer_end",
+    }
+
+
+def _trainer_timing_summary(records: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
+    step_records: list[dict[str, Any]] = []
+    for record in records:
+        current_steps = _safe_int(record.get("current_steps"))
+        elapsed_seconds = _duration_to_seconds(record.get("elapsed_time"))
+        if current_steps is None or current_steps <= 0 or elapsed_seconds is None:
+            continue
+        step_records.append({**record, "current_steps": current_steps, "elapsed_seconds": elapsed_seconds})
+    if not step_records:
+        return {"available": False, "reason": "trainer log has no elapsed step records"}
+
+    final_record = max(step_records, key=lambda row: (int(row["current_steps"]), float(row["elapsed_seconds"])))
+    final_steps = int(final_record["current_steps"])
+    final_elapsed_seconds = float(final_record["elapsed_seconds"])
+    warmup_steps = max(_safe_int(config.get("warmup_steps")) or 0, 0)
+    warmup_record = None
+    if warmup_steps > 0:
+        candidates = [row for row in step_records if int(row["current_steps"]) == warmup_steps]
+        if candidates:
+            warmup_record = max(candidates, key=lambda row: float(row["elapsed_seconds"]))
+
+    measured_steps = final_steps
+    measured_elapsed_seconds = final_elapsed_seconds
+    if warmup_record is not None and final_steps > warmup_steps:
+        measured_steps = final_steps - warmup_steps
+        measured_elapsed_seconds = final_elapsed_seconds - float(warmup_record["elapsed_seconds"])
+
+    total_step_ms = final_elapsed_seconds * 1000.0 / float(final_steps) if final_steps > 0 else None
+    measured_step_ms = (
+        measured_elapsed_seconds * 1000.0 / float(measured_steps) if measured_steps > 0 else None
+    )
+    return {
+        "available": True,
+        "source": "trainer_log_elapsed_time",
+        "final_steps": final_steps,
+        "final_elapsed_seconds": final_elapsed_seconds,
+        "total_e2e_step_milliseconds": total_step_ms,
+        "warmup_steps": warmup_steps,
+        "measured_steps": measured_steps,
+        "measured_elapsed_seconds": measured_elapsed_seconds,
+        "measured_e2e_step_milliseconds": measured_step_ms,
+    }
 
 
 def _env_config() -> dict[str, Any]:
@@ -318,7 +509,19 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
     backend = os.environ.get("ASYM_GEMM_LF_CONFIG_BACKEND") or ("torch" if asym_backend == "torch" else asym_backend or "hf")
     expert_policy = parse_expert_recompute_policy_spec(os.environ.get("ASYM_GEMM_LF_CONFIG_EXPERT_POLICY", "none"))
     is_superoffload_backend = backend == "superoffload"
-    is_deepspeed_backend = backend in {"zero2", "zero3", "zero3_offload", "zero3_offload_mem", "superoffload"}
+    is_cpuadam_backend = backend == "zero3_cpuadam"
+    is_asym_deepspeed_cpuadamw = backend == "asym_cpuadamwds" or (
+        str(env_config.get("use_asym_cpu_adamw", "")).lower() == "true"
+        and str(env_config.get("asym_cpu_adamw_backend", "")).lower() == "deepspeed"
+    )
+    is_deepspeed_backend = backend in {
+        "zero2",
+        "zero3",
+        "zero3_offload",
+        "zero3_offload_mem",
+        "zero3_cpuadam",
+        "superoffload",
+    }
     config = {
         "workflow": "lora_lf_sft",
         "workload": os.environ.get("ASYM_GEMM_LF_CONFIG_WORKLOAD", model_label),
@@ -344,6 +547,7 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "lora_rank": lora_rank,
         "lora_alpha": lora_alpha,
         "lora_dropout": _safe_float(_option_value(args, "--lora_dropout")),
+        "kt_max_cache_depth": _safe_int(_option_value(args, "--kt_max_cache_depth")),
         "max_grad_norm": _safe_float(env_config.get("max_grad_norm"))
         if _safe_float(env_config.get("max_grad_norm")) is not None
         else _safe_float(_option_value(args, "--max_grad_norm")),
@@ -379,7 +583,13 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "superoffload_config": os.environ.get("ASYM_GEMM_LF_CONFIG_SUPEROFFLOAD_CONFIG")
         if is_superoffload_backend
         else None,
-        "deepspeed_dir": os.environ.get("ASYM_GEMM_LF_CONFIG_DEEPSPEED_DIR") if is_deepspeed_backend else None,
+        "cpuadam_config": os.environ.get("ASYM_GEMM_LF_CONFIG_CPUADAM_CONFIG") if is_cpuadam_backend else None,
+        "deepspeed_config": os.environ.get("ASYM_GEMM_LF_CONFIG_DEEPSPEED_CONFIG")
+        if is_deepspeed_backend
+        else None,
+        "deepspeed_dir": os.environ.get("ASYM_GEMM_LF_CONFIG_DEEPSPEED_DIR")
+        if is_deepspeed_backend or is_asym_deepspeed_cpuadamw
+        else None,
         "pytorch_cuda_alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""),
         "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR", ""),
         "output_dir": _option_value(args, "--output_dir"),
@@ -423,9 +633,12 @@ def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] 
     kt_fused_params = _safe_int(lora.get("kt_fused_expert_lora_parameters"))
     kt_expert_params = _safe_int(lora.get("kt_expert_lora_parameters"))
     peft_lora_params = _safe_int(lora.get("peft_lora_parameters"))
+    peft_expert_params = _safe_int(lora.get("peft_expert_lora_parameters"))
     kt_peft_expert_params = _safe_int(lora.get("kt_peft_expert_lora_parameters"))
+    if peft_expert_params is None:
+        peft_expert_params = kt_peft_expert_params
     non_expert_peft_params = (
-        max(0, peft_lora_params - (kt_peft_expert_params or 0)) if peft_lora_params is not None else None
+        max(0, peft_lora_params - (peft_expert_params or 0)) if peft_lora_params is not None else None
     )
 
     def bf16_bytes(params: int) -> int:
@@ -449,6 +662,7 @@ def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] 
         "trainable_parameters": trainable_params,
         "kt_fused_expert_lora_parameters": kt_fused_params,
         "kt_expert_lora_parameters": kt_expert_params,
+        "peft_expert_lora_parameters": peft_expert_params,
         "non_expert_peft_lora_parameters": non_expert_peft_params,
         "param_bf16_bytes": param_bf16_bytes,
         "grad_bf16_bytes": grad_bf16_bytes,
@@ -480,7 +694,7 @@ def _capture_loaded_model(model: Any) -> Any:
     partial_writer = _MODEL_CAPTURE_PARTIAL_WRITER
     if heartbeat is not None:
         try:
-            kt = _kt_counters_from_model()
+            kt = _kt_counters_from_model(getattr(heartbeat, "config", {}))
             lora = _lora_counters_from_model()
             optimizer_memory_preflight = _kt_optimizer_memory_preflight(lora, getattr(heartbeat, "config", {}))
         except Exception as exc:
@@ -584,15 +798,34 @@ def _find_kt_wrappers(model: Any | None, base_model: Any | None) -> list[Any] | 
     return None
 
 
-def _kt_counters_from_model() -> dict[str, Any]:
+def _kt_counters_from_model(config: dict[str, Any] | None = None) -> dict[str, Any]:
     model, base_model = _model_and_base_model()
     if model is None:
         return {"available": False, "reason": "model hook did not capture a model"}
 
     wrappers = _find_kt_wrappers(model, base_model)
     rows: list[dict[str, Any]] = []
+    config = config or {}
+    logical_qlen = _safe_int(config.get("logical_qlen"))
+    logical_max_cache_depth = _safe_int(config.get("kt_max_cache_depth"))
+    kt_arm_token_chunks = _safe_int(config.get("kt_arm_token_chunks"))
+    expected_effective_max_cache_depth = (
+        logical_max_cache_depth * kt_arm_token_chunks
+        if logical_max_cache_depth is not None and kt_arm_token_chunks is not None
+        else None
+    )
+    kt_arm_row_context = {
+        "kt_arm_logical_qlen": logical_qlen,
+        "kt_arm_sft_token_chunk_size": _safe_int(config.get("kt_arm_sft_token_chunk_size")),
+        "kt_arm_effective_route_qlen": _safe_int(config.get("kt_arm_effective_route_qlen")),
+        "kt_arm_token_chunks": kt_arm_token_chunks,
+        "kt_arm_route_rank_work": _safe_int(config.get("kt_arm_route_rank_work")),
+        "logical_max_cache_depth": logical_max_cache_depth,
+        "expected_effective_max_cache_depth": expected_effective_max_cache_depth,
+    }
     for index, layer in enumerate(wrappers or []):
         wrapper = getattr(layer, "wrapper", None)
+        effective_max_cache_depth = int(getattr(wrapper, "max_cache_depth", 0) or 0)
         rows.append(
             {
                 "index": index,
@@ -602,8 +835,10 @@ def _kt_counters_from_model() -> dict[str, Any]:
                 "backward_calls": int(getattr(wrapper, "_kt_backward_calls", 0) or 0),
                 "lora_initialized": bool(getattr(wrapper, "_lora_initialized", False)),
                 "cache_depth": int(getattr(wrapper, "_cache_depth", 0) or 0),
-                "max_cache_depth": int(getattr(wrapper, "max_cache_depth", 0) or 0),
+                "max_cache_depth": effective_max_cache_depth,
+                "effective_max_cache_depth": effective_max_cache_depth,
                 "max_cache_depth_observed": int(getattr(wrapper, "_max_cache_depth_observed", 0) or 0),
+                **kt_arm_row_context,
                 "staging_buffer_scope": "wrapper",
                 "staging_buffer_capacity_qlen": int(getattr(getattr(wrapper, "_buffer", None), "qlen", 0) or 0),
                 "staging_buffer_capacity_bytes": int(
@@ -619,6 +854,10 @@ def _kt_counters_from_model() -> dict[str, Any]:
                 "native_last_cache_entry_bytes": int(getattr(wrapper, "last_cache_entry_bytes", 0) or 0),
                 "native_total_cache_entry_bytes_saved": int(
                     getattr(wrapper, "total_cache_entry_bytes_saved", 0) or 0
+                ),
+                "native_last_cache_route_bytes": int(getattr(wrapper, "last_cache_route_bytes", 0) or 0),
+                "native_total_cache_route_bytes_saved": int(
+                    getattr(wrapper, "total_cache_route_bytes_saved", 0) or 0
                 ),
                 "timing": dict(getattr(wrapper, "_kt_timing", {}) or {}),
             }
@@ -668,6 +907,87 @@ def _superoffload_summary_from_config(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _load_deepspeed_config(config_path: str) -> dict[str, Any]:
+    if not config_path:
+        return {}
+    path = Path(config_path)
+    if not path.is_file():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _cpuadam_summary_from_config(config: dict[str, Any]) -> dict[str, Any]:
+    is_cpuadam_backend = str(config.get("backend") or "").lower() == "zero3_cpuadam"
+    config_path = str(config.get("cpuadam_config") or config.get("deepspeed_config") or "") if is_cpuadam_backend else ""
+    ds_config = _load_deepspeed_config(config_path)
+    zero = ds_config.get("zero_optimization", {}) if isinstance(ds_config, dict) else {}
+    optimizer = ds_config.get("optimizer", {}) if isinstance(ds_config, dict) else {}
+    optimizer_params = optimizer.get("params", {}) if isinstance(optimizer, dict) else {}
+    offload_optimizer = zero.get("offload_optimizer", {}) if isinstance(zero, dict) else {}
+    offload_param = zero.get("offload_param", {}) if isinstance(zero, dict) else {}
+
+    optimizer_type = optimizer.get("type") if isinstance(optimizer, dict) else None
+    offload_optimizer_device = offload_optimizer.get("device") if isinstance(offload_optimizer, dict) else None
+    offload_param_device = offload_param.get("device") if isinstance(offload_param, dict) else None
+    torch_adam = optimizer_params.get("torch_adam") if isinstance(optimizer_params, dict) else None
+    adam_w_mode = optimizer_params.get("adam_w_mode") if isinstance(optimizer_params, dict) else None
+    fp32_optimizer_states = optimizer_params.get("fp32_optimizer_states") if isinstance(optimizer_params, dict) else None
+
+    optimizer_class = _DEEPSPEED_RUNTIME_MARKER.get("optimizer_class")
+    optimizer_wrapper_class = _DEEPSPEED_RUNTIME_MARKER.get("optimizer_wrapper_class")
+    basic_optimizer_class = _DEEPSPEED_RUNTIME_MARKER.get("basic_optimizer_class")
+    runtime_verified = basic_optimizer_class == "DeepSpeedCPUAdam" or optimizer_class == "DeepSpeedCPUAdam"
+    config_enabled = (
+        str(optimizer_type or "").lower() == "adamw"
+        and str(offload_optimizer_device or "").lower() == "cpu"
+        and torch_adam is False
+    )
+    return {
+        "enabled": bool(config_enabled or runtime_verified),
+        "runtime_verified": bool(runtime_verified),
+        "optimizer_class": optimizer_class,
+        "optimizer_wrapper_class": optimizer_wrapper_class,
+        "basic_optimizer_class": basic_optimizer_class,
+        "engine_class": _DEEPSPEED_RUNTIME_MARKER.get("engine_class"),
+        "engine_super_offload": _DEEPSPEED_RUNTIME_MARKER.get("engine_super_offload"),
+        "config_optimizer_type": optimizer_type,
+        "config_offload_optimizer_device": offload_optimizer_device,
+        "config_offload_param_device": offload_param_device,
+        "config_torch_adam": torch_adam,
+        "config_adam_w_mode": adam_w_mode,
+        "config_fp32_optimizer_states": fp32_optimizer_states,
+        "deepspeed_config": config_path or None,
+        "deepspeed_dir": config.get("deepspeed_dir"),
+        "marker_source": _DEEPSPEED_RUNTIME_MARKER.get("marker_source"),
+    }
+
+
+def _asym_cpu_adamw_summary_from_trace(trace_handle: Any | None) -> dict[str, Any]:
+    if trace_handle is None:
+        return {"enabled": False}
+    optimizer = getattr(trace_handle, "optimizer", None) or getattr(trace_handle, "prepared_optimizer", None)
+    summary_fn = getattr(optimizer, "asym_cpu_adamw_summary", None)
+    if callable(summary_fn):
+        try:
+            summary = summary_fn()
+        except Exception as exc:
+            return {"enabled": True, "summary_error": str(exc)}
+        if isinstance(summary, dict):
+            return {"enabled": True, **summary}
+    config = getattr(trace_handle, "config", {}) or {}
+    if isinstance(config, dict):
+        enabled_value = config.get("use_asym_cpu_adamw", "")
+    else:
+        enabled_value = getattr(config, "use_asym_cpu_adamw", "")
+    enabled = str(enabled_value).lower() == "true"
+    return {"enabled": bool(enabled)}
+
+
 def _install_deepspeed_optimizer_capture_hook() -> None:
     try:
         from deepspeed.runtime.engine import DeepSpeedEngine
@@ -677,13 +997,17 @@ def _install_deepspeed_optimizer_capture_hook() -> None:
     original_configure_optimizer = getattr(DeepSpeedEngine, "_configure_optimizer", None)
     if original_configure_optimizer is None:
         return
-    if getattr(original_configure_optimizer, "_asym_gemm_superoffload_capture", False):
+    if getattr(original_configure_optimizer, "_asym_gemm_deepspeed_optimizer_capture", False):
         return
 
     def wrapped_configure_optimizer(self: Any, client_optimizer: Any, model_parameters: Any) -> Any:
         result = original_configure_optimizer(self, client_optimizer, model_parameters)
         optimizer = getattr(self, "optimizer", None)
+        basic_optimizer = getattr(self, "basic_optimizer", None)
+        nested_optimizer = getattr(optimizer, "optimizer", None) if optimizer is not None else None
         optimizer_class = optimizer.__class__.__name__ if optimizer is not None else None
+        basic_optimizer_class = basic_optimizer.__class__.__name__ if basic_optimizer is not None else None
+        nested_optimizer_class = nested_optimizer.__class__.__name__ if nested_optimizer is not None else None
         try:
             engine_super_offload = bool(self.super_offload())
         except Exception:
@@ -691,6 +1015,9 @@ def _install_deepspeed_optimizer_capture_hook() -> None:
         _DEEPSPEED_RUNTIME_MARKER.update(
             {
                 "optimizer_class": optimizer_class,
+                "optimizer_wrapper_class": optimizer_class,
+                "basic_optimizer_class": basic_optimizer_class or nested_optimizer_class,
+                "nested_optimizer_class": nested_optimizer_class,
                 "engine_class": self.__class__.__name__,
                 "engine_super_offload": engine_super_offload,
                 "marker_source": "deepspeed_engine_hook",
@@ -698,11 +1025,15 @@ def _install_deepspeed_optimizer_capture_hook() -> None:
         )
         if _is_rank0() and optimizer_class:
             print(f"DeepSpeed Final Optimizer = {optimizer_class}", flush=True)
+            if basic_optimizer_class:
+                print(f"DeepSpeed Basic Optimizer = {basic_optimizer_class}", flush=True)
             if engine_super_offload:
                 print("DeepSpeed SuperOffload runtime enabled = true", flush=True)
+            if basic_optimizer_class == "DeepSpeedCPUAdam" or nested_optimizer_class == "DeepSpeedCPUAdam":
+                print("DeepSpeed CPUAdam runtime enabled = true", flush=True)
         return result
 
-    wrapped_configure_optimizer._asym_gemm_superoffload_capture = True  # type: ignore[attr-defined]
+    wrapped_configure_optimizer._asym_gemm_deepspeed_optimizer_capture = True  # type: ignore[attr-defined]
     DeepSpeedEngine._configure_optimizer = wrapped_configure_optimizer
 
 
@@ -710,9 +1041,9 @@ def _should_install_deepspeed_hook(args: list[str], config: dict[str, Any]) -> b
     if _option_value(args, "--deepspeed"):
         return True
     backend = str(config.get("backend") or "").lower()
-    if backend in {"zero2", "zero3", "zero3_offload", "zero3_offload_mem", "superoffload"}:
+    if backend in {"zero2", "zero3", "zero3_offload", "zero3_offload_mem", "zero3_cpuadam", "superoffload"}:
         return True
-    return bool(config.get("superoffload_config"))
+    return bool(config.get("superoffload_config") or config.get("cpuadam_config") or config.get("deepspeed_config"))
 
 
 def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: PartialProfileWriter) -> None:
@@ -1427,13 +1758,35 @@ def _lora_counters_from_model() -> dict[str, Any]:
     trainable_params = 0
     all_params = 0
     peft_lora_params = 0
+    peft_expert_lora_tensors = 0
+    peft_expert_lora_params = 0
+
+    def is_peft_lora_name(name: str) -> bool:
+        return "lora_A" in name or "lora_B" in name
+
+    def is_expert_lora_name(name: str) -> bool:
+        lowered = name.lower()
+        if not is_peft_lora_name(name):
+            return False
+        expert_markers = (
+            ".experts.",
+            ".expert.",
+            ".shared_expert",
+            "shared_experts",
+            "block_sparse_moe",
+            "moe.experts",
+        )
+        return any(marker in lowered for marker in expert_markers)
     for name, param in model.named_parameters():
         numel = int(param.numel())
         all_params += numel
         if param.requires_grad:
             trainable_params += numel
-        if ("lora_A" in name or "lora_B" in name) and param.requires_grad:
+        if is_peft_lora_name(name) and param.requires_grad:
             peft_lora_params += numel
+            if is_expert_lora_name(name):
+                peft_expert_lora_tensors += 1
+                peft_expert_lora_params += numel
 
     lf_fused_modules = 0
     lf_fused_tensors = 0
@@ -1518,6 +1871,8 @@ def _lora_counters_from_model() -> dict[str, Any]:
         "trainable_parameters": trainable_params,
         "all_parameters": all_params,
         "peft_lora_parameters": peft_lora_params,
+        "peft_expert_lora_tensors": peft_expert_lora_tensors,
+        "peft_expert_lora_parameters": peft_expert_lora_params,
         "lf_fused_expert_lora_modules": lf_fused_modules,
         "lf_fused_expert_lora_tensors": lf_fused_tensors,
         "lf_fused_expert_lora_parameters": lf_fused_params,
@@ -1658,8 +2013,6 @@ class LFProfileRecorder:
 
     def _measured_records(self, name: str) -> list[StageRecord]:
         records = self.records.get(name, [])
-        if name not in {"step.forward", "step.backward"}:
-            return records
         warmup_steps = min(self._warmup_steps(), len(records))
         return records[warmup_steps:]
 
@@ -1714,7 +2067,12 @@ class LFProfileRecorder:
             )
         return rows
 
-    def _step_sample_rows(self, losses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _step_sample_rows(
+        self,
+        losses: list[dict[str, Any]],
+        trainer_records: list[dict[str, Any]],
+        heartbeat_rows: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
         loss_by_step: dict[int, float] = {}
         for loss_row in losses:
             if not isinstance(loss_row, dict):
@@ -1723,6 +2081,20 @@ class LFProfileRecorder:
             loss = _safe_float(loss_row.get("loss"))
             if step is not None and loss is not None:
                 loss_by_step[step] = loss
+        elapsed_by_step: dict[int, float] = {}
+        for record in trainer_records:
+            if not isinstance(record, dict):
+                continue
+            step = _safe_int(record.get("current_steps", record.get("step")))
+            elapsed_seconds = _duration_to_seconds(record.get("elapsed_time"))
+            if step is None or step <= 0 or elapsed_seconds is None:
+                continue
+            elapsed_by_step[step] = max(elapsed_seconds, elapsed_by_step.get(step, 0.0))
+        heartbeat_by_step = {
+            int(row["raw_step"]): row
+            for row in (heartbeat_rows or [])
+            if row.get("raw_step") is not None
+        }
 
         def add_stage(row: dict[str, Any], prefix: str, record: StageRecord | None) -> None:
             if record is None:
@@ -1755,7 +2127,16 @@ class LFProfileRecorder:
 
         forward_records = self.records.get("step.forward", [])
         backward_records = self.records.get("step.backward", [])
-        sample_count = max(len(forward_records), len(backward_records))
+        training_step_records = self.records.get("lf.step.total", [])
+        max_elapsed_step = max(elapsed_by_step) if elapsed_by_step else 0
+        max_heartbeat_step = max(heartbeat_by_step) if heartbeat_by_step else 0
+        sample_count = max(
+            len(forward_records),
+            len(backward_records),
+            len(training_step_records),
+            max_elapsed_step,
+            max_heartbeat_step,
+        )
         rows: list[dict[str, Any]] = []
         warmup_steps = self._warmup_steps()
         for index in range(sample_count):
@@ -1764,6 +2145,7 @@ class LFProfileRecorder:
             is_warmup = raw_step <= warmup_steps
             forward = forward_records[index] if index < len(forward_records) else None
             backward = backward_records[index] if index < len(backward_records) else None
+            training_step = training_step_records[index] if index < len(training_step_records) else None
             row: dict[str, Any] = {
                 "step": measured_step if measured_step > 0 else raw_step,
                 "raw_step": raw_step,
@@ -1774,9 +2156,31 @@ class LFProfileRecorder:
                 row["loss"] = loss_by_step[raw_step]
             add_stage(row, "forward", forward)
             add_stage(row, "backward", backward)
-            row["step_milliseconds"] = sum(
+            add_stage(row, "training_step", training_step)
+            forward_backward_ms = sum(
                 record.milliseconds for record in (forward, backward) if record is not None
             )
+            row["forward_backward_milliseconds"] = forward_backward_ms
+            row["profiled_training_step_milliseconds"] = training_step.milliseconds if training_step is not None else None
+            heartbeat_row = heartbeat_by_step.get(raw_step)
+            elapsed_seconds = elapsed_by_step.get(raw_step)
+            previous_elapsed_seconds = 0.0 if raw_step == 1 else elapsed_by_step.get(raw_step - 1)
+            if heartbeat_row is not None:
+                trainer_step_ms = float(heartbeat_row["trainer_e2e_step_milliseconds"])
+                row.update(heartbeat_row)
+                row["optimizer_update_side_milliseconds"] = trainer_step_ms - forward_backward_ms
+                row["step_milliseconds"] = trainer_step_ms
+                row["step_milliseconds_source"] = "heartbeat_dataloader_interval"
+            elif elapsed_seconds is not None and previous_elapsed_seconds is not None:
+                trainer_step_ms = max(0.0, elapsed_seconds - previous_elapsed_seconds) * 1000.0
+                row["trainer_elapsed_seconds"] = elapsed_seconds
+                row["trainer_e2e_step_milliseconds"] = trainer_step_ms
+                row["optimizer_update_side_milliseconds"] = trainer_step_ms - forward_backward_ms
+                row["step_milliseconds"] = trainer_step_ms
+                row["step_milliseconds_source"] = "trainer_log_elapsed_time"
+            else:
+                row["step_milliseconds"] = forward_backward_ms
+                row["step_milliseconds_source"] = "forward_plus_backward_only"
             row["peak_allocated_hbm_bytes"] = max(
                 [record.peak_allocated_bytes for record in (forward, backward) if record is not None] or [0]
             )
@@ -1817,9 +2221,18 @@ class LFProfileRecorder:
     def _stage_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for name in sorted(self.records):
-            records = self.records.get(name, [])
-            if records:
-                rows.append({"name": name, "milliseconds": self._stage_total_ms(name), "samples": len(records)})
+            raw_records = self.records.get(name, [])
+            records = self._measured_records(name)
+            if raw_records:
+                rows.append(
+                    {
+                        "name": name,
+                        "milliseconds": self._stage_total_ms(name),
+                        "samples": len(records),
+                        "raw_samples": len(raw_records),
+                        "warmup_samples_skipped": len(raw_records) - len(records),
+                    }
+                )
         return rows
 
     def report(self, trace_handle: LFTraceHandle | None = None) -> dict[str, Any]:
@@ -1829,9 +2242,15 @@ class LFProfileRecorder:
         output_dir = Path(str(self.config.get("output_dir", ""))) if self.config.get("output_dir") else None
         trainer_log = output_dir / "trainer_log.jsonl" if output_dir is not None else None
         trainer_records = _trainer_log_records(trainer_log) if trainer_log is not None else []
+        heartbeat_path = Path(str(self.config.get("heartbeat_jsonl", ""))) if self.config.get("heartbeat_jsonl") else None
+        heartbeat_records = _heartbeat_records(heartbeat_path)
+        heartbeat_rows = _heartbeat_step_interval_rows(heartbeat_records)
+        trainer_timing = _heartbeat_timing_summary(heartbeat_records, self.config, heartbeat_rows) or _trainer_timing_summary(
+            trainer_records, self.config
+        )
         losses = self._loss_rows(trainer_records)
         lora = _lora_counters_from_model()
-        kt = _kt_counters_from_model()
+        kt = _kt_counters_from_model(self.config)
         process_memory = _process_memory_snapshot()
         return {
             "workload": self.config.get("workload", "lf"),
@@ -1877,11 +2296,12 @@ class LFProfileRecorder:
                 "warmup_steps": self._warmup_steps(),
                 "measure_steps": _safe_int(self.config.get("measure_steps")),
                 "total_steps": _safe_int(self.config.get("total_steps")),
-                "rows": self._step_sample_rows(losses),
+                "rows": self._step_sample_rows(losses, trainer_records, heartbeat_rows),
             },
             "trainer": {
                 "trainer_log": str(trainer_log) if trainer_log is not None else "",
                 "records": len(trainer_records),
+                "timing": trainer_timing,
                 "losses": losses,
             },
             "lora": lora,
@@ -1890,6 +2310,8 @@ class LFProfileRecorder:
             "optimizer_memory_preflight": _kt_optimizer_memory_preflight(lora, self.config),
             "optimizer_memory": _OPTIMIZER_MEMORY_MARKER,
             "superoffload": _superoffload_summary_from_config(self.config),
+            "cpuadam": _cpuadam_summary_from_config(self.config),
+            "asym_cpu_adamw": _asym_cpu_adamw_summary_from_trace(trace_handle),
             "expert_token_distribution": {"samples": 0, "per_expert": []},
             "notes": [
                 "LF source timings are host wall-clock ranges without per-range CUDA synchronization.",
@@ -1913,6 +2335,9 @@ def main() -> None:
 
     _GRAD_CLIP_MARKER = {}
     config = _config_from_args(lf_args)
+    heartbeat_path = os.environ.get(PROFILE_HEARTBEAT_ENV)
+    if heartbeat_path:
+        config["heartbeat_jsonl"] = heartbeat_path
     trace_config = LFTraceConfig.from_env(os.environ)
     recorder = LFProfileRecorder(
         config=config,
@@ -1920,7 +2345,6 @@ def main() -> None:
         reset_stage_peak_stats=not trace_config.memory_breakdown,
     )
     source_json = os.environ.get(PROFILE_SOURCE_JSON_ENV)
-    heartbeat_path = os.environ.get(PROFILE_HEARTBEAT_ENV)
     if source_json and _is_rank0():
         source_path = Path(source_json)
         _unlink_if_exists(source_path)

@@ -487,6 +487,21 @@ def _module_device_dtype(module: nn.Module) -> tuple[torch.device, torch.dtype]:
     return torch.device("cpu"), torch.bfloat16
 
 
+def _direct_bf16_linear_shape_reason(module: nn.Linear, *, require_backward: bool = True) -> str | None:
+    weight = module.weight
+    if weight.dim() != 2:
+        return "requires_2d_weight"
+    out_features = int(weight.shape[0])
+    in_features = int(weight.shape[1])
+    if out_features <= 0 or in_features <= 0:
+        return "requires_positive_nk"
+    if out_features % 8 != 0 or in_features % 8 != 0:
+        return "requires_8_aligned_nk"
+    if require_backward and out_features % 64 != 0:
+        return "dx_transpose_b_requires_64_aligned_out_features"
+    return None
+
+
 def _wrap_lf_linear_leaf(
     name: str,
     module: nn.Linear,
@@ -504,6 +519,9 @@ def _wrap_lf_linear_leaf(
 ) -> nn.Module:
     device, dtype = _module_device_dtype(module)
     if selected_cpu_offload and backend == "asym":
+        effective_backend: Literal["asym", "torch"] = backend
+        if _direct_bf16_linear_shape_reason(module, require_backward=True) is not None:
+            effective_backend = "torch"
         if strict and module.weight.device.type != "cpu":
             raise RuntimeError(f"{name} selected for CPU offload but source tensor is on {module.weight.device}")
         if strict and module.weight.dtype != torch.bfloat16:
@@ -523,7 +541,7 @@ def _wrap_lf_linear_leaf(
                 bias=bias,
                 rank=lora_rank,
                 alpha=lora_alpha,
-                backend=backend,
+                backend=effective_backend,
                 stats=stats,
                 device=device,
                 lora_dtype=torch.bfloat16,
@@ -534,7 +552,7 @@ def _wrap_lf_linear_leaf(
         return AsymFrozenLinear.from_host_weight(
             host_weight,
             bias=bias,
-            backend=backend,
+            backend=effective_backend,
             stats=stats,
             precision=precision,
         )
@@ -935,6 +953,11 @@ def apply_lf_asym_lora(
                     continue
                 report.skipped.append(f"{name}:not_nn_linear:{type(module).__name__}")
                 continue
+            shape_fallback_reason = (
+                _direct_bf16_linear_shape_reason(module, require_backward=True)
+                if selected_cpu_offload and backend == "asym"
+                else None
+            )
             dense_replacements.append(
                 (
                     name,
@@ -956,6 +979,8 @@ def apply_lf_asym_lora(
                     is_lora_target,
                 )
             )
+            if shape_fallback_reason is not None:
+                report.skipped.append(f"{name}:torch_cpu_fetched:{shape_fallback_reason}")
 
     if wrap_dense and _is_all_target(raw_lora_target) and not dense_replacements and report.dense_lora_wrapped == 0 and strict:
         raise ValueError("AsymGEMM requested dense LoRA target=all but found no dense nn.Linear modules.")
