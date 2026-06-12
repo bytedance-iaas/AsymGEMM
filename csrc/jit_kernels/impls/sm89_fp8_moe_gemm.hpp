@@ -30,15 +30,16 @@ public:
     static std::string generate_impl(const Args& args) {
         const auto& c = args.gemm_config;
         return fmt::format(R"(
-// sm89 moe fp8 v2: block-scale (1x128/128x128) support
+// sm89 moe fp8 v3: block-scale with multi-group K-tiles
 #include <asym_gemm/impls/sm80_moe_gemm.cuh>
 using namespace asym_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(
-        &sm89_moe_fp8_gemm_impl<{}, {}, {}, {}>);
+        &sm89_moe_fp8_gemm_impl<{}, {}, {}, {}, {}>);
 }};
 )",
-            c.block_m, c.block_n, c.block_k, c.nwarps);
+            c.block_m, c.block_n, c.block_k, c.nwarps,
+            args.params.scale_a_blk_ptr != nullptr);
     }
 
     static void launch_impl(const KernelHandle& kernel,
@@ -92,7 +93,8 @@ static void sm89_m_grouped_fp8_moe_gemm_contiguous(
         .sb_ng       = static_cast<int32_t>((N + 127) / 128),
     };
 
-    const int smem_bytes = sm80::smem_bytes_fp8(cfg.block_m, cfg.block_n, cfg.block_k);
+    const int smem_bytes = sm80::smem_bytes_fp8(cfg.block_m, cfg.block_n, cfg.block_k,
+                                                block_scale);
 
     const SM89MoEFP8GemmRuntime::Args runtime_args {
         .gemm_config = cfg,
@@ -102,8 +104,8 @@ static void sm89_m_grouped_fp8_moe_gemm_contiguous(
         .params      = params,
     };
 
-    const std::string kernel_name = fmt::format("sm89_moe_fp8_gemm_bm{}_bn{}_bk{}",
-        cfg.block_m, cfg.block_n, cfg.block_k);
+    const std::string kernel_name = fmt::format("sm89_moe_fp8_gemm_bm{}_bn{}_bk{}_blk{}",
+        cfg.block_m, cfg.block_n, cfg.block_k, block_scale ? 1 : 0);
 
     const auto& code    = SM89MoEFP8GemmRuntime::generate(runtime_args);
     const auto& runtime = compiler->build(kernel_name, code);
@@ -124,15 +126,16 @@ public:
     static std::string generate_impl(const Args& args) {
         const auto& c = args.gemm_config;
         return fmt::format(R"(
-// sm89 moe fp8 v2: block-scale (1x128/128x128) support
+// sm89 moe fp8 v3: block-scale with multi-group K-tiles
 #include <asym_gemm/impls/sm80_moe_gemm.cuh>
 using namespace asym_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(
-        &sm89_moe_fp8_gemm_masked_impl<{}, {}, {}, {}>);
+        &sm89_moe_fp8_gemm_masked_impl<{}, {}, {}, {}, {}>);
 }};
 )",
-            c.block_m, c.block_n, c.block_k, c.nwarps);
+            c.block_m, c.block_n, c.block_k, c.nwarps,
+            args.params.scale_a_blk_ptr != nullptr);
     }
 
     static void launch_impl(const KernelHandle& kernel,
@@ -184,7 +187,8 @@ static void sm89_m_grouped_fp8_moe_gemm_masked(
         .sb_ng       = static_cast<int32_t>((N + 127) / 128),
     };
 
-    const int smem_bytes = sm80::smem_bytes_fp8(cfg.block_m, cfg.block_n, cfg.block_k);
+    const int smem_bytes = sm80::smem_bytes_fp8(cfg.block_m, cfg.block_n, cfg.block_k,
+                                                block_scale);
 
     const SM89MoEFP8MaskedGemmRuntime::Args runtime_args {
         .gemm_config = cfg,
@@ -194,8 +198,8 @@ static void sm89_m_grouped_fp8_moe_gemm_masked(
         .params      = params,
     };
 
-    const std::string kernel_name = fmt::format("sm89_moe_fp8_gemm_masked_bm{}_bn{}_bk{}",
-        cfg.block_m, cfg.block_n, cfg.block_k);
+    const std::string kernel_name = fmt::format("sm89_moe_fp8_gemm_masked_bm{}_bn{}_bk{}_blk{}",
+        cfg.block_m, cfg.block_n, cfg.block_k, block_scale ? 1 : 0);
 
     const auto& code    = SM89MoEFP8MaskedGemmRuntime::generate(runtime_args);
     const auto& runtime = compiler->build(kernel_name, code);
