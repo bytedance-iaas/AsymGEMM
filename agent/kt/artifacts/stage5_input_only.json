@@ -1,0 +1,63 @@
+{
+  "config": {
+    "backend": "arm",
+    "qlen": [
+      128,
+      512
+    ],
+    "experts": 16,
+    "topk": 4,
+    "hidden": 512,
+    "intermediate": 256,
+    "rank": 8,
+    "alpha": 16.0,
+    "lora_dropout": 0.1,
+    "cache_policy": "input_only",
+    "small_qlen_threshold": 8,
+    "share_backward_bb": false,
+    "share_cache_pool": false,
+    "threads": 1
+  },
+  "results": [
+    {
+      "method": "ARMBF16_SFT",
+      "qlen": 128,
+      "iters": 5,
+      "warmup": 2,
+      "latency_ms_mean": 8.220670197624713,
+      "latency_ms_p50": 8.237970003392547,
+      "latency_ms_p95": 8.473451412282884,
+      "latency_ms_min": 7.821712992154062,
+      "latency_ms_max": 8.496434020344168,
+      "forward_calls": 7,
+      "backward_calls": 7,
+      "lora_dropout": 0.1,
+      "cache_policy": "input_only",
+      "small_qlen_threshold": 8,
+      "share_backward_bb": false,
+      "share_cache_pool": false,
+      "base_projection_kernel": "sve_bfdot",
+      "sve_bf16_compiled": true
+    },
+    {
+      "method": "ARMBF16_SFT",
+      "qlen": 512,
+      "iters": 5,
+      "warmup": 2,
+      "latency_ms_mean": 13.609462406020612,
+      "latency_ms_p50": 13.61330901272595,
+      "latency_ms_p95": 13.926742598414421,
+      "latency_ms_min": 13.258844031952322,
+      "latency_ms_max": 13.956637005321681,
+      "forward_calls": 7,
+      "backward_calls": 7,
+      "lora_dropout": 0.1,
+      "cache_policy": "input_only",
+      "small_qlen_threshold": 8,
+      "share_backward_bb": false,
+      "share_cache_pool": false,
+      "base_projection_kernel": "sve_bfdot",
+      "sve_bf16_compiled": true
+    }
+  ]
+}

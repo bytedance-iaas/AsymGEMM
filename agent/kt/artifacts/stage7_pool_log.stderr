@@ -1,0 +1,3 @@
+KT_ARM_SFT_POOL event=bwd_weight layer=0 qlen=0 cache_stack_top=0 fwd_work=0 bwd_work=0 bwd_weight=12582912 cache=0 requested=12582912
+KT_ARM_SFT_POOL event=bwd_work layer=0 qlen=0 cache_stack_top=0 fwd_work=0 bwd_work=1441792 bwd_weight=12582912 cache=0 requested=1441792
+KT_ARM_SFT_POOL event=bwd_work layer=0 qlen=0 cache_stack_top=0 fwd_work=0 bwd_work=1441792 bwd_weight=12582912 cache=0 requested=1441792

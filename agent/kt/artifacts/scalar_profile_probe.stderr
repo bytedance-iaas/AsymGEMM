@@ -1,0 +1,2 @@
+KT_ARM_SFT_PROFILE layer=0 route_pack_ms=0 input_pack_ms=0 base_gate_up_ms=12.4595 lora_gate_up_ms=0 activation_ms=0 base_down_ms=0 lora_down_ms=0 route_merge_ms=0 cache_save_ms=0.003648 backward_down_ms=0 backward_activation_ms=0 backward_gate_up_ms=0 lora_grad_reduce_ms=0 grad_flush_ms=0
+KT_ARM_SFT_PROFILE layer=0 route_pack_ms=0 input_pack_ms=0 base_gate_up_ms=0 lora_gate_up_ms=0 activation_ms=0 base_down_ms=0 lora_down_ms=0 route_merge_ms=0 cache_save_ms=0 backward_down_ms=0 backward_activation_ms=0 backward_gate_up_ms=0 lora_grad_reduce_ms=0 grad_flush_ms=0

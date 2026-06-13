@@ -1,0 +1,42 @@
+{
+  "config": {
+    "backend": "arm",
+    "qlen": [
+      128
+    ],
+    "experts": 16,
+    "topk": 4,
+    "hidden": 512,
+    "intermediate": 256,
+    "rank": 8,
+    "alpha": 16.0,
+    "lora_dropout": 0.1,
+    "cache_policy": "intermediates",
+    "small_qlen_threshold": 16,
+    "share_backward_bb": true,
+    "share_cache_pool": true,
+    "threads": 1
+  },
+  "results": [
+    {
+      "method": "ARMBF16_SFT",
+      "qlen": 128,
+      "iters": 1,
+      "warmup": 1,
+      "latency_ms_mean": 79.91789298830554,
+      "latency_ms_p50": 79.91789298830554,
+      "latency_ms_p95": 79.91789298830554,
+      "latency_ms_min": 79.91789298830554,
+      "latency_ms_max": 79.91789298830554,
+      "forward_calls": 2,
+      "backward_calls": 2,
+      "lora_dropout": 0.1,
+      "cache_policy": "intermediates",
+      "small_qlen_threshold": 16,
+      "share_backward_bb": true,
+      "share_cache_pool": true,
+      "base_projection_kernel": "sve_bfdot",
+      "sve_bf16_compiled": true
+    }
+  ]
+}
