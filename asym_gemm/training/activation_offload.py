@@ -6,16 +6,31 @@ from typing import Any
 import torch
 
 
+_CPU_BUFFER_POOL: dict[tuple[torch.dtype, tuple[int, ...], bool], list[torch.Tensor]] = {}
+
+
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
     return int(tensor.numel() * tensor.element_size())
 
 
 def _alloc_cpu(shape: tuple[int, ...], dtype: torch.dtype, *, pin_memory: bool) -> torch.Tensor:
     pinned = bool(pin_memory and torch.cuda.is_available())
+    key = (dtype, tuple(int(dim) for dim in shape), pinned)
+    pool = _CPU_BUFFER_POOL.get(key)
+    if pool:
+        return pool.pop()
     try:
-        return torch.empty(shape, device="cpu", dtype=dtype, pin_memory=pinned)
+        return torch.empty(key[1], device="cpu", dtype=dtype, pin_memory=pinned)
     except RuntimeError:
-        return torch.empty(shape, device="cpu", dtype=dtype)
+        return torch.empty(key[1], device="cpu", dtype=dtype)
+
+
+def _return_cpu(tensor: torch.Tensor, *, pin_memory: bool) -> None:
+    if tensor.device.type != "cpu" or not tensor.is_contiguous():
+        return
+    pinned = bool(pin_memory and torch.cuda.is_available() and tensor.is_pinned())
+    key = (tensor.dtype, tuple(int(dim) for dim in tensor.shape), pinned)
+    _CPU_BUFFER_POOL.setdefault(key, []).append(tensor.detach())
 
 
 @dataclass(frozen=True)
@@ -71,7 +86,6 @@ class ActivationOffloadManager:
         self._stage_keys_by_ptr: dict[int, tuple[str, torch.dtype, tuple[int, ...], str]] = {}
         self._active_cpu_bytes: dict[int, tuple[int, str]] = {}
         self._active_stage_bytes: dict[int, tuple[int, str]] = {}
-        self._retired_cpu_handles: list[CPUActivationHandle] = []
 
     def empty_cpu(
         self,
@@ -194,7 +208,7 @@ class ActivationOffloadManager:
         nbytes, tag = entry
         self.stats.cpu_owned_bytes = max(0, self.stats.cpu_owned_bytes - nbytes)
         self.stats.cpu_bytes_by_tag[tag] = max(0, self.stats.cpu_bytes_by_tag.get(tag, 0) - nbytes)
-        self._retired_cpu_handles.append(handle)
+        _return_cpu(handle.tensor, pin_memory=self.pin_memory)
 
     def snapshot(self) -> dict[str, Any]:
         return self.stats.as_dict()

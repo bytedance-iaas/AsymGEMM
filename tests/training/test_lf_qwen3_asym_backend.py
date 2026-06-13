@@ -19,6 +19,7 @@ from asym_gemm.integrations.lf import (
 )
 from asym_gemm.integrations.peft_lf import adapt_lf_asym_peft_lora
 from asym_gemm.training.activation_offload import ActivationOffloadManager
+from asym_gemm.training.exp_act_offload_lora import require_expert_activation_offload_kernels
 from asym_gemm.training.frozen_linear import AsymFrozenLinear, TorchGroupedFrozenLinear
 from asym_gemm.training.llama4_moe import AsymLlama4Moe, AsymLlama4Router, is_llama4_moe
 from asym_gemm.training.lora import AsymLoRALinear
@@ -1996,6 +1997,11 @@ def test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend(monke
     monkeypatch.delenv("ASYMM_EXPERT_ACT_OFFLOAD", raising=False)
     out_torch = torch_backend(x_torch, top_k_index, top_k_weights)
     monkeypatch.setenv("ASYMM_EXPERT_ACT_OFFLOAD", "1")
+    full_reason = require_expert_activation_offload_kernels(scope="full", check_only=True)
+    if full_reason is not None:
+        with pytest.raises(NotImplementedError, match=full_reason):
+            asym_backend(x_asym, top_k_index, top_k_weights)
+        return
     out_asym = asym_backend(x_asym, top_k_index, top_k_weights)
     _assert_tensor_close_l2("qwen3 activation offload output", out_asym, out_torch, max_abs_tol=6e-3, rel_l2_tol=2e-2)
 

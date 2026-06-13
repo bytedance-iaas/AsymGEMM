@@ -1,0 +1,2 @@
+all_cuda_params_on_cuda,all_masters_on_cpu,backend,cpu_adam_step_ms,cpu_master_bytes,enabled,grad_copy_ms,last_step_copyback_param_count,last_step_grad_param_count,optimizer_state_cpu_bytes,param_count,param_numel,pin_memory,pinned_cpu_master_bytes,skipped_copyback_no_grad_param_count,weight_copyback_ms
+True,True,deepspeed,0.0,13501464576,True,0.0,0,0,0,672,3375366144,True,13501464576,0,0.0

@@ -1,0 +1,2 @@
+basic_optimizer_class,config_adam_w_mode,config_fp32_optimizer_states,config_offload_optimizer_device,config_offload_param_device,config_optimizer_type,config_torch_adam,deepspeed_config,deepspeed_dir,enabled,engine_class,engine_super_offload,marker_source,optimizer_class,optimizer_wrapper_class,runtime_verified
+,,,,,,,,/home/kevinni/AsymGEMM-SFT/third_party/deepspeed,False,,,,,,False

@@ -48,6 +48,7 @@ agent/*
 !agent/contribs.md
 !agent/status.md
 !agent/attn_math.md
+!agent/impls/*
 /profiling*/
 test_profiling*/
 # !/profiling/transpose_ncu/

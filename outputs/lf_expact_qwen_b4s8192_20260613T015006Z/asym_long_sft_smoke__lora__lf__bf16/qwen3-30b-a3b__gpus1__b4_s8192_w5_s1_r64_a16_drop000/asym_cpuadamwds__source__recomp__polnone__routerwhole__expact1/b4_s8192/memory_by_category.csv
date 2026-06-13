@@ -1,0 +1,13 @@
+bytes,category,component,device
+6643777536,trainable_param,routed_experts,gpu
+106954752,trainable_param,attention,gpu
+1811939328,host_weight,attention,cpu
+622329856,host_weight,embed_tokens,cpu
+622329856,host_weight,lm_head,cpu
+421888,host_weight,norms,cpu
+57982058496,host_weight,routed_experts,cpu
+25165824,host_weight,router,cpu
+1811939328,pinned_host_weight,attention,cpu
+622329856,pinned_host_weight,lm_head,cpu
+57982058496,pinned_host_weight,routed_experts,cpu
+25165824,pinned_host_weight,router,cpu

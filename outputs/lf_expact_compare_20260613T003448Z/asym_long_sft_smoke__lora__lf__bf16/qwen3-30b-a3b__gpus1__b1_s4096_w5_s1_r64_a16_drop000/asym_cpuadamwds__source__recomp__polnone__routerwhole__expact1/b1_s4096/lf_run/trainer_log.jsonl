@@ -1,0 +1,7 @@
+{"current_steps": 1, "total_steps": 6, "loss": 1.3858578205108643, "lr": 0.0001, "epoch": 0.0078125, "percentage": 16.67, "elapsed_time": "0:03:16", "remaining_time": "0:16:21"}
+{"current_steps": 2, "total_steps": 6, "loss": 1.3503029346466064, "lr": 0.0001, "epoch": 0.015625, "percentage": 33.33, "elapsed_time": "0:03:58", "remaining_time": "0:07:57"}
+{"current_steps": 3, "total_steps": 6, "loss": 2.4099960327148438, "lr": 0.0001, "epoch": 0.0234375, "percentage": 50.0, "elapsed_time": "0:04:14", "remaining_time": "0:04:14"}
+{"current_steps": 4, "total_steps": 6, "loss": 2.218510627746582, "lr": 0.0001, "epoch": 0.03125, "percentage": 66.67, "elapsed_time": "0:05:03", "remaining_time": "0:02:31"}
+{"current_steps": 5, "total_steps": 6, "loss": 1.67863130569458, "lr": 0.0001, "epoch": 0.0390625, "percentage": 83.33, "elapsed_time": "0:05:19", "remaining_time": "0:01:03"}
+{"current_steps": 6, "total_steps": 6, "loss": 1.4556084871292114, "lr": 0.0001, "epoch": 0.046875, "percentage": 100.0, "elapsed_time": "0:05:35", "remaining_time": "0:00:00"}
+{"current_steps": 6, "total_steps": 6, "epoch": 0.046875, "percentage": 100.0, "elapsed_time": "0:05:35", "remaining_time": "0:00:00"}

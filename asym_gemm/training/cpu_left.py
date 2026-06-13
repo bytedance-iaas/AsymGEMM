@@ -6,12 +6,15 @@ import torch
 
 from .frozen_linear import (
     AsymExecutionStats,
+    _GroupedPadding,
     _group_metadata_tensors,
     _normalize_bf16_output_dtype,
+    _unpad_grouped_output,
 )
 
 
 CPU_LEFT_BF16_BINDING = "sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous"
+CPU_LEFT_GROUPED_BLOCK_M = 128
 
 
 def _arch_major(device: torch.device) -> int | None:
@@ -73,6 +76,68 @@ def cpu_left_grouped_bf16_reason(
     return None
 
 
+def _pad_cpu_left_grouped_input_for_asym(
+    x_cpu: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    *,
+    index_device: torch.device,
+    block_m: int = CPU_LEFT_GROUPED_BLOCK_M,
+) -> tuple[torch.Tensor, torch.Tensor, _GroupedPadding | None]:
+    if offsets.numel() != experts.numel():
+        return x_cpu, offsets, None
+
+    num_groups = int(experts.numel() - 1)
+    offsets_cpu = offsets.detach().to(device="cpu", dtype=torch.long)
+    starts = offsets_cpu[:-1]
+    counts = (offsets_cpu[1:] - starts).clamp_min(0)
+    padded_counts = torch.div(counts + int(block_m) - 1, int(block_m), rounding_mode="floor") * int(block_m)
+    padded_offsets_cpu = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.long),
+            torch.cumsum(padded_counts, dim=0),
+        ),
+        dim=0,
+    )
+
+    total_padded = int(padded_offsets_cpu[-1].item())
+    if total_padded == int(x_cpu.shape[0]):
+        return x_cpu, offsets, None
+
+    padded = torch.empty(
+        (total_padded, int(x_cpu.shape[1])),
+        device="cpu",
+        dtype=x_cpu.dtype,
+        pin_memory=True,
+    )
+    padded.zero_()
+
+    padded_row_chunks: list[torch.Tensor] = []
+    original_row_chunks: list[torch.Tensor] = []
+    for group in range(num_groups):
+        rows = int(counts[group].item())
+        if rows <= 0:
+            continue
+        src_start = int(starts[group].item())
+        dst_start = int(padded_offsets_cpu[group].item())
+        padded[dst_start : dst_start + rows].copy_(x_cpu[src_start : src_start + rows])
+        padded_row_chunks.append(torch.arange(dst_start, dst_start + rows, dtype=torch.long))
+        original_row_chunks.append(torch.arange(src_start, src_start + rows, dtype=torch.long))
+
+    if padded_row_chunks:
+        padded_rows = torch.cat(padded_row_chunks).to(device=index_device, non_blocking=True)
+        original_rows = torch.cat(original_row_chunks).to(device=index_device, non_blocking=True)
+    else:
+        padded_rows = torch.empty((0,), device=index_device, dtype=torch.long)
+        original_rows = torch.empty((0,), device=index_device, dtype=torch.long)
+
+    return (
+        padded,
+        padded_offsets_cpu.to(device=offsets.device, dtype=offsets.dtype, non_blocking=True),
+        _GroupedPadding(padded_rows=padded_rows, original_rows=original_rows),
+    )
+
+
 def grouped_expert_lora_cpu_left(
     x_cpu: torch.Tensor,
     weight: torch.Tensor,
@@ -117,10 +182,16 @@ def grouped_expert_lora_cpu_left(
 
     import asym_gemm
 
-    out = torch.empty((m, n), device=weight.device, dtype=out_dtype)
-    offsets_i32, experts_i32, list_size = _group_metadata_tensors(call_offsets, call_experts, device=weight.device)
-    getattr(asym_gemm, CPU_LEFT_BF16_BINDING)(
+    x_kernel, offsets_kernel, unpad = _pad_cpu_left_grouped_input_for_asym(
         x_cpu,
+        call_offsets,
+        call_experts,
+        index_device=weight.device,
+    )
+    out = torch.empty((int(x_kernel.shape[0]), n), device=weight.device, dtype=out_dtype)
+    offsets_i32, experts_i32, list_size = _group_metadata_tensors(offsets_kernel, call_experts, device=weight.device)
+    getattr(asym_gemm, CPU_LEFT_BF16_BINDING)(
+        x_kernel,
         weight,
         out,
         offsets_i32,
@@ -128,6 +199,7 @@ def grouped_expert_lora_cpu_left(
         list_size,
         compiled_dims,
     )
+    out = _unpad_grouped_output(out, unpad, output_m=m)
     if stats is not None:
         stats.cpu_left_lora_a_calls += 1
     return out
@@ -135,6 +207,7 @@ def grouped_expert_lora_cpu_left(
 
 __all__ = [
     "CPU_LEFT_BF16_BINDING",
+    "CPU_LEFT_GROUPED_BLOCK_M",
     "cpu_left_grouped_bf16_reason",
     "grouped_expert_lora_cpu_left",
 ]

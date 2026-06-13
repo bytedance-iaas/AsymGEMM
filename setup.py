@@ -42,6 +42,7 @@ def get_ext_modules():
         sources=[
             os.path.join(current_dir, 'csrc/python_api.cpp'),
             os.path.join(current_dir, 'csrc/dropout/dropout_mask.cu'),
+            os.path.join(current_dir, 'csrc/exp_act_offload/exp_act_offload_kernels.cu'),
             os.path.join(current_dir, 'csrc/qwen3/qwen3_gate_up_windowed_bwd.cu'),
         ],
         include_dirs=[

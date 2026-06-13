@@ -1,0 +1,10 @@
+{
+  "backend": "asym_cpuadamwds",
+  "count": 1,
+  "elapsed_seconds": 556.668004,
+  "kt_backend": null,
+  "pid": 3627219,
+  "source_json": "/workspace/AsymGEMM-SFT/third_party/AsymGEMM/outputs/lf_qwen_b2s8192_norecomp_expact_compare_20260613T024349Z/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b2_s8192_w5_s1_r64_a16_drop000/asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact1/b2_s8192/source_profile.json",
+  "stage": "source_profile_written",
+  "timestamp": "2026-06-13T02:53:30Z"
+}

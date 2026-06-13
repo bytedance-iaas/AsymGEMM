@@ -6,14 +6,24 @@ import pytest
 import torch
 
 import asym_gemm
+from asym_gemm.testing import calc_diff
 from asym_gemm.training import AsymExecutionStats
 
 
 cpu_left_impl = importlib.import_module("asym_gemm.training.cpu_left")
+expact_impl = importlib.import_module("asym_gemm.training.exp_act_offload_lora")
 lora_impl = importlib.import_module("asym_gemm.training.lora")
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA pinning required")
+
+
+def _sm100_cpu_left_available() -> bool:
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability(0)[0] == 10
+        and hasattr(asym_gemm, cpu_left_impl.CPU_LEFT_BF16_BINDING)
+    )
 
 
 def _pin_cpu(tensor: torch.Tensor) -> torch.Tensor:
@@ -64,8 +74,11 @@ def _install_reference_binding(monkeypatch: pytest.MonkeyPatch, calls: list[dict
             calls.append(
                 {
                     "a_device": a_cpu.device.type,
+                    "a_is_pinned": a_cpu.is_pinned(),
+                    "a_shape": tuple(a_cpu.shape),
                     "a_data_ptr": a_cpu.data_ptr(),
                     "weight_data_ptr": weight.data_ptr(),
+                    "out_shape": tuple(out.shape),
                     "pair_offsets_shape": tuple(pair_offsets.shape),
                     "experts_shape": tuple(experts.shape),
                     "list_size": int(list_size),
@@ -107,6 +120,27 @@ def test_grouped_expert_lora_cpu_left_matches_cuda_grouped_lora(monkeypatch: pyt
     torch.testing.assert_close(out, ref, atol=0.0, rtol=0.0)
 
 
+@pytest.mark.skipif(not _sm100_cpu_left_available(), reason="SM100 CPU-left binding required")
+def test_grouped_expert_lora_cpu_left_repeated_uneven_route_matches_cuda_grouped_lora() -> None:
+    torch.manual_seed(11)
+    lengths = [64, 96, 32, 128]
+    experts = [2, 0, 2, 1]
+    m = sum(lengths)
+    k = 1024
+    n = 64
+    x_cuda = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    x_cpu = _pin_cpu(x_cuda)
+    weight = torch.randn((3, n, k), device="cuda", dtype=torch.bfloat16)
+    offsets, experts_t = _metadata(lengths, experts)
+
+    out = cpu_left_impl.grouped_expert_lora_cpu_left(x_cpu, weight, offsets, experts_t)
+    ref = lora_impl.grouped_expert_lora(x_cuda, weight, offsets, experts_t)
+    torch.cuda.synchronize()
+
+    diff = calc_diff(out, ref)
+    assert diff < 1e-3, f"CPU-left repeated uneven route diff={diff:.5e}"
+
+
 def test_grouped_expert_lora_cpu_left_dense_metadata_avoids_weight_gather(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.manual_seed(1)
     calls: list[dict[str, object]] = []
@@ -136,12 +170,12 @@ def test_grouped_expert_lora_cpu_left_does_not_stage_full_input(
     calls: list[dict[str, object]] = []
     _install_reference_binding(monkeypatch, calls)
 
-    m = 192
+    m = 256
     k = 128
     n = 16
     x_cpu = _pin_cpu(torch.randn((m, k), device="cuda", dtype=torch.bfloat16))
     weight = torch.randn((2, n, k), device="cuda", dtype=torch.bfloat16)
-    offsets, experts_t = _metadata([96, 96], [0, 1])
+    offsets, experts_t = _metadata([128, 128], [0, 1])
     cuda_empty_shapes: list[tuple[int, ...]] = []
     real_empty = torch.empty
 
@@ -159,8 +193,50 @@ def test_grouped_expert_lora_cpu_left_does_not_stage_full_input(
 
     assert tuple(out.shape) == (m, n)
     assert calls and calls[0]["a_device"] == "cpu"
+    assert calls[0]["a_is_pinned"] is True
+    assert calls[0]["a_shape"] == (m, k)
     assert calls[0]["a_data_ptr"] == x_cpu.data_ptr()
     assert (m, k) not in cuda_empty_shapes
+
+
+def test_grouped_expert_lora_cpu_left_pads_cpu_input_without_cuda_staging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(12)
+    calls: list[dict[str, object]] = []
+    _install_reference_binding(monkeypatch, calls)
+
+    lengths = [96, 96]
+    m = sum(lengths)
+    padded_m = 256
+    k = 128
+    n = 16
+    x_cpu = _pin_cpu(torch.randn((m, k), device="cuda", dtype=torch.bfloat16))
+    weight = torch.randn((2, n, k), device="cuda", dtype=torch.bfloat16)
+    offsets, experts_t = _metadata(lengths, [0, 1])
+    cuda_empty_shapes: list[tuple[int, ...]] = []
+    real_empty = torch.empty
+
+    def counted_empty(*args, **kwargs):
+        device_arg = kwargs.get("device", None)
+        device = torch.device(device_arg) if device_arg is not None else torch.device("cpu")
+        if device.type == "cuda":
+            shape = args[0] if args else kwargs.get("size")
+            cuda_empty_shapes.append(tuple(shape))
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(cpu_left_impl.torch, "empty", counted_empty)
+
+    out = cpu_left_impl.grouped_expert_lora_cpu_left(x_cpu, weight, offsets, experts_t)
+    ref = _reference(x_cpu, weight, offsets, experts_t)
+
+    torch.testing.assert_close(out, ref, atol=0.0, rtol=0.0)
+    assert calls and calls[0]["a_device"] == "cpu"
+    assert calls[0]["a_is_pinned"] is True
+    assert calls[0]["a_shape"] == (padded_m, k)
+    assert calls[0]["a_data_ptr"] != x_cpu.data_ptr()
+    assert (m, k) not in cuda_empty_shapes
+    assert (padded_m, k) not in cuda_empty_shapes
 
 
 def test_grouped_expert_lora_cpu_left_empty_groups_match_reference(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -252,3 +328,44 @@ def test_grouped_expert_lora_cpu_left_records_stats(monkeypatch: pytest.MonkeyPa
     cpu_left_impl.grouped_expert_lora_cpu_left(x_cpu, weight, offsets, experts_t, stats=stats)
 
     assert stats.cpu_left_lora_a_calls == 1
+
+
+def test_expact_lora_a_forward_wrappers_use_real_cpu_left(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(8)
+    _install_reference_binding(monkeypatch)
+
+    lengths = [64, 32]
+    experts = [0, 1]
+    offsets, experts_t = _metadata(lengths, experts)
+    x_cpu = _pin_cpu(torch.randn((sum(lengths), 128), device="cuda", dtype=torch.bfloat16))
+    act_cpu = _pin_cpu(torch.randn((sum(lengths), 256), device="cuda", dtype=torch.bfloat16))
+    gate_a = torch.randn((2, 16, 128), device="cuda", dtype=torch.bfloat16)
+    up_a = torch.randn((2, 16, 128), device="cuda", dtype=torch.bfloat16)
+    down_a = torch.randn((2, 16, 256), device="cuda", dtype=torch.bfloat16)
+    stats = AsymExecutionStats()
+
+    gate, up = expact_impl.grouped_lora_a_pair_forward_cpu_left(
+        x_cpu,
+        gate_a,
+        up_a,
+        offsets,
+        experts_t,
+        metadata=None,
+        stats=stats,
+        tag="gate_up",
+    )
+    down = expact_impl.grouped_lora_a_forward_cpu_left(
+        act_cpu,
+        down_a,
+        offsets,
+        experts_t,
+        metadata=None,
+        stats=stats,
+        tag="down",
+    )
+
+    torch.testing.assert_close(gate, _reference(x_cpu, gate_a, offsets, experts_t), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(up, _reference(x_cpu, up_a, offsets, experts_t), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(down, _reference(act_cpu, down_a, offsets, experts_t), atol=0.0, rtol=0.0)
+    assert stats.cpu_left_lora_a_calls == 3
+    assert stats.expact_lora_a_forward_grouped_calls == 3

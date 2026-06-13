@@ -1,0 +1,10 @@
+{
+  "backend": "asym_cpuadamwds",
+  "count": 1,
+  "elapsed_seconds": 451.234245,
+  "kt_backend": null,
+  "pid": 3547212,
+  "source_json": "/workspace/AsymGEMM-SFT/third_party/AsymGEMM/outputs/lf_expact_compare_20260613T003448Z/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b1_s4096_w5_s1_r64_a16_drop000/asym_cpuadamwds__source__recomp__polnone__routerwhole__expact1/b1_s4096/source_profile.json",
+  "stage": "source_profile_written",
+  "timestamp": "2026-06-13T00:42:43Z"
+}

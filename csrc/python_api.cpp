@@ -8,6 +8,7 @@
 #include "apis/gemm.hpp"
 // #include "apis/asym_gemm.hpp"
 #include "apis/dropout.hpp"
+#include "apis/exp_act_offload.hpp"
 #include "apis/layout.hpp"
 #include "apis/qwen3_moe.hpp"
 #include "apis/runtime.hpp"
@@ -20,6 +21,7 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "DeepGEMM C++ library";
     asym_gemm::dropout::register_apis(m);
+    asym_gemm::exp_act_offload::register_apis(m);
     asym_gemm::gemm::register_apis(m);
     asym_gemm::layout::register_apis(m);
     asym_gemm::qwen3_moe::register_apis(m);

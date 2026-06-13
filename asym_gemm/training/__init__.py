@@ -51,6 +51,15 @@ from .cpu_left import (
     CPU_LEFT_BF16_BINDING,
     cpu_left_grouped_bf16_reason,
 )
+from .exp_act_offload_lora import (
+    grouped_lora_a_forward_cpu_left,
+    grouped_lora_a_grad_cpu_right,
+    grouped_lora_a_pair_forward_cpu_left,
+    grouped_lora_a_pair_grad_cpu_right,
+    grouped_lora_b_backward_cpu_source,
+    require_expert_activation_offload_kernels,
+    stage_low_rank_from_cpu,
+)
 from .cpu_adam import AsymCPUAdamW
 from .mlp import (
     AsymMLP,
@@ -168,6 +177,11 @@ __all__ = [
     "grouped_expert_lora",
     "grouped_expert_lora_cpu_left",
     "grouped_expert_lora_pair",
+    "grouped_lora_a_forward_cpu_left",
+    "grouped_lora_a_grad_cpu_right",
+    "grouped_lora_a_pair_forward_cpu_left",
+    "grouped_lora_a_pair_grad_cpu_right",
+    "grouped_lora_b_backward_cpu_source",
     "is_qwen3_experts",
     "is_qwen3_moe_block",
     "is_qwen35_moe_block",
@@ -189,6 +203,8 @@ __all__ = [
     "save_peft_adapter",
     "storage_key",
     "prepare_grouped_lora_metadata",
+    "require_expert_activation_offload_kernels",
+    "stage_low_rank_from_cpu",
     "tensor_nbytes",
     "validate_lf_offload_residency",
     "wrap_qwen3_experts",

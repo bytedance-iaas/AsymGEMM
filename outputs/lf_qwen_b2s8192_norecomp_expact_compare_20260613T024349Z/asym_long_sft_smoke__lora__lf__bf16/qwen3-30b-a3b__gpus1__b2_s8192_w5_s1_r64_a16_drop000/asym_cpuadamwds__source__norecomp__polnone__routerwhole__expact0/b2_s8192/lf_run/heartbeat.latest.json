@@ -1,0 +1,11 @@
+{
+  "backend": "asym_cpuadamwds",
+  "count": 1,
+  "elapsed_seconds": 123.89821,
+  "error": "OutOfMemoryError('CUDA out of memory. Tried to allocate 9.27 GiB. GPU 0 has a total capacity of 184.00 GiB of which 2.37 GiB is free. Including non-PyTorch memory, this process has 181.47 GiB memory in use. Of the allocated memory 180.43 GiB is allocated by PyTorch, and 211.11 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)')",
+  "kt_backend": null,
+  "pid": 3634718,
+  "source_json": "/workspace/AsymGEMM-SFT/third_party/AsymGEMM/outputs/lf_qwen_b2s8192_norecomp_expact_compare_20260613T024349Z/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b2_s8192_w5_s1_r64_a16_drop000/asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact0/b2_s8192/source_profile.partial.json",
+  "stage": "source_profile_partial_written",
+  "timestamp": "2026-06-13T02:55:49Z"
+}
