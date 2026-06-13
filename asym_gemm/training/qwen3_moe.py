@@ -10,6 +10,7 @@ from typing import Literal
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .frozen_linear import (
     AsymExecutionStats,
@@ -2141,8 +2142,17 @@ class AsymQwen3Experts(nn.Module):
             down_mask_packed,
         )
 
+    def _uses_expert_gc(self) -> bool:
+        config = self.expert_recompute_config
+        return bool(config.torch_checkpoint_enabled and self.training and torch.is_grad_enabled())
+
     def _uses_expert_recompute(self) -> bool:
-        return bool(self.expert_recompute_config.enabled and self.training and torch.is_grad_enabled())
+        config = self.expert_recompute_config
+        return bool(config.custom_autograd_enabled and self.training and torch.is_grad_enabled())
+
+    def _expert_gc_use_reentrant(self) -> bool:
+        default = _env_flag("ASYM_EXPERT_GC_REENTRANT", True)
+        return _env_flag("ASYM_EXPERT_GC_USE_REENTRANT", default)
 
     def _activation_offload_requested(self) -> bool:
         return _env_flag("ASYMM_EXPERT_ACT_OFFLOAD", False)
@@ -2227,6 +2237,35 @@ class AsymQwen3Experts(nn.Module):
             self,
         )
 
+    def _forward_expert_gc(
+        self,
+        packed: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.lora_dropout_p >= 1.0:
+            raise NotImplementedError("gc-exp requires 0.0 <= lora_dropout < 1.0")
+        if not packed.is_floating_point():
+            raise NotImplementedError("gc-exp requires floating packed expert input")
+        if not packed.requires_grad and any(param.requires_grad for param in self.parameters()):
+            packed = packed.requires_grad_(True)
+
+        def expert_body(packed_arg: torch.Tensor) -> torch.Tensor:
+            return self._forward_expert_body(
+                packed_arg,
+                offsets,
+                experts,
+                dense_experts=True,
+            )
+
+        with prof_range(self._forward_range("expert_gc")):
+            return checkpoint(
+                expert_body,
+                packed,
+                use_reentrant=self._expert_gc_use_reentrant(),
+                preserve_rng_state=True,
+            )
+
     def _forward_expert_policy(
         self,
         packed: torch.Tensor,
@@ -2295,6 +2334,8 @@ class AsymQwen3Experts(nn.Module):
             )
         if self._uses_activation_offload():
             down = self._forward_expert_activation_offload(packed, offsets, experts)
+        elif self._uses_expert_gc():
+            down = self._forward_expert_gc(packed, offsets, experts)
         elif self._uses_expert_recompute():
             down = self._forward_expert_policy(packed, offsets, experts, metadata)
         else:
@@ -2336,6 +2377,8 @@ class AsymQwen3Experts(nn.Module):
             )
         if self._uses_activation_offload():
             down = self._forward_expert_activation_offload(packed, offsets, experts)
+        elif self._uses_expert_gc():
+            down = self._forward_expert_gc(packed, offsets, experts)
         elif self._uses_expert_recompute():
             down = self._forward_expert_policy(packed, offsets, experts, metadata)
         else:

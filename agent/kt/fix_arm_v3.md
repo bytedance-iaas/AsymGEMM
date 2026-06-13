@@ -12,16 +12,141 @@ Rule: do not move to the next stage until the validation gate for the current st
 - Per 2048-token chunk, native forward averages approximately: base gate/up 5.6s, LoRA gate/up 6.1s, base down 3.8s, LoRA down 3.0s, route merge 0.31s. Copies to/from CUDA are small.
 - Backward aggregate logs time only `lora_grad_reduce_ms` and `grad_flush_ms`; wrapper backward sync shows much more time than those two fields explain. Allocation, zeroing, thread reduction, grad-input flush, and some recompute work need explicit timers.
 - Low GPU memory is not suspicious by itself. KT keeps routed expert work CPU-side; memory comparison against ZeRO-3 offload is not one-to-one.
+- GPU policy for KT tests: use physical GPU 1 first, physical GPU 2 as fallback. Do not use GPU 0 or GPU 3 for KT validation. Current snapshot on 2026-06-12 showed GPU 1 with about 140 GiB free and GPU 2 with about 132 GiB free, which is enough for KT smoke tests and should be enough for the previously observed large KT profile shape.
+- Model policy for KT-native SFT validation: use a model architecture supported by `kt_kernel.sft.arch`, currently DeepSeekV2/V3, Qwen2Moe/Qwen3Moe/Qwen3_5Moe, or Mixtral. `meta-llama/Llama-4-Scout-17B-16E` currently fails the KT SFT architecture gate with `KTAMXModelNotSupportedError`; do not use it as a positive KT-native smoke until explicit Llama4 support is implemented.
 
 Useful source locations:
 
-- Launcher and profiling env: `scripts/lf/run_lf_lora_sft.sh`
-- Sweep wrapper: `scripts/lf/profile_lora_lf.sh`
+- Original launcher and profiling env: `scripts/lf/run_lf_lora_sft.sh`
+- Original sweep wrapper: `scripts/lf/profile_lora_lf.sh`
+- KT-only launcher copy to edit during this plan: `agent/kt/scripts/run_lf_lora_sft_kt.sh`
+- KT-only sweep copy to edit during this plan: `agent/kt/scripts/profile_lora_lf_kt.sh`
 - ARM Python wrapper: `../ktransformers/kt-kernel/python/sft/arm.py`
 - Autograd/checkpoint hook: `../ktransformers/kt-kernel/python/sft/autograd.py`
 - LF KT layer bridge: `../ktransformers/kt-kernel/python/sft/layer.py`
 - Native ARM SFT kernel: `../ktransformers/kt-kernel/operators/arm/bf16_sft_moe.hpp`
 - Worker pool: `../ktransformers/kt-kernel/cpu_backend/worker_pool.cpp`
+
+Root causes this plan targets:
+
+1. Invalid launch placement: prior accepted-looking profiles had `cpu_affinity_count=1`.
+2. Worker 0 placement: the caller thread participates in worker-pool jobs and can be badly pinned.
+3. Base projection shape: `arm_bf16_matmul_tiled` is currently a nested loop around one SVE BF16 dot per output element, not a blocked GEMM.
+4. Base down shape: down projection is scalar FP32 accumulation over `H x I`.
+5. LoRA shape: gate/up/down LoRA paths are per-route scalar loops instead of grouped rank GEMMs.
+6. Backward memory traffic: dense full-expert per-thread gradient buffers and dense reductions create large allocation, zeroing, cache, and memory-bandwidth costs.
+7. Layout/NUMA uncertainty: existing logs do not prove first-touch placement, contiguous kernel access, or per-phase bytes/FLOPs strongly enough.
+
+Required evidence before any optimization is accepted:
+
+- Correctness: tiny-shape Torch/scalar reference match for forward and backward when the stage changes math.
+- Launch: `train.log` proves `GPU_ID=1` or `GPU_ID=2`, `NUM_GPUS=1`, `cpu_affinity_count >= KT_NUM_THREADS`, and no accepted run uses GPU 0 or GPU 3.
+- Instruction path: build manifest, `cpu_features.txt`, `objdump.txt`, and `bf16_instruction_hits.txt` prove SVE BF16 code is compiled and present.
+- Layout: `layout_report.json` records SVE vector bytes, padded LoRA rank, route tile shape, base/LoRA strides, 64-byte alignment, route skew, and padding overhead.
+- Phase timing: source profile or microbench JSON records each target phase separately, not only total wrapper time.
+- PMU profile: `perf_stat_*.txt` and `perf_*_report.txt` show whether the phase is instruction-bound, cache-bound, branch-heavy, or dominated by scalar conversion/dot-loop symbols.
+- Memory placement: NUMA artifacts and native allocation logs show first-touch CPU/node, pointer alignment, major buffer sizes, and reuse.
+- Final LF validation: the same large-shape source profile improves materially versus the baseline, with KT forward/backward call counts matching expected chunk/checkpoint counts.
+
+## Stage 0A: Isolate AsymGEMM Launcher Scripts
+
+Goal: keep KT profiling and launcher edits out of the normal AsymGEMM script path while KT ARM work is active.
+
+Isolation contract:
+
+- KT implementation edits belong under `../ktransformers/kt-kernel/**`.
+- KT launcher/profile edits belong under ignored `agent/kt/**`.
+- KT run artifacts belong under `profiling_kt_codex_smoke/kt_armbf16_*`.
+- Do not edit the original AsymGEMM launcher/sweep files during KT work: `scripts/lf/run_lf_lora_sft.sh` and `scripts/lf/profile_lora_lf.sh`.
+- Do not edit shared AsymGEMM helper scripts for KT unless the change is intentionally part of the main AsymGEMM work. If those helpers change while KT profiling is running, KT profiles may reflect those runtime changes.
+- For file-change isolation, the ignored `agent/kt/scripts` copies are enough. For hard runtime isolation from all main AsymGEMM changes, run KT from a separate frozen AsymGEMM worktree/clone and point `ASYM_DIR`/`ROOT` there.
+
+Implementation:
+
+- Copy `scripts/lf/run_lf_lora_sft.sh` to `agent/kt/scripts/run_lf_lora_sft_kt.sh`.
+- Copy `scripts/lf/profile_lora_lf.sh` to `agent/kt/scripts/profile_lora_lf_kt.sh`.
+- In `profile_lora_lf_kt.sh`, set `RUN_LF_SCRIPT="${ASYM_DIR}/agent/kt/scripts/run_lf_lora_sft_kt.sh"` so KT sweeps call the KT-only launcher copy.
+- Optionally copy helper scripts into `agent/kt/scripts/...` and patch the KT copies to call those helper copies. This is recommended if the main AsymGEMM helper scripts are actively changing.
+- Make all launcher/profiling changes from this plan in the KT copies first.
+- Do not edit the original `run_lf_lora_sft.sh` or `profile_lora_lf.sh` until the KT-only path passes the acceptance gates and is ready to upstream.
+
+Commands:
+
+```bash
+cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
+
+mkdir -p agent/kt/scripts/lf agent/kt/scripts/lora agent/kt/scripts/plotting
+cp scripts/lf/run_lf_lora_sft.sh agent/kt/scripts/run_lf_lora_sft_kt.sh
+cp scripts/lf/profile_lora_lf.sh agent/kt/scripts/profile_lora_lf_kt.sh
+
+# Optional helper copies for stronger runtime isolation from scripts/ changes.
+cp scripts/lf/run_lf_profiled_train.py agent/kt/scripts/lf/run_lf_profiled_train.py
+cp scripts/lf/postprocess_lf_profile_artifacts.py agent/kt/scripts/lf/postprocess_lf_profile_artifacts.py
+cp scripts/lf/check_superoffload_run.py agent/kt/scripts/lf/check_superoffload_run.py
+cp scripts/lf/check_deepspeed_cpuadam_run.py agent/kt/scripts/lf/check_deepspeed_cpuadam_run.py
+cp scripts/lf/build_lf_sft_eval_pair.py agent/kt/scripts/lf/build_lf_sft_eval_pair.py
+cp scripts/lf/validate_lf_memory_capacity_schema.py agent/kt/scripts/lf/validate_lf_memory_capacity_schema.py
+cp scripts/lora/postprocess_nsys_lora.py agent/kt/scripts/lora/postprocess_nsys_lora.py
+cp scripts/plotting/plot_activation_recompute_sweep.py agent/kt/scripts/plotting/plot_activation_recompute_sweep.py
+cp scripts/plotting/plot_lf_memory_breakdown.py agent/kt/scripts/plotting/plot_lf_memory_breakdown.py
+cp scripts/plotting/plot_lf_interconnect_ctc.py agent/kt/scripts/plotting/plot_lf_interconnect_ctc.py
+
+python3 - <<'PY'
+from pathlib import Path
+replacements = {
+    Path("agent/kt/scripts/profile_lora_lf_kt.sh"): {
+        'RUN_LF_SCRIPT="${ASYM_DIR}/scripts/lf/run_lf_lora_sft.sh"':
+            'RUN_LF_SCRIPT="${ASYM_DIR}/agent/kt/scripts/run_lf_lora_sft_kt.sh"',
+        'GPU_POOL=${GPU_POOL:-0}':
+            'GPU_POOL=${GPU_POOL:-1,2}',
+        'BUILD_DATASET_SCRIPT="${ASYM_DIR}/scripts/lf/build_lf_sft_eval_pair.py"':
+            'BUILD_DATASET_SCRIPT="${ASYM_DIR}/agent/kt/scripts/lf/build_lf_sft_eval_pair.py"',
+        'PROFILE_POSTPROCESS_SCRIPT="${ASYM_DIR}/scripts/lf/postprocess_lf_profile_artifacts.py"':
+            'PROFILE_POSTPROCESS_SCRIPT="${ASYM_DIR}/agent/kt/scripts/lf/postprocess_lf_profile_artifacts.py"',
+        'MEMORY_SCHEMA_VALIDATOR="${ASYM_DIR}/scripts/lf/validate_lf_memory_capacity_schema.py"':
+            'MEMORY_SCHEMA_VALIDATOR="${ASYM_DIR}/agent/kt/scripts/lf/validate_lf_memory_capacity_schema.py"',
+        'PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_activation_recompute_sweep.py"':
+            'PLOT_SCRIPT="${ASYM_DIR}/agent/kt/scripts/plotting/plot_activation_recompute_sweep.py"',
+        'MEMORY_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_memory_breakdown.py"':
+            'MEMORY_PLOT_SCRIPT="${ASYM_DIR}/agent/kt/scripts/plotting/plot_lf_memory_breakdown.py"',
+        'INTERCONNECT_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_interconnect_ctc.py"':
+            'INTERCONNECT_PLOT_SCRIPT="${ASYM_DIR}/agent/kt/scripts/plotting/plot_lf_interconnect_ctc.py"',
+    },
+    Path("agent/kt/scripts/run_lf_lora_sft_kt.sh"): {
+        'CHECK_SUPEROFFLOAD_SCRIPT=${CHECK_SUPEROFFLOAD_SCRIPT:-${ASYM_DIR}/scripts/lf/check_superoffload_run.py}':
+            'CHECK_SUPEROFFLOAD_SCRIPT=${CHECK_SUPEROFFLOAD_SCRIPT:-${ASYM_DIR}/agent/kt/scripts/lf/check_superoffload_run.py}',
+        'CHECK_CPUADAM_SCRIPT=${CHECK_CPUADAM_SCRIPT:-${ASYM_DIR}/scripts/lf/check_deepspeed_cpuadam_run.py}':
+            'CHECK_CPUADAM_SCRIPT=${CHECK_CPUADAM_SCRIPT:-${ASYM_DIR}/agent/kt/scripts/lf/check_deepspeed_cpuadam_run.py}',
+        'PROFILE_LAUNCHER=${PROFILE_LAUNCHER:-${ASYM_DIR}/scripts/lf/run_lf_profiled_train.py}':
+            'PROFILE_LAUNCHER=${PROFILE_LAUNCHER:-${ASYM_DIR}/agent/kt/scripts/lf/run_lf_profiled_train.py}',
+        'PROFILE_NSYS_POSTPROCESS_SCRIPT=${PROFILE_NSYS_POSTPROCESS_SCRIPT:-${ASYM_DIR}/scripts/lora/postprocess_nsys_lora.py}':
+            'PROFILE_NSYS_POSTPROCESS_SCRIPT=${PROFILE_NSYS_POSTPROCESS_SCRIPT:-${ASYM_DIR}/agent/kt/scripts/lora/postprocess_nsys_lora.py}',
+        'PROFILE_POSTPROCESS_SCRIPT=${PROFILE_POSTPROCESS_SCRIPT:-${ASYM_DIR}/scripts/lf/postprocess_lf_profile_artifacts.py}':
+            'PROFILE_POSTPROCESS_SCRIPT=${PROFILE_POSTPROCESS_SCRIPT:-${ASYM_DIR}/agent/kt/scripts/lf/postprocess_lf_profile_artifacts.py}',
+    },
+}
+for path, reps in replacements.items():
+    text = path.read_text()
+    for old, new in reps.items():
+        if old not in text:
+            raise SystemExit(f"missing expected line in {path}: {old}")
+        text = text.replace(old, new, 1)
+    path.write_text(text)
+PY
+
+bash -n agent/kt/scripts/run_lf_lora_sft_kt.sh
+bash -n agent/kt/scripts/profile_lora_lf_kt.sh
+```
+
+Validation gate:
+
+- `bash -n` passes for both KT-only scripts.
+- `rg -n "run_lf_lora_sft_kt.sh" agent/kt/scripts/profile_lora_lf_kt.sh` shows the sweep copy calls the KT launcher copy.
+- `rg -n "agent/kt/scripts" agent/kt/scripts/run_lf_lora_sft_kt.sh agent/kt/scripts/profile_lora_lf_kt.sh` shows helper paths point to KT copies if helper-copy mode is used.
+- `git check-ignore -v --no-index agent/kt/scripts/run_lf_lora_sft_kt.sh` proves new KT script copies are ignored by normal git status.
+- If the original AsymGEMM scripts are already dirty from unrelated work, leave them dirty and do not touch them. Record `git diff -- scripts/lf/run_lf_lora_sft.sh scripts/lf/profile_lora_lf.sh` before and after KT work; the KT pass must not add new hunks to those files.
+- All commands in this document use `agent/kt/scripts/run_lf_lora_sft_kt.sh` after this stage.
+- Any final upstreaming into the original scripts must be a separate integration step after Stage 12.
 
 ## Stage 0: Baseline Repro and Artifact Parser
 
@@ -81,13 +206,84 @@ Validation gate:
 - The parser prints the known completed artifact values above.
 - All future profiles must be summarized with the same parser or a checked-in equivalent script.
 
+## Stage 0B: GPU and ARM Instruction Preflight
+
+Goal: every KT test uses GPU 1 or GPU 2 only, and every native result proves the ARM SVE BF16 instruction path and layout assumptions before timing is trusted.
+
+Implementation:
+
+- In `agent/kt/scripts/run_lf_lora_sft_kt.sh`, add a KT-only GPU guard:
+  - for `BACKEND=kt_armbf16`, require `GPU_ID` to be `1` or `2`
+  - require `NUM_GPUS=1`
+  - require `PROFILE_NSYS_GPU_METRICS_DEVICES` to match `GPU_ID` for Nsight runs
+  - allow a temporary override only with `KT_ARM_ALLOW_GPU_0_OR_3=1`, and never use that override for accepted profiles
+- In `agent/kt/scripts/profile_lora_lf_kt.sh`, default `GPU_POOL=1,2`.
+- For direct Python microbenches that import torch, set `CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1` unless explicitly testing GPU 2.
+- Add native profile fields or startup logs for:
+  - `sve_vector_bytes=svcntb()`
+  - `base_kernel=sve_bfdot`
+  - `compiled_sve_bf16=1`
+  - base and LoRA weight layouts/strides
+  - `aligned_weights=1`
+  - packed route order, active expert count, hottest expert, and route skew
+
+Validation commands:
+
+```bash
+cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
+
+nvidia-smi --query-gpu=index,name,memory.used,memory.free,memory.total,utilization.gpu \
+  --format=csv,noheader,nounits
+
+# Accept GPU 1 or GPU 2 only for KT runs. This should fail once the guard exists.
+taskset -c 0-143 env \
+  GPU_ID=0 NUM_GPUS=1 BACKEND=kt_armbf16 PROFILE=1 PROFILE_PROFILER=source \
+  CUTOFF_LEN=64 PER_DEVICE_TRAIN_BATCH_SIZE=1 LORA_RANK=8 MAX_STEPS=1 WARMUP_STEPS=0 \
+  OUT_DIR=/tmp/kt_bad_gpu0 \
+  agent/kt/scripts/run_lf_lora_sft_kt.sh
+
+# This is the default KT GPU path.
+taskset -c 0-143 env \
+  GPU_ID=1 NUM_GPUS=1 PROFILE_NSYS_GPU_METRICS_DEVICES=1 \
+  BACKEND=kt_armbf16 PROFILE=1 PROFILE_PROFILER=source \
+  KT_ARM_OMP_NUM_THREADS=8 KT_NUM_THREADS=8 KT_ARM_SFT_PROFILE=1 KT_ARM_SFT_POOL_LOG=1 \
+  MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B TEMPLATE=qwen3_nothink \
+  CUTOFF_LEN=64 PER_DEVICE_TRAIN_BATCH_SIZE=1 LORA_RANK=8 MAX_STEPS=1 WARMUP_STEPS=0 \
+  OUT_DIR=profiling_kt_codex_smoke/kt_armbf16_gpu1_preflight \
+  agent/kt/scripts/run_lf_lora_sft_kt.sh 2>&1 | tee profiling_kt_codex_smoke/kt_armbf16_gpu1_preflight.log
+
+rg "GPU_ID|CUDA_VISIBLE_DEVICES|base_kernel=sve_bfdot|aligned_weights=1|sve_vector_bytes" \
+  profiling_kt_codex_smoke/kt_armbf16_gpu1_preflight.log
+
+# Verify the extension was built for ARM SVE BF16 and contains the expected instruction text.
+SO="$(
+  .venv/bin/python - <<'PY'
+from kt_kernel import kt_kernel_ext
+print(kt_kernel_ext.__file__)
+PY
+)"
+echo "$SO"
+if command -v llvm-objdump >/dev/null 2>&1; then
+  llvm-objdump -d "$SO" | rg -i "bfdot|bfmmla|svbfdot" | head -20
+else
+  objdump -d "$SO" | rg -i "bfdot|bfmmla|svbfdot" | head -20
+fi
+```
+
+Profile gate:
+
+- Accepted KT source profiles must have `GPU_ID=1` or `GPU_ID=2` in `train.log`; default is GPU 1.
+- `nvidia-smi` before launch shows the selected GPU has enough free memory for the shape.
+- `train.log` has `base_kernel=sve_bfdot`, `aligned_weights=1`, and `sve_vector_bytes` once that field is added.
+- Disassembly or build log proves the extension contains SVE BF16 code. If disassembly cannot be used, the build log must show `-march=...+sve+bf16` or `-march=native` on a host with `svebf16`.
+
 ## Stage 1: Fix Launch CPU Affinity
 
 Problem: the completed run requested 8 KT threads but recorded only CPU `0` in its affinity mask. This can make KT appear stuck and invalidates performance conclusions.
 
 Implementation:
 
-- Add a launcher preflight for `BACKEND=kt_armbf16` in `scripts/lf/run_lf_lora_sft.sh`.
+- Add a launcher preflight for `BACKEND=kt_armbf16` in `agent/kt/scripts/run_lf_lora_sft_kt.sh`.
 - Compute available CPU affinity with Python `os.sched_getaffinity(0)`.
 - Fail early when `affinity_count < KT_NUM_THREADS` or `affinity_count < KT_ARM_OMP_NUM_THREADS`.
 - Log `taskset -pc $$`, `/proc/self/status` `Cpus_allowed_list`, `OMP_NUM_THREADS`, `KT_NUM_THREADS`, `KT_ARM_OMP_NUM_THREADS`, and numactl settings into `train.log`.
@@ -103,21 +299,23 @@ cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 
 # Negative guard: this should fail before training starts.
 taskset -c 0 env \
+  GPU_ID=1 NUM_GPUS=1 PROFILE_NSYS_GPU_METRICS_DEVICES=1 \
   BACKEND=kt_armbf16 PROFILE=1 PROFILE_PROFILER=source \
   KT_ARM_OMP_NUM_THREADS=8 KT_NUM_THREADS=8 \
-  MODEL_NAME_OR_PATH=meta-llama/Llama-4-Scout-17B-16E \
+  MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B TEMPLATE=qwen3_nothink \
   CUTOFF_LEN=64 PER_DEVICE_TRAIN_BATCH_SIZE=1 MAX_STEPS=1 \
   OUT_DIR=/tmp/kt_affinity_negative \
-  scripts/lf/run_lf_lora_sft.sh
+  agent/kt/scripts/run_lf_lora_sft_kt.sh
 
 # Positive smoke: this must complete and profile must report enough CPUs.
 taskset -c 0-143 env \
+  GPU_ID=1 NUM_GPUS=1 PROFILE_NSYS_GPU_METRICS_DEVICES=1 \
   BACKEND=kt_armbf16 PROFILE=1 PROFILE_PROFILER=source \
   KT_ARM_OMP_NUM_THREADS=8 KT_NUM_THREADS=8 KT_ARM_SFT_PROFILE=1 KT_ARM_SFT_POOL_LOG=1 \
-  MODEL_NAME_OR_PATH=meta-llama/Llama-4-Scout-17B-16E \
+  MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B TEMPLATE=qwen3_nothink \
   CUTOFF_LEN=64 PER_DEVICE_TRAIN_BATCH_SIZE=1 LORA_RANK=8 MAX_STEPS=1 WARMUP_STEPS=0 \
   OUT_DIR=profiling_kt_codex_smoke/kt_armbf16_affinity_positive \
-  scripts/lf/run_lf_lora_sft.sh 2>&1 | tee profiling_kt_codex_smoke/kt_armbf16_affinity_positive.log
+  agent/kt/scripts/run_lf_lora_sft_kt.sh 2>&1 | tee profiling_kt_codex_smoke/kt_armbf16_affinity_positive.log
 
 python3 - <<'PY'
 import json, pathlib
@@ -155,12 +353,13 @@ CPUINFER_FORCE_REBUILD=1 CPUINFER_BUILD_TYPE=RelWithDebInfo CPUINFER_PARALLEL=16
 
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 taskset -c 0-143 env \
+  GPU_ID=1 NUM_GPUS=1 PROFILE_NSYS_GPU_METRICS_DEVICES=1 \
   BACKEND=kt_armbf16 PROFILE=1 PROFILE_PROFILER=source \
   KT_ARM_OMP_NUM_THREADS=8 KT_NUM_THREADS=8 KT_ARM_SFT_PROFILE=1 KT_ARM_SFT_POOL_LOG=1 \
-  MODEL_NAME_OR_PATH=meta-llama/Llama-4-Scout-17B-16E \
+  MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B TEMPLATE=qwen3_nothink \
   CUTOFF_LEN=128 PER_DEVICE_TRAIN_BATCH_SIZE=1 LORA_RANK=8 MAX_STEPS=1 WARMUP_STEPS=0 \
   OUT_DIR=profiling_kt_codex_smoke/kt_armbf16_worker_place \
-  scripts/lf/run_lf_lora_sft.sh 2>&1 | tee profiling_kt_codex_smoke/kt_armbf16_worker_place.log
+  agent/kt/scripts/run_lf_lora_sft_kt.sh 2>&1 | tee profiling_kt_codex_smoke/kt_armbf16_worker_place.log
 
 # During a longer local run, sample thread placement.
 PID=<python_or_torchrun_pid>
@@ -203,12 +402,13 @@ CPUINFER_FORCE_REBUILD=1 CPUINFER_BUILD_TYPE=RelWithDebInfo CPUINFER_PARALLEL=16
 
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 taskset -c 0-143 env \
+  GPU_ID=1 NUM_GPUS=1 PROFILE_NSYS_GPU_METRICS_DEVICES=1 \
   BACKEND=kt_armbf16 PROFILE=1 PROFILE_PROFILER=source \
   KT_ARM_OMP_NUM_THREADS=8 KT_NUM_THREADS=8 KT_ARM_SFT_PROFILE=1 KT_ARM_SFT_NATIVE_PROGRESS=1 \
-  MODEL_NAME_OR_PATH=meta-llama/Llama-4-Scout-17B-16E \
+  MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B TEMPLATE=qwen3_nothink \
   CUTOFF_LEN=128 PER_DEVICE_TRAIN_BATCH_SIZE=1 LORA_RANK=8 MAX_STEPS=1 WARMUP_STEPS=0 \
   OUT_DIR=profiling_kt_codex_smoke/kt_armbf16_timer_coverage \
-  scripts/lf/run_lf_lora_sft.sh 2>&1 | tee profiling_kt_codex_smoke/kt_armbf16_timer_coverage.log
+  agent/kt/scripts/run_lf_lora_sft_kt.sh 2>&1 | tee profiling_kt_codex_smoke/kt_armbf16_timer_coverage.log
 
 rg "backward_(ensure_buffers|local_alloc_zero|thread_reduce|grad_input_flush)_ms" \
   profiling_kt_codex_smoke/kt_armbf16_timer_coverage.log
@@ -226,11 +426,19 @@ Problem: the end-to-end LF run is too expensive to use as the only kernel develo
 Implementation:
 
 - Add a small C++ or Python-bound microbench that constructs one ARM SFT MoE wrapper/layer with synthetic BF16 inputs, synthetic top-k IDs/weights, and rank/top-k/hidden/intermediate matching the model.
+- The microbench must support phase masks so each slow component can be isolated:
+  - base gate/up only
+  - base down only
+  - LoRA gate/up only
+  - LoRA down only
+  - route merge only
+  - backward route loop only
+  - backward reduction/flush only
 - Benchmark at least these shapes:
   - `qlen=128, topk=8, rank=8`
   - `qlen=512, topk=8, rank=8`
   - `qlen=2048, topk=8, rank=64`
-- Emit JSON with phase times, effective bandwidth estimates, thread count, affinity, NUMA placement, route skew, and checksum.
+- Emit JSON with phase times, effective bandwidth estimates, estimated FLOPs, achieved GFLOP/s, bytes touched, arithmetic intensity, thread count, affinity, NUMA placement, route skew, and checksum.
 - Add a correctness mode comparing native output/grads against a simple Torch or scalar reference for tiny shapes.
 
 Validation commands:
@@ -241,11 +449,13 @@ CPUINFER_FORCE_REBUILD=1 CPUINFER_BUILD_TYPE=RelWithDebInfo CPUINFER_PARALLEL=16
   /workspace/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python -m pip install -e . -v --no-build-isolation
 
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
-taskset -c 0-143 .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
+taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
+  .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
   --qlen 128 --top-k 8 --rank 8 --hidden-size 2048 --intermediate-size 768 \
   --num-experts 128 --threads 8 --check --json profiling_kt_codex_smoke/bench_arm_sft_q128_r8.json
 
-taskset -c 0-143 .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
+taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
+  .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
   --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
   --num-experts 128 --threads 8 --json profiling_kt_codex_smoke/bench_arm_sft_q2048_r64.json
 ```
@@ -255,6 +465,101 @@ Profile gate:
 - Tiny correctness mode passes against reference within BF16/FP32 tolerance.
 - JSON includes all Stage 3 timing fields.
 - Microbench timings trend in the same direction as LF source-profile timings.
+
+## Stage 4A: Instruction, Layout, and PMU Baseline
+
+Problem: `base_kernel=sve_bfdot` only proves the dot primitive is compiled. It does not prove the hot loops are using a high-throughput SVE BF16 GEMM shape or a cache-friendly layout.
+
+Implementation:
+
+- Add a layout report mode to the microbench or native profile. It must emit:
+  - `sve_vector_bytes`
+  - `padded_lora_rank`
+  - `route_tile_m`
+  - base gate/up layout and strides
+  - base down layout and strides
+  - LoRA A/B layouts and strides
+  - whether each phase consumes contiguous rows, transposed weights, and 64-byte aligned buffers
+  - active expert histogram, hottest expert, route skew, padded routes, and padding overhead
+- Add a build manifest artifact for every native change:
+  - compiler ID/version
+  - `CMAKE_BUILD_TYPE`
+  - full CXX flags
+  - whether `-march=...+sve+bf16` or `-march=native` was used
+  - `/proc/cpuinfo` feature lines proving `sve` and `svebf16`
+- Add `perf stat` and `perf record` runs on the phase microbench. Use generic events first because vendor-specific ARM PMU event names vary by kernel:
+  - `cycles`
+  - `instructions`
+  - `cache-references`
+  - `cache-misses`
+  - `branches`
+  - `branch-misses`
+  - `task-clock`
+  - `context-switches`
+  - `cpu-migrations`
+- If vendor events are available, add SVE/FP pipeline and memory bandwidth events after checking `perf list`.
+
+Validation commands:
+
+```bash
+cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
+
+mkdir -p profiling_kt_codex_smoke/kt_armbf16_layout_pmu
+lscpu > profiling_kt_codex_smoke/kt_armbf16_layout_pmu/lscpu.txt
+grep -m1 -i '^Features' /proc/cpuinfo > profiling_kt_codex_smoke/kt_armbf16_layout_pmu/cpu_features.txt
+perf list > profiling_kt_codex_smoke/kt_armbf16_layout_pmu/perf_list.txt 2>&1 || true
+
+SO="$(
+  .venv/bin/python - <<'PY'
+from kt_kernel import kt_kernel_ext
+print(kt_kernel_ext.__file__)
+PY
+)"
+echo "$SO" > profiling_kt_codex_smoke/kt_armbf16_layout_pmu/kt_kernel_ext_so.txt
+readelf -A "$SO" > profiling_kt_codex_smoke/kt_armbf16_layout_pmu/readelf_A.txt 2>&1 || true
+if command -v llvm-objdump >/dev/null 2>&1; then
+  llvm-objdump -d "$SO" > profiling_kt_codex_smoke/kt_armbf16_layout_pmu/objdump.txt
+else
+  objdump -d "$SO" > profiling_kt_codex_smoke/kt_armbf16_layout_pmu/objdump.txt
+fi
+rg -i "bfdot|bfmmla|svbfdot" profiling_kt_codex_smoke/kt_armbf16_layout_pmu/objdump.txt \
+  | tee profiling_kt_codex_smoke/kt_armbf16_layout_pmu/bf16_instruction_hits.txt
+
+taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
+  .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
+    --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
+    --num-experts 128 --threads 8 --layout-report \
+    --json profiling_kt_codex_smoke/kt_armbf16_layout_pmu/layout_report.json
+
+command -v perf && perf stat -r 3 \
+  -e cycles,instructions,cache-references,cache-misses,branches,branch-misses,task-clock,context-switches,cpu-migrations \
+  -o profiling_kt_codex_smoke/kt_armbf16_layout_pmu/perf_stat_base_gate_up.txt -- \
+  taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
+    .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
+      --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
+      --num-experts 128 --threads 8 --phase base_gate_up \
+      --json profiling_kt_codex_smoke/kt_armbf16_layout_pmu/base_gate_up.json
+
+command -v perf && perf record -g --call-graph dwarf \
+  -o profiling_kt_codex_smoke/kt_armbf16_layout_pmu/perf_base_gate_up.data -- \
+  taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
+    .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
+      --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
+      --num-experts 128 --threads 8 --phase base_gate_up \
+      --json /tmp/kt_base_gate_up_profile.json
+
+command -v perf && perf report --stdio \
+  -i profiling_kt_codex_smoke/kt_armbf16_layout_pmu/perf_base_gate_up.data \
+  > profiling_kt_codex_smoke/kt_armbf16_layout_pmu/perf_base_gate_up_report.txt
+```
+
+Profile gate:
+
+- `cpu_features.txt` contains `sve` and `svebf16`.
+- `bf16_instruction_hits.txt` is non-empty.
+- `layout_report.json` proves 64-byte alignment and documents each phase's memory layout.
+- Before Stage 5, `perf` should show the dot-loop/matmul functions near the top for base gate/up; after Stage 5 they should no longer dominate as one-dot-per-output loops.
+- Each kernel optimization stage must save its `layout_report.json`, `perf_stat_*.txt`, and `perf_*_report.txt` next to the phase JSON.
 
 ## Stage 5: Replace Base Gate/Up With Real Grouped BF16 GEMM
 
@@ -276,13 +581,15 @@ CPUINFER_FORCE_REBUILD=1 CPUINFER_BUILD_TYPE=RelWithDebInfo CPUINFER_PARALLEL=16
 
 # Microbench before LF.
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
-taskset -c 0-143 .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
+taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
+  .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
   --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
   --num-experts 128 --threads 8 --json profiling_kt_codex_smoke/bench_stage5_gate_up.json
 
 # Optional CPU PMU profile if perf is installed and permitted.
 command -v perf && perf stat -d -d -d -- \
-  taskset -c 0-143 .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
+  taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
+    .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
     --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
     --num-experts 128 --threads 8 --json /tmp/bench_stage5_gate_up.json
 ```
@@ -291,6 +598,10 @@ Profile gate:
 
 - Correctness mode still passes.
 - `base_gate_up_ms` improves materially on `qlen=2048, rank=64`; target first milestone is at least 2x faster than the existing dot-loop baseline.
+- `perf_stat_base_gate_up.txt` shows fewer instructions and cycles per output element than Stage 4A.
+- `perf_base_gate_up_report.txt` no longer attributes most time to one-dot-per-output `arm_bf16_dot` calls.
+- Disassembly of the new hot symbol shows a blocked SVE BF16 kernel using vector-width work, not scalar BF16-to-FP32 inner loops.
+- `layout_report.json` shows gate/up weights and packed inputs are consumed with contiguous or deliberately packed strides for the new kernel.
 - No regression in input packing or route merge.
 
 ## Stage 6: Replace Base Down Projection
@@ -311,7 +622,8 @@ CPUINFER_FORCE_REBUILD=1 CPUINFER_BUILD_TYPE=RelWithDebInfo CPUINFER_PARALLEL=16
   /workspace/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python -m pip install -e . -v --no-build-isolation
 
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
-taskset -c 0-143 .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
+taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
+  .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
   --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
   --num-experts 128 --threads 8 --json profiling_kt_codex_smoke/bench_stage6_down.json
 ```
@@ -320,6 +632,9 @@ Profile gate:
 
 - Correctness mode still passes.
 - `base_down_ms` improves materially; target first milestone is at least 2x faster than scalar baseline.
+- `perf_stat_base_down.txt` shows fewer instructions and cycles per output element than Stage 4A.
+- `perf_base_down_report.txt` shows the new grouped down GEMM path, not scalar `bf16_to_f32` loops over `H x I`, as the dominant symbol.
+- `layout_report.json` proves the down weight layout matches the kernel access pattern and avoids per-output strided gathers.
 - Total forward chunk time improves after Stage 5 plus Stage 6, not just the isolated phase.
 
 ## Stage 7: Batch LoRA Forward
@@ -348,7 +663,8 @@ CPUINFER_FORCE_REBUILD=1 CPUINFER_BUILD_TYPE=RelWithDebInfo CPUINFER_PARALLEL=16
 
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 for dropout in 0.00 0.10; do
-  taskset -c 0-143 .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
+  taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
+    .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
     --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
     --num-experts 128 --threads 8 --lora-dropout "$dropout" \
     --json "profiling_kt_codex_smoke/bench_stage7_lora_drop${dropout}.json"
@@ -360,6 +676,9 @@ Profile gate:
 - Correctness passes for dropout 0.00 and 0.10.
 - `lora_gate_up_ms + lora_down_ms` improves materially; target first milestone is at least 2x faster than current per-route loops.
 - Dropout 0.10 is not more than 25 percent slower than dropout 0.00 unless profiling proves RNG/mask generation dominates.
+- `perf_stat_lora_*.txt` shows lower instruction count per route-rank operation than the per-route baseline.
+- `layout_report.json` proves LoRA A/B are consumed in GEMM-friendly orientation and that padded rank does not create excessive padding overhead.
+- The profile reports separate `dropout_mask_ms` or equivalent if dropout remains a meaningful cost.
 
 ## Stage 8: Redesign Backward Scratch and Reductions
 
@@ -388,12 +707,14 @@ CPUINFER_FORCE_REBUILD=1 CPUINFER_BUILD_TYPE=RelWithDebInfo CPUINFER_PARALLEL=16
   /workspace/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python -m pip install -e . -v --no-build-isolation
 
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
-taskset -c 0-143 .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
+taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
+  .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
   --qlen 128 --top-k 8 --rank 8 --hidden-size 2048 --intermediate-size 768 \
   --num-experts 128 --threads 8 --check --backward \
   --json profiling_kt_codex_smoke/bench_stage8_backward_check.json
 
-taskset -c 0-143 .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
+taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
+  .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
   --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
   --num-experts 128 --threads 8 --backward \
   --json profiling_kt_codex_smoke/bench_stage8_backward_q2048_r64.json
@@ -418,6 +739,8 @@ Profile gate:
 - `backward_local_alloc_zero_ms`, `backward_thread_reduce_ms`, and `backward_grad_input_flush_ms` are visible and reduced.
 - Wrapper `backward_sync_ms_last` is explained by native detailed timers within 10 percent.
 - Peak CPU RSS does not increase versus baseline for the same shape.
+- `perf_stat_backward_route_loop.txt` and `perf_stat_backward_reduce.txt` show reductions in instructions, cycles, and cache misses versus Stage 4A/Stage 3 baseline.
+- Backward profile artifacts prove dense full-expert per-thread gradient buffers are no longer allocated and reduced for untouched experts.
 
 ## Stage 9: NUMA and Memory-Flow Optimization
 
@@ -428,33 +751,56 @@ Implementation:
 - Keep route buffers, packed inputs, forward caches, and LoRA weights on the NUMA node used by worker threads.
 - Avoid first-touch by the wrong Python/caller thread.
 - Add optional log fields for current CPU, NUMA node, and allocation sizes for major buffers.
+- Add native allocation/layout logs for each major buffer:
+  - pointer address modulo 64
+  - NUMA node if available
+  - byte size
+  - first-touch thread id / CPU
+  - owner layer and reuse count
+- Add route-layout counters:
+  - active experts
+  - padded routes / valid routes
+  - hottest expert routes
+  - route skew ratio
+  - per-expert local route min/p50/max
+- Save CPU topology artifacts for every accepted NUMA profile.
 - Evaluate huge pages only after correctness and affinity are fixed.
 
 Validation commands:
 
 ```bash
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
+mkdir -p profiling_kt_codex_smoke/kt_armbf16_numa_artifacts
+numactl --hardware > profiling_kt_codex_smoke/kt_armbf16_numa_artifacts/numactl_hardware.txt
+lscpu -e=CPU,NODE,SOCKET,CORE,CACHE > profiling_kt_codex_smoke/kt_armbf16_numa_artifacts/lscpu_extended.txt
+command -v hwloc-ls && hwloc-ls --whole-system > profiling_kt_codex_smoke/kt_armbf16_numa_artifacts/hwloc_whole_system.txt || true
+
 taskset -c 0-143 numactl --cpunodebind=0 --membind=0 env \
+  GPU_ID=1 NUM_GPUS=1 PROFILE_NSYS_GPU_METRICS_DEVICES=1 \
   BACKEND=kt_armbf16 PROFILE=1 PROFILE_PROFILER=source \
   KT_ARM_OMP_NUM_THREADS=8 KT_NUM_THREADS=8 KT_ARM_SFT_PROFILE=1 KT_ARM_SFT_POOL_LOG=1 \
-  MODEL_NAME_OR_PATH=meta-llama/Llama-4-Scout-17B-16E \
+  MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B TEMPLATE=qwen3_nothink \
   CUTOFF_LEN=512 PER_DEVICE_TRAIN_BATCH_SIZE=1 LORA_RANK=8 MAX_STEPS=1 WARMUP_STEPS=0 \
   OUT_DIR=profiling_kt_codex_smoke/kt_armbf16_numa_node0 \
-  scripts/lf/run_lf_lora_sft.sh 2>&1 | tee profiling_kt_codex_smoke/kt_armbf16_numa_node0.log
+  agent/kt/scripts/run_lf_lora_sft_kt.sh 2>&1 | tee profiling_kt_codex_smoke/kt_armbf16_numa_node0.log
 
 taskset -c 0-143 numactl --cpunodebind=0,1 --membind=0,1 env \
+  GPU_ID=1 NUM_GPUS=1 PROFILE_NSYS_GPU_METRICS_DEVICES=1 \
   BACKEND=kt_armbf16 PROFILE=1 PROFILE_PROFILER=source \
   KT_ARM_OMP_NUM_THREADS=8 KT_NUM_THREADS=8 KT_ARM_SFT_PROFILE=1 KT_ARM_SFT_POOL_LOG=1 \
-  MODEL_NAME_OR_PATH=meta-llama/Llama-4-Scout-17B-16E \
+  MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B TEMPLATE=qwen3_nothink \
   CUTOFF_LEN=512 PER_DEVICE_TRAIN_BATCH_SIZE=1 LORA_RANK=8 MAX_STEPS=1 WARMUP_STEPS=0 \
   OUT_DIR=profiling_kt_codex_smoke/kt_armbf16_numa_all \
-  scripts/lf/run_lf_lora_sft.sh 2>&1 | tee profiling_kt_codex_smoke/kt_armbf16_numa_all.log
+  agent/kt/scripts/run_lf_lora_sft_kt.sh 2>&1 | tee profiling_kt_codex_smoke/kt_armbf16_numa_all.log
 ```
 
 Profile gate:
 
 - Chosen NUMA policy is faster or equal on source-profile timing.
 - `numastat -p` does not show accidental remote-memory dominance for the selected policy.
+- `lscpu_extended.txt` and `numactl_hardware.txt` are stored next to the profile.
+- Native logs prove first-touch happens on the intended NUMA node for packed inputs, forward work buffers, backward work buffers, cache buffers, and LoRA weight buffers.
+- Route-layout counters are present and can explain load imbalance separately from kernel throughput.
 - No affinity regression.
 
 ## Stage 10: Re-evaluate Chunking and Checkpointing
@@ -474,13 +820,14 @@ Validation commands:
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 for chunk in 1024 2048 4096; do
   taskset -c 0-143 env \
+    GPU_ID=1 NUM_GPUS=1 PROFILE_NSYS_GPU_METRICS_DEVICES=1 \
     BACKEND=kt_armbf16 PROFILE=1 PROFILE_PROFILER=source \
     KT_ARM_OMP_NUM_THREADS=8 KT_NUM_THREADS=8 KT_ARM_SFT_PROFILE=1 \
     KT_ARM_SFT_TOKEN_CHUNK_SIZE="$chunk" \
-    MODEL_NAME_OR_PATH=meta-llama/Llama-4-Scout-17B-16E \
+    MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B TEMPLATE=qwen3_nothink \
     CUTOFF_LEN=1024 PER_DEVICE_TRAIN_BATCH_SIZE=1 LORA_RANK=8 MAX_STEPS=1 WARMUP_STEPS=0 \
     OUT_DIR="profiling_kt_codex_smoke/kt_armbf16_chunk_${chunk}" \
-    scripts/lf/run_lf_lora_sft.sh 2>&1 | tee "profiling_kt_codex_smoke/kt_armbf16_chunk_${chunk}.log"
+    agent/kt/scripts/run_lf_lora_sft_kt.sh 2>&1 | tee "profiling_kt_codex_smoke/kt_armbf16_chunk_${chunk}.log"
 done
 ```
 
@@ -499,13 +846,14 @@ Use Nsight Systems for timeline sanity after a completed matching source profile
 ```bash
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 taskset -c 0-143 env \
+  GPU_ID=1 NUM_GPUS=1 PROFILE_NSYS_GPU_METRICS_DEVICES=1 \
   BACKEND=kt_armbf16 PROFILE=1 PROFILE_PROFILER=nsys \
   KT_ARM_SOURCE_OK_PROFILE_JSON=profiling_kt_codex_smoke/kt_armbf16_source_ok/profile.json \
   KT_ARM_OMP_NUM_THREADS=8 KT_NUM_THREADS=8 \
-  MODEL_NAME_OR_PATH=meta-llama/Llama-4-Scout-17B-16E \
+  MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B TEMPLATE=qwen3_nothink \
   CUTOFF_LEN=512 PER_DEVICE_TRAIN_BATCH_SIZE=1 LORA_RANK=8 MAX_STEPS=1 WARMUP_STEPS=0 \
   OUT_DIR=profiling_kt_codex_smoke/kt_armbf16_nsys_sanity \
-  scripts/lf/run_lf_lora_sft.sh
+  agent/kt/scripts/run_lf_lora_sft_kt.sh
 ```
 
 Use NCU only for CUDA kernels outside the ARM CPU MoE hot path:
@@ -513,10 +861,10 @@ Use NCU only for CUDA kernels outside the ARM CPU MoE hot path:
 ```bash
 ncu --target-processes all --set full --launch-count 20 --force-overwrite \
   --export profiling_kt_codex_smoke/kt_armbf16_cuda_sanity \
-  taskset -c 0-143 env BACKEND=kt_armbf16 PROFILE=0 \
-    MODEL_NAME_OR_PATH=meta-llama/Llama-4-Scout-17B-16E \
+  taskset -c 0-143 env GPU_ID=1 NUM_GPUS=1 PROFILE_NSYS_GPU_METRICS_DEVICES=1 BACKEND=kt_armbf16 PROFILE=0 \
+    MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B TEMPLATE=qwen3_nothink \
     CUTOFF_LEN=128 PER_DEVICE_TRAIN_BATCH_SIZE=1 LORA_RANK=8 MAX_STEPS=1 \
-    scripts/lf/run_lf_lora_sft.sh
+    agent/kt/scripts/run_lf_lora_sft_kt.sh
 ```
 
 Profile gate:
@@ -536,21 +884,24 @@ cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 .venv/bin/python -m pytest tests/lf/test_superoffload_backend_scripts.py -k "kt_arm" -q
 
 taskset -c 0-143 env \
+  GPU_ID=1 NUM_GPUS=1 PROFILE_NSYS_GPU_METRICS_DEVICES=1 \
   BACKEND=kt_armbf16 PROFILE=1 PROFILE_PROFILER=source \
   KT_ARM_OMP_NUM_THREADS=8 KT_NUM_THREADS=8 KT_ARM_SFT_PROFILE=1 KT_ARM_SFT_POOL_LOG=1 \
   KT_ARM_SFT_TOKEN_CHUNK_SIZE=2048 KT_ARM_FIRST_STEP_TIMEOUT_SECONDS=0 \
-  MODEL_NAME_OR_PATH=meta-llama/Llama-4-Scout-17B-16E \
+  MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B TEMPLATE=qwen3_nothink \
   CUTOFF_LEN=7168 PER_DEVICE_TRAIN_BATCH_SIZE=4 LORA_RANK=64 LORA_DROPOUT=0.10 \
   MAX_STEPS=1 WARMUP_STEPS=0 \
   OUT_DIR=profiling_kt_codex_smoke/kt_armbf16_source_b4_s7168_r64_v3_final \
-  scripts/lf/run_lf_lora_sft.sh 2>&1 | tee profiling_kt_codex_smoke/kt_armbf16_source_b4_s7168_r64_v3_final.log
+  agent/kt/scripts/run_lf_lora_sft_kt.sh 2>&1 | tee profiling_kt_codex_smoke/kt_armbf16_source_b4_s7168_r64_v3_final.log
 ```
 
 Acceptance gate:
 
 - `profile.json` exists and is non-partial.
+- `train.log` shows `GPU_ID=1` or `GPU_ID=2`; default accepted GPU is 1. No accepted profile may use GPU 0 or GPU 3.
 - `cpu_affinity_count >= KT_NUM_THREADS`.
-- `base_kernel=sve_bfdot` appears in `train.log`.
+- `base_kernel=sve_bfdot`, `aligned_weights=1`, and `sve_vector_bytes` appear in `train.log`.
+- Stage 4A artifacts exist for the final build: CPU features, extension disassembly/build manifest, layout report, perf stat, and perf report.
 - `kt.total_forward_calls` and `kt.total_backward_calls` match the expected microchunk/checkpoint count for the shape.
 - Backward detailed timers explain wrapper backward time within 10 percent.
 - Total measured step time improves materially versus the baseline 9.5 hour run.

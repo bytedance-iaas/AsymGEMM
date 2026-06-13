@@ -428,7 +428,7 @@ def normalize_expert_recompute_threshold(value: int | None) -> int:
     return threshold
 
 
-VALID_EXPERT_RECOMPUTE_POLICIES = ("none", "tok")
+VALID_EXPERT_RECOMPUTE_POLICIES = ("none", "tok", "gc")
 VALID_EXPERT_ACTIVATION_SAVE_POLICIES = ("save_all", "all_act", "tok_act")
 
 
@@ -559,7 +559,7 @@ def expert_activation_drop_group_mask(
 
 @dataclass(frozen=True)
 class ExpertRecomputeConfig:
-    policy: Literal["none", "tok"]
+    policy: Literal["none", "tok", "gc"]
     token_threshold: int
     activation_save_policy: Literal["save_all", "tok_act"]
     activation_save_threshold: int
@@ -569,6 +569,7 @@ class ExpertRecomputeConfig:
     activation_save_min: int = 1
     activation_save_max: int | None = None
     force_custom_autograd: bool = False
+    torch_checkpoint: bool = False
 
     @property
     def recompute_enabled(self) -> bool:
@@ -589,8 +590,16 @@ class ExpertRecomputeConfig:
         )
 
     @property
+    def torch_checkpoint_enabled(self) -> bool:
+        return bool(self.torch_checkpoint)
+
+    @property
+    def custom_autograd_enabled(self) -> bool:
+        return bool(self.policy == "tok" or self.activation_drop_enabled or self.force_custom_autograd)
+
+    @property
     def enabled(self) -> bool:
-        return self.recompute_enabled or self.activation_drop_enabled or self.force_custom_autograd
+        return self.custom_autograd_enabled or self.torch_checkpoint_enabled
 
 
 def parse_expert_recompute_policy_spec(spec: str | None) -> ExpertRecomputeConfig:
@@ -606,6 +615,20 @@ def parse_expert_recompute_policy_spec(spec: str | None) -> ExpertRecomputeConfi
             token_max=None,
             activation_save_min=1,
             activation_save_max=None,
+        )
+    if raw == "gc-exp":
+        return ExpertRecomputeConfig(
+            policy="gc",
+            token_threshold=0,
+            activation_save_policy="save_all",
+            activation_save_threshold=0,
+            label="gc-exp",
+            token_min=1,
+            token_max=None,
+            activation_save_min=1,
+            activation_save_max=None,
+            force_custom_autograd=False,
+            torch_checkpoint=True,
         )
     if raw in {"tok-le0", "tok-le0-act"}:
         return ExpertRecomputeConfig(
@@ -697,7 +720,7 @@ def parse_expert_recompute_policy_spec(spec: str | None) -> ExpertRecomputeConfi
         )
 
     raise ValueError(
-        f"unsupported expert recompute policy {spec!r}; expected none, tok-leN, tok-geN, tokA-B, or -act variants"
+        f"unsupported expert recompute policy {spec!r}; expected none, tok-leN, tok-geN, tokA-B, gc-exp, or -act variants"
     )
 
 

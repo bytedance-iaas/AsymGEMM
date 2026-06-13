@@ -16,40 +16,44 @@ NSYS_BIN=${NSYS_BIN:-nsys}
 # DIST_LAUNCHER=${DIST_LAUNCHER:-accelerate}
 DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun}
 # DIST_LAUNCHER=${DIST_LAUNCHER:-deepspeed}
-RUN_POSTSERVE=${RUN_POSTSERVE:-false}
+RUN_POST=${RUN_POST:-true}
 
 # Sweep axes
 GPU_POOL=${GPU_POOL:-0}
 # MODEL_SPECS entries are model|num_gpus. Recompute belongs only in BACKEND_SPECS.
-# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
+MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
-MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
+# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1,Qwen/Qwen3.5-122B-A10B|1"}
 ROUTER_MODES=${ROUTER_MODES:-whole}
 # PROFILERS=${PROFILERS:-nsys,source}
 PROFILERS=${PROFILERS:-nsys,source}
 PRECISION=${PRECISION:-bf16}
 # LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
-LORA_DROPOUT=${LORA_DROPOUT:-0.08}
+LORA_DROPOUT=${LORA_DROPOUT:-0.00}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero2|norecomp,zero2|recomp,zero3_offload|norecomp,zero3_offload_mem|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"kt_armbf16|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
 # Plain asym remains the non-CPUAdam Asym baseline; the default e2e path validates the Asym CPUAdamW backend.
-BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp"}
+BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload_mem|recomp"}
 
-# EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le0,tok-le512,tok-le512-act"}
-# EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le1"}
-# EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le1,tok-ge1"}
-EXPERT_POLICIES=${EXPERT_POLICIES-"none"}
+# Paired expert policy / expert activation offload axis.
+# Format: EXPERT_POLICY|ASYMM_EXPERT_ACT_OFFLOAD, e.g. none|true,tok-ge1|false.
+# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true,tok-ge1|false,none|false"}
+if [[ -z "${ASYMM_EXP_ACT_POLICIES+x}" && -n "${EXPERT_POLICIES:-}" ]]; then
+  ASYMM_EXP_ACT_POLICIES="${EXPERT_POLICIES//,/|false,}|false"
+fi
+ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true,gc-exp|false,none|false"}
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
 
 # Training
-SEQ_LENS=${SEQ_LENS:-8192}
+# SEQ_LENS=${SEQ_LENS:-8192}
 # SEQ_LENS=${SEQ_LENS:-7168}
-PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-2}
+SEQ_LENS=${SEQ_LENS:-6144}
+PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-4}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 MAX_STEPS=${MAX_STEPS:-10}
 WARMUP_STEPS=${WARMUP_STEPS:-5}
@@ -70,7 +74,6 @@ MAX_SAMPLES=${MAX_SAMPLES:-128}
 # Backend checks and AsymGEMM options
 # ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-all}
-ASYMM_EXPERT_ACT_OFFLOAD=${ASYMM_EXPERT_ACT_OFFLOAD:-true,false}
 ASYM_STRICT=${ASYM_STRICT:-true}
 REQUIRE_SM100=${REQUIRE_SM100:-1}
 USE_ASYM_CPU_ADAMW=${USE_ASYM_CPU_ADAMW:-false}
@@ -186,7 +189,8 @@ Options:
   --router-modes LIST            AsymGEMM router modes: hf, whole. Default ${ROUTER_MODES}.
   --profilers LIST               source and/or nsys.
   --seq-lens LIST                LF cutoff lengths. Accepts positive integers, e.g. 4096,8192.
-  --expert-policies LIST         AsymGEMM expert policies: none, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, and -act variants.
+  --asymm-exp-act-policies LIST  Paired expert policy / expert activation offload configs.
+                                 Format: policy|true_or_false, e.g. none|true,tok-ge1|false.
 
   Dataset:
   --dataset NAME
@@ -225,9 +229,6 @@ Options:
   --profile-module-filter LIST
   --expandable-seg true|false   Set PYTORCH_CUDA_ALLOC_CONF expandable_segments for training jobs.
                                  Default ${EXPANDABLE_SEG}.
-  --asymm-expert-act-offload LIST
-                                 Qwen3 routed-expert activation offload values: true, false, or true,false.
-                                 Adds expact1/expact0 to run identities.
   --use-asym-cpu-adamw true|false
                                  Low-level forwarding control; prefer BACKEND_SPECS=asym_cpuadamwtorch|... or asym_cpuadamwds|...
   --asym-cpu-adamw-backend torch|deepspeed
@@ -345,6 +346,22 @@ expact_tag() {
     true) printf 'expact1\n' ;;
     false) printf 'expact0\n' ;;
   esac
+}
+
+parse_exp_act_policy_pair() {
+  local raw="$1"
+  local policy_part expact_part policy expact
+  [[ "${raw}" == *"|"* ]] || die "ASYMM_EXP_ACT_POLICIES item must be policy|true_or_false, got '${raw}'"
+  policy_part="${raw%%|*}"
+  expact_part="${raw#*|}"
+  [[ "${expact_part}" != *"|"* ]] || die "ASYMM_EXP_ACT_POLICIES item must contain exactly one '|', got '${raw}'"
+  [[ -n "${policy_part}" && -n "${expact_part}" ]] || die "empty policy or activation-offload value in ASYMM_EXP_ACT_POLICIES item '${raw}'"
+  policy="$(normalize_expert_policy "${policy_part}")"
+  expact="$(bool_value "${expact_part}")"
+  if [[ "${expact}" == "true" && "${policy}" != "none" ]]; then
+    die "ASYMM_EXP_ACT_POLICIES item '${raw}' is unsupported: activation offload currently requires expert policy none"
+  fi
+  printf '%s|%s\n' "${policy}" "${expact}"
 }
 
 optional_bool_value() {
@@ -473,7 +490,7 @@ recompute_label() {
 normalize_expert_policy() {
   local raw="$1"
   case "${raw}" in
-    none|tok-le0|tok-le0-act)
+    none|gc-exp|tok-le0|tok-le0-act)
       printf '%s\n' "${raw}"
       return
       ;;
@@ -482,7 +499,7 @@ normalize_expert_policy() {
     printf '%s\n' "${raw}"
     return
   fi
-  die "invalid expert policy '${1}'; expected none, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, or -act variants"
+  die "invalid expert policy '${1}'; expected none, gc-exp, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, or -act variants"
 }
 
 backend_label() {
@@ -1011,6 +1028,16 @@ job_root_path() {
   printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}")"
 }
 
+legacy_job_root_path() {
+  local config_root="$1"
+  local backend="$2"
+  local profiler="$3"
+  local recompute="$4"
+  local expert_policy="$5"
+  local router_mode="$6"
+  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}")"
+}
+
 kt_arm_matching_source_profile_complete() {
   local config_root="$1"
   local backend="$2"
@@ -1019,9 +1046,13 @@ kt_arm_matching_source_profile_complete() {
   local router_mode="$5"
   local seq_len="$6"
   local model_name="$7"
-  local source_profile_json
+  local source_profile_json expected_expact_for_profile
   source_profile_json="$(kt_arm_matching_source_profile_json "${config_root}" "${backend}" "${recompute}" "${expert_policy}" "${router_mode}" "${seq_len}")"
-  existing_profile_complete "${source_profile_json}" "${backend}" "${seq_len}" "${model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}"
+  expected_expact_for_profile="${ASYMM_EXPERT_ACT_OFFLOAD}"
+  if [[ "$(basename "$(dirname "$(dirname "${source_profile_json}")")")" != *__expact* ]]; then
+    expected_expact_for_profile=""
+  fi
+  existing_profile_complete "${source_profile_json}" "${backend}" "${seq_len}" "${model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${expected_expact_for_profile}"
 }
 
 kt_arm_matching_source_profile_json() {
@@ -1031,9 +1062,15 @@ kt_arm_matching_source_profile_json() {
   local expert_policy="$4"
   local router_mode="$5"
   local seq_len="$6"
-  local source_job_root source_seq_root
+  local source_job_root source_seq_root legacy_source_job_root legacy_source_seq_root
   source_job_root="$(job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}")"
   source_seq_root="${source_job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
+  legacy_source_job_root="$(legacy_job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}")"
+  legacy_source_seq_root="${legacy_source_job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
+  if [[ ! -f "${source_seq_root}/profile.json" && -f "${legacy_source_seq_root}/profile.json" ]]; then
+    printf '%s/profile.json\n' "${legacy_source_seq_root}"
+    return 0
+  fi
   printf '%s/profile.json\n' "${source_seq_root}"
 }
 
@@ -1269,9 +1306,8 @@ backend_specs_spec="${BACKEND_SPECS}"
 router_mode_spec="${ROUTER_MODES}"
 profiler_spec="${PROFILERS}"
 seq_spec="${SEQ_LENS}"
-expert_policy_spec="${EXPERT_POLICIES}"
+exp_act_policy_spec="${ASYMM_EXP_ACT_POLICIES}"
 lora_dropout_spec="${LORA_DROPOUT}"
-asymm_expert_act_offload_spec="${ASYMM_EXPERT_ACT_OFFLOAD}"
 output_root="${OUTPUT_ROOT}"
 run_name="${RUN_NAME}"
 batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}"
@@ -1298,8 +1334,8 @@ while (($#)); do
     --profilers=*) profiler_spec="${1#*=}"; shift ;;
     --seq-lens) need_value "$1" "${2-}"; seq_spec="$2"; shift 2 ;;
     --seq-lens=*) seq_spec="${1#*=}"; shift ;;
-    --expert-policies) need_value "$1" "${2-}"; expert_policy_spec="$2"; shift 2 ;;
-    --expert-policies=*) expert_policy_spec="${1#*=}"; shift ;;
+    --asymm-exp-act-policies) need_value "$1" "${2-}"; exp_act_policy_spec="$2"; ASYMM_EXP_ACT_POLICIES="$2"; shift 2 ;;
+    --asymm-exp-act-policies=*) exp_act_policy_spec="${1#*=}"; ASYMM_EXP_ACT_POLICIES="${1#*=}"; shift ;;
     --dataset) need_value "$1" "${2-}"; DATASET="$2"; shift 2 ;;
     --dataset=*) DATASET="${1#*=}"; shift ;;
     --prepare-datasets) need_value "$1" "${2-}"; PREPARE_DATASETS="$(bool_value "$2")"; shift 2 ;;
@@ -1360,8 +1396,6 @@ while (($#)); do
     --profile-module-filter=*) PROFILE_MODULE_FILTER="${1#*=}"; shift ;;
     --expandable-seg|--expandable-segments) need_value "$1" "${2-}"; EXPANDABLE_SEG="$(bool_value "$2")"; shift 2 ;;
     --expandable-seg=*|--expandable-segments=*) EXPANDABLE_SEG="$(bool_value "${1#*=}")"; shift ;;
-    --asymm-expert-act-offload) need_value "$1" "${2-}"; asymm_expert_act_offload_spec="$2"; ASYMM_EXPERT_ACT_OFFLOAD="$2"; shift 2 ;;
-    --asymm-expert-act-offload=*) asymm_expert_act_offload_spec="${1#*=}"; ASYMM_EXPERT_ACT_OFFLOAD="${1#*=}"; shift ;;
     --use-asym-cpu-adamw) need_value "$1" "${2-}"; USE_ASYM_CPU_ADAMW="$(bool_value "$2")"; shift 2 ;;
     --use-asym-cpu-adamw=*) USE_ASYM_CPU_ADAMW="$(bool_value "${1#*=}")"; shift ;;
     --asym-cpu-adamw-backend) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_BACKEND="$2"; shift 2 ;;
@@ -1448,9 +1482,8 @@ require_comma_list "--backend-specs/BACKEND_SPECS" "${backend_specs_spec}"
 require_comma_list "--router-modes/ROUTER_MODES" "${router_mode_spec}"
 require_comma_list "--profilers/PROFILERS" "${profiler_spec}"
 require_comma_list "--seq-lens/SEQ_LENS" "${seq_spec}"
-require_comma_list "--expert-policies/EXPERT_POLICIES" "${expert_policy_spec}"
+require_comma_list "--asymm-exp-act-policies/ASYMM_EXP_ACT_POLICIES" "${exp_act_policy_spec}"
 require_comma_list "--lora-dropout/LORA_DROPOUT" "${lora_dropout_spec}"
-require_comma_list "--asymm-expert-act-offload/ASYMM_EXPERT_ACT_OFFLOAD" "${asymm_expert_act_offload_spec}"
 
 nonnegative_int "--max-steps" "${MAX_STEPS}"
 nonnegative_int "--warmup-steps" "${WARMUP_STEPS}"
@@ -1470,10 +1503,6 @@ for value in "${lora_dropouts[@]}"; do
 done
 LORA_DROPOUT="${lora_dropouts[0]}"
 lora_dropout_label_value="$(lora_dropout_label "${LORA_DROPOUT}")"
-mapfile -t expact_values < <(tokens "${asymm_expert_act_offload_spec}" | while read -r value; do bool_value "${value}"; done | dedupe)
-((${#expact_values[@]})) || die "ASYMM_EXPERT_ACT_OFFLOAD list is empty"
-ASYMM_EXPERT_ACT_OFFLOAD="${expact_values[0]}"
-expact_label="$(expact_tag "${ASYMM_EXPERT_ACT_OFFLOAD}")"
 TOTAL_STEPS=$((MAX_STEPS + WARMUP_STEPS))
 PREPARE_DATASETS=$(bool_value "${PREPARE_DATASETS}")
 DATASET_OVERWRITE=$(bool_value "${DATASET_OVERWRITE}")
@@ -1485,7 +1514,7 @@ DRY_RUN=$(bool_value "${DRY_RUN}")
 COLLECT_EXISTING=$(bool_value "${COLLECT_EXISTING}")
 CHECK_SUPEROFFLOAD=$(bool_value "${CHECK_SUPEROFFLOAD}")
 CHECK_CPUADAM=$(bool_value "${CHECK_CPUADAM}")
-RUN_POSTSERVE=$(bool_value "${RUN_POSTSERVE}")
+RUN_POST=$(bool_value "${RUN_POST}")
 EXPANDABLE_SEG=$(bool_value "${EXPANDABLE_SEG}")
 USE_ASYM_CPU_ADAMW=$(bool_value "${USE_ASYM_CPU_ADAMW}")
 ASYM_CPU_ADAMW_PIN_MEMORY=$(bool_value "${ASYM_CPU_ADAMW_PIN_MEMORY}")
@@ -1582,13 +1611,19 @@ else
   done
 fi
 mapfile -t seq_lens < <(tokens "${seq_spec}" | dedupe)
-mapfile -t raw_expert_policies < <(tokens "${expert_policy_spec}" | dedupe)
-((${#raw_expert_policies[@]} > 0)) || die "expert policies must include at least one explicit policy"
-expert_policies=()
-for value in "${raw_expert_policies[@]}"; do
-  expert_policies+=("$(normalize_expert_policy "${value}")")
+exp_act_policy_pairs=()
+mapfile -t raw_exp_act_policy_pairs < <(tokens "${exp_act_policy_spec}" | dedupe)
+((${#raw_exp_act_policy_pairs[@]} > 0)) || die "ASYMM_EXP_ACT_POLICIES must include at least one policy|expact pair"
+for value in "${raw_exp_act_policy_pairs[@]}"; do
+  exp_act_policy_pairs+=("$(parse_exp_act_policy_pair "${value}")")
 done
-mapfile -t expert_policies < <(printf '%s\n' "${expert_policies[@]}" | dedupe)
+mapfile -t exp_act_policy_pairs < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | dedupe)
+((${#exp_act_policy_pairs[@]})) || die "expert activation policy pair list is empty"
+mapfile -t expert_policies < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f1 | dedupe)
+mapfile -t expact_values < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f2 | dedupe)
+ASYMM_EXP_ACT_POLICIES="$(IFS=,; printf '%s' "${exp_act_policy_pairs[*]}")"
+ASYMM_EXPERT_ACT_OFFLOAD="${expact_values[0]}"
+expact_label="$(expact_tag "${ASYMM_EXPERT_ACT_OFFLOAD}")"
 
 ((${#gpus[@]})) || die "GPU pool is empty"
 ((${#model_specs[@]})) || die "model spec list is empty"
@@ -2448,47 +2483,46 @@ for model_spec_entry in "${model_specs[@]}"; do
       LORA_DROPOUT="${lora_dropout}"
       lora_dropout_label_value="$(lora_dropout_label "${LORA_DROPOUT}")"
       config_root="$(config_root_path "${seq_len}")"
-      for expact_value in "${expact_values[@]}"; do
-        ASYMM_EXPERT_ACT_OFFLOAD="${expact_value}"
+      for exp_act_policy_pair in "${exp_act_policy_pairs[@]}"; do
+        expert_policy="${exp_act_policy_pair%%|*}"
+        ASYMM_EXPERT_ACT_OFFLOAD="${exp_act_policy_pair#*|}"
         expact_label="$(expact_tag "${ASYMM_EXPERT_ACT_OFFLOAD}")"
         for router_mode in "${router_modes[@]}"; do
-          for expert_policy in "${expert_policies[@]}"; do
-            for backend_recompute in "${backend_specs[@]}"; do
-              backend="${backend_recompute%%|*}"
-              recompute="${backend_recompute##*|}"
-              for profiler in "${profilers[@]}"; do
-                if [[ "${backend}" == "kt_armbf16" && "${profiler}" == "nsys" && "${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}" != "1" ]]; then
-                  echo "Skipping backend=kt_armbf16 profiler=nsys; run profiler=source first and set KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK=1 only after one source step completes."
+          for backend_recompute in "${backend_specs[@]}"; do
+            backend="${backend_recompute%%|*}"
+            recompute="${backend_recompute##*|}"
+            for profiler in "${profilers[@]}"; do
+              if [[ "${backend}" == "kt_armbf16" && "${profiler}" == "nsys" && "${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}" != "1" ]]; then
+                echo "Skipping backend=kt_armbf16 profiler=nsys; run profiler=source first and set KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK=1 only after one source step completes."
+                continue
+              fi
+              job_router_mode="${router_mode}"
+              if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" && "${backend}" != "asym_cpuadamwtorch" && "${backend}" != "asym_cpuadamwds" ]]; then
+                if [[ "${router_hf_selected}" != "true" ]]; then
+                  job_router_mode=hf
+                else
+                  echo "Skipping backend=${backend} router_mode=${router_mode}; owned routing requires an AsymGEMM backend."
                   continue
                 fi
-                job_router_mode="${router_mode}"
-                if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" && "${backend}" != "asym_cpuadamwtorch" && "${backend}" != "asym_cpuadamwds" ]]; then
-                  if [[ "${router_hf_selected}" != "true" ]]; then
-                    job_router_mode=hf
-                  else
-                    echo "Skipping backend=${backend} router_mode=${router_mode}; owned routing requires an AsymGEMM backend."
-                    continue
-                  fi
-                fi
-                if is_policy_independent_backend "${backend}" && [[ "${expert_policy}" != "none" ]]; then
-                  echo "Skipping backend=${backend} expert_policy=${expert_policy}; torch/zero/SuperOffload/KT backends are policy-independent."
+              fi
+              if is_policy_independent_backend "${backend}" && [[ "${expert_policy}" != "none" ]]; then
+                echo "Skipping backend=${backend} expert_policy=${expert_policy}; torch/zero/SuperOffload/KT backends are policy-independent."
+                continue
+              fi
+              if [[ "${backend}" == "kt_armbf16" && "${profiler}" == "nsys" ]]; then
+                if ! kt_arm_matching_source_profile_complete "${config_root}" "${backend}" "${recompute}" "${expert_policy}" "${job_router_mode}" "${seq_len}" "${current_model_name}"; then
+                  echo "Skipping backend=kt_armbf16 profiler=nsys; matching source profile is missing, incomplete, or stale for seq=${seq_len} recompute=${recompute} expert_policy=${expert_policy} router_mode=${job_router_mode} ${expact_label}."
                   continue
                 fi
-                if [[ "${backend}" == "kt_armbf16" && "${profiler}" == "nsys" ]]; then
-                  if ! kt_arm_matching_source_profile_complete "${config_root}" "${backend}" "${recompute}" "${expert_policy}" "${job_router_mode}" "${seq_len}" "${current_model_name}"; then
-                    echo "Skipping backend=kt_armbf16 profiler=nsys; matching source profile is missing, incomplete, or stale for seq=${seq_len} recompute=${recompute} expert_policy=${expert_policy} router_mode=${job_router_mode} ${expact_label}."
-                    continue
-                  fi
+              fi
+              gpu_count="$(backend_gpu_count "${backend}" "${current_model_gpu_count}")"
+              gpu="$(gpu_slice "${gpu_count}")"
+              if ! run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}"; then
+                failures=$((failures + 1))
+                if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
+                  exit 1
                 fi
-                gpu_count="$(backend_gpu_count "${backend}" "${current_model_gpu_count}")"
-                gpu="$(gpu_slice "${gpu_count}")"
-                if ! run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}"; then
-                  failures=$((failures + 1))
-                  if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
-                    exit 1
-                  fi
-                fi
-              done
+              fi
             done
           done
         done
@@ -2548,6 +2582,6 @@ fi
 echo "LF profiling completed. Results: ${precision_root}"
 
 
-if [[ "${RUN_POSTSERVE}" == "true" ]]; then
-  bash scripts/testing/serve.sh
+if [[ "${RUN_POST}" == "true" ]]; then
+  bash scripts/lf/test_profiling.sh
 fi

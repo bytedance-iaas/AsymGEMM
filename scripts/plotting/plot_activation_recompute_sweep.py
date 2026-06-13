@@ -290,6 +290,10 @@ def parse_expert_policy_spec(value: str | None) -> dict[str, Any]:
     spec = str(value).strip()
     if spec == "none":
         return result(spec="none", label="none", policy="none")
+    if spec == "gc-exp":
+        data = result(spec="gc-exp", label="gc-exp", policy="gc")
+        data["expert_recompute_impl"] = "torch_checkpoint"
+        return data
     if spec == "tok-le0":
         return result(spec="tok-le0", label="tok-le0", policy="none")
     if spec == "tok-le0-act":
@@ -347,7 +351,7 @@ def parse_expert_policy_spec(value: str | None) -> dict[str, Any]:
             activation_max=upper,
         )
     raise ValueError(
-        f"invalid expert recompute policy spec {value!r}; expected none, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, or -act variants"
+        f"invalid expert recompute policy spec {value!r}; expected none, gc-exp, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, or -act variants"
     )
 
 

@@ -555,6 +555,15 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         in {"1", "true", "yes", "on"},
         "expert_recompute_policy_spec": expert_policy.label,
         "expert_recompute_policy": expert_policy.policy,
+        "expert_recompute_impl": (
+            "torch_checkpoint"
+            if expert_policy.torch_checkpoint_enabled
+            else "custom"
+            if expert_policy.custom_autograd_enabled
+            else "none"
+        ),
+        "expert_gc_use_reentrant": os.environ.get("ASYM_EXPERT_GC_USE_REENTRANT", os.environ.get("ASYM_EXPERT_GC_REENTRANT", "true")).lower()
+        in {"1", "true", "yes", "on"},
         "expert_recompute_threshold": expert_policy.token_threshold,
         "expert_recompute_token_min": expert_policy.token_min,
         "expert_recompute_token_max": expert_policy.token_max,

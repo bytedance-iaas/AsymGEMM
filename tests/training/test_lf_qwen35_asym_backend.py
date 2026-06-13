@@ -175,6 +175,33 @@ def test_asym_qwen35_moe_whole_matches_source_and_detaches_router() -> None:
     assert list(wrapped._modules)[:4] == ["gate", "experts", "shared_expert", "shared_expert_gate"]
 
 
+def test_asym_qwen35_gc_exp_accepts_and_runs_packed_experts() -> None:
+    torch.manual_seed(11)
+    source = FakeQwen3_5MoeBlock()
+    wrapped = AsymQwen35MoeBlock(
+        source,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        expert_recompute_policy="gc-exp",
+    )
+    assert wrapped.experts.expert_recompute_config.label == "gc-exp"
+    assert wrapped.experts.expert_recompute_config.torch_checkpoint_enabled
+
+    x = torch.randn(2, 5, source.gate.hidden_dim, dtype=torch.bfloat16, requires_grad=True)
+    loss = wrapped(x).float().square().mean()
+    loss.backward()
+
+    assert x.grad is not None
+    assert torch.isfinite(x.grad.float()).all()
+    for name, param in wrapped.experts.named_parameters():
+        if "lora_" in name:
+            assert param.grad is not None, f"{name} missing grad"
+
+
 def test_real_transformers_qwen35_sparse_moe_block_matches_wrapper() -> None:
     modeling = pytest.importorskip("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe")
     configuration = pytest.importorskip("transformers.models.qwen3_5_moe.configuration_qwen3_5_moe")

@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 import asym_gemm
+import asym_gemm.training.qwen3_moe as qwen3_moe_module
 from asym_gemm.integrations.lf import (
     apply_lf_asym_lora,
     classify_lf_component,
@@ -501,6 +502,7 @@ def test_activation_offload_manager_tracks_cpu_owners_and_stage_reuse() -> None:
 
 def test_parse_expert_recompute_policy_spec() -> None:
     none = parse_expert_recompute_policy_spec(None)
+    gc_exp = parse_expert_recompute_policy_spec("gc-exp")
     lower = parse_expert_recompute_policy_spec("tok-le2")
     zero = parse_expert_recompute_policy_spec("tok-le0")
     upper = parse_expert_recompute_policy_spec("tok-ge2")
@@ -513,6 +515,12 @@ def test_parse_expert_recompute_policy_spec() -> None:
     activation_bounded = parse_expert_recompute_policy_spec("tok2-4-act")
 
     assert none.label == "none"
+    assert gc_exp.label == "gc-exp"
+    assert gc_exp.policy == "gc"
+    assert gc_exp.torch_checkpoint_enabled
+    assert not gc_exp.recompute_enabled
+    assert not gc_exp.custom_autograd_enabled
+    assert gc_exp.enabled
     assert lower.label == "tok-le2"
     assert lower.policy == "tok"
     assert lower.token_threshold == 2
@@ -1093,7 +1101,7 @@ def test_asym_llama4_moe_hf_keeps_router_input_grad_path() -> None:
     assert all(not param.requires_grad for param in wrapped.router.parameters())
 
 
-@pytest.mark.parametrize("policy", ["tok-le2", "tok-le2-act"])
+@pytest.mark.parametrize("policy", ["tok-le2", "tok-le2-act", "gc-exp"])
 def test_asym_qwen3_experts_torch_recompute_policies_match_none(policy: str) -> None:
     torch.manual_seed(5)
     source_ref = FakeQwen3Experts()
@@ -1245,7 +1253,7 @@ def test_qwen3_tok_policy_uses_saved_low_rank_without_subset_lora_a_recompute() 
     assert subset_gate_up_calls == 0
 
 
-@pytest.mark.parametrize("policy", ["tok-le0", "tok-le2", "tok-le2-act"])
+@pytest.mark.parametrize("policy", ["tok-le0", "tok-le2", "tok-le2-act", "gc-exp"])
 def test_asym_qwen3_experts_torch_recompute_lora_dropout_matches_none(policy: str) -> None:
     torch.manual_seed(39)
     source_ref = FakeQwen3Experts()
@@ -1300,6 +1308,101 @@ def test_asym_qwen3_experts_torch_recompute_lora_dropout_matches_none(policy: st
         if "lora_" not in name:
             continue
         _assert_grad_close(f"{policy} dropout {name}", candidate_params[name].grad, param.grad)
+
+
+def test_qwen3_gc_exp_uses_torch_checkpoint_not_custom_functions(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(41)
+    source = FakeQwen3Experts()
+    wrapped = AsymQwen3Experts(
+        source,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        expert_recompute_policy="gc-exp",
+        init_lora_weights="peft",
+    )
+
+    def fail_custom_path(*_args, **_kwargs):
+        raise AssertionError("custom expert path used")
+
+    monkeypatch.setattr(qwen3_moe_module._ThresholdedQwen3ExpertFunction, "apply", fail_custom_path)
+    monkeypatch.setattr(qwen3_moe_module._ActivationOffloadQwen3ExpertFunction, "apply", fail_custom_path)
+
+    wrapped.train()
+    x = torch.randn(5, source.hidden_dim, dtype=torch.bfloat16, requires_grad=True)
+    top_k_index, top_k_weights = _routing()
+    loss = wrapped(x, top_k_index, top_k_weights).float().square().mean()
+    loss.backward()
+
+    assert x.grad is not None
+    assert torch.isfinite(x.grad.float()).all()
+    for name, param in wrapped.named_parameters():
+        if "lora_" in name:
+            assert param.grad is not None, f"{name} missing grad"
+
+
+def test_qwen3_gc_exp_reruns_grouped_expert_body_in_backward() -> None:
+    torch.manual_seed(43)
+    source = FakeQwen3Experts()
+    wrapped = AsymQwen3Experts(
+        source,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        expert_recompute_policy="gc-exp",
+        init_lora_weights="peft",
+    )
+    wrapped.train()
+    body_grad_modes: list[bool] = []
+    original = wrapped._forward_expert_body
+
+    def counted_forward_body(*args, **kwargs):
+        body_grad_modes.append(torch.is_grad_enabled())
+        return original(*args, **kwargs)
+
+    wrapped._forward_expert_body = counted_forward_body  # type: ignore[method-assign]
+    x = torch.randn(5, source.hidden_dim, dtype=torch.bfloat16, requires_grad=True)
+    top_k_index, top_k_weights = _routing()
+    loss = wrapped(x, top_k_index, top_k_weights).float().square().mean()
+    assert body_grad_modes == [False]
+    loss.backward()
+    assert body_grad_modes == [False, True]
+
+
+def test_llama4_gc_exp_wrap_accepts_and_runs_packed_experts() -> None:
+    torch.manual_seed(45)
+    source = FakeLlama4Moe()
+    wrapped = AsymLlama4Moe(
+        source,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        expert_recompute_policy="gc-exp",
+        router_mode="whole",
+        strict=True,
+    )
+    assert wrapped.experts.expert_recompute_config.label == "gc-exp"
+    assert wrapped.experts.expert_recompute_config.torch_checkpoint_enabled
+
+    hidden = torch.randn(1, 5, source.hidden_dim, dtype=torch.bfloat16, requires_grad=True)
+    out, _router_logits = wrapped(hidden)
+    loss = out.float().square().mean()
+    loss.backward()
+
+    assert hidden.grad is not None
+    assert torch.isfinite(hidden.grad.float()).all()
+    for name, param in wrapped.experts.named_parameters():
+        if "lora_" in name:
+            assert param.grad is not None, f"{name} missing grad"
 
 
 def test_apply_lf_asym_lora_wraps_experts_dense_and_freezes_router() -> None:
