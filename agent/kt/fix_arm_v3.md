@@ -7,13 +7,42 @@ Rule: do not move to the next stage until the validation gate for the current st
 ## Current Facts
 
 - The completed rank-64 run entered native KT ARM BF16, not DeepSpeed and not a scalar fallback. `train.log` reports `path=packed`, `task_dispatch=worker_pool`, `base_kernel=sve_bfdot`, and `aligned_weights=1`.
-- The same run recorded `cpu_affinity_count=1`, `cpu_affinity.cpus=0`, while the host shell can see 144 CPUs. This is the most suspicious correctness issue.
+- The original accepted-looking rank-64 run recorded `cpu_affinity_count=1`, `cpu_affinity.cpus=0`, while the host shell can see 144 CPUs. This was a real launch/threading correctness issue, not a profiler artifact.
+- The CPU-affinity collapse was reproduced with Qwen3 and traced to `OMP_PROC_BIND=close`: the process leader became pinned to CPU 0 after OpenMP initialized. The KT-only launcher now defaults `KT_ARM_OMP_PROC_BIND=false` and monitors the child process affinity while it runs.
+- The fixed-affinity Qwen3 smoke records `cpu_affinity_count=144`, `OMP_PROC_BIND=false`, 48 wrappers, 48 forward calls, and 48 backward calls.
 - KT totals for the completed rank-64 source profile: 48 wrappers, 1344 forward native calls, 672 backward native calls.
 - Per 2048-token chunk, native forward averages approximately: base gate/up 5.6s, LoRA gate/up 6.1s, base down 3.8s, LoRA down 3.0s, route merge 0.31s. Copies to/from CUDA are small.
-- Backward aggregate logs time only `lora_grad_reduce_ms` and `grad_flush_ms`; wrapper backward sync shows much more time than those two fields explain. Allocation, zeroing, thread reduction, grad-input flush, and some recompute work need explicit timers.
+- Stage 3 timers now explain native backward sync within measurement noise: before the reducer fix, detailed native phases accounted for 99.96 percent of wrapper backward sync on `profiling_kt_codex_smoke/kt_armbf16_timer_coverage_qwen3`.
+- The dominant validated bug was the dense backward reducer dispatching one WorkerPool task per float element. For Qwen3 rank-8 smoke this produced task counts of 131,072, 786,432, and 2,097,152 per reduction field and `backward_thread_reduce_ms ~= 4108 ms/layer`.
+- Stage 8A changed dense reduction dispatch to contiguous chunks (`KT_ARM_SFT_REDUCE_CHUNK_ELEMS`, default 16384). The same Qwen3 smoke dropped `backward_thread_reduce_ms` to `8.45 ms/layer`, backward sync from `4233.50 ms/layer` to `129.63 ms/layer`, and one-step train runtime from `266.6s` to `83.1s`.
+- Accepted KT profiles are now checked by `agent/kt/scripts/validate_kt_arm_profile.py`, which rejects partial profiles, wrong backend, wrong physical GPU, low CPU affinity, OpenMP bind collapse, missing native SVE BF16 log evidence, and missing KT forward/backward counters.
+- KT microbench coverage exists under `../ktransformers/kt-kernel/bench/`, but it is still coarse. The existing benches now run and respect `--threads` for both WorkerPool and ARM backward OpenMP, but they do not yet provide per-phase masks or a full layout/PMU JSON report.
 - Low GPU memory is not suspicious by itself. KT keeps routed expert work CPU-side; memory comparison against ZeRO-3 offload is not one-to-one.
 - GPU policy for KT tests: use physical GPU 1 first, physical GPU 2 as fallback. Do not use GPU 0 or GPU 3 for KT validation. Current snapshot on 2026-06-12 showed GPU 1 with about 140 GiB free and GPU 2 with about 132 GiB free, which is enough for KT smoke tests and should be enough for the previously observed large KT profile shape.
 - Model policy for KT-native SFT validation: use a model architecture supported by `kt_kernel.sft.arch`, currently DeepSeekV2/V3, Qwen2Moe/Qwen3Moe/Qwen3_5Moe, or Mixtral. `meta-llama/Llama-4-Scout-17B-16E` currently fails the KT SFT architecture gate with `KTAMXModelNotSupportedError`; do not use it as a positive KT-native smoke until explicit Llama4 support is implemented.
+
+## Executed Validation Artifacts
+
+- `profiling_kt_codex_smoke/kt_armbf16_gpu1_affinity_fixed_qwen3`: GPU 1, Qwen3, `CUTOFF_LEN=64`, batch 1, rank 8, max step 1. Validated native KT ARM BF16 path with `base_kernel=sve_bfdot`, `compiled_sve_bf16=1`, `sve_vector_bytes=16`, `aligned_weights=1`, and `cpu_affinity_count=144`.
+- `profiling_kt_codex_smoke/kt_armbf16_timer_coverage_qwen3`: pre-reducer-fix timing coverage. Backward sync mean `4233.499 ms`, detailed native timing sum mean `4231.648 ms`, coverage `99.96%`. Root cause was `backward_thread_reduce_ms` mean `4108.213 ms`.
+- `profiling_kt_codex_smoke/kt_armbf16_reduce_chunk_qwen3`: post-reducer-fix validation. Train runtime `83.1s`, backward sync mean `129.632 ms`, `backward_thread_reduce_ms` mean `8.454 ms`, `backward_route_loop_ms` mean `87.916 ms`, `backward_local_alloc_zero_ms` mean `31.345 ms`.
+- `profiling_kt_codex_smoke/kt_armbf16_layout_pmu`: build/disassembly evidence. `bf16_instruction_hits.txt` is non-empty and contains BF16 dot instructions.
+- `profiling_kt_codex_smoke/bench_armbf16_tiny_smoke.json`: `bench_armbf16_sft.py` tiny ARM smoke after bench thread fix. `KT_ARM_SFT_BACKWARD_SCRATCH` reports `threads=1` when `--threads 1`.
+- `profiling_kt_codex_smoke/bench_arm_sft_compare_tiny_smoke.json`: `bench_arm_sft_compare.py` tiny correctness/latency smoke after fixing the stale `wrapper` reference in latency payload.
+- `profiling_kt_codex_smoke/bench_arm_sft_compare_invalid_tiny_smoke.json`: invalid-route-pattern correctness/latency smoke with batched Torch enabled; verifies all reference modes skip invalid expert IDs consistently.
+- Script regression: `bash -n agent/kt/scripts/run_lf_lora_sft_kt.sh agent/kt/scripts/profile_lora_lf_kt.sh` passes. `.venv/bin/python -m pytest tests/lf/test_superoffload_backend_scripts.py -k "kt_arm" -q` passes with `20 passed, 28 deselected`.
+- Python syntax regression: `.venv/bin/python -m py_compile agent/kt/scripts/validate_kt_arm_profile.py ../ktransformers/kt-kernel/bench/bench_armbf16_sft.py ../ktransformers/kt-kernel/bench/bench_arm_sft_compare.py` passes.
+
+## Remaining Bugs and Optimization Targets
+
+1. Forward base projections still use a dot-loop shape rather than a blocked SVE BF16 GEMM. In the post-reducer Qwen3 smoke, forward is now the largest wall-time contributor: base gate/up mean `263.341 ms/layer`, base down mean `161.890 ms/layer`, route merge mean `52.512 ms/layer`.
+2. Backward route recompute is now the main native backward compute target: `backward_route_loop_ms` mean `87.916 ms/layer`. It still recomputes route forward and backward with per-route loops.
+3. Dense backward scratch still exists. Stage 8A fixed reduction task granularity, but per-thread dense full-expert gradient buffers still allocate/zero about `281 MB/layer` local scratch across 8 threads and `35 MB/layer` reduced scratch for the Qwen3 rank-8 smoke. Large rank-64 shapes will amplify this.
+4. Backward-weight repack wait is visible but mostly overlapped outside current backward sync after the reducer fix. It still reports `backward_repack_wait_ms` around `0.94s/layer` in profile lines, so Stage 9/10 should verify overlap and avoid treating it as a hidden synchronous blocker.
+5. `profile.json` now includes KT config and affinity fields, and the KT-only launcher has been patched to include physical `gpu_id`, `num_gpus`, `cuda_visible_devices`, `nvidia_visible_devices`, and `profile_nsys_gpu_metrics_devices` in future source profiles. Older artifacts still require checking `train.log` for `GPU_ID=1` or `GPU_ID=2`.
+6. The shared AsymGEMM sweep script `scripts/lf/profile_lora_lf.sh` still defaults to GPU 0 and should not be used for accepted KT ARM profiles. Use `agent/kt/scripts/profile_lora_lf_kt.sh`, whose default `GPU_POOL` is `1,2`.
+7. Script isolation does not freeze all runtime code: KT script copies still import the live AsymGEMM checkout through `PYTHONPATH`. For accepted performance comparisons, record `git status --short`, relevant diffs, and the `../ktransformers/kt-kernel` source revision or use a separate frozen worktree.
+8. Llama4 remains unsupported by KT SFT. Continue using Qwen3 for positive KT-native tests unless `kt_kernel.sft.arch` is extended and validated.
 
 Useful source locations:
 
@@ -21,25 +50,30 @@ Useful source locations:
 - Original sweep wrapper: `scripts/lf/profile_lora_lf.sh`
 - KT-only launcher copy to edit during this plan: `agent/kt/scripts/run_lf_lora_sft_kt.sh`
 - KT-only sweep copy to edit during this plan: `agent/kt/scripts/profile_lora_lf_kt.sh`
+- KT accepted-profile validator: `agent/kt/scripts/validate_kt_arm_profile.py`
 - ARM Python wrapper: `../ktransformers/kt-kernel/python/sft/arm.py`
 - Autograd/checkpoint hook: `../ktransformers/kt-kernel/python/sft/autograd.py`
 - LF KT layer bridge: `../ktransformers/kt-kernel/python/sft/layer.py`
 - Native ARM SFT kernel: `../ktransformers/kt-kernel/operators/arm/bf16_sft_moe.hpp`
 - Worker pool: `../ktransformers/kt-kernel/cpu_backend/worker_pool.cpp`
+- Existing coarse KT ARM bench: `../ktransformers/kt-kernel/bench/bench_armbf16_sft.py`
+- Existing correctness/latency compare bench: `../ktransformers/kt-kernel/bench/bench_arm_sft_compare.py`
 
 Root causes this plan targets:
 
 1. Invalid launch placement: prior accepted-looking profiles had `cpu_affinity_count=1`.
 2. Worker 0 placement: the caller thread participates in worker-pool jobs and can be badly pinned.
-3. Base projection shape: `arm_bf16_matmul_tiled` is currently a nested loop around one SVE BF16 dot per output element, not a blocked GEMM.
-4. Base down shape: down projection is scalar FP32 accumulation over `H x I`.
-5. LoRA shape: gate/up/down LoRA paths are per-route scalar loops instead of grouped rank GEMMs.
-6. Backward memory traffic: dense full-expert per-thread gradient buffers and dense reductions create large allocation, zeroing, cache, and memory-bandwidth costs.
-7. Layout/NUMA uncertainty: existing logs do not prove first-touch placement, contiguous kernel access, or per-phase bytes/FLOPs strongly enough.
+3. Backward reduction task granularity: dense reductions previously dispatched one worker-pool task per float element. Stage 8A fixed this with chunked contiguous reductions, but dense scratch remains.
+4. Base projection shape: `arm_bf16_matmul_tiled` is currently a nested loop around one SVE BF16 dot per output element, not a blocked GEMM.
+5. Base down shape: down projection is scalar FP32 accumulation over `H x I`.
+6. LoRA shape: gate/up/down LoRA paths are per-route scalar loops instead of grouped rank GEMMs.
+7. Backward memory traffic: dense full-expert per-thread gradient buffers and dense reductions create large allocation, zeroing, cache, and memory-bandwidth costs.
+8. Layout/NUMA uncertainty: existing logs do not prove first-touch placement, contiguous kernel access, or per-phase bytes/FLOPs strongly enough.
 
 Required evidence before any optimization is accepted:
 
 - Correctness: tiny-shape Torch/scalar reference match for forward and backward when the stage changes math.
+- Validator: `agent/kt/scripts/validate_kt_arm_profile.py` passes for any LF source profile accepted as complete.
 - Launch: `train.log` proves `GPU_ID=1` or `GPU_ID=2`, `NUM_GPUS=1`, `cpu_affinity_count >= KT_NUM_THREADS`, and no accepted run uses GPU 0 or GPU 3.
 - Instruction path: build manifest, `cpu_features.txt`, `objdump.txt`, and `bf16_instruction_hits.txt` prove SVE BF16 code is compiled and present.
 - Layout: `layout_report.json` records SVE vector bytes, padded LoRA rank, route tile shape, base/LoRA strides, 64-byte alignment, route skew, and padding overhead.
@@ -58,8 +92,10 @@ Isolation contract:
 - KT launcher/profile edits belong under ignored `agent/kt/**`.
 - KT run artifacts belong under `profiling_kt_codex_smoke/kt_armbf16_*`.
 - Do not edit the original AsymGEMM launcher/sweep files during KT work: `scripts/lf/run_lf_lora_sft.sh` and `scripts/lf/profile_lora_lf.sh`.
+- Do not use `scripts/lf/profile_lora_lf.sh` for accepted KT ARM profiles. Its default GPU pool is not the KT-safe `1,2` policy.
 - Do not edit shared AsymGEMM helper scripts for KT unless the change is intentionally part of the main AsymGEMM work. If those helpers change while KT profiling is running, KT profiles may reflect those runtime changes.
 - For file-change isolation, the ignored `agent/kt/scripts` copies are enough. For hard runtime isolation from all main AsymGEMM changes, run KT from a separate frozen AsymGEMM worktree/clone and point `ASYM_DIR`/`ROOT` there.
+- For accepted performance profiles in this checkout, save `git status --short`, relevant `git diff` snippets, and the KT kernel source diff beside the profile so concurrent AsymGEMM edits are visible.
 
 Implementation:
 
@@ -136,6 +172,11 @@ PY
 
 bash -n agent/kt/scripts/run_lf_lora_sft_kt.sh
 bash -n agent/kt/scripts/profile_lora_lf_kt.sh
+.venv/bin/python -m py_compile \
+  agent/kt/scripts/validate_kt_arm_profile.py \
+  agent/kt/scripts/lf/build_lf_sft_eval_pair.py \
+  agent/kt/scripts/plotting/plot_lf_memory_breakdown.py \
+  agent/kt/scripts/plotting/plot_activation_recompute_sweep.py
 ```
 
 Validation gate:
@@ -143,7 +184,9 @@ Validation gate:
 - `bash -n` passes for both KT-only scripts.
 - `rg -n "run_lf_lora_sft_kt.sh" agent/kt/scripts/profile_lora_lf_kt.sh` shows the sweep copy calls the KT launcher copy.
 - `rg -n "agent/kt/scripts" agent/kt/scripts/run_lf_lora_sft_kt.sh agent/kt/scripts/profile_lora_lf_kt.sh` shows helper paths point to KT copies if helper-copy mode is used.
-- `git check-ignore -v --no-index agent/kt/scripts/run_lf_lora_sft_kt.sh` proves new KT script copies are ignored by normal git status.
+- `rg -n 'GPU_POOL=\$\{GPU_POOL:-1,2\}' agent/kt/scripts/profile_lora_lf_kt.sh` proves the KT sweep defaults to physical GPU 1/2, not GPU 0.
+- `git check-ignore -v --no-index agent/kt/scripts/run_lf_lora_sft_kt.sh agent/kt/scripts/profile_lora_lf_kt.sh agent/kt/scripts/validate_kt_arm_profile.py` proves new KT script copies are ignored by normal git status.
+- `py_compile` passes for the validator and copied helper scripts.
 - If the original AsymGEMM scripts are already dirty from unrelated work, leave them dirty and do not touch them. Record `git diff -- scripts/lf/run_lf_lora_sft.sh scripts/lf/profile_lora_lf.sh` before and after KT work; the KT pass must not add new hunks to those files.
 - All commands in this document use `agent/kt/scripts/run_lf_lora_sft_kt.sh` after this stage.
 - Any final upstreaming into the original scripts must be a separate integration step after Stage 12.
@@ -255,6 +298,18 @@ taskset -c 0-143 env \
 rg "GPU_ID|CUDA_VISIBLE_DEVICES|base_kernel=sve_bfdot|aligned_weights=1|sve_vector_bytes" \
   profiling_kt_codex_smoke/kt_armbf16_gpu1_preflight.log
 
+.venv/bin/python agent/kt/scripts/validate_kt_arm_profile.py \
+  --profile-json profiling_kt_codex_smoke/kt_armbf16_gpu1_preflight/profile.json \
+  --expected-model Qwen/Qwen3-30B-A3B \
+  --expected-seq-len 64 \
+  --expected-batch 1 \
+  --expected-rank 8 \
+  --expected-dropout 0.0 \
+  --expected-top-k 8 \
+  --expected-cache-depth 2 \
+  --expected-recompute false \
+  --require-final
+
 # Verify the extension was built for ARM SVE BF16 and contains the expected instruction text.
 SO="$(
   .venv/bin/python - <<'PY'
@@ -275,6 +330,7 @@ Profile gate:
 - Accepted KT source profiles must have `GPU_ID=1` or `GPU_ID=2` in `train.log`; default is GPU 1.
 - `nvidia-smi` before launch shows the selected GPU has enough free memory for the shape.
 - `train.log` has `base_kernel=sve_bfdot`, `aligned_weights=1`, and `sve_vector_bytes` once that field is added.
+- `validate_kt_arm_profile.py` passes. It is allowed to infer physical GPU from `train.log` for older artifacts, but new artifacts should also contain `config.gpu_id`, `config.num_gpus`, and CUDA visibility fields.
 - Disassembly or build log proves the extension contains SVE BF16 code. If disassembly cannot be used, the build log must show `-march=...+sve+bf16` or `-march=native` on a host with `svebf16`.
 
 ## Stage 1: Fix Launch CPU Affinity
@@ -336,6 +392,12 @@ Profile gate:
 ## Stage 2: Fix Worker-Pool Placement
 
 Problem: `WorkerPool` uses worker 0 as the caller thread, while persistent worker threads start at index 1. If the caller is badly pinned, every native task includes a badly placed worker.
+
+Current status:
+
+- The reproduced placement failure was caused by `OMP_PROC_BIND=close`, which pinned the process leader to CPU 0 after OpenMP initialization.
+- Stage 1 fixed the accepted LF launcher path by defaulting `KT_ARM_OMP_PROC_BIND=false` and monitoring child affinity during training.
+- No WorkerPool caller-thread binding change has been accepted yet. Treat this stage as a targeted follow-up only if `ps -L`, WorkerPool logs, or source timings still show caller-thread placement imbalance after the Stage 1 fix.
 
 Implementation:
 
@@ -417,16 +479,26 @@ rg "backward_(ensure_buffers|local_alloc_zero|thread_reduce|grad_input_flush)_ms
 Profile gate:
 
 - For each backward call, the sum of detailed native backward phases should be within 10 percent of wrapper `backward_sync_ms_last`, excluding explicit Python/CUDA copy fields.
+- This gate passed on `profiling_kt_codex_smoke/kt_armbf16_timer_coverage_qwen3`: wrapper backward sync mean `4233.499 ms`, detailed native backward phase sum mean `4231.648 ms`, coverage `99.96%`.
+- The same artifact identified `backward_thread_reduce_ms` mean `4108.213 ms/layer` as the validated blocker before Stage 8A.
 - If the gap is larger than 10 percent, do not optimize kernels yet; add missing timers first.
 
 ## Stage 4: Add a Native Microbenchmark Harness
 
 Problem: the end-to-end LF run is too expensive to use as the only kernel development loop.
 
+Current status:
+
+- Use `../ktransformers/kt-kernel/bench/bench_armbf16_sft.py` for coarse ARM/Torch wrapper correctness and latency.
+- Use `../ktransformers/kt-kernel/bench/bench_arm_sft_compare.py` for scalar reference, grouped Torch, KT Torch BF16, and KT ARM BF16 comparisons.
+- `bench_arm_sft_compare.py` had a stale `wrapper` reference in `_latency_payload`; this is fixed.
+- Both benches now set `KT_ARM_SFT_BACKWARD_THREADS`, `OMP_NUM_THREADS`, and `OMP_PROC_BIND=false` from `--threads` while running the ARM backend, so `--threads` controls both WorkerPool and ARM backward OpenMP.
+- Remaining harness gap: neither existing bench has per-phase masks, dedicated layout JSON, bytes/FLOPs estimates, or PMU artifact orchestration. Do not accept Stage 5/6/7/8B kernel rewrites on these coarse bench latencies alone.
+
 Implementation:
 
-- Add a small C++ or Python-bound microbench that constructs one ARM SFT MoE wrapper/layer with synthetic BF16 inputs, synthetic top-k IDs/weights, and rank/top-k/hidden/intermediate matching the model.
-- The microbench must support phase masks so each slow component can be isolated:
+- Extend one existing bench, preferably `bench_arm_sft_compare.py`, or add a small C++/Python-bound harness that constructs one ARM SFT MoE wrapper/layer with synthetic BF16 inputs, synthetic top-k IDs/weights, and rank/top-k/hidden/intermediate matching the model.
+- The harness must support phase masks so each slow component can be isolated:
   - base gate/up only
   - base down only
   - LoRA gate/up only
@@ -449,22 +521,38 @@ CPUINFER_FORCE_REBUILD=1 CPUINFER_BUILD_TYPE=RelWithDebInfo CPUINFER_PARALLEL=16
   /workspace/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python -m pip install -e . -v --no-build-isolation
 
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
-taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
-  .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
-  --qlen 128 --top-k 8 --rank 8 --hidden-size 2048 --intermediate-size 768 \
-  --num-experts 128 --threads 8 --check --json profiling_kt_codex_smoke/bench_arm_sft_q128_r8.json
+.venv/bin/python -m py_compile \
+  ../ktransformers/kt-kernel/bench/bench_armbf16_sft.py \
+  ../ktransformers/kt-kernel/bench/bench_arm_sft_compare.py
 
 taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
-  .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
-  --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
-  --num-experts 128 --threads 8 --json profiling_kt_codex_smoke/bench_arm_sft_q2048_r64.json
+  .venv/bin/python ../ktransformers/kt-kernel/bench/bench_arm_sft_compare.py \
+  --qlen 2 --experts 2 --topk 1 --hidden 16 --intermediate 8 --rank 2 \
+  --threads 1 --warmup 0 --iters 1 \
+  --output-json profiling_kt_codex_smoke/bench_arm_sft_compare_tiny_smoke.json
+
+taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 KT_ARM_SFT_PROFILE=1 \
+  .venv/bin/python ../ktransformers/kt-kernel/bench/bench_armbf16_sft.py \
+  --backend both \
+  --qlen 128 --topk 8 --rank 8 --hidden 2048 --intermediate 768 \
+  --experts 128 --threads 8 --warmup 1 --iters 3 \
+  --output-json profiling_kt_codex_smoke/bench_armbf16_q128_r8.json
+
+taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 KT_ARM_SFT_PROFILE=1 \
+  .venv/bin/python ../ktransformers/kt-kernel/bench/bench_armbf16_sft.py \
+  --backend arm --skip-correctness \
+  --qlen 2048 --topk 8 --rank 64 --hidden 2048 --intermediate 768 \
+  --experts 128 --threads 8 --warmup 1 --iters 3 \
+  --output-json profiling_kt_codex_smoke/bench_armbf16_q2048_r64.json
 ```
 
 Profile gate:
 
 - Tiny correctness mode passes against reference within BF16/FP32 tolerance.
-- JSON includes all Stage 3 timing fields.
-- Microbench timings trend in the same direction as LF source-profile timings.
+- `KT_ARM_SFT_BACKWARD_SCRATCH` logs `threads=<--threads>`, not host CPU count, for bench runs.
+- JSON includes native diagnostic fields such as `base_projection_kernel`, `sve_bf16_compiled`, `last_forward_path`, `last_task_dispatch`, `active_expert_count`, route counts, and cache depth.
+- Existing coarse microbench timings trend in the same direction as LF source-profile timings.
+- Before accepting a per-phase kernel optimization, the harness must be extended to emit the missing phase-mask/layout/bytes/FLOPs fields, or an equivalent source-profile plus `perf` artifact set must be saved.
 
 ## Stage 4A: Instruction, Layout, and PMU Baseline
 
@@ -525,41 +613,47 @@ fi
 rg -i "bfdot|bfmmla|svbfdot" profiling_kt_codex_smoke/kt_armbf16_layout_pmu/objdump.txt \
   | tee profiling_kt_codex_smoke/kt_armbf16_layout_pmu/bf16_instruction_hits.txt
 
-taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
-  .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
-    --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
-    --num-experts 128 --threads 8 --layout-report \
-    --json profiling_kt_codex_smoke/kt_armbf16_layout_pmu/layout_report.json
+# Temporary coarse layout/diagnostic probe until the Stage 4 phase/layout extension exists.
+taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 KT_ARM_SFT_PROFILE=1 \
+  .venv/bin/python ../ktransformers/kt-kernel/bench/bench_armbf16_sft.py \
+    --backend arm --skip-correctness \
+    --qlen 2048 --topk 8 --rank 64 --hidden 2048 --intermediate 768 \
+    --experts 128 --threads 8 --warmup 1 --iters 3 \
+    --output-json profiling_kt_codex_smoke/kt_armbf16_layout_pmu/layout_probe.json \
+    2>&1 | tee profiling_kt_codex_smoke/kt_armbf16_layout_pmu/layout_probe.log
 
 command -v perf && perf stat -r 3 \
   -e cycles,instructions,cache-references,cache-misses,branches,branch-misses,task-clock,context-switches,cpu-migrations \
-  -o profiling_kt_codex_smoke/kt_armbf16_layout_pmu/perf_stat_base_gate_up.txt -- \
-  taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
-    .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
-      --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
-      --num-experts 128 --threads 8 --phase base_gate_up \
-      --json profiling_kt_codex_smoke/kt_armbf16_layout_pmu/base_gate_up.json
+  -o profiling_kt_codex_smoke/kt_armbf16_layout_pmu/perf_stat_armbf16_wrapper.txt -- \
+  taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 KT_ARM_SFT_PROFILE=1 \
+    .venv/bin/python ../ktransformers/kt-kernel/bench/bench_armbf16_sft.py \
+      --backend arm --skip-correctness \
+      --qlen 2048 --topk 8 --rank 64 --hidden 2048 --intermediate 768 \
+      --experts 128 --threads 8 --warmup 1 --iters 3 \
+      --output-json profiling_kt_codex_smoke/kt_armbf16_layout_pmu/armbf16_wrapper.json
 
 command -v perf && perf record -g --call-graph dwarf \
-  -o profiling_kt_codex_smoke/kt_armbf16_layout_pmu/perf_base_gate_up.data -- \
-  taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
-    .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
-      --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
-      --num-experts 128 --threads 8 --phase base_gate_up \
-      --json /tmp/kt_base_gate_up_profile.json
+  -o profiling_kt_codex_smoke/kt_armbf16_layout_pmu/perf_armbf16_wrapper.data -- \
+  taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 KT_ARM_SFT_PROFILE=1 \
+    .venv/bin/python ../ktransformers/kt-kernel/bench/bench_armbf16_sft.py \
+      --backend arm --skip-correctness \
+      --qlen 2048 --topk 8 --rank 64 --hidden 2048 --intermediate 768 \
+      --experts 128 --threads 8 --warmup 1 --iters 3 \
+      --output-json /tmp/kt_armbf16_wrapper_profile.json
 
 command -v perf && perf report --stdio \
-  -i profiling_kt_codex_smoke/kt_armbf16_layout_pmu/perf_base_gate_up.data \
-  > profiling_kt_codex_smoke/kt_armbf16_layout_pmu/perf_base_gate_up_report.txt
+  -i profiling_kt_codex_smoke/kt_armbf16_layout_pmu/perf_armbf16_wrapper.data \
+  > profiling_kt_codex_smoke/kt_armbf16_layout_pmu/perf_armbf16_wrapper_report.txt
 ```
 
 Profile gate:
 
 - `cpu_features.txt` contains `sve` and `svebf16`.
 - `bf16_instruction_hits.txt` is non-empty.
-- `layout_report.json` proves 64-byte alignment and documents each phase's memory layout.
-- Before Stage 5, `perf` should show the dot-loop/matmul functions near the top for base gate/up; after Stage 5 they should no longer dominate as one-dot-per-output loops.
-- Each kernel optimization stage must save its `layout_report.json`, `perf_stat_*.txt`, and `perf_*_report.txt` next to the phase JSON.
+- The current coarse `layout_probe.log` must at least show `base_kernel=sve_bfdot`, `compiled_sve_bf16=1`, `sve_vector_bytes`, `route_tile_m`, `padded_lora_rank`, route counts, and `aligned_weights=1`.
+- The full Stage 4A gate is not complete until `layout_report.json` exists and proves 64-byte alignment plus each phase's memory layout and strides.
+- Before Stage 5, `perf` should show the dot-loop/matmul functions near the top for the ARM BF16 wrapper; after Stage 5 they should no longer dominate as one-dot-per-output loops.
+- Each kernel optimization stage must save its `layout_report.json` or temporary `layout_probe.log`, `perf_stat_*.txt`, and `perf_*_report.txt` next to the phase JSON.
 
 ## Stage 5: Replace Base Gate/Up With Real Grouped BF16 GEMM
 
@@ -570,6 +664,8 @@ Implementation options, in order:
 1. Use a proven ARM BF16 GEMM library if available on the target host: Arm Performance Libraries, oneDNN ACL backend, OpenBLAS only if it has relevant BF16 support, or KML if usable through existing build knobs.
 2. If no library is acceptable, implement a blocked SVE BF16 microkernel for `MxN x K` with register blocking across multiple output columns and rows, not one dot per output element.
 3. Batch by expert: route packing already groups routes per expert, so call one grouped GEMM per active expert for gate and up.
+4. Parallelize across active experts and output blocks for large route sets; the current serial active-expert loop leaves most CPU cores unused in small-per-expert route distributions.
+5. Consider fusing gate/up input packing or at least reusing the same packed input stream for both projections so the two base projections do not reload the same route input independently.
 
 Validation commands:
 
@@ -582,16 +678,23 @@ CPUINFER_FORCE_REBUILD=1 CPUINFER_BUILD_TYPE=RelWithDebInfo CPUINFER_PARALLEL=16
 # Microbench before LF.
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
-  .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
-  --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
-  --num-experts 128 --threads 8 --json profiling_kt_codex_smoke/bench_stage5_gate_up.json
+  KT_ARM_SFT_PROFILE=1 \
+  .venv/bin/python ../ktransformers/kt-kernel/bench/bench_armbf16_sft.py \
+  --backend arm --skip-correctness \
+  --qlen 2048 --topk 8 --rank 64 --hidden 2048 --intermediate 768 \
+  --experts 128 --threads 8 --warmup 1 --iters 3 \
+  --output-json profiling_kt_codex_smoke/bench_stage5_gate_up.json \
+  2>&1 | tee profiling_kt_codex_smoke/bench_stage5_gate_up.log
 
 # Optional CPU PMU profile if perf is installed and permitted.
 command -v perf && perf stat -d -d -d -- \
   taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
-    .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
-    --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
-    --num-experts 128 --threads 8 --json /tmp/bench_stage5_gate_up.json
+    KT_ARM_SFT_PROFILE=1 \
+    .venv/bin/python ../ktransformers/kt-kernel/bench/bench_armbf16_sft.py \
+    --backend arm --skip-correctness \
+    --qlen 2048 --topk 8 --rank 64 --hidden 2048 --intermediate 768 \
+    --experts 128 --threads 8 --warmup 1 --iters 3 \
+    --output-json /tmp/bench_stage5_gate_up.json
 ```
 
 Profile gate:
@@ -602,6 +705,7 @@ Profile gate:
 - `perf_base_gate_up_report.txt` no longer attributes most time to one-dot-per-output `arm_bf16_dot` calls.
 - Disassembly of the new hot symbol shows a blocked SVE BF16 kernel using vector-width work, not scalar BF16-to-FP32 inner loops.
 - `layout_report.json` shows gate/up weights and packed inputs are consumed with contiguous or deliberately packed strides for the new kernel.
+- Source profile proves active-expert scheduling is not serially bottlenecked by one hot or many tiny expert batches.
 - No regression in input packing or route merge.
 
 ## Stage 6: Replace Base Down Projection
@@ -623,9 +727,13 @@ CPUINFER_FORCE_REBUILD=1 CPUINFER_BUILD_TYPE=RelWithDebInfo CPUINFER_PARALLEL=16
 
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
-  .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
-  --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
-  --num-experts 128 --threads 8 --json profiling_kt_codex_smoke/bench_stage6_down.json
+  KT_ARM_SFT_PROFILE=1 \
+  .venv/bin/python ../ktransformers/kt-kernel/bench/bench_armbf16_sft.py \
+  --backend arm --skip-correctness \
+  --qlen 2048 --topk 8 --rank 64 --hidden 2048 --intermediate 768 \
+  --experts 128 --threads 8 --warmup 1 --iters 3 \
+  --output-json profiling_kt_codex_smoke/bench_stage6_down.json \
+  2>&1 | tee profiling_kt_codex_smoke/bench_stage6_down.log
 ```
 
 Profile gate:
@@ -664,10 +772,14 @@ CPUINFER_FORCE_REBUILD=1 CPUINFER_BUILD_TYPE=RelWithDebInfo CPUINFER_PARALLEL=16
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 for dropout in 0.00 0.10; do
   taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
-    .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
-    --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
-    --num-experts 128 --threads 8 --lora-dropout "$dropout" \
-    --json "profiling_kt_codex_smoke/bench_stage7_lora_drop${dropout}.json"
+    KT_ARM_SFT_PROFILE=1 \
+    .venv/bin/python ../ktransformers/kt-kernel/bench/bench_armbf16_sft.py \
+    --backend arm --skip-correctness \
+    --qlen 2048 --topk 8 --rank 64 --hidden 2048 --intermediate 768 \
+    --experts 128 --threads 8 --lora-dropout "$dropout" \
+    --warmup 1 --iters 3 \
+    --output-json "profiling_kt_codex_smoke/bench_stage7_lora_drop${dropout}.json" \
+    2>&1 | tee "profiling_kt_codex_smoke/bench_stage7_lora_drop${dropout}.log"
 done
 ```
 
@@ -683,6 +795,20 @@ Profile gate:
 ## Stage 8: Redesign Backward Scratch and Reductions
 
 Problem: backward allocates dense full-expert LoRA gradient buffers per thread, then reduces dense buffers. This creates large memory traffic and hides time outside the existing timers.
+
+Stage 8A completed:
+
+- `reduce_vector_fields()` now reduces contiguous chunks instead of dispatching one WorkerPool task per float.
+- The chunk size is controlled by `KT_ARM_SFT_REDUCE_CHUNK_ELEMS` and defaults to `16384`.
+- Validation artifact: `profiling_kt_codex_smoke/kt_armbf16_reduce_chunk_qwen3`.
+- Result on the same Qwen3 smoke: `backward_thread_reduce_ms` dropped from `4108.213 ms/layer` to `8.454 ms/layer`; wrapper `backward_sync_ms` dropped from `4233.499 ms/layer` to `129.632 ms/layer`; one-step runtime dropped from `266.6s` to `83.1s`.
+- This fixed the “stuck after increasing length/batch” symptom caused by pathological task granularity in backward reduction.
+
+Remaining Stage 8B work:
+
+- Dense per-thread full-expert scratch still exists.
+- Backward route loop is now the primary native backward compute target.
+- The next optimization must reduce only active expert slices or tiles and use grouped GEMM-style LoRA gradient math.
 
 Implementation:
 
@@ -708,16 +834,31 @@ CPUINFER_FORCE_REBUILD=1 CPUINFER_BUILD_TYPE=RelWithDebInfo CPUINFER_PARALLEL=16
 
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
-  .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
-  --qlen 128 --top-k 8 --rank 8 --hidden-size 2048 --intermediate-size 768 \
-  --num-experts 128 --threads 8 --check --backward \
-  --json profiling_kt_codex_smoke/bench_stage8_backward_check.json
+  .venv/bin/python ../ktransformers/kt-kernel/bench/bench_arm_sft_compare.py \
+  --qlen 4 --experts 4 --topk 2 --hidden 64 --intermediate 32 --rank 4 \
+  --threads 4 --warmup 0 --iters 1 \
+  --output-json profiling_kt_codex_smoke/bench_stage8_backward_check.json
 
 taskset -c 0-143 env CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
-  .venv/bin/python scripts/kt/bench_arm_sft_moe.py \
-  --qlen 2048 --top-k 8 --rank 64 --hidden-size 2048 --intermediate-size 768 \
-  --num-experts 128 --threads 8 --backward \
-  --json profiling_kt_codex_smoke/bench_stage8_backward_q2048_r64.json
+  KT_ARM_SFT_PROFILE=1 KT_ARM_SFT_REDUCE_CHUNK_ELEMS=16384 \
+  .venv/bin/python ../ktransformers/kt-kernel/bench/bench_armbf16_sft.py \
+  --backend arm --skip-correctness \
+  --qlen 2048 --topk 8 --rank 64 --hidden 2048 --intermediate 768 \
+  --experts 128 --threads 8 --warmup 1 --iters 3 \
+  --output-json profiling_kt_codex_smoke/bench_stage8_backward_q2048_r64.json \
+  2>&1 | tee profiling_kt_codex_smoke/bench_stage8_backward_q2048_r64.log
+
+.venv/bin/python agent/kt/scripts/validate_kt_arm_profile.py \
+  --profile-json profiling_kt_codex_smoke/kt_armbf16_reduce_chunk_qwen3/profile.json \
+  --expected-model Qwen/Qwen3-30B-A3B \
+  --expected-seq-len 64 \
+  --expected-batch 1 \
+  --expected-rank 8 \
+  --expected-dropout 0.0 \
+  --expected-top-k 8 \
+  --expected-cache-depth 2 \
+  --expected-recompute false \
+  --require-final
 ```
 
 Memory and CPU sampling during a longer run:
@@ -736,7 +877,8 @@ done | tee profiling_kt_codex_smoke/stage8_proc_sampling.log
 Profile gate:
 
 - Tiny backward correctness passes.
-- `backward_local_alloc_zero_ms`, `backward_thread_reduce_ms`, and `backward_grad_input_flush_ms` are visible and reduced.
+- Stage 8A gate passed on `profiling_kt_codex_smoke/kt_armbf16_reduce_chunk_qwen3`: `validate_kt_arm_profile.py` passes, native profile evidence is present, and `backward_thread_reduce_ms` is no longer the dominant phase.
+- Stage 8B gate is still open: `backward_local_alloc_zero_ms`, dense scratch bytes, and `backward_route_loop_ms` must be reduced without correctness loss.
 - Wrapper `backward_sync_ms_last` is explained by native detailed timers within 10 percent.
 - Peak CPU RSS does not increase versus baseline for the same shape.
 - `perf_stat_backward_route_loop.txt` and `perf_stat_backward_reduce.txt` show reductions in instructions, cycles, and cache misses versus Stage 4A/Stage 3 baseline.
@@ -893,6 +1035,27 @@ taskset -c 0-143 env \
   MAX_STEPS=1 WARMUP_STEPS=0 \
   OUT_DIR=profiling_kt_codex_smoke/kt_armbf16_source_b4_s7168_r64_v3_final \
   agent/kt/scripts/run_lf_lora_sft_kt.sh 2>&1 | tee profiling_kt_codex_smoke/kt_armbf16_source_b4_s7168_r64_v3_final.log
+
+git status --short > profiling_kt_codex_smoke/kt_armbf16_source_b4_s7168_r64_v3_final/git_status_short.txt
+git diff -- scripts/lf/run_lf_lora_sft.sh scripts/lf/profile_lora_lf.sh \
+  > profiling_kt_codex_smoke/kt_armbf16_source_b4_s7168_r64_v3_final/main_script_diff.txt
+git diff -- agent/kt/fix_arm_v3.md \
+  > profiling_kt_codex_smoke/kt_armbf16_source_b4_s7168_r64_v3_final/fix_plan_diff.txt
+git -c safe.directory=/workspace/AsymGEMM-SFT/third_party/ktransformers -C ../ktransformers diff \
+  > profiling_kt_codex_smoke/kt_armbf16_source_b4_s7168_r64_v3_final/ktransformers_diff.txt || true
+
+.venv/bin/python agent/kt/scripts/validate_kt_arm_profile.py \
+  --profile-json profiling_kt_codex_smoke/kt_armbf16_source_b4_s7168_r64_v3_final/profile.json \
+  --expected-model Qwen/Qwen3-30B-A3B \
+  --expected-seq-len 7168 \
+  --expected-batch 4 \
+  --expected-rank 64 \
+  --expected-dropout 0.10 \
+  --expected-top-k 8 \
+  --expected-cache-depth 2 \
+  --expected-recompute true \
+  --expected-token-chunk 2048 \
+  --require-final
 ```
 
 Acceptance gate:
@@ -901,6 +1064,8 @@ Acceptance gate:
 - `train.log` shows `GPU_ID=1` or `GPU_ID=2`; default accepted GPU is 1. No accepted profile may use GPU 0 or GPU 3.
 - `cpu_affinity_count >= KT_NUM_THREADS`.
 - `base_kernel=sve_bfdot`, `aligned_weights=1`, and `sve_vector_bytes` appear in `train.log`.
+- `validate_kt_arm_profile.py` passes for the final `profile.json`.
+- Provenance artifacts exist: `git_status_short.txt`, `main_script_diff.txt`, `fix_plan_diff.txt`, and `ktransformers_diff.txt`.
 - Stage 4A artifacts exist for the final build: CPU features, extension disassembly/build manifest, layout report, perf stat, and perf report.
 - `kt.total_forward_calls` and `kt.total_backward_calls` match the expected microchunk/checkpoint count for the shape.
 - Backward detailed timers explain wrapper backward time within 10 percent.

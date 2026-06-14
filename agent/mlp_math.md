@@ -114,8 +114,7 @@ up_cpu = offload(up)                                    # [M,I] CPU
 S_gate_cpu = offload(S_gate)                            # [M,r] CPU, save for dB_gate
 S_up_cpu = offload(S_up)                                # [M,r] CPU, save for dB_up
 
-sig_cpu = sigmoid(gate_cpu)                             # [M,I] CPU
-silu_gate_cpu = gate_cpu * sig_cpu                      # [M,I] CPU
+silu_gate_cpu = silu(gate_cpu)                          # [M,I] CPU
 act_cpu = silu_gate_cpu * up_cpu                        # [M,I] CPU
 
 act_down_lora_cpu,g = D_down(act_cpu,g)                 # [M_g,I] CPU
@@ -156,15 +155,17 @@ dB_down[e] = scale * sum_{g:e_g=e} dY_g.T @ S_down_g    # [H,r] Grad
 
 # ---------------- activation backward ----------------
 
-silu_grad_cpu = sig_cpu * (1 + gate_cpu * (1 - sig_cpu))  # [M,I] CPU
-
-dgate_cpu = dact_cpu * up_cpu * silu_grad_cpu           # [M,I] CPU
+dgate_cpu = silu_backward(dact_cpu * up_cpu, gate_cpu)  # [M,I] CPU
 dup_cpu = dact_cpu * silu_gate_cpu                      # [M,I] CPU
+
+dgate_up = stage_concat(dgate_cpu, dup_cpu)             # [M,2I] HBM
+dgate, dup = split(dgate_up)                            # [M,I], [M,I] HBM
 
 
 # ---------------- gate LoRA backward ----------------
 
-dS_gate_g = scale * (dgate_cpu,g @^L B_gate[e_g])       # [M_g,r] HBM
+S_gate = stage(S_gate_cpu)                              # [M,r] HBM
+dS_gate_g = scale * (dgate_g @ B_gate[e_g])             # [M_g,r] HBM
 dS_gate = pack_g(dS_gate_g)                             # [M,r] HBM
 dX_gate_raw_g = dS_gate_g @ A_gate[e_g]                 # [M_g,H] HBM
 dX_gate_raw = pack_g(dX_gate_raw_g)                     # [M,H] HBM
@@ -172,12 +173,13 @@ dX_gate_lora = D_gate_bar(dX_gate_raw)                  # [M,H] HBM
 
 X_gate_lora_cpu,g = D_gate(X_cpu,g)                     # [M_g,H] CPU
 dA_gate[e] = sum_{g:e_g=e} dS_gate_g.T @^R X_gate_lora_cpu,g  # [r,H] Grad
-dB_gate[e] = scale * sum_{g:e_g=e} dgate_cpu,g.T @^L S_gate_g  # [I,r] Grad
+dB_gate[e] = scale * sum_{g:e_g=e} dgate_g.T @ S_gate_g  # [I,r] Grad
 
 
 # ---------------- up LoRA backward ----------------
 
-dS_up_g = scale * (dup_cpu,g @^L B_up[e_g])             # [M_g,r] HBM
+S_up = stage(S_up_cpu)                                  # [M,r] HBM
+dS_up_g = scale * (dup_g @ B_up[e_g])                   # [M_g,r] HBM
 dS_up = pack_g(dS_up_g)                                 # [M,r] HBM
 dX_up_raw_g = dS_up_g @ A_up[e_g]                       # [M_g,H] HBM
 dX_up_raw = pack_g(dX_up_raw_g)                         # [M,H] HBM
@@ -185,12 +187,11 @@ dX_up_lora = D_up_bar(dX_up_raw)                        # [M,H] HBM
 
 X_up_lora_cpu,g = D_up(X_cpu,g)                         # [M_g,H] CPU
 dA_up[e] = sum_{g:e_g=e} dS_up_g.T @^R X_up_lora_cpu,g  # [r,H] Grad
-dB_up[e] = scale * sum_{g:e_g=e} dup_cpu,g.T @^L S_up_g  # [I,r] Grad
+dB_up[e] = scale * sum_{g:e_g=e} dup_g.T @ S_up_g       # [I,r] Grad
 
 
 # ---------------- gate/up base backward ----------------
 
-dgate_up = stage_concat(dgate_cpu, dup_cpu)              # [M,2I] HBM
 dX_base_g = dgate_up_g @^R W_gate_up_cpu[e_g]           # [M_g,H] HBM
 dX_base = pack_g(dX_base_g)                              # [M,H] HBM
 dX = dX_base + dX_gate_lora + dX_up_lora                 # [M,H] HBM
