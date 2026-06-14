@@ -187,6 +187,7 @@ class RunRecord:
             self.metadata.get("backend", ""),
             f"router={self.metadata.get('router_mode', '')}" if self.metadata.get("router_mode") else "",
             self.metadata.get("expact", ""),
+            self.metadata.get("attnact", ""),
             self.metadata.get("recompute", ""),
             self.metadata.get("expert_policy", ""),
             self.metadata.get("seq_len", ""),
@@ -241,6 +242,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--profiler", action="append", default=[])
     parser.add_argument("--router-mode", action="append", default=[], choices=["hf", "whole"])
     parser.add_argument("--expact", action="append", default=[], choices=["expact0", "expact1"])
+    parser.add_argument("--attnact", action="append", default=[], choices=["attnact0", "attnact1"])
     parser.add_argument("--seq-lens", nargs="+", default=[])
     parser.add_argument("--expert-recompute-policies", nargs="+", default=[])
     return parser.parse_args()
@@ -335,12 +337,25 @@ def _expact_label(value: Any) -> str:
     return "expact1" if _normalize_bool_config(value) == "true" else "expact0"
 
 
+def _attnact_label(value: Any) -> str:
+    return "attnact1" if _normalize_bool_config(value) == "true" else "attnact0"
+
+
 def _parse_expact_part(part: str) -> tuple[str, str] | None:
     value = part.strip().lower()
     if value in {"expact1", "expacttrue"}:
         return "true", "expact1"
     if value in {"expact0", "expactfalse"}:
         return "false", "expact0"
+    return None
+
+
+def _parse_attnact_part(part: str) -> tuple[str, str] | None:
+    value = part.strip().lower()
+    if value in {"attnact1", "attnacttrue"}:
+        return "true", "attnact1"
+    if value in {"attnact0", "attnactfalse"}:
+        return "false", "attnact0"
     return None
 
 
@@ -354,12 +369,24 @@ def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | 
         backend_part, profiler_part, recompute_part, policy_part, router_part = job_parts
         expact_value = "false"
         expact = "expact0"
+        attnact_value = "false"
+        attnact = "attnact0"
     elif len(job_parts) == 6:
         backend_part, profiler_part, recompute_part, policy_part, router_part, expact_part = job_parts
         parsed_expact = _parse_expact_part(expact_part)
         if parsed_expact is None:
             return None
         expact_value, expact = parsed_expact
+        attnact_value = "false"
+        attnact = "attnact0"
+    elif len(job_parts) == 7:
+        backend_part, profiler_part, recompute_part, policy_part, router_part, expact_part, attnact_part = job_parts
+        parsed_expact = _parse_expact_part(expact_part)
+        parsed_attnact = _parse_attnact_part(attnact_part)
+        if parsed_expact is None or parsed_attnact is None:
+            return None
+        expact_value, expact = parsed_expact
+        attnact_value, attnact = parsed_attnact
     else:
         return None
     if not policy_part.startswith("pol") or not router_part.startswith("router"):
@@ -370,6 +397,8 @@ def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | 
     expert_policy = str(config.get("expert_policy") or policy_part[len("pol") :] or "none")
     expact_value = _normalize_bool_config(config.get("asymm_expert_act_offload", expact_value))
     expact = _expact_label(expact_value)
+    attnact_value = _normalize_bool_config(config.get("asymm_attn_act_offload", attnact_value))
+    attnact = _attnact_label(attnact_value)
 
     metadata = {
         "workload": str(config.get("workload") or config_root.name.split("__")[0]),
@@ -380,6 +409,8 @@ def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | 
         "router_mode": router_mode,
         "asymm_expert_act_offload": expact_value,
         "expact": expact,
+        "asymm_attn_act_offload": attnact_value,
+        "attnact": attnact,
         "seq_len": str(config.get("seq_len") or ""),
         "precision": str(config.get("precision") or ""),
         "batch_size": str(config.get("batch_size") or ""),
@@ -518,6 +549,7 @@ def _matches_filters(run: RunRecord, args: argparse.Namespace) -> bool:
         "profiler": _filter_values(args.profiler),
         "router_mode": _filter_values(args.router_mode),
         "expact": _filter_values(args.expact),
+        "attnact": _filter_values(args.attnact),
         "seq_len": _filter_values(args.seq_lens),
         "expert_policy": _filter_values(args.expert_recompute_policies),
     }
@@ -1466,6 +1498,7 @@ def _group_label(run: RunRecord) -> str:
         metadata.get("profiler", ""),
         f"router{metadata.get('router_mode', '')}" if metadata.get("router_mode") else "",
         metadata.get("expact", ""),
+        metadata.get("attnact", ""),
         metadata.get("recompute", ""),
         f"pol{metadata.get('expert_policy', '')}" if metadata.get("expert_policy") else "",
     ]

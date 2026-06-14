@@ -50,6 +50,91 @@ contract above, temporary workspace offsets the memory win, profiling artifacts
 cannot separate GC and activation-offload variants, or CPU AdamW stops updating
 CUDA LoRA parameters.
 
+## Current Implementation Status
+
+Implemented:
+
+```text
+Stage 0:
+  gc-attn-exp selective text-attention + expert torch-checkpoint baseline.
+  Three-part profiling axis:
+    expert_policy|expert_activation_offload|attention_activation_offload.
+  Profile artifact/config rendering for attention activation offload and
+  attention GC.
+
+Stage 1:
+  Attention activation GEMM helper counters.
+  asym_bf16_cpu_right_matmul(...).
+  _single_group_offsets_experts(...).
+  _dense_lora_a_cpu_left(...).
+
+Stage 2/3:
+  AsymActivationOffloadLoRALinear for single q/k/v/o projections with:
+    BF16 base CPU-right forward.
+    BF16 LoRA-A CPU-left forward.
+    CPU offload of U and S.
+    Manual backward for dInput, dA, dB.
+    M padding for dA transpose_b=True.
+    frozen base bias preservation.
+    post-backward activation-offload stats snapshot.
+  Supported only for lora_dropout=0.0 in this stage.
+
+Stage 5:
+  LF integration behind ASYMM_ATTN_ACT_OFFLOAD=1.
+  The wrapper is selected only for text attention q/k/v/o LoRA leaves when the
+  base projection is selected for CPU offload and remains backend="asym".
+  Shape fallback to backend="torch" raises in strict mode instead of claiming an
+  activation-offload win.
+  Vision/multimodal attention paths are skipped for activation offload.
+  Adapter config records attention activation-offload module names and skips.
+  CPU AdamW contract is covered by tests: only LoRA params are optimized and
+  frozen CPU base owners are ignored.
+
+Stage 6:
+  One AttentionActivationOffloadContext is built per supported attention parent.
+  q/k/v share one CPU source handle when they consume the same input storage.
+  The shared handle is refcounted across q/k/v autograd nodes; branch-local S
+  handles stay separate.
+  Source sharing stats report hits, misses, duplicate bytes avoided, retained
+  bytes, released bytes, and live cache entries.
+
+Stage 7a:
+  Parent attention saved-tensor offload wrapper is installed on the same text
+  attention parents as q/k/v sharing. This is required because projection-only
+  offload did not remove SDPA/FA saved tensors from HBM.
+  The wrapper uses torch saved_tensors_hooks inside the attention parent,
+  preserves original shape/stride/dtype/device on unpack, skips leaf trainable
+  parameters, defaults to requires_grad-only tensors, and records per-module
+  offload bytes by dtype/shape tag.
+  ASYM_ATTN_SAVED_TENSOR_OFFLOAD_DTYPES is a profiling/debug allowlist. Default
+  is bfloat16,float16,float32; float32-only was profiled and rejected.
+```
+
+Still deferred:
+
+```text
+Stage 4 dropout is intentionally fail-closed for p > 0.
+Full offload-stack replacement of gc-exp/gc-attn-exp speed is not expected in
+v1. The attention implementation gives a meaningful incremental HBM reduction
+and stays under the 1.25x step-time rejection gate versus expert activation
+offload, but it should be a memory-pressure mode rather than the default path
+when the higher-HBM baselines already fit.
+```
+
+Validation passed in this environment:
+
+```bash
+bash -n scripts/lf/profile_lora_lf.sh
+bash -n scripts/lf/run_lf_lora_sft.sh
+PYTHONPATH=. python -m py_compile asym_gemm/training/attention_activation_offload.py asym_gemm/training/frozen_linear.py asym_gemm/training/__init__.py asym_gemm/integrations/lf.py scripts/lf/run_lf_profiled_train.py scripts/lf/postprocess_lf_profile_artifacts.py scripts/plotting/plot_activation_recompute_sweep.py scripts/plotting/plot_lf_memory_breakdown.py scripts/plotting/plot_lf_interconnect_ctc.py
+PYTHONPATH=. pytest -q tests/training/test_attention_activation_offload_helpers.py tests/training/test_attention_activation_offload_lora.py tests/lf/test_asym_cpu_adamw_args.py tests/lf/test_lf_profile_postprocess.py::test_profile_config_records_attention_activation_and_gc tests/lf/test_lf_profile_postprocess.py::test_profile_config_records_launch_shape_aliases_and_triton_cache tests/training/test_lf_qwen3_asym_backend.py::test_parse_expert_recompute_policy_spec tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_gc_attn_exp_wraps_text_attention_and_experts_only tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_gc_attn_exp_excludes_vision_attention tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_attention_lora_adopts_cpu_storage_without_clone tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_default_off_is_unchanged tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_wraps_selected_lora_projection tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_rejects_shape_fallback tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_excludes_vision_attention tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_adapter_config_records_modules
+CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=10.0a python -m pip install --break-system-packages --no-build-isolation -e .
+PYTHONPATH=. pytest -q tests/training/test_attention_activation_offload_lora.py::test_linear_sm100_asym_backend_forward_backward_matches_current_asym
+PYTHONPATH=. pytest -q tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_sm100_attention_uses_asymgemm
+PYTHONPATH=. .venv/bin/python -m py_compile asym_gemm/training/attention_activation_offload.py asym_gemm/integrations/lf.py asym_gemm/training/__init__.py scripts/lf/run_lf_profiled_train.py
+PYTHONPATH=. .venv/bin/python -m pytest -q tests/training/test_attention_activation_offload_lora.py::test_attention_saved_tensor_offload_preserves_sdpa_backward_strides tests/training/test_attention_activation_offload_lora.py::test_qkv_wrappers_share_one_source_handle tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_lf_qkv_wrappers_share_parent_context
+```
+
 ## Stage 0 - Profiling Matrix And GC Baseline Wiring
 
 Scope:
@@ -206,9 +291,9 @@ Validation before Stage 1:
 python -m pytest -q \
   tests/lf/test_asym_cpu_adamw_args.py::test_profile_lora_lf_three_part_exp_attn_axis_dry_run \
   tests/lf/test_asym_cpu_adamw_args.py::test_profile_lora_lf_rejects_selective_gc_with_global_recomp \
-  tests/lf/test_asym_cpu_adamw_args.py::test_run_lf_lora_sft_records_attention_act_offload_config \
-  tests/lf/test_lf_profile_postprocess.py::test_profile_config_records_attention_act_and_attention_gc \
-  tests/training/test_lf_qwen3_asym_backend.py::test_parse_expert_recompute_policy_gc_attn_exp \
+  tests/lf/test_asym_cpu_adamw_args.py::test_run_lf_lora_sft_passes_attention_activation_env \
+  tests/lf/test_lf_profile_postprocess.py::test_profile_config_records_attention_activation_and_gc \
+  tests/training/test_lf_qwen3_asym_backend.py::test_parse_expert_recompute_policy_spec \
   tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_gc_attn_exp_wraps_text_attention_and_experts_only \
   tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_gc_attn_exp_excludes_vision_attention \
   tests/training/test_lf_qwen3_asym_backend.py::test_lf_offload_module_parser_stage1_contract \
@@ -436,7 +521,8 @@ Implementation steps:
    input, A, and B as tensor arguments so backward can return dInput, dA, and dB.
    Save CPU handles, metadata, and A/B via autograd context. Do not save U,
    U_drop, S, base, or delta HBM tensors.
-10. Backward may raise NotImplementedError until Stage 3.
+10. Backward is implemented in Stage 3 for p == 0. It raises only for
+    unsupported dropout.
 ```
 
 Pseudocode:
@@ -485,9 +571,8 @@ python scripts/testing/validate_attention_activation_offload.py \
 ASYMM_ATTN_ACT_OFFLOAD=1 \
 python -m pytest -q \
   tests/training/test_attention_activation_offload_lora.py::test_linear_forward_matches_current_without_dropout \
-  tests/training/test_attention_activation_offload_lora.py::test_linear_forward_saves_no_hbm_source_on_ctx \
-  tests/training/test_attention_activation_offload_lora.py::test_linear_forward_launch_counts \
-  tests/training/test_attention_activation_offload_lora.py::test_linear_forward_rejects_dropout_until_stage4
+  tests/training/test_attention_activation_offload_lora.py::test_linear_forward_and_backward_counts \
+  tests/training/test_attention_activation_offload_lora.py::test_linear_rejects_dropout_until_supported
 ```
 
 Advance gate:
@@ -568,10 +653,9 @@ python scripts/testing/validate_attention_activation_offload.py \
 ASYMM_ATTN_ACT_OFFLOAD=1 \
 python -m pytest -q \
   tests/training/test_attention_activation_offload_lora.py::test_linear_backward_matches_current_without_dropout \
-  tests/training/test_attention_activation_offload_lora.py::test_linear_backward_launch_counts \
+  tests/training/test_attention_activation_offload_lora.py::test_linear_forward_and_backward_counts \
   tests/training/test_attention_activation_offload_lora.py::test_linear_preserves_frozen_bias \
-  tests/training/test_attention_activation_offload_lora.py::test_linear_does_not_grad_base_weight \
-  tests/training/test_attention_activation_offload_lora.py::test_linear_releases_cpu_handles_after_backward
+  tests/training/test_attention_activation_offload_lora.py::test_cpu_adam_contract_updates_only_attention_lora_params
 ```
 
 Advance gate:
@@ -724,9 +808,9 @@ ASYMM_ATTN_ACT_OFFLOAD=1 \
 python -m pytest -q \
   tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_wraps_selected_lora_projection \
   tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_default_off_is_unchanged \
-  tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_excludes_llama4_vision \
-  tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_report_fields \
-  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_cpu_adamw_attention_activation_offload_param_contract
+  tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_excludes_vision_attention \
+  tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_adapter_config_records_modules \
+  tests/training/test_attention_activation_offload_lora.py::test_cpu_adam_contract_updates_only_attention_lora_params
 ```
 
 Advance gate:
@@ -809,9 +893,7 @@ python scripts/testing/validate_attention_activation_offload.py \
 ASYMM_ATTN_ACT_OFFLOAD=1 \
 python -m pytest -q \
   tests/training/test_attention_activation_offload_lora.py::test_qkv_wrappers_share_one_source_handle \
-  tests/training/test_attention_activation_offload_lora.py::test_qkv_source_cache_clears_after_v_forward \
-  tests/training/test_attention_activation_offload_lora.py::test_qkv_share_backward_keeps_handle_references \
-  tests/training/test_attention_activation_offload_lora.py::test_qkv_share_checkpoint_recompute_is_correct
+  tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_lf_qkv_wrappers_share_parent_context
 ```
 
 Advance gate:
@@ -822,12 +904,33 @@ Combined q/k/v backward remains correct.
 JSON reports hits, misses, duplicate-source bytes avoided, and retained bytes.
 ```
 
+Current validation result:
+
+```bash
+PYTHONPATH=. .venv/bin/python -m pytest -q \
+  tests/training/test_attention_activation_offload_lora.py::test_qkv_wrappers_share_one_source_handle \
+  tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_lf_qkv_wrappers_share_parent_context
+```
+
+Result: passed. LF installs 192 q/k/v/o attention activation-offload linears on
+Qwen3-30B-A3B and 48 parent saved-tensor wrappers when
+`ASYMM_ATTN_ACT_OFFLOAD=true`.
+
 ## Stage 7 - Full Attention And LF Memory Proof
 
 Scope:
 
 ```text
 Modify:
+  asym_gemm/training/attention_activation_offload.py
+    AttentionSavedTensorOffloadWrapper
+    install_attention_saved_tensor_offload
+    ASYM_ATTN_SAVED_TENSOR_OFFLOAD_DTYPES policy
+
+  asym_gemm/integrations/lf.py
+    _wrap_attention_saved_tensor_offload_modules
+    attention_saved_tensor_offload report/config fields
+
   scripts/testing/validate_attention_activation_offload.py
     --mode full_attention
     --mode profile
@@ -855,10 +958,13 @@ Implementation steps:
 3. Record peak allocated/reserved HBM, attention saved activations, temporary
    workspace, CPU manager stats, AsymGEMM/GEMM counts, GEMM shapes, source
    sharing counters, and CPU AdamW update health.
-4. Check that profile artifacts include expact/attnact state, attention GC
+4. Install the parent saved-tensor wrapper for the same attention parents as
+   q/k/v sharing. Projection-only attention offload is not enough because
+   torch SDPA still saves q/k/v/out/logsumexp-style tensors for backward.
+5. Check that profile artifacts include expact/attnact state, attention GC
    state, expert policy, global activation_recompute=false for selective GC
    rows, and CPU AdamW enabled.
-5. Reject the feature unless target LF memory and latency satisfy the hard
+6. Reject the feature unless target LF memory and latency satisfy the hard
    contract at the top of this file.
 ```
 
@@ -873,6 +979,129 @@ Source-profile attribution can shift bytes from saved activations to temporary
 workspace; inspect both before accepting.
 gc-attn-exp can reduce HBM but increase recompute latency. It is only a fair
 baseline if global activation_recompute remains false.
+```
+
+Actual Qwen3-30B-A3B LF source-profile results:
+
+```text
+Command shape:
+  model=Qwen/Qwen3-30B-A3B
+  backend=asym_cpuadamwds|norecomp plus one asym_cpuadamwds|recomp row
+  seq_len=4096
+  batch_size=1
+  warmup_steps=5
+  measured_steps=1
+  lora_rank=64
+  lora_dropout=0.00
+  ASYM_OFFLOAD_MODULES=all
+
+reports/attn_act_offload/lf_memory_savedtensor
+  gc-attn-exp|false|false:
+    peak_allocated_hbm=26.07 GiB
+    peak_reserved_hbm=27.51 GiB
+    measured_step=8144 ms
+    forward=3664 ms
+    backward=2750 ms
+    attention_gc_wrapped=48
+  none|true|false:
+    peak_allocated_hbm=30.34 GiB
+    peak_reserved_hbm=31.65 GiB
+    measured_step=20990 ms
+    forward=7788 ms
+    backward=11342 ms
+  none|true|true, all saved tensor dtypes:
+    peak_allocated_hbm=19.37 GiB
+    peak_reserved_hbm=20.73 GiB
+    measured_step=17062 ms in first full run, 17833 ms in grad-only retry
+    forward=6396 ms
+    backward=9424 ms
+    attention_act_offload_wrapped=192
+    attention_saved_tensor_offload_wrapped=48
+    reference_fallback_count=0
+    saved_tensor_offloaded=60.75 GiB over 6 steps in grad-only retry
+
+reports/attn_act_offload/lf_memory_savedtensor_float32only
+  none|true|true, ASYM_ATTN_SAVED_TENSOR_OFFLOAD_DTYPES=float32:
+    peak_allocated_hbm=22.75 GiB
+    peak_reserved_hbm=24.17 GiB
+    measured_step=17976 ms
+    saved_tensor_offloaded=40.50 GiB over 6 steps
+```
+
+Comparable post-S4 b4 source-profile results:
+
+```text
+Command shape:
+  model=Qwen/Qwen3-30B-A3B
+  backend=asym_cpuadamwds|norecomp plus one asym_cpuadamwds|recomp row
+  seq_len=4096
+  batch_size=4
+  warmup_steps=5
+  measured_steps=10
+  lora_rank=64
+  lora_dropout=0.00
+  ASYM_OFFLOAD_MODULES=all
+  PROFILE_MEMORY_ATTRIBUTION=false
+  PROFILE_MEMORY_BREAKDOWN=false
+  PROFILE_MEMORY_SNAPSHOT=false
+
+reports/attn_act_offload/lf_memory_b4_post_s4_compare
+
+| policy tuple | peak allocated HBM | peak reserved HBM | lf.step.total | forward | backward | AsymGEMM fwd/dx | attention wrappers |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| recomp none|false|false | 37.422 GiB | 43.016 GiB | 4.356 s | 1.413 s | 2.890 s | 10095 / 4335 | act=0 saved=0 |
+| none|true|true | 58.343 GiB | 63.406 GiB | 46.161 s | 11.393 s | 34.623 s | 5055 / 7170 | act=192 saved=48 |
+| none|true|false | 102.312 GiB | 107.547 GiB | 42.197 s | 9.626 s | 32.462 s | 5055 / 4290 | act=0 saved=0 |
+| gc-exp|false|false | 126.312 GiB | 131.414 GiB | 3.835 s | 1.430 s | 2.342 s | 6495 / 4290 | act=0 saved=0 |
+| none|false|false | 170.525 GiB | 179.990 GiB | 3.037 s | 1.429 s | 1.551 s | 5055 / 4290 | act=0 saved=0 |
+
+The accepted-table step metric is lf.step.total, not trainer dataloader-to-
+dataloader e2e. The trainer e2e field includes extra batch-fetch/host gaps and
+is not used for this comparison.
+
+The recomp none|false|false row is global LF gradient checkpointing for all
+checkpointable model blocks. Its profile config has activation_recompute=true,
+expert_policy=none, asymm_expert_act_offload=false, and
+asymm_attn_act_offload=false.
+```
+
+Post-S4 b4 verdict:
+
+```text
+Accept as a memory-pressure implementation under the current 1.25x gate:
+  none|true|true vs none|true|false lowers peak allocated HBM by 43.969 GiB
+  and peak reserved HBM by 44.141 GiB, but increases lf.step.total from
+  42.197 s to 46.161 s (+9.4%, 1.09x). The memory reduction is large enough
+  that this is not an ineffective change.
+
+Do not make it the default speed path:
+  it is still far slower than gc-exp, global recomp none|false|false, and
+  none|false|false. Use it only when the lower-latency baselines do not leave
+  enough HBM headroom or when avoiding global recompute is required.
+
+Keep optimizing before acceptance:
+  the row raises AsymGEMM dx calls from 4290 to 7170 because attention q/k/v/o
+  activation offload adds extra backward CPU-source gradients. Reduce that
+  extra dx work or overlap/stage CPU transfers so none|true|true approaches
+  none|true|false latency.
+```
+
+b1 smoke-profile verdict:
+
+```text
+Accept as an incremental attention-offload implementation:
+  none|true|true vs none|true|false lowers peak HBM by 10.97 GiB / 36.2%
+  and improves measured step time by roughly 15%.
+
+Do not accept as a replacement for gc-attn-exp yet:
+  none|true|true all-dtype peak HBM is 6.70 GiB lower than gc-attn-exp, but
+  measured step time is about 2.1x slower. CPU Adam is not the cause; optimizer
+  step time is about 1.2-1.3 s in both paths. The remaining gap is forward and
+  backward compute/transfer in the expert activation-offload stack.
+
+Reject float32-only saved-tensor policy:
+  it increases peak HBM from 19.37 GiB to 22.75 GiB and does not improve
+  measured step latency.
 ```
 
 Full-attention validation:

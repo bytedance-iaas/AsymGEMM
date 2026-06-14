@@ -519,6 +519,9 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
     asym_backend = _option_value(args, "--asym_backend")
     backend = os.environ.get("ASYM_GEMM_LF_CONFIG_BACKEND") or ("torch" if asym_backend == "torch" else asym_backend or "hf")
     expert_policy = parse_expert_recompute_policy_spec(os.environ.get("ASYM_GEMM_LF_CONFIG_EXPERT_POLICY", "none"))
+    attention_gc_enabled = os.environ.get("ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED")
+    if attention_gc_enabled is None:
+        attention_gc_enabled = "true" if expert_policy.label == "gc-attn-exp" else "false"
     is_superoffload_backend = backend == "superoffload"
     is_cpuadam_backend = backend == "zero3_cpuadam"
     is_asym_deepspeed_cpuadamw = backend == "asym_cpuadamwds" or (
@@ -564,6 +567,9 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         else _safe_float(_option_value(args, "--max_grad_norm")),
         "activation_recompute": os.environ.get("ASYM_GEMM_LF_CONFIG_ACTIVATION_RECOMPUTE", "false").lower()
         in {"1", "true", "yes", "on"},
+        "asymm_expert_act_offload": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD", "false"),
+        "asymm_attn_act_offload": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD", "false"),
+        "attention_gc_enabled": attention_gc_enabled,
         "expert_recompute_policy_spec": expert_policy.label,
         "expert_recompute_policy": expert_policy.policy,
         "expert_recompute_impl": (

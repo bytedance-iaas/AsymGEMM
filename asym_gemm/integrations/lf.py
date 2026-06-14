@@ -12,6 +12,16 @@ from typing import Any, Literal
 import torch
 from torch import nn
 
+from asym_gemm.training.attention_activation_offload import (
+    AsymActivationOffloadLoRALinear,
+    AttentionActivationOffloadContext,
+    attention_saved_tensor_offload_module_names,
+    install_attention_saved_tensor_offload,
+)
+from asym_gemm.training.attention_checkpoint import (
+    attention_checkpoint_module_names,
+    install_attention_checkpoint,
+)
 from asym_gemm.training.frozen_linear import AsymExecutionStats, AsymFrozenLinear
 from asym_gemm.training.lora import (
     AsymLoRALinear,
@@ -142,6 +152,17 @@ class LFAsymReport:
     expert_recompute_policy: str = "none"
     router_mode: str = "whole"
     router_no_grad: bool = False
+    attention_gc_enabled: bool = False
+    attention_gc_wrapped: int = 0
+    attention_gc_modules: tuple[str, ...] = ()
+    attention_gc_skipped: tuple[str, ...] = ()
+    attention_act_offload_enabled: bool = False
+    attention_act_offload_wrapped: int = 0
+    attention_act_offload_modules: tuple[str, ...] = ()
+    attention_act_offload_skipped: tuple[str, ...] = ()
+    attention_saved_tensor_offload_wrapped: int = 0
+    attention_saved_tensor_offload_modules: tuple[str, ...] = ()
+    attention_saved_tensor_offload_skipped: tuple[str, ...] = ()
     skipped: list[str] = field(default_factory=list)
     stats: AsymExecutionStats | None = field(default=None, repr=False)
 
@@ -173,6 +194,11 @@ class LFAsymReport:
             f"gpu_resident_base_bytes_by_component={gpu_by_component}, "
             f"selected_gpu_resident_base_bytes_by_component={selected_gpu_by_component}, "
             f"expert_recompute_policy={self.expert_recompute_policy}, "
+            f"attention_gc_enabled={self.attention_gc_enabled}, "
+            f"attention_gc_wrapped={self.attention_gc_wrapped}, "
+            f"attention_act_offload_enabled={self.attention_act_offload_enabled}, "
+            f"attention_act_offload_wrapped={self.attention_act_offload_wrapped}, "
+            f"attention_saved_tensor_offload_wrapped={self.attention_saved_tensor_offload_wrapped}, "
             f"router_mode={self.router_mode}, "
             f"router_no_grad={self.router_no_grad}, "
             f"qwen3_moes_wrapped={self.qwen3_moes_wrapped}, "
@@ -195,6 +221,11 @@ class LFAsymReport:
             f"torch_forward_calls={self.stats.torch_forward_calls}, "
             f"torch_dx_calls={self.stats.torch_dx_calls}, "
             f"expert_recompute_policy={self.expert_recompute_policy}, "
+            f"attention_gc_enabled={self.attention_gc_enabled}, "
+            f"attention_gc_wrapped={self.attention_gc_wrapped}, "
+            f"attention_act_offload_enabled={self.attention_act_offload_enabled}, "
+            f"attention_act_offload_wrapped={self.attention_act_offload_wrapped}, "
+            f"attention_saved_tensor_offload_wrapped={self.attention_saved_tensor_offload_wrapped}, "
             f"router_mode={self.router_mode}, "
             f"router_no_grad={self.router_no_grad}, "
             f"reference_fallback_count={self.stats.reference_fallback_count}, "
@@ -509,6 +540,8 @@ def _wrap_lf_linear_leaf(
     component: str,
     is_lora_target: bool,
     selected_cpu_offload: bool,
+    attention_act_offload_enabled: bool,
+    attention_context: AttentionActivationOffloadContext | None,
     backend: Literal["asym", "torch"],
     precision: Literal["bf16"],
     stats: AsymExecutionStats,
@@ -536,6 +569,30 @@ def _wrap_lf_linear_leaf(
         )
         bias = None if module.bias is None else module.bias.detach()
         if is_lora_target:
+            if attention_act_offload_enabled and component == "attention" and _is_text_attention_projection_name(name):
+                if effective_backend != "asym":
+                    if strict:
+                        raise RuntimeError(
+                            f"{name} cannot use attention activation offload because its shape falls back to torch"
+                        )
+                elif float(lora_dropout) != 0.0:
+                    raise NotImplementedError("attention activation offload currently requires lora_dropout=0.0")
+                else:
+                    return AsymActivationOffloadLoRALinear.from_host_weight(
+                        host_weight,
+                        bias=bias,
+                        rank=lora_rank,
+                        alpha=lora_alpha,
+                        backend=effective_backend,
+                        stats=stats,
+                        device=device,
+                        lora_dtype=torch.bfloat16,
+                        precision=precision,
+                        init_lora_weights="peft",
+                        lora_dropout=lora_dropout,
+                        projection_role=name.rsplit(".", 1)[-1],
+                        attention_context=attention_context,
+                    )
             return AsymLoRALinear.from_host_weight(
                 host_weight,
                 bias=bias,
@@ -613,6 +670,148 @@ def _reject_tied_lm_head_offload(model: nn.Module, selection: LFOffloadSelection
     if isinstance(input_weight, torch.Tensor) and isinstance(output_weight, torch.Tensor):
         if storage_key(input_weight) == storage_key(output_weight):
             raise ValueError("tied embed/lm_head weights are not supported by this offload stage")
+
+
+_ATTENTION_GC_EXCLUDED_PATH_MARKERS = (
+    ".vision_model.",
+    ".vision_tower.",
+    ".multi_modal_projector.",
+    ".visual.",
+    ".vision.",
+)
+
+
+def _attention_gc_enabled_for_policy(policy_label: str) -> bool:
+    return str(policy_label).strip() == "gc-attn-exp"
+
+
+def _attention_act_offload_enabled() -> bool:
+    return _env_true(os.environ.get("ASYMM_ATTN_ACT_OFFLOAD")) or _env_true(
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD")
+    )
+
+
+def _has_attention_excluded_path_marker(name: str) -> bool:
+    lower = f".{name.lower()}."
+    return any(marker in lower for marker in _ATTENTION_GC_EXCLUDED_PATH_MARKERS)
+
+
+def _is_text_attention_projection_name(name: str) -> bool:
+    if not name:
+        return False
+    if _has_attention_excluded_path_marker(name):
+        return False
+    return name.rsplit(".", 1)[-1] in _ATTENTION_TARGETS
+
+
+def _attention_parent_name(name: str) -> str | None:
+    if not _is_text_attention_projection_name(name) or "." not in name:
+        return None
+    return name.rsplit(".", 1)[0]
+
+
+def _build_attention_activation_contexts(
+    model: nn.Module,
+    *,
+    selection: LFOffloadSelection,
+    dense_target_modules: Sequence[str] | str,
+    backend: Literal["asym", "torch"],
+    attention_act_enabled: bool,
+) -> dict[str, AttentionActivationOffloadContext]:
+    if not attention_act_enabled or backend != "asym":
+        return {}
+
+    roles_by_parent: dict[str, set[str]] = {}
+    for name, module in list(model.named_modules()):
+        if not name or not isinstance(module, nn.Linear):
+            continue
+        if not _is_text_attention_projection_name(name):
+            continue
+        component = classify_lf_component(name, module)
+        leaf = name.rsplit(".", 1)[-1]
+        if (
+            component != "attention"
+            or leaf not in {"q_proj", "k_proj", "v_proj"}
+            or not component_is_selected(component, leaf, selection)
+            or not _matches_target(name, module, dense_target_modules)
+            or _direct_bf16_linear_shape_reason(module, require_backward=True) is not None
+        ):
+            continue
+        parent = _attention_parent_name(name)
+        if parent is not None:
+            roles_by_parent.setdefault(parent, set()).add(leaf)
+
+    return {
+        parent: AttentionActivationOffloadContext()
+        for parent, roles in roles_by_parent.items()
+        if {"q_proj", "k_proj", "v_proj"} <= roles
+    }
+
+
+def _is_text_attention_module_name(name: str, module: nn.Module) -> bool:
+    if not name:
+        return False
+    if _has_attention_excluded_path_marker(name):
+        return False
+    leaf = name.rsplit(".", 1)[-1].lower()
+    if leaf not in {"self_attn", "self_attention", "attention", "attn"} and not leaf.endswith("attention"):
+        return False
+    children = dict(module.named_children())
+    return all(target in children for target in _ATTENTION_TARGETS)
+
+
+def _wrap_attention_checkpoint_modules(
+    model: nn.Module,
+    *,
+    strict: bool,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    wrapped: list[str] = []
+    skipped: list[str] = []
+    for name, module in list(model.named_modules()):
+        if not name:
+            continue
+        if _is_text_attention_module_name(name, module):
+            install_attention_checkpoint(module)
+            wrapped.append(name)
+            continue
+        lower = f".{name.lower()}."
+        leaf = name.rsplit(".", 1)[-1].lower()
+        if leaf in {"self_attn", "self_attention", "attention", "attn"} and any(
+            marker in lower for marker in _ATTENTION_GC_EXCLUDED_PATH_MARKERS
+        ):
+            skipped.append(f"{name}:vision_or_multimodal")
+    if strict and not wrapped:
+        raise RuntimeError("gc-attn-exp requested but no supported text attention modules were found")
+    return tuple(wrapped), tuple(skipped)
+
+
+def _wrap_attention_saved_tensor_offload_modules(
+    model: nn.Module,
+    *,
+    parent_names: Sequence[str],
+    strict: bool,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    requested = {name for name in parent_names if name}
+    if not requested:
+        return (), ()
+
+    wrapped: list[str] = []
+    skipped: list[str] = []
+    modules = dict(model.named_modules())
+    for name in sorted(requested):
+        module = modules.get(name)
+        if module is None:
+            skipped.append(f"{name}:missing_attention_parent")
+            continue
+        if not _is_text_attention_module_name(name, module):
+            skipped.append(f"{name}:unsupported_attention_parent:{type(module).__name__}")
+            continue
+        install_attention_saved_tensor_offload(module)
+        wrapped.append(name)
+
+    if strict and not wrapped:
+        raise RuntimeError("attention activation offload requested but no supported text attention parents were found")
+    return tuple(wrapped), tuple(skipped)
 
 
 def _validate_trainable_params(model: nn.Module) -> None:
@@ -728,6 +927,8 @@ def apply_lf_asym_lora(
     report.dense_lora_wrapped = int(preexisting_dense_lora_wrapped)
     stats = AsymExecutionStats()
     report.stats = stats
+    attention_act_enabled = _attention_act_offload_enabled()
+    report.attention_act_offload_enabled = bool(attention_act_enabled)
     wrap_experts = _targets_experts(raw_lora_target)
     offload_experts = backend == "asym" and selection.routed_experts
     offload_router = backend == "asym" and selection.router
@@ -857,6 +1058,19 @@ def apply_lf_asym_lora(
             report.cpu_resident_base_bytes += new_module.cpu_resident_base_bytes
             report.gpu_resident_base_bytes += new_module.gpu_resident_base_bytes
 
+    if _attention_gc_enabled_for_policy(recompute_config.label):
+        wrapped_attention, skipped_attention = _wrap_attention_checkpoint_modules(model, strict=strict)
+        report.attention_gc_enabled = True
+        report.attention_gc_wrapped = len(wrapped_attention)
+        report.attention_gc_modules = wrapped_attention
+        report.attention_gc_skipped = skipped_attention
+        report.skipped.extend(skipped_attention)
+        setattr(model, "_asym_attention_gc_enabled", True)
+        setattr(model, "_asym_attention_gc_modules", wrapped_attention)
+    else:
+        setattr(model, "_asym_attention_gc_enabled", False)
+        setattr(model, "_asym_attention_gc_modules", tuple())
+
     expert_prefixes = [skip_prefix for _name, _old_module, _new_module, skip_prefix in expert_replacements]
     if offload_router:
         router_replacements: list[tuple[str, nn.Module, nn.Module]] = []
@@ -933,6 +1147,17 @@ def apply_lf_asym_lora(
             _replace_child(parent, child_name, new_module)
 
     dense_replacements: list[tuple[str, nn.Module, nn.Module, bool]] = []
+    attention_act_modules: list[str] = []
+    attention_act_skipped: list[str] = []
+    attention_saved_modules: tuple[str, ...] = ()
+    attention_saved_skipped: tuple[str, ...] = ()
+    attention_contexts = _build_attention_activation_contexts(
+        model,
+        selection=selection,
+        dense_target_modules=dense_target_modules,
+        backend=backend,
+        attention_act_enabled=attention_act_enabled,
+    )
     if wrap_dense:
         for name, module in list(model.named_modules()):
             if not name or _is_under(name, expert_prefixes):
@@ -958,6 +1183,19 @@ def apply_lf_asym_lora(
                 if selected_cpu_offload and backend == "asym"
                 else None
             )
+            if (
+                attention_act_enabled
+                and component == "attention"
+                and is_lora_target
+                and selected_cpu_offload
+                and _has_attention_excluded_path_marker(name)
+            ):
+                attention_act_skipped.append(f"{name}:vision_or_multimodal")
+            attention_context = (
+                attention_contexts.get(_attention_parent_name(name) or "")
+                if leaf in {"q_proj", "k_proj", "v_proj"}
+                else None
+            )
             dense_replacements.append(
                 (
                     name,
@@ -968,6 +1206,8 @@ def apply_lf_asym_lora(
                         component=component,
                         is_lora_target=is_lora_target,
                         selected_cpu_offload=selected_cpu_offload,
+                        attention_act_offload_enabled=attention_act_enabled,
+                        attention_context=attention_context,
                         backend=backend,
                         precision=precision,
                         stats=stats,
@@ -990,7 +1230,30 @@ def apply_lf_asym_lora(
         _replace_child(parent, child_name, new_module)
         if is_lora_target:
             report.dense_lora_wrapped += 1
+        if isinstance(new_module, AsymActivationOffloadLoRALinear):
+            attention_act_modules.append(name)
         report.gpu_resident_base_bytes += int(getattr(new_module, "gpu_resident_base_weight_bytes", 0))
+    if attention_act_enabled and attention_contexts:
+        attention_saved_modules, attention_saved_skipped = _wrap_attention_saved_tensor_offload_modules(
+            model,
+            parent_names=tuple(attention_contexts),
+            strict=strict,
+        )
+    report.attention_act_offload_wrapped = len(attention_act_modules)
+    report.attention_act_offload_modules = tuple(attention_act_modules)
+    report.attention_act_offload_skipped = tuple(attention_act_skipped)
+    if attention_act_skipped:
+        report.skipped.extend(attention_act_skipped)
+    report.attention_saved_tensor_offload_wrapped = len(attention_saved_modules)
+    report.attention_saved_tensor_offload_modules = tuple(attention_saved_modules)
+    report.attention_saved_tensor_offload_skipped = tuple(attention_saved_skipped)
+    if attention_saved_skipped:
+        report.skipped.extend(attention_saved_skipped)
+    setattr(model, "_asym_attention_act_offload_enabled", bool(attention_act_enabled))
+    setattr(model, "_asym_attention_act_offload_modules", tuple(attention_act_modules))
+    setattr(model, "_asym_attention_act_offload_skipped", tuple(attention_act_skipped))
+    setattr(model, "_asym_attention_saved_tensor_offload_modules", tuple(attention_saved_modules))
+    setattr(model, "_asym_attention_saved_tensor_offload_skipped", tuple(attention_saved_skipped))
 
     freeze_non_lora_params(model)
     _validate_trainable_params(model)
@@ -1095,6 +1358,26 @@ def _infer_adapter_config(model: nn.Module, metadata: Mapping[str, Any] | None) 
     raw_selector = getattr(model, "_asym_offload_modules", None)
     if isinstance(raw_selector, str) and raw_selector:
         config["asym_offload_modules"] = raw_selector
+    attention_gc_modules = tuple(getattr(model, "_asym_attention_gc_modules", ())) or attention_checkpoint_module_names(model)
+    if bool(getattr(model, "_asym_attention_gc_enabled", False)) or attention_gc_modules:
+        config["asym_attention_gc_enabled"] = bool(getattr(model, "_asym_attention_gc_enabled", False))
+        config["asym_attention_gc_modules"] = list(attention_gc_modules)
+    attention_act_modules = tuple(getattr(model, "_asym_attention_act_offload_modules", ()))
+    if bool(getattr(model, "_asym_attention_act_offload_enabled", False)) or attention_act_modules:
+        attention_saved_modules = tuple(
+            getattr(model, "_asym_attention_saved_tensor_offload_modules", ())
+        ) or attention_saved_tensor_offload_module_names(model)
+        config["asym_attention_act_offload_enabled"] = bool(
+            getattr(model, "_asym_attention_act_offload_enabled", False)
+        )
+        config["asym_attention_act_offload_modules"] = list(attention_act_modules)
+        config["asym_attention_act_offload_skipped"] = list(
+            getattr(model, "_asym_attention_act_offload_skipped", ())
+        )
+        config["asym_attention_saved_tensor_offload_modules"] = list(attention_saved_modules)
+        config["asym_attention_saved_tensor_offload_skipped"] = list(
+            getattr(model, "_asym_attention_saved_tensor_offload_skipped", ())
+        )
     if metadata:
         config.update(_jsonable(dict(metadata)))
     return config

@@ -7,6 +7,7 @@ from .frozen_linear import (
     AsymGroupedFrozenLinearFunction,
     VALID_ASYM_PRECISIONS,
     VALID_BACKENDS,
+    asym_bf16_cpu_right_matmul,
     asym_frozen_linear,
     asym_grouped_frozen_linear,
     can_use_direct_bf16,
@@ -59,6 +60,14 @@ from .exp_act_offload_lora import (
     grouped_lora_b_backward_cpu_source,
     require_expert_activation_offload_kernels,
     stage_low_rank_from_cpu,
+)
+from .attention_activation_offload import (
+    AsymActivationOffloadLoRALinear,
+    AttentionActivationOffloadContext,
+    AttentionSavedTensorOffloadWrapper,
+    attention_saved_tensor_offload_module_names,
+    install_attention_saved_tensor_offload,
+    is_attention_saved_tensor_offload_wrapper,
 )
 from .cpu_adam import AsymCPUAdamW
 from .mlp import (
@@ -122,6 +131,10 @@ __all__ = [
     "AsymGroupedFrozenLinear",
     "AsymGroupedFrozenLinearFunction",
     "AsymLoRALinear",
+    "AsymActivationOffloadLoRALinear",
+    "AttentionSavedTensorOffloadWrapper",
+    "AttentionActivationOffloadContext",
+    "attention_saved_tensor_offload_module_names",
     "AsymCPUAdamW",
     "AsymMLP",
     "AsymLlama4Moe",
@@ -160,6 +173,7 @@ __all__ = [
     "VALID_MOE_BACKENDS",
     "add_asym_lora",
     "adopt_host_weight",
+    "asym_bf16_cpu_right_matmul",
     "asym_frozen_linear",
     "asym_grouped_frozen_linear",
     "can_use_direct_bf16",
@@ -186,6 +200,7 @@ __all__ = [
     "is_qwen3_moe_block",
     "is_qwen35_moe_block",
     "is_llama4_moe",
+    "is_attention_saved_tensor_offload_wrapper",
     "load_lora_state_dict",
     "load_peft_adapter",
     "lora_parameters",
@@ -203,6 +218,7 @@ __all__ = [
     "save_peft_adapter",
     "storage_key",
     "prepare_grouped_lora_metadata",
+    "install_attention_saved_tensor_offload",
     "require_expert_activation_offload_kernels",
     "stage_low_rank_from_cpu",
     "tensor_nbytes",

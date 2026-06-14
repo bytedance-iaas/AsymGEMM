@@ -616,13 +616,13 @@ def parse_expert_recompute_policy_spec(spec: str | None) -> ExpertRecomputeConfi
             activation_save_min=1,
             activation_save_max=None,
         )
-    if raw == "gc-exp":
+    if raw in {"gc-exp", "gc-attn-exp"}:
         return ExpertRecomputeConfig(
             policy="gc",
             token_threshold=0,
             activation_save_policy="save_all",
             activation_save_threshold=0,
-            label="gc-exp",
+            label=raw,
             token_min=1,
             token_max=None,
             activation_save_min=1,
@@ -720,7 +720,7 @@ def parse_expert_recompute_policy_spec(spec: str | None) -> ExpertRecomputeConfi
         )
 
     raise ValueError(
-        f"unsupported expert recompute policy {spec!r}; expected none, tok-leN, tok-geN, tokA-B, gc-exp, or -act variants"
+        f"unsupported expert recompute policy {spec!r}; expected none, tok-leN, tok-geN, tokA-B, gc-exp, gc-attn-exp, or -act variants"
     )
 
 

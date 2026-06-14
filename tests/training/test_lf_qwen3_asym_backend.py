@@ -24,6 +24,11 @@ from asym_gemm.training.activation_offload import (
     activation_offload_cpu_pool_stats,
     clear_activation_offload_cpu_pool,
 )
+from asym_gemm.training.attention_activation_offload import (
+    AsymActivationOffloadLoRALinear,
+    is_attention_saved_tensor_offload_wrapper,
+)
+from asym_gemm.training.attention_checkpoint import attention_checkpoint_module_names, is_attention_checkpoint_wrapper
 from asym_gemm.training.exp_act_offload_lora import require_expert_activation_offload_kernels
 from asym_gemm.training.frozen_linear import AsymFrozenLinear, TorchGroupedFrozenLinear
 from asym_gemm.training.llama4_moe import AsymLlama4Moe, AsymLlama4Router, is_llama4_moe
@@ -121,6 +126,55 @@ class FakeBlock(nn.Module):
         self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
         self.o_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
         self.mlp = FakeQwen3Moe(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim, num_experts=num_experts)
+
+
+class FakeSelfAttention(nn.Module):
+    def __init__(self, *, hidden_dim: int = 8) -> None:
+        super().__init__()
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
+        self.o_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
+        self.forward_calls = 0
+
+    def forward(self, hidden_states: torch.Tensor, **_kwargs: object) -> tuple[torch.Tensor, None]:
+        self.forward_calls += 1
+        mixed = self.q_proj(hidden_states) + self.k_proj(hidden_states) + self.v_proj(hidden_states)
+        return self.o_proj(mixed), None
+
+
+class FakeAttentionBlock(nn.Module):
+    def __init__(self, *, hidden_dim: int = 8, intermediate_dim: int = 8, num_experts: int = 4) -> None:
+        super().__init__()
+        self.self_attn = FakeSelfAttention(hidden_dim=hidden_dim)
+        self.mlp = FakeQwen3Moe(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim, num_experts=num_experts)
+
+
+class FakeAttentionModel(nn.Module):
+    def __init__(
+        self,
+        *,
+        hidden_dim: int = 8,
+        intermediate_dim: int = 8,
+        num_layers: int = 2,
+        num_experts: int = 4,
+        include_vision: bool = False,
+    ) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [FakeAttentionBlock(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim, num_experts=num_experts) for _ in range(num_layers)]
+        )
+        if include_vision:
+            self.vision_model = nn.Module()
+            self.vision_model.self_attn = FakeSelfAttention(hidden_dim=hidden_dim)
+        self.lm_head = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
+
+    def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            attn_out, _ = layer.self_attn(hidden_states)
+            routed = layer.mlp.experts(hidden_states, top_k_index, top_k_weights)
+            hidden_states = (hidden_states + attn_out.mul(0.125).to(hidden_states.dtype) + routed).to(dtype=hidden_states.dtype)
+        return self.lm_head(hidden_states)
 
 
 class FakeModel(nn.Module):
@@ -536,6 +590,7 @@ def test_activation_offload_cpu_pool_respects_configured_cap(monkeypatch: pytest
 def test_parse_expert_recompute_policy_spec() -> None:
     none = parse_expert_recompute_policy_spec(None)
     gc_exp = parse_expert_recompute_policy_spec("gc-exp")
+    gc_attn_exp = parse_expert_recompute_policy_spec("gc-attn-exp")
     lower = parse_expert_recompute_policy_spec("tok-le2")
     zero = parse_expert_recompute_policy_spec("tok-le0")
     upper = parse_expert_recompute_policy_spec("tok-ge2")
@@ -554,6 +609,12 @@ def test_parse_expert_recompute_policy_spec() -> None:
     assert not gc_exp.recompute_enabled
     assert not gc_exp.custom_autograd_enabled
     assert gc_exp.enabled
+    assert gc_attn_exp.label == "gc-attn-exp"
+    assert gc_attn_exp.policy == "gc"
+    assert gc_attn_exp.torch_checkpoint_enabled
+    assert not gc_attn_exp.recompute_enabled
+    assert not gc_attn_exp.custom_autograd_enabled
+    assert gc_attn_exp.enabled
     assert lower.label == "tok-le2"
     assert lower.policy == "tok"
     assert lower.token_threshold == 2
@@ -737,6 +798,169 @@ def test_apply_lf_asym_lora_attention_lora_adopts_cpu_storage_without_clone() ->
     assert report.cpu_resident_base_bytes_by_component["attention"] > 0
     assert report.selected_gpu_resident_base_bytes_by_component == {}
     assert not any(name == "layers.0.q_proj.weight" for name, _param in model.named_parameters())
+
+
+def test_attention_activation_offload_default_off_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ASYMM_ATTN_ACT_OFFLOAD", raising=False)
+    monkeypatch.delenv("ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD", raising=False)
+    model = FakeModel(hidden_dim=64, intermediate_dim=64, num_layers=1)
+
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj"],
+        dense_target_modules=["q_proj"],
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="q_proj",
+        router_mode="hf",
+        strict=True,
+    )
+
+    assert isinstance(model.layers[0].q_proj, AsymLoRALinear)
+    assert not isinstance(model.layers[0].q_proj, AsymActivationOffloadLoRALinear)
+    assert report.attention_act_offload_enabled is False
+    assert report.attention_act_offload_wrapped == 0
+
+
+def test_attention_activation_offload_wraps_selected_lora_projection(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASYMM_ATTN_ACT_OFFLOAD", "1")
+    model = FakeModel(hidden_dim=64, intermediate_dim=64, num_layers=1)
+
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj"],
+        dense_target_modules=["q_proj"],
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="q_proj",
+        router_mode="hf",
+        strict=True,
+    )
+
+    wrapped = model.layers[0].q_proj
+    assert isinstance(wrapped, AsymActivationOffloadLoRALinear)
+    assert report.attention_act_offload_enabled is True
+    assert report.attention_act_offload_wrapped == 1
+    assert report.attention_act_offload_modules == ("layers.0.q_proj",)
+    assert set(wrapped.state_dict()) == {
+        "base_layer.host_weight",
+        "lora_A.default.weight",
+        "lora_B.default.weight",
+    }
+
+
+def test_attention_activation_offload_lf_qkv_wrappers_share_parent_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASYMM_ATTN_ACT_OFFLOAD", "1")
+    model = FakeAttentionModel(hidden_dim=64, intermediate_dim=64, num_layers=1)
+
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj", "k_proj", "v_proj", "o_proj"],
+        dense_target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="attention",
+        router_mode="hf",
+        strict=True,
+    )
+
+    attn = model.layers[0].self_attn
+    assert isinstance(attn.q_proj, AsymActivationOffloadLoRALinear)
+    assert isinstance(attn.k_proj, AsymActivationOffloadLoRALinear)
+    assert isinstance(attn.v_proj, AsymActivationOffloadLoRALinear)
+    assert isinstance(attn.o_proj, AsymActivationOffloadLoRALinear)
+    assert attn.q_proj.attention_context is attn.k_proj.attention_context
+    assert attn.q_proj.attention_context is attn.v_proj.attention_context
+    assert attn.q_proj.attention_context is not None
+    assert attn.o_proj.attention_context is None
+    assert report.attention_act_offload_wrapped == 4
+    assert report.attention_saved_tensor_offload_wrapped == 1
+    assert report.attention_saved_tensor_offload_modules == ("layers.0.self_attn",)
+    assert is_attention_saved_tensor_offload_wrapper(attn)
+
+
+def test_attention_activation_offload_rejects_shape_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASYMM_ATTN_ACT_OFFLOAD", "1")
+    model = FakeModel(hidden_dim=8, intermediate_dim=8, num_layers=1)
+
+    with pytest.raises(RuntimeError, match="shape falls back to torch"):
+        apply_lf_asym_lora(
+            model,
+            raw_lora_target=["q_proj"],
+            dense_target_modules=["q_proj"],
+            lora_rank=2,
+            lora_alpha=4.0,
+            lora_dropout=0.0,
+            backend="asym",
+            precision="bf16",
+            offload_modules="q_proj",
+            router_mode="hf",
+            strict=True,
+        )
+
+
+def test_attention_activation_offload_excludes_vision_attention(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASYMM_ATTN_ACT_OFFLOAD", "1")
+    model = FakeAttentionModel(hidden_dim=64, intermediate_dim=64, num_layers=1, include_vision=True)
+
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj", "k_proj", "v_proj", "o_proj"],
+        dense_target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="attention",
+        router_mode="hf",
+        strict=True,
+    )
+
+    assert isinstance(model.layers[0].self_attn.q_proj, AsymActivationOffloadLoRALinear)
+    assert isinstance(model.layers[0].self_attn.k_proj, AsymActivationOffloadLoRALinear)
+    assert isinstance(model.layers[0].self_attn.v_proj, AsymActivationOffloadLoRALinear)
+    assert isinstance(model.layers[0].self_attn.o_proj, AsymActivationOffloadLoRALinear)
+    assert isinstance(model.vision_model.self_attn.q_proj, AsymLoRALinear)
+    assert not isinstance(model.vision_model.self_attn.q_proj, AsymActivationOffloadLoRALinear)
+    assert report.attention_act_offload_wrapped == 4
+    assert "vision_model.self_attn.q_proj:vision_or_multimodal" in report.attention_act_offload_skipped
+
+
+def test_attention_activation_offload_adapter_config_records_modules(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("ASYMM_ATTN_ACT_OFFLOAD", "1")
+    model = FakeModel(hidden_dim=64, intermediate_dim=64, num_layers=1)
+    model, _report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj"],
+        dense_target_modules=["q_proj"],
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="q_proj",
+        router_mode="hf",
+        strict=True,
+    )
+
+    save_asym_peft_adapter(model, tmp_path, metadata={"base_model_name_or_path": "fake-qwen3"})
+    config = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+
+    assert config["asym_attention_act_offload_enabled"] is True
+    assert config["asym_attention_act_offload_modules"] == ["layers.0.q_proj"]
 
 
 def test_apply_lf_asym_lora_attention_frozen_base_adopts_cpu_storage_without_clone() -> None:
@@ -1436,6 +1660,74 @@ def test_llama4_gc_exp_wrap_accepts_and_runs_packed_experts() -> None:
     for name, param in wrapped.experts.named_parameters():
         if "lora_" in name:
             assert param.grad is not None, f"{name} missing grad"
+
+
+def test_apply_lf_asym_lora_gc_attn_exp_wraps_text_attention_and_experts_only() -> None:
+    model = FakeAttentionModel()
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["all"],
+        dense_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="torch",
+        precision="bf16",
+        offload_modules="none",
+        expert_recompute_policy="gc-attn-exp",
+        router_mode="hf",
+        strict=True,
+    )
+
+    assert report.attention_gc_enabled
+    assert report.attention_gc_wrapped == 2
+    assert report.attention_gc_modules == ("layers.0.self_attn", "layers.1.self_attn")
+    assert attention_checkpoint_module_names(model) == ("layers.0.self_attn", "layers.1.self_attn")
+    assert is_attention_checkpoint_wrapper(model.layers[0].self_attn)
+    assert isinstance(model.layers[0].self_attn, FakeSelfAttention)
+    assert all(".module." not in name for name, _param in model.named_parameters())
+    assert isinstance(model.layers[0].mlp.experts, AsymQwen3Experts)
+    assert model.layers[0].mlp.experts.expert_recompute_config.label == "gc-attn-exp"
+    assert model.layers[0].mlp.experts.expert_recompute_config.torch_checkpoint_enabled
+    assert "attention_gc_enabled=True" in report.to_log_string()
+
+    model.train()
+    x = torch.randn(5, 8, dtype=torch.bfloat16, requires_grad=True)
+    top_k_index, top_k_weights = _routing()
+    loss = model(x, top_k_index, top_k_weights).float().square().mean()
+    loss.backward()
+
+    wrapper = getattr(model.layers[0].self_attn, "_asym_attention_checkpoint_wrapper")
+    assert wrapper.checkpoint_calls == 1
+    assert x.grad is not None
+    assert torch.isfinite(x.grad.float()).all()
+    lora_grads = [param.grad for name, param in model.named_parameters() if "lora_" in name]
+    assert lora_grads
+    assert all(grad is not None for grad in lora_grads)
+
+
+def test_apply_lf_asym_lora_gc_attn_exp_excludes_vision_attention() -> None:
+    model = FakeAttentionModel(num_layers=1, include_vision=True)
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["all"],
+        dense_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="torch",
+        precision="bf16",
+        offload_modules="none",
+        expert_recompute_policy="gc-attn-exp",
+        router_mode="hf",
+        strict=True,
+    )
+
+    assert report.attention_gc_modules == ("layers.0.self_attn",)
+    assert report.attention_gc_skipped == ("vision_model.self_attn:vision_or_multimodal",)
+    assert attention_checkpoint_module_names(model) == ("layers.0.self_attn",)
+    assert is_attention_checkpoint_wrapper(model.layers[0].self_attn)
+    assert not is_attention_checkpoint_wrapper(model.vision_model.self_attn)
 
 
 def test_apply_lf_asym_lora_wraps_experts_dense_and_freezes_router() -> None:

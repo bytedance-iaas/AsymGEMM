@@ -67,6 +67,9 @@ def make_fake_env(tmp_path: Path) -> tuple[Path, Path]:
                 "fi",
                 "if [[ -n \"${FAKE_LF_ENV_LOG:-}\" ]]; then",
                 "  printf 'PYTHONPATH=%s\\n' \"${PYTHONPATH:-}\" > \"$FAKE_LF_ENV_LOG\"",
+                "  printf 'ASYMM_ATTN_ACT_OFFLOAD=%s\\n' \"${ASYMM_ATTN_ACT_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
+                "  printf 'ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD=%s\\n' \"${ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
+                "  printf 'ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED=%s\\n' \"${ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "fi",
                 "exit 0",
                 "",
@@ -156,6 +159,19 @@ def test_run_lf_lora_sft_asym_cpuadamwds_args(tmp_path: Path) -> None:
     assert env_log.read_text(encoding="utf-8").startswith(f"PYTHONPATH={deepspeed_dir}:")
 
 
+def test_run_lf_lora_sft_passes_attention_activation_env(tmp_path: Path) -> None:
+    env_log = tmp_path / "env.txt"
+    args = _run_lf_lora_sft(
+        tmp_path,
+        "asym",
+        extra_env={"ASYMM_ATTN_ACT_OFFLOAD": "true", "FAKE_LF_ENV_LOG": str(env_log)},
+    )
+
+    assert _arg_value(args, "--use_asym_gemm") == "true"
+    env_text = env_log.read_text(encoding="utf-8")
+    assert "ASYMM_ATTN_ACT_OFFLOAD=true" in env_text
+
+
 def test_run_lf_lora_sft_rejects_direct_cpuadamw_enablement(tmp_path: Path) -> None:
     lf_dir = make_fake_lf(tmp_path)
     for backend in ("zero3_offload", "asym", "asym_torch"):
@@ -205,6 +221,85 @@ def test_profile_lora_lf_dry_run_asym_cpuadamwtorch_label_and_flags(tmp_path: Pa
     assert "PROFILE_BACKEND_LABEL=asym_cpuadamwtorch" in command
     assert "USE_ASYM_CPU_ADAMW=true" in command
     assert "ASYM_CPU_ADAMW_BACKEND=torch" in command
+
+
+def test_profile_lora_lf_three_part_exp_attn_axis_dry_run(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    output_root = tmp_path / "dryrun"
+
+    run_cmd(
+        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
+        env={
+            "LF_DIR": str(lf_dir),
+            "BACKEND_SPECS": "asym_cpuadamwds|norecomp",
+            "GPU_POOL": "0",
+            "PROFILERS": "source",
+            "SEQ_LENS": "128",
+            "MAX_STEPS": "1",
+            "WARMUP_STEPS": "0",
+            "PREPARE_DATASETS": "false",
+            "DRY_RUN": "true",
+            "LORA_DROPOUT": "0.00",
+            "ASYMM_EXP_ACT_POLICIES": "none|false|false,gc-exp|false|false,gc-attn-exp|false|false,none|true|false,none|true|true",
+            "PLOT": "false",
+            "PLOT_MEMORY_BREAKDOWN": "false",
+        },
+    )
+
+    commands = {str(path): path.read_text(encoding="utf-8") for path in output_root.rglob("command.txt")}
+    assert len(commands) == 5
+    command_paths = "\n".join(commands)
+    assert "__polnone__routerwhole__expact0__attnact0/" in command_paths
+    assert "__polgc-exp__routerwhole__expact0__attnact0/" in command_paths
+    assert "__polgc-attn-exp__routerwhole__expact0__attnact0/" in command_paths
+    assert "__polnone__routerwhole__expact1__attnact0/" in command_paths
+    assert "__polnone__routerwhole__expact1__attnact1/" in command_paths
+
+    gc_attn_command = next(text for path, text in commands.items() if "__polgc-attn-exp__" in path)
+    assert "ASYM_EXPERT_RECOMPUTE_POLICY=gc-attn-exp" in gc_attn_command
+    assert "GRADIENT_CHECKPOINTING=false" in gc_attn_command
+    assert "ASYMM_ATTN_ACT_OFFLOAD=false" in gc_attn_command
+    assert "ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED=true" in gc_attn_command
+    assert "ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD=false" in gc_attn_command
+
+    gc_exp_command = next(text for path, text in commands.items() if "__polgc-exp__" in path)
+    assert "ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED=false" in gc_exp_command
+
+    attnact_command = next(text for path, text in commands.items() if "__expact1__attnact1/" in path)
+    assert "ASYMM_EXPERT_ACT_OFFLOAD=true" in attnact_command
+    assert "ASYMM_ATTN_ACT_OFFLOAD=true" in attnact_command
+    assert "ASYM_EXPERT_RECOMPUTE_POLICY=none" in attnact_command
+    assert "ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD=true" in attnact_command
+    assert "ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED=false" in attnact_command
+
+
+def test_profile_lora_lf_rejects_selective_gc_with_global_recomp(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    output_root = tmp_path / "dryrun"
+
+    result = run_cmd(
+        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
+        env={
+            "LF_DIR": str(lf_dir),
+            "BACKEND_SPECS": "asym_cpuadamwds|recomp",
+            "GPU_POOL": "0",
+            "PROFILERS": "source",
+            "SEQ_LENS": "128",
+            "MAX_STEPS": "1",
+            "WARMUP_STEPS": "0",
+            "PREPARE_DATASETS": "false",
+            "DRY_RUN": "true",
+            "LORA_DROPOUT": "0.00",
+            "ASYMM_EXP_ACT_POLICIES": "gc-attn-exp|false|false",
+            "PLOT": "false",
+            "PLOT_MEMORY_BREAKDOWN": "false",
+        },
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "selective GC" in result.stderr
+    assert "backend recompute=norecomp" in result.stderr
 
 
 def test_profile_lora_lf_mixed_dry_run_does_not_leak_cpuadamw_to_zero(tmp_path: Path) -> None:
@@ -303,13 +398,12 @@ def test_profile_lora_lf_default_e2e_shape_uses_asym_cpuadamwds(tmp_path: Path) 
     )
 
     command_files = sorted(output_root.rglob("command.txt"))
-    assert len(command_files) == 2
+    assert len(command_files) == 1
     command_texts = [path.read_text(encoding="utf-8") for path in command_files]
     command_paths = "\n".join(str(path) for path in command_files)
 
-    assert "qwen3_5-122b-a10b__gpus1__b4_s8192_w5_s10_r64_a16_drop008" in command_paths
-    assert "llama-4-scout-17b-16e__gpus1__b4_s8192_w5_s10_r64_a16_drop008" in command_paths
-    assert command_paths.count("asym_cpuadamwds__source__recomp__polnone__routerwhole/b4_s8192") == 2
+    assert "qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a16_drop008" in command_paths
+    assert command_paths.count("asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact0__attnact0/b4_s4096") == 1
     for command in command_texts:
         assert "BACKEND=asym_cpuadamwds" in command
         assert "PROFILE_BACKEND_LABEL=asym_cpuadamwds" in command
@@ -321,7 +415,7 @@ def test_profile_lora_lf_default_e2e_shape_uses_asym_cpuadamwds(tmp_path: Path) 
         assert "PROFILE_MEMORY_ATTRIBUTION=false" in command
         assert "PROFILE_MEMORY_BREAKDOWN=false" in command
         assert "PER_DEVICE_TRAIN_BATCH_SIZE=4" in command
-        assert "CUTOFF_LEN=8192" in command
+        assert "CUTOFF_LEN=4096" in command
 
 
 @pytest.mark.parametrize("offload_modules", ["all", "routed_experts", "attention,router", "none"])

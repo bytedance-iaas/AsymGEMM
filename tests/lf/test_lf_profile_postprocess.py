@@ -192,6 +192,42 @@ def test_profile_config_preserves_deepspeed_dir_for_asym_cpuadamwds(
     assert config["deepspeed_dir"] == str(deepspeed_dir)
 
 
+def test_profile_config_records_attention_activation_and_gc(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    module = _load_profile_launcher_module()
+    monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_BACKEND", "asym_cpuadamwds")
+    monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_EXPERT_POLICY", "gc-attn-exp")
+    monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD", "false")
+    monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD", "true")
+    monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED", "true")
+
+    config = module._config_from_args(
+        [
+            "--model_name_or_path",
+            "Qwen/Qwen3-30B-A3B",
+            "--per_device_train_batch_size",
+            "1",
+            "--cutoff_len",
+            "128",
+            "--gradient_accumulation_steps",
+            "1",
+            "--lora_rank",
+            "8",
+            "--max_steps",
+            "1",
+            "--asym_backend",
+            "asym",
+            "--output_dir",
+            str(tmp_path / "out"),
+        ]
+    )
+
+    assert config["expert_recompute_policy_spec"] == "gc-attn-exp"
+    assert config["expert_recompute_impl"] == "torch_checkpoint"
+    assert config["asymm_expert_act_offload"] == "false"
+    assert config["asymm_attn_act_offload"] == "true"
+    assert config["attention_gc_enabled"] == "true"
+
+
 def test_heartbeat_timing_summary_derives_high_resolution_step_intervals() -> None:
     module = _load_profile_launcher_module()
     timing = module._heartbeat_timing_summary(

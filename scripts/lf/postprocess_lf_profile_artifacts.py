@@ -806,6 +806,8 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
         f"Backend: `{config.get('backend', '-')}`  ",
         f"Router mode: `{config.get('router_mode', '-')}`  ",
         f"Expert activation offload: `{config.get('asymm_expert_act_offload', '-')}`  ",
+        f"Attention activation offload: `{config.get('asymm_attn_act_offload', '-')}`  ",
+        f"Attention GC: `{config.get('attention_gc_enabled', config.get('attn_gc_enabled', '-'))}`  ",
         f"Precision: `{config.get('precision', '-')}`  ",
         f"Seq len: `{config.get('seq_len', '-')}`",
         f"Steps: `{warmup_steps}` warmup + `{measure_steps}` measured",

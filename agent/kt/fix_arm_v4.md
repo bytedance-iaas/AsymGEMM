@@ -1,6 +1,6 @@
 # KT ARM BF16 SFT Fix Plan v4
 
-This is the next implementation plan after v3. The native KT ARM BF16 path is real and not DeepSpeed. Low HBM use is expected because routed expert compute stays on CPU. The old "stuck" symptom was mainly bad CPU affinity plus a dense backward reducer that created one worker task per float. Those are fixed. The remaining problem is that the current ARM SFT path is still loop-shaped code around BF16 dot products, not a useful GEMM kernel design.
+This is the next implementation plan after v3. The native KT ARM BF16 path is real and not DeepSpeed. Low HBM use is expected because routed expert compute stays on CPU. The old "stuck" symptom was mainly bad CPU affinity plus a dense backward reducer that created one worker task per float. Those are fixed. Current v4 forward now uses useful ARM SVE BF16 kernels for base gate/up, base down, and dropout-0 LoRA forward. Sparse active-expert backward buffers and tile-local grouped backward recompute are implemented. The largest remaining unsolved work is true grouped backward gradient accumulation/outer-product kernels and final LF acceptance.
 
 Rules for all stages:
 
@@ -14,12 +14,14 @@ Rules for all stages:
 ## Conclusions Driving Priority
 
 - Current hot code is in `../ktransformers/kt-kernel/operators/arm/bf16_sft_moe.hpp`.
-- `arm_bf16_matmul_tiled()` still loops over `m x n` and calls one SVE BF16 dot per output element.
-- `compute_gate_up_base_by_expert()` calls that dot-loop for gate and up.
-- `compute_down_base_by_expert()` is a scalar FP32 loop over `H x I`.
-- `compute_gate_up_lora_by_expert()` and `compute_down_lora_by_expert()` are per-route scalar loops.
-- `forward_impl_packed()` processes active experts serially.
-- `backward_impl_packed()` still allocates dense per-thread all-expert LoRA gradient buffers. The reducer is now chunked, but the dense buffer design remains wrong for sparse routed experts.
+- `compute_gate_up_base_by_expert()` defaults to `sve_bfdot_blocked` and keeps `KT_ARM_SFT_GEMM_BACKEND=dot_loop` only as a debug fallback.
+- `compute_down_base_by_expert()` defaults to `bf16_bfdot_blocked`. `KT_ARM_SFT_DOWN_BACKEND=scalar` and `KT_ARM_SFT_DOWN_BACKEND=sve_fmla` remain comparison fallbacks.
+- `compute_gate_up_lora_by_expert()` and `compute_down_lora_by_expert()` default to `sve_bfdot_fmla` when LoRA dropout is off. Dropout-enabled forward stays on the scalar path to preserve deterministic mask semantics.
+- `forward_impl_packed()` parallelizes active experts through the existing WorkerPool for `qlen > arm_sft_small_qlen_threshold`.
+- Native profile fields now include `expert_schedule_wall_ms`; per-phase expert fields such as `base_down_ms` are task-sums when expert parallelism is enabled.
+- `backward_impl_packed()` now allocates sparse active-expert FP32 LoRA partials and flushes active slices into dense BF16 output gradients.
+- Backward route compute is tiled by active expert. Each tile now recomputes gate/up, activation, down, and dropout-0 LoRA with the same grouped forward kernels used by the forward path. This removed the worst scalar down-recompute cost.
+- The remaining backward issue is not expert scheduling; it is the per-route gradient accumulation math inside each tile: base gradient-to-input and LoRA outer products still need grouped/tiled kernels.
 - `../ktransformers/kt-kernel/operators/moe-sft-tp.hpp` already has the right backward lesson: use active-expert sparse FP32 partials for reduce-type gradients and direct/sliced writes where ownership is disjoint.
 - This host reports `sve`, `sve2`, `svebf16`, `bf16`, `i8mm`, and `svei8mm`, but not `bfmmla`, `sme`, or `sme2`. First target SVE BF16 BFDOT. Keep BFMMLA/SME paths feature-gated only.
 
@@ -34,6 +36,111 @@ External sources checked and used for design:
 - llama.cpp MoE gather/GEMM/scatter reference path: https://github.com/ggerganov/llama.cpp
 
 The relevant related-work lesson is not "add more loops". It is: define packed layouts, expose microkernel tile sizes, pack stable RHS weights once, pack/gather LHS by active expert/block, run a blocked kernel, and validate each shape with PMU counters.
+
+## Execution Status After Current Pass
+
+Implemented files:
+
+- `../ktransformers/kt-kernel/operators/arm/bf16_sft_moe.hpp`
+  - layout/profile JSON, selected kernel names, CPU feature flags, route stats, buffer bytes, and `expert_schedule_wall_ms`
+  - blocked SVE BF16 gate/up kernel: `sve_bfdot_blocked`
+  - active-expert WorkerPool parallel scheduling with route blocks, so one hot expert still produces many tasks
+  - dropout-0 LoRA forward fast path: `sve_bfdot_fmla`
+  - BF16-converted base-down kernel: `bf16_bfdot_blocked`
+  - sparse active-expert backward LoRA partial buffers, sparse-to-dense final merge, and old-vs-sparse scratch counters
+  - backward route tiles, tile-local grouped recompute, route-local `grad_x` scatter, and backward worker cap to avoid idle tile buffers
+  - debug fallbacks: `KT_ARM_SFT_GEMM_BACKEND=dot_loop`, `KT_ARM_SFT_DOWN_BACKEND=scalar|sve_fmla`, `KT_ARM_SFT_LORA_BACKEND=scalar`, `KT_ARM_SFT_BACKWARD_BASE_BACKEND=sve`, `KT_ARM_SFT_DISABLE_PARALLEL_EXPERTS=1`
+- `../ktransformers/kt-kernel/ext_bindings.cpp`
+  - bound `layout_report_json()`
+- `../ktransformers/kt-kernel/python/sft/arm.py`
+  - exposed parsed `layout_report` and sparse backward scratch properties
+- `../ktransformers/kt-kernel/bench/bench_armbf16_sft.py`
+  - added `--artifact-dir`, `--forward-only`, layout/native summary artifacts, CPU/env capture
+- `../ktransformers/kt-kernel/bench/bench_arm_sft_compare.py`
+  - added layout/native summary artifacts and env capture
+- `../ktransformers/kt-kernel/test/per_commit/test_armbf16_sft_reference.py`
+  - extended route edge-case backward checks for duplicate routes, invalid expert ids, and sparse active-expert counters
+
+Validation already passed:
+
+```bash
+CPUINFER_FORCE_REBUILD=1 CPUINFER_BUILD_TYPE=RelWithDebInfo CPUINFER_PARALLEL=16 \
+  .venv/bin/python -m pip install -e ../ktransformers/kt-kernel -v --no-build-isolation
+
+.venv/bin/python -m py_compile \
+  ../ktransformers/kt-kernel/bench/bench_armbf16_sft.py \
+  ../ktransformers/kt-kernel/bench/bench_arm_sft_compare.py
+
+.venv/bin/python -m pytest ../ktransformers/kt-kernel/test/per_commit/test_armbf16_sft_reference.py -q
+.venv/bin/python -m pytest ../ktransformers/kt-kernel/test/per_commit/test_sft_lora_dropout.py -q
+```
+
+Latest test result:
+
+- `test_armbf16_sft_reference.py`: 30 passed
+- `test_sft_lora_dropout.py`: 13 passed
+
+Key profiling artifacts:
+
+- `profiling_kt_codex_smoke/v4_stage4_q128_serial_wall/`
+- `profiling_kt_codex_smoke/v4_stage4_q128_parallel_wall/`
+- `profiling_kt_codex_smoke/v4_stage5_q128_lora_scalar/`
+- `profiling_kt_codex_smoke/v4_stage5_q128_lora_sve/`
+- `profiling_kt_codex_smoke/v4_stage5_q2048_lora_scalar/`
+- `profiling_kt_codex_smoke/v4_stage5_q2048_lora_sve/`
+- `profiling_kt_codex_smoke/v4_stage6_q128_down_scalar/`
+- `profiling_kt_codex_smoke/v4_stage6_q128_down_bf16/`
+- `profiling_kt_codex_smoke/v4_stage6_q2048_down_bf16/`
+- `profiling_kt_codex_smoke/v4_stage6_sparse_backward_q128_all_to_one/`
+- `profiling_kt_codex_smoke/v4_stage6_sparse_backward_q2048_all_to_one/`
+- `profiling_kt_codex_smoke/v4_stage7_route_block_q2048_all_to_one/`
+- `profiling_kt_codex_smoke/v4_stage7_route_tile_scalar_bwd_q2048_all_to_one/`
+- `profiling_kt_codex_smoke/v4_stage7_grouped_recompute_capped_q128_all_to_one/`
+- `profiling_kt_codex_smoke/v4_stage7_grouped_recompute_capped_q2048_all_to_one/`
+- `profiling_kt_codex_smoke/v4_stage7_grouped_recompute_split_q2048_all_to_one/`
+- `profiling_kt_codex_smoke/v4_stage7_grouped_recompute_sve_bwd_q2048_all_to_one/`
+
+Note: `v4_stage6_q*_down_*` artifact names are the BF16-down follow-up to this plan's Stage 3. `v4_stage6_sparse_backward_*` are the sparse-backward Stage 6 validation artifacts.
+
+Measured forward-only improvements on physical GPU 1 with CPU taskset `0-15`:
+
+| Shape | Kernel state | latency mean | expert wall | base gate/up task-sum | base down task-sum | LoRA gate/up task-sum | LoRA down task-sum |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| q128 r8 | serial experts, scalar down/LoRA | 510.0 ms | 482.2 ms | 179.3 ms | 259.9 ms | 28.7 ms | 12.2 ms |
+| q128 r8 | parallel experts, scalar down/LoRA | 86.5 ms | 64.3 ms | 186.3 ms | 257.7 ms | 28.7 ms | 12.2 ms |
+| q128 r8 | parallel, SVE LoRA, scalar down | 82.9 ms | 60.6 ms | 185.9 ms | 258.6 ms | 6.8 ms | 5.1 ms |
+| q128 r8 | parallel, SVE LoRA, BF16 down | 62.7 ms | 40.1 ms | 196.1 ms | 95.9 ms | 7.1 ms | 5.2 ms |
+| q2048 r64 | parallel, scalar down/LoRA | 2041.9 ms | 1711.7 ms | 2011.4 ms | 3799.5 ms | 4766.9 ms | 2852.0 ms |
+| q2048 r64 | parallel, SVE LoRA, scalar down | 1248.5 ms | 925.0 ms | 2030.1 ms | 3815.5 ms | 772.3 ms | 582.1 ms |
+| q2048 r64 | parallel, SVE LoRA, BF16 down | 923.4 ms | 570.0 ms | 2053.4 ms | 1010.9 ms | 786.9 ms | 586.9 ms |
+
+Measured sparse-backward validation on physical GPU 1 with CPU taskset `0-15`:
+
+| Shape | Routing | active backward experts | old dense scratch estimate | sparse scratch estimate | backward local alloc | backward route loop | sparse merge |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| q128 r8 | all-to-one | 1 | 321.3 MB | 12.3 MB | 0.58 ms | 205.1 ms | 0.09 ms |
+| q2048 r64 | all-to-one | 1 | 2642.9 MB | 170.9 MB | 8.22 ms | 4376.2 ms | 0.69 ms |
+
+Measured Stage 7 grouped-recompute validation on physical GPU 1 with CPU taskset `0-15`:
+
+| Shape | Routing | change | backward threads | old dense scratch estimate | sparse scratch estimate | forward total | backward route loop | total fwd+bwd |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| q2048 r64 | all-to-one | route-block forward before grouped recompute | 8 | 2642.9 MB | 154.2 MB | 911.7 ms | 4412.6 ms | 5338.9 ms |
+| q2048 r64 | all-to-one | grouped tile recompute, scalar base-backward | 8 | 2691.7 MB | 202.9 MB | 878.9 ms | 2517.2 ms | 3409.4 ms |
+| q2048 r64 | all-to-one | grouped tile recompute, `KT_ARM_SFT_BACKWARD_BASE_BACKEND=sve` | 8 | 2691.7 MB | 202.9 MB | 892.0 ms | 5523.4 ms | 6429.8 ms |
+| q128 r8 | all-to-one | grouped tile recompute, worker cap | 4 requested 8 | 202.2 MB | 33.7 MB | 74.8 ms | 192.2 ms | 267.1 ms |
+
+Conclusion: grouped recompute is a real improvement for the hot-expert long-sequence case, but the SVE FP32xBF16 backward-base helper remains slower than the scalar default on this host. Keep it opt-in only. The next useful optimization is grouped/tiled gradient accumulation, not adding loops over experts.
+
+The split-counter q2048 artifact (`v4_stage7_grouped_recompute_split_q2048_all_to_one`) shows why: `backward_tile_recompute_ms=4371.5` task-sum, while `backward_route_grad_accum_ms=15549.6` task-sum. The wall-clock `backward_route_loop_ms=2595.7` because 8 workers run tiles in parallel, but the task-sum split still identifies gradient accumulation as the dominant remaining CPU work.
+
+Remaining high-priority work:
+
+- Stage 6 sparse active-expert backward buffers is implemented and validated on synthetic q128/q2048 all-to-one routing.
+- Stage 7 tile-local grouped recompute is implemented and validated on synthetic q128/q2048 all-to-one routing.
+- Stage 7 grouped gradient accumulation remains open and is now the largest measured CPU issue.
+- Route merge is still a visible wall-time component at long sequence (`~279 ms` in latest q2048 all-to-one full profile).
+- Large LF acceptance is still pending; use GPU 1 first and GPU 2 only as fallback.
 
 ## Common Validation Commands
 
@@ -473,6 +580,8 @@ Validation gate:
 
 Priority: medium-high. This is the main remaining memory and backward scaling fix after the reducer bug.
 
+Status: implemented and validated. This stage removes dense per-thread all-expert LoRA partials, but it does not solve the route-loop scalar backward compute. Do not treat Stage 6 as a grouped-kernel solution; Stage 7 grouped recompute is implemented and Stage 7 grouped gradient accumulation is still required.
+
 Modify:
 
 - `../ktransformers/kt-kernel/operators/arm/bf16_sft_moe.hpp`
@@ -481,7 +590,7 @@ Modify:
   - `backward_route_accumulate()`
   - `reduce_lora_grads_by_disjoint_tiles()`
   - `reduce_vector_fields()`
-  - `flush_lora_grad_accum()`
+  - `flush_sparse_lora_grad_accum()`
   - add sparse active-expert maps based on `cache.routes.active_experts`
 - `../ktransformers/kt-kernel/operators/moe-sft-tp.hpp`
   - read only; use as the local design reference
@@ -494,12 +603,15 @@ Intended changes:
 
 - Port the `moe-sft-tp.hpp` memory idea to ARM SFT:
   - Build `active_expert_to_sparse` from `cache.routes.active_experts`.
-  - Allocate per-thread or per-task sparse FP32 partials for reduce-type gradients only:
+  - Allocate per-thread sparse FP32 partials for active experts:
     - `gate_lora_a`: `[active_count, R, H]`
+    - `gate_lora_b`: `[active_count, I, R]`
     - `up_lora_a`: `[active_count, R, H]`
+    - `up_lora_b`: `[active_count, I, R]`
+    - `down_lora_a`: `[active_count, R, I]`
     - `down_lora_b`: `[active_count, H, R]`
   - Keep `grad_input_accum` per thread/token.
-  - Write copy-type gradients directly only when the work partition gives disjoint ownership. Otherwise keep sparse partials and merge.
+  - Do not directly write final dense gradient tensors from the route loop. ARM SFT is not TP-sliced, so all LoRA gradient partials stay sparse until final merge.
   - Flush sparse active experts into the final dense BF16 gradient tensors, leaving inactive experts zero.
 - Add profile fields:
   - `active_backward_experts`
@@ -515,51 +627,82 @@ Risks and watch items:
 
 Validation gate:
 
-- Common correctness tests pass.
-- Add explicit tests in `test_armbf16_sft_reference.py`:
+- Common correctness tests pass:
+  - `CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 GPU_ID=1 NUM_GPUS=1 .venv/bin/python -m pytest ../ktransformers/kt-kernel/test/per_commit/test_armbf16_sft_reference.py -q`
+  - `CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 GPU_ID=1 NUM_GPUS=1 .venv/bin/python -m pytest ../ktransformers/kt-kernel/test/per_commit/test_sft_lora_dropout.py -q`
+- Explicit tests in `test_armbf16_sft_reference.py` cover:
   - inactive experts have exactly zero LoRA grads
   - duplicate routes sum correctly
   - invalid expert ids do not touch sparse buffers
   - all-to-one routing matches reference
-- Synthetic q128/q2048 profiles show lower `backward_local_alloc_zero_ms` and lower scratch bytes.
-- Qwen3 LF smoke passes validator.
+- Synthetic q128/q2048 profiles show lower scratch bytes:
+  - `profiling_kt_codex_smoke/v4_stage6_sparse_backward_q128_all_to_one/`
+  - `profiling_kt_codex_smoke/v4_stage6_sparse_backward_q2048_all_to_one/`
+- Qwen3 LF smoke is still pending and should be run after Stage 7 grouped gradient accumulation, because Stage 6 exposed `backward_route_loop_ms` as the dominant unsolved bottleneck.
 
 ## Stage 7: Backward Route Compute as Expert-Grouped GEMMs
 
 Priority: medium. Do this after sparse buffers, so backward compute does not write into dense all-expert memory.
 
+Status: partially implemented and validated. Backward no longer performs the expensive forward recompute as a per-route scalar path: each `BackwardExpertTile` now runs the existing grouped forward kernels for base gate/up, dropout-0 LoRA gate/up, activation, BF16 base down, and dropout-0 LoRA down before per-route gradient accumulation. This fixes the worst hot-expert recompute problem without adding serial expert loops. The remaining work in this stage is grouped/tiled gradient accumulation.
+
 Modify:
 
 - `../ktransformers/kt-kernel/operators/arm/bf16_sft_moe.hpp`
-  - `recompute_route_forward()`
+  - tile-local recompute helpers:
+    - `init_backward_recompute_tile_buffers()`
+    - `fill_backward_recompute_tile()`
+    - existing grouped forward helpers called from backward
   - `backward_route_accumulate()`
   - `backward_impl_packed()`
   - Stage 2/3 GEMM helpers
   - sparse gradient merge helpers from Stage 6
 
-Intended changes:
+Implemented changes:
 
-- Replace per-route backward scalar loops with per-expert grouped matrix operations:
-  - Recompute base gate/up/down using Stage 2/3 kernels where possible.
+- Build `BackwardExpertTile` records from packed active-expert routes.
+- Cap backward OpenMP workers to `min(KT_ARM_SFT_BACKWARD_THREADS, backward_route_tiles)` so small all-to-one cases do not allocate idle tile buffers.
+- Allocate one `ForwardBuffers` tile per active backward worker with bounded route count `KT_ARM_SFT_BACKWARD_ROUTE_TILE` (default 256).
+- Fill tile-local packed BF16 inputs and route metadata from the saved cache.
+- Run existing grouped forward kernels on the tile:
+  - `compute_gate_up_base_by_expert()`
+  - `compute_gate_up_lora_by_expert()`
+  - `apply_activation_by_expert()`
+  - `compute_down_base_by_expert()`
+  - `compute_down_lora_by_expert()`
+- Keep route-local `grad_x` storage and scatter to token gradients after tile compute so duplicate routes are correct without atomics.
+- Keep `KT_ARM_SFT_BACKWARD_BASE_BACKEND=sve` as opt-in only; it regressed q2048 all-to-one from `2517.2 ms` to `5523.4 ms` in `backward_route_loop_ms`.
+- Add split profile counters:
+  - `backward_tile_recompute_ms`
+  - `backward_route_grad_accum_ms`
+
+Remaining intended changes:
+
+- Replace per-route gradient accumulation loops with tile/grouped operations:
   - `dB += U^T dY`
   - `dU += dY B^T`
   - `dA += X^T dU`
   - `dX += dU A`
   - base down/gate/up gradient-to-input paths use packed base weights.
-- Keep recompute rather than storing huge forward intermediates unless Stage 1 proves cache saves are cheaper for the target shape.
+- Keep recompute rather than storing huge forward intermediates unless a later profile proves cache saves are cheaper for the target LF shape.
 
 Risks and watch items:
 
 - Backward has more dependencies than forward; partial gradients and `grad_input` can race if partitioning is wrong.
-- Storing intermediate `gate/up/act/down/U` can reduce compute but increase memory traffic. Benchmark both for q128 and q2048 before choosing.
+- Tile recompute stores `gate/up/act/down/U` only for one worker tile, not for the full layer cache. This adds bounded scratch (`~48.8 MB` for 8 q2048 workers at tile 256) and avoids a full saved-forward cache.
+- Grouped gradient accumulation can race on sparse LoRA partials if tile ownership is not preserved. Either keep per-worker sparse partials and reduce, or partition output gradient tiles by sparse expert and parameter slice.
 - Dropout backward must reuse the exact same counter mask as forward.
 
 Validation gate:
 
-- Common correctness tests pass.
-- Dropout tests pass.
-- Synthetic q128/q2048 profiles show lower `backward_route_loop_ms` without increasing scratch bytes beyond Stage 6.
-- Qwen3 LF smoke passes validator.
+- Common correctness tests pass: `test_armbf16_sft_reference.py` 30 passed.
+- Dropout tests pass: `test_sft_lora_dropout.py` 13 passed.
+- Synthetic q128/q2048 profiles show lower `backward_route_loop_ms`:
+  - q128 all-to-one: `205.1 ms` Stage 6 to `192.2 ms` grouped recompute with worker cap.
+  - q2048 all-to-one: `4412.6 ms` route-tile scalar recompute to `2517.2 ms` grouped recompute.
+- q2048 split profile shows `backward_route_grad_accum_ms` task-sum is roughly 3.6x `backward_tile_recompute_ms`, so the next kernel work should group gradient accumulation and LoRA outer products.
+- Watch: sparse scratch estimate rose for q2048 all-to-one from `154.2 MB` route-tile scalar recompute to `202.9 MB` grouped recompute because tile-local forward buffers are now counted. This is still far below the old dense estimate (`2691.7 MB`) and bounded by tile size.
+- Qwen3 LF smoke is still pending and should run before Stage 9 acceptance.
 
 ## Stage 8: NUMA, First-Touch, Prefetch, and Tile Autotuning
 

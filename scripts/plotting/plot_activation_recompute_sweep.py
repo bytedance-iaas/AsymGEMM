@@ -180,6 +180,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", action="append", default=[], choices=list(BACKENDS))
     parser.add_argument("--router-mode", action="append", default=[], choices=["hf", "whole"])
     parser.add_argument("--expact", action="append", default=[], choices=["expact0", "expact1"])
+    parser.add_argument("--attnact", action="append", default=[], choices=["attnact0", "attnact1"])
     parser.add_argument("--profiler", action="append", default=[], choices=list(PROFILERS))
     parser.add_argument(
         "--recompute",
@@ -366,6 +367,8 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
         router_mode = "hf"
         expact_value = "false"
         expact = "expact0"
+        attnact_value = "false"
+        attnact = "attnact0"
     elif len(parts) == 5:
         backend, profiler, recompute, policy_part, router_part = parts
         if not router_part.startswith("router"):
@@ -373,6 +376,8 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
         router_mode = router_part[len("router") :]
         expact_value = "false"
         expact = "expact0"
+        attnact_value = "false"
+        attnact = "attnact0"
     elif len(parts) == 6:
         backend, profiler, recompute, policy_part, router_part, expact_part = parts
         if not router_part.startswith("router"):
@@ -382,6 +387,19 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
         if parsed_expact is None:
             return None
         expact_value, expact = parsed_expact
+        attnact_value = "false"
+        attnact = "attnact0"
+    elif len(parts) == 7:
+        backend, profiler, recompute, policy_part, router_part, expact_part, attnact_part = parts
+        if not router_part.startswith("router"):
+            return None
+        router_mode = router_part[len("router") :]
+        parsed_expact = parse_expact_part(expact_part)
+        parsed_attnact = parse_attnact_part(attnact_part)
+        if parsed_expact is None or parsed_attnact is None:
+            return None
+        expact_value, expact = parsed_expact
+        attnact_value, attnact = parsed_attnact
     else:
         return None
     if router_mode not in {"hf", "whole"}:
@@ -414,6 +432,8 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
         "activation_recompute": recompute == "recomp",
         "asymm_expert_act_offload": expact_value,
         "expact": expact,
+        "asymm_attn_act_offload": attnact_value,
+        "attnact": attnact,
         "backend": backend,
         "router_mode": router_mode,
         "profiler": profiler,
@@ -563,12 +583,25 @@ def expact_label(value: Any) -> str:
     return "expact1" if normalize_bool_config(value) == "true" else "expact0"
 
 
+def attnact_label(value: Any) -> str:
+    return "attnact1" if normalize_bool_config(value) == "true" else "attnact0"
+
+
 def parse_expact_part(part: str) -> tuple[str, str] | None:
     value = part.strip().lower()
     if value in {"expact1", "expacttrue"}:
         return "true", "expact1"
     if value in {"expact0", "expactfalse"}:
         return "false", "expact0"
+    return None
+
+
+def parse_attnact_part(part: str) -> tuple[str, str] | None:
+    value = part.strip().lower()
+    if value in {"attnact1", "attnacttrue"}:
+        return "true", "attnact1"
+    if value in {"attnact0", "attnactfalse"}:
+        return "false", "attnact0"
     return None
 
 
@@ -621,6 +654,8 @@ def passes_filters(args: argparse.Namespace, meta: dict[str, Any]) -> bool:
     if args.router_mode and meta["router_mode"] not in set(args.router_mode):
         return False
     if args.expact and meta.get("expact", "expact0") not in set(args.expact):
+        return False
+    if args.attnact and meta.get("attnact", "attnact0") not in set(args.attnact):
         return False
     if args.profiler and meta["profiler"] not in set(args.profiler):
         return False
@@ -724,6 +759,8 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         return None
     expact_value = normalize_bool_config(config.get("asymm_expert_act_offload", meta.get("asymm_expert_act_offload", "false")))
     expact = expact_label(expact_value)
+    attnact_value = normalize_bool_config(config.get("asymm_attn_act_offload", meta.get("asymm_attn_act_offload", "false")))
+    attnact = attnact_label(attnact_value)
     # Expert-policy sweeps are an AsymGEMM feature.  Zero/KT comparison runs
     # may live under policy-named directories for pairing, but the policy is not
     # applied to those backends.  Canonicalize them to one baseline series so
@@ -766,6 +803,8 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         "activation_recompute": bool(meta["activation_recompute"]),
         "asymm_expert_act_offload": expact_value,
         "expact": expact,
+        "asymm_attn_act_offload": attnact_value,
+        "attnact": attnact,
         "expert_recompute_policy_spec": expert_recompute_policy_spec,
         "expert_policy_label": expert_policy_label,
         "expert_recompute_policy": expert_recompute_policy,
@@ -914,6 +953,7 @@ def trainable_surface_comparison_key(row: dict[str, Any]) -> tuple[Any, ...]:
         row["seq_len"],
         row["router_mode"],
         row.get("expact", "expact0"),
+        row.get("attnact", "attnact0"),
         row["profiler"],
         row["mode"],
         row["expert_policy_label"],
@@ -970,6 +1010,7 @@ def collect_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["backend"],
             row["router_mode"],
             row.get("expact", "expact0"),
+            row.get("attnact", "attnact0"),
             row["profiler"],
             row["mode"],
             row["expert_recompute_policy"],
@@ -990,6 +1031,7 @@ def collect_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["backend"],
             row["router_mode"],
             row.get("expact", "expact0"),
+            row.get("attnact", "attnact0"),
             row["profiler"],
             row["seq_len"],
             row["mode"],
@@ -1132,6 +1174,7 @@ def collect_step_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["backend"],
             row["router_mode"],
             row.get("expact", "expact0"),
+            row.get("attnact", "attnact0"),
             row["profiler"],
             row["mode"],
             row["expert_recompute_policy"],
@@ -1152,6 +1195,7 @@ def collect_step_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["backend"],
             row["router_mode"],
             row.get("expact", "expact0"),
+            row.get("attnact", "attnact0"),
             row["profiler"],
             row["seq_len"],
             row["mode"],
@@ -1165,7 +1209,7 @@ def collect_step_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
     )
 
 
-def group_key(row: dict[str, Any]) -> tuple[str, str, int, float, str, str, str, str]:
+def group_key(row: dict[str, Any]) -> tuple[str, ...]:
     return (
         str(row["workload"]),
         str(row["precision"]),
@@ -1174,11 +1218,12 @@ def group_key(row: dict[str, Any]) -> tuple[str, str, int, float, str, str, str,
         str(row["backend"]),
         str(row["router_mode"]),
         str(row.get("expact", "expact0")),
+        str(row.get("attnact", "attnact0")),
         str(row["profiler"]),
     )
 
 
-def threshold_group_key(row: dict[str, Any]) -> tuple[str, str, int, float, int, str, str, str, str]:
+def threshold_group_key(row: dict[str, Any]) -> tuple[str, ...]:
     return (
         str(row["workload"]),
         str(row["precision"]),
@@ -1188,22 +1233,23 @@ def threshold_group_key(row: dict[str, Any]) -> tuple[str, str, int, float, int,
         str(row["backend"]),
         str(row["router_mode"]),
         str(row.get("expact", "expact0")),
+        str(row.get("attnact", "attnact0")),
         str(row["profiler"]),
     )
 
 
 def varied_fields(rows: list[dict[str, Any]]) -> set[str]:
-    fields = ("workload", "precision", "batch_size", "lora_dropout", "backend", "router_mode", "expact", "profiler", "mode")
+    fields = ("workload", "precision", "batch_size", "lora_dropout", "backend", "router_mode", "expact", "attnact", "profiler", "mode")
     return {field for field in fields if len({row[field] for row in rows}) > 1}
 
 
 def varied_threshold_fields(rows: list[dict[str, Any]]) -> set[str]:
-    fields = ("workload", "precision", "batch_size", "lora_dropout", "seq_len", "backend", "router_mode", "expact", "profiler", "mode")
+    fields = ("workload", "precision", "batch_size", "lora_dropout", "seq_len", "backend", "router_mode", "expact", "attnact", "profiler", "mode")
     return {field for field in fields if len({row[field] for row in rows}) > 1}
 
 
-def combined_label(group: tuple[str, str, int, float, str, str, str, str], mode: str, varied: set[str]) -> str:
-    workload, precision, batch_size, lora_dropout, backend, router_mode, expact, profiler = group
+def combined_label(group: tuple[str, ...], mode: str, varied: set[str]) -> str:
+    workload, precision, batch_size, lora_dropout, backend, router_mode, expact, attnact, profiler = group
     mode_labels = {"no_recompute": "No recompute", "recompute": "Activation recompute"}
     parts: list[str] = []
     if "workload" in varied:
@@ -1220,17 +1266,19 @@ def combined_label(group: tuple[str, str, int, float, str, str, str, str], mode:
         parts.append(f"router={router_mode}")
     if "expact" in varied:
         parts.append(expact)
+    if "attnact" in varied:
+        parts.append(attnact)
     if "profiler" in varied:
         parts.append(profiler)
     if "mode" in varied:
         parts.append(mode_labels.get(mode, mode))
     if parts:
         return " / ".join(parts)
-    return f"{backend} / router={router_mode} / {expact} / {mode_labels.get(mode, mode)}"
+    return f"{backend} / router={router_mode} / {expact} / {attnact} / {mode_labels.get(mode, mode)}"
 
 
-def combined_threshold_label(group: tuple[str, str, int, float, int, str, str, str, str], mode: str, varied: set[str]) -> str:
-    workload, precision, batch_size, lora_dropout, seq_len, backend, router_mode, expact, profiler = group
+def combined_threshold_label(group: tuple[str, ...], mode: str, varied: set[str]) -> str:
+    workload, precision, batch_size, lora_dropout, seq_len, backend, router_mode, expact, attnact, profiler = group
     mode_labels = {"no_recompute": "No layer recompute", "recompute": "Layer recompute"}
     parts: list[str] = []
     if "workload" in varied:
@@ -1249,13 +1297,15 @@ def combined_threshold_label(group: tuple[str, str, int, float, int, str, str, s
         parts.append(f"router={router_mode}")
     if "expact" in varied:
         parts.append(expact)
+    if "attnact" in varied:
+        parts.append(attnact)
     if "profiler" in varied:
         parts.append(profiler)
     if "mode" in varied:
         parts.append(mode_labels.get(mode, mode))
     if parts:
         return " / ".join(parts)
-    return f"s{seq_len} / {backend} / router={router_mode} / {expact} / {mode_labels.get(mode, mode)}"
+    return f"s{seq_len} / {backend} / router={router_mode} / {expact} / {attnact} / {mode_labels.get(mode, mode)}"
 
 
 def write_table(rows: list[dict[str, Any]], output_dir: Path, name: str) -> None:
@@ -1617,7 +1667,7 @@ def plot_combined_metric(
 ) -> None:
     import matplotlib.pyplot as plt
 
-    series: dict[tuple[tuple[str, str, int, float, str, str, str, str], str], list[dict[str, Any]]] = {}
+    series: dict[tuple[tuple[str, ...], str], list[dict[str, Any]]] = {}
     for row in rows:
         series.setdefault((group_key(row), str(row["mode"])), []).append(row)
     varied = varied_fields(rows)
@@ -1877,7 +1927,7 @@ def plot_paired_step_metric(
 
 
 def threshold_sweep_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_series: dict[tuple[tuple[str, str, int, float, int, str, str, str, str], str], set[int]] = {}
+    by_series: dict[tuple[tuple[str, ...], str], set[int]] = {}
     token_rows = [
         row
         for row in rows
@@ -1929,7 +1979,7 @@ def policy_series_suffix(row: dict[str, Any], family: str) -> int:
 
 def policy_sweep_rows(rows: list[dict[str, Any]], family: str) -> list[dict[str, Any]]:
     family_rows = policy_family_rows(rows, family)
-    by_series: dict[tuple[tuple[str, str, int, float, int, str, str, str, str], str, int], set[float]] = {}
+    by_series: dict[tuple[tuple[str, ...], str, int], set[float]] = {}
     for row in family_rows:
         key = (threshold_group_key(row), str(row["mode"]), policy_series_suffix(row, family))
         by_series.setdefault(key, set()).add(policy_sweep_x(row, family))
@@ -2088,7 +2138,7 @@ def plot_combined_threshold_metric(
 ) -> None:
     import matplotlib.pyplot as plt
 
-    series: dict[tuple[tuple[str, str, int, float, int, str, str, str, str], str], list[dict[str, Any]]] = {}
+    series: dict[tuple[tuple[str, ...], str], list[dict[str, Any]]] = {}
     for row in rows:
         series.setdefault((threshold_group_key(row), str(row["mode"])), []).append(row)
     varied = varied_threshold_fields(rows)
@@ -2252,7 +2302,7 @@ def plot_combined_policy_metric(
 ) -> None:
     import matplotlib.pyplot as plt
 
-    series: dict[tuple[tuple[str, str, int, float, int, str, str, str, str], str, int], list[dict[str, Any]]] = {}
+    series: dict[tuple[tuple[str, ...], str, int], list[dict[str, Any]]] = {}
     for row in rows:
         series.setdefault((threshold_group_key(row), str(row["mode"]), policy_series_suffix(row, family)), []).append(row)
     varied = varied_threshold_fields(rows)
@@ -2289,10 +2339,10 @@ def plot_combined_policy_metric(
     plt.close(fig)
 
 
-def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, str, int, float, str, str, str, str]) -> None:
-    workload, precision, batch_size, lora_dropout, backend, router_mode, expact, profiler = key
+def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, ...]) -> None:
+    workload, precision, batch_size, lora_dropout, backend, router_mode, expact, attnact, profiler = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}"
+    suffix = f", batch size {batch_size}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}"
     plot_paired_metric(
         rows,
         output_dir,
@@ -2341,12 +2391,12 @@ def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[s
     )
 
 
-def write_group_step_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, str, int, float, str, str, str, str]) -> None:
+def write_group_step_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, ...]) -> None:
     if not rows:
         return
-    workload, precision, batch_size, lora_dropout, backend, router_mode, expact, profiler = key
+    workload, precision, batch_size, lora_dropout, backend, router_mode, expact, attnact, profiler = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}"
+    suffix = f", batch size {batch_size}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}"
     write_table(rows, output_dir, "step_samples")
     plot_paired_step_metric(
         rows,
@@ -2384,12 +2434,12 @@ def write_group_step_plots(rows: list[dict[str, Any]], output_dir: Path, key: tu
 def write_group_threshold_plots(
     rows: list[dict[str, Any]],
     output_dir: Path,
-    key: tuple[str, str, int, float, str, str, str, str],
+    key: tuple[str, ...],
     seq_len: int,
 ) -> None:
-    workload, precision, batch_size, lora_dropout, backend, router_mode, expact, profiler = key
+    workload, precision, batch_size, lora_dropout, backend, router_mode, expact, attnact, profiler = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}"
+    suffix = f", batch size {batch_size}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}"
     plot_paired_threshold_metric(
         rows,
         output_dir,
@@ -2441,13 +2491,13 @@ def write_group_threshold_plots(
 def write_group_policy_plots(
     rows: list[dict[str, Any]],
     output_dir: Path,
-    key: tuple[str, str, int, float, str, str, str, str],
+    key: tuple[str, ...],
     seq_len: int,
     family: str,
 ) -> None:
-    workload, precision, batch_size, lora_dropout, backend, router_mode, expact, profiler = key
+    workload, precision, batch_size, lora_dropout, backend, router_mode, expact, attnact, profiler = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}"
+    suffix = f", batch size {batch_size}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}"
     name = policy_filename_suffix(family)
     title = {
         "tok": "expert token threshold",
@@ -2783,18 +2833,18 @@ def main() -> None:
         write_combined_step_plots(step_rows, combined_dir)
 
     if not args.combined_only:
-        groups: dict[tuple[str, str, int, float, str, str, str, str], list[dict[str, Any]]] = {}
+        groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
         for row in seq_rows:
             groups.setdefault(group_key(row), []).append(row)
-        step_groups: dict[tuple[str, str, int, float, str, str, str, str], list[dict[str, Any]]] = {}
+        step_groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
         for row in step_rows:
             step_groups.setdefault(group_key(row), []).append(row)
         for key in sorted(set(groups) | set(step_groups)):
             group_rows = groups.get(key, [])
             group_step_rows = step_groups.get(key, [])
-            workload, precision, batch_size, lora_dropout, backend, router_mode, expact, profiler = key
+            workload, precision, batch_size, lora_dropout, backend, router_mode, expact, attnact, profiler = key
             group_dir = root / safe_label(
-                f"{workload}-b{batch_size}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}"
+                f"{workload}-b{batch_size}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}"
             )
             if group_rows:
                 write_table(group_rows, group_dir, "sweep_summary")
@@ -2811,14 +2861,14 @@ def main() -> None:
             write_combined_policy_plots(family_rows, combined_dir, family)
         if args.combined_only:
             continue
-        family_groups: dict[tuple[tuple[str, str, int, float, str, str, str, str], int], list[dict[str, Any]]] = {}
+        family_groups: dict[tuple[tuple[str, ...], int], list[dict[str, Any]]] = {}
         for row in family_rows:
             family_groups.setdefault((group_key(row), int(row["seq_len"])), []).append(row)
         suffix = policy_filename_suffix(family)
         for (key, seq_len), group_rows in sorted(family_groups.items()):
-            workload, precision, batch_size, lora_dropout, backend, router_mode, expact, profiler = key
+            workload, precision, batch_size, lora_dropout, backend, router_mode, expact, attnact, profiler = key
             group_dir = root / safe_label(
-                f"{workload}-b{batch_size}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}"
+                f"{workload}-b{batch_size}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}"
             )
             write_table(group_rows, group_dir, f"{suffix}_summary_s{seq_len}")
             write_group_policy_plots(group_rows, group_dir, key, seq_len, family)

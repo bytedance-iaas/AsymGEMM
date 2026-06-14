@@ -1,6 +1,6 @@
-# Llama4 LF LoRA-SFT Memory Status
+# LF LoRA-SFT Memory Status
 
-Date: 2026-06-11
+Date: 2026-06-14
 
 Model: `meta-llama/Llama-4-Scout-17B-16E`
 
@@ -158,6 +158,29 @@ Comparison to `zero3_offload` at `b4_s8192`:
 | current `asym` `all` | +22.97 GiB | -120.5s, 28.5% faster |
 
 There is no matching `b4_s8192` SuperOffload source artifact in the current profiling tree. The available SuperOffload source artifact is `b4_s7168`.
+
+## Qwen3 Attention and Expert Activation Offload Snapshot
+
+Run: `Qwen/Qwen3-30B-A3B`, `b4_s4096`, `drop000`, `warmup=5`, `measure=10`, source profiler, memory attribution/breakdown/snapshot disabled.
+
+Artifact root:
+
+`/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/reports/attn_act_offload/lf_memory_b4_post_s4_compare/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a16_drop000`
+
+| Backend spec | Policy | Implementation | Peak allocated HBM | Peak reserved HBM | Avg step | Avg forward | Avg backward |
+|---|---|---|---:|---:|---:|---:|---:|
+| `asym_cpuadamwds|norecomp` | `none|true|true` | expert + attention activation offload | 58.343 GiB | 63.406 GiB | 46.161s | 11.393s | 34.623s |
+| `asym_cpuadamwds|norecomp` | `none|true|false` | expert activation offload only | 102.312 GiB | 107.547 GiB | 42.197s | 9.626s | 32.462s |
+| `asym_cpuadamwds|norecomp` | `gc-exp|false|false` | expert checkpoint baseline | 126.312 GiB | 131.414 GiB | 3.835s | 1.430s | 2.342s |
+| `asym_cpuadamwds|norecomp` | `none|false|false` | no expact/no recompute | 170.525 GiB | 179.990 GiB | 3.037s | 1.429s | 1.551s |
+| `asym_cpuadamwds|recomp` | `none|false|false` | global gradient checkpointing | 37.422 GiB | 43.016 GiB | 4.356s | 1.413s | 2.890s |
+| `zero3_offload|recomp` | `none|false|false` | ZeRO-3 offload + global GC | 33.009 GiB | 38.229 GiB | 2.575s | 0.944s | 1.579s |
+
+Validation notes:
+
+- The `asym_cpuadamwds|recomp` row is the real AsymGEMM CPU-Adam/global-GC baseline for `none|false|false`.
+- The `zero3_offload|recomp` row completed and wrote a source profile, but the post-run trainable-surface guard failed. It logged only attention LoRA modules (`q_proj`, `k_proj`, `v_proj`, `o_proj`) with 53,477,376 trainable params and no captured expert LoRA, while the Asym rows train 3,375,366,144 LoRA params including 3,321,888,768 expert LoRA params. Treat this row as a measured historical artifact, not an accepted apples-to-apples baseline.
+- The attention activation offload rows materially reduce HBM, but their current latency is not acceptable: they reduce memory by tens of GiB while increasing step time to about 42-46s. They should not be accepted as production changes until the fetch/backward path is redesigned.
 
 ## Interpretation
 

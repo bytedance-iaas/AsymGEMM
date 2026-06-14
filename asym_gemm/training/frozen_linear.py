@@ -56,6 +56,11 @@ class AsymExecutionStats:
     expact_lora_a_grad_grouped_calls: int = 0
     expact_lora_b_backward_grouped_calls: int = 0
     expact_stage_low_rank_calls: int = 0
+    attn_act_base_dx_calls: int = 0
+    attn_act_lora_a_forward_calls: int = 0
+    attn_act_lora_a_grad_calls: int = 0
+    attn_act_stage_low_rank_calls: int = 0
+    attn_act_hbm_gemm_calls_by_tag: Dict[str, int] = field(default_factory=dict)
     reference_fallback_count: int = 0
     fallback_reasons: Dict[str, int] = field(default_factory=dict)
 
@@ -954,6 +959,84 @@ def _dispatch_nt(
         else:
             stats.torch_dx_calls += 1
     return _torch_nt(a, b_cpu, transpose_b=transpose_b)
+
+
+def _record_attention_cpu_right_call(
+    stats: Optional[AsymExecutionStats],
+    *,
+    phase: str,
+    tag: str,
+) -> None:
+    if stats is None:
+        return
+    phase_text = str(phase)
+    if phase_text in {"attn_act_base_dx", "base_dx"}:
+        stats.attn_act_base_dx_calls += 1
+    elif phase_text in {"attn_act_dA", "lora_a_grad"}:
+        stats.attn_act_lora_a_grad_calls += 1
+    if tag:
+        stats.attn_act_hbm_gemm_calls_by_tag[tag] = stats.attn_act_hbm_gemm_calls_by_tag.get(tag, 0) + 1
+
+
+def asym_bf16_cpu_right_matmul(
+    left: torch.Tensor,
+    right_cpu: torch.Tensor,
+    *,
+    transpose_b: bool = False,
+    backend: str = "asym",
+    stats: Optional[AsymExecutionStats] = None,
+    phase: str = "attn_act",
+    tag: str = "",
+    compiled_dims: str = "mnk",
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Run a BF16 matmul with a CPU-resident right operand.
+
+    This is the narrow public wrapper used by attention activation offload.
+    `backend="asym"` requires the direct pinned-CPU BF16 AsymGEMM path;
+    `backend="torch"` is a correctness fallback for focused tests.
+    """
+
+    _check_backend(backend)
+    if left.dim() != 2 or right_cpu.dim() != 2:
+        raise ValueError(f"asym_bf16_cpu_right_matmul expects 2D operands, got {tuple(left.shape)} and {tuple(right_cpu.shape)}")
+    if left.dtype != torch.bfloat16 or right_cpu.dtype != torch.bfloat16:
+        raise ValueError("asym_bf16_cpu_right_matmul expects BF16 operands")
+    if right_cpu.device.type != "cpu":
+        raise ValueError(f"right operand must be CPU-resident, got {right_cpu.device}")
+    if not left.is_contiguous() or not right_cpu.is_contiguous():
+        raise ValueError("asym_bf16_cpu_right_matmul expects contiguous operands")
+    if transpose_b:
+        if int(left.shape[1]) != int(right_cpu.shape[0]):
+            raise ValueError(f"shape mismatch for transpose_b=True: {tuple(left.shape)} vs {tuple(right_cpu.shape)}")
+    elif int(left.shape[1]) != int(right_cpu.shape[1]):
+        raise ValueError(f"shape mismatch for transpose_b=False: {tuple(left.shape)} vs {tuple(right_cpu.shape)}")
+    if backend == "asym":
+        reason = _direct_bf16_reason(left, right_cpu, transpose_b=transpose_b)
+        if reason is not None:
+            raise RuntimeError(
+                _asym_unavailable_message(
+                    precision="bf16",
+                    reason=reason,
+                    grouped=False,
+                    phase=phase,
+                    transpose_b=transpose_b,
+                )
+            )
+    out = _dispatch_nt(
+        left,
+        right_cpu,
+        backend=backend,
+        stats=stats,
+        phase=phase,
+        compiled_dims=compiled_dims,
+        transpose_b=transpose_b,
+        precision="bf16",
+        profile_label=tag,
+        bf16_output_dtype=output_dtype,
+    )
+    _record_attention_cpu_right_call(stats, phase=phase, tag=tag)
+    return out
 
 
 def _dispatch_grouped_nt(
