@@ -1310,7 +1310,7 @@ LORA_DROPOUT=0.00 \
 SEQ_LENS=4096 \
 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
 MAX_STEPS=1 \
-WARMUP_STEPS=0 \
+WARMUP_STEPS=5 \
 PROFILE_MEMORY_ATTRIBUTION=true \
 PROFILE_MEMORY_BREAKDOWN=true \
 PROFILE_MEMORY_SNAPSHOT=true \
@@ -1406,6 +1406,141 @@ Executed S4 result, 2026-06-13:
   workspace rewrite is selected without a follow-up attribution run and explicit
   user approval.
 - Mandatory pause honored: stop here; no S5+ implementation starts in this run.
+
+Post-S4 continuation after user approval, 2026-06-13:
+
+- Added source-profile activation-offload extraction in
+  `scripts/lf/run_lf_profiled_train.py`. The profile now records per-module
+  `_last_activation_offload_stats`, pre-release stats, CPU live/peak bytes,
+  stage peak bytes, CPU pool cached/limit bytes, cleanup bytes, and module
+  `stats.as_dict()` when present. Empty stats dicts are skipped so the LF JSON
+  focuses on modules that actually ran expact.
+- Hardened existing `PROFILE_MEMORY_SNAPSHOT=true` capture with a
+  version-compatible `_record_memory_history(max_entries=200000,
+  stacks="python", context="all")` path and fallback.
+- Added a torch-free snapshot analyzer:
+  `scripts/testing/analyze_cuda_memory_snapshot.py`. It replays
+  `memory_snapshot.pickle` `device_traces` to reconstruct the true peak live-set
+  and attributes large live blocks by Python frame/component. This is for
+  resolving inferred/residual workspace before any future rewrite.
+- Added tests:
+  `tests/test_lf_memory_breakdown.py::test_source_profile_reports_activation_offload_counters`
+  and `tests/testing/test_analyze_cuda_memory_snapshot.py`.
+- Passed:
+  `PYTHONPATH="$PWD" .venv/bin/python -m pytest -q tests/testing/test_analyze_cuda_memory_snapshot.py`
+  (`2 passed`);
+  `PYTHONPATH="$PWD" .venv/bin/python -m pytest -q tests/test_lf_memory_breakdown.py::test_source_profile_reports_activation_offload_counters`
+  (`1 passed`);
+  `PYTHONPATH="$PWD" .venv/bin/python -m pytest -q tests/training/test_lf_qwen3_asym_backend.py::test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend`
+  (`1 passed`).
+
+Single-policy diagnostic run used for the S5/S6/S8 decision:
+
+```bash
+OUTPUT_ROOT="$PWD/outputs/expact_v3_attr_after_profile_fields_20260614T024939Z" \
+SFT_ROOT=/workspace/AsymGEMM-SFT \
+GPU_POOL=0 \
+MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
+BACKEND_SPECS="asym_cpuadamwds|norecomp" \
+PROFILERS=source \
+ASYMM_EXP_ACT_POLICIES="none|true" \
+ASYM_OFFLOAD_MODULES=all \
+ASYM_EXPACT_CPU_POOL_MAX_BYTES=$((32 * 1024 * 1024 * 1024)) \
+LORA_DROPOUT=0.00 \
+SEQ_LENS=4096 \
+PER_DEVICE_TRAIN_BATCH_SIZE=4 \
+MAX_STEPS=1 \
+WARMUP_STEPS=5 \
+PROFILE_MEMORY_ATTRIBUTION=true \
+PROFILE_MEMORY_BREAKDOWN=true \
+PROFILE_MEMORY_SNAPSHOT=false \
+PROFILE_MEMORY_BREAKDOWN_INTERVAL=1 \
+PROFILE_LEVEL=op \
+PLOT=false \
+RUN_POST=false \
+CONTINUE_ON_ERROR=false \
+scripts/lf/profile_lora_lf.sh --gpus 0
+```
+
+Diagnostic profile path:
+
+```text
+outputs/expact_v3_attr_after_profile_fields_20260614T024939Z/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s1_r64_a16_drop000/asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact1/b4_s4096/source_profile.json
+```
+
+Diagnostic result, not a replacement for the no-hook acceptance baseline:
+
+- peak allocated/reserved:
+  `102.31187963485718 GiB` / `107.46875 GiB`
+- timing:
+  `45.147 s` step, `10.731 s` forward, `34.417 s` backward
+- counts:
+  `asym_forward_calls=2022`, `asym_dx_calls=1716`,
+  `reference_fallback_count=0`
+- activation-offload rows:
+  48 Qwen expert rows after filtering
+- post-backward CPU ownership:
+  `total_cpu_owned_bytes=0`, `total_cpu_live_bytes=0`,
+  `total_final_cleanup_released_bytes=0`
+- CPU pool:
+  cached peak `34359738368` bytes (`32 GiB`), equal to the configured cap
+- per-layer CPU live peak:
+  `1577058304` bytes (`1.46875 GiB`)
+- per-layer max HBM stage:
+  `419430400` bytes (`0.390625 GiB`)
+- max HBM stage tags:
+  `act_for_down_base=201326592` bytes (`192 MiB`),
+  `dgate_up_for_gate_up_base=402653184` bytes (`384 MiB`),
+  `S_gate_for_dB=16777216` bytes,
+  `S_up_for_dB=16777216` bytes,
+  `S_down_for_dB=16777216` bytes
+
+Memory breakdown at the actual peak:
+
+- actual peak:
+  `after_backward`, step `6`,
+  `109856544256` bytes allocated,
+  `115393691648` bytes reserved,
+  closure error `0`
+- saved activations at peak:
+  `83123783180` bytes (`77.415 GiB`)
+- live activations at peak:
+  `5045747712` bytes (`4.699 GiB`)
+- temporary/workspace residual at peak:
+  `8185548276` bytes (`7.623 GiB`)
+- largest GPU-HBM rows:
+  `norms:saved_activation=51.112 GiB`,
+  `attention:saved_activation=16.971 GiB`,
+  `loss:saved_activation=9.274 GiB`,
+  `routed_experts:weight=6.188 GiB`,
+  `routed_experts:grad=6.188 GiB`,
+  `routed_experts:inferred_peak_workspace=5.793 GiB`,
+  `lm_head:live_activation=4.637 GiB`
+- routed-expert saved activations after S3:
+  only `63013632` bytes (`~60 MiB`), so the old route-expanded scatter tensor
+  is gone from saved activations.
+
+Decision from this continuation:
+
+- Stage 5 precondition is false. `dgate_up_for_gate_up_base` is a local
+  per-layer `384 MiB` stage, not the global peak owner. Removing it now would
+  repeat the v2 failure mode: more CPU-source work and likely more latency,
+  with little or no active LF peak-HBM movement.
+- Stage 6 precondition is false. The diagnostic did not identify full LoRA-A
+  accumulator scratch as a peak owner.
+- Stage 8 has a possible but unresolved target:
+  `routed_experts:inferred_peak_workspace=5.793 GiB`. This is inferred from
+  peak-growth residual, not an exact live tensor. Do not rewrite kernels against
+  this residual until `PROFILE_MEMORY_SNAPSHOT=true` plus
+  `scripts/testing/analyze_cuda_memory_snapshot.py` identifies exact live
+  blocks or a tighter expert-block profiler explains it.
+- A follow-up 1M-entry snapshot run below resolves the Stage 8 uncertainty:
+  the inferred routed-expert workspace row is not an exact routed-expert
+  activation/workspace owner. Current `next_target=none_for_expert_hbm`.
+  Expert-side HBM work should stop for this workflow unless future evidence
+  proves a new exact routed-expert live tensor at the active peak. Latency work
+  remains allowed only at flat/lower HBM and must use grouped/native tile-reuse
+  kernels, not v2-style call-count-only changes.
 
 ## Stage 5: Integrated Gate/Up Backward Redesign, Conditional Only
 
@@ -1598,6 +1733,16 @@ Stage 5 passes only if:
 - active LF `none|true` meaningfully lowers peak HBM without material latency
   blow-up, or improves latency with flat/lower HBM
 
+Executed status after post-S4 continuation, 2026-06-13:
+
+- Skipped. The measured precondition is false:
+  `dgate_up_for_gate_up_base` peaks at only `402653184` bytes (`384 MiB`) per
+  active layer, while the global peak is dominated by non-expert saved
+  activations and persistent routed-expert weights/grads.
+- Do not implement the integrated gate/up rewrite until a future snapshot or
+  expert-block profile proves this tensor is exact peak-live and large enough
+  to move the active LF peak.
+
 ## Stage 6: Conditional LoRA-A Accumulator Tiling
 
 ### Why This Stage Is Needed
@@ -1719,6 +1864,13 @@ Stage 6 passes only if:
 - grouped kernel counts remain bounded and do not scale with expert count
 - active LF peak HBM drops meaningfully, or latency improves with flat/lower HBM
 
+Executed status after post-S4 continuation, 2026-06-13:
+
+- Skipped. The measured precondition is false: no full LoRA-A accumulator
+  workspace is identified as the active peak owner.
+- Revisit only if the snapshot analyzer or a future native-kernel profile
+  shows an exact LoRA-A accumulator/scratch block at the peak.
+
 ## Stage 7: Deferred Native Paired Gate/Up Tile Reuse
 
 ### Why This Stage Is Needed
@@ -1826,6 +1978,15 @@ Stage 7 passes only if:
 - do not keep paired scheduling if it only reduces call/source-byte counters
   while full-workflow memory stays flat and latency regresses
 - Qwen3 expact remains numerically matched to the torch backend
+
+Executed status after post-S4 continuation, 2026-06-13:
+
+- Deferred. The active memory target passed, but there is not yet isolated
+  NCU/native evidence that repeated gate/up CPU-source reads are the dominant
+  latency bottleneck.
+- The only acceptable future Stage 7 implementation is a true native paired
+  tile-reuse schedule. Do not re-land the v2 wrapper that hides two independent
+  passes or improves call counts without improving active LF latency.
 
 ## Stage 8: Hidden Materialization And Workspace Cleanup
 
@@ -1946,7 +2107,7 @@ LORA_DROPOUT=0.00 \
 SEQ_LENS=4096 \
 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
 MAX_STEPS=1 \
-WARMUP_STEPS=0 \
+WARMUP_STEPS=5 \
 PROFILE_MEMORY_ATTRIBUTION=true \
 PROFILE_MEMORY_BREAKDOWN=true \
 PROFILE_MEMORY_SNAPSHOT=true \
@@ -1962,6 +2123,79 @@ Stage 8 passes only if:
 - `max_stage_bytes_live` is bounded and does not include full activation stages
 - source profile distinguishes expert-block peak from loss/cross-entropy peak
 - grouped call counts remain bounded
+
+Executed status after post-S4 continuation, 2026-06-13:
+
+- Measurement-side work completed: activation-offload counters are now in the
+  LF source profile, empty stats rows are filtered, and the torch-free snapshot
+  analyzer exists.
+- No memory rewrite landed. The initial remaining routed-expert workspace row
+  was inferred residual (`5.793 GiB`), not an exact tensor/workspace identity.
+  The required snapshot diagnostic was run after adding
+  `ASYM_GEMM_LF_PROFILE_MEMORY_SNAPSHOT_MAX_ENTRIES` support:
+
+```bash
+OUTPUT_ROOT="$PWD/outputs/expact_v3_stage8_snapshot1m_b4s4096_20260614T032030Z" \
+GPU_POOL=0 \
+MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
+BACKEND_SPECS="asym_cpuadamwds|norecomp" \
+PROFILERS=source \
+ASYMM_EXP_ACT_POLICIES="none|true" \
+ASYM_OFFLOAD_MODULES=all \
+ASYM_EXPACT_CPU_POOL_MAX_BYTES=$((32 * 1024 * 1024 * 1024)) \
+LORA_DROPOUT=0.00 \
+SEQ_LENS=4096 \
+PER_DEVICE_TRAIN_BATCH_SIZE=4 \
+MAX_STEPS=1 \
+WARMUP_STEPS=5 \
+PROFILE_MEMORY_ATTRIBUTION=true \
+PROFILE_MEMORY_BREAKDOWN=true \
+PROFILE_MEMORY_BREAKDOWN_INTERVAL=1 \
+PROFILE_MEMORY_SNAPSHOT=true \
+ASYM_GEMM_LF_PROFILE_MEMORY_SNAPSHOT_MAX_ENTRIES=1000000 \
+PLOT=false \
+RUN_POST=false \
+CONTINUE_ON_ERROR=false \
+/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh --gpus 0
+
+PYTHONPATH="$PWD" .venv/bin/python scripts/testing/analyze_cuda_memory_snapshot.py \
+  --snapshot "outputs/expact_v3_stage8_snapshot1m_b4s4096_20260614T032030Z/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s1_r64_a16_drop000/asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact1/b4_s4096/memory_snapshot.pickle" \
+  --device 0 \
+  --top 80 \
+  --min-bytes 0 \
+  --output-json outputs/expact_v3_stage8_snapshot1m_b4s4096_20260614T032030Z/peak_snapshot_attrib_allblocks.json \
+  --output-md outputs/expact_v3_stage8_snapshot1m_b4s4096_20260614T032030Z/peak_snapshot_attrib_allblocks.md
+```
+
+- Snapshot result:
+  - source peak allocated/reserved:
+    `109856544256` bytes (`102.31187963485718 GiB`) /
+    `115393691648` bytes (`107.46875 GiB`)
+  - analyzer replay peak:
+    `102.31178478710353 GiB`, matching source peak within allocator rounding
+  - trace:
+    `443541` events, `max_entries=1000000`, `unknown_free_events=0`
+  - activation-offload:
+    48 rows, `total_cpu_live_bytes=0`,
+    `max_stage_bytes_live=419430400`,
+    CPU pool cached `34359738368` bytes
+  - analyzer buckets at peak:
+    `norms=54.112 GiB`,
+    `allocator_unframed=18.578 GiB`,
+    `other_python=14.196 GiB`,
+    `loss=9.273 GiB`,
+    `attention=6.094 GiB`,
+    `routed_experts=0.059 GiB`
+  - top exact routed-expert frame:
+    `qwen3_moe.py:2578:forward`, `0.059 GiB`; no full
+    `act_for_down_base`, `dgate_up_for_gate_up_base`, route-expanded scatter,
+    or LoRA-A accumulator block owns the global peak.
+
+- Stage 8 verdict: no accepted expert-side HBM rewrite remains. The active
+  `none|true` memory result is already dominated by non-expert norm/loss/
+  attention activations plus real LoRA params/grads and unframed allocator
+  blocks. Continue only latency work at flat/lower HBM, or broaden scope to
+  non-expert activation memory if a lower absolute peak is required.
 
 ## Stage 9: Final Fair Comparison And CPU Adam Acceptance
 

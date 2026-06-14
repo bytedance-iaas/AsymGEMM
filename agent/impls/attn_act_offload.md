@@ -1,707 +1,465 @@
 # Attention Activation Offload Implementation Plan
 
-`agent/attn_math.md` is the source of truth. If this plan conflicts with that
-file, fix this plan. The goal is to implement projection-side attention LoRA
-activation offload without changing SDPA, FlashAttention, eager attention, or
-their backward kernels.
+`agent/attn_math.md` is the source of truth. This plan implements only
+projection-side attention activation offload for q/k/v/o LoRA leaves. Do not
+change SDPA, FlashAttention, eager attention, RoPE/NoPE, q/k norm, qk_norm,
+attention masks, KV-cache semantics, or attention-core backward in v1.
 
-## Target
-
-```text
-Models:
-  Qwen3 / Qwen3-MoE text attention
-  Llama4 text attention
-
-Wrapped leaves:
-  q_proj, k_proj, v_proj, o_proj
-
-Required conditions:
-  component == "attention"
-  projection is selected for LoRA
-  projection base weight is CPU-resident HostWeight
-  backend == "asym"
-  precision == "bf16"
-  ASYMM_ATTN_ACT_OFFLOAD=1
-
-Unchanged:
-  q/k norm
-  RoPE/NoPE
-  qk_norm
-  NoPE temperature
-  attention masks
-  attention dropout
-  KV-cache semantics
-  SDPA/FlashAttention/eager attention forward/backward
-```
-
-This is a projection-leaf feature. Do not build a monolithic custom attention
-autograd Function in v1. The wrapper returns Q, K, V, or final Y; normal
-Transformers/PyTorch autograd owns everything between those projection leaves.
-
-The expected memory win over attention-side gradient checkpointing is on the
-projection/LoRA side: checkpointing recomputes q/k/v/o branches and rematerializes
-projection intermediates, while this design keeps wide projection sources and
-low-rank saved values CPU-resident and fetches CPU operands through AsymGEMM.
-If the remaining peak is dominated by SDPA/FlashAttention internal state, that
-is a separate stage and must be measured separately.
-
-## Existing Code To Reuse
+Hard contract:
 
 ```text
-asym_gemm/training/activation_offload.py
-  CPUActivationHandle
-  ActivationOffloadManager
-  ActivationOffloadStats
+Target leaves: q_proj, k_proj, v_proj, o_proj
+Required gate: ASYMM_ATTN_ACT_OFFLOAD=1
+Required wrapper case: component == "attention", selected CPU base offload,
+  selected LoRA target, backend == "asym", precision == "bf16"
 
-asym_gemm/training/frozen_linear.py
-  AsymFrozenLinear
-  HostWeight dispatch and transpose_b dx path
+Profiling comparison axis:
+  ASYMM_EXP_ACT_POLICIES items are exactly:
+    EXPERT_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD
+  Required comparison entries:
+    none|false|false
+    gc-exp|false|false
+    gc-attn-exp|false|false
+    none|true|false
+    none|true|true
+  gc-exp means selective expert torch checkpointing only.
+  gc-attn-exp means selective text-attention torch checkpointing plus
+    selective expert torch checkpointing. It must not enable global LF
+    gradient_checkpointing.
 
-asym_gemm/training/lora.py
-  AsymLoRALinear public API, adapter naming, init, state dict conventions
+Per wrapped projection forward:
+  1 base CPU-right AsymGEMM:  U @^R W_cpu.T
+  1 LoRA-A CPU-left AsymGEMM: U_drop_cpu @^L A.T
+  1 LoRA-B HBM GEMM:          S @ B.T
 
-asym_gemm/integrations/lf.py
-  parse_lf_offload_modules(...)
-  classify_lf_component(...)
-  _wrap_lf_linear_leaf(...)
-  apply_lf_asym_lora(...)
+Per wrapped projection backward:
+  1 base dx CPU-right AsymGEMM: dZ @^R W_cpu
+  1 dS HBM GEMM:                dZ @ B
+  1 LoRA input HBM GEMM:        dS @ A
+  1 dA CPU-right AsymGEMM:      dS.T @^R U_drop_cpu
+  1 dB HBM GEMM with staged S:  dZ.T @ stage(S_cpu)
 ```
 
-Reuse `ActivationOffloadManager`; do not add a second activation manager.
-Extend counters only when the validation artifacts need a missing field.
-
-## Files
-
-Add:
-
-```text
-asym_gemm/training/attention_activation_offload.py
-tests/training/test_attention_activation_offload_helpers.py
-tests/training/test_attention_activation_offload_lora.py
-scripts/testing/validate_attention_activation_offload.py
-```
-
-Modify:
-
-```text
-asym_gemm/training/frozen_linear.py
-asym_gemm/integrations/lf.py
-scripts/lf/run_lf_lora_sft.sh
-scripts/lf/profile_lora_lf.sh
-```
-
-## Public CPU-Right Helper
-
-Add this helper in `asym_gemm/training/frozen_linear.py` and use it from the
-attention wrapper. Do not call private `_dispatch_nt(...)` directly from
-`attention_activation_offload.py`.
-
-```python
-def hbm_cpu_matmul(
-    left_hbm: torch.Tensor,
-    right_cpu: torch.Tensor,
-    *,
-    transpose_b: bool = False,
-    backend: str = "asym",
-    stats: AsymExecutionStats | None = None,
-    phase: str = "forward",
-    compiled_dims: str = "mnk",
-    precision: str = "bf16",
-    profile_label: str = "",
-    bf16_output_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor: ...
-```
-
-Semantics:
-
-```text
-transpose_b=False: left_hbm @ right_cpu.T
-  left_hbm [M_left,K] HBM contiguous bf16
-  right_cpu [N,K] CPU contiguous pinned bf16
-  out [M_left,N] HBM
-
-transpose_b=True: left_hbm @ right_cpu
-  left_hbm [M_left,K] HBM contiguous bf16
-  right_cpu [K,N] CPU contiguous pinned bf16
-  out [M_left,N] HBM
-```
-
-Validation rules:
-
-```text
-left_hbm must be CUDA, 2D, contiguous
-right_cpu must be CPU, 2D, contiguous
-right_cpu must be pinned when direct AsymGEMM is required
-precision must be bf16
-left_hbm and right_cpu must be bf16
-shape checks must account for transpose_b
-backend="asym" fails loudly on unsupported direct-kernel shapes
-backend="torch" may fallback for tests and must be counted
-```
-
-Do not route arbitrary CPU activation operands through fp8/fp4 quantized
-HostWeight paths. Those paths are for persistent frozen weights, not saved
-activation tensors.
-
-## New Module API
-
-Implement `asym_gemm/training/attention_activation_offload.py`:
-
-```python
-class AttentionActivationOffloadContext: ...
-
-class AsymActivationOffloadLoRALinear(nn.Module): ...
-
-class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function): ...
-```
-
-Helper functions:
-
-```python
-def _flatten_last_dim(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]: ...
-def _restore_last_dim(x_2d: torch.Tensor, input_shape: tuple[int, ...], out_features: int) -> torch.Tensor: ...
-def _row_major_from_transposed(x_t: torch.Tensor) -> torch.Tensor: ...
-def _pad_cpu_rows_to(handle_or_tensor: CPUActivationHandle | torch.Tensor, rows: int, tag: str) -> CPUActivationHandle: ...
-def _pad_hbm_columns_to(x: torch.Tensor, cols: int, tag: str) -> torch.Tensor: ...
-def _cpu_dropout_forward(...): ...
-def _apply_dropout_grad_hbm(...): ...
-```
-
-`AsymActivationOffloadLoRALinear` owns:
-
-```text
-base_layer: AsymFrozenLinear
-lora_A/lora_B: ModuleDict with the same adapter naming as AsymLoRALinear
-active_adapter
-lora_dtype
-lora_dropout_p
-scaling = lora_alpha / rank
-projection_role: q_proj | k_proj | v_proj | o_proj
-activation_manager: ActivationOffloadManager
-attention_context: AttentionActivationOffloadContext | None
-```
-
-It must support `from_host_weight(...)` with the same base arguments as
-`AsymLoRALinear.from_host_weight(...)`, plus:
-
-```text
-projection_role
-activation_manager
-attention_context
-```
-
-The custom Function must receive the input tensor, LoRA A weight, and LoRA B
-weight as tensor arguments. Do not only stash A/B on `ctx`; returned `dA` and
-`dB` must attach to the trainable parameters.
-
-Frozen base bias, if present, is preserved in forward and remains frozen. The
-LF path must not add any non-LoRA trainable parameter.
-
-## Projection Forward
-
-Implement exactly the primitive in `agent/attn_math.md`:
-
-```text
-X_2d = flatten_last_dim(X)                              # [M,in] HBM
-base = AsymFrozenLinear(X_2d, W_cpu, frozen_bias)        # [M,out] HBM
-
-X_cpu = offload_or_share_source(X_2d)                    # [M,in] CPU
-X_drop_cpu, mask_cpu = D(X_cpu)                          # [M,in] CPU
-
-M_fwd = align_up(M, 8)
-X_fwd_cpu = pad_rows(X_drop_cpu, M_fwd)                  # [M_fwd,in] CPU
-S_T_pad = hbm_cpu_matmul(A, X_fwd_cpu, transpose_b=False)# [r,M_fwd] HBM
-S_T = S_T_pad[:, :M]                                     # [r,M] HBM
-S = row_major(S_T.T)                                     # [M,r] HBM
-S_cpu = offload(S)                                       # [M,r] CPU
-
-delta = scale * (S @ B.T)                                # [M,out] HBM
-Y = restore_last_dim(base + delta)
-```
-
-Saved state:
-
-```text
-CPU source handle
-optional CPU dropout mask handle
-CPU S handle
-input shape/dtype
-projection role
-scale, p, M, in, out, rank
-base HostWeight metadata
-LoRA A/B tensors through autograd
-```
-
-Do not save these HBM tensors on ctx:
-
-```text
-X_2d
-X_drop
-S
-S_T
-base
-delta
-```
-
-## Projection Backward
-
-Implement exactly the primitive in `agent/attn_math.md`:
-
-```text
-dY_2d = flatten_last_dim(dY)                             # [M,out] HBM
-
-dX_base = dY_2d @^R W_cpu                                # [M,in] HBM
-dS = scale * (dY_2d @ B)                                 # [M,r] HBM
-dX_lora_raw = dS @ A                                     # [M,in] HBM
-dX_lora = D_bar(dX_lora_raw, saved_mask)                 # [M,in] HBM
-dX = dX_base + dX_lora                                   # [M,in] HBM
-
-X_drop_cpu = recompute D(X_cpu)                          # [M,in] CPU
-M_grad = align_up(M, 64)
-X_grad_cpu = pad_rows(X_drop_cpu, M_grad)                # [M_grad,in] CPU
-dS_T = pad_cols(row_major(dS.T), M_grad)                 # [r,M_grad] HBM
-dA = hbm_cpu_matmul(dS_T, X_grad_cpu, transpose_b=True)  # [r,in] HBM
-
-S_stage = stage(S_cpu)                                   # [M,r] HBM
-dB = scale * (dY_2d.T @ S_stage)                         # [out,r] HBM
-release_stage(S_stage)
-```
-
-Important details:
-
-```text
-row_major(dS.T) must be materialized before hbm_cpu_matmul
-dY_2d.T may be a normal torch GEMM operand for dB; no CPU-right dB in v1
-dropout backward must use the saved mask, not a new RNG draw
-restore dX to the original input shape before returning
-return gradients only for input, A, and B tensor arguments
-```
-
-## Dropout
-
-Supported range:
-
-```text
-0 <= lora_dropout_p < 1
-```
-
-For `p == 0`, no mask is saved. For `0 < p < 1`, generate a branch-local CPU
-mask for each projection invocation, save the exact mask, and apply inverted
-dropout consistently in:
-
-```text
-forward LoRA-A input
-backward dX_lora
-backward dA recompute
-```
-
-CPU-generated masks do not need to reproduce the old CUDA RNG stream. They must
-preserve inverted-dropout semantics and validate against a masked reference.
-
-Every CPU handle created for masks or padding must preserve the intended HBM
-staging device. Do not call `adopt_cpu(...)` for CUDA-bound tensors without
-setting the original device metadata needed by `ActivationOffloadManager.stage`.
-
-## Q/K/V Source Sharing
-
-Implement `AttentionActivationOffloadContext` after the single-projection
-wrapper is correct. q/k/v wrappers for the same attention module should share
-one CPU source activation handle when they receive the same hidden-state tensor.
-
-Cache key, computed before per-leaf contiguous materialization:
-
-```text
-(
-  x.device,
-  x.untyped_storage().data_ptr(),
-  x.storage_offset(),
-  tuple(x.shape),
-  tuple(x.stride()),
-  x.dtype,
-)
-```
-
-Rules:
-
-```text
-q/k/v share only the source X_cpu
-q/k/v keep independent dropout masks
-q/k/v keep independent S_q_cpu/S_k_cpu/S_v_cpu
-clearing the forward lookup after v must not invalidate backward
-each autograd node must retain its own handle reference
-```
-
-If refcounted release is not stable in the first implementation, keep the shared
-handle alive for the attention-layer lifetime and report the retained bytes in
-JSON. Do not claim final source-sharing memory until the sharing tests pass.
-
-## LF Integration
-
-Gate:
-
-```text
-ASYMM_ATTN_ACT_OFFLOAD=1
-```
-
-Modify `_wrap_lf_linear_leaf(...)` only for the gated attention-LoRA case:
-
-```text
-component == "attention"
-is_lora_target
-selected_cpu_offload
-backend == "asym"
-precision == "bf16"
-source is text attention, not vision attention
-```
-
-Env unset behavior must remain unchanged:
-
-```text
-selected attention LoRA + CPU base offload -> AsymLoRALinear
-selected attention frozen CPU base only    -> AsymFrozenLinear
-selected LoRA without CPU base offload     -> TorchLoRALinear
-```
-
-Add helpers in `lf.py`:
-
-```python
-def _attention_act_offload_enabled() -> bool: ...
-def _is_text_attention_projection_name(name: str) -> bool: ...
-def _attention_parent_name(name: str) -> str | None: ...
-def _build_attention_activation_contexts(model: nn.Module, selected_names: set[str]) -> dict[str, AttentionActivationOffloadContext]: ...
-```
-
-Reject known vision paths before generic `q_proj/k_proj/v_proj/o_proj`
-classification can wrap them:
-
-```text
-.vision_model.
-.vision_tower.
-.multi_modal_projector.
-.vision.
-```
-
-Strict mode should fail clearly if a selected activation-offload target is a
-vision attention projection. Non-strict mode may leave it on the existing path
-and report it as skipped.
-
-Report fields:
-
-```text
-attention_act_offload_enabled
-attention_act_offload_wrapped
-attention_act_offload_modules
-attention_act_offload_skipped
-```
-
-## Launch Contract
-
-Per wrapped projection:
-
-```text
-Forward:
-  1 base AsymFrozenLinear call
-  1 CPU-right LoRA-A AsymGEMM call
-  1 HBM LoRA-B GEMM
-
-Backward:
-  1 base dx AsymGEMM call
-  1 HBM dS GEMM
-  1 HBM dX-LoRA GEMM
-  1 CPU-right dA AsymGEMM call
-  1 HBM dB GEMM with staged S_cpu
-```
-
-Hard rules:
-
-```text
-No Python loops over tokens or rows
-No loops over heads or KV groups
-No Python loops over experts; any future grouped path must use grouped kernels
-No loops over LoRA rank chunks
-No row-window staging in v1
-No per-row or per-head AsymGEMM calls
-No splitting one q/k/v/o projection except whole-tensor padding
-No chunked torch fallback loops
-```
-
-Allowed loop level:
-
-```text
-model layers
-projection leaves q_proj/k_proj/v_proj/o_proj
-```
-
-## Validation Artifacts
-
-The validation script must support:
-
-```text
-linear_forward
-linear_backward
-qkv
-full_attention
-profile
-```
-
-Every JSON artifact must include:
-
-```text
-correctness diffs by tensor and grad
-dropout mode and mask metadata
-manager CPU-owned bytes, staged bytes, and per-tag peaks
-q/k/v source-sharing hit/miss counters
-duplicate source bytes when sharing is disabled or missed
-base AsymGEMM call counts by projection
-LoRA-A AsymGEMM call counts by projection
-dA AsymGEMM call counts by projection
-LoRA-B/dS/dX-LoRA/dB HBM GEMM call counts by projection
-all GEMM input/output shapes
-peak allocated HBM
-peak reserved HBM
-step or operator timing
-attention-core saved tensors still present, if any
-```
-
-Timing is reported for review; do not encode arbitrary slowdown thresholds.
-
-## Stage Plan And Gates
-
-Do not advance a stage until the previous stage has a pytest result or JSON
-artifact. Stages 1-6 implement `agent/attn_math.md`. Stage 7 is optional and
-must not start until Stage 6 proves the remaining HBM peak is attention-core
-state, not projection/LoRA state.
-
-Reject criteria for any memory stage:
-
-```text
-Reject if peak allocated/reserved HBM is unchanged within measurement noise.
-Reject if the full-profile peak drops by less than both 5% and 1 GiB on the
-target LF shape, unless a smaller model artifact shows the exact projected
-large-model byte savings.
-Reject if latency rises without a meaningful memory drop.
-Reject if end-to-end step time ratio exceeds 1.25x for the target LF profile
-unless the run is explicitly marked investigation-only.
-Reject if AsymGEMM/GEMM counts exceed the launch contract in this file.
-Reject if CPU AdamW no longer sees CUDA LoRA compute parameters or fails to
-update sampled LoRA parameters.
-```
-
-### Stage 0 Baseline Lock
+No loops over tokens, rows, heads, KV groups, LoRA rank chunks, row windows, or
+experts are allowed. Whole-tensor q/k/v/o projections are the smallest unit.
+
+Reject the implementation if peak HBM is unchanged within noise, the target LF
+profile peak drops by less than both 5% and 1 GiB without a credible large-model
+projection, step time exceeds 1.25x baseline, AsymGEMM/GEMM counts exceed the
+contract above, temporary workspace offsets the memory win, profiling artifacts
+cannot separate GC and activation-offload variants, or CPU AdamW stops updating
+CUDA LoRA parameters.
+
+## Stage 0 - Profiling Matrix And GC Baseline Wiring
 
 Scope:
 
 ```text
-No code changes.
-Read/confirm:
+Modify:
+  scripts/lf/profile_lora_lf.sh
+    ASYMM_EXP_ACT_POLICIES default, help, and EXPERT_POLICIES compatibility
+    parse_exp_act_policy_pair -> parse_exp_act_policy_tuple
+    normalize_expert_policy
+    expact_tag plus new attnact_tag
+    job_root_path
+    legacy_job_root_path
+    kt_arm_matching_source_profile_complete
+    existing_profile_complete
+    run_one_profile run_env/config/run_id
+    main ASYMM_EXP_ACT_POLICIES loop
+
+  scripts/lf/run_lf_lora_sft.sh
+    ASYMM_ATTN_ACT_OFFLOAD default, bool normalization, tag, logging
+    RUN_ENV
+    ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD
+    ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED
+
+  scripts/lf/run_lf_profiled_train.py
+    _config_from_args
+
+  scripts/lf/postprocess_lf_profile_artifacts.py
+    summary/config rendering for attention activation offload and attention GC
+
+  asym_gemm/training/moe.py
+    parse_expert_recompute_policy_spec
+
   asym_gemm/integrations/lf.py
-    parse_lf_offload_modules
-    _wrap_lf_linear_leaf
+    LFAsymReport
+    _attention_gc_enabled_for_policy
+    _is_text_attention_module_name
+    _wrap_attention_checkpoint_modules
     apply_lf_asym_lora
-  asym_gemm/training/lora.py
-    AsymLoRALinear
-  asym_gemm/training/frozen_linear.py
-    AsymFrozenLinear
-  asym_gemm/training/cpu_adam.py
-    AsymCPUAdamW
+    _infer_adapter_config
+
+Add:
+  asym_gemm/training/attention_checkpoint.py
+    AttentionCheckpointWrapper
+    is_attention_checkpoint_wrapper
+    attention_checkpoint_module_names
+
+Add/modify tests:
+  tests/lf/test_asym_cpu_adamw_args.py
+  tests/lf/test_lf_profile_postprocess.py
+  tests/training/test_lf_qwen3_asym_backend.py
 ```
 
 Implementation steps:
 
 ```text
-1. Record current attention LoRA wrapping with ASYMM_ATTN_ACT_OFFLOAD unset.
-2. Record current base weight residency and CPU AdamW behavior.
-3. Record current peak HBM and step time for the Stage 6 target profile shape.
+1. Change ASYMM_EXP_ACT_POLICIES from a two-part axis to a three-part axis:
+   expert_policy|expert_activation_offload|attention_activation_offload.
+   Keep EXPERT_POLICIES backward compatibility by expanding each old policy to
+   policy|false|false.
+2. Add required accepted tuples:
+   none|false|false
+   gc-exp|false|false
+   gc-attn-exp|false|false
+   none|true|false
+   none|true|true
+3. Keep expert activation offload mutually exclusive with non-none expert
+   policies. For v1, keep attention activation offload mutually exclusive with
+   gc-exp/gc-attn-exp so GC and activation-offload comparisons stay separable.
+4. Add gc-attn-exp to every expert-policy parser. In
+   parse_expert_recompute_policy_spec, it must behave like gc-exp for experts:
+   policy="gc", torch_checkpoint=True, label="gc-attn-exp".
+5. Implement selective attention GC in LF integration. Wrap text attention
+   parent modules, not q/k/v/o leaves, with AttentionCheckpointWrapper only
+   when expert_recompute_policy == "gc-attn-exp". Do not set global
+   GRADIENT_CHECKPOINTING for this policy.
+6. Exclude vision and multimodal attention paths before wrapping:
+   .vision_model., .vision_tower., .multi_modal_projector., .visual., .vision.
+7. Ensure profile path identity, run_id, command.txt, profile config, summary
+   markdown, and existing-profile checks include both expact and attnact:
+   __expact0__attnact0 / __expact1__attnact1.
+8. Add ASYMM_ATTN_ACT_OFFLOAD passthrough to run_lf_lora_sft.sh and record it
+   as config["asymm_attn_act_offload"]. Record attention GC as
+   config["attention_gc_enabled"].
+9. Reject selective GC tuples under BACKEND_SPECS=*|recomp unless an explicit
+   developer-only override is set. gc-exp and gc-attn-exp are selective
+   policies; pairing them with global LF gradient checkpointing no longer means
+   "only experts" or "only attention and experts".
+10. Record current attention LoRA wrapping with ASYMM_ATTN_ACT_OFFLOAD unset.
+11. Record current q/k/v/o base residency and LoRA parameter residency.
+12. Record baseline AsymGEMM counts, peak HBM, and step time for the target LF
+   profile shape using the new axis.
+13. Confirm the target hidden/output/rank dims satisfy:
+   base forward in/out % 8 == 0, base dx out % 64 == 0,
+   LoRA-A in/r % 8 == 0, and dA M_grad % 64 == 0.
+```
+
+Pseudocode:
+
+```python
+def parse_tuple(raw):
+    policy, expact, attnact = raw.split("|")
+    policy = normalize_expert_policy(policy)
+    expact = bool_value(expact)
+    attnact = bool_value(attnact)
+    if expact and policy != "none":
+        fail("expert activation offload requires policy none")
+    if attnact and policy != "none":
+        fail("attention activation offload is compared without GC in v1")
+    return policy, expact, attnact
+
+def apply_lf_asym_lora(..., expert_recompute_policy):
+    recompute = parse_expert_recompute_policy_spec(expert_recompute_policy)
+    wrap_existing_expert_modules(recompute.label)
+    if recompute.label == "gc-attn-exp":
+        report.attention_gc_wrapped = wrap_text_attention_modules(model)
+```
+
+Resolved by code exploration:
+
+```text
+CPU-left LoRA-A exists only as SM100 grouped BF16. Dense attention must call it
+as one logical group with offsets=[0,M], experts=[0,-1], A viewed as [1,r,in].
+Dense CPU-right BF16 already has single-group launch support through
+frozen_linear.py. LF integration is bf16-only.
+Existing gc-exp is expert-local torch checkpointing in qwen3_moe.py and friends,
+not global LF layer checkpointing. Reusing global GRADIENT_CHECKPOINTING for
+gc-attn-exp would checkpoint norms, dense MLP pieces, embeddings, and residual
+paths, so it is not the requested baseline.
+run_lf_profiled_train.py automatically preserves ASYM_GEMM_LF_CONFIG_* keys, but
+the plan still adds explicit config fields so stale-profile checks and summaries
+are readable.
 ```
 
 Risks to watch:
 
 ```text
-Baseline attention peak may already be dominated by SDPA/FA internals, limiting
-projection-offload wins.
-Some target models may not have q/k/v/o as plain nn.Linear leaves.
-CPU-first model loading is required for strict attention base offload.
+Attention checkpoint wrappers must preserve HF attention kwargs, tuple outputs,
+past_key_value/use_cache behavior, and SDPA/FA backend selection.
+If attention module inputs have no requires_grad tensors, non-reentrant
+checkpoint behavior must still propagate LoRA parameter gradients; test this
+with a frozen embedding input.
+Model-family attention names can vary. Keep gc-attn-exp strict for known text
+families and fail loudly if zero attention modules are wrapped.
+Existing profiles without attnact in their path must not be reused for the new
+axis.
+Selective attention GC is a baseline only. It does not reduce attention-core
+temporary work and may increase latency through recompute.
 ```
 
 Validation before Stage 1:
 
 ```bash
 python -m pytest -q \
+  tests/lf/test_asym_cpu_adamw_args.py::test_profile_lora_lf_three_part_exp_attn_axis_dry_run \
+  tests/lf/test_asym_cpu_adamw_args.py::test_profile_lora_lf_rejects_selective_gc_with_global_recomp \
+  tests/lf/test_asym_cpu_adamw_args.py::test_run_lf_lora_sft_records_attention_act_offload_config \
+  tests/lf/test_lf_profile_postprocess.py::test_profile_config_records_attention_act_and_attention_gc \
+  tests/training/test_lf_qwen3_asym_backend.py::test_parse_expert_recompute_policy_gc_attn_exp \
+  tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_gc_attn_exp_wraps_text_attention_and_experts_only \
+  tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_gc_attn_exp_excludes_vision_attention \
   tests/training/test_lf_qwen3_asym_backend.py::test_lf_offload_module_parser_stage1_contract \
   tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_attention_lora_adopts_cpu_storage_without_clone \
   tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_attention_frozen_base_adopts_cpu_storage_without_clone \
   tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_strict_attention_offload_rejects_cuda_source
 ```
 
-CUDA target validation:
-
-```bash
-python -m pytest -q \
-  tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_sm100_attention_uses_asymgemm
-```
-
-CPU AdamW validation:
-
-```bash
-python -m pytest -q \
-  tests/training/test_asym_cpu_adamw.py \
-  tests/lf/test_asym_cpu_adamw_args.py::test_run_lf_lora_sft_asym_cpuadamwtorch_args \
-  tests/lf/test_asym_cpu_adamw_args.py::test_run_lf_lora_sft_asym_cpuadamwds_args
-```
-
-Baseline profile command using existing LF profiling, before the new validation
-script exists:
+Dry-run matrix validation:
 
 ```bash
 mkdir -p reports/attn_act_offload
-OUTPUT_ROOT=reports/attn_act_offload/stage0_lf_memory \
-ASYM_OFFLOAD_MODULES=attention \
+OUTPUT_ROOT=reports/attn_act_offload/stage0_profile_matrix \
+ASYM_OFFLOAD_MODULES=all \
 scripts/lf/profile_lora_lf.sh \
   --models 'Qwen/Qwen3-30B-A3B|1' \
-  --backend-specs 'asym_cpuadamwds|recomp' \
+  --backend-specs 'asym_cpuadamwds|norecomp' \
   --profilers source \
-  --seq-lens 4096 \
+  --seq-lens 128 \
   --batch-size 1 \
-  --max-steps 5 \
-  --warmup-steps 5 \
+  --max-steps 1 \
+  --warmup-steps 0 \
+  --max-samples 2 \
   --lora-rank 8 \
   --lora-alpha 16 \
   --lora-dropout 0.00 \
-  --asymm-exp-act-policies 'none|false' \
+  --asymm-exp-act-policies 'none|false|false,gc-exp|false|false,gc-attn-exp|false|false,none|true|false,none|true|true' \
+  --prepare-datasets false \
+  --dry-run true \
+  --overwrite true \
+  --plot false \
+  --plot-memory-breakdown false
+
+grep -R "ASYM_EXPERT_RECOMPUTE_POLICY=gc-attn-exp" \
+  reports/attn_act_offload/stage0_profile_matrix
+grep -R "ASYMM_ATTN_ACT_OFFLOAD=true" \
+  reports/attn_act_offload/stage0_profile_matrix
+find reports/attn_act_offload/stage0_profile_matrix -path '*polgc-attn-exp*attnact0*command.txt'
+find reports/attn_act_offload/stage0_profile_matrix -path '*polnone*expact1*attnact1*command.txt'
+```
+
+Selective-GC profile artifact validation:
+
+```bash
+OUTPUT_ROOT=reports/attn_act_offload/stage0_gc_attn_exp_smoke \
+ASYM_OFFLOAD_MODULES=all \
+scripts/lf/profile_lora_lf.sh \
+  --models 'Qwen/Qwen3-30B-A3B|1' \
+  --backend-specs 'asym_cpuadamwds|norecomp' \
+  --profilers source \
+  --seq-lens 256 \
+  --batch-size 1 \
+  --max-steps 1 \
+  --warmup-steps 1 \
+  --max-samples 4 \
+  --lora-rank 8 \
+  --lora-alpha 16 \
+  --lora-dropout 0.00 \
+  --asymm-exp-act-policies 'gc-exp|false|false,gc-attn-exp|false|false' \
   --profile-memory-breakdown true \
   --profile-memory-breakdown-modules attention,router,mlp,experts,shared_experts,lora,embedding,norms,loss \
   --profile-level module \
   --profile-sync true \
-  --plot true \
-  --plot-memory-breakdown true
+  --plot false \
+  --plot-memory-breakdown false
+
+python - <<'PY'
+import json
+from pathlib import Path
+
+def flag(value):
+    return str(value).lower()
+
+profiles = sorted(Path("reports/attn_act_offload/stage0_gc_attn_exp_smoke").rglob("profile.json"))
+assert profiles, "no profile.json files found"
+by_policy = {}
+for path in profiles:
+    data = json.loads(path.read_text())
+    cfg = data["config"]
+    by_policy[cfg["expert_recompute_policy_spec"]] = cfg
+    assert cfg["activation_recompute"] is False, path
+    assert flag(cfg["asymm_expert_act_offload"]) == "false", path
+    assert flag(cfg["asymm_attn_act_offload"]) == "false", path
+assert by_policy["gc-exp"]["expert_recompute_impl"] == "torch_checkpoint"
+assert flag(by_policy["gc-exp"]["attention_gc_enabled"]) == "false"
+assert by_policy["gc-attn-exp"]["expert_recompute_impl"] == "torch_checkpoint"
+assert flag(by_policy["gc-attn-exp"]["attention_gc_enabled"]) == "true"
+PY
 ```
 
-### Stage 1 CPU-Right Helper And Counters
+## Stage 1 - Activation GEMM Primitives And Counters
 
 Scope:
 
 ```text
 Modify:
   asym_gemm/training/frozen_linear.py
-    hbm_cpu_matmul
     AsymExecutionStats
-  tests/training/test_attention_activation_offload_helpers.py
+    asym_bf16_cpu_right_matmul
 
-Read only unless a missing counter is proven:
-  asym_gemm/training/activation_offload.py
-    CPUActivationHandle
-    ActivationOffloadManager
+Add:
+  asym_gemm/training/attention_activation_offload.py
+    _single_group_offsets_experts
+    _dense_lora_a_cpu_left
+
+Add tests:
+  tests/training/test_attention_activation_offload_helpers.py
 ```
 
 Implementation steps:
 
 ```text
-1. Add public hbm_cpu_matmul(...) around _dispatch_nt(...).
-2. Enforce 2D, contiguous, bf16, CPU-pinned right operand for backend="asym".
-3. Keep backend="torch" as a test/debug whole-tensor fallback only.
-4. Add stats counters for CPU-right activation matmuls by phase/profile label:
-   lora_a_forward, lora_a_dA, torch_fallback.
-5. Do not add loops over rows, heads, rank chunks, or experts.
+1. Add AsymExecutionStats fields for attention activation offload:
+   attn_act_base_dx_calls
+   attn_act_lora_a_forward_calls
+   attn_act_lora_a_grad_calls
+   attn_act_stage_low_rank_calls
+   attn_act_hbm_gemm_calls_by_tag or equivalent shape/call recording
+2. Add public asym_bf16_cpu_right_matmul(...) in frozen_linear.py for BF16
+   CPU-right operands used by attention activation offload. It wraps the
+   existing BF16 CPU-right path, never fp8/fp4 quantized HostWeight paths.
+3. Enforce CUDA left, CPU pinned contiguous BF16 right, 2D operands, shape
+   checks, and transpose_b constraints. backend="asym" fails loudly.
+   backend="torch" is allowed only for focused tests.
+4. Add _single_group_offsets_experts(device, M) with cached CUDA int32
+   offsets=[0,M] and experts=[0,-1].
+5. Add _dense_lora_a_cpu_left(U_drop_cpu, A, stats, tag) that views A as
+   [1,r,in] and calls grouped_expert_lora_cpu_left once.
+6. Forward LoRA-A is CPU-left only.
 ```
 
 Pseudocode:
 
 ```python
-def hbm_cpu_matmul(left_hbm, right_cpu, *, transpose_b=False, backend="asym", ...):
-    validate_public_contract(left_hbm, right_cpu, transpose_b, precision)
+def _dense_lora_a_cpu_left(u_cpu, a, stats, tag):
+    offsets, experts = _single_group_offsets_experts(a.device, u_cpu.shape[0])
+    weight = a.unsqueeze(0).contiguous()
+    out = grouped_expert_lora_cpu_left(
+        u_cpu, weight, offsets, experts,
+        output_dtype=a.dtype, stats=stats,
+    )
+    record_attn_act_lora_a_forward(stats, tag, out.shape)
+    return out
+
+def asym_bf16_cpu_right_matmul(left_hbm, right_cpu, *, transpose_b, backend, stats, phase, tag):
+    validate_bf16_cpu_right(left_hbm, right_cpu, transpose_b)
     return _dispatch_nt(
-        left_hbm,
-        right_cpu,
-        backend=backend,
-        stats=stats,
-        phase=phase,
-        compiled_dims=compiled_dims,
-        transpose_b=transpose_b,
-        precision="bf16",
-        profile_label=profile_label,
-        bf16_output_dtype=bf16_output_dtype,
+        left_hbm, right_cpu,
+        backend=backend, phase=phase, transpose_b=transpose_b,
+        precision="bf16", profile_label=tag,
     )
 ```
 
 Risks to watch:
 
 ```text
-_dispatch_nt expects HostWeight-like CPU operands; verify arbitrary pinned CPU
-activation tensors satisfy the same layout assumptions.
-transpose_b=True requires the reduction dimension to be 64-aligned in the direct
-bf16 path; helper must fail loudly before wrong kernels launch.
-CPU pinning may be unavailable in CPU-only CI; tests need torch-backend coverage.
+CPU-left LoRA-A is SM100-only; non-SM100 tests must assert clear failure or use
+backend="torch" reference paths without pretending production support.
+_dispatch_nt is private today; expose only the minimal public wrapper needed for
+dA so attention code does not depend on private internals.
+CPU pinning can be unavailable in CPU-only CI; keep direct-kernel tests skipped
+when CUDA/SM100 is unavailable.
 ```
 
 Validation before Stage 2:
 
 ```bash
-python -m pytest -q \
-  tests/training/test_lf_qwen3_asym_backend.py::test_activation_offload_manager_tracks_cpu_owners_and_stage_reuse \
-  tests/training/test_attention_activation_offload_helpers.py
+python -m pytest -q tests/training/test_attention_activation_offload_helpers.py
 ```
 
-Required helper tests:
+Required helper test cases:
 
 ```text
-hbm_cpu_matmul(A_hbm, X_cpu, transpose_b=False) == A @ X.T
-hbm_cpu_matmul(dS_T_hbm, X_cpu, transpose_b=True) == dS_T @ X
-non-contiguous left_hbm is rejected
-non-bf16 operands are rejected
-backend="asym" unsupported shapes fail loudly
-backend="torch" fallback uses one whole-tensor matmul, not chunks
-stage(S_cpu); dY.T @ S_stage matches dB reference
-stats record exact helper call counts and shapes
+_dense_lora_a_cpu_left(X_cpu, A) matches X @ A.T on SM100 BF16.
+asym_bf16_cpu_right_matmul(dS_T, X_cpu, transpose_b=True) matches dS.T @ X.
+non-contiguous HBM left is rejected.
+unpinned CPU right is rejected under backend="asym".
+unsupported dA shape with M_grad % 64 != 0 fails loudly.
+no helper test performs row/head/rank/chunk loops.
+stats record exact call counts and operand shapes.
 ```
 
-### Stage 2 Projection Wrapper Forward
+## Stage 2 - Single Projection Forward
 
 Scope:
 
 ```text
-Add:
+Modify:
   asym_gemm/training/attention_activation_offload.py
     AsymActivationOffloadLoRALinear
     _AsymActivationOffloadLoRALinearFunction.forward
     _flatten_last_dim
     _restore_last_dim
-    _row_major_from_transposed
-    _pad_cpu_rows_to
-    _cpu_dropout_forward
-  tests/training/test_attention_activation_offload_lora.py
-  scripts/testing/validate_attention_activation_offload.py
+    _offload_or_adopt_source_cpu
 
 Use:
   asym_gemm/training/frozen_linear.py
     AsymFrozenLinear
-    hbm_cpu_matmul
   asym_gemm/training/activation_offload.py
     ActivationOffloadManager
+
+Add/modify tests:
+  tests/training/test_attention_activation_offload_lora.py
+  scripts/testing/validate_attention_activation_offload.py
+    --mode linear_forward
 ```
 
 Implementation steps:
 
 ```text
-1. Match AsymLoRALinear adapter layout and state-dict naming exactly.
-2. Forward flattens only the last dimension and restores the original shape.
-3. Base path calls AsymFrozenLinear with frozen bias preserved.
-4. Offload source activation to CPU; do not save HBM source on ctx.
-5. Apply LoRA dropout on CPU and save the exact CPU mask when p > 0.
-6. Pad CPU rows to align_up(M, 8), run one LoRA-A CPU-right AsymGEMM.
-7. Materialize S = row_major(S_T.T), offload S_cpu, then run one HBM LoRA-B GEMM.
-8. Save only CPU handles, metadata, and A/B tensor references for backward.
-9. Backward may raise NotImplementedError in this stage.
+1. Match AsymLoRALinear state dict and adapter naming:
+   base_layer, lora_A, lora_B, active_adapter, lora_dtype, scaling.
+2. Implement from_host_weight(...) with the same base arguments as
+   AsymLoRALinear.from_host_weight(...), plus projection_role and optional
+   attention_context.
+3. Flatten only the last dimension: input [...,in] -> [M,in].
+4. Base path calls AsymFrozenLinear and preserves frozen bias.
+5. Offload the source U to CPU with ActivationOffloadManager. Do not save HBM U.
+6. For p == 0, U_drop_cpu is U_cpu. For p > 0 in this stage, fail with a clear
+   NotImplementedError; Stage 4 adds dropout.
+7. Run one CPU-left LoRA-A: S = U_drop_cpu @^L A.T.
+8. Accumulate LoRA-B into the live base output before offloading S:
+   Z += scale * (S @ B.T).
+9. Offload S_cpu only after LoRA-B consumes S. The custom Function must receive
+   input, A, and B as tensor arguments so backward can return dInput, dA, and dB.
+   Save CPU handles, metadata, and A/B via autograd context. Do not save U,
+   U_drop, S, base, or delta HBM tensors.
+10. Backward may raise NotImplementedError until Stage 3.
+```
+
+Pseudocode:
+
+```python
+U = flatten_last_dim(input)
+Z = base_layer(U)
+U_cpu = manager.offload(U, f"{role}.U")
+S = _dense_lora_a_cpu_left(U_cpu.tensor, A, stats, f"{role}.lora_a")
+Z += scale * (S @ B.T)
+S_cpu = manager.offload(S, f"{role}.S")
+ctx.save_handles(U_cpu, S_cpu, shape, dtype, role, scale)
+return restore_last_dim(Z)
 ```
 
 Risks to watch:
 
 ```text
-CPU dropout RNG will not match nn.Dropout CUDA RNG; compare p > 0 only to a
-masked reference using the saved CPU mask.
-For small M/r, offloading S_cpu may not reduce peak; this is acceptable only as
-an operator proof, not a production acceptance.
-Flattening non-contiguous hidden_states may create an HBM contiguous copy; record
-this in JSON and handle q/k/v sharing in Stage 5.
+Flattening a non-contiguous input may materialize an HBM copy; record this in
+validation JSON and reject later if it erases memory savings.
+Very small M or r may not show memory savings; Stage 2 is correctness only.
+Forward q/k/v source sharing is not implemented until Stage 6, so duplicate
+CPU source bytes are expected before that stage.
 ```
 
 Validation before Stage 3:
@@ -723,49 +481,24 @@ python scripts/testing/validate_attention_activation_offload.py \
   --compare-to current_asym_lora \
   --profile-launches true \
   --output-json reports/attn_act_offload/stage2_forward.json
-```
 
-Dropout validation:
-
-```bash
-ASYMM_ATTN_ACT_OFFLOAD=1 \
-python scripts/testing/validate_attention_activation_offload.py \
-  --mode linear_forward \
-  --device cuda:0 \
-  --backend asym \
-  --in-features 128 \
-  --out-features 128 \
-  --tokens 32 \
-  --lora-rank 8 \
-  --lora-alpha 16 \
-  --lora-dropout 0.1 \
-  --seed 17 \
-  --compare-to masked_reference \
-  --profile-launches true \
-  --output-json reports/attn_act_offload/stage2_forward_dropout.json
-```
-
-Required tests:
-
-```bash
 ASYMM_ATTN_ACT_OFFLOAD=1 \
 python -m pytest -q \
-  tests/training/test_attention_activation_offload_lora.py::test_attention_act_offload_linear_forward_matches_current_without_dropout \
-  tests/training/test_attention_activation_offload_lora.py::test_attention_act_offload_linear_forward_matches_masked_reference_with_dropout \
-  tests/training/test_attention_activation_offload_lora.py::test_attention_act_offload_linear_forward_saves_no_hbm_source_on_ctx \
-  tests/training/test_attention_activation_offload_lora.py::test_attention_act_offload_linear_forward_launch_counts
+  tests/training/test_attention_activation_offload_lora.py::test_linear_forward_matches_current_without_dropout \
+  tests/training/test_attention_activation_offload_lora.py::test_linear_forward_saves_no_hbm_source_on_ctx \
+  tests/training/test_attention_activation_offload_lora.py::test_linear_forward_launch_counts \
+  tests/training/test_attention_activation_offload_lora.py::test_linear_forward_rejects_dropout_until_stage4
 ```
 
 Advance gate:
 
 ```text
-forward diff within existing bf16 tolerance
-1 base AsymFrozenLinear call, 1 LoRA-A AsymGEMM, 1 LoRA-B HBM GEMM
-no row/head/rank/window loops
-JSON records S_cpu bytes, source CPU bytes, mask bytes, and HBM temp peak
+Forward diff is within existing BF16 tolerance.
+Launch counts are exactly 1 base CPU-right, 1 LoRA-A CPU-left, 1 LoRA-B HBM.
+Saved state contains CPU handles and metadata only, not wide HBM source or S.
 ```
 
-### Stage 3 Projection Wrapper Backward
+## Stage 3 - Single Projection Backward Without Dropout
 
 Scope:
 
@@ -773,36 +506,44 @@ Scope:
 Modify:
   asym_gemm/training/attention_activation_offload.py
     _AsymActivationOffloadLoRALinearFunction.backward
-    _apply_dropout_grad_hbm
-    _pad_hbm_columns_to
-  tests/training/test_attention_activation_offload_lora.py
+    _pad_cpu_rows_to
+    _pad_hbm_rows_to
+    _materialize_low_rank_transpose_for_dA
+
+Modify/add:
   scripts/testing/validate_attention_activation_offload.py
     --mode linear_backward
+  tests/training/test_attention_activation_offload_lora.py
 ```
 
 Implementation steps:
 
 ```text
-1. Compute dX_base with one frozen base dx AsymGEMM.
+1. Flatten dY to [M,out] and compute base dx explicitly with the base HostWeight:
+   dU = asym_bf16_cpu_right_matmul(dY, W_cpu, transpose_b=True, phase="dx").
 2. Compute dS = scale * (dY @ B) with one HBM GEMM.
-3. Compute dX_lora_raw = dS @ A with one HBM GEMM.
-4. Apply D_bar with the saved CPU mask staged only if p > 0.
-5. Recompute D(X_cpu) on CPU for dA; do not stage the wide dropped source.
-6. Pad rows to align_up(M, 64), materialize row_major(dS.T), pad columns, and
-   run one CPU-right dA AsymGEMM.
-7. Stage S_cpu and compute dB = scale * (dY.T @ S_stage) with one HBM GEMM.
-8. Return gradients only for input, A, and B tensor arguments.
+3. Accumulate LoRA input gradient into dU:
+   dU += dS @ A.
+4. Recompute U_drop_cpu from saved U_cpu. For this stage p == 0, it is U_cpu.
+5. Set M_grad = align_up(M, 64). Pad U_drop_cpu rows to [M_grad,in] on CPU.
+6. Pad dS rows to [M_grad,r] on HBM, materialize contiguous dS_T [r,M_grad],
+   then release dS and the padded dS rows before dB staging.
+7. Compute dA = dS_T @^R U_drop_cpu with asym_bf16_cpu_right_matmul(...,
+   transpose_b=True, phase="attn_act_dA").
+8. Stage S_cpu only for dB, compute dB = scale * (dY.T @ S_stage), then
+   release S_stage and S_cpu.
+9. Return gradients only for input, A, and B tensor arguments. Frozen base
+   weight and bias remain frozen.
 ```
 
 Risks to watch:
 
 ```text
-dY.T in dB may trigger a torch internal materialization; record temp/workspace
-and reject later if it erases HBM gains.
-Staging dropout masks for D_bar may be large when p > 0; record mask bytes and
-consider bit-packing only after correctness.
-Base dx transpose_b constraints can force torch fallback for odd shapes; report
-fallback counts and do not hide them.
+dY.T for dB may create a torch internal temp; record the HBM temp/workspace.
+The dA path intentionally materializes only a low-rank contiguous transpose
+[r,M_grad]; do not materialize wide transposed activations.
+Base dx can fail shape constraints if out % 64 != 0; LF should have filtered or
+fallen back before this wrapper is selected.
 ```
 
 Validation before Stage 4:
@@ -823,9 +564,69 @@ python scripts/testing/validate_attention_activation_offload.py \
   --compare-to current_asym_lora \
   --profile-launches true \
   --output-json reports/attn_act_offload/stage3_backward.json
+
+ASYMM_ATTN_ACT_OFFLOAD=1 \
+python -m pytest -q \
+  tests/training/test_attention_activation_offload_lora.py::test_linear_backward_matches_current_without_dropout \
+  tests/training/test_attention_activation_offload_lora.py::test_linear_backward_launch_counts \
+  tests/training/test_attention_activation_offload_lora.py::test_linear_preserves_frozen_bias \
+  tests/training/test_attention_activation_offload_lora.py::test_linear_does_not_grad_base_weight \
+  tests/training/test_attention_activation_offload_lora.py::test_linear_releases_cpu_handles_after_backward
 ```
 
-Dropout backward:
+Advance gate:
+
+```text
+dU, dA, and dB match references within BF16 tolerance.
+Backward launch counts match the hard contract.
+JSON reports M_grad, dS_T shape, S_stage bytes, fallback reasons, and peak HBM.
+```
+
+## Stage 4 - LoRA Dropout
+
+Scope:
+
+```text
+Modify:
+  asym_gemm/training/attention_activation_offload.py
+    _cpu_dropout_forward
+    _apply_dropout_grad_hbm
+    _recompute_dropped_cpu_source
+
+Optionally add only if duplication becomes material:
+  asym_gemm/training/dropout.py
+    shared packed-mask helpers extracted from qwen3_moe.py
+
+Modify/add:
+  tests/training/test_attention_activation_offload_lora.py
+  scripts/testing/validate_attention_activation_offload.py
+```
+
+Implementation steps:
+
+```text
+1. Support 0 <= p < 1. Keep p == 1 as a clear failure.
+2. For p == 0, keep the fast path branch-free.
+3. For 0 < p < 1, generate one branch-local CPU mask per projection forward,
+   save the exact mask, and apply inverted dropout to U_cpu for LoRA-A.
+4. Backward uses the same mask for dU LoRA gradient and dA source recompute.
+5. Prefer packed masks or a fused mask kernel for D_bar on HBM. If the first
+   implementation stages or expands masks, record those bytes and launch cost.
+6. Do not try to match nn.Dropout CUDA RNG. Compare p > 0 only against a masked
+   reference built from the saved mask.
+```
+
+Risks to watch:
+
+```text
+Nonzero dropout can add enough mask memory or latency to fail production gates.
+If p > 0 requires expanded HBM masks and the target LF run uses p == 0, keep
+p > 0 marked correctness-supported but not performance-accepted until measured.
+Extracting shared dropout helpers from qwen3_moe.py can regress expert paths;
+prefer local helpers unless duplication blocks maintenance.
+```
+
+Validation before Stage 5:
 
 ```bash
 ASYMM_ATTN_ACT_OFFLOAD=1 \
@@ -842,33 +643,25 @@ python scripts/testing/validate_attention_activation_offload.py \
   --seed 29 \
   --compare-to masked_reference \
   --profile-launches true \
-  --output-json reports/attn_act_offload/stage3_backward_dropout.json
-```
+  --output-json reports/attn_act_offload/stage4_backward_dropout.json
 
-Required tests:
-
-```bash
 ASYMM_ATTN_ACT_OFFLOAD=1 \
 python -m pytest -q \
-  tests/training/test_attention_activation_offload_lora.py::test_attention_act_offload_linear_backward_matches_current_without_dropout \
-  tests/training/test_attention_activation_offload_lora.py::test_attention_act_offload_linear_backward_matches_masked_reference_with_dropout \
-  tests/training/test_attention_activation_offload_lora.py::test_attention_act_offload_linear_rejects_dropout_one \
-  tests/training/test_attention_activation_offload_lora.py::test_attention_act_offload_linear_preserves_frozen_bias \
-  tests/training/test_attention_activation_offload_lora.py::test_attention_act_offload_linear_does_not_grad_base_weight \
-  tests/training/test_attention_activation_offload_lora.py::test_attention_act_offload_linear_backward_launch_counts
+  tests/training/test_attention_activation_offload_lora.py::test_linear_forward_matches_masked_reference_with_dropout \
+  tests/training/test_attention_activation_offload_lora.py::test_linear_backward_matches_masked_reference_with_dropout \
+  tests/training/test_attention_activation_offload_lora.py::test_linear_rejects_dropout_one \
+  tests/training/test_attention_activation_offload_lora.py::test_dropout_mask_bytes_are_reported
 ```
 
 Advance gate:
 
 ```text
-dX, dA, dB match references
-dB uses staged S_cpu, not CPU-right AsymGEMM
-exact backward launch counts match the contract
-no frozen base weight grad appears
-JSON records fallback reasons and any dY.T materialization/workspace
+Dropout correctness passes for p == 0 and p == 0.1.
+Mask bytes and mask-apply launches are visible in JSON.
+No extra GEMMs are introduced.
 ```
 
-### Stage 4 LF Integration And CPU Adam Contract
+## Stage 5 - LF Integration And CPU Adam Contract
 
 Scope:
 
@@ -880,81 +673,72 @@ Modify:
     _attention_act_offload_enabled
     _is_text_attention_projection_name
     _attention_parent_name
-    _build_attention_activation_contexts
     _wrap_lf_linear_leaf
     apply_lf_asym_lora
-  tests/training/test_lf_qwen3_asym_backend.py
-  tests/training/test_attention_activation_offload_lora.py
+    _infer_adapter_config
 
-Read/validate:
-  asym_gemm/training/cpu_adam.py
-    AsymCPUAdamW
+Modify/add:
+  tests/training/test_lf_qwen3_asym_backend.py
+  tests/lf/test_asym_cpu_adamw_lf_integration.py
 ```
 
 Implementation steps:
 
 ```text
-1. Add the ASYMM_ATTN_ACT_OFFLOAD gate; default false.
-2. Wrap only selected text attention LoRA leaves with CPU base offload.
-3. Preserve existing AsymLoRALinear behavior when env is unset.
+1. Add ASYMM_ATTN_ACT_OFFLOAD gate. Default unset behavior is unchanged.
+2. In _wrap_lf_linear_leaf, choose AsymActivationOffloadLoRALinear only when:
+   component == "attention", is_lora_target, selected_cpu_offload,
+   backend == "asym", precision == "bf16", and env gate is enabled.
+3. Preserve AsymLoRALinear for selected attention LoRA when the gate is unset.
 4. Preserve AsymFrozenLinear for selected frozen-only attention projections.
-5. Reject or skip Llama4 vision paths before generic q/k/v/o matching.
-6. Ensure lora_A/lora_B remain CUDA nn.Parameters with standard names.
-7. Add report fields: enabled, wrapped modules, skipped modules, bytes/counters.
-8. Add CPU AdamW contract test: AsymCPUAdamW accepts wrapper params and updates
-   sampled nonzero-gradient LoRA parameters.
+5. Reject or skip known vision paths before generic q/k/v/o matching:
+   .vision_model., .vision_tower., .multi_modal_projector., .vision.
+6. Keep lora_A/lora_B as CUDA nn.Parameters with the same ModuleDict key names
+   as AsymLoRALinear.
+7. Add report/config fields:
+   attention_act_offload_enabled, attention_act_offload_wrapped,
+   attention_act_offload_modules, attention_act_offload_skipped.
+8. Add CPU AdamW contract test: optimizer sees CUDA LoRA params, ignores frozen
+   CPU base owners, and updates sampled nonzero-gradient LoRA params.
 ```
 
 Risks to watch:
 
 ```text
-HF module names for Llama4 text vs vision may vary; keep path filters explicit
-and add a strict-mode failure.
-CPU AdamW rejects CPU-resident trainable params; wrapper must never move LoRA
-A/B parameters to CPU.
-State dict compatibility can break adapter save/load if ModuleDict names differ.
+HF naming for Llama4 text versus vision can vary; keep filters conservative and
+strict-mode failures explicit.
+State dict compatibility can break PEFT save/load if ModuleDict names differ.
+Shape fallback in lf.py currently converts unsupported CPU offload to backend
+"torch"; activation offload must not silently claim AsymGEMM savings in that
+fallback case.
 ```
 
-Validation before Stage 5:
+Validation before Stage 6:
 
 ```bash
 python -m pytest -q \
   tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_attention_lora_adopts_cpu_storage_without_clone \
   tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_sm100_attention_uses_asymgemm
-```
 
-Gated integration tests:
-
-```bash
 ASYMM_ATTN_ACT_OFFLOAD=1 \
 python -m pytest -q \
-  tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_attention_activation_offload_wraps_selected_lora_projection \
-  tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_attention_activation_offload_default_off_is_unchanged \
-  tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_attention_activation_offload_rejects_non_asym_backend \
-  tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_attention_activation_offload_excludes_llama4_vision \
-  tests/training/test_lf_qwen3_asym_backend.py::test_apply_lf_asym_lora_attention_activation_offload_report_fields
-```
-
-CPU AdamW contract:
-
-```bash
-ASYMM_ATTN_ACT_OFFLOAD=1 \
-python -m pytest -q \
-  tests/training/test_attention_activation_offload_lora.py::test_attention_act_offload_linear_cpu_adam_param_contract \
-  tests/training/test_asym_cpu_adamw.py
+  tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_wraps_selected_lora_projection \
+  tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_default_off_is_unchanged \
+  tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_excludes_llama4_vision \
+  tests/training/test_lf_qwen3_asym_backend.py::test_attention_activation_offload_report_fields \
+  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_cpu_adamw_attention_activation_offload_param_contract
 ```
 
 Advance gate:
 
 ```text
-env unset path unchanged
-env set wraps only intended text attention LoRA leaves
-optimizer parameter list contains only LoRA params
-AsymCPUAdamW update health passes
-adapter state dict keys match AsymLoRALinear conventions
+Env unset path is byte-for-byte behaviorally unchanged.
+Env set wraps only intended text attention LoRA leaves.
+CPU AdamW update health passes.
+Adapter state dict keys match AsymLoRALinear conventions.
 ```
 
-### Stage 5 Q/K/V Source Sharing
+## Stage 6 - Q/K/V Source Sharing
 
 Scope:
 
@@ -963,9 +747,14 @@ Modify:
   asym_gemm/training/attention_activation_offload.py
     AttentionActivationOffloadContext
     AsymActivationOffloadLoRALinear.forward context path
+
+Modify:
   asym_gemm/integrations/lf.py
     _attention_parent_name
     _build_attention_activation_contexts
+    apply_lf_asym_lora
+
+Modify/add:
   tests/training/test_attention_activation_offload_lora.py
   scripts/testing/validate_attention_activation_offload.py
     --mode qkv
@@ -974,26 +763,31 @@ Modify:
 Implementation steps:
 
 ```text
-1. Build one context per attention parent when q/k/v are all wrapped.
-2. Cache source by storage key before any contiguous materialization.
-3. Share only X_cpu; keep branch-local dropout masks and S_cpu handles.
-4. Clear the forward lookup after v forward.
-5. Retain CPU handles for backward until the last q/k/v backward user.
-6. Record hits, misses, duplicate bytes avoided, and retained lifetime bytes.
+1. Build one AttentionActivationOffloadContext per attention parent only when
+   q/k/v are all activation-offload wrappers.
+2. Compute source keys before any contiguous materialization:
+   device, untyped_storage().data_ptr(), storage_offset(), shape, stride, dtype.
+3. Share only X_cpu across q/k/v. Dropout masks and S_q/S_k/S_v handles remain
+   branch-local.
+4. Clearing the forward lookup after v must not invalidate backward. Each
+   autograd node retains its handle reference.
+5. If refcounting is not stable, keep the shared CPU handle through the
+   attention-layer backward and report retained bytes.
+6. Record q/k/v source-sharing hits, misses, duplicate bytes avoided, and
+   retained lifetime bytes.
 ```
 
 Risks to watch:
 
 ```text
-q/k/v may receive different views after model-specific pre-processing; if keys
-differ, fall back to per-leaf offload and record duplicate bytes.
-ActivationOffloadManager has no built-in refcount; context must own retention or
-intentionally keep handles alive to layer backward.
-Checkpointing may replay forward and interact with context lifetime; validate
-with and without activation recompute.
+Model code may pass different views to q/k/v. Misses are allowed, but must be
+reported and must not claim sharing savings.
+Activation checkpointing can replay forward and disturb context lifetime; test
+with checkpointing enabled and disabled.
+Sharing must never merge branch-local dropout masks or S_cpu handles.
 ```
 
-Validation before Stage 6:
+Validation before Stage 7:
 
 ```bash
 ASYMM_ATTN_ACT_OFFLOAD=1 \
@@ -1010,74 +804,75 @@ python scripts/testing/validate_attention_activation_offload.py \
   --lora-dropout 0.1 \
   --seed 31 \
   --profile-launches true \
-  --output-json reports/attn_act_offload/stage5_qkv_share.json
-```
+  --output-json reports/attn_act_offload/stage6_qkv_share.json
 
-Required tests:
-
-```bash
 ASYMM_ATTN_ACT_OFFLOAD=1 \
 python -m pytest -q \
   tests/training/test_attention_activation_offload_lora.py::test_qkv_wrappers_share_one_source_handle \
   tests/training/test_attention_activation_offload_lora.py::test_qkv_source_cache_clears_after_v_forward \
-  tests/training/test_attention_activation_offload_lora.py::test_qkv_share_backward_keeps_own_handle_references \
+  tests/training/test_attention_activation_offload_lora.py::test_qkv_share_backward_keeps_handle_references \
   tests/training/test_attention_activation_offload_lora.py::test_qkv_share_checkpoint_recompute_is_correct
 ```
 
 Advance gate:
 
 ```text
-q/k/v share one source handle on matching input storage
-combined q/k/v backward remains correct
-JSON reports source-sharing hits and duplicate-source bytes avoided
-misses are explicit and do not silently claim memory savings
+q/k/v share one source handle on matching input storage.
+Combined q/k/v backward remains correct.
+JSON reports hits, misses, duplicate-source bytes avoided, and retained bytes.
 ```
 
-### Stage 6 Full-Attention And LF Memory Proof
+## Stage 7 - Full Attention And LF Memory Proof
 
 Scope:
 
 ```text
 Modify:
   scripts/testing/validate_attention_activation_offload.py
-    full_attention mode
-    profile mode
+    --mode full_attention
+    --mode profile
+    --variants current,gc-exp,gc-attn-exp,exp_act_offload,exp_attn_act_offload
     --min-peak-hbm-reduction-ratio
     --min-peak-hbm-reduction-bytes
     --max-step-time-ratio
-  scripts/lf/run_lf_lora_sft.sh
-    ASYMM_ATTN_ACT_OFFLOAD passthrough
-    profile config/report field
-  scripts/lf/profile_lora_lf.sh
-    --asymm-attn-act-offload LIST
-    attnact0/attnact1 run identity
-    post-run config validation
-  tests/lf/test_asym_cpu_adamw_args.py
-  tests/lf/test_lf_profile_postprocess.py
+
+Modify/add:
+  tests/training/test_attention_activation_offload_lora.py
+  tests/lf/test_asym_cpu_adamw_lf_integration.py
 ```
 
 Implementation steps:
 
 ```text
-1. Validate full attention forward/backward against current path for q/k/v/o.
-2. Compare current, attn_act_offload, and recompute variants.
+1. Validate q/k/v/o inside full attention against the current path for Qwen3
+   text and Llama4 text.
+2. Reuse the Stage 0 profiling axis. Compare:
+   none|false|false as current CPU-base attention/expert baseline,
+   gc-exp|false|false as expert-only GC baseline,
+   gc-attn-exp|false|false as attention+expert GC baseline,
+   none|true|false as expert activation offload,
+   none|true|true as expert+attention activation offload.
 3. Record peak allocated/reserved HBM, attention saved activations, temporary
-   workspace, launch counts, GEMM shapes, CPU manager stats, and CPU AdamW health.
-4. Add LF script controls and include attnact state in output paths.
-5. Reject the feature unless the full target profile shows meaningful HBM
-   reduction without launch-count blowup or unacceptable latency.
+   workspace, CPU manager stats, AsymGEMM/GEMM counts, GEMM shapes, source
+   sharing counters, and CPU AdamW update health.
+4. Check that profile artifacts include expact/attnact state, attention GC
+   state, expert policy, global activation_recompute=false for selective GC
+   rows, and CPU AdamW enabled.
+5. Reject the feature unless target LF memory and latency satisfy the hard
+   contract at the top of this file.
 ```
 
 Risks to watch:
 
 ```text
-SDPA/FA saved tensors may dominate the peak, making projection offload look
-small in end-to-end memory even if projection bytes moved correctly.
-Extra D2H/H2D copies can hurt latency; reject unless memory drop is meaningful.
-Source-profile memory attribution may move bytes from saved activations to
-temporary workspace; inspect both before accepting.
-CPU AdamW profile must still show sampled LoRA gradients update after optimizer
-step.
+SDPA/FA saved tensors may dominate the peak after projection offload. Report
+that separately; do not claim attention-core tensors are removed.
+D2H/H2D copies can hurt step time. A latency increase is acceptable only with a
+meaningful HBM reduction inside the acceptance gate.
+Source-profile attribution can shift bytes from saved activations to temporary
+workspace; inspect both before accepting.
+gc-attn-exp can reduce HBM but increase recompute latency. It is only a fair
+baseline if global activation_recompute remains false.
 ```
 
 Full-attention validation:
@@ -1101,12 +896,8 @@ python scripts/testing/validate_attention_activation_offload.py \
   --seed 37 \
   --compare-to current \
   --profile-launches true \
-  --output-json reports/attn_act_offload/stage6_qwen3_full_attention.json
-```
+  --output-json reports/attn_act_offload/stage7_qwen3_full_attention.json
 
-Llama4 text validation:
-
-```bash
 ASYMM_ATTN_ACT_OFFLOAD=1 \
 python scripts/testing/validate_attention_activation_offload.py \
   --mode full_attention \
@@ -1125,7 +916,7 @@ python scripts/testing/validate_attention_activation_offload.py \
   --seed 41 \
   --compare-to current \
   --profile-launches true \
-  --output-json reports/attn_act_offload/stage6_llama4_text_full_attention.json
+  --output-json reports/attn_act_offload/stage7_llama4_text_full_attention.json
 ```
 
 Operator profile gate:
@@ -1146,23 +937,24 @@ python scripts/testing/validate_attention_activation_offload.py \
   --lora-alpha 16 \
   --lora-dropout 0.0 \
   --attn-implementation sdpa \
-  --variants current,attn_act_offload,recompute \
+  --variants current,gc-exp,gc-attn-exp,exp_act_offload,exp_attn_act_offload \
   --profile-launches true \
   --warmup 5 \
   --iters 10 \
   --min-peak-hbm-reduction-ratio 0.05 \
+  --min-peak-hbm-reduction-bytes 1073741824 \
   --max-step-time-ratio 1.25 \
-  --output-json reports/attn_act_offload/stage6_profile.json
+  --output-json reports/attn_act_offload/stage7_profile.json
 ```
 
 LF CPU AdamW memory proof:
 
 ```bash
 OUTPUT_ROOT=reports/attn_act_offload/lf_memory \
-ASYM_OFFLOAD_MODULES=attention \
+ASYM_OFFLOAD_MODULES=all \
 scripts/lf/profile_lora_lf.sh \
   --models 'Qwen/Qwen3-30B-A3B|1' \
-  --backend-specs 'asym_cpuadamwds|recomp' \
+  --backend-specs 'asym_cpuadamwds|norecomp' \
   --profilers source \
   --seq-lens 4096 \
   --batch-size 1 \
@@ -1171,182 +963,59 @@ scripts/lf/profile_lora_lf.sh \
   --lora-rank 8 \
   --lora-alpha 16 \
   --lora-dropout 0.00 \
-  --asymm-exp-act-policies 'none|false' \
-  --asymm-attn-act-offload false,true \
+  --asymm-exp-act-policies 'none|false|false,gc-exp|false|false,gc-attn-exp|false|false,none|true|false,none|true|true' \
   --profile-memory-breakdown true \
   --profile-memory-breakdown-modules attention,router,mlp,experts,shared_experts,lora,embedding,norms,loss \
   --profile-level module \
   --profile-sync true \
   --plot true \
   --plot-memory-breakdown true
-```
 
-Schema validation:
+python - <<'PY'
+import json
+from pathlib import Path
 
-```bash
-python scripts/lf/validate_lf_memory_capacity_schema.py \
-  --source-profile-json <run_dir>/source_profile.json \
-  --memory-breakdown-summary <run_dir>/memory_breakdown_summary.json \
-  --require-breakdown
-```
+def flag(value):
+    return str(value).lower()
 
-Advance gate:
-
-```text
-full-attention correctness passes for Qwen3 and Llama4 text
-LF source profile shows meaningful HBM reduction by the reject criteria above
-latency ratio is within gate or run is rejected
-CPU AdamW optimizer update health passes
-attention:saved_activations drops without equivalent unattributed/temporary peak growth
-launch counts match the per-projection contract
-remaining SDPA/FA core saved tensors are reported separately
-```
-
-### Stage 7 Scoped Attention-Core Saved-Tensor Hooks
-
-Scope:
-
-```text
-Add only if Stage 6 justifies it:
-  asym_gemm/training/attention_core_saved_tensor_offload.py
-    scoped saved_tensors_hooks utilities
-    model-specific attention wrappers only if hook scoping cannot be local
-  scripts/testing/validate_attention_activation_offload.py
-    attn_act_offload_core_hooks variant
-
-Do not modify:
-  FlashAttention kernels
-  PyTorch SDPA kernels
-```
-
-Implementation steps:
-
-```text
-1. Scope saved_tensors_hooks or save_on_cpu around attention_prepare + core only.
-2. Exclude q/k/v/o projection wrappers from the hook scope.
-3. Pack saved tensors to CPU and unpack to HBM only when autograd requests them.
-4. Record hook bytes separately from projection offload bytes.
-```
-
-Pseudocode:
-
-```python
-with torch.autograd.graph.saved_tensors_hooks(pack_to_cpu, unpack_to_hbm):
-    Q_attn, K_attn, V_attn = attention_prepare(Q, K, V)
-    AttnOut = attention_core(Q_attn, K_attn, V_attn)
-```
-
-Risks to watch:
-
-```text
-Hooks may break fused attention assumptions or add synchronization.
-Saved tensor hooks can increase latency sharply for FA kernels.
-Hooking too broad a scope can offload projection tensors twice.
-```
-
-Validation before Stage 8:
-
-```bash
-ASYMM_ATTN_ACT_OFFLOAD=1 \
-ASYMM_ATTN_CORE_SAVE_ON_CPU=1 \
-python scripts/testing/validate_attention_activation_offload.py \
-  --mode profile \
-  --model-family qwen3 \
-  --device cuda:0 \
-  --backend asym \
-  --batch-size 1 \
-  --seq-len 512 \
-  --hidden-size 1024 \
-  --num-heads 16 \
-  --num-kv-heads 8 \
-  --lora-rank 8 \
-  --lora-alpha 16 \
-  --lora-dropout 0.0 \
-  --attn-implementation sdpa \
-  --variants current,attn_act_offload,attn_act_offload_core_hooks \
-  --profile-launches true \
-  --warmup 5 \
-  --iters 10 \
-  --min-peak-hbm-reduction-ratio 0.05 \
-  --max-step-time-ratio 1.25 \
-  --output-json reports/attn_act_offload/stage7_core_hooks_profile.json
+profiles = sorted(Path("reports/attn_act_offload/lf_memory").rglob("profile.json"))
+assert len(profiles) >= 5, f"expected comparison matrix, found {len(profiles)}"
+seen = set()
+for path in profiles:
+    cfg = json.loads(path.read_text())["config"]
+    key = (
+        cfg["expert_recompute_policy_spec"],
+        flag(cfg["asymm_expert_act_offload"]),
+        flag(cfg["asymm_attn_act_offload"]),
+    )
+    seen.add(key)
+    if key[0] in {"gc-exp", "gc-attn-exp"}:
+        assert cfg["activation_recompute"] is False, path
+        assert cfg["expert_recompute_impl"] == "torch_checkpoint", path
+    if key[0] == "gc-attn-exp":
+        assert flag(cfg["attention_gc_enabled"]) == "true", path
+    if key == ("none", "true", "true"):
+        assert flag(cfg["use_asym_cpu_adamw"]) == "true", path
+required = {
+    ("none", "false", "false"),
+    ("gc-exp", "false", "false"),
+    ("gc-attn-exp", "false", "false"),
+    ("none", "true", "false"),
+    ("none", "true", "true"),
+}
+assert required <= seen, sorted(required - seen)
+PY
 ```
 
 Advance gate:
 
 ```text
-correctness still matches Stage 6
-hook bytes and projection bytes are separated in JSON
-remaining HBM peak drops meaningfully
-latency gate passes
-no FA/SDPA kernel patch exists
-```
-
-### Stage 8 Async Copies And Buffer Pools
-
-Scope:
-
-```text
-Modify only after Stage 6/7 synchronous correctness:
-  asym_gemm/training/activation_offload.py
-    optional copy streams/events
-    pinned CPU pool controls
-    HBM staging pool controls
-  asym_gemm/training/attention_activation_offload.py
-    stream/event waits at wrapper boundaries if needed
-  scripts/testing/validate_attention_activation_offload.py
-    async profiling counters
-```
-
-Implementation steps:
-
-```text
-1. Add optional async D2H/H2D paths guarded by an env/config flag.
-2. Use CUDA events so CPU buffers are not reused before GPU reads complete.
-3. Reuse pinned CPU and HBM staging buffers by shape/dtype/tag.
-4. Add mask packing only if p > 0 mask bytes are material in Stage 6 artifacts.
-```
-
-Risks to watch:
-
-```text
-Incorrect event ordering can race CPU buffer reuse against AsymGEMM reads.
-Async copies can increase reserved HBM through larger staging pools.
-Pinned CPU pool growth can hurt host memory pressure and CPU AdamW state.
-```
-
-Validation:
-
-```bash
-ASYMM_ATTN_ACT_OFFLOAD=1 \
-ASYMM_ATTN_ACT_OFFLOAD_ASYNC=1 \
-python scripts/testing/validate_attention_activation_offload.py \
-  --mode profile \
-  --model-family qwen3 \
-  --device cuda:0 \
-  --backend asym \
-  --batch-size 1 \
-  --seq-len 512 \
-  --hidden-size 1024 \
-  --num-heads 16 \
-  --num-kv-heads 8 \
-  --lora-rank 8 \
-  --lora-alpha 16 \
-  --lora-dropout 0.0 \
-  --attn-implementation sdpa \
-  --variants attn_act_offload,attn_act_offload_async \
-  --profile-launches true \
-  --warmup 5 \
-  --iters 10 \
-  --max-step-time-ratio 1.10 \
-  --output-json reports/attn_act_offload/stage8_async_profile.json
-```
-
-Acceptance:
-
-```text
-same correctness as Stage 6/7
-step time improves or stays within 1.10x of synchronous offload
-reserved HBM does not grow enough to erase the memory win
-CPU process memory including CPU AdamW state remains within expected host budget
+Full-attention correctness passes for Qwen3 text and Llama4 text.
+LF source profile shows meaningful HBM reduction by the hard contract.
+Latency ratio is within gate or the feature is rejected.
+CPU AdamW update health passes.
+attention:saved_activations drops without equivalent temporary/unattributed peak
+growth.
+Launch counts match the per-projection contract.
+Remaining SDPA/FA core saved tensors are reported separately.
 ```

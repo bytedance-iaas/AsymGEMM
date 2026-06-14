@@ -27,6 +27,7 @@ PROFILE_MEMORY_BREAKDOWN_ENV = "ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN"
 PROFILE_MEMORY_BREAKDOWN_OUTPUT_ENV = "ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_OUTPUT"
 PROFILE_MEMORY_SNAPSHOT_ENV = "ASYM_GEMM_LF_PROFILE_MEMORY_SNAPSHOT"
 PROFILE_MEMORY_SNAPSHOT_PATH_ENV = "ASYM_GEMM_LF_PROFILE_MEMORY_SNAPSHOT_PATH"
+PROFILE_MEMORY_SNAPSHOT_MAX_ENTRIES_ENV = "ASYM_GEMM_LF_PROFILE_MEMORY_SNAPSHOT_MAX_ENTRIES"
 PROFILE_EXTERNAL_MEMORY_ENV = "ASYM_GEMM_LF_PROFILE_EXTERNAL_MEMORY"
 PROFILE_SYNC_ENV = "ASYM_GEMM_LF_PROFILE_SYNC"
 PROFILE_MODULE_FILTER_ENV = "ASYM_GEMM_LF_PROFILE_MODULE_FILTER"
@@ -51,6 +52,16 @@ def _env_enabled(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return max(minimum, int(value))
+    except ValueError:
+        return default
 
 
 def _is_rank0() -> bool:
@@ -1351,11 +1362,21 @@ def _start_memory_snapshot_recording(enabled: bool) -> dict[str, Any]:
         return {"enabled": False}
     if not torch.cuda.is_available():
         return {"enabled": True, "record_started": False, "error": "cuda unavailable"}
+    max_entries = _env_int(PROFILE_MEMORY_SNAPSHOT_MAX_ENTRIES_ENV, 1_000_000, minimum=1)
     try:
-        torch.cuda.memory._record_memory_history()  # type: ignore[attr-defined]
+        torch.cuda.memory._record_memory_history(  # type: ignore[attr-defined]
+            max_entries=max_entries,
+            stacks="python",
+            context="all",
+        )
+    except TypeError:
+        try:
+            torch.cuda.memory._record_memory_history()  # type: ignore[attr-defined]
+        except Exception as exc:
+            return {"enabled": True, "record_started": False, "error": str(exc)}
     except Exception as exc:
         return {"enabled": True, "record_started": False, "error": str(exc)}
-    return {"enabled": True, "record_started": True}
+    return {"enabled": True, "record_started": True, "max_entries": max_entries}
 
 
 def _dump_memory_snapshot(snapshot_info: dict[str, Any], path: Path) -> dict[str, Any]:
@@ -1897,6 +1918,74 @@ def _lora_counters_from_model() -> dict[str, Any]:
     }
 
 
+def _activation_offload_counters_from_model() -> dict[str, Any]:
+    model, base_model = _model_and_base_model()
+    if model is None:
+        return {"available": False, "reason": "model hook did not capture a model"}
+
+    rows: list[dict[str, Any]] = []
+    seen_modules: set[int] = set()
+    module_roots = [root for root in (model, base_model) if root is not None]
+    for root in module_roots:
+        for name, module in root.named_modules():
+            module_key = id(module)
+            if module_key in seen_modules:
+                continue
+            seen_modules.add(module_key)
+
+            stats = getattr(module, "_last_activation_offload_stats", None)
+            pre_release_stats = getattr(module, "_last_activation_offload_stats_pre_release", None)
+            execution_stats = getattr(module, "stats", None)
+            if not isinstance(stats, dict) or not stats:
+                continue
+
+            row: dict[str, Any] = {
+                "name": name,
+                "class": module.__class__.__name__,
+                "profile_prefix": getattr(module, "profile_prefix", ""),
+            }
+            if isinstance(stats, dict):
+                row["activation_offload_stats"] = dict(stats)
+                row["cpu_owned_bytes"] = _safe_int(stats.get("cpu_owned_bytes")) or 0
+                row["cpu_live_bytes"] = _safe_int(stats.get("cpu_live_bytes")) or 0
+                row["cpu_peak_bytes_live"] = _safe_int(stats.get("cpu_peak_bytes_live")) or 0
+                row["max_stage_bytes_live"] = _safe_int(stats.get("max_stage_bytes_live")) or 0
+                row["cpu_pool_cached_bytes"] = _safe_int(stats.get("cpu_pool_cached_bytes")) or 0
+                row["cpu_pool_limit_bytes"] = _safe_int(stats.get("cpu_pool_limit_bytes")) or 0
+                row["pre_final_cleanup_cpu_owned_bytes"] = (
+                    _safe_int(stats.get("pre_final_cleanup_cpu_owned_bytes")) or 0
+                )
+                row["final_cleanup_released_bytes"] = _safe_int(stats.get("final_cleanup_released_bytes")) or 0
+            if isinstance(pre_release_stats, dict):
+                row["activation_offload_stats_pre_release"] = dict(pre_release_stats)
+
+            as_dict = getattr(execution_stats, "as_dict", None)
+            if callable(as_dict):
+                try:
+                    execution_stats_dict = as_dict()
+                except Exception as exc:
+                    row["execution_stats_error"] = repr(exc)
+                else:
+                    if isinstance(execution_stats_dict, dict):
+                        row["execution_stats"] = execution_stats_dict
+            rows.append(row)
+
+    return {
+        "available": bool(rows),
+        "module_count": len(rows),
+        "rows": rows,
+        "total_cpu_owned_bytes": sum(int(row.get("cpu_owned_bytes", 0) or 0) for row in rows),
+        "total_cpu_live_bytes": sum(int(row.get("cpu_live_bytes", 0) or 0) for row in rows),
+        "max_cpu_peak_bytes_live": max([int(row.get("cpu_peak_bytes_live", 0) or 0) for row in rows] or [0]),
+        "max_stage_bytes_live": max([int(row.get("max_stage_bytes_live", 0) or 0) for row in rows] or [0]),
+        "max_cpu_pool_cached_bytes": max([int(row.get("cpu_pool_cached_bytes", 0) or 0) for row in rows] or [0]),
+        "max_cpu_pool_limit_bytes": max([int(row.get("cpu_pool_limit_bytes", 0) or 0) for row in rows] or [0]),
+        "total_final_cleanup_released_bytes": sum(
+            int(row.get("final_cleanup_released_bytes", 0) or 0) for row in rows
+        ),
+    }
+
+
 @dataclass
 class StageRecord:
     milliseconds: float
@@ -2260,6 +2349,7 @@ class LFProfileRecorder:
         losses = self._loss_rows(trainer_records)
         lora = _lora_counters_from_model()
         kt = _kt_counters_from_model(self.config)
+        activation_offload = _activation_offload_counters_from_model()
         process_memory = _process_memory_snapshot()
         return {
             "workload": self.config.get("workload", "lf"),
@@ -2315,6 +2405,7 @@ class LFProfileRecorder:
             },
             "lora": lora,
             "kt": kt,
+            "activation_offload": activation_offload,
             "grad_clip": _GRAD_CLIP_MARKER,
             "optimizer_memory_preflight": _kt_optimizer_memory_preflight(lora, self.config),
             "optimizer_memory": _OPTIMIZER_MEMORY_MARKER,

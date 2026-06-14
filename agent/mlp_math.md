@@ -39,6 +39,17 @@ When an operand is CPU-resident, this note marks the operand side in the GEMM
 operator. For example, `U_cpu @^L V.T` has a CPU left operand, while
 `U @^R V_cpu` has a CPU right operand.
 
+```
+offload(Z)   = copy HBM tensor to CPU and save the CPU owner
+stage(Z_cpu) = copy CPU tensor to an HBM tensor for immediate use
+release(...) = listed tensors or saved handles are no longer live
+```
+
+`Y += GEMM(...)` means accumulate into an already-live output buffer. Use a
+beta/addmm-style epilogue when the backend supports it. If a backend must
+materialize the GEMM result, that result is a one-line temporary consumed by the
+add and released immediately.
+
 For branch `b in {gate, up, down}`, with saved dropout mask `mask_b`,
 `p = lora_dropout_p`, and `q = 1 - p`:
 
@@ -67,9 +78,9 @@ S_b   = pack_g(S_b,g)                 # [M,r]
 There is no intermediate `[r,M_g]` low-rank output. The low-rank output layout
 is `[M_g,r]` directly.
 
-Only the small low-rank `[M,r]` tensor is materialized in HBM. The wide dropped
-LoRA input `D(U_cpu)` stays CPU-side and can be recomputed from the saved source
-activation and saved dropout mask.
+For LoRA-A forward, only the small low-rank `[M,r]` tensor is materialized in
+HBM. The wide dropped LoRA input `D(U_cpu)` stays CPU-side and can be recomputed
+from the saved source activation and saved dropout mask.
 
 `S_gate_cpu`, `S_up_cpu`, and `S_down_cpu` store the same low-rank values as
 `S_gate`, `S_up`, and `S_down`. Backward equations write `S_b,g` for the
@@ -83,118 +94,136 @@ reductions below are grouped over `g = 0..G-1`. The `_g` equations are the
 expanded math for the grouped operation/reduction, not separate ungrouped work
 items.
 
+When a wide gradient is already CPU-resident, LoRA-B backward uses a grouped
+CPU-left op to compute both `dS_b` and `dB_b`. Do not stage `[M,I]` or `[M,H]`
+wide gradients to HBM solely for `dS_b`/`dB_b`; stage only the saved low-rank
+`S_b_cpu [M,r]`.
+
 ### Forward
 
 ```
 X = packed_routed_rows                                  # [M,H] HBM
+X_cpu = offload(X)                                      # [M,H] CPU, save for dA_gate/dA_up
 
-gate_up_base_g = X_g @^R W_gate_up_cpu[e_g].T           # [M_g,2I] HBM
-gate_up_base = pack_g(gate_up_base_g)                   # [M,2I] HBM
-gate_base, up_base = split(gate_up_base)                # [M,I], [M,I]
+gate_up = pack_g(X_g @^R W_gate_up_cpu[e_g].T)          # [M,2I] HBM live
+gate, up = split(gate_up)                               # [M,I], [M,I] HBM views
 
-X_cpu = offload(X)                                      # [M,H] CPU
+
+# ---------------- gate projection ----------------
 
 X_gate_lora_cpu,g = D_gate(X_cpu,g)                     # [M_g,H] CPU
 S_gate_g = X_gate_lora_cpu,g @^L A_gate[e_g].T          # [M_g,r] HBM
 S_gate = pack_g(S_gate_g)                               # [M,r] HBM
+S_gate_cpu = offload(S_gate)                            # [M,r] CPU, save for dB_gate
+gate += scale * pack_g(S_gate_g @ B_gate[e_g].T)        # consume gate delta now
+release(S_gate, X_gate_lora_cpu_if_materialized)
+
+
+# ---------------- up projection ----------------
 
 X_up_lora_cpu,g = D_up(X_cpu,g)                         # [M_g,H] CPU
 S_up_g = X_up_lora_cpu,g @^L A_up[e_g].T                # [M_g,r] HBM
 S_up = pack_g(S_up_g)                                   # [M,r] HBM
+S_up_cpu = offload(S_up)                                # [M,r] CPU, save for dB_up
+up += scale * pack_g(S_up_g @ B_up[e_g].T)              # consume up delta now
+release(S_up, X_up_lora_cpu_if_materialized)
 
-LoRA_gate_g = scale * (S_gate_g @ B_gate[e_g].T)        # [M_g,I] HBM
-LoRA_gate = pack_g(LoRA_gate_g)                         # [M,I] HBM
-gate = gate_base + LoRA_gate                            # [M,I] HBM
-LoRA_up_g = scale * (S_up_g @ B_up[e_g].T)              # [M_g,I] HBM
-LoRA_up = pack_g(LoRA_up_g)                             # [M,I] HBM
-up = up_base + LoRA_up                                  # [M,I] HBM
 
 gate_cpu = offload(gate)                                # [M,I] CPU
 up_cpu = offload(up)                                    # [M,I] CPU
-S_gate_cpu = offload(S_gate)                            # [M,r] CPU, save for dB_gate
-S_up_cpu = offload(S_up)                                # [M,r] CPU, save for dB_up
+release(gate_up)
 
-silu_gate_cpu = silu(gate_cpu)                          # [M,I] CPU
-act_cpu = silu_gate_cpu * up_cpu                        # [M,I] CPU
+silu_gate_tmp_cpu = silu(gate_cpu)                      # [M,I] CPU temp
+act_cpu = silu_gate_tmp_cpu * up_cpu                    # [M,I] CPU, save for down
+release(silu_gate_tmp_cpu)
+
+
+# ---------------- down base projection ----------------
+
+act_stage = stage(act_cpu)                               # [M,I] HBM
+Y_down = pack_g(act_stage_g @^R W_down_cpu[e_g].T)       # [M,H] HBM live
+release(act_stage)
+
+
+# ---------------- down LoRA projection ----------------
 
 act_down_lora_cpu,g = D_down(act_cpu,g)                 # [M_g,I] CPU
 S_down_g = act_down_lora_cpu,g @^L A_down[e_g].T        # [M_g,r] HBM
 S_down = pack_g(S_down_g)                               # [M,r] HBM
-LoRA_down_g = scale * (S_down_g @ B_down[e_g].T)        # [M_g,H] HBM
-LoRA_down = pack_g(LoRA_down_g)                         # [M,H] HBM
 S_down_cpu = offload(S_down)                            # [M,r] CPU, save for dB_down
-
-act = stage(act_cpu)                                    # [M,I] HBM, needed for down base
-Y_down_base_g = act_g @^R W_down_cpu[e_g].T             # [M_g,H] HBM
-Y_down = pack_g(Y_down_base_g) + LoRA_down              # [M,H] HBM
+Y_down += scale * pack_g(S_down_g @ B_down[e_g].T)      # consume down delta now
+release(S_down, act_down_lora_cpu_if_materialized)
 ```
 
 ### Backward
 
 ```
 dY = dL/dY_down                                         # [M,H] HBM
+dY_cpu = offload(dY)                                    # [M,H] CPU, for down dS/dB
 
 # ---------------- down backward ----------------
 
-dS_down_g = scale * (dY_g @ B_down[e_g])                # [M_g,r] HBM
-dS_down = pack_g(dS_down_g)                             # [M,r] HBM
+dact = pack_g(dY_g @^R W_down_cpu[e_g])                 # [M,I] HBM live
+release(dY_if_owned)
 
-dact_lora_raw_g = dS_down_g @ A_down[e_g]               # [M_g,I] HBM
-dact_lora_raw = pack_g(dact_lora_raw_g)                 # [M,I] HBM
-dact_lora = D_down_bar(dact_lora_raw)                   # [M,I] HBM
-dact_base_g = dY_g @^R W_down_cpu[e_g]                  # [M_g,I] HBM
-dact_base = pack_g(dact_base_g)                         # [M,I] HBM
-dact = dact_base + dact_lora                            # [M,I] HBM
+S_down = stage(S_down_cpu)                              # [M,r] HBM
+dS_down_g = scale * (dY_cpu,g @^L B_down[e_g])          # [M_g,r] HBM
+dS_down = pack_g(dS_down_g)                             # [M,r] HBM
+dB_down[e] = scale * sum_{g:e_g=e} dY_cpu,g.T @^L S_down_g  # [H,r] Grad
+release(S_down, dY_cpu, S_down_cpu)
+
+dact += D_down_bar(pack_g(dS_down_g @ A_down[e_g]))     # consume down dact delta
 
 dact_cpu = offload(dact)                                # [M,I] CPU
+release(dact)
 
 act_down_lora_cpu,g = D_down(act_cpu,g)                 # [M_g,I] CPU
 dA_down[e] = sum_{g:e_g=e} dS_down_g.T @^R act_down_lora_cpu,g  # [r,I] Grad
-dB_down[e] = scale * sum_{g:e_g=e} dY_g.T @ S_down_g    # [H,r] Grad
+release(dS_down, act_down_lora_cpu_if_materialized, act_cpu)
 
 
 # ---------------- activation backward ----------------
 
 dgate_cpu = silu_backward(dact_cpu * up_cpu, gate_cpu)  # [M,I] CPU
-dup_cpu = dact_cpu * silu_gate_cpu                      # [M,I] CPU
+dup_cpu = dact_cpu * silu(gate_cpu)                     # [M,I] CPU
+release(dact_cpu, gate_cpu, up_cpu)
+
+
+# ---------------- gate/up base backward ----------------
 
 dgate_up = stage_concat(dgate_cpu, dup_cpu)             # [M,2I] HBM
-dgate, dup = split(dgate_up)                            # [M,I], [M,I] HBM
+dX = pack_g(dgate_up_g @^R W_gate_up_cpu[e_g])          # [M,H] HBM live
+release(dgate_up)
 
 
 # ---------------- gate LoRA backward ----------------
 
 S_gate = stage(S_gate_cpu)                              # [M,r] HBM
-dS_gate_g = scale * (dgate_g @ B_gate[e_g])             # [M_g,r] HBM
+dS_gate_g = scale * (dgate_cpu,g @^L B_gate[e_g])       # [M_g,r] HBM
 dS_gate = pack_g(dS_gate_g)                             # [M,r] HBM
-dX_gate_raw_g = dS_gate_g @ A_gate[e_g]                 # [M_g,H] HBM
-dX_gate_raw = pack_g(dX_gate_raw_g)                     # [M,H] HBM
-dX_gate_lora = D_gate_bar(dX_gate_raw)                  # [M,H] HBM
+dB_gate[e] = scale * sum_{g:e_g=e} dgate_cpu,g.T @^L S_gate_g  # [I,r] Grad
+release(S_gate, S_gate_cpu)
+
+dX += D_gate_bar(pack_g(dS_gate_g @ A_gate[e_g]))       # consume gate dX delta
 
 X_gate_lora_cpu,g = D_gate(X_cpu,g)                     # [M_g,H] CPU
 dA_gate[e] = sum_{g:e_g=e} dS_gate_g.T @^R X_gate_lora_cpu,g  # [r,H] Grad
-dB_gate[e] = scale * sum_{g:e_g=e} dgate_g.T @ S_gate_g  # [I,r] Grad
+release(dS_gate, dgate_cpu, X_gate_lora_cpu_if_materialized)
 
 
 # ---------------- up LoRA backward ----------------
 
 S_up = stage(S_up_cpu)                                  # [M,r] HBM
-dS_up_g = scale * (dup_g @ B_up[e_g])                   # [M_g,r] HBM
+dS_up_g = scale * (dup_cpu,g @^L B_up[e_g])             # [M_g,r] HBM
 dS_up = pack_g(dS_up_g)                                 # [M,r] HBM
-dX_up_raw_g = dS_up_g @ A_up[e_g]                       # [M_g,H] HBM
-dX_up_raw = pack_g(dX_up_raw_g)                         # [M,H] HBM
-dX_up_lora = D_up_bar(dX_up_raw)                        # [M,H] HBM
+dB_up[e] = scale * sum_{g:e_g=e} dup_cpu,g.T @^L S_up_g  # [I,r] Grad
+release(S_up, S_up_cpu)
+
+dX += D_up_bar(pack_g(dS_up_g @ A_up[e_g]))             # consume up dX delta
 
 X_up_lora_cpu,g = D_up(X_cpu,g)                         # [M_g,H] CPU
 dA_up[e] = sum_{g:e_g=e} dS_up_g.T @^R X_up_lora_cpu,g  # [r,H] Grad
-dB_up[e] = scale * sum_{g:e_g=e} dup_g.T @ S_up_g       # [I,r] Grad
-
-
-# ---------------- gate/up base backward ----------------
-
-dX_base_g = dgate_up_g @^R W_gate_up_cpu[e_g]           # [M_g,H] HBM
-dX_base = pack_g(dX_base_g)                              # [M,H] HBM
-dX = dX_base + dX_gate_lora + dX_up_lora                 # [M,H] HBM
+release(dS_up, dup_cpu, X_up_lora_cpu_if_materialized, X_cpu)
 
 
 # ---------------- final input gradient ----------------

@@ -775,3 +775,58 @@ def test_source_profile_asym_cpu_adamw_summary_and_warmup_stage_rows() -> None:
     assert row["samples"] == 1
     assert row["raw_samples"] == 2
     assert row["warmup_samples_skipped"] == 1
+
+
+def test_source_profile_reports_activation_offload_counters() -> None:
+    class SyntheticExecutionStats:
+        def as_dict(self):
+            return {
+                "asym_forward_calls": 3,
+                "asym_dx_calls": 2,
+                "expact_lora_a_forward_grouped_calls": 4,
+                "reference_fallback_count": 0,
+                "fallback_reasons": {},
+            }
+
+    class SyntheticExpert(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.profile_prefix = "layers.0.mlp.experts"
+            self.stats = SyntheticExecutionStats()
+            self._last_activation_offload_stats = {
+                "cpu_owned_bytes": 0,
+                "cpu_live_bytes": 0,
+                "cpu_peak_bytes_live": 1024,
+                "max_stage_bytes_live": 2048,
+                "cpu_pool_cached_bytes": 4096,
+                "cpu_pool_limit_bytes": 8192,
+                "pre_final_cleanup_cpu_owned_bytes": 0,
+                "final_cleanup_released_bytes": 0,
+            }
+            self._last_activation_offload_stats_pre_release = {
+                "cpu_owned_bytes": 0,
+                "max_stage_bytes_live": 2048,
+            }
+
+    class SyntheticModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.experts = SyntheticExpert()
+
+    previous = lf_profiled_train._LAST_LF_MODEL
+    try:
+        lf_profiled_train._LAST_LF_MODEL = SyntheticModel()
+        summary = lf_profiled_train._activation_offload_counters_from_model()
+    finally:
+        lf_profiled_train._LAST_LF_MODEL = previous
+
+    assert summary["available"] is True
+    assert summary["module_count"] == 1
+    assert summary["total_cpu_live_bytes"] == 0
+    assert summary["max_cpu_peak_bytes_live"] == 1024
+    assert summary["max_stage_bytes_live"] == 2048
+    assert summary["max_cpu_pool_cached_bytes"] == 4096
+    row = summary["rows"][0]
+    assert row["name"] == "experts"
+    assert row["execution_stats"]["asym_forward_calls"] == 3
+    assert row["activation_offload_stats"]["cpu_pool_limit_bytes"] == 8192
