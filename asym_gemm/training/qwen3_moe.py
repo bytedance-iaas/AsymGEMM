@@ -1057,6 +1057,7 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
                 stats=layer.stats,
             ).mul_(layer.lora_scale)
             manager.release_stage(down_low_rank, drop_cache=True)
+            manager.release_cpu(ctx.down_low_rank_cpu)
             grad_down_lora_A = grouped_lora_a_grad_cpu_right(
                 dS_down,
                 ctx.act_cpu.tensor,
@@ -1066,6 +1067,7 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
                 stats=layer.stats,
                 tag="down",
             )
+            manager.release_cpu(ctx.act_cpu)
 
         with prof_range("backward.mlp.activation_offload.down_base_dx"):
             grad_act = _grouped_base_dx(
@@ -1089,6 +1091,9 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
                 grad_act_cpu,
                 manager,
             )
+            manager.release_cpu(grad_act_cpu)
+            manager.release_cpu(ctx.gate_cpu)
+            manager.release_cpu(ctx.up_cpu)
 
         grad_packed = None
         grad_gate_lora_x = None
@@ -1097,6 +1102,8 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
         with prof_range("backward.mlp.activation_offload.gate_up_stage"):
             grad_gate_up = manager.stage_concat_columns(grad_gate_cpu, grad_up_cpu, tag="dgate_up_for_gate_up_base")
             grad_gate_stage, grad_up_stage = grad_gate_up.split(int(grad_gate_cpu.tensor.shape[1]), dim=-1)
+            manager.release_cpu(grad_gate_cpu)
+            manager.release_cpu(grad_up_cpu)
 
         with prof_range("backward.mlp.activation_offload.gate_lora"):
             gate_low_rank = stage_low_rank_from_cpu(
@@ -1122,6 +1129,7 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
             ).mul_(layer.lora_scale)
             layer.stats.expact_lora_b_backward_grouped_calls += 1
             manager.release_stage(gate_low_rank, drop_cache=True)
+            manager.release_cpu(ctx.gate_low_rank_cpu)
             if need_grad_packed:
                 grad_gate_lora_x = grouped_expert_lora(
                     dS_gate,
@@ -1155,6 +1163,7 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
             ).mul_(layer.lora_scale)
             layer.stats.expact_lora_b_backward_grouped_calls += 1
             manager.release_stage(up_low_rank, drop_cache=True)
+            manager.release_cpu(ctx.up_low_rank_cpu)
             if need_grad_packed:
                 grad_up_lora_x = grouped_expert_lora(
                     dS_up,
@@ -1174,6 +1183,7 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
                 num_experts=int(gate_lora_A.shape[0]),
                 stats=layer.stats,
             )
+            manager.release_cpu(ctx.x_cpu)
 
         if need_grad_packed:
             with prof_range("backward.mlp.activation_offload.gate_up_base_dx"):
@@ -1192,7 +1202,8 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
                 grad_packed.add_(grad_up_lora_x.to(dtype=grad_packed.dtype))
 
         manager.release_stage(grad_gate_up, drop_cache=True)
-        activation_offload_stats = manager.snapshot()
+        activation_offload_stats_pre_release = manager.snapshot()
+        final_cleanup_released_bytes = 0
         for handle in (
             ctx.x_cpu,
             ctx.gate_cpu,
@@ -1205,7 +1216,11 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
             grad_gate_cpu,
             grad_up_cpu,
         ):
-            manager.release_cpu(handle)
+            final_cleanup_released_bytes += manager.release_cpu(handle)
+        activation_offload_stats = manager.snapshot()
+        activation_offload_stats["pre_final_cleanup_cpu_owned_bytes"] = activation_offload_stats_pre_release.get("cpu_owned_bytes", 0)
+        activation_offload_stats["final_cleanup_released_bytes"] = final_cleanup_released_bytes
+        layer._last_activation_offload_stats_pre_release = activation_offload_stats_pre_release
         layer._last_activation_offload_stats = activation_offload_stats
 
         return (

@@ -19,7 +19,11 @@ from asym_gemm.integrations.lf import (
     save_asym_peft_adapter,
 )
 from asym_gemm.integrations.peft_lf import adapt_lf_asym_peft_lora
-from asym_gemm.training.activation_offload import ActivationOffloadManager
+from asym_gemm.training.activation_offload import (
+    ActivationOffloadManager,
+    activation_offload_cpu_pool_stats,
+    clear_activation_offload_cpu_pool,
+)
 from asym_gemm.training.exp_act_offload_lora import require_expert_activation_offload_kernels
 from asym_gemm.training.frozen_linear import AsymFrozenLinear, TorchGroupedFrozenLinear
 from asym_gemm.training.llama4_moe import AsymLlama4Moe, AsymLlama4Router, is_llama4_moe
@@ -480,11 +484,13 @@ def test_is_llama4_moe_accepts_fake_and_rejects_qwen3_experts() -> None:
 
 
 def test_activation_offload_manager_tracks_cpu_owners_and_stage_reuse() -> None:
+    clear_activation_offload_cpu_pool()
     manager = ActivationOffloadManager(pin_memory=False)
     x = torch.randn(3, 4, dtype=torch.bfloat16)
     handle = manager.offload(x, "x")
+    nbytes = x.numel() * x.element_size()
     assert handle.tensor.device.type == "cpu"
-    assert manager.snapshot()["cpu_owned_bytes"] == x.numel() * x.element_size()
+    assert manager.snapshot()["cpu_owned_bytes"] == nbytes
 
     stage0 = manager.stage(handle, tag="x_stage")
     ptr0 = int(stage0.data_ptr())
@@ -494,10 +500,37 @@ def test_activation_offload_manager_tracks_cpu_owners_and_stage_reuse() -> None:
     manager.release_stage(stage1)
 
     stats = manager.snapshot()
-    assert stats["max_stage_bytes_live"] == x.numel() * x.element_size()
-    assert stats["stage_peak_by_tag"]["x_stage"] == x.numel() * x.element_size()
-    manager.release_cpu(handle)
+    assert stats["max_stage_bytes_live"] == nbytes
+    assert stats["stage_peak_by_tag"]["x_stage"] == nbytes
+    assert manager.release_cpu(handle) == nbytes
     assert manager.snapshot()["cpu_owned_bytes"] == 0
+    assert manager.release_cpu(handle) == 0
+    assert activation_offload_cpu_pool_stats()["cpu_pool_cached_bytes"] >= nbytes
+    clear_activation_offload_cpu_pool()
+    assert activation_offload_cpu_pool_stats()["cpu_pool_cached_bytes"] == 0
+
+
+def test_activation_offload_cpu_pool_respects_configured_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    clear_activation_offload_cpu_pool()
+    x = torch.randn(8, 8, dtype=torch.bfloat16)
+    nbytes = x.numel() * x.element_size()
+
+    monkeypatch.setenv("ASYM_EXPACT_CPU_POOL_MAX_BYTES", str(max(0, nbytes - 1)))
+    manager = ActivationOffloadManager(pin_memory=False)
+    handle = manager.offload(x, "x")
+    assert manager.release_cpu(handle) == nbytes
+    stats = activation_offload_cpu_pool_stats()
+    assert stats["cpu_pool_cached_bytes"] == 0
+    assert stats["cpu_pool_evictions"] >= 1
+
+    monkeypatch.setenv("ASYM_EXPACT_CPU_POOL_MAX_BYTES", str(nbytes * 2))
+    manager = ActivationOffloadManager(pin_memory=False)
+    handle = manager.offload(x, "x")
+    assert manager.release_cpu(handle) == nbytes
+    stats = activation_offload_cpu_pool_stats()
+    assert 0 < stats["cpu_pool_cached_bytes"] <= nbytes * 2
+    clear_activation_offload_cpu_pool()
+    assert activation_offload_cpu_pool_stats()["cpu_pool_cached_bytes"] == 0
 
 
 def test_parse_expert_recompute_policy_spec() -> None:
@@ -2128,6 +2161,10 @@ def test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend(monke
     assert stats["offload_bytes_by_tag"]["S_down"] > 0
     assert stats["stage_peak_by_tag"]["act_for_down_base"] > 0
     assert stats["stage_peak_by_tag"]["dgate_up_for_gate_up_base"] > 0
+    assert stats["cpu_owned_bytes"] == 0
+    assert stats["pre_final_cleanup_cpu_owned_bytes"] == 0
+    assert stats["final_cleanup_released_bytes"] == 0
+    assert stats["cpu_pool_cached_bytes"] <= stats["cpu_pool_limit_bytes"]
     assert asym_backend.stats.cpu_left_lora_a_calls > 0
 
 

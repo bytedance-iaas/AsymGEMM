@@ -85,8 +85,9 @@ baseline unless rerun and recorded here.
 | S8 | Hidden materialization and workspace cleanup | profile-visible bounded scratch, no untagged full-width expact materializations |
 | S9 | Final fair comparison and CPU Adam acceptance | canonical `none|true,gc-exp|false,none|false` LF comparison and CPU Adam pass/fail evidence |
 
-Current active comparison baseline, recorded 2026-06-13 from the exact LF
-workflow:
+Pre-S3 acceptance baseline, recorded 2026-06-13 from the exact LF workflow.
+Use these numbers only to judge whether S2/S3 improved the pre-change state;
+future work compares against the post-S4 accepted baseline below.
 
 - command:
   `bash /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh`
@@ -106,7 +107,7 @@ workflow:
   `USE_ASYM_CPU_ADAMW=true`, backend `deepspeed`, pinned memory `true`,
   fp32 master `true`
 
-Baseline results:
+Pre-S3 baseline results:
 
 | policy | implementation | status | peak allocated HBM | peak reserved HBM | avg step | avg forward | avg backward |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -129,15 +130,72 @@ Runtime call counts from the same run:
   `torch_forward_calls=0`, `torch_dx_calls=0`,
   `reference_fallback_count=0`, `fallback_reasons=none`
 
-OOM detail for `none|false`: cross-entropy tried to allocate `9.27 GiB` with
-`4.14 GiB` free; PyTorch reported `178.89 GiB` allocated and the partial
+OOM detail for pre-S3 `none|false`: cross-entropy tried to allocate `9.27 GiB`
+with `4.14 GiB` free; PyTorch reported `178.89 GiB` allocated and the partial
 profile captured the peak above.
 
-Acceptance rule against this baseline: future changes must either materially
-lower `none|true` peak HBM without a large latency regression, or improve
-`none|true` latency while keeping peak HBM flat or lower. Same memory with worse
-latency is a regression and must be reverted. Tiny HBM savings do not justify a
-major latency blow-up.
+Current accepted post-S4 baseline, recorded 2026-06-13 after S2 CPU lifetime
+cleanup and S3 scatter no-save:
+
+- command:
+  `scripts/lf/profile_lora_lf.sh --gpus 0`
+- output root:
+  `/workspace/AsymGEMM-SFT/third_party/AsymGEMM/outputs/expact_v3_stage4_reprofile_b4s4096_nohook_20260614T020837Z/asym_long_sft_smoke__lora__lf__bf16`
+- model/workload: `Qwen/Qwen3-30B-A3B`, `b4_s4096`, `logical_qlen=16384`
+- dataset: `asym_long_sft_smoke__qwen3-30b-a3b__s4096`
+- backend/profiler: `asym_cpuadamwds|norecomp`, `PROFILERS=source`
+- policy axis: `ASYMM_EXP_ACT_POLICIES="none|true,gc-exp|false,none|false"`
+- precision/LoRA: `bf16`, rank `64`, alpha `16`, dropout `0.00`, target `all`
+- steps: `WARMUP_STEPS=5`, measured `MAX_STEPS=10`, trainer total `15`
+- profiling overhead flags:
+  `PROFILE_MEMORY_ATTRIBUTION=false`,
+  `PROFILE_MEMORY_BREAKDOWN=false`,
+  `PROFILE_MEMORY_SNAPSHOT=false`
+- CPU Adam config:
+  `USE_ASYM_CPU_ADAMW=true`, backend `deepspeed`, pinned memory `true`,
+  fp32 master `true`
+- CPU activation pool cap:
+  `ASYM_EXPACT_CPU_POOL_MAX_BYTES=34359738368` (`32 GiB`)
+
+Post-S4 results:
+
+| policy | implementation | status | peak allocated HBM | peak reserved HBM | avg step | avg forward | avg backward | measured e2e step |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `none|true` | activation offload target | completed | `102.312 GiB` | `107.469 GiB` | `45.173 s` | `10.036 s` | `35.137 s` | `46.675 s` |
+| `gc-exp|false` | expert torch checkpoint baseline | completed | `126.312 GiB` | `131.414 GiB` | `3.953 s` | `1.570 s` | `2.383 s` | `5.348 s` |
+| `none|false` | no expact/no expert recompute control | completed | `170.503 GiB` | `183.055 GiB` | `3.129 s` | `1.562 s` | `1.567 s` | `4.521 s` |
+
+Post-S4 runtime call counts:
+
+- `none|true`:
+  `asym_forward_calls=5055`, `asym_dx_calls=4290`,
+  `torch_forward_calls=0`, `torch_dx_calls=0`,
+  `reference_fallback_count=0`, `fallback_reasons=none`
+- `gc-exp|false`:
+  `asym_forward_calls=6495`, `asym_dx_calls=4290`,
+  `torch_forward_calls=0`, `torch_dx_calls=0`,
+  `reference_fallback_count=0`, `fallback_reasons=none`
+- `none|false`:
+  `asym_forward_calls=5055`, `asym_dx_calls=4290`,
+  `torch_forward_calls=0`, `torch_dx_calls=0`,
+  `reference_fallback_count=0`, `fallback_reasons=none`
+
+S3/S4 effect versus the pre-S3 reference:
+
+- `none|true` peak allocated HBM dropped by `24.000 GiB`
+  (`126.312 -> 102.312 GiB`), peak reserved dropped by `24.297 GiB`, and source
+  avg step changed by `+1.431 s` (`43.742 -> 45.173 s`). This is an acceptable
+  memory-first tradeoff: a large HBM reduction with a small latency increase.
+- `gc-exp|false` also dropped by `24.000 GiB` peak allocated because the
+  router-no-grad scatter no-save path is shared by checkpoint and expact cases.
+- `none|false` now completes at `170.503 GiB` peak allocated instead of OOMing
+  at the pre-S3 partial `178.891 GiB` peak.
+
+Future acceptance rule against the post-S4 baseline: future changes must either
+materially lower `none|true` peak HBM below `102.312 GiB` without a large latency
+regression, or improve `none|true` latency below `45.173 s` while keeping peak
+HBM flat or lower. Same memory with worse latency is a regression and must be
+reverted. Tiny HBM savings do not justify a major latency blow-up.
 
 All LF profiling and acceptance validation must use the workflow script:
 
@@ -307,10 +365,11 @@ the profile:
 
 ## Current Baseline Context And Historical Guardrails
 
-The active comparison numbers are only the fresh `b4_s4096` sweep above. Older
-numeric runs are intentionally not carried forward in v3 because they caused
-confusion and are no longer the comparison baseline. Detailed historical numbers
-belong in `fix_exp_acc_offload_v2.md`.
+The active comparison numbers are the post-S4 `b4_s4096` sweep above. The
+pre-S3 table is retained only as the acceptance reference for the scatter
+no-save change. Older numeric runs are intentionally not carried forward in v3
+because they caused confusion and are no longer the comparison baseline.
+Detailed historical numbers belong in `fix_exp_acc_offload_v2.md`.
 
 Preserve these non-numeric lessons from the rejected v2 work:
 
@@ -372,8 +431,9 @@ thresholded recompute against `gc-exp`.
 
 ### Current Attribution Direction: Active `b4_s4096`
 
-Use the fresh `b4_s4096` sweep above as the no-hook comparison control. Do not
-reuse older hook-enabled or stress-run numbers as baselines.
+Use the post-S4 `b4_s4096` sweep above as the no-hook comparison control for
+future changes. Do not reuse older hook-enabled or stress-run numbers as
+baselines.
 
 Saved-tensor hooks and full memory breakdown can perturb memory and timing. Use
 them only for diagnosis, and never replace the no-hook source-profile baseline
@@ -939,6 +999,23 @@ Stage 2 passes only if:
 - AsymGEMM/GEMM counts, fallback counts, and CPU Adam health remain valid
 - any CPU-memory improvement is recorded separately from the HBM claim
 
+Executed status, 2026-06-13:
+
+- Implemented release-at-last-use for activation-offload CPU handles in
+  `qwen3_moe.py`, bounded `_CPU_BUFFER_POOL` accounting in
+  `activation_offload.py`, and post-release `_last_activation_offload_stats`.
+- Passed focused unit tests:
+  `test_activation_offload_manager_tracks_cpu_owners_and_stage_reuse`,
+  `test_activation_offload_cpu_pool_respects_configured_cap`, and
+  `test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend`.
+- Small profile
+  `outputs/expact_v3_stage2_cpu_lifetime_small.json` reported
+  `cpu_owned_bytes=0`, `cpu_live_bytes=0`,
+  `pre_final_cleanup_cpu_owned_bytes=0`,
+  `final_cleanup_released_bytes=0`, and bounded cached CPU pool bytes.
+- Full LF HBM acceptance for this stage was validated together with S3 in the
+  S4 post-scatter no-hook run. S2 is not counted as an HBM win by itself.
+
 ## Stage 3: Remove Route-Expanded Scatter Saved Output
 
 ### Why This Stage Is Needed
@@ -1147,6 +1224,22 @@ Stage 3 passes only if:
   slowdown
 - AsymGEMM counts and CPU Adam health remain valid
 
+Executed status, 2026-06-13:
+
+- Implemented `_ScatterContiguousRouterNoGrad` in `moe.py`. It saves
+  `token_indices` and detached `routing_weights`, but not route-expanded
+  `expert_output`.
+- Router-gradient cases still use the old autograd path because `grad_weights`
+  requires `expert_output`.
+- Passed direct saved-tensor/gradient tests:
+  `test_moe_module_scatter_contiguous_router_nograd_does_not_save_expert_output`
+  and `test_moe_module_scatter_backward_matches_autograd_and_repeated_backward`.
+- Passed Qwen activation-offload parity:
+  `test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend`.
+- Full LF validation is the S4 run below. It shows the expected `24.000 GiB`
+  global peak allocated reduction for `none|true`, so the scatter no-save
+  change is accepted.
+
 ## Stage 4: Mandatory Pause Gate After Scatter No-Save
 
 ### Why This Stage Is Needed
@@ -1288,6 +1381,31 @@ Stage 4 passes only if:
   implementation
 - no v2-like CPU-source base or standalone LoRA-B rewrite is implemented in this
   stage
+
+Executed S4 result, 2026-06-13:
+
+- Canonical no-hook LF comparison completed for all three policies at
+  `b4_s4096` using the output root recorded in the post-S4 baseline section.
+- `none|true` is now the accepted current baseline:
+  `102.312 GiB` peak allocated, `107.469 GiB` peak reserved,
+  `45.173 s` source avg step, `10.036 s` forward, `35.137 s` backward,
+  `asym_forward_calls=5055`, `asym_dx_calls=4290`,
+  `reference_fallback_count=0`.
+- S3 is accepted because it materially reduced `none|true` global peak HBM
+  (`-24.000 GiB`) without a latency blow-up (`+1.431 s` source avg step versus
+  the pre-S3 baseline).
+- Coarse stage attribution says `none|true` still peaks in `step.backward`
+  (`109856544256` bytes allocated) with `step.forward` lower
+  (`104945276928` bytes). The no-hook source profile does not identify the
+  exact expert sub-owner or saved-tensor owner.
+- Missing attribution field to add later, before selecting S5+: LF source
+  profile does not surface per-layer `_last_activation_offload_stats`,
+  CPU-pool stats, or saved-tensor no-save deltas from the Qwen expert modules.
+- `next_target=none` for this agent run. The scatter fix met the immediate S4
+  memory target, and no integrated gate/up, down-base, LoRA-A accumulator, or
+  workspace rewrite is selected without a follow-up attribution run and explicit
+  user approval.
+- Mandatory pause honored: stop here; no S5+ implementation starts in this run.
 
 ## Stage 5: Integrated Gate/Up Backward Redesign, Conditional Only
 

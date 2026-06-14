@@ -964,6 +964,46 @@ def test_moe_module_scatter_backward_matches_autograd_and_repeated_backward(patt
     torch.testing.assert_close(weights.grad, expected_weight_grad * 2.0)
 
 
+def test_moe_module_scatter_contiguous_router_nograd_does_not_save_expert_output() -> None:
+    config = MICRO_MOE_CONFIG
+    device = _route_op_device()
+    topk, weights = moe_module.make_static_routes(config, device, pattern="repeated")[0]
+    weights = weights.detach()
+    num_tokens = _route_token_count(config)
+    feature = 7
+    metadata = moe_module.build_route_metadata(topk, weights, num_experts=config.num_experts, mode="contiguous")
+    assert isinstance(metadata, moe_module.ContiguousRouteMetadata)
+
+    expert_output = torch.randn(metadata.num_routes, feature, device=device, dtype=torch.float32, requires_grad=True)
+    grad_seed = torch.linspace(-0.4, 0.6, num_tokens * feature, device=device, dtype=torch.float32).reshape(
+        num_tokens,
+        feature,
+    )
+    saved_shapes: list[tuple[int, ...]] = []
+
+    def pack(tensor: torch.Tensor) -> torch.Tensor:
+        saved_shapes.append(tuple(int(dim) for dim in tensor.shape))
+        return tensor
+
+    def unpack(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+        out = moe_module.scatter_contiguous(expert_output, metadata)
+
+    flat = expert_output.detach().reshape(metadata.num_routes, -1)
+    weighted = flat * metadata.routing_weights.reshape(metadata.num_routes, 1)
+    expected = torch.zeros((metadata.num_tokens, flat.shape[1]), device=device, dtype=weighted.dtype)
+    expected.index_add_(0, metadata.token_indices, weighted)
+    torch.testing.assert_close(out, expected.reshape_as(out))
+
+    expected_expert_grad, _ = moe_module.scatter_backward_contiguous(grad_seed, expert_output.detach(), metadata)
+    out.backward(grad_seed)
+    torch.testing.assert_close(expert_output.grad, expected_expert_grad)
+    assert tuple(expert_output.shape) not in saved_shapes
+    assert (metadata.num_routes, feature) not in saved_shapes
+
+
 @pytest.mark.parametrize("pattern", STATIC_PATTERNS)
 @pytest.mark.parametrize("mode", GROUPED_MODES)
 def test_moe_module_cpu_static_routing_patterns_and_grouped_modes(pattern: str, mode: str) -> None:

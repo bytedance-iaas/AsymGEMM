@@ -10,16 +10,14 @@ Models:
   Qwen3 / Qwen3-MoE text attention
   Llama4 text attention
 
-Weights:
-  frozen q/k/v/o base weights on CPU HostWeight
-  trainable LoRA A/B weights on HBM
-
-Offloaded activations:
-  projection inputs for q/k/v/o LoRA-A and dA
-  low-rank S tensors used for dB
+Changed in v1:
+  q/k/v/o projection base weights are CPU HostWeights
+  q/k/v/o LoRA-A inputs and dA inputs are CPU-resident
+  q/k/v/o low-rank S tensors are saved on CPU for dB
 
 Unchanged in v1:
-  q/k norm, RoPE/NoPE, temperature scaling, masks, KV-cache semantics,
+  q/k norm, qk_norm, RoPE/NoPE, temperature scaling
+  masks, KV-cache semantics, attention dropout
   SDPA/FlashAttention/eager attention forward and backward
 ```
 
@@ -37,6 +35,7 @@ stage(Z_cpu)   = copy CPU tensor to an HBM tensor for immediate use
 offload(Z)     = copy HBM tensor to CPU and save the CPU owner
 row_major(V)   = materialize a contiguous row-major HBM tensor from view V
 align_up(n, a) = smallest multiple of a greater than or equal to n
+release(...)   = listed branch-local temporaries are no longer live
 
 CPU tensors have suffix _cpu.
 Tensors without _cpu are HBM tensors.
@@ -44,9 +43,14 @@ Temp means HBM temporary, releasable after last use.
 Grad means trainable LoRA gradient.
 ```
 
-`Z.T` denotes GEMM orientation only. It does not imply that a transposed view is
-safe to pass into AsymGEMM. Any HBM operand passed to CPU-right AsymGEMM must be
-materialized contiguous first.
+`Z.T` denotes GEMM orientation only. It does not imply that a transposed HBM view
+is safe to pass into AsymGEMM. Any HBM operand passed to CPU-right AsymGEMM must
+be materialized contiguous first.
+
+`Y += GEMM(...)` means accumulate into an already-live output buffer. Use a
+beta/addmm-style epilogue when the backend supports it. If a backend must
+materialize the GEMM result, that result is a one-line temporary consumed by the
+add and released immediately.
 
 CPU-right helper contract:
 
@@ -65,31 +69,74 @@ hbm_cpu_matmul(L, R_cpu, transpose_b=True) = L @ R_cpu
 The activation CPU-right helper is bf16-only in v1. Do not use fp8/fp4
 quantized host-weight paths for arbitrary saved CPU activations.
 
-## Shapes
+## Shapes And Parameters
 
 ```text
-M   = batch * seq
+B   = batch
+T   = sequence length
+M   = B * T
 H   = hidden_size
-Dq  = num_q_heads  * head_dim
-Dkv = num_kv_heads * head_dim
+Hq  = num_q_heads
+Hkv = num_kv_heads
+Dh  = head_dim
+Dq  = Hq  * Dh
+Dkv = Hkv * Dh
 r   = LoRA rank
 scale = lora_alpha / r
 
-X        [M,H]    hidden_states flattened over batch and sequence
+X        [M,H]     hidden_states flattened over batch and sequence
 Q        [M,Dq]
 K,V      [M,Dkv]
 AttnOut  [M,Dq]
 Y        [M,H]
-
-W_q_cpu  [Dq,H]     A_q [r,H]    B_q [Dq,r]
-W_k_cpu  [Dkv,H]    A_k [r,H]    B_k [Dkv,r]
-W_v_cpu  [Dkv,H]    A_v [r,H]    B_v [Dkv,r]
-W_o_cpu  [H,Dq]     A_o [r,Dq]   B_o [H,r]
 ```
 
-`Qwen3 attention_prepare` includes q/k norm and RoPE. `Llama4
-attention_prepare` includes RoPE/NoPE, optional qk_norm, and NoPE temperature.
-`attention_core` is the selected SDPA/FlashAttention/eager GQA core.
+The attention block has multiple parameter groups:
+
+```text
+# Frozen dense projection weights, CPU HostWeight
+W_q_cpu  [Dq,H]
+W_k_cpu  [Dkv,H]
+W_v_cpu  [Dkv,H]
+W_o_cpu  [H,Dq]
+
+# Trainable LoRA weights, HBM compute params
+A_q [r,H]       B_q [Dq,r]
+A_k [r,H]       B_k [Dkv,r]
+A_v [r,H]       B_v [Dkv,r]
+A_o [r,Dq]      B_o [H,r]
+
+# Optional small prepare/norm parameters, model-specific shape
+gamma_q         q_norm weight when present
+gamma_k         k_norm weight when present
+gamma_qk        Llama4 qk_norm weight when present; may be stateless
+
+# Non-trainable or backend-owned prepare/core data
+RoPE/NoPE metadata, cos/sin/cache buffers, temperature constants
+attention masks, causal masks, attention-dropout RNG/state
+SDPA/FlashAttention internal saved state
+```
+
+Residency:
+
+```text
+W_q_cpu/W_k_cpu/W_v_cpu/W_o_cpu stay CPU-resident.
+A_*/B_* stay HBM-resident CUDA nn.Parameters.
+CPU AdamW may own CPU fp32 masters/state for A_*/B_*, but the compute params
+remain CUDA nn.Parameters.
+q_norm/k_norm/qk_norm are small vector ops, not AsymGEMM GEMMs, and are left to
+normal model/PyTorch autograd in v1.
+```
+
+The projection branch map is:
+
+```text
+branch  input U   output Z  frozen W_cpu  LoRA A  LoRA B  in   out
+q       X         Q         W_q_cpu       A_q     B_q     H    Dq
+k       X         K         W_k_cpu       A_k     B_k     H    Dkv
+v       X         V         W_v_cpu       A_v     B_v     H    Dkv
+o       AttnOut   Y         W_o_cpu       A_o     B_o     Dq   H
+```
 
 ## Dropout
 
@@ -109,65 +156,10 @@ elementwise mask/scale op and does not stage the wide activation to HBM.
 
 `p == 1` is unsupported for this wrapper and must fail clearly.
 
-## Single Projection Primitive
-
-For a projection with input `U [M,in]`, output `Z [M,out]`, frozen base
-`W_cpu [out,in]`, LoRA `A [r,in]`, `B [out,r]`, and branch dropout `D`:
-
-### Forward
+## AsymGEMM Constraints
 
 ```text
-Base = U @^R W_cpu.T                                      # [M,out] HBM
-
-U_cpu = offload_or_share(U)                               # [M,in] CPU
-U_drop_cpu = D(U_cpu)                                     # [M,in] CPU
-
-M_fwd = align_up(M, 8)
-U_fwd_cpu = pad_rows(U_drop_cpu, M_fwd)                   # [M_fwd,in] CPU
-S_T_pad = hbm_cpu_matmul(A, U_fwd_cpu, transpose_b=False) # [r,M_fwd] HBM
-S_T = S_T_pad[:, :M]                                      # [r,M] HBM Temp
-S = row_major(S_T.T)                                      # [M,r] HBM
-S_cpu = offload(S)                                        # [M,r] CPU, save for dB
-
-Delta = scale * (S @ B.T)                                 # [M,out] HBM Temp
-Z = Base + Delta                                          # [M,out] HBM
-```
-
-Only `U_cpu`, the optional dropout mask, `S_cpu`, scalar metadata, shape/dtype
-metadata, and LoRA A/B tensor references are saved across the autograd boundary.
-Do not save the wide HBM `U`, `U_drop`, `S`, or `S_T`.
-
-### Backward
-
-Given `dZ [M,out]`:
-
-```text
-dU_base = dZ @^R W_cpu                                    # [M,in] HBM
-
-dS = scale * (dZ @ B)                                     # [M,r] HBM Temp
-dU_lora_raw = dS @ A                                      # [M,in] HBM Temp
-dU_lora = D_bar(dU_lora_raw)                              # [M,in] HBM Temp
-dU = dU_base + dU_lora                                    # [M,in] HBM
-
-U_drop_cpu = D(U_cpu)                                     # [M,in] CPU recompute
-M_grad = align_up(M, 64)
-U_grad_cpu = pad_rows(U_drop_cpu, M_grad)                 # [M_grad,in] CPU
-dS_T = pad_cols(row_major(dS.T), M_grad)                  # [r,M_grad] HBM
-dA = hbm_cpu_matmul(dS_T, U_grad_cpu, transpose_b=True)   # [r,in] Grad
-
-S_stage = stage(S_cpu)                                    # [M,r] HBM small
-dB = scale * (dZ.T @ S_stage)                             # [out,r] Grad
-release_stage(S_stage)
-```
-
-The `dB` path intentionally stages the small `S_cpu [M,r]` tensor and uses an
-ordinary HBM GEMM. Do not use CPU-right AsymGEMM for `dB` in v1; it would force
-wide transposed HBM materialization while saving little CPU traffic.
-
-Direct bf16 constraints:
-
-```text
-Forward LoRA-A: in % 8 == 0 and M_fwd % 8 == 0
+LoRA-A forward: in % 8 == 0 and M_fwd % 8 == 0
 dA:             in % 8 == 0 and M_grad % 64 == 0
 Base dx:        frozen-linear transpose_b constraints from frozen_linear.py
 ```
@@ -175,126 +167,200 @@ Base dx:        frozen-linear transpose_b constraints from frozen_linear.py
 Under `backend == "asym"`, unsupported shapes fail loudly. Test/debug torch
 fallbacks must be explicit and recorded.
 
-## Full Attention Forward
+Only CPU handles, optional dropout masks, scalar metadata, original shape/dtype
+metadata, and LoRA A/B tensor references are saved across projection autograd
+boundaries. Do not save the wide HBM source activations, dropped activations,
+`S`, or transposed `S_T` tensors.
+
+## Attention Prepare/Core
+
+The projection wrapper returns flat q/k/v tensors. The model reshapes and
+prepares them before calling the selected attention backend:
 
 ```text
-X = hidden_states_flat                                    # [M,H] HBM
+Q_heads = view(Q, [B,T,Hq,Dh])
+K_heads = view(K, [B,T,Hkv,Dh])
+V_heads = view(V, [B,T,Hkv,Dh])
 
-# q/k/v base projections
-Q_base = X @^R W_q_cpu.T                                  # [M,Dq] Temp
-K_base = X @^R W_k_cpu.T                                  # [M,Dkv] Temp
-V_base = X @^R W_v_cpu.T                                  # [M,Dkv] Temp
+# Qwen3 text attention, conceptually
+Q_prep = RoPE(q_norm(Q_heads; gamma_q))
+K_prep = RoPE(k_norm(K_heads; gamma_k))
+V_prep = V_heads
 
-# q/k/v share one CPU source activation when the same X reaches all three leaves.
-X_cpu = offload_or_share_qkv_source(X)                    # [M,H] CPU
-
-# q LoRA
-X_q_cpu = D_q(X_cpu)                                      # [M,H] CPU
-M_fwd = align_up(M, 8)
-X_q_fwd_cpu = pad_rows(X_q_cpu, M_fwd)                    # [M_fwd,H] CPU
-S_q_T_pad = hbm_cpu_matmul(A_q, X_q_fwd_cpu, transpose_b=False)  # [r,M_fwd] HBM
-S_q = row_major(S_q_T_pad[:, :M].T)                       # [M,r] HBM
-S_q_cpu = offload(S_q)                                    # [M,r] CPU
-Q = Q_base + scale * (S_q @ B_q.T)                        # [M,Dq] HBM
-
-# k LoRA
-X_k_cpu = D_k(X_cpu)                                      # [M,H] CPU
-X_k_fwd_cpu = pad_rows(X_k_cpu, M_fwd)                    # [M_fwd,H] CPU
-S_k_T_pad = hbm_cpu_matmul(A_k, X_k_fwd_cpu, transpose_b=False)  # [r,M_fwd] HBM
-S_k = row_major(S_k_T_pad[:, :M].T)                       # [M,r] HBM
-S_k_cpu = offload(S_k)                                    # [M,r] CPU
-K = K_base + scale * (S_k @ B_k.T)                        # [M,Dkv] HBM
-
-# v LoRA
-X_v_cpu = D_v(X_cpu)                                      # [M,H] CPU
-X_v_fwd_cpu = pad_rows(X_v_cpu, M_fwd)                    # [M_fwd,H] CPU
-S_v_T_pad = hbm_cpu_matmul(A_v, X_v_fwd_cpu, transpose_b=False)  # [r,M_fwd] HBM
-S_v = row_major(S_v_T_pad[:, :M].T)                       # [M,r] HBM
-S_v_cpu = offload(S_v)                                    # [M,r] CPU
-V = V_base + scale * (S_v @ B_v.T)                        # [M,Dkv] HBM
-
-# attention prepare/core remains normal model code and normal autograd
-Q_attn, K_attn, V_attn = attention_prepare(Q, K, V)        # HBM
-AttnOut = attention_core(Q_attn, K_attn, V_attn)           # [M,Dq] HBM
-
-# o projection
-Y_base = AttnOut @^R W_o_cpu.T                             # [M,H] Temp
-AttnOut_cpu = offload(AttnOut)                             # [M,Dq] CPU
-AttnOut_o_cpu = D_o(AttnOut_cpu)                           # [M,Dq] CPU
-AttnOut_fwd_cpu = pad_rows(AttnOut_o_cpu, M_fwd)           # [M_fwd,Dq] CPU
-S_o_T_pad = hbm_cpu_matmul(A_o, AttnOut_fwd_cpu, transpose_b=False)  # [r,M_fwd] HBM
-S_o = row_major(S_o_T_pad[:, :M].T)                        # [M,r] HBM
-S_o_cpu = offload(S_o)                                     # [M,r] CPU
-Y = Y_base + scale * (S_o @ B_o.T)                         # [M,H] HBM
+# Llama4 text attention, conceptually
+Q_prep, K_prep = RoPE/NoPE_prepare(Q_heads, K_heads)
+Q_prep, K_prep = optional_qk_norm(Q_prep, K_prep; gamma_qk)
+Q_prep, K_prep = optional_nope_temperature(Q_prep, K_prep)
+V_prep = V_heads
 ```
 
-`M_fwd` is the same row padding value for q/k/v/o within one attention call when
-all use the same flattened token count.
-
-## Full Attention Backward
+The attention core is conceptually:
 
 ```text
-dY = dL/dY                                                # [M,H] HBM
+K_gqa, V_gqa = logical_gqa_broadcast(K_prep, V_prep, Hq, Hkv)
+Scores = (Q_prep @ K_gqa.T) * attention_scale + mask
+P = softmax(Scores)
+Context = P @ V_gqa
+AttnOut = row_major(view(Context, [M,Dq]))
+```
 
-# o projection
-dAttn_base = dY @^R W_o_cpu                               # [M,Dq] HBM
-dS_o = scale * (dY @ B_o)                                 # [M,r] Temp
-dAttn_lora = D_o_bar(dS_o @ A_o)                          # [M,Dq] Temp
-dAttnOut = dAttn_base + dAttn_lora                        # [M,Dq] HBM
+In real execution, `attention_core` may be SDPA, FlashAttention, or eager
+attention. Do not manually split it or call a custom attention-core backward in
+v1.
 
-AttnOut_o_cpu = D_o(AttnOut_cpu)                          # [M,Dq] CPU
+## Forward
+
+This is a lifetime schedule, not just algebra. The q/k/v final tensors must be
+live together by the time attention starts, but their frozen base temporaries do
+not need to be live together. Each branch initializes its final output with the
+base CPU-right GEMM, accumulates the LoRA-B GEMM into that same output, then
+releases branch-local temporaries before the next branch.
+
+```text
+X = hidden_states_flat                                      # [M,H] HBM
+M_fwd = align_up(M, 8)
+
+# q/k/v share one CPU source activation when the same X reaches all branches.
+X_cpu = offload(X)                                          # [M,H] CPU
+
+
+# ---------------- q projection ----------------
+
+Q = X @^R W_q_cpu.T                                         # [M,Dq] HBM live
+X_q_cpu = D_q(X_cpu)                                        # [M,H] CPU
+X_q_fwd_cpu = pad_rows(X_q_cpu, M_fwd)                      # [M_fwd,H] CPU
+S_q_T_pad = hbm_cpu_matmul(A_q, X_q_fwd_cpu, transpose_b=False)  # [r,M_fwd] HBM
+S_q = row_major(S_q_T_pad[:, :M].T)                         # [M,r] HBM
+S_q_cpu = offload(S_q)                                      # [M,r] CPU
+Q += scale * (S_q @ B_q.T)                                  # consume delta now
+release(S_q_T_pad, S_q, X_q_fwd_cpu, X_q_cpu_if_materialized)
+
+
+# ---------------- k projection ----------------
+
+K = X @^R W_k_cpu.T                                         # [M,Dkv] HBM live
+X_k_cpu = D_k(X_cpu)                                        # [M,H] CPU
+X_k_fwd_cpu = pad_rows(X_k_cpu, M_fwd)                      # [M_fwd,H] CPU
+S_k_T_pad = hbm_cpu_matmul(A_k, X_k_fwd_cpu, transpose_b=False)  # [r,M_fwd] HBM
+S_k = row_major(S_k_T_pad[:, :M].T)                         # [M,r] HBM
+S_k_cpu = offload(S_k)                                      # [M,r] CPU
+K += scale * (S_k @ B_k.T)                                  # consume delta now
+release(S_k_T_pad, S_k, X_k_fwd_cpu, X_k_cpu_if_materialized)
+
+
+# ---------------- v projection ----------------
+
+V = X @^R W_v_cpu.T                                         # [M,Dkv] HBM live
+X_v_cpu = D_v(X_cpu)                                        # [M,H] CPU
+X_v_fwd_cpu = pad_rows(X_v_cpu, M_fwd)                      # [M_fwd,H] CPU
+S_v_T_pad = hbm_cpu_matmul(A_v, X_v_fwd_cpu, transpose_b=False)  # [r,M_fwd] HBM
+S_v = row_major(S_v_T_pad[:, :M].T)                         # [M,r] HBM
+S_v_cpu = offload(S_v)                                      # [M,r] CPU
+V += scale * (S_v @ B_v.T)                                  # consume delta now
+release(S_v_T_pad, S_v, X_v_fwd_cpu, X_v_cpu_if_materialized)
+
+
+# ---------------- attention prepare/core ----------------
+
+Q_attn, K_attn, V_attn = attention_prepare(Q, K, V)          # HBM, normal autograd
+AttnOut = attention_core(Q_attn, K_attn, V_attn)             # [M,Dq] HBM
+
+# Only final Q/K/V must reach attention. No separate frozen-base output or
+# low-rank HBM tensor is intentionally live past its projection branch.
+
+
+# ---------------- o projection ----------------
+
+AttnOut_cpu = offload(AttnOut)                               # [M,Dq] CPU
+Y = AttnOut @^R W_o_cpu.T                                    # [M,H] HBM live
+AttnOut_o_cpu = D_o(AttnOut_cpu)                             # [M,Dq] CPU
+AttnOut_fwd_cpu = pad_rows(AttnOut_o_cpu, M_fwd)             # [M_fwd,Dq] CPU
+S_o_T_pad = hbm_cpu_matmul(A_o, AttnOut_fwd_cpu, transpose_b=False)  # [r,M_fwd] HBM
+S_o = row_major(S_o_T_pad[:, :M].T)                          # [M,r] HBM
+S_o_cpu = offload(S_o)                                       # [M,r] CPU
+Y += scale * (S_o @ B_o.T)                                   # consume delta now
+release(S_o_T_pad, S_o, AttnOut_fwd_cpu, AttnOut_o_cpu_if_materialized)
+```
+
+## Backward
+
+```text
+dY = dL/dY                                                  # [M,H] HBM
 M_grad = align_up(M, 64)
-AttnOut_grad_cpu = pad_rows(AttnOut_o_cpu, M_grad)        # [M_grad,Dq] CPU
-dS_o_T = pad_cols(row_major(dS_o.T), M_grad)              # [r,M_grad] HBM
-dA_o = hbm_cpu_matmul(dS_o_T, AttnOut_grad_cpu, transpose_b=True)  # [r,Dq] Grad
-S_o_stage = stage(S_o_cpu)                                # [M,r] HBM
-dB_o = scale * (dY.T @ S_o_stage)                         # [H,r] Grad
-release_stage(S_o_stage)
 
-# attention prepare/core backward is PyTorch/FlashAttention autograd
+# ---------------- o projection ----------------
+
+dAttnOut = dY @^R W_o_cpu                                   # [M,Dq] HBM live
+dS_o = scale * (dY @ B_o)                                   # [M,r] Temp
+dAttnOut += D_o_bar(dS_o @ A_o)                             # consume dAttn delta
+
+AttnOut_o_cpu = D_o(AttnOut_cpu)                            # [M,Dq] CPU
+AttnOut_grad_cpu = pad_rows(AttnOut_o_cpu, M_grad)          # [M_grad,Dq] CPU
+dS_o_T = pad_cols(row_major(dS_o.T), M_grad)                # [r,M_grad] HBM
+dA_o = hbm_cpu_matmul(dS_o_T, AttnOut_grad_cpu, transpose_b=True)  # [r,Dq] Grad
+S_o_stage = stage(S_o_cpu)                                  # [M,r] HBM
+dB_o = scale * (dY.T @ S_o_stage)                           # [H,r] Grad
+release_stage(S_o_stage)
+release(dS_o, dS_o_T, AttnOut_grad_cpu, AttnOut_o_cpu_if_materialized)
+
+
+# ---------------- attention prepare/core ----------------
+
 dQ, dK, dV = autograd(attention_prepare + attention_core, dAttnOut)
 # dQ [M,Dq], dK [M,Dkv], dV [M,Dkv]
 
-# q projection
-dX = dQ @^R W_q_cpu                                       # [M,H] HBM
-dS_q = scale * (dQ @ B_q)                                 # [M,r] Temp
-dX += D_q_bar(dS_q @ A_q)                                 # [M,H] HBM
-X_q_cpu = D_q(X_cpu)                                      # [M,H] CPU
-X_q_grad_cpu = pad_rows(X_q_cpu, M_grad)                  # [M_grad,H] CPU
-dS_q_T = pad_cols(row_major(dS_q.T), M_grad)              # [r,M_grad] HBM
+
+# ---------------- q projection ----------------
+
+dX = dQ @^R W_q_cpu                                         # [M,H] HBM
+dS_q = scale * (dQ @ B_q)                                   # [M,r] Temp
+dX += D_q_bar(dS_q @ A_q)                                   # consume q dX delta
+
+X_q_cpu = D_q(X_cpu)                                        # [M,H] CPU
+X_q_grad_cpu = pad_rows(X_q_cpu, M_grad)                    # [M_grad,H] CPU
+dS_q_T = pad_cols(row_major(dS_q.T), M_grad)                # [r,M_grad] HBM
 dA_q = hbm_cpu_matmul(dS_q_T, X_q_grad_cpu, transpose_b=True)  # [r,H] Grad
-S_q_stage = stage(S_q_cpu)                                # [M,r] HBM
-dB_q = scale * (dQ.T @ S_q_stage)                         # [Dq,r] Grad
+S_q_stage = stage(S_q_cpu)                                  # [M,r] HBM
+dB_q = scale * (dQ.T @ S_q_stage)                           # [Dq,r] Grad
 release_stage(S_q_stage)
+release(dS_q, dS_q_T, X_q_grad_cpu, X_q_cpu_if_materialized)
 
-# k projection
-dX_k_base = dK @^R W_k_cpu                                # [M,H] Temp
-dX += dX_k_base
-dS_k = scale * (dK @ B_k)                                 # [M,r] Temp
-dX += D_k_bar(dS_k @ A_k)                                 # [M,H] HBM
-X_k_cpu = D_k(X_cpu)                                      # [M,H] CPU
-X_k_grad_cpu = pad_rows(X_k_cpu, M_grad)                  # [M_grad,H] CPU
-dS_k_T = pad_cols(row_major(dS_k.T), M_grad)              # [r,M_grad] HBM
+
+# ---------------- k projection ----------------
+
+dX += dK @^R W_k_cpu                                        # base term; temp only if no beta path
+dS_k = scale * (dK @ B_k)                                   # [M,r] Temp
+dX += D_k_bar(dS_k @ A_k)                                   # consume k dX delta
+
+X_k_cpu = D_k(X_cpu)                                        # [M,H] CPU
+X_k_grad_cpu = pad_rows(X_k_cpu, M_grad)                    # [M_grad,H] CPU
+dS_k_T = pad_cols(row_major(dS_k.T), M_grad)                # [r,M_grad] HBM
 dA_k = hbm_cpu_matmul(dS_k_T, X_k_grad_cpu, transpose_b=True)  # [r,H] Grad
-S_k_stage = stage(S_k_cpu)                                # [M,r] HBM
-dB_k = scale * (dK.T @ S_k_stage)                         # [Dkv,r] Grad
+S_k_stage = stage(S_k_cpu)                                  # [M,r] HBM
+dB_k = scale * (dK.T @ S_k_stage)                           # [Dkv,r] Grad
 release_stage(S_k_stage)
+release(dS_k, dS_k_T, X_k_grad_cpu, X_k_cpu_if_materialized)
 
-# v projection
-dX_v_base = dV @^R W_v_cpu                                # [M,H] Temp
-dX += dX_v_base
-dS_v = scale * (dV @ B_v)                                 # [M,r] Temp
-dX += D_v_bar(dS_v @ A_v)                                 # [M,H] HBM
-X_v_cpu = D_v(X_cpu)                                      # [M,H] CPU
-X_v_grad_cpu = pad_rows(X_v_cpu, M_grad)                  # [M_grad,H] CPU
-dS_v_T = pad_cols(row_major(dS_v.T), M_grad)              # [r,M_grad] HBM
+
+# ---------------- v projection ----------------
+
+dX += dV @^R W_v_cpu                                        # base term; temp only if no beta path
+dS_v = scale * (dV @ B_v)                                   # [M,r] Temp
+dX += D_v_bar(dS_v @ A_v)                                   # consume v dX delta
+
+X_v_cpu = D_v(X_cpu)                                        # [M,H] CPU
+X_v_grad_cpu = pad_rows(X_v_cpu, M_grad)                    # [M_grad,H] CPU
+dS_v_T = pad_cols(row_major(dS_v.T), M_grad)                # [r,M_grad] HBM
 dA_v = hbm_cpu_matmul(dS_v_T, X_v_grad_cpu, transpose_b=True)  # [r,H] Grad
-S_v_stage = stage(S_v_cpu)                                # [M,r] HBM
-dB_v = scale * (dV.T @ S_v_stage)                         # [Dkv,r] Grad
+S_v_stage = stage(S_v_cpu)                                  # [M,r] HBM
+dB_v = scale * (dV.T @ S_v_stage)                           # [Dkv,r] Grad
 release_stage(S_v_stage)
+release(dS_v, dS_v_T, X_v_grad_cpu, X_v_cpu_if_materialized)
 
-# final input gradient
-# dX = q/k/v base gradients + q/k/v LoRA gradients         # [M,H] HBM
+
+# ---------------- final input gradient ----------------
+
+# dX = q/k/v base gradients + q/k/v LoRA gradients          # [M,H] HBM
 ```
 
 ## Q/K/V Source Sharing
@@ -352,15 +418,15 @@ remaining peak. A later stage may test scoped `saved_tensors_hooks` around
 
 ## Launch Contract
 
-Per wrapped projection:
+Each wrapped projection has exactly these launches:
 
 ```text
-Forward:
+forward pass:
   1 base CPU-right AsymGEMM:       U @^R W_cpu.T
   1 LoRA-A CPU-right AsymGEMM:     A @^R U_drop_cpu.T
   1 LoRA-B HBM GEMM:               S @ B.T
 
-Backward:
+backward pass:
   1 base dx CPU-right AsymGEMM:    dZ @^R W_cpu
   1 dS HBM GEMM:                   dZ @ B
   1 LoRA input HBM GEMM:           dS @ A

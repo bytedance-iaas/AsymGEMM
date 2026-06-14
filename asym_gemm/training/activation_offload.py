@@ -1,16 +1,74 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from typing import Any
 
 import torch
 
 
 _CPU_BUFFER_POOL: dict[tuple[torch.dtype, tuple[int, ...], bool], list[torch.Tensor]] = {}
+_CPU_BUFFER_POOL_EVICTIONS = 0
+_CPU_BUFFER_POOL_MAX_CACHED_BYTES = 0
+_DEFAULT_CPU_POOL_MAX_BYTES = 32 * 1024**3
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
     return int(tensor.numel() * tensor.element_size())
+
+
+def _cpu_pool_max_bytes() -> int:
+    raw = os.environ.get("ASYM_EXPACT_CPU_POOL_MAX_BYTES")
+    if raw is None or raw == "":
+        return _DEFAULT_CPU_POOL_MAX_BYTES
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_CPU_POOL_MAX_BYTES
+
+
+def _cpu_pool_cached_bytes() -> int:
+    return sum(_tensor_nbytes(tensor) for tensors in _CPU_BUFFER_POOL.values() for tensor in tensors)
+
+
+def _cpu_pool_shape_key(key: tuple[torch.dtype, tuple[int, ...], bool]) -> str:
+    dtype, shape, pinned = key
+    return f"{dtype}:{tuple(int(dim) for dim in shape)}:pinned={int(pinned)}"
+
+
+def _trim_cpu_pool(max_cached_bytes: int) -> None:
+    global _CPU_BUFFER_POOL_EVICTIONS
+    while _cpu_pool_cached_bytes() > max_cached_bytes and _CPU_BUFFER_POOL:
+        key = next(iter(_CPU_BUFFER_POOL))
+        tensors = _CPU_BUFFER_POOL[key]
+        if tensors:
+            tensors.pop()
+            _CPU_BUFFER_POOL_EVICTIONS += 1
+        if not tensors:
+            _CPU_BUFFER_POOL.pop(key, None)
+
+
+def activation_offload_cpu_pool_stats() -> dict[str, Any]:
+    cached_by_shape = {
+        _cpu_pool_shape_key(key): sum(_tensor_nbytes(tensor) for tensor in tensors)
+        for key, tensors in _CPU_BUFFER_POOL.items()
+        if tensors
+    }
+    return {
+        "cpu_pool_cached_bytes": _cpu_pool_cached_bytes(),
+        "cpu_pool_cached_bytes_by_shape": cached_by_shape,
+        "cpu_pool_num_cached_tensors": sum(len(tensors) for tensors in _CPU_BUFFER_POOL.values()),
+        "cpu_pool_evictions": _CPU_BUFFER_POOL_EVICTIONS,
+        "cpu_pool_max_cached_bytes": _CPU_BUFFER_POOL_MAX_CACHED_BYTES,
+        "cpu_pool_limit_bytes": _cpu_pool_max_bytes(),
+    }
+
+
+def clear_activation_offload_cpu_pool() -> None:
+    global _CPU_BUFFER_POOL_EVICTIONS, _CPU_BUFFER_POOL_MAX_CACHED_BYTES
+    _CPU_BUFFER_POOL.clear()
+    _CPU_BUFFER_POOL_EVICTIONS = 0
+    _CPU_BUFFER_POOL_MAX_CACHED_BYTES = 0
 
 
 def _alloc_cpu(shape: tuple[int, ...], dtype: torch.dtype, *, pin_memory: bool) -> torch.Tensor:
@@ -18,7 +76,10 @@ def _alloc_cpu(shape: tuple[int, ...], dtype: torch.dtype, *, pin_memory: bool) 
     key = (dtype, tuple(int(dim) for dim in shape), pinned)
     pool = _CPU_BUFFER_POOL.get(key)
     if pool:
-        return pool.pop()
+        tensor = pool.pop()
+        if not pool:
+            _CPU_BUFFER_POOL.pop(key, None)
+        return tensor
     try:
         return torch.empty(key[1], device="cpu", dtype=dtype, pin_memory=pinned)
     except RuntimeError:
@@ -26,11 +87,20 @@ def _alloc_cpu(shape: tuple[int, ...], dtype: torch.dtype, *, pin_memory: bool) 
 
 
 def _return_cpu(tensor: torch.Tensor, *, pin_memory: bool) -> None:
+    global _CPU_BUFFER_POOL_EVICTIONS, _CPU_BUFFER_POOL_MAX_CACHED_BYTES
     if tensor.device.type != "cpu" or not tensor.is_contiguous():
         return
     pinned = bool(pin_memory and torch.cuda.is_available() and tensor.is_pinned())
     key = (tensor.dtype, tuple(int(dim) for dim in tensor.shape), pinned)
-    _CPU_BUFFER_POOL.setdefault(key, []).append(tensor.detach())
+    returned = tensor.detach()
+    nbytes = _tensor_nbytes(returned)
+    max_cached_bytes = _cpu_pool_max_bytes()
+    if nbytes > max_cached_bytes:
+        _CPU_BUFFER_POOL_EVICTIONS += 1
+        return
+    _trim_cpu_pool(max_cached_bytes - nbytes)
+    _CPU_BUFFER_POOL.setdefault(key, []).append(returned)
+    _CPU_BUFFER_POOL_MAX_CACHED_BYTES = max(_CPU_BUFFER_POOL_MAX_CACHED_BYTES, _cpu_pool_cached_bytes())
 
 
 @dataclass(frozen=True)
@@ -50,6 +120,7 @@ class CPUActivationHandle:
 class ActivationOffloadStats:
     offloaded_bytes: int = 0
     cpu_owned_bytes: int = 0
+    cpu_peak_bytes_live: int = 0
     staged_bytes: int = 0
     max_stage_bytes_live: int = 0
     num_offloads: int = 0
@@ -57,13 +128,17 @@ class ActivationOffloadStats:
     num_stages: int = 0
     offload_bytes_by_tag: dict[str, int] = field(default_factory=dict)
     cpu_bytes_by_tag: dict[str, int] = field(default_factory=dict)
+    cpu_peak_by_tag: dict[str, int] = field(default_factory=dict)
     stage_bytes_by_tag: dict[str, int] = field(default_factory=dict)
     stage_peak_by_tag: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
+        pool_stats = activation_offload_cpu_pool_stats()
         return {
             "offloaded_bytes": self.offloaded_bytes,
             "cpu_owned_bytes": self.cpu_owned_bytes,
+            "cpu_live_bytes": self.cpu_owned_bytes,
+            "cpu_peak_bytes_live": self.cpu_peak_bytes_live,
             "staged_bytes": self.staged_bytes,
             "max_stage_bytes_live": self.max_stage_bytes_live,
             "num_offloads": self.num_offloads,
@@ -71,8 +146,10 @@ class ActivationOffloadStats:
             "num_stages": self.num_stages,
             "offload_bytes_by_tag": dict(self.offload_bytes_by_tag),
             "cpu_bytes_by_tag": dict(self.cpu_bytes_by_tag),
+            "cpu_peak_by_tag": dict(self.cpu_peak_by_tag),
             "stage_bytes_by_tag": dict(self.stage_bytes_by_tag),
             "stage_peak_by_tag": dict(self.stage_peak_by_tag),
+            **pool_stats,
         }
 
 
@@ -199,16 +276,17 @@ class ActivationOffloadManager:
             if key is not None:
                 self._stage_cache.pop(key, None)
 
-    def release_cpu(self, handle: CPUActivationHandle | None) -> None:
+    def release_cpu(self, handle: CPUActivationHandle | None) -> int:
         if handle is None:
-            return
+            return 0
         entry = self._active_cpu_bytes.pop(int(handle.tensor.data_ptr()), None)
         if entry is None:
-            return
+            return 0
         nbytes, tag = entry
         self.stats.cpu_owned_bytes = max(0, self.stats.cpu_owned_bytes - nbytes)
         self.stats.cpu_bytes_by_tag[tag] = max(0, self.stats.cpu_bytes_by_tag.get(tag, 0) - nbytes)
         _return_cpu(handle.tensor, pin_memory=self.pin_memory)
+        return nbytes
 
     def snapshot(self) -> dict[str, Any]:
         return self.stats.as_dict()
@@ -223,6 +301,11 @@ class ActivationOffloadManager:
         self._active_cpu_bytes[ptr] = (nbytes, handle.tag)
         self.stats.cpu_owned_bytes += nbytes
         self.stats.cpu_bytes_by_tag[handle.tag] = self.stats.cpu_bytes_by_tag.get(handle.tag, 0) + nbytes
+        self.stats.cpu_peak_bytes_live = max(self.stats.cpu_peak_bytes_live, self.stats.cpu_owned_bytes)
+        self.stats.cpu_peak_by_tag[handle.tag] = max(
+            self.stats.cpu_peak_by_tag.get(handle.tag, 0),
+            self.stats.cpu_bytes_by_tag[handle.tag],
+        )
 
     def _mark_stage_live(self, tensor: torch.Tensor, tag: str) -> None:
         ptr = int(tensor.data_ptr())

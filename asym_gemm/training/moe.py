@@ -737,9 +737,49 @@ def pack_tokens_masked(hidden: torch.Tensor, metadata: MaskedRouteMetadata) -> t
     return packed * mask.to(dtype=packed.dtype)
 
 
+class _ScatterContiguousRouterNoGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        expert_output: torch.Tensor,
+        token_indices: torch.Tensor,
+        routing_weights: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        flat = expert_output.reshape(int(routing_weights.numel()), -1)
+        weights = routing_weights.reshape(-1, 1)
+        weighted = flat * weights
+        out = torch.zeros(
+            (int(num_tokens), flat.shape[1]),
+            device=expert_output.device,
+            dtype=weighted.dtype,
+        )
+        out.index_add_(0, token_indices, weighted)
+        ctx.expert_shape = tuple(int(dim) for dim in expert_output.shape)
+        ctx.expert_dtype = expert_output.dtype
+        ctx.num_tokens = int(num_tokens)
+        ctx.save_for_backward(token_indices, routing_weights.detach())
+        return out.reshape(int(num_tokens), *expert_output.shape[1:])
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        token_indices, routing_weights = ctx.saved_tensors
+        grad_flat = grad_output.reshape(ctx.num_tokens, -1)
+        gathered = grad_flat.index_select(0, token_indices)
+        grad_expert = gathered * routing_weights.reshape(-1, 1)
+        return grad_expert.reshape(ctx.expert_shape).to(dtype=ctx.expert_dtype), None, None, None
+
+
 def scatter_contiguous(expert_output: torch.Tensor, metadata: ContiguousRouteMetadata) -> torch.Tensor:
     if expert_output.shape[0] != metadata.num_routes:
         raise ValueError(f"expected {metadata.num_routes} route outputs, got {expert_output.shape[0]}")
+    if not metadata.routing_weights.requires_grad:
+        return _ScatterContiguousRouterNoGrad.apply(
+            expert_output,
+            metadata.token_indices,
+            metadata.routing_weights,
+            metadata.num_tokens,
+        )
     flat = expert_output.reshape(metadata.num_routes, -1)
     weights = metadata.routing_weights.reshape(metadata.num_routes, 1)
     weighted = flat * weights
