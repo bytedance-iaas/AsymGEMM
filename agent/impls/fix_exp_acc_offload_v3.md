@@ -23,8 +23,8 @@ optimizer changes are useful design references only if both sides of the
 comparison get the same change. The main comparison remains:
 
 ```text
-BACKEND_SPECS=asym_cpuadamwds|norecomp
-ASYMM_EXP_ACT_POLICIES=none|true,gc-exp|false,none|false
+BACKEND_SPECS="asym_cpuadamwds|norecomp"
+ASYMM_EXP_ACT_POLICIES="none|true,gc-exp|false,none|false"
 ```
 
 This is the active
@@ -76,13 +76,14 @@ baseline unless rerun and recorded here.
 | --- | --- | --- |
 | S0 | Ground-truth peak diagnosis before new changes | peak live-set ownership, expert/non-expert split, and a verdict on whether scatter no-save is peak-relevant |
 | S1 | Measurement, lifetime, and CPU Adam guardrails | expact counters, saved/lifetime labels, CPU Adam health, and bounded stage accounting |
-| S2 | Remove route-expanded scatter saved output | router-no-grad scatter path that does not save the full `[routes, hidden]` expert output |
-| S3 | Remove full HBM base activation restaging | grouped CPU-source base forward/dX kernels with no full `[M,I]` or `[M,2I]` HBM stage |
-| S4 | Replace wide LoRA-B staging | CPU-source/tiled LoRA-B backward that keeps grouped calls and avoids full wide gradient staging |
-| S5 | Tile LoRA-A gradient reductions | no full FP32 LoRA-A accumulator workspaces beyond the real parameter gradients |
-| S6 | True paired gate/up scheduling | paired CPU-tile reuse for gate/up LoRA paths, accepted only when LF timing improves under the same memory budget |
-| S7 | Hidden materialization and workspace cleanup | profile-visible bounded scratch, no untagged full-width expact materializations |
-| S8 | Final fair comparison and CPU Adam acceptance | canonical `none|true,gc-exp|false,none|false` LF comparison and CPU Adam pass/fail evidence |
+| S2 | Tight CPU handle lifetime and bounded pinned pool | release CPU handles at last use, report post-release stats, and cap/clear cached pinned CPU buffers |
+| S3 | Remove route-expanded scatter saved output | router-no-grad scatter path that does not save the full `[routes, hidden]` expert output |
+| S4 | Mandatory pause gate after scatter no-save | active LF comparison, attribution verdict, and explicit stop before any S5+ work |
+| S5 | Integrated gate/up backward redesign, only if proven peak-relevant | remove/avoid `dgate_up_for_gate_up_base` as a coordinated base-dX plus LoRA-B plan; no standalone CPU-source LoRA-B retry |
+| S6 | Conditional LoRA-A accumulator tiling | no full FP32 LoRA-A accumulator workspaces, only if attribution proves they are peak-relevant |
+| S7 | Deferred native paired gate/up tile reuse | latency-only CPU-tile reuse path, not a repeat of the reverted paired LoRA experiment |
+| S8 | Hidden materialization and workspace cleanup | profile-visible bounded scratch, no untagged full-width expact materializations |
+| S9 | Final fair comparison and CPU Adam acceptance | canonical `none|true,gc-exp|false,none|false` LF comparison and CPU Adam pass/fail evidence |
 
 Current active comparison baseline, recorded 2026-06-13 from the exact LF
 workflow:
@@ -94,7 +95,7 @@ workflow:
 - model/workload: `Qwen/Qwen3-30B-A3B`, `b4_s4096`, `logical_qlen=16384`
 - dataset: `asym_long_sft_smoke__qwen3-30b-a3b__s4096`
 - backend/profiler: `asym_cpuadamwds|norecomp`, `PROFILERS=source`
-- policy axis: `ASYMM_EXP_ACT_POLICIES=none|true,gc-exp|false,none|false`
+- policy axis: `ASYMM_EXP_ACT_POLICIES="none|true,gc-exp|false,none|false"`
 - precision/LoRA: `bf16`, rank `64`, alpha `16`, dropout `0.00`, target `all`
 - steps: `WARMUP_STEPS=5`, measured `MAX_STEPS=10`, trainer total `15`
 - profiling overhead flags:
@@ -155,7 +156,7 @@ GPU_POOL=<gpu_id_or_pool> \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 PROFILERS=source \
-ASYMM_EXP_ACT_POLICIES=none|true,gc-exp|false,none|false \
+ASYMM_EXP_ACT_POLICIES="none|true,gc-exp|false,none|false" \
 ASYM_OFFLOAD_MODULES=all \
 LORA_DROPOUT=0.00 \
 SEQ_LENS=<seq_len> \
@@ -202,6 +203,11 @@ profile JSON fields when needed to surface the real issue.
 - `ctx` for activation offload stores CPU handles, metadata, weights, scalar
   config, and trainable LoRA tensors only. It must not keep CUDA activation
   views or staged CUDA tensors alive across forward.
+- CPU activation handles are released at last use, not only at the end of
+  backward. Post-backward live CPU-owned bytes must return to zero.
+- Cached pinned CPU buffers are bounded and profile-visible. Releasing a CPU
+  handle may return storage to the pool, but the pool must not grow without a
+  configured cap or clear hook.
 - Every CUDA intermediate is released at its last use before the next
   high-memory region.
 - D2H copies that feed CPU-side math have explicit completion before CPU reads.
@@ -238,6 +244,10 @@ so these are again current blockers, not solved state:
 - Offloaded CPU activation lifetime and stream ordering still need explicit
   accounting: D2H readiness, CPU-read waits, CPU-source GPU-consumer waits,
   stage-cache drops, and release-at-last-use must be visible in the profile.
+  Current code releases CPU handles at the end of backward, but that is too
+  coarse: handles remain live after last use, `_last_activation_offload_stats`
+  is snapshotted before CPU releases, and `_CPU_BUFFER_POOL` is global and
+  unbounded.
 - Gate/up LoRA-B backward can still recreate wide staged CUDA gradients or full
   FP32 helper workspaces. CPU-source/tiled replacements remain candidates only
   if they reduce peak HBM or improve latency without increasing peak HBM.
@@ -322,17 +332,39 @@ Preserve these non-numeric lessons from the rejected v2 work:
 - Loss/cross-entropy peaks can hide the expert result, so expert-block peaks and
   loss peaks must be reported separately.
 
+V2 repeat-avoidance map:
+
+- S2 is CPU lifetime/pool cleanup. It is not a memory-claim stage; it must make
+  CPU handle release and pinned-pool caching bounded before HBM work continues.
+- S3 is the new primary HBM target. It attacks route-expanded scatter output
+  lifetime, which was not the accepted v2 kernel rewrite path.
+- S4 is not an implementation stage. It is the stop/go measurement gate after
+  S3. It must select one next target from the measured peak owner, or stop
+  expert-side memory work if the peak moved outside the expert block.
+- S5 is not the failed standalone LoRA-B staging/split work. It is only an
+  integrated gate/up backward redesign, and only if S4 proves
+  `dgate_up_for_gate_up_base` is peak-relevant. CPU-source LoRA-B by itself is
+  forbidden while the full gate/up base-dX concat remains live.
+- S6 runs only if S4 or S5 shows full LoRA-A accumulator scratch is a peak
+  owner. It is not a generic "make the kernel nicer" task.
+- S7 is deferred latency work only. Do not re-land the v2 paired LoRA-A/call
+  reduction; only a native tile-reuse design can be tried, and only if active LF
+  timing improves at flat/lower HBM.
+- S8 remains valid only if attribution shows hidden full-width workspaces,
+  padding/unpadding overlap, or allocator/workspace caches are peak
+  contributors.
+
 Keep the three baseline categories separate:
 
 - canonical workflow comparison:
   `BACKEND_SPECS=asym_cpuadamwds|norecomp` and
-  `ASYMM_EXP_ACT_POLICIES=none|true,gc-exp|false,none|false`
+  `ASYMM_EXP_ACT_POLICIES="none|true,gc-exp|false,none|false"`
 - global recompute lower bound:
   `BACKEND_SPECS=asym_cpuadamwds|recomp` and
-  `ASYMM_EXP_ACT_POLICIES=none|false`
+  `ASYMM_EXP_ACT_POLICIES="none|false"`
 - optional global-plus-expert recompute sanity check:
   `BACKEND_SPECS=asym_cpuadamwds|recomp` and
-  `ASYMM_EXP_ACT_POLICIES=gc-exp|false`
+  `ASYMM_EXP_ACT_POLICIES="gc-exp|false"`
 
 Older thresholded token-policy examples are not the default workflow for this
 plan. Use them only as explicit extra experiments if we need to compare custom
@@ -387,6 +419,12 @@ saved-tensor microcheck with detached route weights still shows
 scatter no-save path remains a valid candidate, but it must be accepted only
 after the snapshot analyzer and LF peak validation prove the saved tensor is
 real and peak-relevant.
+
+### Why This Stage Is Needed
+
+Stage 0 does not directly reduce HBM. It prevents false wins by identifying the
+actual allocator peak owner before memory-changing code lands. It can unlock
+HBM reduction only by proving which expert tensors are peak-live and movable.
 
 ### Scope
 
@@ -489,15 +527,15 @@ Shared diagnostic LF run:
 
 ```bash
 cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
-OUTPUT_ROOT="$PWD/outputs/expact_v3_stage0_diag_b4s6144_$(date -u +%Y%m%dT%H%M%SZ)" \
+OUTPUT_ROOT="$PWD/outputs/expact_v3_stage0_diag_b4s4096_$(date -u +%Y%m%dT%H%M%SZ)" \
 GPU_POOL=0 \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 PROFILERS=source \
-ASYMM_EXP_ACT_POLICIES=none|true \
+ASYMM_EXP_ACT_POLICIES="none|true" \
 ASYM_OFFLOAD_MODULES=all \
 LORA_DROPOUT=0.00 \
-SEQ_LENS=6144 \
+SEQ_LENS=4096 \
 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
 MAX_STEPS=1 \
 WARMUP_STEPS=5 \
@@ -531,10 +569,18 @@ Stage 0 passes only if:
   `allocator/unframed`
 - routed-expert bytes at peak are split into kept LoRA params, kept LoRA grads,
   real activation, real workspace, and misattributed/non-expert bytes
-- the output states whether Stage 2 scatter no-save is peak-relevant or only a
+- the output states whether Stage 3 scatter no-save is peak-relevant or only a
   non-peak/local lifetime improvement
 
 ## Stage 1: Measurement, Lifetime, And CPU Adam Guardrails
+
+### Why This Stage Is Needed
+
+Stage 1 does not directly reduce HBM. It makes later reductions enforceable by
+making activation lifetimes, staged HBM bytes, D2H/H2D traffic, grouped
+AsymGEMM/GEMM counts, fallback counts, and CPU Adam health visible. Without
+this, a change can hide a leak, introduce per-expert small GEMMs, or break CPU
+Adam while appearing to save memory.
 
 ### Scope
 
@@ -693,11 +739,11 @@ GPU_POOL=0 \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 PROFILERS=source \
-ASYMM_EXP_ACT_POLICIES=none|true,gc-exp|false,none|false \
+ASYMM_EXP_ACT_POLICIES="none|true,gc-exp|false,none|false" \
 ASYM_OFFLOAD_MODULES=all \
 LORA_DROPOUT=0.00 \
-SEQ_LENS=8192 \
-PER_DEVICE_TRAIN_BATCH_SIZE=2 \
+SEQ_LENS=4096 \
+PER_DEVICE_TRAIN_BATCH_SIZE=4 \
 MAX_STEPS=1 \
 WARMUP_STEPS=5 \
 PLOT=false \
@@ -715,7 +761,193 @@ Stage 1 passes only if:
 - peak HBM is not worse than the previous expact profile except for explicitly
   tagged measurement overhead
 
-## Stage 2: Remove Route-Expanded Scatter Saved Output
+## Stage 2: Tight CPU Handle Lifetime And Bounded Pinned Pool
+
+### Why This Stage Is Needed
+
+This stage does not claim a direct HBM win. It prevents the activation-offload
+path from turning HBM savings into unbounded CPU pinned-memory growth or hidden
+latency. Current code releases CPU handles only at the end of backward, records
+activation-offload stats before those releases, and returns released CPU tensors
+to a global unbounded `_CPU_BUFFER_POOL`. That is logically safe for one step,
+but it is not tight lifetime management and it can hide leaks or excessive
+cached pinned memory across steps.
+
+This stage must prove that earlier CPU release and bounded caching do not break
+the main memory goal: active `none|true` HBM must stay flat/lower, latency must
+not materially regress, AsymGEMM/GEMM counts must not blow up, and CPU Adam must
+remain correct.
+
+### Scope
+
+- `asym_gemm/training/activation_offload.py`
+  - `_CPU_BUFFER_POOL`
+  - `_alloc_cpu`
+  - `_return_cpu`
+  - `CPUActivationHandle`
+  - `ActivationOffloadStats`
+  - `ActivationOffloadManager.release_cpu`
+  - `ActivationOffloadManager.snapshot`
+  - new pool stats/clear helpers if needed
+- `asym_gemm/training/qwen3_moe.py`
+  - `_ActivationOffloadQwen3ExpertFunction.backward`
+  - release CPU handles at last use instead of only in the final loop
+  - record both pre-release and post-release activation-offload stats
+- `scripts/lf/run_lf_profiled_train.py`
+  - include post-release CPU live/cached bytes if missing from source profile
+- `scripts/testing/profile_qwen3_activation_offload.py`
+  - include live and cached CPU pool stats in the JSON output
+- Tests:
+  - `tests/training/test_lf_qwen3_asym_backend.py`
+  - add or extend focused tests for CPU release and pool bounds
+
+### Code Changes
+
+1. Add explicit CPU-pool accounting:
+
+```text
+cpu_live_bytes
+cpu_live_peak_bytes
+cpu_live_bytes_by_tag
+cpu_live_peak_bytes_by_tag
+cpu_pool_cached_bytes
+cpu_pool_cached_bytes_by_shape
+cpu_pool_num_cached_tensors
+cpu_pool_evictions
+cpu_pool_max_cached_bytes
+```
+
+2. Bound the global CPU pool:
+   - add an env/config limit such as `ASYM_EXPACT_CPU_POOL_MAX_BYTES`
+   - default should be conservative and documented
+   - when returning a tensor would exceed the limit, drop it instead of caching
+   - add a test-only or profile-only clear helper, e.g.
+     `clear_activation_offload_cpu_pool()`
+   - never keep tensors with stale CUDA dependencies or non-contiguous views
+
+3. Move `release_cpu()` calls to last use:
+   - release `ctx.down_low_rank_cpu` after `grad_down_lora_B`
+   - release `ctx.act_cpu` after `grad_down_lora_A`
+   - release `grad_act_cpu` after `_activation_offload_cpu_silu_backward`
+   - release `ctx.gate_cpu` and `ctx.up_cpu` after CPU SiLU backward
+   - release `ctx.gate_low_rank_cpu` after gate LoRA-B `dB`
+   - release `ctx.up_low_rank_cpu` after up LoRA-B `dB`
+   - release `ctx.x_cpu` after paired gate/up LoRA-A grad
+   - release `grad_gate_cpu` and `grad_up_cpu` after their final consumer
+   - keep the final cleanup loop as idempotent safety, but it should release
+     zero additional live bytes in the normal path
+
+4. Fix stats timing:
+   - record `activation_offload_stats_pre_release` before final cleanup only if
+     useful for debugging
+   - set `_last_activation_offload_stats` from the post-release snapshot
+   - source profile must expose both live and cached CPU bytes so a post-release
+     live value of zero does not hide a huge cached pinned pool
+
+5. Add lifetime assertions in tests:
+   - after backward, `cpu_owned_bytes == 0`
+   - final cleanup loop is idempotent
+   - cached CPU bytes are `<= ASYM_EXPACT_CPU_POOL_MAX_BYTES`
+   - clearing the pool returns cached bytes to zero
+   - HBM stage bytes are not increased by CPU lifetime cleanup
+
+### Risks And Watch Items
+
+- Releasing a CPU handle before its last CPU-source kernel consumer is a
+  correctness bug. Move one handle at a time and validate against the torch
+  backend.
+- A too-small CPU pool can increase CPU allocation overhead and hurt latency.
+  Compare pool disabled, default bounded pool, and current unbounded behavior if
+  latency regresses.
+- CPU memory reduction is not an HBM win. Do not count this stage as progress on
+  the core claim unless HBM also stays flat/lower and later HBM stages still
+  pass.
+- If async is added later, early release must wait until any CPU-source GPU
+  consumer has finished reading the CPU tile. This stage should keep sync
+  semantics conservative until async live-byte accounting exists.
+
+### Validation Before Stage 3
+
+Unit correctness and lifetime:
+
+```bash
+PYTHONPATH="$PWD" .venv/bin/python -m pytest -q \
+  tests/training/test_lf_qwen3_asym_backend.py::test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend
+```
+
+Add or update focused tests in `tests/training/test_lf_qwen3_asym_backend.py`:
+
+```text
+run one activation-offload forward/backward
+assert post-release activation_offload_stats["cpu_owned_bytes"] == 0
+assert final cleanup releases zero additional bytes in the normal path
+assert cached CPU pool bytes are present and <= configured cap
+clear CPU pool and assert cached bytes == 0
+```
+
+Small profile with pool stats:
+
+```bash
+mkdir -p outputs
+ASYM_EXPACT_CPU_POOL_MAX_BYTES=$((8 * 1024 * 1024 * 1024)) \
+PYTHONPATH="$PWD" .venv/bin/python scripts/testing/profile_qwen3_activation_offload.py \
+  --tokens 1024 \
+  --top-k 2 \
+  --num-experts 8 \
+  --hidden-dim 4096 \
+  --intermediate-dim 11008 \
+  --rank 8 \
+  --warmup 1 \
+  --iters 2 \
+  --output-json outputs/expact_v3_stage2_cpu_lifetime_small.json
+```
+
+Full active LF comparison:
+
+```bash
+OUTPUT_ROOT="$PWD/outputs/expact_v3_stage2_cpu_lifetime_b4s4096_nohook" \
+SFT_ROOT=/workspace/AsymGEMM-SFT \
+GPU_POOL=0 \
+MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
+BACKEND_SPECS="asym_cpuadamwds|norecomp" \
+PROFILERS=source \
+ASYMM_EXP_ACT_POLICIES="none|true,gc-exp|false,none|false" \
+ASYM_OFFLOAD_MODULES=all \
+ASYM_EXPACT_CPU_POOL_MAX_BYTES=$((32 * 1024 * 1024 * 1024)) \
+LORA_DROPOUT=0.00 \
+SEQ_LENS=4096 \
+PER_DEVICE_TRAIN_BATCH_SIZE=4 \
+MAX_STEPS=10 \
+WARMUP_STEPS=5 \
+PROFILE_MEMORY_ATTRIBUTION=false \
+PROFILE_MEMORY_BREAKDOWN=false \
+PROFILE_MEMORY_SNAPSHOT=false \
+PROFILE_LEVEL=op \
+PLOT=false \
+RUN_POST=false \
+CONTINUE_ON_ERROR=false \
+scripts/lf/profile_lora_lf.sh --gpus 0
+```
+
+Stage 2 passes only if:
+
+- post-backward `cpu_owned_bytes == 0` for the activation-offload manager
+- cached pinned CPU bytes are reported and stay under the configured cap
+- active `b4_s4096` `none|true` peak HBM is flat/lower versus `126.312 GiB`
+- active `b4_s4096` `none|true` latency does not materially regress versus
+  `43.742 s`; if it regresses, compare pool cap settings before proceeding
+- AsymGEMM/GEMM counts, fallback counts, and CPU Adam health remain valid
+- any CPU-memory improvement is recorded separately from the HBM claim
+
+## Stage 3: Remove Route-Expanded Scatter Saved Output
+
+### Why This Stage Is Needed
+
+This is the strongest current expert-side HBM candidate. In active `b4_s4096`,
+the route-expanded scatter tensor is `[131072, 2048]` bf16, `512 MiB` per
+layer, up to `24.0 GiB` across 48 layers if peak-live. Router no-grad means
+scatter backward should only need `token_indices` and detached
+`routing_weights` to reconstruct `grad_expert`, not the full `expert_output`.
 
 ### Scope
 
@@ -819,7 +1051,7 @@ implementation or an explicit backward that saves `expert_output` and returns
   the active-workload scatter size recorded above. If the global peak does not
   move, inspect the new actual peak phase before claiming success.
 
-### Validation Before Stage 3
+### Validation Before Stage 4
 
 Static audit:
 
@@ -850,7 +1082,7 @@ assert saved tensors do not include a [num_routes, hidden] expert_output row
 Primary attribution validation, using the successful `b4_s4096` workload:
 
 ```bash
-OUTPUT_ROOT="$PWD/outputs/expact_v3_stage2_scatter_nosave_b4s4096" \
+OUTPUT_ROOT="$PWD/outputs/expact_v3_stage3_scatter_nosave_b4s4096" \
 SFT_ROOT=/workspace/AsymGEMM-SFT \
 GPU_POOL=0 \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
@@ -876,7 +1108,7 @@ scripts/lf/profile_lora_lf.sh --gpus 0
 Full active comparison validation, without attribution overhead:
 
 ```bash
-OUTPUT_ROOT="$PWD/outputs/expact_v3_stage2_scatter_nosave_b4s4096_nohook" \
+OUTPUT_ROOT="$PWD/outputs/expact_v3_stage3_scatter_nosave_b4s4096_nohook" \
 SFT_ROOT=/workspace/AsymGEMM-SFT \
 GPU_POOL=0 \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
@@ -898,7 +1130,7 @@ CONTINUE_ON_ERROR=false \
 scripts/lf/profile_lora_lf.sh --gpus 0
 ```
 
-Stage 2 passes only if:
+Stage 3 passes only if:
 
 - Stage 0 says the route-expanded scatter/index-add saved tensor is real and
   peak-relevant, or the run explicitly reports it as an expert-block local
@@ -915,293 +1147,285 @@ Stage 2 passes only if:
   slowdown
 - AsymGEMM counts and CPU Adam health remain valid
 
-## Stage 3: Remove Full HBM Base Activation Restaging
+## Stage 4: Mandatory Pause Gate After Scatter No-Save
+
+### Why This Stage Is Needed
+
+Stage 3 is the first new HBM target because router scatter currently uses
+ordinary autograd around route-expanded tensors. After changing that lifetime,
+stop and measure. This stage is a mandatory pause gate, not another
+implementation stage. It prevents repeating v2 by requiring the active LF
+workflow to prove what changed, name the new global peak owner and expert-block
+peak owner, and get explicit approval before any S5+ work starts.
+
+### Scope
+
+- `scripts/lf/profile_lora_lf.sh`
+  - run the canonical workflow comparison exactly, with the explicit dataset
+    and sequence settings from the active baseline section
+- `scripts/lf/run_lf_profiled_train.py`
+  - only add missing summary fields if the profile JSON cannot report peak
+    owner, expert-block peak, loss peak, or AsymGEMM/GEMM counts
+- `asym_gemm/training/lf_trace.py`
+  - only improve attribution labels if expert/loss/non-expert peak attribution
+    is ambiguous
+- `asym_gemm/training/qwen3_moe.py`
+  - only add non-disturbing counters or NVTX ranges if Stage 0/1 attribution is
+    insufficient
+
+### Code Changes
+
+1. Do not change expert math in this stage.
+2. Re-run the active comparison after Stage 3:
+
+```bash
+OUTPUT_ROOT="$PWD/outputs/expact_v3_stage4_reprofile_b4s4096_nohook" \
+SFT_ROOT=/workspace/AsymGEMM-SFT \
+GPU_POOL=0 \
+MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
+BACKEND_SPECS="asym_cpuadamwds|norecomp" \
+PROFILERS=source \
+ASYMM_EXP_ACT_POLICIES="none|true,gc-exp|false,none|false" \
+ASYM_OFFLOAD_MODULES=all \
+LORA_DROPOUT=0.00 \
+SEQ_LENS=4096 \
+PER_DEVICE_TRAIN_BATCH_SIZE=4 \
+MAX_STEPS=10 \
+WARMUP_STEPS=5 \
+PROFILE_MEMORY_ATTRIBUTION=false \
+PROFILE_MEMORY_BREAKDOWN=false \
+PROFILE_MEMORY_SNAPSHOT=false \
+PROFILE_LEVEL=op \
+PLOT=false \
+RUN_POST=false \
+CONTINUE_ON_ERROR=false \
+scripts/lf/profile_lora_lf.sh --gpus 0
+```
+
+3. If attribution is still unclear, run a single-step diagnostic only:
+
+```bash
+OUTPUT_ROOT="$PWD/outputs/expact_v3_stage4_reprofile_b4s4096_attr" \
+SFT_ROOT=/workspace/AsymGEMM-SFT \
+GPU_POOL=0 \
+MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
+BACKEND_SPECS="asym_cpuadamwds|norecomp" \
+PROFILERS=source \
+ASYMM_EXP_ACT_POLICIES="none|true" \
+ASYM_OFFLOAD_MODULES=all \
+LORA_DROPOUT=0.00 \
+SEQ_LENS=4096 \
+PER_DEVICE_TRAIN_BATCH_SIZE=4 \
+MAX_STEPS=1 \
+WARMUP_STEPS=0 \
+PROFILE_MEMORY_ATTRIBUTION=true \
+PROFILE_MEMORY_BREAKDOWN=true \
+PROFILE_MEMORY_SNAPSHOT=true \
+PROFILE_MEMORY_BREAKDOWN_INTERVAL=1 \
+PROFILE_LEVEL=op \
+PLOT=false \
+RUN_POST=false \
+CONTINUE_ON_ERROR=false \
+scripts/lf/profile_lora_lf.sh --gpus 0
+```
+
+4. Record one decision proposal:
+   - `next_target=none`: peak moved to non-expert/loss/attention/norm; stop
+     expert-side HBM work and use later stages only for latency at flat HBM
+   - `next_target=integrated_gate_up_backward`: `dgate_up_for_gate_up_base` is
+     live at the expert or global peak
+   - `next_target=down_base_forward_stage`: `act_for_down_base` is live at the
+     expert or global peak
+   - `next_target=lora_a_accumulator`: full LoRA-A accumulator scratch is live
+     at the peak
+   - `next_target=workspace_cleanup`: hidden full-width temporary tensors are
+     live at the peak
+5. Mandatory pause rule:
+   - after recording the S4 metrics and `next_target` proposal, the agent stops
+     implementation work and reports the result
+   - no S5+ design or code work starts until the user explicitly approves the
+     selected next target
+   - if S4 proves the scatter fix achieved the intended memory result and no
+     expert-side peak remains, stop the expert memory project here
+   - if S4 shows no meaningful HBM reduction, do not continue into S5+ without
+     explaining why the scatter hypothesis failed
+6. Future branch rule, only after explicit approval:
+   - if `next_target=integrated_gate_up_backward`, proceed to Stage 5
+   - if `next_target=down_base_forward_stage`, do not reuse the reverted v2
+     CPU-source base rewrite; write a separate evidence-gated Stage 5
+     replacement that explains why the new peak evidence is different and how
+     the kernel will avoid extra host traffic and latency blow-up
+   - if `next_target=lora_a_accumulator`, skip Stage 5 and proceed to Stage 6
+   - if `next_target=workspace_cleanup`, skip Stage 5-7 and proceed to Stage 8
+   - if `next_target=none`, stop expert-side memory work and report the
+     non-expert bottleneck
+
+### Risks And Watch Items
+
+- Saved-tensor hooks, memory snapshots, and full breakdown can perturb peak HBM.
+  They are diagnostic only; the no-hook source-profile run remains the
+  comparison result.
+- If the peak owner is C++/CUDA-only with weak Python frame labels, improve the
+  attribution labels before choosing a rewrite.
+- If loss/cross-entropy owns the global peak, expert-side changes may still be
+  useful only if an expert-block peak is separately reported and reduced.
+- If `act_for_down_base` or `dgate_up_for_gate_up_base` is not peak-live, do not
+  implement CPU-source base rewrites just because those tags look large locally.
+
+### Validation Before Stage 5
+
+Stage 4 passes only if:
+
+- the active `b4_s4096` comparison is recorded for all three policies
+- `none|true` peak allocated/reserved HBM, step/fwd/bwd timing, AsymGEMM/GEMM
+  counts, fallback counts, and CPU Adam health are recorded
+- global peak owner and expert-block peak owner are identified, or attribution
+  gaps are listed as exact missing fields to implement
+- exactly one `next_target` proposal is recorded
+- the mandatory pause is honored: no S5+ implementation starts in the same
+  agent run unless the user explicitly approves continuing past S4
+- the proposed branch is written next to the results before any future
+  implementation
+- no v2-like CPU-source base or standalone LoRA-B rewrite is implemented in this
+  stage
+
+## Stage 5: Integrated Gate/Up Backward Redesign, Conditional Only
+
+### Why This Stage Is Needed
+
+This stage exists only if Stage 4 selects
+`next_target=integrated_gate_up_backward`. The current backward creates a full
+CUDA `dgate_up_for_gate_up_base` concat with
+`ActivationOffloadManager.stage_concat_columns`, then reuses that same tensor
+for gate/up LoRA-B and gate/up base dX. Therefore CPU-source LoRA-B alone is not
+a memory fix: the large `[M,2I]` HBM stage still exists for base dX, and reading
+the CPU gradients again can make latency worse while peak HBM stays flat.
+
+The better design is integrated: avoid or shrink the full gate/up gradient stage
+while computing both gate/up base dX and any LoRA-B work from the same CPU grad
+tiles. This preserves the useful v2 lesson but does not repeat the failed v2
+standalone helper path.
 
 ### Scope
 
 - `asym_gemm/training/qwen3_moe.py`
-  - `_ActivationOffloadQwen3ExpertFunction.forward`
   - `_ActivationOffloadQwen3ExpertFunction.backward`
-- New or extended Python wrapper:
-  - prefer new `asym_gemm/training/exp_act_offload_base.py`
-  - update `asym_gemm/training/__init__.py` if public imports are needed
-- Existing abstractions:
-  - `asym_gemm/training/host_weight.py::HostWeight`
-  - `asym_gemm/training/frozen_linear.py::AsymGroupedFrozenLinear`
-- Native binding:
+- New wrapper only if Stage 4 selects this target:
+  - `asym_gemm/training/exp_act_offload_gateup.py`
+  - update `asym_gemm/training/__init__.py` only if public imports are needed
+- Native only for the accepted integrated design:
   - `csrc/apis/exp_act_offload.hpp`
   - `csrc/exp_act_offload/exp_act_offload_kernels.cu`
-  - `csrc/python_api.cpp` only if a new namespace/register path is added
-  - `setup.py` only if a new `.cu` file is added instead of extending
-    `exp_act_offload_kernels.cu`
+  - `csrc/python_api.cpp` only if new bindings are added
+  - `setup.py` only if a new `.cu` file is added
+- Existing helper may be reused only as a subroutine:
+  - `asym_gemm/training/exp_act_offload_lora.py::grouped_lora_b_backward_cpu_source`
+- Stats:
+  - `asym_gemm/training/frozen_linear.py::AsymExecutionStats`
 - Tests:
-  - new `tests/training/test_exp_act_offload_base_cpu_source.py`
+  - new focused gate/up wrapper tests if a native wrapper is added
   - update `tests/training/test_lf_qwen3_asym_backend.py`
 
 ### Code Changes
 
-1. Add grouped CPU-source base forward:
+1. Add a precondition in the implementation notes or code path:
+
+```text
+assert stage4_next_target == "integrated_gate_up_backward"
+```
+
+2. Preferred design: one integrated grouped CPU-source backward path:
 
 ```python
-output = grouped_down_base_cpu_source(
-    act_cpu.tensor,
-    layer.down_base.host_weight.tensor,
-    offsets,
-    experts,
-    metadata=lora_metadata,
-    stats=layer.stats,
+grad_packed, dS_gate, dS_up, grad_gate_lora_B, grad_up_lora_B = (
+    grouped_gate_up_backward_cpu_source_integrated(
+        grad_gate_cpu.tensor,
+        grad_up_cpu.tensor,
+        ctx.gate_low_rank_cpu.tensor,
+        ctx.up_low_rank_cpu.tensor,
+        layer.gate_up_base.host_weight.tensor,
+        gate_lora_A,
+        gate_lora_B,
+        up_lora_A,
+        up_lora_B,
+        offsets,
+        experts,
+        need_grad_packed=need_grad_packed,
+        scale=layer.lora_scale,
+        metadata=lora_metadata,
+        stats=layer.stats,
+    )
 )
 ```
 
-Contract:
+Scheduling requirements:
+
+- grouped launch or grouped kernel schedule, never a Python loop over experts
+- load a CPU grad tile once, keep/reuse it in SMEM/registers for base dX and
+  LoRA-B work before advancing
+- reuse CPU tiles across inner loops the same way AsymGEMM left-CPU and
+  right-CPU kernels are designed to do
+- write final `grad_packed [M,H]`, `dS_gate [M,R]`, `dS_up [M,R]`, and LoRA-B
+  gradients only; do not materialize full CUDA `[M,2I]`
+- count `expact_gate_up_integrated_bwd_calls`,
+  `expact_gate_up_full_concat_avoided_bytes`,
+  `expact_lora_b_integrated_calls`, and CPU-source bytes by tag
+
+3. Lower-risk fallback if the integrated kernel is too large for one step:
 
 ```text
-act_cpu: pinned CPU BF16 [M,I]
-down_base_weight: pinned CPU BF16 HostWeight [E,H,I]
-offsets/experts: grouped route metadata
-return: CUDA BF16 [M,H]
+stage grad_gate_cpu [M,I] only -> gate LoRA-B + gate contribution to base dX -> release
+stage grad_up_cpu   [M,I] only -> up LoRA-B   + up contribution to base dX   -> release
+accumulate final grad_packed [M,H]
 ```
 
-2. Add grouped CPU-source gate/up base dX:
+The half-stage fallback is accepted only if active LF peak HBM drops
+meaningfully versus the full `[M,2I]` concat and latency stays within the
+acceptance rule. It is not a final design if it only changes local stage bytes.
 
-```python
-grad_packed = grouped_gate_up_base_dx_cpu_source(
-    grad_gate_cpu.tensor,
-    grad_up_cpu.tensor,
-    layer.gate_up_base.host_weight.tensor,
-    offsets,
-    experts,
-    metadata=lora_metadata,
-    stats=layer.stats,
-)
-```
+4. Explicitly forbidden in this stage:
+   - switching gate/up LoRA-B to CPU-source while leaving
+     `dgate_up_for_gate_up_base` live for base dX
+   - reintroducing the v2 rank-64 LoRA-B split as a standalone stage
+   - adding per-expert Python loops or many small GEMMs
+   - accepting a local helper win when the active LF peak is unchanged and
+     latency is worse
 
-Contract:
-
-```text
-dgate_cpu: pinned CPU BF16 [M,I]
-dup_cpu: pinned CPU BF16 [M,I]
-gate_up_base_weight: pinned CPU BF16 HostWeight [E,2I,H]
-offsets/experts: grouped route metadata
-return: CUDA BF16 [M,H]
-```
-
-3. Native scheduling requirements:
-   - one grouped kernel per projection, not one launch per expert
-   - consume CPU activation tiles directly
-   - consume CPU `HostWeight` tiles directly or via bounded tile scratch
-   - write only the final `[M,H]` output/grad to HBM
-   - no full CUDA `[M,I]` or `[M,2I]` source tensor
-   - increment `expact_base_cpu_source_forward_calls` and
-     `expact_base_cpu_source_dx_calls`
-
-4. Remove from expact:
-   - `manager.stage(act_cpu, tag="act_for_down_base")`
-   - `manager.stage_concat_columns(..., tag="dgate_up_for_gate_up_base")`
-   - `manager.release_stage(grad_gate_up, ...)`
-
-5. Update the Qwen3 unit test:
-   - assert `stage_peak_by_tag` does not contain `act_for_down_base`
-   - assert `stage_peak_by_tag` does not contain `dgate_up_for_gate_up_base`
-   - assert new base CPU-source counters are positive
-
-### Risks And Watch Items
-
-- This is the biggest uncertainty: the kernel has CPU activations and CPU base
-  weights. If both are fetched over PCIe/NVLink host mapping, bandwidth may
-  dominate. Correctness and HBM reduction still come first.
-- `HostWeight.metadata.can_map_host_memory` may be false or unknown on some
-  systems. The kernel must fail closed rather than silently staging full HBM.
-- Route metadata uses cumulative offsets with a sentinel expert entry. Tests
-  must cover empty groups, repeated experts, dense experts, and uneven row
-  counts.
-- If native code needs a new `.cu` file, update `setup.py`; otherwise editable
-  builds will not compile it.
-
-### Validation Before Stage 4
-
-Native correctness:
-
-```bash
-PYTHONPATH="$PWD" .venv/bin/python -m pytest -q \
-  tests/training/test_exp_act_offload_base_cpu_source.py
-```
-
-End-to-end unit:
-
-```bash
-PYTHONPATH="$PWD" .venv/bin/python -m pytest -q \
-  tests/training/test_lf_qwen3_asym_backend.py::test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend
-```
-
-Static no-restage audit:
-
-```bash
-rg -n "act_for_down_base|dgate_up_for_gate_up_base|stage_concat_columns|manager.stage\\(" \
-  asym_gemm/training/qwen3_moe.py \
-  asym_gemm/training/activation_offload.py
-```
-
-Small profile:
-
-```bash
-mkdir -p outputs
-PYTHONPATH="$PWD" .venv/bin/python scripts/testing/profile_qwen3_activation_offload.py \
-  --tokens 1024 \
-  --top-k 2 \
-  --num-experts 8 \
-  --hidden-dim 4096 \
-  --intermediate-dim 11008 \
-  --rank 8 \
-  --warmup 1 \
-  --iters 2 \
-  --output-json outputs/expact_v3_stage3_small.json
-```
-
-Stage 3 passes only if:
-
-- both old full-stage tags are absent
-- base CPU-source counters are positive
-- HBM peak drops relative to the prior accepted stage and the Stage 1 guardrail
-  baseline
-- trace shows grouped base CPU-source launches, not one launch per expert
-
-## Stage 4: Replace Wide LoRA-B Staging With CPU-Source Kernels
-
-### Scope
-
-- `asym_gemm/training/qwen3_moe.py`
-  - `_ActivationOffloadQwen3ExpertFunction.backward`
-  - remove expact dependence on `_grouped_lora_weight_grads_torch`
-  - remove expact dependence on `_grouped_lora_cuda_view`
-- `asym_gemm/training/exp_act_offload_lora.py`
-  - `grouped_lora_b_backward_cpu_source`
-  - `_try_lora_b_ds_cpu_left`
-  - `ASYM_EXPACT_LORA_B_SPLIT` auto/force/disable guard
-  - `require_expert_activation_offload_kernels`
-- `asym_gemm/training/frozen_linear.py`
-  - `AsymExecutionStats`
-- Native:
-  - `csrc/apis/exp_act_offload.hpp`
-  - `csrc/exp_act_offload/exp_act_offload_kernels.cu`
-  - `sm100_grouped_lora_b_grad_b_bf16_cpu_source`
-- Profiling:
-  - add or repair a standalone LoRA-B CPU-source profiler before using NCU for
-    this stage; do not depend on stale helpers that are not present in the tree
-  - `scripts/testing/ncu_exp_act_offload_kernel_profile.sh` only after its
-    target profiler exists and is verified with `bash -n`
-- Tests:
-  - update `tests/training/test_exp_act_offload_native.py`
-
-### Code Changes
-
-1. Stage 4A candidate: remove full HBM gate/up LoRA-B staging from
-   `qwen3_moe.py`. Gate/up LoRA-B backward must consume `grad_gate_cpu` and
-   `grad_up_cpu` directly:
-
-```python
-dS_gate, grad_gate_lora_B = grouped_lora_b_backward_cpu_source(
-    grad_gate_cpu.tensor,
-    gate_low_rank,
-    gate_lora_B,
-    offsets,
-    experts,
-    scale=layer.lora_scale,
-    stats=layer.stats,
-    tag="gate",
-)
-```
-
-2. Stage 4A candidate: split the target wide/low-rank LoRA-B path:
-
-```text
-dS      = grouped CPU-left AsymGEMM(grad_out_cpu, lora_b.T)
-grad_b  = grouped native CPU-source reducer(grad_out_cpu, low_rank)
-```
-
-If this split is reintroduced, gate it for `out_dim >= 512`, `rank <= 64`, and at least
-`256 * 512 * sizeof(bf16)` CPU-source bytes. This covers the canonical LF
-Qwen3 shape (`rank=64`, expert width `768`) and the wider low-rank shapes where
-standalone timing shows the split wins, while preserving fallback for the known
-small-width `rank=64,width=256` loss case. Set `ASYM_EXPACT_LORA_B_SPLIT=1` to
-force the split for profiling, or `ASYM_EXPACT_LORA_B_SPLIT=0` to force the old
-combined native helper. The split is accepted only if the canonical LF
-`none|true` run improves latency or lowers peak HBM versus the active
-activation-offload baseline.
-
-3. Stage 4B, still open: replace the `grad_b` reducer internals with a tiled
-   implementation:
-   - no full FP32 `grad_b_acc`
-   - no atomic-heavy per-output-element reduction when a tiled reduction can be
-     used
-   - use CPU `grad_gate_cpu` and `grad_up_cpu` directly
-   - tile accumulators are allowed; full-output FP32 workspaces are not
-   - low-rank CPU input is preferred; low-rank CUDA staging is allowed only if
-     Stage 1 counters show it does not move peak HBM
-   - increment LoRA-B native/helper counters
-
-4. Keep CPU Adam compatible:
-   - returned gradients for `gate_lora_B`, `up_lora_B`, and `down_lora_B` must
-     be normal CUDA tensors with the same dtype/shape contract as current
-     backward
+5. Keep CPU Adam compatible:
+   - returned LoRA gradients stay normal CUDA tensors with current shapes/dtypes
    - do not write directly to `AsymCPUAdamW` CPU masters
-   - do not move LoRA params to CPU to make the kernel simpler
+   - do not move trainable LoRA params to CPU
 
 ### Risks And Watch Items
 
-- Numerical tolerance may change because tiled reductions reorder
-  accumulation. Define tolerances in tests against the current torch reference.
-- The split reads `grad_out_cpu` twice for the target LoRA-B path: once through
-  grouped CPU-left AsymGEMM for `dS`, once through the native `grad_b` reducer.
-  This is acceptable only while it improves latency without increasing HBM
-  stage bytes; keep `expact_cpu_source_kernel_bytes` visible and compare
-  `expact_lora_b_ds_cpu_left_calls` against LoRA-B grouped-call counts.
-- The split materializes a contiguous transposed LoRA-B weight for the CPU-left
-  `dS` AsymGEMM. This is parameter-shaped, not activation-shaped, and should
-  not erase the memory win, but it must stay under memory attribution.
-- Down LoRA-B consumes `grad_output`, which already exists in HBM. It may not
-  need CPU offload unless peak attribution shows down LoRA-B staging matters.
-  Gate/up must not use full HBM gradients.
-- If `dS` is produced in BF16 for memory, LoRA-A grad accuracy must be checked.
-  If FP32 `dS` is required, it must be final-sized by mathematical necessity
-  and counted as such.
+- This path reads CPU gradients and CPU base weights. If NCU shows poor host
+  load reuse, bad SMEM reuse, or host-memory stalls, tune the isolated kernel
+  before accepting the LF result.
+- Numerical tolerance may change because tiled reductions reorder accumulation.
+  Tests must compare against the current torch/reference path.
+- The half-stage fallback is pragmatic but weaker: it still stages `[M,I]` at a
+  time. Reject it if the measured peak is unchanged.
+- If Stage 4 selected `down_base_forward_stage` instead, do not run this stage;
+  write a separate, evidence-gated design for `act_for_down_base`.
 
-### Validation Before Stage 5
-
-Native correctness:
-
-```bash
-PYTHONPATH="$PWD" .venv/bin/python -m pytest -q \
-  tests/training/test_exp_act_offload_native.py
-```
-
-Qwen expact correctness:
-
-```bash
-PYTHONPATH="$PWD" .venv/bin/python -m pytest -q \
-  tests/training/test_lf_qwen3_asym_backend.py::test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend
-```
+### Validation Before Stage 6
 
 Static audit:
 
 ```bash
-rg -n "_grouped_lora_weight_grads_torch|_grouped_lora_cuda_view|dgate_for_lora_b|dup_for_lora_b" \
+rg -n "dgate_up_for_gate_up_base|stage_concat_columns|expact_gate_up_integrated|expact_gate_up_half_stage" \
   asym_gemm/training/qwen3_moe.py \
-  asym_gemm/training/exp_act_offload_lora.py \
-  csrc/exp_act_offload
+  asym_gemm/training/activation_offload.py \
+  asym_gemm/training/exp_act_offload_gateup.py \
+  csrc/exp_act_offload || true
 ```
 
-Representative isolated LoRA-B timing:
+Correctness:
 
-- First add a checked-in standalone profiler for the exact accepted wrapper
-  shape, or repair `scripts/testing/ncu_exp_act_offload_kernel_profile.sh` so
-  it targets an existing profiler.
-- Then time at least these shapes before a full LF run:
-  `m=1024,n=11008,rank=8,groups=8`,
-  `m=24576,n=768,rank=64,groups=128`, and
-  `m=256,n=256,rank=64,groups=8`.
-- Run NCU only on that isolated helper so host-memory load reuse, SMEM reuse,
-  occupancy, and stall reasons are visible without LF noise.
+```bash
+PYTHONPATH="$PWD" .venv/bin/python -m pytest -q \
+  tests/training/test_lf_qwen3_asym_backend.py::test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend
+```
 
 CPU Adam one-step checks:
 
@@ -1211,48 +1435,61 @@ PYTHONPATH="$PWD" .venv/bin/python -m pytest -q \
   tests/lf/test_asym_cpu_adamw_lf_integration.py
 ```
 
-Canonical LF target-policy rerun after changing the auto split guard:
+Isolated NCU after the wrapper exists:
 
 ```bash
-OUTPUT_ROOT="$PWD/outputs/expact_v3_stage4_rank64_split_b4s6144" \
+bash -n scripts/testing/ncu_exp_act_offload_kernel_profile.sh
+scripts/testing/ncu_exp_act_offload_kernel_profile.sh gateup_integrated
+```
+
+Full active comparison:
+
+```bash
+OUTPUT_ROOT="$PWD/outputs/expact_v3_stage5_gateup_integrated_b4s4096_nohook" \
+SFT_ROOT=/workspace/AsymGEMM-SFT \
 GPU_POOL=0 \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 PROFILERS=source \
-ASYMM_EXP_ACT_POLICIES=none|true \
+ASYMM_EXP_ACT_POLICIES="none|true,gc-exp|false,none|false" \
 ASYM_OFFLOAD_MODULES=all \
 LORA_DROPOUT=0.00 \
-SEQ_LENS=6144 \
+SEQ_LENS=4096 \
 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
-MAX_STEPS=1 \
+MAX_STEPS=10 \
 WARMUP_STEPS=5 \
-PROFILE_MEMORY_ATTRIBUTION=true \
-PROFILE_MEMORY_BREAKDOWN=true \
-PROFILE_MEMORY_BREAKDOWN_INTERVAL=1 \
+PROFILE_MEMORY_ATTRIBUTION=false \
+PROFILE_MEMORY_BREAKDOWN=false \
+PROFILE_MEMORY_SNAPSHOT=false \
+PROFILE_LEVEL=op \
 PLOT=false \
 RUN_POST=false \
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh --gpus 0
+CONTINUE_ON_ERROR=false \
+scripts/lf/profile_lora_lf.sh --gpus 0
 ```
 
-Target-policy iteration runs should set `ASYMM_EXP_ACT_POLICIES=none|true`.
-Full comparison runs must use `none|true,gc-exp|false,none|false`.
+Stage 5 passes only if:
 
-Stage 4 passes only if:
+- Stage 4 selected `integrated_gate_up_backward`
+- full `dgate_up_for_gate_up_base` concat is absent, or the accepted half-stage
+  fallback proves lower active LF peak HBM
+- grouped launch behavior is preserved with no per-expert loops or small-GEMM
+  decomposition
+- AsymGEMM/GEMM counts, CPU-source bytes, avoided full-concat bytes, fallback
+  counts, and CPU Adam health are recorded
+- active LF `none|true` meaningfully lowers peak HBM without material latency
+  blow-up, or improves latency with flat/lower HBM
 
-- expact backward no longer calls `_grouped_lora_weight_grads_torch` for LoRA-B
-- expact backward no longer stages full gate/up gradients for LoRA-B
-- Stage 4A passes when the target rank-64/width-768 LoRA-B helper uses grouped
-  CPU-left AsymGEMM for `dS`, keeps low-rank-only HBM stages, and improves
-  latency versus the old combined CPU-source helper
-- the active LF `none|true` run either lowers peak HBM meaningfully without
-  material latency blow-up, or improves latency with flat/lower HBM
-- local helper latency wins are not accepted if the full LF workflow has the
-  same memory and worse latency
-- Stage 4B is not complete until no full FP32 `grad_b_acc` allocation remains
-  in the CPU-source LoRA-B path
-- CPU Adam sees normal LoRA gradients and updates all LoRA params that had grads
+## Stage 6: Conditional LoRA-A Accumulator Tiling
 
-## Stage 5: Tile LoRA-A Gradient Reductions
+### Why This Stage Is Needed
+
+LoRA-A gradient reduction can allocate full FP32 accumulator workspaces larger
+than the final parameter gradients. Tiling keeps scratch bounded while still
+returning real CUDA `.grad` tensors for CPU Adam. This can reduce backward peak
+HBM only if those accumulators overlap the active peak. This stage is skipped
+unless Stage 4, Stage 5, or a later attribution run proves the accumulator is a
+peak owner.
 
 ### Scope
 
@@ -1270,7 +1507,16 @@ Stage 4 passes only if:
 
 ### Code Changes
 
-1. Replace full-accumulator native LoRA-A grad internals:
+1. Add an evidence precondition:
+
+```text
+stage4_next_target == "lora_a_accumulator"
+or Stage 5 attribution reports LoRA-A accumulator scratch at the active peak
+```
+
+If this precondition is false, do not implement this stage.
+
+2. Replace full-accumulator native LoRA-A grad internals:
 
 ```text
 sm100_grouped_lora_a_grad_bf16_cpu_right
@@ -1285,7 +1531,7 @@ grad_gate_acc
 grad_up_acc
 ```
 
-2. Tiled contract:
+3. Tiled contract:
 
 ```text
 dS_cuda: [M,r]
@@ -1294,13 +1540,13 @@ grad_A_cuda: [E,r,K]
 offsets/experts: grouped route metadata
 ```
 
-3. Pair policy:
+4. Pair policy:
    - one paired gate/up kernel consumes `dS_gate`, `dS_up`, and `X_cpu`
    - the same `X_cpu` tile is reused for both gate and up reductions
    - output two final gradient tiles
    - increment paired LoRA-A grad counters separately from single calls
 
-4. Reduction policy:
+5. Reduction policy:
    - accumulate in registers/shared memory or tile scratch
    - write the final tile to `grad_A_cuda`
    - no one-kernel-per-expert fallback in normal path
@@ -1314,7 +1560,7 @@ offsets/experts: grouped route metadata
 - Full final `grad_A` is allowed because it is the real parameter gradient. Full
   extra FP32 grad workspaces are not allowed.
 
-### Validation Before Stage 6
+### Validation Before Stage 7
 
 Native correctness:
 
@@ -1345,29 +1591,42 @@ PYTHONPATH="$PWD" .venv/bin/python scripts/testing/profile_qwen3_activation_offl
   --rank 8 \
   --warmup 1 \
   --iters 2 \
-  --output-json outputs/expact_v3_stage5_small.json
+  --output-json outputs/expact_v3_stage6_small.json
 ```
 
-Stage 5 passes only if:
+Stage 6 passes only if:
 
+- the evidence precondition was true; otherwise Stage 6 is explicitly skipped
 - no full FP32 LoRA-A accumulator remains in the expact native path
 - grouped kernel counts remain bounded and do not scale with expert count
-- peak HBM and backward timing improve or the profile identifies another
-  dominant bottleneck
+- active LF peak HBM drops meaningfully, or latency improves with flat/lower HBM
 
-## Stage 6: True Paired Gate/Up Scheduling
+## Stage 7: Deferred Native Paired Gate/Up Tile Reuse
+
+### Why This Stage Is Needed
+
+This is a deferred latency stage, not a memory-primary stage. Gate and up LoRA-A
+both consume the same offloaded input activation, so a native paired schedule
+could load one CPU tile and reuse it for both paths. The v2 paired attempt
+reduced counters but did not improve the accepted LF workflow, so do not
+re-land the concatenation-based or call-count-only version. Try this only after
+the active memory target is handled and profiles show repeated CPU-source reads
+are a real latency bottleneck at flat/lower HBM.
 
 ### Scope
 
 - `asym_gemm/training/exp_act_offload_lora.py`
-  - `grouped_lora_a_pair_forward_cpu_left`
-  - paired backward wrappers added in Stage 4 and Stage 5
+  - native-backed `grouped_lora_a_pair_forward_cpu_left` only if it performs
+    one physical paired CPU-source schedule
+  - paired backward wrappers only if Stage 5/6 made them necessary and
+    peak-safe
 - `asym_gemm/training/qwen3_moe.py`
   - `_ActivationOffloadQwen3ExpertFunction.forward`
   - `_ActivationOffloadQwen3ExpertFunction.backward`
 - `asym_gemm/training/lora.py`
   - `grouped_expert_lora_pair`
-  - metadata reuse and `torch.cat` accounting
+  - metadata reuse and `torch.cat` accounting only for visibility, not as the
+    accepted paired design
 - Native:
   - `csrc/apis/exp_act_offload.hpp`
   - `csrc/exp_act_offload/exp_act_offload_kernels.cu`
@@ -1377,69 +1636,48 @@ Stage 5 passes only if:
 
 ### Code Changes
 
-1. Stage 6A candidate: replace the pair-forward wrapper that called the
-   single CPU-left kernel twice with one grouped CPU-left call over a
-   concatenated gate/up LoRA-A weight:
+1. Evidence precondition:
 
-```python
-gate_low_rank, up_low_rank = grouped_lora_a_pair_forward_cpu_left(
-    x_cpu.tensor,
-    gate_lora_A,
-    up_lora_A,
-    offsets,
-    experts,
-    metadata=lora_metadata,
-    stats=layer.stats,
-    tag="gate_up",
-)
+```text
+active LF memory target has passed
+and profiling shows repeated gate/up CPU-source reads are a latency bottleneck
+and the proposed change keeps peak HBM flat/lower
 ```
 
-Interim implementation:
+If this precondition is false, skip Stage 7.
 
-```python
-combined_weight = torch.cat((lora_a_gate, lora_a_up), dim=1)
-combined = grouped_lora_a_forward_cpu_left(source_cpu, combined_weight, ...)
-gate_low_rank, up_low_rank = combined.split((gate_rank, up_rank), dim=-1)
-```
-
-This is still one grouped CPU-left AsymGEMM and one CPU-source read of `X_cpu`.
-The temporary is parameter-shaped and the outputs are low-rank; it must not
-become a full activation staging path. A previous experiment did not beat the
-active `none|true` latency baseline under a flat-memory result, so this
-candidate must be re-landed only with a measured LF improvement.
-
-2. Stage 6B, still open: replace the Python-side weight concatenation with a
-   native paired CPU-left schedule:
+2. Native paired CPU-left schedule only:
    - load one `X_cpu` tile
    - compute gate and up low-rank tiles before advancing the source tile
    - one grouped paired call, not two independent source passes
    - reuse the CPU tile in SMEM across both LoRA-A weight tiles
+   - do not implement the v2-style Python-side weight concatenation as the
+     accepted path
 
-3. Backward schedule:
-   - use paired LoRA-B from Stage 4
-   - use paired LoRA-A grad from Stage 5
-   - if `need_grad_packed`, compute gate/up LoRA `dX` through grouped calls and
-     add them into the single final `grad_packed`
+3. Backward pairing is optional and evidence-gated:
+   - use integrated gate/up work from Stage 5 only if that stage passed
+   - use tiled LoRA-A grad from Stage 6 only if that stage passed
    - do not recreate `stage_concat_columns`
+   - do not add another CPU-source pass just to improve a local counter
 
 4. Track allocations:
    - count paired calls distinctly from two singles
    - record CPU source bytes loaded for paired gate/up
-   - tag any `torch.cat` in `grouped_expert_lora_pair`
+   - tag any `torch.cat` in `grouped_expert_lora_pair`; if it appears at the
+     active peak, the native path must remove it or the stage fails
 
 ### Risks And Watch Items
 
-- Pairing is mostly a timing and bandwidth fix, but it can reduce HBM by
-  shortening overlapping low-rank/delta lifetimes. Do not make correctness
-  harder unless profiles show repeated CPU source reads are material.
-- Stage 6A uses a parameter-shaped `torch.cat` for LoRA-A weights. The measured
-  LF peak stayed unchanged, but a native Stage 6B kernel is still preferred if
-  NCU or LF timing shows the concatenation limits the benefit.
+- Pairing is mostly a timing and bandwidth fix. Do not make correctness harder
+  unless profiles show repeated CPU source reads are material.
+- The v2 concatenation/call-count approach is not an accepted fallback. It can
+  remain as code only if it is already present and profile-visible, not as the
+  planned optimization.
 - `grouped_expert_lora_pair` currently uses concatenation for CUDA low-rank
   inputs and weights. That may be acceptable for low-rank tensors, but it must
   be counted and revisited if it moves peak.
 
-### Validation Before Stage 7
+### Validation Before Stage 8
 
 Correctness:
 
@@ -1459,19 +1697,27 @@ rg -n "grouped_lora_a_pair_forward_cpu_left|stage_concat_columns|torch.cat" \
   asym_gemm/training/lora.py
 ```
 
-Stage 6 passes only if:
+Stage 7 passes only if:
 
-- stats show one physical grouped CPU-left LoRA-A forward call for gate/up,
-  not two single calls
+- the evidence precondition was true; otherwise Stage 7 is explicitly skipped
+- stats show one physical native paired CPU-left LoRA-A forward schedule for
+  gate/up, not two single calls hidden behind one wrapper
 - no per-expert GEMM launch pattern appears in source/NSYS stats
 - paired CPU source bytes are lower than two independent passes
-- the active LF `none|true` run improves latency with flat/lower HBM, or lowers
-  peak HBM meaningfully without material latency blow-up
+- the active LF `none|true` run improves latency with flat/lower HBM
 - do not keep paired scheduling if it only reduces call/source-byte counters
   while full-workflow memory stays flat and latency regresses
 - Qwen3 expact remains numerically matched to the torch backend
 
-## Stage 7: Hidden Materialization And Workspace Cleanup
+## Stage 8: Hidden Materialization And Workspace Cleanup
+
+### Why This Stage Is Needed
+
+After the obvious expert tensors are addressed, remaining peak HBM may come
+from untagged convenience materializations: padding buffers, concat buffers,
+stage caches, allocator leftovers, or scratch shaped like full activations.
+This stage makes those buffers profile-visible and bounded, so accidental
+full-width HBM materialization can be removed.
 
 ### Scope
 
@@ -1544,7 +1790,7 @@ ActivationOffloadWorkspace
 - Async double buffering should be enabled only after counters prove max
   in-flight HBM remains below the synchronous path.
 
-### Validation Before Stage 8
+### Validation Before Stage 9
 
 Static audit:
 
@@ -1571,33 +1817,44 @@ PYTHONPATH="$PWD" .venv/bin/python -m pytest -q \
 Memory-breakdown profile:
 
 ```bash
-OUTPUT_ROOT="$PWD/outputs/expact_v3_stage7_cleanup_$(date -u +%Y%m%dT%H%M%SZ)" \
-GPU_POOL=3 \
+OUTPUT_ROOT="$PWD/outputs/expact_v3_stage8_cleanup_b4s4096_$(date -u +%Y%m%dT%H%M%SZ)" \
+GPU_POOL=0 \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 PROFILERS=source \
-ASYMM_EXP_ACT_POLICIES=none|true,gc-exp|false,none|false \
+ASYMM_EXP_ACT_POLICIES="none|true,gc-exp|false,none|false" \
 ASYM_OFFLOAD_MODULES=all \
 LORA_DROPOUT=0.00 \
-SEQ_LENS=8192 \
-PER_DEVICE_TRAIN_BATCH_SIZE=2 \
+SEQ_LENS=4096 \
+PER_DEVICE_TRAIN_BATCH_SIZE=4 \
 MAX_STEPS=1 \
-WARMUP_STEPS=5 \
+WARMUP_STEPS=0 \
+PROFILE_MEMORY_ATTRIBUTION=true \
 PROFILE_MEMORY_BREAKDOWN=true \
+PROFILE_MEMORY_SNAPSHOT=true \
 PROFILE_MEMORY_BREAKDOWN_MODULES=experts,lora,loss \
 PLOT=false \
 RUN_POST=false \
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh --gpus 3
+/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh --gpus 0
 ```
 
-Stage 7 passes only if:
+Stage 8 passes only if:
 
 - no untagged full-width materialization remains in expact hot regions
 - `max_stage_bytes_live` is bounded and does not include full activation stages
 - source profile distinguishes expert-block peak from loss/cross-entropy peak
 - grouped call counts remain bounded
 
-## Stage 8: Final Fair Comparison And CPU Adam Acceptance
+## Stage 9: Final Fair Comparison And CPU Adam Acceptance
+
+### Why This Stage Is Needed
+
+This proves the claim under the fair LF workflow. Microbenchmarks, standalone
+kernels, and local counters are supporting evidence only. The final run must
+compare `none|true`, `gc-exp|false`, and `none|false` with the same model,
+batch, sequence length, LoRA config, precision, optimizer, router mode, and
+profiler settings, while verifying CPU Adam, grouped kernels, and fallback
+counts.
 
 ### Scope
 
@@ -1651,7 +1908,7 @@ Stage 7 passes only if:
 - `check_deepspeed_cpuadam_run.py` is primarily wired for `zero3_cpuadam`.
   For `asym_cpuadamwds`, the stronger required signal is the
   `asym_cpu_adamw` source-profile summary from `AsymCPUAdamW`.
-- If `4x8192` still OOMs after Stage 7, record whether the failure is inside
+- If `4x8192` still OOMs after Stage 8, record whether the failure is inside
   expert blocks or later loss/cross-entropy. The claim is not satisfied by a
   loss-side OOM explanation alone, but the next fix depends on where the peak
   moved.
@@ -1664,11 +1921,11 @@ Canonical active workflow comparison, `b4_s4096`:
 
 ```bash
 OUTPUT_ROOT="$PWD/outputs/expact_v3_final_b4s4096_$(date -u +%Y%m%dT%H%M%SZ)" \
-GPU_POOL=3 \
+GPU_POOL=0 \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 PROFILERS=source \
-ASYMM_EXP_ACT_POLICIES=none|true,gc-exp|false,none|false \
+ASYMM_EXP_ACT_POLICIES="none|true,gc-exp|false,none|false" \
 ASYM_OFFLOAD_MODULES=all \
 LORA_DROPOUT=0.00 \
 SEQ_LENS=4096 \
@@ -1677,18 +1934,18 @@ MAX_STEPS=10 \
 WARMUP_STEPS=5 \
 PLOT=false \
 RUN_POST=false \
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh --gpus 3
+/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh --gpus 0
 ```
 
 Optional stress workflow comparison, `b2_s8192`:
 
 ```bash
 OUTPUT_ROOT="$PWD/outputs/expact_v3_final_b2s8192_$(date -u +%Y%m%dT%H%M%SZ)" \
-GPU_POOL=3 \
+GPU_POOL=0 \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 PROFILERS=source \
-ASYMM_EXP_ACT_POLICIES=none|true,gc-exp|false,none|false \
+ASYMM_EXP_ACT_POLICIES="none|true,gc-exp|false,none|false" \
 ASYM_OFFLOAD_MODULES=all \
 LORA_DROPOUT=0.00 \
 SEQ_LENS=8192 \
@@ -1697,18 +1954,18 @@ MAX_STEPS=1 \
 WARMUP_STEPS=5 \
 PLOT=false \
 RUN_POST=false \
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh --gpus 3
+/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh --gpus 0
 ```
 
 Optional stress workflow comparison, `b4_s8192`:
 
 ```bash
 OUTPUT_ROOT="$PWD/outputs/expact_v3_final_b4s8192_$(date -u +%Y%m%dT%H%M%SZ)" \
-GPU_POOL=3 \
+GPU_POOL=0 \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 PROFILERS=source \
-ASYMM_EXP_ACT_POLICIES=none|true,gc-exp|false,none|false \
+ASYMM_EXP_ACT_POLICIES="none|true,gc-exp|false,none|false" \
 ASYM_OFFLOAD_MODULES=all \
 LORA_DROPOUT=0.00 \
 SEQ_LENS=8192 \
@@ -1717,38 +1974,18 @@ MAX_STEPS=1 \
 WARMUP_STEPS=5 \
 PLOT=false \
 RUN_POST=false \
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh --gpus 3
+/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh --gpus 0
 ```
 
-Optional global recompute lower bound, `b2_s8192`:
+Optional global recompute lower bound, active `b4_s4096`:
 
 ```bash
-OUTPUT_ROOT="$PWD/outputs/expact_v3_final_global_recompute_$(date -u +%Y%m%dT%H%M%SZ)" \
-GPU_POOL=3 \
+OUTPUT_ROOT="$PWD/outputs/expact_v3_final_global_recompute_b4s4096_$(date -u +%Y%m%dT%H%M%SZ)" \
+GPU_POOL=0 \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|recomp" \
 PROFILERS=source \
-ASYMM_EXP_ACT_POLICIES=none|false \
-ASYM_OFFLOAD_MODULES=all \
-LORA_DROPOUT=0.00 \
-SEQ_LENS=8192 \
-PER_DEVICE_TRAIN_BATCH_SIZE=2 \
-MAX_STEPS=1 \
-WARMUP_STEPS=5 \
-PLOT=false \
-RUN_POST=false \
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh --gpus 3
-```
-
-Optional NSYS kernel-count run after the canonical source profile passes:
-
-```bash
-OUTPUT_ROOT="$PWD/outputs/expact_v3_final_nsys_$(date -u +%Y%m%dT%H%M%SZ)" \
-GPU_POOL=3 \
-MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
-BACKEND_SPECS="asym_cpuadamwds|norecomp" \
-PROFILERS=nsys,source \
-ASYMM_EXP_ACT_POLICIES=none|true,gc-exp|false,none|false \
+ASYMM_EXP_ACT_POLICIES="none|false" \
 ASYM_OFFLOAD_MODULES=all \
 LORA_DROPOUT=0.00 \
 SEQ_LENS=4096 \
@@ -1757,7 +1994,27 @@ MAX_STEPS=1 \
 WARMUP_STEPS=5 \
 PLOT=false \
 RUN_POST=false \
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh --gpus 3
+/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh --gpus 0
+```
+
+Optional NSYS kernel-count run after the canonical source profile passes:
+
+```bash
+OUTPUT_ROOT="$PWD/outputs/expact_v3_final_nsys_$(date -u +%Y%m%dT%H%M%SZ)" \
+GPU_POOL=0 \
+MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
+BACKEND_SPECS="asym_cpuadamwds|norecomp" \
+PROFILERS=nsys,source \
+ASYMM_EXP_ACT_POLICIES="none|true,gc-exp|false,none|false" \
+ASYM_OFFLOAD_MODULES=all \
+LORA_DROPOUT=0.00 \
+SEQ_LENS=4096 \
+PER_DEVICE_TRAIN_BATCH_SIZE=4 \
+MAX_STEPS=1 \
+WARMUP_STEPS=5 \
+PLOT=false \
+RUN_POST=false \
+/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh --gpus 0
 ```
 
 Final acceptance requires:
