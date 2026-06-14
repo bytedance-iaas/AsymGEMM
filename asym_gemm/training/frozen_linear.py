@@ -83,11 +83,66 @@ class AsymExecutionStats:
     def torch_calls(self) -> int:
         return self.torch_forward_calls + self.torch_dx_calls
 
+    @property
+    def attn_act_hbm_forward_calls(self) -> int:
+        return sum(
+            int(count)
+            for tag, count in self.attn_act_hbm_gemm_calls_by_tag.items()
+            if str(tag).rsplit(".", 1)[-1] in {"lora_a_forward", "lora_b_forward"}
+        )
+
+    @property
+    def attn_act_hbm_backward_calls(self) -> int:
+        return sum(
+            int(count)
+            for tag, count in self.attn_act_hbm_gemm_calls_by_tag.items()
+            if str(tag).rsplit(".", 1)[-1] in {"dS", "lora_input_grad", "dB"}
+        )
+
+    @property
+    def attn_act_hbm_calls(self) -> int:
+        return self.attn_act_hbm_forward_calls + self.attn_act_hbm_backward_calls
+
+    @property
+    def forward_calls_total(self) -> int:
+        return (
+            self.asym_forward_calls
+            + self.staged_forward_calls
+            + self.torch_forward_calls
+            + self.kt_forward_calls
+            + self.cpu_left_lora_a_calls
+            + self.attn_act_hbm_forward_calls
+        )
+
+    @property
+    def backward_calls_total(self) -> int:
+        return (
+            self.asym_dx_calls
+            + self.staged_dx_calls
+            + self.torch_dx_calls
+            + self.kt_backward_calls
+            + self.expact_lora_a_grad_grouped_calls
+            + self.expact_lora_b_backward_grouped_calls
+            + self.expact_stage_low_rank_calls
+            + self.attn_act_hbm_backward_calls
+            + self.attn_act_stage_low_rank_calls
+        )
+
+    @property
+    def calls_total(self) -> int:
+        return self.forward_calls_total + self.backward_calls_total
+
     def as_dict(self) -> Dict[str, Any]:
         data = asdict(self)
         data["asym_calls"] = self.asym_calls
         data["staged_calls"] = self.staged_calls
         data["torch_calls"] = self.torch_calls
+        data["attn_act_hbm_forward_calls"] = self.attn_act_hbm_forward_calls
+        data["attn_act_hbm_backward_calls"] = self.attn_act_hbm_backward_calls
+        data["attn_act_hbm_calls"] = self.attn_act_hbm_calls
+        data["forward_calls_total"] = self.forward_calls_total
+        data["backward_calls_total"] = self.backward_calls_total
+        data["calls_total"] = self.calls_total
         return data
 
 

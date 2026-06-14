@@ -198,7 +198,9 @@ def test_profile_config_records_attention_activation_and_gc(monkeypatch: pytest.
     monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_EXPERT_POLICY", "gc-attn-exp")
     monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD", "false")
     monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD", "true")
+    monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD", "false")
     monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED", "true")
+    monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED", "false")
 
     config = module._config_from_args(
         [
@@ -225,7 +227,9 @@ def test_profile_config_records_attention_activation_and_gc(monkeypatch: pytest.
     assert config["expert_recompute_impl"] == "torch_checkpoint"
     assert config["asymm_expert_act_offload"] == "false"
     assert config["asymm_attn_act_offload"] == "true"
+    assert config["asymm_layer_act_offload"] == "false"
     assert config["attention_gc_enabled"] == "true"
+    assert config["layer_gc_enabled"] == "false"
 
 
 def test_heartbeat_timing_summary_derives_high_resolution_step_intervals() -> None:
@@ -1273,6 +1277,36 @@ def test_source_summary_flags_kt_attention_plus_expert_surface(tmp_path: Path) -
     assert profile["trainable_surface"]["expert_lora_parameters"] == 3_321_888_768
     assert "attention+expert LoRA" in surface_csv
     assert "requires a baseline that also trains expert LoRA" in surface_csv
+
+
+def test_source_summary_flags_lf_fused_attention_plus_expert_surface(tmp_path: Path) -> None:
+    output_dir = _run_postprocess_output(
+        tmp_path,
+        kt={"available": True, "wrapper_count": 0, "total_forward_calls": 0, "total_backward_calls": 0},
+        lora={
+            "available": True,
+            "trainable_parameters": 3_375_366_144,
+            "peft_lora_parameters": 53_477_376,
+            "peft_expert_lora_parameters": 0,
+            "lf_fused_expert_lora_parameters": 3_321_888_768,
+            "lf_fused_expert_lora_tensors": 288,
+            "kt_expert_lora_parameters": 0,
+            "kt_peft_expert_lora_parameters": 0,
+            "kt_fused_expert_lora_parameters": 0,
+        },
+    )
+
+    summary = (output_dir / "summary.md").read_text(encoding="utf-8")
+    profile = json.loads((output_dir / "profile.json").read_text(encoding="utf-8"))
+    surface_csv = (output_dir / "trainable_surface.csv").read_text(encoding="utf-8")
+    assert "| trainable surface | attention+expert LoRA |" in summary
+    assert "| non-expert PEFT LoRA params | 53477376 |" in summary
+    assert "| LF fused expert LoRA params | 3321888768 |" in summary
+    assert "| LF fused expert LoRA tensors | 288 |" in summary
+    assert "| expert LoRA params | 3321888768 |" in summary
+    assert profile["trainable_surface"]["expert_lora_parameters"] == 3_321_888_768
+    assert profile["trainable_surface"]["lf_fused_expert_lora_parameters"] == 3_321_888_768
+    assert "attention+expert LoRA" in surface_csv
 
 
 def test_source_summary_flags_peft_expert_surface_without_kt_wrappers(tmp_path: Path) -> None:

@@ -29,6 +29,8 @@ from asym_gemm.training.attention_activation_offload import (
     is_attention_saved_tensor_offload_wrapper,
 )
 from asym_gemm.training.attention_checkpoint import attention_checkpoint_module_names, is_attention_checkpoint_wrapper
+from asym_gemm.training.decoder_activation_offload import is_decoder_saved_tensor_offload_wrapper
+from asym_gemm.training.decoder_checkpoint import decoder_checkpoint_module_names, is_decoder_checkpoint_wrapper
 from asym_gemm.training.exp_act_offload_lora import require_expert_activation_offload_kernels
 from asym_gemm.training.frozen_linear import AsymFrozenLinear, TorchGroupedFrozenLinear
 from asym_gemm.training.llama4_moe import AsymLlama4Moe, AsymLlama4Router, is_llama4_moe
@@ -148,6 +150,65 @@ class FakeAttentionBlock(nn.Module):
         super().__init__()
         self.self_attn = FakeSelfAttention(hidden_dim=hidden_dim)
         self.mlp = FakeQwen3Moe(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim, num_experts=num_experts)
+
+
+class FakeRMSNorm(nn.Module):
+    def __init__(self, hidden_dim: int = 8) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_dim, dtype=torch.bfloat16), requires_grad=False)
+        self.variance_epsilon = 1e-6
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        variance = hidden_states.float().pow(2).mean(dim=-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon).to(hidden_states.dtype)
+        return hidden_states * self.weight
+
+
+class FakeQwen3DecoderLayer(nn.Module):
+    def __init__(self, *, hidden_dim: int = 8, intermediate_dim: int = 8, num_experts: int = 4) -> None:
+        super().__init__()
+        self.self_attn = FakeSelfAttention(hidden_dim=hidden_dim)
+        self.mlp = FakeQwen3Moe(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim, num_experts=num_experts)
+        self.input_layernorm = FakeRMSNorm(hidden_dim=hidden_dim)
+        self.post_attention_layernorm = FakeRMSNorm(hidden_dim=hidden_dim)
+
+    def forward(self, hidden_states: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        attn_out, _ = self.self_attn(hidden_states, **kwargs)
+        hidden_states = residual + attn_out.to(dtype=residual.dtype)
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return residual + hidden_states.to(dtype=residual.dtype)
+
+
+class FakeQwen3DecoderModel(nn.Module):
+    def __init__(
+        self,
+        *,
+        hidden_dim: int = 8,
+        intermediate_dim: int = 8,
+        num_layers: int = 2,
+        num_experts: int = 4,
+    ) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                FakeQwen3DecoderLayer(
+                    hidden_dim=hidden_dim,
+                    intermediate_dim=intermediate_dim,
+                    num_experts=num_experts,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.lm_head = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
+
+    def forward(self, hidden_states: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, **kwargs)
+        return self.lm_head(hidden_states)
 
 
 class FakeAttentionModel(nn.Module):
@@ -591,6 +652,7 @@ def test_parse_expert_recompute_policy_spec() -> None:
     none = parse_expert_recompute_policy_spec(None)
     gc_exp = parse_expert_recompute_policy_spec("gc-exp")
     gc_attn_exp = parse_expert_recompute_policy_spec("gc-attn-exp")
+    gc_layer = parse_expert_recompute_policy_spec("gc-layer")
     lower = parse_expert_recompute_policy_spec("tok-le2")
     zero = parse_expert_recompute_policy_spec("tok-le0")
     upper = parse_expert_recompute_policy_spec("tok-ge2")
@@ -615,6 +677,12 @@ def test_parse_expert_recompute_policy_spec() -> None:
     assert not gc_attn_exp.recompute_enabled
     assert not gc_attn_exp.custom_autograd_enabled
     assert gc_attn_exp.enabled
+    assert gc_layer.label == "gc-layer"
+    assert gc_layer.policy == "none"
+    assert not gc_layer.torch_checkpoint_enabled
+    assert not gc_layer.recompute_enabled
+    assert not gc_layer.custom_autograd_enabled
+    assert not gc_layer.enabled
     assert lower.label == "tok-le2"
     assert lower.policy == "tok"
     assert lower.token_threshold == 2
@@ -1728,6 +1796,88 @@ def test_apply_lf_asym_lora_gc_attn_exp_excludes_vision_attention() -> None:
     assert attention_checkpoint_module_names(model) == ("layers.0.self_attn",)
     assert is_attention_checkpoint_wrapper(model.layers[0].self_attn)
     assert not is_attention_checkpoint_wrapper(model.vision_model.self_attn)
+
+
+def test_apply_lf_asym_lora_gc_layer_wraps_qwen3_decoder_layers_only() -> None:
+    model = FakeQwen3DecoderModel(num_layers=2)
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["all"],
+        dense_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="torch",
+        precision="bf16",
+        offload_modules="none",
+        expert_recompute_policy="gc-layer",
+        router_mode="hf",
+        strict=True,
+    )
+
+    assert report.layer_gc_enabled
+    assert report.layer_gc_wrapped == 2
+    assert report.layer_gc_modules == ("layers.0", "layers.1")
+    assert decoder_checkpoint_module_names(model) == ("layers.0", "layers.1")
+    assert is_decoder_checkpoint_wrapper(model.layers[0])
+    assert not is_attention_checkpoint_wrapper(model.layers[0].self_attn)
+    assert not model.layers[0].mlp.experts.expert_recompute_config.enabled
+
+    model.train()
+    x = torch.randn(3, 5, 8, dtype=torch.bfloat16, requires_grad=True)
+    loss = model(x).float().square().mean()
+    loss.backward()
+
+    wrapper = getattr(model.layers[0], "_asym_decoder_checkpoint_wrapper")
+    assert wrapper.checkpoint_calls == 1
+    assert x.grad is not None
+    assert torch.isfinite(x.grad.float()).all()
+
+
+def test_qwen3_decoder_layer_activation_offload_wraps_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASYMM_LAYER_ACT_OFFLOAD", "1")
+    model = FakeQwen3DecoderModel(num_layers=2)
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj"],
+        dense_target_modules=["q_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="none",
+        expert_recompute_policy="none",
+        router_mode="hf",
+        strict=False,
+    )
+
+    assert report.layer_act_offload_enabled
+    assert report.layer_act_offload_wrapped == 2
+    assert report.layer_act_offload_modules == ("layers.0", "layers.1")
+    assert is_decoder_saved_tensor_offload_wrapper(model.layers[0])
+    assert getattr(model, "_asym_layer_act_offload_modules") == ("layers.0", "layers.1")
+
+
+def test_qwen3_decoder_layer_activation_offload_requires_policy_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASYMM_LAYER_ACT_OFFLOAD", "1")
+    model = FakeQwen3DecoderModel(num_layers=1)
+
+    with pytest.raises(RuntimeError, match="requires expert policy none"):
+        apply_lf_asym_lora(
+            model,
+            raw_lora_target=["q_proj"],
+            dense_target_modules=["q_proj"],
+            lora_rank=2,
+            lora_alpha=4.0,
+            lora_dropout=0.0,
+            backend="asym",
+            precision="bf16",
+            offload_modules="none",
+            expert_recompute_policy="gc-exp",
+            router_mode="hf",
+            strict=False,
+        )
 
 
 def test_apply_lf_asym_lora_wraps_experts_dense_and_freezes_router() -> None:

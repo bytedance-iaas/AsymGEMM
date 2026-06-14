@@ -68,8 +68,11 @@ def make_fake_env(tmp_path: Path) -> tuple[Path, Path]:
                 "if [[ -n \"${FAKE_LF_ENV_LOG:-}\" ]]; then",
                 "  printf 'PYTHONPATH=%s\\n' \"${PYTHONPATH:-}\" > \"$FAKE_LF_ENV_LOG\"",
                 "  printf 'ASYMM_ATTN_ACT_OFFLOAD=%s\\n' \"${ASYMM_ATTN_ACT_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
+                "  printf 'ASYMM_LAYER_ACT_OFFLOAD=%s\\n' \"${ASYMM_LAYER_ACT_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "  printf 'ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD=%s\\n' \"${ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
+                "  printf 'ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD=%s\\n' \"${ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "  printf 'ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED=%s\\n' \"${ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED:-}\" >> \"$FAKE_LF_ENV_LOG\"",
+                "  printf 'ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED=%s\\n' \"${ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "fi",
                 "exit 0",
                 "",
@@ -249,11 +252,11 @@ def test_profile_lora_lf_three_part_exp_attn_axis_dry_run(tmp_path: Path) -> Non
     commands = {str(path): path.read_text(encoding="utf-8") for path in output_root.rglob("command.txt")}
     assert len(commands) == 5
     command_paths = "\n".join(commands)
-    assert "__polnone__routerwhole__expact0__attnact0/" in command_paths
-    assert "__polgc-exp__routerwhole__expact0__attnact0/" in command_paths
-    assert "__polgc-attn-exp__routerwhole__expact0__attnact0/" in command_paths
-    assert "__polnone__routerwhole__expact1__attnact0/" in command_paths
-    assert "__polnone__routerwhole__expact1__attnact1/" in command_paths
+    assert "__polnone__routerwhole__expact0__attnact0__layeract0/" in command_paths
+    assert "__polgc-exp__routerwhole__expact0__attnact0__layeract0/" in command_paths
+    assert "__polgc-attn-exp__routerwhole__expact0__attnact0__layeract0/" in command_paths
+    assert "__polnone__routerwhole__expact1__attnact0__layeract0/" in command_paths
+    assert "__polnone__routerwhole__expact1__attnact1__layeract0/" in command_paths
 
     gc_attn_command = next(text for path, text in commands.items() if "__polgc-attn-exp__" in path)
     assert "ASYM_EXPERT_RECOMPUTE_POLICY=gc-attn-exp" in gc_attn_command
@@ -261,15 +264,19 @@ def test_profile_lora_lf_three_part_exp_attn_axis_dry_run(tmp_path: Path) -> Non
     assert "ASYMM_ATTN_ACT_OFFLOAD=false" in gc_attn_command
     assert "ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED=true" in gc_attn_command
     assert "ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD=false" in gc_attn_command
+    assert "ASYMM_LAYER_ACT_OFFLOAD=false" in gc_attn_command
+    assert "ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED=false" in gc_attn_command
 
     gc_exp_command = next(text for path, text in commands.items() if "__polgc-exp__" in path)
     assert "ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED=false" in gc_exp_command
 
-    attnact_command = next(text for path, text in commands.items() if "__expact1__attnact1/" in path)
+    attnact_command = next(text for path, text in commands.items() if "__expact1__attnact1__layeract0/" in path)
     assert "ASYMM_EXPERT_ACT_OFFLOAD=true" in attnact_command
     assert "ASYMM_ATTN_ACT_OFFLOAD=true" in attnact_command
+    assert "ASYMM_LAYER_ACT_OFFLOAD=false" in attnact_command
     assert "ASYM_EXPERT_RECOMPUTE_POLICY=none" in attnact_command
     assert "ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD=true" in attnact_command
+    assert "ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD=false" in attnact_command
     assert "ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED=false" in attnact_command
 
 
@@ -300,6 +307,79 @@ def test_profile_lora_lf_rejects_selective_gc_with_global_recomp(tmp_path: Path)
     assert result.returncode == 2
     assert "selective GC" in result.stderr
     assert "backend recompute=norecomp" in result.stderr
+
+
+def test_profile_lora_lf_rejects_activation_offload_with_global_recomp(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    output_root = tmp_path / "dryrun"
+
+    result = run_cmd(
+        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
+        env={
+            "LF_DIR": str(lf_dir),
+            "BACKEND_SPECS": "asym_cpuadamwds|recomp",
+            "GPU_POOL": "0",
+            "PROFILERS": "source",
+            "SEQ_LENS": "128",
+            "MAX_STEPS": "1",
+            "WARMUP_STEPS": "0",
+            "PREPARE_DATASETS": "false",
+            "DRY_RUN": "true",
+            "LORA_DROPOUT": "0.00",
+            "ASYMM_EXP_ACT_POLICIES": "none|true|true|true",
+            "PLOT": "false",
+            "PLOT_MEMORY_BREAKDOWN": "false",
+        },
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "activation offload tuples" in result.stderr
+    assert "backend recompute=norecomp" in result.stderr
+
+
+def test_profile_lora_lf_four_part_layer_axis_dry_run(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    output_root = tmp_path / "dryrun"
+
+    run_cmd(
+        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
+        env={
+            "LF_DIR": str(lf_dir),
+            "BACKEND_SPECS": "asym_cpuadamwds|norecomp",
+            "GPU_POOL": "0",
+            "PROFILERS": "source",
+            "SEQ_LENS": "128",
+            "MAX_STEPS": "1",
+            "WARMUP_STEPS": "0",
+            "PREPARE_DATASETS": "false",
+            "DRY_RUN": "true",
+            "LORA_DROPOUT": "0.00",
+            "ASYMM_EXP_ACT_POLICIES": "gc-layer|false|false|false,none|true|true|true",
+            "PLOT": "false",
+            "PLOT_MEMORY_BREAKDOWN": "false",
+        },
+    )
+
+    commands = {str(path): path.read_text(encoding="utf-8") for path in output_root.rglob("command.txt")}
+    assert len(commands) == 2
+    command_paths = "\n".join(commands)
+    assert "__polgc-layer__routerwhole__expact0__attnact0__layeract0/" in command_paths
+    assert "__polnone__routerwhole__expact1__attnact1__layeract1/" in command_paths
+
+    gc_layer_command = next(text for path, text in commands.items() if "__polgc-layer__" in path)
+    assert "ASYM_EXPERT_RECOMPUTE_POLICY=gc-layer" in gc_layer_command
+    assert "GRADIENT_CHECKPOINTING=false" in gc_layer_command
+    assert "ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED=true" in gc_layer_command
+    assert "ASYMM_LAYER_ACT_OFFLOAD=false" in gc_layer_command
+
+    layeract_command = next(text for path, text in commands.items() if "__layeract1/" in path)
+    assert "ASYMM_EXPERT_ACT_OFFLOAD=true" in layeract_command
+    assert "ASYMM_ATTN_ACT_OFFLOAD=true" in layeract_command
+    assert "ASYMM_LAYER_ACT_OFFLOAD=true" in layeract_command
+    assert "ASYM_EXPERT_RECOMPUTE_POLICY=none" in layeract_command
+    assert "ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD=true" in layeract_command
+    assert "ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED=false" in layeract_command
 
 
 def test_profile_lora_lf_mixed_dry_run_does_not_leak_cpuadamw_to_zero(tmp_path: Path) -> None:
@@ -403,7 +483,7 @@ def test_profile_lora_lf_default_e2e_shape_uses_asym_cpuadamwds(tmp_path: Path) 
     command_paths = "\n".join(str(path) for path in command_files)
 
     assert "qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a16_drop008" in command_paths
-    assert command_paths.count("asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact0__attnact0/b4_s4096") == 1
+    assert command_paths.count("asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact0__attnact0__layeract0/b4_s4096") == 1
     for command in command_texts:
         assert "BACKEND=asym_cpuadamwds" in command
         assert "PROFILE_BACKEND_LABEL=asym_cpuadamwds" in command

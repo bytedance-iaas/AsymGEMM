@@ -163,6 +163,7 @@ class ActivationOffloadManager:
         self._stage_keys_by_ptr: dict[int, tuple[str, torch.dtype, tuple[int, ...], str]] = {}
         self._active_cpu_bytes: dict[int, tuple[int, str]] = {}
         self._active_stage_bytes: dict[int, tuple[int, str]] = {}
+        self._pending_cpu_ready_events: dict[int, torch.cuda.Event] = {}
 
     def empty_cpu(
         self,
@@ -187,8 +188,13 @@ class ActivationOffloadManager:
         if tensor.device.type == "cpu":
             return self.adopt_cpu(tensor, tag, original_device=tensor.device)
         handle = self.empty_cpu(tuple(tensor.shape), tensor.dtype, tensor.device, tag)
+        non_blocking = bool(handle.tensor.is_pinned())
         with torch.no_grad():
-            handle.tensor.copy_(tensor.detach(), non_blocking=handle.tensor.is_pinned())
+            handle.tensor.copy_(tensor.detach(), non_blocking=non_blocking)
+        if non_blocking and tensor.device.type == "cuda":
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(tensor.device))
+            self._pending_cpu_ready_events[int(handle.tensor.data_ptr())] = event
         nbytes = handle.nbytes
         self.stats.num_offloads += 1
         self.stats.offloaded_bytes += nbytes
@@ -221,7 +227,15 @@ class ActivationOffloadManager:
         self._mark_cpu_live(handle)
         return handle
 
+    def wait_cpu_ready(self, handle: CPUActivationHandle | None) -> None:
+        if handle is None:
+            return
+        event = self._pending_cpu_ready_events.pop(int(handle.tensor.data_ptr()), None)
+        if event is not None:
+            event.synchronize()
+
     def stage(self, handle: CPUActivationHandle, *, tag: str | None = None) -> torch.Tensor:
+        self.wait_cpu_ready(handle)
         stage_tag = handle.tag if tag is None else tag
         shape = tuple(int(dim) for dim in handle.tensor.shape)
         key = (str(handle.original_device), handle.tensor.dtype, shape, stage_tag)
@@ -242,6 +256,8 @@ class ActivationOffloadManager:
         *,
         tag: str,
     ) -> torch.Tensor:
+        self.wait_cpu_ready(left)
+        self.wait_cpu_ready(right)
         if left.tensor.dim() != 2 or right.tensor.dim() != 2:
             raise ValueError("stage_concat_columns expects 2D CPU handles")
         if int(left.tensor.shape[0]) != int(right.tensor.shape[0]):
@@ -279,6 +295,7 @@ class ActivationOffloadManager:
     def release_cpu(self, handle: CPUActivationHandle | None) -> int:
         if handle is None:
             return 0
+        self.wait_cpu_ready(handle)
         entry = self._active_cpu_bytes.pop(int(handle.tensor.data_ptr()), None)
         if entry is None:
             return 0

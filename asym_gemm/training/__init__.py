@@ -69,6 +69,18 @@ from .attention_activation_offload import (
     install_attention_saved_tensor_offload,
     is_attention_saved_tensor_offload_wrapper,
 )
+from .decoder_activation_offload import (
+    DecoderSavedTensorOffloadWrapper,
+    decoder_saved_tensor_offload_module_names,
+    install_decoder_saved_tensor_offload,
+    is_decoder_saved_tensor_offload_wrapper,
+)
+from .decoder_checkpoint import (
+    DecoderCheckpointWrapper,
+    decoder_checkpoint_module_names,
+    install_decoder_checkpoint,
+    is_decoder_checkpoint_wrapper,
+)
 from .cpu_adam import AsymCPUAdamW
 from .mlp import (
     AsymMLP,
@@ -135,6 +147,10 @@ __all__ = [
     "AttentionSavedTensorOffloadWrapper",
     "AttentionActivationOffloadContext",
     "attention_saved_tensor_offload_module_names",
+    "DecoderCheckpointWrapper",
+    "DecoderSavedTensorOffloadWrapper",
+    "decoder_checkpoint_module_names",
+    "decoder_saved_tensor_offload_module_names",
     "AsymCPUAdamW",
     "AsymMLP",
     "AsymLlama4Moe",
@@ -201,6 +217,8 @@ __all__ = [
     "is_qwen35_moe_block",
     "is_llama4_moe",
     "is_attention_saved_tensor_offload_wrapper",
+    "is_decoder_checkpoint_wrapper",
+    "is_decoder_saved_tensor_offload_wrapper",
     "load_lora_state_dict",
     "load_peft_adapter",
     "lora_parameters",
@@ -219,6 +237,8 @@ __all__ = [
     "storage_key",
     "prepare_grouped_lora_metadata",
     "install_attention_saved_tensor_offload",
+    "install_decoder_checkpoint",
+    "install_decoder_saved_tensor_offload",
     "require_expert_activation_offload_kernels",
     "stage_low_rank_from_cpu",
     "tensor_nbytes",

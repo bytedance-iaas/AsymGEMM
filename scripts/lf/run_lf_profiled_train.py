@@ -522,6 +522,9 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
     attention_gc_enabled = os.environ.get("ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED")
     if attention_gc_enabled is None:
         attention_gc_enabled = "true" if expert_policy.label == "gc-attn-exp" else "false"
+    layer_gc_enabled = os.environ.get("ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED")
+    if layer_gc_enabled is None:
+        layer_gc_enabled = "true" if expert_policy.label == "gc-layer" else "false"
     is_superoffload_backend = backend == "superoffload"
     is_cpuadam_backend = backend == "zero3_cpuadam"
     is_asym_deepspeed_cpuadamw = backend == "asym_cpuadamwds" or (
@@ -569,7 +572,9 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         in {"1", "true", "yes", "on"},
         "asymm_expert_act_offload": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD", "false"),
         "asymm_attn_act_offload": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD", "false"),
+        "asymm_layer_act_offload": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD", "false"),
         "attention_gc_enabled": attention_gc_enabled,
+        "layer_gc_enabled": layer_gc_enabled,
         "expert_recompute_policy_spec": expert_policy.label,
         "expert_recompute_policy": expert_policy.policy,
         "expert_recompute_impl": (
@@ -656,6 +661,7 @@ def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] 
             "reason": "lora counter trainable_parameters is missing or non-numeric",
         }
 
+    lf_fused_params = _safe_int(lora.get("lf_fused_expert_lora_parameters"))
     kt_fused_params = _safe_int(lora.get("kt_fused_expert_lora_parameters"))
     kt_expert_params = _safe_int(lora.get("kt_expert_lora_parameters"))
     peft_lora_params = _safe_int(lora.get("peft_lora_parameters"))
@@ -663,6 +669,10 @@ def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] 
     kt_peft_expert_params = _safe_int(lora.get("kt_peft_expert_lora_parameters"))
     if peft_expert_params is None:
         peft_expert_params = kt_peft_expert_params
+    expert_lora_params = max(
+        kt_expert_params or 0,
+        (peft_expert_params or 0) + (lf_fused_params or 0),
+    )
     non_expert_peft_params = (
         max(0, peft_lora_params - (peft_expert_params or 0)) if peft_lora_params is not None else None
     )
@@ -686,6 +696,8 @@ def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] 
         "source": "lora_counters_pre_optimizer_step",
         "assumed_param_dtype": "bf16",
         "trainable_parameters": trainable_params,
+        "expert_lora_parameters": expert_lora_params,
+        "lf_fused_expert_lora_parameters": lf_fused_params,
         "kt_fused_expert_lora_parameters": kt_fused_params,
         "kt_expert_lora_parameters": kt_expert_params,
         "peft_expert_lora_parameters": peft_expert_params,
@@ -700,6 +712,8 @@ def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] 
         "total_bf16_params_grads_adamw_fp32_moments_master_bytes": total_fp32_moment_master_policy,
         "large_surface_warning": bool(
             trainable_params >= 1_000_000_000
+            or expert_lora_params >= 1_000_000_000
+            or (lf_fused_params is not None and lf_fused_params >= 1_000_000_000)
             or (kt_fused_params is not None and kt_fused_params >= 1_000_000_000)
         ),
         "logical_qlen": _safe_int((config or {}).get("logical_qlen")),
@@ -738,6 +752,8 @@ def _capture_loaded_model(model: Any) -> Any:
             kt_forward_calls=kt.get("total_forward_calls"),
             kt_backward_calls=kt.get("total_backward_calls"),
             trainable_parameters=lora.get("trainable_parameters"),
+            expert_lora_parameters=optimizer_memory_preflight.get("expert_lora_parameters"),
+            lf_fused_expert_lora_parameters=lora.get("lf_fused_expert_lora_parameters"),
             kt_expert_lora_parameters=lora.get("kt_expert_lora_parameters"),
             kt_fused_expert_lora_parameters=lora.get("kt_fused_expert_lora_parameters"),
             optimizer_preflight_total_bf16_moments_bytes=optimizer_memory_preflight.get(
@@ -1924,12 +1940,85 @@ def _lora_counters_from_model() -> dict[str, Any]:
     }
 
 
+def _int_dict_sum(value: Any) -> int:
+    if not isinstance(value, dict):
+        return 0
+    return sum(_safe_int(item) or 0 for item in value.values())
+
+
+def _merge_int_dict(target: dict[str, int], value: Any) -> None:
+    if not isinstance(value, dict):
+        return
+    for key, raw_count in value.items():
+        count = _safe_int(raw_count) or 0
+        if count:
+            target[str(key)] = target.get(str(key), 0) + count
+
+
+def _activation_stage_bytes(stats: dict[str, Any]) -> int:
+    by_tag = stats.get("stage_bytes_by_tag")
+    if isinstance(by_tag, dict):
+        return _int_dict_sum(by_tag)
+    return _safe_int(stats.get("staged_bytes")) or 0
+
+
+def _activation_transfer_weight(stats: dict[str, Any]) -> int:
+    return (
+        (_safe_int(stats.get("offloaded_bytes")) or 0)
+        + _activation_stage_bytes(stats)
+        + (_safe_int(stats.get("num_offloads")) or 0)
+        + (_safe_int(stats.get("num_stages")) or 0)
+    )
+
+
+def _activation_source_context_key(row: dict[str, Any]) -> str:
+    source = str(row.get("profile_prefix") or row.get("name") or "")
+    for leaf in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        suffix = f".{leaf}"
+        if source.endswith(suffix):
+            return source[: -len(suffix)]
+    return source
+
+
+def _activation_transfer_totals(stats_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    offload_bytes_by_tag: dict[str, int] = {}
+    stage_bytes_by_tag: dict[str, int] = {}
+    total_offload_calls = 0
+    total_stage_calls = 0
+    total_offloaded_bytes = 0
+    total_staged_bytes = 0
+
+    for stats in stats_rows:
+        total_offload_calls += _safe_int(stats.get("num_offloads")) or 0
+        total_stage_calls += _safe_int(stats.get("num_stages")) or 0
+        total_offloaded_bytes += _safe_int(stats.get("offloaded_bytes")) or 0
+        total_staged_bytes += _activation_stage_bytes(stats)
+        _merge_int_dict(offload_bytes_by_tag, stats.get("offload_bytes_by_tag"))
+        _merge_int_dict(stage_bytes_by_tag, stats.get("stage_bytes_by_tag"))
+
+    return {
+        "total_d2h_offload_copy_calls": total_offload_calls,
+        "total_h2d_stage_copy_calls": total_stage_calls,
+        "total_d2h_offloaded_bytes": total_offloaded_bytes,
+        "total_h2d_staged_bytes": total_staged_bytes,
+        "total_forward_offload_copy_calls": total_offload_calls,
+        "total_backward_stage_copy_calls": total_stage_calls,
+        "total_forward_offloaded_bytes": total_offloaded_bytes,
+        "total_backward_staged_bytes": total_staged_bytes,
+        "total_activation_transfer_calls": total_offload_calls + total_stage_calls,
+        "total_activation_transfer_bytes": total_offloaded_bytes + total_staged_bytes,
+        "offload_bytes_by_tag": offload_bytes_by_tag,
+        "stage_bytes_by_tag": stage_bytes_by_tag,
+    }
+
+
 def _activation_offload_counters_from_model() -> dict[str, Any]:
     model, base_model = _model_and_base_model()
     if model is None:
         return {"available": False, "reason": "model hook did not capture a model"}
 
     rows: list[dict[str, Any]] = []
+    source_context_by_key: dict[str, dict[str, Any]] = {}
     seen_modules: set[int] = set()
     module_roots = [root for root in (model, base_model) if root is not None]
     for root in module_roots:
@@ -1976,10 +2065,26 @@ def _activation_offload_counters_from_model() -> dict[str, Any]:
                         row["execution_stats"] = execution_stats_dict
             rows.append(row)
 
+            source_context = stats.get("source_context")
+            if isinstance(source_context, dict) and source_context:
+                source_key = _activation_source_context_key(row)
+                previous = source_context_by_key.get(source_key)
+                if previous is None or _activation_transfer_weight(source_context) >= _activation_transfer_weight(previous):
+                    source_context_by_key[source_key] = dict(source_context)
+
+    row_stats = [
+        row["activation_offload_stats"]
+        for row in rows
+        if isinstance(row.get("activation_offload_stats"), dict)
+    ]
+    transfer_totals = _activation_transfer_totals(row_stats + list(source_context_by_key.values()))
+
     return {
         "available": bool(rows),
         "module_count": len(rows),
         "rows": rows,
+        "source_context_count": len(source_context_by_key),
+        **transfer_totals,
         "total_cpu_owned_bytes": sum(int(row.get("cpu_owned_bytes", 0) or 0) for row in rows),
         "total_cpu_live_bytes": sum(int(row.get("cpu_live_bytes", 0) or 0) for row in rows),
         "max_cpu_peak_bytes_live": max([int(row.get("cpu_peak_bytes_live", 0) or 0) for row in rows] or [0]),

@@ -181,6 +181,7 @@ class _SavedTensorOffloadHandle:
     original_stride: tuple[int, ...]
     nbytes: int
     tag: str
+    ready_event: torch.cuda.Event | None = None
 
 
 class AttentionSavedTensorOffloadWrapper:
@@ -270,8 +271,13 @@ class AttentionSavedTensorOffloadWrapper:
         if not self._should_offload(tensor):
             return tensor
         cpu = _empty_strided_cpu_like(tensor, pin_memory=self.pin_memory)
+        non_blocking = bool(cpu.is_pinned())
         with torch.no_grad():
-            cpu.copy_(tensor.detach(), non_blocking=cpu.is_pinned())
+            cpu.copy_(tensor.detach(), non_blocking=non_blocking)
+        ready_event = None
+        if non_blocking:
+            ready_event = torch.cuda.Event()
+            ready_event.record(torch.cuda.current_stream(tensor.device))
         nbytes = _tensor_storage_nbytes(cpu)
         tag = self._tag_for(tensor)
         self.offload_calls += 1
@@ -294,11 +300,14 @@ class AttentionSavedTensorOffloadWrapper:
             original_stride=tuple(int(value) for value in tensor.stride()),
             nbytes=nbytes,
             tag=tag,
+            ready_event=ready_event,
         )
 
     def _unpack(self, packed: torch.Tensor | _SavedTensorOffloadHandle) -> torch.Tensor:
         if not isinstance(packed, _SavedTensorOffloadHandle):
             return packed
+        if packed.ready_event is not None:
+            packed.ready_event.synchronize()
         staged = torch.empty_strided(
             packed.original_shape,
             packed.original_stride,

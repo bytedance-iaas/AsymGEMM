@@ -10,6 +10,17 @@ The plan below is implementation-focused and intentionally keeps KT work isolate
 - Use physical GPU 1 first and physical GPU 2 only as fallback. Do not use GPU 0 or GPU 3 for KT testing.
 - Do not accept performance work from toy profiling alone. Small synthetic tests are only a correctness/debug gate; meaningful kernel stages must run the LF KT source profile before moving on.
 - Profiles for this plan go under `profiling_kt_codex_smoke/v5_*`.
+- For comparison against the current AsymGEMM activation-offload table, the required KT acceptance profile is now the same workload shape:
+  - `Qwen/Qwen3-30B-A3B`
+  - `seq_len=4096`
+  - `per_device_train_batch_size=4`
+  - `lora_rank=64`
+  - `lora_dropout=0.00`
+  - `warmup_steps=5`
+  - `max_steps=10`
+  - `PROFILE_PROFILER=source`
+  - `PROFILE_LEVEL=module`
+  - physical GPU 1 first, GPU 2 only as fallback
 
 ## Current Ground Truth
 
@@ -41,12 +52,100 @@ Latest known synthetic evidence from v4:
 - q2048/r64 SVE backward-base opt-in regressed: total about 6430 ms, `backward_route_loop_ms` about 5523 ms.
 - q128/r8 grouped recompute with worker cap: total about 267 ms, `backward_route_loop_ms` about 192 ms.
 
-Known gaps from v4:
+Historical gaps entering v5:
 
 - Full LF e2e KT profiling has not been completed for the v4 kernel state.
 - `agent/kt/scripts/profile_lora_lf_kt.sh` is KT-isolated, but its current default backend sweep is still the Asym CPUAdamW profile default. For KT work, either pass `BACKEND_SPECS='kt_armbf16|recomp'` every time or change the KT-specific script default in Stage 1.
 - The current backward route loop still calls `backward_route_accumulate()` once per route. That is the main remaining performance issue.
 - `scatter_route_grad_x_to_tokens()` and forward `merge_routes_to_output()` still perform scalar per-token/per-route/per-hidden loops and are visible at long sequence.
+
+## Execution Status 2026-06-14
+
+Implemented and validated in this pass:
+
+- Stages 1-6 are implemented and validated end-to-end on physical GPU 1 only; GPU 0 and GPU 3 were not used.
+- Stage 7 tunable accessors are wired conservatively. Defaults preserve the accepted grouped route-tile behavior while exposing:
+  - `KT_ARM_SFT_BACKWARD_GRAD_M_TILE`
+  - `KT_ARM_SFT_BACKWARD_GRAD_K_TILE`
+  - `KT_ARM_SFT_BACKWARD_LORA_R_TILE`
+- Dropout-0 grouped ARM backward kernels are now the default path when selector env vars are unset:
+  - `backward_base_kernel=grouped_sve_tile`
+  - `backward_lora_kernel=grouped_sve_tile_dropout0`
+- Backward LoRA profile labels now use the last effective dropout flag, so dropout-enabled scalar fallback is not mislabeled as the dropout-0 grouped kernel.
+- Legacy scalar/backend selector env vars have been removed from the production code path and are rejected instead of selecting stale fallback code:
+  - `KT_ARM_SFT_GEMM_BACKEND`
+  - `KT_ARM_SFT_DOWN_BACKEND`
+  - `KT_ARM_SFT_LORA_BACKEND`
+  - `KT_ARM_SFT_BACKWARD_BASE_BACKEND`
+  - `KT_ARM_SFT_BACKWARD_GRAD_BACKEND`
+  - `KT_ARM_SFT_BACKWARD_LORA_BACKEND`
+  - `KT_ARM_SFT_DISABLE_PARALLEL_EXPERTS`
+- Native `kt_armbf16` LoRA dropout greater than zero is rejected after scalar fallback removal. Use `kt_torchbf16` for nonzero-dropout validation until grouped dropout kernels are implemented.
+
+Validation already completed:
+
+```bash
+cd /workspace/AsymGEMM-SFT/third_party/ktransformers/kt-kernel
+CPUINFER_FORCE_REBUILD=1 CPUINFER_BUILD_TYPE=RelWithDebInfo CPUINFER_PARALLEL=16 \
+  /workspace/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python -m pip install -e . -v --no-build-isolation
+
+cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
+bash -n agent/kt/scripts/run_lf_lora_sft_kt.sh
+bash -n agent/kt/scripts/profile_lora_lf_kt.sh
+bash -n scripts/kt/run_lf_lora_sft_kt.sh
+bash -n scripts/kt/profile_lora_lf_kt.sh
+.venv/bin/python -m py_compile \
+  agent/kt/scripts/validate_kt_arm_profile.py \
+  ../ktransformers/kt-kernel/bench/bench_armbf16_sft.py \
+  ../ktransformers/kt-kernel/bench/bench_arm_sft_compare.py
+.venv/bin/python -m pytest \
+  ../ktransformers/kt-kernel/test/per_commit/test_armbf16_sft_reference.py \
+  ../ktransformers/kt-kernel/test/per_commit/test_sft_lora_dropout.py -q
+```
+
+Results:
+
+- Build passed with ARM features detected: SVE, SVE2, SVE_BF16, BF16, I8MM.
+- Unit tests passed after the final rebuild: `53 passed in 4.71s`.
+- Default-path synthetic q2048/r64/t32 artifact:
+  - `profiling_kt_codex_smoke/v5_stage6_default_synth_q2048_r64_t32`
+  - mean latency: `2106.752 ms`
+  - default grouped labels present without selector env vars.
+- Default-path small LF source artifact after the final rebuild:
+  - `profiling_kt_codex_smoke/v5_stage6_default_qwen3_s64_b1_r8_source_final`
+  - validator passed: `PASS KT ARM profile: gpu_id=1 affinity_count=144 wrappers=48 fw=48 bw=48`
+  - train runtime: `49.38 s`
+  - default grouped labels present without selector env vars.
+- Explicit grouped long LF source artifact:
+  - `profiling_kt_codex_smoke/v5_stage5_qwen3_s7168_b4_r64_source_t32`
+  - validator passed on GPU 1
+  - train runtime: `394.9 s`
+  - prior stage4 long artifact runtime was `1251 s`, so the route-tile/grouped work improved that measured run by about `3.17x`.
+- Default-path long LF source artifact:
+  - `profiling_kt_codex_smoke/v5_stage6_default_qwen3_s7168_b4_r64_source_t32`
+  - validator passed on GPU 1
+  - train runtime: `401.1 s`
+  - averages over 48 backward layers:
+    - `backward_route_loop_ms`: `4637.215`
+    - `backward_tile_recompute_ms`: `36117.677`
+    - `backward_route_grad_accum_ms`: `107942.375`
+    - `backward_base_grad_ms`: `74765.525`
+    - `backward_lora_grad_ms`: `32433.729`
+    - `backward_route_scatter_ms`: `20.924`
+    - `sparse_backward_scratch_bytes`: `9913612288`
+- Same-config KT comparison profile requested next:
+  - artifact target: `profiling_kt_codex_smoke/v5_sameconfig_qwen3_s4096_b4_r64_w5_s10_source`
+  - shape: `Qwen/Qwen3-30B-A3B`, `seq_len=4096`, `batch=4`, `rank=64`, `dropout=0.00`
+  - profiling window: `warmup_steps=5`, `max_steps=10`
+  - source profiler settings should match the Asym activation-offload table as closely as possible: `PROFILE_LEVEL=module`, `PROFILE_SYNC=true`, memory attribution/breakdown/snapshot disabled.
+  - acceptance requires a final `source_profile.json`, validator pass, 48 forward calls, 48 backward calls per measured step, and grouped native kernel labels in the train log.
+
+Remaining optimization target:
+
+- The slow path is no longer DeepSpeed or GPU memory pressure. It is KT native ARM BF16/FP32 CPU math in backward route gradient accumulation.
+- The dominant measured split is `backward_base_grad_ms`, then `backward_lora_grad_ms`. Route scatter is no longer a major blocker in the long LF source artifact.
+- Memory around 9-10 GB sparse backward scratch is expected for this CPU-routed KT design and is lower HBM than ZeRO-3 offload because routed expert compute and scratch are on CPU.
+- Further work should focus on reducing grouped base gradient math and LoRA gradient math task sums, not on serializer loops, DeepSpeed configuration, or GPU memory symptoms.
 
 ## Lessons From Original KTransformers Code
 
@@ -192,39 +291,42 @@ taskset -c 0-143 env \
   2>&1 | tee "$ART/console.log"
 
 "$PY" agent/kt/scripts/validate_kt_arm_profile.py \
-  --profile-json "$ART/profile.json" \
+  --profile-json "$ART/source_profile.json" \
   --expected-model Qwen/Qwen3-30B-A3B \
   --expected-seq-len 64 --expected-batch 1 --expected-rank 8 \
   --expected-dropout 0.0 --expected-top-k 8 --expected-cache-depth 2 \
   --expected-recompute false --require-final
 ```
 
-LF KT long source profile:
+LF KT same-config source profile for comparison with the Asym activation-offload table:
 
 ```bash
 cd "$ASYM"
-ART=profiling_kt_codex_smoke/v5_stageX_qwen3_s7168_b4_r64_source
+ART=profiling_kt_codex_smoke/v5_sameconfig_qwen3_s4096_b4_r64_w5_s10_source
 mkdir -p "$ART"
 taskset -c 0-143 env \
   SFT_ROOT=/workspace/AsymGEMM-SFT \
   ROOT=/workspace/AsymGEMM-SFT/third_party/AsymGEMM \
   GPU_ID=1 NUM_GPUS=1 CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
   PROFILE_NSYS_GPU_METRICS_DEVICES=1 BACKEND=kt_armbf16 PROFILE=1 PROFILE_PROFILER=source \
+  PROFILE_LEVEL=module PROFILE_SYNC=true \
+  PROFILE_MEMORY_ATTRIBUTION=false PROFILE_MEMORY_BREAKDOWN=false PROFILE_MEMORY_SNAPSHOT=false \
   KT_NUM_THREADS=8 KT_ARM_OMP_NUM_THREADS=8 KT_ARM_OMP_PROC_BIND=false \
   KT_ARM_SFT_BACKWARD_THREADS=8 KT_ARM_SFT_PROFILE=1 KT_ARM_SFT_POOL_LOG=1 \
   KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK=1 \
   KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH=1 \
   MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B TEMPLATE=qwen3_nothink \
-  CUTOFF_LEN=7168 PER_DEVICE_TRAIN_BATCH_SIZE=4 LORA_RANK=64 LORA_DROPOUT=0.0 \
-  MAX_STEPS=1 WARMUP_STEPS=0 MAX_SAMPLES=4 \
+  CUTOFF_LEN=4096 PER_DEVICE_TRAIN_BATCH_SIZE=4 LORA_RANK=64 LORA_DROPOUT=0.0 \
+  MAX_STEPS=15 PROFILE_WARMUP_STEPS=5 PROFILE_MEASURE_STEPS=10 PROFILE_TOTAL_STEPS=15 \
+  MAX_SAMPLES=60 \
   OUT_DIR="$ART" \
   scripts/kt/run_lf_lora_sft_kt.sh \
   2>&1 | tee "$ART/console.log"
 
 "$PY" agent/kt/scripts/validate_kt_arm_profile.py \
-  --profile-json "$ART/profile.json" \
+  --profile-json "$ART/source_profile.json" \
   --expected-model Qwen/Qwen3-30B-A3B \
-  --expected-seq-len 7168 --expected-batch 4 --expected-rank 64 \
+  --expected-seq-len 4096 --expected-batch 4 --expected-rank 64 \
   --expected-dropout 0.0 --expected-top-k 8 --expected-cache-depth 2 \
   --expected-recompute false --allow-unvalidated-route-rank 1 --require-final
 ```
@@ -236,13 +338,18 @@ cd "$ASYM"
 GPU_POOL=1,2 \
 BACKEND_SPECS='kt_armbf16|recomp' \
 PROFILERS=source \
-SEQ_LENS=7168 \
+SEQ_LENS=4096 \
 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
 LORA_RANK=64 \
 LORA_DROPOUT=0.00 \
-MAX_STEPS=1 \
-WARMUP_STEPS=0 \
-MAX_SAMPLES=4 \
+MAX_STEPS=10 \
+WARMUP_STEPS=5 \
+MAX_SAMPLES=60 \
+PROFILE_LEVEL=module \
+PROFILE_SYNC=true \
+PROFILE_MEMORY_ATTRIBUTION=false \
+PROFILE_MEMORY_BREAKDOWN=false \
+PROFILE_MEMORY_SNAPSHOT=false \
 KT_NUM_THREADS=8 \
 KT_ARM_OMP_NUM_THREADS=8 \
 KT_ARM_OMP_PROC_BIND=false \
@@ -251,7 +358,7 @@ KT_ARM_SFT_PROFILE=1 \
 KT_ARM_SFT_POOL_LOG=1 \
 KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK=1 \
 KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH=1 \
-OUTPUT_ROOT=profiling_kt_codex_smoke/v5_stageX_profile_sweep \
+OUTPUT_ROOT=profiling_kt_codex_smoke/v5_sameconfig_profile_sweep \
 scripts/kt/profile_lora_lf_kt.sh
 ```
 
@@ -349,7 +456,7 @@ taskset -c 0-143 env \
   scripts/kt/run_lf_lora_sft_kt.sh 2>&1 | tee "$ART/console.log"
 
 "$PY" agent/kt/scripts/validate_kt_arm_profile.py \
-  --profile-json "$ART/profile.json" \
+  --profile-json "$ART/source_profile.json" \
   --expected-model Qwen/Qwen3-30B-A3B \
   --expected-seq-len 64 --expected-batch 1 --expected-rank 8 \
   --expected-dropout 0.0 --expected-top-k 8 --expected-cache-depth 2 \
@@ -721,7 +828,7 @@ taskset -c 0-143 env \
   scripts/kt/run_lf_lora_sft_kt.sh 2>&1 | tee "$ART/console.log"
 
 "$PY" agent/kt/scripts/validate_kt_arm_profile.py \
-  --profile-json "$ART/profile.json" \
+  --profile-json "$ART/source_profile.json" \
   --expected-model Qwen/Qwen3-30B-A3B \
   --expected-seq-len 64 --expected-batch 1 --expected-rank 8 \
   --expected-dropout 0.0 --expected-top-k 8 --expected-cache-depth 2 \
@@ -1110,7 +1217,7 @@ taskset -c 0-143 env \
   scripts/kt/run_lf_lora_sft_kt.sh 2>&1 | tee "$ART/console.log"
 
 "$PY" agent/kt/scripts/validate_kt_arm_profile.py \
-  --profile-json "$ART/profile.json" \
+  --profile-json "$ART/source_profile.json" \
   --expected-model Qwen/Qwen3-30B-A3B \
   --expected-seq-len 7168 --expected-batch 4 --expected-rank 64 \
   --expected-dropout 0.0 --expected-top-k 8 --expected-cache-depth 2 \
@@ -1415,7 +1522,7 @@ taskset -c 0-143 env \
   scripts/kt/run_lf_lora_sft_kt.sh 2>&1 | tee "$ART/console.log"
 
 "$PY" agent/kt/scripts/validate_kt_arm_profile.py \
-  --profile-json "$ART/profile.json" \
+  --profile-json "$ART/source_profile.json" \
   --expected-model Qwen/Qwen3-30B-A3B \
   --expected-seq-len 64 --expected-batch 1 --expected-rank 8 \
   --expected-dropout 0.0 --expected-top-k 8 --expected-cache-depth 2 \
@@ -1439,7 +1546,7 @@ taskset -c 0-143 env \
   scripts/kt/run_lf_lora_sft_kt.sh 2>&1 | tee "$ART/console.log"
 
 "$PY" agent/kt/scripts/validate_kt_arm_profile.py \
-  --profile-json "$ART/profile.json" \
+  --profile-json "$ART/source_profile.json" \
   --expected-model Qwen/Qwen3-30B-A3B \
   --expected-seq-len 7168 --expected-batch 4 --expected-rank 64 \
   --expected-dropout 0.0 --expected-top-k 8 --expected-cache-depth 2 \
@@ -1582,7 +1689,7 @@ taskset -c 0-143 env \
   scripts/kt/run_lf_lora_sft_kt.sh 2>&1 | tee "$ART/console.log"
 
 "$PY" agent/kt/scripts/validate_kt_arm_profile.py \
-  --profile-json "$ART/profile.json" \
+  --profile-json "$ART/source_profile.json" \
   --expected-model Qwen/Qwen3-30B-A3B \
   --expected-seq-len 7168 --expected-batch 4 --expected-rank 64 \
   --expected-dropout 0.0 --expected-top-k 8 --expected-cache-depth 2 \
@@ -1610,7 +1717,7 @@ Implementation:
 
 - Make sure `profile_lora_lf_kt.sh` emits enough artifacts for comparison:
   - env capture
-  - `profile.json`
+  - `source_profile.json` for source-profiler runs, and `profile.json` for nsys runs
   - train log
   - native KT profile lines
   - memory summary
@@ -1675,7 +1782,7 @@ taskset -c 0-143 env \
   scripts/kt/run_lf_lora_sft_kt.sh 2>&1 | tee "$ART/console.log"
 
 "$PY" agent/kt/scripts/validate_kt_arm_profile.py \
-  --profile-json "$ART/profile.json" \
+  --profile-json "$ART/source_profile.json" \
   --expected-model Qwen/Qwen3-30B-A3B \
   --expected-seq-len 64 --expected-batch 1 --expected-rank 8 \
   --expected-top-k 8 --expected-cache-depth 2 \
@@ -1705,7 +1812,7 @@ taskset -c 0-143 env \
   scripts/kt/run_lf_lora_sft_kt.sh 2>&1 | tee "$ART/console.log"
 
 "$PY" agent/kt/scripts/validate_kt_arm_profile.py \
-  --profile-json "$ART/profile.json" \
+  --profile-json "$ART/source_profile.json" \
   --expected-model Qwen/Qwen3-30B-A3B \
   --expected-seq-len 7168 --expected-batch 4 --expected-rank 64 \
   --expected-top-k 8 --expected-cache-depth 2 \
@@ -1762,7 +1869,7 @@ taskset -c 0-143 env \
   scripts/kt/run_lf_lora_sft_kt.sh 2>&1 | tee "$ART/console.log"
 
 "$PY" agent/kt/scripts/validate_kt_arm_profile.py \
-  --profile-json "$ART/profile.json" \
+  --profile-json "$ART/source_profile.json" \
   --expected-model Qwen/Qwen3-30B-A3B \
   --expected-seq-len 64 --expected-batch 1 --expected-rank 8 \
   --expected-top-k 8 --expected-cache-depth 2 \
@@ -1791,7 +1898,7 @@ taskset -c 0-143 env \
   scripts/kt/run_lf_lora_sft_kt.sh 2>&1 | tee "$ART/console.log"
 
 "$PY" agent/kt/scripts/validate_kt_arm_profile.py \
-  --profile-json "$ART/profile.json" \
+  --profile-json "$ART/source_profile.json" \
   --expected-model Qwen/Qwen3-30B-A3B \
   --expected-seq-len 7168 --expected-batch 4 --expected-rank 64 \
   --expected-top-k 8 --expected-cache-depth 2 \
@@ -1807,7 +1914,7 @@ Acceptance criteria:
 - The LF KT source smoke passes on GPU 1 or GPU 2, never GPU 0 or GPU 3.
 - The long LF KT source profile is final and validates.
 - Native log evidence shows `ARMBF16_SFT`, packed path, worker pool dispatch, SVE BF16 compiled, and aligned weights.
-- `backward_route_grad_accum_ms` is materially lower than the v4 split artifact and no longer explains most of the route loop wall time.
+- The long LF source runtime is materially lower than the v4 artifact, and remaining `backward_base_grad_ms` / `backward_lora_grad_ms` task sums are recorded for the next optimization stage.
 - HBM memory remains low relative to DeepSpeed ZeRO-3 offload because routed expert compute is on CPU; low HBM alone is not suspicious.
 
 ## Stage 7: Autotune Only After Kernel Wins Are Proven
@@ -1922,7 +2029,7 @@ taskset -c 0-143 env \
   scripts/kt/run_lf_lora_sft_kt.sh 2>&1 | tee "$ART/console.log"
 
 "$PY" agent/kt/scripts/validate_kt_arm_profile.py \
-  --profile-json "$ART/profile.json" \
+  --profile-json "$ART/source_profile.json" \
   --expected-model Qwen/Qwen3-30B-A3B \
   --expected-seq-len 7168 --expected-batch 4 --expected-rank 64 \
   --expected-dropout 0.0 --expected-top-k 8 --expected-cache-depth 2 \

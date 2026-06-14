@@ -22,6 +22,14 @@ from asym_gemm.training.attention_checkpoint import (
     attention_checkpoint_module_names,
     install_attention_checkpoint,
 )
+from asym_gemm.training.decoder_activation_offload import (
+    decoder_saved_tensor_offload_module_names,
+    install_decoder_saved_tensor_offload,
+)
+from asym_gemm.training.decoder_checkpoint import (
+    decoder_checkpoint_module_names,
+    install_decoder_checkpoint,
+)
 from asym_gemm.training.frozen_linear import AsymExecutionStats, AsymFrozenLinear
 from asym_gemm.training.lora import (
     AsymLoRALinear,
@@ -156,10 +164,18 @@ class LFAsymReport:
     attention_gc_wrapped: int = 0
     attention_gc_modules: tuple[str, ...] = ()
     attention_gc_skipped: tuple[str, ...] = ()
+    layer_gc_enabled: bool = False
+    layer_gc_wrapped: int = 0
+    layer_gc_modules: tuple[str, ...] = ()
+    layer_gc_skipped: tuple[str, ...] = ()
     attention_act_offload_enabled: bool = False
     attention_act_offload_wrapped: int = 0
     attention_act_offload_modules: tuple[str, ...] = ()
     attention_act_offload_skipped: tuple[str, ...] = ()
+    layer_act_offload_enabled: bool = False
+    layer_act_offload_wrapped: int = 0
+    layer_act_offload_modules: tuple[str, ...] = ()
+    layer_act_offload_skipped: tuple[str, ...] = ()
     attention_saved_tensor_offload_wrapped: int = 0
     attention_saved_tensor_offload_modules: tuple[str, ...] = ()
     attention_saved_tensor_offload_skipped: tuple[str, ...] = ()
@@ -196,8 +212,12 @@ class LFAsymReport:
             f"expert_recompute_policy={self.expert_recompute_policy}, "
             f"attention_gc_enabled={self.attention_gc_enabled}, "
             f"attention_gc_wrapped={self.attention_gc_wrapped}, "
+            f"layer_gc_enabled={self.layer_gc_enabled}, "
+            f"layer_gc_wrapped={self.layer_gc_wrapped}, "
             f"attention_act_offload_enabled={self.attention_act_offload_enabled}, "
             f"attention_act_offload_wrapped={self.attention_act_offload_wrapped}, "
+            f"layer_act_offload_enabled={self.layer_act_offload_enabled}, "
+            f"layer_act_offload_wrapped={self.layer_act_offload_wrapped}, "
             f"attention_saved_tensor_offload_wrapped={self.attention_saved_tensor_offload_wrapped}, "
             f"router_mode={self.router_mode}, "
             f"router_no_grad={self.router_no_grad}, "
@@ -218,13 +238,20 @@ class LFAsymReport:
             "AsymGEMM LoRA-SFT runtime: "
             f"asym_forward_calls={self.stats.asym_forward_calls}, "
             f"asym_dx_calls={self.stats.asym_dx_calls}, "
+            f"forward_calls_total={self.stats.forward_calls_total}, "
+            f"backward_calls_total={self.stats.backward_calls_total}, "
+            f"calls_total={self.stats.calls_total}, "
             f"torch_forward_calls={self.stats.torch_forward_calls}, "
             f"torch_dx_calls={self.stats.torch_dx_calls}, "
             f"expert_recompute_policy={self.expert_recompute_policy}, "
             f"attention_gc_enabled={self.attention_gc_enabled}, "
             f"attention_gc_wrapped={self.attention_gc_wrapped}, "
+            f"layer_gc_enabled={self.layer_gc_enabled}, "
+            f"layer_gc_wrapped={self.layer_gc_wrapped}, "
             f"attention_act_offload_enabled={self.attention_act_offload_enabled}, "
             f"attention_act_offload_wrapped={self.attention_act_offload_wrapped}, "
+            f"layer_act_offload_enabled={self.layer_act_offload_enabled}, "
+            f"layer_act_offload_wrapped={self.layer_act_offload_wrapped}, "
             f"attention_saved_tensor_offload_wrapped={self.attention_saved_tensor_offload_wrapped}, "
             f"router_mode={self.router_mode}, "
             f"router_no_grad={self.router_no_grad}, "
@@ -685,9 +712,19 @@ def _attention_gc_enabled_for_policy(policy_label: str) -> bool:
     return str(policy_label).strip() == "gc-attn-exp"
 
 
+def _layer_gc_enabled_for_policy(policy_label: str) -> bool:
+    return str(policy_label).strip() == "gc-layer"
+
+
 def _attention_act_offload_enabled() -> bool:
     return _env_true(os.environ.get("ASYMM_ATTN_ACT_OFFLOAD")) or _env_true(
         os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD")
+    )
+
+
+def _layer_act_offload_enabled() -> bool:
+    return _env_true(os.environ.get("ASYMM_LAYER_ACT_OFFLOAD")) or _env_true(
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD")
     )
 
 
@@ -760,6 +797,24 @@ def _is_text_attention_module_name(name: str, module: nn.Module) -> bool:
     return all(target in children for target in _ATTENTION_TARGETS)
 
 
+def _is_qwen3_decoder_layer_module_name(name: str, module: nn.Module) -> bool:
+    if not name:
+        return False
+    if _has_attention_excluded_path_marker(name):
+        return False
+    children = dict(module.named_children())
+    required = {"self_attn", "mlp", "input_layernorm", "post_attention_layernorm"}
+    if not required <= set(children):
+        return False
+    class_name = type(module).__name__.lower()
+    module_name = type(module).__module__.lower()
+    config = getattr(module, "config", None)
+    model_type = str(getattr(config, "model_type", "")).lower()
+    if "qwen3" in class_name or "qwen3" in module_name or model_type in {"qwen3_moe", "qwen3_vl_moe"}:
+        return True
+    return hasattr(children["mlp"], "_is_asym_qwen3_moe_block") or is_qwen3_moe_block(children["mlp"])
+
+
 def _wrap_attention_checkpoint_modules(
     model: nn.Module,
     *,
@@ -782,6 +837,29 @@ def _wrap_attention_checkpoint_modules(
             skipped.append(f"{name}:vision_or_multimodal")
     if strict and not wrapped:
         raise RuntimeError("gc-attn-exp requested but no supported text attention modules were found")
+    return tuple(wrapped), tuple(skipped)
+
+
+def _wrap_qwen3_decoder_checkpoint_modules(
+    model: nn.Module,
+    *,
+    strict: bool,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    wrapped: list[str] = []
+    skipped: list[str] = []
+    for name, module in list(model.named_modules()):
+        if not name:
+            continue
+        if _is_qwen3_decoder_layer_module_name(name, module):
+            install_decoder_checkpoint(module)
+            wrapped.append(name)
+            continue
+        lower = f".{name.lower()}."
+        leaf = name.rsplit(".", 1)[-1].lower()
+        if leaf in {"decoder_layer", "layer"} and any(marker in lower for marker in _ATTENTION_GC_EXCLUDED_PATH_MARKERS):
+            skipped.append(f"{name}:vision_or_multimodal")
+    if strict and not wrapped:
+        raise RuntimeError("gc-layer requested but no supported Qwen3 decoder layers were found")
     return tuple(wrapped), tuple(skipped)
 
 
@@ -811,6 +889,29 @@ def _wrap_attention_saved_tensor_offload_modules(
 
     if strict and not wrapped:
         raise RuntimeError("attention activation offload requested but no supported text attention parents were found")
+    return tuple(wrapped), tuple(skipped)
+
+
+def _wrap_qwen3_decoder_saved_tensor_offload_modules(
+    model: nn.Module,
+    *,
+    strict: bool,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    wrapped: list[str] = []
+    skipped: list[str] = []
+    for name, module in list(model.named_modules()):
+        if not name:
+            continue
+        if _is_qwen3_decoder_layer_module_name(name, module):
+            install_decoder_saved_tensor_offload(module)
+            wrapped.append(name)
+            continue
+        lower = f".{name.lower()}."
+        leaf = name.rsplit(".", 1)[-1].lower()
+        if leaf in {"decoder_layer", "layer"} and any(marker in lower for marker in _ATTENTION_GC_EXCLUDED_PATH_MARKERS):
+            skipped.append(f"{name}:vision_or_multimodal")
+    if strict and not wrapped:
+        raise RuntimeError("Qwen3 decoder layer activation offload requested but no supported decoder layers were found")
     return tuple(wrapped), tuple(skipped)
 
 
@@ -928,10 +1029,17 @@ def apply_lf_asym_lora(
     stats = AsymExecutionStats()
     report.stats = stats
     attention_act_enabled = _attention_act_offload_enabled()
+    layer_act_enabled = _layer_act_offload_enabled()
     report.attention_act_offload_enabled = bool(attention_act_enabled)
+    report.layer_act_offload_enabled = bool(layer_act_enabled)
     wrap_experts = _targets_experts(raw_lora_target)
     offload_experts = backend == "asym" and selection.routed_experts
     offload_router = backend == "asym" and selection.router
+
+    if layer_act_enabled and recompute_config.label != "none":
+        raise RuntimeError("Qwen3 decoder layer activation offload requires expert policy none")
+    if layer_act_enabled and backend != "asym":
+        raise RuntimeError("Qwen3 decoder layer activation offload requires backend='asym'")
 
     expert_replacements: list[tuple[str, nn.Module, nn.Module, str]] = []
     if wrap_experts:
@@ -1070,6 +1178,19 @@ def apply_lf_asym_lora(
     else:
         setattr(model, "_asym_attention_gc_enabled", False)
         setattr(model, "_asym_attention_gc_modules", tuple())
+
+    if _layer_gc_enabled_for_policy(recompute_config.label):
+        wrapped_layers, skipped_layers = _wrap_qwen3_decoder_checkpoint_modules(model, strict=strict)
+        report.layer_gc_enabled = True
+        report.layer_gc_wrapped = len(wrapped_layers)
+        report.layer_gc_modules = wrapped_layers
+        report.layer_gc_skipped = skipped_layers
+        report.skipped.extend(skipped_layers)
+        setattr(model, "_asym_layer_gc_enabled", True)
+        setattr(model, "_asym_layer_gc_modules", wrapped_layers)
+    else:
+        setattr(model, "_asym_layer_gc_enabled", False)
+        setattr(model, "_asym_layer_gc_modules", tuple())
 
     expert_prefixes = [skip_prefix for _name, _old_module, _new_module, skip_prefix in expert_replacements]
     if offload_router:
@@ -1255,6 +1376,22 @@ def apply_lf_asym_lora(
     setattr(model, "_asym_attention_saved_tensor_offload_modules", tuple(attention_saved_modules))
     setattr(model, "_asym_attention_saved_tensor_offload_skipped", tuple(attention_saved_skipped))
 
+    layer_saved_modules: tuple[str, ...] = ()
+    layer_saved_skipped: tuple[str, ...] = ()
+    if layer_act_enabled:
+        layer_saved_modules, layer_saved_skipped = _wrap_qwen3_decoder_saved_tensor_offload_modules(
+            model,
+            strict=strict,
+        )
+    report.layer_act_offload_wrapped = len(layer_saved_modules)
+    report.layer_act_offload_modules = tuple(layer_saved_modules)
+    report.layer_act_offload_skipped = tuple(layer_saved_skipped)
+    if layer_saved_skipped:
+        report.skipped.extend(layer_saved_skipped)
+    setattr(model, "_asym_layer_act_offload_enabled", bool(layer_act_enabled))
+    setattr(model, "_asym_layer_act_offload_modules", tuple(layer_saved_modules))
+    setattr(model, "_asym_layer_act_offload_skipped", tuple(layer_saved_skipped))
+
     freeze_non_lora_params(model)
     _validate_trainable_params(model)
     residency_selection = selection if backend == "asym" else LFOffloadSelection(raw=selection.raw)
@@ -1362,6 +1499,10 @@ def _infer_adapter_config(model: nn.Module, metadata: Mapping[str, Any] | None) 
     if bool(getattr(model, "_asym_attention_gc_enabled", False)) or attention_gc_modules:
         config["asym_attention_gc_enabled"] = bool(getattr(model, "_asym_attention_gc_enabled", False))
         config["asym_attention_gc_modules"] = list(attention_gc_modules)
+    layer_gc_modules = tuple(getattr(model, "_asym_layer_gc_modules", ())) or decoder_checkpoint_module_names(model)
+    if bool(getattr(model, "_asym_layer_gc_enabled", False)) or layer_gc_modules:
+        config["asym_layer_gc_enabled"] = bool(getattr(model, "_asym_layer_gc_enabled", False))
+        config["asym_layer_gc_modules"] = list(layer_gc_modules)
     attention_act_modules = tuple(getattr(model, "_asym_attention_act_offload_modules", ()))
     if bool(getattr(model, "_asym_attention_act_offload_enabled", False)) or attention_act_modules:
         attention_saved_modules = tuple(
@@ -1378,6 +1519,15 @@ def _infer_adapter_config(model: nn.Module, metadata: Mapping[str, Any] | None) 
         config["asym_attention_saved_tensor_offload_skipped"] = list(
             getattr(model, "_asym_attention_saved_tensor_offload_skipped", ())
         )
+    layer_act_modules = tuple(getattr(model, "_asym_layer_act_offload_modules", ()))
+    if bool(getattr(model, "_asym_layer_act_offload_enabled", False)) or layer_act_modules:
+        layer_saved_modules = tuple(
+            getattr(model, "_asym_layer_act_offload_modules", ())
+        ) or decoder_saved_tensor_offload_module_names(model)
+        config["asym_layer_act_offload_enabled"] = bool(getattr(model, "_asym_layer_act_offload_enabled", False))
+        config["asym_layer_act_offload_modules"] = list(layer_act_modules)
+        config["asym_layer_act_offload_skipped"] = list(getattr(model, "_asym_layer_act_offload_skipped", ()))
+        config["asym_decoder_saved_tensor_offload_modules"] = list(layer_saved_modules)
     if metadata:
         config.update(_jsonable(dict(metadata)))
     return config

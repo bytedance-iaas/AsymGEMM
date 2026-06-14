@@ -549,6 +549,7 @@ def _grouped_lora_weight_grads_torch(
     out_dtype: torch.dtype,
     metadata: GroupedLoRAMetadata | None = None,
     stats: AsymExecutionStats | None = None,
+    record_lora_b_backward: bool = False,
 ) -> torch.Tensor:
     if left.shape[0] != right.shape[0]:
         raise ValueError(f"left/right row mismatch: {tuple(left.shape)} vs {tuple(right.shape)}")
@@ -563,7 +564,7 @@ def _grouped_lora_weight_grads_torch(
     # tiny test ranks like 2/3 do not, so keep the reference path there.
     if (int(right.shape[1]) * int(right.element_size())) % 16 != 0:
         _record_reference_fallback(stats, "lora_weight_grad_unaligned")
-        return _grouped_lora_weight_grads_reference(
+        out = _grouped_lora_weight_grads_reference(
             left,
             right,
             offsets,
@@ -571,11 +572,16 @@ def _grouped_lora_weight_grads_torch(
             num_experts,
             out_dtype=out_dtype,
         )
+        if stats is not None and record_lora_b_backward:
+            stats.expact_lora_b_backward_grouped_calls += 1
+        return out
     metadata = prepare_grouped_lora_metadata(offsets, experts, dense_experts=False) if metadata is None else metadata
     grouped_mm = _require_lora_grouped_mm()
     left_t = left.transpose(0, 1)
     grouped = grouped_mm(left_t, right, offs=metadata.active_offsets)
     grouped = grouped.to(dtype=out_dtype)
+    if stats is not None and record_lora_b_backward:
+        stats.expact_lora_b_backward_grouped_calls += 1
     if metadata.dense_expert_weights and int(grouped.shape[0]) == int(num_experts):
         return grouped
     out = torch.zeros(
@@ -676,6 +682,7 @@ def _grouped_lora_backward_loop_free(
         out_dtype=b_weight.dtype,
         metadata=lora_metadata,
         stats=stats,
+        record_lora_b_backward=True,
     ).mul_(scale)
     grad_low_rank = grouped_expert_lora(
         grad_lora,
@@ -792,6 +799,7 @@ def _grouped_down_lora_backward_split_loop_free(
         out_dtype=b_weight.dtype,
         metadata=metadata,
         stats=stats,
+        record_lora_b_backward=True,
     ).mul_(scale)
     dS_down = grouped_expert_lora(
         grad_lora,
@@ -859,6 +867,8 @@ def _activation_offload_cpu_silu_mul(
     *,
     tag: str,
 ) -> CPUActivationHandle:
+    manager.wait_cpu_ready(gate)
+    manager.wait_cpu_ready(up)
     out = manager.empty_cpu(tuple(gate.tensor.shape), gate.tensor.dtype, gate.original_device, tag)
     with torch.no_grad():
         out.tensor.copy_(F.silu(gate.tensor).mul(up.tensor), non_blocking=False)
@@ -871,6 +881,9 @@ def _activation_offload_cpu_silu_backward(
     grad_act: CPUActivationHandle,
     manager: ActivationOffloadManager,
 ) -> tuple[CPUActivationHandle, CPUActivationHandle]:
+    manager.wait_cpu_ready(gate)
+    manager.wait_cpu_ready(up)
+    manager.wait_cpu_ready(grad_act)
     grad_gate = manager.empty_cpu(tuple(gate.tensor.shape), gate.tensor.dtype, gate.original_device, "dgate")
     grad_up = manager.empty_cpu(tuple(up.tensor.shape), up.tensor.dtype, up.original_device, "dup")
     with torch.no_grad():
@@ -1055,6 +1068,7 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
                 out_dtype=down_lora_B.dtype,
                 metadata=lora_metadata,
                 stats=layer.stats,
+                record_lora_b_backward=True,
             ).mul_(layer.lora_scale)
             manager.release_stage(down_low_rank, drop_cache=True)
             manager.release_cpu(ctx.down_low_rank_cpu)
@@ -1126,8 +1140,8 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
                 out_dtype=gate_lora_B.dtype,
                 metadata=lora_metadata,
                 stats=layer.stats,
+                record_lora_b_backward=True,
             ).mul_(layer.lora_scale)
-            layer.stats.expact_lora_b_backward_grouped_calls += 1
             manager.release_stage(gate_low_rank, drop_cache=True)
             manager.release_cpu(ctx.gate_low_rank_cpu)
             if need_grad_packed:
@@ -1160,8 +1174,8 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
                 out_dtype=up_lora_B.dtype,
                 metadata=lora_metadata,
                 stats=layer.stats,
+                record_lora_b_backward=True,
             ).mul_(layer.lora_scale)
-            layer.stats.expact_lora_b_backward_grouped_calls += 1
             manager.release_stage(up_low_rank, drop_cache=True)
             manager.release_cpu(ctx.up_low_rank_cpu)
             if need_grad_packed:

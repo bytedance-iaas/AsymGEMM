@@ -171,6 +171,11 @@ def test_linear_forward_and_backward_counts() -> None:
     assert stats.attn_act_lora_a_forward_calls == 1
     assert stats.attn_act_lora_a_grad_calls == 1
     assert stats.attn_act_stage_low_rank_calls == 1
+    assert stats.attn_act_hbm_forward_calls == 2
+    assert stats.attn_act_hbm_backward_calls == 3
+    assert stats.forward_calls_total == 3
+    assert stats.backward_calls_total == 6
+    assert stats.calls_total == 9
     assert stats.attn_act_hbm_gemm_calls_by_tag == {
         "q_proj.base_forward": 1,
         "q_proj.lora_a_forward": 1,

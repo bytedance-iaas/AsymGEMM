@@ -2,16 +2,21 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from dataclasses import fields
 import json
 import os
 import time
 from dataclasses import asdict, dataclass
+from typing import Any, Iterator
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
 import asym_gemm
+from asym_gemm.training.activation_offload import ActivationOffloadManager
+import asym_gemm.training.qwen3_moe as qwen3_moe
 from asym_gemm.training.qwen3_moe import AsymQwen3Experts
 
 
@@ -40,6 +45,129 @@ class VariantResult:
     loss: float
     stats: dict
     activation_offload_stats: dict
+    range_timing: dict
+    transfer_timing: dict
+
+
+class _TimingRecorder:
+    def __init__(self, *, sync_cuda: bool) -> None:
+        self.sync_cuda = bool(sync_cuda)
+        self.enabled = False
+        self._rows: dict[str, dict[str, float | int]] = {}
+        self._stack: list[list[Any]] = []
+
+    def clear(self) -> None:
+        self._rows.clear()
+        self._stack.clear()
+
+    def _sync(self) -> None:
+        if self.sync_cuda and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    @contextmanager
+    def record(self, name: str, *, enabled: bool | None = None) -> Iterator[None]:
+        active = self.enabled if enabled is None else bool(enabled and self.enabled)
+        if not active:
+            yield
+            return
+        self._sync()
+        start = time.perf_counter()
+        self._stack.append([str(name), start, 0.0])
+        try:
+            yield
+        finally:
+            self._sync()
+            end = time.perf_counter()
+            current_name, current_start, child_ms = self._stack.pop()
+            elapsed_ms = (end - float(current_start)) * 1000.0
+            self_ms = max(0.0, elapsed_ms - float(child_ms))
+            row = self._rows.setdefault(
+                str(current_name),
+                {"count": 0, "total_ms": 0.0, "self_ms": 0.0, "max_ms": 0.0},
+            )
+            row["count"] = int(row["count"]) + 1
+            row["total_ms"] = float(row["total_ms"]) + elapsed_ms
+            row["self_ms"] = float(row["self_ms"]) + self_ms
+            row["max_ms"] = max(float(row["max_ms"]), elapsed_ms)
+            if self._stack:
+                self._stack[-1][2] = float(self._stack[-1][2]) + elapsed_ms
+
+    def summary(self, *, iters: int) -> dict[str, Any]:
+        rows = []
+        denom = max(1, int(iters))
+        for name, row in self._rows.items():
+            total_ms = float(row["total_ms"])
+            self_ms = float(row["self_ms"])
+            count = int(row["count"])
+            rows.append(
+                {
+                    "name": name,
+                    "count": count,
+                    "total_ms": total_ms,
+                    "self_ms": self_ms,
+                    "avg_ms": total_ms / max(1, count),
+                    "avg_self_ms": self_ms / max(1, count),
+                    "per_step_ms": total_ms / denom,
+                    "per_step_self_ms": self_ms / denom,
+                    "max_ms": float(row["max_ms"]),
+                }
+            )
+        rows.sort(key=lambda item: float(item["total_ms"]), reverse=True)
+        return {
+            "enabled": bool(self._rows),
+            "sync_cuda": self.sync_cuda,
+            "rows": rows,
+            "total_ms": sum(float(row["total_ms"]) for row in self._rows.values()),
+        }
+
+
+@contextmanager
+def _patched_breakdown_timers(
+    range_recorder: _TimingRecorder | None,
+    transfer_recorder: _TimingRecorder | None,
+) -> Iterator[None]:
+    original_prof_range = qwen3_moe.prof_range
+    original_offload = ActivationOffloadManager.offload
+    original_stage = ActivationOffloadManager.stage
+    original_stage_concat = ActivationOffloadManager.stage_concat_columns
+
+    def timed_prof_range(name: str, *, enabled: bool | None = None):
+        if range_recorder is None:
+            return original_prof_range(name, enabled=enabled)
+        return range_recorder.record(name, enabled=enabled)
+
+    def timed_offload(self: ActivationOffloadManager, tensor: torch.Tensor, tag: str):
+        if transfer_recorder is None:
+            return original_offload(self, tensor, tag)
+        with transfer_recorder.record(f"transfer.offload.{tag}"):
+            return original_offload(self, tensor, tag)
+
+    def timed_stage(self: ActivationOffloadManager, handle, *, tag: str | None = None):
+        if transfer_recorder is None:
+            return original_stage(self, handle, tag=tag)
+        stage_tag = handle.tag if tag is None else tag
+        with transfer_recorder.record(f"transfer.stage.{stage_tag}"):
+            return original_stage(self, handle, tag=tag)
+
+    def timed_stage_concat(self: ActivationOffloadManager, left, right, *, tag: str):
+        if transfer_recorder is None:
+            return original_stage_concat(self, left, right, tag=tag)
+        with transfer_recorder.record(f"transfer.stage_concat.{tag}"):
+            return original_stage_concat(self, left, right, tag=tag)
+
+    if range_recorder is not None:
+        qwen3_moe.prof_range = timed_prof_range
+    if transfer_recorder is not None:
+        ActivationOffloadManager.offload = timed_offload
+        ActivationOffloadManager.stage = timed_stage
+        ActivationOffloadManager.stage_concat_columns = timed_stage_concat
+    try:
+        yield
+    finally:
+        qwen3_moe.prof_range = original_prof_range
+        ActivationOffloadManager.offload = original_offload
+        ActivationOffloadManager.stage = original_stage
+        ActivationOffloadManager.stage_concat_columns = original_stage_concat
 
 
 def _require_sm100_bf16() -> None:
@@ -111,6 +239,20 @@ def _step(model: AsymQwen3Experts, x_seed: int, top_k_index: torch.Tensor, top_k
     return float(loss.detach().cpu().item())
 
 
+def _reset_execution_stats(stats: Any) -> None:
+    dataclass_fields = getattr(stats, "__dataclass_fields__", None)
+    if not isinstance(dataclass_fields, dict):
+        return
+    for field in fields(stats):
+        value = getattr(stats, field.name)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            setattr(stats, field.name, 0)
+        elif isinstance(value, dict):
+            value.clear()
+
+
 def _profile_variant(
     variant: str,
     model: AsymQwen3Experts,
@@ -130,34 +272,42 @@ def _profile_variant(
             _step(model, args.seed + 1000 + idx, top_k_index, top_k_weights, args)
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
+        _reset_execution_stats(getattr(model, "stats", None))
 
+        range_recorder = _TimingRecorder(sync_cuda=args.breakdown_sync_cuda) if args.profile_breakdown else None
+        transfer_recorder = _TimingRecorder(sync_cuda=args.breakdown_sync_cuda) if args.profile_breakdown else None
         peaks_allocated: list[int] = []
         peaks_reserved: list[int] = []
         losses: list[float] = []
-        if args.use_cuda_events:
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            torch.cuda.reset_peak_memory_stats()
-            start.record()
-            for idx in range(args.iters):
-                losses.append(_step(model, args.seed + 2000 + idx, top_k_index, top_k_weights, args))
-            end.record()
-            torch.cuda.synchronize()
-            step_ms = float(start.elapsed_time(end)) / max(1, args.iters)
-            peaks_allocated.append(int(torch.cuda.max_memory_allocated()))
-            peaks_reserved.append(int(torch.cuda.max_memory_reserved()))
-        else:
-            elapsed = 0.0
-            for idx in range(args.iters):
-                torch.cuda.synchronize()
+        with _patched_breakdown_timers(range_recorder, transfer_recorder):
+            if range_recorder is not None:
+                range_recorder.enabled = True
+            if transfer_recorder is not None:
+                transfer_recorder.enabled = True
+            if args.use_cuda_events:
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
                 torch.cuda.reset_peak_memory_stats()
-                t0 = time.perf_counter()
-                losses.append(_step(model, args.seed + 2000 + idx, top_k_index, top_k_weights, args))
+                start.record()
+                for idx in range(args.iters):
+                    losses.append(_step(model, args.seed + 2000 + idx, top_k_index, top_k_weights, args))
+                end.record()
                 torch.cuda.synchronize()
-                elapsed += time.perf_counter() - t0
                 peaks_allocated.append(int(torch.cuda.max_memory_allocated()))
                 peaks_reserved.append(int(torch.cuda.max_memory_reserved()))
-            step_ms = elapsed * 1000.0 / max(1, args.iters)
+                step_ms = float(start.elapsed_time(end)) / max(1, args.iters)
+            else:
+                elapsed = 0.0
+                for idx in range(args.iters):
+                    torch.cuda.synchronize()
+                    torch.cuda.reset_peak_memory_stats()
+                    t0 = time.perf_counter()
+                    losses.append(_step(model, args.seed + 2000 + idx, top_k_index, top_k_weights, args))
+                    torch.cuda.synchronize()
+                    elapsed += time.perf_counter() - t0
+                    peaks_allocated.append(int(torch.cuda.max_memory_allocated()))
+                    peaks_reserved.append(int(torch.cuda.max_memory_reserved()))
+                step_ms = elapsed * 1000.0 / max(1, args.iters)
         return VariantResult(
             variant=variant,
             peak_allocated_bytes=max(peaks_allocated) if peaks_allocated else 0,
@@ -166,6 +316,8 @@ def _profile_variant(
             loss=losses[-1] if losses else 0.0,
             stats=model.stats.as_dict(),
             activation_offload_stats=dict(getattr(model, "_last_activation_offload_stats", {})),
+            range_timing=range_recorder.summary(iters=args.iters) if range_recorder is not None else {"enabled": False, "rows": []},
+            transfer_timing=transfer_recorder.summary(iters=args.iters) if transfer_recorder is not None else {"enabled": False, "rows": []},
         )
     finally:
         if previous is None:
@@ -187,6 +339,8 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--use-cuda-events", action="store_true")
+    parser.add_argument("--profile-breakdown", action="store_true")
+    parser.add_argument("--breakdown-sync-cuda", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--output-json", type=str, default="")
     args = parser.parse_args()
 

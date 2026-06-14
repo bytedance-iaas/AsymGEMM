@@ -800,8 +800,20 @@ def test_source_profile_reports_activation_offload_counters() -> None:
                 "max_stage_bytes_live": 2048,
                 "cpu_pool_cached_bytes": 4096,
                 "cpu_pool_limit_bytes": 8192,
+                "num_offloads": 2,
+                "offloaded_bytes": 100,
+                "offload_bytes_by_tag": {"X": 64, "S": 36},
+                "num_stages": 1,
+                "stage_bytes_by_tag": {"S_stage": 32},
                 "pre_final_cleanup_cpu_owned_bytes": 0,
                 "final_cleanup_released_bytes": 0,
+                "source_context": {
+                    "num_offloads": 1,
+                    "offloaded_bytes": 16,
+                    "offload_bytes_by_tag": {"q_proj.U": 16},
+                    "num_stages": 0,
+                    "stage_bytes_by_tag": {},
+                },
             }
             self._last_activation_offload_stats_pre_release = {
                 "cpu_owned_bytes": 0,
@@ -826,6 +838,19 @@ def test_source_profile_reports_activation_offload_counters() -> None:
     assert summary["max_cpu_peak_bytes_live"] == 1024
     assert summary["max_stage_bytes_live"] == 2048
     assert summary["max_cpu_pool_cached_bytes"] == 4096
+    assert summary["source_context_count"] == 1
+    assert summary["total_d2h_offload_copy_calls"] == 3
+    assert summary["total_h2d_stage_copy_calls"] == 1
+    assert summary["total_d2h_offloaded_bytes"] == 116
+    assert summary["total_h2d_staged_bytes"] == 32
+    assert summary["total_forward_offload_copy_calls"] == 3
+    assert summary["total_backward_stage_copy_calls"] == 1
+    assert summary["total_forward_offloaded_bytes"] == 116
+    assert summary["total_backward_staged_bytes"] == 32
+    assert summary["total_activation_transfer_calls"] == 4
+    assert summary["total_activation_transfer_bytes"] == 148
+    assert summary["offload_bytes_by_tag"] == {"X": 64, "S": 36, "q_proj.U": 16}
+    assert summary["stage_bytes_by_tag"] == {"S_stage": 32}
     row = summary["rows"][0]
     assert row["name"] == "experts"
     assert row["execution_stats"]["asym_forward_calls"] == 3

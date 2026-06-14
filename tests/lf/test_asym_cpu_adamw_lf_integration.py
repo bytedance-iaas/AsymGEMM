@@ -187,6 +187,80 @@ def test_lf_lora_target_all_does_not_select_supported_moe_routers() -> None:
 
 
 @requires_lf_adapter
+def test_lf_plain_lora_all_adapter_adds_qwen3_fused_expert_lora() -> None:
+    from llamafactory.model.adapter import _setup_lora_tuning
+    from llamafactory.model.model_utils.fused_moe_lora import count_fused_moe_lora
+    from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+
+    config = Qwen3MoeConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        moe_intermediate_size=8,
+        num_experts=4,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+        output_router_logits=False,
+        tie_word_embeddings=False,
+    )
+    model = Qwen3MoeForCausalLM(config)
+
+    model_args = SimpleNamespace(
+        adapter_name_or_path=None,
+        adapter_folder=None,
+        offload_folder=None,
+        cache_dir=None,
+        model_revision="main",
+        hf_hub_token=None,
+        use_kt=False,
+        use_unsloth=False,
+        use_asym_gemm=False,
+        resize_vocab=False,
+    )
+    finetuning_args = SimpleNamespace(
+        finetuning_type="lora",
+        create_new_adapter=True,
+        lora_target=["all"],
+        freeze_vision_tower=False,
+        freeze_multi_modal_projector=True,
+        freeze_language_model=False,
+        use_llama_pro=False,
+        freeze_trainable_layers=0,
+        use_dora=False,
+        use_rslora=False,
+        lora_rank=2,
+        lora_alpha=4,
+        lora_dropout=0.0,
+        additional_target=None,
+        pissa_init=False,
+        pissa_iter=-1,
+        oft_rank=0,
+        oft_block_size=0,
+        module_dropout=0.0,
+    )
+
+    model = _setup_lora_tuning(
+        config,
+        model,
+        model_args,
+        finetuning_args,
+        is_trainable=True,
+        cast_trainable_params_to_fp32=False,
+    )
+    trainable_names = [name for name, param in model.named_parameters() if param.requires_grad]
+
+    assert count_fused_moe_lora(model) == {"modules": 1, "tensors": 6, "parameters": 576}
+    assert any("mlp.experts._lf_fused_lora_params.gate_lora_a" in name for name in trainable_names)
+    assert any("mlp.experts._lf_fused_lora_params.down_lora_b" in name for name in trainable_names)
+    assert any("self_attn.q_proj.lora_A" in name for name in trainable_names)
+    assert all(".mlp.gate." not in name and not name.endswith(".mlp.gate.weight") for name in trainable_names)
+
+
+@requires_lf_adapter
 def test_lf_peft_lora_all_does_not_add_adapter_to_qwen_moe_routers() -> None:
     from peft import LoraConfig, TaskType, get_peft_model
     from llamafactory.model.model_utils.fused_moe_lora import apply_fused_moe_lora, count_fused_moe_lora
