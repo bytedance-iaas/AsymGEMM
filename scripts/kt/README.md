@@ -10,11 +10,14 @@ stay isolated from the shared LF scripts in `scripts/lf/`.
 Do not edit `scripts/lf/run_lf_lora_sft.sh` or `scripts/lf/profile_lora_lf.sh`
 for KT ARM BF16 work. Use GPU 1 first and GPU 2 only as fallback.
 The kt_armbf16 production path is grouped packed SVE/BF16 forward and grouped
-dropout-0 backward. Legacy scalar/backend selector envs are rejected instead of
-selecting fallback code.
-Optional tuning knobs are `KT_ARM_SFT_BACKWARD_GRAD_M_TILE`,
-`KT_ARM_SFT_BACKWARD_GRAD_K_TILE`, and `KT_ARM_SFT_BACKWARD_LORA_R_TILE`.
-Unset values preserve the accepted v5 default tile behavior.
+dropout-0 backward. The base backward grads run as register-blocked SVE BFDOT
+(`backward_base_kernel=grouped_sve_bfdot_tile`) on the transposed base weights.
+Legacy scalar/backend selector envs are rejected instead of selecting fallback
+code.
+The only base/LoRA tile tuning knob is `KT_ARM_SFT_BACKWARD_LORA_R_TILE`
+(LoRA rank tile). Unset values preserve the accepted default tile behavior. The
+former `KT_ARM_SFT_BACKWARD_GRAD_M_TILE` / `KT_ARM_SFT_BACKWARD_GRAD_K_TILE`
+knobs were removed with the FP32-FMLA base backward path they tuned.
 
 Small KT source smoke:
 
@@ -43,7 +46,7 @@ taskset -c 0-143 env \
   --expected-recompute false --require-final \
   --require-native-field backward_tile_recompute_ms \
   --require-native-field backward_route_grad_accum_ms \
-  --require-native-kv backward_base_kernel=grouped_sve_tile \
+  --require-native-kv backward_base_kernel=grouped_sve_bfdot_tile \
   --require-native-kv backward_lora_kernel=grouped_sve_tile_dropout0
 ```
 

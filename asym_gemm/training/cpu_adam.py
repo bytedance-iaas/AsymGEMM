@@ -111,6 +111,8 @@ class AsymCPUAdamW(torch.optim.Optimizer):
         pin_memory: bool = True,
         fp32_master: bool = True,
         grad_offload: bool = False,
+        weight_offload: bool = False,
+        coordinator: Any = None,
     ) -> None:
         if backend not in {"torch", "deepspeed"}:
             raise ValueError("backend must be either 'torch' or 'deepspeed'")
@@ -166,6 +168,8 @@ class AsymCPUAdamW(torch.optim.Optimizer):
         self.pin_memory = bool(pin_memory)
         self.fp32_master = bool(fp32_master)
         self.grad_offload = bool(grad_offload)
+        self.weight_offload = bool(weight_offload)
+        self._coordinator = coordinator
         self._mappings: list[_ParamMapping] = []
         self._pin_memory_failures: list[str] = []
         self._grad_offload_handles: list[Any] = []
@@ -224,6 +228,16 @@ class AsymCPUAdamW(torch.optim.Optimizer):
     @property
     def alias_param_names(self) -> list[tuple[str, ...]]:
         return [mapping.aliases for mapping in self._mappings]
+
+    def attach_weight_offload_coordinator(self, coordinator: Any) -> None:
+        """Bind a LoRA weight-offload coordinator built after this optimizer.
+
+        Built afterward so the optimizer's fp32 masters are captured from the full GPU weights
+        before the coordinator releases them. After this call, copy-back refreshes the CPU home and
+        the post-accumulate grad hook releases the backward-staged weight.
+        """
+        self._coordinator = coordinator
+        self.weight_offload = True
 
     def _create_inner_optimizer(
         self,
@@ -374,6 +388,10 @@ class AsymCPUAdamW(torch.optim.Optimizer):
         mapping.offloaded_grad_numel += int(grad.numel())
         mapping.cpu_param.grad = mapping.grad_buffer
         mapping.cuda_param.grad = None
+        if self.weight_offload and self._coordinator is not None:
+            # Single backward release point: runs strictly after AccumulateGrad wrote param.grad.
+            # No-op for non-offloaded params (e.g. attention LoRA).
+            self._coordinator.release(mapping.cuda_param)
 
     def _copy_or_accumulate_grad_to_cpu(self, mapping: _ParamMapping, cuda_grad: torch.Tensor) -> None:
         grad_buffer = self._ensure_grad_buffer(mapping)
@@ -395,6 +413,12 @@ class AsymCPUAdamW(torch.optim.Optimizer):
     def _copy_master_to_compute_param(self, mapping: _ParamMapping) -> None:
         if not mapping.cpu_param.data.is_contiguous():
             raise RuntimeError(f"CPU master for {mapping.name} must be contiguous")
+        if self.weight_offload and self._coordinator is not None and self._coordinator.is_registered(mapping.cuda_param):
+            # Offloaded bank: refresh the pinned bf16 CPU home from the updated fp32 master (CPU cast,
+            # no H2D). The next forward/backward gather re-stages it to GPU. cuda_param.data stays a
+            # 0-size placeholder until then.
+            self._coordinator.refresh_home_from_master(mapping.cuda_param, mapping.cpu_param.data)
+            return
         mapping.cuda_param.data.copy_(mapping.cpu_param.data, non_blocking=mapping.cpu_param.data.is_pinned())
 
     def _refresh_visible_state(self) -> None:
@@ -756,6 +780,8 @@ class AsymCPUAdamW(torch.optim.Optimizer):
             "grad_offload_hook_count": len(self._grad_offload_handles),
             "grad_offload_buffer_bytes": int(grad_buffer_bytes),
             "pinned_grad_offload_buffer_bytes": int(pinned_grad_buffer_bytes),
+            "weight_offload_enabled": bool(self.weight_offload),
+            **(self._coordinator.summary() if self._coordinator is not None else {}),
             "param_count": len(self._mappings),
             "param_numel": sum(int(mapping.cpu_param.numel()) for mapping in self._mappings),
             "cpu_master_bytes": int(master_bytes),

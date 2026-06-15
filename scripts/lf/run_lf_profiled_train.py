@@ -640,6 +640,12 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
             or "false"
         ).lower()
         in {"1", "true", "yes", "on"},
+        "asym_cpu_adamw_weight_offload": (
+            os.environ.get("ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_WEIGHT_OFFLOAD")
+            or _option_value(args, "--asym_cpu_adamw_weight_offload")
+            or "false"
+        ).lower()
+        in {"1", "true", "yes", "on"},
         "nsys_capture_range": _env_enabled("ASYM_GEMM_LF_NSYS_CAPTURE_RANGE"),
         "superoffload_config": os.environ.get("ASYM_GEMM_LF_CONFIG_SUPEROFFLOAD_CONFIG")
         if is_superoffload_backend

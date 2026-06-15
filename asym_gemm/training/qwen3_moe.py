@@ -1079,16 +1079,22 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
         ctx.input_dtype = packed.dtype
         ctx.lora_dropout_p = float(layer.lora_dropout_p)
         ctx.expert_lora_a_forward_mode = lora_a_forward_mode
-        ctx.save_for_backward(
-            offsets,
-            experts,
-            gate_lora_A,
-            gate_lora_B,
-            up_lora_A,
-            up_lora_B,
-            down_lora_A,
-            down_lora_B,
-        )
+        ctx.weight_offload = getattr(layer, "_weight_offload", None) is not None
+        if ctx.weight_offload:
+            # Weight offload: do NOT keep the GPU weights alive across the fwd->bwd gap.
+            # The forward hook releases them; backward re-gathers from ctx.layer.
+            ctx.save_for_backward(offsets, experts)
+        else:
+            ctx.save_for_backward(
+                offsets,
+                experts,
+                gate_lora_A,
+                gate_lora_B,
+                up_lora_A,
+                up_lora_B,
+                down_lora_A,
+                down_lora_B,
+            )
         activation_offload_stats = manager.snapshot()
         activation_offload_stats["expert_lora_a_forward_mode"] = lora_a_forward_mode
         layer._last_activation_offload_stats = activation_offload_stats
@@ -1096,17 +1102,30 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        (
-            offsets,
-            experts,
-            gate_lora_A,
-            gate_lora_B,
-            up_lora_A,
-            up_lora_B,
-            down_lora_A,
-            down_lora_B,
-        ) = ctx.saved_tensors
         layer: AsymQwen3Experts = ctx.layer
+        if getattr(ctx, "weight_offload", False):
+            # Re-gather the layer's LoRA banks to GPU (single H2D) before reading them. param.data is
+            # full-shaped here (AccumulateGrad needs it); per-bank release is owned by the optimizer's
+            # post-accumulate grad hook, which runs strictly after grad accumulation.
+            offsets, experts = ctx.saved_tensors
+            layer.gather_lora_weights()
+            gate_lora_A = layer.gate_lora_A
+            gate_lora_B = layer.gate_lora_B
+            up_lora_A = layer.up_lora_A
+            up_lora_B = layer.up_lora_B
+            down_lora_A = layer.down_lora_A
+            down_lora_B = layer.down_lora_B
+        else:
+            (
+                offsets,
+                experts,
+                gate_lora_A,
+                gate_lora_B,
+                up_lora_A,
+                up_lora_B,
+                down_lora_A,
+                down_lora_B,
+            ) = ctx.saved_tensors
         manager: ActivationOffloadManager = ctx.manager
         need_grad_packed = ctx.needs_input_grad[0]
         lora_metadata = prepare_grouped_lora_metadata(offsets, experts, dense_experts=True)
@@ -1930,6 +1949,7 @@ class AsymQwen3Experts(nn.Module):
         self.expert_recompute_config = parse_expert_recompute_policy_spec(expert_recompute_policy)
         self.profile_prefix = "layers.unknown.mlp.experts"
         self._last_activation_offload_stats: dict[str, object] = {}
+        self._weight_offload = None  # LoRAWeightOffloadCoordinator when JIT LoRA weight offload is installed
 
         base_dtype = torch.bfloat16
         if backend == "asym" and self.offload:
@@ -2262,6 +2282,29 @@ class AsymQwen3Experts(nn.Module):
     def _expert_gc_use_reentrant(self) -> bool:
         default = _env_flag("ASYM_EXPERT_GC_REENTRANT", True)
         return _env_flag("ASYM_EXPERT_GC_USE_REENTRANT", default)
+
+    def _lora_banks(self) -> tuple[torch.nn.Parameter, ...]:
+        return (
+            self.gate_lora_A,
+            self.gate_lora_B,
+            self.up_lora_A,
+            self.up_lora_B,
+            self.down_lora_A,
+            self.down_lora_B,
+        )
+
+    def gather_lora_weights(self) -> None:
+        """Stage this layer's LoRA banks CPU->GPU (single H2D) when JIT weight offload is on."""
+        coordinator = getattr(self, "_weight_offload", None)
+        if coordinator is not None:
+            coordinator.gather_group(self)
+
+    def release_lora_weights(self) -> None:
+        """Release this layer's LoRA banks to 0-size CUDA placeholders (frees the staged slab)."""
+        coordinator = getattr(self, "_weight_offload", None)
+        if coordinator is not None:
+            for param in self._lora_banks():
+                coordinator.release(param)
 
     def _activation_offload_requested(self) -> bool:
         return _env_flag("ASYMM_EXPERT_ACT_OFFLOAD", False)

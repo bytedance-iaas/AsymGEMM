@@ -16,40 +16,70 @@ NSYS_BIN=${NSYS_BIN:-nsys}
 # DIST_LAUNCHER=${DIST_LAUNCHER:-accelerate}
 DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun}
 # DIST_LAUNCHER=${DIST_LAUNCHER:-deepspeed}
-RUN_POSTSERVE=${RUN_POSTSERVE:-false}
+RUN_POST=${RUN_POST:-false}
 
 # Sweep axes
-GPU_POOL=${GPU_POOL:-0}
+GPU_POOL=${GPU_POOL:-3}
 # MODEL_SPECS entries are model|num_gpus. Recompute belongs only in BACKEND_SPECS.
-# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
+MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
-MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
+# MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1,Qwen/Qwen3.5-122B-A10B|1"}
 ROUTER_MODES=${ROUTER_MODES:-whole}
 # PROFILERS=${PROFILERS:-nsys,source}
-PROFILERS=${PROFILERS:-nsys,source}
+PROFILERS=${PROFILERS:-source}
 PRECISION=${PRECISION:-bf16}
 # LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
-LORA_DROPOUT=${LORA_DROPOUT:-0.08}
+LORA_DROPOUT=${LORA_DROPOUT:-0.00}
+LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero2|norecomp,zero2|recomp,zero3_offload|norecomp,zero3_offload_mem|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"kt_armbf16|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
 # Plain asym remains the non-CPUAdam Asym baseline; the default e2e path validates the Asym CPUAdamW backend.
-BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload_mem|recomp"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp,superoffload|recomp"}
+BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
 
-# EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le0,tok-le512,tok-le512-act"}
-# EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le1"}
-# EXPERT_POLICIES=${EXPERT_POLICIES-"none,tok-le1,tok-ge1"}
-EXPERT_POLICIES=${EXPERT_POLICIES-"none"}
+# Paired expert policy / expert activation offload / attention activation offload / layer activation offload axis.
+# Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD.
+# Example: none|true|false|false,gc-attn-exp|false|false|false,none|true|true|true.
+# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|false|false,gc-exp|false|false|false,gc-attn-exp|false|false|false,none|false|false|false"}
+ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|true|true"}
+# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false"}
+ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
 
+# Backend checks and AsymGEMM options
+# ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
+ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-all}
+ASYM_STRICT=${ASYM_STRICT:-true}
+REQUIRE_SM100=${REQUIRE_SM100:-1}
+# Comma/space-separated list of one or more boolean values to sweep (e.g. "false,true").
+ASYM_CPU_ADAMW_GRAD_OFFLOAD=${ASYM_CPU_ADAMW_GRAD_OFFLOAD:-true}
+ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD:-true}
+
+# Optimizer
+USE_ASYM_CPU_ADAMW=${USE_ASYM_CPU_ADAMW:-true}
+ASYM_CPU_ADAMW_BACKEND=${ASYM_CPU_ADAMW_BACKEND:-deepspeed}
+ASYM_CPU_ADAMW_PIN_MEMORY=${ASYM_CPU_ADAMW_PIN_MEMORY:-true}
+ASYM_CPU_ADAMW_FP32_MASTER=${ASYM_CPU_ADAMW_FP32_MASTER:-true}
+
+# Execution
+OVERWRITE=${OVERWRITE:-false}
+CONTINUE_ON_ERROR=${CONTINUE_ON_ERROR:-false}
+DRY_RUN=${DRY_RUN:-false}
+COLLECT_EXISTING=${COLLECT_EXISTING:-false}
+INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
+RUN_NAME=${RUN_NAME:-}
+
 # Training
+# SEQ_LENS=${SEQ_LENS:-11264}
 SEQ_LENS=${SEQ_LENS:-8192}
+# SEQ_LENS=${SEQ_LENS:-8192}
 # SEQ_LENS=${SEQ_LENS:-7168}
-PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-2}
+# SEQ_LENS=${SEQ_LENS:-4096}
+PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-8}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 MAX_STEPS=${MAX_STEPS:-10000000}
 WARMUP_STEPS=${WARMUP_STEPS:-5}
@@ -62,23 +92,10 @@ SEED=${SEED:-42}
 DATASET=${DATASET:-asym_long_sft_smoke}
 PREPARE_DATASETS=${PREPARE_DATASETS:-true}
 DATASET_MIN_TOKENS=${DATASET_MIN_TOKENS:-auto}
-DATASET_EVAL_ROWS=${DATASET_EVAL_ROWS:-128}
+DATASET_EVAL_ROWS=${DATASET_EVAL_ROWS:-1}
 DATASET_OVERWRITE=${DATASET_OVERWRITE:-false}
 TEMPLATE=${TEMPLATE:-auto}
-MAX_SAMPLES=${MAX_SAMPLES:-128}
-
-# Backend checks and AsymGEMM options
-# ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
-ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-all}
-ASYMM_EXPERT_ACT_OFFLOAD=${ASYMM_EXPERT_ACT_OFFLOAD:-true,false}
-ASYM_STRICT=${ASYM_STRICT:-true}
-REQUIRE_SM100=${REQUIRE_SM100:-1}
-USE_ASYM_CPU_ADAMW=${USE_ASYM_CPU_ADAMW:-false}
-ASYM_CPU_ADAMW_BACKEND=${ASYM_CPU_ADAMW_BACKEND:-deepspeed}
-ASYM_CPU_ADAMW_PIN_MEMORY=${ASYM_CPU_ADAMW_PIN_MEMORY:-true}
-ASYM_CPU_ADAMW_FP32_MASTER=${ASYM_CPU_ADAMW_FP32_MASTER:-true}
-ASYM_CPU_ADAMW_GRAD_OFFLOAD=${ASYM_CPU_ADAMW_GRAD_OFFLOAD:-false}
-ASYM_CPU_ADAMW_GRAD_OFFLOADS=${ASYM_CPU_ADAMW_GRAD_OFFLOADS:-${ASYM_CPU_ADAMW_GRAD_OFFLOAD}}
+MAX_SAMPLES=${MAX_SAMPLES:-64}
 
 # Output and profiling
 OUTPUT_ROOT=${OUTPUT_ROOT:-}
@@ -131,13 +148,6 @@ PLOT_MEMORY_BREAKDOWN=${PLOT_MEMORY_BREAKDOWN:-true}
 MEMORY_BREAKDOWN_PLOT_Y_SCALE=${MEMORY_BREAKDOWN_PLOT_Y_SCALE:-shared}
 PLOT_OUTPUT_DIR=${PLOT_OUTPUT_DIR:-}
 
-# Execution
-OVERWRITE=${OVERWRITE:-false}
-CONTINUE_ON_ERROR=${CONTINUE_ON_ERROR:-true}
-DRY_RUN=${DRY_RUN:-false}
-COLLECT_EXISTING=${COLLECT_EXISTING:-false}
-INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
-RUN_NAME=${RUN_NAME:-}
 
 # =============================================================================
 # Derived Parameters
@@ -188,7 +198,8 @@ Options:
   --router-modes LIST            AsymGEMM router modes: hf, whole. Default ${ROUTER_MODES}.
   --profilers LIST               source and/or nsys.
   --seq-lens LIST                LF cutoff lengths. Accepts positive integers, e.g. 4096,8192.
-  --expert-policies LIST         AsymGEMM expert policies: none, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, and -act variants.
+  --asymm-exp-act-policies LIST  Paired expert policy / expert activation offload / attention activation offload / layer activation offload configs.
+                                 Format: policy|expert_act|attn_act|layer_act, e.g. none|true|false|false,gc-layer|false|false|false,none|true|true|true.
 
   Dataset:
   --dataset NAME
@@ -209,6 +220,8 @@ Options:
   --lora-alpha VALUE
   --lora-dropout LIST           LoRA dropout probabilities in fixed 0.xx format, e.g. 0.00,0.10.
                                  KT supports nonzero dropout for validated kt_torchbf16 and kt_armbf16 SFT backends.
+  --lf-expert-lora-impls LIST   Qwen fused expert LoRA implementation(s): peft-target-parameters, split-target-parameters, off.
+                                 Use split-target-parameters for the corrected PEFT-compatible LF/ZeRO expert LoRA path.
   --seed N
   --precision NAME
 
@@ -227,16 +240,13 @@ Options:
   --profile-module-filter LIST
   --expandable-seg true|false   Set PYTORCH_CUDA_ALLOC_CONF expandable_segments for training jobs.
                                  Default ${EXPANDABLE_SEG}.
-  --asymm-expert-act-offload LIST
-                                 Qwen3 routed-expert activation offload values: true, false, or true,false.
-                                 Adds expact1/expact0 to run identities.
   --use-asym-cpu-adamw true|false
                                  Low-level forwarding control; prefer BACKEND_SPECS=asym_cpuadamwtorch|... or asym_cpuadamwds|...
   --asym-cpu-adamw-backend torch|deepspeed
   --asym-cpu-adamw-pin-memory true|false
   --asym-cpu-adamw-fp32-master true|false
-  --asym-cpu-adamw-grad-offloads LIST
-                                 Grad offload modes for Asym CPUAdamW backends, e.g. false,true.
+  --asym-cpu-adamw-grad-offload LIST
+                                 Grad offload mode(s) for Asym CPUAdamW backends; one or more, e.g. false,true.
 
   KT:
   --kt-kernel-dir DIR            Integrated kt-kernel source tree.
@@ -274,6 +284,7 @@ Options:
   --plot-memory-breakdown true|false
   --memory-breakdown-plot-y-scale shared|per-plot|global
   --plot-output-dir DIR
+  --run-post true|false          Run scripts/lf/test_profiling.sh after this sweep. Default ${RUN_POST}.
 
   Execution:
   --overwrite true|false
@@ -344,11 +355,61 @@ bool_value() {
   esac
 }
 
+normalize_expact_lora_a_fwd() {
+  case "${1}" in
+    cpu) printf 'cpu\n' ;;
+    hbm) printf 'hbm\n' ;;
+    *) die "ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD must be cpu or hbm, got '${1}'" ;;
+  esac
+}
+
+expact_lora_a_fwd_tag() {
+  case "$(normalize_expact_lora_a_fwd "$1")" in
+    cpu) printf 'loraafwdcpu\n' ;;
+    hbm) printf 'loraafwdhbm\n' ;;
+  esac
+}
+
 expact_tag() {
   case "$(bool_value "$1")" in
     true) printf 'expact1\n' ;;
     false) printf 'expact0\n' ;;
   esac
+}
+
+attnact_tag() {
+  case "$(bool_value "$1")" in
+    true) printf 'attnact1\n' ;;
+    false) printf 'attnact0\n' ;;
+  esac
+}
+
+layeract_tag() {
+  case "$(bool_value "$1")" in
+    true) printf 'layeract1\n' ;;
+    false) printf 'layeract0\n' ;;
+  esac
+}
+
+parse_exp_act_policy_tuple() {
+  local raw="$1"
+  local policy_part expact_part attnact_part layeract_part policy expact attnact layeract
+  local -a fields
+  IFS='|' read -r -a fields <<< "${raw}"
+  ((${#fields[@]} == 4)) || die "ASYMM_EXP_ACT_POLICIES item must be policy|expert_act|attn_act|layer_act, got '${raw}'"
+  policy_part="${fields[0]}"
+  expact_part="${fields[1]}"
+  attnact_part="${fields[2]}"
+  layeract_part="${fields[3]}"
+  [[ -n "${policy_part}" && -n "${expact_part}" && -n "${attnact_part}" && -n "${layeract_part}" ]] || die "empty policy or activation-offload value in ASYMM_EXP_ACT_POLICIES item '${raw}'"
+  policy="$(normalize_expert_policy "${policy_part}")"
+  expact="$(bool_value "${expact_part}")"
+  attnact="$(bool_value "${attnact_part}")"
+  layeract="$(bool_value "${layeract_part}")"
+  if [[ ( "${expact}" == "true" || "${attnact}" == "true" || "${layeract}" == "true" ) && "${policy}" != "none" ]]; then
+    die "ASYMM_EXP_ACT_POLICIES item '${raw}' is unsupported: activation offload is compared without GC/recompute"
+  fi
+  printf '%s|%s|%s|%s\n' "${policy}" "${expact}" "${attnact}" "${layeract}"
 }
 
 optional_bool_value() {
@@ -477,7 +538,7 @@ recompute_label() {
 normalize_expert_policy() {
   local raw="$1"
   case "${raw}" in
-    none|tok-le0|tok-le0-act)
+    none|gc-exp|gc-attn-exp|gc-layer|tok-le0|tok-le0-act)
       printf '%s\n' "${raw}"
       return
       ;;
@@ -486,7 +547,7 @@ normalize_expert_policy() {
     printf '%s\n' "${raw}"
     return
   fi
-  die "invalid expert policy '${1}'; expected none, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, or -act variants"
+  die "invalid expert policy '${1}'; expected none, gc-exp, gc-attn-exp, gc-layer, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, or -act variants"
 }
 
 backend_label() {
@@ -649,7 +710,11 @@ existing_profile_complete() {
   local expected_recompute="${6:-}"
   local expected_offload_modules="${7:-}"
   local expected_expact="${8:-}"
-  local expected_grad_offload="${9:-}"
+  local expected_attnact="${9:-}"
+  local expected_layeract="${10:-}"
+  local expected_lf_expert_lora_impl="${11:-}"
+  local expected_expact_lora_a_fwd="${12:-}"
+  local expected_grad_offload="${13:-}"
   local current_batch="${PER_DEVICE_TRAIN_BATCH_SIZE:-}"
   local current_lora_rank="${LORA_RANK:-}"
   local current_lora_dropout="${LORA_DROPOUT:-}"
@@ -664,7 +729,8 @@ existing_profile_complete() {
     "${expected_lora_target}" "${expected_recompute}" "${current_batch}" "${current_lora_rank}" \
     "${current_lora_dropout}" "${current_cache_depth}" "${current_top_k}" "${current_token_chunk_size}" \
     "${current_route_rank_limit}" "${current_default_route_rank_limit}" \
-    "${current_allow_unvalidated_route_rank}" "${expected_offload_modules}" "${expected_expact}" "${expected_grad_offload}" <<'PY' >/dev/null 2>&1
+    "${current_allow_unvalidated_route_rank}" "${expected_offload_modules}" "${expected_expact}" "${expected_attnact}" "${expected_layeract}" \
+    "${expected_lf_expert_lora_impl}" "${expected_expact_lora_a_fwd}" "${expected_grad_offload}" <<'PY' >/dev/null 2>&1
 import json
 import math
 import sys
@@ -686,7 +752,11 @@ expected_default_limit = sys.argv[14]
 allow_unvalidated = sys.argv[15]
 expected_offload_modules = sys.argv[16]
 expected_expact = sys.argv[17]
-expected_grad_offload = sys.argv[18] if len(sys.argv) > 18 else ""
+expected_attnact = sys.argv[18]
+expected_layeract = sys.argv[19]
+expected_lf_expert_lora_impl = sys.argv[20] if len(sys.argv) > 20 else ""
+expected_expact_lora_a_fwd = sys.argv[21] if len(sys.argv) > 21 else ""
+expected_grad_offload = sys.argv[22] if len(sys.argv) > 22 else ""
 source_profile = profile.get("source_profile", {})
 source_profile = source_profile if isinstance(source_profile, dict) and source_profile else profile
 if profile.get("partial") is True:
@@ -770,6 +840,48 @@ if expected_expact:
         raise SystemExit(
             "profile asymm_expert_act_offload mismatch: "
             f"expected {wanted_expact}, got {actual_expact}"
+        )
+if expected_attnact:
+    actual_attnact = normalize_bool(config.get("asymm_attn_act_offload"))
+    wanted_attnact = normalize_bool(expected_attnact)
+    if not actual_attnact:
+        raise SystemExit("profile asymm_attn_act_offload missing or invalid")
+    if actual_attnact != wanted_attnact:
+        raise SystemExit(
+            "profile asymm_attn_act_offload mismatch: "
+            f"expected {wanted_attnact}, got {actual_attnact}"
+        )
+if expected_layeract:
+    actual_layeract = normalize_bool(config.get("asymm_layer_act_offload"))
+    wanted_layeract = normalize_bool(expected_layeract)
+    if not actual_layeract:
+        raise SystemExit("profile asymm_layer_act_offload missing or invalid")
+    if actual_layeract != wanted_layeract:
+        raise SystemExit(
+            "profile asymm_layer_act_offload mismatch: "
+            f"expected {wanted_layeract}, got {actual_layeract}"
+        )
+if expected_lf_expert_lora_impl:
+    actual_lf_expert_lora_impl = str(config.get("qwen_moe_expert_lora_impl") or "")
+    if actual_lf_expert_lora_impl != expected_lf_expert_lora_impl:
+        raise SystemExit(
+            "profile qwen_moe_expert_lora_impl mismatch: "
+            f"expected {expected_lf_expert_lora_impl}, got {actual_lf_expert_lora_impl or '<missing>'}"
+        )
+def normalize_lora_a_fwd(value):
+    text = str(value or "")
+    if text in {"cpu", "hbm"}:
+        return text
+    return text
+if expected_expact_lora_a_fwd:
+    actual_expact_lora_a_fwd = normalize_lora_a_fwd(config.get("asymm_expert_act_offload_lora_a_fwd"))
+    wanted_expact_lora_a_fwd = normalize_lora_a_fwd(expected_expact_lora_a_fwd)
+    if not actual_expact_lora_a_fwd:
+        raise SystemExit("profile asymm_expert_act_offload_lora_a_fwd missing or invalid")
+    if actual_expact_lora_a_fwd != wanted_expact_lora_a_fwd:
+        raise SystemExit(
+            "profile asymm_expert_act_offload_lora_a_fwd mismatch: "
+            f"expected {wanted_expact_lora_a_fwd}, got {actual_expact_lora_a_fwd}"
         )
 if backend == "kt_armbf16" and expected_seq_len and expected_batch and expected_rank:
     def require_int_config(key, expected):
@@ -1024,12 +1136,24 @@ job_root_path() {
   local recompute="$4"
   local expert_policy="$5"
   local router_mode="$6"
-  local grad_offload="${7:-false}"
+  local lf_expert_lora_impl_value="${7:-${lf_expert_lora_impl:-split-target-parameters}}"
+  local grad_offload="${8:-false}"
+  local weight_offload="${9:-false}"
   local grad_offload_suffix=""
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
-    grad_offload_suffix="__gradoff${grad_offload}"
+    grad_offload_suffix="__gradoff${grad_offload}__weightoff${weight_offload}"
   fi
-  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}${grad_offload_suffix}")"
+  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__${expact_lora_a_fwd_label}__qwenexpert${lf_expert_lora_impl_value}${grad_offload_suffix}")"
+}
+
+legacy_job_root_path() {
+  local config_root="$1"
+  local backend="$2"
+  local profiler="$3"
+  local recompute="$4"
+  local expert_policy="$5"
+  local router_mode="$6"
+  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}")"
 }
 
 kt_arm_matching_source_profile_complete() {
@@ -1040,9 +1164,27 @@ kt_arm_matching_source_profile_complete() {
   local router_mode="$5"
   local seq_len="$6"
   local model_name="$7"
-  local source_profile_json
+  local source_profile_json expected_expact_for_profile expected_attnact_for_profile expected_layeract_for_profile expected_lf_expert_lora_impl_for_profile expected_expact_lora_a_fwd_for_profile
   source_profile_json="$(kt_arm_matching_source_profile_json "${config_root}" "${backend}" "${recompute}" "${expert_policy}" "${router_mode}" "${seq_len}")"
-  existing_profile_complete "${source_profile_json}" "${backend}" "${seq_len}" "${model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}"
+  expected_expact_for_profile="${ASYMM_EXPERT_ACT_OFFLOAD}"
+  expected_attnact_for_profile="${ASYMM_ATTN_ACT_OFFLOAD}"
+  expected_layeract_for_profile="${ASYMM_LAYER_ACT_OFFLOAD}"
+  expected_lf_expert_lora_impl_for_profile="${lf_expert_lora_impl:-split-target-parameters}"
+  expected_expact_lora_a_fwd_for_profile="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
+  if [[ "$(basename "$(dirname "$(dirname "${source_profile_json}")")")" != *__expact*__attnact* ]]; then
+    expected_expact_for_profile=""
+    expected_attnact_for_profile=""
+    expected_layeract_for_profile=""
+  elif [[ "$(basename "$(dirname "$(dirname "${source_profile_json}")")")" != *__layeract* ]]; then
+    expected_layeract_for_profile=""
+  fi
+  if [[ "$(basename "$(dirname "$(dirname "${source_profile_json}")")")" != *__qwenexpert* ]]; then
+    expected_lf_expert_lora_impl_for_profile=""
+  fi
+  if [[ "$(basename "$(dirname "$(dirname "${source_profile_json}")")")" != *__loraafwd* ]]; then
+    expected_expact_lora_a_fwd_for_profile=""
+  fi
+  existing_profile_complete "${source_profile_json}" "${backend}" "${seq_len}" "${model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${expected_expact_for_profile}" "${expected_attnact_for_profile}" "${expected_layeract_for_profile}" "${expected_lf_expert_lora_impl_for_profile}" "${expected_expact_lora_a_fwd_for_profile}"
 }
 
 kt_arm_matching_source_profile_json() {
@@ -1052,9 +1194,15 @@ kt_arm_matching_source_profile_json() {
   local expert_policy="$4"
   local router_mode="$5"
   local seq_len="$6"
-  local source_job_root source_seq_root
-  source_job_root="$(job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}")"
+  local source_job_root source_seq_root legacy_source_job_root legacy_source_seq_root
+  source_job_root="$(job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}" "${lf_expert_lora_impl:-split-target-parameters}")"
   source_seq_root="${source_job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
+  legacy_source_job_root="$(legacy_job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}")"
+  legacy_source_seq_root="${legacy_source_job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
+  if [[ ! -f "${source_seq_root}/profile.json" && -f "${legacy_source_seq_root}/profile.json" ]]; then
+    printf '%s/profile.json\n' "${legacy_source_seq_root}"
+    return 0
+  fi
   printf '%s/profile.json\n' "${source_seq_root}"
 }
 
@@ -1095,7 +1243,7 @@ ensure_jobs_tsv() {
   local config_root="$1"
   mkdir -p "${config_root}"
   if [[ ! -e "${config_root}/jobs.tsv" ]]; then
-    printf 'status\tgpu\tseq_len\trecompute\texpert_policy\trouter_mode\tbackend\tprofiler\tgrad_offload\tjob_dir\tprofile_json\tlog\n' > "${config_root}/jobs.tsv"
+    printf 'status\tgpu\tseq_len\trecompute\texpert_policy\trouter_mode\tbackend\tprofiler\tgrad_offload\tjob_dir\tprofile_json\tlog\tqwen_expert_lora_impl\texpert_lora_a_fwd\n' > "${config_root}/jobs.tsv"
   fi
 }
 
@@ -1104,7 +1252,7 @@ append_job_record() {
   local status="$2"
   shift 2
   ensure_jobs_tsv "${config_root}"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${status}" "$@" >> "${config_root}/jobs.tsv"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${status}" "$@" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" >> "${config_root}/jobs.tsv"
 }
 
 plot_cmd_base() {
@@ -1191,6 +1339,12 @@ append_expact_filters() {
   for expact_value in "${expact_values[@]}"; do _cmd_ref+=(--expact "$(expact_tag "${expact_value}")"); done
 }
 
+append_attnact_filters() {
+  local -n _cmd_ref="$1"
+  local attnact_value
+  for attnact_value in "${attnact_values[@]}"; do _cmd_ref+=(--attnact "$(attnact_tag "${attnact_value}")"); done
+}
+
 append_fixed_profiler_filter() {
   local -n _cmd_ref="$1"
   local profiler="$2"
@@ -1203,6 +1357,7 @@ append_sweep_plot_filters() {
   append_recompute_filters "$1"
   append_router_mode_filters "$1"
   append_expact_filters "$1"
+  append_attnact_filters "$1"
 }
 
 memory_plot_filters() {
@@ -1210,6 +1365,7 @@ memory_plot_filters() {
   append_fixed_profiler_filter "$1" source
   append_router_mode_filters "$1"
   append_expact_filters "$1"
+  append_attnact_filters "$1"
 }
 
 interconnect_plot_filters() {
@@ -1218,6 +1374,7 @@ interconnect_plot_filters() {
   append_recompute_filters "$1"
   append_router_mode_filters "$1"
   append_expact_filters "$1"
+  append_attnact_filters "$1"
 }
 
 profiler_selected_for_plots() {
@@ -1290,9 +1447,9 @@ backend_specs_spec="${BACKEND_SPECS}"
 router_mode_spec="${ROUTER_MODES}"
 profiler_spec="${PROFILERS}"
 seq_spec="${SEQ_LENS}"
-expert_policy_spec="${EXPERT_POLICIES}"
+exp_act_policy_spec="${ASYMM_EXP_ACT_POLICIES}"
 lora_dropout_spec="${LORA_DROPOUT}"
-asymm_expert_act_offload_spec="${ASYMM_EXPERT_ACT_OFFLOAD}"
+lf_expert_lora_impl_spec="${LF_EXPERT_LORA_IMPLS}"
 output_root="${OUTPUT_ROOT}"
 run_name="${RUN_NAME}"
 batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}"
@@ -1319,8 +1476,8 @@ while (($#)); do
     --profilers=*) profiler_spec="${1#*=}"; shift ;;
     --seq-lens) need_value "$1" "${2-}"; seq_spec="$2"; shift 2 ;;
     --seq-lens=*) seq_spec="${1#*=}"; shift ;;
-    --expert-policies) need_value "$1" "${2-}"; expert_policy_spec="$2"; shift 2 ;;
-    --expert-policies=*) expert_policy_spec="${1#*=}"; shift ;;
+    --asymm-exp-act-policies) need_value "$1" "${2-}"; exp_act_policy_spec="$2"; ASYMM_EXP_ACT_POLICIES="$2"; shift 2 ;;
+    --asymm-exp-act-policies=*) exp_act_policy_spec="${1#*=}"; ASYMM_EXP_ACT_POLICIES="${1#*=}"; shift ;;
     --dataset) need_value "$1" "${2-}"; DATASET="$2"; shift 2 ;;
     --dataset=*) DATASET="${1#*=}"; shift ;;
     --prepare-datasets) need_value "$1" "${2-}"; PREPARE_DATASETS="$(bool_value "$2")"; shift 2 ;;
@@ -1353,6 +1510,8 @@ while (($#)); do
     --seed=*) SEED="${1#*=}"; shift ;;
     --lora-dropout) collect_values "$1" vals "${@:2}"; lora_dropout_spec="${vals[*]}"; LORA_DROPOUT="${lora_dropout_spec}"; set -- "${REMAINING[@]}" ;;
     --lora-dropout=*) lora_dropout_spec="${1#*=}"; LORA_DROPOUT="${lora_dropout_spec}"; shift ;;
+    --lf-expert-lora-impls) need_value "$1" "${2-}"; lf_expert_lora_impl_spec="$2"; LF_EXPERT_LORA_IMPLS="$2"; shift 2 ;;
+    --lf-expert-lora-impls=*) lf_expert_lora_impl_spec="${1#*=}"; LF_EXPERT_LORA_IMPLS="${1#*=}"; shift ;;
     --precision) need_value "$1" "${2-}"; PRECISION="$2"; shift 2 ;;
     --precision=*) PRECISION="${1#*=}"; shift ;;
     --profile-level) need_value "$1" "${2-}"; PROFILE_LEVEL="$2"; shift 2 ;;
@@ -1381,8 +1540,6 @@ while (($#)); do
     --profile-module-filter=*) PROFILE_MODULE_FILTER="${1#*=}"; shift ;;
     --expandable-seg|--expandable-segments) need_value "$1" "${2-}"; EXPANDABLE_SEG="$(bool_value "$2")"; shift 2 ;;
     --expandable-seg=*|--expandable-segments=*) EXPANDABLE_SEG="$(bool_value "${1#*=}")"; shift ;;
-    --asymm-expert-act-offload) need_value "$1" "${2-}"; asymm_expert_act_offload_spec="$2"; ASYMM_EXPERT_ACT_OFFLOAD="$2"; shift 2 ;;
-    --asymm-expert-act-offload=*) asymm_expert_act_offload_spec="${1#*=}"; ASYMM_EXPERT_ACT_OFFLOAD="${1#*=}"; shift ;;
     --use-asym-cpu-adamw) need_value "$1" "${2-}"; USE_ASYM_CPU_ADAMW="$(bool_value "$2")"; shift 2 ;;
     --use-asym-cpu-adamw=*) USE_ASYM_CPU_ADAMW="$(bool_value "${1#*=}")"; shift ;;
     --asym-cpu-adamw-backend) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_BACKEND="$2"; shift 2 ;;
@@ -1391,10 +1548,10 @@ while (($#)); do
     --asym-cpu-adamw-pin-memory=*) ASYM_CPU_ADAMW_PIN_MEMORY="$(bool_value "${1#*=}")"; shift ;;
     --asym-cpu-adamw-fp32-master) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_FP32_MASTER="$(bool_value "$2")"; shift 2 ;;
     --asym-cpu-adamw-fp32-master=*) ASYM_CPU_ADAMW_FP32_MASTER="$(bool_value "${1#*=}")"; shift ;;
-    --asym-cpu-adamw-grad-offload) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_GRAD_OFFLOAD="$(bool_value "$2")"; ASYM_CPU_ADAMW_GRAD_OFFLOADS="${ASYM_CPU_ADAMW_GRAD_OFFLOAD}"; shift 2 ;;
-    --asym-cpu-adamw-grad-offload=*) ASYM_CPU_ADAMW_GRAD_OFFLOAD="$(bool_value "${1#*=}")"; ASYM_CPU_ADAMW_GRAD_OFFLOADS="${ASYM_CPU_ADAMW_GRAD_OFFLOAD}"; shift ;;
-    --asym-cpu-adamw-grad-offloads) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_GRAD_OFFLOADS="$2"; shift 2 ;;
-    --asym-cpu-adamw-grad-offloads=*) ASYM_CPU_ADAMW_GRAD_OFFLOADS="${1#*=}"; shift ;;
+    --asym-cpu-adamw-grad-offload) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_GRAD_OFFLOAD="$2"; shift 2 ;;
+    --asym-cpu-adamw-grad-offload=*) ASYM_CPU_ADAMW_GRAD_OFFLOAD="${1#*=}"; shift ;;
+    --asym-cpu-adamw-weight-offload) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="$2"; shift 2 ;;
+    --asym-cpu-adamw-weight-offload=*) ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${1#*=}"; shift ;;
     --kt-kernel-dir) need_value "$1" "${2-}"; KT_KERNEL_DIR="$2"; shift 2 ;;
     --kt-kernel-dir=*) KT_KERNEL_DIR="${1#*=}"; shift ;;
     --kt-tools-dir) need_value "$1" "${2-}"; KT_TOOLS_DIR="$2"; shift 2 ;;
@@ -1455,6 +1612,8 @@ while (($#)); do
     --memory-breakdown-plot-y-scale=*) MEMORY_BREAKDOWN_PLOT_Y_SCALE="${1#*=}"; shift ;;
     --plot-output-dir) need_value "$1" "${2-}"; PLOT_OUTPUT_DIR="$2"; shift 2 ;;
     --plot-output-dir=*) PLOT_OUTPUT_DIR="${1#*=}"; shift ;;
+    --run-post) need_value "$1" "${2-}"; RUN_POST="$(bool_value "$2")"; shift 2 ;;
+    --run-post=*) RUN_POST="$(bool_value "${1#*=}")"; shift ;;
     --overwrite) need_value "$1" "${2-}"; OVERWRITE="$(bool_value "$2")"; shift 2 ;;
     --overwrite=*) OVERWRITE="$(bool_value "${1#*=}")"; shift ;;
     --continue-on-error) need_value "$1" "${2-}"; CONTINUE_ON_ERROR="$(bool_value "$2")"; shift 2 ;;
@@ -1473,9 +1632,9 @@ require_comma_list "--backend-specs/BACKEND_SPECS" "${backend_specs_spec}"
 require_comma_list "--router-modes/ROUTER_MODES" "${router_mode_spec}"
 require_comma_list "--profilers/PROFILERS" "${profiler_spec}"
 require_comma_list "--seq-lens/SEQ_LENS" "${seq_spec}"
-require_comma_list "--expert-policies/EXPERT_POLICIES" "${expert_policy_spec}"
+require_comma_list "--asymm-exp-act-policies/ASYMM_EXP_ACT_POLICIES" "${exp_act_policy_spec}"
 require_comma_list "--lora-dropout/LORA_DROPOUT" "${lora_dropout_spec}"
-require_comma_list "--asymm-expert-act-offload/ASYMM_EXPERT_ACT_OFFLOAD" "${asymm_expert_act_offload_spec}"
+require_comma_list "--lf-expert-lora-impls/LF_EXPERT_LORA_IMPLS" "${lf_expert_lora_impl_spec}"
 
 nonnegative_int "--max-steps" "${MAX_STEPS}"
 nonnegative_int "--warmup-steps" "${WARMUP_STEPS}"
@@ -1493,12 +1652,27 @@ mapfile -t lora_dropouts < <(tokens "${lora_dropout_spec}" | dedupe)
 for value in "${lora_dropouts[@]}"; do
   lora_dropout_label "${value}" >/dev/null
 done
+lf_expert_lora_impls=()
+while IFS= read -r value; do
+  case "${value,,}" in
+    peft-target-parameters|split-target-parameters|off) lf_expert_lora_impls+=("${value,,}") ;;
+    *) die "LF expert LoRA implementation must be peft-target-parameters, split-target-parameters, or off; got '${value}'" ;;
+  esac
+done < <(tokens "${lf_expert_lora_impl_spec}")
+if ((${#lf_expert_lora_impls[@]})); then
+  mapfile -t lf_expert_lora_impls < <(printf '%s\n' "${lf_expert_lora_impls[@]}" | dedupe)
+fi
+((${#lf_expert_lora_impls[@]})) || die "LF expert LoRA implementation list is empty"
+for value in "${lf_expert_lora_impls[@]}"; do
+  if [[ "${value}" == "peft-target-parameters" || "${value}" == "split-target-parameters" ]]; then
+    for dropout in "${lora_dropouts[@]}"; do
+      [[ "${dropout}" == "0.00" ]] || die "LF_EXPERT_LORA_IMPLS=${value} requires LORA_DROPOUT=0.00, got '${dropout}'"
+    done
+  fi
+done
+LF_EXPERT_LORA_IMPLS="$(IFS=,; printf '%s' "${lf_expert_lora_impls[*]}")"
 LORA_DROPOUT="${lora_dropouts[0]}"
 lora_dropout_label_value="$(lora_dropout_label "${LORA_DROPOUT}")"
-mapfile -t expact_values < <(tokens "${asymm_expert_act_offload_spec}" | while read -r value; do bool_value "${value}"; done | dedupe)
-((${#expact_values[@]})) || die "ASYMM_EXPERT_ACT_OFFLOAD list is empty"
-ASYMM_EXPERT_ACT_OFFLOAD="${expact_values[0]}"
-expact_label="$(expact_tag "${ASYMM_EXPERT_ACT_OFFLOAD}")"
 TOTAL_STEPS=$((MAX_STEPS + WARMUP_STEPS))
 PREPARE_DATASETS=$(bool_value "${PREPARE_DATASETS}")
 DATASET_OVERWRITE=$(bool_value "${DATASET_OVERWRITE}")
@@ -1510,12 +1684,11 @@ DRY_RUN=$(bool_value "${DRY_RUN}")
 COLLECT_EXISTING=$(bool_value "${COLLECT_EXISTING}")
 CHECK_SUPEROFFLOAD=$(bool_value "${CHECK_SUPEROFFLOAD}")
 CHECK_CPUADAM=$(bool_value "${CHECK_CPUADAM}")
-RUN_POSTSERVE=$(bool_value "${RUN_POSTSERVE}")
+RUN_POST=$(bool_value "${RUN_POST}")
 EXPANDABLE_SEG=$(bool_value "${EXPANDABLE_SEG}")
 USE_ASYM_CPU_ADAMW=$(bool_value "${USE_ASYM_CPU_ADAMW}")
 ASYM_CPU_ADAMW_PIN_MEMORY=$(bool_value "${ASYM_CPU_ADAMW_PIN_MEMORY}")
 ASYM_CPU_ADAMW_FP32_MASTER=$(bool_value "${ASYM_CPU_ADAMW_FP32_MASTER}")
-ASYM_CPU_ADAMW_GRAD_OFFLOAD=$(bool_value "${ASYM_CPU_ADAMW_GRAD_OFFLOAD}")
 case "${ASYM_CPU_ADAMW_BACKEND,,}" in
   torch) ASYM_CPU_ADAMW_BACKEND=torch ;;
   deepspeed|ds) ASYM_CPU_ADAMW_BACKEND=deepspeed ;;
@@ -1594,13 +1767,17 @@ if [[ "${selected_has_kt}" == "true" ]]; then
   fi
 fi
 if [[ -z "${output_root}" ]]; then
-  output_root="${ASYM_DIR}/test_profiling"
+  output_root="${ASYM_DIR}/profiling"
 fi
 mapfile -t profilers < <(tokens "${profiler_spec}" | while read -r value; do profiler_label "${value}"; done | dedupe)
 mapfile -t asym_cpu_adamw_grad_offload_modes < <(
-  tokens "${ASYM_CPU_ADAMW_GRAD_OFFLOADS}" | while read -r value; do bool_value "${value}"; done | dedupe
+  tokens "${ASYM_CPU_ADAMW_GRAD_OFFLOAD}" | while read -r value; do bool_value "${value}"; done | dedupe
 )
-((${#asym_cpu_adamw_grad_offload_modes[@]})) || die "ASYM_CPU_ADAMW_GRAD_OFFLOADS must include at least one boolean value"
+((${#asym_cpu_adamw_grad_offload_modes[@]})) || die "ASYM_CPU_ADAMW_GRAD_OFFLOAD must include at least one boolean value"
+mapfile -t asym_cpu_adamw_weight_offload_modes < <(
+  tokens "${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD}" | while read -r value; do bool_value "${value}"; done | dedupe
+)
+((${#asym_cpu_adamw_weight_offload_modes[@]})) || die "ASYM_CPU_ADAMW_WEIGHT_OFFLOAD must include at least one boolean value"
 if printf '%s\n' "${profilers[@]}" | grep -qx 'nsys'; then
   plot_profilers=(nsys)
 else
@@ -1612,13 +1789,27 @@ else
   done
 fi
 mapfile -t seq_lens < <(tokens "${seq_spec}" | dedupe)
-mapfile -t raw_expert_policies < <(tokens "${expert_policy_spec}" | dedupe)
-((${#raw_expert_policies[@]} > 0)) || die "expert policies must include at least one explicit policy"
-expert_policies=()
-for value in "${raw_expert_policies[@]}"; do
-  expert_policies+=("$(normalize_expert_policy "${value}")")
+exp_act_policy_pairs=()
+mapfile -t raw_exp_act_policy_pairs < <(tokens "${exp_act_policy_spec}" | dedupe)
+((${#raw_exp_act_policy_pairs[@]} > 0)) || die "ASYMM_EXP_ACT_POLICIES must include at least one policy|expert_act|attn_act|layer_act tuple"
+for value in "${raw_exp_act_policy_pairs[@]}"; do
+  exp_act_policy_pairs+=("$(parse_exp_act_policy_tuple "${value}")")
 done
-mapfile -t expert_policies < <(printf '%s\n' "${expert_policies[@]}" | dedupe)
+mapfile -t exp_act_policy_pairs < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | dedupe)
+((${#exp_act_policy_pairs[@]})) || die "expert/attention activation policy tuple list is empty"
+mapfile -t expert_policies < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f1 | dedupe)
+mapfile -t expact_values < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f2 | dedupe)
+mapfile -t attnact_values < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f3 | dedupe)
+mapfile -t layeract_values < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f4 | dedupe)
+ASYMM_EXP_ACT_POLICIES="$(IFS=,; printf '%s' "${exp_act_policy_pairs[*]}")"
+ASYMM_EXPERT_ACT_OFFLOAD="${expact_values[0]}"
+expact_label="$(expact_tag "${ASYMM_EXPERT_ACT_OFFLOAD}")"
+ASYMM_ATTN_ACT_OFFLOAD="${attnact_values[0]}"
+attnact_label="$(attnact_tag "${ASYMM_ATTN_ACT_OFFLOAD}")"
+ASYMM_LAYER_ACT_OFFLOAD="${layeract_values[0]}"
+layeract_label="$(layeract_tag "${ASYMM_LAYER_ACT_OFFLOAD}")"
+ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="$(normalize_expact_lora_a_fwd "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}")"
+expact_lora_a_fwd_label="$(expact_lora_a_fwd_tag "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}")"
 
 ((${#gpus[@]})) || die "GPU pool is empty"
 ((${#model_specs[@]})) || die "model spec list is empty"
@@ -1827,26 +2018,33 @@ run_job() {
   local expert_policy="$7"
   local router_mode="$8"
   local dataset_name="$9"
-  local grad_offload="${10:-false}"
+  local lf_expert_lora_impl="${10}"
+  local grad_offload="${11:-false}"
+  local weight_offload="${12:-false}"
   local gradient_checkpointing=false
+  local attention_gc_enabled=false
+  local layer_gc_enabled=false
   [[ "${recompute}" == "recomp" ]] && gradient_checkpointing=true
+  [[ "${expert_policy}" == "gc-attn-exp" ]] && attention_gc_enabled=true
+  [[ "${expert_policy}" == "gc-layer" ]] && layer_gc_enabled=true
   if ! cpuadam_backend_for_label "${backend}" >/dev/null; then
     grad_offload=false
+    weight_offload=false
   fi
 
   local config_root job_root seq_root source_profile lf_out log_file run_id profile_json
   local kt_arm_source_ok_profile_json=""
   config_root="$(config_root_path "${seq_len}")"
-  job_root="$(job_root_path "${config_root}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${grad_offload}")"
+  job_root="$(job_root_path "${config_root}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${lf_expert_lora_impl}" "${grad_offload}" "${weight_offload}")"
   seq_root="${job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
   source_profile="${seq_root}/source_profile.json"
   lf_out="${seq_root}/lf_run"
   log_file="${seq_root}/train.log"
   local grad_offload_run_label=""
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
-    grad_offload_run_label="_gradoff${grad_offload}"
+    grad_offload_run_label="_gradoff${grad_offload}_weightoff${weight_offload}"
   fi
-  run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_${lora_dropout_label_value}"
+  run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${expact_lora_a_fwd_label}_qwenexpert$(safe_label "${lf_expert_lora_impl}")${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
   local profile_memory_attribution profile_memory_breakdown deepspeed_dir_for_profile
   local profile_backend_label job_use_asym_cpu_adamw job_asym_cpu_adamw_backend cpuadam_backend
@@ -1894,10 +2092,10 @@ run_job() {
     fi
   fi
   if [[ "${DRY_RUN}" != "true" && -e "${profile_json}" && "${OVERWRITE}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
-    if existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${grad_offload}" && { [[ "${profile_memory_breakdown}" != "true" ]] || existing_memory_breakdown_valid "${seq_root}"; }; then
+    if existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}" && { [[ "${profile_memory_breakdown}" != "true" ]] || existing_memory_breakdown_valid "${seq_root}"; }; then
       echo "Skipping existing: ${profile_json}"
       append_job_record "${config_root}" skipped \
-        "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}"
+        "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}" "${lf_expert_lora_impl}"
       return 0
     fi
     echo "Existing profile is incomplete, partial, or has missing/stale schema-v2 source-memory breakdown; rerunning: ${profile_json}" >&2
@@ -1905,7 +2103,7 @@ run_job() {
 
   if [[ "${DRY_RUN}" != "true" && "${COLLECT_EXISTING}" == "true" ]]; then
     if [[ -e "${profile_json}" ]]; then
-      if ! existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${grad_offload}"; then
+      if ! existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}"; then
         echo "Existing profile is incomplete or partial: ${profile_json}" >&2
         return 1
       fi
@@ -1940,6 +2138,7 @@ run_job() {
     ASYM_CPU_ADAMW_PIN_MEMORY="${ASYM_CPU_ADAMW_PIN_MEMORY}"
     ASYM_CPU_ADAMW_FP32_MASTER="${ASYM_CPU_ADAMW_FP32_MASTER}"
     ASYM_CPU_ADAMW_GRAD_OFFLOAD="${grad_offload}"
+    ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${weight_offload}"
     GPU_ID="${gpu}"
     NUM_GPUS="${gpu_count}"
     REQUIRE_SM100="${REQUIRE_SM100}"
@@ -1954,11 +2153,15 @@ run_job() {
     LORA_RANK="${LORA_RANK}"
     LORA_ALPHA="${LORA_ALPHA}"
     LORA_DROPOUT="${LORA_DROPOUT}"
+    LF_QWEN_MOE_EXPERT_LORA_IMPL="${lf_expert_lora_impl}"
     SEED="${SEED}"
     GRADIENT_CHECKPOINTING="${gradient_checkpointing}"
     ASYM_PRECISION="${PRECISION}"
     ASYM_OFFLOAD_MODULES="${ASYM_OFFLOAD_MODULES}"
     ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}"
+    ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
+    ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
+    ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
     ASYM_EXPERT_RECOMPUTE_POLICY="${expert_policy}"
     ASYM_ROUTER_MODE="${router_mode}"
     ASYM_STRICT="${ASYM_STRICT}"
@@ -1992,7 +2195,14 @@ run_job() {
     PROFILE_TOTAL_STEPS="${TOTAL_STEPS}"
     MASTER_PORT="${master_port}"
     ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD="${grad_offload}"
+    ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${weight_offload}"
     ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
+    ASYM_GEMM_LF_CONFIG_QWEN_EXPERT_LORA_IMPL="${lf_expert_lora_impl}"
+    ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED="${attention_gc_enabled}"
+    ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED="${layer_gc_enabled}"
     ASYM_GEMM_LF_CONFIG_WARMUP_STEPS="${WARMUP_STEPS}"
     ASYM_GEMM_LF_CONFIG_MEASURE_STEPS="${MAX_STEPS}"
     ASYM_GEMM_LF_CONFIG_TOTAL_STEPS="${TOTAL_STEPS}"
@@ -2041,7 +2251,7 @@ run_job() {
 
   local -a run_cmd=(env "${run_env[@]}" "${RUN_LF_SCRIPT}")
 
-  echo "Running backend=${backend} profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} router_mode=${router_mode} grad_offload=${grad_offload} ${expact_label} seq=${seq_len} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
+  echo "Running backend=${backend} profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} router_mode=${router_mode} grad_offload=${grad_offload} qwen_expert_lora_impl=${lf_expert_lora_impl} lora_a_fwd=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD} ${expact_label} ${attnact_label} ${layeract_label} ${expact_lora_a_fwd_label} seq=${seq_len} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
   echo "  dir=${seq_root}"
   if [[ "${DRY_RUN}" == "true" ]]; then
     print_command "${run_cmd[@]}"
@@ -2051,7 +2261,7 @@ run_job() {
       print_command "${run_cmd[@]}"
     } > "${seq_root}/command.txt"
     append_job_record "${config_root}" dry-run \
-      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}"
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}" "${lf_expert_lora_impl}"
     return 0
   fi
 
@@ -2075,7 +2285,7 @@ run_job() {
     if [[ ! -f "${profile_json}" ]]; then
       echo "Missing expected profile artifact: ${profile_json}" >&2
       status=1
-    elif ! existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${grad_offload}"; then
+    elif ! existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}"; then
       echo "Expected completed profile artifact but found incomplete/partial profile: ${profile_json}" >&2
       status=1
     fi
@@ -2083,7 +2293,7 @@ run_job() {
 
   if ((status == 0)); then
     append_job_record "${config_root}" ok \
-      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}"
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}" "${lf_expert_lora_impl}"
     if profiler_selected_for_plots "${profiler}"; then
       plot_single_run "${config_root}" "${seq_len}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${seq_root}"
       plot_running_combined "${config_root}" "${seq_len}" "${seq_root}"
@@ -2094,7 +2304,7 @@ run_job() {
     fi
   else
     append_job_record "${config_root}" "failed:${status}" \
-      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}"
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}" "${lf_expert_lora_impl}"
   fi
   return "${status}"
 }
@@ -2159,6 +2369,7 @@ plot_single_run() {
     --recompute "${recompute}"
     --router-mode "${router_mode}"
     --expact "${expact_label}"
+    --attnact "${attnact_label}"
   )
   echo "Writing LF per-run plots: ${plot_root}"
   if ! run_tracked_command "${plot_cmd[@]}"; then
@@ -2488,14 +2699,27 @@ for model_spec_entry in "${model_specs[@]}"; do
       LORA_DROPOUT="${lora_dropout}"
       lora_dropout_label_value="$(lora_dropout_label "${LORA_DROPOUT}")"
       config_root="$(config_root_path "${seq_len}")"
-      for expact_value in "${expact_values[@]}"; do
-        ASYMM_EXPERT_ACT_OFFLOAD="${expact_value}"
-        expact_label="$(expact_tag "${ASYMM_EXPERT_ACT_OFFLOAD}")"
-        for router_mode in "${router_modes[@]}"; do
-          for expert_policy in "${expert_policies[@]}"; do
+      for lf_expert_lora_impl in "${lf_expert_lora_impls[@]}"; do
+        for exp_act_policy_pair in "${exp_act_policy_pairs[@]}"; do
+          expert_policy="${exp_act_policy_pair%%|*}"
+          policy_tail="${exp_act_policy_pair#*|}"
+          ASYMM_EXPERT_ACT_OFFLOAD="${policy_tail%%|*}"
+          policy_tail="${policy_tail#*|}"
+          ASYMM_ATTN_ACT_OFFLOAD="${policy_tail%%|*}"
+          ASYMM_LAYER_ACT_OFFLOAD="${policy_tail#*|}"
+          expact_label="$(expact_tag "${ASYMM_EXPERT_ACT_OFFLOAD}")"
+          attnact_label="$(attnact_tag "${ASYMM_ATTN_ACT_OFFLOAD}")"
+          layeract_label="$(layeract_tag "${ASYMM_LAYER_ACT_OFFLOAD}")"
+          for router_mode in "${router_modes[@]}"; do
             for backend_recompute in "${backend_specs[@]}"; do
               backend="${backend_recompute%%|*}"
               recompute="${backend_recompute##*|}"
+              if [[ "${recompute}" == "recomp" && ( "${expert_policy}" == "gc-exp" || "${expert_policy}" == "gc-attn-exp" || "${expert_policy}" == "gc-layer" ) && "$(bool_value "${ASYMM_ALLOW_SELECTIVE_GC_WITH_GLOBAL_RECOMP:-false}")" != "true" ]]; then
+                die "expert_policy=${expert_policy} is selective GC and must use backend recompute=norecomp; global recomp would checkpoint more than the selected modules"
+              fi
+              if [[ "${recompute}" == "recomp" && ( "${ASYMM_EXPERT_ACT_OFFLOAD}" == "true" || "${ASYMM_ATTN_ACT_OFFLOAD}" == "true" || "${ASYMM_LAYER_ACT_OFFLOAD}" == "true" ) ]]; then
+                die "activation offload tuples must use backend recompute=norecomp; global recomp would mix offload and checkpointing"
+              fi
               for profiler in "${profilers[@]}"; do
                 if [[ "${backend}" == "kt_armbf16" && "${profiler}" == "nsys" && "${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}" != "1" ]]; then
                   echo "Skipping backend=kt_armbf16 profiler=nsys; run profiler=source first and set KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK=1 only after one source step completes."
@@ -2516,7 +2740,7 @@ for model_spec_entry in "${model_specs[@]}"; do
                 fi
                 if [[ "${backend}" == "kt_armbf16" && "${profiler}" == "nsys" ]]; then
                   if ! kt_arm_matching_source_profile_complete "${config_root}" "${backend}" "${recompute}" "${expert_policy}" "${job_router_mode}" "${seq_len}" "${current_model_name}"; then
-                    echo "Skipping backend=kt_armbf16 profiler=nsys; matching source profile is missing, incomplete, or stale for seq=${seq_len} recompute=${recompute} expert_policy=${expert_policy} router_mode=${job_router_mode} ${expact_label}."
+                    echo "Skipping backend=kt_armbf16 profiler=nsys; matching source profile is missing, incomplete, or stale for seq=${seq_len} recompute=${recompute} expert_policy=${expert_policy} router_mode=${job_router_mode} qwen_expert_lora_impl=${lf_expert_lora_impl} ${expact_label} ${attnact_label} ${layeract_label}."
                     continue
                   fi
                 fi
@@ -2524,16 +2748,23 @@ for model_spec_entry in "${model_specs[@]}"; do
                 gpu="$(gpu_slice "${gpu_count}")"
                 if cpuadam_backend_for_label "${backend}" >/dev/null; then
                   grad_offload_modes_for_job=("${asym_cpu_adamw_grad_offload_modes[@]}")
+                  weight_offload_modes_for_job=("${asym_cpu_adamw_weight_offload_modes[@]}")
                 else
                   grad_offload_modes_for_job=(false)
+                  weight_offload_modes_for_job=(false)
                 fi
                 for grad_offload in "${grad_offload_modes_for_job[@]}"; do
-                  if ! run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}" "${grad_offload}"; then
-                    failures=$((failures + 1))
-                    if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
-                      exit 1
+                  for weight_offload in "${weight_offload_modes_for_job[@]}"; do
+                    if [[ "${weight_offload}" == "true" && "${grad_offload}" != "true" ]]; then
+                      continue  # weight offload requires grad offload (LF parser enforces this)
                     fi
-                  fi
+                    if ! run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}" "${lf_expert_lora_impl}" "${grad_offload}" "${weight_offload}"; then
+                      failures=$((failures + 1))
+                      if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
+                        exit 1
+                      fi
+                    fi
+                  done
                 done
               done
             done
@@ -2595,6 +2826,6 @@ fi
 echo "LF profiling completed. Results: ${precision_root}"
 
 
-if [[ "${RUN_POSTSERVE}" == "true" ]]; then
-  bash scripts/testing/serve.sh
+if [[ "${RUN_POST}" == "true" ]]; then
+  bash scripts/lf/test_profiling.sh
 fi

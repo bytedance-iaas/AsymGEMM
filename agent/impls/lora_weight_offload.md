@@ -7,13 +7,46 @@ This plan composes with, and assumes, the already-implemented LoRA grad offload 
 ### Primary goal, the toggle, and how success is measured
 
 - **PRIMARY GOAL (hard target): with LoRA weight offload enabled (on top of grad offload), peak allocated HBM for the real Qwen3-30B-A3B `b4_s4096` acceptance workload must be `< 30 GiB`**, down from the `34.593 GiB` baseline where only grad offload is on. This single number decides success. Expected landing ≈ `28.5 GiB`, which leaves margin under the `30 GiB` line.
-- **A toggle is mandatory, and the profiler axis is a list.** All offload behavior sits behind a default-off per-run flag `asym_cpu_adamw_weight_offload`. The `profile_lora_lf.sh` sweep axis `ASYM_CPU_ADAMW_WEIGHT_OFFLOADS` accepts a comma-separated list of bools — set **`ASYM_CPU_ADAMW_WEIGHT_OFFLOADS=false,true`** to run both modes **sequentially in one command, under one output root**, each in its own `__weightoff{false,true}` job dir. That single invocation is the apples-to-apples A/B that measures the design's efficacy (and lets us turn it off if it ever regresses). This mirrors the already-shipped `ASYM_CPU_ADAMW_GRAD_OFFLOADS` axis.
+- **A toggle is mandatory, and the profiler axis is a list.** All offload behavior sits behind a default-off per-run flag `asym_cpu_adamw_weight_offload`. The `profile_lora_lf.sh` sweep axis `ASYM_CPU_ADAMW_WEIGHT_OFFLOAD` accepts a comma-separated list of bools — set **`ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false,true`** to run both modes **sequentially in one command, under one output root**, each in its own `__weightoff{false,true}` job dir. That single invocation is the apples-to-apples A/B that measures the design's efficacy (and lets us turn it off if it ever regresses). This mirrors the already-shipped `ASYM_CPU_ADAMW_GRAD_OFFLOADS` axis.
 - **Validation policy — `scripts/lf/profile_lora_lf.sh` is the only decision authority.** The metric that accepts or rejects the design (peak allocated HBM and step latency) must come from the real end-to-end `profile_lora_lf.sh` run on Qwen3-30B-A3B. Unit tests and tiny-model checks are *necessary but never sufficient*: they only gate correctness (numerics, residency, stream safety). No stage is "done", and the `< 30 GiB` goal is never considered met, on toy/unit evidence alone — the deciding number always comes from `profile_lora_lf.sh`.
+
+### Profiling caveats and knobs (attribution is imperfect — improve it when needed)
+
+**The current memory attribution / breakdown is NOT perfect; it sometimes fails to attribute HBM correctly.** Treat the per-component split as a guide, not ground truth. Known failure modes (observed in the grad-offload debug):
+
+- `temporary_workspace` is a *residual plug* (`peak − known_live`), so it silently absorbs anything the profiler did not model — including bookkeeping shifts that aren't real new allocations.
+- the CUDA snapshot records `stacks="python"` only, so C++/backward allocations (e.g. cross-entropy backward) land in `allocator_unframed` — real bytes, but unlabeled (not an attribution *gap*, a labeling gap).
+- `external_cuda_or_driver_bytes` is `0` unless external profiling is enabled, so the nvidia-smi / CUDA-context / non-torch slice is invisible by default.
+- `peak` is a max-over-step scalar paired with per-tensor "best-observed-live" censuses captured at *different* instants, so rows can list tensors that were not co-resident at the true peak.
+
+When the breakdown cannot explain a peak (e.g. the on-arm peak is still `>= 30 GiB` but staged high-water is small), **do not trust the CSV split — escalate, and modify the profiling to gain insight.** This is an allowed, expected part of the loop: e.g. capture the snapshot with `stacks="all"`, add sub-step `reset_peak_memory_stats()` around forward / loss / backward to pin *when* the max occurs, enable external memory, or add finer breakdown modules. The agent decides when this is needed.
+
+Profiling knobs in `profile_lora_lf.sh` (`:85-96`; CLI forms at `:225-236`) — pick by purpose:
+
+- `--profile-memory-breakdown auto|true|false` — per-module HBM breakdown CSV/MD (default decision artifact).
+- `--profile-memory-snapshot auto|true|false` (+ `--profile-memory-snapshot-path`) — torch CUDA snapshot of the true peak live-set; replay with `scripts/testing/analyze_cuda_memory_snapshot.py` (Stage 6). Best for "what is *actually* live at peak."
+- `--profile-external-memory auto|true|false` — NVML device-used vs torch reserved (the nvidia-smi gap: CUDA context + non-torch allocs). Use when peak HBM and nvidia-smi disagree.
+- `--profile-memory-breakdown-modules LIST` — which module buckets to attribute (`attention,router,mlp,experts,shared_experts,lora,embedding,norms,loss`); narrow/widen to localize a peak.
+- `--profile-memory-breakdown-steps LIST` / `--profile-memory-breakdown-interval N` — which / how often steps are attributed.
+- `--profile-memory-attribution auto|true|false` — the source-level attribution pass.
+- `--profile-level stage|module|op|deep`, `--profile-layers`, `--profile-module-filter LIST`, `--profile-sync true|false` — timing granularity (latency, not memory; `--profile-sync` costs latency but sharpens region timing).
+
+If none of these resolve the ambiguity, modifying the profiler/attribution code itself (e.g. `asym_gemm/profiling/lf_trace.py`, `scripts/testing/analyze_cuda_memory_snapshot.py`) to add the missing signal is in scope.
 
 Implementation status:
 
-- Planned, not yet implemented. This document is the design + staging plan. Each stage below has its own acceptance gate; the binding acceptance is the Stage 5 e2e A/B (meaningful peak-HBM reduction AND no latency blow-up).
-- The optimizer already anticipates this work and currently blocks it: `AsymCPUAdamW.__init__` and `_check_post_prepare_devices` raise if a trainable LoRA compute param is not CUDA-resident, with the message "CPU-resident trainable LoRA is Stage 7 and is not supported by CPUAdamW v1." See `asym_gemm/training/cpu_adam.py:133-141` and `:277-285`. **Stage 2 of this plan relaxes these guards** behind the new toggle. (That quoted "Stage 7" is the original code authors' placeholder label in the error string; it is unrelated to this plan's stage numbering.)
+- IMPLEMENTED and ACCEPTED (2026-06-15). Stages 1-5 are done and the binding e2e acceptance A/B passed; Stage 6 (snapshot verification) run as confirmation.
+- Files: new `asym_gemm/training/weight_offload.py` (`LoRAWeightOffloadCoordinator` + `install_lora_weight_offload`); `asym_gemm/training/qwen3_moe.py` (`AsymQwen3Experts.gather/release_lora_weights`; the expert Function conditionally drops `save_for_backward` of the six banks and re-gathers from `ctx.layer` in backward); `asym_gemm/training/cpu_adam.py` (`weight_offload`/`coordinator` args, `attach_weight_offload_coordinator`, weight release folded into the post-accumulate grad hook, copy-back redirected to the CPU home, summary counters); LF `finetuning_args.asym_cpu_adamw_weight_offload`, parser deps, `trainer_utils._create_asym_cpu_adamw_optimizer` install (construct → install/release → attach); shell plumbing in `run_lf_lora_sft.sh` and `profile_lora_lf.sh` (`ASYM_CPU_ADAMW_WEIGHT_OFFLOAD` list axis + `__weightoff{false,true}` job dirs + grad-offload-required guard in the sweep).
+- Design as realized: ONE contiguous pinned bf16 home slab per decoder layer and ONE H2D per layer (no per-expert loops, no extra GEMMs; the grouped `grouped_mm` compute path is byte-for-byte unchanged); a size-keyed GPU slab pool reused across all 48 layers, so steady-state staging HBM is one layer (~132 MiB); per-bank release is refcounted per layer and owned solely by the grad post-accumulate hook (fires after autograd `AccumulateGrad`).
+- Note correction vs the original plan: the CUDA-residency guards in `cpu_adam.py:133-141` / `:277-285` needed **no relaxation** — a released bank's `.data` is a 0-size *CUDA* tensor, so `param.device.type == "cuda"` stays true. (The code's error string says "CPU-resident trainable LoRA is Stage 7"; that quoted label is the original authors' placeholder, unrelated to this plan's stage numbers.)
+- Acceptance A/B — `profiling/lora_weight_offload_accept` (Qwen3-30B-A3B, single GPU, b4_s4096, w5+s10, `asym_cpuadamwds|norecomp`, `none|true|true|true`, `loraafwdcpu`, `grad_offload=true`):
+  - `weight_offload=false`: peak allocated HBM **34.593 GiB** (reproduces the known baseline; reserved 39.676).
+  - `weight_offload=true`: peak allocated HBM **28.535 GiB** → PRIMARY GOAL `< 30 GiB` **MET**; reduction **6.058 GiB** (reserved 33.562).
+  - latency **59.45 s vs 58.32 s = 1.019×** (well within `<= 1.5×`).
+  - `weight_offload_enabled=true`, 48 groups / 288 banks, staged high-water **0.129 GiB**, bf16 home **6.188 GiB** on CPU.
+  - loss tracks the baseline arm step-for-step (bf16 cast-path noise only) → grads correct.
+- Smoke A/B — `profiling/lora_weight_offload_smoke` (b1_s512): peak **18.924 → 12.675 GiB** (`−6.249`), confirming the expert-LoRA weight footprint is batch/seq-independent.
+- Stage 6 snapshot verification — `profiling/lora_weight_offload_peakdebug` (`weight_offload=true`, `PROFILE_MEMORY_SNAPSHOT=true`): peak live **28.534 GiB** (matches the breakdown peak to ~1 MiB). The peak live-set is cross-entropy-floor dominated — `allocator_unframed` 18.547 + `loss` 9.273 = **27.82 GiB** of fp32 vocab buffers — while the resident expert-LoRA weights are **gone**: `other_python` 6.221 → **0.033 GiB** and `routed_experts` only **0.176 GiB**. Confirms the reduction is real and attributable, not allocator caching.
 
 ## Why grad offload missed the peak and weight offload can hit it
 
@@ -27,7 +60,7 @@ Implementation status:
 - Expert-LoRA weights are six trainable 3-D `nn.Parameter` banks on `AsymQwen3Experts`: `gate_lora_A/B`, `up_lora_A/B`, `down_lora_A/B`, created on the model device in `lora_dtype` (bf16). Shapes are `[num_experts, rank, in]` (A) and `[num_experts, out, rank]` (B). See `asym_gemm/training/qwen3_moe.py:1867` (class) and `:1968-1977` (param creation). For Qwen3-30B-A3B: 48 layers × 128 experts × rank 64 ⇒ `3,321,888,768` params ⇒ `6.187 GiB` bf16 ⇒ ≈ `132 MiB` per decoder layer.
 - The expert forward used by the acceptance config (`ASYMM_EXPERT_ACT_OFFLOAD=1`) is the custom autograd Function `_ActivationOffloadQwen3ExpertFunction`. The six LoRA weights are passed as positional **differentiable** inputs to `.apply(...)` (`asym_gemm/training/qwen3_moe.py:2346-2354`), are `save_for_backward`-ed (`:1082-1091`), are read back from `ctx.saved_tensors` in backward (`:1099-1108`), and their grads are returned positionally (`:1320-1331`). Autograd then accumulates those grads into `self.<bank>.grad`, which is what the grad-offload post-accumulate hook consumes.
 - Consequence: naively setting `param.data = empty(0)` after forward would either keep the storage alive (because `save_for_backward` holds the GPU tensor) or silently corrupt backward (because `.data` reassignment bypasses autograd version checks). Weight offload therefore requires (a) releasing the `nn.Parameter.data` storage to actually reclaim HBM, and (b) modifying the Function so backward reads the *re-staged* weights from `ctx.layer` rather than from `ctx.saved_tensors`. This is exactly ZeRO-3's "do not keep the gathered param across the fwd→bwd gap; re-gather before backward."
-- AsymGEMM already streams a CPU-resident **weight** into a GEMM for frozen base weights: `m_grouped_bf16_asym_gemm_nt_contiguous` consumes a pinned-CPU `b_cpu` weight (`asym_gemm/training/frozen_linear.py`, `_asym_bf16_nt`), and separately streams CPU **activations** via `sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous` (`asym_gemm/training/cpu_left.py:16,141`). So a "stream the LoRA weight from CPU, never materialize it in HBM" variant is *plausible* (Stage 7a) but is **NOT proven applicable to trainable LoRA** and is not assumed by this plan: the frozen path computes grad_x only, whereas trainable LoRA-B also needs grad_weight, and the kernel's NT-contiguous / grouped / transpose conventions may force a change to the LoRA compute math. Stage 2 therefore uses the simpler, certain ZeRO-3 stage-to-HBM approach to hit the `< 30 GiB` goal; CPU-weight streaming is deferred to Stage 7a behind its own math-design + isolated-kernel validation gate.
+- AsymGEMM already streams a CPU-resident **weight** into a GEMM for frozen base weights: `m_grouped_bf16_asym_gemm_nt_contiguous` consumes a pinned-CPU `b_cpu` weight (`asym_gemm/training/frozen_linear.py`, `_asym_bf16_nt`), and separately streams CPU **activations** via `sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous` (`asym_gemm/training/cpu_left.py:16,141`). A "stream the LoRA weight from CPU, never materialize it in HBM" variant is **NOT used** for trainable LoRA: it is unproven for trainable banks (the frozen kernel emits only grad_x; LoRA-B also needs grad_weight), and prior CPU-source experiments did not reduce peak / blew up latency (Stage 7a, REJECTED; see `agent/impls/archive/fix_exp_acc_offload_v2.md`/`v3.md`). This plan uses the simpler, certain ZeRO-3 stage-to-HBM approach, which meets `< 30 GiB`. (Those `*_cpu_source`/`*_cpu_right` kernels in the build belong to the *activation* offload path, not weight offload.)
 - The optimizer keeps, per unique LoRA param, a `_ParamMapping(cuda_param, cpu_param, grad_buffer, ...)` where `cuda_param` is the bf16 CUDA compute weight and `cpu_param` is the fp32 CPU master (`asym_gemm/training/cpu_adam.py:69-81`, `:188-206`). After step it refreshes `cuda_param.data.copy_(cpu_param.data, ...)` (`:395-398`, called at `:478-483`). Weight offload replaces this copy-back target with a pinned bf16 CPU "home" and lets the coordinator own `cuda_param.data` residency.
 - Existing offload idioms to reuse: pinned host tensors and a shape-keyed CPU buffer pool (`asym_gemm/training/activation_offload.py`), `torch.autograd.graph.saved_tensors_hooks` pack/unpack with `torch.cuda.Event` ready-events (`asym_gemm/training/attention_activation_offload.py:232-328`, install at `:370`), and `HostWeight` as the "weight lives on pinned CPU, staged with `.to(device=..., non_blocking=True)`" template (`asym_gemm/training/offload.py`/`host_weight.py`). There is currently **no** CUDA side-stream / prefetch primitive in the training package — Stage 3 introduces one.
 - Existing toggles to mirror: `ASYMM_EXPERT_ACT_OFFLOAD` (`asym_gemm/training/qwen3_moe.py:2267`), `ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD` (`:230-239`). Decoder layers are a standard `model.model.layers` `ModuleList`; the offloaded experts module is built by `wrap_qwen3_experts` → `AsymQwen3MoeBlock` (`:2686`, `:2733`).
@@ -143,12 +176,12 @@ ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${ASYM_CPU_ADAMW_WEIGHT_OFFLO
 
 ```bash
 # profile_lora_lf.sh / test_profiling.sh
-ASYM_CPU_ADAMW_WEIGHT_OFFLOADS=${ASYM_CPU_ADAMW_WEIGHT_OFFLOADS:-${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD:-false}}
+ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD:-${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD:-false}}
 # CLI: --asym-cpu-adamw-weight-offloads LIST
-mapfile -t asym_cpu_adamw_weight_offload_modes < <(tokens "${ASYM_CPU_ADAMW_WEIGHT_OFFLOADS}" | while read -r v; do bool_value "$v"; done | dedupe)
+mapfile -t asym_cpu_adamw_weight_offload_modes < <(tokens "${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD}" | while read -r v; do bool_value "$v"; done | dedupe)
 ```
 
-   The axis is a comma-separated **list of bools**; `ASYM_CPU_ADAMW_WEIGHT_OFFLOADS=false,true` expands to two jobs run **sequentially** within a single `profile_lora_lf.sh` invocation, producing the full A/B under one output root (a single value like `true` runs just that mode). In the backend loop, non-CPUAdamW backends force `false`; CPUAdamW backends iterate the axis. Nest the weight-offload axis *inside* the existing grad-offload loop and thread `weight_offload` into `run_job`, `job_root_path` (suffix `__weightoff${weight_offload}`, appended after `__gradoff${grad_offload}`), `ensure_jobs_tsv`/`append_job_record` (new `weight_offload` column), and `existing_profile_complete` (compare against `source_profile.config.asym_cpu_adamw_weight_offload`, so a stale `weightofffalse` profile is never accepted for a `weightofftrue` run). Keep a `legacy_job_root_path` fallback that omits the suffix for `weight_offload=false` so older profiles still resolve.
+   The axis is a comma-separated **list of bools**; `ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false,true` expands to two jobs run **sequentially** within a single `profile_lora_lf.sh` invocation, producing the full A/B under one output root (a single value like `true` runs just that mode). In the backend loop, non-CPUAdamW backends force `false`; CPUAdamW backends iterate the axis. Nest the weight-offload axis *inside* the existing grad-offload loop and thread `weight_offload` into `run_job`, `job_root_path` (suffix `__weightoff${weight_offload}`, appended after `__gradoff${grad_offload}`), `ensure_jobs_tsv`/`append_job_record` (new `weight_offload` column), and `existing_profile_complete` (compare against `source_profile.config.asym_cpu_adamw_weight_offload`, so a stale `weightofffalse` profile is never accepted for a `weightofftrue` run). Keep a `legacy_job_root_path` fallback that omits the suffix for `weight_offload=false` so older profiles still resolve.
 
 6. Persist in source profiles:
 
@@ -181,7 +214,7 @@ OUT=/tmp/asym_lora_weight_offload_stage1_dryrun
 rm -rf "${OUT}"
 BACKEND_SPECS="asym_cpuadamwds|recomp" \
 ASYM_CPU_ADAMW_GRAD_OFFLOADS="true" \
-ASYM_CPU_ADAMW_WEIGHT_OFFLOADS="false,true" \
+ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="false,true" \
 PROFILERS=source SEQ_LENS=128 MAX_STEPS=1 WARMUP_STEPS=0 \
 PREPARE_DATASETS=false DRY_RUN=true PLOT=false PLOT_MEMORY_BREAKDOWN=false \
 bash scripts/lf/profile_lora_lf.sh --gpus 0 --output-root "${OUT}"
@@ -450,7 +483,7 @@ OUT=/tmp/asym_lora_weight_offload_stage2_$(date -u +%Y%m%dT%H%M%SZ)
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 ASYM_CPU_ADAMW_GRAD_OFFLOADS="true" \
-ASYM_CPU_ADAMW_WEIGHT_OFFLOADS="false,true" \
+ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="false,true" \
 PROFILERS=source SEQ_LENS=4096 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
 GRADIENT_ACCUMULATION_STEPS=1 MAX_STEPS=3 WARMUP_STEPS=2 MAX_SAMPLES=64 \
 DATASET=asym_long_sft_smoke PREPARE_DATASETS=true MAX_GRAD_NORM=1.0 \
@@ -587,7 +620,7 @@ cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
 export ENV_PYTHON=${ENV_PYTHON:-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python}
 OUT=/tmp/asym_lora_weight_offload_smoke_$(date -u +%Y%m%dT%H%M%SZ)
 BACKEND_SPECS="asym_cpuadamwds|norecomp" MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
-ASYM_CPU_ADAMW_GRAD_OFFLOADS="true" ASYM_CPU_ADAMW_WEIGHT_OFFLOADS="false,true" \
+ASYM_CPU_ADAMW_GRAD_OFFLOADS="true" ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="false,true" \
 PROFILERS=source SEQ_LENS=512 PER_DEVICE_TRAIN_BATCH_SIZE=1 GRADIENT_ACCUMULATION_STEPS=1 \
 MAX_STEPS=2 WARMUP_STEPS=0 MAX_SAMPLES=8 PREPARE_DATASETS=true MAX_GRAD_NORM=1.0 \
 ASYMM_EXP_ACT_POLICIES="none|true|true|true" PLOT=false PLOT_MEMORY_BREAKDOWN=false \
@@ -600,7 +633,7 @@ rg -n '"asym_cpu_adamw_weight_offload": (false|true)|"weight_offload_enabled": (
 ```bash
 OUT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/profiling/lora_weight_offload_ab_$(date -u +%Y%m%dT%H%M%SZ)
 BACKEND_SPECS="asym_cpuadamwds|norecomp" MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
-ASYM_CPU_ADAMW_GRAD_OFFLOADS="true" ASYM_CPU_ADAMW_WEIGHT_OFFLOADS="false,true" \
+ASYM_CPU_ADAMW_GRAD_OFFLOADS="true" ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="false,true" \
 PROFILERS=source SEQ_LENS=4096 PER_DEVICE_TRAIN_BATCH_SIZE=4 GRADIENT_ACCUMULATION_STEPS=1 \
 MAX_STEPS=10 WARMUP_STEPS=5 MAX_SAMPLES=128 DATASET=asym_long_sft_smoke PREPARE_DATASETS=true \
 LORA_RANK=64 LORA_ALPHA=16 LORA_DROPOUT=0.00 MAX_GRAD_NORM=1.0 \
@@ -673,7 +706,7 @@ cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
 export ENV_PYTHON=${ENV_PYTHON:-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python}
 OUT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/profiling/lora_weight_offload_peakdebug_$(date -u +%Y%m%dT%H%M%SZ)
 BACKEND_SPECS="asym_cpuadamwds|norecomp" MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
-ASYM_CPU_ADAMW_GRAD_OFFLOADS="true" ASYM_CPU_ADAMW_WEIGHT_OFFLOADS="true" \
+ASYM_CPU_ADAMW_GRAD_OFFLOADS="true" ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="true" \
 PROFILERS=source SEQ_LENS=4096 PER_DEVICE_TRAIN_BATCH_SIZE=4 GRADIENT_ACCUMULATION_STEPS=1 \
 MAX_STEPS=1 WARMUP_STEPS=5 MAX_SAMPLES=128 DATASET=asym_long_sft_smoke PREPARE_DATASETS=true \
 LORA_RANK=64 LORA_ALPHA=16 LORA_DROPOUT=0.00 MAX_GRAD_NORM=1.0 \
@@ -711,21 +744,9 @@ Interpretation note (carried from the grad-offload debug): `allocator_unframed` 
 
 Stage 2's stage-to-HBM design is the shipping design and is expected to reach `< 30 GiB` on its own. Stage 7 is purely optional upside and must never be a prerequisite for the goal.
 
-### Stage 7a — AsymGEMM CPU-weight streaming (Design B): UNCERTAIN — design and validate before building
+### Stage 7a — AsymGEMM CPU-weight streaming (Design B): REJECTED (not pursued)
 
-Status: **not assumed to work; do not implement until the math is designed and validated.** It is true that AsymGEMM can stream a CPU-resident weight into a GEMM without materializing it in HBM (frozen base path, `m_grouped_bf16_asym_gemm_nt_contiguous`, `frozen_linear.py`). It is **not** established that this transfers to the *trainable* expert-LoRA GEMMs, because:
-
-- The frozen kernel emits only grad_x. Trainable LoRA-B also needs grad_weight (`dL/dB = lowrank^T @ grad_out`, grouped per expert). There may be no CPU-streaming kernel that emits grad_weight, so backward might still require staging the weight (or the activation) to HBM — which would erode the memory win.
-- The kernel operand layout (NT-contiguous, grouped offsets, transpose convention) may not match the LoRA-B `grouped_mm` math. Making it fit could require **changing the LoRA compute math**, which must first be proven numerically equivalent (and loss-equivalent) to the current path.
-- The acceptance config already runs LoRA-A forward in a CPU-left mode (`loraafwdcpu`); the interaction of a CPU-left activation stream with a CPU-right weight stream is unverified.
-
-Design gate (all required before any implementation):
-
-1. Write out the exact forward and backward math for the streamed LoRA-B GEMM — what lives on CPU, what on GPU, and what each kernel call computes — and confirm a grad_weight path exists or design one explicitly.
-2. Isolated kernel/autograd test (the one place a kernel-only test is acceptable per the validation policy): forward output and *both* grads must match the current staged `grouped_mm` LoRA-B path within tolerance on representative grouped shapes.
-3. Only then wire it behind a sub-flag (e.g. `asym_cpu_adamw_weight_offload_stream`) and re-run the Stage 5 `profile_lora_lf.sh` A/B. Accept only if it lowers peak further or improves latency with **no** change to the loss curve.
-
-If any of (1)-(3) fails, Design B is abandoned and Stage 2's stage-to-HBM remains the shipping design.
+CPU-source operand streaming for the trainable LoRA GEMMs is a dead end and is not pursued here. Prior work already evaluated CPU-source streaming (for the expert *activation* offload path) and found it either failed to reduce peak or blew up latency — see `agent/impls/archive/fix_exp_acc_offload_v2.md` / `v3.md` (e.g. a CPU-source experiment reverted at ~11.7× slower with no peak reduction). The `sm100_*_cpu_source` / `*_cpu_right` kernels in the build belong to the activation-offload path, not weight streaming. The shipped stage-to-HBM design already meets `< 30 GiB` at 1.019× latency, so there is no motivation to risk a LoRA-math change for it. Left here only to record the decision.
 
 ### Stage 7b — knob tuning
 

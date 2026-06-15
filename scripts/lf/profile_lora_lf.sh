@@ -23,7 +23,7 @@ GPU_POOL=${GPU_POOL:-0}
 # MODEL_SPECS entries are model|num_gpus. Recompute belongs only in BACKEND_SPECS.
 MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
-# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
+# MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1,Qwen/Qwen3.5-122B-A10B|1"}
 ROUTER_MODES=${ROUTER_MODES:-whole}
 # PROFILERS=${PROFILERS:-nsys,source}
@@ -38,8 +38,8 @@ LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 # BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
 # Plain asym remains the non-CPUAdam Asym baseline; the default e2e path validates the Asym CPUAdamW backend.
+# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp,superoffload|recomp"}
 BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp"}
 
 # Paired expert policy / expert activation offload / attention activation offload / layer activation offload axis.
 # Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD.
@@ -50,8 +50,23 @@ ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|true|true"}
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
 
+# Backend checks and AsymGEMM options
+# ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
+ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-all}
+ASYM_STRICT=${ASYM_STRICT:-true}
+REQUIRE_SM100=${REQUIRE_SM100:-1}
+# Comma/space-separated list of one or more boolean values to sweep (e.g. "false,true").
+ASYM_CPU_ADAMW_GRAD_OFFLOAD=${ASYM_CPU_ADAMW_GRAD_OFFLOAD:-true}
+ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD:-true}
+
+# Optimizer
+USE_ASYM_CPU_ADAMW=${USE_ASYM_CPU_ADAMW:-true}
+ASYM_CPU_ADAMW_BACKEND=${ASYM_CPU_ADAMW_BACKEND:-deepspeed}
+ASYM_CPU_ADAMW_PIN_MEMORY=${ASYM_CPU_ADAMW_PIN_MEMORY:-true}
+ASYM_CPU_ADAMW_FP32_MASTER=${ASYM_CPU_ADAMW_FP32_MASTER:-true}
+
 # Execution
-OVERWRITE=${OVERWRITE:-true}
+OVERWRITE=${OVERWRITE:-false}
 CONTINUE_ON_ERROR=${CONTINUE_ON_ERROR:-false}
 DRY_RUN=${DRY_RUN:-false}
 COLLECT_EXISTING=${COLLECT_EXISTING:-false}
@@ -59,10 +74,12 @@ INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
 RUN_NAME=${RUN_NAME:-}
 
 # Training
+# SEQ_LENS=${SEQ_LENS:-11264}
+SEQ_LENS=${SEQ_LENS:-10240}
 # SEQ_LENS=${SEQ_LENS:-8192}
 # SEQ_LENS=${SEQ_LENS:-7168}
-SEQ_LENS=${SEQ_LENS:-4096}
-PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-4}
+# SEQ_LENS=${SEQ_LENS:-4096}
+PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-8}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 MAX_STEPS=${MAX_STEPS:-10}
 WARMUP_STEPS=${WARMUP_STEPS:-5}
@@ -75,10 +92,10 @@ SEED=${SEED:-42}
 DATASET=${DATASET:-asym_long_sft_smoke}
 PREPARE_DATASETS=${PREPARE_DATASETS:-true}
 DATASET_MIN_TOKENS=${DATASET_MIN_TOKENS:-auto}
-DATASET_EVAL_ROWS=${DATASET_EVAL_ROWS:-128}
+DATASET_EVAL_ROWS=${DATASET_EVAL_ROWS:-1}
 DATASET_OVERWRITE=${DATASET_OVERWRITE:-false}
 TEMPLATE=${TEMPLATE:-auto}
-MAX_SAMPLES=${MAX_SAMPLES:-128}
+MAX_SAMPLES=${MAX_SAMPLES:-64}
 
 # Output and profiling
 OUTPUT_ROOT=${OUTPUT_ROOT:-}
@@ -94,19 +111,6 @@ PROFILE_MEMORY_SNAPSHOT_PATH=${PROFILE_MEMORY_SNAPSHOT_PATH:-}
 PROFILE_EXTERNAL_MEMORY=${PROFILE_EXTERNAL_MEMORY:-false}
 PROFILE_SYNC=${PROFILE_SYNC:-0}
 PROFILE_MODULE_FILTER=${PROFILE_MODULE_FILTER:-attention,router,mlp,experts,lora,optimizer,kt}
-
-# Backend checks and AsymGEMM options
-# ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
-ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-all}
-ASYM_STRICT=${ASYM_STRICT:-true}
-REQUIRE_SM100=${REQUIRE_SM100:-1}
-USE_ASYM_CPU_ADAMW=${USE_ASYM_CPU_ADAMW:-false}
-ASYM_CPU_ADAMW_BACKEND=${ASYM_CPU_ADAMW_BACKEND:-deepspeed}
-ASYM_CPU_ADAMW_PIN_MEMORY=${ASYM_CPU_ADAMW_PIN_MEMORY:-true}
-ASYM_CPU_ADAMW_FP32_MASTER=${ASYM_CPU_ADAMW_FP32_MASTER:-true}
-# Comma/space-separated list of one or more boolean values to sweep (e.g. "false,true").
-ASYM_CPU_ADAMW_GRAD_OFFLOAD=${ASYM_CPU_ADAMW_GRAD_OFFLOAD:-false}
-
 
 
 # KT backend
@@ -1134,9 +1138,10 @@ job_root_path() {
   local router_mode="$6"
   local lf_expert_lora_impl_value="${7:-${lf_expert_lora_impl:-split-target-parameters}}"
   local grad_offload="${8:-false}"
+  local weight_offload="${9:-false}"
   local grad_offload_suffix=""
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
-    grad_offload_suffix="__gradoff${grad_offload}"
+    grad_offload_suffix="__gradoff${grad_offload}__weightoff${weight_offload}"
   fi
   printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__${expact_lora_a_fwd_label}__qwenexpert${lf_expert_lora_impl_value}${grad_offload_suffix}")"
 }
@@ -1545,6 +1550,8 @@ while (($#)); do
     --asym-cpu-adamw-fp32-master=*) ASYM_CPU_ADAMW_FP32_MASTER="$(bool_value "${1#*=}")"; shift ;;
     --asym-cpu-adamw-grad-offload) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_GRAD_OFFLOAD="$2"; shift 2 ;;
     --asym-cpu-adamw-grad-offload=*) ASYM_CPU_ADAMW_GRAD_OFFLOAD="${1#*=}"; shift ;;
+    --asym-cpu-adamw-weight-offload) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="$2"; shift 2 ;;
+    --asym-cpu-adamw-weight-offload=*) ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${1#*=}"; shift ;;
     --kt-kernel-dir) need_value "$1" "${2-}"; KT_KERNEL_DIR="$2"; shift 2 ;;
     --kt-kernel-dir=*) KT_KERNEL_DIR="${1#*=}"; shift ;;
     --kt-tools-dir) need_value "$1" "${2-}"; KT_TOOLS_DIR="$2"; shift 2 ;;
@@ -1767,6 +1774,10 @@ mapfile -t asym_cpu_adamw_grad_offload_modes < <(
   tokens "${ASYM_CPU_ADAMW_GRAD_OFFLOAD}" | while read -r value; do bool_value "${value}"; done | dedupe
 )
 ((${#asym_cpu_adamw_grad_offload_modes[@]})) || die "ASYM_CPU_ADAMW_GRAD_OFFLOAD must include at least one boolean value"
+mapfile -t asym_cpu_adamw_weight_offload_modes < <(
+  tokens "${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD}" | while read -r value; do bool_value "${value}"; done | dedupe
+)
+((${#asym_cpu_adamw_weight_offload_modes[@]})) || die "ASYM_CPU_ADAMW_WEIGHT_OFFLOAD must include at least one boolean value"
 if printf '%s\n' "${profilers[@]}" | grep -qx 'nsys'; then
   plot_profilers=(nsys)
 else
@@ -2009,6 +2020,7 @@ run_job() {
   local dataset_name="$9"
   local lf_expert_lora_impl="${10}"
   local grad_offload="${11:-false}"
+  local weight_offload="${12:-false}"
   local gradient_checkpointing=false
   local attention_gc_enabled=false
   local layer_gc_enabled=false
@@ -2017,19 +2029,20 @@ run_job() {
   [[ "${expert_policy}" == "gc-layer" ]] && layer_gc_enabled=true
   if ! cpuadam_backend_for_label "${backend}" >/dev/null; then
     grad_offload=false
+    weight_offload=false
   fi
 
   local config_root job_root seq_root source_profile lf_out log_file run_id profile_json
   local kt_arm_source_ok_profile_json=""
   config_root="$(config_root_path "${seq_len}")"
-  job_root="$(job_root_path "${config_root}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${lf_expert_lora_impl}" "${grad_offload}")"
+  job_root="$(job_root_path "${config_root}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${lf_expert_lora_impl}" "${grad_offload}" "${weight_offload}")"
   seq_root="${job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
   source_profile="${seq_root}/source_profile.json"
   lf_out="${seq_root}/lf_run"
   log_file="${seq_root}/train.log"
   local grad_offload_run_label=""
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
-    grad_offload_run_label="_gradoff${grad_offload}"
+    grad_offload_run_label="_gradoff${grad_offload}_weightoff${weight_offload}"
   fi
   run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${expact_lora_a_fwd_label}_qwenexpert$(safe_label "${lf_expert_lora_impl}")${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
@@ -2125,6 +2138,7 @@ run_job() {
     ASYM_CPU_ADAMW_PIN_MEMORY="${ASYM_CPU_ADAMW_PIN_MEMORY}"
     ASYM_CPU_ADAMW_FP32_MASTER="${ASYM_CPU_ADAMW_FP32_MASTER}"
     ASYM_CPU_ADAMW_GRAD_OFFLOAD="${grad_offload}"
+    ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${weight_offload}"
     GPU_ID="${gpu}"
     NUM_GPUS="${gpu_count}"
     REQUIRE_SM100="${REQUIRE_SM100}"
@@ -2181,6 +2195,7 @@ run_job() {
     PROFILE_TOTAL_STEPS="${TOTAL_STEPS}"
     MASTER_PORT="${master_port}"
     ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD="${grad_offload}"
+    ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${weight_offload}"
     ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
@@ -2733,16 +2748,23 @@ for model_spec_entry in "${model_specs[@]}"; do
                 gpu="$(gpu_slice "${gpu_count}")"
                 if cpuadam_backend_for_label "${backend}" >/dev/null; then
                   grad_offload_modes_for_job=("${asym_cpu_adamw_grad_offload_modes[@]}")
+                  weight_offload_modes_for_job=("${asym_cpu_adamw_weight_offload_modes[@]}")
                 else
                   grad_offload_modes_for_job=(false)
+                  weight_offload_modes_for_job=(false)
                 fi
                 for grad_offload in "${grad_offload_modes_for_job[@]}"; do
-                  if ! run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}" "${lf_expert_lora_impl}" "${grad_offload}"; then
-                    failures=$((failures + 1))
-                    if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
-                      exit 1
+                  for weight_offload in "${weight_offload_modes_for_job[@]}"; do
+                    if [[ "${weight_offload}" == "true" && "${grad_offload}" != "true" ]]; then
+                      continue  # weight offload requires grad offload (LF parser enforces this)
                     fi
-                  fi
+                    if ! run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}" "${lf_expert_lora_impl}" "${grad_offload}" "${weight_offload}"; then
+                      failures=$((failures + 1))
+                      if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
+                        exit 1
+                      fi
+                    fi
+                  done
                 done
               done
             done
