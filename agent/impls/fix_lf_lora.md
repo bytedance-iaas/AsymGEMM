@@ -6,10 +6,55 @@ Resolved implementation facts:
 
 - Local Transformers Qwen3/Qwen3.5 fused experts use `Qwen3MoeExperts` / `Qwen3_5MoeExperts.forward(hidden_states, top_k_index, top_k_weights)` and store `gate_up_proj [E, 2I, H]`, `down_proj [E, H, I]`.
 - PEFT custom LoRA modules are the clean path: upstream docs require `nn.Module + LoraLayer`, adapter tensors in `ParameterDict`/`ModuleDict`, attribute names starting with `lora_`, and re-registering custom modules before adapter load.
-- PEFT `target_parameters` can target 3D MoE tensors, but stock behavior materializes per-expert LoRA deltas and does not express separate gate/up LoRA at rank `r`. Do not use it for this correction.
+- PEFT `target_parameters` can target 3D MoE tensors and is the fast A/B baseline. For Qwen fused `gate_up_proj`, stock PEFT uses one shared LoRA-A for the combined gate/up tensor, so it trains fewer parameters than the corrected split gate/up/down surface.
 - Current LF helper `_lf_fused_lora_params` trains in-memory but is not PEFT-native enough for reliable normal adapter save/load. Replace it for new runs.
 - The A/B comparison is central: the profiling flow must run both stock PEFT expert LoRA and the corrected custom PEFT-compatible expert LoRA as selectable modes on the same workload.
 - The custom wrapper is not only for `lora_target=all`: if target selection includes `experts`, `.mlp.experts`, or exact fused expert module names, use the custom wrapper in `custom-peft` mode.
+- Under DeepSpeed ZeRO-3, local expert parameters can have empty partition shapes. All Qwen fused-expert detection and PEFT `target_parameters` shape inference must use logical `ds_shape` when present.
+
+Implemented result, 2026-06-14:
+
+- `custom-peft` is wired as the corrected split gate/up/down PEFT-compatible Qwen expert LoRA path.
+- `peft-target-parameters` is wired as the stock PEFT A/B baseline and now works under ZeRO-3 by using exact discovered target parameter names plus a ZeRO logical-shape patch for PEFT `ParamWrapper`.
+- `off` remains available for dense-only LF LoRA checks.
+- `profile_lora_lf.sh` can sweep `LF_EXPERT_LORA_IMPLS="peft-target-parameters,custom-peft"` and records the mode in the run label and profile config.
+- Source-profile counters now report `qwen_moe_expert_lora_*`, `peft_expert_lora_*`, and trainable-surface fields, including a sidecar path for ZeRO-3 partitioned model views.
+- `custom-peft` matches the existing Qwen3 AsymGEMM/KT-style MoE LoRA trainable surface: `3,321,888,768` expert LoRA parameters and `3,375,366,144` total trainable LoRA parameters.
+- `peft-target-parameters` is materially faster in plain LF but does not match the split gate/up/down parameter surface: `2,516,582,400` expert LoRA parameters and `2,570,059,776` total trainable LoRA parameters.
+- Plain LF `custom-peft` is correctness-compatible but not latency-acceptable as a performance baseline: its Python-side expert wrapper makes the measured step about `37.34 s` versus `3.61 s` for stock PEFT target-parameters on the same ZeRO-3 workload.
+
+Measured `MAX_STEPS=10` A/B profile:
+
+```text
+MODEL_SPECS="Qwen/Qwen3-30B-A3B|1"
+BACKEND_SPECS="zero3_offload|recomp"
+ASYMM_EXP_ACT_POLICIES="none|false|false|false"
+LF_EXPERT_LORA_IMPLS="peft-target-parameters,custom-peft"
+SEQ_LENS=4096
+PER_DEVICE_TRAIN_BATCH_SIZE=4
+DATASET=asym_long_sft_smoke
+PREPARE_DATASETS=false
+LORA_TARGET=all
+LORA_DROPOUT=0.00
+PROFILERS=source
+WARMUP_STEPS=5
+MAX_STEPS=10
+RUN_POST=false
+scripts/lf/profile_lora_lf.sh --gpus 0 --output-root profiling/lf_lora_fix_ab_w5s10
+```
+
+| backend spec | qwen expert LoRA impl | peak allocated HBM | peak reserved HBM | avg step | avg forward | avg backward | trainable params | expert LoRA params | loss max/last/train |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `zero3_offload|recomp` | `peft-target-parameters` | `33.107 GiB` | `38.756 GiB` | `3.610 s` | `1.035 s` | `2.510 s` | `2,570,059,776` | `2,516,582,400` | `2.282/1.728/1.971` |
+| `zero3_offload|recomp` | `custom-peft` | `33.138 GiB` | `38.504 GiB` | `37.344 s` | `10.520 s` | `26.709 s` | `3,375,366,144` | `3,321,888,768` | `2.225/1.658/1.903` |
+
+MoE-block LoRA trainable-parameter parity:
+
+| row | trainable params | expert LoRA params | PEFT expert LoRA params | Qwen custom expert LoRA params | matches split expert surface |
+| --- | ---: | ---: | ---: | ---: | --- |
+| existing Qwen3 AsymGEMM artifact, `asym_cpuadamwds|norecomp`, `none|true` | `3,375,366,144` | `3,321,888,768` | `3,321,888,768` | n/a | yes |
+| LF `zero3_offload|recomp`, `peft-target-parameters` | `2,570,059,776` | `2,516,582,400` | `2,516,582,400` | `0` | no |
+| LF `zero3_offload|recomp`, `custom-peft` | `3,375,366,144` | `3,321,888,768` | `3,321,888,768` | `3,321,888,768` | yes |
 
 ## Stage 0 - Add LF expert-LoRA mode selection to profiling
 
@@ -349,13 +394,11 @@ def _add_qwen_moe_target_parameters(model, peft_config, raw_lora_target, resolve
         return peft_config
 
     target_parameters = set(getattr(peft_config, "target_parameters", None) or [])
-
-    # PEFT suffix matching covers all decoder layers.
-    target_parameters.update({
-        "mlp.experts.gate_up_proj",
-        "mlp.experts.down_proj",
-    })
+    for name in selected_experts:
+        target_parameters.add(f"{name}.gate_up_proj")
+        target_parameters.add(f"{name}.down_proj")
     peft_config.target_parameters = sorted(target_parameters)
+    _patch_peft_param_wrapper_zero3_shape()
     return peft_config
 
 def prepare_qwen_moe_expert_lora_config(model, peft_config, mode, raw_lora_target, resolved_target_modules):
@@ -416,6 +459,7 @@ Risk and uncertainty:
 - PEFT may warn that the custom module type is unsupported. That is expected when using custom dispatch and should not fail tests.
 - `peft-target-parameters` and `custom-peft` are not mathematically identical. The profile artifact must record the mode and expert parameter count so memory/latency differences are interpretable.
 - Explicit non-expert targets such as `q_proj,v_proj` must not attach expert LoRA.
+- Under ZeRO-3, target parameter names must be exact full names from `model.named_modules()`. Suffix-only names such as `mlp.experts.gate_up_proj` are not sufficient for the accepted path.
 
 Validation before Stage 3:
 

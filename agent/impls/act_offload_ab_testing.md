@@ -24,9 +24,14 @@ ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=gpu_hbm   # experimental behavior
 
 Baseline A is `34.593 GiB` peak allocated, `39.676 GiB` peak reserved,
 `45.861 s` avg step, `11.490 s` avg forward, and `34.213 s` avg backward.
-Reject any B that approaches the old `58.343 GiB` expert+attention-only row.
-Treat `<=36 GiB` peak allocated as acceptable, investigate `36-40 GiB`, and
-reject `>40 GiB`.
+Memory acceptance is intentionally tight: B is acceptable only if peak
+allocated HBM has no increase, or increases by less than `0.5 GiB` versus the
+matched A run. With the current A baseline, that means a hard peak-allocated
+cap of `35.093 GiB`; lower is better. Reject any B that approaches the old
+`58.343 GiB` expert+attention-only row. The expected extra live tensors are
+low-rank `S_*` tensors plus the temporary concatenated LoRA-A weight, so a
+large HBM jump means the implementation accidentally kept or cloned a large
+`[M,H]` or `[M,I]` tensor.
 
 External API assumptions checked before implementation:
 
@@ -36,6 +41,28 @@ External API assumptions checked before implementation:
   live until both views have been consumed/offloaded.
 - `torch.nn.functional.grouped_mm` supports the 2D-left, 3D-right, int32-offset
   MoE shape that `grouped_expert_lora(...)` already uses.
+
+Overall implementation size should be small:
+
+- add one env selector and carry it through LF run labels, command artifacts,
+  source-profile config, and existing-profile completeness checks;
+- add mode-specific expert LoRA-A counters while preserving existing aggregate
+  counters;
+- add one HBM LoRA-A helper that reuses existing `grouped_expert_lora(...)`;
+- branch only expert activation-offload forward LoRA-A in
+  `_ActivationOffloadQwen3ExpertFunction.forward`;
+- keep backward, saved CPU activations, trainable surface, optimizer, policy
+  tuple, and attention/layer activation offload unchanged.
+
+No native kernel work is required for the first A/B. A native same-source
+gate/up LoRA-A kernel is only a follow-up if `gpu_hbm` is faster but violates
+the `<0.5 GiB` peak-allocated HBM delta cap.
+
+Performance and memory acceptance numbers must come from the real LF workflow:
+`scripts/lf/profile_lora_lf.sh` with the target Qwen3-30B-A3B workload above.
+Toy settings, isolated one-MoE profiling, or reduced-shape scripts may be used
+only for debugging and sanity checks. They must not be used in the final A/B
+table, default decision, or `agent/status.md`.
 
 ## Stage 0: Lock Comparable Trainable Surface
 
@@ -702,8 +729,9 @@ test is skipped on development machines.
 Risks to watch:
 
 - `gate_up_a = torch.cat(...)` creates a temporary `[E,2R,H]` HBM tensor. For
-  Qwen3 `E=128,R=64,H=2048`, this is about `64 MiB`. If the e2e peak moves
-  above the acceptance band, replace it with a native same-source pair kernel.
+  Qwen3 `E=128,R=64,H=2048`, this is about `64 MiB`. If the e2e peak allocated
+  HBM increases by `>=0.5 GiB` versus A, replace it with a native same-source
+  pair kernel or reschedule the temporary outside the peak.
 - The split `S_gate`/`S_up` tensors are views. Keep the owner alive until both
   views are consumed and offloaded.
 - `grouped_expert_lora_pair` still materializes a `[2M,R]` input internally for
@@ -760,7 +788,10 @@ PYTHONPATH=. .venv/bin/python scripts/testing/profile_qwen3_activation_offload.p
   --output-json /tmp/qwen3_expact_gpu_hbm_lora_a_one_moe.json
 ```
 
-Short e2e smoke before production A/B:
+Short real-workflow e2e smoke before production A/B. This uses
+`scripts/lf/profile_lora_lf.sh` and the production model/workflow shape, but
+short warmup/measure counts mean it is still only a correctness and gross-memory
+gate, not an acceptance benchmark:
 
 ```bash
 OUTPUT_ROOT=outputs/lf_ab_stage2_gpu_hbm_smoke \
@@ -796,13 +827,18 @@ Acceptance:
 - Postprocessed `profile.json` has
   `trainable_surface.surface == "attention+expert LoRA"`.
 - `reference_fallback_count == 0`.
-- Smoke peak allocated HBM is not near `58 GiB`.
+- Smoke peak allocated HBM is below the hard production cap if compared against
+  the current baseline (`35.093 GiB`). If allocator variance makes this unclear,
+  run a matching `cpu_left` smoke and require `gpu_hbm - cpu_left < 0.5 GiB`.
 
 ## Stage 3: Production E2E A/B
 
 Purpose: decide whether `gpu_hbm` is actually better on the production workload.
-This is the acceptance gate. Do not accept based only on unit tests or one-MoE
-profiling.
+This is the only acceptance gate for memory and latency. Do not accept based on
+unit tests, one-MoE profiling, toy settings, or reduced-shape runs. The final
+reported A/B numbers must come from `scripts/lf/profile_lora_lf.sh` using the
+real target model, dataset workflow, batch, sequence length, warmup, and
+measured-step settings below.
 
 Files, functions, and classes:
 
@@ -874,6 +910,7 @@ import json
 import sys
 from pathlib import Path
 
+results = []
 for root in map(Path, sys.argv[1:]):
     profiles = sorted(root.rglob("profile.json"))
     if len(profiles) != 1:
@@ -895,14 +932,36 @@ for root in map(Path, sys.argv[1:]):
     print("  trainable surface:", surface.get("surface"))
     print("  trainable params:", lora.get("trainable_parameters"))
     print("  expert CPU-left/HBM/fallback:", total_cpu_exp, total_hbm, fallback)
+    results.append((root, profile, total_cpu_exp, total_hbm, fallback))
+
+if len(results) == 2:
+    a_root, a, *_ = results[0]
+    b_root, b, *_ = results[1]
+    a_alloc = int(a["memory"]["peak_allocated_hbm_bytes"])
+    b_alloc = int(b["memory"]["peak_allocated_hbm_bytes"])
+    a_reserved = int(a["memory"]["peak_reserved_hbm_bytes"])
+    b_reserved = int(b["memory"]["peak_reserved_hbm_bytes"])
+    alloc_delta_gib = (b_alloc - a_alloc) / 1024**3
+    reserved_delta_gib = (b_reserved - a_reserved) / 1024**3
+    print("A/B deltas")
+    print("  peak allocated delta GiB:", alloc_delta_gib)
+    print("  peak reserved delta GiB:", reserved_delta_gib)
+    if alloc_delta_gib >= 0.5:
+        raise SystemExit(
+            f"reject {b_root}: peak allocated HBM increased by {alloc_delta_gib:.3f} GiB "
+            f"versus {a_root}; required <0.5 GiB"
+        )
 PY
 ```
 
 Acceptance for B:
 
 - `config.asymm_expert_act_offload_lora_a_fwd == "gpu_hbm"`.
-- Peak allocated HBM `<=36 GiB` preferred; reject `>40 GiB` or near `58 GiB`.
-- Peak reserved HBM has no material increase over A.
+- Peak allocated HBM has no increase versus A, or increases by less than
+  `0.5 GiB`. With the current A baseline of `34.593 GiB`, B must be below
+  `35.093 GiB`.
+- Peak reserved HBM is reported and investigated if it increases materially;
+  reserved-memory growth is not allowed to hide an allocated-memory regression.
 - Avg step improves by at least `20%`.
 - Avg forward materially improves.
 - Avg backward does not increase enough to erase forward savings.
@@ -957,7 +1016,7 @@ Keep `cpu_left` as an override for one release:
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu_left scripts/lf/profile_lora_lf.sh --gpus 0
 ```
 
-If B is faster but above the memory band:
+If B is faster but peak allocated HBM increases by `>=0.5 GiB`:
 
 - Keep default `cpu_left`.
 - Implement a native same-source gate/up LoRA-A grouped kernel that avoids the
