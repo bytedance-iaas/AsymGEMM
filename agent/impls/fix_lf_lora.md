@@ -1,212 +1,179 @@
 # Fix LF Qwen MoE Expert LoRA
 
-Goal: make plain LlamaFactory/ZeRO attach, train, save, and reload Qwen fused MoE expert LoRA correctly whenever LF/PEFT target selection reaches Qwen expert modules. This is not an AsymGEMM feature and should not use AsymGEMM naming.
+Goal: make plain LlamaFactory/ZeRO attach, train, save, reload, and profile Qwen fused MoE expert LoRA correctly, while keeping the fast Transformers Qwen expert execution path. This is not an AsymGEMM feature and should not use AsymGEMM naming.
 
-Resolved implementation facts:
-
-- Local Transformers Qwen3/Qwen3.5 fused experts use `Qwen3MoeExperts` / `Qwen3_5MoeExperts.forward(hidden_states, top_k_index, top_k_weights)` and store `gate_up_proj [E, 2I, H]`, `down_proj [E, H, I]`.
-- PEFT custom LoRA modules are the clean path: upstream docs require `nn.Module + LoraLayer`, adapter tensors in `ParameterDict`/`ModuleDict`, attribute names starting with `lora_`, and re-registering custom modules before adapter load.
-- PEFT `target_parameters` can target 3D MoE tensors and is the fast A/B baseline. For Qwen fused `gate_up_proj`, stock PEFT uses one shared LoRA-A for the combined gate/up tensor, so it trains fewer parameters than the corrected split gate/up/down surface.
-- Current LF helper `_lf_fused_lora_params` trains in-memory but is not PEFT-native enough for reliable normal adapter save/load. Replace it for new runs.
-- The A/B comparison is central: the profiling flow must run both stock PEFT expert LoRA and the corrected custom PEFT-compatible expert LoRA as selectable modes on the same workload.
-- The custom wrapper is not only for `lora_target=all`: if target selection includes `experts`, `.mlp.experts`, or exact fused expert module names, use the custom wrapper in `custom-peft` mode.
-- Under DeepSpeed ZeRO-3, local expert parameters can have empty partition shapes. All Qwen fused-expert detection and PEFT `target_parameters` shape inference must use logical `ds_shape` when present.
-
-Implemented result, 2026-06-14:
-
-- `custom-peft` is wired as the corrected split gate/up/down PEFT-compatible Qwen expert LoRA path.
-- `peft-target-parameters` is wired as the stock PEFT A/B baseline and now works under ZeRO-3 by using exact discovered target parameter names plus a ZeRO logical-shape patch for PEFT `ParamWrapper`.
-- `off` remains available for dense-only LF LoRA checks.
-- `profile_lora_lf.sh` can sweep `LF_EXPERT_LORA_IMPLS="peft-target-parameters,custom-peft"` and records the mode in the run label and profile config.
-- Source-profile counters now report `qwen_moe_expert_lora_*`, `peft_expert_lora_*`, and trainable-surface fields, including a sidecar path for ZeRO-3 partitioned model views.
-- `custom-peft` matches the existing Qwen3 AsymGEMM/KT-style MoE LoRA trainable surface: `3,321,888,768` expert LoRA parameters and `3,375,366,144` total trainable LoRA parameters.
-- `peft-target-parameters` is materially faster in plain LF but does not match the split gate/up/down parameter surface: `2,516,582,400` expert LoRA parameters and `2,570,059,776` total trainable LoRA parameters.
-- Plain LF `custom-peft` is correctness-compatible but not latency-acceptable as a performance baseline: its Python-side expert wrapper makes the measured step about `37.34 s` versus `3.61 s` for stock PEFT target-parameters on the same ZeRO-3 workload.
-
-Measured `MAX_STEPS=10` A/B profile:
+The current `custom-peft` wrapper is correctness-useful but performance-rejected. It replaces Qwen expert forward and loops over active experts in Python, so it loses Transformers `grouped_mm` expert dispatch. The accepted correction must follow PEFT `ParamWrapper` runtime style:
 
 ```text
-MODEL_SPECS="Qwen/Qwen3-30B-A3B|1"
-BACKEND_SPECS="zero3_offload|recomp"
-ASYMM_EXP_ACT_POLICIES="none|false|false|false"
-LF_EXPERT_LORA_IMPLS="peft-target-parameters,custom-peft"
-SEQ_LENS=4096
-PER_DEVICE_TRAIN_BATCH_SIZE=4
-DATASET=asym_long_sft_smoke
-PREPARE_DATASETS=false
-LORA_TARGET=all
-LORA_DROPOUT=0.00
-PROFILERS=source
-WARMUP_STEPS=5
-MAX_STEPS=10
-RUN_POST=false
-scripts/lf/profile_lora_lf.sh --gpus 0 --output-root profiling/lf_lora_fix_ab_w5s10
+compute full 3D LoRA delta weight
+temporarily parametrize original expert parameter as W + delta
+call the original Qwen experts module unchanged
+remove parametrization
 ```
 
-| backend spec | qwen expert LoRA impl | peak allocated HBM | peak reserved HBM | avg step | avg forward | avg backward | trainable params | expert LoRA params | loss max/last/train |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `zero3_offload|recomp` | `peft-target-parameters` | `33.107 GiB` | `38.756 GiB` | `3.610 s` | `1.035 s` | `2.510 s` | `2,570,059,776` | `2,516,582,400` | `2.282/1.728/1.971` |
-| `zero3_offload|recomp` | `custom-peft` | `33.138 GiB` | `38.504 GiB` | `37.344 s` | `10.520 s` | `26.709 s` | `3,375,366,144` | `3,321,888,768` | `2.225/1.658/1.903` |
+Local evidence:
 
-MoE-block LoRA trainable-parameter parity:
+- `/home/kevinni/AsymGEMM-SFT/third_party/peft/src/peft/tuners/lora/layer.py::ParamWrapper`
+  - `get_delta_weight()` materializes a 3D expert delta.
+  - `_activate_lora()` registers `_LoraParameterProxy(delta_weight)` with `nn.utils.parametrize`.
+  - `forward()` calls `self.base_layer(...)`, preserving the original module implementation.
+- `/workspace/AsymGEMM-SFT/third_party/AsymGEMM/.venv/lib/python3.12/site-packages/transformers/integrations/moe.py`
+  - `use_experts_implementation()` dispatches Qwen experts to `grouped_mm` by config.
+  - `grouped_mm_experts_forward()` sorts tokens by expert and uses grouped GEMM.
+- Official PEFT docs say MoE expert `nn.Parameter`s should use `target_parameters`; they also warn that PEFT materializes LoRA contribution for each expert, which is expected overhead, but that is still much faster than replacing grouped expert execution with Python loops.
 
-| row | trainable params | expert LoRA params | PEFT expert LoRA params | Qwen custom expert LoRA params | matches split expert surface |
-| --- | ---: | ---: | ---: | ---: | --- |
-| existing Qwen3 AsymGEMM artifact, `asym_cpuadamwds|norecomp`, `none|true` | `3,375,366,144` | `3,321,888,768` | `3,321,888,768` | n/a | yes |
-| LF `zero3_offload|recomp`, `peft-target-parameters` | `2,570,059,776` | `2,516,582,400` | `2,516,582,400` | `0` | no |
-| LF `zero3_offload|recomp`, `custom-peft` | `3,375,366,144` | `3,321,888,768` | `3,321,888,768` | `3,321,888,768` | yes |
+Measured rejected baseline, Qwen3-30B-A3B, `zero3_offload|recomp`, `b4_s4096`, `WARMUP_STEPS=5`, `MAX_STEPS=10`:
 
-## Stage 0 - Add LF expert-LoRA mode selection to profiling
+| impl | peak allocated HBM | peak reserved HBM | avg step | avg forward | avg backward | trainable params | expert LoRA params |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `peft-target-parameters` | `33.107 GiB` | `38.756 GiB` | `3.610 s` | `1.035 s` | `2.510 s` | `2,570,059,776` | `2,516,582,400` |
+| current `custom-peft` | `33.138 GiB` | `38.504 GiB` | `37.344 s` | `10.520 s` | `26.709 s` | `3,375,366,144` | `3,321,888,768` |
+
+Acceptance target:
+
+- Keep the split gate/up/down expert LoRA trainable surface: `3,321,888,768` expert LoRA params for Qwen3-30B-A3B rank 64.
+- Preserve original Qwen expert module forward and Transformers `grouped_mm` dispatch.
+- E2E timing must be close to `peft-target-parameters`; any small overhead must be justified by the larger trainable surface.
+- If peak memory stays the same but latency remains materially worse, reject the change.
+
+## Stage 0 - Add a new PEFT-style mode and keep A/B baselines
 
 Modify:
 
-- `scripts/lf/profile_lora_lf.sh`
-  - add profile dimension `LF_EXPERT_LORA_IMPLS`
-  - add CLI option `--lf-expert-lora-impls`
-  - include the mode in run labels, cache completeness checks, and env passed to `run_lf_lora_sft.sh`
-- `scripts/lf/run_lf_lora_sft.sh`
-  - add env var `LF_QWEN_MOE_EXPERT_LORA_IMPL`
-  - propagate it to the training process and source-profile config
-- `scripts/lf/run_lf_profiled_train.py`
-  - record `qwen_moe_expert_lora_impl` in the profile JSON config
+- `/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/model_utils/fused_moe_lora.py`
+  - constants: add `QWEN_EXPERT_LORA_SPLIT_TARGET_PARAMETERS = "split-target-parameters"`
+  - `QWEN_EXPERT_LORA_MODES`
+  - `prepare_qwen_moe_expert_lora_config`
+  - `infer_qwen_expert_lora_impl`
 - `/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/adapter.py`
-  - read `LF_QWEN_MOE_EXPERT_LORA_IMPL` during LoRA setup
-
-Modes:
-
-```text
-custom-peft             corrected PEFT custom module with separate gate/up/down LoRA
-peft-target-parameters  stock PEFT target_parameters on gate_up_proj/down_proj
-off                     no fused expert LoRA; dense attention/shared-expert LoRA only
-```
+  - mode validation remains env-driven through `LF_QWEN_MOE_EXPERT_LORA_IMPL`
+- `scripts/lf/profile_lora_lf.sh`
+  - allow `LF_EXPERT_LORA_IMPLS=split-target-parameters`
+- `scripts/lf/run_lf_lora_sft.sh`
+  - allow `LF_QWEN_MOE_EXPERT_LORA_IMPL=split-target-parameters`
+- `scripts/lf/run_lf_profiled_train.py`
+  - no schema rename; keep `qwen_moe_expert_lora_impl`
+- `scripts/lf/postprocess_lf_profile_artifacts.py`
+  - render the new mode label
+- `tests/lf/test_asym_cpu_adamw_args.py`
+  - add dry-run coverage for the new mode
 
 Implementation:
 
-```bash
-# profile_lora_lf.sh
-LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-custom-peft}
-
-case "${arg}" in
-  --lf-expert-lora-impls) LF_EXPERT_LORA_IMPLS="$2"; shift 2 ;;
-  --lf-expert-lora-impls=*) LF_EXPERT_LORA_IMPLS="${arg#*=}"; shift ;;
-esac
-
-parse LF_EXPERT_LORA_IMPLS as comma list
-validate each item in {custom-peft,peft-target-parameters,off}
-
-for model_spec in ...
-  for backend_spec in ...
-    for expert_lora_impl in "${lf_expert_lora_impls[@]}"
-      RUN_ENV+=(
-        LF_QWEN_MOE_EXPERT_LORA_IMPL="${expert_lora_impl}"
-        ASYM_GEMM_LF_CONFIG_QWEN_EXPERT_LORA_IMPL="${expert_lora_impl}"
-      )
-      run_id includes "qwenexpert-${expert_lora_impl}"
-```
-
-```bash
-# run_lf_lora_sft.sh
-LF_QWEN_MOE_EXPERT_LORA_IMPL=${LF_QWEN_MOE_EXPERT_LORA_IMPL:-custom-peft}
-RUN_ENV+=(
-  LF_QWEN_MOE_EXPERT_LORA_IMPL="${LF_QWEN_MOE_EXPERT_LORA_IMPL}"
-  ASYM_GEMM_LF_CONFIG_QWEN_EXPERT_LORA_IMPL="${LF_QWEN_MOE_EXPERT_LORA_IMPL}"
-)
-```
-
 ```python
-# run_lf_profiled_train.py
-config["qwen_moe_expert_lora_impl"] = os.environ.get(
-    "ASYM_GEMM_LF_CONFIG_QWEN_EXPERT_LORA_IMPL",
-    os.environ.get("LF_QWEN_MOE_EXPERT_LORA_IMPL", "custom-peft"),
-)
+QWEN_EXPERT_LORA_SPLIT_TARGET_PARAMETERS = "split-target-parameters"
+QWEN_EXPERT_LORA_MODES = {
+    "custom-peft",
+    "peft-target-parameters",
+    "split-target-parameters",
+    "off",
+}
+
+def prepare_qwen_moe_expert_lora_config(model, peft_config, mode, raw_lora_target, resolved_target_modules):
+    mode = normalize(mode)
+    if mode == "off":
+        return peft_config
+    if mode == "peft-target-parameters":
+        _patch_peft_param_wrapper_zero3_shape()
+        return _add_qwen_moe_target_parameters(...)
+    if mode == "split-target-parameters":
+        _patch_peft_param_wrapper_zero3_shape()
+        return _add_qwen_moe_split_target_parameters(...)
+    if mode == "custom-peft":
+        return _add_current_custom_wrapper_for_legacy_debug_only(...)
+    raise ValueError(...)
 ```
 
-Risk and uncertainty:
+Rules:
 
-- If the profile cache key does not include `qwen_moe_expert_lora_impl`, stale artifacts from the other mode can be reused. The completeness check must reject mismatched mode.
-- `peft-target-parameters` requires `lora_dropout=0.0` because PEFT `ParamWrapper` rejects dropout for raw parameter targets. The script should fail early if this mode is requested with nonzero dropout.
+- Default can remain `custom-peft` until Stage 5 proves the new path. After acceptance, default should become `split-target-parameters`.
+- Keep `peft-target-parameters` as the fast stock PEFT A/B baseline.
+- Keep `custom-peft` only as a correctness/debug baseline; do not accept it as the final performance path.
+
+Unresolved risks to watch:
+
+- Existing cached profile rows must not be reused across mode changes. The existing profile completeness check must reject mismatched `qwen_moe_expert_lora_impl`.
 
 Validation before Stage 1:
 
 ```bash
-.venv/bin/python -m pytest -q \
-  tests/lf/test_asym_cpu_adamw_args.py \
-  tests/lf/test_lf_profile_postprocess.py::test_profile_config_records_qwen_expert_lora_impl
+bash -n scripts/lf/profile_lora_lf.sh scripts/lf/run_lf_lora_sft.sh
+.venv/bin/python -m py_compile \
+  scripts/lf/run_lf_profiled_train.py \
+  scripts/lf/postprocess_lf_profile_artifacts.py \
+  /workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/model_utils/fused_moe_lora.py \
+  /workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/adapter.py
 ```
 
-Dry-run or one-step smoke must show two distinct profile rows/artifacts:
+Dry-run sweep:
 
 ```bash
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="zero3_offload|recomp" \
 ASYMM_EXP_ACT_POLICIES="none|false|false|false" \
-LF_EXPERT_LORA_IMPLS="peft-target-parameters,custom-peft" \
+LF_EXPERT_LORA_IMPLS="peft-target-parameters,split-target-parameters,custom-peft" \
 SEQ_LENS=4096 \
 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
 DATASET=asym_long_sft_smoke \
-PREPARE_DATASETS=true \
-DATASET_MIN_TOKENS=4096 \
-DATASET_OVERWRITE=true \
+PREPARE_DATASETS=false \
 LORA_TARGET=all \
 LORA_DROPOUT=0.00 \
 PROFILERS=source \
 WARMUP_STEPS=0 \
 MAX_STEPS=1 \
-RUN_POST=true \
-scripts/lf/profile_lora_lf.sh --gpus 0
+RUN_POST=false \
+DRY_RUN=true \
+PLOT=false \
+PLOT_MEMORY_BREAKDOWN=false \
+scripts/lf/profile_lora_lf.sh --gpus 0 --output-root /tmp/asymgemm_lf_lora_split_dryrun
 ```
 
-## Stage 1 - Implement a PEFT-native Qwen expert LoRA layer
+Required dry-run assertions:
+
+- three run directories are emitted;
+- labels include `qwenexpertsplit-target-parameters`;
+- every command sets `LF_QWEN_MOE_EXPERT_LORA_IMPL`;
+- `peft-target-parameters` still rejects nonzero `LORA_DROPOUT`.
+
+## Stage 1 - Implement a PEFT-style split expert parameter wrapper
 
 Modify:
 
 - `/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/model_utils/fused_moe_lora.py`
-  - Replace `_lf_fused_lora_params`, `_make_fused_lora_params`, `_fused_experts_lora_forward`, and `apply_fused_moe_lora`.
-  - Add class `QwenMoeExpertLoraLayer`.
-  - Add helpers `_is_qwen_fused_experts_module`, `_qwen_expert_dims`, `prepare_qwen_moe_expert_lora_config`, `infer_qwen_expert_lora_impl`, `count_qwen_moe_expert_lora`.
-  - Add stock-PEFT helper `_add_qwen_moe_target_parameters` for the A/B mode.
+  - add class `QwenSplitMoeExpertParamWrapper`
+  - add helper `_LoraParameterProxy` import or local equivalent
+  - add helper `_split_expert_param_shape`
+  - add helper `_selected_qwen_expert_module_names` reuse
+  - add helper `_add_qwen_moe_split_target_parameters`
+  - do not modify Qwen model source files
 
-Implementation:
+Design:
 
-```python
-def _is_qwen_fused_experts_module(module):
-    gate_up = getattr(module, "gate_up_proj", None)
-    down = getattr(module, "down_proj", None)
-    return (
-        isinstance(gate_up, torch.Tensor)
-        and isinstance(down, torch.Tensor)
-        and gate_up.ndim == 3
-        and down.ndim == 3
-        and gate_up.shape[0] == down.shape[0]      # E
-        and gate_up.shape[1] == 2 * down.shape[2]  # 2I
-        and gate_up.shape[2] == down.shape[1]      # H
-        and hasattr(module, "act_fn")
-        and hasattr(module, "num_experts")
-    )
+- Follow PEFT `ParamWrapper` structure, not the current `QwenMoeExpertLoraLayer`.
+- The wrapper must wrap the existing Qwen experts module and call `self.base_layer(...)`.
+- The wrapper owns split gate/up/down LoRA tensors, but only materializes full parameter deltas:
+  - `delta_gate_up` for `gate_up_proj [E, 2I, H]`
+  - `delta_down` for `down_proj [E, H, I]`
+- Runtime must preserve original Qwen expert forward and therefore preserve Transformers `grouped_mm`.
 
-def _qwen_expert_dims(module):
-    gate_up = module.gate_up_proj
-    down = module.down_proj
-    experts = int(gate_up.shape[0])
-    intermediate = int(down.shape[2])
-    hidden = int(down.shape[1])
-    return experts, hidden, intermediate
-```
+Concrete class shape:
 
 ```python
-class QwenMoeExpertLoraLayer(nn.Module, LoraLayer):
+class QwenSplitMoeExpertParamWrapper(nn.Module, LoraLayer):
     adapter_layer_names = (
         "lora_gate_A", "lora_gate_B",
         "lora_up_A", "lora_up_B",
         "lora_down_A", "lora_down_B",
     )
+    parameter_names = ("gate_up_proj", "down_proj")
 
     def __init__(
         self,
         base_layer,
         adapter_name,
-        r=0,
-        lora_alpha=1,
+        r,
+        lora_alpha,
+        config=None,
         lora_dropout=0.0,
         init_lora_weights=True,
         use_rslora=False,
@@ -214,114 +181,138 @@ class QwenMoeExpertLoraLayer(nn.Module, LoraLayer):
         lora_bias=False,
         **kwargs,
     ):
-        if use_dora or lora_bias:
-            raise ValueError("QwenMoeExpertLoraLayer supports vanilla LoRA only")
-        if not _is_qwen_fused_experts_module(base_layer):
-            raise TypeError("expected Qwen fused MoE experts module")
-
         nn.Module.__init__(self)
         LoraLayer.__init__(self, base_layer, **kwargs)
+        validate_qwen_fused_experts(base_layer)
+        reject lora_dropout != 0, fan_in_fan_out, use_dora, lora_bias
         self.experts, self.hidden_size, self.intermediate_size = _qwen_expert_dims(base_layer)
         self._active_adapter = adapter_name
-
-        self.lora_gate_A = nn.ParameterDict()
-        self.lora_gate_B = nn.ParameterDict()
-        self.lora_up_A = nn.ParameterDict()
-        self.lora_up_B = nn.ParameterDict()
-        self.lora_down_A = nn.ParameterDict()
-        self.lora_down_B = nn.ParameterDict()
-
-        self.update_layer(
-            adapter_name,
-            r,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            init_lora_weights=init_lora_weights,
-            use_rslora=use_rslora,
-        )
+        create ParameterDicts
+        self.update_layer(...)
 ```
 
+Parameter shapes:
+
 ```python
-def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, **_):
-    if r <= 0:
-        raise ValueError("r must be positive")
+# gate/up LoRA, separate rank-r paths
+lora_gate_A[adapter]: [E, r, H]
+lora_gate_B[adapter]: [E, I, r]
+lora_up_A[adapter]:   [E, r, H]
+lora_up_B[adapter]:   [E, I, r]
 
-    E, H, I = self.experts, self.hidden_size, self.intermediate_size
-    dtype = self.base_layer.gate_up_proj.dtype
-    device = self.base_layer.gate_up_proj.device
-
-    self.r[adapter_name] = r
-    self.lora_alpha[adapter_name] = lora_alpha
-    self.scaling[adapter_name] = lora_alpha / math.sqrt(r) if use_rslora else lora_alpha / r
-    self.use_rslora[adapter_name] = use_rslora
-    self.lora_dropout[adapter_name] = nn.Dropout(lora_dropout) if lora_dropout > 0 else nn.Identity()
-
-    self.lora_gate_A[adapter_name] = nn.Parameter(torch.empty(E, r, H, dtype=dtype, device=device))
-    self.lora_gate_B[adapter_name] = nn.Parameter(torch.zeros(E, I, r, dtype=dtype, device=device))
-    self.lora_up_A[adapter_name] = nn.Parameter(torch.empty(E, r, H, dtype=dtype, device=device))
-    self.lora_up_B[adapter_name] = nn.Parameter(torch.zeros(E, I, r, dtype=dtype, device=device))
-    self.lora_down_A[adapter_name] = nn.Parameter(torch.empty(E, r, I, dtype=dtype, device=device))
-    self.lora_down_B[adapter_name] = nn.Parameter(torch.zeros(E, H, r, dtype=dtype, device=device))
-
-    if init_lora_weights is True:
-        for A in (self.lora_gate_A, self.lora_up_A, self.lora_down_A):
-            nn.init.kaiming_uniform_(A[adapter_name].view(E * r, -1), a=math.sqrt(5))
-    elif init_lora_weights in (False, None):
-        pass
-    else:
-        raise ValueError("only default LoRA init is supported for Qwen expert LoRA")
-
-    self._move_adapter_to_device_of_base_layer(adapter_name)
-    self.set_adapter(self.active_adapters, inference_mode=False)
+# down LoRA
+lora_down_A[adapter]: [E, r, I]
+lora_down_B[adapter]: [E, H, r]
 ```
 
+Delta construction:
+
 ```python
-def _lora_linear(self, x, A, B, expert_idx, scale):
-    # x [N, in], A[e] [r, in], B[e] [out, r]
-    return F.linear(F.linear(x, A[expert_idx]), B[expert_idx]) * scale
+def _expert_delta(weight_b, weight_a, scaling):
+    # weight_b [E, O, r], weight_a [E, r, In]
+    return torch.einsum("eor,eri->eoi", weight_b, weight_a) * scaling
 
-def forward(self, hidden_states, top_k_index, top_k_weights):
-    base = self.base_layer
-    final = torch.zeros_like(hidden_states)
+def get_delta_weight(self, adapter_name, parameter_name):
+    if parameter_name == "gate_up_proj":
+        delta_gate = _expert_delta(lora_gate_B[adapter], lora_gate_A[adapter], scale)  # [E,I,H]
+        delta_up = _expert_delta(lora_up_B[adapter], lora_up_A[adapter], scale)        # [E,I,H]
+        delta = torch.cat((delta_gate, delta_up), dim=1)                               # [E,2I,H]
+        param = self.get_base_layer().gate_up_proj
+        return delta.to(device=param.device, dtype=param.dtype)
 
-    with torch.no_grad():
-        expert_mask = F.one_hot(top_k_index, num_classes=int(base.num_experts)).permute(2, 1, 0)
-        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+    if parameter_name == "down_proj":
+        delta = _expert_delta(lora_down_B[adapter], lora_down_A[adapter], scale)       # [E,H,I]
+        param = self.get_base_layer().down_proj
+        return delta.to(device=param.device, dtype=param.dtype)
 
-    for expert_idx in expert_hit:
-        expert_idx = expert_idx[0]
-        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-        x = hidden_states[token_idx]
+    raise ValueError(parameter_name)
+```
 
-        gate, up = F.linear(x, base.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-        for adapter in self.active_adapters:
+Activation:
+
+```python
+@contextmanager
+def _activate_lora(self, active_adapters):
+    if no active split adapters:
+        yield
+        return
+
+    base = self.get_base_layer()
+    registered = []
+    for parameter_name in ("gate_up_proj", "down_proj"):
+        delta_weight = None
+        for adapter in active_adapters:
             if adapter not in self.lora_gate_A:
                 continue
-            x_lora = self.lora_dropout[adapter](x)
-            scale = self.scaling[adapter]
-            gate = gate + self._lora_linear(x_lora, self.lora_gate_A[adapter], self.lora_gate_B[adapter], expert_idx, scale)
-            up = up + self._lora_linear(x_lora, self.lora_up_A[adapter], self.lora_up_B[adapter], expert_idx, scale)
+            candidate = self.get_delta_weight(adapter, parameter_name)
+            delta_weight = candidate if delta_weight is None else delta_weight + candidate
 
-        act = base.act_fn(gate) * up
-        down = F.linear(act, base.down_proj[expert_idx])
-        for adapter in self.active_adapters:
-            if adapter not in self.lora_down_A:
-                continue
-            act_lora = self.lora_dropout[adapter](act)
-            scale = self.scaling[adapter]
-            down = down + self._lora_linear(act_lora, self.lora_down_A[adapter], self.lora_down_B[adapter], expert_idx, scale)
+        if delta_weight is None:
+            continue
 
-        down = down * top_k_weights[token_idx, top_k_pos, None]
-        final.index_add_(0, token_idx, down.to(final.dtype))
+        requires_grad_before = getattr(base, parameter_name).requires_grad
+        nn.utils.parametrize.register_parametrization(
+            base,
+            parameter_name,
+            _LoraParameterProxy(delta_weight),
+        )
+        base.parametrizations[parameter_name].original.requires_grad_(requires_grad_before)
+        registered.append(parameter_name)
 
-    return final
+    try:
+        with nn.utils.parametrize.cached():
+            yield
+    finally:
+        remove only the split LoRA parametrizations registered above
 ```
 
-Risk and uncertainty:
+Forward:
 
-- `merge_and_unload()` is not required for training/profiling, but loading an adapter for merge/export will need `merge`, `unmerge`, and `unload_and_optionally_merge_module`.
-- Custom PEFT module registration is an experimental PEFT API. The implementation must be covered by save/load tests because the wrapper type is not stored in the adapter config.
-- Stock PEFT `target_parameters` is kept only for profiling comparison. It should not replace the corrected custom path unless e2e memory/latency clearly wins and the trainable surface is acceptable.
+```python
+def forward(self, hidden_states, top_k_index, top_k_weights):
+    self._check_forward_args(hidden_states)
+    if self.disable_adapters or self.merged:
+        return self.base_layer(hidden_states, top_k_index, top_k_weights)
+    with self._activate_lora(self.active_adapters):
+        return self.base_layer(hidden_states, top_k_index, top_k_weights)
+```
+
+Merge/unmerge:
+
+```python
+def merge(self, safe_merge=False, adapter_names=None):
+    for adapter in check_adapters_to_merge(...):
+        for parameter_name in ("gate_up_proj", "down_proj"):
+            param = getattr(base, parameter_name)
+            delta = self.get_delta_weight(adapter, parameter_name)
+            if safe_merge:
+                merged = param.data.clone() + delta.to(param.dtype)
+                assert finite
+                param.data = merged
+            else:
+                param.data += delta.to(param.dtype)
+        self.merged_adapters.append(adapter)
+
+def unmerge(self):
+    while self.merged_adapters:
+        adapter = self.merged_adapters.pop()
+        for parameter_name in ("gate_up_proj", "down_proj"):
+            getattr(base, parameter_name).data -= self.get_delta_weight(adapter, parameter_name)
+```
+
+Important implementation rules:
+
+- Do not call `F.linear` inside this wrapper forward.
+- Do not loop over active experts or tokens in wrapper forward.
+- Do not reimplement router/top-k/scatter/index-add behavior.
+- Do not use the current `QwenMoeExpertLoraLayer.forward` as a template.
+- Use PEFT naming conventions (`lora_*`) so adapter save/load keeps working.
+
+Unresolved risks to watch:
+
+- Full delta materialization creates temporary `[E,2I,H]` and `[E,H,I]` tensors per layer. This is the same class of overhead as PEFT `target_parameters`; it should be far cheaper than Python expert loops, but must be measured.
+- Nested parametrization with two parameters on the same module must remove only the wrappers registered by this class, not unrelated parametrizations.
+- ZeRO-3 empty local params require logical `ds_shape` during initialization. Reuse and extend `_tensor_logical_shape`.
 
 Validation before Stage 2:
 
@@ -330,423 +321,296 @@ Validation before Stage 2:
   /workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/model_utils/fused_moe_lora.py
 ```
 
-Add a unit test in `tests/lf/test_asym_cpu_adamw_lf_integration.py` and run:
+Unit tests to add/run:
 
 ```bash
 .venv/bin/python -m pytest -q \
-  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_qwen_moe_expert_lora_layer_registers_peft_native_params
+  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_qwen_split_param_wrapper_shapes_and_trainable_names \
+  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_qwen_split_param_wrapper_delta_shapes \
+  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_qwen_split_param_wrapper_preserves_base_forward_call
 ```
 
 Required assertions:
 
-- one Qwen expert module is wrapped;
-- `E=4,H=16,I=8,r=2` produces `576` expert LoRA params;
-- trainable names include `mlp.experts.lora_gate_A.default` and `mlp.experts.lora_down_B.default`;
-- no trainable names under `.mlp.gate`;
-- `get_peft_model_state_dict(model)` includes six expert LoRA tensor families after adapter-name removal.
-- separate test for `peft-target-parameters` confirms PEFT wraps `mlp.experts.gate_up_proj` and `mlp.experts.down_proj` without creating custom `lora_gate_*` tensors.
+- trainable names include:
+  - `mlp.experts.lora_gate_A.default`
+  - `mlp.experts.lora_up_A.default`
+  - `mlp.experts.lora_down_A.default`
+- no trainable router LoRA under `.mlp.gate`;
+- `get_delta_weight("default", "gate_up_proj").shape == [E, 2I, H]`;
+- `get_delta_weight("default", "down_proj").shape == [E, H, I]`;
+- wrapper forward calls the original base expert module exactly once;
+- wrapper forward does not call the old custom per-expert `_lora_linear`.
 
-## Stage 2 - Wire the wrapper into LF new-adapter creation
+## Stage 2 - Register split wrapper through PEFT-compatible injection
 
 Modify:
 
+- `/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/model_utils/fused_moe_lora.py`
+  - `_add_qwen_moe_split_target_parameters`
+  - `prepare_qwen_moe_expert_lora_config`
+  - `infer_qwen_expert_lora_impl`
 - `/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/adapter.py`
   - `_setup_lora_tuning`
-- `/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/model_utils/fused_moe_lora.py`
-  - `prepare_qwen_moe_expert_lora_config`
-  - `_add_qwen_moe_target_parameters`
-  - `_target_selection_reaches_qwen_experts`
+  - `_load_peft_with_qwen_expert_lora`
+- `tests/lf/test_asym_cpu_adamw_lf_integration.py`
 
-Implementation:
+Preferred registration:
+
+- Use PEFT custom module registration for the Qwen experts module type, but the custom module must be `QwenSplitMoeExpertParamWrapper`.
+- Do not use `target_parameters` for the split wrapper itself because stock PEFT can only create one A/B pair per targeted parameter and cannot express separate gate/up ranks inside one fused `gate_up_proj`.
+- Keep `peft-target-parameters` mode as stock PEFT `target_parameters` for comparison.
+
+Pseudocode:
 
 ```python
-def _target_selection_reaches_qwen_experts(raw_lora_target, resolved_target_modules, expert_module_name):
-    raw = {str(t).lower() for t in (raw_lora_target or [])}
-    resolved = {str(t).lower() for t in (resolved_target_modules or [])}
-    name = expert_module_name.lower()
-    suffix = name.rsplit(".", 1)[-1]
-
-    selectors = raw | resolved
-    if {"all", "all-linear", "all_linear"} & selectors:
-        return True
-    if "experts" in selectors:
-        return True
-    if name in selectors or suffix in selectors:
-        return True
-    if any(name.endswith("." + target) for target in selectors):
-        return True
-    if any(target.endswith(".mlp.experts") or target == "mlp.experts" for target in selectors):
-        return True
-    return False
-
-def _selected_qwen_expert_module_names(model, raw_lora_target, resolved_target_modules):
-    names = []
-    for name, module in model.named_modules():
-        if not _is_qwen_fused_experts_module(module):
-            continue
-        if _target_selection_reaches_qwen_experts(raw_lora_target, resolved_target_modules, name):
-            names.append(name)
-    return names
-
-def _add_qwen_moe_target_parameters(model, peft_config, raw_lora_target, resolved_target_modules):
-    selected_experts = _selected_qwen_expert_module_names(model, raw_lora_target, resolved_target_modules)
-    if not selected_experts:
-        return peft_config
-
-    target_parameters = set(getattr(peft_config, "target_parameters", None) or [])
-    for name in selected_experts:
-        target_parameters.add(f"{name}.gate_up_proj")
-        target_parameters.add(f"{name}.down_proj")
-    peft_config.target_parameters = sorted(target_parameters)
-    _patch_peft_param_wrapper_zero3_shape()
-    return peft_config
-
-def prepare_qwen_moe_expert_lora_config(model, peft_config, mode, raw_lora_target, resolved_target_modules):
-    if mode == "off":
-        return peft_config
-    if mode == "peft-target-parameters":
-        if float(getattr(peft_config, "lora_dropout", 0.0) or 0.0) != 0.0:
-            raise ValueError("peft-target-parameters requires lora_dropout=0.0")
-        return _add_qwen_moe_target_parameters(model, peft_config, raw_lora_target, resolved_target_modules)
-    if mode != "custom-peft":
-        raise ValueError(f"unknown Qwen MoE expert LoRA mode: {mode}")
-
+def _add_qwen_moe_split_target_parameters(model, peft_config, raw_lora_target, resolved_target_modules):
     expert_names = _selected_qwen_expert_module_names(model, raw_lora_target, resolved_target_modules)
+    if not expert_names:
+        logger.info_rank0("Qwen split expert LoRA selected 0 fused expert modules.")
+        return peft_config
+
     custom_types = {}
     for name, module in model.named_modules():
         if name in expert_names:
-            custom_types[type(module)] = QwenMoeExpertLoraLayer
-
-    if not expert_names:
-        return peft_config
+            custom_types[type(module)] = QwenSplitMoeExpertParamWrapper
 
     targets = set(peft_config.target_modules or [])
     targets.update(expert_names)
     peft_config.target_modules = sorted(targets)
     peft_config._register_custom_module(custom_types)
+    logger.info_rank0(
+        f"Qwen split expert LoRA selected {len(expert_names)} fused expert modules."
+    )
     return peft_config
 ```
 
-In `_setup_lora_tuning`, plain LF branch only:
-
-```python
-expert_lora_impl = os.environ.get("LF_QWEN_MOE_EXPERT_LORA_IMPL", "custom-peft")
-peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, **peft_kwargs)
-if finetuning_args.finetuning_type == "lora":
-    from .model_utils.fused_moe_lora import prepare_qwen_moe_expert_lora_config
-    peft_config = prepare_qwen_moe_expert_lora_config(
-        model,
-        peft_config,
-        expert_lora_impl,
-        raw_lora_target=finetuning_args.lora_target,
-        resolved_target_modules=target_modules,
-    )
-model = get_peft_model(model, peft_config)
-```
-
-Delete the old post-wrap manual call:
-
-```python
-from .model_utils.fused_moe_lora import apply_fused_moe_lora
-apply_fused_moe_lora(model, ...)
-```
-
-Do not change `use_asym_gemm` or `use_kt` paths in this stage.
-
-Risk and uncertainty:
-
-- `find_all_linear_modules` still intentionally skips routers and fused expert tensor modules. The wrapper must add only Qwen fused expert modules that the raw or resolved target selection actually requested.
-- PEFT may warn that the custom module type is unsupported. That is expected when using custom dispatch and should not fail tests.
-- `peft-target-parameters` and `custom-peft` are not mathematically identical. The profile artifact must record the mode and expert parameter count so memory/latency differences are interpretable.
-- Explicit non-expert targets such as `q_proj,v_proj` must not attach expert LoRA.
-- Under ZeRO-3, target parameter names must be exact full names from `model.named_modules()`. Suffix-only names such as `mlp.experts.gate_up_proj` are not sufficient for the accepted path.
-
-Validation before Stage 3:
-
-```bash
-.venv/bin/python -m pytest -q \
-  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_lf_plain_lora_all_adapter_adds_qwen3_fused_expert_lora \
-  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_lf_peft_lora_all_does_not_add_adapter_to_qwen_moe_routers \
-  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_lf_qwen_moe_expert_lora_mode_peft_target_parameters \
-  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_lf_qwen_moe_expert_lora_target_experts_uses_custom_wrapper \
-  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_lf_qwen_moe_expert_lora_non_expert_target_does_not_wrap_experts
-```
-
-Update expected names to the PEFT-native wrapper names:
-
-```text
-mlp.experts.lora_gate_A.default
-mlp.experts.lora_gate_B.default
-mlp.experts.lora_up_A.default
-mlp.experts.lora_up_B.default
-mlp.experts.lora_down_A.default
-mlp.experts.lora_down_B.default
-```
-
-## Stage 3 - Prove expert forward and backward correctness
-
-Modify:
-
-- `tests/lf/test_asym_cpu_adamw_lf_integration.py`
-  - add `test_lf_qwen_moe_expert_lora_forward_matches_manual_reference`
-  - add `test_lf_qwen_moe_expert_lora_backward_updates_expert_lora_params`
-
-Implementation:
-
-```python
-def manual_expert_reference(layer, hidden, top_k_index, top_k_weights):
-    final = zeros_like(hidden)
-    for expert e used by top_k_index:
-        x = hidden[token_idx]
-        gate, up = linear(x, base.gate_up_proj[e]).chunk(2, -1)
-        gate += linear(linear(x, layer.lora_gate_A["default"][e]), layer.lora_gate_B["default"][e]) * scale
-        up += linear(linear(x, layer.lora_up_A["default"][e]), layer.lora_up_B["default"][e]) * scale
-        act = base.act_fn(gate) * up
-        down = linear(act, base.down_proj[e])
-        down += linear(linear(act, layer.lora_down_A["default"][e]), layer.lora_down_B["default"][e]) * scale
-        final.index_add_(0, token_idx, down * top_k_weights[token_idx, top_k_pos, None])
-    return final
-```
-
-Forward test:
-
-```python
-model = tiny Qwen3MoeForCausalLM wrapped through _setup_lora_tuning(lora_target=["all"])
-layer = model.base_model.model.model.layers[0].mlp.experts
-fill all six expert LoRA tensors with deterministic nonzero values
-hidden = torch.randn(M, H)
-top_k_index = tensor covering all experts
-top_k_weights = normalized weights
-assert_allclose(layer(hidden, top_k_index, top_k_weights), manual_expert_reference(...))
-```
-
-Backward test:
-
-```python
-set all lora_B tensors nonzero so lora_A gradients are observable on first backward
-out = layer(hidden.requires_grad_(), top_k_index, top_k_weights)
-loss = out.square().mean()
-loss.backward()
-for each of lora_gate_A/B, lora_up_A/B, lora_down_A/B:
-    assert grad is finite
-    assert grad.abs().sum() > 0
-```
-
-Risk and uncertainty:
-
-- With zero-initialized LoRA-B, LoRA-A gradients can be zero on the first backward. Tests must set LoRA-B nonzero or run two optimizer steps.
-- Router-driven full-model tests can miss experts. Use direct expert-module tests with fixed `top_k_index` for correctness.
-
-Validation before Stage 4:
-
-```bash
-.venv/bin/python -m pytest -q \
-  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_lf_qwen_moe_expert_lora_forward_matches_manual_reference \
-  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_lf_qwen_moe_expert_lora_backward_updates_expert_lora_params
-```
-
-## Stage 4 - Fix PEFT adapter save/load and resume
-
-Modify:
-
-- `/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/adapter.py`
-  - `adapter_to_resume` branch in `_setup_lora_tuning`
-  - `adapter_to_merge` branch in `_setup_lora_tuning`
-- `tests/lf/test_asym_cpu_adamw_lf_integration.py`
-  - add `test_lf_qwen_moe_expert_lora_save_load_roundtrip`
-
-Implementation:
+Adapter load/resume:
 
 ```python
 def infer_qwen_expert_lora_impl(peft_config, requested_mode="auto"):
     if requested_mode != "auto":
         return requested_mode
-    target_parameters = set(getattr(peft_config, "target_parameters", None) or [])
-    if {"mlp.experts.gate_up_proj", "mlp.experts.down_proj"} & target_parameters:
+    target_modules = set(peft_config.target_modules or [])
+    target_parameters = set(peft_config.target_parameters or [])
+    if adapter state/config contains lora_gate_A/lora_up_A/lora_down_A:
+        return "split-target-parameters"
+    if any(target endswith "gate_up_proj" for target in target_parameters):
         return "peft-target-parameters"
-    targets = set(getattr(peft_config, "target_modules", None) or [])
-    if any(
-        str(target).endswith(".mlp.experts") or str(target) in {"experts", "mlp.experts"}
-        for target in targets
-    ):
-        return "custom-peft"
+    if any(target endswith ".mlp.experts" or target == "experts" for target in target_modules):
+        return "split-target-parameters"
     return "off"
-
-def load_peft_with_qwen_expert_lora(base_model, adapter_path, is_trainable, init_kwargs, requested_mode="auto"):
-    from peft import PeftConfig, PeftModel
-    from .model_utils.fused_moe_lora import (
-        infer_qwen_expert_lora_impl,
-        prepare_qwen_moe_expert_lora_config,
-    )
-
-    peft_config = PeftConfig.from_pretrained(adapter_path, **init_kwargs)
-    if getattr(peft_config, "peft_type", None).value == "LORA":
-        mode = infer_qwen_expert_lora_impl(peft_config, requested_mode)
-        saved_targets = getattr(peft_config, "target_modules", None) or []
-        peft_config = prepare_qwen_moe_expert_lora_config(
-            base_model,
-            peft_config,
-            mode,
-            raw_lora_target=saved_targets,
-            resolved_target_modules=saved_targets,
-        )
-    return PeftModel.from_pretrained(
-        base_model,
-        adapter_path,
-        is_trainable=is_trainable,
-        config=peft_config,
-        **init_kwargs,
-    )
 ```
 
-Use this helper for:
+Rules:
+
+- New adapters with `LF_QWEN_MOE_EXPERT_LORA_IMPL=split-target-parameters` use `QwenSplitMoeExpertParamWrapper`.
+- Resuming an adapter must re-register the split wrapper before `PeftModel.from_pretrained`.
+- Do not silently load split-wrapper adapter state into stock `ParamWrapper`; tensor names and math differ.
+
+Unresolved risks to watch:
+
+- PEFT config alone may not distinguish old `custom-peft` from new `split-target-parameters` if both target the same module names. Use adapter state key detection when loading from disk.
+- If PEFT custom module registration passes a newer `config=` kwarg instead of old individual kwargs, support both forms.
+
+Validation before Stage 3:
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_lf_plain_lora_all_uses_qwen_split_param_wrapper \
+  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_lf_qwen_split_param_wrapper_respects_explicit_experts_target \
+  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_lf_qwen_split_param_wrapper_non_expert_target_does_not_wrap_experts \
+  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_lf_qwen_split_param_wrapper_auto_load_registers_custom_module
+```
+
+Required assertions:
+
+- `lora_target=all` wraps all 48 Qwen3 fused expert modules on the full model or all expert modules in a tiny model;
+- explicit `LORA_TARGET=q_proj,v_proj` does not wrap experts;
+- explicit `LORA_TARGET=experts` wraps experts;
+- adapter reload finds split wrapper tensors and restores them.
+
+## Stage 3 - Prove math equivalence without losing grouped expert dispatch
+
+Modify:
+
+- `tests/lf/test_asym_cpu_adamw_lf_integration.py`
+  - add direct math/reference tests
+- Optional isolated debug script only if needed:
+  - `scripts/lf/debug_qwen_split_lora_wrapper.py`
+
+Reference math:
 
 ```python
-requested_mode = os.environ.get("LF_QWEN_MOE_EXPERT_LORA_IMPL", "auto")
-model = load_peft_with_qwen_expert_lora(model, adapter_to_resume, is_trainable, init_kwargs, requested_mode)
-model = load_peft_with_qwen_expert_lora(model, adapter, False, init_kwargs, requested_mode).merge_and_unload()
+delta_gate[e] = lora_gate_B[e] @ lora_gate_A[e]      # [I,H]
+delta_up[e]   = lora_up_B[e]   @ lora_up_A[e]        # [I,H]
+delta_down[e] = lora_down_B[e] @ lora_down_A[e]      # [H,I]
+
+gate_up_eff = gate_up_proj + cat(delta_gate, delta_up, dim=1)
+down_eff = down_proj + delta_down
+
+expected = original_qwen_experts_forward_with_parametrized_weights(
+    hidden_states,
+    top_k_index,
+    top_k_weights,
+)
 ```
 
-Save/load test:
+Tests:
 
 ```python
-model_a = tiny Qwen3 lora_target=all model
-fill expert LoRA params with deterministic values
-model_a.save_pretrained(tmpdir)
+def test_qwen_split_param_wrapper_forward_matches_manual_parametrized_reference():
+    build tiny Qwen experts module
+    build QwenSplitMoeExpertParamWrapper
+    set nonzero deterministic LoRA tensors
+    run wrapper(hidden, top_k_index, top_k_weights)
+    manually add full delta to cloned base weights
+    run base(hidden, top_k_index, top_k_weights)
+    assert_allclose
 
-model_b = fresh tiny Qwen3 base
-model_b = load_peft_with_qwen_expert_lora(model_b, tmpdir, is_trainable=True, init_kwargs={}, requested_mode="auto")
+def test_qwen_split_param_wrapper_backward_updates_all_six_lora_families():
+    set B tensors nonzero so A gradients are visible on first backward
+    loss = wrapper(...).float().square().mean()
+    loss.backward()
+    assert finite nonzero grads for gate/up/down A and B
 
-assert six expert LoRA tensor families exist in model_b
-assert saved and loaded tensors match exactly
-assert logits match for fixed input_ids
+def test_qwen_split_param_wrapper_preserves_grouped_mm_dispatch():
+    monkeypatch base.config._experts_implementation = "grouped_mm"
+    monkeypatch transformers.integrations.moe.grouped_mm_experts_forward counter
+    wrapper(...)
+    assert grouped_mm path was called
 ```
 
-Risk and uncertainty:
+Unresolved risks to watch:
 
-- Old `_lf_fused_lora_params` checkpoints will not load through this new path unless a migration mapper is added. Treat this as a legacy checkpoint migration, not part of the new accepted path.
-- `merge_and_unload()` remains a watch item until Stage 1 adds merge methods. If merge is not required for profiling, defer export merge support.
-- `auto` mode inference is based on saved PEFT config. If a custom adapter config does not retain full expert module target names, pass `LF_QWEN_MOE_EXPERT_LORA_IMPL=custom-peft` explicitly during resume.
+- Monkeypatching `grouped_mm_experts_forward` may not catch dispatch if the interface stores the function before patching. If so, validate by setting `config._experts_implementation="eager"` versus `"grouped_mm"` in a timing smoke, and assert the wrapper does not alter `base.config._experts_implementation`.
+- Numerical comparison must use `lora_dropout=0.0`; dropout is unsupported for PEFT parameter-style expert LoRA.
+
+Validation before Stage 4:
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_qwen_split_param_wrapper_forward_matches_manual_parametrized_reference \
+  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_qwen_split_param_wrapper_backward_updates_all_six_lora_families \
+  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_qwen_split_param_wrapper_preserves_grouped_mm_dispatch
+```
+
+Run existing LF integration group:
+
+```bash
+.venv/bin/python -m pytest -q tests/lf/test_asym_cpu_adamw_lf_integration.py
+```
+
+## Stage 4 - Update counters, save/load, and postprocess for the accepted split path
+
+Modify:
+
+- `/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/model_utils/fused_moe_lora.py`
+  - `count_qwen_moe_expert_lora`
+  - `count_fused_moe_lora`
+- `/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/adapter.py`
+  - `_maybe_write_lora_surface_sidecar`
+  - `_load_peft_with_qwen_expert_lora`
+- `scripts/lf/run_lf_profiled_train.py`
+  - `_lora_counters_from_model`
+  - sidecar merge logic
+  - optimizer memory preflight
+- `scripts/lf/run_lf_lora_sft.sh`
+  - source-profile gate
+- `scripts/lf/postprocess_lf_profile_artifacts.py`
+  - summary rows
+- `tests/lf/test_lf_profile_postprocess.py`
+
+Counter rules:
+
+```text
+split-target-parameters:
+  qwen_moe_expert_lora_impl == "split-target-parameters"
+  qwen_moe_expert_lora_modules == number of wrapped expert modules
+  qwen_moe_expert_lora_tensors == modules * 6
+  qwen_moe_expert_lora_parameters == split gate/up/down expert parameter total
+  peft_expert_lora_parameters == qwen_moe_expert_lora_parameters
+  lf_fused_expert_lora_parameters == 0
+
+peft-target-parameters:
+  qwen_moe_expert_lora_impl == "peft-target-parameters"
+  qwen_moe_expert_lora_parameters == 0
+  peft_expert_lora_parameters == stock PEFT target_parameters expert total
+
+custom-peft:
+  keep counted for debug only, but mark performance-rejected in docs/status
+```
+
+Sidecar:
+
+```python
+sidecar = {
+    "qwen_moe_expert_lora_impl": mode,
+    "qwen_moe_expert_lora_modules": modules,
+    "qwen_moe_expert_lora_tensors": tensors,
+    "qwen_moe_expert_lora_parameters": params,
+    "peft_expert_lora_parameters": params,
+    "peft_lora_parameters": total_lora_params,
+    "trainable_parameters": trainable_params,
+}
+```
+
+Save/load validation:
+
+```python
+model = tiny Qwen3 + split wrapper
+fill six LoRA families deterministically
+model.save_pretrained(tmpdir)
+loaded = load_peft_with_qwen_expert_lora(base_model, tmpdir, requested_mode="auto")
+assert all six tensor families exist
+assert state tensors match
+assert forward output matches before save
+```
+
+Unresolved risks to watch:
+
+- `get_peft_model_state_dict` key format may strip adapter names differently from direct `state_dict`. Tests must verify the actual saved adapter files, not only in-memory keys.
+- ZeRO-3 partitioned model views can report zero local `numel`; sidecar counters must use logical `ds_numel` where available.
 
 Validation before Stage 5:
 
 ```bash
 .venv/bin/python -m pytest -q \
-  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_lf_qwen_moe_expert_lora_save_load_roundtrip \
-  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_lf_qwen_moe_expert_lora_peft_target_parameters_save_load_roundtrip
+  tests/lf/test_asym_cpu_adamw_lf_integration.py::test_qwen_split_param_wrapper_save_load_roundtrip \
+  tests/lf/test_lf_profile_postprocess.py::test_lora_counters_count_qwen_split_param_wrapper \
+  tests/lf/test_lf_profile_postprocess.py::test_lora_counters_use_sidecar_when_split_wrapper_model_view_is_partitioned \
+  tests/lf/test_lf_profile_postprocess.py::test_source_summary_labels_split_target_parameters
 ```
 
-## Stage 5 - Update profiling counters and surface checks
-
-Modify:
-
-- `scripts/lf/run_lf_profiled_train.py`
-  - `_collect_lora_summary`
-  - source-profile config payload
-- `scripts/lf/postprocess_lf_profile_artifacts.py`
-  - trainable-surface summary logic
-- `scripts/lf/run_lf_lora_sft.sh`
-  - source-ok surface validation
-- `tests/lf/test_lf_profile_postprocess.py`
-
-Implementation:
-
-```python
-def is_peft_lora_name(name):
-    return ".lora_" in name or "lora_" in name
-
-def is_expert_lora_name(name):
-    lowered = name.lower()
-    return is_peft_lora_name(name) and any(marker in lowered for marker in (
-        ".experts.",
-        ".expert.",
-        ".shared_expert",
-        "shared_experts",
-        "block_sparse_moe",
-        "moe.experts",
-    ))
-```
-
-Expected new profile counters:
-
-```text
-custom-peft:
-  qwen_moe_expert_lora_impl == "custom-peft"
-  peft_expert_lora_parameters > 0
-  peft_expert_lora_tensors includes lora_gate/up/down A/B tensors
-  lf_fused_expert_lora_parameters == 0
-  expert_lora_parameters == peft_expert_lora_parameters
-
-peft-target-parameters:
-  qwen_moe_expert_lora_impl == "peft-target-parameters"
-  peft_expert_lora_parameters > 0
-  peft_expert_lora_tensors includes PEFT ParamWrapper lora_A/lora_B tensors
-  lf_fused_expert_lora_parameters == 0
-  expert_lora_parameters == peft_expert_lora_parameters
-```
-
-AsymGEMM parity counters:
-
-```text
-asym_cpuadamwds/asym custom backend:
-  kt_expert_lora_parameters or kt_fused_expert_lora_parameters records AsymGEMM/KT-style MoE LoRA params
-
-LF custom-peft:
-  peft_expert_lora_parameters records the Torch PEFT-compatible MoE LoRA params
-
-Required equality:
-  LF custom-peft peft_expert_lora_parameters == AsymGEMM expert_lora_parameters
-```
-
-Keep `_lf_fused_lora_params` counting only as legacy detection. It must not be the accepted new LF expert LoRA path.
-
-Risk and uncertainty:
-
-- The broader `lora_` counter must not accidentally count non-LoRA metadata. Count only trainable `nn.Parameter`s.
-- Postprocess tests currently expect old `LF fused expert LoRA` wording. Update wording to `PEFT expert LoRA`.
-- Postprocess output must group or label rows by `qwen_moe_expert_lora_impl`; otherwise A/B memory/timing rows are ambiguous.
-- The profile summary must expose enough fields to compare MoE-block LoRA trainable params across AsymGEMM and LF custom-peft.
-
-Validation before Stage 6:
+Then:
 
 ```bash
 .venv/bin/python -m pytest -q \
-  tests/lf/test_lf_profile_postprocess.py::test_lora_counters_count_peft_expert_lora_by_parameter_name \
-  tests/lf/test_lf_profile_postprocess.py::test_source_summary_flags_peft_attention_plus_expert_surface \
-  tests/lf/test_lf_profile_postprocess.py::test_profile_summary_keeps_qwen_expert_lora_impl_in_rows \
-  tests/lf/test_lf_profile_postprocess.py::test_profile_summary_compares_asym_and_lf_expert_lora_params
+  tests/lf/test_asym_cpu_adamw_args.py \
+  tests/lf/test_lf_profile_postprocess.py \
+  tests/lf/test_asym_cpu_adamw_lf_integration.py
 ```
 
-Then run the local unit group:
-
-```bash
-.venv/bin/python -m pytest -q \
-  tests/lf/test_asym_cpu_adamw_lf_integration.py \
-  tests/lf/test_lf_profile_postprocess.py
-```
-
-## Stage 6 - Validate with real LF/ZeRO profiling
+## Stage 5 - Run real Qwen3/ZeRO A/B profiling and decide acceptance
 
 Modify:
 
-- No model-code edits unless Stage 6 exposes a bug.
-- Use `scripts/lf/profile_lora_lf.sh` artifacts to compare `peft-target-parameters` against `custom-peft` on the same workload.
-- Also include an AsymGEMM row so the MoE expert-LoRA trainable parameter count can be compared against LF `custom-peft`.
-- This stage is required before accepting the LF expert-LoRA correction because the user-facing question is memory/latency, not only correctness.
+- No model-code edits unless profiling exposes a correctness or performance bug.
+- Update this doc and `agent/status.md` with accepted measured rows.
 
-Smoke validation:
+Smoke profile:
 
 ```bash
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
-BACKEND_SPECS="asym_cpuadamwds|norecomp,zero3_offload|recomp" \
+BACKEND_SPECS="zero3_offload|recomp" \
 ASYMM_EXP_ACT_POLICIES="none|false|false|false" \
-LF_EXPERT_LORA_IMPLS="peft-target-parameters,custom-peft" \
+LF_EXPERT_LORA_IMPLS="peft-target-parameters,split-target-parameters,custom-peft" \
 SEQ_LENS=4096 \
 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
 DATASET=asym_long_sft_smoke \
 PREPARE_DATASETS=true \
 DATASET_MIN_TOKENS=4096 \
-DATASET_OVERWRITE=true \
+DATASET_OVERWRITE=false \
 LORA_TARGET=all \
 LORA_DROPOUT=0.00 \
 PROFILERS=source \
@@ -755,23 +619,27 @@ PROFILE_MEMORY_BREAKDOWN=false \
 PROFILE_MEMORY_SNAPSHOT=false \
 WARMUP_STEPS=1 \
 MAX_STEPS=2 \
-RUN_POST=true \
-scripts/lf/profile_lora_lf.sh --gpus 0
+RUN_POST=false \
+PLOT=false \
+PLOT_MEMORY_BREAKDOWN=false \
+CONTINUE_ON_ERROR=false \
+OVERWRITE=true \
+scripts/lf/profile_lora_lf.sh --gpus 0 --output-root profiling/lf_lora_split_smoke
 ```
 
-Acceptance validation:
+Acceptance profile:
 
 ```bash
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
-BACKEND_SPECS="asym_cpuadamwds|norecomp,zero3_offload|recomp" \
+BACKEND_SPECS="zero3_offload|recomp" \
 ASYMM_EXP_ACT_POLICIES="none|false|false|false" \
-LF_EXPERT_LORA_IMPLS="peft-target-parameters,custom-peft" \
+LF_EXPERT_LORA_IMPLS="peft-target-parameters,split-target-parameters,custom-peft" \
 SEQ_LENS=4096 \
 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
 DATASET=asym_long_sft_smoke \
 PREPARE_DATASETS=true \
 DATASET_MIN_TOKENS=4096 \
-DATASET_OVERWRITE=true \
+DATASET_OVERWRITE=false \
 LORA_TARGET=all \
 LORA_DROPOUT=0.00 \
 PROFILERS=source \
@@ -780,52 +648,98 @@ PROFILE_MEMORY_BREAKDOWN=false \
 PROFILE_MEMORY_SNAPSHOT=false \
 WARMUP_STEPS=5 \
 MAX_STEPS=10 \
-RUN_POST=true \
-scripts/lf/profile_lora_lf.sh --gpus 0
+RUN_POST=false \
+PLOT=false \
+PLOT_MEMORY_BREAKDOWN=false \
+CONTINUE_ON_ERROR=false \
+OVERWRITE=true \
+scripts/lf/profile_lora_lf.sh --gpus 0 --output-root profiling/lf_lora_split_accept
 ```
 
-After the run, postprocess must produce both required tables from the generated artifacts. If `RUN_POST=true` does not already emit them, update `scripts/lf/postprocess_lf_profile_artifacts.py` to emit:
+Required result table:
 
-```text
-Table 1: MoE LoRA trainable parameter parity
-Table 2: LF expert-LoRA before/after HBM and timing
+| backend spec | qwen expert LoRA impl | peak allocated HBM | peak reserved HBM | avg step | avg forward | avg backward | trainable params | expert LoRA params | loss max/last/train |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `zero3_offload|recomp` | `peft-target-parameters` | artifact | artifact | artifact | artifact | artifact | `2,570,059,776` expected | `2,516,582,400` expected | artifact |
+| `zero3_offload|recomp` | `split-target-parameters` | artifact | artifact | artifact | artifact | artifact | `3,375,366,144` expected | `3,321,888,768` expected | artifact |
+| `zero3_offload|recomp` | `custom-peft` | artifact | artifact | artifact | artifact | artifact | `3,375,366,144` expected | `3,321,888,768` expected | artifact |
+
+Acceptance checks:
+
+- `split-target-parameters` has `reference_fallback_count == 0`.
+- losses are finite and in the same range as the A/B rows.
+- `split-target-parameters` expert LoRA params equal `3,321,888,768`.
+- `split-target-parameters` total trainable params equal `3,375,366,144`.
+- `split-target-parameters` avg step is close to `peft-target-parameters`, not close to current `custom-peft`.
+- peak HBM remains close to the existing ZeRO rows; no meaningful memory regression is accepted.
+- if latency is materially worse than `peft-target-parameters`, inspect whether grouped expert dispatch was lost before accepting.
+
+Unresolved risks to watch:
+
+- Full delta materialization may make `split-target-parameters` slightly slower than stock PEFT because it materializes two deltas for fused gate/up before concatenating. That is acceptable only if the overhead is small relative to the corrected trainable surface.
+- If `split-target-parameters` still lands near `custom-peft` timing, the implementation likely still replaces or bypasses the Qwen expert grouped path and must be rejected.
+
+## Stage 6 - Promote the new mode only after acceptance
+
+Modify after Stage 5 passes:
+
+- `/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/model_utils/fused_moe_lora.py`
+  - make `QWEN_EXPERT_LORA_SPLIT_TARGET_PARAMETERS` the default corrected mode
+  - keep `custom-peft` behind explicit mode only
+- `/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/adapter.py`
+  - default env fallback becomes `split-target-parameters`
+- `scripts/lf/profile_lora_lf.sh`
+  - default `LF_EXPERT_LORA_IMPLS=split-target-parameters`
+- `scripts/lf/run_lf_lora_sft.sh`
+  - default `LF_QWEN_MOE_EXPERT_LORA_IMPL=split-target-parameters`
+- `agent/status.md`
+  - record accepted table
+
+Implementation:
+
+```python
+QWEN_EXPERT_LORA_DEFAULT = QWEN_EXPERT_LORA_SPLIT_TARGET_PARAMETERS
+
+def _get_qwen_moe_expert_lora_impl(default=QWEN_EXPERT_LORA_DEFAULT):
+    return os.environ.get("LF_QWEN_MOE_EXPERT_LORA_IMPL", default).strip().lower()
 ```
 
-Acceptance checks from artifacts:
+Validation:
 
-- `reference_fallback_count == 0`
-- finite stable loss
-- `lora_target == "all"`
-- comparable LF rows exist for `qwen_moe_expert_lora_impl in {"peft-target-parameters", "custom-peft"}`
-- an AsymGEMM row exists for the same model/rank/workload
-- LF rows have `peft_expert_lora_parameters > 0`
-- LF rows have `lf_fused_expert_lora_parameters == 0`
-- LF `custom-peft` expert LoRA trainable count equals AsymGEMM MoE expert LoRA trainable count
-- no trainable router LoRA under `.mlp.gate`
-- no missing/unexpected expert LoRA keys in save/load validation
-- peak HBM and timing are recorded in the same table format used by prior `profile_lora_lf.sh` comparisons
-- final report must include Table 1, MoE-block LoRA trainable parameter comparison:
-  - `backend spec`
-  - `qwen_moe_expert_lora_impl`
-  - `trainable_parameters`
-  - `expert_lora_parameters`
-  - `peft_expert_lora_parameters`
-  - `kt_expert_lora_parameters`
-  - `kt_fused_expert_lora_parameters`
-  - `lf_fused_expert_lora_parameters`
-  - `matches_asym_expert_lora_params`
-- final report must include Table 2, LF before/after memory and timing comparison:
-  - `backend spec`
-  - `qwen_moe_expert_lora_impl`
-  - `peak allocated HBM`
-  - `peak reserved HBM`
-  - `avg step`
-  - `avg forward`
-  - `avg backward`
-  - `peft_expert_lora_parameters`
-  - `loss max/last/train`
+```bash
+.venv/bin/python -m pytest -q \
+  tests/lf/test_asym_cpu_adamw_args.py \
+  tests/lf/test_lf_profile_postprocess.py \
+  tests/lf/test_asym_cpu_adamw_lf_integration.py
+```
 
-Risk and uncertainty:
+One final default-mode smoke:
 
-- This correction may change ZeRO memory/timing because it changes how expert LoRA is represented and saved. Accept `custom-peft` as the default only if it matches AsymGEMM MoE expert trainable parameter count and does not create a meaningful profiling regression versus `peft-target-parameters`.
-- If `peft-target-parameters` is faster/lower-memory but has the wrong gate/up math, keep it as an explicit A/B baseline, not the default corrected behavior.
+```bash
+MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
+BACKEND_SPECS="zero3_offload|recomp" \
+ASYMM_EXP_ACT_POLICIES="none|false|false|false" \
+SEQ_LENS=4096 \
+PER_DEVICE_TRAIN_BATCH_SIZE=4 \
+DATASET=asym_long_sft_smoke \
+PREPARE_DATASETS=false \
+LORA_TARGET=all \
+LORA_DROPOUT=0.00 \
+PROFILERS=source \
+WARMUP_STEPS=1 \
+MAX_STEPS=1 \
+RUN_POST=false \
+PLOT=false \
+PLOT_MEMORY_BREAKDOWN=false \
+CONTINUE_ON_ERROR=false \
+OVERWRITE=true \
+scripts/lf/profile_lora_lf.sh --gpus 0 --output-root profiling/lf_lora_split_default_smoke
+```
+
+Required final state:
+
+- default row records `qwen_moe_expert_lora_impl == "split-target-parameters"`;
+- expert LoRA param count matches `3,321,888,768`;
+- source-profile surface gate passes;
+- no trainable router LoRA;
+- no stale `custom-peft` default remains in scripts.

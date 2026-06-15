@@ -225,6 +225,24 @@ def _safe_int(value: Any) -> int | None:
     return result
 
 
+def _lora_surface_sidecar() -> dict[str, Any] | None:
+    explicit_path = os.environ.get("ASYM_GEMM_LF_LORA_SURFACE_JSON", "").strip()
+    source_json = os.environ.get(PROFILE_SOURCE_JSON_ENV, "").strip()
+    if explicit_path:
+        path = Path(explicit_path)
+    elif source_json:
+        path = Path(source_json).with_name("lora_surface.json")
+    else:
+        return None
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) and payload.get("available") is True else None
+
+
 def _kt_lora_health_max_tensors() -> int:
     raw = os.environ.get(KT_LORA_HEALTH_MAX_TENSORS_ENV, "12").strip().lower()
     if raw in {"", "default"}:
@@ -564,6 +582,8 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "lora_rank": lora_rank,
         "lora_alpha": lora_alpha,
         "lora_dropout": _safe_float(_option_value(args, "--lora_dropout")),
+        "qwen_moe_expert_lora_impl": os.environ.get("ASYM_GEMM_LF_CONFIG_QWEN_EXPERT_LORA_IMPL")
+        or os.environ.get("LF_QWEN_MOE_EXPERT_LORA_IMPL", "custom-peft"),
         "kt_max_cache_depth": _safe_int(_option_value(args, "--kt_max_cache_depth")),
         "max_grad_norm": _safe_float(env_config.get("max_grad_norm"))
         if _safe_float(env_config.get("max_grad_norm")) is not None
@@ -571,6 +591,10 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "activation_recompute": os.environ.get("ASYM_GEMM_LF_CONFIG_ACTIVATION_RECOMPUTE", "false").lower()
         in {"1", "true", "yes", "on"},
         "asymm_expert_act_offload": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD", "false"),
+        "asymm_expert_act_offload_lora_a_fwd": os.environ.get(
+            "ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD",
+            os.environ.get("ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD", "cpu"),
+        ),
         "asymm_attn_act_offload": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD", "false"),
         "asymm_layer_act_offload": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD", "false"),
         "attention_gc_enabled": attention_gc_enabled,
@@ -666,12 +690,14 @@ def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] 
     kt_expert_params = _safe_int(lora.get("kt_expert_lora_parameters"))
     peft_lora_params = _safe_int(lora.get("peft_lora_parameters"))
     peft_expert_params = _safe_int(lora.get("peft_expert_lora_parameters"))
+    qwen_moe_expert_params = _safe_int(lora.get("qwen_moe_expert_lora_parameters"))
     kt_peft_expert_params = _safe_int(lora.get("kt_peft_expert_lora_parameters"))
     if peft_expert_params is None:
         peft_expert_params = kt_peft_expert_params
     expert_lora_params = max(
         kt_expert_params or 0,
         (peft_expert_params or 0) + (lf_fused_params or 0),
+        qwen_moe_expert_params or 0,
     )
     non_expert_peft_params = (
         max(0, peft_lora_params - (peft_expert_params or 0)) if peft_lora_params is not None else None
@@ -701,6 +727,7 @@ def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] 
         "kt_fused_expert_lora_parameters": kt_fused_params,
         "kt_expert_lora_parameters": kt_expert_params,
         "peft_expert_lora_parameters": peft_expert_params,
+        "qwen_moe_expert_lora_parameters": qwen_moe_expert_params,
         "non_expert_peft_lora_parameters": non_expert_peft_params,
         "param_bf16_bytes": param_bf16_bytes,
         "grad_bf16_bytes": grad_bf16_bytes,
@@ -714,6 +741,7 @@ def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] 
             trainable_params >= 1_000_000_000
             or expert_lora_params >= 1_000_000_000
             or (lf_fused_params is not None and lf_fused_params >= 1_000_000_000)
+            or (qwen_moe_expert_params is not None and qwen_moe_expert_params >= 1_000_000_000)
             or (kt_fused_params is not None and kt_fused_params >= 1_000_000_000)
         ),
         "logical_qlen": _safe_int((config or {}).get("logical_qlen")),
@@ -1814,7 +1842,7 @@ def _lora_counters_from_model() -> dict[str, Any]:
     peft_expert_lora_params = 0
 
     def is_peft_lora_name(name: str) -> bool:
-        return "lora_A" in name or "lora_B" in name
+        return ".lora_" in name or name.startswith("lora_") or "lora_A" in name or "lora_B" in name
 
     def is_expert_lora_name(name: str) -> bool:
         lowered = name.lower()
@@ -1843,6 +1871,9 @@ def _lora_counters_from_model() -> dict[str, Any]:
     lf_fused_modules = 0
     lf_fused_tensors = 0
     lf_fused_params = 0
+    qwen_moe_expert_modules = 0
+    qwen_moe_expert_tensors = 0
+    qwen_moe_expert_params = 0
     kt_peft_expert_modules = 0
     kt_peft_expert_tensors = 0
     kt_peft_expert_params = 0
@@ -1855,6 +1886,13 @@ def _lora_counters_from_model() -> dict[str, Any]:
 
     module_roots = [root for root in (model, base_model) if root is not None]
     seen_modules: set[int] = set()
+    qwen_moe_layer_type: Any = ()
+    try:
+        from llamafactory.model.model_utils.fused_moe_lora import QwenMoeExpertLoraLayer
+
+        qwen_moe_layer_type = QwenMoeExpertLoraLayer
+    except Exception:
+        qwen_moe_layer_type = ()
     for root in module_roots:
         for module in root.modules():
             module_key = id(module)
@@ -1867,6 +1905,17 @@ def _lora_counters_from_model() -> dict[str, Any]:
                 lf_fused_modules += 1
                 lf_fused_tensors += len(lf_params)
                 lf_fused_params += sum(int(param.numel()) for param in lf_params)
+            if qwen_moe_layer_type and isinstance(module, qwen_moe_layer_type):
+                qwen_params = [
+                    param
+                    for layer_name in getattr(module, "adapter_layer_names", ())
+                    for param in getattr(module, layer_name).values()
+                    if isinstance(param, torch.nn.Parameter) and param.requires_grad
+                ]
+                if qwen_params:
+                    qwen_moe_expert_modules += 1
+                    qwen_moe_expert_tensors += len(qwen_params)
+                    qwen_moe_expert_params += sum(int(param.numel()) for param in qwen_params)
 
     wrappers = _find_kt_wrappers(model, base_model) or []
     seen_kt_params: set[int] = set()
@@ -1918,7 +1967,7 @@ def _lora_counters_from_model() -> dict[str, Any]:
             kt_expert_tensors += len(layer_kt_params)
             kt_expert_params += sum(int(param.numel()) for param in layer_kt_params)
 
-    return {
+    result = {
         "available": True,
         "trainable_parameters": trainable_params,
         "all_parameters": all_params,
@@ -1928,6 +1977,9 @@ def _lora_counters_from_model() -> dict[str, Any]:
         "lf_fused_expert_lora_modules": lf_fused_modules,
         "lf_fused_expert_lora_tensors": lf_fused_tensors,
         "lf_fused_expert_lora_parameters": lf_fused_params,
+        "qwen_moe_expert_lora_modules": qwen_moe_expert_modules,
+        "qwen_moe_expert_lora_tensors": qwen_moe_expert_tensors,
+        "qwen_moe_expert_lora_parameters": qwen_moe_expert_params,
         "kt_peft_expert_lora_modules": kt_peft_expert_modules,
         "kt_peft_expert_lora_tensors": kt_peft_expert_tensors,
         "kt_peft_expert_lora_parameters": kt_peft_expert_params,
@@ -1938,6 +1990,22 @@ def _lora_counters_from_model() -> dict[str, Any]:
         "kt_expert_lora_tensors": kt_expert_tensors,
         "kt_expert_lora_parameters": kt_expert_params,
     }
+    sidecar = _lora_surface_sidecar()
+    if sidecar is not None and (_safe_int(sidecar.get("trainable_parameters")) or 0) > trainable_params:
+        for key in (
+            "trainable_parameters",
+            "all_parameters",
+            "peft_lora_parameters",
+            "peft_expert_lora_tensors",
+            "peft_expert_lora_parameters",
+            "qwen_moe_expert_lora_modules",
+            "qwen_moe_expert_lora_tensors",
+            "qwen_moe_expert_lora_parameters",
+        ):
+            if key in sidecar:
+                result[key] = sidecar[key]
+        result["sidecar_source"] = sidecar.get("source", "lora_surface_sidecar")
+    return result
 
 
 def _int_dict_sum(value: Any) -> int:

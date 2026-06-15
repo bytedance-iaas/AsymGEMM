@@ -53,6 +53,8 @@ class AsymExecutionStats:
     kt_lora_update_calls: int = 0
     cpu_left_lora_a_calls: int = 0
     expact_lora_a_forward_grouped_calls: int = 0
+    expact_lora_a_forward_cpu_left_grouped_calls: int = 0
+    expact_lora_a_forward_hbm_grouped_calls: int = 0
     expact_lora_a_grad_grouped_calls: int = 0
     expact_lora_b_backward_grouped_calls: int = 0
     expact_stage_low_rank_calls: int = 0
@@ -111,6 +113,7 @@ class AsymExecutionStats:
             + self.torch_forward_calls
             + self.kt_forward_calls
             + self.cpu_left_lora_a_calls
+            + self.expact_lora_a_forward_hbm_grouped_calls
             + self.attn_act_hbm_forward_calls
         )
 

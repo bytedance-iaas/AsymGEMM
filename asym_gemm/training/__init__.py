@@ -54,6 +54,7 @@ from .cpu_left import (
 )
 from .exp_act_offload_lora import (
     grouped_lora_a_forward_cpu_left,
+    grouped_lora_a_forward_hbm,
     grouped_lora_a_grad_cpu_right,
     grouped_lora_a_pair_forward_cpu_left,
     grouped_lora_a_pair_grad_cpu_right,
@@ -208,6 +209,7 @@ __all__ = [
     "grouped_expert_lora_cpu_left",
     "grouped_expert_lora_pair",
     "grouped_lora_a_forward_cpu_left",
+    "grouped_lora_a_forward_hbm",
     "grouped_lora_a_grad_cpu_right",
     "grouped_lora_a_pair_forward_cpu_left",
     "grouped_lora_a_pair_grad_cpu_right",

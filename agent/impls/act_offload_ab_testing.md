@@ -18,20 +18,35 @@ The A/B compares the same full expert + attention + decoder-layer activation
 offload stack and changes only expert activation-offload forward LoRA-A source:
 
 ```text
-ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu_left  # current behavior, default
-ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=gpu_hbm   # experimental behavior
+ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu  # current behavior, default
+ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm  # experimental behavior
 ```
 
-Baseline A is `34.593 GiB` peak allocated, `39.676 GiB` peak reserved,
-`45.861 s` avg step, `11.490 s` avg forward, and `34.213 s` avg backward.
-Memory acceptance is intentionally tight: B is acceptable only if peak
-allocated HBM has no increase, or increases by less than `0.5 GiB` versus the
-matched A run. With the current A baseline, that means a hard peak-allocated
-cap of `35.093 GiB`; lower is better. Reject any B that approaches the old
+Matched Stage 3 A is `34.593 GiB` peak allocated, `39.676 GiB` peak reserved,
+`44.930 s` source forward+backward step, `11.318 s` avg forward, and `33.612 s`
+avg backward. Memory acceptance is intentionally tight: B is acceptable only if
+peak allocated HBM has no increase, or increases by less than `0.5 GiB` versus
+the matched A run. With this A baseline, that means a hard peak-allocated cap
+of `35.093 GiB`; lower is better. Reject any B that approaches the old
 `58.343 GiB` expert+attention-only row. The expected extra live tensors are
-low-rank `S_*` tensors plus the temporary concatenated LoRA-A weight, so a
-large HBM jump means the implementation accidentally kept or cloned a large
-`[M,H]` or `[M,I]` tensor.
+low-rank `S_*` tensors plus the temporary concatenated LoRA-A weight, so a large
+HBM jump means the implementation accidentally kept or cloned a large `[M,H]`
+or `[M,I]` tensor.
+
+Measured Stage 3 result on 2026-06-14:
+
+| Mode | Peak allocated HBM | Peak reserved HBM | Source fwd+bwd step | Avg forward | Avg backward | Trainer E2E step | Forward-end HBM | Saved CPU peak |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `cpu` | 34.593 GiB | 39.676 GiB | 44.930s | 11.318s | 33.612s | 46.864s | 16.046 GiB | 1.469 GiB |
+| `hbm` | 34.593 GiB | 39.676 GiB | 36.631s | 2.831s | 33.800s | 38.506s | 16.046 GiB | 1.469 GiB |
+
+`hbm` passes the hard memory gate: peak allocated delta is `0.000 GiB` and
+peak reserved delta is `0.000 GiB`. It improves source forward+backward step by
+`8.299s` (`18.47%`), forward by `8.488s` (`74.99%`), and trainer E2E step by
+`8.357s` (`17.83%`), while backward increases by `0.188s` (`0.56%`). This is a
+validated selectable mode. The current patch does not promote it to default
+because the stricter default-promotion latency gate below asks for at least a
+`20%` avg-step improvement on the matched production run.
 
 External API assumptions checked before implementation:
 
@@ -55,7 +70,7 @@ Overall implementation size should be small:
   tuple, and attention/layer activation offload unchanged.
 
 No native kernel work is required for the first A/B. A native same-source
-gate/up LoRA-A kernel is only a follow-up if `gpu_hbm` is faster but violates
+gate/up LoRA-A kernel is only a follow-up if `hbm` is faster but violates
 the `<0.5 GiB` peak-allocated HBM delta cap.
 
 Performance and memory acceptance numbers must come from the real LF workflow:
@@ -160,6 +175,8 @@ PROFILE_MEMORY_SNAPSHOT=false \
 WARMUP_STEPS=5 \
 MAX_STEPS=10 \
 RUN_POST=false \
+PLOT=false \
+PLOT_MEMORY_BREAKDOWN=false \
 scripts/lf/profile_lora_lf.sh --gpus 0
 ```
 
@@ -175,8 +192,8 @@ Acceptance:
 ## Stage 1: Add Selector, Run Identity, and Counters
 
 Purpose: add the A/B control plane without changing default behavior. After
-this stage, `cpu_left` must produce byte-for-byte equivalent behavior to the
-current path, and `gpu_hbm` must fail clearly until Stage 2 implements it.
+this stage, `cpu` must produce byte-for-byte equivalent behavior to the current
+path, and `hbm` must fail clearly until Stage 2 implements it.
 
 Files, functions, and classes:
 
@@ -221,13 +238,11 @@ Implementation:
 
 ```python
 EXPERT_ACT_OFFLOAD_LORA_A_FWD_ENV = "ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD"
-VALID_EXPERT_ACT_OFFLOAD_LORA_A_FWD = {"cpu_left", "gpu_hbm"}
+VALID_EXPERT_ACT_OFFLOAD_LORA_A_FWD = {"cpu", "hbm"}
 
 def _expert_act_offload_lora_a_fwd_mode() -> str:
-    raw = os.environ.get(EXPERT_ACT_OFFLOAD_LORA_A_FWD_ENV, "cpu_left")
-    mode = str(raw).strip().lower().replace("-", "_")
-    if mode == "":
-        mode = "cpu_left"
+    raw = os.environ.get(EXPERT_ACT_OFFLOAD_LORA_A_FWD_ENV, "cpu")
+    mode = str(raw)
     if mode not in VALID_EXPERT_ACT_OFFLOAD_LORA_A_FWD:
         valid = ", ".join(sorted(VALID_EXPERT_ACT_OFFLOAD_LORA_A_FWD))
         raise ValueError(
@@ -237,7 +252,7 @@ def _expert_act_offload_lora_a_fwd_mode() -> str:
     return mode
 ```
 
-2. Fail closed for unimplemented `gpu_hbm`.
+2. Fail closed for unimplemented `hbm`.
 
 ```python
 # AsymQwen3Experts._activation_offload_unsupported_reasons
@@ -246,13 +261,13 @@ try:
 except ValueError as exc:
     reasons.append(str(exc))
 else:
-    if mode == "gpu_hbm":
-        reasons.append("gpu_hbm expert forward LoRA-A is not implemented yet")
+    if mode == "hbm":
+        reasons.append("hbm expert forward LoRA-A is not implemented yet")
 ```
 
 Do not put a silent fallback in `_ActivationOffloadQwen3ExpertFunction.forward`.
 For Stage 1, the forward body may read and record the mode but must still route
-only `cpu_left`.
+only `cpu`.
 
 3. Add mode-specific expert counters while keeping the existing aggregate name.
 
@@ -299,23 +314,26 @@ return out
 
 ```bash
 # profile_lora_lf.sh and run_lf_lora_sft.sh
-ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD:-cpu_left}
+ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-cpu}
 
 normalize_expact_lora_a_fwd() {
-  case "${1,,}" in
-    ""|cpu|cpu_left|cpu-left) printf 'cpu_left\n' ;;
-    hbm|gpu|gpu_hbm|gpu-hbm) printf 'gpu_hbm\n' ;;
-    *) die "ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD must be cpu_left or gpu_hbm, got '$1'" ;;
+  case "${1}" in
+    cpu) printf 'cpu\n' ;;
+    hbm) printf 'hbm\n' ;;
+    *) die "ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD must be cpu or hbm, got '$1'" ;;
   esac
 }
 
 expact_lora_a_fwd_tag() {
   case "$(normalize_expact_lora_a_fwd "$1")" in
-    cpu_left) printf 'loraafwdcpu\n' ;;
-    gpu_hbm) printf 'loraafwdhbm\n' ;;
+    cpu) printf 'loraafwdcpu\n' ;;
+    hbm) printf 'loraafwdhbm\n' ;;
   esac
 }
 ```
+
+Only exact lowercase `cpu` and `hbm` are valid selector values. Do not accept
+aliases such as `cpu_left`, `gpu_hbm`, `gpu-hbm`, `gpu`, or uppercase forms.
 
 Apply the normalized value once and pass it everywhere:
 
@@ -351,7 +369,7 @@ if expected_lora_a_fwd and actual != wanted:
 
 Update all callers of `existing_profile_complete(...)`, including
 `kt_arm_matching_source_profile_complete(...)`, to pass the selector. This
-prevents a `cpu_left` source profile from being reused for a `gpu_hbm` run.
+prevents a `cpu` source profile from being reused for a `hbm` run.
 
 7. Record the selector in `source_profile.json`.
 
@@ -359,7 +377,7 @@ prevents a `cpu_left` source profile from being reused for a `gpu_hbm` run.
 # run_lf_profiled_train.py config dict
 "asymm_expert_act_offload_lora_a_fwd": os.environ.get(
     "ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD",
-    os.environ.get("ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD", "cpu_left"),
+    os.environ.get("ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD", "cpu"),
 ),
 ```
 
@@ -373,7 +391,7 @@ class VariantResult:
     lora_a_forward_mode: str
     ...
 
-def _profile_variant(..., lora_a_forward_mode: str = "cpu_left"):
+def _profile_variant(..., lora_a_forward_mode: str = "cpu"):
     previous_mode = os.environ.get("ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD")
     os.environ["ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD"] = lora_a_forward_mode
     ...
@@ -384,7 +402,7 @@ Risks to watch:
 
 - Existing dry-run tests assert exact path substrings. Update them to include
   `__loraafwdcpu` for default runs.
-- `cpu_left_lora_a_calls` will not drop to zero in full-stack `gpu_hbm` runs
+- `cpu_left_lora_a_calls` will not drop to zero in full-stack `hbm` runs
   because attention activation offload still uses CPU-left LoRA-A. Use the new
   expert-specific subcounters for the A/B assertion.
 - If `ASYMM_EXPERT_ACT_OFFLOAD=false`, the selector is recorded and labeled but
@@ -415,7 +433,7 @@ PREPARE_DATASETS=false \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 ASYMM_EXP_ACT_POLICIES="none|true|true|true" \
-ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu_left \
+ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu \
 SEQ_LENS=128 \
 PER_DEVICE_TRAIN_BATCH_SIZE=1 \
 MAX_STEPS=1 \
@@ -426,15 +444,15 @@ PLOT_MEMORY_BREAKDOWN=false \
 scripts/lf/profile_lora_lf.sh --gpus 0
 
 find /tmp/lf_ab_stage1_dryrun -name command.txt -print -exec rg -n \
-  "ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu_left|ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu_left|loraafwdcpu" {} +
+  "ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu|ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu|loraafwdcpu" {} +
 ```
 
 Fresh default-mode e2e regression profile:
 
 ```bash
-OUTPUT_ROOT=outputs/lf_ab_stage1_cpu_left \
+OUTPUT_ROOT=outputs/lf_ab_stage1_cpu \
 OVERWRITE=true \
-ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu_left \
+ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 ASYMM_EXP_ACT_POLICIES="none|true|true|true" \
@@ -452,19 +470,24 @@ PROFILE_MEMORY_SNAPSHOT=false \
 WARMUP_STEPS=5 \
 MAX_STEPS=10 \
 RUN_POST=false \
+PLOT=false \
+PLOT_MEMORY_BREAKDOWN=false \
 scripts/lf/profile_lora_lf.sh --gpus 0
 ```
+
+`PLOT=false` only disables optional plotting after source-profile artifacts are
+written. It does not change the training/profiling workflow measured by the A/B.
 
 Acceptance:
 
 - Source profile config has
-  `asymm_expert_act_offload_lora_a_fwd == "cpu_left"`.
+  `asymm_expert_act_offload_lora_a_fwd == "cpu"`.
 - `expact_lora_a_forward_cpu_left_grouped_calls > 0`.
 - `expact_lora_a_forward_hbm_grouped_calls == 0`.
 - `reference_fallback_count == 0`.
 - HBM and timing are consistent with the current A row.
 
-## Stage 2: Implement `gpu_hbm` Expert Forward LoRA-A
+## Stage 2: Implement `hbm` Expert Forward LoRA-A
 
 Purpose: route only expert activation-offload forward LoRA-A through existing
 HBM grouped GEMM windows. Backward stays unchanged and still uses CPU-resident
@@ -531,12 +554,12 @@ Do not add a HBM pair helper that calls `grouped_expert_lora_pair(packed,
 packed, ...)`; that path materializes `[2M,H]`. Gate/up must concatenate only
 LoRA-A weights.
 
-2. Enable `gpu_hbm` in unsupported-reason checks.
+2. Enable `hbm` in unsupported-reason checks.
 
 ```python
 # AsymQwen3Experts._activation_offload_unsupported_reasons
 mode = _expert_act_offload_lora_a_fwd_mode()
-if mode == "gpu_hbm":
+if mode == "hbm":
     try:
         _require_lora_grouped_mm()
     except RuntimeError as exc:
@@ -557,7 +580,7 @@ kernel_reason = require_expert_activation_offload_kernels(scope="full", check_on
 mode = _expert_act_offload_lora_a_fwd_mode()
 
 with prof_range(layer._forward_range("activation_offload", "gate_up_lora_a")):
-    if mode == "cpu_left":
+    if mode == "cpu":
         gate_low_rank, up_low_rank = grouped_lora_a_pair_forward_cpu_left(
             x_cpu.tensor,
             gate_lora_A,
@@ -569,7 +592,7 @@ with prof_range(layer._forward_range("activation_offload", "gate_up_lora_a")):
             tag="gate_up",
         )
         gate_up_low_rank_owner = None
-    elif mode == "gpu_hbm":
+    elif mode == "hbm":
         gate_up_a = torch.cat((gate_lora_A, up_lora_A), dim=1).contiguous()
         try:
             gate_up_low_rank_owner = grouped_lora_a_forward_hbm(
@@ -626,14 +649,14 @@ Do not call `.contiguous()` on the split views before `manager.offload(...)`;
 that would create extra `[M,R]` HBM clones. `ActivationOffloadManager.offload`
 copies the view into a contiguous CPU owner.
 
-5. Rewrite down LoRA-A scheduling for `gpu_hbm`.
+5. Rewrite down LoRA-A scheduling for `hbm`.
 
 ```python
 with prof_range(layer._forward_range("activation_offload", "activation_cpu")):
     act_cpu = _activation_offload_cpu_silu_mul(gate_cpu, up_cpu, manager, tag="act")
 
 act_stage = None
-if mode == "cpu_left":
+if mode == "cpu":
     with prof_range(layer._forward_range("activation_offload", "down_lora_a")):
         down_low_rank = grouped_lora_a_forward_cpu_left(
             act_cpu.tensor,
@@ -706,12 +729,12 @@ preliminary snapshot and backward overwrites it.
 
 ```python
 # tests/training/test_lf_qwen3_asym_backend.py
-@pytest.mark.parametrize("mode", ["cpu_left", "gpu_hbm"])
+@pytest.mark.parametrize("mode", ["cpu", "hbm"])
 def test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend(monkeypatch, mode):
     monkeypatch.setenv("ASYMM_EXPERT_ACT_OFFLOAD", "1")
     monkeypatch.setenv("ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD", mode)
     ...
-    if mode == "cpu_left":
+    if mode == "cpu":
         assert asym_backend.stats.expact_lora_a_forward_cpu_left_grouped_calls == 3
         assert asym_backend.stats.expact_lora_a_forward_hbm_grouped_calls == 0
     else:
@@ -738,7 +761,7 @@ Risks to watch:
   LoRA-B, matching current behavior. Do not accidentally use it with identical
   `[M,H]` packed inputs.
 - If `torch.nn.functional.grouped_mm` / `torch._grouped_mm` is unavailable,
-  `gpu_hbm` must raise. Do not fall back to CPU-left.
+  `hbm` must raise. Do not fall back to CPU-left.
 
 Validation before Stage 3:
 
@@ -759,7 +782,7 @@ Validation before Stage 3:
 Focused one-MoE sanity check, not acceptance:
 
 ```bash
-ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu_left \
+ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu \
 PYTHONPATH=. .venv/bin/python scripts/testing/profile_qwen3_activation_offload.py \
   --tokens 16384 \
   --top-k 8 \
@@ -771,9 +794,9 @@ PYTHONPATH=. .venv/bin/python scripts/testing/profile_qwen3_activation_offload.p
   --warmup 2 \
   --iters 5 \
   --profile-breakdown \
-  --output-json /tmp/qwen3_expact_cpu_left_lora_a_one_moe.json
+  --output-json /tmp/qwen3_expact_cpu_lora_a_one_moe.json
 
-ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=gpu_hbm \
+ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm \
 PYTHONPATH=. .venv/bin/python scripts/testing/profile_qwen3_activation_offload.py \
   --tokens 16384 \
   --top-k 8 \
@@ -785,7 +808,7 @@ PYTHONPATH=. .venv/bin/python scripts/testing/profile_qwen3_activation_offload.p
   --warmup 2 \
   --iters 5 \
   --profile-breakdown \
-  --output-json /tmp/qwen3_expact_gpu_hbm_lora_a_one_moe.json
+  --output-json /tmp/qwen3_expact_hbm_lora_a_one_moe.json
 ```
 
 Short real-workflow e2e smoke before production A/B. This uses
@@ -794,9 +817,9 @@ short warmup/measure counts mean it is still only a correctness and gross-memory
 gate, not an acceptance benchmark:
 
 ```bash
-OUTPUT_ROOT=outputs/lf_ab_stage2_gpu_hbm_smoke \
+OUTPUT_ROOT=outputs/lf_ab_stage2_hbm_smoke \
 OVERWRITE=true \
-ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=gpu_hbm \
+ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 ASYMM_EXP_ACT_POLICIES="none|true|true|true" \
@@ -820,20 +843,20 @@ scripts/lf/profile_lora_lf.sh --gpus 0
 Acceptance:
 
 - Unit parity passes for both modes.
-- Smoke `source_profile.json` records `gpu_hbm`; postprocessed `profile.json`
+- Smoke `source_profile.json` records `hbm`; postprocessed `profile.json`
   preserves the same config.
 - Expert counters show CPU-left expert forward calls are `0` and HBM expert
-  forward calls are positive for `gpu_hbm`.
+  forward calls are positive for `hbm`.
 - Postprocessed `profile.json` has
   `trainable_surface.surface == "attention+expert LoRA"`.
 - `reference_fallback_count == 0`.
 - Smoke peak allocated HBM is below the hard production cap if compared against
   the current baseline (`35.093 GiB`). If allocator variance makes this unclear,
-  run a matching `cpu_left` smoke and require `gpu_hbm - cpu_left < 0.5 GiB`.
+  run a matching `cpu` smoke and require `hbm - cpu < 0.5 GiB`.
 
 ## Stage 3: Production E2E A/B
 
-Purpose: decide whether `gpu_hbm` is actually better on the production workload.
+Purpose: decide whether `hbm` is actually better on the production workload.
 This is the only acceptance gate for memory and latency. Do not accept based on
 unit tests, one-MoE profiling, toy settings, or reduced-shape runs. The final
 reported A/B numbers must come from `scripts/lf/profile_lora_lf.sh` using the
@@ -853,9 +876,9 @@ Files, functions, and classes:
 Run A:
 
 ```bash
-OUTPUT_ROOT=outputs/lf_ab_stage3_cpu_left \
+OUTPUT_ROOT=outputs/lf_ab_stage3_cpu \
 OVERWRITE=true \
-ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu_left \
+ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 ASYMM_EXP_ACT_POLICIES="none|true|true|true" \
@@ -879,9 +902,9 @@ scripts/lf/profile_lora_lf.sh --gpus 0
 Run B:
 
 ```bash
-OUTPUT_ROOT=outputs/lf_ab_stage3_gpu_hbm \
+OUTPUT_ROOT=outputs/lf_ab_stage3_hbm \
 OVERWRITE=true \
-ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=gpu_hbm \
+ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 ASYMM_EXP_ACT_POLICIES="none|true|true|true" \
@@ -905,7 +928,7 @@ scripts/lf/profile_lora_lf.sh --gpus 0
 Post-run checks:
 
 ```bash
-.venv/bin/python - <<'PY' outputs/lf_ab_stage3_cpu_left outputs/lf_ab_stage3_gpu_hbm
+.venv/bin/python - <<'PY' outputs/lf_ab_stage3_cpu outputs/lf_ab_stage3_hbm
 import json
 import sys
 from pathlib import Path
@@ -956,13 +979,13 @@ PY
 
 Acceptance for B:
 
-- `config.asymm_expert_act_offload_lora_a_fwd == "gpu_hbm"`.
-- Peak allocated HBM has no increase versus A, or increases by less than
+- Hard memory gate: peak allocated HBM has no increase versus A, or increases by
+  less than
   `0.5 GiB`. With the current A baseline of `34.593 GiB`, B must be below
   `35.093 GiB`.
 - Peak reserved HBM is reported and investigated if it increases materially;
   reserved-memory growth is not allowed to hide an allocated-memory regression.
-- Avg step improves by at least `20%`.
+- `config.asymm_expert_act_offload_lora_a_fwd == "hbm"`.
 - Avg forward materially improves.
 - Avg backward does not increase enough to erase forward savings.
 - `trainable_surface.surface == "attention+expert LoRA"`.
@@ -972,6 +995,12 @@ Acceptance for B:
 - Expert counters:
   - A: `expact_lora_a_forward_cpu_left_grouped_calls > 0`, HBM calls `0`.
   - B: `expact_lora_a_forward_hbm_grouped_calls > 0`, expert CPU-left calls `0`.
+
+Default-promotion latency gate:
+
+- Avg step improves by at least `20%` on the matched production A/B run, unless
+  a later decision explicitly accepts the measured smaller E2E win because the
+  forward-path win is the target.
 
 Risks to watch:
 
@@ -985,7 +1014,17 @@ Risks to watch:
 
 Purpose: make a default decision only after Stage 3 passes.
 
-Files, functions, and classes if `gpu_hbm` wins:
+Current decision from the 2026-06-14 production A/B:
+
+- Keep the default as `cpu` for now.
+- Keep `hbm` available through
+  `ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm`.
+- Rationale: `hbm` passed the hard HBM gate with `0.000 GiB` peak
+  allocated increase and delivered the expected forward-path improvement, but
+  the matched source forward+backward step improved by `18.47%`, below the
+  `20%` default-promotion latency gate in this plan.
+
+Files, functions, and classes if `hbm` wins:
 
 - `asym_gemm/training/qwen3_moe.py`
   - `_expert_act_offload_lora_a_fwd_mode`
@@ -1002,23 +1041,23 @@ Implementation if accepted:
 
 ```python
 # qwen3_moe.py
-raw = os.environ.get(EXPERT_ACT_OFFLOAD_LORA_A_FWD_ENV, "gpu_hbm")
+raw = os.environ.get(EXPERT_ACT_OFFLOAD_LORA_A_FWD_ENV, "hbm")
 ```
 
 ```bash
 # run_lf_lora_sft.sh and profile_lora_lf.sh
-ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD:-gpu_hbm}
+ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
 ```
 
-Keep `cpu_left` as an override for one release:
+Keep `cpu` as an override for one release:
 
 ```bash
-ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu_left scripts/lf/profile_lora_lf.sh --gpus 0
+ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu scripts/lf/profile_lora_lf.sh --gpus 0
 ```
 
 If B is faster but peak allocated HBM increases by `>=0.5 GiB`:
 
-- Keep default `cpu_left`.
+- Keep default `cpu`.
 - Implement a native same-source gate/up LoRA-A grouped kernel that avoids the
   `[E,2R,H]` concat or schedules the concat outside the peak.
 - Do not use `grouped_expert_lora_pair(packed, packed, ...)`, because that
@@ -1026,7 +1065,7 @@ If B is faster but peak allocated HBM increases by `>=0.5 GiB`:
 
 If B does not improve latency:
 
-- Keep default `cpu_left`.
+- Keep default `cpu`.
 - Next work should target backward LoRA-A grad and CPU SiLU-mul fusion.
 
 Validation:

@@ -33,6 +33,7 @@ W_down_cpu     [E,H,I]
 A_gate         [E,r,H]   B_gate     [E,I,r]
 A_up           [E,r,H]   B_up       [E,I,r]
 A_down         [E,r,I]   B_down     [E,H,r]
+A_gate_up      [E,2r,H]  temporary cat_r(A_gate, A_up) for HBM LoRA-A mode
 ```
 
 When an operand is CPU-resident, this note marks the operand side in the GEMM
@@ -78,9 +79,26 @@ S_b   = pack_g(S_b,g)                 # [M,r]
 There is no intermediate `[r,M_g]` low-rank output. The low-rank output layout
 is `[M_g,r]` directly.
 
-For LoRA-A forward, only the small low-rank `[M,r]` tensor is materialized in
-HBM. The wide dropped LoRA input `D(U_cpu)` stays CPU-side and can be recomputed
-from the saved source activation and saved dropout mask.
+Expert activation-offload forward LoRA-A is selected by
+`ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD`, whose only valid values are `cpu` and
+`hbm`.
+
+In `cpu` mode, only the small low-rank `[M,r]` tensor is materialized in HBM.
+The wide dropped LoRA input `D(U_cpu)` stays CPU-side and can be recomputed from
+the saved source activation and saved dropout mask.
+
+In `hbm` mode, forward LoRA-A uses the already-live or already-staged HBM source
+for the LoRA-A GEMM. Gate/up concatenate only LoRA-A weights:
+`A_gate_up = cat_r(A_gate, A_up) [E,2r,H]`, not the wide `[M,H]` activation.
+The grouped result owner is `S_gate_up [M,2r]`; `S_gate` and `S_up` are views
+split from that owner and the owner must stay live until both views have been
+consumed by LoRA-B and offloaded. Down LoRA-A reuses the same `act_stage [M,I]`
+window that is needed for the down base projection.
+
+The activation-offload path described here is the current v0 path and requires
+`lora_dropout=0.0`, so `D_b` is the identity in the validated `cpu`/`hbm` A/B.
+The `D_b` notation is kept in the CPU equations to show where dropout would
+apply if that constraint changes later.
 
 `S_gate_cpu`, `S_up_cpu`, and `S_down_cpu` store the same low-rank values as
 `S_gate`, `S_up`, and `S_down`. Backward equations write `S_b,g` for the
@@ -109,7 +127,7 @@ gate_up = pack_g(X_g @^R W_gate_up_cpu[e_g].T)          # [M,2I] HBM live
 gate, up = split(gate_up)                               # [M,I], [M,I] HBM views
 
 
-# ---------------- gate projection ----------------
+# ---------------- gate/up LoRA-A forward: mode = cpu ----------------
 
 X_gate_lora_cpu,g = D_gate(X_cpu,g)                     # [M_g,H] CPU
 S_gate_g = X_gate_lora_cpu,g @^L A_gate[e_g].T          # [M_g,r] HBM
@@ -129,6 +147,20 @@ up += scale * pack_g(S_up_g @ B_up[e_g].T)              # consume up delta now
 release(S_up, X_up_lora_cpu_if_materialized)
 
 
+# ---------------- gate/up LoRA-A forward: mode = hbm ----------------
+
+A_gate_up = cat_r(A_gate, A_up)                         # [E,2r,H] HBM temp, weights only
+S_gate_up_g = X_g @ A_gate_up[e_g].T                    # [M_g,2r] HBM
+S_gate_g, S_up_g = split_r(S_gate_up_g)                 # [M_g,r], [M_g,r] HBM views
+S_gate_up = pack_g(S_gate_up_g)                         # [M,2r] HBM owner
+S_gate, S_up = split_r(S_gate_up)                       # [M,r], [M,r] HBM views
+gate += scale * pack_g(S_gate_g @ B_gate[e_g].T)        # S_gate_g is view of S_gate_up_g
+up += scale * pack_g(S_up_g @ B_up[e_g].T)              # S_up_g is view of S_gate_up_g
+S_gate_cpu = offload(S_gate)                            # [M,r] CPU, save for dB_gate
+S_up_cpu = offload(S_up)                                # [M,r] CPU, save for dB_up
+release(S_gate, S_up, S_gate_up, A_gate_up)
+
+
 gate_cpu = offload(gate)                                # [M,I] CPU
 up_cpu = offload(up)                                    # [M,I] CPU
 release(gate_up)
@@ -138,26 +170,41 @@ act_cpu = silu_gate_tmp_cpu * up_cpu                    # [M,I] CPU, save for do
 release(silu_gate_tmp_cpu)
 
 
-# ---------------- down base projection ----------------
-
-act_stage = stage(act_cpu)                               # [M,I] HBM
-Y_down = pack_g(act_stage_g @^R W_down_cpu[e_g].T)       # [M,H] HBM live
-release(act_stage)
-
-
-# ---------------- down LoRA projection ----------------
+# ---------------- down projection: mode = cpu ----------------
 
 act_down_lora_cpu,g = D_down(act_cpu,g)                 # [M_g,I] CPU
 S_down_g = act_down_lora_cpu,g @^L A_down[e_g].T        # [M_g,r] HBM
 S_down = pack_g(S_down_g)                               # [M,r] HBM
 S_down_cpu = offload(S_down)                            # [M,r] CPU, save for dB_down
-Y_down += scale * pack_g(S_down_g @ B_down[e_g].T)      # consume down delta now
-release(S_down, act_down_lora_cpu_if_materialized)
+down_delta = scale * pack_g(S_down_g @ B_down[e_g].T)   # [M,H] HBM temp
+
+act_stage = stage(act_cpu)                               # [M,I] HBM
+Y_down = pack_g(act_stage_g @^R W_down_cpu[e_g].T)       # [M,H] HBM live
+release(act_stage)
+Y_down += down_delta
+release(S_down, down_delta, act_down_lora_cpu_if_materialized)
+
+
+# ---------------- down projection: mode = hbm ----------------
+
+act_stage = stage(act_cpu)                               # [M,I] HBM, shared by LoRA-A and base
+S_down_g = act_stage_g @ A_down[e_g].T                  # [M_g,r] HBM
+S_down = pack_g(S_down_g)                               # [M,r] HBM
+S_down_cpu = offload(S_down)                            # [M,r] CPU, save for dB_down
+down_delta = scale * pack_g(S_down_g @ B_down[e_g].T)   # [M,H] HBM temp
+
+Y_down = pack_g(act_stage_g @^R W_down_cpu[e_g].T)       # [M,H] HBM live
+Y_down += down_delta
+release(S_down, down_delta, act_stage)
 ```
 
 ### Backward
 
 ```
+# Backward is identical for `cpu` and `hbm` forward LoRA-A modes because the
+# saved CPU low-rank tensors S_gate_cpu, S_up_cpu, and S_down_cpu have the same
+# mathematical values in both modes.
+
 dY = dL/dY_down                                         # [M,H] HBM
 dY_cpu = offload(dY)                                    # [M,H] CPU, for down dS/dB
 

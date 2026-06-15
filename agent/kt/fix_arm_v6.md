@@ -172,19 +172,28 @@ for T in 8 16 32 64; do
     BACKEND=kt_armbf16 KT_BACKEND=armbf16 KT_PRECISION=bf16 \
     KT_NUM_THREADS="${T}" KT_ARM_OMP_NUM_THREADS="${T}" KT_ARM_SFT_BACKWARD_THREADS="${T}" \
     KT_ARM_OMP_PROC_BIND=false KT_ARM_SFT_PROFILE=1 \
+    KT_ARM_SFT_MAX_ROUTE_RANK_WORK=8388608 \
+    KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH=1 \
     MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B \
+    DATASET=asym_long_sft_smoke__qwen3-30b-a3b__s4096 \
     CUTOFF_LEN=4096 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
     LORA_RANK=64 LORA_ALPHA=128 LORA_DROPOUT=0.0 \
+    GRADIENT_CHECKPOINTING=true \
     MAX_STEPS=1 MAX_SAMPLES=4 \
     PROFILE=1 PROFILE_PROFILER=source PROFILE_LEVEL=module PROFILE_SYNC=1 \
     PROFILE_WARMUP_STEPS=0 PROFILE_MEASURE_STEPS=1 PROFILE_TOTAL_STEPS=1 \
-    OUTPUT_ROOT="${ART}" \
+    PROFILE_OUTPUT_DIR="${ART}" PROFILE_JSON="${ART}/profile.json" \
+    PROFILE_SOURCE_JSON="${ART}/source_profile.json" PROFILE_SUMMARY_MD="${ART}/summary.md" \
+    PROFILE_HEARTBEAT_JSON="${ART}/heartbeat.json" \
+    OUT_DIR="${ART}/lf_run" LOG_FILE="${ART}/train.log" RUN_ID="v6_stage0_t${T}_recomp" \
     scripts/kt/run_lf_lora_sft_kt.sh
 
   .venv/bin/python agent/kt/scripts/validate_kt_arm_profile.py \
-    --artifact-dir "${ART}" \
-    --expected-gpu-id 1 --expected-cuda-visible-devices 1 \
+    --profile-json "${ART}/profile.json" \
+    --train-log "${ART}/train.log" \
     --expected-seq-len 4096 --expected-batch 4 --expected-rank 64 \
+    --expected-dropout 0.0 --expected-top-k 8 --expected-cache-depth 2 \
+    --expected-recompute true --expected-route-rank-limit 8388608 \
     --require-native-field expert_schedule_wall_ms \
     --require-native-field backward_grouped_tile_ms \
     --require-native-field backward_base_grad_ms \
@@ -323,19 +332,28 @@ taskset -c 0-143 env \
   BACKEND=kt_armbf16 KT_BACKEND=armbf16 KT_PRECISION=bf16 \
   KT_NUM_THREADS="${BEST_T}" KT_ARM_OMP_NUM_THREADS="${BEST_T}" KT_ARM_SFT_BACKWARD_THREADS="${BEST_T}" \
   KT_ARM_OMP_PROC_BIND=false KT_ARM_SFT_PROFILE=1 \
+  KT_ARM_SFT_MAX_ROUTE_RANK_WORK=8388608 \
+  KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH=1 \
   MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B \
+  DATASET=asym_long_sft_smoke__qwen3-30b-a3b__s4096 \
   CUTOFF_LEN=4096 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
   LORA_RANK=64 LORA_ALPHA=128 LORA_DROPOUT=0.0 \
+  GRADIENT_CHECKPOINTING=true \
   MAX_STEPS=3 MAX_SAMPLES=12 \
   PROFILE=1 PROFILE_PROFILER=source PROFILE_LEVEL=module PROFILE_SYNC=1 \
   PROFILE_WARMUP_STEPS=1 PROFILE_MEASURE_STEPS=2 PROFILE_TOTAL_STEPS=3 \
-  OUTPUT_ROOT="${ART}" \
+  PROFILE_OUTPUT_DIR="${ART}" PROFILE_JSON="${ART}/profile.json" \
+  PROFILE_SOURCE_JSON="${ART}/source_profile.json" PROFILE_SUMMARY_MD="${ART}/summary.md" \
+  PROFILE_HEARTBEAT_JSON="${ART}/heartbeat.json" \
+  OUT_DIR="${ART}/lf_run" LOG_FILE="${ART}/train.log" RUN_ID="v6_stage1_base_t${BEST_T}" \
   scripts/kt/run_lf_lora_sft_kt.sh
 
 .venv/bin/python agent/kt/scripts/validate_kt_arm_profile.py \
-  --artifact-dir "${ART}" \
-  --expected-gpu-id 1 --expected-cuda-visible-devices 1 \
+  --profile-json "${ART}/profile.json" \
+  --train-log "${ART}/train.log" \
   --expected-seq-len 4096 --expected-batch 4 --expected-rank 64 \
+  --expected-dropout 0.0 --expected-top-k 8 --expected-cache-depth 2 \
+  --expected-recompute true --expected-route-rank-limit 8388608 \
   --require-native-field backward_base_grad_ms \
   --require-native-field backward_lora_grad_ms \
   --require-native-field backward_grouped_tile_ms
@@ -492,19 +510,28 @@ taskset -c 0-143 env \
   BACKEND=kt_armbf16 KT_BACKEND=armbf16 KT_PRECISION=bf16 \
   KT_NUM_THREADS="${BEST_T}" KT_ARM_OMP_NUM_THREADS="${BEST_T}" KT_ARM_SFT_BACKWARD_THREADS="${BEST_T}" \
   KT_ARM_OMP_PROC_BIND=false KT_ARM_SFT_PROFILE=1 \
+  KT_ARM_SFT_MAX_ROUTE_RANK_WORK=8388608 \
+  KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH=1 \
   MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B \
+  DATASET=asym_long_sft_smoke__qwen3-30b-a3b__s4096 \
   CUTOFF_LEN=4096 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
   LORA_RANK=64 LORA_ALPHA=128 LORA_DROPOUT=0.0 \
+  GRADIENT_CHECKPOINTING=true \
   MAX_STEPS=3 MAX_SAMPLES=12 \
   PROFILE=1 PROFILE_PROFILER=source PROFILE_LEVEL=module PROFILE_SYNC=1 \
   PROFILE_WARMUP_STEPS=1 PROFILE_MEASURE_STEPS=2 PROFILE_TOTAL_STEPS=3 \
-  OUTPUT_ROOT="${ART}" \
+  PROFILE_OUTPUT_DIR="${ART}" PROFILE_JSON="${ART}/profile.json" \
+  PROFILE_SOURCE_JSON="${ART}/source_profile.json" PROFILE_SUMMARY_MD="${ART}/summary.md" \
+  PROFILE_HEARTBEAT_JSON="${ART}/heartbeat.json" \
+  OUT_DIR="${ART}/lf_run" LOG_FILE="${ART}/train.log" RUN_ID="v6_stage2_lora_bwd_t${BEST_T}" \
   scripts/kt/run_lf_lora_sft_kt.sh
 
 .venv/bin/python agent/kt/scripts/validate_kt_arm_profile.py \
-  --artifact-dir "${ART}" \
-  --expected-gpu-id 1 --expected-cuda-visible-devices 1 \
+  --profile-json "${ART}/profile.json" \
+  --train-log "${ART}/train.log" \
   --expected-seq-len 4096 --expected-batch 4 --expected-rank 64 \
+  --expected-dropout 0.0 --expected-top-k 8 --expected-cache-depth 2 \
+  --expected-recompute true --expected-route-rank-limit 8388608 \
   --require-native-field backward_lora_grad_ms \
   --require-native-field backward_base_grad_ms \
   --require-native-field backward_grouped_tile_ms
@@ -651,19 +678,28 @@ taskset -c 0-143 env \
   BACKEND=kt_armbf16 KT_BACKEND=armbf16 KT_PRECISION=bf16 \
   KT_NUM_THREADS="${BEST_T}" KT_ARM_OMP_NUM_THREADS="${BEST_T}" KT_ARM_SFT_BACKWARD_THREADS="${BEST_T}" \
   KT_ARM_OMP_PROC_BIND=false KT_ARM_SFT_PROFILE=1 \
+  KT_ARM_SFT_MAX_ROUTE_RANK_WORK=8388608 \
+  KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH=1 \
   MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B \
+  DATASET=asym_long_sft_smoke__qwen3-30b-a3b__s4096 \
   CUTOFF_LEN=4096 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
   LORA_RANK=64 LORA_ALPHA=128 LORA_DROPOUT=0.0 \
+  GRADIENT_CHECKPOINTING=true \
   MAX_STEPS=3 MAX_SAMPLES=12 \
   PROFILE=1 PROFILE_PROFILER=source PROFILE_LEVEL=module PROFILE_SYNC=1 \
   PROFILE_WARMUP_STEPS=1 PROFILE_MEASURE_STEPS=2 PROFILE_TOTAL_STEPS=3 \
-  OUTPUT_ROOT="${ART}" \
+  PROFILE_OUTPUT_DIR="${ART}" PROFILE_JSON="${ART}/profile.json" \
+  PROFILE_SOURCE_JSON="${ART}/source_profile.json" PROFILE_SUMMARY_MD="${ART}/summary.md" \
+  PROFILE_HEARTBEAT_JSON="${ART}/heartbeat.json" \
+  OUT_DIR="${ART}/lf_run" LOG_FILE="${ART}/train.log" RUN_ID="v6_stage3_lora_fwd_t${BEST_T}" \
   scripts/kt/run_lf_lora_sft_kt.sh
 
 .venv/bin/python agent/kt/scripts/validate_kt_arm_profile.py \
-  --artifact-dir "${ART}" \
-  --expected-gpu-id 1 --expected-cuda-visible-devices 1 \
+  --profile-json "${ART}/profile.json" \
+  --train-log "${ART}/train.log" \
   --expected-seq-len 4096 --expected-batch 4 --expected-rank 64 \
+  --expected-dropout 0.0 --expected-top-k 8 --expected-cache-depth 2 \
+  --expected-recompute true --expected-route-rank-limit 8388608 \
   --require-native-field expert_schedule_wall_ms \
   --require-native-field backward_tile_recompute_ms \
   --require-native-field backward_grouped_tile_ms
@@ -764,13 +800,20 @@ for T in 16 32 64; do
     BACKEND=kt_armbf16 KT_BACKEND=armbf16 KT_PRECISION=bf16 \
     KT_NUM_THREADS="${T}" KT_ARM_OMP_NUM_THREADS="${T}" KT_ARM_SFT_BACKWARD_THREADS="${T}" \
     KT_ARM_OMP_PROC_BIND=false KT_ARM_SFT_PROFILE=1 \
+    KT_ARM_SFT_MAX_ROUTE_RANK_WORK=8388608 \
+    KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH=1 \
     MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B \
+    DATASET=asym_long_sft_smoke__qwen3-30b-a3b__s4096 \
     CUTOFF_LEN=4096 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
     LORA_RANK=64 LORA_ALPHA=128 LORA_DROPOUT=0.0 \
+    GRADIENT_CHECKPOINTING=true \
     MAX_STEPS=3 MAX_SAMPLES=12 \
     PROFILE=1 PROFILE_PROFILER=source PROFILE_LEVEL=module PROFILE_SYNC=1 \
     PROFILE_WARMUP_STEPS=1 PROFILE_MEASURE_STEPS=2 PROFILE_TOTAL_STEPS=3 \
-    OUTPUT_ROOT="${ART}" \
+    PROFILE_OUTPUT_DIR="${ART}" PROFILE_JSON="${ART}/profile.json" \
+    PROFILE_SOURCE_JSON="${ART}/source_profile.json" PROFILE_SUMMARY_MD="${ART}/summary.md" \
+    PROFILE_HEARTBEAT_JSON="${ART}/heartbeat.json" \
+    OUT_DIR="${ART}/lf_run" LOG_FILE="${ART}/train.log" RUN_ID="v6_stage4_shards_t${T}" \
     scripts/kt/run_lf_lora_sft_kt.sh
 done
 ```
@@ -952,12 +995,18 @@ BEST_T=32  # replace with validated winner
 SEQ_LENS=4096 \
 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
 BACKEND_SPECS='kt_armbf16|recomp' \
-GPU_IDS=1 \
+GPU_POOL=1 \
+PROFILERS=source \
+ASYMM_EXP_ACT_POLICIES='none|false' \
+CONTINUE_ON_ERROR=false \
+RUN_POST=false \
 KT_NUM_THREADS="${BEST_T}" \
 KT_ARM_OMP_NUM_THREADS="${BEST_T}" \
 KT_ARM_SFT_BACKWARD_THREADS="${BEST_T}" \
 KT_ARM_OMP_PROC_BIND=false \
 KT_ARM_SFT_PROFILE=1 \
+KT_ARM_SFT_MAX_ROUTE_RANK_WORK=8388608 \
+KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH=1 \
 MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B \
 LORA_RANK=64 \
 LORA_ALPHA=128 \
@@ -966,14 +1015,13 @@ WARMUP_STEPS=5 \
 MAX_STEPS=10 \
 MAX_SAMPLES=60 \
 PROFILE=1 \
-PROFILE_PROFILER=source \
 PROFILE_LEVEL=module \
 PROFILE_SYNC=1 \
 OUTPUT_ROOT=profiling_kt_codex_smoke/v6_accept_qwen3_s4096_b4_r64_w5_s10_t${BEST_T}_source \
 scripts/kt/profile_lora_lf_kt.sh
 ```
 
-If GPU 1 is unavailable, rerun with `GPU_IDS=2`; do not use GPU 0 or GPU 3 for
+If GPU 1 is unavailable, rerun with `GPU_POOL=2`; do not use GPU 0 or GPU 3 for
 accepted numbers.
 
 Acceptance validation:
@@ -981,14 +1029,35 @@ Acceptance validation:
 ```bash
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 ART="profiling_kt_codex_smoke/v6_accept_qwen3_s4096_b4_r64_w5_s10_t${BEST_T}_source"
+PROFILE_JSON="$(find "${ART}" -path '*/b4_s4096/profile.json' -print -quit)"
+TRAIN_LOG="$(dirname "${PROFILE_JSON}")/train.log"
 
 .venv/bin/python agent/kt/scripts/validate_kt_arm_profile.py \
-  --artifact-dir "${ART}" \
-  --expected-gpu-id 1 \
-  --expected-cuda-visible-devices 1 \
+  --profile-json "${PROFILE_JSON}" \
+  --train-log "${TRAIN_LOG}" \
+  --expected-model Qwen/Qwen3-30B-A3B \
   --expected-seq-len 4096 \
   --expected-batch 4 \
   --expected-rank 64 \
+  --expected-dropout 0.0 \
+  --expected-warmup-steps 5 \
+  --expected-measure-steps 10 \
+  --expected-profile-total-steps 15 \
+  --expected-trainer-max-steps 15 \
+  --expected-measured-step-start 6 \
+  --expected-measured-step-end 15 \
+  --min-measured-step-samples 10 \
+  --expected-top-k 8 \
+  --expected-cache-depth 2 \
+  --expected-recompute true \
+  --expected-route-rank-limit 8388608 \
+  --require-final \
+  --require-native-kv base_kernel=sve_bfdot_blocked \
+  --require-native-kv down_kernel=bf16_bfdot_blocked \
+  --require-native-kv lora_forward_kernel=sve_bfdot_fmla \
+  --require-native-kv backward_base_kernel=grouped_sve_tile \
+  --require-native-kv backward_lora_kernel=grouped_sve_tile_dropout0 \
+  --require-native-kv compiled_sve_bf16=1 \
   --require-native-field expert_schedule_wall_ms \
   --require-native-field backward_grouped_tile_ms \
   --require-native-field backward_tile_recompute_ms \

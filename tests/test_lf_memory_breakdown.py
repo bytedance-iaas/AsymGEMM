@@ -597,10 +597,12 @@ def test_plotter_reports_legacy_schema_when_no_v2_runs_match(tmp_path: Path) -> 
             "include_non_source": False,
             "workload": [],
             "backend": [],
-            "profiler": [],
-            "router_mode": [],
-            "seq_lens": [],
-            "expert_recompute_policies": [],
+                "profiler": [],
+                "router_mode": [],
+                "expact": [],
+                "attnact": [],
+                "seq_lens": [],
+                "expert_recompute_policies": [],
         },
     )()
 
@@ -644,10 +646,12 @@ def test_plotter_repairs_stale_summary_from_jsonl(tmp_path: Path) -> None:
             "include_non_source": False,
             "workload": [],
             "backend": [],
-            "profiler": [],
-            "router_mode": [],
-            "seq_lens": [],
-            "expert_recompute_policies": [],
+                "profiler": [],
+                "router_mode": [],
+                "expact": [],
+                "attnact": [],
+                "seq_lens": [],
+                "expert_recompute_policies": [],
         },
     )()
 
@@ -784,6 +788,8 @@ def test_source_profile_reports_activation_offload_counters() -> None:
                 "asym_forward_calls": 3,
                 "asym_dx_calls": 2,
                 "expact_lora_a_forward_grouped_calls": 4,
+                "expact_lora_a_forward_cpu_left_grouped_calls": 3,
+                "expact_lora_a_forward_hbm_grouped_calls": 1,
                 "reference_fallback_count": 0,
                 "fallback_reasons": {},
             }
@@ -853,5 +859,7 @@ def test_source_profile_reports_activation_offload_counters() -> None:
     assert summary["stage_bytes_by_tag"] == {"S_stage": 32}
     row = summary["rows"][0]
     assert row["name"] == "experts"
+    assert row["execution_stats"]["expact_lora_a_forward_cpu_left_grouped_calls"] == 3
+    assert row["execution_stats"]["expact_lora_a_forward_hbm_grouped_calls"] == 1
     assert row["execution_stats"]["asym_forward_calls"] == 3
     assert row["activation_offload_stats"]["cpu_pool_limit_bytes"] == 8192

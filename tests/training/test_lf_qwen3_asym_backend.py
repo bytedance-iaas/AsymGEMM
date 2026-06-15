@@ -1578,6 +1578,20 @@ def test_qwen3_tok_policy_uses_saved_low_rank_without_subset_lora_a_recompute() 
     assert subset_gate_up_calls == 0
 
 
+def test_qwen3_activation_offload_lora_a_fwd_selector_accepts_exact_values_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD", raising=False)
+    assert qwen3_moe_module._expert_act_offload_lora_a_fwd_mode() == "cpu"
+    monkeypatch.setenv("ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD", "hbm")
+    assert qwen3_moe_module._expert_act_offload_lora_a_fwd_mode() == "hbm"
+    for bad_value in ("bad", "cpu_left", "gpu_hbm", "gpu-hbm", "gpu", ""):
+        monkeypatch.setenv("ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD", bad_value)
+        with pytest.raises(ValueError, match="ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD"):
+            qwen3_moe_module._expert_act_offload_lora_a_fwd_mode()
+    monkeypatch.setenv("ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD", "HBM")
+    with pytest.raises(ValueError, match="ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD"):
+        qwen3_moe_module._expert_act_offload_lora_a_fwd_mode()
+
+
 @pytest.mark.parametrize("policy", ["tok-le0", "tok-le2", "tok-le2-act", "gc-exp"])
 def test_asym_qwen3_experts_torch_recompute_lora_dropout_matches_none(policy: str) -> None:
     torch.manual_seed(39)
@@ -2538,7 +2552,11 @@ def test_asym_qwen3_experts_sm100_backward_matches_torch_backend() -> None:
 
 
 @pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")
-def test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend(monkeypatch) -> None:
+@pytest.mark.parametrize("lora_a_forward_mode", ["cpu", "hbm"])
+def test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    lora_a_forward_mode: str,
+) -> None:
     torch.manual_seed(71)
     source_torch = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128).cuda()
     source_asym = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128)
@@ -2573,6 +2591,7 @@ def test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend(monke
     top_k_weights = top_k_weights.cuda()
 
     monkeypatch.delenv("ASYMM_EXPERT_ACT_OFFLOAD", raising=False)
+    monkeypatch.setenv("ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD", lora_a_forward_mode)
     out_torch = torch_backend(x_torch, top_k_index, top_k_weights)
     monkeypatch.setenv("ASYMM_EXPERT_ACT_OFFLOAD", "1")
     full_reason = require_expert_activation_offload_kernels(scope="full", check_only=True)
@@ -2580,6 +2599,14 @@ def test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend(monke
         with pytest.raises(NotImplementedError, match=full_reason):
             asym_backend(x_asym, top_k_index, top_k_weights)
         return
+    if lora_a_forward_mode == "hbm":
+        try:
+            qwen3_moe_module._require_lora_grouped_mm()
+        except RuntimeError as exc:
+            with pytest.raises(NotImplementedError, match="grouped"):
+                asym_backend(x_asym, top_k_index, top_k_weights)
+            assert str(exc)
+            return
     out_asym = asym_backend(x_asym, top_k_index, top_k_weights)
     _assert_tensor_close_l2("qwen3 activation offload output", out_asym, out_torch, max_abs_tol=6e-3, rel_l2_tol=2e-2)
 
@@ -2607,7 +2634,17 @@ def test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend(monke
     assert stats["pre_final_cleanup_cpu_owned_bytes"] == 0
     assert stats["final_cleanup_released_bytes"] == 0
     assert stats["cpu_pool_cached_bytes"] <= stats["cpu_pool_limit_bytes"]
-    assert asym_backend.stats.cpu_left_lora_a_calls > 0
+    assert stats["expert_lora_a_forward_mode"] == lora_a_forward_mode
+    if lora_a_forward_mode == "cpu":
+        assert asym_backend.stats.cpu_left_lora_a_calls == 3
+        assert asym_backend.stats.expact_lora_a_forward_grouped_calls == 3
+        assert asym_backend.stats.expact_lora_a_forward_cpu_left_grouped_calls == 3
+        assert asym_backend.stats.expact_lora_a_forward_hbm_grouped_calls == 0
+    else:
+        assert asym_backend.stats.cpu_left_lora_a_calls == 0
+        assert asym_backend.stats.expact_lora_a_forward_grouped_calls == 2
+        assert asym_backend.stats.expact_lora_a_forward_cpu_left_grouped_calls == 0
+        assert asym_backend.stats.expact_lora_a_forward_hbm_grouped_calls == 2
 
 
 @pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")

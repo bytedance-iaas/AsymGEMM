@@ -479,6 +479,7 @@ def _trainable_surface_summary(profile: dict[str, Any]) -> dict[str, Any]:
         "kt_peft_expert_lora_parameters",
         "kt_expert_lora_parameters",
         "lf_fused_expert_lora_parameters",
+        "qwen_moe_expert_lora_parameters",
         "kt_fused_expert_lora_parameters",
     )
     if not any(_int_counter(lora, key) is not None for key in surface_counter_keys):
@@ -491,7 +492,8 @@ def _trainable_surface_summary(profile: dict[str, Any]) -> dict[str, Any]:
     peft_expert = peft_expert or 0
     kt_expert = _int_counter(lora, "kt_expert_lora_parameters") or 0
     lf_fused_expert = _int_counter(lora, "lf_fused_expert_lora_parameters") or 0
-    expert_lora = max(kt_expert, peft_expert + lf_fused_expert)
+    qwen_moe_expert = _int_counter(lora, "qwen_moe_expert_lora_parameters") or 0
+    expert_lora = max(kt_expert, peft_expert + lf_fused_expert, qwen_moe_expert)
     non_expert_peft = None if peft_lora is None else max(0, peft_lora - peft_expert)
 
     if expert_lora > 0 and (non_expert_peft or 0) > 0:
@@ -527,6 +529,7 @@ def _trainable_surface_summary(profile: dict[str, Any]) -> dict[str, Any]:
         "expert_lora_parameters": expert_lora,
         "peft_expert_lora_parameters": peft_expert,
         "lf_fused_expert_lora_parameters": lf_fused_expert,
+        "qwen_moe_expert_lora_parameters": qwen_moe_expert,
         "kt_expert_lora_parameters": kt_expert,
         "kt_peft_expert_lora_parameters": kt_peft_expert,
         "kt_fused_expert_lora_parameters": _int_counter(lora, "kt_fused_expert_lora_parameters") or 0,
@@ -806,8 +809,10 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
         f"Backend: `{config.get('backend', '-')}`  ",
         f"Router mode: `{config.get('router_mode', '-')}`  ",
         f"Expert activation offload: `{config.get('asymm_expert_act_offload', '-')}`  ",
+        f"Expert LoRA-A fwd: `{config.get('asymm_expert_act_offload_lora_a_fwd', '-')}`  ",
         f"Attention activation offload: `{config.get('asymm_attn_act_offload', '-')}`  ",
         f"Layer activation offload: `{config.get('asymm_layer_act_offload', '-')}`  ",
+        f"Qwen expert LoRA impl: `{config.get('qwen_moe_expert_lora_impl', '-')}`  ",
         f"Attention GC: `{config.get('attention_gc_enabled', config.get('attn_gc_enabled', '-'))}`  ",
         f"Layer GC: `{config.get('layer_gc_enabled', '-')}`  ",
         f"Precision: `{config.get('precision', '-')}`  ",
@@ -932,6 +937,8 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
             lines += [
                 f"| trainable params | {_trainable_param_display(profile)} |",
                 f"| PEFT LoRA params | {_counter_value(lora, 'peft_lora_parameters')} |",
+                f"| Qwen MoE expert LoRA params | {_counter_value(lora, 'qwen_moe_expert_lora_parameters')} |",
+                f"| Qwen MoE expert LoRA tensors | {_counter_value(lora, 'qwen_moe_expert_lora_tensors')} |",
                 f"| LF fused expert LoRA params | {_counter_value(lora, 'lf_fused_expert_lora_parameters')} |",
                 f"| LF fused expert LoRA tensors | {_counter_value(lora, 'lf_fused_expert_lora_tensors')} |",
                 f"| KT expert LoRA params | {_counter_value(lora, 'kt_expert_lora_parameters')} |",
@@ -945,6 +952,7 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
                 f"| trainable surface | {trainable_surface.get('surface', '-')} |",
                 f"| non-expert PEFT LoRA params | {trainable_surface.get('non_expert_peft_lora_parameters', '-')} |",
                 f"| PEFT expert LoRA params | {trainable_surface.get('peft_expert_lora_parameters', '-')} |",
+                f"| Qwen MoE expert LoRA params | {trainable_surface.get('qwen_moe_expert_lora_parameters', '-')} |",
                 f"| expert LoRA params | {trainable_surface.get('expert_lora_parameters', '-')} |",
                 f"| backend comparison note | {trainable_surface.get('comparison_note', '-')} |",
             ]

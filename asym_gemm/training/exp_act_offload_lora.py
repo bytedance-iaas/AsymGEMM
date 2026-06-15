@@ -7,7 +7,7 @@ import torch
 from .activation_offload import ActivationOffloadManager, CPUActivationHandle
 from .cpu_left import CPU_LEFT_BF16_BINDING
 from .frozen_linear import AsymExecutionStats, _group_metadata_tensors
-from .lora import GroupedLoRAMetadata, grouped_expert_lora_cpu_left
+from .lora import GroupedLoRAMetadata, grouped_expert_lora, grouped_expert_lora_cpu_left
 
 
 LORA_A_GRAD_CPU_RIGHT = "sm100_grouped_lora_a_grad_bf16_cpu_right"
@@ -68,6 +68,21 @@ def _check_cpu_left_inputs(source_cpu: torch.Tensor, lora_a: torch.Tensor, tag: 
         raise RuntimeError(f"{tag}: CPU-left LoRA-A shape mismatch")
 
 
+def _check_hbm_lora_a_inputs(source_hbm: torch.Tensor, lora_a: torch.Tensor, tag: str) -> None:
+    if source_hbm.device.type != "cuda":
+        raise RuntimeError(f"{tag}: HBM LoRA-A source must be CUDA, got {source_hbm.device}")
+    if lora_a.device.type != "cuda":
+        raise RuntimeError(f"{tag}: HBM LoRA-A weight must be CUDA, got {lora_a.device}")
+    if source_hbm.dtype != torch.bfloat16 or lora_a.dtype != torch.bfloat16:
+        raise RuntimeError(f"{tag}: HBM LoRA-A requires BF16 source and weight")
+    if not source_hbm.is_contiguous() or not lora_a.is_contiguous():
+        raise RuntimeError(f"{tag}: HBM LoRA-A requires contiguous source and weight")
+    if source_hbm.dim() != 2 or lora_a.dim() != 3:
+        raise RuntimeError(f"{tag}: HBM LoRA-A expects source [M,K] and weight [E,r,K]")
+    if int(source_hbm.shape[1]) != int(lora_a.shape[2]):
+        raise RuntimeError(f"{tag}: HBM LoRA-A shape mismatch")
+
+
 def _check_pinned_cpu_bf16_2d(source_cpu: torch.Tensor, tag: str) -> None:
     if source_cpu.device.type != "cpu":
         raise RuntimeError(f"{tag}: expected CPU tensor, got {source_cpu.device}")
@@ -103,6 +118,31 @@ def grouped_lora_a_forward_cpu_left(
     )
     if stats is not None:
         stats.expact_lora_a_forward_grouped_calls += 1
+        stats.expact_lora_a_forward_cpu_left_grouped_calls += 1
+    return out
+
+
+def grouped_lora_a_forward_hbm(
+    source_hbm: torch.Tensor,
+    lora_a: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    *,
+    metadata: GroupedLoRAMetadata | None,
+    stats: AsymExecutionStats | None,
+    tag: str,
+) -> torch.Tensor:
+    _check_hbm_lora_a_inputs(source_hbm, lora_a, tag)
+    out = grouped_expert_lora(
+        source_hbm,
+        lora_a,
+        offsets,
+        experts,
+        metadata=metadata,
+    )
+    if stats is not None:
+        stats.expact_lora_a_forward_grouped_calls += 1
+        stats.expact_lora_a_forward_hbm_grouped_calls += 1
     return out
 
 
@@ -263,6 +303,7 @@ def stage_low_rank_from_cpu(
 
 __all__ = [
     "grouped_lora_a_forward_cpu_left",
+    "grouped_lora_a_forward_hbm",
     "grouped_lora_a_grad_cpu_right",
     "grouped_lora_a_pair_forward_cpu_left",
     "grouped_lora_a_pair_grad_cpu_right",

@@ -254,8 +254,8 @@ def test_lf_plain_lora_all_adapter_adds_qwen3_fused_expert_lora() -> None:
     trainable_names = [name for name, param in model.named_parameters() if param.requires_grad]
 
     assert count_fused_moe_lora(model) == {"modules": 1, "tensors": 6, "parameters": 576}
-    assert any("mlp.experts._lf_fused_lora_params.gate_lora_a" in name for name in trainable_names)
-    assert any("mlp.experts._lf_fused_lora_params.down_lora_b" in name for name in trainable_names)
+    assert any("mlp.experts.lora_gate_A.default" in name for name in trainable_names)
+    assert any("mlp.experts.lora_down_B.default" in name for name in trainable_names)
     assert any("self_attn.q_proj.lora_A" in name for name in trainable_names)
     assert all(".mlp.gate." not in name and not name.endswith(".mlp.gate.weight") for name in trainable_names)
 
@@ -263,7 +263,7 @@ def test_lf_plain_lora_all_adapter_adds_qwen3_fused_expert_lora() -> None:
 @requires_lf_adapter
 def test_lf_peft_lora_all_does_not_add_adapter_to_qwen_moe_routers() -> None:
     from peft import LoraConfig, TaskType, get_peft_model
-    from llamafactory.model.model_utils.fused_moe_lora import apply_fused_moe_lora, count_fused_moe_lora
+    from llamafactory.model.model_utils.fused_moe_lora import count_fused_moe_lora, prepare_qwen_moe_expert_lora_config
     from llamafactory.model.model_utils.misc import find_all_linear_modules
     from llamafactory.model.model_utils.visual import patch_target_modules
     from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
@@ -282,18 +282,25 @@ def test_lf_peft_lora_all_does_not_add_adapter_to_qwen_moe_routers() -> None:
             ),
             target_modules,
         )
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=2,
+            lora_alpha=4,
+            lora_dropout=0.0,
+            target_modules=target_modules,
+        )
+        peft_config = prepare_qwen_moe_expert_lora_config(
+            model,
+            peft_config,
+            "custom-peft",
+            raw_lora_target=["all"],
+            resolved_target_modules=target_modules,
+        )
         model = get_peft_model(
             model,
-            LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                inference_mode=False,
-                r=2,
-                lora_alpha=4,
-                lora_dropout=0.0,
-                target_modules=target_modules,
-            ),
+            peft_config,
         )
-        apply_fused_moe_lora(model, rank=2, alpha=4)
         return model
 
     qwen3 = wrap_like_lf_lora_all(
@@ -341,16 +348,243 @@ def test_lf_peft_lora_all_does_not_add_adapter_to_qwen_moe_routers() -> None:
         lora_module_names = [
             name
             for name, _module in model.named_modules()
-            if "lora_A" in name or "lora_B" in name or "_lf_fused_lora_params" in name
+            if "lora_A" in name or "lora_B" in name or "lora_" in name
         ]
         trainable_names = [name for name, param in model.named_parameters() if param.requires_grad]
 
         assert count_fused_moe_lora(model)["modules"] == 1
         assert all(".mlp.gate" not in name for name in lora_module_names)
         assert all(".mlp.gate" not in name for name in trainable_names)
-        assert any("mlp.experts._lf_fused_lora_params.gate_lora" in name for name in trainable_names)
+        assert any("mlp.experts.lora_gate_A.default" in name for name in trainable_names)
 
     assert any("mlp.shared_expert_gate.lora_A" in name for name, _param in qwen35.named_parameters())
+
+
+@requires_lf_adapter
+def test_lf_qwen_expert_lora_respects_explicit_target_selection() -> None:
+    from peft import LoraConfig, TaskType, get_peft_model
+    from llamafactory.model.model_utils.fused_moe_lora import count_fused_moe_lora, prepare_qwen_moe_expert_lora_config
+    from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+
+    def build_model(targets: list[str]) -> nn.Module:
+        model = Qwen3MoeForCausalLM(
+            Qwen3MoeConfig(
+                vocab_size=64,
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                moe_intermediate_size=8,
+                num_experts=4,
+                num_experts_per_tok=2,
+                norm_topk_prob=True,
+                output_router_logits=False,
+                tie_word_embeddings=False,
+            )
+        )
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=2,
+            lora_alpha=4,
+            lora_dropout=0.0,
+            target_modules=targets,
+        )
+        peft_config = prepare_qwen_moe_expert_lora_config(
+            model,
+            peft_config,
+            "custom-peft",
+            raw_lora_target=targets,
+            resolved_target_modules=targets,
+        )
+        return get_peft_model(model, peft_config)
+
+    assert count_fused_moe_lora(build_model(["experts"]))["modules"] == 1
+    assert count_fused_moe_lora(build_model(["q_proj"]))["modules"] == 0
+
+
+@requires_lf_adapter
+def test_lf_qwen_expert_lora_target_parameters_mode_is_stock_peft_baseline() -> None:
+    from peft import LoraConfig, TaskType, get_peft_model
+    from llamafactory.model.model_utils.fused_moe_lora import count_fused_moe_lora, prepare_qwen_moe_expert_lora_config
+    from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+
+    model = Qwen3MoeForCausalLM(
+        Qwen3MoeConfig(
+            vocab_size=64,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            moe_intermediate_size=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            output_router_logits=False,
+            tie_word_embeddings=False,
+        )
+    )
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=2,
+        lora_alpha=4,
+        lora_dropout=0.0,
+        target_modules=["q_proj"],
+    )
+    peft_config = prepare_qwen_moe_expert_lora_config(
+        model,
+        peft_config,
+        "peft-target-parameters",
+        raw_lora_target=["experts", "q_proj"],
+        resolved_target_modules=["experts", "q_proj"],
+    )
+    assert set(peft_config.target_parameters) == {
+        "model.layers.0.mlp.experts.down_proj",
+        "model.layers.0.mlp.experts.gate_up_proj",
+    }
+
+    model = get_peft_model(model, peft_config)
+    expert_trainable = {
+        name: param.numel()
+        for name, param in model.named_parameters()
+        if param.requires_grad and ".mlp.experts." in name
+    }
+    assert count_fused_moe_lora(model) == {"modules": 0, "tensors": 0, "parameters": 0}
+    assert sum(expert_trainable.values()) == 448
+    assert any(".mlp.experts.lora_A.default.weight" in name for name in expert_trainable)
+
+
+@requires_lf_adapter
+def test_lf_qwen_expert_lora_handles_zero3_partitioned_expert_shapes() -> None:
+    from llamafactory.model.model_utils.fused_moe_lora import prepare_qwen_moe_expert_lora_config
+    from peft import LoraConfig, TaskType
+    from peft.tuners.lora.layer import ParamWrapper
+    from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+
+    model = Qwen3MoeForCausalLM(
+        Qwen3MoeConfig(
+            vocab_size=64,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            moe_intermediate_size=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            output_router_logits=False,
+            tie_word_embeddings=False,
+        )
+    )
+    experts = model.model.layers[0].mlp.experts
+    gate_up_shape = experts.gate_up_proj.shape
+    down_shape = experts.down_proj.shape
+
+    for name in ("gate_up_proj", "down_proj"):
+        original = getattr(experts, name)
+        partitioned = torch.nn.Parameter(torch.empty(0, dtype=original.dtype), requires_grad=original.requires_grad)
+        partitioned.ds_shape = original.shape
+        partitioned.ds_numel = original.numel()
+        setattr(experts, name, partitioned)
+
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=2,
+        lora_alpha=4,
+        lora_dropout=0.0,
+        target_modules=["q_proj"],
+    )
+    peft_config = prepare_qwen_moe_expert_lora_config(
+        model,
+        peft_config,
+        "peft-target-parameters",
+        raw_lora_target=["all"],
+        resolved_target_modules=["q_proj"],
+    )
+    assert set(peft_config.target_parameters) == {
+        "model.layers.0.mlp.experts.down_proj",
+        "model.layers.0.mlp.experts.gate_up_proj",
+    }
+
+    wrapper = ParamWrapper(experts, "default", "gate_up_proj", r=2, lora_alpha=4, lora_dropout=0.0)
+    assert (wrapper.num_experts, wrapper.in_features, wrapper.out_features) == tuple(gate_up_shape)
+    nested_wrapper = ParamWrapper(wrapper, "default", "down_proj", r=2, lora_alpha=4, lora_dropout=0.0)
+    assert (nested_wrapper.num_experts, nested_wrapper.in_features, nested_wrapper.out_features) == tuple(down_shape)
+
+
+@requires_lf_adapter
+def test_lf_qwen_expert_lora_runs_backward_and_reloads(tmp_path: Path) -> None:
+    from llamafactory.model.adapter import _load_peft_with_qwen_expert_lora
+    from llamafactory.model.model_utils.fused_moe_lora import count_fused_moe_lora, prepare_qwen_moe_expert_lora_config
+    from peft import LoraConfig, TaskType, get_peft_model
+    from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+
+    def qwen_config() -> Qwen3MoeConfig:
+        return Qwen3MoeConfig(
+            vocab_size=64,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            moe_intermediate_size=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            output_router_logits=False,
+            tie_word_embeddings=False,
+        )
+
+    base = Qwen3MoeForCausalLM(qwen_config())
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=2,
+        lora_alpha=4,
+        lora_dropout=0.0,
+        target_modules=["q_proj"],
+    )
+    peft_config = prepare_qwen_moe_expert_lora_config(
+        base,
+        peft_config,
+        "custom-peft",
+        raw_lora_target=["experts", "q_proj"],
+        resolved_target_modules=["experts", "q_proj"],
+    )
+    model = get_peft_model(base, peft_config)
+    model.train()
+
+    input_ids = torch.randint(0, 64, (2, 8), dtype=torch.long)
+    loss = model(input_ids=input_ids, labels=input_ids).loss
+    loss.backward()
+    expert_grads = [
+        param.grad
+        for name, param in model.named_parameters()
+        if "mlp.experts.lora_" in name and param.requires_grad
+    ]
+    assert expert_grads
+    assert any(grad is not None for grad in expert_grads)
+
+    model.save_pretrained(tmp_path)
+    reloaded_base = Qwen3MoeForCausalLM(qwen_config())
+    reloaded = _load_peft_with_qwen_expert_lora(
+        reloaded_base,
+        str(tmp_path),
+        is_trainable=True,
+        init_kwargs={},
+        requested_mode="auto",
+    )
+    assert count_fused_moe_lora(reloaded) == {"modules": 1, "tensors": 6, "parameters": 576}
+    assert any("mlp.experts.lora_gate_A.default" in name for name, _param in reloaded.named_parameters())
 
 
 @requires_lf_adapter

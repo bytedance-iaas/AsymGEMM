@@ -197,8 +197,10 @@ def test_profile_config_records_attention_activation_and_gc(monkeypatch: pytest.
     monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_BACKEND", "asym_cpuadamwds")
     monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_EXPERT_POLICY", "gc-attn-exp")
     monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD", "false")
+    monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD", "hbm")
     monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD", "true")
     monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD", "false")
+    monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_QWEN_EXPERT_LORA_IMPL", "peft-target-parameters")
     monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED", "true")
     monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED", "false")
 
@@ -226,8 +228,10 @@ def test_profile_config_records_attention_activation_and_gc(monkeypatch: pytest.
     assert config["expert_recompute_policy_spec"] == "gc-attn-exp"
     assert config["expert_recompute_impl"] == "torch_checkpoint"
     assert config["asymm_expert_act_offload"] == "false"
+    assert config["asymm_expert_act_offload_lora_a_fwd"] == "hbm"
     assert config["asymm_attn_act_offload"] == "true"
     assert config["asymm_layer_act_offload"] == "false"
+    assert config["qwen_moe_expert_lora_impl"] == "peft-target-parameters"
     assert config["attention_gc_enabled"] == "true"
     assert config["layer_gc_enabled"] == "false"
 
@@ -347,8 +351,8 @@ def test_lora_counters_count_peft_expert_lora_by_parameter_name() -> None:
             self.layers = torch.nn.ModuleList([torch.nn.Module()])
             self.layers[0].mlp = torch.nn.Module()
             self.layers[0].mlp.experts = torch.nn.Module()
-            self.layers[0].mlp.experts.gate_lora_A = torch.nn.Parameter(torch.ones(2, 3))
-            self.layers[0].mlp.experts.gate_lora_B = torch.nn.Parameter(torch.ones(3, 2))
+            self.layers[0].mlp.experts.lora_gate_A = torch.nn.Parameter(torch.ones(2, 3))
+            self.layers[0].mlp.experts.lora_gate_B = torch.nn.Parameter(torch.ones(3, 2))
             self.layers[0].mlp.shared_expert = torch.nn.Module()
             self.layers[0].mlp.shared_expert.gate_proj = torch.nn.Module()
             self.layers[0].mlp.shared_expert.gate_proj.lora_A = torch.nn.Parameter(torch.ones(2, 4))
@@ -367,6 +371,45 @@ def test_lora_counters_count_peft_expert_lora_by_parameter_name() -> None:
     assert counters["peft_lora_parameters"] == 2 * 3 + 3 * 2 + 2 * 4 + 2 * 5
     assert counters["peft_expert_lora_tensors"] == 3
     assert counters["peft_expert_lora_parameters"] == 2 * 3 + 3 * 2 + 2 * 4
+
+
+def test_lora_counters_use_sidecar_when_model_view_is_partitioned(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_profile_launcher_module()
+    source_json = tmp_path / "source_profile.json"
+    sidecar = tmp_path / "lora_surface.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "available": True,
+                "source": "unit",
+                "trainable_parameters": 100,
+                "all_parameters": 200,
+                "peft_lora_parameters": 80,
+                "peft_expert_lora_tensors": 2,
+                "peft_expert_lora_parameters": 32,
+                "qwen_moe_expert_lora_modules": 1,
+                "qwen_moe_expert_lora_tensors": 6,
+                "qwen_moe_expert_lora_parameters": 32,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ASYM_GEMM_LF_PROFILE_SOURCE_JSON", str(source_json))
+
+    old_model = module._LAST_LF_MODEL
+    module._LAST_LF_MODEL = torch.nn.Module()
+    try:
+        counters = module._lora_counters_from_model()
+    finally:
+        module._LAST_LF_MODEL = old_model
+
+    assert counters["trainable_parameters"] == 100
+    assert counters["peft_expert_lora_parameters"] == 32
+    assert counters["qwen_moe_expert_lora_parameters"] == 32
+    assert counters["sidecar_source"] == "unit"
 
 
 def test_model_capture_startup_validation_rejects_missing_kt_wrappers(monkeypatch) -> None:

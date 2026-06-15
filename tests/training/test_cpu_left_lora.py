@@ -26,6 +26,14 @@ def _sm100_cpu_left_available() -> bool:
     )
 
 
+def _grouped_mm_available() -> bool:
+    try:
+        lora_impl._require_lora_grouped_mm()
+    except RuntimeError:
+        return False
+    return True
+
+
 def _pin_cpu(tensor: torch.Tensor) -> torch.Tensor:
     pinned = tensor.detach().cpu().contiguous().pin_memory()
     if not pinned.is_pinned():
@@ -369,3 +377,35 @@ def test_expact_lora_a_forward_wrappers_use_real_cpu_left(monkeypatch: pytest.Mo
     torch.testing.assert_close(down, _reference(act_cpu, down_a, offsets, experts_t), atol=0.0, rtol=0.0)
     assert stats.cpu_left_lora_a_calls == 3
     assert stats.expact_lora_a_forward_grouped_calls == 3
+    assert stats.expact_lora_a_forward_cpu_left_grouped_calls == 3
+    assert stats.expact_lora_a_forward_hbm_grouped_calls == 0
+
+
+@pytest.mark.skipif(not _grouped_mm_available(), reason="PyTorch grouped_mm required")
+def test_expact_lora_a_forward_hbm_uses_grouped_lora_and_records_stats() -> None:
+    torch.manual_seed(13)
+
+    lengths = [64, 32]
+    experts = [0, 1]
+    offsets, experts_t = _metadata(lengths, experts)
+    x_hbm = torch.randn((sum(lengths), 128), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((2, 16, 128), device="cuda", dtype=torch.bfloat16)
+    metadata = lora_impl.prepare_grouped_lora_metadata(offsets, experts_t, dense_experts=True)
+    stats = AsymExecutionStats()
+
+    out = expact_impl.grouped_lora_a_forward_hbm(
+        x_hbm,
+        weight,
+        offsets,
+        experts_t,
+        metadata=metadata,
+        stats=stats,
+        tag="gate",
+    )
+    ref = lora_impl.grouped_expert_lora(x_hbm, weight, offsets, experts_t, metadata=metadata)
+
+    torch.testing.assert_close(out, ref, atol=0.0, rtol=0.0)
+    assert stats.cpu_left_lora_a_calls == 0
+    assert stats.expact_lora_a_forward_grouped_calls == 1
+    assert stats.expact_lora_a_forward_cpu_left_grouped_calls == 0
+    assert stats.expact_lora_a_forward_hbm_grouped_calls == 1

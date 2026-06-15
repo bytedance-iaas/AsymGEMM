@@ -39,6 +39,7 @@ class FakeQwen3Experts(nn.Module):
 @dataclass
 class VariantResult:
     variant: str
+    lora_a_forward_mode: str
     peak_allocated_bytes: int
     peak_reserved_bytes: int
     step_ms: float
@@ -258,15 +259,18 @@ def _profile_variant(
     model: AsymQwen3Experts,
     *,
     activation_offload: bool,
+    lora_a_forward_mode: str,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
     args: argparse.Namespace,
 ) -> VariantResult:
     previous = os.environ.get("ASYMM_EXPERT_ACT_OFFLOAD")
+    previous_lora_a_forward_mode = os.environ.get("ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD")
     if activation_offload:
         os.environ["ASYMM_EXPERT_ACT_OFFLOAD"] = "1"
     else:
         os.environ.pop("ASYMM_EXPERT_ACT_OFFLOAD", None)
+    os.environ["ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD"] = lora_a_forward_mode
     try:
         for idx in range(args.warmup):
             _step(model, args.seed + 1000 + idx, top_k_index, top_k_weights, args)
@@ -310,6 +314,7 @@ def _profile_variant(
                 step_ms = elapsed * 1000.0 / max(1, args.iters)
         return VariantResult(
             variant=variant,
+            lora_a_forward_mode=lora_a_forward_mode,
             peak_allocated_bytes=max(peaks_allocated) if peaks_allocated else 0,
             peak_reserved_bytes=max(peaks_reserved) if peaks_reserved else 0,
             step_ms=step_ms,
@@ -324,6 +329,10 @@ def _profile_variant(
             os.environ.pop("ASYMM_EXPERT_ACT_OFFLOAD", None)
         else:
             os.environ["ASYMM_EXPERT_ACT_OFFLOAD"] = previous
+        if previous_lora_a_forward_mode is None:
+            os.environ.pop("ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD", None)
+        else:
+            os.environ["ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD"] = previous_lora_a_forward_mode
 
 
 def main() -> None:
@@ -341,6 +350,7 @@ def main() -> None:
     parser.add_argument("--use-cuda-events", action="store_true")
     parser.add_argument("--profile-breakdown", action="store_true")
     parser.add_argument("--breakdown-sync-cuda", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--lora-a-forward-mode", choices=("cpu", "hbm"), default="cpu")
     parser.add_argument("--output-json", type=str, default="")
     args = parser.parse_args()
 
@@ -356,7 +366,15 @@ def main() -> None:
     baseline = _make_model(args, source_state, None)
     lora_state = _make_lora_state(baseline, seed=args.seed + 31)
     _copy_lora_state(baseline, lora_state)
-    current = _profile_variant("current_asym", baseline, activation_offload=False, top_k_index=top_k_index, top_k_weights=top_k_weights, args=args)
+    current = _profile_variant(
+        "current_asym",
+        baseline,
+        activation_offload=False,
+        lora_a_forward_mode="cpu",
+        top_k_index=top_k_index,
+        top_k_weights=top_k_weights,
+        args=args,
+    )
     del baseline
     torch.cuda.empty_cache()
 
@@ -365,6 +383,7 @@ def main() -> None:
         "activation_offload",
         candidate,
         activation_offload=True,
+        lora_a_forward_mode=args.lora_a_forward_mode,
         top_k_index=top_k_index,
         top_k_weights=top_k_weights,
         args=args,

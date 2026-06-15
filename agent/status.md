@@ -182,6 +182,37 @@ Validation notes:
 - The `zero3_offload|recomp` row completed and wrote a source profile, but the post-run trainable-surface guard failed. It logged only attention LoRA modules (`q_proj`, `k_proj`, `v_proj`, `o_proj`) with 53,477,376 trainable params and no captured expert LoRA, while the Asym rows train 3,375,366,144 LoRA params including 3,321,888,768 expert LoRA params. Treat this row as a measured historical artifact, not an accepted apples-to-apples baseline.
 - The attention activation offload rows materially reduce HBM, but their current latency is not acceptable: they reduce memory by tens of GiB while increasing step time to about 42-46s. They should not be accepted as production changes until the fetch/backward path is redesigned.
 
+## Qwen3 Expert Activation-Offload LoRA-A A/B
+
+Run: `Qwen/Qwen3-30B-A3B`, `b4_s4096`, `drop000`, `warmup=5`, `measure=10`, source profiler, memory attribution/breakdown/snapshot disabled.
+
+Backend/policy: `asym_cpuadamwds|norecomp`, `none|true|true|true` (`expert`, `attention`, and `layer` activation offload enabled).
+
+| Forward LoRA-A mode | Peak allocated HBM | Peak reserved HBM | Source fwd+bwd step | Avg forward | Avg backward | Forward-end HBM | Saved CPU peak |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `cpu` | 34.593 GiB | 39.676 GiB | 44.930s | 11.318s | 33.612s | 16.046 GiB | 1.469 GiB |
+| `hbm` | 34.593 GiB | 39.676 GiB | 36.631s | 2.831s | 33.800s | 16.046 GiB | 1.469 GiB |
+
+| Forward LoRA-A mode | Trainer E2E step | AsymGEMM fwd/dx | Expert CPU-left LoRA-A calls | Expert HBM LoRA-A calls | Generic CPU-left LoRA-A calls | Loss max / last / train |
+|---|---:|---:|---:|---:|---:|---:|
+| `cpu` | 46.864s | 242,640 / 344,160 | 103,680 | 0 | 241,920 | 2.335 / 1.267 / 1.916 |
+| `hbm` | 38.506s | 242,640 / 344,160 | 0 | 69,120 | 138,240 | 2.326 / 1.261 / 1.915 |
+
+Result:
+
+- `hbm` passed the hard memory acceptance gate: peak allocated HBM delta is `0.000 GiB`, below the `<0.5 GiB` cap, and peak reserved HBM also did not increase.
+- `hbm` improved source forward+backward step by `8.299s` (`18.47%`), forward by `8.488s` (`74.99%`), and trainer E2E step by `8.357s` (`17.83%`). Backward increased by `0.188s` (`0.56%`).
+- The default remains `cpu` in this patch because the implementation plan's default-promotion latency gate asks for at least `20%` matched avg-step improvement. `hbm` is validated and selectable with `ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm`.
+- Both profiles reported `attention+expert LoRA`, `3,375,366,144` trainable params, `3,321,888,768` expert LoRA params, and `reference_fallback_count=0`.
+
+Artifacts:
+
+The artifact directory names are historical from the run that produced the
+numbers; the current selector values are only `cpu` and `hbm`.
+
+- `cpu`: `outputs/lf_ab_stage3_cpu_left/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a16_drop000/asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact1__attnact1__layeract1__loraafwdcpu__qwenexpertcustom-peft/b4_s4096/profile.json`
+- `hbm`: `outputs/lf_ab_stage3_gpu_hbm/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a16_drop000/asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact1__attnact1__layeract1__loraafwdhbm__qwenexpertcustom-peft/b4_s4096/profile.json`
+
 ## Interpretation
 
 The old AsymGEMM memory gap versus Zero3/SuperOffload was mostly not activation memory. Activations were similar across systems. The gap came from persistent GPU state that Zero3/SuperOffload shard or offload:
