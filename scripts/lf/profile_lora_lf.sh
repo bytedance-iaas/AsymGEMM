@@ -38,15 +38,15 @@ LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 # BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
 # Plain asym remains the non-CPUAdam Asym baseline; the default e2e path validates the Asym CPUAdamW backend.
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
-BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp"}
+BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp"}
 
 # Paired expert policy / expert activation offload / attention activation offload / layer activation offload axis.
 # Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD.
 # Example: none|true|false|false,gc-attn-exp|false|false|false,none|true|true|true.
 # ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|false|false,gc-exp|false|false|false,gc-attn-exp|false|false|false,none|false|false|false"}
-# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|true|true"}
-ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false"}
+ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|true|true"}
+# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false"}
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
 
@@ -104,8 +104,8 @@ USE_ASYM_CPU_ADAMW=${USE_ASYM_CPU_ADAMW:-false}
 ASYM_CPU_ADAMW_BACKEND=${ASYM_CPU_ADAMW_BACKEND:-deepspeed}
 ASYM_CPU_ADAMW_PIN_MEMORY=${ASYM_CPU_ADAMW_PIN_MEMORY:-true}
 ASYM_CPU_ADAMW_FP32_MASTER=${ASYM_CPU_ADAMW_FP32_MASTER:-true}
+# Comma/space-separated list of one or more boolean values to sweep (e.g. "false,true").
 ASYM_CPU_ADAMW_GRAD_OFFLOAD=${ASYM_CPU_ADAMW_GRAD_OFFLOAD:-false}
-ASYM_CPU_ADAMW_GRAD_OFFLOADS=${ASYM_CPU_ADAMW_GRAD_OFFLOADS:-${ASYM_CPU_ADAMW_GRAD_OFFLOAD}}
 
 
 
@@ -241,8 +241,8 @@ Options:
   --asym-cpu-adamw-backend torch|deepspeed
   --asym-cpu-adamw-pin-memory true|false
   --asym-cpu-adamw-fp32-master true|false
-  --asym-cpu-adamw-grad-offloads LIST
-                                 Grad offload modes for Asym CPUAdamW backends, e.g. false,true.
+  --asym-cpu-adamw-grad-offload LIST
+                                 Grad offload mode(s) for Asym CPUAdamW backends; one or more, e.g. false,true.
 
   KT:
   --kt-kernel-dir DIR            Integrated kt-kernel source tree.
@@ -1543,10 +1543,8 @@ while (($#)); do
     --asym-cpu-adamw-pin-memory=*) ASYM_CPU_ADAMW_PIN_MEMORY="$(bool_value "${1#*=}")"; shift ;;
     --asym-cpu-adamw-fp32-master) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_FP32_MASTER="$(bool_value "$2")"; shift 2 ;;
     --asym-cpu-adamw-fp32-master=*) ASYM_CPU_ADAMW_FP32_MASTER="$(bool_value "${1#*=}")"; shift ;;
-    --asym-cpu-adamw-grad-offload) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_GRAD_OFFLOAD="$(bool_value "$2")"; ASYM_CPU_ADAMW_GRAD_OFFLOADS="${ASYM_CPU_ADAMW_GRAD_OFFLOAD}"; shift 2 ;;
-    --asym-cpu-adamw-grad-offload=*) ASYM_CPU_ADAMW_GRAD_OFFLOAD="$(bool_value "${1#*=}")"; ASYM_CPU_ADAMW_GRAD_OFFLOADS="${ASYM_CPU_ADAMW_GRAD_OFFLOAD}"; shift ;;
-    --asym-cpu-adamw-grad-offloads) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_GRAD_OFFLOADS="$2"; shift 2 ;;
-    --asym-cpu-adamw-grad-offloads=*) ASYM_CPU_ADAMW_GRAD_OFFLOADS="${1#*=}"; shift ;;
+    --asym-cpu-adamw-grad-offload) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_GRAD_OFFLOAD="$2"; shift 2 ;;
+    --asym-cpu-adamw-grad-offload=*) ASYM_CPU_ADAMW_GRAD_OFFLOAD="${1#*=}"; shift ;;
     --kt-kernel-dir) need_value "$1" "${2-}"; KT_KERNEL_DIR="$2"; shift 2 ;;
     --kt-kernel-dir=*) KT_KERNEL_DIR="${1#*=}"; shift ;;
     --kt-tools-dir) need_value "$1" "${2-}"; KT_TOOLS_DIR="$2"; shift 2 ;;
@@ -1684,7 +1682,6 @@ EXPANDABLE_SEG=$(bool_value "${EXPANDABLE_SEG}")
 USE_ASYM_CPU_ADAMW=$(bool_value "${USE_ASYM_CPU_ADAMW}")
 ASYM_CPU_ADAMW_PIN_MEMORY=$(bool_value "${ASYM_CPU_ADAMW_PIN_MEMORY}")
 ASYM_CPU_ADAMW_FP32_MASTER=$(bool_value "${ASYM_CPU_ADAMW_FP32_MASTER}")
-ASYM_CPU_ADAMW_GRAD_OFFLOAD=$(bool_value "${ASYM_CPU_ADAMW_GRAD_OFFLOAD}")
 case "${ASYM_CPU_ADAMW_BACKEND,,}" in
   torch) ASYM_CPU_ADAMW_BACKEND=torch ;;
   deepspeed|ds) ASYM_CPU_ADAMW_BACKEND=deepspeed ;;
@@ -1767,9 +1764,9 @@ if [[ -z "${output_root}" ]]; then
 fi
 mapfile -t profilers < <(tokens "${profiler_spec}" | while read -r value; do profiler_label "${value}"; done | dedupe)
 mapfile -t asym_cpu_adamw_grad_offload_modes < <(
-  tokens "${ASYM_CPU_ADAMW_GRAD_OFFLOADS}" | while read -r value; do bool_value "${value}"; done | dedupe
+  tokens "${ASYM_CPU_ADAMW_GRAD_OFFLOAD}" | while read -r value; do bool_value "${value}"; done | dedupe
 )
-((${#asym_cpu_adamw_grad_offload_modes[@]})) || die "ASYM_CPU_ADAMW_GRAD_OFFLOADS must include at least one boolean value"
+((${#asym_cpu_adamw_grad_offload_modes[@]})) || die "ASYM_CPU_ADAMW_GRAD_OFFLOAD must include at least one boolean value"
 if printf '%s\n' "${profilers[@]}" | grep -qx 'nsys'; then
   plot_profilers=(nsys)
 else

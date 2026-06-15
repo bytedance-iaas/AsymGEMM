@@ -255,7 +255,7 @@ def test_profile_lora_lf_dry_run_sweeps_asym_cpuadamw_grad_offload_modes(tmp_pat
         env={
             "LF_DIR": str(lf_dir),
             "BACKEND_SPECS": "asym_cpuadamwtorch|recomp",
-            "ASYM_CPU_ADAMW_GRAD_OFFLOADS": "false,true",
+            "ASYM_CPU_ADAMW_GRAD_OFFLOAD": "false,true",
             "GPU_POOL": "0",
             "PROFILERS": "source",
             "SEQ_LENS": "128",
