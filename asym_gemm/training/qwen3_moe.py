@@ -1979,6 +1979,20 @@ class AsymQwen3Experts(nn.Module):
             if strict and torch.cuda.is_available():
                 if not self.gate_up_base.host_weight.weight.is_pinned() or not self.down_base.host_weight.weight.is_pinned():
                     raise RuntimeError("Qwen3 expert CPU offload requires pinned CPU HostWeights for AsymGEMM")
+            # Release the duplicated source base weights now that the pinned HostWeight copies are
+            # independent (pin_memory() always copies). Frozen experts would otherwise stay resident a
+            # second time (~1.2 GiB/layer, ~58 GiB total). Gated on the copies actually being pinned so
+            # a silent pin failure (HostWeight swallows the error) cannot drop weights still aliased.
+            if self.gate_up_base.host_weight.weight.is_pinned() and self.down_base.host_weight.weight.is_pinned():
+                for _src_attr in ("gate_up_proj", "down_proj"):
+                    _src = getattr(source, _src_attr, None)
+                    if isinstance(_src, torch.nn.Parameter):
+                        _src.data = torch.empty(0, dtype=_src.dtype, device=_src.device)
+                    elif _src is not None:
+                        try:
+                            setattr(source, _src_attr, None)
+                        except Exception:
+                            pass
         else:
             device = _resolve_device(gate_up)
             self.gate_up_base = TorchGroupedFrozenLinear(gate_up, device=device, dtype=base_dtype)

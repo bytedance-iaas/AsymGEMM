@@ -163,3 +163,15 @@ Notes:
 3. What are the bottlenecks for timing and memory currently?
 
 ```
+
+
+1. Can we build a cuda graph for kernel launch (partially)? This avoids synchronization from the CPU.
+2. Scheduling between recompute/offload and where to place tensors (cpu, gpu, nvme)
+3. nvme -> hbm use native gemm / cpu -> smem use asymGEMM scheduling. 
+4. What to use for compute (cpu or GPU) also scheduling
+
+5. Can we fully use back and forward beween CPU and GPU whihc uses separte bandwith not like smem <-> hbm which shares the bandwith betwen read and write
+e.g. compute silu and directly write to HBM
+
+6. Ask agents to optimize bf16 sm100 AsymGEMM kernels.
+

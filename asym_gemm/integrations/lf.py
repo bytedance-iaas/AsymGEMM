@@ -1402,6 +1402,12 @@ def apply_lf_asym_lora(
     if report.trainable_lora_params == 0 and strict:
         raise ValueError("AsymGEMM setup produced zero trainable LoRA parameters.")
     _register_runtime_report(report)
+    # Drop the orphaned pre-conversion modules (retained in expert_replacements / reference cycles) so
+    # the source base weights freed inside AsymQwen3Experts.__init__ are actually reclaimed by the
+    # allocator instead of lingering until the next incidental GC.
+    import gc
+
+    gc.collect()
     return model, report
 
 
