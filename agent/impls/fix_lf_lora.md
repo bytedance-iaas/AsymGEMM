@@ -598,6 +598,7 @@ Modify:
 
 - `scripts/lf/run_lf_profiled_train.py`
   - `_collect_lora_summary`
+  - source-profile config payload
 - `scripts/lf/postprocess_lf_profile_artifacts.py`
   - trainable-surface summary logic
 - `scripts/lf/run_lf_lora_sft.sh`
@@ -640,6 +641,19 @@ peft-target-parameters:
   expert_lora_parameters == peft_expert_lora_parameters
 ```
 
+AsymGEMM parity counters:
+
+```text
+asym_cpuadamwds/asym custom backend:
+  kt_expert_lora_parameters or kt_fused_expert_lora_parameters records AsymGEMM/KT-style MoE LoRA params
+
+LF custom-peft:
+  peft_expert_lora_parameters records the Torch PEFT-compatible MoE LoRA params
+
+Required equality:
+  LF custom-peft peft_expert_lora_parameters == AsymGEMM expert_lora_parameters
+```
+
 Keep `_lf_fused_lora_params` counting only as legacy detection. It must not be the accepted new LF expert LoRA path.
 
 Risk and uncertainty:
@@ -647,6 +661,7 @@ Risk and uncertainty:
 - The broader `lora_` counter must not accidentally count non-LoRA metadata. Count only trainable `nn.Parameter`s.
 - Postprocess tests currently expect old `LF fused expert LoRA` wording. Update wording to `PEFT expert LoRA`.
 - Postprocess output must group or label rows by `qwen_moe_expert_lora_impl`; otherwise A/B memory/timing rows are ambiguous.
+- The profile summary must expose enough fields to compare MoE-block LoRA trainable params across AsymGEMM and LF custom-peft.
 
 Validation before Stage 6:
 
@@ -654,7 +669,8 @@ Validation before Stage 6:
 .venv/bin/python -m pytest -q \
   tests/lf/test_lf_profile_postprocess.py::test_lora_counters_count_peft_expert_lora_by_parameter_name \
   tests/lf/test_lf_profile_postprocess.py::test_source_summary_flags_peft_attention_plus_expert_surface \
-  tests/lf/test_lf_profile_postprocess.py::test_profile_summary_keeps_qwen_expert_lora_impl_in_rows
+  tests/lf/test_lf_profile_postprocess.py::test_profile_summary_keeps_qwen_expert_lora_impl_in_rows \
+  tests/lf/test_lf_profile_postprocess.py::test_profile_summary_compares_asym_and_lf_expert_lora_params
 ```
 
 Then run the local unit group:
@@ -671,13 +687,14 @@ Modify:
 
 - No model-code edits unless Stage 6 exposes a bug.
 - Use `scripts/lf/profile_lora_lf.sh` artifacts to compare `peft-target-parameters` against `custom-peft` on the same workload.
+- Also include an AsymGEMM row so the MoE expert-LoRA trainable parameter count can be compared against LF `custom-peft`.
 - This stage is required before accepting the LF expert-LoRA correction because the user-facing question is memory/latency, not only correctness.
 
 Smoke validation:
 
 ```bash
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
-BACKEND_SPECS="zero3_offload|recomp" \
+BACKEND_SPECS="asym_cpuadamwds|norecomp,zero3_offload|recomp" \
 ASYMM_EXP_ACT_POLICIES="none|false|false|false" \
 LF_EXPERT_LORA_IMPLS="peft-target-parameters,custom-peft" \
 SEQ_LENS=4096 \
@@ -702,7 +719,7 @@ Acceptance validation:
 
 ```bash
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
-BACKEND_SPECS="zero3_offload|recomp" \
+BACKEND_SPECS="asym_cpuadamwds|norecomp,zero3_offload|recomp" \
 ASYMM_EXP_ACT_POLICIES="none|false|false|false" \
 LF_EXPERT_LORA_IMPLS="peft-target-parameters,custom-peft" \
 SEQ_LENS=4096 \
@@ -723,18 +740,37 @@ RUN_POST=true \
 scripts/lf/profile_lora_lf.sh --gpus 0
 ```
 
+After the run, postprocess must produce both required tables from the generated artifacts. If `RUN_POST=true` does not already emit them, update `scripts/lf/postprocess_lf_profile_artifacts.py` to emit:
+
+```text
+Table 1: MoE LoRA trainable parameter parity
+Table 2: LF expert-LoRA before/after HBM and timing
+```
+
 Acceptance checks from artifacts:
 
 - `reference_fallback_count == 0`
 - finite stable loss
 - `lora_target == "all"`
-- exactly two comparable rows exist for `qwen_moe_expert_lora_impl in {"peft-target-parameters", "custom-peft"}`
-- both rows have `peft_expert_lora_parameters > 0`
-- both rows have `lf_fused_expert_lora_parameters == 0`
+- comparable LF rows exist for `qwen_moe_expert_lora_impl in {"peft-target-parameters", "custom-peft"}`
+- an AsymGEMM row exists for the same model/rank/workload
+- LF rows have `peft_expert_lora_parameters > 0`
+- LF rows have `lf_fused_expert_lora_parameters == 0`
+- LF `custom-peft` expert LoRA trainable count equals AsymGEMM MoE expert LoRA trainable count
 - no trainable router LoRA under `.mlp.gate`
 - no missing/unexpected expert LoRA keys in save/load validation
 - peak HBM and timing are recorded in the same table format used by prior `profile_lora_lf.sh` comparisons
-- report table must include:
+- final report must include Table 1, MoE-block LoRA trainable parameter comparison:
+  - `backend spec`
+  - `qwen_moe_expert_lora_impl`
+  - `trainable_parameters`
+  - `expert_lora_parameters`
+  - `peft_expert_lora_parameters`
+  - `kt_expert_lora_parameters`
+  - `kt_fused_expert_lora_parameters`
+  - `lf_fused_expert_lora_parameters`
+  - `matches_asym_expert_lora_params`
+- final report must include Table 2, LF before/after memory and timing comparison:
   - `backend spec`
   - `qwen_moe_expert_lora_impl`
   - `peak allocated HBM`
@@ -747,5 +783,5 @@ Acceptance checks from artifacts:
 
 Risk and uncertainty:
 
-- This correction may change ZeRO memory/timing because it changes how expert LoRA is represented and saved. Accept `custom-peft` as the default only if it fixes the trainable surface and does not create a meaningful profiling regression versus `peft-target-parameters`.
+- This correction may change ZeRO memory/timing because it changes how expert LoRA is represented and saved. Accept `custom-peft` as the default only if it matches AsymGEMM MoE expert trainable parameter count and does not create a meaningful profiling regression versus `peft-target-parameters`.
 - If `peft-target-parameters` is faster/lower-memory but has the wrong gate/up math, keep it as an explicit A/B baseline, not the default corrected behavior.

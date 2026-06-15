@@ -17,7 +17,8 @@ The plan below is implementation-focused and intentionally keeps KT work isolate
   - `lora_rank=64`
   - `lora_dropout=0.00`
   - `warmup_steps=5`
-  - `max_steps=10`
+  - `measure_steps=10`
+  - `total max_steps=15`
   - `PROFILE_PROFILER=source`
   - `PROFILE_LEVEL=module`
   - physical GPU 1 first, GPU 2 only as fallback
@@ -54,7 +55,7 @@ Latest known synthetic evidence from v4:
 
 Historical gaps entering v5:
 
-- Full LF e2e KT profiling has not been completed for the v4 kernel state.
+- Full LF e2e KT acceptance profiling has not been completed for the v4 kernel state. One same-config warmup step was collected on 2026-06-15, but it was intentionally stopped before the full 5-warmup/10-measured source window because the unoptimized 8-thread KT path would take several more hours.
 - `agent/kt/scripts/profile_lora_lf_kt.sh` is KT-isolated, but its current default backend sweep is still the Asym CPUAdamW profile default. For KT work, either pass `BACKEND_SPECS='kt_armbf16|recomp'` every time or change the KT-specific script default in Stage 1.
 - The current backward route loop still calls `backward_route_accumulate()` once per route. That is the main remaining performance issue.
 - `scatter_route_grad_x_to_tokens()` and forward `merge_routes_to_output()` still perform scalar per-token/per-route/per-hidden loops and are visible at long sequence.
@@ -136,14 +137,28 @@ Results:
 - Same-config KT comparison profile requested next:
   - artifact target: `profiling_kt_codex_smoke/v5_sameconfig_qwen3_s4096_b4_r64_w5_s10_source`
   - shape: `Qwen/Qwen3-30B-A3B`, `seq_len=4096`, `batch=4`, `rank=64`, `dropout=0.00`
-  - profiling window: `warmup_steps=5`, `max_steps=10`
+  - profiling window: `warmup_steps=5`, `measure_steps=10`, `total max_steps=15`
   - source profiler settings should match the Asym activation-offload table as closely as possible: `PROFILE_LEVEL=module`, `PROFILE_SYNC=true`, memory attribution/breakdown/snapshot disabled.
   - acceptance requires a final `source_profile.json`, validator pass, 48 forward calls, 48 backward calls per measured step, and grouped native kernel labels in the train log.
+- Same-config partial evidence collected on physical GPU 1:
+  - artifact: `profiling_kt_codex_smoke/v5_sameconfig_qwen3_s4096_b4_r64_w5_s10_source`
+  - status: interrupted after the first complete warmup step to avoid a multi-hour full run before the obvious kernel fixes; no final `source_profile.json`, so this is not acceptance.
+  - actual shape: `seq_len=4096`, `batch=4`, `rank=64`, `dropout=0.00`, `CUDA_VISIBLE_DEVICES=1`, `KT_NUM_THREADS=8`.
+  - trainer step 1: `1171.55 s/it`, loss `2.1505`.
+  - source step sample: forward `273.793 s`, backward `895.032 s`, optimizer/update side `2.175 s`.
+  - HBM: peak allocated `85.604 GiB`, peak reserved `90.920 GiB` in the step sample; global partial summary peak reserved `91.305 GiB`.
+  - process RSS peak: `170.344 GiB`.
+  - first 48 native forward rows: `expert_schedule_wall_ms` total `253.695 s`, avg `5.285 s/layer`; route merge avg `26.8 ms/layer`.
+  - first 48 native backward rows: `backward_grouped_tile_ms` total `843.744 s`, avg `17.578 s/layer`; `backward_route_scatter_ms` avg `23.3 ms/layer`; `backward_repack_wait_ms` avg about `0.798 s/layer`.
+  - backward task-sum counters show the math priority: `backward_base_grad_ms` avg `72.752 s/layer`, then `backward_lora_grad_ms` avg `31.927 s/layer`. These are task-sum counters, not single-layer wall time.
+  - native labels were correct: `base_kernel=sve_bfdot_blocked`, `down_kernel=bf16_bfdot_blocked`, `lora_forward_kernel=sve_bfdot_fmla`, `backward_base_kernel=grouped_sve_tile`, `backward_lora_kernel=grouped_sve_tile_dropout0`, `compiled_sve_bf16=1`.
+  - profiler cleanup needed: the partial profile config recorded `max_steps=10` even though the trainer command/log used 15 total steps. Make the profile metadata distinguish warmup, measured, and total trainer steps before relying on automated comparisons.
 
 Remaining optimization target:
 
 - The slow path is no longer DeepSpeed or GPU memory pressure. It is KT native ARM BF16/FP32 CPU math in backward route gradient accumulation.
-- The dominant measured split is `backward_base_grad_ms`, then `backward_lora_grad_ms`. Route scatter is no longer a major blocker in the long LF source artifact.
+- The current same-config run used only `KT_NUM_THREADS=8`. Before another full acceptance run, add a same-shape thread sweep for at least 8/16/32/64 threads on physical GPU 1 or 2 and pick the best setting for the acceptance profile.
+- The dominant measured split is `backward_base_grad_ms`, then `backward_lora_grad_ms`. Route scatter is no longer a major blocker in the long LF source artifact or the same-config partial run.
 - Memory around 9-10 GB sparse backward scratch is expected for this CPU-routed KT design and is lower HBM than ZeRO-3 offload because routed expert compute and scratch are on CPU.
 - Further work should focus on reducing grouped base gradient math and LoRA gradient math task sums, not on serializer loops, DeepSpeed configuration, or GPU memory symptoms.
 
