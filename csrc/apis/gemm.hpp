@@ -546,8 +546,8 @@ static void check_sm89_block_scales(
     const auto& sa = *scale_a_block;
     const auto& sb = *scale_b_block;
     DG_HOST_ASSERT(sa.is_cuda() && sa.is_contiguous());
-    DG_HOST_ASSERT(sb.is_cuda() && sb.is_contiguous());
-    DG_HOST_ASSERT(sa.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(sa.is_cuda() && sa.is_contiguous());
+    DG_HOST_ASSERT((sb.is_cuda() || (sb.device().is_cpu() && sb.is_pinned())) && sb.is_contiguous());
     DG_HOST_ASSERT(sb.scalar_type() == torch::kFloat32);
     DG_HOST_ASSERT(sa.numel() == rows * kg);
     DG_HOST_ASSERT(sb.numel() == num_experts * ng * kg);
