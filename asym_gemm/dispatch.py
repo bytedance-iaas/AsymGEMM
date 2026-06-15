@@ -135,6 +135,23 @@ def _as_int(list_size) -> int:
     return int(list_size.item())
 
 
+def _is_block_scaled(a_scale: torch.Tensor, b_scale: torch.Tensor) -> bool:
+    """Distinguish 1x128/128x128 block scales from legacy per-token/per-expert.
+
+    The weight scale is the discriminator: per-expert is 1-D ``[G]``, block is
+    3-D ``[G, ceil(N/128), ceil(K/128)]``.
+    """
+    if a_scale is None or b_scale is None or b_scale.dim() != 3:
+        return False
+    if a_scale.dtype != torch.float32 or b_scale.dtype != torch.float32:
+        raise TypeError(
+            "SM89/SM90 block-scale path requires float32 scales, got "
+            f"a={a_scale.dtype}, b={b_scale.dtype} (UE8M0/packed scales are "
+            "Blackwell-only)"
+        )
+    return True
+
+
 def m_grouped_fp8_asym_gemm_nt_contiguous(
     a: Tuple[torch.Tensor, torch.Tensor],
     b: Tuple[torch.Tensor, torch.Tensor],
@@ -148,9 +165,10 @@ def m_grouped_fp8_asym_gemm_nt_contiguous(
 ) -> None:
     """Architecture-agnostic contiguous FP8 grouped GEMM ``[M, K] @ [G, N, K].mT``.
 
-    ``a``/``b`` are ``(data, scale)`` pairs. On Blackwell they carry block scales;
-    on SM89/SM90 ``a``'s scale is a per-token tensor and ``b``'s scale is a
-    per-expert tensor.
+    ``a``/``b`` are ``(data, scale)`` pairs. Block scales (``a``: [M, ceil(K/128)]
+    1x128, ``b``: [G, ceil(N/128), ceil(K/128)] 128x128, both float32) are accepted
+    on every architecture. The SM89/SM90 path also accepts the legacy per-token /
+    per-expert scale pair.
     """
     if is_blackwell():
         _C.m_grouped_fp8_asym_gemm_nt_contiguous(
@@ -160,6 +178,18 @@ def m_grouped_fp8_asym_gemm_nt_contiguous(
 
     a_data, a_scale = a
     b_data, b_scale = b
+    if _is_block_scaled(a_scale, b_scale):
+        _C.m_grouped_fp8_asym_gemm_sm89(
+            a_data,
+            b_data,
+            d,
+            offsets,
+            experts,
+            _as_int(list_size),
+            scale_a_block=a_scale.contiguous(),
+            scale_b_block=b_scale.contiguous(),
+        )
+        return
     _C.m_grouped_fp8_asym_gemm_sm89(
         a_data,
         b_data,
@@ -186,9 +216,10 @@ def m_grouped_fp8_asym_gemm_nt_masked(
 ) -> None:
     """Architecture-agnostic masked FP8 grouped GEMM ``[G, M, K] @ [G, N, K].mT``.
 
-    ``a``/``b`` are ``(data, scale)`` pairs. On Blackwell they carry block scales;
-    on SM89/SM90 ``a``'s scale is a per-token tensor ([G, M, 1]) and ``b``'s scale
-    is a per-expert tensor.
+    ``a``/``b`` are ``(data, scale)`` pairs. Block scales (``a``: [G, M, ceil(K/128)]
+    1x128, ``b``: [G, ceil(N/128), ceil(K/128)] 128x128, both float32) are accepted
+    on every architecture. The SM89/SM90 path also accepts the legacy per-token
+    ([G, M, 1]) / per-expert scale pair.
     """
     if is_blackwell():
         _C.m_grouped_fp8_asym_gemm_nt_masked(
@@ -198,6 +229,17 @@ def m_grouped_fp8_asym_gemm_nt_masked(
 
     a_data, a_scale = a
     b_data, b_scale = b
+    if _is_block_scaled(a_scale, b_scale):
+        _C.m_grouped_fp8_asym_gemm_sm89_masked(
+            a_data,
+            b_data,
+            d,
+            masked_m,
+            expected_m,
+            scale_a_block=a_scale.contiguous(),
+            scale_b_block=b_scale.contiguous(),
+        )
+        return
     _C.m_grouped_fp8_asym_gemm_sm89_masked(
         a_data,
         b_data,

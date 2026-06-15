@@ -412,13 +412,22 @@ __global__ void sm80_moe_gemm_impl(SM80MoEParams params) {
 //   at contiguous smem addresses after the XOR.  The 32-col atom is the minimum
 //   divisible by BLOCK_K (which is a multiple of 32).
 // ──────────────────────────────────────────────────────────────────────────────
-template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t NWARPS>
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t NWARPS,
+          bool USE_BLOCK_SCALES = false>
 __global__ void sm89_moe_fp8_gemm_impl(SM89MoEFP8Params params) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
 
     static_assert(BLOCK_K >= 32,       "BLOCK_K must be >= 32 (SM89 FP8 MMA K-atom)");
     static_assert(BLOCK_K % 32 == 0,   "BLOCK_K must be a multiple of 32");
     static_assert(BLOCK_M % (NWARPS * 16) == 0, "BLOCK_M must be divisible by NWARPS*16");
+    static_assert(BLOCK_K < 128 || BLOCK_K % 128 == 0,
+                  "BLOCK_K must be <128 or a multiple of 128 (scale k-group alignment)");
+
+    // Block-scale mode: number of 128-element scale k-groups per K-tile, and
+    // MMA K-atoms (32 elements each) per group. BLOCK_K < 128 → the whole tile
+    // sits inside one k-group (128 % BLOCK_K == 0 holds for 64/32).
+    constexpr int SCALE_K_GROUPS    = (BLOCK_K >= 128) ? static_cast<int>(BLOCK_K / 128) : 1;
+    constexpr int K_ATOMS_PER_GROUP = static_cast<int>((SCALE_K_GROUPS > 1 ? 128u : BLOCK_K) / 32u);
 
     using ElementIn  = cutlass::float_e4m3_t;   // FP8 E4M3 — smem and MMA operands
     using ElementOut = cutlass::bfloat16_t;     // BF16 — output and partial-sum HBM type
@@ -456,6 +465,8 @@ __global__ void sm89_moe_fp8_gemm_impl(SM89MoEFP8Params params) {
     ElementIn*  smem_w  = smem_x + SMEM_X_ELEMS;
     ElementOut* smem_o  = reinterpret_cast<ElementOut*>(smem_w + SMEM_W_ELEMS);
     float*      smem_sa = reinterpret_cast<float*>(smem_ + SMEM_SA_OFFSET);
+    float*      smem_rcs = smem_sa + BLOCK_M;    // block mode: 1/cs_first per row
+    float*      smem_ratio = smem_rcs + BLOCK_M; // block mode: [SCALE_K_GROUPS-1, BLOCK_M] cs_g/cs_{g+1}
 
     Tensor sX = make_tensor(make_smem_ptr(smem_x), SmemLayoutX{});
     Tensor sW = make_tensor(make_smem_ptr(smem_w), SmemLayoutW{});
@@ -530,6 +541,10 @@ __global__ void sm89_moe_fp8_gemm_impl(SM89MoEFP8Params params) {
     Tensor tOsO_src = gmem_thr_copy_o.partition_S(sO);
     Tensor tOpO_o   = make_tensor<bool>(make_shape(size<2>(tOsO_src)));
     cute::fill(tOpO_o, true);
+
+    // MMA-C-layout coordinates: same shape as tSrO, gives the in-tile (m, n)
+    // coord of each accumulator element (block-scale seed rescaling needs m).
+    Tensor tScO = thr_mma.partition_C(cO);
 
     // ── Hoist: X-side K-predicate vector for partial-tile cp.async ──────────
     // K is always BLOCK_K-aligned (validated at API boundary), so all entries are
@@ -606,6 +621,12 @@ __global__ void sm89_moe_fp8_gemm_impl(SM89MoEFP8Params params) {
             : 0.0f;
         const float  scalar_cs = params.scale_a * params.scale_b;
 
+        // Block-scale mode: 1x128 activation x 128x128 weight scales, applied
+        // per K-tile. BLOCK_N <= 128 and 128 % BLOCK_N == 0, so each CTA's
+        // N-tile sits in exactly one n-group.
+        constexpr bool use_block_scales = USE_BLOCK_SCALES;
+        const int  ng_idx = (n_tile * static_cast<int>(BLOCK_N)) / 128;
+
         const ElementIn* x_e = x_g + len_start * K;
         const ElementIn* w_e = w_g + (int64_t)expert_id * N * K;
         ElementOut*      o_e = o_g + len_start * N;
@@ -632,6 +653,35 @@ __global__ void sm89_moe_fp8_gemm_impl(SM89MoEFP8Params params) {
                 int m_global = m_base + tidx;
                 smem_sa[tidx] = (m_global < static_cast<int>(len))
                     ? sa_base[m_global] : 1.0f;
+            }
+        };
+
+        // ── Helper: block mode — combined cs = sa[token, kg] * sb[e, ng, kg]
+        // for every scale k-group covered by one K-tile. Stores:
+        //   smem_sa[m]    = cs of the LAST group   (epilogue multiplies by it)
+        //   smem_rcs[m]   = 1 / cs of the FIRST group (seed rescale)
+        //   smem_ratio[g][m] = cs_g / cs_{g+1}     (inter-group accumulator fold)
+        auto load_block_scales_for_tile = [&](int m, int k) {
+            const int m_base = m * static_cast<int>(BLOCK_M);
+            if (tidx < static_cast<int>(BLOCK_M)) {
+                const int  m_global = m_base + tidx;
+                const bool valid    = m_global < static_cast<int>(len);
+                const int  kg_base  = (k * static_cast<int>(BLOCK_K)) / 128;
+                float cs[SCALE_K_GROUPS];
+                CUTE_UNROLL
+                for (int g = 0; g < SCALE_K_GROUPS; ++g) {
+                    const int kg = kg_base + g;
+                    const float sb = params.scale_b_blk_ptr[
+                        ((int64_t)expert_id * params.sb_ng + ng_idx) * params.sa_kg + kg];
+                    cs[g] = valid
+                        ? params.scale_a_blk_ptr[(len_start + m_global) * params.sa_kg + kg] * sb
+                        : 1.0f;
+                }
+                smem_sa[tidx]  = cs[SCALE_K_GROUPS - 1];
+                smem_rcs[tidx] = 1.0f / cs[0];
+                CUTE_UNROLL
+                for (int g = 0; g + 1 < SCALE_K_GROUPS; ++g)
+                    smem_ratio[g * static_cast<int>(BLOCK_M) + tidx] = cs[g] / cs[g + 1];
             }
         };
 
@@ -662,7 +712,8 @@ __global__ void sm89_moe_fp8_gemm_impl(SM89MoEFP8Params params) {
                                         /*Clear_OOB_MN=*/true,  /*Clear_OOB_K=*/true>(
                         gmem_tiled_copy_xw, tXgX_mk, tXsX, tXcX, tXpX, m_actual);
                 }
-                load_scales_for_m_tile(m);
+                if (use_block_scales) load_block_scales_for_tile(m, 0);
+                else                  load_scales_for_m_tile(m);
                 cp_async_fence();
                 cp_async_wait<0>();
                 __syncthreads();
@@ -673,20 +724,45 @@ __global__ void sm89_moe_fp8_gemm_impl(SM89MoEFP8Params params) {
                 Tensor tOrW_view = smem_thr_copy_B.retile_D(tOrW);
                 cute::copy(smem_copy_B, tOsW, tOrW_view);
 
-                // Native FP8 MMA → FP32 accumulator
-                cute::gemm(tiled_mma, tSrO, tSrX, tOrW, tSrO);
+                // Native FP8 MMA → FP32 accumulator.
+                // Block mode: MMA per 128-element scale k-group, folding each
+                // group's scale into the accumulator via cs_g/cs_{g+1}; the
+                // epilogue applies cs_last once:
+                //   acc = seed/cs_0; per g: +S_g then ×cs_g/cs_{g+1}; out = acc·cs_last
+                if (use_block_scales) {
+                    CUTE_UNROLL
+                    for (int g = 0; g < SCALE_K_GROUPS; ++g) {
+                        CUTE_UNROLL
+                        for (int kk = 0; kk < K_ATOMS_PER_GROUP; ++kk) {
+                            const int ka = g * K_ATOMS_PER_GROUP + kk;
+                            cute::gemm(tiled_mma, tSrO,
+                                       tSrX(_, _, ka), tOrW(_, _, ka), tSrO);
+                        }
+                        if (g + 1 < SCALE_K_GROUPS) {
+                            CUTE_UNROLL
+                            for (int i = 0; i < size(tSrO); i++)
+                                tSrO(i) *= smem_ratio[g * static_cast<int>(BLOCK_M)
+                                                      + get<0>(tScO(i))];
+                        }
+                    }
+                } else {
+                    cute::gemm(tiled_mma, tSrO, tSrX, tOrW, tSrO);
+                }
 
-                if (k_max == 1 && !use_tensor_scales) {
+                if (k_max == 1 && !use_tensor_scales && !use_block_scales) {
                     CUTE_UNROLL
                     for (int i = 0; i < size(tSrO); i++) tSrO(i) *= scalar_cs;
                 }
 
                 // FP32 → BF16 via cvt.rn.bf16x2.f32, then write sO → gO
+                // Block mode: every K-tile's partials are scaled by its own cs
+                // (cs already combined into smem_sa, so sb_val passes as 1).
                 Tensor rO = moe_convert_type<ElementOut>(tSrO);
                 Tensor gO_m = gO(_, _, m);
                 write_output(rO, gO_m, m_actual,
-                             /*apply_scale=*/k_max == 1 && use_tensor_scales,
-                             sb_val);
+                             /*apply_scale=*/use_block_scales ||
+                                 (k_max == 1 && use_tensor_scales),
+                             use_block_scales ? 1.0f : sb_val);
             }  // m-loop (k=0)
         }
 
@@ -704,6 +780,13 @@ __global__ void sm89_moe_fp8_gemm_impl(SM89MoEFP8Params params) {
                 const int m_actual = static_cast<int>(
                     cute::min((int64_t)BLOCK_M, len - (int64_t)m * BLOCK_M));
 
+                // Block mode: this tile's cs/rcs must be in smem before the
+                // seed rescale below (cross-thread read → needs a barrier).
+                if (use_block_scales) {
+                    load_block_scales_for_tile(m, k);
+                    __syncthreads();
+                }
+
                 // Load X[m,k] → sX
                 Tensor gX_m    = gX(_, _, m, _);
                 Tensor gO_m    = gO(_, _, m);
@@ -711,14 +794,25 @@ __global__ void sm89_moe_fp8_gemm_impl(SM89MoEFP8Params params) {
                 Tensor tXgX_mk = gmem_thr_copy_xw.partition_S(gX_m(_, _, k));
                 Tensor tXcX    = gmem_thr_copy_xw.partition_S(cX);
 
+                // Seed the accumulator with the previous K-tiles' partial sum.
+                // Block mode: partials hold the SCALED running sum; divide by
+                // this tile's cs so the shared epilogue (x cs) restores it:
+                //   O_k = cs_k * (O_{k-1} / cs_k + X_k W_k) = O_{k-1} + cs_k X_k W_k
                 if (m_actual == static_cast<int>(BLOCK_M)) {
                     cute::copy(gmem_tiled_copy_xw, tXgX_mk, tXsX);
                     cp_async_fence();
                     cp_async_wait<0>();
                     Tensor tSgO = thr_mma.partition_C(gO_m);
-                    CUTE_UNROLL
-                    for (int i = 0; i < size(tSrO); i++)
-                        tSrO(i) = static_cast<float>(tSgO(i));
+                    if (use_block_scales) {
+                        CUTE_UNROLL
+                        for (int i = 0; i < size(tSrO); i++)
+                            tSrO(i) = static_cast<float>(tSgO(i))
+                                      * smem_rcs[get<0>(tScO(i))];
+                    } else {
+                        CUTE_UNROLL
+                        for (int i = 0; i < size(tSrO); i++)
+                            tSrO(i) = static_cast<float>(tSgO(i));
+                    }
                 } else {
                     moe_predicated_copy</*Is_even_MN=*/false, /*Is_even_K=*/true,
                                         /*Clear_OOB_MN=*/true,  /*Clear_OOB_K=*/true>(
@@ -739,12 +833,19 @@ __global__ void sm89_moe_fp8_gemm_impl(SM89MoEFP8Params params) {
                     Tensor rO_seed      = make_tensor<ElementOut>(shape(tSrO));
                     Tensor rO_seed_view = smem_thr_copy_O.retile_D(rO_seed);
                     cute::copy(smem_copy_O, tSsO, rO_seed_view);
-                    CUTE_UNROLL
-                    for (int i = 0; i < size(tSrO); i++)
-                        tSrO(i) = static_cast<float>(rO_seed(i));
+                    if (use_block_scales) {
+                        CUTE_UNROLL
+                        for (int i = 0; i < size(tSrO); i++)
+                            tSrO(i) = static_cast<float>(rO_seed(i))
+                                      * smem_rcs[get<0>(tScO(i))];
+                    } else {
+                        CUTE_UNROLL
+                        for (int i = 0; i < size(tSrO); i++)
+                            tSrO(i) = static_cast<float>(rO_seed(i));
+                    }
                 }
 
-                if (is_last_k) load_scales_for_m_tile(m);
+                if (!use_block_scales && is_last_k) load_scales_for_m_tile(m);
 
                 // LDSM: sX → tSrX,  sW → tOrW
                 Tensor tSrX_view = smem_thr_copy_A.retile_D(tSrX);
@@ -752,10 +853,29 @@ __global__ void sm89_moe_fp8_gemm_impl(SM89MoEFP8Params params) {
                 Tensor tOrW_view = smem_thr_copy_B.retile_D(tOrW);
                 cute::copy(smem_copy_B, tOsW, tOrW_view);
 
-                // Native FP8 MMA — accumulates into seeded FP32 tSrO
-                cute::gemm(tiled_mma, tSrO, tSrX, tOrW, tSrO);
+                // Native FP8 MMA — accumulates into seeded FP32 tSrO.
+                // Block mode: per-group MMA + inter-group rescale (see k=0 path).
+                if (use_block_scales) {
+                    CUTE_UNROLL
+                    for (int g = 0; g < SCALE_K_GROUPS; ++g) {
+                        CUTE_UNROLL
+                        for (int kk = 0; kk < K_ATOMS_PER_GROUP; ++kk) {
+                            const int ka = g * K_ATOMS_PER_GROUP + kk;
+                            cute::gemm(tiled_mma, tSrO,
+                                       tSrX(_, _, ka), tOrW(_, _, ka), tSrO);
+                        }
+                        if (g + 1 < SCALE_K_GROUPS) {
+                            CUTE_UNROLL
+                            for (int i = 0; i < size(tSrO); i++)
+                                tSrO(i) *= smem_ratio[g * static_cast<int>(BLOCK_M)
+                                                      + get<0>(tScO(i))];
+                        }
+                    }
+                } else {
+                    cute::gemm(tiled_mma, tSrO, tSrX, tOrW, tSrO);
+                }
 
-                if (is_last_k && !use_tensor_scales) {
+                if (is_last_k && !use_tensor_scales && !use_block_scales) {
                     CUTE_UNROLL
                     for (int i = 0; i < size(tSrO); i++) tSrO(i) *= scalar_cs;
                 }
@@ -763,8 +883,9 @@ __global__ void sm89_moe_fp8_gemm_impl(SM89MoEFP8Params params) {
                 // FP32 → BF16 via cvt.rn.bf16x2.f32, then write sO → gO
                 Tensor rO = moe_convert_type<ElementOut>(tSrO);
                 write_output(rO, gO_m, m_actual,
-                             /*apply_scale=*/is_last_k && use_tensor_scales,
-                             sb_val);
+                             /*apply_scale=*/use_block_scales ||
+                                 (is_last_k && use_tensor_scales),
+                             use_block_scales ? 1.0f : sb_val);
             }  // m-loop (k>0)
         }  // k-loop
     }  // expert block
@@ -785,13 +906,22 @@ __global__ void sm89_moe_fp8_gemm_impl(SM89MoEFP8Params params) {
 // Each CTA reads masked_m[blockIdx.y] to get the valid row count for its
 // expert, then processes only those rows. Experts with 0 valid rows early-exit.
 // ──────────────────────────────────────────────────────────────────────────────
-template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t NWARPS>
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t NWARPS,
+          bool USE_BLOCK_SCALES = false>
 __global__ void sm89_moe_fp8_gemm_masked_impl(SM89MoEFP8MaskedParams params) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
 
     static_assert(BLOCK_K >= 32,       "BLOCK_K must be >= 32 (SM89 FP8 MMA K-atom)");
     static_assert(BLOCK_K % 32 == 0,   "BLOCK_K must be a multiple of 32");
     static_assert(BLOCK_M % (NWARPS * 16) == 0, "BLOCK_M must be divisible by NWARPS*16");
+    static_assert(BLOCK_K < 128 || BLOCK_K % 128 == 0,
+                  "BLOCK_K must be <128 or a multiple of 128 (scale k-group alignment)");
+
+    // Block-scale mode: number of 128-element scale k-groups per K-tile, and
+    // MMA K-atoms (32 elements each) per group. BLOCK_K < 128 → the whole tile
+    // sits inside one k-group (128 % BLOCK_K == 0 holds for 64/32).
+    constexpr int SCALE_K_GROUPS    = (BLOCK_K >= 128) ? static_cast<int>(BLOCK_K / 128) : 1;
+    constexpr int K_ATOMS_PER_GROUP = static_cast<int>((SCALE_K_GROUPS > 1 ? 128u : BLOCK_K) / 32u);
 
     using ElementIn  = cutlass::float_e4m3_t;
     using ElementOut = cutlass::bfloat16_t;
@@ -824,6 +954,8 @@ __global__ void sm89_moe_fp8_gemm_masked_impl(SM89MoEFP8MaskedParams params) {
     ElementIn*  smem_w  = smem_x + SMEM_X_ELEMS;
     ElementOut* smem_o  = reinterpret_cast<ElementOut*>(smem_w + SMEM_W_ELEMS);
     float*      smem_sa = reinterpret_cast<float*>(smem_ + SMEM_SA_OFFSET);
+    float*      smem_rcs = smem_sa + BLOCK_M;    // block mode: 1/cs_first per row
+    float*      smem_ratio = smem_rcs + BLOCK_M; // block mode: [SCALE_K_GROUPS-1, BLOCK_M] cs_g/cs_{g+1}
 
     Tensor sX = make_tensor(make_smem_ptr(smem_x), SmemLayoutX{});
     Tensor sW = make_tensor(make_smem_ptr(smem_w), SmemLayoutW{});
@@ -886,6 +1018,10 @@ __global__ void sm89_moe_fp8_gemm_masked_impl(SM89MoEFP8MaskedParams params) {
 
     Tensor tXpX = make_tensor<bool>(make_shape(size<2>(gmem_thr_copy_xw.partition_D(sX))));
     cute::fill(tXpX, true);
+
+    // MMA-C-layout coordinates: same shape as tSrO, gives the in-tile (m, n)
+    // coord of each accumulator element (block-scale seed rescaling needs m).
+    Tensor tScO = thr_mma.partition_C(cO);
 
     // ── Helper: write BF16 rO register buffer → sO → gO ─────────────────────
     // When apply_scale=true, per-token scales are in smem_sa[0..BLOCK_M-1] and
@@ -950,6 +1086,11 @@ __global__ void sm89_moe_fp8_gemm_masked_impl(SM89MoEFP8MaskedParams params) {
             : 0.0f;
         const float  scalar_cs = params.scale_a * params.scale_b;
 
+        // Block-scale mode: 1x128 activation x 128x128 weight scales, applied
+        // per K-tile (see contiguous kernel for the seed-rescale scheme).
+        constexpr bool use_block_scales = USE_BLOCK_SCALES;
+        const int  ng_idx = (n_tile * static_cast<int>(BLOCK_N)) / 128;
+
         Tensor mX = make_tensor(make_gmem_ptr(x_e),
                                 make_shape(len, K), make_stride(K, Int<1>{}));
         Tensor mW = make_tensor(make_gmem_ptr(w_e),
@@ -971,6 +1112,33 @@ __global__ void sm89_moe_fp8_gemm_masked_impl(SM89MoEFP8MaskedParams params) {
                 int m_global = m_base + tidx;
                 smem_sa[tidx] = (m_global < static_cast<int>(len))
                     ? sa_base[m_global] : 1.0f;
+            }
+        };
+
+        // ── Helper: block mode — combined cs = sa[g, token, kg] * sb[g, ng, kg]
+        // for every scale k-group covered by one K-tile (see contiguous kernel).
+        auto load_block_scales_for_tile = [&](int m, int k) {
+            const int m_base = m * static_cast<int>(BLOCK_M);
+            if (tidx < static_cast<int>(BLOCK_M)) {
+                const int  m_global = m_base + tidx;
+                const bool valid    = m_global < static_cast<int>(len);
+                const int  kg_base  = (k * static_cast<int>(BLOCK_K)) / 128;
+                float cs[SCALE_K_GROUPS];
+                CUTE_UNROLL
+                for (int g = 0; g < SCALE_K_GROUPS; ++g) {
+                    const int kg = kg_base + g;
+                    const float sb = params.scale_b_blk_ptr[
+                        ((int64_t)expert_e * params.sb_ng + ng_idx) * params.sa_kg + kg];
+                    cs[g] = valid
+                        ? params.scale_a_blk_ptr[
+                              ((int64_t)expert_e * M_max + m_global) * params.sa_kg + kg] * sb
+                        : 1.0f;
+                }
+                smem_sa[tidx]  = cs[SCALE_K_GROUPS - 1];
+                smem_rcs[tidx] = 1.0f / cs[0];
+                CUTE_UNROLL
+                for (int g = 0; g + 1 < SCALE_K_GROUPS; ++g)
+                    smem_ratio[g * static_cast<int>(BLOCK_M) + tidx] = cs[g] / cs[g + 1];
             }
         };
 
@@ -1000,7 +1168,8 @@ __global__ void sm89_moe_fp8_gemm_masked_impl(SM89MoEFP8MaskedParams params) {
                                         /*Clear_OOB_MN=*/true,  /*Clear_OOB_K=*/true>(
                         gmem_tiled_copy_xw, tXgX_mk, tXsX, tXcX, tXpX, m_actual);
                 }
-                load_scales_for_m_tile(m);
+                if (use_block_scales) load_block_scales_for_tile(m, 0);
+                else                  load_scales_for_m_tile(m);
                 cp_async_fence();
                 cp_async_wait<0>();
                 __syncthreads();
@@ -1010,9 +1179,28 @@ __global__ void sm89_moe_fp8_gemm_masked_impl(SM89MoEFP8MaskedParams params) {
                 Tensor tOrW_view = smem_thr_copy_B.retile_D(tOrW);
                 cute::copy(smem_copy_B, tOsW, tOrW_view);
 
-                cute::gemm(tiled_mma, tSrO, tSrX, tOrW, tSrO);
+                // Block mode: per-group MMA + inter-group rescale (see contiguous).
+                if (use_block_scales) {
+                    CUTE_UNROLL
+                    for (int g = 0; g < SCALE_K_GROUPS; ++g) {
+                        CUTE_UNROLL
+                        for (int kk = 0; kk < K_ATOMS_PER_GROUP; ++kk) {
+                            const int ka = g * K_ATOMS_PER_GROUP + kk;
+                            cute::gemm(tiled_mma, tSrO,
+                                       tSrX(_, _, ka), tOrW(_, _, ka), tSrO);
+                        }
+                        if (g + 1 < SCALE_K_GROUPS) {
+                            CUTE_UNROLL
+                            for (int i = 0; i < size(tSrO); i++)
+                                tSrO(i) *= smem_ratio[g * static_cast<int>(BLOCK_M)
+                                                      + get<0>(tScO(i))];
+                        }
+                    }
+                } else {
+                    cute::gemm(tiled_mma, tSrO, tSrX, tOrW, tSrO);
+                }
 
-                if (k_max == 1 && !use_tensor_scales) {
+                if (k_max == 1 && !use_tensor_scales && !use_block_scales) {
                     CUTE_UNROLL
                     for (int i = 0; i < size(tSrO); i++) tSrO(i) *= scalar_cs;
                 }
@@ -1020,8 +1208,9 @@ __global__ void sm89_moe_fp8_gemm_masked_impl(SM89MoEFP8MaskedParams params) {
                 Tensor rO = moe_convert_type<ElementOut>(tSrO);
                 Tensor gO_m = gO(_, _, m);
                 write_output(rO, gO_m, m_actual,
-                             /*apply_scale=*/k_max == 1 && use_tensor_scales,
-                             sb_val);
+                             /*apply_scale=*/use_block_scales ||
+                                 (k_max == 1 && use_tensor_scales),
+                             use_block_scales ? 1.0f : sb_val);
             }
         }
 
@@ -1039,20 +1228,35 @@ __global__ void sm89_moe_fp8_gemm_masked_impl(SM89MoEFP8MaskedParams params) {
                 const int m_actual = static_cast<int>(
                     cute::min((int64_t)BLOCK_M, len - (int64_t)m * BLOCK_M));
 
+                // Block mode: this tile's cs/rcs must be in smem before the
+                // seed rescale below (cross-thread read → needs a barrier).
+                if (use_block_scales) {
+                    load_block_scales_for_tile(m, k);
+                    __syncthreads();
+                }
+
                 Tensor gX_m    = gX(_, _, m, _);
                 Tensor gO_m    = gO(_, _, m);
                 Tensor tXsX    = gmem_thr_copy_xw.partition_D(sX);
                 Tensor tXgX_mk = gmem_thr_copy_xw.partition_S(gX_m(_, _, k));
                 Tensor tXcX    = gmem_thr_copy_xw.partition_S(cX);
 
+                // Seed accumulator; block mode rescales by 1/cs (see contiguous).
                 if (m_actual == static_cast<int>(BLOCK_M)) {
                     cute::copy(gmem_tiled_copy_xw, tXgX_mk, tXsX);
                     cp_async_fence();
                     cp_async_wait<0>();
                     Tensor tSgO = thr_mma.partition_C(gO_m);
-                    CUTE_UNROLL
-                    for (int i = 0; i < size(tSrO); i++)
-                        tSrO(i) = static_cast<float>(tSgO(i));
+                    if (use_block_scales) {
+                        CUTE_UNROLL
+                        for (int i = 0; i < size(tSrO); i++)
+                            tSrO(i) = static_cast<float>(tSgO(i))
+                                      * smem_rcs[get<0>(tScO(i))];
+                    } else {
+                        CUTE_UNROLL
+                        for (int i = 0; i < size(tSrO); i++)
+                            tSrO(i) = static_cast<float>(tSgO(i));
+                    }
                 } else {
                     moe_predicated_copy</*Is_even_MN=*/false, /*Is_even_K=*/true,
                                         /*Clear_OOB_MN=*/true,  /*Clear_OOB_K=*/true>(
@@ -1073,29 +1277,56 @@ __global__ void sm89_moe_fp8_gemm_masked_impl(SM89MoEFP8MaskedParams params) {
                     Tensor rO_seed      = make_tensor<ElementOut>(shape(tSrO));
                     Tensor rO_seed_view = smem_thr_copy_O.retile_D(rO_seed);
                     cute::copy(smem_copy_O, tSsO, rO_seed_view);
-                    CUTE_UNROLL
-                    for (int i = 0; i < size(tSrO); i++)
-                        tSrO(i) = static_cast<float>(rO_seed(i));
+                    if (use_block_scales) {
+                        CUTE_UNROLL
+                        for (int i = 0; i < size(tSrO); i++)
+                            tSrO(i) = static_cast<float>(rO_seed(i))
+                                      * smem_rcs[get<0>(tScO(i))];
+                    } else {
+                        CUTE_UNROLL
+                        for (int i = 0; i < size(tSrO); i++)
+                            tSrO(i) = static_cast<float>(rO_seed(i));
+                    }
                 }
 
-                if (is_last_k) load_scales_for_m_tile(m);
+                if (!use_block_scales && is_last_k) load_scales_for_m_tile(m);
 
                 Tensor tSrX_view = smem_thr_copy_A.retile_D(tSrX);
                 cute::copy(smem_copy_A, tSsX, tSrX_view);
                 Tensor tOrW_view = smem_thr_copy_B.retile_D(tOrW);
                 cute::copy(smem_copy_B, tOsW, tOrW_view);
 
-                cute::gemm(tiled_mma, tSrO, tSrX, tOrW, tSrO);
+                // Block mode: per-group MMA + inter-group rescale (see contiguous).
+                if (use_block_scales) {
+                    CUTE_UNROLL
+                    for (int g = 0; g < SCALE_K_GROUPS; ++g) {
+                        CUTE_UNROLL
+                        for (int kk = 0; kk < K_ATOMS_PER_GROUP; ++kk) {
+                            const int ka = g * K_ATOMS_PER_GROUP + kk;
+                            cute::gemm(tiled_mma, tSrO,
+                                       tSrX(_, _, ka), tOrW(_, _, ka), tSrO);
+                        }
+                        if (g + 1 < SCALE_K_GROUPS) {
+                            CUTE_UNROLL
+                            for (int i = 0; i < size(tSrO); i++)
+                                tSrO(i) *= smem_ratio[g * static_cast<int>(BLOCK_M)
+                                                      + get<0>(tScO(i))];
+                        }
+                    }
+                } else {
+                    cute::gemm(tiled_mma, tSrO, tSrX, tOrW, tSrO);
+                }
 
-                if (is_last_k && !use_tensor_scales) {
+                if (is_last_k && !use_tensor_scales && !use_block_scales) {
                     CUTE_UNROLL
                     for (int i = 0; i < size(tSrO); i++) tSrO(i) *= scalar_cs;
                 }
 
                 Tensor rO = moe_convert_type<ElementOut>(tSrO);
                 write_output(rO, gO_m, m_actual,
-                             /*apply_scale=*/is_last_k && use_tensor_scales,
-                             sb_val);
+                             /*apply_scale=*/use_block_scales ||
+                                 (is_last_k && use_tensor_scales),
+                             use_block_scales ? 1.0f : sb_val);
             }
         }
     }
