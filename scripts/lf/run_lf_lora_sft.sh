@@ -47,7 +47,7 @@ LEARNING_RATE=${LEARNING_RATE:-1e-4}
 LORA_RANK=${LORA_RANK:-8}
 LORA_ALPHA=${LORA_ALPHA:-16}
 LORA_DROPOUT=${LORA_DROPOUT:-0.0}
-LF_QWEN_MOE_EXPERT_LORA_IMPL=${LF_QWEN_MOE_EXPERT_LORA_IMPL:-custom-peft}
+LF_QWEN_MOE_EXPERT_LORA_IMPL=${LF_QWEN_MOE_EXPERT_LORA_IMPL:-split-target-parameters}
 SEED=${SEED:-42}
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
 MAX_GRAD_NORM=${MAX_GRAD_NORM:-}
@@ -323,8 +323,8 @@ fi
 
 MODEL_TAG=$(basename "${MODEL_NAME_OR_PATH}" | tr '/:' '__')
 case "${LF_QWEN_MOE_EXPERT_LORA_IMPL,,}" in
-  custom-peft|peft-target-parameters|off) LF_QWEN_MOE_EXPERT_LORA_IMPL="${LF_QWEN_MOE_EXPERT_LORA_IMPL,,}" ;;
-  *) echo "LF_QWEN_MOE_EXPERT_LORA_IMPL must be custom-peft, peft-target-parameters, or off; got '${LF_QWEN_MOE_EXPERT_LORA_IMPL}'" >&2; exit 2 ;;
+  peft-target-parameters|split-target-parameters|off) LF_QWEN_MOE_EXPERT_LORA_IMPL="${LF_QWEN_MOE_EXPERT_LORA_IMPL,,}" ;;
+  *) echo "LF_QWEN_MOE_EXPERT_LORA_IMPL must be peft-target-parameters, split-target-parameters, or off; got '${LF_QWEN_MOE_EXPERT_LORA_IMPL}'" >&2; exit 2 ;;
 esac
 QWEN_EXPERT_LORA_TAG=$(printf '%s' "${LF_QWEN_MOE_EXPERT_LORA_IMPL}" | tr '/:' '__' | tr -c '[:alnum:]_-' '_')
 EXPERT_POLICY_TAG=$(printf '%s' "${ASYM_EXPERT_RECOMPUTE_POLICY}" | tr '/:' '__' | tr -c '[:alnum:]_-' '_')
@@ -748,7 +748,7 @@ if not isinstance(surface, dict) or not surface.get("surface"):
         "peft_expert_lora_parameters",
         "kt_peft_expert_lora_parameters",
         "kt_expert_lora_parameters",
-        "lf_fused_expert_lora_parameters",
+        "qwen_moe_expert_lora_parameters",
         "kt_fused_expert_lora_parameters",
     )
     if not any(optional_int_value(lora_for_surface, key) is not None for key in surface_counter_keys):
@@ -758,8 +758,8 @@ if not isinstance(surface, dict) or not surface.get("surface"):
     if peft_expert is None:
         peft_expert = optional_int_value(lora_for_surface, "kt_peft_expert_lora_parameters") or 0
     kt_expert = optional_int_value(lora_for_surface, "kt_expert_lora_parameters") or 0
-    lf_fused_expert = optional_int_value(lora_for_surface, "lf_fused_expert_lora_parameters") or 0
-    expert_lora = max(kt_expert, (peft_expert or 0) + lf_fused_expert)
+    qwen_moe_expert = optional_int_value(lora_for_surface, "qwen_moe_expert_lora_parameters") or 0
+    expert_lora = max(kt_expert, peft_expert or 0, qwen_moe_expert)
     non_expert_peft = 0 if peft_lora is None else max(0, peft_lora - (peft_expert or 0))
     if expert_lora > 0 and non_expert_peft > 0:
         derived_surface = "attention+expert LoRA"
@@ -772,8 +772,16 @@ if not isinstance(surface, dict) or not surface.get("surface"):
     surface = {"surface": derived_surface}
 lora = source_profile.get("lora", {})
 fused_lora_params = int_value(lora, "kt_fused_expert_lora_parameters") if isinstance(lora, dict) else 0
-if "qwen3" in expected_model.lower() and fused_lora_params <= 0:
-    raise SystemExit("source-ok Qwen3 profile has no captured fused expert LoRA params")
+expert_lora_params = 0
+if isinstance(lora, dict):
+    expert_lora_params = max(
+        int_value(lora, "kt_expert_lora_parameters") or 0,
+        int_value(lora, "peft_expert_lora_parameters") or 0,
+        int_value(lora, "qwen_moe_expert_lora_parameters") or 0,
+        fused_lora_params or 0,
+    )
+if "qwen3" in expected_model.lower() and expert_lora_params <= 0:
+    raise SystemExit("source-ok Qwen3 profile has no captured expert LoRA params")
 if fused_lora_params > 0:
     health = optimizer_memory.get("kt_lora_update_health", {}) if isinstance(optimizer_memory, dict) else {}
     health_ok, health_reason = kt_lora_health_passed(health)
@@ -1382,7 +1390,6 @@ if expert is None:
     expert = (
         lora.get("peft_expert_lora_parameters", 0)
         or lora.get("kt_expert_lora_parameters", 0)
-        or lora.get("lf_fused_expert_lora_parameters", 0)
         or lora.get("qwen_moe_expert_lora_parameters", 0)
     )
 try:

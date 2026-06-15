@@ -293,7 +293,7 @@ def test_lf_peft_lora_all_does_not_add_adapter_to_qwen_moe_routers() -> None:
         peft_config = prepare_qwen_moe_expert_lora_config(
             model,
             peft_config,
-            "custom-peft",
+            "split-target-parameters",
             raw_lora_target=["all"],
             resolved_target_modules=target_modules,
         )
@@ -395,7 +395,7 @@ def test_lf_qwen_expert_lora_respects_explicit_target_selection() -> None:
         peft_config = prepare_qwen_moe_expert_lora_config(
             model,
             peft_config,
-            "custom-peft",
+            "split-target-parameters",
             raw_lora_target=targets,
             resolved_target_modules=targets,
         )
@@ -457,6 +457,178 @@ def test_lf_qwen_expert_lora_target_parameters_mode_is_stock_peft_baseline() -> 
     assert count_fused_moe_lora(model) == {"modules": 0, "tensors": 0, "parameters": 0}
     assert sum(expert_trainable.values()) == 448
     assert any(".mlp.experts.lora_A.default.weight" in name for name in expert_trainable)
+
+
+@requires_lf_adapter
+def test_qwen_split_param_wrapper_shapes_and_trainable_names() -> None:
+    from peft import LoraConfig, TaskType, get_peft_model
+    from llamafactory.model.model_utils.fused_moe_lora import (
+        QwenSplitMoeExpertParamWrapper,
+        count_fused_moe_lora,
+        prepare_qwen_moe_expert_lora_config,
+    )
+    from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+
+    model = Qwen3MoeForCausalLM(
+        Qwen3MoeConfig(
+            vocab_size=64,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            moe_intermediate_size=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            output_router_logits=False,
+            tie_word_embeddings=False,
+        )
+    )
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=2,
+        lora_alpha=4,
+        lora_dropout=0.0,
+        target_modules=["q_proj"],
+    )
+    peft_config = prepare_qwen_moe_expert_lora_config(
+        model,
+        peft_config,
+        "split-target-parameters",
+        raw_lora_target=["experts", "q_proj"],
+        resolved_target_modules=["experts", "q_proj"],
+    )
+    model = get_peft_model(model, peft_config)
+
+    wrappers = [module for module in model.modules() if isinstance(module, QwenSplitMoeExpertParamWrapper)]
+    trainable_names = [name for name, param in model.named_parameters() if param.requires_grad]
+
+    assert len(wrappers) == 1
+    assert count_fused_moe_lora(model) == {"modules": 1, "tensors": 6, "parameters": 576}
+    assert wrappers[0].get_delta_weight("default", "gate_up_proj").shape == (4, 16, 16)
+    assert wrappers[0].get_delta_weight("default", "down_proj").shape == (4, 16, 8)
+    assert any("mlp.experts.lora_gate_A.default" in name for name in trainable_names)
+    assert any("mlp.experts.lora_up_A.default" in name for name in trainable_names)
+    assert any("mlp.experts.lora_down_A.default" in name for name in trainable_names)
+    assert all(".mlp.gate." not in name and not name.endswith(".mlp.gate.weight") for name in trainable_names)
+
+
+@requires_lf_adapter
+def test_qwen_split_param_wrapper_forward_matches_manual_parametrized_reference() -> None:
+    from llamafactory.model.model_utils.fused_moe_lora import QwenSplitMoeExpertParamWrapper
+    from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
+
+    torch.manual_seed(0)
+    config = Qwen3MoeConfig(
+        hidden_size=8,
+        moe_intermediate_size=4,
+        num_experts=3,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+    )
+    experts = Qwen3MoeExperts(config)
+    with torch.no_grad():
+        experts.gate_up_proj.normal_(mean=0.0, std=0.02)
+        experts.down_proj.normal_(mean=0.0, std=0.02)
+    reference = Qwen3MoeExperts(config)
+    reference.load_state_dict(experts.state_dict())
+    wrapper = QwenSplitMoeExpertParamWrapper(experts, "default", r=2, lora_alpha=4)
+
+    with torch.no_grad():
+        for name, param in wrapper.named_parameters():
+            if "lora_" in name:
+                param.copy_(torch.randn_like(param) * 0.05)
+        reference.gate_up_proj.copy_(experts.gate_up_proj + wrapper.get_delta_weight("default", "gate_up_proj"))
+        reference.down_proj.copy_(experts.down_proj + wrapper.get_delta_weight("default", "down_proj"))
+
+    hidden = torch.randn(7, 8)
+    top_k_index = torch.tensor([[0, 1], [1, 2], [2, 0], [0, 2], [1, 0], [2, 1], [0, 1]])
+    top_k_weights = torch.full((7, 2), 0.5)
+
+    actual = wrapper(hidden, top_k_index, top_k_weights)
+    expected = reference(hidden, top_k_index, top_k_weights)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+@requires_lf_adapter
+def test_qwen_split_param_wrapper_backward_updates_all_six_lora_families() -> None:
+    from llamafactory.model.model_utils.fused_moe_lora import QwenSplitMoeExpertParamWrapper
+    from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
+
+    config = Qwen3MoeConfig(
+        hidden_size=8,
+        moe_intermediate_size=4,
+        num_experts=3,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+    )
+    experts = Qwen3MoeExperts(config)
+    with torch.no_grad():
+        experts.gate_up_proj.normal_(mean=0.0, std=0.02)
+        experts.down_proj.normal_(mean=0.0, std=0.02)
+    wrapper = QwenSplitMoeExpertParamWrapper(experts, "default", r=2, lora_alpha=4)
+    with torch.no_grad():
+        for param_dict in (wrapper.lora_gate_B, wrapper.lora_up_B, wrapper.lora_down_B):
+            param_dict["default"].normal_(mean=0.0, std=0.02)
+
+    hidden = torch.randn(7, 8)
+    top_k_index = torch.tensor([[0, 1], [1, 2], [2, 0], [0, 2], [1, 0], [2, 1], [0, 1]])
+    top_k_weights = torch.full((7, 2), 0.5)
+    loss = wrapper(hidden, top_k_index, top_k_weights).float().square().mean()
+    loss.backward()
+
+    grads = [
+        wrapper.lora_gate_A["default"].grad,
+        wrapper.lora_gate_B["default"].grad,
+        wrapper.lora_up_A["default"].grad,
+        wrapper.lora_up_B["default"].grad,
+        wrapper.lora_down_A["default"].grad,
+        wrapper.lora_down_B["default"].grad,
+    ]
+    assert all(grad is not None and torch.isfinite(grad).all() for grad in grads)
+    assert all(torch.count_nonzero(grad).item() > 0 for grad in grads)
+
+
+@requires_lf_adapter
+def test_qwen_split_param_wrapper_preserves_grouped_mm_dispatch() -> None:
+    import transformers.integrations.moe as moe_integration
+    from llamafactory.model.model_utils.fused_moe_lora import QwenSplitMoeExpertParamWrapper
+    from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
+
+    config = Qwen3MoeConfig(
+        hidden_size=8,
+        moe_intermediate_size=4,
+        num_experts=3,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+    )
+    experts = Qwen3MoeExperts(config)
+    with torch.no_grad():
+        experts.gate_up_proj.normal_(mean=0.0, std=0.02)
+        experts.down_proj.normal_(mean=0.0, std=0.02)
+    experts.config._experts_implementation = "grouped_mm"
+    wrapper = QwenSplitMoeExpertParamWrapper(experts, "default", r=2, lora_alpha=4)
+    calls = {"grouped_mm": 0}
+    original = moe_integration.ALL_EXPERTS_FUNCTIONS["grouped_mm"]
+
+    def counted_grouped_mm(self, hidden_states, top_k_index, top_k_weights):
+        calls["grouped_mm"] += 1
+        return torch.zeros_like(hidden_states)
+
+    moe_integration.ALL_EXPERTS_FUNCTIONS["grouped_mm"] = counted_grouped_mm
+    try:
+        out = wrapper(torch.randn(5, 8), torch.zeros(5, 2, dtype=torch.long), torch.full((5, 2), 0.5))
+    finally:
+        moe_integration.ALL_EXPERTS_FUNCTIONS["grouped_mm"] = original
+
+    assert calls["grouped_mm"] == 1
+    assert out.shape == (5, 8)
 
 
 @requires_lf_adapter
@@ -556,7 +728,7 @@ def test_lf_qwen_expert_lora_runs_backward_and_reloads(tmp_path: Path) -> None:
     peft_config = prepare_qwen_moe_expert_lora_config(
         base,
         peft_config,
-        "custom-peft",
+        "split-target-parameters",
         raw_lora_target=["experts", "q_proj"],
         resolved_target_modules=["experts", "q_proj"],
     )

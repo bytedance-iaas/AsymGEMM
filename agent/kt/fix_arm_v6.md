@@ -77,6 +77,92 @@ Accepted comparison shape for all meaningful LF profiling from here:
 - `PROFILE_LEVEL=module`
 - physical GPU 1 first, GPU 2 fallback
 
+## Current Implementation Status
+
+Completed and validated through Stage 4 on the accepted short e2e shape:
+
+- Artifact:
+  `profiling_kt_codex_smoke/v6_stage4_tilebalanced_qwen3_s4096_b4_r64_t64_source`
+- Validation:
+  `PASS KT ARM profile: gpu_id=1 affinity_count=144 wrappers=48 fw=288 bw=144`
+- Shape: `Qwen/Qwen3-30B-A3B`, `seq_len=4096`, `batch=4`,
+  `rank=64`, `dropout=0.00`, `warmup_steps=1`, `measure_steps=2`,
+  `trainer_max_steps=3`
+- Device/threading: physical GPU 1, `CUDA_VISIBLE_DEVICES=1`,
+  `KT_NUM_THREADS=64`, CPU affinity `0-143`
+- E2E trainer timing:
+  - measured e2e step `275.536 s`
+  - total e2e step `273.330 s`
+  - measured forward avg `74.657 s`
+  - measured backward avg `199.304 s`
+- Memory:
+  - peak allocated HBM `34.478 GiB`
+  - peak reserved HBM `40.111 GiB`
+  - process RSS peak `179.638 GiB`
+- Native counters, all 144 backward rows:
+  - `backward_grouped_tile_ms` avg `2444.008 ms/layer`
+  - `backward_tile_recompute_ms` avg `44108.256 task-ms/layer`
+  - `backward_route_grad_accum_ms` avg `82858.797 task-ms/layer`
+  - `backward_base_grad_ms` avg `66050.799 task-ms/layer`
+  - `backward_lora_grad_ms` avg `15915.865 task-ms/layer`
+  - `backward_local_alloc_zero_ms` avg `60.352 ms/layer`
+  - `backward_thread_reduce_ms` avg `0.000 ms/layer`
+  - `backward_lora_grad_flush_ms` avg `26.373 ms/layer`
+  - `backward_repack_wait_ms` avg `0.004 ms/layer`
+  - `backward_route_scatter_ms` avg `14.398 ms/layer`
+  - `sparse_backward_scratch_bytes` avg `3.043 GiB`, max `3.066 GiB`
+- Native counters, last 96 backward rows:
+  - `backward_grouped_tile_ms` avg `2452.849 ms/layer`
+  - `backward_local_alloc_zero_ms` avg `60.647 ms/layer`
+  - `backward_thread_reduce_ms` avg `0.000 ms/layer`
+  - `sparse_backward_scratch_bytes` avg `3.043 GiB`
+- Native labels stayed correct:
+  - `base_kernel=sve_bfdot_blocked`
+  - `down_kernel=bf16_bfdot_blocked`
+  - `lora_forward_kernel=sve_bfdot_fmla`
+  - `backward_base_kernel=grouped_sve_tile`
+  - `backward_lora_kernel=grouped_sve_tile_dropout0`
+  - `compiled_sve_bf16=1`
+- Losses: warmup `2.2104`, measured `1.6572`, `1.6701`,
+  trainer `1.8459`
+
+Same short e2e comparison against the Stage 1/2/3 grouped artifact
+`profiling_kt_codex_smoke/v6_stage123_grouped_qwen3_s4096_b4_r64_t64_source`:
+
+- measured e2e step improved from `311.745 s` to `275.536 s`
+  (`-36.209 s`, `-11.6%`)
+- measured backward avg improved from `235.798 s` to `199.304 s`
+  (`-36.494 s`, `-15.5%`)
+- process RSS peak improved from `194.852 GiB` to `179.638 GiB`
+- `sparse_backward_scratch_bytes` avg improved from `18.193 GiB` to
+  `3.043 GiB`
+- `backward_local_alloc_zero_ms` avg improved from `936.237 ms/layer` to
+  `60.352 ms/layer`
+- `backward_thread_reduce_ms` avg improved from `263.423 ms/layer` to
+  `0.000 ms/layer`
+- `backward_grouped_tile_ms` regressed from `2048.579 ms/layer` to
+  `2444.008 ms/layer`; this is acceptable for now because scratch/allocation
+  savings still improve e2e time materially.
+
+Decision after Stage 4:
+
+- Keep tile-balanced compact partials as the default. The earlier expert-owned
+  attempt lowered scratch but serialized skewed hot experts and was rejected.
+- The KT profile wrapper now defaults
+  `KT_ARM_SFT_DEFAULT_MAX_BACKWARD_SCRATCH_BYTES=34359738368` and validates it
+  as positive, matching `agent/kt/scripts/run_lf_lora_sft_kt.sh`. This avoids a
+  preflight failure where the wrapper passed `0` even when
+  `KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH=1`.
+- Full profile sweep commands must use fixed dropout labels such as
+  `LORA_DROPOUT=0.00`; the profile wrapper rejects `0.0` because the value is
+  also used in artifact labels.
+- Skip Stage 5 for now. `backward_repack_wait_ms` is about `0.004 ms/layer`,
+  so repack overlap is not a meaningful bottleneck in the current profile.
+- Skip Stage 6 for now. Route scatter/merge remains tens of milliseconds per
+  layer, while CPU grouped expert math remains seconds per layer.
+- Next required validation is Stage 7 full same-config LF acceptance with
+  `BEST_T=64`, `warmup_steps=5`, and `measure_steps=10` on physical GPU 1.
+
 ## Stage 0: Fix KT Profile Metadata And Thread Sweep
 
 Scope:
@@ -177,7 +263,7 @@ for T in 8 16 32 64; do
     MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B \
     DATASET=asym_long_sft_smoke__qwen3-30b-a3b__s4096 \
     CUTOFF_LEN=4096 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
-    LORA_RANK=64 LORA_ALPHA=128 LORA_DROPOUT=0.0 \
+    LORA_RANK=64 LORA_ALPHA=128 LORA_DROPOUT=0.00 \
     GRADIENT_CHECKPOINTING=true \
     MAX_STEPS=1 MAX_SAMPLES=4 \
     PROFILE=1 PROFILE_PROFILER=source PROFILE_LEVEL=module PROFILE_SYNC=1 \
@@ -324,7 +410,7 @@ LF validation, using the best thread count from Stage 0:
 
 ```bash
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
-BEST_T=32  # replace with Stage 0 winner
+BEST_T=64
 ART="profiling_kt_codex_smoke/v6_stage1_base_qwen3_s4096_b4_r64_t${BEST_T}_source"
 
 taskset -c 0-143 env \
@@ -337,7 +423,7 @@ taskset -c 0-143 env \
   MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B \
   DATASET=asym_long_sft_smoke__qwen3-30b-a3b__s4096 \
   CUTOFF_LEN=4096 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
-  LORA_RANK=64 LORA_ALPHA=128 LORA_DROPOUT=0.0 \
+  LORA_RANK=64 LORA_ALPHA=128 LORA_DROPOUT=0.00 \
   GRADIENT_CHECKPOINTING=true \
   MAX_STEPS=3 MAX_SAMPLES=12 \
   PROFILE=1 PROFILE_PROFILER=source PROFILE_LEVEL=module PROFILE_SYNC=1 \
@@ -502,7 +588,7 @@ LF validation:
 
 ```bash
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
-BEST_T=32
+BEST_T=64
 ART="profiling_kt_codex_smoke/v6_stage2_lora_bwd_qwen3_s4096_b4_r64_t${BEST_T}_source"
 
 taskset -c 0-143 env \
@@ -515,7 +601,7 @@ taskset -c 0-143 env \
   MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B \
   DATASET=asym_long_sft_smoke__qwen3-30b-a3b__s4096 \
   CUTOFF_LEN=4096 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
-  LORA_RANK=64 LORA_ALPHA=128 LORA_DROPOUT=0.0 \
+  LORA_RANK=64 LORA_ALPHA=128 LORA_DROPOUT=0.00 \
   GRADIENT_CHECKPOINTING=true \
   MAX_STEPS=3 MAX_SAMPLES=12 \
   PROFILE=1 PROFILE_PROFILER=source PROFILE_LEVEL=module PROFILE_SYNC=1 \
@@ -670,7 +756,7 @@ LF validation:
 
 ```bash
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
-BEST_T=32
+BEST_T=64
 ART="profiling_kt_codex_smoke/v6_stage3_lora_fwd_qwen3_s4096_b4_r64_t${BEST_T}_source"
 
 taskset -c 0-143 env \
@@ -683,7 +769,7 @@ taskset -c 0-143 env \
   MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B \
   DATASET=asym_long_sft_smoke__qwen3-30b-a3b__s4096 \
   CUTOFF_LEN=4096 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
-  LORA_RANK=64 LORA_ALPHA=128 LORA_DROPOUT=0.0 \
+  LORA_RANK=64 LORA_ALPHA=128 LORA_DROPOUT=0.00 \
   GRADIENT_CHECKPOINTING=true \
   MAX_STEPS=3 MAX_SAMPLES=12 \
   PROFILE=1 PROFILE_PROFILER=source PROFILE_LEVEL=module PROFILE_SYNC=1 \
@@ -805,7 +891,7 @@ for T in 16 32 64; do
     MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B \
     DATASET=asym_long_sft_smoke__qwen3-30b-a3b__s4096 \
     CUTOFF_LEN=4096 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
-    LORA_RANK=64 LORA_ALPHA=128 LORA_DROPOUT=0.0 \
+    LORA_RANK=64 LORA_ALPHA=128 LORA_DROPOUT=0.00 \
     GRADIENT_CHECKPOINTING=true \
     MAX_STEPS=3 MAX_SAMPLES=12 \
     PROFILE=1 PROFILE_PROFILER=source PROFILE_LEVEL=module PROFILE_SYNC=1 \
@@ -990,7 +1076,7 @@ Full acceptance command:
 
 ```bash
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
-BEST_T=32  # replace with validated winner
+BEST_T=64  # validated winner from Stage 0/Stage 4 short profiles
 
 SEQ_LENS=4096 \
 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
@@ -1010,7 +1096,7 @@ KT_ARM_ALLOW_UNVALIDATED_BACKWARD_SCRATCH=1 \
 MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B \
 LORA_RANK=64 \
 LORA_ALPHA=128 \
-LORA_DROPOUT=0.0 \
+LORA_DROPOUT=0.00 \
 WARMUP_STEPS=5 \
 MAX_STEPS=10 \
 MAX_SAMPLES=60 \

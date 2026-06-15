@@ -373,6 +373,43 @@ def test_lora_counters_count_peft_expert_lora_by_parameter_name() -> None:
     assert counters["peft_expert_lora_parameters"] == 2 * 3 + 3 * 2 + 2 * 4
 
 
+def test_lora_counters_count_qwen_split_param_wrapper() -> None:
+    lf_src = ROOT.parent / "LlamaFactory" / "src"
+    if str(lf_src) not in sys.path:
+        sys.path.insert(0, str(lf_src))
+
+    from llamafactory.model.model_utils.fused_moe_lora import QwenSplitMoeExpertParamWrapper
+    from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
+
+    module = _load_profile_launcher_module()
+    config = Qwen3MoeConfig(
+        hidden_size=8,
+        moe_intermediate_size=4,
+        num_experts=3,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+    )
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    model.layers[0].mlp = torch.nn.Module()
+    model.layers[0].mlp.experts = QwenSplitMoeExpertParamWrapper(
+        Qwen3MoeExperts(config), "default", r=2, lora_alpha=4
+    )
+
+    old_model = module._LAST_LF_MODEL
+    module._LAST_LF_MODEL = model
+    try:
+        counters = module._lora_counters_from_model()
+    finally:
+        module._LAST_LF_MODEL = old_model
+
+    assert counters["qwen_moe_expert_lora_modules"] == 1
+    assert counters["qwen_moe_expert_lora_tensors"] == 6
+    assert counters["qwen_moe_expert_lora_parameters"] == 3 * (2 * 8 + 4 * 2 + 2 * 8 + 4 * 2 + 2 * 4 + 8 * 2)
+    assert counters["peft_expert_lora_parameters"] == counters["qwen_moe_expert_lora_parameters"]
+
+
 def test_lora_counters_use_sidecar_when_model_view_is_partitioned(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1263,7 +1300,6 @@ def test_source_summary_preserves_real_zero_lora_counters(tmp_path: Path) -> Non
             "available": True,
             "trainable_parameters": 0,
             "peft_lora_parameters": 0,
-            "lf_fused_expert_lora_parameters": 0,
             "kt_expert_lora_parameters": 0,
             "kt_peft_expert_lora_parameters": 0,
             "kt_fused_expert_lora_parameters": 0,
@@ -1297,8 +1333,6 @@ def test_source_summary_flags_kt_attention_plus_expert_surface(tmp_path: Path) -
             "available": True,
             "trainable_parameters": 3_375_366_144,
             "peft_lora_parameters": 53_477_376,
-            "lf_fused_expert_lora_parameters": 0,
-            "lf_fused_expert_lora_tensors": 0,
             "kt_expert_lora_parameters": 3_321_888_768,
             "kt_peft_expert_lora_parameters": 0,
             "kt_fused_expert_lora_tensors": 288,
@@ -1322,17 +1356,17 @@ def test_source_summary_flags_kt_attention_plus_expert_surface(tmp_path: Path) -
     assert "requires a baseline that also trains expert LoRA" in surface_csv
 
 
-def test_source_summary_flags_lf_fused_attention_plus_expert_surface(tmp_path: Path) -> None:
+def test_source_summary_flags_qwen_moe_attention_plus_expert_surface(tmp_path: Path) -> None:
     output_dir = _run_postprocess_output(
         tmp_path,
         kt={"available": True, "wrapper_count": 0, "total_forward_calls": 0, "total_backward_calls": 0},
         lora={
             "available": True,
             "trainable_parameters": 3_375_366_144,
-            "peft_lora_parameters": 53_477_376,
-            "peft_expert_lora_parameters": 0,
-            "lf_fused_expert_lora_parameters": 3_321_888_768,
-            "lf_fused_expert_lora_tensors": 288,
+            "peft_lora_parameters": 3_375_366_144,
+            "peft_expert_lora_parameters": 3_321_888_768,
+            "qwen_moe_expert_lora_parameters": 3_321_888_768,
+            "qwen_moe_expert_lora_tensors": 288,
             "kt_expert_lora_parameters": 0,
             "kt_peft_expert_lora_parameters": 0,
             "kt_fused_expert_lora_parameters": 0,
@@ -1344,11 +1378,11 @@ def test_source_summary_flags_lf_fused_attention_plus_expert_surface(tmp_path: P
     surface_csv = (output_dir / "trainable_surface.csv").read_text(encoding="utf-8")
     assert "| trainable surface | attention+expert LoRA |" in summary
     assert "| non-expert PEFT LoRA params | 53477376 |" in summary
-    assert "| LF fused expert LoRA params | 3321888768 |" in summary
-    assert "| LF fused expert LoRA tensors | 288 |" in summary
+    assert "| Qwen MoE expert LoRA params | 3321888768 |" in summary
+    assert "| Qwen MoE expert LoRA tensors | 288 |" in summary
     assert "| expert LoRA params | 3321888768 |" in summary
     assert profile["trainable_surface"]["expert_lora_parameters"] == 3_321_888_768
-    assert profile["trainable_surface"]["lf_fused_expert_lora_parameters"] == 3_321_888_768
+    assert profile["trainable_surface"]["qwen_moe_expert_lora_parameters"] == 3_321_888_768
     assert "attention+expert LoRA" in surface_csv
 
 
@@ -1361,7 +1395,6 @@ def test_source_summary_flags_peft_expert_surface_without_kt_wrappers(tmp_path: 
             "trainable_parameters": 100,
             "peft_lora_parameters": 100,
             "peft_expert_lora_parameters": 80,
-            "lf_fused_expert_lora_parameters": 0,
             "kt_expert_lora_parameters": 0,
             "kt_peft_expert_lora_parameters": 0,
             "kt_fused_expert_lora_parameters": 0,
@@ -1387,7 +1420,6 @@ def test_source_summary_flags_attention_only_surface(tmp_path: Path) -> None:
             "available": True,
             "trainable_parameters": 53_477_376,
             "peft_lora_parameters": 53_477_376,
-            "lf_fused_expert_lora_parameters": 0,
             "kt_expert_lora_parameters": 0,
             "kt_peft_expert_lora_parameters": 0,
             "kt_fused_expert_lora_parameters": 0,
@@ -1426,7 +1458,6 @@ def test_source_summary_and_csv_include_kt_lora_update_health(tmp_path: Path) ->
             "available": True,
             "trainable_parameters": 8,
             "peft_lora_parameters": 0,
-            "lf_fused_expert_lora_parameters": 0,
             "kt_expert_lora_parameters": 8,
             "kt_peft_expert_lora_parameters": 0,
             "kt_fused_expert_lora_parameters": 8,
@@ -1485,7 +1516,6 @@ def test_source_profile_with_profile_json_does_not_overwrite_source_csvs(tmp_pat
             "available": True,
             "trainable_parameters": 10,
             "peft_lora_parameters": 4,
-            "lf_fused_expert_lora_parameters": 0,
             "kt_expert_lora_parameters": 6,
             "kt_peft_expert_lora_parameters": 1,
             "kt_fused_expert_lora_parameters": 6,
@@ -1543,7 +1573,6 @@ def test_source_summary_recomputes_stale_kt_lora_update_health_fail_closed(tmp_p
             "available": True,
             "trainable_parameters": 8,
             "peft_lora_parameters": 0,
-            "lf_fused_expert_lora_parameters": 0,
             "kt_expert_lora_parameters": 8,
             "kt_peft_expert_lora_parameters": 0,
             "kt_fused_expert_lora_parameters": 8,
@@ -1586,7 +1615,6 @@ def test_source_summary_rejects_kt_lora_health_with_no_updated_grad_tensors(tmp_
             "available": True,
             "trainable_parameters": 8,
             "peft_lora_parameters": 0,
-            "lf_fused_expert_lora_parameters": 0,
             "kt_expert_lora_parameters": 8,
             "kt_peft_expert_lora_parameters": 0,
             "kt_fused_expert_lora_parameters": 8,
@@ -1628,7 +1656,6 @@ def test_source_summary_reports_kt_lora_tensor_set_mismatch_fields(tmp_path: Pat
             "available": True,
             "trainable_parameters": 8,
             "peft_lora_parameters": 0,
-            "lf_fused_expert_lora_parameters": 0,
             "kt_expert_lora_parameters": 8,
             "kt_peft_expert_lora_parameters": 0,
             "kt_fused_expert_lora_parameters": 8,
@@ -1674,7 +1701,6 @@ def test_source_summary_and_csv_include_optimizer_memory_preflight(tmp_path: Pat
             "available": True,
             "trainable_parameters": 10,
             "peft_lora_parameters": 4,
-            "lf_fused_expert_lora_parameters": 0,
             "kt_expert_lora_parameters": 6,
             "kt_peft_expert_lora_parameters": 1,
             "kt_fused_expert_lora_parameters": 6,
@@ -1850,7 +1876,6 @@ def test_profile_json_csvs_include_nested_source_profile_artifacts(tmp_path: Pat
             "available": True,
             "trainable_parameters": 10,
             "peft_lora_parameters": 4,
-            "lf_fused_expert_lora_parameters": 0,
             "kt_expert_lora_parameters": 6,
             "kt_peft_expert_lora_parameters": 1,
             "kt_fused_expert_lora_parameters": 6,

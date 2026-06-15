@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -244,7 +243,7 @@ def test_profile_lora_lf_dry_run_sweeps_qwen_expert_lora_impls(tmp_path: Path) -
             "DRY_RUN": "true",
             "LORA_DROPOUT": "0.00",
             "ASYMM_EXP_ACT_POLICIES": "none|false|false|false",
-            "LF_EXPERT_LORA_IMPLS": "peft-target-parameters,custom-peft",
+            "LF_EXPERT_LORA_IMPLS": "peft-target-parameters,split-target-parameters",
             "PLOT": "false",
             "PLOT_MEMORY_BREAKDOWN": "false",
         },
@@ -254,12 +253,12 @@ def test_profile_lora_lf_dry_run_sweeps_qwen_expert_lora_impls(tmp_path: Path) -
     assert len(commands) == 2
     command_paths = "\n".join(commands)
     assert "__qwenexpertpeft-target-parameters/" in command_paths
-    assert "__qwenexpertcustom-peft/" in command_paths
+    assert "__qwenexpertsplit-target-parameters/" in command_paths
     assert "__loraafwdcpu__qwenexpertpeft-target-parameters/" in command_paths
-    assert "__loraafwdcpu__qwenexpertcustom-peft/" in command_paths
+    assert "__loraafwdcpu__qwenexpertsplit-target-parameters/" in command_paths
     assert all("LF_QWEN_MOE_EXPERT_LORA_IMPL=" in text for text in commands.values())
     assert any("LF_QWEN_MOE_EXPERT_LORA_IMPL=peft-target-parameters" in text for text in commands.values())
-    assert any("LF_QWEN_MOE_EXPERT_LORA_IMPL=custom-peft" in text for text in commands.values())
+    assert any("LF_QWEN_MOE_EXPERT_LORA_IMPL=split-target-parameters" in text for text in commands.values())
     assert all("ASYM_GEMM_LF_CONFIG_QWEN_EXPERT_LORA_IMPL=" in text for text in commands.values())
     assert all("ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu" in text for text in commands.values())
     assert all("ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu" in text for text in commands.values())
@@ -292,7 +291,7 @@ def test_profile_lora_lf_dry_run_labels_expert_lora_a_hbm_mode(tmp_path: Path) -
     commands = {str(path): path.read_text(encoding="utf-8") for path in output_root.rglob("command.txt")}
     assert len(commands) == 1
     command_paths = "\n".join(commands)
-    assert "__expact1__attnact1__layeract1__loraafwdhbm__qwenexpertcustom-peft/" in command_paths
+    assert "__expact1__attnact1__layeract1__loraafwdhbm__qwenexpertsplit-target-parameters/" in command_paths
     command = next(iter(commands.values()))
     assert "ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm" in command
     assert "ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm" in command
@@ -373,11 +372,11 @@ def test_profile_lora_lf_four_field_exp_attn_axis_dry_run(tmp_path: Path) -> Non
     commands = {str(path): path.read_text(encoding="utf-8") for path in output_root.rglob("command.txt")}
     assert len(commands) == 5
     command_paths = "\n".join(commands)
-    assert "__polnone__routerwhole__expact0__attnact0__layeract0__loraafwdcpu__qwenexpertcustom-peft/" in command_paths
-    assert "__polgc-exp__routerwhole__expact0__attnact0__layeract0__loraafwdcpu__qwenexpertcustom-peft/" in command_paths
-    assert "__polgc-attn-exp__routerwhole__expact0__attnact0__layeract0__loraafwdcpu__qwenexpertcustom-peft/" in command_paths
-    assert "__polnone__routerwhole__expact1__attnact0__layeract0__loraafwdcpu__qwenexpertcustom-peft/" in command_paths
-    assert "__polnone__routerwhole__expact1__attnact1__layeract0__loraafwdcpu__qwenexpertcustom-peft/" in command_paths
+    assert "__polnone__routerwhole__expact0__attnact0__layeract0__loraafwdcpu__qwenexpertsplit-target-parameters/" in command_paths
+    assert "__polgc-exp__routerwhole__expact0__attnact0__layeract0__loraafwdcpu__qwenexpertsplit-target-parameters/" in command_paths
+    assert "__polgc-attn-exp__routerwhole__expact0__attnact0__layeract0__loraafwdcpu__qwenexpertsplit-target-parameters/" in command_paths
+    assert "__polnone__routerwhole__expact1__attnact0__layeract0__loraafwdcpu__qwenexpertsplit-target-parameters/" in command_paths
+    assert "__polnone__routerwhole__expact1__attnact1__layeract0__loraafwdcpu__qwenexpertsplit-target-parameters/" in command_paths
 
     gc_attn_command = next(text for path, text in commands.items() if "__polgc-attn-exp__" in path)
     assert "ASYM_EXPERT_RECOMPUTE_POLICY=gc-attn-exp" in gc_attn_command
@@ -391,7 +390,7 @@ def test_profile_lora_lf_four_field_exp_attn_axis_dry_run(tmp_path: Path) -> Non
     gc_exp_command = next(text for path, text in commands.items() if "__polgc-exp__" in path)
     assert "ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED=false" in gc_exp_command
 
-    attnact_command = next(text for path, text in commands.items() if "__expact1__attnact1__layeract0__loraafwdcpu__qwenexpertcustom-peft/" in path)
+    attnact_command = next(text for path, text in commands.items() if "__expact1__attnact1__layeract0__loraafwdcpu__qwenexpertsplit-target-parameters/" in path)
     assert "ASYMM_EXPERT_ACT_OFFLOAD=true" in attnact_command
     assert "ASYMM_ATTN_ACT_OFFLOAD=true" in attnact_command
     assert "ASYMM_LAYER_ACT_OFFLOAD=false" in attnact_command
@@ -485,8 +484,8 @@ def test_profile_lora_lf_four_part_layer_axis_dry_run(tmp_path: Path) -> None:
     commands = {str(path): path.read_text(encoding="utf-8") for path in output_root.rglob("command.txt")}
     assert len(commands) == 2
     command_paths = "\n".join(commands)
-    assert "__polgc-layer__routerwhole__expact0__attnact0__layeract0__loraafwdcpu__qwenexpertcustom-peft/" in command_paths
-    assert "__polnone__routerwhole__expact1__attnact1__layeract1__loraafwdcpu__qwenexpertcustom-peft/" in command_paths
+    assert "__polgc-layer__routerwhole__expact0__attnact0__layeract0__loraafwdcpu__qwenexpertsplit-target-parameters/" in command_paths
+    assert "__polnone__routerwhole__expact1__attnact1__layeract1__loraafwdcpu__qwenexpertsplit-target-parameters/" in command_paths
 
     gc_layer_command = next(text for path, text in commands.items() if "__polgc-layer__" in path)
     assert "ASYM_EXPERT_RECOMPUTE_POLICY=gc-layer" in gc_layer_command
@@ -494,7 +493,7 @@ def test_profile_lora_lf_four_part_layer_axis_dry_run(tmp_path: Path) -> None:
     assert "ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED=true" in gc_layer_command
     assert "ASYMM_LAYER_ACT_OFFLOAD=false" in gc_layer_command
 
-    layeract_command = next(text for path, text in commands.items() if "__layeract1__loraafwdcpu__qwenexpertcustom-peft/" in path)
+    layeract_command = next(text for path, text in commands.items() if "__layeract1__loraafwdcpu__qwenexpertsplit-target-parameters/" in path)
     assert "ASYMM_EXPERT_ACT_OFFLOAD=true" in layeract_command
     assert "ASYMM_ATTN_ACT_OFFLOAD=true" in layeract_command
     assert "ASYMM_LAYER_ACT_OFFLOAD=true" in layeract_command
@@ -590,7 +589,7 @@ def test_profile_lora_lf_default_e2e_shape_uses_asym_cpuadamwds(tmp_path: Path) 
             "PROFILERS": "source",
             "PREPARE_DATASETS": "false",
             "DRY_RUN": "true",
-            "LORA_DROPOUT": "0.08",
+            "LORA_DROPOUT": "0.00",
             "ASYMM_EXP_ACT_POLICIES": "none|false|false|false",
             "ROUTER_MODES": "whole",
             "PLOT": "false",
@@ -603,8 +602,8 @@ def test_profile_lora_lf_default_e2e_shape_uses_asym_cpuadamwds(tmp_path: Path) 
     command_texts = [path.read_text(encoding="utf-8") for path in command_files]
     command_paths = "\n".join(str(path) for path in command_files)
 
-    assert "qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a16_drop008" in command_paths
-    assert command_paths.count("asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact0__attnact0__layeract0__loraafwdcpu__qwenexpertcustom-peft/b4_s4096") == 1
+    assert "qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a16_drop000" in command_paths
+    assert command_paths.count("asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact0__attnact0__layeract0__loraafwdcpu__qwenexpertsplit-target-parameters/b4_s4096") == 1
     for command in command_texts:
         assert "BACKEND=asym_cpuadamwds" in command
         assert "PROFILE_BACKEND_LABEL=asym_cpuadamwds" in command

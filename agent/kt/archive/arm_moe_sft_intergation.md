@@ -56,7 +56,7 @@ Reference metrics from
 
 | Backend | Runtime | Train loss | Delta vs torch GPU | Peak HBM | Expert LoRA | KT calls |
 |---|---:|---:|---:|---:|---:|---:|
-| LF torch GPU | `17.919 s` | `1.366307` | `0.000000` | `106.173 GiB` | `415,236,096` LF fused | `0 fw / 0 bw` |
+| LF torch GPU | `17.919 s` | `1.366307` | `0.000000` | `106.173 GiB` | `415,236,096` Qwen expert | `0 fw / 0 bw` |
 | LF KT TORCHBF16 on CUDA | `20.630 s` | `1.364013` | `-0.002294` | `78.202 GiB` | `415,236,096` KT fused | `48 fw / 48 bw` |
 | LF KT ARMBF16 on CPU | `160.461 s` | `1.367199` | `+0.000891` | `23.437 GiB` | `415,236,096` KT fused | `48 fw / 48 bw` |
 
@@ -507,7 +507,7 @@ Required changes:
 - Add `model_utils/fused_moe_lora.py` from isolated LF.
 - Preserve the current AsymGEMM branch in `adapter.py`.
 - Preserve the current KT branch that creates normal PEFT LoRA.
-- Add LF fused expert LoRA only for the normal LF torch baseline path:
+- Add Qwen expert LoRA only for the normal LF torch baseline path:
   - `finetuning_type == "lora"`
   - `lora_target == ["all"]`
   - not `use_kt`
@@ -519,7 +519,7 @@ Required changes:
 Validation:
 
 - For Qwen3-30B-A3B full LoRA:
-  - LF torch GPU row should report `415,236,096` LF fused expert LoRA params.
+  - LF torch GPU row should report `415,236,096` Qwen expert LoRA params.
   - KT rows should report `415,236,096` KT fused expert LoRA params.
 
 ### 2.5 Trainer Save Path
@@ -723,7 +723,7 @@ Required additions:
 - Add `_lora_counters_from_model()`:
   - trainable params
   - PEFT LoRA params
-  - LF fused expert LoRA params
+  - Qwen MoE expert LoRA params
   - KT fused expert LoRA params
 - Include `"kt"` and `"lora"` sections in the existing source profile JSON.
 - Preserve existing memory attribution, memory breakdown, stage timing, and
@@ -749,7 +749,7 @@ After a KT sweep run, `source_profile.json` must contain:
 ```
 
 For LF torch GPU baseline, `kt.wrapper_count` may be missing/zero, but
-`lora.lf_fused_expert_lora_parameters` should be populated for fused Qwen3.
+`lora.qwen_moe_expert_lora_parameters` should be populated for Qwen3 split expert LoRA.
 
 ### 3.3 Postprocess Output
 
@@ -768,7 +768,7 @@ Required additions:
   - KT wrappers
   - KT forward calls
   - KT backward calls
-  - LF fused expert LoRA params
+  - Qwen MoE expert LoRA params
   - KT fused expert LoRA params
 - Preserve existing latency, memory, loss comparison, memory attribution, and
   memory breakdown outputs.
@@ -1043,7 +1043,7 @@ After successful merge:
 - [ ] Extend LF `KTransformersArguments`.
 - [ ] Add LF local KT backend dependency guard.
 - [ ] Add LF direct KT model loading.
-- [ ] Add LF fused MoE LoRA baseline for torch.
+- [ ] Add Qwen MoE LoRA baseline for torch.
 - [ ] Add KT sidecar save/load integration while preserving AsymGEMM save path.
 - [ ] Add `KT_KERNEL_DIR` and backend placement envs to KT runner.
 - [ ] Add KT/Lora counters to current source profiler.

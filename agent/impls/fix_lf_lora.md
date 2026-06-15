@@ -2,7 +2,7 @@
 
 Goal: make plain LlamaFactory/ZeRO attach, train, save, reload, and profile Qwen fused MoE expert LoRA correctly, while keeping the fast Transformers Qwen expert execution path. This is not an AsymGEMM feature and should not use AsymGEMM naming.
 
-The current `custom-peft` wrapper is correctness-useful but performance-rejected. It replaces Qwen expert forward and loops over active experts in Python, so it loses Transformers `grouped_mm` expert dispatch. The accepted correction must follow PEFT `ParamWrapper` runtime style:
+The accepted correction follows PEFT `ParamWrapper` runtime style:
 
 ```text
 compute full 3D LoRA delta weight
@@ -22,12 +22,12 @@ Local evidence:
   - `grouped_mm_experts_forward()` sorts tokens by expert and uses grouped GEMM.
 - Official PEFT docs say MoE expert `nn.Parameter`s should use `target_parameters`; they also warn that PEFT materializes LoRA contribution for each expert, which is expected overhead, but that is still much faster than replacing grouped expert execution with Python loops.
 
-Measured rejected baseline, Qwen3-30B-A3B, `zero3_offload|recomp`, `b4_s4096`, `WARMUP_STEPS=5`, `MAX_STEPS=10`:
+Accepted A/B baseline, Qwen3-30B-A3B, `zero3_offload|recomp`, `b4_s4096`, `WARMUP_STEPS=5`, `MAX_STEPS=10`:
 
 | impl | peak allocated HBM | peak reserved HBM | avg step | avg forward | avg backward | trainable params | expert LoRA params |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `peft-target-parameters` | `33.107 GiB` | `38.756 GiB` | `3.610 s` | `1.035 s` | `2.510 s` | `2,570,059,776` | `2,516,582,400` |
-| current `custom-peft` | `33.138 GiB` | `38.504 GiB` | `37.344 s` | `10.520 s` | `26.709 s` | `3,375,366,144` | `3,321,888,768` |
+| `split-target-parameters` | `33.138 GiB` | `38.268 GiB` | `5.155 s` | `1.424 s` | `3.730 s` | `3,375,366,144` | `3,321,888,768` |
 
 Acceptance target:
 
@@ -63,7 +63,6 @@ Implementation:
 ```python
 QWEN_EXPERT_LORA_SPLIT_TARGET_PARAMETERS = "split-target-parameters"
 QWEN_EXPERT_LORA_MODES = {
-    "custom-peft",
     "peft-target-parameters",
     "split-target-parameters",
     "off",
@@ -79,16 +78,14 @@ def prepare_qwen_moe_expert_lora_config(model, peft_config, mode, raw_lora_targe
     if mode == "split-target-parameters":
         _patch_peft_param_wrapper_zero3_shape()
         return _add_qwen_moe_split_target_parameters(...)
-    if mode == "custom-peft":
-        return _add_current_custom_wrapper_for_legacy_debug_only(...)
     raise ValueError(...)
 ```
 
 Rules:
 
-- Default can remain `custom-peft` until Stage 5 proves the new path. After acceptance, default should become `split-target-parameters`.
+- Default is now `split-target-parameters` after Stage 5 acceptance.
 - Keep `peft-target-parameters` as the fast stock PEFT A/B baseline.
-- Keep `custom-peft` only as a correctness/debug baseline; do not accept it as the final performance path.
+- Only `peft-target-parameters`, `split-target-parameters`, and `off` remain supported.
 
 Unresolved risks to watch:
 
@@ -111,7 +108,7 @@ Dry-run sweep:
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="zero3_offload|recomp" \
 ASYMM_EXP_ACT_POLICIES="none|false|false|false" \
-LF_EXPERT_LORA_IMPLS="peft-target-parameters,split-target-parameters,custom-peft" \
+LF_EXPERT_LORA_IMPLS="peft-target-parameters,split-target-parameters" \
 SEQ_LENS=4096 \
 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
 DATASET=asym_long_sft_smoke \
@@ -149,7 +146,7 @@ Modify:
 
 Design:
 
-- Follow PEFT `ParamWrapper` structure, not the current `QwenMoeExpertLoraLayer`.
+- Follow PEFT `ParamWrapper` structure.
 - The wrapper must wrap the existing Qwen experts module and call `self.base_layer(...)`.
 - The wrapper owns split gate/up/down LoRA tensors, but only materializes full parameter deltas:
   - `delta_gate_up` for `gate_up_proj [E, 2I, H]`
@@ -305,7 +302,6 @@ Important implementation rules:
 - Do not call `F.linear` inside this wrapper forward.
 - Do not loop over active experts or tokens in wrapper forward.
 - Do not reimplement router/top-k/scatter/index-add behavior.
-- Do not use the current `QwenMoeExpertLoraLayer.forward` as a template.
 - Use PEFT naming conventions (`lora_*`) so adapter save/load keeps working.
 
 Unresolved risks to watch:
@@ -410,7 +406,7 @@ Rules:
 
 Unresolved risks to watch:
 
-- PEFT config alone may not distinguish old `custom-peft` from new `split-target-parameters` if both target the same module names. Use adapter state key detection when loading from disk.
+- PEFT config alone may not distinguish old saved split expert adapters from new `split-target-parameters` if both target the same module names. Use adapter state key detection when loading from disk if needed.
 - If PEFT custom module registration passes a newer `config=` kwarg instead of old individual kwargs, support both forms.
 
 Validation before Stage 3:
@@ -530,15 +526,11 @@ split-target-parameters:
   qwen_moe_expert_lora_tensors == modules * 6
   qwen_moe_expert_lora_parameters == split gate/up/down expert parameter total
   peft_expert_lora_parameters == qwen_moe_expert_lora_parameters
-  lf_fused_expert_lora_parameters == 0
 
 peft-target-parameters:
   qwen_moe_expert_lora_impl == "peft-target-parameters"
   qwen_moe_expert_lora_parameters == 0
   peft_expert_lora_parameters == stock PEFT target_parameters expert total
-
-custom-peft:
-  keep counted for debug only, but mark performance-rejected in docs/status
 ```
 
 Sidecar:
@@ -593,6 +585,8 @@ Then:
 
 ## Stage 5 - Run real Qwen3/ZeRO A/B profiling and decide acceptance
 
+Status: completed and accepted.
+
 Modify:
 
 - No model-code edits unless profiling exposes a correctness or performance bug.
@@ -604,7 +598,7 @@ Smoke profile:
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="zero3_offload|recomp" \
 ASYMM_EXP_ACT_POLICIES="none|false|false|false" \
-LF_EXPERT_LORA_IMPLS="peft-target-parameters,split-target-parameters,custom-peft" \
+LF_EXPERT_LORA_IMPLS="peft-target-parameters,split-target-parameters" \
 SEQ_LENS=4096 \
 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
 DATASET=asym_long_sft_smoke \
@@ -617,7 +611,7 @@ PROFILERS=source \
 PROFILE_MEMORY_ATTRIBUTION=false \
 PROFILE_MEMORY_BREAKDOWN=false \
 PROFILE_MEMORY_SNAPSHOT=false \
-WARMUP_STEPS=1 \
+WARMUP_STEPS=5 \
 MAX_STEPS=2 \
 RUN_POST=false \
 PLOT=false \
@@ -633,7 +627,7 @@ Acceptance profile:
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="zero3_offload|recomp" \
 ASYMM_EXP_ACT_POLICIES="none|false|false|false" \
-LF_EXPERT_LORA_IMPLS="peft-target-parameters,split-target-parameters,custom-peft" \
+LF_EXPERT_LORA_IMPLS="peft-target-parameters,split-target-parameters" \
 SEQ_LENS=4096 \
 PER_DEVICE_TRAIN_BATCH_SIZE=4 \
 DATASET=asym_long_sft_smoke \
@@ -656,13 +650,24 @@ OVERWRITE=true \
 scripts/lf/profile_lora_lf.sh --gpus 0 --output-root profiling/lf_lora_split_accept
 ```
 
-Required result table:
+Accepted result table from `profiling/lf_lora_split_accept`:
 
-| backend spec | qwen expert LoRA impl | peak allocated HBM | peak reserved HBM | avg step | avg forward | avg backward | trainable params | expert LoRA params | loss max/last/train |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `zero3_offload|recomp` | `peft-target-parameters` | artifact | artifact | artifact | artifact | artifact | `2,570,059,776` expected | `2,516,582,400` expected | artifact |
-| `zero3_offload|recomp` | `split-target-parameters` | artifact | artifact | artifact | artifact | artifact | `3,375,366,144` expected | `3,321,888,768` expected | artifact |
-| `zero3_offload|recomp` | `custom-peft` | artifact | artifact | artifact | artifact | artifact | `3,375,366,144` expected | `3,321,888,768` expected | artifact |
+| backend spec | qwen expert LoRA impl | peak allocated HBM | peak reserved HBM | avg step | avg forward | avg backward | trainable params | PEFT expert params | Qwen split expert params | fallback | loss max/last/train |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `zero3_offload|recomp` | `peft-target-parameters` | `33.107 GiB` | `38.756 GiB` | `4.932 s` | `1.436 s` | `3.496 s` | `2,570,059,776` | `2,516,582,400` | `0` | `0` | `2.326/1.273/1.914` |
+| `zero3_offload|recomp` | `split-target-parameters` | `33.138 GiB` | `38.268 GiB` | `6.026 s` | `1.671 s` | `4.355 s` | `3,375,366,144` | `3,321,888,768` | `3,321,888,768` | `0` | `2.273/1.231/1.874` |
+
+Accepted conclusion:
+
+- `split-target-parameters` fixes the trainable surface: `3,321,888,768` expert LoRA params and `3,375,366,144` total trainable params.
+- It preserves the fast grouped expert path: avg step is `6.026 s`, close to stock PEFT target-parameters and far faster than the removed Python-loop wrapper.
+- HBM stays in the accepted ZeRO range: `33.138 GiB` peak allocated.
+- `reference_fallback_count=0`; losses are finite and in the same range.
+
+Artifacts:
+
+- `peft-target-parameters`: `profiling/lf_lora_split_accept/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a16_drop000/zero3_offload__source__recomp__polnone__routerhf__expact0__attnact0__layeract0__loraafwdcpu__qwenexpertpeft-target-parameters/b4_s4096/source_profile.json`
+- `split-target-parameters`: `profiling/lf_lora_split_accept/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a16_drop000/zero3_offload__source__recomp__polnone__routerhf__expact0__attnact0__layeract0__loraafwdcpu__qwenexpertsplit-target-parameters/b4_s4096/source_profile.json`
 
 Acceptance checks:
 
@@ -670,22 +675,24 @@ Acceptance checks:
 - losses are finite and in the same range as the A/B rows.
 - `split-target-parameters` expert LoRA params equal `3,321,888,768`.
 - `split-target-parameters` total trainable params equal `3,375,366,144`.
-- `split-target-parameters` avg step is close to `peft-target-parameters`, not close to current `custom-peft`.
+- `split-target-parameters` avg step is close to `peft-target-parameters`, not close to the removed Python-loop wrapper.
 - peak HBM remains close to the existing ZeRO rows; no meaningful memory regression is accepted.
 - if latency is materially worse than `peft-target-parameters`, inspect whether grouped expert dispatch was lost before accepting.
 
 Unresolved risks to watch:
 
 - Full delta materialization may make `split-target-parameters` slightly slower than stock PEFT because it materializes two deltas for fused gate/up before concatenating. That is acceptable only if the overhead is small relative to the corrected trainable surface.
-- If `split-target-parameters` still lands near `custom-peft` timing, the implementation likely still replaces or bypasses the Qwen expert grouped path and must be rejected.
+- If `split-target-parameters` regresses toward removed-wrapper timing, the implementation likely replaces or bypasses the Qwen expert grouped path and must be rejected.
 
 ## Stage 6 - Promote the new mode only after acceptance
+
+Status: completed.
 
 Modify after Stage 5 passes:
 
 - `/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/model_utils/fused_moe_lora.py`
   - make `QWEN_EXPERT_LORA_SPLIT_TARGET_PARAMETERS` the default corrected mode
-  - keep `custom-peft` behind explicit mode only
+  - keep only supported modes: `split-target-parameters`, `peft-target-parameters`, and `off`
 - `/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/adapter.py`
   - default env fallback becomes `split-target-parameters`
 - `scripts/lf/profile_lora_lf.sh`
@@ -698,9 +705,7 @@ Modify after Stage 5 passes:
 Implementation:
 
 ```python
-QWEN_EXPERT_LORA_DEFAULT = QWEN_EXPERT_LORA_SPLIT_TARGET_PARAMETERS
-
-def _get_qwen_moe_expert_lora_impl(default=QWEN_EXPERT_LORA_DEFAULT):
+def _get_qwen_moe_expert_lora_impl(default: str = "split-target-parameters"):
     return os.environ.get("LF_QWEN_MOE_EXPERT_LORA_IMPL", default).strip().lower()
 ```
 
@@ -726,8 +731,8 @@ PREPARE_DATASETS=false \
 LORA_TARGET=all \
 LORA_DROPOUT=0.00 \
 PROFILERS=source \
-WARMUP_STEPS=1 \
-MAX_STEPS=1 \
+WARMUP_STEPS=5 \
+MAX_STEPS=2 \
 RUN_POST=false \
 PLOT=false \
 PLOT_MEMORY_BREAKDOWN=false \
@@ -736,10 +741,16 @@ OVERWRITE=true \
 scripts/lf/profile_lora_lf.sh --gpus 0 --output-root profiling/lf_lora_split_default_smoke
 ```
 
+Default smoke result from `profiling/lf_lora_split_default_smoke`:
+
+| qwen expert LoRA impl | peak allocated HBM | peak reserved HBM | avg step | avg forward | avg backward | trainable params | expert LoRA params | fallback |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `split-target-parameters` | `33.138 GiB` | `38.268 GiB` | `5.155 s` | `1.424 s` | `3.730 s` | `3,375,366,144` | `3,321,888,768` | `0` |
+
 Required final state:
 
 - default row records `qwen_moe_expert_lora_impl == "split-target-parameters"`;
 - expert LoRA param count matches `3,321,888,768`;
 - source-profile surface gate passes;
 - no trainable router LoRA;
-- no stale `custom-peft` default remains in scripts.
+- no stale expert LoRA mode remains in scripts.

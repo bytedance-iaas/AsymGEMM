@@ -21,7 +21,7 @@ Execution placement:
 
 | Backend label | Dense LF model / attention | Routed MoE expert compute | Persistent expert storage |
 |---|---|---|---|
-| LF torch GPU | CUDA | CUDA torch/HF path, no KT wrapper | CUDA/HF-LF fused |
+| LF torch GPU | CUDA | CUDA torch/HF path, no KT wrapper | CUDA/HF Qwen expert |
 | LF KT TORCHBF16 on CUDA | CUDA | KT wrapper active, but `TORCHBF16_SFT` computes with torch on CUDA via `KT_TORCHBF16_SFT_DEVICE=cuda` | expert base weights on CUDA; fused expert LoRA params/grads remain CPU KT buffers with transient CUDA copies |
 | LF KT ARMBF16 on CPU | CUDA | KT wrapper active, native `ARMBF16_SFT` computes on ARM CPU | CPU KT buffers |
 
@@ -36,7 +36,7 @@ the ordinary HF/PEFT expert autograd graph for all layers.
 
 | Backend | Runtime | Train loss | Delta vs torch GPU | Peak HBM | Expert LoRA | KT calls |
 |---|---:|---:|---:|---:|---:|---:|
-| LF torch GPU | `17.919 s` | `1.366307` | `0.000000` | `106.173 GiB` | `415,236,096` LF fused | `0 fw / 0 bw` |
+| LF torch GPU | `17.919 s` | `1.366307` | `0.000000` | `106.173 GiB` | `415,236,096` Qwen expert | `0 fw / 0 bw` |
 | LF KT TORCHBF16 on CUDA | `20.630 s` | `1.364013` | `-0.002294` | `78.202 GiB` | `415,236,096` KT fused | `48 fw / 48 bw` |
 | LF KT ARMBF16 on CPU | `160.461 s` | `1.367199` | `+0.000891` | `23.437 GiB` | `415,236,096` KT fused | `48 fw / 48 bw` |
 

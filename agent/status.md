@@ -159,6 +159,29 @@ Comparison to `zero3_offload` at `b4_s8192`:
 
 There is no matching `b4_s8192` SuperOffload source artifact in the current profiling tree. The available SuperOffload source artifact is `b4_s7168`.
 
+## Qwen3 LF/ZeRO Expert LoRA Surface Fix
+
+Run: `Qwen/Qwen3-30B-A3B`, `zero3_offload|recomp`, `b4_s4096`, `drop000`, `warmup=5`, `measure=10`, source profiler, memory attribution/breakdown/snapshot disabled.
+
+This fixes the earlier LF/ZeRO trainable-surface mismatch. The accepted default is now `split-target-parameters`: it keeps the split gate/up/down expert LoRA parameter surface while preserving the original Qwen grouped expert execution path.
+
+| Qwen expert LoRA impl | Peak allocated HBM | Peak reserved HBM | Avg step | Avg forward | Avg backward | Trainable params | PEFT expert params | Qwen split expert params | Fallback | Loss max/last/train |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `peft-target-parameters` | 33.107 GiB | 38.756 GiB | 4.932s | 1.436s | 3.496s | 2,570,059,776 | 2,516,582,400 | 0 | 0 | 2.326 / 1.273 / 1.914 |
+| `split-target-parameters` | 33.138 GiB | 38.268 GiB | 6.026s | 1.671s | 4.355s | 3,375,366,144 | 3,321,888,768 | 3,321,888,768 | 0 | 2.273 / 1.231 / 1.874 |
+
+Result:
+
+- `split-target-parameters` is accepted: it has the corrected expert LoRA coverage while preserving the fast grouped expert path.
+- `peft-target-parameters` remains a useful fast PEFT baseline, but it trains fewer expert LoRA parameters and is not the corrected all-expert surface.
+- Only `split-target-parameters`, `peft-target-parameters`, and `off` remain selectable.
+- A default-mode smoke without `LF_EXPERT_LORA_IMPLS` selected `split-target-parameters`, reported `3,321,888,768` expert LoRA params, and had `reference_fallback_count=0`.
+
+Artifacts:
+
+- A/B root: `profiling/lf_lora_split_accept/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a16_drop000`
+- default smoke: `profiling/lf_lora_split_default_smoke/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s2_r64_a16_drop000/zero3_offload__source__recomp__polnone__routerhf__expact0__attnact0__layeract0__loraafwdcpu__qwenexpertsplit-target-parameters/b4_s4096/source_profile.json`
+
 ## Qwen3 Attention and Expert Activation Offload Snapshot
 
 Run: `Qwen/Qwen3-30B-A3B`, `b4_s4096`, `drop000`, `warmup=5`, `measure=10`, source profiler, memory attribution/breakdown/snapshot disabled.
@@ -179,7 +202,7 @@ Artifact root:
 Validation notes:
 
 - The `asym_cpuadamwds|recomp` row is the real AsymGEMM CPU-Adam/global-GC baseline for `none|false|false`.
-- The `zero3_offload|recomp` row completed and wrote a source profile, but the post-run trainable-surface guard failed. It logged only attention LoRA modules (`q_proj`, `k_proj`, `v_proj`, `o_proj`) with 53,477,376 trainable params and no captured expert LoRA, while the Asym rows train 3,375,366,144 LoRA params including 3,321,888,768 expert LoRA params. Treat this row as a measured historical artifact, not an accepted apples-to-apples baseline.
+- The `zero3_offload|recomp` row in this older table completed and wrote a source profile, but the post-run trainable-surface guard failed. It logged only attention LoRA modules (`q_proj`, `k_proj`, `v_proj`, `o_proj`) with 53,477,376 trainable params and no captured expert LoRA. Treat this row as a measured historical artifact. Use the accepted `split-target-parameters` row above for current LF/ZeRO Qwen3 comparisons.
 - The attention activation offload rows materially reduce HBM, but their current latency is not acceptable: they reduce memory by tens of GiB while increasing step time to about 42-46s. They should not be accepted as production changes until the fetch/backward path is redesigned.
 
 ## Qwen3 Expert Activation-Offload LoRA-A A/B
@@ -208,10 +231,7 @@ Result:
 Artifacts:
 
 The artifact directory names are historical from the run that produced the
-numbers; the current selector values are only `cpu` and `hbm`.
-
-- `cpu`: `outputs/lf_ab_stage3_cpu_left/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a16_drop000/asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact1__attnact1__layeract1__loraafwdcpu__qwenexpertcustom-peft/b4_s4096/profile.json`
-- `hbm`: `outputs/lf_ab_stage3_gpu_hbm/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a16_drop000/asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact1__attnact1__layeract1__loraafwdhbm__qwenexpertcustom-peft/b4_s4096/profile.json`
+numbers; the current LoRA-A selector values are only `cpu` and `hbm`.
 
 ## Interpretation
 

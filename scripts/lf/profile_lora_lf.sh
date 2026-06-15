@@ -31,7 +31,7 @@ PROFILERS=${PROFILERS:-source}
 PRECISION=${PRECISION:-bf16}
 # LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
 LORA_DROPOUT=${LORA_DROPOUT:-0.00}
-LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-custom-peft}
+LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero2|norecomp,zero2|recomp,zero3_offload|norecomp,zero3_offload_mem|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"kt_armbf16|recomp"}
@@ -211,8 +211,8 @@ Options:
   --lora-alpha VALUE
   --lora-dropout LIST           LoRA dropout probabilities in fixed 0.xx format, e.g. 0.00,0.10.
                                  KT supports nonzero dropout for validated kt_torchbf16 and kt_armbf16 SFT backends.
-  --lf-expert-lora-impls LIST   Qwen fused expert LoRA implementation(s): custom-peft, peft-target-parameters, off.
-                                 Use custom-peft for the corrected PEFT-compatible LF/ZeRO expert LoRA path.
+  --lf-expert-lora-impls LIST   Qwen fused expert LoRA implementation(s): peft-target-parameters, split-target-parameters, off.
+                                 Use split-target-parameters for the corrected PEFT-compatible LF/ZeRO expert LoRA path.
   --seed N
   --precision NAME
 
@@ -341,13 +341,6 @@ bool_value() {
     1|true|yes|y|on) printf 'true\n' ;;
     0|false|no|n|off) printf 'false\n' ;;
     *) die "expected true or false, got '${1}'" ;;
-  esac
-}
-
-normalize_lf_expert_lora_impl() {
-  case "${1,,}" in
-    custom-peft|peft-target-parameters|off) printf '%s\n' "${1,,}" ;;
-    *) die "LF expert LoRA implementation must be custom-peft, peft-target-parameters, or off; got '${1}'" ;;
   esac
 }
 
@@ -1120,7 +1113,7 @@ job_root_path() {
   local recompute="$4"
   local expert_policy="$5"
   local router_mode="$6"
-  local lf_expert_lora_impl_value="${7:-${lf_expert_lora_impl:-custom-peft}}"
+  local lf_expert_lora_impl_value="${7:-${lf_expert_lora_impl:-split-target-parameters}}"
   printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__${expact_lora_a_fwd_label}__qwenexpert${lf_expert_lora_impl_value}")"
 }
 
@@ -1147,7 +1140,7 @@ kt_arm_matching_source_profile_complete() {
   expected_expact_for_profile="${ASYMM_EXPERT_ACT_OFFLOAD}"
   expected_attnact_for_profile="${ASYMM_ATTN_ACT_OFFLOAD}"
   expected_layeract_for_profile="${ASYMM_LAYER_ACT_OFFLOAD}"
-  expected_lf_expert_lora_impl_for_profile="${lf_expert_lora_impl:-custom-peft}"
+  expected_lf_expert_lora_impl_for_profile="${lf_expert_lora_impl:-split-target-parameters}"
   expected_expact_lora_a_fwd_for_profile="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
   if [[ "$(basename "$(dirname "$(dirname "${source_profile_json}")")")" != *__expact*__attnact* ]]; then
     expected_expact_for_profile=""
@@ -1173,7 +1166,7 @@ kt_arm_matching_source_profile_json() {
   local router_mode="$5"
   local seq_len="$6"
   local source_job_root source_seq_root legacy_source_job_root legacy_source_seq_root
-  source_job_root="$(job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}" "${lf_expert_lora_impl:-custom-peft}")"
+  source_job_root="$(job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}" "${lf_expert_lora_impl:-split-target-parameters}")"
   source_seq_root="${source_job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
   legacy_source_job_root="$(legacy_job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}")"
   legacy_source_seq_root="${legacy_source_job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
@@ -1626,12 +1619,21 @@ mapfile -t lora_dropouts < <(tokens "${lora_dropout_spec}" | dedupe)
 for value in "${lora_dropouts[@]}"; do
   lora_dropout_label "${value}" >/dev/null
 done
-mapfile -t lf_expert_lora_impls < <(tokens "${lf_expert_lora_impl_spec}" | while read -r value; do normalize_lf_expert_lora_impl "${value}"; done | dedupe)
+lf_expert_lora_impls=()
+while IFS= read -r value; do
+  case "${value,,}" in
+    peft-target-parameters|split-target-parameters|off) lf_expert_lora_impls+=("${value,,}") ;;
+    *) die "LF expert LoRA implementation must be peft-target-parameters, split-target-parameters, or off; got '${value}'" ;;
+  esac
+done < <(tokens "${lf_expert_lora_impl_spec}")
+if ((${#lf_expert_lora_impls[@]})); then
+  mapfile -t lf_expert_lora_impls < <(printf '%s\n' "${lf_expert_lora_impls[@]}" | dedupe)
+fi
 ((${#lf_expert_lora_impls[@]})) || die "LF expert LoRA implementation list is empty"
 for value in "${lf_expert_lora_impls[@]}"; do
-  if [[ "${value}" == "peft-target-parameters" ]]; then
+  if [[ "${value}" == "peft-target-parameters" || "${value}" == "split-target-parameters" ]]; then
     for dropout in "${lora_dropouts[@]}"; do
-      [[ "${dropout}" == "0.00" ]] || die "LF_EXPERT_LORA_IMPLS=peft-target-parameters requires LORA_DROPOUT=0.00, got '${dropout}'"
+      [[ "${dropout}" == "0.00" ]] || die "LF_EXPERT_LORA_IMPLS=${value} requires LORA_DROPOUT=0.00, got '${dropout}'"
     done
   fi
 done

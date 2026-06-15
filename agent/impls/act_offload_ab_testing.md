@@ -90,7 +90,8 @@ Files, functions, and classes:
 - `/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/adapter.py`
   - `_setup_lora_tuning`
 - `/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/model/model_utils/fused_moe_lora.py`
-  - `apply_fused_moe_lora`
+  - `prepare_qwen_moe_expert_lora_config`
+  - `QwenSplitMoeExpertParamWrapper`
   - `count_fused_moe_lora`
 - `scripts/lf/run_lf_profiled_train.py`
   - `_lora_counters_from_model`
@@ -106,27 +107,25 @@ Implementation if validation shows a regression:
 
 ```python
 # adapter.py::_setup_lora_tuning
-model = peft_wrap_dense_attention_lora(...)
-if lora_target == "all" and model_has_qwen3_packed_experts(model):
-    apply_fused_moe_lora(model, rank=finetuning_args.lora_rank,
-                         alpha=finetuning_args.lora_alpha)
-return model
+target_modules = resolve_lora_targets(...)
+peft_config = LoraConfig(target_modules=target_modules, ...)
+peft_config = prepare_qwen_moe_expert_lora_config(
+    model, peft_config, "split-target-parameters", raw_lora_target, target_modules
+)
+model = get_peft_model(model, peft_config)
 
-# fused_moe_lora.py::apply_fused_moe_lora
-for module in model.modules():
-    if looks_like_qwen3_packed_experts(module):  # has 3D gate_up_proj/down_proj
-        attach _lf_fused_lora_params with:
-            gate_lora_a/b, up_lora_a/b, down_lora_a/b
-        patch/wrap forward so expert delta is applied
-        do not add LoRA to module.gate/router
+# fused_moe_lora.py::QwenSplitMoeExpertParamWrapper
+temporarily parametrize gate_up_proj and down_proj with split gate/up/down LoRA deltas
+call the original Qwen experts module unchanged
+remove parametrization after forward
 
 # run_lf_profiled_train.py::_lora_counters_from_model
 count peft attention LoRA params
-count LF fused expert LoRA params through count_fused_moe_lora(model)
-return trainable_parameters and lf_fused_expert_lora_parameters
+count Qwen split expert LoRA params through count_fused_moe_lora(model)
+return trainable_parameters and qwen_moe_expert_lora_parameters
 
 # postprocess_lf_profile_artifacts.py::_trainable_surface_summary
-expert = peft_expert_lora_parameters + lf_fused_expert_lora_parameters
+expert = max(peft_expert_lora_parameters, qwen_moe_expert_lora_parameters, kt_expert_lora_parameters)
 if non_expert_peft_lora_parameters > 0 and expert > 0:
     surface = "attention+expert LoRA"
 elif non_expert_peft_lora_parameters > 0:
@@ -149,7 +148,7 @@ Validation:
 .venv/bin/python -m pytest -q \
   tests/lf/test_asym_cpu_adamw_lf_integration.py::test_lf_plain_lora_all_adapter_adds_qwen3_fused_expert_lora \
   tests/lf/test_asym_cpu_adamw_lf_integration.py::test_lf_peft_lora_all_does_not_add_adapter_to_qwen_moe_routers \
-  tests/lf/test_lf_profile_postprocess.py::test_source_summary_flags_lf_fused_attention_plus_expert_surface \
+  tests/lf/test_lf_profile_postprocess.py::test_source_summary_flags_qwen_moe_attention_plus_expert_surface \
   tests/lf/test_lf_profile_postprocess.py::test_source_summary_flags_attention_only_surface
 ```
 

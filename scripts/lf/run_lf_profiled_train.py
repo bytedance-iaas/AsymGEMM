@@ -583,7 +583,7 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "lora_alpha": lora_alpha,
         "lora_dropout": _safe_float(_option_value(args, "--lora_dropout")),
         "qwen_moe_expert_lora_impl": os.environ.get("ASYM_GEMM_LF_CONFIG_QWEN_EXPERT_LORA_IMPL")
-        or os.environ.get("LF_QWEN_MOE_EXPERT_LORA_IMPL", "custom-peft"),
+        or os.environ.get("LF_QWEN_MOE_EXPERT_LORA_IMPL", "split-target-parameters"),
         "kt_max_cache_depth": _safe_int(_option_value(args, "--kt_max_cache_depth")),
         "max_grad_norm": _safe_float(env_config.get("max_grad_norm"))
         if _safe_float(env_config.get("max_grad_norm")) is not None
@@ -685,7 +685,6 @@ def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] 
             "reason": "lora counter trainable_parameters is missing or non-numeric",
         }
 
-    lf_fused_params = _safe_int(lora.get("lf_fused_expert_lora_parameters"))
     kt_fused_params = _safe_int(lora.get("kt_fused_expert_lora_parameters"))
     kt_expert_params = _safe_int(lora.get("kt_expert_lora_parameters"))
     peft_lora_params = _safe_int(lora.get("peft_lora_parameters"))
@@ -696,7 +695,7 @@ def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] 
         peft_expert_params = kt_peft_expert_params
     expert_lora_params = max(
         kt_expert_params or 0,
-        (peft_expert_params or 0) + (lf_fused_params or 0),
+        peft_expert_params or 0,
         qwen_moe_expert_params or 0,
     )
     non_expert_peft_params = (
@@ -723,7 +722,6 @@ def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] 
         "assumed_param_dtype": "bf16",
         "trainable_parameters": trainable_params,
         "expert_lora_parameters": expert_lora_params,
-        "lf_fused_expert_lora_parameters": lf_fused_params,
         "kt_fused_expert_lora_parameters": kt_fused_params,
         "kt_expert_lora_parameters": kt_expert_params,
         "peft_expert_lora_parameters": peft_expert_params,
@@ -740,7 +738,6 @@ def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] 
         "large_surface_warning": bool(
             trainable_params >= 1_000_000_000
             or expert_lora_params >= 1_000_000_000
-            or (lf_fused_params is not None and lf_fused_params >= 1_000_000_000)
             or (qwen_moe_expert_params is not None and qwen_moe_expert_params >= 1_000_000_000)
             or (kt_fused_params is not None and kt_fused_params >= 1_000_000_000)
         ),
@@ -781,7 +778,6 @@ def _capture_loaded_model(model: Any) -> Any:
             kt_backward_calls=kt.get("total_backward_calls"),
             trainable_parameters=lora.get("trainable_parameters"),
             expert_lora_parameters=optimizer_memory_preflight.get("expert_lora_parameters"),
-            lf_fused_expert_lora_parameters=lora.get("lf_fused_expert_lora_parameters"),
             kt_expert_lora_parameters=lora.get("kt_expert_lora_parameters"),
             kt_fused_expert_lora_parameters=lora.get("kt_fused_expert_lora_parameters"),
             optimizer_preflight_total_bf16_moments_bytes=optimizer_memory_preflight.get(
@@ -1868,9 +1864,6 @@ def _lora_counters_from_model() -> dict[str, Any]:
                 peft_expert_lora_tensors += 1
                 peft_expert_lora_params += numel
 
-    lf_fused_modules = 0
-    lf_fused_tensors = 0
-    lf_fused_params = 0
     qwen_moe_expert_modules = 0
     qwen_moe_expert_tensors = 0
     qwen_moe_expert_params = 0
@@ -1888,9 +1881,9 @@ def _lora_counters_from_model() -> dict[str, Any]:
     seen_modules: set[int] = set()
     qwen_moe_layer_type: Any = ()
     try:
-        from llamafactory.model.model_utils.fused_moe_lora import QwenMoeExpertLoraLayer
+        from llamafactory.model.model_utils.fused_moe_lora import QwenSplitMoeExpertParamWrapper
 
-        qwen_moe_layer_type = QwenMoeExpertLoraLayer
+        qwen_moe_layer_type = QwenSplitMoeExpertParamWrapper
     except Exception:
         qwen_moe_layer_type = ()
     for root in module_roots:
@@ -1900,11 +1893,6 @@ def _lora_counters_from_model() -> dict[str, Any]:
                 continue
             seen_modules.add(module_key)
 
-            lf_params = _iter_unique_parameters(getattr(module, "_lf_fused_lora_params", None))
-            if lf_params:
-                lf_fused_modules += 1
-                lf_fused_tensors += len(lf_params)
-                lf_fused_params += sum(int(param.numel()) for param in lf_params)
             if qwen_moe_layer_type and isinstance(module, qwen_moe_layer_type):
                 qwen_params = [
                     param
@@ -1974,9 +1962,6 @@ def _lora_counters_from_model() -> dict[str, Any]:
         "peft_lora_parameters": peft_lora_params,
         "peft_expert_lora_tensors": peft_expert_lora_tensors,
         "peft_expert_lora_parameters": peft_expert_lora_params,
-        "lf_fused_expert_lora_modules": lf_fused_modules,
-        "lf_fused_expert_lora_tensors": lf_fused_tensors,
-        "lf_fused_expert_lora_parameters": lf_fused_params,
         "qwen_moe_expert_lora_modules": qwen_moe_expert_modules,
         "qwen_moe_expert_lora_tensors": qwen_moe_expert_tensors,
         "qwen_moe_expert_lora_parameters": qwen_moe_expert_params,

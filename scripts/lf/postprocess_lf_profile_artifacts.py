@@ -478,7 +478,6 @@ def _trainable_surface_summary(profile: dict[str, Any]) -> dict[str, Any]:
         "peft_expert_lora_parameters",
         "kt_peft_expert_lora_parameters",
         "kt_expert_lora_parameters",
-        "lf_fused_expert_lora_parameters",
         "qwen_moe_expert_lora_parameters",
         "kt_fused_expert_lora_parameters",
     )
@@ -491,9 +490,8 @@ def _trainable_surface_summary(profile: dict[str, Any]) -> dict[str, Any]:
         peft_expert = kt_peft_expert
     peft_expert = peft_expert or 0
     kt_expert = _int_counter(lora, "kt_expert_lora_parameters") or 0
-    lf_fused_expert = _int_counter(lora, "lf_fused_expert_lora_parameters") or 0
     qwen_moe_expert = _int_counter(lora, "qwen_moe_expert_lora_parameters") or 0
-    expert_lora = max(kt_expert, peft_expert + lf_fused_expert, qwen_moe_expert)
+    expert_lora = max(kt_expert, peft_expert, qwen_moe_expert)
     non_expert_peft = None if peft_lora is None else max(0, peft_lora - peft_expert)
 
     if expert_lora > 0 and (non_expert_peft or 0) > 0:
@@ -528,7 +526,6 @@ def _trainable_surface_summary(profile: dict[str, Any]) -> dict[str, Any]:
         "non_expert_peft_lora_parameters": non_expert_peft,
         "expert_lora_parameters": expert_lora,
         "peft_expert_lora_parameters": peft_expert,
-        "lf_fused_expert_lora_parameters": lf_fused_expert,
         "qwen_moe_expert_lora_parameters": qwen_moe_expert,
         "kt_expert_lora_parameters": kt_expert,
         "kt_peft_expert_lora_parameters": kt_peft_expert,
@@ -939,8 +936,6 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
                 f"| PEFT LoRA params | {_counter_value(lora, 'peft_lora_parameters')} |",
                 f"| Qwen MoE expert LoRA params | {_counter_value(lora, 'qwen_moe_expert_lora_parameters')} |",
                 f"| Qwen MoE expert LoRA tensors | {_counter_value(lora, 'qwen_moe_expert_lora_tensors')} |",
-                f"| LF fused expert LoRA params | {_counter_value(lora, 'lf_fused_expert_lora_parameters')} |",
-                f"| LF fused expert LoRA tensors | {_counter_value(lora, 'lf_fused_expert_lora_tensors')} |",
                 f"| KT expert LoRA params | {_counter_value(lora, 'kt_expert_lora_parameters')} |",
                 f"| KT PEFT-view expert LoRA params | {_counter_value(lora, 'kt_peft_expert_lora_parameters')} |",
                 f"| KT fused expert LoRA params | {_counter_value(lora, 'kt_fused_expert_lora_parameters')} |",
@@ -977,7 +972,6 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
             f"| KT ARM route-rank cap | {optimizer_memory_preflight.get('kt_arm_sft_max_route_rank_work', '-')} |",
             f"| trainable params | {optimizer_memory_preflight.get('trainable_parameters', '-')} |",
             f"| expert LoRA params | {optimizer_memory_preflight.get('expert_lora_parameters', '-')} |",
-            f"| LF fused expert LoRA params | {optimizer_memory_preflight.get('lf_fused_expert_lora_parameters', '-')} |",
             f"| KT fused expert LoRA params | {optimizer_memory_preflight.get('kt_fused_expert_lora_parameters', '-')} |",
             f"| KT expert LoRA params | {optimizer_memory_preflight.get('kt_expert_lora_parameters', '-')} |",
             f"| non-expert PEFT LoRA params | {optimizer_memory_preflight.get('non_expert_peft_lora_parameters', '-')} |",
