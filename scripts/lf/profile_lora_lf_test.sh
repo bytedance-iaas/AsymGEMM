@@ -38,8 +38,9 @@ LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 # BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
 # Plain asym remains the non-CPUAdam Asym baseline; the default e2e path validates the Asym CPUAdamW backend.
-BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp,superoffload|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
+BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp"}
 
 # Paired expert policy / expert activation offload / attention activation offload / layer activation offload axis.
 # Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD.
@@ -74,8 +75,9 @@ INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
 RUN_NAME=${RUN_NAME:-}
 
 # Training
-SEQ_LENS=${SEQ_LENS:-11264}
-# SEQ_LENS=${SEQ_LENS:-8192}
+# SEQ_LENS=${SEQ_LENS:-11264}
+# SEQ_LENS=${SEQ_LENS:-10240}
+SEQ_LENS=${SEQ_LENS:-8192}
 # SEQ_LENS=${SEQ_LENS:-7168}
 # SEQ_LENS=${SEQ_LENS:-4096}
 PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-8}
@@ -88,13 +90,6 @@ LORA_ALPHA=${LORA_ALPHA:-16}
 SEED=${SEED:-42}
 
 # Dataset
-# DATASET=${DATASET:-asym_long_sft_smoke}
-# PREPARE_DATASETS=${PREPARE_DATASETS:-true}
-# DATASET_MIN_TOKENS=${DATASET_MIN_TOKENS:-auto}
-# DATASET_EVAL_ROWS=${DATASET_EVAL_ROWS:-128}
-# DATASET_OVERWRITE=${DATASET_OVERWRITE:-false}
-# TEMPLATE=${TEMPLATE:-auto}
-# MAX_SAMPLES=${MAX_SAMPLES:-128}
 DATASET=${DATASET:-asym_long_sft_smoke}
 PREPARE_DATASETS=${PREPARE_DATASETS:-true}
 DATASET_MIN_TOKENS=${DATASET_MIN_TOKENS:-auto}

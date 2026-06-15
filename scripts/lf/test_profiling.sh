@@ -39,7 +39,8 @@ LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
 # Plain asym remains the non-CPUAdam Asym baseline; the default e2e path validates the Asym CPUAdamW backend.
 # BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp,superoffload|recomp"}
-BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
+BACKEND_SPECS=${BACKEND_SPECS:-"zero3|norecomp"}
 
 # Paired expert policy / expert activation offload / attention activation offload / layer activation offload axis.
 # Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD.
@@ -75,11 +76,11 @@ RUN_NAME=${RUN_NAME:-}
 
 # Training
 # SEQ_LENS=${SEQ_LENS:-11264}
-SEQ_LENS=${SEQ_LENS:-8192}
+SEQ_LENS=${SEQ_LENS:-1024}
 # SEQ_LENS=${SEQ_LENS:-8192}
 # SEQ_LENS=${SEQ_LENS:-7168}
 # SEQ_LENS=${SEQ_LENS:-4096}
-PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-8}
+PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-1}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 MAX_STEPS=${MAX_STEPS:-10000000}
 WARMUP_STEPS=${WARMUP_STEPS:-5}

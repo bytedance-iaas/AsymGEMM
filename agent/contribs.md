@@ -156,3 +156,10 @@ Notes:
 - Did LoRAFusion make S_up and S_down persistent? across forward and backward? Are we currently doing that?
 
 
+### Questions
+```
+1. How to fix CPU OOM with partial recompute / NVME offloading? Can we load directly from NVME to SMEM in a kernel?
+2. Is there more kernels for the backward process?
+3. What are the bottlenecks for timing and memory currently?
+
+```
