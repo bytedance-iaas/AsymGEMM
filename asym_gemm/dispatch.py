@@ -141,7 +141,7 @@ def _is_block_scaled(a_scale: torch.Tensor, b_scale: torch.Tensor) -> bool:
     The weight scale is the discriminator: per-expert is 1-D ``[G]``, block is
     3-D ``[G, ceil(N/128), ceil(K/128)]``.
     """
-    if b_scale is None or b_scale.dim() != 3:
+    if a_scale is None or b_scale is None or b_scale.dim() != 3:
         return False
     if a_scale.dtype != torch.float32 or b_scale.dtype != torch.float32:
         raise TypeError(
