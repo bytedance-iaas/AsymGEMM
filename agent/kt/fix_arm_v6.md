@@ -160,8 +160,56 @@ Decision after Stage 4:
   so repack overlap is not a meaningful bottleneck in the current profile.
 - Skip Stage 6 for now. Route scatter/merge remains tens of milliseconds per
   layer, while CPU grouped expert math remains seconds per layer.
-- Next required validation is Stage 7 full same-config LF acceptance with
-  `BEST_T=64`, `warmup_steps=5`, and `measure_steps=10` on physical GPU 1.
+Stage 7 full same-config LF acceptance is complete:
+
+- Artifact:
+  `profiling_kt_codex_smoke/v6_accept_qwen3_s4096_b4_r64_w5_s10_t64_source/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a128_drop000/kt_armbf16__source__recomp__polnone__routerhf__expact0/b4_s4096`
+- Validation:
+  `PASS KT ARM profile: gpu_id=1 affinity_count=144 wrappers=48 fw=1440 bw=720`
+- Shape: `Qwen/Qwen3-30B-A3B`, `seq_len=4096`, `batch=4`,
+  `rank=64`, `dropout=0.00`, `warmup_steps=5`, `measure_steps=10`,
+  `trainer_max_steps=15`
+- Device/threading: physical GPU 1, `CUDA_VISIBLE_DEVICES=1`,
+  `KT_NUM_THREADS=64`, `KT_ARM_OMP_NUM_THREADS=64`,
+  `KT_ARM_SFT_BACKWARD_THREADS=64`, CPU affinity `0-143`
+- E2E trainer timing:
+  - measured e2e step `276.813 s`
+  - total e2e step `277.079 s`
+  - measured forward avg `75.246 s`
+  - measured backward avg `199.535 s`
+- Memory:
+  - peak allocated HBM `34.479 GiB`
+  - peak reserved HBM `44.029 GiB`
+  - process RSS peak `184.467 GiB`
+- Native counters, measured last 10 steps:
+  - `expert_schedule_wall_ms` avg `1078.092 ms/layer`
+  - `backward_grouped_tile_ms` avg `2457.110 ms/layer`
+  - `backward_tile_recompute_ms` avg `44131.841 task-ms/layer`
+  - `backward_route_grad_accum_ms` avg `82977.276 task-ms/layer`
+  - `backward_base_grad_ms` avg `66154.476 task-ms/layer`
+  - `backward_lora_grad_ms` avg `15930.130 task-ms/layer`
+  - `backward_local_alloc_zero_ms` avg `56.582 ms/layer`
+  - `backward_thread_reduce_ms` avg `0.000 ms/layer`
+  - `backward_repack_wait_ms` avg `0.003 ms/layer`
+  - `backward_route_scatter_ms` avg `13.292 ms/layer`
+  - `sparse_backward_scratch_bytes` avg `3.043 GiB`, max `3.074 GiB`
+- Losses: measured max `1.8324`, measured last `1.4692`,
+  trainer `1.6074`
+
+Stage 7 script fixes:
+
+- `agent/kt/scripts/profile_lora_lf_kt.sh` now passes the sibling
+  `train.log` to `validate_kt_arm_profile.py` during `existing_profile_complete`.
+  The first completed full run exited nonzero after training because this
+  wrapper validation call omitted `--train-log`; the artifact itself was
+  complete and strict validation passed once the log was supplied.
+- `agent/kt/scripts/validate_kt_arm_profile.py` now infers `train.log` and
+  `lf_run/train.log` before falling back to `train_*.log` patterns.
+- `agent/kt/scripts/lf/run_lf_profiled_train.py` removes the live
+  `source_profile.partial.json` sidecar after a successful final
+  `source_profile.json` write.
+- Wrapper validation was rechecked with `COLLECT_EXISTING=true`; it found the
+  completed artifact without rerunning training.
 
 ## Stage 0: Fix KT Profile Metadata And Thread Sweep
 

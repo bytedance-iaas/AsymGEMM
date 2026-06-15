@@ -730,6 +730,7 @@ def test_memory_breakdown_labels_asym_cpu_adamw_master_and_state_once() -> None:
     name = "model.layers.0.mlp.experts.3.lora_A.default.weight"
     cpu_master = torch.nn.Parameter(torch.ones(2, 2, dtype=torch.float32))
     exp_avg = torch.full((2, 2), 0.5, dtype=torch.float32)
+    grad_offload_buffer = torch.full((8,), 0.25, dtype=torch.float32)
 
     class SyntheticAsymCPUAdamW:
         def __init__(self) -> None:
@@ -744,12 +745,16 @@ def test_memory_breakdown_labels_asym_cpu_adamw_master_and_state_once() -> None:
         def asym_cpu_adamw_summary(self):
             return {"enabled": True, "backend": "torch"}
 
+        def asym_cpu_adamw_grad_offload_buffer(self):
+            return grad_offload_buffer
+
     profiler = LFMemoryBreakdownProfiler(LFTraceConfig(memory_breakdown=True))
     persistent = profiler._collect_persistent_bytes(None, SyntheticAsymCPUAdamW())
 
     routed = persistent["routed_experts"]
     assert routed["cpu_master_weight_cpu"] == cpu_master.untyped_storage().nbytes()
     assert routed["optimizer_state_cpu"] == exp_avg.untyped_storage().nbytes()
+    assert persistent["optimizer"]["offloaded_grad_cpu"] == grad_offload_buffer.untyped_storage().nbytes()
     assert routed.get("optimizer_state_cpu", 0) != cpu_master.untyped_storage().nbytes() + exp_avg.untyped_storage().nbytes()
 
 

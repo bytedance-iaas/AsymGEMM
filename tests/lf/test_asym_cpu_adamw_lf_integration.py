@@ -75,6 +75,7 @@ def _finetuning_args(**overrides):
         "asym_cpu_adamw_backend": "torch",
         "asym_cpu_adamw_pin_memory": False,
         "asym_cpu_adamw_fp32_master": True,
+        "asym_cpu_adamw_grad_offload": False,
         "use_galore": False,
         "use_apollo": False,
         "loraplus_lr_ratio": None,
@@ -922,6 +923,24 @@ def test_create_custom_optimizer_returns_asym_cpu_adamw_for_all_lora_name_forms(
         "dense.lora_A.default.weight",
         "dense.lora_B.default.weight",
     }
+
+
+@requires_lf_runtime
+@pytest.mark.skipif(not _cuda_available(), reason="LF AsymCPUAdamW integration tests require CUDA")
+def test_create_custom_optimizer_enables_grad_offload_when_requested() -> None:
+    model = MixedLoRAModule(device=_device())
+
+    optimizer = trainer_utils.create_custom_optimizer(
+        model,
+        _training_args(),
+        _finetuning_args(asym_cpu_adamw_grad_offload=True),
+    )
+
+    assert isinstance(optimizer, AsymCPUAdamW)
+    summary = optimizer.asym_cpu_adamw_summary()
+    assert summary["grad_offload_enabled"] is True
+    assert summary["grad_offload_hook_count"] == len(optimizer.param_names)
+    assert summary["grad_offload_buffer_bytes"] == summary["param_numel"] * 4
 
 
 @requires_lf_runtime

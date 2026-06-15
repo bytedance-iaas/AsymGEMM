@@ -77,6 +77,8 @@ USE_ASYM_CPU_ADAMW=${USE_ASYM_CPU_ADAMW:-false}
 ASYM_CPU_ADAMW_BACKEND=${ASYM_CPU_ADAMW_BACKEND:-deepspeed}
 ASYM_CPU_ADAMW_PIN_MEMORY=${ASYM_CPU_ADAMW_PIN_MEMORY:-true}
 ASYM_CPU_ADAMW_FP32_MASTER=${ASYM_CPU_ADAMW_FP32_MASTER:-true}
+ASYM_CPU_ADAMW_GRAD_OFFLOAD=${ASYM_CPU_ADAMW_GRAD_OFFLOAD:-false}
+ASYM_CPU_ADAMW_GRAD_OFFLOADS=${ASYM_CPU_ADAMW_GRAD_OFFLOADS:-${ASYM_CPU_ADAMW_GRAD_OFFLOAD}}
 
 # Output and profiling
 OUTPUT_ROOT=${OUTPUT_ROOT:-}
@@ -233,6 +235,8 @@ Options:
   --asym-cpu-adamw-backend torch|deepspeed
   --asym-cpu-adamw-pin-memory true|false
   --asym-cpu-adamw-fp32-master true|false
+  --asym-cpu-adamw-grad-offloads LIST
+                                 Grad offload modes for Asym CPUAdamW backends, e.g. false,true.
 
   KT:
   --kt-kernel-dir DIR            Integrated kt-kernel source tree.
@@ -645,6 +649,7 @@ existing_profile_complete() {
   local expected_recompute="${6:-}"
   local expected_offload_modules="${7:-}"
   local expected_expact="${8:-}"
+  local expected_grad_offload="${9:-}"
   local current_batch="${PER_DEVICE_TRAIN_BATCH_SIZE:-}"
   local current_lora_rank="${LORA_RANK:-}"
   local current_lora_dropout="${LORA_DROPOUT:-}"
@@ -659,7 +664,7 @@ existing_profile_complete() {
     "${expected_lora_target}" "${expected_recompute}" "${current_batch}" "${current_lora_rank}" \
     "${current_lora_dropout}" "${current_cache_depth}" "${current_top_k}" "${current_token_chunk_size}" \
     "${current_route_rank_limit}" "${current_default_route_rank_limit}" \
-    "${current_allow_unvalidated_route_rank}" "${expected_offload_modules}" "${expected_expact}" <<'PY' >/dev/null 2>&1
+    "${current_allow_unvalidated_route_rank}" "${expected_offload_modules}" "${expected_expact}" "${expected_grad_offload}" <<'PY' >/dev/null 2>&1
 import json
 import math
 import sys
@@ -681,6 +686,7 @@ expected_default_limit = sys.argv[14]
 allow_unvalidated = sys.argv[15]
 expected_offload_modules = sys.argv[16]
 expected_expact = sys.argv[17]
+expected_grad_offload = sys.argv[18] if len(sys.argv) > 18 else ""
 source_profile = profile.get("source_profile", {})
 source_profile = source_profile if isinstance(source_profile, dict) and source_profile else profile
 if profile.get("partial") is True:
@@ -738,14 +744,24 @@ if expected_offload_modules and backend in {"asym", "asym_torch", "asym_cpuadamw
             "profile asym_offload_modules mismatch: "
             f"expected {expected_offload_modules}, got {actual_offload or '<missing>'}"
         )
+def normalize_bool(value):
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return "true"
+    if text in {"0", "false", "no", "n", "off"}:
+        return "false"
+    return ""
+if expected_grad_offload and backend in {"asym_cpuadamwtorch", "asym_cpuadamwds"}:
+    actual_grad_offload = normalize_bool(config.get("asym_cpu_adamw_grad_offload"))
+    wanted_grad_offload = normalize_bool(expected_grad_offload)
+    if not actual_grad_offload:
+        raise SystemExit("profile asym_cpu_adamw_grad_offload missing or invalid")
+    if actual_grad_offload != wanted_grad_offload:
+        raise SystemExit(
+            "profile asym_cpu_adamw_grad_offload mismatch: "
+            f"expected {wanted_grad_offload}, got {actual_grad_offload}"
+        )
 if expected_expact:
-    def normalize_bool(value):
-        text = str(value).strip().lower()
-        if text in {"1", "true", "yes", "y", "on"}:
-            return "true"
-        if text in {"0", "false", "no", "n", "off"}:
-            return "false"
-        return ""
     actual_expact = normalize_bool(config.get("asymm_expert_act_offload"))
     wanted_expact = normalize_bool(expected_expact)
     if not actual_expact:
@@ -1008,7 +1024,12 @@ job_root_path() {
   local recompute="$4"
   local expert_policy="$5"
   local router_mode="$6"
-  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}")"
+  local grad_offload="${7:-false}"
+  local grad_offload_suffix=""
+  if cpuadam_backend_for_label "${backend}" >/dev/null; then
+    grad_offload_suffix="__gradoff${grad_offload}"
+  fi
+  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}${grad_offload_suffix}")"
 }
 
 kt_arm_matching_source_profile_complete() {
@@ -1074,7 +1095,7 @@ ensure_jobs_tsv() {
   local config_root="$1"
   mkdir -p "${config_root}"
   if [[ ! -e "${config_root}/jobs.tsv" ]]; then
-    printf 'status\tgpu\tseq_len\trecompute\texpert_policy\trouter_mode\tbackend\tprofiler\tjob_dir\tprofile_json\tlog\n' > "${config_root}/jobs.tsv"
+    printf 'status\tgpu\tseq_len\trecompute\texpert_policy\trouter_mode\tbackend\tprofiler\tgrad_offload\tjob_dir\tprofile_json\tlog\n' > "${config_root}/jobs.tsv"
   fi
 }
 
@@ -1083,7 +1104,7 @@ append_job_record() {
   local status="$2"
   shift 2
   ensure_jobs_tsv "${config_root}"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${status}" "$@" >> "${config_root}/jobs.tsv"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${status}" "$@" >> "${config_root}/jobs.tsv"
 }
 
 plot_cmd_base() {
@@ -1370,6 +1391,10 @@ while (($#)); do
     --asym-cpu-adamw-pin-memory=*) ASYM_CPU_ADAMW_PIN_MEMORY="$(bool_value "${1#*=}")"; shift ;;
     --asym-cpu-adamw-fp32-master) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_FP32_MASTER="$(bool_value "$2")"; shift 2 ;;
     --asym-cpu-adamw-fp32-master=*) ASYM_CPU_ADAMW_FP32_MASTER="$(bool_value "${1#*=}")"; shift ;;
+    --asym-cpu-adamw-grad-offload) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_GRAD_OFFLOAD="$(bool_value "$2")"; ASYM_CPU_ADAMW_GRAD_OFFLOADS="${ASYM_CPU_ADAMW_GRAD_OFFLOAD}"; shift 2 ;;
+    --asym-cpu-adamw-grad-offload=*) ASYM_CPU_ADAMW_GRAD_OFFLOAD="$(bool_value "${1#*=}")"; ASYM_CPU_ADAMW_GRAD_OFFLOADS="${ASYM_CPU_ADAMW_GRAD_OFFLOAD}"; shift ;;
+    --asym-cpu-adamw-grad-offloads) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_GRAD_OFFLOADS="$2"; shift 2 ;;
+    --asym-cpu-adamw-grad-offloads=*) ASYM_CPU_ADAMW_GRAD_OFFLOADS="${1#*=}"; shift ;;
     --kt-kernel-dir) need_value "$1" "${2-}"; KT_KERNEL_DIR="$2"; shift 2 ;;
     --kt-kernel-dir=*) KT_KERNEL_DIR="${1#*=}"; shift ;;
     --kt-tools-dir) need_value "$1" "${2-}"; KT_TOOLS_DIR="$2"; shift 2 ;;
@@ -1490,6 +1515,7 @@ EXPANDABLE_SEG=$(bool_value "${EXPANDABLE_SEG}")
 USE_ASYM_CPU_ADAMW=$(bool_value "${USE_ASYM_CPU_ADAMW}")
 ASYM_CPU_ADAMW_PIN_MEMORY=$(bool_value "${ASYM_CPU_ADAMW_PIN_MEMORY}")
 ASYM_CPU_ADAMW_FP32_MASTER=$(bool_value "${ASYM_CPU_ADAMW_FP32_MASTER}")
+ASYM_CPU_ADAMW_GRAD_OFFLOAD=$(bool_value "${ASYM_CPU_ADAMW_GRAD_OFFLOAD}")
 case "${ASYM_CPU_ADAMW_BACKEND,,}" in
   torch) ASYM_CPU_ADAMW_BACKEND=torch ;;
   deepspeed|ds) ASYM_CPU_ADAMW_BACKEND=deepspeed ;;
@@ -1571,6 +1597,10 @@ if [[ -z "${output_root}" ]]; then
   output_root="${ASYM_DIR}/test_profiling"
 fi
 mapfile -t profilers < <(tokens "${profiler_spec}" | while read -r value; do profiler_label "${value}"; done | dedupe)
+mapfile -t asym_cpu_adamw_grad_offload_modes < <(
+  tokens "${ASYM_CPU_ADAMW_GRAD_OFFLOADS}" | while read -r value; do bool_value "${value}"; done | dedupe
+)
+((${#asym_cpu_adamw_grad_offload_modes[@]})) || die "ASYM_CPU_ADAMW_GRAD_OFFLOADS must include at least one boolean value"
 if printf '%s\n' "${profilers[@]}" | grep -qx 'nsys'; then
   plot_profilers=(nsys)
 else
@@ -1797,18 +1827,26 @@ run_job() {
   local expert_policy="$7"
   local router_mode="$8"
   local dataset_name="$9"
+  local grad_offload="${10:-false}"
   local gradient_checkpointing=false
   [[ "${recompute}" == "recomp" ]] && gradient_checkpointing=true
+  if ! cpuadam_backend_for_label "${backend}" >/dev/null; then
+    grad_offload=false
+  fi
 
   local config_root job_root seq_root source_profile lf_out log_file run_id profile_json
   local kt_arm_source_ok_profile_json=""
   config_root="$(config_root_path "${seq_len}")"
-  job_root="$(job_root_path "${config_root}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${router_mode}")"
+  job_root="$(job_root_path "${config_root}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${grad_offload}")"
   seq_root="${job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
   source_profile="${seq_root}/source_profile.json"
   lf_out="${seq_root}/lf_run"
   log_file="${seq_root}/train.log"
-  run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_${lora_dropout_label_value}"
+  local grad_offload_run_label=""
+  if cpuadam_backend_for_label "${backend}" >/dev/null; then
+    grad_offload_run_label="_gradoff${grad_offload}"
+  fi
+  run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
   local profile_memory_attribution profile_memory_breakdown deepspeed_dir_for_profile
   local profile_backend_label job_use_asym_cpu_adamw job_asym_cpu_adamw_backend cpuadam_backend
@@ -1856,10 +1894,10 @@ run_job() {
     fi
   fi
   if [[ "${DRY_RUN}" != "true" && -e "${profile_json}" && "${OVERWRITE}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
-    if existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" && { [[ "${profile_memory_breakdown}" != "true" ]] || existing_memory_breakdown_valid "${seq_root}"; }; then
+    if existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${grad_offload}" && { [[ "${profile_memory_breakdown}" != "true" ]] || existing_memory_breakdown_valid "${seq_root}"; }; then
       echo "Skipping existing: ${profile_json}"
       append_job_record "${config_root}" skipped \
-        "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
+        "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}"
       return 0
     fi
     echo "Existing profile is incomplete, partial, or has missing/stale schema-v2 source-memory breakdown; rerunning: ${profile_json}" >&2
@@ -1867,7 +1905,7 @@ run_job() {
 
   if [[ "${DRY_RUN}" != "true" && "${COLLECT_EXISTING}" == "true" ]]; then
     if [[ -e "${profile_json}" ]]; then
-      if ! existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}"; then
+      if ! existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${grad_offload}"; then
         echo "Existing profile is incomplete or partial: ${profile_json}" >&2
         return 1
       fi
@@ -1901,6 +1939,7 @@ run_job() {
     ASYM_CPU_ADAMW_BACKEND="${job_asym_cpu_adamw_backend}"
     ASYM_CPU_ADAMW_PIN_MEMORY="${ASYM_CPU_ADAMW_PIN_MEMORY}"
     ASYM_CPU_ADAMW_FP32_MASTER="${ASYM_CPU_ADAMW_FP32_MASTER}"
+    ASYM_CPU_ADAMW_GRAD_OFFLOAD="${grad_offload}"
     GPU_ID="${gpu}"
     NUM_GPUS="${gpu_count}"
     REQUIRE_SM100="${REQUIRE_SM100}"
@@ -1952,6 +1991,7 @@ run_job() {
     PROFILE_MEASURE_STEPS="${MAX_STEPS}"
     PROFILE_TOTAL_STEPS="${TOTAL_STEPS}"
     MASTER_PORT="${master_port}"
+    ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD="${grad_offload}"
     ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_WARMUP_STEPS="${WARMUP_STEPS}"
     ASYM_GEMM_LF_CONFIG_MEASURE_STEPS="${MAX_STEPS}"
@@ -2001,7 +2041,7 @@ run_job() {
 
   local -a run_cmd=(env "${run_env[@]}" "${RUN_LF_SCRIPT}")
 
-  echo "Running backend=${backend} profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} router_mode=${router_mode} ${expact_label} seq=${seq_len} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
+  echo "Running backend=${backend} profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} router_mode=${router_mode} grad_offload=${grad_offload} ${expact_label} seq=${seq_len} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
   echo "  dir=${seq_root}"
   if [[ "${DRY_RUN}" == "true" ]]; then
     print_command "${run_cmd[@]}"
@@ -2011,7 +2051,7 @@ run_job() {
       print_command "${run_cmd[@]}"
     } > "${seq_root}/command.txt"
     append_job_record "${config_root}" dry-run \
-      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}"
     return 0
   fi
 
@@ -2035,7 +2075,7 @@ run_job() {
     if [[ ! -f "${profile_json}" ]]; then
       echo "Missing expected profile artifact: ${profile_json}" >&2
       status=1
-    elif ! existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}"; then
+    elif ! existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${grad_offload}"; then
       echo "Expected completed profile artifact but found incomplete/partial profile: ${profile_json}" >&2
       status=1
     fi
@@ -2043,7 +2083,7 @@ run_job() {
 
   if ((status == 0)); then
     append_job_record "${config_root}" ok \
-      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}"
     if profiler_selected_for_plots "${profiler}"; then
       plot_single_run "${config_root}" "${seq_len}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${seq_root}"
       plot_running_combined "${config_root}" "${seq_len}" "${seq_root}"
@@ -2054,7 +2094,7 @@ run_job() {
     fi
   else
     append_job_record "${config_root}" "failed:${status}" \
-      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${seq_root}" "${profile_json}" "${log_file}"
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}"
   fi
   return "${status}"
 }
@@ -2482,12 +2522,19 @@ for model_spec_entry in "${model_specs[@]}"; do
                 fi
                 gpu_count="$(backend_gpu_count "${backend}" "${current_model_gpu_count}")"
                 gpu="$(gpu_slice "${gpu_count}")"
-                if ! run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}"; then
-                  failures=$((failures + 1))
-                  if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
-                    exit 1
-                  fi
+                if cpuadam_backend_for_label "${backend}" >/dev/null; then
+                  grad_offload_modes_for_job=("${asym_cpu_adamw_grad_offload_modes[@]}")
+                else
+                  grad_offload_modes_for_job=(false)
                 fi
+                for grad_offload in "${grad_offload_modes_for_job[@]}"; do
+                  if ! run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}" "${grad_offload}"; then
+                    failures=$((failures + 1))
+                    if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
+                      exit 1
+                    fi
+                  fi
+                done
               done
             done
           done

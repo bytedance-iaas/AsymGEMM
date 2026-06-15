@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import time
-from typing import Any, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 import torch
 
@@ -75,6 +76,19 @@ class _ParamMapping:
     model_dtype: torch.dtype
     master_dtype: torch.dtype
     last_had_grad: bool = False
+    grad_buffer_has_data: bool = False
+    hook_calls: int = 0
+    offloaded_grad_numel: int = 0
+
+
+def _register_post_accumulate_hook(param: torch.nn.Parameter, hook: Callable[[torch.Tensor], None]) -> Any:
+    register = getattr(param, "register_post_accumulate_grad_hook", None)
+    if callable(register):
+        return register(hook)
+
+    param_tmp = param.expand_as(param)
+    grad_acc = param_tmp.grad_fn.next_functions[0][0]
+    return grad_acc.register_hook(lambda *unused: hook(param))
 
 
 class AsymCPUAdamW(torch.optim.Optimizer):
@@ -96,6 +110,7 @@ class AsymCPUAdamW(torch.optim.Optimizer):
         backend: Literal["torch", "deepspeed"] = "deepspeed",
         pin_memory: bool = True,
         fp32_master: bool = True,
+        grad_offload: bool = False,
     ) -> None:
         if backend not in {"torch", "deepspeed"}:
             raise ValueError("backend must be either 'torch' or 'deepspeed'")
@@ -150,8 +165,12 @@ class AsymCPUAdamW(torch.optim.Optimizer):
         self.backend = backend
         self.pin_memory = bool(pin_memory)
         self.fp32_master = bool(fp32_master)
+        self.grad_offload = bool(grad_offload)
         self._mappings: list[_ParamMapping] = []
         self._pin_memory_failures: list[str] = []
+        self._grad_offload_handles: list[Any] = []
+        self._grad_flat_buffer: torch.Tensor | None = None
+        self._grad_accum_staging_buffer: torch.Tensor | None = None
         self._post_prepare_checked = False
         self._last_step_grad_param_count = 0
         self._last_step_copyback_param_count = 0
@@ -159,6 +178,12 @@ class AsymCPUAdamW(torch.optim.Optimizer):
         self._last_grad_copy_ms = 0.0
         self._last_cpu_adam_step_ms = 0.0
         self._last_weight_copyback_ms = 0.0
+        self._current_hook_grad_copy_ms = 0.0
+        self._last_hook_offloaded_param_count = 0
+        self._last_hook_offloaded_numel = 0
+        self._last_hook_call_count = 0
+        self._last_hook_grad_copy_ms = 0.0
+        self._last_step_used_offloaded_grads = False
 
         cpu_params: list[torch.nn.Parameter] = []
         for name, cuda_param, aliases in unique_entries:
@@ -188,6 +213,9 @@ class AsymCPUAdamW(torch.optim.Optimizer):
             weight_decay=weight_decay,
         )
         self._refresh_visible_state()
+        if self.grad_offload:
+            self._ensure_grad_offload_flat_buffer()
+            self._register_grad_offload_hooks()
 
     @property
     def param_names(self) -> list[str]:
@@ -257,6 +285,13 @@ class AsymCPUAdamW(torch.optim.Optimizer):
         self._post_prepare_checked = True
 
     def _ensure_grad_buffer(self, mapping: _ParamMapping) -> torch.Tensor:
+        if self.grad_offload:
+            if mapping.grad_buffer is None:
+                self._ensure_grad_offload_flat_buffer()
+            if mapping.grad_buffer is None:
+                raise RuntimeError(f"missing offload grad buffer for {mapping.name}")
+            return mapping.grad_buffer
+
         current = mapping.grad_buffer
         if current is not None and current.shape == mapping.cpu_param.shape and current.dtype == mapping.cpu_param.dtype:
             return current
@@ -266,6 +301,96 @@ class AsymCPUAdamW(torch.optim.Optimizer):
             self._pin_memory_failures.append(f"{mapping.name}.grad: {pin_error}")
         mapping.grad_buffer = buffer
         return buffer
+
+    def _ensure_grad_offload_flat_buffer(self) -> torch.Tensor:
+        total = sum(int(mapping.cpu_param.numel()) for mapping in self._mappings)
+        current = self._grad_flat_buffer
+        if current is not None and current.numel() == total and current.dtype == torch.float32:
+            return current
+
+        flat = torch.empty(total, device="cpu", dtype=torch.float32)
+        flat, pin_error = _pin_if_requested(flat, pin_memory=self.pin_memory)
+        if pin_error is not None:
+            self._pin_memory_failures.append(f"grad_flat_buffer: {pin_error}")
+        self._grad_flat_buffer = flat
+
+        offset = 0
+        for mapping in self._mappings:
+            numel = int(mapping.cpu_param.numel())
+            mapping.grad_buffer = flat.narrow(0, offset, numel).view_as(mapping.cpu_param.data)
+            offset += numel
+        return flat
+
+    def _ensure_grad_accum_staging_buffer(self, numel: int) -> torch.Tensor:
+        current = self._grad_accum_staging_buffer
+        if current is None or current.numel() < numel or current.dtype != torch.float32:
+            staging = torch.empty(numel, device="cpu", dtype=torch.float32)
+            staging, pin_error = _pin_if_requested(staging, pin_memory=self.pin_memory)
+            if pin_error is not None:
+                self._pin_memory_failures.append(f"grad_accum_staging_buffer: {pin_error}")
+            self._grad_accum_staging_buffer = staging
+        return self._grad_accum_staging_buffer.narrow(0, 0, numel)
+
+    def _register_grad_offload_hooks(self) -> None:
+        if self._grad_offload_handles:
+            return
+        for mapping in self._mappings:
+            if not mapping.cuda_param.is_leaf:
+                raise RuntimeError(f"AsymCPUAdamW grad offload requires leaf CUDA params; got {mapping.name}")
+            self._grad_offload_handles.append(
+                _register_post_accumulate_hook(
+                    mapping.cuda_param,
+                    lambda param, mapping=mapping: self._offload_grad_from_hook(mapping, param),
+                )
+            )
+
+    @torch.no_grad()
+    def _offload_grad_from_hook(self, mapping: _ParamMapping, param: torch.Tensor) -> None:
+        if not self.grad_offload:
+            return
+        if param is not mapping.cuda_param:
+            raise RuntimeError(f"Grad hook param mismatch for {mapping.name}")
+
+        grad = mapping.cuda_param.grad
+        if grad is None:
+            return
+        if grad.is_sparse:
+            raise RuntimeError("AsymCPUAdamW grad offload does not support sparse LoRA grads.")
+        if grad.device.type != "cuda":
+            raise RuntimeError(f"AsymCPUAdamW grad offload expected CUDA grad for {mapping.name}, got {grad.device}")
+        if tuple(grad.shape) != tuple(mapping.cpu_param.shape):
+            raise RuntimeError(
+                f"AsymCPUAdamW grad shape mismatch for {mapping.name}: "
+                f"grad={tuple(grad.shape)}, param={tuple(mapping.cpu_param.shape)}"
+            )
+
+        started = time.perf_counter()
+        self._copy_or_accumulate_grad_to_cpu(mapping, grad.detach())
+        self._current_hook_grad_copy_ms += (time.perf_counter() - started) * 1000.0
+
+        mapping.last_had_grad = True
+        mapping.grad_buffer_has_data = True
+        mapping.hook_calls += 1
+        mapping.offloaded_grad_numel += int(grad.numel())
+        mapping.cpu_param.grad = mapping.grad_buffer
+        mapping.cuda_param.grad = None
+
+    def _copy_or_accumulate_grad_to_cpu(self, mapping: _ParamMapping, cuda_grad: torch.Tensor) -> None:
+        grad_buffer = self._ensure_grad_buffer(mapping)
+        if not grad_buffer.is_contiguous():
+            raise RuntimeError(f"CPU grad buffer for {mapping.name} must be contiguous")
+        if grad_buffer.dtype != mapping.cpu_param.dtype:
+            raise RuntimeError(
+                f"CPU grad buffer for {mapping.name} has dtype {grad_buffer.dtype}, "
+                f"expected {mapping.cpu_param.dtype}"
+            )
+        if not mapping.grad_buffer_has_data:
+            grad_buffer.copy_(cuda_grad, non_blocking=False)
+            return
+
+        staging = self._ensure_grad_accum_staging_buffer(int(cuda_grad.numel())).view_as(grad_buffer)
+        staging.copy_(cuda_grad, non_blocking=False)
+        grad_buffer.add_(staging)
 
     def _copy_master_to_compute_param(self, mapping: _ParamMapping) -> None:
         if not mapping.cpu_param.data.is_contiguous():
@@ -298,26 +423,50 @@ class AsymCPUAdamW(torch.optim.Optimizer):
 
         with torch.no_grad():
             grad_copy_start = time.perf_counter()
-            for mapping in self._mappings:
-                grad = mapping.cuda_param.grad
-                if grad is None:
-                    mapping.cpu_param.grad = None
-                    mapping.last_had_grad = False
-                    skipped_no_grad += 1
-                    continue
-                grad_buffer = self._ensure_grad_buffer(mapping)
-                grad_buffer.copy_(grad.detach(), non_blocking=False)
-                if not grad_buffer.is_contiguous():
-                    raise RuntimeError(f"CPU grad buffer for {mapping.name} must be contiguous")
-                if grad_buffer.dtype != mapping.cpu_param.dtype:
-                    raise RuntimeError(
-                        f"CPU grad buffer for {mapping.name} has dtype {grad_buffer.dtype}, "
-                        f"expected {mapping.cpu_param.dtype}"
-                    )
-                mapping.cpu_param.grad = grad_buffer
-                mapping.last_had_grad = True
-                grad_param_count += 1
-            self._last_grad_copy_ms = (time.perf_counter() - grad_copy_start) * 1000.0
+            if self.grad_offload:
+                for mapping in self._mappings:
+                    if mapping.grad_buffer_has_data:
+                        mapping.cpu_param.grad = mapping.grad_buffer
+                        mapping.last_had_grad = True
+                        grad_param_count += 1
+                    else:
+                        mapping.cpu_param.grad = None
+                        mapping.last_had_grad = False
+                        skipped_no_grad += 1
+                self._last_grad_copy_ms = 0.0
+                self._last_step_used_offloaded_grads = grad_param_count > 0
+                self._last_hook_offloaded_param_count = grad_param_count
+                self._last_hook_offloaded_numel = sum(
+                    int(mapping.offloaded_grad_numel) for mapping in self._mappings if mapping.last_had_grad
+                )
+                self._last_hook_call_count = sum(int(mapping.hook_calls) for mapping in self._mappings)
+                self._last_hook_grad_copy_ms = self._current_hook_grad_copy_ms
+            else:
+                for mapping in self._mappings:
+                    grad = mapping.cuda_param.grad
+                    if grad is None:
+                        mapping.cpu_param.grad = None
+                        mapping.last_had_grad = False
+                        skipped_no_grad += 1
+                        continue
+                    grad_buffer = self._ensure_grad_buffer(mapping)
+                    grad_buffer.copy_(grad.detach(), non_blocking=False)
+                    if not grad_buffer.is_contiguous():
+                        raise RuntimeError(f"CPU grad buffer for {mapping.name} must be contiguous")
+                    if grad_buffer.dtype != mapping.cpu_param.dtype:
+                        raise RuntimeError(
+                            f"CPU grad buffer for {mapping.name} has dtype {grad_buffer.dtype}, "
+                            f"expected {mapping.cpu_param.dtype}"
+                        )
+                    mapping.cpu_param.grad = grad_buffer
+                    mapping.last_had_grad = True
+                    grad_param_count += 1
+                self._last_grad_copy_ms = (time.perf_counter() - grad_copy_start) * 1000.0
+                self._last_step_used_offloaded_grads = False
+                self._last_hook_offloaded_param_count = 0
+                self._last_hook_offloaded_numel = 0
+                self._last_hook_call_count = 0
+                self._last_hook_grad_copy_ms = 0.0
 
             step_start = time.perf_counter()
             if grad_param_count:
@@ -340,16 +489,23 @@ class AsymCPUAdamW(torch.optim.Optimizer):
         return loss
 
     def zero_grad(self, set_to_none: bool = True) -> None:
-        super().zero_grad(set_to_none=set_to_none)
+        super().zero_grad(set_to_none=True if self.grad_offload else set_to_none)
         try:
-            self.inner_optimizer.zero_grad(set_to_none=set_to_none)
+            self.inner_optimizer.zero_grad(set_to_none=True if self.grad_offload else set_to_none)
         except TypeError:
             self.inner_optimizer.zero_grad()
         for mapping in self._mappings:
-            if set_to_none:
+            mapping.cuda_param.grad = None
+            if self.grad_offload or set_to_none:
                 mapping.cpu_param.grad = None
             elif mapping.cpu_param.grad is not None:
                 mapping.cpu_param.grad.zero_()
+            mapping.grad_buffer_has_data = False
+            mapping.last_had_grad = False
+            mapping.hook_calls = 0
+            mapping.offloaded_grad_numel = 0
+        if self.grad_offload:
+            self._current_hook_grad_copy_ms = 0.0
 
     def _sanitized_param_groups(self) -> list[dict[str, Any]]:
         param_index = {id(mapping.cuda_param): index for index, mapping in enumerate(self._mappings)}
@@ -372,6 +528,7 @@ class AsymCPUAdamW(torch.optim.Optimizer):
             "backend": self.backend,
             "pin_memory": self.pin_memory,
             "fp32_master": self.fp32_master,
+            "grad_offload": self.grad_offload,
             "param_names": self.param_names,
             "alias_param_names": [list(aliases) for aliases in self.alias_param_names],
             "param_groups": self._sanitized_param_groups(),
@@ -462,6 +619,101 @@ class AsymCPUAdamW(torch.optim.Optimizer):
     def asym_cuda_param_name_map(self) -> dict[int, str]:
         return {id(mapping.cuda_param): mapping.name for mapping in self._mappings}
 
+    def asym_cpu_adamw_grad_offload_enabled(self) -> bool:
+        return bool(self.grad_offload)
+
+    def asym_cpu_adamw_grad_buffers(self) -> list[torch.Tensor]:
+        return [
+            mapping.grad_buffer
+            for mapping in self._mappings
+            if mapping.grad_buffer_has_data and mapping.grad_buffer is not None
+        ]
+
+    def asym_cpu_adamw_grad_norm(self, norm_type: float = 2.0, chunk_elements: int = 8_388_608) -> torch.Tensor:
+        chunk_elements_i = int(chunk_elements)
+        if chunk_elements_i <= 0:
+            raise ValueError("chunk_elements must be positive")
+
+        grads = self.asym_cpu_adamw_grad_buffers()
+        if not grads:
+            return torch.zeros((), dtype=torch.float32, device="cpu")
+
+        norm_type_f = float(norm_type)
+        if math.isinf(norm_type_f):
+            max_abs = torch.zeros((), dtype=torch.float64, device="cpu")
+            for grad in grads:
+                flat = grad.detach().reshape(-1)
+                for start in range(0, int(flat.numel()), chunk_elements_i):
+                    chunk = flat.narrow(0, start, min(chunk_elements_i, int(flat.numel()) - start))
+                    max_abs = torch.maximum(max_abs, chunk.abs().max().to(device="cpu", dtype=torch.float64))
+            return max_abs.to(dtype=torch.float32)
+
+        total = torch.zeros((), dtype=torch.float64, device="cpu")
+        for grad in grads:
+            flat = grad.detach().reshape(-1)
+            for start in range(0, int(flat.numel()), chunk_elements_i):
+                chunk = flat.narrow(0, start, min(chunk_elements_i, int(flat.numel()) - start))
+                chunk_f32 = chunk if chunk.dtype in (torch.float32, torch.float64) else chunk.float()
+                total += torch.sum(torch.abs(chunk_f32) ** norm_type_f, dtype=torch.float64).cpu()
+        return total.pow(1.0 / norm_type_f).to(dtype=torch.float32)
+
+    def asym_cpu_adamw_clip_grad_norm_(
+        self,
+        max_norm: float,
+        norm_type: float = 2.0,
+        chunk_elements: int = 8_388_608,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        total_norm = self.asym_cpu_adamw_grad_norm(norm_type=norm_type, chunk_elements=chunk_elements)
+        max_norm_f = float(max_norm)
+        total_norm_value = float(total_norm.item())
+        nonfinite = not math.isfinite(total_norm_value)
+        norm_only = math.isinf(max_norm_f)
+        if norm_only:
+            clip_coef = 1.0
+            clip_coef_clamped = 1.0
+            clipped = False
+            max_norm_summary: float | str = "inf"
+        elif math.isnan(total_norm_value):
+            clip_coef = float("nan")
+            clip_coef_clamped = 1.0
+            clipped = False
+            max_norm_summary = max_norm_f
+        else:
+            clip_coef = max_norm_f / (total_norm_value + 1e-6)
+            clip_coef_clamped = min(clip_coef, 1.0) if math.isfinite(clip_coef) else clip_coef
+            clipped = bool(clip_coef_clamped < 1.0)
+            max_norm_summary = max_norm_f
+        if clipped:
+            for grad in self.asym_cpu_adamw_grad_buffers():
+                grad.mul_(clip_coef_clamped)
+
+        grad_buffers = self.asym_cpu_adamw_grad_buffers()
+        if clipped and math.isfinite(total_norm_value) and math.isfinite(clip_coef_clamped):
+            result_norm_value = total_norm_value * clip_coef_clamped
+        else:
+            result_norm_value = total_norm_value
+        summary = {
+            "enabled": True,
+            "path": "asym_cpu_adamw_grad_offload",
+            "operation": "norm_only" if norm_only else "clip",
+            "max_norm": max_norm_summary,
+            "norm_type": float(norm_type),
+            "total_norm": total_norm_value,
+            "result_norm": result_norm_value,
+            "clip_coef": float(clip_coef),
+            "clip_coef_clamped": float(clip_coef_clamped),
+            "clipped": clipped,
+            "nonfinite": nonfinite,
+            "cpu_grad_tensors": len(grad_buffers),
+            "cpu_grad_numel": sum(int(grad.numel()) for grad in grad_buffers),
+            "cuda_grad_tensors": 0,
+            "chunk_elements": int(chunk_elements),
+        }
+        return total_norm, summary
+
+    def asym_cpu_adamw_grad_offload_buffer(self) -> torch.Tensor | None:
+        return self._grad_flat_buffer
+
     def asym_cpu_adamw_summary(self) -> dict[str, Any]:
         master_bytes = sum(_tensor_storage_nbytes(mapping.cpu_param.data) for mapping in self._mappings)
         pinned_master_bytes = sum(
@@ -491,9 +743,19 @@ class AsymCPUAdamW(torch.optim.Optimizer):
                 seen_state.add(key)
                 if value.device.type == "cpu":
                     optimizer_state_cpu_bytes += int(key[2])
+        grad_buffer_bytes = _tensor_storage_nbytes(self._grad_flat_buffer) if self._grad_flat_buffer is not None else 0
+        pinned_grad_buffer_bytes = (
+            _tensor_storage_nbytes(self._grad_flat_buffer)
+            if self._grad_flat_buffer is not None and self._grad_flat_buffer.is_pinned()
+            else 0
+        )
         return {
             "enabled": True,
             "backend": self.backend,
+            "grad_offload_enabled": bool(self.grad_offload),
+            "grad_offload_hook_count": len(self._grad_offload_handles),
+            "grad_offload_buffer_bytes": int(grad_buffer_bytes),
+            "pinned_grad_offload_buffer_bytes": int(pinned_grad_buffer_bytes),
             "param_count": len(self._mappings),
             "param_numel": sum(int(mapping.cpu_param.numel()) for mapping in self._mappings),
             "cpu_master_bytes": int(master_bytes),
@@ -504,6 +766,12 @@ class AsymCPUAdamW(torch.optim.Optimizer):
             "last_step_grad_param_count": int(self._last_step_grad_param_count),
             "last_step_copyback_param_count": int(self._last_step_copyback_param_count),
             "skipped_copyback_no_grad_param_count": int(self._last_step_skipped_copyback_no_grad_param_count),
+            "last_step_used_offloaded_grads": bool(self._last_step_used_offloaded_grads),
+            "last_hook_offloaded_param_count": int(self._last_hook_offloaded_param_count),
+            "last_hook_offloaded_numel": int(self._last_hook_offloaded_numel),
+            "last_hook_call_count": int(self._last_hook_call_count),
+            "hook_grad_copy_ms": float(self._last_hook_grad_copy_ms),
+            "step_grad_copy_ms": float(self._last_grad_copy_ms),
             "grad_copy_ms": float(self._last_grad_copy_ms),
             "cpu_adam_step_ms": float(self._last_cpu_adam_step_ms),
             "weight_copyback_ms": float(self._last_weight_copyback_ms),

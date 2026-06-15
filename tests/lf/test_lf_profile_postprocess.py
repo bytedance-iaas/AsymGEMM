@@ -161,6 +161,7 @@ def test_profile_config_preserves_deepspeed_dir_for_asym_cpuadamwds(
     monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_BACKEND", "asym_cpuadamwds")
     monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_USE_ASYM_CPU_ADAMW", "true")
     monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_BACKEND", "deepspeed")
+    monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD", "true")
     monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_DEEPSPEED_DIR", str(deepspeed_dir))
 
     config = module._config_from_args(
@@ -189,6 +190,7 @@ def test_profile_config_preserves_deepspeed_dir_for_asym_cpuadamwds(
     assert config["backend"] == "asym_cpuadamwds"
     assert config["use_asym_cpu_adamw"] == "true"
     assert config["asym_cpu_adamw_backend"] == "deepspeed"
+    assert config["asym_cpu_adamw_grad_offload"] is True
     assert config["deepspeed_dir"] == str(deepspeed_dir)
 
 
@@ -857,6 +859,58 @@ def test_grad_clip_hook_records_kt_summary(monkeypatch) -> None:
     assert module._GRAD_CLIP_MARKER["path"] == "kt_aware_dense"
     assert module._GRAD_CLIP_MARKER["operation"] == "clip"
     assert module._GRAD_CLIP_MARKER["cpu_grad_numel"] == 16
+
+
+def test_grad_clip_hook_records_asym_cpuadamw_summary(monkeypatch) -> None:
+    module = _load_profile_launcher_module()
+    events: list[tuple[str, dict]] = []
+    writes: list[tuple[str, dict | None]] = []
+
+    class DummyHeartbeat:
+        def emit(self, stage: str, **fields) -> None:
+            events.append((stage, fields))
+
+    class DummyPartialWriter:
+        def write(self, reason: str, *, force: bool = False, extra: dict | None = None) -> None:
+            writes.append((reason, extra))
+
+    class DummyTrainer:
+        def __init__(self) -> None:
+            self.state = SimpleNamespace(global_step=6)
+
+        def train(self, *args, **kwargs):
+            return None
+
+        def training_step(self, model, inputs, *args, **kwargs):
+            return torch.tensor(0.0)
+
+        def _clip_grad_norm(self, model):
+            self._asym_cpu_adamw_grad_clip_last_summary = {
+                "path": "asym_cpu_adamw_grad_offload",
+                "operation": "clip",
+                "total_norm": 5.0,
+                "clip_coef": 0.25,
+                "clipped": True,
+                "cpu_grad_tensors": 3,
+                "cpu_grad_numel": 24,
+            }
+            return torch.tensor(5.0)
+
+    fake_transformers = ModuleType("transformers")
+    fake_transformers.Trainer = DummyTrainer
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    module._GRAD_CLIP_MARKER = {}
+    module._install_trainer_heartbeat_hooks(DummyHeartbeat(), DummyPartialWriter())
+
+    result = DummyTrainer()._clip_grad_norm(torch.nn.Linear(1, 1))
+
+    assert float(result) == 5.0
+    assert [stage for stage, _ in events] == ["grad_clip_start", "grad_clip_end"]
+    assert [reason for reason, _ in writes] == ["grad_clip_start", "grad_clip_end"]
+    assert module._GRAD_CLIP_MARKER["path"] == "asym_cpu_adamw_grad_offload"
+    assert module._GRAD_CLIP_MARKER["operation"] == "clip"
+    assert module._GRAD_CLIP_MARKER["cpu_grad_numel"] == 24
 
 
 def test_optimizer_step_hook_brackets_rss_around_original_step(monkeypatch) -> None:
@@ -1949,6 +2003,13 @@ def test_profile_json_csvs_include_nested_source_profile_artifacts(tmp_path: Pat
         "asym_cpu_adamw": {
             "enabled": True,
             "backend": "torch",
+            "grad_offload_enabled": True,
+            "grad_offload_hook_count": 2,
+            "grad_offload_buffer_bytes": 64,
+            "last_step_used_offloaded_grads": True,
+            "last_hook_offloaded_numel": 16,
+            "hook_grad_copy_ms": 0.25,
+            "step_grad_copy_ms": 0.0,
             "param_count": 2,
             "cpu_master_bytes": 32,
             "optimizer_state_cpu_bytes": 64,
@@ -1980,7 +2041,11 @@ def test_profile_json_csvs_include_nested_source_profile_artifacts(tmp_path: Pat
     assert "saved_activation" in (output_dir / "memory_breakdown.csv").read_text(encoding="utf-8")
     assert "saved_activation" in (output_dir / "memory_actual_peak_breakdown.csv").read_text(encoding="utf-8")
     assert "DeepSpeedCPUAdam" in (output_dir / "cpuadam.csv").read_text(encoding="utf-8")
-    assert "cpu_master_bytes" in (output_dir / "asym_cpu_adamw.csv").read_text(encoding="utf-8")
+    asym_cpu_adamw_csv = (output_dir / "asym_cpu_adamw.csv").read_text(encoding="utf-8")
+    assert "cpu_master_bytes" in asym_cpu_adamw_csv
+    assert "grad_offload_enabled" in asym_cpu_adamw_csv
+    assert "grad_offload_buffer_bytes" in asym_cpu_adamw_csv
+    assert "last_hook_offloaded_numel" in asym_cpu_adamw_csv
     persisted = json.loads(profile_json.read_text(encoding="utf-8"))
     persisted_source = persisted["source_profile"]
     assert persisted_source["trainable_surface"]["surface"] == "attention+expert LoRA"

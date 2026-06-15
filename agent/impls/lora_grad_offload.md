@@ -2,6 +2,19 @@
 
 Goal: add an opt-in LoRA gradient offload path for single-GPU AsymGEMM LoRA SFT. Keep LoRA compute weights on CUDA. Do not add LoRA weight offload in this plan.
 
+Implementation status:
+
+- Stages 1-4 are implemented: the LF toggle is plumbed, `AsymCPUAdamW` has hook-time LoRA grad offload, LF gradient clipping/norm reads the optimizer-owned CPU buffers, and source/memory-breakdown reporting exposes grad-offload counters.
+- The implemented path keeps CUDA LoRA weights resident and offloads only grads. Each unique LoRA CUDA parameter gets a post-accumulate hook. The hook copies/accumulates the CUDA grad into one contiguous fp32 CPU grad slab, assigns that CPU view to the CPU master param `.grad`, and immediately clears the CUDA param `.grad`.
+- The default remains `asym_cpu_adamw_grad_offload=false`; A/B scripts can sweep `ASYM_CPU_ADAMW_GRAD_OFFLOADS=false,true`, and CPUAdamW job paths include `__gradofffalse` or `__gradofftrue`.
+- A shortened real-script A/B smoke passed in the Python 3.12 enroot runtime with host repo mounted: Qwen3-30B-A3B, `asym_cpuadamwds|recomp`, `b1_s128`, `warmup=5`, `measure=1`, `ASYM_CPU_ADAMW_GRAD_OFFLOADS=false,true`. The `grad_offload=true` profile reported 672 hooks, a 12.574 GiB pinned CPU grad slab, `optimizer_memory.cuda_grad_bytes=0`, `step_grad_copy_ms=0`, `grad_clip.path=asym_cpu_adamw_grad_offload`, and peak allocated HBM `6.592 GiB` versus `12.764 GiB` for `grad_offload=false`.
+- Full real-script A/B acceptance was executed in the Python 3.12 enroot runtime with host repo mounted: Qwen3-30B-A3B, `asym_cpuadamwds|norecomp`, `b4_s4096`, `warmup=5`, `measure=10`, `ASYMM_EXP_ACT_POLICIES=none|true|true|true`, `ASYM_CPU_ADAMW_GRAD_OFFLOADS=false,true`. Output root: `profiling/lora_grad_offload_accept_20260615T073937Z`.
+- Full-run functional grad-offload checks passed: `grad_offload=true` reported 672 hooks, a 12.574 GiB pinned CPU grad slab, `optimizer_memory.cuda_grad_bytes=0`, `step_grad_copy_ms=0`, `grad_clip.path=asym_cpu_adamw_grad_offload`, and `last_step_used_offloaded_grads=true`.
+- Full-run peak-HBM acceptance failed: `grad_offload=false` peak allocated HBM was `34.593 GiB`; `grad_offload=true` peak allocated HBM was also `34.593 GiB`, missing the `<= 30.5 GiB` target. Measured step latency stayed within the planned 15% bound: `46.974 s` baseline versus `53.509 s` with grad offload, ratio `1.139x`.
+- The failure is not stale CUDA grad residency. The `grad_offload=true` step samples drop live allocation at backward end from `13.012 GiB` to `6.725 GiB`, which matches removing the `6.287 GiB` CUDA LoRA grads. The global peak remains unchanged because this workload also has large loss/lm-head allocations live around the peak, so deleting persistent LoRA grad tensors does not move the allocator high-water mark.
+- A focused `grad_offload=true` debug run with `PROFILE_MEMORY_SNAPSHOT=true` confirms the actual peak live set. Output root: `profiling/lora_grad_offload_peakdebug_20260615T083310Z`. The snapshot replay reports peak live HBM `34.593 GiB`, with `18.547 GiB` in two allocator-unframed blocks, `9.273 GiB` in one `cross_entropy`/loss block from `transformers/models/qwen3_moe/modeling_qwen3_moe.py:688`, `6.221 GiB` in long-lived model CUDA params, and only small norm/attention/expert blocks. The three `9.273 GiB` blocks match fp32-sized `[4 * (4096 - 1), 151936]` loss/logit workspace scale. Therefore the unchanged peak is real loss-side memory, not memory appearing from nowhere and not hidden CUDA LoRA grads.
+- Stage 5 is therefore not accepted for the stated `<= 30.5 GiB` peak target. The implemented LoRA grad offload is functionally correct and DS-like, but the target requires reducing the loss/lm-head backward temporary peak or changing the acceptance metric to post-backward live allocation; neither is LoRA grad offload alone.
+
 Facts resolved from local code and docs:
 
 - Current `AsymCPUAdamW` keeps CUDA LoRA compute params and CPU fp32 masters, but copies CUDA `.grad` into CPU buffers inside `AsymCPUAdamW.step()` only. See `asym_gemm/training/cpu_adam.py:80`, `:118`, `:299`.
@@ -25,8 +38,9 @@ Peak HBM target for the real acceptance workload:
 - Baseline config: Qwen3-30B-A3B, single GPU, `b4_s4096`, `warmup=5`, `measure=10`, rank 64, `asym_cpuadamwds|norecomp`, and activation offload `none|true|true|true` for expert, attention, and layer activation offload.
 - Baseline profile numbers: peak allocated HBM `34.593 GiB`, peak reserved HBM `39.676 GiB`, forward peak allocated `29.988 GiB`, backward peak allocated `34.562 GiB`, trainable LoRA params `3,375,366,144`, CUDA bf16 LoRA grads `6.287 GiB`.
 - Naively subtracting all CUDA grads gives `34.593 - 6.287 = 28.306 GiB`, but that is not the practical target because the forward pass already peaks around `29.988 GiB` before LoRA grads exist.
-- The expected post-grad-offload peak allocated HBM is therefore `max(forward_peak, backward_peak - cuda_lora_grad_bytes) = max(29.988, 34.562 - 6.287) ~= 30.0 GiB`.
-- Acceptance target for the real workload: `grad_offload=true` should reach peak allocated HBM `<= 30.5 GiB`. Peak reserved HBM is tracked but is not the hard target because CUDA allocator caching can keep reserved blocks even after live allocated HBM drops.
+- The original expected post-grad-offload peak allocated HBM was `max(forward_peak, backward_peak - cuda_lora_grad_bytes) = max(29.988, 34.562 - 6.287) ~= 30.0 GiB`.
+- The full-run A/B invalidated that estimate for this workload. `grad_offload=true` removes CUDA LoRA grads from end-of-backward live allocation, but the recorded global peak still reaches `34.593 GiB` due to loss/lm-head temporary workspace. The allocator snapshot shows three `9.273 GiB` loss-side blocks live at the peak, so the old `~30.0 GiB` estimate was missing loss temporaries rather than failing to offload grads.
+- Acceptance target for the real workload remains the user-requested `grad_offload=true` peak allocated HBM `<= 30.5 GiB`, but it is currently not met by LoRA grad offload alone. Peak reserved HBM is tracked but is not the hard target because CUDA allocator caching can keep reserved blocks even after live allocated HBM drops.
 
 ## Stage 1: Add the Toggle and A/B Routing With No Behavior Change
 
@@ -193,12 +207,21 @@ job_root_path() {
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
     suffix="__gradoff${grad_offload}"
   fi
-  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__qwenexpert${lf_expert_lora_impl_value}${suffix}")"
+  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__${expact_lora_a_fwd_label}__qwenexpert${lf_expert_lora_impl_value}${suffix}")"
 }
 
 ensure_jobs_tsv() {
   ...
-  printf 'status\tgpu\tseq_len\trecompute\texpert_policy\trouter_mode\tbackend\tprofiler\tgrad_offload\tjob_dir\tprofile_json\tlog\tqwen_expert_lora_impl\n' > "${config_root}/jobs.tsv"
+  printf 'status\tgpu\tseq_len\trecompute\texpert_policy\trouter_mode\tbackend\tprofiler\tgrad_offload\tjob_dir\tprofile_json\tlog\tqwen_expert_lora_impl\texpert_lora_a_fwd\n' > "${config_root}/jobs.tsv"
+}
+
+append_job_record() {
+  local config_root="$1"
+  local status="$2"
+  shift 2
+  ensure_jobs_tsv "${config_root}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${status}" "$@" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" >> "${config_root}/jobs.tsv"
 }
 ```
 
@@ -221,6 +244,8 @@ if expected_grad_offload:
 PY
 }
 ```
+
+Thread `expected_grad_offload` through every `existing_profile_complete` call in `run_job`, including skip, `COLLECT_EXISTING=true`, and KT matching-source helpers. Thread `grad_offload` through every `append_job_record` call in `run_job`, including `skipped`, `dry-run`, `ok`, and `failed:*`.
 
 8. Store the value in source profiles:
 
@@ -356,6 +381,17 @@ def _ensure_grad_offload_flat_buffer(self) -> torch.Tensor:
             mapping.grad_buffer = flat.narrow(0, offset, numel).view_as(mapping.cpu_param.data)
             offset += numel
     return self._grad_flat_buffer
+
+def _ensure_grad_buffer(self, mapping: _ParamMapping) -> torch.Tensor:
+    if self.grad_offload:
+        if mapping.grad_buffer is None:
+            self._ensure_grad_offload_flat_buffer()
+        if mapping.grad_buffer is None:
+            raise RuntimeError(f"missing offload grad buffer for {mapping.name}")
+        return mapping.grad_buffer
+
+    # Existing per-param lazy CPU grad buffer path for grad_offload=false.
+    ...
 ```
 
 4. Register post-accumulate hooks. Mirror DeepSpeed's compatibility helper: use PyTorch's native hook for torch >= 2.1, else the grad-accumulator fallback. The hook must be on the CUDA compute param, not the CPU master.
@@ -468,7 +504,7 @@ def step(self, closure=None):
                     mapping.last_had_grad = False
                     skipped_no_grad += 1
             self._last_grad_copy_ms = 0.0
-            self._last_step_used_offloaded_grads = True
+            self._last_step_used_offloaded_grads = grad_param_count > 0
             self._last_hook_offloaded_param_count = grad_param_count
             self._last_hook_offloaded_numel = sum(
                 int(mapping.offloaded_grad_numel) for mapping in self._mappings if mapping.last_had_grad
@@ -624,9 +660,10 @@ for path in profiles:
     source = data.get("source_profile") if isinstance(data.get("source_profile"), dict) else data
     config = source.get("config", {})
     cpu = source.get("asym_cpu_adamw", {})
+    optimizer_memory = source.get("optimizer_memory", {})
     mode = bool(config.get("asym_cpu_adamw_grad_offload"))
     step_copy_ms = cpu.get("step_grad_copy_ms", cpu.get("grad_copy_ms"))
-    seen[mode] = {"path": str(path), "cpu": cpu}
+    seen[mode] = {"path": str(path), "cpu": cpu, "optimizer_memory": optimizer_memory}
     print(json.dumps({
         "path": str(path),
         "mode": mode,
@@ -650,6 +687,11 @@ if true_cpu.get("last_hook_offloaded_param_count") != true_cpu.get("last_step_gr
 true_step_copy_ms = true_cpu.get("step_grad_copy_ms", true_cpu.get("grad_copy_ms"))
 if true_step_copy_ms not in (0, 0.0):
     raise SystemExit(f"grad_offload=true still reports step-time grad copy: {true_cpu}")
+if int(true_cpu.get("last_hook_offloaded_numel") or 0) <= 0:
+    raise SystemExit(f"grad_offload=true did not report offloaded grad numel: {true_cpu}")
+optimizer_memory = seen[True].get("optimizer_memory", {})
+if isinstance(optimizer_memory, dict) and int(optimizer_memory.get("cuda_grad_bytes") or 0) != 0:
+    raise SystemExit(f"grad_offload=true left model CUDA grads visible at optimizer summary time: {optimizer_memory}")
 PY
 ```
 
@@ -912,7 +954,9 @@ Implementation:
 }
 ```
 
-2. Add a persistent CPU-memory accessor only if memory breakdown cannot infer the flat grad buffer from summary:
+2. Do not rely on `optimizer_memory.cpu_grad_bytes` for offloaded grads. The current `scripts/lf/run_lf_profiled_train.py::_optimizer_memory_summary` only scans `model.parameters()` and their `.grad` fields. A correct grad-offload run clears model CUDA `.grad` and keeps grads inside `AsymCPUAdamW`, so the authoritative fields are `asym_cpu_adamw.grad_offload_buffer_bytes`, `last_hook_offloaded_numel`, and `optimizer_memory.cuda_grad_bytes == 0`.
+
+3. Add a persistent CPU-memory accessor only if memory breakdown cannot infer the flat grad buffer from summary:
 
 ```python
 def asym_cpu_adamw_grad_offload_buffer(self) -> torch.Tensor | None:
@@ -921,7 +965,7 @@ def asym_cpu_adamw_grad_offload_buffer(self) -> torch.Tensor | None:
 
 If `LFMemoryBreakdownProfiler` supports optimizer-specific accessors, label this storage as `optimizer_grad_cpu` or `offloaded_grad_cpu`, not `optimizer_state_cpu`, so CPU master/state/grad are not double-counted.
 
-3. Keep `_asym_cpu_adamw_rows` generic, but add tests to require the new scalar columns in `asym_cpu_adamw.csv`.
+4. Keep `_asym_cpu_adamw_rows` generic, but add tests to require the new scalar columns in `asym_cpu_adamw.csv`.
 
 ```python
 def _asym_cpu_adamw_rows(profile):
@@ -933,6 +977,7 @@ def _asym_cpu_adamw_rows(profile):
 Risks to watch:
 
 - Memory breakdown must not count `mapping.grad_buffer` views multiple times. Count the flat storage once by storage pointer or use the single accessor.
+- A successful grad-offload run may report `optimizer_memory.cpu_grad_bytes=0` because the generic model scanner cannot see optimizer-owned CPU grad buffers. Do not treat that as failure if `asym_cpu_adamw.grad_offload_buffer_bytes` and `last_hook_offloaded_numel` are correct.
 - Step timing fields must distinguish hook-copy time from old step-copy time. Otherwise A/B results will look like the optimizer got faster just because copy time moved into backward.
 
 Validation before Stage 5:
@@ -984,7 +1029,7 @@ Scope:
 - No new source changes unless Stage 5 finds a correctness or performance regression.
 - This stage accepts or rejects the implementation with real LF LoRA profiling, not toy profiling.
 
-Implementation gate:
+Validation before Stage 6:
 
 1. Run the smoke A/B first. This catches command routing, LF parser issues, hook registration, clipping, and postprocess output.
 
@@ -1106,6 +1151,12 @@ if true_row["grad_offload_summary"] is not True:
     raise SystemExit("grad_offload=true run did not report grad_offload_enabled=true")
 if not true_row["hook_params"] or true_row["hook_params"] != true_row["grad_params"]:
     raise SystemExit(f"offloaded hook param count mismatch: {true_row}")
+if not (33.5 <= false_row["peak_allocated_gib"] <= 35.5):
+    raise SystemExit(
+        "grad_offload=false baseline is not the expected Qwen3 b4_s4096 "
+        "exp+attn+layer activation-offload profile near 34.593 GiB: "
+        f"off={false_row['peak_allocated_gib']} GiB"
+    )
 if true_row["peak_allocated_gib"] >= false_row["peak_allocated_gib"]:
     raise SystemExit(f"expected lower peak allocated HBM with grad offload: off={false_row['peak_allocated_gib']}, on={true_row['peak_allocated_gib']}")
 if true_row["peak_allocated_gib"] > 30.5:
@@ -1130,10 +1181,16 @@ Acceptance criteria:
 - `grad_offload=false` preserves current behavior: CUDA grad copy happens in optimizer step and `grad_offload_enabled=false`.
 - `grad_offload=true` reports `grad_offload_enabled=true`, `last_step_used_offloaded_grads=true`, and `last_hook_offloaded_param_count == last_step_grad_param_count` for the real profile.
 - `grad_clip.path == asym_cpu_adamw_grad_offload` when `MAX_GRAD_NORM=1.0`.
+- The `grad_offload=false` baseline for the acceptance workload must be near the known layer-offload profile: `33.5 GiB <= peak allocated HBM <= 35.5 GiB`. If it is outside that range, the command shape or profiler selection changed and the `<= 30.5 GiB` target is not comparable.
 - Peak allocated HBM decreases in the `grad_offload=true` run.
 - For the real `Qwen3-30B-A3B`, `b4_s4096`, `asym_cpuadamwds|norecomp`, `none|true|true|true` acceptance workload, `grad_offload=true` must reach peak allocated HBM `<= 30.5 GiB`. The expected value is about `30.0 GiB`: current best profile is `34.593 GiB`, CUDA LoRA grads are `6.287 GiB`, and the forward-only peak floor is about `29.988 GiB`.
 - Do not require peak reserved HBM to hit `<= 30.5 GiB`; reserved HBM may remain higher due to CUDA allocator caching. Use peak allocated HBM for the hard memory target.
 - Average measured `step_milliseconds` must not regress by more than 15% versus the same-run `grad_offload=false` baseline. If it does, inspect `hook_grad_copy_ms`, backward time, `cpu_adam_step_ms`, and `weight_copyback_ms` before proceeding to Stage 6.
+
+Risks to watch:
+
+- If the false baseline is not near `34.593 GiB`, do not reinterpret the `<= 30.5 GiB` target. First fix the run shape, stale-profile skip logic, or profiler completeness checks.
+- If the true peak lands above `30.5 GiB` but `optimizer_memory.cuda_grad_bytes == 0`, inspect stage peaks. The target may be blocked by a new forward/workspace allocation, not by grad residency.
 
 ## Stage 6: Optional Performance Refinement if A/B Timing Regresses
 
@@ -1190,7 +1247,7 @@ export ENV_PYTHON=${ENV_PYTHON:-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/
 "${ENV_PYTHON}" -m pytest -q tests/training/test_asym_cpu_adamw.py
 
 OUT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/profiling/lora_grad_offload_async_ab_$(date -u +%Y%m%dT%H%M%SZ)
-BACKEND_SPECS="asym_cpuadamwds|recomp" \
+BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 ASYM_CPU_ADAMW_GRAD_OFFLOADS="false,true" \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 PROFILERS=source \
@@ -1206,7 +1263,7 @@ LORA_RANK=64 \
 LORA_ALPHA=16 \
 LORA_DROPOUT=0.00 \
 MAX_GRAD_NORM=1.0 \
-ASYMM_EXP_ACT_POLICIES="none|true|true|false" \
+ASYMM_EXP_ACT_POLICIES="none|true|true|true" \
 PROFILE_MEMORY_BREAKDOWN=true \
 PLOT=false \
 PLOT_MEMORY_BREAKDOWN=false \

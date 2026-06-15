@@ -1,16 +1,90 @@
 # Active Qwen3 Decoder-Layer Activation Offload Plan
 
-Goal: replace the current hook-only `ASYMM_LAYER_ACT_OFFLOAD=true`
-implementation with an explicit active offload/backfetch path for the remaining
-Qwen3 decoder-layer activations not already owned by `attn_math.md` or
-`mlp_math.md`.
+Status: ON HOLD. Do not implement this plan unless new production profiling
+shows decoder-layer RMSNorm staging is a material peak-HBM source, or the goal
+changes from peak-HBM reduction to CPU-transfer / CPU-activation reduction.
 
-Acceptance is profile-based, not toy-shape based. The change is accepted only
-if the real LF LoRA workflow shows lower peak HBM on at least one measured HBM
-metric versus the current traditional saved-tensor hook baseline, does not
-increase any peak HBM metric by more than `0.5 GiB`, and does not regress
-latency beyond the stage gate below. Use `scripts/lf/profile_lora_lf.sh` for
-every acceptance profile.
+Reason for hold:
+
+- The only remaining in-layer targets outside attention and MLP/expert are
+  `input_layernorm` and `post_attention_layernorm`. RMSNorm is vector/reduction
+  math, not a GEMM, so this is not an AsymGEMM kernel optimization.
+- The current `DecoderSavedTensorOffloadWrapper` already does the simple
+  offload-and-stage behavior. The active RMSNorm path can only make that more
+  explicit and save/stage the original RMSNorm input dtype instead of PyTorch's
+  float32 RMSNorm temporary.
+- For the target b4/s4096 Qwen3-30B shape:
+
+  ```text
+  B*T*H = 4*4096*2048 = 33,554,432 elements
+
+  current hook staged tensor:
+    float32 [4,4096,2048] = 33,554,432 * 4 bytes = 0.125 GiB
+
+  active RMSNorm staged tensor:
+    bf16 [4,4096,2048] = 33,554,432 * 2 bytes = 0.0625 GiB
+
+  best local peak-HBM reduction:
+    0.125 GiB - 0.0625 GiB = 0.0625 GiB
+  ```
+
+- Because the current hook stages only one such tensor at a time, the expected
+  global peak-HBM reduction is only `0` to `0.0625 GiB`. Peak reserved HBM is
+  likely `0 GiB` better because allocator reservation may not shrink from a
+  transient 64 MiB reduction.
+- The current profile shows about `356.25 GiB` of decoder-hook norm
+  offload/stage traffic over the measured run, so active bf16 RMSNorm saves
+  could reduce CPU/H2D/D2H traffic. That is useful diagnostics, but it is not
+  the required peak-HBM win.
+- Therefore this is unlikely to beat the current simple offload/stage path on
+  the actual acceptance target: lower real production peak HBM without too much
+  latency regression.
+
+Reference goal if this is resumed later: add an `asym_layer_offload` selector
+so `ASYMM_LAYER_ACT_OFFLOAD=true` can run either the current hook-only layer
+offload path or the active backfetch path for the remaining Qwen3 decoder-layer
+modules not already owned by `attn_math.md` or `mlp_math.md`.
+
+Acceptance is profile-based, not toy-shape based. The canonical production
+profiling script is
+`/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh`;
+all memory and latency numbers that drive design decisions must come from that
+real LF LoRA workflow, not microbenchmarks or toy settings. The change is
+accepted only if the real workflow shows lower peak HBM on at least one
+measured HBM metric versus the current traditional saved-tensor hook baseline,
+does not increase any peak HBM metric by more than `0.5 GiB`, and does not
+regress latency beyond the stage gate below.
+
+The production memory envelope is the combined expert+attention+layer
+activation-offload profile, not a layer-only microbenchmark. Today that is the
+`none|true|true|true` real profile. If that run is around `34 GiB` for the
+chosen peak HBM metric, the active implementation for the remaining layer
+modules must land in the same combined envelope with at most `+0.5 GiB`
+fluctuation. Use the exact `profile.json` fields
+`peak_allocated_hbm_bytes` and `peak_reserved_hbm_bytes` as source of truth if
+the summary label differs.
+
+Control semantics:
+
+```text
+ASYMM_LAYER_ACT_OFFLOAD=false
+  no decoder-layer activation offload
+
+ASYMM_LAYER_ACT_OFFLOAD=true, asym_layer_offload=false
+  current traditional decoder saved-tensor hook offload/backfetch
+  implementation: DecoderSavedTensorOffloadWrapper
+
+ASYMM_LAYER_ACT_OFFLOAD=true, asym_layer_offload=true
+  new active AsymGEMM-style layer backfetching for every remaining
+  decoder-layer module outside attention and experts
+  source-verified active targets: input_layernorm and
+  post_attention_layernorm
+```
+
+Use `--asym-layer-offload true|false` in `scripts/lf/profile_lora_lf.sh`; the
+profile config field is `asym_layer_offload`. Default it to `false` until the
+active path passes Stage 4, so existing `ASYMM_LAYER_ACT_OFFLOAD=true` behavior
+continues to mean the current hook path unless explicitly toggled.
 
 The current `none|true|true|true` tuple is important:
 
@@ -19,10 +93,14 @@ EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LA
 none|true|true|true
 ```
 
-Capture it before replacing the layer path. At that point it is the
-traditional layer saved-tensor offload/staging baseline. After the active layer
-implementation lands, rerun the same tuple and compare active backfetching
-against that baseline artifact.
+Capture it with `asym_layer_offload=false` before adding the active path. At
+that point it is the traditional layer saved-tensor offload/staging baseline.
+After the active layer implementation lands, rerun the same tuple with
+`asym_layer_offload=true` and compare active backfetching against that baseline
+artifact. The target is not "RMSNorm offload works in isolation"; the target is
+"expert+attention+active-layer offload together stays at the current production
+HBM envelope, with no more than `0.5 GiB` upward fluctuation on any peak HBM
+metric."
 
 Resolved facts used by this plan:
 
@@ -31,10 +109,40 @@ Resolved facts used by this plan:
   `asym_gemm/integrations/lf.py::_wrap_qwen3_decoder_saved_tensor_offload_modules`.
 - The current hook profile offloads float32 `[4,4096,2048]` tensors, with most
   decoder layers peaking at `0.5 GiB` CPU-owned saved tensors per layer.
+- The active path does not intentionally reduce model precision. It saves the
+  original RMSNorm input dtype, which is bf16 in the target LoRA workflow, and
+  recomputes the float32 RMSNorm temporaries during backward. The hook's
+  float32 saved tensors are PyTorch RMSNorm intermediates, not higher-precision
+  model activations that must be preserved as stored tensors.
 - Qwen3 RMSNorm casts hidden states to float32, computes the RMS variance over
   the hidden dimension, multiplies by `rsqrt(variance + eps)`, then applies the
   RMSNorm weight. This was checked against the Hugging Face
   [`Qwen3RMSNorm` source](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py).
+- Local source inspection confirms the Qwen3/Qwen3-MoE decoder-layer body is:
+  `input_layernorm`, `self_attn`, residual add, `post_attention_layernorm`,
+  `mlp`, residual add. LlamaFactory does not add another Qwen3-30B-A3B
+  decoder-layer module outside that Hugging Face structure. `q_norm` and
+  `k_norm` live inside attention, while MoE routing/gating lives inside `mlp`.
+- `model.embed_tokens`, the final `model.norm`, and `lm_head` are outside the
+  decoder layer. They are not targets for `asym_layer_offload`; if any of them
+  becomes a material HBM source, handle it as a separate model-boundary or loss
+  path optimization, not as remaining decoder-layer offload.
+- The active RMSNorm path is not an AsymGEMM kernel optimization. It only uses
+  the same explicit ownership, CPU save, just-in-time stage, and immediate
+  release pattern used by the AsymGEMM activation-offload paths. Therefore the
+  expected peak-HBM improvement is bounded by the currently staged norm tensor,
+  not by the sum of all norm tensors across layers.
+- In the current b4/s4096 hook profile, each decoder hook stages at most one
+  float32 `[4,4096,2048]` tensor live on HBM, or `0.125 GiB`. The active path
+  would stage the original bf16 RMSNorm input, or `0.0625 GiB`, so the local
+  peak-stage saving from norms is about `0.0625 GiB` per live staged tensor.
+  If the global peak is dominated by attention, experts, logits, or allocator
+  reservation, measured peak HBM may improve by `0 GiB`.
+- The possible benefit is more likely lower CPU-owned activation bytes and
+  lower D2H/H2D traffic for decoder norms. The existing profile shows about
+  `356.25 GiB` of decoder-hook offload/stage traffic over the measured run;
+  active bf16 RMSNorm input saves would nominally halve that part. Do not count
+  this traffic reduction as peak-HBM reduction.
 - In the LF path, `ASYM_OFFLOAD_MODULES=all` can replace norms with
   `AsymFrozenRMSNorm` before layer activation offload is installed. The active
   wrapper must therefore work for both HF-style `Qwen3RMSNorm` and local
@@ -50,6 +158,7 @@ Scope:
   - `asym_gemm/integrations/lf.py`
   - `scripts/lf/run_lf_profiled_train.py`
   - `scripts/lf/profile_lora_lf.sh`
+  - `scripts/lf/run_lf_lora_sft.sh`
   - `agent/mlp_math.md`
   - `agent/attn_math.md`
 
@@ -67,7 +176,8 @@ Implementation steps:
 2. Capture the current traditional layer saved-tensor baseline:
 
    ```text
-   none|true|true|true
+   ASYMM_EXP_ACT_POLICIES=none|true|true|true
+   asym_layer_offload=false
    ```
 
    Before this plan is implemented, this is the hook-only baseline. Keep this
@@ -87,6 +197,30 @@ Implementation steps:
    assert shape_counts["float32:(4, 4096, 2048)"] > 0
    ```
 
+4. Record the combined activation-offload production memory envelope from the
+   same `none|true|true|true` profile:
+
+   ```python
+   measured = [
+       row for row in profile["step_samples"]["rows"]
+       if not row.get("is_warmup")
+   ]
+   combined_peak_alloc_gib = max(row["peak_allocated_hbm_bytes"] for row in measured) / 1024**3
+   combined_peak_reserved_gib = max(row["peak_reserved_hbm_bytes"] for row in measured) / 1024**3
+   print("combined exp+attn+layer envelope", {
+       "peak_alloc_gib": combined_peak_alloc_gib,
+       "peak_reserved_gib": combined_peak_reserved_gib,
+       "max_allowed_active_peak_alloc_gib": combined_peak_alloc_gib + 0.5,
+       "max_allowed_active_peak_reserved_gib": combined_peak_reserved_gib + 0.5,
+   })
+   ```
+
+   This is the target envelope for the active remaining-layer implementation.
+   If the current profile reports about `34 GiB` for the metric being used in
+   analysis, the active implementation must stay within that number plus
+   `0.5 GiB` when expert, attention, and layer activation offload are enabled
+   together.
+
 Ambiguity and risk checks:
 
 - If `none|true|true|true` already reports an active RMSNorm implementation,
@@ -102,6 +236,7 @@ Validation before Stage 1:
 OUTPUT_ROOT=outputs/lf_layer_active_stage0 \
 OVERWRITE=true \
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm \
+ASYM_LAYER_OFFLOAD=false \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 ASYMM_EXP_ACT_POLICIES="none|true|true|false,none|true|true|true" \
@@ -124,9 +259,13 @@ PLOT_MEMORY_BREAKDOWN=false \
 bash scripts/lf/profile_lora_lf.sh --gpus 0
 ```
 
-Stage 0 passes only if both profiles finish, both use the real
-`Qwen/Qwen3-30B-A3B` LF LoRA workflow, and the `none|true|true|true` artifact
-contains decoder saved-tensor hook rows.
+Stage 0 passes only if both profiles finish through
+`/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh`,
+both use the real `Qwen/Qwen3-30B-A3B` LF LoRA workflow, the
+`none|true|true|true` artifact contains decoder saved-tensor hook rows, and
+the combined expert+attention+layer HBM envelope is recorded from measured
+steps. This recorded envelope, not a toy-profile number, is the memory target
+for the active remaining-layer implementation.
 
 ## Stage 1: Implement The Active RMSNorm Offload Primitive
 
@@ -142,7 +281,8 @@ Scope:
   - add `is_rmsnorm_activation_offload_wrapper`
   - add `rmsnorm_activation_offload_module_names`
   - keep `DecoderSavedTensorOffloadWrapper` available only for debug/fallback
-    comparison, not as the final `ASYMM_LAYER_ACT_OFFLOAD=true` path
+    comparison and for `asym_layer_offload=false`, not for the active selector
+    path
 - Modify `asym_gemm/training/__init__.py`:
   - export the new active RMSNorm wrapper/install/query helpers
 - Modify `tests/training/test_decoder_activation_offload.py`:
@@ -185,6 +325,7 @@ class RMSNormActivationOffloadWrapper:
         self.backward_stages = 0
         self.dtype_counts: dict[str, int] = {}
         self.shape_counts: dict[str, int] = {}
+        self.cast_output_to_input_dtype = type(module).__name__ == "AsymFrozenRMSNorm"
         self._sync_module_stats()
 
     def install(self) -> None:
@@ -244,9 +385,11 @@ class _RMSNormActivationOffloadFunction(torch.autograd.Function):
         input_dtype = x.dtype
         x_f = x.to(torch.float32)
         inv = torch.rsqrt(x_f.pow(2).mean(dim=-1, keepdim=True) + float(eps))
-        y = (x_f * inv).to(dtype=input_dtype) * weight
-        if y.dtype != input_dtype:
-            y = y.to(dtype=input_dtype)
+        normalized = x_f * inv
+        if wrapper.cast_output_to_input_dtype:
+            y = (normalized * weight.to(dtype=torch.float32)).to(dtype=input_dtype)
+        else:
+            y = weight * normalized.to(dtype=input_dtype)
 
         ctx.wrapper = wrapper
         ctx.x_cpu = x_cpu
@@ -303,8 +446,14 @@ Ambiguity and risk checks:
 - The wrapper must not rely on the norm weight being a CUDA `nn.Parameter`.
   The real LF profile can use `AsymFrozenRMSNorm`, whose weight is CPU-resident.
 - The active wrapper recomputes float32 RMSNorm intermediates from the original
-  bf16 input. This should match Qwen3 training behavior, but it must be tested
-  against autograd output, input grad, and weight grad.
+  input tensor dtype. In the target Qwen3 LoRA workflow that input is bf16, so
+  this is recompute from the actual forward input, not a precision downgrade
+  from an fp32 activation. It must still be tested against autograd output,
+  input grad, and weight grad.
+- The active wrapper must preserve the installed module's output dtype
+  semantics: HF-style Qwen3 RMSNorm multiplies by its weight after casting the
+  normalized activation back to input dtype, while local `AsymFrozenRMSNorm`
+  returns the final result in the input dtype.
 - Gated or shifted RMSNorm variants are not part of this Qwen3 layer plan.
   Raise clearly instead of silently using the wrong formula.
 
@@ -324,6 +473,7 @@ changed the production path before integration:
 OUTPUT_ROOT=outputs/lf_layer_active_stage1_noop \
 OVERWRITE=true \
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm \
+ASYM_LAYER_OFFLOAD=false \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 ASYMM_EXP_ACT_POLICIES="none|true|true|false" \
@@ -350,33 +500,58 @@ Stage 1 passes if unit tests pass, the no-op profile completes, and profile
 JSON contains no `rmsnorm_active_activation_offload` rows when
 `ASYMM_LAYER_ACT_OFFLOAD=false`.
 
-## Stage 2: Install Active Wrappers On Qwen3 Decoder RMSNorms
+## Stage 2: Add `asym_layer_offload` Selector And Install Active Wrappers
 
 Scope:
 
 - Modify `asym_gemm/integrations/lf.py`:
   - imports from `asym_gemm.training.decoder_activation_offload`
-  - replace `_wrap_qwen3_decoder_saved_tensor_offload_modules` with
-    `_wrap_qwen3_decoder_rmsnorm_activation_offload_modules`
+  - keep `_wrap_qwen3_decoder_saved_tensor_offload_modules` for
+    `asym_layer_offload=false`
+  - add `_wrap_qwen3_decoder_rmsnorm_activation_offload_modules` for
+    `asym_layer_offload=true`
+  - add `_asym_layer_offload_enabled`
   - update `apply_lf_asym_lora` near the existing `layer_act_enabled` block
   - update `LFAsymReport.layer_act_offload_modules` semantics to record RMSNorm
-    module names, not decoder parent names
+    module names in active mode and decoder parent names in hook mode
   - update `asym_lora_config_from_model`
+- Modify `scripts/lf/profile_lora_lf.sh`:
+  - add `ASYM_LAYER_OFFLOAD=${ASYM_LAYER_OFFLOAD:-false}`
+  - add `--asym-layer-offload true|false`
+  - forward `ASYM_LAYER_OFFLOAD` and
+    `ASYM_GEMM_LF_CONFIG_ASYM_LAYER_OFFLOAD` into jobs
+  - include the selector in run labels, `jobs.tsv`, and
+    `existing_profile_complete`
+- Modify `scripts/lf/run_lf_lora_sft.sh`:
+  - accept and forward `ASYM_LAYER_OFFLOAD`
+- Modify `scripts/lf/run_lf_profiled_train.py`:
+  - record `config["asym_layer_offload"]`
 - Modify `tests/training/test_lf_qwen3_asym_backend.py`:
-  - replace the current layer hook test
+  - keep a hook-mode test for `asym_layer_offload=false`
+  - add an active-mode test for `asym_layer_offload=true`
   - assert exact active RMSNorm module inventory
   - assert no decoder parent hook is installed
+- Modify `tests/lf/test_asym_cpu_adamw_args.py`:
+  - verify the dry-run command forwards and labels both selector values
 
 Intended code changes:
 
 ```python
 from asym_gemm.training.decoder_activation_offload import (
     decoder_saved_tensor_offload_module_names,
+    install_decoder_saved_tensor_offload,
     install_rmsnorm_activation_offload,
     is_decoder_saved_tensor_offload_wrapper,
     is_rmsnorm_activation_offload_wrapper,
     rmsnorm_activation_offload_module_names,
 )
+```
+
+```python
+def _asym_layer_offload_enabled() -> bool:
+    return _env_true(os.environ.get("ASYM_LAYER_OFFLOAD")) or _env_true(
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYM_LAYER_OFFLOAD")
+    )
 ```
 
 ```python
@@ -418,17 +593,28 @@ def _wrap_qwen3_decoder_rmsnorm_activation_offload_modules(
 ```python
 layer_act_modules: tuple[str, ...] = ()
 layer_act_skipped: tuple[str, ...] = ()
+layer_act_impl = "none"
+asym_layer_enabled = _asym_layer_offload_enabled()
 if layer_act_enabled:
-    layer_act_modules, layer_act_skipped = _wrap_qwen3_decoder_rmsnorm_activation_offload_modules(
-        model,
-        strict=strict,
-    )
+    if asym_layer_enabled:
+        layer_act_impl = "rmsnorm_active"
+        layer_act_modules, layer_act_skipped = _wrap_qwen3_decoder_rmsnorm_activation_offload_modules(
+            model,
+            strict=strict,
+        )
+    else:
+        layer_act_impl = "decoder_saved_tensor_hook"
+        layer_act_modules, layer_act_skipped = _wrap_qwen3_decoder_saved_tensor_offload_modules(
+            model,
+            strict=strict,
+        )
 
 report.layer_act_offload_wrapped = len(layer_act_modules)
 report.layer_act_offload_modules = tuple(layer_act_modules)
 report.layer_act_offload_skipped = tuple(layer_act_skipped)
 setattr(model, "_asym_layer_act_offload_enabled", bool(layer_act_enabled))
-setattr(model, "_asym_layer_act_offload_impl", "rmsnorm_active" if layer_act_enabled else "none")
+setattr(model, "_asym_layer_offload_enabled", bool(asym_layer_enabled))
+setattr(model, "_asym_layer_act_offload_impl", layer_act_impl)
 setattr(model, "_asym_layer_act_offload_modules", tuple(layer_act_modules))
 setattr(model, "_asym_layer_act_offload_skipped", tuple(layer_act_skipped))
 ```
@@ -439,6 +625,7 @@ def asym_lora_config_from_model(...):
     layer_act_modules = tuple(getattr(model, "_asym_layer_act_offload_modules", ()))
     if bool(getattr(model, "_asym_layer_act_offload_enabled", False)) or layer_act_modules:
         config["asym_layer_act_offload_enabled"] = bool(...)
+        config["asym_layer_offload"] = bool(getattr(model, "_asym_layer_offload_enabled", False))
         config["asym_layer_act_offload_impl"] = getattr(model, "_asym_layer_act_offload_impl", "unknown")
         config["asym_layer_act_offload_modules"] = list(layer_act_modules)
         config["asym_layer_act_offload_skipped"] = list(...)
@@ -453,8 +640,25 @@ def asym_lora_config_from_model(...):
 Test pseudocode:
 
 ```python
-def test_layer_act_wraps_only_qwen3_decoder_rmsnorms(monkeypatch):
+def test_layer_act_hook_mode_keeps_decoder_saved_tensor_wrapper(monkeypatch):
     monkeypatch.setenv("ASYMM_LAYER_ACT_OFFLOAD", "true")
+    monkeypatch.setenv("ASYM_LAYER_OFFLOAD", "false")
+    model = FakeQwen3DecoderModel(num_layers=2)
+    model, report = apply_lf_asym_lora(..., backend="asym", offload_modules="all")
+
+    assert report.layer_act_offload_enabled is True
+    assert report.layer_act_offload_wrapped == 2
+    assert report.layer_act_offload_modules == ("layers.0", "layers.1")
+    assert is_decoder_saved_tensor_offload_wrapper(model.layers[0])
+    assert not is_rmsnorm_activation_offload_wrapper(model.layers[0].input_layernorm)
+    assert getattr(model, "_asym_layer_offload_enabled") is False
+    assert getattr(model, "_asym_layer_act_offload_impl") == "decoder_saved_tensor_hook"
+```
+
+```python
+def test_asym_layer_offload_wraps_only_qwen3_decoder_rmsnorms(monkeypatch):
+    monkeypatch.setenv("ASYMM_LAYER_ACT_OFFLOAD", "true")
+    monkeypatch.setenv("ASYM_LAYER_OFFLOAD", "true")
     model = FakeQwen3DecoderModel(num_layers=2)
     model, report = apply_lf_asym_lora(..., backend="asym", offload_modules="all")
 
@@ -471,6 +675,7 @@ def test_layer_act_wraps_only_qwen3_decoder_rmsnorms(monkeypatch):
     assert not is_decoder_saved_tensor_offload_wrapper(model.layers[0])
     assert not is_rmsnorm_activation_offload_wrapper(model.layers[0].self_attn)
     assert not is_rmsnorm_activation_offload_wrapper(model.layers[0].mlp)
+    assert getattr(model, "_asym_layer_offload_enabled") is True
     assert getattr(model, "_asym_layer_act_offload_impl") == "rmsnorm_active"
 ```
 
@@ -482,13 +687,20 @@ Ambiguity and risk checks:
   large saved tensor target in the Stage 0 evidence.
 - Do not wrap `self_attn` or `mlp`. Their activation ownership remains in
   `attn_math.md` and `mlp_math.md`.
+- `asym_layer_offload=true` means the active path owns all remaining
+  decoder-layer activation targets outside attention and experts. The current
+  real profile identifies RMSNorm boundary tensors as that remaining set. If a
+  later production profile exposes another non-attention, non-expert saved
+  tensor target, add it to the active selector before accepting Stage 4.
 
 Validation before Stage 3:
 
 ```bash
 .venv/bin/python -m pytest -q \
-  tests/training/test_lf_qwen3_asym_backend.py::test_layer_act_wraps_only_qwen3_decoder_rmsnorms \
-  tests/training/test_lf_qwen3_asym_backend.py::test_qwen3_decoder_layer_activation_offload_requires_policy_none
+  tests/training/test_lf_qwen3_asym_backend.py::test_layer_act_hook_mode_keeps_decoder_saved_tensor_wrapper \
+  tests/training/test_lf_qwen3_asym_backend.py::test_asym_layer_offload_wraps_only_qwen3_decoder_rmsnorms \
+  tests/training/test_lf_qwen3_asym_backend.py::test_qwen3_decoder_layer_activation_offload_requires_policy_none \
+  tests/lf/test_asym_cpu_adamw_args.py::test_profile_lora_lf_dry_run_labels_asym_layer_offload_modes
 ```
 
 Run the first active candidate on the real workflow:
@@ -497,6 +709,7 @@ Run the first active candidate on the real workflow:
 OUTPUT_ROOT=outputs/lf_layer_active_stage2 \
 OVERWRITE=true \
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm \
+ASYM_LAYER_OFFLOAD=true \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 ASYMM_EXP_ACT_POLICIES="none|true|true|true" \
@@ -521,6 +734,7 @@ bash scripts/lf/profile_lora_lf.sh --gpus 0
 
 Stage 2 passes only if:
 
+- profile JSON has `config.asym_layer_offload == true`;
 - profile JSON has `config.asym_layer_act_offload_impl == "rmsnorm_active"`;
 - active rows exist for every decoder `input_layernorm` and
   `post_attention_layernorm`;
@@ -540,14 +754,20 @@ Scope:
   - add active RMSNorm row counts to the `activation_offload` summary
 - Modify `scripts/lf/profile_lora_lf.sh`:
   - update `existing_profile_complete`
-  - reject stale `layer_act=true` profiles that lack
-    `config.asym_layer_act_offload_impl == "rmsnorm_active"`
+  - compare expected `asym_layer_offload` against
+    `config.asym_layer_offload`
+  - reject stale active profiles when `asym_layer_offload=true` and
+    `config.asym_layer_act_offload_impl != "rmsnorm_active"`
+  - reject stale hook profiles when `asym_layer_offload=false` and
+    `config.asym_layer_act_offload_impl != "decoder_saved_tensor_hook"`
 - Modify `tests/lf/test_lf_profile_postprocess.py`:
   - verify active RMSNorm summary counts are emitted
 - Modify `tests/lf/test_superoffload_backend_scripts.py` or
   `tests/lf/test_asym_cpu_adamw_args.py`:
-  - verify stale hook-era `layer_act=true` profile JSON is not treated as
-    complete
+  - verify stale hook-era `layer_act=true` profile JSON is not treated as a
+    complete active profile
+  - verify hook-era `layer_act=true` profile JSON is still valid for
+    `asym_layer_offload=false`
 
 Intended code changes:
 
@@ -577,22 +797,36 @@ def _activation_offload_counters_from_model() -> dict[str, Any]:
 
 ```python
 # scripts/lf/profile_lora_lf.sh::existing_profile_complete
+# shell signature adds:
+#   expected_asym_layer_offload="${13:-}"
+# and every caller passes "${ASYM_LAYER_OFFLOAD}" after the existing
+# expert/attention/layer activation-offload expectations.
 actual_layeract = normalize_bool(config.get("asymm_layer_act_offload"))
 wanted_layeract = normalize_bool(expected_layeract)
 if wanted_layeract == "true":
+    actual_asym_layer = normalize_bool(config.get("asym_layer_offload"))
+    wanted_asym_layer = normalize_bool(expected_asym_layer_offload)
+    if actual_asym_layer != wanted_asym_layer:
+        raise SystemExit(
+            "profile asym_layer_offload mismatch: "
+            f"expected {wanted_asym_layer}, got {actual_asym_layer or '<missing>'}"
+        )
     impl = str(config.get("asym_layer_act_offload_impl", ""))
-    if impl != "rmsnorm_active":
-        raise SystemExit("profile layer activation offload impl missing or stale")
+    if wanted_asym_layer == "true" and impl != "rmsnorm_active":
+        raise SystemExit("profile active layer offload impl missing or stale")
+    if wanted_asym_layer == "false" and impl != "decoder_saved_tensor_hook":
+        raise SystemExit("profile hook layer offload impl missing or stale")
 ```
 
 Ambiguity and risk checks:
 
 - Existing artifacts produced before this implementation have the same public
-  tuple `none|true|true|true`. The stale-profile guard is required so future
-  sweeps do not accidentally reuse hook-era profiles as active-layer profiles.
-- If a deliberate hook baseline is needed after Stage 3, use the Stage 0
-  baseline artifact or a temporary debug branch. Do not make the hook path the
-  default meaning of `ASYMM_LAYER_ACT_OFFLOAD=true`.
+  tuple `none|true|true|true`. The `asym_layer_offload` selector is required
+  so future sweeps do not accidentally reuse hook-era profiles as active-layer
+  profiles.
+- Hook baselines remain valid and rerunnable after Stage 3 by setting
+  `asym_layer_offload=false`; active candidates require
+  `asym_layer_offload=true`.
 
 Validation before Stage 4:
 
@@ -600,17 +834,21 @@ Validation before Stage 4:
 bash -n scripts/lf/profile_lora_lf.sh
 .venv/bin/python -m pytest -q \
   tests/lf/test_lf_profile_postprocess.py \
-  tests/lf/test_superoffload_backend_scripts.py::test_existing_profile_complete_rejects_stale_layer_hook_profile \
+  tests/lf/test_superoffload_backend_scripts.py::test_existing_profile_complete_rejects_hook_profile_for_asym_layer_offload_true \
+  tests/lf/test_superoffload_backend_scripts.py::test_existing_profile_complete_accepts_hook_profile_for_asym_layer_offload_false \
   tests/lf/test_asym_cpu_adamw_args.py::test_profile_lora_lf_four_part_layer_axis_dry_run
 ```
 
-Run the real workflow again with overwrite disabled to exercise the stale
-profile path in normal script routing:
+Run the real workflow in both selector modes. This is the production A/B for
+the new argument:
+
+1. Hook baseline under the new selector:
 
 ```bash
-OUTPUT_ROOT=outputs/lf_layer_active_stage3 \
+OUTPUT_ROOT=outputs/lf_layer_active_stage3_hook \
 OVERWRITE=true \
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm \
+ASYM_LAYER_OFFLOAD=false \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 ASYMM_EXP_ACT_POLICIES="none|true|true|true" \
@@ -631,10 +869,44 @@ RUN_POST=false \
 PLOT=false \
 PLOT_MEMORY_BREAKDOWN=false \
 bash scripts/lf/profile_lora_lf.sh --gpus 0
+```
 
-OUTPUT_ROOT=outputs/lf_layer_active_stage3 \
+2. Active candidate:
+
+```bash
+OUTPUT_ROOT=outputs/lf_layer_active_stage3_active \
+OVERWRITE=true \
+ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm \
+ASYM_LAYER_OFFLOAD=true \
+MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
+BACKEND_SPECS="asym_cpuadamwds|norecomp" \
+ASYMM_EXP_ACT_POLICIES="none|true|true|true" \
+SEQ_LENS=4096 \
+PER_DEVICE_TRAIN_BATCH_SIZE=4 \
+DATASET=asym_long_sft_smoke \
+PREPARE_DATASETS=true \
+DATASET_MIN_TOKENS=4096 \
+DATASET_OVERWRITE=true \
+LORA_DROPOUT=0.00 \
+PROFILERS=source \
+PROFILE_MEMORY_ATTRIBUTION=false \
+PROFILE_MEMORY_BREAKDOWN=false \
+PROFILE_MEMORY_SNAPSHOT=false \
+WARMUP_STEPS=5 \
+MAX_STEPS=10 \
+RUN_POST=false \
+PLOT=false \
+PLOT_MEMORY_BREAKDOWN=false \
+bash scripts/lf/profile_lora_lf.sh --gpus 0
+```
+
+3. Active candidate reuse check:
+
+```bash
+OUTPUT_ROOT=outputs/lf_layer_active_stage3_active \
 OVERWRITE=false \
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm \
+ASYM_LAYER_OFFLOAD=true \
 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
 BACKEND_SPECS="asym_cpuadamwds|norecomp" \
 ASYMM_EXP_ACT_POLICIES="none|true|true|true" \
@@ -655,9 +927,12 @@ PLOT_MEMORY_BREAKDOWN=false \
 bash scripts/lf/profile_lora_lf.sh --gpus 0
 ```
 
-Stage 3 passes if the first command produces active RMSNorm summary counts and
-the second command reuses only a complete active profile, not a hook-era stale
-profile.
+Stage 3 passes if the hook run records
+`config.asym_layer_offload == false` and
+`config.asym_layer_act_offload_impl == "decoder_saved_tensor_hook"`, the active
+run records `config.asym_layer_offload == true` and
+`config.asym_layer_act_offload_impl == "rmsnorm_active"`, and the reuse check
+reuses only a complete active profile, not a hook-era stale profile.
 
 ## Stage 4: Compare And Accept Or Reject
 
@@ -672,17 +947,23 @@ Scope:
 
 Implementation steps:
 
-1. Compare Stage 0 hook baseline `none|true|true|true` against Stage 3 active
-   candidate `none|true|true|true`.
+1. Compare the Stage 3 hook baseline `none|true|true|true` with
+   `asym_layer_offload=false` against the Stage 3 active candidate
+   `none|true|true|true` with `asym_layer_offload=true`.
 2. Also compare Stage 0 no-layer baseline `none|true|true|false` so the final
    result is clear:
    - no layer offload;
-   - traditional hook layer offload;
-   - active RMSNorm layer offload.
+   - traditional hook layer offload with `asym_layer_offload=false`;
+   - active RMSNorm layer offload with `asym_layer_offload=true`.
 3. Use measured steps only. Ignore warmup rows.
 4. Compare both peak allocated HBM and peak reserved HBM.
 5. Compare both `forward_backward_milliseconds` and
    `trainer_e2e_step_milliseconds`.
+6. Treat the Stage 3 hook-mode `none|true|true|true,
+   asym_layer_offload=false` measured HBM values as the production combined
+   activation-offload envelope. The Stage 3 active candidate must stay within
+   `+0.5 GiB` of that envelope on both peak allocated and peak reserved HBM.
+   This is the real acceptance target for the remaining modules together.
 
 Concrete comparison script:
 
@@ -693,12 +974,22 @@ import json
 import statistics
 from pathlib import Path
 
-def load_one(root: str, *, layeract: str, impl: str | None = None):
+def norm_bool(value):
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return "true"
+    if text in {"0", "false", "no", "n", "off"}:
+        return "false"
+    return ""
+
+def load_one(root: str, *, layeract: str, asym_layer: str | None = None, impl: str | None = None):
     matches = []
     for path in glob.glob(f"{root}/**/profile.json", recursive=True):
         data = json.loads(Path(path).read_text())
         cfg = data.get("config", {})
-        if str(cfg.get("asymm_layer_act_offload")).lower() != layeract:
+        if norm_bool(cfg.get("asymm_layer_act_offload")) != layeract:
+            continue
+        if asym_layer is not None and norm_bool(cfg.get("asym_layer_offload")) != asym_layer:
             continue
         if impl is not None and cfg.get("asym_layer_act_offload_impl") != impl:
             continue
@@ -721,8 +1012,18 @@ def metrics(data):
         "e2e_s": statistics.mean(row["trainer_e2e_step_milliseconds"] for row in rows) / 1000.0,
     }
 
-hook_path, hook = load_one("outputs/lf_layer_active_stage0", layeract="true")
-active_path, active = load_one("outputs/lf_layer_active_stage3", layeract="true", impl="rmsnorm_active")
+hook_path, hook = load_one(
+    "outputs/lf_layer_active_stage3_hook",
+    layeract="true",
+    asym_layer="false",
+    impl="decoder_saved_tensor_hook",
+)
+active_path, active = load_one(
+    "outputs/lf_layer_active_stage3_active",
+    layeract="true",
+    asym_layer="true",
+    impl="rmsnorm_active",
+)
 no_layer_path, no_layer = load_one("outputs/lf_layer_active_stage0", layeract="false")
 
 for label, path, data in [
@@ -746,6 +1047,14 @@ print("delta_vs_hook", {
     "e2e_regression_pct": e2e_regression * 100.0,
     "fwd_bwd_regression_pct": fwd_bwd_regression * 100.0,
 })
+print("production_envelope", {
+    "baseline_combined_peak_alloc_gib": hm["peak_alloc_gib"],
+    "baseline_combined_peak_reserved_gib": hm["peak_reserved_gib"],
+    "max_active_peak_alloc_gib": hm["peak_alloc_gib"] + 0.5,
+    "max_active_peak_reserved_gib": hm["peak_reserved_gib"] + 0.5,
+    "active_peak_alloc_gib": am["peak_alloc_gib"],
+    "active_peak_reserved_gib": am["peak_reserved_gib"],
+})
 
 if not memory_improved:
     raise SystemExit("REJECT: active layer offload did not reduce peak HBM by at least 0.1 GiB")
@@ -763,19 +1072,27 @@ PY
 
 Acceptance criteria:
 
+- The final acceptance profile is the real
+  `/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh`
+  production LF LoRA run, not a toy setting.
+- The active candidate is evaluated as the combined
+  expert+attention+layer-activation-offload profile. If the Stage 3 hook-mode combined
+  baseline is around `34 GiB` for the HBM metric used in analysis, the active
+  candidate must stay in the same envelope with at most `+0.5 GiB`
+  fluctuation on that metric.
 - Active candidate peak allocated HBM or peak reserved HBM is at least
-  `0.1 GiB` lower than the Stage 0 hook baseline. Prefer both to decrease.
+  `0.1 GiB` lower than the Stage 3 hook baseline. Prefer both to decrease.
 - Neither peak allocated HBM nor peak reserved HBM is more than `0.5 GiB`
-  higher than the Stage 0 hook baseline.
+  higher than the Stage 3 hook baseline.
 - Active candidate trainer E2E measured step time is no more than `5%` slower
-  than the Stage 0 hook baseline.
+  than the Stage 3 hook baseline.
 - Active candidate forward+backward time is no more than `5%` slower than the
-  Stage 0 hook baseline.
+  Stage 3 hook baseline.
 - `activation_offload.decoder_saved_tensor_hook_row_count == 0`.
 - `activation_offload.active_rmsnorm_activation_offload_row_count == 96` for a
   48-layer Qwen3 model.
-- Active row shape/dtype evidence shows original activation dtype
-  `[4,4096,2048]`, not hook-saved `float32 [4,4096,2048]`.
+- Active row shape/dtype evidence shows the original RMSNorm input dtype
+  `[4,4096,2048]`, not hook-saved float32 RMSNorm temporaries.
 - Trainable parameters remain LoRA-only.
 - No reference fallback is present.
 
@@ -784,6 +1101,9 @@ Risks to watch after Stage 4:
 - If active RMSNorm lowers CPU saved bytes but not HBM, the hook baseline may
   already be eliminating the relevant HBM save. In that case this path is only
   accepted if reserved HBM or allocated HBM still drops in the real profile.
+- If active RMSNorm only reduces CPU traffic or host activation bytes and does
+  not reduce peak allocated/reserved HBM, treat that as a useful diagnostic but
+  reject it as a peak-HBM optimization unless the acceptance target is changed.
 - If latency regresses by more than `5%`, the likely issue is RMSNorm backward
   staging or unfused vector/reduction math. The next step would be a fused CUDA
   RMSNorm backward kernel, not an AsymGEMM matrix kernel.
@@ -793,7 +1113,9 @@ Risks to watch after Stage 4:
 
 ## Decoder-Layer Math Target
 
-These are the only remaining layer targets for this plan:
+These are the only remaining layer targets for this plan. They are derived
+from the explicit Hugging Face Qwen3/Qwen3-MoE decoder-layer forward and the
+active LlamaFactory Qwen3-30B-A3B path, not inferred from profiling:
 
 | Module / boundary | Active target? | Reason |
 |---|---:|---|
@@ -803,6 +1125,9 @@ These are the only remaining layer targets for this plan:
 | residual add after MLP | no | backward is gradient routing/addition; no large saved tensor required |
 | `self_attn` internals | no | owned by `attn_math.md` / `ASYMM_ATTN_ACT_OFFLOAD` |
 | `mlp` / routed experts | no | owned by `mlp_math.md` / `ASYMM_EXPERT_ACT_OFFLOAD` |
+| `model.embed_tokens` | no | outside decoder layers; frozen embedding boundary in the target LoRA workflow |
+| final model norm outside decoder layers | no | not inside the decoder layer; handle separately if it ever becomes material |
+| `lm_head` / loss logits | no | outside decoder layers; handle as a separate head/loss optimization if material |
 
 Notation:
 

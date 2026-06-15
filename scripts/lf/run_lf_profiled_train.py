@@ -634,6 +634,12 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "kt_lora_health_max_tensors": os.environ.get(KT_LORA_HEALTH_MAX_TENSORS_ENV, "12"),
         "kt_lora_health_max_elements": os.environ.get(KT_LORA_HEALTH_MAX_ELEMENTS_ENV, "4096"),
         "kt_grad_clip_chunk_elements": os.environ.get("ASYM_GEMM_LF_KT_GRAD_CLIP_CHUNK_ELEMENTS", ""),
+        "asym_cpu_adamw_grad_offload": (
+            os.environ.get("ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD")
+            or _option_value(args, "--asym_cpu_adamw_grad_offload")
+            or "false"
+        ).lower()
+        in {"1", "true", "yes", "on"},
         "nsys_capture_range": _env_enabled("ASYM_GEMM_LF_NSYS_CAPTURE_RANGE"),
         "superoffload_config": os.environ.get("ASYM_GEMM_LF_CONFIG_SUPEROFFLOAD_CONFIG")
         if is_superoffload_backend
@@ -1037,14 +1043,29 @@ def _asym_cpu_adamw_summary_from_trace(trace_handle: Any | None) -> dict[str, An
     if trace_handle is None:
         return {"enabled": False}
     optimizer = getattr(trace_handle, "optimizer", None) or getattr(trace_handle, "prepared_optimizer", None)
-    summary_fn = getattr(optimizer, "asym_cpu_adamw_summary", None)
-    if callable(summary_fn):
-        try:
-            summary = summary_fn()
-        except Exception as exc:
-            return {"enabled": True, "summary_error": str(exc)}
-        if isinstance(summary, dict):
-            return {"enabled": True, **summary}
+    seen: set[int] = set()
+    for _ in range(8):
+        if optimizer is None:
+            break
+        optimizer_id = id(optimizer)
+        if optimizer_id in seen:
+            break
+        seen.add(optimizer_id)
+        summary_fn = getattr(optimizer, "asym_cpu_adamw_summary", None)
+        if callable(summary_fn):
+            try:
+                summary = summary_fn()
+            except Exception as exc:
+                return {"enabled": True, "summary_error": str(exc)}
+            if isinstance(summary, dict):
+                return {"enabled": True, **summary}
+        next_optimizer = None
+        for attr in ("optimizer", "base_optimizer", "wrapped_optimizer", "inner_optimizer"):
+            candidate = getattr(optimizer, attr, None)
+            if candidate is not None and candidate is not optimizer:
+                next_optimizer = candidate
+                break
+        optimizer = next_optimizer
     config = getattr(trace_handle, "config", {}) or {}
     if isinstance(config, dict):
         enabled_value = config.get("use_asym_cpu_adamw", "")
@@ -1175,7 +1196,9 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
 
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             record = dict(start_record)
-            summary = getattr(self, "_kt_grad_clip_last_summary", None)
+            summary = getattr(self, "_asym_cpu_adamw_grad_clip_last_summary", None)
+            if not isinstance(summary, dict):
+                summary = getattr(self, "_kt_grad_clip_last_summary", None)
             if isinstance(summary, dict):
                 record.update(summary)
             else:

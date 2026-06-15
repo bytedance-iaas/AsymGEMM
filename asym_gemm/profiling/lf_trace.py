@@ -1120,6 +1120,14 @@ class LFMemoryBreakdownProfiler:
                             cpu_master_storage_keys.add(add(component, "cpu_master_weight", cpu_param))
                 except Exception:
                     pass
+            grad_offload_buffer = getattr(optimizer, "asym_cpu_adamw_grad_offload_buffer", None)
+            if callable(grad_offload_buffer):
+                try:
+                    grad_buffer = grad_offload_buffer()
+                except Exception:
+                    grad_buffer = None
+                if isinstance(grad_buffer, torch.Tensor):
+                    add("optimizer", "offloaded_grad", grad_buffer)
             try:
                 state_items = list(optimizer.state.items())
             except Exception:
