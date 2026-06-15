@@ -30,6 +30,14 @@ typedef struct {
  *         also used as partial-sum accumulation buffer between K-tiles
  * scale_a/b: per-tensor float32 scales applied to FP32 accumulator at the
  *            final K-tile only (intermediate writes store unscaled BF16).
+ *
+ * Block-scale mode (scale_a_blk_ptr != nullptr): 1x128 activation scales and
+ * 128x128 weight scales. Each K-tile's contribution is scaled by its own
+ * (token, k-group) x (expert, n-group, k-group) factor before accumulating;
+ * intermediate BF16 partials hold the SCALED running sum, and the next K-tile
+ * rescales the seed by the reciprocal of its own combined scale.
+ * Requires BLOCK_K <= 128 with 128 % BLOCK_K == 0 (tile never straddles a
+ * k-group) — enforced by select_sm80_fp8_config(block_scale=true).
  */
 typedef struct {
     void*    x_ptr;
@@ -43,8 +51,12 @@ typedef struct {
     int64_t  K;
     float    scale_a;
     float    scale_b;
-    const float* scale_a_ptr;   // [total_tokens] per-token scales, or nullptr
-    const float* scale_b_ptr;   // [num_experts] per-expert scales, or nullptr
+    const float* scale_a_ptr;     // [total_tokens] per-token scales, or nullptr
+    const float* scale_b_ptr;     // [num_experts] per-expert scales, or nullptr
+    const float* scale_a_blk_ptr; // [total_tokens, ceil(K/128)] 1x128 scales, or nullptr
+    const float* scale_b_blk_ptr; // [num_experts, ceil(N/128), ceil(K/128)], or nullptr
+    int32_t  sa_kg;               // ceil(K/128): k-group count (row stride of scale_a_blk)
+    int32_t  sb_ng;               // ceil(N/128): n-group count
 } SM89MoEFP8Params;
 
 /*
@@ -68,8 +80,12 @@ typedef struct {
     int64_t  K;
     float    scale_a;
     float    scale_b;
-    const float* scale_a_ptr;   // [num_groups * M_max] per-token scales, or nullptr
-    const float* scale_b_ptr;   // [num_groups] per-expert scales, or nullptr
+    const float* scale_a_ptr;     // [num_groups * M_max] per-token scales, or nullptr
+    const float* scale_b_ptr;     // [num_groups] per-expert scales, or nullptr
+    const float* scale_a_blk_ptr; // [num_groups * M_max, ceil(K/128)] 1x128 scales, or nullptr
+    const float* scale_b_blk_ptr; // [num_groups, ceil(N/128), ceil(K/128)], or nullptr
+    int32_t  sa_kg;               // ceil(K/128)
+    int32_t  sb_ng;               // ceil(N/128)
 } SM89MoEFP8MaskedParams;
 
 #ifdef __cplusplus

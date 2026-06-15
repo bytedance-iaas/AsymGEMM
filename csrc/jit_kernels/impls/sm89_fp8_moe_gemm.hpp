@@ -30,14 +30,16 @@ public:
     static std::string generate_impl(const Args& args) {
         const auto& c = args.gemm_config;
         return fmt::format(R"(
+// sm89 moe fp8 v3: block-scale with multi-group K-tiles
 #include <asym_gemm/impls/sm80_moe_gemm.cuh>
 using namespace asym_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(
-        &sm89_moe_fp8_gemm_impl<{}, {}, {}, {}>);
+        &sm89_moe_fp8_gemm_impl<{}, {}, {}, {}, {}>);
 }};
 )",
-            c.block_m, c.block_n, c.block_k, c.nwarps);
+            c.block_m, c.block_n, c.block_k, c.nwarps,
+            args.params.scale_a_blk_ptr != nullptr);
     }
 
     static void launch_impl(const KernelHandle& kernel,
@@ -56,12 +58,16 @@ static void sm89_m_grouped_fp8_moe_gemm_contiguous(
     int32_t num_experts, int32_t list_size,
     float scale_a, float scale_b,
     const std::optional<torch::Tensor>& scale_a_tensor = std::nullopt,
-    const std::optional<torch::Tensor>& scale_b_tensor = std::nullopt)
+    const std::optional<torch::Tensor>& scale_b_tensor = std::nullopt,
+    const std::optional<torch::Tensor>& scale_a_block = std::nullopt,
+    const std::optional<torch::Tensor>& scale_b_block = std::nullopt)
 {
     const auto& [arch_major, arch_minor] = device_runtime->get_arch_pair();
+    const bool block_scale = scale_a_block.has_value();
     const auto cfg = sm80::select_sm80_fp8_config(arch_major, arch_minor,
                                                    static_cast<int>(N),
-                                                   static_cast<int>(K));
+                                                   static_cast<int>(K),
+                                                   block_scale);
 
     const SM89MoEFP8Params params {
         .x_ptr       = a.data_ptr(),
@@ -79,9 +85,16 @@ static void sm89_m_grouped_fp8_moe_gemm_contiguous(
             ? scale_a_tensor->data_ptr<float>() : nullptr,
         .scale_b_ptr = scale_b_tensor.has_value()
             ? scale_b_tensor->data_ptr<float>() : nullptr,
+        .scale_a_blk_ptr = block_scale
+            ? scale_a_block->data_ptr<float>() : nullptr,
+        .scale_b_blk_ptr = scale_b_block.has_value()
+            ? scale_b_block->data_ptr<float>() : nullptr,
+        .sa_kg       = static_cast<int32_t>((K + 127) / 128),
+        .sb_ng       = static_cast<int32_t>((N + 127) / 128),
     };
 
-    const int smem_bytes = sm80::smem_bytes_fp8(cfg.block_m, cfg.block_n, cfg.block_k);
+    const int smem_bytes = sm80::smem_bytes_fp8(cfg.block_m, cfg.block_n, cfg.block_k,
+                                                block_scale);
 
     const SM89MoEFP8GemmRuntime::Args runtime_args {
         .gemm_config = cfg,
@@ -91,8 +104,8 @@ static void sm89_m_grouped_fp8_moe_gemm_contiguous(
         .params      = params,
     };
 
-    const std::string kernel_name = fmt::format("sm89_moe_fp8_gemm_bm{}_bn{}_bk{}",
-        cfg.block_m, cfg.block_n, cfg.block_k);
+    const std::string kernel_name = fmt::format("sm89_moe_fp8_gemm_bm{}_bn{}_bk{}_blk{}",
+        cfg.block_m, cfg.block_n, cfg.block_k, block_scale ? 1 : 0);
 
     const auto& code    = SM89MoEFP8GemmRuntime::generate(runtime_args);
     const auto& runtime = compiler->build(kernel_name, code);
@@ -113,14 +126,16 @@ public:
     static std::string generate_impl(const Args& args) {
         const auto& c = args.gemm_config;
         return fmt::format(R"(
+// sm89 moe fp8 v3: block-scale with multi-group K-tiles
 #include <asym_gemm/impls/sm80_moe_gemm.cuh>
 using namespace asym_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(
-        &sm89_moe_fp8_gemm_masked_impl<{}, {}, {}, {}>);
+        &sm89_moe_fp8_gemm_masked_impl<{}, {}, {}, {}, {}>);
 }};
 )",
-            c.block_m, c.block_n, c.block_k, c.nwarps);
+            c.block_m, c.block_n, c.block_k, c.nwarps,
+            args.params.scale_a_blk_ptr != nullptr);
     }
 
     static void launch_impl(const KernelHandle& kernel,
@@ -138,12 +153,16 @@ static void sm89_m_grouped_fp8_moe_gemm_masked(
     int32_t num_groups,
     float scale_a, float scale_b,
     const std::optional<torch::Tensor>& scale_a_tensor = std::nullopt,
-    const std::optional<torch::Tensor>& scale_b_tensor = std::nullopt)
+    const std::optional<torch::Tensor>& scale_b_tensor = std::nullopt,
+    const std::optional<torch::Tensor>& scale_a_block = std::nullopt,
+    const std::optional<torch::Tensor>& scale_b_block = std::nullopt)
 {
     const auto& [arch_major, arch_minor] = device_runtime->get_arch_pair();
+    const bool block_scale = scale_a_block.has_value();
     const auto cfg = sm80::select_sm80_fp8_config(arch_major, arch_minor,
                                                    static_cast<int>(N),
-                                                   static_cast<int>(K));
+                                                   static_cast<int>(K),
+                                                   block_scale);
 
     const SM89MoEFP8MaskedParams params {
         .x_ptr       = a.data_ptr(),
@@ -160,9 +179,16 @@ static void sm89_m_grouped_fp8_moe_gemm_masked(
             ? scale_a_tensor->data_ptr<float>() : nullptr,
         .scale_b_ptr = scale_b_tensor.has_value()
             ? scale_b_tensor->data_ptr<float>() : nullptr,
+        .scale_a_blk_ptr = block_scale
+            ? scale_a_block->data_ptr<float>() : nullptr,
+        .scale_b_blk_ptr = scale_b_block.has_value()
+            ? scale_b_block->data_ptr<float>() : nullptr,
+        .sa_kg       = static_cast<int32_t>((K + 127) / 128),
+        .sb_ng       = static_cast<int32_t>((N + 127) / 128),
     };
 
-    const int smem_bytes = sm80::smem_bytes_fp8(cfg.block_m, cfg.block_n, cfg.block_k);
+    const int smem_bytes = sm80::smem_bytes_fp8(cfg.block_m, cfg.block_n, cfg.block_k,
+                                                block_scale);
 
     const SM89MoEFP8MaskedGemmRuntime::Args runtime_args {
         .gemm_config = cfg,
@@ -172,8 +198,8 @@ static void sm89_m_grouped_fp8_moe_gemm_masked(
         .params      = params,
     };
 
-    const std::string kernel_name = fmt::format("sm89_moe_fp8_gemm_masked_bm{}_bn{}_bk{}",
-        cfg.block_m, cfg.block_n, cfg.block_k);
+    const std::string kernel_name = fmt::format("sm89_moe_fp8_gemm_masked_bm{}_bn{}_bk{}_blk{}",
+        cfg.block_m, cfg.block_n, cfg.block_k, block_scale ? 1 : 0);
 
     const auto& code    = SM89MoEFP8MaskedGemmRuntime::generate(runtime_args);
     const auto& runtime = compiler->build(kernel_name, code);
