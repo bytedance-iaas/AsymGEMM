@@ -1,122 +1,130 @@
-# Fix CPU memory: reclaim ~90 GiB of wasted host RAM (lossless)
+# Fix CPU-RAM OOM during the FIRST forward (Qwen3-30B-A3B LoRA-SFT)
 
-## Why
-The qwen3-30b-a3b LoRA-SFT smoke OOM-kills in the first forward. Real CPU ceiling is **~958 GiB** (2 Grace NUMA nodes 0+1, `numactl --membind=0,1`; the "1.65 TiB" `free` reports includes GPU HBM). The workload needs ~0.8 TB, so it dies. Two host-RAM wastes are **lossless** to remove (no numerics change, no recompute, no GEMM change):
-- **A. ~60 GiB** — every frozen base weight is held twice (original HF tensor + pinned `HostWeight` copy); the original is never freed.
-- **B. ~32 GiB** — the expert activation-offload warm pinned pool (`_CPU_BUFFER_POOL`) is capped at 32 GiB and only trims on insert.
+## Corrected diagnosis (measured)
+- **OOM is CPU host RAM, in the FIRST forward** — heartbeat dies at `model_forward_enter`, `global_step 0`, **before any backward**. No-recompute ⇒ all 48 layers' activations are offloaded to **pinned CPU** and held live at the forward peak.
+- **Numbers:** s8192 **completes** at ~**815 GB** peak; s10240 **OOMs** at ~**970 GB**. ~**9.4 MB/token** live. GPU nearly **idle (104 MiB used, 188 GB free)**.
+- **Effective ceiling < 958 GiB:** under `--membind=0,1` + first-touch, pinned buffers **skew onto one Grace node**, so practical ceiling ≈ 820 GB (matches s8192-fits / s10240-OOMs).
 
-Target: drop preflight resident from **~213 GiB → ~150 GiB** and forward peak by up to **32 GiB**, with **no** forward/backward latency regression.
-
-## How to validate (mostly just a CPU-RAM check — NOT the heavy e2e timing profile)
-These reclaims do not touch the compute path, so we do **not** need the full e2e timing profiling that kernel/compute changes require. Split by what each stage changes:
-- **Stage 1 = load-time memory only** → verify **CPU RSS** at model-load. Forward/backward kernels are byte-identical, so latency is unchanged *by construction* — no timing run, no completed training.
-- **Stage 2 = per-step alloc pattern** → also needs a short forward/backward timing check (it changes how often `cudaHostAlloc` fires).
-
-Keep a change only if it **meaningfully** cuts memory (not trivially) **without** blowing up latency where latency can actually move.
-
-### Measuring CPU RSS (Stage 1, the main signal)
-Baseline already exists: the OOM run recorded `rss_peak_bytes = 213,376,696,320` (~213 GiB) in its `process_memory.csv` and `model_loaded` heartbeat. Post-change number — either:
-- **Re-use the existing launch** (it may still OOM later in forward; preflight RSS is captured *before* that): run it, read `process_memory.csv:rss_bytes` and the `model_loaded` line in `lf_run/heartbeat.jsonl`. Expect **~150 GiB**.
-- **Or a standalone load-and-measure** (no training): build the AsymGEMM-wrapped model exactly as the loader does (CPU-first, `ASYM_OFFLOAD_MODULES=all`), `gc.collect()`, then read `VmRSS`/`VmHWM` from `/proc/self/status`. Expect ~150 GiB.
-
-Always on an **idle** node — `numactl -H` (node 0/1 free) first; co-tenants corrupt the comparison.
+## Done / ruled out
+- **DONE — free duplicated base weights** (`AsymQwen3Experts.__init__` empties `source.gate_up_proj/down_proj`; `gc.collect()` in `apply_lf_asym_lora`). Validated bit-exact + `pytest tests/training/test_lf_qwen3_asym_backend.py` = 108 passed. **Real effect only ~13 GB** (duplicate is mostly mmap-reclaimable) → keep (lossless) but it is **not** the OOM fix.
+- **RULED OUT — pool cap** (`ASYM_EXPACT_CPU_POOL_MAX_BYTES`, default 32 GiB): the pool fills only on **backward release**, so it is **empty in the first forward** → 0 saving at the OOM point.
 
 ---
 
-## Stage 1 — Free the duplicated frozen base weights (~60 GiB)
+## Shared validation harness (used by every lever below)
+**Baselines that already exist:** s10240 OOM run (`…/b8_s10240/`, heartbeat `model_forward_enter`, rss_peak ~200 GB); s8192 completed run (`…/b8_s8192/`, `source_profile_written`, rss_peak ~815 GB, has timing).
 
-### Scope (exact)
-- `asym_gemm/training/qwen3_moe.py` → `class AsymQwen3Experts.__init__` (lines ~1919–1989) — **primary** (the ~58 GiB of packed experts).
-- `asym_gemm/integrations/lf.py` → `apply_lf_asym_lora` (def ~993; expert install loop ~1155–1167) — add one `gc.collect()` after the loop.
-- `asym_gemm/integrations/lf.py` → `_wrap_lf_linear_leaf` (~563) — **optional 1b** (~3 GiB non-expert Linears; trivial alone, keep only because it's the same mechanism at ~zero cost).
-
-### Root cause (verified in code)
-`AsymQwen3Experts.__init__`: `gate_up = source.gate_up_proj.detach()` (aliases source storage) → `AsymGroupedFrozenLinear(gate_up.to(bf16), clone=False, pin_memory=True)`. With `clone=False`, `HostWeight` allocates a **new** buffer only via `pin_memory()` (`host_weight.py:222`, which always copies — [PyTorch #21076]). The result is an independent pinned copy, but **`source.gate_up_proj` / `source.down_proj` are never released**, and `apply_lf_asym_lora` keeps the old module in `expert_replacements` and never calls `gc`. → two CPU copies of all 30B frozen weights.
-
-### Code change — 1a (primary), in `AsymQwen3Experts.__init__`, immediately AFTER the pinned-assert (~line 1981)
-Emptying the source `Parameter` drops its reference to the big storage; the local `gate_up`/`down` (still used at `_resolve_device(gate_up)` ~line 1987) free at function return → per-layer transient only, never whole-model 2×.
-
-```python
-# existing (1963–1981): self.gate_up_base / self.down_base built with clone=False + pinned; assert pinned
-# NEW — release the duplicated source base weights (the pinned HostWeight copies are independent):
-gate_up_pinned = self.gate_up_base.host_weight.weight.is_pinned()
-down_pinned    = self.down_base.host_weight.weight.is_pinned()
-if self.offload and backend == "asym" and gate_up_pinned and down_pinned:   # SAFETY GATE
-    for _attr in ("gate_up_proj", "down_proj"):
-        _src = getattr(source, _attr, None)
-        if isinstance(_src, torch.nn.Parameter):
-            _src.data = torch.empty(0, dtype=_src.dtype, device=_src.device)  # free storage, keep a valid Parameter
-        elif _src is not None:
-            try:
-                setattr(source, _attr, None)
-            except Exception:
-                pass
-# Do NOT free in the torch/non-offload branch (TorchGroupedFrozenLinear may alias the source).
-```
-
-### Code change — 1a insurance, end of `apply_lf_asym_lora` (before `return model, report`, ~1405)
-```python
-import gc
-gc.collect()   # drop the orphaned old modules retained in expert_replacements / any reference cycles
-```
-
-### Code change — 1b (optional, ~3 GiB), in `_wrap_lf_linear_leaf` after `adopt_host_weight(...)` builds the pinned `host_weight`
-```python
-if getattr(host_weight, "is_pinned", False) and isinstance(module.weight, torch.nn.Parameter):
-    module.weight.data = torch.empty(0, dtype=module.weight.dtype, device=module.weight.device)
-```
-
-### Efficiency / latency / kernel reasoning
-Load-time weight lifecycle only. No change to the grouped GEMM, expert dispatch, dtype, or any per-step op → forward/backward kernels and launch pattern are **identical by construction**. No per-expert loops, no GEMM splitting. Forward/backward Δ = 0 % → **no timing run needed**.
-
-### Ambiguities resolved
-- `pin_memory()` always copies, so the source is safe to free once pinned — [PyTorch #21076], [#32167].
-- `AsymQwen3Experts.__init__` does **not** store `source` on `self` (read 1919–1989) → after construction the source is reachable only via the old module; emptying its two packed params releases the storage.
-- Non-strict / pin-failed path leaves `HostWeight` aliasing the source → the `is_pinned()` gate prevents an unsafe free.
-
-### Risks / watch items
-- **Source read after free** (a base-`state_dict` save / correctness probe). LoRA-SFT saves only adapter params, so it shouldn't happen — watch any path reading `*.experts.gate_up_proj`.
-- **Other families** (`AsymQwen35Experts`, Llama4, packed `wrap_qwen3_experts`) have their own classes — Stage 1a fixes Qwen3 only (our workload). Replicate before using those models.
-- **The 213→150 drop IS the hypothesis test.** If RSS falls < 40 GiB, the duplicate wasn't the cause → REJECT and re-examine the 213 GiB composition (CUDA ctx / dataloader / DeepSpeed).
-
-### Validation (CPU-side only)
-1. **Correctness (isolated, allowed):** build one `AsymQwen3Experts` from a small fake source, forward a fixed input, run the source-free, forward again → `assert torch.equal(out_before, out_after)`.
-2. **Memory (the acceptance signal):** get post-change RSS via "Measuring CPU RSS" above. **ACCEPT** if RSS at `model_loaded` drops ≥ 40 GiB (~213 → ~150 GiB); **REJECT** if < 10 GiB.
-3. **No timing run** (compute path unchanged). Optional belt-and-suspenders: step-0 loss matches a pre-change run (bit-for-bit; lossless).
-
-**✅ Result (executed — `agent/impls/_val_stage1.py`, real 128-expert/H2048/I768 dims, venv torch 2.12+cu130):**
-`pinned=True,True` · `faithful copy=True,True` (forward weights bit-exact) · `source numel=0,0` (freed) · 8 layers: RSS grew **10.97 GiB vs one-copy 9.00 GiB (1.22×, not 2×=18 GiB)**. The duplicate is gone on the real expert dims; ×48 layers ⇒ ~58 GiB reclaimed.
-Regression: `pytest tests/training/test_lf_qwen3_asym_backend.py` → **108 passed** (incl. SM100 forward+backward+checkpoint+anomaly vs reference) — no break, "source-read-after-free" risk did not trigger. **PASS.**
-Still to confirm via one e2e (node idle: GPU0 free, ~794 GiB on Grace nodes 0/1): full-model preflight RSS (~213 → ~150 GiB) and the Stage 2 latency sweep.
-
----
-
-## Stage 2 — Cap the warm pinned activation pool (~32 GiB, forward-time)
-
-### Scope (exact)
-- `asym_gemm/training/activation_offload.py` → `_DEFAULT_CPU_POOL_MAX_BYTES` (line 13), `_cpu_pool_max_bytes()` (reads env `ASYM_EXPACT_CPU_POOL_MAX_BYTES`), `clear_activation_offload_cpu_pool()` (line 67). **No code change** — drive via env.
-- Only the **expert** offload path uses this pool (decoder/attention saved-tensor paths alloc per-tensor, unaffected).
-
-### Change
+**Run one config** (single backend, single seq), on an **idle node** (`numactl -H` → check node 0/1 free first; `nvidia-smi` → pick an idle `GPU_POOL`):
 ```bash
-ASYM_EXPACT_CPU_POOL_MAX_BYTES=8589934592   # 8 GiB (sweep 32→8→0, find the knee)
+cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
+BACKEND_SPECS="asym_cpuadamwds|norecomp" SEQ_LENS=10240 GPU_POOL=0 \
+PER_DEVICE_TRAIN_BATCH_SIZE=8 MODEL_SPECS="Qwen/Qwen3-30B-A3B|1" \
+bash scripts/lf/profile_lora_lf.sh        # swap SEQ_LENS=8192 for the latency control
+```
+**Read the three metrics from the run dir:**
+```bash
+RUN=$(find profiling -name process_memory.csv -newermt '-20 min' -printf '%h\n' | sort | tail -1)
+# (1) completion: source_profile_written = OK ; model_forward_enter = OOM
+python3 -c "import json;print(json.load(open('$RUN/lf_run/heartbeat.latest.json'))['stage'])"
+# (2) peak CPU RSS, GiB (max over rows, col5=rss_peak_bytes)
+awk -F, 'NR>1&&$5+0>m{m=$5} END{printf "CPU rss_peak = %.1f GiB\n", m/1073741824}' "$RUN/process_memory.csv"
+# (3) fwd/bwd host-ms (latency) + peak HBM
+grep -E 'step\.forward|step\.backward' "$RUN/summary.md"; grep -i 'reserved' "$RUN/memory.md"
 ```
 
-### Efficiency / latency / kernel reasoning
-The pool amortizes `cudaHostAlloc` (slow). Shrinking it trades a smaller live pinned cache for more alloc churn **on the expert offload path only** — the one place latency can move, so this stage *does* need a timing check. No GEMM/compute change.
-
-### Risks / watch items
-- **Latency knee:** too small → repeated `cudaHostAlloc` in forward → fwd-ms regression. If even `0` shows no regression, the pool was pure waste → set it low permanently.
-
-### Validation (needs a short forward/backward run — the only stage that does)
-Short real-model run (not the heavy profile): `scripts/lf/profile_lora_lf.sh` with `MAX_STEPS=5 PROFILE_WARMUP_STEPS=2 CUTOFF_LEN=6144 PER_DEVICE_TRAIN_BATCH_SIZE=8 MODEL_NAME_OR_PATH=Qwen/Qwen3-30B-A3B` and the same offload flags as the OOM run, for `ASYM_EXPACT_CPU_POOL_MAX_BYTES ∈ {32 GiB(base), 8 GiB, 0}`, on an idle node. Record `rss_peak_bytes`, `activation_offload_cpu_pool_stats()['cpu_pool_cached_bytes']`, and `summary.md` `step.forward`/`step.backward` ms.
-**ACCEPT** the smallest cap with fwd/bwd regression ≤ 3 % and `rss_peak` drop ≥ 20 GiB; else REJECT (keep 32 GiB).
+**GLOBAL ACCEPT / REJECT (applies to every lever):**
+- **ACCEPT only if BOTH:** (a) **memory win is meaningful** — s10240 goes **OOM→`source_profile_written`**, *or* CPU `rss_peak` drops **≥ 40 GiB**; **and** (b) **latency not blown up** — at the **s8192 control** (completes either way) `step.forward + step.backward` regress **≤ 5 %** vs the existing s8192 baseline.
+- **REJECT if:** memory drop **< 10 GiB** (trivial), OR it still OOMs and rss_peak barely moves, OR (fwd+bwd) regression **> 10 %**.
+- 5–10 % latency or 10–40 GiB memory = inconclusive → re-measure / tune before deciding.
 
 ---
 
-## Stage 3 — In-place pinning (deferred, optional)
-Avoid the second copy entirely: instead of `pin_memory()` (always copies), pin the existing storage in place with `torch.cuda.cudart().cudaHostRegister(ptr, nbytes, 0)` (no stable `pin_memory_()` yet — [PyTorch #32167]). Removes the duplicate **and** the transient 2× during load.
-- **Risk (don't ship before Stage 1 lands):** source pages must stay alive, aligned, and unmigrated for all of training; on the 64 KB-page Grace kernel under `numactl --membind` this is fragile. Follow-up only if the (already small, ~1 layer) load-time peak ever matters.
+## Lever 1 — NUMA interleave  (free; try first)
+### Implementation
+Edit `scripts/lf/run_lf_lora_sft.sh`:
+- `:30-33` add a mode flag: `NUMACTL_MODE=${NUMACTL_MODE:-interleave}` (values `interleave|membind`).
+- `:1925-1929` build the args by mode:
+```bash
+if [[ "${NUMACTL_MODE}" == "interleave" ]]; then
+  NUMACTL_CMD=( "${NUMACTL_BIN}" "--interleave=${NUMACTL_MEMBIND}" "--cpunodebind=${NUMACTL_CPUNODEBIND}" )
+else
+  NUMACTL_CMD=( "${NUMACTL_BIN}" "--membind=${NUMACTL_MEMBIND}" "--cpunodebind=${NUMACTL_CPUNODEBIND}" )
+fi
+```
+Mirror the same in `scripts/lf/profile_lora_lf.sh` (the `numactl --membind=0,1 …` near `:297`). Do **not** pass `--membind` and `--interleave` together.
 
-## Sources
-`pin_memory()` always copies; in-place via `cudaHostRegister`: [PyTorch #21076](https://github.com/pytorch/pytorch/issues/21076), [PyTorch #32167](https://github.com/pytorch/pytorch/issues/32167), [CUDA semantics](https://docs.pytorch.org/docs/2.11/notes/cuda.html).
+### Validate
+```bash
+# memory/completion at s10240, interleave ON:
+NUMACTL_MODE=interleave BACKEND_SPECS="asym_cpuadamwds|norecomp" SEQ_LENS=10240 GPU_POOL=0 bash scripts/lf/profile_lora_lf.sh
+# then run the 3-metric block. Also confirm pages split ~50/50 during forward:
+PID=$(pgrep -f 'src/train.py' | head -1); awk '/N0=|N1=/{n0+=gensub(/.*N0=([0-9]+).*/,"\\1",1);n1+=gensub(/.*N1=([0-9]+).*/,"\\1",1)} END{print "N0pages",n0,"N1pages",n1}' /proc/$PID/numa_maps
+# latency control at s8192 (compare to existing s8192 baseline timing):
+NUMACTL_MODE=interleave SEQ_LENS=8192 BACKEND_SPECS="asym_cpuadamwds|norecomp" GPU_POOL=0 bash scripts/lf/profile_lora_lf.sh
+```
+### Accept iff
+s10240 → `source_profile_written` (was OOM) **and** N0≈N1 (balanced) **and** s8192 (fwd+bwd) ≤ 5 % over baseline. **Reject if** s10240 still `model_forward_enter`, or N0/N1 still ~100/0 (interleave not taking effect), or s8192 latency > 10 %.
+
+---
+
+## Lever 2 — Stop storing derivable activations  (lossless; the principled win)
+### Implementation (`asym_gemm/training/qwen3_moe.py` `_ActivationOffloadQwen3ExpertFunction`; `moe.py`; `exp_act_offload_lora.py`)
+**2A (do first, easy): drop `act`.** `act = silu(gate)·up` of already-stored `gate`,`up`.
+1. In forward, keep the GPU `act` only through the `down_base` path; **remove** the `manager.offload(..., "act")` (`qwen3_moe.py:~1003`) so it does not persist to CPU. Do **not** put `act` on `ctx`.
+2. In backward, before the down LoRA-A grad (`:~1170`), recompute `act = F.silu(gate)*up` on GPU from the staged `gate`,`up`; switch that call from the CPU-source kernel (`grouped_lora_a_grad_cpu_right`) to its **HBM-source** analog (operand now GPU).
+
+**2B (bigger): unpack `X` (it is stored packed 8× = R×2048, R=8N).**
+1. Stop offloading the packed input; instead offload the **pre-gather hidden `N×2048`** + carry `token_indices` (`ContiguousRouteMetadata`, `moe.py:207`). Add `token_indices` to `ctx.save_for_backward` (alongside `offsets`,`experts` at `:1086/1088`); thread `hidden` into the Function (currently only `packed` passed at `:2403`).
+2. In backward, re-gather once on GPU: `X_gpu = hidden.index_select(0, token_indices)`; feed the gate/up LoRA-A grad via the **HBM-source** path (`grouped_lora_a_forward_hbm` analog) instead of `grouped_lora_a_pair_grad_cpu_right` (`exp_act_offload_lora.py:218`).
+
+No per-expert loop; all backward GEMMs stay grouped. Forward gets cheaper (copy N×2048, not 8N×2048).
+
+### Validate (correctness gate FIRST, then the harness)
+```bash
+# correctness: existing suite must stay green (exercises this Function fwd+bwd vs reference)
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m pytest tests/training/test_lf_qwen3_asym_backend.py -q
+# numerics e2e: step-0/1 loss must match a pre-change run (bf16 tolerance). Run s8192 with & without:
+SEQ_LENS=8192 BACKEND_SPECS="asym_cpuadamwds|norecomp" GPU_POOL=0 bash scripts/lf/profile_lora_lf.sh
+grep -i 'loss' "$RUN/train.log" | head -3      # compare to the s8192 baseline's first losses
+# memory + completion + latency: run s10240, then s8192, then the 3-metric block on each.
+```
+### Accept iff
+**Correctness:** 108/108 tests pass **and** step-0/1 loss within **2e-3** of baseline (else REJECT outright — it's not lossless). **Memory:** s10240 → `source_profile_written` or CPU rss_peak ≥ 40 GiB lower. **Latency:** s8192 (fwd+bwd) ≤ 5 % (it should be ~neutral; the index_select/silu are cheap). **Reject if** loss diverges, memory drop < 10 GiB, or latency > 10 %. (Do 2A and 2B as separate accept/reject decisions — 2A alone may be < 40 GiB = keep only if it stacks toward fitting; 2B is the headroom.)
+
+---
+
+## Lever 3 — HBM-budget watermark  (backstop; uses the idle 188 GB)
+### Implementation
+New shared helpers (mirror `_decoder_saved_tensor_min_bytes`, `decoder_activation_offload.py:37`): a process-global `_GLOBAL_CPU_OWNED_BYTES` + `_activation_cpu_budget_bytes()` from env `ASYM_ACT_CPU_BUDGET_BYTES`. Then:
+- `decoder_activation_offload.py` `_should_offload` (`:159-179`): after the `min_bytes` check add `if _global_cpu_owned() + nbytes > budget: return False` (tensor stays on HBM — `_pack` returns it unchanged). Increment the global in `_pack` after the CPU copy (`:201`); decrement in `_unpack` on release (`:243`).
+- Repeat in `attention_activation_offload.py` (`:243-263` / `:285` / `:325`).
+- Leave the expert CPU-kernel path (`X`/`gate`/`act`) on CPU (kernel-coupled).
+
+### Validate
+```bash
+# sweep the budget; lower budget = more on HBM = less on CPU. Run s10240 each:
+for B in 999999999999 700 500; do
+  ASYM_ACT_CPU_BUDGET_BYTES=$((B*1024*1024*1024)) BACKEND_SPECS="asym_cpuadamwds|norecomp" SEQ_LENS=10240 GPU_POOL=0 bash scripts/lf/profile_lora_lf.sh
+  echo "budget=${B}GiB:"; <run the 3-metric block: completion, CPU rss_peak, peak HBM>
+done
+# latency control at s8192 with the chosen budget vs baseline.
+```
+### Accept iff
+s10240 → `source_profile_written` **and** CPU rss_peak drops by ≈ budget reduction (≥ 40 GiB) **and** **peak reserved HBM < 180 GiB** (no GPU OOM) **and** s8192 (fwd+bwd) ≤ 5 % (should be *faster* — skips H2D/D2H). **Reject if** GPU OOMs (HBM peak ≥ 188 GB), CPU drop < 10 GiB, or latency > 10 %. Pick the **largest** budget (most CPU) that still makes s10240 complete (keeps HBM minimal for the paper).
+
+---
+
+## Lever 4 — Temporal bounded-live window  (future; heavy — implement only if 1–3 insufficient)
+### Implementation (sketch)
+Add an eviction engine on a dedicated `torch.cuda.Stream`: `register_forward_hook` on each decoder layer (same modules as `lf.py:922-926`) hands its CPU handles to the evictor, which keeps W most-recent layers in CPU/HBM and migrates older layers' storage (swap `CPUActivationHandle.tensor` / `_SavedTensorOffloadHandle.tensor`); `register_full_backward_pre_hook` prefetches them back just-in-time. Tier = **HBM** (NVMe is ~10–20× too slow for the forward rate). Requires un-freezing `CPUActivationHandle` and building the copy-stream/double-buffer infra that does not exist today.
+### Validate / Accept
+Same harness; additionally vary `W` and require: s10240 completes, CPU rss_peak ≈ `W×~9 GiB`, and (fwd+bwd) ≤ 5 % (overlap must hide the eviction copies — if it stalls, **reject**). Defer unless 1–3 cannot reach the target sequence length.
+
+---
+
+## Recommended order
+1. **Lever 1** (interleave) — free; run s10240, likely fits.
+2. **Lever 2** (drop `act`, unpack `X`) — lossless, biggest principled reduction.
+3. **Lever 3** (HBM budget) — backstop using idle HBM.
+4. **Lever 4** — only for a much larger envelope.
+Each is independently gated by the ACCEPT/REJECT rules above: **keep only a meaningful (not trivial) memory win that does not blow up latency.**
