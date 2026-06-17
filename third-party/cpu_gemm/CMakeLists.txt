@@ -61,6 +61,7 @@ if(CPU_GEMM_WITH_AMX)
   add_library(cpu_gemm_amx OBJECT
     src/kernels/amx/bf16_gemm.cpp
     src/kernels/amx/int8_gemm.cpp
+    src/kernels/amx/int8_gemm_rm.cpp
   )
   target_compile_options(cpu_gemm_amx PRIVATE
     -mamx-tile -mamx-bf16 -mamx-int8
