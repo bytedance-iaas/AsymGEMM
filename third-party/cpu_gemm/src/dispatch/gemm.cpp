@@ -26,6 +26,7 @@
 #if defined(CPU_GEMM_HAS_AMX)
 #include "kernels/amx/bf16_gemm.h"
 #include "kernels/amx/int8_gemm.h"
+#include "kernels/amx/int8_gemm_rm.h"
 #endif
 
 namespace {
@@ -101,6 +102,25 @@ bool amx_int8_eligible(const cg_gemm_desc_t* d) {
   return true;
 }
 
+/* True when the stride-aware AMX INT8 path can handle this descriptor —
+ * i.e. B is row-major int8 + per-channel scales, K is K_STEP-aligned, A is
+ * tightly packed BF16, and B's logical N is N_STEP-aligned (so the
+ * strided _tile_loadd never reads past the caller's allocation).
+ *
+ * The unified-MoE runtime always pads N to 128 (GPU constraint), which is
+ * a multiple of N_STEP=32, so this predicate covers it. Unaligned-N
+ * callers still hit the older packed-on-touch path below. */
+bool amx_int8_rm_eligible(const cg_gemm_desc_t* d) {
+  using T = cpu_gemm::kernels::amx::Int8KernelTraits;
+  if (!cpu_gemm::kernels::amx::amx_available()) return false;
+  if (!is_bf16_int8_f32_nt(d)) return false;
+  if (d->k % T::K_STEP != 0) return false;
+  if (d->n % T::N_STEP != 0) return false;
+  if (d->lda != d->k)          return false;   /* A still tight row-major BF16 */
+  if (d->ldb <  d->k)          return false;   /* B row-major, stride >= k */
+  return true;
+}
+
 /* True when the AMX INT8 path can consume a pre-packed B on this host. */
 bool amx_int8_prepacked_eligible(const cg_gemm_desc_t* d) {
   using T = cpu_gemm::kernels::amx::Int8KernelTraits;
@@ -169,6 +189,58 @@ cg_status_t run_amx_int8_prepacked(cg_runtime_t* rt, const cg_gemm_desc_t* d) {
   return CG_OK;
 }
 
+/* Stride-aware row-major B path. No per-call B pack — B is read straight
+ * from caller memory by AMX src1 (strided _tile_loadd). A is packed once
+ * into AMX src2's VNNI shape; C lands as C^T and the unpack transposes
+ * during scale apply. See Stride.md §3 for the full derivation. */
+cg_status_t run_amx_int8_rm(cg_runtime_t* rt, const cg_gemm_desc_t* d) {
+  namespace amx = cpu_gemm::kernels::amx;
+  int m = (int)d->m, n = (int)d->n, k = (int)d->k;
+
+  auto s = amx::int8_rm_scratch(m, n, k);
+  void* base = rt->scratch->reserve(s.total());
+  auto* p = reinterpret_cast<unsigned char*>(base);
+  void* sA = p;            p += s.bytes_a;
+  void* sC = p;
+
+  int max_m_pad = amx::int8_pad_up(m, amx::Int8KernelTraits::M_STEP);
+  const float* a_scales = reinterpret_cast<const float*>(
+      reinterpret_cast<unsigned char*>(sA) + amx::int8_rm_a_scales_offset(max_m_pad, k));
+
+  int n_blocks = (amx::int8_pad_up(n, amx::Int8KernelTraits::N_STEP)
+                  + amx::Int8KernelTraits::N_BLOCK - 1)
+                 / amx::Int8KernelTraits::N_BLOCK;
+  int nth = rt->threads;
+  if (nth > n_blocks) nth = n_blocks;
+  if (nth <= 0) nth = 1;
+
+  const cg_bf16_t* a_rm        = reinterpret_cast<const cg_bf16_t*>(d->a);
+  const int8_t*    b_rm        = reinterpret_cast<const int8_t*>(d->b);
+  const float*     b_scales_in = reinterpret_cast<const float*>(d->b_scales);
+  float*           c_rm        = reinterpret_cast<float*>(d->c);
+
+  if (nth == 1) {
+    amx::int8_rm_pack_a_bf16(m, k, a_rm, sA);
+    amx::int8_rm_run(m, n, k, b_rm, d->ldb, sA, sC, 0, 1);
+    amx::int8_rm_unpack_transposed(m, n, a_scales, b_scales_in, sC,
+                                   d->alpha, d->beta, c_rm, d->ldc, 0, 1);
+  } else {
+    /* A pack is cheap and single-threaded (m is small); run-and-unpack
+     * fan out across threads along whole N_BLOCK stripes. */
+    rt->pool->parallel_for(nth, [&](int ith) {
+      if (ith == 0) amx::int8_rm_pack_a_bf16(m, k, a_rm, sA);
+    });
+    rt->pool->parallel_for(nth, [&](int ith) {
+      amx::int8_rm_run(m, n, k, b_rm, d->ldb, sA, sC, ith, nth);
+    });
+    rt->pool->parallel_for(nth, [&](int ith) {
+      amx::int8_rm_unpack_transposed(m, n, a_scales, b_scales_in, sC,
+                                     d->alpha, d->beta, c_rm, d->ldc, ith, nth);
+    });
+  }
+  return CG_OK;
+}
+
 cg_status_t run_amx_int8(cg_runtime_t* rt, const cg_gemm_desc_t* d) {
   namespace amx = cpu_gemm::kernels::amx;
   int m = (int)d->m, n = (int)d->n, k = (int)d->k;
@@ -226,6 +298,13 @@ cg_status_t run_cg_gemm(cg_runtime_t* rt, const cg_gemm_desc_t* d) {
 #if defined(CPU_GEMM_HAS_AMX)
   if (rt && rt->pool && amx_int8_prepacked_eligible(d)) {
     return run_amx_int8_prepacked(rt, d);
+  }
+  /* Prefer the stride-aware (row-major B) path over the packed-on-touch
+   * variant — it avoids the per-call B repack and has strictly less
+   * scratch. The packed-on-touch fallback remains for shapes that don't
+   * satisfy the stride-aware predicate (e.g. n % N_STEP != 0). */
+  if (rt && rt->pool && amx_int8_rm_eligible(d)) {
+    return run_amx_int8_rm(rt, d);
   }
   if (rt && rt->pool && amx_int8_eligible(d)) {
     return run_amx_int8(rt, d);
