@@ -1,13 +1,14 @@
-"""Unified INT8 MoE layer (asym_gemm.unified_moe.Layer) — v2.
+"""Unified INT8 MoE layer (asym_gemm.unified_moe.Layer) — v3.
 
 Per-expert dispatch on routed token count:
-- m_e <= m_cpu  → CPU AMX INT8 path (cpu_gemm)
+- m_e <= m_cpu  → CPU AMX INT8 path (cpu_gemm, stride-aware row-major B)
 - m_e >  m_cpu  → SM90 INT8 grouped-MoE WGMMA kernel (asym_gemm)
 
 **All expert parameters live in pinned host memory** — no VRAM weight mirror.
 The GPU path reads weights from pinned host via Hopper TMA over PCIe (UVA).
-The CPU path reads from the AMX blocked-VNNI permutation of the same bytes,
-also page-locked.
+The CPU path reads from **the same pinned row-major INT8 bytes** via the
+stride-aware AMX kernel — no second permuted view, no per-call repack.
+See `Stride.md` for the kernel rework that enables this unification.
 
 Both backends compute the same INT8 → INT32 → FP32 dequant contract:
 
@@ -26,8 +27,7 @@ See docs unified_kernel_pinned_CPU_memory.md for the full design.
 
 from __future__ import annotations
 
-import ctypes
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -106,48 +106,6 @@ def silu_fp32(x: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Pinning (page-locking) AMX-packed numpy buffers via torch's libcudart bridge.
-# Avoids adding a CUDA build dependency to _cpu_C — torch already has libcudart
-# loaded and exposes ctypes-friendly wrappers via torch.cuda.cudart().
-# ---------------------------------------------------------------------------
-
-class _PinnedAmxBuffer:
-    """Wraps a numpy array whose backing memory has been cudaHostRegister'd.
-
-    Holds a reference to the numpy array so the buffer outlives any kernel
-    launch, and runs cudaHostUnregister in __del__ so the pin is released
-    when the layer is torn down."""
-
-    __slots__ = ("arr", "_ptr", "_size", "_unregister")
-
-    def __init__(self, arr: np.ndarray):
-        assert arr.dtype == np.uint8 and arr.ndim == 1 and arr.flags["C_CONTIGUOUS"]
-        self.arr = arr
-        self._ptr = int(arr.ctypes.data)
-        self._size = int(arr.nbytes)
-        # torch.cuda.cudart() is a module-like object; calls return cudaError enum.
-        cudart = torch.cuda.cudart()
-        err = cudart.cudaHostRegister(self._ptr, self._size, 0)  # cudaHostRegisterDefault
-        if int(err) != 0:
-            # 712 (cudaErrorHostMemoryAlreadyRegistered) is benign here.
-            if int(err) != 712:
-                raise RuntimeError(f"cudaHostRegister failed with code {int(err)}")
-        self._unregister = cudart.cudaHostUnregister
-
-    def __del__(self):
-        try:
-            if self._unregister is not None and self._ptr:
-                self._unregister(self._ptr)
-                self._ptr = 0
-        except Exception:
-            pass
-
-
-def _pin_amx_buffer(arr: np.ndarray) -> _PinnedAmxBuffer:
-    return _PinnedAmxBuffer(arr)
-
-
-# ---------------------------------------------------------------------------
 # Expert weight container
 # ---------------------------------------------------------------------------
 
@@ -155,20 +113,17 @@ def _pin_amx_buffer(arr: np.ndarray) -> _PinnedAmxBuffer:
 class ExpertSlab:
     """One MoE layer's three projections, INT8 quantized, all in pinned host.
 
-    Per expert weight bytes have TWO views (same content, different layout):
+    A **single** pinned-host byte layout per expert — row-major
+    `[G, N, K]` int8 + `[G, N]` fp32 scales — feeds both backends:
+
       *_int8 / *_scales   — row-major torch tensors, pinned via pin_memory().
-                            Consumed directly by the SM90 INT8 GPU kernel
-                            via Hopper TMA UVA fetches over PCIe.
-      *_packed            — AMX blocked-VNNI uint8 buffers (cudaHostRegister'd).
-                            Consumed by cpu_gemm AMX INT8.
+                            Consumed directly by the SM90 INT8 GPU kernel via
+                            Hopper TMA UVA fetches over PCIe, *and* directly
+                            by the stride-aware cpu_gemm AMX INT8 kernel.
 
     Plus the per-K-block scale broadcast on device:
-      *_sfb [G, N, K//128] fp32  — small device tensor, built once at load,
-                                   consumed by the GPU kernel.
-
-    The "two pinned views" invariant: pack_b_int8_amx is a byte-level
-    permutation of (q, s) — no re-quantization. Backed by parity test
-    test_cpu_vs_gpu_single_expert (cpu_vs_gpu ≈ 0 historically).
+      *_sfb [G, N, K//128] fp32 — small device tensor, built once at load,
+                                  consumed by the GPU kernel.
     """
     num_experts: int
     hidden: int
@@ -176,7 +131,7 @@ class ExpertSlab:
     kb_hidden: int                      # hidden // GRAN_K
     kb_inter:  int                      # inter  // GRAN_K
 
-    # row-major INT8 in pinned host (one source of truth for GPU TMA reads)
+    # row-major INT8 in pinned host (one source of truth for both backends)
     gate_int8: torch.Tensor             # int8, pinned, [G, inter, hidden]
     gate_scales: torch.Tensor           # float32, pinned, [G, inter]
     up_int8: torch.Tensor               # int8, pinned, [G, inter, hidden]
@@ -184,20 +139,10 @@ class ExpertSlab:
     down_int8: torch.Tensor             # int8, pinned, [G, hidden, inter]
     down_scales: torch.Tensor           # float32, pinned, [G, hidden]
 
-    # AMX-packed twins (pinned page-locked uint8, per expert)
-    gate_packed: list = field(default_factory=list)   # list[_PinnedAmxBuffer]
-    up_packed: list   = field(default_factory=list)
-    down_packed: list = field(default_factory=list)
-
     # Device-resident SFB broadcasts for the SM90 kernel
     gate_sfb: Optional[torch.Tensor] = None   # [G, inter, kb_hidden] fp32 on CUDA
     up_sfb:   Optional[torch.Tensor] = None   # [G, inter, kb_hidden] fp32 on CUDA
     down_sfb: Optional[torch.Tensor] = None   # [G, hidden, kb_inter] fp32 on CUDA
-
-    def packed_array(self, kind: str, e: int) -> np.ndarray:
-        """Return the underlying numpy view of a packed expert buffer."""
-        return {"gate": self.gate_packed, "up": self.up_packed,
-                "down": self.down_packed}[kind][e].arr
 
 
 # ---------------------------------------------------------------------------
@@ -279,23 +224,20 @@ class Layer:
         down_int8 = torch.empty(G, K_hidden, N_inter, dtype=torch.int8).pin_memory()
         down_s    = torch.empty(G, K_hidden,           dtype=torch.float32).pin_memory()
 
-        # --- pinned host: AMX-packed twins ---
-        gate_packed, up_packed, down_packed = [], [], []
+        # --- quantize once into the pinned row-major buffers ---
+        # No second permuted view: both backends read these bytes directly.
         for g in range(G):
             q, s = quantize_per_channel_int8(gate[g])
             gate_int8[g] = torch.from_numpy(q)
             gate_s[g]    = torch.from_numpy(s)
-            gate_packed.append(_pin_amx_buffer(_C.pack_b_int8_amx(q, s)))
 
             q, s = quantize_per_channel_int8(up[g])
             up_int8[g] = torch.from_numpy(q)
             up_s[g]    = torch.from_numpy(s)
-            up_packed.append(_pin_amx_buffer(_C.pack_b_int8_amx(q, s)))
 
             q, s = quantize_per_channel_int8(down[g])
             down_int8[g] = torch.from_numpy(q)
             down_s[g]    = torch.from_numpy(s)
-            down_packed.append(_pin_amx_buffer(_C.pack_b_int8_amx(q, s)))
 
         # --- device-resident SFB broadcasts ---
         # Build on whatever CUDA device the user picked.
@@ -315,7 +257,6 @@ class Layer:
             gate_int8=gate_int8, gate_scales=gate_s,
             up_int8=up_int8,     up_scales=up_s,
             down_int8=down_int8, down_scales=down_s,
-            gate_packed=gate_packed, up_packed=up_packed, down_packed=down_packed,
             gate_sfb=gate_sfb, up_sfb=up_sfb, down_sfb=down_sfb,
         )
         return cls(slab, top_k=top_k, cpu_threads=cpu_threads,
@@ -325,7 +266,7 @@ class Layer:
         self.m_cpu = int(m_cpu)
 
     # -----------------------------------------------------------
-    # CPU bucket — unchanged from v1
+    # CPU bucket — reads the same pinned row-major bytes as the GPU path
     # -----------------------------------------------------------
 
     def _cpu_expert_forward(
@@ -337,19 +278,24 @@ class Layer:
         m_e = x_bf16_bits.shape[0]
         H, I = slab.hidden, slab.inter
 
+        # numpy views into the pinned tensors — same bytes, no copy.
+        gate_b   = slab.gate_int8[e].numpy()
+        gate_s   = slab.gate_scales[e].numpy()
+        up_b     = slab.up_int8[e].numpy()
+        up_s     = slab.up_scales[e].numpy()
+        down_b   = slab.down_int8[e].numpy()
+        down_s   = slab.down_scales[e].numpy()
+
         c_gate = np.empty((m_e, I), dtype=np.float32)
         c_up   = np.empty((m_e, I), dtype=np.float32)
-        _C.gemm_bf16_int8_packed(self.rt, x_bf16_bits, slab.packed_array("gate", e),
-                                  c_gate, I, H, 1.0, 0.0)
-        _C.gemm_bf16_int8_packed(self.rt, x_bf16_bits, slab.packed_array("up", e),
-                                  c_up,   I, H, 1.0, 0.0)
+        _C.gemm_bf16_int8(self.rt, x_bf16_bits, gate_b, gate_s, c_gate, 1.0, 0.0)
+        _C.gemm_bf16_int8(self.rt, x_bf16_bits, up_b,   up_s,   c_up,   1.0, 0.0)
 
         act = silu_fp32(c_gate) * c_up
         act_bf16_bits = fp32_to_bf16_bits(act)
 
         c_down = np.empty((m_e, H), dtype=np.float32)
-        _C.gemm_bf16_int8_packed(self.rt, act_bf16_bits, slab.packed_array("down", e),
-                                  c_down, H, I, 1.0, 0.0)
+        _C.gemm_bf16_int8(self.rt, act_bf16_bits, down_b, down_s, c_down, 1.0, 0.0)
         return c_down
 
     # -----------------------------------------------------------
