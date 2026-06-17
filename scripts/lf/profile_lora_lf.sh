@@ -23,7 +23,7 @@ GPU_POOL=${GPU_POOL:-0}
 # MODEL_SPECS entries are model|num_gpus. Recompute belongs only in BACKEND_SPECS.
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
-MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
+MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1,Qwen/Qwen3.5-122B-A10B|1"}
 ROUTER_MODES=${ROUTER_MODES:-whole}
 PROFILERS=${PROFILERS:-both}
@@ -64,7 +64,6 @@ USE_ASYM_CPU_ADAMW=${USE_ASYM_CPU_ADAMW:-true}
 ASYM_CPU_ADAMW_BACKEND=${ASYM_CPU_ADAMW_BACKEND:-deepspeed}
 ASYM_CPU_ADAMW_PIN_MEMORY=${ASYM_CPU_ADAMW_PIN_MEMORY:-true}
 ASYM_CPU_ADAMW_FP32_MASTER=${ASYM_CPU_ADAMW_FP32_MASTER:-true}
-ASYM_CUDA_GRAPH=${ASYM_CUDA_GRAPH:-off}
 
 # Execution
 OVERWRITE=${OVERWRITE:-false}
@@ -75,13 +74,9 @@ INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
 RUN_NAME=${RUN_NAME:-}
 
 # Training
-# SEQ_LENS=${SEQ_LENS:-11264}
-# SEQ_LENS=${SEQ_LENS:-10240}
-SEQ_LENS=${SEQ_LENS:-8192}
-# SEQ_LENS=${SEQ_LENS:-7168}
-# SEQ_LENS=${SEQ_LENS:-4096}
-PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-8}
-GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
+# WORKLOADS entries are seq_len|per_device_train_batch_size|gradient_accumulation_steps.
+# Example: WORKLOADS="2048|3|1,4096|2|1".
+WORKLOADS="${WORKLOADS:-8192|8|1}"
 # MAX_STEPS=${MAX_STEPS:-10}
 # WARMUP_STEPS=${WARMUP_STEPS:-5}
 MAX_STEPS=${MAX_STEPS:-1}
@@ -190,7 +185,7 @@ Defaults:
   --dist-launcher ${DIST_LAUNCHER}
   --backend-specs ${BACKEND_SPECS}
   --profilers ${PROFILERS}
-  --seq-lens ${SEQ_LENS}
+  --workloads '${WORKLOADS}'
   --output-root ${OUTPUT_ROOT}
 
 Options:
@@ -206,7 +201,8 @@ Options:
                                  Use canonical recompute labels: norecomp or recomp. Use both to expand to both modes.
   --router-modes LIST            AsymGEMM router modes: hf, whole. Default ${ROUTER_MODES}.
   --profilers LIST               source, nsys, and/or both. both runs Nsight once and materializes sibling source artifacts.
-  --seq-lens LIST                LF cutoff lengths. Accepts positive integers, e.g. 4096,8192.
+  --workloads LIST               Paired workload list. Each item is seq_len|per_device_batch_size|gradient_accumulation_steps.
+                                 Example: '2048|3|1,4096|2|1'.
   --asymm-exp-act-policies LIST  Paired expert policy / expert activation offload / attention activation offload / layer activation offload configs.
                                  Format: policy|expert_act|attn_act|layer_act, e.g. none|true|false|false,gc-layer|false|false|false,none|true|true|true.
 
@@ -222,8 +218,6 @@ Options:
   Training:
   --max-steps N                  Measured steps kept in plots/summaries.
   --warmup-steps N               Extra initial steps to run but exclude from plots/summaries. Use 5+ for stable timing; 0/1 is allowed for smoke tests.
-  --batch-size N
-  --gradient-accumulation-steps N
   --learning-rate VALUE
   --lora-rank N
   --lora-alpha VALUE
@@ -255,9 +249,6 @@ Options:
   --asym-cpu-adamw-fp32-master true|false
   --asym-cpu-adamw-grad-offload LIST
                                  Grad offload mode(s) for Asym CPUAdamW backends; one or more, e.g. false,true.
-  --asym-cuda-graph off|compile
-                                 Compile Asym jobs with PyTorch reduce-overhead CUDA graph mode. Requires norecomp, dropout 0.00, and no activation offload.
-
   KT:
   --kt-kernel-dir DIR            Integrated kt-kernel source tree.
   --kt-tools-dir DIR             Helper source tree to put on PYTHONPATH for KT jobs. Defaults to ROOT.
@@ -287,8 +278,8 @@ Options:
   --check-cpuadam true|false
 
   Outputs and plotting:
-  --output-root DIR              Default config layout: <root>/<dataset>__lora__lf__<precision>/<model>__gpus<model_gpus>__b<batch>_s<seq>_w<warmup>_s<steps>_r<rank>_a<alpha>_drop0xx
-                                 Per-run dirs add <backend>__<profiler>__<recompute>__pol<policy>__router<mode>/b<batch>_s<seq>.
+  --output-root DIR              Default config layout: <root>/<dataset>__lora__lf__<precision>/<model>__gpus<model_gpus>__b<batch>_s<seq>_ga<grad_accum>_w<warmup>_s<steps>_r<rank>_a<alpha>_drop0xx
+                                 Per-run dirs add <backend>__<profiler>__<recompute>__pol<policy>__router<mode>/b<batch>_s<seq>_ga<grad_accum>.
   --run-name NAME                Optional config directory under <dataset>__lora__lf__<precision>.
   --plot true|false
   --plot-memory-breakdown true|false
@@ -459,14 +450,6 @@ lora_dropout_label() {
   printf 'drop0%s\n' "${value#*.}"
 }
 
-cuda_graph_mode() {
-  case "${1,,}" in
-    off|none|0|false|no|n) printf 'off\n' ;;
-    compile|partial|inductor|1|true|yes|y|on) printf 'compile\n' ;;
-    *) die "ASYM_CUDA_GRAPH/--asym-cuda-graph must be off or compile, got '${1}'" ;;
-  esac
-}
-
 infer_template() {
   local model="$1"
   local lower="${model,,}"
@@ -489,6 +472,25 @@ positive_int() {
   local name="$1"
   local value="$2"
   [[ "${value}" =~ ^[1-9][0-9]*$ ]] || die "${name} must be a positive integer, got '${value}'"
+}
+
+parse_workload_tuple() {
+  local raw="$1"
+  local seq_len batch grad_accum
+  local -a fields
+
+  IFS='|' read -r -a fields <<< "${raw}"
+  ((${#fields[@]} == 3)) || die "workload item must be seq_len|per_device_batch_size|gradient_accumulation_steps, got '${raw}'"
+
+  seq_len="${fields[0]}"
+  batch="${fields[1]}"
+  grad_accum="${fields[2]}"
+  [[ -n "${seq_len}" && -n "${batch}" && -n "${grad_accum}" ]] || die "empty value in workload item '${raw}'"
+  positive_int "workload seq_len in '${raw}'" "${seq_len}"
+  positive_int "workload per-device batch size in '${raw}'" "${batch}"
+  positive_int "workload gradient accumulation steps in '${raw}'" "${grad_accum}"
+
+  printf '%s|%s|%s\n' "${seq_len}" "${batch}" "${grad_accum}"
 }
 
 parse_model_spec() {
@@ -789,6 +791,7 @@ existing_profile_complete() {
   local expected_expact_lora_a_fwd="${12:-}"
   local expected_grad_offload="${13:-}"
   local current_batch="${PER_DEVICE_TRAIN_BATCH_SIZE:-}"
+  local current_grad_accum="${GRADIENT_ACCUMULATION_STEPS:-}"
   local current_lora_rank="${LORA_RANK:-}"
   local current_lora_dropout="${LORA_DROPOUT:-}"
   local current_cache_depth="${KT_MAX_CACHE_DEPTH:-}"
@@ -799,7 +802,7 @@ existing_profile_complete() {
   local current_allow_unvalidated_route_rank="${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK:-0}"
   [[ -f "${profile_json}" ]] || return 1
   "${ENV_PYTHON}" - "${profile_json}" "${expected_backend}" "${expected_seq_len}" "${expected_model_name}" \
-    "${expected_lora_target}" "${expected_recompute}" "${current_batch}" "${current_lora_rank}" \
+    "${expected_lora_target}" "${expected_recompute}" "${current_batch}" "${current_grad_accum}" "${current_lora_rank}" \
     "${current_lora_dropout}" "${current_cache_depth}" "${current_top_k}" "${current_token_chunk_size}" \
     "${current_route_rank_limit}" "${current_default_route_rank_limit}" \
     "${current_allow_unvalidated_route_rank}" "${expected_offload_modules}" "${expected_expact}" "${expected_attnact}" "${expected_layeract}" \
@@ -815,21 +818,22 @@ expected_model_name = sys.argv[4]
 expected_lora_target = sys.argv[5]
 expected_recompute = sys.argv[6]
 expected_batch = sys.argv[7]
-expected_rank = sys.argv[8]
-expected_dropout = sys.argv[9]
-expected_cache_depth = sys.argv[10]
-expected_top_k = sys.argv[11]
-expected_token_chunk = sys.argv[12]
-expected_limit = sys.argv[13]
-expected_default_limit = sys.argv[14]
-allow_unvalidated = sys.argv[15]
-expected_offload_modules = sys.argv[16]
-expected_expact = sys.argv[17]
-expected_attnact = sys.argv[18]
-expected_layeract = sys.argv[19]
-expected_lf_expert_lora_impl = sys.argv[20] if len(sys.argv) > 20 else ""
-expected_expact_lora_a_fwd = sys.argv[21] if len(sys.argv) > 21 else ""
-expected_grad_offload = sys.argv[22] if len(sys.argv) > 22 else ""
+expected_grad_accum = sys.argv[8]
+expected_rank = sys.argv[9]
+expected_dropout = sys.argv[10]
+expected_cache_depth = sys.argv[11]
+expected_top_k = sys.argv[12]
+expected_token_chunk = sys.argv[13]
+expected_limit = sys.argv[14]
+expected_default_limit = sys.argv[15]
+allow_unvalidated = sys.argv[16]
+expected_offload_modules = sys.argv[17]
+expected_expact = sys.argv[18]
+expected_attnact = sys.argv[19]
+expected_layeract = sys.argv[20]
+expected_lf_expert_lora_impl = sys.argv[21] if len(sys.argv) > 21 else ""
+expected_expact_lora_a_fwd = sys.argv[22] if len(sys.argv) > 22 else ""
+expected_grad_offload = sys.argv[23] if len(sys.argv) > 23 else ""
 source_profile = profile.get("source_profile", {})
 source_profile = source_profile if isinstance(source_profile, dict) and source_profile else profile
 if profile.get("partial") is True:
@@ -837,6 +841,7 @@ if profile.get("partial") is True:
 if source_profile.get("partial") is True:
     raise SystemExit("partial nested source profile")
 config = source_profile.get("config", {})
+config = config if isinstance(config, dict) else {}
 backend = str(config.get("backend") or "") if isinstance(config, dict) else ""
 def heartbeat_stage(payload):
     heartbeat = payload.get("heartbeat", {})
@@ -872,6 +877,24 @@ if expected_lora_target:
     lora_target = str(config.get("lora_target") or "")
     if lora_target != expected_lora_target:
         raise SystemExit(f"profile lora_target mismatch: expected {expected_lora_target}, got {lora_target or '<missing>'}")
+def require_int_config_any(keys, expected, label):
+    if not str(expected).strip():
+        return
+    wanted = int(expected)
+    for key in keys:
+        value = config.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            actual = int(value)
+        except (TypeError, ValueError):
+            raise SystemExit(f"profile {key} missing or invalid")
+        if actual != wanted:
+            raise SystemExit(f"profile {label} mismatch: expected {wanted}, got {actual}")
+        return
+    raise SystemExit(f"profile {label} missing or invalid")
+require_int_config_any(("per_device_train_batch_size", "batch_size"), expected_batch, "batch_size")
+require_int_config_any(("gradient_accumulation_steps",), expected_grad_accum, "gradient_accumulation_steps")
 if expected_offload_modules and backend in {"asym", "asym_torch", "asym_cpuadamwtorch", "asym_cpuadamwds"}:
     def normalize_selector(value):
         return ",".join(
@@ -1187,19 +1210,13 @@ check_kt_arm_route_rank_for_sweep() {
 
 config_root_path() {
   local seq_len="$1"
-  local config_label step_label dropout_label cuda_graph_suffix
+  local config_label step_label dropout_label
   step_label="w${WARMUP_STEPS}_s${MAX_STEPS}"
   dropout_label="${lora_dropout_label_value}"
-  cuda_graph_suffix=""
-  [[ "${ASYM_CUDA_GRAPH}" == "off" ]] || cuda_graph_suffix="_cg${ASYM_CUDA_GRAPH}"
   if [[ -n "${run_name}" ]]; then
-    if ((${#seq_lens[@]} > 1)); then
-      config_label="$(safe_label "${run_name}__s${seq_len}_${dropout_label}${cuda_graph_suffix}")"
-    else
-      config_label="$(safe_label "${run_name}__${dropout_label}${cuda_graph_suffix}")"
-    fi
+    config_label="$(safe_label "${run_name}__b${batch_size}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${dropout_label}")"
   else
-    config_label="$(safe_label "${workload_label}__gpus${current_model_gpu_count}__b${batch_size}_s${seq_len}_${step_label}_r${LORA_RANK}_a${LORA_ALPHA}_${dropout_label}${cuda_graph_suffix}")"
+    config_label="$(safe_label "${workload_label}__gpus${current_model_gpu_count}__b${batch_size}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${step_label}_r${LORA_RANK}_a${LORA_ALPHA}_${dropout_label}")"
   fi
   printf '%s/%s\n' "${precision_root}" "${config_label}"
 }
@@ -1218,6 +1235,16 @@ job_root_path() {
     grad_offload_suffix="__gradoff${grad_offload}__weightoff${weight_offload}"
   fi
   printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__${expact_lora_a_fwd_label}__${actrecomp_label}__${xunpack_label}${grad_offload_suffix}")"
+}
+
+workload_run_dir_name() {
+  local seq_len="$1"
+  printf 'b%s_s%s_ga%s\n' "${PER_DEVICE_TRAIN_BATCH_SIZE}" "${seq_len}" "${GRADIENT_ACCUMULATION_STEPS}"
+}
+
+current_workload_tuple() {
+  local seq_len="$1"
+  printf '%s|%s|%s\n' "${seq_len}" "${PER_DEVICE_TRAIN_BATCH_SIZE}" "${GRADIENT_ACCUMULATION_STEPS}"
 }
 
 kt_arm_matching_source_profile_complete() {
@@ -1265,12 +1292,10 @@ kt_arm_matching_source_profile_json_candidates() {
   local expert_policy="$4"
   local router_mode="$5"
   local seq_len="$6"
-  local source_job_root
+  local source_job_root run_dir_name
   source_job_root="$(job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}")"
-  printf '%s/profile.json\n' "${source_job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
-  # Compatibility for source profiles produced before actrecomp/xunpack became part of the run label.
-  source_job_root="${config_root}/$(safe_label "${backend}__source__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__${expact_lora_a_fwd_label}")"
-  printf '%s/profile.json\n' "${source_job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
+  run_dir_name="$(workload_run_dir_name "${seq_len}")"
+  printf '%s/profile.json\n' "${source_job_root}/${run_dir_name}"
 }
 
 plot_workload_from_config_root() {
@@ -1310,16 +1335,19 @@ ensure_jobs_tsv() {
   local config_root="$1"
   mkdir -p "${config_root}"
   if [[ ! -e "${config_root}/jobs.tsv" ]]; then
-    printf 'status\tgpu\tseq_len\trecompute\texpert_policy\trouter_mode\tbackend\tprofiler\tgrad_offload\tjob_dir\tprofile_json\tlog\tqwen_expert_lora_impl\texpert_lora_a_fwd\n' > "${config_root}/jobs.tsv"
+    printf 'status\tgpu\tseq_len\tbatch_size\tgradient_accumulation_steps\trecompute\texpert_policy\trouter_mode\tbackend\tprofiler\tgrad_offload\tjob_dir\tprofile_json\tlog\tqwen_expert_lora_impl\texpert_lora_a_fwd\n' > "${config_root}/jobs.tsv"
   fi
 }
 
 append_job_record() {
   local config_root="$1"
   local status="$2"
-  shift 2
+  local gpu="$3"
+  local seq_len="$4"
+  shift 4
   ensure_jobs_tsv "${config_root}"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${status}" "$@" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" >> "${config_root}/jobs.tsv"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${status}" "${gpu}" "${seq_len}" "${PER_DEVICE_TRAIN_BATCH_SIZE}" "${GRADIENT_ACCUMULATION_STEPS}" "$@" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" >> "${config_root}/jobs.tsv"
 }
 
 plot_cmd_base() {
@@ -1328,7 +1356,7 @@ plot_cmd_base() {
   local output_dir="$3"
   local combined_output_dir="$4"
   shift 4
-  (($# > 0)) || die "plot_cmd_base requires at least one sequence length"
+  (($# > 0)) || die "plot_cmd_base requires at least one workload"
   _cmd_ref=(
     "${ENV_PYTHON}" "${PLOT_SCRIPT}"
     --input-root "${input_root}"
@@ -1336,9 +1364,8 @@ plot_cmd_base() {
     --combined-output-dir "${combined_output_dir}"
     --precision "${PRECISION}"
     --clean-output
-    --batch-size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
-    --seq-lens "$@"
   )
+  _cmd_ref+=(--workloads "$@")
 }
 
 memory_combined_plot_cmd_base() {
@@ -1346,7 +1373,7 @@ memory_combined_plot_cmd_base() {
   local input_root="$2"
   local output_dir="$3"
   shift 3
-  (($# > 0)) || die "memory_combined_plot_cmd_base requires at least one sequence length"
+  (($# > 0)) || die "memory_combined_plot_cmd_base requires at least one workload"
   _cmd_ref=(
     "${ENV_PYTHON}" "${MEMORY_PLOT_SCRIPT}"
     --input-root "${input_root}"
@@ -1354,7 +1381,7 @@ memory_combined_plot_cmd_base() {
     --clean-output
     --combined-only
     --y-scale "${MEMORY_BREAKDOWN_PLOT_Y_SCALE}"
-    --seq-lens "$@"
+    --workloads "$@"
     --expert-recompute-policies "${expert_policies[@]}"
   )
 }
@@ -1364,14 +1391,14 @@ interconnect_combined_plot_cmd_base() {
   local input_root="$2"
   local output_dir="$3"
   shift 3
-  (($# > 0)) || die "interconnect_combined_plot_cmd_base requires at least one sequence length"
+  (($# > 0)) || die "interconnect_combined_plot_cmd_base requires at least one workload"
   _cmd_ref=(
     "${ENV_PYTHON}" "${INTERCONNECT_PLOT_SCRIPT}"
     --input-root "${input_root}"
     --output-dir "${output_dir}"
     --clean-output
     --combined-only
-    --seq-lens "$@"
+    --workloads "$@"
     --expert-recompute-policies "${expert_policies[@]}"
   )
 }
@@ -1513,13 +1540,12 @@ model_spec="${MODEL_SPECS}"
 backend_specs_spec="${BACKEND_SPECS}"
 router_mode_spec="${ROUTER_MODES}"
 profiler_spec="${PROFILERS}"
-seq_spec="${SEQ_LENS}"
+workload_spec="${WORKLOADS}"
 exp_act_policy_spec="${ASYMM_EXP_ACT_POLICIES}"
 lora_dropout_spec="${LORA_DROPOUT}"
 lf_expert_lora_impl_spec="${LF_EXPERT_LORA_IMPLS}"
 output_root="${OUTPUT_ROOT}"
 run_name="${RUN_NAME}"
-batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}"
 template_spec="${TEMPLATE}"
 kt_repo_dir_user_set=false
 [[ -n "${KT_REPO_DIR_ENV_SET}" ]] && kt_repo_dir_user_set=true
@@ -1541,8 +1567,8 @@ while (($#)); do
     --router-modes=*) router_mode_spec="${1#*=}"; ROUTER_MODES="${1#*=}"; shift ;;
     --profilers) need_value "$1" "${2-}"; profiler_spec="$2"; shift 2 ;;
     --profilers=*) profiler_spec="${1#*=}"; shift ;;
-    --seq-lens) need_value "$1" "${2-}"; seq_spec="$2"; shift 2 ;;
-    --seq-lens=*) seq_spec="${1#*=}"; shift ;;
+    --workloads) collect_values "$1" vals "${@:2}"; workload_spec="${vals[*]}"; WORKLOADS="${workload_spec}"; set -- "${REMAINING[@]}" ;;
+    --workloads=*) workload_spec="${1#*=}"; WORKLOADS="${workload_spec}"; shift ;;
     --asymm-exp-act-policies) need_value "$1" "${2-}"; exp_act_policy_spec="$2"; ASYMM_EXP_ACT_POLICIES="$2"; shift 2 ;;
     --asymm-exp-act-policies=*) exp_act_policy_spec="${1#*=}"; ASYMM_EXP_ACT_POLICIES="${1#*=}"; shift ;;
     --dataset) need_value "$1" "${2-}"; DATASET="$2"; shift 2 ;;
@@ -1563,10 +1589,6 @@ while (($#)); do
     --max-steps=*) MAX_STEPS="${1#*=}"; shift ;;
     --warmup-steps) need_value "$1" "${2-}"; WARMUP_STEPS="$2"; shift 2 ;;
     --warmup-steps=*) WARMUP_STEPS="${1#*=}"; shift ;;
-    --batch-size) need_value "$1" "${2-}"; batch_size="$2"; PER_DEVICE_TRAIN_BATCH_SIZE="$2"; shift 2 ;;
-    --batch-size=*) batch_size="${1#*=}"; PER_DEVICE_TRAIN_BATCH_SIZE="${1#*=}"; shift ;;
-    --gradient-accumulation-steps) need_value "$1" "${2-}"; GRADIENT_ACCUMULATION_STEPS="$2"; shift 2 ;;
-    --gradient-accumulation-steps=*) GRADIENT_ACCUMULATION_STEPS="${1#*=}"; shift ;;
     --learning-rate) need_value "$1" "${2-}"; LEARNING_RATE="$2"; shift 2 ;;
     --learning-rate=*) LEARNING_RATE="${1#*=}"; shift ;;
     --lora-rank) need_value "$1" "${2-}"; LORA_RANK="$2"; shift 2 ;;
@@ -1617,8 +1639,6 @@ while (($#)); do
     --asym-cpu-adamw-grad-offload=*) ASYM_CPU_ADAMW_GRAD_OFFLOAD="${1#*=}"; shift ;;
     --asym-cpu-adamw-weight-offload) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="$2"; shift 2 ;;
     --asym-cpu-adamw-weight-offload=*) ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${1#*=}"; shift ;;
-    --asym-cuda-graph) need_value "$1" "${2-}"; ASYM_CUDA_GRAPH="$2"; shift 2 ;;
-    --asym-cuda-graph=*) ASYM_CUDA_GRAPH="${1#*=}"; shift ;;
     --kt-kernel-dir) need_value "$1" "${2-}"; KT_KERNEL_DIR="$2"; shift 2 ;;
     --kt-kernel-dir=*) KT_KERNEL_DIR="${1#*=}"; shift ;;
     --kt-tools-dir) need_value "$1" "${2-}"; KT_TOOLS_DIR="$2"; shift 2 ;;
@@ -1698,7 +1718,7 @@ require_comma_list "--models/MODEL_SPECS" "${model_spec}"
 require_comma_list "--backend-specs/BACKEND_SPECS" "${backend_specs_spec}"
 require_comma_list "--router-modes/ROUTER_MODES" "${router_mode_spec}"
 require_comma_list "--profilers/PROFILERS" "${profiler_spec}"
-require_comma_list "--seq-lens/SEQ_LENS" "${seq_spec}"
+require_comma_list "--workloads/WORKLOADS" "${workload_spec}"
 require_comma_list "--asymm-exp-act-policies/ASYMM_EXP_ACT_POLICIES" "${exp_act_policy_spec}"
 require_comma_list "--lora-dropout/LORA_DROPOUT" "${lora_dropout_spec}"
 require_comma_list "--lf-expert-lora-impls/LF_EXPERT_LORA_IMPLS" "${lf_expert_lora_impl_spec}"
@@ -1722,12 +1742,6 @@ mapfile -t lora_dropouts < <(tokens "${lora_dropout_spec}" | dedupe)
 for value in "${lora_dropouts[@]}"; do
   lora_dropout_label "${value}" >/dev/null
 done
-ASYM_CUDA_GRAPH="$(cuda_graph_mode "${ASYM_CUDA_GRAPH}")"
-if [[ "${ASYM_CUDA_GRAPH}" == "compile" ]]; then
-  for value in "${lora_dropouts[@]}"; do
-    [[ "${value}" == "0.00" ]] || die "ASYM_CUDA_GRAPH=compile requires LORA_DROPOUT=0.00, got '${value}'"
-  done
-fi
 lf_expert_lora_impls=()
 while IFS= read -r value; do
   lf_expert_lora_impls+=("${value,,}")
@@ -1795,11 +1809,6 @@ fi
 mapfile -t backends < <(printf '%s\n' "${backend_specs[@]}" | cut -d '|' -f1 | dedupe)
 mapfile -t backend_recompute_modes < <(printf '%s\n' "${backend_specs[@]}" | cut -d '|' -f2 | dedupe)
 recompute_modes=("${backend_recompute_modes[@]}")
-if [[ "${ASYM_CUDA_GRAPH}" == "compile" ]]; then
-  for recompute_mode in "${recompute_modes[@]}"; do
-    [[ "${recompute_mode}" == "norecomp" ]] || die "ASYM_CUDA_GRAPH=compile requires backend recompute=norecomp because gradient checkpointing breaks capture"
-  done
-fi
 mapfile -t router_modes < <(tokens "${router_mode_spec}" | while read -r value; do router_mode_label "${value}"; done | dedupe)
 router_hf_selected=false
 router_whole_selected=false
@@ -1824,9 +1833,6 @@ for backend in "${backends[@]}"; do
     *) selected_has_non_asym=true ;;
   esac
 done
-if [[ "${ASYM_CUDA_GRAPH}" == "compile" && "${selected_has_non_asym}" == "true" ]]; then
-  die "ASYM_CUDA_GRAPH=compile only supports Asym backend specs; remove non-Asym backends from BACKEND_SPECS"
-fi
 plot_router_modes=("${router_modes[@]}")
 if [[ "${router_whole_selected}" == "true" && "${selected_has_non_asym}" == "true" ]]; then
   plot_router_modes+=("hf")
@@ -1892,7 +1898,20 @@ else
     fi
   done
 fi
-mapfile -t seq_lens < <(tokens "${seq_spec}" | dedupe)
+workloads=()
+while IFS= read -r workload_value; do
+  [[ -n "${workload_value}" ]] || continue
+  parsed_workload="$(parse_workload_tuple "${workload_value}")" || exit 1
+  workloads+=("${parsed_workload}")
+done <<< "$(tokens "${workload_spec}")"
+((${#workloads[@]})) || die "workload list is empty"
+mapfile -t workloads < <(printf '%s\n' "${workloads[@]}" | dedupe)
+mapfile -t seq_lens < <(printf '%s\n' "${workloads[@]}" | cut -d '|' -f1 | dedupe)
+mapfile -t workload_batch_sizes < <(printf '%s\n' "${workloads[@]}" | cut -d '|' -f2 | dedupe)
+mapfile -t workload_grad_accum_steps < <(printf '%s\n' "${workloads[@]}" | cut -d '|' -f3 | dedupe)
+WORKLOADS="$(IFS=,; printf '%s' "${workloads[*]}")"
+IFS='|' read -r _first_workload_seq PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS <<< "${workloads[0]}"
+batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}"
 exp_act_policy_pairs=()
 mapfile -t raw_exp_act_policy_pairs < <(tokens "${exp_act_policy_spec}" | dedupe)
 ((${#raw_exp_act_policy_pairs[@]} > 0)) || die "ASYMM_EXP_ACT_POLICIES must include at least one policy|expert_act|attn_act|layer_act tuple"
@@ -1901,18 +1920,6 @@ for value in "${raw_exp_act_policy_pairs[@]}"; do
 done
 mapfile -t exp_act_policy_pairs < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | dedupe)
 ((${#exp_act_policy_pairs[@]})) || die "expert/attention activation policy tuple list is empty"
-if [[ "${ASYM_CUDA_GRAPH}" == "compile" ]]; then
-  for value in "${exp_act_policy_pairs[@]}"; do
-    policy_tail="${value#*|}"
-    expact_value="${policy_tail%%|*}"
-    policy_tail="${policy_tail#*|}"
-    attnact_value="${policy_tail%%|*}"
-    layeract_value="${policy_tail#*|}"
-    if [[ "${expact_value}" != "false" || "${attnact_value}" != "false" || "${layeract_value}" != "false" ]]; then
-      die "ASYM_CUDA_GRAPH=compile cannot be combined with activation offload policies; use ASYMM_EXP_ACT_POLICIES=none|false|false|false"
-    fi
-  done
-fi
 mapfile -t expert_policies < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f1 | dedupe)
 mapfile -t expact_values < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f2 | dedupe)
 mapfile -t attnact_values < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f3 | dedupe)
@@ -1945,10 +1952,10 @@ expact_lora_a_fwd_label="$(expact_lora_a_fwd_tag "${ASYMM_EXPERT_ACT_OFFLOAD_LOR
 ((${#backends[@]})) || die "backend list is empty"
 ((${#router_modes[@]})) || die "router mode list is empty"
 ((${#profilers[@]})) || die "profiler list is empty"
+((${#workloads[@]})) || die "workload list is empty"
 ((${#seq_lens[@]})) || die "sequence length list is empty"
-for seq_len in "${seq_lens[@]}"; do
-  positive_int "--seq-lens item" "${seq_len}"
-done
+((${#workload_batch_sizes[@]})) || die "workload batch-size list is empty"
+((${#workload_grad_accum_steps[@]})) || die "workload gradient-accumulation list is empty"
 ((${#expert_policies[@]})) || die "expert policy list is empty"
 [[ -f "${RUN_LF_SCRIPT}" ]] || die "missing ${RUN_LF_SCRIPT}"
 if [[ "${selected_has_kt}" == "true" ]]; then
@@ -2217,18 +2224,19 @@ run_job() {
     weight_offload=false
   fi
 
-  local config_root job_root seq_root source_profile lf_out log_file run_id profile_json
+  local config_root job_root seq_root source_profile lf_out log_file run_id profile_json run_dir_name
   local source_materialized_job_root="" source_materialized_seq_root="" source_materialized_profile_json="" source_materialized_source_profile="" source_materialized_log_file=""
   local kt_arm_source_ok_profile_json=""
   config_root="$(config_root_path "${seq_len}")"
   job_root="$(job_root_path "${config_root}" "${backend}" "${run_profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${grad_offload}" "${weight_offload}")"
-  seq_root="${job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
+  run_dir_name="$(workload_run_dir_name "${seq_len}")"
+  seq_root="${job_root}/${run_dir_name}"
   source_profile="${seq_root}/source_profile.json"
   lf_out="${seq_root}/lf_run"
   log_file="${seq_root}/train.log"
   if [[ "${materialize_source_from_nsys}" == "true" ]]; then
     source_materialized_job_root="$(job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}" "${grad_offload}" "${weight_offload}")"
-    source_materialized_seq_root="${source_materialized_job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
+    source_materialized_seq_root="${source_materialized_job_root}/${run_dir_name}"
     source_materialized_source_profile="${source_materialized_seq_root}/source_profile.json"
     source_materialized_profile_json="${source_materialized_seq_root}/profile.json"
     source_materialized_log_file="${source_materialized_seq_root}/train.log"
@@ -2237,9 +2245,7 @@ run_job() {
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
     grad_offload_run_label="_gradoff${grad_offload}_weightoff${weight_offload}"
   fi
-  local cuda_graph_run_label=""
-  [[ "${ASYM_CUDA_GRAPH}" == "off" ]] || cuda_graph_run_label="_cg${ASYM_CUDA_GRAPH}"
-  run_id="lf_${backend}_${run_profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${expact_lora_a_fwd_label}_${actrecomp_label}_${xunpack_label}${grad_offload_run_label}${cuda_graph_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_${lora_dropout_label_value}"
+  run_id="lf_${backend}_${run_profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${expact_lora_a_fwd_label}_${actrecomp_label}_${xunpack_label}${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
   local profile_memory_breakdown deepspeed_dir_for_profile
   local profile_backend_label job_use_asym_cpu_adamw job_asym_cpu_adamw_backend cpuadam_backend
@@ -2436,6 +2442,9 @@ run_job() {
     ASYM_GEMM_LF_CONFIG_ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}"
     ASYM_GEMM_LF_CONFIG_ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
     ASYM_GEMM_LF_CONFIG_QWEN_EXPERT_LORA_IMPL="${lf_expert_lora_impl}"
+    ASYM_GEMM_LF_CONFIG_SEQ_LEN="${seq_len}"
+    ASYM_GEMM_LF_CONFIG_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE}"
+    ASYM_GEMM_LF_CONFIG_GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS}"
     ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED="${attention_gc_enabled}"
     ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED="${layer_gc_enabled}"
     ASYM_GEMM_LF_CONFIG_WARMUP_STEPS="${WARMUP_STEPS}"
@@ -2446,12 +2455,6 @@ run_job() {
     LOG_FILE="${log_file}"
     RUN_ID="${run_id}"
   )
-  if [[ "${ASYM_CUDA_GRAPH}" == "compile" ]]; then
-    run_env+=(
-      ASYM_CUDA_GRAPH="${ASYM_CUDA_GRAPH}"
-      ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH="${ASYM_CUDA_GRAPH}"
-    )
-  fi
   if [[ "${backend}" == kt_* ]]; then
     local kt_num_threads_for_job="${KT_NUM_THREADS}"
     if [[ "${backend}" == "kt_armbf16" && -z "${kt_num_threads_for_job}" ]]; then
@@ -2491,14 +2494,9 @@ run_job() {
   fi
 
   local -a run_cmd=(env)
-  if [[ "${ASYM_CUDA_GRAPH}" == "off" ]]; then
-    run_cmd+=( -u ASYM_CUDA_GRAPH -u ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH )
-  fi
   run_cmd+=("${run_env[@]}" "${RUN_LF_SCRIPT}")
 
-  local cuda_graph_log=""
-  [[ "${ASYM_CUDA_GRAPH}" == "off" ]] || cuda_graph_log=" cuda_graph=${ASYM_CUDA_GRAPH}"
-  echo "Running backend=${backend} profiler=${profiler} run_profiler=${run_profiler} recompute=${recompute} expert_policy=${expert_policy} router_mode=${router_mode} grad_offload=${grad_offload} qwen_expert_lora_impl=${lf_expert_lora_impl} lora_a_fwd=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD} ${expact_label} ${attnact_label} ${layeract_label} ${expact_lora_a_fwd_label}${cuda_graph_log} seq=${seq_len} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
+  echo "Running backend=${backend} profiler=${profiler} run_profiler=${run_profiler} recompute=${recompute} expert_policy=${expert_policy} router_mode=${router_mode} grad_offload=${grad_offload} qwen_expert_lora_impl=${lf_expert_lora_impl} lora_a_fwd=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD} ${expact_label} ${attnact_label} ${layeract_label} ${expact_lora_a_fwd_label} seq=${seq_len} batch=${PER_DEVICE_TRAIN_BATCH_SIZE} grad_accum=${GRADIENT_ACCUMULATION_STEPS} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
   echo "  dir=${seq_root}"
   if [[ "${materialize_source_from_nsys}" == "true" ]]; then
     echo "  source_dir=${source_materialized_seq_root}"
@@ -2617,7 +2615,7 @@ plot_config_root() {
   plot_root="${config_root}/combined"
   [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")/combined"
   local -a plot_cmd
-  plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${plot_root}" "${seq_len}"
+  plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
   plot_cmd+=(--expert-recompute-policies "${expert_policies[@]}")
   append_sweep_plot_filters plot_cmd
   echo "Writing LF config combined plots: ${plot_root}"
@@ -2634,7 +2632,7 @@ plot_running_combined() {
 
   plot_root="${seq_root}/plots/_combined"
   local -a plot_cmd
-  plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${plot_root}" "${seq_len}"
+  plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
   plot_cmd+=(--combined-only --expert-recompute-policies "${expert_policies[@]}")
   append_sweep_plot_filters plot_cmd
   echo "Writing LF running combined plots: ${plot_root}"
@@ -2658,7 +2656,7 @@ plot_single_run() {
 
   plot_root="${seq_root}/plots"
   local -a plot_cmd
-  plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${plot_root}/combined" "${seq_len}"
+  plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${plot_root}/combined" "$(current_workload_tuple "${seq_len}")"
   plot_cmd+=(
     --skip-combined
     --expert-recompute-policies "${expert_policy}"
@@ -2703,7 +2701,7 @@ plot_memory_running_combined() {
 
   plot_root="${seq_root}/memory_plots/_combined"
   local -a plot_cmd
-  memory_combined_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${seq_len}"
+  memory_combined_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
   memory_plot_filters plot_cmd
   echo "Writing LF running source-memory combined plots: ${plot_root}"
   if ! run_tracked_command "${plot_cmd[@]}"; then
@@ -2720,7 +2718,7 @@ plot_memory_config_root() {
   plot_root="${config_root}/memory_combined"
   [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")/memory_combined"
   local -a plot_cmd
-  memory_combined_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${seq_len}"
+  memory_combined_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
   memory_plot_filters plot_cmd
   echo "Writing LF source-memory combined plots: ${plot_root}"
   if ! run_tracked_command "${plot_cmd[@]}"; then
@@ -2753,7 +2751,7 @@ This config root is organized as follows:
 - \`combined/\`: config-level LF timing and allocator-summary plots from \`profile.json\`.
 - \`memory_combined/\`: config-level source-memory breakdown plots plus per-group subfolders split by workload/backend/profiler/router/recompute/policy. If no source-memory rows were collected, this folder contains a README explaining why.
 - \`c2c_combined/\`: config-level C2C/CTC saturation plots plus per-group subfolders split by workload/backend/profiler/router/recompute/policy. If old traces lack GPU metrics, this folder contains a README explaining why.
-- \`<backend>__<profiler>__<recompute>__pol<policy>__router<mode>/b<batch>_s<seq>/\`: per-run artifacts.
+- \`<backend>__<profiler>__<recompute>__pol<policy>__router<mode>/b<batch>_s<seq>_ga<grad_accum>/\`: per-run artifacts.
 
 If \`PLOT_OUTPUT_DIR\` is set, combined plot folders are written under that external plot output root instead of this config root.
 
@@ -2789,7 +2787,7 @@ plot_interconnect_config_root() {
   plot_root="${config_root}/c2c_combined"
   [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")/c2c_combined"
   local -a plot_cmd
-  interconnect_combined_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${seq_len}"
+  interconnect_combined_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
   interconnect_plot_filters plot_cmd
   echo "Writing LF C2C combined plots: ${plot_root}"
   if ! run_tracked_command "${plot_cmd[@]}"; then
@@ -2833,7 +2831,7 @@ timing_precision_combined_cmd() {
   local output_dir="$2"
   shift 2
 
-  plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${output_dir}" "${seq_lens[@]}"
+  plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${output_dir}" "${workloads[@]}"
   _cmd_ref+=(--combined-only --expert-recompute-policies "${expert_policies[@]}")
   _cmd_ref+=("$@")
 }
@@ -2844,7 +2842,7 @@ memory_precision_combined_cmd() {
   local output_dir="$2"
   shift 2
 
-  memory_combined_plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${seq_lens[@]}"
+  memory_combined_plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${workloads[@]}"
   _cmd_ref+=("$@")
 }
 
@@ -2854,7 +2852,7 @@ interconnect_precision_combined_cmd() {
   local output_dir="$2"
   shift 2
 
-  interconnect_combined_plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${seq_lens[@]}"
+  interconnect_combined_plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${workloads[@]}"
   _cmd_ref+=("$@")
 }
 
@@ -2979,7 +2977,9 @@ for model_spec_entry in "${model_specs[@]}"; do
   fi
   echo "Using template: ${TEMPLATE} for model ${current_model_name} requesting ${current_model_gpu_count} GPU(s), recompute from backend specs"
 
-  for seq_len in "${seq_lens[@]}"; do
+  for workload in "${workloads[@]}"; do
+    IFS='|' read -r seq_len PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS <<< "${workload}"
+    batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}"
     current_dataset="${DATASET}"
     if [[ "${PREPARE_DATASETS}" == "true" ]]; then
       current_dataset="$(dataset_name_for_seq "${seq_len}")"

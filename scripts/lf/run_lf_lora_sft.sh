@@ -75,7 +75,6 @@ ASYM_CPU_ADAMW_PIN_MEMORY=${ASYM_CPU_ADAMW_PIN_MEMORY:-true}
 ASYM_CPU_ADAMW_FP32_MASTER=${ASYM_CPU_ADAMW_FP32_MASTER:-true}
 ASYM_CPU_ADAMW_GRAD_OFFLOAD=${ASYM_CPU_ADAMW_GRAD_OFFLOAD:-false}
 ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD:-false}
-ASYM_CUDA_GRAPH=${ASYM_CUDA_GRAPH:-off} # off | compile
 CHECK_ASYM_CALLS=${CHECK_ASYM_CALLS:-1}
 CHECK_TRAINABLE_SURFACE=${CHECK_TRAINABLE_SURFACE:-1}
 
@@ -376,44 +375,6 @@ case "${ASYMM_LAYER_ACT_OFFLOAD,,}" in
   0|false|no|n|off) ASYMM_LAYER_ACT_OFFLOAD=false; LAYER_ACT_OFFLOAD_TAG=layeract0 ;;
   *) echo "ASYMM_LAYER_ACT_OFFLOAD must be true or false, got '${ASYMM_LAYER_ACT_OFFLOAD}'" >&2; exit 2 ;;
 esac
-case "${ASYM_CUDA_GRAPH,,}" in
-  off|none|0|false|no|n) ASYM_CUDA_GRAPH=off ;;
-  compile|partial|inductor|1|true|yes|y|on) ASYM_CUDA_GRAPH=compile ;;
-  *) echo "ASYM_CUDA_GRAPH must be off or compile, got '${ASYM_CUDA_GRAPH}'" >&2; exit 2 ;;
-esac
-if [[ "${ASYM_CUDA_GRAPH}" == "compile" ]]; then
-  if [[ "${BACKEND}" != "asym" && "${BACKEND}" != "asym_torch" ]]; then
-    echo "ASYM_CUDA_GRAPH=compile is only supported for BACKEND=asym/asym_torch aliases; got BACKEND=${RUN_BACKEND_LABEL}" >&2
-    exit 2
-  fi
-  if [[ "${ASYMM_EXPERT_ACT_OFFLOAD}" != "false" || "${ASYMM_ATTN_ACT_OFFLOAD}" != "false" || "${ASYMM_LAYER_ACT_OFFLOAD}" != "false" ]]; then
-    echo "ASYM_CUDA_GRAPH=compile cannot be combined with activation offload; set ASYMM_EXPERT_ACT_OFFLOAD=false ASYMM_ATTN_ACT_OFFLOAD=false ASYMM_LAYER_ACT_OFFLOAD=false." >&2
-    exit 2
-  fi
-  case "${GRADIENT_CHECKPOINTING,,}" in
-    1|true|yes|y|on)
-      echo "ASYM_CUDA_GRAPH=compile requires GRADIENT_CHECKPOINTING=false because checkpoint recompute changes the captured region." >&2
-      exit 2
-      ;;
-    0|false|no|n|off) ;;
-    *) ;;
-  esac
-  if ! python3 - "${LORA_DROPOUT}" <<'PY' >/dev/null 2>&1; then
-import math
-import sys
-
-try:
-    value = float(sys.argv[1])
-except Exception:
-    raise SystemExit(1)
-raise SystemExit(0 if math.isclose(value, 0.0, abs_tol=1e-12) else 1)
-PY
-    echo "ASYM_CUDA_GRAPH=compile requires LORA_DROPOUT=0.0 so the compiled graph has deterministic control flow." >&2
-    exit 2
-  fi
-fi
-CUDA_GRAPH_TAG=""
-[[ "${ASYM_CUDA_GRAPH}" == "off" ]] || CUDA_GRAPH_TAG="_cg${ASYM_CUDA_GRAPH}"
 ATTN_GC_ENABLED=false
 if [[ "${ASYM_EXPERT_RECOMPUTE_POLICY}" == "gc-attn-exp" ]]; then
   ATTN_GC_ENABLED=true
@@ -431,9 +392,9 @@ fi
 
 if [[ "${BACKEND}" == kt_* ]]; then
   KT_BACKEND_TAG="${KT_BACKEND_INTERNAL:-none}"
-  DEFAULT_RUN_ID="${RUN_TS}_${MODEL_TAG}_${BACKEND}_${KT_BACKEND_TAG}_${KT_PRECISION}_ctx${CUTOFF_LEN}_bs${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_r${LORA_RANK}_a${LORA_ALPHA}_steps${MAX_STEPS}_${EXP_ACT_LORA_A_FWD_TAG}${CUDA_GRAPH_TAG}_qwenexpert${QWEN_EXPERT_LORA_TAG}_${PROFILE_TAG}"
+  DEFAULT_RUN_ID="${RUN_TS}_${MODEL_TAG}_${BACKEND}_${KT_BACKEND_TAG}_${KT_PRECISION}_ctx${CUTOFF_LEN}_bs${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_r${LORA_RANK}_a${LORA_ALPHA}_steps${MAX_STEPS}_${EXP_ACT_LORA_A_FWD_TAG}_qwenexpert${QWEN_EXPERT_LORA_TAG}_${PROFILE_TAG}"
 else
-  DEFAULT_RUN_ID="${RUN_TS}_${MODEL_TAG}_${RUN_BACKEND_LABEL}_${ASYM_PRECISION}_ctx${CUTOFF_LEN}_bs${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_r${LORA_RANK}_a${LORA_ALPHA}_steps${MAX_STEPS}_offload${ASYM_OFFLOAD_MODULES}_pol${EXPERT_POLICY_TAG}_router${ASYM_ROUTER_MODE}_${EXP_ACT_OFFLOAD_TAG}_${ATTN_ACT_OFFLOAD_TAG}_${EXP_ACT_LORA_A_FWD_TAG}${CUDA_GRAPH_TAG}_qwenexpert${QWEN_EXPERT_LORA_TAG}_${PROFILE_TAG}"
+  DEFAULT_RUN_ID="${RUN_TS}_${MODEL_TAG}_${RUN_BACKEND_LABEL}_${ASYM_PRECISION}_ctx${CUTOFF_LEN}_bs${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_r${LORA_RANK}_a${LORA_ALPHA}_steps${MAX_STEPS}_offload${ASYM_OFFLOAD_MODULES}_pol${EXPERT_POLICY_TAG}_router${ASYM_ROUTER_MODE}_${EXP_ACT_OFFLOAD_TAG}_${ATTN_ACT_OFFLOAD_TAG}_${EXP_ACT_LORA_A_FWD_TAG}_qwenexpert${QWEN_EXPERT_LORA_TAG}_${PROFILE_TAG}"
 fi
 RUN_ID=${RUN_ID:-${DEFAULT_RUN_ID}}
 if [[ "${BACKEND}" == kt_* ]]; then
@@ -1590,10 +1551,6 @@ case "${GRADIENT_CHECKPOINTING,,}" in
   *) echo "GRADIENT_CHECKPOINTING must be true or false" >&2; exit 2 ;;
 esac
 
-if [[ "${ASYM_CUDA_GRAPH}" == "compile" ]]; then
-  CMD_ARGS+=(--torch_compile true --torch_compile_backend inductor --torch_compile_mode reduce-overhead)
-fi
-
 if [[ "${BACKEND}" == "asym_torch" ]]; then
   CMD_ARGS+=(--use_asym_gemm true --asym_backend torch --asym_precision "${ASYM_PRECISION}")
   CMD_ARGS+=(--asym_offload_modules "${ASYM_OFFLOAD_MODULES}" --asym_strict "${ASYM_STRICT}")
@@ -1721,7 +1678,6 @@ log_kv ASYMM_ATTN_ACT_OFFLOAD "${ASYMM_ATTN_ACT_OFFLOAD}"
 log_kv ASYMM_LAYER_ACT_OFFLOAD "${ASYMM_LAYER_ACT_OFFLOAD}"
 log_kv ASYM_OFFLOAD_ACT_RECOMPUTE "${ASYM_OFFLOAD_ACT_RECOMPUTE}"
 log_kv ASYM_OFFLOAD_X_UNPACKED "${ASYM_OFFLOAD_X_UNPACKED}"
-[[ "${ASYM_CUDA_GRAPH}" == "off" ]] || log_kv ASYM_CUDA_GRAPH "${ASYM_CUDA_GRAPH}"
 log_kv ATTN_GC_ENABLED "${ATTN_GC_ENABLED}"
 log_kv LAYER_GC_ENABLED "${LAYER_GC_ENABLED}"
 if [[ "${BACKEND}" == "asym" || "${BACKEND}" == "asym_torch" ]]; then
@@ -1788,19 +1744,10 @@ RUN_ENV=(
   LF_QWEN_MOE_EXPERT_LORA_IMPL="${LF_QWEN_MOE_EXPERT_LORA_IMPL}"
   ASYM_GEMM_LF_CONFIG_QWEN_EXPERT_LORA_IMPL="${LF_QWEN_MOE_EXPERT_LORA_IMPL}"
 )
-if [[ "${ASYM_CUDA_GRAPH}" == "compile" ]]; then
-  RUN_ENV+=(
-    ASYM_CUDA_GRAPH="${ASYM_CUDA_GRAPH}"
-    ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH="${ASYM_CUDA_GRAPH}"
-  )
-fi
 if [[ -n "${TRITON_CACHE_DIR:-}" ]]; then
   RUN_ENV+=(TRITON_CACHE_DIR="${TRITON_CACHE_DIR}")
 fi
 ENV_CMD=(env)
-if [[ "${ASYM_CUDA_GRAPH}" == "off" ]]; then
-  ENV_CMD+=( -u ASYM_CUDA_GRAPH -u ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH )
-fi
 if ! { is_torch_run && [[ "${DIST_LAUNCHER}" == "deepspeed" ]]; }; then
   RUN_ENV=(CUDA_VISIBLE_DEVICES="${GPU_ID}" NVIDIA_VISIBLE_DEVICES="${GPU_ID}" "${RUN_ENV[@]}")
 else
@@ -1973,9 +1920,6 @@ if [[ "${PROFILE}" == "1" ]]; then
     ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD="${ASYM_CPU_ADAMW_GRAD_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD}"
   )
-  if [[ "${ASYM_CUDA_GRAPH}" == "compile" ]]; then
-    RUN_ENV+=(ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH="${ASYM_CUDA_GRAPH}")
-  fi
   if [[ "${BACKEND}" == kt_* ]]; then
     RUN_ENV+=(
       ASYM_GEMM_LF_CONFIG_KT_BACKEND="${KT_BACKEND_INTERNAL:-}"

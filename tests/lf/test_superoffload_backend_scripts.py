@@ -1448,8 +1448,7 @@ def test_profile_lora_lf_dry_run_accepts_superoffload(tmp_path: Path) -> None:
             "BACKEND_SPECS": "superoffload|norecompute",
             "GPU_POOL": "0,1",
             "PROFILERS": "source",
-            "SEQ_LENS": "128",
-            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
+            "WORKLOADS": "128|4|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -1497,8 +1496,7 @@ def test_profile_lora_lf_dry_run_accepts_zero3_cpuadam(tmp_path: Path) -> None:
             "BACKEND_SPECS": "zero3_cpuadam|recomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "SEQ_LENS": "128",
-            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
+            "WORKLOADS": "128|4|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -1546,8 +1544,7 @@ def test_profile_lora_lf_skips_kt_arm_nsys_without_source_ok(tmp_path: Path) -> 
             "BACKEND_SPECS": "kt_armbf16|recomp",
             "GPU_POOL": "0",
             "PROFILERS": "nsys",
-            "SEQ_LENS": "128",
-            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
+            "WORKLOADS": "128|4|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -1582,8 +1579,7 @@ def test_profile_lora_lf_skips_kt_arm_nsys_without_matching_source_profile(tmp_p
             "BACKEND_SPECS": "kt_armbf16|recomp",
             "GPU_POOL": "0",
             "PROFILERS": "nsys",
-            "SEQ_LENS": "128",
-            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
+            "WORKLOADS": "128|4|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -1606,9 +1602,9 @@ def test_profile_lora_lf_passes_matching_source_profile_to_kt_arm_nsys(tmp_path:
     source_profile = (
         output_root
         / "asym_long_sft_smoke__lora__lf__bf16"
-        / "qwen3-30b-a3b__gpus1__b4_s128_w0_s1_r64_a16_drop000"
-        / "kt_armbf16__source__recomp__polnone__routerhf__expact0__attnact0__layeract0__loraafwdhbm"
-        / "b4_s128"
+        / "qwen3-30b-a3b__gpus1__b4_s128_ga1_w0_s1_r64_a16_drop000"
+        / "kt_armbf16__source__recomp__polnone__routerhf__expact0__attnact0__layeract0__loraafwdhbm__actrecomp0__xunpack0"
+        / "b4_s128_ga1"
         / "profile.json"
     )
     source_profile.parent.mkdir(parents=True)
@@ -1621,6 +1617,7 @@ def test_profile_lora_lf_passes_matching_source_profile_to_kt_arm_nsys(tmp_path:
                     "model_name_or_path": "Qwen/Qwen3-30B-A3B",
                     "seq_len": 128,
                     "per_device_train_batch_size": 4,
+                    "gradient_accumulation_steps": 1,
                     "lora_target": "all",
                     "lora_rank": 64,
                     "lora_dropout": 0.0,
@@ -1691,8 +1688,7 @@ def test_profile_lora_lf_passes_matching_source_profile_to_kt_arm_nsys(tmp_path:
             "BACKEND_SPECS": "kt_armbf16|recomp",
             "GPU_POOL": "0",
             "PROFILERS": "nsys",
-            "SEQ_LENS": "128",
-            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
+            "WORKLOADS": "128|4|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -1734,8 +1730,7 @@ def test_profile_lora_lf_dry_run_rejects_kt_arm_large_route_rank(tmp_path: Path)
             "BACKEND_SPECS": "kt_armbf16|recomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "SEQ_LENS": "7168",
-            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
+            "WORKLOADS": "7168|4|1",
             "LORA_RANK": "64",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
@@ -1779,8 +1774,7 @@ def test_profile_lora_lf_dry_run_allows_kt_arm_large_route_rank_with_token_chunk
             "BACKEND_SPECS": "kt_armbf16|recomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "SEQ_LENS": "7168",
-            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
+            "WORKLOADS": "7168|4|1",
             "LORA_RANK": "64",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
@@ -2197,8 +2191,7 @@ def test_profile_lora_lf_rejects_zero_exit_wrong_shape_profile_after_run(tmp_pat
             "BACKEND_SPECS": "kt_armbf16|recomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "SEQ_LENS": "128",
-            "PER_DEVICE_TRAIN_BATCH_SIZE": "1",
+            "WORKLOADS": "128|1|1",
             "LORA_RANK": "8",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "5",
@@ -2238,7 +2231,7 @@ def test_profile_lora_lf_rejects_legacy_superoffload_alias(tmp_path: Path) -> No
             "BACKEND_SPECS": "ds_superoffload|norecomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "SEQ_LENS": "128",
+            "WORKLOADS": "128|1|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -2573,7 +2566,7 @@ def test_profile_lora_lf_skips_expert_policy_for_superoffload(tmp_path: Path) ->
             "BACKEND_SPECS": "superoffload|norecomp",
             "GPU_POOL": "0,1",
             "PROFILERS": "source",
-            "SEQ_LENS": "128",
+            "WORKLOADS": "128|1|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -2591,7 +2584,7 @@ def test_profile_lora_lf_skips_expert_policy_for_superoffload(tmp_path: Path) ->
     for path in output_root.rglob("jobs.tsv"):
         lines = path.read_text(encoding="utf-8").splitlines()
         rows.extend(line.split("\t") for line in lines[1:] if line.strip())
-    assert sum(1 for row in rows if len(row) > 6 and row[6] == "superoffload") == 1
+    assert sum(1 for row in rows if len(row) > 8 and row[8] == "superoffload") == 1
 
 
 def test_profile_lora_lf_keeps_superoffload_recompute_modes(tmp_path: Path) -> None:
@@ -2613,7 +2606,7 @@ def test_profile_lora_lf_keeps_superoffload_recompute_modes(tmp_path: Path) -> N
             "BACKEND_SPECS": "superoffload|both",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "SEQ_LENS": "128",
+            "WORKLOADS": "128|1|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",

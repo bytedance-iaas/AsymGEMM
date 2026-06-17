@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import json
 import math
+import pickle
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +47,10 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writeheader()
         if fieldnames:
             writer.writerows(rows)
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
 
 
 def _fmt_ms(value: Any) -> str:
@@ -364,6 +371,331 @@ def _asym_cpu_adamw_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
         return []
     row = {key: value for key, value in cpuadamw.items() if not isinstance(value, (dict, list))}
     return [row] if row else []
+
+
+_RUNTIME_COUNT_KEYS = (
+    "asym_forward_calls",
+    "asym_dx_calls",
+    "forward_calls_total",
+    "backward_calls_total",
+    "calls_total",
+    "torch_forward_calls",
+    "torch_dx_calls",
+    "reference_fallback_count",
+    "expact_lora_a_forward_grouped_calls",
+    "expact_lora_a_forward_cpu_left_grouped_calls",
+    "expact_lora_a_forward_hbm_grouped_calls",
+)
+
+
+def _measured_steps(profile: dict[str, Any]) -> int | None:
+    timing = _trainer_timing(profile)
+    value = _int_value(timing.get("measured_steps")) if isinstance(timing, dict) else None
+    if value is not None and value > 0:
+        return value
+    config = profile.get("config", {})
+    if isinstance(config, dict):
+        value = _int_value(config.get("measure_steps", config.get("max_steps")))
+        if value is not None and value > 0:
+            return value
+    rows = profile.get("step_samples", {}).get("rows", [])
+    if isinstance(rows, list):
+        measured = {
+            _int_value(row.get("measured_step"))
+            for row in rows
+            if isinstance(row, dict) and not row.get("is_warmup")
+        }
+        measured.discard(None)
+        if measured:
+            return len(measured)
+    return None
+
+
+def _parse_bool_text(value: str) -> bool | str:
+    lowered = value.strip().lower()
+    if lowered in {"true", "1", "yes", "y", "on"}:
+        return True
+    if lowered in {"false", "0", "no", "n", "off"}:
+        return False
+    return value
+
+
+def _parse_fallback_reasons(value: str) -> dict[str, int]:
+    value = value.strip()
+    if not value or value == "none":
+        return {}
+    reasons: dict[str, int] = {}
+    for part in value.split(";"):
+        if not part:
+            continue
+        key, sep, raw_count = part.partition(":")
+        if not sep:
+            continue
+        count = _int_value(raw_count)
+        reasons[key] = int(count or 0)
+    return reasons
+
+
+def _runtime_train_log_path(profile: dict[str, Any]) -> Path | None:
+    for container_name in ("trainer", "config"):
+        container = profile.get(container_name)
+        if isinstance(container, dict):
+            for key in ("train_log", "log", "log_file"):
+                value = str(container.get(key) or "").strip()
+                if value:
+                    path = Path(value)
+                    if path.is_file():
+                        return path
+    config = profile.get("config", {})
+    output_dir = str(config.get("output_dir") or "").strip() if isinstance(config, dict) else ""
+    if output_dir:
+        candidate = Path(output_dir).parent / "train.log"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _runtime_counters_from_train_log(profile: dict[str, Any]) -> dict[str, Any]:
+    path = _runtime_train_log_path(profile)
+    if path is None:
+        return {"available": False, "reason": "no train_log path available"}
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"available": False, "reason": f"failed to read train_log: {exc}"}
+    matches = re.findall(r"AsymGEMM LoRA-SFT runtime:\s*(.*)", text)
+    if not matches:
+        return {"available": False, "reason": f"no AsymGEMM runtime line in {path}"}
+    row: dict[str, Any] = {"available": True, "source": "train_log", "train_log": str(path)}
+    for field in re.split(r",\s*", matches[-1].strip()):
+        key, sep, value = field.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        value = value.strip()
+        if key == "fallback_reasons":
+            row[key] = _parse_fallback_reasons(value)
+            continue
+        int_value = _int_value(value)
+        row[key] = int_value if int_value is not None else _parse_bool_text(value)
+    return row
+
+
+def _runtime_counters(profile: dict[str, Any]) -> dict[str, Any]:
+    existing = profile.get("runtime_counters")
+    if isinstance(existing, dict) and existing:
+        return dict(existing)
+    stats = profile.get("asym_execution_stats")
+    if isinstance(stats, dict) and stats and stats.get("available") is not False:
+        counters = {
+            key: value
+            for key, value in stats.items()
+            if not isinstance(value, list) and key not in {"rows"}
+        }
+        counters["available"] = True
+        counters["source"] = counters.get("source") or "asym_execution_stats"
+    else:
+        counters = _runtime_counters_from_train_log(profile)
+        if not counters.get("available"):
+            if isinstance(stats, dict) and stats.get("available") is False:
+                counters["reason"] = str(stats.get("reason") or counters.get("reason") or "asym_execution_stats unavailable")
+            return counters
+
+    config = profile.get("config", {})
+    if isinstance(config, dict):
+        counters.setdefault("expert_recompute_policy", config.get("expert_recompute_policy", config.get("expert_policy_label", "")))
+        counters.setdefault("router_mode", config.get("router_mode", ""))
+        counters.setdefault("asymm_expert_act_offload", config.get("asymm_expert_act_offload", ""))
+        counters.setdefault("asymm_attn_act_offload", config.get("asymm_attn_act_offload", ""))
+        counters.setdefault("asymm_layer_act_offload", config.get("asymm_layer_act_offload", ""))
+    measured_steps = _measured_steps(profile)
+    if measured_steps is not None:
+        counters["measured_steps"] = measured_steps
+        for key in _RUNTIME_COUNT_KEYS:
+            value = _int_value(counters.get(key))
+            if value is not None:
+                counters[f"{key}_per_measured_step"] = float(value) / float(measured_steps)
+    fallback_reasons = counters.get("fallback_reasons")
+    if fallback_reasons is None:
+        counters["fallback_reasons"] = {}
+    elif not isinstance(fallback_reasons, dict):
+        counters["fallback_reasons"] = _parse_fallback_reasons(str(fallback_reasons))
+    return counters
+
+
+def _runtime_counter_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    counters = _runtime_counters(profile)
+    row = {
+        key: (json.dumps(value, sort_keys=True) if isinstance(value, dict) else value)
+        for key, value in counters.items()
+        if not isinstance(value, list)
+    }
+    return [row] if row else []
+
+
+def _load_snapshot_analyzer():
+    analyzer_path = _repo_root() / "scripts/testing/analyze_cuda_memory_snapshot.py"
+    spec = importlib.util.spec_from_file_location("analyze_cuda_memory_snapshot_for_postprocess", analyzer_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load snapshot analyzer from {analyzer_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    analyze_snapshot = getattr(module, "analyze_snapshot", None)
+    if not callable(analyze_snapshot):
+        raise RuntimeError(f"snapshot analyzer missing analyze_snapshot: {analyzer_path}")
+    return analyze_snapshot
+
+
+def _snapshot_source_peak_bytes(profile: dict[str, Any]) -> int | None:
+    memory = profile.get("memory", {})
+    gpu = memory.get("gpu", {}) if isinstance(memory, dict) else {}
+    value = _int_value(gpu.get("peak_allocated_hbm_bytes"))
+    if value is not None:
+        return value
+    summary = _memory_breakdown_summary(profile)
+    for key in ("actual_peak_allocated_hbm_bytes", "peak_allocated_hbm_bytes"):
+        value = _int_value(summary.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _snapshot_replay_markdown(report: dict[str, Any]) -> str:
+    validation = report.get("validation", {}) if isinstance(report.get("validation"), dict) else {}
+    lines = [
+        "# CUDA Memory Snapshot Peak Attribution",
+        "",
+        f"- snapshot: `{report.get('snapshot_path', '')}`",
+        f"- replayed peak live bytes: `{report.get('peak_live_bytes', '-')}`",
+        f"- source peak allocated bytes: `{validation.get('source_peak_allocated_hbm_bytes', '-')}`",
+        f"- replay/source delta bytes: `{validation.get('replay_source_peak_delta_bytes', '-')}`",
+        f"- unknown free events: `{report.get('unknown_free_events', '-')}`",
+        f"- event count: `{report.get('event_count', '-')}`",
+        f"- configured max entries: `{validation.get('configured_max_entries', '-')}`",
+        "",
+    ]
+    warnings = validation.get("warnings", [])
+    if isinstance(warnings, list) and warnings:
+        lines += ["## Warnings", ""]
+        lines.extend(f"- {warning}" for warning in warnings)
+        lines.append("")
+    lines += ["## Components", "", "| component | bytes | blocks |", "|---|---:|---:|"]
+    for row in _as_rows(report.get("bucket_rows", [])):
+        lines.append(f"| {row.get('component', '-')} | {row.get('bytes', '-')} | {row.get('blocks', '-')} |")
+    lines += ["", "## Top Frames", "", "| frame | bytes | blocks |", "|---|---:|---:|"]
+    for row in _as_rows(report.get("frame_rows", [])):
+        lines.append(f"| {row.get('frame', '-')} | {row.get('bytes', '-')} | {row.get('blocks', '-')} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _snapshot_validation_csv_row(validation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: json.dumps(value, sort_keys=True) if isinstance(value, (dict, list)) else value
+        for key, value in validation.items()
+    }
+
+
+def _write_snapshot_report(output_dir: Path, report: dict[str, Any]) -> None:
+    (output_dir / "peak_snapshot_attrib_allblocks.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (output_dir / "peak_snapshot_attrib_allblocks.md").write_text(
+        _snapshot_replay_markdown(report), encoding="utf-8"
+    )
+    validation = report.get("validation", {})
+    if isinstance(validation, dict) and validation:
+        _write_csv(output_dir / "peak_snapshot_attrib_allblocks_validation.csv", [_snapshot_validation_csv_row(validation)])
+
+
+def _snapshot_replay_validation(profile: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+    snapshot = profile.get("memory_snapshot", {})
+    source_peak = _snapshot_source_peak_bytes(profile)
+    replay_peak = _int_value(report.get("peak_live_bytes"))
+    max_entries = _int_value(snapshot.get("max_entries")) if isinstance(snapshot, dict) else None
+    event_count = _int_value(report.get("event_count"))
+    delta = replay_peak - source_peak if replay_peak is not None and source_peak is not None else None
+    warnings: list[str] = []
+    unknown_frees = _int_value(report.get("unknown_free_events")) or 0
+    if unknown_frees:
+        warnings.append(f"snapshot replay saw {unknown_frees} unknown frees")
+    if delta is not None and abs(delta) > int(0.25 * 1024**3):
+        warnings.append("snapshot replay peak differs from source peak by more than 0.25 GiB")
+    if max_entries is not None and event_count is not None and event_count >= max_entries:
+        warnings.append("snapshot event count reached configured max entries")
+    return {
+        "source_peak_allocated_hbm_bytes": source_peak,
+        "replayed_peak_live_bytes": replay_peak,
+        "replay_source_peak_delta_bytes": delta,
+        "unknown_free_events": unknown_frees,
+        "event_count": event_count,
+        "configured_max_entries": max_entries,
+        "warnings": warnings,
+        "passed": not warnings,
+    }
+
+
+def _write_snapshot_replay_artifacts(profile: dict[str, Any], output_dir: Path) -> None:
+    snapshot = profile.get("memory_snapshot", {})
+    if not isinstance(snapshot, dict) or not snapshot.get("enabled"):
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if not snapshot.get("dumped"):
+        validation = {
+            "available": False,
+            "reason": snapshot.get("error") or "snapshot was enabled but no pickle was dumped",
+            "warnings": ["snapshot missing even though memory_snapshot was enabled"],
+            "passed": False,
+        }
+        report = {"available": False, "validation": validation}
+        _write_snapshot_report(output_dir, report)
+        profile["memory_snapshot_analysis"] = report
+        return
+    snapshot_path = Path(str(snapshot.get("path") or ""))
+    if not snapshot_path.is_file():
+        validation = {
+            "available": False,
+            "snapshot_path": str(snapshot_path),
+            "reason": "snapshot path is missing",
+            "warnings": ["snapshot missing even though memory_snapshot was enabled"],
+            "passed": False,
+        }
+        report = {"available": False, "snapshot_path": str(snapshot_path), "validation": validation}
+        _write_snapshot_report(output_dir, report)
+        profile["memory_snapshot_analysis"] = report
+        return
+
+    try:
+        with snapshot_path.open("rb") as handle:
+            snapshot_payload = pickle.load(handle)
+        if not isinstance(snapshot_payload, dict):
+            raise ValueError("snapshot root must be a dict")
+        analyze_snapshot = _load_snapshot_analyzer()
+        report = analyze_snapshot(snapshot_payload, device=None, top=40, min_bytes=0)
+    except Exception as exc:
+        validation = {
+            "available": False,
+            "snapshot_path": str(snapshot_path),
+            "reason": repr(exc),
+            "warnings": ["snapshot analyzer failed"],
+            "passed": False,
+        }
+        report = {"available": False, "snapshot_path": str(snapshot_path), "validation": validation}
+        _write_snapshot_report(output_dir, report)
+        profile["memory_snapshot_analysis"] = report
+        return
+
+    report = dict(report)
+    report["snapshot_path"] = str(snapshot_path)
+    validation = _snapshot_replay_validation(profile, report)
+    validation["available"] = True
+    validation["snapshot_path"] = str(snapshot_path)
+    report["validation"] = validation
+    profile["memory_snapshot_analysis"] = report
+    _write_snapshot_report(output_dir, report)
+    _write_csv(output_dir / "peak_snapshot_attrib_allblocks_components.csv", _as_rows(report.get("bucket_rows", [])))
+    _write_csv(output_dir / "peak_snapshot_attrib_allblocks_frames.csv", _as_rows(report.get("frame_rows", [])))
 
 
 def _source_profile_for_artifacts(profile: dict[str, Any]) -> dict[str, Any]:
@@ -809,6 +1141,9 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
     process_memory = _process_memory(profile)
     process_memory_rows = _process_memory_rows(profile)
     timing = _trainer_timing(profile)
+    runtime_counters = profile.get("runtime_counters")
+    if not isinstance(runtime_counters, dict):
+        runtime_counters = _runtime_counters(profile)
     forward_ms = _float_value(profile.get("forward", {}).get("total_milliseconds"))
     backward_ms = _float_value(profile.get("backward", {}).get("total_milliseconds"))
     forward_backward_ms = forward_ms + backward_ms if forward_ms is not None and backward_ms is not None else None
@@ -873,6 +1208,25 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
         f"Trainer log: `{trainer.get('trainer_log', '')}`",
         "",
     ]
+    if runtime_counters:
+        lines += [
+            "## AsymGEMM Runtime Counters",
+            "",
+            "| Metric | Value |",
+            "|---|---:|",
+            f"| available | {runtime_counters.get('available', '-')} |",
+            f"| source | {runtime_counters.get('source', '-')} |",
+            f"| measured steps | {runtime_counters.get('measured_steps', '-')} |",
+            f"| asym forward calls | {runtime_counters.get('asym_forward_calls', '-')} |",
+            f"| asym dX calls | {runtime_counters.get('asym_dx_calls', '-')} |",
+            f"| torch forward calls | {runtime_counters.get('torch_forward_calls', '-')} |",
+            f"| torch dX calls | {runtime_counters.get('torch_dx_calls', '-')} |",
+            f"| reference fallback count | {runtime_counters.get('reference_fallback_count', '-')} |",
+            f"| fallback reasons | {json.dumps(runtime_counters.get('fallback_reasons', {}), sort_keys=True)} |",
+            f"| asym forward calls / measured step | {_fmt_ms(runtime_counters.get('asym_forward_calls_per_measured_step'))} |",
+            f"| asym dX calls / measured step | {_fmt_ms(runtime_counters.get('asym_dx_calls_per_measured_step'))} |",
+            "",
+        ]
     if process_memory:
         lines += [
             "## Process Memory",
@@ -1303,6 +1657,19 @@ def _source_memory_breakdown_markdown(profile: dict[str, Any], *, top_level: boo
         ]
         if snapshot.get("error"):
             lines.append(f"- error: `{snapshot.get('error')}`")
+    analysis = profile.get("memory_snapshot_analysis", {})
+    if isinstance(analysis, dict) and analysis:
+        validation = analysis.get("validation", analysis)
+        if isinstance(validation, dict):
+            lines += [
+                f"- replayed peak live bytes: `{validation.get('replayed_peak_live_bytes', analysis.get('peak_live_bytes', '-'))}`",
+                f"- replay/source peak delta bytes: `{validation.get('replay_source_peak_delta_bytes', '-')}`",
+                f"- unknown free events: `{validation.get('unknown_free_events', analysis.get('unknown_free_events', '-'))}`",
+                f"- validation passed: `{validation.get('passed', '-')}`",
+            ]
+            warnings = validation.get("warnings", [])
+            if isinstance(warnings, list) and warnings:
+                lines.append(f"- warnings: `{'; '.join(str(warning) for warning in warnings)}`")
     lines.append("")
     return "\n".join(lines)
 
@@ -1680,6 +2047,14 @@ def _write_source_artifacts(source_profile_json: Path, output_dir: Path, profile
         profile["optimizer_memory"]["kt_lora_update_health"] = kt_lora_health
     _install_augmented_step_samples(profile)
     output_dir.mkdir(parents=True, exist_ok=True)
+    runtime_counters = _runtime_counters(profile)
+    if runtime_counters:
+        profile["runtime_counters"] = runtime_counters
+        _write_csv(output_dir / "runtime_counters.csv", _runtime_counter_rows(profile))
+        (output_dir / "runtime_counters.json").write_text(
+            json.dumps(runtime_counters, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    _write_snapshot_replay_artifacts(profile, output_dir)
     target_profile = profile_json or output_dir / "profile.json"
     target_profile.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     summary = _source_summary_markdown(profile)
@@ -1734,8 +2109,16 @@ def _write_profile_csv_artifacts(profile_json: Path, output_dir: Path) -> None:
     if kt_lora_health and isinstance(source_profile.get("optimizer_memory"), dict):
         source_profile["optimizer_memory"]["kt_lora_update_health"] = kt_lora_health
     _install_augmented_step_samples(source_profile)
-    profile_json.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     output_dir.mkdir(parents=True, exist_ok=True)
+    runtime_counters = _runtime_counters(source_profile)
+    if runtime_counters:
+        source_profile["runtime_counters"] = runtime_counters
+        _write_csv(output_dir / "runtime_counters.csv", _runtime_counter_rows(source_profile))
+        (output_dir / "runtime_counters.json").write_text(
+            json.dumps(runtime_counters, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    _write_snapshot_replay_artifacts(source_profile, output_dir)
+    profile_json.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     stage_rows = _timing_by_stage(profile)
     op_rows = _timing_by_op(profile)
     _write_csv(output_dir / "timing_by_stage.csv", stage_rows)

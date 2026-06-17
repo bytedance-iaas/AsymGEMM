@@ -15,7 +15,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 MIB = 1024.0**2
-FLAT_SEQ_RE = re.compile(r"^(?:b(?P<batch_size>[0-9]+)_)?s(?P<seq_len>[0-9]+)$")
+FLAT_SEQ_RE = re.compile(r"^b(?P<batch_size>[0-9]+)_s(?P<seq_len>[0-9]+)_ga(?P<grad_accum>[0-9]+)$")
 PROFILERS = ("source", "nsys", "cpu", "ncu")
 BACKENDS = (
     "torch",
@@ -208,8 +208,7 @@ def parse_args() -> argparse.Namespace:
         choices=["norecomp", "recomp"],
         help="Activation recompute mode to include. Repeat for both.",
     )
-    parser.add_argument("--batch-size", action="append", type=int, default=[])
-    parser.add_argument("--seq-lens", nargs="+", type=int, default=[])
+    parser.add_argument("--workloads", nargs="+", default=[])
     parser.add_argument(
         "--expert-recompute-policies",
         nargs="+",
@@ -248,6 +247,20 @@ def split_tokens(values: list[str]) -> list[str]:
     for value in values:
         tokens.extend(part.strip() for part in str(value).split(",") if part.strip())
     return tokens
+
+
+def apply_workload_filters(args: argparse.Namespace) -> None:
+    workload_tuples: set[tuple[int, int, int]] = set()
+    for workload in split_tokens(list(args.workloads)):
+        fields = workload.split("|")
+        if len(fields) != 3 or not all(field.isdigit() and int(field) > 0 for field in fields):
+            raise SystemExit(
+                "--workloads items must be seq_len|per_device_batch_size|gradient_accumulation_steps, "
+                f"got {workload!r}"
+            )
+        seq_len, batch_size, grad_accum = (int(field) for field in fields)
+        workload_tuples.add((seq_len, batch_size, grad_accum))
+    args.workload_tuples = workload_tuples
 
 
 def resolve_path(path: Path) -> Path:
@@ -418,6 +431,7 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
         "precision": precision_from_path(path),
         "batch_size": batch_size,
         "seq_len": int(seq_match.group("seq_len")),
+        "gradient_accumulation_steps": int(seq_match.group("grad_accum")),
         "mode": "recompute" if recompute == "recomp" else "no_recompute",
         "activation_recompute": recompute == "recomp",
         "asymm_expert_act_offload": expact_value,
@@ -707,10 +721,14 @@ def passes_filters(args: argparse.Namespace, meta: dict[str, Any]) -> bool:
         return False
     if recompute_modes and meta["mode"] not in recompute_modes:
         return False
-    if args.batch_size and int(meta["batch_size"]) != 0 and meta["batch_size"] not in set(args.batch_size):
-        return False
-    if args.seq_lens and meta["seq_len"] not in set(args.seq_lens):
-        return False
+    if getattr(args, "workload_tuples", set()):
+        workload_tuple = (
+            int(meta["seq_len"]),
+            int(meta["batch_size"]),
+            int(meta["gradient_accumulation_steps"]),
+        )
+        if workload_tuple not in args.workload_tuples:
+            return False
     policy_values = split_tokens(list(args.expert_recompute_policies))
     if policy_values:
         parsed_policy_filter = [parse_expert_policy_spec(value) for value in policy_values]
@@ -736,15 +754,14 @@ def skip_search_path(path: Path, input_root: Path) -> bool:
 
 def result_dirs(input_root: Path) -> list[Path]:
     flat_dirs = []
-    for pattern in ("s*", "b*_s*"):
-        for path in input_root.rglob(pattern):
-            if not path.is_dir() or FLAT_SEQ_RE.match(path.name) is None or skip_search_path(path, input_root):
-                continue
-            meta = parse_result_dir(path)
-            if meta is None:
-                continue
-            if profile_json_path(path, str(meta.get("profiler", ""))) is not None:
-                flat_dirs.append(path)
+    for path in input_root.rglob("b*_s*_ga*"):
+        if not path.is_dir() or FLAT_SEQ_RE.match(path.name) is None or skip_search_path(path, input_root):
+            continue
+        meta = parse_result_dir(path)
+        if meta is None:
+            continue
+        if profile_json_path(path, str(meta.get("profiler", ""))) is not None:
+            flat_dirs.append(path)
     return sorted(set(flat_dirs))
 
 
@@ -764,11 +781,16 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
     if not isinstance(memory_gpu, dict):
         memory_gpu = {}
     batch_size = int(config.get("batch_size", meta["batch_size"]))
+    gradient_accumulation_steps = int(
+        config.get("gradient_accumulation_steps") or meta["gradient_accumulation_steps"]
+    )
     lora_dropout = optional_float(config.get("lora_dropout"))
     if lora_dropout is None:
         lora_dropout = 0.0
-    if args.batch_size and batch_size not in set(args.batch_size):
-        return None
+    if getattr(args, "workload_tuples", set()):
+        workload_tuple = (int(meta["seq_len"]), batch_size, gradient_accumulation_steps)
+        if workload_tuple not in args.workload_tuples:
+            return None
     route_stats = first_dict(profile, "expert_token_distribution")
     threshold_effect = route_stats.get("threshold_effect", {})
     if not isinstance(threshold_effect, dict):
@@ -842,6 +864,7 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         "model_gpus": meta.get("model_gpus", ""),
         "precision": meta["precision"],
         "batch_size": batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
         "lora_dropout": lora_dropout,
         "seq_len": int(meta["seq_len"]),
         "logical_tokens": int(config.get("logical_tokens", batch_size * int(meta["seq_len"]))),
@@ -1260,6 +1283,7 @@ def group_key(row: dict[str, Any]) -> tuple[str, ...]:
         str(row["workload"]),
         str(row["precision"]),
         int(row["batch_size"]),
+        int(row["gradient_accumulation_steps"]),
         numeric_float(row.get("lora_dropout")),
         str(row["backend"]),
         str(row["router_mode"]),
@@ -1274,6 +1298,7 @@ def threshold_group_key(row: dict[str, Any]) -> tuple[str, ...]:
         str(row["workload"]),
         str(row["precision"]),
         int(row["batch_size"]),
+        int(row["gradient_accumulation_steps"]),
         numeric_float(row.get("lora_dropout")),
         int(row["seq_len"]),
         str(row["backend"]),
@@ -1285,23 +1310,25 @@ def threshold_group_key(row: dict[str, Any]) -> tuple[str, ...]:
 
 
 def varied_fields(rows: list[dict[str, Any]]) -> set[str]:
-    fields = ("workload", "precision", "batch_size", "lora_dropout", "backend", "router_mode", "expact", "attnact", "profiler", "mode")
+    fields = ("workload", "precision", "batch_size", "gradient_accumulation_steps", "lora_dropout", "backend", "router_mode", "expact", "attnact", "profiler", "mode")
     return {field for field in fields if len({row[field] for row in rows}) > 1}
 
 
 def varied_threshold_fields(rows: list[dict[str, Any]]) -> set[str]:
-    fields = ("workload", "precision", "batch_size", "lora_dropout", "seq_len", "backend", "router_mode", "expact", "attnact", "profiler", "mode")
+    fields = ("workload", "precision", "batch_size", "gradient_accumulation_steps", "lora_dropout", "seq_len", "backend", "router_mode", "expact", "attnact", "profiler", "mode")
     return {field for field in fields if len({row[field] for row in rows}) > 1}
 
 
 def combined_label(group: tuple[str, ...], mode: str, varied: set[str]) -> str:
-    workload, precision, batch_size, lora_dropout, backend, router_mode, expact, attnact, profiler = group
+    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, profiler = group
     mode_labels = {"no_recompute": "No recompute", "recompute": "Activation recompute"}
     parts: list[str] = []
     if "workload" in varied:
         parts.append(workload)
     if "batch_size" in varied:
         parts.append(f"b{batch_size}")
+    if "gradient_accumulation_steps" in varied:
+        parts.append(f"ga{grad_accum}")
     if "lora_dropout" in varied:
         parts.append(dropout_label(lora_dropout))
     if "precision" in varied:
@@ -1324,13 +1351,15 @@ def combined_label(group: tuple[str, ...], mode: str, varied: set[str]) -> str:
 
 
 def combined_threshold_label(group: tuple[str, ...], mode: str, varied: set[str]) -> str:
-    workload, precision, batch_size, lora_dropout, seq_len, backend, router_mode, expact, attnact, profiler = group
+    workload, precision, batch_size, grad_accum, lora_dropout, seq_len, backend, router_mode, expact, attnact, profiler = group
     mode_labels = {"no_recompute": "No layer recompute", "recompute": "Layer recompute"}
     parts: list[str] = []
     if "workload" in varied:
         parts.append(workload)
     if "batch_size" in varied:
         parts.append(f"b{batch_size}")
+    if "gradient_accumulation_steps" in varied:
+        parts.append(f"ga{grad_accum}")
     if "lora_dropout" in varied:
         parts.append(dropout_label(lora_dropout))
     if "seq_len" in varied:
@@ -2386,9 +2415,9 @@ def plot_combined_policy_metric(
 
 
 def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, ...]) -> None:
-    workload, precision, batch_size, lora_dropout, backend, router_mode, expact, attnact, profiler = key
+    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, profiler = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}"
+    suffix = f", batch size {batch_size}, grad accum {grad_accum}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}"
     plot_paired_metric(
         rows,
         output_dir,
@@ -2440,9 +2469,9 @@ def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[s
 def write_group_step_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, ...]) -> None:
     if not rows:
         return
-    workload, precision, batch_size, lora_dropout, backend, router_mode, expact, attnact, profiler = key
+    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, profiler = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}"
+    suffix = f", batch size {batch_size}, grad accum {grad_accum}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}"
     write_table(rows, output_dir, "step_samples")
     plot_paired_step_metric(
         rows,
@@ -2483,9 +2512,9 @@ def write_group_threshold_plots(
     key: tuple[str, ...],
     seq_len: int,
 ) -> None:
-    workload, precision, batch_size, lora_dropout, backend, router_mode, expact, attnact, profiler = key
+    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, profiler = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}"
+    suffix = f", batch size {batch_size}, grad accum {grad_accum}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}"
     plot_paired_threshold_metric(
         rows,
         output_dir,
@@ -2541,9 +2570,9 @@ def write_group_policy_plots(
     seq_len: int,
     family: str,
 ) -> None:
-    workload, precision, batch_size, lora_dropout, backend, router_mode, expact, attnact, profiler = key
+    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, profiler = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}"
+    suffix = f", batch size {batch_size}, grad accum {grad_accum}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}"
     name = policy_filename_suffix(family)
     title = {
         "tok": "expert token threshold",
@@ -2832,6 +2861,7 @@ def write_combined_policy_plots(rows: list[dict[str, Any]], output_dir: Path, fa
 
 def main() -> None:
     args = parse_args()
+    apply_workload_filters(args)
     if args.skip_combined and args.combined_only:
         raise SystemExit("--skip-combined and --combined-only cannot be used together")
     rows = collect_rows(args)
@@ -2888,9 +2918,9 @@ def main() -> None:
         for key in sorted(set(groups) | set(step_groups)):
             group_rows = groups.get(key, [])
             group_step_rows = step_groups.get(key, [])
-            workload, precision, batch_size, lora_dropout, backend, router_mode, expact, attnact, profiler = key
+            workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, profiler = key
             group_dir = root / safe_label(
-                f"{workload}-b{batch_size}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}"
+                f"{workload}-b{batch_size}-ga{grad_accum}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}"
             )
             if group_rows:
                 write_table(group_rows, group_dir, "sweep_summary")
@@ -2912,9 +2942,9 @@ def main() -> None:
             family_groups.setdefault((group_key(row), int(row["seq_len"])), []).append(row)
         suffix = policy_filename_suffix(family)
         for (key, seq_len), group_rows in sorted(family_groups.items()):
-            workload, precision, batch_size, lora_dropout, backend, router_mode, expact, attnact, profiler = key
+            workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, profiler = key
             group_dir = root / safe_label(
-                f"{workload}-b{batch_size}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}"
+                f"{workload}-b{batch_size}-ga{grad_accum}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}"
             )
             write_table(group_rows, group_dir, f"{suffix}_summary_s{seq_len}")
             write_group_policy_plots(group_rows, group_dir, key, seq_len, family)

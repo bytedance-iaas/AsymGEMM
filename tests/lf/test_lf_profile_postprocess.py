@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import csv
 import json
+import pickle
 import subprocess
 import sys
 from pathlib import Path
@@ -35,11 +36,14 @@ def _write_source_profile(
     optimizer_memory: dict | None = None,
     optimizer_memory_preflight: dict | None = None,
     process_memory: dict | None = None,
+    memory_gpu: dict | None = None,
+    memory_snapshot: dict | None = None,
     stage_memory_rows: list[dict] | None = None,
     trainer_timing: dict | None = None,
     step_rows: list[dict] | None = None,
     step_sample_rows: list[dict] | None = None,
     heartbeat_jsonl: Path | None = None,
+    asym_execution_stats: dict | None = None,
 ) -> None:
     path.write_text(
         json.dumps(
@@ -53,7 +57,8 @@ def _write_source_profile(
                     "warmup_steps": 0,
                     "measure_steps": 1,
                 },
-                "memory": {"gpu": {}, "process": process_memory or {}},
+                "memory": {"gpu": memory_gpu or {}, "process": process_memory or {}},
+                "memory_snapshot": memory_snapshot or {},
                 "trainer": {"trainer_log": str(trainer_log or "")},
                 "heartbeat": {"jsonl": str(heartbeat_jsonl or "")},
                 "step_samples": {"rows": step_sample_rows or []},
@@ -72,6 +77,7 @@ def _write_source_profile(
                 "grad_clip": grad_clip or {},
                 "optimizer_memory_preflight": optimizer_memory_preflight or {},
                 "optimizer_memory": optimizer_memory or {},
+                "asym_execution_stats": asym_execution_stats or {},
             }
         )
         + "\n",
@@ -1908,6 +1914,130 @@ def test_source_summary_and_csv_include_process_memory(tmp_path: Path) -> None:
     assert "step.forward" in csv_text
     assert "optimizer_step_after" in csv_text
     assert "process_rss_delta_bytes" in csv_text
+
+
+def test_postprocess_writes_runtime_counter_artifacts(tmp_path: Path) -> None:
+    source_profile = tmp_path / "source_profile.json"
+    output_dir = tmp_path / "out"
+    _write_source_profile(
+        source_profile,
+        kt={"available": True, "wrapper_count": 0, "total_forward_calls": 0, "total_backward_calls": 0},
+        lora={"available": True, "trainable_parameters": 10},
+        trainer_timing={"available": True, "source": "heartbeat_dataloader_interval", "measured_steps": 2},
+        asym_execution_stats={
+            "available": True,
+            "source": "model",
+            "asym_forward_calls": 10,
+            "asym_dx_calls": 6,
+            "torch_forward_calls": 0,
+            "torch_dx_calls": 0,
+            "reference_fallback_count": 0,
+            "fallback_reasons": {},
+        },
+    )
+
+    subprocess.run(
+        [
+            sys.executable,
+            "scripts/lf/postprocess_lf_profile_artifacts.py",
+            "--source-profile-json",
+            str(source_profile),
+            "--output-dir",
+            str(output_dir),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+
+    counters = json.loads((output_dir / "runtime_counters.json").read_text(encoding="utf-8"))
+    assert counters["available"] is True
+    assert counters["asym_forward_calls"] == 10
+    assert counters["torch_forward_calls"] == 0
+    assert counters["asym_forward_calls_per_measured_step"] == pytest.approx(5.0)
+    csv_text = (output_dir / "runtime_counters.csv").read_text(encoding="utf-8")
+    assert "reference_fallback_count" in csv_text
+    assert "asym_dx_calls_per_measured_step" in csv_text
+    profile = json.loads((output_dir / "profile.json").read_text(encoding="utf-8"))
+    assert profile["runtime_counters"]["asym_dx_calls_per_measured_step"] == pytest.approx(3.0)
+    assert "## AsymGEMM Runtime Counters" in (output_dir / "summary.md").read_text(encoding="utf-8")
+
+
+def test_postprocess_replays_memory_snapshot_artifacts(tmp_path: Path) -> None:
+    snapshot_path = tmp_path / "memory_snapshot.pickle"
+    with snapshot_path.open("wb") as handle:
+        pickle.dump(
+            {
+                "device_traces": [
+                    [
+                        {
+                            "action": "alloc",
+                            "addr": 0x10,
+                            "size": 100,
+                            "frames": [
+                                {
+                                    "filename": "/repo/asym_gemm/training/qwen3_moe.py",
+                                    "name": "expert_forward",
+                                    "line": 10,
+                                }
+                            ],
+                        },
+                        {
+                            "action": "alloc",
+                            "addr": 0x20,
+                            "size": 200,
+                            "frames": [
+                                {
+                                    "filename": "/repo/modeling_qwen3.py",
+                                    "name": "self_attn_forward",
+                                    "line": 20,
+                                }
+                            ],
+                        },
+                    ]
+                ]
+            },
+            handle,
+        )
+    source_profile = tmp_path / "source_profile.json"
+    output_dir = tmp_path / "out"
+    _write_source_profile(
+        source_profile,
+        kt={"available": True, "wrapper_count": 0, "total_forward_calls": 0, "total_backward_calls": 0},
+        lora={"available": True, "trainable_parameters": 10},
+        memory_gpu={"peak_allocated_hbm_bytes": 300},
+        memory_snapshot={
+            "enabled": True,
+            "record_started": True,
+            "dumped": True,
+            "path": str(snapshot_path),
+            "max_entries": 100,
+        },
+    )
+
+    subprocess.run(
+        [
+            sys.executable,
+            "scripts/lf/postprocess_lf_profile_artifacts.py",
+            "--source-profile-json",
+            str(source_profile),
+            "--output-dir",
+            str(output_dir),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+
+    report = json.loads((output_dir / "peak_snapshot_attrib_allblocks.json").read_text(encoding="utf-8"))
+    assert report["peak_live_bytes"] == 300
+    assert report["validation"]["passed"] is True
+    assert report["validation"]["replay_source_peak_delta_bytes"] == 0
+    components = (output_dir / "peak_snapshot_attrib_allblocks_components.csv").read_text(encoding="utf-8")
+    assert "routed_experts" in components
+    assert "attention" in components
+    validation = (output_dir / "peak_snapshot_attrib_allblocks_validation.csv").read_text(encoding="utf-8")
+    assert "replay_source_peak_delta_bytes" in validation
+    profile = json.loads((output_dir / "profile.json").read_text(encoding="utf-8"))
+    assert profile["memory_snapshot_analysis"]["validation"]["passed"] is True
 
 
 def test_profile_json_csvs_include_nested_source_profile_artifacts(tmp_path: Path) -> None:

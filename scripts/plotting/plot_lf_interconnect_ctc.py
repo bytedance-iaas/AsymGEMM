@@ -32,6 +32,7 @@ SUMMARY_FIELDS = [
     "seq_len",
     "precision",
     "batch_size",
+    "gradient_accumulation_steps",
     "lora_dropout",
     "config",
     "metric",
@@ -62,6 +63,7 @@ STEP_FIELDS = [
     "seq_len",
     "precision",
     "batch_size",
+    "gradient_accumulation_steps",
     "lora_dropout",
     "config",
     "metric",
@@ -89,6 +91,7 @@ INDEX_FIELDS = [
     "seq_len",
     "precision",
     "batch_size",
+    "gradient_accumulation_steps",
     "lora_dropout",
     "config",
     "run_label",
@@ -103,7 +106,7 @@ METRIC_COLORS = {
     "ctc_rx": "#1f77b4",
     "ctc_tx": "#d62728",
 }
-RUN_DIR_RE = re.compile(r"^(?:b(?P<batch_size>[0-9]+)_)?s(?P<seq_len>[0-9]+)$")
+RUN_DIR_RE = re.compile(r"^b(?P<batch_size>[0-9]+)_s(?P<seq_len>[0-9]+)_ga(?P<grad_accum>[0-9]+)$")
 
 
 @dataclass(frozen=True)
@@ -142,7 +145,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--expact", action="append", default=[], choices=["expact0", "expact1"])
     parser.add_argument("--attnact", action="append", default=[], choices=["attnact0", "attnact1"])
     parser.add_argument("--recompute", action="append", default=[])
-    parser.add_argument("--seq-lens", nargs="+", default=[])
+    parser.add_argument("--workloads", nargs="+", default=[])
     parser.add_argument("--expert-recompute-policies", nargs="+", default=[])
     return parser.parse_args()
 
@@ -268,6 +271,20 @@ def _filter_values(values: list[str]) -> set[str]:
     return result
 
 
+def _apply_workload_filters(args: argparse.Namespace) -> None:
+    workload_tuples: set[tuple[str, str, str]] = set()
+    for value in args.workloads:
+        for workload in str(value).replace(",", " ").split():
+            fields = workload.split("|")
+            if len(fields) != 3 or not all(field.isdigit() and int(field) > 0 for field in fields):
+                raise SystemExit(
+                    "--workloads items must be seq_len|per_device_batch_size|gradient_accumulation_steps, "
+                    f"got {workload!r}"
+                )
+            workload_tuples.add((fields[0], fields[1], fields[2]))
+    args.workload_tuples = workload_tuples
+
+
 def _seq_len_from_run_dir_name(name: str) -> str:
     match = RUN_DIR_RE.match(name)
     return match.group("seq_len") if match is not None else ""
@@ -311,6 +328,7 @@ def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, st
     job_root = run_dir.parent
     config_root = job_root.parent
     config = _source_config(run_dir, profile)
+    run_dir_match = RUN_DIR_RE.match(run_dir.name)
     job_meta = _parse_job_dir_parts(job_root.name)
     if job_meta is None:
         return None
@@ -333,7 +351,11 @@ def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, st
     if router_mode not in {"hf", "whole"}:
         return None
 
-    seq_len = str(config.get("seq_len") or config.get("cutoff_len") or "")
+    seq_len = str(
+        config.get("seq_len")
+        or config.get("cutoff_len")
+        or (run_dir_match.group("seq_len") if run_dir_match else "")
+    )
     if not seq_len:
         seq_len = _seq_len_from_run_dir_name(run_dir.name)
     expact_value = _normalize_bool_config(config.get("asymm_expert_act_offload", expact_value))
@@ -354,7 +376,10 @@ def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, st
         "expert_policy": expert_policy,
         "seq_len": seq_len,
         "precision": str(config.get("precision") or ""),
-        "batch_size": str(config.get("batch_size") or ""),
+        "batch_size": str(config.get("batch_size") or (run_dir_match.group("batch_size") if run_dir_match else "")),
+        "gradient_accumulation_steps": str(
+            config.get("gradient_accumulation_steps") or (run_dir_match.group("grad_accum") if run_dir_match else "")
+        ),
         "lora_dropout": str(config.get("lora_dropout") if config.get("lora_dropout") is not None else ""),
         "config": config_root.name,
     }
@@ -362,6 +387,14 @@ def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, st
 
 
 def _matches_filters(record: RunRecord, args: argparse.Namespace) -> bool:
+    if getattr(args, "workload_tuples", set()):
+        workload_tuple = (
+            record.metadata.get("seq_len", ""),
+            record.metadata.get("batch_size", ""),
+            record.metadata.get("gradient_accumulation_steps", ""),
+        )
+        if workload_tuple not in args.workload_tuples:
+            return False
     filters = {
         "workload": _filter_values(args.workload),
         "backend": _filter_values(args.backend),
@@ -370,7 +403,6 @@ def _matches_filters(record: RunRecord, args: argparse.Namespace) -> bool:
         "expact": _filter_values(args.expact),
         "attnact": _filter_values(args.attnact),
         "recompute": _filter_values(args.recompute),
-        "seq_len": _filter_values(args.seq_lens),
         "expert_policy": _filter_values(args.expert_recompute_policies),
     }
     for key, allowed in filters.items():
@@ -661,6 +693,7 @@ def _group_label(run: RunRecord) -> str:
     parts = [
         metadata.get("workload", ""),
         f"b{metadata.get('batch_size', '')}" if metadata.get("batch_size") else "",
+        f"ga{metadata.get('gradient_accumulation_steps', '')}" if metadata.get("gradient_accumulation_steps") else "",
         f"drop{metadata.get('lora_dropout', '').replace('.', '')}" if metadata.get("lora_dropout") else "",
         metadata.get("precision", ""),
         metadata.get("backend", ""),
@@ -708,6 +741,7 @@ def _write_outputs(runs: list[RunRecord], out_dir: Path, clean: bool, *, write_g
 
 def main() -> None:
     args = _parse_args()
+    _apply_workload_filters(args)
     runs = _load_runs(args)
     if not runs:
         reason = (

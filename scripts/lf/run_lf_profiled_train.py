@@ -195,14 +195,14 @@ class PartialProfileWriter:
         _atomic_write_json(self.path, report)
 
 
-def _option_value(args: list[str], name: str) -> str:
+def _option_value(args: list[str], name: str) -> str | None:
     prefix = f"{name}="
     for index, arg in enumerate(args):
         if arg == name and index + 1 < len(args):
             return args[index + 1]
         if arg.startswith(prefix):
             return arg[len(prefix) :]
-    return ""
+    return None
 
 
 def _safe_float(value: Any) -> float | None:
@@ -661,18 +661,6 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR", ""),
         "output_dir": _option_value(args, "--output_dir"),
     }
-    asym_cuda_graph = os.environ.get("ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH") or os.environ.get("ASYM_CUDA_GRAPH")
-    if asym_cuda_graph and asym_cuda_graph.lower() not in {"off", "none", "0", "false", "no"}:
-        config["asym_cuda_graph"] = asym_cuda_graph
-    torch_compile = _option_value(args, "--torch_compile")
-    if torch_compile is not None:
-        config["torch_compile"] = torch_compile.lower() in {"1", "true", "yes", "on"}
-    torch_compile_backend = _option_value(args, "--torch_compile_backend")
-    if torch_compile_backend is not None:
-        config["torch_compile_backend"] = torch_compile_backend
-    torch_compile_mode = _option_value(args, "--torch_compile_mode")
-    if torch_compile_mode is not None:
-        config["torch_compile_mode"] = torch_compile_mode
     for key, value in env_config.items():
         config.setdefault(key, value)
     return {key: value for key, value in config.items() if value is not None and value != ""}
@@ -2191,6 +2179,36 @@ def _activation_offload_counters_from_model() -> dict[str, Any]:
     }
 
 
+def _asym_execution_stats_from_model() -> dict[str, Any]:
+    model, base_model = _model_and_base_model()
+    if model is None:
+        return {"available": False, "reason": "model hook did not capture a model"}
+
+    stats = None
+    source = ""
+    for label, candidate in (("model", model), ("base_model", base_model)):
+        if candidate is None:
+            continue
+        candidate_stats = getattr(candidate, "_asym_execution_stats", None)
+        if candidate_stats is not None:
+            stats = candidate_stats
+            source = label
+            break
+    if stats is None:
+        return {"available": False, "reason": "model has no _asym_execution_stats"}
+
+    as_dict = getattr(stats, "as_dict", None)
+    if not callable(as_dict):
+        return {"available": False, "reason": "_asym_execution_stats has no as_dict"}
+    try:
+        data = as_dict()
+    except Exception as exc:
+        return {"available": False, "reason": f"as_dict failed: {exc!r}"}
+    if not isinstance(data, dict):
+        return {"available": False, "reason": "as_dict did not return a dict"}
+    return {"available": True, "source": source, **data}
+
+
 @dataclass
 class StageRecord:
     milliseconds: float
@@ -2555,6 +2573,7 @@ class LFProfileRecorder:
         lora = _lora_counters_from_model()
         kt = _kt_counters_from_model(self.config)
         activation_offload = _activation_offload_counters_from_model()
+        asym_execution_stats = _asym_execution_stats_from_model()
         process_memory = _process_memory_snapshot()
         return {
             "workload": self.config.get("workload", "lf"),
@@ -2611,6 +2630,7 @@ class LFProfileRecorder:
             "lora": lora,
             "kt": kt,
             "activation_offload": activation_offload,
+            "asym_execution_stats": asym_execution_stats,
             "grad_clip": _GRAD_CLIP_MARKER,
             "optimizer_memory_preflight": _kt_optimizer_memory_preflight(lora, self.config),
             "optimizer_memory": _OPTIMIZER_MEMORY_MARKER,

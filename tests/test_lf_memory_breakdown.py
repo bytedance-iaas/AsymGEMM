@@ -18,6 +18,7 @@ from asym_gemm.profiling.lf_trace import (  # noqa: E402
     _component_from_param_name,
     build_memory_breakdown_summary,
 )
+from asym_gemm.training.frozen_linear import AsymExecutionStats  # noqa: E402
 from scripts.lf.validate_lf_memory_capacity_schema import validate_breakdown  # noqa: E402
 from scripts.lf import run_lf_profiled_train as lf_profiled_train  # noqa: E402
 import torch  # noqa: E402
@@ -262,6 +263,24 @@ def test_cpu_host_rows_do_not_affect_gpu_closure() -> None:
     assert summary["allocated_stack_sum_bytes"] == 50
     assert summary["reserved_stack_sum_bytes"] == 70
     assert validate_breakdown(summary) == []
+
+
+def test_lf_profile_report_includes_global_asym_execution_stats(monkeypatch) -> None:
+    model = torch.nn.Module()
+    stats = AsymExecutionStats(asym_forward_calls=2, asym_dx_calls=1, torch_forward_calls=3)
+    setattr(model, "_asym_execution_stats", stats)
+    monkeypatch.setattr(lf_profiled_train, "_LAST_LF_MODEL", model)
+
+    recorder = lf_profiled_train.LFProfileRecorder(config={})
+    report = recorder.report(None)
+
+    asym_stats = report["asym_execution_stats"]
+    assert asym_stats["available"] is True
+    assert asym_stats["source"] == "model"
+    assert asym_stats["asym_calls"] == 3
+    assert asym_stats["torch_calls"] == 3
+    assert asym_stats["forward_calls_total"] == 5
+    assert asym_stats["backward_calls_total"] == 1
 
 
 def test_warmup_rows_do_not_select_peak_summary() -> None:

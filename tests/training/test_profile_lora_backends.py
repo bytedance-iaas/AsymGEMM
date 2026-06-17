@@ -193,10 +193,20 @@ def test_activation_sweep_plot_parses_expert_policy_flat_dirs() -> None:
     plotter = _load_activation_sweep_plot_module()
 
     ge_meta = plotter.parse_result_dir(
-        Path("/tmp/profiling/lora__e2e__bf16/moe-604m-a38m-l2__b8_s1024_r64_a128/asym__nsys__norecomp__poltok-ge128/s1024")
+        Path(
+            "/tmp/profiling/lora__e2e__bf16/"
+            "moe-604m-a38m-l2__gpus1__b8_s1024_ga1_w0_s1_r64_a128_drop000/"
+            "asym__nsys__norecomp__poltok-ge128__routerhf__expact0__attnact0__layeract0__loraafwdhbm__actrecomp0__xunpack0/"
+            "b8_s1024_ga1"
+        )
     )
     bounded_meta = plotter.parse_result_dir(
-        Path("/tmp/profiling/lora__e2e__bf16/moe-604m-a38m-l2__b8_s1024_r64_a128/asym__nsys__norecomp__poltok64-256/s1024")
+        Path(
+            "/tmp/profiling/lora__e2e__bf16/"
+            "moe-604m-a38m-l2__gpus1__b8_s1024_ga1_w0_s1_r64_a128_drop000/"
+            "asym__nsys__norecomp__poltok64-256__routerhf__expact0__attnact0__layeract0__loraafwdhbm__actrecomp0__xunpack0/"
+            "b8_s1024_ga1"
+        )
     )
 
     assert ge_meta is not None
@@ -228,16 +238,21 @@ def test_activation_sweep_plot_accepts_cpuadam_backend_labels(tmp_path: Path) ->
         seq_lens=[],
         expert_recompute_policies=[],
     )
-    config_root = tmp_path / "profiling" / "unit__lora__lf__bf16" / "unit__gpus1__b1_s128_w0_s1_r8_a16_drop000"
+    config_root = tmp_path / "profiling" / "unit__lora__lf__bf16" / "unit__gpus1__b1_s128_ga1_w0_s1_r8_a16_drop000"
 
     def write_profile(backend: str) -> Path:
-        run_dir = config_root / f"{backend}__source__recomp__poltok-le64__routerwhole" / "b1_s128"
+        run_dir = (
+            config_root
+            / f"{backend}__source__recomp__poltok-le64__routerwhole__expact0__attnact0__layeract0__loraafwdhbm__actrecomp0__xunpack0"
+            / "b1_s128_ga1"
+        )
         run_dir.mkdir(parents=True)
         profile = {
             "config": {
                 "backend": backend,
                 "batch_size": 1,
                 "seq_len": 128,
+                "gradient_accumulation_steps": 1,
                 "logical_tokens": 128,
                 "lora_dropout": 0.0,
                 "router_mode": "whole",
@@ -336,16 +351,21 @@ def test_profile_lora_e2e_driver_prefers_nsys_stage_timing_over_source_step() ->
 def test_activation_sweep_rows_flag_mismatched_trainable_surfaces(tmp_path: Path) -> None:
     plotter = _load_activation_sweep_plot_module()
     input_root = tmp_path / "profiling"
-    config_root = input_root / "qwen3-30b-a3b__lora__lf__bf16" / "qwen3-30b-a3b__gpus1__b1_s128_w0_s1_r8_a16_drop000"
+    config_root = input_root / "qwen3-30b-a3b__lora__lf__bf16" / "qwen3-30b-a3b__gpus1__b1_s128_ga1_w0_s1_r8_a16_drop000"
 
     def write_profile(backend: str, surface: str, trainable_params: int) -> None:
-        run_dir = config_root / f"{backend}__source__recomp__polnone__routerhf" / "b1_s128"
+        run_dir = (
+            config_root
+            / f"{backend}__source__recomp__polnone__routerhf__expact0__attnact0__layeract0__loraafwdhbm__actrecomp0__xunpack0"
+            / "b1_s128_ga1"
+        )
         run_dir.mkdir(parents=True)
         profile = {
             "config": {
                 "backend": backend,
                 "batch_size": 1,
                 "seq_len": 128,
+                "gradient_accumulation_steps": 1,
                 "logical_tokens": 128,
                 "lora_dropout": 0.0,
                 "router_mode": "hf",

@@ -157,7 +157,7 @@ SEGMENT_COLORS = {
     "other:persistent": "#16a34a",
     "source_runtime:temporary_workspace": "#0f172a",
 }
-RUN_DIR_RE = re.compile(r"^(?:b(?P<batch_size>[0-9]+)_)?s(?P<seq_len>[0-9]+)$")
+RUN_DIR_RE = re.compile(r"^b(?P<batch_size>[0-9]+)_s(?P<seq_len>[0-9]+)_ga(?P<grad_accum>[0-9]+)$")
 PHASE_PRIORITY = {
     "after_backward": 60,
     "before_optimizer_step": 50,
@@ -197,7 +197,7 @@ class RunRecord:
 
 
 CONFIG_SUFFIX_RE = re.compile(
-    r"(?:^|__)gpus(?P<gpus>[0-9]+)__b(?P<batch>[0-9]+)_s(?P<seq>[0-9]+)_"
+    r"(?:^|__)gpus(?P<gpus>[0-9]+)__b(?P<batch>[0-9]+)_s(?P<seq>[0-9]+)_ga(?P<grad_accum>[0-9]+)_"
     r"w(?P<warmup>[0-9]+)_s(?P<steps>[0-9]+)_r(?P<rank>[0-9]+)_a(?P<alpha>[^_]+)_(?P<drop>drop[0-9]+)"
 )
 
@@ -208,7 +208,7 @@ def _run_config_label(run: RunRecord) -> str:
     if match is None:
         return config
     return (
-        f"gpus{match.group('gpus')} b{match.group('batch')} s{match.group('seq')} "
+        f"gpus{match.group('gpus')} b{match.group('batch')} s{match.group('seq')} ga{match.group('grad_accum')} "
         f"w{match.group('warmup')}_s{match.group('steps')} "
         f"r{match.group('rank')} a{match.group('alpha')} {match.group('drop')}"
     )
@@ -257,7 +257,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--router-mode", action="append", default=[], choices=["hf", "whole"])
     parser.add_argument("--expact", action="append", default=[], choices=["expact0", "expact1"])
     parser.add_argument("--attnact", action="append", default=[], choices=["attnact0", "attnact1"])
-    parser.add_argument("--seq-lens", nargs="+", default=[])
+    parser.add_argument("--workloads", nargs="+", default=[])
     parser.add_argument("--expert-recompute-policies", nargs="+", default=[])
     return parser.parse_args()
 
@@ -440,6 +440,7 @@ def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | 
     config = source_profile.get("config", {}) if isinstance(source_profile.get("config"), dict) else {}
     job_root = run_dir.parent
     config_root = job_root.parent
+    run_dir_match = RUN_DIR_RE.match(run_dir.name)
     job_meta = _parse_job_dir_parts(job_root.name)
     if job_meta is None:
         return None
@@ -474,9 +475,12 @@ def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | 
         "expact": expact,
         "asymm_attn_act_offload": attnact_value,
         "attnact": attnact,
-        "seq_len": str(config.get("seq_len") or ""),
+        "seq_len": str(config.get("seq_len") or (run_dir_match.group("seq_len") if run_dir_match else "")),
         "precision": str(config.get("precision") or ""),
-        "batch_size": str(config.get("batch_size") or ""),
+        "batch_size": str(config.get("batch_size") or (run_dir_match.group("batch_size") if run_dir_match else "")),
+        "gradient_accumulation_steps": str(
+            config.get("gradient_accumulation_steps") or (run_dir_match.group("grad_accum") if run_dir_match else "")
+        ),
         "lora_dropout": str(config.get("lora_dropout") if config.get("lora_dropout") is not None else ""),
         "config": config_root.name,
     }
@@ -609,7 +613,29 @@ def _filter_values(values: list[str]) -> set[str]:
     return result
 
 
+def _apply_workload_filters(args: argparse.Namespace) -> None:
+    workload_tuples: set[tuple[str, str, str]] = set()
+    for value in args.workloads:
+        for workload in str(value).replace(",", " ").split():
+            fields = workload.split("|")
+            if len(fields) != 3 or not all(field.isdigit() and int(field) > 0 for field in fields):
+                raise SystemExit(
+                    "--workloads items must be seq_len|per_device_batch_size|gradient_accumulation_steps, "
+                    f"got {workload!r}"
+                )
+            workload_tuples.add((fields[0], fields[1], fields[2]))
+    args.workload_tuples = workload_tuples
+
+
 def _matches_filters(run: RunRecord, args: argparse.Namespace) -> bool:
+    if getattr(args, "workload_tuples", set()):
+        workload_tuple = (
+            run.metadata.get("seq_len", ""),
+            run.metadata.get("batch_size", ""),
+            run.metadata.get("gradient_accumulation_steps", ""),
+        )
+        if workload_tuple not in args.workload_tuples:
+            return False
     filters = {
         "workload": _filter_values(args.workload),
         "backend": _filter_values(args.backend),
@@ -617,7 +643,6 @@ def _matches_filters(run: RunRecord, args: argparse.Namespace) -> bool:
         "router_mode": _filter_values(args.router_mode),
         "expact": _filter_values(args.expact),
         "attnact": _filter_values(args.attnact),
-        "seq_len": _filter_values(args.seq_lens),
         "expert_policy": _filter_values(args.expert_recompute_policies),
     }
     for key, allowed in filters.items():
@@ -1563,6 +1588,7 @@ def _group_label(run: RunRecord) -> str:
     parts = [
         metadata.get("workload", ""),
         f"b{metadata.get('batch_size', '')}" if metadata.get("batch_size") else "",
+        f"ga{metadata.get('gradient_accumulation_steps', '')}" if metadata.get("gradient_accumulation_steps") else "",
         f"drop{metadata.get('lora_dropout', '').replace('.', '')}" if metadata.get("lora_dropout") else "",
         metadata.get("precision", ""),
         metadata.get("backend", ""),
@@ -1641,6 +1667,7 @@ def _write_combined(
 
 def main() -> None:
     args = _parse_args()
+    _apply_workload_filters(args)
     runs = _load_runs(args)
     if not runs:
         raise SystemExit(_no_runs_message(args))

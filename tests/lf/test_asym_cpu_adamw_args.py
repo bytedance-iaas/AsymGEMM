@@ -69,13 +69,11 @@ def make_fake_env(tmp_path: Path) -> tuple[Path, Path]:
                 "  printf 'ASYMM_ATTN_ACT_OFFLOAD=%s\\n' \"${ASYMM_ATTN_ACT_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "  printf 'ASYMM_LAYER_ACT_OFFLOAD=%s\\n' \"${ASYMM_LAYER_ACT_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "  printf 'ASYM_CPU_ADAMW_GRAD_OFFLOAD=%s\\n' \"${ASYM_CPU_ADAMW_GRAD_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
-                "  printf 'ASYM_CUDA_GRAPH=%s\\n' \"${ASYM_CUDA_GRAPH:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "  printf 'ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD=%s\\n' \"${ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "  printf 'ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD=%s\\n' \"${ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "  printf 'ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED=%s\\n' \"${ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "  printf 'ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED=%s\\n' \"${ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "  printf 'ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD=%s\\n' \"${ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
-                "  printf 'ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH=%s\\n' \"${ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "fi",
                 "exit 0",
                 "",
@@ -195,68 +193,6 @@ def test_run_lf_lora_sft_passes_attention_activation_env(tmp_path: Path) -> None
     assert "ASYMM_ATTN_ACT_OFFLOAD=true" in env_text
 
 
-def test_run_lf_lora_sft_asym_cuda_graph_compile_args_and_env(tmp_path: Path) -> None:
-    env_log = tmp_path / "env.txt"
-    args = _run_lf_lora_sft(
-        tmp_path,
-        "asym",
-        extra_env={
-            "USE_ASYM_CPU_ADAMW": "false",
-            "ASYM_CUDA_GRAPH": "compile",
-            "FAKE_LF_ENV_LOG": str(env_log),
-        },
-    )
-
-    assert _arg_value(args, "--torch_compile") == "true"
-    assert _arg_value(args, "--torch_compile_backend") == "inductor"
-    assert _arg_value(args, "--torch_compile_mode") == "reduce-overhead"
-    env_text = env_log.read_text(encoding="utf-8")
-    assert "ASYM_CUDA_GRAPH=compile" in env_text
-    assert "ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH=compile" in env_text
-
-
-def test_run_lf_lora_sft_cuda_graph_off_is_launch_inert(tmp_path: Path) -> None:
-    env_log = tmp_path / "env.txt"
-    args = _run_lf_lora_sft(
-        tmp_path,
-        "asym",
-        extra_env={
-            "USE_ASYM_CPU_ADAMW": "false",
-            "ASYM_CUDA_GRAPH": "off",
-            "FAKE_LF_ENV_LOG": str(env_log),
-        },
-    )
-
-    assert "--torch_compile" not in args
-    env_text = env_log.read_text(encoding="utf-8")
-    assert "ASYM_CUDA_GRAPH=\n" in env_text
-    assert "ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH=\n" in env_text
-    assert "ASYM_CUDA_GRAPH=off" not in env_text
-    assert "ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH=off" not in env_text
-
-
-def test_run_lf_lora_sft_cuda_graph_rejects_activation_offload(tmp_path: Path) -> None:
-    lf_dir = make_fake_lf(tmp_path)
-    result = run_cmd(
-        ["scripts/lf/run_lf_lora_sft.sh"],
-        env={
-            "LF_DIR": str(lf_dir),
-            "BACKEND": "asym",
-            "USE_ASYM_CPU_ADAMW": "false",
-            "ASYM_CUDA_GRAPH": "compile",
-            "ASYMM_ATTN_ACT_OFFLOAD": "true",
-            "NUMACTL_ENABLE": "0",
-            "REQUIRE_SM100": "0",
-            "DATASET": "dummy",
-            "LORA_DROPOUT": "0.00",
-        },
-        check=False,
-    )
-
-    assert result.returncode == 2
-    assert "ASYM_CUDA_GRAPH=compile cannot be combined with activation offload" in result.stderr
-
-
 def test_run_lf_lora_sft_rejects_direct_cpuadamw_enablement(tmp_path: Path) -> None:
     lf_dir = make_fake_lf(tmp_path)
     for backend in ("zero3_offload", "asym", "asym_torch"):
@@ -286,8 +222,7 @@ def test_profile_lora_lf_dry_run_asym_cpuadamwtorch_label_and_flags(tmp_path: Pa
             "BACKEND_SPECS": "asym_cpuadamwtorch|recomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
-            "SEQ_LENS": "4096",
+            "WORKLOADS": "4096|4|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -306,50 +241,13 @@ def test_profile_lora_lf_dry_run_asym_cpuadamwtorch_label_and_flags(tmp_path: Pa
     assert len(command_files) == 1
     command = command_files[0].read_text(encoding="utf-8")
     assert "asym_cpuadamwtorch__source__recomp__polnone" in str(command_files[0])
-    assert "__gradofffalse__weightofffalse/b4_s4096" in str(command_files[0])
+    assert "__gradofffalse__weightofffalse/b4_s4096_ga1" in str(command_files[0])
     assert "BACKEND=asym_cpuadamwtorch" in command
     assert "PROFILE_BACKEND_LABEL=asym_cpuadamwtorch" in command
     assert "USE_ASYM_CPU_ADAMW=true" in command
     assert "ASYM_CPU_ADAMW_BACKEND=torch" in command
     assert "ASYM_CPU_ADAMW_GRAD_OFFLOAD=false" in command
     assert "ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD=false" in command
-
-
-def test_profile_lora_lf_dry_run_asym_cuda_graph_compile(tmp_path: Path) -> None:
-    lf_dir = make_fake_lf(tmp_path)
-    output_root = tmp_path / "dryrun"
-
-    run_cmd(
-        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
-        env={
-            "LF_DIR": str(lf_dir),
-            "BACKEND_SPECS": "asym_cpuadamwtorch|norecomp",
-            "ASYM_CUDA_GRAPH": "compile",
-            "GPU_POOL": "0",
-            "PROFILERS": "source",
-            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
-            "SEQ_LENS": "4096",
-            "MAX_STEPS": "1",
-            "WARMUP_STEPS": "0",
-            "PREPARE_DATASETS": "false",
-            "DRY_RUN": "true",
-            "LORA_DROPOUT": "0.00",
-            "ASYMM_EXP_ACT_POLICIES": "none|false|false|false",
-            "ASYM_CPU_ADAMW_GRAD_OFFLOAD": "false",
-            "ASYM_CPU_ADAMW_WEIGHT_OFFLOAD": "false",
-            "PLOT": "false",
-            "PLOT_MEMORY_BREAKDOWN": "false",
-        },
-    )
-
-    command_files = list(output_root.rglob("command.txt"))
-    assert len(command_files) == 1
-    command_path = str(command_files[0])
-    command = command_files[0].read_text(encoding="utf-8")
-    assert "drop000_cgcompile" in command_path
-    assert "_cgcompile_b4_s4096_drop000" in command
-    assert "ASYM_CUDA_GRAPH=compile" in command
-    assert "ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH=compile" in command
 
 
 def test_profile_lora_lf_dry_run_sweeps_asym_cpuadamw_grad_offload_modes(tmp_path: Path) -> None:
@@ -366,8 +264,7 @@ def test_profile_lora_lf_dry_run_sweeps_asym_cpuadamw_grad_offload_modes(tmp_pat
             "ASYM_CPU_ADAMW_WEIGHT_OFFLOAD": "false",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
-            "SEQ_LENS": "4096",
+            "WORKLOADS": "4096|4|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -408,7 +305,7 @@ def test_profile_lora_lf_dry_run_rejects_multi_qwen_expert_lora_impls(tmp_path: 
             "BACKEND_SPECS": "zero3_offload|recomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "SEQ_LENS": "128",
+            "WORKLOADS": "128|8|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -438,8 +335,7 @@ def test_profile_lora_lf_dry_run_labels_expert_lora_a_hbm_mode(tmp_path: Path) -
             "BACKEND_SPECS": "asym_cpuadamwds|norecomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
-            "SEQ_LENS": "4096",
+            "WORKLOADS": "4096|4|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -460,7 +356,7 @@ def test_profile_lora_lf_dry_run_labels_expert_lora_a_hbm_mode(tmp_path: Path) -
     command_paths = "\n".join(commands)
     assert (
         "__expact1__attnact1__layeract1__loraafwdhbm__actrecomp0__xunpack0"
-        "__gradofffalse__weightofffalse/b4_s4096"
+        "__gradofffalse__weightofffalse/b4_s4096_ga1"
     ) in command_paths
     command = next(iter(commands.values()))
     assert "ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm" in command
@@ -477,7 +373,7 @@ def test_profile_lora_lf_rejects_non_exact_expert_lora_a_modes(tmp_path: Path, b
             "BACKEND_SPECS": "asym_cpuadamwds|norecomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "SEQ_LENS": "128",
+            "WORKLOADS": "128|8|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -501,7 +397,7 @@ def test_profile_lora_lf_rejects_three_field_exp_act_policy_tuple(tmp_path: Path
             "BACKEND_SPECS": "asym_cpuadamwds|norecomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "SEQ_LENS": "128",
+            "WORKLOADS": "128|8|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -527,8 +423,7 @@ def test_profile_lora_lf_four_field_exp_attn_axis_dry_run(tmp_path: Path) -> Non
             "BACKEND_SPECS": "asym_cpuadamwds|norecomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
-            "SEQ_LENS": "4096",
+            "WORKLOADS": "4096|4|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -591,7 +486,7 @@ def test_profile_lora_lf_rejects_selective_gc_with_global_recomp(tmp_path: Path)
             "BACKEND_SPECS": "asym_cpuadamwds|recomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "SEQ_LENS": "128",
+            "WORKLOADS": "128|8|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -620,7 +515,7 @@ def test_profile_lora_lf_rejects_activation_offload_with_global_recomp(tmp_path:
             "BACKEND_SPECS": "asym_cpuadamwds|recomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "SEQ_LENS": "128",
+            "WORKLOADS": "128|8|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -649,8 +544,7 @@ def test_profile_lora_lf_four_part_layer_axis_dry_run(tmp_path: Path) -> None:
             "BACKEND_SPECS": "asym_cpuadamwds|norecomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
-            "SEQ_LENS": "4096",
+            "WORKLOADS": "4096|4|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -703,7 +597,7 @@ def test_profile_lora_lf_mixed_dry_run_does_not_leak_cpuadamw_to_zero(tmp_path: 
             "BACKEND_SPECS": "asym_cpuadamwtorch|recomp,zero3_offload|recomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "SEQ_LENS": "128",
+            "WORKLOADS": "128|8|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -743,7 +637,7 @@ def test_profile_lora_lf_test_wrapper_preserves_output_root(tmp_path: Path) -> N
             "BACKEND_SPECS": "asym_cpuadamwds|recomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "SEQ_LENS": "128",
+            "WORKLOADS": "128|8|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -775,6 +669,7 @@ def test_profile_lora_lf_default_e2e_shape_uses_asym_cpuadamwds(tmp_path: Path) 
         env={
             "LF_DIR": str(lf_dir),
             "DEEPSPEED_DIR": str(deepspeed_dir),
+            "MODEL_SPECS": "meta-llama/Llama-4-Scout-17B-16E|1",
             "BACKEND_SPECS": "asym_cpuadamwds|norecomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
@@ -784,8 +679,7 @@ def test_profile_lora_lf_default_e2e_shape_uses_asym_cpuadamwds(tmp_path: Path) 
             "ASYMM_EXP_ACT_POLICIES": "none|false|false|false",
             "ROUTER_MODES": "whole",
             # Pin the shape/offload knobs this test asserts instead of relying on script defaults.
-            "PER_DEVICE_TRAIN_BATCH_SIZE": "4",
-            "SEQ_LENS": "4096",
+            "WORKLOADS": "4096|4|1",
             "MAX_STEPS": "10",
             "WARMUP_STEPS": "5",
             "ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD": "cpu",
@@ -801,10 +695,10 @@ def test_profile_lora_lf_default_e2e_shape_uses_asym_cpuadamwds(tmp_path: Path) 
     command_texts = [path.read_text(encoding="utf-8") for path in command_files]
     command_paths = "\n".join(str(path) for path in command_files)
 
-    assert "qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a16_drop000" in command_paths
+    assert "llama-4-scout-17b-16e__gpus1__b4_s4096_ga1_w5_s10_r64_a16_drop000" in command_paths
     assert command_paths.count(
         "asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact0__attnact0__layeract0__loraafwdcpu"
-        "__actrecomp0__xunpack0__gradofffalse__weightofffalse/b4_s4096"
+        "__actrecomp0__xunpack0__gradofffalse__weightofffalse/b4_s4096_ga1"
     ) == 1
     for command in command_texts:
         assert "BACKEND=asym_cpuadamwds" in command
@@ -845,8 +739,7 @@ def test_profile_lora_lf_dry_run_three_model_families_preserves_offload_modules(
             "BACKEND_SPECS": "asym_cpuadamwds|recomp",
             "GPU_POOL": "0",
             "PROFILERS": "source",
-            "SEQ_LENS": "128",
-            "PER_DEVICE_TRAIN_BATCH_SIZE": "1",
+            "WORKLOADS": "128|1|1",
             "MAX_STEPS": "1",
             "WARMUP_STEPS": "0",
             "PREPARE_DATASETS": "false",
@@ -863,9 +756,9 @@ def test_profile_lora_lf_dry_run_three_model_families_preserves_offload_modules(
     command_files = sorted(output_root.rglob("command.txt"))
     assert len(command_files) == 3
     command_paths = "\n".join(str(path) for path in command_files)
-    assert "qwen3-30b-a3b__gpus1__b1_s128_w0_s1_r64_a16_drop000" in command_paths
-    assert "qwen3_5-122b-a10b__gpus1__b1_s128_w0_s1_r64_a16_drop000" in command_paths
-    assert "llama-4-scout-17b-16e__gpus1__b1_s128_w0_s1_r64_a16_drop000" in command_paths
+    assert "qwen3-30b-a3b__gpus1__b1_s128_ga1_w0_s1_r64_a16_drop000" in command_paths
+    assert "qwen3_5-122b-a10b__gpus1__b1_s128_ga1_w0_s1_r64_a16_drop000" in command_paths
+    assert "llama-4-scout-17b-16e__gpus1__b1_s128_ga1_w0_s1_r64_a16_drop000" in command_paths
 
     command_offload_modules = offload_modules.replace(",", "\\,")
     for path in command_files:

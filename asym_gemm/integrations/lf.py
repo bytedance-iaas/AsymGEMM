@@ -1553,6 +1553,7 @@ def apply_lf_asym_lora(
     rows = validate_lf_offload_residency(model, residency_selection, strict=strict, classify_component=classify_lf_component)
     build_lf_asym_report(report, rows, selection=selection)
     setattr(model, "_asym_offload_modules", selection.raw)
+    setattr(model, "_asym_execution_stats", stats)
     report.trainable_lora_params = sum(param.numel() for param in lora_parameters(model))
     if report.trainable_lora_params == 0 and strict:
         raise ValueError("AsymGEMM setup produced zero trainable LoRA parameters.")
