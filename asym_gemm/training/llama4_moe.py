@@ -8,8 +8,10 @@ import torch
 from torch import nn
 
 from .frozen_linear import AsymExecutionStats, AsymFrozenLinear
+from .llama4_experts import AsymLlama4Experts
+from .llama4_shared_mlp import AsymLlama4SharedMLP
 from .offload import adopt_host_weight
-from .packed_moe import AsymPackedExperts, PackedExpertSource, PackedMoELayout, wrap_packed_experts
+from .packed_moe import PackedExpertSource, PackedMoELayout
 from .profile_ranges import prof_range, scoped_name
 
 
@@ -56,6 +58,15 @@ def is_llama4_moe(module: nn.Module) -> bool:
         expert_dim,
         hidden_size,
     )
+
+
+def _drop_parameter_storage(module: nn.Module, *names: str) -> None:
+    for name in names:
+        value = getattr(module, name, None)
+        if not isinstance(value, nn.Parameter):
+            continue
+        value.data = torch.empty(0, dtype=value.dtype, device=value.device)
+        value.requires_grad_(False)
 
 
 class AsymLlama4Router(nn.Module):
@@ -130,6 +141,8 @@ class AsymLlama4Moe(nn.Module):
         expert_recompute_policy: str = "none",
         router_mode: Literal["hf", "whole"] = "whole",
         offload_router: bool = False,
+        wrap_shared_expert: bool = False,
+        offload_shared_expert: bool = False,
         router_debug_grad: bool = False,
         stats: AsymExecutionStats | None = None,
         strict: bool = True,
@@ -165,7 +178,23 @@ class AsymLlama4Moe(nn.Module):
             if backend == "asym" and offload_router
             else source_router
         )
-        self.shared_expert = getattr(source, "shared_expert")
+        source_shared_expert = getattr(source, "shared_expert")
+        self.shared_expert = (
+            AsymLlama4SharedMLP(
+                source_shared_expert,
+                backend=backend,
+                precision=precision,
+                offload=offload_shared_expert,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                lora_dtype=lora_dtype,
+                stats=stats,
+                strict=strict,
+            )
+            if wrap_shared_expert
+            else source_shared_expert
+        )
         self.backend = backend
         self.precision = precision
         self.offload = bool(offload)
@@ -190,13 +219,13 @@ class AsymLlama4Moe(nn.Module):
                 f"experts hidden/experts=({layout.hidden_size}, {layout.num_experts})"
             )
         packed_source = PackedExpertSource(
-            gate_up_proj=gate_up.transpose(-1, -2).contiguous(),
-            down_proj=down.transpose(-1, -2).contiguous(),
+            gate_up_proj=gate_up,
+            down_proj=down,
             layout=layout,
             act_fn=getattr(source_experts, "act_fn"),
             config=getattr(source_experts, "config", self.config),
         )
-        self.experts: AsymPackedExperts = wrap_packed_experts(
+        self.experts = AsymLlama4Experts(
             packed_source,
             backend=backend,
             precision=precision,
@@ -207,24 +236,31 @@ class AsymLlama4Moe(nn.Module):
             lora_dtype=lora_dtype,
             expert_recompute_policy=expert_recompute_policy,
             stats=stats,
+            strict=False,
         )
         if backend == "asym" and offload and strict and torch.cuda.is_available():
             if not self.experts.gate_up_base.host_weight.weight.is_pinned() or not self.experts.down_base.host_weight.weight.is_pinned():
                 raise RuntimeError("Llama 4 expert CPU offload requires pinned CPU HostWeights for AsymGEMM")
+        if backend == "asym" and offload:
+            _drop_parameter_storage(source_experts, "gate_up_proj", "down_proj")
+        del packed_source, gate_up, down
 
     @property
     def cpu_resident_base_bytes(self) -> int:
         router_bytes = int(getattr(getattr(self.router, "proj", None), "cpu_resident_base_weight_bytes", 0))
-        return int(self.experts.cpu_resident_base_bytes) + router_bytes
+        shared_bytes = int(getattr(self.shared_expert, "cpu_resident_base_bytes", 0))
+        return int(self.experts.cpu_resident_base_bytes) + router_bytes + shared_bytes
 
     @property
     def gpu_resident_base_bytes(self) -> int:
         router_bytes = int(getattr(getattr(self.router, "proj", None), "gpu_resident_base_weight_bytes", 0))
-        return int(self.experts.gpu_resident_base_bytes) + router_bytes
+        shared_bytes = int(getattr(self.shared_expert, "gpu_resident_base_bytes", 0))
+        return int(self.experts.gpu_resident_base_bytes) + router_bytes + shared_bytes
 
     @property
     def trainable_lora_params(self) -> int:
-        return int(self.experts.trainable_lora_params)
+        shared_params = int(getattr(self.shared_expert, "trainable_lora_params", 0))
+        return int(self.experts.trainable_lora_params) + shared_params
 
     def report(self) -> Llama4MoeReport:
         return Llama4MoeReport(
@@ -280,6 +316,8 @@ def wrap_llama4_moe(
     expert_recompute_policy: str = "none",
     router_mode: Literal["hf", "whole"] = "whole",
     offload_router: bool = False,
+    wrap_shared_expert: bool = False,
+    offload_shared_expert: bool = False,
     router_debug_grad: bool = False,
     stats: AsymExecutionStats | None = None,
     strict: bool = True,
@@ -296,6 +334,8 @@ def wrap_llama4_moe(
         expert_recompute_policy=expert_recompute_policy,
         router_mode=router_mode,
         offload_router=offload_router,
+        wrap_shared_expert=wrap_shared_expert,
+        offload_shared_expert=offload_shared_expert,
         router_debug_grad=router_debug_grad,
         stats=stats,
         strict=strict,

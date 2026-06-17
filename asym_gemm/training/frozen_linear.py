@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -15,6 +15,7 @@ from .profile_ranges import is_profile_enabled, prof_range
 VALID_BACKENDS = ("asym", "torch")
 VALID_ASYM_PRECISIONS = ("bf16", "fp8", "fp4")
 VALID_BF16_OUTPUT_DTYPES = ("bf16", "bfloat16", "fp32", "float32")
+VALID_GROUPED_WEIGHT_LAYOUTS = ("out_in", "in_out")
 _FP8_RECIPE = (1, 128, 128)
 _FP4_RECIPE = (1, 1, 16)
 _TORCH_GROUPED_MM = getattr(torch.nn.functional, "grouped_mm", None)
@@ -223,6 +224,23 @@ def _normalize_bf16_output_dtype(dtype: torch.dtype | str) -> torch.dtype:
     if normalized in {"fp32", "float32"}:
         return torch.float32
     raise ValueError(f"unsupported BF16 AsymGEMM output dtype {dtype!r}; expected one of {VALID_BF16_OUTPUT_DTYPES}")
+
+
+def _normalize_grouped_weight_layout(layout: str) -> str:
+    normalized = str(layout).lower().replace("-", "_")
+    if normalized not in VALID_GROUPED_WEIGHT_LAYOUTS:
+        raise ValueError(f"unsupported grouped weight layout={layout!r}; expected one of {VALID_GROUPED_WEIGHT_LAYOUTS}")
+    return normalized
+
+
+def _grouped_weight_features(weight: torch.Tensor, layout: str) -> tuple[int, int, bool, bool]:
+    """Return (in_features, out_features, forward_transpose_b, backward_transpose_b)."""
+    layout = _normalize_grouped_weight_layout(layout)
+    if weight.dim() != 3:
+        raise ValueError(f"grouped weight must be 3D, got shape {tuple(weight.shape)}")
+    if layout == "out_in":
+        return int(weight.shape[2]), int(weight.shape[1]), False, True
+    return int(weight.shape[1]), int(weight.shape[2]), True, False
 
 
 def _pin_cpu_tensor(tensor: torch.Tensor, *, pin_memory: bool) -> torch.Tensor:
@@ -601,6 +619,46 @@ def _single_group_launch_tensors(
     experts = torch.tensor([0, -1], device=device, dtype=torch.int32)
     _SINGLE_GROUP_LAUNCH_TENSOR_CACHE[key] = (offsets, experts)
     return offsets, experts
+
+
+def _resolve_launch_tensor_device(device: torch.device | str | int) -> torch.device:
+    if isinstance(device, torch.device):
+        return device
+    if isinstance(device, int):
+        return torch.device("cuda", device)
+    return torch.device(device)
+
+
+def initialize_asym_single_group_launch_tensors(
+    device: torch.device | str | int,
+    rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pre-create dense AsymGEMM launch metadata before CUDA graph capture."""
+    rows_int = int(rows)
+    if rows_int <= 0:
+        raise ValueError(f"rows must be positive, got {rows}")
+    return _single_group_launch_tensors(_resolve_launch_tensor_device(device), rows_int)
+
+
+def initialize_asym_cuda_graph_state(
+    device: torch.device | str | int,
+    rows: int | Sequence[int],
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+    """Pre-create dense/single-group AsymGEMM tensors needed during CUDA graph replay.
+
+    This covers the direct dense AsymFrozenLinear launch path. Grouped MoE routes still
+    need graph-stable routing metadata supplied by the caller.
+    """
+    if isinstance(rows, int):
+        row_values = (rows,)
+    else:
+        row_values = tuple(rows)
+    if not row_values:
+        raise ValueError("rows must contain at least one row count")
+    return tuple(
+        initialize_asym_single_group_launch_tensors(device, int(row_count))
+        for row_count in row_values
+    )
 
 
 def _asym_bf16_nt(
@@ -1358,18 +1416,21 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
         quantized_weight: Optional[QuantizedHostWeight],
         dense_experts: bool,
         bf16_output_dtype: torch.dtype,
+        weight_layout: str,
     ) -> torch.Tensor:
         precision = _normalize_precision(precision)
         bf16_output_dtype = _normalize_bf16_output_dtype(bf16_output_dtype)
-        if host_weight.weight.dim() != 3:
-            raise ValueError(f"grouped host weight must be 3D, got shape {tuple(host_weight.weight.shape)}")
-        if x.shape[-1] != int(host_weight.weight.shape[2]):
-            raise ValueError(f"expected input last dim {int(host_weight.weight.shape[2])}, got {x.shape[-1]}")
+        weight_layout = _normalize_grouped_weight_layout(weight_layout)
+        in_features, out_features, forward_transpose_b, backward_transpose_b = _grouped_weight_features(
+            host_weight.weight,
+            weight_layout,
+        )
+        if x.shape[-1] != in_features:
+            raise ValueError(f"expected input last dim {in_features}, got {x.shape[-1]}")
         offsets = offsets.detach().contiguous()
         experts = experts.detach().contiguous()
         input_shape = tuple(x.shape)
-        x_2d = x.reshape(-1, int(host_weight.weight.shape[2])).contiguous()
-        out_features = int(host_weight.weight.shape[1])
+        x_2d = x.reshape(-1, in_features).contiguous()
         forward_range = (
             "forward.grouped_base_frozen_asymgemm"
             if not profile_name
@@ -1386,6 +1447,7 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
                 stats=stats,
                 phase="forward",
                 compiled_dims=compiled_dims,
+                transpose_b=forward_transpose_b,
                 precision=precision,
                 quantized_weight=quantized_weight,
                 dense_experts=dense_experts,
@@ -1401,31 +1463,33 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
         ctx.precision = precision
         ctx.bf16_output_dtype = bf16_output_dtype
         ctx.dense_experts = bool(dense_experts)
+        ctx.backward_transpose_b = backward_transpose_b
         ctx.profile_backward_range = backward_range
         ctx.profile_enabled = is_profile_enabled()
         ctx.input_shape = input_shape
         ctx.input_dtype = x.dtype
+        ctx.out_features = out_features
         return y.reshape(*input_shape[:-1], out_features)
 
     @staticmethod
     def backward(
         ctx: Any,
         grad_output: torch.Tensor,
-    ) -> Tuple[Optional[torch.Tensor], None, None, None, None, None, None, None, None, None, None, None]:
+    ) -> Tuple[Optional[torch.Tensor], None, None, None, None, None, None, None, None, None, None, None, None]:
         grad_x = None
         if ctx.needs_input_grad[0]:
-            grad_output_2d = grad_output.reshape(-1, int(ctx.host_weight.weight.shape[1])).contiguous()
+            grad_output_2d = grad_output.reshape(-1, int(ctx.out_features)).contiguous()
             if ctx.precision == "bf16" and ctx.backend != "torch" and grad_output_2d.dtype != ctx.host_weight.weight.dtype:
                 grad_output_2d = grad_output_2d.to(dtype=ctx.host_weight.weight.dtype)
             if ctx.precision == "bf16":
                 b_cpu = ctx.host_weight.weight
-                transpose_b = True
+                transpose_b = bool(ctx.backward_transpose_b)
                 quantized_weight_t = None
             else:
                 b_cpu = ctx.host_weight.weight
-                transpose_b = True
+                transpose_b = bool(ctx.backward_transpose_b)
                 quantized_weight_t = (
-                    _get_quantized_host_weight(ctx.host_weight, ctx.precision, transpose=True)
+                    _get_quantized_host_weight(ctx.host_weight, ctx.precision, transpose=transpose_b)
                     if ctx.backend != "torch"
                     else None
                 )
@@ -1446,7 +1510,7 @@ class AsymGroupedFrozenLinearFunction(torch.autograd.Function):
                     bf16_output_dtype=ctx.input_dtype if ctx.precision == "bf16" else ctx.bf16_output_dtype,
                 )
             grad_x = grad_x.reshape(ctx.input_shape)
-        return grad_x, None, None, None, None, None, None, None, None, None, None, None
+        return grad_x, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def asym_grouped_frozen_linear(
@@ -1462,9 +1526,13 @@ def asym_grouped_frozen_linear(
     precision: str = "bf16",
     dense_experts: bool = False,
     bf16_output_dtype: torch.dtype | str = torch.bfloat16,
+    weight_layout: str = "out_in",
 ) -> torch.Tensor:
     precision = _normalize_precision(precision)
     bf16_output_dtype = _normalize_bf16_output_dtype(bf16_output_dtype)
+    weight_layout = _normalize_grouped_weight_layout(weight_layout)
+    if precision != "bf16" and weight_layout != "out_in":
+        raise NotImplementedError("non-bf16 grouped host weights currently require out_in layout")
     quantized_weight = (
         _get_quantized_host_weight(host_weight, precision, transpose=False)
         if backend != "torch" and precision != "bf16"
@@ -1483,6 +1551,7 @@ def asym_grouped_frozen_linear(
         quantized_weight,
         dense_experts,
         bf16_output_dtype,
+        weight_layout,
     )
 
 
@@ -1498,6 +1567,7 @@ class AsymGroupedFrozenLinear(nn.Module):
         compiled_dims: str = "mnk",
         precision: str = "bf16",
         bf16_output_dtype: torch.dtype | str = torch.bfloat16,
+        weight_layout: str = "out_in",
     ) -> None:
         super().__init__()
         adopted_host_weight = weight if isinstance(weight, HostWeight) else None
@@ -1510,16 +1580,20 @@ class AsymGroupedFrozenLinear(nn.Module):
         _check_backend(backend)
         precision = _normalize_precision(precision)
         bf16_output_dtype = _normalize_bf16_output_dtype(bf16_output_dtype)
+        weight_layout = _normalize_grouped_weight_layout(weight_layout)
         self.host_weight = adopted_host_weight or HostWeight(weight, pin_memory=pin_memory, clone=clone, require_2d=False)
         self.backend = backend
         self.stats = stats if stats is not None else AsymExecutionStats()
         self.compiled_dims = compiled_dims
         self.precision = precision
         self.bf16_output_dtype = bf16_output_dtype
+        self.weight_layout = weight_layout
         self.profile_name = ""
         self.num_groups = int(self.host_weight.weight.shape[0])
-        self.out_features = int(self.host_weight.weight.shape[1])
-        self.in_features = int(self.host_weight.weight.shape[2])
+        self.in_features, self.out_features, self.forward_transpose_b, self.backward_transpose_b = _grouped_weight_features(
+            self.host_weight.weight,
+            self.weight_layout,
+        )
 
     @property
     def pinned_cpu_bytes(self) -> int:
@@ -1556,6 +1630,7 @@ class AsymGroupedFrozenLinear(nn.Module):
             precision=self.precision,
             dense_experts=dense_experts,
             bf16_output_dtype=self.bf16_output_dtype,
+            weight_layout=self.weight_layout,
         )
 
     def _save_to_state_dict(self, destination: Dict[str, torch.Tensor], prefix: str, keep_vars: bool) -> None:
@@ -1586,8 +1661,10 @@ class AsymGroupedFrozenLinear(nn.Module):
                     require_2d=False,
                 )
                 self.num_groups = int(self.host_weight.weight.shape[0])
-                self.out_features = int(self.host_weight.weight.shape[1])
-                self.in_features = int(self.host_weight.weight.shape[2])
+                self.in_features, self.out_features, self.forward_transpose_b, self.backward_transpose_b = _grouped_weight_features(
+                    self.host_weight.weight,
+                    self.weight_layout,
+                )
         elif strict:
             missing_keys.append(weight_key)
         super()._load_from_state_dict(
@@ -1605,6 +1682,7 @@ class AsymGroupedFrozenLinear(nn.Module):
             f"num_groups={self.num_groups}, in_features={self.in_features}, "
             f"out_features={self.out_features}, backend={self.backend}, "
             f"precision={self.precision}, "
+            f"weight_layout={self.weight_layout}, "
             f"bf16_output_dtype={str(self.bf16_output_dtype).removeprefix('torch.')}, "
             f"pinned={self.host_weight.metadata.pinned}"
         )
@@ -1620,46 +1698,55 @@ class TorchGroupedFrozenLinearFunction(torch.autograd.Function):
         experts: torch.Tensor,
         profile_name: str,
         dense_experts: bool,
+        weight_layout: str,
     ) -> torch.Tensor:
-        if weight.dim() != 3:
-            raise ValueError(f"grouped torch weight must be 3D, got shape {tuple(weight.shape)}")
-        if x.shape[-1] != int(weight.shape[2]):
-            raise ValueError(f"expected input last dim {int(weight.shape[2])}, got {x.shape[-1]}")
+        weight_layout = _normalize_grouped_weight_layout(weight_layout)
+        in_features, out_features, forward_transpose_b, backward_transpose_b = _grouped_weight_features(weight, weight_layout)
+        if x.shape[-1] != in_features:
+            raise ValueError(f"expected input last dim {in_features}, got {x.shape[-1]}")
         input_shape = tuple(x.shape)
-        x_2d = x.reshape(-1, int(weight.shape[2])).contiguous()
-        out_features = int(weight.shape[1])
+        x_2d = x.reshape(-1, in_features).contiguous()
         forward_range = "forward.grouped_base_torch" if not profile_name else f"forward.{profile_name}.grouped_base_torch"
         backward_range = "backward.grouped_base_dx_torch" if not profile_name else f"backward.{profile_name}.grouped_base_dx_torch"
         with prof_range(forward_range):
-            y = _grouped_torch_chunks(x_2d, weight, offsets, experts, dense_experts=dense_experts)
+            y = _grouped_torch_chunks(
+                x_2d,
+                weight,
+                offsets,
+                experts,
+                transpose_b=forward_transpose_b,
+                dense_experts=dense_experts,
+            )
 
         ctx.save_for_backward(weight, offsets, experts)
         ctx.dense_experts = bool(dense_experts)
+        ctx.backward_transpose_b = backward_transpose_b
         ctx.profile_backward_range = backward_range
         ctx.profile_enabled = is_profile_enabled()
         ctx.input_shape = input_shape
+        ctx.out_features = out_features
         return y.reshape(*input_shape[:-1], out_features)
 
     @staticmethod
     def backward(
         ctx: Any,
         grad_output: torch.Tensor,
-    ) -> Tuple[Optional[torch.Tensor], None, None, None, None, None]:
+    ) -> Tuple[Optional[torch.Tensor], None, None, None, None, None, None]:
         grad_x = None
         if ctx.needs_input_grad[0]:
             weight, offsets, experts = ctx.saved_tensors
-            grad_output_2d = grad_output.reshape(-1, int(weight.shape[1])).contiguous()
+            grad_output_2d = grad_output.reshape(-1, int(ctx.out_features)).contiguous()
             with prof_range(ctx.profile_backward_range, enabled=ctx.profile_enabled):
                 grad_x = _grouped_torch_chunks(
                     grad_output_2d,
                     weight,
                     offsets,
                     experts,
-                    transpose_b=True,
+                    transpose_b=bool(ctx.backward_transpose_b),
                     dense_experts=ctx.dense_experts,
                 )
             grad_x = grad_x.reshape(ctx.input_shape)
-        return grad_x, None, None, None, None, None
+        return grad_x, None, None, None, None, None, None
 
 
 class TorchGroupedFrozenLinear(nn.Module):
@@ -1671,17 +1758,21 @@ class TorchGroupedFrozenLinear(nn.Module):
         *,
         device: torch.device,
         dtype: torch.dtype,
+        weight_layout: str = "out_in",
     ) -> None:
         super().__init__()
         if not isinstance(weight, torch.Tensor):
             raise TypeError(f"weight must be a torch.Tensor, got {type(weight)!r}")
         if weight.dim() != 3:
             raise ValueError(f"TorchGroupedFrozenLinear expects [groups, out, in], got {tuple(weight.shape)}")
+        self.weight_layout = _normalize_grouped_weight_layout(weight_layout)
         self.register_buffer("weight", weight.detach().to(device=device, dtype=dtype).contiguous())
         self.profile_name = ""
         self.num_groups = int(self.weight.shape[0])
-        self.out_features = int(self.weight.shape[1])
-        self.in_features = int(self.weight.shape[2])
+        self.in_features, self.out_features, self.forward_transpose_b, self.backward_transpose_b = _grouped_weight_features(
+            self.weight,
+            self.weight_layout,
+        )
 
     @property
     def pinned_cpu_bytes(self) -> int:
@@ -1705,12 +1796,21 @@ class TorchGroupedFrozenLinear(nn.Module):
         profile_name: str | None = None,
     ) -> torch.Tensor:
         effective_profile_name = self.profile_name if profile_name is None else profile_name
-        return TorchGroupedFrozenLinearFunction.apply(x, self.weight, offsets, experts, effective_profile_name, dense_experts)
+        return TorchGroupedFrozenLinearFunction.apply(
+            x,
+            self.weight,
+            offsets,
+            experts,
+            effective_profile_name,
+            dense_experts,
+            self.weight_layout,
+        )
 
     def extra_repr(self) -> str:
         return (
             f"num_groups={self.num_groups}, in_features={self.in_features}, "
-            f"out_features={self.out_features}, device={self.weight.device}, dtype={self.weight.dtype}"
+            f"out_features={self.out_features}, weight_layout={self.weight_layout}, "
+            f"device={self.weight.device}, dtype={self.weight.dtype}"
         )
 
 

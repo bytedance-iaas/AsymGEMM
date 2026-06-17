@@ -204,6 +204,61 @@ def _parse_attnact_part(part: str) -> tuple[str, str] | None:
     return None
 
 
+def _known_optional_job_axis(part: str) -> bool:
+    value = part.strip().lower()
+    return (
+        value in {"layeract0", "layeract1", "layeractfalse", "layeracttrue"}
+        or value in {"actrecomp0", "actrecomp1", "actrecompfalse", "actrecomptrue"}
+        or value in {"xunpack0", "xunpack1", "xunpackfalse", "xunpacktrue"}
+        or value.startswith("loraafwd")
+        or value.startswith("gradoff")
+        or value.startswith("weightoff")
+    )
+
+
+def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
+    parts = job_dir_name.split("__")
+    if len(parts) < 4:
+        return None
+    backend_part, profiler_part, recompute_part, policy_part = parts[:4]
+    tail = parts[4:]
+    router_part = "routerhf"
+    expact_value = "false"
+    expact = "expact0"
+    attnact_value = "false"
+    attnact = "attnact0"
+
+    if tail:
+        router_part = tail.pop(0)
+        if not router_part.startswith("router"):
+            return None
+
+    for part in tail:
+        parsed_expact = _parse_expact_part(part)
+        if parsed_expact is not None:
+            expact_value, expact = parsed_expact
+            continue
+        parsed_attnact = _parse_attnact_part(part)
+        if parsed_attnact is not None:
+            attnact_value, attnact = parsed_attnact
+            continue
+        if _known_optional_job_axis(part):
+            continue
+        return None
+
+    return {
+        "backend": backend_part,
+        "profiler": profiler_part,
+        "recompute": recompute_part,
+        "policy_part": policy_part,
+        "router_part": router_part,
+        "asymm_expert_act_offload": expact_value,
+        "expact": expact,
+        "asymm_attn_act_offload": attnact_value,
+        "attnact": attnact,
+    }
+
+
 def _filter_values(values: list[str]) -> set[str]:
     result: set[str] = set()
     for value in values:
@@ -255,32 +310,19 @@ def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, st
     run_dir = profile_path.parent
     job_root = run_dir.parent
     config_root = job_root.parent
-    job_parts = job_root.name.split("__")
     config = _source_config(run_dir, profile)
-    if len(job_parts) == 5:
-        backend_part, profiler_part, recompute_part, policy_part, router_part = job_parts
-        expact_value = "false"
-        expact = "expact0"
-        attnact_value = "false"
-        attnact = "attnact0"
-    elif len(job_parts) == 6:
-        backend_part, profiler_part, recompute_part, policy_part, router_part, expact_part = job_parts
-        parsed_expact = _parse_expact_part(expact_part)
-        if parsed_expact is None:
-            return None
-        expact_value, expact = parsed_expact
-        attnact_value = "false"
-        attnact = "attnact0"
-    elif len(job_parts) == 7:
-        backend_part, profiler_part, recompute_part, policy_part, router_part, expact_part, attnact_part = job_parts
-        parsed_expact = _parse_expact_part(expact_part)
-        parsed_attnact = _parse_attnact_part(attnact_part)
-        if parsed_expact is None or parsed_attnact is None:
-            return None
-        expact_value, expact = parsed_expact
-        attnact_value, attnact = parsed_attnact
-    else:
+    job_meta = _parse_job_dir_parts(job_root.name)
+    if job_meta is None:
         return None
+    backend_part = job_meta["backend"]
+    profiler_part = job_meta["profiler"]
+    recompute_part = job_meta["recompute"]
+    policy_part = job_meta["policy_part"]
+    router_part = job_meta["router_part"]
+    expact_value = job_meta["asymm_expert_act_offload"]
+    expact = job_meta["expact"]
+    attnact_value = job_meta["asymm_attn_act_offload"]
+    attnact = job_meta["attnact"]
     if not policy_part.startswith("pol") or not router_part.startswith("router"):
         return None
     if recompute_part not in {"norecomp", "recomp"}:

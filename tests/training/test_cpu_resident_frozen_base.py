@@ -15,6 +15,8 @@ from asym_gemm.training import (
     asym_frozen_linear,
     asym_grouped_frozen_linear,
     can_use_direct_bf16,
+    initialize_asym_cuda_graph_state,
+    initialize_asym_single_group_launch_tensors,
     measure_gpu_weight_allocation,
 )
 
@@ -71,6 +73,22 @@ def test_grouped_asym_padding_and_unpadding_preserve_rows_cpu() -> None:
     torch.testing.assert_close(restored, x)
     torch.testing.assert_close(padded[3], torch.zeros_like(padded[3]))
     torch.testing.assert_close(padded[4:11], x[3:10])
+
+
+def test_initialize_asym_cuda_graph_state_caches_single_group_tensors_cpu() -> None:
+    offsets, experts = initialize_asym_single_group_launch_tensors("cpu", 17)
+    ((offsets_again, experts_again),) = initialize_asym_cuda_graph_state(torch.device("cpu"), [17])
+
+    assert offsets.data_ptr() == offsets_again.data_ptr()
+    assert experts.data_ptr() == experts_again.data_ptr()
+    assert offsets.dtype == torch.int32
+    assert experts.dtype == torch.int32
+    assert offsets.tolist() == [0, 17]
+    assert experts.tolist() == [0, -1]
+    with pytest.raises(ValueError, match="rows must be positive"):
+        initialize_asym_cuda_graph_state("cpu", 0)
+    with pytest.raises(ValueError, match="at least one row count"):
+        initialize_asym_cuda_graph_state("cpu", [])
 
 
 def _expand_last_dim_scales(scales: torch.Tensor, cols: int, gran_k: int) -> torch.Tensor:

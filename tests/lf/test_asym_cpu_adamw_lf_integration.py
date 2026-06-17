@@ -76,6 +76,7 @@ def _finetuning_args(**overrides):
         "asym_cpu_adamw_pin_memory": False,
         "asym_cpu_adamw_fp32_master": True,
         "asym_cpu_adamw_grad_offload": False,
+        "asym_cpu_adamw_weight_offload": False,
         "use_galore": False,
         "use_apollo": False,
         "loraplus_lr_ratio": None,
@@ -871,6 +872,76 @@ def test_split_asym_peft_dense_targets_expands_mixed_shared_expert_suffix() -> N
 
     assert peft_targets == ["layers.0.mlp.gate_proj"]
     assert asym_targets == ["layers.0.mlp.shared_expert.gate_proj"]
+
+
+@requires_lf_adapter
+def test_split_asym_peft_dense_targets_expands_mlp_dense_suffix() -> None:
+    from asym_gemm.integrations.lf import parse_lf_offload_modules
+    from llamafactory.model.adapter import split_asym_peft_dense_targets
+
+    class MixedDenseMlpTargets(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            layer = nn.Module()
+            layer.self_attn = nn.Module()
+            layer.self_attn.q_proj = nn.Linear(4, 4, bias=False)
+            layer.feed_forward = nn.Module()
+            layer.feed_forward.gate_proj = nn.Linear(4, 4, bias=False)
+            layer.feed_forward.up_proj = nn.Linear(4, 4, bias=False)
+            layer.feed_forward.down_proj = nn.Linear(4, 4, bias=False)
+            layer.feed_forward.shared_expert = nn.Module()
+            layer.feed_forward.shared_expert.gate_proj = nn.Linear(4, 4, bias=False)
+            self.layers = nn.ModuleList([layer])
+
+    selection = parse_lf_offload_modules("mlp_dense")
+    peft_targets, asym_targets = split_asym_peft_dense_targets(
+        MixedDenseMlpTargets(),
+        ["q_proj", "gate_proj", "up_proj", "down_proj"],
+        selection,
+    )
+
+    assert peft_targets == ["q_proj", "layers.0.feed_forward.shared_expert.gate_proj"]
+    assert asym_targets == [
+        "layers.0.feed_forward.down_proj",
+        "layers.0.feed_forward.gate_proj",
+        "layers.0.feed_forward.up_proj",
+    ]
+
+
+@requires_lf_adapter
+def test_split_asym_peft_dense_targets_respects_full_language_model_names() -> None:
+    from asym_gemm.integrations.lf import parse_lf_offload_modules
+    from llamafactory.model.adapter import split_asym_peft_dense_targets
+
+    class FrozenVisionCompositeTargets(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.vision_model = nn.Module()
+            self.vision_model.q_proj = nn.Linear(4, 4, bias=False)
+            self.language_model = nn.Module()
+            self.language_model.model = nn.Module()
+            layer = nn.Module()
+            layer.self_attn = nn.Module()
+            layer.self_attn.q_proj = nn.Linear(4, 4, bias=False)
+            layer.feed_forward = nn.Module()
+            layer.feed_forward.gate_proj = nn.Linear(4, 4, bias=False)
+            self.language_model.model.layers = nn.ModuleList([layer])
+
+    selection = parse_lf_offload_modules("attention,mlp_dense")
+    peft_targets, asym_targets = split_asym_peft_dense_targets(
+        FrozenVisionCompositeTargets(),
+        [
+            "language_model.model.layers.0.self_attn.q_proj",
+            "language_model.model.layers.0.feed_forward.gate_proj",
+        ],
+        selection,
+    )
+
+    assert peft_targets == []
+    assert asym_targets == [
+        "language_model.model.layers.0.feed_forward.gate_proj",
+        "language_model.model.layers.0.self_attn.q_proj",
+    ]
 
 
 @requires_lf_adapter

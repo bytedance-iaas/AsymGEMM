@@ -24,10 +24,10 @@ class PackedMoELayout:
 class PackedExpertSource(nn.Module):
     """Small normalized source object for packed expert wrappers.
 
-    `AsymPackedExperts` consumes Qwen3-style packed weights:
-    gate/up as `[experts, 2 * expert_size, hidden]` and down as
-    `[experts, hidden, expert_size]`. Model-family adapters should normalize
-    their own layouts into this shape and then call `wrap_packed_experts`.
+    `AsymPackedExperts` can consume either Qwen3-style `[experts, out, in]`
+    packed weights or model-native `[experts, in, out]` weights when the
+    layout declares it. The grouped GEMM wrapper then selects the correct
+    transpose mode without materializing a full layout-conversion copy.
     """
 
     def __init__(
@@ -40,8 +40,22 @@ class PackedExpertSource(nn.Module):
         config: object | None = None,
     ) -> None:
         super().__init__()
-        expected_gate_up = (layout.num_experts, 2 * layout.expert_size, layout.hidden_size)
-        expected_down = (layout.num_experts, layout.hidden_size, layout.expert_size)
+        if layout.gate_up_layout == "experts,2*expert,hidden":
+            expected_gate_up = (layout.num_experts, 2 * layout.expert_size, layout.hidden_size)
+            self.gate_up_weight_layout = "out_in"
+        elif layout.gate_up_layout == "experts,hidden,2*expert":
+            expected_gate_up = (layout.num_experts, layout.hidden_size, 2 * layout.expert_size)
+            self.gate_up_weight_layout = "in_out"
+        else:
+            raise ValueError(f"unsupported gate_up layout {layout.gate_up_layout!r}")
+        if layout.down_layout == "experts,hidden,expert":
+            expected_down = (layout.num_experts, layout.hidden_size, layout.expert_size)
+            self.down_weight_layout = "out_in"
+        elif layout.down_layout == "experts,expert,hidden":
+            expected_down = (layout.num_experts, layout.expert_size, layout.hidden_size)
+            self.down_weight_layout = "in_out"
+        else:
+            raise ValueError(f"unsupported down layout {layout.down_layout!r}")
         if tuple(gate_up_proj.shape) != expected_gate_up:
             raise ValueError(f"normalized gate_up shape {tuple(gate_up_proj.shape)} != {expected_gate_up}")
         if tuple(down_proj.shape) != expected_down:

@@ -13,6 +13,8 @@ from .frozen_linear import (
     can_use_direct_bf16,
     direct_asym_capability,
     frozen_linear,
+    initialize_asym_cuda_graph_state,
+    initialize_asym_single_group_launch_tensors,
     measure_gpu_weight_allocation,
 )
 from .host_weight import HostWeight, HostWeightMetadata, tensor_nbytes
@@ -241,6 +243,8 @@ __all__ = [
     "install_attention_saved_tensor_offload",
     "install_decoder_checkpoint",
     "install_decoder_saved_tensor_offload",
+    "initialize_asym_cuda_graph_state",
+    "initialize_asym_single_group_launch_tensors",
     "require_expert_activation_offload_kernels",
     "stage_low_rank_from_cpu",
     "tensor_nbytes",

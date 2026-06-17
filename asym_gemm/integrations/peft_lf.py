@@ -29,7 +29,8 @@ def adapt_lf_asym_peft_lora(
     selection = parse_lf_offload_modules(offload_modules)
     asym_dense_targets = asym_owned_dense_target_modules
     wrap_dense = bool(asym_dense_targets) or (
-        backend == "asym" and (bool(selection.attention_targets) or selection.shared_experts or selection.lm_head)
+        backend == "asym"
+        and (bool(selection.attention_targets) or selection.shared_experts or selection.lm_head or selection.mlp_dense)
     )
     return apply_lf_asym_lora(
         model,

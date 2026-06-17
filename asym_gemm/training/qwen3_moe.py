@@ -240,6 +240,14 @@ def _expert_act_offload_lora_a_fwd_mode() -> str:
     return mode
 
 
+def _expert_act_offload_act_recompute() -> bool:
+    return _env_flag("ASYM_OFFLOAD_ACT_RECOMPUTE", False)
+
+
+def _expert_act_offload_x_unpacked() -> bool:
+    return _env_flag("ASYM_OFFLOAD_X_UNPACKED", False)
+
+
 def _qwen3_window_param(name: str, default: int) -> int:
     value = os.environ.get(f"ASYM_QWEN3_GATE_UP_WINDOWED_BWD_{name}")
     if value is None or not value.strip():
@@ -907,6 +915,32 @@ def _activation_offload_cpu_silu_backward(
     return grad_gate, grad_up
 
 
+def _rebuild_qwen3_packed_x_cpu(
+    ctx,
+    manager: ActivationOffloadManager,
+) -> tuple[CPUActivationHandle, bool]:
+    if not getattr(ctx, "x_unpacked", False):
+        return ctx.x_cpu, False
+
+    hidden_cpu = ctx.x_cpu.tensor
+    token_indices = getattr(ctx, "x_token_indices_cpu", None)
+    if token_indices is None:
+        raise RuntimeError("Qwen3 unpacked-X reconstruction requires token indices")
+
+    manager.wait_cpu_ready(ctx.x_cpu)
+    rebuilt = manager.empty_cpu(
+        (int(token_indices.numel()), int(hidden_cpu.shape[1])),
+        hidden_cpu.dtype,
+        ctx.x_cpu.original_device,
+        "X",
+    )
+    torch.index_select(hidden_cpu, 0, token_indices, out=rebuilt.tensor)
+    route_scale = getattr(ctx, "x_route_scale_cpu", None)
+    if route_scale is not None:
+        rebuilt.tensor.mul_(route_scale.reshape(-1, 1).to(dtype=rebuilt.tensor.dtype))
+    return rebuilt, True
+
+
 class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -914,6 +948,9 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
         packed: torch.Tensor,
         offsets: torch.Tensor,
         experts: torch.Tensor,
+        x_src_hidden: torch.Tensor | None,
+        x_token_indices: torch.Tensor | None,
+        x_route_scale: torch.Tensor | None,
         gate_lora_A: torch.Tensor,
         gate_lora_B: torch.Tensor,
         up_lora_A: torch.Tensor,
@@ -927,9 +964,24 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
         experts = experts.detach().contiguous()
         lora_metadata = prepare_grouped_lora_metadata(offsets, experts, dense_experts=True)
         lora_a_forward_mode = _expert_act_offload_lora_a_fwd_mode()
+        act_recompute = _expert_act_offload_act_recompute()
+        x_unpacked = (
+            _expert_act_offload_x_unpacked()
+            and lora_a_forward_mode == "hbm"
+            and x_src_hidden is not None
+            and x_token_indices is not None
+        )
 
+        x_token_indices_cpu = None
+        x_route_scale_cpu = None
         with prof_range(layer._forward_range("activation_offload", "x_to_cpu")):
-            x_cpu = manager.offload(packed, "X")
+            if x_unpacked:
+                x_cpu = manager.offload(x_src_hidden.detach(), "X")
+                x_token_indices_cpu = x_token_indices.detach().to(device="cpu", dtype=torch.long).contiguous()
+                if x_route_scale is not None:
+                    x_route_scale_cpu = x_route_scale.detach().to(device="cpu", dtype=x_cpu.tensor.dtype).contiguous()
+            else:
+                x_cpu = manager.offload(packed, "X")
 
         with prof_range(layer._forward_range("activation_offload", "gate_up_base")):
             gate_up = layer.gate_up_base(
@@ -1072,7 +1124,15 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
         ctx.x_cpu = x_cpu
         ctx.gate_cpu = gate_cpu
         ctx.up_cpu = up_cpu
-        ctx.act_cpu = act_cpu
+        ctx.act_recompute = act_recompute
+        ctx.x_unpacked = x_unpacked
+        ctx.x_token_indices_cpu = x_token_indices_cpu
+        ctx.x_route_scale_cpu = x_route_scale_cpu
+        if act_recompute:
+            manager.release_cpu(act_cpu)
+            ctx.act_cpu = None
+        else:
+            ctx.act_cpu = act_cpu
         ctx.gate_low_rank_cpu = gate_low_rank_cpu
         ctx.up_low_rank_cpu = up_low_rank_cpu
         ctx.down_low_rank_cpu = down_low_rank_cpu
@@ -1097,6 +1157,8 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
             )
         activation_offload_stats = manager.snapshot()
         activation_offload_stats["expert_lora_a_forward_mode"] = lora_a_forward_mode
+        activation_offload_stats["qwen3_act_recompute"] = bool(act_recompute)
+        activation_offload_stats["qwen3_x_unpacked"] = bool(x_unpacked)
         layer._last_activation_offload_stats = activation_offload_stats
         return output
 
@@ -1165,16 +1227,20 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
             ).mul_(layer.lora_scale)
             manager.release_stage(down_low_rank, drop_cache=True)
             manager.release_cpu(ctx.down_low_rank_cpu)
+            if getattr(ctx, "act_recompute", False):
+                act_handle = _activation_offload_cpu_silu_mul(ctx.gate_cpu, ctx.up_cpu, manager, tag="act")
+            else:
+                act_handle = ctx.act_cpu
             grad_down_lora_A = grouped_lora_a_grad_cpu_right(
                 dS_down,
-                ctx.act_cpu.tensor,
+                act_handle.tensor,
                 offsets,
                 experts,
                 num_experts=int(down_lora_A.shape[0]),
                 stats=layer.stats,
                 tag="down",
             )
-            manager.release_cpu(ctx.act_cpu)
+            manager.release_cpu(act_handle)
 
         with prof_range("backward.mlp.activation_offload.down_base_dx"):
             grad_act = _grouped_base_dx(
@@ -1281,15 +1347,18 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
                 )
 
         with prof_range("backward.mlp.activation_offload.gate_up_lora_a_grad"):
+            x_handle, release_x_handle = _rebuild_qwen3_packed_x_cpu(ctx, manager)
             grad_gate_lora_A, grad_up_lora_A = grouped_lora_a_pair_grad_cpu_right(
                 dS_gate,
                 dS_up,
-                ctx.x_cpu.tensor,
+                x_handle.tensor,
                 offsets,
                 experts,
                 num_experts=int(gate_lora_A.shape[0]),
                 stats=layer.stats,
             )
+            if release_x_handle:
+                manager.release_cpu(x_handle)
             manager.release_cpu(ctx.x_cpu)
 
         if need_grad_packed:
@@ -1315,6 +1384,8 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
             "expert_lora_a_forward_mode",
             "cpu",
         )
+        activation_offload_stats_pre_release["qwen3_act_recompute"] = bool(getattr(ctx, "act_recompute", False))
+        activation_offload_stats_pre_release["qwen3_x_unpacked"] = bool(getattr(ctx, "x_unpacked", False))
         final_cleanup_released_bytes = 0
         for handle in (
             ctx.x_cpu,
@@ -1331,6 +1402,8 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
             final_cleanup_released_bytes += manager.release_cpu(handle)
         activation_offload_stats = manager.snapshot()
         activation_offload_stats["expert_lora_a_forward_mode"] = getattr(ctx, "expert_lora_a_forward_mode", "cpu")
+        activation_offload_stats["qwen3_act_recompute"] = bool(getattr(ctx, "act_recompute", False))
+        activation_offload_stats["qwen3_x_unpacked"] = bool(getattr(ctx, "x_unpacked", False))
         activation_offload_stats["pre_final_cleanup_cpu_owned_bytes"] = activation_offload_stats_pre_release.get("cpu_owned_bytes", 0)
         activation_offload_stats["final_cleanup_released_bytes"] = final_cleanup_released_bytes
         layer._last_activation_offload_stats_pre_release = activation_offload_stats_pre_release
@@ -1338,6 +1411,9 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
 
         return (
             grad_packed,
+            None,
+            None,
+            None,
             None,
             None,
             grad_gate_lora_A,
@@ -2398,12 +2474,19 @@ class AsymQwen3Experts(nn.Module):
         packed: torch.Tensor,
         offsets: torch.Tensor,
         experts: torch.Tensor,
+        *,
+        x_src_hidden: torch.Tensor | None = None,
+        x_token_indices: torch.Tensor | None = None,
+        x_route_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self._check_activation_offload_supported(packed)
         return _ActivationOffloadQwen3ExpertFunction.apply(
             packed,
             offsets,
             experts,
+            x_src_hidden,
+            x_token_indices,
+            x_route_scale,
             self.gate_lora_A,
             self.gate_lora_B,
             self.up_lora_A,
@@ -2509,7 +2592,19 @@ class AsymQwen3Experts(nn.Module):
                 device=packed.device,
             )
         if self._uses_activation_offload():
-            down = self._forward_expert_activation_offload(packed, offsets, experts)
+            x_src_hidden = None
+            x_token_indices = None
+            if _expert_act_offload_x_unpacked():
+                x_src_hidden = hidden_states.reshape(metadata.num_tokens, -1)
+                x_token_indices = metadata.token_indices
+            down = self._forward_expert_activation_offload(
+                packed,
+                offsets,
+                experts,
+                x_src_hidden=x_src_hidden,
+                x_token_indices=x_token_indices,
+                x_route_scale=None,
+            )
         elif self._uses_expert_gc():
             down = self._forward_expert_gc(packed, offsets, experts)
         elif self._uses_expert_recompute():
@@ -2552,7 +2647,21 @@ class AsymQwen3Experts(nn.Module):
                 device=packed.device,
             )
         if self._uses_activation_offload():
-            down = self._forward_expert_activation_offload(packed, offsets, experts)
+            x_src_hidden = None
+            x_token_indices = None
+            x_route_scale = None
+            if _expert_act_offload_x_unpacked():
+                x_src_hidden = hidden_states.reshape(metadata.num_tokens, -1)
+                x_token_indices = metadata.token_indices
+                x_route_scale = metadata.routing_weights
+            down = self._forward_expert_activation_offload(
+                packed,
+                offsets,
+                experts,
+                x_src_hidden=x_src_hidden,
+                x_token_indices=x_token_indices,
+                x_route_scale=x_route_scale,
+            )
         elif self._uses_expert_gc():
             down = self._forward_expert_gc(packed, offsets, experts)
         elif self._uses_expert_recompute():

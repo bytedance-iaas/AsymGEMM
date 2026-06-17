@@ -102,7 +102,7 @@ def _default_classify_component(name: str, module: nn.Module | None = None) -> s
         or ".k_norm." in lower
     ):
         return "norms"
-    if ".mlp." in lower and parent_leaf in {"gate_proj", "up_proj", "down_proj"}:
+    if parent_leaf in {"gate_proj", "up_proj", "down_proj"} and (".mlp." in lower or ".feed_forward." in lower):
         return "mlp_dense"
     return "other"
 
@@ -128,6 +128,8 @@ def _selection_component_selected(selection: Any, component: str, leaf: str = ""
         return bool(getattr(selection, "lm_head", False))
     if component == "norms":
         return bool(getattr(selection, "norms", False))
+    if component == "mlp_dense":
+        return bool(getattr(selection, "mlp_dense", False))
     return False
 
 
@@ -308,6 +310,7 @@ def validate_lf_offload_residency(
 class AsymFrozenEmbedding(nn.Module):
     def __init__(self, source: nn.Embedding, *, host_weight: HostWeight | None = None, pin_memory: bool = False) -> None:
         super().__init__()
+        self._output_device: torch.device | None = None
         if getattr(source, "max_norm", None) is not None:
             raise ValueError("AsymFrozenEmbedding does not support mutable max_norm embeddings")
         self.host_weight = host_weight or adopt_host_weight(
@@ -327,8 +330,17 @@ class AsymFrozenEmbedding(nn.Module):
     def weight(self) -> torch.Tensor:
         return self.host_weight.weight
 
+    def _apply(self, fn, recurse: bool = True):  # type: ignore[override]
+        super()._apply(fn, recurse=recurse)
+        probe_device = self._output_device or self.host_weight.weight.device
+        probe = torch.empty(0, dtype=self.host_weight.weight.dtype, device=probe_device)
+        moved = fn(probe)
+        if isinstance(moved, torch.Tensor):
+            self._output_device = moved.device
+        return self
+
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        target_device = input_ids.device
+        target_device = self._output_device or input_ids.device
         input_ids_cpu = input_ids.to("cpu", non_blocking=False)
         out_cpu = F.embedding(input_ids_cpu, self.host_weight.weight, self.padding_idx)
         if target_device.type == "cpu":

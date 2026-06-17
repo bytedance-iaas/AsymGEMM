@@ -49,7 +49,7 @@ agent/archive/
 # !agent/status.md
 # !agent/attn_math.md
 # !agent/impls/*
-/profiling*/
+profiling*/
 test_profiling*/
 # !/profiling/transpose_ncu/
 # !/profiling/transpose_ncu/**
@@ -57,4 +57,5 @@ results/
 reports/
 third-party/
 outputs/
+archive/
 

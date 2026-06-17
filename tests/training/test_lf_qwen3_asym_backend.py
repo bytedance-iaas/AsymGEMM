@@ -33,7 +33,9 @@ from asym_gemm.training.decoder_activation_offload import is_decoder_saved_tenso
 from asym_gemm.training.decoder_checkpoint import decoder_checkpoint_module_names, is_decoder_checkpoint_wrapper
 from asym_gemm.training.exp_act_offload_lora import require_expert_activation_offload_kernels
 from asym_gemm.training.frozen_linear import AsymFrozenLinear, TorchGroupedFrozenLinear
+from asym_gemm.training.llama4_experts import AsymLlama4Experts
 from asym_gemm.training.llama4_moe import AsymLlama4Moe, AsymLlama4Router, is_llama4_moe
+from asym_gemm.training.llama4_shared_mlp import AsymLlama4SharedMLP
 from asym_gemm.training.lora import AsymLoRALinear
 from asym_gemm.training.moe import (
     build_contiguous_route_metadata,
@@ -385,6 +387,30 @@ class FakeLlama4MLP(nn.Module):
         return self.down_proj(self.activation_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
+class FakePeftLinear(nn.Module):
+    def __init__(self, base_layer: nn.Linear, *, rank: int = 2, alpha: float = 4.0) -> None:
+        super().__init__()
+        self.base_layer = base_layer
+        self.active_adapter = "default"
+        self.lora_A = nn.ModuleDict(
+            {"default": nn.Linear(base_layer.in_features, rank, bias=False, dtype=torch.bfloat16)}
+        )
+        self.lora_B = nn.ModuleDict(
+            {"default": nn.Linear(rank, base_layer.out_features, bias=False, dtype=torch.bfloat16)}
+        )
+        self.lora_dropout = nn.ModuleDict({"default": nn.Identity()})
+        self.scaling = {"default": float(alpha) / float(rank)}
+        nn.init.kaiming_uniform_(self.lora_A["default"].weight, a=5**0.5)
+        nn.init.zeros_(self.lora_B["default"].weight)
+
+    def get_base_layer(self) -> nn.Linear:
+        return self.base_layer
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        lora = self.lora_B["default"](self.lora_A["default"](x.to(dtype=torch.bfloat16))) * self.scaling["default"]
+        return self.base_layer(x) + lora.to(dtype=x.dtype)
+
+
 class FakeLlama4Moe(nn.Module):
     def __init__(
         self,
@@ -439,6 +465,43 @@ class FakeLlama4WholeOffloadModel(FakeLlama4Model):
         self.embed_tokens = nn.Embedding(hidden_size, hidden_size, dtype=torch.bfloat16)
         self.lm_head = nn.Linear(hidden_size, hidden_size, bias=False, dtype=torch.bfloat16)
         self.norm = FakeRMSNorm(hidden_size)
+
+
+class FakeLlama4DecoderLayer(nn.Module):
+    """Faithful Llama4 decoder layer: self_attn + `feed_forward` + the two norms."""
+
+    def __init__(self, *, hidden_dim: int = 8, intermediate_dim: int = 8) -> None:
+        super().__init__()
+        self.self_attn = FakeSelfAttention(hidden_dim=hidden_dim)
+        self.feed_forward = FakeLlama4Moe(hidden_size=hidden_dim, intermediate_size=intermediate_dim)
+        self.input_layernorm = FakeRMSNorm(hidden_dim=hidden_dim)
+        self.post_attention_layernorm = FakeRMSNorm(hidden_dim=hidden_dim)
+
+    def forward(self, hidden_states: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        attn_out, _ = self.self_attn(hidden_states, **kwargs)
+        hidden_states = residual + attn_out.to(dtype=residual.dtype)
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        ff_out = self.feed_forward(hidden_states)
+        if isinstance(ff_out, tuple):
+            ff_out = ff_out[0]
+        return residual + ff_out.to(dtype=residual.dtype)
+
+
+class FakeLlama4DecoderModel(nn.Module):
+    def __init__(self, *, hidden_dim: int = 8, intermediate_dim: int = 8, num_layers: int = 2) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [FakeLlama4DecoderLayer(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim) for _ in range(num_layers)]
+        )
+        self.lm_head = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
+
+    def forward(self, hidden_states: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, **kwargs)
+        return self.lm_head(hidden_states)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -531,13 +594,18 @@ def test_lf_offload_module_parser_stage1_contract() -> None:
     assert parse_lf_offload_modules("norms").implemented_components == frozenset({"norms"})
     assert parse_lf_offload_modules("q_proj").attention_targets == frozenset({"q_proj"})
     assert parse_lf_offload_modules("all").implemented_components == frozenset(
-        {"routed_experts", "router", "shared_experts", "attention", "embed_tokens", "lm_head", "norms"}
+        {"routed_experts", "router", "shared_experts", "attention", "embed_tokens", "lm_head", "norms", "mlp_dense"}
     )
+    # dense-MLP base offload is a selectable component (Llama4 Maverick interleaved dense layers).
+    assert parse_lf_offload_modules("mlp_dense").implemented_components == frozenset({"mlp_dense"})
+    assert parse_lf_offload_modules("dense_mlp").mlp_dense
+    assert parse_lf_offload_modules("feed_forward").mlp_dense
+    assert parse_lf_offload_modules("routed_experts,mlp_dense").mlp_dense
 
     with pytest.raises(ValueError, match="cannot be combined"):
         parse_lf_offload_modules("none,routed_experts")
     with pytest.raises(ValueError, match="unknown"):
-        parse_lf_offload_modules("mlp_dense")
+        parse_lf_offload_modules("not_a_real_component")
 
 
 @pytest.mark.parametrize(
@@ -564,10 +632,57 @@ def test_lf_offload_module_parser_stage1_contract() -> None:
         ("model.layers.0.feed_forward.router", "router"),
         ("model.layers.0.feed_forward.router.weight", "router"),
         ("model.layers.0.feed_forward.shared_expert.down_proj.weight", "shared_experts"),
+        ("model.layers.0.feed_forward.gate_proj", "mlp_dense"),
+        ("model.layers.0.feed_forward.up_proj.weight", "mlp_dense"),
+        ("model.layers.0.feed_forward.down_proj", "mlp_dense"),
+        ("model.layers.0.mlp.gate_proj", "mlp_dense"),
     ],
 )
 def test_lf_component_classifier_covers_qwen3_qwen35_llama4_names(name: str, component: str) -> None:
     assert classify_lf_component(name) == component
+
+
+def test_default_residency_classifier_covers_llama4_dense_mlp_names() -> None:
+    from asym_gemm.training.offload import collect_lf_offload_residency
+
+    class Selection:
+        mlp_dense = True
+
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Module()])
+    model.layers[0].feed_forward = nn.Module()
+    model.layers[0].feed_forward.gate_proj = nn.Linear(8, 8, bias=False)
+
+    rows = collect_lf_offload_residency(model, Selection())
+    row = next(row for row in rows if row.name == "layers.0.feed_forward.gate_proj.weight")
+    assert row.component == "mlp_dense"
+    assert row.selected_for_cpu
+
+
+def test_adapt_lf_asym_peft_lora_wraps_explicit_mlp_dense_cpu_offload_without_peft_target() -> None:
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Module()])
+    model.layers[0].feed_forward = nn.Module()
+    model.layers[0].feed_forward.gate_proj = nn.Linear(8, 8, bias=False, dtype=torch.bfloat16)
+
+    model, report = adapt_lf_asym_peft_lora(
+        model,
+        raw_lora_target=[],
+        dense_target_modules=[],
+        asym_owned_dense_target_modules=[],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="mlp_dense",
+        expert_recompute_policy="none",
+        router_mode="hf",
+        strict=False,
+    )
+
+    assert isinstance(model.layers[0].feed_forward.gate_proj, AsymFrozenLinear)
+    assert report.cpu_resident_base_bytes_by_component["mlp_dense"] > 0
 
 
 def test_lf_trace_model_memory_summary_attributes_host_weights_by_component() -> None:
@@ -581,6 +696,11 @@ def test_lf_trace_model_memory_summary_attributes_host_weights_by_component() ->
     host_rows = [row for row in summary["rows"] if row["category"] == "host_weight"]
     assert any(row["component"] == "embed_tokens" and row["bytes"] > 0 for row in host_rows)
     assert not any(row["component"] == "routed_experts" for row in host_rows)
+    # Pinned bytes are a SUBSET field on each host_weight row, never a separate additive
+    # "pinned_host_weight" row -- otherwise offloaded weights (e.g. routed_experts) are
+    # double-counted when the rows are summed.
+    assert not any(row["category"] == "pinned_host_weight" for row in summary["rows"])
+    assert all("pinned_bytes" in row and row["pinned_bytes"] <= row["bytes"] for row in host_rows)
 
 
 def test_is_qwen3_experts_accepts_packed_fake_and_rejects_linear() -> None:
@@ -1154,6 +1274,17 @@ def test_apply_lf_asym_lora_embed_tokens_adopts_cpu_storage_without_clone() -> N
     assert not any(name == "embed_tokens.weight" for name, _param in model.named_parameters())
 
 
+def test_asym_frozen_embedding_tracks_model_to_output_device_without_moving_host_weight() -> None:
+    wrapped = AsymFrozenEmbedding(nn.Embedding(8, 4, dtype=torch.bfloat16))
+    assert wrapped.weight.device.type == "cpu"
+
+    wrapped.to(torch.device("meta"))
+    out = wrapped(torch.tensor([[0, 1, 2]], dtype=torch.long))
+
+    assert wrapped.weight.device.type == "cpu"
+    assert out.device.type == "meta"
+
+
 def test_apply_lf_asym_lora_embed_tokens_rejects_tied_input_output_embeddings() -> None:
     model = FakeTiedHeadModel()
     with pytest.raises(ValueError, match="tied embed/lm_head"):
@@ -1426,6 +1557,113 @@ def test_asym_llama4_moe_hf_keeps_router_input_grad_path() -> None:
     assert all(not param.requires_grad for param in wrapped.router.parameters())
 
 
+def test_llama4_forward_input_scaled_exposes_route_scale_for_x_unpacked(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(9)
+    monkeypatch.setenv("ASYM_OFFLOAD_X_UNPACKED", "1")
+    source = FakeLlama4Moe()
+    wrapped = AsymLlama4Moe(
+        source,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        router_mode="hf",
+    )
+    experts = wrapped.experts
+    experts.train()
+    captured: dict[str, torch.Tensor] = {}
+
+    monkeypatch.setattr(experts, "_uses_activation_offload", lambda: True)
+
+    def fake_activation_offload(
+        packed: torch.Tensor,
+        offsets: torch.Tensor,
+        expert_ids: torch.Tensor,
+        *,
+        x_src_hidden: torch.Tensor | None = None,
+        x_token_indices: torch.Tensor | None = None,
+        x_route_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert x_src_hidden is not None
+        assert x_token_indices is not None
+        assert x_route_scale is not None
+        captured["src_hidden"] = x_src_hidden.detach().clone()
+        captured["token_indices"] = x_token_indices.detach().clone()
+        captured["route_scale"] = x_route_scale.detach().clone()
+        captured["packed"] = packed.detach().clone()
+        return experts._forward_expert_body(packed, offsets, expert_ids, dense_experts=True)
+
+    monkeypatch.setattr(experts, "_forward_expert_activation_offload", fake_activation_offload)
+    x = torch.randn(2, 5, source.hidden_dim, dtype=torch.bfloat16)
+    flat = x.reshape(-1, source.hidden_dim)
+    top_k_index, input_weights, _router_logits = wrapped._compute_routing(flat)
+
+    _ = experts.forward_input_scaled(flat, top_k_index, input_weights)
+
+    metadata = build_contiguous_route_metadata(top_k_index, input_weights, num_experts=source.num_experts)
+    expected_packed = pack_tokens_contiguous(flat, metadata)
+    expected_packed = expected_packed * metadata.routing_weights.reshape(-1, 1).to(
+        device=expected_packed.device,
+        dtype=expected_packed.dtype,
+    )
+    torch.testing.assert_close(captured["src_hidden"], flat)
+    torch.testing.assert_close(captured["token_indices"], metadata.token_indices)
+    torch.testing.assert_close(captured["route_scale"], metadata.routing_weights)
+    torch.testing.assert_close(captured["packed"], expected_packed)
+
+
+def test_llama4_forward_input_scaled_omits_x_unpacked_metadata_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(10)
+    monkeypatch.setenv("ASYM_OFFLOAD_X_UNPACKED", "0")
+    source = FakeLlama4Moe()
+    wrapped = AsymLlama4Moe(
+        source,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        router_mode="hf",
+    )
+    experts = wrapped.experts
+    experts.train()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(experts, "_uses_activation_offload", lambda: True)
+
+    def fake_activation_offload(
+        packed: torch.Tensor,
+        offsets: torch.Tensor,
+        expert_ids: torch.Tensor,
+        *,
+        x_src_hidden: torch.Tensor | None = None,
+        x_token_indices: torch.Tensor | None = None,
+        x_route_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        captured["x_src_hidden"] = x_src_hidden
+        captured["x_token_indices"] = x_token_indices
+        captured["x_route_scale"] = x_route_scale
+        return experts._forward_expert_body(packed, offsets, expert_ids, dense_experts=True)
+
+    monkeypatch.setattr(experts, "_forward_expert_activation_offload", fake_activation_offload)
+    x = torch.randn(2, 5, source.hidden_dim, dtype=torch.bfloat16)
+    flat = x.reshape(-1, source.hidden_dim)
+    top_k_index, input_weights, _router_logits = wrapped._compute_routing(flat)
+
+    _ = experts.forward_input_scaled(flat, top_k_index, input_weights)
+
+    assert captured == {
+        "x_src_hidden": None,
+        "x_token_indices": None,
+        "x_route_scale": None,
+    }
+
+
 @pytest.mark.parametrize("policy", ["tok-le2", "tok-le2-act", "gc-exp"])
 def test_asym_qwen3_experts_torch_recompute_policies_match_none(policy: str) -> None:
     torch.manual_seed(5)
@@ -1590,6 +1828,111 @@ def test_qwen3_activation_offload_lora_a_fwd_selector_accepts_exact_values_only(
     monkeypatch.setenv("ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD", "HBM")
     with pytest.raises(ValueError, match="ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD"):
         qwen3_moe_module._expert_act_offload_lora_a_fwd_mode()
+
+
+def test_qwen3_activation_offload_threads_unpacked_x_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(40)
+    monkeypatch.setenv("ASYM_OFFLOAD_X_UNPACKED", "1")
+    source = FakeQwen3Experts()
+    wrapped = AsymQwen3Experts(
+        source,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        init_lora_weights="peft",
+        strict=False,
+    )
+    wrapped.train()
+    captured: dict[str, torch.Tensor | None] = {}
+    monkeypatch.setattr(wrapped, "_uses_activation_offload", lambda: True)
+
+    def fake_activation_offload(
+        packed: torch.Tensor,
+        offsets: torch.Tensor,
+        expert_ids: torch.Tensor,
+        *,
+        x_src_hidden: torch.Tensor | None = None,
+        x_token_indices: torch.Tensor | None = None,
+        x_route_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert x_src_hidden is not None
+        assert x_token_indices is not None
+        captured["src_hidden"] = x_src_hidden.detach().clone()
+        captured["token_indices"] = x_token_indices.detach().clone()
+        captured["route_scale"] = None if x_route_scale is None else x_route_scale.detach().clone()
+        captured["packed"] = packed.detach().clone()
+        return wrapped._forward_expert_body(packed, offsets, expert_ids, dense_experts=True)
+
+    monkeypatch.setattr(wrapped, "_forward_expert_activation_offload", fake_activation_offload)
+    x = torch.randn(5, source.hidden_dim, dtype=torch.bfloat16)
+    top_k_index, top_k_weights = _routing()
+
+    _ = wrapped(x, top_k_index, top_k_weights)
+
+    metadata = build_contiguous_route_metadata(top_k_index, top_k_weights, num_experts=source.num_experts)
+    expected_packed = pack_tokens_contiguous(x, metadata)
+    torch.testing.assert_close(captured["src_hidden"], x)
+    torch.testing.assert_close(captured["token_indices"], metadata.token_indices)
+    assert captured["route_scale"] is None
+    torch.testing.assert_close(captured["packed"], expected_packed)
+
+
+def test_qwen3_activation_offload_threads_input_scaled_route_scale(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(41)
+    monkeypatch.setenv("ASYM_OFFLOAD_X_UNPACKED", "1")
+    source = FakeQwen3Experts()
+    wrapped = AsymQwen3Experts(
+        source,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        init_lora_weights="peft",
+        strict=False,
+    )
+    wrapped.train()
+    captured: dict[str, torch.Tensor | None] = {}
+    monkeypatch.setattr(wrapped, "_uses_activation_offload", lambda: True)
+
+    def fake_activation_offload(
+        packed: torch.Tensor,
+        offsets: torch.Tensor,
+        expert_ids: torch.Tensor,
+        *,
+        x_src_hidden: torch.Tensor | None = None,
+        x_token_indices: torch.Tensor | None = None,
+        x_route_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert x_src_hidden is not None
+        assert x_token_indices is not None
+        assert x_route_scale is not None
+        captured["src_hidden"] = x_src_hidden.detach().clone()
+        captured["token_indices"] = x_token_indices.detach().clone()
+        captured["route_scale"] = x_route_scale.detach().clone()
+        captured["packed"] = packed.detach().clone()
+        return wrapped._forward_expert_body(packed, offsets, expert_ids, dense_experts=True)
+
+    monkeypatch.setattr(wrapped, "_forward_expert_activation_offload", fake_activation_offload)
+    x = torch.randn(5, source.hidden_dim, dtype=torch.bfloat16)
+    top_k_index, top_k_weights = _routing()
+
+    _ = wrapped.forward_input_scaled(x, top_k_index, top_k_weights)
+
+    metadata = build_contiguous_route_metadata(top_k_index, top_k_weights, num_experts=source.num_experts)
+    expected_packed = pack_tokens_contiguous(x, metadata)
+    expected_packed = expected_packed * metadata.routing_weights.reshape(-1, 1).to(
+        device=expected_packed.device,
+        dtype=expected_packed.dtype,
+    )
+    torch.testing.assert_close(captured["src_hidden"], x)
+    torch.testing.assert_close(captured["token_indices"], metadata.token_indices)
+    torch.testing.assert_close(captured["route_scale"], metadata.routing_weights)
+    torch.testing.assert_close(captured["packed"], expected_packed)
 
 
 @pytest.mark.parametrize("policy", ["tok-le0", "tok-le2", "tok-le2-act", "gc-exp"])
@@ -1873,6 +2216,64 @@ def test_qwen3_decoder_layer_activation_offload_wraps_layers(monkeypatch: pytest
     assert getattr(model, "_asym_layer_act_offload_modules") == ("layers.0", "layers.1")
 
 
+def test_decoder_layer_matcher_accepts_qwen3_and_llama4() -> None:
+    from asym_gemm.integrations.lf import _is_qwen3_decoder_layer_module_name as _is_decoder
+
+    # Qwen3 (regression): self_attn + mlp + norms, qwen3 lineage.
+    assert _is_decoder("model.layers.0", FakeQwen3DecoderLayer())
+    # Llama4 (NEW in this change): self_attn + feed_forward + norms, llama4 lineage.
+    assert _is_decoder("model.layers.0", FakeLlama4DecoderLayer())
+    # Negative: not a decoder layer.
+    assert not _is_decoder("model.layers.0", nn.Linear(8, 8))
+
+
+def test_apply_lf_asym_lora_gc_layer_wraps_llama4_decoder_layers() -> None:
+    model = FakeLlama4DecoderModel(num_layers=2)
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj"],
+        dense_target_modules=["q_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="torch",
+        precision="bf16",
+        offload_modules="none",
+        expert_recompute_policy="gc-layer",
+        router_mode="hf",
+        strict=False,
+    )
+
+    assert report.layer_gc_enabled
+    assert report.layer_gc_wrapped == 2
+    assert report.layer_gc_modules == ("layers.0", "layers.1")
+    assert is_decoder_checkpoint_wrapper(model.layers[0])
+
+
+def test_llama4_decoder_layer_activation_offload_wraps_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASYMM_LAYER_ACT_OFFLOAD", "1")
+    model = FakeLlama4DecoderModel(num_layers=2)
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["q_proj"],
+        dense_target_modules=["q_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="none",
+        expert_recompute_policy="none",
+        router_mode="hf",
+        strict=False,
+    )
+
+    assert report.layer_act_offload_enabled
+    assert report.layer_act_offload_wrapped == 2
+    assert report.layer_act_offload_modules == ("layers.0", "layers.1")
+    assert is_decoder_saved_tensor_offload_wrapper(model.layers[0])
+
+
 def test_qwen3_decoder_layer_activation_offload_requires_policy_none(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ASYMM_LAYER_ACT_OFFLOAD", "1")
     model = FakeQwen3DecoderModel(num_layers=1)
@@ -2046,7 +2447,7 @@ def test_apply_lf_asym_lora_wraps_llama4_moe_and_dense_without_router_lora() -> 
     assert report.llama4_moes_wrapped == 2
     assert report.dense_lora_wrapped == 14
     assert isinstance(model.layers[0].feed_forward, AsymLlama4Moe)
-    assert isinstance(model.layers[0].feed_forward.experts, AsymQwen3Experts)
+    assert isinstance(model.layers[0].feed_forward.experts, AsymLlama4Experts)
     assert not model.layers[0].feed_forward.router.weight.requires_grad
     trainable = [name for name, param in model.named_parameters() if param.requires_grad]
     assert trainable
@@ -2084,6 +2485,9 @@ def test_apply_lf_asym_lora_whole_wraps_llama4_moe_and_reports_router_mode() -> 
 
 def test_apply_lf_asym_lora_llama4_replaces_source_experts_with_single_cpu_owner() -> None:
     model = FakeLlama4Model()
+    source_experts = model.layers[0].feed_forward.experts
+    gate_up_shape = tuple(model.layers[0].feed_forward.experts.gate_up_proj.shape)
+    down_shape = tuple(model.layers[0].feed_forward.experts.down_proj.shape)
     model, report = apply_lf_asym_lora(
         model,
         raw_lora_target=["experts"],
@@ -2102,6 +2506,16 @@ def test_apply_lf_asym_lora_llama4_replaces_source_experts_with_single_cpu_owner
     assert isinstance(wrapped, AsymLlama4Moe)
     assert wrapped.experts.gate_up_base.host_weight.weight.device.type == "cpu"
     assert wrapped.experts.down_base.host_weight.weight.device.type == "cpu"
+    assert wrapped.experts.gate_up_base.weight_layout == "in_out"
+    assert wrapped.experts.down_base.weight_layout == "in_out"
+    assert tuple(wrapped.experts.gate_up_base.host_weight.weight.shape) == gate_up_shape
+    assert tuple(wrapped.experts.down_base.host_weight.weight.shape) == down_shape
+    assert source_experts.gate_up_proj.numel() == 0
+    assert source_experts.down_proj.numel() == 0
+    assert wrapped.experts.gate_up_base.in_features == model.layers[0].feed_forward.hidden_dim
+    assert wrapped.experts.gate_up_base.out_features == 2 * wrapped.experts.intermediate_dim
+    assert wrapped.experts.down_base.in_features == wrapped.experts.intermediate_dim
+    assert wrapped.experts.down_base.out_features == model.layers[0].feed_forward.hidden_dim
     assert report.cpu_resident_base_bytes_by_component["routed_experts"] > 0
     assert report.selected_gpu_resident_base_bytes_by_component == {}
     assert not any(
@@ -2136,6 +2550,41 @@ def test_apply_lf_asym_lora_llama4_shared_experts_adopt_cpu_storage_without_clon
     assert not any(
         ".feed_forward.shared_expert.gate_proj.weight" in name for name, _param in model.named_parameters()
     )
+
+
+def test_adapt_lf_asym_peft_lora_llama4_shared_expert_replaces_preexisting_peft_leaves() -> None:
+    model = FakeLlama4Model(num_layers=1)
+    shared = model.layers[0].feed_forward.shared_expert
+    shared.gate_proj = FakePeftLinear(shared.gate_proj, rank=2, alpha=4.0)
+    shared.up_proj = FakePeftLinear(shared.up_proj, rank=2, alpha=4.0)
+    shared.down_proj = FakePeftLinear(shared.down_proj, rank=2, alpha=4.0)
+    gate_a_before = shared.gate_proj.lora_A["default"].weight.detach().clone()
+    up_a_before = shared.up_proj.lora_A["default"].weight.detach().clone()
+    down_a_before = shared.down_proj.lora_A["default"].weight.detach().clone()
+
+    model, report = adapt_lf_asym_peft_lora(
+        model,
+        raw_lora_target=["all"],
+        dense_target_modules=["gate_proj", "up_proj", "down_proj"],
+        asym_owned_dense_target_modules=[],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="shared_experts",
+        router_mode="whole",
+        strict=True,
+    )
+
+    wrapped = model.layers[0].feed_forward.shared_expert
+    assert isinstance(wrapped, AsymLlama4SharedMLP)
+    assert wrapped.preexisting_lora_leaf_count == 3
+    assert report.dense_lora_wrapped == 3
+    assert torch.equal(wrapped.gate_proj.lora_a.detach().cpu(), gate_a_before)
+    assert torch.equal(wrapped.up_proj.lora_a.detach().cpu(), up_a_before)
+    assert torch.equal(wrapped.down_proj.lora_a.detach().cpu(), down_a_before)
+    assert report.cpu_resident_base_bytes_by_component["shared_experts"] > 0
 
 
 def test_apply_lf_asym_lora_llama4_router_adopts_cpu_storage_without_clone() -> None:
@@ -2553,9 +3002,13 @@ def test_asym_qwen3_experts_sm100_backward_matches_torch_backend() -> None:
 
 @pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")
 @pytest.mark.parametrize("lora_a_forward_mode", ["cpu", "hbm"])
+@pytest.mark.parametrize("act_recompute", ["0", "1"])
+@pytest.mark.parametrize("x_unpacked", ["0", "1"])
 def test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend(
     monkeypatch: pytest.MonkeyPatch,
     lora_a_forward_mode: str,
+    act_recompute: str,
+    x_unpacked: str,
 ) -> None:
     torch.manual_seed(71)
     source_torch = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128).cuda()
@@ -2592,6 +3045,8 @@ def test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend(
 
     monkeypatch.delenv("ASYMM_EXPERT_ACT_OFFLOAD", raising=False)
     monkeypatch.setenv("ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD", lora_a_forward_mode)
+    monkeypatch.setenv("ASYM_OFFLOAD_ACT_RECOMPUTE", act_recompute)
+    monkeypatch.setenv("ASYM_OFFLOAD_X_UNPACKED", x_unpacked)
     out_torch = torch_backend(x_torch, top_k_index, top_k_weights)
     monkeypatch.setenv("ASYMM_EXPERT_ACT_OFFLOAD", "1")
     full_reason = require_expert_activation_offload_kernels(scope="full", check_only=True)
@@ -2635,6 +3090,8 @@ def test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend(
     assert stats["final_cleanup_released_bytes"] == 0
     assert stats["cpu_pool_cached_bytes"] <= stats["cpu_pool_limit_bytes"]
     assert stats["expert_lora_a_forward_mode"] == lora_a_forward_mode
+    assert stats["qwen3_act_recompute"] is (act_recompute == "1")
+    assert stats["qwen3_x_unpacked"] is (x_unpacked == "1" and lora_a_forward_mode == "hbm")
     if lora_a_forward_mode == "cpu":
         assert asym_backend.stats.cpu_left_lora_a_calls == 3
         assert asym_backend.stats.expact_lora_a_forward_grouped_calls == 3

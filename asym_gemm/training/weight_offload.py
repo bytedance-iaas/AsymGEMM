@@ -219,17 +219,23 @@ class LoRAWeightOffloadCoordinator:
 
     def summary(self) -> dict[str, Any]:
         home_bytes = 0
+        home_numel = 0
         pinned_bytes = 0
         for group in self._groups:
             if group.home is None:
                 continue
             nbytes = int(group.home.numel() * group.home.element_size())
             home_bytes += nbytes
+            # Element count survives gather/release (the bank .data is a 0-numel placeholder at rest,
+            # but the CPU home slab always holds the real weights), so this is the trustworthy
+            # trainable expert-LoRA parameter count for offloaded banks.
+            home_numel += int(group.home.numel())
             if group.home.is_pinned():
                 pinned_bytes += nbytes
         return {
             "weight_offload_enabled": True,
             "weight_offload_param_count": len(self.registered_params),
+            "weight_offload_param_numel": int(home_numel),
             "weight_offload_group_count": len(self._groups),
             "weight_offload_home_bytes": int(home_bytes),
             "weight_offload_pinned_home_bytes": int(pinned_bytes),

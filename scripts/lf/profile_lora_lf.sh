@@ -19,27 +19,27 @@ DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun}
 RUN_POST=${RUN_POST:-false}
 
 # Sweep axes
-GPU_POOL=${GPU_POOL:-2}
+GPU_POOL=${GPU_POOL:-0}
 # MODEL_SPECS entries are model|num_gpus. Recompute belongs only in BACKEND_SPECS.
-MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
+# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
-# MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
+MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1,Qwen/Qwen3.5-122B-A10B|1"}
 ROUTER_MODES=${ROUTER_MODES:-whole}
-# PROFILERS=${PROFILERS:-nsys,source}
-PROFILERS=${PROFILERS:-source}
+PROFILERS=${PROFILERS:-both}
+# PROFILERS=${PROFILERS:-source}
 PRECISION=${PRECISION:-bf16}
 # LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
 LORA_DROPOUT=${LORA_DROPOUT:-0.00}
 LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero2|norecomp,zero2|recomp,zero3_offload|norecomp,zero3_offload_mem|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"kt_armbf16|recomp"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
 # Plain asym remains the non-CPUAdam Asym baseline; the default e2e path validates the Asym CPUAdamW backend.
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp,superoffload|recomp"}
-BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
+BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp,zero3_offload|recomp"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
 
 # Paired expert policy / expert activation offload / attention activation offload / layer activation offload axis.
 # Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD.
@@ -64,6 +64,7 @@ USE_ASYM_CPU_ADAMW=${USE_ASYM_CPU_ADAMW:-true}
 ASYM_CPU_ADAMW_BACKEND=${ASYM_CPU_ADAMW_BACKEND:-deepspeed}
 ASYM_CPU_ADAMW_PIN_MEMORY=${ASYM_CPU_ADAMW_PIN_MEMORY:-true}
 ASYM_CPU_ADAMW_FP32_MASTER=${ASYM_CPU_ADAMW_FP32_MASTER:-true}
+ASYM_CUDA_GRAPH=${ASYM_CUDA_GRAPH:-off}
 
 # Execution
 OVERWRITE=${OVERWRITE:-false}
@@ -75,14 +76,16 @@ RUN_NAME=${RUN_NAME:-}
 
 # Training
 # SEQ_LENS=${SEQ_LENS:-11264}
-SEQ_LENS=${SEQ_LENS:-10240}
-# SEQ_LENS=${SEQ_LENS:-8192}
+# SEQ_LENS=${SEQ_LENS:-10240}
+SEQ_LENS=${SEQ_LENS:-8192}
 # SEQ_LENS=${SEQ_LENS:-7168}
 # SEQ_LENS=${SEQ_LENS:-4096}
 PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-8}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
-MAX_STEPS=${MAX_STEPS:-10}
-WARMUP_STEPS=${WARMUP_STEPS:-5}
+# MAX_STEPS=${MAX_STEPS:-10}
+# WARMUP_STEPS=${WARMUP_STEPS:-5}
+MAX_STEPS=${MAX_STEPS:-1}
+WARMUP_STEPS=${WARMUP_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 LORA_RANK=${LORA_RANK:-64}
 LORA_ALPHA=${LORA_ALPHA:-16}
@@ -97,12 +100,18 @@ DATASET_OVERWRITE=${DATASET_OVERWRITE:-false}
 TEMPLATE=${TEMPLATE:-auto}
 MAX_SAMPLES=${MAX_SAMPLES:-64}
 
+# Shared AsymGEMM expert activation-backfetch toggles. Default OFF; forced off for
+# policy-independent backends. Qwen and Llama use the same env names.
+ASYM_OFFLOAD_ACT_RECOMPUTE=${ASYM_OFFLOAD_ACT_RECOMPUTE:-0}
+ASYM_OFFLOAD_X_UNPACKED=${ASYM_OFFLOAD_X_UNPACKED:-0}
+
 # Output and profiling
 OUTPUT_ROOT=${OUTPUT_ROOT:-}
 PROFILE_LEVEL=${PROFILE_LEVEL:-op}
 PROFILE_LAYERS=${PROFILE_LAYERS:-all}
-PROFILE_MEMORY_ATTRIBUTION=${PROFILE_MEMORY_ATTRIBUTION:-auto}
-PROFILE_MEMORY_BREAKDOWN=${PROFILE_MEMORY_BREAKDOWN:-auto}
+# Single knob: PROFILE_MEMORY_BREAKDOWN gates BOTH the per-module memory breakdown and the
+# saved-tensor/param attribution (they always move together). true/false only; no auto.
+PROFILE_MEMORY_BREAKDOWN=${PROFILE_MEMORY_BREAKDOWN:-true}
 PROFILE_MEMORY_BREAKDOWN_INTERVAL=${PROFILE_MEMORY_BREAKDOWN_INTERVAL:-1}
 PROFILE_MEMORY_BREAKDOWN_STEPS=${PROFILE_MEMORY_BREAKDOWN_STEPS:-}
 PROFILE_MEMORY_BREAKDOWN_MODULES=${PROFILE_MEMORY_BREAKDOWN_MODULES:-attention,router,mlp,experts,shared_experts,lora,embedding,norms,loss}
@@ -196,7 +205,7 @@ Options:
   --backend-specs LIST           Backend/recompute specs, e.g. 'asym_cpuadamwds|recomp,asym_cpuadamwtorch|recomp,zero3_cpuadam|recomp'.
                                  Use canonical recompute labels: norecomp or recomp. Use both to expand to both modes.
   --router-modes LIST            AsymGEMM router modes: hf, whole. Default ${ROUTER_MODES}.
-  --profilers LIST               source and/or nsys.
+  --profilers LIST               source, nsys, and/or both. both runs Nsight once and materializes sibling source artifacts.
   --seq-lens LIST                LF cutoff lengths. Accepts positive integers, e.g. 4096,8192.
   --asymm-exp-act-policies LIST  Paired expert policy / expert activation offload / attention activation offload / layer activation offload configs.
                                  Format: policy|expert_act|attn_act|layer_act, e.g. none|true|false|false,gc-layer|false|false|false,none|true|true|true.
@@ -212,7 +221,7 @@ Options:
 
   Training:
   --max-steps N                  Measured steps kept in plots/summaries.
-  --warmup-steps N               Extra initial steps to run but exclude from plots/summaries. Minimum 5.
+  --warmup-steps N               Extra initial steps to run but exclude from plots/summaries. Use 5+ for stable timing; 0/1 is allowed for smoke tests.
   --batch-size N
   --gradient-accumulation-steps N
   --learning-rate VALUE
@@ -220,7 +229,7 @@ Options:
   --lora-alpha VALUE
   --lora-dropout LIST           LoRA dropout probabilities in fixed 0.xx format, e.g. 0.00,0.10.
                                  KT supports nonzero dropout for validated kt_torchbf16 and kt_armbf16 SFT backends.
-  --lf-expert-lora-impls LIST   Qwen fused expert LoRA implementation(s): peft-target-parameters, split-target-parameters, off.
+  --lf-expert-lora-impls NAME   Qwen fused expert LoRA implementation: peft-target-parameters, split-target-parameters, off.
                                  Use split-target-parameters for the corrected PEFT-compatible LF/ZeRO expert LoRA path.
   --seed N
   --precision NAME
@@ -228,8 +237,7 @@ Options:
   Profiling:
   --profile-level stage|module|op|deep
   --profile-layers all|first,last|0,1,2|every4
-  --profile-memory-attribution auto|true|false
-  --profile-memory-breakdown auto|true|false
+  --profile-memory-breakdown true|false   Gate per-module memory breakdown AND saved-tensor/param attribution.
   --profile-memory-breakdown-interval N
   --profile-memory-breakdown-steps LIST
   --profile-memory-breakdown-modules LIST
@@ -247,6 +255,8 @@ Options:
   --asym-cpu-adamw-fp32-master true|false
   --asym-cpu-adamw-grad-offload LIST
                                  Grad offload mode(s) for Asym CPUAdamW backends; one or more, e.g. false,true.
+  --asym-cuda-graph off|compile
+                                 Compile Asym jobs with PyTorch reduce-overhead CUDA graph mode. Requires norecomp, dropout 0.00, and no activation offload.
 
   KT:
   --kt-kernel-dir DIR            Integrated kt-kernel source tree.
@@ -391,6 +401,21 @@ layeract_tag() {
   esac
 }
 
+# Lever-2 toggles (AsymGEMM-only). Encoded in the run dir so each setting gets its own folder.
+actrecomp_tag() {
+  case "${1,,}" in
+    1|true|yes|on) printf 'actrecomp1\n' ;;
+    *) printf 'actrecomp0\n' ;;
+  esac
+}
+
+xunpack_tag() {
+  case "${1,,}" in
+    1|true|yes|on) printf 'xunpack1\n' ;;
+    *) printf 'xunpack0\n' ;;
+  esac
+}
+
 parse_exp_act_policy_tuple() {
   local raw="$1"
   local policy_part expact_part attnact_part layeract_part policy expact attnact layeract
@@ -432,6 +457,14 @@ lora_dropout_label() {
   local value="$1"
   [[ "${value}" =~ ^0\.[0-9][0-9]$ ]] || die "LORA_DROPOUT must use fixed 0.xx format, e.g. 0.10; got '${value}'"
   printf 'drop0%s\n' "${value#*.}"
+}
+
+cuda_graph_mode() {
+  case "${1,,}" in
+    off|none|0|false|no|n) printf 'off\n' ;;
+    compile|partial|inductor|1|true|yes|y|on) printf 'compile\n' ;;
+    *) die "ASYM_CUDA_GRAPH/--asym-cuda-graph must be off or compile, got '${1}'" ;;
+  esac
 }
 
 infer_template() {
@@ -524,6 +557,26 @@ is_policy_independent_backend() {
     torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_cpuadam|superoffload|kt_*) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# Collapse the AsymGEMM-only policy axes (expert policy + expert/attn/layer activation offload + lora_a_fwd
+# + act-recompute + x-unpacked) to their canonical inert values for policy-independent backends
+# (torch/zero*/superoffload/kt_*), where those knobs do nothing at runtime. Mutates the caller's
+# dynamically-scoped shadows, so every caller MUST declare expert_policy / ASYMM_*_ACT_OFFLOAD /
+# ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD / ASYM_OFFLOAD_ACT_RECOMPUTE / ASYM_OFFLOAD_X_UNPACKED / *_label as
+# `local` first (else the loop globals get clobbered and the folder label diverges from the launched env,
+# e.g. an `actrecomp1` folder that actually ran with ASYM_OFFLOAD_ACT_RECOMPUTE=0). Single source of truth:
+# run_job and the kt_armbf16 source-profile matcher must compute identical folders and expected values.
+canonicalize_policy_axis_for_independent_backend() {
+  local backend="${1}"
+  is_policy_independent_backend "${backend}" || return 0
+  expert_policy=none
+  ASYMM_EXPERT_ACT_OFFLOAD=false; expact_label="$(expact_tag false)"
+  ASYMM_ATTN_ACT_OFFLOAD=false; attnact_label="$(attnact_tag false)"
+  ASYMM_LAYER_ACT_OFFLOAD=false; layeract_label="$(layeract_tag false)"
+  ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm; expact_lora_a_fwd_label="$(expact_lora_a_fwd_tag hbm)"
+  ASYM_OFFLOAD_ACT_RECOMPUTE=0; actrecomp_label="$(actrecomp_tag 0)"
+  ASYM_OFFLOAD_X_UNPACKED=0; xunpack_label="$(xunpack_tag 0)"
 }
 
 recompute_label() {
@@ -626,8 +679,8 @@ append_backend_spec() {
 
 profiler_label() {
   case "${1,,}" in
-    source|nsys) printf '%s\n' "${1,,}" ;;
-    *) die "profiler must be source or nsys, got '${1}'" ;;
+    source|nsys|both) printf '%s\n' "${1,,}" ;;
+    *) die "profiler must be source, nsys, or both, got '${1}'" ;;
   esac
 }
 
@@ -637,24 +690,6 @@ dist_launcher_label() {
     accelerate|accelerate_launch) printf 'accelerate\n' ;;
     deepspeed|ds) printf 'deepspeed\n' ;;
     *) die "dist launcher must be torchrun, accelerate, or deepspeed, got '${1}'" ;;
-  esac
-}
-
-profile_memory_flag_for_profiler() {
-  local option="$1"
-  local value="$2"
-  local profiler="$3"
-  case "${value,,}" in
-    auto)
-      if [[ "${profiler}" == "source" ]]; then
-        printf 'true\n'
-      else
-        printf 'false\n'
-      fi
-      ;;
-    1|true|yes|y|on) printf 'true\n' ;;
-    0|false|no|n|off) printf 'false\n' ;;
-    *) die "${option} must be auto, true, or false; got '${value}'" ;;
   esac
 }
 
@@ -695,10 +730,48 @@ allocator_conf_with_expandable_seg() {
 
 existing_memory_breakdown_valid() {
   local seq_root="$1"
-  local summary_json="${seq_root}/memory_breakdown_summary.json"
-  [[ -f "${summary_json}" ]] || return 1
-  "${ENV_PYTHON}" "${MEMORY_SCHEMA_VALIDATOR}" \
-    --memory-breakdown-summary "${summary_json}" >/dev/null 2>&1
+  local summary_json
+  for summary_json in \
+    "${seq_root}/memory_breakdown_summary.json" \
+    "${seq_root}/memory_breakdown/memory_breakdown_summary.json"; do
+    [[ -f "${summary_json}" ]] || continue
+    "${ENV_PYTHON}" "${MEMORY_SCHEMA_VALIDATOR}" \
+      --memory-breakdown-summary "${summary_json}" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
+job_profile_complete() {
+  local profile_json="$1"
+  local seq_root="$2"
+  local expected_backend="$3"
+  local expected_seq_len="$4"
+  local expected_model_name="$5"
+  local expected_recompute="$6"
+  local expected_offload_modules="$7"
+  local expected_expact="$8"
+  local expected_attnact="$9"
+  local expected_layeract="${10}"
+  local expected_lf_expert_lora_impl="${11}"
+  local expected_expact_lora_a_fwd="${12}"
+  local expected_grad_offload="${13}"
+  local require_memory_breakdown="${14}"
+
+  existing_profile_complete \
+    "${profile_json}" \
+    "${expected_backend}" \
+    "${expected_seq_len}" \
+    "${expected_model_name}" \
+    "all" \
+    "${expected_recompute}" \
+    "${expected_offload_modules}" \
+    "${expected_expact}" \
+    "${expected_attnact}" \
+    "${expected_layeract}" \
+    "${expected_lf_expert_lora_impl}" \
+    "${expected_expact_lora_a_fwd}" \
+    "${expected_grad_offload}" || return 1
+  [[ "${require_memory_breakdown}" != "true" ]] || existing_memory_breakdown_valid "${seq_root}"
 }
 
 existing_profile_complete() {
@@ -1114,17 +1187,19 @@ check_kt_arm_route_rank_for_sweep() {
 
 config_root_path() {
   local seq_len="$1"
-  local config_label step_label dropout_label
+  local config_label step_label dropout_label cuda_graph_suffix
   step_label="w${WARMUP_STEPS}_s${MAX_STEPS}"
   dropout_label="${lora_dropout_label_value}"
+  cuda_graph_suffix=""
+  [[ "${ASYM_CUDA_GRAPH}" == "off" ]] || cuda_graph_suffix="_cg${ASYM_CUDA_GRAPH}"
   if [[ -n "${run_name}" ]]; then
     if ((${#seq_lens[@]} > 1)); then
-      config_label="$(safe_label "${run_name}__s${seq_len}_${dropout_label}")"
+      config_label="$(safe_label "${run_name}__s${seq_len}_${dropout_label}${cuda_graph_suffix}")"
     else
-      config_label="$(safe_label "${run_name}__${dropout_label}")"
+      config_label="$(safe_label "${run_name}__${dropout_label}${cuda_graph_suffix}")"
     fi
   else
-    config_label="$(safe_label "${workload_label}__gpus${current_model_gpu_count}__b${batch_size}_s${seq_len}_${step_label}_r${LORA_RANK}_a${LORA_ALPHA}_${dropout_label}")"
+    config_label="$(safe_label "${workload_label}__gpus${current_model_gpu_count}__b${batch_size}_s${seq_len}_${step_label}_r${LORA_RANK}_a${LORA_ALPHA}_${dropout_label}${cuda_graph_suffix}")"
   fi
   printf '%s/%s\n' "${precision_root}" "${config_label}"
 }
@@ -1136,24 +1211,13 @@ job_root_path() {
   local recompute="$4"
   local expert_policy="$5"
   local router_mode="$6"
-  local lf_expert_lora_impl_value="${7:-${lf_expert_lora_impl:-split-target-parameters}}"
-  local grad_offload="${8:-false}"
-  local weight_offload="${9:-false}"
+  local grad_offload="${7:-false}"
+  local weight_offload="${8:-false}"
   local grad_offload_suffix=""
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
     grad_offload_suffix="__gradoff${grad_offload}__weightoff${weight_offload}"
   fi
-  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__${expact_lora_a_fwd_label}__qwenexpert${lf_expert_lora_impl_value}${grad_offload_suffix}")"
-}
-
-legacy_job_root_path() {
-  local config_root="$1"
-  local backend="$2"
-  local profiler="$3"
-  local recompute="$4"
-  local expert_policy="$5"
-  local router_mode="$6"
-  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}")"
+  printf '%s/%s\n' "${config_root}" "$(safe_label "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__${expact_lora_a_fwd_label}__${actrecomp_label}__${xunpack_label}${grad_offload_suffix}")"
 }
 
 kt_arm_matching_source_profile_complete() {
@@ -1164,46 +1228,49 @@ kt_arm_matching_source_profile_complete() {
   local router_mode="$5"
   local seq_len="$6"
   local model_name="$7"
-  local source_profile_json expected_expact_for_profile expected_attnact_for_profile expected_layeract_for_profile expected_lf_expert_lora_impl_for_profile expected_expact_lora_a_fwd_for_profile
-  source_profile_json="$(kt_arm_matching_source_profile_json "${config_root}" "${backend}" "${recompute}" "${expert_policy}" "${router_mode}" "${seq_len}")"
-  expected_expact_for_profile="${ASYMM_EXPERT_ACT_OFFLOAD}"
-  expected_attnact_for_profile="${ASYMM_ATTN_ACT_OFFLOAD}"
-  expected_layeract_for_profile="${ASYMM_LAYER_ACT_OFFLOAD}"
-  expected_lf_expert_lora_impl_for_profile="${lf_expert_lora_impl:-split-target-parameters}"
-  expected_expact_lora_a_fwd_for_profile="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
-  if [[ "$(basename "$(dirname "$(dirname "${source_profile_json}")")")" != *__expact*__attnact* ]]; then
-    expected_expact_for_profile=""
-    expected_attnact_for_profile=""
-    expected_layeract_for_profile=""
-  elif [[ "$(basename "$(dirname "$(dirname "${source_profile_json}")")")" != *__layeract* ]]; then
-    expected_layeract_for_profile=""
-  fi
-  if [[ "$(basename "$(dirname "$(dirname "${source_profile_json}")")")" != *__qwenexpert* ]]; then
-    expected_lf_expert_lora_impl_for_profile=""
-  fi
-  if [[ "$(basename "$(dirname "$(dirname "${source_profile_json}")")")" != *__loraafwd* ]]; then
-    expected_expact_lora_a_fwd_for_profile=""
-  fi
-  existing_profile_complete "${source_profile_json}" "${backend}" "${seq_len}" "${model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${expected_expact_for_profile}" "${expected_attnact_for_profile}" "${expected_layeract_for_profile}" "${expected_lf_expert_lora_impl_for_profile}" "${expected_expact_lora_a_fwd_for_profile}"
+  kt_arm_resolve_matching_source_profile_json "${config_root}" "${backend}" "${recompute}" "${expert_policy}" "${router_mode}" "${seq_len}" "${model_name}" >/dev/null
 }
 
-kt_arm_matching_source_profile_json() {
+kt_arm_resolve_matching_source_profile_json() {
   local config_root="$1"
   local backend="$2"
   local recompute="$3"
   local expert_policy="$4"
   local router_mode="$5"
   local seq_len="$6"
-  local source_job_root source_seq_root legacy_source_job_root legacy_source_seq_root
-  source_job_root="$(job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}" "${lf_expert_lora_impl:-split-target-parameters}")"
-  source_seq_root="${source_job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
-  legacy_source_job_root="$(legacy_job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}")"
-  legacy_source_seq_root="${legacy_source_job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
-  if [[ ! -f "${source_seq_root}/profile.json" && -f "${legacy_source_seq_root}/profile.json" ]]; then
-    printf '%s/profile.json\n' "${legacy_source_seq_root}"
+  local model_name="$7"
+  # Canonicalize the AsymGEMM-only axes (via local shadows) so the matched source path AND the expected
+  # values agree with what run_job wrote for policy-independent backends.
+  local source_profile_json
+  local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}"
+  local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
+  local ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}" ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
+  canonicalize_policy_axis_for_independent_backend "${backend}"
+  while IFS= read -r source_profile_json; do
+    existing_profile_complete "${source_profile_json}" "${backend}" "${seq_len}" "${model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${lf_expert_lora_impl:-split-target-parameters}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" || continue
+    printf '%s\n' "${source_profile_json}"
     return 0
-  fi
-  printf '%s/profile.json\n' "${source_seq_root}"
+  done < <(kt_arm_matching_source_profile_json_candidates "${config_root}" "${backend}" "${recompute}" "${expert_policy}" "${router_mode}" "${seq_len}")
+  return 1
+}
+
+kt_arm_matching_source_profile_json() {
+  kt_arm_matching_source_profile_json_candidates "$@" | head -n 1
+}
+
+kt_arm_matching_source_profile_json_candidates() {
+  local config_root="$1"
+  local backend="$2"
+  local recompute="$3"
+  local expert_policy="$4"
+  local router_mode="$5"
+  local seq_len="$6"
+  local source_job_root
+  source_job_root="$(job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}")"
+  printf '%s/profile.json\n' "${source_job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
+  # Compatibility for source profiles produced before actrecomp/xunpack became part of the run label.
+  source_job_root="${config_root}/$(safe_label "${backend}__source__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__${expact_lora_a_fwd_label}")"
+  printf '%s/profile.json\n' "${source_job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
 }
 
 plot_workload_from_config_root() {
@@ -1336,13 +1403,13 @@ append_router_mode_filters() {
 append_expact_filters() {
   local -n _cmd_ref="$1"
   local expact_value
-  for expact_value in "${expact_values[@]}"; do _cmd_ref+=(--expact "$(expact_tag "${expact_value}")"); done
+  for expact_value in "${plot_expact_values[@]}"; do _cmd_ref+=(--expact "$(expact_tag "${expact_value}")"); done
 }
 
 append_attnact_filters() {
   local -n _cmd_ref="$1"
   local attnact_value
-  for attnact_value in "${attnact_values[@]}"; do _cmd_ref+=(--attnact "$(attnact_tag "${attnact_value}")"); done
+  for attnact_value in "${plot_attnact_values[@]}"; do _cmd_ref+=(--attnact "$(attnact_tag "${attnact_value}")"); done
 }
 
 append_fixed_profiler_filter() {
@@ -1518,8 +1585,6 @@ while (($#)); do
     --profile-level=*) PROFILE_LEVEL="${1#*=}"; shift ;;
     --profile-layers) need_value "$1" "${2-}"; PROFILE_LAYERS="$2"; shift 2 ;;
     --profile-layers=*) PROFILE_LAYERS="${1#*=}"; shift ;;
-    --profile-memory-attribution) need_value "$1" "${2-}"; PROFILE_MEMORY_ATTRIBUTION="$2"; shift 2 ;;
-    --profile-memory-attribution=*) PROFILE_MEMORY_ATTRIBUTION="${1#*=}"; shift ;;
     --profile-memory-breakdown) need_value "$1" "${2-}"; PROFILE_MEMORY_BREAKDOWN="$2"; shift 2 ;;
     --profile-memory-breakdown=*) PROFILE_MEMORY_BREAKDOWN="${1#*=}"; shift ;;
     --profile-memory-breakdown-interval) need_value "$1" "${2-}"; PROFILE_MEMORY_BREAKDOWN_INTERVAL="$2"; shift 2 ;;
@@ -1552,6 +1617,8 @@ while (($#)); do
     --asym-cpu-adamw-grad-offload=*) ASYM_CPU_ADAMW_GRAD_OFFLOAD="${1#*=}"; shift ;;
     --asym-cpu-adamw-weight-offload) need_value "$1" "${2-}"; ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="$2"; shift 2 ;;
     --asym-cpu-adamw-weight-offload=*) ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${1#*=}"; shift ;;
+    --asym-cuda-graph) need_value "$1" "${2-}"; ASYM_CUDA_GRAPH="$2"; shift 2 ;;
+    --asym-cuda-graph=*) ASYM_CUDA_GRAPH="${1#*=}"; shift ;;
     --kt-kernel-dir) need_value "$1" "${2-}"; KT_KERNEL_DIR="$2"; shift 2 ;;
     --kt-kernel-dir=*) KT_KERNEL_DIR="${1#*=}"; shift ;;
     --kt-tools-dir) need_value "$1" "${2-}"; KT_TOOLS_DIR="$2"; shift 2 ;;
@@ -1639,10 +1706,13 @@ require_comma_list "--lf-expert-lora-impls/LF_EXPERT_LORA_IMPLS" "${lf_expert_lo
 nonnegative_int "--max-steps" "${MAX_STEPS}"
 nonnegative_int "--warmup-steps" "${WARMUP_STEPS}"
 if ((WARMUP_STEPS < 5)) && [[ "$(bool_value "${DRY_RUN}")" != "true" && "$(bool_value "${COLLECT_EXISTING}")" != "true" ]]; then
-  die "--warmup-steps must be at least 5 so profiling only measures after a stable warmup"
+  echo "warning: --warmup-steps ${WARMUP_STEPS} is below the recommended 5; timing may be noisier, but the run is allowed." >&2
 fi
 nonnegative_int "INTERRUPT_GRACE_SECONDS" "${INTERRUPT_GRACE_SECONDS}"
 positive_int "--profile-memory-breakdown-interval" "${PROFILE_MEMORY_BREAKDOWN_INTERVAL}"
+# Normalize the single memory knob once, at top level, so invalid values (including the removed
+# 'auto') hard-fail here instead of being silently swallowed inside run_job's command substitution.
+PROFILE_MEMORY_BREAKDOWN="$(bool_value "${PROFILE_MEMORY_BREAKDOWN}")"
 case "${MEMORY_BREAKDOWN_PLOT_Y_SCALE}" in
   shared|per-plot|global) ;;
   *) die "--memory-breakdown-plot-y-scale must be shared, per-plot, or global; got '${MEMORY_BREAKDOWN_PLOT_Y_SCALE}'" ;;
@@ -1652,17 +1722,25 @@ mapfile -t lora_dropouts < <(tokens "${lora_dropout_spec}" | dedupe)
 for value in "${lora_dropouts[@]}"; do
   lora_dropout_label "${value}" >/dev/null
 done
+ASYM_CUDA_GRAPH="$(cuda_graph_mode "${ASYM_CUDA_GRAPH}")"
+if [[ "${ASYM_CUDA_GRAPH}" == "compile" ]]; then
+  for value in "${lora_dropouts[@]}"; do
+    [[ "${value}" == "0.00" ]] || die "ASYM_CUDA_GRAPH=compile requires LORA_DROPOUT=0.00, got '${value}'"
+  done
+fi
 lf_expert_lora_impls=()
 while IFS= read -r value; do
-  case "${value,,}" in
-    peft-target-parameters|split-target-parameters|off) lf_expert_lora_impls+=("${value,,}") ;;
-    *) die "LF expert LoRA implementation must be peft-target-parameters, split-target-parameters, or off; got '${value}'" ;;
-  esac
+  lf_expert_lora_impls+=("${value,,}")
 done < <(tokens "${lf_expert_lora_impl_spec}")
-if ((${#lf_expert_lora_impls[@]})); then
-  mapfile -t lf_expert_lora_impls < <(printf '%s\n' "${lf_expert_lora_impls[@]}" | dedupe)
+# The multi-impl sweep was retired: exactly one implementation is allowed now.
+if ((${#lf_expert_lora_impls[@]} > 1)); then
+  die "LF_EXPERT_LORA_IMPLS must be a single implementation; the multi-impl sweep was retired"
 fi
 ((${#lf_expert_lora_impls[@]})) || die "LF expert LoRA implementation list is empty"
+case "${lf_expert_lora_impls[0]}" in
+  peft-target-parameters|split-target-parameters|off) ;;
+  *) die "LF expert LoRA implementation must be peft-target-parameters, split-target-parameters, or off; got '${lf_expert_lora_impls[0]}'" ;;
+esac
 for value in "${lf_expert_lora_impls[@]}"; do
   if [[ "${value}" == "peft-target-parameters" || "${value}" == "split-target-parameters" ]]; then
     for dropout in "${lora_dropouts[@]}"; do
@@ -1717,6 +1795,11 @@ fi
 mapfile -t backends < <(printf '%s\n' "${backend_specs[@]}" | cut -d '|' -f1 | dedupe)
 mapfile -t backend_recompute_modes < <(printf '%s\n' "${backend_specs[@]}" | cut -d '|' -f2 | dedupe)
 recompute_modes=("${backend_recompute_modes[@]}")
+if [[ "${ASYM_CUDA_GRAPH}" == "compile" ]]; then
+  for recompute_mode in "${recompute_modes[@]}"; do
+    [[ "${recompute_mode}" == "norecomp" ]] || die "ASYM_CUDA_GRAPH=compile requires backend recompute=norecomp because gradient checkpointing breaks capture"
+  done
+fi
 mapfile -t router_modes < <(tokens "${router_mode_spec}" | while read -r value; do router_mode_label "${value}"; done | dedupe)
 router_hf_selected=false
 router_whole_selected=false
@@ -1741,6 +1824,9 @@ for backend in "${backends[@]}"; do
     *) selected_has_non_asym=true ;;
   esac
 done
+if [[ "${ASYM_CUDA_GRAPH}" == "compile" && "${selected_has_non_asym}" == "true" ]]; then
+  die "ASYM_CUDA_GRAPH=compile only supports Asym backend specs; remove non-Asym backends from BACKEND_SPECS"
+fi
 plot_router_modes=("${router_modes[@]}")
 if [[ "${router_whole_selected}" == "true" && "${selected_has_non_asym}" == "true" ]]; then
   plot_router_modes+=("hf")
@@ -1766,10 +1852,26 @@ if [[ "${selected_has_kt}" == "true" ]]; then
     KT_GGUF_PY_DIR="${KT_REPO_DIR}/third_party/llama.cpp/gguf-py"
   fi
 fi
-if [[ -z "${output_root}" ]]; then
-  output_root="${ASYM_DIR}/profiling"
-fi
 mapfile -t profilers < <(tokens "${profiler_spec}" | while read -r value; do profiler_label "${value}"; done | dedupe)
+both_profiler_selected=false
+nsys_artifacts_selected=false
+if printf '%s\n' "${profilers[@]}" | grep -qx 'both'; then
+  both_profiler_selected=true
+  nsys_artifacts_selected=true
+fi
+if printf '%s\n' "${profilers[@]}" | grep -qx 'nsys'; then
+  nsys_artifacts_selected=true
+fi
+if [[ "${both_profiler_selected}" == "true" && "${#profilers[@]}" != "1" ]]; then
+  die "PROFILERS=both must be used alone; use PROFILERS=source,nsys for two separate runs or PROFILERS=both for one nsys run plus materialized source artifacts"
+fi
+if [[ -z "${output_root}" ]]; then
+  if [[ "${both_profiler_selected}" == "true" ]]; then
+    output_root="${ASYM_DIR}/profiling_both"
+  else
+    output_root="${ASYM_DIR}/profiling"
+  fi
+fi
 mapfile -t asym_cpu_adamw_grad_offload_modes < <(
   tokens "${ASYM_CPU_ADAMW_GRAD_OFFLOAD}" | while read -r value; do bool_value "${value}"; done | dedupe
 )
@@ -1778,12 +1880,14 @@ mapfile -t asym_cpu_adamw_weight_offload_modes < <(
   tokens "${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD}" | while read -r value; do bool_value "${value}"; done | dedupe
 )
 ((${#asym_cpu_adamw_weight_offload_modes[@]})) || die "ASYM_CPU_ADAMW_WEIGHT_OFFLOAD must include at least one boolean value"
-if printf '%s\n' "${profilers[@]}" | grep -qx 'nsys'; then
+if [[ "${both_profiler_selected}" == "true" ]]; then
+  plot_profilers=(nsys source)
+elif [[ "${nsys_artifacts_selected}" == "true" ]]; then
   plot_profilers=(nsys)
 else
   plot_profilers=()
   for profiler in "${profilers[@]}"; do
-    if [[ "$(profile_memory_flag_for_profiler "--profile-memory-breakdown" "${PROFILE_MEMORY_BREAKDOWN}" "${profiler}")" != "true" ]]; then
+    if [[ "$(bool_value "${PROFILE_MEMORY_BREAKDOWN}")" != "true" ]]; then
       plot_profilers+=("${profiler}")
     fi
   done
@@ -1797,13 +1901,37 @@ for value in "${raw_exp_act_policy_pairs[@]}"; do
 done
 mapfile -t exp_act_policy_pairs < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | dedupe)
 ((${#exp_act_policy_pairs[@]})) || die "expert/attention activation policy tuple list is empty"
+if [[ "${ASYM_CUDA_GRAPH}" == "compile" ]]; then
+  for value in "${exp_act_policy_pairs[@]}"; do
+    policy_tail="${value#*|}"
+    expact_value="${policy_tail%%|*}"
+    policy_tail="${policy_tail#*|}"
+    attnact_value="${policy_tail%%|*}"
+    layeract_value="${policy_tail#*|}"
+    if [[ "${expact_value}" != "false" || "${attnact_value}" != "false" || "${layeract_value}" != "false" ]]; then
+      die "ASYM_CUDA_GRAPH=compile cannot be combined with activation offload policies; use ASYMM_EXP_ACT_POLICIES=none|false|false|false"
+    fi
+  done
+fi
 mapfile -t expert_policies < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f1 | dedupe)
 mapfile -t expact_values < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f2 | dedupe)
 mapfile -t attnact_values < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f3 | dedupe)
 mapfile -t layeract_values < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f4 | dedupe)
+plot_expact_values=("${expact_values[@]}")
+plot_attnact_values=("${attnact_values[@]}")
+if [[ "${selected_has_non_asym}" == "true" ]]; then
+  # Policy-independent baselines are canonicalized to no activation offload when they run.
+  # Include that canonical label in plot filters so those baselines are not filtered out.
+  plot_expact_values+=(false)
+  plot_attnact_values+=(false)
+fi
+mapfile -t plot_expact_values < <(printf '%s\n' "${plot_expact_values[@]}" | dedupe)
+mapfile -t plot_attnact_values < <(printf '%s\n' "${plot_attnact_values[@]}" | dedupe)
 ASYMM_EXP_ACT_POLICIES="$(IFS=,; printf '%s' "${exp_act_policy_pairs[*]}")"
 ASYMM_EXPERT_ACT_OFFLOAD="${expact_values[0]}"
 expact_label="$(expact_tag "${ASYMM_EXPERT_ACT_OFFLOAD}")"
+actrecomp_label="$(actrecomp_tag "${ASYM_OFFLOAD_ACT_RECOMPUTE}")"
+xunpack_label="$(xunpack_tag "${ASYM_OFFLOAD_X_UNPACKED}")"
 ASYMM_ATTN_ACT_OFFLOAD="${attnact_values[0]}"
 attnact_label="$(attnact_tag "${ASYMM_ATTN_ACT_OFFLOAD}")"
 ASYMM_LAYER_ACT_OFFLOAD="${layeract_values[0]}"
@@ -1834,7 +1962,7 @@ fi
 if [[ "${PLOT_MEMORY_BREAKDOWN}" == "true" ]]; then
   [[ -f "${MEMORY_PLOT_SCRIPT}" ]] || die "missing ${MEMORY_PLOT_SCRIPT}"
 fi
-if [[ "${PLOT}" == "true" ]] && printf '%s\n' "${profilers[@]}" | grep -qx 'nsys'; then
+if [[ "${PLOT}" == "true" && "${nsys_artifacts_selected}" == "true" ]]; then
   [[ -f "${INTERCONNECT_PLOT_SCRIPT}" ]] || die "missing ${INTERCONNECT_PLOT_SCRIPT}"
 fi
 if [[ "${DRY_RUN}" != "true" && ( "${PLOT}" == "true" || ( "${PREPARE_DATASETS}" == "true" && "${COLLECT_EXISTING}" != "true" ) ) ]]; then
@@ -1991,6 +2119,51 @@ run_tracked_command_logged() {
   run_tracked_command "$@" > >(tee -a "${log_file}") 2>&1
 }
 
+materialize_source_artifacts_from_nsys() {
+  local nsys_source_profile="$1"
+  local source_seq_root="$2"
+  local source_profile_json="$3"
+  local source_output_profile_json="$4"
+  local source_log_file="$5"
+  local nsys_seq_root="$6"
+  local -a postprocess_cmd=(
+    "${ENV_PYTHON}" "${PROFILE_POSTPROCESS_SCRIPT}"
+    --source-profile-json "${source_profile_json}"
+    --profile-json "${source_output_profile_json}"
+    --output-dir "${source_seq_root}"
+  )
+
+  if [[ ! -f "${nsys_source_profile}" ]]; then
+    echo "Cannot materialize source artifacts; missing nsys source profile: ${nsys_source_profile}" >&2
+    return 1
+  fi
+
+  mkdir -p "${source_seq_root}"
+  cp "${nsys_source_profile}" "${source_profile_json}"
+  for memory_artifact in memory_breakdown.jsonl memory_breakdown_summary.json; do
+    if [[ -f "${nsys_seq_root}/${memory_artifact}" ]]; then
+      cp "${nsys_seq_root}/${memory_artifact}" "${source_seq_root}/${memory_artifact}"
+    fi
+  done
+  if [[ -d "${nsys_seq_root}/memory_breakdown" ]]; then
+    mkdir -p "${source_seq_root}/memory_breakdown"
+    for memory_artifact in memory_breakdown.jsonl memory_breakdown_summary.json; do
+      if [[ -f "${nsys_seq_root}/memory_breakdown/${memory_artifact}" ]]; then
+        cp "${nsys_seq_root}/memory_breakdown/${memory_artifact}" "${source_seq_root}/memory_breakdown/${memory_artifact}"
+      fi
+    done
+  fi
+  {
+    echo "Materialized source artifacts from nsys run:"
+    echo "  nsys_dir=${nsys_seq_root}"
+    echo "  nsys_source_profile=${nsys_source_profile}"
+    print_command "${postprocess_cmd[@]}"
+  } > "${source_seq_root}/command.txt"
+  : > "${source_log_file}"
+  echo "Materializing source artifacts from ${nsys_source_profile} into ${source_seq_root}"
+  run_tracked_command_logged "${source_log_file}" "${postprocess_cmd[@]}"
+}
+
 handle_interrupt() {
   local signal="${1:-INT}"
   case "${signal}" in
@@ -2011,6 +2184,8 @@ trap 'cleanup_on_exit' EXIT
 run_job() {
   local backend="$1"
   local profiler="$2"
+  local run_profiler="$2"
+  local materialize_source_from_nsys=false
   local recompute="$3"
   local seq_len="$4"
   local gpu="$5"
@@ -2021,6 +2196,16 @@ run_job() {
   local lf_expert_lora_impl="${10}"
   local grad_offload="${11:-false}"
   local weight_offload="${12:-false}"
+  # Canonicalize the AsymGEMM-only axes for policy-independent backends (see the helper). Local shadows feed
+  # run_id, the folder (job_root_path is dynamic-scoped), the env block, and the completeness check.
+  local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}"
+  local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
+  local ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}" ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
+  canonicalize_policy_axis_for_independent_backend "${backend}"
+  if [[ "${profiler}" == "both" ]]; then
+    run_profiler=nsys
+    materialize_source_from_nsys=true
+  fi
   local gradient_checkpointing=false
   local attention_gc_enabled=false
   local layer_gc_enabled=false
@@ -2033,20 +2218,30 @@ run_job() {
   fi
 
   local config_root job_root seq_root source_profile lf_out log_file run_id profile_json
+  local source_materialized_job_root="" source_materialized_seq_root="" source_materialized_profile_json="" source_materialized_source_profile="" source_materialized_log_file=""
   local kt_arm_source_ok_profile_json=""
   config_root="$(config_root_path "${seq_len}")"
-  job_root="$(job_root_path "${config_root}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${lf_expert_lora_impl}" "${grad_offload}" "${weight_offload}")"
+  job_root="$(job_root_path "${config_root}" "${backend}" "${run_profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${grad_offload}" "${weight_offload}")"
   seq_root="${job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
   source_profile="${seq_root}/source_profile.json"
   lf_out="${seq_root}/lf_run"
   log_file="${seq_root}/train.log"
+  if [[ "${materialize_source_from_nsys}" == "true" ]]; then
+    source_materialized_job_root="$(job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}" "${grad_offload}" "${weight_offload}")"
+    source_materialized_seq_root="${source_materialized_job_root}/b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}"
+    source_materialized_source_profile="${source_materialized_seq_root}/source_profile.json"
+    source_materialized_profile_json="${source_materialized_seq_root}/profile.json"
+    source_materialized_log_file="${source_materialized_seq_root}/train.log"
+  fi
   local grad_offload_run_label=""
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
     grad_offload_run_label="_gradoff${grad_offload}_weightoff${weight_offload}"
   fi
-  run_id="lf_${backend}_${profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${expact_lora_a_fwd_label}_qwenexpert$(safe_label "${lf_expert_lora_impl}")${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_${lora_dropout_label_value}"
+  local cuda_graph_run_label=""
+  [[ "${ASYM_CUDA_GRAPH}" == "off" ]] || cuda_graph_run_label="_cg${ASYM_CUDA_GRAPH}"
+  run_id="lf_${backend}_${run_profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${expact_lora_a_fwd_label}_${actrecomp_label}_${xunpack_label}${grad_offload_run_label}${cuda_graph_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
-  local profile_memory_attribution profile_memory_breakdown deepspeed_dir_for_profile
+  local profile_memory_breakdown deepspeed_dir_for_profile
   local profile_backend_label job_use_asym_cpu_adamw job_asym_cpu_adamw_backend cpuadam_backend
   local master_port
   profile_backend_label="${backend}"
@@ -2056,16 +2251,9 @@ run_job() {
     job_use_asym_cpu_adamw=true
     job_asym_cpu_adamw_backend="${cpuadam_backend}"
   fi
-  profile_memory_attribution="$(profile_memory_flag_for_profiler "--profile-memory-attribution" "${PROFILE_MEMORY_ATTRIBUTION}" "${profiler}")"
-  profile_memory_breakdown="$(profile_memory_flag_for_profiler "--profile-memory-breakdown" "${PROFILE_MEMORY_BREAKDOWN}" "${profiler}")"
-  if [[ -n "${cpuadam_backend:-}" ]]; then
-    if [[ "${PROFILE_MEMORY_ATTRIBUTION,,}" == "auto" ]]; then
-      profile_memory_attribution=false
-    fi
-    if [[ "${PROFILE_MEMORY_BREAKDOWN,,}" == "auto" ]]; then
-      profile_memory_breakdown=false
-    fi
-  fi
+  # Single knob: PROFILE_MEMORY_BREAKDOWN gates the per-module breakdown AND the attribution.
+  # true/false only (no auto), and no per-backend override so all backends behave identically.
+  profile_memory_breakdown="$(bool_value "${PROFILE_MEMORY_BREAKDOWN}")"
   deepspeed_dir_for_profile=""
   if [[ "${backend}" == zero* || "${backend}" == "superoffload" ]]; then
     deepspeed_dir_for_profile="${DEEPSPEED_DIR}"
@@ -2082,34 +2270,77 @@ run_job() {
   if [[ "${profile_memory_breakdown}" == "true" ]]; then
     memory_plot_roots["${config_root}"]="${seq_len}"
   fi
-  if [[ "${profiler}" == "nsys" ]]; then
+  if [[ "${run_profiler}" == "nsys" ]]; then
     interconnect_plot_roots["${config_root}"]="${seq_len}"
   fi
   if [[ "${backend}" == "kt_armbf16" ]]; then
     check_kt_arm_route_rank_for_sweep "${seq_len}"
-    if [[ "${profiler}" == "nsys" ]]; then
-      kt_arm_source_ok_profile_json="$(kt_arm_matching_source_profile_json "${config_root}" "${backend}" "${recompute}" "${expert_policy}" "${router_mode}" "${seq_len}")"
+    if [[ "${run_profiler}" == "nsys" ]]; then
+      kt_arm_source_ok_profile_json="$(kt_arm_resolve_matching_source_profile_json "${config_root}" "${backend}" "${recompute}" "${expert_policy}" "${router_mode}" "${seq_len}" "${current_model_name}")"
     fi
   fi
   if [[ "${DRY_RUN}" != "true" && -e "${profile_json}" && "${OVERWRITE}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
-    if existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}" && { [[ "${profile_memory_breakdown}" != "true" ]] || existing_memory_breakdown_valid "${seq_root}"; }; then
+    if job_profile_complete "${profile_json}" "${seq_root}" "${backend}" "${seq_len}" "${current_model_name}" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}" "${profile_memory_breakdown}" && {
+      [[ "${materialize_source_from_nsys}" != "true" ]] ||
+        job_profile_complete "${source_materialized_profile_json}" "${source_materialized_seq_root}" "${backend}" "${seq_len}" "${current_model_name}" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}" "${profile_memory_breakdown}"
+    }; then
       echo "Skipping existing: ${profile_json}"
       append_job_record "${config_root}" skipped \
-        "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}" "${lf_expert_lora_impl}"
+        "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${run_profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}" "${lf_expert_lora_impl}"
+      if [[ "${materialize_source_from_nsys}" == "true" ]]; then
+        append_job_record "${config_root}" skipped \
+          "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" source "${grad_offload}" "${source_materialized_seq_root}" "${source_materialized_profile_json}" "${source_materialized_log_file}" "${lf_expert_lora_impl}"
+      fi
       return 0
     fi
-    echo "Existing profile is incomplete, partial, or has missing/stale schema-v2 source-memory breakdown; rerunning: ${profile_json}" >&2
+    if [[ "${materialize_source_from_nsys}" == "true" ]] &&
+      job_profile_complete "${profile_json}" "${seq_root}" "${backend}" "${seq_len}" "${current_model_name}" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}" "${profile_memory_breakdown}"; then
+      echo "Existing nsys profile is complete; materializing missing/stale source artifacts: ${source_materialized_profile_json}" >&2
+      materialize_source_artifacts_from_nsys \
+        "${source_profile}" \
+        "${source_materialized_seq_root}" \
+        "${source_materialized_source_profile}" \
+        "${source_materialized_profile_json}" \
+        "${source_materialized_log_file}" \
+        "${seq_root}" || return $?
+      if ! job_profile_complete "${source_materialized_profile_json}" "${source_materialized_seq_root}" "${backend}" "${seq_len}" "${current_model_name}" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}" "${profile_memory_breakdown}"; then
+        echo "Materialized source profile is incomplete or partial: ${source_materialized_profile_json}" >&2
+        return 1
+      fi
+      append_job_record "${config_root}" skipped \
+        "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${run_profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}" "${lf_expert_lora_impl}"
+      append_job_record "${config_root}" ok \
+        "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" source "${grad_offload}" "${source_materialized_seq_root}" "${source_materialized_profile_json}" "${source_materialized_log_file}" "${lf_expert_lora_impl}"
+      if profiler_selected_for_plots source; then
+        plot_single_run "${config_root}" "${seq_len}" "${backend}" source "${recompute}" "${expert_policy}" "${router_mode}" "${source_materialized_seq_root}"
+        plot_running_combined "${config_root}" "${seq_len}" "${source_materialized_seq_root}"
+      fi
+      if [[ "${profile_memory_breakdown}" == "true" ]]; then
+        plot_memory_single_run "${source_materialized_seq_root}"
+        plot_memory_running_combined "${config_root}" "${seq_len}" "${source_materialized_seq_root}"
+      fi
+      return 0
+    else
+      echo "Existing profile is incomplete, partial, or has missing/stale schema-v2 source-memory breakdown; rerunning: ${profile_json}" >&2
+    fi
   fi
 
   if [[ "${DRY_RUN}" != "true" && "${COLLECT_EXISTING}" == "true" ]]; then
     if [[ -e "${profile_json}" ]]; then
-      if ! existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}"; then
+      if ! job_profile_complete "${profile_json}" "${seq_root}" "${backend}" "${seq_len}" "${current_model_name}" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}" "${profile_memory_breakdown}"; then
         echo "Existing profile is incomplete or partial: ${profile_json}" >&2
         return 1
       fi
-      if [[ "${profile_memory_breakdown}" == "true" ]] && ! existing_memory_breakdown_valid "${seq_root}"; then
-        echo "Existing profile lacks a valid schema-v2 source-memory breakdown: ${profile_json}" >&2
-        return 1
+      if [[ "${materialize_source_from_nsys}" == "true" ]] &&
+        ! job_profile_complete "${source_materialized_profile_json}" "${source_materialized_seq_root}" "${backend}" "${seq_len}" "${current_model_name}" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}" "${profile_memory_breakdown}"; then
+        materialize_source_artifacts_from_nsys \
+          "${source_profile}" \
+          "${source_materialized_seq_root}" \
+          "${source_materialized_source_profile}" \
+          "${source_materialized_profile_json}" \
+          "${source_materialized_log_file}" \
+          "${seq_root}" || return $?
+        job_profile_complete "${source_materialized_profile_json}" "${source_materialized_seq_root}" "${backend}" "${seq_len}" "${current_model_name}" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}" "${profile_memory_breakdown}" || return 1
       fi
       echo "Found existing: ${profile_json}"
       return 0
@@ -2120,6 +2351,9 @@ run_job() {
 
   local -a run_env=(
     ROOT="${ROOT}"
+    NUMACTL_MODE="${NUMACTL_MODE:-membind}"
+    ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE:-0}"
+    ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED:-0}"
     LF_DIR="${LF_DIR}"
     ASYM_DIR="${ASYM_DIR}"
     ENV_DIR="${ENV_DIR}"
@@ -2166,10 +2400,9 @@ run_job() {
     ASYM_ROUTER_MODE="${router_mode}"
     ASYM_STRICT="${ASYM_STRICT}"
     PROFILE=1
-    PROFILE_PROFILER="${profiler}"
+    PROFILE_PROFILER="${run_profiler}"
     PROFILE_LEVEL="${PROFILE_LEVEL}"
     PROFILE_LAYERS="${PROFILE_LAYERS}"
-    PROFILE_MEMORY_ATTRIBUTION="${profile_memory_attribution}"
     PROFILE_MEMORY_BREAKDOWN="${profile_memory_breakdown}"
     PROFILE_MEMORY_BREAKDOWN_INTERVAL="${PROFILE_MEMORY_BREAKDOWN_INTERVAL}"
     PROFILE_MEMORY_BREAKDOWN_STEPS="${PROFILE_MEMORY_BREAKDOWN_STEPS}"
@@ -2200,6 +2433,8 @@ run_job() {
     ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
+    ASYM_GEMM_LF_CONFIG_ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}"
+    ASYM_GEMM_LF_CONFIG_ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
     ASYM_GEMM_LF_CONFIG_QWEN_EXPERT_LORA_IMPL="${lf_expert_lora_impl}"
     ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED="${attention_gc_enabled}"
     ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED="${layer_gc_enabled}"
@@ -2211,6 +2446,12 @@ run_job() {
     LOG_FILE="${log_file}"
     RUN_ID="${run_id}"
   )
+  if [[ "${ASYM_CUDA_GRAPH}" == "compile" ]]; then
+    run_env+=(
+      ASYM_CUDA_GRAPH="${ASYM_CUDA_GRAPH}"
+      ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH="${ASYM_CUDA_GRAPH}"
+    )
+  fi
   if [[ "${backend}" == kt_* ]]; then
     local kt_num_threads_for_job="${KT_NUM_THREADS}"
     if [[ "${backend}" == "kt_armbf16" && -z "${kt_num_threads_for_job}" ]]; then
@@ -2249,10 +2490,19 @@ run_job() {
     )
   fi
 
-  local -a run_cmd=(env "${run_env[@]}" "${RUN_LF_SCRIPT}")
+  local -a run_cmd=(env)
+  if [[ "${ASYM_CUDA_GRAPH}" == "off" ]]; then
+    run_cmd+=( -u ASYM_CUDA_GRAPH -u ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH )
+  fi
+  run_cmd+=("${run_env[@]}" "${RUN_LF_SCRIPT}")
 
-  echo "Running backend=${backend} profiler=${profiler} recompute=${recompute} expert_policy=${expert_policy} router_mode=${router_mode} grad_offload=${grad_offload} qwen_expert_lora_impl=${lf_expert_lora_impl} lora_a_fwd=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD} ${expact_label} ${attnact_label} ${layeract_label} ${expact_lora_a_fwd_label} seq=${seq_len} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
+  local cuda_graph_log=""
+  [[ "${ASYM_CUDA_GRAPH}" == "off" ]] || cuda_graph_log=" cuda_graph=${ASYM_CUDA_GRAPH}"
+  echo "Running backend=${backend} profiler=${profiler} run_profiler=${run_profiler} recompute=${recompute} expert_policy=${expert_policy} router_mode=${router_mode} grad_offload=${grad_offload} qwen_expert_lora_impl=${lf_expert_lora_impl} lora_a_fwd=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD} ${expact_label} ${attnact_label} ${layeract_label} ${expact_lora_a_fwd_label}${cuda_graph_log} seq=${seq_len} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
   echo "  dir=${seq_root}"
+  if [[ "${materialize_source_from_nsys}" == "true" ]]; then
+    echo "  source_dir=${source_materialized_seq_root}"
+  fi
   if [[ "${DRY_RUN}" == "true" ]]; then
     print_command "${run_cmd[@]}"
     mkdir -p "${seq_root}"
@@ -2261,7 +2511,24 @@ run_job() {
       print_command "${run_cmd[@]}"
     } > "${seq_root}/command.txt"
     append_job_record "${config_root}" dry-run \
-      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}" "${lf_expert_lora_impl}"
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${run_profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}" "${lf_expert_lora_impl}"
+    if [[ "${materialize_source_from_nsys}" == "true" ]]; then
+      local -a source_postprocess_cmd=(
+        "${ENV_PYTHON}" "${PROFILE_POSTPROCESS_SCRIPT}"
+        --source-profile-json "${source_materialized_source_profile}"
+        --profile-json "${source_materialized_profile_json}"
+        --output-dir "${source_materialized_seq_root}"
+      )
+      mkdir -p "${source_materialized_seq_root}"
+      {
+        echo "Dry-run source materialization from nsys source profile:"
+        echo "  nsys_source_profile=${source_profile}"
+        print_command cp "${source_profile}" "${source_materialized_source_profile}"
+        print_command "${source_postprocess_cmd[@]}"
+      } > "${source_materialized_seq_root}/command.txt"
+      append_job_record "${config_root}" dry-run \
+        "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" source "${grad_offload}" "${source_materialized_seq_root}" "${source_materialized_profile_json}" "${source_materialized_log_file}" "${lf_expert_lora_impl}"
+    fi
     return 0
   fi
 
@@ -2285,26 +2552,57 @@ run_job() {
     if [[ ! -f "${profile_json}" ]]; then
       echo "Missing expected profile artifact: ${profile_json}" >&2
       status=1
-    elif ! existing_profile_complete "${profile_json}" "${backend}" "${seq_len}" "${current_model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}"; then
+    elif ! job_profile_complete "${profile_json}" "${seq_root}" "${backend}" "${seq_len}" "${current_model_name}" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}" "${profile_memory_breakdown}"; then
       echo "Expected completed profile artifact but found incomplete/partial profile: ${profile_json}" >&2
+      status=1
+    fi
+  fi
+  if ((status == 0)) && [[ "${materialize_source_from_nsys}" == "true" ]]; then
+    materialize_source_artifacts_from_nsys \
+      "${source_profile}" \
+      "${source_materialized_seq_root}" \
+      "${source_materialized_source_profile}" \
+      "${source_materialized_profile_json}" \
+      "${source_materialized_log_file}" \
+      "${seq_root}" || status=$?
+    if ((status == 0)) &&
+      ! job_profile_complete "${source_materialized_profile_json}" "${source_materialized_seq_root}" "${backend}" "${seq_len}" "${current_model_name}" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}" "${profile_memory_breakdown}"; then
+      echo "Expected completed materialized source profile but found incomplete/partial profile: ${source_materialized_profile_json}" >&2
       status=1
     fi
   fi
 
   if ((status == 0)); then
     append_job_record "${config_root}" ok \
-      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}" "${lf_expert_lora_impl}"
-    if profiler_selected_for_plots "${profiler}"; then
-      plot_single_run "${config_root}" "${seq_len}" "${backend}" "${profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${seq_root}"
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${run_profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}" "${lf_expert_lora_impl}"
+    if [[ "${materialize_source_from_nsys}" == "true" ]]; then
+      append_job_record "${config_root}" ok \
+        "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" source "${grad_offload}" "${source_materialized_seq_root}" "${source_materialized_profile_json}" "${source_materialized_log_file}" "${lf_expert_lora_impl}"
+    fi
+    if profiler_selected_for_plots "${run_profiler}"; then
+      plot_single_run "${config_root}" "${seq_len}" "${backend}" "${run_profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${seq_root}"
       plot_running_combined "${config_root}" "${seq_len}" "${seq_root}"
     fi
+    if [[ "${materialize_source_from_nsys}" == "true" ]] && profiler_selected_for_plots source; then
+      plot_single_run "${config_root}" "${seq_len}" "${backend}" source "${recompute}" "${expert_policy}" "${router_mode}" "${source_materialized_seq_root}"
+      plot_running_combined "${config_root}" "${seq_len}" "${source_materialized_seq_root}"
+    fi
     if [[ "${profile_memory_breakdown}" == "true" ]]; then
-      plot_memory_single_run "${seq_root}"
-      plot_memory_running_combined "${config_root}" "${seq_len}" "${seq_root}"
+      if [[ "${materialize_source_from_nsys}" == "true" ]]; then
+        plot_memory_single_run "${source_materialized_seq_root}"
+        plot_memory_running_combined "${config_root}" "${seq_len}" "${source_materialized_seq_root}"
+      else
+        plot_memory_single_run "${seq_root}"
+        plot_memory_running_combined "${config_root}" "${seq_len}" "${seq_root}"
+      fi
     fi
   else
     append_job_record "${config_root}" "failed:${status}" \
-      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}" "${lf_expert_lora_impl}"
+      "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${run_profiler}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}" "${lf_expert_lora_impl}"
+    if [[ "${materialize_source_from_nsys}" == "true" ]]; then
+      append_job_record "${config_root}" "failed:${status}" \
+        "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" source "${grad_offload}" "${source_materialized_seq_root}" "${source_materialized_profile_json}" "${source_materialized_log_file}" "${lf_expert_lora_impl}"
+    fi
   fi
   return "${status}"
 }
@@ -2714,15 +3012,17 @@ for model_spec_entry in "${model_specs[@]}"; do
             for backend_recompute in "${backend_specs[@]}"; do
               backend="${backend_recompute%%|*}"
               recompute="${backend_recompute##*|}"
-              if [[ "${recompute}" == "recomp" && ( "${expert_policy}" == "gc-exp" || "${expert_policy}" == "gc-attn-exp" || "${expert_policy}" == "gc-layer" ) && "$(bool_value "${ASYMM_ALLOW_SELECTIVE_GC_WITH_GLOBAL_RECOMP:-false}")" != "true" ]]; then
+              if ! is_policy_independent_backend "${backend}" && [[ "${recompute}" == "recomp" && ( "${expert_policy}" == "gc-exp" || "${expert_policy}" == "gc-attn-exp" || "${expert_policy}" == "gc-layer" ) && "$(bool_value "${ASYMM_ALLOW_SELECTIVE_GC_WITH_GLOBAL_RECOMP:-false}")" != "true" ]]; then
                 die "expert_policy=${expert_policy} is selective GC and must use backend recompute=norecomp; global recomp would checkpoint more than the selected modules"
               fi
-              if [[ "${recompute}" == "recomp" && ( "${ASYMM_EXPERT_ACT_OFFLOAD}" == "true" || "${ASYMM_ATTN_ACT_OFFLOAD}" == "true" || "${ASYMM_LAYER_ACT_OFFLOAD}" == "true" ) ]]; then
+              if ! is_policy_independent_backend "${backend}" && [[ "${recompute}" == "recomp" && ( "${ASYMM_EXPERT_ACT_OFFLOAD}" == "true" || "${ASYMM_ATTN_ACT_OFFLOAD}" == "true" || "${ASYMM_LAYER_ACT_OFFLOAD}" == "true" ) ]]; then
                 die "activation offload tuples must use backend recompute=norecomp; global recomp would mix offload and checkpointing"
               fi
               for profiler in "${profilers[@]}"; do
-                if [[ "${backend}" == "kt_armbf16" && "${profiler}" == "nsys" && "${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}" != "1" ]]; then
-                  echo "Skipping backend=kt_armbf16 profiler=nsys; run profiler=source first and set KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK=1 only after one source step completes."
+                profiler_runs_nsys=false
+                [[ "${profiler}" == "nsys" || "${profiler}" == "both" ]] && profiler_runs_nsys=true
+                if [[ "${backend}" == "kt_armbf16" && "${profiler_runs_nsys}" == "true" && "${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}" != "1" ]]; then
+                  echo "Skipping backend=kt_armbf16 profiler=${profiler}; run profiler=source first and set KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK=1 only after one source step completes."
                   continue
                 fi
                 job_router_mode="${router_mode}"
@@ -2734,13 +3034,13 @@ for model_spec_entry in "${model_specs[@]}"; do
                     continue
                   fi
                 fi
-                if is_policy_independent_backend "${backend}" && [[ "${expert_policy}" != "none" ]]; then
-                  echo "Skipping backend=${backend} expert_policy=${expert_policy}; torch/zero/SuperOffload/KT backends are policy-independent."
+                if is_policy_independent_backend "${backend}" && [[ "${exp_act_policy_pair}" != "${exp_act_policy_pairs[0]}" ]]; then
+                  echo "Skipping backend=${backend} policy=${exp_act_policy_pair}; policy-independent backends run once (canonicalized to none|false|false|false)."
                   continue
                 fi
-                if [[ "${backend}" == "kt_armbf16" && "${profiler}" == "nsys" ]]; then
+                if [[ "${backend}" == "kt_armbf16" && "${profiler_runs_nsys}" == "true" ]]; then
                   if ! kt_arm_matching_source_profile_complete "${config_root}" "${backend}" "${recompute}" "${expert_policy}" "${job_router_mode}" "${seq_len}" "${current_model_name}"; then
-                    echo "Skipping backend=kt_armbf16 profiler=nsys; matching source profile is missing, incomplete, or stale for seq=${seq_len} recompute=${recompute} expert_policy=${expert_policy} router_mode=${job_router_mode} qwen_expert_lora_impl=${lf_expert_lora_impl} ${expact_label} ${attnact_label} ${layeract_label}."
+                    echo "Skipping backend=kt_armbf16 profiler=${profiler}; matching source profile is missing, incomplete, or stale for seq=${seq_len} recompute=${recompute} expert_policy=${expert_policy} router_mode=${job_router_mode} qwen_expert_lora_impl=${lf_expert_lora_impl} ${expact_label} ${attnact_label} ${layeract_label}."
                     continue
                   fi
                 fi

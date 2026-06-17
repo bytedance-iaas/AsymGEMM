@@ -1607,7 +1607,7 @@ def test_profile_lora_lf_passes_matching_source_profile_to_kt_arm_nsys(tmp_path:
         output_root
         / "asym_long_sft_smoke__lora__lf__bf16"
         / "qwen3-30b-a3b__gpus1__b4_s128_w0_s1_r64_a16_drop000"
-        / "kt_armbf16__source__recomp__polnone__routerhf"
+        / "kt_armbf16__source__recomp__polnone__routerhf__expact0__attnact0__layeract0__loraafwdhbm"
         / "b4_s128"
         / "profile.json"
     )
@@ -1632,6 +1632,11 @@ def test_profile_lora_lf_passes_matching_source_profile_to_kt_arm_nsys(tmp_path:
                     "kt_arm_token_chunks": 1,
                     "kt_arm_route_rank_work": 262144,
                     "kt_arm_sft_max_route_rank_work": 1048576,
+                    "asymm_expert_act_offload": False,
+                    "asymm_attn_act_offload": False,
+                    "asymm_layer_act_offload": False,
+                    "asymm_expert_act_offload_lora_a_fwd": "hbm",
+                    "qwen_moe_expert_lora_impl": "split-target-parameters",
                 },
                 "heartbeat": {"latest": {"stage": "source_profile_written"}},
                 "kt": {

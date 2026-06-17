@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import re
-import time
 import warnings
 import weakref
 from collections import Counter
@@ -1893,9 +1892,20 @@ def _model_memory_summary(model: nn.Module | None) -> dict[str, Any]:
                 if tensor.is_pinned():
                     pinned_bytes_by_component[component] = pinned_bytes_by_component.get(component, 0) + bytes_value
     for component, bytes_value in sorted(host_bytes_by_component.items()):
-        rows.append({"category": "host_weight", "component": component, "device": "cpu", "bytes": bytes_value})
-    for component, bytes_value in sorted(pinned_bytes_by_component.items()):
-        rows.append({"category": "pinned_host_weight", "component": component, "device": "cpu", "bytes": bytes_value})
+        # Pinned bytes are the page-locked SUBSET of this component's host bytes, not additional
+        # memory. Emit them as a subset field on the single host_weight row rather than a separate
+        # additive "pinned_host_weight" row, so summing rows never double-counts offloaded weights
+        # (e.g. routed_experts, whose GPU param is a 0-byte placeholder and whose real ~54 GiB lives
+        # only on the CPU host).
+        rows.append(
+            {
+                "category": "host_weight",
+                "component": component,
+                "device": "cpu",
+                "bytes": bytes_value,
+                "pinned_bytes": pinned_bytes_by_component.get(component, 0),
+            }
+        )
     return {"enabled": True, "total_parameter_bytes": total, "rows": rows}
 
 

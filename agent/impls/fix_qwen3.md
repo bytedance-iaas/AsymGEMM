@@ -1,0 +1,522 @@
+# Qwen3 ASYM_OFFLOAD_ACT_RECOMPUTE / ASYM_OFFLOAD_X_UNPACKED Implementation
+
+Goal: make the existing generic knobs real for Qwen3 routed expert activation offload, without changing the `0/0` behavior and without adding Qwen3-specific envs.
+
+Knobs:
+
+- `ASYM_OFFLOAD_ACT_RECOMPUTE=1`: do not keep saved CPU `act = silu(gate) * up` across the forward/backward gap; recompute it on CPU in backward only when needed for `down_lora_A` grad.
+- `ASYM_OFFLOAD_X_UNPACKED=1`: do not keep packed routed-token `X` across the forward/backward gap; keep source hidden states plus route indices and rebuild packed `X` in backward only when needed for gate/up LoRA-A grads.
+
+Default `ASYM_OFFLOAD_ACT_RECOMPUTE=0 ASYM_OFFLOAD_X_UNPACKED=0` must remain semantically identical to current Qwen3 code: save packed `X`, save CPU `act`, no extra tensor copies, no CPU `index_select`, no recompute.
+
+## Scope
+
+Modify:
+
+- `asym_gemm/training/qwen3_moe.py`
+  - `_expert_act_offload_lora_a_fwd_mode`
+  - `_ActivationOffloadQwen3ExpertFunction.forward`
+  - `_ActivationOffloadQwen3ExpertFunction.backward`
+  - `AsymQwen3Experts._forward_expert_activation_offload`
+  - `AsymQwen3Experts.forward`
+  - `AsymQwen3Experts.forward_input_scaled`
+
+Add tests:
+
+- `tests/training/test_lf_qwen3_asym_backend.py`
+  - extend the SM100 activation-offload correctness test to cover `actrecomp/xunpack`
+  - add a CPU-safe metadata threading test so the metadata path is covered even when SM100 kernels are unavailable
+
+Do not modify:
+
+- scripts/env names
+- Qwen3 non-activation-offload paths
+- Llama4 source
+- grouped GEMM kernels
+- expert routing kernels
+
+## Stage 1: Thread Qwen3 Route Metadata Into Activation Offload
+
+### Code Changes
+
+In `asym_gemm/training/qwen3_moe.py`, add generic env readers near `_expert_act_offload_lora_a_fwd_mode()`:
+
+```python
+def _expert_act_offload_act_recompute() -> bool:
+    return _env_flag("ASYM_OFFLOAD_ACT_RECOMPUTE", False)
+
+
+def _expert_act_offload_x_unpacked() -> bool:
+    return _env_flag("ASYM_OFFLOAD_X_UNPACKED", False)
+```
+
+Change `AsymQwen3Experts._forward_expert_activation_offload` to accept direct metadata args. Do not stash anything on `self`; this avoids `try/finally` cleanup and prevents stale layer state.
+
+```python
+def _forward_expert_activation_offload(
+    self,
+    packed: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    *,
+    x_src_hidden: torch.Tensor | None = None,
+    x_token_indices: torch.Tensor | None = None,
+    x_route_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    self._check_activation_offload_supported(packed)
+    return _ActivationOffloadQwen3ExpertFunction.apply(
+        packed,
+        offsets,
+        experts,
+        x_src_hidden,
+        x_token_indices,
+        x_route_scale,
+        self.gate_lora_A,
+        self.gate_lora_B,
+        self.up_lora_A,
+        self.up_lora_B,
+        self.down_lora_A,
+        self.down_lora_B,
+        self,
+    )
+```
+
+In `AsymQwen3Experts.forward`, pass the original unscaled hidden and token indices:
+
+```python
+if self._uses_activation_offload():
+    down = self._forward_expert_activation_offload(
+        packed,
+        offsets,
+        experts,
+        x_src_hidden=hidden_states.reshape(metadata.num_tokens, -1),
+        x_token_indices=metadata.token_indices,
+        x_route_scale=None,
+    )
+```
+
+Reason: normal Qwen3 routes scale expert outputs in `scatter_contiguous`, not expert inputs. Rebuilding packed `X` should only gather hidden rows.
+
+In `AsymQwen3Experts.forward_input_scaled`, pass route scale too:
+
+```python
+if self._uses_activation_offload():
+    down = self._forward_expert_activation_offload(
+        packed,
+        offsets,
+        experts,
+        x_src_hidden=hidden_states.reshape(metadata.num_tokens, -1),
+        x_token_indices=metadata.token_indices,
+        x_route_scale=metadata.routing_weights,
+    )
+```
+
+Reason: this path multiplies packed inputs before the expert body, so rebuilding packed `X` in backward must also multiply by `metadata.routing_weights`.
+
+Update `_ActivationOffloadQwen3ExpertFunction.forward` signature:
+
+```python
+def forward(
+    ctx,
+    packed: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    x_src_hidden: torch.Tensor | None,
+    x_token_indices: torch.Tensor | None,
+    x_route_scale: torch.Tensor | None,
+    gate_lora_A: torch.Tensor,
+    gate_lora_B: torch.Tensor,
+    up_lora_A: torch.Tensor,
+    up_lora_B: torch.Tensor,
+    down_lora_A: torch.Tensor,
+    down_lora_B: torch.Tensor,
+    layer: "AsymQwen3Experts",
+) -> torch.Tensor:
+```
+
+Because this adds three autograd inputs, the backward return tuple must add three `None` entries after `grad_packed`.
+
+```python
+return (
+    grad_packed,
+    None,  # offsets
+    None,  # experts
+    None,  # x_src_hidden
+    None,  # x_token_indices
+    None,  # x_route_scale
+    grad_gate_lora_A,
+    grad_gate_lora_B,
+    grad_up_lora_A,
+    grad_up_lora_B,
+    grad_down_lora_A,
+    grad_down_lora_B,
+    None,  # layer
+)
+```
+
+### Validation
+
+Run syntax and focused non-SM100 tests:
+
+```bash
+.venv/bin/python -m py_compile asym_gemm/training/qwen3_moe.py
+.venv/bin/python -m pytest -q tests/training/test_lf_qwen3_asym_backend.py -k "qwen3 and not sm100"
+```
+
+Acceptance:
+
+- no syntax errors
+- existing Qwen3 tests still pass
+- no Llama4 files changed
+
+## Stage 2: Implement `ASYM_OFFLOAD_X_UNPACKED`
+
+### Code Changes
+
+In `_ActivationOffloadQwen3ExpertFunction.forward`, after `lora_a_forward_mode` is resolved:
+
+```python
+act_recompute = _expert_act_offload_act_recompute()
+x_unpacked = (
+    _expert_act_offload_x_unpacked()
+    and lora_a_forward_mode == "hbm"
+    and x_src_hidden is not None
+    and x_token_indices is not None
+)
+```
+
+Important: `x_unpacked` must stay disabled for `lora_a_forward_mode == "cpu"`, because CPU LoRA-A forward immediately needs packed `X` in forward. Using source hidden there would be wrong.
+
+Replace current unconditional `x_cpu = manager.offload(packed, "X")` with:
+
+```python
+x_token_indices_cpu = None
+x_route_scale_cpu = None
+with prof_range(layer._forward_range("activation_offload", "x_to_cpu")):
+    if x_unpacked:
+        x_cpu = manager.offload(x_src_hidden.detach(), "X")
+        x_token_indices_cpu = x_token_indices.detach().to(device="cpu", dtype=torch.long).contiguous()
+        if x_route_scale is not None:
+            x_route_scale_cpu = x_route_scale.detach().to(device="cpu", dtype=x_cpu.tensor.dtype).contiguous()
+    else:
+        x_cpu = manager.offload(packed, "X")
+```
+
+Save on `ctx`:
+
+```python
+ctx.x_unpacked = x_unpacked
+ctx.x_token_indices_cpu = x_token_indices_cpu
+ctx.x_route_scale_cpu = x_route_scale_cpu
+```
+
+Add helper near `_activation_offload_cpu_silu_backward`:
+
+```python
+def _rebuild_qwen3_packed_x_cpu(
+    ctx,
+    manager: ActivationOffloadManager,
+) -> tuple[CPUActivationHandle, bool]:
+    if not getattr(ctx, "x_unpacked", False):
+        return ctx.x_cpu, False
+
+    hidden_cpu = ctx.x_cpu.tensor
+    token_indices = getattr(ctx, "x_token_indices_cpu", None)
+    if token_indices is None:
+        raise RuntimeError("Qwen3 unpacked-X reconstruction requires token indices")
+
+    manager.wait_cpu_ready(ctx.x_cpu)
+    rebuilt = manager.empty_cpu(
+        (int(token_indices.numel()), int(hidden_cpu.shape[1])),
+        hidden_cpu.dtype,
+        ctx.x_cpu.original_device,
+        "X",
+    )
+    torch.index_select(hidden_cpu, 0, token_indices, out=rebuilt.tensor)
+
+    route_scale = getattr(ctx, "x_route_scale_cpu", None)
+    if route_scale is not None:
+        rebuilt.tensor.mul_(route_scale.reshape(-1, 1).to(dtype=rebuilt.tensor.dtype))
+
+    return rebuilt, True
+```
+
+Use helper in backward gate/up LoRA-A grad:
+
+```python
+with prof_range("backward.mlp.activation_offload.gate_up_lora_a_grad"):
+    x_handle, release_x_handle = _rebuild_qwen3_packed_x_cpu(ctx, manager)
+    grad_gate_lora_A, grad_up_lora_A = grouped_lora_a_pair_grad_cpu_right(
+        dS_gate,
+        dS_up,
+        x_handle.tensor,
+        offsets,
+        experts,
+        num_experts=int(gate_lora_A.shape[0]),
+        stats=layer.stats,
+    )
+    if release_x_handle:
+        manager.release_cpu(x_handle)
+    manager.release_cpu(ctx.x_cpu)
+```
+
+Do not add expert loops. The only extra work for `xunpack=1` is one CPU `index_select` over all routed tokens.
+
+### Validation
+
+Add a CPU-safe metadata-threading test in `tests/training/test_lf_qwen3_asym_backend.py`:
+
+```python
+def test_qwen3_activation_offload_threads_unpacked_x_metadata(monkeypatch):
+    source = FakeQwen3Experts()
+    wrapped = AsymQwen3Experts(
+        source,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        init_lora_weights="peft",
+        strict=False,
+    )
+    wrapped.train()
+    captured = {}
+    monkeypatch.setattr(wrapped, "_uses_activation_offload", lambda: True)
+
+    def fake_activation_offload(packed, offsets, experts, *, x_src_hidden=None, x_token_indices=None, x_route_scale=None):
+        captured["src_hidden"] = x_src_hidden.detach().clone()
+        captured["token_indices"] = x_token_indices.detach().clone()
+        captured["route_scale"] = None if x_route_scale is None else x_route_scale.detach().clone()
+        captured["packed"] = packed.detach().clone()
+        return wrapped._forward_expert_body(packed, offsets, experts, dense_experts=True)
+
+    monkeypatch.setattr(wrapped, "_forward_expert_activation_offload", fake_activation_offload)
+    x = torch.randn(5, source.hidden_dim, dtype=torch.bfloat16)
+    top_k_index, top_k_weights = _routing()
+
+    _ = wrapped(x, top_k_index, top_k_weights)
+    metadata = build_contiguous_route_metadata(top_k_index, top_k_weights, num_experts=source.num_experts)
+    expected_packed = pack_tokens_contiguous(x, metadata)
+
+    torch.testing.assert_close(captured["src_hidden"], x)
+    torch.testing.assert_close(captured["token_indices"], metadata.token_indices)
+    assert captured["route_scale"] is None
+    torch.testing.assert_close(captured["packed"], expected_packed)
+```
+
+Also test `forward_input_scaled` route scale:
+
+```python
+_ = wrapped.forward_input_scaled(x, top_k_index, top_k_weights)
+assert captured["route_scale"] is not None
+torch.testing.assert_close(captured["route_scale"], metadata.routing_weights)
+```
+
+Run:
+
+```bash
+.venv/bin/python -m pytest -q tests/training/test_lf_qwen3_asym_backend.py -k "unpacked_x_metadata or activation_offload_lora_a_fwd_selector"
+```
+
+Acceptance:
+
+- metadata matches `pack_tokens_contiguous`
+- normal Qwen3 has no route scale
+- `forward_input_scaled` does have route scale
+
+## Stage 3: Implement `ASYM_OFFLOAD_ACT_RECOMPUTE`
+
+### Code Changes
+
+In `_ActivationOffloadQwen3ExpertFunction.forward`, after `act_cpu` is computed and after forward has used it for down base/down LoRA:
+
+```python
+ctx.act_recompute = act_recompute
+if act_recompute:
+    manager.release_cpu(act_cpu)
+    ctx.act_cpu = None
+else:
+    ctx.act_cpu = act_cpu
+```
+
+Do not release `gate_cpu` or `up_cpu`; Qwen3 needs them later for SiLU backward. This stage only drops saved `act`.
+
+In backward `down_lora` block, replace direct use of `ctx.act_cpu.tensor`:
+
+```python
+if getattr(ctx, "act_recompute", False):
+    act_handle = _activation_offload_cpu_silu_mul(ctx.gate_cpu, ctx.up_cpu, manager, tag="act")
+else:
+    act_handle = ctx.act_cpu
+
+grad_down_lora_A = grouped_lora_a_grad_cpu_right(
+    dS_down,
+    act_handle.tensor,
+    offsets,
+    experts,
+    num_experts=int(down_lora_A.shape[0]),
+    stats=layer.stats,
+    tag="down",
+)
+manager.release_cpu(act_handle)
+```
+
+This preserves the existing grouped LoRA-A gradient kernel. There is no new GEMM fragmentation.
+
+Add stats before returning from forward and backward:
+
+```python
+activation_offload_stats["qwen3_act_recompute"] = bool(act_recompute)
+activation_offload_stats["qwen3_x_unpacked"] = bool(x_unpacked)
+```
+
+For backward final stats, use values from `ctx`:
+
+```python
+activation_offload_stats["qwen3_act_recompute"] = bool(getattr(ctx, "act_recompute", False))
+activation_offload_stats["qwen3_x_unpacked"] = bool(getattr(ctx, "x_unpacked", False))
+```
+
+### Validation
+
+Extend SM100 correctness test to cover toggles:
+
+```python
+@pytest.mark.parametrize("lora_a_forward_mode", ["cpu", "hbm"])
+@pytest.mark.parametrize("act_recompute", ["0", "1"])
+@pytest.mark.parametrize("x_unpacked", ["0", "1"])
+def test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend(...):
+    monkeypatch.setenv("ASYM_OFFLOAD_ACT_RECOMPUTE", act_recompute)
+    monkeypatch.setenv("ASYM_OFFLOAD_X_UNPACKED", x_unpacked)
+```
+
+Expected stats:
+
+```python
+effective_x_unpacked = x_unpacked == "1" and lora_a_forward_mode == "hbm"
+assert stats["qwen3_act_recompute"] is (act_recompute == "1")
+assert stats["qwen3_x_unpacked"] is effective_x_unpacked
+```
+
+For `lora_a_forward_mode == "cpu"` and `ASYM_OFFLOAD_X_UNPACKED=1`, assert fallback to packed X:
+
+```python
+assert stats["qwen3_x_unpacked"] is False
+```
+
+Run:
+
+```bash
+.venv/bin/python -m pytest -q tests/training/test_lf_qwen3_asym_backend.py -k "sm100_activation_offload_matches_torch_backend"
+```
+
+Acceptance:
+
+- outputs match torch backend
+- input grads match torch backend
+- all LoRA grads match torch backend
+- `xunpack=1` is effective only with HBM LoRA-A forward
+- `actrecomp=1` does not change math
+
+## Stage 4: Verify `0/0` Is the Old Path
+
+### Required Behavior
+
+With:
+
+```bash
+ASYM_OFFLOAD_ACT_RECOMPUTE=0
+ASYM_OFFLOAD_X_UNPACKED=0
+```
+
+the executed tensor path must remain:
+
+```python
+x_cpu = manager.offload(packed, "X")
+ctx.act_cpu = act_cpu
+grad_down_lora_A uses ctx.act_cpu.tensor
+grad_gate_lora_A / grad_up_lora_A use ctx.x_cpu.tensor
+```
+
+No `index_select` rebuild. No activation recompute. No extra H2D/D2H tensor movement. Only cheap Python boolean checks and three optional autograd inputs.
+
+### Validation
+
+Run focused test:
+
+```bash
+ASYM_OFFLOAD_ACT_RECOMPUTE=0 \
+ASYM_OFFLOAD_X_UNPACKED=0 \
+.venv/bin/python -m pytest -q tests/training/test_lf_qwen3_asym_backend.py -k "sm100_activation_offload_matches_torch_backend"
+```
+
+Then run Qwen3 e2e smoke using existing script defaults:
+
+```bash
+bash scripts/lf/profile_lora_lf.sh
+```
+
+For quick smoke if the test script is configured to Qwen3:
+
+```bash
+bash scripts/lf/profile_lora_lf_test.sh
+```
+
+Acceptance:
+
+- `actrecomp0__xunpack0` L1 loss remains sane and comparable to previous runs
+- forward/backward timing within noise of previous `0/0` run
+- allocated/reserved HBM within noise of previous `0/0` run
+- no new failures in `source_profile.json`, `profile.json`, or `train.log`
+
+Reject if:
+
+- `0/0` latency increases meaningfully
+- `0/0` memory changes for no reason
+- loss diverges from previous Qwen3 runs
+
+## Stage 5: E2E Memory/Latency Acceptance for `1/1`
+
+### Run
+
+Use the real LF LoRA profiling path. Do not accept based only on toy tests.
+
+```bash
+ASYM_OFFLOAD_ACT_RECOMPUTE=1 \
+ASYM_OFFLOAD_X_UNPACKED=1 \
+bash scripts/lf/profile_lora_lf.sh
+```
+
+If the full script is too expensive during development, first run the configured smoke:
+
+```bash
+ASYM_OFFLOAD_ACT_RECOMPUTE=1 \
+ASYM_OFFLOAD_X_UNPACKED=1 \
+bash scripts/lf/profile_lora_lf_test.sh
+```
+
+### Acceptance
+
+Keep the change only if Qwen3 ASym activation-offload profiling shows:
+
+- meaningful GPU memory reduction versus `actrecomp0__xunpack0`
+- no forward/backward timing blow-up
+- no loss instability
+- no significant kernel launch count explosion
+- CPU RSS stays acceptable
+
+Reject if:
+
+- memory reduction is trivial
+- latency increases materially with no meaningful memory win
+- CPU `index_select` rebuild becomes a backward bottleneck
+- `xunpack=1` adds overhead but does not reduce peak memory for the actual Qwen3 workload
+
+## Risks To Watch
+
+- `ASYM_OFFLOAD_X_UNPACKED=1` may reduce CPU activation storage but not GPU peak if Qwen3 peak is dominated by loss/lm_head or other non-expert activations. This must be decided from e2e profiling, not unit tests.
+- `forward_input_scaled` must multiply rebuilt packed `X` by route scale. Normal `forward` must not, because Qwen3 applies route weights at scatter.
+- `xunpack=1` is intentionally ineffective with CPU LoRA-A forward. Enabling it there would make forward LoRA-A read the wrong input.
+- `actrecomp=1` saves CPU activation memory, not HBM directly. Its value depends on whether CPU activation pressure or staging indirectly affects the run.
+- Do not add per-expert loops or split grouped GEMMs. All existing grouped kernels must stay intact.

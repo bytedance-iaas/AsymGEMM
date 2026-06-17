@@ -9,6 +9,7 @@ import math
 import re
 import shutil
 import sys
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -217,13 +218,26 @@ def _run_plot_label(run: RunRecord) -> str:
     return run.label or run.run_dir.name
 
 
+def _wrap_plot_label(label: str, *, width: int = 32) -> str:
+    if len(label) <= width:
+        return label
+    return "\n".join(
+        textwrap.wrap(
+            label,
+            width=width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+    )
+
+
 def _run_plot_labels(runs: list[RunRecord]) -> list[str]:
     base_labels = [_run_plot_label(run) for run in runs]
     counts: dict[str, int] = {}
     for label in base_labels:
         counts[label] = counts.get(label, 0) + 1
     return [
-        f"{label}\n{_run_config_label(run)}" if counts.get(label, 0) > 1 else label
+        _wrap_plot_label(f"{label}\n{_run_config_label(run)}" if counts.get(label, 0) > 1 else label)
         for run, label in zip(runs, base_labels)
     ]
 
@@ -359,36 +373,85 @@ def _parse_attnact_part(part: str) -> tuple[str, str] | None:
     return None
 
 
+def _known_optional_job_axis(part: str) -> bool:
+    value = part.strip().lower()
+    return (
+        value in {"layeract0", "layeract1", "layeractfalse", "layeracttrue"}
+        or value in {"actrecomp0", "actrecomp1", "actrecompfalse", "actrecomptrue"}
+        or value in {"xunpack0", "xunpack1", "xunpackfalse", "xunpacktrue"}
+        or value.startswith("loraafwd")
+        or value.startswith("gradoff")
+        or value.startswith("weightoff")
+    )
+
+
+def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
+    parts = job_dir_name.split("__")
+    if len(parts) < 4:
+        return None
+    backend_part, profiler_part, recompute_part, policy_part = parts[:4]
+    tail = parts[4:]
+    router_part = "routerhf"
+    expact_value = "false"
+    expact = "expact0"
+    attnact_value = "false"
+    attnact = "attnact0"
+
+    if tail:
+        router_part = tail.pop(0)
+        if not router_part.startswith("router"):
+            return None
+
+    for part in tail:
+        parsed_expact = _parse_expact_part(part)
+        if parsed_expact is not None:
+            expact_value, expact = parsed_expact
+            continue
+        parsed_attnact = _parse_attnact_part(part)
+        if parsed_attnact is not None:
+            attnact_value, attnact = parsed_attnact
+            continue
+        if _known_optional_job_axis(part):
+            continue
+        return None
+
+    return {
+        "backend": backend_part,
+        "profiler": profiler_part,
+        "recompute": recompute_part,
+        "policy_part": policy_part,
+        "router_part": router_part,
+        "asymm_expert_act_offload": expact_value,
+        "expact": expact,
+        "asymm_attn_act_offload": attnact_value,
+        "attnact": attnact,
+    }
+
+
+def _run_dir_for_summary(summary_path: Path) -> Path:
+    run_dir = summary_path.parent
+    if run_dir.name == "memory_breakdown" and RUN_DIR_RE.match(run_dir.parent.name):
+        return run_dir.parent
+    return run_dir
+
+
 def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | None:
     source_profile = _safe_read_json(run_dir / "source_profile.json")
     config = source_profile.get("config", {}) if isinstance(source_profile.get("config"), dict) else {}
     job_root = run_dir.parent
     config_root = job_root.parent
-    job_parts = job_root.name.split("__")
-    if len(job_parts) == 5:
-        backend_part, profiler_part, recompute_part, policy_part, router_part = job_parts
-        expact_value = "false"
-        expact = "expact0"
-        attnact_value = "false"
-        attnact = "attnact0"
-    elif len(job_parts) == 6:
-        backend_part, profiler_part, recompute_part, policy_part, router_part, expact_part = job_parts
-        parsed_expact = _parse_expact_part(expact_part)
-        if parsed_expact is None:
-            return None
-        expact_value, expact = parsed_expact
-        attnact_value = "false"
-        attnact = "attnact0"
-    elif len(job_parts) == 7:
-        backend_part, profiler_part, recompute_part, policy_part, router_part, expact_part, attnact_part = job_parts
-        parsed_expact = _parse_expact_part(expact_part)
-        parsed_attnact = _parse_attnact_part(attnact_part)
-        if parsed_expact is None or parsed_attnact is None:
-            return None
-        expact_value, expact = parsed_expact
-        attnact_value, attnact = parsed_attnact
-    else:
+    job_meta = _parse_job_dir_parts(job_root.name)
+    if job_meta is None:
         return None
+    backend_part = job_meta["backend"]
+    profiler_part = job_meta["profiler"]
+    recompute_part = job_meta["recompute"]
+    policy_part = job_meta["policy_part"]
+    router_part = job_meta["router_part"]
+    expact_value = job_meta["asymm_expert_act_offload"]
+    expact = job_meta["expact"]
+    attnact_value = job_meta["asymm_attn_act_offload"]
+    attnact = job_meta["attnact"]
     if not policy_part.startswith("pol") or not router_part.startswith("router"):
         return None
     router_mode = str(config.get("router_mode") or router_part[len("router") :])
@@ -462,11 +525,13 @@ def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
             continue
         if int(summary.get("schema_version") or 0) != 2:
             continue
-        run_dir = summary_path.parent
+        run_dir = _run_dir_for_summary(summary_path)
         jsonl_path = _first_existing(
             [
                 run_dir / "memory_breakdown.jsonl",
+                run_dir / "memory_breakdown" / "memory_breakdown.jsonl",
                 run_dir / f"{summary_path.stem.removesuffix('_summary')}.jsonl",
+                summary_path.parent / f"{summary_path.stem.removesuffix('_summary')}.jsonl",
             ]
         )
         summary = _repair_summary_from_jsonl(summary, jsonl_path)
@@ -496,7 +561,7 @@ def _no_runs_message(args: argparse.Namespace) -> str:
         if int(summary.get("schema_version") or 0) != 2:
             legacy_paths.append(summary_path)
             continue
-        run_dir = summary_path.parent
+        run_dir = _run_dir_for_summary(summary_path)
         metadata = _infer_metadata(run_dir, summary)
         if metadata is None:
             metadata_failures += 1
@@ -504,7 +569,9 @@ def _no_runs_message(args: argparse.Namespace) -> str:
         jsonl_path = _first_existing(
             [
                 run_dir / "memory_breakdown.jsonl",
+                run_dir / "memory_breakdown" / "memory_breakdown.jsonl",
                 run_dir / f"{summary_path.stem.removesuffix('_summary')}.jsonl",
+                summary_path.parent / f"{summary_path.stem.removesuffix('_summary')}.jsonl",
             ]
         )
         record = RunRecord(
@@ -779,7 +846,11 @@ def _flatten_row(row: dict[str, Any]) -> tuple[list[dict[str, Any]], int, int]:
                 if value_int <= 0:
                     continue
                 kind_str = str(kind)
-                if kind_str.endswith("_cpu") or kind_str.endswith("_cpu_pinned"):
+                if kind_str.endswith("_cpu_pinned"):
+                    # Page-locked SUBSET of the matching *_cpu total -- already counted in "CPU host".
+                    # Skip it so the CPU host bar does not double-count offloaded weights.
+                    continue
+                if kind_str.endswith("_cpu"):
                     add("CPU host", "host", str(component), kind_str, value_int)
                 elif kind_str in {"weight", "frozen_weight", "buffer"}:
                     add("GPU HBM", "weights", str(component), kind_str, value_int)

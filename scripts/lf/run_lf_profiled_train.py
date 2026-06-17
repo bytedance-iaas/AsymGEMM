@@ -661,6 +661,18 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR", ""),
         "output_dir": _option_value(args, "--output_dir"),
     }
+    asym_cuda_graph = os.environ.get("ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH") or os.environ.get("ASYM_CUDA_GRAPH")
+    if asym_cuda_graph and asym_cuda_graph.lower() not in {"off", "none", "0", "false", "no"}:
+        config["asym_cuda_graph"] = asym_cuda_graph
+    torch_compile = _option_value(args, "--torch_compile")
+    if torch_compile is not None:
+        config["torch_compile"] = torch_compile.lower() in {"1", "true", "yes", "on"}
+    torch_compile_backend = _option_value(args, "--torch_compile_backend")
+    if torch_compile_backend is not None:
+        config["torch_compile_backend"] = torch_compile_backend
+    torch_compile_mode = _option_value(args, "--torch_compile_mode")
+    if torch_compile_mode is not None:
+        config["torch_compile_mode"] = torch_compile_mode
     for key, value in env_config.items():
         config.setdefault(key, value)
     return {key: value for key, value in config.items() if value is not None and value != ""}

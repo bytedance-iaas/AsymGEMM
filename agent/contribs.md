@@ -157,14 +157,14 @@ Notes:
 
 
 ### Questions
-```
 1. How to fix CPU OOM with partial recompute / NVME offloading? Can we load directly from NVME to SMEM in a kernel?
-2. Is there more kernels for the backward process?
-3. What are the bottlenecks for timing and memory currently?
+2. Is there more kernels for the backward process? 
+- Compute silu and directly write to HBM not storing on CPU
+- Compute grad and directly write to CPU not through HBM
+3. What are the gains and bottlenecks for timing and memory currently across Qwen3 and Llama4?
 
-```
 
-
+### Discussion
 1. Can we build a cuda graph for kernel launch (partially)? This avoids synchronization from the CPU.
 2. Scheduling between recompute/offload and where to place tensors (cpu, gpu, nvme)
 3. nvme -> hbm use native gemm / cpu -> smem use asymGEMM scheduling. 

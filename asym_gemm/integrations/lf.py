@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import atexit
+import ctypes
+import gc
 import json
 import os
 from collections import OrderedDict
@@ -65,11 +67,12 @@ from asym_gemm.training.qwen35_moe import (
     wrap_qwen35_moe_block,
 )
 from asym_gemm.training.llama4_moe import AsymLlama4Moe, AsymLlama4Router, is_llama4_moe, wrap_llama4_moe
+from asym_gemm.training.llama4_shared_mlp import AsymLlama4SharedMLP, is_llama4_shared_mlp_leaf
 
 
 ASYM_LF_ADAPTER_FORMAT = "asym_gemm_lf_v1"
 SUPPORTED_LF_OFFLOAD_COMPONENTS = frozenset(
-    {"routed_experts", "router", "shared_experts", "attention", "embed_tokens", "lm_head", "norms"}
+    {"routed_experts", "router", "shared_experts", "attention", "embed_tokens", "lm_head", "norms", "mlp_dense"}
 )
 _ALL_LF_OFFLOAD_COMPONENTS = frozenset(
     {
@@ -80,8 +83,39 @@ _ALL_LF_OFFLOAD_COMPONENTS = frozenset(
         "embed_tokens",
         "lm_head",
         "norms",
+        "mlp_dense",
     }
 )
+_MALLOC_TRIM_FUNC: Any | None = None
+_MALLOC_TRIM_LOOKED_UP = False
+
+
+def _malloc_trim_func() -> Any | None:
+    global _MALLOC_TRIM_FUNC, _MALLOC_TRIM_LOOKED_UP
+    if _MALLOC_TRIM_LOOKED_UP:
+        return _MALLOC_TRIM_FUNC
+    _MALLOC_TRIM_LOOKED_UP = True
+    try:
+        trim = getattr(ctypes.CDLL(None), "malloc_trim")
+        trim.argtypes = [ctypes.c_size_t]
+        trim.restype = ctypes.c_int
+    except Exception:
+        trim = None
+    _MALLOC_TRIM_FUNC = trim
+    return _MALLOC_TRIM_FUNC
+
+
+def _release_replaced_module_memory() -> None:
+    gc.collect()
+    if os.environ.get("ASYM_GEMM_DISABLE_MALLOC_TRIM", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return
+    trim = _malloc_trim_func()
+    if trim is None:
+        return
+    try:
+        trim(0)
+    except Exception:
+        return
 _ATTENTION_TARGETS = frozenset({"q_proj", "k_proj", "v_proj", "o_proj"})
 
 
@@ -95,6 +129,7 @@ class LFOffloadSelection:
     embed_tokens: bool = False
     lm_head: bool = False
     norms: bool = False
+    mlp_dense: bool = False
 
     @property
     def any_cpu_offload(self) -> bool:
@@ -106,6 +141,7 @@ class LFOffloadSelection:
             or self.embed_tokens
             or self.lm_head
             or self.norms
+            or self.mlp_dense
         )
 
     @property
@@ -125,6 +161,8 @@ class LFOffloadSelection:
             components.add("lm_head")
         if self.norms:
             components.add("norms")
+        if self.mlp_dense:
+            components.add("mlp_dense")
         return frozenset(components)
 
 
@@ -319,6 +357,11 @@ def parse_lf_offload_modules(selector: Sequence[str] | str | None) -> LFOffloadS
         "norm": "norms",
         "layernorm": "norms",
         "rmsnorm": "norms",
+        "dense_mlp": "mlp_dense",
+        "mlp": "mlp_dense",
+        "dense": "mlp_dense",
+        "dense_ffn": "mlp_dense",
+        "feed_forward": "mlp_dense",
         "whole_model": "all",
         "model": "all",
     }
@@ -366,6 +409,7 @@ def parse_lf_offload_modules(selector: Sequence[str] | str | None) -> LFOffloadS
         embed_tokens="embed_tokens" in expanded,
         lm_head="lm_head" in expanded,
         norms="norms" in expanded,
+        mlp_dense="mlp_dense" in expanded,
     )
 
 
@@ -433,7 +477,7 @@ def classify_lf_component(name: str, module: nn.Module | None = None) -> str:
         or ".k_norm." in lower
     ):
         return "norms"
-    if ".mlp." in lower and parent_leaf in {"gate_proj", "up_proj", "down_proj"}:
+    if parent_leaf in {"gate_proj", "up_proj", "down_proj"} and (".mlp." in lower or ".feed_forward." in lower):
         return "mlp_dense"
     return "other"
 
@@ -453,6 +497,8 @@ def component_is_selected(component: str, leaf: str, selection: LFOffloadSelecti
         return selection.lm_head
     if component == "norms":
         return selection.norms
+    if component == "mlp_dense":
+        return selection.mlp_dense
     return False
 
 
@@ -803,16 +849,23 @@ def _is_qwen3_decoder_layer_module_name(name: str, module: nn.Module) -> bool:
     if _has_attention_excluded_path_marker(name):
         return False
     children = dict(module.named_children())
-    required = {"self_attn", "mlp", "input_layernorm", "post_attention_layernorm"}
-    if not required <= set(children):
-        return False
     class_name = type(module).__name__.lower()
     module_name = type(module).__module__.lower()
     config = getattr(module, "config", None)
     model_type = str(getattr(config, "model_type", "")).lower()
-    if "qwen3" in class_name or "qwen3" in module_name or model_type in {"qwen3_moe", "qwen3_vl_moe"}:
-        return True
-    return hasattr(children["mlp"], "_is_asym_qwen3_moe_block") or is_qwen3_moe_block(children["mlp"])
+    # Qwen3 / Qwen3-MoE decoder layer (token mixer `self_attn`, FFN child `mlp`).
+    qwen3_required = {"self_attn", "mlp", "input_layernorm", "post_attention_layernorm"}
+    if qwen3_required <= set(children):
+        if "qwen3" in class_name or "qwen3" in module_name or model_type in {"qwen3_moe", "qwen3_vl_moe"}:
+            return True
+        if hasattr(children["mlp"], "_is_asym_qwen3_moe_block") or is_qwen3_moe_block(children["mlp"]):
+            return True
+    # Llama 4 decoder layer (token mixer `self_attn`, FFN child `feed_forward`; dense or MoE).
+    llama4_required = {"self_attn", "feed_forward", "input_layernorm", "post_attention_layernorm"}
+    if llama4_required <= set(children):
+        if "llama4" in class_name or "llama4" in module_name or model_type in {"llama4", "llama4_text"}:
+            return True
+    return False
 
 
 def _wrap_attention_checkpoint_modules(
@@ -1041,95 +1094,86 @@ def apply_lf_asym_lora(
     if layer_act_enabled and backend != "asym":
         raise RuntimeError("Qwen3 decoder layer activation offload requires backend='asym'")
 
-    expert_replacements: list[tuple[str, nn.Module, nn.Module, str]] = []
-    if wrap_experts:
-        if router_mode == "whole":
-            for name, module in list(model.named_modules()):
-                if is_qwen35_moe_block(module):
-                    wrapped = wrap_qwen35_moe_block(
-                        module,
-                        backend=backend,
-                        precision=precision,
-                        offload=offload_experts,
-                        lora_rank=lora_rank,
-                        lora_alpha=lora_alpha,
-                        lora_dropout=lora_dropout,
-                        lora_dtype=torch.bfloat16,
-                        expert_recompute_policy=recompute_config.label,
-                        router_mode="whole",
-                        offload_router=offload_router,
-                        router_debug_grad=False,
-                        stats=stats,
-                        strict=strict,
-                    )
-                    wrapped.profile_prefix = _layer_profile_prefix_from_module_name(name, "mlp")
-                    wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
-                    expert_replacements.append((name, module, wrapped, f"{name}.experts"))
-                elif is_qwen3_moe_block(module):
-                    wrapped = wrap_qwen3_moe_block(
-                        module,
-                        backend=backend,
-                        precision=precision,
-                        offload=offload_experts,
-                        lora_rank=lora_rank,
-                        lora_alpha=lora_alpha,
-                        lora_dropout=lora_dropout,
-                        lora_dtype=torch.bfloat16,
-                        expert_recompute_policy=recompute_config.label,
-                        router_mode="whole",
-                        offload_router=offload_router,
-                        router_debug_grad=False,
-                        stats=stats,
-                        strict=strict,
-                    )
-                    wrapped.profile_prefix = _layer_profile_prefix_from_module_name(name, "mlp")
-                    wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
-                    expert_replacements.append((name, module, wrapped, f"{name}.experts"))
-                elif is_llama4_moe(module):
-                    wrapped = wrap_llama4_moe(
-                        module,
-                        backend=backend,
-                        precision=precision,
-                        offload=offload_experts,
-                        lora_rank=lora_rank,
-                        lora_alpha=lora_alpha,
-                        lora_dropout=lora_dropout,
-                        lora_dtype=torch.bfloat16,
-                        expert_recompute_policy=recompute_config.label,
-                        router_mode="whole",
-                        offload_router=offload_router,
-                        router_debug_grad=False,
-                        stats=stats,
-                        strict=strict,
-                    )
-                    wrapped.profile_prefix = _llama4_profile_prefix_from_module_name(name)
-                    wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
-                    expert_replacements.append((name, module, wrapped, f"{name}.experts"))
+    expert_prefixes: list[str] = []
+
+    def _llama4_shared_expert_is_lora_target(name: str, module: nn.Module) -> bool:
+        if not wrap_dense or not selection.shared_experts:
+            return False
+        shared = getattr(module, "shared_expert", None)
+        if not isinstance(shared, nn.Module):
+            return False
+        leaf_supported: list[bool] = []
+        leaf_targeted: list[bool] = []
+        leaf_preexisting_lora: list[bool] = []
+        for leaf in ("gate_proj", "up_proj", "down_proj"):
+            child = getattr(shared, leaf, None)
+            leaf_supported.append(isinstance(child, nn.Module) and is_llama4_shared_mlp_leaf(child))
+            leaf_targeted.append(
+                _is_all_target(raw_lora_target)
+                or (
+                    isinstance(child, nn.Module)
+                    and _matches_target(f"{name}.shared_expert.{leaf}", child, dense_target_modules)
+                )
+            )
+            leaf_preexisting_lora.append(
+                isinstance(child, nn.Module)
+                and hasattr(child, "lora_A")
+                and hasattr(child, "lora_B")
+            )
+        if not all(leaf_supported):
+            return False
+        return all(leaf_targeted) or all(leaf_preexisting_lora)
+
+    def _install_expert_replacement(name: str, new_module: nn.Module, skip_prefix: str) -> None:
+        parent, child_name = _parent_and_child(model, name)
+        _replace_child(parent, child_name, new_module)
+        expert_prefixes.append(skip_prefix)
+        if isinstance(new_module, AsymQwen35MoeBlock):
+            report.qwen35_moes_wrapped += 1
+        elif isinstance(new_module, AsymLlama4Moe):
+            report.llama4_moes_wrapped += 1
+        elif isinstance(new_module, AsymQwen3MoeBlock):
+            report.qwen3_moes_wrapped += 1
         else:
-            for name, module in list(model.named_modules()):
-                if is_qwen3_experts(module):
-                    family = _packed_expert_family(module)
-                    wrapped = wrap_qwen3_experts(
-                        module,
-                        backend=backend,
-                        precision=precision,
-                        offload=offload_experts,
-                        lora_rank=lora_rank,
-                        lora_alpha=lora_alpha,
-                        lora_dropout=lora_dropout,
-                        lora_dtype=torch.bfloat16,
-                        expert_recompute_policy=recompute_config.label,
-                        stats=stats,
-                        strict=strict,
-                    )
-                    wrapped.asym_expert_family = family
-                    if family == "gemma4":
-                        wrapped.profile_prefix = _gemma4_profile_prefix_from_module_name(name)
-                    else:
-                        wrapped.profile_prefix = _qwen3_profile_prefix_from_module_name(name)
-                    expert_replacements.append((name, module, wrapped, name))
+            report.packed_experts_wrapped += 1
+        report.cpu_resident_base_bytes += new_module.cpu_resident_base_bytes
+        report.gpu_resident_base_bytes += new_module.gpu_resident_base_bytes
+
+    if wrap_experts:
+        expert_candidates: list[tuple[str, str]] = []
+        if router_mode == "whole":
+            for name, module in model.named_modules():
+                if is_qwen35_moe_block(module):
+                    expert_candidates.append((name, "qwen35_whole"))
+                elif is_qwen3_moe_block(module):
+                    expert_candidates.append((name, "qwen3_whole"))
                 elif is_llama4_moe(module):
-                    wrapped = wrap_llama4_moe(
+                    expert_candidates.append((name, "llama4_whole"))
+        else:
+            for name, module in model.named_modules():
+                if is_qwen3_experts(module):
+                    expert_candidates.append((name, "qwen3_experts"))
+                elif is_llama4_moe(module):
+                    expert_candidates.append((name, "llama4_hf"))
+
+        for name, kind in expert_candidates:
+            if not name or _is_under(name, expert_prefixes):
+                continue
+            try:
+                module = model.get_submodule(name)
+            except AttributeError:
+                if strict:
+                    raise RuntimeError(f"{name} disappeared while installing routed expert wrappers")
+                report.skipped.append(f"{name}:missing_during_expert_wrap")
+                continue
+
+            if kind == "qwen35_whole":
+                if not is_qwen35_moe_block(module):
+                    if strict:
+                        raise RuntimeError(f"{name} no longer looks like a Qwen3.5 MoE block")
+                    report.skipped.append(f"{name}:stale_qwen35_moe_block")
+                    continue
+                wrapped = wrap_qwen35_moe_block(
                         module,
                         backend=backend,
                         precision=precision,
@@ -1139,32 +1183,105 @@ def apply_lf_asym_lora(
                         lora_dropout=lora_dropout,
                         lora_dtype=torch.bfloat16,
                         expert_recompute_policy=recompute_config.label,
-                        router_mode="hf",
+                        router_mode="whole",
                         offload_router=offload_router,
                         router_debug_grad=False,
                         stats=stats,
                         strict=strict,
-                    )
-                    wrapped.profile_prefix = _llama4_profile_prefix_from_module_name(name)
-                    wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
-                    expert_replacements.append((name, module, wrapped, f"{name}.experts"))
-
-        if not expert_replacements and strict:
-            raise ValueError("AsymGEMM requested routed expert LoRA but found no supported packed expert/MoE modules.")
-
-        for name, _old_module, new_module, _skip_prefix in expert_replacements:
-            parent, child_name = _parent_and_child(model, name)
-            _replace_child(parent, child_name, new_module)
-            if isinstance(new_module, AsymQwen35MoeBlock):
-                report.qwen35_moes_wrapped += 1
-            elif isinstance(new_module, AsymLlama4Moe):
-                report.llama4_moes_wrapped += 1
-            elif isinstance(new_module, AsymQwen3MoeBlock):
-                report.qwen3_moes_wrapped += 1
+                )
+                wrapped.profile_prefix = _layer_profile_prefix_from_module_name(name, "mlp")
+                wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
+                _install_expert_replacement(name, wrapped, f"{name}.experts")
+            elif kind == "qwen3_whole":
+                if not is_qwen3_moe_block(module):
+                    if strict:
+                        raise RuntimeError(f"{name} no longer looks like a Qwen3 MoE block")
+                    report.skipped.append(f"{name}:stale_qwen3_moe_block")
+                    continue
+                wrapped = wrap_qwen3_moe_block(
+                        module,
+                        backend=backend,
+                        precision=precision,
+                        offload=offload_experts,
+                        lora_rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=lora_dropout,
+                        lora_dtype=torch.bfloat16,
+                        expert_recompute_policy=recompute_config.label,
+                        router_mode="whole",
+                        offload_router=offload_router,
+                        router_debug_grad=False,
+                        stats=stats,
+                        strict=strict,
+                )
+                wrapped.profile_prefix = _layer_profile_prefix_from_module_name(name, "mlp")
+                wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
+                _install_expert_replacement(name, wrapped, f"{name}.experts")
+            elif kind in {"llama4_whole", "llama4_hf"}:
+                if not is_llama4_moe(module):
+                    if strict:
+                        raise RuntimeError(f"{name} no longer looks like a Llama4 MoE block")
+                    report.skipped.append(f"{name}:stale_llama4_moe")
+                    continue
+                wrapped = wrap_llama4_moe(
+                        module,
+                        backend=backend,
+                        precision=precision,
+                        offload=offload_experts,
+                        lora_rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=lora_dropout,
+                        lora_dtype=torch.bfloat16,
+                        expert_recompute_policy=recompute_config.label,
+                        router_mode="whole" if kind == "llama4_whole" else "hf",
+                        offload_router=offload_router,
+                        wrap_shared_expert=_llama4_shared_expert_is_lora_target(name, module),
+                        offload_shared_expert=backend == "asym" and selection.shared_experts,
+                        router_debug_grad=False,
+                        stats=stats,
+                        strict=strict,
+                )
+                wrapped.profile_prefix = _llama4_profile_prefix_from_module_name(name)
+                wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
+                if isinstance(wrapped.shared_expert, AsymLlama4SharedMLP):
+                    wrapped.shared_expert.profile_prefix = f"{wrapped.profile_prefix}.shared_expert"
+                    report.dense_lora_wrapped += max(0, 3 - int(wrapped.shared_expert.preexisting_lora_leaf_count))
+                _install_expert_replacement(name, wrapped, f"{name}.experts")
+            elif kind == "qwen3_experts":
+                if not is_qwen3_experts(module):
+                    if strict:
+                        raise RuntimeError(f"{name} no longer looks like a Qwen3 packed expert module")
+                    report.skipped.append(f"{name}:stale_qwen3_experts")
+                    continue
+                family = _packed_expert_family(module)
+                wrapped = wrap_qwen3_experts(
+                        module,
+                        backend=backend,
+                        precision=precision,
+                        offload=offload_experts,
+                        lora_rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=lora_dropout,
+                        lora_dtype=torch.bfloat16,
+                        expert_recompute_policy=recompute_config.label,
+                        stats=stats,
+                        strict=strict,
+                )
+                wrapped.asym_expert_family = family
+                if family == "gemma4":
+                    wrapped.profile_prefix = _gemma4_profile_prefix_from_module_name(name)
+                else:
+                    wrapped.profile_prefix = _qwen3_profile_prefix_from_module_name(name)
+                _install_expert_replacement(name, wrapped, name)
             else:
-                report.packed_experts_wrapped += 1
-            report.cpu_resident_base_bytes += new_module.cpu_resident_base_bytes
-            report.gpu_resident_base_bytes += new_module.gpu_resident_base_bytes
+                raise AssertionError(f"unknown expert candidate kind: {kind}")
+
+            del module
+            if backend == "asym" and offload_experts:
+                _release_replaced_module_memory()
+
+        if not expert_prefixes and strict:
+            raise ValueError("AsymGEMM requested routed expert LoRA but found no supported packed expert/MoE modules.")
 
     if _attention_gc_enabled_for_policy(recompute_config.label):
         wrapped_attention, skipped_attention = _wrap_attention_checkpoint_modules(model, strict=strict)
@@ -1192,16 +1309,21 @@ def apply_lf_asym_lora(
         setattr(model, "_asym_layer_gc_enabled", False)
         setattr(model, "_asym_layer_gc_modules", tuple())
 
-    expert_prefixes = [skip_prefix for _name, _old_module, _new_module, skip_prefix in expert_replacements]
     if offload_router:
-        router_replacements: list[tuple[str, nn.Module, nn.Module]] = []
-        for name, module in list(model.named_modules()):
+        router_names: list[str] = []
+        for name, module in model.named_modules():
             if not name or _is_under(name, expert_prefixes) or isinstance(module, (AsymQwen3Router, AsymLlama4Router)):
                 continue
             lower_name = name.lower()
             if not (lower_name == "router" or lower_name.endswith(".mlp.gate") or lower_name.endswith(".feed_forward.router")):
                 continue
             if classify_lf_component(name, module) != "router":
+                continue
+            router_names.append(name)
+
+        for name in router_names:
+            module = model.get_submodule(name)
+            if isinstance(module, (AsymQwen3Router, AsymLlama4Router)):
                 continue
             wrapped_router = _wrap_lf_router_module(
                 name,
@@ -1216,15 +1338,14 @@ def apply_lf_asym_lora(
                     raise RuntimeError(f"{name} selected for router CPU offload but no supported router wrapper exists")
                 report.skipped.append(f"{name}:unsupported_router")
                 continue
-            router_replacements.append((name, module, wrapped_router))
-
-        for name, _old_module, new_module in router_replacements:
             parent, child_name = _parent_and_child(model, name)
-            _replace_child(parent, child_name, new_module)
+            _replace_child(parent, child_name, wrapped_router)
+            del module
+            _release_replaced_module_memory()
 
     if backend == "asym" and selection.embed_tokens:
-        embedding_replacements: list[tuple[str, nn.Module, nn.Module]] = []
-        for name, module in list(model.named_modules()):
+        embedding_names: list[str] = []
+        for name, module in model.named_modules():
             if not name or isinstance(module, AsymFrozenEmbedding):
                 continue
             if classify_lf_component(name, module) != "embed_tokens":
@@ -1234,28 +1355,38 @@ def apply_lf_asym_lora(
                     raise RuntimeError(f"{name} selected for embed_tokens CPU offload but is {type(module).__name__}")
                 report.skipped.append(f"{name}:unsupported_embedding:{type(module).__name__}")
                 continue
-            embedding_replacements.append((name, module, AsymFrozenEmbedding(module)))
+            embedding_names.append(name)
 
-        for name, _old_module, new_module in embedding_replacements:
+        for name in embedding_names:
+            module = model.get_submodule(name)
+            if isinstance(module, AsymFrozenEmbedding):
+                continue
+            if not isinstance(module, nn.Embedding):
+                if strict:
+                    raise RuntimeError(f"{name} selected for embed_tokens CPU offload but is {type(module).__name__}")
+                report.skipped.append(f"{name}:unsupported_embedding:{type(module).__name__}")
+                continue
             parent, child_name = _parent_and_child(model, name)
-            _replace_child(parent, child_name, new_module)
+            _replace_child(parent, child_name, AsymFrozenEmbedding(module))
+            del module
+            _release_replaced_module_memory()
 
     if backend == "asym" and selection.norms:
-        norm_replacements: list[tuple[str, nn.Module, nn.Module]] = []
-        for name, module in list(model.named_modules()):
+        norm_names: list[str] = []
+        for name, module in model.named_modules():
             if not name or isinstance(module, (AsymFrozenLayerNorm, AsymFrozenRMSNorm)):
                 continue
             if classify_lf_component(name, module) != "norms":
                 continue
             if isinstance(module, nn.LayerNorm):
-                norm_replacements.append((name, module, AsymFrozenLayerNorm(module, strict=strict)))
+                norm_names.append(name)
                 continue
             weight = getattr(module, "weight", None)
             class_name = type(module).__name__.lower()
             if isinstance(weight, torch.Tensor) and (
                 "rmsnorm" in class_name or "rms_norm" in class_name or hasattr(module, "variance_epsilon")
             ):
-                norm_replacements.append((name, module, AsymFrozenRMSNorm(module)))
+                norm_names.append(name)
                 continue
             if _is_stateless_module(module):
                 continue
@@ -1263,11 +1394,30 @@ def apply_lf_asym_lora(
                 raise RuntimeError(f"{name} selected for norms CPU offload but is {type(module).__name__}")
             report.skipped.append(f"{name}:unsupported_norm:{type(module).__name__}")
 
-        for name, _old_module, new_module in norm_replacements:
+        for name in norm_names:
+            module = model.get_submodule(name)
+            if isinstance(module, (AsymFrozenLayerNorm, AsymFrozenRMSNorm)):
+                continue
+            if isinstance(module, nn.LayerNorm):
+                new_module = AsymFrozenLayerNorm(module, strict=strict)
+            else:
+                weight = getattr(module, "weight", None)
+                class_name = type(module).__name__.lower()
+                if isinstance(weight, torch.Tensor) and (
+                    "rmsnorm" in class_name or "rms_norm" in class_name or hasattr(module, "variance_epsilon")
+                ):
+                    new_module = AsymFrozenRMSNorm(module)
+                else:
+                    if strict:
+                        raise RuntimeError(f"{name} selected for norms CPU offload but is {type(module).__name__}")
+                    report.skipped.append(f"{name}:unsupported_norm:{type(module).__name__}")
+                    continue
             parent, child_name = _parent_and_child(model, name)
             _replace_child(parent, child_name, new_module)
+            del module
+            _release_replaced_module_memory()
 
-    dense_replacements: list[tuple[str, nn.Module, nn.Module, bool]] = []
+    dense_replacement_names: list[str] = []
     attention_act_modules: list[str] = []
     attention_act_skipped: list[str] = []
     attention_saved_modules: tuple[str, ...] = ()
@@ -1280,7 +1430,7 @@ def apply_lf_asym_lora(
         attention_act_enabled=attention_act_enabled,
     )
     if wrap_dense:
-        for name, module in list(model.named_modules()):
+        for name, module in model.named_modules():
             if not name or _is_under(name, expert_prefixes):
                 continue
             if _is_router_module_name(name):
@@ -1299,6 +1449,17 @@ def apply_lf_asym_lora(
                     continue
                 report.skipped.append(f"{name}:not_nn_linear:{type(module).__name__}")
                 continue
+            dense_replacement_names.append(name)
+
+        for name in dense_replacement_names:
+            module = model.get_submodule(name)
+            if not isinstance(module, nn.Linear):
+                report.skipped.append(f"{name}:not_nn_linear:{type(module).__name__}")
+                continue
+            component = classify_lf_component(name, module)
+            leaf = name.rsplit(".", 1)[-1]
+            selected_cpu_offload = backend == "asym" and component_is_selected(component, leaf, selection)
+            is_lora_target = _matches_target(name, module, dense_target_modules)
             shape_fallback_reason = (
                 _direct_bf16_linear_shape_reason(module, require_backward=True)
                 if selected_cpu_offload and backend == "asym"
@@ -1317,43 +1478,37 @@ def apply_lf_asym_lora(
                 if leaf in {"q_proj", "k_proj", "v_proj"}
                 else None
             )
-            dense_replacements.append(
-                (
-                    name,
-                    module,
-                    _wrap_lf_linear_leaf(
-                        name,
-                        module,
-                        component=component,
-                        is_lora_target=is_lora_target,
-                        selected_cpu_offload=selected_cpu_offload,
-                        attention_act_offload_enabled=attention_act_enabled,
-                        attention_context=attention_context,
-                        backend=backend,
-                        precision=precision,
-                        stats=stats,
-                        lora_rank=lora_rank,
-                        lora_alpha=lora_alpha,
-                        lora_dropout=lora_dropout,
-                        strict=strict,
-                    ),
-                    is_lora_target,
-                )
+            new_module = _wrap_lf_linear_leaf(
+                name,
+                module,
+                component=component,
+                is_lora_target=is_lora_target,
+                selected_cpu_offload=selected_cpu_offload,
+                attention_act_offload_enabled=attention_act_enabled,
+                attention_context=attention_context,
+                backend=backend,
+                precision=precision,
+                stats=stats,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                strict=strict,
             )
             if shape_fallback_reason is not None:
                 report.skipped.append(f"{name}:torch_cpu_fetched:{shape_fallback_reason}")
+            parent, child_name = _parent_and_child(model, name)
+            _replace_child(parent, child_name, new_module)
+            if is_lora_target:
+                report.dense_lora_wrapped += 1
+            if isinstance(new_module, AsymActivationOffloadLoRALinear):
+                attention_act_modules.append(name)
+            report.gpu_resident_base_bytes += int(getattr(new_module, "gpu_resident_base_weight_bytes", 0))
+            del module
+            if selected_cpu_offload:
+                _release_replaced_module_memory()
 
-    if wrap_dense and _is_all_target(raw_lora_target) and not dense_replacements and report.dense_lora_wrapped == 0 and strict:
+    if wrap_dense and _is_all_target(raw_lora_target) and not dense_replacement_names and report.dense_lora_wrapped == 0 and strict:
         raise ValueError("AsymGEMM requested dense LoRA target=all but found no dense nn.Linear modules.")
-
-    for name, _old_module, new_module, is_lora_target in dense_replacements:
-        parent, child_name = _parent_and_child(model, name)
-        _replace_child(parent, child_name, new_module)
-        if is_lora_target:
-            report.dense_lora_wrapped += 1
-        if isinstance(new_module, AsymActivationOffloadLoRALinear):
-            attention_act_modules.append(name)
-        report.gpu_resident_base_bytes += int(getattr(new_module, "gpu_resident_base_weight_bytes", 0))
     if attention_act_enabled and attention_contexts:
         attention_saved_modules, attention_saved_skipped = _wrap_attention_saved_tensor_offload_modules(
             model,
@@ -1402,12 +1557,8 @@ def apply_lf_asym_lora(
     if report.trainable_lora_params == 0 and strict:
         raise ValueError("AsymGEMM setup produced zero trainable LoRA parameters.")
     _register_runtime_report(report)
-    # Drop the orphaned pre-conversion modules (retained in expert_replacements / reference cycles) so
-    # the source base weights freed inside AsymQwen3Experts.__init__ are actually reclaimed by the
-    # allocator instead of lingering until the next incidental GC.
-    import gc
-
-    gc.collect()
+    # Drop any orphaned pre-conversion modules/reference cycles before the first trainer step.
+    _release_replaced_module_memory()
     return model, report
 
 

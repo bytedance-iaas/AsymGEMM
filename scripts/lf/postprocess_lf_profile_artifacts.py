@@ -491,7 +491,19 @@ def _trainable_surface_summary(profile: dict[str, Any]) -> dict[str, Any]:
     peft_expert = peft_expert or 0
     kt_expert = _int_counter(lora, "kt_expert_lora_parameters") or 0
     qwen_moe_expert = _int_counter(lora, "qwen_moe_expert_lora_parameters") or 0
-    expert_lora = max(kt_expert, peft_expert, qwen_moe_expert)
+    # AsymGEMM weight-offloaded expert-LoRA banks stay requires_grad=True but their .data is a 0-numel
+    # placeholder at rest (the real bf16 weights live in the optimizer's pinned CPU "home" slab), so
+    # the model-view PEFT/engine counts read 0. The trustworthy count is the offloaded home numel
+    # reported by the AsymGEMM CPU-AdamW weight-offload coordinator.
+    asym_expert = _int_counter(lora, "asym_expert_lora_parameters") or 0
+    asym_cpu_adamw = profile.get("asym_cpu_adamw")
+    if isinstance(asym_cpu_adamw, dict) and asym_cpu_adamw.get("weight_offload_enabled"):
+        offloaded = _int_counter(asym_cpu_adamw, "weight_offload_param_numel")
+        if offloaded is None:  # profiles captured before the numel field existed
+            total_managed = _int_counter(asym_cpu_adamw, "param_numel") or 0
+            offloaded = max(0, total_managed - (peft_lora or 0))
+        asym_expert = max(asym_expert, offloaded or 0)
+    expert_lora = max(kt_expert, peft_expert, qwen_moe_expert, asym_expert)
     non_expert_peft = None if peft_lora is None else max(0, peft_lora - peft_expert)
 
     if expert_lora > 0 and (non_expert_peft or 0) > 0:
@@ -527,6 +539,7 @@ def _trainable_surface_summary(profile: dict[str, Any]) -> dict[str, Any]:
         "expert_lora_parameters": expert_lora,
         "peft_expert_lora_parameters": peft_expert,
         "qwen_moe_expert_lora_parameters": qwen_moe_expert,
+        "asym_expert_lora_parameters": asym_expert,
         "kt_expert_lora_parameters": kt_expert,
         "kt_peft_expert_lora_parameters": kt_peft_expert,
         "kt_fused_expert_lora_parameters": _int_counter(lora, "kt_fused_expert_lora_parameters") or 0,
@@ -948,6 +961,7 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
                 f"| non-expert PEFT LoRA params | {trainable_surface.get('non_expert_peft_lora_parameters', '-')} |",
                 f"| PEFT expert LoRA params | {trainable_surface.get('peft_expert_lora_parameters', '-')} |",
                 f"| Qwen MoE expert LoRA params | {trainable_surface.get('qwen_moe_expert_lora_parameters', '-')} |",
+                f"| AsymGEMM expert LoRA params | {trainable_surface.get('asym_expert_lora_parameters', '-')} |",
                 f"| expert LoRA params | {trainable_surface.get('expert_lora_parameters', '-')} |",
                 f"| backend comparison note | {trainable_surface.get('comparison_note', '-')} |",
             ]
@@ -1317,10 +1331,10 @@ def _source_memory_markdown(profile: dict[str, Any]) -> str:
         lines += [
             "## Persistent Tensor Accounting",
             "",
-            "These rows are exact tensor-size accounting for parameters, buffers, gradients, and host/pinned tensors. They are not a full peak allocated HBM attribution by themselves.",
+            "These rows are exact tensor-size accounting for parameters, buffers, gradients, and host-offloaded tensors. Pinned MiB is the page-locked SUBSET of a host_weight row's MiB (already counted in MiB), not additional memory. They are not a full peak allocated HBM attribution by themselves.",
             "",
-            "| Category | Component | Device | MiB |",
-            "|---|---|---|---:|",
+            "| Category | Component | Device | MiB | Pinned MiB |",
+            "|---|---|---|---:|---:|",
         ]
         sorted_categories = sorted(
             (row for row in category_rows if isinstance(row, dict)),
@@ -1328,12 +1342,14 @@ def _source_memory_markdown(profile: dict[str, Any]) -> str:
             reverse=True,
         )
         for row in sorted_categories[:12]:
+            pinned_bytes = row.get("pinned_bytes")
             lines.append(
-                "| {category} | {component} | {device} | {mib} |".format(
+                "| {category} | {component} | {device} | {mib} | {pinned} |".format(
                     category=row.get("category", "-"),
                     component=row.get("component", "-"),
                     device=row.get("device", "-"),
                     mib=_fmt_mib(row.get("bytes")),
+                    pinned=_fmt_mib(pinned_bytes) if pinned_bytes else "-",
                 )
             )
         lines.append("")

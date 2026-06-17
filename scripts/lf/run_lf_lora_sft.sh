@@ -31,6 +31,8 @@ NUMACTL_ENABLE=${NUMACTL_ENABLE:-1}
 NUMACTL_BIN=${NUMACTL_BIN:-numactl}
 NUMACTL_MEMBIND=${NUMACTL_MEMBIND:-0,1}
 NUMACTL_CPUNODEBIND=${NUMACTL_CPUNODEBIND:-0,1}
+# Lever-1 toggle: membind (default = today's behavior) | interleave (spread pinned pages 50/50 across nodes)
+NUMACTL_MODE=${NUMACTL_MODE:-membind}
 REQUIRE_SM100=${REQUIRE_SM100:-1}
 
 # Dataset
@@ -53,6 +55,7 @@ GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
 MAX_GRAD_NORM=${MAX_GRAD_NORM:-}
 PREPROCESSING_NUM_WORKERS=${PREPROCESSING_NUM_WORKERS:-}
 DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-}
+TRAINING_BF16=${TRAINING_BF16:-}
 
 # AsymGEMM
 ASYM_PRECISION=${ASYM_PRECISION:-bf16}
@@ -61,6 +64,8 @@ ASYMM_EXPERT_ACT_OFFLOAD=${ASYMM_EXPERT_ACT_OFFLOAD:-false}
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-cpu}
 ASYMM_ATTN_ACT_OFFLOAD=${ASYMM_ATTN_ACT_OFFLOAD:-false}
 ASYMM_LAYER_ACT_OFFLOAD=${ASYMM_LAYER_ACT_OFFLOAD:-false}
+ASYM_OFFLOAD_ACT_RECOMPUTE=${ASYM_OFFLOAD_ACT_RECOMPUTE:-0}
+ASYM_OFFLOAD_X_UNPACKED=${ASYM_OFFLOAD_X_UNPACKED:-0}
 ASYM_EXPERT_RECOMPUTE_POLICY=${ASYM_EXPERT_RECOMPUTE_POLICY:-none}
 ASYM_ROUTER_MODE=${ASYM_ROUTER_MODE:-whole}
 ASYM_STRICT=${ASYM_STRICT:-true}
@@ -70,6 +75,7 @@ ASYM_CPU_ADAMW_PIN_MEMORY=${ASYM_CPU_ADAMW_PIN_MEMORY:-true}
 ASYM_CPU_ADAMW_FP32_MASTER=${ASYM_CPU_ADAMW_FP32_MASTER:-true}
 ASYM_CPU_ADAMW_GRAD_OFFLOAD=${ASYM_CPU_ADAMW_GRAD_OFFLOAD:-false}
 ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD:-false}
+ASYM_CUDA_GRAPH=${ASYM_CUDA_GRAPH:-off} # off | compile
 CHECK_ASYM_CALLS=${CHECK_ASYM_CALLS:-1}
 CHECK_TRAINABLE_SURFACE=${CHECK_TRAINABLE_SURFACE:-1}
 
@@ -122,8 +128,9 @@ PROFILE_PROFILER=${PROFILE_PROFILER:-source} # source | nsys
 PROFILE_MEMORY=${PROFILE_MEMORY:-1}
 PROFILE_LEVEL=${PROFILE_LEVEL:-op}           # stage | module | op | deep
 PROFILE_LAYERS=${PROFILE_LAYERS:-all}
-PROFILE_MEMORY_ATTRIBUTION=${PROFILE_MEMORY_ATTRIBUTION:-auto}
-PROFILE_MEMORY_BREAKDOWN=${PROFILE_MEMORY_BREAKDOWN:-auto}
+# Single knob: PROFILE_MEMORY_BREAKDOWN gates BOTH the per-module breakdown and the saved-tensor/param
+# attribution; both ASYM_GEMM_LF_PROFILE_MEMORY_* toggles are set from it below. Default true.
+PROFILE_MEMORY_BREAKDOWN=${PROFILE_MEMORY_BREAKDOWN:-true}
 PROFILE_MEMORY_BREAKDOWN_INTERVAL=${PROFILE_MEMORY_BREAKDOWN_INTERVAL:-1}
 PROFILE_MEMORY_BREAKDOWN_STEPS=${PROFILE_MEMORY_BREAKDOWN_STEPS:-}
 PROFILE_MEMORY_BREAKDOWN_MODULES=${PROFILE_MEMORY_BREAKDOWN_MODULES:-attention,router,mlp,experts,shared_experts,lora,embedding,norms,loss}
@@ -319,9 +326,28 @@ infer_template() {
   esac
 }
 
+is_llama4_model() {
+  case "${1,,}" in
+    *llama-4*|*llama4*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 if [[ "${TEMPLATE}" == "auto" ]]; then
   TEMPLATE="$(infer_template "${MODEL_NAME_OR_PATH}")"
 fi
+if [[ -z "${TRAINING_BF16}" ]]; then
+  if is_llama4_model "${MODEL_NAME_OR_PATH}" && [[ "${BACKEND}" == "asym" || "${BACKEND}" == "asym_torch" ]]; then
+    TRAINING_BF16=false
+  else
+    TRAINING_BF16=true
+  fi
+fi
+case "${TRAINING_BF16,,}" in
+  1|true|yes|y|on) TRAINING_BF16=true ;;
+  0|false|no|n|off) TRAINING_BF16=false ;;
+  *) echo "TRAINING_BF16 must be true or false, got '${TRAINING_BF16}'" >&2; exit 2 ;;
+esac
 
 MODEL_TAG=$(basename "${MODEL_NAME_OR_PATH}" | tr '/:' '__')
 case "${LF_QWEN_MOE_EXPERT_LORA_IMPL,,}" in
@@ -350,6 +376,44 @@ case "${ASYMM_LAYER_ACT_OFFLOAD,,}" in
   0|false|no|n|off) ASYMM_LAYER_ACT_OFFLOAD=false; LAYER_ACT_OFFLOAD_TAG=layeract0 ;;
   *) echo "ASYMM_LAYER_ACT_OFFLOAD must be true or false, got '${ASYMM_LAYER_ACT_OFFLOAD}'" >&2; exit 2 ;;
 esac
+case "${ASYM_CUDA_GRAPH,,}" in
+  off|none|0|false|no|n) ASYM_CUDA_GRAPH=off ;;
+  compile|partial|inductor|1|true|yes|y|on) ASYM_CUDA_GRAPH=compile ;;
+  *) echo "ASYM_CUDA_GRAPH must be off or compile, got '${ASYM_CUDA_GRAPH}'" >&2; exit 2 ;;
+esac
+if [[ "${ASYM_CUDA_GRAPH}" == "compile" ]]; then
+  if [[ "${BACKEND}" != "asym" && "${BACKEND}" != "asym_torch" ]]; then
+    echo "ASYM_CUDA_GRAPH=compile is only supported for BACKEND=asym/asym_torch aliases; got BACKEND=${RUN_BACKEND_LABEL}" >&2
+    exit 2
+  fi
+  if [[ "${ASYMM_EXPERT_ACT_OFFLOAD}" != "false" || "${ASYMM_ATTN_ACT_OFFLOAD}" != "false" || "${ASYMM_LAYER_ACT_OFFLOAD}" != "false" ]]; then
+    echo "ASYM_CUDA_GRAPH=compile cannot be combined with activation offload; set ASYMM_EXPERT_ACT_OFFLOAD=false ASYMM_ATTN_ACT_OFFLOAD=false ASYMM_LAYER_ACT_OFFLOAD=false." >&2
+    exit 2
+  fi
+  case "${GRADIENT_CHECKPOINTING,,}" in
+    1|true|yes|y|on)
+      echo "ASYM_CUDA_GRAPH=compile requires GRADIENT_CHECKPOINTING=false because checkpoint recompute changes the captured region." >&2
+      exit 2
+      ;;
+    0|false|no|n|off) ;;
+    *) ;;
+  esac
+  if ! python3 - "${LORA_DROPOUT}" <<'PY' >/dev/null 2>&1; then
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if math.isclose(value, 0.0, abs_tol=1e-12) else 1)
+PY
+    echo "ASYM_CUDA_GRAPH=compile requires LORA_DROPOUT=0.0 so the compiled graph has deterministic control flow." >&2
+    exit 2
+  fi
+fi
+CUDA_GRAPH_TAG=""
+[[ "${ASYM_CUDA_GRAPH}" == "off" ]] || CUDA_GRAPH_TAG="_cg${ASYM_CUDA_GRAPH}"
 ATTN_GC_ENABLED=false
 if [[ "${ASYM_EXPERT_RECOMPUTE_POLICY}" == "gc-attn-exp" ]]; then
   ATTN_GC_ENABLED=true
@@ -367,9 +431,9 @@ fi
 
 if [[ "${BACKEND}" == kt_* ]]; then
   KT_BACKEND_TAG="${KT_BACKEND_INTERNAL:-none}"
-  DEFAULT_RUN_ID="${RUN_TS}_${MODEL_TAG}_${BACKEND}_${KT_BACKEND_TAG}_${KT_PRECISION}_ctx${CUTOFF_LEN}_bs${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_r${LORA_RANK}_a${LORA_ALPHA}_steps${MAX_STEPS}_${EXP_ACT_LORA_A_FWD_TAG}_qwenexpert${QWEN_EXPERT_LORA_TAG}_${PROFILE_TAG}"
+  DEFAULT_RUN_ID="${RUN_TS}_${MODEL_TAG}_${BACKEND}_${KT_BACKEND_TAG}_${KT_PRECISION}_ctx${CUTOFF_LEN}_bs${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_r${LORA_RANK}_a${LORA_ALPHA}_steps${MAX_STEPS}_${EXP_ACT_LORA_A_FWD_TAG}${CUDA_GRAPH_TAG}_qwenexpert${QWEN_EXPERT_LORA_TAG}_${PROFILE_TAG}"
 else
-  DEFAULT_RUN_ID="${RUN_TS}_${MODEL_TAG}_${RUN_BACKEND_LABEL}_${ASYM_PRECISION}_ctx${CUTOFF_LEN}_bs${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_r${LORA_RANK}_a${LORA_ALPHA}_steps${MAX_STEPS}_offload${ASYM_OFFLOAD_MODULES}_pol${EXPERT_POLICY_TAG}_router${ASYM_ROUTER_MODE}_${EXP_ACT_OFFLOAD_TAG}_${ATTN_ACT_OFFLOAD_TAG}_${EXP_ACT_LORA_A_FWD_TAG}_qwenexpert${QWEN_EXPERT_LORA_TAG}_${PROFILE_TAG}"
+  DEFAULT_RUN_ID="${RUN_TS}_${MODEL_TAG}_${RUN_BACKEND_LABEL}_${ASYM_PRECISION}_ctx${CUTOFF_LEN}_bs${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_r${LORA_RANK}_a${LORA_ALPHA}_steps${MAX_STEPS}_offload${ASYM_OFFLOAD_MODULES}_pol${EXPERT_POLICY_TAG}_router${ASYM_ROUTER_MODE}_${EXP_ACT_OFFLOAD_TAG}_${ATTN_ACT_OFFLOAD_TAG}_${EXP_ACT_LORA_A_FWD_TAG}${CUDA_GRAPH_TAG}_qwenexpert${QWEN_EXPERT_LORA_TAG}_${PROFILE_TAG}"
 fi
 RUN_ID=${RUN_ID:-${DEFAULT_RUN_ID}}
 if [[ "${BACKEND}" == kt_* ]]; then
@@ -504,20 +568,16 @@ case "${PROFILE_LEVEL}" in
   *) echo "PROFILE_LEVEL must be one of: stage, module, op, deep" >&2; exit 2 ;;
 esac
 
-PROFILE_MEMORY_ATTRIBUTION_RAW="${PROFILE_MEMORY_ATTRIBUTION}"
-PROFILE_MEMORY_BREAKDOWN_RAW="${PROFILE_MEMORY_BREAKDOWN}"
-PROFILE_MEMORY_ATTRIBUTION="$(profile_memory_flag PROFILE_MEMORY_ATTRIBUTION "${PROFILE_MEMORY_ATTRIBUTION}" "${PROFILE_PROFILER}")"
+# Resolve the single memory knob (true/false only; the old 'auto' is gone). No per-backend (CPUAdamW)
+# override, so every backend gets identical memory instrumentation. Both ASYM_GEMM_LF_PROFILE_MEMORY_*
+# toggles are derived from it below.
+if [[ "${PROFILE_MEMORY_BREAKDOWN,,}" == "auto" ]]; then
+  echo "PROFILE_MEMORY_BREAKDOWN must be true or false (the removed 'auto' is no longer supported)" >&2
+  exit 2
+fi
 PROFILE_MEMORY_BREAKDOWN="$(profile_memory_flag PROFILE_MEMORY_BREAKDOWN "${PROFILE_MEMORY_BREAKDOWN}" "${PROFILE_PROFILER}")"
 PROFILE_MEMORY_SNAPSHOT="$(profile_memory_flag PROFILE_MEMORY_SNAPSHOT "${PROFILE_MEMORY_SNAPSHOT}" "${PROFILE_PROFILER}")"
 PROFILE_EXTERNAL_MEMORY="$(profile_memory_flag PROFILE_EXTERNAL_MEMORY "${PROFILE_EXTERNAL_MEMORY}" "${PROFILE_PROFILER}")"
-if [[ "${CPUADAM_ALIAS_SELECTED}" == "1" ]]; then
-  if [[ "${PROFILE_MEMORY_ATTRIBUTION_RAW,,}" == "auto" ]]; then
-    PROFILE_MEMORY_ATTRIBUTION=false
-  fi
-  if [[ "${PROFILE_MEMORY_BREAKDOWN_RAW,,}" == "auto" ]]; then
-    PROFILE_MEMORY_BREAKDOWN=false
-  fi
-fi
 
 validate_kt_arm_source_ok_profile() {
   local profile_json="$1"
@@ -1514,7 +1574,7 @@ CMD_ARGS=(
   --lr_scheduler_type constant
   --warmup_steps 0
   --seed "${SEED}"
-  --bf16 true
+  --bf16 "${TRAINING_BF16}"
 )
 [[ -z "${MAX_GRAD_NORM}" ]] || CMD_ARGS+=(--max_grad_norm "${MAX_GRAD_NORM}")
 
@@ -1529,6 +1589,10 @@ case "${GRADIENT_CHECKPOINTING,,}" in
   0|false|no|n|off) CMD_ARGS+=(--gradient_checkpointing false --disable_gradient_checkpointing true) ;;
   *) echo "GRADIENT_CHECKPOINTING must be true or false" >&2; exit 2 ;;
 esac
+
+if [[ "${ASYM_CUDA_GRAPH}" == "compile" ]]; then
+  CMD_ARGS+=(--torch_compile true --torch_compile_backend inductor --torch_compile_mode reduce-overhead)
+fi
 
 if [[ "${BACKEND}" == "asym_torch" ]]; then
   CMD_ARGS+=(--use_asym_gemm true --asym_backend torch --asym_precision "${ASYM_PRECISION}")
@@ -1578,6 +1642,7 @@ if [[ "${NUMACTL_ENABLE}" == "1" ]]; then
 fi
 is_torch_run && log_kv DIST_LAUNCHER "${DIST_LAUNCHER}"
 log_kv SEED "${SEED}"
+log_kv TRAINING_BF16 "${TRAINING_BF16}"
 log_kv PREPROCESSING_NUM_WORKERS "${PREPROCESSING_NUM_WORKERS}"
 log_kv DATALOADER_NUM_WORKERS "${DATALOADER_NUM_WORKERS}"
 log_kv_if_set MAX_GRAD_NORM "${MAX_GRAD_NORM}"
@@ -1654,6 +1719,9 @@ log_kv ASYMM_EXPERT_ACT_OFFLOAD "${ASYMM_EXPERT_ACT_OFFLOAD}"
 log_kv ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
 log_kv ASYMM_ATTN_ACT_OFFLOAD "${ASYMM_ATTN_ACT_OFFLOAD}"
 log_kv ASYMM_LAYER_ACT_OFFLOAD "${ASYMM_LAYER_ACT_OFFLOAD}"
+log_kv ASYM_OFFLOAD_ACT_RECOMPUTE "${ASYM_OFFLOAD_ACT_RECOMPUTE}"
+log_kv ASYM_OFFLOAD_X_UNPACKED "${ASYM_OFFLOAD_X_UNPACKED}"
+[[ "${ASYM_CUDA_GRAPH}" == "off" ]] || log_kv ASYM_CUDA_GRAPH "${ASYM_CUDA_GRAPH}"
 log_kv ATTN_GC_ENABLED "${ATTN_GC_ENABLED}"
 log_kv LAYER_GC_ENABLED "${LAYER_GC_ENABLED}"
 if [[ "${BACKEND}" == "asym" || "${BACKEND}" == "asym_torch" ]]; then
@@ -1672,7 +1740,6 @@ if [[ "${PROFILE}" == "1" ]]; then
   log_kv PROFILE_PROFILER "${PROFILE_PROFILER}"
   log_kv PROFILE_LEVEL "${PROFILE_LEVEL}"
   log_kv PROFILE_LAYERS "${PROFILE_LAYERS}"
-  log_kv PROFILE_MEMORY_ATTRIBUTION "${PROFILE_MEMORY_ATTRIBUTION}"
   log_kv PROFILE_MEMORY_BREAKDOWN "${PROFILE_MEMORY_BREAKDOWN}"
   log_kv PROFILE_MEMORY_BREAKDOWN_INTERVAL "${PROFILE_MEMORY_BREAKDOWN_INTERVAL}"
   log_kv_if_set PROFILE_MEMORY_BREAKDOWN_STEPS "${PROFILE_MEMORY_BREAKDOWN_STEPS}"
@@ -1714,15 +1781,26 @@ RUN_ENV=(
   ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
   ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
   ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
+  ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}"
+  ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
   ASYM_CPU_ADAMW_GRAD_OFFLOAD="${ASYM_CPU_ADAMW_GRAD_OFFLOAD}"
   ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD}"
   LF_QWEN_MOE_EXPERT_LORA_IMPL="${LF_QWEN_MOE_EXPERT_LORA_IMPL}"
   ASYM_GEMM_LF_CONFIG_QWEN_EXPERT_LORA_IMPL="${LF_QWEN_MOE_EXPERT_LORA_IMPL}"
 )
+if [[ "${ASYM_CUDA_GRAPH}" == "compile" ]]; then
+  RUN_ENV+=(
+    ASYM_CUDA_GRAPH="${ASYM_CUDA_GRAPH}"
+    ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH="${ASYM_CUDA_GRAPH}"
+  )
+fi
 if [[ -n "${TRITON_CACHE_DIR:-}" ]]; then
   RUN_ENV+=(TRITON_CACHE_DIR="${TRITON_CACHE_DIR}")
 fi
 ENV_CMD=(env)
+if [[ "${ASYM_CUDA_GRAPH}" == "off" ]]; then
+  ENV_CMD+=( -u ASYM_CUDA_GRAPH -u ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH )
+fi
 if ! { is_torch_run && [[ "${DIST_LAUNCHER}" == "deepspeed" ]]; }; then
   RUN_ENV=(CUDA_VISIBLE_DEVICES="${GPU_ID}" NVIDIA_VISIBLE_DEVICES="${GPU_ID}" "${RUN_ENV[@]}")
 else
@@ -1845,7 +1923,7 @@ if [[ "${PROFILE}" == "1" ]]; then
     ASYM_GEMM_LF_PROFILE_MEMORY="${PROFILE_MEMORY}"
     ASYM_GEMM_LF_PROFILE_LEVEL="${PROFILE_LEVEL}"
     ASYM_GEMM_LF_PROFILE_LAYERS="${PROFILE_LAYERS}"
-    ASYM_GEMM_LF_PROFILE_MEMORY_ATTRIBUTION="${PROFILE_MEMORY_ATTRIBUTION}"
+    ASYM_GEMM_LF_PROFILE_MEMORY_ATTRIBUTION="${PROFILE_MEMORY_BREAKDOWN}"
     ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN="${PROFILE_MEMORY_BREAKDOWN}"
     ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_INTERVAL="${PROFILE_MEMORY_BREAKDOWN_INTERVAL}"
     ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_STEPS="${PROFILE_MEMORY_BREAKDOWN_STEPS}"
@@ -1866,10 +1944,13 @@ if [[ "${PROFILE}" == "1" ]]; then
     ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
+    ASYM_GEMM_LF_CONFIG_ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}"
+    ASYM_GEMM_LF_CONFIG_ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
     ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED="${ATTN_GC_ENABLED}"
     ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED="${LAYER_GC_ENABLED}"
     ASYM_GEMM_LF_CONFIG_ROUTER_MODE="${ASYM_ROUTER_MODE}"
     ASYM_GEMM_LF_CONFIG_PRECISION="${profile_precision}"
+    ASYM_GEMM_LF_CONFIG_TRAINING_BF16="${TRAINING_BF16}"
     ASYM_GEMM_LF_CONFIG_SEQ_LEN="${CUTOFF_LEN}"
     ASYM_GEMM_LF_CONFIG_PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE}"
     ASYM_GEMM_LF_CONFIG_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE}"
@@ -1892,6 +1973,9 @@ if [[ "${PROFILE}" == "1" ]]; then
     ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD="${ASYM_CPU_ADAMW_GRAD_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD}"
   )
+  if [[ "${ASYM_CUDA_GRAPH}" == "compile" ]]; then
+    RUN_ENV+=(ASYM_GEMM_LF_CONFIG_ASYM_CUDA_GRAPH="${ASYM_CUDA_GRAPH}")
+  fi
   if [[ "${BACKEND}" == kt_* ]]; then
     RUN_ENV+=(
       ASYM_GEMM_LF_CONFIG_KT_BACKEND="${KT_BACKEND_INTERNAL:-}"
@@ -1922,11 +2006,20 @@ if [[ "${NUMACTL_ENABLE}" == "1" ]]; then
     echo "NUMACTL_ENABLE=1 but numactl binary not found: ${NUMACTL_BIN}" >&2
     exit 2
   fi
-  NUMACTL_CMD=(
-    "${NUMACTL_BIN}"
-    "--membind=${NUMACTL_MEMBIND}"
-    "--cpunodebind=${NUMACTL_CPUNODEBIND}"
-  )
+  if [[ "${NUMACTL_MODE}" == "interleave" ]]; then
+    NUMACTL_CMD=(
+      "${NUMACTL_BIN}"
+      "--interleave=${NUMACTL_MEMBIND}"
+      "--cpunodebind=${NUMACTL_CPUNODEBIND}"
+    )
+  else
+    NUMACTL_CMD=(
+      "${NUMACTL_BIN}"
+      "--membind=${NUMACTL_MEMBIND}"
+      "--cpunodebind=${NUMACTL_CPUNODEBIND}"
+    )
+  fi
+  echo "NUMACTL_MODE=${NUMACTL_MODE} -> ${NUMACTL_CMD[*]}" >&2
 fi
 
 if [[ "${PROFILE}" == "1" ]]; then
@@ -1935,9 +2028,9 @@ else
   LAUNCH_CMD=("${LF_CLI_BIN}" train "${CMD_ARGS[@]}")
 fi
 
+launch_entry="${LF_DIR}/src/train.py"
+[[ "${PROFILE}" == "1" ]] && launch_entry="${PROFILE_LAUNCHER}"
 if is_torch_run; then
-  launch_entry="${LF_DIR}/src/train.py"
-  [[ "${PROFILE}" == "1" ]] && launch_entry="${PROFILE_LAUNCHER}"
   if [[ "${DIST_LAUNCHER}" == "deepspeed" ]]; then
     if [[ "${NNODES:-1}" != "1" ]]; then
       echo "DIST_LAUNCHER=deepspeed currently supports single-node launches only; got NNODES=${NNODES:-1}" >&2

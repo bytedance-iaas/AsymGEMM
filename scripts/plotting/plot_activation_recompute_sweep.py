@@ -8,6 +8,7 @@ import csv
 import json
 import math
 import re
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,24 @@ MIN_LINEAR_REGION_POINTS = 4
 SUBLINEAR_SLOPE_TOLERANCE = 0.08
 SUBLINEAR_COLOR = "green"
 SUBLINEAR_ALPHA = 0.055
+
+
+def plot_title(text: str, *, width: int = 86) -> str:
+    label = str(text)
+    if len(label) <= width:
+        return label
+    return "\n".join(
+        textwrap.wrap(
+            label,
+            width=width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+    )
+
+
+def save_plot(fig: Any, path: Path) -> None:
+    fig.savefig(path, bbox_inches="tight")
 STYLE_PALETTE = (
     "#0072B2",
     "#D55E00",
@@ -361,47 +380,18 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
     if seq_match is None:
         return None
     job_dir = path.parent
-    parts = job_dir.name.split("__")
-    if len(parts) == 4:
-        backend, profiler, recompute, policy_part = parts
-        router_mode = "hf"
-        expact_value = "false"
-        expact = "expact0"
-        attnact_value = "false"
-        attnact = "attnact0"
-    elif len(parts) == 5:
-        backend, profiler, recompute, policy_part, router_part = parts
-        if not router_part.startswith("router"):
-            return None
-        router_mode = router_part[len("router") :]
-        expact_value = "false"
-        expact = "expact0"
-        attnact_value = "false"
-        attnact = "attnact0"
-    elif len(parts) == 6:
-        backend, profiler, recompute, policy_part, router_part, expact_part = parts
-        if not router_part.startswith("router"):
-            return None
-        router_mode = router_part[len("router") :]
-        parsed_expact = parse_expact_part(expact_part)
-        if parsed_expact is None:
-            return None
-        expact_value, expact = parsed_expact
-        attnact_value = "false"
-        attnact = "attnact0"
-    elif len(parts) == 7:
-        backend, profiler, recompute, policy_part, router_part, expact_part, attnact_part = parts
-        if not router_part.startswith("router"):
-            return None
-        router_mode = router_part[len("router") :]
-        parsed_expact = parse_expact_part(expact_part)
-        parsed_attnact = parse_attnact_part(attnact_part)
-        if parsed_expact is None or parsed_attnact is None:
-            return None
-        expact_value, expact = parsed_expact
-        attnact_value, attnact = parsed_attnact
-    else:
+    job_meta = parse_job_dir_parts(job_dir.name)
+    if job_meta is None:
         return None
+    backend = str(job_meta["backend"])
+    profiler = str(job_meta["profiler"])
+    recompute = str(job_meta["recompute"])
+    policy_part = str(job_meta["policy_part"])
+    router_mode = str(job_meta["router_mode"])
+    expact_value = str(job_meta["asymm_expert_act_offload"])
+    expact = str(job_meta["expact"])
+    attnact_value = str(job_meta["asymm_attn_act_offload"])
+    attnact = str(job_meta["attnact"])
     if router_mode not in {"hf", "whole"}:
         return None
     if profiler not in PROFILERS or recompute not in {"recomp", "norecomp"}:
@@ -603,6 +593,62 @@ def parse_attnact_part(part: str) -> tuple[str, str] | None:
     if value in {"attnact0", "attnactfalse"}:
         return "false", "attnact0"
     return None
+
+
+def known_optional_job_axis(part: str) -> bool:
+    value = part.strip().lower()
+    return (
+        value in {"layeract0", "layeract1", "layeractfalse", "layeracttrue"}
+        or value in {"actrecomp0", "actrecomp1", "actrecompfalse", "actrecomptrue"}
+        or value in {"xunpack0", "xunpack1", "xunpackfalse", "xunpacktrue"}
+        or value.startswith("loraafwd")
+        or value.startswith("gradoff")
+        or value.startswith("weightoff")
+    )
+
+
+def parse_job_dir_parts(job_dir_name: str) -> dict[str, Any] | None:
+    parts = job_dir_name.split("__")
+    if len(parts) < 4:
+        return None
+    backend, profiler, recompute, policy_part = parts[:4]
+    tail = parts[4:]
+    router_mode = "hf"
+    expact_value = "false"
+    expact = "expact0"
+    attnact_value = "false"
+    attnact = "attnact0"
+
+    if tail:
+        router_part = tail.pop(0)
+        if not router_part.startswith("router"):
+            return None
+        router_mode = router_part[len("router") :]
+
+    for part in tail:
+        parsed_expact = parse_expact_part(part)
+        if parsed_expact is not None:
+            expact_value, expact = parsed_expact
+            continue
+        parsed_attnact = parse_attnact_part(part)
+        if parsed_attnact is not None:
+            attnact_value, attnact = parsed_attnact
+            continue
+        if known_optional_job_axis(part):
+            continue
+        return None
+
+    return {
+        "backend": backend,
+        "profiler": profiler,
+        "recompute": recompute,
+        "policy_part": policy_part,
+        "router_mode": router_mode,
+        "asymm_expert_act_offload": expact_value,
+        "expact": expact,
+        "asymm_attn_act_offload": attnact_value,
+        "attnact": attnact,
+    }
 
 
 def config_workload_meta(config_name: str) -> dict[str, str]:
@@ -1585,13 +1631,13 @@ def plot_metric(
         )
         sublinear_spans.extend(sublinear_regions(mode_rows, key, scale=scale))
     has_sublinear_region = draw_sublinear_regions(ax, sublinear_spans)
-    ax.set_title(title)
+    ax.set_title(plot_title(title))
     ax.set_xlabel("Sequence length")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
     add_legend(ax, sublinear_region=has_sublinear_region)
     fig.tight_layout()
-    fig.savefig(output_dir / filename)
+    save_plot(fig, output_dir / filename)
     plt.close(fig)
 
 
@@ -1645,13 +1691,13 @@ def plot_paired_metric(
     if not plotted:
         plt.close(fig)
         return
-    ax.set_title(title)
+    ax.set_title(plot_title(title))
     ax.set_xlabel("Sequence length")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(output_dir / filename)
+    save_plot(fig, output_dir / filename)
     plt.close(fig)
 
 
@@ -1691,13 +1737,13 @@ def plot_combined_metric(
         )
         sublinear_spans.extend(sublinear_regions(sorted_rows, key, scale=scale))
     has_sublinear_region = draw_sublinear_regions(ax, sublinear_spans)
-    ax.set_title(title)
+    ax.set_title(plot_title(title))
     ax.set_xlabel("Sequence length")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
     add_legend(ax, sublinear_region=has_sublinear_region, fontsize=7)
     fig.tight_layout()
-    fig.savefig(output_dir / filename)
+    save_plot(fig, output_dir / filename)
     plt.close(fig)
 
 
@@ -1852,13 +1898,13 @@ def plot_step_metric(
             linewidth=1.8,
             color=color_by_label[label],
         )
-    ax.set_title(title)
+    ax.set_title(plot_title(title))
     ax.set_xlabel("Raw trainer step")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
     ax.legend(fontsize=7 if combined else None)
     fig.tight_layout()
-    fig.savefig(output_dir / filename)
+    save_plot(fig, output_dir / filename)
     plt.close(fig)
 
 
@@ -1916,13 +1962,13 @@ def plot_paired_step_metric(
             color=color,
             linestyle="--",
         )
-    ax.set_title(title)
+    ax.set_title(plot_title(title))
     ax.set_xlabel("Raw trainer step")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(output_dir / filename)
+    save_plot(fig, output_dir / filename)
     plt.close(fig)
 
 
@@ -2050,13 +2096,13 @@ def plot_threshold_metric(
     if not plotted:
         plt.close(fig)
         return
-    ax.set_title(title)
+    ax.set_title(plot_title(title))
     ax.set_xlabel("Expert recompute threshold (tokens)")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(output_dir / filename)
+    save_plot(fig, output_dir / filename)
     plt.close(fig)
 
 
@@ -2116,13 +2162,13 @@ def plot_paired_threshold_metric(
     if not plotted:
         plt.close(fig)
         return
-    ax.set_title(title)
+    ax.set_title(plot_title(title))
     ax.set_xlabel("Expert recompute threshold (tokens)")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(output_dir / filename)
+    save_plot(fig, output_dir / filename)
     plt.close(fig)
 
 
@@ -2165,13 +2211,13 @@ def plot_combined_threshold_metric(
     if not plotted:
         plt.close(fig)
         return
-    ax.set_title(title)
+    ax.set_title(plot_title(title))
     ax.set_xlabel("Expert recompute threshold (tokens)")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
     ax.legend(fontsize=7)
     fig.tight_layout()
-    fig.savefig(output_dir / filename)
+    save_plot(fig, output_dir / filename)
     plt.close(fig)
 
 
@@ -2215,13 +2261,13 @@ def plot_policy_metric(
     if not plotted:
         plt.close(fig)
         return
-    ax.set_title(title)
+    ax.set_title(plot_title(title))
     ax.set_xlabel(policy_x_label(family))
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(output_dir / filename)
+    save_plot(fig, output_dir / filename)
     plt.close(fig)
 
 
@@ -2279,13 +2325,13 @@ def plot_paired_policy_metric(
     if not plotted:
         plt.close(fig)
         return
-    ax.set_title(title)
+    ax.set_title(plot_title(title))
     ax.set_xlabel(policy_x_label(family))
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(output_dir / filename)
+    save_plot(fig, output_dir / filename)
     plt.close(fig)
 
 
@@ -2329,13 +2375,13 @@ def plot_combined_policy_metric(
     if not plotted:
         plt.close(fig)
         return
-    ax.set_title(title)
+    ax.set_title(plot_title(title))
     ax.set_xlabel(policy_x_label(family))
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
     ax.legend(fontsize=7)
     fig.tight_layout()
-    fig.savefig(output_dir / filename)
+    save_plot(fig, output_dir / filename)
     plt.close(fig)
 
 

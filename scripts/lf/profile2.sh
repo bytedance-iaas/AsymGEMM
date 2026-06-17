@@ -101,8 +101,8 @@ MAX_SAMPLES=${MAX_SAMPLES:-64}
 
 # Shared AsymGEMM expert activation-backfetch toggles. Default OFF; forced off for
 # policy-independent backends. Qwen and Llama use the same env names.
-ASYM_OFFLOAD_ACT_RECOMPUTE=${ASYM_OFFLOAD_ACT_RECOMPUTE:-0}
-ASYM_OFFLOAD_X_UNPACKED=${ASYM_OFFLOAD_X_UNPACKED:-1}
+ASYM_OFFLOAD_ACT_RECOMPUTE=${ASYM_OFFLOAD_ACT_RECOMPUTE:-1}
+ASYM_OFFLOAD_X_UNPACKED=${ASYM_OFFLOAD_X_UNPACKED:-0}
 
 # Output and profiling
 OUTPUT_ROOT=${OUTPUT_ROOT:-}
