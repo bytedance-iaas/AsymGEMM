@@ -18,6 +18,7 @@ from asym_gemm.profiling.lf_trace import (  # noqa: E402
     _component_from_param_name,
     build_memory_breakdown_summary,
 )
+from asym_gemm.integrations.lf import classify_lf_component, component_is_selected, parse_lf_offload_modules  # noqa: E402
 from asym_gemm.training.frozen_linear import AsymExecutionStats  # noqa: E402
 from scripts.lf.validate_lf_memory_capacity_schema import validate_breakdown  # noqa: E402
 from scripts.lf import run_lf_profiled_train as lf_profiled_train  # noqa: E402
@@ -138,6 +139,20 @@ def test_qwen_moe_component_classification_separates_router_dense_and_experts() 
     assert _component_from_range_name("lf.forward_loss") == "loss"
     assert _component_from_range_name("forward.mlp.expert_policy.scatter_combine") == "routed_experts"
     assert _component_from_range_name("backward.layers.0.self_attn.q_proj") == "attention"
+
+
+def test_qwen35_linear_attention_component_is_profile_only_before_offload_stage() -> None:
+    assert _component_from_param_name("model.layers.0.linear_attn.in_proj_qkv.weight") == "linear_attention"
+    assert _component_from_param_name("model.layers.0.linear_attn.in_proj_z.lora_A.default.weight") == "linear_attention"
+    assert _component_from_param_name("model.layers.0.linear_attn.out_proj.weight") == "linear_attention"
+    assert _component_from_module_name("model.layers.0.linear_attn") == "linear_attention"
+    assert _component_from_module_name("model.layers.0.linear_attn.in_proj_b") == "linear_attention"
+    assert _component_from_range_name("forward.layers.0.linear_attn.chunk_gated_delta_rule") == "linear_attention"
+    assert _component_from_range_name("backward.Qwen3_5MoeGatedDeltaNet") == "linear_attention"
+    assert classify_lf_component("model.layers.0.linear_attn.in_proj_a.weight") == "linear_attention"
+
+    selection = parse_lf_offload_modules("all")
+    assert not component_is_selected("linear_attention", "in_proj_qkv", selection)
 
 
 def test_external_memory_is_diagnostic_not_reserved_closure() -> None:

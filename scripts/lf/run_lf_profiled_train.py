@@ -536,6 +536,11 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         measure_steps = max(int(total_steps) - warmup_steps, 0)
     asym_backend = _option_value(args, "--asym_backend")
     backend = os.environ.get("ASYM_GEMM_LF_CONFIG_BACKEND") or ("torch" if asym_backend == "torch" else asym_backend or "hf")
+    liger_loss = os.environ.get("ASYM_GEMM_LF_CONFIG_LIGER_LOSS", "ligerloss0").strip().lower()
+    if liger_loss not in {"ligerloss0", "ligerloss1"}:
+        raise SystemExit(
+            f"ASYM_GEMM_LF_CONFIG_LIGER_LOSS must be ligerloss0 or ligerloss1, got {liger_loss!r}"
+        )
     expert_policy = parse_expert_recompute_policy_spec(os.environ.get("ASYM_GEMM_LF_CONFIG_EXPERT_POLICY", "none"))
     attention_gc_enabled = os.environ.get("ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED")
     if attention_gc_enabled is None:
@@ -562,6 +567,7 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "workload": os.environ.get("ASYM_GEMM_LF_CONFIG_WORKLOAD", model_label),
         "model_name_or_path": model_name,
         "backend": backend,
+        "liger_loss": liger_loss,
         "kt_backend": os.environ.get("ASYM_GEMM_LF_CONFIG_KT_BACKEND") or _option_value(args, "--kt_backend"),
         "precision": os.environ.get("ASYM_GEMM_LF_CONFIG_PRECISION") or _option_value(args, "--asym_precision") or "bf16",
         "dataset": _option_value(args, "--dataset"),
@@ -2209,6 +2215,33 @@ def _asym_execution_stats_from_model() -> dict[str, Any]:
     return {"available": True, "source": source, **data}
 
 
+def _asym_liger_lm_head_bridge_from_model() -> dict[str, Any]:
+    model, base_model = _model_and_base_model()
+    if model is None:
+        return {"enabled": False, "reason": "model hook did not capture a model"}
+
+    try:
+        from asym_gemm.integrations.liger_loss import asym_liger_lm_head_bridge_metadata
+    except Exception as exc:
+        return {"enabled": False, "reason": f"metadata import failed: {exc!r}"}
+
+    for label, candidate in (("model", model), ("base_model", base_model)):
+        if candidate is None:
+            continue
+        try:
+            metadata = asym_liger_lm_head_bridge_metadata(candidate)
+        except Exception as exc:
+            return {"enabled": False, "source": label, "reason": f"metadata failed: {exc!r}"}
+        if metadata.get("enabled"):
+            return {"source": label, **metadata}
+
+    try:
+        metadata = asym_liger_lm_head_bridge_metadata(model)
+    except Exception as exc:
+        return {"enabled": False, "reason": f"metadata failed: {exc!r}"}
+    return {"source": "model", **metadata}
+
+
 @dataclass
 class StageRecord:
     milliseconds: float
@@ -2574,6 +2607,7 @@ class LFProfileRecorder:
         kt = _kt_counters_from_model(self.config)
         activation_offload = _activation_offload_counters_from_model()
         asym_execution_stats = _asym_execution_stats_from_model()
+        asym_liger_lm_head_bridge = _asym_liger_lm_head_bridge_from_model()
         process_memory = _process_memory_snapshot()
         return {
             "workload": self.config.get("workload", "lf"),
@@ -2631,6 +2665,7 @@ class LFProfileRecorder:
             "kt": kt,
             "activation_offload": activation_offload,
             "asym_execution_stats": asym_execution_stats,
+            "asym_liger_lm_head_bridge": asym_liger_lm_head_bridge,
             "grad_clip": _GRAD_CLIP_MARKER,
             "optimizer_memory_preflight": _kt_optimizer_memory_preflight(lora, self.config),
             "optimizer_memory": _OPTIMIZER_MEMORY_MARKER,

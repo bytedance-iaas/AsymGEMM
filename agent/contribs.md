@@ -162,7 +162,7 @@ Notes:
 - Compute silu and directly write to HBM not storing on CPU
 - Compute grad and directly write to CPU not through HBM
 3. What are the gains and bottlenecks for timing and memory currently across Qwen3 and Llama4?
-
+4. fused CE with AsymGEMM?
 
 ### Discussion
 1. Can we build a cuda graph for kernel launch (partially)? This avoids synchronization from the CPU.

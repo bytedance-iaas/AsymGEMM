@@ -1,403 +1,1514 @@
-# Qwen3.5 (`qwen3_5_moe`) LoRA-SFT Memory-Offload Port — Staged Implementation Plan
+# Qwen3.5 AsymGEMM/LF Implementation Plan
 
-## State of the world (read first)
+This plan is based on the current Qwen3, Qwen3.5, Llama4, LF integration,
+and profiling code in this checkout, plus current Transformers Qwen3.5 MoE
+docs/source. The external architecture facts that matter are: Qwen3.5 MoE uses
+a 3:1 Gated DeltaNet/full-attention backbone and replaces dense FFNs with MoE
+blocks containing routed experts plus one shared expert, with default text
+config fields such as `num_experts=256`, `num_experts_per_tok=8`,
+`moe_intermediate_size=512`, and `shared_expert_intermediate_size=512`.
+See:
 
-- **One shared expert engine, reused as-is.** `AsymQwen3Experts` (`asym_gemm/training/qwen3_moe.py:1886`) is the only MoE engine. `is_qwen3_experts` (`qwen3_moe.py:86`) matches HF `Qwen3_5MoeExperts` exactly (3D `gate_up_proj`/`down_proj`, int `num_experts/hidden_dim/intermediate_dim`, callable `act_fn`, forward `(hidden_states, top_k_index, top_k_weights)`). VERIFIED at runtime: `is_qwen35_moe_block(layers.N.mlp) == True` on a real tiny `Qwen3_5MoeTextModel`, for BOTH linear-attention and full-attention layers. So routed experts inherit split-LoRA (fused gate+up LoRA-A), grouped GEMM (replacing the native per-`expert_hit` python loop in `Qwen3_5MoeExperts.forward`), `ASYMM_EXPERT_ACT_OFFLOAD`, recompute policy, and LoRA weight-offload (`weight_offload.py`) for free.
-- **MoE-block scaffold already complete AND tested.** `AsymQwen35MoeBlock`/`is_qwen35_moe_block`/`wrap_qwen35_moe_block` (`asym_gemm/training/qwen35_moe.py`) are wired into `apply_lf_asym_lora` (`lf.py:1048`, FIRST so it beats the qwen3 branch). `tests/training/test_lf_qwen35_asym_backend.py` already proves: matcher accept/reject, whole-block forward equals HF `Qwen3_5MoeSparseMoeBlock` (incl. real transformers block), router detach, experts CPU-adopt-without-clone, shared_expert + shared_expert_gate LoRA via the dense walk, router offload, shifted+gated RMSNorm offload, and adapter save/load. **The MoE block is done.**
-- **The real challenge is the hybrid-attention glue, NOT the experts.** `Qwen3_5MoeDecoderLayer` is `linear_attention` for 3/4 of layers (`full_attention_interval=4`): child `linear_attn` = `Qwen3_5MoeGatedDeltaNet` (GDN), no `self_attn`. The remaining 1/4 are `full_attention` (`self_attn` = `Qwen3_5MoeAttention`, with the q/k/v/o projections). Every layer carries `mlp` (the MoE block), `input_layernorm`, `post_attention_layernorm`.
-- **What works today (verified):** experts grouped-GEMM + LoRA; shared expert/gate LoRA + base CPU offload; router offload; norms offload incl. gated/shifted; expert activation offload; full-attention activation offload + attention GC (the 1/4 full-attn layers only); embed/lm_head offload; adapter IO.
-- **The gaps (verified, see Q1–Q7 below):** GDN decoder layers get NO decoder-level activation offload/checkpoint (matcher requires `self_attn`); GDN Linear leaves' LoRA behaviour under `target=all` is unvetted (and two of them are degenerate); deps `causal_conv1d`/`fla` are absent in all relevant venvs (GDN runs the pure-torch fallback — verified autograd-safe); MTP head treatment.
+- https://huggingface.co/docs/transformers/en/model_doc/qwen3_5_moe
+- https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py
 
-**Single biggest memory lever: Stage 1 (generalize the decoder matcher so the existing decoder saved-tensor-offload + checkpoint cover the GDN layers — 3/4 of the model).**
-
-### Corrections to the briefing's "verified context" (re-verified against source + runtime)
-
-- GDN projections are **`in_proj_qkv` / `in_proj_z` / `in_proj_b` / `in_proj_a` / `out_proj`** (five Linears), NOT `in_proj_qkvz`/`in_proj_ba`. Confirmed identical in `third_party/transformers/src/.../modeling_qwen3_5_moe.py:418-421,428` and the runtime copy `LlamaFactory/.venv/.../modeling_qwen3_5_moe.py:418-421`, and on a live tiny model. Q2 below is written against the real names.
-- `Qwen3_5MoeSparseMoeBlock` exists on every layer; gate is `Qwen3_5MoeTopKRouter` returning `(router_logits, router_scores, router_indices)`. `AsymQwen35MoeBlock._compute_routing` reads `[1]`=weights, `[2]`=index — matches (`router_scores` is the normalized top-k weight). Q7 OK.
-- `causal_conv1d` and `fla` are **not installed** in `AsymGEMM/.venv`, `LlamaFactory/.venv`, or `LlamaFactory-fa4/.conda-lf-fa4`. GDN therefore uses `torch_chunk_gated_delta_rule` + `Qwen3_5MoeRMSNormGated` (NOT `FusedRMSNormGated`). Both verified present and the torch chunk kernel is forward+backward differentiable (isolated test passed). This is the de-risked default; see Stage 0 / Q6.
-
----
-
-## Profiling harness facts (used by every stage's VALIDATION)
-
-- **Entry:** `scripts/lf/run_lf_lora_sft.sh` (env → `run_lf_profiled_train.py`). Sweep wrapper: `scripts/lf/profile_lora_lf.sh`. The runtime venv is `ENV_DIR=${ROOT}/.venv` = `AsymGEMM/.venv` (`run_lf_lora_sft.sh:163-164`).
-- **Peak GPU memory:** `run_lf_profiled_train.py:2267` `peak_allocated = int(torch.cuda.max_memory_allocated())`; surfaced in the source profile JSON as `memory.peak_allocated_hbm_bytes` (and `memory.gpu.peak_allocated_hbm_bytes`), `:2562-2573`. This is the acceptance metric for memory.
-- **Step latency:** `measured_e2e_step_milliseconds` (`run_lf_profiled_train.py:432,477`), surfaced under `trainer.timing` (`:2596`) and echoed by postprocess (`postprocess_lf_profile_artifacts.py:293,823,1032`). This is the acceptance metric for latency.
-- **Activation-offload counters:** `model._last_activation_offload_stats` snapshots (`decoder_activation_offload.py:248-279`) flow into the profile `activation_offload` block (`:2601`). Use `layer_act_offload_wrapped` / `offloaded_bytes` / `num_offloads` to PROVE the GDN layers were actually wrapped and offloaded.
-- **Model spec for the real workload (from the sweep comments, `profile_lora_lf.sh:25,27`):** `Qwen/Qwen3.5-122B-A10B|1`. Template inference returns `qwen3_nothink` for it (`run_lf_lora_sft.sh:310-320`). For Stage 0 use a small **local** Qwen3.5 config dir (recipe below) so we get GDN+full-attn layers cheaply and CPU-first.
-- **The flags (all gated through `run_lf_lora_sft.sh`):** `ASYM_OFFLOAD_MODULES`, `ASYMM_EXPERT_ACT_OFFLOAD`(+`_LORA_A_FWD`), `ASYMM_ATTN_ACT_OFFLOAD`, `ASYMM_LAYER_ACT_OFFLOAD`, `ASYM_EXPERT_RECOMPUTE_POLICY` (`none|gc-exp|gc-layer|gc-attn-exp`), `USE_ASYM_CPU_ADAMW`(+grad/weight offload), `BACKEND` (`asym|torch`), `ASYM_PRECISION=bf16`.
-
-### ACCEPTANCE RULE (applied identically in every stage)
-Keep a change ONLY if, baseline-vs-change at identical config:
-- **Memory:** `memory.peak_allocated_hbm_bytes` drops **meaningfully** — threshold **≥ 5% AND ≥ 512 MiB** on the real workload (toy models: ≥ 5% only, MiB threshold waived). A drop < 2% or < ~100 MiB is "trivial" → REJECT.
-- **Latency:** `measured_e2e_step_milliseconds` rises by no more than the **noise band of 5%** (3% target). Take the median of the measured steps (warmup excluded by the harness).
-- **Decision matrix:** memory meaningfully down + latency within band → ACCEPT. Memory unchanged but latency up → REJECT. Memory drop trivial → REJECT. Memory down but latency blows up (> 5%) → REJECT (or gate behind a flag, off by default).
-- Correctness gate precedes all of the above: forward/backward finite, grads on every LoRA bank, and (Stage 0) numerics equal to `backend=torch` within tolerance.
-
-### EFFICIENCY RULES (binding on every design)
-Never split work into many small GEMMs. Never loop over experts in python (the engine already eliminates the native loop). For GDN, never reimplement the delta-rule/conv kernels — wrap ONLY at the decoder-layer boundary (saved-tensor offload / checkpoint) and at the Linear-leaf boundary (LoRA). Prefer the existing grouped-GEMM + fused split-LoRA paths.
-
----
-
-## Stage 0 — Baseline + correctness harness (MANDATORY; nothing accepted without it)
-
-### SCOPE
-Files/functions exercised (no edits): `apply_lf_asym_lora` (`lf.py:993`), `wrap_qwen35_moe_block`/`is_qwen35_moe_block` (`qwen35_moe.py:48,228`), `AsymQwen3Experts` (`qwen3_moe.py:1886`), `is_qwen3_experts` (`qwen3_moe.py:86`). Existing test: `tests/training/test_lf_qwen35_asym_backend.py`. Modeling: `transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py`.
-
-Goal: a small **bf16** Qwen3.5 text model (a few layers MIXING GDN + full attention, small experts) trains e2e through `run_lf_lora_sft.sh` with `BACKEND=asym, lora_target=all, ASYM_OFFLOAD_MODULES=routed_experts`, and is **numerically equal** to `BACKEND=torch` within tolerance. Record baseline peak memory + step latency. Establish the deps decision.
-
-VALIDATION (must all pass):
-1. `is_qwen35_moe_block` matches each `layers.N.mlp` (both layer types); `is_qwen3_experts` passes; `report.qwen35_moes_wrapped == num_layers`; experts wrapped to `AsymQwen3Experts`.
-2. Forward/backward finite; every expert-LoRA + dense-LoRA bank has a grad; `_validate_trainable_params` raises nothing.
-3. **Numerical equivalence:** loss and (a sample of) LoRA grads from `BACKEND=asym` vs `BACKEND=torch` agree within `atol=4e-3, rtol=2e-2` (the tolerance used in the existing test `_assert_close`).
-4. Deps probe recorded: `causal_conv1d`/`fla` availability; confirm the GDN warning "fast path is not available" appears and the run still completes (it does — verified).
-5. Record `memory.peak_allocated_hbm_bytes` and `measured_e2e_step_milliseconds` as the BASELINE for Stages 1–3.
-
-ACCEPTANCE RULE: Stage 0 is a gate, not an optimization — it must simply pass (1)–(5). If numerics fail, STOP and fix before any offload stage.
-
-### INTENDED CODE CHANGES
-**None to source.** Stage 0 adds only a local test config + (optionally) a tiny e2e test. Build a local Qwen3.5 config directory (CPU-first load → satisfies the `strict` CPU-residency guard in `AsymQwen3Experts.__init__:1956` and `_wrap_lf_linear_leaf:585`):
+The local vendored source confirms the concrete block shape:
 
 ```python
-# scripts/.../make_tiny_qwen35.py  (helper, not shipped src)
-from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeTextForCausalLM  # text-only CausalLM
-cfg = Qwen3_5MoeTextConfig(
-    vocab_size=512, hidden_size=256, num_hidden_layers=8,        # 6 GDN + 2 full-attn (interval=4)
-    num_attention_heads=4, num_key_value_heads=2, head_dim=64,
-    moe_intermediate_size=128, shared_expert_intermediate_size=128,
-    num_experts=16, num_experts_per_tok=4, hidden_act="silu",
-    linear_num_key_heads=4, linear_num_value_heads=8,
-    linear_key_head_dim=64, linear_value_head_dim=64, linear_conv_kernel_dim=4,
-    full_attention_interval=4, max_position_embeddings=4096, output_router_logits=False,
-)
-m = Qwen3_5MoeTextForCausalLM(cfg).to(dtype="bfloat16")   # keep on CPU
-m.save_pretrained("/tmp/tiny-qwen35"); cfg.save_pretrained("/tmp/tiny-qwen35")
-# also save the matching tokenizer or point MODEL to a real Qwen3.5 tokenizer dir
+class Qwen3_5MoeSparseMoeBlock(nn.Module):
+    gate: Qwen3_5MoeTopKRouter
+    experts: Qwen3_5MoeExperts
+    shared_expert: Qwen3_5MoeMLP  # gate_proj, up_proj, down_proj
+    shared_expert_gate: nn.Linear(hidden_size, 1, bias=False)
+
+    def forward(hidden_states):
+        flat = hidden_states.view(-1, hidden)
+        shared = shared_expert(flat)
+        _, weights, indices = gate(flat)
+        routed = experts(flat, indices, weights)
+        shared = sigmoid(shared_expert_gate(flat)) * shared
+        return (routed + shared).view(batch, seq, hidden)
 ```
-Reason like real code: keep `head_dim`/`moe_intermediate_size` multiples of 8 so the experts and attention leaves hit the direct-bf16 path; keep `num_hidden_layers` a multiple of 4 so both layer types appear; `output_router_logits=False` because `router_mode=whole` requires it (`lf.py:1018`).
 
-### AMBIGUITY/UNCERTAINTY
-- **Is the text-only `*ForCausalLM` class present and named as assumed?** RESOLVE: `grep -n "class Qwen3_5Moe.*ForCausalLM\|Qwen3_5MoeTextModel\|Qwen3_5MoeModel" transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py`. The tiny `Qwen3_5MoeTextModel` already built+ran here; for SFT you need the CausalLM head — verify its exact class name and that LF can load it via `MODEL_NAME_OR_PATH=/tmp/tiny-qwen35`. If the only top class is the VL conditional-generation wrapper, build the text config under `text_config` and use the text CausalLM directly.
-- **Tokenizer:** LF needs a tokenizer. RESOLVE: point at a real Qwen3.5 tokenizer dir, or copy one into `/tmp/tiny-qwen35`.
+Current repo facts:
 
-### RISKS
-- The MTP head (`_keys_to_ignore_on_load_unexpected=[r"^mtp.*"]`, `modeling:903`) may add params; if the chosen CausalLM class instantiates an MTP head it could trip `_validate_trainable_params` (Q5). Covered in Risks/watch.
-- Tolerance: the torch chunk delta-rule runs in fp32 internally; asym-vs-torch differences are dominated by the experts' bf16 GEMM, not GDN — `4e-3/2e-2` is the established band but re-confirm on this model.
+- Qwen3 routed experts are comprehensively owned by
+  `asym_gemm/training/qwen3_moe.py`. `AsymQwen3Experts` supports packed
+  routed expert base offload, LoRA banks, activation offload/backfetch,
+  expert recompute, input-scaled routed forward, and CPUAdamW trainable
+  expert-LoRA weight offload.
+- Llama4 adds the missing pattern for shared branches. `AsymLlama4Moe` in
+  `asym_gemm/training/llama4_moe.py` owns the whole MoE block and can wrap
+  `shared_expert` with `AsymLlama4SharedMLP` from
+  `asym_gemm/training/llama4_shared_mlp.py`, including shared-MLP activation
+  offload/backfetch.
+- Qwen3.5 already has `AsymQwen35MoeBlock` in
+  `asym_gemm/training/qwen35_moe.py`. It wraps the routed experts via
+  `wrap_qwen3_experts` and preserves the Qwen3.5 shared branch, but the shared
+  branch is not first-class. It is only reached later by generic dense wrapping
+  in `asym_gemm/integrations/lf.py`.
+- Qwen3.5 decoder layers are not Qwen3 decoder layers with only a different MLP.
+  They are hybrid: most layers have `linear_attn` (`Qwen3_5MoeGatedDeltaNet`)
+  and the rest have `self_attn`. The current LF decoder-layer matcher must cover
+  both shapes, otherwise `ASYMM_LAYER_ACT_OFFLOAD=true` and `gc-layer` only cover
+  the full-attention subset.
+- Verified dependency state at plan time: `python`,
+  `third_party/AsymGEMM/.venv/bin/python`,
+  `third_party/LlamaFactory/.venv/bin/python`, and
+  `third_party/LlamaFactory-fa4/.conda-lf-fa4/bin/python` all lack importable
+  `fla` and `causal_conv1d`. The profile scripts default to
+  `third_party/AsymGEMM/.venv/bin/python`, so current Qwen3.5 runs use the
+  Transformers torch fallback for Gated DeltaNet unless the environment changes.
+  The mandatory pre-stage below must install and verify the package-index
+  `flash-linear-attention` path before any profiling baseline or implementation
+  work proceeds. In this checkout, Transformers 5.6.0 exposes
+  `is_flash_linear_attention_available` from
+  `transformers.utils.import_utils`, not from `transformers.utils`.
+- The Gated DeltaNet linear leaves are `in_proj_qkv`, `in_proj_z`, `in_proj_b`,
+  `in_proj_a`, and `out_proj`. Verified locally with a tiny
+  `Qwen3_5MoeTextModel`: LlamaFactory's `find_all_linear_modules` logic includes
+  all five leaf names under `lora_target=all`. Verified against current
+  `classify_lf_component`: those same `layers.*.linear_attn.*` leaves classify
+  as `other` and are not selected by `ASYM_OFFLOAD_MODULES=all`. Therefore,
+  current code gives them PEFT LoRA coverage, but not Asym-owned frozen-base CPU
+  offload.
+- `asym_offload_modules=all` already selects `shared_experts`, router,
+  attention, embeddings, LM head, norms, and dense MLPs. For Qwen3.5 this means
+  the current code can offload `shared_expert.{gate,up,down}_proj` and
+  `shared_expert_gate` as generic dense leaves, but it does not have the
+  Llama4-style shared-MLP activation offload path or Qwen3.5-specific shared
+  wrapper accounting.
+- `scripts/lf/profile3.sh` is the final gate. Before Pre-Stage 0A, its relevant
+  backend default is the legacy two-field
+  `BACKEND_SPECS=asym_cpuadamwds|norecomp,zero3_offload|recomp`; after
+  Pre-Stage 0A, the normalized Qwen3.5 validation form must be
+  `asym_cpuadamwds|norecomp|ligerloss0,zero3_offload|recomp|ligerloss0`.
+  The other relevant defaults are:
+  `ASYMM_EXP_ACT_POLICIES=none|true|true|true`,
+  `ASYM_OFFLOAD_MODULES=all`, `ASYM_STRICT=true`,
+  `ASYM_CPU_ADAMW_GRAD_OFFLOAD=true`,
+  `ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true`, `WORKLOADS=2048|4|1`,
+  `MAX_STEPS=1`, `WARMUP_STEPS=1`, `LORA_RANK=64`, `LORA_ALPHA=16`,
+  `LORA_DROPOUT=0.00`, and `PROFILE_MEMORY_BREAKDOWN=true`.
+  `scripts/lf/run_lf_lora_sft.sh` then runs LF with `--lora_target all`.
+  The implementation must therefore support Qwen3.5 under the exact all-target
+  LoRA and `ASYM_OFFLOAD_MODULES=all` surface, not under a hand-pruned target
+  list.
+- Qwen3.5 profiling and final acceptance must use only
+  `/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile3.sh` as
+  the profiling entry point. Do not use
+  `/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh`,
+  `/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf_test2.sh`,
+  or
+  `/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf_test.sh`
+  for Qwen3.5 validation; those scripts are entry points for other experiments.
+  For Qwen3.5, all validation and verdict commands below must explicitly use
+  `ligerloss0` and `ENABLE_LIGER_KERNEL=false`; the separate Liger-loss work
+  must not change the Qwen3.5 Asym-vs-ZeRO comparison.
 
-### WATCH LATER
-- If deps get installed later (`fla`/`causal_conv1d`), GDN switches to `FusedRMSNormGated` + fused kernels: re-run Stage 0 numerics AND re-baseline memory/latency, because the norm class change flips `AsymFrozenRMSNorm.gated` detection (Q4) and the saved-tensor population changes (Stage 1).
+Global acceptance rule for every stage:
 
-### EXACT VALIDATION COMMANDS
+- Use toy/unit tests only to prove local correctness and kernel safety.
+  Accept or reject runtime implementation stages using the real LF e2e Qwen3.5
+  profiling path. Pre-Stage 0A is the exception because it is common profiling
+  and interface plumbing only; accept it by dry-run command audit, unit tests,
+  and proving it does not change model execution or offload selection semantics.
+- Keep a runtime implementation stage only if it reduces peak HBM meaningfully
+  and does not blow up latency once the exact Asym Qwen3.5 row is runnable.
+  "Meaningful" means at least 5% peak allocated/reserved HBM reduction or at
+  least 2 GiB, whichever is larger. "Does not blow up latency" means forward,
+  backward, and measured e2e step time are each no more than 20% slower than the
+  most recent accepted same-backend Qwen3.5 profile. For the first stage that makes
+  `asym_cpuadamwds|norecomp|ligerloss0` complete, there is no earlier successful Asym
+  Qwen3.5 baseline; require that it does not obviously exceed
+  `zero3_offload|recomp|ligerloss0` timing while the later optimization stages establish
+  real Asym-vs-Asym deltas.
+- Reject a stage if memory is unchanged and latency increases. Also reject it
+  if memory drops only trivially, even if correctness tests pass.
+- Do not introduce per-expert Python loops, per-token loops, or many small GEMMs.
+  Qwen3.5 routed expert work must keep using the packed/grouped Qwen3 expert
+  paths. Shared expert work must remain three large dense projections plus the
+  scalar shared gate, matching the source architecture.
+
+Required `profile3.sh` knob coverage:
+
+| Knob/config | Qwen3.5 requirement |
+| --- | --- |
+| `MODEL_SPECS='Qwen/Qwen3.5-122B-A10B|1'` | Model detection must route to Qwen3.5 MoE wrappers and hybrid layer hooks. Template inference may stay `qwen3_nothink` unless LF needs a Qwen3.5-specific template. |
+| `BACKEND_SPECS='asym_cpuadamwds|norecomp|ligerloss0,zero3_offload|recomp|ligerloss0'` | Final implementation must run with CPUAdamW-Deepspeed and no recompute for the Asym row; ZeRO-3 offload baseline must still run through normal PEFT/DeepSpeed. The explicit third field pins Qwen3.5 to the no-Liger-loss axis while parallel Liger work evolves. Stage 0 does not run the Asym row; it identifies missing support by code audit after Pre-Stage 0A makes the profiling interface trustworthy and Pre-Stage 0B validates FLA. Later stages validate the exact Asym row after implementation. Do not add code that only works for the Asym row. |
+| `liger_loss=ligerloss0` and `ENABLE_LIGER_KERNEL=false` | Pre-Stage 0A must make the common scripts preserve the Liger-loss axis, but Qwen3.5 implementation validation must not enable Liger kernels yet. Every Qwen3.5 profile artifact used for acceptance must prove `liger_loss=ligerloss0`. |
+| `LF_EXPERT_LORA_IMPLS=split-target-parameters` and `--lora_target all` | Routed expert LoRA must use the Qwen3 split expert path. Shared expert and GDN projection LoRA must be correctly included or deliberately transferred from PEFT to Asym-owned modules when selected for offload. |
+| `LORA_RANK`, `LORA_ALPHA`, `LORA_DROPOUT=0.00` | All Qwen3.5 wrappers must preserve the requested rank/alpha/dropout. Expert split LoRA remains valid only for dropout `0.00`; do not silently ignore nonzero dropout. |
+| `ASYM_OFFLOAD_MODULES=all` and `ASYM_STRICT=true` | Every component included in `all` must either be implemented for Qwen3.5 or fail loudly in strict mode. No selected Qwen3.5 base weight may stay on HBM without being reported. Add `ASYM_GEMM_LF_CONFIG_ASYM_STRICT` to the profile-script env so final artifacts prove strict mode was on. |
+| `ASYMM_EXP_ACT_POLICIES=policy|expert_act|attn_act|layer_act` | `expert_act` applies to routed experts and, after Stage 4, shared MLP activation offload. `attn_act` applies only to full-attention `self_attn` q/k/v/o projections. `layer_act` must cover both full-attention and Gated DeltaNet decoder layers. |
+| `ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu|hbm` | Keep this routed-expert-specific unless a new shared/GDN implementation explicitly proves benefit. Do not accidentally apply this routed expert knob to shared MLP or GDN projections. |
+| `ASYM_CPU_ADAMW_GRAD_OFFLOAD=true` | All trainable LoRA gradients created by Qwen3.5 wrappers must remain visible to the optimizer/offload path. `_validate_trainable_params` must still pass. |
+| `ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true` | Any trainable LoRA weights owned by Qwen3.5-specific wrappers must participate in CPUAdamW weight offload, or the stage must prove the existing generic path already handles them. |
+| `PROFILE_MEMORY_BREAKDOWN=true` and modules `attention,linear_attention,router,mlp,experts,shared_experts,lora,embedding,norms,loss` | Pre-Stage 0A must add a `linear_attention` profiling component and update script defaults/postprocess classification so GDN rows do not disappear into `other`. |
+| `PROFILE_MODULE_FILTER=attention,linear_attention,router,mlp,experts,lora,optimizer,kt` | Pre-Stage 0A must add a filter token for `linear_attention` or deliberately map it into an existing token with tests. Prefer a separate token to keep comparison meaningful. |
+
+## Pre-Stage 0A: Common Profiling, Config Capture, And LF Component Interface
+
+Do this before Qwen3.5 runtime work. The point is to make every later stage
+measurable and auditable before changing model execution.
+
+Files/functions/classes to modify:
+
+- `scripts/lf/profile3.sh`
+  - default `PROFILE_MEMORY_BREAKDOWN_MODULES`
+  - default `PROFILE_MODULE_FILTER`
+  - backend-spec parser and normalized backend tuple shape
+  - `job_root_path`, `run_id`, `jobs.tsv`, completeness checks, plot filters,
+    and `run_job` signature
+  - `ENABLE_LIGER_KERNEL`, `ASYM_GEMM_LF_CONFIG_LIGER_LOSS`, and
+    `ASYM_GEMM_LF_CONFIG_ASYM_STRICT="${ASYM_STRICT}"` profile env forwarding.
+- `scripts/lf/run_lf_lora_sft.sh`
+  - profile-mode forwarding for `ASYM_GEMM_LF_CONFIG_ASYM_STRICT`
+  - verify existing `ENABLE_LIGER_KERNEL` and `ASYM_GEMM_LF_CONFIG_LIGER_LOSS`
+    forwarding remains intact.
+- `scripts/lf/run_lf_profiled_train.py`
+  - `_env_config`
+  - `_config_from_args`
+  - verify `ASYM_GEMM_LF_CONFIG_LIGER_LOSS` is persisted as `liger_loss`.
+- `scripts/lf/migrate_liger_loss_axis.py`
+  - inspect/use for legacy artifact migration only; fresh Qwen3.5 runs must
+    write the explicit axis directly.
+- `scripts/plotting/plot_activation_recompute_sweep.py`
+  - `--liger-loss`, job-dir parsing, row metadata, grouping labels.
+- `scripts/plotting/plot_lf_memory_breakdown.py`
+  - `--liger-loss`, job-dir parsing, row metadata, grouping labels.
+- `scripts/plotting/plot_lf_interconnect_ctc.py`
+  - `--liger-loss`, job-dir parsing, row metadata, grouping labels.
+- `asym_gemm/profiling/lf_trace.py`
+  - `_component_from_param_name`
+  - `_component_from_module_name`
+  - `_component_from_range_name`
+  - `_component_filter_token`
+- `scripts/lf/postprocess_lf_profile_artifacts.py`
+  - module/timing labels for Qwen3.5 `linear_attn` / Gated DeltaNet rows.
+- `asym_gemm/integrations/lf.py`
+  - `classify_lf_component` for reporting/classification only.
+- `tests/lf/test_asym_cpu_adamw_args.py`
+  - dry-run env/config forwarding coverage for strict mode, Liger-loss axis,
+    command paths, `jobs.tsv`, and plot filters.
+- `tests/lf/test_superoffload_backend_scripts.py`
+  - update expected source-profile metadata/path fixtures to include
+    `liger_loss`.
+- `tests/test_lf_memory_breakdown.py`
+  - component classification tests for `linear_attn` params, modules, and ranges.
+
+Intended code changes:
+
+- Make profile artifacts prove the exact common knobs used by later stages:
+  `liger_loss`, `asym_strict`, `asym_offload_modules`, CPUAdamW grad/weight
+  offload, activation offload knobs, LoRA impl, rank, alpha, and dropout.
+- Implement the needed profiling interface directly in `profile3.sh`:
+  - accept `backend|recompute` and `backend|recompute|ligerloss0/ligerloss1`;
+  - normalize every backend spec to `backend|recompute|ligerloss`;
+  - default legacy two-field specs to `ligerloss0`;
+  - include `liger_loss` in job directory names, run IDs, `jobs.tsv`, profile
+    completeness checks, source-profile matching, and plot filter calls;
+  - set `ENABLE_LIGER_KERNEL=false` for `ligerloss0` and `true` for
+    `ligerloss1`;
+  - forward `ASYM_GEMM_LF_CONFIG_LIGER_LOSS` so
+    `run_lf_profiled_train.py` records it in `source_profile.config`.
+- For Qwen3.5, do not sweep Liger loss in this plan. All Qwen3.5 commands must
+  spell `|ligerloss0`; any accidental `ligerloss1` artifact is excluded from
+  Qwen3.5 Asym acceptance.
+- Add a profiling component named `linear_attention` for Qwen3.5 Gated DeltaNet
+  ranges and projection leaves. This is profile/accounting only in Pre-Stage 0A.
+- Update profile defaults so memory breakdown and module filters can emit
+  `linear_attention` rows:
+
 ```bash
-cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
-# (a) deps + GDN autograd probe (records the Q6 decision)
-.venv/bin/python - <<'PY'
-import importlib.util as u
-print("causal_conv1d", u.find_spec("causal_conv1d") is not None, "| fla", u.find_spec("fla") is not None)
-PY
-
-# (b) unit harness (the existing suite is the correctness backbone)
-.venv/bin/python -m pytest tests/training/test_lf_qwen35_asym_backend.py -q
-
-# (c) build tiny local model (see helper above), then e2e asym baseline
-MODEL_NAME_OR_PATH=/tmp/tiny-qwen35 BACKEND=asym ASYM_PRECISION=bf16 \
-  LORA_RANK=8 LORA_ALPHA=16 LORA_DROPOUT=0.0 \
-  DATASET=asym_long_sft_smoke CUTOFF_LEN=2048 MAX_SAMPLES=16 MAX_STEPS=8 \
-  PER_DEVICE_TRAIN_BATCH_SIZE=1 \
-  ASYM_OFFLOAD_MODULES=routed_experts ASYM_EXPERT_RECOMPUTE_POLICY=none ASYM_ROUTER_MODE=whole \
-  PROFILE=1 PROFILE_PROFILER=source PROFILE_LEVEL=op \
-  bash scripts/lf/run_lf_lora_sft.sh
-
-# (d) e2e torch reference (numerical baseline)
-MODEL_NAME_OR_PATH=/tmp/tiny-qwen35 BACKEND=torch ASYM_PRECISION=bf16 \
-  LORA_RANK=8 LORA_ALPHA=16 LORA_DROPOUT=0.0 \
-  DATASET=asym_long_sft_smoke CUTOFF_LEN=2048 MAX_SAMPLES=16 MAX_STEPS=8 \
-  PER_DEVICE_TRAIN_BATCH_SIZE=1 ASYM_ROUTER_MODE=whole \
-  PROFILE=1 PROFILE_PROFILER=source PROFILE_LEVEL=op \
-  bash scripts/lf/run_lf_lora_sft.sh
-
-# (e) read the two acceptance metrics from each run's source profile JSON
-.venv/bin/python - "$ASYM_JSON" <<'PY'
-import json,sys; p=json.load(open(sys.argv[1]))
-print("peak_alloc_bytes", p["memory"]["peak_allocated_hbm_bytes"])
-print("e2e_step_ms", p["trainer"]["timing"].get("measured_e2e_step_milliseconds"))
-PY
-# (loss/grad equivalence: compare the per-step losses in trainer.losses between (c) and (d))
+PROFILE_MEMORY_BREAKDOWN_MODULES=attention,linear_attention,router,mlp,experts,shared_experts,lora,embedding,norms,loss
+PROFILE_MODULE_FILTER=attention,linear_attention,router,mlp,experts,lora,optimizer,kt
 ```
 
----
+- Do not change `ASYM_OFFLOAD_MODULES=all` semantics in this stage. In
+  particular, do not add `linear_attention` to `_ALL_LF_OFFLOAD_COMPONENTS` and
+  do not route GDN projection leaves into Asym-owned dense targets yet. Stage 2
+  makes that decision based on real profile evidence.
+- Do not enable Liger kernels for Qwen3.5. The common scripts may support
+  `ligerloss1` for the parallel Liger work, but the Qwen3.5 validation row is
+  always `ligerloss0` / `ENABLE_LIGER_KERNEL=false`.
+- Keep the common interface efficient: this stage should add labels,
+  config-capture, and classification only. It must not add model hooks, tensor
+  transfers, or new kernels.
 
-## Stage 1 — GDN decoder-layer activation offload + checkpoint (THE dominant lever)
+Pseudocode:
 
-### SCOPE
-- `asym_gemm/integrations/lf.py:800` `_is_qwen3_decoder_layer_module_name` — generalize so it matches Qwen3.5 GDN decoder layers.
-- Consumers (no signature change): `_wrap_qwen3_decoder_saved_tensor_offload_modules` (`lf.py:895`, driven by `ASYMM_LAYER_ACT_OFFLOAD`, `lf.py:1382`) and `_wrap_qwen3_decoder_checkpoint_modules` (`lf.py:843`, driven by `gc-layer`, `lf.py:1183`). Both already call `install_decoder_saved_tensor_offload` / `install_decoder_checkpoint` (`decoder_activation_offload.py:289`, `decoder_checkpoint.py`) which wrap at the WHOLE decoder-layer forward boundary — exactly the right granularity for GDN (never touches the delta-rule kernels).
+```bash
+append_backend_spec() {
+  raw="$1"
+  if raw has one pipe:
+    backend, recompute = split(raw, "|")
+    liger_loss=ligerloss0
+  elif raw has two pipes:
+    backend, recompute, liger_loss = split(raw, "|")
+  else:
+    die "backend spec must be backend|recompute[|ligerloss]"
 
-PROBLEM (verified on a live tiny model): GDN decoder layers expose children `['linear_attn','mlp','input_layernorm','post_attention_layernorm']` (no `self_attn`). The current required set is `{self_attn, mlp, input_layernorm, post_attention_layernorm}` (`lf.py:806`), so with `ASYMM_LAYER_ACT_OFFLOAD=true` (or `gc-layer`) ONLY the 1/4 full-attention layers are wrapped; the GDN layers — the dominant activation memory (3/4 of layers, each producing large `[B,S,H,head_dim]` q/k/v/conv/core_attn tensors) — are NOT offloaded.
+  liger_loss = normalize_liger_loss(liger_loss)  # ligerloss0 or ligerloss1
+  for recompute_mode in expand_recompute(recompute):  # norecomp/recomp/both
+    backend_specs_raw += "${backend}|${recompute_mode}|${liger_loss}"
+}
 
-VALIDATION (effectiveness):
-- After fix, `report.layer_act_offload_wrapped == num_hidden_layers` (was `num_full_attention_layers`); `activation_offload` block shows the GDN layer names with `num_offloads > 0` and nonzero `offloaded_bytes` from GDN-shaped tensors (tags like `decoder.saved.bfloat16.<B>x<S>x...`).
-- Same for `gc-layer`: `report.layer_gc_wrapped == num_hidden_layers`.
-- Memory: `memory.peak_allocated_hbm_bytes` drops meaningfully vs Stage-0 baseline (expect the bulk of the win here, since the GDN layers were previously un-offloaded). Latency within band (saved-tensor offload is H2D/D2H copy overlapped with compute; `gc-layer` recompute adds a second forward of GDN — measure both, prefer saved-tensor offload if `gc-layer` blows latency).
-
-ACCEPTANCE RULE: Apply the matcher generalization ONLY if peak memory drops ≥ 5% AND ≥ 512 MiB on the real workload with `ASYMM_LAYER_ACT_OFFLOAD=true` (and/or `gc-layer`), and `measured_e2e_step_milliseconds` rises ≤ 5%. If the offload path is net-neutral on memory (it will not be, given 3/4 of layers were excluded) or latency blows up, REJECT that sub-mode and keep only the one that passes.
-
-### INTENDED CODE CHANGES (pseudocode — efficient + correct)
-Generalize the matcher to accept either token-mixer child and to recognize the qwen3.5 lineage. Keep it strict (still require `mlp` + both layernorms; still exclude vision via the existing path-marker guard):
+run_job(backend, profiler, recompute, liger_loss, ...):
+  enable_liger_kernel=false
+  if liger_loss == "ligerloss1":
+    enable_liger_kernel=true
+  job_root = job_root_path(..., liger_loss, grad_offload, weight_offload)
+  run_env += ENABLE_LIGER_KERNEL="${enable_liger_kernel}"
+  run_env += ASYM_GEMM_LF_CONFIG_LIGER_LOSS="${liger_loss}"
+  append_job_record(..., profiler, liger_loss, grad_offload, ...)
+```
 
 ```python
-# lf.py  (replace _is_qwen3_decoder_layer_module_name)
-def _is_qwen3_decoder_layer_module_name(name: str, module: nn.Module) -> bool:
-    if not name:
-        return False
-    if _has_attention_excluded_path_marker(name):   # excludes vision_model/visual/etc.
-        return False
+def classify_profile_component(name):
+    lower = name.lower()
+    leaf = lower.rsplit(".", 1)[-1]
+    if ".linear_attn." in lower and leaf in {
+        "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
+    }:
+        return "linear_attention"
+    if ".linear_attn" in lower or "gateddeltanet" in lower:
+        return "linear_attention"
+    return existing_profile_component(name)
+
+def classify_lf_component(name, module=None):
+    component = classify_profile_component(name)
+    if component == "linear_attention":
+        return "linear_attention"  # reporting only until Stage 2
+    return existing_classification(name, module)
+
+# Pre-Stage 0A invariant:
+# parse_lf_offload_modules("all") does not select linear_attention yet.
+```
+
+Validation commands:
+
+```bash
+cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
+
+pytest -q tests/lf/test_asym_cpu_adamw_args.py tests/test_lf_memory_breakdown.py
+
+bash -n scripts/lf/profile3.sh scripts/lf/run_lf_lora_sft.sh
+
+DRY_RUN=true \
+OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/outputs/qwen35_prestage0a_interface_dryrun \
+PROFILERS=source \
+PROFILE_MEMORY_BREAKDOWN=true \
+MODEL_SPECS='Qwen/Qwen3.5-122B-A10B|1' \
+BACKEND_SPECS='asym_cpuadamwds|norecomp|ligerloss0,zero3_offload|recomp|ligerloss0' \
+ASYMM_EXP_ACT_POLICIES='none|true|true|true' \
+ASYM_OFFLOAD_MODULES=all \
+ASYM_STRICT=true \
+ASYM_CPU_ADAMW_GRAD_OFFLOAD=true \
+ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true \
+LF_EXPERT_LORA_IMPLS=split-target-parameters \
+LORA_DROPOUT=0.00 \
+LORA_RANK=64 \
+LORA_ALPHA=16 \
+WORKLOADS='2048|4|1' \
+MAX_STEPS=1 \
+WARMUP_STEPS=1 \
+bash scripts/lf/profile3.sh --overwrite true
+```
+
+Acceptance before Pre-Stage 0B:
+
+- Dry-run command artifacts include
+  `ASYM_GEMM_LF_CONFIG_ASYM_STRICT=true`,
+  `ASYM_GEMM_LF_CONFIG_LIGER_LOSS=ligerloss0`,
+  `ENABLE_LIGER_KERNEL=false`, and the expected CPUAdamW, activation-offload,
+  LoRA, and workload config values.
+- Dry-run command paths include `__ligerloss0` and do not include
+  `__ligerloss1`.
+- `jobs.tsv` has a `liger_loss` column, and every Qwen3.5 row in this dry run
+  has `ligerloss0`.
+- Profile completeness checks reject stale Qwen3.5 artifacts whose config lacks
+  the expected `liger_loss=ligerloss0`.
+- Plot invocations generated by the scripts include `--liger-loss ligerloss0`.
+  `plot_activation_recompute_sweep.py`, `plot_lf_memory_breakdown.py`, and
+  `plot_lf_interconnect_ctc.py` must parse both legacy job dirs and explicit
+  `__ligerloss0` job dirs, defaulting only legacy paths to `ligerloss0`.
+- Unit tests prove Qwen3.5 `linear_attn` params/modules/ranges classify as
+  `linear_attention`, not `other`.
+- `ASYM_OFFLOAD_MODULES=all` still does not select GDN projection offload in
+  Pre-Stage 0A. If this changes accidentally, reject the stage because it mixed
+  measurement plumbing with model implementation.
+- This stage is accepted by correctness and auditability, not by memory
+  reduction. It should not change forward/backward latency because it does not
+  alter runtime model execution.
+
+Risks to watch:
+
+- `classify_lf_component` may be used by both reporting and offload target
+  splitting. Keep tests that prove `linear_attention` is visible in reports but
+  not selected for Asym ownership until Stage 2 explicitly enables it.
+- `profile_lora_lf.sh`, `profile_lora_lf_test2.sh`, and
+  `profile_lora_lf_test.sh` are not Qwen3.5 validation entry points. Do not let
+  their behavior or artifacts drive Qwen3.5 acceptance unless a separate task
+  explicitly changes the scope.
+- `profile3.sh`, postprocess, plotting, and migration must stay aligned;
+  otherwise final comparisons can show `linear_attention` in one artifact,
+  `other` in another, or mix `ligerloss0` and `ligerloss1` rows.
+
+## Pre-Stage 0B: Mandatory FLA Install And Validation Gate
+
+Run this only after Pre-Stage 0A has made the profiling/script interface
+auditable. If this install or validation fails, stop. Do not proceed to the
+Stage 0 baseline, Qwen3.5 implementation, profiling, or acceptance/rejection
+decisions until the FLA/GDN dependency path works in the same Python environment
+used by `profile3.sh`.
+
+Environment to modify:
+
+- `third_party/AsymGEMM/.venv/bin/python`
+
+Files to modify:
+
+- None.
+
+Required install command:
+
+```bash
+cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
+
+PY=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python
+
+$PY -m pip show fla-core flash-linear-attention causal-conv1d || true
+$PY -m pip index versions flash-linear-attention | head
+$PY -m pip index versions fla-core | head
+$PY -m pip install "flash-linear-attention[cuda,conv1d]==0.5.0"
+```
+
+Use the package-index install, not the local checkout and not editable, unless
+the package-index install is proven unusable on this machine. If a local-source
+fallback is required later, record it explicitly in the profiling artifact notes
+because those numbers no longer match the FA4-style package-index setup. The
+local `third_party/flash-linear-attention` checkout currently advertises
+`0.5.1`, while the package-index version checked here is `0.5.0`; do not mix
+those two in the same verdict run.
+If validation fails because an old, local, or editable FLA package is already
+present, uninstall `fla-core flash-linear-attention causal-conv1d` and rerun the
+install command; do not proceed with a mixed environment.
+
+Required validation command:
+
+```bash
+PY=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python
+
+$PY - <<'PY'
+import importlib.metadata as md
+
+import fla
+from fla.modules.convolution import causal_conv1d as fla_causal_conv1d
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+import causal_conv1d
+
+from transformers.utils.import_utils import (
+    is_causal_conv1d_available,
+    is_flash_linear_attention_available,
+)
+
+print("flash-linear-attention", md.version("flash-linear-attention"))
+print("fla-core", md.version("fla-core"))
+print("fla.__version__", fla.__version__)
+print("causal-conv1d", md.version("causal-conv1d"))
+print("hf_flash_linear_attention_available", is_flash_linear_attention_available())
+print("hf_causal_conv1d_available", is_causal_conv1d_available())
+
+assert md.version("flash-linear-attention") == "0.5.0"
+assert is_flash_linear_attention_available()
+assert is_causal_conv1d_available()
+assert callable(chunk_gated_delta_rule)
+assert callable(fused_recurrent_gated_delta_rule)
+assert callable(fla_causal_conv1d)
+print("Qwen3.5 FLA dependency gate: PASS")
+PY
+```
+
+Acceptance before Stage 0:
+
+- `flash-linear-attention==0.5.0`, `fla-core`, and `causal-conv1d` are installed
+  in `third_party/AsymGEMM/.venv`.
+- `fla.ops.gated_delta_rule.{chunk,fused_recurrent}_gated_delta_rule` imports.
+- `fla.modules.convolution.causal_conv1d` imports.
+- Transformers reports both `is_flash_linear_attention_available()` and
+  `is_causal_conv1d_available()` as true.
+- If any item fails, fix the environment first. Do not start Stage 0 or later
+  work against the torch fallback path.
+
+## Stage 0: Establish Zero3 Baseline And Static Asym Code Audit
+
+Run the numeric baseline only after Pre-Stage 0A has made the common profiling
+and config-capture interface trustworthy and Pre-Stage 0B has validated FLA.
+Do not collect baseline artifacts with an older schema that lacks strict-mode
+config or `linear_attention` labels.
+
+Files to inspect:
+
+- `scripts/lf/profile3.sh`
+- `scripts/lf/postprocess_lf_profile_artifacts.py`
+- `scripts/lf/run_lf_lora_sft.sh`
+- `scripts/lf/run_lf_profiled_train.py`
+- `asym_gemm/training/qwen35_moe.py`
+- `asym_gemm/training/qwen3_moe.py`
+- `asym_gemm/training/llama4_moe.py`
+- `asym_gemm/training/llama4_shared_mlp.py`
+- `asym_gemm/integrations/lf.py`
+- `asym_gemm/training/weight_offload.py`
+- `tests/training/test_lf_qwen35_asym_backend.py`
+
+Implementation work:
+
+- Run the known-good `zero3_offload|recomp|ligerloss0` Qwen3.5 profile. This is the only
+  required numeric Stage 0 baseline because it does not depend on the missing
+  Qwen3.5 Asym implementation.
+- Do not run `asym_cpuadamwds|norecomp|ligerloss0` as a Stage 0 probe. The missing work is
+  already visible from code inspection: hybrid decoder-layer hooks do not cover
+  `linear_attn`, GDN projection offload is intentionally not selected yet,
+  shared expert lacks a first-class Qwen3.5 wrapper/activation-offload path, and
+  shared-wrapper LoRA weight-offload coverage must be verified.
+- Capture allocator peaks and source memory breakdown for the completed ZeRO
+  row. Do not accept or reject Qwen3.5 changes from tiny model tests unless the
+  changed code is an isolated kernel implementation.
+- Record a baseline table with:
+  `peak_allocated_hbm_bytes`, `peak_reserved_hbm_bytes`,
+  `actual_peak_allocated_hbm_bytes`, `actual_peak_reserved_hbm_bytes`,
+  `forward.total_milliseconds`, `backward.total_milliseconds`, and
+  `trainer.timing.measured_e2e_step_milliseconds`.
+
+Validation command, required numeric baseline:
+
+```bash
+cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
+
+OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/outputs/qwen35_stage0_zero3 \
+PROFILERS=source \
+PROFILE_MEMORY_BREAKDOWN=true \
+MODEL_SPECS='Qwen/Qwen3.5-122B-A10B|1' \
+BACKEND_SPECS='zero3_offload|recomp|ligerloss0' \
+ASYMM_EXP_ACT_POLICIES='none|true|true|true' \
+ASYM_OFFLOAD_MODULES=all \
+ASYM_STRICT=true \
+ASYM_CPU_ADAMW_GRAD_OFFLOAD=true \
+ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true \
+LF_EXPERT_LORA_IMPLS=split-target-parameters \
+LORA_DROPOUT=0.00 \
+LORA_RANK=64 \
+LORA_ALPHA=16 \
+WORKLOADS='2048|4|1' \
+MAX_STEPS=1 \
+WARMUP_STEPS=1 \
+bash scripts/lf/profile3.sh --overwrite true
+```
+
+Metric extraction pseudocode:
+
+```python
+from pathlib import Path
+import json
+
+root = Path("outputs/qwen35_stage0_zero3")
+
+def read_profile(path):
+    profile = json.loads(path.read_text())
+    source = profile.get("source_profile") or profile
+    config = source.get("config", {})
+    mem = source.get("memory", {}).get("gpu", {})
+    trainer = source.get("trainer", {}).get("timing", {})
+    row = {
+        "path": str(path),
+        "backend": config.get("backend"),
+        "liger_loss": config.get("liger_loss"),
+        "activation_recompute": config.get("activation_recompute"),
+        "model": config.get("model_name_or_path"),
+        "lora_target": config.get("lora_target"),
+        "offload_modules": config.get("asym_offload_modules"),
+        "strict": config.get("asym_strict"),
+        "qwen_moe_expert_lora_impl": config.get("qwen_moe_expert_lora_impl"),
+        "cpuadam_grad_offload": config.get("asym_cpu_adamw_grad_offload"),
+        "cpuadam_weight_offload": config.get("asym_cpu_adamw_weight_offload"),
+        "expact": config.get("asymm_expert_act_offload"),
+        "attnact": config.get("asymm_attn_act_offload"),
+        "layeract": config.get("asymm_layer_act_offload"),
+        "peak_alloc": mem.get("peak_allocated_hbm_bytes"),
+        "peak_reserved": mem.get("peak_reserved_hbm_bytes"),
+        "forward_ms": source.get("forward", {}).get("total_milliseconds"),
+        "backward_ms": source.get("backward", {}).get("total_milliseconds"),
+        "e2e_ms": trainer.get("measured_e2e_step_milliseconds"),
+    }
+    for candidate in (
+        path.parent / "memory_breakdown_summary.json",
+        path.parent / "memory_breakdown" / "memory_breakdown_summary.json",
+    ):
+        if candidate.exists():
+            summary = json.loads(candidate.read_text())
+            row["actual_peak_alloc"] = summary.get("actual_peak_allocated_hbm_bytes")
+            row["actual_peak_reserved"] = summary.get("actual_peak_reserved_hbm_bytes")
+            row["actual_peak_phase"] = summary.get("actual_peak_phase")
+            break
+    return row
+
+rows = [read_profile(p) for p in root.rglob("profile.json")]
+for row in sorted(rows, key=lambda r: (str(r["backend"]), str(r["path"]))):
+    print(row)
+```
+
+Acceptance before Stage 1:
+
+- The `zero3_offload|recomp|ligerloss0` Stage 0 artifact is complete, not `partial`, and
+  `profile3.sh` accepts it through `job_profile_complete`.
+- The complete source profile config proves the exact baseline knob surface:
+  `model_name_or_path=Qwen/Qwen3.5-122B-A10B`, `lora_target=all`,
+  `liger_loss=ligerloss0`,
+  `qwen_moe_expert_lora_impl=split-target-parameters`,
+  `asym_strict=true`, and the ZeRO row's policy-independent Asym knobs
+  canonicalized off by the script.
+- The code audit maps every known missing Qwen3.5 Asym runtime surface to a
+  later stage: hybrid decoder-layer hooks to Stage 1, GDN projection offload to
+  Stage 2, shared MLP wrapper/accounting to Stage 3, shared activation offload
+  to Stage 4, and trainable LoRA weight-offload verification to Stage 5.
+
+Risks to watch:
+
+- `Qwen/Qwen3.5-122B-A10B` may require model access and enough CPU memory for
+  CPU-first loading. A failed download/load is not an implementation failure.
+- `MAX_STEPS=1` is the exact script default and good for the requested verdict
+  shape, but timing noise is high. If a latency decision is close, run a second
+  same-knob sweep with `MAX_STEPS=10 WARMUP_STEPS=5` as supporting evidence;
+  do not replace the exact-config verdict with the longer run.
+
+Reusable Asym e2e validation command for implementation Stages 1-5:
+
+```bash
+cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
+
+OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/outputs/qwen35_stageN \
+PROFILERS=source \
+PROFILE_MEMORY_BREAKDOWN=true \
+MODEL_SPECS='Qwen/Qwen3.5-122B-A10B|1' \
+BACKEND_SPECS='asym_cpuadamwds|norecomp|ligerloss0' \
+ASYMM_EXP_ACT_POLICIES='none|true|true|true' \
+ASYM_OFFLOAD_MODULES=all \
+ASYM_STRICT=true \
+ASYM_CPU_ADAMW_GRAD_OFFLOAD=true \
+ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true \
+LF_EXPERT_LORA_IMPLS=split-target-parameters \
+LORA_DROPOUT=0.00 \
+LORA_RANK=64 \
+LORA_ALPHA=16 \
+WORKLOADS='2048|4|1' \
+MAX_STEPS=1 \
+WARMUP_STEPS=1 \
+bash scripts/lf/profile3.sh --overwrite true
+```
+
+## Stage 1: Cover Qwen3.5 Hybrid Decoder-Layer Hooks
+
+Files/functions/classes to modify:
+
+- `asym_gemm/training/qwen35_moe.py`
+  - `_is_qwen35_family`
+  - `is_qwen35_moe_block`
+  - `AsymQwen35MoeBlock.__init__`
+  - `AsymQwen35MoeBlock._compute_routing`
+  - `AsymQwen35MoeBlock.forward`
+- `asym_gemm/integrations/lf.py`
+  - `_is_qwen3_decoder_layer_module_name`
+  - `_wrap_qwen3_decoder_checkpoint_modules`
+  - `_wrap_qwen3_decoder_saved_tensor_offload_modules`
+- `asym_gemm/training/decoder_activation_offload.py`
+  - no algorithm change expected; use existing `install_decoder_saved_tensor_offload`.
+- `asym_gemm/training/decoder_checkpoint.py`
+  - no algorithm change expected; use existing `install_decoder_checkpoint`.
+- `tests/training/test_lf_qwen35_asym_backend.py`
+  - add tests for Qwen3.5 decoder layer detection, saved tensor offload, and
+    layer checkpoint/activation hook installation.
+
+Intended code changes:
+
+- Make Qwen3.5 model-type checks explicit in LF decoder-layer discovery. The
+  current code recognizes classic Qwen3 layers and Llama4 layers; Qwen3.5
+  decoder layers are different because they use either `linear_attn` or
+  `self_attn` depending on `layer_type`, plus `mlp`, `input_layernorm`, and
+  `post_attention_layernorm`.
+- This is an optimization stage, not just naming hardening. The intended effect
+  is that `ASYMM_LAYER_ACT_OFFLOAD=true` and `ASYM_EXPERT_RECOMPUTE_POLICY=gc-layer`
+  wrap all Qwen3.5 text decoder layers, including the Gated DeltaNet layers that
+  make up most of the stack. That should reduce saved activation HBM for the
+  linear-attention path without changing routed expert math.
+- Full-attention `self_attn` layers keep the existing attention path:
+  selected q/k/v/o projections can use AsymGEMM frozen-base CPU offload plus
+  attention activation offload/backfetch when `ASYMM_ATTN_ACT_OFFLOAD=true`.
+  Qwen3.5 `linear_attn` layers do not use that attention projection backfetch
+  path. They are covered at this stage only by decoder-layer checkpointing and
+  decoder saved-tensor offload around the whole layer.
+- Preserve the active Gated DeltaNet core. If `flash-linear-attention` and
+  `causal_conv1d` are installed later, the wrapper must still let Transformers
+  call FLA's `chunk_gated_delta_rule` / `fused_recurrent_gated_delta_rule` and
+  `causal_conv1d`. If they are absent, it must leave the current torch fallback
+  intact. The layer hook boundary is outside the GDN core in both cases.
+- Keep whole-router mode as the e2e path for `profile3.sh`. Qwen3.5
+  `output_router_logits=True` conflicts with `router_mode=whole` because whole
+  mode intentionally detaches router outputs.
+- Keep routed expert execution delegated to `AsymQwen3Experts`; do not copy or
+  rewrite the grouped routed expert kernels.
+- Strengthen shape assertions for `shared_expert` and `shared_expert_gate` so
+  unsupported variants fail before profiling.
+
+Pseudocode:
+
+```python
+def _is_qwen35_decoder_layer(module):
     children = dict(module.named_children())
-    # Token mixer is EITHER full attention (self_attn) OR GDN linear attention (linear_attn).
-    has_token_mixer = ("self_attn" in children) or ("linear_attn" in children)
-    base_required = {"mlp", "input_layernorm", "post_attention_layernorm"}
-    if not has_token_mixer or not base_required <= set(children):
-        return False
-    class_name = type(module).__name__.lower()
-    module_name = type(module).__module__.lower()
     config = getattr(module, "config", None)
     model_type = str(getattr(config, "model_type", "")).lower()
-    # qwen3 + qwen3.5 lineage (class/module/config), unchanged for qwen3.
-    if (
-        "qwen3" in class_name or "qwen3" in module_name
-        or model_type in {"qwen3_moe", "qwen3_vl_moe", "qwen3_5_moe", "qwen3_5_moe_text"}
-    ):
-        return True
-    # Fallback: identify by the MoE block child (covers Asym-wrapped or renamed lineages).
-    mlp_child = children["mlp"]
+    has_norms = {"mlp", "input_layernorm", "post_attention_layernorm"} <= set(children)
+    has_mixer = "linear_attn" in children or "self_attn" in children
+    class_or_module = (type(module).__name__ + " " + type(module).__module__).lower()
     return (
-        hasattr(mlp_child, "_is_asym_qwen3_moe_block")
-        or hasattr(mlp_child, "_is_asym_qwen35_moe_block")     # AsymQwen35MoeBlock marker
-        or is_qwen3_moe_block(mlp_child)
-        or is_qwen35_moe_block(mlp_child)
+        has_norms
+        and has_mixer
+        and (
+            model_type in {"qwen3_5_moe", "qwen3_5_moe_text"}
+            or "qwen3_5_moe" in class_or_module
+            or getattr(children["mlp"], "_is_asym_qwen35_moe_block", False)
+            or is_qwen35_moe_block(children["mlp"])
+        )
     )
+
+def _is_qwen3_decoder_layer_module_name(name, module):
+    if not name or _has_attention_excluded_path_marker(name):
+        return False
+    if _is_qwen35_decoder_layer(module):
+        return True
+    # existing Qwen3 and Llama4 branches stay unchanged
 ```
-Notes on correctness:
-- `is_qwen35_moe_block` returns `False` once the block is already wrapped (it checks `_is_asym_qwen35_moe_block` and returns False, `qwen35_moe.py:49`), which is why the explicit `hasattr(..., "_is_asym_qwen35_moe_block")` check is needed for the post-wrap walk. Decoder wrapping in `apply_lf_asym_lora` happens AFTER expert replacement (`lf.py:1381` vs `:1155`), so the `mlp` child is already `AsymQwen35MoeBlock` — the `hasattr` branch (and the `model_type`/class branch) cover it. The class/module-name branch (`"qwen3_5_moe"` in the decoder layer's own type) is the primary, robust path and fires regardless of wrap order.
-- The `class GradientCheckpointingLayer.__call__` base (modeling_layers.py:59) strips `use_cache`/`past_key_values` under its own GC; our wrappers replace `module.forward` and also skip when `use_cache=True` (`decoder_activation_offload.py:153`), so they compose safely. The decoder saved-tensor wrapper only offloads tensors with `requires_grad` and `nbytes ≥ min_bytes` (`:159-179`) — GDN's large activations qualify, the tiny `dt_bias`/`A_log`-derived tensors do not.
-- Do NOT also enable HF native gradient checkpointing (`GRADIENT_CHECKPOINTING=true`) together with `gc-layer` — that would double-wrap. The script keeps `GRADIENT_CHECKPOINTING=false` by default (`run_lf_lora_sft.sh:52`); `gc-layer` is the AsymGEMM path.
-
-### AMBIGUITY/UNCERTAINTY
-- **Does the GDN forward's `**kwargs` (cache_params/attention_mask/seq_idx/cu_seq_lens) survive the saved-tensors-hooks / checkpoint wrappers?** The wrappers pass `*args, **kwargs` straight through (`decoder_activation_offload.py:149,157`; `decoder_checkpoint.py` `body`), and skip entirely when `use_cache=True`. RESOLVE by the Stage-1 e2e run asserting forward/backward finite + `num_offloads>0` on GDN layers (the tiny model already runs the GDN path).
-- **Which sub-mode to ship?** Saved-tensor offload (`ASYMM_LAYER_ACT_OFFLOAD=true`, requires policy `none` + backend `asym`, `lf.py:1039-1042`) vs recompute (`gc-layer`). They are mutually exclusive by config. Measure both; ship whichever passes the ACCEPTANCE RULE with the better memory/latency trade. Given GDN's heavy fp32 internal recompute under the torch fallback, expect `gc-layer` to cost more latency than saved-tensor offload — but verify, don't assume.
-- **min_bytes default** is 1 MiB (`decoder_activation_offload.py:14`). On the tiny Stage-0 model many GDN tensors fall below 1 MiB and won't offload — that's expected; validate effectiveness on the REAL workload (long context, hidden=2048), where GDN activations are well above 1 MiB. Use `ASYM_DECODER_SAVED_TENSOR_OFFLOAD_MIN_BYTES` only if needed for the toy correctness run.
-
-### RISKS
-- If a future HF refactor renames `linear_attn` (e.g. to `mamba`/`token_mixer`), the `has_token_mixer` set must grow. Low risk; the lineage/model_type branch still catches it.
-- Over-broad matching: the added `is_qwen35_moe_block(mlp_child)` fallback could in principle match a non-decoder container that happens to hold a qwen3.5 MoE block; mitigated because we still require BOTH layernorms + a token-mixer child, which only a real decoder layer has.
-
-### WATCH LATER
-- With `fla` installed, GDN uses fused kernels whose internal saved tensors differ; re-confirm `num_offloads>0` and re-baseline memory (the chunked FLA kernel may save fewer/different tensors than the torch fallback).
-- Interaction with expert activation offload (`ASYMM_EXPERT_ACT_OFFLOAD`) and CPU-Adam weight/grad offload at the real peak — Stage 1 must be measured BOTH standalone and stacked with `ASYM_OFFLOAD_MODULES=all` to confirm the levers are additive, not antagonistic.
-
-### EXACT VALIDATION COMMANDS
-```bash
-cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
-# unit: matcher now accepts GDN + full-attn decoder layers (add to the qwen35 test file)
-.venv/bin/python - <<'PY'
-import torch
-from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as M
-from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
-from asym_gemm.integrations.lf import _is_qwen3_decoder_layer_module_name
-cfg=Qwen3_5MoeTextConfig(vocab_size=64,hidden_size=16,num_hidden_layers=4,num_attention_heads=2,
-  num_key_value_heads=1,head_dim=8,moe_intermediate_size=16,shared_expert_intermediate_size=16,
-  num_experts=4,num_experts_per_tok=2,linear_num_key_heads=2,linear_num_value_heads=4,
-  linear_key_head_dim=8,linear_value_head_dim=8,linear_conv_kernel_dim=4,full_attention_interval=4)
-m=M.Qwen3_5MoeTextModel(cfg)
-hits=[n for n,mod in m.named_modules() if _is_qwen3_decoder_layer_module_name(n,mod)]
-print("matched decoder layers:", hits)   # EXPECT all 4 (layers.0..3), not just the full-attn one
-assert len(hits)==cfg.num_hidden_layers, hits
-PY
-
-# e2e: layer activation offload ON; expect layer_act_offload_wrapped == num_layers, memory down
-MODEL_NAME_OR_PATH=/tmp/tiny-qwen35 BACKEND=asym ASYM_PRECISION=bf16 \
-  LORA_RANK=8 LORA_ALPHA=16 LORA_DROPOUT=0.0 CUTOFF_LEN=2048 MAX_SAMPLES=16 MAX_STEPS=8 \
-  PER_DEVICE_TRAIN_BATCH_SIZE=1 ASYM_ROUTER_MODE=whole \
-  ASYM_OFFLOAD_MODULES=routed_experts ASYM_EXPERT_RECOMPUTE_POLICY=none \
-  ASYMM_LAYER_ACT_OFFLOAD=true \
-  PROFILE=1 PROFILE_PROFILER=source PROFILE_LEVEL=op \
-  bash scripts/lf/run_lf_lora_sft.sh
-# also the gc-layer variant (mutually exclusive with ASYMM_LAYER_ACT_OFFLOAD):
-#   ASYM_EXPERT_RECOMPUTE_POLICY=gc-layer ASYMM_LAYER_ACT_OFFLOAD=false ...
-
-# accept/reject: compare to Stage-0 baseline JSON
-.venv/bin/python - "$BASELINE_JSON" "$STAGE1_JSON" <<'PY'
-import json,sys
-b=json.load(open(sys.argv[1])); s=json.load(open(sys.argv[2]))
-bm=b["memory"]["peak_allocated_hbm_bytes"]; sm=s["memory"]["peak_allocated_hbm_bytes"]
-bl=b["trainer"]["timing"]["measured_e2e_step_milliseconds"]; sl=s["trainer"]["timing"]["measured_e2e_step_milliseconds"]
-ao=s.get("activation_offload",{})
-print(f"mem {bm}->{sm} ({100*(bm-sm)/bm:.1f}% lower, {(bm-sm)/2**20:.0f} MiB)")
-print(f"lat {bl:.1f}->{sl:.1f} ms ({100*(sl-bl)/bl:+.1f}%)")
-print("layer_act_offload_wrapped", ao.get("layer_act_offload_wrapped"), "num_offloads", ao.get("num_offloads"))
-ok = (bm-sm)/bm>=0.05 and (bm-sm)>=512*2**20 and (sl-bl)/bl<=0.05   # MiB gate on real workload only
-print("ACCEPT" if ok else "REJECT")
-PY
-```
-
----
-
-## Stage 2 — Shared expert + shared_expert_gate (base CPU offload + LoRA; exclude the degenerate gate)
-
-### SCOPE
-- Dense walk in `apply_lf_asym_lora` (`lf.py:1282-1356`) via `_wrap_lf_linear_leaf` (`lf.py:563`) and `classify_lf_component` (`lf.py:372`).
-- The wrapped block keeps `shared_expert` (a `Qwen3_5MoeMLP`: `gate_proj/up_proj/down_proj`) and `shared_expert_gate` (`nn.Linear(hidden,1)`) RAW (`qwen35_moe.py:146-147`). After block replacement, the dense walk reaches `{block}.shared_expert.{gate,up,down}_proj` (classify→`shared_experts`) and `{block}.shared_expert_gate` (classify→`shared_experts`, `lf.py:377`).
-
-STATUS (already verified by existing tests, so Stage 2 is largely a CONFIRM-and-guard, not new code):
-- `shared_expert.{gate,up,down}_proj` get base CPU offload + LoRA when `shared_experts ∈ ASYM_OFFLOAD_MODULES` and `target` includes those leaves (`test_apply_lf_asym_lora_qwen35_shared_experts_adopt_cpu_storage_without_clone`).
-- `shared_expert_gate` (out_features=1) — the existing tests show it CAN be wrapped (`test_..._shared_modules`, `test_..._shape_is_not_direct_bf16_compatible`). out_features=1 violates `_direct_bf16_linear_shape_reason` (`requires_8_aligned_nk`, `lf.py:556-558`) so its base falls back to `backend=torch` CPU-fetch, and LoRA on a `(1,hidden)` matrix is **degenerate** (rank capped at 1, near-zero capacity, wasteful). The clean policy: **base CPU offload YES; LoRA NO**.
-
-VALIDATION (effectiveness):
-- Shared expert is DENSE (every token), so its base weights (3×`hidden×shared_intermediate`) and activations are nontrivial. With `ASYM_OFFLOAD_MODULES` including `shared_experts`, `report.cpu_resident_base_bytes_by_component["shared_experts"] > 0` and `selected_gpu_resident_base_bytes_by_component` has no `shared_experts` residue.
-- Shared-expert ACTIVATION memory is covered for free by Stage 1 (the shared expert runs inside the decoder layer's forward, so its saved tensors are offloaded by the decoder saved-tensor wrapper). No separate dense-MLP activation path is needed — confirm via the Stage-1 `offloaded_bytes` tags.
-
-ACCEPTANCE RULE: Including `shared_experts` in CPU offload must drop peak memory ≥ 5% AND ≥ 512 MiB on the real workload (shared-expert base is large at hidden=2048, num_layers=40) with latency ≤ 5% up. The LoRA-exclusion of `shared_expert_gate` must not change loss meaningfully (it's a near-degenerate adapter) and must remove a wasteful `(1,hidden)` adapter — keep the exclusion regardless of memory (it's a correctness/efficiency hygiene change, validated by "no `shared_expert_gate.lora_A` in trainable params").
-
-### INTENDED CODE CHANGES
-The base-offload path needs **no change** (works today). The only change is to **stop emitting LoRA on the degenerate `shared_expert_gate`**, while still allowing its base to be CPU-offloaded. Two equally valid options; prefer (A) (localized, no new flag):
 
 ```python
-# Option A — in _wrap_lf_linear_leaf (lf.py:563), force is_lora_target=False for the (·,1) gate.
-def _is_degenerate_lora_leaf(name: str, module: nn.Linear) -> bool:
-    # A (out=1) projection (Qwen3.5 shared_expert_gate, hidden->1) is not a useful LoRA target.
-    return name.rsplit(".", 1)[-1] == "shared_expert_gate" and int(module.weight.shape[0]) == 1
-
-# at the top of _wrap_lf_linear_leaf, after computing device/dtype:
-if is_lora_target and _is_degenerate_lora_leaf(name, module):
-    is_lora_target = False        # base CPU offload still applies if selected_cpu_offload
+def is_qwen35_moe_block(module):
+    if getattr(module, "_is_asym_qwen35_moe_block", False):
+        return False
+    if not _is_qwen35_family(module):
+        return False
+    gate = module.gate
+    experts = module.experts
+    shared = module.shared_expert
+    shared_gate = module.shared_expert_gate
+    require is_qwen3_experts(experts)
+    require shared has gate_proj/up_proj/down_proj
+    require shared_gate.in_features == gate.hidden_dim
+    require shared_gate.out_features == 1
+    require shared.gate_proj.in_features == gate.hidden_dim
+    require shared.up_proj.in_features == gate.hidden_dim
+    require shared.down_proj.out_features == gate.hidden_dim
+    require shared.gate_proj.out_features == shared.up_proj.out_features
+    require shared.down_proj.in_features == shared.gate_proj.out_features
+    return True
 ```
-Then it naturally returns `AsymFrozenLinear.from_host_weight(...)` when `selected_cpu_offload` (base offload, no LoRA), or — if not selected for offload and not a LoRA target — the leaf is simply skipped by the caller's `if not is_lora_target and not selected_cpu_offload: continue` (`lf.py:1295`). Reason: this removes one wasted adapter + its optimizer state per layer (40 layers × `(1+hidden)` params is small but the adapter is pure noise) and avoids a `(1,hidden)` GEMM in the forward.
 
-Correctness guard: `freeze_non_lora_params` + `_validate_trainable_params` (`lf.py:1395-1396`) still pass because the gate's base is frozen and no LoRA bank is created for it.
+Validation commands:
 
-NOTE on the existing tests: `test_apply_lf_asym_lora_whole_wraps_qwen35_and_dense_shared_modules:360` and `:418` assert `shared_expert_gate` HAS `lora_A`. **These tests encode the CURRENT behaviour and must be updated** to assert the gate is `AsymFrozenLinear`/base-only (or `TorchLoRALinear` with LoRA disabled) — flag this to the reviewer; do not silently break them. (This is the only place Stage 2 touches tests.)
-
-### AMBIGUITY/UNCERTAINTY
-- **Is excluding the gate's LoRA a behaviour change users rely on?** PEFT `target=all` would, by default, put LoRA on every Linear including `(·,1)`; but a rank-`r` adapter on a 1-row matrix is mathematically rank-≤1 and contributes negligible capacity. RESOLVE: confirm loss curves are within noise with/without the gate adapter on the tiny model; if a stakeholder wants exact PEFT parity, gate the exclusion behind `ASYM_LORA_SKIP_DEGENERATE=true` (default true) instead of unconditional. Document the choice in the adapter config.
-- **`shared_expert` leaf shapes** (`hidden=2048 ↔ shared_intermediate=512`) are 8-aligned and 64-aligned on the out dim for `gate/up_proj` (out=512) and `down_proj` (out=2048) → direct-bf16 LoRA path, efficient. Confirm with `_direct_bf16_linear_shape_reason` on the real config.
-
-### RISKS
-- If `shared_expert_intermediate_size` is ever not 64-aligned, `down_proj`/`up_proj` could fall back to torch — measure, but it's the existing dense-leaf behaviour, not new.
-- Touching the two assertions in the existing test is mandatory; missing it makes the suite red.
-
-### WATCH LATER
-- Whether shared-expert base offload + Stage-1 activation offload + expert offload are additive at the real peak (measure stacked).
-
-### EXACT VALIDATION COMMANDS
 ```bash
-cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
-# base offload present, gate not a LoRA target, no degenerate adapter
-MODEL_NAME_OR_PATH=/tmp/tiny-qwen35 BACKEND=asym ASYM_PRECISION=bf16 \
-  LORA_RANK=8 LORA_ALPHA=16 LORA_DROPOUT=0.0 CUTOFF_LEN=2048 MAX_SAMPLES=16 MAX_STEPS=8 \
-  PER_DEVICE_TRAIN_BATCH_SIZE=1 ASYM_ROUTER_MODE=whole \
-  ASYM_OFFLOAD_MODULES=routed_experts,shared_experts ASYM_EXPERT_RECOMPUTE_POLICY=none \
-  ASYMM_LAYER_ACT_OFFLOAD=true \
-  PROFILE=1 PROFILE_PROFILER=source PROFILE_LEVEL=op \
-  bash scripts/lf/run_lf_lora_sft.sh
+cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
 
-.venv/bin/python - "$STAGE2_JSON" <<'PY'
-import json,sys; p=json.load(open(sys.argv[1]))
-cpu=p.get("lora",{}); 
-# residency by component is in the setup log; here assert no degenerate gate adapter survived:
-# (grep the train log for shared_expert_gate adapters; expect none)
-print("peak_alloc", p["memory"]["peak_allocated_hbm_bytes"], "e2e_ms", p["trainer"]["timing"]["measured_e2e_step_milliseconds"])
-PY
-grep -E "shared_expert_gate.*(lora_A|lora_B)" "$STAGE2_LOG" && echo "FAIL: degenerate gate adapter present" || echo "OK: no gate adapter"
-# accept/reject vs Stage-1 JSON via the same comparison snippet as Stage 1 (mem >=5% & >=512MiB, lat <=5%).
+pytest -q \
+  tests/training/test_lf_qwen35_asym_backend.py \
+  tests/training/test_lf_qwen3_asym_backend.py \
+  tests/training/test_lf_llama4_asym_backend.py
 ```
 
----
+Then run the reusable Asym e2e validation command, changing only:
 
-## Stage 3 — Norms offload for shifted / gated RMSNorm
+```bash
+OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/outputs/qwen35_stage1
+```
 
-### SCOPE
-- `asym_gemm/training/offload.py:339` `AsymFrozenRMSNorm` (already class-cases `Qwen3_5MoeRMSNorm`→`shifted_weight`, `Qwen3_5MoeRMSNormGated`→`gated`, `:354-355`; forward at `:361-376`).
-- Driver: `apply_lf_asym_lora` norms branch (`lf.py:1243-1268`) selecting modules where `classify_lf_component(...)=="norms"`.
+Acceptance before Stage 2:
 
-STATUS (already verified): `test_asym_frozen_qwen35_rmsnorm_matches_shifted_weight_formula` and `test_asym_frozen_qwen35_gated_rmsnorm_matches_transformers` PASS — both the shifted `(1+w)` formula and the gated `forward(x, gate)` match HF exactly. VERIFIED at runtime that the GDN `norm` is `Qwen3_5MoeRMSNormGated` (because `fla` is absent). So the gated case is the live path.
+- Qwen3.5 unit tests prove source/wrapped forward parity and that
+  `ASYMM_LAYER_ACT_OFFLOAD=true` installs hooks on Qwen3.5 decoder layers.
+- The test/log output records which GDN backend was active: FLA/causal-conv when
+  dependencies are importable, or the Transformers torch fallback when they are
+  absent. Do not accept a change that silently switches a FLA run to fallback.
+- E2E `memory_breakdown_summary.json` and the Asym setup/runtime logs show
+  decoder saved-tensor offload wrappers on both `linear_attn` and `self_attn`
+  layer types. The wrapped count should match the text decoder layer count, not
+  only the full-attention count. Attention activation offload counts should
+  continue to count only `self_attn` q/k/v/o parents.
+- If this stage is the first one to make the reusable Asym e2e command complete,
+  accept it only when the layer-hook counters are correct and
+  forward/backward/e2e timing is not obviously worse than the Stage 0 Zero3
+  baseline. Otherwise keep it only if it lowers actual peak HBM meaningfully
+  versus the previous successful Asym profile without measurable latency
+  regression. If it wraps more layers but memory is unchanged and latency
+  increases, reject the change.
 
-The Qwen3.5 norm inventory and classification:
-- `input_layernorm`, `post_attention_layernorm` (`Qwen3_5MoeRMSNorm`, shifted) → classify `norms` ✓ (`lf.py:430-431`).
-- Full-attn `self_attn.q_norm`, `self_attn.k_norm` (`Qwen3_5MoeRMSNorm`, shifted, head-dim) → classify `norms` ✓ (`lf.py:427-428,433-434`).
-- Model final `norm` (`Qwen3_5MoeRMSNorm`) → `norms` ✓ (`lf.py:429`).
-- GDN `linear_attn.norm` (`Qwen3_5MoeRMSNormGated`, **gated**, lives INSIDE the GDN, invoked as `self.norm(core_attn_out, z)` at `modeling:551`) → leaf `norm`, classify `norms` ✓.
+Risks to watch:
 
-CRITICAL CORRECTNESS POINT for the gated norm: the GDN calls its norm with a positional `gate` (`z`). `AsymFrozenRMSNorm.forward(self, x, gate=None)` accepts that positional second arg and requires it in gated mode (`offload.py:361-365`). So replacing the GDN's `norm` with `AsymFrozenRMSNorm` preserves the call contract. VERIFIED by the passing gated test. The per-call weight staging is a `head_v_dim`-length vector copy (`offload.py:362`) — negligible.
+- Qwen3.5 multimodal/vision module names may match generic attention/norm logic.
+  Keep `_ATTENTION_GC_EXCLUDED_PATH_MARKERS` exclusions in place and test text
+  tower names, not vision tower names.
+- `router_mode=hf` can still find Qwen3.5 `experts` because they are Qwen3-style
+  packed experts, but the final `profile3.sh` path uses `whole`; optimize whole
+  mode first.
 
-VALIDATION (effectiveness):
-- With `ASYM_OFFLOAD_MODULES` including `norms`, `report.cpu_resident_base_bytes_by_component["norms"] > 0`, no `norms` GPU residue; forward/backward finite; loss within Stage-0 tolerance (norms are frozen; only staging changes).
-- The gated GDN norm specifically: assert the replaced module is `AsymFrozenRMSNorm` with `.gated==True` and the GDN forward still runs (it does on the tiny model).
+## Stage 2: Conditional Gated DeltaNet Projection Offload
 
-ACCEPTANCE RULE: Norm weights are TINY (a few KiB each). Their CPU offload will NOT move peak memory meaningfully → by the ACCEPTANCE RULE, **do NOT enable `norms` offload for a memory win** (it's trivial, REJECT as a standalone lever). KEEP norms offload ONLY as part of `ASYM_OFFLOAD_MODULES=all` correctness coverage, and ONLY if it does not raise latency > 5% (per-call host→device staging of a tiny vector must overlap; if it measurably slows the step, REJECT and leave norms resident). The deliverable here is a CORRECTNESS/coverage guarantee for the gated+shifted variants under `all`, not a memory optimization.
+Pre-Stage 0A already made Qwen3.5 Gated DeltaNet visible as `linear_attention` in
+profiles. This stage decides whether to turn that profile component into an
+actual Asym-owned offload selector.
 
-### INTENDED CODE CHANGES
-**None expected** — `AsymFrozenRMSNorm` already handles both variants and the driver already selects them. Stage 3 is a VERIFY stage. The only possible change is defensive: if profiling shows the per-call weight `.to(device)` in the gated path (`offload.py:362`) adds latency on the hot GDN path (3/4 of layers × every step), pin the norm weight and stage on a side stream, or simply EXCLUDE GDN gated norms from offload (they are tiny — leaving them resident costs ~nothing in memory and avoids any latency). Pseudocode for the optional exclusion (only if Stage 3 latency check fails):
+The implementation is conditional: add Asym ownership/offload only for the
+dense projection leaves if the real profile shows those frozen base weights are
+a meaningful HBM contributor. Never own or rewrite the Gated DeltaNet
+recurrent/delta-rule core.
+
+Files/functions/classes to modify only if GDN projection offload is accepted by
+the memory gate:
+
+- `asym_gemm/integrations/lf.py`
+  - `SUPPORTED_LF_OFFLOAD_COMPONENTS`
+  - `_ALL_LF_OFFLOAD_COMPONENTS`
+  - `LFOffloadSelection`
+  - `parse_lf_offload_modules`
+  - `classify_lf_component`
+  - `component_is_selected`
+  - `_wrap_lf_linear_leaf`
+  - report byte accounting in `build_lf_asym_report`
+- `asym_gemm/training/offload.py`
+  - `collect_lf_offload_residency` classification only if extra component names
+    need explicit handling.
+- `third_party/LlamaFactory/src/llamafactory/model/adapter.py`
+  - `split_asym_peft_dense_targets`
+  - `_filter_asym_dense_peft_targets` only if target filtering needs to avoid
+    PEFT pre-wrapping selected GDN projection leaves.
+- `tests/training/test_lf_qwen35_asym_backend.py`
+  - tests for `linear_attn.{in_proj_qkv,in_proj_z,in_proj_b,in_proj_a,out_proj}`
+    selection, CPU host adoption, fallback accounting, and forward/backward parity.
+
+Intended code changes:
+
+- Convert Pre-Stage 0A's profiling-only `linear_attention` component into an actual
+  `asym_offload_modules=linear_attention` selector only if projection offload is
+  accepted by the memory/latency gate. Include it in `all` only in the accepted
+  implementation. Do not overload normal `attention` activation offload, because
+  Gated DeltaNet is not q/k/v/o attention and should not enter
+  `AsymActivationOffloadLoRALinear`.
+- Classify only text-tower Qwen3.5 Gated DeltaNet leaves:
+  `linear_attn.in_proj_qkv`, `linear_attn.in_proj_z`, `linear_attn.in_proj_b`,
+  `linear_attn.in_proj_a`, and `linear_attn.out_proj`.
+- Use the existing generic dense offload machinery for base weights:
+  `AsymLoRALinear.from_host_weight` when the shape supports direct BF16, or the
+  existing torch CPU-fetch fallback when it does not. Do not reimplement the
+  delta-rule, causal convolution, or Gated DeltaNet kernels.
+- Keep each GDN projection as one dense projection. Do not split
+  `in_proj_qkv` into tiny per-head q/k/v GEMMs, do not loop over channels, and
+  do not wrap the convolution or delta-rule state update. The only allowed
+  AsymGEMM work here is frozen-base CPU offload/backfetch for whole dense
+  projection leaves.
+- Update LlamaFactory's PEFT/Asym split so selected `linear_attention` leaves are
+  assigned to `asym_owned_dense_target_modules`. Without this, `lora_target=all`
+  can let PEFT wrap the GDN linears first, after which the generic Asym dense
+  pass will not own or offload their frozen bases.
+- Keep Pre-Stage 0A profile defaults and postprocess classification intact so the
+  final verdict can show whether GDN projection offload actually reduced HBM and
+  whether it added latency.
+- Expect `in_proj_b` and `in_proj_a` to be small and possibly direct-BF16
+  backward-incompatible because their output dimension can be below 64. They
+  should either fall back to torch CPU fetch or remain resident if profiling
+  shows transfer overhead exceeds memory benefit.
+
+Pseudocode:
 
 ```python
-# lf.py norms branch: skip the GDN gated norm if staging hurts the hot path (tiny weight, no memory cost)
-class_name = type(module).__name__.lower()
-if "rmsnormgated" in class_name and _env_true(os.environ.get("ASYM_KEEP_GATED_NORM_RESIDENT", "true")):
-    continue   # leave Qwen3_5MoeRMSNormGated resident; negligible memory, avoids per-call staging on GDN
+SUPPORTED_LF_OFFLOAD_COMPONENTS = frozenset({
+    "routed_experts", "router", "shared_experts", "attention",
+    "linear_attention", "embed_tokens", "lm_head", "norms", "mlp_dense",
+})
+
+def parse_lf_offload_modules(selector):
+    aliases = {
+        ...,
+        "gdn": "linear_attention",
+        "linear_attn": "linear_attention",
+        "gated_deltanet": "linear_attention",
+    }
+    if token == "all":
+        expanded.update(SUPPORTED_LF_OFFLOAD_COMPONENTS)
+
+# Pre-Stage 0A already classifies Qwen3.5 GDN ranges/leaves as linear_attention.
+# Stage 2 makes that component selectable for offload.
+
+def component_is_selected(component, leaf, selection):
+    if component == "linear_attention":
+        return selection.linear_attention
+    return existing_component_selection(component, leaf, selection)
+
+# LlamaFactory adapter.py
+if component in {"attention", "linear_attention", "shared_experts", "lm_head", "mlp_dense"} \
+   and component_is_selected(component, module_leaf, selection):
+    selected_names.append(name)
 ```
 
-### AMBIGUITY/UNCERTAINTY
-- **Does the gated-norm offload survive being INSIDE a Stage-1-wrapped decoder layer (saved-tensor hooks active)?** The norm forward produces activations that the decoder wrapper may offload; the norm WEIGHT staging is separate (a `.to()` inside forward). RESOLVE by the stacked Stage-1+norms e2e run asserting finite grads + `.gated==True` on the replaced module.
-- **`FusedRMSNormGated` (if `fla` later installed)** is NOT detected by `AsymFrozenRMSNorm` (it only matches class name `Qwen3_5MoeRMSNormGated`, `offload.py:355`). If deps get installed, the GDN norm becomes `FusedRMSNormGated` and `classify`/`AsymFrozenRMSNorm` will treat it as a plain RMSNorm (no gate) → WRONG. WATCH item: extend the gated detection to also match `fusedrmsnormgated` if/when `fla` is installed.
+Validation commands:
 
-### RISKS
-- If `norms` offload is enabled and a norm leaf is not actually frozen elsewhere, `_validate_trainable_params` would catch it — but norms are frozen by `freeze_non_lora_params`. Low risk.
-
-### WATCH LATER
-- `FusedRMSNormGated` detection gap (above) — only relevant once `fla` is installed.
-
-### EXACT VALIDATION COMMANDS
 ```bash
-cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
-# unit: both variants already covered
-.venv/bin/python -m pytest tests/training/test_lf_qwen35_asym_backend.py -q \
-  -k "gated_rmsnorm or shifted_weight"
-# runtime: gated GDN norm is the wrapped class, forward finite
-.venv/bin/python - <<'PY'
-import torch
-from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as M
-from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
-from asym_gemm.training.offload import AsymFrozenRMSNorm
-cfg=Qwen3_5MoeTextConfig(hidden_size=16,num_hidden_layers=4,num_attention_heads=2,num_key_value_heads=1,
-  head_dim=8,moe_intermediate_size=16,shared_expert_intermediate_size=16,num_experts=4,num_experts_per_tok=2,
-  linear_num_key_heads=2,linear_num_value_heads=4,linear_key_head_dim=8,linear_value_head_dim=8,
-  linear_conv_kernel_dim=4,full_attention_interval=4,vocab_size=64)
-gdn=[m for m in M.Qwen3_5MoeTextModel(cfg).modules() if type(m).__name__=="Qwen3_5MoeGatedDeltaNet"][0]
-w=AsymFrozenRMSNorm(gdn.norm); print("gated", w.gated, "shifted", w.shifted_weight)  # EXPECT gated True
-PY
-# e2e: all selector includes norms; accept/reject -> KEEP only if latency <=5% (memory delta expected trivial)
-MODEL_NAME_OR_PATH=/tmp/tiny-qwen35 BACKEND=asym ASYM_OFFLOAD_MODULES=all \
-  ASYM_PRECISION=bf16 LORA_RANK=8 LORA_ALPHA=16 LORA_DROPOUT=0.0 CUTOFF_LEN=2048 MAX_SAMPLES=16 MAX_STEPS=8 \
-  PER_DEVICE_TRAIN_BATCH_SIZE=1 ASYM_ROUTER_MODE=whole ASYMM_LAYER_ACT_OFFLOAD=true \
-  PROFILE=1 PROFILE_PROFILER=source PROFILE_LEVEL=op bash scripts/lf/run_lf_lora_sft.sh
+cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
+
+pytest -q tests/training/test_lf_qwen35_asym_backend.py -k 'linear_attn or offload_modules or all'
+pytest -q tests/training/test_lf_qwen35_asym_backend.py tests/training/test_lf_qwen3_asym_backend.py
 ```
 
----
+Then run the reusable Asym e2e validation command, changing only:
 
-## Risks / watch-later (cross-stage, unresolved)
+```bash
+OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/outputs/qwen35_stage2
+```
 
-### Q2 — LoRA on GDN Linear leaves (`in_proj_qkv/z/b/a`, `out_proj`) under `target=all`
-VERIFIED leaf set + shapes on a live model: `out_proj` (value_dim→hidden, both 8/64-aligned at real sizes → direct-bf16 LoRA OK), `in_proj_qkv` (hidden→`2*key_dim+value_dim`, large, aligned → OK), `in_proj_z` (hidden→value_dim → OK), **`in_proj_b` and `in_proj_a` (hidden→`num_v_heads`)**. Real `num_v_heads=32` → out_features=32: 8-aligned but NOT 64-aligned → `_direct_bf16_linear_shape_reason(require_backward=True)` returns `dx_transpose_b_requires_64_aligned_out_features` (`lf.py:558`), so under `selected_cpu_offload` they fall back to `backend=torch` (correct, just not the fast path), and a rank-`r` LoRA on a 32-wide output is low-value (near-degenerate, like `shared_expert_gate` but less extreme). conv1d/`A_log`/`dt_bias` are NOT `nn.Linear` → never LoRA-wrapped (correct — never touch the delta-rule params). DECISION: (a) confirm the four big GDN Linears get useful LoRA and feed the GDN forward correctly (Stage-0 finite-grad check already exercises this since the tiny model has GDN layers and `target=all`); (b) consider extending the Stage-2 degenerate-leaf exclusion to `in_proj_b`/`in_proj_a` (out_features ≤ some threshold, e.g. < 64) to avoid wasted adapters — measure loss impact first. These are "other"/unselectable for base CPU offload today (no component bucket); leaving their base resident is fine (GDN base is dominated by `in_proj_qkv`/`out_proj`, not b/a). **Watch:** if GDN base CPU offload is ever wanted, add a `gdn`/`linear_attn` component to `SUPPORTED_LF_OFFLOAD_COMPONENTS` + `classify_lf_component` — out of scope unless memory demands it.
+Acceptance before Stage 3:
 
-### Q5 — MTP (multi-token-prediction) head
-`Qwen3_5MoePreTrainedModel._keys_to_ignore_on_load_unexpected=[r"^mtp.*"]` (`modeling:903`). If the instantiated SFT class builds an MTP head with trainable params, `_validate_trainable_params` (`lf.py:918`) will raise on non-LoRA trainables. DECISION: ensure the MTP head is frozen (it is not a LoRA/offload target → it must carry `requires_grad=False`). `freeze_non_lora_params` (`lf.py:1395`) freezes everything not LoRA, so MTP becomes frozen automatically; confirm at Stage 0 that the chosen CausalLM class either has no MTP head or that `_validate_trainable_params` passes. If an MTP head exists and is large, optionally add it to `ASYM_OFFLOAD_MODULES` coverage (classify currently → `other`, stays resident). **Watch:** verify with `grep -n "mtp" modeling_qwen3_5_moe.py` and a Stage-0 trainable-param dump.
+- If projection offload is accepted, residency validation reports no selected
+  CUDA-resident frozen base weights for the new `linear_attention` component
+  when `ASYM_OFFLOAD_MODULES=all`.
+- If projection offload is accepted, `split_asym_peft_dense_targets` routes
+  selected GDN projection leaves into `asym_owned_dense_target_modules`; tests
+  must fail if those leaves remain ordinary PEFT LoRA modules before Asym
+  wrapping.
+- Profile/postprocess artifacts contain `linear_attention` rows in memory and
+  timing outputs, not only `other`.
+- Profile logs show GDN leaves are not passed through attention activation
+  offload. Only base CPU offload and LoRA wrapping are expected here.
+- Keep the projection-offload implementation only if the real Qwen3.5 profile
+  shows a meaningful HBM drop versus the previous successful Asym profile without
+  forward/backward/e2e latency blowup. Reject projection offload if most
+  affected leaves are tiny torch CPU-fetch fallbacks and transfer overhead
+  dominates.
 
-### Q6 — GDN deps (`causal_conv1d`, `fla`)
-VERIFIED ABSENT in all three venvs; GDN runs `torch_chunk_gated_delta_rule` + `Qwen3_5MoeRMSNormGated`, which are forward+backward correct (isolated test passed) and complete e2e (tiny model ran). So deps are NOT a hard blocker for correctness, but: (a) the torch fallback is slower and may use MORE activation memory (more intermediate fp32 tensors) than the fused path — this actually makes Stage 1's decoder offload MORE valuable; (b) installing `fla`/`causal_conv1d` later changes the norm class (Q4 detection gap) and the saved-tensor population (Stage 1 re-baseline). DECISION for the plan: develop + accept Stages 1–3 against the torch-fallback path (the shipping default here), and record a WATCH to re-validate numerics + re-baseline memory/latency if deps are installed. **Do not gate any stage on installing deps.**
+Risks to watch:
 
-### Q7 — Router (`Qwen3_5MoeTopKRouter`)
-VERIFIED: returns `(router_logits, router_scores, router_indices)`; `router_scores`=normalized top-k weights (`router_top_value /= sum`, `modeling:788`). `AsymQwen35MoeBlock._compute_routing` consumes `[1]`=weights, `[2]`=index, detaches under no-grad, and casts weights to the hidden dtype (`qwen35_moe.py:187-197`). `norm_topk_prob` is effectively always-on in this router (the normalize is unconditional in HF) — matches. The existing `test_asym_qwen35_moe_whole_matches_source_and_detaches_router` covers it. No action; **watch** only if HF adds a `norm_topk_prob=False` config branch.
+- Adding `linear_attention` to `all` changes the meaning of `ASYM_OFFLOAD_MODULES=all`.
+  Do that only if projection offload is accepted. Pre-Stage 0A already added
+  `linear_attention` to profiling outputs without making it an offload selector.
+- Gated DeltaNet optional fused dependencies can change saved tensors and norm
+  classes. Re-run this stage if `causal_conv1d` or `flash-linear-attention` is
+  installed after the baseline.
 
-### General
-- Measure every stage BOTH standalone and stacked under `ASYM_OFFLOAD_MODULES=all` + `USE_ASYM_CPU_ADAMW=true` (+grad/weight offload) at the real `Qwen/Qwen3.5-122B-A10B|1` workload, SEQ≈11264, batch as in the sweep — that stacked config is the true acceptance target; the toy model only proves correctness + matcher behaviour, not the real peak.
-- The full-attention path (1/4 of layers) already has attention activation offload (`ASYMM_ATTN_ACT_OFFLOAD`, matcher `_is_text_attention_module_name` requires q/k/v/o — only full-attn layers match; GDN has none, correctly skipped). Stage 1's decoder-level offload covers BOTH layer types and supersedes the need for any GDN-specific attention path. Do not attempt a GDN "attention activation offload" — wrap at the decoder boundary only.
+## Stage 3: Add A First-Class Qwen3.5 Shared MLP Wrapper
+
+Files/functions/classes to modify:
+
+- Add `asym_gemm/training/qwen35_shared_mlp.py`
+  - `AsymQwen35SharedMLP`
+  - `is_qwen35_shared_mlp`
+  - `is_qwen35_shared_mlp_leaf`
+  - helper functions copied from `llama4_shared_mlp.py` with Qwen3.5 names.
+- `asym_gemm/training/qwen35_moe.py`
+  - `AsymQwen35MoeBlock.__init__`
+  - `AsymQwen35MoeBlock.cpu_resident_base_bytes`
+  - `AsymQwen35MoeBlock.gpu_resident_base_bytes`
+  - `AsymQwen35MoeBlock.trainable_lora_params`
+  - `AsymQwen35MoeBlock.forward`
+  - `wrap_qwen35_moe_block`
+- `asym_gemm/training/__init__.py`
+  - export the new wrapper if this package exports training wrappers there.
+- `asym_gemm/integrations/lf.py`
+  - imports
+  - `count_lora_wrapped_modules`
+  - `apply_lf_asym_lora`
+  - `_infer_adapter_config`
+- `tests/training/test_lf_qwen35_asym_backend.py`
+  - shared wrapper parity
+  - preexisting PEFT LoRA copy
+  - CPU host adoption without cloning
+  - residency validation and report byte accounting.
+
+Intended code changes:
+
+- Copy `AsymLlama4SharedMLP` as the implementation template, then change only
+  architecture-specific naming and activation attribute handling. Qwen3.5
+  `Qwen3_5MoeMLP` uses `act_fn`; Llama4 shared MLP uses `activation_fn`.
+  The Qwen3.5 wrapper should accept either but store `self.activation_fn`.
+- Wrap Qwen3.5 `shared_expert` inside `AsymQwen35MoeBlock` when all three
+  leaves are LoRA targets or already have PEFT LoRA, exactly like Llama4.
+- Keep `shared_expert_gate` outside the shared MLP wrapper. It is a separate
+  scalar gate with shape `[1, hidden]`; the existing generic dense offload path
+  correctly handles it, and the Asym direct BF16 dx path is usually not valid
+  because `out_features=1`.
+- Avoid double wrapping. Once `shared_expert` is an `AsymQwen35SharedMLP`, the
+  generic dense traversal should skip its `AsymLoRALinear` children naturally,
+  but tests must verify `dense_lora_wrapped` counts only missing leaves.
+
+Pseudocode:
+
+```python
+class AsymQwen35SharedMLP(nn.Module):
+    def __init__(self, source, *, backend, precision, offload,
+                 lora_rank, lora_alpha, lora_dropout,
+                 lora_dtype=torch.bfloat16, stats=None, strict=True):
+        gate_spec = _extract_shared_linear_leaf(source.gate_proj, strict=strict)
+        up_spec = _extract_shared_linear_leaf(source.up_proj, strict=strict)
+        down_spec = _extract_shared_linear_leaf(source.down_proj, strict=strict)
+
+        gate = gate_spec.base
+        up = up_spec.base
+        down = down_spec.base
+        require all biases are None
+        require gate.in_features == up.in_features == down.out_features
+        require gate.out_features == up.out_features == down.in_features
+
+        self.hidden_size = gate.in_features
+        self.intermediate_size = gate.out_features
+        self.activation_fn = getattr(source, "act_fn", None) or getattr(source, "activation_fn", None)
+        require callable(self.activation_fn)
+
+        self.backend = backend
+        self.precision = precision
+        self.offload = bool(offload)
+        self.lora_rank = int(lora_rank)
+        self.lora_alpha = float(lora_alpha)
+        self.lora_scale = float(lora_alpha) / float(lora_rank)
+        self.lora_dtype = normalize_lora_dtype(lora_dtype)
+        self.lora_dropout_p = float(lora_dropout)
+        self.stats = stats or AsymExecutionStats()
+        self.profile_prefix = "layers.unknown.mlp.shared_expert"
+
+        if backend == "asym" and offload:
+            for leaf_name, linear in [("gate_proj", gate), ("up_proj", up), ("down_proj", down)]:
+                require linear.weight.device.type == "cpu" when strict
+                require linear.weight.dtype == torch.bfloat16 when strict
+            self.gate_proj = AsymLoRALinear.from_host_weight(
+                adopt_host_weight("shared_expert.gate_proj.weight", gate.weight, "shared_experts",
+                                  pin_memory_policy="auto", strict=strict),
+                rank=lora_rank, alpha=lora_alpha, backend="asym", stats=self.stats,
+                device=cuda_if_available(), lora_dtype=self.lora_dtype,
+                precision=precision, init_lora_weights="peft", lora_dropout=lora_dropout)
+            self.up_proj = same_for(up)
+            self.down_proj = same_for(down)
+        elif backend == "asym":
+            self.gate_proj = AsymLoRALinear(gate, ...)
+            self.up_proj = AsymLoRALinear(up, ...)
+            self.down_proj = AsymLoRALinear(down, ...)
+        else:
+            self.gate_proj = TorchLoRALinear(gate, ...)
+            self.up_proj = TorchLoRALinear(up, ...)
+            self.down_proj = TorchLoRALinear(down, ...)
+
+        copy preexisting LoRA weights and validate scaling
+
+    def forward(self, x):
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        return self.down_proj(self.activation_fn(gate) * up)
+```
+
+```python
+def _qwen35_shared_expert_is_lora_target(name, module):
+    if not wrap_dense or not selection.shared_experts:
+        return False
+    shared = getattr(module, "shared_expert", None)
+    if not isinstance(shared, nn.Module):
+        return False
+    for leaf in ("gate_proj", "up_proj", "down_proj"):
+        child = getattr(shared, leaf, None)
+        supported = isinstance(child, nn.Module) and is_qwen35_shared_mlp_leaf(child)
+        targeted = (
+            _is_all_target(raw_lora_target)
+            or _matches_target(f"{name}.shared_expert.{leaf}", child, dense_target_modules)
+        )
+        preexisting = hasattr(child, "lora_A") and hasattr(child, "lora_B")
+        require supported
+    return all(targeted) or all(preexisting)
+```
+
+```python
+if kind == "qwen35_whole":
+    wrapped = wrap_qwen35_moe_block(
+        module,
+        ...,
+        wrap_shared_expert=_qwen35_shared_expert_is_lora_target(name, module),
+        offload_shared_expert=backend == "asym" and selection.shared_experts,
+    )
+    wrapped.profile_prefix = _layer_profile_prefix_from_module_name(name, "mlp")
+    wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
+    if isinstance(wrapped.shared_expert, AsymQwen35SharedMLP):
+        wrapped.shared_expert.profile_prefix = f"{wrapped.profile_prefix}.shared_expert"
+        report.dense_lora_wrapped += max(0, 3 - wrapped.shared_expert.preexisting_lora_leaf_count)
+```
+
+Validation commands:
+
+```bash
+cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
+
+pytest -q tests/training/test_lf_qwen35_asym_backend.py
+pytest -q tests/training/test_lf_llama4_asym_backend.py tests/training/test_lf_qwen3_asym_backend.py
+```
+
+Then run the reusable Asym e2e validation command, changing only:
+
+```bash
+OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/outputs/qwen35_stage3
+```
+
+Acceptance before Stage 4:
+
+- Correctness tests show Qwen3.5 source and wrapped block outputs match in BF16
+  within the same tolerances as existing Qwen3.5 tests.
+- `validate_lf_offload_residency` reports no selected CUDA-resident frozen base
+  weights for `shared_experts`.
+- Runtime counters still show Asym routed expert calls, and shared MLP profile
+  ranges appear under `layers.*.mlp.shared_expert`.
+- Keep the stage only if e2e Qwen3.5 peak HBM improves meaningfully versus the
+  previous successful Asym profile or if it is required for Stage 4 activation
+  offload. If generic dense wrapping already achieved the same base-weight
+  memory reduction and this stage adds latency, reject it or keep only the
+  minimal scaffolding needed for Stage 4.
+
+Risks to watch:
+
+- Qwen3.5 generic dense offload may already save most shared expert base memory,
+  so this stage alone may have little memory effect.
+- Preexisting PEFT LoRA modules may carry adapter-specific scaling. Copy the
+  Llama4 scaling validation exactly so load/save roundtrips remain compatible.
+- Do not include `shared_expert_gate` in the MLP wrapper. Its scalar output
+  shape is a poor fit for the direct Asym BF16 dx kernel, and folding it into
+  the MLP would change the source graph and saved tensors.
+
+## Stage 4: Add Qwen3.5 Shared-MLP Activation Offload/Backfetch
+
+Files/functions/classes to modify:
+
+- `asym_gemm/training/qwen35_shared_mlp.py`
+  - `_Qwen35SharedMLPActivationOffloadFunction`
+  - `_shared_mlp_activation_offload_enabled`
+  - `_is_silu_activation`
+  - `_asym_base_forward`
+  - `_asym_base_dx`
+  - `_lora_forward`
+  - `_lora_backward`
+  - `AsymQwen35SharedMLP._activation_offload_supported`
+  - `AsymQwen35SharedMLP.forward`
+- `tests/training/test_lf_qwen35_asym_backend.py`
+  - CUDA-gated forward/backward parity for shared MLP activation offload
+  - saved activation/residency counters for `ASYMM_EXPERT_ACT_OFFLOAD=true`.
+
+Intended code changes:
+
+- Copy Llama4 shared MLP activation offload and rename it for Qwen3.5. This is
+  safe because the math is identical: `down(silu(gate(x)) * up(x))`.
+- Use the same env knobs as Qwen3/Llama4 so `profile3.sh` exercises the feature:
+  `ASYMM_EXPERT_ACT_OFFLOAD=true` or
+  `ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD=true`.
+- Use the activation offload path only under strict conditions:
+  `backend=="asym"`, shared base weights are offloaded, training mode, grad
+  enabled, LoRA dropout is zero, LoRA dtype is BF16, input is CUDA BF16, activation
+  is SiLU, and all three leaves are `AsymLoRALinear` over BF16
+  `AsymFrozenLinear` bases.
+- Keep the forward as three large dense projections. The backward should stage
+  `x` once, recompute gate/up and activation once, compute down dx/LoRA grads,
+  then compute gate/up dx/LoRA grads. No token loops and no expert loops.
+
+Pseudocode:
+
+```python
+class _Qwen35SharedMLPActivationOffloadFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, gate_a, gate_b, up_a, up_b, down_a, down_b, layer):
+        flat = x.reshape(-1, layer.hidden_size).contiguous()
+        require flat.dtype == torch.bfloat16
+
+        manager = ActivationOffloadManager(pin_memory=True)
+        x_cpu = manager.offload(flat, "qwen35_shared.X")
+
+        gate_base = _asym_base_forward(layer.gate_proj.base_layer, flat, tag="shared_gate.base_forward")
+        up_base = _asym_base_forward(layer.up_proj.base_layer, flat, tag="shared_up.base_forward")
+        gate_delta, _ = _lora_forward(flat, gate_a, gate_b, scale=layer.lora_scale)
+        up_delta, _ = _lora_forward(flat, up_a, up_b, scale=layer.lora_scale)
+        gate = gate_base + gate_delta.to(gate_base.dtype)
+        up = up_base + up_delta.to(up_base.dtype)
+
+        activated = layer.activation_fn(gate) * up
+
+        down_base = _asym_base_forward(
+            layer.down_proj.base_layer,
+            activated.to(torch.bfloat16).contiguous(),
+            tag="shared_down.base_forward")
+        down_delta, _ = _lora_forward(
+            activated.to(down_a.dtype).contiguous(),
+            down_a, down_b, scale=layer.lora_scale)
+        out = down_base + down_delta.to(down_base.dtype)
+
+        ctx.save_for_backward(gate_a, gate_b, up_a, up_b, down_a, down_b)
+        ctx.layer = layer
+        ctx.manager = manager
+        ctx.x_cpu = x_cpu
+        ctx.input_shape = tuple(x.shape)
+        ctx.input_dtype = x.dtype
+        return out.reshape(*x.shape[:-1], layer.hidden_size)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        gate_a, gate_b, up_a, up_b, down_a, down_b = ctx.saved_tensors
+        layer = ctx.layer
+        manager = ctx.manager
+        x_stage = manager.stage(ctx.x_cpu, tag="qwen35_shared.X_for_backward")
+        x_lora = x_stage.to(gate_a.dtype)
+
+        gate_base = _asym_base_forward(layer.gate_proj.base_layer, x_stage, tag="shared_gate.recompute")
+        up_base = _asym_base_forward(layer.up_proj.base_layer, x_stage, tag="shared_up.recompute")
+        gate_delta, gate_low_rank = _lora_forward(x_lora, gate_a, gate_b, scale=layer.lora_scale)
+        up_delta, up_low_rank = _lora_forward(x_lora, up_a, up_b, scale=layer.lora_scale)
+        gate = gate_base + gate_delta.to(gate_base.dtype)
+        up = up_base + up_delta.to(up_base.dtype)
+        activated = layer.activation_fn(gate) * up
+
+        grad_2d = grad_output.reshape(-1, layer.hidden_size).to(torch.bfloat16).contiguous()
+        grad_down_base_x = _asym_base_dx(layer.down_proj.base_layer, grad_2d, input_dtype=torch.bfloat16)
+        _, down_low_rank = _lora_forward(activated.to(down_a.dtype).contiguous(), down_a, down_b, scale=layer.lora_scale)
+        grad_down_lora_x, grad_down_a, grad_down_b = _lora_backward(
+            grad_2d, down_low_rank, activated.to(down_a.dtype).contiguous(),
+            down_a, down_b, scale=layer.lora_scale)
+        grad_act = grad_down_base_x + grad_down_lora_x.to(grad_down_base_x.dtype)
+
+        grad_up = grad_act * layer.activation_fn(gate)
+        grad_gate = torch.ops.aten.silu_backward(grad_act * up, gate)
+
+        grad_gate_base_x = _asym_base_dx(layer.gate_proj.base_layer, grad_gate.to(torch.bfloat16).contiguous())
+        grad_up_base_x = _asym_base_dx(layer.up_proj.base_layer, grad_up.to(torch.bfloat16).contiguous())
+        grad_gate_lora_x, grad_gate_a, grad_gate_b = _lora_backward(
+            grad_gate, gate_low_rank, x_lora, gate_a, gate_b, scale=layer.lora_scale)
+        grad_up_lora_x, grad_up_a, grad_up_b = _lora_backward(
+            grad_up, up_low_rank, x_lora, up_a, up_b, scale=layer.lora_scale)
+
+        grad_x_2d = grad_gate_base_x + grad_up_base_x
+        grad_x_2d.add_(grad_gate_lora_x.to(grad_x_2d.dtype))
+        grad_x_2d.add_(grad_up_lora_x.to(grad_x_2d.dtype))
+        grad_x = grad_x_2d.to(ctx.input_dtype).reshape(ctx.input_shape)
+
+        manager.release_stage(x_stage, drop_cache=True)
+        manager.release_cpu(ctx.x_cpu)
+        return grad_x, grad_gate_a, grad_gate_b, grad_up_a, grad_up_b, grad_down_a, grad_down_b, None
+```
+
+Validation commands:
+
+```bash
+cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
+
+ASYMM_EXPERT_ACT_OFFLOAD=true \
+pytest -q tests/training/test_lf_qwen35_asym_backend.py -k 'shared and activation'
+
+pytest -q \
+  tests/training/test_lf_qwen35_asym_backend.py \
+  tests/training/test_lf_llama4_asym_backend.py \
+  tests/training/test_lf_qwen3_asym_backend.py
+```
+
+Then run the reusable Asym e2e validation command, changing only:
+
+```bash
+OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/outputs/qwen35_stage4
+```
+
+Acceptance before Stage 5:
+
+- Unit tests prove forward and backward parity for the Qwen3.5 shared MLP
+  activation-offload path.
+- `memory_breakdown_summary.json` shows actual peak HBM or saved activation HBM
+  drops meaningfully versus the previous successful Asym profile. The drop
+  should be attributable to `shared_experts`, `mlp`, or activation/saved tensor
+  rows, not allocator noise.
+- Forward/backward/e2e timing stays within the global latency threshold. If
+  shared activation offload reduces memory but adds many small operations or
+  excessive H2D/D2H copies, reject it.
+
+Risks to watch:
+
+- The shared branch may not be the actual peak at `WORKLOADS=2048|4|1`; in that
+  case this stage can be correct but not worth keeping.
+- `ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD` is routed-expert-specific today. Do not
+  invent a separate shared-MLP interpretation unless profiling shows shared LoRA
+  low-rank staging is a real peak contributor.
+- `shared_expert_gate` still saves its input for backward through generic
+  autograd. If the breakdown shows the scalar gate is a peak contributor, add a
+  separate small activation-offload gate wrapper later, but do not fold it into
+  this stage.
+
+## Stage 5: Verify Or Implement Shared-MLP LoRA Weight Offload
+
+`profile3.sh` sets `ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true`, so this stage is not
+optional as a validation gate. The implementation work is conditional: if the
+existing generic dense/CPUAdamW path already offloads Qwen3.5 shared-MLP LoRA
+weights correctly, add tests and keep the code unchanged. If the Stage 3/4
+shared wrapper owns LoRA tensors in a way the generic coordinator cannot see,
+implement grouped shared-MLP LoRA weight offload here.
+
+Files/functions/classes to inspect in all cases:
+
+- `asym_gemm/training/weight_offload.py`
+  - current trainable LoRA tensor discovery and coordinator lifetime model.
+- `third_party/LlamaFactory/src/llamafactory/train/trainer_utils.py`
+  - `_create_asym_cpu_adamw_optimizer`
+- `tests/training/test_lf_qwen35_asym_backend.py`
+  - trainable surface and CPUAdamW weight-offload coverage.
+
+Files/functions/classes to modify only if the existing path does not cover the
+Qwen3.5 shared wrapper:
+
+- `asym_gemm/training/weight_offload.py`
+  - `LoRAWeightOffloadCoordinator`
+  - registration/discovery for trainable LoRA tensors
+  - forward/backward gather/release hooks
+- `asym_gemm/training/qwen35_shared_mlp.py`
+  - safe gather/release points if the shared MLP custom autograd function owns
+    the LoRA tensors during forward and backward.
+- `third_party/LlamaFactory/src/llamafactory/train/trainer_utils.py`
+  - `_create_asym_cpu_adamw_optimizer` error/reporting text so it does not imply
+    only `AsymQwen3Experts` LoRA banks can be coordinated.
+- `tests/training/test_lf_qwen35_asym_backend.py`
+  - shared MLP LoRA weight offload parity and lifetime tests.
+
+Intended code changes:
+
+- The current weight offload coordinator is designed for `AsymQwen3Experts`
+  LoRA banks. Qwen3.5 routed expert banks already inherit that support because
+  Qwen3.5 uses `AsymQwen3Experts`.
+- First prove whether Qwen3.5 shared-MLP LoRA tensors are already discovered by
+  the generic path under `ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true`. The proof is
+  explicit parameter names, residency/lifetime accounting, and a trainable
+  surface check, not an assumption.
+- Only add new shared MLP trainable LoRA weight-offload code if the existing path
+  misses those tensors or if the new shared wrapper uses custom autograd and
+  therefore needs explicit gather/release points. They are much smaller than
+  routed expert banks, so do not add a new runtime path unless correctness or a
+  meaningful memory drop requires it.
+- If implemented, register all six shared MLP LoRA tensors as one per-layer
+  group, not six independent tiny transfer groups.
+- Never release a LoRA tensor before autograd no longer needs it. Generic
+  `AsymLoRALinear` autograd will save parameter tensors implicitly, so this
+  stage is only safe if the shared MLP is using the custom activation-offload
+  function that manually controls LoRA forward/backward math, or if releases are
+  delayed by a post-accumulate/backward-completion hook.
+
+Pseudocode:
+
+```python
+def discover_lora_weight_offload_groups(model):
+    groups = []
+    for name, module in model.named_modules():
+        if isinstance(module, AsymQwen3Experts):
+            groups.append(register_existing_expert_bank_group(name, module))
+        if isinstance(module, AsymQwen35SharedMLP) and module.uses_custom_autograd_weight_lifetime:
+            groups.append(LoRAWeightGroup(
+                name=f"{name}.shared_mlp_lora",
+                tensors=[
+                    module.gate_proj.lora_a,
+                    module.gate_proj.lora_b,
+                    module.up_proj.lora_a,
+                    module.up_proj.lora_b,
+                    module.down_proj.lora_a,
+                    module.down_proj.lora_b,
+                ],
+                gather_before_forward=module.gather_lora_weights,
+                release_after_forward=module.release_lora_weights,
+                gather_before_backward=module.gather_lora_weights,
+                release_after_backward=module.release_lora_weights,
+            ))
+    return groups
+```
+
+Validation commands:
+
+```bash
+cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
+
+ASYMM_EXPERT_ACT_OFFLOAD=true \
+ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true \
+pytest -q tests/training/test_lf_qwen35_asym_backend.py -k 'weight_offload or shared'
+```
+
+Add or update a test that prints/asserts the exact Qwen3.5 trainable LoRA names
+seen by the optimizer under `--lora_target all`. The accepted trainable surface is:
+
+- routed expert split LoRA banks from `AsymQwen3Experts`;
+- shared expert dense LoRA weights for `shared_expert.gate_proj`,
+  `shared_expert.up_proj`, and `shared_expert.down_proj`;
+- `shared_expert_gate` LoRA if it remains selected by `lora_target=all`;
+- GDN projection LoRA for `linear_attn.{in_proj_qkv,in_proj_z,in_proj_b,in_proj_a,out_proj}`
+  if Stage 2 leaves them PEFT-owned or moves them into Asym-owned dense wrappers.
+
+No router base weights, dense base weights, norms, embeddings, or GDN
+non-projection tensors may be trainable.
+
+Then run the reusable Asym e2e validation command, changing only:
+
+```bash
+OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/outputs/qwen35_stage5
+```
+
+Acceptance before Stage 6:
+
+- The validation gate is passed only when `ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true`
+  correctly covers every Qwen3.5 trainable LoRA tensor that the final config
+  creates. If the existing path already does this, keep the verification/tests
+  and do not add new runtime code.
+- Keep any new runtime offload implementation only if Qwen3.5 e2e peak HBM drops
+  meaningfully beyond Stage 4. A small trainable LoRA memory reduction is not
+  enough.
+- Backward must be numerically correct and must not crash from missing/released
+  LoRA parameters.
+- Transfer scheduling must not create many tiny H2D/D2H operations. Use grouped
+  slabs or one coordinated per-layer transfer.
+
+Risks to watch:
+
+- This stage has the highest correctness risk because LoRA parameter lifetimes
+  cross autograd boundaries.
+- It is likely not needed for `LORA_RANK=64` unless memory breakdown shows
+  trainable dense/shared LoRA weights are unexpectedly large.
+
+## Stage 6: Final Verdict From Exact `profile3.sh` Qwen3.5 Numbers
+
+Files to use, not necessarily modify:
+
+- `scripts/lf/profile3.sh`
+- `scripts/lf/postprocess_lf_profile_artifacts.py`
+- final output directory selected below.
+
+Final profiling command:
+
+```bash
+cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
+
+OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/outputs/qwen35_final \
+PROFILERS=source \
+PROFILE_MEMORY_BREAKDOWN=true \
+MODEL_SPECS='Qwen/Qwen3.5-122B-A10B|1' \
+BACKEND_SPECS='asym_cpuadamwds|norecomp|ligerloss0,zero3_offload|recomp|ligerloss0' \
+ASYMM_EXP_ACT_POLICIES='none|true|true|true' \
+ASYM_OFFLOAD_MODULES=all \
+ASYM_STRICT=true \
+ASYM_CPU_ADAMW_GRAD_OFFLOAD=true \
+ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true \
+LF_EXPERT_LORA_IMPLS=split-target-parameters \
+LORA_DROPOUT=0.00 \
+LORA_RANK=64 \
+LORA_ALPHA=16 \
+WORKLOADS='2048|4|1' \
+MAX_STEPS=1 \
+WARMUP_STEPS=1 \
+bash scripts/lf/profile3.sh --overwrite true
+```
+
+Final extraction command:
+
+```bash
+cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
+
+python - <<'PY'
+from pathlib import Path
+import json
+
+root = Path("outputs/qwen35_final")
+rows = []
+for path in root.rglob("profile.json"):
+    profile = json.loads(path.read_text())
+    source = profile.get("source_profile") or profile
+    if source.get("partial") is True:
+        continue
+    config = source.get("config", {})
+    mem = source.get("memory", {}).get("gpu", {})
+    timing = source.get("trainer", {}).get("timing", {})
+    row = {
+        "backend": config.get("backend"),
+        "liger_loss": config.get("liger_loss"),
+        "activation_recompute": config.get("activation_recompute"),
+        "model": config.get("model_name_or_path"),
+        "lora_target": config.get("lora_target"),
+        "offload_modules": config.get("asym_offload_modules"),
+        "strict": config.get("asym_strict"),
+        "qwen_moe_expert_lora_impl": config.get("qwen_moe_expert_lora_impl"),
+        "cpuadam_grad_offload": config.get("asym_cpu_adamw_grad_offload"),
+        "cpuadam_weight_offload": config.get("asym_cpu_adamw_weight_offload"),
+        "expert_policy": config.get("expert_recompute_policy"),
+        "exp_act": config.get("asymm_expert_act_offload"),
+        "attn_act": config.get("asymm_attn_act_offload"),
+        "layer_act": config.get("asymm_layer_act_offload"),
+        "peak_alloc_gib": (mem.get("peak_allocated_hbm_bytes") or 0) / 2**30,
+        "peak_reserved_gib": (mem.get("peak_reserved_hbm_bytes") or 0) / 2**30,
+        "forward_ms": source.get("forward", {}).get("total_milliseconds"),
+        "backward_ms": source.get("backward", {}).get("total_milliseconds"),
+        "e2e_ms": timing.get("measured_e2e_step_milliseconds"),
+        "path": str(path),
+    }
+    for candidate in (
+        path.parent / "memory_breakdown_summary.json",
+        path.parent / "memory_breakdown" / "memory_breakdown_summary.json",
+    ):
+        if candidate.exists():
+            summary = json.loads(candidate.read_text())
+            row["actual_peak_alloc_gib"] = (summary.get("actual_peak_allocated_hbm_bytes") or 0) / 2**30
+            row["actual_peak_reserved_gib"] = (summary.get("actual_peak_reserved_hbm_bytes") or 0) / 2**30
+            row["actual_peak_phase"] = summary.get("actual_peak_phase")
+            break
+    rows.append(row)
+
+for row in sorted(rows, key=lambda r: (str(r["backend"]), str(r["path"]))):
+    print(json.dumps(row, sort_keys=True))
+PY
+```
+
+Final acceptance:
+
+- Final source profile configs must prove the exact knobs used for the verdict:
+  `model_name_or_path=Qwen/Qwen3.5-122B-A10B`, `lora_target=all`,
+  `liger_loss=ligerloss0`,
+  `qwen_moe_expert_lora_impl=split-target-parameters`,
+  `asym_offload_modules=all`, `asym_strict=true`,
+  `asym_cpu_adamw_grad_offload=true`,
+  `asym_cpu_adamw_weight_offload=true`, `lora_rank=64`, `lora_alpha=16`, and
+  `lora_dropout=0.00`.
+- `asym_cpuadamwds|norecomp|ligerloss0` must have lower Qwen3.5 peak HBM than
+  `zero3_offload|recomp|ligerloss0` by at least the global memory rule. Prefer
+  `actual_peak_allocated_hbm_bytes` and `actual_peak_reserved_hbm_bytes` from
+  `memory_breakdown_summary.json`; fall back to `memory.gpu` allocator peaks
+  only if breakdown artifacts are missing.
+- `asym_cpuadamwds|norecomp|ligerloss0` forward, backward, and measured e2e step times must
+  not exceed the global latency threshold versus the first successful or most
+  recent accepted `asym_cpuadamwds|norecomp|ligerloss0` Qwen3.5 profile. If there is only
+  one successful Asym profile by Stage 6, judge it directly against
+  `zero3_offload|recomp|ligerloss0`: it must win memory meaningfully without obviously
+  worse forward/backward/e2e timing.
+- Runtime health must show the intended code paths:
+  - `qwen35_moes_wrapped > 0`
+  - `packed_experts_wrapped`/`qwen3_experts_wrapped` reflects routed expert use
+  - `dense_lora_wrapped` includes shared expert leaves or the shared MLP wrapper
+  - selected `shared_experts`, `router`, `attention`, `embed_tokens`, `lm_head`,
+    and `norms` have no frozen selected CUDA residues
+  - if Stage 2 projection offload was accepted, selected `linear_attention` has
+    no frozen selected CUDA residues and the breakdown has `linear_attention`
+    rows; if Stage 2 projection offload was rejected, the breakdown still has
+    `linear_attention` rows so the rejection is evidence-based
+  - `asym_forward_calls` and `asym_dx_calls` are nonzero
+  - no unexpected reference fallback spikes
+- If final memory is the same as zero3 or only trivially lower, reject the last
+  implemented stage that failed to move the profile. If memory improves but
+  forward/backward latency regresses beyond the threshold, reject the stage that
+  introduced the regression.
+
+Unresolved risks to watch through the final verdict:
+
+- The biggest missing Qwen3.5-specific feature is likely shared MLP activation
+  offload, not routed expert offload. However, the profile peak may be attention,
+  Gated DeltaNet, loss/logits, or optimizer state instead.
+- Qwen3.5 linear-attention layers depend on optional FLA/causal-conv kernels.
+  If those are missing, Transformers/LlamaFactory may fall back to slower and
+  more memory-hungry PyTorch paths, hiding the effect of MoE changes.
+- CPU offload latency is sensitive to pinned memory, NUMA placement, C2C/PCIe
+  topology, and concurrent processes. Compare stages on the same host/GPU with
+  identical `profile3.sh` knobs.

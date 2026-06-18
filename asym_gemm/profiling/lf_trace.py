@@ -43,6 +43,8 @@ def _semantic_module_name(name: str) -> str | None:
         return None
     if name.endswith(".self_attn"):
         return f"layers.{layer}.self_attn"
+    if name.endswith(".linear_attn"):
+        return f"layers.{layer}.linear_attn"
     if name.endswith(".mlp.gate") or name.endswith(".feed_forward.router"):
         return f"layers.{layer}.router"
     if name.endswith(".mlp.experts") or name.endswith(".experts"):
@@ -57,6 +59,8 @@ def _semantic_module_name(name: str) -> str | None:
 def _filter_token(semantic_name: str) -> str:
     if semantic_name.endswith(".self_attn"):
         return "attention"
+    if semantic_name.endswith(".linear_attn"):
+        return "linear_attention"
     if semantic_name.endswith(".mlp.experts"):
         return "experts"
     if semantic_name.endswith(".mlp"):
@@ -68,12 +72,12 @@ def _filter_token(semantic_name: str) -> str:
 class LFTraceConfig:
     level: str = "stage"
     layers: str = "all"
-    module_filter: str = "attention,router,mlp,experts,lora,optimizer"
+    module_filter: str = "attention,linear_attention,router,mlp,experts,lora,optimizer"
     memory_attribution: bool = False
     memory_breakdown: bool = False
     memory_breakdown_interval: int = 1
     memory_breakdown_steps: str = ""
-    memory_breakdown_modules: str = "attention,router,mlp,experts,shared_experts,lora,embedding,embed_tokens,norms,loss"
+    memory_breakdown_modules: str = "attention,linear_attention,router,mlp,experts,shared_experts,lora,embedding,embed_tokens,norms,loss"
     memory_breakdown_output: str = "memory_breakdown"
     external_memory_diagnostics: bool = False
     sync: bool = False
@@ -94,7 +98,7 @@ class LFTraceConfig:
             layers=env.get("ASYM_GEMM_LF_PROFILE_LAYERS", "all").strip().lower(),
             module_filter=env.get(
                 "ASYM_GEMM_LF_PROFILE_MODULE_FILTER",
-                "attention,router,mlp,experts,lora,optimizer",
+                "attention,linear_attention,router,mlp,experts,lora,optimizer",
             ),
             memory_attribution=_parse_bool(env.get("ASYM_GEMM_LF_PROFILE_MEMORY_ATTRIBUTION", "0")),
             memory_breakdown=_parse_bool(env.get("ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN", "0")),
@@ -102,7 +106,7 @@ class LFTraceConfig:
             memory_breakdown_steps=env.get("ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_STEPS", "").strip(),
             memory_breakdown_modules=env.get(
                 "ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_MODULES",
-                "attention,router,mlp,experts,shared_experts,lora,embedding,embed_tokens,norms,loss",
+                "attention,linear_attention,router,mlp,experts,shared_experts,lora,embedding,embed_tokens,norms,loss",
             ),
             memory_breakdown_output=env.get(
                 "ASYM_GEMM_LF_PROFILE_MEMORY_BREAKDOWN_OUTPUT",
@@ -337,6 +341,13 @@ def _is_attention_name(lower: str) -> bool:
     return "self_attn" in lower or any(part in lower for part in ("q_proj", "k_proj", "v_proj", "o_proj"))
 
 
+def _is_linear_attention_name(lower: str) -> bool:
+    if "linear_attn" in lower or "gateddeltanet" in lower:
+        return True
+    gdn_leaves = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+    return any(part in lower for part in gdn_leaves)
+
+
 def _is_shared_expert_name(lower: str) -> bool:
     return "shared_expert" in lower or "shared_experts" in lower
 
@@ -365,7 +376,11 @@ def _component_from_param_name(name: str) -> str:
         pass
 
     lower = name.lower()
+    if _is_linear_attention_name(lower):
+        return "linear_attention"
     if "lora" in lower:
+        if _is_linear_attention_name(lower):
+            return "linear_attention"
         if _is_shared_expert_name(lower):
             return "shared_experts"
         if _is_attention_name(lower):
@@ -413,6 +428,8 @@ def _component_from_module_name(name: str) -> str | None:
         return "router"
     if lower.endswith(".self_attn") or lower.endswith(".attention") or lower.endswith(".self_attention"):
         return "attention"
+    if lower.endswith(".linear_attn") or _is_linear_attention_name(lower):
+        return "linear_attention"
     if _is_shared_expert_name(lower):
         return "shared_experts"
     if _is_routed_expert_name(lower):
@@ -433,6 +450,8 @@ def _component_from_module_name(name: str) -> str | None:
 def _component_filter_token(component: str) -> str:
     if component == "routed_experts":
         return "experts"
+    if component == "linear_attention":
+        return "linear_attention"
     if component == "shared_experts":
         return "shared_experts"
     if component == "mlp_dense":
@@ -460,6 +479,8 @@ def _component_from_range_name(name: str | None) -> str | None:
         return "norms"
     if _is_attention_name(lower):
         return "attention"
+    if _is_linear_attention_name(lower):
+        return "linear_attention"
     if _is_router_name(lower) or ".router" in lower:
         return "router"
     if _is_shared_expert_name(lower):

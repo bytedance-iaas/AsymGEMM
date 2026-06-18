@@ -1,673 +1,723 @@
 # Staged Implementation Plan: Liger Loss-Only Axis
 
-Goal: add a per-job `ligerloss0/ligerloss1` axis for Qwen3-MoE Liger fused linear cross entropy. The axis must work for AsymGEMM and ZeRO-style backends, but it must remain loss-only. Do not encode Liger in backend names. Do not enable Liger experts, SwiGLU, RoPE, RMSNorm, or any default Liger model patch when this profiling path asks for Liger.
+Goal: add a `liger_loss` profiling axis with values `ligerloss0` and `ligerloss1`. `ligerloss1` means Liger fused linear cross entropy only. It must not enable Liger RoPE, RMSNorm, SwiGLU, expert, or other non-loss patches.
 
-Global accept/reject rule:
-- Keep the feature only if full e2e `profile_lora_lf.sh` runs with `PROFILERS=both` show meaningful HBM reduction without timing blowup.
-- Default pass threshold: peak CUDA allocated drops by at least 10 GiB and source-attributed `lm_head`/`loss` memory drops by at least 20 GiB.
-- Reject if median measured step latency is above 1.10x no-Liger baseline, or median forward/backward latency is above 1.15x baseline.
-- Reject same-memory/slower and trivial-memory/slower outcomes.
-- Toy tests prove compatibility only. They are not acceptance evidence for memory or latency.
+Repository layout used by this plan:
+- AsymGEMM root: `/workspace/AsymGEMM-SFT/third_party/AsymGEMM`
+- LlamaFactory sibling: `../LlamaFactory`
+- Liger-Kernel sibling: `../Liger-Kernel`
 
-Canonical naming:
-- `BACKEND_SPECS` is the only sweep input for this axis: `backend|recompute|ligerloss0` or `backend|recompute|ligerloss1`.
-- The third field accepts exactly `ligerloss0` or `ligerloss1`. Do not add aliases like `true`, `1`, `liger`, or `noliger`.
-- The third field is optional only for backward compatibility; missing means `ligerloss0`.
-- Every new per-job output path, run ID, `jobs.tsv` row, profile config, plot row, and comparison row must contain `ligerloss0` or `ligerloss1`.
-- The profile metadata key is exactly `liger_loss`. Do not add duplicate artifact keys such as `enable_liger_kernel`, `liger_enabled`, or `liger_loss_enabled`.
-- `run_lf_lora_sft.sh` uses exactly two runtime env inputs: `ENABLE_LIGER_KERNEL` and `LIGER_LOSS_ONLY`.
-- LF CLI args use LF's existing snake_case convention only: `--enable_liger_kernel` and `--liger_loss_only`.
-- Plot CLIs use the existing plotting kebab-case convention only: `--liger-loss`.
+Hard design decisions:
+- Do not edit `../Liger-Kernel` source. The local Liger package is an external dependency. We may import its public functions/classes, but the compatibility bridge lives in AsymGEMM/LlamaFactory integration code.
+- Use the vendored Liger checkout, not PyPI. Install it editable into the AsymGEMM `.venv` with `--no-deps --no-build-isolation` so pip does not change the existing Torch/Triton/CUDA stack.
+- Do not modify `scripts/lf/profile3.sh` for this Liger work. That script is for the separate Qwen3.5 testing path. The Liger loss-only plan uses `scripts/lf/profile_lora_lf.sh` and shared LF wrapper/profile/plotting interfaces.
+- Keep `lm_head` Asym-wrapped when `ASYM_OFFLOAD_MODULES` selects `lm_head`. The Asym + Liger path must stage the Asym CPU-resident `lm_head` weight explicitly for the fused CE call.
+- Do not make `AsymFrozenLinear.weight` secretly stage to GPU. Direct `.weight` stays CPU host storage. Staging must use an explicit method so other code paths are not surprised.
+- Common script/runtime interfaces are implemented first. Model-specific and Asym-specific behavior is wired only after folder names, metadata, CLI flags, and validation plumbing are stable.
+- Use one user-facing runtime env only: `ENABLE_LIGER_KERNEL`. Do not add `LIGER_LOSS_ONLY` or aliases. Stage 0 maps the profiling axis to this env; Stage 1 makes LlamaFactory resolve it as loss-only for validated model types.
 
-Current codebase facts this plan must preserve:
-- `scripts/lf/profile_lora_lf.sh` currently parses two-field backend specs in `append_backend_spec()` and stores specs as `backend|recompute`.
-- `append_backend_spec()` currently supports `recompute=both` by expanding one backend into `backend|norecomp` and `backend|recomp`; keep this behavior while appending the Liger field.
-- The main sweep loop currently does:
-  - `backend="${backend_recompute%%|*}"`
-  - `recompute="${backend_recompute##*|}"`
-  This must be replaced with explicit three-field parsing. Otherwise `recompute` becomes `ligerloss1`.
-- `PROFILERS=both` is already implemented as one Nsight run plus materialized source artifacts. With no `OUTPUT_ROOT`, it writes under `${ASYM_DIR}/profiling_both`; otherwise it uses the supplied `OUTPUT_ROOT`.
-- `job_root_path()` currently includes backend, profiler, recompute, policy, router, `expact`, `attnact`, `layeract`, `loraafwd`, `actrecomp`, `xunpack`, and CPUAdam offload suffixes. Add `ligerloss0/1` without removing those axes.
-- `run_lf_lora_sft.sh` accepts no command-line args. It is controlled through env vars and builds LF CLI args internally.
-- `run_lf_profiled_train.py::_config_from_args()` already imports `ASYM_GEMM_LF_CONFIG_*` env vars into the profile config. Add an explicit `liger_loss` config entry anyway so missing metadata is easy to catch.
-- The three plotting scripts currently reject unknown path-tail tokens unless they are parsed or listed as optional axes. `ligerloss0/1` must be parsed as a real axis, not silently ignored.
+Canonical interface:
+- Sweep axis: `BACKEND_SPECS=backend|recompute|ligerloss0_or_ligerloss1`.
+- Accepted third-field values are exactly `ligerloss0` and `ligerloss1`.
+- Missing third field is backward-compatible input and means `ligerloss0`, but every new output folder must still include `__ligerloss0`.
+- Artifact metadata key is exactly `liger_loss`.
+- Plot CLI flag is exactly `--liger-loss`.
+- Runtime env input is exactly `ENABLE_LIGER_KERNEL`.
+- Derived metadata env is `ASYM_GEMM_LF_CONFIG_LIGER_LOSS`; scripts set it from the selected axis. Users do not set it directly.
+- `run_lf_lora_sft.sh` derives LF loss-only behavior from `ENABLE_LIGER_KERNEL`:
+  - `ligerloss0` -> `ENABLE_LIGER_KERNEL=false`, `--enable_liger_kernel false`
+  - `ligerloss1` -> `ENABLE_LIGER_KERNEL=true`, `--enable_liger_kernel true`
 
-Checked Liger/LF facts:
-- LF applies Liger before model load in `third_party/LlamaFactory/src/llamafactory/model/loader.py::load_model`.
-- Local LF currently calls Liger with default kwargs for SFT, which can enable non-loss patches.
-- Local Liger Qwen3-MoE exposes `fused_linear_cross_entropy`, `cross_entropy`, `rope`, `rms_norm`, and `swiglu`.
-- Local Liger `apply_liger_kernel_to_qwen3_moe()` can patch only fused linear CE if called with `fused_linear_cross_entropy=True` and all other boolean patch flags false.
-- With Transformers v5, default Liger Qwen3-MoE `swiglu=True` replaces `Qwen3MoeExperts` with `LigerExperts`; that must not happen for AsymGEMM.
-- Upstream Liger supports source install with `pip install -e .`; use `--no-deps` here so pip cannot alter torch/triton. Sources: https://github.com/linkedin/Liger-Kernel and https://github.com/linkedin/Liger-Kernel/blob/main/src/liger_kernel/transformers/monkey_patch.py
+Acceptance rule:
+- Toy/unit tests only prove plumbing and compatibility. They do not justify keeping the feature.
+- Keep `ligerloss1` for a backend only if full e2e `PROFILERS=both` LoRA profiling shows meaningful memory reduction without timing blowup.
+- Default acceptance thresholds:
+  - peak CUDA allocated drops by at least 10 GiB
+  - source-attributed `lm_head`/`loss` HBM drops by at least 20 GiB
+  - median measured step latency <= 1.10x `ligerloss0`
+  - median forward latency <= 1.15x `ligerloss0`
+  - median backward latency <= 1.15x `ligerloss0`
+- Reject same-memory/slower results, trivial-memory/slower results, and any result that adds many tiny GEMMs or per-expert launch loops.
 
-## Stage 0: Dependency And Current Baseline
+Resolved facts:
+- The common profiling script must normalize every backend spec to three fields before any real `ligerloss1` run.
+- Plot parsers must parse `ligerloss0/1` as real metadata, not hide it as an optional/ignored token.
+- `../Liger-Kernel/src/liger_kernel/transformers/monkey_patch.py::apply_liger_kernel_to_qwen3_moe()` exposes `rope`, `cross_entropy`, `fused_linear_cross_entropy`, `rms_norm`, `swiglu`, and `model`; default Liger Qwen3-MoE patching enables non-loss pieces unless we force loss-only kwargs.
+- Local Liger also exposes `apply_liger_kernel_to_qwen3_5()` and `apply_liger_kernel_to_qwen3_5_moe()`, both with `fused_linear_cross_entropy`, but those model types remain out of scope for this Qwen3-MoE loss-only implementation. Do not enable them from this plan.
+- Current Qwen3.5/common-profiling changes add `linear_attention` classification/default filters and strict-mode metadata. Treat those as existing profiling-surface requirements; do not mix them with Liger runtime changes.
+- Liger Qwen3-MoE loss forward passes `lm_head_weight=self.lm_head.weight`. That works with normal HF/DeepSpeed-managed parameters, but not with Asym offloaded `lm_head` because `AsymFrozenLinear.weight` is CPU host storage.
+- AsymGEMM and DeepSpeed ZeRO3 are mutually exclusive in LlamaFactory. `asym_cpuadamwds` only uses DeepSpeed CPUAdamW optimizer pieces, not ZeRO3 parameter offload.
+- LlamaFactory `lora_target=all` excludes `lm_head`, and AsymGEMM already rejects `additional_target`. First implementation can require frozen `lm_head`.
+- Kernel smoke test completed locally with `PYTHONPATH=/workspace/AsymGEMM-SFT/third_party/Liger-Kernel/src`: CUDA was visible, `LigerForCausalLMLoss` ran on GPU 3 in BF16, matched torch CE within about `0.0014`, and produced finite hidden/weight gradients.
 
-Files/functions/classes:
-- No production code changes.
-- Read/verify:
-  - `third_party/Liger-Kernel/setup.py`
-  - `third_party/Liger-Kernel/src/liger_kernel/transformers/monkey_patch.py`
-  - `third_party/Liger-Kernel/src/liger_kernel/transformers/model/qwen3_moe.py`
-  - `third_party/LlamaFactory/src/llamafactory/model/model_utils/liger_kernel.py`
-
-Implementation steps:
-- Install the vendored Liger checkout into the exact venv used by the LF scripts.
-- Use `--no-deps`; dependency churn invalidates profiling.
-- Run an optional pre-change baseline with the current two-field `BACKEND_SPECS` format. Do not expect `ligerloss0` in this pre-change path because the current script cannot parse the third field yet.
-- Treat this baseline as a sanity check only. Final acceptance must use the post-Stage-2 axis paths.
-
-Commands:
+Environment setup:
+- The current AsymGEMM `.venv` must be able to import the local vendored Liger package before any `ligerloss1` run.
+- Current local state before installation: `.venv/bin/python -c "import liger_kernel"` fails with `ModuleNotFoundError`. `PYTHONPATH=../Liger-Kernel/src` is fine for API/kernel smoke tests, but e2e profiling should use the editable install below.
+- Recommended install command:
 
 ```bash
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python - <<'PY'
-from packaging.version import Version
-import torch
-import triton
+cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
+.venv/bin/python -m pip install \
+  --no-deps \
+  --no-build-isolation \
+  -e /workspace/AsymGEMM-SFT/third_party/Liger-Kernel
+```
 
-assert Version(torch.__version__.split("+")[0]) >= Version("2.1.2"), torch.__version__
-assert Version(triton.__version__) >= Version("2.3.1"), triton.__version__
-print("torch", torch.__version__, "cuda", torch.version.cuda)
-print("triton", triton.__version__)
-PY
+- Do not use `pip install liger-kernel` for this workflow unless intentionally switching away from the vendored source.
+- Do not install with dependencies enabled; the existing profiling venv already owns the Torch/Triton/CUDA versions.
+- Verify the install with:
 
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python \
-  -m pip install --no-deps -e /home/kevinni/AsymGEMM-SFT/third_party/Liger-Kernel
-
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python - <<'PY'
-import inspect
-from importlib.metadata import version
+```bash
+.venv/bin/python - <<'PY'
+import liger_kernel
 from liger_kernel.transformers import apply_liger_kernel_to_qwen3_moe
-
-print("liger-kernel", version("liger-kernel"))
-sig = inspect.signature(apply_liger_kernel_to_qwen3_moe)
-required = {"fused_linear_cross_entropy", "cross_entropy", "rope", "rms_norm", "swiglu"}
-assert not (required - set(sig.parameters)), sig
-print(sig)
+print(liger_kernel.__file__)
+print(apply_liger_kernel_to_qwen3_moe)
 PY
-
-OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/profiling_liger_prechange_baseline \
-RUN_NAME=qwen3_asym_prechange_baseline \
-MODEL_SPECS='Qwen/Qwen3-30B-A3B|1' \
-BACKEND_SPECS='asym_cpuadamwds|norecomp' \
-PROFILERS=both \
-GPU_POOL=3 \
-WARMUP_STEPS=5 \
-MAX_STEPS=5 \
-OVERWRITE=true \
-bash /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh
 ```
 
-Validation before Stage 1:
-- Liger import/version/signature check passes in `${ASYM_DIR}/.venv`.
-- Optional pre-change baseline completes and produces `profile.json`, `summary.md`, source-memory artifacts, and Nsight artifacts.
-- Train log confirms Qwen3-MoE modules were wrapped by AsymGEMM.
-- Record baseline peak allocated/reserved, `lm_head`/`loss` source memory, forward median, backward median, and step median.
+## Stage 0: Common Interfaces, Scripts, Artifact Axis, And `ligerloss0` Migration
 
-Risks to watch:
-- First Liger/Triton use can include compile overhead. Acceptance timing must use measured post-warmup steps only.
-- Pre-change artifacts do not have the `liger_loss` axis and must not be mixed with final acceptance artifacts.
+Purpose: update all shared user-facing and artifact-facing interfaces before changing model math. This stage owns backend-spec parsing, runtime env mapping, LF script command construction, profile metadata, postprocessing, plotting, and migration. Every no-Liger run becomes explicit as `ligerloss0`.
 
-## Stage 1: LF Loss-Only Resolver
-
-Files/functions/classes:
-- Modify `third_party/LlamaFactory/src/llamafactory/hparams/model_args.py`
-  - Add `liger_loss_only: bool = False`.
-- Modify `third_party/LlamaFactory/src/llamafactory/model/model_utils/liger_kernel.py`
-  - `apply_liger_kernel(config, model_args, is_trainable, require_logits)`
-  - add `LigerApplySpec`
-  - add `_LIGER_APPLY_SPECS`
-  - add `_resolve_liger_apply(model_type)`
-  - add `_build_liger_loss_only_kwargs(apply_fn)`
-- Add `tests/lf/test_liger_loss_only_qwen3_moe.py`
-  - `test_qwen3_moe_loss_only_kwargs_disable_non_loss_patches`
-  - `test_asym_liger_skips_unvalidated_model_type`
-  - `test_zero3_liger_loss_only_uses_same_loss_patch`
-  - `test_qwen3_moe_loss_only_preserves_hf_experts_for_asym_wrap`
-  - `test_qwen3_moe_loss_only_cuda_forward_backward`
-
-Implementation steps:
-- Preserve current non-loss-only Liger behavior for users outside this profiling path.
-- Add the explicit `liger_loss_only` LF model arg so ZeRO-3 can use the same loss-only path as AsymGEMM.
-- Treat `model_args.use_asym_gemm=True` as requiring loss-only behavior whenever Liger is enabled.
-- When loss-only is active, call the model-specific Liger apply function with `fused_linear_cross_entropy=True` and every other boolean patch option set to `False`.
-- Initially mark only `qwen3_moe` as validated for loss-only Liger.
-- Skip loss-only Liger if `require_logits=True`.
-- Skip loss-only Liger for unvalidated model types such as `llama4`/`llama4_text`.
-
-Pseudocode:
-
-```python
-@dataclass(frozen=True)
-class LigerApplySpec:
-    model_types: tuple[str, ...]
-    import_name: str
-    loss_only_supported: bool = False
-
-
-_LIGER_APPLY_SPECS = (
-    LigerApplySpec(("qwen3_moe",), "apply_liger_kernel_to_qwen3_moe", loss_only_supported=True),
-    LigerApplySpec(("qwen3",), "apply_liger_kernel_to_qwen3"),
-    LigerApplySpec(("qwen3_next",), "apply_liger_kernel_to_qwen3_next"),
-    LigerApplySpec(("qwen3_5",), "apply_liger_kernel_to_qwen3_5"),
-    # Preserve existing local mappings: gemma, llama, mistral, mixtral, phi3, etc.
-)
-
-
-def _build_liger_loss_only_kwargs(apply_fn):
-    sig = inspect.signature(apply_fn)
-    if "fused_linear_cross_entropy" not in sig.parameters:
-        return None
-
-    kwargs = {}
-    for name, param in sig.parameters.items():
-        if name == "model":
-            continue
-        if name == "fused_linear_cross_entropy":
-            kwargs[name] = True
-        elif isinstance(param.default, bool):
-            kwargs[name] = False
-    if "cross_entropy" in sig.parameters:
-        kwargs["cross_entropy"] = False
-    return kwargs
-
-
-def apply_liger_kernel(config, model_args, is_trainable, require_logits):
-    if not is_trainable or not model_args.enable_liger_kernel:
-        return
-
-    apply_fn, spec = _resolve_liger_apply(getattr(config, "model_type", None))
-    if apply_fn is None:
-        logger.warning_rank0("Current model does not support liger kernel.")
-        return
-
-    loss_only = bool(getattr(model_args, "liger_loss_only", False) or getattr(model_args, "use_asym_gemm", False))
-    if loss_only:
-        if require_logits:
-            logger.warning_rank0("Skipping Liger loss-only because logits are required.")
-            return
-        if spec is None or not spec.loss_only_supported:
-            logger.warning_rank0("Skipping Liger loss-only: model type is not validated.")
-            return
-        kwargs = _build_liger_loss_only_kwargs(apply_fn)
-        if kwargs is None:
-            logger.warning_rank0("Skipping Liger loss-only: fused CE is unavailable.")
-            return
-        apply_fn(**kwargs)
-        logger.info_rank0("Liger loss-only kernel has been applied.")
-        return
-
-    # Existing non-loss-only behavior.
-    if require_logits and "fused_linear_cross_entropy" in inspect.signature(apply_fn).parameters:
-        apply_fn(fused_linear_cross_entropy=False, cross_entropy=True)
-    else:
-        apply_fn()
-```
-
-Validation before Stage 2:
-
-```bash
-PYTHONPATH=/home/kevinni/AsymGEMM-SFT/third_party/LlamaFactory/src:/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM \
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python \
-  -m pytest /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/tests/lf/test_liger_loss_only_qwen3_moe.py -q
-```
-
-Required evidence:
-- Qwen3-MoE loss-only kwargs are exactly loss-only: `fused_linear_cross_entropy=True`; `cross_entropy/rope/rms_norm/swiglu=False`.
-- The same loss-only kwargs are used when `use_asym_gemm=True` and when `liger_loss_only=True` for a non-Asym ZeRO-style job.
-- `llama4_text` or another unvalidated model type is skipped in loss-only mode.
-- With Qwen3-MoE, Liger patches only the causal-LM forward; HF `Qwen3MoeExperts` remains recognizable.
-- AsymGEMM still wraps the MoE block as `AsymQwen3MoeBlock`.
-- Tiny CUDA forward/backward produces finite loss, `outputs.logits is None`, and expected LoRA grads exist.
-
-Risks to watch:
-- Liger monkey-patches global classes. Tests that compare patched/unpatched behavior must run in fresh Python subprocesses.
-- Future Liger versions may add new boolean patch toggles. `_build_liger_loss_only_kwargs` must keep disabling all boolean toggles except `fused_linear_cross_entropy`.
-
-## Stage 2: Run/Profile Path, Metadata, And Plot Axis
-
-Files/functions/classes:
-- Modify `scripts/lf/run_lf_lora_sft.sh`
-  - user/env defaults: add `ENABLE_LIGER_KERNEL=${ENABLE_LIGER_KERNEL:-false}` and `LIGER_LOSS_ONLY=${LIGER_LOSS_ONLY:-false}`
-  - bool normalization block near the other user params
-  - `DEFAULT_RUN_ID` construction
-  - `CMD_ARGS`
-  - logging block
-  - `RUN_ENV`
-  - profile env block that emits `ASYM_GEMM_LF_CONFIG_*`
+Scope:
 - Modify `scripts/lf/profile_lora_lf.sh`
-  - usage text and path examples
+  - usage text and examples
   - `append_backend_spec()`
-  - backend-spec normalization around `backend_specs_raw`, `backend_specs`, `backends`, and `recompute_modes`
-  - new `liger_loss_modes` array for plot filters
+  - backend-spec normalization arrays
   - `job_root_path()`
-  - `kt_arm_matching_source_profile_json_candidates()` only as needed to pass/default the new argument
+  - KT source-profile matching helpers
   - `ensure_jobs_tsv()`
   - `append_job_record()`
   - `job_profile_complete()`
   - `existing_profile_complete()`
-  - `append_sweep_plot_filters()`
-  - `memory_plot_filters()`
-  - `interconnect_plot_filters()`
+  - plot-filter helpers
   - `run_job()`
-  - main sweep loop that currently parses `backend_recompute`
+  - the main nested loop over backend specs
+- Modify `scripts/lf/run_lf_lora_sft.sh`
+  - env default for `ENABLE_LIGER_KERNEL`
+  - boolean normalization
+  - `DEFAULT_RUN_ID`
+  - `CMD_ARGS`
+  - log block
+  - `RUN_ENV`
 - Modify `scripts/lf/run_lf_profiled_train.py`
   - `_config_from_args()`
 - Modify plotting scripts:
   - `scripts/plotting/plot_activation_recompute_sweep.py`
   - `scripts/plotting/plot_lf_memory_breakdown.py`
   - `scripts/plotting/plot_lf_interconnect_ctc.py`
-- Modify tests:
+- Add `scripts/lf/migrate_liger_loss_axis.py`
+- Extend tests:
+  - `tests/lf/test_superoffload_backend_scripts.py`
   - `tests/lf/test_asym_cpu_adamw_args.py`
-  - add `tests/lf/test_liger_loss_plot_axes.py`
 
-Implementation steps:
-- Keep backend labels unchanged. Liger is not a backend.
-- Extend `BACKEND_SPECS` from `backend|recompute` to `backend|recompute|ligerloss`.
-- Missing third field normalizes to `ligerloss0`, but all new output paths still include `__ligerloss0`.
-- Keep `recompute=both` expansion:
-  - `asym_cpuadamwds|both` becomes `asym_cpuadamwds|norecomp|ligerloss0` and `asym_cpuadamwds|recomp|ligerloss0`.
-  - `asym_cpuadamwds|both|ligerloss1` becomes `asym_cpuadamwds|norecomp|ligerloss1` and `asym_cpuadamwds|recomp|ligerloss1`.
-- Add `ligerloss0/1` to both the Nsight job folder and the materialized source sibling folder when `PROFILERS=both`.
-- Generated profile configs must contain `config["liger_loss"]`.
-- New plot output must keep `ligerloss0` and `ligerloss1` as separate series/groups. Do not collapse them into the same plot row.
+Actual code changes:
+- Add `liger_loss_label()` in `profile_lora_lf.sh` next to existing label helpers.
+- Change `append_backend_spec()` to accept exactly two or three fields. The third field must validate as `ligerloss0` or `ligerloss1`; missing means `ligerloss0`.
+- Normalize every backend spec internally to exactly `backend|recompute|ligerloss`.
+- Preserve `recompute=both` expansion:
+  - `asym_cpuadamwds|both` -> `asym_cpuadamwds|norecomp|ligerloss0`, `asym_cpuadamwds|recomp|ligerloss0`
+  - `asym_cpuadamwds|both|ligerloss1` -> `asym_cpuadamwds|norecomp|ligerloss1`, `asym_cpuadamwds|recomp|ligerloss1`
+- Replace all two-field splits with explicit three-field parsing.
+- Change `job_root_path()` signature to:
+  - `job_root_path config_root backend profiler recompute expert_policy router_mode liger_loss grad_offload weight_offload`
+- Insert the Liger token before CPUAdam suffixes:
+  - no CPUAdam suffix: `...__xunpack0__ligerloss0`
+  - CPUAdam suffix: `...__xunpack0__ligerloss0__gradofftrue__weightofffalse`
+- Add `_ligerloss0/1` to `run_id`.
+- Add exactly one `jobs.tsv` column: `liger_loss`, immediately after `profiler`.
+- In `profile_lora_lf.sh::run_job()`:
+  - validate `liger_loss`
+  - map `ligerloss0` to `ENABLE_LIGER_KERNEL=false`
+  - map `ligerloss1` to `ENABLE_LIGER_KERNEL=true`
+  - pass the same value to both `nsys` and materialized `source` runs
+  - include `ENABLE_LIGER_KERNEL` and `ASYM_GEMM_LF_CONFIG_LIGER_LOSS` in dry-run command/status artifacts
+- In `run_lf_lora_sft.sh`, add and normalize:
+  - `ENABLE_LIGER_KERNEL=${ENABLE_LIGER_KERNEL:-false}`
+  - derive `LIGER_LOSS_TAG=ligerloss1` when true, else `ligerloss0`
+  - append `${LIGER_LOSS_TAG}` to KT and non-KT `DEFAULT_RUN_ID`
+  - add `--enable_liger_kernel "${ENABLE_LIGER_KERNEL}"` to `CMD_ARGS`
+  - add `ENABLE_LIGER_KERNEL` and `ASYM_GEMM_LF_CONFIG_LIGER_LOSS="${LIGER_LOSS_TAG}"` to `RUN_ENV`
+  - log `ENABLE_LIGER_KERNEL` and `LIGER_LOSS_TAG`
+- Completion checks must reject mismatched metadata. `existing_profile_complete()` and `job_profile_complete()` need expected `liger_loss` arguments and must compare against `profile.config.liger_loss` or nested `source_profile.config.liger_loss`.
+- Plot scripts must parse `ligerloss0/1` as metadata, add `--liger-loss`, filter by it, and include it in CSV/index/JSON rows, labels, grouping keys, and group output directory names.
+- `run_lf_profiled_train.py::_config_from_args()` must read `ASYM_GEMM_LF_CONFIG_LIGER_LOSS`, default missing to `ligerloss0`, reject other values, and write `config["liger_loss"]`.
+- The migration script must rename legacy job dirs to include `__ligerloss0`, update `jobs.tsv`, update profile/source/memory JSON metadata, refuse overwrites, and write `liger_loss_migration.json`.
 
-`profile_lora_lf.sh` pseudocode:
+Pseudocode:
 
 ```bash
 liger_loss_label() {
   case "${1}" in
     ligerloss0|ligerloss1) printf '%s\n' "${1}" ;;
-    *) die "liger loss field must be exactly ligerloss0 or ligerloss1, got '${1}'" ;;
+    *) die "liger loss must be exactly ligerloss0 or ligerloss1, got '${1}'" ;;
   esac
 }
 
 append_backend_spec() {
-  local raw="$1"
-  local backend_part recompute_part liger_part backend recompute_token recompute_mode liger_loss
+  local raw="$1" backend recompute_token recompute_mode liger_loss
   local -a fields recompute_tokens
-
   IFS='|' read -r -a fields <<< "${raw}"
   ((${#fields[@]} == 2 || ${#fields[@]} == 3)) ||
-    die "backend spec must be backend|recompute or backend|recompute|ligerloss0/1, got '${raw}'"
+    die "backend spec must be backend|recompute or backend|recompute|ligerloss0/1"
 
-  backend_part="${fields[0]}"
-  recompute_part="${fields[1]}"
-  liger_part="${fields[2]:-ligerloss0}"
+  backend="$(backend_label "${fields[0]}")"
+  liger_loss="$(liger_loss_label "${fields[2]:-ligerloss0}")"
+  mapfile -t recompute_tokens < <(tokens "${fields[1]}")
 
-  backend="$(backend_label "${backend_part}")"
-  liger_loss="$(liger_loss_label "${liger_part}")"
-
-  mapfile -t recompute_tokens < <(tokens "${recompute_part}")
-  ((${#recompute_tokens[@]} > 0)) || die "empty recompute mode in backend spec '${raw}'"
   for recompute_token in "${recompute_tokens[@]}"; do
     if [[ "${recompute_token,,}" == "both" ]]; then
       backend_specs_raw+=("${backend}|norecomp|${liger_loss}" "${backend}|recomp|${liger_loss}")
-      continue
+    else
+      recompute_mode="$(recompute_label "${recompute_token}")"
+      backend_specs_raw+=("${backend}|${recompute_mode}|${liger_loss}")
     fi
-    recompute_mode="$(recompute_label "${recompute_token}")"
-    backend_specs_raw+=("${backend}|${recompute_mode}|${liger_loss}")
   done
-}
-
-mapfile -t backends < <(printf '%s\n' "${backend_specs[@]}" | cut -d '|' -f1 | dedupe)
-mapfile -t recompute_modes < <(printf '%s\n' "${backend_specs[@]}" | cut -d '|' -f2 | dedupe)
-mapfile -t liger_loss_modes < <(printf '%s\n' "${backend_specs[@]}" | cut -d '|' -f3 | dedupe)
-
-append_liger_loss_filters() {
-  local -n _cmd_ref="$1"
-  local liger_loss
-  for liger_loss in "${liger_loss_modes[@]}"; do
-    _cmd_ref+=(--liger-loss "${liger_loss}")
-  done
-}
-
-job_root_path() {
-  local config_root="$1"
-  local backend="$2"
-  local profiler="$3"
-  local recompute="$4"
-  local expert_policy="$5"
-  local router_mode="$6"
-  local grad_offload="${7:-false}"
-  local weight_offload="${8:-false}"
-  local liger_loss="${9:-ligerloss0}"
-  local grad_offload_suffix=""
-  if cpuadam_backend_for_label "${backend}" >/dev/null; then
-    grad_offload_suffix="__gradoff${grad_offload}__weightoff${weight_offload}"
-  fi
-  printf '%s/%s\n' "${config_root}" "$(safe_label \
-    "${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__${expact_lora_a_fwd_label}__${actrecomp_label}__${xunpack_label}__${liger_loss}${grad_offload_suffix}")"
-}
-
-run_job() {
-  local backend="$1"
-  local profiler="$2"
-  local recompute="$3"
-  local seq_len="$4"
-  local gpu="$5"
-  local gpu_count="$6"
-  local expert_policy="$7"
-  local router_mode="$8"
-  local dataset_name="$9"
-  local lf_expert_lora_impl="${10}"
-  local grad_offload="${11:-false}"
-  local weight_offload="${12:-false}"
-  local liger_loss="${13:-ligerloss0}"
-  local job_enable_liger_kernel=false
-
-  [[ "${liger_loss}" == "ligerloss1" ]] && job_enable_liger_kernel=true
-
-  job_root="$(job_root_path "${config_root}" "${backend}" "${run_profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${grad_offload}" "${weight_offload}" "${liger_loss}")"
-  source_materialized_job_root="$(job_root_path "${config_root}" "${backend}" source "${recompute}" "${expert_policy}" "${router_mode}" "${grad_offload}" "${weight_offload}" "${liger_loss}")"
-  run_id="lf_${backend}_${run_profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${expact_lora_a_fwd_label}_${actrecomp_label}_${xunpack_label}_${liger_loss}${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${lora_dropout_label_value}"
-
-  run_env+=(
-    ENABLE_LIGER_KERNEL="${job_enable_liger_kernel}"
-    LIGER_LOSS_ONLY="${job_enable_liger_kernel}"
-    ASYM_GEMM_LF_CONFIG_LIGER_LOSS="${liger_loss}"
-  )
 }
 
 for backend_spec in "${backend_specs[@]}"; do
-  IFS='|' read -r backend recompute liger_loss <<< "${backend_spec}"
-  [[ -n "${backend}" && -n "${recompute}" && -n "${liger_loss}" ]] || die "internal backend spec is malformed: ${backend_spec}"
-  ...
-  run_job "${backend}" "${profiler}" "${recompute}" "${seq_len}" "${gpu}" "${gpu_count}" \
-    "${expert_policy}" "${job_router_mode}" "${current_dataset}" "${lf_expert_lora_impl}" \
-    "${grad_offload}" "${weight_offload}" "${liger_loss}"
+  IFS='|' read -r backend recompute liger_loss extra <<< "${backend_spec}"
+  [[ -n "${backend}" && -n "${recompute}" && -n "${liger_loss}" && -z "${extra}" ]] ||
+    die "internal backend spec is malformed: ${backend_spec}"
+  run_job "${backend}" "${profiler}" "${recompute}" "${liger_loss}" ...
 done
-```
 
-`jobs.tsv` and profile-completeness changes:
+case "${ENABLE_LIGER_KERNEL,,}" in
+  1|true|yes|y|on) ENABLE_LIGER_KERNEL=true ;;
+  0|false|no|n|off) ENABLE_LIGER_KERNEL=false ;;
+  *) echo "ENABLE_LIGER_KERNEL must be true or false, got '${ENABLE_LIGER_KERNEL}'" >&2; exit 2 ;;
+esac
 
-```bash
-ensure_jobs_tsv() {
-  printf 'status\tgpu\tseq_len\tbatch_size\tgradient_accumulation_steps\trecompute\texpert_policy\trouter_mode\tbackend\tprofiler\tliger_loss\tgrad_offload\tjob_dir\tprofile_json\tlog\tqwen_expert_lora_impl\texpert_lora_a_fwd\n'
-}
-
-append_job_record ... "${backend}" "${run_profiler}" "${liger_loss}" "${grad_offload}" ...
-
-job_profile_complete ... "${expected_grad_offload}" "${expected_liger_loss}" "${profile_memory_breakdown}"
-existing_profile_complete ... "${expected_grad_offload}" "${expected_liger_loss}"
-```
-
-Inside the Python check in `existing_profile_complete()`, require:
-
-```python
-expected_liger_loss = sys.argv[24] if len(sys.argv) > 24 else "ligerloss0"
-actual_liger_loss = str(config.get("liger_loss") or "")
-if actual_liger_loss != expected_liger_loss:
-    raise SystemExit(
-        f"profile liger_loss mismatch: expected {expected_liger_loss}, got {actual_liger_loss or '<missing>'}"
-    )
-```
-
-`run_lf_lora_sft.sh` pseudocode:
-
-```bash
-ENABLE_LIGER_KERNEL=${ENABLE_LIGER_KERNEL:-false}
-LIGER_LOSS_ONLY=${LIGER_LOSS_ONLY:-false}
-
-ENABLE_LIGER_KERNEL="$(bool_string ENABLE_LIGER_KERNEL "${ENABLE_LIGER_KERNEL}")"
-LIGER_LOSS_ONLY="$(bool_string LIGER_LOSS_ONLY "${LIGER_LOSS_ONLY}")"
-if [[ "${ENABLE_LIGER_KERNEL}" == "true" && "${LIGER_LOSS_ONLY}" != "true" ]]; then
-  echo "ENABLE_LIGER_KERNEL=true requires LIGER_LOSS_ONLY=true in this profiling script" >&2
-  exit 2
-fi
 if [[ "${ENABLE_LIGER_KERNEL}" == "true" ]]; then
   LIGER_LOSS_TAG=ligerloss1
 else
   LIGER_LOSS_TAG=ligerloss0
 fi
 
-DEFAULT_RUN_ID="..._${LIGER_LOSS_TAG}_..."
-
-CMD_ARGS+=(
-  --enable_liger_kernel "${ENABLE_LIGER_KERNEL}"
-  --liger_loss_only "${LIGER_LOSS_ONLY}"
-)
-
-log_kv ENABLE_LIGER_KERNEL "${ENABLE_LIGER_KERNEL}"
-log_kv LIGER_LOSS_ONLY "${LIGER_LOSS_ONLY}"
-log_kv LIGER_LOSS "${LIGER_LOSS_TAG}"
-
-RUN_ENV+=(
-  ASYM_GEMM_LF_CONFIG_LIGER_LOSS="${LIGER_LOSS_TAG}"
-)
+CMD_ARGS+=(--enable_liger_kernel "${ENABLE_LIGER_KERNEL}")
+RUN_ENV+=(ASYM_GEMM_LF_CONFIG_LIGER_LOSS="${LIGER_LOSS_TAG}")
 ```
 
-`run_lf_profiled_train.py` pseudocode:
-
-```python
-liger_loss = os.environ.get("ASYM_GEMM_LF_CONFIG_LIGER_LOSS", "ligerloss0")
-if liger_loss not in {"ligerloss0", "ligerloss1"}:
-    raise ValueError(f"invalid ASYM_GEMM_LF_CONFIG_LIGER_LOSS: {liger_loss!r}")
-
-config = {
-    ...
-    "liger_loss": liger_loss,
-    ...
-}
-```
-
-Plotting pseudocode for all three plotting scripts:
-
-```python
-parser.add_argument("--liger-loss", action="append", default=[], choices=["ligerloss0", "ligerloss1"])
-
-def parse_liger_loss_part(part: str) -> str | None:
-    value = part.strip().lower()
-    if value in {"ligerloss0", "ligerloss1"}:
-        return value
-    return None
-
-def parse_job_dir_parts(job_dir_name):
-    ...
-    liger_loss = "ligerloss0"
-    for part in tail:
-        parsed_liger_loss = parse_liger_loss_part(part)
-        if parsed_liger_loss is not None:
-            liger_loss = parsed_liger_loss
-            continue
-        ...
-    return {
-        ...
-        "liger_loss": liger_loss,
-    }
-
-def matches_filters(record_or_meta, args):
-    if args.liger_loss and metadata.get("liger_loss", "ligerloss0") not in set(args.liger_loss):
-        return False
-```
-
-Add `liger_loss` to:
-- `plot_activation_recompute_sweep.py`
-  - `row_from_result_dir()`
-  - `passes_filters()`
-  - `trainable_surface_comparison_key()`
-  - `group_key()`
-  - `threshold_group_key()`
-  - `comparison_key_fields()`
-  - `threshold_comparison_key_fields()`
-  - `combined_label()`
-  - `combined_threshold_label()`
-  - group output directory names and group plot title suffixes
-- `plot_lf_memory_breakdown.py`
-  - `SUMMARY_FIELDS`, `DETAIL_FIELDS`, and any index field list
-  - `_metadata_label()`
-  - `_infer_metadata()`
-  - `_matches_filters()`
-  - `_group_label()`
-- `plot_lf_interconnect_ctc.py`
-  - `SUMMARY_FIELDS`, `STEP_FIELDS`, `INDEX_FIELDS`
-  - `RunRecord.label`
-  - `_infer_metadata()`
-  - `_matches_filters()`
-  - `_sort_key()`
-  - `_group_label()`
-
-Validation before Stage 3:
+Validation before Stage 1:
 
 ```bash
-PYTHONPATH=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM \
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python \
-  -m pytest /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/tests/lf/test_asym_cpu_adamw_args.py -q -k 'liger'
+.venv/bin/python -m pytest \
+  tests/lf/test_asym_cpu_adamw_args.py \
+  -q
 
-PYTHONPATH=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM \
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python \
-  -m pytest /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/tests/lf/test_liger_loss_plot_axes.py -q
+.venv/bin/python -m pytest \
+  tests/lf/test_superoffload_backend_scripts.py \
+  -q -k 'profile_lora_lf or uses_deepspeed_for_single_gpu_zero3_offload or uses_deepspeed_for_single_gpu_superoffload'
+```
 
-OUTPUT_ROOT=/tmp/asym_liger_axis_dryrun \
+```bash
+OUT=/tmp/asym_liger_axis_dryrun
+LOG=/tmp/asym_liger_axis_dryrun.log
+rm -rf "${OUT}" "${LOG}"
+OUTPUT_ROOT="${OUT}" \
 RUN_NAME=qwen3_liger_axis_dryrun \
+MODEL_SPECS='Qwen/Qwen3-30B-A3B|1' \
+BACKEND_SPECS='asym_cpuadamwds|norecomp,zero3_offload|recomp' \
+PROFILERS=both \
+GPU_POOL=3 \
+WORKLOADS='128|1|1' \
+WARMUP_STEPS=0 \
+MAX_STEPS=1 \
+DRY_RUN=true \
+PLOT=false \
+PLOT_MEMORY_BREAKDOWN=false \
+PREPARE_DATASETS=false \
+ASYMM_EXP_ACT_POLICIES='none|false|false|false' \
+ASYM_CPU_ADAMW_GRAD_OFFLOAD=false \
+ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false \
+bash scripts/lf/profile_lora_lf.sh 2>&1 | tee "${LOG}"
+
+rg '__ligerloss0' "${LOG}"
+! rg '__source__.*__ligerloss1|__nsys__.*__ligerloss1' "${LOG}"
+```
+
+Four-way common-interface dry run:
+
+```bash
+OUT=/tmp/asym_liger_axis_fourway
+LOG=/tmp/asym_liger_axis_fourway.log
+rm -rf "${OUT}" "${LOG}"
+OUTPUT_ROOT="${OUT}" \
+RUN_NAME=qwen3_liger_axis_fourway \
 MODEL_SPECS='Qwen/Qwen3-30B-A3B|1' \
 BACKEND_SPECS='asym_cpuadamwds|norecomp|ligerloss0,asym_cpuadamwds|norecomp|ligerloss1,zero3_offload|recomp|ligerloss0,zero3_offload|recomp|ligerloss1' \
 PROFILERS=both \
 GPU_POOL=3 \
-WARMUP_STEPS=1 \
+WORKLOADS='128|1|1' \
+WARMUP_STEPS=0 \
 MAX_STEPS=1 \
 DRY_RUN=true \
-bash /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh
+PLOT=false \
+PLOT_MEMORY_BREAKDOWN=false \
+PREPARE_DATASETS=false \
+ASYMM_EXP_ACT_POLICIES='none|false|false|false' \
+ASYM_CPU_ADAMW_GRAD_OFFLOAD=false \
+ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false \
+bash scripts/lf/profile_lora_lf.sh 2>&1 | tee "${LOG}"
+
+rg '__ligerloss0|__ligerloss1' "${LOG}"
+rg 'ENABLE_LIGER_KERNEL=true' "${LOG}"
+rg 'ENABLE_LIGER_KERNEL=false' "${LOG}"
+rg 'ASYM_GEMM_LF_CONFIG_LIGER_LOSS=ligerloss1|ligerloss1' "${LOG}"
+rg 'ASYM_GEMM_LF_CONFIG_LIGER_LOSS=ligerloss0|ligerloss0' "${LOG}"
+```
+
+Migration validation on a copied root:
+
+```bash
+SRC=/workspace/AsymGEMM-SFT/third_party/AsymGEMM/profiling_both
+DST=/tmp/asym_liger_axis_migration_check
+test -d "${SRC}"
+rm -rf "${DST}"
+cp -a "${SRC}" "${DST}"
+
+.venv/bin/python scripts/lf/migrate_liger_loss_axis.py --root "${DST}" --dry-run
+.venv/bin/python scripts/lf/migrate_liger_loss_axis.py --root "${DST}" --apply
+
+find "${DST}" -type d \( -name '*__source__*' -o -name '*__nsys__*' \) \
+  ! -name '*__ligerloss0*' ! -name '*__ligerloss1*' -print -quit | grep -q . && exit 1 || true
+rg -n 'liger_loss' "${DST}" --glob 'profile.json' --glob 'source_profile.json' --glob 'jobs.tsv'
 ```
 
 Required evidence:
-- Dry-run produces four Nsight job roots and four materialized source job roots.
-- Every root contains either `__ligerloss0` or `__ligerloss1`; no new job root lacks the Liger axis.
-- `ligerloss1` command files contain `ENABLE_LIGER_KERNEL=true`, `LIGER_LOSS_ONLY=true`, and `ASYM_GEMM_LF_CONFIG_LIGER_LOSS=ligerloss1`.
-- `ligerloss0` command files contain `ENABLE_LIGER_KERNEL=false`, `LIGER_LOSS_ONLY=false`, and `ASYM_GEMM_LF_CONFIG_LIGER_LOSS=ligerloss0`.
-- `jobs.tsv` has exactly one Liger axis column named `liger_loss`.
-- Plot scripts accept `--liger-loss ligerloss0 --liger-loss ligerloss1`.
-- Plot metadata/CSV rows include `liger_loss`, and combined plots do not collapse `ligerloss0` and `ligerloss1` into the same series.
-- Negative dry-run with `BACKEND_SPECS='asym_cpuadamwds|norecomp|true'` fails because only `ligerloss0/1` are valid.
+- Fresh dry-run commands include `__ligerloss0` even when `BACKEND_SPECS` omits the third field.
+- `PROFILERS=both` paths include both `__nsys__...__ligerloss0` and `__source__...__ligerloss0`.
+- Four-way dry-run commands include `__ligerloss0` and `__ligerloss1`.
+- Profile dry-run command artifacts contain `ENABLE_LIGER_KERNEL=true/false` and `ASYM_GEMM_LF_CONFIG_LIGER_LOSS=ligerloss0/1`.
+- Direct `run_lf_lora_sft.sh` fake-LF tests show final LF argv contains `--enable_liger_kernel true/false`.
+- `jobs.tsv` has exactly one `liger_loss` column.
+- Migrated artifacts have explicit path labels and `config.liger_loss == "ligerloss0"`.
+- Plot outputs can be filtered by `--liger-loss ligerloss0`.
+- Invalid aliases such as `true`, `false`, `liger`, or `loss1` fail.
+
+Efficiency rationale:
+- Stage 0 validates script/runtime plumbing through dry runs and fake-LF tests. It must not require real model execution.
+- Any real runtime or memory change from Stage 0 alone is a bug; actual Liger behavior is only enabled after Stage 1 implements the LF resolver.
 
 Risks to watch:
-- Existing profiles without `liger_loss` are legacy. Do not reuse them for final acceptance.
-- Adding `ligerloss0/1` only to `_known_optional_job_axis()` would hide the token but not make it available for filtering/grouping. Parse it as real metadata.
-- `PROFILERS=both` creates two sibling artifact trees from one run. Both siblings must carry the same `liger_loss` axis.
+- Do not run real `ligerloss1` training after Stage 0 alone. Stage 0 can set `--enable_liger_kernel true`, but LlamaFactory does not yet constrain that to loss-only until Stage 1.
+- Do not migrate a real profiling root in place until copied-root validation passes.
+- If a migration destination already exists, fail. Do not merge directories.
+- Do not touch `scripts/lf/profile3.sh` for this Liger work. It belongs to the separate Qwen3.5 testing path. Ignore `scripts/lf/profile_lora_lf_test*.sh` and `../archive/*` unless one is explicitly promoted as canonical.
 
-## Stage 3: Acceptance Comparison Tool
+## Stage 1: LlamaFactory Loss-Only Resolver
 
-Files/functions/classes:
-- Add `scripts/lf/compare_liger_loss_profiles.py`
-  - `ProfileMetrics`
-  - `find_profile_artifacts(root, backend, liger_loss)`
-  - `load_memory_metrics(root)`
-  - `load_timing_metrics(root)`
-  - `compare_metrics(baseline, candidate, thresholds)`
-  - `main()`
-- Add `tests/lf/test_compare_liger_loss_profiles.py`
-  - `test_compare_same_profile_fails_memory_threshold`
-  - `test_compare_rejects_latency_regression`
-  - `test_compare_accepts_meaningful_memory_drop_without_latency_regression`
-  - `test_parser_selects_liger_loss_axis`
-  - `test_parser_reports_missing_required_metrics`
+Purpose: make the Stage 0 common runtime interface executable by LlamaFactory. `ENABLE_LIGER_KERNEL=true` now resolves to loss-only Liger for validated model types. This stage must not contain Asym-specific `lm_head` staging logic.
 
-Implementation steps:
-- Consume only e2e profile artifacts produced by `profile_lora_lf.sh`.
-- Require explicit `--backend`, `--baseline-liger-loss`, and `--candidate-liger-loss`.
-- The two Liger-loss CLI values accept only `ligerloss0` or `ligerloss1`.
-- Select artifacts by profile metadata first and path label second; fail if metadata and path disagree.
-- Parse source-memory and timing summaries from existing JSON/CSV artifacts, recursively if needed.
-- Print the exact files used for each metric.
-- Exit nonzero on trivial memory drop, same memory, missing metrics, metadata mismatch, or latency regression.
-- Do not hard-code that baseline must be `ligerloss0` inside `compare_metrics()`. That would make baseline-vs-itself validation impossible. The acceptance command supplies `ligerloss0` vs `ligerloss1`.
+Scope:
+- Modify `../LlamaFactory/src/llamafactory/hparams/model_args.py`
+  - class `ModelArguments`
+- Modify `../LlamaFactory/src/llamafactory/model/model_utils/liger_kernel.py`
+  - `apply_liger_kernel(config, model_args, is_trainable, require_logits)`
+  - add `_LOSS_ONLY_SUPPORTED_MODEL_TYPES`
+  - add `_resolve_liger_apply_fn(model_type)`
+  - add `_build_liger_loss_only_kwargs(apply_fn)`
+- Extend tests:
+  - `tests/lf/test_liger_loss_only_qwen3_moe.py`
+
+Actual code changes:
+- In LlamaFactory `model_utils/liger_kernel.py`:
+  - in this AsymGEMM/LF integration, `model_args.enable_liger_kernel=True` means loss-only
+  - initially support only `config.model_type == "qwen3_moe"`
+  - skip when `require_logits=True`
+  - build kwargs by introspecting the Liger apply function and setting only `fused_linear_cross_entropy=True`; every other boolean patch must be `False`
+- Do not change `../Liger-Kernel`.
 
 Pseudocode:
 
 ```python
-@dataclass
+_LOSS_ONLY_SUPPORTED_MODEL_TYPES = {"qwen3_moe"}
+
+def _build_liger_loss_only_kwargs(apply_fn):
+    signature = inspect.signature(apply_fn)
+    if "fused_linear_cross_entropy" not in signature.parameters:
+        return None
+
+    kwargs = {}
+    for name, param in signature.parameters.items():
+        if name == "model":
+            continue
+        if name == "fused_linear_cross_entropy":
+            kwargs[name] = True
+        elif isinstance(param.default, bool):
+            kwargs[name] = False
+
+    return kwargs if kwargs.get("fused_linear_cross_entropy") is True else None
+
+def apply_liger_kernel(config, model_args, is_trainable, require_logits):
+    if not is_trainable or not model_args.enable_liger_kernel:
+        return
+
+    model_type = getattr(config, "model_type", None)
+    apply_fn = _resolve_liger_apply_fn(model_type)
+    if apply_fn is None:
+        return
+
+    if require_logits:
+        logger.warning_rank0("Skipping Liger loss-only because logits are required.")
+        return
+    if model_type not in _LOSS_ONLY_SUPPORTED_MODEL_TYPES:
+        logger.warning_rank0(f"Skipping Liger loss-only for unvalidated model_type={model_type}.")
+        return
+    kwargs = _build_liger_loss_only_kwargs(apply_fn)
+    if kwargs is None:
+        logger.warning_rank0(f"Skipping Liger loss-only for model_type={model_type}; fused linear CE is unavailable.")
+        return
+    apply_fn(**kwargs)
+    logger.info_rank0("Liger loss-only kernel has been applied.")
+```
+
+Validation before Stage 2:
+
+```bash
+PYTHONPATH=/workspace/AsymGEMM-SFT/third_party/Liger-Kernel/src \
+.venv/bin/python - <<'PY'
+import inspect
+import liger_kernel
+from liger_kernel.transformers import apply_liger_kernel_to_qwen3_moe
+
+print(liger_kernel.__file__)
+sig = inspect.signature(apply_liger_kernel_to_qwen3_moe)
+expected = {"rope", "cross_entropy", "fused_linear_cross_entropy", "rms_norm", "swiglu", "model"}
+missing = expected - set(sig.parameters)
+assert not missing, missing
+PY
+```
+
+```bash
+PYTHONPATH=/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src:/workspace/AsymGEMM-SFT/third_party/Liger-Kernel/src:/workspace/AsymGEMM-SFT/third_party/AsymGEMM \
+.venv/bin/python -m pytest \
+  tests/lf/test_liger_loss_only_qwen3_moe.py \
+  -q
+```
+
+Required evidence:
+- Qwen3-MoE loss-only kwargs are exactly:
+  - `fused_linear_cross_entropy=True`
+  - `cross_entropy=False`
+  - `rope=False`
+  - `rms_norm=False`
+  - `swiglu=False`
+- `enable_liger_kernel=True` selects loss-only for validated Qwen3-MoE.
+- ZeRO3-offload and AsymGEMM use the same `ENABLE_LIGER_KERNEL`/`--enable_liger_kernel` knob.
+- `require_logits=True` skips fused linear CE.
+- Unvalidated model types skip loss-only.
+- Stage 0 four-way dry-run still passes after the LF resolver is added.
+
+Efficiency rationale:
+- This stage changes only flag routing and loss-only Liger patch selection.
+- It must not add Asym staging, change kernel granularity directly, or loop over experts.
+
+Risks to watch:
+- Liger monkey-patches global classes. Unit tests that inspect patched/unpatched behavior must use fresh Python subprocesses.
+- Future Liger releases can add boolean toggles. `_build_liger_loss_only_kwargs()` must keep disabling every boolean except `fused_linear_cross_entropy`.
+
+## Stage 2: Asym-Wrapped `lm_head` Staging Bridge
+
+Purpose: keep `lm_head` offloaded by AsymGEMM while allowing Liger fused CE to consume a temporary CUDA weight. This is the specific compatibility bridge. It must live in AsymGEMM/LF integration code, not in Liger-Kernel.
+
+Scope:
+- Modify `asym_gemm/training/frozen_linear.py`
+  - class `AsymFrozenLinear`: add explicit staging method
+- Add `asym_gemm/integrations/liger_loss.py`
+  - `_resolve_liger_lm_head_weight(lm_head, hidden_states)`
+  - `asym_qwen3_moe_lce_forward(...)`
+  - `install_asym_liger_qwen3_moe_loss_bridge(model, *, strict=True)`
+- Modify `../LlamaFactory/src/llamafactory/model/adapter.py`
+  - call the bridge after `adapt_lf_asym_peft_lora(...)`
+- Modify `scripts/lf/run_lf_profiled_train.py`
+  - `_config_from_args()`
+  - add `_asym_liger_lm_head_bridge_from_model()`
+  - include bridge metadata in the final profile dict next to `asym_execution_stats`
+- Add tests:
+  - `tests/lf/test_asym_liger_lm_head_bridge.py`
+
+Actual code changes:
+- `AsymFrozenLinear.asym_liger_lm_head_weight(self, *, device, dtype) -> torch.Tensor`
+  - require `self.bias_cpu is None`; otherwise raise, because the local Liger causal LM loss call does not pass a bias.
+  - require `self.host_weight.weight.requires_grad is False`; otherwise raise.
+  - require source weight is 2D and contiguous; if not contiguous, make CPU contiguous before staging and record this in tests.
+  - stage with:
+    - `non_blocking=True` only when the CPU tensor is pinned
+    - `dtype` equal to hidden state dtype
+    - `device` equal to hidden state device
+  - return a temporary CUDA tensor. Do not cache it on the module.
+- `asym_gemm/integrations/liger_loss.py`
+  - Import Liger public loss/output helpers:
+    - `LigerForCausalLMLoss`
+    - `unpack_cross_entropy_result`
+    - `LigerMoeCausalLMOutputWithPast`
+  - Copy the Qwen3-MoE loss-only forward structure from the installed Liger version, but replace only the weight line with `_resolve_liger_lm_head_weight(...)`.
+  - Preserve the non-loss fallback path: if `skip_logits` is false, call `self.lm_head(kept_hidden_states)` normally.
+  - Install as an instance-level method with `types.MethodType`, not a global class patch. This prevents leaking Asym-specific behavior into non-Asym runs in the same Python process.
+- `../LlamaFactory/src/llamafactory/model/adapter.py`
+  - after `model, report = adapt_lf_asym_peft_lora(...)` and before `return model`, conditionally call:
+    - `install_asym_liger_qwen3_moe_loss_bridge(model, strict=model_args.asym_strict)`
+  - call only when:
+    - `model_args.use_asym_gemm`
+    - `model_args.enable_liger_kernel`
+    - `model.config.model_type == "qwen3_moe"`
+  - fail fast if `ASYM_OFFLOAD_MODULES` selected `lm_head` but `model.lm_head` does not expose `asym_liger_lm_head_weight`.
+  - fail fast if `model.lm_head` has trainable params, which indicates explicit `lm_head` LoRA or unsupported wrapping.
+- `run_lf_profiled_train.py`
+  - `_config_from_args()` records `liger_loss`.
+  - add `_asym_liger_lm_head_bridge_from_model()` near `_asym_execution_stats_from_model()`.
+  - the helper reads the captured model and returns:
+    - `enabled`
+    - `weight_source` with values like `asym_host_staged`, `normal_parameter`, or `disabled`
+    - `staged_bytes` when measurable from `model.lm_head.cpu_resident_base_weight_bytes`
+    - `lm_head_type`
+  - final profile JSON includes this helper output as `asym_liger_lm_head_bridge`.
+
+Pseudocode:
+
+```python
+# asym_gemm/training/frozen_linear.py
+class AsymFrozenLinear(nn.Module):
+    ...
+    def asym_liger_lm_head_weight(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if self.bias_cpu is not None:
+            raise RuntimeError("Asym Liger lm_head bridge currently requires bias-free lm_head.")
+        weight = self.host_weight.weight
+        if weight.requires_grad:
+            raise RuntimeError("Asym Liger lm_head bridge supports frozen lm_head only.")
+        if weight.ndim != 2:
+            raise RuntimeError(f"expected 2D lm_head weight, got {tuple(weight.shape)}")
+        if not weight.is_contiguous():
+            weight = weight.contiguous()
+        return weight.to(
+            device=device,
+            dtype=dtype,
+            non_blocking=bool(weight.is_pinned()),
+        )
+```
+
+```python
+# asym_gemm/integrations/liger_loss.py
+def _resolve_liger_lm_head_weight(lm_head: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+    resolver = getattr(lm_head, "asym_liger_lm_head_weight", None)
+    if callable(resolver):
+        return resolver(device=hidden_states.device, dtype=hidden_states.dtype)
+
+    weight = getattr(lm_head, "weight", None)
+    if weight is None:
+        raise TypeError(f"lm_head has no weight for Liger fused CE: {type(lm_head).__name__}")
+    return weight
+
+def asym_qwen3_moe_lce_forward(self, ..., skip_logits=None, return_dict=None, **kwargs):
+    outputs = self.model(...)
+    hidden_states = outputs.last_hidden_state
+    kept_hidden_states = hidden_states[:, slice_indices, :]
+    shift_labels = kwargs.pop("shift_labels", None)
+
+    if skip_logits is None:
+        skip_logits = self.training and (labels is not None or shift_labels is not None)
+
+    if skip_logits:
+        lm_head_weight = _resolve_liger_lm_head_weight(self.lm_head, kept_hidden_states)
+        result = LigerForCausalLMLoss(
+            hidden_states=kept_hidden_states,
+            lm_head_weight=lm_head_weight,
+            labels=labels,
+            shift_labels=shift_labels,
+            hidden_size=self.config.hidden_size,
+            **kwargs,
+        )
+        loss, _, token_accuracy, predicted_tokens = unpack_cross_entropy_result(result)
+    else:
+        logits = self.lm_head(kept_hidden_states)
+        ...
+    return LigerMoeCausalLMOutputWithPast(...)
+
+def install_asym_liger_qwen3_moe_loss_bridge(model: nn.Module, *, strict: bool = True) -> bool:
+    if getattr(model.config, "model_type", None) != "qwen3_moe":
+        if strict:
+            raise ValueError("Asym Liger bridge only supports qwen3_moe.")
+        return False
+
+    lm_head = getattr(model, "lm_head", None)
+    if lm_head is None:
+        raise RuntimeError("Qwen3-MoE model has no lm_head.")
+
+    resolver = getattr(lm_head, "asym_liger_lm_head_weight", None)
+    if not callable(resolver):
+        if strict:
+            raise RuntimeError("lm_head is not AsymFrozenLinear-compatible for Liger staging.")
+        return False
+
+    if any(p.requires_grad for p in lm_head.parameters(recurse=True)):
+        raise RuntimeError("Asym Liger bridge supports frozen lm_head only.")
+
+    model.forward = MethodType(asym_qwen3_moe_lce_forward, model)
+    model._asym_liger_lm_head_bridge_enabled = True
+    model._asym_liger_lm_head_weight_source = "asym_host_staged"
+    return True
+```
+
+Validation before Stage 3:
+
+```bash
+PYTHONPATH=/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src:/workspace/AsymGEMM-SFT/third_party/Liger-Kernel/src:/workspace/AsymGEMM-SFT/third_party/AsymGEMM \
+.venv/bin/python -m pytest tests/lf/test_asym_liger_lm_head_bridge.py -q
+```
+
+Small CUDA bridge validation:
+
+```bash
+CUDA_VISIBLE_DEVICES=3 \
+PYTHONPATH=/workspace/AsymGEMM-SFT/third_party/Liger-Kernel/src:/workspace/AsymGEMM-SFT/third_party/AsymGEMM \
+.venv/bin/python - <<'PY'
+import torch
+from asym_gemm.training.frozen_linear import AsymFrozenLinear
+
+lin = torch.nn.Linear(128, 256, bias=False, dtype=torch.bfloat16, device="cuda")
+wrapped = AsymFrozenLinear.from_gpu_linear(lin, backend="asym", pin_memory=True)
+assert wrapped.weight.device.type == "cpu"
+staged = wrapped.asym_liger_lm_head_weight(device=torch.device("cuda"), dtype=torch.bfloat16)
+assert staged.device.type == "cuda"
+assert staged.dtype == torch.bfloat16
+assert staged.shape == (256, 128)
+assert not hasattr(wrapped, "_cached_liger_lm_head_weight")
+print("ok")
+PY
+```
+
+Required evidence:
+- `AsymFrozenLinear.weight` still returns a CPU tensor.
+- `asym_liger_lm_head_weight()` stages to CUDA, uses hidden-state dtype, and does not cache.
+- Bias or trainable `lm_head` is rejected.
+- The installed bridge is instance-local, not a global class patch.
+- A tiny Qwen3-MoE-compatible forward/backward subprocess produces finite loss and LoRA grads.
+- AsymGEMM logs still show Qwen3-MoE blocks and selected dense modules wrapped, including `lm_head` when selected.
+
+Efficiency rationale:
+- The bridge stages exactly one full `vocab x hidden` `lm_head` weight per loss call.
+- It must not split LM-head work into Python loops or small GEMMs.
+- It must not keep a persistent GPU cache, because that would defeat `lm_head` offload.
+- On one GPU, this is conceptually equivalent to DeepSpeed ZeRO3 offload making the parameter GPU-available for Liger, but implemented explicitly.
+
+Risks to watch:
+- The local forward copies Liger Qwen3-MoE forward structure. If local Liger updates its Qwen3 forward signature or output class, tests must catch drift.
+- If Qwen3-MoE ever has a biased `lm_head`, the bridge must either pass bias into a supported fused CE path or reject.
+- Explicit `lm_head` LoRA is unsupported in the first bridge. Supporting it would require a mathematically correct fused CE over `W + B @ A`, not a naive materialization loop.
+
+## Stage 3: Acceptance Comparison Tool
+
+Purpose: make the memory/timing decision reproducible instead of manual.
+
+Scope:
+- Add `scripts/lf/compare_liger_loss_profiles.py`
+  - `ProfileMetrics`
+  - `load_profile_config(run_dir)`
+  - `load_memory_metrics(run_dir)`
+  - `load_timing_metrics(run_dir)`
+  - `compare_metrics(baseline, candidate, thresholds)`
+  - `main()`
+- Add `tests/lf/test_compare_liger_loss_profiles.py`
+
+Actual code changes:
+- Add explicit CLI args:
+  - `--baseline`
+  - `--candidate`
+  - `--backend`
+  - `--baseline-liger-loss`
+  - `--candidate-liger-loss`
+  - `--min-peak-drop-gib`
+  - `--min-lm-head-loss-drop-gib`
+  - `--max-step-ratio`
+  - `--max-forward-ratio`
+  - `--max-backward-ratio`
+- Validate `config.backend`, `config.liger_loss`, and path labels.
+- Read memory metrics from `memory_breakdown_summary.json`:
+  - prefer `actual_peak_allocated_hbm_bytes`
+  - fallback to `peak_allocated_hbm_bytes`
+  - fallback to `allocated_stack_sum_bytes`
+  - compute `lm_head_loss_hbm_bytes` by summing HBM rows whose component/module/path contains `lm_head` or `loss`
+- Read timing metrics from `step_samples.csv`:
+  - median `step_milliseconds`
+  - median `forward_milliseconds`
+  - median `backward_milliseconds`
+  - fallback to profile summary only when step samples are absent, and report fallback in output
+- Print every metric source file and field.
+- Exit nonzero on same-axis comparison, missing metrics, metadata mismatch, insufficient memory drop, or latency regression.
+
+Pseudocode:
+
+```python
+@dataclass(frozen=True)
 class ProfileMetrics:
-    peak_allocated_gib: float
-    peak_reserved_gib: float
-    lm_head_loss_gib: float
-    forward_median_ms: float
-    backward_median_ms: float
-    step_median_ms: float
+    run_dir: Path
     backend: str
     liger_loss: str
-    parsed_files: dict[str, str]
+    peak_allocated_hbm_bytes: int
+    lm_head_loss_hbm_bytes: int
+    median_step_ms: float
+    median_forward_ms: float
+    median_backward_ms: float
+    sources: dict[str, str]
 
-
-def compare_metrics(base, cand, thresholds):
-    failures = []
-    if base.backend != cand.backend:
-        failures.append("backend mismatch")
+def compare_metrics(base, cand, args):
     if base.liger_loss == cand.liger_loss:
-        failures.append("baseline and candidate use the same liger_loss axis")
-
-    peak_drop = base.peak_allocated_gib - cand.peak_allocated_gib
-    loss_drop = base.lm_head_loss_gib - cand.lm_head_loss_gib
-    fwd_ratio = cand.forward_median_ms / base.forward_median_ms
-    bwd_ratio = cand.backward_median_ms / base.backward_median_ms
-    step_ratio = cand.step_median_ms / base.step_median_ms
-
-    if peak_drop < thresholds.min_peak_drop_gib:
-        failures.append("peak memory drop below threshold")
-    if loss_drop < thresholds.min_lm_head_loss_drop_gib:
-        failures.append("lm_head/loss memory drop below threshold")
-    if step_ratio > thresholds.max_step_ratio:
-        failures.append("step latency regression")
-    if fwd_ratio > thresholds.max_forward_ratio:
-        failures.append("forward latency regression")
-    if bwd_ratio > thresholds.max_backward_ratio:
-        failures.append("backward latency regression")
-    return failures
+        fail("baseline and candidate use the same liger_loss")
+    peak_drop = base.peak_allocated_hbm_bytes - cand.peak_allocated_hbm_bytes
+    lm_loss_drop = base.lm_head_loss_hbm_bytes - cand.lm_head_loss_hbm_bytes
+    step_ratio = cand.median_step_ms / base.median_step_ms
+    fwd_ratio = cand.median_forward_ms / base.median_forward_ms
+    bwd_ratio = cand.median_backward_ms / base.median_backward_ms
+    require(peak_drop >= gib(args.min_peak_drop_gib), "peak drop too small")
+    require(lm_loss_drop >= gib(args.min_lm_head_loss_drop_gib), "lm_head/loss drop too small")
+    require(step_ratio <= args.max_step_ratio, "step latency regression")
+    require(fwd_ratio <= args.max_forward_ratio, "forward latency regression")
+    require(bwd_ratio <= args.max_backward_ratio, "backward latency regression")
 ```
 
 Validation before Stage 4:
 
 ```bash
-PYTHONPATH=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM \
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python \
-  -m pytest /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/tests/lf/test_compare_liger_loss_profiles.py -q
-
-BASE_JOB="$(
-  find /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/profiling_liger_acceptance \
-    -type d -name '*asym_cpuadamwds*ligerloss0*' -print -quit
-)"
-test -n "${BASE_JOB}"
-
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python \
-  /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/compare_liger_loss_profiles.py \
-  --baseline "${BASE_JOB}" \
-  --candidate "${BASE_JOB}" \
-  --backend asym_cpuadamwds \
-  --baseline-liger-loss ligerloss0 \
-  --candidate-liger-loss ligerloss0
+PYTHONPATH=/workspace/AsymGEMM-SFT/third_party/AsymGEMM \
+.venv/bin/python -m pytest tests/lf/test_compare_liger_loss_profiles.py -q
 ```
 
 Required evidence:
-- Unit tests prove pass/fail behavior for meaningful memory drop, latency regression, missing metrics, and `liger_loss` selection.
-- Baseline-vs-itself comparison exits nonzero and reports same-axis/zero-drop failures.
-- Tool output names the artifact files used for memory and timing.
+- Tests cover meaningful memory drop, trivial memory drop, latency regression, missing metrics, metadata/path mismatch, and same-axis failure.
+- Baseline-vs-itself exits nonzero.
+- Output reports all metric source files.
+
+Efficiency rationale:
+- This stage is analysis-only and must not change training execution.
+- The compare tool must reject memory wins that come with forward/backward/step timing blowups.
 
 Risks to watch:
-- Current profile artifact schemas may not expose every metric in one stable file. Keep the parser tolerant, but fail loudly with missing metric names and searched paths.
+- Source-memory schemas can evolve. The tool can tolerate alternate key names, but it must fail loudly with searched paths and missing metric names.
+- If `lm_head`/`loss` attribution cannot be found, fail instead of accepting only peak-HBM evidence.
 
 ## Stage 4: Full E2E Acceptance
 
-Files/functions/classes:
-- Exercise:
-  - `third_party/LlamaFactory/src/llamafactory/model/model_utils/liger_kernel.py`
-  - `third_party/LlamaFactory/src/llamafactory/hparams/model_args.py`
-  - `scripts/lf/run_lf_lora_sft.sh`
-  - `scripts/lf/profile_lora_lf.sh`
-  - `scripts/lf/run_lf_profiled_train.py`
-  - plotting scripts under `scripts/plotting/`
-  - `scripts/lf/compare_liger_loss_profiles.py`
+Purpose: decide whether `ligerloss1` is actually worth keeping for AsymGEMM and ZeRO3-offload.
 
-Implementation steps:
-- Run no-Liger and Liger-loss variants for each backend being judged.
-- Use `PROFILERS=both` so the one training run produces Nsight timing plus materialized source memory artifacts.
-- Confirm the loss optimization did not introduce inefficient kernels:
-  - Do not split experts into small GEMMs.
-  - Do not loop over experts in Python.
-  - Do not enable Liger experts/SwiGLU.
-  - Expert compute must remain AsymGEMM-owned for AsymGEMM jobs.
+Scope exercised:
+- Stage 0 common interfaces, scripts, artifact axis, and plotting
+- Stage 1 LF loss-only resolver
+- Stage 2 Asym `lm_head` staging bridge
+- Stage 3 compare tool
 
-E2E command for four-way Asym/ZeRO comparison:
+Actual code changes:
+- None by default. This stage is the e2e acceptance gate for earlier stages.
+- If acceptance fails, fix the responsible earlier-stage implementation and rerun that stage's validation before rerunning Stage 4.
+- Do not tune thresholds or loosen checks to pass.
+
+E2E run:
 
 ```bash
-OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/profiling_liger_acceptance \
+ROOT=/workspace/AsymGEMM-SFT/third_party/AsymGEMM/profiling_liger_acceptance
+rm -rf "${ROOT}"
+OUTPUT_ROOT="${ROOT}" \
 RUN_NAME=qwen3_ligerloss_fourway \
 MODEL_SPECS='Qwen/Qwen3-30B-A3B|1' \
 BACKEND_SPECS='asym_cpuadamwds|norecomp|ligerloss0,asym_cpuadamwds|norecomp|ligerloss1,zero3_offload|recomp|ligerloss0,zero3_offload|recomp|ligerloss1' \
@@ -676,22 +726,52 @@ GPU_POOL=3 \
 WARMUP_STEPS=5 \
 MAX_STEPS=5 \
 OVERWRITE=true \
-bash /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh
+bash scripts/lf/profile_lora_lf.sh 2>&1 | tee /tmp/qwen3_ligerloss_fourway.log
+```
+
+Artifact checks:
+
+```bash
+find "${ROOT}" -type d \( -name '*__source__*' -o -name '*__nsys__*' \) \
+  ! -name '*__ligerloss0*' ! -name '*__ligerloss1*' -print -quit | grep -q . && exit 1 || true
+
+rg -n 'Liger loss-only kernel has been applied|asym_liger_lm_head_bridge' "${ROOT}" --glob 'train.log' --glob 'profile.json' --glob 'source_profile.json'
+rg -n 'liger_loss' "${ROOT}" --glob 'profile.json' --glob 'source_profile.json' --glob 'jobs.tsv' --glob '*.csv' --glob '*.json'
+```
+
+Plot rerun checks:
+
+```bash
+.venv/bin/python scripts/plotting/plot_activation_recompute_sweep.py \
+  --input-root "${ROOT}" \
+  --output-dir "${ROOT}/plot_check/timing" \
+  --combined-output-dir "${ROOT}/plot_check/timing/_combined" \
+  --clean-output --combined-only \
+  --liger-loss ligerloss0 --liger-loss ligerloss1
+
+.venv/bin/python scripts/plotting/plot_lf_memory_breakdown.py \
+  --input-root "${ROOT}" \
+  --output-dir "${ROOT}/plot_check/memory" \
+  --clean-output --combined-only \
+  --liger-loss ligerloss0 --liger-loss ligerloss1
+
+.venv/bin/python scripts/plotting/plot_lf_interconnect_ctc.py \
+  --input-root "${ROOT}" \
+  --output-dir "${ROOT}/plot_check/c2c" \
+  --clean-output --combined-only \
+  --liger-loss ligerloss0 --liger-loss ligerloss1
 ```
 
 Comparison commands:
 
 ```bash
-ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/profiling_liger_acceptance
-ASYM_BASE="$(find "${ROOT}" -type d -name '*asym_cpuadamwds*ligerloss0*' -print -quit)"
-ASYM_CAND="$(find "${ROOT}" -type d -name '*asym_cpuadamwds*ligerloss1*' -print -quit)"
-ZERO_BASE="$(find "${ROOT}" -type d -name '*zero3_offload*ligerloss0*' -print -quit)"
-ZERO_CAND="$(find "${ROOT}" -type d -name '*zero3_offload*ligerloss1*' -print -quit)"
-test -n "${ASYM_BASE}" && test -n "${ASYM_CAND}"
-test -n "${ZERO_BASE}" && test -n "${ZERO_CAND}"
+ASYM_BASE="$(find "${ROOT}" -type d -path '*asym_cpuadamwds*__source__*ligerloss0*' -name 'b*_s*_ga*' -print -quit)"
+ASYM_CAND="$(find "${ROOT}" -type d -path '*asym_cpuadamwds*__source__*ligerloss1*' -name 'b*_s*_ga*' -print -quit)"
+ZERO_BASE="$(find "${ROOT}" -type d -path '*zero3_offload*__source__*ligerloss0*' -name 'b*_s*_ga*' -print -quit)"
+ZERO_CAND="$(find "${ROOT}" -type d -path '*zero3_offload*__source__*ligerloss1*' -name 'b*_s*_ga*' -print -quit)"
+test -n "${ASYM_BASE}" && test -n "${ASYM_CAND}" && test -n "${ZERO_BASE}" && test -n "${ZERO_CAND}"
 
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python \
-  /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/compare_liger_loss_profiles.py \
+.venv/bin/python scripts/lf/compare_liger_loss_profiles.py \
   --baseline "${ASYM_BASE}" \
   --candidate "${ASYM_CAND}" \
   --backend asym_cpuadamwds \
@@ -703,8 +783,7 @@ test -n "${ZERO_BASE}" && test -n "${ZERO_CAND}"
   --max-forward-ratio 1.15 \
   --max-backward-ratio 1.15
 
-/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/.venv/bin/python \
-  /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/compare_liger_loss_profiles.py \
+.venv/bin/python scripts/lf/compare_liger_loss_profiles.py \
   --baseline "${ZERO_BASE}" \
   --candidate "${ZERO_CAND}" \
   --backend zero3_offload \
@@ -717,42 +796,88 @@ test -n "${ZERO_BASE}" && test -n "${ZERO_CAND}"
   --max-backward-ratio 1.15
 ```
 
+Kernel launch sanity check:
+
+```bash
+.venv/bin/python - "${ROOT}" <<'PY'
+import csv, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+for csv_path in sorted(root.rglob("timing_by_op.csv")):
+    if "ligerloss1" not in str(csv_path):
+        continue
+    rows = list(csv.DictReader(csv_path.open()))
+    gemm_rows = [r for r in rows if "gemm" in " ".join(str(v).lower() for v in r.values())]
+    tiny = [
+        r for r in gemm_rows
+        if any(float(r.get(k) or 9999) < 0.05 for k in ("milliseconds", "total_milliseconds", "duration_ms"))
+    ]
+    print(csv_path, "gemm_rows", len(gemm_rows), "tiny_gemm_rows", len(tiny))
+PY
+```
+
 Required evidence:
-- Every per-job folder includes `ligerloss0` or `ligerloss1`.
-- `jobs.tsv`, profile metadata, timing CSVs, memory CSVs, and plot metadata include `liger_loss`.
-- LF log for `ligerloss1` contains `Liger loss-only kernel has been applied`.
-- LF log for `ligerloss0` does not apply Liger.
-- AsymGEMM `ligerloss1` log still confirms Qwen3-MoE blocks are wrapped as `AsymQwen3MoeBlock`.
-- Candidate artifacts include source memory attribution, source plots, Nsight timeline, timing plots, `profile.json`, and `summary.md`.
-- Source attribution shows `lm_head`/`loss` memory reduction.
-- Nsight timeline does not show a large number of new tiny GEMMs or expert-loop launches.
-- Comparison tool passes all memory and latency thresholds for the backend being accepted.
+- Every job folder and run folder is unambiguous by `ligerloss0/1`.
+- `jobs.tsv`, profile metadata, timing CSVs, memory CSVs, plot metadata, and grouped plot paths carry `liger_loss`.
+- `ligerloss1` logs show `Liger loss-only kernel has been applied`.
+- AsymGEMM `ligerloss1` profile metadata shows `asym_liger_lm_head_bridge.enabled=true` and `asym_liger_lm_head_bridge.weight_source=asym_host_staged`.
+- AsymGEMM `ligerloss1` logs still show `lm_head` wrapped/offloaded when `ASYM_OFFLOAD_MODULES=all`.
+- Source attribution shows meaningful `lm_head`/`loss` memory reduction.
+- Nsight timing does not show a large new population of tiny GEMMs or per-expert launch loops.
+- Compare tool passes thresholds for a backend before accepting that backend.
+
+Efficiency rationale:
+- The intended memory win is avoiding full final logits/loss materialization.
+- The accepted Asym path pays one full `lm_head` CPU-to-GPU staging copy per loss call. This must still be outweighed by the logits/loss memory saving.
+- If HBM drops but forward/backward/step timing regresses past threshold, reject the backend.
 
 Decision:
-- Accept Liger loss for a backend only if that backend's comparison passes and visual artifact inspection agrees.
-- Reject for a backend if memory reduction is below threshold, latency exceeds threshold, or the win comes from an inefficient launch pattern.
+- Accept `ligerloss1` per backend, not globally.
+- If AsymGEMM passes and ZeRO3-offload fails, keep the axis but mark only AsymGEMM accepted.
+- If AsymGEMM fails because staged `lm_head` cost erases the win, reject the Asym `ligerloss1` path rather than disabling `lm_head` offload silently.
 
 Risks to watch:
-- If another earlier module dominates peak allocation, peak memory may not drop as much as `lm_head`/`loss` attribution. Do not relax thresholds unless total peak reserved does not increase and the source-attributed loss reduction is clearly meaningful.
-- Liger fused CE may trade memory for loss-kernel time. Keep it only if the e2e timing guardrails pass.
+- Warmup 1/step 1 is allowed for smoke tests only. Acceptance must use at least `WARMUP_STEPS=5 MAX_STEPS=5`.
+- Logits memory scales with `batch * seq_len * vocab`, so small toy runs can understate savings.
 
 ## Stage 5: Future Compatible Models
 
-Files/functions/classes:
-- Modify only `_LIGER_APPLY_SPECS` in `third_party/LlamaFactory/src/llamafactory/model/model_utils/liger_kernel.py`.
-- Add a model-specific compatibility test next to `tests/lf/test_liger_loss_only_qwen3_moe.py`.
+Purpose: add future model support without accidentally enabling incompatible model patches.
 
-Implementation steps:
-- Add another model only after proving:
-  - Liger exposes fused linear CE for that model.
-  - Loss-only kwargs disable all other boolean patches.
-  - Original model modules remain recognizable to the matching AsymGEMM wrapper when used with AsymGEMM.
-  - Tiny CUDA forward/backward produces finite loss, no logits, and LoRA grads.
-  - Full e2e profiling passes Stage 4 memory and latency thresholds.
+Scope:
+- Modify only:
+  - `_LOSS_ONLY_SUPPORTED_MODEL_TYPES` in `../LlamaFactory/src/llamafactory/model/model_utils/liger_kernel.py`
+  - model-specific bridge code in `asym_gemm/integrations/liger_loss.py`
+  - model-specific tests next to `tests/lf/test_liger_loss_only_qwen3_moe.py`
+- Reuse Stage 1 through Stage 4 validation commands with the future model's real e2e workload.
 
-Validation:
-- Run the new model-specific pytest.
-- Run the same e2e baseline/candidate/compare sequence from Stages 0 and 4.
+Actual code changes:
+- Add one exact `config.model_type` value only after compatibility is proven.
+- Do not add model families, broad prefixes, or name-similarity matches.
+- Do not modify `_build_liger_loss_only_kwargs()` unless the new model exposes a genuinely incompatible apply signature; if modified, rerun Qwen3-MoE tests.
+- Add a model-specific local forward bridge only if the model's Liger fused-loss forward directly reads `self.lm_head.weight` and needs Asym staging.
+
+Rule:
+- Add a model only after proving all of the following:
+  - Liger exposes `fused_linear_cross_entropy` for that model.
+  - `_build_liger_loss_only_kwargs()` disables every other boolean patch.
+  - The model's original modules remain recognizable to any AsymGEMM wrappers.
+  - The Asym bridge preserves `lm_head` offload when selected.
+  - Tiny CUDA forward/backward passes in a fresh subprocess.
+  - Full e2e `PROFILERS=both` profiling passes Stage 4 thresholds.
+- Do not add Llama4, dense Qwen3, Qwen3.5, Qwen3.5-MoE, or any other model by name similarity.
+
+Efficiency rationale:
+- New models must reuse fused-loss-only behavior.
+- Do not add model-specific expert loops, split expert GEMMs, or hidden persistent GPU copies.
 
 Risks to watch:
-- Do not add Llama4, Qwen3 dense, Qwen3.5 MoE, or any other model by name similarity. Add only after the compatibility and e2e gates pass.
+- Public Liger support for a model does not imply AsymGEMM compatibility. Treat each model as unvalidated until Stage 4 passes.
+- If a model requires logits for the active training stage, skip loss-only Liger for that model.
+
+References checked:
+- Local Liger fused CE source: `../Liger-Kernel/src/liger_kernel/ops/fused_linear_cross_entropy.py`
+- Local Liger Qwen3-MoE fused-loss forward: `../Liger-Kernel/src/liger_kernel/transformers/model/qwen3_moe.py`
+- Local Liger Qwen3-MoE apply function: `../Liger-Kernel/src/liger_kernel/transformers/monkey_patch.py`
+- Local Asym frozen linear wrapper: `asym_gemm/training/frozen_linear.py`
+- Local Asym LF adapter path: `asym_gemm/integrations/lf.py`, `asym_gemm/integrations/peft_lf.py`, and `../LlamaFactory/src/llamafactory/model/adapter.py`

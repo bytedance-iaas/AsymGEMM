@@ -117,6 +117,7 @@ def _release_replaced_module_memory() -> None:
     except Exception:
         return
 _ATTENTION_TARGETS = frozenset({"q_proj", "k_proj", "v_proj", "o_proj"})
+_LINEAR_ATTENTION_LEAVES = frozenset({"in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"})
 
 
 @dataclass(frozen=True)
@@ -416,6 +417,20 @@ def parse_lf_offload_modules(selector: Sequence[str] | str | None) -> LFOffloadS
 def classify_lf_component(name: str, module: nn.Module | None = None) -> str:
     lower = name.lower()
     leaf = lower.rsplit(".", 1)[-1]
+    module_name = type(module).__name__.lower() if module is not None else ""
+    if (
+        lower == "linear_attn"
+        or lower.endswith(".linear_attn")
+        or ".linear_attn." in lower
+        or "gateddeltanet" in lower
+        or "gateddeltanet" in module_name
+    ):
+        if leaf == "weight" and "." in lower:
+            parent_leaf = lower.rsplit(".", 1)[0].rsplit(".", 1)[-1]
+        else:
+            parent_leaf = leaf
+        if parent_leaf in _LINEAR_ATTENTION_LEAVES or ".linear_attn." in lower or lower.endswith(".linear_attn"):
+            return "linear_attention"
     if ".mlp.shared_expert" in lower or ".shared_expert." in lower or ".shared_experts." in lower:
         return "shared_experts"
     if lower == "shared_expert_gate" or lower.endswith(".shared_expert_gate") or ".shared_expert_gate." in lower:

@@ -2000,6 +2000,22 @@ class AsymFrozenLinear(nn.Module):
     def bias(self) -> Optional[torch.Tensor]:
         return self.bias_cpu
 
+    def asym_liger_lm_head_weight(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if self.bias_cpu is not None:
+            raise RuntimeError("Asym Liger lm_head bridge currently requires a bias-free lm_head.")
+        weight = self.host_weight.weight
+        if weight.requires_grad:
+            raise RuntimeError("Asym Liger lm_head bridge supports frozen lm_head only.")
+        if weight.ndim != 2:
+            raise RuntimeError(f"Asym Liger lm_head bridge expected a 2D weight, got {tuple(weight.shape)}.")
+        if not weight.is_contiguous():
+            weight = weight.contiguous()
+        return weight.to(
+            device=device,
+            dtype=dtype,
+            non_blocking=bool(weight.device.type == "cpu" and weight.is_pinned()),
+        )
+
     def forward(self, x: torch.Tensor, *, profile_name: str | None = None) -> torch.Tensor:
         effective_profile_name = self.profile_name if profile_name is None else profile_name
         return asym_frozen_linear(

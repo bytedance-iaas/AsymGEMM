@@ -1875,6 +1875,8 @@ def _layer(name: str) -> str:
 
 
 def _module(name: str) -> str:
+    if ".linear_attn" in name or "gateddeltanet" in name.lower():
+        return "linear_attention"
     if ".self_attn" in name or ".attention" in name:
         return "attention"
     if ".mlp.experts" in name or ".experts" in name:

@@ -26,6 +26,7 @@ SUMMARY_FIELDS = [
     "expact",
     "asymm_attn_act_offload",
     "attnact",
+    "liger_loss",
     "profiler",
     "recompute",
     "expert_policy",
@@ -57,6 +58,7 @@ STEP_FIELDS = [
     "expact",
     "asymm_attn_act_offload",
     "attnact",
+    "liger_loss",
     "profiler",
     "recompute",
     "expert_policy",
@@ -85,6 +87,7 @@ INDEX_FIELDS = [
     "expact",
     "asymm_attn_act_offload",
     "attnact",
+    "liger_loss",
     "profiler",
     "recompute",
     "expert_policy",
@@ -124,6 +127,7 @@ class RunRecord:
             f"router={self.metadata.get('router_mode', '')}" if self.metadata.get("router_mode") else "",
             self.metadata.get("expact", ""),
             self.metadata.get("attnact", ""),
+            self.metadata.get("liger_loss", ""),
             self.metadata.get("recompute", ""),
             self.metadata.get("expert_policy", ""),
             f"s{self.metadata.get('seq_len', '')}" if self.metadata.get("seq_len") else "",
@@ -144,6 +148,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--router-mode", action="append", default=[], choices=["hf", "whole"])
     parser.add_argument("--expact", action="append", default=[], choices=["expact0", "expact1"])
     parser.add_argument("--attnact", action="append", default=[], choices=["attnact0", "attnact1"])
+    parser.add_argument("--liger-loss", action="append", default=[], choices=["ligerloss0", "ligerloss1"])
     parser.add_argument("--recompute", action="append", default=[])
     parser.add_argument("--workloads", nargs="+", default=[])
     parser.add_argument("--expert-recompute-policies", nargs="+", default=[])
@@ -207,6 +212,13 @@ def _parse_attnact_part(part: str) -> tuple[str, str] | None:
     return None
 
 
+def _parse_liger_loss_part(part: str) -> str | None:
+    value = part.strip().lower()
+    if value in {"ligerloss0", "ligerloss1"}:
+        return value
+    return None
+
+
 def _known_optional_job_axis(part: str) -> bool:
     value = part.strip().lower()
     return (
@@ -230,6 +242,7 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
     expact = "expact0"
     attnact_value = "false"
     attnact = "attnact0"
+    liger_loss = "ligerloss0"
 
     if tail:
         router_part = tail.pop(0)
@@ -245,6 +258,10 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         if parsed_attnact is not None:
             attnact_value, attnact = parsed_attnact
             continue
+        parsed_liger_loss = _parse_liger_loss_part(part)
+        if parsed_liger_loss is not None:
+            liger_loss = parsed_liger_loss
+            continue
         if _known_optional_job_axis(part):
             continue
         return None
@@ -259,6 +276,7 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         "expact": expact,
         "asymm_attn_act_offload": attnact_value,
         "attnact": attnact,
+        "liger_loss": liger_loss,
     }
 
 
@@ -362,6 +380,9 @@ def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, st
     expact = _expact_label(expact_value)
     attnact_value = _normalize_bool_config(config.get("asymm_attn_act_offload", attnact_value))
     attnact = _attnact_label(attnact_value)
+    liger_loss = str(config.get("liger_loss") or job_meta.get("liger_loss") or "ligerloss0").lower()
+    if liger_loss not in {"ligerloss0", "ligerloss1"}:
+        liger_loss = "ligerloss0"
 
     metadata = {
         "workload": str(config.get("workload") or config_root.name.split("__", 1)[0]),
@@ -371,6 +392,7 @@ def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, st
         "expact": expact,
         "asymm_attn_act_offload": attnact_value,
         "attnact": attnact,
+        "liger_loss": liger_loss,
         "profiler": str(profiler_part),
         "recompute": recompute_part,
         "expert_policy": expert_policy,
@@ -402,6 +424,7 @@ def _matches_filters(record: RunRecord, args: argparse.Namespace) -> bool:
         "router_mode": _filter_values(args.router_mode),
         "expact": _filter_values(args.expact),
         "attnact": _filter_values(args.attnact),
+        "liger_loss": _filter_values(getattr(args, "liger_loss", [])),
         "recompute": _filter_values(args.recompute),
         "expert_policy": _filter_values(args.expert_recompute_policies),
     }
@@ -476,6 +499,7 @@ def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
             int(run.metadata.get("seq_len") or 0),
             run.metadata.get("backend", ""),
             run.metadata.get("router_mode", ""),
+            run.metadata.get("liger_loss", ""),
             run.metadata.get("recompute", ""),
             run.metadata.get("expert_policy", ""),
             str(run.run_dir),
@@ -701,6 +725,7 @@ def _group_label(run: RunRecord) -> str:
         f"router{metadata.get('router_mode', '')}" if metadata.get("router_mode") else "",
         metadata.get("expact", ""),
         metadata.get("attnact", ""),
+        metadata.get("liger_loss", ""),
         metadata.get("recompute", ""),
         f"pol{metadata.get('expert_policy', '')}" if metadata.get("expert_policy") else "",
     ]

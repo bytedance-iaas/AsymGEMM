@@ -189,6 +189,7 @@ class RunRecord:
             f"router={self.metadata.get('router_mode', '')}" if self.metadata.get("router_mode") else "",
             self.metadata.get("expact", ""),
             self.metadata.get("attnact", ""),
+            self.metadata.get("liger_loss", ""),
             self.metadata.get("recompute", ""),
             self.metadata.get("expert_policy", ""),
             self.metadata.get("seq_len", ""),
@@ -257,6 +258,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--router-mode", action="append", default=[], choices=["hf", "whole"])
     parser.add_argument("--expact", action="append", default=[], choices=["expact0", "expact1"])
     parser.add_argument("--attnact", action="append", default=[], choices=["attnact0", "attnact1"])
+    parser.add_argument("--liger-loss", action="append", default=[], choices=["ligerloss0", "ligerloss1"])
     parser.add_argument("--workloads", nargs="+", default=[])
     parser.add_argument("--expert-recompute-policies", nargs="+", default=[])
     return parser.parse_args()
@@ -373,6 +375,13 @@ def _parse_attnact_part(part: str) -> tuple[str, str] | None:
     return None
 
 
+def _parse_liger_loss_part(part: str) -> str | None:
+    value = part.strip().lower()
+    if value in {"ligerloss0", "ligerloss1"}:
+        return value
+    return None
+
+
 def _known_optional_job_axis(part: str) -> bool:
     value = part.strip().lower()
     return (
@@ -396,6 +405,7 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
     expact = "expact0"
     attnact_value = "false"
     attnact = "attnact0"
+    liger_loss = "ligerloss0"
 
     if tail:
         router_part = tail.pop(0)
@@ -411,6 +421,10 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         if parsed_attnact is not None:
             attnact_value, attnact = parsed_attnact
             continue
+        parsed_liger_loss = _parse_liger_loss_part(part)
+        if parsed_liger_loss is not None:
+            liger_loss = parsed_liger_loss
+            continue
         if _known_optional_job_axis(part):
             continue
         return None
@@ -425,6 +439,7 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         "expact": expact,
         "asymm_attn_act_offload": attnact_value,
         "attnact": attnact,
+        "liger_loss": liger_loss,
     }
 
 
@@ -463,6 +478,9 @@ def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | 
     expact = _expact_label(expact_value)
     attnact_value = _normalize_bool_config(config.get("asymm_attn_act_offload", attnact_value))
     attnact = _attnact_label(attnact_value)
+    liger_loss = str(config.get("liger_loss") or job_meta.get("liger_loss") or "ligerloss0").lower()
+    if liger_loss not in {"ligerloss0", "ligerloss1"}:
+        liger_loss = "ligerloss0"
 
     metadata = {
         "workload": str(config.get("workload") or config_root.name.split("__")[0]),
@@ -475,6 +493,7 @@ def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | 
         "expact": expact,
         "asymm_attn_act_offload": attnact_value,
         "attnact": attnact,
+        "liger_loss": liger_loss,
         "seq_len": str(config.get("seq_len") or (run_dir_match.group("seq_len") if run_dir_match else "")),
         "precision": str(config.get("precision") or ""),
         "batch_size": str(config.get("batch_size") or (run_dir_match.group("batch_size") if run_dir_match else "")),
@@ -643,6 +662,7 @@ def _matches_filters(run: RunRecord, args: argparse.Namespace) -> bool:
         "router_mode": _filter_values(args.router_mode),
         "expact": _filter_values(args.expact),
         "attnact": _filter_values(args.attnact),
+        "liger_loss": _filter_values(getattr(args, "liger_loss", [])),
         "expert_policy": _filter_values(args.expert_recompute_policies),
     }
     for key, allowed in filters.items():
@@ -1596,6 +1616,7 @@ def _group_label(run: RunRecord) -> str:
         f"router{metadata.get('router_mode', '')}" if metadata.get("router_mode") else "",
         metadata.get("expact", ""),
         metadata.get("attnact", ""),
+        metadata.get("liger_loss", ""),
         metadata.get("recompute", ""),
         f"pol{metadata.get('expert_policy', '')}" if metadata.get("expert_policy") else "",
     ]

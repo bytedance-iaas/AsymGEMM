@@ -76,7 +76,7 @@ RUN_NAME=${RUN_NAME:-}
 # Training
 # WORKLOADS entries are seq_len|per_device_train_batch_size|gradient_accumulation_steps.
 # Example: WORKLOADS="2048|3|1,4096|2|1".
-WORKLOADS="${WORKLOADS:-8192|8|1}"
+WORKLOADS="${WORKLOADS:-2048|4|1}"
 # MAX_STEPS=${MAX_STEPS:-10}
 # WARMUP_STEPS=${WARMUP_STEPS:-5}
 MAX_STEPS=${MAX_STEPS:-1}
@@ -178,7 +178,7 @@ INTERCONNECT_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_interconnect_ctc.
 usage() {
   cat <<USAGE
 Usage:
-  scripts/lf/profile_lora_lf.sh [options]
+  scripts/lf/profile3.sh [options]
 
 Defaults:
   --gpus ${GPU_POOL}
@@ -792,10 +792,10 @@ job_profile_complete() {
     "${expected_expact}" \
     "${expected_attnact}" \
     "${expected_layeract}" \
-	    "${expected_lf_expert_lora_impl}" \
-	    "${expected_expact_lora_a_fwd}" \
-	    "${expected_grad_offload}" \
-	    "${expected_liger_loss}" || return 1
+    "${expected_lf_expert_lora_impl}" \
+    "${expected_expact_lora_a_fwd}" \
+    "${expected_grad_offload}" \
+    "${expected_liger_loss}" || return 1
   [[ "${require_memory_breakdown}" != "true" ]] || existing_memory_breakdown_valid "${seq_root}"
 }
 

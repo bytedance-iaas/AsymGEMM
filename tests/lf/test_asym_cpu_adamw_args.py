@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -69,6 +71,7 @@ def make_fake_env(tmp_path: Path) -> tuple[Path, Path]:
                 "  printf 'ASYMM_ATTN_ACT_OFFLOAD=%s\\n' \"${ASYMM_ATTN_ACT_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "  printf 'ASYMM_LAYER_ACT_OFFLOAD=%s\\n' \"${ASYMM_LAYER_ACT_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "  printf 'ASYM_CPU_ADAMW_GRAD_OFFLOAD=%s\\n' \"${ASYM_CPU_ADAMW_GRAD_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
+                "  printf 'ASYM_GEMM_LF_CONFIG_ASYM_STRICT=%s\\n' \"${ASYM_GEMM_LF_CONFIG_ASYM_STRICT:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "  printf 'ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD=%s\\n' \"${ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "  printf 'ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD=%s\\n' \"${ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD:-}\" >> \"$FAKE_LF_ENV_LOG\"",
                 "  printf 'ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED=%s\\n' \"${ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED:-}\" >> \"$FAKE_LF_ENV_LOG\"",
@@ -136,7 +139,14 @@ def test_run_lf_lora_sft_asym_cpuadamwtorch_args(tmp_path: Path) -> None:
     assert _arg_value(args, "--asym_cpu_adamw_pin_memory") == "false"
     assert _arg_value(args, "--asym_cpu_adamw_fp32_master") == "true"
     assert _arg_value(args, "--asym_cpu_adamw_grad_offload") == "false"
+    assert _arg_value(args, "--enable_liger_kernel") == "false"
     assert "--deepspeed" not in args
+
+
+def test_run_lf_lora_sft_passes_enable_liger_kernel_arg(tmp_path: Path) -> None:
+    args = _run_lf_lora_sft(tmp_path, "asym_cpuadamwtorch", extra_env={"ENABLE_LIGER_KERNEL": "true"})
+
+    assert _arg_value(args, "--enable_liger_kernel") == "true"
 
 
 def test_run_lf_lora_sft_plain_asym_explicitly_disables_cpuadamw(tmp_path: Path) -> None:
@@ -241,7 +251,7 @@ def test_profile_lora_lf_dry_run_asym_cpuadamwtorch_label_and_flags(tmp_path: Pa
     assert len(command_files) == 1
     command = command_files[0].read_text(encoding="utf-8")
     assert "asym_cpuadamwtorch__source__recomp__polnone" in str(command_files[0])
-    assert "__gradofffalse__weightofffalse/b4_s4096_ga1" in str(command_files[0])
+    assert "__ligerloss0__gradofffalse__weightofffalse/b4_s4096_ga1" in str(command_files[0])
     assert "BACKEND=asym_cpuadamwtorch" in command
     assert "PROFILE_BACKEND_LABEL=asym_cpuadamwtorch" in command
     assert "USE_ASYM_CPU_ADAMW=true" in command
@@ -279,17 +289,114 @@ def test_profile_lora_lf_dry_run_sweeps_asym_cpuadamw_grad_offload_modes(tmp_pat
     commands = {str(path): path.read_text(encoding="utf-8") for path in output_root.rglob("command.txt")}
     assert len(commands) == 2
     command_paths = "\n".join(commands)
-    assert "__gradofffalse__weightofffalse/" in command_paths
-    assert "__gradofftrue__weightofffalse/" in command_paths
+    assert "__ligerloss0__gradofffalse__weightofffalse/" in command_paths
+    assert "__ligerloss0__gradofftrue__weightofffalse/" in command_paths
     assert any("ASYM_CPU_ADAMW_GRAD_OFFLOAD=false" in text for text in commands.values())
     assert any("ASYM_CPU_ADAMW_GRAD_OFFLOAD=true" in text for text in commands.values())
     assert any("ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD=false" in text for text in commands.values())
     assert any("ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD=true" in text for text in commands.values())
 
     jobs_tsv = next(output_root.rglob("jobs.tsv")).read_text(encoding="utf-8")
-    assert "profiler\tgrad_offload\tjob_dir" in jobs_tsv
-    assert "\tsource\tfalse\t" in jobs_tsv
-    assert "\tsource\ttrue\t" in jobs_tsv
+    assert "profiler\tliger_loss\tgrad_offload\tjob_dir" in jobs_tsv
+    assert "\tsource\tligerloss0\tfalse\t" in jobs_tsv
+    assert "\tsource\tligerloss0\ttrue\t" in jobs_tsv
+
+
+def test_profile_lora_lf_dry_run_wires_liger_loss_axis(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    output_root = tmp_path / "dryrun"
+
+    run_cmd(
+        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
+        env={
+            "LF_DIR": str(lf_dir),
+            "BACKEND_SPECS": "asym_cpuadamwds|norecomp|ligerloss0,zero3_offload|recomp|ligerloss1",
+            "GPU_POOL": "0",
+            "PROFILERS": "both",
+            "WORKLOADS": "128|1|1",
+            "MAX_STEPS": "1",
+            "WARMUP_STEPS": "0",
+            "PREPARE_DATASETS": "false",
+            "DRY_RUN": "true",
+            "LORA_DROPOUT": "0.00",
+            "ASYMM_EXP_ACT_POLICIES": "none|false|false|false",
+            "ASYM_CPU_ADAMW_GRAD_OFFLOAD": "false",
+            "ASYM_CPU_ADAMW_WEIGHT_OFFLOAD": "false",
+            "PLOT": "false",
+            "PLOT_MEMORY_BREAKDOWN": "false",
+        },
+    )
+
+    commands = {str(path): path.read_text(encoding="utf-8") for path in output_root.rglob("command.txt")}
+    command_paths = "\n".join(commands)
+    command_text = "\n".join(commands.values())
+    assert "__nsys__norecomp__polnone" in command_paths
+    assert "__source__norecomp__polnone" in command_paths
+    assert "__ligerloss0" in command_paths
+    assert "__ligerloss1" in command_paths
+    assert "ENABLE_LIGER_KERNEL=false" in command_text
+    assert "ENABLE_LIGER_KERNEL=true" in command_text
+    assert "ASYM_GEMM_LF_CONFIG_LIGER_LOSS=ligerloss0" in command_text
+    assert "ASYM_GEMM_LF_CONFIG_LIGER_LOSS=ligerloss1" in command_text
+
+
+def test_plot_activation_recompute_sweep_filters_liger_loss_axis(tmp_path: Path) -> None:
+    input_root = tmp_path / "profiles"
+    for liger_loss in ("ligerloss0", "ligerloss1"):
+        run_dir = (
+            input_root
+            / "precision"
+            / (
+                "torch__source__norecomp__polnone__routerhf__expact0__attnact0__layeract0__"
+                f"loraafwdhbm__actrecomp0__xunpack0__{liger_loss}"
+            )
+            / "b1_s128_ga1"
+        )
+        run_dir.mkdir(parents=True)
+        profile = {
+            "config": {
+                "backend": "torch",
+                "router_mode": "hf",
+                "seq_len": 128,
+                "batch_size": 1,
+                "gradient_accumulation_steps": 1,
+                "precision": "bf16",
+                "liger_loss": liger_loss,
+                "lora_dropout": 0.0,
+                "expert_policy": "none",
+            },
+            "stages": [{"name": "step", "total_milliseconds": 10.0}],
+            "forward": {"total_milliseconds": 4.0},
+            "backward": {"total_milliseconds": 6.0},
+            "memory": {"gpu": {"peak_allocated_hbm_bytes": 1024, "peak_reserved_hbm_bytes": 2048}},
+            "trainable_surface": {"available": True, "surface": "synthetic"},
+        }
+        (run_dir / "profile.json").write_text(json.dumps(profile) + "\n", encoding="utf-8")
+
+    output_dir = tmp_path / "plots"
+    run_cmd(
+        [
+            sys.executable,
+            "scripts/plotting/plot_activation_recompute_sweep.py",
+            "--input-root",
+            str(input_root),
+            "--output-dir",
+            str(output_dir),
+            "--backend",
+            "torch",
+            "--profiler",
+            "source",
+            "--recompute",
+            "norecomp",
+            "--liger-loss",
+            "ligerloss0",
+            "--skip-combined",
+        ]
+    )
+
+    rows = list(csv.DictReader((output_dir / "activation_recompute_sweep_index.csv").open()))
+    assert len(rows) == 1
+    assert rows[0]["liger_loss"] == "ligerloss0"
 
 
 def test_profile_lora_lf_dry_run_rejects_multi_qwen_expert_lora_impls(tmp_path: Path) -> None:
@@ -356,7 +463,7 @@ def test_profile_lora_lf_dry_run_labels_expert_lora_a_hbm_mode(tmp_path: Path) -
     command_paths = "\n".join(commands)
     assert (
         "__expact1__attnact1__layeract1__loraafwdhbm__actrecomp0__xunpack0"
-        "__gradofffalse__weightofffalse/b4_s4096_ga1"
+        "__ligerloss0__gradofffalse__weightofffalse/b4_s4096_ga1"
     ) in command_paths
     command = next(iter(commands.values()))
     assert "ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm" in command
@@ -442,7 +549,7 @@ def test_profile_lora_lf_four_field_exp_attn_axis_dry_run(tmp_path: Path) -> Non
     commands = {str(path): path.read_text(encoding="utf-8") for path in output_root.rglob("command.txt")}
     assert len(commands) == 5
     command_paths = "\n".join(commands)
-    neutral = "__actrecomp0__xunpack0__gradofffalse__weightofffalse/"
+    neutral = "__actrecomp0__xunpack0__ligerloss0__gradofffalse__weightofffalse/"
     assert f"__polnone__routerwhole__expact0__attnact0__layeract0__loraafwdcpu{neutral}" in command_paths
     assert f"__polgc-exp__routerwhole__expact0__attnact0__layeract0__loraafwdcpu{neutral}" in command_paths
     assert f"__polgc-attn-exp__routerwhole__expact0__attnact0__layeract0__loraafwdcpu{neutral}" in command_paths
@@ -450,6 +557,7 @@ def test_profile_lora_lf_four_field_exp_attn_axis_dry_run(tmp_path: Path) -> Non
     assert f"__polnone__routerwhole__expact1__attnact1__layeract0__loraafwdcpu{neutral}" in command_paths
 
     gc_attn_command = next(text for path, text in commands.items() if "__polgc-attn-exp__" in path)
+    assert "ASYM_GEMM_LF_CONFIG_ASYM_STRICT=true" in gc_attn_command
     assert "ASYM_EXPERT_RECOMPUTE_POLICY=gc-attn-exp" in gc_attn_command
     assert "GRADIENT_CHECKPOINTING=false" in gc_attn_command
     assert "ASYMM_ATTN_ACT_OFFLOAD=false" in gc_attn_command
@@ -563,7 +671,7 @@ def test_profile_lora_lf_four_part_layer_axis_dry_run(tmp_path: Path) -> None:
     commands = {str(path): path.read_text(encoding="utf-8") for path in output_root.rglob("command.txt")}
     assert len(commands) == 2
     command_paths = "\n".join(commands)
-    neutral = "__actrecomp0__xunpack0__gradofffalse__weightofffalse/"
+    neutral = "__actrecomp0__xunpack0__ligerloss0__gradofffalse__weightofffalse/"
     assert f"__polgc-layer__routerwhole__expact0__attnact0__layeract0__loraafwdcpu{neutral}" in command_paths
     assert f"__polnone__routerwhole__expact1__attnact1__layeract1__loraafwdcpu{neutral}" in command_paths
 
@@ -698,7 +806,7 @@ def test_profile_lora_lf_default_e2e_shape_uses_asym_cpuadamwds(tmp_path: Path) 
     assert "llama-4-scout-17b-16e__gpus1__b4_s4096_ga1_w5_s10_r64_a16_drop000" in command_paths
     assert command_paths.count(
         "asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact0__attnact0__layeract0__loraafwdcpu"
-        "__actrecomp0__xunpack0__gradofffalse__weightofffalse/b4_s4096_ga1"
+        "__actrecomp0__xunpack0__ligerloss0__gradofffalse__weightofffalse/b4_s4096_ga1"
     ) == 1
     for command in command_texts:
         assert "BACKEND=asym_cpuadamwds" in command

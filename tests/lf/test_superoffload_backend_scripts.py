@@ -1603,7 +1603,7 @@ def test_profile_lora_lf_passes_matching_source_profile_to_kt_arm_nsys(tmp_path:
         output_root
         / "asym_long_sft_smoke__lora__lf__bf16"
         / "qwen3-30b-a3b__gpus1__b4_s128_ga1_w0_s1_r64_a16_drop000"
-        / "kt_armbf16__source__recomp__polnone__routerhf__expact0__attnact0__layeract0__loraafwdhbm__actrecomp0__xunpack0"
+        / "kt_armbf16__source__recomp__polnone__routerhf__expact0__attnact0__layeract0__loraafwdhbm__actrecomp0__xunpack0__ligerloss0"
         / "b4_s128_ga1"
         / "profile.json"
     )
@@ -1612,8 +1612,9 @@ def test_profile_lora_lf_passes_matching_source_profile_to_kt_arm_nsys(tmp_path:
         json.dumps(
             {
                 "config": {
-                    "backend": "kt_armbf16",
-                    "kt_backend": "ARMBF16",
+                        "backend": "kt_armbf16",
+                        "liger_loss": "ligerloss0",
+                        "kt_backend": "ARMBF16",
                     "model_name_or_path": "Qwen/Qwen3-30B-A3B",
                     "seq_len": 128,
                     "per_device_train_batch_size": 4,
