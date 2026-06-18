@@ -1122,7 +1122,22 @@ def test_asym_cpu_first_loader_source_order_moves_after_adapter_conversion() -> 
     loader_path = LF_SRC / "llamafactory" / "model" / "loader.py"
     source = loader_path.read_text(encoding="utf-8")
     init_pos = source.index("model = init_adapter(config, model, model_args, finetuning_args, is_trainable)")
-    move_pos = source.index("_move_asym_cpu_first_model_to_device(model)", init_pos)
+    move_pos = source.index("_move_asym_cpu_first_model_to_device(model, model_args, finetuning_args)", init_pos)
+    move_func = source[source.index("def _move_asym_cpu_first_model_to_device") : source.index("class TokenizerModule")]
 
     assert init_pos < move_pos
-    assert "model.to(device)" in source
+    assert "move_lf_asym_cpu_first_model_to_device" in move_func
+    assert "_asym_cpu_first_selective_device_move" in move_func
+    assert "model.to(device)" not in move_func
+
+
+def test_custom_seq2seq_trainer_skips_trainer_device_move_after_asym_cpu_first_placement() -> None:
+    trainer_path = LF_SRC / "llamafactory" / "train" / "sft" / "trainer.py"
+    source = trainer_path.read_text(encoding="utf-8")
+    move_func = source[
+        source.index("def _move_model_to_device") : source.index("def _wrap_kt_optimizer_step")
+    ]
+
+    assert "_asym_cpu_first_selective_device_move" in move_func
+    assert "super()._move_model_to_device(model, device)" in move_func
+    assert "model.to(device)" not in move_func

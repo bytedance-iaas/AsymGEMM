@@ -20,6 +20,8 @@ Design notes (memory / latency / launch efficiency):
 
 from __future__ import annotations
 
+from collections import OrderedDict
+import types
 from typing import Any
 
 import torch
@@ -34,6 +36,8 @@ class _LayerGroup:
 
     __slots__ = (
         "module_key",
+        "group_name",
+        "component",
         "params",
         "shapes",
         "numels",
@@ -50,6 +54,8 @@ class _LayerGroup:
 
     def __init__(self) -> None:
         self.module_key: int = 0
+        self.group_name: str = ""
+        self.component: str = "lora"
         self.params: list[torch.nn.Parameter] = []
         self.shapes: list[tuple[int, ...]] = []
         self.numels: list[int] = []
@@ -84,6 +90,7 @@ class LoRAWeightOffloadCoordinator:
         self._live_groups = 0
         self.staged_high_water_bytes = 0
         self.pin_memory_failures: list[str] = []
+        self.skipped_groups: list[dict[str, Any]] = []
         # Stage 3 (prefetch) fields, unused in the synchronous core.
         self._stream: torch.cuda.Stream | None = None
 
@@ -92,20 +99,55 @@ class LoRAWeightOffloadCoordinator:
     def is_registered(self, param: torch.nn.Parameter) -> bool:
         return id(param) in self._registered_keys
 
+    def is_module_registered(self, module: Any) -> bool:
+        return id(module) in self._group_of_module
+
+    def group_for_module(self, module: Any) -> _LayerGroup | None:
+        return self._group_of_module.get(id(module))
+
     @torch.no_grad()
-    def register_group(self, module: Any, named_banks: list[tuple[str, torch.nn.Parameter]]) -> int:
+    def register_group(
+        self,
+        module: Any,
+        named_banks: list[tuple[str, torch.nn.Parameter]],
+        *,
+        group_name: str = "",
+        component: str = "lora",
+        force: bool = False,
+    ) -> int:
         """Capture the layer's banks into a pinned bf16 home slab, then release them.
 
         Must be called while the params are still full on CUDA (before any release), so the
         captured home equals the optimizer's freshly-built fp32 master.
         """
-        params = [param for _, param in named_banks]
+        params: list[torch.nn.Parameter] = []
+        seen_params: set[int] = set()
+        for _, param in named_banks:
+            if not isinstance(param, torch.nn.Parameter):
+                continue
+            key = id(param)
+            if key in seen_params:
+                continue
+            seen_params.add(key)
+            params.append(param)
         if not params:
             return 0
         if id(module) in self._group_of_module:
             return len(self._group_of_module[id(module)].params)
+        if any(id(param) in self._registered_keys for param in params):
+            return 0
         total = sum(int(param.numel()) for param in params)
-        if total < self.persistence_threshold_numel:
+        if total < self.persistence_threshold_numel and not force:
+            self.skipped_groups.append(
+                {
+                    "group_name": str(group_name or type(module).__name__),
+                    "component": str(component or "lora"),
+                    "param_count": len(params),
+                    "numel": int(total),
+                    "bytes": int(total * params[0].element_size()),
+                    "reason": "below_persistence_threshold",
+                }
+            )
             return 0  # keep tiny adapters resident; offloading them is all latency, no benefit
 
         dtype = params[0].dtype
@@ -116,6 +158,8 @@ class LoRAWeightOffloadCoordinator:
 
         group = _LayerGroup()
         group.module_key = id(module)
+        group.group_name = str(group_name or type(module).__name__)
+        group.component = str(component or "lora")
         group.params = params
         group.shapes = [tuple(int(d) for d in param.shape) for param in params]
         group.numels = [int(param.numel()) for param in params]
@@ -203,7 +247,14 @@ class LoRAWeightOffloadCoordinator:
         if group.buf is not None:
             self._return_slab(group.buf)
             group.buf = None
+            self._live_groups = max(0, self._live_groups - 1)
         group.live = 0
+
+    @torch.no_grad()
+    def release_group(self, module: Any) -> None:
+        group = self._group_of_module.get(id(module))
+        if group is not None:
+            self._release_group(group)
 
     @torch.no_grad()
     def refresh_home_from_master(self, param: torch.nn.Parameter, master_fp32: torch.Tensor) -> None:
@@ -221,6 +272,9 @@ class LoRAWeightOffloadCoordinator:
         home_bytes = 0
         home_numel = 0
         pinned_bytes = 0
+        group_count_by_component: OrderedDict[str, int] = OrderedDict()
+        param_count_by_component: OrderedDict[str, int] = OrderedDict()
+        home_bytes_by_component: OrderedDict[str, int] = OrderedDict()
         for group in self._groups:
             if group.home is None:
                 continue
@@ -232,30 +286,106 @@ class LoRAWeightOffloadCoordinator:
             home_numel += int(group.home.numel())
             if group.home.is_pinned():
                 pinned_bytes += nbytes
+            group_count_by_component[group.component] = group_count_by_component.get(group.component, 0) + 1
+            param_count_by_component[group.component] = param_count_by_component.get(group.component, 0) + len(group.params)
+            home_bytes_by_component[group.component] = home_bytes_by_component.get(group.component, 0) + nbytes
+        skipped_bytes_by_component: OrderedDict[str, int] = OrderedDict()
+        skipped_groups_by_component: OrderedDict[str, int] = OrderedDict()
+        for item in self.skipped_groups:
+            component = str(item.get("component", "lora"))
+            skipped_groups_by_component[component] = skipped_groups_by_component.get(component, 0) + 1
+            skipped_bytes_by_component[component] = skipped_bytes_by_component.get(component, 0) + int(item.get("bytes", 0))
         return {
             "weight_offload_enabled": True,
             "weight_offload_param_count": len(self.registered_params),
             "weight_offload_param_numel": int(home_numel),
             "weight_offload_group_count": len(self._groups),
+            "weight_offload_group_count_by_component": dict(group_count_by_component),
+            "weight_offload_param_count_by_component": dict(param_count_by_component),
             "weight_offload_home_bytes": int(home_bytes),
+            "weight_offload_home_bytes_by_component": dict(home_bytes_by_component),
             "weight_offload_pinned_home_bytes": int(pinned_bytes),
             "weight_offload_staged_high_water_bytes": int(self.staged_high_water_bytes),
             "weight_offload_persistence_threshold_numel": int(self.persistence_threshold_numel),
+            "weight_offload_skipped_group_count": len(self.skipped_groups),
+            "weight_offload_skipped_group_count_by_component": dict(skipped_groups_by_component),
+            "weight_offload_skipped_bytes_by_component": dict(skipped_bytes_by_component),
+            "weight_offload_skipped_groups": list(self.skipped_groups),
         }
 
 
 def install_lora_weight_offload(model: Any, coordinator: LoRAWeightOffloadCoordinator) -> int:
-    """Register every ``AsymQwen3Experts`` layer with the coordinator and wire forward hooks.
+    """Register trainable Asym LoRA weights with the coordinator and wire staging hooks.
 
     Returns the number of offloaded banks (0 means nothing matched; callers should assert > 0).
     """
+    from .attention_activation_offload import AsymActivationOffloadLoRALinear
+    from .llama4_shared_mlp import AsymLlama4SharedMLP
+    from .lora import AsymLoRALinear
     from .qwen3_moe import AsymQwen3Experts
+    try:
+        from .qwen35_shared_mlp import AsymQwen35SharedMLP
+    except Exception:  # pragma: no cover - defensive import guard
+        AsymQwen35SharedMLP = AsymLlama4SharedMLP  # type: ignore[assignment]
 
     def _gather_hook(module: Any, _inputs: Any) -> None:
         module.gather_lora_weights()
 
     def _release_hook(module: Any, _inputs: Any, _output: Any) -> None:
         module.release_lora_weights()
+
+    def _bind_parent_methods(module: Any) -> None:
+        if not hasattr(module, "gather_lora_weights"):
+            def gather_lora_weights(self: Any) -> None:
+                current = getattr(self, "_weight_offload", None)
+                if current is not None:
+                    current.gather_group(self)
+
+            module.gather_lora_weights = types.MethodType(gather_lora_weights, module)
+        if not hasattr(module, "release_lora_weights"):
+            def release_lora_weights(self: Any) -> None:
+                current = getattr(self, "_weight_offload", None)
+                if current is not None:
+                    current.release_group(self)
+
+            module.release_lora_weights = types.MethodType(release_lora_weights, module)
+
+    def _mark_child_owned(child: Any, owner: Any) -> None:
+        child._weight_offload = coordinator
+        object.__setattr__(child, "_weight_offload_owner", owner)
+        child._weight_offload_release_after_forward = False
+
+    def _linear_attn_children(module: Any) -> dict[str, Any]:
+        return {name: getattr(module, name, None) for name in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj")}
+
+    def _is_linear_attn_parent(name: str, module: Any) -> bool:
+        if not name or not name.lower().endswith(".linear_attn"):
+            return False
+        children = _linear_attn_children(module)
+        return all(isinstance(child, (AsymLoRALinear, AsymActivationOffloadLoRALinear)) for child in children.values())
+
+    def _linear_attn_lora_banks(module: Any) -> list[tuple[str, torch.nn.Parameter]]:
+        banks: list[tuple[str, torch.nn.Parameter]] = []
+        for leaf, child in _linear_attn_children(module).items():
+            if isinstance(child, (AsymLoRALinear, AsymActivationOffloadLoRALinear)):
+                banks.append((f"{leaf}.lora_A", child.lora_a))
+                banks.append((f"{leaf}.lora_B", child.lora_b))
+        return banks
+
+    def _component_for_lora_leaf(name: str) -> str:
+        lower = name.lower()
+        leaf = lower.rsplit(".", 1)[-1]
+        if ".linear_attn." in lower or lower.endswith(".linear_attn"):
+            return "linear_attention"
+        if ".shared_expert" in lower or lower.endswith(".shared_expert_gate") or ".shared_expert_gate." in lower:
+            return "shared_experts"
+        if leaf in {"q_proj", "k_proj", "v_proj", "o_proj"} or ".self_attn." in lower:
+            return "attention"
+        if leaf in {"gate_proj", "up_proj", "down_proj"} and (".mlp." in lower or ".feed_forward." in lower):
+            return "mlp_dense"
+        if leaf in {"lm_head", "output", "output_layer"} or lower.endswith(".lm_head"):
+            return "lm_head"
+        return "dense_lora"
 
     installed = 0
     for module in model.modules():
@@ -266,7 +396,76 @@ def install_lora_weight_offload(model: Any, coordinator: LoRAWeightOffloadCoordi
             for name in _BANK_NAMES
             if isinstance(getattr(module, name, None), torch.nn.Parameter)
         ]
-        registered = coordinator.register_group(module, named_banks)
+        registered = coordinator.register_group(
+            module,
+            named_banks,
+            group_name=getattr(module, "profile_prefix", type(module).__name__),
+            component="routed_experts",
+        )
+        if registered:
+            module._weight_offload = coordinator
+            module.register_forward_pre_hook(_gather_hook)
+            module.register_forward_hook(_release_hook)
+            installed += registered
+
+    for module in model.modules():
+        if not isinstance(module, (AsymLlama4SharedMLP, AsymQwen35SharedMLP)):
+            continue
+        banks_fn = getattr(module, "_lora_weight_banks", None)
+        if not callable(banks_fn):
+            continue
+        named_banks = banks_fn()
+        registered = coordinator.register_group(
+            module,
+            named_banks,
+            group_name=getattr(module, "profile_prefix", type(module).__name__),
+            component="shared_experts",
+            force=True,
+        )
+        if registered:
+            module._weight_offload = coordinator
+            for child in (module.gate_proj, module.up_proj, module.down_proj):
+                if isinstance(child, AsymLoRALinear):
+                    _mark_child_owned(child, module)
+            module.register_forward_pre_hook(_gather_hook)
+            module.register_forward_hook(_release_hook)
+            installed += registered
+
+    for name, module in model.named_modules():
+        if not _is_linear_attn_parent(name, module):
+            continue
+        named_banks = _linear_attn_lora_banks(module)
+        registered = coordinator.register_group(
+            module,
+            named_banks,
+            group_name=name,
+            component="linear_attention",
+            force=True,
+        )
+        if registered:
+            module._weight_offload = coordinator
+            _bind_parent_methods(module)
+            for child in _linear_attn_children(module).values():
+                if isinstance(child, (AsymLoRALinear, AsymActivationOffloadLoRALinear)):
+                    _mark_child_owned(child, module)
+            module.register_forward_pre_hook(_gather_hook)
+            module.register_forward_hook(_release_hook)
+            installed += registered
+
+    for name, module in model.named_modules():
+        if not isinstance(module, (AsymLoRALinear, AsymActivationOffloadLoRALinear)):
+            continue
+        if getattr(module, "_weight_offload_owner", module) is not module:
+            continue
+        named_banks = [("lora_A", module.lora_a), ("lora_B", module.lora_b)]
+        component = _component_for_lora_leaf(name)
+        registered = coordinator.register_group(
+            module,
+            named_banks,
+            group_name=name,
+            component=component,
+            force=component in {"attention", "shared_experts", "linear_attention", "lm_head", "mlp_dense"},
+        )
         if registered:
             module._weight_offload = coordinator
             module.register_forward_pre_hook(_gather_hook)

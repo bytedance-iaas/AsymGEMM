@@ -10,10 +10,12 @@ import torch.nn.functional as F
 import asym_gemm
 from asym_gemm.integrations.lf import (
     apply_lf_asym_lora,
+    audit_lf_frozen_cuda_residue,
     classify_lf_component,
     component_is_selected,
     get_asym_lora_state_dict,
     load_asym_peft_adapter,
+    move_lf_asym_cpu_first_model_to_device,
     parse_lf_offload_modules,
     save_asym_peft_adapter,
 )
@@ -22,6 +24,10 @@ from asym_gemm.training.attention_activation_offload import AsymActivationOffloa
 from asym_gemm.training.decoder_activation_offload import (
     decoder_saved_tensor_offload_module_names,
     is_decoder_saved_tensor_offload_wrapper,
+)
+from asym_gemm.training.linear_attention_activation_offload import (
+    is_linear_attention_saved_tensor_offload_wrapper,
+    linear_attention_saved_tensor_offload_module_names,
 )
 from asym_gemm.training.decoder_checkpoint import decoder_checkpoint_module_names, is_decoder_checkpoint_wrapper
 from asym_gemm.training.offload import AsymFrozenEmbedding, AsymFrozenLayerNorm, AsymFrozenRMSNorm
@@ -900,7 +906,71 @@ def test_qwen35_all_selector_includes_linear_attention() -> None:
     assert isinstance(model.layers[0].linear_attn.in_proj_qkv, AsymLoRALinear)
 
 
-def test_qwen35_weight_offload_registers_routed_banks_and_preserves_dense_trainables() -> None:
+def test_qwen35_vision_paths_are_not_misclassified_as_text_offload_components() -> None:
+    assert classify_lf_component("visual.pos_embed") == "vision"
+    assert classify_lf_component("model.visual.blocks.0.mlp.fc1.weight") == "vision"
+    assert classify_lf_component("model.visual.merger.mlp.0.weight") == "vision"
+    assert classify_lf_component("multi_modal_projector.linear.weight") == "vision"
+    assert classify_lf_component("language_model.layers.0.linear_attn.in_proj_qkv.weight") == "linear_attention"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="selective Asym CPU-first move requires CUDA")
+def test_qwen35_asym_cpu_first_move_keeps_frozen_visual_state_on_cpu() -> None:
+    class FakeVisual(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pos_embed = nn.Parameter(torch.randn(4, 8, dtype=torch.bfloat16), requires_grad=False)
+            self.blocks = nn.ModuleList([nn.Sequential(nn.Linear(8, 8, bias=False, dtype=torch.bfloat16))])
+            self.merger = nn.Sequential(nn.Linear(8, 8, bias=False, dtype=torch.bfloat16))
+
+    class FakeConditional(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.language_model = FakeQwen3_5WholeOffloadModel(hidden_dim=8, intermediate_dim=8, num_layers=1)
+            self.visual = FakeVisual()
+            self.multi_modal_projector = nn.Linear(8, 8, bias=False, dtype=torch.bfloat16)
+
+        def get_input_embeddings(self) -> nn.Embedding:
+            return self.language_model.get_input_embeddings()
+
+        def get_output_embeddings(self) -> nn.Linear:
+            return self.language_model.get_output_embeddings()
+
+    model = FakeConditional()
+    model, _report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["all"],
+        dense_target_modules=_dense_targets(),
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="all",
+        router_mode="whole",
+        strict=True,
+    )
+
+    summary = move_lf_asym_cpu_first_model_to_device(
+        model,
+        torch.device("cuda"),
+        offload_modules="all",
+        strict=True,
+        keep_frozen_vision_on_cpu=True,
+        keep_frozen_projector_on_cpu=True,
+    )
+
+    assert summary["kept_cpu_bytes_by_component"]["vision_or_projector"] > 0
+    assert model.visual.pos_embed.device.type == "cpu"
+    assert model.visual.blocks[0][0].weight.device.type == "cpu"
+    assert model.multi_modal_projector.weight.device.type == "cpu"
+    lora_params = [param for name, param in model.named_parameters() if "lora_" in name]
+    assert lora_params and all(param.device.type == "cuda" for param in lora_params)
+    residue = audit_lf_frozen_cuda_residue(model, offload_modules="all", strict=True)
+    assert residue.get("vision", 0) == 0
+
+
+def test_qwen35_weight_offload_registers_routed_shared_and_linear_attention_banks() -> None:
     model = FakeQwen3_5DecoderModel(hidden_dim=64, intermediate_dim=64, layer_mixers=("linear_attn",))
     model, _report = apply_lf_asym_lora(
         model,
@@ -909,7 +979,7 @@ def test_qwen35_weight_offload_registers_routed_banks_and_preserves_dense_traina
         lora_rank=2,
         lora_alpha=4.0,
         lora_dropout=0.0,
-        backend="torch",
+        backend="asym",
         precision="bf16",
         offload_modules="all",
         router_mode="whole",
@@ -935,14 +1005,18 @@ def test_qwen35_weight_offload_registers_routed_banks_and_preserves_dense_traina
     registered_names = [name for name, param in model.named_parameters() if id(param) in registered_ids]
     resident_trainable_names = [name for name, param in model.named_parameters() if param.requires_grad and id(param) not in registered_ids]
 
-    assert installed == 6
-    assert summary["weight_offload_group_count"] == 1
-    assert summary["weight_offload_param_count"] == 6
-    assert all(".mlp.experts." in name for name in registered_names)
-    assert any(".mlp.shared_expert.gate_proj.lora_A" in name for name in resident_trainable_names)
-    assert any(".mlp.shared_expert_gate.lora_A" in name for name in resident_trainable_names)
-    assert any(".linear_attn.in_proj_qkv.lora_A" in name for name in resident_trainable_names)
-    assert any(".linear_attn.out_proj.lora_A" in name for name in resident_trainable_names)
+    assert installed == 24
+    assert summary["weight_offload_group_count"] == 4
+    assert summary["weight_offload_param_count"] == 24
+    assert summary["weight_offload_group_count_by_component"]["routed_experts"] == 1
+    assert summary["weight_offload_group_count_by_component"]["shared_experts"] == 2
+    assert summary["weight_offload_group_count_by_component"]["linear_attention"] == 1
+    assert any(".mlp.experts." in name for name in registered_names)
+    assert any(".mlp.shared_expert.gate_proj.lora_A" in name for name in registered_names)
+    assert any(".mlp.shared_expert_gate.lora_A" in name for name in registered_names)
+    assert any(".linear_attn.in_proj_qkv.lora_A" in name for name in registered_names)
+    assert any(".linear_attn.out_proj.lora_A" in name for name in registered_names)
+    assert not resident_trainable_names
 
 
 def test_adapt_lf_asym_peft_lora_preserves_preexisting_shared_expert_lora() -> None:
@@ -1051,6 +1125,32 @@ def test_qwen35_hybrid_decoder_layer_activation_offload_wraps_layers(monkeypatch
     assert is_decoder_saved_tensor_offload_wrapper(model.layers[0])
     assert is_decoder_saved_tensor_offload_wrapper(model.layers[1])
     assert getattr(model, "_asym_layer_act_offload_modules") == ("layers.0", "layers.1")
+
+
+def test_qwen35_layer_activation_offload_wraps_linear_attention_saved_tensors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASYMM_LAYER_ACT_OFFLOAD", "1")
+    model = FakeQwen3_5DecoderModel(layer_mixers=("linear_attn", "self_attn"))
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["experts"],
+        dense_target_modules=[],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="linear_attention",
+        expert_recompute_policy="none",
+        router_mode="whole",
+        strict=False,
+    )
+
+    assert report.layer_act_offload_enabled
+    assert report.linear_attention_saved_tensor_offload_wrapped == 1
+    assert report.linear_attention_saved_tensor_offload_modules == ("layers.0.linear_attn",)
+    assert linear_attention_saved_tensor_offload_module_names(model) == ("layers.0.linear_attn",)
+    assert is_linear_attention_saved_tensor_offload_wrapper(model.layers[0].linear_attn)
+    assert getattr(model, "_asym_linear_attention_saved_tensor_offload_modules") == ("layers.0.linear_attn",)
 
 
 def test_apply_lf_asym_lora_hf_wraps_only_qwen35_experts() -> None:

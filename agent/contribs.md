@@ -38,7 +38,7 @@ Questions
 
 ####################################################################
 
-Notations: 
+### Notations 
 @ = GEMM
 @^ = AsymGEMM A @ B.T where B is on CPU
 @^^ = (Hypothetical) AsymGEMM A @ B.T where A is on CPU
@@ -155,9 +155,16 @@ dB_up = scale * (dup.T @^ S_up_cpu)                   # [I, r] Grad
 Notes:
 - Did LoRAFusion make S_up and S_down persistent? across forward and backward? Are we currently doing that?
 
+####################################################################
+
+### Contributions
+- We develop
+
+- We test it comprehensively 
+
 
 ### Questions
-1. How to fix CPU OOM with partial recompute / NVME offloading? Can we load directly from NVME to SMEM in a kernel?
+1. How to fix CPU OOM with partial recompute / NVME offloading?
 2. Is there more kernels for the backward process? 
 - Compute silu and directly write to HBM not storing on CPU
 - Compute grad and directly write to CPU not through HBM
@@ -165,13 +172,48 @@ Notes:
 4. fused CE with AsymGEMM?
 
 ### Discussion
-1. Can we build a cuda graph for kernel launch (partially)? This avoids synchronization from the CPU.
-2. Scheduling between recompute/offload and where to place tensors (cpu, gpu, nvme)
-3. nvme -> hbm use native gemm / cpu -> smem use asymGEMM scheduling. 
-4. What to use for compute (cpu or GPU) also scheduling
+0. Current numbers
+┌──────────────────────┬───────────────────┬─────────────────┬────────┬────────────────┬───────────────┬──────────────┬───────────┬─────────────┐
+│        Model         │  Workload (tok)   │     Backend     │ Recomp │ Peak alloc HBM │ Peak resv HBM │ Peak RAM/RSS │ Mean step │ Median step │
+├──────────────────────┼───────────────────┼─────────────────┼────────┼────────────────┼───────────────┼──────────────┼───────────┼─────────────┤
+│ qwen3-30B-A3B        │ b8_s4096 (32 768) │ asym_cpuadamwds │   no   │          56.78 │         67.06 │       483.04 │   75.75 s │     75.67 s │
+├──────────────────────┼───────────────────┼─────────────────┼────────┼────────────────┼───────────────┼──────────────┼───────────┼─────────────┤
+│ qwen3-30B-A3B        │ b8_s4096 (32 768) │ zero3_offload   │  yes   │          64.15 │         74.26 │       195.54 │    7.82 s │      7.61 s │
+├──────────────────────┼───────────────────┼─────────────────┼────────┼────────────────┼───────────────┼──────────────┼───────────┼─────────────┤
+│ qwen3-30B-A3B        │ b8_s8192 (65 536) │ asym_cpuadamwds │   no   │         113.21 │        132.92 │       760.53 │  151.99 s │    151.01 s │
+├──────────────────────┼───────────────────┼─────────────────┼────────┼────────────────┼───────────────┼──────────────┼───────────┼─────────────┤
+│ qwen3-30B-A3B        │ b8_s8192 (65 536) │ zero3_offload   │  yes   │         126.17 │        146.20 │       196.53 │   12.30 s │     12.30 s │
+├──────────────────────┼───────────────────┼─────────────────┼────────┼────────────────┼───────────────┼──────────────┼───────────┼─────────────┤
+│ llama4-scout-17B-16E │ b4_s4096 (16 384) │ asym_cpuadamwds │   no   │          27.83 │         29.03 │       857.45 │  68.13 s¹ │    68.13 s¹ │
+├──────────────────────┼───────────────────┼─────────────────┼────────┼────────────────┼───────────────┼──────────────┼───────────┼─────────────┤
+│ llama4-scout-17B-16E │ b4_s4096 (16 384) │ zero3_offload   │  yes   │          49.53 │         55.93 │       525.83 │  39.33 s¹ │    39.33 s¹ │
+└──────────────────────┴───────────────────┴─────────────────┴────────┴────────────────┴───────────────┴──────────────┴───────────┴─────────────┘
 
-5. Can we fully use back and forward beween CPU and GPU whihc uses separte bandwith not like smem <-> hbm which shares the bandwith betwen read and write
-e.g. compute silu and directly write to HBM
+1. Can we build a cuda graph for kernel launch (partially)?
+- Normally can for attention, exp router but we add in offloading and staging which requires CPU sync
+- Cannot for experts because the each receives a diff token count (M) so the cpu needs to read that count to launch the kernel
 
-6. Ask agents to optimize bf16 sm100 AsymGEMM kernels.
+2. Scheduling between recomputing/offloading/caching
+Motivation:
+- Memory: caching > recomputing > offloading
+- Latency: offloading > recomputing > caching
+Method:
+- Split by layers / required storage/ required compute
+- Early layers offload. Late layers recompute. Middle layers in HBM. 
+- Save smaller tensors and recompute larger tensors => save RAM/HBM
+
+3. Where to store tensors? 
+- Model params / optimizer states / activations in nvme / cpu
+- Activation tensors in CPU instead of nvme, and more weight tensors in nvme
+
+4. What to use for compute? cpu or GPU
+- Elementwise (silu(x) = x * sigmoid(x), optimizer updates) use CPU
+- GEMMs (AsymGEMM, Native GEMM) use GPU
+
+5. Can we fully use back and forward beween CPU <-> GPU whihc uses separte bandwith not like smem <-> hbm which shares the bandwith betwen read and write
+- Compute silu on CPU and directly write to HBM => save RAM
+- Compute grad and directly add to buffer is it possibel?
+
+6. Ask agents to optimize bf16 sm100 AsymGEMM
+
 

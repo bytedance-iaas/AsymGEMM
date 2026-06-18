@@ -34,8 +34,8 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _decoder_saved_tensor_min_bytes() -> int:
-    raw = os.environ.get("ASYM_DECODER_SAVED_TENSOR_OFFLOAD_MIN_BYTES")
+def _linear_attention_saved_tensor_min_bytes() -> int:
+    raw = os.environ.get("ASYM_LINEAR_ATTENTION_SAVED_TENSOR_OFFLOAD_MIN_BYTES")
     if raw is None or raw == "":
         return _DEFAULT_SAVED_TENSOR_OFFLOAD_MIN_BYTES
     try:
@@ -44,8 +44,8 @@ def _decoder_saved_tensor_min_bytes() -> int:
         return _DEFAULT_SAVED_TENSOR_OFFLOAD_MIN_BYTES
 
 
-def _decoder_saved_tensor_dtypes() -> frozenset[torch.dtype]:
-    raw = os.environ.get("ASYM_DECODER_SAVED_TENSOR_OFFLOAD_DTYPES")
+def _linear_attention_saved_tensor_dtypes() -> frozenset[torch.dtype]:
+    raw = os.environ.get("ASYM_LINEAR_ATTENTION_SAVED_TENSOR_OFFLOAD_DTYPES")
     if raw is None or raw.strip() == "":
         return _DEFAULT_SAVED_TENSOR_OFFLOAD_DTYPES
     allowed: set[torch.dtype] = set()
@@ -96,8 +96,8 @@ class _SavedTensorOffloadHandle:
     released: bool = False
 
 
-class DecoderSavedTensorOffloadWrapper:
-    """Forward wrapper that offloads large decoder-layer saved tensors to CPU."""
+class LinearAttentionSavedTensorOffloadWrapper:
+    """Forward wrapper that offloads large Qwen3.5 linear-attention saved tensors to CPU."""
 
     def __init__(
         self,
@@ -111,21 +111,20 @@ class DecoderSavedTensorOffloadWrapper:
         self.module = module
         self.original_forward: Callable[..., Any] = module.forward
         self.pin_memory = bool(pin_memory)
-        self.min_bytes = _decoder_saved_tensor_min_bytes() if min_bytes is None else max(0, int(min_bytes))
+        self.min_bytes = _linear_attention_saved_tensor_min_bytes() if min_bytes is None else max(0, int(min_bytes))
         self.allowed_dtypes = (
-            _decoder_saved_tensor_dtypes()
+            _linear_attention_saved_tensor_dtypes()
             if allowed_dtypes is None
             else frozenset(dtype for dtype in allowed_dtypes if isinstance(dtype, torch.dtype))
         )
         self.require_grad = (
-            _env_bool("ASYM_DECODER_SAVED_TENSOR_OFFLOAD_REQUIRE_GRAD", False)
+            _env_bool("ASYM_LINEAR_ATTENTION_SAVED_TENSOR_OFFLOAD_REQUIRE_GRAD", False)
             if require_grad is None
             else bool(require_grad)
         )
         self.calls = 0
         self.offload_calls = 0
         self.unpack_calls = 0
-        self.skipped_cache_calls = 0
         self.skipped_tensors = 0
         self.skipped_bytes = 0
         self.offloaded_bytes = 0
@@ -143,15 +142,12 @@ class DecoderSavedTensorOffloadWrapper:
         self._sync_module_stats()
 
     def install(self) -> None:
-        setattr(self.module, "_asym_decoder_saved_tensor_offload_wrapper", self)
-        self.module.forward = types.MethodType(_decoder_saved_tensor_offload_forward, self.module)  # type: ignore[method-assign]
+        setattr(self.module, "_asym_linear_attention_saved_tensor_offload_wrapper", self)
+        self.module.forward = types.MethodType(_linear_attention_saved_tensor_offload_forward, self.module)  # type: ignore[method-assign]
 
     def run(self, *args: Any, **kwargs: Any) -> Any:
         self.calls += 1
         if not self.module.training or not torch.is_grad_enabled():
-            return self.original_forward(*args, **kwargs)
-        if bool(kwargs.get("use_cache", False)):
-            self.skipped_cache_calls += 1
             return self.original_forward(*args, **kwargs)
         with saved_tensors_hooks(self._pack, self._unpack):
             return self.original_forward(*args, **kwargs)
@@ -181,7 +177,7 @@ class DecoderSavedTensorOffloadWrapper:
     def _tag_for(self, tensor: torch.Tensor) -> str:
         dtype_name = str(tensor.dtype).replace("torch.", "")
         shape = "x".join(str(int(dim)) for dim in tensor.shape) or "scalar"
-        return f"decoder.saved.{dtype_name}.{shape}"
+        return f"linear_attention.saved.{dtype_name}.{shape}"
 
     def _pack(self, tensor: torch.Tensor) -> torch.Tensor | _SavedTensorOffloadHandle:
         if not self._should_offload(tensor):
@@ -247,7 +243,7 @@ class DecoderSavedTensorOffloadWrapper:
 
     def snapshot(self) -> dict[str, Any]:
         return {
-            "decoder_saved_tensor_offload": True,
+            "linear_attention_saved_tensor_offload": True,
             "calls": self.calls,
             "min_bytes": self.min_bytes,
             "require_grad": self.require_grad,
@@ -261,7 +257,6 @@ class DecoderSavedTensorOffloadWrapper:
             "num_offloads": self.offload_calls,
             "num_cpu_allocs": self.offload_calls,
             "num_stages": self.unpack_calls,
-            "skipped_cache_calls": self.skipped_cache_calls,
             "skipped_tensors": self.skipped_tensors,
             "skipped_bytes": self.skipped_bytes,
             "offload_bytes_by_tag": dict(self.offload_bytes_by_tag),
@@ -279,24 +274,24 @@ class DecoderSavedTensorOffloadWrapper:
         setattr(self.module, "_last_activation_offload_stats", self.snapshot())
 
 
-def _decoder_saved_tensor_offload_forward(module: nn.Module, *args: Any, **kwargs: Any) -> Any:
-    wrapper = getattr(module, "_asym_decoder_saved_tensor_offload_wrapper", None)
-    if not isinstance(wrapper, DecoderSavedTensorOffloadWrapper):
-        raise RuntimeError("decoder saved-tensor offload wrapper is missing from module")
+def _linear_attention_saved_tensor_offload_forward(module: nn.Module, *args: Any, **kwargs: Any) -> Any:
+    wrapper = getattr(module, "_asym_linear_attention_saved_tensor_offload_wrapper", None)
+    if not isinstance(wrapper, LinearAttentionSavedTensorOffloadWrapper):
+        raise RuntimeError("linear-attention saved-tensor offload wrapper is missing from module")
     return wrapper.run(*args, **kwargs)
 
 
-def install_decoder_saved_tensor_offload(
+def install_linear_attention_saved_tensor_offload(
     module: nn.Module,
     *,
     min_bytes: int | None = None,
     require_grad: bool | None = None,
     allowed_dtypes: set[torch.dtype] | frozenset[torch.dtype] | None = None,
-) -> DecoderSavedTensorOffloadWrapper:
-    existing = getattr(module, "_asym_decoder_saved_tensor_offload_wrapper", None)
-    if isinstance(existing, DecoderSavedTensorOffloadWrapper):
+) -> LinearAttentionSavedTensorOffloadWrapper:
+    existing = getattr(module, "_asym_linear_attention_saved_tensor_offload_wrapper", None)
+    if isinstance(existing, LinearAttentionSavedTensorOffloadWrapper):
         return existing
-    wrapper = DecoderSavedTensorOffloadWrapper(
+    wrapper = LinearAttentionSavedTensorOffloadWrapper(
         module,
         min_bytes=min_bytes,
         require_grad=require_grad,
@@ -306,19 +301,22 @@ def install_decoder_saved_tensor_offload(
     return wrapper
 
 
-def is_decoder_saved_tensor_offload_wrapper(module: nn.Module) -> bool:
-    return isinstance(getattr(module, "_asym_decoder_saved_tensor_offload_wrapper", None), DecoderSavedTensorOffloadWrapper)
+def is_linear_attention_saved_tensor_offload_wrapper(module: nn.Module) -> bool:
+    return isinstance(
+        getattr(module, "_asym_linear_attention_saved_tensor_offload_wrapper", None),
+        LinearAttentionSavedTensorOffloadWrapper,
+    )
 
 
-def decoder_saved_tensor_offload_module_names(model: nn.Module) -> tuple[str, ...]:
+def linear_attention_saved_tensor_offload_module_names(model: nn.Module) -> tuple[str, ...]:
     return tuple(
-        name for name, module in model.named_modules() if name and is_decoder_saved_tensor_offload_wrapper(module)
+        name for name, module in model.named_modules() if name and is_linear_attention_saved_tensor_offload_wrapper(module)
     )
 
 
 __all__ = [
-    "DecoderSavedTensorOffloadWrapper",
-    "decoder_saved_tensor_offload_module_names",
-    "install_decoder_saved_tensor_offload",
-    "is_decoder_saved_tensor_offload_wrapper",
+    "LinearAttentionSavedTensorOffloadWrapper",
+    "install_linear_attention_saved_tensor_offload",
+    "is_linear_attention_saved_tensor_offload_wrapper",
+    "linear_attention_saved_tensor_offload_module_names",
 ]

@@ -1572,6 +1572,53 @@ def _actual_peak_memory_breakdown_csv_rows(summary: dict[str, Any]) -> list[dict
     return normalized
 
 
+def _memory_live_activation_detail_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+
+    def add_rows(raw_rows: Any, *, peak_kind: str, step: Any, phase: Any) -> None:
+        if not isinstance(raw_rows, list):
+            return
+        for row in raw_rows:
+            if not isinstance(row, dict):
+                continue
+            bytes_value = int(row.get("bytes", 0) or 0)
+            shape = row.get("shape", [])
+            if isinstance(shape, list):
+                shape_value = "x".join(str(item) for item in shape)
+            else:
+                shape_value = str(shape or "")
+            result.append(
+                {
+                    "peak_kind": peak_kind,
+                    "step": step,
+                    "phase": phase,
+                    "component": _memory_breakdown_component(row.get("component", "-")),
+                    "module_name": row.get("module_name", ""),
+                    "dtype": row.get("dtype", ""),
+                    "shape": shape_value,
+                    "bytes": bytes_value,
+                    "mib": bytes_value / (1024.0 ** 2),
+                    "ref_count": int(row.get("ref_count", 0) or 0),
+                    "device": row.get("device", ""),
+                    "storage_bytes": int(row.get("storage_bytes", bytes_value) or 0),
+                }
+            )
+
+    add_rows(
+        summary.get("live_activation_detail_rows_at_peak", []),
+        peak_kind="selected",
+        step=summary.get("selected_step", ""),
+        phase=summary.get("selected_phase", ""),
+    )
+    add_rows(
+        summary.get("actual_peak_live_activation_detail_rows", []),
+        peak_kind="actual",
+        step=summary.get("actual_peak_step", ""),
+        phase=summary.get("actual_peak_phase", ""),
+    )
+    return result
+
+
 def _source_memory_breakdown_markdown(profile: dict[str, Any], *, top_level: bool = False) -> str:
     summary = _memory_breakdown_summary(profile)
     rows = _memory_breakdown_csv_rows(summary)
@@ -2068,11 +2115,14 @@ def _write_source_artifacts(source_profile_json: Path, output_dir: Path, profile
     memory_breakdown_summary = _memory_breakdown_summary(profile)
     breakdown_rows = _memory_breakdown_csv_rows(memory_breakdown_summary)
     actual_breakdown_rows = _actual_peak_memory_breakdown_csv_rows(memory_breakdown_summary)
+    live_activation_detail_rows = _memory_live_activation_detail_rows(memory_breakdown_summary)
     if breakdown and breakdown_rows:
         (output_dir / "memory_breakdown.md").write_text(breakdown, encoding="utf-8")
         _write_csv(output_dir / "memory_breakdown.csv", breakdown_rows)
     if actual_breakdown_rows:
         _write_csv(output_dir / "memory_actual_peak_breakdown.csv", actual_breakdown_rows)
+    if live_activation_detail_rows:
+        _write_csv(output_dir / "memory_live_activation_details.csv", live_activation_detail_rows)
     process_memory_rows = _process_memory_rows(profile)
     if process_memory_rows:
         _write_csv(output_dir / "process_memory.csv", process_memory_rows)
@@ -2139,6 +2189,9 @@ def _write_profile_csv_artifacts(profile_json: Path, output_dir: Path) -> None:
     actual_breakdown_rows = _actual_peak_memory_breakdown_csv_rows(memory_breakdown_summary)
     if actual_breakdown_rows:
         _write_csv(output_dir / "memory_actual_peak_breakdown.csv", actual_breakdown_rows)
+    live_activation_detail_rows = _memory_live_activation_detail_rows(memory_breakdown_summary)
+    if live_activation_detail_rows:
+        _write_csv(output_dir / "memory_live_activation_details.csv", live_activation_detail_rows)
     process_memory_rows = _process_memory_rows(source_profile)
     if process_memory_rows:
         _write_csv(output_dir / "process_memory.csv", process_memory_rows)

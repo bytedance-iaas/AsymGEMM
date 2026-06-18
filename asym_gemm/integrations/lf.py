@@ -5,7 +5,7 @@ import ctypes
 import gc
 import json
 import os
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,11 +28,16 @@ from asym_gemm.training.decoder_activation_offload import (
     decoder_saved_tensor_offload_module_names,
     install_decoder_saved_tensor_offload,
 )
+from asym_gemm.training.linear_attention_activation_offload import (
+    install_linear_attention_saved_tensor_offload,
+    linear_attention_saved_tensor_offload_module_names,
+)
 from asym_gemm.training.decoder_checkpoint import (
     decoder_checkpoint_module_names,
     install_decoder_checkpoint,
 )
 from asym_gemm.training.frozen_linear import AsymExecutionStats, AsymFrozenLinear
+from asym_gemm.training.host_weight import tensor_nbytes
 from asym_gemm.training.lora import (
     AsymLoRALinear,
     TorchLoRALinear,
@@ -130,6 +135,50 @@ def _release_replaced_module_memory() -> None:
         return
 _ATTENTION_TARGETS = frozenset({"q_proj", "k_proj", "v_proj", "o_proj"})
 _LINEAR_ATTENTION_LEAVES = frozenset({"in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"})
+_VISION_PATH_MARKERS = (
+    ".visual.",
+    ".vision.",
+    ".vision_model.",
+    ".vision_tower.",
+)
+_MULTIMODAL_PROJECTOR_PATH_MARKERS = (
+    ".multi_modal_projector.",
+    ".visual.merger.",
+    ".model.visual.merger.",
+)
+_QWEN35_LINEAR_ATTN_RUNTIME_MARKERS = (
+    ".linear_attn.conv1d.",
+    ".linear_attn.dt_bias.",
+    ".linear_attn.a_log.",
+    ".linear_attn.norm.",
+)
+
+
+def _path_for_match(name: str) -> str:
+    return f".{str(name).lower().strip('.')}."
+
+
+def _is_vision_path(name: str) -> bool:
+    lower = _path_for_match(name)
+    return any(marker in lower for marker in _VISION_PATH_MARKERS)
+
+
+def _is_multimodal_projector_path(name: str) -> bool:
+    lower = _path_for_match(name)
+    return any(marker in lower for marker in _MULTIMODAL_PROJECTOR_PATH_MARKERS)
+
+
+def _is_vision_or_multimodal_path(name: str) -> bool:
+    return _is_vision_path(name) or _is_multimodal_projector_path(name)
+
+
+def _is_qwen35_linear_attn_runtime_state(name: str) -> bool:
+    lower = _path_for_match(name)
+    return any(marker in lower for marker in _QWEN35_LINEAR_ATTN_RUNTIME_MARKERS)
+
+
+def _is_lora_parameter_name(name: str) -> bool:
+    return "lora_" in name or ".lora_A." in name or ".lora_B." in name
 
 
 @dataclass(frozen=True)
@@ -211,6 +260,7 @@ class LFAsymReport:
     cpu_resident_base_bytes_by_component: dict[str, int] = field(default_factory=dict)
     gpu_resident_base_bytes_by_component: dict[str, int] = field(default_factory=dict)
     selected_gpu_resident_base_bytes_by_component: dict[str, int] = field(default_factory=dict)
+    unselected_frozen_cuda_residue_bytes_by_component: dict[str, int] = field(default_factory=dict)
     offload_modules: str = "routed_experts"
     expert_recompute_policy: str = "none"
     router_mode: str = "whole"
@@ -234,6 +284,9 @@ class LFAsymReport:
     attention_saved_tensor_offload_wrapped: int = 0
     attention_saved_tensor_offload_modules: tuple[str, ...] = ()
     attention_saved_tensor_offload_skipped: tuple[str, ...] = ()
+    linear_attention_saved_tensor_offload_wrapped: int = 0
+    linear_attention_saved_tensor_offload_modules: tuple[str, ...] = ()
+    linear_attention_saved_tensor_offload_skipped: tuple[str, ...] = ()
     skipped: list[str] = field(default_factory=list)
     stats: AsymExecutionStats | None = field(default=None, repr=False)
 
@@ -252,6 +305,9 @@ class LFAsymReport:
         selected_gpu_by_component = ",".join(
             f"{key}:{value}" for key, value in sorted(self.selected_gpu_resident_base_bytes_by_component.items())
         ) or "none"
+        unselected_residue_by_component = ",".join(
+            f"{key}:{value}" for key, value in sorted(self.unselected_frozen_cuda_residue_bytes_by_component.items())
+        ) or "none"
         return (
             "AsymGEMM LoRA-SFT setup: "
             f"offload_modules={self.offload_modules}, "
@@ -264,6 +320,7 @@ class LFAsymReport:
             f"cpu_resident_base_bytes_by_component={cpu_by_component}, "
             f"gpu_resident_base_bytes_by_component={gpu_by_component}, "
             f"selected_gpu_resident_base_bytes_by_component={selected_gpu_by_component}, "
+            f"unselected_frozen_cuda_residue_bytes_by_component={unselected_residue_by_component}, "
             f"expert_recompute_policy={self.expert_recompute_policy}, "
             f"attention_gc_enabled={self.attention_gc_enabled}, "
             f"attention_gc_wrapped={self.attention_gc_wrapped}, "
@@ -274,6 +331,7 @@ class LFAsymReport:
             f"layer_act_offload_enabled={self.layer_act_offload_enabled}, "
             f"layer_act_offload_wrapped={self.layer_act_offload_wrapped}, "
             f"attention_saved_tensor_offload_wrapped={self.attention_saved_tensor_offload_wrapped}, "
+            f"linear_attention_saved_tensor_offload_wrapped={self.linear_attention_saved_tensor_offload_wrapped}, "
             f"router_mode={self.router_mode}, "
             f"router_no_grad={self.router_no_grad}, "
             f"qwen3_moes_wrapped={self.qwen3_moes_wrapped}, "
@@ -308,6 +366,7 @@ class LFAsymReport:
             f"layer_act_offload_enabled={self.layer_act_offload_enabled}, "
             f"layer_act_offload_wrapped={self.layer_act_offload_wrapped}, "
             f"attention_saved_tensor_offload_wrapped={self.attention_saved_tensor_offload_wrapped}, "
+            f"linear_attention_saved_tensor_offload_wrapped={self.linear_attention_saved_tensor_offload_wrapped}, "
             f"router_mode={self.router_mode}, "
             f"router_no_grad={self.router_no_grad}, "
             f"reference_fallback_count={self.stats.reference_fallback_count}, "
@@ -438,6 +497,8 @@ def classify_lf_component(name: str, module: nn.Module | None = None) -> str:
     lower = name.lower()
     leaf = lower.rsplit(".", 1)[-1]
     module_name = type(module).__name__.lower() if module is not None else ""
+    if _is_vision_or_multimodal_path(lower):
+        return "vision"
     if (
         lower == "linear_attn"
         or lower.endswith(".linear_attn")
@@ -537,6 +598,266 @@ def component_is_selected(component: str, leaf: str, selection: LFOffloadSelecti
     if component == "mlp_dense":
         return selection.mlp_dense
     return False
+
+
+def _move_tensor_data_in_place(tensor: torch.Tensor, device: torch.device) -> None:
+    if tensor.device == device:
+        return
+    tensor.data = tensor.data.to(device=device, non_blocking=False)
+    if tensor.grad is not None:
+        tensor.grad.data = tensor.grad.data.to(device=device, non_blocking=False)
+
+
+def audit_lf_frozen_cuda_residue(
+    model: nn.Module,
+    *,
+    offload_modules: Sequence[str] | str | None,
+    strict: bool = True,
+    max_allowed_unselected_cuda_bytes: int = 8 * 1024 * 1024,
+    allowed_components: set[str] | frozenset[str] = frozenset({"linear_attention"}),
+) -> dict[str, int]:
+    selection = parse_lf_offload_modules(offload_modules)
+    rows = collect_lf_offload_residency(model, selection, classify_component=classify_lf_component)
+    residue: dict[str, int] = defaultdict(int)
+    examples: dict[str, list[str]] = defaultdict(list)
+    for row in rows:
+        if row.kind not in {"parameter", "buffer"}:
+            continue
+        if row.device != "cuda" or row.requires_grad or _is_lora_parameter_name(row.name):
+            continue
+        if row.selected_for_cpu:
+            continue
+        residue[row.component] = residue.get(row.component, 0) + int(row.bytes)
+        if len(examples[row.component]) < 8:
+            examples[row.component].append(row.name)
+
+    bad = {
+        component: bytes_value
+        for component, bytes_value in residue.items()
+        if component not in allowed_components and int(bytes_value) > int(max_allowed_unselected_cuda_bytes)
+    }
+    if strict and bad:
+        bad_examples = {component: examples[component] for component in bad}
+        raise RuntimeError(
+            "unselected frozen CUDA residue remains under Asym strict mode: "
+            f"bytes_by_component={bad}, examples={bad_examples}"
+        )
+    return dict(residue)
+
+
+def summarize_lf_tensor_devices(
+    model: nn.Module,
+    *,
+    offload_modules: Sequence[str] | str | None = None,
+    max_examples_per_component: int = 4,
+) -> dict[str, Any]:
+    selection = parse_lf_offload_modules(offload_modules or getattr(model, "_asym_offload_modules", None))
+    rows = collect_lf_offload_residency(model, selection, classify_component=classify_lf_component)
+    bytes_by_device_component: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    selected_cuda_bytes_by_component: dict[str, int] = defaultdict(int)
+    frozen_cuda_bytes_by_component: dict[str, int] = defaultdict(int)
+    cuda_examples_by_component: dict[str, list[str]] = defaultdict(list)
+    seen_host_keys: set[tuple[Any, ...]] = set()
+
+    for row in rows:
+        if row.kind == "host_weight_alias":
+            continue
+        if row.kind == "host_weight":
+            if row.storage_key is not None and row.storage_key in seen_host_keys:
+                continue
+            if row.storage_key is not None:
+                seen_host_keys.add(row.storage_key)
+
+        bytes_by_device_component[row.device][row.component] += int(row.bytes)
+        if row.device == "cuda":
+            if row.selected_for_cpu:
+                selected_cuda_bytes_by_component[row.component] += int(row.bytes)
+            if not row.requires_grad and not _is_lora_parameter_name(row.name):
+                frozen_cuda_bytes_by_component[row.component] += int(row.bytes)
+            examples = cuda_examples_by_component[row.component]
+            if len(examples) < max(0, int(max_examples_per_component)):
+                examples.append(row.name)
+
+    def _sorted_int_dict(values: Mapping[str, int]) -> dict[str, int]:
+        return {key: int(values[key]) for key in sorted(values)}
+
+    return {
+        "bytes_by_device_component": {
+            device: _sorted_int_dict(values)
+            for device, values in sorted(bytes_by_device_component.items())
+        },
+        "cuda_bytes_by_component": _sorted_int_dict(bytes_by_device_component.get("cuda", {})),
+        "cpu_bytes_by_component": _sorted_int_dict(bytes_by_device_component.get("cpu", {})),
+        "selected_cuda_bytes_by_component": _sorted_int_dict(selected_cuda_bytes_by_component),
+        "frozen_cuda_bytes_by_component": _sorted_int_dict(frozen_cuda_bytes_by_component),
+        "cuda_examples_by_component": {
+            component: tuple(names) for component, names in sorted(cuda_examples_by_component.items())
+        },
+    }
+
+
+def _module_tensor_nbytes(module: nn.Module) -> int:
+    total = 0
+    seen: set[tuple[Any, ...]] = set()
+    for tensor in list(module.parameters(recurse=True)) + list(module.buffers(recurse=True)):
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        key = storage_key(tensor)
+        if key in seen:
+            continue
+        seen.add(key)
+        total += tensor_nbytes(tensor)
+    return total
+
+
+def _looks_like_qwen35_vision_tower(module: nn.Module) -> bool:
+    if all(hasattr(module, attr) for attr in ("patch_embed", "blocks", "merger")):
+        return True
+    class_name = type(module).__name__.lower()
+    return "visionmodel" in class_name or "vision_model" in class_name
+
+
+class _DroppedFrozenVisionTower(nn.Module):
+    def __init__(self, source: nn.Module, *, source_name: str) -> None:
+        super().__init__()
+        self.source_name = str(source_name)
+        self.spatial_merge_size = int(getattr(source, "spatial_merge_size", 1))
+        self.dtype = getattr(source, "dtype", torch.bfloat16)
+        config = getattr(source, "config", None)
+        if config is not None:
+            self.config = config
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(
+            "Qwen3.5 vision tower was removed by ASYM_GEMM_LF_DROP_FROZEN_VISION=1; "
+            "this text-only profiling run cannot accept image/video inputs."
+        )
+
+
+def drop_lf_frozen_vision_tower_for_text_only_profile(
+    model: nn.Module,
+    *,
+    strict: bool = True,
+) -> dict[str, Any]:
+    candidates: list[str] = []
+    for name, module in list(model.named_modules()):
+        if not name:
+            continue
+        if not _is_vision_path(name) or _is_multimodal_projector_path(name):
+            continue
+        if _looks_like_qwen35_vision_tower(module):
+            candidates.append(name)
+
+    selected: list[str] = []
+    for name in sorted(candidates, key=lambda item: (item.count("."), len(item), item)):
+        if any(name == parent or name.startswith(f"{parent}.") for parent in selected):
+            continue
+        selected.append(name)
+
+    if strict and not selected:
+        raise RuntimeError("ASYM_GEMM_LF_DROP_FROZEN_VISION=1 but no frozen Qwen3.5 vision tower was found")
+
+    summaries: list[dict[str, Any]] = []
+    removed_bytes = 0
+    for name in selected:
+        module = model.get_submodule(name)
+        trainable = [param_name for param_name, param in module.named_parameters(recurse=True) if param.requires_grad]
+        if trainable and strict:
+            raise RuntimeError(
+                f"refusing to drop trainable vision tower {name}; trainable params include {trainable[:8]}"
+            )
+        nbytes = _module_tensor_nbytes(module)
+        parent, child_name = _parent_and_child(model, name)
+        _replace_child(parent, child_name, _DroppedFrozenVisionTower(module, source_name=name))
+        removed_bytes += nbytes
+        summaries.append({"name": name, "removed_bytes": int(nbytes), "type": type(module).__name__})
+        del module
+
+    _release_replaced_module_memory()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"dropped_vision_towers": tuple(summaries), "removed_bytes": int(removed_bytes)}
+
+
+@torch.no_grad()
+def move_lf_asym_cpu_first_model_to_device(
+    model: nn.Module,
+    device: torch.device | str,
+    *,
+    offload_modules: Sequence[str] | str | None,
+    strict: bool = True,
+    keep_frozen_vision_on_cpu: bool = True,
+    keep_frozen_projector_on_cpu: bool = True,
+) -> dict[str, Any]:
+    target_device = torch.device(device)
+    selection = parse_lf_offload_modules(offload_modules)
+    moved_bytes_by_reason: dict[str, int] = defaultdict(int)
+    kept_cpu_bytes_by_component: dict[str, int] = defaultdict(int)
+
+    def should_keep_cpu(name: str, tensor: torch.Tensor) -> bool:
+        if bool(getattr(tensor, "requires_grad", False)):
+            return False
+        if keep_frozen_vision_on_cpu and _is_vision_path(name):
+            return True
+        if keep_frozen_projector_on_cpu and _is_multimodal_projector_path(name):
+            return True
+        return False
+
+    def should_force_cuda(name: str, tensor: torch.Tensor) -> bool:
+        if bool(getattr(tensor, "requires_grad", False)):
+            return True
+        if _is_lora_parameter_name(name):
+            return True
+        if _is_qwen35_linear_attn_runtime_state(name):
+            return True
+        return False
+
+    for name, param in model.named_parameters(recurse=True):
+        if should_keep_cpu(name, param):
+            kept_cpu_bytes_by_component["vision_or_projector"] += tensor_nbytes(param)
+            continue
+        if should_force_cuda(name, param):
+            _move_tensor_data_in_place(param, target_device)
+            moved_bytes_by_reason["trainable_or_text_runtime"] += tensor_nbytes(param)
+            continue
+
+        component = classify_lf_component(name)
+        leaf = name.rsplit(".", 1)[-1]
+        selected = component_is_selected(component, leaf, selection)
+        if selected and strict:
+            raise RuntimeError(
+                f"{name} is selected for Asym CPU offload but remains a raw parameter before device move"
+            )
+
+        _move_tensor_data_in_place(param, target_device)
+        moved_bytes_by_reason[f"unselected_{component}"] += tensor_nbytes(param)
+
+    for name, buffer in model.named_buffers(recurse=True):
+        if not isinstance(buffer, torch.Tensor):
+            continue
+        if should_keep_cpu(name, buffer):
+            kept_cpu_bytes_by_component["vision_or_projector"] += tensor_nbytes(buffer)
+            continue
+        if _is_qwen35_linear_attn_runtime_state(name):
+            buffer.data = buffer.data.to(device=target_device, non_blocking=False)
+            moved_bytes_by_reason["linear_attention_runtime_buffer"] += tensor_nbytes(buffer)
+            continue
+        if buffer.device != target_device:
+            buffer.data = buffer.data.to(device=target_device, non_blocking=False)
+            moved_bytes_by_reason[f"buffer_{classify_lf_component(name)}"] += tensor_nbytes(buffer)
+
+    residue = audit_lf_frozen_cuda_residue(
+        model,
+        offload_modules=selection.raw,
+        strict=strict,
+        max_allowed_unselected_cuda_bytes=8 * 1024 * 1024,
+        allowed_components=frozenset({"linear_attention"}),
+    )
+    return {
+        "moved_bytes_by_reason": dict(moved_bytes_by_reason),
+        "kept_cpu_bytes_by_component": dict(kept_cpu_bytes_by_component),
+        "unselected_frozen_cuda_residue_bytes_by_component": dict(residue),
+    }
 
 
 def _is_stateless_module(module: nn.Module) -> bool:
@@ -1016,6 +1337,43 @@ def _wrap_qwen3_decoder_saved_tensor_offload_modules(
             skipped.append(f"{name}:vision_or_multimodal")
     if strict and not wrapped:
         raise RuntimeError("Qwen3 decoder layer activation offload requested but no supported decoder layers were found")
+    return tuple(wrapped), tuple(skipped)
+
+
+def _is_qwen35_linear_attention_module_name(name: str, module: nn.Module) -> bool:
+    if not name:
+        return False
+    if _has_attention_excluded_path_marker(name):
+        return False
+    if not name.lower().endswith(".linear_attn"):
+        return False
+    child_names = set(dict(module.named_children()))
+    return _LINEAR_ATTENTION_LEAVES <= child_names
+
+
+def _wrap_linear_attention_saved_tensor_offload_modules(
+    model: nn.Module,
+    *,
+    strict: bool,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    wrapped: list[str] = []
+    skipped: list[str] = []
+    saw_linear_attn_name = False
+    for name, module in list(model.named_modules()):
+        if not name:
+            continue
+        if name.lower().endswith(".linear_attn"):
+            saw_linear_attn_name = True
+        if _is_qwen35_linear_attention_module_name(name, module):
+            install_linear_attention_saved_tensor_offload(module)
+            wrapped.append(name)
+            continue
+        lower = f".{name.lower()}."
+        leaf = name.rsplit(".", 1)[-1].lower()
+        if leaf == "linear_attn" and any(marker in lower for marker in _ATTENTION_GC_EXCLUDED_PATH_MARKERS):
+            skipped.append(f"{name}:vision_or_multimodal")
+    if strict and saw_linear_attn_name and not wrapped:
+        raise RuntimeError("Qwen3.5 linear-attention activation offload requested but no supported linear_attn modules were found")
     return tuple(wrapped), tuple(skipped)
 
 
@@ -1617,19 +1975,33 @@ def apply_lf_asym_lora(
 
     layer_saved_modules: tuple[str, ...] = ()
     layer_saved_skipped: tuple[str, ...] = ()
+    linear_attention_saved_modules: tuple[str, ...] = ()
+    linear_attention_saved_skipped: tuple[str, ...] = ()
     if layer_act_enabled:
         layer_saved_modules, layer_saved_skipped = _wrap_qwen3_decoder_saved_tensor_offload_modules(
             model,
             strict=strict,
         )
+        if selection.linear_attention:
+            linear_attention_saved_modules, linear_attention_saved_skipped = _wrap_linear_attention_saved_tensor_offload_modules(
+                model,
+                strict=strict,
+            )
     report.layer_act_offload_wrapped = len(layer_saved_modules)
     report.layer_act_offload_modules = tuple(layer_saved_modules)
     report.layer_act_offload_skipped = tuple(layer_saved_skipped)
     if layer_saved_skipped:
         report.skipped.extend(layer_saved_skipped)
+    report.linear_attention_saved_tensor_offload_wrapped = len(linear_attention_saved_modules)
+    report.linear_attention_saved_tensor_offload_modules = tuple(linear_attention_saved_modules)
+    report.linear_attention_saved_tensor_offload_skipped = tuple(linear_attention_saved_skipped)
+    if linear_attention_saved_skipped:
+        report.skipped.extend(linear_attention_saved_skipped)
     setattr(model, "_asym_layer_act_offload_enabled", bool(layer_act_enabled))
     setattr(model, "_asym_layer_act_offload_modules", tuple(layer_saved_modules))
     setattr(model, "_asym_layer_act_offload_skipped", tuple(layer_saved_skipped))
+    setattr(model, "_asym_linear_attention_saved_tensor_offload_modules", tuple(linear_attention_saved_modules))
+    setattr(model, "_asym_linear_attention_saved_tensor_offload_skipped", tuple(linear_attention_saved_skipped))
 
     freeze_non_lora_params(model)
     _validate_trainable_params(model)
@@ -1770,6 +2142,14 @@ def _infer_adapter_config(model: nn.Module, metadata: Mapping[str, Any] | None) 
         config["asym_layer_act_offload_modules"] = list(layer_act_modules)
         config["asym_layer_act_offload_skipped"] = list(getattr(model, "_asym_layer_act_offload_skipped", ()))
         config["asym_decoder_saved_tensor_offload_modules"] = list(layer_saved_modules)
+        linear_attention_saved_modules = tuple(
+            getattr(model, "_asym_linear_attention_saved_tensor_offload_modules", ())
+        ) or linear_attention_saved_tensor_offload_module_names(model)
+        if linear_attention_saved_modules:
+            config["asym_linear_attention_saved_tensor_offload_modules"] = list(linear_attention_saved_modules)
+            config["asym_linear_attention_saved_tensor_offload_skipped"] = list(
+                getattr(model, "_asym_linear_attention_saved_tensor_offload_skipped", ())
+            )
     if metadata:
         config.update(_jsonable(dict(metadata)))
     return config
@@ -1845,6 +2225,10 @@ __all__ = [
     "count_lora_wrapped_modules",
     "get_asym_lora_state_dict",
     "load_asym_peft_adapter",
+    "audit_lf_frozen_cuda_residue",
+    "drop_lf_frozen_vision_tower_for_text_only_profile",
+    "move_lf_asym_cpu_first_model_to_device",
     "parse_lf_offload_modules",
     "save_asym_peft_adapter",
+    "summarize_lf_tensor_devices",
 ]

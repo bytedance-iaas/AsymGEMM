@@ -572,8 +572,14 @@ class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function):
         backend: str,
         snapshot: dict[str, Any] | None,
         attention_context: AttentionActivationOffloadContext | None,
+        module: "AsymActivationOffloadLoRALinear | None" = None,
     ) -> torch.Tensor:
         _check_backend(backend)
+        weight_offload_module = module if module is not None and getattr(module, "_weight_offload", None) is not None else None
+        if weight_offload_module is not None:
+            weight_offload_module.gather_lora_weights()
+            a = weight_offload_module.lora_a
+            b = weight_offload_module.lora_b
         if base_layer.precision != "bf16":
             raise NotImplementedError("attention activation offload currently supports only BF16 base weights")
         if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
@@ -621,7 +627,11 @@ class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function):
         s_handle = manager.offload(s.contiguous(), f"{projection_role}.S")
         _update_snapshot(snapshot, manager, attention_context)
 
-        ctx.save_for_backward(a, b)
+        if weight_offload_module is None:
+            ctx.save_for_backward(a, b)
+        else:
+            ctx.save_for_backward()
+        ctx.weight_offload_module = weight_offload_module
         ctx.manager = manager
         ctx.u_handle = u_handle
         ctx.shared_source = shared_source
@@ -636,17 +646,25 @@ class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function):
         ctx.lora_dropout_p = float(lora_dropout_p)
         ctx.snapshot = snapshot
         ctx.attention_context = attention_context
+        if weight_offload_module is not None and bool(getattr(weight_offload_module, "_weight_offload_release_after_forward", True)):
+            weight_offload_module.release_lora_weights()
         return _restore_last_dim(out, input_shape, base_layer.out_features)
 
     @staticmethod
     def backward(
         ctx: Any,
         grad_output: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None, None, None, None, None, None, None, None, None, None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None, None, None, None, None, None, None, None, None, None, None]:
         if ctx.lora_dropout_p != 0.0:
             raise NotImplementedError("attention activation offload dropout is not implemented yet")
 
-        a, b = ctx.saved_tensors
+        if getattr(ctx, "weight_offload_module", None) is not None:
+            module: AsymActivationOffloadLoRALinear = ctx.weight_offload_module
+            module.gather_lora_weights()
+            a = module.lora_a
+            b = module.lora_b
+        else:
+            a, b = ctx.saved_tensors
         manager: ActivationOffloadManager = ctx.manager
         u_handle: CPUActivationHandle = ctx.u_handle
         s_handle: CPUActivationHandle = ctx.s_handle
@@ -722,7 +740,7 @@ class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function):
                 ctx.shared_source.release()
             _update_snapshot(ctx.snapshot, manager, ctx.attention_context)
 
-        return grad_x, grad_a, grad_b, None, None, None, None, None, None, None, None, None, None
+        return grad_x, grad_a, grad_b, None, None, None, None, None, None, None, None, None, None, None
 
 
 class AsymActivationOffloadLoRALinear(nn.Module):
@@ -889,6 +907,9 @@ class AsymActivationOffloadLoRALinear(nn.Module):
         self.projection_role = str(projection_role)
         self.attention_context = attention_context
         self._last_activation_offload_stats: dict[str, Any] = {}
+        self._weight_offload = None
+        object.__setattr__(self, "_weight_offload_owner", self)
+        self._weight_offload_release_after_forward = True
         self._reset_lora(adapter_name, lora_generator, init_lora_weights=init_lora_weights)
 
     @property
@@ -930,6 +951,16 @@ class AsymActivationOffloadLoRALinear(nn.Module):
                 generator=generator,
             )
 
+    def gather_lora_weights(self) -> None:
+        coordinator = getattr(self, "_weight_offload", None)
+        if coordinator is not None:
+            coordinator.gather_group(getattr(self, "_weight_offload_owner", self))
+
+    def release_lora_weights(self) -> None:
+        coordinator = getattr(self, "_weight_offload", None)
+        if coordinator is not None:
+            coordinator.release_group(getattr(self, "_weight_offload_owner", self))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _AsymActivationOffloadLoRALinearFunction.apply(
             x,
@@ -945,6 +976,7 @@ class AsymActivationOffloadLoRALinear(nn.Module):
             self.base_layer.backend,
             self._last_activation_offload_stats,
             self.attention_context,
+            self,
         )
 
 

@@ -13,6 +13,22 @@ from .host_weight import HostWeight, tensor_nbytes
 
 ComponentClassifier = Callable[[str, nn.Module | None], str]
 _LINEAR_ATTENTION_LEAVES = frozenset({"in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"})
+_VISION_PATH_MARKERS = (
+    ".visual.",
+    ".vision.",
+    ".vision_model.",
+    ".vision_tower.",
+    ".multi_modal_projector.",
+)
+
+
+def _path_for_match(name: str) -> str:
+    return f".{str(name).lower().strip('.')}."
+
+
+def _is_vision_path(name: str) -> bool:
+    lower = _path_for_match(name)
+    return any(marker in lower for marker in _VISION_PATH_MARKERS)
 
 
 @dataclass(frozen=True)
@@ -42,6 +58,8 @@ def storage_key(tensor: torch.Tensor) -> tuple[Any, ...]:
 def _default_classify_component(name: str, module: nn.Module | None = None) -> str:
     lower = name.lower()
     leaf = lower.rsplit(".", 1)[-1]
+    if _is_vision_path(lower):
+        return "vision"
     if ".mlp.shared_expert" in lower or ".shared_expert." in lower or ".shared_experts." in lower:
         return "shared_experts"
     if lower == "shared_expert_gate" or lower.endswith(".shared_expert_gate") or ".shared_expert_gate." in lower:

@@ -243,6 +243,15 @@ class _Llama4SharedMLPActivationOffloadFunction(torch.autograd.Function):
     ) -> torch.Tensor:
         if x.dim() < 1:
             raise ValueError("Llama4 shared expert MLP expects a tensor with a hidden dimension")
+        weight_offload = getattr(layer, "_weight_offload", None) is not None
+        if weight_offload:
+            layer.gather_lora_weights()
+            gate_a = layer.gate_proj.lora_a
+            gate_b = layer.gate_proj.lora_b
+            up_a = layer.up_proj.lora_a
+            up_b = layer.up_proj.lora_b
+            down_a = layer.down_proj.lora_a
+            down_b = layer.down_proj.lora_b
         flat = x.reshape(-1, layer.hidden_size).contiguous()
         if flat.dtype != torch.bfloat16:
             raise ValueError(f"Llama4 shared expert activation offload requires bf16 input, got {flat.dtype}")
@@ -285,19 +294,34 @@ class _Llama4SharedMLPActivationOffloadFunction(torch.autograd.Function):
             out = down_base + down_delta.to(dtype=down_base.dtype)
             del down_base, down_delta, activated
 
-        ctx.save_for_backward(gate_a, gate_b, up_a, up_b, down_a, down_b)
+        if weight_offload:
+            ctx.save_for_backward()
+        else:
+            ctx.save_for_backward(gate_a, gate_b, up_a, up_b, down_a, down_b)
+        ctx.weight_offload = bool(weight_offload)
         ctx.layer = layer
         ctx.manager = manager
         ctx.x_cpu = x_cpu
         ctx.input_shape = tuple(int(dim) for dim in x.shape)
         ctx.input_dtype = x.dtype
         layer._last_activation_offload_stats = manager.snapshot()
+        if weight_offload and bool(getattr(layer, "_weight_offload_release_after_forward", True)):
+            layer.release_lora_weights()
         return out.reshape(*ctx.input_shape[:-1], layer.hidden_size)
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor):
-        gate_a, gate_b, up_a, up_b, down_a, down_b = ctx.saved_tensors
         layer: AsymLlama4SharedMLP = ctx.layer
+        if getattr(ctx, "weight_offload", False):
+            layer.gather_lora_weights()
+            gate_a = layer.gate_proj.lora_a
+            gate_b = layer.gate_proj.lora_b
+            up_a = layer.up_proj.lora_a
+            up_b = layer.up_proj.lora_b
+            down_a = layer.down_proj.lora_a
+            down_b = layer.down_proj.lora_b
+        else:
+            gate_a, gate_b, up_a, up_b, down_a, down_b = ctx.saved_tensors
         manager: ActivationOffloadManager = ctx.manager
         x_stage = None
 
@@ -479,6 +503,8 @@ class AsymLlama4SharedMLP(nn.Module):
         self.stats = stats if stats is not None else AsymExecutionStats()
         self.profile_prefix = "layers.unknown.feed_forward.shared_expert"
         self._last_activation_offload_stats: dict[str, Any] = {}
+        self._weight_offload = None
+        self._weight_offload_release_after_forward = True
         self.preexisting_lora_leaf_count = sum(
             int(spec.preexisting_lora) for spec in (gate_spec, up_spec, down_spec)
         )
@@ -552,6 +578,32 @@ class AsymLlama4SharedMLP(nn.Module):
     @property
     def trainable_lora_params(self) -> int:
         return sum(param.numel() for name, param in self.named_parameters() if "lora_" in name or ".lora_A." in name or ".lora_B." in name)
+
+    def _lora_weight_banks(self) -> list[tuple[str, torch.nn.Parameter]]:
+        if not (
+            isinstance(self.gate_proj, AsymLoRALinear)
+            and isinstance(self.up_proj, AsymLoRALinear)
+            and isinstance(self.down_proj, AsymLoRALinear)
+        ):
+            return []
+        return [
+            ("gate_lora_A", self.gate_proj.lora_a),
+            ("gate_lora_B", self.gate_proj.lora_b),
+            ("up_lora_A", self.up_proj.lora_a),
+            ("up_lora_B", self.up_proj.lora_b),
+            ("down_lora_A", self.down_proj.lora_a),
+            ("down_lora_B", self.down_proj.lora_b),
+        ]
+
+    def gather_lora_weights(self) -> None:
+        coordinator = getattr(self, "_weight_offload", None)
+        if coordinator is not None:
+            coordinator.gather_group(self)
+
+    def release_lora_weights(self) -> None:
+        coordinator = getattr(self, "_weight_offload", None)
+        if coordinator is not None:
+            coordinator.release_group(self)
 
     def _profile_name(self, *parts: object) -> str:
         return scoped_name(self.profile_prefix, *parts)

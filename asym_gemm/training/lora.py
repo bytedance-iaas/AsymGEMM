@@ -174,6 +174,64 @@ class FrozenTorchLinear(nn.Module):
         return F.linear(x, self.weight, self.bias)
 
 
+class _AsymLoRALinearWeightOffloadFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, x: torch.Tensor, lora_a: torch.Tensor, lora_b: torch.Tensor, module: "AsymLoRALinear") -> torch.Tensor:
+        if not isinstance(module.lora_dropout, nn.Identity):
+            raise RuntimeError("Asym LoRA weight offload requires lora_dropout=0.0")
+        module.gather_lora_weights()
+        a = module.lora_a
+        b = module.lora_b
+        if a.dtype != module.lora_dtype or b.dtype != module.lora_dtype:
+            raise RuntimeError("Asym LoRA weight offload found staged weights with the wrong dtype")
+        if a.dim() != 2 or b.dim() != 2:
+            raise RuntimeError("Asym LoRA weight offload expects 2D LoRA A/B weights")
+        if int(a.shape[0]) != int(b.shape[1]):
+            raise RuntimeError(f"Asym LoRA rank mismatch: A={tuple(a.shape)} B={tuple(b.shape)}")
+        if x.shape[-1] != int(module.base_layer.in_features):
+            raise ValueError(f"expected input last dim {module.base_layer.in_features}, got {x.shape[-1]}")
+
+        input_shape = tuple(int(dim) for dim in x.shape)
+        flat = x.reshape(-1, int(module.base_layer.in_features)).contiguous()
+        x_lora = flat.to(dtype=module.lora_dtype).contiguous()
+        low_rank = F.linear(x_lora, a)
+        out = F.linear(low_rank, b) * float(module.scaling)
+
+        ctx.module = module
+        ctx.input_shape = input_shape
+        ctx.input_dtype = x.dtype
+        ctx.out_features = int(module.base_layer.out_features)
+        ctx.save_for_backward(x_lora, low_rank)
+        if bool(getattr(module, "_weight_offload_release_after_forward", True)):
+            module.release_lora_weights()
+        return out.reshape(*input_shape[:-1], ctx.out_features).to(dtype=x.dtype)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None]:
+        module: AsymLoRALinear = ctx.module
+        module.gather_lora_weights()
+        a = module.lora_a
+        b = module.lora_b
+        x_lora, low_rank = ctx.saved_tensors
+
+        grad_x = grad_a = grad_b = None
+        grad_flat = grad_output.reshape(-1, int(ctx.out_features)).to(dtype=module.lora_dtype).contiguous()
+        grad_scaled = grad_flat * float(module.scaling)
+        if ctx.needs_input_grad[2]:
+            grad_b = grad_scaled.t().contiguous().matmul(low_rank).to(dtype=b.dtype)
+        needs_low_rank_grad = bool(ctx.needs_input_grad[0] or ctx.needs_input_grad[1])
+        d_low_rank = grad_scaled.matmul(b) if needs_low_rank_grad else None
+        if ctx.needs_input_grad[1]:
+            if d_low_rank is None:
+                raise RuntimeError("internal error: missing low-rank gradient for LoRA-A")
+            grad_a = d_low_rank.t().contiguous().matmul(x_lora).to(dtype=a.dtype)
+        if ctx.needs_input_grad[0]:
+            if d_low_rank is None:
+                raise RuntimeError("internal error: missing low-rank gradient for input")
+            grad_x = d_low_rank.matmul(a).reshape(ctx.input_shape).to(dtype=ctx.input_dtype)
+        return grad_x, grad_a, grad_b, None
+
+
 class AsymLoRALinear(nn.Module):
     def __init__(
         self,
@@ -224,6 +282,9 @@ class AsymLoRALinear(nn.Module):
         self.scaling = float(alpha) / float(rank)
         self.precision = precision
         self.lora_dropout = nn.Dropout(p=float(lora_dropout)) if float(lora_dropout) > 0.0 else nn.Identity()
+        self._weight_offload = None
+        object.__setattr__(self, "_weight_offload_owner", self)
+        self._weight_offload_release_after_forward = True
         self._reset_lora(adapter_name, lora_generator, init_lora_weights=init_lora_weights)
 
     @classmethod
@@ -273,6 +334,9 @@ class AsymLoRALinear(nn.Module):
         obj.scaling = float(alpha) / float(rank)
         obj.precision = precision
         obj.lora_dropout = nn.Dropout(p=float(lora_dropout)) if float(lora_dropout) > 0.0 else nn.Identity()
+        obj._weight_offload = None
+        object.__setattr__(obj, "_weight_offload_owner", obj)
+        obj._weight_offload_release_after_forward = True
         obj._reset_lora(adapter_name, lora_generator, init_lora_weights=init_lora_weights)
         return obj
 
@@ -308,8 +372,28 @@ class AsymLoRALinear(nn.Module):
     def cpu_resident_base_weight_bytes(self) -> int:
         return self.base_layer.weight_hbm_saved_bytes
 
+    def gather_lora_weights(self) -> None:
+        coordinator = getattr(self, "_weight_offload", None)
+        if coordinator is not None:
+            coordinator.gather_group(getattr(self, "_weight_offload_owner", self))
+
+    def release_lora_weights(self) -> None:
+        coordinator = getattr(self, "_weight_offload", None)
+        if coordinator is not None:
+            coordinator.release_group(getattr(self, "_weight_offload_owner", self))
+
+    def _uses_lora_weight_offload(self) -> bool:
+        return (
+            getattr(self, "_weight_offload", None) is not None
+            and self.training
+            and torch.is_grad_enabled()
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base = self.base_layer(x)
+        if self._uses_lora_weight_offload():
+            lora = _AsymLoRALinearWeightOffloadFunction.apply(x, self.lora_a, self.lora_b, self)
+            return base + lora.to(dtype=base.dtype)
         lora_input = self.lora_dropout(x).to(dtype=self.lora_dtype)
         lora = self.lora_B[self.active_adapter](self.lora_A[self.active_adapter](lora_input)) * self.scaling
         return base + lora.to(dtype=base.dtype)

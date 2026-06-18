@@ -78,6 +78,12 @@ from .decoder_activation_offload import (
     install_decoder_saved_tensor_offload,
     is_decoder_saved_tensor_offload_wrapper,
 )
+from .linear_attention_activation_offload import (
+    LinearAttentionSavedTensorOffloadWrapper,
+    install_linear_attention_saved_tensor_offload,
+    is_linear_attention_saved_tensor_offload_wrapper,
+    linear_attention_saved_tensor_offload_module_names,
+)
 from .decoder_checkpoint import (
     DecoderCheckpointWrapper,
     decoder_checkpoint_module_names,
@@ -153,8 +159,10 @@ __all__ = [
     "attention_saved_tensor_offload_module_names",
     "DecoderCheckpointWrapper",
     "DecoderSavedTensorOffloadWrapper",
+    "LinearAttentionSavedTensorOffloadWrapper",
     "decoder_checkpoint_module_names",
     "decoder_saved_tensor_offload_module_names",
+    "linear_attention_saved_tensor_offload_module_names",
     "AsymCPUAdamW",
     "AsymMLP",
     "AsymLlama4Moe",
@@ -227,6 +235,7 @@ __all__ = [
     "is_attention_saved_tensor_offload_wrapper",
     "is_decoder_checkpoint_wrapper",
     "is_decoder_saved_tensor_offload_wrapper",
+    "is_linear_attention_saved_tensor_offload_wrapper",
     "load_lora_state_dict",
     "load_peft_adapter",
     "lora_parameters",
@@ -247,6 +256,7 @@ __all__ = [
     "install_attention_saved_tensor_offload",
     "install_decoder_checkpoint",
     "install_decoder_saved_tensor_offload",
+    "install_linear_attention_saved_tensor_offload",
     "initialize_asym_cuda_graph_state",
     "initialize_asym_single_group_launch_tensors",
     "require_expert_activation_offload_kernels",

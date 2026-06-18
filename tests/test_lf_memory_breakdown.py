@@ -218,6 +218,32 @@ def test_zero_reserved_gap_keeps_allocator_row_for_schema_closure() -> None:
     assert allocator_rows
     assert allocator_rows[0]["bytes"] == 0
     assert summary["reserved_stack_sum_bytes"] == 80
+
+
+def test_live_activation_detail_rows_are_preserved_in_summary() -> None:
+    row = _row(
+        phase="after_forward",
+        peak_allocated=96,
+        peak_reserved=128,
+        persistent={"linear_attention": {"weight": 16}},
+        live={"linear_attention": 32},
+    )
+    row["live_activation_detail_rows_at_peak"] = [
+        {
+            "component": "linear_attention",
+            "module_name": "layers.0.linear_attn",
+            "dtype": "bfloat16",
+            "shape": [2, 16, 8],
+            "bytes": 32,
+            "ref_count": 1,
+        }
+    ]
+
+    summary = build_memory_breakdown_summary([row])
+
+    assert summary["live_activation_detail_rows_at_peak"]
+    assert summary["live_activation_detail_rows_at_peak"][0]["module_name"] == "layers.0.linear_attn"
+    assert summary["actual_peak_live_activation_detail_rows"][0]["component"] == "linear_attention"
     assert validate_breakdown(summary) == []
 
 
