@@ -150,6 +150,9 @@ def get_cpu_extension():
         include_dirs=[
             _pybind11_include(),
             os.path.join(CPU_GEMM_SRC, 'include'),
+            # Internal headers: the MoE batch entry drives the worker pool
+            # directly (runtime/runtime_impl.h, runtime/worker_pool.h).
+            os.path.join(CPU_GEMM_SRC, 'src'),
         ],
         extra_objects=[CPU_GEMM_LIB],
         extra_compile_args=cxx_flags,

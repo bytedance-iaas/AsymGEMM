@@ -477,20 +477,36 @@ class Layer:
 
         out_fp32 = torch.zeros((T, H), dtype=torch.float32, device=in_device)
 
-        # ---- CPU bucket (unchanged from v1) ----
+        # ---- CPU bucket: all experts in one worker-pool job ----
+        # One parallel_for over the CPU experts (each runs gate/up/silu/down on
+        # a single pool thread) instead of a Python loop of per-expert cg_gemm
+        # launches — recovers cross-expert parallelism that dominated at decode,
+        # where every expert holds one row.
         if cpu_experts:
             x_cpu_bf16 = x_bf16.to("cpu", dtype=torch.bfloat16).contiguous()
             x_bits_all = torch_bf16_to_np_bits(x_cpu_bf16)
             route_w_cpu = route_w.to("cpu", dtype=torch.float32).numpy()
+            slab = self.slab
+
+            rows_cat  = np.concatenate([per_expert[e] for e in cpu_experts])
+            slots_cat = np.concatenate([per_expert_slot[e] for e in cpu_experts])
+            m_offsets = np.zeros(len(cpu_experts) + 1, dtype=np.int64)
+            np.cumsum([len(per_expert[e]) for e in cpu_experts], out=m_offsets[1:])
+            expert_ids = np.asarray(cpu_experts, dtype=np.int64)
+
+            x_cat = np.ascontiguousarray(x_bits_all[rows_cat])
+            out_cat = np.empty((rows_cat.shape[0], H), dtype=np.float32)
+            _C.moe_expert_forward_batch(
+                self.rt, x_cat, m_offsets, expert_ids,
+                slab.gate_int8.numpy(), slab.gate_scales.numpy(),
+                slab.up_int8.numpy(),   slab.up_scales.numpy(),
+                slab.down_int8.numpy(), slab.down_scales.numpy(),
+                out_cat, slab.inter, slab.hidden,
+            )
 
             cpu_out = np.zeros((T, H), dtype=np.float32)
-            for e in cpu_experts:
-                rows  = per_expert[e]
-                slots = per_expert_slot[e]
-                gathered = np.ascontiguousarray(x_bits_all[rows])
-                y = self._cpu_expert_forward(e, gathered)
-                w = route_w_cpu[rows, slots][:, None]
-                np.add.at(cpu_out, rows, y * w)
+            w = route_w_cpu[rows_cat, slots_cat][:, None]
+            np.add.at(cpu_out, rows_cat, out_cat * w)
             out_fp32 += torch.from_numpy(cpu_out).to(in_device, non_blocking=True)
 
         # ---- GPU bucket (grouped INT8 over pinned weights) ----
