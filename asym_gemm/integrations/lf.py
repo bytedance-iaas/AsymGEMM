@@ -66,13 +66,24 @@ from asym_gemm.training.qwen35_moe import (
     is_qwen35_moe_block,
     wrap_qwen35_moe_block,
 )
+from asym_gemm.training.qwen35_shared_mlp import AsymQwen35SharedMLP, is_qwen35_shared_mlp_leaf
 from asym_gemm.training.llama4_moe import AsymLlama4Moe, AsymLlama4Router, is_llama4_moe, wrap_llama4_moe
 from asym_gemm.training.llama4_shared_mlp import AsymLlama4SharedMLP, is_llama4_shared_mlp_leaf
 
 
 ASYM_LF_ADAPTER_FORMAT = "asym_gemm_lf_v1"
 SUPPORTED_LF_OFFLOAD_COMPONENTS = frozenset(
-    {"routed_experts", "router", "shared_experts", "attention", "embed_tokens", "lm_head", "norms", "mlp_dense"}
+    {
+        "routed_experts",
+        "router",
+        "shared_experts",
+        "attention",
+        "linear_attention",
+        "embed_tokens",
+        "lm_head",
+        "norms",
+        "mlp_dense",
+    }
 )
 _ALL_LF_OFFLOAD_COMPONENTS = frozenset(
     {
@@ -80,6 +91,7 @@ _ALL_LF_OFFLOAD_COMPONENTS = frozenset(
         "router",
         "shared_experts",
         "attention",
+        "linear_attention",
         "embed_tokens",
         "lm_head",
         "norms",
@@ -127,6 +139,7 @@ class LFOffloadSelection:
     router: bool = False
     shared_experts: bool = False
     attention_targets: frozenset[str] = frozenset()
+    linear_attention: bool = False
     embed_tokens: bool = False
     lm_head: bool = False
     norms: bool = False
@@ -139,6 +152,7 @@ class LFOffloadSelection:
             or self.router
             or self.shared_experts
             or bool(self.attention_targets)
+            or self.linear_attention
             or self.embed_tokens
             or self.lm_head
             or self.norms
@@ -156,6 +170,8 @@ class LFOffloadSelection:
             components.add("shared_experts")
         if self.attention_targets:
             components.add("attention")
+        if self.linear_attention:
+            components.add("linear_attention")
         if self.embed_tokens:
             components.add("embed_tokens")
         if self.lm_head:
@@ -350,6 +366,9 @@ def parse_lf_offload_modules(selector: Sequence[str] | str | None) -> LFOffloadS
         "shared": "shared_experts",
         "shared_expert": "shared_experts",
         "attn": "attention",
+        "linear_attn": "linear_attention",
+        "gdn": "linear_attention",
+        "gated_deltanet": "linear_attention",
         "embedding": "embed_tokens",
         "embeddings": "embed_tokens",
         "token_embeddings": "embed_tokens",
@@ -407,6 +426,7 @@ def parse_lf_offload_modules(selector: Sequence[str] | str | None) -> LFOffloadS
         router="router" in expanded,
         shared_experts="shared_experts" in expanded,
         attention_targets=frozenset(attention_targets),
+        linear_attention="linear_attention" in expanded,
         embed_tokens="embed_tokens" in expanded,
         lm_head="lm_head" in expanded,
         norms="norms" in expanded,
@@ -506,6 +526,8 @@ def component_is_selected(component: str, leaf: str, selection: LFOffloadSelecti
         return selection.shared_experts
     if component == "attention":
         return bool(selection.attention_targets) and leaf in selection.attention_targets
+    if component == "linear_attention":
+        return selection.linear_attention and leaf in _LINEAR_ATTENTION_LEAVES
     if component == "embed_tokens":
         return selection.embed_tokens
     if component == "lm_head":
@@ -864,20 +886,34 @@ def _is_qwen3_decoder_layer_module_name(name: str, module: nn.Module) -> bool:
     if _has_attention_excluded_path_marker(name):
         return False
     children = dict(module.named_children())
+    child_names = set(children)
     class_name = type(module).__name__.lower()
     module_name = type(module).__module__.lower()
     config = getattr(module, "config", None)
     model_type = str(getattr(config, "model_type", "")).lower()
+
+    # Qwen3.5-MoE hybrid decoder layer. Most layers use `linear_attn`
+    # (Gated DeltaNet), while full-attention layers use `self_attn`.
+    qwen35_required = {"mlp", "input_layernorm", "post_attention_layernorm"}
+    qwen35_has_mixer = "linear_attn" in child_names or "self_attn" in child_names
+    if qwen35_required <= child_names and qwen35_has_mixer:
+        qwen35_class = "qwen3_5" in class_name or "qwen35" in class_name.replace("_", "")
+        qwen35_module = "qwen3_5_moe" in module_name or "qwen35" in module_name.replace("_", "")
+        qwen35_config = model_type in {"qwen3_5_moe", "qwen3_5_moe_text"}
+        qwen35_mlp = hasattr(children["mlp"], "_is_asym_qwen35_moe_block") or is_qwen35_moe_block(children["mlp"])
+        if qwen35_class or qwen35_module or qwen35_config or qwen35_mlp:
+            return True
+
     # Qwen3 / Qwen3-MoE decoder layer (token mixer `self_attn`, FFN child `mlp`).
     qwen3_required = {"self_attn", "mlp", "input_layernorm", "post_attention_layernorm"}
-    if qwen3_required <= set(children):
+    if qwen3_required <= child_names:
         if "qwen3" in class_name or "qwen3" in module_name or model_type in {"qwen3_moe", "qwen3_vl_moe"}:
             return True
         if hasattr(children["mlp"], "_is_asym_qwen3_moe_block") or is_qwen3_moe_block(children["mlp"]):
             return True
     # Llama 4 decoder layer (token mixer `self_attn`, FFN child `feed_forward`; dense or MoE).
     llama4_required = {"self_attn", "feed_forward", "input_layernorm", "post_attention_layernorm"}
-    if llama4_required <= set(children):
+    if llama4_required <= child_names:
         if "llama4" in class_name or "llama4" in module_name or model_type in {"llama4", "llama4_text"}:
             return True
     return False
@@ -1139,6 +1175,34 @@ def apply_lf_asym_lora(
             return False
         return all(leaf_targeted) or all(leaf_preexisting_lora)
 
+    def _qwen35_shared_expert_is_lora_target(name: str, module: nn.Module) -> bool:
+        if not wrap_dense or not selection.shared_experts:
+            return False
+        shared = getattr(module, "shared_expert", None)
+        if not isinstance(shared, nn.Module):
+            return False
+        leaf_supported: list[bool] = []
+        leaf_targeted: list[bool] = []
+        leaf_preexisting_lora: list[bool] = []
+        for leaf in ("gate_proj", "up_proj", "down_proj"):
+            child = getattr(shared, leaf, None)
+            leaf_supported.append(isinstance(child, nn.Module) and is_qwen35_shared_mlp_leaf(child))
+            leaf_targeted.append(
+                _is_all_target(raw_lora_target)
+                or (
+                    isinstance(child, nn.Module)
+                    and _matches_target(f"{name}.shared_expert.{leaf}", child, dense_target_modules)
+                )
+            )
+            leaf_preexisting_lora.append(
+                isinstance(child, nn.Module)
+                and hasattr(child, "lora_A")
+                and hasattr(child, "lora_B")
+            )
+        if not all(leaf_supported):
+            return False
+        return all(leaf_targeted) or all(leaf_preexisting_lora)
+
     def _install_expert_replacement(name: str, new_module: nn.Module, skip_prefix: str) -> None:
         parent, child_name = _parent_and_child(model, name)
         _replace_child(parent, child_name, new_module)
@@ -1200,12 +1264,17 @@ def apply_lf_asym_lora(
                         expert_recompute_policy=recompute_config.label,
                         router_mode="whole",
                         offload_router=offload_router,
+                        wrap_shared_expert=_qwen35_shared_expert_is_lora_target(name, module),
+                        offload_shared_expert=backend == "asym" and selection.shared_experts,
                         router_debug_grad=False,
                         stats=stats,
                         strict=strict,
                 )
                 wrapped.profile_prefix = _layer_profile_prefix_from_module_name(name, "mlp")
                 wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
+                if isinstance(wrapped.shared_expert, AsymQwen35SharedMLP):
+                    wrapped.shared_expert.profile_prefix = f"{wrapped.profile_prefix}.shared_expert"
+                    report.dense_lora_wrapped += max(0, 3 - int(wrapped.shared_expert.preexisting_lora_leaf_count))
                 _install_expert_replacement(name, wrapped, f"{name}.experts")
             elif kind == "qwen3_whole":
                 if not is_qwen3_moe_block(module):

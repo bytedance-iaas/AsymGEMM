@@ -11,6 +11,15 @@ Hard design decisions:
 - Do not edit `../Liger-Kernel` source. The local Liger package is an external dependency. We may import its public functions/classes, but the compatibility bridge lives in AsymGEMM/LlamaFactory integration code.
 - Use the vendored Liger checkout, not PyPI. Install it editable into the AsymGEMM `.venv` with `--no-deps --no-build-isolation` so pip does not change the existing Torch/Triton/CUDA stack.
 - Do not modify `scripts/lf/profile3.sh` for this Liger work. That script is for the separate Qwen3.5 testing path. The Liger loss-only plan uses `scripts/lf/profile_lora_lf.sh` and shared LF wrapper/profile/plotting interfaces.
+- CPU offload profiling must bind host allocations only to real CPU DRAM NUMA
+  nodes. On the current GB200 system, the only accepted profiling placement is
+  `NUMACTL_MEMBIND=0,1 NUMACTL_CPUNODEBIND=0,1 NUMACTL_MODE=membind`.
+  This means CPU execution is bound to nodes `0,1` and host allocations are
+  bound to CPU RAM nodes `0,1` only. Do not use `NUMACTL_MODE=interleave`, do
+  not widen `NUMACTL_MEMBIND` beyond `0,1`, and do not include any GPU/HBM NUMA
+  node. If this placement causes host-memory pressure, report that result
+  instead of changing NUMA placement. Discard any artifact produced with
+  different placement.
 - Keep `lm_head` Asym-wrapped when `ASYM_OFFLOAD_MODULES` selects `lm_head`. The Asym + Liger path must stage the Asym CPU-resident `lm_head` weight explicitly for the fused CE call.
 - Do not make `AsymFrozenLinear.weight` secretly stage to GPU. Direct `.weight` stays CPU host storage. Staging must use an explicit method so other code paths are not surprised.
 - Common script/runtime interfaces are implemented first. Model-specific and Asym-specific behavior is wired only after folder names, metadata, CLI flags, and validation plumbing are stable.
@@ -217,6 +226,9 @@ LOG=/tmp/asym_liger_axis_dryrun.log
 rm -rf "${OUT}" "${LOG}"
 OUTPUT_ROOT="${OUT}" \
 RUN_NAME=qwen3_liger_axis_dryrun \
+NUMACTL_MEMBIND=0,1 \
+NUMACTL_CPUNODEBIND=0,1 \
+NUMACTL_MODE=membind \
 MODEL_SPECS='Qwen/Qwen3-30B-A3B|1' \
 BACKEND_SPECS='asym_cpuadamwds|norecomp,zero3_offload|recomp' \
 PROFILERS=both \
@@ -245,6 +257,9 @@ LOG=/tmp/asym_liger_axis_fourway.log
 rm -rf "${OUT}" "${LOG}"
 OUTPUT_ROOT="${OUT}" \
 RUN_NAME=qwen3_liger_axis_fourway \
+NUMACTL_MEMBIND=0,1 \
+NUMACTL_CPUNODEBIND=0,1 \
+NUMACTL_MODE=membind \
 MODEL_SPECS='Qwen/Qwen3-30B-A3B|1' \
 BACKEND_SPECS='asym_cpuadamwds|norecomp|ligerloss0,asym_cpuadamwds|norecomp|ligerloss1,zero3_offload|recomp|ligerloss0,zero3_offload|recomp|ligerloss1' \
 PROFILERS=both \
@@ -719,6 +734,9 @@ ROOT=/workspace/AsymGEMM-SFT/third_party/AsymGEMM/profiling_liger_acceptance
 rm -rf "${ROOT}"
 OUTPUT_ROOT="${ROOT}" \
 RUN_NAME=qwen3_ligerloss_fourway \
+NUMACTL_MEMBIND=0,1 \
+NUMACTL_CPUNODEBIND=0,1 \
+NUMACTL_MODE=membind \
 MODEL_SPECS='Qwen/Qwen3-30B-A3B|1' \
 BACKEND_SPECS='asym_cpuadamwds|norecomp|ligerloss0,asym_cpuadamwds|norecomp|ligerloss1,zero3_offload|recomp|ligerloss0,zero3_offload|recomp|ligerloss1' \
 PROFILERS=both \

@@ -141,7 +141,7 @@ def test_qwen_moe_component_classification_separates_router_dense_and_experts() 
     assert _component_from_range_name("backward.layers.0.self_attn.q_proj") == "attention"
 
 
-def test_qwen35_linear_attention_component_is_profile_only_before_offload_stage() -> None:
+def test_qwen35_linear_attention_component_is_profiled_and_selectable() -> None:
     assert _component_from_param_name("model.layers.0.linear_attn.in_proj_qkv.weight") == "linear_attention"
     assert _component_from_param_name("model.layers.0.linear_attn.in_proj_z.lora_A.default.weight") == "linear_attention"
     assert _component_from_param_name("model.layers.0.linear_attn.out_proj.weight") == "linear_attention"
@@ -152,7 +152,8 @@ def test_qwen35_linear_attention_component_is_profile_only_before_offload_stage(
     assert classify_lf_component("model.layers.0.linear_attn.in_proj_a.weight") == "linear_attention"
 
     selection = parse_lf_offload_modules("all")
-    assert not component_is_selected("linear_attention", "in_proj_qkv", selection)
+    assert component_is_selected("linear_attention", "in_proj_qkv", selection)
+    assert not component_is_selected("linear_attention", "rotary_emb", selection)
 
 
 def test_external_memory_is_diagnostic_not_reserved_closure() -> None:

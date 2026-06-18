@@ -105,6 +105,61 @@ Current repo facts:
   For Qwen3.5, all validation and verdict commands below must explicitly use
   `ligerloss0` and `ENABLE_LIGER_KERNEL=false`; the separate Liger-loss work
   must not change the Qwen3.5 Asym-vs-ZeRO comparison.
+- Qwen3.5 CPU offload profiling must bind CPU offload allocations only to real
+  CPU DRAM NUMA nodes. On the current GB200 system, the only accepted
+  profiling placement is:
+  `NUMACTL_MEMBIND=0,1 NUMACTL_CPUNODEBIND=0,1 NUMACTL_MODE=membind`.
+  This means CPU execution is bound to nodes `0,1` and host allocations are
+  bound to CPU RAM nodes `0,1` only. Do not use `NUMACTL_MODE=interleave`, do
+  not widen `NUMACTL_MEMBIND` beyond `0,1`, and do not include any GPU/HBM NUMA
+  node. Any artifact produced with different NUMA placement must be discarded
+  for the final verdict.
+
+Execution status as of 2026-06-17:
+
+- Pre-Stage 0B is complete in `third_party/AsymGEMM/.venv`:
+  `flash-linear-attention==0.5.0`, `fla-core==0.5.0`, and
+  `causal-conv1d==1.6.2.post1` import correctly; Transformers reports both FLA
+  and causal-conv availability as true.
+- Stage 0 ZeRO baseline is complete with the exact `profile3.sh` Qwen3.5 knobs:
+  `zero3_offload|recomp|ligerloss0` reached actual peak allocated
+  `31.5265 GiB`, actual peak reserved `36.7949 GiB`, forward `27024.0 ms`,
+  backward `14800.3 ms`, and measured e2e `43462.7 ms`.
+- Stage 1 hybrid Qwen3.5 decoder-layer hooks are implemented and profiled. The
+  Asym row completed with `qwen35_moes_wrapped=48`,
+  `layer_act_offload_wrapped=48`, `attention_act_offload_wrapped=48`, and
+  `attention_saved_tensor_offload_wrapped=12`, but memory was worse than ZeRO:
+  actual peak allocated `55.9898 GiB`, actual peak reserved `61.4316 GiB`,
+  forward `12747.0 ms`, backward `54761.0 ms`, and e2e `74833.1 ms`.
+- Stage 2 Gated DeltaNet projection offload is implemented. The setup report
+  showed `linear_attention:6370099200` CPU-resident base bytes and no selected
+  frozen-base CUDA residue, but the stage profile did not reach a valid
+  training step because the GPU had only about `1.52 GiB` free during setup.
+- Stages 3 and 4 are implemented by adding `AsymQwen35SharedMLP`, a Qwen3.5
+  adapter over the proven Llama4 shared-MLP base/offload and activation-offload
+  path. Tests verify source parity, preexisting LoRA transfer, shared-leaf host
+  adoption, and the CUDA-gated activation-offload path when kernels are
+  available.
+- Stage 5 is implemented as a validation gate: Qwen3.5 routed expert LoRA banks
+  are registered for grouped CPUAdamW weight offload; dense/shared/GDN LoRA
+  tensors remain CUDA-resident by design because they are much smaller than
+  routed expert banks and offloading them as tiny groups is not accepted without
+  a real memory win.
+- Current validation passed:
+  `pytest -q tests/training/test_lf_qwen35_asym_backend.py tests/training/test_lf_qwen3_asym_backend.py tests/test_lf_memory_breakdown.py`
+  produced `163 passed, 25 skipped`. A venv-level probe also proved FLA imports
+  and LlamaFactory routes selected `linear_attn.{in_proj_qkv,in_proj_z,in_proj_b,in_proj_a,out_proj}`
+  leaves into `asym_owned_dense_target_modules`.
+- Final Stage 6 verdict is still pending. Do not claim Qwen3.5 memory
+  improvement until `scripts/lf/profile3.sh` completes both final rows on a GPU
+  with enough free HBM. At this checkpoint, `nvidia-smi` shows GPUs 0-2 almost
+  full with no visible process owner and GPU3 occupied by an unrelated Qwen3
+  Liger run, so the exact Qwen3.5 final profile is externally blocked.
+- A later manually launched `outputs/qwen35_final` attempt used an invalid
+  `NUMACTL_MEMBIND` setting that included non-CPU NUMA nodes. That run was
+  stopped/discarded and must not be used for acceptance. Final Qwen3.5 runs must
+  use CPU RAM nodes only:
+  `NUMACTL_MEMBIND=0,1 NUMACTL_CPUNODEBIND=0,1 NUMACTL_MODE=membind`.
 
 Global acceptance rule for every stage:
 
@@ -486,6 +541,9 @@ Validation command, required numeric baseline:
 ```bash
 cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
 
+NUMACTL_MEMBIND=0,1 \
+NUMACTL_CPUNODEBIND=0,1 \
+NUMACTL_MODE=membind \
 OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/outputs/qwen35_stage0_zero3 \
 PROFILERS=source \
 PROFILE_MEMORY_BREAKDOWN=true \
@@ -587,6 +645,9 @@ Reusable Asym e2e validation command for implementation Stages 1-5:
 ```bash
 cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
 
+NUMACTL_MEMBIND=0,1 \
+NUMACTL_CPUNODEBIND=0,1 \
+NUMACTL_MODE=membind \
 OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/outputs/qwen35_stageN \
 PROFILERS=source \
 PROFILE_MEMORY_BREAKDOWN=true \
@@ -1385,6 +1446,9 @@ Final profiling command:
 ```bash
 cd /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
 
+NUMACTL_MEMBIND=0,1 \
+NUMACTL_CPUNODEBIND=0,1 \
+NUMACTL_MODE=membind \
 OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/outputs/qwen35_final \
 PROFILERS=source \
 PROFILE_MEMORY_BREAKDOWN=true \
@@ -1472,7 +1536,10 @@ Final acceptance:
   `asym_offload_modules=all`, `asym_strict=true`,
   `asym_cpu_adamw_grad_offload=true`,
   `asym_cpu_adamw_weight_offload=true`, `lora_rank=64`, `lora_alpha=16`, and
-  `lora_dropout=0.00`.
+  `lora_dropout=0.00`. The run log must also show
+  `NUMACTL_MEMBIND=0,1`, `NUMACTL_CPUNODEBIND=0,1`, and
+  `NUMACTL_MODE=membind`; reject any final artifact whose `MEMBIND` includes a
+  non-CPU NUMA node.
 - `asym_cpuadamwds|norecomp|ligerloss0` must have lower Qwen3.5 peak HBM than
   `zero3_offload|recomp|ligerloss0` by at least the global memory rule. Prefer
   `actual_peak_allocated_hbm_bytes` and `actual_peak_reserved_hbm_bytes` from

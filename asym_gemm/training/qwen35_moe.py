@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from .frozen_linear import AsymExecutionStats
 from .profile_ranges import prof_range, scoped_name
 from .qwen3_moe import AsymQwen3Experts, AsymQwen3Router, is_qwen3_experts, wrap_qwen3_experts
+from .qwen35_shared_mlp import AsymQwen35SharedMLP
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,31 @@ def _is_qwen35_family(module: nn.Module) -> bool:
     return False
 
 
+def _linear_leaf_shape(module: nn.Module | None) -> tuple[int, int] | None:
+    """Return (in_features, out_features) for Linear-like leaves."""
+    if not isinstance(module, nn.Module):
+        return None
+    candidates: list[object] = [module]
+    get_base_layer = getattr(module, "get_base_layer", None)
+    if callable(get_base_layer):
+        try:
+            candidates.append(get_base_layer())
+        except Exception:
+            pass
+    candidates.append(getattr(module, "base_layer", None))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        in_features = getattr(candidate, "in_features", None)
+        out_features = getattr(candidate, "out_features", None)
+        if isinstance(in_features, int) and isinstance(out_features, int):
+            return int(in_features), int(out_features)
+        weight = getattr(candidate, "weight", None)
+        if isinstance(weight, torch.Tensor) and weight.dim() == 2:
+            return int(weight.shape[1]), int(weight.shape[0])
+    return None
+
+
 def is_qwen35_moe_block(module: nn.Module) -> bool:
     if getattr(module, "_is_asym_qwen35_moe_block", False):
         return False
@@ -76,9 +102,22 @@ def is_qwen35_moe_block(module: nn.Module) -> bool:
     if not callable(getattr(shared_expert_gate, "forward", None)):
         return False
 
-    if hasattr(shared_expert_gate, "in_features") and int(shared_expert_gate.in_features) != int(gate.hidden_dim):
+    hidden_dim = int(gate.hidden_dim)
+    gate_shape = _linear_leaf_shape(shared_expert_gate)
+    if gate_shape is not None and gate_shape != (hidden_dim, 1):
         return False
-    if hasattr(shared_expert_gate, "out_features") and int(shared_expert_gate.out_features) != 1:
+    shared_gate_shape = _linear_leaf_shape(getattr(shared_expert, "gate_proj", None))
+    shared_up_shape = _linear_leaf_shape(getattr(shared_expert, "up_proj", None))
+    shared_down_shape = _linear_leaf_shape(getattr(shared_expert, "down_proj", None))
+    if shared_gate_shape is None or shared_up_shape is None or shared_down_shape is None:
+        return False
+    if shared_gate_shape[0] != hidden_dim or shared_up_shape[0] != hidden_dim:
+        return False
+    if shared_down_shape[1] != hidden_dim:
+        return False
+    if shared_gate_shape[1] != shared_up_shape[1]:
+        return False
+    if shared_down_shape[0] != shared_gate_shape[1]:
         return False
     return True
 
@@ -102,6 +141,8 @@ class AsymQwen35MoeBlock(nn.Module):
         expert_recompute_policy: str = "none",
         router_mode: Literal["whole"] = "whole",
         offload_router: bool = False,
+        wrap_shared_expert: bool = False,
+        offload_shared_expert: bool = False,
         router_debug_grad: bool = False,
         stats: AsymExecutionStats | None = None,
         strict: bool = True,
@@ -143,7 +184,23 @@ class AsymQwen35MoeBlock(nn.Module):
             stats=stats,
             strict=strict,
         )
-        self.shared_expert = getattr(source, "shared_expert")
+        source_shared = getattr(source, "shared_expert")
+        self.shared_expert = (
+            AsymQwen35SharedMLP(
+                source_shared,
+                backend=backend,
+                precision=precision,
+                offload=backend == "asym" and bool(offload_shared_expert),
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                lora_dtype=lora_dtype,
+                stats=stats,
+                strict=strict,
+            )
+            if wrap_shared_expert
+            else source_shared
+        )
         self.shared_expert_gate = getattr(source, "shared_expert_gate")
 
         self.hidden_dim = int(getattr(self.gate, "hidden_dim"))
@@ -154,16 +211,19 @@ class AsymQwen35MoeBlock(nn.Module):
     @property
     def cpu_resident_base_bytes(self) -> int:
         gate_bytes = int(getattr(getattr(self.gate, "proj", None), "cpu_resident_base_weight_bytes", 0))
-        return int(self.experts.cpu_resident_base_bytes) + gate_bytes
+        shared_bytes = int(getattr(self.shared_expert, "cpu_resident_base_bytes", 0))
+        return int(self.experts.cpu_resident_base_bytes) + gate_bytes + shared_bytes
 
     @property
     def gpu_resident_base_bytes(self) -> int:
         gate_bytes = int(getattr(getattr(self.gate, "proj", None), "gpu_resident_base_weight_bytes", 0))
-        return int(self.experts.gpu_resident_base_bytes) + gate_bytes
+        shared_bytes = int(getattr(self.shared_expert, "gpu_resident_base_bytes", 0))
+        return int(self.experts.gpu_resident_base_bytes) + gate_bytes + shared_bytes
 
     @property
     def trainable_lora_params(self) -> int:
-        return int(self.experts.trainable_lora_params)
+        shared_params = int(getattr(self.shared_expert, "trainable_lora_params", 0))
+        return int(self.experts.trainable_lora_params) + shared_params
 
     def report(self) -> Qwen35MoeReport:
         return Qwen35MoeReport(
@@ -238,6 +298,8 @@ def wrap_qwen35_moe_block(
     expert_recompute_policy: str = "none",
     router_mode: Literal["whole"] = "whole",
     offload_router: bool = False,
+    wrap_shared_expert: bool = False,
+    offload_shared_expert: bool = False,
     router_debug_grad: bool = False,
     stats: AsymExecutionStats | None = None,
     strict: bool = True,
@@ -254,6 +316,8 @@ def wrap_qwen35_moe_block(
         expert_recompute_policy=expert_recompute_policy,
         router_mode=router_mode,
         offload_router=offload_router,
+        wrap_shared_expert=wrap_shared_expert,
+        offload_shared_expert=offload_shared_expert,
         router_debug_grad=router_debug_grad,
         stats=stats,
         strict=strict,

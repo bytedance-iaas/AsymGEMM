@@ -592,9 +592,23 @@ def test_lf_offload_module_parser_stage1_contract() -> None:
     assert parse_lf_offload_modules("embed_tokens").implemented_components == frozenset({"embed_tokens"})
     assert parse_lf_offload_modules("lm_head").implemented_components == frozenset({"lm_head"})
     assert parse_lf_offload_modules("norms").implemented_components == frozenset({"norms"})
+    assert parse_lf_offload_modules("linear_attention").implemented_components == frozenset({"linear_attention"})
+    assert parse_lf_offload_modules("linear_attn").linear_attention
+    assert parse_lf_offload_modules("gdn").linear_attention
+    assert parse_lf_offload_modules("gated_deltanet").linear_attention
     assert parse_lf_offload_modules("q_proj").attention_targets == frozenset({"q_proj"})
     assert parse_lf_offload_modules("all").implemented_components == frozenset(
-        {"routed_experts", "router", "shared_experts", "attention", "embed_tokens", "lm_head", "norms", "mlp_dense"}
+        {
+            "routed_experts",
+            "router",
+            "shared_experts",
+            "attention",
+            "linear_attention",
+            "embed_tokens",
+            "lm_head",
+            "norms",
+            "mlp_dense",
+        }
     )
     # dense-MLP base offload is a selectable component (Llama4 Maverick interleaved dense layers).
     assert parse_lf_offload_modules("mlp_dense").implemented_components == frozenset({"mlp_dense"})
@@ -619,6 +633,11 @@ def test_lf_offload_module_parser_stage1_contract() -> None:
         ("model.layers.0.mlp.shared_expert.gate_proj.weight", "shared_experts"),
         ("model.layers.0.mlp.shared_expert_gate.weight", "shared_experts"),
         ("model.layers.0.self_attn.q_proj.weight", "attention"),
+        ("model.layers.0.linear_attn.in_proj_qkv.weight", "linear_attention"),
+        ("model.layers.0.linear_attn.in_proj_z.weight", "linear_attention"),
+        ("model.layers.0.linear_attn.in_proj_b.weight", "linear_attention"),
+        ("model.layers.0.linear_attn.in_proj_a.weight", "linear_attention"),
+        ("model.layers.0.linear_attn.out_proj.weight", "linear_attention"),
         ("q_proj", "attention"),
         ("model.layers.0.q_proj.weight", "attention"),
         ("embed_tokens", "embed_tokens"),

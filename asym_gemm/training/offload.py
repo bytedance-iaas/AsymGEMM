@@ -12,6 +12,7 @@ from .host_weight import HostWeight, tensor_nbytes
 
 
 ComponentClassifier = Callable[[str, nn.Module | None], str]
+_LINEAR_ATTENTION_LEAVES = frozenset({"in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"})
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,13 @@ def _default_classify_component(name: str, module: nn.Module | None = None) -> s
         parent_leaf = lower.rsplit(".", 1)[0].rsplit(".", 1)[-1]
     else:
         parent_leaf = leaf
+    if (
+        lower == "linear_attn"
+        or lower.endswith(".linear_attn")
+        or ".linear_attn." in lower
+        or "gateddeltanet" in lower
+    ) and (parent_leaf in _LINEAR_ATTENTION_LEAVES or ".linear_attn." in lower or lower.endswith(".linear_attn")):
+        return "linear_attention"
     attention_leaves = {"q_proj", "k_proj", "v_proj", "o_proj"}
     if parent_leaf in attention_leaves or any(
         lower == target or lower.endswith(f".{target}") or f".{target}." in lower for target in attention_leaves
@@ -121,6 +129,16 @@ def _selection_component_selected(selection: Any, component: str, leaf: str = ""
             not leaf
             or leaf in targets
             or any(lower == target or lower.endswith(f".{target}") or f".{target}." in lower for target in targets)
+        )
+    if component == "linear_attention":
+        lower = name.lower()
+        return bool(getattr(selection, "linear_attention", False)) and (
+            not leaf
+            or leaf in _LINEAR_ATTENTION_LEAVES
+            or any(
+                lower == target or lower.endswith(f".{target}") or f".{target}." in lower
+                for target in _LINEAR_ATTENTION_LEAVES
+            )
         )
     if component == "embed_tokens":
         return bool(getattr(selection, "embed_tokens", False))

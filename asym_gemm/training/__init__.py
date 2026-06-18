@@ -125,6 +125,7 @@ from .qwen35_moe import (
     is_qwen35_moe_block,
     wrap_qwen35_moe_block,
 )
+from .qwen35_shared_mlp import AsymQwen35SharedMLP, is_qwen35_shared_mlp, is_qwen35_shared_mlp_leaf
 from .llama4_moe import AsymLlama4Moe, AsymLlama4Router, Llama4MoeReport, is_llama4_moe, wrap_llama4_moe
 from .packed_moe import AsymPackedExperts, PackedExpertSource, PackedMoELayout, wrap_packed_experts
 
@@ -163,6 +164,7 @@ __all__ = [
     "AsymQwen3MoeBlock",
     "AsymQwen3Router",
     "AsymQwen35MoeBlock",
+    "AsymQwen35SharedMLP",
     "FrozenLinear",
     "GroupedLoRAMetadata",
     "HostWeight",
@@ -218,6 +220,8 @@ __all__ = [
     "grouped_lora_b_backward_cpu_source",
     "is_qwen3_experts",
     "is_qwen3_moe_block",
+    "is_qwen35_shared_mlp",
+    "is_qwen35_shared_mlp_leaf",
     "is_qwen35_moe_block",
     "is_llama4_moe",
     "is_attention_saved_tensor_offload_wrapper",

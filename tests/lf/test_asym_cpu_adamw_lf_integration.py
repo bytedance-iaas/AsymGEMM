@@ -909,6 +909,44 @@ def test_split_asym_peft_dense_targets_expands_mlp_dense_suffix() -> None:
 
 
 @requires_lf_adapter
+def test_split_asym_peft_dense_targets_expands_linear_attention_suffixes() -> None:
+    from asym_gemm.integrations.lf import parse_lf_offload_modules
+    from llamafactory.model.adapter import split_asym_peft_dense_targets
+
+    class MixedLinearAttentionTargets(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            layer = nn.Module()
+            layer.self_attn = nn.Module()
+            layer.self_attn.q_proj = nn.Linear(4, 4, bias=False)
+            layer.linear_attn = nn.Module()
+            layer.linear_attn.in_proj_qkv = nn.Linear(4, 4, bias=False)
+            layer.linear_attn.in_proj_z = nn.Linear(4, 4, bias=False)
+            layer.linear_attn.in_proj_b = nn.Linear(4, 4, bias=False)
+            layer.linear_attn.in_proj_a = nn.Linear(4, 4, bias=False)
+            layer.linear_attn.out_proj = nn.Linear(4, 4, bias=False)
+            layer.mlp = nn.Module()
+            layer.mlp.gate_proj = nn.Linear(4, 4, bias=False)
+            self.layers = nn.ModuleList([layer])
+
+    selection = parse_lf_offload_modules("linear_attention")
+    peft_targets, asym_targets = split_asym_peft_dense_targets(
+        MixedLinearAttentionTargets(),
+        ["q_proj", "gate_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"],
+        selection,
+    )
+
+    assert peft_targets == ["q_proj", "gate_proj"]
+    assert asym_targets == [
+        "layers.0.linear_attn.in_proj_a",
+        "layers.0.linear_attn.in_proj_b",
+        "layers.0.linear_attn.in_proj_qkv",
+        "layers.0.linear_attn.in_proj_z",
+        "layers.0.linear_attn.out_proj",
+    ]
+
+
+@requires_lf_adapter
 def test_split_asym_peft_dense_targets_respects_full_language_model_names() -> None:
     from asym_gemm.integrations.lf import parse_lf_offload_modules
     from llamafactory.model.adapter import split_asym_peft_dense_targets
