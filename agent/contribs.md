@@ -189,6 +189,17 @@ Notes:
 │ llama4-scout-17B-16E │ b4_s4096 (16 384) │ zero3_offload   │  yes   │          49.53 │         55.93 │       525.83 │  39.33 s¹ │    39.33 s¹ │
 └──────────────────────┴───────────────────┴─────────────────┴────────┴────────────────┴───────────────┴──────────────┴───────────┴─────────────┘
 
+Comments:
+1. Comine Suoerlaod with ours to reduce the latency (meomry and latency tradeoff)
+- For qwen, we need to do more swapping
+3. More plots on tradeoffs
+<!-- 4. Can we modify fused CE so that we write the iutputs diretl into CPU 
+for vocab tile b:
+    Z_b = H @ W_b.T        # [M,Bv], temporary tile only
+    update online max/sum   # [M] stats
+    discard Z_b -->
+
+
 1. Can we build a cuda graph for kernel launch (partially)?
 - Normally can for attention, exp router but we add in offloading and staging which requires CPU sync
 - Cannot for experts because the each receives a diff token count (M) so the cpu needs to read that count to launch the kernel
@@ -212,8 +223,26 @@ Method:
 
 5. Can we fully use back and forward beween CPU <-> GPU whihc uses separte bandwith not like smem <-> hbm which shares the bandwith betwen read and write
 - Compute silu on CPU and directly write to HBM => save RAM
-- Compute grad and directly add to buffer is it possibel?
 
 6. Ask agents to optimize bf16 sm100 AsymGEMM
+
+7. What is the motivation?
+- We identify a memory-bottleneck shift in LoRA SFT for large MoEs: adapter weights, gradients, and optimizer states occupy only [X] GiB ([X]% of peak HBM), while frozen model weights and activations reach [X] GiB and [X] GiB ([X]% of peak HBM). The main challenge reducing frozen weights and activations' memory footprints.
+
+- We develop SuperLoRA, a Superchip-native LoRA SFT system that keeps frozen MoE weights and most activations in CPU memory, using NVLink-C2C’s
+    [Z] GB/s bandwidth to treat host DRAM as an active extension of HBM. 
+
+- We redesign forward and backward execution with C2C-streaming GEMM kernels that load CPU-resident weights and activations tile-wise from CPU directly into GPU shared memory, eliminating HBM materialization. Meanwhile, we delegate lightweight elementwise ops to the CPU, including SiLU, SiLU backward, LoRA grad accomulation, and adapter updates, reserving GPU resources for high-arithmetic-intensity GEMM operations.
+
+- We introduce a specialized scheduler that chooses, per layer and tensor, whether to keep activations in HBM, offload them, or
+recompute them. It exploits the structure of LoRA SFT: frozen weights are read-only, trainable
+adapters are small, expert usage is sparse, and backward needs CPU-resident weights and activations only at precise GEMM boundaries. 
+This enables better memory-latency tradeoffs for fitting larger MoE SFT workloads on a single GB200.
+
+Given a config => deterin an optial poitn in the search space
+
+Schedule needs to cover these cases:
+storage {nvme, cpu, gpu} x compute {cpu, gpu}
+
 
 

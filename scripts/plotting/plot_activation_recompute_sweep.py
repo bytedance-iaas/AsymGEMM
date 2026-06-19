@@ -196,12 +196,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--precision", default="")
     parser.add_argument("--workload", action="append", default=[], help="Workload label to include, e.g. moe-604m-a38m-l2.")
-    parser.add_argument("--backend", action="append", default=[], choices=list(BACKENDS))
-    parser.add_argument("--router-mode", action="append", default=[], choices=["hf", "whole"])
-    parser.add_argument("--expact", action="append", default=[], choices=["expact0", "expact1"])
-    parser.add_argument("--attnact", action="append", default=[], choices=["attnact0", "attnact1"])
-    parser.add_argument("--profiler", action="append", default=[], choices=list(PROFILERS))
-    parser.add_argument("--liger-loss", action="append", default=[], choices=["ligerloss0", "ligerloss1"])
+    parser.add_argument("--backend", action="append", default=[])
+    parser.add_argument("--router-mode", action="append", default=[])
+    parser.add_argument("--expact", action="append", default=[])
+    parser.add_argument("--attnact", action="append", default=[])
+    parser.add_argument("--layeract", action="append", default=[])
+    parser.add_argument("--layergc", action="append", default=[])
+    parser.add_argument("--profiler", action="append", default=[])
+    parser.add_argument("--liger-loss", action="append", default=[])
     parser.add_argument(
         "--recompute",
         action="append",
@@ -214,7 +216,7 @@ def parse_args() -> argparse.Namespace:
         "--expert-recompute-policies",
         nargs="+",
         default=[],
-        help="Expert policy filter. Accepts none, tok-le0, tok-le128, tok-ge128, tok64-256, or -act variants.",
+        help="Expert policy filter. Accepts none, gc-exp, gc-attn-exp, gc-layer, tok-le0, tok-le128, tok-ge128, tok64-256, or -act variants.",
     )
     parser.add_argument(
         "--clean-output",
@@ -324,10 +326,12 @@ def parse_expert_policy_spec(value: str | None) -> dict[str, Any]:
     spec = str(value).strip()
     if spec == "none":
         return result(spec="none", label="none", policy="none")
-    if spec == "gc-exp":
-        data = result(spec="gc-exp", label="gc-exp", policy="gc")
+    if spec in {"gc-exp", "gc-attn-exp"}:
+        data = result(spec=spec, label=spec, policy="gc")
         data["expert_recompute_impl"] = "torch_checkpoint"
         return data
+    if spec == "gc-layer":
+        return result(spec="gc-layer", label="gc-layer", policy="none")
     if spec == "tok-le0":
         return result(spec="tok-le0", label="tok-le0", policy="none")
     if spec == "tok-le0-act":
@@ -385,8 +389,41 @@ def parse_expert_policy_spec(value: str | None) -> dict[str, Any]:
             activation_max=upper,
         )
     raise ValueError(
-        f"invalid expert recompute policy spec {value!r}; expected none, gc-exp, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, or -act variants"
+        f"invalid expert recompute policy spec {value!r}; expected none, gc-exp, gc-attn-exp, gc-layer, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, or -act variants"
     )
+
+
+def unknown_expert_policy_spec(value: str | None) -> dict[str, Any]:
+    spec = str(value or "none").strip() or "none"
+    return {
+        "expert_recompute_policy_spec": spec,
+        "expert_policy_label": spec,
+        "expert_recompute_impl": "unknown",
+        "expert_recompute_policy": "unknown",
+        "expert_recompute_threshold": 0,
+        "expert_recompute_token_min": 1,
+        "expert_recompute_token_max": None,
+        "expert_activation_save_policy": "save_all",
+        "expert_activation_save_threshold": 0,
+        "expert_activation_save_token_min": 1,
+        "expert_activation_save_token_max": None,
+    }
+
+
+def expert_policy_filter_values(values: list[str]) -> set[str]:
+    filters: set[str] = set()
+    for value in split_tokens(values):
+        raw = str(value).strip()
+        if not raw:
+            continue
+        filters.add(raw.lower())
+        try:
+            policy = parse_expert_policy_spec(raw)
+        except ValueError:
+            continue
+        filters.add(str(policy["expert_recompute_policy_spec"]).lower())
+        filters.add(str(policy["expert_policy_label"]).lower())
+    return filters
 
 
 def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
@@ -406,18 +443,18 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
     expact = str(job_meta["expact"])
     attnact_value = str(job_meta["asymm_attn_act_offload"])
     attnact = str(job_meta["attnact"])
+    layeract_value = str(job_meta["asymm_layer_act_offload"])
+    layeract = str(job_meta["layeract"])
+    layergc_value = str(job_meta["asymm_layer_gc"])
+    layergc = str(job_meta["layergc"])
     liger_loss = str(job_meta.get("liger_loss") or "ligerloss0")
-    if router_mode not in {"hf", "whole"}:
-        return None
-    if profiler not in PROFILERS or recompute not in {"recomp", "norecomp"}:
-        return None
-    if backend not in BACKENDS:
+    if recompute not in {"recomp", "norecomp"}:
         return None
     if policy_part.startswith("pol"):
         try:
             policy_meta = parse_expert_policy_spec(policy_part[3:])
         except ValueError:
-            return None
+            policy_meta = unknown_expert_policy_spec(policy_part[3:])
     else:
         return None
     config_name = job_dir.parent.name
@@ -440,6 +477,10 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
         "expact": expact,
         "asymm_attn_act_offload": attnact_value,
         "attnact": attnact,
+        "asymm_layer_act_offload": layeract_value,
+        "layeract": layeract,
+        "asymm_layer_gc": layergc_value,
+        "layergc": layergc,
         "backend": backend,
         "router_mode": router_mode,
         "profiler": profiler,
@@ -594,6 +635,14 @@ def attnact_label(value: Any) -> str:
     return "attnact1" if normalize_bool_config(value) == "true" else "attnact0"
 
 
+def layeract_label(value: Any) -> str:
+    return "layeract1" if normalize_bool_config(value) == "true" else "layeract0"
+
+
+def layergc_label(value: Any) -> str:
+    return "layergc1" if normalize_bool_config(value) == "true" else "layergc0"
+
+
 def parse_expact_part(part: str) -> tuple[str, str] | None:
     value = part.strip().lower()
     if value in {"expact1", "expacttrue"}:
@@ -612,6 +661,24 @@ def parse_attnact_part(part: str) -> tuple[str, str] | None:
     return None
 
 
+def parse_layeract_part(part: str) -> tuple[str, str] | None:
+    value = part.strip().lower()
+    if value in {"layeract1", "layeracttrue"}:
+        return "true", "layeract1"
+    if value in {"layeract0", "layeractfalse"}:
+        return "false", "layeract0"
+    return None
+
+
+def parse_layergc_part(part: str) -> tuple[str, str] | None:
+    value = part.strip().lower()
+    if value in {"layergc1", "layergctrue"}:
+        return "true", "layergc1"
+    if value in {"layergc0", "layergcfalse"}:
+        return "false", "layergc0"
+    return None
+
+
 def parse_liger_loss_part(part: str) -> str | None:
     value = part.strip().lower()
     if value in {"ligerloss0", "ligerloss1"}:
@@ -622,7 +689,16 @@ def parse_liger_loss_part(part: str) -> str | None:
 def known_optional_job_axis(part: str) -> bool:
     value = part.strip().lower()
     return (
-        value in {"layeract0", "layeract1", "layeractfalse", "layeracttrue"}
+        value in {
+            "layeract0",
+            "layeract1",
+            "layeractfalse",
+            "layeracttrue",
+            "layergc0",
+            "layergc1",
+            "layergcfalse",
+            "layergctrue",
+        }
         or value in {"actrecomp0", "actrecomp1", "actrecompfalse", "actrecomptrue"}
         or value in {"xunpack0", "xunpack1", "xunpackfalse", "xunpacktrue"}
         or value.startswith("loraafwd")
@@ -642,6 +718,10 @@ def parse_job_dir_parts(job_dir_name: str) -> dict[str, Any] | None:
     expact = "expact0"
     attnact_value = "false"
     attnact = "attnact0"
+    layeract_value = "false"
+    layeract = "layeract0"
+    layergc_value = "false"
+    layergc = "layergc0"
     liger_loss = "ligerloss0"
 
     if tail:
@@ -659,13 +739,21 @@ def parse_job_dir_parts(job_dir_name: str) -> dict[str, Any] | None:
         if parsed_attnact is not None:
             attnact_value, attnact = parsed_attnact
             continue
+        parsed_layeract = parse_layeract_part(part)
+        if parsed_layeract is not None:
+            layeract_value, layeract = parsed_layeract
+            continue
+        parsed_layergc = parse_layergc_part(part)
+        if parsed_layergc is not None:
+            layergc_value, layergc = parsed_layergc
+            continue
         parsed_liger_loss = parse_liger_loss_part(part)
         if parsed_liger_loss is not None:
             liger_loss = parsed_liger_loss
             continue
-        if known_optional_job_axis(part):
-            continue
-        return None
+        # Unknown tail parts are config axes. Plotting should not reject a run
+        # just because the driver grew a new folder label.
+        continue
 
     return {
         "backend": backend,
@@ -677,6 +765,10 @@ def parse_job_dir_parts(job_dir_name: str) -> dict[str, Any] | None:
         "expact": expact,
         "asymm_attn_act_offload": attnact_value,
         "attnact": attnact,
+        "asymm_layer_act_offload": layeract_value,
+        "layeract": layeract,
+        "asymm_layer_gc": layergc_value,
+        "layergc": layergc,
         "liger_loss": liger_loss,
     }
 
@@ -725,15 +817,26 @@ def passes_filters(args: argparse.Namespace, meta: dict[str, Any]) -> bool:
         }
         if workload_filter.isdisjoint(workload_candidates):
             return False
-    if args.backend and meta["backend"] not in set(args.backend):
+    backend_filter = {str(value).lower() for value in args.backend}
+    if backend_filter and str(meta["backend"]).lower() not in backend_filter:
         return False
-    if args.router_mode and meta["router_mode"] not in set(args.router_mode):
+    router_filter = {str(value).lower() for value in args.router_mode}
+    if router_filter and str(meta["router_mode"]).lower() not in router_filter:
         return False
-    if args.expact and meta.get("expact", "expact0") not in set(args.expact):
+    expact_filter = getattr(args, "expact", [])
+    if expact_filter and meta.get("expact", "expact0") not in set(expact_filter):
         return False
-    if args.attnact and meta.get("attnact", "attnact0") not in set(args.attnact):
+    attnact_filter = getattr(args, "attnact", [])
+    if attnact_filter and meta.get("attnact", "attnact0") not in set(attnact_filter):
         return False
-    if args.profiler and meta["profiler"] not in set(args.profiler):
+    layeract_filter = getattr(args, "layeract", [])
+    if layeract_filter and meta.get("layeract", "layeract0") not in set(layeract_filter):
+        return False
+    layergc_filter = getattr(args, "layergc", [])
+    if layergc_filter and meta.get("layergc", "layergc0") not in set(layergc_filter):
+        return False
+    profiler_filter = {str(value).lower() for value in args.profiler}
+    if profiler_filter and str(meta["profiler"]).lower() not in profiler_filter:
         return False
     liger_loss_filter = getattr(args, "liger_loss", [])
     if liger_loss_filter and meta.get("liger_loss", "ligerloss0") not in set(liger_loss_filter):
@@ -748,17 +851,12 @@ def passes_filters(args: argparse.Namespace, meta: dict[str, Any]) -> bool:
         )
         if workload_tuple not in args.workload_tuples:
             return False
-    policy_values = split_tokens(list(args.expert_recompute_policies))
-    if policy_values:
-        parsed_policy_filter = [parse_expert_policy_spec(value) for value in policy_values]
-        policy_filter = {
-            str(policy["expert_recompute_policy_spec"])
-            for policy in parsed_policy_filter
-        } | {
-            str(policy["expert_policy_label"])
-            for policy in parsed_policy_filter
-        }
-        if str(meta["expert_recompute_policy_spec"]) not in policy_filter and str(meta.get("expert_policy_label", "")) not in policy_filter:
+    policy_filter = expert_policy_filter_values(list(args.expert_recompute_policies))
+    if policy_filter:
+        if (
+            str(meta["expert_recompute_policy_spec"]).lower() not in policy_filter
+            and str(meta.get("expert_policy_label", "")).lower() not in policy_filter
+        ):
             return False
     return True
 
@@ -842,12 +940,15 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         )
     )
     router_mode = str(config.get("router_mode", meta["router_mode"]))
-    if router_mode not in {"hf", "whole"}:
-        return None
     expact_value = normalize_bool_config(config.get("asymm_expert_act_offload", meta.get("asymm_expert_act_offload", "false")))
     expact = expact_label(expact_value)
     attnact_value = normalize_bool_config(config.get("asymm_attn_act_offload", meta.get("asymm_attn_act_offload", "false")))
     attnact = attnact_label(attnact_value)
+    layeract_value = normalize_bool_config(config.get("asymm_layer_act_offload", meta.get("asymm_layer_act_offload", "false")))
+    layeract = layeract_label(layeract_value)
+    layergc_config_value = config.get("asymm_layer_gc", config.get("asym_layer_glue_gc_enabled", meta.get("asymm_layer_gc", "false")))
+    layergc_value = normalize_bool_config(layergc_config_value)
+    layergc = layergc_label(layergc_value)
     liger_loss = str(config.get("liger_loss") or meta.get("liger_loss") or "ligerloss0").lower()
     if liger_loss not in {"ligerloss0", "ligerloss1"}:
         liger_loss = "ligerloss0"
@@ -896,6 +997,10 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         "expact": expact,
         "asymm_attn_act_offload": attnact_value,
         "attnact": attnact,
+        "asymm_layer_act_offload": layeract_value,
+        "layeract": layeract,
+        "asymm_layer_gc": layergc_value,
+        "layergc": layergc,
         "expert_recompute_policy_spec": expert_recompute_policy_spec,
         "expert_policy_label": expert_policy_label,
         "expert_recompute_policy": expert_recompute_policy,
@@ -1046,6 +1151,8 @@ def trainable_surface_comparison_key(row: dict[str, Any]) -> tuple[Any, ...]:
         row["router_mode"],
         row.get("expact", "expact0"),
         row.get("attnact", "attnact0"),
+        row.get("layeract", "layeract0"),
+        row.get("layergc", "layergc0"),
         row["profiler"],
         row["liger_loss"],
         row["mode"],
@@ -1104,6 +1211,8 @@ def collect_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["router_mode"],
             row.get("expact", "expact0"),
             row.get("attnact", "attnact0"),
+            row.get("layeract", "layeract0"),
+            row.get("layergc", "layergc0"),
             row["profiler"],
             row["liger_loss"],
             row["mode"],
@@ -1126,6 +1235,8 @@ def collect_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["router_mode"],
             row.get("expact", "expact0"),
             row.get("attnact", "attnact0"),
+            row.get("layeract", "layeract0"),
+            row.get("layergc", "layergc0"),
             row["profiler"],
             row["liger_loss"],
             row["seq_len"],
@@ -1270,6 +1381,8 @@ def collect_step_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["router_mode"],
             row.get("expact", "expact0"),
             row.get("attnact", "attnact0"),
+            row.get("layeract", "layeract0"),
+            row.get("layergc", "layergc0"),
             row["profiler"],
             row["liger_loss"],
             row["mode"],
@@ -1292,6 +1405,8 @@ def collect_step_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row["router_mode"],
             row.get("expact", "expact0"),
             row.get("attnact", "attnact0"),
+            row.get("layeract", "layeract0"),
+            row.get("layergc", "layergc0"),
             row["profiler"],
             row["liger_loss"],
             row["seq_len"],
@@ -1317,6 +1432,8 @@ def group_key(row: dict[str, Any]) -> tuple[str, ...]:
         str(row["router_mode"]),
         str(row.get("expact", "expact0")),
         str(row.get("attnact", "attnact0")),
+        str(row.get("layeract", "layeract0")),
+        str(row.get("layergc", "layergc0")),
         str(row["profiler"]),
         str(row.get("liger_loss", "ligerloss0")),
     )
@@ -1334,23 +1451,25 @@ def threshold_group_key(row: dict[str, Any]) -> tuple[str, ...]:
         str(row["router_mode"]),
         str(row.get("expact", "expact0")),
         str(row.get("attnact", "attnact0")),
+        str(row.get("layeract", "layeract0")),
+        str(row.get("layergc", "layergc0")),
         str(row["profiler"]),
         str(row.get("liger_loss", "ligerloss0")),
     )
 
 
 def varied_fields(rows: list[dict[str, Any]]) -> set[str]:
-    fields = ("workload", "precision", "batch_size", "gradient_accumulation_steps", "lora_dropout", "backend", "router_mode", "expact", "attnact", "profiler", "liger_loss", "mode")
+    fields = ("workload", "precision", "batch_size", "gradient_accumulation_steps", "lora_dropout", "backend", "router_mode", "expact", "attnact", "layeract", "layergc", "profiler", "liger_loss", "mode")
     return {field for field in fields if len({row[field] for row in rows}) > 1}
 
 
 def varied_threshold_fields(rows: list[dict[str, Any]]) -> set[str]:
-    fields = ("workload", "precision", "batch_size", "gradient_accumulation_steps", "lora_dropout", "seq_len", "backend", "router_mode", "expact", "attnact", "profiler", "liger_loss", "mode")
+    fields = ("workload", "precision", "batch_size", "gradient_accumulation_steps", "lora_dropout", "seq_len", "backend", "router_mode", "expact", "attnact", "layeract", "layergc", "profiler", "liger_loss", "mode")
     return {field for field in fields if len({row[field] for row in rows}) > 1}
 
 
 def combined_label(group: tuple[str, ...], mode: str, varied: set[str]) -> str:
-    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, profiler, liger_loss = group
+    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = group
     mode_labels = {"no_recompute": "No recompute", "recompute": "Activation recompute"}
     parts: list[str] = []
     if "workload" in varied:
@@ -1371,6 +1490,10 @@ def combined_label(group: tuple[str, ...], mode: str, varied: set[str]) -> str:
         parts.append(expact)
     if "attnact" in varied:
         parts.append(attnact)
+    if "layeract" in varied:
+        parts.append(layeract)
+    if "layergc" in varied:
+        parts.append(layergc)
     if "profiler" in varied:
         parts.append(profiler)
     if "liger_loss" in varied:
@@ -1379,11 +1502,11 @@ def combined_label(group: tuple[str, ...], mode: str, varied: set[str]) -> str:
         parts.append(mode_labels.get(mode, mode))
     if parts:
         return " / ".join(parts)
-    return f"{backend} / router={router_mode} / {expact} / {attnact} / {liger_loss} / {mode_labels.get(mode, mode)}"
+    return f"{backend} / router={router_mode} / {expact} / {attnact} / {layeract} / {layergc} / {liger_loss} / {mode_labels.get(mode, mode)}"
 
 
 def combined_threshold_label(group: tuple[str, ...], mode: str, varied: set[str]) -> str:
-    workload, precision, batch_size, grad_accum, lora_dropout, seq_len, backend, router_mode, expact, attnact, profiler, liger_loss = group
+    workload, precision, batch_size, grad_accum, lora_dropout, seq_len, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = group
     mode_labels = {"no_recompute": "No layer recompute", "recompute": "Layer recompute"}
     parts: list[str] = []
     if "workload" in varied:
@@ -1406,6 +1529,10 @@ def combined_threshold_label(group: tuple[str, ...], mode: str, varied: set[str]
         parts.append(expact)
     if "attnact" in varied:
         parts.append(attnact)
+    if "layeract" in varied:
+        parts.append(layeract)
+    if "layergc" in varied:
+        parts.append(layergc)
     if "profiler" in varied:
         parts.append(profiler)
     if "liger_loss" in varied:
@@ -1414,7 +1541,7 @@ def combined_threshold_label(group: tuple[str, ...], mode: str, varied: set[str]
         parts.append(mode_labels.get(mode, mode))
     if parts:
         return " / ".join(parts)
-    return f"s{seq_len} / {backend} / router={router_mode} / {expact} / {attnact} / {liger_loss} / {mode_labels.get(mode, mode)}"
+    return f"s{seq_len} / {backend} / router={router_mode} / {expact} / {attnact} / {layeract} / {layergc} / {liger_loss} / {mode_labels.get(mode, mode)}"
 
 
 def write_table(rows: list[dict[str, Any]], output_dir: Path, name: str) -> None:
@@ -1658,6 +1785,22 @@ def plot_line(
     )
 
 
+def mode_policy_label(mode: Any, policy_label: Any) -> str:
+    mode_labels = {"no_recompute": "No recompute", "recompute": "Activation recompute"}
+    label = mode_labels.get(str(mode), str(mode))
+    policy = str(policy_label or "none")
+    if policy != "none":
+        label = f"{label} / {policy}"
+    return label
+
+
+def append_policy_label(label: str, policy_label: Any) -> str:
+    policy = str(policy_label or "none")
+    if policy == "none":
+        return label
+    return f"{label} / {policy}"
+
+
 def plot_metric(
     rows: list[dict[str, Any]],
     output_dir: Path,
@@ -1670,29 +1813,30 @@ def plot_metric(
 ) -> None:
     import matplotlib.pyplot as plt
 
-    by_mode = {
-        "no_recompute": sorted((row for row in rows if row["mode"] == "no_recompute"), key=lambda row: row["seq_len"]),
-        "recompute": sorted((row for row in rows if row["mode"] == "recompute"), key=lambda row: row["seq_len"]),
-    }
-    labels = {"no_recompute": "No recompute", "recompute": "Activation recompute"}
-    color_by_label = series_color_map([labels[mode] for mode, mode_rows in by_mode.items() if mode_rows])
+    series: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        series.setdefault((str(row["mode"]), str(row.get("expert_policy_label", "none"))), []).append(row)
+    series_items: list[tuple[str, list[dict[str, Any]]]] = []
+    for (mode, policy_label), series_rows in sorted(series.items()):
+        label = mode_policy_label(mode, policy_label)
+        series_items.append((label, sorted(series_rows, key=lambda row: row["seq_len"])))
+    color_by_label = series_color_map([label for label, _ in series_items])
 
     fig, ax = plt.subplots(figsize=(8, 5), dpi=160)
     sublinear_spans: list[tuple[float, float]] = []
-    for mode, mode_rows in by_mode.items():
-        if not mode_rows:
+    for label, sorted_rows in series_items:
+        if not sorted_rows:
             continue
-        label = labels[mode]
         plot_line(
             ax,
-            [row["seq_len"] for row in mode_rows],
-            [float(row[key]) / scale for row in mode_rows],
+            [row["seq_len"] for row in sorted_rows],
+            [float(row[key]) / scale for row in sorted_rows],
             label=label,
-            backend=mode_rows[0].get("backend", ""),
+            backend=sorted_rows[0].get("backend", ""),
             linewidth=2,
             color=color_by_label[label],
         )
-        sublinear_spans.extend(sublinear_regions(mode_rows, key, scale=scale))
+        sublinear_spans.extend(sublinear_regions(sorted_rows, key, scale=scale))
     has_sublinear_region = draw_sublinear_regions(ax, sublinear_spans)
     ax.set_title(plot_title(title))
     ax.set_xlabel("Sequence length")
@@ -1717,35 +1861,36 @@ def plot_paired_metric(
 ) -> None:
     import matplotlib.pyplot as plt
 
-    by_mode = {
-        "no_recompute": sorted((row for row in rows if row["mode"] == "no_recompute"), key=lambda row: row["seq_len"]),
-        "recompute": sorted((row for row in rows if row["mode"] == "recompute"), key=lambda row: row["seq_len"]),
-    }
-    labels = {"no_recompute": "No recompute", "recompute": "Activation recompute"}
-    color_by_label = series_color_map([labels[mode] for mode, mode_rows in by_mode.items() if mode_rows])
+    series: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        series.setdefault((str(row["mode"]), str(row.get("expert_policy_label", "none"))), []).append(row)
+    series_items: list[tuple[str, list[dict[str, Any]]]] = []
+    for (mode, policy_label), series_rows in sorted(series.items()):
+        label = mode_policy_label(mode, policy_label)
+        series_items.append((label, sorted(series_rows, key=lambda row: row["seq_len"])))
+    color_by_label = series_color_map([label for label, _ in series_items])
 
     fig, ax = plt.subplots(figsize=(8, 5), dpi=160)
     plotted = False
-    for mode, mode_rows in by_mode.items():
-        if not mode_rows:
+    for label, sorted_rows in series_items:
+        if not sorted_rows:
             continue
-        label = labels[mode]
         color = color_by_label[label]
         plot_line(
             ax,
-            [row["seq_len"] for row in mode_rows],
-            [float(row[allocated_key]) / scale for row in mode_rows],
+            [row["seq_len"] for row in sorted_rows],
+            [float(row[allocated_key]) / scale for row in sorted_rows],
             label=f"{label} allocated",
-            backend=mode_rows[0].get("backend", ""),
+            backend=sorted_rows[0].get("backend", ""),
             linewidth=2,
             color=color,
         )
         plot_line(
             ax,
-            [row["seq_len"] for row in mode_rows],
-            [float(row[reserved_key]) / scale for row in mode_rows],
+            [row["seq_len"] for row in sorted_rows],
+            [float(row[reserved_key]) / scale for row in sorted_rows],
             label=f"{label} reserved",
-            backend=mode_rows[0].get("backend", ""),
+            backend=sorted_rows[0].get("backend", ""),
             linewidth=2,
             color=color,
             linestyle="--",
@@ -1776,14 +1921,17 @@ def plot_combined_metric(
 ) -> None:
     import matplotlib.pyplot as plt
 
-    series: dict[tuple[tuple[str, ...], str], list[dict[str, Any]]] = {}
+    series: dict[tuple[tuple[str, ...], str, str], list[dict[str, Any]]] = {}
     for row in rows:
-        series.setdefault((group_key(row), str(row["mode"])), []).append(row)
+        series.setdefault(
+            (group_key(row), str(row["mode"]), str(row.get("expert_policy_label", "none"))),
+            [],
+        ).append(row)
     varied = varied_fields(rows)
     series_items: list[tuple[str, list[dict[str, Any]]]] = []
-    for (group, mode), group_rows in sorted(series.items()):
+    for (group, mode, policy_label), group_rows in sorted(series.items()):
         sorted_rows = sorted(group_rows, key=lambda row: row["seq_len"])
-        series_items.append((combined_label(group, mode, varied), sorted_rows))
+        series_items.append((append_policy_label(combined_label(group, mode, varied), policy_label), sorted_rows))
     color_by_label = series_color_map([label for label, _ in series_items])
 
     fig, ax = plt.subplots(figsize=(11, 6), dpi=160)
@@ -2449,9 +2597,9 @@ def plot_combined_policy_metric(
 
 
 def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, ...]) -> None:
-    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, profiler, liger_loss = key
+    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, grad accum {grad_accum}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}, {liger_loss}"
+    suffix = f", batch size {batch_size}, grad accum {grad_accum}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}, {layeract}, {layergc}, {liger_loss}"
     plot_paired_metric(
         rows,
         output_dir,
@@ -2503,9 +2651,9 @@ def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[s
 def write_group_step_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, ...]) -> None:
     if not rows:
         return
-    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, profiler, liger_loss = key
+    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, grad accum {grad_accum}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}, {liger_loss}"
+    suffix = f", batch size {batch_size}, grad accum {grad_accum}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}, {layeract}, {layergc}, {liger_loss}"
     write_table(rows, output_dir, "step_samples")
     plot_paired_step_metric(
         rows,
@@ -2546,9 +2694,9 @@ def write_group_threshold_plots(
     key: tuple[str, ...],
     seq_len: int,
 ) -> None:
-    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, profiler, liger_loss = key
+    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, grad accum {grad_accum}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}, {liger_loss}"
+    suffix = f", batch size {batch_size}, grad accum {grad_accum}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}, {layeract}, {layergc}, {liger_loss}"
     plot_paired_threshold_metric(
         rows,
         output_dir,
@@ -2604,9 +2752,9 @@ def write_group_policy_plots(
     seq_len: int,
     family: str,
 ) -> None:
-    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, profiler, liger_loss = key
+    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, grad accum {grad_accum}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}, {liger_loss}"
+    suffix = f", batch size {batch_size}, grad accum {grad_accum}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}, {layeract}, {layergc}, {liger_loss}"
     name = policy_filename_suffix(family)
     title = {
         "tok": "expert token threshold",
@@ -2952,9 +3100,9 @@ def main() -> None:
         for key in sorted(set(groups) | set(step_groups)):
             group_rows = groups.get(key, [])
             group_step_rows = step_groups.get(key, [])
-            workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, profiler, liger_loss = key
+            workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = key
             group_dir = root / safe_label(
-                f"{workload}-b{batch_size}-ga{grad_accum}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}-{liger_loss}"
+                f"{workload}-b{batch_size}-ga{grad_accum}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}-{layeract}-{layergc}-{liger_loss}"
             )
             if group_rows:
                 write_table(group_rows, group_dir, "sweep_summary")
@@ -2976,9 +3124,9 @@ def main() -> None:
             family_groups.setdefault((group_key(row), int(row["seq_len"])), []).append(row)
         suffix = policy_filename_suffix(family)
         for (key, seq_len), group_rows in sorted(family_groups.items()):
-            workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, profiler, liger_loss = key
+            workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = key
             group_dir = root / safe_label(
-                f"{workload}-b{batch_size}-ga{grad_accum}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}-{liger_loss}"
+                f"{workload}-b{batch_size}-ga{grad_accum}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}-{layeract}-{layergc}-{liger_loss}"
             )
             write_table(group_rows, group_dir, f"{suffix}_summary_s{seq_len}")
             write_group_policy_plots(group_rows, group_dir, key, seq_len, family)

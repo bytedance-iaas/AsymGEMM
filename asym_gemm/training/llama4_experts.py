@@ -965,7 +965,8 @@ class AsymLlama4Experts(AsymQwen3Experts):
             with prof_range(self._forward_range("scatter_combine")):
                 return _scatter_contiguous_sum(down, metadata).to(dtype=input_dtype)
         finally:
-            self.release_lora_weights()
+            if self._asym_weight_offload_release_after_forward():
+                self.release_lora_weights()
 
 
 __all__ = ["AsymLlama4Experts"]

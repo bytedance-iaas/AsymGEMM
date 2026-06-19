@@ -32,15 +32,16 @@ projection leaves around that core.
 @^L = AsymGEMM with a CPU left operand
 @^R = AsymGEMM with a CPU right operand
 
-stage(Z_cpu)   = copy CPU tensor to an HBM tensor for immediate use
+stage(U)       = make CPU tensor or CPU-home logical LoRA weight U available as an HBM tensor
 offload(Z)     = copy HBM tensor to CPU and save the CPU owner
 contiguous(V)  = materialize a contiguous HBM tensor from view V
 pad_rows(Z, N) = append zero rows so the first dimension is N
 align_up(n, a) = smallest multiple of a greater than or equal to n
-release(...)   = listed tensors or saved handles are no longer live
+release(...)   = listed tensors, staged weights, or saved handles are no longer live
 
 CPU tensors have suffix _cpu.
 Tensors without _cpu are HBM tensors.
+Staged LoRA weights have suffix _hbm.
 Temp means HBM temporary, releasable after last use.
 Grad means trainable LoRA gradient.
 ```
@@ -53,6 +54,15 @@ immediately.
 When an operand is CPU-resident, the operator marks the CPU side. For example,
 `U_cpu @^L V.T` has a CPU left operand, while `U @^R V_cpu` has a CPU right
 operand.
+
+For a saved CPU tensor, `stage(U_cpu)` copies it to HBM for immediate use. For a
+LoRA weight, `stage(A_q)` / `stage(B_q)` are explicit weight-offload lifetime
+points. If LoRA weight offload is enabled, the CPU-home trainable weight is
+staged/backfetched to HBM and the returned `*_hbm` tensor is the GEMM operand.
+If LoRA weight offload is disabled, `stage(...)` is a no-op view of the CUDA
+parameter. In both cases, formulas use the staged `*_hbm` operand and release it
+after its last use. The logical trainable parameter and optimizer state remain
+owned by the optimizer/weight-offload coordinator.
 
 `Y += GEMM(...)` means accumulate into an already-live output buffer. Use a
 beta/addmm-style epilogue when the backend supports it. If a backend must
@@ -93,7 +103,8 @@ W_k_cpu  [Dkv,H]
 W_v_cpu  [Dkv,H]
 W_o_cpu  [H,Dq]
 
-# Trainable LoRA weights, HBM compute params
+# Trainable LoRA weights, CPU-home when weight offload is enabled;
+# staged HBM operands are named A_*_hbm / B_*_hbm in the schedule.
 A_q [r,H]       B_q [Dq,r]
 A_k [r,H]       B_k [Dkv,r]
 A_v [r,H]       B_v [Dkv,r]
@@ -117,11 +128,15 @@ Residency:
 
 ```text
 W_q_cpu/W_k_cpu/W_v_cpu/W_o_cpu stay CPU-resident.
-A_*/B_* stay HBM-resident CUDA nn.Parameters.
+A_*/B_* are logical trainable LoRA parameters. With LoRA weight offload enabled,
+their home storage is CPU-resident/pinned and they are staged to HBM only around
+the GEMMs that consume them. Without LoRA weight offload, the same `stage`
+points are no-ops over the CUDA parameter storage.
 Projection bias, when present, is a small vector add folded into the base output
 before LoRA accumulation.
-CPU AdamW may own CPU fp32 masters/state for A_*/B_*, but the compute params
-remain CUDA nn.Parameters.
+CPU AdamW may own CPU fp32 masters/state for A_*/B_* and may offload gradients
+from CUDA to CPU after backward accumulation. The math still treats dA_*/dB_* as
+gradients of the logical trainable LoRA weights.
 q_norm/k_norm/qk_norm are small vector ops, not AsymGEMM GEMMs, and are left to
 normal model/PyTorch autograd in v1.
 ```
@@ -238,30 +253,36 @@ X_cpu = offload(X)                                          # [M,H] CPU
 
 Q = X @^R W_q_cpu.T                                         # [M,Dq] HBM live
 X_q_cpu = D_q(X_cpu)                                        # [M,H] CPU
-S_q = X_q_cpu @^L A_q.T                                     # [M,r] HBM
-Q += scale * (S_q @ B_q.T)                                  # consume delta now
+A_q_hbm = stage(A_q)                                 # [r,H] HBM staged
+B_q_hbm = stage(B_q)                                 # [Dq,r] HBM staged
+S_q = X_q_cpu @^L A_q_hbm.T                                 # [M,r] HBM
+Q += scale * (S_q @ B_q_hbm.T)                              # consume delta now
 S_q_cpu = offload(S_q)                                      # [M,r] CPU, save for dB_q
-release(S_q, X_q_cpu_if_materialized)
+release(S_q, A_q_hbm, B_q_hbm, X_q_cpu_if_materialized)
 
 
 # ---------------- k projection ----------------
 
 K = X @^R W_k_cpu.T                                         # [M,Dkv] HBM live
 X_k_cpu = D_k(X_cpu)                                        # [M,H] CPU
-S_k = X_k_cpu @^L A_k.T                                     # [M,r] HBM
-K += scale * (S_k @ B_k.T)                                  # consume delta now
+A_k_hbm = stage(A_k)                                 # [r,H] HBM staged
+B_k_hbm = stage(B_k)                                 # [Dkv,r] HBM staged
+S_k = X_k_cpu @^L A_k_hbm.T                                 # [M,r] HBM
+K += scale * (S_k @ B_k_hbm.T)                              # consume delta now
 S_k_cpu = offload(S_k)                                      # [M,r] CPU, save for dB_k
-release(S_k, X_k_cpu_if_materialized)
+release(S_k, A_k_hbm, B_k_hbm, X_k_cpu_if_materialized)
 
 
 # ---------------- v projection ----------------
 
 V = X @^R W_v_cpu.T                                         # [M,Dkv] HBM live
 X_v_cpu = D_v(X_cpu)                                        # [M,H] CPU
-S_v = X_v_cpu @^L A_v.T                                     # [M,r] HBM
-V += scale * (S_v @ B_v.T)                                  # consume delta now
+A_v_hbm = stage(A_v)                                 # [r,H] HBM staged
+B_v_hbm = stage(B_v)                                 # [Dkv,r] HBM staged
+S_v = X_v_cpu @^L A_v_hbm.T                                 # [M,r] HBM
+V += scale * (S_v @ B_v_hbm.T)                              # consume delta now
 S_v_cpu = offload(S_v)                                      # [M,r] CPU, save for dB_v
-release(S_v, X_v_cpu_if_materialized)
+release(S_v, A_v_hbm, B_v_hbm, X_v_cpu_if_materialized)
 
 
 # ---------------- attention prepare/core ----------------
@@ -275,10 +296,12 @@ AttnOut = attention_core(Q_attn, K_attn, V_attn)             # [M,Dq] HBM
 AttnOut_cpu = offload(AttnOut)                               # [M,Dq] CPU
 Y = AttnOut @^R W_o_cpu.T                                    # [M,H] HBM live
 AttnOut_o_cpu = D_o(AttnOut_cpu)                             # [M,Dq] CPU
-S_o = AttnOut_o_cpu @^L A_o.T                                # [M,r] HBM
-Y += scale * (S_o @ B_o.T)                                   # consume delta now
+A_o_hbm = stage(A_o)                                  # [r,Dq] HBM staged
+B_o_hbm = stage(B_o)                                  # [H,r] HBM staged
+S_o = AttnOut_o_cpu @^L A_o_hbm.T                            # [M,r] HBM
+Y += scale * (S_o @ B_o_hbm.T)                               # consume delta now
 S_o_cpu = offload(S_o)                                       # [M,r] CPU, save for dB_o
-release(S_o, AttnOut_o_cpu_if_materialized)
+release(S_o, A_o_hbm, B_o_hbm, AttnOut_o_cpu_if_materialized)
 ```
 
 ## Backward
@@ -290,8 +313,11 @@ M_grad = align_up(M, 64)
 # ---------------- o projection ----------------
 
 dAttnOut = dY @^R W_o_cpu                                   # [M,Dq] HBM live
-dS_o = scale * (dY @ B_o)                                   # [M,r] Temp
-dAttnOut += D_o_bar(dS_o @ A_o)                             # consume dAttn delta
+B_o_hbm = stage(B_o)                                 # [H,r] HBM staged
+A_o_hbm = stage(A_o)                                 # [r,Dq] HBM staged
+dS_o = scale * (dY @ B_o_hbm)                               # [M,r] Temp
+dAttnOut += D_o_bar(dS_o @ A_o_hbm)                         # consume dAttn delta
+release(A_o_hbm, B_o_hbm)
 
 AttnOut_o_cpu = D_o(AttnOut_cpu)                            # [M,Dq] CPU
 AttnOut_grad_cpu = pad_rows(AttnOut_o_cpu, M_grad)          # [M_grad,Dq] CPU
@@ -315,8 +341,11 @@ dQ, dK, dV = autograd(attention_prepare + attention_core, dAttnOut)
 # ---------------- q projection ----------------
 
 dX = dQ @^R W_q_cpu                                         # [M,H] HBM
-dS_q = scale * (dQ @ B_q)                                   # [M,r] Temp
-dX += D_q_bar(dS_q @ A_q)                                   # consume q dX delta
+B_q_hbm = stage(B_q)                                 # [Dq,r] HBM staged
+A_q_hbm = stage(A_q)                                 # [r,H] HBM staged
+dS_q = scale * (dQ @ B_q_hbm)                               # [M,r] Temp
+dX += D_q_bar(dS_q @ A_q_hbm)                               # consume q dX delta
+release(A_q_hbm, B_q_hbm)
 
 X_q_cpu = D_q(X_cpu)                                        # [M,H] CPU
 X_q_grad_cpu = pad_rows(X_q_cpu, M_grad)                    # [M_grad,H] CPU
@@ -334,8 +363,11 @@ release(S_q_cpu)
 # ---------------- k projection ----------------
 
 dX += dK @^R W_k_cpu                                        # base term; temp only if no beta path
-dS_k = scale * (dK @ B_k)                                   # [M,r] Temp
-dX += D_k_bar(dS_k @ A_k)                                   # consume k dX delta
+B_k_hbm = stage(B_k)                                 # [Dkv,r] HBM staged
+A_k_hbm = stage(A_k)                                 # [r,H] HBM staged
+dS_k = scale * (dK @ B_k_hbm)                               # [M,r] Temp
+dX += D_k_bar(dS_k @ A_k_hbm)                               # consume k dX delta
+release(A_k_hbm, B_k_hbm)
 
 X_k_cpu = D_k(X_cpu)                                        # [M,H] CPU
 X_k_grad_cpu = pad_rows(X_k_cpu, M_grad)                    # [M_grad,H] CPU
@@ -353,8 +385,11 @@ release(S_k_cpu)
 # ---------------- v projection ----------------
 
 dX += dV @^R W_v_cpu                                        # base term; temp only if no beta path
-dS_v = scale * (dV @ B_v)                                   # [M,r] Temp
-dX += D_v_bar(dS_v @ A_v)                                   # consume v dX delta
+B_v_hbm = stage(B_v)                                 # [Dkv,r] HBM staged
+A_v_hbm = stage(A_v)                                 # [r,H] HBM staged
+dS_v = scale * (dV @ B_v_hbm)                               # [M,r] Temp
+dX += D_v_bar(dS_v @ A_v_hbm)                               # consume v dX delta
+release(A_v_hbm, B_v_hbm)
 
 X_v_cpu = D_v(X_cpu)                                        # [M,H] CPU
 X_v_grad_cpu = pad_rows(X_v_cpu, M_grad)                    # [M_grad,H] CPU
@@ -434,13 +469,13 @@ Each wrapped projection has exactly these launches:
 ```text
 forward pass:
   1 base CPU-right AsymGEMM:       U @^R W_cpu.T
-  1 LoRA-A CPU-left AsymGEMM:      U_drop_cpu @^L A.T
-  1 LoRA-B HBM GEMM:               S @ B.T
+  1 LoRA-A CPU-left AsymGEMM:      U_drop_cpu @^L stage(A).T
+  1 LoRA-B HBM GEMM:               S @ stage(B).T
 
 backward pass:
   1 base dx CPU-right AsymGEMM:    dZ @^R W_cpu
-  1 dS HBM GEMM:                   dZ @ B
-  1 LoRA input HBM GEMM:           dS @ A
+  1 dS HBM GEMM:                   dZ @ stage(B)
+  1 LoRA input HBM GEMM:           dS @ stage(A)
   1 dA CPU-right AsymGEMM:         dS.T @^R U_drop_cpu
   1 dB HBM GEMM with staged S:     dZ.T @ stage(S_cpu)
 ```

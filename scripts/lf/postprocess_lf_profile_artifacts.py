@@ -312,6 +312,10 @@ def _stage_memory_row(profile: dict[str, Any], name: str) -> dict[str, Any]:
     return {}
 
 
+def _training_step_memory_row(profile: dict[str, Any]) -> dict[str, Any]:
+    return _stage_memory_row(profile, "lf.step.total") or _stage_memory_row(profile, "lf.training_step.total")
+
+
 def _stage_timing_ms(profile: dict[str, Any], name: str) -> float | None:
     step = profile.get("step", {})
     rows = step.get("rows", []) if isinstance(step, dict) else []
@@ -508,6 +512,7 @@ def _runtime_counters(profile: dict[str, Any]) -> dict[str, Any]:
         counters.setdefault("asymm_expert_act_offload", config.get("asymm_expert_act_offload", ""))
         counters.setdefault("asymm_attn_act_offload", config.get("asymm_attn_act_offload", ""))
         counters.setdefault("asymm_layer_act_offload", config.get("asymm_layer_act_offload", ""))
+        counters.setdefault("asymm_layer_gc", config.get("asymm_layer_gc", config.get("asym_layer_glue_gc_enabled", "")))
     measured_steps = _measured_steps(profile)
     if measured_steps is not None:
         counters["measured_steps"] = measured_steps
@@ -1157,6 +1162,7 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
         f"Expert LoRA-A fwd: `{config.get('asymm_expert_act_offload_lora_a_fwd', '-')}`  ",
         f"Attention activation offload: `{config.get('asymm_attn_act_offload', '-')}`  ",
         f"Layer activation offload: `{config.get('asymm_layer_act_offload', '-')}`  ",
+        f"Layer glue GC: `{config.get('asymm_layer_gc', config.get('asym_layer_glue_gc_enabled', '-'))}`  ",
         f"Qwen expert LoRA impl: `{config.get('qwen_moe_expert_lora_impl', '-')}`  ",
         f"Attention GC: `{config.get('attention_gc_enabled', config.get('attn_gc_enabled', '-'))}`  ",
         f"Layer GC: `{config.get('layer_gc_enabled', '-')}`  ",
@@ -1199,11 +1205,17 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
                 samples=row.get("samples", "-"),
             )
         )
+    training_step_memory = _training_step_memory_row(profile)
+    breakdown_summary = _memory_breakdown_summary(profile)
     lines += [
         "",
-        f"Peak allocated HBM: `{_fmt_mib(gpu.get('peak_allocated_hbm_bytes'))} MiB`",
-        f"Peak reserved HBM: `{_fmt_mib(gpu.get('peak_reserved_hbm_bytes'))} MiB`",
-        f"Reserved but unallocated: `{_fmt_mib(gpu.get('reserved_unallocated_bytes'))} MiB`",
+        f"Whole-process peak allocated HBM: `{_fmt_mib(gpu.get('peak_allocated_hbm_bytes'))} MiB`",
+        f"Whole-process peak reserved HBM: `{_fmt_mib(gpu.get('peak_reserved_hbm_bytes'))} MiB`",
+        f"Measured training-step peak allocated HBM: `{_fmt_mib(training_step_memory.get('avg_peak_allocated_bytes'))} MiB`",
+        f"Measured training-step peak reserved HBM: `{_fmt_mib(training_step_memory.get('avg_peak_reserved_bytes'))} MiB`",
+        f"Memory-breakdown actual peak allocated HBM: `{_fmt_mib(breakdown_summary.get('actual_peak_allocated_hbm_bytes'))} MiB`",
+        f"Memory-breakdown actual peak reserved HBM: `{_fmt_mib(breakdown_summary.get('actual_peak_reserved_hbm_bytes'))} MiB`",
+        f"Whole-process reserved but unallocated: `{_fmt_mib(gpu.get('reserved_unallocated_bytes'))} MiB`",
         f"Timing source: `{timing.get('source', '-')}`",
         f"Trainer log: `{trainer.get('trainer_log', '')}`",
         "",
@@ -1724,6 +1736,8 @@ def _source_memory_breakdown_markdown(profile: dict[str, Any], *, top_level: boo
 def _source_memory_markdown(profile: dict[str, Any]) -> str:
     memory = profile.get("memory", {})
     gpu = memory.get("gpu", {}) if isinstance(memory, dict) else {}
+    training_step_memory = _training_step_memory_row(profile)
+    breakdown_summary = _memory_breakdown_summary(profile)
     memory_attribution = profile.get("memory_attribution", {})
     category_rows = memory_attribution.get("rows", []) if isinstance(memory_attribution, dict) else []
     saved_tensors = memory_attribution.get("saved_tensors", {}) if isinstance(memory_attribution, dict) else {}
@@ -1733,9 +1747,13 @@ def _source_memory_markdown(profile: dict[str, Any]) -> str:
         "",
         "| Metric | MiB |",
         "|---|---:|",
-        f"| peak_allocated_hbm_bytes | {_fmt_mib(gpu.get('peak_allocated_hbm_bytes'))} |",
-        f"| peak_reserved_hbm_bytes | {_fmt_mib(gpu.get('peak_reserved_hbm_bytes'))} |",
-        f"| reserved_unallocated_bytes | {_fmt_mib(gpu.get('reserved_unallocated_bytes'))} |",
+        f"| whole_process_peak_allocated_hbm_bytes | {_fmt_mib(gpu.get('peak_allocated_hbm_bytes'))} |",
+        f"| whole_process_peak_reserved_hbm_bytes | {_fmt_mib(gpu.get('peak_reserved_hbm_bytes'))} |",
+        f"| measured_training_step_peak_allocated_hbm_bytes | {_fmt_mib(training_step_memory.get('avg_peak_allocated_bytes'))} |",
+        f"| measured_training_step_peak_reserved_hbm_bytes | {_fmt_mib(training_step_memory.get('avg_peak_reserved_bytes'))} |",
+        f"| memory_breakdown_actual_peak_allocated_hbm_bytes | {_fmt_mib(breakdown_summary.get('actual_peak_allocated_hbm_bytes'))} |",
+        f"| memory_breakdown_actual_peak_reserved_hbm_bytes | {_fmt_mib(breakdown_summary.get('actual_peak_reserved_hbm_bytes'))} |",
+        f"| whole_process_reserved_unallocated_bytes | {_fmt_mib(gpu.get('reserved_unallocated_bytes'))} |",
         "",
     ]
     breakdown_markdown = _source_memory_breakdown_markdown(profile)

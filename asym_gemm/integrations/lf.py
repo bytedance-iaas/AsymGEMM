@@ -36,6 +36,10 @@ from asym_gemm.training.decoder_checkpoint import (
     decoder_checkpoint_module_names,
     install_decoder_checkpoint,
 )
+from asym_gemm.training.decoder_layer_glue_gc import (
+    decoder_layer_glue_gc_module_names,
+    install_decoder_layer_glue_gc,
+)
 from asym_gemm.training.frozen_linear import AsymExecutionStats, AsymFrozenLinear
 from asym_gemm.training.host_weight import tensor_nbytes
 from asym_gemm.training.lora import (
@@ -281,6 +285,10 @@ class LFAsymReport:
     layer_act_offload_wrapped: int = 0
     layer_act_offload_modules: tuple[str, ...] = ()
     layer_act_offload_skipped: tuple[str, ...] = ()
+    layer_glue_gc_enabled: bool = False
+    layer_glue_gc_wrapped: int = 0
+    layer_glue_gc_modules: tuple[str, ...] = ()
+    layer_glue_gc_skipped: tuple[str, ...] = ()
     attention_saved_tensor_offload_wrapped: int = 0
     attention_saved_tensor_offload_modules: tuple[str, ...] = ()
     attention_saved_tensor_offload_skipped: tuple[str, ...] = ()
@@ -330,6 +338,8 @@ class LFAsymReport:
             f"attention_act_offload_wrapped={self.attention_act_offload_wrapped}, "
             f"layer_act_offload_enabled={self.layer_act_offload_enabled}, "
             f"layer_act_offload_wrapped={self.layer_act_offload_wrapped}, "
+            f"layer_glue_gc_enabled={self.layer_glue_gc_enabled}, "
+            f"layer_glue_gc_wrapped={self.layer_glue_gc_wrapped}, "
             f"attention_saved_tensor_offload_wrapped={self.attention_saved_tensor_offload_wrapped}, "
             f"linear_attention_saved_tensor_offload_wrapped={self.linear_attention_saved_tensor_offload_wrapped}, "
             f"router_mode={self.router_mode}, "
@@ -365,6 +375,8 @@ class LFAsymReport:
             f"attention_act_offload_wrapped={self.attention_act_offload_wrapped}, "
             f"layer_act_offload_enabled={self.layer_act_offload_enabled}, "
             f"layer_act_offload_wrapped={self.layer_act_offload_wrapped}, "
+            f"layer_glue_gc_enabled={self.layer_glue_gc_enabled}, "
+            f"layer_glue_gc_wrapped={self.layer_glue_gc_wrapped}, "
             f"attention_saved_tensor_offload_wrapped={self.attention_saved_tensor_offload_wrapped}, "
             f"linear_attention_saved_tensor_offload_wrapped={self.linear_attention_saved_tensor_offload_wrapped}, "
             f"router_mode={self.router_mode}, "
@@ -717,6 +729,164 @@ def _looks_like_qwen35_vision_tower(module: nn.Module) -> bool:
     return "visionmodel" in class_name or "vision_model" in class_name
 
 
+def _looks_like_multimodal_vision_tower(module: nn.Module) -> bool:
+    if isinstance(module, _CpuStagedFrozenModule):
+        return False
+    if bool(getattr(module, "input_modalities", ())):
+        return True
+    if all(hasattr(module, attr) for attr in ("patch_embed", "blocks", "merger")):
+        return True
+    if all(hasattr(module, attr) for attr in ("patch_embedding", "model", "vision_adapter")):
+        return True
+    class_name = type(module).__name__.lower().replace("_", "")
+    return "visionmodel" in class_name or "visiontower" in class_name
+
+
+def _first_cuda_tensor_device(value: Any) -> torch.device | None:
+    if isinstance(value, torch.Tensor):
+        return value.device if value.device.type == "cuda" else None
+    if isinstance(value, Mapping):
+        values = value.values()
+    elif isinstance(value, (tuple, list, set)):
+        values = value
+    else:
+        return None
+    for item in values:
+        device = _first_cuda_tensor_device(item)
+        if device is not None:
+            return device
+    return None
+
+
+def _contains_requires_grad_tensor(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        return bool(value.requires_grad)
+    if isinstance(value, Mapping):
+        values = value.values()
+    elif isinstance(value, (tuple, list, set)):
+        values = value
+    else:
+        return False
+    return any(_contains_requires_grad_tensor(item) for item in values)
+
+
+class _CpuStagedFrozenModule(nn.Module):
+    """CPU-home wrapper for frozen multimodal modules that run with CUDA inputs."""
+
+    def __init__(self, module: nn.Module, *, source_name: str, target_device: torch.device | str, component: str) -> None:
+        super().__init__()
+        self.module = module
+        self.source_name = str(source_name)
+        self.target_device = torch.device(target_device)
+        self.component = str(component)
+        self.cpu_resident_base_bytes = int(_module_tensor_nbytes(module))
+        self.stage_calls = 0
+        self.release_calls = 0
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return super().__getattr__(name)
+        except AttributeError as original:
+            modules = self.__dict__.get("_modules", {})
+            module = modules.get("module") if isinstance(modules, dict) else None
+            if module is not None:
+                try:
+                    return getattr(module, name)
+                except AttributeError:
+                    pass
+            raise original
+
+    def _execution_device(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> torch.device:
+        input_device = _first_cuda_tensor_device((args, kwargs))
+        if input_device is not None:
+            return input_device
+        return self.target_device
+
+    @torch.no_grad()
+    def _move_inner(self, device: torch.device | str) -> None:
+        self.module.to(device=torch.device(device), non_blocking=False)
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        execution_device = self._execution_device(args, kwargs)
+        self._move_inner(execution_device)
+        self.stage_calls += 1
+        try:
+            output = self.module(*args, **kwargs)
+            if _contains_requires_grad_tensor(output):
+                raise RuntimeError(
+                    f"{self.source_name} is installed as a frozen CPU-staged multimodal module, "
+                    "but its forward output requires grad. Keep this module CUDA-resident or disable "
+                    "vision/projector freezing when training through this path."
+                )
+            return output
+        finally:
+            self._move_inner("cpu")
+            self.release_calls += 1
+
+
+def install_lf_frozen_multimodal_cpu_staging(
+    model: nn.Module,
+    device: torch.device | str,
+    *,
+    stage_frozen_vision: bool = True,
+    stage_frozen_projector: bool = True,
+    strict: bool = True,
+) -> dict[str, Any]:
+    target_device = torch.device(device)
+    if not stage_frozen_vision and not stage_frozen_projector:
+        return {"staged_modules": tuple(), "skipped": tuple(), "staged_bytes": 0}
+
+    candidates: list[tuple[str, str]] = []
+    for name, module in list(model.named_modules()):
+        if not name or isinstance(module, _CpuStagedFrozenModule):
+            continue
+        if stage_frozen_projector and _is_multimodal_projector_path(name):
+            candidates.append((name, "projector"))
+            continue
+        if (
+            stage_frozen_vision
+            and _is_vision_path(name)
+            and not _is_multimodal_projector_path(name)
+            and _looks_like_multimodal_vision_tower(module)
+        ):
+            candidates.append((name, "vision"))
+
+    selected: list[tuple[str, str]] = []
+    for name, component in sorted(candidates, key=lambda item: (item[0].count("."), len(item[0]), item[0])):
+        if any(name == parent or name.startswith(f"{parent}.") for parent, _ in selected):
+            continue
+        selected.append((name, component))
+
+    staged: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    staged_bytes = 0
+    for name, component in selected:
+        module = model.get_submodule(name)
+        if isinstance(module, _CpuStagedFrozenModule):
+            continue
+        trainable = [param_name for param_name, param in module.named_parameters(recurse=True) if param.requires_grad]
+        if trainable:
+            message = f"{name}:trainable_params:{trainable[:8]}"
+            if strict:
+                raise RuntimeError(
+                    f"refusing to install CPU staging for non-frozen multimodal module {name}; "
+                    f"trainable params include {trainable[:8]}"
+                )
+            skipped.append(message)
+            continue
+        nbytes = _module_tensor_nbytes(module)
+        parent, child_name = _parent_and_child(model, name)
+        _replace_child(
+            parent,
+            child_name,
+            _CpuStagedFrozenModule(module, source_name=name, target_device=target_device, component=component),
+        )
+        staged.append({"name": name, "component": component, "bytes": int(nbytes), "type": type(module).__name__})
+        staged_bytes += int(nbytes)
+
+    return {"staged_modules": tuple(staged), "skipped": tuple(skipped), "staged_bytes": int(staged_bytes)}
+
+
 class _DroppedFrozenVisionTower(nn.Module):
     def __init__(self, source: nn.Module, *, source_name: str) -> None:
         super().__init__()
@@ -793,6 +963,14 @@ def move_lf_asym_cpu_first_model_to_device(
     selection = parse_lf_offload_modules(offload_modules)
     moved_bytes_by_reason: dict[str, int] = defaultdict(int)
     kept_cpu_bytes_by_component: dict[str, int] = defaultdict(int)
+    staging_summary = install_lf_frozen_multimodal_cpu_staging(
+        model,
+        target_device,
+        stage_frozen_vision=keep_frozen_vision_on_cpu,
+        stage_frozen_projector=keep_frozen_projector_on_cpu,
+        strict=strict,
+    )
+    setattr(model, "_asym_multimodal_cpu_staging", staging_summary)
 
     def should_keep_cpu(name: str, tensor: torch.Tensor) -> bool:
         if bool(getattr(tensor, "requires_grad", False)):
@@ -856,6 +1034,7 @@ def move_lf_asym_cpu_first_model_to_device(
     return {
         "moved_bytes_by_reason": dict(moved_bytes_by_reason),
         "kept_cpu_bytes_by_component": dict(kept_cpu_bytes_by_component),
+        "multimodal_cpu_staging": staging_summary,
         "unselected_frozen_cuda_residue_bytes_by_component": dict(residue),
     }
 
@@ -1132,6 +1311,12 @@ def _layer_act_offload_enabled() -> bool:
     )
 
 
+def _layer_glue_gc_enabled() -> bool:
+    return _env_true(os.environ.get("ASYMM_LAYER_GC")) or _env_true(
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_GC")
+    )
+
+
 def _has_attention_excluded_path_marker(name: str) -> bool:
     lower = f".{name.lower()}."
     return any(marker in lower for marker in _ATTENTION_GC_EXCLUDED_PATH_MARKERS)
@@ -1285,6 +1470,29 @@ def _wrap_qwen3_decoder_checkpoint_modules(
             skipped.append(f"{name}:vision_or_multimodal")
     if strict and not wrapped:
         raise RuntimeError("gc-layer requested but no supported Qwen3 decoder layers were found")
+    return tuple(wrapped), tuple(skipped)
+
+
+def _wrap_decoder_layer_glue_gc_modules(
+    model: nn.Module,
+    *,
+    strict: bool,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    wrapped: list[str] = []
+    skipped: list[str] = []
+    for name, module in list(model.named_modules()):
+        if not name:
+            continue
+        if _is_qwen3_decoder_layer_module_name(name, module):
+            install_decoder_layer_glue_gc(module)
+            wrapped.append(name)
+            continue
+        lower = f".{name.lower()}."
+        leaf = name.rsplit(".", 1)[-1].lower()
+        if leaf in {"decoder_layer", "layer"} and any(marker in lower for marker in _ATTENTION_GC_EXCLUDED_PATH_MARKERS):
+            skipped.append(f"{name}:vision_or_multimodal")
+    if strict and not wrapped:
+        raise RuntimeError("ASYMM_LAYER_GC requested but no supported decoder layers were found")
     return tuple(wrapped), tuple(skipped)
 
 
@@ -1492,8 +1700,10 @@ def apply_lf_asym_lora(
     report.stats = stats
     attention_act_enabled = _attention_act_offload_enabled()
     layer_act_enabled = _layer_act_offload_enabled()
+    layer_glue_gc_enabled = _layer_glue_gc_enabled()
     report.attention_act_offload_enabled = bool(attention_act_enabled)
     report.layer_act_offload_enabled = bool(layer_act_enabled)
+    report.layer_glue_gc_enabled = bool(layer_glue_gc_enabled)
     wrap_experts = _targets_experts(raw_lora_target)
     offload_experts = backend == "asym" and selection.routed_experts
     offload_router = backend == "asym" and selection.router
@@ -1502,6 +1712,12 @@ def apply_lf_asym_lora(
         raise RuntimeError("Qwen3 decoder layer activation offload requires expert policy none")
     if layer_act_enabled and backend != "asym":
         raise RuntimeError("Qwen3 decoder layer activation offload requires backend='asym'")
+    if layer_glue_gc_enabled and recompute_config.label != "none":
+        raise RuntimeError("ASYMM_LAYER_GC requires expert policy none")
+    if layer_glue_gc_enabled and backend != "asym":
+        raise RuntimeError("ASYMM_LAYER_GC requires backend='asym'")
+    if layer_glue_gc_enabled and layer_act_enabled:
+        raise RuntimeError("ASYMM_LAYER_GC and Qwen3 decoder layer activation offload are mutually exclusive")
 
     expert_prefixes: list[str] = []
 
@@ -1982,11 +2198,11 @@ def apply_lf_asym_lora(
             model,
             strict=strict,
         )
-        if selection.linear_attention:
-            linear_attention_saved_modules, linear_attention_saved_skipped = _wrap_linear_attention_saved_tensor_offload_modules(
-                model,
-                strict=strict,
-            )
+    if (layer_act_enabled or layer_glue_gc_enabled) and selection.linear_attention:
+        linear_attention_saved_modules, linear_attention_saved_skipped = _wrap_linear_attention_saved_tensor_offload_modules(
+            model,
+            strict=strict,
+        )
     report.layer_act_offload_wrapped = len(layer_saved_modules)
     report.layer_act_offload_modules = tuple(layer_saved_modules)
     report.layer_act_offload_skipped = tuple(layer_saved_skipped)
@@ -2002,6 +2218,22 @@ def apply_lf_asym_lora(
     setattr(model, "_asym_layer_act_offload_skipped", tuple(layer_saved_skipped))
     setattr(model, "_asym_linear_attention_saved_tensor_offload_modules", tuple(linear_attention_saved_modules))
     setattr(model, "_asym_linear_attention_saved_tensor_offload_skipped", tuple(linear_attention_saved_skipped))
+
+    layer_glue_modules: tuple[str, ...] = ()
+    layer_glue_skipped: tuple[str, ...] = ()
+    if layer_glue_gc_enabled:
+        layer_glue_modules, layer_glue_skipped = _wrap_decoder_layer_glue_gc_modules(
+            model,
+            strict=strict,
+        )
+    report.layer_glue_gc_wrapped = len(layer_glue_modules)
+    report.layer_glue_gc_modules = tuple(layer_glue_modules)
+    report.layer_glue_gc_skipped = tuple(layer_glue_skipped)
+    if layer_glue_skipped:
+        report.skipped.extend(layer_glue_skipped)
+    setattr(model, "_asym_layer_glue_gc_enabled", bool(layer_glue_gc_enabled))
+    setattr(model, "_asym_layer_glue_gc_modules", tuple(layer_glue_modules))
+    setattr(model, "_asym_layer_glue_gc_skipped", tuple(layer_glue_skipped))
 
     freeze_non_lora_params(model)
     _validate_trainable_params(model)
@@ -2117,6 +2349,12 @@ def _infer_adapter_config(model: nn.Module, metadata: Mapping[str, Any] | None) 
     if bool(getattr(model, "_asym_layer_gc_enabled", False)) or layer_gc_modules:
         config["asym_layer_gc_enabled"] = bool(getattr(model, "_asym_layer_gc_enabled", False))
         config["asym_layer_gc_modules"] = list(layer_gc_modules)
+    layer_glue_gc_modules = tuple(getattr(model, "_asym_layer_glue_gc_modules", ())) or decoder_layer_glue_gc_module_names(model)
+    config["asymm_layer_gc"] = bool(getattr(model, "_asym_layer_glue_gc_enabled", False))
+    if bool(getattr(model, "_asym_layer_glue_gc_enabled", False)) or layer_glue_gc_modules:
+        config["asym_layer_glue_gc_enabled"] = bool(getattr(model, "_asym_layer_glue_gc_enabled", False))
+        config["asym_layer_glue_gc_modules"] = list(layer_glue_gc_modules)
+        config["asym_layer_glue_gc_skipped"] = list(getattr(model, "_asym_layer_glue_gc_skipped", ()))
     attention_act_modules = tuple(getattr(model, "_asym_attention_act_offload_modules", ()))
     if bool(getattr(model, "_asym_attention_act_offload_enabled", False)) or attention_act_modules:
         attention_saved_modules = tuple(
@@ -2224,6 +2462,7 @@ __all__ = [
     "component_is_selected",
     "count_lora_wrapped_modules",
     "get_asym_lora_state_dict",
+    "install_lf_frozen_multimodal_cpu_staging",
     "load_asym_peft_adapter",
     "audit_lf_frozen_cuda_residue",
     "drop_lf_frozen_vision_tower_for_text_only_profile",

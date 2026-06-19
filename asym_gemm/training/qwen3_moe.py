@@ -2396,6 +2396,15 @@ class AsymQwen3Experts(nn.Module):
             for param in self._lora_banks():
                 coordinator.release(param)
 
+    def _asym_weight_offload_release_after_forward(self) -> bool:
+        if not self.training or not torch.is_grad_enabled():
+            return True
+        # Plain expert autograd reads trainable LoRA banks through regular torch
+        # ops, so AccumulateGrad needs the parameters to stay full-shaped until
+        # the optimizer's post-accumulate hooks release them. The custom expert
+        # paths below gather in their backward and can release after forward.
+        return bool(self._uses_activation_offload() or self._uses_expert_gc() or self._uses_expert_recompute())
+
     def _activation_offload_requested(self) -> bool:
         return _env_flag("ASYMM_EXPERT_ACT_OFFLOAD", False)
 
@@ -2510,6 +2519,13 @@ class AsymQwen3Experts(nn.Module):
             packed = packed.requires_grad_(True)
 
         def expert_body(packed_arg: torch.Tensor) -> torch.Tensor:
+            if getattr(self, "_weight_offload", None) is not None:
+                # Checkpoint recompute calls this closure directly, bypassing module
+                # forward pre-hooks. Gather here so released 0-size LoRA placeholders
+                # are restored before grouped LoRA GEMMs run. Do not release here:
+                # original forward is released by the module hook, and recompute
+                # backward is released by the post-accumulate grad hook.
+                self.gather_lora_weights()
             return self._forward_expert_body(
                 packed_arg,
                 offsets,

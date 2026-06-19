@@ -209,10 +209,13 @@ class _AsymLoRALinearWeightOffloadFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None]:
         module: AsymLoRALinear = ctx.module
+        x_lora, low_rank = ctx.saved_tensors
+        # With non-reentrant checkpointing, materializing saved tensors can replay
+        # forward and release the offloaded LoRA group. Gather after that replay so
+        # the weights used below are full staged tensors, not 0-size placeholders.
         module.gather_lora_weights()
         a = module.lora_a
         b = module.lora_b
-        x_lora, low_rank = ctx.saved_tensors
 
         grad_x = grad_a = grad_b = None
         grad_flat = grad_output.reshape(-1, int(ctx.out_features)).to(dtype=module.lora_dtype).contiguous()

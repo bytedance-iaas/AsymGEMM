@@ -332,6 +332,11 @@ def install_lora_weight_offload(model: Any, coordinator: LoRAWeightOffloadCoordi
         module.gather_lora_weights()
 
     def _release_hook(module: Any, _inputs: Any, _output: Any) -> None:
+        should_release = getattr(module, "_asym_weight_offload_release_after_forward", None)
+        if callable(should_release) and not bool(should_release()):
+            return
+        if not bool(getattr(module, "_weight_offload_release_after_forward", True)):
+            return
         module.release_lora_weights()
 
     def _bind_parent_methods(module: Any) -> None:

@@ -1789,6 +1789,17 @@ def _patch_training_phases(handle: LFTraceHandle) -> None:
                             optimizer=getattr(self, "optimizer", None),
                         )
                     return result
+                except BaseException:
+                    if handle.memory_breakdown_profiler is not None:
+                        try:
+                            handle.memory_breakdown_profiler.record_phase(
+                                "forward_exception",
+                                model=getattr(self, "model", None),
+                                optimizer=getattr(self, "optimizer", None),
+                            )
+                        except Exception:
+                            pass
+                    raise
                 finally:
                     setattr(self, "_asym_lf_in_compute_loss_profile", False)
 

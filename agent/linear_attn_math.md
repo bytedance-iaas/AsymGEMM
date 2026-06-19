@@ -8,11 +8,12 @@
 @^R  = AsymGEMM with a CPU right operand
 
 offload(Z)   = copy HBM tensor to CPU and save the CPU owner
-stage(Z_cpu) = copy CPU tensor to an HBM tensor for immediate use
-release(...) = listed tensors or handles are no longer live
+stage(U)     = make CPU tensor or CPU-home logical LoRA weight U available as an HBM tensor
+release(...) = listed tensors, staged weights, or saved handles are no longer live
 
 CPU tensors have suffix _cpu.
 Tensors without _cpu are HBM tensors.
+Staged LoRA weights have suffix _hbm.
 ```
 
 For LoRA branch `p`:
@@ -59,17 +60,23 @@ Y         [M,H]
 ```
 
 ```text
-W_qkv_cpu [C,H]    A_qkv [r,H]    B_qkv [C,r]
-W_z_cpu   [V,H]    A_z   [r,H]    B_z   [V,r]
-W_b_cpu   [Hv,H]   A_b   [r,H]    B_b   [Hv,r]
-W_a_cpu   [Hv,H]   A_a   [r,H]    B_a   [Hv,r]
-W_o_cpu   [H,V]    A_o   [r,V]    B_o   [H,r]
+W_qkv_cpu [C,H]    A_qkv [r,H]    B_qkv [C,r]    logical LoRA weights
+W_z_cpu   [V,H]    A_z   [r,H]    B_z   [V,r]    logical LoRA weights
+W_b_cpu   [Hv,H]   A_b   [r,H]    B_b   [Hv,r]   logical LoRA weights
+W_a_cpu   [Hv,H]   A_a   [r,H]    B_a   [Hv,r]   logical LoRA weights
+W_o_cpu   [H,V]    A_o   [r,V]    B_o   [H,r]    logical LoRA weights
 
 W_conv    [C,1,Kconv]
 dt_bias   [Hv]
 A_log     [Hv]
 gamma     [Dv]
 ```
+
+With LoRA weight offload enabled, `A_*` and `B_*` are CPU-home logical
+trainable weights. Every GEMM below uses the staged `A_*_hbm` or `B_*_hbm`
+operand returned by `stage(...)`. With LoRA weight offload disabled,
+`stage(...)` is a no-op view of the CUDA parameter. Saved CPU activations use
+the same `stage(...)` API when they must be copied back to HBM.
 
 ## Forward
 
@@ -79,28 +86,40 @@ gamma     [Dv]
 X_cpu = offload(X)
 
 QKV_pre = X @^R W_qkv_cpu.T
-S_qkv = D_qkv(X_cpu) @^L A_qkv.T
+A_qkv_hbm = stage(A_qkv)
+S_qkv = D_qkv(X_cpu) @^L A_qkv_hbm.T
+release(A_qkv_hbm)
 S_qkv_cpu = offload(S_qkv)
-QKV_pre += scale * (S_qkv @ B_qkv.T)
-release(S_qkv)
+B_qkv_hbm = stage(B_qkv)
+QKV_pre += scale * (S_qkv @ B_qkv_hbm.T)
+release(S_qkv, B_qkv_hbm)
 
 Z_flat = X @^R W_z_cpu.T
-S_z = D_z(X_cpu) @^L A_z.T
+A_z_hbm = stage(A_z)
+S_z = D_z(X_cpu) @^L A_z_hbm.T
+release(A_z_hbm)
 S_z_cpu = offload(S_z)
-Z_flat += scale * (S_z @ B_z.T)
-release(S_z)
+B_z_hbm = stage(B_z)
+Z_flat += scale * (S_z @ B_z_hbm.T)
+release(S_z, B_z_hbm)
 
 Braw = X @^R W_b_cpu.T
-S_b = D_b(X_cpu) @^L A_b.T
+A_b_hbm = stage(A_b)
+S_b = D_b(X_cpu) @^L A_b_hbm.T
+release(A_b_hbm)
 S_b_cpu = offload(S_b)
-Braw += scale * (S_b @ B_b.T)
-release(S_b)
+B_b_hbm = stage(B_b)
+Braw += scale * (S_b @ B_b_hbm.T)
+release(S_b, B_b_hbm)
 
 Araw = X @^R W_a_cpu.T
-S_a = D_a(X_cpu) @^L A_a.T
+A_a_hbm = stage(A_a)
+S_a = D_a(X_cpu) @^L A_a_hbm.T
+release(A_a_hbm)
 S_a_cpu = offload(S_a)
-Araw += scale * (S_a @ B_a.T)
-release(S_a)
+B_a_hbm = stage(B_a)
+Araw += scale * (S_a @ B_a_hbm.T)
+release(S_a, B_a_hbm)
 ```
 
 ### Conv, Gates, And Heads
@@ -158,10 +177,13 @@ N = view(stack_i,h(n), [M,V])
 N_cpu = offload(N)
 
 Y = N @^R W_o_cpu.T
-S_o = D_o(N_cpu) @^L A_o.T
+A_o_hbm = stage(A_o)
+S_o = D_o(N_cpu) @^L A_o_hbm.T
+release(A_o_hbm)
 S_o_cpu = offload(S_o)
-Y += scale * (S_o @ B_o.T)
-release(S_o)
+B_o_hbm = stage(B_o)
+Y += scale * (S_o @ B_o_hbm.T)
+release(S_o, B_o_hbm)
 ```
 
 ## Backward
@@ -175,13 +197,15 @@ dN_base = dY @^R W_o_cpu
 
 S_o = stage(S_o_cpu)
 dB_o = scale * (dY.T @ S_o)
-dS_o = scale * (dY @ B_o)
-release(S_o, S_o_cpu)
+B_o_hbm = stage(B_o)
+dS_o = scale * (dY @ B_o_hbm)
+release(S_o, S_o_cpu, B_o_hbm)
 
 dA_o = dS_o.T @^R D_o(N_cpu)
-dN_lora = D_o_bar(dS_o @ A_o)
+A_o_hbm = stage(A_o)
+dN_lora = D_o_bar(dS_o @ A_o_hbm)
 dN = dN_base + dN_lora
-release(dS_o, N_cpu)
+release(dS_o, A_o_hbm, N_cpu)
 ```
 
 ### Gated RMSNorm
@@ -191,9 +215,9 @@ For each row/head vector:
 ```text
 dn = dL/dn
 
-dgamma += dn * u * silu(z)
+dgamma += reduce_rows_heads(dn * u * silu(z))
 du = dn * gamma * silu(z)
-dz = dn * gamma * u * silu_bar(z)
+dz = dn * gamma * u * silu'(z)
 
 dot = sum_j du_j * c_j
 dc = rsqrt(rho) * du - c * (rho ** -1.5) * dot / Dv
@@ -229,16 +253,23 @@ dg_t += sum(dH'_t * H'_t)
 dH_{t-1} += exp(g_t) * dH'_t
 ```
 
-Backpropagate `dq_t, dk_t` through:
+Backpropagate `dq_t, dk_t` through the normalizations to produce
+`dQ_t, dK_t`:
 
 ```text
 q_t = l2norm(Q_t) / sqrt(Dk)
 k_t = l2norm(K_t)
 ```
 
-Then undo the `R` head repeat:
+Then collect token/head gradients and undo the `R` head repeat:
 
 ```text
+dQ = stack_t(dQ_t)
+dK = stack_t(dK_t)
+dVal = stack_t(dv_t)
+dBeta = stack_t(dbeta_t)
+dG = stack_t(dg_t)
+
 dQ0 = reduce_repeated_heads(dQ, R) if R > 1 else dQ
 dK0 = reduce_repeated_heads(dK, R) if R > 1 else dK
 ```
@@ -277,20 +308,31 @@ dX_P_base = dOut_P @^R W_P_cpu
 
 S_P = stage(S_P_cpu)
 dB_P = scale * (dOut_P.T @ S_P)
-dS_P = scale * (dOut_P @ B_P)
-release(S_P, S_P_cpu)
+B_P_hbm = stage(B_P)
+dS_P = scale * (dOut_P @ B_P_hbm)
+release(S_P, S_P_cpu, B_P_hbm)
 
 dA_P = dS_P.T @^R D_P(X_cpu)
-dX_P_lora = D_P_bar(dS_P @ A_P)
-release(dS_P)
+A_P_hbm = stage(A_P)
+dX_P_lora = D_P_bar(dS_P @ A_P_hbm)
+release(dS_P, A_P_hbm)
+```
+
+The generic loop yields:
+
+```text
+dX_qkv_base, dX_qkv_lora
+dX_z_base,   dX_z_lora
+dX_b_base,   dX_b_lora
+dX_a_base,   dX_a_lora
 ```
 
 ```text
 dX =
-  dQKV_pre @^R W_qkv_cpu + D_qkv_bar(dS_qkv @ A_qkv)
-+ view(dZ,[M,V]) @^R W_z_cpu + D_z_bar(dS_z @ A_z)
-+ dBraw @^R W_b_cpu + D_b_bar(dS_b @ A_b)
-+ dAraw @^R W_a_cpu + D_a_bar(dS_a @ A_a)
+  dX_qkv_base + dX_qkv_lora
++ dX_z_base   + dX_z_lora
++ dX_b_base   + dX_b_lora
++ dX_a_base   + dX_a_lora
 
 release(X_cpu)
 ```

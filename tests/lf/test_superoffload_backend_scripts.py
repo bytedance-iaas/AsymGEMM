@@ -1603,7 +1603,7 @@ def test_profile_lora_lf_passes_matching_source_profile_to_kt_arm_nsys(tmp_path:
         output_root
         / "asym_long_sft_smoke__lora__lf__bf16"
         / "qwen3-30b-a3b__gpus1__b4_s128_ga1_w0_s1_r64_a16_drop000"
-        / "kt_armbf16__source__recomp__polnone__routerhf__expact0__attnact0__layeract0__loraafwdhbm__actrecomp0__xunpack0__ligerloss0"
+        / "kt_armbf16__source__recomp__polnone__routerhf__expact0__attnact0__layeract0__layergc0__loraafwdhbm__actrecomp0__xunpack0__ligerloss0"
         / "b4_s128_ga1"
         / "profile.json"
     )
@@ -1622,8 +1622,9 @@ def test_profile_lora_lf_passes_matching_source_profile_to_kt_arm_nsys(tmp_path:
                     "lora_target": "all",
                     "lora_rank": 64,
                     "lora_dropout": 0.0,
-                    "activation_recompute": True,
-                    "kt_max_cache_depth": 2,
+                        "activation_recompute": True,
+                        "profile_sync": False,
+                        "kt_max_cache_depth": 2,
                     "kt_arm_sft_top_k": 8,
                     "kt_arm_sft_token_chunk_size": 2048,
                     "kt_arm_effective_route_qlen": 512,

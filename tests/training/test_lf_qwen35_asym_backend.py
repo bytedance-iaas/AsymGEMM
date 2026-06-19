@@ -970,6 +970,67 @@ def test_qwen35_asym_cpu_first_move_keeps_frozen_visual_state_on_cpu() -> None:
     assert residue.get("vision", 0) == 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="frozen multimodal CPU staging requires CUDA")
+def test_qwen35_frozen_visual_cpu_staging_runs_forward_and_releases_to_cpu() -> None:
+    class FakeVisual(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pos_embed = nn.Parameter(torch.randn(4, 8, dtype=torch.bfloat16), requires_grad=False)
+            self.patch_embed = nn.Identity()
+            self.blocks = nn.ModuleList([nn.Linear(8, 8, bias=False, dtype=torch.bfloat16)])
+            self.merger = nn.Linear(8, 8, bias=False, dtype=torch.bfloat16)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.merger(self.blocks[0](x + self.pos_embed[: x.shape[0]]))
+
+    class FakeConditional(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.language_model = FakeQwen3_5WholeOffloadModel(hidden_dim=8, intermediate_dim=8, num_layers=1)
+            self.visual = FakeVisual()
+
+        def get_input_embeddings(self) -> nn.Embedding:
+            return self.language_model.get_input_embeddings()
+
+        def get_output_embeddings(self) -> nn.Linear:
+            return self.language_model.get_output_embeddings()
+
+    model = FakeConditional()
+    model, _report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["all"],
+        dense_target_modules=_dense_targets(),
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="all",
+        router_mode="whole",
+        strict=True,
+    )
+    move_lf_asym_cpu_first_model_to_device(
+        model,
+        torch.device("cuda"),
+        offload_modules="all",
+        strict=True,
+        keep_frozen_vision_on_cpu=True,
+        keep_frozen_projector_on_cpu=True,
+    )
+
+    assert getattr(model.visual, "stage_calls", 0) == 0
+    x = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
+    out = model.visual(x)
+
+    assert out.device.type == "cuda"
+    assert out.requires_grad is False
+    assert model.visual.stage_calls == 1
+    assert model.visual.release_calls == 1
+    assert model.visual.pos_embed.device.type == "cpu"
+    assert model.visual.blocks[0].weight.device.type == "cpu"
+    assert model.visual.merger.weight.device.type == "cpu"
+
+
 def test_qwen35_weight_offload_registers_routed_shared_and_linear_attention_banks() -> None:
     model = FakeQwen3_5DecoderModel(hidden_dim=64, intermediate_dim=64, layer_mixers=("linear_attn",))
     model, _report = apply_lf_asym_lora(

@@ -54,6 +54,29 @@ def _env_enabled(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _value_enabled(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _source_profile_notes(config: dict[str, Any]) -> list[str]:
+    if _value_enabled(config.get("profile_sync"), default=True):
+        timing_note = (
+            "LF source timings are host wall-clock ranges with torch.cuda.synchronize() "
+            "before and after each profiled range."
+        )
+    else:
+        timing_note = "LF source timings are host wall-clock ranges without per-range CUDA synchronization."
+    return [
+        timing_note,
+        "Use heartbeat e2e timing for full training-step wall time including optimizer-side and trainer overhead.",
+        "Use Nsight Systems postprocessed profile.json for CUDA-kernel attribution, not as the sole source of source-stage wall timing.",
+    ]
+
+
 def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     value = os.environ.get(name)
     if value is None or value.strip() == "":
@@ -603,6 +626,7 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         ),
         "asymm_attn_act_offload": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD", "false"),
         "asymm_layer_act_offload": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD", "false"),
+        "asymm_layer_gc": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_GC", "false"),
         "attention_gc_enabled": attention_gc_enabled,
         "layer_gc_enabled": layer_gc_enabled,
         "expert_recompute_policy_spec": expert_policy.label,
@@ -2673,10 +2697,7 @@ class LFProfileRecorder:
             "cpuadam": _cpuadam_summary_from_config(self.config),
             "asym_cpu_adamw": _asym_cpu_adamw_summary_from_trace(trace_handle),
             "expert_token_distribution": {"samples": 0, "per_expert": []},
-            "notes": [
-                "LF source timings are host wall-clock ranges without per-range CUDA synchronization.",
-                "Use the Nsight Systems postprocessed profile.json for low-overhead GPU timing truth.",
-            ],
+            "notes": _source_profile_notes(self.config),
         }
 
 

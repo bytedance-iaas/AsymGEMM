@@ -189,6 +189,8 @@ class RunRecord:
             f"router={self.metadata.get('router_mode', '')}" if self.metadata.get("router_mode") else "",
             self.metadata.get("expact", ""),
             self.metadata.get("attnact", ""),
+            self.metadata.get("layeract", ""),
+            self.metadata.get("layergc", ""),
             self.metadata.get("liger_loss", ""),
             self.metadata.get("recompute", ""),
             self.metadata.get("expert_policy", ""),
@@ -255,10 +257,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--workload", action="append", default=[])
     parser.add_argument("--backend", action="append", default=[])
     parser.add_argument("--profiler", action="append", default=[])
-    parser.add_argument("--router-mode", action="append", default=[], choices=["hf", "whole"])
-    parser.add_argument("--expact", action="append", default=[], choices=["expact0", "expact1"])
-    parser.add_argument("--attnact", action="append", default=[], choices=["attnact0", "attnact1"])
-    parser.add_argument("--liger-loss", action="append", default=[], choices=["ligerloss0", "ligerloss1"])
+    parser.add_argument("--router-mode", action="append", default=[])
+    parser.add_argument("--expact", action="append", default=[])
+    parser.add_argument("--attnact", action="append", default=[])
+    parser.add_argument("--layeract", action="append", default=[])
+    parser.add_argument("--layergc", action="append", default=[])
+    parser.add_argument("--liger-loss", action="append", default=[])
     parser.add_argument("--workloads", nargs="+", default=[])
     parser.add_argument("--expert-recompute-policies", nargs="+", default=[])
     return parser.parse_args()
@@ -357,6 +361,14 @@ def _attnact_label(value: Any) -> str:
     return "attnact1" if _normalize_bool_config(value) == "true" else "attnact0"
 
 
+def _layeract_label(value: Any) -> str:
+    return "layeract1" if _normalize_bool_config(value) == "true" else "layeract0"
+
+
+def _layergc_label(value: Any) -> str:
+    return "layergc1" if _normalize_bool_config(value) == "true" else "layergc0"
+
+
 def _parse_expact_part(part: str) -> tuple[str, str] | None:
     value = part.strip().lower()
     if value in {"expact1", "expacttrue"}:
@@ -375,6 +387,24 @@ def _parse_attnact_part(part: str) -> tuple[str, str] | None:
     return None
 
 
+def _parse_layeract_part(part: str) -> tuple[str, str] | None:
+    value = part.strip().lower()
+    if value in {"layeract1", "layeracttrue"}:
+        return "true", "layeract1"
+    if value in {"layeract0", "layeractfalse"}:
+        return "false", "layeract0"
+    return None
+
+
+def _parse_layergc_part(part: str) -> tuple[str, str] | None:
+    value = part.strip().lower()
+    if value in {"layergc1", "layergctrue"}:
+        return "true", "layergc1"
+    if value in {"layergc0", "layergcfalse"}:
+        return "false", "layergc0"
+    return None
+
+
 def _parse_liger_loss_part(part: str) -> str | None:
     value = part.strip().lower()
     if value in {"ligerloss0", "ligerloss1"}:
@@ -385,7 +415,16 @@ def _parse_liger_loss_part(part: str) -> str | None:
 def _known_optional_job_axis(part: str) -> bool:
     value = part.strip().lower()
     return (
-        value in {"layeract0", "layeract1", "layeractfalse", "layeracttrue"}
+        value in {
+            "layeract0",
+            "layeract1",
+            "layeractfalse",
+            "layeracttrue",
+            "layergc0",
+            "layergc1",
+            "layergcfalse",
+            "layergctrue",
+        }
         or value in {"actrecomp0", "actrecomp1", "actrecompfalse", "actrecomptrue"}
         or value in {"xunpack0", "xunpack1", "xunpackfalse", "xunpacktrue"}
         or value.startswith("loraafwd")
@@ -405,6 +444,10 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
     expact = "expact0"
     attnact_value = "false"
     attnact = "attnact0"
+    layeract_value = "false"
+    layeract = "layeract0"
+    layergc_value = "false"
+    layergc = "layergc0"
     liger_loss = "ligerloss0"
 
     if tail:
@@ -421,13 +464,21 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         if parsed_attnact is not None:
             attnact_value, attnact = parsed_attnact
             continue
+        parsed_layeract = _parse_layeract_part(part)
+        if parsed_layeract is not None:
+            layeract_value, layeract = parsed_layeract
+            continue
+        parsed_layergc = _parse_layergc_part(part)
+        if parsed_layergc is not None:
+            layergc_value, layergc = parsed_layergc
+            continue
         parsed_liger_loss = _parse_liger_loss_part(part)
         if parsed_liger_loss is not None:
             liger_loss = parsed_liger_loss
             continue
-        if _known_optional_job_axis(part):
-            continue
-        return None
+        # Unknown tail parts are config axes. Plotting should not reject a run
+        # just because the driver grew a new folder label.
+        continue
 
     return {
         "backend": backend_part,
@@ -439,6 +490,10 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         "expact": expact,
         "asymm_attn_act_offload": attnact_value,
         "attnact": attnact,
+        "asymm_layer_act_offload": layeract_value,
+        "layeract": layeract,
+        "asymm_layer_gc": layergc_value,
+        "layergc": layergc,
         "liger_loss": liger_loss,
     }
 
@@ -468,16 +523,23 @@ def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | 
     expact = job_meta["expact"]
     attnact_value = job_meta["asymm_attn_act_offload"]
     attnact = job_meta["attnact"]
+    layeract_value = job_meta["asymm_layer_act_offload"]
+    layeract = job_meta["layeract"]
+    layergc_value = job_meta["asymm_layer_gc"]
+    layergc = job_meta["layergc"]
     if not policy_part.startswith("pol") or not router_part.startswith("router"):
         return None
     router_mode = str(config.get("router_mode") or router_part[len("router") :])
-    if router_mode not in {"hf", "whole"}:
-        return None
     expert_policy = str(config.get("expert_policy") or policy_part[len("pol") :] or "none")
     expact_value = _normalize_bool_config(config.get("asymm_expert_act_offload", expact_value))
     expact = _expact_label(expact_value)
     attnact_value = _normalize_bool_config(config.get("asymm_attn_act_offload", attnact_value))
     attnact = _attnact_label(attnact_value)
+    layeract_value = _normalize_bool_config(config.get("asymm_layer_act_offload", layeract_value))
+    layeract = _layeract_label(layeract_value)
+    layergc_config_value = config.get("asymm_layer_gc", config.get("asym_layer_glue_gc_enabled", layergc_value))
+    layergc_value = _normalize_bool_config(layergc_config_value)
+    layergc = _layergc_label(layergc_value)
     liger_loss = str(config.get("liger_loss") or job_meta.get("liger_loss") or "ligerloss0").lower()
     if liger_loss not in {"ligerloss0", "ligerloss1"}:
         liger_loss = "ligerloss0"
@@ -493,6 +555,10 @@ def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | 
         "expact": expact,
         "asymm_attn_act_offload": attnact_value,
         "attnact": attnact,
+        "asymm_layer_act_offload": layeract_value,
+        "layeract": layeract,
+        "asymm_layer_gc": layergc_value,
+        "layergc": layergc,
         "liger_loss": liger_loss,
         "seq_len": str(config.get("seq_len") or (run_dir_match.group("seq_len") if run_dir_match else "")),
         "precision": str(config.get("precision") or ""),
@@ -660,8 +726,10 @@ def _matches_filters(run: RunRecord, args: argparse.Namespace) -> bool:
         "backend": _filter_values(args.backend),
         "profiler": _filter_values(args.profiler),
         "router_mode": _filter_values(args.router_mode),
-        "expact": _filter_values(args.expact),
-        "attnact": _filter_values(args.attnact),
+        "expact": _filter_values(getattr(args, "expact", [])),
+        "attnact": _filter_values(getattr(args, "attnact", [])),
+        "layeract": _filter_values(getattr(args, "layeract", [])),
+        "layergc": _filter_values(getattr(args, "layergc", [])),
         "liger_loss": _filter_values(getattr(args, "liger_loss", [])),
         "expert_policy": _filter_values(args.expert_recompute_policies),
     }
@@ -1616,6 +1684,8 @@ def _group_label(run: RunRecord) -> str:
         f"router{metadata.get('router_mode', '')}" if metadata.get("router_mode") else "",
         metadata.get("expact", ""),
         metadata.get("attnact", ""),
+        metadata.get("layeract", ""),
+        metadata.get("layergc", ""),
         metadata.get("liger_loss", ""),
         metadata.get("recompute", ""),
         f"pol{metadata.get('expert_policy', '')}" if metadata.get("expert_policy") else "",

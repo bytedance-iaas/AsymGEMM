@@ -90,6 +90,12 @@ from .decoder_checkpoint import (
     install_decoder_checkpoint,
     is_decoder_checkpoint_wrapper,
 )
+from .decoder_layer_glue_gc import (
+    DecoderLayerGlueGCWrapper,
+    decoder_layer_glue_gc_module_names,
+    install_decoder_layer_glue_gc,
+    is_decoder_layer_glue_gc_wrapper,
+)
 from .cpu_adam import AsymCPUAdamW
 from .mlp import (
     AsymMLP,
@@ -158,9 +164,11 @@ __all__ = [
     "AttentionActivationOffloadContext",
     "attention_saved_tensor_offload_module_names",
     "DecoderCheckpointWrapper",
+    "DecoderLayerGlueGCWrapper",
     "DecoderSavedTensorOffloadWrapper",
     "LinearAttentionSavedTensorOffloadWrapper",
     "decoder_checkpoint_module_names",
+    "decoder_layer_glue_gc_module_names",
     "decoder_saved_tensor_offload_module_names",
     "linear_attention_saved_tensor_offload_module_names",
     "AsymCPUAdamW",
@@ -234,6 +242,7 @@ __all__ = [
     "is_llama4_moe",
     "is_attention_saved_tensor_offload_wrapper",
     "is_decoder_checkpoint_wrapper",
+    "is_decoder_layer_glue_gc_wrapper",
     "is_decoder_saved_tensor_offload_wrapper",
     "is_linear_attention_saved_tensor_offload_wrapper",
     "load_lora_state_dict",
@@ -255,6 +264,7 @@ __all__ = [
     "prepare_grouped_lora_metadata",
     "install_attention_saved_tensor_offload",
     "install_decoder_checkpoint",
+    "install_decoder_layer_glue_gc",
     "install_decoder_saved_tensor_offload",
     "install_linear_attention_saved_tensor_offload",
     "initialize_asym_cuda_graph_state",
