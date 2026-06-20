@@ -877,11 +877,20 @@ def _legend_handles(keys: list[str], *, include_peak: bool = True) -> list[Any]:
 
 def _plot_legend(ax: Any, keys: list[str], *, include_peak: bool = True) -> None:
     handles = _legend_handles(keys, include_peak=include_peak)
+    labels = [handle.get_label() for handle in handles]
+    ncol = max(1, min(len(labels), 5))
+    # Move any existing axes title to a figure-level suptitle so the
+    # above-axes legend strip does not overlap it.
+    existing_title = ax.get_title()
+    if existing_title:
+        ax.set_title("")
+        ax.figure.suptitle(existing_title)
     ax.legend(
         handles=handles,
-        loc="upper left",
-        bbox_to_anchor=(1.02, 1.0),
-        frameon=True,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=ncol,
+        frameon=False,
         fontsize=8,
         labelspacing=0.35,
         handlelength=1.4,
@@ -1612,11 +1621,14 @@ def _plot_combined_steps(runs: list[RunRecord], out_dir: Path, y_limit_gib: floa
             ax.set_ylabel("Memory (GiB)")
     for idx in range(n_runs, nrows * ncols):
         axes[idx // ncols][idx % ncols].axis("off")
+    _combined_handles = _legend_handles(legend_keys, include_peak=True)
     fig.legend(
-        handles=_legend_handles(legend_keys, include_peak=True),
-        loc="center left",
-        bbox_to_anchor=(1.01, 0.5),
-        frameon=True,
+        handles=_combined_handles,
+        labels=[handle.get_label() for handle in _combined_handles],
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.0),
+        ncol=max(1, min(len(_combined_handles), 5)),
+        frameon=False,
         fontsize=8,
         labelspacing=0.35,
         handlelength=1.4,
@@ -1658,11 +1670,14 @@ def _plot_combined_phases(runs: list[RunRecord], out_dir: Path, y_limit_gib: flo
             ax.set_ylabel("Memory (GiB)")
     for idx in range(n_runs, nrows * ncols):
         axes[idx // ncols][idx % ncols].axis("off")
+    _combined_handles = _legend_handles(legend_keys, include_peak=True)
     fig.legend(
-        handles=_legend_handles(legend_keys, include_peak=True),
-        loc="center left",
-        bbox_to_anchor=(1.01, 0.5),
-        frameon=True,
+        handles=_combined_handles,
+        labels=[handle.get_label() for handle in _combined_handles],
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.0),
+        ncol=max(1, min(len(_combined_handles), 5)),
+        frameon=False,
         fontsize=8,
         labelspacing=0.35,
         handlelength=1.4,
@@ -1697,7 +1712,10 @@ def _write_grouped_combined(runs: list[RunRecord], out_dir: Path, clean: bool, y
     groups: dict[str, list[RunRecord]] = {}
     for run in runs:
         groups.setdefault(_group_label(run), []).append(run)
+    # Skip single-run groups: they just duplicate that config's own leaf memory_plots/ breakdown.
     for label, group_runs in sorted(groups.items()):
+        if len(group_runs) <= 1:
+            continue
         _write_combined(group_runs, out_dir / label, clean, y_limit_gib, write_groups=False)
 
 

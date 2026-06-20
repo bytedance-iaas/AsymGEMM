@@ -27,8 +27,13 @@ def _shared_mlp_activation_offload_enabled() -> bool:
 
 
 def _is_silu_activation(fn: Any) -> bool:
-    name = getattr(fn, "__name__", "")
-    return fn is F.silu or name in {"silu", "silu_python"}
+    if fn is F.silu or isinstance(fn, torch.nn.SiLU):
+        return True
+    # transformers exposes silu as an ACT2FN["silu"] == SiLUActivation() instance whose
+    # __name__ is unset; match by class name so the shared-MLP activation offload is not
+    # silently disabled for Llama-4 (whose MLP uses ACT2FN[config.hidden_act]).
+    name = getattr(fn, "__name__", "") or type(fn).__name__
+    return name in {"silu", "silu_python", "SiLU", "SiLUActivation"}
 
 
 @dataclass(frozen=True)

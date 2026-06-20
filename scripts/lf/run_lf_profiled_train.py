@@ -2723,7 +2723,8 @@ def main() -> None:
     recorder = LFProfileRecorder(
         config=config,
         measure_memory=_env_enabled(PROFILE_MEMORY_ENV, default=True),
-        reset_stage_peak_stats=not trace_config.memory_breakdown,
+        # Reset the torch peak counter per stage so forward/backward report true within-stage peaks.
+        reset_stage_peak_stats=True,
     )
     source_json = os.environ.get(PROFILE_SOURCE_JSON_ENV)
     if source_json and _is_rank0():

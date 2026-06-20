@@ -1787,9 +1787,11 @@ def _source_memory_markdown(profile: dict[str, Any]) -> str:
         lines.append("")
     if isinstance(saved_tensors, dict) and saved_tensors.get("enabled"):
         lines += [
-            "## Saved Activation Owners",
+            "## Saved Activation Owners (reference/lifetime bytes)",
             "",
-            "| Owner | MiB |",
+            "_Reference/lifetime bytes (can exceed HBM); not live-resident. For live-at-peak HBM see the saved_activation rows._",
+            "",
+            "| Owner | MiB (reference) |",
             "|---|---:|",
         ]
         sorted_saved = sorted(

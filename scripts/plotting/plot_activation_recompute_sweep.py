@@ -1737,19 +1737,37 @@ def draw_sublinear_regions(ax: Any, regions: list[tuple[float, float]]) -> bool:
     return bool(merged_regions)
 
 
-def add_legend(ax: Any, *, sublinear_region: bool, fontsize: int | None = None) -> None:
-    if not sublinear_region:
-        ax.legend(fontsize=fontsize)
-        return
-    from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch
-
+def add_legend(ax: Any, *, sublinear_region: bool = False, fontsize: int | None = None) -> None:
     handles, labels = ax.get_legend_handles_labels()
-    handles.append(Line2D([0], [0], color=SUBLINEAR_COLOR, linestyle=":", linewidth=1.4))
-    labels.append("Sublinear boundary")
-    handles.append(Patch(facecolor=SUBLINEAR_COLOR, alpha=SUBLINEAR_ALPHA, edgecolor="none"))
-    labels.append("Sublinear region")
-    ax.legend(handles, labels, fontsize=fontsize)
+    if sublinear_region:
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import Patch
+
+        handles = list(handles)
+        labels = list(labels)
+        handles.append(Line2D([0], [0], color=SUBLINEAR_COLOR, linestyle=":", linewidth=1.4))
+        labels.append("Sublinear boundary")
+        handles.append(Patch(facecolor=SUBLINEAR_COLOR, alpha=SUBLINEAR_ALPHA, edgecolor="none"))
+        labels.append("Sublinear region")
+    if not labels:
+        return
+    ncol = max(1, min(len(labels), 5))
+    # Promote any axes title to a figure suptitle so the above-axes legend
+    # strip does not overlap it.
+    existing_title = ax.get_title()
+    if existing_title:
+        ax.set_title("")
+        ax.figure.suptitle(existing_title)
+    ax.legend(
+        handles,
+        labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=ncol,
+        borderaxespad=0.0,
+        frameon=False,
+        fontsize=fontsize,
+    )
 
 
 def series_color_map(labels: list[str]) -> dict[str, str]:
@@ -1903,7 +1921,7 @@ def plot_paired_metric(
     ax.set_xlabel("Sequence length")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
-    ax.legend()
+    add_legend(ax)
     fig.tight_layout()
     save_plot(fig, output_dir / filename)
     plt.close(fig)
@@ -2113,7 +2131,7 @@ def plot_step_metric(
     ax.set_xlabel("Raw trainer step")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
-    ax.legend(fontsize=7 if combined else None)
+    add_legend(ax, fontsize=7 if combined else None)
     fig.tight_layout()
     save_plot(fig, output_dir / filename)
     plt.close(fig)
@@ -2177,7 +2195,7 @@ def plot_paired_step_metric(
     ax.set_xlabel("Raw trainer step")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
-    ax.legend()
+    add_legend(ax)
     fig.tight_layout()
     save_plot(fig, output_dir / filename)
     plt.close(fig)
@@ -2311,7 +2329,7 @@ def plot_threshold_metric(
     ax.set_xlabel("Expert recompute threshold (tokens)")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
-    ax.legend()
+    add_legend(ax)
     fig.tight_layout()
     save_plot(fig, output_dir / filename)
     plt.close(fig)
@@ -2377,7 +2395,7 @@ def plot_paired_threshold_metric(
     ax.set_xlabel("Expert recompute threshold (tokens)")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
-    ax.legend()
+    add_legend(ax)
     fig.tight_layout()
     save_plot(fig, output_dir / filename)
     plt.close(fig)
@@ -2426,7 +2444,7 @@ def plot_combined_threshold_metric(
     ax.set_xlabel("Expert recompute threshold (tokens)")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
-    ax.legend(fontsize=7)
+    add_legend(ax, fontsize=7)
     fig.tight_layout()
     save_plot(fig, output_dir / filename)
     plt.close(fig)
@@ -2476,7 +2494,7 @@ def plot_policy_metric(
     ax.set_xlabel(policy_x_label(family))
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
-    ax.legend()
+    add_legend(ax)
     fig.tight_layout()
     save_plot(fig, output_dir / filename)
     plt.close(fig)
@@ -2540,7 +2558,7 @@ def plot_paired_policy_metric(
     ax.set_xlabel(policy_x_label(family))
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
-    ax.legend()
+    add_legend(ax)
     fig.tight_layout()
     save_plot(fig, output_dir / filename)
     plt.close(fig)
@@ -2590,7 +2608,7 @@ def plot_combined_policy_metric(
     ax.set_xlabel(policy_x_label(family))
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.35)
-    ax.legend(fontsize=7)
+    add_legend(ax, fontsize=7)
     fig.tight_layout()
     save_plot(fig, output_dir / filename)
     plt.close(fig)

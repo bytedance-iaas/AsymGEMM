@@ -709,7 +709,14 @@ def _plot_by_step(runs: list[RunRecord], out_dir: Path) -> None:
         axes[idx // ncols][idx % ncols].axis("off")
     handles, labels = axes[0][0].get_legend_handles_labels()
     if handles:
-        fig.legend(handles, labels, loc="center left", bbox_to_anchor=(1.01, 0.5))
+        fig.legend(
+            handles,
+            labels,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 1.0),
+            ncol=max(1, min(len(labels), 5)),
+            frameon=False,
+        )
     fig.suptitle("Combined C2C Saturation by Measured Step", fontsize=12)
     fig.savefig(out_dir / "combined_c2c_saturation_by_step.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -738,11 +745,21 @@ def _plot_peak_summary(runs: list[RunRecord], out_dir: Path) -> None:
     ax.set_yticks(y_positions)
     ax.set_yticklabels(labels, fontsize=8)
     ax.set_xlabel("Saturation (%)")
-    ax.set_title("Combined C2C Peak Saturation")
+    fig.suptitle("Combined C2C Peak Saturation")
     all_values = [float(row.get("p95_peak_percent", 0.0)) for row in summary] + [float(row.get("max_peak_percent", 0.0)) for row in summary]
     ax.set_xlim(left=0.0, right=max(100.0, max(all_values, default=0.0) * 1.08))
     ax.grid(True, axis="x", alpha=0.25)
-    ax.legend(loc="lower right", fontsize=8)
+    _summary_handles, _summary_labels = ax.get_legend_handles_labels()
+    ax.legend(
+        _summary_handles,
+        _summary_labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=max(1, min(len(_summary_labels), 5)),
+        borderaxespad=0.0,
+        frameon=False,
+        fontsize=8,
+    )
     fig.savefig(out_dir / "combined_c2c_peak_summary.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
@@ -818,7 +835,10 @@ def _write_grouped_outputs(runs: list[RunRecord], out_dir: Path, clean: bool) ->
     groups: dict[str, list[RunRecord]] = {}
     for run in runs:
         groups.setdefault(_group_label(run), []).append(run)
+    # Skip single-run groups: they just duplicate that config's own leaf interconnect_ctc_* outputs.
     for label, group_runs in sorted(groups.items()):
+        if len(group_runs) <= 1:
+            continue
         _write_outputs(group_runs, out_dir / label, clean, write_groups=False)
 
 

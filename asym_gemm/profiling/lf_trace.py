@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+import os
 import re
 import warnings
 import weakref
@@ -17,6 +18,23 @@ from asym_gemm.training.profile_ranges import current_profile_range, prof_range,
 _PATCH_ATTR = "_asym_lf_profile_wrapped"
 _HOOK_ATTR = "_asym_lf_profile_hooks_installed"
 _MEMORY_HOOK_ATTR = "_asym_lf_memory_breakdown_hooks_installed"
+# Stock MoE classes whose forward mutates a child's output in place — Llama4TextMoe does `out.add_(...)`
+# on its shared_expert output. A full backward hook wraps a module's output in a custom autograd
+# Function, and autograd forbids in-place edits of that wrapped output ("Output 0 of
+# BackwardHookFunctionBackward is a view and is being modified inplace") -> crash in backward. So only
+# when such a stock module is present (non-asym Llama4) do we skip BACKWARD hooks on the affected child
+# subtree (shared_expert, including its inner down_proj Linear). The asym wrapper AsymLlama4Moe returns a
+# fresh tensor (`out + routed`) and is safe -> the stock class is absent and its hooks are kept.
+_INPLACE_MOE_CLASSES = {"Llama4TextMoe"}
+_INPLACE_MOE_CHILD_MARKERS = ("shared_expert",)
+
+
+def _has_inplace_moe(named_modules) -> bool:
+    return any(type(module).__name__ in _INPLACE_MOE_CLASSES for _name, module in named_modules)
+
+
+def _skip_backward_hook(module_name: str, has_inplace_moe: bool) -> bool:
+    return has_inplace_moe and any(marker in module_name for marker in _INPLACE_MOE_CHILD_MARKERS)
 _OTHER_SAVED_ACTIVATION_COMPONENT = "other_saved_activations"
 
 
@@ -138,7 +156,8 @@ class LFTraceConfig:
 
     @property
     def backward_module_ranges_enabled(self) -> bool:
-        return self.level == "deep" or "backward" in self.module_filter_set
+        # Enable backward NVTX ranges whenever forward module ranges are on (adds backward hooks).
+        return self.level in {"module", "op", "deep"} or "backward" in self.module_filter_set
 
     @property
     def op_ranges_enabled(self) -> bool:
@@ -796,6 +815,7 @@ class LFMemoryBreakdownProfiler:
         self._model = model
         modules = list(model.named_modules())
         module_names = {name for name, _module in modules}
+        has_inplace_moe = _has_inplace_moe(modules)
         for module_name, module in modules:
             component = _component_from_module_name(module_name)
             if component is None:
@@ -824,20 +844,7 @@ class LFMemoryBreakdownProfiler:
             ) -> None:
                 if not self._active or not torch.cuda.is_available():
                     return
-                after = int(torch.cuda.memory_allocated())
-                try:
-                    peak_allocated = int(torch.cuda.max_memory_allocated())
-                    peak_reserved = int(torch.cuda.max_memory_reserved())
-                except RuntimeError:
-                    peak_allocated = after
-                    peak_reserved = int(torch.cuda.memory_reserved())
-                self._update_peak_values(
-                    after,
-                    int(torch.cuda.memory_reserved()),
-                    peak_allocated,
-                    peak_reserved,
-                    component=_component,
-                )
+                after = self._record_component_peak(_component)
                 self._remember_tensor_components(_output, _component, _module_name)
                 self._capture_saved_activation_peak(after)
                 if self._component_stack:
@@ -845,7 +852,43 @@ class LFMemoryBreakdownProfiler:
 
             self._hooks.append(module.register_forward_pre_hook(forward_pre))
             self._hooks.append(module.register_forward_hook(forward_post))
+
+            # Mirror the forward hooks on backward so backward peak growth attributes to its
+            # component; defensive so a hook error can never break the backward pass.
+            def backward_pre(_module: nn.Module, _grad_output: Any, *, _component: str = component) -> None:
+                if not self._active or not torch.cuda.is_available():
+                    return
+                self._component_stack.append(_component)
+
+            def backward_post(_module: nn.Module, _grad_input: Any, _grad_output: Any, *, _component: str = component) -> None:
+                if not self._active or not torch.cuda.is_available():
+                    return
+                try:
+                    self._capture_saved_activation_peak(self._record_component_peak(_component))
+                except Exception:
+                    pass
+                finally:
+                    if self._component_stack:
+                        self._component_stack.pop()
+
+            if not _skip_backward_hook(module_name, has_inplace_moe):
+                try:
+                    self._hooks.append(module.register_full_backward_pre_hook(backward_pre))
+                    self._hooks.append(module.register_full_backward_hook(backward_post))
+                except Exception:
+                    pass
         setattr(model, _MEMORY_HOOK_ATTR, True)
+
+    def _record_component_peak(self, component: str) -> int:
+        after = int(torch.cuda.memory_allocated())
+        try:
+            peak_allocated = int(torch.cuda.max_memory_allocated())
+            peak_reserved = int(torch.cuda.max_memory_reserved())
+        except RuntimeError:
+            peak_allocated = after
+            peak_reserved = int(torch.cuda.memory_reserved())
+        self._update_peak_values(after, int(torch.cuda.memory_reserved()), peak_allocated, peak_reserved, component=component)
+        return after
 
     def step_begin(self, model: nn.Module | None = None, optimizer: Any | None = None) -> None:
         if model is not None:
@@ -916,6 +959,9 @@ class LFMemoryBreakdownProfiler:
             "reserved_bytes": reserved,
             "peak_allocated_since_step_begin": self._current_peak_allocated,
             "peak_reserved_since_step_begin": self._current_peak_reserved,
+            # Phase-local peak (max since the last stage reset); exact for after_forward/after_backward.
+            "peak_allocated_within_phase": int(peak_allocated),
+            "peak_reserved_within_phase": int(peak_reserved),
             "persistent_bytes": persistent,
             "saved_activation_bytes": saved_activation,
             "saved_activation_bytes_at_peak": saved_activation_at_peak,
@@ -1788,6 +1834,32 @@ def _patch_training_phases(handle: LFTraceHandle) -> None:
                             model=getattr(self, "model", None),
                             optimizer=getattr(self, "optimizer", None),
                         )
+                        # Opt-in: dump a full CUDA allocator snapshot at the forward->backward
+                        # boundary so every live byte (incl. saved-activations, offload-staging,
+                        # workspace -- not just live module outputs) can be attributed by
+                        # allocation frame. Requires ASYM_GEMM_LF_PROFILE_MEMORY_SNAPSHOT=1 so
+                        # blocks carry python stacks. Fires only on the measured step.
+                        _af_prof = handle.memory_breakdown_profiler
+                        _af_path = os.environ.get("ASYM_GEMM_LF_PROFILE_AFTER_FORWARD_SNAPSHOT_PATH", "").strip()
+                        if _af_path and torch.cuda.is_available() and getattr(_af_prof, "_active", False):
+                            try:
+                                import pickle as _af_pickle
+
+                                if getattr(getattr(_af_prof, "config", None), "sync", False):
+                                    torch.cuda.synchronize()
+                                _af_step = int(getattr(_af_prof, "_step", 0) or 0)
+                                _af_out = _af_path.replace("{step}", str(_af_step)) if "{step}" in _af_path else _af_path
+                                _af_dir = os.path.dirname(_af_out)
+                                if _af_dir:
+                                    os.makedirs(_af_dir, exist_ok=True)
+                                with open(_af_out, "wb") as _af_fh:
+                                    _af_pickle.dump(
+                                        torch.cuda.memory._snapshot(),  # type: ignore[attr-defined]
+                                        _af_fh,
+                                        protocol=_af_pickle.HIGHEST_PROTOCOL,
+                                    )
+                            except Exception:
+                                pass
                     return result
                 except BaseException:
                     if handle.memory_breakdown_profiler is not None:
@@ -1942,6 +2014,7 @@ def _install_module_hooks_once(handle: LFTraceHandle, model: nn.Module | None) -
     modules = list(model.named_modules())
     layer_indices = [_layer_index(name) for name, _module in modules]
     max_layer = max((idx for idx in layer_indices if idx is not None), default=None)
+    has_inplace_moe = _has_inplace_moe(modules)
     filters = handle.config.module_filter_set
 
     for module_name, module in modules:
@@ -1977,11 +2050,11 @@ def _install_module_hooks_once(handle: LFTraceHandle, model: nn.Module | None) -
 
         handle.module_hooks.append(module.register_forward_pre_hook(forward_pre))
         handle.module_hooks.append(module.register_forward_hook(forward_post))
-        if handle.config.backward_module_ranges_enabled:
+        if handle.config.backward_module_ranges_enabled and not _skip_backward_hook(module_name, has_inplace_moe):
             try:
                 handle.module_hooks.append(module.register_full_backward_pre_hook(backward_pre))
                 handle.module_hooks.append(module.register_full_backward_hook(backward_post))
-            except AttributeError:
+            except Exception:
                 pass
 
     setattr(model, _HOOK_ATTR, True)

@@ -19,16 +19,16 @@ DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun}
 RUN_POST=${RUN_POST:-false}
 
 # Sweep axes
-GPU_POOL=${GPU_POOL:-0}
+GPU_POOL=${GPU_POOL:-3}
 # MODEL_SPECS entries are model|num_gpus. Recompute and Liger-loss mode belong only in BACKEND_SPECS.
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
-MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-35B-A3B|1"}
+MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-35B-A3B|1,Qwen/Qwen3.5-122B-A10B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1,Qwen/Qwen3.5-122B-A10B|1"}
 ROUTER_MODES=${ROUTER_MODES:-whole}
-PROFILERS=${PROFILERS:-both}
-# PROFILERS=${PROFILERS:-source}
+# PROFILERS=${PROFILERS:-both}
+PROFILERS=${PROFILERS:-source}
 PRECISION=${PRECISION:-bf16}
 # LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
 LORA_DROPOUT=${LORA_DROPOUT:-0.00}
@@ -39,14 +39,14 @@ LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 # BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
 # Plain asym remains the non-CPUAdam Asym baseline; the default e2e path validates the Asym CPUAdamW backend.
-BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp,zero3_offload|recomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp"}
+BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
 
 # Paired expert policy / expert activation offload / attention activation offload / layer activation offload / layer GC axis.
 # Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD|ASYMM_LAYER_GC.
 # Example: none|true|true|true|false,none|true|true|false|true.
-# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|false|false|false,gc-exp|false|false|false|false,gc-attn-exp|false|false|false|false,none|false|false|false|false"}
-ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|true|false|true"}
+# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false,none|true|false|false|false,gc-exp|false|false|false|false,gc-attn-exp|false|false|false|false,none|false|false|false|false"}
+ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|false|false|false,none|true|true|false|false,none|true|true|false|true,gc-exp|false|false|false|false,gc-attn-exp|false|false|false|false,gc-layer|false|false|false|false"}
 # ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false"}
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
@@ -77,7 +77,7 @@ RUN_NAME=${RUN_NAME:-}
 # Training
 # WORKLOADS entries are seq_len|per_device_train_batch_size|gradient_accumulation_steps.
 # Example: WORKLOADS="2048|3|1,4096|2|1".
-WORKLOADS="${WORKLOADS:-8192|8|1}"
+WORKLOADS="${WORKLOADS:-2048|2|1}"
 # MAX_STEPS=${MAX_STEPS:-10}
 # WARMUP_STEPS=${WARMUP_STEPS:-5}
 MAX_STEPS=${MAX_STEPS:-1}
@@ -1466,7 +1466,6 @@ memory_combined_plot_cmd_base() {
     --combined-only
     --y-scale "${MEMORY_BREAKDOWN_PLOT_Y_SCALE}"
     --workloads "$@"
-    --expert-recompute-policies "${expert_policies[@]}"
   )
 }
 
@@ -1483,7 +1482,6 @@ interconnect_combined_plot_cmd_base() {
     --clean-output
     --combined-only
     --workloads "$@"
-    --expert-recompute-policies "${expert_policies[@]}"
   )
 }
 
@@ -1564,13 +1562,9 @@ append_fixed_profiler_filter() {
   _cmd_ref+=(--profiler "${profiler}")
 }
 
+# Combined plots include every config present on disk; only the profiler dedup filter is applied.
 append_sweep_plot_filters() {
-  append_backend_filters "$1"
   append_plot_profiler_filters "$1"
-  append_recompute_filters "$1"
-  append_liger_loss_filters "$1"
-  append_router_mode_filters "$1"
-  append_activation_axis_filters "$1"
 }
 
 append_running_sweep_plot_filters() {
@@ -1582,12 +1576,9 @@ append_running_sweep_plot_filters() {
   append_current_activation_axis_filters "$1"
 }
 
+# Memory combined: source profiler only (dedups the nsys/source pair); no config narrowing.
 memory_plot_filters() {
-  append_backend_filters "$1"
   append_fixed_profiler_filter "$1" source
-  append_liger_loss_filters "$1"
-  append_router_mode_filters "$1"
-  append_activation_axis_filters "$1"
 }
 
 memory_running_plot_filters() {
@@ -1598,13 +1589,9 @@ memory_running_plot_filters() {
   append_current_activation_axis_filters "$1"
 }
 
+# C2C combined: nsys profiler only (C2C metrics exist only in nsys runs); no config narrowing.
 interconnect_plot_filters() {
-  append_backend_filters "$1"
   append_fixed_profiler_filter "$1" nsys
-  append_recompute_filters "$1"
-  append_liger_loss_filters "$1"
-  append_router_mode_filters "$1"
-  append_activation_axis_filters "$1"
 }
 
 profiler_selected_for_plots() {
@@ -2776,7 +2763,8 @@ plot_config_root() {
   [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")/combined"
   local -a plot_cmd
   plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
-  plot_cmd+=(--expert-recompute-policies "${expert_policies[@]}")
+  # Cross-config comparison only; per-config sweep plots already live in each leaf's plots/ dir.
+  plot_cmd+=(--combined-only)
   append_sweep_plot_filters plot_cmd
   echo "Writing LF config combined plots: ${plot_root}"
   run_tracked_command "${plot_cmd[@]}"
@@ -2996,7 +2984,7 @@ timing_precision_combined_cmd() {
   shift 2
 
   plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${output_dir}" "${workloads[@]}"
-  _cmd_ref+=(--combined-only --expert-recompute-policies "${expert_policies[@]}")
+  _cmd_ref+=(--combined-only)
   _cmd_ref+=("$@")
 }
 

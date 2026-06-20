@@ -22,8 +22,10 @@ RUN_POST=${RUN_POST:-false}
 GPU_POOL=${GPU_POOL:-3}
 # MODEL_SPECS entries are model|num_gpus. Recompute and Liger-loss mode belong only in BACKEND_SPECS.
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
-MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-35B-A3B|1"}
+# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-35B-A3B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
+# MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
+MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-35B-A3B|1,Qwen/Qwen3.5-122B-A10B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1,Qwen/Qwen3.5-122B-A10B|1"}
 ROUTER_MODES=${ROUTER_MODES:-whole}
@@ -39,14 +41,14 @@ LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 # BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
 # Plain asym remains the non-CPUAdam Asym baseline; the default e2e path validates the Asym CPUAdamW backend.
-BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
+BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,asym_cpuadamwds|recomp"}
 
 # Paired expert policy / expert activation offload / attention activation offload / layer activation offload / layer GC axis.
 # Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD|ASYMM_LAYER_GC.
 # Example: none|true|true|true|false,none|true|true|false|true.
-# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|false|false|false,gc-exp|false|false|false|false,gc-attn-exp|false|false|false|false,none|false|false|false|false"}
-ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|true|true|false"}
+# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false,none|true|false|false|false,gc-exp|false|false|false|false,gc-attn-exp|false|false|false|false,none|false|false|false|false"}
+ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false"}
 # ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false"}
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
@@ -68,7 +70,7 @@ ASYM_CPU_ADAMW_FP32_MASTER=${ASYM_CPU_ADAMW_FP32_MASTER:-true}
 
 # Execution
 OVERWRITE=${OVERWRITE:-false}
-CONTINUE_ON_ERROR=${CONTINUE_ON_ERROR:-false}
+CONTINUE_ON_ERROR=${CONTINUE_ON_ERROR:-true}
 DRY_RUN=${DRY_RUN:-false}
 COLLECT_EXISTING=${COLLECT_EXISTING:-false}
 INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
@@ -77,11 +79,11 @@ RUN_NAME=${RUN_NAME:-}
 # Training
 # WORKLOADS entries are seq_len|per_device_train_batch_size|gradient_accumulation_steps.
 # Example: WORKLOADS="2048|3|1,4096|2|1".
-WORKLOADS="${WORKLOADS:-8192|8|1}"
-# MAX_STEPS=${MAX_STEPS:-10}
-# WARMUP_STEPS=${WARMUP_STEPS:-5}
-MAX_STEPS=${MAX_STEPS:-1}
-WARMUP_STEPS=${WARMUP_STEPS:-1}
+WORKLOADS="${WORKLOADS:-4096|4|1,8192|4|1,8192|8|1}"
+MAX_STEPS=${MAX_STEPS:-10}
+WARMUP_STEPS=${WARMUP_STEPS:-5}
+# MAX_STEPS=${MAX_STEPS:-1}
+# WARMUP_STEPS=${WARMUP_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 LORA_RANK=${LORA_RANK:-64}
 LORA_ALPHA=${LORA_ALPHA:-16}
