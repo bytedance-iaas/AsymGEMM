@@ -78,7 +78,8 @@ RUN_NAME=${RUN_NAME:-}
 # Training
 # WORKLOADS entries are seq_len|per_device_train_batch_size|gradient_accumulation_steps.
 # Example: WORKLOADS="2048|3|1,4096|2|1".
-WORKLOADS="${WORKLOADS:-2048|2|1}"
+# WORKLOADS="${WORKLOADS:-2048|2|1}"
+WORKLOADS="${WORKLOADS:-4096|4|1}"
 # MAX_STEPS=${MAX_STEPS:-10}
 # WARMUP_STEPS=${WARMUP_STEPS:-5}
 MAX_STEPS=${MAX_STEPS:-1}

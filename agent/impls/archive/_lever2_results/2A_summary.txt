@@ -1,0 +1,6 @@
+>>> 01:17:01 2A_s8192 start
+## 2A_s8192  (ASYM_OFFLOAD_ACT_RECOMPUTE=1)
+stage=source_profile_written   CPU_rss_peak_GiB=701.0   step_time=217.47s/it   loss=NA
+BASELINE OFF: CPU_rss_peak=805.0 GiB   step_time=193.78s/it
+dir=profiling/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b8_s8192_w5_s1_r64_a16_drop000/asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact1__attnact1__layeract1__loraafwdhbm__gradofftrue__weightofftrue/b8_s8192
+>>> 01:41:13 2A_s8192 done

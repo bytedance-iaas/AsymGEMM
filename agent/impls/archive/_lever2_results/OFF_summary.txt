@@ -1,0 +1,3 @@
+>>> 01:46:34 OFF_s8192 start
+## OFF_s8192 (fresh, OVERWRITE)  stage=source_profile_written  CPU_rss_peak_GiB=748.2  step_time=160.93s/it
+>>> 02:04:59 OFF_s8192 done
