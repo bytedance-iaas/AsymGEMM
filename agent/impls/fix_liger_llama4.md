@@ -24,6 +24,7 @@ Current local facts to keep the implementation grounded:
 - `asym_gemm/integrations/liger_loss.py` currently has only the Qwen3-MoE Asym bridge.
 - `../LlamaFactory/src/llamafactory/model/loader.py` applies the LF Liger hook before model construction, then loads the model, then calls `init_adapter(...)`.
 - `../LlamaFactory/src/llamafactory/model/loader.py` selects `AutoModelForImageTextToText` when the config is in that mapping; real Llama4 Scout/Maverick configs should be treated as likely `Llama4ForConditionalGeneration` until the run proves otherwise.
+- `scripts/lf/run_lf_lora_sft.sh` puts `${ASYM_DIR}` and `${LF_DIR}/src` on `PYTHONPATH` for normal and DeepSpeed runs, so the post-load bridge can live in `asym_gemm.integrations.liger_loss` and still be importable during zero3 profiling.
 
 Install precondition:
 
@@ -296,6 +297,7 @@ Scope:
   - `_lm_head_weight_source`
   - `_validate_liger_lm_head`
   - `_mark_liger_bridge_installed`
+  - `_bridge_metadata_target`
   - `_make_liger_shift_labels`
   - add `asym_llama4_causal_lm_lce_forward`
   - add `asym_llama4_conditional_lce_forward`
@@ -410,13 +412,35 @@ def _mark_liger_bridge_installed(target_model, lm_head, weight_source, model_typ
     target_model._asym_liger_lm_head_staged_bytes = int(getattr(lm_head, "cpu_resident_base_weight_bytes", 0) or 0)
     target_model._asym_liger_model_type = model_type
     target_model._asym_liger_bridge_kind = bridge_kind
+
+
+def _bridge_metadata_target(model: nn.Module) -> nn.Module:
+    # Conditional Llama4 is marked on the top-level wrapper, while causal-LM
+    # bridges are marked on the causal LM. Check both before falling back.
+    candidates = [model, _root_model(model), *_candidate_language_models(model)]
+    seen = set()
+    for candidate in candidates:
+        ident = id(candidate)
+        if not isinstance(candidate, nn.Module) or ident in seen:
+            continue
+        seen.add(ident)
+        if getattr(candidate, "_asym_liger_lm_head_bridge_enabled", False):
+            return candidate
+    return _base_causal_lm_model(model)
 ```
 
-`asym_liger_lm_head_bridge_metadata(...)` should return at least `enabled`, `weight_source`, `staged_bytes`, `lm_head_type`, `model_type`, and `bridge_kind`.
+`asym_liger_lm_head_bridge_metadata(...)` must call `_bridge_metadata_target(...)`, not only `_base_causal_lm_model(...)`. Otherwise conditional Llama4 bridges marked on the top-level wrapper will look disabled in `source_profile.json`. It should return at least `enabled`, `weight_source`, `staged_bytes`, `lm_head_type`, `model_type`, and `bridge_kind`.
 
 4. Add a Llama4 causal-LM bridge for `llama4_text` and nested causal LMs.
 
 Use `../Liger-Kernel/src/liger_kernel/transformers/model/llama4.py::lce_forward` as the template. The only intended behavior change is replacing `self.lm_head.weight` with `_resolve_liger_lm_head_weight(self.lm_head, kept_hidden_states)`.
+
+Required imports:
+
+```python
+from liger_kernel.transformers.model.output_classes import LigerCausalLMOutputWithPast
+from transformers.models.llama4.modeling_llama4 import Llama4CausalLMOutputWithPast
+```
 
 ```python
 def asym_llama4_causal_lm_lce_forward(self, ..., labels=None, logits_to_keep=0, **kwargs):
@@ -455,7 +479,15 @@ def asym_llama4_causal_lm_lce_forward(self, ..., labels=None, logits_to_keep=0, 
 This bridge must mirror `transformers.models.llama4.modeling_llama4.Llama4ForConditionalGeneration.forward` through embedding/image merging, but it must not call `self.language_model(...)` in the loss path because that materializes logits. Instead, call `self.language_model.model(...)` to get hidden states, then call `LigerForCausalLMLoss` with `self.language_model.lm_head`.
 
 ```python
-def _make_liger_shift_labels(labels, attention_mask, *, kept_seq_len: int, ignore_index: int = -100):
+def _select_sequence_positions(tensor: torch.Tensor, slice_indices: slice | torch.Tensor) -> torch.Tensor:
+    if isinstance(slice_indices, slice):
+        return tensor[:, slice_indices].contiguous()
+    if isinstance(slice_indices, torch.Tensor):
+        return tensor.index_select(1, slice_indices.to(device=tensor.device, dtype=torch.long)).contiguous()
+    return tensor[:, slice_indices].contiguous()
+
+
+def _make_liger_shift_labels(labels, attention_mask, *, slice_indices: slice | torch.Tensor, ignore_index: int = -100):
     if labels is None:
         return None
 
@@ -464,9 +496,23 @@ def _make_liger_shift_labels(labels, attention_mask, *, kept_seq_len: int, ignor
         active = torch.nn.functional.pad(attention_mask[..., 1:], (0, 1), value=0).to(dtype=torch.bool)
         shifted = shifted.masked_fill(~active.to(device=shifted.device), ignore_index)
 
-    if shifted.shape[1] != kept_seq_len:
-        shifted = shifted[:, -kept_seq_len:].contiguous()
-    return shifted
+    return _select_sequence_positions(shifted, slice_indices)
+
+
+def _coerce_existing_shift_labels(
+    shift_labels: torch.Tensor,
+    *,
+    slice_indices: slice | torch.Tensor,
+    full_seq_len: int,
+    kept_seq_len: int,
+) -> torch.Tensor:
+    if shift_labels.shape[1] == full_seq_len:
+        return _select_sequence_positions(shift_labels, slice_indices)
+    if shift_labels.shape[1] == kept_seq_len:
+        return shift_labels.contiguous()
+    raise ValueError(
+        f"shift_labels length {shift_labels.shape[1]} does not match full seq {full_seq_len} or kept seq {kept_seq_len}"
+    )
 
 
 def asym_llama4_conditional_lce_forward(
@@ -529,7 +575,14 @@ def asym_llama4_conditional_lce_forward(
 
     shift_labels = kwargs.pop("shift_labels", None)
     if shift_labels is None:
-        shift_labels = _make_liger_shift_labels(labels, attention_mask, kept_seq_len=kept_hidden_states.shape[1])
+        shift_labels = _make_liger_shift_labels(labels, attention_mask, slice_indices=slice_indices)
+    else:
+        shift_labels = _coerce_existing_shift_labels(
+            shift_labels,
+            slice_indices=slice_indices,
+            full_seq_len=hidden_states.shape[1],
+            kept_seq_len=kept_hidden_states.shape[1],
+        )
 
     logits = None
     loss = None
@@ -558,6 +611,10 @@ def asym_llama4_conditional_lce_forward(
                 vocab_size=self.config.text_config.vocab_size,
                 **kwargs,
             )
+
+    if not return_dict:
+        output = (logits,) + outputs[1:]
+        return ((loss,) + output) if loss is not None else output
 
     return Llama4CausalLMOutputWithPast(
         loss=loss,
@@ -673,7 +730,10 @@ New bridge tests must prove:
 - `llama4_text` causal-LM bridge passes a staged weight to `LigerForCausalLMLoss`.
 - `llama4` conditional-generation bridge does not call `language_model.lm_head(...)` in the training loss path.
 - `llama4` conditional-generation bridge passes `normal_parameter` weight for normal/DeepSpeed and `asym_host_staged` weight for Asym.
-- `_make_liger_shift_labels` preserves `-100` labels and masks out padded positions from `attention_mask`.
+- `_make_liger_shift_labels` preserves `-100` labels, masks out padded positions from `attention_mask`, and selects the same sequence positions as `logits_to_keep` for both integer and tensor forms.
+- `_coerce_existing_shift_labels` accepts already-kept `shift_labels`, slices full-length `shift_labels`, and rejects any ambiguous shape.
+- `asym_liger_lm_head_bridge_metadata(...)` reports an enabled bridge when the marker is on the top-level conditional Llama4 wrapper and when it is on a nested causal LM.
+- Conditional Llama4 bridge supports `return_dict=False` without materializing logits in the training loss path.
 - Trainable or biased `lm_head` is rejected.
 - Unsupported model types return `False` when `strict=False`.
 - `asym_liger_lm_head_bridge_metadata(...)` reports `enabled`, `model_type`, `bridge_kind`, `weight_source`, `lm_head_type`, and `staged_bytes`.
@@ -766,6 +826,7 @@ Acceptance criteria:
 - `source_profile.json["config"]["asymm_attn_sdpa_recompute"] == "false"`.
 - Liger-on logs contain `Liger loss-only kernel has been applied.`
 - For real `model_type="llama4"` runs, logs also show the post-load Llama4 conditional bridge was installed. A class-level Liger message alone is not sufficient.
+- zero3 Llama4 conditional Liger-on has `source_profile.json["asym_liger_lm_head_bridge"]["enabled"] == true`, `bridge_kind == "conditional_generation"`, and `weight_source == "normal_parameter"`.
 - zero3 Llama4 Liger-on reduces peak allocated HBM by at least 10 GiB and reduces lm_head/loss HBM attribution by at least 20 GiB.
 - Asym Llama4 Liger-on reduces peak allocated HBM by at least 10 GiB and reduces lm_head/loss HBM attribution by at least 20 GiB.
 - Asym Liger-on has `source_profile.json["asym_liger_lm_head_bridge"]["enabled"] == true`.
