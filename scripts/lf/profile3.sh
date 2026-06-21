@@ -6,7 +6,8 @@ set -Eeuo pipefail
 # =============================================================================
 
 # Paths and tools
-SFT_ROOT=${SFT_ROOT:-/home/kevinni/AsymGEMM-SFT}
+# Repo root = AsymGEMM-SFT (../.. from the AsymGEMM dir you run in). Override with SFT_ROOT=...
+SFT_ROOT=${SFT_ROOT:-$(cd ../.. && pwd)}
 ROOT=${ROOT:-${SFT_ROOT}/third_party/AsymGEMM}
 LF_DIR=${LF_DIR:-${SFT_ROOT}/third_party/LlamaFactory}
 KT_KERNEL_DIR=${KT_KERNEL_DIR:-${SFT_ROOT}/third_party/ktransformers/kt-kernel}

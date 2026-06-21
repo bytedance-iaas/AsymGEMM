@@ -41,12 +41,13 @@ def model_tag(name_or_path: str) -> str:
     return name_or_path.split("/")[-1].lower()
 
 
-def config_label(policy: str, expact: bool, attnact: bool, layeract: bool, layergc: bool) -> str:
+def config_label(policy: str, expact: bool, attnact: bool, layeract: bool, layergc: bool, sdparecomp: bool = False) -> str:
+    sdpa = "+SDPArecomp" if sdparecomp else ""
     gc_map = {"gc-exp": "GC-experts", "gc-attn-exp": "GC-attn+experts", "gc-layer": "GC-layer"}
     if policy in gc_map:
-        return gc_map[policy]
+        return gc_map[policy] + sdpa
     if policy and policy != "none":
-        return policy
+        return policy + sdpa
     offs = [n for n, on in (("exp", expact), ("attn", attnact), ("layer", layeract)) if on]
     if not offs:
         label = "none (no offload)"
@@ -56,7 +57,7 @@ def config_label(policy: str, expact: bool, attnact: bool, layeract: bool, layer
         label = "none+" + "+".join(offs) + "-offload"
     if layergc:
         label += "+layerGC" if offs else " (layerGC)"
-    return label
+    return label + sdpa
 
 
 def _tok(tokens: list[str], prefix: str, default: str = "") -> str:
@@ -120,6 +121,7 @@ def collect(root: Path) -> dict:
                     _tok(toks, "attnact", "0") == "1",
                     _tok(toks, "layeract", "0") == "1",
                     _tok(toks, "layergc", "0") == "1",
+                    _tok(toks, "sdparecomp", "0") == "1",
                 )
                 leaf = next((p for p in rd.iterdir() if p.is_dir() and p.name.startswith("b")), None)
                 status, mtime = classify(leaf)

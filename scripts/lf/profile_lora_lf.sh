@@ -6,7 +6,8 @@ set -Eeuo pipefail
 # =============================================================================
 
 # Paths and tools
-SFT_ROOT=${SFT_ROOT:-/home/kevinni/AsymGEMM-SFT}
+# Repo root = AsymGEMM-SFT (../.. from the AsymGEMM dir you run in). Override with SFT_ROOT=...
+SFT_ROOT=${SFT_ROOT:-$(cd ../.. && pwd)}
 ROOT=${ROOT:-${SFT_ROOT}/third_party/AsymGEMM}
 LF_DIR=${LF_DIR:-${SFT_ROOT}/third_party/LlamaFactory}
 KT_KERNEL_DIR=${KT_KERNEL_DIR:-${SFT_ROOT}/third_party/ktransformers/kt-kernel}
@@ -22,9 +23,9 @@ RUN_POST=${RUN_POST:-false}
 GPU_POOL=${GPU_POOL:-3}
 # MODEL_SPECS entries are model|num_gpus. Recompute and Liger-loss mode belong only in BACKEND_SPECS.
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
-MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-35B-A3B|1,Qwen/Qwen3.5-122B-A10B|1"}
+# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-35B-A3B|1,Qwen/Qwen3.5-122B-A10B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
-# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
+MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1,Qwen/Qwen3.5-122B-A10B|1"}
 ROUTER_MODES=${ROUTER_MODES:-whole}
 # PROFILERS=${PROFILERS:-both}
@@ -46,7 +47,7 @@ BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
 # Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD|ASYMM_LAYER_GC.
 # Example: none|true|true|true|false,none|true|true|false|true.
 # ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false,none|true|false|false|false,gc-exp|false|false|false|false,gc-attn-exp|false|false|false|false,none|false|false|false|false"}
-ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|false|false|false,none|true|true|false|false,none|true|true|false|true,gc-exp|false|false|false|false,gc-attn-exp|false|false|false|false,gc-layer|false|false|false|false"}
+ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|false|false|false|false,none|true|true|false|false|false,none|true|true|false|true|false,none|true|true|false|true|true,none|true|true|true|false|true,gc-exp|false|false|false|false|false,gc-attn-exp|false|false|false|false|false,gc-layer|false|false|false|false|false"}
 # ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false"}
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
@@ -403,6 +404,13 @@ layergc_tag() {
   esac
 }
 
+sdparecomp_tag() {
+  case "$(bool_value "$1")" in
+    true) printf 'sdparecomp1\n' ;;
+    false) printf 'sdparecomp0\n' ;;
+  esac
+}
+
 # Lever-2 toggles (AsymGEMM-only). Encoded in the run dir so each setting gets its own folder.
 actrecomp_tag() {
   case "${1,,}" in
@@ -420,21 +428,23 @@ xunpack_tag() {
 
 parse_exp_act_policy_tuple() {
   local raw="$1"
-  local policy_part expact_part attnact_part layeract_part layergc_part policy expact attnact layeract layergc
+  local policy_part expact_part attnact_part layeract_part layergc_part sdparecomp_part policy expact attnact layeract layergc sdparecomp
   local -a fields
   IFS='|' read -r -a fields <<< "${raw}"
-  (( ${#fields[@]} == 4 || ${#fields[@]} == 5 )) || die "ASYMM_EXP_ACT_POLICIES item must be policy|expert_act|attn_act|layer_act[|layer_gc], got '${raw}'"
+  (( ${#fields[@]} == 4 || ${#fields[@]} == 5 || ${#fields[@]} == 6 )) || die "ASYMM_EXP_ACT_POLICIES item must be policy|expert_act|attn_act|layer_act[|layer_gc[|sdpa_recompute]], got '${raw}'"
   policy_part="${fields[0]}"
   expact_part="${fields[1]}"
   attnact_part="${fields[2]}"
   layeract_part="${fields[3]}"
   layergc_part="${fields[4]:-false}"
-  [[ -n "${policy_part}" && -n "${expact_part}" && -n "${attnact_part}" && -n "${layeract_part}" && -n "${layergc_part}" ]] || die "empty policy, activation-offload, or layer-GC value in ASYMM_EXP_ACT_POLICIES item '${raw}'"
+  sdparecomp_part="${fields[5]:-false}"
+  [[ -n "${policy_part}" && -n "${expact_part}" && -n "${attnact_part}" && -n "${layeract_part}" && -n "${layergc_part}" && -n "${sdparecomp_part}" ]] || die "empty policy, activation-offload, layer-GC, or sdpa-recompute value in ASYMM_EXP_ACT_POLICIES item '${raw}'"
   policy="$(normalize_expert_policy "${policy_part}")"
   expact="$(bool_value "${expact_part}")"
   attnact="$(bool_value "${attnact_part}")"
   layeract="$(bool_value "${layeract_part}")"
   layergc="$(bool_value "${layergc_part}")"
+  sdparecomp="$(bool_value "${sdparecomp_part}")"
   if [[ "${layeract}" == "true" && "${layergc}" == "true" ]]; then
     die "ASYMM_EXP_ACT_POLICIES item '${raw}' is unsupported: ASYMM_LAYER_ACT_OFFLOAD and ASYMM_LAYER_GC are mutually exclusive"
   fi
@@ -444,7 +454,7 @@ parse_exp_act_policy_tuple() {
   if [[ ( "${expact}" == "true" || "${attnact}" == "true" || "${layeract}" == "true" ) && "${policy}" != "none" ]]; then
     die "ASYMM_EXP_ACT_POLICIES item '${raw}' is unsupported: activation offload is compared without GC/recompute"
   fi
-  printf '%s|%s|%s|%s|%s\n' "${policy}" "${expact}" "${attnact}" "${layeract}" "${layergc}"
+  printf '%s|%s|%s|%s|%s|%s\n' "${policy}" "${expact}" "${attnact}" "${layeract}" "${layergc}" "${sdparecomp}"
 }
 
 optional_bool_value() {
@@ -596,6 +606,7 @@ canonicalize_policy_axis_for_independent_backend() {
   ASYMM_ATTN_ACT_OFFLOAD=false; attnact_label="$(attnact_tag false)"
   ASYMM_LAYER_ACT_OFFLOAD=false; layeract_label="$(layeract_tag false)"
   ASYMM_LAYER_GC=false; layergc_label="$(layergc_tag false)"
+  ASYMM_ATTN_SDPA_RECOMPUTE=false; sdparecomp_label="$(sdparecomp_tag false)"
   ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm; expact_lora_a_fwd_label="$(expact_lora_a_fwd_tag hbm)"
   ASYM_OFFLOAD_ACT_RECOMPUTE=0; actrecomp_label="$(actrecomp_tag 0)"
   ASYM_OFFLOAD_X_UNPACKED=0; xunpack_label="$(xunpack_tag 0)"
@@ -1310,7 +1321,7 @@ job_root_path() {
   local grad_offload="${8:-false}"
   local weight_offload="${9:-false}"
   local grad_offload_suffix=""
-  local path_label="${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__${layergc_label}"
+  local path_label="${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__${layergc_label}__${sdparecomp_label}"
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
     grad_offload_suffix="__gradoff${grad_offload}__weightoff${weight_offload}"
   fi
@@ -1352,8 +1363,8 @@ kt_arm_resolve_matching_source_profile_json() {
   # Canonicalize the AsymGEMM-only axes (via local shadows) so the matched source path AND the expected
   # values agree with what run_job wrote for policy-independent backends.
   local source_profile_json
-  local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}"
-  local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_LAYER_GC="${ASYMM_LAYER_GC}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
+  local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" sdparecomp_label="${sdparecomp_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}"
+  local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_LAYER_GC="${ASYMM_LAYER_GC}" ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
   local ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}" ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
   canonicalize_policy_axis_for_independent_backend "${backend}"
   while IFS= read -r source_profile_json; do
@@ -2049,6 +2060,7 @@ mapfile -t expact_values < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d
 mapfile -t attnact_values < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f3 | dedupe)
 mapfile -t layeract_values < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f4 | dedupe)
 mapfile -t layergc_values < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f5 | dedupe)
+mapfile -t sdparecomp_values < <(printf '%s\n' "${exp_act_policy_pairs[@]}" | cut -d '|' -f6 | dedupe)
 plot_expact_values=("${expact_values[@]}")
 plot_attnact_values=("${attnact_values[@]}")
 plot_layeract_values=("${layeract_values[@]}")
@@ -2076,6 +2088,8 @@ ASYMM_LAYER_ACT_OFFLOAD="${layeract_values[0]}"
 layeract_label="$(layeract_tag "${ASYMM_LAYER_ACT_OFFLOAD}")"
 ASYMM_LAYER_GC="${layergc_values[0]}"
 layergc_label="$(layergc_tag "${ASYMM_LAYER_GC}")"
+ASYMM_ATTN_SDPA_RECOMPUTE="${sdparecomp_values[0]:-false}"
+sdparecomp_label="$(sdparecomp_tag "${ASYMM_ATTN_SDPA_RECOMPUTE}")"
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="$(normalize_expact_lora_a_fwd "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}")"
 expact_lora_a_fwd_label="$(expact_lora_a_fwd_tag "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}")"
 
@@ -2339,8 +2353,8 @@ run_job() {
   local weight_offload="${13:-false}"
   # Canonicalize the AsymGEMM-only axes for policy-independent backends (see the helper). Local shadows feed
   # run_id, the folder (job_root_path is dynamic-scoped), the env block, and the completeness check.
-  local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}"
-  local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_LAYER_GC="${ASYMM_LAYER_GC}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
+  local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" sdparecomp_label="${sdparecomp_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}"
+  local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_LAYER_GC="${ASYMM_LAYER_GC}" ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
   local ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}" ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
   canonicalize_policy_axis_for_independent_backend "${backend}"
   if [[ "${profiler}" == "both" ]]; then
@@ -2385,7 +2399,7 @@ run_job() {
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
     grad_offload_run_label="_gradoff${grad_offload}_weightoff${weight_offload}"
   fi
-  run_id="lf_${backend}_${run_profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${layergc_label}_${expact_lora_a_fwd_label}_${actrecomp_label}_${xunpack_label}_${liger_loss}${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${lora_dropout_label_value}"
+  run_id="lf_${backend}_${run_profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${layergc_label}_${sdparecomp_label}_${expact_lora_a_fwd_label}_${actrecomp_label}_${xunpack_label}_${liger_loss}${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
   local profile_memory_breakdown deepspeed_dir_for_profile
   local profile_backend_label job_use_asym_cpu_adamw job_asym_cpu_adamw_backend cpuadam_backend
@@ -2544,6 +2558,7 @@ run_job() {
     ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
     ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
     ASYMM_LAYER_GC="${ASYMM_LAYER_GC}"
+    ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}"
     ASYM_EXPERT_RECOMPUTE_POLICY="${expert_policy}"
     ASYM_ROUTER_MODE="${router_mode}"
     ASYM_STRICT="${ASYM_STRICT}"
@@ -2586,6 +2601,7 @@ run_job() {
     ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_GC="${ASYMM_LAYER_GC}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}"
     ASYM_GEMM_LF_CONFIG_ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}"
     ASYM_GEMM_LF_CONFIG_ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
     ASYM_GEMM_LF_CONFIG_QWEN_EXPERT_LORA_IMPL="${lf_expert_lora_impl}"
@@ -3158,11 +3174,14 @@ for model_spec_entry in "${model_specs[@]}"; do
           ASYMM_ATTN_ACT_OFFLOAD="${policy_tail%%|*}"
           policy_tail="${policy_tail#*|}"
           ASYMM_LAYER_ACT_OFFLOAD="${policy_tail%%|*}"
-          ASYMM_LAYER_GC="${policy_tail#*|}"
+          policy_tail="${policy_tail#*|}"
+          ASYMM_LAYER_GC="${policy_tail%%|*}"
+          ASYMM_ATTN_SDPA_RECOMPUTE="${policy_tail#*|}"
           expact_label="$(expact_tag "${ASYMM_EXPERT_ACT_OFFLOAD}")"
           attnact_label="$(attnact_tag "${ASYMM_ATTN_ACT_OFFLOAD}")"
           layeract_label="$(layeract_tag "${ASYMM_LAYER_ACT_OFFLOAD}")"
           layergc_label="$(layergc_tag "${ASYMM_LAYER_GC}")"
+          sdparecomp_label="$(sdparecomp_tag "${ASYMM_ATTN_SDPA_RECOMPUTE}")"
           for router_mode in "${router_modes[@]}"; do
             for backend_recompute in "${backend_specs[@]}"; do
               IFS='|' read -r backend recompute liger_loss backend_spec_extra <<< "${backend_recompute}"

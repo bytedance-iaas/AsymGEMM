@@ -20,6 +20,7 @@ from asym_gemm.training.attention_activation_offload import (
     attention_saved_tensor_offload_module_names,
     install_attention_saved_tensor_offload,
 )
+from asym_gemm.training.sdpa_recompute import install_sdpa_recompute
 from asym_gemm.training.attention_checkpoint import (
     attention_checkpoint_module_names,
     install_attention_checkpoint,
@@ -1519,6 +1520,9 @@ def _wrap_attention_saved_tensor_offload_modules(
             continue
         install_attention_saved_tensor_offload(module)
         wrapped.append(name)
+
+    # SDPA-only recompute pairs with attn_act; self-gated on ASYMM_ATTN_SDPA_RECOMPUTE, text-scoped.
+    install_sdpa_recompute(model)
 
     if strict and not wrapped:
         raise RuntimeError("attention activation offload requested but no supported text attention parents were found")

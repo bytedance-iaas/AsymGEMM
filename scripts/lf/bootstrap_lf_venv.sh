@@ -4,7 +4,8 @@ set -Eeuo pipefail
 # Create a normal python -m venv under AsymGEMM, with bin/activate.
 # This is separate from the existing LlamaFactory/.venv conda-prefix env.
 
-SFT_ROOT=${SFT_ROOT:-/home/kevinni/AsymGEMM-SFT}
+# Repo root = AsymGEMM-SFT (../.. from the AsymGEMM dir you run in). Override with SFT_ROOT=...
+SFT_ROOT=${SFT_ROOT:-$(cd ../.. && pwd)}
 ASYMGEMM_DIR=${ASYMGEMM_DIR:-${SFT_ROOT}/third_party/AsymGEMM}
 LF_DIR=${LF_DIR:-${SFT_ROOT}/third_party/LlamaFactory}
 KT_DIR=${KT_DIR:-${SFT_ROOT}/third_party/ktransformers}

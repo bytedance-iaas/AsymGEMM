@@ -4,7 +4,8 @@ set -Eeuo pipefail
 # =============================================================================
 # User Parameters
 # =============================================================================
-ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
+# AsymGEMM dir = the dir you run in. Override with ROOT=...
+ROOT=${ROOT:-$(pwd)}
 PYTHON_BIN="${PYTHON_BIN:-${PYTHON:-python3}}"
 
 MODE="${MODE:-timing}"

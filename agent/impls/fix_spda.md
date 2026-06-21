@@ -40,7 +40,7 @@ Checkpointing the SDPA call deletes saver (1); `attn_act` then offloads (2) → 
 # 409  attn_output = self.o_proj(attn_output)   # OUTSIDE the interface
 ```
 `ALL_ATTENTION_FUNCTIONS` is a registry (`.register`/`.get`/`.get_interface`) → swap without forking
-transformers. **Two call sites:** 397 (text) and **820 (vision)** → scope to the **text** config only.
+transformers. **Two call sites:** 397 (text) and **824 (vision)** → scope to the **text** config only.
 `attention_dropout = 0.0` (verified) → recompute is deterministic.
 
 **Existing `attention_checkpoint.py`** = the *whole-attention* wrapper (recomputes projections too;
@@ -234,9 +234,10 @@ imports, ~lines 20-25):
 from ..training.sdpa_recompute import install_sdpa_recompute
 ```
 
-**Change 2.2 — `asym_gemm/integrations/lf.py`, call it once** in the attn_act wrap function. Anchor:
-the loop that ends with `install_attention_saved_tensor_offload(module)` at **lf.py:1520**. Insert
-**after the for-loop, before the `if strict and not wrapped:` check (line 1523)**:
+**Change 2.2 — `asym_gemm/integrations/lf.py`, call it once** in the attn_act wrap function
+`_wrap_attention_saved_tensor_offload_modules` (its first param is `model`). Anchor: the loop that ends
+with `install_attention_saved_tensor_offload(module)` at **lf.py:1520**. Insert **after the for-loop,
+before the `if strict and not wrapped:` check (~line 1523)**:
 ```python
         install_attention_saved_tensor_offload(module)
         wrapped.append(name)
@@ -370,7 +371,8 @@ efficiency, and correctness pass — *memory-only is not acceptance*.
 3. **forward (s)**: ON within ~±5% of OFF (recompute lands in backward, not forward).
 4. **backward (s)**: ON > OFF by a **bounded** delta (per-layer SDPA recompute + q/k/v restage), and the
    increase is **localized to attention** — `timing_by_module.csv` `stage=step.backward` attention kernel
-   time rises while non-attention rows stay ≈ flat. (OFF backward ≈ **59.3 s**.)
+   time rises while non-attention rows stay ≈ flat. (OFF backward ≈ **59.3 s**. `timing_by_module.csv` is
+   the **nsys** output — populated by `PROFILERS=both` (test.sh default); it is empty in source-only mode.)
 5. **step (s)**: record absolute + % increase and state the tradeoff explicitly —
    **"freed ≈X GiB for +Y s (+Z%) step time"**. **Reject as a blow-up** if step time rises
    disproportionately (e.g. >~25%) or the delta is not attributable to attention — that is the

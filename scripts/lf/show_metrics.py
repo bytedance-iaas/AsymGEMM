@@ -3,11 +3,13 @@
 
 Same layout as show_status.py, but each row reports the measured numbers:
     Model | Workload | Backend | Config |
-    forward (s) | backward (s) | optimizer (s) | step (s) |
-    forward (GiB) | backward (GiB) | step (GiB)
+    fwd_s | bwd_s | opt_s | step_s |          # seconds
+    fwd_H | bwd_H | step_H |                   # GPU HBM peak GiB
+    RAM                                        # host RSS peak GiB (whole step)
 
-Times are seconds (x.xxx); memory is GiB peak-allocated (x.xxx). Configs that did
-not produce a profile (OOM / failed / not run) show "-".
+The Config column carries a compact "[lg± sd±]" tag for liger-loss / sdpa-recompute
+usage (+ on, - off). Numbers are printed as x.x (1 decimal) to keep the table narrow.
+Configs that did not produce a profile (OOM / failed / not run) show a status marker.
 
 Usage:
     show_metrics.py [PROFILING_DIR]      # default profiling_both
@@ -71,6 +73,11 @@ def read_metrics(leaf: Path) -> dict | None:
         "fwd_g": gib(mx("forward_peak_allocated_bytes")),
         "bwd_g": gib(mx("backward_peak_allocated_bytes")),
         "step_g": gib(mx("peak_allocated_hbm_bytes")),
+        # Host RAM high-water mark for the whole step (process RSS). RSS is monotonic
+        # across stages, so one step-level peak captures it; per-stage peaks would be
+        # near-identical. Falls back to the per-stage backward peak for older profiles.
+        "ram_g": gib(mx("process_rss_peak_bytes") or mx("training_step_process_rss_peak_end_bytes")
+                     or mx("backward_process_rss_peak_end_bytes")),
     }
 
 
@@ -97,6 +104,11 @@ def collect_leaves(root: Path) -> dict:
                     S._tok(toks, "layeract", "0") == "1",
                     S._tok(toks, "layergc", "0") == "1",
                 )
+                # Compact liger / sdpa-recompute usage tag (replaces config_label's long
+                # "+SDPArecomp"): [lg± sd±], + on / - off.
+                liger_on = S._tok(toks, "ligerloss", "0") == "1"
+                sdpa_on = S._tok(toks, "sdparecomp", "0") == "1"
+                config += f"  [lg{'+' if liger_on else '-'} sd{'+' if sdpa_on else '-'}]"
                 leaf = next((p for p in rd.iterdir() if p.is_dir() and p.name.startswith("b")), None)
                 if leaf is None:
                     continue
@@ -122,9 +134,9 @@ def collect_leaves(root: Path) -> dict:
 
 
 HEAD = ["Model", "Workload", "Backend", "Config",
-        "forward (s)", "backward (s)", "optimizer (s)", "step (s)",
-        "forward (GiB)", "backward (GiB)", "step (GiB)"]
-NUM_KEYS = ["fwd_s", "bwd_s", "opt_s", "step_s", "fwd_g", "bwd_g", "step_g"]
+        "fwd_s", "bwd_s", "opt_s", "step_s",
+        "fwd_H", "bwd_H", "step_H", "RAM"]
+NUM_KEYS = ["fwd_s", "bwd_s", "opt_s", "step_s", "fwd_g", "bwd_g", "step_g", "ram_g"]
 CFG_RANK = {c: i for i, c in enumerate(S.CONFIG_ORDER)}
 MARKER = {  # shown (in the first metric column) for configs with no metrics
     "OOM (GPU)": "🔴", "OOM (host RAM)": "🟠", "FAILED (non-OOM)": "⚠️",
@@ -133,7 +145,7 @@ MARKER = {  # shown (in the first metric column) for configs with no metrics
 
 
 def fmt(v) -> str:
-    return f"{v:.3f}" if isinstance(v, (int, float)) else "-"
+    return f"{v:.1f}" if isinstance(v, (int, float)) else "-"
 
 
 def main() -> None:
@@ -165,9 +177,12 @@ def main() -> None:
         by_model.setdefault(model, []).append((seq, batch, be, config, cells))
 
     print(f"Profiling metrics: {root}")
-    print("Legend: 🔴 OOM (GPU)   🟠 OOM (host RAM)   ⚠️ failed   🔵 running   — not run\n")
+    print("Legend: 🔴 OOM (GPU)   🟠 OOM (host RAM)   ⚠️ failed   🔵 running   — not run")
+    print("Cols: _s seconds | _H GPU HBM peak GiB | RAM host RSS peak GiB (whole step)"
+          " | Config [lg± sd±] = liger / sdpa-recompute on(+)/off(-)\n")
     for model in sorted(by_model):
-        recs = sorted(by_model[model], key=lambda r: (r[0], r[1], r[2], CFG_RANK.get(r[3], 99), r[3]))
+        # Rank on the base config label (strip the trailing "  [lg± sd±]" usage tag).
+        recs = sorted(by_model[model], key=lambda r: (r[0], r[1], r[2], CFG_RANK.get(r[3].split("  [")[0], 99), r[3]))
         data = [r[4] for r in recs]
         w = [max(len(HEAD[i]), max((len(d[i]) for d in data), default=0)) for i in range(len(HEAD))]
         just = lambda i, s: s.ljust(w[i]) if i < 4 else s.rjust(w[i])  # text left, numbers right

@@ -447,6 +447,8 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
     layeract = str(job_meta["layeract"])
     layergc_value = str(job_meta["asymm_layer_gc"])
     layergc = str(job_meta["layergc"])
+    sdparecomp_value = str(job_meta["asymm_attn_sdpa_recompute"])
+    sdparecomp = str(job_meta["sdparecomp"])
     liger_loss = str(job_meta.get("liger_loss") or "ligerloss0")
     if recompute not in {"recomp", "norecomp"}:
         return None
@@ -481,6 +483,8 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
         "layeract": layeract,
         "asymm_layer_gc": layergc_value,
         "layergc": layergc,
+        "asymm_attn_sdpa_recompute": sdparecomp_value,
+        "sdparecomp": sdparecomp,
         "backend": backend,
         "router_mode": router_mode,
         "profiler": profiler,
@@ -643,6 +647,10 @@ def layergc_label(value: Any) -> str:
     return "layergc1" if normalize_bool_config(value) == "true" else "layergc0"
 
 
+def sdparecomp_label(value: Any) -> str:
+    return "sdparecomp1" if normalize_bool_config(value) == "true" else "sdparecomp0"
+
+
 def parse_expact_part(part: str) -> tuple[str, str] | None:
     value = part.strip().lower()
     if value in {"expact1", "expacttrue"}:
@@ -676,6 +684,15 @@ def parse_layergc_part(part: str) -> tuple[str, str] | None:
         return "true", "layergc1"
     if value in {"layergc0", "layergcfalse"}:
         return "false", "layergc0"
+    return None
+
+
+def parse_sdparecomp_part(part: str) -> tuple[str, str] | None:
+    value = part.strip().lower()
+    if value in {"sdparecomp1", "sdparecomptrue"}:
+        return "true", "sdparecomp1"
+    if value in {"sdparecomp0", "sdparecompfalse"}:
+        return "false", "sdparecomp0"
     return None
 
 
@@ -722,6 +739,8 @@ def parse_job_dir_parts(job_dir_name: str) -> dict[str, Any] | None:
     layeract = "layeract0"
     layergc_value = "false"
     layergc = "layergc0"
+    sdparecomp_value = "false"
+    sdparecomp = "sdparecomp0"
     liger_loss = "ligerloss0"
 
     if tail:
@@ -747,6 +766,10 @@ def parse_job_dir_parts(job_dir_name: str) -> dict[str, Any] | None:
         if parsed_layergc is not None:
             layergc_value, layergc = parsed_layergc
             continue
+        parsed_sdparecomp = parse_sdparecomp_part(part)
+        if parsed_sdparecomp is not None:
+            sdparecomp_value, sdparecomp = parsed_sdparecomp
+            continue
         parsed_liger_loss = parse_liger_loss_part(part)
         if parsed_liger_loss is not None:
             liger_loss = parsed_liger_loss
@@ -769,6 +792,8 @@ def parse_job_dir_parts(job_dir_name: str) -> dict[str, Any] | None:
         "layeract": layeract,
         "asymm_layer_gc": layergc_value,
         "layergc": layergc,
+        "asymm_attn_sdpa_recompute": sdparecomp_value,
+        "sdparecomp": sdparecomp,
         "liger_loss": liger_loss,
     }
 
@@ -949,6 +974,9 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
     layergc_config_value = config.get("asymm_layer_gc", config.get("asym_layer_glue_gc_enabled", meta.get("asymm_layer_gc", "false")))
     layergc_value = normalize_bool_config(layergc_config_value)
     layergc = layergc_label(layergc_value)
+    sdparecomp_config_value = config.get("asymm_attn_sdpa_recompute", meta.get("asymm_attn_sdpa_recompute", "false"))
+    sdparecomp_value = normalize_bool_config(sdparecomp_config_value)
+    sdparecomp = sdparecomp_label(sdparecomp_value)
     liger_loss = str(config.get("liger_loss") or meta.get("liger_loss") or "ligerloss0").lower()
     if liger_loss not in {"ligerloss0", "ligerloss1"}:
         liger_loss = "ligerloss0"
@@ -1001,6 +1029,8 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         "layeract": layeract,
         "asymm_layer_gc": layergc_value,
         "layergc": layergc,
+        "asymm_attn_sdpa_recompute": sdparecomp_value,
+        "sdparecomp": sdparecomp,
         "expert_recompute_policy_spec": expert_recompute_policy_spec,
         "expert_policy_label": expert_policy_label,
         "expert_recompute_policy": expert_recompute_policy,
@@ -1153,6 +1183,7 @@ def trainable_surface_comparison_key(row: dict[str, Any]) -> tuple[Any, ...]:
         row.get("attnact", "attnact0"),
         row.get("layeract", "layeract0"),
         row.get("layergc", "layergc0"),
+        row.get("sdparecomp", "sdparecomp0"),
         row["profiler"],
         row["liger_loss"],
         row["mode"],

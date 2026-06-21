@@ -191,6 +191,7 @@ class RunRecord:
             self.metadata.get("attnact", ""),
             self.metadata.get("layeract", ""),
             self.metadata.get("layergc", ""),
+            self.metadata.get("sdparecomp", ""),
             self.metadata.get("liger_loss", ""),
             self.metadata.get("recompute", ""),
             self.metadata.get("expert_policy", ""),
@@ -369,6 +370,10 @@ def _layergc_label(value: Any) -> str:
     return "layergc1" if _normalize_bool_config(value) == "true" else "layergc0"
 
 
+def _sdparecomp_label(value: Any) -> str:
+    return "sdparecomp1" if _normalize_bool_config(value) == "true" else "sdparecomp0"
+
+
 def _parse_expact_part(part: str) -> tuple[str, str] | None:
     value = part.strip().lower()
     if value in {"expact1", "expacttrue"}:
@@ -405,6 +410,15 @@ def _parse_layergc_part(part: str) -> tuple[str, str] | None:
     return None
 
 
+def _parse_sdparecomp_part(part: str) -> tuple[str, str] | None:
+    value = part.strip().lower()
+    if value in {"sdparecomp1", "sdparecomptrue"}:
+        return "true", "sdparecomp1"
+    if value in {"sdparecomp0", "sdparecompfalse"}:
+        return "false", "sdparecomp0"
+    return None
+
+
 def _parse_liger_loss_part(part: str) -> str | None:
     value = part.strip().lower()
     if value in {"ligerloss0", "ligerloss1"}:
@@ -424,6 +438,10 @@ def _known_optional_job_axis(part: str) -> bool:
             "layergc1",
             "layergcfalse",
             "layergctrue",
+            "sdparecomp0",
+            "sdparecomp1",
+            "sdparecompfalse",
+            "sdparecomptrue",
         }
         or value in {"actrecomp0", "actrecomp1", "actrecompfalse", "actrecomptrue"}
         or value in {"xunpack0", "xunpack1", "xunpackfalse", "xunpacktrue"}
@@ -448,6 +466,8 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
     layeract = "layeract0"
     layergc_value = "false"
     layergc = "layergc0"
+    sdparecomp_value = "false"
+    sdparecomp = "sdparecomp0"
     liger_loss = "ligerloss0"
 
     if tail:
@@ -472,6 +492,10 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         if parsed_layergc is not None:
             layergc_value, layergc = parsed_layergc
             continue
+        parsed_sdparecomp = _parse_sdparecomp_part(part)
+        if parsed_sdparecomp is not None:
+            sdparecomp_value, sdparecomp = parsed_sdparecomp
+            continue
         parsed_liger_loss = _parse_liger_loss_part(part)
         if parsed_liger_loss is not None:
             liger_loss = parsed_liger_loss
@@ -494,6 +518,8 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         "layeract": layeract,
         "asymm_layer_gc": layergc_value,
         "layergc": layergc,
+        "asymm_attn_sdpa_recompute": sdparecomp_value,
+        "sdparecomp": sdparecomp,
         "liger_loss": liger_loss,
     }
 
@@ -527,6 +553,8 @@ def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | 
     layeract = job_meta["layeract"]
     layergc_value = job_meta["asymm_layer_gc"]
     layergc = job_meta["layergc"]
+    sdparecomp_value = job_meta["asymm_attn_sdpa_recompute"]
+    sdparecomp = job_meta["sdparecomp"]
     if not policy_part.startswith("pol") or not router_part.startswith("router"):
         return None
     router_mode = str(config.get("router_mode") or router_part[len("router") :])
@@ -540,6 +568,9 @@ def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | 
     layergc_config_value = config.get("asymm_layer_gc", config.get("asym_layer_glue_gc_enabled", layergc_value))
     layergc_value = _normalize_bool_config(layergc_config_value)
     layergc = _layergc_label(layergc_value)
+    sdparecomp_config_value = config.get("asymm_attn_sdpa_recompute", sdparecomp_value)
+    sdparecomp_value = _normalize_bool_config(sdparecomp_config_value)
+    sdparecomp = _sdparecomp_label(sdparecomp_value)
     liger_loss = str(config.get("liger_loss") or job_meta.get("liger_loss") or "ligerloss0").lower()
     if liger_loss not in {"ligerloss0", "ligerloss1"}:
         liger_loss = "ligerloss0"
@@ -559,6 +590,8 @@ def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | 
         "layeract": layeract,
         "asymm_layer_gc": layergc_value,
         "layergc": layergc,
+        "asymm_attn_sdpa_recompute": sdparecomp_value,
+        "sdparecomp": sdparecomp,
         "liger_loss": liger_loss,
         "seq_len": str(config.get("seq_len") or (run_dir_match.group("seq_len") if run_dir_match else "")),
         "precision": str(config.get("precision") or ""),

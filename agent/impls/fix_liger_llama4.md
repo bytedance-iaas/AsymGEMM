@@ -1,74 +1,112 @@
 # Liger Loss-Only for Llama4
 
-Goal: make `--enable_liger_kernel true` enable only Liger fused linear cross entropy for Llama4, the same way it already does for Qwen3-MoE. This must work for regular LF/DeepSpeed runs and for AsymGEMM runs where `lm_head` can be offloaded/wrapped. Do not enable any other Liger kernels, and do not patch unsupported model types.
+Goal: make `ENABLE_LIGER_KERNEL=true` enable only Liger fused linear cross entropy for Llama4, with no RoPE, norm, SwiGLU, or standalone CE patches. The same knob must work for regular LF/DeepSpeed runs and for AsymGEMM runs where `lm_head` can be CPU-resident or wrapped by `AsymFrozenLinear`.
 
 Non-goals:
-- Do not modify `third_party/Liger-Kernel` unless local validation proves its existing Llama4 loss path is broken.
-- Do not add a second runtime knob. The only user-facing runtime knob remains `ENABLE_LIGER_KERNEL`, surfaced in sweeps as `BACKEND_SPECS=...|ligerloss0` or `...|ligerloss1`.
-- Do not special-case profiling paths outside the existing `ligerloss0/1` axis unless validation finds a stale artifact filter.
+- Do not add a second runtime knob. The only runtime knob is `ENABLE_LIGER_KERNEL`, represented in sweeps as `BACKEND_SPECS=...|ligerloss0` or `...|ligerloss1`.
+- Do not enable non-loss Liger kernels.
+- Do not patch unsupported model types.
+- Do not modify `third_party/Liger-Kernel` unless local validation proves the repo-local Llama4 loss path is incorrect.
 
-Current local facts:
-- `../Liger-Kernel/src/liger_kernel/transformers/monkey_patch.py` already has `apply_liger_kernel_to_llama4(...)`.
-- Its signature is:
-
-```python
-(
-    rope=True,
-    cross_entropy=False,
-    fused_linear_cross_entropy=True,
-    rms_norm=True,
-    swiglu=True,
-    model=None,
-    layer_norm=True,
-)
-```
-
-- `../Liger-Kernel/src/liger_kernel/transformers/model/llama4.py::lce_forward` already uses `LigerForCausalLMLoss`.
-- That Liger Llama4 forward calls `lm_head_weight=self.lm_head.weight`. This is fine for normal/DeepSpeed models but not sufficient for AsymGEMM when `lm_head` is an `AsymFrozenLinear`, because Asym needs to stage the CPU-resident weight to the active device/dtype.
+Current local facts to keep the implementation grounded:
+- `scripts/lf/profile_lora_lf.sh` derives `SFT_ROOT`, `ROOT`, `ASYM_DIR`, `ENV_DIR`, and `ENV_PYTHON`; docs and commands should use those dynamic paths, not a hardcoded virtualenv.
+- `scripts/lf/profile_lora_lf.sh` already parses `BACKEND_SPECS='backend|recompute[|ligerloss0/1]'`, exports `ENABLE_LIGER_KERNEL`, records `ASYM_GEMM_LF_CONFIG_LIGER_LOSS`, writes `liger_loss` into `jobs.tsv`, and includes `__ligerloss0/1__` in run paths.
+- `scripts/lf/profile_lora_lf.sh` now supports six-field activation tuples: `policy|expert_act|attn_act|layer_act[|layer_gc[|sdpa_recompute]]`. Run paths include `__sdparecomp0/1__`, and `ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_SDPA_RECOMPUTE` is exported.
+- The Liger validation runs must pin one six-field `ASYMM_EXP_ACT_POLICIES` tuple. The default script sweep varies activation and SDPA recompute axes, so it is not a clean Liger off/on comparison.
+- `scripts/plotting/plot_activation_recompute_sweep.py` and `scripts/plotting/plot_lf_memory_breakdown.py` parse `sdparecomp`, but the combined plot grouping/labels are not fully split by SDPA everywhere. Pinning the SDPA axis is required unless Stage 0 expands plot grouping.
+- `../Liger-Kernel/src/liger_kernel/transformers/monkey_patch.py` maps both `llama4_text` and `llama4` to `apply_liger_kernel_to_llama4(...)`.
+- `apply_liger_kernel_to_llama4(...)` accepts `rope`, `cross_entropy`, `fused_linear_cross_entropy`, `rms_norm`, `swiglu`, `model`, and `layer_norm`.
+- The repo-local Liger Llama4 fused CE forward patches `transformers.models.llama4.modeling_llama4.Llama4ForCausalLM.forward` and calls `LigerForCausalLMLoss(hidden_states=..., lm_head_weight=self.lm_head.weight, ...)`.
+- `Llama4TextConfig.model_type == "llama4_text"` and uses `Llama4ForCausalLM`.
+- `Llama4Config.model_type == "llama4"` and uses `Llama4ForConditionalGeneration`, which owns `language_model = Llama4ForCausalLM(config.text_config)`.
+- `Llama4ForConditionalGeneration.forward` calls `self.language_model(...)` without labels, materializes logits, and then computes CE at the top level. Therefore a class-level patch of `Llama4ForCausalLM.forward` is not enough to prove fused CE for Scout/Maverick-style `model_type="llama4"` runs.
 - `../LlamaFactory/src/llamafactory/model/model_utils/liger_kernel.py` currently whitelists only `qwen3_moe`.
 - `asym_gemm/integrations/liger_loss.py` currently has only the Qwen3-MoE Asym bridge.
-- `scripts/lf/profile_lora_lf.sh` already parses `ligerloss0/1`, includes `liger_loss` in output paths, completeness checks, jobs TSV, plot filters, and exports `ENABLE_LIGER_KERNEL`.
+- `../LlamaFactory/src/llamafactory/model/loader.py` applies the LF Liger hook before model construction, then loads the model, then calls `init_adapter(...)`.
+- `../LlamaFactory/src/llamafactory/model/loader.py` selects `AutoModelForImageTextToText` when the config is in that mapping; real Llama4 Scout/Maverick configs should be treated as likely `Llama4ForConditionalGeneration` until the run proves otherwise.
 
 Install precondition:
 
 ```bash
-python -m pip install -e /home/kevinni/AsymGEMM-SFT/third_party/Liger-Kernel
-python - <<'PY'
+SFT_ROOT=${SFT_ROOT:-/home/kevinni/AsymGEMM-SFT}
+ASYM_DIR=${ASYM_DIR:-${SFT_ROOT}/third_party/AsymGEMM}
+ENV_PYTHON=${ENV_PYTHON:-${ASYM_DIR}/.venv/bin/python}
+
+"${ENV_PYTHON}" -m pip install -e "${SFT_ROOT}/third_party/Liger-Kernel"
+"${ENV_PYTHON}" - <<'PY'
 import inspect
 from liger_kernel.transformers import apply_liger_kernel_to_llama4
-print(inspect.signature(apply_liger_kernel_to_llama4))
+from liger_kernel.transformers.monkey_patch import MODEL_TYPE_TO_APPLY_LIGER_FN
+
+sig = inspect.signature(apply_liger_kernel_to_llama4)
+required = {"fused_linear_cross_entropy", "rope", "cross_entropy", "rms_norm", "swiglu", "layer_norm", "model"}
+missing = required - set(sig.parameters)
+assert not missing, missing
+assert MODEL_TYPE_TO_APPLY_LIGER_FN["llama4"] is apply_liger_kernel_to_llama4
+assert MODEL_TYPE_TO_APPLY_LIGER_FN["llama4_text"] is apply_liger_kernel_to_llama4
+print(sig)
 PY
 ```
 
-Accept this precondition only if the signature includes `fused_linear_cross_entropy` and `layer_norm`. If the import resolves to a non-local package without Llama4 support, fix the environment before changing LF/Asym code.
+Accept this precondition only if it uses the same `ENV_PYTHON` that `scripts/lf/profile_lora_lf.sh` will use.
 
-## Stage 0 - Common Interface Preflight
+## Stage 0 - Common Script and Interface Preflight
 
 Scope:
 - `scripts/lf/profile_lora_lf.sh`
+  - `usage`
+  - `parse_exp_act_policy_tuple`
+  - `sdparecomp_tag`
   - `append_backend_spec`
   - `liger_loss_label`
   - `job_root_path`
   - `job_profile_complete`
   - `append_liger_loss_filters`
+  - `append_current_activation_axis_filters`
   - `run_job`
   - `plot_single_run`
   - `plot_running_combined`
   - `plot_memory_single_run`
   - `plot_memory_running_combined`
+  - `write_config_artifact_readme`
+  - `write_precision_artifact_readme`
 - `scripts/lf/run_lf_lora_sft.sh`
   - `ENABLE_LIGER_KERNEL` normalization
-  - `--enable_liger_kernel` argument forwarding
+  - `--enable_liger_kernel` forwarding
+  - `ASYMM_ATTN_SDPA_RECOMPUTE` forwarding
+  - `ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_SDPA_RECOMPUTE`
+  - `NUMACTL_MEMBIND`, `NUMACTL_CPUNODEBIND`, `NUMACTL_MODE`
 - `scripts/lf/run_lf_profiled_train.py`
-  - `_asym_liger_lm_head_bridge_from_model`
-  - emitted `config["asym_liger_lm_head_bridge"]`
+  - `_env_config`
+  - `_config_from_args`
+  - emitted top-level `source_profile["config"]`
+  - emitted top-level `source_profile["asym_liger_lm_head_bridge"]`
+- Only if unpinned SDPA sweeps are needed for acceptance:
+  - `scripts/plotting/plot_activation_recompute_sweep.py`
+    - `collect_rows` dedupe key
+    - sort key in `collect_rows`
+    - `combined_group_key`
+    - `combined_threshold_group_key`
+    - `varied_fields`
+    - `varied_threshold_fields`
+    - `combined_label`
+    - `combined_threshold_label`
+    - grouped plot key destructuring and filename suffixes around the per-group writers
+  - `scripts/plotting/plot_lf_memory_breakdown.py`
+    - `_group_label`
+    - optional `--sdparecomp` filter only if accepting unpinned SDPA sweeps
+  - `scripts/plotting/plot_lf_interconnect_ctc.py`
+    - `_parse_job_dir_parts`
+    - `_infer_metadata`
+    - labels/filters only if accepting unpinned SDPA sweeps
 
 Intended code changes:
-- None expected before Stage 1.
-- Keep the interface exactly as:
-  - sweep axis: `BACKEND_SPECS='backend|recomp|ligerloss0,backend|recomp|ligerloss1'`
-  - runtime env: `ENABLE_LIGER_KERNEL=true|false`
-  - no `LIGER_LOSS_ONLY` env, because loss-only is the only supported behavior in this repo.
+- No LF, AsymGEMM, or Liger runtime changes in this stage.
+- Keep exactly one runtime env var for Liger: `ENABLE_LIGER_KERNEL=true|false`.
+- Keep exactly one sweep axis spelling: `ligerloss0` and `ligerloss1`.
+- Keep `BACKEND_SPECS` format as `backend|recomp|ligerloss0/1`.
+- If the current script help or artifact READMEs omit `sdpa_recompute`, update only those text strings so they match the current six-field tuple and `__sdparecomp0/1__` path axis.
+- Do not touch `scripts/lf/profile3.sh`; it is out of scope for this Llama4 Liger-loss change.
 
 Validation before moving on:
 
@@ -76,6 +114,8 @@ Validation before moving on:
 DRY_RUN=true \
 MODEL_SPECS='meta-llama/Llama-4-Scout-17B-16E|1' \
 BACKEND_SPECS='zero3_offload|recomp|ligerloss0,zero3_offload|recomp|ligerloss1,asym_cpuadamwds|norecomp|ligerloss0,asym_cpuadamwds|norecomp|ligerloss1' \
+ASYMM_EXP_ACT_POLICIES='none|true|false|false|false|false' \
+WORKLOADS='8192|2|1' \
 PROFILERS=both GPU_POOL=3 \
 NUMACTL_MEMBIND=0,1 NUMACTL_CPUNODEBIND=0,1 NUMACTL_MODE=membind \
 bash /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh
@@ -83,30 +123,36 @@ bash /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.
 
 Pass conditions:
 - Dry-run commands contain `ENABLE_LIGER_KERNEL=true` only for `ligerloss1`.
-- Output paths and run IDs contain `ligerloss0` or `ligerloss1`.
-- `jobs.tsv` header includes `liger_loss`.
-- No path or plot code needs to be changed if those pass.
+- Dry-run commands contain `ENABLE_LIGER_KERNEL=false` only for `ligerloss0`.
+- Dry-run commands pass `ASYMM_ATTN_SDPA_RECOMPUTE=false` and `ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_SDPA_RECOMPUTE=false`.
+- Run paths and run IDs contain both `__sdparecomp0__` and `__ligerloss0/1__`.
+- `jobs.tsv` header contains `liger_loss`.
+- `PROFILERS=both` shows one Nsight execution path plus a sibling materialized `source` artifact path.
+- `NUMACTL_MEMBIND=0,1` and `NUMACTL_CPUNODEBIND=0,1` are forwarded unchanged.
 
-Risk to watch:
-- `profile3.sh` is out of scope for this change. Do not modify it for Llama4 Liger loss.
+Risks to watch:
+- If validation uses the default `ASYMM_EXP_ACT_POLICIES`, the result is not a clean Liger comparison because activation offload and SDPA recompute vary too.
+- If unpinned SDPA sweeps become required, update the plot grouping functions listed above before accepting performance plots.
 
-## Stage 1 - Enable Llama4 in LF Loss-Only Gate
+## Stage 1 - Enable LF Loss-Only Gate for Llama4 Model Types
 
 Scope:
-- Modify `../LlamaFactory/src/llamafactory/model/model_utils/liger_kernel.py`
+- `../LlamaFactory/src/llamafactory/model/model_utils/liger_kernel.py`
   - `_LOSS_ONLY_SUPPORTED_MODEL_TYPES`
   - `_resolve_liger_apply_fn`
-  - `_build_liger_loss_only_kwargs` only if tests prove it mishandles Llama4's `layer_norm` bool.
-  - `apply_liger_kernel` should remain structurally unchanged.
-- Modify `tests/lf/test_liger_loss_only_qwen3_moe.py`
-  - Add Llama4 coverage while keeping existing Qwen3-MoE coverage.
+  - `_build_liger_loss_only_kwargs` only if tests prove it mishandles `layer_norm`
+  - `apply_liger_kernel`
+- `tests/lf/test_liger_loss_only_qwen3_moe.py`
+  - keep Qwen3-MoE coverage
+  - add `llama4_text` and `llama4` coverage
+  - update unsupported-model tests so they no longer use `llama4` as unsupported
 
 Intended code changes:
 
 ```python
 # ../LlamaFactory/src/llamafactory/model/model_utils/liger_kernel.py
 
-_LOSS_ONLY_SUPPORTED_MODEL_TYPES = {"qwen3_moe", "llama4"}
+_LOSS_ONLY_SUPPORTED_MODEL_TYPES = {"qwen3_moe", "llama4_text", "llama4"}
 
 
 def _resolve_liger_apply_fn(model_type: str | None) -> Callable[..., None] | None:
@@ -114,14 +160,14 @@ def _resolve_liger_apply_fn(model_type: str | None) -> Callable[..., None] | Non
         from liger_kernel.transformers import apply_liger_kernel_to_qwen3_moe
         return apply_liger_kernel_to_qwen3_moe
 
-    if model_type == "llama4":
+    if model_type in {"llama4_text", "llama4"}:
         from liger_kernel.transformers import apply_liger_kernel_to_llama4
         return apply_liger_kernel_to_llama4
 
     return None
 ```
 
-`_build_liger_loss_only_kwargs` should already do the right thing:
+`_build_liger_loss_only_kwargs` should remain generic:
 
 ```python
 def _build_liger_loss_only_kwargs(apply_fn):
@@ -137,6 +183,7 @@ def _build_liger_loss_only_kwargs(apply_fn):
             kwargs[name] = True
         elif isinstance(param.default, bool):
             kwargs[name] = False
+
     return kwargs if kwargs.get("fused_linear_cross_entropy") is True else None
 ```
 
@@ -153,12 +200,15 @@ For Llama4 this must produce:
 }
 ```
 
-That means LF applies only the class-level Llama4 fused CE forward and does not replace RoPE, RMSNorm, SwiGLU, LayerNorm, or standalone CE.
-
-Tests to add:
+Add tests:
 
 ```python
-def test_build_liger_loss_only_kwargs_disables_llama4_non_loss_patches():
+@pytest.mark.parametrize("model_type", ["llama4_text", "llama4"])
+def test_apply_liger_kernel_uses_loss_only_for_llama4_model_types(monkeypatch, model_type):
+    from llamafactory.model.model_utils import liger_kernel
+
+    calls = []
+
     def fake_apply(
         rope=True,
         cross_entropy=False,
@@ -168,24 +218,19 @@ def test_build_liger_loss_only_kwargs_disables_llama4_non_loss_patches():
         model=None,
         layer_norm=True,
     ):
-        pass
+        calls.append({
+            "rope": rope,
+            "cross_entropy": cross_entropy,
+            "fused_linear_cross_entropy": fused_linear_cross_entropy,
+            "rms_norm": rms_norm,
+            "swiglu": swiglu,
+            "layer_norm": layer_norm,
+        })
 
-    assert liger_kernel._build_liger_loss_only_kwargs(fake_apply) == {
-        "rope": False,
-        "cross_entropy": False,
-        "fused_linear_cross_entropy": True,
-        "rms_norm": False,
-        "swiglu": False,
-        "layer_norm": False,
-    }
-
-
-def test_apply_liger_kernel_uses_loss_only_for_llama4(monkeypatch):
-    calls = []
-    monkeypatch.setattr(liger_kernel, "_resolve_liger_apply_fn", lambda model_type: lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(liger_kernel, "_resolve_liger_apply_fn", lambda mt: fake_apply)
 
     liger_kernel.apply_liger_kernel(
-        SimpleNamespace(model_type="llama4"),
+        SimpleNamespace(model_type=model_type),
         SimpleNamespace(enable_liger_kernel=True),
         is_trainable=True,
         require_logits=False,
@@ -201,58 +246,80 @@ def test_apply_liger_kernel_uses_loss_only_for_llama4(monkeypatch):
     }]
 ```
 
-Also update the existing unsupported-model test so it no longer uses `llama4` as the unsupported example. Use `qwen3` or another unvalidated model type.
+Add an explicit source check:
+
+```python
+def test_local_liger_llama4_signature_and_dispatch_are_supported():
+    import inspect
+    from liger_kernel.transformers import apply_liger_kernel_to_llama4
+    from liger_kernel.transformers.monkey_patch import MODEL_TYPE_TO_APPLY_LIGER_FN
+
+    sig = inspect.signature(apply_liger_kernel_to_llama4)
+    assert {"rope", "cross_entropy", "fused_linear_cross_entropy", "rms_norm", "swiglu", "layer_norm", "model"} <= set(sig.parameters)
+    assert MODEL_TYPE_TO_APPLY_LIGER_FN["llama4_text"] is apply_liger_kernel_to_llama4
+    assert MODEL_TYPE_TO_APPLY_LIGER_FN["llama4"] is apply_liger_kernel_to_llama4
+```
 
 Validation before moving on:
 
 ```bash
-pytest -q tests/lf/test_liger_loss_only_qwen3_moe.py
-python - <<'PY'
-import inspect
-from liger_kernel.transformers import apply_liger_kernel_to_llama4
-sig = inspect.signature(apply_liger_kernel_to_llama4)
-required = {"fused_linear_cross_entropy", "rope", "cross_entropy", "rms_norm", "swiglu", "layer_norm", "model"}
-missing = required - set(sig.parameters)
-raise SystemExit(f"missing Llama4 Liger params: {missing}") if missing else None
-print(sig)
+SFT_ROOT=${SFT_ROOT:-/home/kevinni/AsymGEMM-SFT}
+ASYM_DIR=${ASYM_DIR:-${SFT_ROOT}/third_party/AsymGEMM}
+ENV_PYTHON=${ENV_PYTHON:-${ASYM_DIR}/.venv/bin/python}
+
+"${ENV_PYTHON}" -m pytest -q tests/lf/test_liger_loss_only_qwen3_moe.py
+"${ENV_PYTHON}" - <<'PY'
+from transformers.models.llama4.configuration_llama4 import Llama4Config, Llama4TextConfig
+assert Llama4TextConfig.model_type == "llama4_text"
+assert Llama4Config.model_type == "llama4"
+print("llama4 config model types verified")
 PY
 ```
 
 Pass conditions:
-- Qwen3-MoE tests still pass.
-- Llama4 tests prove only `fused_linear_cross_entropy=True` and every other bool patch is false.
+- Existing Qwen3-MoE loss-only tests still pass.
+- `llama4_text` and `llama4` both call Liger with only `fused_linear_cross_entropy=True`.
 - Unsupported model types still skip cleanly.
 
-Risk to watch:
-- This stage validates normal LF/DeepSpeed class patching only. It does not make AsymGEMM `lm_head` staging correct; that is Stage 2.
+Risks to watch:
+- This stage only enables the LF pre-load class patch. It is enough for `Llama4ForCausalLM` / `model_type="llama4_text"` but is not enough to accept `Llama4ForConditionalGeneration` / `model_type="llama4"` memory results.
 
-## Stage 2 - Add AsymGEMM Llama4 Loss Bridge
+## Stage 2 - Add Post-Load Llama4 Loss Bridge for Normal and Asym Runs
 
 Scope:
-- Modify `asym_gemm/integrations/liger_loss.py`
+- `asym_gemm/integrations/liger_loss.py`
+  - `_candidate_language_models`
   - `_base_causal_lm_model`
-  - add `_validate_liger_lm_head`
-  - add `_mark_liger_bridge_installed`
-  - add `asym_llama4_lce_forward`
+  - `_root_model`
+  - `_is_llama4_conditional_generation`
+  - `_resolve_liger_lm_head_weight`
+  - `_lm_head_weight_source`
+  - `_validate_liger_lm_head`
+  - `_mark_liger_bridge_installed`
+  - `_make_liger_shift_labels`
+  - add `asym_llama4_causal_lm_lce_forward`
+  - add `asym_llama4_conditional_lce_forward`
   - add `install_asym_liger_llama4_loss_bridge`
   - add `install_asym_liger_loss_bridge`
   - keep `install_asym_liger_qwen3_moe_loss_bridge` as a compatibility wrapper
+  - update `asym_liger_lm_head_bridge_metadata`
   - update `__all__`
-- Modify `../LlamaFactory/src/llamafactory/model/adapter.py`
-  - import `install_asym_liger_loss_bridge`
-  - replace the Qwen3-only bridge install block with the generic dispatcher.
-- Modify `tests/lf/test_asym_liger_lm_head_bridge.py`
-  - add Llama4 tiny-model coverage.
-  - update the unsupported-model test so `llama4` is no longer expected to skip.
+- `../LlamaFactory/src/llamafactory/model/adapter.py`
+  - import `install_asym_liger_loss_bridge` only inside the branches that need it
+  - install the generic post-load bridge after Asym wrapping
+  - install the generic post-load bridge after normal PEFT wrapping for Llama4 conditional-generation runs
+- `tests/lf/test_asym_liger_lm_head_bridge.py`
+  - keep Qwen3-MoE coverage
+  - add `llama4_text` causal-LM coverage
+  - add `llama4` conditional-generation coverage
+  - cover normal-parameter and `AsymFrozenLinear` `lm_head` sources
 
-Implementation details:
+Intended code changes:
 
-1. Make target-model resolution handle PEFT and possible Llama4 wrappers.
+1. Resolve PEFT, top-level conditional wrappers, and nested language models.
 
 ```python
-def _candidate_language_models(model: nn.Module) -> list[nn.Module]:
-    candidates = [model]
-
+def _root_model(model: nn.Module) -> nn.Module:
     get_base_model = getattr(model, "get_base_model", None)
     if callable(get_base_model):
         try:
@@ -260,38 +327,57 @@ def _candidate_language_models(model: nn.Module) -> list[nn.Module]:
         except Exception:
             base = None
         if isinstance(base, nn.Module):
-            candidates.append(base)
+            return base
+    return model
 
-    expanded = []
-    for candidate in candidates:
-        expanded.append(candidate)
+
+def _candidate_language_models(model: nn.Module) -> list[nn.Module]:
+    root = _root_model(model)
+    candidates = [model, root]
+
+    for candidate in list(candidates):
         language_model = getattr(candidate, "language_model", None)
         if isinstance(language_model, nn.Module):
-            expanded.append(language_model)
+            candidates.append(language_model)
+
         inner = getattr(candidate, "model", None)
         if isinstance(inner, nn.Module):
-            expanded.append(inner)
+            candidates.append(inner)
             inner_language_model = getattr(inner, "language_model", None)
             if isinstance(inner_language_model, nn.Module):
-                expanded.append(inner_language_model)
+                candidates.append(inner_language_model)
 
-    return expanded
+    deduped = []
+    seen = set()
+    for candidate in candidates:
+        ident = id(candidate)
+        if isinstance(candidate, nn.Module) and ident not in seen:
+            deduped.append(candidate)
+            seen.add(ident)
+    return deduped
 
 
 def _base_causal_lm_model(model: nn.Module) -> nn.Module:
     for candidate in _candidate_language_models(model):
-        if isinstance(candidate, nn.Module) and hasattr(candidate, "lm_head"):
+        if hasattr(candidate, "lm_head") and hasattr(candidate, "model"):
             return candidate
     return model
+
+
+def _is_llama4_conditional_generation(model: nn.Module) -> bool:
+    root = _root_model(model)
+    return (
+        getattr(getattr(root, "config", None), "model_type", None) == "llama4"
+        and isinstance(getattr(root, "language_model", None), nn.Module)
+        and hasattr(root.language_model, "lm_head")
+        and hasattr(root.language_model, "model")
+    )
 ```
 
-This keeps the existing Qwen3 path working and makes Llama4 robust if LF returns a wrapper whose causal LM lives under `language_model`.
-
-2. Factor the shared `lm_head` validation.
+2. Share `lm_head` validation for Qwen3-MoE, Llama4 text, and Llama4 conditional.
 
 ```python
-def _validate_liger_lm_head(target_model: nn.Module, *, model_label: str, strict: bool) -> tuple[nn.Module, str] | None:
-    lm_head = getattr(target_model, "lm_head", None)
+def _validate_liger_lm_head(lm_head: nn.Module | None, *, model_label: str, strict: bool):
     if lm_head is None:
         if strict:
             raise RuntimeError(f"{model_label} model has no lm_head.")
@@ -306,69 +392,35 @@ def _validate_liger_lm_head(target_model: nn.Module, *, model_label: str, strict
         return None
 
     if getattr(lm_head, "bias", None) is not None or getattr(lm_head, "bias_cpu", None) is not None:
-        raise RuntimeError("Asym Liger loss bridge currently requires a bias-free lm_head.")
+        raise RuntimeError("Liger loss bridge currently requires a bias-free lm_head.")
 
     if any(param.requires_grad for param in lm_head.parameters(recurse=True)):
-        raise RuntimeError("Asym Liger loss bridge supports frozen lm_head only.")
+        raise RuntimeError("Liger loss bridge supports frozen lm_head only.")
 
     return lm_head, weight_source
 ```
 
-3. Preserve metadata for profiling.
+3. Preserve bridge metadata for source profiling.
 
 ```python
-def _mark_liger_bridge_installed(target_model, lm_head, weight_source, model_type):
+def _mark_liger_bridge_installed(target_model, lm_head, weight_source, model_type, bridge_kind):
     target_model._asym_liger_lm_head_bridge_enabled = True
     target_model._asym_liger_lm_head_weight_source = weight_source
     target_model._asym_liger_lm_head_type = type(lm_head).__name__
     target_model._asym_liger_lm_head_staged_bytes = int(getattr(lm_head, "cpu_resident_base_weight_bytes", 0) or 0)
     target_model._asym_liger_model_type = model_type
+    target_model._asym_liger_bridge_kind = bridge_kind
 ```
 
-`asym_liger_lm_head_bridge_metadata` should continue returning `enabled`, `weight_source`, `staged_bytes`, and `lm_head_type`; adding `model_type` is acceptable if tests and profile consumers are updated, but not required.
+`asym_liger_lm_head_bridge_metadata(...)` should return at least `enabled`, `weight_source`, `staged_bytes`, `lm_head_type`, `model_type`, and `bridge_kind`.
 
-4. Add `asym_llama4_lce_forward`.
+4. Add a Llama4 causal-LM bridge for `llama4_text` and nested causal LMs.
 
-Use the local Liger implementation as the template:
-`../Liger-Kernel/src/liger_kernel/transformers/model/llama4.py::lce_forward`.
-
-The only behavior change is replacing `self.lm_head.weight` with the Asym-aware resolver.
+Use `../Liger-Kernel/src/liger_kernel/transformers/model/llama4.py::lce_forward` as the template. The only intended behavior change is replacing `self.lm_head.weight` with `_resolve_liger_lm_head_weight(self.lm_head, kept_hidden_states)`.
 
 ```python
-def asym_llama4_lce_forward(
-    self,
-    input_ids=None,
-    attention_mask=None,
-    position_ids=None,
-    past_key_values=None,
-    inputs_embeds=None,
-    labels=None,
-    use_cache=None,
-    output_attentions=None,
-    output_hidden_states=None,
-    return_dict=None,
-    cache_position=None,
-    logits_to_keep=0,
-    **kwargs,
-):
-    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-    output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-    outputs = self.model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=past_key_values,
-        inputs_embeds=inputs_embeds,
-        use_cache=use_cache,
-        output_attentions=output_attentions,
-        output_hidden_states=output_hidden_states,
-        return_dict=True,
-        cache_position=cache_position,
-        **kwargs,
-    )
-
+def asym_llama4_causal_lm_lce_forward(self, ..., labels=None, logits_to_keep=0, **kwargs):
+    outputs = self.model(..., return_dict=True, ...)
     hidden_states = outputs[0]
     slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
     kept_hidden_states = hidden_states[:, slice_indices, :]
@@ -393,153 +445,263 @@ def asym_llama4_lce_forward(
     else:
         logits = self.lm_head(kept_hidden_states)
         if labels is not None or shift_labels is not None:
-            loss = self.loss_function(
+            loss = self.loss_function(logits=logits, labels=labels, shift_labels=shift_labels, vocab_size=self.config.vocab_size, **kwargs)
+
+    return LigerCausalLMOutputWithPast(...)
+```
+
+5. Add a top-level conditional-generation bridge for real `model_type="llama4"` runs.
+
+This bridge must mirror `transformers.models.llama4.modeling_llama4.Llama4ForConditionalGeneration.forward` through embedding/image merging, but it must not call `self.language_model(...)` in the loss path because that materializes logits. Instead, call `self.language_model.model(...)` to get hidden states, then call `LigerForCausalLMLoss` with `self.language_model.lm_head`.
+
+```python
+def _make_liger_shift_labels(labels, attention_mask, *, kept_seq_len: int, ignore_index: int = -100):
+    if labels is None:
+        return None
+
+    shifted = torch.nn.functional.pad(labels, (0, 1), value=ignore_index)[..., 1:].contiguous()
+    if attention_mask is not None:
+        active = torch.nn.functional.pad(attention_mask[..., 1:], (0, 1), value=0).to(dtype=torch.bool)
+        shifted = shifted.masked_fill(~active.to(device=shifted.device), ignore_index)
+
+    if shifted.shape[1] != kept_seq_len:
+        shifted = shifted[:, -kept_seq_len:].contiguous()
+    return shifted
+
+
+def asym_llama4_conditional_lce_forward(
+    self,
+    input_ids=None,
+    pixel_values=None,
+    attention_mask=None,
+    position_ids=None,
+    past_key_values=None,
+    inputs_embeds=None,
+    vision_feature_select_strategy=None,
+    labels=None,
+    use_cache=None,
+    output_attentions=None,
+    output_hidden_states=None,
+    return_dict=None,
+    logits_to_keep=0,
+    **kwargs,
+):
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    return_dict = return_dict if return_dict is not None else self.config.return_dict
+
+    if (input_ids is None) ^ (inputs_embeds is not None):
+        raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+    if pixel_values is not None and inputs_embeds is not None:
+        raise ValueError("You cannot specify both pixel_values and inputs_embeds at the same time.")
+
+    if inputs_embeds is None:
+        inputs_embeds = self.get_input_embeddings()(input_ids)
+
+    image_features = None
+    if pixel_values is not None:
+        image_features = self.get_image_features(
+            pixel_values=pixel_values,
+            vision_feature_select_strategy=vision_feature_select_strategy,
+            return_dict=True,
+        ).last_hidden_state
+        vision_flat = image_features.view(-1, image_features.size(-1))
+        projected = self.multi_modal_projector(vision_flat).to(inputs_embeds.device, inputs_embeds.dtype)
+        special_image_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, image_features=projected)
+        inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, projected)
+
+    causal_lm = self.language_model
+    outputs = causal_lm.model(
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=True,
+        **kwargs,
+    )
+
+    hidden_states = outputs[0]
+    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    kept_hidden_states = hidden_states[:, slice_indices, :]
+
+    shift_labels = kwargs.pop("shift_labels", None)
+    if shift_labels is None:
+        shift_labels = _make_liger_shift_labels(labels, attention_mask, kept_seq_len=kept_hidden_states.shape[1])
+
+    logits = None
+    loss = None
+    token_accuracy = None
+    predicted_tokens = None
+    skip_logits = self.training and (labels is not None or shift_labels is not None)
+
+    if skip_logits:
+        lm_head_weight = _resolve_liger_lm_head_weight(causal_lm.lm_head, kept_hidden_states)
+        result = LigerForCausalLMLoss(
+            hidden_states=kept_hidden_states,
+            lm_head_weight=lm_head_weight,
+            labels=labels,
+            shift_labels=shift_labels,
+            hidden_size=self.config.text_config.hidden_size,
+            **kwargs,
+        )
+        loss, _, token_accuracy, predicted_tokens = unpack_cross_entropy_result(result)
+    else:
+        logits = causal_lm.lm_head(kept_hidden_states)
+        if labels is not None or shift_labels is not None:
+            loss = causal_lm.loss_function(
                 logits=logits,
                 labels=labels,
                 shift_labels=shift_labels,
-                vocab_size=self.config.vocab_size,
+                vocab_size=self.config.text_config.vocab_size,
                 **kwargs,
             )
 
-    if not return_dict:
-        output = (logits,) + outputs[1:]
-        output = ((loss,) + output) if loss is not None else output
-        output = output + (token_accuracy,) if token_accuracy is not None else output
-        output = output + (predicted_tokens,) if predicted_tokens is not None else output
-        return output
-
-    return LigerCausalLMOutputWithPast(
+    return Llama4CausalLMOutputWithPast(
         loss=loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
-        token_accuracy=token_accuracy,
-        predicted_tokens=predicted_tokens,
+        image_hidden_states=image_features if pixel_values is not None else None,
     )
 ```
 
-Required imports:
+This keeps kernel launch efficiency acceptable: there is still one text-backbone forward and one fused linear CE loss path. Do not split expert work into Python loops, do not create per-expert GEMMs, and do not materialize full `[batch, seq, vocab]` logits in the training loss path.
 
-```python
-from liger_kernel.transformers.model.output_classes import LigerCausalLMOutputWithPast
-```
-
-Keep the existing Qwen3 imports for `LigerMoeCausalLMOutputWithPast` and `MoeModelOutputWithPast`.
-
-5. Add the Llama4 installer and generic dispatcher.
+6. Add installers.
 
 ```python
 def install_asym_liger_llama4_loss_bridge(model: nn.Module, *, strict: bool = True) -> bool:
-    target_model = _base_causal_lm_model(model)
-    config = getattr(target_model, "config", None)
-    if getattr(config, "model_type", None) != "llama4":
+    root = _root_model(model)
+
+    if _is_llama4_conditional_generation(root):
+        causal_lm = root.language_model
+        validated = _validate_liger_lm_head(getattr(causal_lm, "lm_head", None), model_label="Llama4", strict=strict)
+        if validated is None:
+            return False
+        lm_head, weight_source = validated
+        root.forward = MethodType(asym_llama4_conditional_lce_forward, root)
+        _mark_liger_bridge_installed(root, lm_head, weight_source, "llama4", "conditional_generation")
+        return True
+
+    target = _base_causal_lm_model(root)
+    model_type = getattr(getattr(target, "config", None), "model_type", None)
+    if model_type not in {"llama4_text", "llama4"}:
         if strict:
-            raise ValueError("Asym Liger loss bridge only supports llama4.")
+            raise ValueError("Llama4 Liger loss bridge only supports llama4_text or llama4.")
         return False
 
-    validated = _validate_liger_lm_head(target_model, model_label="Llama4", strict=strict)
+    validated = _validate_liger_lm_head(getattr(target, "lm_head", None), model_label="Llama4", strict=strict)
     if validated is None:
         return False
-
     lm_head, weight_source = validated
-    target_model.forward = MethodType(asym_llama4_lce_forward, target_model)
-    _mark_liger_bridge_installed(target_model, lm_head, weight_source, "llama4")
-    return True
-
-
-def install_asym_liger_qwen3_moe_loss_bridge(model: nn.Module, *, strict: bool = True) -> bool:
-    target_model = _base_causal_lm_model(model)
-    config = getattr(target_model, "config", None)
-    if getattr(config, "model_type", None) != "qwen3_moe":
-        if strict:
-            raise ValueError("Asym Liger loss bridge only supports qwen3_moe.")
-        return False
-
-    validated = _validate_liger_lm_head(target_model, model_label="Qwen3-MoE", strict=strict)
-    if validated is None:
-        return False
-
-    lm_head, weight_source = validated
-    target_model.forward = MethodType(asym_qwen3_moe_lce_forward, target_model)
-    _mark_liger_bridge_installed(target_model, lm_head, weight_source, "qwen3_moe")
+    target.forward = MethodType(asym_llama4_causal_lm_lce_forward, target)
+    _mark_liger_bridge_installed(target, lm_head, weight_source, model_type, "causal_lm")
     return True
 
 
 def install_asym_liger_loss_bridge(model: nn.Module, *, strict: bool = True) -> bool:
-    target_model = _base_causal_lm_model(model)
-    model_type = getattr(getattr(target_model, "config", None), "model_type", None)
+    root = _root_model(model)
+    root_type = getattr(getattr(root, "config", None), "model_type", None)
+    causal = _base_causal_lm_model(root)
+    causal_type = getattr(getattr(causal, "config", None), "model_type", None)
 
-    if model_type == "qwen3_moe":
-        return install_asym_liger_qwen3_moe_loss_bridge(model, strict=strict)
-    if model_type == "llama4":
+    if root_type == "llama4" or causal_type in {"llama4", "llama4_text"}:
         return install_asym_liger_llama4_loss_bridge(model, strict=strict)
-
-    if strict:
-        raise ValueError(f"Asym Liger loss bridge does not support model_type={model_type}.")
+    if causal_type == "qwen3_moe":
+        return install_asym_liger_qwen3_moe_loss_bridge(model, strict=strict)
     return False
 ```
 
-6. Wire the generic bridge in LF adapter after Asym wrapping.
+The installer may patch normal-parameter `lm_head` for Llama4 conditional-generation runs because the class-level Liger CausalLM patch is not sufficient there. For Qwen3-MoE and `llama4_text`, normal non-Asym runs can rely on the class-level Liger patch; the post-load bridge is primarily needed when `lm_head` is Asym-wrapped.
+
+7. Wire LF adapter after wrapping.
 
 ```python
 # ../LlamaFactory/src/llamafactory/model/adapter.py
-from asym_gemm.integrations.liger_loss import install_asym_liger_loss_bridge
 
-# after adapt_lf_asym_peft_lora(...)
-if model_args.enable_liger_kernel and getattr(model.config, "model_type", None) in {"qwen3_moe", "llama4"}:
-    bridge_installed = install_asym_liger_loss_bridge(
-        model,
-        strict=bool(model_args.asym_strict and selection.lm_head),
-    )
+if model_args.use_asym_gemm:
+    ...
+    model, report = adapt_lf_asym_peft_lora(...)
+    if model_args.enable_liger_kernel:
+        from asym_gemm.integrations.liger_loss import install_asym_liger_loss_bridge
+
+        bridge_installed = install_asym_liger_loss_bridge(
+            model,
+            strict=bool(model_args.asym_strict and selection.lm_head),
+        )
+        if bridge_installed:
+            logger.info_rank0("Asym Liger loss bridge has been installed.")
+    logger.info_rank0(report.to_log_string())
+    return model
+
+# In the normal LoRA/OFT branch after get_peft_model(...), before the final return.
+# Only the top-level Llama4 conditional-generation path needs this post-load
+# normal-parameter bridge; Qwen3-MoE and llama4_text can use the class patch.
+if model_args.enable_liger_kernel and getattr(config, "model_type", None) == "llama4":
+    from asym_gemm.integrations.liger_loss import install_asym_liger_loss_bridge
+
+    bridge_installed = install_asym_liger_loss_bridge(model, strict=False)
     if bridge_installed:
-        logger.info_rank0("Asym Liger lm_head bridge has been installed.")
+        logger.info_rank0("Post-load Liger loss bridge has been installed.")
 ```
 
 Patch order:
-- LF loader applies the global Liger class patch before model construction.
-- PEFT/Asym adapter then wraps/offloads modules.
-- Asym adapter then installs the instance-level bridge for Qwen3-MoE or Llama4.
-- The instance bridge intentionally overrides the class-level Liger forward for Asym runs only, so `AsymFrozenLinear.asym_liger_lm_head_weight(...)` stages `lm_head` correctly.
-- DeepSpeed/normal runs do not use the Asym bridge; they use Liger's normal Llama4 class-level fused CE forward.
+- LF pre-load Liger hook applies the class-level loss-only patch.
+- LF loads the model.
+- PEFT and/or Asym wrapping happens.
+- The post-load bridge patches only the resolved model instance.
+- For Asym runs, the bridge stages `lm_head` through `AsymFrozenLinear.asym_liger_lm_head_weight(...)`.
+- For normal `Llama4ForConditionalGeneration`, the bridge avoids the top-level logits materialization that the class-level CausalLM patch cannot avoid.
 
 Validation before moving on:
 
 ```bash
-pytest -q tests/lf/test_asym_liger_lm_head_bridge.py
-pytest -q tests/lf/test_liger_loss_only_qwen3_moe.py
+SFT_ROOT=${SFT_ROOT:-/home/kevinni/AsymGEMM-SFT}
+ASYM_DIR=${ASYM_DIR:-${SFT_ROOT}/third_party/AsymGEMM}
+ENV_PYTHON=${ENV_PYTHON:-${ASYM_DIR}/.venv/bin/python}
+
+"${ENV_PYTHON}" -m pytest -q tests/lf/test_asym_liger_lm_head_bridge.py
+"${ENV_PYTHON}" -m pytest -q tests/lf/test_liger_loss_only_qwen3_moe.py
 ```
 
 New bridge tests must prove:
-- `install_asym_liger_llama4_loss_bridge` patches only the model instance, not the class.
-- `asym_llama4_lce_forward` passes a staged `AsymFrozenLinear` weight into `LigerForCausalLMLoss`.
-- The Llama4 bridge rejects trainable or biased `lm_head`.
-- The generic `install_asym_liger_loss_bridge` dispatches both `qwen3_moe` and `llama4`.
-- Unsupported model types still return `False` with `strict=False`.
+- The Llama4 bridge patches only the model instance, not the class.
+- `llama4_text` causal-LM bridge passes a staged weight to `LigerForCausalLMLoss`.
+- `llama4` conditional-generation bridge does not call `language_model.lm_head(...)` in the training loss path.
+- `llama4` conditional-generation bridge passes `normal_parameter` weight for normal/DeepSpeed and `asym_host_staged` weight for Asym.
+- `_make_liger_shift_labels` preserves `-100` labels and masks out padded positions from `attention_mask`.
+- Trainable or biased `lm_head` is rejected.
+- Unsupported model types return `False` when `strict=False`.
+- `asym_liger_lm_head_bridge_metadata(...)` reports `enabled`, `model_type`, `bridge_kind`, `weight_source`, `lm_head_type`, and `staged_bytes`.
 
 Risks to watch:
-- Some Llama4 HF classes may be wrappers around a nested `language_model`; `_base_causal_lm_model` must locate the actual causal LM with `lm_head`.
-- Do not enable `llama4_text` unless a real LF-loaded config proves that is the correct top-level `model_type`.
-- If a future Llama4 loss implementation adds router auxiliary loss, compare against HF/Liger behavior before adding aux-loss code. The current local Liger Llama4 `lce_forward` does not add an MoE aux loss.
+- If a real LF Llama4 run loads a different wrapper shape than `Llama4ForConditionalGeneration(language_model=Llama4ForCausalLM)`, update `_candidate_language_models` and add a fixture before accepting.
+- The conditional bridge must remain aligned with the repo-local Transformers `Llama4ForConditionalGeneration.forward`. If Transformers changes that forward, diff the function and update the bridge before profiling.
+- `attention_mask` handling must be validated numerically against the unfused HF loss on a small CPU/GPU fixture before running large E2E comparisons.
 
-## Stage 3 - E2E Llama4 Validation
+## Stage 3 - E2E Llama4 Validation on Real Workload
 
 Scope:
-- No new implementation files unless Stage 0 found stale profiling filters.
+- No implementation files should change in this stage unless Stage 0 or Stage 2 validation fails.
 - Use:
   - `scripts/lf/profile_lora_lf.sh`
   - `scripts/lf/compare_liger_loss_profiles.py`
   - generated `source_profile.json`
   - generated `memory_breakdown_summary.json`
-  - generated timing/memory plots.
+  - generated timing and memory plots
 
-Run zero3 first to validate Liger's normal Llama4 path:
+Run zero3 first:
 
 ```bash
 OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/profiling_liger_llama4_zero3 \
 RUN_NAME=llama4_liger_zero3 \
 MODEL_SPECS='meta-llama/Llama-4-Scout-17B-16E|1' \
 BACKEND_SPECS='zero3_offload|recomp|ligerloss0,zero3_offload|recomp|ligerloss1' \
+ASYMM_EXP_ACT_POLICIES='none|true|false|false|false|false' \
 WORKLOADS='8192|2|1' \
 PROFILERS=both GPU_POOL=3 \
 WARMUP_STEPS=5 MAX_STEPS=5 \
@@ -548,13 +710,14 @@ OVERWRITE=true CONTINUE_ON_ERROR=true \
 bash /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh
 ```
 
-Then validate AsymGEMM staging:
+Then run Asym:
 
 ```bash
 OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/profiling_liger_llama4_asym \
 RUN_NAME=llama4_liger_asym \
 MODEL_SPECS='meta-llama/Llama-4-Scout-17B-16E|1' \
 BACKEND_SPECS='asym_cpuadamwds|norecomp|ligerloss0,asym_cpuadamwds|norecomp|ligerloss1' \
+ASYMM_EXP_ACT_POLICIES='none|true|false|false|false|false' \
 WORKLOADS='8192|2|1' \
 PROFILERS=both GPU_POOL=3 \
 WARMUP_STEPS=5 MAX_STEPS=5 \
@@ -563,14 +726,18 @@ OVERWRITE=true CONTINUE_ON_ERROR=true \
 bash /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh
 ```
 
-Use `WORKLOADS='8192|2|1'` as the first real validation workload. If the no-Liger baseline OOMs, record that as an OOM-avoidance result, then rerun both off/on at the largest common workload that completes so latency can still be compared fairly. Do not accept from tiny toy workloads.
+Use `WORKLOADS='8192|2|1'` as the first real validation workload. If the no-Liger baseline OOMs, record that as an OOM-avoidance result, then rerun both off/on at the largest common workload that completes so latency can still be compared fairly. Do not accept from tiny toy profiling.
 
-Compare each pair:
+Compare each off/on pair:
 
 ```bash
-python /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/compare_liger_loss_profiles.py \
-  --baseline /path/to/ligerloss0/run_dir \
-  --candidate /path/to/ligerloss1/run_dir \
+SFT_ROOT=${SFT_ROOT:-/home/kevinni/AsymGEMM-SFT}
+ASYM_DIR=${ASYM_DIR:-${SFT_ROOT}/third_party/AsymGEMM}
+ENV_PYTHON=${ENV_PYTHON:-${ASYM_DIR}/.venv/bin/python}
+
+"${ENV_PYTHON}" "${ASYM_DIR}/scripts/lf/compare_liger_loss_profiles.py" \
+  --baseline /path/to/zero3/ligerloss0/run_dir \
+  --candidate /path/to/zero3/ligerloss1/run_dir \
   --backend zero3_offload \
   --baseline-liger-loss ligerloss0 \
   --candidate-liger-loss ligerloss1 \
@@ -580,9 +747,9 @@ python /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/compare_liger_
   --max-forward-ratio 1.15 \
   --max-backward-ratio 1.15
 
-python /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/compare_liger_loss_profiles.py \
-  --baseline /path/to/ligerloss0/run_dir \
-  --candidate /path/to/ligerloss1/run_dir \
+"${ENV_PYTHON}" "${ASYM_DIR}/scripts/lf/compare_liger_loss_profiles.py" \
+  --baseline /path/to/asym/ligerloss0/run_dir \
+  --candidate /path/to/asym/ligerloss1/run_dir \
   --backend asym_cpuadamwds \
   --baseline-liger-loss ligerloss0 \
   --candidate-liger-loss ligerloss1 \
@@ -594,27 +761,25 @@ python /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/compare_liger_
 ```
 
 Acceptance criteria:
-- `train.log` for Liger-on runs contains `Liger loss-only kernel has been applied.`
-- `source_profile.json["config"]["liger_loss"]` is `ligerloss0` or `ligerloss1` and matches the folder path.
-- zero3 Llama4 Liger-on run completes and reduces peak allocated HBM by at least 10 GiB and reduces lm_head/loss HBM attribution by at least 20 GiB.
-- Asym Llama4 Liger-on run completes and has:
-  - `source_profile.json["config"]["asym_liger_lm_head_bridge"]["enabled"] == true`
-  - `weight_source == "asym_host_staged"`
-  - `lm_head_type == "AsymFrozenLinear"`
-- Mean/median step time does not exceed no-Liger by more than 10%.
+- Run paths contain `__sdparecomp0__` and `__ligerloss0/1__`.
+- `source_profile.json["config"]["liger_loss"]` matches the folder path.
+- `source_profile.json["config"]["asymm_attn_sdpa_recompute"] == "false"`.
+- Liger-on logs contain `Liger loss-only kernel has been applied.`
+- For real `model_type="llama4"` runs, logs also show the post-load Llama4 conditional bridge was installed. A class-level Liger message alone is not sufficient.
+- zero3 Llama4 Liger-on reduces peak allocated HBM by at least 10 GiB and reduces lm_head/loss HBM attribution by at least 20 GiB.
+- Asym Llama4 Liger-on reduces peak allocated HBM by at least 10 GiB and reduces lm_head/loss HBM attribution by at least 20 GiB.
+- Asym Liger-on has `source_profile.json["asym_liger_lm_head_bridge"]["enabled"] == true`.
+- Asym Liger-on bridge metadata has `weight_source == "asym_host_staged"` if `lm_head` is Asym-wrapped.
+- Mean and median step time do not exceed no-Liger by more than 10%.
 - Median forward and backward time do not exceed no-Liger by more than 15%.
-- Losses remain finite and close between off/on runs at the same seed/workload. Small differences are acceptable, but NaNs, large divergence, or systematic loss collapse reject the change.
-- Plots and postprocessed artifacts exist for both `source` and `nsys` materialized outputs under separate `ligerloss0` and `ligerloss1` paths.
+- Losses remain finite and close between off/on runs at the same seed/workload. NaNs, collapse, or large systematic divergence reject the change.
+- Source and Nsight/materialized-source artifacts exist under separate `ligerloss0` and `ligerloss1` paths.
 
-If plots miss the Liger axis:
-- Only then touch `scripts/lf/profile_lora_lf.sh`.
-- The exact functions to inspect are `append_liger_loss_filters`, `plot_single_run`, `plot_running_combined`, `plot_memory_single_run`, `plot_memory_running_combined`, `job_root_path`, and `job_profile_complete`.
-- The fix should be to propagate the existing `liger_loss` argument, not to add another naming convention.
-
-## Final Implementation Checklist
-
-- `../LlamaFactory/src/llamafactory/model/model_utils/liger_kernel.py` allows `model_type == "llama4"` and resolves `apply_liger_kernel_to_llama4`.
-- `asym_gemm/integrations/liger_loss.py` has a Llama4 Asym bridge that stages `lm_head` through `_resolve_liger_lm_head_weight`.
-- `../LlamaFactory/src/llamafactory/model/adapter.py` installs the generic Asym bridge after Asym wrapping for Qwen3-MoE and Llama4.
-- Unit tests cover Qwen3-MoE, Llama4, unsupported model skip, and Asym staged `lm_head`.
-- E2E Llama4 zero3 and Asym comparisons show meaningful HBM reduction without forward/backward or step-time blow-up.
+Final implementation checklist:
+- LF allows `qwen3_moe`, `llama4_text`, and `llama4` through the loss-only gate.
+- LF passes only `fused_linear_cross_entropy=True` to Liger and disables every other bool patch.
+- Llama4 conditional-generation runs have a post-load bridge that bypasses full logits in the training loss path.
+- AsymGEMM runs stage `lm_head` through `_resolve_liger_lm_head_weight`.
+- Normal/DeepSpeed Llama4 conditional runs use the same top-level bridge with `normal_parameter` weight.
+- Profiling commands pin `ASYMM_EXP_ACT_POLICIES='none|true|false|false|false|false'`.
+- E2E zero3 and Asym Llama4 comparisons show meaningful HBM reduction without forward/backward or step-time blow-up.

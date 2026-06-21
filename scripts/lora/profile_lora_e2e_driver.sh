@@ -7,7 +7,8 @@ set -Eeuo pipefail
 # Edit this section for the default run. CLI flags override these values.
 # List defaults use the same comma-separated format accepted by CLI flags.
 
-ROOT=${ROOT:-/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM}
+# AsymGEMM dir = the dir you run in. Override with ROOT=...
+ROOT=${ROOT:-$(pwd)}
 
 GPU_POOL="0,1,3"
 # Per-workload layers can be set as "workload|layers", e.g. "moe-604m-a75m|2".
