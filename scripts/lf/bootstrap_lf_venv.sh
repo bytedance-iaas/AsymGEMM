@@ -10,6 +10,7 @@ ASYMGEMM_DIR=${ASYMGEMM_DIR:-${SFT_ROOT}/third_party/AsymGEMM}
 LF_DIR=${LF_DIR:-${SFT_ROOT}/third_party/LlamaFactory}
 KT_DIR=${KT_DIR:-${SFT_ROOT}/third_party/ktransformers}
 DEEPSPEED_DIR=${DEEPSPEED_DIR:-${SFT_ROOT}/third_party/deepspeed}
+LIGER_DIR=${LIGER_DIR:-${SFT_ROOT}/third_party/Liger-Kernel}
 ENV_DIR=${ENV_DIR:-${ASYMGEMM_DIR}/.venv}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 
@@ -19,6 +20,9 @@ INSTALL_KT=${INSTALL_KT:-1}
 INSTALL_DEEPSPEED=${INSTALL_DEEPSPEED:-1}
 INSTALL_ASYMGEMM=${INSTALL_ASYMGEMM:-0}
 INSTALL_KT_KERNEL=${INSTALL_KT_KERNEL:-0}
+INSTALL_LIGER=${INSTALL_LIGER:-1}
+INSTALL_FLA=${INSTALL_FLA:-1}
+INSTALL_CAUSAL_CONV1D=${INSTALL_CAUSAL_CONV1D:-1}
 TORCH_INSTALL_CMD=${TORCH_INSTALL_CMD:-}
 
 if [[ "${RECREATE_ENV}" == "1" && -d "${ENV_DIR}" ]]; then
@@ -62,6 +66,28 @@ if [[ "${INSTALL_KT_KERNEL}" == "1" ]]; then
   (cd "${KT_DIR}/kt-kernel" && bash ./install.sh build)
 fi
 
+if [[ "${INSTALL_LIGER}" == "1" ]]; then
+  # Liger-Kernel fused Triton kernels. LF's enable_liger_kernel/apply_liger_kernel
+  # path and asym_gemm.integrations.liger_loss both import this, so it is required
+  # for the normal training path. Editable from the local checkout; --no-deps keeps
+  # it from dragging torch/triton/transformers off the versions pinned above.
+  python -m pip install --no-deps -e "${LIGER_DIR}"
+fi
+
+if [[ "${INSTALL_FLA}" == "1" ]]; then
+  # flash-linear-attention (+ fla-core) for linear-/gated-attention model paths.
+  # Pure Triton/Python; transformers is already satisfied by LF above, so only
+  # fla-core gets added.
+  python -m pip install "flash-linear-attention==0.5.0" "fla-core==0.5.0"
+fi
+
+if [[ "${INSTALL_CAUSAL_CONV1D}" == "1" ]]; then
+  # causal-conv1d CUDA kernels for Mamba/hybrid blocks. Build against this venv's
+  # torch instead of an isolated build env. Set INSTALL_CAUSAL_CONV1D=0 if the host
+  # has no matching CUDA build toolchain.
+  python -m pip install --no-build-isolation "causal_conv1d==1.6.2.post1"
+fi
+
 python - <<'PY'
 import sys
 print("python", sys.executable)
@@ -81,6 +107,21 @@ try:
     print("deepspeed", getattr(deepspeed, "__version__", "unknown"))
 except Exception as exc:
     print("deepspeed import failed:", repr(exc))
+try:
+    import liger_kernel
+    print("liger_kernel", getattr(liger_kernel, "__version__", "ok"))
+except Exception as exc:
+    print("liger_kernel import failed:", repr(exc))
+try:
+    import fla
+    print("flash-linear-attention", getattr(fla, "__version__", "unknown"))
+except Exception as exc:
+    print("flash-linear-attention import failed:", repr(exc))
+try:
+    import causal_conv1d
+    print("causal_conv1d", getattr(causal_conv1d, "__version__", "unknown"))
+except Exception as exc:
+    print("causal_conv1d import failed:", repr(exc))
 PY
 
 echo

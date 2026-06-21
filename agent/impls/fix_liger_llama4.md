@@ -14,6 +14,8 @@ Current local facts to keep the implementation grounded:
 - `scripts/lf/profile_lora_lf.sh` now supports six-field activation tuples: `policy|expert_act|attn_act|layer_act[|layer_gc[|sdpa_recompute]]`. Run paths include `__sdparecomp0/1__`, and `ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_SDPA_RECOMPUTE` is exported.
 - The Liger validation runs must pin one six-field `ASYMM_EXP_ACT_POLICIES` tuple. The default script sweep varies activation and SDPA recompute axes, so it is not a clean Liger off/on comparison.
 - `scripts/plotting/plot_activation_recompute_sweep.py` and `scripts/plotting/plot_lf_memory_breakdown.py` parse `sdparecomp`, but the combined plot grouping/labels are not fully split by SDPA everywhere. Pinning the SDPA axis is required unless Stage 0 expands plot grouping.
+- The main `scripts/lf/profile_lora_lf.sh` implementation accepts the six-field tuple today, but some help/README strings still describe the old tuple shape. Stage 0 should correct those strings without changing runtime behavior.
+- `scripts/lf/profile3.sh`, `scripts/lf/profile_lora_lf_test.sh`, and `scripts/lf/profile_lora_lf_test2.sh` are not the Llama4 Liger validation entry points for this plan. Do not mirror their Qwen3.5/test defaults into this doc.
 - `../Liger-Kernel/src/liger_kernel/transformers/monkey_patch.py` maps both `llama4_text` and `llama4` to `apply_liger_kernel_to_llama4(...)`.
 - `apply_liger_kernel_to_llama4(...)` accepts `rope`, `cross_entropy`, `fused_linear_cross_entropy`, `rms_norm`, `swiglu`, `model`, and `layer_norm`.
 - The repo-local Liger Llama4 fused CE forward patches `transformers.models.llama4.modeling_llama4.Llama4ForCausalLM.forward` and calls `LigerForCausalLMLoss(hidden_states=..., lm_head_weight=self.lm_head.weight, ...)`.
@@ -25,6 +27,8 @@ Current local facts to keep the implementation grounded:
 - `../LlamaFactory/src/llamafactory/model/loader.py` applies the LF Liger hook before model construction, then loads the model, then calls `init_adapter(...)`.
 - `../LlamaFactory/src/llamafactory/model/loader.py` selects `AutoModelForImageTextToText` when the config is in that mapping; real Llama4 Scout/Maverick configs should be treated as likely `Llama4ForConditionalGeneration` until the run proves otherwise.
 - `scripts/lf/run_lf_lora_sft.sh` puts `${ASYM_DIR}` and `${LF_DIR}/src` on `PYTHONPATH` for normal and DeepSpeed runs, so the post-load bridge can live in `asym_gemm.integrations.liger_loss` and still be importable during zero3 profiling.
+- `scripts/lf/run_lf_lora_sft.sh` defaults `NUMACTL_MEMBIND=0,1`, `NUMACTL_CPUNODEBIND=0,1`, and `NUMACTL_MODE=membind`. `scripts/lf/profile_lora_lf.sh` currently serializes `NUMACTL_MODE` into the child command; Stage 0 should make `NUMACTL_MEMBIND` and `NUMACTL_CPUNODEBIND` explicit too so command artifacts prove the CPU-node binding.
+- Local DeepSpeed docs describe ZeRO-3 external parameters and automatic external-parameter discovery during forward. Liger's local Llama/Llama4 loss helpers read `lm_head.weight` directly, so zero3 compatibility should be treated as a required validation result, not assumed from code inspection alone.
 
 Install precondition:
 
@@ -106,8 +110,10 @@ Intended code changes:
 - Keep exactly one runtime env var for Liger: `ENABLE_LIGER_KERNEL=true|false`.
 - Keep exactly one sweep axis spelling: `ligerloss0` and `ligerloss1`.
 - Keep `BACKEND_SPECS` format as `backend|recomp|ligerloss0/1`.
-- If the current script help or artifact READMEs omit `sdpa_recompute`, update only those text strings so they match the current six-field tuple and `__sdparecomp0/1__` path axis.
-- Do not touch `scripts/lf/profile3.sh`; it is out of scope for this Llama4 Liger-loss change.
+- In `profile_lora_lf.sh::run_job`, pass `NUMACTL_MEMBIND="${NUMACTL_MEMBIND:-0,1}"` and `NUMACTL_CPUNODEBIND="${NUMACTL_CPUNODEBIND:-0,1}"` next to the existing `NUMACTL_MODE="${NUMACTL_MODE:-membind}"`. This is plumbing only; keep the same defaults in `run_lf_lora_sft.sh`.
+- Update `profile_lora_lf.sh` `usage` and any tuple-format help/error text that still describes `ASYMM_EXP_ACT_POLICIES` as the old four/five-field shape. The exact documented format should be `policy|expert_act|attn_act|layer_act[|layer_gc[|sdpa_recompute]]`.
+- Do not add `sdparecomp` to combined artifact README split lists unless the plotting grouping functions are expanded in the same stage. Without that plot change, README text should be explicit that run directories contain `__sdparecomp0/1__`, while Liger validation pins SDPA because combined grouping is not fully split by it.
+- Do not touch `scripts/lf/profile3.sh`, `scripts/lf/profile_lora_lf_test.sh`, or `scripts/lf/profile_lora_lf_test2.sh`; they are out of scope for this Llama4 Liger-loss validation path.
 
 Validation before moving on:
 
@@ -128,8 +134,9 @@ Pass conditions:
 - Dry-run commands pass `ASYMM_ATTN_SDPA_RECOMPUTE=false` and `ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_SDPA_RECOMPUTE=false`.
 - Run paths and run IDs contain both `__sdparecomp0__` and `__ligerloss0/1__`.
 - `jobs.tsv` header contains `liger_loss`.
+- `profile_lora_lf.sh --help` documents `ASYMM_EXP_ACT_POLICIES` with the optional `sdpa_recompute` field.
 - `PROFILERS=both` shows one Nsight execution path plus a sibling materialized `source` artifact path.
-- `NUMACTL_MEMBIND=0,1` and `NUMACTL_CPUNODEBIND=0,1` are forwarded unchanged.
+- Generated `command.txt` files contain `NUMACTL_MODE=membind`, `NUMACTL_MEMBIND=0,1`, and `NUMACTL_CPUNODEBIND=0,1`.
 
 Risks to watch:
 - If validation uses the default `ASYMM_EXP_ACT_POLICIES`, the result is not a clean Liger comparison because activation offload and SDPA recompute vary too.
@@ -742,6 +749,7 @@ Risks to watch:
 - If a real LF Llama4 run loads a different wrapper shape than `Llama4ForConditionalGeneration(language_model=Llama4ForCausalLM)`, update `_candidate_language_models` and add a fixture before accepting.
 - The conditional bridge must remain aligned with the repo-local Transformers `Llama4ForConditionalGeneration.forward`. If Transformers changes that forward, diff the function and update the bridge before profiling.
 - `attention_mask` handling must be validated numerically against the unfused HF loss on a small CPU/GPU fixture before running large E2E comparisons.
+- If ZeRO-3 Llama4 conditional validation fails because `language_model.lm_head.weight` is still partitioned or wrong-shaped when passed to `LigerForCausalLMLoss`, add a minimal normal-parameter-only path that wraps the fused-loss call in `deepspeed.zero.GatheredParameters(lm_head.weight, fwd_module=<current forward module>)`. Do not apply that path to `AsymFrozenLinear`, which must keep using explicit Asym staging.
 
 ## Stage 3 - E2E Llama4 Validation on Real Workload
 
