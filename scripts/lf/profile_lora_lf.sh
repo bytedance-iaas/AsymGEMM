@@ -23,9 +23,9 @@ RUN_POST=${RUN_POST:-false}
 GPU_POOL=${GPU_POOL:-3}
 # MODEL_SPECS entries are model|num_gpus. Recompute and Liger-loss mode belong only in BACKEND_SPECS.
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
-# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-35B-A3B|1,Qwen/Qwen3.5-122B-A10B|1"}
+MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-35B-A3B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
-MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
+# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1,Qwen/Qwen3.5-122B-A10B|1"}
 ROUTER_MODES=${ROUTER_MODES:-whole}
 # PROFILERS=${PROFILERS:-both}
@@ -46,9 +46,8 @@ BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
 # Paired expert policy / expert activation offload / attention activation offload / layer activation offload / layer GC axis.
 # Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD|ASYMM_LAYER_GC.
 # Example: none|true|true|true|false,none|true|true|false|true.
-# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false,none|true|false|false|false,gc-exp|false|false|false|false,gc-attn-exp|false|false|false|false,none|false|false|false|false"}
-ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|false|false|false|false,none|true|true|false|false|false,none|true|true|false|true|false,none|true|true|false|true|true,none|true|true|true|false|true,gc-exp|false|false|false|false|false,gc-attn-exp|false|false|false|false|false,gc-layer|false|false|false|false|false"}
-# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false"}
+# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|false|false|false|false,none|true|true|false|false|false,none|true|true|false|true|false,none|true|true|false|true|true,none|true|true|true|false|true,gc-exp|false|false|false|false|false,gc-attn-exp|false|false|false|false|false,gc-layer|false|false|false|false|false"}
+ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|true|false|true|false,none|true|true|true|false|false"}
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
 
