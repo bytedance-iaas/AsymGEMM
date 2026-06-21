@@ -22,16 +22,14 @@ RUN_POST=${RUN_POST:-false}
 # Sweep axes
 GPU_POOL=${GPU_POOL:-3}
 # MODEL_SPECS entries are model|num_gpus. Recompute and Liger-loss mode belong only in BACKEND_SPECS.
-MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
-# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-35B-A3B|1"}
-# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
-# MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
-# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
-# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1,Qwen/Qwen3.5-122B-A10B|1"}
+# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-35B-A3B|1,Qwen/Qwen3.5-122B-A10B|1"}
+# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
+MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
+# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1,Qwen/Qwen3.5-122B-A10B|1"}
 ROUTER_MODES=${ROUTER_MODES:-whole}
-PROFILERS=${PROFILERS:-both}
-# PROFILERS=${PROFILERS:-source}
+# PROFILERS=${PROFILERS:-both}
+PROFILERS=${PROFILERS:-source}
 PRECISION=${PRECISION:-bf16}
 # LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
 LORA_DROPOUT=${LORA_DROPOUT:-0.00}
@@ -44,14 +42,12 @@ LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 # Plain asym remains the non-CPUAdam Asym baseline; the default e2e path validates the Asym CPUAdamW backend.
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp"}
 BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp"}
 
 # Paired expert policy / expert activation offload / attention activation offload / layer activation offload / layer GC axis.
 # Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD|ASYMM_LAYER_GC.
 # Example: none|true|true|true|false,none|true|true|false|true.
 # ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false,none|true|false|false|false,gc-exp|false|false|false|false,gc-attn-exp|false|false|false|false,none|false|false|false|false"}
-# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|false|false|false|false,none|true|true|false|false|false,none|true|true|false|true|false,none|true|true|false|true|true,none|true|true|true|false|true,gc-exp|false|false|false|false|false,gc-attn-exp|false|false|false|false|false,gc-layer|false|false|false|false|false"}
-ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|true|false|true|true,none|true|true|true|false|true"}
+ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|false|false|false|false,none|true|true|false|false|false,none|true|true|false|true|false,none|true|true|false|true|true,none|true|true|true|false|true,gc-exp|false|false|false|false|false,gc-attn-exp|false|false|false|false|false,gc-layer|false|false|false|false|false"}
 # ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false"}
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
@@ -73,7 +69,7 @@ ASYM_CPU_ADAMW_FP32_MASTER=${ASYM_CPU_ADAMW_FP32_MASTER:-true}
 
 # Execution
 OVERWRITE=${OVERWRITE:-false}
-CONTINUE_ON_ERROR=${CONTINUE_ON_ERROR:-true}
+CONTINUE_ON_ERROR=${CONTINUE_ON_ERROR:-false}
 DRY_RUN=${DRY_RUN:-false}
 COLLECT_EXISTING=${COLLECT_EXISTING:-false}
 INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
@@ -82,12 +78,11 @@ RUN_NAME=${RUN_NAME:-}
 # Training
 # WORKLOADS entries are seq_len|per_device_train_batch_size|gradient_accumulation_steps.
 # Example: WORKLOADS="2048|3|1,4096|2|1".
-# WORKLOADS="${WORKLOADS:-4096|4|1,8192|4|1,8192|8|1}"
-WORKLOADS="${WORKLOADS:-4096|4|1,8192|4|1,8192|8|1}"
-MAX_STEPS=${MAX_STEPS:-10}
-WARMUP_STEPS=${WARMUP_STEPS:-5}
-# MAX_STEPS=${MAX_STEPS:-1}
-# WARMUP_STEPS=${WARMUP_STEPS:-1}
+WORKLOADS="${WORKLOADS:-2048|2|1}"
+# MAX_STEPS=${MAX_STEPS:-10}
+# WARMUP_STEPS=${WARMUP_STEPS:-5}
+MAX_STEPS=${MAX_STEPS:-1}
+WARMUP_STEPS=${WARMUP_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 LORA_RANK=${LORA_RANK:-64}
 LORA_ALPHA=${LORA_ALPHA:-16}
@@ -595,17 +590,12 @@ is_policy_independent_backend() {
   esac
 }
 
-# Collapse the AsymGEMM-only policy axes (expert policy + expert/attn/layer activation offload + layer GC + lora_a_fwd
-# + act-recompute + x-unpacked) to their canonical inert values for policy-independent backends
-# (torch/zero*/superoffload/kt_*), where those knobs do nothing at runtime. Mutates the caller's
-# dynamically-scoped shadows, so every caller MUST declare expert_policy / ASYMM_*_ACT_OFFLOAD /
-# ASYMM_LAYER_GC / ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD / ASYM_OFFLOAD_ACT_RECOMPUTE / ASYM_OFFLOAD_X_UNPACKED / *_label as
-# `local` first (else the loop globals get clobbered and the folder label diverges from the launched env,
-# e.g. an `actrecomp1` folder that actually ran with ASYM_OFFLOAD_ACT_RECOMPUTE=0). Single source of truth:
-# run_job and the kt_armbf16 source-profile matcher must compute identical folders and expected values.
-canonicalize_policy_axis_for_independent_backend() {
+# Collapse AsymGEMM-only policy axes to inert values when they're no-ops: policy-independent backends or
+# recompute=recomp. Mutates the caller's dynamically-scoped vars, so callers must declare them `local` first.
+canonicalize_policy_axis_for_inert_run() {
   local backend="${1}"
-  is_policy_independent_backend "${backend}" || return 0
+  local recompute="${2:-}"
+  { is_policy_independent_backend "${backend}" || [[ "${recompute}" == "recomp" ]]; } || return 0
   expert_policy=none
   ASYMM_EXPERT_ACT_OFFLOAD=false; expact_label="$(expact_tag false)"
   ASYMM_ATTN_ACT_OFFLOAD=false; attnact_label="$(attnact_tag false)"
@@ -1365,13 +1355,12 @@ kt_arm_resolve_matching_source_profile_json() {
   local liger_loss="$6"
   local seq_len="$7"
   local model_name="$8"
-  # Canonicalize the AsymGEMM-only axes (via local shadows) so the matched source path AND the expected
-  # values agree with what run_job wrote for policy-independent backends.
+  # Canonicalize the policy axes so the matched source path and expected values agree with run_job.
   local source_profile_json
   local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" sdparecomp_label="${sdparecomp_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}"
   local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_LAYER_GC="${ASYMM_LAYER_GC}" ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
   local ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}" ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
-  canonicalize_policy_axis_for_independent_backend "${backend}"
+  canonicalize_policy_axis_for_inert_run "${backend}" "${recompute}"
   while IFS= read -r source_profile_json; do
     existing_profile_complete "${source_profile_json}" "${backend}" "${seq_len}" "${model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${ASYMM_LAYER_GC}" "${lf_expert_lora_impl:-split-target-parameters}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "" "${liger_loss}" || continue
     printf '%s\n' "${source_profile_json}"
@@ -1482,7 +1471,6 @@ memory_combined_plot_cmd_base() {
     --combined-only
     --y-scale "${MEMORY_BREAKDOWN_PLOT_Y_SCALE}"
     --workloads "$@"
-    --expert-recompute-policies "${expert_policies[@]}"
   )
 }
 
@@ -1499,7 +1487,6 @@ interconnect_combined_plot_cmd_base() {
     --clean-output
     --combined-only
     --workloads "$@"
-    --expert-recompute-policies "${expert_policies[@]}"
   )
 }
 
@@ -1580,13 +1567,9 @@ append_fixed_profiler_filter() {
   _cmd_ref+=(--profiler "${profiler}")
 }
 
+# Combined plots include every config present on disk; only the profiler dedup filter is applied.
 append_sweep_plot_filters() {
-  append_backend_filters "$1"
   append_plot_profiler_filters "$1"
-  append_recompute_filters "$1"
-  append_liger_loss_filters "$1"
-  append_router_mode_filters "$1"
-  append_activation_axis_filters "$1"
 }
 
 append_running_sweep_plot_filters() {
@@ -1598,12 +1581,9 @@ append_running_sweep_plot_filters() {
   append_current_activation_axis_filters "$1"
 }
 
+# Memory combined: source profiler only (dedups the nsys/source pair); no config narrowing.
 memory_plot_filters() {
-  append_backend_filters "$1"
   append_fixed_profiler_filter "$1" source
-  append_liger_loss_filters "$1"
-  append_router_mode_filters "$1"
-  append_activation_axis_filters "$1"
 }
 
 memory_running_plot_filters() {
@@ -1614,13 +1594,9 @@ memory_running_plot_filters() {
   append_current_activation_axis_filters "$1"
 }
 
+# C2C combined: nsys profiler only (C2C metrics exist only in nsys runs); no config narrowing.
 interconnect_plot_filters() {
-  append_backend_filters "$1"
   append_fixed_profiler_filter "$1" nsys
-  append_recompute_filters "$1"
-  append_liger_loss_filters "$1"
-  append_router_mode_filters "$1"
-  append_activation_axis_filters "$1"
 }
 
 profiler_selected_for_plots() {
@@ -2369,12 +2345,11 @@ run_job() {
   local lf_expert_lora_impl="${11}"
   local grad_offload="${12:-false}"
   local weight_offload="${13:-false}"
-  # Canonicalize the AsymGEMM-only axes for policy-independent backends (see the helper). Local shadows feed
-  # run_id, the folder (job_root_path is dynamic-scoped), the env block, and the completeness check.
+  # Canonicalize the policy axes for inert runs; local shadows feed run_id, the folder, the env, and the check.
   local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" sdparecomp_label="${sdparecomp_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}"
   local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_LAYER_GC="${ASYMM_LAYER_GC}" ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
   local ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}" ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
-  canonicalize_policy_axis_for_independent_backend "${backend}"
+  canonicalize_policy_axis_for_inert_run "${backend}" "${recompute}"
   if [[ "${profiler}" == "both" ]]; then
     run_profiler=nsys
     materialize_source_from_nsys=true
@@ -2797,7 +2772,8 @@ plot_config_root() {
   [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")/combined"
   local -a plot_cmd
   plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
-  plot_cmd+=(--expert-recompute-policies "${expert_policies[@]}")
+  # Cross-config comparison only; per-config sweep plots already live in each leaf's plots/ dir.
+  plot_cmd+=(--combined-only)
   append_sweep_plot_filters plot_cmd
   echo "Writing LF config combined plots: ${plot_root}"
   run_tracked_command "${plot_cmd[@]}"
@@ -3017,7 +2993,7 @@ timing_precision_combined_cmd() {
   shift 2
 
   plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${output_dir}" "${workloads[@]}"
-  _cmd_ref+=(--combined-only --expert-recompute-policies "${expert_policies[@]}")
+  _cmd_ref+=(--combined-only)
   _cmd_ref+=("$@")
 }
 
@@ -3203,12 +3179,6 @@ for model_spec_entry in "${model_specs[@]}"; do
             for backend_recompute in "${backend_specs[@]}"; do
               IFS='|' read -r backend recompute liger_loss backend_spec_extra <<< "${backend_recompute}"
               [[ -n "${backend}" && -n "${recompute}" && -n "${liger_loss}" && -z "${backend_spec_extra:-}" ]] || die "internal error: malformed normalized backend spec '${backend_recompute}'"
-              if ! is_policy_independent_backend "${backend}" && [[ "${recompute}" == "recomp" && ( "${expert_policy}" == "gc-exp" || "${expert_policy}" == "gc-attn-exp" || "${expert_policy}" == "gc-layer" ) && "$(bool_value "${ASYMM_ALLOW_SELECTIVE_GC_WITH_GLOBAL_RECOMP:-false}")" != "true" ]]; then
-                die "expert_policy=${expert_policy} is selective GC and must use backend recompute=norecomp; global recomp would checkpoint more than the selected modules"
-              fi
-              if ! is_policy_independent_backend "${backend}" && [[ "${recompute}" == "recomp" && ( "${ASYMM_EXPERT_ACT_OFFLOAD}" == "true" || "${ASYMM_ATTN_ACT_OFFLOAD}" == "true" || "${ASYMM_LAYER_ACT_OFFLOAD}" == "true" || "${ASYMM_LAYER_GC}" == "true" ) ]]; then
-                die "activation offload tuples and layer GC tuples must use backend recompute=norecomp; global recomp would mix offload and checkpointing"
-              fi
               for profiler in "${profilers[@]}"; do
                 profiler_runs_nsys=false
                 [[ "${profiler}" == "nsys" || "${profiler}" == "both" ]] && profiler_runs_nsys=true
@@ -3225,8 +3195,8 @@ for model_spec_entry in "${model_specs[@]}"; do
                     continue
                   fi
                 fi
-                if is_policy_independent_backend "${backend}" && [[ "${exp_act_policy_pair}" != "${exp_act_policy_pairs[0]}" ]]; then
-                  echo "Skipping backend=${backend} policy=${exp_act_policy_pair}; policy-independent backends run once (canonicalized to none|false|false|false|false)."
+                if { is_policy_independent_backend "${backend}" || [[ "${recompute}" == "recomp" ]]; } && [[ "${exp_act_policy_pair}" != "${exp_act_policy_pairs[0]}" ]]; then
+                  echo "Skipping backend=${backend} recompute=${recompute} policy=${exp_act_policy_pair}; inert policy axes run once (canonicalized to none|false|false|false|false)."
                   continue
                 fi
                 if [[ "${backend}" == "kt_armbf16" && "${profiler_runs_nsys}" == "true" ]]; then

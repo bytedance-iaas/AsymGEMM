@@ -23,6 +23,14 @@ INSTALL_KT_KERNEL=${INSTALL_KT_KERNEL:-0}
 INSTALL_LIGER=${INSTALL_LIGER:-1}
 INSTALL_FLA=${INSTALL_FLA:-1}
 INSTALL_CAUSAL_CONV1D=${INSTALL_CAUSAL_CONV1D:-1}
+
+# Torch stack, pinned to the known-good venv (torch 2.12.0 built against CUDA 13.0).
+# Override any var to retarget CUDA/versions. A non-empty TORCH_INSTALL_CMD wins
+# over the pinned default below (e.g. an air-gapped wheel dir or another channel).
+TORCH_VERSION=${TORCH_VERSION:-2.12.0+cu130}
+TORCHVISION_VERSION=${TORCHVISION_VERSION:-0.27.0}
+TORCHAUDIO_VERSION=${TORCHAUDIO_VERSION:-2.11.0}
+TORCH_INDEX_URL=${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu130}
 TORCH_INSTALL_CMD=${TORCH_INSTALL_CMD:-}
 
 if [[ "${RECREATE_ENV}" == "1" && -d "${ENV_DIR}" ]]; then
@@ -39,6 +47,16 @@ python -m pip install -U pip "setuptools<82" wheel packaging ninja
 
 if [[ -n "${TORCH_INSTALL_CMD}" ]]; then
   bash -lc "${TORCH_INSTALL_CMD}"
+else
+  # Default: pinned torch/vision/audio from the CUDA 13.0 wheel index, installed
+  # before LF so its resolver treats torch as already satisfied and won't swap it.
+  # If torch 2.12.0 has moved off the stable channel, point TORCH_INDEX_URL at
+  # https://download.pytorch.org/whl/test/cu130 (or the nightly channel) instead.
+  python -m pip install \
+    "torch==${TORCH_VERSION}" \
+    "torchvision==${TORCHVISION_VERSION}" \
+    "torchaudio==${TORCHAUDIO_VERSION}" \
+    --index-url "${TORCH_INDEX_URL}"
 fi
 
 if [[ "${INSTALL_LF}" == "1" ]]; then

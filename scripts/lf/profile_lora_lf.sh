@@ -590,17 +590,12 @@ is_policy_independent_backend() {
   esac
 }
 
-# Collapse the AsymGEMM-only policy axes (expert policy + expert/attn/layer activation offload + layer GC + lora_a_fwd
-# + act-recompute + x-unpacked) to their canonical inert values for policy-independent backends
-# (torch/zero*/superoffload/kt_*), where those knobs do nothing at runtime. Mutates the caller's
-# dynamically-scoped shadows, so every caller MUST declare expert_policy / ASYMM_*_ACT_OFFLOAD /
-# ASYMM_LAYER_GC / ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD / ASYM_OFFLOAD_ACT_RECOMPUTE / ASYM_OFFLOAD_X_UNPACKED / *_label as
-# `local` first (else the loop globals get clobbered and the folder label diverges from the launched env,
-# e.g. an `actrecomp1` folder that actually ran with ASYM_OFFLOAD_ACT_RECOMPUTE=0). Single source of truth:
-# run_job and the kt_armbf16 source-profile matcher must compute identical folders and expected values.
-canonicalize_policy_axis_for_independent_backend() {
+# Collapse AsymGEMM-only policy axes to inert values when they're no-ops: policy-independent backends or
+# recompute=recomp. Mutates the caller's dynamically-scoped vars, so callers must declare them `local` first.
+canonicalize_policy_axis_for_inert_run() {
   local backend="${1}"
-  is_policy_independent_backend "${backend}" || return 0
+  local recompute="${2:-}"
+  { is_policy_independent_backend "${backend}" || [[ "${recompute}" == "recomp" ]]; } || return 0
   expert_policy=none
   ASYMM_EXPERT_ACT_OFFLOAD=false; expact_label="$(expact_tag false)"
   ASYMM_ATTN_ACT_OFFLOAD=false; attnact_label="$(attnact_tag false)"
@@ -1360,13 +1355,12 @@ kt_arm_resolve_matching_source_profile_json() {
   local liger_loss="$6"
   local seq_len="$7"
   local model_name="$8"
-  # Canonicalize the AsymGEMM-only axes (via local shadows) so the matched source path AND the expected
-  # values agree with what run_job wrote for policy-independent backends.
+  # Canonicalize the policy axes so the matched source path and expected values agree with run_job.
   local source_profile_json
   local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" sdparecomp_label="${sdparecomp_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}"
   local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_LAYER_GC="${ASYMM_LAYER_GC}" ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
   local ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}" ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
-  canonicalize_policy_axis_for_independent_backend "${backend}"
+  canonicalize_policy_axis_for_inert_run "${backend}" "${recompute}"
   while IFS= read -r source_profile_json; do
     existing_profile_complete "${source_profile_json}" "${backend}" "${seq_len}" "${model_name}" "all" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${ASYMM_LAYER_GC}" "${lf_expert_lora_impl:-split-target-parameters}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "" "${liger_loss}" || continue
     printf '%s\n' "${source_profile_json}"
@@ -2351,12 +2345,11 @@ run_job() {
   local lf_expert_lora_impl="${11}"
   local grad_offload="${12:-false}"
   local weight_offload="${13:-false}"
-  # Canonicalize the AsymGEMM-only axes for policy-independent backends (see the helper). Local shadows feed
-  # run_id, the folder (job_root_path is dynamic-scoped), the env block, and the completeness check.
+  # Canonicalize the policy axes for inert runs; local shadows feed run_id, the folder, the env, and the check.
   local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" sdparecomp_label="${sdparecomp_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}"
   local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_LAYER_GC="${ASYMM_LAYER_GC}" ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
   local ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}" ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
-  canonicalize_policy_axis_for_independent_backend "${backend}"
+  canonicalize_policy_axis_for_inert_run "${backend}" "${recompute}"
   if [[ "${profiler}" == "both" ]]; then
     run_profiler=nsys
     materialize_source_from_nsys=true
@@ -3186,12 +3179,6 @@ for model_spec_entry in "${model_specs[@]}"; do
             for backend_recompute in "${backend_specs[@]}"; do
               IFS='|' read -r backend recompute liger_loss backend_spec_extra <<< "${backend_recompute}"
               [[ -n "${backend}" && -n "${recompute}" && -n "${liger_loss}" && -z "${backend_spec_extra:-}" ]] || die "internal error: malformed normalized backend spec '${backend_recompute}'"
-              if ! is_policy_independent_backend "${backend}" && [[ "${recompute}" == "recomp" && ( "${expert_policy}" == "gc-exp" || "${expert_policy}" == "gc-attn-exp" || "${expert_policy}" == "gc-layer" ) && "$(bool_value "${ASYMM_ALLOW_SELECTIVE_GC_WITH_GLOBAL_RECOMP:-false}")" != "true" ]]; then
-                die "expert_policy=${expert_policy} is selective GC and must use backend recompute=norecomp; global recomp would checkpoint more than the selected modules"
-              fi
-              if ! is_policy_independent_backend "${backend}" && [[ "${recompute}" == "recomp" && ( "${ASYMM_EXPERT_ACT_OFFLOAD}" == "true" || "${ASYMM_ATTN_ACT_OFFLOAD}" == "true" || "${ASYMM_LAYER_ACT_OFFLOAD}" == "true" || "${ASYMM_LAYER_GC}" == "true" ) ]]; then
-                die "activation offload tuples and layer GC tuples must use backend recompute=norecomp; global recomp would mix offload and checkpointing"
-              fi
               for profiler in "${profilers[@]}"; do
                 profiler_runs_nsys=false
                 [[ "${profiler}" == "nsys" || "${profiler}" == "both" ]] && profiler_runs_nsys=true
@@ -3208,8 +3195,8 @@ for model_spec_entry in "${model_specs[@]}"; do
                     continue
                   fi
                 fi
-                if is_policy_independent_backend "${backend}" && [[ "${exp_act_policy_pair}" != "${exp_act_policy_pairs[0]}" ]]; then
-                  echo "Skipping backend=${backend} policy=${exp_act_policy_pair}; policy-independent backends run once (canonicalized to none|false|false|false|false)."
+                if { is_policy_independent_backend "${backend}" || [[ "${recompute}" == "recomp" ]]; } && [[ "${exp_act_policy_pair}" != "${exp_act_policy_pairs[0]}" ]]; then
+                  echo "Skipping backend=${backend} recompute=${recompute} policy=${exp_act_policy_pair}; inert policy axes run once (canonicalized to none|false|false|false|false)."
                   continue
                 fi
                 if [[ "${backend}" == "kt_armbf16" && "${profiler_runs_nsys}" == "true" ]]; then
