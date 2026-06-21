@@ -29,12 +29,14 @@ Current local facts to keep the implementation grounded:
 - `scripts/lf/run_lf_lora_sft.sh` puts `${ASYM_DIR}` and `${LF_DIR}/src` on `PYTHONPATH` for normal and DeepSpeed runs, so the post-load bridge can live in `asym_gemm.integrations.liger_loss` and still be importable during zero3 profiling.
 - `scripts/lf/run_lf_lora_sft.sh` defaults `NUMACTL_MEMBIND=0,1`, `NUMACTL_CPUNODEBIND=0,1`, and `NUMACTL_MODE=membind`. `scripts/lf/profile_lora_lf.sh` currently serializes `NUMACTL_MODE` into the child command; Stage 0 should make `NUMACTL_MEMBIND` and `NUMACTL_CPUNODEBIND` explicit too so command artifacts prove the CPU-node binding.
 - Local DeepSpeed docs describe ZeRO-3 external parameters and automatic external-parameter discovery during forward. Liger's local Llama/Llama4 loss helpers read `lm_head.weight` directly, so zero3 compatibility should be treated as a required validation result, not assumed from code inspection alone.
+- `ASYM_OFFLOAD_MODULES` defaults to `all`, which includes `lm_head`, so the Asym Liger-on run reaches `weight_source=asym_host_staged` with no extra pin. But `_reject_tied_lm_head_offload` (`asym_gemm/integrations/lf.py`) raises under `ASYM_STRICT=true` when `lm_head` is tied to embeddings; confirm Llama-4 Scout's `tie_word_embeddings` (text vocab 202048) or drop `lm_head` from offload before the Asym run.
+- The `ligerloss0/1` arms inherit single-valued `profile_lora_lf.sh` defaults that are not otherwise pinned: `PRECISION=bf16`, `SEED=42`, `DATASET=asym_long_sft_smoke`, `LORA_RANK=64`, `LORA_ALPHA=16`, `LEARNING_RATE=1e-4`, `MAX_SAMPLES=64`, `ROUTER_MODES=whole`, `ASYM_CPU_ADAMW_GRAD_OFFLOAD=true`, `ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true`. They do not confound the off/on comparison (both arms share them) but must stay identical across arms and are recorded in `source_profile.json["config"]` for reproducibility.
 
 Install precondition:
 
 ```bash
-SFT_ROOT=${SFT_ROOT:-/home/kevinni/AsymGEMM-SFT}
-ASYM_DIR=${ASYM_DIR:-${SFT_ROOT}/third_party/AsymGEMM}
+ASYM_DIR=${ASYM_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")}
+SFT_ROOT=${SFT_ROOT:-$(cd "${ASYM_DIR}/../.." && pwd)}
 ENV_PYTHON=${ENV_PYTHON:-${ASYM_DIR}/.venv/bin/python}
 
 "${ENV_PYTHON}" -m pip install -e "${SFT_ROOT}/third_party/Liger-Kernel"
@@ -118,6 +120,8 @@ Intended code changes:
 Validation before moving on:
 
 ```bash
+ASYM_DIR=${ASYM_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")}
+
 DRY_RUN=true \
 MODEL_SPECS='meta-llama/Llama-4-Scout-17B-16E|1' \
 BACKEND_SPECS='zero3_offload|recomp|ligerloss0,zero3_offload|recomp|ligerloss1,asym_cpuadamwds|norecomp|ligerloss0,asym_cpuadamwds|norecomp|ligerloss1' \
@@ -125,7 +129,7 @@ ASYMM_EXP_ACT_POLICIES='none|true|false|false|false|false' \
 WORKLOADS='8192|2|1' \
 PROFILERS=both GPU_POOL=3 \
 NUMACTL_MEMBIND=0,1 NUMACTL_CPUNODEBIND=0,1 NUMACTL_MODE=membind \
-bash /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh
+bash "${ASYM_DIR}/scripts/lf/profile_lora_lf.sh"
 ```
 
 Pass conditions:
@@ -271,8 +275,8 @@ def test_local_liger_llama4_signature_and_dispatch_are_supported():
 Validation before moving on:
 
 ```bash
-SFT_ROOT=${SFT_ROOT:-/home/kevinni/AsymGEMM-SFT}
-ASYM_DIR=${ASYM_DIR:-${SFT_ROOT}/third_party/AsymGEMM}
+ASYM_DIR=${ASYM_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")}
+SFT_ROOT=${SFT_ROOT:-$(cd "${ASYM_DIR}/../.." && pwd)}
 ENV_PYTHON=${ENV_PYTHON:-${ASYM_DIR}/.venv/bin/python}
 
 "${ENV_PYTHON}" -m pytest -q tests/lf/test_liger_loss_only_qwen3_moe.py
@@ -724,8 +728,8 @@ Patch order:
 Validation before moving on:
 
 ```bash
-SFT_ROOT=${SFT_ROOT:-/home/kevinni/AsymGEMM-SFT}
-ASYM_DIR=${ASYM_DIR:-${SFT_ROOT}/third_party/AsymGEMM}
+ASYM_DIR=${ASYM_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")}
+SFT_ROOT=${SFT_ROOT:-$(cd "${ASYM_DIR}/../.." && pwd)}
 ENV_PYTHON=${ENV_PYTHON:-${ASYM_DIR}/.venv/bin/python}
 
 "${ENV_PYTHON}" -m pytest -q tests/lf/test_asym_liger_lm_head_bridge.py
@@ -765,7 +769,9 @@ Scope:
 Run zero3 first:
 
 ```bash
-OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/profiling_liger_llama4_zero3 \
+ASYM_DIR=${ASYM_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")}
+
+OUTPUT_ROOT="${ASYM_DIR}/profiling_liger_llama4_zero3" \
 RUN_NAME=llama4_liger_zero3 \
 MODEL_SPECS='meta-llama/Llama-4-Scout-17B-16E|1' \
 BACKEND_SPECS='zero3_offload|recomp|ligerloss0,zero3_offload|recomp|ligerloss1' \
@@ -775,13 +781,15 @@ PROFILERS=both GPU_POOL=3 \
 WARMUP_STEPS=5 MAX_STEPS=5 \
 NUMACTL_MEMBIND=0,1 NUMACTL_CPUNODEBIND=0,1 NUMACTL_MODE=membind \
 OVERWRITE=true CONTINUE_ON_ERROR=true \
-bash /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh
+bash "${ASYM_DIR}/scripts/lf/profile_lora_lf.sh"
 ```
 
 Then run Asym:
 
 ```bash
-OUTPUT_ROOT=/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/profiling_liger_llama4_asym \
+ASYM_DIR=${ASYM_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")}
+
+OUTPUT_ROOT="${ASYM_DIR}/profiling_liger_llama4_asym" \
 RUN_NAME=llama4_liger_asym \
 MODEL_SPECS='meta-llama/Llama-4-Scout-17B-16E|1' \
 BACKEND_SPECS='asym_cpuadamwds|norecomp|ligerloss0,asym_cpuadamwds|norecomp|ligerloss1' \
@@ -791,7 +799,7 @@ PROFILERS=both GPU_POOL=3 \
 WARMUP_STEPS=5 MAX_STEPS=5 \
 NUMACTL_MEMBIND=0,1 NUMACTL_CPUNODEBIND=0,1 NUMACTL_MODE=membind \
 OVERWRITE=true CONTINUE_ON_ERROR=true \
-bash /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/scripts/lf/profile_lora_lf.sh
+bash "${ASYM_DIR}/scripts/lf/profile_lora_lf.sh"
 ```
 
 Use `WORKLOADS='8192|2|1'` as the first real validation workload. If the no-Liger baseline OOMs, record that as an OOM-avoidance result, then rerun both off/on at the largest common workload that completes so latency can still be compared fairly. Do not accept from tiny toy profiling.
@@ -799,8 +807,8 @@ Use `WORKLOADS='8192|2|1'` as the first real validation workload. If the no-Lige
 Compare each off/on pair:
 
 ```bash
-SFT_ROOT=${SFT_ROOT:-/home/kevinni/AsymGEMM-SFT}
-ASYM_DIR=${ASYM_DIR:-${SFT_ROOT}/third_party/AsymGEMM}
+ASYM_DIR=${ASYM_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")}
+SFT_ROOT=${SFT_ROOT:-$(cd "${ASYM_DIR}/../.." && pwd)}
 ENV_PYTHON=${ENV_PYTHON:-${ASYM_DIR}/.venv/bin/python}
 
 "${ENV_PYTHON}" "${ASYM_DIR}/scripts/lf/compare_liger_loss_profiles.py" \
