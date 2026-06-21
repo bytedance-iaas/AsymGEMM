@@ -43,15 +43,16 @@ LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp,superoffload|recomp,asym|recomp,kt_armbf16|recomp"}
 # Plain asym remains the non-CPUAdam Asym baseline; the default e2e path validates the Asym CPUAdamW backend.
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp"}
-BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
+BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp"}
 
 # Paired expert policy / expert activation offload / attention activation offload / layer activation offload / layer GC axis.
 # Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD|ASYMM_LAYER_GC.
 # Example: none|true|true|true|false,none|true|true|false|true.
 # ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false,none|true|false|false|false,gc-exp|false|false|false|false,gc-attn-exp|false|false|false|false,none|false|false|false|false"}
 # ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|false|false|false|false,none|true|true|false|false|false,none|true|true|false|true|false,none|true|true|false|true|true,none|true|true|true|false|true,gc-exp|false|false|false|false|false,gc-attn-exp|false|false|false|false|false,gc-layer|false|false|false|false|false"}
-ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|true|false|true|true,none|true|true|true|false|true"}
-# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false"}
+# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|true|false|true|true,none|true|true|true|false|true"}
+ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false"}
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
 
@@ -82,6 +83,7 @@ RUN_NAME=${RUN_NAME:-}
 # WORKLOADS entries are seq_len|per_device_train_batch_size|gradient_accumulation_steps.
 # Example: WORKLOADS="2048|3|1,4096|2|1".
 # WORKLOADS="${WORKLOADS:-4096|4|1,8192|4|1,8192|8|1}"
+# WORKLOADS="${WORKLOADS:-8192|8|1}"
 WORKLOADS="${WORKLOADS:-4096|4|1}"
 MAX_STEPS=${MAX_STEPS:-10}
 WARMUP_STEPS=${WARMUP_STEPS:-5}

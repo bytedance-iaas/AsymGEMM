@@ -104,6 +104,7 @@ def collect_leaves(root: Path) -> dict:
                     S._tok(toks, "layeract", "0") == "1",
                     S._tok(toks, "layergc", "0") == "1",
                 )
+                config = config.replace("layer-offload", "layerOF")  # compact label
                 # Compact liger / sdpa-recompute usage tag (replaces config_label's long
                 # "+SDPArecomp"): [lg± sd±], + on / - off.
                 liger_on = S._tok(toks, "ligerloss", "0") == "1"
@@ -137,7 +138,14 @@ HEAD = ["Model", "Workload", "Backend", "Config",
         "fwd_s", "bwd_s", "opt_s", "step_s",
         "fwd_H", "bwd_H", "step_H", "RAM"]
 NUM_KEYS = ["fwd_s", "bwd_s", "opt_s", "step_s", "fwd_g", "bwd_g", "step_g", "ram_g"]
-CFG_RANK = {c: i for i, c in enumerate(S.CONFIG_ORDER)}
+# Start from the shared semantic order, then slot the layer-offload family (renamed
+# "layerOF") right after its exp+attn+layerGC sibling so the "none+exp+attn..." configs
+# stay adjacent instead of the unranked layerOF falling to the end of the backend group.
+_CFG_ORDER = list(S.CONFIG_ORDER)
+_anchor = "none+exp+attn-offload+layerGC"
+if _anchor in _CFG_ORDER:
+    _CFG_ORDER.insert(_CFG_ORDER.index(_anchor) + 1, "none+exp+attn+layerOF")
+CFG_RANK = {c: i for i, c in enumerate(_CFG_ORDER)}
 MARKER = {  # shown (in the first metric column) for configs with no metrics
     "OOM (GPU)": "🔴", "OOM (host RAM)": "🟠", "FAILED (non-OOM)": "⚠️",
     "RUNNING": "🔵", "INCOMPLETE": "·", "NOT RUN": "—",
@@ -188,8 +196,12 @@ def main() -> None:
         just = lambda i, s: s.ljust(w[i]) if i < 4 else s.rjust(w[i])  # text left, numbers right
         print("  ".join(just(i, HEAD[i]) for i in range(len(HEAD))))
         print("  ".join("-" * w[i] for i in range(len(HEAD))))
+        prev_wl = None
         for d in data:
+            if prev_wl is not None and d[1] != prev_wl:  # heavier rule between workloads
+                print("  ".join("=" * w[i] for i in range(len(HEAD))))
             print("  ".join(just(i, d[i]) for i in range(len(HEAD))))
+            prev_wl = d[1]
         print()
 
 
