@@ -571,7 +571,7 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
     layer_gc_enabled = os.environ.get("ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED")
     if layer_gc_enabled is None:
         layer_gc_enabled = "true" if expert_policy.label == "gc-layer" else "false"
-    is_superoffload_backend = backend == "superoffload"
+    is_superoffload_backend = backend in {"superoffload", "superoffload_mem"}
     is_cpuadam_backend = backend == "zero3_cpuadam"
     is_asym_deepspeed_cpuadamw = backend == "asym_cpuadamwds" or (
         str(env_config.get("use_asym_cpu_adamw", "")).lower() == "true"
@@ -584,6 +584,7 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "zero3_offload_mem",
         "zero3_cpuadam",
         "superoffload",
+        "superoffload_mem",
     }
     config = {
         "workflow": "lora_lf_sft",
@@ -981,7 +982,7 @@ def _kt_counters_from_model(config: dict[str, Any] | None = None) -> dict[str, A
 
 
 def _superoffload_summary_from_config(config: dict[str, Any]) -> dict[str, Any]:
-    is_superoffload_backend = str(config.get("backend") or "").lower() == "superoffload"
+    is_superoffload_backend = str(config.get("backend") or "").lower() in {"superoffload", "superoffload_mem"}
     config_path = str(config.get("superoffload_config") or "") if is_superoffload_backend else ""
     config_super_offload = False
     cpuadam_cores_perc = None
@@ -1164,7 +1165,7 @@ def _should_install_deepspeed_hook(args: list[str], config: dict[str, Any]) -> b
     if _option_value(args, "--deepspeed"):
         return True
     backend = str(config.get("backend") or "").lower()
-    if backend in {"zero2", "zero3", "zero3_offload", "zero3_offload_mem", "zero3_cpuadam", "superoffload"}:
+    if backend in {"zero2", "zero3", "zero3_offload", "zero3_offload_mem", "zero3_cpuadam", "superoffload", "superoffload_mem"}:
         return True
     return bool(config.get("superoffload_config") or config.get("cpuadam_config") or config.get("deepspeed_config"))
 

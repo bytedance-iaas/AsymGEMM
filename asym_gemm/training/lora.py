@@ -386,15 +386,23 @@ class AsymLoRALinear(nn.Module):
             coordinator.release_group(getattr(self, "_weight_offload_owner", self))
 
     def _uses_lora_weight_offload(self) -> bool:
-        return (
-            getattr(self, "_weight_offload", None) is not None
-            and self.training
-            and torch.is_grad_enabled()
-        )
+        # NOTE: do not gate on torch.is_grad_enabled(). A checkpoint recompute runs the forward
+        # under no_grad (inside an autograd.Function or reentrant checkpoint); the non-offload
+        # path then hits the 0-numel at-rest LoRA weights ("vec (0)" size mismatch). The offload
+        # path stages the weights itself (see forward: gather_lora_weights before apply), so it is
+        # the correct path whenever weight offload is configured and we're training.
+        return getattr(self, "_weight_offload", None) is not None and self.training
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base = self.base_layer(x)
         if self._uses_lora_weight_offload():
+            # Stage the LoRA bank BEFORE apply() captures self.lora_a/self.lora_b, so the
+            # differentiable inputs are the full [r, k]/[n, r] weights, not the 0-numel
+            # at-rest placeholders. Without this, a checkpoint recompute pass (gradient
+            # checkpointing / sdpa-recompute) captures [0]-shaped inputs and backward returns
+            # full-shaped grads -> "invalid gradient ... expected shape compatible with [0]". gather_group
+            # is idempotent (no-op if already staged), so the normal path is unchanged.
+            self.gather_lora_weights()
             lora = _AsymLoRALinearWeightOffloadFunction.apply(x, self.lora_a, self.lora_b, self)
             return base + lora.to(dtype=base.dtype)
         lora_input = self.lora_dropout(x).to(dtype=self.lora_dtype)

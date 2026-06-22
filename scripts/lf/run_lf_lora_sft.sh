@@ -25,7 +25,7 @@ DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun} # torchrun | accelerate | deepspeed
 
 # Workload and placement
 MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-Qwen/Qwen3-30B-A3B}
-BACKEND=${BACKEND:-asym}              # torch | zero2 | zero3 | zero3_offload | zero3_offload_mem | zero3_cpuadam | superoffload | asym_torch | asym | kt_torchbf16 | kt_armbf16
+BACKEND=${BACKEND:-asym}              # torch | zero2 | zero3 | zero3_offload | zero3_offload_mem | zero3_cpuadam | superoffload | superoffload_mem | asym_torch | asym | kt_torchbf16 | kt_armbf16
 GPU_ID=${GPU_ID:-0}
 NUM_GPUS=${NUM_GPUS:-1}
 NUMACTL_ENABLE=${NUMACTL_ENABLE:-1}
@@ -197,6 +197,7 @@ zero_deepspeed_config() {
     zero3_offload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_config.json" ;;
     zero3_cpuadam) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_cpuadam_config.json" ;;
     superoffload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_config.json" ;;
+    superoffload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_config.json" ;;
     *) return 1 ;;
   esac
 }
@@ -242,6 +243,12 @@ case "${BACKEND,,}" in
     BACKEND=torch
     TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config superoffload)"
     ;;
+  superoffload_mem)
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-superoffload_mem}
+    ZERO_BACKEND_LABEL=superoffload_mem
+    BACKEND=torch
+    TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config superoffload_mem)"
+    ;;
   asym_cpuadamwtorch)
     PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-asym_cpuadamwtorch}
     USE_ASYM_CPU_ADAMW=true
@@ -266,7 +273,7 @@ case "${BACKEND,,}" in
     BACKEND=kt_armbf16
     KT_BACKEND_INTERNAL=ARMBF16
     ;;
-  *) echo "BACKEND must be one of: torch, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_cpuadam, superoffload, asym_cpuadamwtorch, asym_cpuadamwds, asym_torch, asym, kt_torchbf16, kt_armbf16; got '${BACKEND}'" >&2; exit 2 ;;
+  *) echo "BACKEND must be one of: torch, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_cpuadam, superoffload, superoffload_mem, asym_cpuadamwtorch, asym_cpuadamwds, asym_torch, asym, kt_torchbf16, kt_armbf16; got '${BACKEND}'" >&2; exit 2 ;;
 esac
 
 case "${DIST_LAUNCHER,,}" in
@@ -506,7 +513,7 @@ is_zero_backend_run() {
 }
 
 is_superoffload_zero_run() {
-  [[ "${ZERO_BACKEND_LABEL}" == "superoffload" ]]
+  [[ "${ZERO_BACKEND_LABEL}" == "superoffload" || "${ZERO_BACKEND_LABEL}" == "superoffload_mem" ]]
 }
 
 is_cpuadam_zero_run() {

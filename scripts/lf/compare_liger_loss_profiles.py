@@ -175,8 +175,12 @@ def load_memory_metrics(run_dir: Path) -> tuple[int, int, dict[str, str]]:
             continue
         lm_head_loss += value
         matched_rows += 1
-    if matched_rows == 0 or lm_head_loss <= 0:
-        raise ValueError(f"{path} has no GPU HBM rows attributed to lm_head or loss")
+    # Breakdown rows are present (guarded above). Zero GPU rows attributed to
+    # lm_head/loss is a VALID measurement, not missing data: fused linear CE
+    # never materializes the logits, so a ligerloss1 candidate legitimately has
+    # 0 bytes here. The drop gate (baseline - candidate >= threshold) still
+    # rejects a baseline that wrongly reports 0.
+    lm_head_loss = max(lm_head_loss, 0)
 
     return peak, lm_head_loss, {
         "memory_summary": str(path),

@@ -172,7 +172,9 @@ class DecoderSavedTensorOffloadWrapper:
             self.skipped_tensors += 1
             self.skipped_bytes += nbytes
             return False
-        if tensor.is_leaf and tensor.requires_grad:
+        # Skip ONLY real parameters (leaf+grad weights). qwen3.5's fla delta-net
+        # emits leaf+requires_grad *activations* (param=False) — those must offload.
+        if isinstance(tensor, torch.nn.Parameter):
             self.skipped_tensors += 1
             self.skipped_bytes += nbytes
             return False
