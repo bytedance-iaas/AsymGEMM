@@ -3,12 +3,13 @@ from __future__ import annotations
 import inspect
 import types
 import warnings
+from contextlib import nullcontext
 from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
 from torch import nn
-from torch.autograd.graph import saved_tensors_hooks
+from torch.autograd.graph import save_on_cpu, saved_tensors_hooks
 from torch.utils.checkpoint import checkpoint
 
 from .decoder_activation_offload import DecoderSavedTensorOffloadWrapper
@@ -138,8 +139,11 @@ class DecoderLayerGlueGCWrapper:
         *,
         use_reentrant: bool = False,
         preserve_rng_state: bool = True,
+        offload_mode: str = "custom",
     ) -> None:
         self.module = module
+        # "custom"=asym pack/unpack | "save_on_cpu"=generic whole-forward | "none"=recompute-only (offload done externally)
+        self.offload_mode = str(offload_mode)
         self.original_forward: Callable[..., Any] = module.forward
         self.forward_signature = inspect.signature(self.original_forward)
         self.use_reentrant = bool(use_reentrant)
@@ -196,7 +200,16 @@ class DecoderLayerGlueGCWrapper:
         self.saved_tensor_offload.calls += 1
         self.saved_tensor_offload_calls += 1
         self.saved_tensor_offload._sync_module_stats()
-        with saved_tensors_hooks(self.saved_tensor_offload._pack, self.saved_tensor_offload._unpack):
+        if self.offload_mode == "none":
+            # Recompute-only: glue-GC checkpoints norms; exp/attn offload is done EXTERNALLY by a
+            # module-scoped save_on_cpu (generic baseline #2). No whole-forward offload here, so
+            # norms/router/residuals are NOT offloaded -- only what the scoped wrappers cover.
+            offload_ctx: Any = nullcontext()
+        elif self.offload_mode == "save_on_cpu":
+            offload_ctx = save_on_cpu(pin_memory=True)
+        else:  # "custom" -> AsymGEMM pack/unpack kernel
+            offload_ctx = saved_tensors_hooks(self.saved_tensor_offload._pack, self.saved_tensor_offload._unpack)
+        with offload_ctx:
             return self._manual_forward(values)
 
     def _manual_forward(self, values: Mapping[str, Any]) -> torch.Tensor:
@@ -236,11 +249,11 @@ def _decoder_layer_glue_gc_forward(module: nn.Module, *args: Any, **kwargs: Any)
     return wrapper.run(*args, **kwargs)
 
 
-def install_decoder_layer_glue_gc(module: nn.Module) -> DecoderLayerGlueGCWrapper:
+def install_decoder_layer_glue_gc(module: nn.Module, *, offload_mode: str = "custom") -> DecoderLayerGlueGCWrapper:
     existing = getattr(module, "_asym_decoder_layer_glue_gc_wrapper", None)
     if isinstance(existing, DecoderLayerGlueGCWrapper):
         return existing
-    wrapper = DecoderLayerGlueGCWrapper(module)
+    wrapper = DecoderLayerGlueGCWrapper(module, offload_mode=offload_mode)
     wrapper.install()
     return wrapper
 

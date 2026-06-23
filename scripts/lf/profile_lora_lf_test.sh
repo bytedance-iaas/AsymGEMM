@@ -23,11 +23,11 @@ RUN_POST=${RUN_POST:-false}
 GPU_POOL=${GPU_POOL:-3}
 
 # MODEL_SPECS entries are model|num_gpus. Recompute and Liger-loss mode belong only in BACKEND_SPECS.
-# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
+MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-35B-A3B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
-MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
+# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
 
 ROUTER_MODES=${ROUTER_MODES:-whole}
 PROFILERS=${PROFILERS:-both}
@@ -54,7 +54,8 @@ BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|norecomp|ligerloss1"}
 # Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD|ASYMM_LAYER_GC.
 # ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false|false"}
 # ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|true|false|true|true,gc-layer|false|false|false|false"}
-ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|true|false|true|true,off-layer|false|false|false|false"}
+# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|true|false|true|true,off-layer|false|false|false|false"}
+ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"off-layer|false|false|false|false"}
 
 # Training
 # WORKLOADS entries are seq_len|per_device_train_batch_size|gradient_accumulation_steps.
@@ -611,11 +612,25 @@ is_policy_independent_backend() {
   esac
 }
 
+# A policy the backend-agnostic generic-offload hook acts on: off-layer (whole-layer save_on_cpu) or any
+# expert/attn/layer-GC offload flag set. These are NOT inert on non-asym backends, so they must not be
+# canonicalized to none|false... nor skipped as redundant. Arg: an ASYMM_EXP_ACT_POLICIES pair string.
+policy_pair_is_generic_baseline() {
+  case "${1%%|*}" in off-layer) return 0 ;; esac
+  local IFS='|'; local -a f; read -ra f <<< "${1}"
+  [[ "${f[1]:-false}" == "true" || "${f[2]:-false}" == "true" || "${f[4]:-false}" == "true" ]]
+}
+
 # Collapse AsymGEMM-only policy axes to inert values when they're no-ops: policy-independent backends or
 # recompute=recomp. Mutates the caller's dynamically-scoped vars, so callers must declare them `local` first.
 canonicalize_policy_axis_for_inert_run() {
   local backend="${1}"
   local recompute="${2:-}"
+  # Generic activation-offload baselines (off-layer / any expert|attn|layer-GC offload flag) are NOT inert on
+  # non-asym backends -- they drive the backend-agnostic generic_offload hook. Keep their policy axes intact.
+  if [[ "${expert_policy}" == "off-layer" || "${ASYMM_EXPERT_ACT_OFFLOAD}" == "true" || "${ASYMM_ATTN_ACT_OFFLOAD}" == "true" || "${ASYMM_LAYER_GC}" == "true" ]]; then
+    return 0
+  fi
   { is_policy_independent_backend "${backend}" || [[ "${recompute}" == "recomp" ]]; } || return 0
   expert_policy=none
   ASYMM_EXPERT_ACT_OFFLOAD=false; expact_label="$(expact_tag false)"
@@ -648,7 +663,7 @@ liger_loss_label() {
 normalize_expert_policy() {
   local raw="$1"
   case "${raw}" in
-    none|gc-exp|gc-attn-exp|gc-layer|tok-le0|tok-le0-act)
+    none|gc-exp|gc-attn-exp|gc-layer|off-layer|tok-le0|tok-le0-act)
       printf '%s\n' "${raw}"
       return
       ;;
@@ -657,7 +672,7 @@ normalize_expert_policy() {
     printf '%s\n' "${raw}"
     return
   fi
-  die "invalid expert policy '${1}'; expected none, gc-exp, gc-attn-exp, gc-layer, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, or -act variants"
+  die "invalid expert policy '${1}'; expected none, gc-exp, gc-attn-exp, gc-layer, off-layer, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, or -act variants"
 }
 
 backend_label() {
@@ -2534,8 +2549,8 @@ run_job() {
     ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE:-0}"
     ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED:-0}"
     ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU:-1}"
-    DG_BF16_CPU_LEFT_COMPACT_GRID="${DG_BF16_CPU_LEFT_COMPACT_GRID:-1}"
-    ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE="${ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE:-1}"
+    DG_BF16_CPU_LEFT_COMPACT_GRID="${DG_BF16_CPU_LEFT_COMPACT_GRID:-0}"
+    ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE="${ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE:-0}"
     LF_DIR="${LF_DIR}"
     ASYM_DIR="${ASYM_DIR}"
     ENV_DIR="${ENV_DIR}"
@@ -3225,7 +3240,7 @@ for model_spec_entry in "${model_specs[@]}"; do
                     continue
                   fi
                 fi
-                if { is_policy_independent_backend "${backend}" || [[ "${recompute}" == "recomp" ]]; } && [[ "${exp_act_policy_pair}" != "${exp_act_policy_pairs[0]}" ]]; then
+                if { is_policy_independent_backend "${backend}" || [[ "${recompute}" == "recomp" ]]; } && [[ "${exp_act_policy_pair}" != "${exp_act_policy_pairs[0]}" ]] && ! policy_pair_is_generic_baseline "${exp_act_policy_pair}"; then
                   echo "Skipping backend=${backend} recompute=${recompute} policy=${exp_act_policy_pair}; inert policy axes run once (canonicalized to none|false|false|false|false)."
                   continue
                 fi

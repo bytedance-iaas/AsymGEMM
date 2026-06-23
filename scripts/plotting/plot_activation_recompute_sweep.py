@@ -210,8 +210,8 @@ def parse_args() -> argparse.Namespace:
         "--recompute",
         action="append",
         default=[],
-        choices=["norecomp", "recomp"],
-        help="Activation recompute mode to include. Repeat for both.",
+        help="Recompute/optimization mode to include (e.g. norecomp, recomp, unsloth). "
+        "Any value is accepted; repeat to include several.",
     )
     parser.add_argument("--workloads", nargs="+", default=[])
     parser.add_argument(
@@ -452,8 +452,8 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
     sdparecomp_value = str(job_meta["asymm_attn_sdpa_recompute"])
     sdparecomp = str(job_meta["sdparecomp"])
     liger_loss = str(job_meta.get("liger_loss") or "ligerloss0")
-    if recompute not in {"recomp", "norecomp"}:
-        return None
+    # Any recompute/optimization token is accepted (norecomp, recomp, unsloth, ...);
+    # the polNNN anchor below still validates the directory layout.
     if policy_part.startswith("pol"):
         try:
             policy_meta = parse_expert_policy_spec(policy_part[3:])
@@ -475,8 +475,8 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
         "batch_size": batch_size,
         "seq_len": int(seq_match.group("seq_len")),
         "gradient_accumulation_steps": int(seq_match.group("grad_accum")),
-        "mode": "recompute" if recompute == "recomp" else "no_recompute",
-        "activation_recompute": recompute == "recomp",
+        "mode": {"recomp": "recompute", "norecomp": "no_recompute"}.get(recompute, recompute),
+        "activation_recompute": recompute != "norecomp",
         "asymm_expert_act_offload": expact_value,
         "expact": expact,
         "asymm_attn_act_offload": attnact_value,

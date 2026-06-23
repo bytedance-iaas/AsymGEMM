@@ -630,6 +630,23 @@ def parse_expert_recompute_policy_spec(spec: str | None) -> ExpertRecomputeConfi
             force_custom_autograd=False,
             torch_checkpoint=False,
         )
+    if raw == "off-layer":
+        # Generic whole-layer activation OFFLOAD baseline (offload twin of gc-layer).
+        # Applied backend-agnostically via generic save_on_cpu per layer
+        # (asym_gemm/integrations/generic_offload_lf.py). policy stays "none".
+        return ExpertRecomputeConfig(
+            policy="none",
+            token_threshold=0,
+            activation_save_policy="save_all",
+            activation_save_threshold=0,
+            label="off-layer",
+            token_min=1,
+            token_max=None,
+            activation_save_min=1,
+            activation_save_max=None,
+            force_custom_autograd=False,
+            torch_checkpoint=False,
+        )
     if raw in {"gc-exp", "gc-attn-exp"}:
         return ExpertRecomputeConfig(
             policy="gc",
@@ -734,7 +751,7 @@ def parse_expert_recompute_policy_spec(spec: str | None) -> ExpertRecomputeConfi
         )
 
     raise ValueError(
-        f"unsupported expert recompute policy {spec!r}; expected none, tok-leN, tok-geN, tokA-B, gc-exp, gc-attn-exp, gc-layer, or -act variants"
+        f"unsupported expert recompute policy {spec!r}; expected none, tok-leN, tok-geN, tokA-B, gc-exp, gc-attn-exp, gc-layer, off-layer, or -act variants"
     )
 
 
