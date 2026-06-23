@@ -283,6 +283,169 @@ void moe_expert_forward_batch_py(
         std::to_string(first_err.load()));
 }
 
+// ---------------------------------------------------------------------------
+// Capturable single-token decode host node.
+//
+// `moe_decode_host` has the cudaHostFn_t signature (void(void*)) and is the
+// function pointer cudaLaunchHostFunc records as a CUDA-graph HOST NODE during
+// stream capture. It runs the whole MoE for the decode batch (T tokens, all on
+// CPU) reading/writing FIXED pinned buffers whose addresses are bound once into
+// a DecodeArgs struct (so graph replay re-reads the same memory). It makes NO
+// CUDA calls and touches NO Python state — only cg_gemm over raw pointers — so
+// it is legal both as a captured graph node and when invoked on a CUDA driver
+// thread at replay.
+//
+// Math mirrors moe_expert_forward_batch_py exactly (gate/up -> SiLU*up -> bf16
+// round -> down, route-weighted FP32 accumulate -> bf16). The caller supplies
+// expert_ids clamped >= 0 and route_w masked (invalid slots = 0); routed
+// scaling is applied by the caller after the H2D copy, matching the eager path.
+struct DecodeArgs {
+  RuntimeHandle* rth = nullptr;      // shared pool + per-slot serial runtimes
+  const uint16_t* x = nullptr;       // [T, H] bf16 bits
+  const int64_t*  eid = nullptr;     // [T, K] int64
+  const float*    rw = nullptr;      // [T, K] fp32 (masked)
+  uint16_t*       out = nullptr;     // [T, H] bf16 bits
+  const int8_t*   gate_b = nullptr;  const float* gate_s = nullptr;  // [G,I,H],[G,I]
+  const int8_t*   up_b = nullptr;    const float* up_s = nullptr;    // [G,I,H],[G,I]
+  const int8_t*   down_b = nullptr;  const float* down_s = nullptr;  // [G,H,I],[G,H]
+  int T = 0, K = 0, G = 0, H = 0, I = 0;
+  // Pre-allocated per-slot scratch (one row per top-k slot, so the K experts
+  // run concurrently with no write aliasing). single-replay-at-a-time, no race.
+  float* c_gate = nullptr;   // [K, I]
+  float* c_up = nullptr;     // [K, I]
+  uint16_t* act = nullptr;   // [K, I] bf16 bits
+  float* c_down = nullptr;   // [K, H]  per-slot expert output (pre-reduce)
+  float* acc = nullptr;      // [H] fp32 accumulator
+};
+
+// CUDA-graph host node. Mirrors moe_expert_forward_batch_py's parallelism:
+// ONE parallel_for over the K routed slots (each expert on its own single-
+// thread serial runtime, computing gate/up/silu/down inline), then a serial
+// route-weighted reduce. This is one pool wake per token per layer — NOT a
+// full-pool fan-out per tiny m=1 GEMM, which is catastrophically slow.
+void moe_decode_host(void* user) {
+  DecodeArgs* a = static_cast<DecodeArgs*>(user);
+  const int H = a->H, I = a->I, K = a->K, G = a->G, T = a->T;
+  for (int t = 0; t < T; ++t) {
+    const uint16_t* xt   = a->x   + (size_t)t * H;
+    const int64_t*  eidt = a->eid + (size_t)t * K;
+    const float*    rwt  = a->rw  + (size_t)t * K;
+
+    // Each routed slot computes its expert on a dedicated 1-thread runtime;
+    // distinct output rows (c_down + j*H) → no cross-slot races.
+    a->rth->rt->pool->parallel_for(K, [&](int j) {
+      const float w = rwt[j];
+      if (w == 0.0f) return;             // masked / padding slot
+      const int64_t e = eidt[j];
+      if (e < 0 || e >= G) return;
+      cg_runtime_t* srt = a->rth->serial_rts[(size_t)j]->rt;
+
+      float* cg = a->c_gate + (size_t)j * I;
+      float* cu = a->c_up   + (size_t)j * I;
+      uint16_t* ac = a->act + (size_t)j * I;
+      float* cd = a->c_down + (size_t)j * H;
+
+      auto d = cpu_gemm::make_desc();
+      d.alpha = 1.0f; d.beta = 0.0f;
+      d.dtype_a = CG_BF16; d.dtype_b = CG_INT8; d.dtype_c = CG_F32;
+
+      // gate = x @ Wgate^T   [1, I]
+      d.m = 1; d.k = (size_t)H; d.n = (size_t)I;
+      d.a = xt; d.lda = (size_t)H;
+      d.b = a->gate_b + (size_t)e * I * H; d.ldb = (size_t)H;
+      d.b_scales = a->gate_s + (size_t)e * I;
+      d.c = cg; d.ldc = (size_t)I;
+      if (cg_gemm(srt, &d) != CG_OK) return;
+
+      // up = x @ Wup^T   [1, I]
+      d.b = a->up_b + (size_t)e * I * H;
+      d.b_scales = a->up_s + (size_t)e * I;
+      d.c = cu;
+      if (cg_gemm(srt, &d) != CG_OK) return;
+
+      // act = silu(gate) * up, rounded to bf16 (matches the GPU path round-trip)
+      for (int i = 0; i < I; ++i) {
+        const float gg = cg[i];
+        const float v = (gg / (1.0f + std::exp(-gg))) * cu[i];
+        ac[i] = fp32_to_bf16_rne(v);
+      }
+
+      // down = act @ Wdown^T   [1, H]
+      d.m = 1; d.k = (size_t)I; d.n = (size_t)H;
+      d.a = ac; d.lda = (size_t)I;
+      d.b = a->down_b + (size_t)e * H * I; d.ldb = (size_t)I;
+      d.b_scales = a->down_s + (size_t)e * H;
+      d.c = cd; d.ldc = (size_t)H;
+      if (cg_gemm(srt, &d) != CG_OK) return;
+    });
+
+    // Route-weighted reduce over the K slots → bf16 output.
+    float* acc = a->acc;
+    for (int h = 0; h < H; ++h) acc[h] = 0.0f;
+    for (int j = 0; j < K; ++j) {
+      const float w = rwt[j];
+      if (w == 0.0f) continue;
+      const int64_t e = eidt[j];
+      if (e < 0 || e >= G) continue;
+      const float* cd = a->c_down + (size_t)j * H;
+      for (int h = 0; h < H; ++h) acc[h] += w * cd[h];
+    }
+    uint16_t* outt = a->out + (size_t)t * H;
+    for (int h = 0; h < H; ++h) outt[h] = fp32_to_bf16_rne(acc[h]);
+  }
+}
+
+// Address of the host-node callback, as an int, for ctypes cudaLaunchHostFunc.
+std::intptr_t decode_host_fn_ptr_py() {
+  return reinterpret_cast<std::intptr_t>(&moe_decode_host);
+}
+
+// Bind fixed buffer addresses + weight slab pointers + dims into a heap
+// DecodeArgs that must outlive the captured graph (freed via free_decode_args).
+std::intptr_t make_decode_args_py(
+    RuntimeHandle& rt,
+    std::uintptr_t x, std::uintptr_t eid, std::uintptr_t rw, std::uintptr_t out,
+    std::uintptr_t gate_b, std::uintptr_t gate_s,
+    std::uintptr_t up_b, std::uintptr_t up_s,
+    std::uintptr_t down_b, std::uintptr_t down_s,
+    int T, int K, int G, int H, int I) {
+  if (T <= 0 || K <= 0 || G <= 0 || H <= 0 || I <= 0)
+    throw std::invalid_argument("make_decode_args: dims must be positive");
+  // One single-thread runtime per routed slot, so the K experts run concurrently
+  // under the host node's parallel_for (allocated outside capture).
+  rt.ensure_serial((size_t)K);
+  auto* a = new DecodeArgs();
+  a->rth = &rt;
+  a->x = reinterpret_cast<const uint16_t*>(x);
+  a->eid = reinterpret_cast<const int64_t*>(eid);
+  a->rw = reinterpret_cast<const float*>(rw);
+  a->out = reinterpret_cast<uint16_t*>(out);
+  a->gate_b = reinterpret_cast<const int8_t*>(gate_b);
+  a->gate_s = reinterpret_cast<const float*>(gate_s);
+  a->up_b = reinterpret_cast<const int8_t*>(up_b);
+  a->up_s = reinterpret_cast<const float*>(up_s);
+  a->down_b = reinterpret_cast<const int8_t*>(down_b);
+  a->down_s = reinterpret_cast<const float*>(down_s);
+  a->T = T; a->K = K; a->G = G; a->H = H; a->I = I;
+  a->c_gate = new float[(size_t)K * I];
+  a->c_up = new float[(size_t)K * I];
+  a->act = new uint16_t[(size_t)K * I];
+  a->c_down = new float[(size_t)K * H];
+  a->acc = new float[(size_t)H];
+  return reinterpret_cast<std::intptr_t>(a);
+}
+
+void free_decode_args_py(std::intptr_t p) {
+  auto* a = reinterpret_cast<DecodeArgs*>(p);
+  if (!a) return;
+  delete[] a->c_gate;
+  delete[] a->c_up;
+  delete[] a->act;
+  delete[] a->c_down;
+  delete[] a->acc;
+  delete a;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_cpu_C, m) {
@@ -316,4 +479,16 @@ PYBIND11_MODULE(_cpu_C, m) {
         py::arg("up_int8"), py::arg("up_scales"),
         py::arg("down_int8"), py::arg("down_scales"),
         py::arg("out_cat"), py::arg("inter"), py::arg("hidden"));
+
+  // Capturable single-token decode (CUDA-graph host-node path).
+  m.def("decode_host_fn_ptr", &decode_host_fn_ptr_py,
+        "Address (int) of the cudaLaunchHostFunc decode callback.");
+  m.def("make_decode_args", &make_decode_args_py,
+        py::arg("rt"), py::arg("x"), py::arg("eid"), py::arg("rw"),
+        py::arg("out"),
+        py::arg("gate_int8"), py::arg("gate_scales"),
+        py::arg("up_int8"), py::arg("up_scales"),
+        py::arg("down_int8"), py::arg("down_scales"),
+        py::arg("T"), py::arg("K"), py::arg("G"), py::arg("H"), py::arg("I"));
+  m.def("free_decode_args", &free_decode_args_py, py::arg("args"));
 }
