@@ -69,6 +69,13 @@ def _parse_args() -> argparse.Namespace:
     output.add_argument("--train-name", default="lf_smoltalk_small_train")
     output.add_argument("--eval-name", default="lf_smoltalk_small_eval")
     output.add_argument("--train-rows", type=int, default=1000)
+    output.add_argument(
+        "--min-dataset-rows",
+        type=int,
+        default=512,
+        help="Always build at least this many train rows (the fixed dataset pool). The per-run sample count is a "
+        "separate runtime post-cap (LF --max_samples), so MAX_SAMPLES <= this needs no rebuild. Default 512.",
+    )
     output.add_argument("--eval-rows", type=int, default=128)
     output.add_argument("--seed", type=int, default=0)
     output.add_argument("--cutoff-len", type=int, default=4096)
@@ -82,6 +89,26 @@ def _parse_args() -> argparse.Namespace:
         "--audit-only",
         action="store_true",
         help="Require existing train/eval files and only reprint validation/stats/results.",
+    )
+    output.add_argument(
+        "--concat-to-len",
+        choices=["auto", "true", "false"],
+        default="auto",
+        help="Build each row by concatenating randomly-selected real conversations (seeded by --seed) until it "
+        "reaches cutoff_len. auto (default) enables this when cutoff_len >= --concat-min-seq. Real tokens at every "
+        "position keep MoE routing realistic; use for long-seq memory stress when the corpus lacks long rows.",
+    )
+    output.add_argument(
+        "--concat-min-seq",
+        type=int,
+        default=0,
+        help="Under --concat-to-len auto, concatenate when cutoff_len >= this threshold. Default 0 (always concat).",
+    )
+    output.add_argument(
+        "--concat-overshoot",
+        type=float,
+        default=1.02,
+        help="Concat until raw tokens >= concat-overshoot * cutoff_len, so LF truncation lands at exactly cutoff_len.",
     )
 
     validation = parser.add_argument_group("validation")
@@ -275,6 +302,96 @@ def _sample_split(
             f"needed {count}; skipped={skipped}"
         )
     return records, lengths, skipped
+
+
+def _concat_split(
+    dataset_name: str,
+    config: str,
+    split: str,
+    count: int,
+    seed: int,
+    tokenizer: Any,
+    cutoff_len: int,
+    overshoot: float,
+    used_ids: set[str],
+) -> tuple[list[dict[str, Any]], list[int], dict[str, Any]]:
+    """Build `count` rows, each a seeded-random concatenation of real conversations >= cutoff_len tokens.
+
+    Every position is a real token (so MoE routing stays realistic) and rows train as one sequence
+    under a normal causal mask, so this faithfully mimics long-context memory without long source rows.
+    """
+    dataset = load_dataset(dataset_name, config, split=split)
+    rng = random.Random(seed)
+
+    # Pool of valid real conversations to draw from (with replacement across rows).
+    pool: list[list[dict[str, str]]] = []
+    for row in dataset:
+        conversations, _ = _normalize_messages(row)
+        if conversations:
+            pool.append(conversations)
+    if not pool:
+        raise RuntimeError(f"no valid conversations in {dataset_name}/{config}:{split} to concat")
+
+    indices = list(range(len(pool)))
+    target = max(cutoff_len + 1, int(cutoff_len * overshoot))
+    tok_cache: dict[int, int] = {}
+
+    def _conv_tokens(pool_idx: int) -> int:
+        if pool_idx not in tok_cache:
+            tok_cache[pool_idx] = len(
+                tokenizer.encode(_record_text({"conversations": pool[pool_idx]}), add_special_tokens=False)
+            )
+        return tok_cache[pool_idx]
+
+    records: list[dict[str, Any]] = []
+    lengths: list[int] = []
+    segments: list[int] = []
+    for _ in range(count):
+        while True:
+            merged: list[dict[str, str]] = []
+            approx = 0
+            n_seg = 0
+            while approx < target:  # cheap pass using cached per-conversation token counts
+                pick = rng.choice(indices)
+                merged += pool[pick]
+                approx += _conv_tokens(pick)
+                n_seg += 1
+            token_length = len(tokenizer.encode(_record_text({"conversations": merged}), add_special_tokens=False))
+            while token_length < cutoff_len:  # safety: guarantee the row truly fills cutoff_len
+                pick = rng.choice(indices)
+                merged += pool[pick]
+                n_seg += 1
+                token_length = len(tokenizer.encode(_record_text({"conversations": merged}), add_special_tokens=False))
+            record_id = _stable_id(merged)
+            if record_id not in used_ids:
+                break  # else (astronomically rare) regenerate a fresh row from the rng stream
+        record = {
+            "id": record_id,
+            "conversations": merged,
+            "system": "",
+            "source": dataset_name,
+            "source_config": config,
+            "source_split": split,
+            "concat_segments": n_seg,
+            "token_length": token_length,
+            "truncated_by_cutoff": token_length > cutoff_len,
+        }
+        records.append(record)
+        lengths.append(token_length)
+        segments.append(n_seg)
+        used_ids.add(record_id)
+
+    info = {
+        "mode": "concat",
+        "pool_size": len(pool),
+        "source_rows": len(dataset),
+        "target_tokens": target,
+        "seed": seed,
+        "segments_min": min(segments),
+        "segments_avg": mean(segments),
+        "segments_max": max(segments),
+    }
+    return records, lengths, info
 
 
 def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
@@ -810,6 +927,11 @@ def main() -> None:
     if args.template == "auto":
         args.template = _infer_template(args.model_name_or_path)
     print(f"Using template: {args.template} for model {args.model_name_or_path}")
+    concat_active = args.concat_to_len == "true" or (
+        args.concat_to_len == "auto" and args.cutoff_len >= args.concat_min_seq
+    )
+    # The dataset is a fixed pool; the per-run sample count is a separate runtime post-cap (LF --max_samples).
+    train_build_rows = max(args.train_rows, args.min_dataset_rows)
     lf_dir = Path(args.lf_dir).resolve()
     data_dir = lf_dir / "data"
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
@@ -833,12 +955,39 @@ def main() -> None:
         eval_records, eval_lengths = _load_existing_jsonl(eval_path, tokenizer)
         train_skips = {"mode": "existing", "not_resampled": True, "scanned": len(train_records)}
         eval_skips = {"mode": "existing", "not_resampled": True, "scanned": len(eval_records)}
+    elif concat_active:
+        train_records, train_lengths, train_skips = _concat_split(
+            args.source_dataset,
+            args.source_config,
+            args.train_split,
+            train_build_rows,
+            args.seed,
+            tokenizer,
+            args.cutoff_len,
+            args.concat_overshoot,
+            used_ids,
+        )
+        eval_records, eval_lengths, eval_skips = _concat_split(
+            args.source_dataset,
+            args.source_config,
+            args.eval_split,
+            args.eval_rows,
+            args.seed + 1,
+            tokenizer,
+            args.cutoff_len,
+            args.concat_overshoot,
+            used_ids,
+        )
+
+        _write_jsonl(train_path, train_records)
+        _write_jsonl(eval_path, eval_records)
+        _update_dataset_info(lf_dir, args.train_name, args.eval_name)
     else:
         train_records, train_lengths, train_skips = _sample_split(
             args.source_dataset,
             args.source_config,
             args.train_split,
-            args.train_rows,
+            train_build_rows,
             args.seed,
             tokenizer,
             args.min_tokens,
@@ -938,6 +1087,11 @@ def main() -> None:
     print(f"eval_file={eval_path}")
     print(f"results_config_dir={config_root}")
     print(f"validation_ok={validation['ok']}")
+    print(f"dataset_pool_rows={len(train_records)} min_dataset_rows={args.min_dataset_rows} (per-run count = LF --max_samples post-cap)")
+    print(f"concat_to_len={args.concat_to_len} concat_active={concat_active}")
+    if concat_active and train_skips.get("mode") == "concat":
+        print(f"source_pool_train={train_skips.get('pool_size')} source_pool_eval={eval_skips.get('pool_size')}")
+        print(f"concat_seed={args.seed} concat_segments_avg={train_skips.get('segments_avg'):.1f}")
     print(f"train_p50={token_stats['train']['p50']:.2f}")
     print(f"train_p75={token_stats['train']['p75']:.2f}")
     print(f"eval_p50={token_stats['eval']['p50']:.2f}")

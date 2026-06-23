@@ -23,8 +23,8 @@ RUN_POST=${RUN_POST:-false}
 GPU_POOL=${GPU_POOL:-3}
 
 # MODEL_SPECS entries are model|num_gpus. Recompute and Liger-loss mode belong only in BACKEND_SPECS.
-# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
-MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
+MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
+# MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-35B-A3B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
@@ -37,14 +37,16 @@ PRECISION=${PRECISION:-bf16}
 LORA_DROPOUT=${LORA_DROPOUT:-0.00}
 LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 
-# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload_mem|recomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|recomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp,zero3_offload|recomp,zero3_offload_mem|recomp,asym_cpuadamwds|norecomp"}
-BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|recomp,superoffload|recomp,zero3_offload_mem|recomp,zero3_offload|recomp"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp|ligerloss0"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload_mem|recomp|ligerloss0"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp|ligerloss0"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|recomp|ligerloss0"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp|ligerloss0"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp|ligerloss0"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp|ligerloss0,zero3_offload|recomp|ligerloss0,zero3_offload_mem|recomp|ligerloss0,asym_cpuadamwds|norecomp|ligerloss0"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|recomp|ligerloss0,superoffload|recomp|ligerloss0,zero3_offload_mem|recomp|ligerloss0,zero3_offload|recomp|ligerloss0"}
+BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload_opnvme|recomp|ligerloss1,zero3_offload_pnvme|recomp|ligerloss1"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp|ligerloss1,asym_cpuadamwds|recomp|ligerloss1"}
 
 # Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD|ASYMM_LAYER_GC.
 ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false|false"}
@@ -52,13 +54,14 @@ ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false|f
 
 # Training
 # WORKLOADS entries are seq_len|per_device_train_batch_size|gradient_accumulation_steps.
-# Example: WORKLOADS="2048|3|1,4096|2|1".
 # WORKLOADS="${WORKLOADS:-2048|2|1}"
-WORKLOADS="${WORKLOADS:-4096|4|1}"
-MAX_STEPS=${MAX_STEPS:-10}
-WARMUP_STEPS=${WARMUP_STEPS:-5}
-# MAX_STEPS=${MAX_STEPS:-1}
-# WARMUP_STEPS=${WARMUP_STEPS:-1}
+# WORKLOADS="${WORKLOADS:-4096|8|1,8192|8|1}"
+WORKLOADS="${WORKLOADS:-48000|8|1}"
+
+# MAX_STEPS=${MAX_STEPS:-10}
+# WARMUP_STEPS=${WARMUP_STEPS:-5}
+MAX_STEPS=${MAX_STEPS:-1}
+WARMUP_STEPS=${WARMUP_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 LORA_RANK=${LORA_RANK:-64}
 LORA_ALPHA=${LORA_ALPHA:-16}
@@ -97,7 +100,7 @@ DATASET_MIN_TOKENS=${DATASET_MIN_TOKENS:-auto}
 DATASET_EVAL_ROWS=${DATASET_EVAL_ROWS:-1}
 DATASET_OVERWRITE=${DATASET_OVERWRITE:-false}
 TEMPLATE=${TEMPLATE:-auto}
-MAX_SAMPLES=${MAX_SAMPLES:-64}
+MAX_SAMPLES=${MAX_SAMPLES:-256}
 
 # Shared AsymGEMM expert activation-backfetch toggles. Default OFF; forced off for
 # policy-independent backends. Qwen and Llama use the same env names.
@@ -560,7 +563,7 @@ backend_gpu_count() {
   local model_gpu_count="$2"
   case "${backend}" in
     asym|asym_torch|asym_cpuadamwtorch|asym_cpuadamwds) printf '1\n' ;;
-    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_cpuadam|superoffload|superoffload_mem) printf '%s\n' "${model_gpu_count}" ;;
+    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_pnvme|zero3_cpuadam|superoffload|superoffload_mem) printf '%s\n' "${model_gpu_count}" ;;
     kt_torchbf16|kt_armbf16) printf '1\n' ;;
     *) die "internal backend label must be torch, asym, asym_torch, asym_cpuadamwtorch, asym_cpuadamwds, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_cpuadam, superoffload, superoffload_mem, kt_torchbf16, or kt_armbf16, got '${backend}'" ;;
   esac
@@ -572,6 +575,8 @@ zero_deepspeed_config() {
     zero3) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_config.json" ;;
     zero3_offload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json" ;;
     zero3_offload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_config.json" ;;
+    zero3_offload_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_opnvme_config.json" ;;
+    zero3_offload_pnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_pnvme_config.json" ;;
     zero3_cpuadam) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_cpuadam_config.json" ;;
     superoffload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_config.json" ;;
     superoffload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_config.json" ;;
@@ -581,14 +586,14 @@ zero_deepspeed_config() {
 
 is_zero_backend() {
   case "${1}" in
-    zero2|zero3|zero3_offload|zero3_offload_mem|zero3_cpuadam|superoffload|superoffload_mem) return 0 ;;
+    zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_pnvme|zero3_cpuadam|superoffload|superoffload_mem) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 is_policy_independent_backend() {
   case "${1}" in
-    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_cpuadam|superoffload|superoffload_mem|kt_*) return 0 ;;
+    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_pnvme|zero3_cpuadam|superoffload|superoffload_mem|kt_*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -652,6 +657,8 @@ backend_label() {
     zero3) printf 'zero3\n' ;;
     zero3_offload) printf 'zero3_offload\n' ;;
     zero3_offload_mem) printf 'zero3_offload_mem\n' ;;
+    zero3_offload_opnvme) printf 'zero3_offload_opnvme\n' ;;
+    zero3_offload_pnvme) printf 'zero3_offload_pnvme\n' ;;
     zero3_cpuadam) printf 'zero3_cpuadam\n' ;;
     superoffload) printf 'superoffload\n' ;;
     superoffload_mem) printf 'superoffload_mem\n' ;;
@@ -709,6 +716,8 @@ append_backend_spec() {
     zero3) backend=zero3 ;;
     zero3_offload) backend=zero3_offload ;;
     zero3_offload_mem) backend=zero3_offload_mem ;;
+    zero3_offload_opnvme) backend=zero3_offload_opnvme ;;
+    zero3_offload_pnvme) backend=zero3_offload_pnvme ;;
     zero3_cpuadam) backend=zero3_cpuadam ;;
     superoffload) backend=superoffload ;;
     superoffload_mem) backend=superoffload_mem ;;
@@ -1958,7 +1967,7 @@ selected_has_non_asym=false
 for backend in "${backends[@]}"; do
   case "${backend}" in
     asym|asym_torch|asym_cpuadamwtorch|asym_cpuadamwds) selected_has_asym=true ;;
-    zero2|zero3|zero3_offload|zero3_offload_mem|zero3_cpuadam) selected_has_zero=true ;;
+    zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_pnvme|zero3_cpuadam) selected_has_zero=true ;;
     superoffload|superoffload_mem) selected_has_zero=true; selected_has_superoffload=true ;;
     kt_*) selected_has_kt=true ;;
   esac

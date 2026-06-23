@@ -27,7 +27,8 @@ GPU_POOL=${GPU_POOL:-3}
 # MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-35B-A3B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
-MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
+# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
+MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
 
 ROUTER_MODES=${ROUTER_MODES:-whole}
 PROFILERS=${PROFILERS:-both}
@@ -42,14 +43,10 @@ LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 # BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp|ligerloss0"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|recomp|ligerloss0"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp|ligerloss0"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp|ligerloss0"}
+BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp|ligerloss0"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp|ligerloss0,zero3_offload_mem|recomp|ligerloss0"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp|ligerloss0,zero3_offload|recomp|ligerloss0,zero3_offload_mem|recomp|ligerloss0,asym_cpuadamwds|norecomp|ligerloss0"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|recomp|ligerloss0,superoffload|recomp|ligerloss0,zero3_offload_mem|recomp|ligerloss0,zero3_offload|recomp|ligerloss0"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp|ligerloss"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp|ligerloss1,asym_cpuadamwds|recomp|ligerloss1"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|unsloth|ligerloss1,zero3_offload|recomp|ligerloss1"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|unsloth|ligerloss1,superoffload_mem|recomp|ligerloss1"}
-BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp|ligerloss1"}
 
 # Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD|ASYMM_LAYER_GC.
 # ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false|false"}
@@ -58,15 +55,11 @@ ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|true|false|true|true
 
 # Training
 # WORKLOADS entries are seq_len|per_device_train_batch_size|gradient_accumulation_steps.
-WORKLOADS="${WORKLOADS:-4096|8|1}"
-# WORKLOADS="${WORKLOADS:-4096|8|1,8192|8|1}"
-# WORKLOADS="${WORKLOADS:-48000|8|1}"
-# WORKLOADS="${WORKLOADS:-4096|8|1,8192|8|1}"
-
-MAX_STEPS=${MAX_STEPS:-3}
-WARMUP_STEPS=${WARMUP_STEPS:-3}
-# MAX_STEPS=${MAX_STEPS:-10}
-# WARMUP_STEPS=${WARMUP_STEPS:-5}
+# Example: WORKLOADS="2048|3|1,4096|2|1".
+# WORKLOADS="${WORKLOADS:-2048|2|1}"
+WORKLOADS="${WORKLOADS:-4096|4|1}"
+MAX_STEPS=${MAX_STEPS:-10}
+WARMUP_STEPS=${WARMUP_STEPS:-5}
 # MAX_STEPS=${MAX_STEPS:-1}
 # WARMUP_STEPS=${WARMUP_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
@@ -107,7 +100,7 @@ DATASET_MIN_TOKENS=${DATASET_MIN_TOKENS:-auto}
 DATASET_EVAL_ROWS=${DATASET_EVAL_ROWS:-1}
 DATASET_OVERWRITE=${DATASET_OVERWRITE:-false}
 TEMPLATE=${TEMPLATE:-auto}
-MAX_SAMPLES=${MAX_SAMPLES:-256}
+MAX_SAMPLES=${MAX_SAMPLES:-64}
 
 # Shared AsymGEMM expert activation-backfetch toggles. Default OFF; forced off for
 # policy-independent backends. Qwen and Llama use the same env names.
@@ -622,11 +615,10 @@ canonicalize_policy_axis_for_inert_run() {
 
 recompute_label() {
   case "${1,,}" in
-    norecomp|recomp|unsloth) printf '%s\n' "${1,,}" ;;
-    unslothgc|unsloth_gc|unsloth-gc) printf 'unsloth\n' ;;
+    norecomp|recomp) printf '%s\n' "${1,,}" ;;
     norecompute|no_recompute|no-recompute) printf 'norecomp\n' ;;
     recompute) printf 'recomp\n' ;;
-    *) die "expected recompute mode norecomp/recomp/unsloth or norecompute/recompute; got '${1}'" ;;
+    *) die "expected recompute mode norecomp/recomp or norecompute/recompute; got '${1}'" ;;
   esac
 }
 
@@ -1092,7 +1084,7 @@ if backend == "kt_armbf16" and expected_seq_len and expected_batch and expected_
     if str(expected_cache_depth).strip():
         require_int_config("kt_max_cache_depth", expected_cache_depth)
     if expected_recompute:
-        if expected_recompute in ("recomp", "unsloth"):
+        if expected_recompute == "recomp":
             wanted_recompute = "true"
         elif expected_recompute == "norecomp":
             wanted_recompute = "false"
@@ -2371,11 +2363,9 @@ run_job() {
     materialize_source_from_nsys=true
   fi
   local gradient_checkpointing=false
-  local use_unsloth_gc=false
   local attention_gc_enabled=false
   local layer_gc_enabled=false
   [[ "${recompute}" == "recomp" ]] && gradient_checkpointing=true
-  [[ "${recompute}" == "unsloth" ]] && { gradient_checkpointing=true; use_unsloth_gc=true; }
   [[ "${expert_policy}" == "gc-attn-exp" ]] && attention_gc_enabled=true
   [[ "${expert_policy}" == "gc-layer" ]] && layer_gc_enabled=true
   if ! cpuadam_backend_for_label "${backend}" >/dev/null; then
@@ -2562,7 +2552,6 @@ run_job() {
     ENABLE_LIGER_KERNEL="${enable_liger_kernel}"
     SEED="${SEED}"
     GRADIENT_CHECKPOINTING="${gradient_checkpointing}"
-    USE_UNSLOTH_GC="${use_unsloth_gc}"
     ASYM_PRECISION="${PRECISION}"
     ASYM_OFFLOAD_MODULES="${ASYM_OFFLOAD_MODULES}"
     ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}"

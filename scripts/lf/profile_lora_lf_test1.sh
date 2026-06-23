@@ -24,10 +24,11 @@ GPU_POOL=${GPU_POOL:-3}
 
 # MODEL_SPECS entries are model|num_gpus. Recompute and Liger-loss mode belong only in BACKEND_SPECS.
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
-MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
+# MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-35B-A3B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
 # MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
+MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
 
 ROUTER_MODES=${ROUTER_MODES:-whole}
 PROFILERS=${PROFILERS:-both}
@@ -37,14 +38,15 @@ PRECISION=${PRECISION:-bf16}
 LORA_DROPOUT=${LORA_DROPOUT:-0.00}
 LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 
-# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload_mem|recomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|recomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp,zero3_offload|recomp,zero3_offload_mem|recomp,asym_cpuadamwds|norecomp"}
-BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|recomp,superoffload|recomp,zero3_offload_mem|recomp,zero3_offload|recomp"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp|ligerloss0"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload_mem|recomp|ligerloss0"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp|ligerloss0"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|recomp|ligerloss0"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp|ligerloss0"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp|ligerloss0"}
+BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp|ligerloss0,zero3_offload_mem|recomp|ligerloss0"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp|ligerloss0,zero3_offload|recomp|ligerloss0,zero3_offload_mem|recomp|ligerloss0,asym_cpuadamwds|norecomp|ligerloss0"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|recomp|ligerloss0,superoffload|recomp|ligerloss0,zero3_offload_mem|recomp|ligerloss0,zero3_offload|recomp|ligerloss0"}
 
 # Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD|ASYMM_LAYER_GC.
 ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false|false"}
@@ -54,7 +56,7 @@ ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false|f
 # WORKLOADS entries are seq_len|per_device_train_batch_size|gradient_accumulation_steps.
 # Example: WORKLOADS="2048|3|1,4096|2|1".
 # WORKLOADS="${WORKLOADS:-2048|2|1}"
-WORKLOADS="${WORKLOADS:-4096|4|1,8192|4|1}"
+WORKLOADS="${WORKLOADS:-4096|4|1}"
 MAX_STEPS=${MAX_STEPS:-10}
 WARMUP_STEPS=${WARMUP_STEPS:-5}
 # MAX_STEPS=${MAX_STEPS:-1}

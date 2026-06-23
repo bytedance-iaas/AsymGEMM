@@ -259,6 +259,8 @@ class LFAsymReport:
     qwen35_moes_wrapped: int = 0
     llama4_moes_wrapped: int = 0
     dense_lora_wrapped: int = 0
+    dense_mlp_act_offload_enabled: bool = False
+    dense_mlp_act_offload_wrapped: int = 0
     trainable_lora_params: int = 0
     cpu_resident_base_bytes: int = 0
     gpu_resident_base_bytes: int = 0
@@ -323,6 +325,7 @@ class LFAsymReport:
             f"packed_experts_wrapped={self.packed_experts_wrapped}, "
             f"llama4_moes_wrapped={self.llama4_moes_wrapped}, "
             f"dense_lora_wrapped={self.dense_lora_wrapped}, "
+            f"dense_mlp_act_offload_wrapped={self.dense_mlp_act_offload_wrapped}, "
             f"trainable_lora_params={self.trainable_lora_params}, "
             f"cpu_resident_base_bytes={self.cpu_resident_base_bytes}, "
             f"gpu_resident_base_bytes={self.gpu_resident_base_bytes}, "
@@ -1418,6 +1421,17 @@ def _is_qwen3_decoder_layer_module_name(name: str, module: nn.Module) -> bool:
             return True
         if hasattr(children["mlp"], "_is_asym_qwen3_moe_block") or is_qwen3_moe_block(children["mlp"]):
             return True
+    # Generic DENSE decoder layer (Qwen2 / Qwen2.5 / Llama-3.x / Mistral / etc.): standard
+    # {self_attn, mlp, input_layernorm, post_attention_layernorm} with a dense FFN whose `mlp`
+    # child exposes gate/up/down projections (in any wrapped form) or is an already-installed
+    # AsymDenseMLP. MoE decoder layers (mlp = sparse block, no gate/up/down children) are
+    # excluded, so this never reclassifies a routed-expert layer.
+    if qwen3_required <= child_names:
+        mlp_child = children["mlp"]
+        if getattr(mlp_child, "_is_asym_dense_mlp", False):
+            return True
+        if {"gate_proj", "up_proj", "down_proj"} <= set(dict(mlp_child.named_children())):
+            return True
     # Llama 4 decoder layer (token mixer `self_attn`, FFN child `feed_forward`; dense or MoE).
     llama4_required = {"self_attn", "feed_forward", "input_layernorm", "post_attention_layernorm"}
     if llama4_required <= child_names:
@@ -1942,8 +1956,71 @@ def apply_lf_asym_lora(
             if backend == "asym" and offload_experts:
                 _release_replaced_module_memory()
 
-        if not expert_prefixes and strict:
+        # Dense models (e.g. Qwen/Qwen3-32B) have no packed-expert/MoE blocks, but
+        # `--lora_target all` still sets wrap_experts. When the MoE detectors find ZERO
+        # candidates the model is genuinely dense: record it and skip expert wrapping.
+        # MoE models (Qwen3-MoE / Qwen3.5 / Llama4) ALWAYS produce candidates, so they
+        # fall through to the original strict guard below and are unaffected.
+        dense_no_experts = not expert_candidates
+        if dense_no_experts:
+            report.skipped.append("routed_experts:dense_model_no_experts")
+        elif not expert_prefixes and strict:
             raise ValueError("AsymGEMM requested routed expert LoRA but found no supported packed expert/MoE modules.")
+
+    # Dense-MLP surgical activation offload. On a DENSE model the MLP is the analog of routed
+    # experts, so `ASYMM_EXPERT_ACT_OFFLOAD` should offload its `silu(gate)*up` intermediate to
+    # CPU and run the down-proj LoRA backward on CPU via AsymGEMM (reusing the expert engine as a
+    # single expert). Composes with attn_act and layer_gc (layer_gc then catches only the
+    # residual/glue). Gated on dense (no expert prefixes) so MoE models never enter here.
+    # OPT-IN ONLY. The surgical dense-MLP offload is numerically correct but runs the FULL dense
+    # MLP forward/backward on CPU (all tokens x the large intermediate, every layer) — practical
+    # for sparse MoE experts (top-k tokens) but it stalls a dense model at large seq/batch. The
+    # standard `ASYMM_EXPERT_ACT_OFFLOAD` is therefore a no-op for the dense MLP; `ASYMM_LAYER_GC`
+    # offloads the MLP activation (HBM win) while keeping the backward on GPU (fast). Set
+    # ASYMM_DENSE_MLP_SURGICAL_OFFLOAD=1 only to opt into the CPU-side path for small workloads.
+    dense_mlp_act_enabled = (
+        backend == "asym"
+        and not expert_prefixes
+        and (
+            _env_true(os.environ.get("ASYMM_DENSE_MLP_SURGICAL_OFFLOAD"))
+            or _env_true(os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_SURGICAL_OFFLOAD"))
+        )
+    )
+    report.dense_mlp_act_offload_enabled = bool(dense_mlp_act_enabled)
+    if dense_mlp_act_enabled:
+        from asym_gemm.training.dense_mlp import AsymDenseMLP, build_dense_mlp_expert_engine, is_dense_mlp_module
+        from asym_gemm.training.exp_act_offload_lora import require_expert_activation_offload_kernels
+
+        require_expert_activation_offload_kernels(scope="full")
+        dense_mlp_names = [
+            name
+            for name, module in model.named_modules()
+            if name
+            and not _is_under(name, expert_prefixes)
+            and not _is_router_module_name(name)
+            and not _is_vision_or_multimodal_path(name)
+            and is_dense_mlp_module(module)
+        ]
+        for name in dense_mlp_names:
+            module = model.get_submodule(name)
+            engine = build_dense_mlp_expert_engine(
+                module,
+                backend=backend,
+                precision=precision,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                stats=stats,
+                strict=strict,
+            )
+            parent, child_name = _parent_and_child(model, name)
+            _replace_child(parent, child_name, AsymDenseMLP(engine))
+            expert_prefixes.append(name)
+            report.dense_mlp_act_offload_wrapped += 1
+            report.cpu_resident_base_bytes += int(getattr(engine, "cpu_resident_base_bytes", 0))
+            report.gpu_resident_base_bytes += int(getattr(engine, "gpu_resident_base_bytes", 0))
+            del module
+            _release_replaced_module_memory()
 
     if _attention_gc_enabled_for_policy(recompute_config.label):
         wrapped_attention, skipped_attention = _wrap_attention_checkpoint_modules(model, strict=strict)

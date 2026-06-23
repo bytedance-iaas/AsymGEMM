@@ -23,6 +23,22 @@ CONDA_EXE=${CONDA_EXE:-conda}
 NSYS_BIN=${NSYS_BIN:-nsys}
 DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun} # torchrun | accelerate | deepspeed
 
+# DeepSpeed NVMe offload (async_io) needs libaio, provided by a shared sidecar conda env at
+# ${ROOT}/.aioenv so every container sees it like .venv. Guarded + harmless for non-NVMe backends.
+# CFLAGS/LDFLAGS let DeepSpeed JIT-compile async_io; LD_LIBRARY_PATH lets the built op load libaio.so.1.
+AIO_HOME=${AIO_HOME:-${ROOT}/.aioenv}
+if [[ -d "${AIO_HOME}/lib" ]]; then
+  # g++ honors CPATH/LIBRARY_PATH directly; the DeepSpeed/ninja JIT build does NOT pass CFLAGS/LDFLAGS
+  # into its compile line, so CPATH/LIBRARY_PATH are what actually let it find libaio.h and -laio.
+  # LD_LIBRARY_PATH lets the compiled async_io op load libaio.so.1 at runtime. (CFLAGS/LDFLAGS kept
+  # too for DeepSpeed's is_compatible() probe; harmless otherwise.)
+  export CPATH="${AIO_HOME}/include${CPATH:+:${CPATH}}"
+  export LIBRARY_PATH="${AIO_HOME}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+  export LD_LIBRARY_PATH="${AIO_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  export CFLAGS="-I${AIO_HOME}/include ${CFLAGS:-}"
+  export LDFLAGS="-L${AIO_HOME}/lib ${LDFLAGS:-}"
+fi
+
 # Workload and placement
 MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-Qwen/Qwen3-30B-A3B}
 BACKEND=${BACKEND:-asym}              # torch | zero2 | zero3 | zero3_offload | zero3_offload_mem | zero3_cpuadam | superoffload | superoffload_mem | asym_torch | asym | kt_torchbf16 | kt_armbf16
@@ -50,6 +66,7 @@ LEARNING_RATE=${LEARNING_RATE:-1e-4}
 LORA_RANK=${LORA_RANK:-8}
 LORA_ALPHA=${LORA_ALPHA:-16}
 LORA_DROPOUT=${LORA_DROPOUT:-0.0}
+FINETUNING_TYPE=${FINETUNING_TYPE:-lora} # lora | full
 LF_QWEN_MOE_EXPERT_LORA_IMPL=${LF_QWEN_MOE_EXPERT_LORA_IMPL:-split-target-parameters}
 SEED=${SEED:-42}
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
@@ -58,6 +75,7 @@ PREPROCESSING_NUM_WORKERS=${PREPROCESSING_NUM_WORKERS:-}
 DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-}
 TRAINING_BF16=${TRAINING_BF16:-}
 ENABLE_LIGER_KERNEL=${ENABLE_LIGER_KERNEL:-false}
+USE_UNSLOTH_GC=${USE_UNSLOTH_GC:-false}
 
 # AsymGEMM
 ASYM_PRECISION=${ASYM_PRECISION:-bf16}
@@ -195,6 +213,8 @@ zero_deepspeed_config() {
     zero3) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_config.json" ;;
     zero3_offload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json" ;;
     zero3_offload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_config.json" ;;
+    zero3_offload_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_opnvme_config.json" ;;
+    zero3_offload_pnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_pnvme_config.json" ;;
     zero3_cpuadam) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_cpuadam_config.json" ;;
     superoffload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_config.json" ;;
     superoffload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_config.json" ;;
@@ -230,6 +250,18 @@ case "${BACKEND,,}" in
     ZERO_BACKEND_LABEL=zero3_offload_mem
     BACKEND=torch
     TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero3_offload_mem)"
+    ;;
+  zero3_offload_opnvme)
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-zero3_offload_opnvme}
+    ZERO_BACKEND_LABEL=zero3_offload_opnvme
+    BACKEND=torch
+    TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero3_offload_opnvme)"
+    ;;
+  zero3_offload_pnvme)
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-zero3_offload_pnvme}
+    ZERO_BACKEND_LABEL=zero3_offload_pnvme
+    BACKEND=torch
+    TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero3_offload_pnvme)"
     ;;
   zero3_cpuadam)
     PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-zero3_cpuadam}
@@ -365,6 +397,18 @@ case "${ENABLE_LIGER_KERNEL,,}" in
   0|false|no|n|off) ENABLE_LIGER_KERNEL=false ;;
   *) echo "ENABLE_LIGER_KERNEL must be true or false, got '${ENABLE_LIGER_KERNEL}'" >&2; exit 2 ;;
 esac
+case "${USE_UNSLOTH_GC,,}" in
+  1|true|yes|y|on) USE_UNSLOTH_GC=true ;;
+  0|false|no|n|off) USE_UNSLOTH_GC=false ;;
+  *) echo "USE_UNSLOTH_GC must be true or false, got '${USE_UNSLOTH_GC}'" >&2; exit 2 ;;
+esac
+# Unsloth GC only installs when gradient checkpointing is enabled (LF prepare_model_for_training).
+if [[ "${USE_UNSLOTH_GC}" == "true" ]]; then
+  case "${GRADIENT_CHECKPOINTING,,}" in
+    1|true|yes|y|on) : ;;
+    *) echo "USE_UNSLOTH_GC=true requires GRADIENT_CHECKPOINTING=true" >&2; exit 2 ;;
+  esac
+fi
 if [[ "${ENABLE_LIGER_KERNEL}" == "true" ]]; then
   LIGER_LOSS_TAG=ligerloss1
 else
@@ -372,6 +416,10 @@ else
 fi
 
 MODEL_TAG=$(basename "${MODEL_NAME_OR_PATH}" | tr '/:' '__')
+case "${FINETUNING_TYPE,,}" in
+  lora|full) FINETUNING_TYPE="${FINETUNING_TYPE,,}" ;;
+  *) echo "FINETUNING_TYPE must be lora or full; got '${FINETUNING_TYPE}'" >&2; exit 2 ;;
+esac
 case "${LF_QWEN_MOE_EXPERT_LORA_IMPL,,}" in
   peft-target-parameters|split-target-parameters|off) LF_QWEN_MOE_EXPERT_LORA_IMPL="${LF_QWEN_MOE_EXPERT_LORA_IMPL,,}" ;;
   *) echo "LF_QWEN_MOE_EXPERT_LORA_IMPL must be peft-target-parameters, split-target-parameters, or off; got '${LF_QWEN_MOE_EXPERT_LORA_IMPL}'" >&2; exit 2 ;;
@@ -1535,11 +1583,7 @@ CMD_ARGS=(
   --trust_remote_code true
   --stage sft
   --do_train true
-  --finetuning_type lora
-  --lora_rank "${LORA_RANK}"
-  --lora_alpha "${LORA_ALPHA}"
-  --lora_dropout "${LORA_DROPOUT}"
-  --lora_target all
+  --finetuning_type "${FINETUNING_TYPE}"
   --dataset "${DATASET}"
   --dataset_dir "${LF_DIR}/data"
   --template "${TEMPLATE}"
@@ -1565,7 +1609,16 @@ CMD_ARGS=(
   --seed "${SEED}"
   --bf16 "${TRAINING_BF16}"
   --enable_liger_kernel "${ENABLE_LIGER_KERNEL}"
+  --use_unsloth_gc "${USE_UNSLOTH_GC}"
 )
+if [[ "${FINETUNING_TYPE}" == "lora" ]]; then
+  CMD_ARGS+=(
+    --lora_rank "${LORA_RANK}"
+    --lora_alpha "${LORA_ALPHA}"
+    --lora_dropout "${LORA_DROPOUT}"
+    --lora_target all
+  )
+fi
 [[ -z "${MAX_GRAD_NORM}" ]] || CMD_ARGS+=(--max_grad_norm "${MAX_GRAD_NORM}")
 
 if is_zero_backend_run; then
@@ -1778,7 +1831,9 @@ RUN_ENV=(
   ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD}"
   LF_QWEN_MOE_EXPERT_LORA_IMPL="${LF_QWEN_MOE_EXPERT_LORA_IMPL}"
   ENABLE_LIGER_KERNEL="${ENABLE_LIGER_KERNEL}"
+  USE_UNSLOTH_GC="${USE_UNSLOTH_GC}"
   ASYM_GEMM_LF_CONFIG_LIGER_LOSS="${LIGER_LOSS_TAG}"
+  ASYM_GEMM_LF_CONFIG_USE_UNSLOTH_GC="${USE_UNSLOTH_GC}"
   ASYM_GEMM_LF_CONFIG_QWEN_EXPERT_LORA_IMPL="${LF_QWEN_MOE_EXPERT_LORA_IMPL}"
 )
 if [[ -n "${TRITON_CACHE_DIR:-}" ]]; then

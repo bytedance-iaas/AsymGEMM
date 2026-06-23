@@ -582,6 +582,8 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "zero3",
         "zero3_offload",
         "zero3_offload_mem",
+        "zero3_offload_opnvme",
+        "zero3_offload_pnvme",
         "zero3_cpuadam",
         "superoffload",
         "superoffload_mem",
@@ -1165,7 +1167,7 @@ def _should_install_deepspeed_hook(args: list[str], config: dict[str, Any]) -> b
     if _option_value(args, "--deepspeed"):
         return True
     backend = str(config.get("backend") or "").lower()
-    if backend in {"zero2", "zero3", "zero3_offload", "zero3_offload_mem", "zero3_cpuadam", "superoffload", "superoffload_mem"}:
+    if backend in {"zero2", "zero3", "zero3_offload", "zero3_offload_mem", "zero3_offload_opnvme", "zero3_offload_pnvme", "zero3_cpuadam", "superoffload", "superoffload_mem"}:
         return True
     return bool(config.get("superoffload_config") or config.get("cpuadam_config") or config.get("deepspeed_config"))
 
