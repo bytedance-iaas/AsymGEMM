@@ -13,12 +13,14 @@ graph this whole chain records into it; on replay the CUDA runtime re-invokes
 the host node (CPU recomputes) — no ``--disable-cuda-graph`` needed. The
 mechanism is validated standalone in tests/phase0_cudagraph_decode.py.
 
-Scope (this phase): batch size in ``SUPPORTED_BATCH`` and the all-CPU regime.
-At T=1 every routed expert holds exactly one token (<= m_cpu), so the GPU
-bucket is always empty and the host node does the whole layer. The caller
-supplies ``expert_ids`` already clamped >= 0 and ``route_w`` already masked
-(invalid slots = 0) and scaled (routed_scaling folded in), so the host node's
-route-weighted reduce produces the final output directly.
+Scope: any batch size T (all-CPU). The host node groups the (token, slot)
+routing into a per-expert concatenated layout and runs the same per-expert
+batched CPU kernel the eager path uses, so larger batches engage more pool
+threads. It does NOT offload large experts to the GPU, so capture should be
+limited to a moderate batch (``--cuda-graph-max-bs``); larger decode batches,
+where the eager path's GPU offload wins, are left to eager. The caller supplies
+``expert_ids`` already clamped >= 0 and ``route_w`` already masked (invalid
+slots = 0); routed_scaling is applied by the caller after the H2D copy.
 """
 from __future__ import annotations
 
@@ -30,11 +32,9 @@ import torch
 
 from .. import _cpu_C as _C
 
-# Batch sizes for which the capturable host-node path is available. Larger
-# batches (where the m_cpu split genuinely activates) need the static-layout +
-# routing-weight masking design and are out of scope here; they fall back to
-# the BF16 path under capture.
-SUPPORTED_BATCH = (1,)
+# The host-node path now supports any batch size (all-CPU). The set of batch
+# sizes actually pre-allocated is whatever init_capturable_decode is given
+# (the CUDA-graph capture batch sizes); see asym_gemm_unified glue.
 
 _cudart = None
 _fn_ptr = None
@@ -125,10 +125,11 @@ def init_capturable_decode(layer, batch_sizes) -> None:
     # / ctypes setup during capture).
     _cudart_lib()
     _host_fn_ptr()
-    cap = {}
+    cap = getattr(layer, "_capturable", None) or {}
     for T in batch_sizes:
-        if T in SUPPORTED_BATCH:
-            cap[int(T)] = _DecodeBuffers(layer, int(T))
+        t = int(T)
+        if t >= 1 and t not in cap:
+            cap[t] = _DecodeBuffers(layer, t)
     layer._capturable = cap
 
 
