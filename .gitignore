@@ -43,16 +43,8 @@ submodules/
 
 # Local profiling/report artifacts
 agent/archive/
-# !agent/
-# !agent/mlp_math.md
-# !agent/contribs.md
-# !agent/status.md
-# !agent/attn_math.md
-# !agent/impls/*
 profiling*/
 test_profiling*/
-# !/profiling/transpose_ncu/
-# !/profiling/transpose_ncu/**
 results/
 reports/
 third-party/
