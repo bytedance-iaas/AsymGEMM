@@ -10,11 +10,21 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 namespace asym_gemm::exp_act_offload {
 namespace {
 
 constexpr int kThreads = 256;
+
+// v13: opt-out switch. The tiled, atomic-free LoRA-A weight-gradient kernel is
+// the default; set ASYMM_LORA_A_GRAD_ATOMIC=1 to fall back to the legacy
+// per-element atomicAdd kernel (kept for debugging / A-B comparison).
+inline bool use_atomic_lora_a_grad() {
+    const char* v = std::getenv("ASYMM_LORA_A_GRAD_ATOMIC");
+    return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+}
 
 __device__ __forceinline__ float to_float(at::BFloat16 v) {
     return static_cast<float>(v);
@@ -131,6 +141,142 @@ __global__ void lora_a_grad_kernel(
     }
 }
 
+// v13: shared-memory-tiled, atomic-free LoRA-A weight-gradient kernel.
+//
+// Computes, per expert group g:  grad[g] = dS_g^T @ X_g   (shape [rank, K]),
+// reducing over the group's rows *inside one CTA* so there are no global
+// atomics. The output region [rank, K-tile] of each (group, K-tile) CTA is
+// disjoint, so the FP32 register accumulators are written straight to BF16 ---
+// no FP32 scratch buffer and no separate cast kernel are needed.
+//
+// Grid:  x = ceil(k_total / BN)  (output column tiles)
+//        y = groups              (one expert segment each)
+// Block: (BN, RY) threads. Thread (tx,ty) owns output column n0+tx and the
+// rank rows r = ty, ty+RY, ... . X (CPU-resident) and dS (HBM) tiles are staged
+// in SMEM and reused across the rank dimension.
+template <int BN, int RY, int BROWS, int RANK_MAX>
+__global__ void lora_a_grad_tiled_kernel(
+    const at::BFloat16* __restrict__ dS0,
+    const at::BFloat16* __restrict__ dS1,
+    const at::BFloat16* __restrict__ source_cpu,
+    at::BFloat16* __restrict__ grad0,
+    at::BFloat16* __restrict__ grad1,
+    const int32_t* __restrict__ offsets,
+    const int32_t* __restrict__ experts,
+    int32_t groups,
+    int32_t rank,
+    int32_t k_total) {
+    const int group = static_cast<int>(blockIdx.y);
+    if (group >= groups) return;
+    const int expert = experts[group];
+    if (expert < 0) return;
+    const int start = offsets[2 * group];
+    const int end = offsets[2 * group + 1];
+    const int rows = end - start;
+
+    const int tx = static_cast<int>(threadIdx.x);   // column within the tile
+    const int ty = static_cast<int>(threadIdx.y);   // rank row-group
+    const int n0 = static_cast<int>(blockIdx.x) * BN;
+    const int col = n0 + tx;
+    const bool col_valid = col < k_total;
+    constexpr int NT = BN * RY;
+    const int tid = ty * BN + tx;
+    const bool pair = (dS1 != nullptr && grad1 != nullptr);
+
+    constexpr int ACC = (RANK_MAX + RY - 1) / RY;
+    float acc0[ACC];
+    float acc1[ACC];
+    #pragma unroll
+    for (int i = 0; i < ACC; ++i) { acc0[i] = 0.f; acc1[i] = 0.f; }
+
+    // sX is staged with 128-bit stores, so it must be 16-byte aligned.
+    __shared__ __align__(16) at::BFloat16 sX[BROWS][BN];
+    __shared__ at::BFloat16 sS0[BROWS][RANK_MAX];
+    __shared__ at::BFloat16 sS1[BROWS][RANK_MAX];
+
+    // Vectorized host->SMEM staging of X: 128-bit (8 bf16) loads over NVLink-C2C.
+    // BN is a multiple of 8 and, in every real shape, k_total % 8 == 0, so each
+    // 8-column chunk is either fully in range or fully out (zero). A scalar tail
+    // keeps correctness if some exotic k_total is not a multiple of 8.
+    constexpr int VEC = 8;
+    constexpr int VPR = BN / VEC;                 // int4 chunks per tile row
+    for (int r0 = 0; r0 < rows; r0 += BROWS) {
+        const int crows = min(BROWS, rows - r0);
+        for (int e = tid; e < crows * VPR; e += NT) {
+            const int rr = e / VPR;
+            const int j = e - rr * VPR;
+            const int c = n0 + j * VEC;
+            const int64_t xbase = static_cast<int64_t>(start + r0 + rr) * k_total + c;
+            if (c + VEC <= k_total) {
+                *reinterpret_cast<int4*>(&sX[rr][j * VEC]) =
+                    *reinterpret_cast<const int4*>(&source_cpu[xbase]);
+            } else {
+                // Scalar tail (only reachable for exotic k_total not a multiple of 8).
+                #pragma unroll
+                for (int l = 0; l < VEC; ++l)
+                    sX[rr][j * VEC + l] =
+                        (c + l < k_total) ? source_cpu[xbase + l] : static_cast<at::BFloat16>(0);
+            }
+        }
+        for (int e = tid; e < crows * rank; e += NT) {
+            const int rr = e / rank;
+            const int r = e - rr * rank;
+            const int64_t base = static_cast<int64_t>(start + r0 + rr) * rank + r;
+            sS0[rr][r] = dS0[base];
+            if (pair) sS1[rr][r] = dS1[base];
+        }
+        __syncthreads();
+        if (col_valid) {
+            for (int rr = 0; rr < crows; ++rr) {
+                const float xv = static_cast<float>(sX[rr][tx]);
+                #pragma unroll
+                for (int i = 0; i < ACC; ++i) {
+                    const int r = ty + i * RY;
+                    if (r < rank) {
+                        acc0[i] += static_cast<float>(sS0[rr][r]) * xv;
+                        if (pair) acc1[i] += static_cast<float>(sS1[rr][r]) * xv;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (col_valid) {
+        #pragma unroll
+        for (int i = 0; i < ACC; ++i) {
+            const int r = ty + i * RY;
+            if (r < rank) {
+                const int64_t out =
+                    (static_cast<int64_t>(expert) * rank + r) * k_total + col;
+                grad0[out] = static_cast<at::BFloat16>(acc0[i]);
+                if (pair) grad1[out] = static_cast<at::BFloat16>(acc1[i]);
+            }
+        }
+    }
+}
+
+template <int BN, int RY, int BROWS, int RANK_MAX>
+void launch_lora_a_grad_tiled(
+    const at::BFloat16* dS0,
+    const at::BFloat16* dS1,
+    const at::BFloat16* source_cpu,
+    at::BFloat16* grad0,
+    at::BFloat16* grad1,
+    const int32_t* offsets,
+    const int32_t* experts,
+    int groups,
+    int rank,
+    int k_total,
+    cudaStream_t stream) {
+    TORCH_CHECK(rank <= RANK_MAX, "lora_a_grad_tiled: rank ", rank, " exceeds RANK_MAX ", RANK_MAX);
+    dim3 block(BN, RY);
+    dim3 grid(static_cast<unsigned int>((k_total + BN - 1) / BN), static_cast<unsigned int>(groups));
+    lora_a_grad_tiled_kernel<BN, RY, BROWS, RANK_MAX><<<grid, block, 0, stream>>>(
+        dS0, dS1, source_cpu, grad0, grad1, offsets, experts, groups, rank, k_total);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 __global__ void lora_b_backward_kernel(
     const at::BFloat16* __restrict__ grad_out_cpu,
     const at::BFloat16* __restrict__ low_rank,
@@ -222,25 +368,43 @@ void sm100_grouped_lora_a_grad_bf16_cpu_right(
         return;
     }
 
-    auto grad_acc = torch::zeros(grad_a.sizes(), grad_a.options().dtype(torch::kFloat32));
-    const int64_t max_linear = plan.max_rows * source_cpu.size(1);
-    dim3 grid(blocks_for(max_linear), static_cast<unsigned int>(plan.groups));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    lora_a_grad_kernel<<<grid, kThreads, 0, stream>>>(
+    if (use_atomic_lora_a_grad()) {
+        auto grad_acc = torch::zeros(grad_a.sizes(), grad_a.options().dtype(torch::kFloat32));
+        const int64_t max_linear = plan.max_rows * source_cpu.size(1);
+        dim3 grid(blocks_for(max_linear), static_cast<unsigned int>(plan.groups));
+        lora_a_grad_kernel<<<grid, kThreads, 0, stream>>>(
+            grad_low_rank.data_ptr<at::BFloat16>(),
+            nullptr,
+            source_cpu.data_ptr<at::BFloat16>(),
+            grad_acc.data_ptr<float>(),
+            nullptr,
+            offsets.data_ptr<int32_t>(),
+            experts.data_ptr<int32_t>(),
+            static_cast<int32_t>(plan.groups),
+            static_cast<int32_t>(grad_low_rank.size(0)),
+            static_cast<int32_t>(grad_low_rank.size(1)),
+            static_cast<int32_t>(source_cpu.size(1)),
+            max_linear);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        cast_fp32_to_bf16(grad_acc, grad_a, stream);
+        return;
+    }
+    // Tiled, atomic-free path (default). Experts that never appear as a group
+    // are zeroed here; active experts are fully overwritten by the kernel.
+    grad_a.zero_();
+    launch_lora_a_grad_tiled<64, 8, 32, 128>(
         grad_low_rank.data_ptr<at::BFloat16>(),
         nullptr,
         source_cpu.data_ptr<at::BFloat16>(),
-        grad_acc.data_ptr<float>(),
+        grad_a.data_ptr<at::BFloat16>(),
         nullptr,
         offsets.data_ptr<int32_t>(),
         experts.data_ptr<int32_t>(),
         static_cast<int32_t>(plan.groups),
-        static_cast<int32_t>(grad_low_rank.size(0)),
         static_cast<int32_t>(grad_low_rank.size(1)),
         static_cast<int32_t>(source_cpu.size(1)),
-        max_linear);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    cast_fp32_to_bf16(grad_acc, grad_a, stream);
+        stream);
 }
 
 void sm100_grouped_lora_a_pair_grad_bf16_cpu_right(
@@ -276,27 +440,44 @@ void sm100_grouped_lora_a_pair_grad_bf16_cpu_right(
         return;
     }
 
-    auto grad_gate_acc = torch::zeros(grad_gate.sizes(), grad_gate.options().dtype(torch::kFloat32));
-    auto grad_up_acc = torch::zeros(grad_up.sizes(), grad_up.options().dtype(torch::kFloat32));
-    const int64_t max_linear = plan.max_rows * x_cpu.size(1);
-    dim3 grid(blocks_for(max_linear), static_cast<unsigned int>(plan.groups));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    lora_a_grad_kernel<<<grid, kThreads, 0, stream>>>(
+    if (use_atomic_lora_a_grad()) {
+        auto grad_gate_acc = torch::zeros(grad_gate.sizes(), grad_gate.options().dtype(torch::kFloat32));
+        auto grad_up_acc = torch::zeros(grad_up.sizes(), grad_up.options().dtype(torch::kFloat32));
+        const int64_t max_linear = plan.max_rows * x_cpu.size(1);
+        dim3 grid(blocks_for(max_linear), static_cast<unsigned int>(plan.groups));
+        lora_a_grad_kernel<<<grid, kThreads, 0, stream>>>(
+            dS_gate.data_ptr<at::BFloat16>(),
+            dS_up.data_ptr<at::BFloat16>(),
+            x_cpu.data_ptr<at::BFloat16>(),
+            grad_gate_acc.data_ptr<float>(),
+            grad_up_acc.data_ptr<float>(),
+            offsets.data_ptr<int32_t>(),
+            experts.data_ptr<int32_t>(),
+            static_cast<int32_t>(plan.groups),
+            static_cast<int32_t>(dS_gate.size(0)),
+            static_cast<int32_t>(dS_gate.size(1)),
+            static_cast<int32_t>(x_cpu.size(1)),
+            max_linear);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        cast_fp32_to_bf16(grad_gate_acc, grad_gate, stream);
+        cast_fp32_to_bf16(grad_up_acc, grad_up, stream);
+        return;
+    }
+    grad_gate.zero_();
+    grad_up.zero_();
+    launch_lora_a_grad_tiled<64, 8, 32, 128>(
         dS_gate.data_ptr<at::BFloat16>(),
         dS_up.data_ptr<at::BFloat16>(),
         x_cpu.data_ptr<at::BFloat16>(),
-        grad_gate_acc.data_ptr<float>(),
-        grad_up_acc.data_ptr<float>(),
+        grad_gate.data_ptr<at::BFloat16>(),
+        grad_up.data_ptr<at::BFloat16>(),
         offsets.data_ptr<int32_t>(),
         experts.data_ptr<int32_t>(),
         static_cast<int32_t>(plan.groups),
-        static_cast<int32_t>(dS_gate.size(0)),
         static_cast<int32_t>(dS_gate.size(1)),
         static_cast<int32_t>(x_cpu.size(1)),
-        max_linear);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    cast_fp32_to_bf16(grad_gate_acc, grad_gate, stream);
-    cast_fp32_to_bf16(grad_up_acc, grad_up, stream);
+        stream);
 }
 
 void sm100_grouped_lora_b_backward_bf16_cpu_source(

@@ -628,7 +628,8 @@ static void sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous(
                                               const torch::Tensor& d,
                                               const torch::Tensor& offsets, const torch::Tensor& experts,
                                               const torch::Tensor& list_size_t,
-                                              const std::string& compiled_dims) {
+                                              const std::string& compiled_dims,
+                                              const int& compact_m_blocks = 0) {
     check_list_size_tensor(list_size_t);
 
     check_cpu_left_condition(device_runtime->get_arch_major() == 10, "requires_sm100");
@@ -671,7 +672,8 @@ static void sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous(
                                                        offsets, experts, grid_y,
                                                        num_groups, m, n, k,
                                                        major_a, major_b, compiled_dims,
-                                                       static_cast<int>(b.stride(get_non_contiguous_dim(major_b))));
+                                                       static_cast<int>(b.stride(get_non_contiguous_dim(major_b))),
+                                                       compact_m_blocks);
 }
 
 static void sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous(
@@ -680,7 +682,8 @@ static void sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous(
                                               const torch::Tensor& d,
                                               const torch::Tensor& offsets, const torch::Tensor& experts,
                                               const int& list_size,
-                                              const std::string& compiled_dims) {
+                                              const std::string& compiled_dims,
+                                              const int& compact_m_blocks = 0) {
     check_cpu_left_condition(device_runtime->get_arch_major() == 10, "requires_sm100");
     check_cpu_left_condition(a.device().is_cpu(), "input_not_cpu");
     check_cpu_left_condition(a.is_pinned(), "input_not_pinned");
@@ -723,7 +726,74 @@ static void sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous(
                                                        offsets, experts, grid_y,
                                                        num_groups, m, n, k,
                                                        major_a, major_b, compiled_dims,
-                                                       static_cast<int>(b.stride(get_non_contiguous_dim(major_b))));
+                                                       static_cast<int>(b.stride(get_non_contiguous_dim(major_b))),
+                                                       compact_m_blocks);
+}
+
+static void sm100_m_grouped_bf16_cpu_left_pair_asym_gemm_nt_contiguous(
+                                              const torch::Tensor& a,
+                                              const torch::Tensor& b_gate,
+                                              const torch::Tensor& b_up,
+                                              const torch::Tensor& d_gate,
+                                              const torch::Tensor& d_up,
+                                              const torch::Tensor& offsets, const torch::Tensor& experts,
+                                              const int& list_size,
+                                              const std::string& compiled_dims,
+                                              const int& compact_m_blocks = 0) {
+    check_cpu_left_condition(device_runtime->get_arch_major() == 10, "requires_sm100");
+    check_cpu_left_condition(a.device().is_cpu(), "input_not_cpu");
+    check_cpu_left_condition(a.is_pinned(), "input_not_pinned");
+    check_cpu_left_condition(b_gate.is_cuda() && b_up.is_cuda(), "weight_not_cuda");
+    check_cpu_left_condition(d_gate.is_cuda() && d_up.is_cuda(), "output_not_cuda");
+    check_cpu_left_condition(a.dim() == 2 && b_gate.dim() == 3 && b_up.dim() == 3 &&
+                             d_gate.dim() == 2 && d_up.dim() == 2, "requires_2d_input_3d_weight");
+    check_cpu_left_condition(a.is_contiguous() && b_gate.is_contiguous() && b_up.is_contiguous() &&
+                             d_gate.is_contiguous() && d_up.is_contiguous(), "requires_contiguous");
+    check_cpu_left_condition(a.scalar_type() == torch::kBFloat16 &&
+                             b_gate.scalar_type() == torch::kBFloat16 &&
+                             b_up.scalar_type() == torch::kBFloat16,
+                             "requires_bf16");
+    check_cpu_left_condition(d_gate.scalar_type() == d_up.scalar_type(), "output_dtype_mismatch");
+    check_cpu_left_condition(d_gate.scalar_type() == torch::kBFloat16 || d_gate.scalar_type() == torch::kFloat,
+                             "requires_bf16_or_fp32_output");
+
+    const auto& major_a = get_major_type_ab(a);
+    const auto& major_b = get_major_type_ab(b_gate);
+    check_cpu_left_condition(major_a == cute::UMMA::Major::K && major_b == cute::UMMA::Major::K,
+                             "requires_k_major_operands");
+    check_cpu_left_condition(get_major_type_ab(b_up) == major_b, "requires_k_major_operands");
+    check_major_type_cd(d_gate);
+    check_major_type_cd(d_up);
+
+    const auto& [m, k_a] = get_shape<2>(a);
+    const auto& [num_groups, n, k] = get_shape<3>(b_gate);
+    const auto& [num_groups_up, n_up, k_up] = get_shape<3>(b_up);
+    const auto& [m_gate, n_gate] = get_shape<2>(d_gate);
+    const auto& [m_up, n_up_out] = get_shape<2>(d_up);
+    check_cpu_left_condition(num_groups > 0, "requires_positive_groups");
+    check_cpu_left_condition(num_groups == num_groups_up && n == n_up && k == k_up, "shape_mismatch");
+    check_cpu_left_condition(n > 0 && k > 0, "requires_positive_nk");
+    check_cpu_left_condition(m == m_gate && m == m_up && n == n_gate && n == n_up_out && k == k_a, "shape_mismatch");
+    check_cpu_left_condition(n % 8 == 0 && k % 8 == 0, "requires_8_aligned_nk");
+
+    const int grid_y = list_size - 1;
+    check_cpu_left_condition(list_size >= 1, "metadata_mismatch");
+    check_cpu_left_condition(offsets.is_cuda() && experts.is_cuda(), "metadata_not_cuda");
+    check_cpu_left_condition(offsets.is_contiguous() && experts.is_contiguous(), "metadata_not_contiguous");
+    check_cpu_left_condition(offsets.scalar_type() == torch::kInt && experts.scalar_type() == torch::kInt,
+                             "metadata_not_int32");
+    check_cpu_left_condition(offsets.numel() >= 2 * grid_y && experts.numel() >= list_size,
+                             "metadata_mismatch");
+
+    if (m == 0 || grid_y <= 0)
+        return;
+
+    sm100_m_grouped_bf16_cpu_left_pair_asym_gemm_contiguous(a, b_gate, b_up, d_gate, d_up,
+                                                            offsets, experts, grid_y,
+                                                            num_groups, m, n, k,
+                                                            major_a, major_b, compiled_dims,
+                                                            static_cast<int>(b_gate.stride(get_non_contiguous_dim(major_b))),
+                                                            compact_m_blocks);
 }
 
 static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const torch::Tensor& b,
@@ -1038,19 +1108,28 @@ static void register_apis(pybind11::module_& m) {
     m.def("sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous",
           static_cast<void(*)(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
                               const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
-                              const std::string&)>(
+                              const std::string&, const int&)>(
               &sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous),
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
-          py::arg("compiled_dims") = "nk");
+          py::arg("compiled_dims") = "nk",
+          py::arg("compact_m_blocks") = 0);
     m.def("sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous",
           static_cast<void(*)(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
                               const torch::Tensor&, const torch::Tensor&, const int&,
-                              const std::string&)>(
+                              const std::string&, const int&)>(
               &sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous),
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
-          py::arg("compiled_dims") = "nk");
+          py::arg("compiled_dims") = "nk",
+          py::arg("compact_m_blocks") = 0);
+    m.def("sm100_m_grouped_bf16_cpu_left_pair_asym_gemm_nt_contiguous",
+          &sm100_m_grouped_bf16_cpu_left_pair_asym_gemm_nt_contiguous,
+          py::arg("a"), py::arg("b_gate"), py::arg("b_up"),
+          py::arg("d_gate"), py::arg("d_up"),
+          py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
+          py::arg("compiled_dims") = "nk",
+          py::arg("compact_m_blocks") = 0);
     m.def("m_grouped_bf16_asym_gemm_nt_masked",
           static_cast<void(*)(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
                               const torch::Tensor&, const int&, const std::string&)>(

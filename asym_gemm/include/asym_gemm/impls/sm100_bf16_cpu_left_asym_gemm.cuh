@@ -22,13 +22,17 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
           GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t,
-          uint64_t kTensorCoreUtilControl>
+          uint64_t kTensorCoreUtilControl,
+          bool kCompactMBlockGrid,
+          bool kPairOutput>
 __global__ void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_bf16_cpu_left_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_b,
-                     const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
+                     const __grid_constant__ cute::TmaDescriptor tensor_map_cd,
+                     const __grid_constant__ cute::TmaDescriptor tensor_map_b_pair,
+                     const __grid_constant__ cute::TmaDescriptor tensor_map_cd_pair) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     // Enlarge `BLOCK_K` for some cases
     // NOTES: this is for reducing the `umma_arrive()` overhead
@@ -188,7 +192,7 @@ sm100_bf16_cpu_left_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
     // must release the TMEM before returning, otherwise subsequent kernels see
     // "tensor memory not completely freed". Use the same one-warp-frees pattern
     // as the normal exit path.
-    const uint32_t block_m_iter = blockIdx.x;
+    const uint32_t block_m_iter = kCompactMBlockGrid ? (scheduler.m_start + blockIdx.x) : blockIdx.x;
     if (scheduler.m_start >= scheduler.m_end or block_m_iter < scheduler.m_start or block_m_iter >= scheduler.m_end) {
         if (warp_idx == 2) {
             const auto tmem_ptr = ld_shared(tmem_ptr_in_smem);
@@ -210,7 +214,8 @@ sm100_bf16_cpu_left_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
     // Dispatch warps into different roles. CPU-left owns one M tile per CTA
     // and reuses that host-resident A tile across all CUDA-resident B/N tiles.
     if (warp_idx == 0 and cute::elect_one_sync()) {
-        const uint32_t num_n_blocks = ceil_div_device(shape_n, BLOCK_N);
+        const uint32_t num_n_blocks_per_output = ceil_div_device(shape_n, BLOCK_N);
+        const uint32_t num_n_blocks = kPairOutput ? num_n_blocks_per_output * 2 : num_n_blocks_per_output;
         const uint32_t m_idx = block_m_iter * BLOCK_M;
 
         for (int block_k_iter = 0; block_k_iter < block_k; ++block_k_iter) {
@@ -228,11 +233,14 @@ sm100_bf16_cpu_left_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
             }
 
             for (uint32_t block_n_iter = 0; block_n_iter < num_n_blocks; advance_pipeline(block_n_iter)) {
-                const uint32_t n_idx = block_n_iter * BLOCK_N + shape_n * scheduler.current_group_idx;
+                const uint32_t pair_output_idx = kPairOutput ? block_n_iter / num_n_blocks_per_output : 0;
+                const uint32_t local_block_n_iter = kPairOutput ? block_n_iter - pair_output_idx * num_n_blocks_per_output : block_n_iter;
+                const uint32_t n_idx = local_block_n_iter * BLOCK_N + shape_n * scheduler.current_group_idx;
+                const auto* selected_tensor_map_b = (kPairOutput && pair_output_idx != 0) ? &tensor_map_b_pair : &tensor_map_b;
 
                 empty_barriers[stage_idx]->wait(phase ^ 1);
                 tma_copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, cutlass::bfloat16_t, false>(
-                    &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx, kNumMulticast, 0);
+                    selected_tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx, kNumMulticast, 0);
 
                 if (is_leader_cta) {
                     full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE);
@@ -276,7 +284,8 @@ sm100_bf16_cpu_left_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
             accum_phase_idx ^= accum_stage_idx == 0;
         };
 
-        const uint32_t num_n_blocks = ceil_div_device(shape_n, BLOCK_N);
+        const uint32_t num_n_blocks_per_output = ceil_div_device(shape_n, BLOCK_N);
+        const uint32_t num_n_blocks = kPairOutput ? num_n_blocks_per_output * 2 : num_n_blocks_per_output;
         for (int block_k_iter = 0; block_k_iter < block_k; ++block_k_iter) {
             full_barriers_a[0]->wait(phase_a);
             phase_a ^= 1;
@@ -359,7 +368,8 @@ sm100_bf16_cpu_left_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
             accum_phase_idx ^= accum_stage_idx == 0;
         };
 
-        const uint32_t num_n_blocks = ceil_div_device(shape_n, BLOCK_N);
+        const uint32_t num_n_blocks_per_output = ceil_div_device(shape_n, BLOCK_N);
+        const uint32_t num_n_blocks = kPairOutput ? num_n_blocks_per_output * 2 : num_n_blocks_per_output;
         for (int block_k_iter = 0; block_k_iter < block_k; ++block_k_iter) {
             for (uint32_t block_n_iter = 0; block_n_iter < num_n_blocks; ++block_n_iter, advance_accum_pipeline()) {
                 tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
@@ -379,7 +389,10 @@ sm100_bf16_cpu_left_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                         cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
                         const auto m_idx = BLOCK_M * block_m_iter + w * WAVE_BLOCK_M;
-                        const auto n_idx = block_n_iter * BLOCK_N + s * STORE_BLOCK_N;
+                        const uint32_t pair_output_idx = kPairOutput ? block_n_iter / num_n_blocks_per_output : 0;
+                        const uint32_t local_block_n_iter = kPairOutput ? block_n_iter - pair_output_idx * num_n_blocks_per_output : block_n_iter;
+                        const auto n_idx = local_block_n_iter * BLOCK_N + s * STORE_BLOCK_N;
+                        const auto* selected_tensor_map_cd = (kPairOutput && pair_output_idx != 0) ? &tensor_map_cd_pair : &tensor_map_cd;
 
                         #pragma unroll
                         for (uint32_t i = 0; i < STORE_BLOCK_N / kNumElemsPerBankGroup; ++i) {
@@ -427,9 +440,9 @@ sm100_bf16_cpu_left_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
 
                         if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
                             if (block_k_iter == 0) {
-                                cute::SM90_TMA_STORE_2D::copy(&tensor_map_cd, smem_cd[tma_stage_idx], n_idx, m_idx);
+                                cute::SM90_TMA_STORE_2D::copy(selected_tensor_map_cd, smem_cd[tma_stage_idx], n_idx, m_idx);
                             } else {
-                                cute::SM90_TMA_REDUCE_ADD_2D::copy(&tensor_map_cd, smem_cd[tma_stage_idx], n_idx, m_idx);
+                                cute::SM90_TMA_REDUCE_ADD_2D::copy(selected_tensor_map_cd, smem_cd[tma_stage_idx], n_idx, m_idx);
                             }
                             cute::tma_store_arrive();
                         }

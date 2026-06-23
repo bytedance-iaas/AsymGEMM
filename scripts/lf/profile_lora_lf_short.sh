@@ -48,8 +48,8 @@ LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp|ligerloss"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp|ligerloss1,asym_cpuadamwds|recomp|ligerloss1"}
 # BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|unsloth|ligerloss1,zero3_offload|recomp|ligerloss1"}
-BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|unsloth|ligerloss1,superoffload_mem|recomp|ligerloss1"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp|ligerloss1"}
+# BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|unsloth|ligerloss1,superoffload_mem|recomp|ligerloss1"}
+BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp|ligerloss1"}
 
 # Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD|ASYMM_LAYER_GC.
 # ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false|false"}
@@ -76,6 +76,13 @@ SEED=${SEED:-42}
 
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
+
+# Kernel / SwiGLU-backward optimization toggles for this sweep (1=on, 0=off); forwarded via run_env below.
+# ASYMM_EXPERT_SILU_BWD_GPU: v14 expert SwiGLU backward on GPU. DG_BF16_CPU_LEFT_COMPACT_GRID: compact
+# CPU-left forward M-grid. Native gate/up pair fwd is intentionally left OFF (it needs LORA_A_FWD=cpu; we keep hbm).
+ASYMM_EXPERT_SILU_BWD_GPU=${ASYMM_EXPERT_SILU_BWD_GPU:-1}
+DG_BF16_CPU_LEFT_COMPACT_GRID=${DG_BF16_CPU_LEFT_COMPACT_GRID:-0}
+ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE=${ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE:-0}
 
 # Backend checks and AsymGEMM options
 # ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
@@ -113,6 +120,7 @@ MAX_SAMPLES=${MAX_SAMPLES:-256}
 # policy-independent backends. Qwen and Llama use the same env names.
 ASYM_OFFLOAD_ACT_RECOMPUTE=${ASYM_OFFLOAD_ACT_RECOMPUTE:-0}
 ASYM_OFFLOAD_X_UNPACKED=${ASYM_OFFLOAD_X_UNPACKED:-0}
+
 
 # Output and profiling
 OUTPUT_ROOT=${OUTPUT_ROOT:-}
@@ -2525,6 +2533,9 @@ run_job() {
     NUMACTL_MODE="${NUMACTL_MODE:-membind}"
     ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE:-0}"
     ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED:-0}"
+    ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU:-1}"
+    DG_BF16_CPU_LEFT_COMPACT_GRID="${DG_BF16_CPU_LEFT_COMPACT_GRID:-1}"
+    ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE="${ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE:-1}"
     LF_DIR="${LF_DIR}"
     ASYM_DIR="${ASYM_DIR}"
     ENV_DIR="${ENV_DIR}"

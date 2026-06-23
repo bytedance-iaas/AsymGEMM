@@ -903,16 +903,67 @@ def _activation_offload_cpu_silu_backward(
     grad_act: CPUActivationHandle,
     manager: ActivationOffloadManager,
 ) -> tuple[CPUActivationHandle, CPUActivationHandle]:
-    manager.wait_cpu_ready(gate)
-    manager.wait_cpu_ready(up)
-    manager.wait_cpu_ready(grad_act)
-    grad_gate = manager.empty_cpu(tuple(gate.tensor.shape), gate.tensor.dtype, gate.original_device, "dgate")
-    grad_up = manager.empty_cpu(tuple(up.tensor.shape), up.tensor.dtype, up.original_device, "dup")
-    with torch.no_grad():
-        silu = F.silu(gate.tensor)
-        grad_up.tensor.copy_(grad_act.tensor.mul(silu), non_blocking=False)
-        grad_gate.tensor.copy_(torch.ops.aten.silu_backward(grad_act.tensor.mul(up.tensor), gate.tensor), non_blocking=False)
+    with prof_range("backward.mlp.activation_offload.activation_cpu.wait"):
+        manager.wait_cpu_ready(gate)
+        manager.wait_cpu_ready(up)
+        manager.wait_cpu_ready(grad_act)
+    with prof_range("backward.mlp.activation_offload.activation_cpu.alloc"):
+        grad_gate = manager.empty_cpu(tuple(gate.tensor.shape), gate.tensor.dtype, gate.original_device, "dgate")
+        grad_up = manager.empty_cpu(tuple(up.tensor.shape), up.tensor.dtype, up.original_device, "dup")
+    with prof_range("backward.mlp.activation_offload.activation_cpu.math"):
+        with torch.no_grad():
+            silu = F.silu(gate.tensor)
+            grad_up.tensor.copy_(grad_act.tensor.mul(silu), non_blocking=False)
+            grad_gate.tensor.copy_(torch.ops.aten.silu_backward(grad_act.tensor.mul(up.tensor), gate.tensor), non_blocking=False)
     return grad_gate, grad_up
+
+
+def _use_gpu_silu_bwd() -> bool:
+    """v14: opt-in. Compute the expert SwiGLU backward on the GPU instead of on the
+    CPU. The CPU path is ~640 ms/layer (CPU-bandwidth-contended with the concurrent
+    gradient-offload D2H copies); the GPU is ~90% idle and does the same math in
+    sub-millisecond. Default OFF (preserves the all-CPU activation-offload behavior)."""
+    v = os.environ.get("ASYMM_EXPERT_SILU_BWD_GPU", "")
+    return v.lower() not in {"", "0", "false", "no", "off"}
+
+
+def _silu_backward_gpu(
+    gate_cpu: CPUActivationHandle,
+    up_cpu: CPUActivationHandle,
+    grad_act: torch.Tensor,
+    manager: ActivationOffloadManager,
+):
+    """GPU SwiGLU backward. Stages the offloaded gate/up activations back to the GPU
+    (transient ~200 MB each, released immediately), keeps grad_act on the GPU, and
+    computes grad_gate/grad_up there. Returns the same layout the CPU path produced:
+    a concatenated grad_gate_up = [grad_gate | grad_up] plus its two split views.
+
+    Takes the gate/up CPU handles explicitly (symmetric with the CPU
+    `_activation_offload_cpu_silu_backward`) so the Qwen3 and Llama4 expert
+    backwards can share it.
+
+    Numerically identical to `_activation_offload_cpu_silu_backward` (same BF16 ops):
+      grad_up   = grad_act * silu(gate)
+      grad_gate = silu_backward(grad_act * up, gate)
+    """
+    with prof_range("backward.mlp.activation_offload.activation_cpu.stage"):
+        gate_gpu = manager.stage(gate_cpu, tag="gate_for_silu_bwd")
+        up_gpu = manager.stage(up_cpu, tag="up_for_silu_bwd")
+    with prof_range("backward.mlp.activation_offload.activation_cpu.math"):
+        inter = int(gate_gpu.shape[1])
+        grad_gate_up = torch.empty(
+            (int(gate_gpu.shape[0]), 2 * inter), device=gate_gpu.device, dtype=gate_gpu.dtype
+        )
+        with torch.no_grad():
+            silu = F.silu(gate_gpu)
+            grad_gate_up[:, inter:].copy_(grad_act.mul(silu))
+            grad_gate_up[:, :inter].copy_(torch.ops.aten.silu_backward(grad_act.mul(up_gpu), gate_gpu))
+        grad_gate_stage, grad_up_stage = grad_gate_up.split(inter, dim=-1)
+    manager.release_stage(gate_gpu, drop_cache=True)
+    manager.release_stage(up_gpu, drop_cache=True)
+    manager.release_cpu(gate_cpu)
+    manager.release_cpu(up_cpu)
+    return grad_gate_up, grad_gate_stage, grad_up_stage
 
 
 def _rebuild_qwen3_packed_x_cpu(
@@ -1254,29 +1305,43 @@ class _ActivationOffloadQwen3ExpertFunction(torch.autograd.Function):
             )
             grad_act.add_(grad_down_lora_x.to(dtype=grad_act.dtype))
             del grad_down_lora_x
-            grad_act_cpu = manager.offload(grad_act, "dact")
-            del grad_act
-
-        with prof_range("backward.mlp.activation_offload.activation_cpu"):
-            grad_gate_cpu, grad_up_cpu = _activation_offload_cpu_silu_backward(
-                ctx.gate_cpu,
-                ctx.up_cpu,
-                grad_act_cpu,
-                manager,
-            )
-            manager.release_cpu(grad_act_cpu)
-            manager.release_cpu(ctx.gate_cpu)
-            manager.release_cpu(ctx.up_cpu)
+            # GPU SwiGLU-backward keeps grad_act resident on the GPU; the CPU path
+            # offloads it (D2H) so the SwiGLU backward can run on the host.
+            if _use_gpu_silu_bwd():
+                grad_act_cpu = None
+            else:
+                grad_act_cpu = manager.offload(grad_act, "dact")
+                del grad_act
 
         grad_packed = None
         grad_gate_lora_x = None
         grad_up_lora_x = None
+        # The GPU SwiGLU-backward path never materializes these CPU handles; keep them
+        # defined so the shared final-cleanup loop (release_cpu tolerates None) is happy.
+        grad_gate_cpu = None
+        grad_up_cpu = None
 
-        with prof_range("backward.mlp.activation_offload.gate_up_stage"):
-            grad_gate_up = manager.stage_concat_columns(grad_gate_cpu, grad_up_cpu, tag="dgate_up_for_gate_up_base")
-            grad_gate_stage, grad_up_stage = grad_gate_up.split(int(grad_gate_cpu.tensor.shape[1]), dim=-1)
-            manager.release_cpu(grad_gate_cpu)
-            manager.release_cpu(grad_up_cpu)
+        if _use_gpu_silu_bwd():
+            with prof_range("backward.mlp.activation_offload.activation_cpu"):
+                grad_gate_up, grad_gate_stage, grad_up_stage = _silu_backward_gpu(ctx.gate_cpu, ctx.up_cpu, grad_act, manager)
+                del grad_act
+        else:
+            with prof_range("backward.mlp.activation_offload.activation_cpu"):
+                grad_gate_cpu, grad_up_cpu = _activation_offload_cpu_silu_backward(
+                    ctx.gate_cpu,
+                    ctx.up_cpu,
+                    grad_act_cpu,
+                    manager,
+                )
+                manager.release_cpu(grad_act_cpu)
+                manager.release_cpu(ctx.gate_cpu)
+                manager.release_cpu(ctx.up_cpu)
+
+            with prof_range("backward.mlp.activation_offload.gate_up_stage"):
+                grad_gate_up = manager.stage_concat_columns(grad_gate_cpu, grad_up_cpu, tag="dgate_up_for_gate_up_base")
+                grad_gate_stage, grad_up_stage = grad_gate_up.split(int(grad_gate_cpu.tensor.shape[1]), dim=-1)
+                manager.release_cpu(grad_gate_cpu)
+                manager.release_cpu(grad_up_cpu)
 
         with prof_range("backward.mlp.activation_offload.gate_lora"):
             gate_low_rank = stage_low_rank_from_cpu(

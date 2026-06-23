@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
 from typing import Literal
 
 import torch
 
 from .activation_offload import ActivationOffloadManager, CPUActivationHandle
-from .cpu_left import CPU_LEFT_BF16_BINDING
+from .cpu_left import CPU_LEFT_BF16_BINDING, grouped_expert_lora_pair_cpu_left
 from .frozen_linear import AsymExecutionStats, _group_metadata_tensors
 from .lora import GroupedLoRAMetadata, grouped_expert_lora, grouped_expert_lora_cpu_left
 
@@ -13,6 +14,11 @@ from .lora import GroupedLoRAMetadata, grouped_expert_lora, grouped_expert_lora_
 LORA_A_GRAD_CPU_RIGHT = "sm100_grouped_lora_a_grad_bf16_cpu_right"
 LORA_A_PAIR_GRAD_CPU_RIGHT = "sm100_grouped_lora_a_pair_grad_bf16_cpu_right"
 LORA_B_BACKWARD_CPU_SOURCE = "sm100_grouped_lora_b_backward_bf16_cpu_source"
+
+
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.lower() not in {"", "0", "false", "no", "off"}
 
 
 def _missing_symbol(name: str) -> str | None:
@@ -157,6 +163,41 @@ def grouped_lora_a_pair_forward_cpu_left(
     stats: AsymExecutionStats | None,
     tag: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if _env_flag("ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE"):
+        _check_cpu_left_inputs(source_cpu, lora_a_gate, f"{tag}.gate")
+        _check_cpu_left_inputs(source_cpu, lora_a_up, f"{tag}.up")
+        gate, up = grouped_expert_lora_pair_cpu_left(
+            source_cpu,
+            lora_a_gate,
+            lora_a_up,
+            offsets,
+            experts,
+            metadata=metadata,
+            stats=stats,
+        )
+        if stats is not None:
+            stats.expact_lora_a_forward_grouped_calls += 1
+            stats.expact_lora_a_forward_cpu_left_grouped_calls += 1
+        return gate, up
+
+    if _env_flag("ASYMM_CPU_LEFT_LORA_A_PAIR_CAT"):
+        _check_cpu_left_inputs(source_cpu, lora_a_gate, f"{tag}.gate")
+        _check_cpu_left_inputs(source_cpu, lora_a_up, f"{tag}.up")
+        if lora_a_gate.shape != lora_a_up.shape:
+            raise RuntimeError(f"{tag}: gate/up LoRA-A weights must have matching shapes")
+        gate_up_lora_a = torch.cat((lora_a_gate, lora_a_up), dim=1).contiguous()
+        gate_up = grouped_lora_a_forward_cpu_left(
+            source_cpu,
+            gate_up_lora_a,
+            offsets,
+            experts,
+            metadata=metadata,
+            stats=stats,
+            tag=f"{tag}.gate_up",
+        )
+        gate, up = gate_up.split(int(lora_a_gate.shape[1]), dim=-1)
+        return gate.contiguous(), up.contiguous()
+
     gate = grouped_lora_a_forward_cpu_left(
         source_cpu,
         lora_a_gate,
