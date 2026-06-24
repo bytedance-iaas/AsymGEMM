@@ -364,7 +364,9 @@ infer_template() {
   local base="${lower##*/}"
   case "${base}" in
     gemma-4-*|gemma4-*) printf 'gemma4\n' ;;
-    llama-4-*) printf 'llama4\n' ;;
+    llama-4-*|llama4-*) printf 'llama4\n' ;;
+    llama-3*|llama3-*|meta-llama-3*) printf 'llama3\n' ;;
+    llama-2*|llama2-*) printf 'llama2\n' ;;
     qwen3-*|qwen3-next-*) printf 'qwen3_nothink\n' ;;
     *) printf 'qwen3_nothink\n' ;;
   esac
