@@ -246,3 +246,65 @@ storage {nvme, cpu, gpu} x compute {cpu, gpu}
 
 
 
+### CORE ISSUES
+Why does not materializing in HBM does not save weights?
+
+
+
+### Agenda
+Show curr results
+
+Mention potential issues 
+1. bad designs - routed experts need 128 padding
+2. the transient natures of finetuning needs little weights
+3. Larger MoE / dense models?
+- 
+4. Rebuild the same code path for sanity check.
+- Use the AsymGEMM code path but stages instead of AsymGEMM for all operations
+5. Some tensors not fully captured? Not the peak?
+- Check the actiation tensor details
+
+
+### Meeting Notes
+Scheduling
+- What tensors (not hot) to put hbm vs. cpu vs. nvme?
+- Big model we need to reduce memory
+- Small model we need to improve throughput
+
+Related work:
+- MorphServe
+
+Scenario: Single Superchip GPU first + LoRA
+Later + EP
+
+Goal: Scheduler for Superchip-based LoRA SFT
+Consider different storage devices / compute devices / kernels
+Target High throughput + big model + long context
+
+Motivation:
+1. Memory increases to OOM for LoRA and compositions
+2. Superchips
+
+Superchips => new scheduling algorithm
+CPU + GPU co-computing
+NVME + CPu + GPU storage
+Kernels: AsymGEMM NativeGEMM
+
+Target: 
+Largest throughput
+- Larger batch size
+- Lower memory => larger batch size => larger throughput
+
+Takeaways: Needs to be very concrete actionable scheduling insights
+
+Scheduling Questions:
+- 
+
+Scheduling Insights:
+- Use AsymGEMM to compute with LoRA is faster than NativeGEMM with larger matrixes
+(transfer bound vs compute bound)
+- Static scheduling (decision making) at front
+- Dynamic scheudling (whats dynamic?)
+- Zero3 needs to load the whole tensor for each transfer why? even if one tensor only needs like a few rows (token embedding)
+- Put big lm head and embed tokens and other big tensors on CPU and put experts on nvme / a pool tier of buffers
+

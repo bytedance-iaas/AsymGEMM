@@ -71,6 +71,12 @@ def _fmt_pct(value: Any, total: Any) -> str:
     return "-"
 
 
+def _fmt_tps(value: Any) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{float(value):,.0f}"
+    return "-"
+
+
 def _float_value(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
@@ -1130,6 +1136,65 @@ def _process_memory_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _throughput_summary(profile: dict[str, Any]) -> dict[str, Any]:
+    config = profile.get("config", {})
+    if not isinstance(config, dict):
+        config = {}
+    timing = _trainer_timing(profile)
+    batch = _int_value(config.get("batch_size")) or _int_value(config.get("per_device_train_batch_size")) or 0
+    seq_len = _int_value(config.get("seq_len")) or _int_value(config.get("cutoff_len")) or 0
+    grad_accum = _int_value(config.get("gradient_accumulation_steps")) or 0
+    tokens_per_step = batch * seq_len * grad_accum
+    measured_steps = _int_value(timing.get("measured_steps")) or 0
+    elapsed = _float_value(timing.get("measured_elapsed_seconds"))
+    mean_step_ms = _float_value(timing.get("measured_e2e_step_milliseconds"))
+    effective = None
+    if tokens_per_step > 0 and measured_steps > 0 and elapsed and elapsed > 0.0:
+        effective = (measured_steps * tokens_per_step) / elapsed
+    mean_step_tps = None
+    if tokens_per_step > 0 and mean_step_ms and mean_step_ms > 0.0:
+        mean_step_tps = tokens_per_step / (mean_step_ms / 1000.0)
+    return {
+        "available": effective is not None,
+        "tokens_per_step": tokens_per_step,
+        "batch_size": batch,
+        "seq_len": seq_len,
+        "gradient_accumulation_steps": grad_accum,
+        "measured_steps": measured_steps,
+        "measured_elapsed_seconds": elapsed,
+        "measured_e2e_step_milliseconds": mean_step_ms,
+        "effective_tokens_per_second": effective,
+        "mean_step_tokens_per_second": mean_step_tps,
+        "source": timing.get("source"),
+    }
+
+
+def _throughput_breakdown_markdown(profile: dict[str, Any]) -> str:
+    t = _throughput_summary(profile)
+    elapsed = _float_value(t.get("measured_elapsed_seconds"))
+    lines = [
+        "# LF Throughput Breakdown",
+        "",
+        "Training throughput in tokens/sec over post-warmup (measured) steps.",
+        "`effective = measured_steps * tokens_per_step / measured_elapsed_seconds` (jitter-robust headline).",
+        "",
+        "| Metric | Value |",
+        "|---|---:|",
+        f"| tokens per step (batch x seq x grad_accum) | {t.get('tokens_per_step', '-')} |",
+        f"| batch_size | {t.get('batch_size', '-')} |",
+        f"| seq_len | {t.get('seq_len', '-')} |",
+        f"| gradient_accumulation_steps | {t.get('gradient_accumulation_steps', '-')} |",
+        f"| measured steps | {t.get('measured_steps', '-')} |",
+        f"| measured elapsed seconds | {f'{elapsed:.3f}' if elapsed is not None else '-'} |",
+        f"| mean step (ms) | {_fmt_ms(t.get('measured_e2e_step_milliseconds'))} |",
+        f"| effective throughput (tokens/sec) | {_fmt_tps(t.get('effective_tokens_per_second'))} |",
+        f"| mean per-step throughput (tokens/sec) | {_fmt_tps(t.get('mean_step_tokens_per_second'))} |",
+        f"| timing source | {t.get('source', '-')} |",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def _source_summary_markdown(profile: dict[str, Any]) -> str:
     config = profile.get("config", {})
     warmup_steps = int(config.get("warmup_steps", 0) or 0)
@@ -1146,6 +1211,7 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
     process_memory = _process_memory(profile)
     process_memory_rows = _process_memory_rows(profile)
     timing = _trainer_timing(profile)
+    throughput = _throughput_summary(profile)
     runtime_counters = profile.get("runtime_counters")
     if not isinstance(runtime_counters, dict):
         runtime_counters = _runtime_counters(profile)
@@ -1216,6 +1282,7 @@ def _source_summary_markdown(profile: dict[str, Any]) -> str:
         f"Memory-breakdown actual peak allocated HBM: `{_fmt_mib(breakdown_summary.get('actual_peak_allocated_hbm_bytes'))} MiB`",
         f"Memory-breakdown actual peak reserved HBM: `{_fmt_mib(breakdown_summary.get('actual_peak_reserved_hbm_bytes'))} MiB`",
         f"Whole-process reserved but unallocated: `{_fmt_mib(gpu.get('reserved_unallocated_bytes'))} MiB`",
+        f"Throughput (measured): `{_fmt_tps(throughput.get('effective_tokens_per_second'))} tokens/sec`  (`{throughput.get('tokens_per_step', '-')}` tok/step x `{throughput.get('measured_steps', '-')}` measured steps)",
         f"Timing source: `{timing.get('source', '-')}`",
         f"Trainer log: `{trainer.get('trainer_log', '')}`",
         "",
@@ -2131,6 +2198,7 @@ def _write_source_artifacts(source_profile_json: Path, output_dir: Path, profile
     (output_dir / "table.md").write_text(summary, encoding="utf-8")
     (output_dir / "lat.md").write_text(_source_latency_markdown(profile), encoding="utf-8")
     (output_dir / "memory.md").write_text(_source_memory_markdown(profile), encoding="utf-8")
+    (output_dir / "throughput_breakdown.md").write_text(_throughput_breakdown_markdown(profile), encoding="utf-8")
     breakdown = _source_memory_breakdown_markdown(profile, top_level=True)
     memory_breakdown_summary = _memory_breakdown_summary(profile)
     breakdown_rows = _memory_breakdown_csv_rows(memory_breakdown_summary)

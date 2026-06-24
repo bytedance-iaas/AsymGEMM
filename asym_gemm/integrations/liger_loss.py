@@ -5,6 +5,7 @@ from typing import Any, Optional, Union
 
 import torch
 from torch import nn
+from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.models.mixtral.modeling_mixtral import load_balancing_loss_func
 from transformers.utils import can_return_tuple
@@ -717,6 +718,126 @@ def install_asym_liger_qwen3_5_moe_loss_bridge(model: nn.Module, *, strict: bool
     return True
 
 
+# ---------------------------------------------------------------------------
+# Dense causal-LM bridge (qwen2 / llama / qwen3 dense, router-free).
+# Qwen2.5, Llama-3.1/3.3, and Qwen3-dense share one `...ForCausalLM.forward`
+# shape, so a single router-free forward + installer covers all three.
+# ---------------------------------------------------------------------------
+_ASYM_LIGER_DENSE_MODEL_TYPES = {"qwen2", "llama", "qwen3"}
+
+
+def asym_dense_causal_lce_forward(
+    self,
+    input_ids: Optional[torch.LongTensor] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[list[torch.FloatTensor]] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    labels: Optional[torch.LongTensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    logits_to_keep: Union[int, torch.Tensor] = 0,
+    skip_logits: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+    **kwargs: Any,
+) -> LigerCausalLMOutputWithPast:
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_hidden_states = (
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    )
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    outputs: BaseModelOutputWithPast = self.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        cache_position=cache_position,
+        **kwargs,
+    )
+
+    hidden_states = outputs.last_hidden_state
+    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    kept_hidden_states = hidden_states[:, slice_indices, :]
+
+    shift_labels = kwargs.pop("shift_labels", None)
+    logits = None
+    loss = None
+    token_accuracy = None
+    predicted_tokens = None
+
+    if skip_logits is None:
+        skip_logits = self.training and (labels is not None or shift_labels is not None)
+
+    if skip_logits:
+        lm_head_weight = _resolve_liger_lm_head_weight(self.lm_head, kept_hidden_states)
+        result = LigerForCausalLMLoss(
+            hidden_states=kept_hidden_states,
+            lm_head_weight=lm_head_weight,
+            labels=labels,
+            shift_labels=shift_labels,
+            hidden_size=self.config.hidden_size,
+            **kwargs,
+        )
+        loss, _, token_accuracy, predicted_tokens = unpack_cross_entropy_result(result)
+    else:
+        logits = self.lm_head(kept_hidden_states)
+        if labels is not None or shift_labels is not None:
+            loss = self.loss_function(
+                logits=logits,
+                labels=labels,
+                shift_labels=shift_labels,
+                vocab_size=self.vocab_size,
+                **kwargs,
+            )
+
+    if not return_dict:
+        output = (logits,) + outputs[1:]
+        output = ((loss,) + output) if loss is not None else output
+        output = output + (token_accuracy,) if token_accuracy is not None else output
+        output = output + (predicted_tokens,) if predicted_tokens is not None else output
+        return output
+
+    return LigerCausalLMOutputWithPast(
+        loss=loss,
+        logits=logits,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+        token_accuracy=token_accuracy,
+        predicted_tokens=predicted_tokens,
+    )
+
+
+def install_asym_liger_dense_loss_bridge(model: nn.Module, *, strict: bool = True) -> bool:
+    target_model = _base_causal_lm_model(model)
+    config = getattr(target_model, "config", None)
+    model_type = getattr(config, "model_type", None)
+    if model_type not in _ASYM_LIGER_DENSE_MODEL_TYPES:
+        if strict:
+            raise ValueError(
+                f"Asym Liger dense loss bridge only supports {sorted(_ASYM_LIGER_DENSE_MODEL_TYPES)}."
+            )
+        return False
+
+    validated = _validate_liger_lm_head(
+        getattr(target_model, "lm_head", None), model_label=f"{model_type} (dense)", strict=strict
+    )
+    if validated is None:
+        return False
+    lm_head, weight_source = validated
+
+    target_model.forward = MethodType(asym_dense_causal_lce_forward, target_model)
+    _mark_liger_bridge_installed(target_model, lm_head, weight_source, model_type, "causal_lm")
+    return True
+
+
 def install_asym_liger_loss_bridge(model: nn.Module, *, strict: bool = True) -> bool:
     root = _root_model(model)
     root_type = getattr(getattr(root, "config", None), "model_type", None)
@@ -729,6 +850,8 @@ def install_asym_liger_loss_bridge(model: nn.Module, *, strict: bool = True) -> 
         return install_asym_liger_qwen3_5_moe_loss_bridge(model, strict=strict)
     if causal_type == "qwen3_moe":
         return install_asym_liger_qwen3_moe_loss_bridge(model, strict=strict)
+    if causal_type in _ASYM_LIGER_DENSE_MODEL_TYPES:
+        return install_asym_liger_dense_loss_bridge(model, strict=strict)
     return False
 
 
@@ -738,8 +861,10 @@ __all__ = [
     "asym_qwen3_5_moe_conditional_lce_forward",
     "asym_llama4_causal_lm_lce_forward",
     "asym_llama4_conditional_lce_forward",
+    "asym_dense_causal_lce_forward",
     "install_asym_liger_qwen3_moe_loss_bridge",
     "install_asym_liger_qwen3_5_moe_loss_bridge",
     "install_asym_liger_llama4_loss_bridge",
+    "install_asym_liger_dense_loss_bridge",
     "install_asym_liger_loss_bridge",
 ]

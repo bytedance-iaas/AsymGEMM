@@ -7,6 +7,7 @@ import json
 import math
 import re
 import shutil
+import statistics
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,8 +18,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-CTC_METRICS = ("ctc_rx", "ctc_tx")
-SUMMARY_FIELDS = [
+# Throughput (tokens/sec) is derived per run from step_samples.csv: tokens_per_step / step_seconds,
+# computed over post-warmup (measured) steps only. Mirrors the c2c/interconnect combined-plot layout.
+THROUGHPUT_COLOR = "#2ca02c"
+THROUGHPUT_EFF_COLOR = "#1f77b4"
+_META_FIELDS = [
     "workload",
     "backend",
     "router_mode",
@@ -43,93 +47,33 @@ SUMMARY_FIELDS = [
     "lora_alpha",
     "lora_target",
     "config",
-    "metric",
-    "metric_name",
+]
+SUMMARY_FIELDS = _META_FIELDS + [
     "run_label",
-    "step_count",
-    "p95_mean_percent",
-    "p95_peak_percent",
-    "p95_peak_step",
-    "max_peak_percent",
-    "max_peak_step",
-    "p95_saturated_steps_ge90",
-    "max_saturated_steps_ge90",
+    "tokens_per_step",
+    "measured_steps",
+    "effective_tokens_per_second",
+    "mean_tokens_per_second",
+    "median_tokens_per_second",
+    "min_tokens_per_second",
+    "max_tokens_per_second",
+    "measured_elapsed_seconds",
     "profile_json",
     "run_dir",
 ]
-STEP_FIELDS = [
-    "workload",
-    "backend",
-    "router_mode",
-    "asymm_expert_act_offload",
-    "expact",
-    "asymm_attn_act_offload",
-    "attnact",
-    "asymm_layer_act_offload",
-    "layeract",
-    "asymm_layer_gc",
-    "layergc",
-    "liger_loss",
-    "profiler",
-    "recompute",
-    "expert_policy",
-    "seq_len",
-    "precision",
-    "batch_size",
-    "gradient_accumulation_steps",
-    "lora_dropout",
-    "lora_rank",
-    "lora_alpha",
-    "lora_target",
-    "config",
-    "metric",
-    "metric_name",
+STEP_FIELDS = _META_FIELDS + [
     "run_label",
     "step",
-    "avg_percent",
-    "p50_percent",
-    "p95_percent",
-    "max_percent",
+    "tokens_per_second",
+    "step_milliseconds",
     "profile_json",
     "run_dir",
 ]
-INDEX_FIELDS = [
-    "workload",
-    "backend",
-    "router_mode",
-    "asymm_expert_act_offload",
-    "expact",
-    "asymm_attn_act_offload",
-    "attnact",
-    "asymm_layer_act_offload",
-    "layeract",
-    "asymm_layer_gc",
-    "layergc",
-    "liger_loss",
-    "profiler",
-    "recompute",
-    "expert_policy",
-    "seq_len",
-    "precision",
-    "batch_size",
-    "gradient_accumulation_steps",
-    "lora_dropout",
-    "lora_rank",
-    "lora_alpha",
-    "lora_target",
-    "config",
+INDEX_FIELDS = _META_FIELDS + [
     "run_label",
     "profile_json",
     "run_dir",
 ]
-METRIC_LABELS = {
-    "ctc_rx": "C2C RX",
-    "ctc_tx": "C2C TX",
-}
-METRIC_COLORS = {
-    "ctc_rx": "#1f77b4",
-    "ctc_tx": "#d62728",
-}
 RUN_DIR_RE = re.compile(r"^b(?P<batch_size>[0-9]+)_s(?P<seq_len>[0-9]+)_ga(?P<grad_accum>[0-9]+)$")
 
 
@@ -138,7 +82,9 @@ class RunRecord:
     run_dir: Path
     profile_path: Path
     metadata: dict[str, str]
-    by_step: dict[int, dict[str, dict[str, float]]]
+    tokens_per_step: int
+    by_step: dict[int, float]  # measured step -> tokens/sec
+    measured_elapsed_seconds: float
 
     @property
     def label(self) -> str:
@@ -157,12 +103,17 @@ class RunRecord:
         ]
         return " ".join(part for part in parts if part)
 
+    def effective_tokens_per_second(self) -> float:
+        if self.measured_elapsed_seconds <= 0.0 or not self.by_step:
+            return 0.0
+        return (len(self.by_step) * self.tokens_per_step) / self.measured_elapsed_seconds
+
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Plot combined LF Nsight C2C/CTC saturation artifacts.")
-    parser.add_argument("--input-root", type=Path, action="append", default=[], help="Root to scan for nsys profile.json files.")
+    parser = argparse.ArgumentParser(description="Plot combined LF training throughput (tokens/sec) artifacts.")
+    parser.add_argument("--input-root", type=Path, action="append", default=[], help="Root to scan for profile.json files.")
     parser.add_argument("--run-dir", type=Path, action="append", default=[], help="Explicit run directory containing profile.json.")
-    parser.add_argument("--output-dir", type=Path, required=True, help="Directory for combined C2C plots.")
+    parser.add_argument("--output-dir", type=Path, required=True, help="Directory for combined throughput plots.")
     parser.add_argument("--clean-output", action="store_true")
     parser.add_argument("--combined-only", action="store_true", help="Accepted for parity with other LF plotting scripts.")
     parser.add_argument("--workload", action="append", default=[])
@@ -270,27 +221,6 @@ def _parse_liger_loss_part(part: str) -> str | None:
     return None
 
 
-def _known_optional_job_axis(part: str) -> bool:
-    value = part.strip().lower()
-    return (
-        value in {
-            "layeract0",
-            "layeract1",
-            "layeractfalse",
-            "layeracttrue",
-            "layergc0",
-            "layergc1",
-            "layergcfalse",
-            "layergctrue",
-        }
-        or value in {"actrecomp0", "actrecomp1", "actrecompfalse", "actrecomptrue"}
-        or value in {"xunpack0", "xunpack1", "xunpackfalse", "xunpacktrue"}
-        or value.startswith("loraafwd")
-        or value.startswith("gradoff")
-        or value.startswith("weightoff")
-    )
-
-
 def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
     parts = job_dir_name.split("__")
     if len(parts) < 4:
@@ -298,14 +228,10 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
     backend_part, profiler_part, recompute_part, policy_part = parts[:4]
     tail = parts[4:]
     router_part = "routerhf"
-    expact_value = "false"
-    expact = "expact0"
-    attnact_value = "false"
-    attnact = "attnact0"
-    layeract_value = "false"
-    layeract = "layeract0"
-    layergc_value = "false"
-    layergc = "layergc0"
+    expact_value, expact = "false", "expact0"
+    attnact_value, attnact = "false", "attnact0"
+    layeract_value, layeract = "false", "layeract0"
+    layergc_value, layergc = "false", "layergc0"
     liger_loss = "ligerloss0"
 
     if tail:
@@ -334,8 +260,6 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         if parsed_liger_loss is not None:
             liger_loss = parsed_liger_loss
             continue
-        # Unknown tail parts are config axes. Plotting should not reject a run
-        # just because the driver grew a new folder label.
         continue
 
     return {
@@ -441,7 +365,7 @@ def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, st
     layergc = job_meta["layergc"]
     if not policy_part.startswith("pol") or not router_part.startswith("router"):
         return None
-    if recompute_part not in {"norecomp", "recomp"}:
+    if recompute_part not in {"norecomp", "recomp", "unsloth"}:
         return None
 
     expert_policy = str(config.get("expert_policy") or policy_part[len("pol") :] or "none")
@@ -533,54 +457,66 @@ def _matches_filters(record: RunRecord, args: argparse.Namespace) -> bool:
     return True
 
 
-def _aggregate_step_rows(rows: list[Any]) -> dict[int, dict[str, dict[str, float]]]:
-    by_step: dict[int, dict[str, dict[str, float]]] = {}
-    for row in rows:
-        if not isinstance(row, dict) or row.get("scope") != "step":
-            continue
-        metric = str(row.get("metric") or "")
-        if metric not in CTC_METRICS:
-            continue
-        try:
-            step = int(row.get("step"))
-        except (TypeError, ValueError):
-            continue
-        entry = by_step.setdefault(step, {}).setdefault(
-            metric,
-            {
-                "avg_percent": 0.0,
-                "p50_percent": 0.0,
-                "p95_percent": 0.0,
-                "max_percent": 0.0,
-            },
-        )
-        for key in ("avg_percent", "p50_percent", "p95_percent", "max_percent"):
-            entry[key] = max(entry[key], _to_float(row.get(key)))
-    return by_step
+def _tokens_per_step(metadata: dict[str, str]) -> int:
+    try:
+        b = int(metadata.get("batch_size") or 0)
+        s = int(metadata.get("seq_len") or 0)
+        g = int(metadata.get("gradient_accumulation_steps") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return b * s * g
+
+
+def _read_step_throughput(run_dir: Path, tokens_per_step: int) -> tuple[dict[int, float], float]:
+    path = run_dir / "step_samples.csv"
+    if tokens_per_step <= 0 or not path.exists():
+        return {}, 0.0
+    by_step: dict[int, float] = {}
+    total_ms = 0.0
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                if str(row.get("is_warmup", "")).strip().lower() in {"true", "1", "yes"}:
+                    continue
+                ms = _to_float(row.get("step_milliseconds"))
+                if ms <= 0.0:
+                    continue
+                step = 0
+                for key in ("measured_step", "step", "raw_step"):
+                    try:
+                        candidate = int(float(row.get(key)))
+                    except (TypeError, ValueError):
+                        candidate = 0
+                    if candidate > 0:
+                        step = candidate
+                        break
+                if step <= 0:
+                    step = len(by_step) + 1
+                by_step[step] = tokens_per_step / (ms / 1000.0)
+                total_ms += ms
+    except Exception:
+        return {}, 0.0
+    return by_step, total_ms / 1000.0
 
 
 def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
     runs: list[RunRecord] = []
     for profile_path in _find_profile_paths(args.input_root, args.run_dir):
         profile = _safe_read_json(profile_path)
-        metrics = profile.get("interconnect_metrics")
-        if not isinstance(metrics, dict) or not metrics.get("available"):
-            continue
-        range_summary = metrics.get("range_summary")
-        rows = range_summary.get("rows") if isinstance(range_summary, dict) else []
-        if not isinstance(rows, list):
-            continue
-        by_step = _aggregate_step_rows(rows)
-        if not by_step:
-            continue
         metadata = _infer_metadata(profile_path, profile)
         if metadata is None:
+            continue
+        tokens_per_step = _tokens_per_step(metadata)
+        by_step, elapsed = _read_step_throughput(profile_path.parent, tokens_per_step)
+        if not by_step:
             continue
         record = RunRecord(
             run_dir=profile_path.parent,
             profile_path=profile_path,
             metadata=metadata,
+            tokens_per_step=tokens_per_step,
             by_step=by_step,
+            measured_elapsed_seconds=elapsed,
         )
         if _matches_filters(record, args):
             runs.append(record)
@@ -620,42 +556,28 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str] | N
             writer.writerows(rows)
 
 
-def _metric_step_values(run: RunRecord, metric: str, stat: str) -> list[tuple[int, float]]:
-    values: list[tuple[int, float]] = []
-    for step in sorted(run.by_step):
-        values.append((step, float(run.by_step[step].get(metric, {}).get(stat, 0.0))))
-    return values
-
-
 def _summary_rows(runs: list[RunRecord]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for run in runs:
-        for metric in CTC_METRICS:
-            p95_values = _metric_step_values(run, metric, "p95_percent")
-            max_values = _metric_step_values(run, metric, "max_percent")
-            if not any(value for _step, value in p95_values) and not any(value for _step, value in max_values):
-                continue
-            peak_p95_step, peak_p95_value = max(p95_values, key=lambda item: item[1], default=(0, 0.0))
-            peak_max_step, peak_max_value = max(max_values, key=lambda item: item[1], default=(0, 0.0))
-            nonzero_p95 = [value for _step, value in p95_values if value > 0.0]
-            rows.append(
-                {
-                    **run.metadata,
-                    "metric": metric,
-                    "metric_name": METRIC_LABELS[metric],
-                    "run_label": run.label,
-                    "step_count": len(run.by_step),
-                    "p95_mean_percent": sum(nonzero_p95) / len(nonzero_p95) if nonzero_p95 else 0.0,
-                    "p95_peak_percent": peak_p95_value,
-                    "p95_peak_step": peak_p95_step,
-                    "max_peak_percent": peak_max_value,
-                    "max_peak_step": peak_max_step,
-                    "p95_saturated_steps_ge90": sum(1 for _step, value in p95_values if value >= 90.0),
-                    "max_saturated_steps_ge90": sum(1 for _step, value in max_values if value >= 90.0),
-                    "profile_json": str(run.profile_path),
-                    "run_dir": str(run.run_dir),
-                }
-            )
+        values = [run.by_step[step] for step in sorted(run.by_step)]
+        if not values:
+            continue
+        rows.append(
+            {
+                **run.metadata,
+                "run_label": run.label,
+                "tokens_per_step": run.tokens_per_step,
+                "measured_steps": len(values),
+                "effective_tokens_per_second": round(run.effective_tokens_per_second(), 2),
+                "mean_tokens_per_second": round(statistics.fmean(values), 2),
+                "median_tokens_per_second": round(statistics.median(values), 2),
+                "min_tokens_per_second": round(min(values), 2),
+                "max_tokens_per_second": round(max(values), 2),
+                "measured_elapsed_seconds": round(run.measured_elapsed_seconds, 4),
+                "profile_json": str(run.profile_path),
+                "run_dir": str(run.run_dir),
+            }
+        )
     return rows
 
 
@@ -663,22 +585,19 @@ def _step_rows(runs: list[RunRecord]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for run in runs:
         for step in sorted(run.by_step):
-            for metric in CTC_METRICS:
-                stats = run.by_step[step].get(metric)
-                if not stats:
-                    continue
-                rows.append(
-                    {
-                        **run.metadata,
-                        "metric": metric,
-                        "metric_name": METRIC_LABELS[metric],
-                        "run_label": run.label,
-                        "step": step,
-                        **stats,
-                        "profile_json": str(run.profile_path),
-                        "run_dir": str(run.run_dir),
-                    }
-                )
+            tps = run.by_step[step]
+            step_ms = (run.tokens_per_step / tps * 1000.0) if tps > 0 else 0.0
+            rows.append(
+                {
+                    **run.metadata,
+                    "run_label": run.label,
+                    "step": step,
+                    "tokens_per_second": round(tps, 2),
+                    "step_milliseconds": round(step_ms, 4),
+                    "profile_json": str(run.profile_path),
+                    "run_dir": str(run.run_dir),
+                }
+            )
     return rows
 
 
@@ -689,121 +608,73 @@ def _plot_by_step(runs: list[RunRecord], out_dir: Path) -> None:
     fig, axes = plt.subplots(nrows, ncols, figsize=(8.0 * ncols, 3.4 * nrows), sharey=True, squeeze=False, constrained_layout=True)
     for idx, run in enumerate(runs):
         ax = axes[idx // ncols][idx % ncols]
-        for metric in CTC_METRICS:
-            p95 = _metric_step_values(run, metric, "p95_percent")
-            max_values = _metric_step_values(run, metric, "max_percent")
-            if not any(value for _step, value in p95) and not any(value for _step, value in max_values):
-                continue
-            steps = [step for step, _value in p95]
-            ax.plot(
-                steps,
-                [value for _step, value in p95],
-                label=f"{METRIC_LABELS[metric]} p95",
-                color=METRIC_COLORS[metric],
-                linewidth=1.7,
-            )
-            ax.plot(
-                [step for step, _value in max_values],
-                [value for _step, value in max_values],
-                label=f"{METRIC_LABELS[metric]} max",
-                color=METRIC_COLORS[metric],
-                linestyle=":",
-                linewidth=1.3,
-            )
-        ax.axhline(90.0, color="#444444", linestyle="--", linewidth=0.9)
+        steps = sorted(run.by_step)
+        values = [run.by_step[step] for step in steps]
+        ax.plot(steps, values, label="tokens/sec", color=THROUGHPUT_COLOR, linewidth=1.8, marker="o", markersize=3)
+        eff = run.effective_tokens_per_second()
+        if eff > 0.0:
+            ax.axhline(eff, color=THROUGHPUT_EFF_COLOR, linestyle="--", linewidth=1.0, label=f"effective {eff:,.0f}")
         ax.set_title(run.label or run.run_dir.name, fontsize=9)
         ax.set_xlabel("Measured step")
-        ax.set_ylim(bottom=0.0, top=max(100.0, ax.get_ylim()[1]))
+        ax.set_ylim(bottom=0.0)
         ax.grid(True, axis="y", alpha=0.25)
         if idx % ncols == 0:
-            ax.set_ylabel("Saturation (%)")
+            ax.set_ylabel("Throughput (tokens/sec)")
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(handles, labels, fontsize=7, loc="lower right", frameon=False)
     for idx in range(n_runs, nrows * ncols):
         axes[idx // ncols][idx % ncols].axis("off")
-    handles, labels = axes[0][0].get_legend_handles_labels()
-    if handles:
-        fig.legend(
-            handles,
-            labels,
-            loc="lower center",
-            bbox_to_anchor=(0.5, 1.0),
-            ncol=max(1, min(len(labels), 5)),
-            frameon=False,
-        )
-    fig.suptitle("Combined C2C Saturation by Measured Step", fontsize=12)
-    fig.savefig(out_dir / "combined_c2c_saturation_by_step.png", dpi=180, bbox_inches="tight")
+    fig.suptitle("Combined Throughput by Measured Step", fontsize=12)
+    fig.savefig(out_dir / "combined_throughput_by_step.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
-def _plot_peak_summary(runs: list[RunRecord], out_dir: Path) -> None:
+def _plot_summary(runs: list[RunRecord], out_dir: Path) -> None:
     labels = [run.label or run.run_dir.name for run in runs]
-    summary = _summary_rows(runs)
-    by_run_metric = {(row["profile_json"], row["metric"]): row for row in summary}
+    eff = [run.effective_tokens_per_second() for run in runs]
+    mean = [statistics.fmean(run.by_step.values()) if run.by_step else 0.0 for run in runs]
     y_positions = list(range(len(runs)))
     height = max(4.5, min(28.0, 0.52 * len(runs) + 2.5))
     fig, ax = plt.subplots(figsize=(10.0, height), constrained_layout=True)
-    for metric, offset in (("ctc_rx", -0.18), ("ctc_tx", 0.18)):
-        p95 = [
-            float(by_run_metric.get((str(run.profile_path), metric), {}).get("p95_peak_percent", 0.0))
-            for run in runs
-        ]
-        max_values = [
-            float(by_run_metric.get((str(run.profile_path), metric), {}).get("max_peak_percent", 0.0))
-            for run in runs
-        ]
-        ys = [y + offset for y in y_positions]
-        ax.barh(ys, p95, height=0.3, color=METRIC_COLORS[metric], alpha=0.72, label=f"{METRIC_LABELS[metric]} p95 peak")
-        ax.scatter(max_values, ys, color=METRIC_COLORS[metric], marker="D", s=18, label=f"{METRIC_LABELS[metric]} max peak")
-    ax.axvline(90.0, color="#444444", linestyle="--", linewidth=1.0, label="90%")
+    ax.barh(y_positions, eff, height=0.55, color=THROUGHPUT_EFF_COLOR, alpha=0.78, label="effective tok/s (Σtokens/Σtime)")
+    ax.scatter(mean, y_positions, color=THROUGHPUT_COLOR, marker="D", s=22, label="mean per-step tok/s", zorder=3)
+    for y, value in zip(y_positions, eff):
+        ax.text(value, y, f" {value:,.0f}", va="center", ha="left", fontsize=7)
     ax.set_yticks(y_positions)
     ax.set_yticklabels(labels, fontsize=8)
-    ax.set_xlabel("Saturation (%)")
-    fig.suptitle("Combined C2C Peak Saturation")
-    all_values = [float(row.get("p95_peak_percent", 0.0)) for row in summary] + [float(row.get("max_peak_percent", 0.0)) for row in summary]
-    ax.set_xlim(left=0.0, right=max(100.0, max(all_values, default=0.0) * 1.08))
+    ax.set_xlabel("Throughput (tokens/sec)")
+    ax.set_xlim(left=0.0, right=max(eff + mean, default=1.0) * 1.15)
     ax.grid(True, axis="x", alpha=0.25)
-    _summary_handles, _summary_labels = ax.get_legend_handles_labels()
-    ax.legend(
-        _summary_handles,
-        _summary_labels,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 1.02),
-        ncol=max(1, min(len(_summary_labels), 5)),
-        borderaxespad=0.0,
-        frameon=False,
-        fontsize=8,
-    )
-    fig.savefig(out_dir / "combined_c2c_peak_summary.png", dpi=180, bbox_inches="tight")
+    fig.suptitle("Combined Effective Throughput")
+    handles, legend_labels = ax.get_legend_handles_labels()
+    ax.legend(handles, legend_labels, loc="lower center", bbox_to_anchor=(0.5, 1.02), ncol=2, frameon=False, fontsize=8)
+    fig.savefig(out_dir / "combined_throughput_summary.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
 def _write_readme(out_dir: Path, *, runs: list[RunRecord], reason: str | None = None) -> None:
     lines = [
-        "# LF C2C / CTC Combined Artifacts",
+        "# LF Throughput Combined Artifacts",
         "",
-        "These files summarize Nsight Systems GPU metric samples for NVLink-C2C/CTC throughput saturation.",
-        "Values are percent of peak throughput reported by Nsight GPU metrics, not absolute GB/s.",
-        "Per-step values aggregate with max across GPUs so one saturated GPU is not hidden by idle GPUs.",
+        "Training throughput in tokens/sec, derived per run from step_samples.csv:",
+        "`tokens_per_sec = (batch_size x seq_len x grad_accum) / step_seconds`, over post-warmup (measured) steps only.",
+        "Effective throughput = total measured tokens / total measured wall time (jitter-robust headline number).",
+        "Use the `source` profiler runs for throughput; nsys runs carry profiling overhead.",
         "",
     ]
     if reason:
-        lines.extend(
-            [
-                "## Status",
-                "",
-                reason,
-                "",
-            ]
-        )
+        lines.extend(["## Status", "", reason, ""])
     else:
         lines.extend(
             [
                 "## Files",
                 "",
-                "- `combined_c2c_saturation_by_step.png`: subplots per run; x-axis is measured step, y-axis is C2C RX/TX saturation percent.",
-                "- `combined_c2c_peak_summary.png`: per-run peak p95 bars and max markers.",
-                "- `combined_c2c_summary.csv`: one row per run and C2C direction.",
-                "- `combined_c2c_step_summary.csv`: one row per run, step, and C2C direction.",
-                "- `combined_c2c_index.csv` / `combined_c2c_index.json`: input run index.",
+                "- `combined_throughput_by_step.png`: subplots per run; x-axis is measured step, y-axis tokens/sec, dashed line = effective.",
+                "- `combined_throughput_summary.png`: per-run effective throughput bars with mean per-step markers.",
+                "- `combined_throughput_summary.csv`: one row per run (effective/mean/median/min/max tok/s).",
+                "- `combined_throughput_step_summary.csv`: one row per run and measured step.",
+                "- `combined_throughput_index.csv` / `combined_throughput_index.json`: input run index.",
                 "",
                 f"Runs included: {len(runs)}.",
                 "",
@@ -814,10 +685,10 @@ def _write_readme(out_dir: Path, *, runs: list[RunRecord], reason: str | None = 
 
 def _write_empty_outputs(out_dir: Path, clean: bool, reason: str) -> None:
     _prepare_output(out_dir, clean)
-    _write_csv(out_dir / "combined_c2c_summary.csv", [], SUMMARY_FIELDS)
-    _write_csv(out_dir / "combined_c2c_step_summary.csv", [], STEP_FIELDS)
-    _write_csv(out_dir / "combined_c2c_index.csv", [], INDEX_FIELDS)
-    (out_dir / "combined_c2c_index.json").write_text("[]\n", encoding="utf-8")
+    _write_csv(out_dir / "combined_throughput_summary.csv", [], SUMMARY_FIELDS)
+    _write_csv(out_dir / "combined_throughput_step_summary.csv", [], STEP_FIELDS)
+    _write_csv(out_dir / "combined_throughput_index.csv", [], INDEX_FIELDS)
+    (out_dir / "combined_throughput_index.json").write_text("[]\n", encoding="utf-8")
     _write_readme(out_dir, runs=[], reason=reason)
 
 
@@ -829,16 +700,6 @@ def _group_label(run: RunRecord) -> str:
         f"ga{metadata.get('gradient_accumulation_steps', '')}" if metadata.get("gradient_accumulation_steps") else "",
         f"drop{metadata.get('lora_dropout', '').replace('.', '')}" if metadata.get("lora_dropout") else "",
         metadata.get("precision", ""),
-        metadata.get("backend", ""),
-        metadata.get("profiler", ""),
-        f"router{metadata.get('router_mode', '')}" if metadata.get("router_mode") else "",
-        metadata.get("expact", ""),
-        metadata.get("attnact", ""),
-        metadata.get("layeract", ""),
-        metadata.get("layergc", ""),
-        metadata.get("liger_loss", ""),
-        metadata.get("recompute", ""),
-        f"pol{metadata.get('expert_policy', '')}" if metadata.get("expert_policy") else "",
     ]
     return _safe_label("-".join(part for part in parts if part))
 
@@ -847,7 +708,6 @@ def _write_grouped_outputs(runs: list[RunRecord], out_dir: Path, clean: bool) ->
     groups: dict[str, list[RunRecord]] = {}
     for run in runs:
         groups.setdefault(_group_label(run), []).append(run)
-    # Skip single-run groups: they just duplicate that config's own leaf interconnect_ctc_* outputs.
     for label, group_runs in sorted(groups.items()):
         if len(group_runs) <= 1:
             continue
@@ -867,12 +727,12 @@ def _write_outputs(runs: list[RunRecord], out_dir: Path, clean: bool, *, write_g
         }
         for run in runs
     ]
-    _write_csv(out_dir / "combined_c2c_summary.csv", summary_rows, SUMMARY_FIELDS)
-    _write_csv(out_dir / "combined_c2c_step_summary.csv", step_rows, STEP_FIELDS)
-    _write_csv(out_dir / "combined_c2c_index.csv", index_rows, INDEX_FIELDS)
-    (out_dir / "combined_c2c_index.json").write_text(json.dumps(index_rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _write_csv(out_dir / "combined_throughput_summary.csv", summary_rows, SUMMARY_FIELDS)
+    _write_csv(out_dir / "combined_throughput_step_summary.csv", step_rows, STEP_FIELDS)
+    _write_csv(out_dir / "combined_throughput_index.csv", index_rows, INDEX_FIELDS)
+    (out_dir / "combined_throughput_index.json").write_text(json.dumps(index_rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _plot_by_step(runs, out_dir)
-    _plot_peak_summary(runs, out_dir)
+    _plot_summary(runs, out_dir)
     _write_readme(out_dir, runs=runs)
     if write_groups:
         _write_grouped_outputs(runs, out_dir, clean)
@@ -884,15 +744,14 @@ def main() -> None:
     runs = _load_runs(args)
     if not runs:
         reason = (
-            "No nsys `profile.json` files with C2C/CTC step metrics matched the requested filters. "
-            "Fresh traces must be collected with Nsight GPU metrics enabled; older traces without "
-            "`GPU_METRICS` tables cannot be converted into C2C saturation plots."
+            "No runs with usable per-step timing (step_samples.csv) were found for the requested filters. "
+            "Throughput is computed from `source` profiler runs."
         )
         _write_empty_outputs(args.output_dir, args.clean_output, reason)
-        print(reason)
+        print(f"[plot_lf_throughput] no runs matched; wrote empty artifacts to {args.output_dir}")
         return
     _write_outputs(runs, args.output_dir, args.clean_output)
-    print(f"Plotted {len(runs)} C2C/CTC run(s).")
+    print(f"[plot_lf_throughput] wrote throughput artifacts for {len(runs)} run(s) to {args.output_dir}")
 
 
 if __name__ == "__main__":

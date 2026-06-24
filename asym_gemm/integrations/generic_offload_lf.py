@@ -66,42 +66,35 @@ def apply_off_layer(model: nn.Module) -> int:
     return wrapped
 
 
-def apply_generic_same_policy(model: nn.Module) -> tuple[int, int, int]:
-    """Baseline #2: offload ONLY attn + expert activations (module-scoped ``save_on_cpu``), recompute norms
-    (glue-GC, ``offload_mode="none"`` -> no whole-layer offload) + sdpa. Matches AsymGEMM ``none|T|T|F|T|T``'s
-    offload SCOPE (exp+attn only, nothing outside) with a generic kernel -- NOT off-layer (whole-layer)."""
-    from asym_gemm.integrations.lf import (
-        _is_qwen3_decoder_layer_module_name,
-        _is_text_attention_module_name,
-    )
+def apply_generic_same_policy(model: nn.Module) -> int:
+    """Baseline #2: generic equivalent of AsymGEMM ``none|T|T|F|T|T``.
+
+    Per decoder layer, run the layer forward via glue-GC under a generic ``save_on_cpu`` that offloads ALL of the
+    layer's saved-for-backward activations (boundary/residual + attn + expert) to CPU, while recomputing norms
+    (glue-GC) and sdpa. This matches asym's *measured* behaviour (``saved_activation_hbm_at_peak == 0`` -- asym
+    offloads everything saved, only the compute transient stays resident), so peak HBM collapses to the
+    transient (~asym's). It differs from asym ONLY in the offload kernel (generic ``save_on_cpu`` vs asym's
+    curated pack/unpack) -- which shows up as higher host RAM -- and from off-layer #1 by the norm+sdpa
+    recompute (fewer tensors offloaded -> lower host RAM than off-layer).
+
+    NOTE: an earlier version offloaded ONLY exp+attn and left the residual/boundary saves on GPU
+    (``offload_mode="none"``). That stranded ~12 GiB of saved activations on GPU (HBM 20.4, *higher than even
+    full recompute*), which is nonsensical for an offload config -- asym keeps saved-on-GPU at 0. Hence we
+    offload everything the layer saves.
+    """
+    from asym_gemm.integrations.lf import _is_qwen3_decoder_layer_module_name
     from asym_gemm.training.decoder_layer_glue_gc import install_decoder_layer_glue_gc
     from asym_gemm.training.sdpa_recompute import install_sdpa_recompute
 
-    n_attn = n_exp = n_layer = 0
-    # Attention: scoped save_on_cpu (offload ONLY attention activations).
+    n_layer = 0
     for name, module in list(model.named_modules()):
-        if name and _is_text_attention_module_name(name, module):
-            _install_save_on_cpu(module)
-            n_attn += 1
-    # Per decoder layer: offload its FFN child (mlp / feed_forward = the MoE/expert block) via save_on_cpu, and
-    # recompute norms via glue-GC (offload_mode="none" -> NO whole-layer offload, so nothing outside attn+FFN
-    # is offloaded). Matching by the FFN child is robust to the stock-HF / LoRA-wrapped expert format (the
-    # fused-format is_qwen3_experts matcher does not match it on the superoffload path).
-    for name, module in list(model.named_modules()):
-        if not (name and _is_qwen3_decoder_layer_module_name(name, module)):
-            continue
-        ffn = getattr(module, "mlp", None)
-        if not isinstance(ffn, nn.Module):
-            ffn = getattr(module, "feed_forward", None)
-        if isinstance(ffn, nn.Module):
-            _install_save_on_cpu(ffn)
-            n_exp += 1
-        install_decoder_layer_glue_gc(module, offload_mode="none")
-        n_layer += 1
-    if n_attn + n_exp == 0:
-        raise RuntimeError("generic same-policy baseline: no attention/FFN modules matched")
+        if name and _is_qwen3_decoder_layer_module_name(name, module):
+            install_decoder_layer_glue_gc(module, offload_mode="save_on_cpu")
+            n_layer += 1
+    if n_layer == 0:
+        raise RuntimeError("generic same-policy baseline: no decoder layers matched")
     install_sdpa_recompute(model)  # self-gates on ASYMM_ATTN_SDPA_RECOMPUTE
-    return n_attn, n_exp, n_layer
+    return n_layer
 
 
 def maybe_apply_generic_offload(model: nn.Module) -> None:
@@ -127,11 +120,11 @@ def maybe_apply_generic_offload(model: nn.Module) -> None:
         count = apply_off_layer(model)
         _log_rank0(f"off-layer baseline: wrapped {count} decoder layers in save_on_cpu (no recompute)")
     elif exp or attn or layer_gc:
-        n_attn, n_exp, n_layer = apply_generic_same_policy(model)
+        n_layer = apply_generic_same_policy(model)
         _log_rank0(
-            f"generic same-policy baseline: save_on_cpu on {n_attn} attn + {n_exp} expert modules "
-            f"(offload scope = exp+attn ONLY), glue-GC norm-recompute on {n_layer} layers + sdpa-recompute "
-            f"(exp={exp} attn={attn} layer_gc={layer_gc})"
+            f"generic same-policy baseline: glue-GC on {n_layer} layers, save_on_cpu offload of ALL layer "
+            f"saved-activations (boundary+attn+expert -> saved-on-GPU~=0, matching asym) + norm-recompute + "
+            f"sdpa-recompute (exp={exp} attn={attn} layer_gc={layer_gc})"
         )
     else:
         return

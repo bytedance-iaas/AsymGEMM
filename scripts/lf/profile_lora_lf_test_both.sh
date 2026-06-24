@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # =============================================================================
 
 # Paths and tools
-# Repo root = AsymGEMM-SFT (../.. from the AsymGEMM dir you run in). Override with SFT_ROOT=...
+# Repo root = AsymGEMM-SFT; override with SFT_ROOT=
 SFT_ROOT=${SFT_ROOT:-$(cd ../.. && pwd)}
 ROOT=${ROOT:-${SFT_ROOT}/third_party/AsymGEMM}
 LF_DIR=${LF_DIR:-${SFT_ROOT}/third_party/LlamaFactory}
@@ -22,64 +22,92 @@ RUN_POST=${RUN_POST:-false}
 # Sweep axes
 GPU_POOL=${GPU_POOL:-3}
 
-# MODEL_SPECS entries are model|num_gpus. Recompute and Liger-loss mode belong only in BACKEND_SPECS.
-# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1"}
-# MODEL_SPECS=${MODEL_SPECS:-"meta-llama/Llama-4-Scout-17B-16E|1"}
-# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-35B-A3B|1"}
-# MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3.5-122B-A10B|1"}
-MODEL_SPECS=${MODEL_SPECS:-"Qwen/Qwen3-30B-A3B|1,meta-llama/Llama-4-Scout-17B-16E|1"}
+# RUNS: model ; backend|recompute|liger ; seq|batch|grad_accum ; policy|expact|attnact|layeract|layergc|sdparecomp
+# Models use the M shorthand; env MODEL_SPECS / BACKEND_SPECS / WORKLOADS / ASYMM_EXP_ACT_POLICIES override.
+#   backend  : asym_cpuadamwds | zero3_offload | zero3_offload_mem | zero3_offload_opnvme | zero3_offload_pnvme | superoffload | superoffload_mem
+#   recompute: recomp | norecomp | unsloth        liger: ligerloss0 | ligerloss1
+#   policy   : none|false|false|false|false|false (off)  |  none|true|true|false|true|true (offload+gc)
+declare -A M=(
+  # MoE                                          (key = family-version + total size)
+  [q3-30b]="Qwen/Qwen3-30B-A3B|1"
+  [q3.5-35b]="Qwen/Qwen3.5-35B-A3B|1"
+  [q3.5-122b]="Qwen/Qwen3.5-122B-A10B|1"
+  [llama4-scout]="meta-llama/Llama-4-Scout-17B-16E|1"
+  # dense
+  [q3-32b]="Qwen/Qwen3-32B|1"
+  [q2.5-72b]="Qwen/Qwen2.5-72B-Instruct|1"
+  [llama3.3-70b]="meta-llama/Llama-3.3-70B-Instruct|1"
+)
+# RUNS=(
+#   # "q3-30b ; zero3_offload_opnvme|recomp|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+#   # "q3-30b ; zero3_offload_pnvme|recomp|ligerloss1  ; 4092|8|1 ; none|false|false|false|false|false"
+#   "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+# )
+RUNS=(
+  "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+  "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+
+  "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+  "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+
+  "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+  "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+
+  "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+  "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+
+  "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  "llama3.3-70b; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+  "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  "llama3.3-70b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+)
+
+# iterate + parse the rows into the legacy lists
+_run_models=(); _run_backends=(); _run_workloads=(); _run_policies=()
+for _run in "${RUNS[@]}"; do
+  IFS=';' read -r _m _b _w _p <<< "${_run}"
+  _m="${_m// /}"; _b="${_b// /}"; _w="${_w// /}"; _p="${_p// /}"
+  [[ -n "${M[$_m]:-}" ]] || { echo "RUNS: unknown model shorthand '${_m}' (add it to M)" >&2; exit 1; }
+  _run_models+=("${M[$_m]}"); _run_backends+=("${_b}"); _run_workloads+=("${_w}"); _run_policies+=("${_p}")
+done
+MODEL_SPECS="${MODEL_SPECS:-$(IFS=,; echo "${_run_models[*]}")}"
+BACKEND_SPECS="${BACKEND_SPECS:-$(IFS=,; echo "${_run_backends[*]}")}"
+WORKLOADS="${WORKLOADS:-$(IFS=,; echo "${_run_workloads[*]}")}"
+ASYMM_EXP_ACT_POLICIES="${ASYMM_EXP_ACT_POLICIES:-$(IFS=,; echo "${_run_policies[*]}")}"
 
 ROUTER_MODES=${ROUTER_MODES:-whole}
 PROFILERS=${PROFILERS:-both}
 # PROFILERS=${PROFILERS:-source}
 PRECISION=${PRECISION:-bf16}
-# LORA_DROPOUT=${LORA_DROPOUT:-0.00,0.10}
-LORA_DROPOUT=${LORA_DROPOUT:-0.00}
 LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 
-# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp|ligerloss0"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload_mem|recomp|ligerloss0"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"superoffload|recomp|ligerloss0"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|recomp|ligerloss0"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp|ligerloss0"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp|ligerloss0"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|recomp|ligerloss0,zero3_offload|recomp|ligerloss0,zero3_offload_mem|recomp|ligerloss0,asym_cpuadamwds|norecomp|ligerloss0"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|recomp|ligerloss0,superoffload|recomp|ligerloss0,zero3_offload_mem|recomp|ligerloss0,zero3_offload|recomp|ligerloss0"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp|ligerloss"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|recomp|ligerloss1,asym_cpuadamwds|recomp|ligerloss1"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"zero3_offload|unsloth|ligerloss1,zero3_offload|recomp|ligerloss1"}
-# BACKEND_SPECS=${BACKEND_SPECS:-"superoffload_mem|unsloth|ligerloss1,superoffload_mem|recomp|ligerloss1"}
-BACKEND_SPECS=${BACKEND_SPECS:-"asym_cpuadamwds|norecomp|ligerloss1"}
-
-# Format: EXPERT_SELECTION_POLICY|ASYMM_EXPERT_ACT_OFFLOAD|ASYMM_ATTN_ACT_OFFLOAD|ASYMM_LAYER_ACT_OFFLOAD|ASYMM_LAYER_GC.
-# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|false|false|false|false|false"}
-# ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|true|false|true|true,gc-layer|false|false|false|false"}
-ASYMM_EXP_ACT_POLICIES=${ASYMM_EXP_ACT_POLICIES:-"none|true|true|false|true|true"}
-
 # Training
-# WORKLOADS entries are seq_len|per_device_train_batch_size|gradient_accumulation_steps.
-WORKLOADS="${WORKLOADS:-4096|8|1}"
-# WORKLOADS="${WORKLOADS:-4096|8|1,8192|8|1}"
-# WORKLOADS="${WORKLOADS:-48000|8|1}"
-# WORKLOADS="${WORKLOADS:-4096|8|1,8192|8|1}"
-
-MAX_STEPS=${MAX_STEPS:-3}
-WARMUP_STEPS=${WARMUP_STEPS:-3}
-# MAX_STEPS=${MAX_STEPS:-10}
-# WARMUP_STEPS=${WARMUP_STEPS:-5}
+# MAX_STEPS=${MAX_STEPS:-2}
+# WARMUP_STEPS=${WARMUP_STEPS:-2}
+MAX_STEPS=${MAX_STEPS:-6}
+WARMUP_STEPS=${WARMUP_STEPS:-6}
 # MAX_STEPS=${MAX_STEPS:-1}
 # WARMUP_STEPS=${WARMUP_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
-LORA_RANK=${LORA_RANK:-64}
-LORA_ALPHA=${LORA_ALPHA:-16}
+# LORA_PARAMS is the only LoRA knob: sweep tuples, each "dropout|rank|alpha[|target]" (target optional, default 'all').
+# rank moves memory/throughput; alpha is a scalar (no profiling effect); keep target=all for MoE expert-LoRA.
+# Multi-module target uses '+' (commas separate tuples), e.g. "0.00|64|128|q_proj+k_proj" -> q_proj,k_proj.
+# LORA_PARAMS=${LORA_PARAMS:-"0.00|64|128|all"}
+LORA_PARAMS=${LORA_PARAMS:-"0.00|64|128|all,0.00|16|32|all"}
 SEED=${SEED:-42}
 
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
 
-# Kernel / SwiGLU-backward optimization toggles for this sweep (1=on, 0=off); forwarded via run_env below.
-# ASYMM_EXPERT_SILU_BWD_GPU: v14 expert SwiGLU backward on GPU. DG_BF16_CPU_LEFT_COMPACT_GRID: compact
-# CPU-left forward M-grid. Native gate/up pair fwd is intentionally left OFF (it needs LORA_A_FWD=cpu; we keep hbm).
+# Kernel / SwiGLU-backward toggles (1=on, 0=off)
 ASYMM_EXPERT_SILU_BWD_GPU=${ASYMM_EXPERT_SILU_BWD_GPU:-1}
 DG_BF16_CPU_LEFT_COMPACT_GRID=${DG_BF16_CPU_LEFT_COMPACT_GRID:-0}
 ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE=${ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE:-0}
@@ -116,8 +144,7 @@ DATASET_OVERWRITE=${DATASET_OVERWRITE:-false}
 TEMPLATE=${TEMPLATE:-auto}
 MAX_SAMPLES=${MAX_SAMPLES:-256}
 
-# Shared AsymGEMM expert activation-backfetch toggles. Default OFF; forced off for
-# policy-independent backends. Qwen and Llama use the same env names.
+# Expert activation-backfetch toggles (default off)
 ASYM_OFFLOAD_ACT_RECOMPUTE=${ASYM_OFFLOAD_ACT_RECOMPUTE:-0}
 ASYM_OFFLOAD_X_UNPACKED=${ASYM_OFFLOAD_X_UNPACKED:-0}
 
@@ -126,13 +153,11 @@ ASYM_OFFLOAD_X_UNPACKED=${ASYM_OFFLOAD_X_UNPACKED:-0}
 OUTPUT_ROOT=${OUTPUT_ROOT:-}
 PROFILE_LEVEL=${PROFILE_LEVEL:-op}
 PROFILE_LAYERS=${PROFILE_LAYERS:-all}
-# Single knob: PROFILE_MEMORY_BREAKDOWN gates BOTH the per-module memory breakdown and the
-# saved-tensor/param attribution (they always move together). true/false only; no auto.
 PROFILE_MEMORY_BREAKDOWN=${PROFILE_MEMORY_BREAKDOWN:-true}
 PROFILE_MEMORY_BREAKDOWN_INTERVAL=${PROFILE_MEMORY_BREAKDOWN_INTERVAL:-1}
 PROFILE_MEMORY_BREAKDOWN_STEPS=${PROFILE_MEMORY_BREAKDOWN_STEPS:-}
 PROFILE_MEMORY_BREAKDOWN_MODULES=${PROFILE_MEMORY_BREAKDOWN_MODULES:-attention,linear_attention,router,mlp,experts,shared_experts,lora,embedding,norms,loss}
-PROFILE_LIVE_ACTIVATION_DETAILS=${PROFILE_LIVE_ACTIVATION_DETAILS:-${ASYM_GEMM_LF_PROFILE_LIVE_ACTIVATION_DETAILS:-false}}
+PROFILE_LIVE_ACTIVATION_DETAILS=${PROFILE_LIVE_ACTIVATION_DETAILS:-${ASYM_GEMM_LF_PROFILE_LIVE_ACTIVATION_DETAILS:-true}}
 PROFILE_LIVE_ACTIVATION_TOPK=${PROFILE_LIVE_ACTIVATION_TOPK:-${ASYM_GEMM_LF_PROFILE_LIVE_ACTIVATION_TOPK:-100}}
 PROFILE_MEMORY_SNAPSHOT=${PROFILE_MEMORY_SNAPSHOT:-false}
 PROFILE_MEMORY_SNAPSHOT_PATH=${PROFILE_MEMORY_SNAPSHOT_PATH:-}
@@ -195,6 +220,7 @@ MEMORY_SCHEMA_VALIDATOR="${ASYM_DIR}/scripts/lf/validate_lf_memory_capacity_sche
 PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_activation_recompute_sweep.py"
 MEMORY_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_memory_breakdown.py"
 INTERCONNECT_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_interconnect_ctc.py"
+THROUGHPUT_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_throughput.py"
 
 # =============================================================================
 # Main Logic
@@ -244,10 +270,7 @@ Options:
   --max-steps N                  Measured steps kept in plots/summaries.
   --warmup-steps N               Extra initial steps to run but exclude from plots/summaries. Use 5+ for stable timing; 0/1 is allowed for smoke tests.
   --learning-rate VALUE
-  --lora-rank N
-  --lora-alpha VALUE
-  --lora-dropout LIST           LoRA dropout probabilities in fixed 0.xx format, e.g. 0.00,0.10.
-                                 KT supports nonzero dropout for validated kt_torchbf16 and kt_armbf16 SFT backends.
+  --lora-params LIST            LoRA sweep tuples, each dropout|rank|alpha[|target] (target default all; multi-module via '+').
   --lf-expert-lora-impls NAME   Qwen fused expert LoRA implementation: peft-target-parameters, split-target-parameters, off.
                                  Use split-target-parameters for the corrected PEFT-compatible LF/ZeRO expert LoRA path.
   --seed N
@@ -578,7 +601,7 @@ backend_gpu_count() {
   local model_gpu_count="$2"
   case "${backend}" in
     asym|asym_torch|asym_cpuadamwtorch|asym_cpuadamwds) printf '1\n' ;;
-    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_cpuadam|superoffload|superoffload_mem) printf '%s\n' "${model_gpu_count}" ;;
+    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_pnvme|zero3_cpuadam|superoffload|superoffload_mem) printf '%s\n' "${model_gpu_count}" ;;
     kt_torchbf16|kt_armbf16) printf '1\n' ;;
     *) die "internal backend label must be torch, asym, asym_torch, asym_cpuadamwtorch, asym_cpuadamwds, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_cpuadam, superoffload, superoffload_mem, kt_torchbf16, or kt_armbf16, got '${backend}'" ;;
   esac
@@ -590,6 +613,8 @@ zero_deepspeed_config() {
     zero3) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_config.json" ;;
     zero3_offload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json" ;;
     zero3_offload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_config.json" ;;
+    zero3_offload_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_opnvme_config.json" ;;
+    zero3_offload_pnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_pnvme_config.json" ;;
     zero3_cpuadam) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_cpuadam_config.json" ;;
     superoffload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_config.json" ;;
     superoffload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_config.json" ;;
@@ -599,16 +624,25 @@ zero_deepspeed_config() {
 
 is_zero_backend() {
   case "${1}" in
-    zero2|zero3|zero3_offload|zero3_offload_mem|zero3_cpuadam|superoffload|superoffload_mem) return 0 ;;
+    zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_pnvme|zero3_cpuadam|superoffload|superoffload_mem) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 is_policy_independent_backend() {
   case "${1}" in
-    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_cpuadam|superoffload|superoffload_mem|kt_*) return 0 ;;
+    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_pnvme|zero3_cpuadam|superoffload|superoffload_mem|kt_*) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# A policy the backend-agnostic generic-offload hook acts on: off-layer (whole-layer save_on_cpu) or any
+# expert/attn/layer-GC offload flag set. These are NOT inert on non-asym backends, so they must not be
+# canonicalized to none|false... nor skipped as redundant. Arg: an ASYMM_EXP_ACT_POLICIES pair string.
+policy_pair_is_generic_baseline() {
+  case "${1%%|*}" in off-layer) return 0 ;; esac
+  local IFS='|'; local -a f; read -ra f <<< "${1}"
+  [[ "${f[1]:-false}" == "true" || "${f[2]:-false}" == "true" || "${f[4]:-false}" == "true" ]]
 }
 
 # Collapse AsymGEMM-only policy axes to inert values when they're no-ops: policy-independent backends or
@@ -616,6 +650,11 @@ is_policy_independent_backend() {
 canonicalize_policy_axis_for_inert_run() {
   local backend="${1}"
   local recompute="${2:-}"
+  # Generic activation-offload baselines (off-layer / any expert|attn|layer-GC offload flag) are NOT inert on
+  # non-asym backends -- they drive the backend-agnostic generic_offload hook. Keep their policy axes intact.
+  if [[ "${expert_policy}" == "off-layer" || "${ASYMM_EXPERT_ACT_OFFLOAD}" == "true" || "${ASYMM_ATTN_ACT_OFFLOAD}" == "true" || "${ASYMM_LAYER_GC}" == "true" ]]; then
+    return 0
+  fi
   { is_policy_independent_backend "${backend}" || [[ "${recompute}" == "recomp" ]]; } || return 0
   expert_policy=none
   ASYMM_EXPERT_ACT_OFFLOAD=false; expact_label="$(expact_tag false)"
@@ -648,7 +687,7 @@ liger_loss_label() {
 normalize_expert_policy() {
   local raw="$1"
   case "${raw}" in
-    none|gc-exp|gc-attn-exp|gc-layer|tok-le0|tok-le0-act)
+    none|gc-exp|gc-attn-exp|gc-layer|off-layer|tok-le0|tok-le0-act)
       printf '%s\n' "${raw}"
       return
       ;;
@@ -657,7 +696,7 @@ normalize_expert_policy() {
     printf '%s\n' "${raw}"
     return
   fi
-  die "invalid expert policy '${1}'; expected none, gc-exp, gc-attn-exp, gc-layer, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, or -act variants"
+  die "invalid expert policy '${1}'; expected none, gc-exp, gc-attn-exp, gc-layer, off-layer, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, or -act variants"
 }
 
 backend_label() {
@@ -671,6 +710,8 @@ backend_label() {
     zero3) printf 'zero3\n' ;;
     zero3_offload) printf 'zero3_offload\n' ;;
     zero3_offload_mem) printf 'zero3_offload_mem\n' ;;
+    zero3_offload_opnvme) printf 'zero3_offload_opnvme\n' ;;
+    zero3_offload_pnvme) printf 'zero3_offload_pnvme\n' ;;
     zero3_cpuadam) printf 'zero3_cpuadam\n' ;;
     superoffload) printf 'superoffload\n' ;;
     superoffload_mem) printf 'superoffload_mem\n' ;;
@@ -728,6 +769,8 @@ append_backend_spec() {
     zero3) backend=zero3 ;;
     zero3_offload) backend=zero3_offload ;;
     zero3_offload_mem) backend=zero3_offload_mem ;;
+    zero3_offload_opnvme) backend=zero3_offload_opnvme ;;
+    zero3_offload_pnvme) backend=zero3_offload_pnvme ;;
     zero3_cpuadam) backend=zero3_cpuadam ;;
     superoffload) backend=superoffload ;;
     superoffload_mem) backend=superoffload_mem ;;
@@ -1324,7 +1367,9 @@ config_root_path() {
   if [[ -n "${run_name}" ]]; then
     config_label="$(safe_label "${run_name}__b${batch_size}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${dropout_label}")"
   else
-    config_label="$(safe_label "${workload_label}__gpus${current_model_gpu_count}__b${batch_size}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${step_label}_r${LORA_RANK}_a${LORA_ALPHA}_${dropout_label}")"
+    local lora_target_frag=""
+    [[ "${LORA_TARGET:-all}" != "all" ]] && lora_target_frag="_tgt${LORA_TARGET}"
+    config_label="$(safe_label "${workload_label}__gpus${current_model_gpu_count}__b${batch_size}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${step_label}_r${LORA_RANK}_a${LORA_ALPHA}_${dropout_label}${lora_target_frag}")"
   fi
   printf '%s/%s\n' "${precision_root}" "${config_label}"
 }
@@ -1514,6 +1559,22 @@ interconnect_combined_plot_cmd_base() {
   )
 }
 
+throughput_combined_plot_cmd_base() {
+  local -n _cmd_ref="$1"
+  local input_root="$2"
+  local output_dir="$3"
+  shift 3
+  (($# > 0)) || die "throughput_combined_plot_cmd_base requires at least one workload"
+  _cmd_ref=(
+    "${ENV_PYTHON}" "${THROUGHPUT_PLOT_SCRIPT}"
+    --input-root "${input_root}"
+    --output-dir "${output_dir}"
+    --clean-output
+    --combined-only
+    --workloads "$@"
+  )
+}
+
 append_backend_filters() {
   local -n _cmd_ref="$1"
   local backend
@@ -1623,6 +1684,11 @@ interconnect_plot_filters() {
   append_fixed_profiler_filter "$1" nsys
 }
 
+# Throughput combined: source profiler only (per-step timing without nsys overhead); no config narrowing.
+throughput_plot_filters() {
+  append_fixed_profiler_filter "$1" source
+}
+
 profiler_selected_for_plots() {
   local profiler="$1"
   local selected
@@ -1694,7 +1760,7 @@ router_mode_spec="${ROUTER_MODES}"
 profiler_spec="${PROFILERS}"
 workload_spec="${WORKLOADS}"
 exp_act_policy_spec="${ASYMM_EXP_ACT_POLICIES}"
-lora_dropout_spec="${LORA_DROPOUT}"
+lora_params_spec="${LORA_PARAMS}"
 lf_expert_lora_impl_spec="${LF_EXPERT_LORA_IMPLS}"
 output_root="${OUTPUT_ROOT}"
 run_name="${RUN_NAME}"
@@ -1743,14 +1809,10 @@ while (($#)); do
     --warmup-steps=*) WARMUP_STEPS="${1#*=}"; shift ;;
     --learning-rate) need_value "$1" "${2-}"; LEARNING_RATE="$2"; shift 2 ;;
     --learning-rate=*) LEARNING_RATE="${1#*=}"; shift ;;
-    --lora-rank) need_value "$1" "${2-}"; LORA_RANK="$2"; shift 2 ;;
-    --lora-rank=*) LORA_RANK="${1#*=}"; shift ;;
-    --lora-alpha) need_value "$1" "${2-}"; LORA_ALPHA="$2"; shift 2 ;;
-    --lora-alpha=*) LORA_ALPHA="${1#*=}"; shift ;;
     --seed) need_value "$1" "${2-}"; SEED="$2"; shift 2 ;;
     --seed=*) SEED="${1#*=}"; shift ;;
-    --lora-dropout) collect_values "$1" vals "${@:2}"; lora_dropout_spec="${vals[*]}"; LORA_DROPOUT="${lora_dropout_spec}"; set -- "${REMAINING[@]}" ;;
-    --lora-dropout=*) lora_dropout_spec="${1#*=}"; LORA_DROPOUT="${lora_dropout_spec}"; shift ;;
+    --lora-params) collect_values "$1" vals "${@:2}"; lora_params_spec="${vals[*]}"; LORA_PARAMS="${lora_params_spec}"; set -- "${REMAINING[@]}" ;;
+    --lora-params=*) lora_params_spec="${1#*=}"; LORA_PARAMS="${lora_params_spec}"; shift ;;
     --lf-expert-lora-impls) need_value "$1" "${2-}"; lf_expert_lora_impl_spec="$2"; LF_EXPERT_LORA_IMPLS="$2"; shift 2 ;;
     --lf-expert-lora-impls=*) lf_expert_lora_impl_spec="${1#*=}"; LF_EXPERT_LORA_IMPLS="${1#*=}"; shift ;;
     --precision) need_value "$1" "${2-}"; PRECISION="$2"; shift 2 ;;
@@ -1872,7 +1934,7 @@ require_comma_list "--router-modes/ROUTER_MODES" "${router_mode_spec}"
 require_comma_list "--profilers/PROFILERS" "${profiler_spec}"
 require_comma_list "--workloads/WORKLOADS" "${workload_spec}"
 require_comma_list "--asymm-exp-act-policies/ASYMM_EXP_ACT_POLICIES" "${exp_act_policy_spec}"
-require_comma_list "--lora-dropout/LORA_DROPOUT" "${lora_dropout_spec}"
+require_comma_list "--lora-params/LORA_PARAMS" "${lora_params_spec}"
 require_comma_list "--lf-expert-lora-impls/LF_EXPERT_LORA_IMPLS" "${lf_expert_lora_impl_spec}"
 
 nonnegative_int "--max-steps" "${MAX_STEPS}"
@@ -1889,11 +1951,18 @@ case "${MEMORY_BREAKDOWN_PLOT_Y_SCALE}" in
   shared|per-plot|global) ;;
   *) die "--memory-breakdown-plot-y-scale must be shared, per-plot, or global; got '${MEMORY_BREAKDOWN_PLOT_Y_SCALE}'" ;;
 esac
-mapfile -t lora_dropouts < <(tokens "${lora_dropout_spec}" | dedupe)
-((${#lora_dropouts[@]})) || die "LoRA dropout list is empty"
-for value in "${lora_dropouts[@]}"; do
-  lora_dropout_label "${value}" >/dev/null
-done
+# LORA_PARAMS entries are dropout|rank|alpha[|target]; parsed into aligned sweep arrays.
+lora_dropouts=(); lora_ranks=(); lora_alphas=(); lora_targets=()
+while IFS= read -r _lp_tuple; do
+  IFS='|' read -r _lp_d _lp_r _lp_a _lp_t _lp_extra <<< "${_lp_tuple}"
+  _lp_t="${_lp_t:-all}"
+  [[ -n "${_lp_d}" && -n "${_lp_r}" && -n "${_lp_a}" && -z "${_lp_extra:-}" ]] || die "LORA_PARAMS entry must be dropout|rank|alpha[|target], got '${_lp_tuple}'"
+  lora_dropout_label "${_lp_d}" >/dev/null
+  positive_int "LoRA rank" "${_lp_r}"
+  positive_int "LoRA alpha" "${_lp_a}"
+  lora_dropouts+=("${_lp_d}"); lora_ranks+=("${_lp_r}"); lora_alphas+=("${_lp_a}"); lora_targets+=("${_lp_t}")
+done < <(tokens "${LORA_PARAMS}" | dedupe)
+((${#lora_dropouts[@]})) || die "LORA_PARAMS list is empty"
 lf_expert_lora_impls=()
 while IFS= read -r value; do
   lf_expert_lora_impls+=("${value,,}")
@@ -1916,6 +1985,9 @@ for value in "${lf_expert_lora_impls[@]}"; do
 done
 LF_EXPERT_LORA_IMPLS="$(IFS=,; printf '%s' "${lf_expert_lora_impls[*]}")"
 LORA_DROPOUT="${lora_dropouts[0]}"
+LORA_RANK="${lora_ranks[0]}"
+LORA_ALPHA="${lora_alphas[0]}"
+LORA_TARGET="${lora_targets[0]}"
 lora_dropout_label_value="$(lora_dropout_label "${LORA_DROPOUT}")"
 TOTAL_STEPS=$((MAX_STEPS + WARMUP_STEPS))
 PREPARE_DATASETS=$(bool_value "${PREPARE_DATASETS}")
@@ -1977,7 +2049,7 @@ selected_has_non_asym=false
 for backend in "${backends[@]}"; do
   case "${backend}" in
     asym|asym_torch|asym_cpuadamwtorch|asym_cpuadamwds) selected_has_asym=true ;;
-    zero2|zero3|zero3_offload|zero3_offload_mem|zero3_cpuadam) selected_has_zero=true ;;
+    zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_pnvme|zero3_cpuadam) selected_has_zero=true ;;
     superoffload|superoffload_mem) selected_has_zero=true; selected_has_superoffload=true ;;
     kt_*) selected_has_kt=true ;;
   esac
@@ -2136,6 +2208,7 @@ if [[ "${PLOT_MEMORY_BREAKDOWN}" == "true" ]]; then
 fi
 if [[ "${PLOT}" == "true" && "${nsys_artifacts_selected}" == "true" ]]; then
   [[ -f "${INTERCONNECT_PLOT_SCRIPT}" ]] || die "missing ${INTERCONNECT_PLOT_SCRIPT}"
+  [[ -f "${THROUGHPUT_PLOT_SCRIPT}" ]] || die "missing ${THROUGHPUT_PLOT_SCRIPT}"
 fi
 if [[ "${DRY_RUN}" != "true" && ( "${PLOT}" == "true" || ( "${PREPARE_DATASETS}" == "true" && "${COLLECT_EXISTING}" != "true" ) ) ]]; then
   [[ -x "${ENV_PYTHON}" ]] || die "missing executable LF Python at ${ENV_PYTHON}"
@@ -2163,6 +2236,7 @@ echo "Output precision root: ${precision_root}"
 declare -A plot_roots=()
 declare -A memory_plot_roots=()
 declare -A interconnect_plot_roots=()
+declare -A throughput_plot_roots=()
 failures=0
 interrupted=false
 interrupt_exit_status=130
@@ -2452,6 +2526,9 @@ run_job() {
   if [[ "${run_profiler}" == "nsys" ]]; then
     interconnect_plot_roots["${config_root}"]="${seq_len}"
   fi
+  if [[ "${run_profiler}" == "source" ]]; then
+    throughput_plot_roots["${config_root}"]="${seq_len}"
+  fi
   if [[ "${backend}" == "kt_armbf16" ]]; then
     check_kt_arm_route_rank_for_sweep "${seq_len}"
     if [[ "${run_profiler}" == "nsys" ]]; then
@@ -2569,6 +2646,7 @@ run_job() {
     LORA_RANK="${LORA_RANK}"
     LORA_ALPHA="${LORA_ALPHA}"
     LORA_DROPOUT="${LORA_DROPOUT}"
+    LORA_TARGET="${LORA_TARGET}"
     LF_QWEN_MOE_EXPERT_LORA_IMPL="${lf_expert_lora_impl}"
     ENABLE_LIGER_KERNEL="${enable_liger_kernel}"
     SEED="${SEED}"
@@ -2942,6 +3020,7 @@ This config root is organized as follows:
 - \`combined/\`: config-level LF timing and allocator-summary plots from \`profile.json\`.
 - \`memory_combined/\`: config-level source-memory breakdown plots plus per-group subfolders split by workload/backend/profiler/router/expact/attnact/layeract/layergc/recompute/policy/liger_loss. If no source-memory rows were collected, this folder contains a README explaining why.
 - \`c2c_combined/\`: config-level C2C/CTC saturation plots plus per-group subfolders split by workload/backend/profiler/router/expact/attnact/layeract/layergc/recompute/policy/liger_loss. If old traces lack GPU metrics, this folder contains a README explaining why.
+- \`throughput_combined/\`: config-level training throughput (tokens/sec) plots from source-profiler runs, plus per-group subfolders.
 - \`<backend>__<profiler>__<recompute>__pol<policy>__router<mode>__...__ligerloss0/b<batch>_s<seq>_ga<grad_accum>/\`: per-run artifacts.
 
 If \`PLOT_OUTPUT_DIR\` is set, combined plot folders are written under that external plot output root instead of this config root.
@@ -2961,7 +3040,8 @@ This precision root is organized as follows:
 - \`combined/\`: global LF timing and allocator-summary plots across config roots.
 - \`memory_combined/\`: global source-memory breakdown plots across config roots plus per-group subfolders split by workload/backend/profiler/router/expact/attnact/layeract/layergc/recompute/policy/liger_loss. If no source-memory rows were collected, this folder contains a README explaining why.
 - \`c2c_combined/\`: global C2C/CTC saturation plots across config roots plus per-group subfolders split by workload/backend/profiler/router/expact/attnact/layeract/layergc/recompute/policy/liger_loss. If old traces lack Nsight GPU metrics, this folder contains a README explaining why.
-- \`<config_root>/\`: one workload/configuration root. Each config root has its own \`combined/\`, \`memory_combined/\`, \`c2c_combined/\`, and per-run backend/profiler folders.
+- \`throughput_combined/\`: global training throughput (tokens/sec) plots across config roots plus per-group subfolders.
+- \`<config_root>/\`: one workload/configuration root. Each config root has its own \`combined/\`, \`memory_combined/\`, \`c2c_combined/\`, \`throughput_combined/\`, and per-run backend/profiler folders.
 
 If \`PLOT_OUTPUT_DIR\` is set, global combined plot folders are written under that external plot output root instead of this precision root.
 
@@ -2983,6 +3063,23 @@ plot_interconnect_config_root() {
   echo "Writing LF C2C combined plots: ${plot_root}"
   if ! run_tracked_command "${plot_cmd[@]}"; then
     echo "warning: failed to write C2C combined plots for ${config_root}" >&2
+  fi
+}
+
+plot_throughput_config_root() {
+  local config_root="$1"
+  local seq_len="$2"
+  local plot_root
+  [[ "${PLOT}" == "true" ]] || return 0
+
+  plot_root="${config_root}/throughput_combined"
+  [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")/throughput_combined"
+  local -a plot_cmd
+  throughput_combined_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
+  throughput_plot_filters plot_cmd
+  echo "Writing LF throughput combined plots: ${plot_root}"
+  if ! run_tracked_command "${plot_cmd[@]}"; then
+    echo "warning: failed to write throughput combined plots for ${config_root}" >&2
   fi
 }
 
@@ -3044,6 +3141,16 @@ interconnect_precision_combined_cmd() {
   shift 2
 
   interconnect_combined_plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${workloads[@]}"
+  _cmd_ref+=("$@")
+}
+
+throughput_precision_combined_cmd() {
+  local cmd_name="$1"
+  local -n _cmd_ref="${cmd_name}"
+  local output_dir="$2"
+  shift 2
+
+  throughput_combined_plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${workloads[@]}"
   _cmd_ref+=("$@")
 }
 
@@ -3156,6 +3263,25 @@ plot_interconnect_precision_combined() {
   fi
 }
 
+plot_throughput_precision_combined() {
+  local combined_throughput_plot_root
+  [[ "${PLOT}" == "true" ]] || return 0
+
+  combined_throughput_plot_root="${precision_root}/throughput_combined"
+  [[ -n "${PLOT_OUTPUT_DIR}" ]] && combined_throughput_plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/throughput_combined"
+  if [[ "${#throughput_plot_roots[@]}" -gt 0 ]]; then
+    declare -A throughput_combined_workload_bases=()
+    collect_workload_bases_from_roots throughput_plot_roots throughput_combined_workload_bases
+    run_precision_combined_plot "${combined_throughput_plot_root}" throughput_precision_combined_cmd throughput_plot_filters throughput false
+    run_model_split_precision_combined_plots throughput_combined_workload_bases "${combined_throughput_plot_root}" throughput_precision_combined_cmd throughput_plot_filters throughput false
+  else
+    write_missing_combined_readme \
+      "${combined_throughput_plot_root}" \
+      "LF Throughput Combined Artifacts" \
+      "No source profiler runs were selected in this sweep, so no per-step timing is available to compute tokens/sec."
+  fi
+}
+
 for model_spec_entry in "${model_specs[@]}"; do
   parse_model_spec "${model_spec_entry}"
   current_model_name="${parsed_model_name}"
@@ -3184,8 +3310,11 @@ for model_spec_entry in "${model_specs[@]}"; do
         fi
       fi
     fi
-    for lora_dropout in "${lora_dropouts[@]}"; do
-      LORA_DROPOUT="${lora_dropout}"
+    for _lp_idx in "${!lora_dropouts[@]}"; do
+      LORA_DROPOUT="${lora_dropouts[$_lp_idx]}"
+      LORA_RANK="${lora_ranks[$_lp_idx]}"
+      LORA_ALPHA="${lora_alphas[$_lp_idx]}"
+      LORA_TARGET="${lora_targets[$_lp_idx]}"
       lora_dropout_label_value="$(lora_dropout_label "${LORA_DROPOUT}")"
       config_root="$(config_root_path "${seq_len}")"
       for lf_expert_lora_impl in "${lf_expert_lora_impls[@]}"; do
@@ -3225,7 +3354,7 @@ for model_spec_entry in "${model_specs[@]}"; do
                     continue
                   fi
                 fi
-                if { is_policy_independent_backend "${backend}" || [[ "${recompute}" == "recomp" ]]; } && [[ "${exp_act_policy_pair}" != "${exp_act_policy_pairs[0]}" ]]; then
+                if { is_policy_independent_backend "${backend}" || [[ "${recompute}" == "recomp" ]]; } && [[ "${exp_act_policy_pair}" != "${exp_act_policy_pairs[0]}" ]] && ! policy_pair_is_generic_baseline "${exp_act_policy_pair}"; then
                   echo "Skipping backend=${backend} recompute=${recompute} policy=${exp_act_policy_pair}; inert policy axes run once (canonicalized to none|false|false|false|false)."
                   continue
                 fi
@@ -3286,6 +3415,14 @@ for model_spec_entry in "${model_specs[@]}"; do
             "LF C2C / CTC Combined Artifacts" \
             "No nsys profiler run was selected for this config, so no Nsight C2C/CTC GPU metric samples can be summarized."
         fi
+        if [[ -n "${throughput_plot_roots[${config_root}]+set}" ]]; then
+          plot_throughput_config_root "${config_root}" "${seq_len}"
+        else
+          write_missing_combined_readme \
+            "${config_root}/throughput_combined" \
+            "LF Throughput Combined Artifacts" \
+            "No source profiler run was selected for this config, so no per-step timing is available to compute tokens/sec."
+        fi
         write_config_artifact_readme "${config_root}"
       fi
     done
@@ -3308,6 +3445,7 @@ if [[ "${PLOT}" == "true" ]]; then
   plot_timing_precision_combined
   plot_memory_precision_combined
   plot_interconnect_precision_combined
+  plot_throughput_precision_combined
 fi
 
 if [[ "${DRY_RUN}" != "true" ]]; then

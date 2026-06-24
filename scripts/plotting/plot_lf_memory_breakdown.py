@@ -600,6 +600,9 @@ def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | 
             config.get("gradient_accumulation_steps") or (run_dir_match.group("grad_accum") if run_dir_match else "")
         ),
         "lora_dropout": str(config.get("lora_dropout") if config.get("lora_dropout") is not None else ""),
+        "lora_rank": str(config.get("lora_rank") if config.get("lora_rank") is not None else ""),
+        "lora_alpha": str(config.get("lora_alpha") if config.get("lora_alpha") is not None else ""),
+        "lora_target": str(config.get("lora_target") or ""),
         "config": config_root.name,
     }
     if not metadata["seq_len"]:

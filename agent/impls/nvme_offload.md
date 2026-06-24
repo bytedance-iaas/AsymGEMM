@@ -8,6 +8,122 @@ The intended reuse is the performance substrate: AIO/GDS builders, AIO handles, 
 
 The design must keep a stable placement/materialization boundary so the local backend can be replaced later by a DeepSpeed-owned backend if multi-GPU/ZeRO support becomes necessary. In that future mode, DeepSpeed would own parameter residency, partitioning, optimizer state, checkpointing, and `param.data`; AsymGEMM would keep its compute policies/kernels and request materialized tensors or views through the same boundary. New local NVMe code should therefore improve single-GPU capacity/performance now without creating contract or ownership conflicts that make a later DeepSpeed backend hard to swap in.
 
+## Current-Repo Reconciliation — audited 2026-06-23 (READ THIS FIRST)
+
+This plan was written ~2026-06-19 and was **never implemented** (none of the proposed new files exist). The repo has since moved on. Every concrete anchor below was re-verified against current code on 2026-06-23. **Where an inline reference later in this doc disagrees with this section, this section wins.** Line numbers are current as of the audit.
+
+### Status at a glance
+
+- **New files — all still absent (as planned):** `optimizer_contracts.py`, `placement.py`, `disk_offload.py`, `paged_cpu_adam.py`, `deepspeed_placement.py`, and all 9 proposed test files. The staged decomposition (0A→5) is still valid; this is a forward-looking plan that was paused, not a stale one.
+- **Stage 0A is ~60% already done** inside `cpu_adam.py` — re-scope it from "add" to "verify present".
+- **Nothing NVMe-related is pre-wired** in LlamaFactory, the profile scripts, or the Python profile layer (`grep asym_nvme` returns 0 everywhere). Stage 0B is 100% greenfield.
+- **The profiling-script layer drifted hard** — the single biggest change. See "Script layer" below.
+
+### Core training files (`asym_gemm/training/`)
+
+`cpu_adam.py` — `class AsymCPUAdamW` @94:
+- Mapping objects are `_ParamMapping` (@69), **not** the plan's proposed `LoRAParamRecord`. The fields the plan reads all exist: `.name`, `.aliases`, `.cuda_param`, `.cpu_param`, `.model_dtype`, `.last_had_grad` (plus runtime extras). `iter_lora_param_records()` can read these as written.
+- `attach_weight_offload_coordinator` **ALREADY EXISTS** @232 (plan says "add"). `self._coordinator` (@172), `self.weight_offload` (@171), and a `coordinator=` ctor arg (@115) already exist.
+- `asym_cpu_adamw_summary()` @741: of the plan's 5 "additive" keys, **3 already exist** — `cpu_master_bytes` (@787), `optimizer_state_cpu_bytes` (@789), `grad_offload_buffer_bytes` (@781). Only `optimizer_state_resident_bytes` and `optimizer_paged` are genuinely new.
+- `step()` copyback loop @502-508 — the Stage 2 hooks (`seal_step_trace_if_needed` / `begin_optimizer_refresh` / `flush_dirty_groups`) slot in here. `_copy_master_to_compute_param` @413.
+- `asym_cpu_adamw_clip_grad_norm_(max_norm, norm_type=2.0, chunk_elements=8_388_608)` @684 — signature matches the plan exactly. `asym_cpu_adamw_grad_offload_enabled` @646, `asym_cpu_adamw_grad_buffers` @649.
+- `backend` arg is `Literal["torch", "deepspeed"]` (default `"deepspeed"`, **not** `"ds"`). The parity test `AsymCPUAdamW(backend="torch")` is valid but also requires `named_params, lr, betas, eps, weight_decay`.
+- State dict `"asym_cpu_adamw_v1"` written @551 / enforced @566; `load_state_dict` hard-rejects any other format, so a paged optimizer is NOT checkpoint-compatible — Stage 3 needs the parser guard it already notes.
+
+`weight_offload.py` — `_LayerGroup` @34 (uses `__slots__` @37-53; current slots include extras `module_key`, `component`, `placeholders`); `LoRAWeightOffloadCoordinator` @73; `install_lora_weight_offload(model, coordinator) -> int` @317.
+- `__init__(self, *, pin_memory=True, persistence_threshold_numel=_DEFAULT_PERSIST_NUMEL)` @76; `_DEFAULT_PERSIST_NUMEL = 1_048_576` @29.
+- `gather_group` @209 — one-H2D-slab invariant intact; slab via `_take_slab` @199/214. `refresh_home_from_master(param, master_fp32)` @260. `register_group(...)` @108.
+- `_groups` is a **list** (@84), not a dict; membership is tracked by `_group_of_module` / `_group_of_key` dicts (@85-86) + a `_registered_keys` set.
+- `summary()` @271 already emits `weight_offload_param_numel` (@301) and is spread into the optimizer summary (cpu_adam.py:784), so `asym_cpu_adamw.weight_offload_*` paths already resolve in profiles.
+- The coordinator is ALREADY wired into the optimizer runtime: `refresh_home_from_master` is called from `_copy_master_to_compute_param` (@420) and `release` from `_offload_grad_from_hook` (@394). Stage 2 extends an existing contract, not a brand-new one.
+
+`__init__.py` exports `AsymCPUAdamW` (@99, in `__all__`) but **not** `LoRAWeightOffloadCoordinator` / `install_lora_weight_offload` — current convention is direct submodule import. The "update `__init__.py`" step is therefore optional.
+
+### LlamaFactory integration — canonical path is `third_party/LlamaFactory` (NOT `-fa4`)
+
+Confirmed via `run_lf_lora_sft.sh:19` (`LF_DIR=…/third_party/LlamaFactory`) and the editable `_editable_impl_llamafactory.pth`. All three plan target files exist.
+- `hparams/finetuning_args.py`: existing asym fields @460-482 (`use_asym_cpu_adamw` 460, `asym_cpu_adamw_backend` 464, `_pin_memory` 468, `_fp32_master` 472, `_grad_offload` 476, `_weight_offload` 482). No `asym_nvme_*` yet. House style is `field(default=…, metadata={"help": …})` — new fields should add `metadata`.
+- `hparams/parser.py`: `_verify_asym_cpu_adamw_args(model_args, training_args, finetuning_args)` @234, called @561 inside `if model_args.use_asym_gemm:` (opens @510) but **nested under `if finetuning_args.use_asym_cpu_adamw:` (@560)**. If NVMe must work independently of cpu_adamw, call `_verify_asym_nvme_args` directly under the `use_asym_gemm` block, not in that sub-branch. `ParallelMode` (@31) and `is_deepspeed_zero3_enabled` (@29) are already imported — no new imports needed.
+- `train/trainer_utils.py`: `_create_asym_cpu_adamw_optimizer(model, training_args, finetuning_args)` @530. **DRIFT vs the plan's flat snippet:** the coordinator steps (`LoRAWeightOffloadCoordinator(pin_memory=…)` @588 → `install_lora_weight_offload` @589 → `attach_weight_offload_coordinator` @594) only run inside `if finetuning_args.asym_cpu_adamw_weight_offload:` (@580) with an `installed <= 0` guard (@590). Preserve that gate.
+- SFT discovery: `_asym_cpu_adamw_grad_offload_optimizer` @ `train/sft/trainer.py:86`; clip called @545 & @575. A paged optimizer must keep `asym_cpu_adamw_grad_offload_enabled()` + `asym_cpu_adamw_clip_grad_norm_(…, chunk_elements=…)` reachable through one of `optimizer` / `base_optimizer` / `wrapped_optimizer` / `inner_optimizer`.
+
+### Script layer — the biggest drift
+
+- **Canonical profile script = `scripts/lf/profile_lora_lf_test.sh`** (chosen 2026-06-23). The former single driver was forked into five ~156KB near-identical variants (`profile_lora_lf_{long,short,nvme,test,test2}.sh`, differing mainly in top-of-file default knobs + a couple of backend case-arms). **All command blocks below and all Stage 0B bash plumbing target `profile_lora_lf_test.sh`.** The other four forks are out of scope; if they ever need NVMe, factor the knobs into a shared sourced fragment rather than copy-pasting.
+- **NAME COLLISION (still applies in `_test.sh`):** the `zero3_offload_opnvme` / `zero3_offload_pnvme` backends (present in `profile_lora_lf_test.sh` too — 9× each → `ds_z3_offload_*nvme_config.json`) are **DeepSpeed ZeRO-3 NVMe offload**, unrelated to this AsymGEMM-local-NVMe plan. Keep the new feature on the `ASYM_NVME_*` env prefix (orthogonal to the backend token) so it never collides with those backends.
+- **Stage 0B bash plumbing is 100% TODO.** No `ASYM_NVME_*`, `nvme_tag`, or `asym_nvme` token exists in `profile_lora_lf_test.sh` (or any variant) or in `run_lf_lora_sft.sh`.
+- Template anchors in `profile_lora_lf_test.sh`: `bool_value` @373; ASYM_CPU_ADAMW defaults @93-100 (add `ASYM_NVME_*` defaults right after, ~line 100); CLI arg parse @1799-1810; bool coercion @1950 + sweep coercion @2052-2058; per-job assignment @2569-2574; `ASYM_GEMM_LF_CONFIG_*` passthrough @2637-2638; the `run_env` array @2548 is launched via an `env` array @2699-2700. Run-label: `job_root_path()` @1349 builds `path_label` ending `__${liger_loss}${grad_offload_suffix}` @1364 — append a `nvme_tag` there so baseline (`ASYM_NVME_ENABLE=false`) and candidate run dirs differ.
+- `job_profile_complete` @833 takes 16 positional args (last `expected_liger_loss`=`$16` @849); it forwards to `existing_profile_complete` @870 (where `expected_liger_loss`=`$15` @885, then `current_profile_sync` is appended @886/906). The embedded Python validator reads up to `sys.argv[26]` (= `expected_profile_sync` @934).
+- **PLAN BUG — validator argv index:** the plan body says new NVMe expected-args start at `sys.argv[26]`, but slot 26 is already `expected_profile_sync`. New args start at **`sys.argv[27]`**, threaded through **both** `job_profile_complete` (append at `$17+`) and `existing_profile_complete` (append after the profile_sync arg), and **all 9** `job_profile_complete` call sites (@2479, 2481, 2493, 2502, 2526, 2531, 2539, 2756, 2770) need the trailing args.
+- `run_lf_lora_sft.sh` (not forked): `bool_string` @493; the `CMD_ARGS+=(--asym_…)` template @1660-1667 is gated by `BACKEND==asym*` — add `--asym_nvme_*` appends there. `LF_DIR` @19; profiled launcher (`run_lf_profiled_train.py`) dispatched @2067.
+- BACKEND_SPECS tokens `asym_cpuadamwds` (15×), `zero3_offload`, `norecomp` are all valid in `profile_lora_lf_test.sh`, so the plan's example commands parse.
+
+### Python profile layer
+
+- `run_lf_profiled_train.py`: `_config_from_args(args)` @543 — add `asym_nvme_*` config keys after the existing `asym_cpu_adamw_*` keys @670-681 (the env-or-arg-or-default pattern). The report dict adds `"asym_cpu_adamw": _asym_cpu_adamw_summary_from_trace(trace_handle)` @2701 (inside `report(self, trace_handle)` @2619) — add the `"asym_nvme"` sibling here.
+- **PLAN BUG — `_walk_optimizer_wrappers` does not exist.** The 8-hop optimizer-wrapper walk is **inlined** inside `_asym_cpu_adamw_summary_from_trace` @1081 (walk @1086-1107). Either inline the same walk in `_asym_nvme_summary_from_trace` or factor a shared helper as part of the diff.
+- The trace object's type is `LFTraceHandle` (dataclass, `asym_gemm/profiling/lf_trace.py:263`), built @2745; its `.optimizer` / `.prepared_optimizer` / `.model` / `.config` attributes are all real (the plan's attribute names are correct — only the helper name was fictional).
+- `postprocess_lf_profile_artifacts.py`: `_asym_cpu_adamw_rows(profile)` @372 — clone as `_asym_nvme_rows`. **`asym_cpu_adamw.csv` is written in TWO functions** — `_write_source_artifacts` @2158-2160 AND `_write_profile_csv_artifacts` @2227-2229 — so `asym_nvme.csv` must be added in **both**. NVMe markdown block targets: `_source_memory_markdown` (memory.md) @1736 / `_source_summary_markdown` (summary.md) @1133.
+
+### Profile schema & artifacts — verified, mostly accurate
+
+- **All 19 dotted paths the compare tool reads RESOLVE against the live `source_profile.json`** (`trainer.timing.*`, `memory.gpu.peak_{allocated,reserved}_hbm_bytes`, `memory.process.rss_peak_bytes`, `step_samples.rows[].{forward,backward,forward_backward,step,optimizer_update_side}_milliseconds`, `asym_cpu_adamw.*`, `config.*`, `trainer.losses`). No path corrections needed. The only not-yet-present fields are the Stage 0A additive aliases and the whole `asym_nvme` block (both expected).
+- **PLAN FIX:** artifacts are flat at the run-dir root. `memory_breakdown_summary.json` exists at top level (the `memory_breakdown/…` subdir alternative the plan lists **never occurs**), and it is produced by the runtime profiler, **not** by `postprocess_lf_profile_artifacts.py` — do not try to add NVMe fields to it there.
+- The output-root convention is `profiling_curr/` (note spelling) etc.; **there is no `profiling_nvme/` dir** yet — the plan's `OUTPUT_ROOT=profiling_nvme/...` simply creates it fresh, which is fine.
+
+### Genuine decisions for the implementer (not resolvable from code)
+
+1. ~~Canonical profile script among the 5 forks~~ — **RESOLVED 2026-06-23: `profile_lora_lf_test.sh`.** The other four forks are out of scope; DRY into a shared sourced fragment only if they later need NVMe.
+2. **NVMe independence** from `use_asym_cpu_adamw` (changes where `_verify_asym_nvme_args` is called and whether the `CMD_ARGS` gate at `run_lf_lora_sft.sh:1660` fits). Still open.
+
+## Critical Implementation Review (2026-06-24)
+
+A correctness + efficiency pass over the staged code sketches. All AIO claims were verified against the vendored DeepSpeed (`third_party/deepspeed`). Severity: **A = correctness bug (stage cannot pass as written)**, **B = resource sizing (will exhaust/stall)**, **C = reasonable-efficiency win (low-risk)**, **D = keep deferred**. The targeted sketches below carry an inline `⚠ Critical Review` pointer.
+
+### A. Correctness bugs
+
+**A1 — Shared AIO handle + per-future `wait()` is wrong under any concurrency [Stage 1 substrate; bites Stage 2 prefetch and Stage 3 pipelining].**
+Verified: `aio_handle.wait()` drains **all** outstanding ops on the handle and returns the total count (`csrc/aio/py_lib/deepspeed_py_io_handle.cpp:201`, `while (_num_pending_ops > 0)`), and DeepSpeed itself asserts `pending_reads == aio_read_handle.wait()` in 6+ sites (`partitioned_param_swapper.py:207/217`, `optimizer_utils.py:347/429`, …). The plan's `DiskTensorStore.wait(future)` calls `aio.read.wait()` per-future and `assert completed == future.op_count` (==1). The instant a second read is outstanding on the shared read handle — `prefetch_depth>1`, a prefetch overlapping a synchronous `materialize`, or any Stage 3 pipelined read/write — `wait()` returns >1, the assert fails, and the other in-flight ops complete silently/untracked.
+Fix (low-risk): mirror DeepSpeed — keep `pending_reads`/`pending_writes` counters per handle; `wait()` drains the whole direction and reconciles the counter (drop the per-future ==1 assert). Submit a batch, then `wait()` once (the `SwapBufferPool` model). Keep at most one outstanding read *batch* per handle — that already buys the read-ahead overlap.
+
+**A2 — Tiled-AdamW eps placement does not match the stated parity baseline [Stage 3].**
+The sketch folds bias correction into `step_size = lr*sqrt(bc2)/bc1` and adds eps to the **non**-bias-corrected sqrt (`denom = sqrt(v)+eps`). torch AdamW instead uses `denom = sqrt(v)/sqrt(bc2)+eps`, `step_size = lr/bc1` — equivalent to `eps*sqrt(bc2)` in the denominator. The two differ by `eps` vs `eps*sqrt(bc2)`, ≈30× at t=1 (beta2=0.999 ⇒ sqrt(bc2)≈0.032). The Stage 3 parity test vs `AsymCPUAdamW(backend="torch")` at rtol=1e-5/atol=1e-6 will fail in early steps when grads (hence v) are small.
+Fix: pick one baseline and make the math match it — either keep the fused form and parity-test against the DeepSpeed formula (the existing default `backend="deepspeed"`/`DeepSpeedCPUAdam`, which is what the paged optimizer replaces), or switch the tile math to torch's denom-based bias correction and test against torch. Whichever you choose, eps placement is the specific trap; assert it in the parity test.
+
+**A3 — Home-refresh from a tile assumes no LoRA mapping straddles a tile boundary [Stage 3].**
+`_refresh_compute_or_lora_home_from_tile` does `master_tile.narrow(mapping.offset - tile.start, mapping.numel)`. With fixed 256MiB tiles and variable LoRA-bank sizes, mappings straddle boundaries ⇒ negative local start / out-of-range numel.
+Fix: clip to the overlap `[max(mapping.offset, tile.start), min(mapping.offset+numel, tile.start+tile.length))`, copy only that sub-range into the matching home sub-range, and let a straddling mapping refresh across the two tiles it spans. `active_ranges_in_tile` (the Adam update) must clip identically — it already intends to, so share one clip helper.
+
+**A4 — O_DIRECT tile alignment [Stage 3].**
+`async_pread/pwrite(buffer, path, file_offset)` does take a file offset (verified `deepspeed_py_io_handle.h:68/70`), so offset-tiles are feasible — but O_DIRECT needs offset **and** length aligned (`AIO_ALIGNED_BYTES=1024`; the C++ also rejects `num_bytes % intra_op_parallelism`). The final tile (total_numel not a multiple of tile size) has an unaligned length.
+Fix: pad each backing state file to `round_up(total_numel*4, aligned_bytes)`, align every tile offset+length, and read/write the padded length on the last tile.
+
+**A5 — Per-step grad-presence must reset [Stage 3].**
+`active_ranges_in_tile` must reflect **this** step's grads only. The flat grad buffer is overwritten per-param (not zeroed wholesale), so inactive slots retain stale grads; wrong active-range detection would read them and corrupt moments.
+Fix: reset the per-param presence flags (e.g. `last_had_grad`) at step start; derive active ranges from current-step presence; never read a stale slot.
+
+### B. Resource sizing
+
+**B1 — Swap-buffer pool count vs. cached resident homes [Stage 2; ×3 under Stage 3 pipelining].**
+The plan uses DeepSpeed swap buffers (scarce; `transfer_buffer_count` default 5) as the actual cache backing — a read aliases a buffer and the cache holds it until eviction, but eviction is gated by `cpu_cache_bytes`, not by buffer count. If the byte budget admits more resident homes than there are buffers (+ prefetch + active), `mgr.allocate` returns `None` ⇒ `RuntimeError`. Stage 3 pipelining needs ~9 buffers in flight (3 arrays × {writing prev, computing cur, reading next}).
+Fix (recommended, low-risk): on the **cache** path, copy the read-out into a plain (optionally pinned) cache tensor and release the swap buffer immediately — decouples residency from the scarce pool; the extra CPU memcpy (~tens of GB/s) is negligible next to NVMe. Keep aliasing only for the transient "materialize → consume → release" path. Otherwise assert `transfer_buffer_count ≥ max_resident + prefetch_depth + 1`.
+
+### C. Reasonable-efficiency wins (low-risk)
+
+**C1 — Skip inactive tiles entirely [Stage 3].** If a tile has no active range this step, skip its read **and** write (don't touch master/exp_avg/exp_avg_sq). Correct: no-grad params get no update and no weight decay — matches torch skipping `grad=None`. Large win for sparse MoE-expert-LoRA where most experts have no grad in a microbatch. (Depends on A5.)
+
+**C2 — Ship synchronous tiled Stage 3 first; demote pipelining.** `pipeline_read`/`pipeline_write` are already default-off and are the riskiest surface (B1 + A1). Land the synchronous tiled optimizer (correctness + the host-RAM win), validate, then add pipelining behind the existing flags as a separately-gated capacity mode.
+
+**C3 — Frame optimizer-state NVMe as a capacity mode, not a speed path.** It is inherently 2× full-state I/O per step (read+write master+exp_avg+exp_avg_sq). For the repo's Qwen3-30B profile (~40.5 GB fp32 state) that is ~81 GB/step (~16 s/step at 5 GB/s). Keep it opt-in; its ≤5% latency gate is unrealistic at scale — use the doc's own ≤10% capacity-mode gate.
+
+### D. Keep deferred (correct as written)
+
+- **Stage 4 base-weight NVMe:** base weights are hot ⇒ re-reading the whole base model per step is catastrophic unless the CPU cache holds the working set — and if it does, NVMe adds little. Keep optional/deferred.
+- **Stage 5 DeepSpeed adapter, gradient/activation NVMe:** keep deferred.
+- The `begin_optimizer_refresh` depth counter is harmless (minor over-engineering); leave it.
+
+**Verified-correct anchors (no change needed):** the `aio_handle(block_size, queue_depth, single_submit, overlap_events, intra_op_parallelism)` 5-arg ctor matches the plan (`py_ds_aio.cpp:23`); `swap_in/out_tensors` hardcode offset 0 (`utils.py:22/27`) — so they are whole-file only and Stage 3 correctly needs `async_pread/pwrite` directly for tiles; `MIN_AIO_BYTES=1 MiB`, `AIO_ALIGNED_BYTES=1024`; `SwapBufferManager` uses `dist.get_rank()` (`utils.py:195`), so the `LocalSwapBufferManager` fallback is justified.
+
 ## Design Contract
 
 Target the local single-GPU AsymGEMM LoRA-SFT path first. This is not the DeepSpeed/ZeRO integration. It is a local AsymGEMM-owned implementation that mimics the useful DeepSpeed NVMe optimizations behind a replaceable placement backend. Keep the interface clean enough that a future DeepSpeed/ZeRO backend can own parameters and optimizer states, but do not implement that backend in the first NVMe work.
@@ -133,7 +249,7 @@ ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true \
 ASYM_NVME_ENABLE=false \
 PLOT=false \
 PLOT_MEMORY_BREAKDOWN=false \
-scripts/lf/profile_lora_lf.sh --gpus 0 --overwrite true
+scripts/lf/profile_lora_lf_test.sh --gpus 0 --overwrite true
 ```
 
 Use the same model/workload/steps for candidate runs and change only the stage-specific NVMe knobs.
@@ -141,7 +257,7 @@ Use the same model/workload/steps for candidate runs and change only the stage-s
 Universal profile artifact gate:
 
 - Required source artifacts after every LF profile: `source_profile.json`, `lat.md`, `memory.md`, `step_samples.csv`, `step_samples.json`, and `asym_cpu_adamw.csv` when `USE_ASYM_CPU_ADAMW=true`.
-- Required with `PROFILE_MEMORY_BREAKDOWN=true`: `memory_breakdown.csv`, `memory_breakdown.md`, and `memory_breakdown_summary.json` or `memory_breakdown/memory_breakdown_summary.json`.
+- Required with `PROFILE_MEMORY_BREAKDOWN=true`: `memory_breakdown.csv`, `memory_breakdown.md`, and `memory_breakdown_summary.json` (top-level only — the `memory_breakdown/…` subdir form never occurs, and this JSON is written by the runtime profiler, not by `postprocess_lf_profile_artifacts.py`).
 - Required for every NVMe candidate: top-level `asym_nvme` in `source_profile.json` and postprocessed `asym_nvme.csv`.
 - Required timing fields: `trainer.timing.measured_e2e_step_milliseconds`, measured rows in `step_samples.rows`, and per-step `forward_milliseconds`, `backward_milliseconds`, `forward_backward_milliseconds`, and `step_milliseconds` after postprocess augmentation.
 - Required memory fields: `memory.gpu.peak_allocated_hbm_bytes`, `memory.gpu.peak_reserved_hbm_bytes`, process RSS from `memory.process`, and the role-specific resident/logical/NVMe byte fields added by that stage.
@@ -197,7 +313,7 @@ Stage 0B config/profile/compare plumbing:
 - `/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src/llamafactory/train/trainer_utils.py`
   - `_create_asym_cpu_adamw_optimizer`
 - `scripts/lf/run_lf_lora_sft.sh`
-- `scripts/lf/profile_lora_lf.sh`
+- `scripts/lf/profile_lora_lf_test.sh`
 - `scripts/lf/run_lf_profiled_train.py`
   - `_config_from_args`
   - add `_asym_nvme_summary_from_trace`
@@ -218,7 +334,7 @@ Contract/interface issues found in the current code and addressed by this stage:
 - Stage 0A must not switch optimizer classes, allocate NVMe buffers, build AIO handles, or change LoRA `.data` placeholder behavior. The only allowed `AsymCPUAdamW` changes are additive protocol methods and additive summary fields.
 - `run_lf_profiled_train.py` currently reports `asym_cpu_adamw` from optimizer wrappers only. Add `asym_nvme` reporting there rather than relying on logs.
 - `postprocess_lf_profile_artifacts.py` currently writes `asym_cpu_adamw.csv` but no NVMe artifact. Add `asym_nvme.csv` and make missing NVMe rows a candidate failure.
-- `profile_lora_lf.sh` completion checks currently key on existing config fields. Add NVMe config to run labels and completion validation so `ASYM_NVME_ENABLE=false` and `true` cannot reuse the same source profile.
+- `profile_lora_lf_test.sh` completion checks currently key on existing config fields. Add NVMe config to run labels and completion validation so `ASYM_NVME_ENABLE=false` and `true` cannot reuse the same source profile.
 - DeepSpeed's `swap_in_tensors`/`swap_out_tensors` are whole-file helpers with `file_offset=0`; Stage 3 must use direct AIO handle calls for optimizer tiles.
 - After Stage 0B, later stages should not need LF CLI/parser/run-label/postprocess refactors. Role implementations should report through `asym_nvme_summary()` and the generic Stage 0B `stats_by_role` schema. If a later stage discovers a missing required metric, treat that as a Stage 0B contract bug, fix the schema first, and rerun the Stage 0B no-change profile before continuing.
 
@@ -283,6 +399,8 @@ class AsymCPUOptimizerLike(Protocol):
 
 2. Add a read-only record iterator to the existing optimizer. Do not move masters, gradients, state, hooks, clipping, or checkpoint logic in this stage:
 
+> **Current-repo note (2026-06-23):** `attach_weight_offload_coordinator` **already exists** (`cpu_adam.py:232`) with this exact body — do not re-add it; only `iter_lora_param_records` is new. The live mapping type is `_ParamMapping` (`cpu_adam.py:69`), not `LoRAParamRecord`; its `.name`/`.aliases`/`.cuda_param`/`.cpu_param`/`.model_dtype` fields are all present, so the generator below works once `LoRAParamRecord` is defined in `optimizer_contracts.py`.
+
 ```python
 # asym_gemm/training/cpu_adam.py
 from .optimizer_contracts import LoRAParamRecord, WeightHomeCoordinator
@@ -308,6 +426,8 @@ class AsymCPUAdamW(torch.optim.Optimizer):
 The `numel` fallback is required because weight-offloaded CUDA params may be 0-size placeholders while the CPU master still holds the logical tensor.
 
 Add only additive summary aliases needed by later comparison tooling; keep all existing keys unchanged:
+
+> **Current-repo note (2026-06-23):** `cpu_master_bytes` (@787), `optimizer_state_cpu_bytes` (@789), and `grad_offload_buffer_bytes` (@781) **already exist** in `asym_cpu_adamw_summary()` (`cpu_adam.py:741`). Only `optimizer_state_resident_bytes` and `optimizer_paged` are genuinely new.
 
 ```python
 def asym_cpu_adamw_summary(self) -> dict[str, Any]:
@@ -338,6 +458,8 @@ class LoRAWeightOffloadCoordinator:
 ```
 
 4. Keep current construction order. The optimizer must still be created before installing weight offload so CPU masters are captured from full CUDA LoRA params:
+
+> **Current-repo note (2026-06-23):** this lives in `_create_asym_cpu_adamw_optimizer` (`trainer_utils.py:530`). Steps 2–4 below already run, but **only inside `if finetuning_args.asym_cpu_adamw_weight_offload:` (@580)** with an `installed <= 0` guard (@590), and the coordinator is built as `LoRAWeightOffloadCoordinator(pin_memory=…)` (@588). Preserve that gate.
 
 ```python
 optimizer = AsymCPUAdamW(...)
@@ -450,7 +572,7 @@ ASYM_CPU_ADAMW_GRAD_OFFLOAD=true \
 ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true \
 ASYM_NVME_ENABLE=false \
 PLOT=false PLOT_MEMORY_BREAKDOWN=false \
-scripts/lf/profile_lora_lf.sh --gpus 0 --overwrite true
+scripts/lf/profile_lora_lf_test.sh --gpus 0 --overwrite true
 ```
 
 Compare pre/post Stage 0A as a no-change gate:
@@ -552,7 +674,7 @@ def _verify_asym_nvme_args(model_args, training_args, finetuning_args):
 
 Call this from the same AsymGEMM validation path that already calls `_verify_asym_cpu_adamw_args`.
 
-8. Add script plumbing in both `scripts/lf/run_lf_lora_sft.sh` and `scripts/lf/profile_lora_lf.sh`. `profile_lora_lf.sh` does not forward arbitrary unknown flags; it must parse these NVMe knobs, include them in run-directory labels, pass them through the training-job environment, and include them in `job_profile_complete` validation.
+8. Add script plumbing in both `scripts/lf/run_lf_lora_sft.sh` and `scripts/lf/profile_lora_lf_test.sh`. `profile_lora_lf_test.sh` does not forward arbitrary unknown flags; it must parse these NVMe knobs, include them in run-directory labels, pass them through the training-job environment, and include them in `job_profile_complete` validation.
 
 ```bash
 ASYM_NVME_ENABLE=${ASYM_NVME_ENABLE:-false}
@@ -582,7 +704,7 @@ ASYM_NVME_REQUIRE_AIO="$(bool_string ASYM_NVME_REQUIRE_AIO "${ASYM_NVME_REQUIRE_
 ASYM_NVME_OPTIMIZER_PIPELINE_READ="$(bool_string ASYM_NVME_OPTIMIZER_PIPELINE_READ "${ASYM_NVME_OPTIMIZER_PIPELINE_READ}")"
 ASYM_NVME_OPTIMIZER_PIPELINE_WRITE="$(bool_string ASYM_NVME_OPTIMIZER_PIPELINE_WRITE "${ASYM_NVME_OPTIMIZER_PIPELINE_WRITE}")"
 
-# In profile_lora_lf.sh, use the existing bool_value helper instead:
+# In profile_lora_lf_test.sh, use the existing bool_value helper instead:
 ASYM_NVME_ENABLE="$(bool_value "${ASYM_NVME_ENABLE}")"
 ASYM_NVME_AIO_SINGLE_SUBMIT="$(bool_value "${ASYM_NVME_AIO_SINGLE_SUBMIT}")"
 ASYM_NVME_AIO_OVERLAP_EVENTS="$(bool_value "${ASYM_NVME_AIO_OVERLAP_EVENTS}")"
@@ -617,11 +739,11 @@ ASYM_GEMM_LF_CONFIG_ASYM_NVME_CPU_CACHE_BYTES="${ASYM_NVME_CPU_CACHE_BYTES}"
 ASYM_GEMM_LF_CONFIG_ASYM_NVME_OPTIMIZER_TILE_BYTES="${ASYM_NVME_OPTIMIZER_TILE_BYTES}"
 ```
 
-`profile_lora_lf.sh` should not append `CMD_ARGS`; it should parse/sanitize the same environment knobs, add them to the child training-job environment, add them to `ASYM_GEMM_LF_CONFIG_*`, and validate them in completion checks.
+`profile_lora_lf_test.sh` should not append `CMD_ARGS`; it should parse/sanitize the same environment knobs, add them to the child training-job environment, add them to `ASYM_GEMM_LF_CONFIG_*`, and validate them in completion checks.
 
-Add the same keys to `run_lf_profiled_train.py::_config_from_args()` so `source_profile.json.config` records the exact candidate settings. Extend `profile_lora_lf.sh`'s existing `job_profile_complete` Python validation to compare `asym_nvme_enable`, `asym_nvme_roles`, cache bytes, prefetch depth, and optimizer tile/pipeline flags against the requested environment.
+Add the same keys to `run_lf_profiled_train.py::_config_from_args()` so `source_profile.json.config` records the exact candidate settings. Extend `profile_lora_lf_test.sh`'s existing `job_profile_complete` Python validation to compare `asym_nvme_enable`, `asym_nvme_roles`, cache bytes, prefetch depth, and optimizer tile/pipeline flags against the requested environment.
 
-Concrete `profile_lora_lf.sh` completion-check changes:
+Concrete `profile_lora_lf_test.sh` completion-check changes:
 
 ```bash
 job_profile_complete() {
@@ -647,16 +769,18 @@ job_profile_complete() {
 }
 ```
 
-Inside the embedded Python validator:
+`existing_profile_complete` (@870) must mirror the forwarding: give it `local expected_nvme_*` at `$16…$22` (one less than in `job_profile_complete` because it inserts the `all` lora-target at `$5`), and append the seven `"${expected_nvme_*}"` values to its `"${ENV_PYTHON}" - …` heredoc call (@898-906) **after** `"${current_profile_sync}"`. They therefore arrive in the validator as `sys.argv[27..33]`, not `[26..32]`:
 
 ```python
-expected_nvme_enable = sys.argv[26] if len(sys.argv) > 26 else ""
-expected_nvme_roles = sys.argv[27] if len(sys.argv) > 27 else ""
-expected_nvme_cpu_cache_bytes = sys.argv[28] if len(sys.argv) > 28 else ""
-expected_nvme_prefetch_depth = sys.argv[29] if len(sys.argv) > 29 else ""
-expected_nvme_optimizer_tile_bytes = sys.argv[30] if len(sys.argv) > 30 else ""
-expected_nvme_optimizer_pipeline_read = sys.argv[31] if len(sys.argv) > 31 else ""
-expected_nvme_optimizer_pipeline_write = sys.argv[32] if len(sys.argv) > 32 else ""
+# slot 26 is already expected_profile_sync (existing_profile_complete @934);
+# NVMe expected-args are appended AFTER current_profile_sync, so they begin at argv[27]:
+expected_nvme_enable = sys.argv[27] if len(sys.argv) > 27 else ""
+expected_nvme_roles = sys.argv[28] if len(sys.argv) > 28 else ""
+expected_nvme_cpu_cache_bytes = sys.argv[29] if len(sys.argv) > 29 else ""
+expected_nvme_prefetch_depth = sys.argv[30] if len(sys.argv) > 30 else ""
+expected_nvme_optimizer_tile_bytes = sys.argv[31] if len(sys.argv) > 31 else ""
+expected_nvme_optimizer_pipeline_read = sys.argv[32] if len(sys.argv) > 32 else ""
+expected_nvme_optimizer_pipeline_write = sys.argv[33] if len(sys.argv) > 33 else ""
 
 def normalize_roles(value):
     return ",".join(sorted(part.strip() for part in str(value or "").split(",") if part.strip()))
@@ -683,7 +807,7 @@ if normalize_bool(expected_nvme_enable) == "true":
                 raise SystemExit(f"profile {key} mismatch: expected {wanted}, got {actual}")
 ```
 
-Update every existing `job_profile_complete ... "${liger_loss}"` call in `run_job()` to append:
+Update **all 9** `job_profile_complete` call sites (`profile_lora_lf_test.sh` @2479, 2481, 2493, 2502, 2526, 2531, 2539, 2756, 2770), each currently ending `… "${liger_loss}"`, to append:
 
 ```bash
 "${ASYM_NVME_ENABLE}" \
@@ -697,17 +821,20 @@ Update every existing `job_profile_complete ... "${liger_loss}"` call in `run_jo
 
 Also pass the same environment into the subshell that launches `run_lf_lora_sft.sh`, alongside the existing `ASYM_GEMM_LF_CONFIG_*` values, so `_config_from_args()` records the requested candidate settings in `source_profile.json.config`.
 
-In `profile_lora_lf.sh`, add NVMe fields to run labels and completion checks so baseline and candidate profiles cannot be confused:
+In `profile_lora_lf_test.sh`, add an NVMe tag to the run-dir label so baseline (`ASYM_NVME_ENABLE=false`) and candidate profiles cannot be confused. The label is assembled in `job_root_path()` @1349 as `path_label` (@1360-1364), which currently ends `…__${liger_loss}${grad_offload_suffix}` — append the tag there (there is no standalone `run_dir_name` variable to suffix):
 
 ```bash
-nvme_tag="nvmeoff"
+# inside job_root_path(), right after path_label is assembled (~line 1364):
+local nvme_tag="nvmeoff"
 if [[ "$(bool_value "${ASYM_NVME_ENABLE}")" == "true" ]]; then
   nvme_tag="nvme_${ASYM_NVME_ROLES//,/+}"
 fi
-run_dir_name="${run_dir_name}_${nvme_tag}"
+path_label="${path_label}__${nvme_tag}"
 ```
 
-9. Add source-profile summary hook:
+9. Add source-profile summary hook (mirror the existing `_asym_cpu_adamw_summary_from_trace`, `run_lf_profiled_train.py:1081`):
+
+> **Current-repo note (2026-06-23):** `_walk_optimizer_wrappers` **does not exist** — the 8-hop wrapper walk is inlined inside `_asym_cpu_adamw_summary_from_trace` (@1086-1107). Either inline that same walk here or extract a shared helper. `trace_handle` is an `LFTraceHandle` (`asym_gemm/profiling/lf_trace.py:263`); its `.optimizer`/`.prepared_optimizer`/`.model` attributes are real.
 
 ```python
 def _asym_nvme_summary_from_trace(trace_handle: Any | None) -> dict[str, Any]:
@@ -785,7 +912,7 @@ def _asym_nvme_rows(profile):
     return rows or [base]
 ```
 
-Write these rows to `asym_nvme.csv`. Add a short NVMe block to `memory.md` or `summary.md` that lists roles, resident CPU bytes, NVMe stored bytes, read/write bytes, and wait time.
+Write these rows to `asym_nvme.csv`. **Current repo: `asym_cpu_adamw.csv` is emitted in TWO functions — `_write_source_artifacts` (@2158-2160) and `_write_profile_csv_artifacts` (@2227-2229) — so add the `asym_nvme.csv` write in both.** Add a short NVMe block to `memory.md` (generator `_source_memory_markdown` @1736) or `summary.md` (`_source_summary_markdown` @1133) that lists roles, resident CPU bytes, NVMe stored bytes, read/write bytes, and wait time.
 
 10. Add comparison tool:
 
@@ -849,7 +976,7 @@ Comparison metric resolution:
 Stage 0B validation:
 
 ```bash
-bash -n scripts/lf/run_lf_lora_sft.sh scripts/lf/profile_lora_lf.sh
+bash -n scripts/lf/run_lf_lora_sft.sh scripts/lf/profile_lora_lf_test.sh
 
 .venv/bin/python -m pytest \
   tests/lf/test_asym_cpu_adamw_args.py \
@@ -863,7 +990,7 @@ ASYM_NVME_ROLES=lora_weights \
 BACKEND_SPECS='asym_cpuadamwds|norecomp' \
 MODEL_SPECS='Qwen/Qwen3-30B-A3B|1' \
 WORKLOADS='4096|4|1' \
-scripts/lf/profile_lora_lf.sh --dry-run --gpus 0
+scripts/lf/profile_lora_lf_test.sh --dry-run --gpus 0
 ```
 
 Run the no-NVMe profile again after Stage 0B plumbing. This proves that config/profile changes still do not affect runtime behavior:
@@ -882,7 +1009,7 @@ ASYM_CPU_ADAMW_GRAD_OFFLOAD=true \
 ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true \
 ASYM_NVME_ENABLE=false \
 PLOT=false PLOT_MEMORY_BREAKDOWN=false \
-scripts/lf/profile_lora_lf.sh --gpus 0 --overwrite true
+scripts/lf/profile_lora_lf_test.sh --gpus 0 --overwrite true
 ```
 
 Compare Stage 0B against the accepted Stage 0A profile:
@@ -1189,6 +1316,9 @@ class DiskTensorStore:
     def wait(self, future: DiskIOFuture):
         started = time.perf_counter()
         aio = self.aio.write if future.kind == "write" else self.aio.read
+        # ⚠ Critical Review A1: aio.wait() drains ALL outstanding ops on this handle and
+        # returns the total, NOT this future's count. Track pending_reads/pending_writes
+        # per handle and reconcile; never assert == 1 when prefetch/pipeline overlap.
         completed = aio.wait()
         assert completed == future.op_count
         if future.release_buffers_on_wait:
@@ -1355,7 +1485,7 @@ ASYM_CPU_ADAMW_GRAD_OFFLOAD=true \
 ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true \
 ASYM_NVME_ENABLE=false \
 PLOT=false PLOT_MEMORY_BREAKDOWN=false \
-scripts/lf/profile_lora_lf.sh --gpus 0 --overwrite true
+scripts/lf/profile_lora_lf_test.sh --gpus 0 --overwrite true
 ```
 
 Compare against the accepted Stage 0B no-NVMe profile:
@@ -1773,7 +1903,7 @@ ASYM_CPU_ADAMW_GRAD_OFFLOAD=true \
 ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true \
 ASYM_NVME_ENABLE=false \
 PLOT=false PLOT_MEMORY_BREAKDOWN=false \
-scripts/lf/profile_lora_lf.sh --gpus 0 --overwrite true
+scripts/lf/profile_lora_lf_test.sh --gpus 0 --overwrite true
 ```
 
 Candidate:
@@ -1798,7 +1928,7 @@ ASYM_NVME_CPU_CACHE_BYTES=$((512*1024*1024)) \
 ASYM_NVME_PREFETCH_DEPTH=1 \
 ASYM_NVME_REQUIRE_AIO=true \
 PLOT=false PLOT_MEMORY_BREAKDOWN=false \
-scripts/lf/profile_lora_lf.sh --gpus 0 --overwrite true
+scripts/lf/profile_lora_lf_test.sh --gpus 0 --overwrite true
 ```
 
 Compare:
@@ -1963,6 +2093,9 @@ def step(self, closure=None):
     bias_correction1 = 1 - beta1 ** self._step
     bias_correction2 = 1 - beta2 ** self._step
     step_size = lr * math.sqrt(bias_correction2) / bias_correction1
+    # ⚠ Critical Review A2: this fused eps placement (eps added to the non-bias-corrected
+    # sqrt below) differs from torch AdamW (denom = sqrt(v)/sqrt(bc2) + eps). Parity-test
+    # against the DeepSpeed formula, or switch to torch's denom; assert eps placement.
 
     previous_write_futures = []
     next_prefetch = self._prefetch_tile(self._tiles[0]) if self.pipeline_read else None
@@ -2015,6 +2148,9 @@ def step(self, closure=None):
 ```python
 def _refresh_compute_or_lora_home_from_tile(self, tile, master_tile):
     for mapping in self._flat.mappings_overlapping(tile):
+        # ⚠ Critical Review A3: a mapping can straddle the tile boundary. Clip to the
+        # overlap [max(offset, tile.start), min(offset+numel, tile.start+tile.length)) and
+        # copy only that sub-range; refresh straddling mappings across both tiles they span.
         local_start = mapping.offset - tile.start
         src = master_tile.narrow(0, local_start, mapping.numel)
         if self._coordinator and self._coordinator.is_registered(mapping.cuda_param):
@@ -2085,7 +2221,7 @@ ASYM_NVME_OPTIMIZER_PIPELINE_WRITE=true \
 ASYM_NVME_PREFETCH_DEPTH=1 \
 ASYM_NVME_REQUIRE_AIO=true \
 PLOT=false PLOT_MEMORY_BREAKDOWN=false \
-scripts/lf/profile_lora_lf.sh --gpus 0 --overwrite true
+scripts/lf/profile_lora_lf_test.sh --gpus 0 --overwrite true
 ```
 
 Compare against the accepted Stage 2 candidate:
@@ -2236,7 +2372,7 @@ ASYM_NVME_ROLES=lora_weights,optimizer_state,base_weight \
 ASYM_NVME_CPU_CACHE_BYTES=$((8*1024*1024*1024)) \
 ASYM_NVME_REQUIRE_AIO=true \
 PLOT=false PLOT_MEMORY_BREAKDOWN=false \
-scripts/lf/profile_lora_lf.sh --gpus 0 --overwrite true
+scripts/lf/profile_lora_lf_test.sh --gpus 0 --overwrite true
 ```
 
 Compare against the accepted Stage 3 candidate:
@@ -2362,7 +2498,7 @@ PROFILE_EXTERNAL_MEMORY=true \
 PROFILE_MEMORY_SNAPSHOT=false \
 ASYM_NVME_ENABLE=false \
 PLOT=false PLOT_MEMORY_BREAKDOWN=false \
-scripts/lf/profile_lora_lf.sh --gpus 0 --overwrite true
+scripts/lf/profile_lora_lf_test.sh --gpus 0 --overwrite true
 ```
 
 Stage 5 acceptance, if implemented later:

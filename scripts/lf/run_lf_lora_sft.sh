@@ -1612,11 +1612,12 @@ CMD_ARGS=(
   --use_unsloth_gc "${USE_UNSLOTH_GC}"
 )
 if [[ "${FINETUNING_TYPE}" == "lora" ]]; then
+  _lora_target_arg="${LORA_TARGET:-all}"
   CMD_ARGS+=(
     --lora_rank "${LORA_RANK}"
     --lora_alpha "${LORA_ALPHA}"
     --lora_dropout "${LORA_DROPOUT}"
-    --lora_target all
+    --lora_target "${_lora_target_arg//+/,}"
   )
 fi
 [[ -z "${MAX_GRAD_NORM}" ]] || CMD_ARGS+=(--max_grad_norm "${MAX_GRAD_NORM}")
