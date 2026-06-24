@@ -19,11 +19,12 @@ DIST_LAUNCHER=${DIST_LAUNCHER:-torchrun}
 # DIST_LAUNCHER=${DIST_LAUNCHER:-deepspeed}
 RUN_POST=${RUN_POST:-false}
 
-# Sweep axes
+# Run list
 GPU_POOL=${GPU_POOL:-3}
 
 # RUNS: model ; backend|recompute|liger ; seq|batch|grad_accum ; policy|expact|attnact|layeract|layergc|sdparecomp
-# Models use the M shorthand; env MODEL_SPECS / BACKEND_SPECS / WORKLOADS / ASYMM_EXP_ACT_POLICIES override.
+# Models use the M shorthand. To override the default list from the environment, pass:
+#   RUNS='q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false || q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true'
 #   backend  : asym_cpuadamwds | zero3_offload | zero3_offload_mem | zero3_offload_opnvme | zero3_offload_pnvme | superoffload | superoffload_mem
 #   recompute: recomp | norecomp | unsloth        liger: ligerloss0 | ligerloss1
 #   policy   : none|false|false|false|false|false (off)  |  none|true|true|false|true|true (offload+gc)
@@ -38,50 +39,83 @@ declare -A M=(
   [q2.5-72b]="Qwen/Qwen2.5-72B-Instruct|1"
   [llama3.3-70b]="meta-llama/Llama-3.3-70B-Instruct|1"
 )
+declare -A _M_REV=()
+for _k in "${!M[@]}"; do _M_REV["${M[$_k]%%|*}"]="${_k}"; done
+_RUNS_ENV_SET=false
+_RUNS_ENV_SPEC=""
+if [[ -n "${RUNS+x}" ]]; then
+  _RUNS_ENV_SET=true
+  _RUNS_ENV_SPEC="${RUNS}"
+  unset RUNS
+fi
+_RUNS_LOG="${RUNS_LOG:-${ROOT}/scripts/lf/runs.log}"
 # RUNS=(
 #   # "q3-30b ; zero3_offload_opnvme|recomp|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
 #   # "q3-30b ; zero3_offload_pnvme|recomp|ligerloss1  ; 4092|8|1 ; none|false|false|false|false|false"
 #   "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
 # )
-RUNS=(
-  "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-  "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+if [[ "${_RUNS_ENV_SET}" == "true" ]]; then
+  RUNS=()
+  _runs_env_lines="${_RUNS_ENV_SPEC//||/$'\n'}"
+  while IFS= read -r _run; do
+    _run="${_run#"${_run%%[![:space:]]*}"}"
+    _run="${_run%"${_run##*[![:space:]]}"}"
+    [[ -n "${_run}" ]] && RUNS+=("${_run}")
+  done <<< "${_runs_env_lines}"
+else
+  RUNS=(
+    "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+    "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+    "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+    "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
 
-  "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-  "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+    "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+    "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+    "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+    "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
 
-  "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-  "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+    "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+    "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+    "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+    "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
 
-  "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-  "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+    "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+    "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+    "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+    "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
 
-  "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  "llama3.3-70b; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-  "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  "llama3.3-70b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-)
+    "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+    "llama3.3-70b; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+    "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+    "llama3.3-70b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+  )
+fi
 
-# iterate + parse the rows into the legacy lists
-_run_models=(); _run_backends=(); _run_workloads=(); _run_policies=()
+# Iterate and parse the rows into scheduler metadata. Each RUNS item remains one scheduled run.
+_run_models=(); _run_backends=(); _run_workloads=(); _run_policies=(); _run_specs=()
+(( ${#RUNS[@]} > 0 )) || { echo "error: RUNS is empty" >&2; exit 2; }
 for _run in "${RUNS[@]}"; do
-  IFS=';' read -r _m _b _w _p <<< "${_run}"
+  IFS=';' read -r _m _b _w _p _extra <<< "${_run}"
   _m="${_m// /}"; _b="${_b// /}"; _w="${_w// /}"; _p="${_p// /}"
-  [[ -n "${M[$_m]:-}" ]] || { echo "RUNS: unknown model shorthand '${_m}' (add it to M)" >&2; exit 1; }
-  _run_models+=("${M[$_m]}"); _run_backends+=("${_b}"); _run_workloads+=("${_w}"); _run_policies+=("${_p}")
+  [[ -n "${_m}" && -n "${_b}" && -n "${_w}" && -n "${_p}" && -z "${_extra:-}" ]] || {
+    echo "error: RUNS item must be model ; backend|recompute|ligerloss ; seq|batch|grad_accum ; policy|expact|attnact|layeract|layergc|sdparecomp, got '${_run}'" >&2
+    exit 2
+  }
+  if [[ -n "${M[$_m]:-}" ]]; then
+    _m_spec="${M[$_m]}"
+  elif [[ "${_m}" == */* || "${_m}" == *"|"* ]]; then
+    _m_spec="${_m}"
+  else
+    echo "error: RUNS unknown model shorthand '${_m}' (add it to M or use model/path|num_gpus)" >&2
+    exit 2
+  fi
+  _run_models+=("${_m_spec}"); _run_backends+=("${_b}"); _run_workloads+=("${_w}"); _run_policies+=("${_p}")
+  _run_specs+=("${_m_spec};${_b};${_w};${_p}")
 done
-MODEL_SPECS="${MODEL_SPECS:-$(IFS=,; echo "${_run_models[*]}")}"
-BACKEND_SPECS="${BACKEND_SPECS:-$(IFS=,; echo "${_run_backends[*]}")}"
-WORKLOADS="${WORKLOADS:-$(IFS=,; echo "${_run_workloads[*]}")}"
-ASYMM_EXP_ACT_POLICIES="${ASYMM_EXP_ACT_POLICIES:-$(IFS=,; echo "${_run_policies[*]}")}"
+RUN_MODEL_SPECS="$(IFS=,; echo "${_run_models[*]}")"
+RUN_BACKENDS="$(IFS=,; echo "${_run_backends[*]}")"
+RUN_WORKLOADS="$(IFS=,; echo "${_run_workloads[*]}")"
+RUN_EXP_ACT_POLICIES="$(IFS=,; echo "${_run_policies[*]}")"
 
 ROUTER_MODES=${ROUTER_MODES:-whole}
 PROFILERS=${PROFILERS:-both}
@@ -117,7 +151,7 @@ ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE=${ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE:-0}
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-all}
 ASYM_STRICT=${ASYM_STRICT:-true}
 REQUIRE_SM100=${REQUIRE_SM100:-1}
-# Comma/space-separated list of one or more boolean values to sweep (e.g. "false,true").
+# Single boolean values; multi-value sweeps would make one RUNS row expand to multiple launches.
 ASYM_CPU_ADAMW_GRAD_OFFLOAD=${ASYM_CPU_ADAMW_GRAD_OFFLOAD:-true}
 ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD:-true}
 
@@ -233,29 +267,22 @@ Usage:
 Defaults:
   --gpus ${GPU_POOL}
   --dist-launcher ${DIST_LAUNCHER}
-  --backend-specs ${BACKEND_SPECS}
   --profilers ${PROFILERS}
-  --workloads '${WORKLOADS}'
+  RUNS rows: ${#RUNS[@]}
   --output-root ${OUTPUT_ROOT}
 
 Options:
-  List values must be comma-separated with no spaces.
+  RUNS is the job list. Each row is:
+    model ; backend|recompute|ligerloss ; seq|batch|grad_accum ; policy|expact|attnact|layeract|layergc|sdparecomp
+  Override it from the environment with rows separated by '||':
+    RUNS='q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false || q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true'
 
   Sweep:
   --gpus LIST                    Physical GPU pool, e.g. 0,1.
   --dist-launcher torchrun|accelerate|deepspeed
                                  Launcher for torch/zero/SuperOffload/zero3_cpuadam jobs. Default ${DIST_LAUNCHER}.
-  --models LIST                  Model specs. Each item is model_name_or_path|num_gpus.
-                                 Example: meta-llama/Llama-4-Scout-17B-16E|1,meta-llama/Llama-4-Maverick-17B-128E|4
-  --backend-specs LIST           Backend|recompute[|ligerloss] specs, e.g. 'asym_cpuadamwds|recomp|ligerloss1,zero3_cpuadam|recomp|ligerloss0'.
-                                 Use canonical recompute labels: norecomp or recomp. Use both to expand to both modes.
-                                 The optional third field is ligerloss0 or ligerloss1 and defaults to ligerloss0.
-  --router-modes LIST            AsymGEMM router modes: hf, whole. Default ${ROUTER_MODES}.
-  --profilers LIST               source, nsys, and/or both. both runs Nsight once and materializes sibling source artifacts.
-  --workloads LIST               Paired workload list. Each item is seq_len|per_device_batch_size|gradient_accumulation_steps.
-                                 Example: '2048|3|1,4096|2|1'.
-  --asymm-exp-act-policies LIST  Paired expert policy / expert activation offload / attention activation offload / layer activation offload / layer GC configs.
-                                 Format: policy|expert_act|attn_act|layer_act[|layer_gc], e.g. none|true|true|true,none|true|true|false|true.
+  --router-modes NAME            AsymGEMM router mode: hf or whole. Default ${ROUTER_MODES}.
+  --profilers NAME               source, nsys, or both. both runs Nsight once and materializes sibling source artifacts.
 
   Dataset:
   --dataset NAME
@@ -291,12 +318,14 @@ Options:
   --expandable-seg true|false   Set PYTORCH_CUDA_ALLOC_CONF expandable_segments for training jobs.
                                  Default ${EXPANDABLE_SEG}.
   --use-asym-cpu-adamw true|false
-                                 Low-level forwarding control; prefer BACKEND_SPECS=asym_cpuadamwtorch|... or asym_cpuadamwds|...
+                                 Low-level forwarding control; prefer setting the backend in RUNS to asym_cpuadamwtorch or asym_cpuadamwds.
   --asym-cpu-adamw-backend torch|deepspeed
   --asym-cpu-adamw-pin-memory true|false
   --asym-cpu-adamw-fp32-master true|false
-  --asym-cpu-adamw-grad-offload LIST
-                                 Grad offload mode(s) for Asym CPUAdamW backends; one or more, e.g. false,true.
+  --asym-cpu-adamw-grad-offload true|false
+                                 Grad offload mode for Asym CPUAdamW backends.
+  --asym-cpu-adamw-weight-offload true|false
+                                 Weight offload mode for Asym CPUAdamW backends; requires grad offload.
   KT:
   --kt-kernel-dir DIR            Integrated kt-kernel source tree.
   --kt-tools-dir DIR             Helper source tree to put on PYTHONPATH for KT jobs. Defaults to ROOT.
@@ -474,14 +503,14 @@ parse_exp_act_policy_tuple() {
   local policy_part expact_part attnact_part layeract_part layergc_part sdparecomp_part policy expact attnact layeract layergc sdparecomp
   local -a fields
   IFS='|' read -r -a fields <<< "${raw}"
-  (( ${#fields[@]} == 4 || ${#fields[@]} == 5 || ${#fields[@]} == 6 )) || die "ASYMM_EXP_ACT_POLICIES item must be policy|expert_act|attn_act|layer_act[|layer_gc[|sdpa_recompute]], got '${raw}'"
+  (( ${#fields[@]} == 4 || ${#fields[@]} == 5 || ${#fields[@]} == 6 )) || die "RUNS policy item must be policy|expert_act|attn_act|layer_act[|layer_gc[|sdpa_recompute]], got '${raw}'"
   policy_part="${fields[0]}"
   expact_part="${fields[1]}"
   attnact_part="${fields[2]}"
   layeract_part="${fields[3]}"
   layergc_part="${fields[4]:-false}"
   sdparecomp_part="${fields[5]:-false}"
-  [[ -n "${policy_part}" && -n "${expact_part}" && -n "${attnact_part}" && -n "${layeract_part}" && -n "${layergc_part}" && -n "${sdparecomp_part}" ]] || die "empty policy, activation-offload, layer-GC, or sdpa-recompute value in ASYMM_EXP_ACT_POLICIES item '${raw}'"
+  [[ -n "${policy_part}" && -n "${expact_part}" && -n "${attnact_part}" && -n "${layeract_part}" && -n "${layergc_part}" && -n "${sdparecomp_part}" ]] || die "empty policy, activation-offload, layer-GC, or sdpa-recompute value in RUNS policy item '${raw}'"
   policy="$(normalize_expert_policy "${policy_part}")"
   expact="$(bool_value "${expact_part}")"
   attnact="$(bool_value "${attnact_part}")"
@@ -489,13 +518,13 @@ parse_exp_act_policy_tuple() {
   layergc="$(bool_value "${layergc_part}")"
   sdparecomp="$(bool_value "${sdparecomp_part}")"
   if [[ "${layeract}" == "true" && "${layergc}" == "true" ]]; then
-    die "ASYMM_EXP_ACT_POLICIES item '${raw}' is unsupported: ASYMM_LAYER_ACT_OFFLOAD and ASYMM_LAYER_GC are mutually exclusive"
+    die "RUNS policy item '${raw}' is unsupported: ASYMM_LAYER_ACT_OFFLOAD and ASYMM_LAYER_GC are mutually exclusive"
   fi
   if [[ "${layergc}" == "true" && "${policy}" != "none" ]]; then
-    die "ASYMM_EXP_ACT_POLICIES item '${raw}' is unsupported: ASYMM_LAYER_GC requires policy none"
+    die "RUNS policy item '${raw}' is unsupported: ASYMM_LAYER_GC requires policy none"
   fi
   if [[ ( "${expact}" == "true" || "${attnact}" == "true" || "${layeract}" == "true" ) && "${policy}" != "none" ]]; then
-    die "ASYMM_EXP_ACT_POLICIES item '${raw}' is unsupported: activation offload is compared without GC/recompute"
+    die "RUNS policy item '${raw}' is unsupported: activation offload is compared without GC/recompute"
   fi
   printf '%s|%s|%s|%s|%s|%s\n' "${policy}" "${expact}" "${attnact}" "${layeract}" "${layergc}" "${sdparecomp}"
 }
@@ -638,7 +667,7 @@ is_policy_independent_backend() {
 
 # A policy the backend-agnostic generic-offload hook acts on: off-layer (whole-layer save_on_cpu) or any
 # expert/attn/layer-GC offload flag set. These are NOT inert on non-asym backends, so they must not be
-# canonicalized to none|false... nor skipped as redundant. Arg: an ASYMM_EXP_ACT_POLICIES pair string.
+# canonicalized to none|false... nor skipped as redundant. Arg: a RUNS policy tuple.
 policy_pair_is_generic_baseline() {
   case "${1%%|*}" in off-layer) return 0 ;; esac
   local IFS='|'; local -a f; read -ra f <<< "${1}"
@@ -790,6 +819,41 @@ append_backend_spec() {
     recompute_mode="$(recompute_label "${recompute_token}")"
     backend_specs_raw+=("${backend}|${recompute_mode}|${liger_loss}")
   done
+}
+
+backend_entries_for_run_spec() {
+  local raw="$1"
+  local -a backend_specs_raw=()
+  append_backend_spec "${raw}"
+  printf '%s\n' "${backend_specs_raw[@]}"
+}
+
+normalize_run_spec_entry() {
+  local raw="$1"
+  local model_part backend_part workload_part policy_part extra
+  local normalized_model parsed_workload parsed_policy
+  local -a backend_entries
+
+  IFS=';' read -r model_part backend_part workload_part policy_part extra <<< "${raw}"
+  model_part="${model_part// /}"
+  backend_part="${backend_part// /}"
+  workload_part="${workload_part// /}"
+  policy_part="${policy_part// /}"
+  [[ -n "${model_part}" && -n "${backend_part}" && -n "${workload_part}" && -n "${policy_part}" && -z "${extra:-}" ]] ||
+    die "RUNS item must be model ; backend|recompute[|ligerloss] ; seq|batch|grad_accum ; policy|expact|attnact|layeract|layergc|sdparecomp, got '${raw}'"
+
+  if [[ -n "${M[$model_part]:-}" ]]; then
+    model_part="${M[$model_part]}"
+  fi
+  parse_model_spec "${model_part}"
+  normalized_model="${parsed_model_name}|${parsed_model_gpu_count}"
+  parsed_workload="$(parse_workload_tuple "${workload_part}")"
+  parsed_policy="$(parse_exp_act_policy_tuple "${policy_part}")"
+
+  mapfile -t backend_entries < <(backend_entries_for_run_spec "${backend_part}")
+  ((${#backend_entries[@]} == 1)) ||
+    die "RUNS backend spec must resolve to exactly one job; got ${#backend_entries[@]} from '${backend_part}'"
+  printf '%s;%s;%s;%s\n' "${normalized_model}" "${backend_entries[0]}" "${parsed_workload}" "${parsed_policy}"
 }
 
 profiler_label() {
@@ -1754,12 +1818,12 @@ prepare_dataset_for_seq() {
 }
 
 gpu_spec="${GPU_POOL}"
-model_spec="${MODEL_SPECS}"
-backend_specs_spec="${BACKEND_SPECS}"
+model_spec="${RUN_MODEL_SPECS}"
+backend_specs_spec="${RUN_BACKENDS}"
 router_mode_spec="${ROUTER_MODES}"
 profiler_spec="${PROFILERS}"
-workload_spec="${WORKLOADS}"
-exp_act_policy_spec="${ASYMM_EXP_ACT_POLICIES}"
+workload_spec="${RUN_WORKLOADS}"
+exp_act_policy_spec="${RUN_EXP_ACT_POLICIES}"
 lora_params_spec="${LORA_PARAMS}"
 lf_expert_lora_impl_spec="${LF_EXPERT_LORA_IMPLS}"
 output_root="${OUTPUT_ROOT}"
@@ -1777,18 +1841,10 @@ while (($#)); do
     --gpus=*) gpu_spec="${1#*=}"; shift ;;
     --dist-launcher) need_value "$1" "${2-}"; DIST_LAUNCHER="$(dist_launcher_label "$2")"; shift 2 ;;
     --dist-launcher=*) DIST_LAUNCHER="$(dist_launcher_label "${1#*=}")"; shift ;;
-    --models|--model-specs) collect_values "$1" vals "${@:2}"; model_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
-    --models=*|--model-specs=*) model_spec="${1#*=}"; shift ;;
-    --backend-specs) collect_values "$1" vals "${@:2}"; backend_specs_spec="${vals[*]}"; set -- "${REMAINING[@]}" ;;
-    --backend-specs=*) backend_specs_spec="${1#*=}"; shift ;;
     --router-modes) need_value "$1" "${2-}"; router_mode_spec="$2"; ROUTER_MODES="$2"; shift 2 ;;
     --router-modes=*) router_mode_spec="${1#*=}"; ROUTER_MODES="${1#*=}"; shift ;;
     --profilers) need_value "$1" "${2-}"; profiler_spec="$2"; shift 2 ;;
     --profilers=*) profiler_spec="${1#*=}"; shift ;;
-    --workloads) collect_values "$1" vals "${@:2}"; workload_spec="${vals[*]}"; WORKLOADS="${workload_spec}"; set -- "${REMAINING[@]}" ;;
-    --workloads=*) workload_spec="${1#*=}"; WORKLOADS="${workload_spec}"; shift ;;
-    --asymm-exp-act-policies) need_value "$1" "${2-}"; exp_act_policy_spec="$2"; ASYMM_EXP_ACT_POLICIES="$2"; shift 2 ;;
-    --asymm-exp-act-policies=*) exp_act_policy_spec="${1#*=}"; ASYMM_EXP_ACT_POLICIES="${1#*=}"; shift ;;
     --dataset) need_value "$1" "${2-}"; DATASET="$2"; shift 2 ;;
     --dataset=*) DATASET="${1#*=}"; shift ;;
     --prepare-datasets) need_value "$1" "${2-}"; PREPARE_DATASETS="$(bool_value "$2")"; shift 2 ;;
@@ -1928,12 +1984,12 @@ done
 DIST_LAUNCHER="$(dist_launcher_label "${DIST_LAUNCHER}")"
 
 require_comma_list "--gpus/GPU_POOL" "${gpu_spec}"
-require_comma_list "--models/MODEL_SPECS" "${model_spec}"
-require_comma_list "--backend-specs/BACKEND_SPECS" "${backend_specs_spec}"
+require_comma_list "RUNS-derived model list" "${model_spec}"
+require_comma_list "RUNS-derived backend list" "${backend_specs_spec}"
 require_comma_list "--router-modes/ROUTER_MODES" "${router_mode_spec}"
 require_comma_list "--profilers/PROFILERS" "${profiler_spec}"
-require_comma_list "--workloads/WORKLOADS" "${workload_spec}"
-require_comma_list "--asymm-exp-act-policies/ASYMM_EXP_ACT_POLICIES" "${exp_act_policy_spec}"
+require_comma_list "RUNS-derived workload list" "${workload_spec}"
+require_comma_list "RUNS-derived policy list" "${exp_act_policy_spec}"
 require_comma_list "--lora-params/LORA_PARAMS" "${lora_params_spec}"
 require_comma_list "--lf-expert-lora-impls/LF_EXPERT_LORA_IMPLS" "${lf_expert_lora_impl_spec}"
 
@@ -2021,7 +2077,7 @@ mapfile -t gpus < <(tokens "${gpu_spec}" | sed 's/^cuda://' | dedupe)
 mapfile -t model_specs < <(tokens "${model_spec}" | dedupe)
 backend_specs_raw=()
 mapfile -t raw_backend_spec_tokens < <(tokens "${backend_specs_spec}")
-((${#raw_backend_spec_tokens[@]} > 0)) || die "BACKEND_SPECS must include at least one backend|recompute[|ligerloss] spec"
+((${#raw_backend_spec_tokens[@]} > 0)) || die "RUNS must include at least one backend|recompute[|ligerloss] spec"
 for value in "${raw_backend_spec_tokens[@]}"; do
   append_backend_spec "${value}"
 done
@@ -2035,6 +2091,7 @@ mapfile -t backend_recompute_modes < <(printf '%s\n' "${backend_specs[@]}" | cut
 mapfile -t liger_loss_modes < <(printf '%s\n' "${backend_specs[@]}" | cut -d '|' -f3 | dedupe)
 recompute_modes=("${backend_recompute_modes[@]}")
 mapfile -t router_modes < <(tokens "${router_mode_spec}" | while read -r value; do router_mode_label "${value}"; done | dedupe)
+((${#router_modes[@]} == 1)) || die "ROUTER_MODES must be a single value so each RUNS row maps to one launch"
 router_hf_selected=false
 router_whole_selected=false
 for router_mode in "${router_modes[@]}"; do
@@ -2084,6 +2141,7 @@ if [[ "${selected_has_kt}" == "true" ]]; then
   fi
 fi
 mapfile -t profilers < <(tokens "${profiler_spec}" | while read -r value; do profiler_label "${value}"; done | dedupe)
+((${#profilers[@]} == 1)) || die "PROFILERS must be a single value so each RUNS row maps to one launch; use both for one nsys run plus source artifacts"
 both_profiler_selected=false
 nsys_artifacts_selected=false
 if printf '%s\n' "${profilers[@]}" | grep -qx 'both'; then
@@ -2107,10 +2165,15 @@ mapfile -t asym_cpu_adamw_grad_offload_modes < <(
   tokens "${ASYM_CPU_ADAMW_GRAD_OFFLOAD}" | while read -r value; do bool_value "${value}"; done | dedupe
 )
 ((${#asym_cpu_adamw_grad_offload_modes[@]})) || die "ASYM_CPU_ADAMW_GRAD_OFFLOAD must include at least one boolean value"
+((${#asym_cpu_adamw_grad_offload_modes[@]} == 1)) || die "ASYM_CPU_ADAMW_GRAD_OFFLOAD must be a single boolean so each RUNS row maps to one launch"
 mapfile -t asym_cpu_adamw_weight_offload_modes < <(
   tokens "${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD}" | while read -r value; do bool_value "${value}"; done | dedupe
 )
 ((${#asym_cpu_adamw_weight_offload_modes[@]})) || die "ASYM_CPU_ADAMW_WEIGHT_OFFLOAD must include at least one boolean value"
+((${#asym_cpu_adamw_weight_offload_modes[@]} == 1)) || die "ASYM_CPU_ADAMW_WEIGHT_OFFLOAD must be a single boolean so each RUNS row maps to one launch"
+if [[ "${asym_cpu_adamw_weight_offload_modes[0]}" == "true" && "${asym_cpu_adamw_grad_offload_modes[0]}" != "true" ]]; then
+  die "ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true requires ASYM_CPU_ADAMW_GRAD_OFFLOAD=true so each CPUAdamW RUNS row maps to one launch"
+fi
 if [[ "${both_profiler_selected}" == "true" ]]; then
   plot_profilers=(nsys source)
 elif [[ "${nsys_artifacts_selected}" == "true" ]]; then
@@ -2134,12 +2197,11 @@ mapfile -t workloads < <(printf '%s\n' "${workloads[@]}" | dedupe)
 mapfile -t seq_lens < <(printf '%s\n' "${workloads[@]}" | cut -d '|' -f1 | dedupe)
 mapfile -t workload_batch_sizes < <(printf '%s\n' "${workloads[@]}" | cut -d '|' -f2 | dedupe)
 mapfile -t workload_grad_accum_steps < <(printf '%s\n' "${workloads[@]}" | cut -d '|' -f3 | dedupe)
-WORKLOADS="$(IFS=,; printf '%s' "${workloads[*]}")"
 IFS='|' read -r _first_workload_seq PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS <<< "${workloads[0]}"
 batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}"
 exp_act_policy_pairs=()
 mapfile -t raw_exp_act_policy_pairs < <(tokens "${exp_act_policy_spec}" | dedupe)
-((${#raw_exp_act_policy_pairs[@]} > 0)) || die "ASYMM_EXP_ACT_POLICIES must include at least one policy|expert_act|attn_act|layer_act|layer_gc tuple"
+((${#raw_exp_act_policy_pairs[@]} > 0)) || die "RUNS must include at least one policy|expert_act|attn_act|layer_act|layer_gc tuple"
 for value in "${raw_exp_act_policy_pairs[@]}"; do
   exp_act_policy_pairs+=("$(parse_exp_act_policy_tuple "${value}")")
 done
@@ -2167,7 +2229,6 @@ mapfile -t plot_expact_values < <(printf '%s\n' "${plot_expact_values[@]}" | ded
 mapfile -t plot_attnact_values < <(printf '%s\n' "${plot_attnact_values[@]}" | dedupe)
 mapfile -t plot_layeract_values < <(printf '%s\n' "${plot_layeract_values[@]}" | dedupe)
 mapfile -t plot_layergc_values < <(printf '%s\n' "${plot_layergc_values[@]}" | dedupe)
-ASYMM_EXP_ACT_POLICIES="$(IFS=,; printf '%s' "${exp_act_policy_pairs[*]}")"
 ASYMM_EXPERT_ACT_OFFLOAD="${expact_values[0]}"
 expact_label="$(expact_tag "${ASYMM_EXPERT_ACT_OFFLOAD}")"
 actrecomp_label="$(actrecomp_tag "${ASYM_OFFLOAD_ACT_RECOMPUTE}")"
@@ -2182,6 +2243,16 @@ ASYMM_ATTN_SDPA_RECOMPUTE="${sdparecomp_values[0]:-false}"
 sdparecomp_label="$(sdparecomp_tag "${ASYMM_ATTN_SDPA_RECOMPUTE}")"
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="$(normalize_expact_lora_a_fwd "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}")"
 expact_lora_a_fwd_label="$(expact_lora_a_fwd_tag "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}")"
+
+paired_run_specs=()
+for run_spec_value in "${_run_specs[@]}"; do
+  [[ -n "${run_spec_value}" ]] || continue
+  normalized_run_spec="$(normalize_run_spec_entry "${run_spec_value}")" || exit $?
+  [[ -n "${normalized_run_spec}" ]] || die "RUNS item produced an empty normalized run: '${run_spec_value}'"
+  paired_run_specs+=("${normalized_run_spec}")
+done
+((${#paired_run_specs[@]})) || die "RUNS schedule is empty"
+echo "Using RUNS schedule: ${#paired_run_specs[@]} row(s)"
 
 ((${#gpus[@]})) || die "GPU pool is empty"
 ((${#model_specs[@]})) || die "model spec list is empty"
@@ -2232,6 +2303,15 @@ if [[ "${DRY_RUN}" != "true" && "${COLLECT_EXISTING}" != "true" ]]; then
   mkdir -p "${precision_root}"
 fi
 echo "Output precision root: ${precision_root}"
+mkdir -p "$(dirname "${_RUNS_LOG}")"
+if [[ -s "${_RUNS_LOG}" ]]; then
+  printf '\n' >> "${_RUNS_LOG}"
+fi
+{
+  printf '===== profile_lora_lf_test_both.sh invocation: %s =====\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  printf 'runs=%s lora_configs=%s profilers=%s router_modes=%s\n' "${#paired_run_specs[@]}" "${#lora_dropouts[@]}" "${PROFILERS}" "${ROUTER_MODES}"
+} >> "${_RUNS_LOG}"
+echo "Run log: ${_RUNS_LOG} (append mode)"
 
 declare -A plot_roots=()
 declare -A memory_plot_roots=()
@@ -3282,153 +3362,167 @@ plot_throughput_precision_combined() {
   fi
 }
 
-for model_spec_entry in "${model_specs[@]}"; do
-  parse_model_spec "${model_spec_entry}"
-  current_model_name="${parsed_model_name}"
-  current_model_gpu_count="${parsed_model_gpu_count}"
-  current_model_tag=$(basename "${current_model_name}" | tr '/:' '__')
-  workload_label="$(safe_label "${current_model_tag}")"
-  TEMPLATE="${template_spec}"
-  if [[ "${TEMPLATE}" == "auto" ]]; then
-    TEMPLATE="$(infer_template "${current_model_name}")"
-  fi
-  echo "Using template: ${TEMPLATE} for model ${current_model_name} requesting ${current_model_gpu_count} GPU(s), recompute from backend specs"
+plot_config_artifacts_for_root() {
+  local config_root="$1"
+  local seq_len="$2"
+  [[ "${DRY_RUN}" != "true" ]] || return 0
 
-  for workload in "${workloads[@]}"; do
-    IFS='|' read -r seq_len PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS <<< "${workload}"
-    batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}"
-    current_dataset="${DATASET}"
-    if [[ "${PREPARE_DATASETS}" == "true" ]]; then
-      current_dataset="$(dataset_name_for_seq "${seq_len}")"
-      if [[ "${COLLECT_EXISTING}" != "true" ]]; then
-        if ! prepare_dataset_for_seq "${seq_len}" "${current_dataset}"; then
-          failures=$((failures + 1))
-          if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
-            exit 1
+  plot_config_root "${config_root}" "${seq_len}"
+  if [[ -z "${PLOT_OUTPUT_DIR}" && ! -d "${config_root}/combined" ]]; then
+    write_missing_combined_readme \
+      "${config_root}/combined" \
+      "LF Config Combined Artifacts" \
+      "No config-level LF timing plots were generated for this config. This can happen when plotting is disabled or no matching profile rows are available."
+  fi
+  if [[ -n "${memory_plot_roots[${config_root}]+set}" ]]; then
+    plot_memory_config_root "${config_root}" "${seq_len}"
+  else
+    write_missing_combined_readme \
+      "${config_root}/memory_combined" \
+      "LF Source Memory Combined Artifacts" \
+      "No source-memory breakdown rows were collected for this config. Include the source profiler in PROFILERS, or set PROFILE_MEMORY_BREAKDOWN=true for a run where source-memory hook overhead is acceptable."
+  fi
+  if [[ -n "${interconnect_plot_roots[${config_root}]+set}" ]]; then
+    plot_interconnect_config_root "${config_root}" "${seq_len}"
+  else
+    write_missing_combined_readme \
+      "${config_root}/c2c_combined" \
+      "LF C2C / CTC Combined Artifacts" \
+      "No nsys profiler run was selected for this config, so no Nsight C2C/CTC GPU metric samples can be summarized."
+  fi
+  if [[ -n "${throughput_plot_roots[${config_root}]+set}" ]]; then
+    plot_throughput_config_root "${config_root}" "${seq_len}"
+  else
+    write_missing_combined_readme \
+      "${config_root}/throughput_combined" \
+      "LF Throughput Combined Artifacts" \
+      "No source profiler run was selected for this config, so no per-step timing is available to compute tokens/sec."
+  fi
+  write_config_artifact_readme "${config_root}"
+}
+
+declare -A prepared_dataset_keys=()
+for _lp_idx in "${!lora_dropouts[@]}"; do
+    LORA_DROPOUT="${lora_dropouts[$_lp_idx]}"
+    LORA_RANK="${lora_ranks[$_lp_idx]}"
+    LORA_ALPHA="${lora_alphas[$_lp_idx]}"
+    LORA_TARGET="${lora_targets[$_lp_idx]}"
+    lora_dropout_label_value="$(lora_dropout_label "${LORA_DROPOUT}")"
+
+    unset lora_config_roots
+    declare -A lora_config_roots=()
+    for paired_run_spec in "${paired_run_specs[@]}"; do
+      IFS=';' read -r model_spec_entry backend_recompute workload exp_act_policy_pair paired_run_extra <<< "${paired_run_spec}"
+      [[ -n "${model_spec_entry}" && -n "${backend_recompute}" && -n "${workload}" && -n "${exp_act_policy_pair}" && -z "${paired_run_extra:-}" ]] ||
+        die "internal error: malformed paired RUNS entry '${paired_run_spec}'"
+
+      parse_model_spec "${model_spec_entry}"
+      current_model_name="${parsed_model_name}"
+      current_model_gpu_count="${parsed_model_gpu_count}"
+      current_model_tag=$(basename "${current_model_name}" | tr '/:' '__')
+      workload_label="$(safe_label "${current_model_tag}")"
+      TEMPLATE="${template_spec}"
+      if [[ "${TEMPLATE}" == "auto" ]]; then
+        TEMPLATE="$(infer_template "${current_model_name}")"
+      fi
+      echo "Using template: ${TEMPLATE} for model ${current_model_name} requesting ${current_model_gpu_count} GPU(s), recompute from RUNS"
+
+      IFS='|' read -r seq_len PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS <<< "${workload}"
+      batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}"
+      current_dataset="${DATASET}"
+      if [[ "${PREPARE_DATASETS}" == "true" ]]; then
+        current_dataset="$(dataset_name_for_seq "${seq_len}")"
+        if [[ "${COLLECT_EXISTING}" != "true" ]]; then
+          dataset_key="${current_model_name}|${seq_len}|${current_dataset}"
+          if [[ -z "${prepared_dataset_keys[${dataset_key}]+set}" ]]; then
+            if ! prepare_dataset_for_seq "${seq_len}" "${current_dataset}"; then
+              failures=$((failures + 1))
+              if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
+                exit 1
+              fi
+              continue
+            fi
+            prepared_dataset_keys["${dataset_key}"]=1
           fi
-          continue
         fi
       fi
-    fi
-    for _lp_idx in "${!lora_dropouts[@]}"; do
-      LORA_DROPOUT="${lora_dropouts[$_lp_idx]}"
-      LORA_RANK="${lora_ranks[$_lp_idx]}"
-      LORA_ALPHA="${lora_alphas[$_lp_idx]}"
-      LORA_TARGET="${lora_targets[$_lp_idx]}"
-      lora_dropout_label_value="$(lora_dropout_label "${LORA_DROPOUT}")"
+
       config_root="$(config_root_path "${seq_len}")"
+      lora_config_roots["${config_root}"]="${seq_len}"
       for lf_expert_lora_impl in "${lf_expert_lora_impls[@]}"; do
-        for exp_act_policy_pair in "${exp_act_policy_pairs[@]}"; do
-          expert_policy="${exp_act_policy_pair%%|*}"
-          policy_tail="${exp_act_policy_pair#*|}"
-          ASYMM_EXPERT_ACT_OFFLOAD="${policy_tail%%|*}"
-          policy_tail="${policy_tail#*|}"
-          ASYMM_ATTN_ACT_OFFLOAD="${policy_tail%%|*}"
-          policy_tail="${policy_tail#*|}"
-          ASYMM_LAYER_ACT_OFFLOAD="${policy_tail%%|*}"
-          policy_tail="${policy_tail#*|}"
-          ASYMM_LAYER_GC="${policy_tail%%|*}"
-          ASYMM_ATTN_SDPA_RECOMPUTE="${policy_tail#*|}"
-          expact_label="$(expact_tag "${ASYMM_EXPERT_ACT_OFFLOAD}")"
-          attnact_label="$(attnact_tag "${ASYMM_ATTN_ACT_OFFLOAD}")"
-          layeract_label="$(layeract_tag "${ASYMM_LAYER_ACT_OFFLOAD}")"
-          layergc_label="$(layergc_tag "${ASYMM_LAYER_GC}")"
-          sdparecomp_label="$(sdparecomp_tag "${ASYMM_ATTN_SDPA_RECOMPUTE}")"
-          for router_mode in "${router_modes[@]}"; do
-            for backend_recompute in "${backend_specs[@]}"; do
-              IFS='|' read -r backend recompute liger_loss backend_spec_extra <<< "${backend_recompute}"
-              [[ -n "${backend}" && -n "${recompute}" && -n "${liger_loss}" && -z "${backend_spec_extra:-}" ]] || die "internal error: malformed normalized backend spec '${backend_recompute}'"
-              for profiler in "${profilers[@]}"; do
-                profiler_runs_nsys=false
-                [[ "${profiler}" == "nsys" || "${profiler}" == "both" ]] && profiler_runs_nsys=true
-                if [[ "${backend}" == "kt_armbf16" && "${profiler_runs_nsys}" == "true" && "${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}" != "1" ]]; then
-                  echo "Skipping backend=kt_armbf16 profiler=${profiler}; run profiler=source first and set KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK=1 only after one source step completes."
-                  continue
+        expert_policy="${exp_act_policy_pair%%|*}"
+        policy_tail="${exp_act_policy_pair#*|}"
+        ASYMM_EXPERT_ACT_OFFLOAD="${policy_tail%%|*}"
+        policy_tail="${policy_tail#*|}"
+        ASYMM_ATTN_ACT_OFFLOAD="${policy_tail%%|*}"
+        policy_tail="${policy_tail#*|}"
+        ASYMM_LAYER_ACT_OFFLOAD="${policy_tail%%|*}"
+        policy_tail="${policy_tail#*|}"
+        ASYMM_LAYER_GC="${policy_tail%%|*}"
+        ASYMM_ATTN_SDPA_RECOMPUTE="${policy_tail#*|}"
+        expact_label="$(expact_tag "${ASYMM_EXPERT_ACT_OFFLOAD}")"
+        attnact_label="$(attnact_tag "${ASYMM_ATTN_ACT_OFFLOAD}")"
+        layeract_label="$(layeract_tag "${ASYMM_LAYER_ACT_OFFLOAD}")"
+        layergc_label="$(layergc_tag "${ASYMM_LAYER_GC}")"
+        sdparecomp_label="$(sdparecomp_tag "${ASYMM_ATTN_SDPA_RECOMPUTE}")"
+
+        IFS='|' read -r backend recompute liger_loss backend_spec_extra <<< "${backend_recompute}"
+        [[ -n "${backend}" && -n "${recompute}" && -n "${liger_loss}" && -z "${backend_spec_extra:-}" ]] || die "internal error: malformed normalized backend spec '${backend_recompute}'"
+        for router_mode in "${router_modes[@]}"; do
+          for profiler in "${profilers[@]}"; do
+            profiler_runs_nsys=false
+            [[ "${profiler}" == "nsys" || "${profiler}" == "both" ]] && profiler_runs_nsys=true
+            if [[ "${backend}" == "kt_armbf16" && "${profiler_runs_nsys}" == "true" && "${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}" != "1" ]]; then
+              die "backend=kt_armbf16 profiler=${profiler} requires a completed source run first; set PROFILERS=source, or set KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK=1 after one source step completes"
+            fi
+            job_router_mode="${router_mode}"
+            if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" && "${backend}" != "asym_cpuadamwtorch" && "${backend}" != "asym_cpuadamwds" ]]; then
+              if [[ "${router_hf_selected}" != "true" ]]; then
+                job_router_mode=hf
+              else
+                die "backend=${backend} router_mode=${router_mode} is invalid; owned routing requires an AsymGEMM backend"
+              fi
+            fi
+            if [[ "${backend}" == "kt_armbf16" && "${profiler_runs_nsys}" == "true" ]]; then
+              if ! kt_arm_matching_source_profile_complete "${config_root}" "${backend}" "${recompute}" "${expert_policy}" "${job_router_mode}" "${liger_loss}" "${seq_len}" "${current_model_name}"; then
+                die "backend=kt_armbf16 profiler=${profiler} requires a matching completed source profile for seq=${seq_len} recompute=${recompute} liger_loss=${liger_loss} expert_policy=${expert_policy} router_mode=${job_router_mode} qwen_expert_lora_impl=${lf_expert_lora_impl} ${expact_label} ${attnact_label} ${layeract_label} ${layergc_label}"
+              fi
+            fi
+            gpu_count="$(backend_gpu_count "${backend}" "${current_model_gpu_count}")"
+            gpu="$(gpu_slice "${gpu_count}")"
+            if cpuadam_backend_for_label "${backend}" >/dev/null; then
+              grad_offload_modes_for_job=("${asym_cpu_adamw_grad_offload_modes[@]}")
+              weight_offload_modes_for_job=("${asym_cpu_adamw_weight_offload_modes[@]}")
+            else
+              grad_offload_modes_for_job=(false)
+              weight_offload_modes_for_job=(false)
+            fi
+            for grad_offload in "${grad_offload_modes_for_job[@]}"; do
+              for weight_offload in "${weight_offload_modes_for_job[@]}"; do
+                if [[ "${weight_offload}" == "true" && "${grad_offload}" != "true" ]]; then
+                  die "internal error: weight offload requires grad offload"
                 fi
-                job_router_mode="${router_mode}"
-                if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" && "${backend}" != "asym_cpuadamwtorch" && "${backend}" != "asym_cpuadamwds" ]]; then
-                  if [[ "${router_hf_selected}" != "true" ]]; then
-                    job_router_mode=hf
-                  else
-                    echo "Skipping backend=${backend} router_mode=${router_mode}; owned routing requires an AsymGEMM backend."
-                    continue
+                _run_log_line="[$(date '+%Y-%m-%d %H:%M:%S')] ${_M_REV[${current_model_name}]:-${current_model_name}} ; ${backend}|${recompute}|${liger_loss} ; ${seq_len}|${PER_DEVICE_TRAIN_BATCH_SIZE}|${GRADIENT_ACCUMULATION_STEPS} ; ${expert_policy}|${ASYMM_EXPERT_ACT_OFFLOAD}|${ASYMM_ATTN_ACT_OFFLOAD}|${ASYMM_LAYER_ACT_OFFLOAD}|${ASYMM_LAYER_GC}|${ASYMM_ATTN_SDPA_RECOMPUTE} ; lora=${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|${LORA_TARGET}"
+                echo "${_run_log_line}" | tee -a "${_RUNS_LOG}"
+                if ! run_job "${backend}" "${profiler}" "${recompute}" "${liger_loss}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}" "${lf_expert_lora_impl}" "${grad_offload}" "${weight_offload}"; then
+                  failures=$((failures + 1))
+                  if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
+                    exit 1
                   fi
                 fi
-                if { is_policy_independent_backend "${backend}" || [[ "${recompute}" == "recomp" ]]; } && [[ "${exp_act_policy_pair}" != "${exp_act_policy_pairs[0]}" ]] && ! policy_pair_is_generic_baseline "${exp_act_policy_pair}"; then
-                  echo "Skipping backend=${backend} recompute=${recompute} policy=${exp_act_policy_pair}; inert policy axes run once (canonicalized to none|false|false|false|false)."
-                  continue
-                fi
-                if [[ "${backend}" == "kt_armbf16" && "${profiler_runs_nsys}" == "true" ]]; then
-                  if ! kt_arm_matching_source_profile_complete "${config_root}" "${backend}" "${recompute}" "${expert_policy}" "${job_router_mode}" "${liger_loss}" "${seq_len}" "${current_model_name}"; then
-                  echo "Skipping backend=kt_armbf16 profiler=${profiler}; matching source profile is missing, incomplete, or stale for seq=${seq_len} recompute=${recompute} liger_loss=${liger_loss} expert_policy=${expert_policy} router_mode=${job_router_mode} qwen_expert_lora_impl=${lf_expert_lora_impl} ${expact_label} ${attnact_label} ${layeract_label} ${layergc_label}."
-                    continue
-                  fi
-                fi
-                gpu_count="$(backend_gpu_count "${backend}" "${current_model_gpu_count}")"
-                gpu="$(gpu_slice "${gpu_count}")"
-                if cpuadam_backend_for_label "${backend}" >/dev/null; then
-                  grad_offload_modes_for_job=("${asym_cpu_adamw_grad_offload_modes[@]}")
-                  weight_offload_modes_for_job=("${asym_cpu_adamw_weight_offload_modes[@]}")
-                else
-                  grad_offload_modes_for_job=(false)
-                  weight_offload_modes_for_job=(false)
-                fi
-                for grad_offload in "${grad_offload_modes_for_job[@]}"; do
-                  for weight_offload in "${weight_offload_modes_for_job[@]}"; do
-                    if [[ "${weight_offload}" == "true" && "${grad_offload}" != "true" ]]; then
-                      continue  # weight offload requires grad offload (LF parser enforces this)
-                    fi
-                    if ! run_job "${backend}" "${profiler}" "${recompute}" "${liger_loss}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}" "${lf_expert_lora_impl}" "${grad_offload}" "${weight_offload}"; then
-                      failures=$((failures + 1))
-                      if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
-                        exit 1
-                      fi
-                    fi
-                  done
-                done
               done
             done
           done
         done
       done
-      if [[ "${DRY_RUN}" != "true" ]]; then
-        plot_config_root "${config_root}" "${seq_len}"
-        if [[ -z "${PLOT_OUTPUT_DIR}" && ! -d "${config_root}/combined" ]]; then
-          write_missing_combined_readme \
-            "${config_root}/combined" \
-            "LF Config Combined Artifacts" \
-            "No config-level LF timing plots were generated for this config. This can happen when plotting is disabled or no matching profile rows are available."
-        fi
-        if [[ -n "${memory_plot_roots[${config_root}]+set}" ]]; then
-          plot_memory_config_root "${config_root}" "${seq_len}"
-        else
-          write_missing_combined_readme \
-            "${config_root}/memory_combined" \
-            "LF Source Memory Combined Artifacts" \
-            "No source-memory breakdown rows were collected for this config. Include the source profiler in PROFILERS, or set PROFILE_MEMORY_BREAKDOWN=true for a run where source-memory hook overhead is acceptable."
-        fi
-        if [[ -n "${interconnect_plot_roots[${config_root}]+set}" ]]; then
-          plot_interconnect_config_root "${config_root}" "${seq_len}"
-        else
-          write_missing_combined_readme \
-            "${config_root}/c2c_combined" \
-            "LF C2C / CTC Combined Artifacts" \
-            "No nsys profiler run was selected for this config, so no Nsight C2C/CTC GPU metric samples can be summarized."
-        fi
-        if [[ -n "${throughput_plot_roots[${config_root}]+set}" ]]; then
-          plot_throughput_config_root "${config_root}" "${seq_len}"
-        else
-          write_missing_combined_readme \
-            "${config_root}/throughput_combined" \
-            "LF Throughput Combined Artifacts" \
-            "No source profiler run was selected for this config, so no per-step timing is available to compute tokens/sec."
-        fi
-        write_config_artifact_readme "${config_root}"
-      fi
     done
-  done
-done
 
+    if [[ "${DRY_RUN}" != "true" ]]; then
+      for config_root in "${!lora_config_roots[@]}"; do
+        plot_config_artifacts_for_root "${config_root}" "${lora_config_roots[${config_root}]}"
+      done
+    fi
+  done
 if ((failures > 0)); then
   echo "${failures} profiling job(s) failed" >&2
   if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
