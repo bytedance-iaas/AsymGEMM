@@ -367,8 +367,18 @@ infer_template() {
     llama-4-*|llama4-*) printf 'llama4\n' ;;
     llama-3*|llama3-*|meta-llama-3*) printf 'llama3\n' ;;
     llama-2*|llama2-*) printf 'llama2\n' ;;
-    qwen3-*|qwen3-next-*) printf 'qwen3_nothink\n' ;;
-    *) printf 'qwen3_nothink\n' ;;
+    qwen2-vl-*|qwen2.5-vl-*|qvq-*) printf 'qwen2_vl\n' ;;
+    qwen2-audio-*) printf 'qwen2_audio\n' ;;
+    qwen2.5-omni-*) printf 'qwen2_omni\n' ;;
+    qwen3-omni-*-thinking*) printf 'qwen3_omni\n' ;;
+    qwen3-omni-*) printf 'qwen3_omni_nothink\n' ;;
+    qwen3-vl-*-thinking*) printf 'qwen3_vl\n' ;;
+    qwen3-vl-*) printf 'qwen3_vl_nothink\n' ;;
+    qwen3.5-*) printf 'qwen3_5\n' ;;
+    qwen3-*-instruct*|qwen3-next-*-instruct*) printf 'qwen3_nothink\n' ;;
+    qwen3-*|qwen3-next-*) printf 'qwen3\n' ;;
+    qwen2.5-*|qwen2-*|qwq-*) printf 'qwen\n' ;;
+    *) echo "error: TEMPLATE=auto cannot infer a safe template for '${model}'. Set TEMPLATE explicitly." >&2; return 2 ;;
   esac
 }
 

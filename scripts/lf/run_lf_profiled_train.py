@@ -2509,12 +2509,14 @@ class LFProfileRecorder:
         forward_records = self.records.get("step.forward", [])
         backward_records = self.records.get("step.backward", [])
         training_step_records = self.records.get("lf.step.total", [])
+        optimizer_records = self.records.get("lf.optimizer.step", [])
         max_elapsed_step = max(elapsed_by_step) if elapsed_by_step else 0
         max_heartbeat_step = max(heartbeat_by_step) if heartbeat_by_step else 0
         sample_count = max(
             len(forward_records),
             len(backward_records),
             len(training_step_records),
+            len(optimizer_records),
             max_elapsed_step,
             max_heartbeat_step,
         )
@@ -2527,6 +2529,7 @@ class LFProfileRecorder:
             forward = forward_records[index] if index < len(forward_records) else None
             backward = backward_records[index] if index < len(backward_records) else None
             training_step = training_step_records[index] if index < len(training_step_records) else None
+            optimizer = optimizer_records[index] if index < len(optimizer_records) else None
             row: dict[str, Any] = {
                 "step": measured_step if measured_step > 0 else raw_step,
                 "raw_step": raw_step,
@@ -2538,6 +2541,7 @@ class LFProfileRecorder:
             add_stage(row, "forward", forward)
             add_stage(row, "backward", backward)
             add_stage(row, "training_step", training_step)
+            add_stage(row, "optimizer", optimizer)
             forward_backward_ms = sum(
                 record.milliseconds for record in (forward, backward) if record is not None
             )

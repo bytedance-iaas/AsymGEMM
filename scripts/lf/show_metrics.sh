@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Thin wrapper: print LF profiling timing/memory metrics, one table per model.
+# Thin wrapper: print LF source-profile timing/memory metrics, one table per model.
 # Usage: show_metrics.sh [PROFILING_DIR]   (default: profiling_both)
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

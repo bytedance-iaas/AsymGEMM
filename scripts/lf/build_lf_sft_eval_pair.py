@@ -137,11 +137,37 @@ def _infer_template(model_name_or_path: str) -> str:
     base = Path(model_name_or_path).name.lower()
     if base.startswith("gemma-4-") or base.startswith("gemma4-"):
         return "gemma4"
-    if base.startswith("llama-4-"):
+    if base.startswith(("llama-4-", "llama4-")):
         return "llama4"
-    if base.startswith("qwen3-") or base.startswith("qwen3-next-"):
+    if base.startswith(("llama-3", "llama3-", "meta-llama-3")):
+        return "llama3"
+    if base.startswith(("llama-2", "llama2-")):
+        return "llama2"
+    if base.startswith(("qwen2-vl-", "qwen2.5-vl-", "qvq-")):
+        return "qwen2_vl"
+    if base.startswith("qwen2-audio-"):
+        return "qwen2_audio"
+    if base.startswith("qwen2.5-omni-"):
+        return "qwen2_omni"
+    if base.startswith("qwen3-omni-") and "-thinking" in base:
+        return "qwen3_omni"
+    if base.startswith("qwen3-omni-"):
+        return "qwen3_omni_nothink"
+    if base.startswith("qwen3-vl-") and "-thinking" in base:
+        return "qwen3_vl"
+    if base.startswith("qwen3-vl-"):
+        return "qwen3_vl_nothink"
+    if base.startswith("qwen3.5-"):
+        return "qwen3_5"
+    if base.startswith(("qwen3-", "qwen3-next-")) and "-instruct" in base:
         return "qwen3_nothink"
-    return "qwen3_nothink"
+    if base.startswith(("qwen3-", "qwen3-next-")):
+        return "qwen3"
+    if base.startswith(("qwen2.5-", "qwen2-", "qwq-")):
+        return "qwen"
+    raise ValueError(
+        f"template=auto cannot infer a safe template for {model_name_or_path!r}; pass --template explicitly"
+    )
 
 
 def _percentile(sorted_values: list[int], pct: float) -> float:

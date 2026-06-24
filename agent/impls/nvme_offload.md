@@ -4,7 +4,7 @@
 
 Add NVMe support for AsymGEMM LoRA-SFT model parameters, LoRA weight homes, and optimizer state by reusing as much of vendored DeepSpeed's proven low-level NVMe machinery as is practical, while avoiding DeepSpeed/ZeRO ownership assumptions in the local single-GPU path.
 
-The intended reuse is the performance substrate: AIO/GDS builders, AIO handles, alignment/min-size constants, pinned swap-buffer utilities, queue-depth/block-size/pipeline knobs, and reusable buffer-pool patterns. The local implementation should not copy DeepSpeed's distributed ZeRO state machine into AsymGEMM, and should not directly depend on classes that require `ds_id`, `ds_tensor`, partition state, process groups, ZeRO checkpoint ownership, or initialized DeepSpeed comm.
+The intended reuse is the performance substrate: AIO builders, AIO handles, alignment/min-size constants, pinned swap-buffer utilities, queue-depth/block-size/pipeline knobs, and reusable buffer-pool patterns. The local implementation should not copy DeepSpeed's distributed ZeRO state machine into AsymGEMM, and should not directly depend on classes that require `ds_id`, `ds_tensor`, partition state, process groups, ZeRO checkpoint ownership, or initialized DeepSpeed comm.
 
 The design must keep a stable placement/materialization boundary so the local backend can be replaced later by a DeepSpeed-owned backend if multi-GPU/ZeRO support becomes necessary. In that future mode, DeepSpeed would own parameter residency, partitioning, optimizer state, checkpointing, and `param.data`; AsymGEMM would keep its compute policies/kernels and request materialized tensors or views through the same boundary. New local NVMe code should therefore improve single-GPU capacity/performance now without creating contract or ownership conflicts that make a later DeepSpeed backend hard to swap in.
 
@@ -155,7 +155,7 @@ Rules:
 
 DeepSpeed behavior to mirror at the low level:
 
-- Use AIO/GDS-style handles, not `torch.save` as a performance path.
+- Use DeepSpeed AIO handles, not `torch.save` as a performance path.
 - Use pinned/page-aligned reusable transfer buffers.
 - Do not swap tensors smaller than a meaningful threshold. DeepSpeed uses `MIN_AIO_BYTES = 1 MiB` and also raises the minimum to at least `aio.block_size`.
 - Use block-size, queue-depth, single-submit, overlap-events, and intra-op-parallelism knobs.
@@ -183,10 +183,11 @@ AIO_ALIGNED_BYTES         use exact alignment base
 SwapBuffer / SwapBufferPool
 get_sized_buffer(s)
 AsyncTensorSwapper        only later, and only behind a DeepSpeed-comm-safe wrapper
-GDSBuilder                later optional GPU-direct experiment
 DeepSpeed AIO knobs       same names/defaults where possible
 DeepSpeedCPUAdam          only where it fits resident/tiled CPU tensors
 ```
+
+GDS status: **ON HOLD / DO NOT IMPLEMENT**. The current target NVMe setup does not support GDS, so this plan must not import, build, call, validate, or add CLI/config paths for `GDSBuilder` or GPU-direct NVMe. Keep the backend boundary compatible with a hypothetical future GDS backend, but all current stages must use the CPU-staged AIO path: `NVMe -> CPU pinned/staged buffer -> H2D if needed -> compute`.
 
 Use `SwapBufferManager` directly only if it is safe in local single-process runs. In the vendored DeepSpeed code it calls `deepspeed.comm.get_rank()` during construction, which asserts unless DeepSpeed comm is initialized. If that blocks local AsymGEMM, implement a tiny `LocalSwapBufferManager` compatibility wrapper with the same `allocate`/`allocate_all`/`free` shape, but still use DeepSpeed's `SwapBufferPool`, `get_sized_buffer(s)`, constants, AIO handle, and swap functions. Do not reimplement the actual AIO submission path.
 
@@ -197,7 +198,7 @@ DeepSpeed compatibility rules:
 - Not safe to reuse directly in local AsymGEMM mode: `OptimizerSwapper`, `PartitionedOptimizerSwapper`, `PipelinedOptimizerSwapper`, `AsyncPartitionedParameterSwapper`, and ZeRO coordinators. They assume `ds_id`, `ds_tensor`, ZeRO partition status, distributed rank state, and ZeRO checkpoint ownership.
 - `DeepSpeedCPUAdam` is direct-safe only for resident CPU tensors. Do not mutate its internal state tensors into NVMe-backed placeholders. A paged optimizer must either use a separate tiled implementation or a proven resident-tile adapter.
 - DeepSpeed `swap_in_tensors`/`swap_out_tensors` hardcode file offset `0`. Use them for whole-file tensor swaps. For optimizer tiles, call the AIO handle directly with explicit `file_offset` and validate offset reads/writes with DeepSpeed AIO unit tests before Stage 3.
-- `GDSBuilder` is deferred. It is CUDA/GDS-specific and must not be required for the first local NVMe implementation.
+- `GDSBuilder` is on hold and must not be used in this implementation. Do not add GDS config flags, fallback code paths, tests, or acceptance criteria until the target hardware/storage stack explicitly supports GDS and a separate design is approved.
 
 DeepSpeed pieces not to reuse directly in local mode:
 

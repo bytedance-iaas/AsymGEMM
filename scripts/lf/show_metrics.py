@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Show LF profiling timing + memory metrics as one table per model.
+"""Show LF source-profile timing + memory metrics as one table per model.
 
 Same layout as show_status.py, but each row reports the measured numbers:
     Model | Workload | Backend | Config |
     fwd_s | bwd_s | opt_s | step_s |          # seconds
     fwd_H | bwd_H | step_H |                   # GPU HBM peak GiB
     RAM                                        # host RSS peak GiB (whole step)
+
+Timing columns are explicit per-step averages from source-profile raw step
+samples when the needed raw field exists. Warmup rows are identified by
+row["is_warmup"]. The first and final measured rows are dropped when at least
+three measured rows remain. Older profiles without raw optimizer rows fall back
+to the source-stage optimizer mean. Peak-memory columns still use max over
+non-warmup rows.
 
 The Config column carries a compact "[lg± sd±]" tag for liger-loss / sdpa-recompute
 usage (+ on, - off). Numbers are printed as x.x (1 decimal) to keep the table narrow.
@@ -28,18 +35,43 @@ import show_status as S  # noqa: E402  (shared parsing: config_label, _tok, REPO
 GIB = 1024 ** 3
 
 
-def _load_samples(leaf: Path, sp: dict) -> list:
+def _as_bool(value) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lower = value.strip().lower()
+        if lower in {"1", "true", "yes", "y"}:
+            return True
+        if lower in {"0", "false", "no", "n"}:
+            return False
+    return None
+
+
+def _load_step_samples(leaf: Path, sp: dict) -> list:
     ssf = leaf / "step_samples.json"
     if ssf.exists():
         try:
             d = json.loads(ssf.read_text())
-            return d if isinstance(d, list) else d.get("rows", [])
+            if isinstance(d, dict):
+                return d.get("rows", [])
+            if isinstance(d, list):
+                return d
         except Exception:
             pass
     ss = sp.get("step_samples")
     if isinstance(ss, dict):
         return ss.get("rows", [])
     return ss if isinstance(ss, list) else []
+
+
+def _measured_samples(samples: list) -> list:
+    rows = [r for r in samples if isinstance(r, dict) and _as_bool(r.get("is_warmup")) is False]
+    return rows or samples
+
+
+def _timing_average_samples(samples: list) -> list:
+    rows = _measured_samples(samples)
+    return rows[1:-1] if len(rows) > 2 else rows
 
 
 def read_metrics(leaf: Path) -> dict | None:
@@ -51,33 +83,40 @@ def read_metrics(leaf: Path) -> dict | None:
     except Exception:
         return None
     step_rows = {r.get("name"): r.get("milliseconds") for r in (sp.get("step") or {}).get("rows", [])}
-    samples = _load_samples(leaf, sp)
-    meas = [r for r in samples if not r.get("is_warmup")] or samples
+    samples = _load_step_samples(leaf, sp)
+    timing_samples = _timing_average_samples(samples)
+    peak_samples = _measured_samples(samples)
 
-    def mean(key):
-        vals = [r[key] for r in meas if isinstance(r.get(key), (int, float))]
+    def mean(rows, key):
+        vals = [r[key] for r in rows if isinstance(r.get(key), (int, float))]
         return sum(vals) / len(vals) if vals else None
 
-    def mx(key):
-        vals = [r[key] for r in meas if isinstance(r.get(key), (int, float))]
+    def mx(rows, key):
+        vals = [r[key] for r in rows if isinstance(r.get(key), (int, float))]
         return max(vals) if vals else None
 
-    fwd_ms = (sp.get("forward") or {}).get("total_milliseconds")
-    bwd_ms = (sp.get("backward") or {}).get("total_milliseconds")
-    opt_ms = step_rows.get("lf.optimizer.step")
-    step_ms = mean("step_milliseconds") or step_rows.get("lf.step.total")
+    fwd_ms = mean(timing_samples, "forward_milliseconds") or (sp.get("forward") or {}).get("total_milliseconds")
+    bwd_ms = mean(timing_samples, "backward_milliseconds") or (sp.get("backward") or {}).get("total_milliseconds")
+    opt_ms = (
+        mean(timing_samples, "optimizer_milliseconds")
+        or mean(timing_samples, "heartbeat_optimizer_step_milliseconds")
+        or mean(timing_samples, "optimizer_step_milliseconds")
+        or step_rows.get("lf.optimizer.step")
+    )
+    step_ms = mean(timing_samples, "step_milliseconds") or step_rows.get("lf.step.total")
     sec = lambda ms: None if ms is None else ms / 1000.0
     gib = lambda b: None if b is None else b / GIB
     return {
         "fwd_s": sec(fwd_ms), "bwd_s": sec(bwd_ms), "opt_s": sec(opt_ms), "step_s": sec(step_ms),
-        "fwd_g": gib(mx("forward_peak_allocated_bytes")),
-        "bwd_g": gib(mx("backward_peak_allocated_bytes")),
-        "step_g": gib(mx("peak_allocated_hbm_bytes")),
+        "fwd_g": gib(mx(peak_samples, "forward_peak_allocated_bytes")),
+        "bwd_g": gib(mx(peak_samples, "backward_peak_allocated_bytes")),
+        "step_g": gib(mx(peak_samples, "peak_allocated_hbm_bytes")),
         # Host RAM high-water mark for the whole step (process RSS). RSS is monotonic
         # across stages, so one step-level peak captures it; per-stage peaks would be
         # near-identical. Falls back to the per-stage backward peak for older profiles.
-        "ram_g": gib(mx("process_rss_peak_bytes") or mx("training_step_process_rss_peak_end_bytes")
-                     or mx("backward_process_rss_peak_end_bytes")),
+        "ram_g": gib(mx(peak_samples, "process_rss_peak_bytes")
+                     or mx(peak_samples, "training_step_process_rss_peak_end_bytes")
+                     or mx(peak_samples, "backward_process_rss_peak_end_bytes")),
     }
 
 
@@ -186,7 +225,9 @@ def main() -> None:
 
     print(f"Profiling metrics: {root}")
     print("Legend: 🔴 OOM (GPU)   🟠 OOM (host RAM)   ⚠️ failed   🔵 running   — not run")
-    print("Cols: _s seconds | _H GPU HBM peak GiB | RAM host RSS peak GiB (whole step)"
+    print("Cols: _s seconds, avg over non-warmup raw steps excluding first/final measured steps"
+          " (opt_s falls back to source-stage mean for older profiles without raw optimizer rows)"
+          " | _H GPU HBM peak GiB | RAM host RSS peak GiB (whole step)"
           " | Config [lg± sd±] = liger / sdpa-recompute on(+)/off(-)\n")
     for model in sorted(by_model):
         # Rank on the base config label (strip the trailing "  [lg± sd±]" usage tag).
@@ -194,8 +235,15 @@ def main() -> None:
         data = [r[4] for r in recs]
         w = [max(len(HEAD[i]), max((len(d[i]) for d in data), default=0)) for i in range(len(HEAD))]
         just = lambda i, s: s.ljust(w[i]) if i < 4 else s.rjust(w[i])  # text left, numbers right
+        group_width = lambda start, end: sum(w[start:end]) + 2 * max(0, end - start - 1)
+        separator = [
+            *("-" * w[i] for i in range(4)),
+            "-" * group_width(4, 8),
+            "-" * group_width(8, 11),
+            "-" * w[11],
+        ]
         print("  ".join(just(i, HEAD[i]) for i in range(len(HEAD))))
-        print("  ".join("-" * w[i] for i in range(len(HEAD))))
+        print("  ".join(separator))
         prev_wl = None
         for d in data:
             if prev_wl is not None and d[1] != prev_wl:  # heavier rule between workloads
