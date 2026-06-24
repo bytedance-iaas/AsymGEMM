@@ -1572,6 +1572,19 @@ append_job_record() {
     "${status}" "${gpu}" "${seq_len}" "${PER_DEVICE_TRAIN_BATCH_SIZE}" "${GRADIENT_ACCUMULATION_STEPS}" "$@" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" >> "${config_root}/jobs.tsv"
 }
 
+append_runs_log_entry() {
+  local tag="$1"
+  local payload="$2"
+  local reason="${3:-}"
+  local extra_tag="${4:-}"
+  local line
+  line="[$(date '+%Y-%m-%d %H:%M:%S')] [${tag}]"
+  [[ -n "${extra_tag}" ]] && line+=" [${extra_tag}]"
+  line+=" ${payload}"
+  [[ -n "${reason}" ]] && line+=" ; ${reason}"
+  echo "${line}" | tee -a "${_RUNS_LOG}"
+}
+
 plot_cmd_base() {
   local -n _cmd_ref="$1"
   local input_root="$2"
@@ -2527,7 +2540,15 @@ run_job() {
   local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" sdparecomp_label="${sdparecomp_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}"
   local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_LAYER_GC="${ASYMM_LAYER_GC}" ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
   local ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}" ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
+  local requested_policy_tuple="${expert_policy}|${ASYMM_EXPERT_ACT_OFFLOAD}|${ASYMM_ATTN_ACT_OFFLOAD}|${ASYMM_LAYER_ACT_OFFLOAD}|${ASYMM_LAYER_GC}|${ASYMM_ATTN_SDPA_RECOMPUTE}"
   canonicalize_policy_axis_for_inert_run "${backend}" "${recompute}"
+  local effective_policy_tuple="${expert_policy}|${ASYMM_EXPERT_ACT_OFFLOAD}|${ASYMM_ATTN_ACT_OFFLOAD}|${ASYMM_LAYER_ACT_OFFLOAD}|${ASYMM_LAYER_GC}|${ASYMM_ATTN_SDPA_RECOMPUTE}"
+  local run_log_extra_tag=""
+  local run_log_inert_reason=""
+  if [[ "${effective_policy_tuple}" != "${requested_policy_tuple}" ]]; then
+    run_log_extra_tag="INERT"
+    run_log_inert_reason=" requested_policy=${requested_policy_tuple}"
+  fi
   if [[ "${profiler}" == "both" ]]; then
     run_profiler=nsys
     materialize_source_from_nsys=true
@@ -2574,6 +2595,8 @@ run_job() {
   fi
   run_id="lf_${backend}_${run_profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${layergc_label}_${sdparecomp_label}_${expact_lora_a_fwd_label}_${actrecomp_label}_${xunpack_label}_${liger_loss}${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
+  local run_log_payload
+  run_log_payload="${_M_REV[${current_model_name}]:-${current_model_name}} ; ${backend}|${recompute}|${liger_loss} ; ${seq_len}|${PER_DEVICE_TRAIN_BATCH_SIZE}|${GRADIENT_ACCUMULATION_STEPS} ; ${effective_policy_tuple} ; lora=${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|${LORA_TARGET}"
   local profile_memory_breakdown deepspeed_dir_for_profile
   local profile_backend_label job_use_asym_cpu_adamw job_asym_cpu_adamw_backend cpuadam_backend
   local master_port
@@ -2621,6 +2644,7 @@ run_job() {
         job_profile_complete "${source_materialized_profile_json}" "${source_materialized_seq_root}" "${backend}" "${seq_len}" "${current_model_name}" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${ASYMM_LAYER_GC}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}" "${profile_memory_breakdown}" "${liger_loss}"
     }; then
       echo "Skipping existing: ${profile_json}"
+      append_runs_log_entry "SKIP" "${run_log_payload}" "reason=existing-complete profile_json=${profile_json}${run_log_inert_reason}" "${run_log_extra_tag}"
       append_job_record "${config_root}" skipped \
         "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${run_profiler}" "${liger_loss}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}" "${lf_expert_lora_impl}"
       if [[ "${materialize_source_from_nsys}" == "true" ]]; then
@@ -2632,6 +2656,7 @@ run_job() {
     if [[ "${materialize_source_from_nsys}" == "true" ]] &&
       job_profile_complete "${profile_json}" "${seq_root}" "${backend}" "${seq_len}" "${current_model_name}" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${ASYMM_LAYER_GC}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}" "${profile_memory_breakdown}" "${liger_loss}"; then
       echo "Existing nsys profile is complete; materializing missing/stale source artifacts: ${source_materialized_profile_json}" >&2
+      append_runs_log_entry "SKIP" "${run_log_payload}" "reason=existing-nsys-complete materializing_source_profile=${source_materialized_profile_json}${run_log_inert_reason}" "${run_log_extra_tag}"
       materialize_source_artifacts_from_nsys \
         "${source_profile}" \
         "${source_materialized_seq_root}" \
@@ -2679,9 +2704,11 @@ run_job() {
         job_profile_complete "${source_materialized_profile_json}" "${source_materialized_seq_root}" "${backend}" "${seq_len}" "${current_model_name}" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${ASYMM_LAYER_GC}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}" "${profile_memory_breakdown}" "${liger_loss}" || return 1
       fi
       echo "Found existing: ${profile_json}"
+      append_runs_log_entry "SKIP" "${run_log_payload}" "reason=collect-existing-found profile_json=${profile_json}${run_log_inert_reason}" "${run_log_extra_tag}"
       return 0
     fi
     echo "Missing existing profile: ${profile_json}" >&2
+    append_runs_log_entry "SKIP" "${run_log_payload}" "reason=collect-existing-missing profile_json=${profile_json}${run_log_inert_reason}" "${run_log_extra_tag}"
     return 1
   fi
 
@@ -2846,6 +2873,7 @@ run_job() {
     echo "  source_dir=${source_materialized_seq_root}"
   fi
   if [[ "${DRY_RUN}" == "true" ]]; then
+    append_runs_log_entry "RUN" "${run_log_payload}" "reason=dry-run${run_log_inert_reason}" "${run_log_extra_tag}"
     print_command "${run_cmd[@]}"
     mkdir -p "${seq_root}"
     ensure_jobs_tsv "${config_root}"
@@ -2881,6 +2909,7 @@ run_job() {
   } > "${seq_root}/command.txt"
 
   local status=0
+  append_runs_log_entry "RUN" "${run_log_payload}" "${run_log_inert_reason# }" "${run_log_extra_tag}"
   run_tracked_command "${run_cmd[@]}" || status=$?
   if [[ "${interrupted}" == "true" ]]; then
     echo "Interrupted run; exiting without scheduling more jobs." >&2
@@ -3502,8 +3531,6 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
                 if [[ "${weight_offload}" == "true" && "${grad_offload}" != "true" ]]; then
                   die "internal error: weight offload requires grad offload"
                 fi
-                _run_log_line="[$(date '+%Y-%m-%d %H:%M:%S')] ${_M_REV[${current_model_name}]:-${current_model_name}} ; ${backend}|${recompute}|${liger_loss} ; ${seq_len}|${PER_DEVICE_TRAIN_BATCH_SIZE}|${GRADIENT_ACCUMULATION_STEPS} ; ${expert_policy}|${ASYMM_EXPERT_ACT_OFFLOAD}|${ASYMM_ATTN_ACT_OFFLOAD}|${ASYMM_LAYER_ACT_OFFLOAD}|${ASYMM_LAYER_GC}|${ASYMM_ATTN_SDPA_RECOMPUTE} ; lora=${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|${LORA_TARGET}"
-                echo "${_run_log_line}" | tee -a "${_RUNS_LOG}"
                 if ! run_job "${backend}" "${profiler}" "${recompute}" "${liger_loss}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}" "${lf_expert_lora_impl}" "${grad_offload}" "${weight_offload}"; then
                   failures=$((failures + 1))
                   if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
