@@ -316,3 +316,5 @@ Scheduling Insights:
 TODO
 - Implement the residual stream offloading + recompute everything else. for long seq, load from Load activation from hbm.
 - Single CPU based context paralleim for million tokens
+
+- activation swapping within the layer?
