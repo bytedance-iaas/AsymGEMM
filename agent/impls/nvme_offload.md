@@ -167,24 +167,26 @@ NVMe target roles for this plan:
 
 - `lora_weights`: trainable adapter parameter homes. Use NVMe as backing storage, CPU as the staging/cache tier, and HBM only for the compute slab.
 - `optimizer_state`: FP32 master weights plus Adam moments. These are persistent, large, and tile-friendly, so they are the strongest NVMe target.
-- `base_weight`: optional frozen/base parameters. This is useful only when host memory is the blocker and the CPU cache can prevent blocking reads on hot layers.
+- `base_weight`: frozen/base parameters. Required stage (Stage 4), not optional. DeepSpeed's `AsyncPartitionedParameterSwapper` (`runtime/swap_tensor/partitioned_param_swapper.py:37`) handles exactly this role; its only local-mode blocker is `dist.get_rank()` calls (lines 76, 87), which are trivially shimmed to 0 for single-GPU. Reuse it directly behind the shim rather than re-implementing parameter swap logic.
 - `gradient`: not a default NVMe target. Gradients are transient and backward-critical; keep the first implementation as a CPU flat grad buffer. Add gradient NVMe only as a later capacity mode, and only with large coalesced tile writes/reads during optimizer step, never per-parameter disk writes from autograd hooks.
 
-Do not include activation NVMe in the main implementation path. Activation tensors are backward-critical and usually better handled by recompute/checkpointing or existing CPU activation offload. Revisit activation NVMe only if full e2e profiles prove CPU activation residency is the dominant remaining bottleneck after parameter and optimizer-state NVMe.
+Activation NVMe: **not implemented here and not supported by DeepSpeed either.** DeepSpeed's activation checkpointing (`runtime/activation_checkpointing/checkpointing.py`) uses CPU offload and recompute, not NVMe. There is no `activation_spill` NVMe role in DeepSpeed's ZeRO stack. Do not add `activation_spill` to the accepted role set in any stage of this plan. If CPU activation residency later proves to be the dominant bottleneck after all four NVMe roles are accepted, treat activation NVMe as a separate design with its own doc.
 
 DeepSpeed pieces to reuse directly where practical:
 
 ```text
-AsyncIOBuilder            required local AIO performance path
-swap_in_tensors           use for full-file batched reads
-swap_out_tensors          use for full-file batched writes
-MIN_AIO_BYTES             use exact minimum threshold
-AIO_ALIGNED_BYTES         use exact alignment base
+AsyncIOBuilder                      required local AIO performance path
+swap_in_tensors                     use for full-file batched reads
+swap_out_tensors                    use for full-file batched writes
+MIN_AIO_BYTES                       use exact minimum threshold
+AIO_ALIGNED_BYTES                   use exact alignment base
 SwapBuffer / SwapBufferPool
 get_sized_buffer(s)
-AsyncTensorSwapper        only later, and only behind a DeepSpeed-comm-safe wrapper
-DeepSpeed AIO knobs       same names/defaults where possible
-DeepSpeedCPUAdam          only where it fits resident/tiled CPU tensors
+AsyncTensorSwapper                  only later, and only behind a DeepSpeed-comm-safe wrapper
+AsyncPartitionedParameterSwapper    use for Stage 4 base-weight NVMe; shim dist.get_rank()→0
+                                    (partitioned_param_swapper.py:37; rank only in path+logging)
+DeepSpeed AIO knobs                 same names/defaults where possible
+DeepSpeedCPUAdam                    only where it fits resident/tiled CPU tensors
 ```
 
 GDS status: **ON HOLD / DO NOT IMPLEMENT**. The current target NVMe setup does not support GDS, so this plan must not import, build, call, validate, or add CLI/config paths for `GDSBuilder` or GPU-direct NVMe. Keep the backend boundary compatible with a hypothetical future GDS backend, but all current stages must use the CPU-staged AIO path: `NVMe -> CPU pinned/staged buffer -> H2D if needed -> compute`.
@@ -195,7 +197,8 @@ DeepSpeed compatibility rules:
 
 - Direct-safe in local mode after import/build checks: `AsyncIOBuilder`, AIO handle `async_pread`/`async_pwrite`/`wait`, `swap_in_tensors`, `swap_out_tensors`, `MIN_AIO_BYTES`, `AIO_ALIGNED_BYTES`, `SwapBuffer`, `SwapBufferPool`, `get_sized_buffer(s)`.
 - Guarded-safe only: `SwapBufferManager` and `AsyncTensorSwapper`, because they call `deepspeed.comm.get_rank()` in logging/stat paths. Use them only if DeepSpeed comm is initialized or a local wrapper suppresses the comm-dependent behavior.
-- Not safe to reuse directly in local AsymGEMM mode: `OptimizerSwapper`, `PartitionedOptimizerSwapper`, `PipelinedOptimizerSwapper`, `AsyncPartitionedParameterSwapper`, and ZeRO coordinators. They assume `ds_id`, `ds_tensor`, ZeRO partition status, distributed rank state, and ZeRO checkpoint ownership.
+- **Shim-safe: `AsyncPartitionedParameterSwapper`.** The only distributed dependency is `dist.get_rank()` in `__init__` (line 76: `self.rank`) and the swap-folder path (line 87: `rank{rank}`). Both are initialization-time only and have no collective communication. In Stage 4, apply a one-line shim before construction — `deepspeed.comm.get_rank = lambda: 0` inside a local context — and the full parameter swap machinery (swap_in, swap_out, synchronize_reads, synchronize_writes, buffer pool, prefetch) is directly usable. Do not re-implement parameter swap logic from scratch. Verify the shim does not leak across the process by using a context manager that restores the original function on exit.
+- Not safe to reuse directly in local AsymGEMM mode without additional work: `OptimizerSwapper`, `PartitionedOptimizerSwapper`, `PipelinedOptimizerSwapper`, and ZeRO coordinators. They assume `ds_id`, `ds_tensor`, ZeRO partition status, full distributed rank state across `step()` calls, and ZeRO checkpoint ownership — not just init-time rank.
 - `DeepSpeedCPUAdam` is direct-safe only for resident CPU tensors. Do not mutate its internal state tensors into NVMe-backed placeholders. A paged optimizer must either use a separate tiled implementation or a proven resident-tile adapter.
 - DeepSpeed `swap_in_tensors`/`swap_out_tensors` hardcode file offset `0`. Use them for whole-file tensor swaps. For optimizer tiles, call the AIO handle directly with explicit `file_offset` and validate offset reads/writes with DeepSpeed AIO unit tests before Stage 3.
 - `GDSBuilder` is on hold and must not be used in this implementation. Do not add GDS config flags, fallback code paths, tests, or acceptance criteria until the target hardware/storage stack explicitly supports GDS and a separate design is approved.

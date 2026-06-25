@@ -1734,14 +1734,24 @@ def _wrap_callable_once(owner: Any, attr: str, name: str, handle: LFTraceHandle,
     seen.add(key)
 
     def wrapped(*args: Any, **kwargs: Any) -> Any:
-        if handle.memory_breakdown_profiler is not None and name == "lf.optimizer.step":
-            handle.memory_breakdown_profiler.record_phase("before_optimizer_step", model=handle.model, optimizer=owner)
-        with _range(handle, name):
-            try:
-                return original(*args, **kwargs)
-            finally:
-                if handle.memory_breakdown_profiler is not None and name == "lf.optimizer.step":
-                    handle.memory_breakdown_profiler.record_phase("after_optimizer_step", model=handle.model, optimizer=owner)
+        is_optimizer_step = name == "lf.optimizer.step"
+        if is_optimizer_step and getattr(handle, "_asym_lf_in_optimizer_step_range", False):
+            return original(*args, **kwargs)
+        previous_optimizer_step_range = bool(getattr(handle, "_asym_lf_in_optimizer_step_range", False))
+        if is_optimizer_step:
+            setattr(handle, "_asym_lf_in_optimizer_step_range", True)
+        try:
+            if handle.memory_breakdown_profiler is not None and is_optimizer_step:
+                handle.memory_breakdown_profiler.record_phase("before_optimizer_step", model=handle.model, optimizer=owner)
+            with _range(handle, name):
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    if handle.memory_breakdown_profiler is not None and is_optimizer_step:
+                        handle.memory_breakdown_profiler.record_phase("after_optimizer_step", model=handle.model, optimizer=owner)
+        finally:
+            if is_optimizer_step:
+                setattr(handle, "_asym_lf_in_optimizer_step_range", previous_optimizer_step_range)
 
     setattr(wrapped, _PATCH_ATTR, True)
     if getattr(original, "_wrapped_by_lr_sched", False):
