@@ -268,13 +268,19 @@ def main() -> None:
             "-" * group_width(7, 10),
             "-" * w[10],
         ]
+        workload_separator = [
+            *("=" * w[i] for i in range(3)),
+            "=" * group_width(3, 7),
+            "=" * group_width(7, 10),
+            "=" * w[10],
+        ]
         print(f"Model: {model}    LoRA: {lora}")
         print("  ".join(just(i, HEAD[i]) for i in range(len(HEAD))))
         print("  ".join(separator))
         prev_wl = None
         for d in data:
             if prev_wl is not None and d[0] != prev_wl:  # heavier rule between workloads
-                print("  ".join("=" * w[i] for i in range(len(HEAD))))
+                print("  ".join(workload_separator))
             print("  ".join(just(i, d[i]) for i in range(len(HEAD))))
             prev_wl = d[0]
         print()
