@@ -307,4 +307,8 @@ Scheduling Insights:
 - Dynamic scheudling (whats dynamic?)
 - Zero3 needs to load the whole tensor for each transfer why? even if one tensor only needs like a few rows (token embedding)
 - Put big lm head and embed tokens and other big tensors on CPU and put experts on nvme / a pool tier of buffers
+- Layerwise + module wise act/weight offloading. Small pressure => more retainemnt. Large pression => more movement.
+- Finegrained offload + recompute desing to max out throughput given the memory
+
+- Overlay activatino offloading / loading with computes to improve throughput
 

@@ -235,7 +235,6 @@ release(S_down, down_delta, act_stage, B_down_hbm)
 # mathematical values in both modes.
 
 dY = dL/dY_down                                         # [M,H] HBM
-dY_cpu = offload(dY)                                    # [M,H] CPU, for down dS/dB
 
 # ---------------- down backward ----------------
 
@@ -245,10 +244,10 @@ release(dY_if_owned)
 S_down = stage(S_down_cpu)                              # [M,r] HBM
 S_down_g = S_down[offsets[g]:offsets[g+1]]              # [M_g,r] HBM view
 B_down_hbm = stage(B_down)                       # [E,H,r] HBM staged
-dS_down_g = scale * (dY_cpu,g @^L B_down_hbm[e_g])      # [M_g,r] HBM
+dS_down_g = scale * (dY_g @ B_down_hbm[e_g])            # [M_g,r] HBM
 dS_down = pack_g(dS_down_g)                             # [M,r] HBM
-dB_down[e] = scale * sum_{g:e_g=e} dY_cpu,g.T @^L S_down_g  # [H,r] Grad
-release(S_down, dY_cpu, S_down_cpu, B_down_hbm)
+dB_down[e] = scale * sum_{g:e_g=e} dY_g.T @ S_down_g   # [H,r] Grad
+release(S_down, S_down_cpu, B_down_hbm)
 
 A_down_hbm = stage(A_down)                       # [E,r,I] HBM staged
 dact += D_down_bar(pack_g(dS_down_g @ A_down_hbm[e_g])) # consume down dact delta
@@ -268,12 +267,13 @@ dgate_cpu = silu_backward(dact_cpu * up_cpu, gate_cpu)  # [M,I] CPU
 dup_cpu = dact_cpu * silu(gate_cpu)                     # [M,I] CPU
 release(dact_cpu, gate_cpu, up_cpu)
 
+dgate_up = stage_concat(dgate_cpu, dup_cpu)             # [M,2I] HBM
+dgate_stage_g, dup_stage_g = split(dgate_up_g)          # [M_g,I], [M_g,I] HBM views
+
 
 # ---------------- gate/up base backward ----------------
 
-dgate_up = stage_concat(dgate_cpu, dup_cpu)             # [M,2I] HBM
 dX = pack_g(dgate_up_g @^R W_gate_up_cpu[e_g])          # [M,H] HBM live
-release(dgate_up)
 
 
 # ---------------- gate LoRA backward ----------------
@@ -281,9 +281,9 @@ release(dgate_up)
 S_gate = stage(S_gate_cpu)                              # [M,r] HBM
 S_gate_g = S_gate[offsets[g]:offsets[g+1]]              # [M_g,r] HBM view
 B_gate_hbm = stage(B_gate)                       # [E,I,r] HBM staged
-dS_gate_g = scale * (dgate_cpu,g @^L B_gate_hbm[e_g])   # [M_g,r] HBM
+dS_gate_g = scale * (dgate_stage_g @ B_gate_hbm[e_g])   # [M_g,r] HBM
 dS_gate = pack_g(dS_gate_g)                             # [M,r] HBM
-dB_gate[e] = scale * sum_{g:e_g=e} dgate_cpu,g.T @^L S_gate_g  # [I,r] Grad
+dB_gate[e] = scale * sum_{g:e_g=e} dgate_stage_g.T @ S_gate_g  # [I,r] Grad
 release(S_gate, S_gate_cpu, B_gate_hbm)
 
 A_gate_hbm = stage(A_gate)                       # [E,r,H] HBM staged
@@ -292,7 +292,7 @@ release(A_gate_hbm)
 
 X_gate_lora_cpu,g = D_gate(X_cpu,g)                     # [M_g,H] CPU
 dA_gate[e] = sum_{g:e_g=e} dS_gate_g.T @^R X_gate_lora_cpu,g  # [r,H] Grad
-release(dS_gate, dgate_cpu, X_gate_lora_cpu_if_materialized)
+release(dS_gate, X_gate_lora_cpu_if_materialized)
 
 
 # ---------------- up LoRA backward ----------------
@@ -300,9 +300,9 @@ release(dS_gate, dgate_cpu, X_gate_lora_cpu_if_materialized)
 S_up = stage(S_up_cpu)                                  # [M,r] HBM
 S_up_g = S_up[offsets[g]:offsets[g+1]]                  # [M_g,r] HBM view
 B_up_hbm = stage(B_up)                           # [E,I,r] HBM staged
-dS_up_g = scale * (dup_cpu,g @^L B_up_hbm[e_g])         # [M_g,r] HBM
+dS_up_g = scale * (dup_stage_g @ B_up_hbm[e_g])         # [M_g,r] HBM
 dS_up = pack_g(dS_up_g)                                 # [M,r] HBM
-dB_up[e] = scale * sum_{g:e_g=e} dup_cpu,g.T @^L S_up_g  # [I,r] Grad
+dB_up[e] = scale * sum_{g:e_g=e} dup_stage_g.T @ S_up_g  # [I,r] Grad
 release(S_up, S_up_cpu, B_up_hbm)
 
 A_up_hbm = stage(A_up)                           # [E,r,H] HBM staged
@@ -311,7 +311,8 @@ release(A_up_hbm)
 
 X_up_lora_cpu,g = D_up(X_cpu,g)                         # [M_g,H] CPU
 dA_up[e] = sum_{g:e_g=e} dS_up_g.T @^R X_up_lora_cpu,g  # [r,H] Grad
-release(dS_up, dup_cpu, X_up_lora_cpu_if_materialized, X_cpu)
+release(dS_up, X_up_lora_cpu_if_materialized, X_cpu)
+release(dgate_up)
 
 
 # ---------------- final input gradient ----------------

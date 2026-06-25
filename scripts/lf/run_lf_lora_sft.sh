@@ -1186,6 +1186,138 @@ managed_interrupt_exit_status=130
 managed_child_pid=""
 managed_child_pid_file=""
 managed_wait_pid=""
+host_oom_cgroup_kind=""
+host_oom_cgroup_path=""
+host_oom_failcnt_before=""
+host_oom_oom_before=""
+host_oom_oom_kill_before=""
+host_oom_under_oom_before=""
+
+cgroup_memory_dir() {
+  local rel path
+  if [[ -r "/sys/fs/cgroup/memory.events" ]]; then
+    printf '%s\n' "/sys/fs/cgroup"
+    return 0
+  fi
+  rel="$(awk -F: '$2 ~ /(^|,)memory(,|$)/ {print $3; exit}' /proc/self/cgroup 2>/dev/null || true)"
+  if [[ -n "${rel}" ]]; then
+    if [[ "${rel}" == "/" ]]; then
+      path="/sys/fs/cgroup/memory"
+    else
+      path="/sys/fs/cgroup/memory/${rel#/}"
+    fi
+    if [[ -r "${path}/memory.failcnt" || -r "${path}/memory.oom_control" ]]; then
+      printf '%s\n' "${path}"
+      return 0
+    fi
+  fi
+  if [[ -r "/sys/fs/cgroup/memory/memory.failcnt" || -r "/sys/fs/cgroup/memory/memory.oom_control" ]]; then
+    printf '%s\n' "/sys/fs/cgroup/memory"
+    return 0
+  fi
+  return 1
+}
+
+cgroup_kv() {
+  local file="$1" key="$2"
+  awk -v key="${key}" '$1 == key {print $2; found=1; exit} END {if (!found) exit 1}' "${file}" 2>/dev/null || true
+}
+
+cgroup_scalar() {
+  local file="$1"
+  if [[ -r "${file}" ]]; then
+    tr -d '[:space:]' < "${file}" 2>/dev/null || true
+  fi
+}
+
+detect_host_oom_monitor() {
+  host_oom_cgroup_path="$(cgroup_memory_dir || true)"
+  [[ -n "${host_oom_cgroup_path}" ]] || return 0
+  if [[ -r "${host_oom_cgroup_path}/memory.events" ]]; then
+    host_oom_cgroup_kind="v2"
+    host_oom_oom_before="$(cgroup_kv "${host_oom_cgroup_path}/memory.events" oom)"
+    host_oom_oom_kill_before="$(cgroup_kv "${host_oom_cgroup_path}/memory.events" oom_kill)"
+  else
+    host_oom_cgroup_kind="v1"
+    host_oom_failcnt_before="$(cgroup_scalar "${host_oom_cgroup_path}/memory.failcnt")"
+    host_oom_oom_kill_before="$(cgroup_kv "${host_oom_cgroup_path}/memory.oom_control" oom_kill)"
+    host_oom_under_oom_before="$(cgroup_kv "${host_oom_cgroup_path}/memory.oom_control" under_oom)"
+  fi
+}
+
+int_delta() {
+  local before="$1" after="$2"
+  if [[ "${before}" =~ ^[0-9]+$ && "${after}" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$((after - before))"
+  else
+    printf 'NA\n'
+  fi
+}
+
+positive_delta() {
+  [[ "$1" =~ ^-?[0-9]+$ ]] && (( $1 > 0 ))
+}
+
+signal_label_from_status() {
+  local status="$1" sig
+  if [[ "${status}" =~ ^[0-9]+$ && "${status}" -ge 128 ]]; then
+    sig=$((status - 128))
+    printf 'SIG%s\n' "$(kill -l "${sig}" 2>/dev/null || printf '%s' "${sig}")"
+  else
+    printf 'none\n'
+  fi
+}
+
+append_host_oom_diagnostics() {
+  local status="$1"
+  local signal_label evidence=false reason="no cgroup memory kill counter increase observed"
+  local oom_after="" oom_kill_after="" failcnt_after="" under_oom_after=""
+  local oom_delta="NA" oom_kill_delta="NA" failcnt_delta="NA"
+  signal_label="$(signal_label_from_status "${status}")"
+  {
+    printf '===== host memory OOM diagnostics =====\n'
+    printf 'exit_status=%s\n' "${status}"
+    printf 'exit_signal=%s\n' "${signal_label}"
+    if [[ -z "${host_oom_cgroup_path}" ]]; then
+      printf 'cgroup_memory_monitor=unavailable\n'
+      printf 'HOST_OOM_EVIDENCE=false\n'
+      printf 'HOST_OOM_EVIDENCE_REASON=no readable cgroup memory counters\n'
+    else
+      printf 'cgroup_memory_monitor=%s\n' "${host_oom_cgroup_kind}"
+      printf 'cgroup_memory_path=%s\n' "${host_oom_cgroup_path}"
+      if [[ "${host_oom_cgroup_kind}" == "v2" ]]; then
+        oom_after="$(cgroup_kv "${host_oom_cgroup_path}/memory.events" oom)"
+        oom_kill_after="$(cgroup_kv "${host_oom_cgroup_path}/memory.events" oom_kill)"
+        oom_delta="$(int_delta "${host_oom_oom_before}" "${oom_after}")"
+        oom_kill_delta="$(int_delta "${host_oom_oom_kill_before}" "${oom_kill_after}")"
+        printf 'memory.events.oom.before=%s after=%s delta=%s\n' "${host_oom_oom_before:-NA}" "${oom_after:-NA}" "${oom_delta}"
+        printf 'memory.events.oom_kill.before=%s after=%s delta=%s\n' "${host_oom_oom_kill_before:-NA}" "${oom_kill_after:-NA}" "${oom_kill_delta}"
+        if positive_delta "${oom_kill_delta}"; then
+          evidence=true
+          reason="cgroup v2 memory.events oom_kill increased during run"
+        fi
+      else
+        failcnt_after="$(cgroup_scalar "${host_oom_cgroup_path}/memory.failcnt")"
+        oom_kill_after="$(cgroup_kv "${host_oom_cgroup_path}/memory.oom_control" oom_kill)"
+        under_oom_after="$(cgroup_kv "${host_oom_cgroup_path}/memory.oom_control" under_oom)"
+        failcnt_delta="$(int_delta "${host_oom_failcnt_before}" "${failcnt_after}")"
+        oom_kill_delta="$(int_delta "${host_oom_oom_kill_before}" "${oom_kill_after}")"
+        printf 'memory.failcnt.before=%s after=%s delta=%s\n' "${host_oom_failcnt_before:-NA}" "${failcnt_after:-NA}" "${failcnt_delta}"
+        printf 'memory.oom_control.oom_kill.before=%s after=%s delta=%s\n' "${host_oom_oom_kill_before:-NA}" "${oom_kill_after:-NA}" "${oom_kill_delta}"
+        printf 'memory.oom_control.under_oom.before=%s after=%s\n' "${host_oom_under_oom_before:-NA}" "${under_oom_after:-NA}"
+        if positive_delta "${oom_kill_delta}"; then
+          evidence=true
+          reason="cgroup v1 memory.oom_control oom_kill increased during run"
+        fi
+      fi
+      printf 'HOST_OOM_EVIDENCE=%s\n' "${evidence}"
+      printf 'HOST_OOM_EVIDENCE_REASON=%s\n' "${reason}"
+    fi
+    printf '===== end host memory OOM diagnostics =====\n'
+  } | tee -a "${LOG_FILE}" >/dev/null
+}
+
+detect_host_oom_monitor
 
 managed_process_alive() {
   local target_pid
@@ -2210,6 +2342,7 @@ if [[ "${TRAIN_STATUS}" != "0" ]]; then
   if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" != "source" ]]; then
     postprocess_source_profile_if_available || true
   fi
+  append_host_oom_diagnostics "${TRAIN_STATUS}"
   echo "Training command failed with status ${TRAIN_STATUS}" | tee -a "${LOG_FILE}"
   exit "${TRAIN_STATUS}"
 fi

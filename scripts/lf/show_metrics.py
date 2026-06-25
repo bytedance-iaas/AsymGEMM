@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Show LF source-profile timing + memory metrics as one table per model.
+"""Show LF source-profile timing + memory metrics as one table per model/LoRA config.
 
 Same layout as show_status.py, but each row reports the measured numbers:
-    Model | Workload | Backend | Config |
+    Workload | Backend | Config |
     fwd_s | bwd_s | opt_s | step_s |          # seconds
     fwd_H | bwd_H | step_H |                   # GPU HBM peak GiB
     RAM                                        # host RSS peak GiB (whole step)
@@ -16,7 +16,8 @@ non-warmup rows.
 
 The Config column carries a compact "[lg± sd±]" tag for liger-loss / sdpa-recompute
 usage (+ on, - off). Numbers are printed as x.x (1 decimal) to keep the table narrow.
-Configs that did not produce a profile (OOM / failed / not run) show a status marker.
+Configs that did not produce a profile (OOM / failed / not run) show a status marker
+in the first timing column.
 
 Usage:
     show_metrics.py [PROFILING_DIR]      # default profiling_both
@@ -120,6 +121,19 @@ def read_metrics(leaf: Path) -> dict | None:
     }
 
 
+def _dropout_label_to_value(label: str) -> str:
+    if re.fullmatch(r"drop[0-9]{3}", label):
+        return f"0.{label[-2:]}"
+    return label.removeprefix("drop")
+
+
+def lora_label(config_root_name: str) -> str:
+    match = re.search(r"(?:^|_)r(?P<rank>\d+)_a(?P<alpha>\d+)_(?P<drop>drop[0-9A-Za-z.]+)(?:_|$)", config_root_name)
+    if not match:
+        return "unknown"
+    return f"r{match.group('rank')}/a{match.group('alpha')}/d{_dropout_label_to_value(match.group('drop'))}"
+
+
 def collect_leaves(root: Path) -> dict:
     """Return {logical_key: leaf_path} for the run with the most max_steps (ties: newest)."""
     runs: dict[tuple, dict] = {}
@@ -129,6 +143,7 @@ def collect_leaves(root: Path) -> dict:
             m = re.search(r"b(\d+)_s(\d+)_ga(\d+)", cr.name)
             if not model or not m:
                 continue
+            lora = lora_label(cr.name)
             batch, seq, ga = int(m.group(1)), int(m.group(2)), int(m.group(3))
             ws = re.search(r"_w\d+_s(\d+)", cr.name)
             steps = int(ws.group(1)) if ws else 0
@@ -156,7 +171,7 @@ def collect_leaves(root: Path) -> dict:
                 has = sp.exists()
                 anchor = sp if has else (leaf / "train.log")
                 mtime = anchor.stat().st_mtime if anchor.exists() else 0.0
-                lkey = (model, seq, batch, ga, f"{toks[0]} ({toks[2]})", config)
+                lkey = (model, lora, seq, batch, ga, f"{toks[0]} ({toks[2]})", config)
                 run = runs.get((lkey, cr.name))
                 if run is None:
                     runs[(lkey, cr.name)] = {"lkey": lkey, "steps": steps, "has": has, "mtime": mtime, "leaf": leaf}
@@ -173,7 +188,7 @@ def collect_leaves(root: Path) -> dict:
     return out
 
 
-HEAD = ["Model", "Workload", "Backend", "Config",
+HEAD = ["Workload", "Backend", "Config",
         "fwd_s", "bwd_s", "opt_s", "step_s",
         "fwd_H", "bwd_H", "step_H", "RAM"]
 NUM_KEYS = ["fwd_s", "bwd_s", "opt_s", "step_s", "fwd_g", "bwd_g", "step_g", "ram_g"]
@@ -189,6 +204,16 @@ MARKER = {  # shown (in the first metric column) for configs with no metrics
     "OOM (GPU)": "🔴", "OOM (host RAM)": "🟠", "FAILED (non-OOM)": "⚠️",
     "RUNNING": "🔵", "INCOMPLETE": "·", "NOT RUN": "—",
 }
+
+
+def status_marker(status: str) -> str:
+    if status.startswith("SIGTERM"):
+        return "TERM"
+    if status.startswith("SIGKILL"):
+        return "KILL"
+    if status.startswith("SIG"):
+        return "SIG"
+    return MARKER.get(status, "—")
 
 
 def fmt(v) -> str:
@@ -211,45 +236,47 @@ def main() -> None:
         print(f"No runs found under {root}")
         return
 
-    by_model: dict[str, list] = {}
-    for (model, seq, batch, ga, be, config), leaf in leaves.items():
+    by_group: dict[tuple[str, str], list] = {}
+    for (model, lora, seq, batch, ga, be, config), leaf in leaves.items():
         metrics = read_metrics(leaf) if leaf is not None else None
         wl = f"s{seq}·b{batch}" + (f"·ga{ga}" if ga != 1 else "")
         if metrics is not None:
             nums = [fmt(metrics.get(k)) for k in NUM_KEYS]
         else:
             status = S.classify(leaf)[0] if leaf is not None else "NOT RUN"
-            nums = [MARKER.get(status, "—")] + [""] * (len(NUM_KEYS) - 1)
-        cells = [model, wl, be, config] + nums
-        by_model.setdefault(model, []).append((seq, batch, be, config, cells))
+            nums = [status_marker(status)] + [""] * (len(NUM_KEYS) - 1)
+        cells = [wl, be, config] + nums
+        by_group.setdefault((model, lora), []).append((seq, batch, be, config, cells))
 
     print(f"Profiling metrics: {root}")
-    print("Legend: 🔴 OOM (GPU)   🟠 OOM (host RAM)   ⚠️ failed   🔵 running   — not run")
+    print("Legend: 🔴 GPU OOM   🟠 explicit host OOM   TERM SIGTERM/143   KILL SIGKILL/137"
+          "   ⚠️ failed   🔵 running   — not run")
     print("Cols: _s seconds, avg over non-warmup raw steps excluding first/final measured steps"
           " (opt_s falls back to source-stage mean for older profiles without raw optimizer rows)"
           " | _H GPU HBM peak GiB | RAM host RSS peak GiB (whole step)"
           " | Config [lg± sd±] = liger / sdpa-recompute on(+)/off(-)\n")
-    for model in sorted(by_model):
+    for model, lora in sorted(by_group):
         # Rank on the base config label (strip the trailing "  [lg± sd±]" usage tag).
-        recs = sorted(by_model[model], key=lambda r: (r[0], r[1], r[2], CFG_RANK.get(r[3].split("  [")[0], 99), r[3]))
+        recs = sorted(by_group[(model, lora)], key=lambda r: (r[0], r[1], r[2], CFG_RANK.get(r[3].split("  [")[0], 99), r[3]))
         data = [r[4] for r in recs]
         w = [max(len(HEAD[i]), max((len(d[i]) for d in data), default=0)) for i in range(len(HEAD))]
-        just = lambda i, s: s.ljust(w[i]) if i < 4 else s.rjust(w[i])  # text left, numbers right
+        just = lambda i, s: s.ljust(w[i]) if i < 3 else s.rjust(w[i])  # text left, numbers right
         group_width = lambda start, end: sum(w[start:end]) + 2 * max(0, end - start - 1)
         separator = [
-            *("-" * w[i] for i in range(4)),
-            "-" * group_width(4, 8),
-            "-" * group_width(8, 11),
-            "-" * w[11],
+            *("-" * w[i] for i in range(3)),
+            "-" * group_width(3, 7),
+            "-" * group_width(7, 10),
+            "-" * w[10],
         ]
+        print(f"Model: {model}    LoRA: {lora}")
         print("  ".join(just(i, HEAD[i]) for i in range(len(HEAD))))
         print("  ".join(separator))
         prev_wl = None
         for d in data:
-            if prev_wl is not None and d[1] != prev_wl:  # heavier rule between workloads
+            if prev_wl is not None and d[0] != prev_wl:  # heavier rule between workloads
                 print("  ".join("=" * w[i] for i in range(len(HEAD))))
             print("  ".join(just(i, d[i]) for i in range(len(HEAD))))
-            prev_wl = d[1]
+            prev_wl = d[0]
         print()
 
 

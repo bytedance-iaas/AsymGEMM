@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -25,6 +26,12 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 SKIP_DIRS = {"combined", "memory_combined", "c2c_combined"}
 OOM_GPU_MARKERS = ("CUDA out of memory", "OutOfMemoryError")
+OOM_HOST_MARKERS = (
+    "HOST_OOM_EVIDENCE=true",
+    "Out of memory: Killed process",
+    "Memory cgroup out of memory",
+    "cgroup out of memory",
+)
 
 # Higher wins when the same logical config has several dirs (nsys/source, stale roots).
 PRIORITY = {
@@ -67,6 +74,42 @@ def _tok(tokens: list[str], prefix: str, default: str = "") -> str:
     return default
 
 
+def priority(status: str) -> int:
+    if status.startswith("SIG"):
+        return 3
+    return PRIORITY.get(status, 0)
+
+
+def _failure_codes(text: str) -> list[int]:
+    codes: list[int] = []
+    for pattern in (
+        r"Training command failed with status\s+(-?\d+)",
+        r"failed with status\s+(-?\d+)",
+        r"exitcode\s*[:=]\s*(-?\d+)",
+    ):
+        for match in re.findall(pattern, text):
+            try:
+                codes.append(int(match))
+            except ValueError:
+                pass
+    return codes
+
+
+def _signal_status(code: int) -> str | None:
+    sig = None
+    if code >= 128:
+        sig = code - 128
+    elif code < 0:
+        sig = -code
+    if sig is None:
+        return None
+    try:
+        name = signal.Signals(sig).name
+    except ValueError:
+        name = f"SIG{sig}"
+    return f"{name}/{code}"
+
+
 def classify(leaf: Path | None) -> tuple[str, float]:
     if leaf is None:
         return "NOT RUN", 0.0
@@ -86,8 +129,12 @@ def classify(leaf: Path | None) -> tuple[str, float]:
         text = ""
     if any(m in text for m in OOM_GPU_MARKERS):
         return "OOM (GPU)", mtime
-    if "status 137" in text:
+    if any(m in text for m in OOM_HOST_MARKERS):
         return "OOM (host RAM)", mtime
+    for code in reversed(_failure_codes(text)):
+        signal_status = _signal_status(code)
+        if signal_status is not None:
+            return signal_status, mtime
     if any(m in text for m in ("Training command failed", "Traceback", "ChildFailedError", "failed with status")):
         return "FAILED (non-OOM)", mtime
     if time.time() - mtime < 600:
@@ -126,7 +173,7 @@ def collect(root: Path) -> dict:
                 leaf = next((p for p in rd.iterdir() if p.is_dir() and p.name.startswith("b")), None)
                 status, mtime = classify(leaf)
                 lkey = (model, seq, batch, ga, f"{backend} ({recompute})", config)
-                rank = (status == "OK", PRIORITY.get(status, 0))
+                rank = (status == "OK", priority(status))
                 run = runs.get((lkey, cr.name))
                 if run is None:
                     runs[(lkey, cr.name)] = {"lkey": lkey, "rank": rank, "status": status, "mtime": mtime, "steps": steps}
@@ -141,7 +188,7 @@ def collect(root: Path) -> dict:
         cur = (run["steps"], run["mtime"])
         if lk not in pick or cur > pick[lk]:
             pick[lk] = cur
-            rows[lk] = [PRIORITY.get(run["status"], 0), run["mtime"], run["status"]]
+            rows[lk] = [priority(run["status"]), run["mtime"], run["status"]]
     return rows
 
 
