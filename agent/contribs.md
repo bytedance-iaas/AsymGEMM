@@ -318,3 +318,6 @@ TODO
 - Single CPU based context paralleim for million tokens
 
 - activation swapping within the layer?
+- add in nvme offloading
+- do we have to store all layer input residuals? why canrt we keep rolling one and take the outoptu fo rthe next..
+

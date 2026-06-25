@@ -7,12 +7,12 @@ Same layout as show_status.py, but each row reports the measured numbers:
     fwd_H | bwd_H | step_H |                   # GPU HBM peak GiB
     RAM                                        # host RSS peak GiB (whole step)
 
-Timing columns are explicit per-step averages from source-profile raw step
-samples when the needed raw field exists. Warmup rows are identified by
-row["is_warmup"]. The first and final measured rows are dropped when at least
-three measured rows remain. Older profiles without raw optimizer rows fall back
-to the source-stage optimizer mean. Peak-memory columns still use max over
-non-warmup rows.
+Timing columns are explicit per-step averages from source_profile.json
+step_samples.rows. Warmup rows are identified only by boolean row["is_warmup"].
+The first and final measured rows are dropped when at least three measured rows
+remain. step_s is always computed as fwd_s + bwd_s + opt_s from those same
+averages. The script does not fall back to alternate fields; completed profiles
+missing required raw fields are treated as malformed and abort the report.
 
 The Config column carries a compact "[lg± sd±]" tag for liger-loss / sdpa-recompute
 usage (+ on, - off). Numbers are printed as x.x (1 decimal) to keep the table narrow.
@@ -36,42 +36,35 @@ import show_status as S  # noqa: E402  (shared parsing: config_label, _tok, REPO
 GIB = 1024 ** 3
 
 
-def _as_bool(value) -> bool | None:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        lower = value.strip().lower()
-        if lower in {"1", "true", "yes", "y"}:
-            return True
-        if lower in {"0", "false", "no", "n"}:
-            return False
-    return None
+class MetricError(RuntimeError):
+    pass
+
+
+def _require(condition: bool, leaf: Path, message: str) -> None:
+    if not condition:
+        raise MetricError(f"{leaf}: {message}")
 
 
 def _load_step_samples(leaf: Path, sp: dict) -> list:
-    ssf = leaf / "step_samples.json"
-    if ssf.exists():
-        try:
-            d = json.loads(ssf.read_text())
-            if isinstance(d, dict):
-                return d.get("rows", [])
-            if isinstance(d, list):
-                return d
-        except Exception:
-            pass
-    ss = sp.get("step_samples")
-    if isinstance(ss, dict):
-        return ss.get("rows", [])
-    return ss if isinstance(ss, list) else []
+    step_samples = sp.get("step_samples")
+    _require(isinstance(step_samples, dict), leaf, "source_profile.json missing object step_samples")
+    rows = step_samples.get("rows")
+    _require(isinstance(rows, list), leaf, "source_profile.json missing list step_samples.rows")
+    _require(bool(rows), leaf, "source_profile.json step_samples.rows is empty")
+    for index, row in enumerate(rows):
+        _require(isinstance(row, dict), leaf, f"step_samples.rows[{index}] is not an object")
+        _require(isinstance(row.get("is_warmup"), bool), leaf, f"step_samples.rows[{index}].is_warmup is not boolean")
+    return rows
 
 
-def _measured_samples(samples: list) -> list:
-    rows = [r for r in samples if isinstance(r, dict) and _as_bool(r.get("is_warmup")) is False]
-    return rows or samples
+def _measured_samples(samples: list, leaf: Path) -> list:
+    rows = [r for r in samples if r["is_warmup"] is False]
+    _require(bool(rows), leaf, "step_samples.rows has no non-warmup rows")
+    return rows
 
 
-def _timing_average_samples(samples: list) -> list:
-    rows = _measured_samples(samples)
+def _timing_average_samples(samples: list, leaf: Path) -> list:
+    rows = _measured_samples(samples, leaf)
     return rows[1:-1] if len(rows) > 2 else rows
 
 
@@ -81,30 +74,32 @@ def read_metrics(leaf: Path) -> dict | None:
         return None
     try:
         sp = json.loads(sp_path.read_text())
-    except Exception:
-        return None
-    step_rows = {r.get("name"): r.get("milliseconds") for r in (sp.get("step") or {}).get("rows", [])}
+    except Exception as exc:
+        raise MetricError(f"{leaf}: failed to parse source_profile.json: {exc}") from exc
+    _require(isinstance(sp, dict), leaf, "source_profile.json root is not an object")
     samples = _load_step_samples(leaf, sp)
-    timing_samples = _timing_average_samples(samples)
-    peak_samples = _measured_samples(samples)
+    timing_samples = _timing_average_samples(samples, leaf)
+    peak_samples = _measured_samples(samples, leaf)
+
+    def values(rows, key):
+        vals = []
+        for index, row in enumerate(rows):
+            value = row.get(key)
+            _require(isinstance(value, (int, float)), leaf, f"required numeric field {key!r} missing from selected row {index}")
+            vals.append(value)
+        return vals
 
     def mean(rows, key):
-        vals = [r[key] for r in rows if isinstance(r.get(key), (int, float))]
-        return sum(vals) / len(vals) if vals else None
+        vals = values(rows, key)
+        return sum(vals) / len(vals)
 
     def mx(rows, key):
-        vals = [r[key] for r in rows if isinstance(r.get(key), (int, float))]
-        return max(vals) if vals else None
+        return max(values(rows, key))
 
-    fwd_ms = mean(timing_samples, "forward_milliseconds") or (sp.get("forward") or {}).get("total_milliseconds")
-    bwd_ms = mean(timing_samples, "backward_milliseconds") or (sp.get("backward") or {}).get("total_milliseconds")
-    opt_ms = (
-        mean(timing_samples, "optimizer_milliseconds")
-        or mean(timing_samples, "heartbeat_optimizer_step_milliseconds")
-        or mean(timing_samples, "optimizer_step_milliseconds")
-        or step_rows.get("lf.optimizer.step")
-    )
-    step_ms = mean(timing_samples, "step_milliseconds") or step_rows.get("lf.step.total")
+    fwd_ms = mean(timing_samples, "forward_milliseconds")
+    bwd_ms = mean(timing_samples, "backward_milliseconds")
+    opt_ms = mean(timing_samples, "optimizer_milliseconds")
+    step_ms = fwd_ms + bwd_ms + opt_ms
     sec = lambda ms: None if ms is None else ms / 1000.0
     gib = lambda b: None if b is None else b / GIB
     return {
@@ -112,12 +107,7 @@ def read_metrics(leaf: Path) -> dict | None:
         "fwd_g": gib(mx(peak_samples, "forward_peak_allocated_bytes")),
         "bwd_g": gib(mx(peak_samples, "backward_peak_allocated_bytes")),
         "step_g": gib(mx(peak_samples, "peak_allocated_hbm_bytes")),
-        # Host RAM high-water mark for the whole step (process RSS). RSS is monotonic
-        # across stages, so one step-level peak captures it; per-stage peaks would be
-        # near-identical. Falls back to the per-stage backward peak for older profiles.
-        "ram_g": gib(mx(peak_samples, "process_rss_peak_bytes")
-                     or mx(peak_samples, "training_step_process_rss_peak_end_bytes")
-                     or mx(peak_samples, "backward_process_rss_peak_end_bytes")),
+        "ram_g": gib(mx(peak_samples, "process_rss_peak_bytes")),
     }
 
 
@@ -130,7 +120,7 @@ def _dropout_label_to_value(label: str) -> str:
 def lora_label(config_root_name: str) -> str:
     match = re.search(r"(?:^|_)r(?P<rank>\d+)_a(?P<alpha>\d+)_(?P<drop>drop[0-9A-Za-z.]+)(?:_|$)", config_root_name)
     if not match:
-        return "unknown"
+        raise MetricError(f"{config_root_name}: cannot parse LoRA params from config-root name")
     return f"r{match.group('rank')}/a{match.group('alpha')}/d{_dropout_label_to_value(match.group('drop'))}"
 
 
@@ -252,7 +242,8 @@ def main() -> None:
     print("Legend: 🔴 GPU OOM   🟠 explicit host OOM   TERM SIGTERM/143   KILL SIGKILL/137"
           "   ⚠️ failed   🔵 running   — not run")
     print("Cols: _s seconds, avg over non-warmup raw steps excluding first/final measured steps"
-          " (opt_s falls back to source-stage mean for older profiles without raw optimizer rows)"
+          " (strict fields: forward_milliseconds, backward_milliseconds, optimizer_milliseconds;"
+          " step_s = fwd_s + bwd_s + opt_s)"
           " | _H GPU HBM peak GiB | RAM host RSS peak GiB (whole step)"
           " | Config [lg± sd±] = liger / sdpa-recompute on(+)/off(-)\n")
     for model, lora in sorted(by_group):
@@ -287,4 +278,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except MetricError as exc:
+        sys.exit(f"show_metrics: {exc}")
