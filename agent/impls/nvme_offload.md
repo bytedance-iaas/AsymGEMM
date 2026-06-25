@@ -118,7 +118,7 @@ Fix (recommended, low-risk): on the **cache** path, copy the read-out into a pla
 
 ### D. Keep deferred (correct as written)
 
-- **Stage 4 base-weight NVMe:** base weights are hot ⇒ re-reading the whole base model per step is catastrophic unless the CPU cache holds the working set — and if it does, NVMe adds little. Keep optional/deferred.
+- **Stage 4 base-weight NVMe:** base weights are hot ⇒ blocking NVMe reads per layer are catastrophic without trace prefetch + CPU cache. Stage 4 is required but must pass the `wait_read_ms / forward_ms < 0.5` gate; if the cache is undersized for the working set, raise `ASYM_NVME_CPU_CACHE_BYTES` first. Use `AsyncPartitionedParameterSwapper` with rank shim — do not re-implement parameter swap. Pipeline deferred flag still deferred: pipelining Stage 4 reads with forward kernels is a follow-on optimization, not a gate for Stage 4 acceptance.
 - **Stage 5 DeepSpeed adapter, gradient/activation NVMe:** keep deferred.
 - The `begin_optimizer_refresh` depth counter is harmless (minor over-engineering); leave it.
 
@@ -206,13 +206,14 @@ DeepSpeed compatibility rules:
 DeepSpeed pieces not to reuse directly in local mode:
 
 ```text
-ZeRO parameter coordinator
-AsyncPartitionedParameterSwapper as-is
-PartitionedOptimizerSwapper as-is
+ZeRO parameter coordinator          (requires full ZeRO partition/comm state at every step)
+AsyncPartitionedParameterSwapper    (usable with rank shim at init-time only — see "shim-safe" above)
+PartitionedOptimizerSwapper as-is   (dist.get_rank() called inside step(), not just init)
+PipelinedOptimizerSwapper as-is     (same — step-time dist dependency)
 ZeRO optimizer/checkpoint ownership
 ```
 
-Those high-level classes assume `ds_tensor`, `ds_id`, distributed partition state, all-gather, ZeRO release state, and ZeRO checkpoint ownership. Local AsymGEMM must not mix those owners with its current LoRA `.data` placeholder swapping and `AsymCPUAdamW` CPU-master ownership.
+`PartitionedOptimizerSwapper` and `PipelinedOptimizerSwapper` differ from `AsyncPartitionedParameterSwapper` in that they call `dist.get_rank()` inside `swap_in_optimizer_state` and `swap_out_optimizer_state` (not just at init), so patching only `__init__` is not sufficient. The Stage 3 tiled Adam is the correct approach for optimizer state, not a shim over these classes. ZeRO coordinator classes assume `ds_tensor`, `ds_id`, distributed partition state, all-gather, ZeRO release state, and ZeRO checkpoint ownership; local AsymGEMM must not mix those owners with its current LoRA `.data` placeholder swapping and `AsymCPUAdamW` CPU-master ownership.
 
 ## Acceptance Gate
 
@@ -2267,84 +2268,137 @@ Risks to watch:
 - Offset AIO support must be verified. If the local DeepSpeed AIO build lacks efficient offset reads/writes, whole-file state rewrites are unacceptable.
 - Gradient paging during backward is intentionally not in this stage; writing tiny grad chunks from hooks would be too latency sensitive.
 
-## Stage 4: Optional Frozen/Base Parameter NVMe
+## Stage 4: Frozen/Base Parameter NVMe
 
-Purpose: reduce host memory from frozen/base parameters after LoRA adapter homes and optimizer state have already been handled. This is optional because base weights are hot. A blocked NVMe read per layer can erase the memory benefit, so this stage is accepted only if trace prefetch and CPU cache keep wait time low.
+Purpose: reduce host memory from frozen/base parameters after LoRA adapter homes and optimizer state have already been handled. This is a required stage. DeepSpeed already has production-grade machinery for exactly this role in `AsyncPartitionedParameterSwapper` (`runtime/swap_tensor/partitioned_param_swapper.py:37`); Stage 4 reuses it directly via a single-GPU rank shim rather than re-implementing parameter swapping. The chief risk is forward-pass blocking on NVMe reads, which trace prefetch and a bounded CPU cache must keep below the 5% latency gate — the same gate applied to Stages 2 and 3.
 
-Files for optional local base-weight NVMe:
+Files for base-weight NVMe:
 
-- `asym_gemm/training/frozen_linear.py`
-- `asym_gemm/training/offload.py`
-- `asym_gemm/training/host_weight.py` if present or added
-- model wrappers that request frozen/base weights
-- `asym_gemm/training/placement.py` for the existing `TensorRef`/`PlacementBackend` API
-- `asym_gemm/training/disk_offload.py` for the local backend implementation
+- `asym_gemm/training/base_weight_nvme.py`
+  - `LocalRankShim` context manager
+  - `AsymBaseWeightNVMeCoordinator` (thin wrapper around `AsyncPartitionedParameterSwapper`)
+- model wrappers / forward hooks that request frozen/base weights
+- `asym_gemm/training/placement.py` — existing `TensorRef`/`PlacementBackend` API unchanged
 - add tests:
   - `tests/training/test_base_weight_nvme_offload.py`
 
 No Stage 0B profile/postprocess refactor is expected here; add base-weight role metrics through `asym_nvme_summary()`.
 
-Code changes for optional local base weights:
+Code changes:
 
-1. Register frozen/base tensors as large refs, preferably per layer or packed module block. Do not create per-row or per-expert disk files.
+1. Rank shim. `AsyncPartitionedParameterSwapper.__init__` calls `dist.get_rank()` only at lines 76 and 87 (for `self.rank` and the swap-folder path). There are no collective ops inside swap_in/swap_out/synchronize. Shim it with a context manager that patches and restores:
 
 ```python
-@dataclass
-class FrozenWeightRef:
-    name: str
-    ref: TensorRef
-    shape: tuple[int, ...]
-    dtype: torch.dtype
-    view_offset: int = 0
-    view_numel: int | None = None
+# asym_gemm/training/base_weight_nvme.py
+import contextlib, types
+import deepspeed.comm as _ds_comm
 
-def register_frozen_weight(name, tensor):
-    ref = backend.register_tensor_ref(
-        stable_id=f"base_weight/{name}",
-        role="base_weight",
-        tensor=tensor.detach().contiguous(),
-        mutable=False,
-    )
-    replace_param_with_lightweight_placeholder(name)
-    return FrozenWeightRef(name=name, ref=ref, shape=tuple(tensor.shape), dtype=tensor.dtype)
+@contextlib.contextmanager
+def _local_rank_zero_shim():
+    """Temporarily override deepspeed.comm.get_rank() → 0 for single-GPU use."""
+    original = getattr(_ds_comm, "get_rank", None)
+    _ds_comm.get_rank = lambda **_: 0
+    try:
+        yield
+    finally:
+        if original is None:
+            del _ds_comm.get_rank
+        else:
+            _ds_comm.get_rank = original
 ```
 
-2. Add a base-weight coordinator with the same execution-order idea used for LoRA weights:
+2. Thin coordinator wrapping `AsyncPartitionedParameterSwapper`. Use DeepSpeed's existing buffer pool, swap_in, swap_out, synchronize_reads, synchronize_writes, and swap_into_buffer as-is. Do not re-implement any of this logic.
 
 ```python
-class BaseWeightOffloadCoordinator:
-    def __init__(self, backend, cpu_cache_bytes, prefetch_depth):
-        self.backend = backend
-        self._trace_build = []
-        self._trace = []
+from deepspeed.runtime.swap_tensor.partitioned_param_swapper import AsyncPartitionedParameterSwapper
+from deepspeed.runtime.zero.offload_config import DeepSpeedZeroOffloadParamConfig
+
+class AsymBaseWeightNVMeCoordinator:
+    def __init__(self, *, nvme_path, buffer_count, buffer_size, max_in_cpu, pin_memory, prefetch_depth, aio_config):
+        param_config = DeepSpeedZeroOffloadParamConfig(
+            device="nvme",
+            nvme_path=nvme_path,
+            buffer_count=buffer_count,
+            buffer_size=buffer_size,   # elements per swap buffer
+            max_in_cpu=max_in_cpu,
+            pin_memory=pin_memory,
+        )
+        with _local_rank_zero_shim():
+            self._swapper = AsyncPartitionedParameterSwapper(param_config, model_dtype=torch.bfloat16)
+        self._prefetch_depth = prefetch_depth
+        self._registered: dict[str, object] = {}     # param_name → ds_param proxy
+        self._trace_build: list[str] = []
+        self._trace: list[str] = []
         self._trace_frozen = False
         self._trace_cursor = 0
-        self._prefetch_depth = prefetch_depth
 
-    def materialize_for_layer(self, weight_ref, *, target_device):
-        self._record_access(weight_ref.ref.stable_id)
-        self._prefetch_next()
-        materialized = self.backend.materialize(
-            weight_ref.ref,
-            target_device=target_device,
-            target_layout="contiguous",
-        )
-        return materialized.tensor.view(weight_ref.shape)
+    def register_frozen_weight(self, name: str, param: torch.nn.Parameter) -> None:
+        """Write param to NVMe and replace .data with a 0-element placeholder."""
+        proxy = _make_ds_param_proxy(name, param)    # assigns a stable ds_id, writes file
+        with _local_rank_zero_shim():
+            self._swapper.reserve_partitioned_swap_space([proxy])
+            self._swapper.swap_out_and_release([proxy])
+        param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+        self._registered[name] = proxy
 
-    def finish_layer(self, weight_ref):
-        self.backend.release_cached_if_over_budget(weight_ref.ref, role="base_weight")
+    def gather_for_layer(self, name: str, param: torch.nn.Parameter) -> None:
+        """Blocking gather: read weight from NVMe/CPU-cache into param.data (CPU-pinned)."""
+        proxy = self._registered[name]
+        self._record_trace(name)
+        self._issue_prefetch()
+        with _local_rank_zero_shim():
+            self._swapper.swap_in([proxy], async_op=False)
+            self._swapper.synchronize_reads()
+        param.data = proxy.data   # now holds the full weight
+
+    def release_layer(self, name: str, param: torch.nn.Parameter) -> None:
+        """Return weight to NVMe/CPU-cache and clear param.data."""
+        proxy = self._registered[name]
+        with _local_rank_zero_shim():
+            self._swapper.swap_out_and_release([proxy])
+            self._swapper.synchronize_writes()
+        param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+
+    def _issue_prefetch(self) -> None:
+        if not self._trace or self._prefetch_depth <= 0:
+            return
+        n = len(self._trace)
+        issued = 0
+        for delta in range(1, n + 1):
+            if issued >= self._prefetch_depth:
+                break
+            name = self._trace[(self._trace_cursor + delta) % n]
+            proxy = self._registered.get(name)
+            if proxy is None or getattr(proxy, "_nvme_swapper_inflight", False):
+                continue
+            with _local_rank_zero_shim():
+                self._swapper.swap_in([proxy], async_op=True)
+            proxy._nvme_swapper_inflight = True
+            issued += 1
 ```
 
-3. Keep compute layout explicit at the call site:
+`_make_ds_param_proxy` assigns a monotone `ds_id`, sets `param.ds_numel`, `param.ds_shape`, `param.ds_dtype`, and `param.nvme_swapper = self._swapper` — the minimal fields `AsyncPartitionedParameterSwapper` reads. Do not construct a full ZeRO `ds_tensor`; these fields are the only ones touched by `swap_in`/`swap_out`/`synchronize_*`. Verify against `partitioned_param_swapper.py:291-349` before finalizing.
+
+3. Forward hook pattern (same as Stage 2 gather/release for LoRA, applied to frozen layers):
 
 ```python
-def materialize_base_weight_for_gemm(weight_ref, *, compute_device):
-    target = "cuda" if compute_device.type == "cuda" else "cpu_pinned"
-    # Kernels still receive a real tensor in the required layout.
-    return base_weight_coordinator.materialize_for_layer(weight_ref, target_device=target)
+def install_base_weight_nvme_hooks(model, coordinator):
+    for name, module in model.named_modules():
+        if _is_frozen_linear(module):
+            weight_name = f"{name}.weight"
+            module.register_forward_pre_hook(
+                lambda m, inp, _n=weight_name, _p=module.weight:
+                    coordinator.gather_for_layer(_n, _p)
+            )
+            module.register_forward_hook(
+                lambda m, inp, out, _n=weight_name, _p=module.weight:
+                    coordinator.release_layer(_n, _p)
+            )
 ```
 
-Do not use base-weight NVMe for hot weights unless the CPU cache hit rate is high enough. The accepted path must be large-block reads, bounded resident CPU cache, trace prefetch, and explicit release after the layer/group no longer needs the weight.
+Keep compute layout explicit: `gather_for_layer` delivers a CPU-pinned contiguous weight; the existing AsymGEMM kernel or the model's linear layer handles H2D staging from there. Do not add a CUDA staging path inside the coordinator.
+
+4. Trace sealing: record layer access names during the first forward pass (while `_trace_frozen=False`). After the first full step, freeze the trace and switch `gather_for_layer` to prefetch-driven mode. Mirror the Stage 2 `seal_step_trace_if_needed` / `_trace_disabled` pattern identically.
 
 Validation before Stage 5:
 
@@ -2402,17 +2456,20 @@ Acceptance:
 
 - Required artifacts exist: `source_profile.json`, `lat.md`, `memory.md`, `step_samples.csv`, `step_samples.json`, `asym_nvme.csv`, and memory-breakdown artifacts.
 - `source_profile.json.config.asym_nvme_enable=true`, `asym_nvme.roles` contains `base_weight`, and `asym_nvme.stats_by_role.base_weight` exists.
-- Host memory decreases meaningfully.
-- HBM does not regress.
-- E2E timing and `step_samples` forward/backward timing regression are each <= 5% for default use, <= 10% only for explicit capacity mode.
-- Cache hit/miss and NVMe wait stats prove this is not a blocking read on every hot layer; blocking read wait time must not dominate forward time.
+- `AsyncPartitionedParameterSwapper` constructed successfully with rank shim; `_local_rank_zero_shim` restored original `deepspeed.comm.get_rank` after construction (verified by unit test).
+- `asym_nvme.stats_by_role.base_weight.cache_hits`, `bytes_read`, `bytes_written`, `read_ops` are all nonzero.
+- Trace is frozen after the first step (`weight_offload_nvme_trace_frozen=true`) and prefetch reads are issued ahead of layer execution.
+- NVMe read wait time does not dominate forward time: `wait_read_ms / forward_ms < 0.5` in the per-step profile.
+- Host process RSS decreases by at least `max(2 GiB, 10%)` vs. the Stage 3 accepted candidate.
+- HBM peak does not regress vs. Stage 3.
+- E2E timing and `step_samples` forward/backward regression each ≤ 5%.
 - Measured losses remain finite.
 
 Risks to watch:
 
-- Base weights are usually hot. Disk-staging them may be worse than CPU residency unless the cache policy is strong.
-- If the model path needs base weights in HBM every layer and the cache cannot hold the working set, reject this stage for the default fair-comparison path.
-- Checkpoint semantics must follow the active owner. Local backend writes local checkpoints; future DeepSpeed backend must use DeepSpeed checkpoint APIs.
+- Base weights are accessed on every forward pass. If the CPU cache cannot hold the working set and every layer is a blocking NVMe miss, the `wait_read_ms / forward_ms < 0.5` gate will fail. Raise `ASYM_NVME_CPU_CACHE_BYTES` until the gate passes; this stage is not accepted on a miss-dominated profile.
+- The `_make_ds_param_proxy` shim must match all fields read by `AsyncPartitionedParameterSwapper.swap_in` and `synchronize_reads` (`partitioned_param_swapper.py:291-349`). Verify field names against the vendored code before coding; a missing field causes a silent wrong-shape read.
+- Checkpoint semantics: local backend writes per-param `.tensor.swp` files in the rank-0 path; future DeepSpeed backend must use DeepSpeed checkpoint APIs and must not share these files.
 
 ## Stage 5: Future DeepSpeed Adapter and Deferred Roles
 
@@ -2449,11 +2506,11 @@ class DeepSpeedZeROBackend:
 
 DeepSpeed integration means "DeepSpeed owns the model-state lifecycle, AsymGEMM supplies compute kernels/policies." It does not mean running current local `AsymCPUAdamW` and LoRA `.data` placeholder swapping on top of ZeRO-owned params.
 
-Deferred activation NVMe:
+Activation NVMe — not deferred, not in scope:
 
-- Do not add `activation_spill` to the accepted role set.
-- Prefer activation checkpointing/recompute and existing CPU activation offload.
-- Revisit only with a separate profile showing `activation_offload.cpu_peak_bytes_live` or process RSS is the dominant remaining bottleneck and parameter/optimizer NVMe is already accepted.
+- DeepSpeed does not implement NVMe activation offload. `runtime/activation_checkpointing/checkpointing.py` provides CPU offload and recompute only; there is no `activation_spill` NVMe role anywhere in the ZeRO stack.
+- Do not add `activation_spill` to the accepted role set in any stage of this plan.
+- If activation memory is a bottleneck, use the existing CPU activation offload path or gradient checkpointing. Activation NVMe would require a new design document with its own acceptance gates and is not a near-term follow-on to this plan.
 
 Deferred gradient NVMe:
 
@@ -2529,8 +2586,8 @@ Stage 0B: config/profile/compare plumbing
 Stage 1: disk substrate
 Stage 2: LoRA NVMe homes
 Stage 3: optimizer-state paging
-Stage 4: optional frozen/base parameter NVMe
+Stage 4: frozen/base parameter NVMe (required; AsyncPartitionedParameterSwapper + rank shim)
 Stage 5: future DeepSpeed adapter / deferred roles
 ```
 
-Do not start Stage 1 until Stage 0A and Stage 0B both have clean no-change profiles. Do not start Stage 3 until Stage 2 has a clean accepted profile. Do not start Stage 4 until Stage 3 proves whether host memory is still the limiter. Do not implement gradient NVMe, activation NVMe, or the DeepSpeed adapter until local single-GPU NVMe results prove they are necessary.
+Do not start Stage 1 until Stage 0A and Stage 0B both have clean no-change profiles. Do not start Stage 3 until Stage 2 has a clean accepted profile. Do not start Stage 4 until Stage 3 is accepted. Stage 4 is required, not optional — base-weight NVMe is implemented via `AsyncPartitionedParameterSwapper` with a rank shim and must pass the same 5% latency and 10%/2 GiB memory gates as Stages 2–3. Do not implement gradient NVMe or the DeepSpeed adapter until local single-GPU NVMe results prove they are necessary. Activation NVMe is not part of this plan; DeepSpeed does not support it either.

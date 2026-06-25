@@ -64,31 +64,44 @@ if [[ "${_RUNS_ENV_SET}" == "true" ]]; then
   done <<< "${_runs_env_lines}"
 else
   RUNS=(
+    "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+    "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
     "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
     "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
     "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
     "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
 
+    "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+    "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
     "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
     "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
     "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
     "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
 
+    "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+    "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
     "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
     "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
     "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
     "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
 
+    "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+    "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
     "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
     "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
     "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
     "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
 
+    "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+    "llama3.3-70b ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
     "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
     "llama3.3-70b; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
     "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
     "llama3.3-70b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
   )
+  # RUNS=(
+  #   "llama3.3-70b ; zero3_offload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  # )
 fi
 
 # Iterate and parse the rows into scheduler metadata. Each RUNS item remains one scheduled run.
@@ -126,6 +139,8 @@ LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 # Training
 # MAX_STEPS=${MAX_STEPS:-2}
 # WARMUP_STEPS=${WARMUP_STEPS:-2}
+# MAX_STEPS=${MAX_STEPS:-6}
+# WARMUP_STEPS=${WARMUP_STEPS:-6}
 MAX_STEPS=${MAX_STEPS:-10}
 WARMUP_STEPS=${WARMUP_STEPS:-3}
 # MAX_STEPS=${MAX_STEPS:-1}
