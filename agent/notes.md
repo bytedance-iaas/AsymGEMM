@@ -245,7 +245,7 @@ Schedule needs to cover these cases:
 storage {nvme, cpu, gpu} x compute {cpu, gpu}
 
 
-
+#######################################################################
 ### CORE ISSUES
 Why does not materializing in HBM does not save weights?
 
@@ -264,7 +264,6 @@ Mention potential issues
 5. Some tensors not fully captured? Not the peak?
 - Check the actiation tensor details
 
-
 ### Meeting Notes
 Scheduling
 - What tensors (not hot) to put hbm vs. cpu vs. nvme?
@@ -277,13 +276,13 @@ Related work:
 Scenario: Single Superchip GPU first + LoRA
 Later + EP
 
-Goal: Scheduler for Superchip-based LoRA SFT
-Consider different storage devices / compute devices / kernels
-Target High throughput + big model + long context
 
-Motivation:
-1. Memory increases to OOM for LoRA and compositions
-2. Superchips
+
+#######################################################################
+Goal: A Superchip-based Offloading System for LoRA SFT
+- Consider different storage devices / compute devices / kernels
+- Target High throughput + big model + long context
+
 
 Superchips => new scheduling algorithm
 CPU + GPU co-computing
@@ -313,11 +312,14 @@ Scheduling Insights:
 - Overlay activatino offloading / loading with computes to improve throughput
 
 
-TODO
+### TODO
 - Implement the residual stream offloading + recompute everything else. for long seq, load from Load activation from hbm.
 - Single CPU based context paralleim for million tokens
 
 - activation swapping within the layer?
 - add in nvme offloading
 - do we have to store all layer input residuals? why canrt we keep rolling one and take the outoptu fo rthe next..
+
+
+### 
 

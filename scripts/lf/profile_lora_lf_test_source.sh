@@ -31,6 +31,7 @@ GPU_POOL=${GPU_POOL:-3}
 declare -A M=(
   # MoE                                          (key = family-version + total size)
   [q3-30b]="Qwen/Qwen3-30B-A3B|1"
+  [q3-235b]="Qwen/Qwen3-235B-A22B|1"
   [q3.5-35b]="Qwen/Qwen3.5-35B-A3B|1"
   [q3.5-122b]="Qwen/Qwen3.5-122B-A10B|1"
   [llama4-scout]="meta-llama/Llama-4-Scout-17B-16E|1"

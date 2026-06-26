@@ -31,6 +31,7 @@ GPU_POOL=${GPU_POOL:-3}
 declare -A M=(
   # MoE                                          (key = family-version + total size)
   [q3-30b]="Qwen/Qwen3-30B-A3B|1"
+  [q3-235b]="Qwen/Qwen3-235B-A22B|1"
   [q3.5-35b]="Qwen/Qwen3.5-35B-A3B|1"
   [q3.5-122b]="Qwen/Qwen3.5-122B-A10B|1"
   [llama4-scout]="meta-llama/Llama-4-Scout-17B-16E|1"
@@ -63,45 +64,48 @@ if [[ "${_RUNS_ENV_SET}" == "true" ]]; then
     [[ -n "${_run}" ]] && RUNS+=("${_run}")
   done <<< "${_runs_env_lines}"
 else
+  # RUNS=(
+  #   "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+  #   "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
+  #   "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+  #   "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+  #   "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+
+  #   "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+  #   "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
+  #   "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+  #   "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+  #   "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+
+  #   "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+  #   "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
+  #   "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+  #   "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+  #   "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+
+  #   "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+  #   "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
+  #   "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+  #   "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+  #   "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+
+  #   "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+  #   "llama3.3-70b ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
+  #   "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "llama3.3-70b; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+  #   "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+  #   "llama3.3-70b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+  # )
   RUNS=(
-    "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-    "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
     "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
     "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
-    "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-    "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
 
-    "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-    "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
-    "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-    "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
-    "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-    "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
 
-    "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-    "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
-    "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-    "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
-    "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-    "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-
-    "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-    "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
-    "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-    "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
-    "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-    "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-
-    "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-    "llama3.3-70b ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
-    "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-    "llama3.3-70b; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
-    "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-    "llama3.3-70b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
   )
-  # RUNS=(
-  #   "llama3.3-70b ; zero3_offload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  # )
 fi
 
 # Iterate and parse the rows into scheduler metadata. Each RUNS item remains one scheduled run.
