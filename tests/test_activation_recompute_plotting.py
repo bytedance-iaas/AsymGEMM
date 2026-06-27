@@ -9,6 +9,7 @@ from scripts.plotting.plot_activation_recompute_sweep import (
 )
 from scripts.plotting.plot_lf_interconnect_ctc import _parse_job_dir_parts as parse_ctc_job_dir_parts
 from scripts.plotting.plot_lf_memory_breakdown import _parse_job_dir_parts as parse_memory_job_dir_parts
+from scripts.plotting.plot_lf_utilization import _parse_job_dir_parts as parse_utilization_job_dir_parts
 
 
 def _filter_args(policy: str) -> Namespace:
@@ -94,8 +95,9 @@ def test_lf_plotters_ignore_unknown_config_axes_in_job_dir_tail() -> None:
     activation_meta = parse_activation_job_dir_parts(job_dir)
     memory_meta = parse_memory_job_dir_parts(job_dir)
     ctc_meta = parse_ctc_job_dir_parts(job_dir)
+    utilization_meta = parse_utilization_job_dir_parts(job_dir)
 
-    for meta in (activation_meta, memory_meta, ctc_meta):
+    for meta in (activation_meta, memory_meta, ctc_meta, utilization_meta):
         assert meta is not None
         assert meta["policy_part"] == "polgc-attn-exp"
         assert meta.get("router_mode", meta.get("router_part", "")) in {"newmode", "routernewmode"}

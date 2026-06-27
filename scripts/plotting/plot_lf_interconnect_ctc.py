@@ -441,7 +441,7 @@ def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, st
     layergc = job_meta["layergc"]
     if not policy_part.startswith("pol") or not router_part.startswith("router"):
         return None
-    if recompute_part not in {"norecomp", "recomp"}:
+    if recompute_part not in {"norecomp", "recomp", "unsloth"}:
         return None
 
     expert_policy = str(config.get("expert_policy") or policy_part[len("pol") :] or "none")

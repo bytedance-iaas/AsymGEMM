@@ -323,3 +323,25 @@ Scheduling Insights:
 
 ### 
 
+
+
+
+
+i am trying to formulate a problem/motivation to do for research project. We need to figure out some CORE issues to target the current superoffload system. We wanna do superchips + lora + GB200 machines (each is 2 GPUs 2x200G + 1 CPU 1x450G) because no one has done it whereas superoffload targets full finetuning (optimizer update is significaint) and GH200 machines (each is 1 GPU 1x98G + 1 CPU 900G)
+The current struggle is that I need to surface the issues of superoffload on this new setting why it is insufficient and why its insufficiency cannot be easily solved with unsloth-gc. 
+Some angle (not major but can be liek 1/4 of contribitons not major) is that we can use ASymGEMM to somehow save HBM but i cant figure out after saving the memory how can we materialize the use of that to enalbe longer seq or large model...
+Do serious brianstorming and do necessay online searching and let me know what insuffinceis can I surface? As for a paper, in the motivation section, what kinda of plots can I show ... (ssytem conferences need to show numetical results as to WHY current systems fail/insufficein before introducing ur fixes)
+
+
+
+
+################################
+
+1. CPU Low => we need to improve. Show compute vs memory bound for the modules.
+1.5 Module-wise Compute bound vs memory bound
+2. Show that activation
+3. Hardware architectures for 2 cards (GPU utiliation, throughput)
+- Do we need to change
+- 2 gpus's bandwidths to CPU are indepdent from each and ind from back/forth (225 each)
+
+

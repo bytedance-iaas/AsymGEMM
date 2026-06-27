@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 from typing import Any, Iterator
 
@@ -33,6 +34,8 @@ PROFILE_SYNC_ENV = "ASYM_GEMM_LF_PROFILE_SYNC"
 PROFILE_MODULE_FILTER_ENV = "ASYM_GEMM_LF_PROFILE_MODULE_FILTER"
 PROFILE_HEARTBEAT_ENV = "ASYM_GEMM_LF_HEARTBEAT_JSON"
 PROFILE_PARTIAL_INTERVAL_ENV = "ASYM_GEMM_LF_PROFILE_PARTIAL_INTERVAL_SECONDS"
+PROFILE_UTILIZATION_ENV = "ASYM_GEMM_LF_PROFILE_UTILIZATION"
+PROFILE_UTILIZATION_INTERVAL_ENV = "ASYM_GEMM_LF_PROFILE_UTILIZATION_INTERVAL_SECONDS"
 CONFIG_ENV_PREFIX = "ASYM_GEMM_LF_CONFIG_"
 KT_LORA_HEALTH_MAX_TENSORS_ENV = "ASYM_GEMM_LF_KT_LORA_HEALTH_MAX_TENSORS"
 KT_LORA_HEALTH_MAX_ELEMENTS_ENV = "ASYM_GEMM_LF_KT_LORA_HEALTH_MAX_ELEMENTS"
@@ -2269,6 +2272,143 @@ def _asym_liger_lm_head_bridge_from_model() -> dict[str, Any]:
     return {"source": "model", **metadata}
 
 
+class CPUUtilizationSampler:
+    def __init__(self, *, enabled: bool, interval_seconds: float = 0.1):
+        self.enabled = enabled
+        self.interval_seconds = max(float(interval_seconds), 0.02)
+        self.available_cpu_cores = self._available_cpu_cores()
+        self.pid = os.getpid()
+        self._rows: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._start_wall = 0.0
+        self._previous_wall = 0.0
+        self._previous_cpu = 0.0
+        self._started = False
+
+    @staticmethod
+    def _available_cpu_cores() -> int:
+        try:
+            return max(1, len(os.sched_getaffinity(0)))
+        except Exception:
+            return max(1, os.cpu_count() or 1)
+
+    @staticmethod
+    def _process_cpu_seconds() -> float:
+        times = os.times()
+        return float(times.user + times.system)
+
+    @staticmethod
+    def _percentile(values: list[float], percentile: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return ordered[0]
+        rank = (len(ordered) - 1) * percentile / 100.0
+        lower = int(math.floor(rank))
+        upper = int(math.ceil(rank))
+        if lower == upper:
+            return ordered[lower]
+        weight = rank - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+    def start(self) -> None:
+        if not self.enabled or self._started:
+            return
+        self._started = True
+        self._start_wall = time.perf_counter()
+        self._previous_wall = self._start_wall
+        self._previous_cpu = self._process_cpu_seconds()
+        self._thread = threading.Thread(target=self._run, name="lf-cpu-utilization-sampler", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if not self._started:
+            return
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.interval_seconds * 4.0))
+        self._sample()
+        self._started = False
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self.interval_seconds):
+            self._sample()
+
+    def _sample(self) -> None:
+        wall = time.perf_counter()
+        cpu = self._process_cpu_seconds()
+        with self._lock:
+            wall_delta = wall - self._previous_wall
+            cpu_delta = cpu - self._previous_cpu
+            self._previous_wall = wall
+            self._previous_cpu = cpu
+            if wall_delta <= 0.0:
+                return
+            raw_percent = 100.0 * max(0.0, cpu_delta) / wall_delta / float(self.available_cpu_cores)
+            self._rows.append(
+                {
+                    "device": "cpu",
+                    "metric": "cpu_process_util",
+                    "metric_name": "CPU process utilization",
+                    "source": "process_cpu_time",
+                    "pid": self.pid,
+                    "available_cpu_cores": self.available_cpu_cores,
+                    "elapsed_seconds": wall - self._start_wall,
+                    "wall_delta_seconds": wall_delta,
+                    "process_cpu_delta_seconds": max(0.0, cpu_delta),
+                    "value_percent": min(100.0, max(0.0, raw_percent)),
+                }
+            )
+
+    def report(self) -> dict[str, Any]:
+        if not self.enabled:
+            return {"available": False, "reason": "CPU utilization sampling disabled"}
+        with self._lock:
+            rows = [dict(row) for row in self._rows]
+        if not rows:
+            return {"available": False, "reason": "no CPU utilization samples"}
+        values = [float(row["value_percent"]) for row in rows]
+        total_wall = sum(float(row.get("wall_delta_seconds", 0.0) or 0.0) for row in rows)
+        mean = (
+            sum(float(row["value_percent"]) * float(row.get("wall_delta_seconds", 0.0) or 0.0) for row in rows)
+            / total_wall
+            if total_wall > 0.0
+            else sum(values) / float(len(values))
+        )
+        summary_row = {
+            "device": "cpu",
+            "metric": "cpu_process_util",
+            "metric_name": "CPU process utilization",
+            "source": "process_cpu_time",
+            "samples": len(rows),
+            "available_cpu_cores": self.available_cpu_cores,
+            "mean_percent": mean,
+            "p50_percent": self._percentile(values, 50.0),
+            "p95_percent": self._percentile(values, 95.0),
+            "max_percent": max(values),
+        }
+        cpu = {
+            "available": True,
+            "source": "process_cpu_time",
+            "units": "percent_of_available_cpu_cores",
+            "summary": summary_row,
+            "timeseries": {"rows": rows},
+            "notes": [
+                "CPU utilization is process user+system CPU time normalized by wall time and available CPU affinity cores.",
+                "The value is not RAM occupancy.",
+            ],
+        }
+        return {
+            "available": True,
+            "cpu": cpu,
+            "summary": {"rows": [summary_row]},
+            "timeseries": {"rows": rows},
+        }
+
+
 @dataclass
 class StageRecord:
     milliseconds: float
@@ -2321,6 +2461,7 @@ class LFProfileRecorder:
     config: dict[str, Any]
     measure_memory: bool = True
     reset_stage_peak_stats: bool = True
+    utilization_sampler: CPUUtilizationSampler | None = None
     records: dict[str, list[StageRecord]] = field(default_factory=dict)
     global_peak_allocated_bytes: int = 0
     global_peak_reserved_bytes: int = 0
@@ -2679,6 +2820,11 @@ class LFProfileRecorder:
                 else {"enabled": False, "rows": []}
             ),
             "memory_breakdown": {"enabled": False},
+            "utilization_metrics": (
+                self.utilization_sampler.report()
+                if self.utilization_sampler is not None
+                else {"available": False, "reason": "CPU utilization sampler unavailable"}
+            ),
             "step_samples": {
                 "source": "lf_source_recorder",
                 "warmup_steps": self._warmup_steps(),
@@ -2727,11 +2873,17 @@ def main() -> None:
     if heartbeat_path:
         config["heartbeat_jsonl"] = heartbeat_path
     trace_config = LFTraceConfig.from_env(os.environ)
+    utilization_interval = _safe_float(os.environ.get(PROFILE_UTILIZATION_INTERVAL_ENV)) or 0.1
+    utilization_sampler = CPUUtilizationSampler(
+        enabled=_env_enabled(PROFILE_UTILIZATION_ENV, default=True) and _is_rank0(),
+        interval_seconds=utilization_interval,
+    )
     recorder = LFProfileRecorder(
         config=config,
         measure_memory=_env_enabled(PROFILE_MEMORY_ENV, default=True),
         # Reset the torch peak counter per stage so forward/backward report true within-stage peaks.
         reset_stage_peak_stats=True,
+        utilization_sampler=utilization_sampler,
     )
     source_json = os.environ.get(PROFILE_SOURCE_JSON_ENV)
     if source_json and _is_rank0():
@@ -2760,6 +2912,7 @@ def main() -> None:
 
     run_succeeded = False
     run_exception: BaseException | None = None
+    utilization_sampler.start()
     try:
         from llamafactory.train.tuner import run_exp
 
@@ -2776,6 +2929,7 @@ def main() -> None:
     finally:
         heartbeat.emit("profile_launcher_finally", success=run_succeeded)
         partial_writer.write("profile_launcher_finally", force=True)
+        utilization_sampler.stop()
         if source_json and _is_rank0():
             path = Path(source_json)
             write_path = path if run_succeeded else path.with_name("source_profile.partial.json")

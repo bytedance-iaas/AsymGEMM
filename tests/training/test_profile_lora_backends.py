@@ -741,6 +741,84 @@ def test_postprocess_summarizes_ctc_gpu_metrics_by_step() -> None:
     assert len(metrics["timeseries"]["rows"]) == 9
 
 
+def test_postprocess_summarizes_gpu_and_cpu_utilization_metrics() -> None:
+    postprocess = _load_postprocess_nsys_lora_module()
+    con = sqlite3.connect(":memory:")
+    con.executescript(
+        """
+        create table GPU_METRICS(timestamp integer, typeId integer, metricId integer, value integer);
+        create table TARGET_INFO_GPU_METRICS(typeId integer, sourceId integer, typeName text, metricId integer, metricName text);
+        create table TARGET_INFO_GPU(id integer, name text, busLocation text);
+        create table NVTX_EVENTS(start integer, end integer, text text);
+        """
+    )
+    con.execute(
+        "insert into TARGET_INFO_GPU_METRICS values (0, 0, '', ?, ?)",
+        (30, "SMs Active [Throughput %]"),
+    )
+    con.execute("insert into TARGET_INFO_GPU values (0, 'NVIDIA GB200', '0008:01:00.0')")
+    con.executemany(
+        "insert into NVTX_EVENTS values (?, ?, ?)",
+        [
+            (100, 300, "step.forward"),
+            (400, 600, "step.backward"),
+        ],
+    )
+    con.executemany(
+        "insert into GPU_METRICS values (?, 0, ?, ?)",
+        [
+            (100, 30, 20),
+            (200, 30, 80),
+            (300, 30, 100),
+            (400, 30, 40),
+            (500, 30, 60),
+            (600, 30, 90),
+        ],
+    )
+    source_profile = {
+        "utilization_metrics": {
+            "available": True,
+            "cpu": {
+                "available": True,
+                "source": "process_cpu_time",
+                "summary": {
+                    "samples": 2,
+                    "available_cpu_cores": 144,
+                    "mean_percent": 12.5,
+                    "p50_percent": 12.0,
+                    "p95_percent": 18.0,
+                    "max_percent": 20.0,
+                },
+                "timeseries": {
+                    "rows": [
+                        {"elapsed_seconds": 0.1, "value_percent": 10.0},
+                        {"elapsed_seconds": 0.2, "value_percent": 15.0},
+                    ]
+                },
+            },
+        }
+    }
+
+    metrics = postprocess.summarize_utilization_metrics(con, source_profile)
+
+    assert metrics["available"] is True
+    assert metrics["gpu"]["available"] is True
+    assert metrics["cpu"]["available"] is True
+    gpu_summary = next(row for row in metrics["summary"]["rows"] if row["device"] == "gpu")
+    assert gpu_summary["metric"] == "gpu_util"
+    assert gpu_summary["max_percent"] == pytest.approx(100.0)
+    cpu_summary = next(row for row in metrics["summary"]["rows"] if row["device"] == "cpu")
+    assert cpu_summary["mean_percent"] == pytest.approx(12.5)
+    forward_gpu = next(
+        row
+        for row in metrics["range_summary"]["rows"]
+        if row["scope"] == "phase" and row["phase"] == "forward" and row["device"] == "gpu"
+    )
+    assert forward_gpu["samples"] == 3
+    assert forward_gpu["p95_percent"] == pytest.approx(98.0)
+    assert len(metrics["timeseries"]["rows"]) == 8
+
+
 def test_kt_backend_is_restricted_to_moe_workloads() -> None:
     profile_lora = _load_profile_lora_e2e_module()
 

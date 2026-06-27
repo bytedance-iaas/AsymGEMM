@@ -24,21 +24,21 @@ GPU_POOL=${GPU_POOL:-3}
 
 # RUNS: model ; backend|recompute|liger ; seq|batch|grad_accum ; policy|expact|attnact|layeract|layergc|sdparecomp
 # Models use the M shorthand. To override the default list from the environment, pass:
-#   RUNS='q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false || q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true'
+#   RUNS='q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false || q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true'
 #   backend  : asym_cpuadamwds | zero3_offload | zero3_offload_mem | zero3_offload_opnvme | zero3_offload_pnvme | superoffload | superoffload_mem
 #   recompute: recomp | norecomp | unsloth        liger: ligerloss0 | ligerloss1
 #   policy   : none|false|false|false|false|false (off)  |  none|true|true|false|true|true (offload+gc)
 declare -A M=(
-  # MoE                                          (key = family-version + total size)
-  [q3-30b]="Qwen/Qwen3-30B-A3B|1"
-  [q3-235b]="Qwen/Qwen3-235B-A22B|1"
-  [q3.5-35b]="Qwen/Qwen3.5-35B-A3B|1"
-  [q3.5-122b]="Qwen/Qwen3.5-122B-A10B|1"
-  [llama4-scout]="meta-llama/Llama-4-Scout-17B-16E|1"
+  # MoE                                          (key = family-version + total size + active size)
+  [q3-30b-a3b]="Qwen/Qwen3-30B-A3B"
+  [q3-235b-a22b]="Qwen/Qwen3-235B-A22B"
+  [q3.5-35b-a3b]="Qwen/Qwen3.5-35B-A3B"
+  [q3.5-122b-a10b]="Qwen/Qwen3.5-122B-A10B"
+  [llama4-scout]="meta-llama/Llama-4-Scout-17B-16E"
   # dense
-  [q3-32b]="Qwen/Qwen3-32B|1"
-  [q2.5-72b]="Qwen/Qwen2.5-72B-Instruct|1"
-  [llama3.3-70b]="meta-llama/Llama-3.3-70B-Instruct|1"
+  [q3-32b]="Qwen/Qwen3-32B"
+  [q2.5-72b]="Qwen/Qwen2.5-72B-Instruct"
+  [llama3.3-70b]="meta-llama/Llama-3.3-70B-Instruct"
 )
 declare -A _M_REV=()
 for _k in "${!M[@]}"; do _M_REV["${M[$_k]%%|*}"]="${_k}"; done
@@ -51,9 +51,9 @@ if [[ -n "${RUNS+x}" ]]; then
 fi
 _RUNS_LOG="${RUNS_LOG:-${ROOT}/scripts/lf/runs.log}"
 # RUNS=(
-#   # "q3-30b ; zero3_offload_opnvme|recomp|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-#   # "q3-30b ; zero3_offload_pnvme|recomp|ligerloss1  ; 4092|8|1 ; none|false|false|false|false|false"
-#   "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+#   # "q3-30b-a3b|1 ; zero3_offload_opnvme|recomp|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+#   # "q3-30b-a3b|1 ; zero3_offload_pnvme|recomp|ligerloss1  ; 4092|8|1 ; none|false|false|false|false|false"
+#   "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
 # )
 if [[ "${_RUNS_ENV_SET}" == "true" ]]; then
   RUNS=()
@@ -64,45 +64,67 @@ if [[ "${_RUNS_ENV_SET}" == "true" ]]; then
     [[ -n "${_run}" ]] && RUNS+=("${_run}")
   done <<< "${_runs_env_lines}"
 else
-  RUNS=(
-    "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-    "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
-    "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-    "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
-    "q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-    "q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-
-    "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-    "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
-    "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-    "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
-    "llama4-scout ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-    "llama4-scout ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-
-    "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-    "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
-    "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-    "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
-    "q3-32b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-    "q3-32b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-
-    "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-    "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
-    "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-    "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
-    "q2.5-72b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-    "q2.5-72b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-
-    "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-    "llama3.3-70b ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
-    "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-    "llama3.3-70b; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
-    "llama3.3-70b ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-    "llama3.3-70b ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-  )
   # RUNS=(
-  #   "llama3.3-70b ; zero3_offload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+  #   "q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
+  #   "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+  #   "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+  #   "q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+
+  #   "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+  #   "llama4-scout|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
+  #   "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "llama4-scout|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+  #   "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+  #   "llama4-scout|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+
+  #   "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+  #   "q3-32b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
+  #   "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "q3-32b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+  #   "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+  #   "q3-32b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+
+  #   "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+  #   "q2.5-72b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
+  #   "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "q2.5-72b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+  #   "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+  #   "q2.5-72b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
+
+  #   "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+  #   "llama3.3-70b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
+  #   "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "llama3.3-70b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+  #   "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+  #   "llama3.3-70b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
   # )
+  # RUNS=(
+  #   "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+  # )
+  RUNS=(
+    "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+    "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+    "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+
+    "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+    "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+    "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+
+    "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+    "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+    "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+
+    "q2.5-72b|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+    "q2.5-72b|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+    "q2.5-72b|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+
+    "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+    "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+    "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+  )
 fi
 
 # Iterate and parse the rows into scheduler metadata. Each RUNS item remains one scheduled run.
@@ -115,9 +137,14 @@ for _run in "${RUNS[@]}"; do
     echo "error: RUNS item must be model ; backend|recompute|ligerloss ; seq|batch|grad_accum ; policy|expact|attnact|layeract|layergc|sdparecomp, got '${_run}'" >&2
     exit 2
   }
-  if [[ -n "${M[$_m]:-}" ]]; then
-    _m_spec="${M[$_m]}"
-  elif [[ "${_m}" == */* || "${_m}" == *"|"* ]]; then
+  _m_key="${_m%%|*}"
+  if [[ "${_m}" == *"|"* && -n "${M[$_m_key]:-}" ]]; then
+    # shorthand|N: resolve the shorthand's path, then apply the GPU count N from the RUNS row.
+    _m_spec="${M[$_m_key]%%|*}|${_m#*|}"
+  elif [[ -n "${M[$_m]:-}" ]]; then
+    echo "error: RUNS model shorthand '${_m}' must include GPU count, e.g. '${_m}|1'" >&2
+    exit 2
+  elif [[ "${_m}" == */* ]]; then
     _m_spec="${_m}"
   else
     echo "error: RUNS unknown model shorthand '${_m}' (add it to M or use model/path|num_gpus)" >&2
@@ -142,7 +169,7 @@ LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 # WARMUP_STEPS=${WARMUP_STEPS:-2}
 # MAX_STEPS=${MAX_STEPS:-6}
 # WARMUP_STEPS=${WARMUP_STEPS:-6}
-MAX_STEPS=${MAX_STEPS:-10}
+MAX_STEPS=${MAX_STEPS:-7}
 WARMUP_STEPS=${WARMUP_STEPS:-3}
 # MAX_STEPS=${MAX_STEPS:-1}
 # WARMUP_STEPS=${WARMUP_STEPS:-1}
@@ -271,6 +298,7 @@ PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_activation_recompute_sweep.py"
 MEMORY_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_memory_breakdown.py"
 INTERCONNECT_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_interconnect_ctc.py"
 THROUGHPUT_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_throughput.py"
+UTILIZATION_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_utilization.py"
 
 # =============================================================================
 # Main Logic
@@ -291,7 +319,7 @@ Options:
   RUNS is the job list. Each row is:
     model ; backend|recompute|ligerloss ; seq|batch|grad_accum ; policy|expact|attnact|layeract|layergc|sdparecomp
   Override it from the environment with rows separated by '||':
-    RUNS='q3-30b ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false || q3-30b ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true'
+    RUNS='q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false || q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true'
 
   Sweep:
   --gpus LIST                    Physical GPU pool, e.g. 0,1.
@@ -870,8 +898,13 @@ normalize_run_spec_entry() {
   [[ -n "${model_part}" && -n "${backend_part}" && -n "${workload_part}" && -n "${policy_part}" && -z "${extra:-}" ]] ||
     die "RUNS item must be model ; backend|recompute[|ligerloss] ; seq|batch|grad_accum ; policy|expact|attnact|layeract|layergc|sdparecomp, got '${raw}'"
 
-  if [[ -n "${M[$model_part]:-}" ]]; then
-    model_part="${M[$model_part]}"
+  if [[ "${model_part}" == *"|"* && -n "${M[${model_part%%|*}]:-}" ]]; then
+    # shorthand|N: resolve the shorthand's path, then apply the GPU count N from the RUNS row.
+    model_part="${M[${model_part%%|*}]%%|*}|${model_part#*|}"
+  elif [[ -n "${M[$model_part]:-}" ]]; then
+    die "RUNS model shorthand '${model_part}' must include GPU count, e.g. '${model_part}|1'"
+  elif [[ "${model_part}" != */* ]]; then
+    die "RUNS unknown model shorthand '${model_part%%|*}' (add it to M or use model/path|num_gpus)"
   fi
   parse_model_spec "${model_part}"
   normalized_model="${parsed_model_name}|${parsed_model_gpu_count}"
@@ -1680,6 +1713,22 @@ throughput_combined_plot_cmd_base() {
   )
 }
 
+utilization_combined_plot_cmd_base() {
+  local -n _cmd_ref="$1"
+  local input_root="$2"
+  local output_dir="$3"
+  shift 3
+  (($# > 0)) || die "utilization_combined_plot_cmd_base requires at least one workload"
+  _cmd_ref=(
+    "${ENV_PYTHON}" "${UTILIZATION_PLOT_SCRIPT}"
+    --input-root "${input_root}"
+    --output-dir "${output_dir}"
+    --clean-output
+    --combined-only
+    --workloads "$@"
+  )
+}
+
 append_backend_filters() {
   local -n _cmd_ref="$1"
   local backend
@@ -1786,6 +1835,11 @@ memory_running_plot_filters() {
 
 # C2C combined: nsys profiler only (C2C metrics exist only in nsys runs); no config narrowing.
 interconnect_plot_filters() {
+  append_fixed_profiler_filter "$1" nsys
+}
+
+# Utilization combined: nsys profiler only so GPU and CPU are available together.
+utilization_plot_filters() {
   append_fixed_profiler_filter "$1" nsys
 }
 
@@ -2320,6 +2374,7 @@ if [[ "${PLOT_MEMORY_BREAKDOWN}" == "true" ]]; then
 fi
 if [[ "${PLOT}" == "true" && "${nsys_artifacts_selected}" == "true" ]]; then
   [[ -f "${INTERCONNECT_PLOT_SCRIPT}" ]] || die "missing ${INTERCONNECT_PLOT_SCRIPT}"
+  [[ -f "${UTILIZATION_PLOT_SCRIPT}" ]] || die "missing ${UTILIZATION_PLOT_SCRIPT}"
   [[ -f "${THROUGHPUT_PLOT_SCRIPT}" ]] || die "missing ${THROUGHPUT_PLOT_SCRIPT}"
 fi
 if [[ "${DRY_RUN}" != "true" && ( "${PLOT}" == "true" || ( "${PREPARE_DATASETS}" == "true" && "${COLLECT_EXISTING}" != "true" ) ) ]]; then
@@ -2357,6 +2412,7 @@ echo "Run log: ${_RUNS_LOG} (append mode)"
 declare -A plot_roots=()
 declare -A memory_plot_roots=()
 declare -A interconnect_plot_roots=()
+declare -A utilization_plot_roots=()
 declare -A throughput_plot_roots=()
 failures=0
 interrupted=false
@@ -2656,6 +2712,7 @@ run_job() {
   fi
   if [[ "${run_profiler}" == "nsys" ]]; then
     interconnect_plot_roots["${config_root}"]="${seq_len}"
+    utilization_plot_roots["${config_root}"]="${seq_len}"
   fi
   if [[ "${run_profiler}" == "source" ]]; then
     throughput_plot_roots["${config_root}"]="${seq_len}"
@@ -3157,12 +3214,13 @@ This config root is organized as follows:
 - \`combined/\`: config-level LF timing and allocator-summary plots from \`profile.json\`.
 - \`memory_combined/\`: config-level source-memory breakdown plots plus per-group subfolders split by workload/backend/profiler/router/expact/attnact/layeract/layergc/recompute/policy/liger_loss. If no source-memory rows were collected, this folder contains a README explaining why.
 - \`c2c_combined/\`: config-level C2C/CTC saturation plots plus per-group subfolders split by workload/backend/profiler/router/expact/attnact/layeract/layergc/recompute/policy/liger_loss. If old traces lack GPU metrics, this folder contains a README explaining why.
+- \`utilization_combined/\`: config-level GPU/CPU utilization summaries from nsys runs.
 - \`throughput_combined/\`: config-level training throughput (tokens/sec) plots from source-profiler runs, plus per-group subfolders.
 - \`<backend>__<profiler>__<recompute>__pol<policy>__router<mode>__...__ligerloss0/b<batch>_s<seq>_ga<grad_accum>/\`: per-run artifacts.
 
 If \`PLOT_OUTPUT_DIR\` is set, combined plot folders are written under that external plot output root instead of this config root.
 
-Per-run nsys folders contain \`profile.json\`, markdown summaries, \`plots/\` for per-run LF plots, and \`interconnect_ctc_*.png/csv\` when C2C GPU metrics are available.
+Per-run nsys folders contain \`profile.json\`, markdown summaries, \`plots/\` for per-run LF plots, \`utilization.png/csv\`, and \`interconnect_ctc_*.png/csv\` when GPU metrics are available.
 EOF
 }
 
@@ -3177,8 +3235,9 @@ This precision root is organized as follows:
 - \`combined/\`: global LF timing and allocator-summary plots across config roots.
 - \`memory_combined/\`: global source-memory breakdown plots across config roots plus per-group subfolders split by workload/backend/profiler/router/expact/attnact/layeract/layergc/recompute/policy/liger_loss. If no source-memory rows were collected, this folder contains a README explaining why.
 - \`c2c_combined/\`: global C2C/CTC saturation plots across config roots plus per-group subfolders split by workload/backend/profiler/router/expact/attnact/layeract/layergc/recompute/policy/liger_loss. If old traces lack Nsight GPU metrics, this folder contains a README explaining why.
+- \`utilization_combined/\`: global GPU/CPU utilization summaries from nsys runs.
 - \`throughput_combined/\`: global training throughput (tokens/sec) plots across config roots plus per-group subfolders.
-- \`<config_root>/\`: one workload/configuration root. Each config root has its own \`combined/\`, \`memory_combined/\`, \`c2c_combined/\`, \`throughput_combined/\`, and per-run backend/profiler folders.
+- \`<config_root>/\`: one workload/configuration root. Each config root has its own \`combined/\`, \`memory_combined/\`, \`c2c_combined/\`, \`utilization_combined/\`, \`throughput_combined/\`, and per-run backend/profiler folders.
 
 If \`PLOT_OUTPUT_DIR\` is set, global combined plot folders are written under that external plot output root instead of this precision root.
 
@@ -3200,6 +3259,23 @@ plot_interconnect_config_root() {
   echo "Writing LF C2C combined plots: ${plot_root}"
   if ! run_tracked_command "${plot_cmd[@]}"; then
     echo "warning: failed to write C2C combined plots for ${config_root}" >&2
+  fi
+}
+
+plot_utilization_config_root() {
+  local config_root="$1"
+  local seq_len="$2"
+  local plot_root
+  [[ "${PLOT}" == "true" ]] || return 0
+
+  plot_root="${config_root}/utilization_combined"
+  [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")/utilization_combined"
+  local -a plot_cmd
+  utilization_combined_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
+  utilization_plot_filters plot_cmd
+  echo "Writing LF utilization combined plots: ${plot_root}"
+  if ! run_tracked_command "${plot_cmd[@]}"; then
+    echo "warning: failed to write utilization combined plots for ${config_root}" >&2
   fi
 }
 
@@ -3278,6 +3354,16 @@ interconnect_precision_combined_cmd() {
   shift 2
 
   interconnect_combined_plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${workloads[@]}"
+  _cmd_ref+=("$@")
+}
+
+utilization_precision_combined_cmd() {
+  local cmd_name="$1"
+  local -n _cmd_ref="${cmd_name}"
+  local output_dir="$2"
+  shift 2
+
+  utilization_combined_plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${workloads[@]}"
   _cmd_ref+=("$@")
 }
 
@@ -3400,6 +3486,24 @@ plot_interconnect_precision_combined() {
   fi
 }
 
+plot_utilization_precision_combined() {
+  local combined_utilization_plot_root
+
+  combined_utilization_plot_root="${precision_root}/utilization_combined"
+  [[ -n "${PLOT_OUTPUT_DIR}" ]] && combined_utilization_plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/utilization_combined"
+  if [[ "${#utilization_plot_roots[@]}" -gt 0 ]]; then
+    declare -A utilization_combined_workload_bases=()
+    collect_workload_bases_from_roots utilization_plot_roots utilization_combined_workload_bases
+    run_precision_combined_plot "${combined_utilization_plot_root}" utilization_precision_combined_cmd utilization_plot_filters utilization true
+    run_model_split_precision_combined_plots utilization_combined_workload_bases "${combined_utilization_plot_root}" utilization_precision_combined_cmd utilization_plot_filters utilization true
+  else
+    write_missing_combined_readme \
+      "${combined_utilization_plot_root}" \
+      "LF Utilization Combined Artifacts" \
+      "No nsys profiler runs were selected in this sweep, so no Nsight GPU utilization samples can be summarized."
+  fi
+}
+
 plot_throughput_precision_combined() {
   local combined_throughput_plot_root
   [[ "${PLOT}" == "true" ]] || return 0
@@ -3446,6 +3550,14 @@ plot_config_artifacts_for_root() {
       "${config_root}/c2c_combined" \
       "LF C2C / CTC Combined Artifacts" \
       "No nsys profiler run was selected for this config, so no Nsight C2C/CTC GPU metric samples can be summarized."
+  fi
+  if [[ -n "${utilization_plot_roots[${config_root}]+set}" ]]; then
+    plot_utilization_config_root "${config_root}" "${seq_len}"
+  else
+    write_missing_combined_readme \
+      "${config_root}/utilization_combined" \
+      "LF Utilization Combined Artifacts" \
+      "No nsys profiler run was selected for this config, so no Nsight GPU utilization samples can be summarized."
   fi
   if [[ -n "${throughput_plot_roots[${config_root}]+set}" ]]; then
     plot_throughput_config_root "${config_root}" "${seq_len}"
@@ -3594,6 +3706,7 @@ if [[ "${PLOT}" == "true" ]]; then
   plot_timing_precision_combined
   plot_memory_precision_combined
   plot_interconnect_precision_combined
+  plot_utilization_precision_combined
   plot_throughput_precision_combined
 fi
 

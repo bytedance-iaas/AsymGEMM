@@ -630,29 +630,6 @@ def _plot_by_step(runs: list[RunRecord], out_dir: Path) -> None:
     plt.close(fig)
 
 
-def _plot_summary(runs: list[RunRecord], out_dir: Path) -> None:
-    labels = [run.label or run.run_dir.name for run in runs]
-    eff = [run.effective_tokens_per_second() for run in runs]
-    mean = [statistics.fmean(run.by_step.values()) if run.by_step else 0.0 for run in runs]
-    y_positions = list(range(len(runs)))
-    height = max(4.5, min(28.0, 0.52 * len(runs) + 2.5))
-    fig, ax = plt.subplots(figsize=(10.0, height), constrained_layout=True)
-    ax.barh(y_positions, eff, height=0.55, color=THROUGHPUT_EFF_COLOR, alpha=0.78, label="effective tok/s (Σtokens/Σtime)")
-    ax.scatter(mean, y_positions, color=THROUGHPUT_COLOR, marker="D", s=22, label="mean per-step tok/s", zorder=3)
-    for y, value in zip(y_positions, eff):
-        ax.text(value, y, f" {value:,.0f}", va="center", ha="left", fontsize=7)
-    ax.set_yticks(y_positions)
-    ax.set_yticklabels(labels, fontsize=8)
-    ax.set_xlabel("Throughput (tokens/sec)")
-    ax.set_xlim(left=0.0, right=max(eff + mean, default=1.0) * 1.15)
-    ax.grid(True, axis="x", alpha=0.25)
-    fig.suptitle("Combined Effective Throughput")
-    handles, legend_labels = ax.get_legend_handles_labels()
-    ax.legend(handles, legend_labels, loc="lower center", bbox_to_anchor=(0.5, 1.02), ncol=2, frameon=False, fontsize=8)
-    fig.savefig(out_dir / "combined_throughput_summary.png", dpi=180, bbox_inches="tight")
-    plt.close(fig)
-
-
 def _write_readme(out_dir: Path, *, runs: list[RunRecord], reason: str | None = None) -> None:
     lines = [
         "# LF Throughput Combined Artifacts",
@@ -671,7 +648,6 @@ def _write_readme(out_dir: Path, *, runs: list[RunRecord], reason: str | None = 
                 "## Files",
                 "",
                 "- `combined_throughput_by_step.png`: subplots per run; x-axis is measured step, y-axis tokens/sec, dashed line = effective.",
-                "- `combined_throughput_summary.png`: per-run effective throughput bars with mean per-step markers.",
                 "- `combined_throughput_summary.csv`: one row per run (effective/mean/median/min/max tok/s).",
                 "- `combined_throughput_step_summary.csv`: one row per run and measured step.",
                 "- `combined_throughput_index.csv` / `combined_throughput_index.json`: input run index.",
@@ -700,6 +676,16 @@ def _group_label(run: RunRecord) -> str:
         f"ga{metadata.get('gradient_accumulation_steps', '')}" if metadata.get("gradient_accumulation_steps") else "",
         f"drop{metadata.get('lora_dropout', '').replace('.', '')}" if metadata.get("lora_dropout") else "",
         metadata.get("precision", ""),
+        metadata.get("backend", ""),
+        metadata.get("profiler", ""),
+        f"router{metadata.get('router_mode', '')}" if metadata.get("router_mode") else "",
+        metadata.get("expact", ""),
+        metadata.get("attnact", ""),
+        metadata.get("layeract", ""),
+        metadata.get("layergc", ""),
+        metadata.get("liger_loss", ""),
+        metadata.get("recompute", ""),
+        f"pol{metadata.get('expert_policy', '')}" if metadata.get("expert_policy") else "",
     ]
     return _safe_label("-".join(part for part in parts if part))
 
@@ -732,7 +718,6 @@ def _write_outputs(runs: list[RunRecord], out_dir: Path, clean: bool, *, write_g
     _write_csv(out_dir / "combined_throughput_index.csv", index_rows, INDEX_FIELDS)
     (out_dir / "combined_throughput_index.json").write_text(json.dumps(index_rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _plot_by_step(runs, out_dir)
-    _plot_summary(runs, out_dir)
     _write_readme(out_dir, runs=runs)
     if write_groups:
         _write_grouped_outputs(runs, out_dir, clean)

@@ -43,6 +43,9 @@ _INTERCONNECT_METRICS = {
     "NVLink TX Responses Protocol Data [Throughput %]": {"key": "nvlink_tx_responses_protocol", "label": "NVLink TX responses protocol", "family": "nvlink"},
 }
 _CTC_METRIC_KEYS = {"ctc_rx", "ctc_tx"}
+_GPU_UTILIZATION_METRIC_KEY = "gpu_util"
+_GPU_UTILIZATION_SM_RE = re.compile(r"\bsms?\s+active\b", flags=re.IGNORECASE)
+_GPU_UTILIZATION_GR_RE = re.compile(r"\bgr\s+active\b", flags=re.IGNORECASE)
 
 
 def _table_exists(con: sqlite3.Connection, name: str) -> bool:
@@ -1427,13 +1430,7 @@ def _metric_stats(values: list[float]) -> dict[str, Any]:
     }
 
 
-def _interconnect_samples(con: sqlite3.Connection) -> tuple[list[dict[str, Any]], str | None]:
-    required_tables = ("GPU_METRICS", "TARGET_INFO_GPU_METRICS")
-    missing = [table for table in required_tables if not _table_exists(con, table)]
-    if missing:
-        return [], f"missing Nsight GPU metric table(s): {', '.join(missing)}"
-
-    metric_names = tuple(_INTERCONNECT_METRICS.keys())
+def _gpu_metric_query_rows(con: sqlite3.Connection, metric_names: tuple[str, ...]) -> Iterable[tuple[Any, ...]]:
     placeholders = ",".join("?" for _ in metric_names)
     has_gpu_info = _table_exists(con, "TARGET_INFO_GPU")
     if has_gpu_info:
@@ -1458,9 +1455,240 @@ def _interconnect_samples(con: sqlite3.Connection) -> tuple[list[dict[str, Any]]
             where i.metricName in ({placeholders})
             order by m.timestamp, m.typeId, m.metricId
         """
+    return con.execute(query, metric_names)
+
+
+def _gpu_utilization_metric_names(con: sqlite3.Connection) -> tuple[list[str], str, str]:
+    names = [
+        str(row[0])
+        for row in con.execute("select distinct metricName from TARGET_INFO_GPU_METRICS order by metricName")
+        if row[0] is not None
+    ]
+    sm_names = [name for name in names if _GPU_UTILIZATION_SM_RE.search(name)]
+    if sm_names:
+        return sm_names, "GPU SM Active", "nsight_sm_active"
+    gr_names = [name for name in names if _GPU_UTILIZATION_GR_RE.search(name)]
+    if gr_names:
+        return gr_names, "GPU GR Active", "nsight_gr_active"
+    return [], "GPU utilization", "nsight_gpu_metrics"
+
+
+def _gpu_utilization_samples(con: sqlite3.Connection) -> tuple[list[dict[str, Any]], str | None, str, str]:
+    required_tables = ("GPU_METRICS", "TARGET_INFO_GPU_METRICS")
+    missing = [table for table in required_tables if not _table_exists(con, table)]
+    if missing:
+        return [], f"missing Nsight GPU metric table(s): {', '.join(missing)}", "GPU utilization", "missing"
+
+    metric_names, metric_label, source = _gpu_utilization_metric_names(con)
+    if not metric_names:
+        return [], "no Nsight SM Active / GR Active GPU utilization metric found", metric_label, source
 
     rows: list[dict[str, Any]] = []
-    for timestamp, type_id, metric_id, metric_name, value, gpu_name, bus_location in con.execute(query, metric_names):
+    for timestamp, type_id, metric_id, metric_name, value, gpu_name, bus_location in _gpu_metric_query_rows(
+        con, tuple(metric_names)
+    ):
+        gpu_id = int(type_id) & 255
+        rows.append(
+            {
+                "device": "gpu",
+                "timestamp_ns": int(timestamp),
+                "timestamp_ms": _ms(int(timestamp)),
+                "gpu_id": gpu_id,
+                "gpu": f"{bus_location} - {gpu_name}".strip(" -") if gpu_name or bus_location else str(gpu_id),
+                "metric_id": int(metric_id),
+                "metric": _GPU_UTILIZATION_METRIC_KEY,
+                "metric_name": metric_label,
+                "source": source,
+                "raw_metric_name": str(metric_name),
+                "value_percent": min(100.0, max(0.0, float(value))),
+            }
+        )
+    if not rows:
+        return [], "no Nsight GPU utilization samples found", metric_label, source
+    first_timestamp = min(int(row["timestamp_ns"]) for row in rows)
+    for row in rows:
+        row["elapsed_seconds"] = _ms(int(row["timestamp_ns"]) - first_timestamp) / 1000.0
+    return rows, None, metric_label, source
+
+
+def _gpu_utilization_summary_rows(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[int, str], list[float]] = defaultdict(list)
+    metadata: dict[tuple[int, str], dict[str, Any]] = {}
+    for sample in samples:
+        key = (int(sample["gpu_id"]), str(sample["metric"]))
+        grouped[key].append(float(sample["value_percent"]))
+        metadata.setdefault(key, sample)
+
+    rows: list[dict[str, Any]] = []
+    for key, values in sorted(grouped.items()):
+        sample = metadata[key]
+        stats = _metric_stats(values)
+        rows.append(
+            {
+                "device": "gpu",
+                "gpu_id": sample["gpu_id"],
+                "gpu": sample["gpu"],
+                "metric": sample["metric"],
+                "metric_name": sample["metric_name"],
+                "source": sample["source"],
+                "samples": stats["samples"],
+                "mean_percent": stats["avg_percent"],
+                "avg_percent": stats["avg_percent"],
+                "p50_percent": stats["p50_percent"],
+                "p95_percent": stats["p95_percent"],
+                "max_percent": stats["max_percent"],
+            }
+        )
+    return rows
+
+
+def _gpu_utilization_range_summary_rows(samples: list[dict[str, Any]], ranges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for current_range in ranges:
+        start = int(current_range["start_ns"])
+        end = int(current_range["end_ns"])
+        grouped: dict[tuple[int, str], list[float]] = defaultdict(list)
+        metadata: dict[tuple[int, str], dict[str, Any]] = {}
+        for sample in samples:
+            timestamp = int(sample["timestamp_ns"])
+            if timestamp < start or timestamp > end:
+                continue
+            key = (int(sample["gpu_id"]), str(sample["metric"]))
+            grouped[key].append(float(sample["value_percent"]))
+            metadata.setdefault(key, sample)
+        for key, values in sorted(grouped.items()):
+            sample = metadata[key]
+            stats = _metric_stats(values)
+            rows.append(
+                {
+                    "device": "gpu",
+                    "scope": current_range["scope"],
+                    "phase": current_range["phase"],
+                    "step": current_range["step"],
+                    "start_ns": start,
+                    "end_ns": end,
+                    "milliseconds": _ms(end - start),
+                    "gpu_id": sample["gpu_id"],
+                    "gpu": sample["gpu"],
+                    "metric": sample["metric"],
+                    "metric_name": sample["metric_name"],
+                    "source": sample["source"],
+                    "samples": stats["samples"],
+                    "mean_percent": stats["avg_percent"],
+                    "avg_percent": stats["avg_percent"],
+                    "p50_percent": stats["p50_percent"],
+                    "p95_percent": stats["p95_percent"],
+                    "max_percent": stats["max_percent"],
+                }
+            )
+    return rows
+
+
+def _cpu_utilization_from_source_profile(source_profile: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    metrics = source_profile.get("utilization_metrics", {}) if isinstance(source_profile, dict) else {}
+    cpu = metrics.get("cpu", {}) if isinstance(metrics, dict) else {}
+    if not isinstance(cpu, dict) or not cpu.get("available"):
+        return {}, [], []
+    timeseries = cpu.get("timeseries", {})
+    raw_rows = timeseries.get("rows", []) if isinstance(timeseries, dict) else []
+    rows: list[dict[str, Any]] = []
+    for raw_row in (raw_rows if isinstance(raw_rows, list) else []):
+        if not isinstance(raw_row, dict):
+            continue
+        value = raw_row.get("value_percent", raw_row.get("cpu_util_percent"))
+        try:
+            value_percent = min(100.0, max(0.0, float(value)))
+        except (TypeError, ValueError):
+            continue
+        elapsed = raw_row.get("elapsed_seconds", raw_row.get("timestamp_seconds"))
+        try:
+            elapsed_seconds = float(elapsed)
+        except (TypeError, ValueError):
+            elapsed_seconds = float(len(rows))
+        rows.append(
+            {
+                **raw_row,
+                "device": "cpu",
+                "metric": "cpu_process_util",
+                "metric_name": "CPU process utilization",
+                "source": raw_row.get("source", "process_cpu_time"),
+                "elapsed_seconds": elapsed_seconds,
+                "value_percent": value_percent,
+            }
+        )
+    summary = cpu.get("summary", {}) if isinstance(cpu.get("summary"), dict) else {}
+    summary_row = {
+        "device": "cpu",
+        "metric": "cpu_process_util",
+        "metric_name": "CPU process utilization",
+        "source": cpu.get("source", "process_cpu_time"),
+        "samples": summary.get("samples", len(rows)),
+        "available_cpu_cores": summary.get("available_cpu_cores"),
+        "mean_percent": summary.get("mean_percent", summary.get("avg_percent", 0.0)),
+        "avg_percent": summary.get("avg_percent", summary.get("mean_percent", 0.0)),
+        "p50_percent": summary.get("p50_percent", 0.0),
+        "p95_percent": summary.get("p95_percent", 0.0),
+        "max_percent": summary.get("max_percent", 0.0),
+    }
+    return summary_row, rows, list(cpu.get("notes", [])) if isinstance(cpu.get("notes"), list) else []
+
+
+def summarize_utilization_metrics(con: sqlite3.Connection, source_profile: dict[str, Any]) -> dict[str, Any]:
+    gpu_samples, gpu_reason, gpu_metric_label, gpu_source = _gpu_utilization_samples(con)
+    ranges = _interconnect_ranges(con)
+    gpu_summary_rows = _gpu_utilization_summary_rows(gpu_samples) if gpu_samples else []
+    gpu_range_rows = _gpu_utilization_range_summary_rows(gpu_samples, ranges) if gpu_samples else []
+    cpu_summary_row, cpu_rows, cpu_notes = _cpu_utilization_from_source_profile(source_profile)
+    summary_rows = [*gpu_summary_rows]
+    if cpu_summary_row:
+        summary_rows.append(cpu_summary_row)
+    timeseries_rows = [*gpu_samples, *cpu_rows]
+    available = bool(summary_rows)
+    return {
+        "available": available,
+        "units": "percent",
+        "gpu": {
+            "available": bool(gpu_samples),
+            "source": gpu_source,
+            "metric_name": gpu_metric_label,
+            "reason": "" if gpu_samples else gpu_reason,
+            "summary": {"rows": gpu_summary_rows},
+            "range_summary": {"rows": gpu_range_rows},
+            "timeseries": {"rows": gpu_samples},
+        },
+        "cpu": {
+            "available": bool(cpu_summary_row),
+            "source": cpu_summary_row.get("source", "process_cpu_time") if cpu_summary_row else "process_cpu_time",
+            "summary": cpu_summary_row,
+            "timeseries": {"rows": cpu_rows},
+            "notes": cpu_notes,
+        },
+        "summary": {"rows": summary_rows},
+        "range_summary": {"rows": gpu_range_rows},
+        "timeseries": {"rows": timeseries_rows},
+        "artifacts": {
+            "timeline_plot": "utilization.png",
+            "timeseries_csv": "utilization_timeseries.csv",
+            "summary_csv": "utilization_summary.csv",
+        },
+        "notes": [
+            "GPU utilization uses Nsight SM Active / SMs Active when available, falling back to GR Active.",
+            "CPU utilization uses process CPU time normalized by available CPU affinity cores.",
+            "CPU utilization is not RAM occupancy.",
+            "At 100 Hz GPU sampling, sub-10 ms bursts can be missed.",
+        ],
+    }
+
+
+def _interconnect_samples(con: sqlite3.Connection) -> tuple[list[dict[str, Any]], str | None]:
+    required_tables = ("GPU_METRICS", "TARGET_INFO_GPU_METRICS")
+    missing = [table for table in required_tables if not _table_exists(con, table)]
+    if missing:
+        return [], f"missing Nsight GPU metric table(s): {', '.join(missing)}"
+
+    metric_names = tuple(_INTERCONNECT_METRICS.keys())
+    rows: list[dict[str, Any]] = []
+    for timestamp, type_id, metric_id, metric_name, value, gpu_name, bus_location in _gpu_metric_query_rows(con, metric_names):
         metric_info = _INTERCONNECT_METRICS.get(str(metric_name))
         if metric_info is None:
             continue
@@ -1807,6 +2035,62 @@ def write_interconnect_artifacts(report: dict[str, Any], output_dir: Path) -> No
         _plot_interconnect_by_phase(metrics, output_dir)
     except Exception as exc:
         print(f"warning: failed to write interconnect CTC plots: {exc}", file=sys.stderr, flush=True)
+
+
+def _utilization_series(rows: list[dict[str, Any]], device: str) -> tuple[list[float], list[float]]:
+    points: list[tuple[float, float]] = []
+    for row in rows:
+        if str(row.get("device") or "") != device:
+            continue
+        try:
+            x = float(row.get("elapsed_seconds", row.get("timestamp_seconds", 0.0)) or 0.0)
+            y = float(row.get("value_percent", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        points.append((x, min(100.0, max(0.0, y))))
+    points.sort(key=lambda item: item[0])
+    return [x for x, _ in points], [y for _, y in points]
+
+
+def _plot_utilization_timeline(metrics: dict[str, Any], output_dir: Path) -> None:
+    rows = metrics.get("timeseries", {}).get("rows", [])
+    if not isinstance(rows, list) or not rows:
+        return
+    normalized_rows = [row for row in rows if isinstance(row, dict)]
+    gpu_x, gpu_y = _utilization_series(normalized_rows, "gpu")
+    cpu_x, cpu_y = _utilization_series(normalized_rows, "cpu")
+    if not gpu_x and not cpu_x:
+        return
+    plt = _matplotlib_pyplot()
+    fig, axes = plt.subplots(2, 1, figsize=(10.5, 5.4), dpi=160, sharex=True, constrained_layout=True)
+    panels = (
+        (axes[0], gpu_x, gpu_y, "GPU Utilization", "#ff2d2d"),
+        (axes[1], cpu_x, cpu_y, "CPU Utilization", "#1f4aff"),
+    )
+    for ax, xs, ys, title, color in panels:
+        if xs:
+            ax.plot(xs, ys, color=color, linewidth=1.6)
+            if title.startswith("GPU"):
+                ax.fill_between(xs, ys, color=color, alpha=0.16, step=None)
+        ax.set_title(title, loc="right", fontsize=10, pad=3)
+        ax.set_ylabel("Utilization (%)")
+        ax.set_ylim(0.0, 100.0)
+        ax.grid(True, axis="both", alpha=0.25)
+    axes[-1].set_xlabel("Elapsed time (s)")
+    fig.savefig(output_dir / "utilization.png", bbox_inches="tight")
+    plt.close(fig)
+
+
+def write_utilization_artifacts(report: dict[str, Any], output_dir: Path) -> None:
+    metrics = report.get("utilization_metrics")
+    if not isinstance(metrics, dict) or not metrics.get("available"):
+        return
+    _write_dict_rows_csv(output_dir / "utilization_timeseries.csv", metrics.get("timeseries", {}).get("rows", []))
+    _write_dict_rows_csv(output_dir / "utilization_summary.csv", metrics.get("summary", {}).get("rows", []))
+    try:
+        _plot_utilization_timeline(metrics, output_dir)
+    except Exception as exc:
+        print(f"warning: failed to write utilization plot: {exc}", file=sys.stderr, flush=True)
 
 
 def _semantic_rows(stage: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2831,6 +3115,46 @@ def _interconnect_markdown(report: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _utilization_markdown(report: dict[str, Any]) -> list[str]:
+    metrics = report.get("utilization_metrics")
+    if not isinstance(metrics, dict) or not metrics.get("available"):
+        return []
+    summary_rows = metrics.get("summary", {}).get("rows", [])
+    if not isinstance(summary_rows, list) or not summary_rows:
+        return []
+    display_rows = [row for row in summary_rows if isinstance(row, dict)]
+    if not display_rows:
+        return []
+    lines = [
+        "## Utilization",
+        "",
+        "GPU utilization uses Nsight SM Active when available; CPU utilization is process CPU time normalized by available CPU affinity cores.",
+        "",
+        "| Device | Metric | mean % | p50 % | p95 % | max % | samples |",
+        "|---|---|---:|---:|---:|---:|---:|",
+    ]
+    for row in sorted(display_rows, key=lambda item: (str(item.get("device", "")), str(item.get("metric_name", "")))):
+        lines.append(
+            f"| {str(row.get('device', '-')).upper()} | "
+            f"{row.get('metric_name', '-')} | "
+            f"{float(row.get('mean_percent', row.get('avg_percent', 0.0)) or 0.0):.2f} | "
+            f"{float(row.get('p50_percent', 0.0) or 0.0):.2f} | "
+            f"{float(row.get('p95_percent', 0.0) or 0.0):.2f} | "
+            f"{float(row.get('max_percent', 0.0) or 0.0):.2f} | "
+            f"{int(row.get('samples', 0) or 0)} |"
+        )
+    artifacts = metrics.get("artifacts", {})
+    if isinstance(artifacts, dict):
+        lines += [
+            "",
+            f"Plot: `{artifacts.get('timeline_plot', 'utilization.png')}`.",
+            "",
+        ]
+    else:
+        lines.append("")
+    return lines
+
+
 def _front_summary_markdown(report: dict[str, Any]) -> list[str]:
     source_profile = report.get("source_profile", {})
     memory_profile = report.get("memory_profile", {})
@@ -2839,6 +3163,7 @@ def _front_summary_markdown(report: dict[str, Any]) -> list[str]:
     lines: list[str] = []
     lines.extend(_semantic_timing_memory_markdown(report))
     lines.extend(_top_bottlenecks_markdown(report))
+    lines.extend(_utilization_markdown(report))
     lines.extend(_interconnect_markdown(report))
     lines.extend(_timing_summary_markdown(report, "step.forward", "Forward"))
     lines.extend(_timing_summary_markdown(report, "step.backward", "Backward"))
@@ -3063,6 +3388,9 @@ def main() -> None:
     phase_start = _log_timing("Summarizing interconnect GPU metrics")
     interconnect_metrics = summarize_interconnect_metrics(con)
     _log_timing("Summarized interconnect GPU metrics", phase_start)
+    phase_start = _log_timing("Summarizing utilization metrics")
+    utilization_metrics = summarize_utilization_metrics(con, source_profile)
+    _log_timing("Summarized utilization metrics", phase_start)
     report = {
         "source": str(args.sqlite_path),
         "source_profile": source_profile,
@@ -3070,6 +3398,7 @@ def main() -> None:
         "stages": [forward_stage, backward_stage],
         "step_samples": step_samples,
         "interconnect_metrics": interconnect_metrics,
+        "utilization_metrics": utilization_metrics,
     }
     if args.output_json:
         phase_start = _log_timing("Writing Nsight JSON report")
@@ -3091,6 +3420,7 @@ def main() -> None:
         phase_start = _log_timing("Writing Nsight CSV/sample artifacts")
         write_step_sample_artifacts(report, artifact_dir)
         write_interconnect_artifacts(report, artifact_dir)
+        write_utilization_artifacts(report, artifact_dir)
         _log_timing("Wrote Nsight CSV/sample artifacts", phase_start)
     if not args.output_json and not args.output_md:
         print(json.dumps(report, indent=2, sort_keys=True))

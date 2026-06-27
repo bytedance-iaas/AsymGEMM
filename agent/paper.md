@@ -46,7 +46,7 @@ Next Steps:
 3. [TODO] Improve the system throughput with scheduling based on the required model size + sequence length
 
 
-
+#############################################################################################################
 
 Motivation Figures:
 - Superoffload has large activations footprints in HBM wrt seq length. Large activations causes OOM.
@@ -54,8 +54,20 @@ Motivation Figures:
 - Why does it have issues with extending to 2 GPUs (Superoffload + deepspeed / Superoffload + seq parallel)?
 <!-- - CPU + GPU computes vs. GPU-only computes (Run superoffload directly) -->
 
+Method:
 
+Baselines:
+- FSDP
+- FSDP Offload (Optimizer State + Model Params)
+- Zero2
+- Zero2 Offload (Optimizer State)
+- Zero3 
+- Zero3 Offload (Optimizer State)
+- Zero3 Offload (Optimizer State + Model Params)
+- Superoffload (Optimizer State + Model Params)
+<!-- - Megatron (Optimizer State) -->
 
+Exps:
 
 
 
