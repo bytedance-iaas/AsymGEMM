@@ -8,6 +8,7 @@ import csv
 import json
 import math
 import re
+import shutil
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,8 @@ def plot_title(text: str, *, width: int = 86) -> str:
 
 
 def save_plot(fig: Any, path: Path) -> None:
+    # PNGs are written directly into output_dir (no plots/ subfolder); data/ stays nested.
+    path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, bbox_inches="tight")
 STYLE_PALETTE = (
     "#0072B2",
@@ -1578,9 +1581,10 @@ def combined_threshold_label(group: tuple[str, ...], mode: str, varied: set[str]
 
 
 def write_table(rows: list[dict[str, Any]], output_dir: Path, name: str) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / f"{name}.json").write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
-    with (output_dir / f"{name}.csv").open("w", newline="", encoding="utf-8") as handle:
+    data_dir = output_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / f"{name}.json").write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
+    with (data_dir / f"{name}.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
@@ -1589,7 +1593,10 @@ def write_table(rows: list[dict[str, Any]], output_dir: Path, name: str) -> None
 def clean_output_dir(output_dir: Path) -> None:
     if not output_dir.exists():
         return
-    # Keep the root output directory limited to the sweep index.
+    for generated_dir in (output_dir / "plots", output_dir / "data"):
+        if generated_dir.exists():
+            shutil.rmtree(generated_dir)
+    # Remove legacy direct files from older flat layouts.
     for name in ROOT_OUTPUT_FILES + COMBINED_OUTPUT_FILES:
         path = output_dir / name
         if path.is_file():
@@ -1598,9 +1605,15 @@ def clean_output_dir(output_dir: Path) -> None:
         path.unlink()
     for path in output_dir.glob("reserved_unallocated_hbm_vs*.png"):
         path.unlink()
+    # Flat layout: PNGs live directly in output_dir, so clean by location (no plots/ subdir to rmtree).
+    for path in output_dir.glob("*.png"):
+        path.unlink()
     for child in output_dir.iterdir():
         if not child.is_dir():
             continue
+        for generated_dir in (child / "plots", child / "data"):
+            if generated_dir.exists():
+                shutil.rmtree(generated_dir)
         if child.name in {"_combined", "combined"}:
             for name in COMBINED_OUTPUT_FILES:
                 path = child / name
@@ -1628,10 +1641,32 @@ def clean_output_dir(output_dir: Path) -> None:
             path.unlink()
         for path in child.glob("*_vs_expert_*_threshold_s*.png"):
             path.unlink()
+        # Flat layout: remove any remaining PNGs that lived directly in the child dir.
+        for path in child.glob("*.png"):
+            path.unlink()
         try:
             child.rmdir()
         except OSError:
             pass
+
+
+def write_readme(output_dir: Path, *, combined: bool, runs: int) -> None:
+    title = "LF Timing Combined Artifacts" if combined else "LF Timing Artifacts"
+    lines = [
+        f"# {title}",
+        "",
+        "Timing and allocator-summary plots from LF `profile.json` artifacts.",
+        "",
+        "## Files",
+        "",
+        "- `plots/`: PNG timing and HBM plots.",
+        "- `data/`: CSV/JSON indices and per-step samples used by the plots.",
+        "",
+        f"Rows included: {runs}.",
+        "",
+    ]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "README.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def coefficient_of_variation(values: list[float]) -> float:
@@ -3138,28 +3173,37 @@ def main() -> None:
     ]
     if seq_rows and not args.skip_combined:
         write_combined_plots(seq_rows, combined_dir)
-    if step_rows and not args.skip_combined:
-        write_combined_step_plots(step_rows, combined_dir)
+    if seq_step_rows and not args.skip_combined:
+        write_combined_step_plots(seq_step_rows, combined_dir)
+    if not args.skip_combined:
+        write_readme(combined_dir, combined=True, runs=len(rows))
 
     if not args.combined_only:
         groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
         for row in seq_rows:
             groups.setdefault(group_key(row), []).append(row)
         step_groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
-        for row in step_rows:
+        for row in seq_step_rows:
             step_groups.setdefault(group_key(row), []).append(row)
-        for key in sorted(set(groups) | set(step_groups)):
+        group_keys = set(groups) | set(step_groups)
+        if args.skip_combined and len(group_keys) > 1:
+            raise SystemExit("--skip-combined expects one timing group; use --combined-only for multi-group metric roots")
+        for key in sorted(group_keys):
             group_rows = groups.get(key, [])
             group_step_rows = step_groups.get(key, [])
             workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = key
-            group_dir = root / safe_label(
-                f"{workload}-b{batch_size}-ga{grad_accum}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}-{layeract}-{layergc}-{liger_loss}"
-            )
+            if args.skip_combined:
+                group_dir = root
+            else:
+                group_dir = root / safe_label(
+                    f"{workload}-b{batch_size}-ga{grad_accum}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}-{layeract}-{layergc}-{liger_loss}"
+                )
             if group_rows:
                 write_table(group_rows, group_dir, "sweep_summary")
                 write_group_plots(group_rows, group_dir, key)
             if group_step_rows:
                 write_group_step_plots(group_step_rows, group_dir, key)
+            write_readme(group_dir, combined=False, runs=len(group_rows or group_step_rows))
             print(f"wrote {group_dir}", flush=True)
 
     for family in ("tok", "tok_act"):
@@ -3173,16 +3217,24 @@ def main() -> None:
         family_groups: dict[tuple[tuple[str, ...], int], list[dict[str, Any]]] = {}
         for row in family_rows:
             family_groups.setdefault((group_key(row), int(row["seq_len"])), []).append(row)
+        if args.skip_combined and len(family_groups) > 1:
+            raise SystemExit("--skip-combined expects one timing policy group; use --combined-only for multi-group metric roots")
         suffix = policy_filename_suffix(family)
         for (key, seq_len), group_rows in sorted(family_groups.items()):
             workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = key
-            group_dir = root / safe_label(
-                f"{workload}-b{batch_size}-ga{grad_accum}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}-{layeract}-{layergc}-{liger_loss}"
-            )
+            if args.skip_combined:
+                group_dir = root
+            else:
+                group_dir = root / safe_label(
+                    f"{workload}-b{batch_size}-ga{grad_accum}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}-{layeract}-{layergc}-{liger_loss}"
+                )
             write_table(group_rows, group_dir, f"{suffix}_summary_s{seq_len}")
             write_group_policy_plots(group_rows, group_dir, key, seq_len, family)
+            write_readme(group_dir, combined=False, runs=len(group_rows))
             print(f"wrote {group_dir} {suffix} s{seq_len}", flush=True)
-    print(f"wrote {root / 'activation_recompute_sweep_index.json'}", flush=True)
+    if not args.combined_only:
+        write_readme(root, combined=False, runs=len(rows))
+    print(f"wrote {root / 'data' / 'activation_recompute_sweep_index.json'}", flush=True)
 
 
 if __name__ == "__main__":

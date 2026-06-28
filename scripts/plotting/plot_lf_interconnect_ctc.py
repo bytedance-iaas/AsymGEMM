@@ -15,6 +15,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 
 
 CTC_METRICS = ("ctc_rx", "ctc_tx")
@@ -130,7 +131,20 @@ METRIC_COLORS = {
     "ctc_rx": "#1f77b4",
     "ctc_tx": "#d62728",
 }
+# Phase background shading for the per-step timeline (forward -> backward -> optimizer).
+# Hues chosen distinct from the RX (blue) and TX (red) lines so the lines stay readable.
+PHASE_SHADE = (
+    ("forward", "Forward", "#4C9A4C"),      # green
+    ("backward", "Backward", "#8A6FC1"),    # purple
+    ("optimizer", "Optimizer", "#D9A300"),  # gold
+)
+PHASE_SHADE_ALPHA = 0.17
 RUN_DIR_RE = re.compile(r"^b(?P<batch_size>[0-9]+)_s(?P<seq_len>[0-9]+)_ga(?P<grad_accum>[0-9]+)$")
+POINTS_PER_STEP = 100  # resample each measured step to this many points
+TIMELINE_VARIANTS = (
+    ("avg", "mean", "avg per bucket", "timeline_avg.png"),
+    ("max", "max", "max per bucket", "timeline_max.png"),
+)
 
 
 @dataclass(frozen=True)
@@ -139,6 +153,8 @@ class RunRecord:
     profile_path: Path
     metadata: dict[str, str]
     by_step: dict[int, dict[str, dict[str, float]]]
+    timelines: dict[str, dict[str, list[tuple[float, float]]]]
+    phase_spans: tuple[tuple[str, float, float], ...] = ()
 
     @property
     def label(self) -> str:
@@ -193,13 +209,6 @@ def _to_float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
-
-
-def _safe_label(value: str) -> str:
-    cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in value).strip("_")
-    while "__" in cleaned:
-        cleaned = cleaned.replace("__", "_")
-    return cleaned or "run"
 
 
 def _normalize_bool_config(value: Any, default: str = "false") -> str:
@@ -559,6 +568,208 @@ def _aggregate_step_rows(rows: list[Any]) -> dict[int, dict[str, dict[str, float
     return by_step
 
 
+def _phase_spans(rows: list[Any], bounds: list[tuple[float, float]]) -> list[tuple[str, float, float]]:
+    """Per-step forward/backward/optimizer x-bands (step-index coords) for timeline shading.
+
+    Each measured step occupies [k, k+1). Forward/backward come from the NVTX phase ranges
+    (durations in ns, clock-rate-invariant), drawn contiguous forward -> backward; the leftover
+    tail of the measured step (bounds[k], which spans the full trainer step incl. the optimizer)
+    is the post-backward optimizer+overhead region. Without measured-step bounds the optimizer
+    tail is unknown, so only forward/backward are shaded.
+    """
+    per_step: dict[int, dict[str, float]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or row.get("scope") != "phase":
+            continue
+        if str(row.get("metric") or "") != "ctc_rx":  # one metric only -> no double count
+            continue
+        phase = str(row.get("phase") or "")
+        if phase not in ("forward", "backward"):
+            continue
+        try:
+            step = int(row.get("step"))
+            dur = (int(row.get("end_ns")) - int(row.get("start_ns"))) / 1e9
+        except (TypeError, ValueError):
+            continue
+        if dur > 0:
+            per_step.setdefault(step, {})[phase] = dur
+    spans: list[tuple[str, float, float]] = []
+    for index, step in enumerate(sorted(per_step)):
+        durs = per_step[step]
+        fwd_s = durs.get("forward", 0.0)
+        bwd_s = durs.get("backward", 0.0)
+        have_bounds = index < len(bounds)
+        denom = (bounds[index][1] - bounds[index][0]) if have_bounds else (fwd_s + bwd_s)
+        if denom <= 0:
+            continue
+        f = fwd_s / denom
+        b = bwd_s / denom
+        if f + b > 1.0:  # guard clock skew so phases never overflow the step
+            f, b = f / (f + b), b / (f + b)
+        x = float(index)
+        if f > 0:
+            spans.append(("forward", x, x + f))
+        if b > 0:
+            spans.append(("backward", x + f, x + f + b))
+        # optimizer = tail of the measured step after backward; only defined when backward exists
+        # (a missing backward range -> incomplete step, leave the tail unshaded rather than mislabel).
+        if have_bounds and b > 0 and (1.0 - f - b) > 1e-4:
+            spans.append(("optimizer", x + f + b, x + 1.0))
+    return spans
+
+
+def _phase_duration_seconds(row: dict[str, Any], *keys: str) -> float:
+    for key in keys:
+        value = _to_float(row.get(key))
+        if value > 0.0:
+            return value / 1000.0
+    return 0.0
+
+
+def _phase_spans_from_step_samples(
+    profile: dict[str, Any],
+    bounds: list[tuple[float, float]],
+) -> list[tuple[str, float, float]]:
+    source_profile = profile.get("source_profile")
+    if not isinstance(source_profile, dict):
+        return []
+    step_samples = source_profile.get("step_samples")
+    rows = step_samples.get("rows") if isinstance(step_samples, dict) else None
+    if not isinstance(rows, list):
+        return []
+    measured_rows = [row for row in rows if isinstance(row, dict) and not row.get("is_warmup")]
+    spans: list[tuple[str, float, float]] = []
+    for index, row in enumerate(measured_rows):
+        have_bounds = index < len(bounds)
+        denom = (bounds[index][1] - bounds[index][0]) if have_bounds else 0.0
+        if denom <= 0.0:
+            denom = _phase_duration_seconds(row, "trainer_e2e_step_milliseconds", "step_milliseconds")
+        if denom <= 0.0:
+            continue
+        fwd_s = _phase_duration_seconds(row, "forward_milliseconds", "source_forward_milliseconds")
+        bwd_s = _phase_duration_seconds(row, "backward_milliseconds", "source_backward_milliseconds")
+        f = fwd_s / denom
+        b = bwd_s / denom
+        if f + b > 1.0:
+            f, b = f / (f + b), b / (f + b)
+        x = float(index)
+        if f > 0.0:
+            spans.append(("forward", x, x + f))
+        if b > 0.0:
+            spans.append(("backward", x + f, x + f + b))
+        if (1.0 - f - b) > 1e-4:
+            spans.append(("optimizer", x + f + b, x + 1.0))
+    return spans
+
+
+def _phase_spans_from_profile(
+    profile: dict[str, Any],
+    range_rows: list[Any],
+    bounds: list[tuple[float, float]],
+) -> list[tuple[str, float, float]]:
+    spans = _phase_spans_from_step_samples(profile, bounds)
+    if spans:
+        return spans
+    return _phase_spans(range_rows, bounds)
+
+
+def _measured_step_bounds(profile: dict[str, Any]) -> list[tuple[float, float]]:
+    """[(start, end), ...] trainer-e2e seconds for non-warmup steps (source_profile.step_samples)."""
+    source_profile = profile.get("source_profile")
+    if not isinstance(source_profile, dict):
+        return []
+    step_samples = source_profile.get("step_samples")
+    rows = step_samples.get("rows") if isinstance(step_samples, dict) else None
+    if not isinstance(rows, list):
+        return []
+    bounds: list[tuple[float, float]] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("is_warmup"):
+            continue
+        try:
+            start = float(row.get("trainer_e2e_start_seconds"))
+            end = float(row.get("trainer_e2e_end_seconds"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(start) and math.isfinite(end) and end > start:
+            bounds.append((start, end))
+    return sorted(bounds, key=lambda item: item[0])
+
+
+def _affine_to_window(
+    series: list[tuple[float, float]], window: tuple[float, float] | None
+) -> list[tuple[float, float]]:
+    """Map a series' own elapsed range onto [window.start, window.end] (CTC Nsight clock -> steps)."""
+    if not series or window is None:
+        return series
+    start, end = window
+    lo, hi = series[0][0], series[-1][0]
+    if hi <= lo:
+        return series
+    scale = (end - start) / (hi - lo)
+    return [(start + (x - lo) * scale, y) for x, y in series]
+
+
+def _resample_per_step(
+    series: list[tuple[float, float]], bounds: list[tuple[float, float]], points_per_step: int, agg: str = "max"
+) -> list[tuple[float, float]]:
+    """Resample (elapsed, value) to points_per_step per measured step; x = step_index + fraction.
+
+    agg "max" reports each bucket's peak (right for saturation); "mean" reports the average. Falls
+    back to one synthetic step over the series' own span when bounds are unavailable.
+    """
+    if not series or points_per_step <= 0:
+        return []
+    if not bounds:
+        bounds = [(series[0][0], series[-1][0])]
+    out: list[tuple[float, float]] = []
+    for index, (start, end) in enumerate(bounds):
+        if end <= start:
+            continue
+        buckets: list[list[float]] = [[] for _ in range(points_per_step)]
+        for x, y in series:
+            if start <= x < end:
+                slot = int((x - start) / (end - start) * points_per_step)
+                buckets[min(slot, points_per_step - 1)].append(y)
+        for slot, values in enumerate(buckets):
+            if values:
+                value = max(values) if agg == "max" else sum(values) / len(values)
+                out.append((index + (slot + 0.5) / points_per_step, value))
+    return out
+
+
+def _ctc_timeline_series(
+    metrics: dict[str, Any], bounds: list[tuple[float, float]]
+) -> dict[str, dict[str, list[tuple[float, float]]]]:
+    """Per-step-normalized CTC RX/TX timelines keyed by timeline variant, then metric label."""
+    rows = metrics.get("timeseries", {}).get("rows", [])
+    if not isinstance(rows, list):
+        return {}
+    raw: dict[str, dict[int, float]] = {"ctc_rx": {}, "ctc_tx": {}}
+    for row in rows:
+        if not isinstance(row, dict) or row.get("metric_key") not in raw:
+            continue
+        try:
+            timestamp = int(row.get("timestamp_ns"))
+            value = float(row.get("value_percent"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value):
+            continue
+        key = row["metric_key"]
+        raw[key][timestamp] = max(raw[key].get(timestamp, 0.0), min(100.0, max(0.0, value)))
+    window = (bounds[0][0], bounds[-1][1]) if bounds else None
+    timelines: dict[str, dict[str, list[tuple[float, float]]]] = {name: {} for name, _agg, _suffix, _file in TIMELINE_VARIANTS}
+    for key in ("ctc_rx", "ctc_tx"):
+        points = [(float(ts), val) for ts, val in sorted(raw[key].items())]
+        normalized = _affine_to_window(points, window)
+        for variant, agg, _suffix, _filename in TIMELINE_VARIANTS:
+            resampled = _resample_per_step(normalized, bounds, POINTS_PER_STEP, agg)
+            if resampled:
+                timelines[variant][METRIC_LABELS[key]] = resampled
+    return {variant: series for variant, series in timelines.items() if series}
+
+
 def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
     runs: list[RunRecord] = []
     for profile_path in _find_profile_paths(args.input_root, args.run_dir):
@@ -576,11 +787,14 @@ def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
         metadata = _infer_metadata(profile_path, profile)
         if metadata is None:
             continue
+        bounds = _measured_step_bounds(profile)
         record = RunRecord(
             run_dir=profile_path.parent,
             profile_path=profile_path,
             metadata=metadata,
             by_step=by_step,
+            timelines=_ctc_timeline_series(metrics, bounds),
+            phase_spans=tuple(_phase_spans_from_profile(profile, rows, bounds)),
         )
         if _matches_filters(record, args):
             runs.append(record)
@@ -599,10 +813,14 @@ def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
     )
 
 
-def _prepare_output(path: Path, clean: bool) -> None:
+def _prepare_output(path: Path, clean: bool) -> tuple[Path, Path]:
     if clean and path.exists():
         shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
+    plots_dir = path  # plots sit directly in the metric folder; data/ stays nested
+    data_dir = path / "data"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return plots_dir, data_dir
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str] | None = None) -> None:
@@ -682,103 +900,80 @@ def _step_rows(runs: list[RunRecord]) -> list[dict[str, Any]]:
     return rows
 
 
-def _plot_by_step(runs: list[RunRecord], out_dir: Path) -> None:
+def _plot_timeline(
+    runs: list[RunRecord],
+    plots_dir: Path,
+    *,
+    variant: str,
+    title_suffix: str,
+    filename: str,
+) -> None:
     n_runs = len(runs)
     ncols = 2 if n_runs > 2 else 1
     nrows = math.ceil(n_runs / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(8.0 * ncols, 3.4 * nrows), sharey=True, squeeze=False, constrained_layout=True)
+    color_for = {METRIC_LABELS["ctc_rx"]: METRIC_COLORS["ctc_rx"], METRIC_LABELS["ctc_tx"]: METRIC_COLORS["ctc_tx"]}
+    legend_handles: dict[str, Any] = {}
     for idx, run in enumerate(runs):
         ax = axes[idx // ncols][idx % ncols]
-        for metric in CTC_METRICS:
-            p95 = _metric_step_values(run, metric, "p95_percent")
-            max_values = _metric_step_values(run, metric, "max_percent")
-            if not any(value for _step, value in p95) and not any(value for _step, value in max_values):
+        n_steps = 0
+        # Phase background bands (forward -> backward -> optimizer) behind the RX/TX lines.
+        for phase_key, phase_label, phase_color in PHASE_SHADE:
+            drawn = False
+            for span_key, x0, x1 in run.phase_spans:
+                if span_key != phase_key or x1 <= x0:
+                    continue
+                ax.axvspan(x0, x1, color=phase_color, alpha=PHASE_SHADE_ALPHA, linewidth=0, zorder=0)
+                drawn = True
+            if drawn:
+                legend_handles.setdefault(
+                    phase_label, Patch(facecolor=phase_color, alpha=PHASE_SHADE_ALPHA, label=phase_label)
+                )
+        # CTC RX/TX already per-step-normalized (x = measured step).
+        for label in (METRIC_LABELS["ctc_rx"], METRIC_LABELS["ctc_tx"]):
+            series = run.timelines.get(variant, {}).get(label, [])
+            if not series:
                 continue
-            steps = [step for step, _value in p95]
-            ax.plot(
-                steps,
-                [value for _step, value in p95],
-                label=f"{METRIC_LABELS[metric]} p95",
-                color=METRIC_COLORS[metric],
-                linewidth=1.7,
-            )
-            ax.plot(
-                [step for step, _value in max_values],
-                [value for _step, value in max_values],
-                label=f"{METRIC_LABELS[metric]} max",
-                color=METRIC_COLORS[metric],
-                linestyle=":",
-                linewidth=1.3,
-            )
-        ax.axhline(90.0, color="#444444", linestyle="--", linewidth=0.9)
+            xs = [point[0] for point in series]
+            ys = [point[1] for point in series]
+            n_steps = max(n_steps, int(math.ceil(max(xs))))
+            (line,) = ax.plot(xs, ys, label=label, color=color_for[label], linewidth=1.5)
+            legend_handles.setdefault(label, line)
+        for boundary in range(1, n_steps):
+            ax.axvline(boundary, color="#999999", linestyle=":", linewidth=0.8, alpha=0.6)
+        ax.set_xlim(0.0, float(max(n_steps, 1)))
+        ax.set_xticks(list(range(n_steps + 1)))
         ax.set_title(run.label or run.run_dir.name, fontsize=9)
         ax.set_xlabel("Measured step")
         ax.set_ylim(bottom=0.0, top=max(100.0, ax.get_ylim()[1]))
         ax.grid(True, axis="y", alpha=0.25)
         if idx % ncols == 0:
-            ax.set_ylabel("Saturation (%)")
+            ax.set_ylabel("C2C Saturation (%)")
     for idx in range(n_runs, nrows * ncols):
         axes[idx // ncols][idx % ncols].axis("off")
-    handles, labels = axes[0][0].get_legend_handles_labels()
-    if handles:
+    if legend_handles:
+        labels = list(legend_handles)
         fig.legend(
-            handles,
+            [legend_handles[name] for name in labels],
             labels,
             loc="lower center",
             bbox_to_anchor=(0.5, 1.0),
-            ncol=max(1, min(len(labels), 5)),
+            ncol=max(1, min(len(labels), 6)),
             frameon=False,
         )
-    fig.suptitle("Combined C2C Saturation by Measured Step", fontsize=12)
-    fig.savefig(out_dir / "combined_c2c_saturation_by_step.png", dpi=180, bbox_inches="tight")
+    fig.suptitle(f"C2C Saturation Timeline by Measured Step ({POINTS_PER_STEP} pts/step, {title_suffix})", fontsize=12)
+    fig.savefig(plots_dir / filename, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
-def _plot_peak_summary(runs: list[RunRecord], out_dir: Path) -> None:
-    labels = [run.label or run.run_dir.name for run in runs]
-    summary = _summary_rows(runs)
-    by_run_metric = {(row["profile_json"], row["metric"]): row for row in summary}
-    y_positions = list(range(len(runs)))
-    height = max(4.5, min(28.0, 0.52 * len(runs) + 2.5))
-    fig, ax = plt.subplots(figsize=(10.0, height), constrained_layout=True)
-    for metric, offset in (("ctc_rx", -0.18), ("ctc_tx", 0.18)):
-        p95 = [
-            float(by_run_metric.get((str(run.profile_path), metric), {}).get("p95_peak_percent", 0.0))
-            for run in runs
-        ]
-        max_values = [
-            float(by_run_metric.get((str(run.profile_path), metric), {}).get("max_peak_percent", 0.0))
-            for run in runs
-        ]
-        ys = [y + offset for y in y_positions]
-        ax.barh(ys, p95, height=0.3, color=METRIC_COLORS[metric], alpha=0.72, label=f"{METRIC_LABELS[metric]} p95 peak")
-        ax.scatter(max_values, ys, color=METRIC_COLORS[metric], marker="D", s=18, label=f"{METRIC_LABELS[metric]} max peak")
-    ax.axvline(90.0, color="#444444", linestyle="--", linewidth=1.0, label="90%")
-    ax.set_yticks(y_positions)
-    ax.set_yticklabels(labels, fontsize=8)
-    ax.set_xlabel("Saturation (%)")
-    fig.suptitle("Combined C2C Peak Saturation")
-    all_values = [float(row.get("p95_peak_percent", 0.0)) for row in summary] + [float(row.get("max_peak_percent", 0.0)) for row in summary]
-    ax.set_xlim(left=0.0, right=max(100.0, max(all_values, default=0.0) * 1.08))
-    ax.grid(True, axis="x", alpha=0.25)
-    _summary_handles, _summary_labels = ax.get_legend_handles_labels()
-    ax.legend(
-        _summary_handles,
-        _summary_labels,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 1.02),
-        ncol=max(1, min(len(_summary_labels), 5)),
-        borderaxespad=0.0,
-        frameon=False,
-        fontsize=8,
-    )
-    fig.savefig(out_dir / "combined_c2c_peak_summary.png", dpi=180, bbox_inches="tight")
-    plt.close(fig)
+def _plot_timelines(runs: list[RunRecord], plots_dir: Path) -> None:
+    for variant, _agg, title_suffix, filename in TIMELINE_VARIANTS:
+        _plot_timeline(runs, plots_dir, variant=variant, title_suffix=title_suffix, filename=filename)
 
 
 def _write_readme(out_dir: Path, *, runs: list[RunRecord], reason: str | None = None) -> None:
     lines = [
-        "# LF C2C / CTC Combined Artifacts",
+        "# LF C2C / CTC Artifacts",
         "",
         "These files summarize Nsight Systems GPU metric samples for NVLink-C2C/CTC throughput saturation.",
         "Values are percent of peak throughput reported by Nsight GPU metrics, not absolute GB/s.",
@@ -799,11 +994,11 @@ def _write_readme(out_dir: Path, *, runs: list[RunRecord], reason: str | None = 
             [
                 "## Files",
                 "",
-                "- `combined_c2c_saturation_by_step.png`: subplots per run; x-axis is measured step, y-axis is C2C RX/TX saturation percent.",
-                "- `combined_c2c_peak_summary.png`: per-run peak p95 bars and max markers.",
-                "- `combined_c2c_summary.csv`: one row per run and C2C direction.",
-                "- `combined_c2c_step_summary.csv`: one row per run, step, and C2C direction.",
-                "- `combined_c2c_index.csv` / `combined_c2c_index.json`: input run index.",
+                f"- `timeline_avg.png`: subplots per run; x-axis is the measured step ({POINTS_PER_STEP} pts/step, mean per bucket), y-axis is C2C RX/TX saturation percent.",
+                f"- `timeline_max.png`: subplots per run; x-axis is the measured step ({POINTS_PER_STEP} pts/step, max per bucket), y-axis is C2C RX/TX saturation percent.",
+                "- `data/summary.csv`: one row per run and C2C direction.",
+                "- `data/step_summary.csv`: one row per run, step, and C2C direction.",
+                "- `data/index.csv` / `data/index.json`: input run index.",
                 "",
                 f"Runs included: {len(runs)}.",
                 "",
@@ -813,49 +1008,16 @@ def _write_readme(out_dir: Path, *, runs: list[RunRecord], reason: str | None = 
 
 
 def _write_empty_outputs(out_dir: Path, clean: bool, reason: str) -> None:
-    _prepare_output(out_dir, clean)
-    _write_csv(out_dir / "combined_c2c_summary.csv", [], SUMMARY_FIELDS)
-    _write_csv(out_dir / "combined_c2c_step_summary.csv", [], STEP_FIELDS)
-    _write_csv(out_dir / "combined_c2c_index.csv", [], INDEX_FIELDS)
-    (out_dir / "combined_c2c_index.json").write_text("[]\n", encoding="utf-8")
+    _plots_dir, data_dir = _prepare_output(out_dir, clean)
+    _write_csv(data_dir / "summary.csv", [], SUMMARY_FIELDS)
+    _write_csv(data_dir / "step_summary.csv", [], STEP_FIELDS)
+    _write_csv(data_dir / "index.csv", [], INDEX_FIELDS)
+    (data_dir / "index.json").write_text("[]\n", encoding="utf-8")
     _write_readme(out_dir, runs=[], reason=reason)
 
 
-def _group_label(run: RunRecord) -> str:
-    metadata = run.metadata
-    parts = [
-        metadata.get("workload", ""),
-        f"b{metadata.get('batch_size', '')}" if metadata.get("batch_size") else "",
-        f"ga{metadata.get('gradient_accumulation_steps', '')}" if metadata.get("gradient_accumulation_steps") else "",
-        f"drop{metadata.get('lora_dropout', '').replace('.', '')}" if metadata.get("lora_dropout") else "",
-        metadata.get("precision", ""),
-        metadata.get("backend", ""),
-        metadata.get("profiler", ""),
-        f"router{metadata.get('router_mode', '')}" if metadata.get("router_mode") else "",
-        metadata.get("expact", ""),
-        metadata.get("attnact", ""),
-        metadata.get("layeract", ""),
-        metadata.get("layergc", ""),
-        metadata.get("liger_loss", ""),
-        metadata.get("recompute", ""),
-        f"pol{metadata.get('expert_policy', '')}" if metadata.get("expert_policy") else "",
-    ]
-    return _safe_label("-".join(part for part in parts if part))
-
-
-def _write_grouped_outputs(runs: list[RunRecord], out_dir: Path, clean: bool) -> None:
-    groups: dict[str, list[RunRecord]] = {}
-    for run in runs:
-        groups.setdefault(_group_label(run), []).append(run)
-    # Skip single-run groups: they just duplicate that config's own leaf interconnect_ctc_* outputs.
-    for label, group_runs in sorted(groups.items()):
-        if len(group_runs) <= 1:
-            continue
-        _write_outputs(group_runs, out_dir / label, clean, write_groups=False)
-
-
-def _write_outputs(runs: list[RunRecord], out_dir: Path, clean: bool, *, write_groups: bool = True) -> None:
-    _prepare_output(out_dir, clean)
+def _write_outputs(runs: list[RunRecord], out_dir: Path, clean: bool) -> None:
+    plots_dir, data_dir = _prepare_output(out_dir, clean)
     summary_rows = _summary_rows(runs)
     step_rows = _step_rows(runs)
     index_rows = [
@@ -867,15 +1029,12 @@ def _write_outputs(runs: list[RunRecord], out_dir: Path, clean: bool, *, write_g
         }
         for run in runs
     ]
-    _write_csv(out_dir / "combined_c2c_summary.csv", summary_rows, SUMMARY_FIELDS)
-    _write_csv(out_dir / "combined_c2c_step_summary.csv", step_rows, STEP_FIELDS)
-    _write_csv(out_dir / "combined_c2c_index.csv", index_rows, INDEX_FIELDS)
-    (out_dir / "combined_c2c_index.json").write_text(json.dumps(index_rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _plot_by_step(runs, out_dir)
-    _plot_peak_summary(runs, out_dir)
+    _write_csv(data_dir / "summary.csv", summary_rows, SUMMARY_FIELDS)
+    _write_csv(data_dir / "step_summary.csv", step_rows, STEP_FIELDS)
+    _write_csv(data_dir / "index.csv", index_rows, INDEX_FIELDS)
+    (data_dir / "index.json").write_text(json.dumps(index_rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _plot_timelines(runs, plots_dir)
     _write_readme(out_dir, runs=runs)
-    if write_groups:
-        _write_grouped_outputs(runs, out_dir, clean)
 
 
 def main() -> None:

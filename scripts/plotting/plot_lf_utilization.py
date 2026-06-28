@@ -16,18 +16,20 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.plotting.plot_lf_interconnect_ctc import (
+    PHASE_SHADE,
+    PHASE_SHADE_ALPHA,
     _apply_workload_filters,
     _find_profile_paths,
+    _phase_spans,
     _infer_metadata,
     _matches_filters,
-    _parse_job_dir_parts,
-    _safe_label,
     _safe_read_json,
 )
 
@@ -99,7 +101,7 @@ INDEX_FIELDS = [
     "profile_json",
     "run_dir",
 ]
-TIMELINE_BIN_SECONDS = 0.25
+POINTS_PER_STEP = 100  # resample each measured (non-warmup) step to this many points; x-axis = step index
 
 
 @dataclass(frozen=True)
@@ -109,6 +111,7 @@ class RunRecord:
     metadata: dict[str, str]
     summary: dict[str, Any]
     series: dict[str, list[tuple[float, float]]]
+    phase_spans: tuple[tuple[str, float, float], ...] = ()
 
     @property
     def label(self) -> str:
@@ -256,23 +259,83 @@ def _measured_window(profile: dict[str, Any]) -> tuple[float, float] | None:
     return start, end
 
 
-def _shift_series_to_window(series: list[tuple[float, float]], window: tuple[float, float] | None) -> list[tuple[float, float]]:
-    if window is None:
+def _measured_step_bounds(profile: dict[str, Any]) -> list[tuple[float, float]]:
+    """[(start, end), ...] in trainer-e2e seconds for non-warmup steps (source_profile.step_samples)."""
+    source_profile = profile.get("source_profile")
+    if not isinstance(source_profile, dict):
+        return []
+    step_samples = source_profile.get("step_samples")
+    rows = step_samples.get("rows") if isinstance(step_samples, dict) else None
+    if not isinstance(rows, list):
+        return []
+    bounds: list[tuple[float, float]] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("is_warmup"):
+            continue
+        start = _float_or_none(row.get("trainer_e2e_start_seconds"))
+        end = _float_or_none(row.get("trainer_e2e_end_seconds"))
+        if start is not None and end is not None and end > start:
+            bounds.append((start, end))
+    return sorted(bounds, key=lambda item: item[0])
+
+
+def _affine_to_window(
+    series: list[tuple[float, float]], window: tuple[float, float] | None
+) -> list[tuple[float, float]]:
+    """Linearly map a series' own elapsed range onto [window.start, window.end].
+
+    The GPU line is on the Nsight capture clock, which is gated to the post-warmup steps and so
+    spans ~the measured window but with its own origin/scale. An affine fit co-registers it with
+    the trainer step boundaries used for binning.
+    """
+    if not series or window is None:
         return series
     start, end = window
-    shifted = [(elapsed - start, value) for elapsed, value in series if start <= elapsed <= end]
-    return sorted(shifted, key=lambda item: item[0])
+    lo, hi = series[0][0], series[-1][0]
+    if hi <= lo:
+        return series
+    scale = (end - start) / (hi - lo)
+    return [(start + (elapsed - lo) * scale, value) for elapsed, value in series]
+
+
+def _resample_per_step(
+    series: list[tuple[float, float]], bounds: list[tuple[float, float]], points_per_step: int
+) -> list[tuple[float, float]]:
+    """Resample (elapsed, value) points (trainer seconds) to points_per_step per measured step.
+
+    Returns (x, value) with x = step_index + (k + 0.5) / points_per_step, so each step occupies one
+    x-unit regardless of wall-clock duration (total points = points_per_step * len(bounds)). Falls
+    back to one synthetic step over the series' own span when bounds are unavailable.
+    """
+    if not series or points_per_step <= 0:
+        return []
+    if not bounds:
+        bounds = [(series[0][0], series[-1][0])]
+    out: list[tuple[float, float]] = []
+    for index, (start, end) in enumerate(bounds):
+        if end <= start:
+            continue
+        buckets: list[list[float]] = [[] for _ in range(points_per_step)]
+        for elapsed, value in series:
+            if start <= elapsed < end:
+                slot = int((elapsed - start) / (end - start) * points_per_step)
+                buckets[min(slot, points_per_step - 1)].append(value)
+        for slot, values in enumerate(buckets):
+            if values:
+                out.append((index + (slot + 0.5) / points_per_step, sum(values) / len(values)))
+    return out
 
 
 def _channel_series(
     profile: dict[str, Any],
     measured_window: tuple[float, float] | None,
 ) -> dict[str, list[tuple[float, float]]]:
-    """One time-series per channel: one entry per GPU id (keyed "GPU <id>") plus "CPU".
+    """Per-step-normalized series per channel ("GPU <id>" + "CPU").
 
-    GPU points keep their Nsight capture-relative elapsed axis; CPU points are shifted to the
-    post-warmup measured-step window. The two come from different clocks (Nsight capture vs the
-    in-process sampler) and are not co-registered, so GPU is left on its own axis.
+    Each measured (non-warmup) step is resampled to POINTS_PER_STEP points, so the x-axis is the
+    measured step index and every step has equal width regardless of duration. CPU samples are
+    already in trainer time; GPU samples (Nsight clock) are affine-mapped onto the measured window
+    first so the two co-register on the step axis.
     """
     metrics = profile.get("utilization_metrics")
     if not isinstance(metrics, dict) or not metrics.get("available"):
@@ -302,14 +365,77 @@ def _channel_series(
             gpu_points.setdefault(gpu_id, []).append((elapsed, value))
         elif device == "cpu":
             cpu_points.append((elapsed, value))
+    bounds = _measured_step_bounds(profile)
+    window = (bounds[0][0], bounds[-1][1]) if bounds else measured_window
     channels: dict[str, list[tuple[float, float]]] = {}
     for gpu_id in sorted(gpu_points):
-        channels[f"GPU {gpu_id}"] = sorted(gpu_points[gpu_id], key=lambda item: item[0])
+        gpu_sorted = sorted(gpu_points[gpu_id], key=lambda item: item[0])
+        channels[f"GPU {gpu_id}"] = _resample_per_step(_affine_to_window(gpu_sorted, window), bounds, POINTS_PER_STEP)
     if cpu_points:
-        channels["CPU"] = _shift_series_to_window(
-            sorted(cpu_points, key=lambda item: item[0]), measured_window
-        )
+        cpu_sorted = sorted(cpu_points, key=lambda item: item[0])
+        channels["CPU"] = _resample_per_step(cpu_sorted, bounds, POINTS_PER_STEP)
     return channels
+
+
+def _duration_seconds(row: dict[str, Any], *keys: str) -> float:
+    for key in keys:
+        value = _float_or_none(row.get(key))
+        if value is not None and value > 0.0:
+            return value / 1000.0
+    return 0.0
+
+
+def _phase_spans_from_step_samples(
+    profile: dict[str, Any],
+    bounds: list[tuple[float, float]],
+) -> list[tuple[str, float, float]]:
+    source_profile = profile.get("source_profile")
+    if not isinstance(source_profile, dict):
+        return []
+    step_samples = source_profile.get("step_samples")
+    rows = step_samples.get("rows") if isinstance(step_samples, dict) else None
+    if not isinstance(rows, list):
+        return []
+    measured_rows = [row for row in rows if isinstance(row, dict) and not row.get("is_warmup")]
+    spans: list[tuple[str, float, float]] = []
+    for index, row in enumerate(measured_rows):
+        have_bounds = index < len(bounds)
+        denom = (bounds[index][1] - bounds[index][0]) if have_bounds else 0.0
+        if denom <= 0.0:
+            denom = _duration_seconds(row, "trainer_e2e_step_milliseconds", "step_milliseconds")
+        if denom <= 0.0:
+            continue
+        fwd_s = _duration_seconds(row, "forward_milliseconds", "source_forward_milliseconds")
+        bwd_s = _duration_seconds(row, "backward_milliseconds", "source_backward_milliseconds")
+        f = fwd_s / denom
+        b = bwd_s / denom
+        if f + b > 1.0:
+            f, b = f / (f + b), b / (f + b)
+        x = float(index)
+        if f > 0.0:
+            spans.append(("forward", x, x + f))
+        if b > 0.0:
+            spans.append(("backward", x + f, x + f + b))
+        if (1.0 - f - b) > 1e-4:
+            spans.append(("optimizer", x + f + b, x + 1.0))
+    return spans
+
+
+def _phase_spans_from_profile(
+    profile: dict[str, Any],
+    bounds: list[tuple[float, float]],
+) -> tuple[tuple[str, float, float], ...]:
+    step_sample_spans = _phase_spans_from_step_samples(profile, bounds)
+    if step_sample_spans:
+        return tuple(step_sample_spans)
+    metrics = profile.get("interconnect_metrics")
+    range_summary = metrics.get("range_summary") if isinstance(metrics, dict) else None
+    rows = range_summary.get("rows") if isinstance(range_summary, dict) else None
+    if isinstance(rows, list):
+        spans = _phase_spans(rows, bounds)
+        if spans:
+            return tuple(spans)
+    return tuple(_phase_spans_from_step_samples(profile, bounds))
 
 
 def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
@@ -319,6 +445,7 @@ def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
         summary = _run_summary(profile)
         measured_window = _measured_window(profile)
         series = _channel_series(profile, measured_window)
+        bounds = _measured_step_bounds(profile)
         if not any(channel != "CPU" for channel in series):
             # Skip CPU-only/empty profiles so source-only runs don't create GPU-less panels.
             continue
@@ -331,6 +458,7 @@ def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
             metadata=metadata,
             summary=summary,
             series=series,
+            phase_spans=_phase_spans_from_profile(profile, bounds),
         )
         if _matches_filters(record, args):
             runs.append(record)
@@ -349,10 +477,14 @@ def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
     )
 
 
-def _prepare_output(path: Path, clean: bool) -> None:
+def _prepare_output(path: Path, clean: bool) -> tuple[Path, Path]:
     if clean and path.exists():
         shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
+    plots_dir = path  # plots sit directly in the metric folder; data/ stays nested
+    data_dir = path / "data"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return plots_dir, data_dir
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str] | None = None) -> None:
@@ -376,7 +508,7 @@ def _summary_rows(runs: list[RunRecord]) -> list[dict[str, Any]]:
             **run.metadata,
             "run_label": run.label,
             **run.summary,
-            "utilization_plot": str(run.run_dir / "utilization.png"),
+            "utilization_plot": str(run.run_dir / "metrics" / "utilization" / "utilization.png"),
             "profile_json": str(run.profile_path),
             "run_dir": str(run.run_dir),
         }
@@ -407,26 +539,6 @@ def _plot_label(run: RunRecord) -> str:
     return " ".join(part for part in parts if part)
 
 
-def _bin_series(series: list[tuple[float, float]], bin_seconds: float) -> list[tuple[float, float]]:
-    if bin_seconds <= 0.0 or len(series) <= 1:
-        return series
-    bins: dict[int, list[float]] = {}
-    for elapsed, value in series:
-        bucket = int(elapsed // bin_seconds)
-        bins.setdefault(bucket, []).append(value)
-    return [
-        ((bucket + 0.5) * bin_seconds, sum(values) / len(values))
-        for bucket, values in sorted(bins.items())
-        if values
-    ]
-
-
-def _bin_label(bin_seconds: float) -> str:
-    if bin_seconds < 1.0:
-        return f"{bin_seconds * 1000.0:g} ms"
-    return f"{bin_seconds:g} s"
-
-
 # Distinct reds/oranges per GPU id; CPU is always blue. Color keyed by gpu id so a given
 # physical GPU keeps the same color across subplots and the shared legend stays consistent.
 _GPU_LINE_COLORS = ["#ff2d2d", "#ff8c00", "#9b1d1d", "#ff5c8a", "#d2691e", "#7a0000", "#ffae42", "#c71585"]
@@ -451,7 +563,7 @@ def _channel_sort_key(channel: str) -> tuple[int, int]:
     return (1, 0) if channel == "CPU" else (0, _gpu_id_from_channel(channel))
 
 
-def _plot_timeline(runs: list[RunRecord], out_dir: Path) -> None:
+def _plot_timeline(runs: list[RunRecord], plots_dir: Path) -> None:
     n_runs = len(runs)
     ncols = 2 if n_runs > 2 else 1
     nrows = math.ceil(n_runs / ncols)
@@ -463,24 +575,40 @@ def _plot_timeline(runs: list[RunRecord], out_dir: Path) -> None:
         squeeze=False,
         constrained_layout=True,
     )
-    bin_label = _bin_label(TIMELINE_BIN_SECONDS)
     legend_handles: dict[str, Any] = {}
     for idx, run in enumerate(runs):
         ax = axes[idx // ncols][idx % ncols]
-        # One line per GPU id, CPU last.
+        n_steps = 0
+        for phase_key, phase_label, phase_color in PHASE_SHADE:
+            drawn = False
+            for span_key, x0, x1 in run.phase_spans:
+                if span_key != phase_key or x1 <= x0:
+                    continue
+                ax.axvspan(x0, x1, color=phase_color, alpha=PHASE_SHADE_ALPHA, linewidth=0, zorder=0)
+                drawn = True
+            if drawn:
+                legend_handles.setdefault(
+                    phase_label,
+                    Patch(facecolor=phase_color, alpha=PHASE_SHADE_ALPHA, label=phase_label),
+                )
+        # One line per GPU id, CPU last; series are already per-step-normalized (x = step index).
         for channel in sorted(run.series, key=_channel_sort_key):
             series = run.series.get(channel, [])
             if not series:
                 continue
-            binned = _bin_series(series, TIMELINE_BIN_SECONDS)
-            xs = [point[0] for point in binned]
-            ys = [point[1] for point in binned]
+            xs = [point[0] for point in series]
+            ys = [point[1] for point in series]
+            n_steps = max(n_steps, int(math.ceil(max(xs))))
             (line,) = ax.plot(xs, ys, color=_channel_color(channel), linewidth=1.4, label=channel)
             legend_handles.setdefault(channel, line)
+        for boundary in range(1, n_steps):
+            ax.axvline(boundary, color="#999999", linestyle=":", linewidth=0.8, alpha=0.6)
+        ax.set_xlim(0.0, float(max(n_steps, 1)))
+        ax.set_xticks(list(range(n_steps + 1)))
         ax.set_title(_plot_label(run) or run.run_dir.name, fontsize=9)
-        ax.set_xlabel("Elapsed time (s)")
+        ax.set_xlabel("Measured step")
         ax.set_ylim(0.0, 100.0)
-        ax.grid(True, axis="both", alpha=0.25)
+        ax.grid(True, axis="y", alpha=0.25)
         if idx % ncols == 0:
             ax.set_ylabel("Utilization (%)")
     for idx in range(n_runs, nrows * ncols):
@@ -495,22 +623,21 @@ def _plot_timeline(runs: list[RunRecord], out_dir: Path) -> None:
             ncol=max(1, min(len(labels), 5)),
             frameon=False,
         )
-    fig.suptitle(f"Per-GPU and CPU Utilization Timeline ({bin_label} mean)", fontsize=12)
-    fig.savefig(out_dir / "combined_utilization_timeline.png", dpi=180, bbox_inches="tight")
+    fig.suptitle(f"Per-GPU and CPU Utilization by Measured Step ({POINTS_PER_STEP} pts/step)", fontsize=12)
+    fig.savefig(plots_dir / "timeline.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
 def _write_readme(out_dir: Path, *, runs: list[RunRecord], reason: str | None = None) -> None:
-    bin_label = _bin_label(TIMELINE_BIN_SECONDS)
     lines = [
-        "# LF Utilization Combined Artifacts",
+        "# LF Utilization Artifacts",
         "",
         "These files combine per-run GPU and CPU utilization timelines across runs.",
-        f"`combined_utilization_timeline.png` renders {bin_label} mean utilization bins and stacks one subplot per run, drawing one line per physical GPU id plus a CPU line.",
-        "The per-run timeline plot is `utilization.png` next to each `profile.json`.",
+        f"`timeline.png` resamples each measured (non-warmup) step to {POINTS_PER_STEP} points, so the x-axis is the measured step index and every step has equal width regardless of wall-clock duration. One subplot per run, one line per physical GPU id plus a CPU line.",
+        "The per-run timeline plot is `metrics/utilization/utilization.png` under each run directory.",
         "GPU values come from Nsight SM Active / SMs Active when available (one line per physical GPU); CPU values come from process CPU time normalized by available CPU affinity cores.",
         "Runs without GPU utilization samples are excluded so CPU-only source profiles do not create extra panels.",
-        "GPU lines use the Nsight capture-relative time axis; CPU samples are shifted to the post-warmup measured-step window, so GPU and CPU are not co-registered in wall-clock time.",
+        "CPU samples are binned by the trainer step boundaries; GPU samples (Nsight capture clock) are affine-mapped onto the measured window first, then binned by the same boundaries.",
         "",
     ]
     if reason:
@@ -520,9 +647,9 @@ def _write_readme(out_dir: Path, *, runs: list[RunRecord], reason: str | None = 
             [
                 "## Files",
                 "",
-                "- `combined_utilization_timeline.png`: stacked per-run GPU/CPU measured-window timeline plot.",
-                "- `combined_utilization_summary.csv`: one row per run.",
-                "- `combined_utilization_index.csv` / `combined_utilization_index.json`: input run index.",
+                "- `timeline.png`: stacked per-run GPU/CPU per-measured-step utilization plot.",
+                "- `data/summary.csv`: one row per run.",
+                "- `data/index.csv` / `data/index.json`: input run index.",
                 "",
                 f"Runs included: {len(runs)}.",
                 "",
@@ -532,47 +659,15 @@ def _write_readme(out_dir: Path, *, runs: list[RunRecord], reason: str | None = 
 
 
 def _write_empty_outputs(out_dir: Path, clean: bool, reason: str) -> None:
-    _prepare_output(out_dir, clean)
-    _write_csv(out_dir / "combined_utilization_summary.csv", [], SUMMARY_FIELDS)
-    _write_csv(out_dir / "combined_utilization_index.csv", [], INDEX_FIELDS)
-    (out_dir / "combined_utilization_index.json").write_text("[]\n", encoding="utf-8")
+    _plots_dir, data_dir = _prepare_output(out_dir, clean)
+    _write_csv(data_dir / "summary.csv", [], SUMMARY_FIELDS)
+    _write_csv(data_dir / "index.csv", [], INDEX_FIELDS)
+    (data_dir / "index.json").write_text("[]\n", encoding="utf-8")
     _write_readme(out_dir, runs=[], reason=reason)
 
 
-def _group_label(run: RunRecord) -> str:
-    metadata = run.metadata
-    parts = [
-        metadata.get("workload", ""),
-        f"b{metadata.get('batch_size', '')}" if metadata.get("batch_size") else "",
-        f"ga{metadata.get('gradient_accumulation_steps', '')}" if metadata.get("gradient_accumulation_steps") else "",
-        f"drop{metadata.get('lora_dropout', '').replace('.', '')}" if metadata.get("lora_dropout") else "",
-        metadata.get("precision", ""),
-        metadata.get("backend", ""),
-        metadata.get("profiler", ""),
-        f"router{metadata.get('router_mode', '')}" if metadata.get("router_mode") else "",
-        metadata.get("expact", ""),
-        metadata.get("attnact", ""),
-        metadata.get("layeract", ""),
-        metadata.get("layergc", ""),
-        metadata.get("liger_loss", ""),
-        metadata.get("recompute", ""),
-        f"pol{metadata.get('expert_policy', '')}" if metadata.get("expert_policy") else "",
-    ]
-    return _safe_label("-".join(part for part in parts if part))
-
-
-def _write_grouped_outputs(runs: list[RunRecord], out_dir: Path, clean: bool) -> None:
-    groups: dict[str, list[RunRecord]] = {}
-    for run in runs:
-        groups.setdefault(_group_label(run), []).append(run)
-    for label, group_runs in sorted(groups.items()):
-        if len(group_runs) <= 1:
-            continue
-        _write_outputs(group_runs, out_dir / label, clean, write_groups=False)
-
-
-def _write_outputs(runs: list[RunRecord], out_dir: Path, clean: bool, *, write_groups: bool = True) -> None:
-    _prepare_output(out_dir, clean)
+def _write_outputs(runs: list[RunRecord], out_dir: Path, clean: bool) -> None:
+    plots_dir, data_dir = _prepare_output(out_dir, clean)
     summary_rows = _summary_rows(runs)
     index_rows = [
         {
@@ -583,13 +678,11 @@ def _write_outputs(runs: list[RunRecord], out_dir: Path, clean: bool, *, write_g
         }
         for run in runs
     ]
-    _write_csv(out_dir / "combined_utilization_summary.csv", summary_rows, SUMMARY_FIELDS)
-    _write_csv(out_dir / "combined_utilization_index.csv", index_rows, INDEX_FIELDS)
-    (out_dir / "combined_utilization_index.json").write_text(json.dumps(index_rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _plot_timeline(runs, out_dir)
+    _write_csv(data_dir / "summary.csv", summary_rows, SUMMARY_FIELDS)
+    _write_csv(data_dir / "index.csv", index_rows, INDEX_FIELDS)
+    (data_dir / "index.json").write_text(json.dumps(index_rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _plot_timeline(runs, plots_dir)
     _write_readme(out_dir, runs=runs)
-    if write_groups:
-        _write_grouped_outputs(runs, out_dir, clean)
 
 
 def main() -> None:

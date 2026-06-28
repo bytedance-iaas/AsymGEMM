@@ -146,13 +146,6 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
-def _safe_label(value: str) -> str:
-    cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in value).strip("_")
-    while "__" in cleaned:
-        cleaned = cleaned.replace("__", "_")
-    return cleaned or "run"
-
-
 def _normalize_bool_config(value: Any, default: str = "false") -> str:
     text = str(value if value is not None else default).strip().lower()
     if text in {"1", "true", "yes", "y", "on"}:
@@ -535,10 +528,14 @@ def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
     )
 
 
-def _prepare_output(path: Path, clean: bool) -> None:
+def _prepare_output(path: Path, clean: bool) -> tuple[Path, Path]:
     if clean and path.exists():
         shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
+    plots_dir = path  # plots sit directly in the metric folder; data/ stays nested
+    data_dir = path / "data"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return plots_dir, data_dir
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str] | None = None) -> None:
@@ -601,7 +598,7 @@ def _step_rows(runs: list[RunRecord]) -> list[dict[str, Any]]:
     return rows
 
 
-def _plot_by_step(runs: list[RunRecord], out_dir: Path) -> None:
+def _plot_by_step(runs: list[RunRecord], plots_dir: Path) -> None:
     n_runs = len(runs)
     ncols = 2 if n_runs > 2 else 1
     nrows = math.ceil(n_runs / ncols)
@@ -625,14 +622,14 @@ def _plot_by_step(runs: list[RunRecord], out_dir: Path) -> None:
             ax.legend(handles, labels, fontsize=7, loc="lower right", frameon=False)
     for idx in range(n_runs, nrows * ncols):
         axes[idx // ncols][idx % ncols].axis("off")
-    fig.suptitle("Combined Throughput by Measured Step", fontsize=12)
-    fig.savefig(out_dir / "combined_throughput_by_step.png", dpi=180, bbox_inches="tight")
+    fig.suptitle("Throughput by Measured Step", fontsize=12)
+    fig.savefig(plots_dir / "throughput_by_step.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
 def _write_readme(out_dir: Path, *, runs: list[RunRecord], reason: str | None = None) -> None:
     lines = [
-        "# LF Throughput Combined Artifacts",
+        "# LF Throughput Artifacts",
         "",
         "Training throughput in tokens/sec, derived per run from step_samples.csv:",
         "`tokens_per_sec = (batch_size x seq_len x grad_accum) / step_seconds`, over post-warmup (measured) steps only.",
@@ -647,10 +644,10 @@ def _write_readme(out_dir: Path, *, runs: list[RunRecord], reason: str | None = 
             [
                 "## Files",
                 "",
-                "- `combined_throughput_by_step.png`: subplots per run; x-axis is measured step, y-axis tokens/sec, dashed line = effective.",
-                "- `combined_throughput_summary.csv`: one row per run (effective/mean/median/min/max tok/s).",
-                "- `combined_throughput_step_summary.csv`: one row per run and measured step.",
-                "- `combined_throughput_index.csv` / `combined_throughput_index.json`: input run index.",
+                "- `throughput_by_step.png`: subplots per run; x-axis is measured step, y-axis tokens/sec, dashed line = effective.",
+                "- `data/summary.csv`: one row per run (effective/mean/median/min/max tok/s).",
+                "- `data/step_summary.csv`: one row per run and measured step.",
+                "- `data/index.csv` / `data/index.json`: input run index.",
                 "",
                 f"Runs included: {len(runs)}.",
                 "",
@@ -660,48 +657,16 @@ def _write_readme(out_dir: Path, *, runs: list[RunRecord], reason: str | None = 
 
 
 def _write_empty_outputs(out_dir: Path, clean: bool, reason: str) -> None:
-    _prepare_output(out_dir, clean)
-    _write_csv(out_dir / "combined_throughput_summary.csv", [], SUMMARY_FIELDS)
-    _write_csv(out_dir / "combined_throughput_step_summary.csv", [], STEP_FIELDS)
-    _write_csv(out_dir / "combined_throughput_index.csv", [], INDEX_FIELDS)
-    (out_dir / "combined_throughput_index.json").write_text("[]\n", encoding="utf-8")
+    _plots_dir, data_dir = _prepare_output(out_dir, clean)
+    _write_csv(data_dir / "summary.csv", [], SUMMARY_FIELDS)
+    _write_csv(data_dir / "step_summary.csv", [], STEP_FIELDS)
+    _write_csv(data_dir / "index.csv", [], INDEX_FIELDS)
+    (data_dir / "index.json").write_text("[]\n", encoding="utf-8")
     _write_readme(out_dir, runs=[], reason=reason)
 
 
-def _group_label(run: RunRecord) -> str:
-    metadata = run.metadata
-    parts = [
-        metadata.get("workload", ""),
-        f"b{metadata.get('batch_size', '')}" if metadata.get("batch_size") else "",
-        f"ga{metadata.get('gradient_accumulation_steps', '')}" if metadata.get("gradient_accumulation_steps") else "",
-        f"drop{metadata.get('lora_dropout', '').replace('.', '')}" if metadata.get("lora_dropout") else "",
-        metadata.get("precision", ""),
-        metadata.get("backend", ""),
-        metadata.get("profiler", ""),
-        f"router{metadata.get('router_mode', '')}" if metadata.get("router_mode") else "",
-        metadata.get("expact", ""),
-        metadata.get("attnact", ""),
-        metadata.get("layeract", ""),
-        metadata.get("layergc", ""),
-        metadata.get("liger_loss", ""),
-        metadata.get("recompute", ""),
-        f"pol{metadata.get('expert_policy', '')}" if metadata.get("expert_policy") else "",
-    ]
-    return _safe_label("-".join(part for part in parts if part))
-
-
-def _write_grouped_outputs(runs: list[RunRecord], out_dir: Path, clean: bool) -> None:
-    groups: dict[str, list[RunRecord]] = {}
-    for run in runs:
-        groups.setdefault(_group_label(run), []).append(run)
-    for label, group_runs in sorted(groups.items()):
-        if len(group_runs) <= 1:
-            continue
-        _write_outputs(group_runs, out_dir / label, clean, write_groups=False)
-
-
-def _write_outputs(runs: list[RunRecord], out_dir: Path, clean: bool, *, write_groups: bool = True) -> None:
-    _prepare_output(out_dir, clean)
+def _write_outputs(runs: list[RunRecord], out_dir: Path, clean: bool) -> None:
+    plots_dir, data_dir = _prepare_output(out_dir, clean)
     summary_rows = _summary_rows(runs)
     step_rows = _step_rows(runs)
     index_rows = [
@@ -713,18 +678,18 @@ def _write_outputs(runs: list[RunRecord], out_dir: Path, clean: bool, *, write_g
         }
         for run in runs
     ]
-    _write_csv(out_dir / "combined_throughput_summary.csv", summary_rows, SUMMARY_FIELDS)
-    _write_csv(out_dir / "combined_throughput_step_summary.csv", step_rows, STEP_FIELDS)
-    _write_csv(out_dir / "combined_throughput_index.csv", index_rows, INDEX_FIELDS)
-    (out_dir / "combined_throughput_index.json").write_text(json.dumps(index_rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _plot_by_step(runs, out_dir)
+    _write_csv(data_dir / "summary.csv", summary_rows, SUMMARY_FIELDS)
+    _write_csv(data_dir / "step_summary.csv", step_rows, STEP_FIELDS)
+    _write_csv(data_dir / "index.csv", index_rows, INDEX_FIELDS)
+    (data_dir / "index.json").write_text(json.dumps(index_rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _plot_by_step(runs, plots_dir)
     _write_readme(out_dir, runs=runs)
-    if write_groups:
-        _write_grouped_outputs(runs, out_dir, clean)
 
 
 def main() -> None:
     args = _parse_args()
+    if not args.profiler:
+        args.profiler = ["source"]
     _apply_workload_filters(args)
     runs = _load_runs(args)
     if not runs:

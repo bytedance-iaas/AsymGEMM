@@ -96,35 +96,54 @@ else
   #   "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
   #   "llama3.3-70b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
   #   "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  #   "llama3.3-70b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+  #   "llama3.3-70b|1; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
   #   "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
   #   "llama3.3-70b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
   # )
-  # RUNS=(
-  #   "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  #   "q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
-  # )
   RUNS=(
-    "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-    "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-    "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+    # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 75000|8|1 ; none|false|false|false|false|false"
+    # "q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
 
-    "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-    "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-    "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+    "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
+    "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x60k
+    "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x60k
+    "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false"
+    "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 8000|8|1 ; none|false|false|false|false|false"
 
-    "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-    "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-    "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+    "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
+    "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x60k
+    "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # x60k
+    "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false"
+    "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false"
 
-    "q2.5-72b|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-    "q2.5-72b|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-    "q2.5-72b|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-
-    "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-    "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-    "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+    "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # x90k
+    "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 250000|8|1 ; none|false|false|false|false|false" # x60k
+    "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # x60k
+    "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false"
+    "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false"
   )
+
+  # RUNS=(
+  #   "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+  #   "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+
+  #   "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+  #   "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+
+  #   "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+  #   "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+
+  #   "q2.5-72b|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+  #   "q2.5-72b|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "q2.5-72b|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+
+  #   "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
+  #   "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
+  #   "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
+  # )
 fi
 
 # Iterate and parse the rows into scheduler metadata. Each RUNS item remains one scheduled run.
@@ -165,20 +184,20 @@ PRECISION=${PRECISION:-bf16}
 LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 
 # Training
-# MAX_STEPS=${MAX_STEPS:-2}
-# WARMUP_STEPS=${WARMUP_STEPS:-2}
+MAX_STEPS=${MAX_STEPS:-3}
+WARMUP_STEPS=${WARMUP_STEPS:-1}
 # MAX_STEPS=${MAX_STEPS:-6}
 # WARMUP_STEPS=${WARMUP_STEPS:-6}
-MAX_STEPS=${MAX_STEPS:-7}
-WARMUP_STEPS=${WARMUP_STEPS:-3}
+# MAX_STEPS=${MAX_STEPS:-7}
+# WARMUP_STEPS=${WARMUP_STEPS:-3}
 # MAX_STEPS=${MAX_STEPS:-1}
 # WARMUP_STEPS=${WARMUP_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 # LORA_PARAMS is the only LoRA knob: sweep tuples, each "dropout|rank|alpha[|target]" (target optional, default 'all').
 # rank moves memory/throughput; alpha is a scalar (no profiling effect); keep target=all for MoE expert-LoRA.
 # Multi-module target uses '+' (commas separate tuples), e.g. "0.00|64|128|q_proj+k_proj" -> q_proj,k_proj.
-# LORA_PARAMS=${LORA_PARAMS:-"0.00|64|128|all"}
-LORA_PARAMS=${LORA_PARAMS:-"0.00|64|128|all,0.00|16|32|all"}
+LORA_PARAMS=${LORA_PARAMS:-"0.00|64|128|all"}
+# LORA_PARAMS=${LORA_PARAMS:-"0.00|64|128|all,0.00|16|32|all"}
 SEED=${SEED:-42}
 
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
@@ -292,6 +311,7 @@ ENV_DIR=${ENV_DIR:-${ASYM_DIR}/.venv}
 ENV_PYTHON=${ENV_PYTHON:-${ENV_DIR}/bin/python}
 RUN_LF_SCRIPT="${ASYM_DIR}/scripts/lf/run_lf_lora_sft.sh"
 BUILD_DATASET_SCRIPT="${ASYM_DIR}/scripts/lf/build_lf_sft_eval_pair.py"
+PROFILE_NSYS_POSTPROCESS_SCRIPT="${ASYM_DIR}/scripts/lora/postprocess_nsys_lora.py"
 PROFILE_POSTPROCESS_SCRIPT="${ASYM_DIR}/scripts/lf/postprocess_lf_profile_artifacts.py"
 MEMORY_SCHEMA_VALIDATOR="${ASYM_DIR}/scripts/lf/validate_lf_memory_capacity_schema.py"
 PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_activation_recompute_sweep.py"
@@ -721,15 +741,6 @@ is_policy_independent_backend() {
   esac
 }
 
-# A policy the backend-agnostic generic-offload hook acts on: off-layer (whole-layer save_on_cpu) or any
-# expert/attn/layer-GC offload flag set. These are NOT inert on non-asym backends, so they must not be
-# canonicalized to none|false... nor skipped as redundant. Arg: a RUNS policy tuple.
-policy_pair_is_generic_baseline() {
-  case "${1%%|*}" in off-layer) return 0 ;; esac
-  local IFS='|'; local -a f; read -ra f <<< "${1}"
-  [[ "${f[1]:-false}" == "true" || "${f[2]:-false}" == "true" || "${f[4]:-false}" == "true" ]]
-}
-
 # Collapse AsymGEMM-only policy axes to inert values when they're no-ops: policy-independent backends or
 # recompute=recomp. Mutates the caller's dynamically-scoped vars, so callers must declare them `local` first.
 canonicalize_policy_axis_for_inert_run() {
@@ -782,28 +793,6 @@ normalize_expert_policy() {
     return
   fi
   die "invalid expert policy '${1}'; expected none, gc-exp, gc-attn-exp, gc-layer, off-layer, tok-le0, tok-le0-act, tok-leN, tok-geN, tokA-B, or -act variants"
-}
-
-backend_label() {
-  case "${1,,}" in
-    torch) printf 'torch\n' ;;
-    asym) printf 'asym\n' ;;
-    asym_torch) printf 'asym_torch\n' ;;
-    asym_cpuadamwtorch) printf 'asym_cpuadamwtorch\n' ;;
-    asym_cpuadamwds) printf 'asym_cpuadamwds\n' ;;
-    zero2) printf 'zero2\n' ;;
-    zero3) printf 'zero3\n' ;;
-    zero3_offload) printf 'zero3_offload\n' ;;
-    zero3_offload_mem) printf 'zero3_offload_mem\n' ;;
-    zero3_offload_opnvme) printf 'zero3_offload_opnvme\n' ;;
-    zero3_offload_pnvme) printf 'zero3_offload_pnvme\n' ;;
-    zero3_cpuadam) printf 'zero3_cpuadam\n' ;;
-    superoffload) printf 'superoffload\n' ;;
-    superoffload_mem) printf 'superoffload_mem\n' ;;
-    kt_torchbf16) printf 'kt_torchbf16\n' ;;
-    kt_armbf16) printf 'kt_armbf16\n' ;;
-    *) die "backend must be torch, asym, asym_torch, asym_cpuadamwtorch, asym_cpuadamwds, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_cpuadam, superoffload, superoffload_mem, kt_torchbf16, or kt_armbf16, got '${1}'" ;;
-  esac
 }
 
 cpuadam_backend_for_label() {
@@ -1563,10 +1552,6 @@ kt_arm_resolve_matching_source_profile_json() {
   return 1
 }
 
-kt_arm_matching_source_profile_json() {
-  kt_arm_matching_source_profile_json_candidates "$@" | head -n 1
-}
-
 kt_arm_matching_source_profile_json_candidates() {
   local config_root="$1"
   local backend="$2"
@@ -1590,12 +1575,6 @@ plot_workload_from_config_root() {
   else
     printf '%s\n' "${workload}"
   fi
-}
-
-plot_workload_base_from_config_root() {
-  local config_name
-  config_name="$(basename "$1")"
-  printf '%s\n' "${config_name%%__*}"
 }
 
 print_command() {
@@ -1664,12 +1643,72 @@ plot_cmd_base() {
   _cmd_ref+=(--workloads "$@")
 }
 
-memory_combined_plot_cmd_base() {
+config_combined_metric_dir() {
+  local config_root="$1"
+  local metric="$2"
+  if [[ -n "${PLOT_OUTPUT_DIR}" ]]; then
+    printf '%s/%s/combined/%s\n' "$(abs_path "${PLOT_OUTPUT_DIR}")" "$(basename "${config_root}")" "${metric}"
+  else
+    printf '%s/combined/%s\n' "${config_root}" "${metric}"
+  fi
+}
+
+precision_combined_metric_dir() {
+  local metric="$1"
+  if [[ -n "${PLOT_OUTPUT_DIR}" ]]; then
+    printf '%s/combined/%s\n' "$(abs_path "${PLOT_OUTPUT_DIR}")" "${metric}"
+  else
+    printf '%s/combined/%s\n' "${precision_root}" "${metric}"
+  fi
+}
+
+run_metric_dir() {
+  local seq_root="$1"
+  local metric="$2"
+  printf '%s/metrics/%s\n' "${seq_root}" "${metric}"
+}
+
+cleanup_legacy_run_artifacts() {
+  local seq_root="$1"
+  rm -rf "${seq_root}/plots" "${seq_root}/memory_plots"
+  rm -f \
+    "${seq_root}/utilization.png" \
+    "${seq_root}/utilization.csv" \
+    "${seq_root}/utilization_timeseries.csv" \
+    "${seq_root}/utilization_summary.csv" \
+    "${seq_root}/interconnect_ctc_timeline.png" \
+    "${seq_root}/interconnect_ctc_by_step.png" \
+    "${seq_root}/interconnect_ctc_by_phase.png" \
+    "${seq_root}/interconnect_ctc_timeseries.csv" \
+    "${seq_root}/interconnect_ctc_step_summary.csv" \
+    "${seq_root}/interconnect_metric_summary.csv"
+}
+
+cleanup_legacy_combined_artifacts() {
+  local root="$1"
+  rm -rf \
+    "${root}/memory_combined" \
+    "${root}/c2c_combined" \
+    "${root}/utilization_combined" \
+    "${root}/throughput_combined"
+  if [[ -d "${root}/combined" ]]; then
+    find "${root}/combined" -mindepth 1 -maxdepth 1 -type f -delete
+    find "${root}/combined" -mindepth 1 -maxdepth 1 -type d \
+      ! -name timing \
+      ! -name memory \
+      ! -name utilization \
+      ! -name interconnect \
+      ! -name throughput \
+      -exec rm -rf {} +
+  fi
+}
+
+memory_metric_plot_cmd_base() {
   local -n _cmd_ref="$1"
   local input_root="$2"
   local output_dir="$3"
   shift 3
-  (($# > 0)) || die "memory_combined_plot_cmd_base requires at least one workload"
+  (($# > 0)) || die "memory_metric_plot_cmd_base requires at least one workload"
   _cmd_ref=(
     "${ENV_PYTHON}" "${MEMORY_PLOT_SCRIPT}"
     --input-root "${input_root}"
@@ -1681,12 +1720,12 @@ memory_combined_plot_cmd_base() {
   )
 }
 
-interconnect_combined_plot_cmd_base() {
+interconnect_metric_plot_cmd_base() {
   local -n _cmd_ref="$1"
   local input_root="$2"
   local output_dir="$3"
   shift 3
-  (($# > 0)) || die "interconnect_combined_plot_cmd_base requires at least one workload"
+  (($# > 0)) || die "interconnect_metric_plot_cmd_base requires at least one workload"
   _cmd_ref=(
     "${ENV_PYTHON}" "${INTERCONNECT_PLOT_SCRIPT}"
     --input-root "${input_root}"
@@ -1697,12 +1736,12 @@ interconnect_combined_plot_cmd_base() {
   )
 }
 
-throughput_combined_plot_cmd_base() {
+throughput_metric_plot_cmd_base() {
   local -n _cmd_ref="$1"
   local input_root="$2"
   local output_dir="$3"
   shift 3
-  (($# > 0)) || die "throughput_combined_plot_cmd_base requires at least one workload"
+  (($# > 0)) || die "throughput_metric_plot_cmd_base requires at least one workload"
   _cmd_ref=(
     "${ENV_PYTHON}" "${THROUGHPUT_PLOT_SCRIPT}"
     --input-root "${input_root}"
@@ -1713,12 +1752,12 @@ throughput_combined_plot_cmd_base() {
   )
 }
 
-utilization_combined_plot_cmd_base() {
+utilization_metric_plot_cmd_base() {
   local -n _cmd_ref="$1"
   local input_root="$2"
   local output_dir="$3"
   shift 3
-  (($# > 0)) || die "utilization_combined_plot_cmd_base requires at least one workload"
+  (($# > 0)) || die "utilization_metric_plot_cmd_base requires at least one workload"
   _cmd_ref=(
     "${ENV_PYTHON}" "${UTILIZATION_PLOT_SCRIPT}"
     --input-root "${input_root}"
@@ -1729,75 +1768,10 @@ utilization_combined_plot_cmd_base() {
   )
 }
 
-append_backend_filters() {
-  local -n _cmd_ref="$1"
-  local backend
-  for backend in "${backends[@]}"; do _cmd_ref+=(--backend "${backend}"); done
-}
-
 append_plot_profiler_filters() {
   local -n _cmd_ref="$1"
   local profiler
   for profiler in "${plot_profilers[@]}"; do _cmd_ref+=(--profiler "${profiler}"); done
-}
-
-append_recompute_filters() {
-  local -n _cmd_ref="$1"
-  local recompute
-  for recompute in "${recompute_modes[@]}"; do _cmd_ref+=(--recompute "${recompute}"); done
-}
-
-append_liger_loss_filters() {
-  local -n _cmd_ref="$1"
-  local liger_loss
-  for liger_loss in "${liger_loss_modes[@]}"; do _cmd_ref+=(--liger-loss "${liger_loss}"); done
-}
-
-append_router_mode_filters() {
-  local -n _cmd_ref="$1"
-  local router_mode
-  for router_mode in "${plot_router_modes[@]}"; do _cmd_ref+=(--router-mode "${router_mode}"); done
-}
-
-append_expact_filters() {
-  local -n _cmd_ref="$1"
-  local expact_value
-  for expact_value in "${plot_expact_values[@]}"; do _cmd_ref+=(--expact "$(expact_tag "${expact_value}")"); done
-}
-
-append_attnact_filters() {
-  local -n _cmd_ref="$1"
-  local attnact_value
-  for attnact_value in "${plot_attnact_values[@]}"; do _cmd_ref+=(--attnact "$(attnact_tag "${attnact_value}")"); done
-}
-
-append_layeract_filters() {
-  local -n _cmd_ref="$1"
-  local layeract_value
-  for layeract_value in "${plot_layeract_values[@]}"; do _cmd_ref+=(--layeract "$(layeract_tag "${layeract_value}")"); done
-}
-
-append_layergc_filters() {
-  local -n _cmd_ref="$1"
-  local layergc_value
-  for layergc_value in "${plot_layergc_values[@]}"; do _cmd_ref+=(--layergc "$(layergc_tag "${layergc_value}")"); done
-}
-
-append_activation_axis_filters() {
-  append_expact_filters "$1"
-  append_attnact_filters "$1"
-  append_layeract_filters "$1"
-  append_layergc_filters "$1"
-}
-
-append_current_activation_axis_filters() {
-  local -n _cmd_ref="$1"
-  _cmd_ref+=(
-    --expact "${expact_label}"
-    --attnact "${attnact_label}"
-    --layeract "${layeract_label}"
-    --layergc "${layergc_label}"
-  )
 }
 
 append_fixed_profiler_filter() {
@@ -1811,26 +1785,9 @@ append_sweep_plot_filters() {
   append_plot_profiler_filters "$1"
 }
 
-append_running_sweep_plot_filters() {
-  append_backend_filters "$1"
-  append_plot_profiler_filters "$1"
-  append_recompute_filters "$1"
-  append_liger_loss_filters "$1"
-  append_router_mode_filters "$1"
-  append_current_activation_axis_filters "$1"
-}
-
 # Memory combined: source profiler only (dedups the nsys/source pair); no config narrowing.
 memory_plot_filters() {
   append_fixed_profiler_filter "$1" source
-}
-
-memory_running_plot_filters() {
-  append_backend_filters "$1"
-  append_fixed_profiler_filter "$1" source
-  append_liger_loss_filters "$1"
-  append_router_mode_filters "$1"
-  append_current_activation_axis_filters "$1"
 }
 
 # C2C combined: nsys profiler only (C2C metrics exist only in nsys runs); no config narrowing.
@@ -2562,6 +2519,7 @@ materialize_source_artifacts_from_nsys() {
   fi
 
   mkdir -p "${source_seq_root}"
+  rm -f "${source_seq_root}/PENDING.md"  # drop the placeholder now that real artifacts land here
   cp "${nsys_source_profile}" "${source_profile_json}"
   for memory_artifact in memory_breakdown.jsonl memory_breakdown_summary.json; do
     if [[ -f "${nsys_seq_root}/${memory_artifact}" ]]; then
@@ -2585,6 +2543,35 @@ materialize_source_artifacts_from_nsys() {
   : > "${source_log_file}"
   echo "Materializing source artifacts from ${nsys_source_profile} into ${source_seq_root}"
   run_tracked_command_logged "${source_log_file}" "${postprocess_cmd[@]}"
+}
+
+postprocess_existing_nsys_artifacts() {
+  local seq_root="$1"
+  local source_profile_json="$2"
+  local profile_json="$3"
+  local sqlite_path="${seq_root}/trace.sqlite"
+  local summary_md="${seq_root}/summary.md"
+  local -a postprocess_cmd=(
+    "${ENV_PYTHON}" "${PROFILE_NSYS_POSTPROCESS_SCRIPT}"
+    "${sqlite_path}"
+    --output-json "${profile_json}"
+    --output-md "${summary_md}"
+  )
+
+  if [[ ! -f "${sqlite_path}" ]]; then
+    echo "warning: cannot refresh nsys metric artifacts; missing sqlite trace: ${sqlite_path}" >&2
+    return 0
+  fi
+  if [[ ! -f "${PROFILE_NSYS_POSTPROCESS_SCRIPT}" ]]; then
+    echo "Missing Nsight postprocess script ${PROFILE_NSYS_POSTPROCESS_SCRIPT}" >&2
+    return 2
+  fi
+  if [[ -f "${source_profile_json}" ]]; then
+    postprocess_cmd+=(--source-profile-json "${source_profile_json}")
+  fi
+
+  echo "Refreshing LF nsys metric artifacts: ${seq_root}"
+  run_tracked_command "${postprocess_cmd[@]}"
 }
 
 handle_interrupt() {
@@ -2672,6 +2659,10 @@ run_job() {
     source_materialized_source_profile="${source_materialized_seq_root}/source_profile.json"
     source_materialized_profile_json="${source_materialized_seq_root}/profile.json"
     source_materialized_log_file="${source_materialized_seq_root}/train.log"
+    # Create the source sibling up front so both __nsys__ and __source__ folders are visible from
+    # the start; it holds only a PENDING note until materialized from the nsys run after it finishes.
+    mkdir -p "${source_materialized_seq_root}"
+    printf '%s\n' "Source artifacts are materialized from the sibling nsys run after it completes." > "${source_materialized_seq_root}/PENDING.md"
   fi
   local grad_offload_run_label=""
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
@@ -2714,7 +2705,7 @@ run_job() {
     interconnect_plot_roots["${config_root}"]="${seq_len}"
     utilization_plot_roots["${config_root}"]="${seq_len}"
   fi
-  if [[ "${run_profiler}" == "source" ]]; then
+  if [[ "${run_profiler}" == "source" || "${materialize_source_from_nsys}" == "true" ]]; then
     throughput_plot_roots["${config_root}"]="${seq_len}"
   fi
   if [[ "${backend}" == "kt_armbf16" ]]; then
@@ -2742,6 +2733,7 @@ run_job() {
       job_profile_complete "${profile_json}" "${seq_root}" "${backend}" "${seq_len}" "${current_model_name}" "${recompute}" "${ASYM_OFFLOAD_MODULES}" "${ASYMM_EXPERT_ACT_OFFLOAD}" "${ASYMM_ATTN_ACT_OFFLOAD}" "${ASYMM_LAYER_ACT_OFFLOAD}" "${ASYMM_LAYER_GC}" "${lf_expert_lora_impl}" "${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}" "${grad_offload}" "${profile_memory_breakdown}" "${liger_loss}"; then
       echo "Existing nsys profile is complete; materializing missing/stale source artifacts: ${source_materialized_profile_json}" >&2
       append_runs_log_entry "SKIP" "${run_log_payload}" "reason=existing-nsys-complete materializing_source_profile=${source_materialized_profile_json}${run_log_inert_reason}" "${run_log_extra_tag}"
+      postprocess_existing_nsys_artifacts "${seq_root}" "${source_profile}" "${profile_json}" || return $?
       materialize_source_artifacts_from_nsys \
         "${source_profile}" \
         "${source_materialized_seq_root}" \
@@ -2759,12 +2751,11 @@ run_job() {
         "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" source "${liger_loss}" "${grad_offload}" "${source_materialized_seq_root}" "${source_materialized_profile_json}" "${source_materialized_log_file}" "${lf_expert_lora_impl}"
       if profiler_selected_for_plots source; then
         plot_single_run "${config_root}" "${seq_len}" "${backend}" source "${recompute}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${source_materialized_seq_root}"
-        plot_running_combined "${config_root}" "${seq_len}" "${source_materialized_seq_root}"
       fi
       if [[ "${profile_memory_breakdown}" == "true" ]]; then
         plot_memory_single_run "${source_materialized_seq_root}"
-        plot_memory_running_combined "${config_root}" "${seq_len}" "${source_materialized_seq_root}"
       fi
+      plot_throughput_single_run "${source_materialized_seq_root}"
       return 0
     else
       echo "Existing profile is incomplete, partial, or has missing/stale schema-v2 source-memory breakdown; rerunning: ${profile_json}" >&2
@@ -2790,6 +2781,28 @@ run_job() {
       fi
       echo "Found existing: ${profile_json}"
       append_runs_log_entry "SKIP" "${run_log_payload}" "reason=collect-existing-found profile_json=${profile_json}${run_log_inert_reason}" "${run_log_extra_tag}"
+      if [[ "${run_profiler}" == "nsys" ]]; then
+        postprocess_existing_nsys_artifacts "${seq_root}" "${source_profile}" "${profile_json}" || return $?
+      fi
+      if profiler_selected_for_plots "${run_profiler}"; then
+        plot_single_run "${config_root}" "${seq_len}" "${backend}" "${run_profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${seq_root}"
+      fi
+      if [[ "${materialize_source_from_nsys}" == "true" ]] && profiler_selected_for_plots source; then
+        plot_single_run "${config_root}" "${seq_len}" "${backend}" source "${recompute}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${source_materialized_seq_root}"
+      fi
+      if [[ "${profile_memory_breakdown}" == "true" ]]; then
+        if [[ "${materialize_source_from_nsys}" == "true" ]]; then
+          plot_memory_single_run "${source_materialized_seq_root}"
+          plot_throughput_single_run "${source_materialized_seq_root}"
+        elif [[ "${run_profiler}" == "source" ]]; then
+          plot_memory_single_run "${seq_root}"
+          plot_throughput_single_run "${seq_root}"
+        fi
+      elif [[ "${materialize_source_from_nsys}" == "true" ]]; then
+        plot_throughput_single_run "${source_materialized_seq_root}"
+      elif [[ "${run_profiler}" == "source" ]]; then
+        plot_throughput_single_run "${seq_root}"
+      fi
       return 0
     fi
     echo "Missing existing profile: ${profile_json}" >&2
@@ -3037,20 +3050,22 @@ run_job() {
     fi
     if profiler_selected_for_plots "${run_profiler}"; then
       plot_single_run "${config_root}" "${seq_len}" "${backend}" "${run_profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${seq_root}"
-      plot_running_combined "${config_root}" "${seq_len}" "${seq_root}"
     fi
     if [[ "${materialize_source_from_nsys}" == "true" ]] && profiler_selected_for_plots source; then
       plot_single_run "${config_root}" "${seq_len}" "${backend}" source "${recompute}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${source_materialized_seq_root}"
-      plot_running_combined "${config_root}" "${seq_len}" "${source_materialized_seq_root}"
     fi
     if [[ "${profile_memory_breakdown}" == "true" ]]; then
       if [[ "${materialize_source_from_nsys}" == "true" ]]; then
         plot_memory_single_run "${source_materialized_seq_root}"
-        plot_memory_running_combined "${config_root}" "${seq_len}" "${source_materialized_seq_root}"
+        plot_throughput_single_run "${source_materialized_seq_root}"
       else
         plot_memory_single_run "${seq_root}"
-        plot_memory_running_combined "${config_root}" "${seq_len}" "${seq_root}"
+        plot_throughput_single_run "${seq_root}"
       fi
+    elif [[ "${materialize_source_from_nsys}" == "true" ]]; then
+      plot_throughput_single_run "${source_materialized_seq_root}"
+    elif [[ "${run_profiler}" == "source" ]]; then
+      plot_throughput_single_run "${seq_root}"
     fi
   else
     append_job_record "${config_root}" "failed:${status}" \
@@ -3070,34 +3085,15 @@ plot_config_root() {
   [[ "${PLOT}" == "true" ]] || return 0
   ((${#plot_profilers[@]})) || return 0
 
-  plot_root="${config_root}/combined"
-  [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")/combined"
+  cleanup_legacy_combined_artifacts "${config_root}"
+  plot_root="$(config_combined_metric_dir "${config_root}" timing)"
   local -a plot_cmd
   plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
-  # Cross-config comparison only; per-config sweep plots already live in each leaf's plots/ dir.
+  # Cross-config comparison only; per-run timing plots live in each leaf's metrics/timing dir.
   plot_cmd+=(--combined-only)
   append_sweep_plot_filters plot_cmd
   echo "Writing LF config combined plots: ${plot_root}"
   run_tracked_command "${plot_cmd[@]}"
-}
-
-plot_running_combined() {
-  local config_root="$1"
-  local seq_len="$2"
-  local seq_root="$3"
-  local plot_root
-  [[ "${PLOT}" == "true" ]] || return 0
-  ((${#plot_profilers[@]})) || return 0
-
-  plot_root="${seq_root}/plots/_combined"
-  local -a plot_cmd
-  plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
-  plot_cmd+=(--combined-only --expert-recompute-policies "${expert_policies[@]}")
-  append_running_sweep_plot_filters plot_cmd
-  echo "Writing LF running combined plots: ${plot_root}"
-  if ! run_tracked_command "${plot_cmd[@]}"; then
-    echo "warning: failed to write running combined plots for ${seq_root}" >&2
-  fi
 }
 
 plot_single_run() {
@@ -3114,7 +3110,8 @@ plot_single_run() {
   [[ "${PLOT}" == "true" ]] || return 0
   ((${#plot_profilers[@]})) || return 0
 
-  plot_root="${seq_root}/plots"
+  cleanup_legacy_run_artifacts "${seq_root}"
+  plot_root="$(run_metric_dir "${seq_root}" timing)"
   local -a plot_cmd
   plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "${plot_root}/combined" "$(current_workload_tuple "${seq_len}")"
   plot_cmd+=(
@@ -3141,7 +3138,8 @@ plot_memory_single_run() {
   local plot_root
   [[ "${PLOT}" == "true" && "${PLOT_MEMORY_BREAKDOWN}" == "true" ]] || return 0
 
-  plot_root="${seq_root}/memory_plots"
+  cleanup_legacy_run_artifacts "${seq_root}"
+  plot_root="$(run_metric_dir "${seq_root}" memory)"
   local -a plot_cmd=(
     "${ENV_PYTHON}" "${MEMORY_PLOT_SCRIPT}"
     --run-dir "${seq_root}"
@@ -3155,20 +3153,23 @@ plot_memory_single_run() {
   fi
 }
 
-plot_memory_running_combined() {
-  local config_root="$1"
-  local seq_len="$2"
-  local seq_root="$3"
+plot_throughput_single_run() {
+  local seq_root="$1"
   local plot_root
-  [[ "${PLOT}" == "true" && "${PLOT_MEMORY_BREAKDOWN}" == "true" ]] || return 0
+  [[ "${PLOT}" == "true" ]] || return 0
 
-  plot_root="${seq_root}/memory_plots/_combined"
-  local -a plot_cmd
-  memory_combined_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
-  memory_running_plot_filters plot_cmd
-  echo "Writing LF running source-memory combined plots: ${plot_root}"
+  cleanup_legacy_run_artifacts "${seq_root}"
+  plot_root="$(run_metric_dir "${seq_root}" throughput)"
+  local -a plot_cmd=(
+    "${ENV_PYTHON}" "${THROUGHPUT_PLOT_SCRIPT}"
+    --run-dir "${seq_root}"
+    --output-dir "${plot_root}"
+    --clean-output
+    --combined-only
+  )
+  echo "Writing LF source throughput plots: ${plot_root}"
   if ! run_tracked_command "${plot_cmd[@]}"; then
-    echo "warning: failed to write running source-memory combined plots for ${seq_root}" >&2
+    echo "warning: failed to write source throughput plots for ${seq_root}" >&2
   fi
 }
 
@@ -3178,10 +3179,10 @@ plot_memory_config_root() {
   local plot_root
   [[ "${PLOT}" == "true" && "${PLOT_MEMORY_BREAKDOWN}" == "true" ]] || return 0
 
-  plot_root="${config_root}/memory_combined"
-  [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")/memory_combined"
+  cleanup_legacy_combined_artifacts "${config_root}"
+  plot_root="$(config_combined_metric_dir "${config_root}" memory)"
   local -a plot_cmd
-  memory_combined_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
+  memory_metric_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
   memory_plot_filters plot_cmd
   echo "Writing LF source-memory combined plots: ${plot_root}"
   if ! run_tracked_command "${plot_cmd[@]}"; then
@@ -3193,7 +3194,7 @@ write_missing_combined_readme() {
   local output_dir="$1"
   local title="$2"
   local reason="$3"
-  mkdir -p "${output_dir}"
+  mkdir -p "${output_dir}/data"
   cat > "${output_dir}/README.md" <<EOF
 # ${title}
 
@@ -3211,16 +3212,16 @@ write_config_artifact_readme() {
 
 This config root is organized as follows:
 
-- \`combined/\`: config-level LF timing and allocator-summary plots from \`profile.json\`.
-- \`memory_combined/\`: config-level source-memory breakdown plots plus per-group subfolders split by workload/backend/profiler/router/expact/attnact/layeract/layergc/recompute/policy/liger_loss. If no source-memory rows were collected, this folder contains a README explaining why.
-- \`c2c_combined/\`: config-level C2C/CTC saturation plots plus per-group subfolders split by workload/backend/profiler/router/expact/attnact/layeract/layergc/recompute/policy/liger_loss. If old traces lack GPU metrics, this folder contains a README explaining why.
-- \`utilization_combined/\`: config-level GPU/CPU utilization summaries from nsys runs.
-- \`throughput_combined/\`: config-level training throughput (tokens/sec) plots from source-profiler runs, plus per-group subfolders.
+- \`combined/timing/\`: config-level LF timing and allocator-summary plots from \`profile.json\`.
+- \`combined/memory/\`: config-level source-memory breakdown plots. If no source-memory rows were collected, this folder contains a README explaining why.
+- \`combined/interconnect/\`: config-level C2C/CTC saturation plots. If old traces lack GPU metrics, this folder contains a README explaining why.
+- \`combined/utilization/\`: config-level GPU/CPU utilization summaries from nsys runs.
+- \`combined/throughput/\`: config-level training throughput (tokens/sec) line plots from source-profiler runs.
 - \`<backend>__<profiler>__<recompute>__pol<policy>__router<mode>__...__ligerloss0/b<batch>_s<seq>_ga<grad_accum>/\`: per-run artifacts.
 
 If \`PLOT_OUTPUT_DIR\` is set, combined plot folders are written under that external plot output root instead of this config root.
 
-Per-run nsys folders contain \`profile.json\`, markdown summaries, \`plots/\` for per-run LF plots, \`utilization.png/csv\`, and \`interconnect_ctc_*.png/csv\` when GPU metrics are available.
+Per-run metric plots live directly under \`metrics/<metric>/\`, with tabular data under \`metrics/<metric>/data/\`. Source and nsys runs remain separate folders and only contain metrics that profiler can produce.
 EOF
 }
 
@@ -3232,12 +3233,12 @@ write_precision_artifact_readme() {
 
 This precision root is organized as follows:
 
-- \`combined/\`: global LF timing and allocator-summary plots across config roots.
-- \`memory_combined/\`: global source-memory breakdown plots across config roots plus per-group subfolders split by workload/backend/profiler/router/expact/attnact/layeract/layergc/recompute/policy/liger_loss. If no source-memory rows were collected, this folder contains a README explaining why.
-- \`c2c_combined/\`: global C2C/CTC saturation plots across config roots plus per-group subfolders split by workload/backend/profiler/router/expact/attnact/layeract/layergc/recompute/policy/liger_loss. If old traces lack Nsight GPU metrics, this folder contains a README explaining why.
-- \`utilization_combined/\`: global GPU/CPU utilization summaries from nsys runs.
-- \`throughput_combined/\`: global training throughput (tokens/sec) plots across config roots plus per-group subfolders.
-- \`<config_root>/\`: one workload/configuration root. Each config root has its own \`combined/\`, \`memory_combined/\`, \`c2c_combined/\`, \`utilization_combined/\`, \`throughput_combined/\`, and per-run backend/profiler folders.
+- \`combined/timing/\`: global LF timing and allocator-summary plots across config roots.
+- \`combined/memory/\`: global source-memory breakdown plots across config roots.
+- \`combined/interconnect/\`: global C2C/CTC saturation plots across config roots.
+- \`combined/utilization/\`: global GPU/CPU utilization summaries from nsys runs.
+- \`combined/throughput/\`: global training throughput (tokens/sec) line plots across config roots.
+- \`<config_root>/\`: one workload/configuration root. Each config root has its own \`combined/<metric>/\` folders and per-run backend/profiler folders.
 
 If \`PLOT_OUTPUT_DIR\` is set, global combined plot folders are written under that external plot output root instead of this precision root.
 
@@ -3251,10 +3252,10 @@ plot_interconnect_config_root() {
   local plot_root
   [[ "${PLOT}" == "true" ]] || return 0
 
-  plot_root="${config_root}/c2c_combined"
-  [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")/c2c_combined"
+  cleanup_legacy_combined_artifacts "${config_root}"
+  plot_root="$(config_combined_metric_dir "${config_root}" interconnect)"
   local -a plot_cmd
-  interconnect_combined_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
+  interconnect_metric_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
   interconnect_plot_filters plot_cmd
   echo "Writing LF C2C combined plots: ${plot_root}"
   if ! run_tracked_command "${plot_cmd[@]}"; then
@@ -3268,10 +3269,10 @@ plot_utilization_config_root() {
   local plot_root
   [[ "${PLOT}" == "true" ]] || return 0
 
-  plot_root="${config_root}/utilization_combined"
-  [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")/utilization_combined"
+  cleanup_legacy_combined_artifacts "${config_root}"
+  plot_root="$(config_combined_metric_dir "${config_root}" utilization)"
   local -a plot_cmd
-  utilization_combined_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
+  utilization_metric_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
   utilization_plot_filters plot_cmd
   echo "Writing LF utilization combined plots: ${plot_root}"
   if ! run_tracked_command "${plot_cmd[@]}"; then
@@ -3285,10 +3286,10 @@ plot_throughput_config_root() {
   local plot_root
   [[ "${PLOT}" == "true" ]] || return 0
 
-  plot_root="${config_root}/throughput_combined"
-  [[ -n "${PLOT_OUTPUT_DIR}" ]] && plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/$(basename "${config_root}")/throughput_combined"
+  cleanup_legacy_combined_artifacts "${config_root}"
+  plot_root="$(config_combined_metric_dir "${config_root}" throughput)"
   local -a plot_cmd
-  throughput_combined_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
+  throughput_metric_plot_cmd_base plot_cmd "${config_root}" "${plot_root}" "$(current_workload_tuple "${seq_len}")"
   throughput_plot_filters plot_cmd
   echo "Writing LF throughput combined plots: ${plot_root}"
   if ! run_tracked_command "${plot_cmd[@]}"; then
@@ -3299,30 +3300,13 @@ plot_throughput_config_root() {
 collect_timing_workloads_from_roots() {
   local roots_name="$1"
   local workloads_name="$2"
-  local workload_bases_name="$3"
   local -n roots_ref="${roots_name}"
   local -n workloads_ref="${workloads_name}"
-  local -n workload_bases_ref="${workload_bases_name}"
   local config_root
 
   workloads_ref=()
-  workload_bases_ref=()
   for config_root in "${!roots_ref[@]}"; do
     workloads_ref["$(plot_workload_from_config_root "${config_root}")"]=1
-    workload_bases_ref["$(plot_workload_base_from_config_root "${config_root}")"]=1
-  done
-}
-
-collect_workload_bases_from_roots() {
-  local roots_name="$1"
-  local workload_bases_name="$2"
-  local -n roots_ref="${roots_name}"
-  local -n workload_bases_ref="${workload_bases_name}"
-  local config_root
-
-  workload_bases_ref=()
-  for config_root in "${!roots_ref[@]}"; do
-    workload_bases_ref["$(plot_workload_base_from_config_root "${config_root}")"]=1
   done
 }
 
@@ -3343,7 +3327,7 @@ memory_precision_combined_cmd() {
   local output_dir="$2"
   shift 2
 
-  memory_combined_plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${workloads[@]}"
+  memory_metric_plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${workloads[@]}"
   _cmd_ref+=("$@")
 }
 
@@ -3353,7 +3337,7 @@ interconnect_precision_combined_cmd() {
   local output_dir="$2"
   shift 2
 
-  interconnect_combined_plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${workloads[@]}"
+  interconnect_metric_plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${workloads[@]}"
   _cmd_ref+=("$@")
 }
 
@@ -3363,7 +3347,7 @@ utilization_precision_combined_cmd() {
   local output_dir="$2"
   shift 2
 
-  utilization_combined_plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${workloads[@]}"
+  utilization_metric_plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${workloads[@]}"
   _cmd_ref+=("$@")
 }
 
@@ -3373,7 +3357,7 @@ throughput_precision_combined_cmd() {
   local output_dir="$2"
   shift 2
 
-  throughput_combined_plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${workloads[@]}"
+  throughput_metric_plot_cmd_base "${cmd_name}" "${precision_root}" "${output_dir}" "${workloads[@]}"
   _cmd_ref+=("$@")
 }
 
@@ -3398,30 +3382,13 @@ run_precision_combined_plot() {
   fi
 }
 
-run_model_split_precision_combined_plots() {
-  local workload_bases_name="$1"
-  local output_root="$2"
-  local build_func="$3"
-  local filter_func="$4"
-  local label="$5"
-  local warn_on_failure="$6"
-  local -n workload_bases_ref="${workload_bases_name}"
-  local workload_base plot_root
+cleanup_precision_metric_extra_dirs() {
+  local output_root="$1"
 
-  for workload_base in "${!workload_bases_ref[@]}"; do
-    plot_root="${output_root}/$(safe_label "${workload_base}")"
-    local -a plot_cmd
-    "${build_func}" plot_cmd "${plot_root}" --workload "${workload_base}"
-    "${filter_func}" plot_cmd
-    echo "Writing model-split combined LF ${label} plots: ${plot_root}"
-    if [[ "${warn_on_failure}" == "true" ]]; then
-      if ! run_tracked_command "${plot_cmd[@]}"; then
-        echo "warning: failed to write model-split combined LF ${label} plots for ${workload_base}" >&2
-      fi
-    else
-      run_tracked_command "${plot_cmd[@]}"
-    fi
-  done
+  # Strict layout: precision combined metric dirs contain only plots/, data/, and README.md.
+  if [[ -d "${output_root}" ]]; then
+    find "${output_root}" -mindepth 1 -maxdepth 1 -type d ! -name plots ! -name data -exec rm -rf -- {} +
+  fi
 }
 
 plot_timing_precision_combined() {
@@ -3429,19 +3396,18 @@ plot_timing_precision_combined() {
   local -a workload_filters=()
 
   if ((${#plot_profilers[@]})); then
-    combined_plot_root="${precision_root}/combined"
-    [[ -n "${PLOT_OUTPUT_DIR}" ]] && combined_plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/combined"
+    cleanup_legacy_combined_artifacts "${precision_root}"
+    combined_plot_root="$(precision_combined_metric_dir timing)"
     declare -A combined_workloads=()
-    declare -A combined_workload_bases=()
-    collect_timing_workloads_from_roots plot_roots combined_workloads combined_workload_bases
+    collect_timing_workloads_from_roots plot_roots combined_workloads
 
     for workload in "${!combined_workloads[@]}"; do
       workload_filters+=(--workload "${workload}")
     done
     run_precision_combined_plot "${combined_plot_root}" timing_precision_combined_cmd append_sweep_plot_filters profile false "${workload_filters[@]}"
-    run_model_split_precision_combined_plots combined_workload_bases "${combined_plot_root}" timing_precision_combined_cmd append_sweep_plot_filters profile false
+    cleanup_precision_metric_extra_dirs "${combined_plot_root}"
   elif [[ -z "${PLOT_OUTPUT_DIR}" ]]; then
-    combined_plot_root="${precision_root}/combined"
+    combined_plot_root="$(precision_combined_metric_dir timing)"
     write_missing_combined_readme \
       "${combined_plot_root}" \
       "LF Global Combined Artifacts" \
@@ -3453,13 +3419,11 @@ plot_memory_precision_combined() {
   local combined_memory_plot_root
   [[ "${PLOT_MEMORY_BREAKDOWN}" == "true" ]] || return 0
 
-  combined_memory_plot_root="${precision_root}/memory_combined"
-  [[ -n "${PLOT_OUTPUT_DIR}" ]] && combined_memory_plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/memory_combined"
+  cleanup_legacy_combined_artifacts "${precision_root}"
+  combined_memory_plot_root="$(precision_combined_metric_dir memory)"
   if [[ "${#memory_plot_roots[@]}" -gt 0 ]]; then
-    declare -A memory_combined_workload_bases=()
-    collect_workload_bases_from_roots memory_plot_roots memory_combined_workload_bases
     run_precision_combined_plot "${combined_memory_plot_root}" memory_precision_combined_cmd memory_plot_filters source-memory false
-    run_model_split_precision_combined_plots memory_combined_workload_bases "${combined_memory_plot_root}" memory_precision_combined_cmd memory_plot_filters source-memory false
+    cleanup_precision_metric_extra_dirs "${combined_memory_plot_root}"
   else
     write_missing_combined_readme \
       "${combined_memory_plot_root}" \
@@ -3471,13 +3435,11 @@ plot_memory_precision_combined() {
 plot_interconnect_precision_combined() {
   local combined_interconnect_plot_root
 
-  combined_interconnect_plot_root="${precision_root}/c2c_combined"
-  [[ -n "${PLOT_OUTPUT_DIR}" ]] && combined_interconnect_plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/c2c_combined"
+  cleanup_legacy_combined_artifacts "${precision_root}"
+  combined_interconnect_plot_root="$(precision_combined_metric_dir interconnect)"
   if [[ "${#interconnect_plot_roots[@]}" -gt 0 ]]; then
-    declare -A interconnect_combined_workload_bases=()
-    collect_workload_bases_from_roots interconnect_plot_roots interconnect_combined_workload_bases
     run_precision_combined_plot "${combined_interconnect_plot_root}" interconnect_precision_combined_cmd interconnect_plot_filters C2C true
-    run_model_split_precision_combined_plots interconnect_combined_workload_bases "${combined_interconnect_plot_root}" interconnect_precision_combined_cmd interconnect_plot_filters C2C true
+    cleanup_precision_metric_extra_dirs "${combined_interconnect_plot_root}"
   else
     write_missing_combined_readme \
       "${combined_interconnect_plot_root}" \
@@ -3489,13 +3451,11 @@ plot_interconnect_precision_combined() {
 plot_utilization_precision_combined() {
   local combined_utilization_plot_root
 
-  combined_utilization_plot_root="${precision_root}/utilization_combined"
-  [[ -n "${PLOT_OUTPUT_DIR}" ]] && combined_utilization_plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/utilization_combined"
+  cleanup_legacy_combined_artifacts "${precision_root}"
+  combined_utilization_plot_root="$(precision_combined_metric_dir utilization)"
   if [[ "${#utilization_plot_roots[@]}" -gt 0 ]]; then
-    declare -A utilization_combined_workload_bases=()
-    collect_workload_bases_from_roots utilization_plot_roots utilization_combined_workload_bases
     run_precision_combined_plot "${combined_utilization_plot_root}" utilization_precision_combined_cmd utilization_plot_filters utilization true
-    run_model_split_precision_combined_plots utilization_combined_workload_bases "${combined_utilization_plot_root}" utilization_precision_combined_cmd utilization_plot_filters utilization true
+    cleanup_precision_metric_extra_dirs "${combined_utilization_plot_root}"
   else
     write_missing_combined_readme \
       "${combined_utilization_plot_root}" \
@@ -3508,13 +3468,11 @@ plot_throughput_precision_combined() {
   local combined_throughput_plot_root
   [[ "${PLOT}" == "true" ]] || return 0
 
-  combined_throughput_plot_root="${precision_root}/throughput_combined"
-  [[ -n "${PLOT_OUTPUT_DIR}" ]] && combined_throughput_plot_root="$(abs_path "${PLOT_OUTPUT_DIR}")/throughput_combined"
+  cleanup_legacy_combined_artifacts "${precision_root}"
+  combined_throughput_plot_root="$(precision_combined_metric_dir throughput)"
   if [[ "${#throughput_plot_roots[@]}" -gt 0 ]]; then
-    declare -A throughput_combined_workload_bases=()
-    collect_workload_bases_from_roots throughput_plot_roots throughput_combined_workload_bases
     run_precision_combined_plot "${combined_throughput_plot_root}" throughput_precision_combined_cmd throughput_plot_filters throughput false
-    run_model_split_precision_combined_plots throughput_combined_workload_bases "${combined_throughput_plot_root}" throughput_precision_combined_cmd throughput_plot_filters throughput false
+    cleanup_precision_metric_extra_dirs "${combined_throughput_plot_root}"
   else
     write_missing_combined_readme \
       "${combined_throughput_plot_root}" \
@@ -3529,9 +3487,9 @@ plot_config_artifacts_for_root() {
   [[ "${DRY_RUN}" != "true" ]] || return 0
 
   plot_config_root "${config_root}" "${seq_len}"
-  if [[ -z "${PLOT_OUTPUT_DIR}" && ! -d "${config_root}/combined" ]]; then
+  if [[ -z "${PLOT_OUTPUT_DIR}" && ! -d "$(config_combined_metric_dir "${config_root}" timing)" ]]; then
     write_missing_combined_readme \
-      "${config_root}/combined" \
+      "$(config_combined_metric_dir "${config_root}" timing)" \
       "LF Config Combined Artifacts" \
       "No config-level LF timing plots were generated for this config. This can happen when plotting is disabled or no matching profile rows are available."
   fi
@@ -3539,7 +3497,7 @@ plot_config_artifacts_for_root() {
     plot_memory_config_root "${config_root}" "${seq_len}"
   else
     write_missing_combined_readme \
-      "${config_root}/memory_combined" \
+      "$(config_combined_metric_dir "${config_root}" memory)" \
       "LF Source Memory Combined Artifacts" \
       "No source-memory breakdown rows were collected for this config. Include the source profiler in PROFILERS, or set PROFILE_MEMORY_BREAKDOWN=true for a run where source-memory hook overhead is acceptable."
   fi
@@ -3547,7 +3505,7 @@ plot_config_artifacts_for_root() {
     plot_interconnect_config_root "${config_root}" "${seq_len}"
   else
     write_missing_combined_readme \
-      "${config_root}/c2c_combined" \
+      "$(config_combined_metric_dir "${config_root}" interconnect)" \
       "LF C2C / CTC Combined Artifacts" \
       "No nsys profiler run was selected for this config, so no Nsight C2C/CTC GPU metric samples can be summarized."
   fi
@@ -3555,7 +3513,7 @@ plot_config_artifacts_for_root() {
     plot_utilization_config_root "${config_root}" "${seq_len}"
   else
     write_missing_combined_readme \
-      "${config_root}/utilization_combined" \
+      "$(config_combined_metric_dir "${config_root}" utilization)" \
       "LF Utilization Combined Artifacts" \
       "No nsys profiler run was selected for this config, so no Nsight GPU utilization samples can be summarized."
   fi
@@ -3563,7 +3521,7 @@ plot_config_artifacts_for_root() {
     plot_throughput_config_root "${config_root}" "${seq_len}"
   else
     write_missing_combined_readme \
-      "${config_root}/throughput_combined" \
+      "$(config_combined_metric_dir "${config_root}" throughput)" \
       "LF Throughput Combined Artifacts" \
       "No source profiler run was selected for this config, so no per-step timing is available to compute tokens/sec."
   fi

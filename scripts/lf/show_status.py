@@ -24,7 +24,7 @@ from collections import Counter
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-SKIP_DIRS = {"combined", "memory_combined", "c2c_combined"}
+SKIP_DIRS = {"combined", "metrics", "memory_combined", "c2c_combined", "utilization_combined", "throughput_combined"}
 OOM_GPU_MARKERS = ("CUDA out of memory", "OutOfMemoryError")
 OOM_HOST_MARKERS = (
     "HOST_OOM_EVIDENCE=true",

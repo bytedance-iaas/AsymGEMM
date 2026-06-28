@@ -49,12 +49,21 @@ Next Steps:
 #############################################################################################################
 
 Motivation Figures:
-- Superoffload has large activations footprints in HBM wrt seq length. Large activations causes OOM.
-- Superoffload = zero 3 offload on LoRA because optimizer updates are mimial for low rank updates.
-- Why does it have issues with extending to 2 GPUs (Superoffload + deepspeed / Superoffload + seq parallel)?
+- Runtime breakdown of zero3offload vs superoffload => Optimizer is trivial in timing so superoffload does not target the truth bottleneck in LoRA SFT
+- Memory decomposition of LoRA SFT => Show 1. even with recompute activation memory is core aspect 2. other aspects taken care of by superoffload but activation not taken care
+- Show C2C receiving underutilization of SuperOffload => Motivate more AsyGEMM to utilize RX
+- Show CPU underutilization of SuperOffload => Motivate more computes on CPU
+- For each activation tensor/module, show compute vs memory bound and the CPU low utilization => Motivate to put work on CPU selectively
+- Show hardware specs difference between GH200 and GB200 in a table  ⇒ more scheduling needed to achieve better throughput + storage needed form nvme
+- [?] Why does it have issues with extending to 2 GPUs (Superoffload + deepspeed / Superoffload + seq parallel)?
 <!-- - CPU + GPU computes vs. GPU-only computes (Run superoffload directly) -->
 
 Method:
+- AsymGEMM-enabled design for selective activation offload+recompute. 
+- Utilizing more CPU computes based on module/op heterogenuity
+- Multi-tier activation storage system / NVME-based activation offload and prefetching
+- Intgeration with SP/deepspeed for multiple superchips
+
 
 Baselines:
 - FSDP
@@ -69,33 +78,6 @@ Baselines:
 
 Exps:
 
-
-
-
-
-<!-- 
-#####################################################################################################################
-Paper Outline
-
-Motivation
-- 
-- 
-- 
-
-Method
-- 
-- 
--
-
-Main exp
-- 
--
--
-
-Ablations
-- 
--
-- -->
 
 
 

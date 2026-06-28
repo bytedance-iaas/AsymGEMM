@@ -338,13 +338,6 @@ def _seq_len_from_run_dir_name(name: str) -> str:
     return match.group("seq_len") if match is not None else ""
 
 
-def _safe_label(value: str) -> str:
-    cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in value).strip("_")
-    while "__" in cleaned:
-        cleaned = cleaned.replace("__", "_")
-    return cleaned or "run"
-
-
 def _normalize_bool_config(value: Any, default: str = "false") -> str:
     text = str(value if value is not None else default).strip().lower()
     if text in {"1", "true", "yes", "y", "on"}:
@@ -1380,10 +1373,32 @@ def _actual_peak_csv_rows(run: RunRecord) -> list[dict[str, Any]]:
     return result
 
 
-def _prepare_output(path: Path, clean: bool) -> None:
+def _prepare_output(path: Path, clean: bool) -> tuple[Path, Path]:
     if clean and path.exists():
         shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
+    plots_dir = path  # plots sit directly in the metric folder; data/ stays nested
+    data_dir = path / "data"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return plots_dir, data_dir
+
+
+def _write_readme(out_dir: Path, *, runs: list[RunRecord], combined: bool) -> None:
+    title = "LF Source Memory Combined Artifacts" if combined else "LF Source Memory Artifacts"
+    lines = [
+        f"# {title}",
+        "",
+        "Memory breakdown plots and tabular data from source-profiler memory attribution.",
+        "",
+        "## Files",
+        "",
+        "- `plots/`: PNG memory breakdown plots.",
+        "- `data/`: CSV/JSON data used by the plots.",
+        "",
+        f"Runs included: {len(runs)}.",
+        "",
+    ]
+    (out_dir / "README.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def _peak_ylim_gib(runs: list[RunRecord]) -> float:
@@ -1561,19 +1576,20 @@ def _plot_single_phases(run: RunRecord, out_dir: Path, y_limit_gib: float | None
 
 
 def _write_per_run(run: RunRecord, out_dir: Path, clean: bool, y_limit_gib: float | None) -> None:
-    _prepare_output(out_dir, clean)
-    _write_csv(out_dir / "memory_breakdown.csv", _summary_csv_rows(run))
-    _write_csv(out_dir / "memory_actual_peak_breakdown.csv", _actual_peak_csv_rows(run))
-    _write_csv(out_dir / "memory_breakdown_by_phase.csv", _phase_csv_rows(run))
-    (out_dir / "memory_breakdown_index.json").write_text(
+    plots_dir, data_dir = _prepare_output(out_dir, clean)
+    _write_csv(data_dir / "memory_breakdown.csv", _summary_csv_rows(run))
+    _write_csv(data_dir / "memory_actual_peak_breakdown.csv", _actual_peak_csv_rows(run))
+    _write_csv(data_dir / "memory_breakdown_by_phase.csv", _phase_csv_rows(run))
+    (data_dir / "index.json").write_text(
         json.dumps({"run_dir": str(run.run_dir), "summary_path": str(run.summary_path), "jsonl_path": str(run.jsonl_path or "")}, indent=2) + "\n",
         encoding="utf-8",
     )
-    _plot_single_peak(run, out_dir, y_limit_gib)
-    _plot_single_peak(run, out_dir, y_limit_gib, actual=True)
-    _plot_single_steps(run, out_dir, y_limit_gib)
+    _plot_single_peak(run, plots_dir, y_limit_gib)
+    _plot_single_peak(run, plots_dir, y_limit_gib, actual=True)
+    _plot_single_steps(run, plots_dir, y_limit_gib)
     phase_y_limit = max(y_limit_gib or 0.0, _phase_ylim_gib([run])) if y_limit_gib is not None else None
-    _plot_single_phases(run, out_dir, phase_y_limit)
+    _plot_single_phases(run, plots_dir, phase_y_limit)
+    _write_readme(out_dir, runs=[run], combined=False)
 
 
 def _plot_combined_peak(runs: list[RunRecord], out_dir: Path, y_limit_gib: float, *, actual: bool = False) -> None:
@@ -1722,48 +1738,13 @@ def _plot_combined_phases(runs: list[RunRecord], out_dir: Path, y_limit_gib: flo
     plt.close(fig)
 
 
-def _group_label(run: RunRecord) -> str:
-    metadata = run.metadata
-    parts = [
-        metadata.get("workload", ""),
-        f"b{metadata.get('batch_size', '')}" if metadata.get("batch_size") else "",
-        f"ga{metadata.get('gradient_accumulation_steps', '')}" if metadata.get("gradient_accumulation_steps") else "",
-        f"drop{metadata.get('lora_dropout', '').replace('.', '')}" if metadata.get("lora_dropout") else "",
-        metadata.get("precision", ""),
-        metadata.get("backend", ""),
-        metadata.get("profiler", ""),
-        f"router{metadata.get('router_mode', '')}" if metadata.get("router_mode") else "",
-        metadata.get("expact", ""),
-        metadata.get("attnact", ""),
-        metadata.get("layeract", ""),
-        metadata.get("layergc", ""),
-        metadata.get("liger_loss", ""),
-        metadata.get("recompute", ""),
-        f"pol{metadata.get('expert_policy', '')}" if metadata.get("expert_policy") else "",
-    ]
-    return _safe_label("-".join(part for part in parts if part))
-
-
-def _write_grouped_combined(runs: list[RunRecord], out_dir: Path, clean: bool, y_limit_gib: float) -> None:
-    groups: dict[str, list[RunRecord]] = {}
-    for run in runs:
-        groups.setdefault(_group_label(run), []).append(run)
-    # Skip single-run groups: they just duplicate that config's own leaf memory_plots/ breakdown.
-    for label, group_runs in sorted(groups.items()):
-        if len(group_runs) <= 1:
-            continue
-        _write_combined(group_runs, out_dir / label, clean, y_limit_gib, write_groups=False)
-
-
 def _write_combined(
     runs: list[RunRecord],
     out_dir: Path,
     clean: bool,
     y_limit_gib: float,
-    *,
-    write_groups: bool = True,
 ) -> None:
-    _prepare_output(out_dir, clean)
+    plots_dir, data_dir = _prepare_output(out_dir, clean)
     all_rows: list[dict[str, Any]] = []
     actual_rows: list[dict[str, Any]] = []
     phase_rows: list[dict[str, Any]] = []
@@ -1797,17 +1778,16 @@ def _write_combined(
                 "unattributed_allocated_peak_bytes": int(run.summary.get("unattributed_allocated_peak_bytes", 0) or 0),
             }
         )
-    _write_csv(out_dir / "combined_memory_breakdown.csv", all_rows)
-    _write_csv(out_dir / "combined_memory_actual_peak_breakdown.csv", actual_rows)
-    _write_csv(out_dir / "combined_memory_breakdown_by_phase.csv", phase_rows)
-    _write_csv(out_dir / "memory_breakdown_index.csv", index_rows)
-    (out_dir / "memory_breakdown_index.json").write_text(json.dumps(index_rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _plot_combined_peak(runs, out_dir, y_limit_gib)
-    _plot_combined_peak(runs, out_dir, y_limit_gib, actual=True)
-    _plot_combined_steps(runs, out_dir, y_limit_gib)
-    _plot_combined_phases(runs, out_dir, _phase_ylim_gib(runs))
-    if write_groups:
-        _write_grouped_combined(runs, out_dir, clean, y_limit_gib)
+    _write_csv(data_dir / "memory_breakdown.csv", all_rows)
+    _write_csv(data_dir / "memory_actual_peak_breakdown.csv", actual_rows)
+    _write_csv(data_dir / "memory_breakdown_by_phase.csv", phase_rows)
+    _write_csv(data_dir / "index.csv", index_rows)
+    (data_dir / "index.json").write_text(json.dumps(index_rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _plot_combined_peak(runs, plots_dir, y_limit_gib)
+    _plot_combined_peak(runs, plots_dir, y_limit_gib, actual=True)
+    _plot_combined_steps(runs, plots_dir, y_limit_gib)
+    _plot_combined_phases(runs, plots_dir, _phase_ylim_gib(runs))
+    _write_readme(out_dir, runs=runs, combined=True)
 
 
 def main() -> None:
@@ -1821,7 +1801,7 @@ def main() -> None:
     single_run_output = bool(args.output_dir and len(runs) == 1 and args.run_dir and not args.input_root and not args.combined_only)
     if not args.combined_only:
         for run in runs:
-            out_dir = args.output_dir if single_run_output else run.run_dir / "memory_plots"
+            out_dir = args.output_dir if single_run_output else run.run_dir / "metrics" / "memory"
             y_limit = None if args.y_scale == "per-plot" else shared_ylim
             _write_per_run(run, out_dir, args.clean_output, y_limit)
 

@@ -1667,9 +1667,9 @@ def summarize_utilization_metrics(con: sqlite3.Connection, source_profile: dict[
         "range_summary": {"rows": gpu_range_rows},
         "timeseries": {"rows": timeseries_rows},
         "artifacts": {
-            "timeline_plot": "utilization.png",
-            "timeseries_csv": "utilization_timeseries.csv",
-            "summary_csv": "utilization_summary.csv",
+            "timeline_plot": "metrics/utilization/utilization.png",
+            "timeseries_csv": "metrics/utilization/data/timeseries.csv",
+            "summary_csv": "metrics/utilization/data/summary.csv",
         },
         "notes": [
             "GPU utilization uses Nsight SM Active / SMs Active when available, falling back to GR Active.",
@@ -1822,12 +1822,14 @@ def summarize_interconnect_metrics(con: sqlite3.Connection) -> dict[str, Any]:
         "ranges": ranges,
         "timeseries": {"rows": ctc_samples},
         "artifacts": {
-            "timeseries_csv": "interconnect_ctc_timeseries.csv",
-            "range_summary_csv": "interconnect_ctc_step_summary.csv",
-            "summary_csv": "interconnect_metric_summary.csv",
-            "timeline_plot": "interconnect_ctc_timeline.png",
-            "by_step_plot": "interconnect_ctc_by_step.png",
-            "by_phase_plot": "interconnect_ctc_by_phase.png",
+            "timeseries_csv": "metrics/interconnect/data/timeseries.csv",
+            "range_summary_csv": "metrics/interconnect/data/step_summary.csv",
+            "summary_csv": "metrics/interconnect/data/summary.csv",
+            "timeline_plot": "metrics/interconnect/timeline_max.png",
+            "timeline_avg_plot": "metrics/interconnect/timeline_avg.png",
+            "timeline_max_plot": "metrics/interconnect/timeline_max.png",
+            "by_step_plot": "metrics/interconnect/by_step.png",
+            "by_phase_plot": "metrics/interconnect/by_phase.png",
         },
         "notes": [
             "Values are Nsight GPU metric throughput percentages, not absolute GB/s.",
@@ -1868,10 +1870,26 @@ def _write_dict_rows_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         for key in row.keys():
             if key not in fieldnames:
                 fieldnames.append(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(normalized_rows)
+
+
+def _metric_artifact_dirs(output_dir: Path, metric: str) -> tuple[Path, Path, Path]:
+    metric_dir = output_dir / "metrics" / metric
+    plots_dir = metric_dir  # plots sit directly in the metric folder; data/ stays nested
+    data_dir = metric_dir / "data"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return metric_dir, plots_dir, data_dir
+
+
+def _write_metric_readme(metric_dir: Path, title: str, lines: list[str]) -> None:
+    body = [f"# {title}", "", *lines, "", "## Files", "", "- `*.png`: plot files in this metric directory.", "- `data/`: CSV data.", ""]
+    metric_dir.mkdir(parents=True, exist_ok=True)
+    (metric_dir / "README.md").write_text("\n".join(body), encoding="utf-8")
 
 
 def _matplotlib_pyplot():
@@ -1923,45 +1941,202 @@ def _aggregate_phase_rows(rows: list[dict[str, Any]]) -> dict[tuple[int, str, st
     return aggregated
 
 
-def _plot_interconnect_timeline(metrics: dict[str, Any], output_dir: Path) -> None:
+INTERCONNECT_TIMELINE_VARIANTS = (
+    ("mean", "avg per bucket", "timeline_avg.png"),
+    ("max", "max per bucket", "timeline_max.png"),
+)
+INTERCONNECT_POINTS_PER_STEP = 100
+PHASE_SHADE = (
+    ("forward", "Forward", "#4C9A4C"),
+    ("backward", "Backward", "#8A6FC1"),
+    ("optimizer", "Optimizer", "#D9A300"),
+)
+PHASE_SHADE_ALPHA = 0.17
+
+
+def _timeline_phase_spans_from_range_rows(
+    rows: list[Any],
+    bounds: list[tuple[float, float]],
+) -> list[tuple[str, float, float]]:
+    per_step: dict[int, dict[str, float]] = {}
+    seen: set[tuple[int, str]] = set()
+    for row in rows:
+        if not isinstance(row, dict) or row.get("scope") != "phase":
+            continue
+        phase = str(row.get("phase") or "")
+        if phase not in {"forward", "backward"}:
+            continue
+        try:
+            step = int(row.get("step"))
+            dur = (int(row.get("end_ns")) - int(row.get("start_ns"))) / 1e9
+        except (TypeError, ValueError):
+            continue
+        key = (step, phase)
+        if dur <= 0.0 or key in seen:
+            continue
+        seen.add(key)
+        per_step.setdefault(step, {})[phase] = dur
+    spans: list[tuple[str, float, float]] = []
+    for index, step in enumerate(sorted(per_step)):
+        durs = per_step[step]
+        fwd_s = durs.get("forward", 0.0)
+        bwd_s = durs.get("backward", 0.0)
+        have_bounds = index < len(bounds)
+        denom = (bounds[index][1] - bounds[index][0]) if have_bounds else (fwd_s + bwd_s)
+        if denom <= 0.0:
+            continue
+        f = fwd_s / denom
+        b = bwd_s / denom
+        if f + b > 1.0:
+            f, b = f / (f + b), b / (f + b)
+        x = float(index)
+        if f > 0.0:
+            spans.append(("forward", x, x + f))
+        if b > 0.0:
+            spans.append(("backward", x + f, x + f + b))
+        if have_bounds and b > 0.0 and (1.0 - f - b) > 1e-4:
+            spans.append(("optimizer", x + f + b, x + 1.0))
+    return spans
+
+
+def _duration_seconds_from_row(row: dict[str, Any], *keys: str) -> float:
+    for key in keys:
+        value = _opt_float(row.get(key))
+        if value is not None and value > 0.0:
+            return value / 1000.0
+    return 0.0
+
+
+def _timeline_phase_spans_from_step_samples(
+    report: dict[str, Any],
+    bounds: list[tuple[float, float]],
+) -> list[tuple[str, float, float]]:
+    source_profile = report.get("source_profile")
+    if not isinstance(source_profile, dict):
+        return []
+    step_samples = source_profile.get("step_samples")
+    rows = step_samples.get("rows") if isinstance(step_samples, dict) else None
+    if not isinstance(rows, list):
+        return []
+    measured_rows = [row for row in rows if isinstance(row, dict) and not row.get("is_warmup")]
+    spans: list[tuple[str, float, float]] = []
+    for index, row in enumerate(measured_rows):
+        have_bounds = index < len(bounds)
+        denom = (bounds[index][1] - bounds[index][0]) if have_bounds else 0.0
+        if denom <= 0.0:
+            denom = _duration_seconds_from_row(row, "trainer_e2e_step_milliseconds", "step_milliseconds")
+        if denom <= 0.0:
+            continue
+        fwd_s = _duration_seconds_from_row(row, "forward_milliseconds", "source_forward_milliseconds")
+        bwd_s = _duration_seconds_from_row(row, "backward_milliseconds", "source_backward_milliseconds")
+        f = fwd_s / denom
+        b = bwd_s / denom
+        if f + b > 1.0:
+            f, b = f / (f + b), b / (f + b)
+        x = float(index)
+        if f > 0.0:
+            spans.append(("forward", x, x + f))
+        if b > 0.0:
+            spans.append(("backward", x + f, x + f + b))
+        if (1.0 - f - b) > 1e-4:
+            spans.append(("optimizer", x + f + b, x + 1.0))
+    return spans
+
+
+def _timeline_phase_spans(
+    report: dict[str, Any],
+    bounds: list[tuple[float, float]],
+) -> list[tuple[str, float, float]]:
+    spans = _timeline_phase_spans_from_step_samples(report, bounds)
+    if spans:
+        return spans
+    metrics = report.get("interconnect_metrics")
+    range_summary = metrics.get("range_summary") if isinstance(metrics, dict) else None
+    rows = range_summary.get("rows") if isinstance(range_summary, dict) else None
+    if isinstance(rows, list):
+        spans = _timeline_phase_spans_from_range_rows(rows, bounds)
+        if spans:
+            return spans
+    return _timeline_phase_spans_from_step_samples(report, bounds)
+
+
+def _draw_phase_shading(ax, phase_spans: list[tuple[str, float, float]], legend_handles: dict[str, Any] | None = None) -> None:
+    if not phase_spans:
+        return
+    for phase_key, phase_label, phase_color in PHASE_SHADE:
+        drawn = False
+        for span_key, x0, x1 in phase_spans:
+            if span_key != phase_key or x1 <= x0:
+                continue
+            ax.axvspan(x0, x1, color=phase_color, alpha=PHASE_SHADE_ALPHA, linewidth=0, zorder=0)
+            drawn = True
+        if drawn and legend_handles is not None:
+            from matplotlib.patches import Patch
+
+            legend_handles.setdefault(
+                phase_label,
+                Patch(facecolor=phase_color, alpha=PHASE_SHADE_ALPHA, label=phase_label),
+            )
+
+
+def _plot_interconnect_timeline(
+    metrics: dict[str, Any], output_dir: Path, step_bounds: list[tuple[float, float]], report: dict[str, Any]
+) -> None:
     rows = metrics.get("timeseries", {}).get("rows", [])
     if not isinstance(rows, list) or not rows:
         return
-    plt = _matplotlib_pyplot()
     series = _aggregate_max_by_timestamp([row for row in rows if isinstance(row, dict)])
-    timestamps = [int(row["timestamp_ns"]) for row in rows if isinstance(row, dict)]
-    if not timestamps:
-        return
-    first_timestamp = min(timestamps)
-
-    fig, ax = plt.subplots(figsize=(11.0, 4.8), dpi=160, constrained_layout=True)
+    window = (step_bounds[0][0], step_bounds[-1][1]) if step_bounds else None
+    n_steps = len(step_bounds) if step_bounds else 1
+    plt = _matplotlib_pyplot()
     colors = {"ctc_rx": "#1f77b4", "ctc_tx": "#d62728"}
-    labels = {"ctc_rx": "CTC RX", "ctc_tx": "CTC TX"}
-    for metric in ("ctc_rx", "ctc_tx"):
-        metric_points = series.get(metric, {})
-        if not metric_points:
+    labels = {"ctc_rx": "C2C RX", "ctc_tx": "C2C TX"}
+    phase_spans = _timeline_phase_spans(report, step_bounds)
+    # CTC samples are on the Nsight capture clock; affine-map onto the measured window, then resample
+    # each measured step so the x-axis is the measured step index.
+    for agg, title_suffix, filename in INTERCONNECT_TIMELINE_VARIANTS:
+        fig, ax = plt.subplots(figsize=(11.0, 4.8), dpi=160, constrained_layout=True)
+        plotted = False
+        legend_handles: dict[str, Any] = {}
+        _draw_phase_shading(ax, phase_spans, legend_handles)
+        for metric in ("ctc_rx", "ctc_tx"):
+            metric_points = series.get(metric, {})
+            if not metric_points:
+                continue
+            raw = [(float(timestamp), metric_points[timestamp]) for timestamp in sorted(metric_points)]
+            resampled = _util_resample_per_step(
+                _util_affine_to_window(raw, window),
+                step_bounds,
+                INTERCONNECT_POINTS_PER_STEP,
+                agg,
+            )
+            if not resampled:
+                continue
+            xs = [point[0] for point in resampled]
+            ys = [point[1] for point in resampled]
+            (line,) = ax.plot(xs, ys, label=labels[metric], color=colors[metric], linewidth=1.6)
+            legend_handles.setdefault(labels[metric], line)
+            plotted = True
+        if not plotted:
+            plt.close(fig)
             continue
-        xs = [_ms(timestamp - first_timestamp) for timestamp in sorted(metric_points)]
-        ys = [metric_points[timestamp] for timestamp in sorted(metric_points)]
-        ax.plot(xs, ys, label=labels[metric], color=colors[metric], linewidth=1.6)
-
-    for current_range in metrics.get("ranges", [])[:120]:
-        if not isinstance(current_range, dict) or current_range.get("scope") != "phase":
-            continue
-        start_ms = _ms(int(current_range["start_ns"]) - first_timestamp)
-        end_ms = _ms(int(current_range["end_ns"]) - first_timestamp)
-        color = "#1f77b4" if current_range.get("phase") == "forward" else "#ff7f0e"
-        ax.axvspan(start_ms, end_ms, color=color, alpha=0.045, linewidth=0)
-
-    ax.axhline(90.0, color="#444444", linestyle="--", linewidth=1.0, label="90%")
-    ax.set_title("CTC Throughput Saturation Timeline")
-    ax.set_xlabel("Time from first CTC sample (ms)")
-    ax.set_ylabel("Throughput saturation (%)")
-    ax.set_ylim(bottom=0.0, top=max(100.0, ax.get_ylim()[1]))
-    ax.grid(True, axis="y", alpha=0.25)
-    ax.legend(loc="upper right", ncols=3)
-    fig.savefig(output_dir / "interconnect_ctc_timeline.png", bbox_inches="tight")
-    plt.close(fig)
+        for boundary in range(1, n_steps):
+            ax.axvline(boundary, color="#999999", linestyle=":", linewidth=0.8, alpha=0.6)
+        ax.set_xlim(0.0, float(max(n_steps, 1)))
+        ax.set_xticks(list(range(n_steps + 1)))
+        ax.set_title(f"C2C Saturation by Measured Step ({title_suffix})")
+        ax.set_xlabel(f"Measured step ({INTERCONNECT_POINTS_PER_STEP} pts/step)")
+        ax.set_ylabel("C2C Saturation (%)")
+        ax.set_ylim(bottom=0.0, top=max(100.0, ax.get_ylim()[1]))
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.legend(
+            handles=list(legend_handles.values()),
+            labels=list(legend_handles),
+            loc="upper right",
+            ncols=max(1, min(len(legend_handles), 6)),
+        )
+        fig.savefig(output_dir / filename, bbox_inches="tight")
+        plt.close(fig)
 
 
 def _plot_interconnect_by_step(metrics: dict[str, Any], output_dir: Path) -> None:
@@ -1990,7 +2165,7 @@ def _plot_interconnect_by_step(metrics: dict[str, Any], output_dir: Path) -> Non
     ax.set_ylim(bottom=0.0, top=max(100.0, ax.get_ylim()[1]))
     ax.grid(True, axis="y", alpha=0.25)
     ax.legend(loc="upper right", ncols=3)
-    fig.savefig(output_dir / "interconnect_ctc_by_step.png", bbox_inches="tight")
+    fig.savefig(output_dir / "by_step.png", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -2018,7 +2193,7 @@ def _plot_interconnect_by_phase(metrics: dict[str, Any], output_dir: Path) -> No
         ax.grid(True, axis="y", alpha=0.25)
         ax.legend(loc="upper right")
     axes[-1].set_xlabel("Measured step")
-    fig.savefig(output_dir / "interconnect_ctc_by_phase.png", bbox_inches="tight")
+    fig.savefig(output_dir / "by_phase.png", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -2026,57 +2201,168 @@ def write_interconnect_artifacts(report: dict[str, Any], output_dir: Path) -> No
     metrics = report.get("interconnect_metrics")
     if not isinstance(metrics, dict) or not metrics.get("available"):
         return
-    _write_dict_rows_csv(output_dir / "interconnect_ctc_timeseries.csv", metrics.get("timeseries", {}).get("rows", []))
-    _write_dict_rows_csv(output_dir / "interconnect_ctc_step_summary.csv", metrics.get("range_summary", {}).get("rows", []))
-    _write_dict_rows_csv(output_dir / "interconnect_metric_summary.csv", metrics.get("summary", {}).get("rows", []))
+    metric_dir, plots_dir, data_dir = _metric_artifact_dirs(output_dir, "interconnect")
+    _write_dict_rows_csv(data_dir / "timeseries.csv", metrics.get("timeseries", {}).get("rows", []))
+    _write_dict_rows_csv(data_dir / "step_summary.csv", metrics.get("range_summary", {}).get("rows", []))
+    _write_dict_rows_csv(data_dir / "summary.csv", metrics.get("summary", {}).get("rows", []))
     try:
-        _plot_interconnect_timeline(metrics, output_dir)
-        _plot_interconnect_by_step(metrics, output_dir)
-        _plot_interconnect_by_phase(metrics, output_dir)
+        (plots_dir / "timeline.png").unlink(missing_ok=True)
+        _plot_interconnect_timeline(metrics, plots_dir, _util_measured_step_bounds(report), report)
+        _plot_interconnect_by_step(metrics, plots_dir)
+        _plot_interconnect_by_phase(metrics, plots_dir)
     except Exception as exc:
         print(f"warning: failed to write interconnect CTC plots: {exc}", file=sys.stderr, flush=True)
+    _write_metric_readme(
+        metric_dir,
+        "Nsight Interconnect Artifacts",
+        [
+            "Per-run C2C/CTC saturation data from Nsight GPU metric sampling.",
+            "Values are percent of peak throughput, not absolute GB/s.",
+        ],
+    )
 
 
-def _utilization_series(rows: list[dict[str, Any]], device: str) -> tuple[list[float], list[float]]:
+# Resample utilization measured steps to this many points; x-axis = step index.
+# Interconnect timelines use INTERCONNECT_POINTS_PER_STEP.
+POINTS_PER_STEP = 100
+
+
+def _opt_float(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if result != result or result in (float("inf"), float("-inf")):
+        return None
+    return result
+
+
+def _utilization_points(rows: list[dict[str, Any]], device: str) -> list[tuple[float, float]]:
     points: list[tuple[float, float]] = []
     for row in rows:
         if str(row.get("device") or "") != device:
             continue
-        try:
-            x = float(row.get("elapsed_seconds", row.get("timestamp_seconds", 0.0)) or 0.0)
-            y = float(row.get("value_percent", 0.0) or 0.0)
-        except (TypeError, ValueError):
+        x = _opt_float(row.get("elapsed_seconds", row.get("timestamp_seconds")))
+        y = _opt_float(row.get("value_percent"))
+        if x is None or y is None:
             continue
         points.append((x, min(100.0, max(0.0, y))))
     points.sort(key=lambda item: item[0])
-    return [x for x, _ in points], [y for _, y in points]
+    return points
 
 
-def _plot_utilization_timeline(metrics: dict[str, Any], output_dir: Path) -> None:
+def _util_measured_step_bounds(report: dict[str, Any]) -> list[tuple[float, float]]:
+    """[(start, end), ...] trainer-e2e seconds for non-warmup steps (source_profile.step_samples)."""
+    source_profile = report.get("source_profile")
+    if not isinstance(source_profile, dict):
+        return []
+    step_samples = source_profile.get("step_samples")
+    rows = step_samples.get("rows") if isinstance(step_samples, dict) else None
+    if not isinstance(rows, list):
+        return []
+    bounds: list[tuple[float, float]] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("is_warmup"):
+            continue
+        start = _opt_float(row.get("trainer_e2e_start_seconds"))
+        end = _opt_float(row.get("trainer_e2e_end_seconds"))
+        if start is not None and end is not None and end > start:
+            bounds.append((start, end))
+    return sorted(bounds, key=lambda item: item[0])
+
+
+def _util_affine_to_window(
+    series: list[tuple[float, float]], window: tuple[float, float] | None
+) -> list[tuple[float, float]]:
+    """Map a series' own elapsed range onto [window.start, window.end] (GPU Nsight clock -> steps)."""
+    if not series or window is None:
+        return series
+    start, end = window
+    lo, hi = series[0][0], series[-1][0]
+    if hi <= lo:
+        return series
+    scale = (end - start) / (hi - lo)
+    return [(start + (x - lo) * scale, y) for x, y in series]
+
+
+def _util_resample_per_step(
+    series: list[tuple[float, float]], bounds: list[tuple[float, float]], points_per_step: int, agg: str = "mean"
+) -> list[tuple[float, float]]:
+    """Resample (elapsed, value) to points_per_step per measured step; x = step_index + fraction.
+
+    agg picks each bucket's value: "mean" (duty cycle, for utilization) or "max" (peaks, for saturation).
+    Falls back to one synthetic step over the series' own span when bounds are unavailable.
+    """
+    if not series or points_per_step <= 0:
+        return []
+    if not bounds:
+        bounds = [(series[0][0], series[-1][0])]
+    out: list[tuple[float, float]] = []
+    for index, (start, end) in enumerate(bounds):
+        if end <= start:
+            continue
+        buckets: list[list[float]] = [[] for _ in range(points_per_step)]
+        for x, y in series:
+            if start <= x < end:
+                slot = int((x - start) / (end - start) * points_per_step)
+                buckets[min(slot, points_per_step - 1)].append(y)
+        for slot, values in enumerate(buckets):
+            if values:
+                value = max(values) if agg == "max" else sum(values) / len(values)
+                out.append((index + (slot + 0.5) / points_per_step, value))
+    return out
+
+
+def _plot_utilization_timeline(
+    metrics: dict[str, Any], output_dir: Path, step_bounds: list[tuple[float, float]], report: dict[str, Any]
+) -> None:
     rows = metrics.get("timeseries", {}).get("rows", [])
     if not isinstance(rows, list) or not rows:
         return
     normalized_rows = [row for row in rows if isinstance(row, dict)]
-    gpu_x, gpu_y = _utilization_series(normalized_rows, "gpu")
-    cpu_x, cpu_y = _utilization_series(normalized_rows, "cpu")
-    if not gpu_x and not cpu_x:
+    gpu = _utilization_points(normalized_rows, "gpu")
+    cpu = _utilization_points(normalized_rows, "cpu")
+    if not gpu and not cpu:
         return
+    # CPU is already in trainer time; GPU (Nsight clock) is affine-mapped onto the measured window.
+    window = (step_bounds[0][0], step_bounds[-1][1]) if step_bounds else None
+    gpu = _util_resample_per_step(_util_affine_to_window(gpu, window), step_bounds, POINTS_PER_STEP)
+    cpu = _util_resample_per_step(cpu, step_bounds, POINTS_PER_STEP)
+    if not gpu and not cpu:
+        return
+    n_steps = len(step_bounds) if step_bounds else 1
     plt = _matplotlib_pyplot()
     fig, axes = plt.subplots(2, 1, figsize=(10.5, 5.4), dpi=160, sharex=True, constrained_layout=True)
+    phase_spans = _timeline_phase_spans(report, step_bounds)
+    phase_handles: dict[str, Any] = {}
     panels = (
-        (axes[0], gpu_x, gpu_y, "GPU Utilization", "#ff2d2d"),
-        (axes[1], cpu_x, cpu_y, "CPU Utilization", "#1f4aff"),
+        (axes[0], gpu, "GPU Utilization", "#ff2d2d"),
+        (axes[1], cpu, "CPU Utilization", "#1f4aff"),
     )
-    for ax, xs, ys, title, color in panels:
-        if xs:
+    for ax, points, title, color in panels:
+        _draw_phase_shading(ax, phase_spans, phase_handles)
+        if points:
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
             ax.plot(xs, ys, color=color, linewidth=1.6)
-            if title.startswith("GPU"):
-                ax.fill_between(xs, ys, color=color, alpha=0.16, step=None)
+        for boundary in range(1, n_steps):
+            ax.axvline(boundary, color="#999999", linestyle=":", linewidth=0.8, alpha=0.6)
+        ax.set_xlim(0.0, float(max(n_steps, 1)))
+        ax.set_xticks(list(range(n_steps + 1)))
         ax.set_title(title, loc="right", fontsize=10, pad=3)
         ax.set_ylabel("Utilization (%)")
         ax.set_ylim(0.0, 100.0)
-        ax.grid(True, axis="both", alpha=0.25)
-    axes[-1].set_xlabel("Elapsed time (s)")
+        ax.grid(True, axis="y", alpha=0.25)
+    axes[-1].set_xlabel(f"Measured step ({POINTS_PER_STEP} pts/step)")
+    if phase_handles:
+        fig.legend(
+            handles=list(phase_handles.values()),
+            labels=list(phase_handles),
+            loc="lower center",
+            bbox_to_anchor=(0.5, 1.0),
+            ncol=len(phase_handles),
+            frameon=False,
+        )
     fig.savefig(output_dir / "utilization.png", bbox_inches="tight")
     plt.close(fig)
 
@@ -2085,12 +2371,21 @@ def write_utilization_artifacts(report: dict[str, Any], output_dir: Path) -> Non
     metrics = report.get("utilization_metrics")
     if not isinstance(metrics, dict) or not metrics.get("available"):
         return
-    _write_dict_rows_csv(output_dir / "utilization_timeseries.csv", metrics.get("timeseries", {}).get("rows", []))
-    _write_dict_rows_csv(output_dir / "utilization_summary.csv", metrics.get("summary", {}).get("rows", []))
+    metric_dir, plots_dir, data_dir = _metric_artifact_dirs(output_dir, "utilization")
+    _write_dict_rows_csv(data_dir / "timeseries.csv", metrics.get("timeseries", {}).get("rows", []))
+    _write_dict_rows_csv(data_dir / "summary.csv", metrics.get("summary", {}).get("rows", []))
     try:
-        _plot_utilization_timeline(metrics, output_dir)
+        _plot_utilization_timeline(metrics, plots_dir, _util_measured_step_bounds(report), report)
     except Exception as exc:
         print(f"warning: failed to write utilization plot: {exc}", file=sys.stderr, flush=True)
+    _write_metric_readme(
+        metric_dir,
+        "Nsight Utilization Artifacts",
+        [
+            "Per-run GPU and CPU utilization data.",
+            "GPU utilization comes from Nsight GPU metrics; CPU utilization is process CPU time normalized by available CPU affinity cores.",
+        ],
+    )
 
 
 def _semantic_rows(stage: dict[str, Any]) -> list[dict[str, Any]]:
@@ -3102,12 +3397,15 @@ def _interconnect_markdown(report: dict[str, Any]) -> list[str]:
         )
     artifacts = metrics.get("artifacts", {})
     if isinstance(artifacts, dict):
+        timeline_avg = artifacts.get("timeline_avg_plot", "metrics/interconnect/timeline_avg.png")
+        timeline_max = artifacts.get("timeline_max_plot", artifacts.get("timeline_plot", "metrics/interconnect/timeline_max.png"))
         lines += [
             "",
             "Plots: "
-            f"`{artifacts.get('timeline_plot', 'interconnect_ctc_timeline.png')}`, "
-            f"`{artifacts.get('by_step_plot', 'interconnect_ctc_by_step.png')}`, "
-            f"`{artifacts.get('by_phase_plot', 'interconnect_ctc_by_phase.png')}`.",
+            f"`{timeline_avg}`, "
+            f"`{timeline_max}`, "
+            f"`{artifacts.get('by_step_plot', 'metrics/interconnect/by_step.png')}`, "
+            f"`{artifacts.get('by_phase_plot', 'metrics/interconnect/by_phase.png')}`.",
             "",
         ]
     else:
