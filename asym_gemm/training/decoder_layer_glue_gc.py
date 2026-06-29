@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import types
 import warnings
 from contextlib import nullcontext
@@ -13,6 +14,23 @@ from torch.autograd.graph import save_on_cpu, saved_tensors_hooks
 from torch.utils.checkpoint import checkpoint
 
 from .decoder_activation_offload import DecoderSavedTensorOffloadWrapper
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
 
 
 _FORWARD_RESERVED_KWARGS = frozenset(
@@ -144,6 +162,23 @@ class DecoderLayerGlueGCWrapper:
         self.module = module
         # "custom"=asym pack/unpack | "save_on_cpu"=generic whole-forward | "none"=recompute-only (offload done externally)
         self.offload_mode = str(offload_mode)
+        # Sub-block recompute (ASYMM_LAYER_GC_RECOMPUTE=1): instead of offloading the wide attn/mlp saved
+        # activations to CPU (the "custom" pack, which OOMs CPU at long seq because all L layers stay live),
+        # checkpoint [norm+attn] and [norm+mlp] as separate sub-blocks. Only the 2x[M,H]/layer block inputs
+        # cross the autograd boundary (offloaded to CPU by the same pack); the wide [M,I]/[M,Dq] activations are
+        # recomputed in backward and freed immediately -> HBM peak = one sub-block transient, not the whole layer.
+        self.recompute_submodules = _env_bool("ASYMM_LAYER_GC_RECOMPUTE", False)
+        # The dense MLP is token-parallel, so recompute it in row-chunks of this many tokens. This caps the
+        # MLP recompute working set at [chunk, I] instead of [M, I] (whole-MLP recompute at M=B*T blows up the
+        # transient and OOMs). <=0 disables chunking (recompute the whole MLP sub-block in one checkpoint).
+        self.recompute_chunk_tokens = _env_int("ASYMM_LAYER_GC_RECOMPUTE_CHUNK", 8192)
+        if self.recompute_submodules and not getattr(DecoderLayerGlueGCWrapper, "_logged_recompute", False):
+            DecoderLayerGlueGCWrapper._logged_recompute = True
+            print(
+                f"[asym] decoder-layer glue-GC: sub-block recompute ENABLED "
+                f"(ASYMM_LAYER_GC_RECOMPUTE=1, mlp chunk={self.recompute_chunk_tokens} tokens)",
+                flush=True,
+            )
         self.original_forward: Callable[..., Any] = module.forward
         self.forward_signature = inspect.signature(self.original_forward)
         self.use_reentrant = bool(use_reentrant)
@@ -212,11 +247,92 @@ class DecoderLayerGlueGCWrapper:
         with offload_ctx:
             return self._manual_forward(values)
 
+    def _attn_subblock(self, layer: nn.Module, hidden_states: torch.Tensor, values: Mapping[str, Any]) -> torch.Tensor:
+        normed = layer.input_layernorm(hidden_states)
+        if getattr(layer, "layer_type", None) == "linear_attention" and hasattr(layer, "linear_attn"):
+            out = _call_qwen35_linear_attention(layer, normed, values)
+        else:
+            out = _call_self_attention(layer, normed, values)
+        return out[0] if isinstance(out, tuple) else out
+
+    def _mlp_subblock(self, layer: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+        normed = layer.post_attention_layernorm(hidden_states)
+        if hasattr(layer, "feed_forward"):
+            out = layer.feed_forward(normed)
+            out = out[0] if isinstance(out, tuple) else out
+            return out.view(hidden_states.shape)
+        out = layer.mlp(normed)
+        return out[0] if isinstance(out, tuple) else out
+
+    def _mlp_subblock_flat(self, layer: nn.Module, hidden_flat: torch.Tensor) -> torch.Tensor:
+        normed = layer.post_attention_layernorm(hidden_flat)
+        if hasattr(layer, "feed_forward"):
+            out = layer.feed_forward(normed)
+            out = out[0] if isinstance(out, tuple) else out
+            return out.reshape(hidden_flat.shape)
+        out = layer.mlp(normed)
+        return out[0] if isinstance(out, tuple) else out
+
+    def _mlp_chunked(self, layer: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+        # [post_attn_norm + mlp] over token row-chunks; each chunk is checkpointed so only [chunk, I] is
+        # materialized during recompute. The chunk inputs ([M,H] total) are the only mlp-side tensors that
+        # cross the autograd boundary (offloaded by the surrounding pack).
+        out_shape = hidden_states.shape
+        flat = hidden_states.reshape(-1, out_shape[-1])
+        rows = int(flat.shape[0])
+        chunk = int(self.recompute_chunk_tokens)
+
+        def _mlp_flat_fn(h: torch.Tensor) -> torch.Tensor:
+            return self._mlp_subblock_flat(layer, h)
+
+        if not flat.requires_grad:
+            return _mlp_flat_fn(flat).reshape(out_shape)
+        if chunk <= 0 or rows <= chunk:
+            out = checkpoint(
+                _mlp_flat_fn, flat, use_reentrant=self.use_reentrant, preserve_rng_state=self.preserve_rng_state
+            )
+            return out.reshape(out_shape)
+        pieces = [
+            checkpoint(
+                _mlp_flat_fn,
+                flat[start : start + chunk],
+                use_reentrant=self.use_reentrant,
+                preserve_rng_state=self.preserve_rng_state,
+            )
+            for start in range(0, rows, chunk)
+        ]
+        return torch.cat(pieces, dim=0).reshape(out_shape)
+
     def _manual_forward(self, values: Mapping[str, Any]) -> torch.Tensor:
         layer = self.module
         hidden_states = values["hidden_states"]
         if not isinstance(hidden_states, torch.Tensor):
             raise TypeError("hidden_states must be a tensor")
+
+        if self.recompute_submodules:
+            # Each sub-block bundles its norm; checkpoint recomputes [norm+attn] / [norm+mlp] in backward.
+            # Only the sub-block input [M,H] crosses the autograd boundary (offloaded by the surrounding pack);
+            # the wide attn/mlp activations are recomputed and freed -> peak = one sub-block transient.
+            # Non-tensor kwargs (mask/RoPE/position ids) ride the closures; only the [M,H] sub-block input
+            # is a tracked checkpoint tensor, so only it is saved (and offloaded by the surrounding pack).
+            def _attn_fn(h: torch.Tensor) -> torch.Tensor:
+                return self._attn_subblock(layer, h, values)
+
+            residual = hidden_states
+            if hidden_states.requires_grad:
+                mixer_out = checkpoint(
+                    _attn_fn,
+                    hidden_states,
+                    use_reentrant=self.use_reentrant,
+                    preserve_rng_state=self.preserve_rng_state,
+                )
+            else:
+                mixer_out = _attn_fn(hidden_states)
+            hidden_states = residual + mixer_out
+
+            residual = hidden_states
+            mlp_out = self._mlp_chunked(layer, hidden_states)
+            return residual + mlp_out
 
         residual = hidden_states
         normed = self._checkpoint_norm(layer.input_layernorm, hidden_states)

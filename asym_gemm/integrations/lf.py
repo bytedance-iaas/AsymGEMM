@@ -37,6 +37,7 @@ from asym_gemm.training.decoder_checkpoint import (
     decoder_checkpoint_module_names,
     install_decoder_checkpoint,
 )
+from asym_gemm.training.chunked_mlp import install_chunked_mlp_on_dense_mlps
 from asym_gemm.training.decoder_layer_glue_gc import (
     decoder_layer_glue_gc_module_names,
     install_decoder_layer_glue_gc,
@@ -2315,6 +2316,12 @@ def apply_lf_asym_lora(
     setattr(model, "_asym_layer_glue_gc_enabled", bool(layer_glue_gc_enabled))
     setattr(model, "_asym_layer_glue_gc_modules", tuple(layer_glue_modules))
     setattr(model, "_asym_layer_glue_gc_skipped", tuple(layer_glue_skipped))
+
+    # Token-chunked dense MLP recompute (ASYMM_MLP_RECOMPUTE_CHUNK>0): caps the per-layer MLP working set at
+    # [chunk, I] so whole-layer gradient checkpointing (HF/Unsloth) doesn't rebuild the full [M, I] transient in
+    # backward. No-op when the env is unset/<=0; composes with any backend.
+    chunked_mlp_modules = install_chunked_mlp_on_dense_mlps(model)
+    setattr(model, "_asym_chunked_mlp_modules", tuple(chunked_mlp_modules))
 
     freeze_non_lora_params(model)
     _validate_trainable_params(model)

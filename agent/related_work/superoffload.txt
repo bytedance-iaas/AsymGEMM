@@ -1,0 +1,1635 @@
+
+
+===== PAGE 1 =====
+
+SuperOffload: Unleashing the Power of Large-Scale
+LLM Training on Superchips
+Xinyu Lian
+SSAIL Lab, University of Illinois
+Urbana-Champaign, IL, USA
+Masahiro Tanaka
+Anyscale
+San Francisco, CA, USA
+Olatunji Ruwase
+Snowflake
+Bellevue, WA, USA
+Minjia Zhang
+SSAIL Lab, University of Illinois
+Urbana-Champaign, IL, USA
+Abstract
+The emergence of Superchips represents a significant ad-
+vancement in next-generation AI hardware. These Super-
+chips employ a tightly coupled heterogeneous architecture
+that integrates GPU and CPU on the same package, which
+offers unprecedented computational power. However, there
+has been scant research investigating how LLM training ben-
+efits from this new architecture. In this work, for the first
+time, we study LLM training solutions based on offloading
+for Superchips. We observe important differences between
+Superchips and traditional loosely-coupled GPU-CPU archi-
+tecture, which necessitate revisiting prevailing assumptions
+about offloading. Based on that, we present SuperOffload,
+a Superchip-centric offloading system that simultaneously
+uses Hopper GPU, Grace CPU, and NVLink-C2C intercon-
+nect more efficiently. SuperOffload accomplishes this via a
+combination of techniques, such as adaptive weight offload-
+ing, bucketization repartitioning, Superchip-aware casting,
+speculative execution, and a highly optimized Adam opti-
+mizer for Grace CPUs. Our evaluation of SuperOffload on
+NVIDIA GH200 demonstrates up to 2.5 × throughput im-
+provement compared to state-of-the-art offloading-based
+systems, enabling training of up to 25B model on a single Su-
+perchip while achieving high training throughput. We also
+extend SuperOffload with ZeRO-style data parallelism and
+DeepSpeed-Ulysses sequence parallelism, enabling training
+of 13B model with sequence lengths up to 1 million tokens
+on 8 GH200 while achieving 55% MFU.
+1 Introduction
+The impressive capabilities of Large Language Models (LLMs)
+have spurred significant research and industry efforts [ 1,
+33, 43, 63, 68] to optimize the resource and time costs of
+training state-of-the-art LLMs. A large fraction of this work is
+motivated by thememory wallchallenge of scaling LLMs [14]
+– the disparity between exponential growth in model sizes
+and relatively slower increase in hardware memory capacity
+and bandwidth [24, 52]. Consequently, training LLMs is often
+constrained by limited GPU memory.
+When LLM training exceeds a single GPU’s memory ca-
+pacity, practitioners often employ a variety of distributed
+techniques, such as ZeRO-style data parallelism [51], tensor-
+slicing parallelism [60], pipeline parallelism [18, 36, 37], and
+sequence parallelism [22, 29], to shard model and data states
+across multiple GPUs. However, the large number of GPUs
+required by these methods poses a significant bottleneck for
+researchers and institutions with modest GPU budgets.
+Yet, enabling training of LLMs with a limited number of
+GPUs is critical in many scenarios. Beyond pre-training,
+LLMs often reach their full potential through additional
+post-training phases, such as long context extension [8, 33],
+continuous training [28, 57, 61], supervised fine-tuning [6],
+instruction tuning [70], and human preference alignment
+techniques such as RLHF [ 44] and DPO [50], all of which
+require model training, even when users have significantly
+fewer GPUs than used for pre-training.
+Among different approaches, offloading techniques have
+become a promising solution to reduce GPU requirements
+for large-scale LLM training [32, 52, 55, 72]. These methods
+offload a portion of the model states and computation from
+GPU to CPU, effectively utilizing both to enable large-scale
+LLM training without excessive GPU usage. As a result, of-
+floading is supported by major DL training frameworks such
+as PyTorch-FSDP [73] and DeepSpeed [52, 55].
+While showing promising results, existing offloading so-
+lutions are based on one key assumption: the GPU is an ac-
+celerator connected to the CPU via PCIe, which has limited
+communication bandwidth (e.g., 32GB/s for PCIe-Gen4). Due
+to this bandwidth limitation, prior work primarily focuses
+on optimizing data transfers between GPU and CPU to avoid
+PCIe becoming a major performance bottleneck [48, 52, 55].
+However, hardware vendors have embarked on the develop-
+ment of a new class of high-end tightly coupled hardware
+architecture in their product roadmaps [ 41], e.g., NVIDIA
+Grace Hopper GH200 [ 42] and AMD MI300A [ 2], which
+herald a paradigm shift in deep learning infrastructure.
+Take NVIDIA’s Grace Hopper Superchip (GH200) as an
+example. It integrates a Hopper H100 GPU and an ARM-
+based Grace CPU on the same package through the NVLink-
+Chip2Chip (C2C) interconnect, with GPU-CPU bandwidth
+reaching a staggering 900 GB/s—30× increase over tradi-
+tional PCIe connections. Moreover, multiple Superchips can
+1
+arXiv:2509.21271v1  [cs.LG]  25 Sep 2025
+
+===== PAGE 2 =====
+
+Xinyu Lian, Masahiro Tanaka, Olatunji Ruwase, and Minjia Zhang
+be connected to form a large-scale tightly coupled system,
+which offers fast and low latency interaction between differ-
+ent classes of chiplets. Given the tightly coupled hardware
+architecture, recent work has started benchmarking Super-
+chips [11, 19, 58] and how to best program them [69]. How-
+ever, efficient utilization of Superchips for offloading-based
+LLM training has not yet been studied in depth.
+In this work, we investigate software optimizations to
+train LLMs in the era of Superchips. We find that existing
+offloading methods, designed under the assumption of lim-
+ited PCIe bandwidth, perform suboptimally on Superchips.
+In particular, off-the-shelf solutions severely underutilize the
+Hopper GPU, Grace CPU, and C2C bandwidth. For example,
+prior work often adopts a greedy algorithm for data transfer
+in mixed-precision training, transferring only low-precision
+data between CPU and GPU to minimize PCIe communica-
+tion volume in order to maximize training efficiency. Our
+detailed analysis reveals that these common assumptions do
+not hold true for Superchips.
+Contribution.This paper addresses a pressing need to
+harness the power of Superchips for training LLMs. Con-
+cretely, we take a leap forward and introduce SuperOffload,
+a Superchip-centric offloading system that delivers excel-
+lent training performance on NVIDIA GH200 Superchips.
+SuperOffload accomplishes this via a combination of tech-
+niques, such asadaptive weight-stationary and weight-flow
+offloading(§ 4.2),fine-grained bucketization repartitioning
+(§ 4.3),speculation-then-validationsupport to overlap com-
+pute and communication (§ 4.4),Superchip-aware typecasting
+for mixed-precision training(§ 4.5), andhighly optimized
+GraceAdamfor Grace Arm CPUs (§ 4.6). To our knowledge,
+this is the first work that systematically optimizes LLM train-
+ing for Superchip architectures, maximizing the utilization
+of Hopper GPU, Grace CPU, and C2C interconnect, simulta-
+neously.
+We validate our design through comprehensive experi-
+ments. SuperOffload achieves a 2.5× throughput improve-
+ment over state-of-the-art offloading solutions and outper-
+forms GPU-only approaches across all tested model sizes,
+which challenges the conventional wisdom that offloading
+often comes at the cost of performance penalty. SuperOf-
+fload also enables 25B-parameter model training on a single
+Superchip, which is 7×larger than GPU-only solutions.
+In addition, we validate our design by integrating Super-
+Offload with ZeRO-style data parallelism [51], which allows
+SuperOffload to extend to multi-Superchip training settings.
+Specifically, SuperOffload enables LLM training with 50B
+parameters using only four Superchips, which is 2.5× larger
+than the largest model trainable with ZeRO-Offload and
+FSDP-Offload, while achieving up to 3 × higher training
+throughput.
+We also extend SuperOffload to support long-sequence
+training, termed SuperOffload-Ulysses, via integration with
+importtorch... ... model = BuildModel(config) optimizer = Optimizer(model) ... ... forbatch inbatches: loss = model(batch) loss.backward() optimizer.step()
+importtorchimportSuperOffload... model = BuildModel(config) optimizer = Optimizer(model) model = SuperOffload.init(     model, optimizer) forbatch inbatches: loss = model(batch) model.backward() model.step()
+Figure 1.SuperOffload can be enabled with a few lines of
+change. The code on left shows a standard training pipeline,
+while the right shows the same pipeline with SuperOffload.
+Ulysses-style sequence parallelism [22]. This unlocks new
+possibilities for training or fine-tuning LLMs with long se-
+quence lengths. Specifically, SuperOffload-Ulysses supports
+training sequences 8× longer than Ulysses and enables the
+training of a 13B model with up to a million tokens using
+only 8 GH200 Superchips, while achieving 55% MFU. To
+enhance usability, SuperOffload has been integrated with
+DeepSpeed [53], a popular open-source DL training library.
+Users can enable SuperOffload through a few lines, as illus-
+trated in Fig. 1, without model code refactoring.
+2 Background and Related Work
+2.1 The Emergence of Superchips
+GPUs were initially developed as accelerators loosely-coupled
+with CPUs. Driven by the need to support the next genera-
+tion of AI systems, NVIDIA introduced GH200 Grace Hopper
+Superchip [42], a groundbreaking processor that integrates
+a tightly-coupled Hopper GPU and Grace CPU on the same
+package with high-bandwidth NVLink Chip-2-Chip (C2C)
+interconnect, as shown in Fig. 2. Recently, NVIDIA also an-
+nounced GB200 [41], the next-generation Superchip that has
+a tightly-coupled Blackwell GPU with Grace CPU to deliver
+unprecedented performance and efficiency for AI and other
+advanced computing fields. Other hardware vendors, such as
+AMD, have released AMD Instinct MI300A Superchip [2] that
+connects 6 AMD CDNA3 GPU chiplets and 3 AMD Zen4 x86
+CPU chiplets through AMD’s 4th Gen Infinity interconnect
+using 3D stacking technology.
+Despite being a new architecture, Superchips have already
+been adopted in large-scale supercomputing clusters world-
+wide, including France’s EXA1-HE [21], Poland’s Helios [16],
+Switzerland’s Alps [64], Germany’s JUPITER [23], the United
+States’ NCSA [9, 38], and Japan’s Miyabi [20]. Notably, the
+Alps supercomputer has integrated over 2,000 GH200 nodes
+and Isambard-AI supercomputer plans to deploy over 5,000
+GH200 nodes to enhance computational capabilities. The
+GH200 Superchip is also available through cloud service
+providers such as Amazon Web Services [ 59], Microsoft
+Azure [5], and Lambda [26], offering flexible options for or-
+ganizations seeking high-performance computing resources.
+2
+
+===== PAGE 3 =====
+
+SuperOffload: Unleashing the Power of Large-Scale LLM Training on Superchips
+Figure 2.Grace Hopper GH200 Superchip hardware
+overview [40]. The Grace CPU, equipped with a 500 GB/s
+DDR interface, is shown on the left, and the Hopper GPU,
+with 4000 GB/s HBM, is depicted on the right. The two are
+interconnected via NVLINK-C2C at 900 GB/s.
+Given the ever-growing adoption, Superchips have at-
+tracted significant attention with active research on bench-
+marking their hardware characteristics [11, 19, 58] and their
+programmability [69]. However, few studies have been done
+to investigate how to effectively leverage it for LLM training.
+2.2 LLM Training on Heterogeneous Hardware
+Modern LLM training is highly memory-intensive due to
+the large number of parameters and the significant mem-
+ory required for model states like gradients and optimizer
+states [25, 31]. As an example, during mixed precision train-
+ing [34], a model with Ψ parameters consumes a total of 16Ψ
+bytes of memory (e.g., 2Ψ parameters, 2Ψ gradients, and 12Ψ
+optimizer states). An NVIDIA H100 GPU with 96GB memory
+can only accommodate a model with up to 6B parameters.
+To overcome the memory limitations, advanced distributed
+training techniques such as tensor parallelism (TP) [ 60],
+pipeline parallelism (PP) [18, 36], ZeRO-style data parallelism
+(ZeRO-DP) [51], 3D parallelism [37] have been developed.
+Despite their strong capabilities, all of these methods rely on
+the aggregated memory of multiple GPUs to store the model
+states and residual states.
+To reduce the number of GPUs needed, researchers have
+explored heterogeneous training that exploit the expansive
+memory capacity of CPUs to scale up model training [15, 17,
+46, 54, 56, 67]. Offloading strategies like ZeRO-Offload [55]
+carefully divide the computation between the hardware types:
+GPU performs compute-intensive operations such as back-
+propagation, while CPU performs memory-intensive opera-
+tions such as optimizer updates. ZeRO-Infinity further ex-
+tends this approach to NVMe storage, enabling larger model
+training with limited GPU resources [52]. Deep-Optimizer-
+States extends ZeRO-Offload by fetching optimizer states
+from CPU to GPU and updating parameters in parallel across
+both devices, thus reducing optimizer step time in the criti-
+cal path [32]. Similar to ZeRO-Infinity, SpeedLoader offloads
+Table 1.Comparison of GPU node. DGX-2 is used in the
+ZeRO-Offload [55], DGX-A100 is used for LLaMa model train-
+ing [65], and GH denotes a single Grace Hopper Superchip.
+Node Arch DGX-2 DGX-A100 GH
+Hardware Setting Intel Xeon+V100 AMD Roma+A100 GH200
+CPU BW (GB/s) 100 150500
+C↔GPU BW (GB/s) 32 64900
+CPU Cores 24 64 72
+CPU FLOPS (TFLOPS) 2.07 2.3 3.0
+GPU FLOPS (TFLOPS) 125.0 312.0 990.0
+GPU/CPU FLOPS 60.39 135.65330.0
+both parameters and optimizer states to CPU memory, then
+dynamically fetches them to GPU layer by layer [72].
+While demonstrating promising results, prior work often
+assume limited bandwidth between GPU and CPU via PCIe
+(e.g., <32GB/s). Therefore, they primarily focus on reducing
+the communication volume between GPU and CPU to avoid
+the PCIe from becoming a major performance bottleneck.
+However, newer hardware, such as Superchips with 30 ×
+higher C2C bandwidth, challenges these assumptions. Con-
+sequently, adhering to the older design principles could lead
+to suboptimal performance, which motivates us to revisit
+the offloading design.
+3 Challenges and Opportunities
+NVIDIA’s GH200 Grace Hopper Superchip represents a sig-
+nificant advancement in high-performance computing. How-
+ever, this new hardware architecture poses challenges for
+existing off-the-shelf offloading solutions tofully utilize all
+Superchip resources, including the Hopper GPU, C2C band-
+width, simultaneously, for the following reasons:
+Superchip ≠ GPU + CPU.Before the advent of Super-
+chip, the connection between CPUs and GPUs relied on PCI
+Express (PCIe). For instance, as shown in Table 1, the DGX-
+A100 node [39], widely deployed within Meta for training
+the LLaMA model [65], comprises two AMD Rome CPUs and
+eight NVIDIA A100 GPUs, connected via PCIe 4.0 x16, deliv-
+ering a bandwidth of 64 GB/s. Similarly, the DGX-2 node eval-
+uated in ZeRO-Offload [55] contains two Intel Xeon CPUs
+and 16 NVIDIA V100 GPUs, with the CPU-GPU connection
+utilizing PCIe 3.0 x16, providing a bandwidth of 32 GB/s.
+The Superchip, however, tightly couples GPU and CPU
+with in the same package through the high-bandwidth in-
+terconnect, delivering a staggering 900 GB/s bandwidth be-
+tween GPU and CPU (NVLINK-C2C as in the GH200) – 14×
+the standard PCIe Gen4 lanes. In addition, the 72-core Grace
+CPU significantly enhances compute capacity with 500 GB/s
+of LPDDR5 high-bandwidth memory, providing not only
+additional memory space but also efficient handling of com-
+putation tasks.
+3
+
+===== PAGE 4 =====
+
+Xinyu Lian, Masahiro Tanaka, Olatunji Ruwase, and Minjia Zhang
+F1F2F3F4B4B3B2B1
+G4G3G2G1
+OptimizerStep
+F1F2F3F4GPUComputation
+GPU			CPU													Communication
+CPUComputation
+F: ForwardB: BackwardG: GradientP: Parameter
+iteration	i iteration	i+1
+…
+P1P2P3P4
+idle time
+idle time
+idle time
+Figure 3.ZeRO-Offload computation idle time on both GPU
+and CPU side.
+Challenges in idle-free scheduling.Prior offloading-
+based solutions often suffer from GPU and CPU idle time
+due to GPU-CPU synchronization. Take ZeRO-Offload [55]
+as an example. As shown in Fig. 3, there are three primary
+constraints: 1) Global Gradient Synchronization: Gradient
+clipping and normalization require global information. Con-
+sequently, the CPU must wait until it has received all gradi-
+ents from the GPUs before starting the optimizer step. This
+results in CPU idle time while the GPUs are busy with the
+backward pass. 2) Synchronized Parameter Updates: The
+GPU must wait for all FP16 parameters to return before
+initiating the forward pass of the next iteration. This syn-
+chronization is crucial to ensure that the forward pass uses
+updated parameters. 3) Limited Overlap of Computation and
+Communication: Even with small bucket sizes for transfer-
+ring gradients to the CPU and updated parameters back to
+the GPU, complete overlap between computation and com-
+munication is unattainable (more details in § 4.3). As a result,
+during the final bucket’s transfer interval, both the GPU and
+CPU remain idle. Fig. 4 shows that 40-50% of the Hopper GPU
+is idle per training iteration. These significant idle periods
+raise the question: How can we reduce these inefficiencies
+for offloading-based solutions on Superchips?
+Challenges in mixed-precision training on Superchips.
+Modern DL training often employs mixed precision train-
+ing [34], which uses a mix of full and lower precisions to
+deliver significant computational speedup by executing op-
+erations in a lower precision format on matrix cores (e.g.,
+TensorCore) as much as possible, while storing critical infor-
+mation in the full-precision to preserve model accuracy.
+Mixed precision training makes offloading more complex
+because of additional casting operations in the computation
+graph. To enable efficient mixed-precision training through
+offloading, the conventional design principle was to adopt
+a greedy edge-cut algorithm [ 55]. As an example, ZeRO-
+Offload keeps all the optimizer states on the CPU, and moves
+the FP16 gradients to CPU during the backward pass and
+returns the updated FP16 parameter back to GPU during the
+optimizer step. This minimizes the communication volume
+between the GPU and CPU (e.g., 4 Ψ), such that the PCIe
+bandwidth does not become a major bottleneck. However,
+our detailed performance analysis shows that this method
+GPU GPU
+CPU CPU
+One	SuperChip One	Node
+Figure 4.Prior offloading-based solutions cause idle time
+on both GPU and CPU side. We evaluate it using the largest
+model size that offloading-based solutions (ZeRO-Offload)
+can accommodate, along with the maximum batch size that
+prevents out-of-memory errors, on single Superchip and one
+node. The results show that during each training iteration,
+the GPU remains idle for 40-50% of the total execution time.
+is suboptimal for Superchip architectures (§ 4.5), which mo-
+tivates us to revisit the decision of offloading-based mixed
+precision training.
+There are other challenges such as Grace Arm CPU’s lack
+of a high-performance Adam optimizer, and lacking of a clear
+solution towards scaling model sizes and long-sequence on
+multiple Superchips. In the following, we describe the design
+of SuperOffload, which specifically addresses all of the above
+challenges, eventually leading to a highly-optimized solution
+tailored for Superchips in many practical settings.
+4 SuperOffload Design and Implementation
+4.1 System Overview
+SuperOffload takes the tightly-coupled Superchip architec-
+ture into account by considering a Superchip-aware DFG
+(SA-DFG). In SA-DFG, each vertex𝑢 still represents a ten-
+sor operator but it also reflects the computation cost that𝑢
+would incur if it is assigned to the Hopper GPU or Grace
+CPU. The edge𝑢→𝑣 in SA-DFG reflects the communication
+cost that𝑢→𝑣 would incur if𝑢 and𝑣 are executed on a
+Hopper GPU or Grace CPU. An offload strategy then can be
+viewed as a two-way partition of SA-DFG.
+Fig. 5 illustrates an overview of SuperOffload, a system
+specifically designed for training LLMs on Superchips by
+judiciously optimizing data placement, computation, and
+tensor migration between Hopper GPU and Grace CPU. This
+is achieved through a combination of techniques. First, it
+examines the amount of computation and communication as-
+sociated with the operators in SA-DFG, and employs an adap-
+tive weight-stationary and weight-flow policy to exploit het-
+erogeneous compute efficiencies of Hopper GPU and Grace
+CPU (§ 4.2). Second, it adjusts the bucketization strategy and
+leverages fine-grained repartitioning to balance the work-
+load among different resources on a Superchip (§ 4.3). Third,
+it introduces a novel speculation-then-validation algorithm
+4
+
+===== PAGE 5 =====
+
+SuperOffload: Unleashing the Power of Large-Scale LLM Training on Superchips
+GraceAdam(§4.6)
+Grace	CPU Hopper	GPU
+Superchip-Aware Casting(§4.5)
+MoveCast
+NVLINK-C2C	(900GB/s)Speculation-then-Validation (§4.4)Speculative	Optimizer	Step
+Post	Validation
+RollBack
+dfWeight-Stationary or Flow Offloading(§4.2)Optimizer	State	(12Ψ) Param	(2Ψ)Offload?
+Bucketization Repartitioning (§4.3)
+If𝐵𝑢𝑐𝑘!"#<𝑛
+Buck$%&%'𝑆𝑡𝑒𝑝()"
+𝑆𝑡𝑒𝑝*)"
+Optim.	State(𝐵!"#≥𝑛)
+Optim.	State(𝐵!"#<𝑛)
+FWD
+BWDG32Cast
+A16
+G16
+Step
+4M
+Buck+&%,
+A16Cast4M
+P32
+P162M
+2M
+2M
+2M
+2M
+2
+2 2
+2
+2 2
+2
+1
+1
+1
+1
+1
+𝐶𝑜𝑚𝑝(𝐺𝑃𝑈𝐶𝑃𝑈)
+𝐶𝑃𝑈−𝐺𝑃𝑈	𝐵𝑊
+1
+2
+SA-DFG
+SuperOffloadGH200GB200
+GB10……
+Figure 5.Overview of SuperOffload. At a high level, Super-
+Offload employs a Superchip-centric design that judiciously
+optimizes data placement, computation, and tensor migra-
+tion between the Hopper GPU and Grace CPU, while fully
+utilizing the NVLink-C2C via a combination of techniques.
+to replace the conventional synchronization-then-execution
+scheme that enables effective overlapping between Hopper
+GPU and Grace CPU (§ 4.4). Fourth, it performs Superchip-
+aware casting for mixed-precision training (§ 4.5). Fifth, we
+develop a highly optimized Adam optimizer, GraceAdam, to
+make the best use of the Grace CPU (§ 4.6). Finally, Super-
+Offload can be extended with ZeRO-style data parallelism
+and Ulysses-style sequence parallelism to support multi-
+Superchip training and training with long sequences (§ 4.7).
+4.2 Adaptive Weight-Stationary and Weight-Flow
+Offloading
+When it comes to offloading LLM training, a key issue is to
+determine what model states to offload from GPU to CPU.
+While CPUs offer large memory capacity, transferring model
+states to and from CPU memory still incurs time delays.
+Given that both the forward propagation and backward prop-
+agation of LLM training have a computation complexity of
+𝑂(𝑏𝑠𝑧·Ψ) and the optimizer state update has a complexity
+of𝑂(Ψ) , where𝑏𝑠𝑧 is the batch size, state-of-the-art offload-
+ing systems often offload optimizer states and updates to
+the CPU [52, 55], which significantly reduces GPU memory
+consumption while avoiding offloading compute-intensive
+operations to the CPU.
+However, an offloading decision must also be made for
+the model weights. Prior work often takes one of two direc-
+tions: (1)weight-stationary, which keeps model weights on
+GPU [55], and (2)weight-flow, which partially loads model
+weights part-by-part [52]. For example, ZeRO-Offload keeps
+FP16 weights stationary on the GPU while offloading opti-
+mizer states to the CPU, reducing GPU memory consumption
+by roughly 8×. Conversely, ZeRO-Infinity partially offloads
+FP16 weights to DRAM or NVMe, allowing larger models to
+10 20 40 80 160 320400 640 1280
+Bandwidth (GB/s)
+0
+10
+20
+30
+40
+50
+60
+70
+80
+90
+100Efficiency in Percent
+Efficiency based on AIT wrt Params
+Bsz1
+Bsz2
+Bsz4
+Figure 6.Impact of bandwidth on efficiency.
+be trained with a single GPU. Given the drastic change in
+Superchip architecture and emerging post-training scenarios
+like long-context extension, an important question arises:
+shall we offload the FP16 weights from Hopper GPU to the
+Grace CPU to scale up model training on Superchip?
+To analyze the theoretical viability of offloading FP16
+weights to Grace CPU on Superchip, we use the peak com-
+putational throughput (𝑝𝑒𝑎𝑘 𝑡𝑝 ), data movement bandwidth
+(𝑏𝑤) to estimate training efficiency. The efficiency metric
+can be derived as follows:
+𝑐𝑜𝑚𝑝_𝑡𝑖𝑚𝑒= 𝑡𝑜𝑡𝑎𝑙_𝑐𝑜𝑚𝑝𝑢𝑡𝑎𝑡𝑖𝑜𝑛
+𝑝𝑒𝑎𝑘 𝑡𝑝
+(1)
+𝑐𝑜𝑚𝑚_𝑡𝑖𝑚𝑒= 𝑡𝑜𝑡𝑎𝑙_𝑑𝑎𝑡𝑎_𝑚𝑜𝑣𝑒𝑚𝑒𝑛𝑡
+𝑏𝑤 (2)
+𝑒𝑓𝑓𝑖𝑐𝑖𝑒𝑛𝑐𝑦= 𝑐𝑜𝑚𝑝_𝑡𝑖𝑚𝑒
+𝑐𝑜𝑚𝑝_𝑡𝑖𝑚𝑒+𝑐𝑜𝑚𝑚_𝑡𝑖𝑚𝑒 (3)
+For the forward pass in LLMs, the total computation is
+dominated by the operations in the linear layers. This can
+be approximated as a function of the number of parameters,
+sequence length, and batch size (i.e.,2×𝑏𝑠𝑧×𝑠𝑒𝑞×𝑝𝑎𝑟𝑎𝑚𝑠 ).
+During the forward, the model parameters must be loaded
+from CPU to GPU at least once, resulting in𝑑𝑎𝑡𝑎_𝑚𝑜𝑣𝑒𝑚𝑒𝑛𝑡
+of2×𝑝𝑎𝑟𝑎𝑚𝑠 in bytes. To identify𝑝𝑒𝑎𝑘 𝑡𝑝 , we use the achiev-
+able peak instead of the theoretical hardware peak.
+To ensure that data movement can be completely over-
+lapped with computation, the efficiency should exceed 50%
+and ideally surpass 60% when considering communication
+latency and other overhead. Fig. 6 shows that even with a
+theoretical peak uni-directional C2C bandwidth of 450 GB/s,
+the batch size needs to be larger or equal to 4 with a sequence
+length of 1024 to achieve an efficiency greater than 60%.
+This analysis indicates that the optimal offloading strat-
+egy is scenario-dependent. When scaling model sizes, each
+GPU can only handle a small micro-batch size to prevent
+out-of-memory, as seen in training large-scale LLMs like
+Bloom [62], Megatron-LM [60], and Turing-NLG models [35],
+which often use a micro-batch size of 1 or 2. As batch size
+and sequence lengths grow, such as in post-training with
+long-context extension [10, 13], activation memory may be-
+come significantly larger than model states. For instance, a
+7B-parameter model requires 112GB for model states but
+5
+
+===== PAGE 6 =====
+
+Xinyu Lian, Masahiro Tanaka, Olatunji Ruwase, and Minjia Zhang
+needs 2TB of memory for activations with a sequence length
+of 1 million tokens. When this happens, it becomes more eco-
+nomical to transfer FP16 weights between the Hopper GPU
+and Grace CPU. In SuperOffload, we support both weight-
+stationary and weight-flow policies and adaptively choose
+the offloading policy for various practical settings.
+4.3 Fine-Grained Bucketization Repartitioning
+One challenge in offloading-based solutions is that they can-
+not fully utilize both the computation and interconnect re-
+sources simultaneously because the GPU and CPU are idle
+during data movement operations. To overcome this chal-
+lenge, prior work uses abucketizationstrategy [ 55], dividing
+model states (e.g.,weights, gradients, optimizer states) into
+buckets to overlap GPU computation ( e.g., MatMul during
+backward propagation) with swap-out/in operations (e.g.,
+transferring gradients from GPU to CPU) in a fine-grained
+manner. This allows the swap-out/in operation of a bucket
+to start as soon as the compute kernel produces it.
+In theory, bucketization should allow GPU computation
+to fully overlap with the optimizer step on CPU and data
+transfer between GPU and CPU. However, in practice, we
+observe that Hopper GPU still experiences long idle times
+with bucketization, as shown in Fig. 4. By diving deeper into
+the issue, we find that this is primarily because the FLOPS
+ratio between Hopper GPU and Grace CPU is∼330, which is
+significantly larger than prior architectures such as DGX-2
+(∼60.39) and DGX-A100 (∼135.65). This increased compute
+gap makes balancing computation challenging. Take the last
+bucket as an example. In order for the last bucket’s optimizer
+state to be executed on CPU, it requires a three-stage process:
+(i) gradient swap-out from GPU to CPU, (ii) execution of
+the Adam optimization algorithm on CPU, and (iii) swap-
+in the updated parameters back to the GPU. Since the first
+parameter in the forward pass is updated by the last gradient
+created in the backward pass, all of the above processes
+cannot overlap with any computation on GPU because the
+GPU needs to wait for the optimizer and weight updates to
+completely finish before starting the forward pass of the next
+training iteration. As a result, the latency from executing the
+last bucket(s) becomes exposed to the critical path length, and
+we need to carefully reorganize the computation to improve
+the Superchip utilization.
+In contrast to previous studies [55], SuperOffload repar-
+titions SA-DFG by placing optimizer states and gradients
+for the last few buckets on the GPU, provided they fit into
+Hopper GPU memory. Moreover, to overlap the compute and
+communication, the last bucket of gradients offloaded to the
+CPU must complete its optimization step and return updated
+parameters to the GPU before the next iteration begins. If
+we denote the number of buckets with optimizer states kept
+on the GPU as𝑛, then:
+movebucket(𝑔𝑟𝑎𝑑)+step cpu(𝑏𝑢𝑐𝑘𝑒𝑡)+move bucket(𝑝𝑎𝑟𝑎𝑚)≤(4)
+bwd(𝑛·𝑏𝑢𝑐𝑘𝑒𝑡)+step gpu(𝑛·𝑏𝑢𝑐𝑘𝑒𝑡)(5)
+0.25 0.5 1 2 4 8 16 32 64 128 256
+T ensor Size (MB)
+100
+200
+300
+400Bandwidth (GB/s)
+CPU-GPU
+GPU-CPU
+Figure 7.GH200 bandwidth measurement.
+Stepcpu/gpu(𝑏𝑢𝑐𝑘𝑒𝑡) represents the time required to com-
+plete the optimizer step on the CPU/GPU for a bucket size
+of𝑏𝑢𝑐𝑘𝑒𝑡 . bwd(𝑛·𝑏𝑢𝑐𝑘𝑒𝑡) denotes the time to complete the
+backward pass for𝑛 buckets on GPU, which can be approxi-
+mated as a function of the number of parameters, sequence
+length, and batch size, given by4×𝑏𝑠𝑧×𝑠𝑒𝑞×𝑏𝑘×𝑛/4.
+The analysis indicates that the bucket size 𝑏𝑘 is a cru-
+cial system parameter. Fig. 7 shows the bandwidth between
+GPU and CPU across different tensor sizes. It shows that the
+C2C bandwidth increases with tensor size until saturation
+occurs at approximately 64 MB. Based on this observation,
+we implement a bucketization strategy where gradients and
+parameters are grouped into buckets of 64 MB before trans-
+fer between GPU and CPU. This approach ensures efficient
+utilization of the available C2C bandwidth while also provid-
+ing a convenient unit that enables fine-grained overlapping
+between compute and communication. Finally, SuperOffload
+determines the number of buckets to retain on GPU to hide
+Grace CPU execution and data transfer time. The optimal
+number of buckets depends on model size and batch sizes,
+and SuperOffload uses grid search to identify the optimal
+number.
+4.4 Speculation-then-Validation (STV)
+In most offloading solutions, synchronizations between CPU
+and GPU are needed in optimizer step to ensure numerical
+robustness. As an example, the clipping of the gradient norm
+requires calculating the global gradient norm [45], and mixed
+precision training requires a global check of NAN and INF
+values [34]. Both examples require the CPU to wait until all
+gradients have been received before the optimizer step and
+weight updates. As illustrated by the gray block in Fig. 3, this
+dependency exposes the optimizer step to the critical path,
+preventing it from overlapping with the backward pass.
+To address this limitation, we propose aspeculation-then-
+validationalgorithm, which largely bypasses these synchro-
+nizations while preserving the exact convergence property
+of the training. Our mechanism is based on a key observation:
+most of the time the global states have no effects. For exam-
+ple, gradient clipping is rarely triggered, especially after the
+initial warm-up phase when gradient variance significantly
+reduces [30]. Similarly, mixed precision training rarely en-
+counters NAN and INF, as a healthy training run should not
+have numerical instability issues.
+6
+
+===== PAGE 7 =====
+
+SuperOffload: Unleashing the Power of Large-Scale LLM Training on Superchips
+Based on the observation, we propose to replace the con-
+ventional offloading synchronization-then-execution (STE)
+scheme with a speculation-then-validation (STV) mechanism.
+Fig. 8 illustrates the idea. Instead of waiting for all gradients
+to arrive, the CPU initiates the optimizer step speculatively
+using the gradients available at that moment. Meanwhile,
+gradient clipping and normalization are deferred to occur
+during CPU idle periods, concurrent with the GPU executing
+the forward pass for the next iteration. Meanwhile, to guar-
+antee the synchronous nature of the optimization process,
+we implement thein-place rollbackfor the optimization step.
+Therefore, STV is an exact optimization that preserves
+correctness by speculatively executing the optimizer step on
+CPU in parallel with the next GPU forward pass. A back-
+ground process validates gradients in parallel by checking
+NaNs/Infs and gradient clipping violations. Specifically, the
+validation process is implemented using Python multipro-
+cessing, and its results are passed to the GPU through a mul-
+tiprocessing queue. After the forward pass, the GPU checks
+whether rollback is needed. There are two rollback scenarios:
+(1) if NaNs and Infs are detected, the iteration is skipped; (2)
+if gradients exceed clipping thresholds (e.g., after finishing
+computing the global gradient norm across all parameter gra-
+dients), SuperOffload reverts the previous optimizer update
+and re-executes it using the clipped gradients.
+The speculation-then-validation scheduling offers two key
+benefits. First, it allows the optimizer steps on the CPU to
+overlap with backward propagation on the GPU, rather than
+placing all optimizer steps sequentially on the critical path,
+which would significantly hurt throughput. Second, it elimi-
+nates the time cost of normalization calculations and value
+checking by relocating these operations to previously idle
+CPU cycles (when the GPU is executing the forward pass),
+thereby improving overall resource utilization. Compared
+with the ZeRO-Offload schedule in Fig. 3, SuperOffload re-
+duces the critical path of a single iteration from
+𝑇iter =fwd gpu+bwd gpu+move bucket(𝑔𝑟𝑎𝑑)
++step cpu+move bucket(𝑝𝑎𝑟𝑎𝑚)(6)
+to
+𝑇iter =fwd gpu+bwd gpu+step cpu(𝑏𝑢𝑐𝑘𝑒𝑡)(7)
+Interestingly, in theory, the STV schedule indicates that
+the iteration time of SuperOffload can be shorter than that
+of non-offload training because the optimizer steps are per-
+formed on the entire model using GPU in non-offload train-
+ing, while SuperOffload only updates a subset of the param-
+eters on GPU. However, the conventional wisdom is that
+offloading often comes at a performance cost. In our evalua-
+tion, we show that SuperOffload can indeed be faster than
+GPU-only solutions.
+F1F2F3F4B4B3B2B1
+G4G3G2G1
+U4
+F1F2F3F4GPUComputation
+GPU					CPUCommunication
+CPUComputation
+F: ForwardB: Backward G: GradientP: Parameter
+iteration	i iteration	i+1
+U1
+U3U2
+P4CPU					GPUCommunication P3P2
+Post	Valid Post	Valid
+RollBack
+P
+F1RB …
+U: Optimizer Step
+Figure 8.SuperOffload speculation-then-validation sched-
+ule. It enables optimizer steps (U) to overlap with backward
+propagation (B), eliminating synchronization bottlenecks
+and improving resource utilization.
+4.5 Superchip-Aware Casting (SAC)
+In DL training frameworks like PyTorch and DeepSpeed, the
+mixed precision training is implemented through a graph
+rewriting process [47]. The default precision of all ops is
+float32 (FP32). Mixed precision training casts certain model
+states (e.g., weights, gradients) from FP32 to float16 (FP16),
+or vice versa. For example, the gradients in the backward
+pass are produced in FP16, and the optimizer computes
+the updates using FP32 gradients. Therefore, the functions
+movebucket(𝑔𝑟𝑎𝑑) and movebucket(𝑝𝑎𝑟𝑎𝑚) not only transfer
+tensors between the GPU and CPU but also involve convert-
+ing tensor data types. These additional casting operations
+become complex when considering offloading strategies. Ex-
+isting offloading-based solutions often adopt a minimum
+edge cut algorithm to computation graph [55], based on the
+implicit assumption that minimizing the data communica-
+tion volume between the CPU and GPU leads to performance
+improvements. However, these methods ignore the casting
+cost. Given that the C2C link between Hopper and Grace is
+an order of magnitude higher, is this assumption still valid?
+We conduct experiments to examine the time cost of the
+two methods. The results are shown in Fig. 9. We observe
+that𝐶𝑎𝑠𝑡𝑐𝑝𝑢 ↔𝑀𝑜𝑣𝑒 𝑓 𝑝16 takes around 2× execution time
+than𝐶𝑎𝑠𝑡𝑔𝑝𝑢↔𝑀𝑜𝑣𝑒 𝑓 𝑝32 on Superchips, depending on the
+size of the input tensor involved in mixed precision training.
+In most cases, 𝐶𝑎𝑠𝑡𝑔𝑝𝑢 ↔𝑀𝑜𝑣𝑒 𝑓 𝑝32 surpasses the perfor-
+mance of𝐶𝑎𝑠𝑡𝑐𝑝𝑢↔𝑀𝑜𝑣𝑒 𝑓 𝑝16 by a large margin (e.g., tensor
+size 256MB to 2048MB). Based on our analysis, we opt for
+𝐶𝑎𝑠𝑡𝑔𝑝𝑢↔𝑀𝑜𝑣𝑒 𝑓 𝑝32, as it incurs an overall lower cost com-
+pared to𝐶𝑎𝑠𝑡 𝑐𝑝𝑢↔𝑀𝑜𝑣𝑒 𝑓 𝑝16 even though the latter design
+incurs a lower theoretical communication volume.
+In addition to the casting cost, we also find that the casting
+operation has an intricate interaction with the pinned mem-
+ory. A transfer-then-cast operation triggers an unpinned
+temporary memory buffer allocation on the Grace CPU to
+hold the FP16 copy of gradients swapped-out from the Hop-
+per GPU before casting FP16 gradients to FP32 on the Grace
+7
+
+===== PAGE 8 =====
+
+Xinyu Lian, Masahiro Tanaka, Olatunji Ruwase, and Minjia Zhang
+16 32 64 128 256 512 1024 2048
+Tensor Size (MB)
+10
+20
+30
+40
+50
+60Time Cost (ms)
+Castcpu  Movefp16
+Castgpu  Movefp32
+Figure 9.Time cost comparison for casting operations on
+GPU vs. CPU (including data transfer overhead).
+CPU. As such, the data transfer is implicitly through un-
+pinned memory, which is significantly slower than DMA
+transfer with FP32. This observation also motivates us to
+adopt the𝐶𝑎𝑠𝑡 𝑔𝑝𝑢↔𝑀𝑜𝑣𝑒 𝑓 𝑝32 design in SuperOffload.
+4.6 GraceAdam
+The careful reader may ask: Is Grace CPU in a Superchip
+sufficient for optimizer step and weight updates given the in-
+creased GPU/CPU FLOPS ratio? Prior work introduces CPU-
+Adam [55], a highly-optimized implementation to accelerate
+Adam optimizer on CPU through multi-level parallelism.
+However, the original CPU-Adam implementation was pri-
+marily designed for x86 architectures using AVX2/AVX512
+instruction sets, which are not available on ARM CPUs. More-
+over, while x86 implementations rely on fixed-width SIMD
+vectors, ARM’s Scalable Vector Extension (SVE) employs a
+length-agnostic vector processing paradigm that requires
+more adaptive algorithms. Finally, ARM CPU has a different
+memory hierarchy, with different cache sizes, latencies, and
+bandwidth characteristics, which requires careful considera-
+tion of memory access patterns and prefetching strategies.
+To address this limitation, we introduce GraceAdam, which
+includes multiple optimizations: 1)SVE Integration:We
+adopt SVE’s length-agnostic programming model to dynami-
+cally determine vector length at runtime withsvcntw(). We
+replace scalar operations with SVE-specific intrinsics such as
+svld1_f32, svmla_f32_m, and svsqrt_f32_m that operate
+on entire vectors simultaneously and thus reduce the compu-
+tation cost. 2)Enhanced Memory Management:We im-
+plement ARM-specific memory access patterns with explicit
+prefetching strategies using svprfm directives that preload
+data into cache before computation. Our tiled processing ap-
+proach divides parameter updates into cache-friendly chunks
+(TILE size), minimizing data movement between memory
+hierarchies. We further optimize memory access by align-
+ing SVE load/store operations (svld1_f32, svst1_f32) with
+ARM’s cache line boundaries, reducing cache thrashing dur-
+ing parameter updates. 3)Parallel Execution:We employ a
+dual-level parallelism strategy, where we use OpenMP multi-
+threading to ensure efficient scaling across multi-core ARM
+Grace CPUs and SVE for instruction-level parallelism within
+each core. These strategies together allow GraceAdam to
+maximize Grace CPU throughput and achieve significantly
+faster speed than the default PyTorch Adam on Grace CPU.
+4.7 Multi-Superchip Schedule
+In this part, we describe how SuperOffload can be extended to
+work effectively in a multi-Superchip environment by com-
+bining it with ZeRO-style data parallelism (ZeRO-DP) [51]
+and Ulysses-style sequence parallelism (Ulysses-SP) [22].
+ZeRO-3 Integration.SuperOffload preserves the model
+state partitioning strategy of ZeRO stage-3 (Fully Sharded
+Data Parallelism). Each GPU offloads a portion of its gradi-
+ents and optimizer states to CPU memory while the parti-
+tioned weights, as well as the last few buckets from adap-
+tive offloading (§ 4.2) remain on the GPUs. The primary
+advantage of partitioning before offloading is that in a multi-
+Superchip system, each parallel process is responsible for
+updating only a subset of the model parameters. This de-
+sign ensures that the total communication volume from all
+GPUs to the CPU remains constant, while the CPU resources
+are utilized in parallel to jointly compute a unified weight
+update.
+SuperOffload-Ulysses.SuperOffload can also work together
+with Ulysses-SP. Recent advancements in large language
+models have demonstrated a clear trend toward training
+and fine-tuning with increasingly longer sequence lengths.
+Notable examples include Claude’s expansion of context
+window from 100K to 200K tokens [3] and GPT-4 Turbo’s in-
+crease from 8K to 128K tokens [43]. This evolution is driven
+by real-world applications that require processing extensive
+documents, images, and videos, requiring models capable of
+handling substantially longer sequences.
+Ulysses-SP [22] addresses sequence parallelism challenges
+by partitioning input data along the sequence dimension and
+employing an efficient all-to-all collective communication
+strategy for attention computations. However, even with
+activation checkpointing, the fixed GPU memory consump-
+tion of model states significantly limits the ability to scale
+to longer sequences. We integrate Ulysses-SP with Super-
+Offload by leveraging its offloading capabilities to manage
+memory more efficiently. Specifically, SuperOffload’s adap-
+tive weight-flow policy offloads optimizer states and the
+majority of model weights to CPU memory, significantly re-
+ducing the GPU memory footprint. This enables Ulysses-SP
+to handle longer sequences on a per-layer basis without being
+constrained by GPU memory limitations. We term the com-
+bined strategySuperOffload-Ulysses. SuperOffload-Ulysses
+supports 8× longer sequence training than Ulysses-SP and
+easily enables million-token sequence length LLM training
+with high throughput using only a few Superchips. See § 5.3
+for more details.
+NUMA binding.In a K-way Superchip node, there are K
+Hopper GPUs and K Grace CPUs, and each Superchip is
+8
+
+===== PAGE 9 =====
+
+SuperOffload: Unleashing the Power of Large-Scale LLM Training on Superchips
+configured as a distinct NUMA node. Assume K = 4, a 4-
+way Superchip node has a total of 288 CPU cores (e.g., each
+Grace CPU has 72 cores). By default, a training launcher may
+randomly assign the process to certain CPU cores, which
+leads to issues such as the CPU process and GPU are not
+co-located on the same Superchip. If this happens, data trans-
+fers traverse an inter-Superchip connection (typically Sling-
+shot), which has significantly lower bandwidth compared to
+the NVLINK-C2C connection. To mitigate this performance
+penalty, SuperOffload explicitly binds each process to spe-
+cific cores to ensure optimal CPU–GPU affinity.
+5 Evaluation
+In this section, we conduct a comprehensive evaluation of Su-
+perOffload in comparison with state-of-the-art approaches,
+demonstrating that it achieves excellent training efficiency
+and scalability across various model sizes and extremely
+long sequence training. We also show the impact of different
+technologies within SuperOffload on overall performance.
+5.1 Evaluation Methodology
+Hardware.We conducted single Superchip experiments on
+a1×GH200(96GB HBM, 480GB DDR). For multiple nodes
+experiments, we used 8GH200 NVL2nodes, each containing
+2×GH200(96GB HBM, 240GB DDR), and the nodes are con-
+nected via HPE/Cray’s 200Gbps Slingshot 11 interconnect.
+Workloads.For the performance evaluation, we focus on
+evaluating GPT/LLaMA [49, 65] like Transformer-based mod-
+els [66]. We vary the hidden dimension and the number of
+Transformer blocks to obtain models with a different number
+of parameters. Appendix A shows the configuration param-
+eters used in our experiments. We use a subset of the Pile
+dataset [12] for training datasets.
+Baseline.We compare the effectiveness of SuperOffload
+with state-of-the-art multi-billion parameter training solu-
+tions: PyTorch DDP [27], which uses data parallelism across
+GPUs; Megatron [ 60], which employs model parallelism;
+ZeRO-2/3 [51], which shard gradients, optimizer states, and
+parameters (ZeRO-3) across GPUs; ZeRO-Offload [55], which
+extends ZeRO-2 by offloading optimzer states to CPU; ZeRO-
+Infinity [52], an extension of ZeRO-3 that offloads model
+states to CPU and NVMe (we only enable its CPU offload-
+ing for fair comparison); and FSDP-CPU Offload [73], which
+extends FSDP by offloading model states to CPU. A more
+detailed description of baselines is provided in Appendix B.
+5.2 Training Throughput
+Single Superchip.We compare the training throughput
+of SuperOffload with PyTorch DDP, FSDP-Offload, ZeRO-
+Infinity and ZeRO-Offload on a single Superchip across dif-
+ferent model sizes. We exclude Megatron and ZeRO-2/3 from
+the comparison because they do not change the workload
+PyTorchFSDP-Offload SuperOffloadZeRO-InfinityZeRO-Offload
+OOM OOM OOM OOMOOM OOMOOM
+Figure 10.The training throughput with PyTorch DDP,
+FSDP-Offload, ZeRO-Infinity, ZeRO-Offload, and SuperOf-
+fload on a single Superchip with batch size 8.
+on a single GPU compared to PyTorch DDP, and none of
+them can train models exceeding 4B parameters due to out-
+of-memory (OOM) errors. We evaluate them on the same
+batch size. And when large batch sizes cause OOM errors, we
+employ two strategies: (1) using smaller micro-batch sizes
+with gradient accumulation, or (2) implementing activation
+checkpointing with the largest micro-batch size without
+OOM errors. Note that we exclude recomputation volume
+when calculating TFLOPS to measure effective computa-
+tional throughput. For each techniques, we report the higher
+throughput achieved between these two approaches.
+Fig. 10 shows the comparison results. Interestingly, Su-
+perOffload not only outperforms existing offloading meth-
+ods, but it also outperforms GPU-only approaches across
+all tested model sizes, which is different from conventional
+wisdom where offloading often comes at the cost of perfor-
+mance penalty. Specifically, SuperOffload achieves up to 67%
+higher throughput (TFLOPS) compared to PyTorch DDP. The
+reasons are two folds: (1) SuperOffload offloads the optimizer
+steps to CPU, fully overlapping them with GPU backward
+propagation, and (2) by offloading the optimizer states to
+CPU memory, GPU has more memory space to hold the acti-
+vations for larger batch without requiring activation check-
+pointing, which typically reduces throughput by approxi-
+mately 33% [7]. Moreover, SuperOffload achieves 2× through-
+put on average (up to 2.5×) compared to ZeRO-Offload. The
+performance benefit of SuperOffload comes from three as-
+pects. First, the speculation-then-validation (§ 4.4) algorithm
+enables effective overlapping of CPU and GPU computa-
+tion, whereas in ZeRO-Offload, CPU optimizer steps must
+wait until GPU backward propagation completes. Second,
+the bucketization repartitioning (§ 4.3) eliminates commu-
+nication bottlenecks on the critical path when transferring
+gradients and updated parameters, while in ZeRO-Offload,
+the forward pass for the next iteration must wait for updated
+parameters to be completely transferred from CPU to GPU.
+Third, GraceAdam (§ 4.6) further reduces the computation
+cost of optimizer steps on Grace CPU.
+SuperOffload achieves significantly higher throughput
+than both FSDP-Offload and ZeRO-Infinity. FSDP-Offload
+9
+
+===== PAGE 10 =====
+
+Xinyu Lian, Masahiro Tanaka, Olatunji Ruwase, and Minjia Zhang
+(a) 4-Superchip
+OOM OOM OOM
+MegatronZeRO-2 ZeRO-3 ZeRO-Offload
+(b) 16-Superchip
+SuperOffload
+Figure 11.Training throughput comparison between Mega-
+tron, ZeRO-2/3, ZeRO-Offload, and SuperOffload on 4 and
+16 GH200 GPUs. We use batch sizes of 16 and 128 for the
+4-GPU and 16-GPU experiments, respectively.
+consistently achieves less than 15 TFLOPS because it re-
+lies on PyTorch’s native CPU-Adam implementation. As we
+demonstrate later in § 5.6, native implementation is up to
+3.5× slower than our GraceAdam, creating a substantial ef-
+ficiency bottleneck. Similarly, ZeRO-Infinity’s throughput
+remains below 50 TFLOPS. This limitation stems from ZeRO-
+Infinity’s bucket-based approach for transferring gradients
+and parameters between CPU and GPU, which fails to ac-
+count for the characteristics of C2C bandwidth—specifically,
+that bandwidth can drop to as low as 50GB/s with small
+tensor sizes.
+Multiple Superchips.We evaluate the training throughput
+of SuperOffload against Megatron, ZeRO-2, ZeRO-3, and
+ZeRO-Offload across 4 and 16 GH200 Superchips. We exclude
+the PyTorch DDP from the comparison as it cannot scale out
+to larger model sizes, and we exclude FSDP-offload and ZeRO-
+Infinity due to their significantly lower throughput compared
+to other solutions on single Superchip. For Megatron, we
+use a MP degree that gives the best performance. Similar to
+the above single GPU experiment, when facing OOM errors,
+we either use gradient accumulation with smaller micro-
+batches or activation checkpointing with the largest possible
+micro-batch, reporting the higher throughput between these
+approaches. Fig. 11 shows the throughput per GPU results
+when training on 4 Superchips and 16 Superchips. We have
+the following observations:
+• For models ranging from 5B to 20B parameters, Su-
+perOffload consistently achieves higher throughput
+compared to existing solutions. Specifically, it demon-
+strates throughput improvements of up to 83%, 46%,
+and 37% over Megatron, ZeRO-2, ZeRO-3 respectively.
+In comparison with ZeRO-Offload, SuperOffload achieves
+2.5× throughput on average across a wider range of
+model sizes. This is primarily attributed to highly over-
+lapped CPU and GPU computation and sufficient GPU
+memory space for larger micro batch without using
+activation checkpointing, and those methods effec-
+tively leverage the high-bandwidth C2C interconnect
+in the Superchip architecture, enabling more efficient
+(a) 13B,  4-Superchip(b) 13B,  8-Superchip(c) 30B,  8-Superchip
+OOM
+OOM
+OOM
+Figure 12.Supported sequence lengths and corresponding
+MFU using SuperOffload-Ulysses and Ulysses. OOM denotes
+the point where increasing sequence length causes OOM.
+utilization of both GPU and CPU resources during
+training.
+• While Megatron and ZeRO-3 encounter memory limi-
+tations at 15B parameters due to insufficient aggregate
+GPU memory across 4 GPUs, SuperOffload effectively
+scales to models with up to 50B parameters. Moreover,
+SuperOffload demonstrates exceptional scalability by
+efficiently training 200B models on 16 GPUs while
+maintaining high computational throughput.
+5.3 Unlock Massive Sequence Training
+We combine SuperOffload together with Ulysses [22] to cre-
+ate SuperOffload-Ulysses for long-sequence training and
+evaluate its performance against vanilla Ulysses using two
+commonly deployed model sizes: 13B and 30B parameters.
+Our experiments are conducted on both 4-Superchip and
+8-Superchip. For all experiments, we utilize the maximum
+batch sizes that avoid out-of-memory errors, and imple-
+mented activation checkpointing when activation sizes are
+substantial. As shown in Fig. 12, SuperOffload-Ulysses trains
+sequences up to 8× longer than Ulysses. SuperOffload-Ulysses
+enables the training of 13B model with sequence lengths up
+to 1 million tokens on 8 Superchips while achieving 55% MFU.
+For sequence lengths that Ulysses can handle, SuperOffload-
+Ulysses consistently achieves higher Model FLOPS Utiliza-
+tion (MFU). This performance advantage stems from our
+adaptive Offloading policy (§ 4.2), which adaptively detects
+extremely long sequences and dynamically offloads more
+weight parameters to CPU memory. This strategic offloading
+provides GPUs with additional memory space to accommo-
+date larger activations without requiring activation check-
+pointing, thereby maintaining computational efficiency even
+with extended sequence lengths.
+5.4 Model Scale
+In this part, we first test the largest trainable models on a
+single Superchip as well as 4-Superchip and 16-Superchip.
+10
+
+===== PAGE 11 =====
+
+SuperOffload: Unleashing the Power of Large-Scale LLM Training on Superchips
+PyTorchMegatronZeRO-2ZeRO-3ZeRO-Offload SuperOffloadZeRO-Infinity
+Figure 13.The size of the biggest model that can be trained
+on single Superchip, 4 and 16 Superchips.
+Single Superchip.Fig. 13 shows that the largest model can
+be trained using PyTorch DDP on a single GPU with 96GB
+memory is 3.5B. Megatron, ZeRO-2, and ZeRO-3 do not en-
+able training larger models on a single GPU compared to
+PyTorch DDP, because they all depend on the aggregated
+GPU memory to store model states. ZeRO-Offload, how-
+ever, can handle models up to 15B by offloading optimizer
+states. SuperOffload can train models up to 25B – primarily
+because it adaptively controls the offloading ratio for op-
+timizer states and gradients. Unlike ZeRO-Offload, which
+keeps weights stationary on GPUs and uses a fixed pattern
+for tensor placement across devices, SuperOffload adaptively
+adopts weight-stationary and weight-flow policy based on
+the available GPU and CPU memory, thereby increasing the
+trainable model size. While ZeRO-Infinity can train models
+of comparable size to SuperOffload, its throughput is signifi-
+cantly lower. As shown in Fig. 10, SuperOffload achieves on
+average 6.7× higher throughput (up to 12.6×) than ZeRO-
+Infinity. This is mainly due to the technologies introduced by
+SuperOffload such as STV and bucketization repartitioning
+that improve the overall utilization of the Hopper GPU and
+C2C bandwidth.
+Multiple Superchips.We further perform model scale tests
+with 4 and 16 GPUs in a single GH200 Node and four GH200
+nodes, respectively. As shown in Fig. 13, the maximum train-
+able model size stays the same for PyTorch DDP, because
+none of them handle memory redundancies in data paral-
+lelism. As a result, its scalability is bounded by the model
+scale on a single GPU. Megatron, ZeRO2/3 support large
+model training with more GPUs, but they cannot scale effi-
+ciently beyond 50B parameters, even with 16 GPUs. Mega-
+tron supports larger models than ZeRO-2, because ZeRO-2
+still incurs memory redundancies on model weights. Since
+ZeRO-Offload is built on top of ZeRO-2, it needs each GPU
+to hold at least the full copy of FP16 parameter, therefore, the
+largest model size the ZeRO-Offload can train is bounded to
+20B even though we increase the number of GPUs. Overall,
+SuperOffload increases the model scale on 16 Superchips by
+57×, 4.4×, 10×, 4.5×, 10× than using PyTorch DDP, Megatron,
+ZeRO-2, ZeRO-3, and ZeRO-Offload, respectively.
+Table 2.Breakdown of SuperOffload optimizations and
+their impact on throughput (TFLOPS), including GraceAdam
+(§ 4.6), Superchip-Aware Casting (SAC, § 4.5), Speculation-
+then-Validation (SVT, § 4.4), and Bucket Repartitioning
+(§ 4.3).
+GraceAdam Cast Optim. STV Buck. Repart. Throughput
+✗ ✗ ✗ ✗ 116.20
+✓ ✗ ✗ ✗ 128.23
+✓ ✓ ✗ ✗ 144.49
+✓ ✓ ✓ ✗ 209.36
+✓ ✓ ✓ ✓ 238.92
+5.5 Performance Breakdown
+We systematically enable each optimization component to
+quantify its individual contribution to overall performance.
+We use the same setting as used in § 5.2 and use 5B model
+as a demonstration. Table 2 presents a comprehensive break-
+down of SuperOffload’s key optimizations and their cumula-
+tive impact on training throughput. Starting with the base-
+line configuration (all optimizations disabled), we observe
+a throughput of 116.2 TFLOPS, that is close to the ZeRO-
+Offload throughput shown in Fig. 10. Enabling GraceAdam
+increases throughput to 128.23 TFLOPS, representing a 10.4%
+improvement. When further enabling SAC from § 4.5, through-
+put increases to 144.49 TFLOPS, delivering an additional
+12.7% improvement. This optimization strategically balances
+casting and data transfer costs for maximum efficiency. The
+Speculation-Then-Validation (STV) technique described in
+§ 4.4 delivers the most substantial performance gain, boost-
+ing throughput by 45%. This significant enhancement demon-
+strates how effectively STV eliminates Hopper GPU com-
+putational idle time by overlapping backward propagation
+with Grace CPU-based optimization steps. Finally, enabling
+the bucketization repartitioning from § 4.3 further increases
+throughput to 238.92 TFLOPS, representing a 14.1% improve-
+ment. In total, SuperOffload with all optimizations enabled
+achieves a 2.06× throughput improvement over the baseline
+configuration. This breakdown highlights how each com-
+ponent addresses specific performance bottlenecks in large-
+scale training on Superchip architectures, with their com-
+bined effect delivering substantial multiplicative benefits.
+5.6 Optimized GraceAdam Execution
+In this section, we evaluate our ARM-optimized GraceAdam
+implementation against the PyTorch CPU Adam and CPU-
+Adam implementation from ZeRO-Offload (which was op-
+timized for Intel CPUs). Table 3 evaluates GraceAdam by
+measuring the optimizer execution times across model sizes
+ranging from 1B to 8B. Compared to PyTorch’s CPU imple-
+mentation (PT-CPU), GraceAdam achieves over 3× speedup
+11
+
+===== PAGE 12 =====
+
+Xinyu Lian, Masahiro Tanaka, Olatunji Ruwase, and Minjia Zhang
+across all configurations. Even compared to the already-
+optimized CPU-Adam implementation, GraceAdam demon-
+strates 1.36× faster execution. These performance gains from
+GraceAdam’s optimizations that leverage ARM’s Scalable
+Vector Extension (SVE), along with optimized memory man-
+agement and OpenMP multithreading, which make Grace
+CPU a viable and performant component within the Super-
+Offload system.
+Table 3.Adam latency (s) for PyTorch Native CPU-Adam,
+CPU-Adam, and GraceAdam.
+#Parameter PT-CPU CPU-Adam GraceAdam
+1 billion 0.289 0.098 0.082
+2 billion 0.531 0.198 0.160
+4 billion 0.958 0.393 0.316
+8 billion 1.834 0.769 0.608
+5.7 Speculation-Then-Validation Evaluation
+Speculation-then-Validation in § 4.4 is an exact optimization
+but the schedule is complex. To validate its correctness and
+overhead, we trained a GPT-style 175B model with the Pile
+dataset on 16 Superchips. Note that a GPT-style 175B model
+often requires thousands of GPUs to train [4, 62, 71], which
+are simply out of reach for most model scientists. Figure 14
+shows the pre-training loss curve over 80,000 training iter-
+ations, with the expected convergence trend. Though from
+iterations 1 to 1000, roll-backs occur frequently as gradient
+clipping and INF & NaN values are mainly detected during
+the initial training stage. After iteration 1000, when training
+becomes more stable, roll-backs rarely happen - occurring
+only 93 times between steps 1000 and 80000, which repre-
+sents 0.12% of the total iterations. For the 175B model, roll-
+back operations executed in parallel across 16 Grace CPUs
+take 2 seconds on average, accumulating to less than 200
+seconds over 79,000 iterations. This represents a negligible
+overhead while fully preserving training accuracy.
+Step	1000	 Step	80000	
+Number	of	Roll	Back	=	93	(93/79000	=	0.12%)
+Figure 14.Training loss and rollback occurrences during
+training of the GPT 176B model over 80,000 iterations. Red
+dots indicate iterations where rollbacks were triggered due
+to gradient clipping, NaN or INF values.
+5.8 GPU Idle Time Measurement
+Unlike the prior solutions cause GPU idle time (as shown in
+Fig. 4), we measure the GPU utilization with the same model
+and hardware setting. As shown in Fig. 15, SuperOffload
+achieves near-complete GPU utilization, effectively eliminat-
+ing idle periods and maximizing computational efficiency.
+GPU
+One	SuperChip One	Node
+Figure 15.SuperOffload fully utilizes the GPU resources.
+6 Conclusion
+In this paper, we have taken a leap forward in designing
+a Superchip-centric offloading system for large-scale LLM
+training. Our analysis reveals key challenges and perfor-
+mance implications of training LLMs on Superchips. Moti-
+vated by the observations, we design SuperOffload, the first
+system that allows LLM training to make the best use of Hop-
+per GPU, Grace CPU, and NVLink-C2C interconnects simul-
+taneously. Our extensive evaluation demonstrates that Su-
+perOffload not only outperforms state-of-the-art offloading-
+based solutions but also unlocks new system capabilities such
+as training LLMs with 1 million token sequence length with
+only 8 Superchips, making large-scale LLM training more
+accessible to researchers and practitioners even without a
+large number of GPUs.
+Acknowledgments
+We sincerely appreciate the anonymous reviewers and our
+shepherd Luo Mai. Their insightful feedback helps signifi-
+cantly improve the quality of the paper. We also gratefully
+acknowledge William Gropp, Brett Bode, and Gregory H.
+Bauer from the National Center for Supercomputing Appli-
+cations (NCSA), as well as Dan Ernst, Ian Karlin, Giridhar
+Chukkapalli, Kurt Rago, and others from NVIDIA for their
+valuable discussions and guidance on MPAM support on
+Grace CPU. This research was supported by the National Sci-
+ence Foundation (NSF) under Grant No. 2441601. The work
+utilized the Delta and DeltaAI system at the National Center
+for Supercomputing Applications (NCSA) and Jetstream2
+at Indiana University through allocation CIS240055 from
+the Advanced Cyberinfrastructure Coordination Ecosystem:
+Services & Support (ACCESS) program, which is supported
+by National Science Foundation grants #2138259, #2138286,
+#2138307, #2137603, and #2138296. The Delta advanced com-
+puting resource is a collaborative effort between the Univer-
+sity of Illinois Urbana-Champaign and NCSA, supported by
+the NSF (award OAC 2005572) and the State of Illinois. UIUC
+SSAIL Lab is supported by research funding and gift from
+Google, IBM, and AMD.
+12
+
+===== PAGE 13 =====
+
+SuperOffload: Unleashing the Power of Large-Scale LLM Training on Superchips
+References
+[1] Marah Abdin, Jyoti Aneja, Hany Awadalla, Ahmed Awadallah, Am-
+mar Ahmad Awan, Nguyen Bach, Amit Bahree, Arash Bakhtiari, Jian-
+min Bao, Harkirat Behl, Alon Benhaim, Misha Bilenko, Johan Bjorck,
+Sébastien Bubeck, Martin Cai, Qin Cai, Vishrav Chaudhary, Dong
+Chen, Dongdong Chen, Weizhu Chen, Yen-Chun Chen, Yi-Ling Chen,
+Hao Cheng, Parul Chopra, Xiyang Dai, Matthew Dixon, Ronen El-
+dan, Victor Fragoso, Jianfeng Gao, Mei Gao, Min Gao, Amit Garg, Al-
+lie Del Giorno, Abhishek Goswami, Suriya Gunasekar, Emman Haider,
+Junheng Hao, Russell J. Hewett, Wenxiang Hu, Jamie Huynh, Dan
+Iter, Sam Ade Jacobs, Mojan Javaheripi, Xin Jin, Nikos Karampatzi-
+akis, Piero Kauffmann, Mahoud Khademi, Dongwoo Kim, Young Jin
+Kim, Lev Kurilenko, James R. Lee, Yin Tat Lee, Yuanzhi Li, Yunsheng
+Li, Chen Liang, Lars Liden, Xihui Lin, Zeqi Lin, Ce Liu, Liyuan Liu,
+Mengchen Liu, Weishung Liu, Xiaodong Liu, Chong Luo, Piyush
+Madan, Ali Mahmoudzadeh, David Majercak, Matt Mazzola, Caio
+César Teodoro Mendes, Arindam Mitra, Hardik Modi, Anh Nguyen,
+Brandon Norick, Barun Patra, Daniel Perez-Becker, Thomas Portet,
+Reid Pryzant, Heyang Qin, Marko Radmilac, Liliang Ren, Gustavo de
+Rosa, Corby Rosset, Sambudha Roy, Olatunji Ruwase, Olli Saarikivi,
+Amin Saied, Adil Salim, Michael Santacroce, Shital Shah, Ning Shang,
+Hiteshi Sharma, Yelong Shen, Swadheen Shukla, Xia Song, Masahiro
+Tanaka, Andrea Tupini, Praneetha Vaddamanu, Chunyu Wang, Guan-
+hua Wang, Lijuan Wang, Shuohang Wang, Xin Wang, Yu Wang, Rachel
+Ward, Wen Wen, Philipp Witte, Haiping Wu, Xiaoxia Wu, Michael
+Wyatt, Bin Xiao, Can Xu, Jiahang Xu, Weijian Xu, Jilong Xue, Sonali
+Yadav, Fan Yang, Jianwei Yang, Yifan Yang, Ziyi Yang, Donghan Yu,
+Lu Yuan, Chenruidong Zhang, Cyril Zhang, Jianwen Zhang, Li Lyna
+Zhang, Yi Zhang, Yue Zhang, Yunan Zhang, and Xiren Zhou. 2024.
+Phi-3 Technical Report: A Highly Capable Language Model Locally
+on Your Phone.arXiv preprint arXiv:2404.14219(2024).
+[2] AMD. 2024. AMD Instinct MI300A.https://www.amd.com/en/
+products/accelerators/instinct/mi300/mi300a.html.
+[3] Anthropic. 2024. Claude.https://www.anthropic.com/claude.
+[4] Anyscale. 2023. Training 175B Parameter Language Models at
+1000 GPU scale with Alpa and Ray.https://www.anyscale.com/
+blog/training-175b-parameter-language-models-at-1000-gpu-scale-
+with-alpa-and-ray.
+[5] Microsoft Azure. 2024. Microsoft and NVIDIA partnership continues
+to deliver on the promise of AI.https://azure.microsoft.com/en-
+us/blog/microsoft-and-nvidia-partnership-continues-to-deliver-on-
+the-promise-of-ai.
+[6] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D
+Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam,
+Girish Sastry, Amanda Askell, Sandhini Agarwal, Ariel Herbert-Voss,
+Gretchen Krueger, Tom Henighan, Rewon Child, Aditya Ramesh,
+Daniel Ziegler, Jeffrey Wu, Clemens Winter, Chris Hesse, Mark Chen,
+Eric Sigler, Mateusz Litwin, Scott Gray, Benjamin Chess, Jack Clark,
+Christopher Berner, Sam McCandlish, Alec Radford, Ilya Sutskever,
+and Dario Amodei. 2020. Language Models are Few-Shot Learners. In
+Proceedings of the 34th International Conference on Neural Information
+Processing Systems (NIPS’20).
+[7] Tianqi Chen, Bing Xu, Chiyuan Zhang, and Carlos Guestrin. 2016.
+Training Deep Nets with Sublinear Memory Cost.arXiv preprint
+arXiv:1604.06174(2016).
+[8] Yukang Chen, Shengju Qian, Haotian Tang, Xin Lai, Zhijian Liu, Song
+Han, and Jiaya Jia. 2024. LongLoRA: Efficient Fine-tuning of Long-
+Context Large Language Models.arXiv preprint arXiv:2309.12307
+(2024).
+[9] Shengkun Cui, Archit Patke, Hung Nguyen, Aditya Ranjan, Ziheng
+Chen, Phuong Cao, Brett Bode, Gregory Bauer, Catello Di Martino,
+Saurabh Jha, Chandra Narayanaswami, Daby Sow, Zbigniew T. Kalbar-
+czyk, and Ravishankar K. Iyer. 2025. Characterizing GPU Resilience
+and Impact on AI/HPC Systems.arXiv preprint arXiv:2503.11901
+(2025).
+[10] Yiran Ding, Li Lyna Zhang, Chengruidong Zhang, Yuanyuan Xu, Ning
+Shang, Jiahang Xu, Fan Yang, and Mao Yang. 2024. LongRoPE: Extend-
+ing LLM Context Window Beyond 2 Million Tokens.arXiv preprint
+arXiv:2402.13753(2024).
+[11] Luigi Fusco, Mikhail Khalilov, Marcin Chrapek, Giridhar Chukkapalli,
+Thomas Schulthess, and Torsten Hoefler. 2024. Understanding Data
+Movement in Tightly Coupled Heterogeneous Systems: A Case Study
+with the Grace Hopper Superchip.arXiv preprint arXiv:2408.11556
+(2024).
+[12] Leo Gao, Stella Biderman, Sid Black, Laurence Golding, Travis Hoppe,
+Charles Foster, Jason Phang, Horace He, Anish Thite, Noa Nabeshima,
+Shawn Presser, and Connor Leahy. 2020. The Pile: An 800GB Dataset of
+Diverse Text for Language Modeling.arXiv preprint arXiv:2101.00027
+(2020).
+[13] Tianyu Gao, Alexander Wettig, Howard Yen, and Danqi Chen. 2024.
+How to Train Long-Context Language Models (Effectively).arXiv
+preprint arXiv:2410.02660(2024).
+[14] Amir Gholami, Zhewei Yao, Sehoon Kim, Coleman Hooper, Michael W.
+Mahoney, and Kurt Keutzer. 2024. AI and Memory Wall.arXiv preprint
+arXiv:2403.14123(2024).
+[15] Mark Hildebrand, Jawad Khan, Sanjeev Trika, Jason Lowe-Power, and
+Venkatesh Akella. 2020. AutoTM: Automatic Tensor Movement in
+Heterogeneous Memory Systems using Integer Linear Programming.
+InProceedings of the 25th International Conference on Architectural Sup-
+port for Programming Languages and Operating Systems (ASPLOS’20).
+[16] HPCwire. 2024. HPE’s New Helios Supercomputer Elevates Polish
+Scientific Research at Cyfronet.https://www.hpcwire.com/off-the-
+wire/hpes-new-helios-supercomputer-elevates-polish-scientific-
+research-at-cyfronet.
+[17] Chien-Chin Huang, Gu Jin, and Jinyang Li. 2020. SwapAdvisor: Push-
+ing Deep Learning Beyond the GPU Memory Limit via Smart Swap-
+ping. InProceedings of the 25th International Conference on Archi-
+tectural Support for Programming Languages and Operating Systems
+(ASPLOS’20).
+[18] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao
+Chen, Mia Xu Chen, HyoukJoong Lee, and et al. 2019. GPipe: Efficient
+Training of Giant Neural Networks using Pipeline Parallelism. In
+Proceedings of the 33rd International Conference on Neural Information
+Processing Systems (NIPS’19).
+[19] J. Alex Hurt, Grant J. Scott, Derek Weitzel, and Huijun Zhu. 2024. Ad-
+ventures with Grace Hopper AI Super Chip and the National Research
+Platform.arXiv preprint arXiv:2410.16487(2024).
+[20] Information Technology Center, The University of Tokyo. 2024.
+Miyabi Supercomputer System.https://www.cc.u-tokyo.ac.jp/en/
+supercomputer/miyabi/system.php.
+[21] insideHPC. 2024. Eviden Delivers 104 PFLOPS NVIDIA-Powered
+EXA1-HE Supercomputer for CEA.https://insidehpc.com/
+2024/04/eviden-delivers-104-pflops-nvidia-powered-exa1-he-
+supercomputer-for-cea.
+[22] Sam Ade Jacobs, Masahiro Tanaka, Chengming Zhang, Minjia Zhang,
+Shuaiwen Leon Song, Samyam Rajbhandari, and Yuxiong He. 2023.
+DeepSpeed Ulysses: System Optimizations for Enabling Training
+of Extreme Long Sequence Transformer Models.arXiv preprint
+arXiv:2309.14509(2023).
+[23] Jülich Supercomputing Centre. 2024. JUPITER Supercomputer.https:
+//www.fz-juelich.de/en/ias/jsc/jupiter/tech.
+[24] Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B. Brown, Ben-
+jamin Chess, Rewon Child, Scott Gray, Alec Radford, Jeffrey Wu, and
+Dario Amodei. 2020. Scaling Laws for Neural Language Models.arXiv
+preprint arXiv:2001.08361(2020).
+[25] Diederik P. Kingma and Jimmy Ba. 2015. Adam: A Method for Sto-
+chastic Optimization. InProceedings of the 3rd International Conference
+on Learning Representations (ICLR’15).
+13
+
+===== PAGE 14 =====
+
+Xinyu Lian, Masahiro Tanaka, Olatunji Ruwase, and Minjia Zhang
+[26] Lambda. 2024. NVIDIA GH200 Grace Hopper Superchip.https://
+lambdalabs.com/nvidia-gh200.
+[27] Shen Li, Yanli Zhao, Rohan Varma, Omkar Salpekar, Pieter Noord-
+huis, Teng Li, Adam Paszke, and et al. 2020. PyTorch Distributed:
+Experiences on Accelerating Data Parallel Training.arXiv preprint
+arXiv:2006.15704(2020).
+[28] Xinyu Lian, Yinfang Chen, Runxiang Cheng, Jie Huang, Parth Thakkar,
+Minjia Zhang, and Tianyin Xu. 2025. Large Language Models as Con-
+figuration Validators. InProceedings of the 47th IEEE/ACM International
+Conference on Software Engineering (ICSE’25).
+[29] Hao Liu, Matei Zaharia, and Pieter Abbeel. 2023. Ring Attention with
+Blockwise Transformers for Near-Infinite Context.arXiv preprint
+arXiv:2310.01889(2023).
+[30] Liyuan Liu, Haoming Jiang, Pengcheng He, Weizhu Chen, Xiaodong
+Liu, Jianfeng Gao, and Jiawei Han. 2020. On the Variance of the Adap-
+tive Learning Rate and Beyond. InProceedings of the 8th International
+Conference on Learning Representations (ICLR’20).
+[31] Ilya Loshchilov and Frank Hutter. 2019. Decoupled Weight Decay
+Regularization. InProceedings of the 7th International Conference on
+Learning Representations (ICLR’19).
+[32] Avinash Maurya, Jie Ye, M. Mustafa Rafique, Franck Cappello, and Bog-
+dan Nicolae. 2024. Deep Optimizer States: Towards Scalable Training
+of Transformer Models using Interleaved Offloading. InProceedings of
+the 25th International Middleware Conference (Middleware’24).
+[33] Meta AI LLaMA Team. 2024. The Llama 3 Herd of Models.https:
+//ai.meta.com/research/publications/the-llama-3-herd-of-models.
+[34] Paulius Micikevicius, Sharan Narang, Jonah Alben, Gregory F. Diamos,
+Erich Elsen, David García, Boris Ginsburg, Michael Houston, Oleksii
+Kuchaiev, Ganesh Venkatesh, and Hao Wu. 2018. Mixed Precision
+Training. InProceedings of the 6th International Conference on Learning
+Representations (ICLR’18).
+[35] Microsoft Research. 2020. Turing-NLG: A 17-billion-parameter
+language model by Microsoft.https://www.microsoft.com/en-
+us/research/blog/turing-nlg-a-17-billion-parameter-language-
+model-by-microsoft.
+[36] Deepak Narayanan, Aaron Harlap, Amar Phanishayee, Vivek Seshadri,
+Nikhil R. Devanur, Gregory R. Ganger, Phillip B. Gibbons, and Matei
+Zaharia. 2019. PipeDream: Generalized Pipeline Parallelism for DNN
+Training. InProceedings of the 27th ACM Symposium on Operating
+Systems Principles (SOSP’19).
+[37] Deepak Narayanan, Mohammad Shoeybi, Jared Casper, Patrick LeGres-
+ley, Mostofa Patwary, Vijay Anand Korthikanti, Dmitri Vainbrand,
+Prethvi Kashinkunti, Julie Bernauer, Bryan Catanzaro, Amar Phan-
+ishayee, and Matei Zaharia. 2021. Efficient Large-Scale Language
+Model Training on GPU Clusters Using Megatron-LM.arXiv preprint
+arXiv:2104.04473(2021).
+[38] National Center for Supercomputing Applications. 2024. Delta-AI.
+https://delta.ncsa.illinois.edu/delta-delta-ai.
+[39] NVIDIA. 2022. NVIDIA DGX A100: The Universal System for AI
+Infrastructure.https://images.nvidia.com/aem-dam/Solutions/Data-
+Center/nvidia-dgx-a100-datasheet.pdf.
+[40] NVIDIA. 2023. NVIDIA Grace Hopper Superchip Architecture
+In-Depth.https://developer.nvidia.com/blog/nvidia-grace-hopper-
+superchip-architecture-in-depth.
+[41] NVIDIA. 2024. NVIDIA GB200 NVL72.https://www.nvidia.com/en-
+us/data-center/gb200-nvl72.
+[42] NVIDIA. 2024. NVIDIA Grace Hopper Superchip.https://www.nvidia.
+com/en-us/data-center/grace-hopper-superchip.
+[43] OpenAI. 2023. GPT-4.https://openai.com/product/gpt-4.
+[44] Long Ouyang, Jeff Wu, Xu Jiang, Diogo Almeida, Carroll L. Wain-
+wright, Pamela Mishkin, Chong Zhang, Sandhini Agarwal, Katarina
+Slama, Alex Ray, John Schulman, Jacob Hilton, Fraser Kelton, Luke
+Miller, Maddie Simens, Amanda Askell, Peter Welinder, Paul Chris-
+tiano, Jan Leike, and Ryan Lowe. 2022. Training Language Mod-
+els to Follow Instructions with Human Feedback.arXiv preprint
+arXiv:2203.02155(2022).
+[45] Razvan Pascanu, Tomás Mikolov, and Yoshua Bengio. 2013. On the
+Difficulty of Training Recurrent Neural Networks. InProceedings of
+the 30th International Conference on Machine Learning, (ICML’13).
+[46] Xuan Peng, Xuanhua Shi, Hulin Dai, Hai Jin, Weiliang Ma, Qian Xiong,
+Fan Yang, and Xuehai Qian. 2020. Capuchin: Tensor-based GPU
+Memory Management for Deep Learning. InProceedings of the 25th
+International Conference on Architectural Support for Programming
+Languages and Operating Systems (ASPLOS’20).
+[47] PyTorch Team. 2025. Automatic Mixed Precision.https://pytorch.org/
+tutorials/recipes/recipes/amp_recipe.html.
+[48] PyTorch Team. 2025. FSDP Tutorial.https://pytorch.org/tutorials/
+intermediate/FSDP_tutorial.html.
+[49] Alec Radford, Jeff Wu, Rewon Child, David Luan, Dario Amodei, and
+Ilya Sutskever. 2019.Language Models are Unsupervised Multitask
+Learners. Technical Report. OpenAI.
+[50] Rafael Rafailov, Archit Sharma, Eric Mitchell, Stefano Ermon, Christo-
+pher D. Manning, and Chelsea Finn. 2024. Direct Preference Optimiza-
+tion: Your Language Model is Secretly a Reward Model.arXiv preprint
+arXiv:2305.18290(2024).
+[51] Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He.
+2019. ZeRO: Memory Optimization Towards Training A Trillion
+Parameter Models.arXiv preprint arXiv:1910.02054(2019).
+[52] Samyam Rajbhandari, Olatunji Ruwase, Jeff Rasley, Shaden Smith, and
+Yuxiong He. 2021. ZeRO-Infinity: Breaking the GPU Memory Wall for
+Extreme Scale Deep Learning.arXiv preprint arXiv:2104.07857(2021).
+[53] Jeff Rasley, Samyam Rajbhandari, Olatunji Ruwase, and Yuxiong He.
+2020. DeepSpeed: System Optimizations Enable Training Deep Learn-
+ing Models with Over 100 Billion Parameters. InProceedings of the 26th
+ACM SIGKDD Conference on Knowledge Discovery and Data Mining
+(KDD’20).
+[54] Jie Ren, Jiaolin Luo, Kai Wu, Minjia Zhang, Hyeran Jeon, and Dong Li.
+2021. Sentinel: Efficient Tensor Migration and Allocation on Heteroge-
+neous Memory Systems for Deep Learning. InProceedings of the 27th
+International Symposium on High-Performance Computer Architecture
+(HPCA’21).
+[55] Jie Ren, Samyam Rajbhandari, Reza Yazdani Aminabadi, Olatunji
+Ruwase, Shuangyan Yang, Minjia Zhang, Dong Li, and Yuxiong He.
+2021. ZeRO-Offload: Democratizing Billion-Scale Model Training. In
+Proceedings of the 2021 USENIX Annual Technical Conference (ATC’21).
+[56] Minsoo Rhu, Natalia Gimelshein, Jason Clemons, Arslan Zulfiqar, and
+Stephen W. Keckler. 2016. vDNN: Virtualized Deep Neural Networks
+for Scalable, Memory-Efficient Neural Network Design. InProceedings
+of the 49th Annual IEEE/ACM International Symposium on Microarchi-
+tecture (MICRO-49).
+[57] Baptiste Rozière, Jonas Gehring, Fabian Gloeckle, Sten Sootla, Itai
+Gat, Xiaoqing Ellen Tan, Yossi Adi, Jingyu Liu, Romain Sauvestre, Tal
+Remez, Jérémy Rapin, Artyom Kozhevnikov, Ivan Evtimov, Joanna Bit-
+ton, Manish Bhatt, Cristian Canton Ferrer, Aaron Grattafiori, Wenhan
+Xiong, Alexandre Défossez, Jade Copet, Faisal Azhar, Hugo Touvron,
+Louis Martin, Nicolas Usunier, Thomas Scialom, and Gabriel Synnaeve.
+2024. Code Llama: Open Foundation Models for Code.arXiv preprint
+arXiv:2308.12950(2024).
+[58] Gabin Schieffer, Jacob Wahlgren, Jie Ren, Jennifer Faj, and Ivy Peng.
+2024. Harnessing Integrated CPU-GPU System Memory for HPC: a
+first look into Grace Hopper.arXiv preprint arXiv:2407.07850(2024).
+[59] Amazon Web Services. 2023. NVIDIA Announces Availabil-
+ity of NVIDIA GH200 Grace Hopper Superchips on Amazon
+EC2.https://aws.amazon.com/solutions/case-studies/nvidia-keynote-
+aws-reinvent-2023.
+[60] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley,
+Jared Casper, and Bryan Catanzaro. 2020. Megatron-LM: Training
+Multi-Billion Parameter Language Models Using Model Parallelism.
+arXiv preprint arXiv:1909.08053(2020).
+14
+
+===== PAGE 15 =====
+
+SuperOffload: Unleashing the Power of Large-Scale LLM Training on Superchips
+[61] Karan Singhal, Shekoofeh Azizi, Tao Tu, S. Sara Mahdavi, Jason Wei,
+Hyung Won Chung, Nathan Scales, Ajay Tanwani, Heather Cole-
+Lewis, Stephen Pfohl, Perry Payne, Martin Seneviratne, Paul Gamble,
+Chris Kelly, Nathaneal Scharli, Aakanksha Chowdhery, Philip Mans-
+field, Blaise Aguera y Arcas, Dale Webster, Greg S. Corrado, Yossi
+Matias, Katherine Chou, Juraj Gottweis, Nenad Tomasev, Yun Liu,
+Alvin Rajkomar, Joelle Barral, Christopher Semturs, Alan Karthike-
+salingam, and Vivek Natarajan. 2023. Large Language Models Encode
+Clinical Knowledge.arXiv preprint arXiv:2212.13138(2023).
+[62] BigScience team. 2023. BLOOM: A 176B-Parameter Open-Access
+Multilingual Language Model.arXiv preprint arXiv:2211.05100(2023).
+[63] Gemini Team. 2024. Gemini: A Family of Highly Capable Multimodal
+Models.arXiv preprint arXiv:2312.11805(2024).
+[64] TOP500. 2024. Alps Supercomputer.https://top500.org/system/
+180259.
+[65] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-
+Anne Lachaux, Timothée Lacroix, Baptiste Rozière, Naman Goyal, Eric
+Hambro, Faisal Azhar, Aurelien Rodriguez, Armand Joulin, Edouard
+Grave, and Guillaume Lample. 2023. LLaMA: Open and Efficient
+Foundation Language Models.arXiv preprint arXiv:2302.13971(2023).
+[66] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion
+Jones, Aidan N. Gomez, Lukasz Kaiser, and Illia Polosukhin. 2017.
+Attention is All you Need. InProceedings of the 31st Conference on
+Neural Information Processing Systems (NIPS’17).
+[67] Linnan Wang, Jinmian Ye, Yiyang Zhao, Wei Wu, Ang Li, Shuai-
+wen Leon Song, Zenglin Xu, and Tim Kraska. 2018. SuperNeurons: Dy-
+namic GPU Memory Management for Training Deep Neural Networks.
+InProceedings of the 23rd ACM SIGPLAN Symposium on Principles and
+Practice of Parallel Programming (PPoPP’18).
+[68] xAI. 2024. Grok-2.https://x.ai/blog/grok-2.
+[69] Yi Xu, Ziming Mao, Xiangxi Mo, Shu Liu, and Ion Stoica. 2024.
+Pie: Pooling CPU Memory for LLM Inference.arXiv preprint
+arXiv:2411.09317(2024).
+[70] Shengyu Zhang, Linfeng Dong, Xiaoya Li, Sen Zhang, Xiaofei Sun,
+Shuhe Wang, Jiwei Li, Runyi Hu, Tianwei Zhang, Fei Wu, and Guoyin
+Wang. 2024. Instruction Tuning for Large Language Models: A Survey.
+arXiv preprint arXiv:2308.10792(2024).
+[71] Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya
+Chen, Shuohui Chen, Christopher Dewan, Mona Diab, Xian Li, Xi Vic-
+toria Lin, Todor Mihaylov, Myle Ott, Sam Shleifer, Kurt Shuster, Daniel
+Simig, Punit Singh Koura, Anjali Sridhar, Tianlu Wang, and Luke
+Zettlemoyer. 2022. OPT: Open Pre-trained Transformer Language
+Models.arXiv preprint arXiv:2205.01068(2022).
+[72] Yiqi Zhang and Yang You. 2024. SpeedLoader: An I/O Efficient Scheme
+for Heterogeneous and Distributed LLM Operation. InProceedings of
+the 38th Conference on Neural Information Processing Systems (NIPS’24).
+[73] Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo, Chien-Chin Huang,
+Min Xu, Less Wright, Hamid Shojanazeri, Myle Ott, Sam Shleifer,
+Alban Desmaison, Can Balioglu, Pritam Damania, Bernard Nguyen,
+Geeta Chauhan, Yuchen Hao, Ajit Mathews, and Shen Li. 2023. Py-
+Torch FSDP: Experiences on Scaling Fully Sharded Data Parallel.arXiv
+preprint arXiv:2304.11277(2023).
+15
+
+===== PAGE 16 =====
+
+Xinyu Lian, Masahiro Tanaka, Olatunji Ruwase, and Minjia Zhang
+A Model Config
+Table 4. Model configuration in evaluation.
+# params # layer Hidden size
+1, 2, 3 billion 20, 40, 60 2048
+4 billion 64 2304
+5, 6, 8 billion 44, 53, 72 3072
+10, 11 billion 50, 55 4096
+12, 13 billion 60, 65 4096
+15 billion 78 4096
+20, 25, 50, 60 billion 25, 30, 60, 75 8192
+70, 80 billion 87, 100 8192
+150, 200 billion 45, 60 16384
+B Baseline
+We compare the effectiveness of SuperOffload with state-of-
+the-art multi-billion parameter training solutions:
+• PyTorch DDP[ 27]: The standard PyTorch Trans-
+former implementation using DistributedDataParallel
+(DDP) for data parallelism across multiple GPUs.
+• Megatron[ 60]: A widely used large-scale model train-
+ing solution that employs model parallelism to effi-
+ciently scale Transformer models.
+• ZeRO-2[ 51]: An extension of data parallelism that
+eliminates memory redundancies across multiple GPUs
+by sharding gradients and optimizer states.
+• ZeRO-3[ 51]: An enhancement over ZeRO-2 that fur-
+ther shards model parameters across GPUs.
+• ZeRO-Offload[ 55]: Built on top of ZeRO-2, ZeRO-
+Offload further offloads gradients and optimizer states
+to CPU memory, providing an efficient solution for
+training large-scale models with limited GPU mem-
+ory. It has been adopted in DeepSpeed as the default
+offloading solution to CPU.
+• ZeRO-Infinity[ 52]: An extension of ZeRO-3 and
+ZeRO-Offload that enables training very large models
+by utilizing GPU, CPU memory, and NVMe storage
+through optimized memory management, prefetch-
+ing, and computation-communication overlapping.
+For fair comparison, we only enable its CPU offloading
+capabilities, excluding NVMe storage offloading.
+• FSDP-CPU Offload[ 73]: Fully Sharded Data Parallel
+(FSDP) with CPU offloading is an advanced memory-
+saving technique that extends FSDP by offloading
+model states, including parameters, gradients, and
+optimizer states, to CPU when not actively needed.
+16

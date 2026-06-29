@@ -1,15 +1,15 @@
 # Dense-LLM Activation Schedule (LoRA SFT)
 
-One row per activation, named by its **producer** module. Drives the per-tensor schedule:
-where to compute (CPU/GPU) and whether to persist / recompute / offload / offload+fetch.
-Megatron-aligned. Caveats / unwired gaps: see `issues.md`.
+One row per **forward-saved** activation. Drives the per-tensor schedule: where to compute
+(CPU/GPU) + its disposition. Megatron-aligned. Backward transients & fp32/HBM accounting,
+caveats, unwired gaps → `issues.md`.
 
 ## Convention
 
 - **Rows = modules, named by producer** (the `= C` of the Ops column). Megatron names
   recompute by producer, offload by consumer ("input of X"); we use producer for both, since
   `output-of-M ≡ input-of-next`. Map: MG `qkv_linear`-in = `attn_norm`-out · `core_attn`-in =
-  `qkv`-out · `attn_proj`-in = `core_attn`-out · `moe_act`-in = `fc1`-out.
+  `qkv`-out · `attn_proj`-in = `core_attn`-out.
 - **Tokens** (Megatron): `attn_norm, qkv, core_attn, attn_proj, mlp_norm, fc1, mlp_act, fc2`
   (+ `embed, final_norm, lm_head`). LoRA rows added (MG has none): `*·loraA` → `S[M,r]`;
   LoRA-B delta folds into the base output.
@@ -17,9 +17,9 @@ Megatron-aligned. Caveats / unwired gaps: see `issues.md`.
   `* + -`=elementwise, `FA`=FlashAttention.
 - **Bound**: compute = AI ≫ ridge (≈330 FLOP/B); memory = AI ≪ ridge.
 - **Disposition** (extends MG `persist|offload|recompute`): `offload+fetch ★` = CPU-resident,
-  streamed into the bwd GEMM via AsymGEMM `@^L/@^R`, **never re-materialized** (ours; only when
-  the sole bwd consumer is a GEMM). `cpu-weight` = frozen base on CPU, `@^R`-fetched.
+  streamed into the bwd GEMM via AsymGEMM `@^L/@^R`, **never re-materialized** (ours). `cpu-weight` = frozen base on CPU, `@^R`-fetched.
   `fuse` = never-form. `FA` = FlashAttention-owned.
+- **p=0**: lora_dropout (enforced) & attention_dropout = 0 → no dropout-mask activations.
 
 ## Dims & sizes (Qwen3-32B, M=B·T=16384, bf16)
 
@@ -33,8 +33,8 @@ Megatron-aligned. Caveats / unwired gaps: see `issues.md`.
 |---|---|---|---|---|---|
 | → | compute | compute | memory | memory | memory |
 
-All-saved ≈3.38 GiB/layer ×64 ≈ **216 GiB** (infeasible). Frozen base 58 GiB → all `cpu-weight`.
-Offload priority: `[M,I]` (2400/layer) ≫ `[M,Dq]` (512) > `[M,H]` (160) ≫ `[M,r]`.
+All-saved ≈3.38 GiB/layer ×64 ≈ **216 GiB** (infeasible). Frozen base 58 GiB (+ embed/lm_head 1.45 ea) → all `cpu-weight`.
+Offload priority: gate,up `[M,2I]` (1600/layer) ≫ FA Q/K/V/O (≈576, later) > stream `[M,H]` (160) ≫ `[M,r]`.
 
 ---
 
@@ -62,14 +62,14 @@ The `[M,H]` carry; feeds `attn_norm`/`mlp_norm` (recompute) + skip-add.
 | `qkv` base | `[M,H] @ [H,Dq+2Dkv] = [M,Dq+2Dkv]` | compute | cpu-weight | out Q,K,V → FA |
 | `qkv·loraA` | `[M,H] @ [H,r] = [M,r]` ×3 | memory | persist | S for dB; 0.5 MiB |
 | `qk_norm+rope` | `rmsnorm·rope(Q,K) = [M,Dq],[M,Dkv]` | memory | recompute (FA) | per-head norm+RoPE (Qwen3; Llama=RoPE only) |
-| `core_attn` | `[M,Dq] = FA(Q′,K′,V)`; scores `[B,Hq,T,T]` **never formed** | compute | FA | FA saves Q,K,V,LSE; recomputes scores in bwd |
-| `core_attn` out | `AttnOut [M,Dq] → attn_proj in` | compute | offload+fetch ★ | recompute = re-run FA (costly); today HBM (gap) |
+| `core_attn` | `[M,Dq] = FA(Q′,K′,V)`; scores `[B,Hq,T,T]` **never formed** | compute | FA | FA saves Q,K,V,O,LSE; recomputes scores in bwd |
+| `core_attn` out | `AttnOut [M,Dq] → attn_proj in` | compute | FA | FA holds O (bwd needs `D=rowsum(dO∘O)`); attn_proj dA_o reuses it → plain `@` |
 | `attn_proj` base | `[M,Dq] @ [Dq,H] = [M,H]` | compute | cpu-weight | out → +resid (unsaved) |
 | `attn_proj·loraA` | `[M,Dq] @ [Dq,r] = [M,r]` | memory | persist | S_o for dB |
 | `+resid` | `[M,H] + [M,H] = [M,H]` | memory | persist → offload | produces next `input_stream` |
 
 ## mlp
-`input_stream → mlp_norm → fc1 (gate,up) → mlp_act (silu·up) → fc2 → +resid`
+`input_stream → mlp_norm → fc1 → gate,up → mlp_act (silu·up) → fc2 → +resid`
 
 | Module | Ops | Bound | Disposition | Why |
 |---|---|---|---|---|
@@ -77,7 +77,7 @@ The `[M,H]` carry; feeds `attn_norm`/`mlp_norm` (recompute) + skip-add.
 | `fc1` base | `[M,H] @ [H,2I] = [M,2I]` (gate‖up) | compute | cpu-weight | out → gate,up |
 | `fc1·loraA` | `[M,H] @ [H,r] = [M,r]` ×2 | memory | persist | S_gate/S_up for dB |
 | `fc1` out | `gate,up [M,2I] → mlp_act in` | compute | offload | bwd silu (GPU) needs whole gate,up |
-| `mlp_act` | `silu([M,I]) * [M,I] = [M,I]` | memory | recompute | from staged gate,up |
+| `mlp_act` | `silu([M,I]) * [M,I] = [M,I]` | memory | recompute | from staged gate,up; ★-eligible (sole bwd consumer = dA_down) |
 | `fc2` base | `[M,I] @ [I,H] = [M,H]` | compute | cpu-weight | out → +resid (unsaved) |
 | `fc2·loraA` | `[M,I] @ [I,r] = [M,r]` | memory | persist | S_down for dB |
 | `+resid` | `[M,H] + [M,H] = [M,H]` | memory | persist → offload | produces next `input_stream` |
@@ -98,9 +98,9 @@ The `[M,H]` carry; feeds `attn_norm`/`mlp_norm` (recompute) + skip-add.
 1. `input_stream` = backbone → `persist` (→ `offload`/NVMe at depth); norms recompute from it.
 2. Frozen base GEMMs (qkv, attn_proj, fc1, fc2, embed, lm_head) → `cpu-weight` `@^R`, GPU.
 3. LoRA `S[M,r]` → `persist` (too small to move).
-4. Wide + sole-bwd-consumer-a-GEMM (AttnOut; act) → `offload+fetch ★`.
-5. Wide + bwd elementwise/softmax consumer (gate,up; FA Q/K/V) → `offload` (stage), no fetch.
-6. Memory-bound + inputs kept (norms, qk_norm+rope, act) → `recompute`. Logits → `fuse`.
+4. Wide + sole-bwd-GEMM-consumer (act) → `offload+fetch ★`-eligible; recompute preferred (gate,up kept).
+5. Wide + bwd-elementwise consumer → `offload` (stage), no fetch: gate,up (now); FA Q/K/V/O incl. AttnOut (`FA` now → offload later).
+6. Memory-bound + inputs kept (norms, qk_norm+rope) → `recompute`. Logits → `fuse`.
 
 **Compute (dense):** GEMMs + silu always on **GPU** — dense M = full B·T, so CPU GEMM *and* CPU
 silu over `[M,I]` stall. CPU(+NVMe) = storage/streaming tier, not compute. (MoE differs:

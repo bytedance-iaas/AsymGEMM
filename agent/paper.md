@@ -48,35 +48,50 @@ Next Steps:
 
 #############################################################################################################
 
-Motivation Figures:
-- Runtime breakdown of zero3offload vs superoffload => Optimizer is trivial in timing so superoffload does not target the truth bottleneck in LoRA SFT
-- Memory decomposition of LoRA SFT => Show 1. even with recompute activation memory is core aspect 2. other aspects taken care of by superoffload but activation not taken care
-- Show C2C receiving underutilization of SuperOffload => Motivate more AsyGEMM to utilize RX
-- Show CPU underutilization of SuperOffload => Motivate more computes on CPU
-- For each activation tensor/module, show compute vs memory bound and the CPU low utilization => Motivate to put work on CPU selectively
-- Show hardware specs difference between GH200 and GB200 in a table  ⇒ more scheduling needed to achieve better throughput + storage needed form nvme
+Motivations:
+- RuntimOptimizer is trivial in timing
+    - Euperoffload does not target the truth bottleneck in LoRA SFT
+- Memory decomposition of LoRA SFT
+    - Even with recompute activation memory is core aspect
+    - Other aspects taken care of by superoffload but activation not taken care
+- Show C2C receiving underutilization of SuperOffload
+    - Motivate more AsyGEMM to utilize RX
+- Show CPU underutilization of SuperOffload
+    - Motivate more computes on CPU
+- Show compute vs memory bound for each activation tensor
+    - Motivate to recompute on GPU / recompute on CPU / offload and fetch via AsymGEMM
+- Show hardware specs difference between GH200 and GB200 in a table 
+    - More scheduling needed to achieve better throughput + storage needed form nvme
 - [?] Why does it have issues with extending to 2 GPUs (Superoffload + deepspeed / Superoffload + seq parallel)?
 <!-- - CPU + GPU computes vs. GPU-only computes (Run superoffload directly) -->
 
-Method:
+System Design:
 - AsymGEMM-enabled design for selective activation offload+recompute. 
 - Utilizing more CPU computes based on module/op heterogenuity
 - Multi-tier activation storage system / NVME-based activation offload and prefetching
 - Intgeration with SP/deepspeed for multiple superchips
 
-
 Baselines:
+- KTransformers
 - FSDP
 - FSDP Offload (Optimizer State + Model Params)
 - Zero2
 - Zero2 Offload (Optimizer State)
-- Zero3 
+- Zero3
 - Zero3 Offload (Optimizer State)
 - Zero3 Offload (Optimizer State + Model Params)
 - Superoffload (Optimizer State + Model Params)
 <!-- - Megatron (Optimizer State) -->
 
 Exps:
+- 
+-
+-
+
+Ablations:
+- 
+-
+-
 
 
 
