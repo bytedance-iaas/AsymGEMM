@@ -1,5 +1,11 @@
 """Token-chunked dense-MLP forward.
 
+DISABLED / NOT WIRED (kept as source). Superseded by the fine-grained recomp-off design
+(`agent/impls/finegrained_offload.md`), which reduces the `[M,I]` peak via CPU-elementwise placement
+(silu on CPU, one `[M,I]` on GPU) rather than token tiling. The `install_chunked_mlp_on_dense_mlps` call site
+in `lf.py` is commented out; `ASYMM_MLP_RECOMPUTE_CHUNK` is therefore a no-op. Do not use without re-wiring.
+
+
 The dense SwiGLU MLP (`down(silu(gate(x)) * up(x))`) is token-parallel, so its forward can be evaluated in
 row-chunks. Under whole-layer gradient checkpointing (HF/Unsloth), the layer is recomputed in backward; if the
 MLP recompute materializes the full `[M, I]` working set at once it blows up the transient HBM peak (the dense MLP
