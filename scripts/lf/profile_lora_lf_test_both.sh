@@ -101,18 +101,14 @@ else
   #   "llama3.3-70b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
   # )
   RUNS=(
+    # "q3-235b-a22b|1 ; superoffload_mem_panvme|unsloth|ligerloss1 ; 1000|8|1 ; none|false|false|false|false|false"
+    "q3-30b-a3b|1 ; superoffload_mem_panvme|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
+
     # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
-    "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # x55k
+    # "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # x55k
     # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x50k
     # "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # x10k
     # "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # x45k
-    # "q3-235b-a22b|1 ; superoffload_mem_panvme|unsloth|ligerloss1 ; 1000|8|1 ; none|false|false|false|false|false"
-
-    # "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
-    # "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x60k
-    # "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # x60k
-    # "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false"
-    # "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false"
 
     # "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # x90k
     # "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 250000|8|1 ; none|false|false|false|false|false" # x60k
