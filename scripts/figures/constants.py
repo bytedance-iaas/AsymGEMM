@@ -23,11 +23,11 @@ HELVETICA_LIKE_FONTS = [
 
 # --- Font sizes (consistent across every figure) --------------------------
 FONT_SIZE_BASE = 22         # general text / annotations
-FONT_SIZE_TICK = 18         # x and y tick labels
-FONT_SIZE_LEGEND = 20       # legend entries
-FONT_SIZE_AXIS_TITLE = 24   # x and y axis labels
+FONT_SIZE_TICK = 22         # x and y tick labels
+FONT_SIZE_LEGEND = 22       # legend entries
+FONT_SIZE_AXIS_TITLE = 26   # x and y axis labels
 FONT_SIZE_SEGMENT = 18      # in-bar per-segment % labels
-FONT_SIZE_MODEL = 20        # per-group model-name labels under the x-axis
+FONT_SIZE_MODEL = 24        # per-group model-name labels under the x-axis
 # (no figure title anywhere)
 
 # --- Colors: phase/segment -> color (legend reuses these exact colors) ----
@@ -103,12 +103,13 @@ def figure_size_for_xlim(xlim, height):
 # --- Per-figure size params (height/bar spacing differ per figure) --------
 FIGURE_PARAMS = {
     "lora_timing": {
-        "height": 4,
+        "height": 6,
         "bar_width": 0.10,    # bar thickness only (independent)
-        "pair_gap": 0.16,     # spacing of the 2 bars WITHIN a group
+        "pair_gap": 0.18,     # spacing of the 2 bars WITHIN a group
         "group_gap": 0.25,    # spacing BETWEEN groups (independent of pair_gap)
         "x_margin": 0.11,     # padding beyond the outermost bar edges
-        "model_label_y": -0.15,  # model-name y position in x-axis coords
+        "x_tick_label_pad": 10,  # PyTorch/SuperOffload label distance from x-axis
+        "model_label_y": -0.2,  # model-name y position in x-axis coords
         "axes_left": 0.12,
         "axes_right": 0.985,
         "axes_bottom": 0.22,
@@ -116,12 +117,13 @@ FIGURE_PARAMS = {
         "dpi": 200,
     },
     "memory": {
-        "height": 4,
+        "height": 6,
         "bar_width": 0.1,    # bar thickness only (independent)
-        "pair_gap": 0.16,     # PyTorch vs SuperOffload within one model
+        "pair_gap": 0.18,     # PyTorch vs SuperOffload within one model
         "group_gap": 0.25,    # spacing BETWEEN model groups
         "x_margin": 0.11,     # padding beyond the outermost bar edges
-        "model_label_y": -0.15,  # model-name y position in x-axis coords
+        "x_tick_label_pad": 10,  # PyTorch/SuperOffload label distance from x-axis
+        "model_label_y": -0.2,  # model-name y position in x-axis coords
         "axes_left": 0.12,
         "axes_right": 0.985,
         "axes_bottom": 0.22,
@@ -131,7 +133,7 @@ FIGURE_PARAMS = {
     "timeline": {
         "width": 12,
         "c2c_width": 12,
-        "height": 4,
+        "height": 6,
         "axes_left": 0.12,
         "axes_right": 0.985,
         "axes_bottom": 0.22,
@@ -147,7 +149,7 @@ FIGURE_PARAMS = {
 LEGEND_PARAMS = {
     "default": dict(
         loc="lower center",
-        bbox_to_anchor=(0.5, 0.98),
+        bbox_to_anchor=(0.47, 0.98),
         frameon=False,
         fontsize=FONT_SIZE_LEGEND,
         handlelength=1.4,

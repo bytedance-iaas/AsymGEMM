@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Driver for the LoRA SFT step-time breakdown figure.
 #
-# Generates a grouped stacked-bar PNG of forward/backward/optimizer time for
+# Generates a grouped stacked-bar PDF of forward/backward/optimizer time for
 # Qwen3-32B and Qwen3-MoE-30B under ZeRO-3 Offload vs SuperOffload, motivating
 # that the optimizer step (SuperOffload's only target) is not the bottleneck.
 #

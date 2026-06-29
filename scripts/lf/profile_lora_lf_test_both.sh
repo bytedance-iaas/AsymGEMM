@@ -25,7 +25,7 @@ GPU_POOL=${GPU_POOL:-3}
 # RUNS: model ; backend|recompute|liger ; seq|batch|grad_accum ; policy|expact|attnact|layeract|layergc|sdparecomp
 # Models use the M shorthand. To override the default list from the environment, pass:
 #   RUNS='q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false || q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true'
-#   backend  : asym_cpuadamwds | zero3_offload | zero3_offload_mem | zero3_offload_opnvme | zero3_offload_pnvme | superoffload | superoffload_mem
+#   backend  : asym_cpuadamwds | zero3_offload | zero3_offload_mem | zero3_offload_opnvme | zero3_offload_panvme | zero3_offload_mem_opnvme | zero3_offload_mem_panvme | superoffload | superoffload_mem | superoffload_mem_opnvme | superoffload_mem_panvme
 #   recompute: recomp | norecomp | unsloth        liger: ligerloss0 | ligerloss1
 #   policy   : none|false|false|false|false|false (off)  |  none|true|true|false|true|true (offload+gc)
 declare -A M=(
@@ -52,7 +52,7 @@ fi
 _RUNS_LOG="${RUNS_LOG:-${ROOT}/scripts/lf/runs.log}"
 # RUNS=(
 #   # "q3-30b-a3b|1 ; zero3_offload_opnvme|recomp|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-#   # "q3-30b-a3b|1 ; zero3_offload_pnvme|recomp|ligerloss1  ; 4092|8|1 ; none|false|false|false|false|false"
+#   # "q3-30b-a3b|1 ; zero3_offload_panvme|recomp|ligerloss1  ; 4092|8|1 ; none|false|false|false|false|false"
 #   "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
 # )
 if [[ "${_RUNS_ENV_SET}" == "true" ]]; then
@@ -101,26 +101,24 @@ else
   #   "llama3.3-70b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
   # )
   RUNS=(
-    # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 75000|8|1 ; none|false|false|false|false|false"
-    # "q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
+    # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
+    "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # x55k
+    # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x50k
+    # "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # x10k
+    # "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # x45k
+    # "q3-235b-a22b|1 ; superoffload_mem_panvme|unsloth|ligerloss1 ; 1000|8|1 ; none|false|false|false|false|false"
 
-    "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
-    "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x60k
-    "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x60k
-    "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false"
-    "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 8000|8|1 ; none|false|false|false|false|false"
+    # "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
+    # "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x60k
+    # "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # x60k
+    # "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false"
+    # "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false"
 
-    "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
-    "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x60k
-    "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # x60k
-    "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false"
-    "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false"
-
-    "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # x90k
-    "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 250000|8|1 ; none|false|false|false|false|false" # x60k
-    "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # x60k
-    "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false"
-    "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false"
+    # "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # x90k
+    # "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 250000|8|1 ; none|false|false|false|false|false" # x60k
+    # "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # x60k
+    # "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false"
+    # "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false"
   )
 
   # RUNS=(
@@ -706,9 +704,9 @@ backend_gpu_count() {
   local model_gpu_count="$2"
   case "${backend}" in
     asym|asym_torch|asym_cpuadamwtorch|asym_cpuadamwds) printf '1\n' ;;
-    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_pnvme|zero3_cpuadam|superoffload|superoffload_mem) printf '%s\n' "${model_gpu_count}" ;;
+    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam|superoffload|superoffload_mem|superoffload_mem_opnvme|superoffload_mem_panvme) printf '%s\n' "${model_gpu_count}" ;;
     kt_torchbf16|kt_armbf16) printf '1\n' ;;
-    *) die "internal backend label must be torch, asym, asym_torch, asym_cpuadamwtorch, asym_cpuadamwds, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_cpuadam, superoffload, superoffload_mem, kt_torchbf16, or kt_armbf16, got '${backend}'" ;;
+    *) die "internal backend label must be torch, asym, asym_torch, asym_cpuadamwtorch, asym_cpuadamwds, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_offload_opnvme, zero3_offload_panvme, zero3_offload_mem_opnvme, zero3_offload_mem_panvme, zero3_cpuadam, superoffload, superoffload_mem, superoffload_mem_opnvme, superoffload_mem_panvme, kt_torchbf16, or kt_armbf16, got '${backend}'" ;;
   esac
 }
 
@@ -719,24 +717,28 @@ zero_deepspeed_config() {
     zero3_offload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json" ;;
     zero3_offload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_config.json" ;;
     zero3_offload_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_opnvme_config.json" ;;
-    zero3_offload_pnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_pnvme_config.json" ;;
+    zero3_offload_panvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_panvme_config.json" ;;
+    zero3_offload_mem_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_opnvme_config.json" ;;
+    zero3_offload_mem_panvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_panvme_config.json" ;;
     zero3_cpuadam) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_cpuadam_config.json" ;;
     superoffload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_config.json" ;;
     superoffload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_config.json" ;;
+    superoffload_mem_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_opnvme_config.json" ;;
+    superoffload_mem_panvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_panvme_config.json" ;;
     *) return 1 ;;
   esac
 }
 
 is_zero_backend() {
   case "${1}" in
-    zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_pnvme|zero3_cpuadam|superoffload|superoffload_mem) return 0 ;;
+    zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam|superoffload|superoffload_mem|superoffload_mem_opnvme|superoffload_mem_panvme) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 is_policy_independent_backend() {
   case "${1}" in
-    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_pnvme|zero3_cpuadam|superoffload|superoffload_mem|kt_*) return 0 ;;
+    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam|superoffload|superoffload_mem|superoffload_mem_opnvme|superoffload_mem_panvme|kt_*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -844,13 +846,17 @@ append_backend_spec() {
     zero3_offload) backend=zero3_offload ;;
     zero3_offload_mem) backend=zero3_offload_mem ;;
     zero3_offload_opnvme) backend=zero3_offload_opnvme ;;
-    zero3_offload_pnvme) backend=zero3_offload_pnvme ;;
+    zero3_offload_panvme) backend=zero3_offload_panvme ;;
+    zero3_offload_mem_opnvme) backend=zero3_offload_mem_opnvme ;;
+    zero3_offload_mem_panvme) backend=zero3_offload_mem_panvme ;;
     zero3_cpuadam) backend=zero3_cpuadam ;;
     superoffload) backend=superoffload ;;
     superoffload_mem) backend=superoffload_mem ;;
+    superoffload_mem_opnvme) backend=superoffload_mem_opnvme ;;
+    superoffload_mem_panvme) backend=superoffload_mem_panvme ;;
     kt_torchbf16) backend=kt_torchbf16 ;;
     kt_armbf16) backend=kt_armbf16 ;;
-    *) die "backend must be torch, asym, asym_torch, asym_cpuadamwtorch, asym_cpuadamwds, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_cpuadam, superoffload, superoffload_mem, kt_torchbf16, or kt_armbf16, got '${backend_part}'" ;;
+    *) die "backend must be torch, asym, asym_torch, asym_cpuadamwtorch, asym_cpuadamwds, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_offload_opnvme, zero3_offload_panvme, zero3_offload_mem_opnvme, zero3_offload_mem_panvme, zero3_cpuadam, superoffload, superoffload_mem, superoffload_mem_opnvme, superoffload_mem_panvme, kt_torchbf16, or kt_armbf16, got '${backend_part}'" ;;
   esac
   liger_loss="$(liger_loss_label "${liger_loss_part}")"
 
@@ -2158,8 +2164,8 @@ selected_has_non_asym=false
 for backend in "${backends[@]}"; do
   case "${backend}" in
     asym|asym_torch|asym_cpuadamwtorch|asym_cpuadamwds) selected_has_asym=true ;;
-    zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_pnvme|zero3_cpuadam) selected_has_zero=true ;;
-    superoffload|superoffload_mem) selected_has_zero=true; selected_has_superoffload=true ;;
+    zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam) selected_has_zero=true ;;
+    superoffload|superoffload_mem|superoffload_mem_opnvme|superoffload_mem_panvme) selected_has_zero=true; selected_has_superoffload=true ;;
     kt_*) selected_has_kt=true ;;
   esac
   case "${backend}" in
@@ -2686,7 +2692,7 @@ run_job() {
   # true/false only (no auto), and no per-backend override so all backends behave identically.
   profile_memory_breakdown="$(bool_value "${PROFILE_MEMORY_BREAKDOWN}")"
   deepspeed_dir_for_profile=""
-  if [[ "${backend}" == zero* || "${backend}" == "superoffload" || "${backend}" == "superoffload_mem" ]]; then
+  if [[ "${backend}" == zero* || "${backend}" == superoffload* ]]; then
     deepspeed_dir_for_profile="${DEEPSPEED_DIR}"
   fi
   if [[ "${job_use_asym_cpu_adamw}" == "true" && "${job_asym_cpu_adamw_backend}" == "deepspeed" ]]; then

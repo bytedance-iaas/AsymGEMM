@@ -158,7 +158,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Replot a per-run GPU/CPU utilization timeline for paper figures.")
     ap.add_argument("input_path", type=Path, help="run dir, metric dir, utilization PNG, or timeseries CSV")
     ap.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent / "out")
-    ap.add_argument("--filename", default="utilization_timeline.png")
+    ap.add_argument("--filename", default="utilization_timeline.pdf")
     args = ap.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)

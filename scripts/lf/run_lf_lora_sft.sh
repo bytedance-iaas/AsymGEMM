@@ -41,7 +41,7 @@ fi
 
 # Workload and placement
 MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-Qwen/Qwen3-30B-A3B}
-BACKEND=${BACKEND:-asym}              # torch | zero2 | zero3 | zero3_offload | zero3_offload_mem | zero3_cpuadam | superoffload | superoffload_mem | asym_torch | asym | kt_torchbf16 | kt_armbf16
+BACKEND=${BACKEND:-asym}              # torch | zero2 | zero3 | zero3_offload | zero3_offload_mem | zero3_offload_opnvme | zero3_offload_panvme | zero3_offload_mem_opnvme | zero3_offload_mem_panvme | zero3_cpuadam | superoffload | superoffload_mem | superoffload_mem_opnvme | superoffload_mem_panvme | asym_torch | asym | kt_torchbf16 | kt_armbf16
 GPU_ID=${GPU_ID:-0}
 NUM_GPUS=${NUM_GPUS:-1}
 NUMACTL_ENABLE=${NUMACTL_ENABLE:-1}
@@ -214,10 +214,14 @@ zero_deepspeed_config() {
     zero3_offload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json" ;;
     zero3_offload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_config.json" ;;
     zero3_offload_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_opnvme_config.json" ;;
-    zero3_offload_pnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_pnvme_config.json" ;;
+    zero3_offload_panvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_panvme_config.json" ;;
+    zero3_offload_mem_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_opnvme_config.json" ;;
+    zero3_offload_mem_panvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_panvme_config.json" ;;
     zero3_cpuadam) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_cpuadam_config.json" ;;
     superoffload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_config.json" ;;
     superoffload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_config.json" ;;
+    superoffload_mem_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_opnvme_config.json" ;;
+    superoffload_mem_panvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_panvme_config.json" ;;
     *) return 1 ;;
   esac
 }
@@ -257,11 +261,23 @@ case "${BACKEND,,}" in
     BACKEND=torch
     TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero3_offload_opnvme)"
     ;;
-  zero3_offload_pnvme)
-    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-zero3_offload_pnvme}
-    ZERO_BACKEND_LABEL=zero3_offload_pnvme
+  zero3_offload_panvme)
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-zero3_offload_panvme}
+    ZERO_BACKEND_LABEL=zero3_offload_panvme
     BACKEND=torch
-    TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero3_offload_pnvme)"
+    TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero3_offload_panvme)"
+    ;;
+  zero3_offload_mem_opnvme)
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-zero3_offload_mem_opnvme}
+    ZERO_BACKEND_LABEL=zero3_offload_mem_opnvme
+    BACKEND=torch
+    TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero3_offload_mem_opnvme)"
+    ;;
+  zero3_offload_mem_panvme)
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-zero3_offload_mem_panvme}
+    ZERO_BACKEND_LABEL=zero3_offload_mem_panvme
+    BACKEND=torch
+    TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero3_offload_mem_panvme)"
     ;;
   zero3_cpuadam)
     PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-zero3_cpuadam}
@@ -280,6 +296,18 @@ case "${BACKEND,,}" in
     ZERO_BACKEND_LABEL=superoffload_mem
     BACKEND=torch
     TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config superoffload_mem)"
+    ;;
+  superoffload_mem_opnvme)
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-superoffload_mem_opnvme}
+    ZERO_BACKEND_LABEL=superoffload_mem_opnvme
+    BACKEND=torch
+    TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config superoffload_mem_opnvme)"
+    ;;
+  superoffload_mem_panvme)
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-superoffload_mem_panvme}
+    ZERO_BACKEND_LABEL=superoffload_mem_panvme
+    BACKEND=torch
+    TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config superoffload_mem_panvme)"
     ;;
   asym_cpuadamwtorch)
     PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-asym_cpuadamwtorch}
@@ -305,7 +333,7 @@ case "${BACKEND,,}" in
     BACKEND=kt_armbf16
     KT_BACKEND_INTERNAL=ARMBF16
     ;;
-  *) echo "BACKEND must be one of: torch, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_cpuadam, superoffload, superoffload_mem, asym_cpuadamwtorch, asym_cpuadamwds, asym_torch, asym, kt_torchbf16, kt_armbf16; got '${BACKEND}'" >&2; exit 2 ;;
+  *) echo "BACKEND must be one of: torch, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_offload_opnvme, zero3_offload_panvme, zero3_offload_mem_opnvme, zero3_offload_mem_panvme, zero3_cpuadam, superoffload, superoffload_mem, superoffload_mem_opnvme, superoffload_mem_panvme, asym_cpuadamwtorch, asym_cpuadamwds, asym_torch, asym, kt_torchbf16, kt_armbf16; got '${BACKEND}'" >&2; exit 2 ;;
 esac
 
 case "${DIST_LAUNCHER,,}" in
@@ -573,7 +601,7 @@ is_zero_backend_run() {
 }
 
 is_superoffload_zero_run() {
-  [[ "${ZERO_BACKEND_LABEL}" == "superoffload" || "${ZERO_BACKEND_LABEL}" == "superoffload_mem" ]]
+  [[ "${ZERO_BACKEND_LABEL}" == superoffload* ]]
 }
 
 is_cpuadam_zero_run() {
@@ -1970,6 +1998,8 @@ RUN_ENV=(
   ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
   ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
   ASYMM_LAYER_GC="${ASYMM_LAYER_GC}"
+  ASYMM_LAYER_GC_RECOMPUTE="${ASYMM_LAYER_GC_RECOMPUTE:-false}"
+  ASYMM_MLP_RECOMPUTE_CHUNK="${ASYMM_MLP_RECOMPUTE_CHUNK:-0}"
   ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}"
   ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
   ASYM_CPU_ADAMW_GRAD_OFFLOAD="${ASYM_CPU_ADAMW_GRAD_OFFLOAD}"

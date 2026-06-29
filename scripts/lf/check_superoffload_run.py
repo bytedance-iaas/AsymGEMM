@@ -37,7 +37,7 @@ def summarize(profile_json: Path | None, train_log: Path | None) -> dict[str, An
     profile_marker = optimizer_class == "SuperOffloadOptimizer_Stage3"
     config_enabled = (
         superoffload.get("config_super_offload") is True
-        or profile.get("config", {}).get("backend") in {"superoffload", "superoffload_mem"}
+        or profile.get("config", {}).get("backend") in {"superoffload", "superoffload_mem", "superoffload_mem_opnvme", "superoffload_mem_panvme"}
     )
     log_marker = FINAL_OPTIMIZER_MARKER in _read_text(train_log)
     enabled = profile_marker or log_marker

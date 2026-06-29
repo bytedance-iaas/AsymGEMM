@@ -112,7 +112,7 @@ def build_figure():
     # x ticks = backend; model group labels underneath
     ax.set_xticks(xpos)
     ax.set_xticklabels([b["backend"] for b in BARS])
-    ax.tick_params(axis="x", length=0)
+    ax.tick_params(axis="x", length=0, pad=pp["x_tick_label_pad"])
     trans = ax.get_xaxis_transform()
     for center, model in zip(centers, GROUP_MODELS):
         ax.text(center, pp["model_label_y"], model, transform=trans,
@@ -140,7 +140,7 @@ def build_figure():
 def main():
     ap = argparse.ArgumentParser(description="Plot the LoRA SFT memory-breakdown figure.")
     ap.add_argument("--output-dir", default=str(Path(__file__).resolve().parent / "out"))
-    ap.add_argument("--filename", default="memory_breakdown.png")
+    ap.add_argument("--filename", default="memory_breakdown.pdf")
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
