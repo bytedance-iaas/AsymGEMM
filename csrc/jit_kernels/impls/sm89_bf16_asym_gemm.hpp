@@ -1,4 +1,4 @@
-// csrc/jit_kernels/impls/sm89_bf16_moe_gemm_masked.hpp
+// csrc/jit_kernels/impls/sm89_bf16_asym_gemm.hpp
 #pragma once
 
 #include "sm80_moe_gemm.hpp"

@@ -101,14 +101,14 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast : 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
     constexpr uint32_t STORE_BLOCK_M = WAVE_BLOCK_M;
-    constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(cd_dtype_t);
+    constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode == 0 ? BLOCK_N : kSwizzleCDMode / sizeof(cd_dtype_t);
     DG_STATIC_ASSERT(not kIsMulticastOnA or kNumMulticast == 1, "Invalid multicast");
     DG_STATIC_ASSERT(LOAD_BLOCK_M == BLOCK_M, "Only support A/D layout without multicast on A");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kIsMulticastOnA, "B-side multicast not supported in SM90 asym GEMM");
 
     // Shared memory sizes
-    constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * kSwizzleCDMode;
+    constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * (kSwizzleCDMode == 0 ? BLOCK_N * static_cast<uint32_t>(sizeof(cd_dtype_t)) : kSwizzleCDMode);
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(cutlass::float_e4m3_t);
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(cutlass::float_e4m3_t);
@@ -226,8 +226,12 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                     tma_copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, cutlass::float_e4m3_t, kIsBatchedMM>(
                         &tensor_map_b, full_barriers_b[0], smem_b[0], n_idx, k_idx, kNumMulticast, batch_idx);
 
-                // Load SFB (per K-block, single slot) — one float per column of B
-                tma_copy<BLOCK_N, 1, 0>(&tensor_map_sfb, full_barriers_b[0], smem_sfb[0], n_idx, sf_k_idx);
+                // Load SFB (per K-block, single slot) — one float per column of B.
+                // SFB is laid out per-group along the K-outer dim (see make_tma_sf_desc),
+                // so the group offset goes into the K coordinate, NOT the MN coordinate.
+                const uint32_t sfb_n_idx = blockIdx.x * BLOCK_N;
+                const uint32_t sfb_k_idx = scheduler.current_group_idx * block_k + sf_k_idx;
+                tma_copy<BLOCK_N, 1, 0>(&tensor_map_sfb, full_barriers_b[0], smem_sfb[0], sfb_n_idx, sfb_k_idx);
 
                 if (is_leader_cta) {
                     full_barriers_b[0]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE);
@@ -266,7 +270,7 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
 
                     // Load SFA (per M-block per K-block) — one float per row of A
                     const uint32_t sfa_k_idx = (kGemmType == GemmType::MGroupedMasked)
-                        ? scheduler.current_group_idx * ceil_div(shape_k, BLOCK_K) + sf_k_idx
+                        ? scheduler.current_group_idx * block_k + sf_k_idx
                         : sf_k_idx;
                     tma_copy<BLOCK_M, 1, 0>(&tensor_map_sfa, full_barriers[stage_idx], smem_sfa[stage_idx], local_m_idx, sfa_k_idx);
 
@@ -445,7 +449,7 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                 const auto m_idx_out = (kGemmType == GemmType::MGroupedMasked)
                     ? (scheduler.current_group_idx * shape_m + (block_m_iter - scheduler.m_start) * BLOCK_M)
                     : (BLOCK_M * block_m_iter);
-                const auto n_idx_out = scheduler.n_idx;
+                const auto n_idx_out = blockIdx.x * BLOCK_N;
 
                 DG_STATIC_ASSERT(kNumWGMMAStoreThreads >= BLOCK_N / TMA_D_BLOCK_N, "Too many TMA blocks");
                 if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {

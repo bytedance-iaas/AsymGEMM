@@ -13,12 +13,14 @@
 #include "../jit_kernels/impls/sm100_bf16_asym_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_asym_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_fp4_asym_gemm_1d1d.hpp"
+#include "../jit_kernels/impls/sm90_fp8_asym_gemm_1d1d.hpp"
+#include "../jit_kernels/impls/sm90_bf16_asym_gemm.hpp"
 #endif
 
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
-#include "../jit_kernels/impls/sm89_bf16_moe_gemm_masked.hpp"
+#include "../jit_kernels/impls/sm89_bf16_asym_gemm.hpp"
 #include "../jit_kernels/impls/sm80_moe_gemm.hpp"
-#include "../jit_kernels/impls/sm89_fp8_moe_gemm.hpp"
+#include "../jit_kernels/impls/sm89_fp8_asym_gemm.hpp"
 
 #include "layout.hpp"
 
@@ -71,53 +73,15 @@ static torch::Tensor broadcast_packed_ue8m0_sf(const torch::Tensor& sf,
     return result;
 }
 
-static bool early_return(const int& m, const int &n, const int& k,
-                         const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
-    // Do nothing if the problem is empty
-    if (m == 0 or n == 0)
-        return true;
-
-    // Checks
-    const bool& is_cd_same = c.has_value() and c->data_ptr() == d.data_ptr();
-    if (is_cd_same)
-        DG_HOST_ASSERT(c->sizes() == d.sizes() and c->strides() == d.strides());
-    if (c.has_value()) {
-        check_major_type_cd(c.value());
-        DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
-        DG_HOST_ASSERT(c.value().scalar_type() == torch::kFloat);
-    }
-
-    // No accumulation
-    if (k == 0) {
-        if (not is_cd_same)
-            c.has_value() ? d.copy_(c.value()) : d.zero_();
-        return true;
-    }
-
-    // With accumulation, do copy before GEMM (assuming the GEMM kernel does not support different C/D)
-    if (c.has_value() and not is_cd_same)
-        d.copy_(c.value());
-    return false;
-}
-
-// Validate the list_size tensor shape/dtype without copying it to host.
-// The host can no longer read the value (capture-mode incompatibility), so the
-// kernel launches with grid Y = num_groups and per-block sentinels handle no-ops.
-static void check_list_size_tensor(const torch::Tensor& list_size_t) {
-    DG_HOST_ASSERT(list_size_t.numel() == 1);
-    DG_HOST_ASSERT(list_size_t.scalar_type() == torch::kInt);
-}
-
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 static void m_grouped_fp8_asym_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
                                              const std::pair<torch::Tensor, torch::Tensor>& b,
                                              const torch::Tensor& d,
                                              const torch::Tensor& offsets, const torch::Tensor& experts,
-                                             const torch::Tensor& list_size_t,
+                                             const int& list_size,
                                              std::optional<std::tuple<int, int, int>> recipe,
                                              const std::string& compiled_dims,
                                              const bool& disable_ue8m0_cast) {
-    check_list_size_tensor(list_size_t);
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto& major_a = get_major_type_ab(a.first);
     const auto& major_b = get_major_type_ab(b.first);
@@ -146,17 +110,46 @@ static void m_grouped_fp8_asym_gemm_nt_contiguous(const std::pair<torch::Tensor,
     if (m == 0)
         return;
 
-    // Transform SFA and SFB into compute-required layout
-    if (not recipe.has_value())
-        recipe = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
-    const auto& sfa = layout::transform_sf_into_required_layout(a.second, m, k, recipe.value(), std::nullopt,  true, disable_ue8m0_cast);
-    const auto& sfb = layout::transform_sf_into_required_layout(b.second, n, k, recipe.value(),   num_groups, false, disable_ue8m0_cast);
+    // Architecture dispatch.
+    const auto& [arch_major, arch_minor] = device_runtime->get_arch_pair();
 
-    // Dispatch implementation. Grid Y = num_groups; sentinel blocks early-exit in-kernel.
-    const auto& arch_major = device_runtime->get_arch_major();
-    sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d,
-                                                 offsets, experts, /*grid_y=*/num_groups,
-                                                 num_groups, m, n, k, major_a, major_b, compiled_dims);
+    // SM89 (Ada): native FP8 MoE kernel. It consumes the *original* (untransformed) scales,
+    // so it must run before the SF layout transform below. SM80/SM86 lack FP8 tensor cores
+    // and are not supported.
+    if (arch_major == 8 and arch_minor == 9) {
+        if (b.second.dim() == 3) {
+            DG_HOST_ASSERT(b.second.scalar_type() == torch::kFloat32);
+            m_grouped_fp8_asym_gemm_sm89(a.first, b.first, d, offsets, experts, list_size,
+                                         1.0f, 1.0f, std::nullopt, std::nullopt,
+                                         a.second.contiguous(), b.second.contiguous());
+        } else {
+            m_grouped_fp8_asym_gemm_sm89(a.first, b.first, d, offsets, experts, list_size,
+                                         1.0f, 1.0f, a.second.reshape(-1).contiguous(), b.second.contiguous(),
+                                         std::nullopt, std::nullopt);
+        }
+        return;
+    }
+
+    // SM90 (Hopper) / SM100 (Blackwell): native asym kernels consume SFA/SFB in the
+    // transformed compute layout. Grid Y = num_groups; sentinel blocks early-exit in-kernel.
+    if (arch_major == 9 or arch_major == 10) {
+        if (not recipe.has_value())
+            recipe = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
+        const auto& sfa = layout::transform_sf_into_required_layout(a.second, m, k, recipe.value(), std::nullopt, true, disable_ue8m0_cast);
+        const auto& sfb = layout::transform_sf_into_required_layout(b.second, n, k, recipe.value(), num_groups, false, disable_ue8m0_cast);
+        if (arch_major == 9)
+            sm90_m_grouped_fp8_asym_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d,
+                                                         offsets, experts, /*grid_y=*/num_groups,
+                                                         num_groups, m, n, k, major_a, major_b, compiled_dims);
+        else
+            sm100_m_grouped_fp8_asym_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d,
+                                                          offsets, experts, /*grid_y=*/num_groups,
+                                                          num_groups, m, n, k, major_a, major_b, compiled_dims);
+        return;
+    }
+
+    DG_HOST_UNREACHABLE("FP8 contiguous asym GEMM requires SM89, SM90, or SM100 "
+                        "(SM80/SM86 lack FP8 tensor cores)");
 }
 
 static void m_grouped_fp8_asym_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -197,15 +190,44 @@ static void m_grouped_fp8_asym_gemm_nt_masked(const std::pair<torch::Tensor, tor
     if (m == 0 or expected_m == 0)
         return;
 
-    // Transform SFA and SFB into compute-required layout
-    if (not recipe.has_value())
-        recipe = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
-    const auto& sfa = layout::transform_sf_into_required_layout(a.second, m, k, recipe.value(), num_groups, true, disable_ue8m0_cast);
-    const auto& sfb = layout::transform_sf_into_required_layout(b.second, n, k, recipe.value(), num_groups, false, disable_ue8m0_cast);
+    // Architecture dispatch.
+    const auto& [arch_major, arch_minor] = device_runtime->get_arch_pair();
 
-    // Launch with gridDim.y == num_groups (constant) — CUDA-graph safe.
-    sm100_m_grouped_fp8_asym_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m, expected_m,
-                                              num_groups, m, n, k, major_a, major_b, compiled_dims);
+    // SM89 (Ada): native FP8 MoE kernel. It consumes the *original* (untransformed) scales,
+    // so it must run before the SF layout transform below. SM80/SM86 lack FP8 tensor cores
+    // and are not supported.
+    if (arch_major == 8 and arch_minor == 9) {
+        if (b.second.dim() == 3) {
+            DG_HOST_ASSERT(b.second.scalar_type() == torch::kFloat32);
+            m_grouped_fp8_asym_gemm_sm89_masked(a.first, b.first, d, masked_m, expected_m,
+                                                1.0f, 1.0f, std::nullopt, std::nullopt,
+                                                a.second.contiguous(), b.second.contiguous());
+        } else {
+            m_grouped_fp8_asym_gemm_sm89_masked(a.first, b.first, d, masked_m, expected_m,
+                                                1.0f, 1.0f, a.second.reshape(-1).contiguous(), b.second.contiguous(),
+                                                std::nullopt, std::nullopt);
+        }
+        return;
+    }
+
+    // SM90 (Hopper) / SM100 (Blackwell): native asym kernels consume SFA/SFB in the
+    // transformed compute layout. Launch with gridDim.y == num_groups (constant) — CUDA-graph safe.
+    if (arch_major == 9 or arch_major == 10) {
+        if (not recipe.has_value())
+            recipe = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
+        const auto& sfa = layout::transform_sf_into_required_layout(a.second, m, k, recipe.value(), num_groups, true, disable_ue8m0_cast);
+        const auto& sfb = layout::transform_sf_into_required_layout(b.second, n, k, recipe.value(), num_groups, false, disable_ue8m0_cast);
+        if (arch_major == 9)
+            sm90_m_grouped_fp8_asym_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m, expected_m,
+                                                     num_groups, m, n, k, major_a, major_b, compiled_dims);
+        else
+            sm100_m_grouped_fp8_asym_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m, expected_m,
+                                                      num_groups, m, n, k, major_a, major_b, compiled_dims);
+        return;
+    }
+
+    DG_HOST_UNREACHABLE("FP8 masked asym GEMM requires SM89, SM90, or SM100 "
+                        "(SM80/SM86 lack FP8 tensor cores)");
 }
 
 static void m_grouped_fp4_asym_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -344,9 +366,8 @@ static void m_grouped_fp4_asym_gemm_nt_masked(const std::pair<torch::Tensor, tor
 static void m_grouped_bf16_asym_gemm_nt_contiguous(const torch::Tensor& a, const torch::Tensor& b,
                                               const torch::Tensor& d,
                                               const torch::Tensor& offsets, const torch::Tensor& experts,
-                                              const torch::Tensor& list_size_t,
+                                              const int& list_size,
                                               const std::string& compiled_dims) {
-    check_list_size_tensor(list_size_t);
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto& major_a = get_major_type_ab(a);
     const auto& major_b = get_major_type_ab(b);
@@ -376,20 +397,20 @@ static void m_grouped_bf16_asym_gemm_nt_contiguous(const torch::Tensor& a, const
 
     // Grid Y = num_groups; sentinel blocks early-exit in-kernel.
     const auto& arch_major = device_runtime->get_arch_major();
+    if (arch_major == 9) {
+        sm90_m_grouped_bf16_asym_gemm_contiguous(a, b, d,
+                                                 offsets, experts, /*grid_y=*/num_groups,
+                                                 num_groups, m, n, k, major_a, major_b, compiled_dims);
+        return;
+    }
     if (arch_major == 10) {
         sm100_m_grouped_bf16_asym_gemm_contiguous(a, b, d,
                                                 offsets, experts, /*grid_y=*/num_groups,
                                                 num_groups, m, n, k, major_a, major_b, compiled_dims);
         return;
     }
-    // SM90 (Hopper/H20): the contiguous BF16 layout is only reached via DeepEP-normal
-    // dispatch. The native SM90 BF16 asym kernel (sm90_bf16_asym_gemm.cuh) is not yet
-    // numerically correct, and the contiguous offset layout is not compatible with the
-    // SM80-style kernel used by the masked path, so this combination is unsupported for
-    // now. Fail loudly rather than silently produce wrong results.
     DG_HOST_UNREACHABLE("BF16 contiguous asym GEMM is not supported on this architecture "
-                        "(only SM100 has a verified kernel; the standard serving path uses "
-                        "the masked dispatcher, which is supported on SM90)");
+                        "(supported: SM90/H20, SM100)");
 }
 
 static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const torch::Tensor& b,
@@ -426,12 +447,16 @@ static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const tor
         return;
 
     const auto& [arch_major, arch_minor] = device_runtime->get_arch_pair();
-    // Ada (SM89) and Hopper (SM90/H20) both use the arch-aware SM80-style grouped
-    // MoE kernel (native SM90 WGMMA asym kernel exists in sm90_bf16_asym_gemm.cuh
-    // but is not yet numerically correct). It flattens the padded [G, M_max, K]
-    // masked layout and skips padding rows in-kernel, all via GPU tensor ops so it
-    // is CUDA-graph capturable.
-    if (arch_major == 9 or (arch_major == 8 and arch_minor == 9)) {
+    // Hopper (SM90/H20): native WGMMA asym kernel (sm90_bf16_asym_gemm.cuh).
+    if (arch_major == 9) {
+        sm90_m_grouped_bf16_asym_gemm_masked(a, b, d, masked_m, expected_m,
+                                             num_groups, m, n, k, major_a, major_b, compiled_dims);
+        return;
+    }
+    // Ada (SM89): arch-aware SM80-style grouped MoE kernel. It flattens the padded
+    // [G, M_max, K] masked layout and skips padding rows in-kernel, all via GPU tensor
+    // ops so it is CUDA-graph capturable.
+    if (arch_major == 8 and arch_minor == 9) {
         sm89_m_grouped_bf16_moe_gemm_masked(
             a,
             b,
@@ -527,140 +552,6 @@ static void m_grouped_moe_gemm_nt_contiguous(
         element_type_str);
 }
 
-// Validate block-scale tensors shared by the contiguous and masked SM89 APIs.
-// rows: total_tokens (contiguous) or num_groups * M_max (masked).
-static void check_sm89_block_scales(
-    const std::optional<torch::Tensor>& scale_a_block,
-    const std::optional<torch::Tensor>& scale_b_block,
-    const std::optional<torch::Tensor>& scale_a_tensor,
-    const std::optional<torch::Tensor>& scale_b_tensor,
-    int64_t rows, int64_t num_experts, int64_t N, int64_t K)
-{
-    DG_HOST_ASSERT(scale_a_block.has_value() == scale_b_block.has_value());
-    if (!scale_a_block.has_value())
-        return;
-    DG_HOST_ASSERT(!scale_a_tensor.has_value() && !scale_b_tensor.has_value());
-
-    const int64_t kg = (K + 127) / 128;
-    const int64_t ng = (N + 127) / 128;
-    const auto& sa = *scale_a_block;
-    const auto& sb = *scale_b_block;
-    DG_HOST_ASSERT(sa.is_cuda() && sa.is_contiguous());
-    DG_HOST_ASSERT(sa.is_cuda() && sa.is_contiguous());
-    DG_HOST_ASSERT((sb.is_cuda() || (sb.device().is_cpu() && sb.is_pinned())) && sb.is_contiguous());
-    DG_HOST_ASSERT(sb.scalar_type() == torch::kFloat32);
-    DG_HOST_ASSERT(sa.numel() == rows * kg);
-    DG_HOST_ASSERT(sb.numel() == num_experts * ng * kg);
-}
-
-static void m_grouped_fp8_asym_gemm_sm89(
-    const torch::Tensor& a,        // [total_tokens, K]   float8_e4m3fn  (HBM)
-    const torch::Tensor& b,        // [num_experts, N, K] float8_e4m3fn  (CPU pinned or HBM)
-    const torch::Tensor& d,        // [total_tokens, N]   bfloat16       (HBM)
-    const torch::Tensor& offsets,  // [list_size] int32 cumulative end indices
-    const torch::Tensor& experts,  // [list_size] int32 expert IDs
-    const int&           list_size,
-    const float&         scale_a,
-    const float&         scale_b,
-    const std::optional<torch::Tensor>& scale_a_tensor = std::nullopt,
-    const std::optional<torch::Tensor>& scale_b_tensor = std::nullopt,
-    const std::optional<torch::Tensor>& scale_a_block = std::nullopt,  // [total_tokens, ceil(K/128)] f32
-    const std::optional<torch::Tensor>& scale_b_block = std::nullopt)  // [num_experts, ceil(N/128), ceil(K/128)] f32
-{
-    DG_HOST_ASSERT(a.dim() == 2 && b.dim() == 3 && d.dim() == 2);
-
-    const int64_t total_tokens = a.size(0);
-    const int64_t K            = a.size(1);
-    const int64_t num_experts  = b.size(0);
-    const int64_t N            = b.size(1);
-    DG_HOST_ASSERT(b.size(2) == K);
-    DG_HOST_ASSERT(d.size(0) == total_tokens && d.size(1) == N);
-
-    DG_HOST_ASSERT(a.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(b.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
-
-    // a and d must be on CUDA; b may be on CPU pinned memory (PCIe) or CUDA
-    DG_HOST_ASSERT(a.is_cuda() && d.is_cuda());
-    DG_HOST_ASSERT(a.is_contiguous() && b.is_contiguous() && d.is_contiguous());
-
-    DG_HOST_ASSERT(offsets.is_cuda() && experts.is_cuda());
-    DG_HOST_ASSERT(offsets.is_contiguous() && experts.is_contiguous());
-    DG_HOST_ASSERT(offsets.scalar_type() == torch::kInt32);
-    DG_HOST_ASSERT(experts.scalar_type() == torch::kInt32);
-    DG_HOST_ASSERT(offsets.numel() >= list_size && experts.numel() >= list_size);
-
-    check_sm89_block_scales(scale_a_block, scale_b_block,
-                            scale_a_tensor, scale_b_tensor,
-                            total_tokens, num_experts, N, K);
-
-    if (total_tokens == 0 || N == 0 || K == 0) return;
-
-    DG_HOST_ASSERT(K % 32 == 0 && K >= 32);   // SM89 FP8 MMA K-atom = 32
-    DG_HOST_ASSERT(N % 32 == 0);
-
-    sm89_m_grouped_fp8_moe_gemm_contiguous(
-        a, b, d, experts, offsets,
-        N, K,
-        static_cast<int32_t>(num_experts),
-        static_cast<int32_t>(list_size),
-        scale_a, scale_b,
-        scale_a_tensor, scale_b_tensor,
-        scale_a_block, scale_b_block);
-}
-
-static void m_grouped_fp8_asym_gemm_sm89_masked(
-    const torch::Tensor& a,        // [num_groups, M_max, K]  float8_e4m3fn
-    const torch::Tensor& b,        // [num_groups, N, K]      float8_e4m3fn
-    const torch::Tensor& d,        // [num_groups, M_max, N]  bfloat16
-    const torch::Tensor& masked_m, // [num_groups]            int32
-    const int&           expected_m,
-    const float&         scale_a,
-    const float&         scale_b,
-    const std::optional<torch::Tensor>& scale_a_tensor = std::nullopt,
-    const std::optional<torch::Tensor>& scale_b_tensor = std::nullopt,
-    const std::optional<torch::Tensor>& scale_a_block = std::nullopt,  // [num_groups, M_max, ceil(K/128)] f32
-    const std::optional<torch::Tensor>& scale_b_block = std::nullopt)  // [num_groups, ceil(N/128), ceil(K/128)] f32
-{
-    DG_HOST_ASSERT(a.dim() == 3 && b.dim() == 3 && d.dim() == 3);
-
-    const int64_t num_groups = a.size(0);
-    const int64_t M_max      = a.size(1);
-    const int64_t K          = a.size(2);
-    const int64_t N          = b.size(1);
-    DG_HOST_ASSERT(b.size(0) == num_groups && b.size(2) == K);
-    DG_HOST_ASSERT(d.size(0) == num_groups && d.size(1) == M_max && d.size(2) == N);
-
-    DG_HOST_ASSERT(a.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(b.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
-
-    // a and d must be on CUDA; b may be on CPU pinned memory (PCIe) or CUDA
-    DG_HOST_ASSERT(a.is_cuda() && d.is_cuda());
-    DG_HOST_ASSERT(a.is_contiguous() && b.is_contiguous() && d.is_contiguous());
-
-    DG_HOST_ASSERT(masked_m.is_cuda() && masked_m.is_contiguous());
-    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt32);
-    DG_HOST_ASSERT(masked_m.numel() == num_groups);
-
-    check_sm89_block_scales(scale_a_block, scale_b_block,
-                            scale_a_tensor, scale_b_tensor,
-                            num_groups * M_max, num_groups, N, K);
-
-    if (M_max == 0 || N == 0 || K == 0 || expected_m == 0) return;
-
-    DG_HOST_ASSERT(K % 32 == 0 && K >= 32);
-    DG_HOST_ASSERT(N % 32 == 0);
-
-    sm89_m_grouped_fp8_moe_gemm_masked(
-        a, b, d, masked_m,
-        M_max, N, K,
-        static_cast<int32_t>(num_groups),
-        scale_a, scale_b,
-        scale_a_tensor, scale_b_tensor,
-        scale_a_block, scale_b_block);
-}
-
 static void register_apis(pybind11::module_& m) {
 
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
@@ -668,7 +559,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("m_grouped_fp8_asym_gemm_nt_contiguous",
         static_cast<void(*)(const std::pair<torch::Tensor, torch::Tensor>&,
                             const std::pair<torch::Tensor, torch::Tensor>&,
-                            const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+                            const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const int&,
                             std::optional<std::tuple<int, int, int>>, const std::string&, const bool&)>(
             &m_grouped_fp8_asym_gemm_nt_contiguous),
         py::arg("a"), py::arg("b"), py::arg("d"),
@@ -713,7 +604,7 @@ static void register_apis(pybind11::module_& m) {
     // BF16 GEMMs
     m.def("m_grouped_bf16_asym_gemm_nt_contiguous",
           static_cast<void(*)(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
-                              const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const std::string&)>(
+                              const torch::Tensor&, const torch::Tensor&, const int&, const std::string&)>(
               &m_grouped_bf16_asym_gemm_nt_contiguous),
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
@@ -727,44 +618,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk");
 #endif
 
-    // SM89 FP8 MoE GEMM — masked variant (padded [G, M_max, K] layout)
-    m.def("m_grouped_fp8_asym_gemm_sm89_masked",
-          static_cast<void(*)(const torch::Tensor&, const torch::Tensor&,
-                              const torch::Tensor&, const torch::Tensor&,
-                              const int&, const float&, const float&,
-                              const std::optional<torch::Tensor>&,
-                              const std::optional<torch::Tensor>&,
-                              const std::optional<torch::Tensor>&,
-                              const std::optional<torch::Tensor>&)>(
-              &m_grouped_fp8_asym_gemm_sm89_masked),
-          py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("masked_m"), py::arg("expected_m"),
-          py::arg("scale_a") = 1.0f,
-          py::arg("scale_b") = 1.0f,
-          py::arg("scale_a_tensor") = py::none(),
-          py::arg("scale_b_tensor") = py::none(),
-          py::arg("scale_a_block") = py::none(),
-          py::arg("scale_b_block") = py::none());
-
-    // SM89 FP8 MoE GEMM (native FP8 MMA, K-outer M-inner, W may be CPU-pinned)
-    m.def("m_grouped_fp8_asym_gemm_sm89",
-          static_cast<void(*)(const torch::Tensor&, const torch::Tensor&,
-                              const torch::Tensor&, const torch::Tensor&,
-                              const torch::Tensor&, const int&,
-                              const float&, const float&,
-                              const std::optional<torch::Tensor>&,
-                              const std::optional<torch::Tensor>&,
-                              const std::optional<torch::Tensor>&,
-                              const std::optional<torch::Tensor>&)>(
-              &m_grouped_fp8_asym_gemm_sm89),
-          py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
-          py::arg("scale_a") = 1.0f,
-          py::arg("scale_b") = 1.0f,
-          py::arg("scale_a_tensor") = py::none(),
-          py::arg("scale_b_tensor") = py::none(),
-          py::arg("scale_a_block") = py::none(),
-          py::arg("scale_b_block") = py::none());
+    // SM89 FP8 MoE GEMM helpers are now internal-only (dispatched from the
+    // architecture-agnostic m_grouped_fp8_asym_gemm_nt_* APIs); not exported to Python.
 
     // SM80 MoE GEMM (FP16 + BF16, no arch guard needed: uses >= SM80 primitives)
     m.def("m_grouped_moe_gemm_nt_contiguous",
