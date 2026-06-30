@@ -57,8 +57,16 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
         return get_mn_major_tma_aligned_packed_ue8m0_tensor(sf);
     }
 
-    // (FP32, 128, 128/256) on SM90: no need to transform, check SFB requirements
-    if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and (gran_k == 128 or gran_k == 256) and (arch_major == 9 or disable_ue8m0_cast))
+    // (FP32, 128, 128/256) on SM90: the native asym 1d1d kernel consumes per-column
+    // (gran_mn == 1) MN-major scales, so broadcast the per-128-block weight scale across
+    // its 128 columns, then convert to TMA-aligned MN-major (no UE8M0 packing on SM90).
+    if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and (gran_k == 128 or gran_k == 256) and arch_major == 9) {
+        const auto& broadcasted = sf.index_select(-2, torch::arange(mn, at::TensorOptions().device(sf.device())).floor_divide_(128));
+        return get_mn_major_tma_aligned_tensor(broadcasted);
+    }
+
+    // (FP32, 128, 128/256) on SM100 with UE8M0 disabled: no need to transform, check SFB requirements
+    if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and (gran_k == 128 or gran_k == 256) and disable_ue8m0_cast)
         return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, false, true, torch::kFloat);
 
     // (FP32, 128, 128/256) on SM100: broadcast to (FP32, 1, gran_k), then pack to UE8M0

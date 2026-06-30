@@ -404,7 +404,7 @@ sm90_bf16_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                 const auto m_idx_out = (kGemmType == GemmType::MGroupedMasked)
                     ? (scheduler.current_group_idx * shape_m + (block_m_iter - scheduler.m_start) * BLOCK_M)
                     : (BLOCK_M * block_m_iter);
-                const auto n_idx_out = scheduler.n_idx;
+                const auto n_idx_out = blockIdx.x * BLOCK_N;
 
                 DG_STATIC_ASSERT(kNumWGMMAStoreThreads >= BLOCK_N / TMA_D_BLOCK_N, "Too many TMA blocks");
                 if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {
