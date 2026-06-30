@@ -7,3 +7,6 @@ build-*/
 compile_commands.json
 .cache/
 .vscode/
+build_off/
+build_off/
+build_on/
