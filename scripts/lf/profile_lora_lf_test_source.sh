@@ -37,6 +37,7 @@ declare -A M=(
   [llama4-scout]="meta-llama/Llama-4-Scout-17B-16E"
   # dense
   [q3-32b]="Qwen/Qwen3-32B"
+  [q2.5-32b]="Qwen/Qwen2.5-32B-Instruct"
   [q2.5-72b]="Qwen/Qwen2.5-72B-Instruct"
   [llama3.3-70b]="meta-llama/Llama-3.3-70B-Instruct"
 )
@@ -64,84 +65,24 @@ if [[ "${_RUNS_ENV_SET}" == "true" ]]; then
     [[ -n "${_run}" ]] && RUNS+=("${_run}")
   done <<< "${_runs_env_lines}"
 else
-  # RUNS=(
-  #   "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-  #   "q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
-  #   "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  #   "q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
-  #   "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-  #   "q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-
-  #   "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-  #   "llama4-scout|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
-  #   "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  #   "llama4-scout|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
-  #   "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-  #   "llama4-scout|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-
-  #   "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-  #   "q3-32b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
-  #   "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  #   "q3-32b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
-  #   "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-  #   "q3-32b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-
-  #   "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-  #   "q2.5-72b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
-  #   "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  #   "q2.5-72b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
-  #   "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-  #   "q2.5-72b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-
-  #   "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-  #   "llama3.3-70b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 2048|8|1 ; none|true|true|false|true|true"
-  #   "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  #   "llama3.3-70b|1; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true"
-  #   "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-  #   "llama3.3-70b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 8192|8|1 ; none|true|true|false|true|true"
-  # )
   RUNS=(
-    # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # <90k
-    # "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # <55k
-    # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # <50k
-    # "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # <10k
-    # "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # <45k
-    "q3-235b-a22b|1 ; superoffload_mem_panvme|unsloth|ligerloss1 ; 1000|8|1 ; none|false|false|false|false|false"
+    # "q3-235b-a22b|1 ; superoffload_mem_panvme|unsloth|ligerloss1 ; 1000|8|1 ; none|false|false|false|false|false"
+    # "q3-30b-a3b|1 ; zero3_offload_mem_panvme|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
+    # "q3-32b|1 ; zero3_offload_mem_panvme|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false"
 
-    # "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
-    # "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x60k
-    # "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # x60k
-    # "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false"
-    # "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false"
+    "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false"
+    # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
+    # "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # x55k
+    # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x50k
+    # "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # x10k
+    # "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # x45k
 
-    # "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # x90k
-    # "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 250000|8|1 ; none|false|false|false|false|false" # x60k
-    # "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # x60k
-    # "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false"
-    # "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false"
+    # "q3-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # x25k
+    # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x50k
+    # "llama3.3-70b|1 ; superoffload_mem|recomp|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false" # x15k
+    # "llama4-scout|1 ; superoffload_mem|recomp|ligerloss1 ; 8000|8|1 ; none|false|false|false|false|false" # x9k
+    # "q2.5-72b|1 ; superoffload_mem|recomp|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false" # x15k
   )
-
-  # RUNS=(
-  #   "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-  #   "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  #   "q3-30b-a3b|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-
-  #   "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-  #   "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  #   "llama4-scout|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-
-  #   "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-  #   "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  #   "q3-32b|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-
-  #   "q2.5-72b|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-  #   "q2.5-72b|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  #   "q2.5-72b|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-
-  #   "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false"
-  #   "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-  #   "llama3.3-70b|1 ; superoffload_mem|recompute|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-  # )
 fi
 
 # Iterate and parse the rows into scheduler metadata. Each RUNS item remains one scheduled run.
@@ -206,6 +147,10 @@ SEED=${SEED:-42}
 
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
 ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD=${ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD:-0}
+ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD=${ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD:-0}
+# Diagnostic only. Keep at 0 for final comparisons; nonzero values move some
+# outer Unsloth checkpoint roots from CPU RAM back to HBM.
+UNSLOTH_GC_OUTER_HBM_EVERY_N=${UNSLOTH_GC_OUTER_HBM_EVERY_N:-0}
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
 
 # Kernel / SwiGLU-backward toggles (1=on, 0=off)
@@ -1637,11 +1582,15 @@ job_root_path() {
   local grad_offload="${8:-false}"
   local weight_offload="${9:-false}"
   local grad_offload_suffix=""
+  local outer_hbm_suffix=""
   local path_label="${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__${layergc_label}__${sdparecomp_label}"
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
     grad_offload_suffix="__gradoff${grad_offload}__weightoff${weight_offload}"
   fi
-  path_label="${path_label}__${expact_lora_a_fwd_label}__${actrecomp_label}__${xunpack_label}__${liger_loss}${grad_offload_suffix}"
+  if [[ "${UNSLOTH_GC_OUTER_HBM_EVERY_N:-0}" != "0" ]]; then
+    outer_hbm_suffix="__outerhbm${UNSLOTH_GC_OUTER_HBM_EVERY_N}"
+  fi
+  path_label="${path_label}__${expact_lora_a_fwd_label}__${actrecomp_label}__${xunpack_label}__${liger_loss}${grad_offload_suffix}${outer_hbm_suffix}"
   printf '%s/%s\n' "${config_root}" "$(safe_label "${path_label}")"
 }
 
@@ -2845,8 +2794,12 @@ run_job() {
     ASYM_OFFLOAD_ACT_RECOMPUTE=0; actrecomp_label="$(actrecomp_tag 0)"
     ASYM_OFFLOAD_X_UNPACKED=0; xunpack_label="$(xunpack_tag 0)"
     ASYMM_LAYER_ACT_OFFLOAD=false; layeract_label="$(layeract_tag false)"
-    ASYMM_LAYER_GC=false; layergc_label="$(layergc_tag false)"
-    ASYMM_ATTN_SDPA_RECOMPUTE=false; sdparecomp_label="$(sdparecomp_tag false)"
+    if [[ "$(bool_value "${ASYMM_RECOMP_OFF_ALLOW_LAYER_GC:-false}")" != "true" ]]; then
+      ASYMM_LAYER_GC=false; layergc_label="$(layergc_tag false)"
+    fi
+    if [[ "$(bool_value "${ASYMM_RECOMP_OFF_ALLOW_SDPA_RECOMPUTE:-false}")" != "true" ]]; then
+      ASYMM_ATTN_SDPA_RECOMPUTE=false; sdparecomp_label="$(sdparecomp_tag false)"
+    fi
     ASYMM_EXPERT_SILU_BWD_GPU=0
     ASYMM_MLP_RECOMPUTE_CHUNK=0
     dense_mlp_surgical=0
@@ -3076,9 +3029,11 @@ run_job() {
     NUMACTL_MODE="${NUMACTL_MODE:-membind}"
     ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE:-0}"
     ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED:-0}"
-    ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU}"
-    ASYMM_MLP_RECOMPUTE_CHUNK="${ASYMM_MLP_RECOMPUTE_CHUNK}"
-    DG_BF16_CPU_LEFT_COMPACT_GRID="${DG_BF16_CPU_LEFT_COMPACT_GRID:-0}"
+	    ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU}"
+	    ASYMM_MLP_RECOMPUTE_CHUNK="${ASYMM_MLP_RECOMPUTE_CHUNK}"
+	    ASYMM_DENSE_MLP_FINEGRAINED_CPU_ACT="${ASYMM_DENSE_MLP_FINEGRAINED_CPU_ACT:-0}"
+	    ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD="${ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD:-0}"
+	    DG_BF16_CPU_LEFT_COMPACT_GRID="${DG_BF16_CPU_LEFT_COMPACT_GRID:-0}"
     ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE="${ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE:-0}"
     LF_DIR="${LF_DIR}"
     ASYM_DIR="${ASYM_DIR}"
@@ -3120,12 +3075,14 @@ run_job() {
     GRADIENT_CHECKPOINTING="${gradient_checkpointing}"
     USE_UNSLOTH_GC="${use_unsloth_gc}"
     UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU="${unsloth_recompute_save_on_cpu}"
+    UNSLOTH_GC_OUTER_HBM_EVERY_N="${UNSLOTH_GC_OUTER_HBM_EVERY_N}"
     ASYM_PRECISION="${PRECISION}"
     ASYM_OFFLOAD_MODULES="${ASYM_OFFLOAD_MODULES}"
     ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}"
     ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
     ASYMM_DENSE_MLP_SURGICAL_OFFLOAD="${dense_mlp_surgical}"
     ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD="${dense_mlp_finegrained}"
+    ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD="${ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD:-0}"
     ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
     ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
     ASYMM_LAYER_GC="${ASYMM_LAYER_GC}"
@@ -3168,14 +3125,17 @@ run_job() {
     ASYM_GEMM_LF_CONFIG_RECOMP_OFF_STAGE="${recomp_off_stage}"
     ASYM_GEMM_LF_CONFIG_USE_UNSLOTH_GC="${use_unsloth_gc}"
     ASYM_GEMM_LF_CONFIG_UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU="${unsloth_recompute_save_on_cpu}"
+    ASYM_GEMM_LF_CONFIG_UNSLOTH_GC_OUTER_HBM_EVERY_N="${UNSLOTH_GC_OUTER_HBM_EVERY_N}"
     ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU}"
     ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD="${grad_offload}"
     ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${weight_offload}"
     ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
-    ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_SURGICAL_OFFLOAD="${dense_mlp_surgical}"
-    ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD="${dense_mlp_finegrained}"
-    ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
+	    ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_SURGICAL_OFFLOAD="${dense_mlp_surgical}"
+	    ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD="${dense_mlp_finegrained}"
+	    ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FINEGRAINED_CPU_ACT="${ASYMM_DENSE_MLP_FINEGRAINED_CPU_ACT:-0}"
+	    ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD="${ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD:-0}"
+	    ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_GC="${ASYMM_LAYER_GC}"
     ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}"

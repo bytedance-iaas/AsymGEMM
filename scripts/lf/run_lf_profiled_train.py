@@ -631,12 +631,23 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         else _safe_float(_option_value(args, "--max_grad_norm")),
         "activation_recompute": os.environ.get("ASYM_GEMM_LF_CONFIG_ACTIVATION_RECOMPUTE", "false").lower()
         in {"1", "true", "yes", "on"},
+        "unsloth_gc_outer_hbm_every_n": _safe_int(
+            os.environ.get(
+                "ASYM_GEMM_LF_CONFIG_UNSLOTH_GC_OUTER_HBM_EVERY_N",
+                os.environ.get("UNSLOTH_GC_OUTER_HBM_EVERY_N", "0"),
+            )
+        )
+        or 0,
         "asymm_expert_act_offload": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD", "false"),
         "asymm_expert_act_offload_lora_a_fwd": os.environ.get(
             "ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD",
             os.environ.get("ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD", "cpu"),
         ),
         "asymm_attn_act_offload": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD", "false"),
+        "asymm_dense_mlp_finegrained_nograd_cpu_offload": os.environ.get(
+            "ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD",
+            os.environ.get("ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD", "0"),
+        ),
         "asymm_layer_act_offload": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD", "false"),
         "asymm_layer_gc": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_GC", "false"),
         "attention_gc_enabled": attention_gc_enabled,
