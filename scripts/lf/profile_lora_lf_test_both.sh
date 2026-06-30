@@ -103,8 +103,9 @@ else
   RUNS=(
     # "q3-235b-a22b|1 ; superoffload_mem_panvme|unsloth|ligerloss1 ; 1000|8|1 ; none|false|false|false|false|false"
     # "q3-30b-a3b|1 ; zero3_offload_mem_panvme|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
-    "q3-32b|1 ; zero3_offload_mem_panvme|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false"
+    # "q3-32b|1 ; zero3_offload_mem_panvme|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false"
 
+    "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false"
     # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
     # "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # x55k
     # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x50k
@@ -188,18 +189,26 @@ WARMUP_STEPS=${WARMUP_STEPS:-1}
 # MAX_STEPS=${MAX_STEPS:-1}
 # WARMUP_STEPS=${WARMUP_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
-# LORA_PARAMS is the only LoRA knob: sweep tuples, each "dropout|rank|alpha[|target]" (target optional, default 'all').
+# LORA_PARAMS is the canonical LoRA knob: sweep tuples, each "dropout|rank|alpha[|target]".
+# Older LORA_DROPOUT/LORA_RANK/LORA_ALPHA knobs still seed the default tuple.
 # rank moves memory/throughput; alpha is a scalar (no profiling effect); keep target=all for MoE expert-LoRA.
 # Multi-module target uses '+' (commas separate tuples), e.g. "0.00|64|128|q_proj+k_proj" -> q_proj,k_proj.
-LORA_PARAMS=${LORA_PARAMS:-"0.00|64|128|all"}
+_LORA_PARAMS_ENV_SET=false
+[[ -n "${LORA_PARAMS+x}" ]] && _LORA_PARAMS_ENV_SET=true
+LORA_DROPOUT=${LORA_DROPOUT:-0.00}
+LORA_RANK=${LORA_RANK:-64}
+LORA_ALPHA=${LORA_ALPHA:-16}
+LORA_PARAMS=${LORA_PARAMS:-"${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|all"}
 # LORA_PARAMS=${LORA_PARAMS:-"0.00|64|128|all,0.00|16|32|all"}
 SEED=${SEED:-42}
 
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
+ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD=${ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD:-0}
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
 
 # Kernel / SwiGLU-backward toggles (1=on, 0=off)
 ASYMM_EXPERT_SILU_BWD_GPU=${ASYMM_EXPERT_SILU_BWD_GPU:-1}
+ASYMM_MLP_RECOMPUTE_CHUNK=${ASYMM_MLP_RECOMPUTE_CHUNK:-0}
 DG_BF16_CPU_LEFT_COMPACT_GRID=${DG_BF16_CPU_LEFT_COMPACT_GRID:-0}
 ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE=${ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE:-0}
 
@@ -557,19 +566,40 @@ xunpack_tag() {
   esac
 }
 
+is_recomp_off_recompute() {
+  case "${1,,}" in
+    recomp-off|recomp-off-base|recomp-off-attn|recomp-off-dense|recomp-off-full|recomp-off-dense-fg|recomp-off-full-fg) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+recomp_off_stage_label() {
+  case "${1,,}" in
+    recomp-off|recomp-off-full) printf 'full\n' ;;
+    recomp-off-base) printf 'base\n' ;;
+    recomp-off-attn) printf 'attn\n' ;;
+    recomp-off-dense) printf 'dense\n' ;;
+    recomp-off-dense-fg) printf 'dense-fg\n' ;;
+    recomp-off-full-fg) printf 'full-fg\n' ;;
+    *) return 1 ;;
+  esac
+}
+
 parse_exp_act_policy_tuple() {
   local raw="$1"
   local policy_part expact_part attnact_part layeract_part layergc_part sdparecomp_part policy expact attnact layeract layergc sdparecomp
   local -a fields
   IFS='|' read -r -a fields <<< "${raw}"
-  (( ${#fields[@]} == 4 || ${#fields[@]} == 5 || ${#fields[@]} == 6 )) || die "RUNS policy item must be policy|expert_act|attn_act|layer_act[|layer_gc[|sdpa_recompute]], got '${raw}'"
+  (( ${#fields[@]} == 4 || ${#fields[@]} == 5 || ${#fields[@]} == 6 )) ||
+    die "ASYMM_EXP_ACT_POLICIES item must be policy|expert_act|attn_act|layer_act[|layer_gc[|sdpa_recompute]], got '${raw}'"
   policy_part="${fields[0]}"
   expact_part="${fields[1]}"
   attnact_part="${fields[2]}"
   layeract_part="${fields[3]}"
   layergc_part="${fields[4]:-false}"
   sdparecomp_part="${fields[5]:-false}"
-  [[ -n "${policy_part}" && -n "${expact_part}" && -n "${attnact_part}" && -n "${layeract_part}" && -n "${layergc_part}" && -n "${sdparecomp_part}" ]] || die "empty policy, activation-offload, layer-GC, or sdpa-recompute value in RUNS policy item '${raw}'"
+  [[ -n "${policy_part}" && -n "${expact_part}" && -n "${attnact_part}" && -n "${layeract_part}" && -n "${layergc_part}" && -n "${sdparecomp_part}" ]] ||
+    die "empty policy, activation-offload, layer-GC, or sdpa-recompute value in ASYMM_EXP_ACT_POLICIES item '${raw}'"
   policy="$(normalize_expert_policy "${policy_part}")"
   expact="$(bool_value "${expact_part}")"
   attnact="$(bool_value "${attnact_part}")"
@@ -701,9 +731,9 @@ backend_gpu_count() {
   local model_gpu_count="$2"
   case "${backend}" in
     asym|asym_torch|asym_cpuadamwtorch|asym_cpuadamwds) printf '1\n' ;;
-    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam|superoffload|superoffload_mem|superoffload_mem_opnvme|superoffload_mem_panvme) printf '%s\n' "${model_gpu_count}" ;;
+    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_mem_nocpuadamw|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam|superoffload|superoffload_mem|superoffload_mem_nocpuadamw|superoffload_mem_opnvme|superoffload_mem_panvme) printf '%s\n' "${model_gpu_count}" ;;
     kt_torchbf16|kt_armbf16) printf '1\n' ;;
-    *) die "internal backend label must be torch, asym, asym_torch, asym_cpuadamwtorch, asym_cpuadamwds, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_offload_opnvme, zero3_offload_panvme, zero3_offload_mem_opnvme, zero3_offload_mem_panvme, zero3_cpuadam, superoffload, superoffload_mem, superoffload_mem_opnvme, superoffload_mem_panvme, kt_torchbf16, or kt_armbf16, got '${backend}'" ;;
+    *) die "internal backend label must be torch, asym, asym_torch, asym_cpuadamwtorch, asym_cpuadamwds, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_offload_mem_nocpuadamw, zero3_offload_opnvme, zero3_offload_panvme, zero3_offload_mem_opnvme, zero3_offload_mem_panvme, zero3_cpuadam, superoffload, superoffload_mem, superoffload_mem_nocpuadamw, superoffload_mem_opnvme, superoffload_mem_panvme, kt_torchbf16, or kt_armbf16, got '${backend}'" ;;
   esac
 }
 
@@ -713,6 +743,7 @@ zero_deepspeed_config() {
     zero3) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_config.json" ;;
     zero3_offload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json" ;;
     zero3_offload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_config.json" ;;
+    zero3_offload_mem_nocpuadamw) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_nocpuadamw_config.json" ;;
     zero3_offload_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_opnvme_config.json" ;;
     zero3_offload_panvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_panvme_config.json" ;;
     zero3_offload_mem_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_opnvme_config.json" ;;
@@ -720,6 +751,7 @@ zero_deepspeed_config() {
     zero3_cpuadam) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_cpuadam_config.json" ;;
     superoffload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_config.json" ;;
     superoffload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_config.json" ;;
+    superoffload_mem_nocpuadamw) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_nocpuadamw_config.json" ;;
     superoffload_mem_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_opnvme_config.json" ;;
     superoffload_mem_panvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_panvme_config.json" ;;
     *) return 1 ;;
@@ -728,14 +760,14 @@ zero_deepspeed_config() {
 
 is_zero_backend() {
   case "${1}" in
-    zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam|superoffload|superoffload_mem|superoffload_mem_opnvme|superoffload_mem_panvme) return 0 ;;
+    zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_mem_nocpuadamw|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam|superoffload|superoffload_mem|superoffload_mem_nocpuadamw|superoffload_mem_opnvme|superoffload_mem_panvme) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 is_policy_independent_backend() {
   case "${1}" in
-    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam|superoffload|superoffload_mem|superoffload_mem_opnvme|superoffload_mem_panvme|kt_*) return 0 ;;
+    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_mem_nocpuadamw|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam|superoffload|superoffload_mem|superoffload_mem_nocpuadamw|superoffload_mem_opnvme|superoffload_mem_panvme|kt_*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -764,11 +796,19 @@ canonicalize_policy_axis_for_inert_run() {
 
 recompute_label() {
   case "${1,,}" in
-    norecomp|recomp|unsloth) printf '%s\n' "${1,,}" ;;
+    norecomp|recomp|unsloth|unsloth-off) printf '%s\n' "${1,,}" ;;
     unslothgc|unsloth_gc|unsloth-gc) printf 'unsloth\n' ;;
+    unslothoff|unsloth_off|unsloth-savecpu|unsloth_savecpu|unsloth-recomp-off|unsloth_recomp_off) printf 'unsloth-off\n' ;;
     norecompute|no_recompute|no-recompute) printf 'norecomp\n' ;;
     recompute) printf 'recomp\n' ;;
-    *) die "expected recompute mode norecomp/recomp/unsloth or norecompute/recompute; got '${1}'" ;;
+    recomp-off|recompoff|recomp_off) printf 'recomp-off\n' ;;
+    recomp-off-base|recompoff-base|recomp_off_base) printf 'recomp-off-base\n' ;;
+    recomp-off-attn|recompoff-attn|recomp_off_attn) printf 'recomp-off-attn\n' ;;
+    recomp-off-dense|recompoff-dense|recomp_off_dense) printf 'recomp-off-dense\n' ;;
+    recomp-off-full|recompoff-full|recomp_off_full) printf 'recomp-off-full\n' ;;
+    recomp-off-dense-fg|recompoff-dense-fg|recomp_off_dense_fg) printf 'recomp-off-dense-fg\n' ;;
+    recomp-off-full-fg|recompoff-full-fg|recomp_off_full_fg) printf 'recomp-off-full-fg\n' ;;
+    *) die "expected recompute mode norecomp/recomp/unsloth/unsloth-off/recomp-off[-base|-attn|-dense|-full|-dense-fg|-full-fg] or norecompute/recompute; got '${1}'" ;;
   esac
 }
 
@@ -842,6 +882,7 @@ append_backend_spec() {
     zero3) backend=zero3 ;;
     zero3_offload) backend=zero3_offload ;;
     zero3_offload_mem) backend=zero3_offload_mem ;;
+    zero3_offload_mem_nocpuadamw) backend=zero3_offload_mem_nocpuadamw ;;
     zero3_offload_opnvme) backend=zero3_offload_opnvme ;;
     zero3_offload_panvme) backend=zero3_offload_panvme ;;
     zero3_offload_mem_opnvme) backend=zero3_offload_mem_opnvme ;;
@@ -849,11 +890,12 @@ append_backend_spec() {
     zero3_cpuadam) backend=zero3_cpuadam ;;
     superoffload) backend=superoffload ;;
     superoffload_mem) backend=superoffload_mem ;;
+    superoffload_mem_nocpuadamw) backend=superoffload_mem_nocpuadamw ;;
     superoffload_mem_opnvme) backend=superoffload_mem_opnvme ;;
     superoffload_mem_panvme) backend=superoffload_mem_panvme ;;
     kt_torchbf16) backend=kt_torchbf16 ;;
     kt_armbf16) backend=kt_armbf16 ;;
-    *) die "backend must be torch, asym, asym_torch, asym_cpuadamwtorch, asym_cpuadamwds, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_offload_opnvme, zero3_offload_panvme, zero3_offload_mem_opnvme, zero3_offload_mem_panvme, zero3_cpuadam, superoffload, superoffload_mem, superoffload_mem_opnvme, superoffload_mem_panvme, kt_torchbf16, or kt_armbf16, got '${backend_part}'" ;;
+    *) die "backend must be torch, asym, asym_torch, asym_cpuadamwtorch, asym_cpuadamwds, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_offload_mem_nocpuadamw, zero3_offload_opnvme, zero3_offload_panvme, zero3_offload_mem_opnvme, zero3_offload_mem_panvme, zero3_cpuadam, superoffload, superoffload_mem, superoffload_mem_nocpuadamw, superoffload_mem_opnvme, superoffload_mem_panvme, kt_torchbf16, or kt_armbf16, got '${backend_part}'" ;;
   esac
   liger_loss="$(liger_loss_label "${liger_loss_part}")"
 
@@ -990,6 +1032,12 @@ job_profile_complete() {
   local expected_grad_offload="${14}"
   local require_memory_breakdown="${15}"
   local expected_liger_loss="${16:-}"
+  local expected_unsloth_recompute_save_on_cpu="${17:-}"
+  if [[ -z "${expected_unsloth_recompute_save_on_cpu}" ]]; then
+    if [[ "${expected_recompute}" == "unsloth-off" ]] || is_recomp_off_recompute "${expected_recompute}"; then
+      expected_unsloth_recompute_save_on_cpu=true
+    fi
+  fi
 
   existing_profile_complete \
     "${profile_json}" \
@@ -1006,7 +1054,8 @@ job_profile_complete() {
 	    "${expected_lf_expert_lora_impl}" \
 	    "${expected_expact_lora_a_fwd}" \
 	    "${expected_grad_offload}" \
-	    "${expected_liger_loss}" || return 1
+	    "${expected_liger_loss}" \
+	    "${expected_unsloth_recompute_save_on_cpu}" || return 1
   [[ "${require_memory_breakdown}" != "true" ]] || existing_memory_breakdown_valid "${seq_root}"
 }
 
@@ -1026,6 +1075,7 @@ existing_profile_complete() {
   local expected_expact_lora_a_fwd="${13:-}"
   local expected_grad_offload="${14:-}"
   local expected_liger_loss="${15:-}"
+  local expected_unsloth_recompute_save_on_cpu="${16:-}"
   local current_profile_sync="${PROFILE_SYNC:-}"
   local current_batch="${PER_DEVICE_TRAIN_BATCH_SIZE:-}"
   local current_grad_accum="${GRADIENT_ACCUMULATION_STEPS:-}"
@@ -1037,6 +1087,11 @@ existing_profile_complete() {
   local current_route_rank_limit="${KT_ARM_SFT_MAX_ROUTE_RANK_WORK:-}"
   local current_default_route_rank_limit="${KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK:-}"
   local current_allow_unvalidated_route_rank="${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK:-0}"
+  if [[ -z "${expected_unsloth_recompute_save_on_cpu}" ]]; then
+    if [[ "${expected_recompute}" == "unsloth-off" ]] || is_recomp_off_recompute "${expected_recompute}"; then
+      expected_unsloth_recompute_save_on_cpu=true
+    fi
+  fi
   [[ -f "${profile_json}" ]] || return 1
   "${ENV_PYTHON}" - "${profile_json}" "${expected_backend}" "${expected_seq_len}" "${expected_model_name}" \
     "${expected_lora_target}" "${expected_recompute}" "${current_batch}" "${current_grad_accum}" "${current_lora_rank}" \
@@ -1044,7 +1099,7 @@ existing_profile_complete() {
     "${current_route_rank_limit}" "${current_default_route_rank_limit}" \
     "${current_allow_unvalidated_route_rank}" "${expected_offload_modules}" "${expected_expact}" "${expected_attnact}" "${expected_layeract}" "${expected_layergc}" \
     "${expected_lf_expert_lora_impl}" "${expected_expact_lora_a_fwd}" "${expected_grad_offload}" "${expected_liger_loss}" \
-    "${current_profile_sync}" <<'PY' >/dev/null 2>&1
+    "${expected_unsloth_recompute_save_on_cpu}" "${current_profile_sync}" <<'PY' >/dev/null 2>&1
 import json
 import math
 import sys
@@ -1074,7 +1129,8 @@ expected_lf_expert_lora_impl = sys.argv[22] if len(sys.argv) > 22 else ""
 expected_expact_lora_a_fwd = sys.argv[23] if len(sys.argv) > 23 else ""
 expected_grad_offload = sys.argv[24] if len(sys.argv) > 24 else ""
 expected_liger_loss = sys.argv[25] if len(sys.argv) > 25 else ""
-expected_profile_sync = sys.argv[26] if len(sys.argv) > 26 else ""
+expected_unsloth_recompute_save_on_cpu = sys.argv[26] if len(sys.argv) > 26 else ""
+expected_profile_sync = sys.argv[27] if len(sys.argv) > 27 else ""
 source_profile = profile.get("source_profile", {})
 source_profile = source_profile if isinstance(source_profile, dict) and source_profile else profile
 if profile.get("partial") is True:
@@ -1164,6 +1220,83 @@ def normalize_bool(value):
     if text in {"0", "false", "no", "n", "off"}:
         return "false"
     return ""
+def recomp_off_stage(label):
+    return {
+        "recomp-off": "full",
+        "recomp-off-base": "base",
+        "recomp-off-attn": "attn",
+        "recomp-off-dense": "dense",
+        "recomp-off-full": "full",
+        "recomp-off-dense-fg": "dense-fg",
+        "recomp-off-full-fg": "full-fg",
+    }.get(str(label or "").strip().lower())
+expected_recomp_off_stage = recomp_off_stage(expected_recompute)
+if expected_unsloth_recompute_save_on_cpu:
+    actual_unsloth_off = normalize_bool(config.get("unsloth_gc_recompute_save_on_cpu"))
+    wanted_unsloth_off = normalize_bool(expected_unsloth_recompute_save_on_cpu)
+    if not actual_unsloth_off:
+        raise SystemExit("profile unsloth_gc_recompute_save_on_cpu missing or invalid")
+    if actual_unsloth_off != wanted_unsloth_off:
+        raise SystemExit(
+            "profile unsloth_gc_recompute_save_on_cpu mismatch: "
+            f"expected {wanted_unsloth_off}, got {actual_unsloth_off}"
+        )
+if expected_recomp_off_stage:
+    actual_stage = str(config.get("recomp_off_stage") or "").strip()
+    if actual_stage != expected_recomp_off_stage:
+        raise SystemExit(
+            f"profile recomp_off_stage mismatch: expected {expected_recomp_off_stage}, got {actual_stage or '<missing>'}"
+        )
+    actual_use_unsloth_gc = normalize_bool(config.get("use_unsloth_gc"))
+    if actual_use_unsloth_gc != "true":
+        raise SystemExit(f"profile use_unsloth_gc mismatch for {expected_recompute}: got {actual_use_unsloth_gc or '<missing>'}")
+    actual_recompute = normalize_bool(config.get("activation_recompute"))
+    if actual_recompute != "true":
+        raise SystemExit(
+            f"profile activation_recompute mismatch for {expected_recompute}: got {actual_recompute or '<missing>'}"
+        )
+    actual_silu_gpu = normalize_bool(config.get("asymm_expert_silu_bwd_gpu"))
+    if actual_silu_gpu != "false":
+        raise SystemExit(
+            "profile asymm_expert_silu_bwd_gpu mismatch for recomp-off stage: "
+            f"expected false, got {actual_silu_gpu or '<missing>'}"
+        )
+    expected_dense_surgical = "true" if expected_recomp_off_stage in {"dense", "full"} else "false"
+    expected_dense_finegrained = "true" if expected_recomp_off_stage in {"dense-fg", "full-fg"} else "false"
+    actual_dense_surgical = normalize_bool(config.get("asymm_dense_mlp_surgical_offload"))
+    actual_dense_finegrained = normalize_bool(config.get("asymm_dense_mlp_finegrained_offload"))
+    if actual_dense_surgical != expected_dense_surgical:
+        raise SystemExit(
+            "profile asymm_dense_mlp_surgical_offload mismatch: "
+            f"expected {expected_dense_surgical}, got {actual_dense_surgical or '<missing>'}"
+        )
+    if actual_dense_finegrained != expected_dense_finegrained:
+        raise SystemExit(
+            "profile asymm_dense_mlp_finegrained_offload mismatch: "
+            f"expected {expected_dense_finegrained}, got {actual_dense_finegrained or '<missing>'}"
+        )
+    if normalize_bool(config.get("asym_offload_act_recompute")) != "false":
+        raise SystemExit("profile asym_offload_act_recompute must be false for recomp-off stages")
+    if normalize_bool(config.get("asym_offload_x_unpacked")) != "false":
+        raise SystemExit("profile asym_offload_x_unpacked must be false for recomp-off stages")
+    if str(config.get("expert_recompute_policy_spec") or config.get("expert_policy") or "").strip() not in {"", "none"}:
+        raise SystemExit("profile expert recompute policy must be none for recomp-off stages")
+    if str(config.get("asymm_mlp_recompute_chunk") or "0").strip() not in {"", "0"}:
+        raise SystemExit("profile asymm_mlp_recompute_chunk must be 0 for recomp-off stages")
+if expected_backend.endswith("_nocpuadamw"):
+    offload_param = str(config.get("deepspeed_offload_param_device") or "").strip().lower()
+    offload_optimizer = str(config.get("deepspeed_offload_optimizer_device") or "").strip().lower()
+    super_offload = normalize_bool(config.get("deepspeed_super_offload"))
+    if offload_param != "cpu":
+        raise SystemExit(
+            f"profile {expected_backend} must prove offload_param.device=cpu, got {offload_param or '<missing>'}"
+        )
+    if offload_optimizer not in {"", "none", "false"}:
+        raise SystemExit(
+            f"profile {expected_backend} must prove offload_optimizer disabled, got {offload_optimizer}"
+        )
+    if super_offload == "true":
+        raise SystemExit(f"profile {expected_backend} must not enable super_offload")
 if expected_profile_sync:
     actual_profile_sync = normalize_bool(config.get("profile_sync"))
     wanted_profile_sync = normalize_bool(expected_profile_sync)
@@ -1260,7 +1393,7 @@ if backend == "kt_armbf16" and expected_seq_len and expected_batch and expected_
     if str(expected_cache_depth).strip():
         require_int_config("kt_max_cache_depth", expected_cache_depth)
     if expected_recompute:
-        if expected_recompute in ("recomp", "unsloth"):
+        if expected_recompute in ("recomp", "unsloth", "unsloth-off"):
             wanted_recompute = "true"
         elif expected_recompute == "norecomp":
             wanted_recompute = "false"
@@ -1563,10 +1696,15 @@ kt_arm_matching_source_profile_json_candidates() {
   local router_mode="$5"
   local liger_loss="$6"
   local seq_len="$7"
-  local source_job_root run_dir_name
+  local source_job_root run_dir_name legacy_path_label
   source_job_root="$(job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}" "${liger_loss}")"
   run_dir_name="$(workload_run_dir_name "${seq_len}")"
   printf '%s/profile.json\n' "${source_job_root}/${run_dir_name}"
+  if [[ "${sdparecomp_label:-}" == "sdparecomp0" ]]; then
+    legacy_path_label="${backend}__source__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__${layergc_label}"
+    legacy_path_label="${legacy_path_label}__${expact_lora_a_fwd_label}__${actrecomp_label}__${xunpack_label}__${liger_loss}"
+    printf '%s/profile.json\n' "${config_root}/$(safe_label "${legacy_path_label}")/${run_dir_name}"
+  fi
 }
 
 plot_workload_from_config_root() {
@@ -1873,12 +2011,24 @@ prepare_dataset_for_seq() {
 }
 
 gpu_spec="${GPU_POOL}"
-model_spec="${RUN_MODEL_SPECS}"
-backend_specs_spec="${RUN_BACKENDS}"
+if [[ "${_RUNS_ENV_SET}" == "true" ]]; then
+  model_spec="${RUN_MODEL_SPECS}"
+  backend_specs_spec="${RUN_BACKENDS}"
+  workload_spec="${RUN_WORKLOADS}"
+  exp_act_policy_spec="${RUN_EXP_ACT_POLICIES}"
+  axis_run_override=false
+else
+  model_spec="${MODEL_SPECS:-${RUN_MODEL_SPECS}}"
+  backend_specs_spec="${BACKEND_SPECS:-${RUN_BACKENDS}}"
+  workload_spec="${WORKLOADS:-${RUN_WORKLOADS}}"
+  exp_act_policy_spec="${ASYMM_EXP_ACT_POLICIES:-${RUN_EXP_ACT_POLICIES}}"
+  axis_run_override=false
+  if [[ -n "${MODEL_SPECS+x}" || -n "${BACKEND_SPECS+x}" || -n "${WORKLOADS+x}" || -n "${ASYMM_EXP_ACT_POLICIES+x}" ]]; then
+    axis_run_override=true
+  fi
+fi
 router_mode_spec="${ROUTER_MODES}"
 profiler_spec="${PROFILERS}"
-workload_spec="${RUN_WORKLOADS}"
-exp_act_policy_spec="${RUN_EXP_ACT_POLICIES}"
 lora_params_spec="${LORA_PARAMS}"
 lf_expert_lora_impl_spec="${LF_EXPERT_LORA_IMPLS}"
 output_root="${OUTPUT_ROOT}"
@@ -1896,10 +2046,18 @@ while (($#)); do
     --gpus=*) gpu_spec="${1#*=}"; shift ;;
     --dist-launcher) need_value "$1" "${2-}"; DIST_LAUNCHER="$(dist_launcher_label "$2")"; shift 2 ;;
     --dist-launcher=*) DIST_LAUNCHER="$(dist_launcher_label "${1#*=}")"; shift ;;
+    --models|--model-specs) collect_values "$1" vals "${@:2}"; model_spec="${vals[*]}"; axis_run_override=true; set -- "${REMAINING[@]}" ;;
+    --models=*|--model-specs=*) model_spec="${1#*=}"; axis_run_override=true; shift ;;
+    --backend-specs) collect_values "$1" vals "${@:2}"; backend_specs_spec="${vals[*]}"; axis_run_override=true; set -- "${REMAINING[@]}" ;;
+    --backend-specs=*) backend_specs_spec="${1#*=}"; axis_run_override=true; shift ;;
     --router-modes) need_value "$1" "${2-}"; router_mode_spec="$2"; ROUTER_MODES="$2"; shift 2 ;;
     --router-modes=*) router_mode_spec="${1#*=}"; ROUTER_MODES="${1#*=}"; shift ;;
     --profilers) need_value "$1" "${2-}"; profiler_spec="$2"; shift 2 ;;
     --profilers=*) profiler_spec="${1#*=}"; shift ;;
+    --workloads) collect_values "$1" vals "${@:2}"; workload_spec="${vals[*]}"; WORKLOADS="${workload_spec}"; axis_run_override=true; set -- "${REMAINING[@]}" ;;
+    --workloads=*) workload_spec="${1#*=}"; WORKLOADS="${workload_spec}"; axis_run_override=true; shift ;;
+    --asymm-exp-act-policies) need_value "$1" "${2-}"; exp_act_policy_spec="$2"; ASYMM_EXP_ACT_POLICIES="$2"; axis_run_override=true; shift 2 ;;
+    --asymm-exp-act-policies=*) exp_act_policy_spec="${1#*=}"; ASYMM_EXP_ACT_POLICIES="${1#*=}"; axis_run_override=true; shift ;;
     --dataset) need_value "$1" "${2-}"; DATASET="$2"; shift 2 ;;
     --dataset=*) DATASET="${1#*=}"; shift ;;
     --prepare-datasets) need_value "$1" "${2-}"; PREPARE_DATASETS="$(bool_value "$2")"; shift 2 ;;
@@ -1922,6 +2080,12 @@ while (($#)); do
     --learning-rate=*) LEARNING_RATE="${1#*=}"; shift ;;
     --seed) need_value "$1" "${2-}"; SEED="$2"; shift 2 ;;
     --seed=*) SEED="${1#*=}"; shift ;;
+    --lora-rank) need_value "$1" "${2-}"; LORA_RANK="$2"; [[ "${_LORA_PARAMS_ENV_SET}" == "true" ]] || { LORA_PARAMS="${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|all"; lora_params_spec="${LORA_PARAMS}"; }; shift 2 ;;
+    --lora-rank=*) LORA_RANK="${1#*=}"; [[ "${_LORA_PARAMS_ENV_SET}" == "true" ]] || { LORA_PARAMS="${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|all"; lora_params_spec="${LORA_PARAMS}"; }; shift ;;
+    --lora-alpha) need_value "$1" "${2-}"; LORA_ALPHA="$2"; [[ "${_LORA_PARAMS_ENV_SET}" == "true" ]] || { LORA_PARAMS="${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|all"; lora_params_spec="${LORA_PARAMS}"; }; shift 2 ;;
+    --lora-alpha=*) LORA_ALPHA="${1#*=}"; [[ "${_LORA_PARAMS_ENV_SET}" == "true" ]] || { LORA_PARAMS="${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|all"; lora_params_spec="${LORA_PARAMS}"; }; shift ;;
+    --lora-dropout) collect_values "$1" vals "${@:2}"; LORA_DROPOUT="${vals[*]}"; [[ "${_LORA_PARAMS_ENV_SET}" == "true" ]] || { LORA_PARAMS="${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|all"; lora_params_spec="${LORA_PARAMS}"; }; set -- "${REMAINING[@]}" ;;
+    --lora-dropout=*) LORA_DROPOUT="${1#*=}"; [[ "${_LORA_PARAMS_ENV_SET}" == "true" ]] || { LORA_PARAMS="${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|all"; lora_params_spec="${LORA_PARAMS}"; }; shift ;;
     --lora-params) collect_values "$1" vals "${@:2}"; lora_params_spec="${vals[*]}"; LORA_PARAMS="${lora_params_spec}"; set -- "${REMAINING[@]}" ;;
     --lora-params=*) lora_params_spec="${1#*=}"; LORA_PARAMS="${lora_params_spec}"; shift ;;
     --lf-expert-lora-impls) need_value "$1" "${2-}"; lf_expert_lora_impl_spec="$2"; LF_EXPERT_LORA_IMPLS="$2"; shift 2 ;;
@@ -2038,13 +2202,45 @@ done
 
 DIST_LAUNCHER="$(dist_launcher_label "${DIST_LAUNCHER}")"
 
+if [[ "${_RUNS_ENV_SET}" == "true" && "${axis_run_override}" == "true" ]]; then
+  die "RUNS is an explicit schedule; do not combine it with --models/--backend-specs/--workloads/--asymm-exp-act-policies"
+fi
+
+if [[ "${_RUNS_ENV_SET}" != "true" && "${axis_run_override}" == "true" ]]; then
+  _run_models=(); _run_backends=(); _run_workloads=(); _run_policies=(); _run_specs=()
+  mapfile -t _axis_models < <(tokens "${model_spec}" | dedupe)
+  mapfile -t _axis_backend_tokens < <(tokens "${backend_specs_spec}" | dedupe)
+  mapfile -t _axis_workloads < <(tokens "${workload_spec}" | dedupe)
+  mapfile -t _axis_policies < <(tokens "${exp_act_policy_spec}" | dedupe)
+  ((${#_axis_models[@]})) || die "model spec list is empty"
+  ((${#_axis_backend_tokens[@]})) || die "backend spec list is empty"
+  ((${#_axis_workloads[@]})) || die "workload list is empty"
+  ((${#_axis_policies[@]})) || die "expert/attention activation policy tuple list is empty"
+  for _axis_model in "${_axis_models[@]}"; do
+    for _axis_backend_token in "${_axis_backend_tokens[@]}"; do
+      mapfile -t _axis_backend_entries < <(backend_entries_for_run_spec "${_axis_backend_token}")
+      for _axis_backend in "${_axis_backend_entries[@]}"; do
+        for _axis_workload in "${_axis_workloads[@]}"; do
+          for _axis_policy in "${_axis_policies[@]}"; do
+            _run_models+=("${_axis_model}")
+            _run_backends+=("${_axis_backend}")
+            _run_workloads+=("${_axis_workload}")
+            _run_policies+=("${_axis_policy}")
+            _run_specs+=("${_axis_model};${_axis_backend};${_axis_workload};${_axis_policy}")
+          done
+        done
+      done
+    done
+  done
+fi
+
 require_comma_list "--gpus/GPU_POOL" "${gpu_spec}"
-require_comma_list "RUNS-derived model list" "${model_spec}"
-require_comma_list "RUNS-derived backend list" "${backend_specs_spec}"
+require_comma_list "--models/MODEL_SPECS or RUNS-derived model list" "${model_spec}"
+require_comma_list "--backend-specs/BACKEND_SPECS or RUNS-derived backend list" "${backend_specs_spec}"
 require_comma_list "--router-modes/ROUTER_MODES" "${router_mode_spec}"
 require_comma_list "--profilers/PROFILERS" "${profiler_spec}"
-require_comma_list "RUNS-derived workload list" "${workload_spec}"
-require_comma_list "RUNS-derived policy list" "${exp_act_policy_spec}"
+require_comma_list "--workloads/WORKLOADS or RUNS-derived workload list" "${workload_spec}"
+require_comma_list "--asymm-exp-act-policies/ASYMM_EXP_ACT_POLICIES or RUNS-derived policy list" "${exp_act_policy_spec}"
 require_comma_list "--lora-params/LORA_PARAMS" "${lora_params_spec}"
 require_comma_list "--lf-expert-lora-impls/LF_EXPERT_LORA_IMPLS" "${lf_expert_lora_impl_spec}"
 
@@ -2161,8 +2357,9 @@ selected_has_non_asym=false
 for backend in "${backends[@]}"; do
   case "${backend}" in
     asym|asym_torch|asym_cpuadamwtorch|asym_cpuadamwds) selected_has_asym=true ;;
-    zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam) selected_has_zero=true ;;
+    zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_mem_nocpuadamw|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam) selected_has_zero=true ;;
     superoffload|superoffload_mem|superoffload_mem_opnvme|superoffload_mem_panvme) selected_has_zero=true; selected_has_superoffload=true ;;
+    superoffload_mem_nocpuadamw) selected_has_zero=true ;;
     kt_*) selected_has_kt=true ;;
   esac
   case "${backend}" in
@@ -2220,12 +2417,10 @@ mapfile -t asym_cpu_adamw_grad_offload_modes < <(
   tokens "${ASYM_CPU_ADAMW_GRAD_OFFLOAD}" | while read -r value; do bool_value "${value}"; done | dedupe
 )
 ((${#asym_cpu_adamw_grad_offload_modes[@]})) || die "ASYM_CPU_ADAMW_GRAD_OFFLOAD must include at least one boolean value"
-((${#asym_cpu_adamw_grad_offload_modes[@]} == 1)) || die "ASYM_CPU_ADAMW_GRAD_OFFLOAD must be a single boolean so each RUNS row maps to one launch"
 mapfile -t asym_cpu_adamw_weight_offload_modes < <(
   tokens "${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD}" | while read -r value; do bool_value "${value}"; done | dedupe
 )
 ((${#asym_cpu_adamw_weight_offload_modes[@]})) || die "ASYM_CPU_ADAMW_WEIGHT_OFFLOAD must include at least one boolean value"
-((${#asym_cpu_adamw_weight_offload_modes[@]} == 1)) || die "ASYM_CPU_ADAMW_WEIGHT_OFFLOAD must be a single boolean so each RUNS row maps to one launch"
 if [[ "${asym_cpu_adamw_weight_offload_modes[0]}" == "true" && "${asym_cpu_adamw_grad_offload_modes[0]}" != "true" ]]; then
   die "ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=true requires ASYM_CPU_ADAMW_GRAD_OFFLOAD=true so each CPUAdamW RUNS row maps to one launch"
 fi
@@ -2614,30 +2809,91 @@ run_job() {
   local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" sdparecomp_label="${sdparecomp_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}"
   local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_LAYER_GC="${ASYMM_LAYER_GC}" ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
   local ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}" ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
+  local ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU:-1}"
+  local ASYMM_MLP_RECOMPUTE_CHUNK="${ASYMM_MLP_RECOMPUTE_CHUNK:-0}"
   local requested_policy_tuple="${expert_policy}|${ASYMM_EXPERT_ACT_OFFLOAD}|${ASYMM_ATTN_ACT_OFFLOAD}|${ASYMM_LAYER_ACT_OFFLOAD}|${ASYMM_LAYER_GC}|${ASYMM_ATTN_SDPA_RECOMPUTE}"
   canonicalize_policy_axis_for_inert_run "${backend}" "${recompute}"
-  local effective_policy_tuple="${expert_policy}|${ASYMM_EXPERT_ACT_OFFLOAD}|${ASYMM_ATTN_ACT_OFFLOAD}|${ASYMM_LAYER_ACT_OFFLOAD}|${ASYMM_LAYER_GC}|${ASYMM_ATTN_SDPA_RECOMPUTE}"
   local run_log_extra_tag=""
   local run_log_inert_reason=""
-  if [[ "${effective_policy_tuple}" != "${requested_policy_tuple}" ]]; then
-    run_log_extra_tag="INERT"
-    run_log_inert_reason=" requested_policy=${requested_policy_tuple}"
-  fi
   if [[ "${profiler}" == "both" ]]; then
     run_profiler=nsys
     materialize_source_from_nsys=true
   fi
   local gradient_checkpointing=false
   local use_unsloth_gc=false
+  local unsloth_recompute_save_on_cpu=false
   local attention_gc_enabled=false
   local layer_gc_enabled=false
+  local dense_mlp_surgical="${ASYMM_DENSE_MLP_SURGICAL_OFFLOAD:-0}"
+  local dense_mlp_finegrained="${ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD:-0}"
+  local recomp_off_stage=""
   [[ "${recompute}" == "recomp" ]] && gradient_checkpointing=true
-  [[ "${recompute}" == "unsloth" ]] && { gradient_checkpointing=true; use_unsloth_gc=true; }
+  [[ "${recompute}" == "unsloth" || "${recompute}" == "unsloth-off" ]] && { gradient_checkpointing=true; use_unsloth_gc=true; }
+  if [[ "${recompute}" == "unsloth-off" ]]; then
+    unsloth_recompute_save_on_cpu=true
+    dense_mlp_surgical=0
+    dense_mlp_finegrained=0
+  fi
+  if is_recomp_off_recompute "${recompute}"; then
+    recomp_off_stage="$(recomp_off_stage_label "${recompute}")"
+    gradient_checkpointing=true
+    use_unsloth_gc=true
+    unsloth_recompute_save_on_cpu=true
+    expert_policy=none
+    ASYM_OFFLOAD_ACT_RECOMPUTE=0; actrecomp_label="$(actrecomp_tag 0)"
+    ASYM_OFFLOAD_X_UNPACKED=0; xunpack_label="$(xunpack_tag 0)"
+    ASYMM_LAYER_ACT_OFFLOAD=false; layeract_label="$(layeract_tag false)"
+    ASYMM_LAYER_GC=false; layergc_label="$(layergc_tag false)"
+    ASYMM_ATTN_SDPA_RECOMPUTE=false; sdparecomp_label="$(sdparecomp_tag false)"
+    ASYMM_EXPERT_SILU_BWD_GPU=0
+    ASYMM_MLP_RECOMPUTE_CHUNK=0
+    dense_mlp_surgical=0
+    dense_mlp_finegrained=0
+    case "${recomp_off_stage}" in
+      base)
+        ASYMM_EXPERT_ACT_OFFLOAD=false; expact_label="$(expact_tag false)"
+        ASYMM_ATTN_ACT_OFFLOAD=false; attnact_label="$(attnact_tag false)"
+        ;;
+      attn)
+        ASYMM_EXPERT_ACT_OFFLOAD=false; expact_label="$(expact_tag false)"
+        ASYMM_ATTN_ACT_OFFLOAD=true; attnact_label="$(attnact_tag true)"
+        ;;
+      dense)
+        dense_mlp_surgical=1
+        ASYMM_EXPERT_ACT_OFFLOAD=true; expact_label="$(expact_tag true)"
+        ASYMM_ATTN_ACT_OFFLOAD=false; attnact_label="$(attnact_tag false)"
+        ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu; expact_lora_a_fwd_label="$(expact_lora_a_fwd_tag cpu)"
+        ;;
+      full)
+        dense_mlp_surgical=1
+        ASYMM_EXPERT_ACT_OFFLOAD=true; expact_label="$(expact_tag true)"
+        ASYMM_ATTN_ACT_OFFLOAD=true; attnact_label="$(attnact_tag true)"
+        ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu; expact_lora_a_fwd_label="$(expact_lora_a_fwd_tag cpu)"
+        ;;
+      dense-fg)
+        dense_mlp_finegrained=1
+        ASYMM_EXPERT_ACT_OFFLOAD=false; expact_label="$(expact_tag false)"
+        ASYMM_ATTN_ACT_OFFLOAD=false; attnact_label="$(attnact_tag false)"
+        ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu; expact_lora_a_fwd_label="$(expact_lora_a_fwd_tag cpu)"
+        ;;
+      full-fg)
+        dense_mlp_finegrained=1
+        ASYMM_EXPERT_ACT_OFFLOAD=false; expact_label="$(expact_tag false)"
+        ASYMM_ATTN_ACT_OFFLOAD=true; attnact_label="$(attnact_tag true)"
+        ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu; expact_lora_a_fwd_label="$(expact_lora_a_fwd_tag cpu)"
+        ;;
+    esac
+  fi
   [[ "${expert_policy}" == "gc-attn-exp" ]] && attention_gc_enabled=true
   [[ "${expert_policy}" == "gc-layer" ]] && layer_gc_enabled=true
   if ! cpuadam_backend_for_label "${backend}" >/dev/null; then
     grad_offload=false
     weight_offload=false
+  fi
+  local effective_policy_tuple="${expert_policy}|${ASYMM_EXPERT_ACT_OFFLOAD}|${ASYMM_ATTN_ACT_OFFLOAD}|${ASYMM_LAYER_ACT_OFFLOAD}|${ASYMM_LAYER_GC}|${ASYMM_ATTN_SDPA_RECOMPUTE}"
+  if [[ "${effective_policy_tuple}" != "${requested_policy_tuple}" ]] && ! is_recomp_off_recompute "${recompute}"; then
+    run_log_extra_tag="INERT"
+    run_log_inert_reason=" requested_policy=${requested_policy_tuple}"
   fi
   local enable_liger_kernel
   case "${liger_loss}" in
@@ -2818,7 +3074,8 @@ run_job() {
     NUMACTL_MODE="${NUMACTL_MODE:-membind}"
     ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE:-0}"
     ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED:-0}"
-    ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU:-1}"
+    ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU}"
+    ASYMM_MLP_RECOMPUTE_CHUNK="${ASYMM_MLP_RECOMPUTE_CHUNK}"
     DG_BF16_CPU_LEFT_COMPACT_GRID="${DG_BF16_CPU_LEFT_COMPACT_GRID:-0}"
     ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE="${ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE:-0}"
     LF_DIR="${LF_DIR}"
@@ -2860,10 +3117,13 @@ run_job() {
     SEED="${SEED}"
     GRADIENT_CHECKPOINTING="${gradient_checkpointing}"
     USE_UNSLOTH_GC="${use_unsloth_gc}"
+    UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU="${unsloth_recompute_save_on_cpu}"
     ASYM_PRECISION="${PRECISION}"
     ASYM_OFFLOAD_MODULES="${ASYM_OFFLOAD_MODULES}"
     ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}"
     ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
+    ASYMM_DENSE_MLP_SURGICAL_OFFLOAD="${dense_mlp_surgical}"
+    ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD="${dense_mlp_finegrained}"
     ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
     ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
     ASYMM_LAYER_GC="${ASYMM_LAYER_GC}"
@@ -2903,16 +3163,23 @@ run_job() {
     MASTER_PORT="${master_port}"
     ASYM_GEMM_LF_CONFIG_ASYM_STRICT="${ASYM_STRICT}"
     ASYM_GEMM_LF_CONFIG_LIGER_LOSS="${liger_loss}"
+    ASYM_GEMM_LF_CONFIG_RECOMP_OFF_STAGE="${recomp_off_stage}"
+    ASYM_GEMM_LF_CONFIG_USE_UNSLOTH_GC="${use_unsloth_gc}"
+    ASYM_GEMM_LF_CONFIG_UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU="${unsloth_recompute_save_on_cpu}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU}"
     ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD="${grad_offload}"
     ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${weight_offload}"
     ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_SURGICAL_OFFLOAD="${dense_mlp_surgical}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD="${dense_mlp_finegrained}"
     ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_GC="${ASYMM_LAYER_GC}"
     ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}"
     ASYM_GEMM_LF_CONFIG_ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}"
     ASYM_GEMM_LF_CONFIG_ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_MLP_RECOMPUTE_CHUNK="${ASYMM_MLP_RECOMPUTE_CHUNK}"
     ASYM_GEMM_LF_CONFIG_QWEN_EXPERT_LORA_IMPL="${lf_expert_lora_impl}"
     ASYM_GEMM_LF_CONFIG_SEQ_LEN="${seq_len}"
     ASYM_GEMM_LF_CONFIG_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE}"
@@ -3598,12 +3865,27 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
 
         IFS='|' read -r backend recompute liger_loss backend_spec_extra <<< "${backend_recompute}"
         [[ -n "${backend}" && -n "${recompute}" && -n "${liger_loss}" && -z "${backend_spec_extra:-}" ]] || die "internal error: malformed normalized backend spec '${backend_recompute}'"
+        if { is_policy_independent_backend "${backend}" || [[ "${recompute}" == "recomp" ]]; } && [[ "${exp_act_policy_pair}" != "${exp_act_policy_pairs[0]}" ]]; then
+          if [[ "${expert_policy}" != "off-layer" && "${ASYMM_EXPERT_ACT_OFFLOAD}" != "true" && "${ASYMM_ATTN_ACT_OFFLOAD}" != "true" && "${ASYMM_LAYER_GC}" != "true" ]]; then
+            echo "Skipping backend=${backend} recompute=${recompute} policy=${exp_act_policy_pair}; inert policy axes run once (canonicalized to none|false|false|false|false|false)."
+            continue
+          fi
+        fi
+        if [[ "${recompute}" == "recomp" ]]; then
+          if [[ "${expert_policy}" != "none" ]]; then
+            die "selective GC policy '${expert_policy}' is not supported with global recompute; set backend recompute=norecomp, unsloth-off, or a recomp-off-* stage"
+          fi
+          if [[ "${ASYMM_EXPERT_ACT_OFFLOAD}" == "true" || "${ASYMM_ATTN_ACT_OFFLOAD}" == "true" || "${ASYMM_LAYER_ACT_OFFLOAD}" == "true" || "${ASYMM_LAYER_GC}" == "true" ]]; then
+            die "activation offload tuples are not supported with global recompute; set backend recompute=norecomp, unsloth-off, or a recomp-off-* stage"
+          fi
+        fi
         for router_mode in "${router_modes[@]}"; do
           for profiler in "${profilers[@]}"; do
             profiler_runs_nsys=false
             [[ "${profiler}" == "nsys" || "${profiler}" == "both" ]] && profiler_runs_nsys=true
             if [[ "${backend}" == "kt_armbf16" && "${profiler_runs_nsys}" == "true" && "${KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK}" != "1" ]]; then
-              die "backend=kt_armbf16 profiler=${profiler} requires a completed source run first; set PROFILERS=source, or set KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK=1 after one source step completes"
+              echo "Skipping backend=kt_armbf16 profiler=${profiler}; run profiler=source first and set KT_ARM_ALLOW_NSYS_WITHOUT_SOURCE_OK=1 only after one source step completes."
+              continue
             fi
             job_router_mode="${router_mode}"
             if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" && "${backend}" != "asym_cpuadamwtorch" && "${backend}" != "asym_cpuadamwds" ]]; then
@@ -3615,7 +3897,8 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
             fi
             if [[ "${backend}" == "kt_armbf16" && "${profiler_runs_nsys}" == "true" ]]; then
               if ! kt_arm_matching_source_profile_complete "${config_root}" "${backend}" "${recompute}" "${expert_policy}" "${job_router_mode}" "${liger_loss}" "${seq_len}" "${current_model_name}"; then
-                die "backend=kt_armbf16 profiler=${profiler} requires a matching completed source profile for seq=${seq_len} recompute=${recompute} liger_loss=${liger_loss} expert_policy=${expert_policy} router_mode=${job_router_mode} qwen_expert_lora_impl=${lf_expert_lora_impl} ${expact_label} ${attnact_label} ${layeract_label} ${layergc_label}"
+                echo "Skipping backend=kt_armbf16 profiler=${profiler}; matching source profile is missing, incomplete, or stale for seq=${seq_len} recompute=${recompute} liger_loss=${liger_loss} expert_policy=${expert_policy} router_mode=${job_router_mode} qwen_expert_lora_impl=${lf_expert_lora_impl} ${expact_label} ${attnact_label} ${layeract_label} ${layergc_label}."
+                continue
               fi
             fi
             gpu_count="$(backend_gpu_count "${backend}" "${current_model_gpu_count}")"

@@ -320,6 +320,7 @@ def install_lora_weight_offload(model: Any, coordinator: LoRAWeightOffloadCoordi
     Returns the number of offloaded banks (0 means nothing matched; callers should assert > 0).
     """
     from .attention_activation_offload import AsymActivationOffloadLoRALinear
+    from .dense_mlp_finegrained import AsymFinegrainedDenseMLP
     from .llama4_shared_mlp import AsymLlama4SharedMLP
     from .lora import AsymLoRALinear
     from .qwen3_moe import AsymQwen3Experts
@@ -393,6 +394,29 @@ def install_lora_weight_offload(model: Any, coordinator: LoRAWeightOffloadCoordi
         return "dense_lora"
 
     installed = 0
+    for module in model.modules():
+        if not isinstance(module, AsymFinegrainedDenseMLP):
+            continue
+        banks_fn = getattr(module, "_lora_weight_banks", None)
+        if not callable(banks_fn):
+            continue
+        named_banks = banks_fn()
+        registered = coordinator.register_group(
+            module,
+            named_banks,
+            group_name=getattr(module, "profile_prefix", type(module).__name__),
+            component="mlp_dense",
+            force=True,
+        )
+        if registered:
+            module._weight_offload = coordinator
+            for child in (module.gate_proj, module.up_proj, module.down_proj):
+                if isinstance(child, AsymLoRALinear):
+                    _mark_child_owned(child, module)
+            module.register_forward_pre_hook(_gather_hook)
+            module.register_forward_hook(_release_hook)
+            installed += registered
+
     for module in model.modules():
         if not isinstance(module, AsymQwen3Experts):
             continue

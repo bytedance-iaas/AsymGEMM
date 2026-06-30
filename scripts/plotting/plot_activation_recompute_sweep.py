@@ -1595,11 +1595,20 @@ def combined_threshold_label(group: tuple[str, ...], mode: str, varied: set[str]
 def write_table(rows: list[dict[str, Any]], output_dir: Path, name: str) -> None:
     data_dir = output_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
-    (data_dir / f"{name}.json").write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
+    json_text = json.dumps(rows, indent=2) + "\n"
+    fieldnames = list(rows[0].keys())
+    (data_dir / f"{name}.json").write_text(json_text, encoding="utf-8")
     with (data_dir / f"{name}.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+    if f"{name}.csv" in ROOT_OUTPUT_FILES:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / f"{name}.json").write_text(json_text, encoding="utf-8")
+        with (output_dir / f"{name}.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
 
 
 def clean_output_dir(output_dir: Path) -> None:

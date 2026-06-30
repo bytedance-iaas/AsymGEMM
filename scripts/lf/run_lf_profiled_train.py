@@ -585,6 +585,7 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "zero3",
         "zero3_offload",
         "zero3_offload_mem",
+        "zero3_offload_mem_nocpuadamw",
         "zero3_offload_opnvme",
         "zero3_offload_panvme",
         "zero3_offload_mem_opnvme",
@@ -592,6 +593,7 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "zero3_cpuadam",
         "superoffload",
         "superoffload_mem",
+        "superoffload_mem_nocpuadamw",
         "superoffload_mem_opnvme",
         "superoffload_mem_panvme",
     }
@@ -701,6 +703,18 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR", ""),
         "output_dir": _option_value(args, "--output_dir"),
     }
+    ds_config = _load_deepspeed_config(str(config.get("deepspeed_config") or ""))
+    zero_config = ds_config.get("zero_optimization", {}) if isinstance(ds_config, dict) else {}
+    offload_param = zero_config.get("offload_param", {}) if isinstance(zero_config, dict) else {}
+    offload_optimizer = zero_config.get("offload_optimizer", {}) if isinstance(zero_config, dict) else {}
+    if isinstance(offload_param, dict):
+        config["deepspeed_offload_param_device"] = offload_param.get("device")
+    if isinstance(offload_optimizer, dict) and offload_optimizer:
+        config["deepspeed_offload_optimizer_device"] = offload_optimizer.get("device")
+        config["deepspeed_super_offload"] = offload_optimizer.get("super_offload") is True
+    elif is_deepspeed_backend:
+        config["deepspeed_offload_optimizer_device"] = ""
+        config["deepspeed_super_offload"] = False
     for key, value in env_config.items():
         config.setdefault(key, value)
     return {key: value for key, value in config.items() if value is not None and value != ""}

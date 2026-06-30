@@ -76,12 +76,16 @@ DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-}
 TRAINING_BF16=${TRAINING_BF16:-}
 ENABLE_LIGER_KERNEL=${ENABLE_LIGER_KERNEL:-false}
 USE_UNSLOTH_GC=${USE_UNSLOTH_GC:-false}
+UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU=${UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU:-false}
 
 # AsymGEMM
 ASYM_PRECISION=${ASYM_PRECISION:-bf16}
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
 ASYMM_EXPERT_ACT_OFFLOAD=${ASYMM_EXPERT_ACT_OFFLOAD:-false}
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-cpu}
+ASYMM_EXPERT_SILU_BWD_GPU=${ASYMM_EXPERT_SILU_BWD_GPU:-1}
+ASYMM_DENSE_MLP_SURGICAL_OFFLOAD=${ASYMM_DENSE_MLP_SURGICAL_OFFLOAD:-0}
+ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD=${ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD:-0}
 ASYMM_ATTN_ACT_OFFLOAD=${ASYMM_ATTN_ACT_OFFLOAD:-false}
 ASYMM_LAYER_ACT_OFFLOAD=${ASYMM_LAYER_ACT_OFFLOAD:-false}
 ASYMM_LAYER_GC=${ASYMM_LAYER_GC:-false}
@@ -89,6 +93,7 @@ ASYMM_ATTN_SDPA_RECOMPUTE=${ASYMM_ATTN_SDPA_RECOMPUTE:-false}
 ASYM_OFFLOAD_ACT_RECOMPUTE=${ASYM_OFFLOAD_ACT_RECOMPUTE:-0}
 ASYM_OFFLOAD_X_UNPACKED=${ASYM_OFFLOAD_X_UNPACKED:-0}
 ASYM_EXPERT_RECOMPUTE_POLICY=${ASYM_EXPERT_RECOMPUTE_POLICY:-none}
+ASYMM_MLP_RECOMPUTE_CHUNK=${ASYMM_MLP_RECOMPUTE_CHUNK:-0}
 ASYM_ROUTER_MODE=${ASYM_ROUTER_MODE:-whole}
 ASYM_STRICT=${ASYM_STRICT:-true}
 USE_ASYM_CPU_ADAMW=${USE_ASYM_CPU_ADAMW:-false}
@@ -213,6 +218,7 @@ zero_deepspeed_config() {
     zero3) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_config.json" ;;
     zero3_offload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json" ;;
     zero3_offload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_config.json" ;;
+    zero3_offload_mem_nocpuadamw) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_nocpuadamw_config.json" ;;
     zero3_offload_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_opnvme_config.json" ;;
     zero3_offload_panvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_panvme_config.json" ;;
     zero3_offload_mem_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_opnvme_config.json" ;;
@@ -220,6 +226,7 @@ zero_deepspeed_config() {
     zero3_cpuadam) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_cpuadam_config.json" ;;
     superoffload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_config.json" ;;
     superoffload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_config.json" ;;
+    superoffload_mem_nocpuadamw) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_nocpuadamw_config.json" ;;
     superoffload_mem_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_opnvme_config.json" ;;
     superoffload_mem_panvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_panvme_config.json" ;;
     *) return 1 ;;
@@ -254,6 +261,12 @@ case "${BACKEND,,}" in
     ZERO_BACKEND_LABEL=zero3_offload_mem
     BACKEND=torch
     TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero3_offload_mem)"
+    ;;
+  zero3_offload_mem_nocpuadamw)
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-zero3_offload_mem_nocpuadamw}
+    ZERO_BACKEND_LABEL=zero3_offload_mem_nocpuadamw
+    BACKEND=torch
+    TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero3_offload_mem_nocpuadamw)"
     ;;
   zero3_offload_opnvme)
     PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-zero3_offload_opnvme}
@@ -297,6 +310,12 @@ case "${BACKEND,,}" in
     BACKEND=torch
     TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config superoffload_mem)"
     ;;
+  superoffload_mem_nocpuadamw)
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-superoffload_mem_nocpuadamw}
+    ZERO_BACKEND_LABEL=superoffload_mem_nocpuadamw
+    BACKEND=torch
+    TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config superoffload_mem_nocpuadamw)"
+    ;;
   superoffload_mem_opnvme)
     PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-superoffload_mem_opnvme}
     ZERO_BACKEND_LABEL=superoffload_mem_opnvme
@@ -333,7 +352,7 @@ case "${BACKEND,,}" in
     BACKEND=kt_armbf16
     KT_BACKEND_INTERNAL=ARMBF16
     ;;
-  *) echo "BACKEND must be one of: torch, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_offload_opnvme, zero3_offload_panvme, zero3_offload_mem_opnvme, zero3_offload_mem_panvme, zero3_cpuadam, superoffload, superoffload_mem, superoffload_mem_opnvme, superoffload_mem_panvme, asym_cpuadamwtorch, asym_cpuadamwds, asym_torch, asym, kt_torchbf16, kt_armbf16; got '${BACKEND}'" >&2; exit 2 ;;
+  *) echo "BACKEND must be one of: torch, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_offload_mem_nocpuadamw, zero3_offload_opnvme, zero3_offload_panvme, zero3_offload_mem_opnvme, zero3_offload_mem_panvme, zero3_cpuadam, superoffload, superoffload_mem, superoffload_mem_nocpuadamw, superoffload_mem_opnvme, superoffload_mem_panvme, asym_cpuadamwtorch, asym_cpuadamwds, asym_torch, asym, kt_torchbf16, kt_armbf16; got '${BACKEND}'" >&2; exit 2 ;;
 esac
 
 case "${DIST_LAUNCHER,,}" in
@@ -442,12 +461,21 @@ case "${USE_UNSLOTH_GC,,}" in
   0|false|no|n|off) USE_UNSLOTH_GC=false ;;
   *) echo "USE_UNSLOTH_GC must be true or false, got '${USE_UNSLOTH_GC}'" >&2; exit 2 ;;
 esac
+case "${UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU,,}" in
+  1|true|yes|y|on) UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU=true ;;
+  0|false|no|n|off) UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU=false ;;
+  *) echo "UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU must be true or false, got '${UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU}'" >&2; exit 2 ;;
+esac
 # Unsloth GC only installs when gradient checkpointing is enabled (LF prepare_model_for_training).
 if [[ "${USE_UNSLOTH_GC}" == "true" ]]; then
   case "${GRADIENT_CHECKPOINTING,,}" in
     1|true|yes|y|on) : ;;
     *) echo "USE_UNSLOTH_GC=true requires GRADIENT_CHECKPOINTING=true" >&2; exit 2 ;;
   esac
+fi
+if [[ "${UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU}" == "true" && "${USE_UNSLOTH_GC}" != "true" ]]; then
+  echo "UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU=true requires USE_UNSLOTH_GC=true" >&2
+  exit 2
 fi
 if [[ "${ENABLE_LIGER_KERNEL}" == "true" ]]; then
   LIGER_LOSS_TAG=ligerloss1
@@ -601,7 +629,10 @@ is_zero_backend_run() {
 }
 
 is_superoffload_zero_run() {
-  [[ "${ZERO_BACKEND_LABEL}" == superoffload* ]]
+  case "${ZERO_BACKEND_LABEL}" in
+    superoffload|superoffload_mem|superoffload_mem_opnvme|superoffload_mem_panvme) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 is_cpuadam_zero_run() {
@@ -1857,6 +1888,12 @@ log_kv SEED "${SEED}"
 log_kv TRAINING_BF16 "${TRAINING_BF16}"
 log_kv ENABLE_LIGER_KERNEL "${ENABLE_LIGER_KERNEL}"
 log_kv LIGER_LOSS_TAG "${LIGER_LOSS_TAG}"
+log_kv USE_UNSLOTH_GC "${USE_UNSLOTH_GC}"
+log_kv UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU "${UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU}"
+log_kv ASYMM_EXPERT_SILU_BWD_GPU "${ASYMM_EXPERT_SILU_BWD_GPU}"
+log_kv ASYMM_DENSE_MLP_SURGICAL_OFFLOAD "${ASYMM_DENSE_MLP_SURGICAL_OFFLOAD}"
+log_kv ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD "${ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD}"
+log_kv ASYMM_MLP_RECOMPUTE_CHUNK "${ASYMM_MLP_RECOMPUTE_CHUNK}"
 log_kv PREPROCESSING_NUM_WORKERS "${PREPROCESSING_NUM_WORKERS}"
 log_kv DATALOADER_NUM_WORKERS "${DATALOADER_NUM_WORKERS}"
 log_kv_if_set MAX_GRAD_NORM "${MAX_GRAD_NORM}"
@@ -1995,11 +2032,14 @@ RUN_ENV=(
   PYTHONPATH="${RUN_PYTHONPATH}"
   ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}"
   ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
+  ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU}"
+  ASYMM_DENSE_MLP_SURGICAL_OFFLOAD="${ASYMM_DENSE_MLP_SURGICAL_OFFLOAD}"
+  ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD="${ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD}"
   ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
   ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
   ASYMM_LAYER_GC="${ASYMM_LAYER_GC}"
   ASYMM_LAYER_GC_RECOMPUTE="${ASYMM_LAYER_GC_RECOMPUTE:-false}"
-  ASYMM_MLP_RECOMPUTE_CHUNK="${ASYMM_MLP_RECOMPUTE_CHUNK:-0}"
+  ASYMM_MLP_RECOMPUTE_CHUNK="${ASYMM_MLP_RECOMPUTE_CHUNK}"
   ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}"
   ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
   ASYM_CPU_ADAMW_GRAD_OFFLOAD="${ASYM_CPU_ADAMW_GRAD_OFFLOAD}"
@@ -2007,8 +2047,15 @@ RUN_ENV=(
   LF_QWEN_MOE_EXPERT_LORA_IMPL="${LF_QWEN_MOE_EXPERT_LORA_IMPL}"
   ENABLE_LIGER_KERNEL="${ENABLE_LIGER_KERNEL}"
   USE_UNSLOTH_GC="${USE_UNSLOTH_GC}"
+  UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU="${UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU}"
   ASYM_GEMM_LF_CONFIG_LIGER_LOSS="${LIGER_LOSS_TAG}"
+  ASYM_GEMM_LF_CONFIG_RECOMP_OFF_STAGE="${ASYM_GEMM_LF_CONFIG_RECOMP_OFF_STAGE:-}"
   ASYM_GEMM_LF_CONFIG_USE_UNSLOTH_GC="${USE_UNSLOTH_GC}"
+  ASYM_GEMM_LF_CONFIG_UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU="${UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU}"
+  ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU}"
+  ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_SURGICAL_OFFLOAD="${ASYMM_DENSE_MLP_SURGICAL_OFFLOAD}"
+  ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD="${ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD}"
+  ASYM_GEMM_LF_CONFIG_ASYMM_MLP_RECOMPUTE_CHUNK="${ASYMM_MLP_RECOMPUTE_CHUNK}"
   ASYM_GEMM_LF_CONFIG_QWEN_EXPERT_LORA_IMPL="${LF_QWEN_MOE_EXPERT_LORA_IMPL}"
 )
 if [[ -n "${TRITON_CACHE_DIR:-}" ]]; then
@@ -2157,14 +2204,19 @@ if [[ "${PROFILE}" == "1" ]]; then
     ASYM_GEMM_LF_CONFIG_DIST_LAUNCHER="${DIST_LAUNCHER}"
     ASYM_GEMM_LF_CONFIG_ASYM_OFFLOAD_MODULES="${ASYM_OFFLOAD_MODULES}"
     ASYM_GEMM_LF_CONFIG_ASYM_STRICT="${ASYM_STRICT}"
+    ASYM_GEMM_LF_CONFIG_RECOMP_OFF_STAGE="${ASYM_GEMM_LF_CONFIG_RECOMP_OFF_STAGE:-}"
     ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_SURGICAL_OFFLOAD="${ASYMM_DENSE_MLP_SURGICAL_OFFLOAD}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD="${ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_GC="${ASYMM_LAYER_GC}"
     ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}"
     ASYM_GEMM_LF_CONFIG_ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}"
     ASYM_GEMM_LF_CONFIG_ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_MLP_RECOMPUTE_CHUNK="${ASYMM_MLP_RECOMPUTE_CHUNK}"
     ASYM_GEMM_LF_CONFIG_ATTN_GC_ENABLED="${ATTN_GC_ENABLED}"
     ASYM_GEMM_LF_CONFIG_LAYER_GC_ENABLED="${LAYER_GC_ENABLED}"
     ASYM_GEMM_LF_CONFIG_ROUTER_MODE="${ASYM_ROUTER_MODE}"

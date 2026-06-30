@@ -462,7 +462,7 @@ def test_profile_lora_lf_dry_run_labels_expert_lora_a_hbm_mode(tmp_path: Path) -
     assert len(commands) == 1
     command_paths = "\n".join(commands)
     assert (
-        "__expact1__attnact1__layeract1__layergc0__loraafwdhbm__actrecomp0__xunpack0"
+        "__expact1__attnact1__layeract1__layergc0__sdparecomp0__loraafwdhbm__actrecomp0__xunpack0"
         "__ligerloss0__gradofffalse__weightofffalse/b4_s4096_ga1"
     ) in command_paths
     command = next(iter(commands.values()))
@@ -549,12 +549,12 @@ def test_profile_lora_lf_four_field_exp_attn_axis_dry_run(tmp_path: Path) -> Non
     commands = {str(path): path.read_text(encoding="utf-8") for path in output_root.rglob("command.txt")}
     assert len(commands) == 5
     command_paths = "\n".join(commands)
-    neutral = "__actrecomp0__xunpack0__ligerloss0__gradofffalse__weightofffalse/"
-    assert f"__polnone__routerwhole__expact0__attnact0__layeract0__layergc0__loraafwdcpu{neutral}" in command_paths
-    assert f"__polgc-exp__routerwhole__expact0__attnact0__layeract0__layergc0__loraafwdcpu{neutral}" in command_paths
-    assert f"__polgc-attn-exp__routerwhole__expact0__attnact0__layeract0__layergc0__loraafwdcpu{neutral}" in command_paths
-    assert f"__polnone__routerwhole__expact1__attnact0__layeract0__layergc0__loraafwdcpu{neutral}" in command_paths
-    assert f"__polnone__routerwhole__expact1__attnact1__layeract0__layergc0__loraafwdcpu{neutral}" in command_paths
+    neutral = "__sdparecomp0__loraafwdcpu__actrecomp0__xunpack0__ligerloss0__gradofffalse__weightofffalse/"
+    assert f"__polnone__routerwhole__expact0__attnact0__layeract0__layergc0{neutral}" in command_paths
+    assert f"__polgc-exp__routerwhole__expact0__attnact0__layeract0__layergc0{neutral}" in command_paths
+    assert f"__polgc-attn-exp__routerwhole__expact0__attnact0__layeract0__layergc0{neutral}" in command_paths
+    assert f"__polnone__routerwhole__expact1__attnact0__layeract0__layergc0{neutral}" in command_paths
+    assert f"__polnone__routerwhole__expact1__attnact1__layeract0__layergc0{neutral}" in command_paths
 
     gc_attn_command = next(text for path, text in commands.items() if "__polgc-attn-exp__" in path)
     assert "ASYM_GEMM_LF_CONFIG_ASYM_STRICT=true" in gc_attn_command
@@ -572,7 +572,7 @@ def test_profile_lora_lf_four_field_exp_attn_axis_dry_run(tmp_path: Path) -> Non
     attnact_command = next(
         text
         for path, text in commands.items()
-        if f"__expact1__attnact1__layeract0__layergc0__loraafwdcpu{neutral}" in path
+        if f"__expact1__attnact1__layeract0__layergc0{neutral}" in path
     )
     assert "ASYMM_EXPERT_ACT_OFFLOAD=true" in attnact_command
     assert "ASYMM_ATTN_ACT_OFFLOAD=true" in attnact_command
@@ -671,9 +671,9 @@ def test_profile_lora_lf_four_part_layer_axis_dry_run(tmp_path: Path) -> None:
     commands = {str(path): path.read_text(encoding="utf-8") for path in output_root.rglob("command.txt")}
     assert len(commands) == 2
     command_paths = "\n".join(commands)
-    neutral = "__actrecomp0__xunpack0__ligerloss0__gradofffalse__weightofffalse/"
-    assert f"__polgc-layer__routerwhole__expact0__attnact0__layeract0__layergc0__loraafwdcpu{neutral}" in command_paths
-    assert f"__polnone__routerwhole__expact1__attnact1__layeract1__layergc0__loraafwdcpu{neutral}" in command_paths
+    neutral = "__sdparecomp0__loraafwdcpu__actrecomp0__xunpack0__ligerloss0__gradofffalse__weightofffalse/"
+    assert f"__polgc-layer__routerwhole__expact0__attnact0__layeract0__layergc0{neutral}" in command_paths
+    assert f"__polnone__routerwhole__expact1__attnact1__layeract1__layergc0{neutral}" in command_paths
 
     gc_layer_command = next(text for path, text in commands.items() if "__polgc-layer__" in path)
     assert "ASYM_EXPERT_RECOMPUTE_POLICY=gc-layer" in gc_layer_command
@@ -684,7 +684,7 @@ def test_profile_lora_lf_four_part_layer_axis_dry_run(tmp_path: Path) -> None:
     layeract_command = next(
         text
         for path, text in commands.items()
-        if f"__layeract1__layergc0__loraafwdcpu{neutral}" in path
+        if f"__layeract1__layergc0{neutral}" in path
     )
     assert "ASYMM_EXPERT_ACT_OFFLOAD=true" in layeract_command
     assert "ASYMM_ATTN_ACT_OFFLOAD=true" in layeract_command
@@ -805,7 +805,7 @@ def test_profile_lora_lf_default_e2e_shape_uses_asym_cpuadamwds(tmp_path: Path) 
 
     assert "llama-4-scout-17b-16e__gpus1__b4_s4096_ga1_w5_s10_r64_a16_drop000" in command_paths
     assert command_paths.count(
-        "asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact0__attnact0__layeract0__layergc0__loraafwdcpu"
+        "asym_cpuadamwds__source__norecomp__polnone__routerwhole__expact0__attnact0__layeract0__layergc0__sdparecomp0__loraafwdcpu"
         "__actrecomp0__xunpack0__ligerloss0__gradofffalse__weightofffalse/b4_s4096_ga1"
     ) == 1
     for command in command_texts:

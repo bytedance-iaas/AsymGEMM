@@ -963,7 +963,22 @@ class AsymActivationOffloadLoRALinear(nn.Module):
         if coordinator is not None:
             coordinator.release_group(getattr(self, "_weight_offload_owner", self))
 
+    def _plain_forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight_offload_enabled = getattr(self, "_weight_offload", None) is not None
+        if weight_offload_enabled:
+            self.gather_lora_weights()
+        try:
+            base = self.base_layer(x)
+            lora_x = self.lora_dropout(x).to(dtype=self.lora_dtype)
+            delta = self.lora_B[self.active_adapter](self.lora_A[self.active_adapter](lora_x))
+            return base + (delta * float(self.scaling)).to(dtype=base.dtype)
+        finally:
+            if weight_offload_enabled and bool(getattr(self, "_weight_offload_release_after_forward", True)):
+                self.release_lora_weights()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not (self.training and torch.is_grad_enabled()):
+            return self._plain_forward(x)
         return _AsymActivationOffloadLoRALinearFunction.apply(
             x,
             self.lora_A[self.active_adapter].weight,

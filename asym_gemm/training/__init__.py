@@ -138,6 +138,7 @@ from .qwen35_moe import (
     wrap_qwen35_moe_block,
 )
 from .qwen35_shared_mlp import AsymQwen35SharedMLP, is_qwen35_shared_mlp, is_qwen35_shared_mlp_leaf
+from .dense_mlp_finegrained import AsymFinegrainedDenseMLP, build_finegrained_dense_mlp
 from .llama4_moe import AsymLlama4Moe, AsymLlama4Router, Llama4MoeReport, is_llama4_moe, wrap_llama4_moe
 from .packed_moe import AsymPackedExperts, PackedExpertSource, PackedMoELayout, wrap_packed_experts
 
@@ -156,6 +157,7 @@ __all__ = [
     "AsymFrozenEmbedding",
     "AsymFrozenLayerNorm",
     "AsymFrozenRMSNorm",
+    "AsymFinegrainedDenseMLP",
     "AsymGroupedFrozenLinear",
     "AsymGroupedFrozenLinearFunction",
     "AsymLoRALinear",
@@ -213,6 +215,7 @@ __all__ = [
     "asym_bf16_cpu_right_matmul",
     "asym_frozen_linear",
     "asym_grouped_frozen_linear",
+    "build_finegrained_dense_mlp",
     "can_use_direct_bf16",
     "copy_lora",
     "collect_lf_offload_residency",

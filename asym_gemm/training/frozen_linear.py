@@ -64,6 +64,14 @@ class AsymExecutionStats:
     attn_act_lora_a_grad_calls: int = 0
     attn_act_stage_low_rank_calls: int = 0
     attn_act_hbm_gemm_calls_by_tag: Dict[str, int] = field(default_factory=dict)
+    dense_mlp_finegrained_forward_calls: int = 0
+    dense_mlp_finegrained_backward_calls: int = 0
+    dense_mlp_finegrained_gate_base_calls: int = 0
+    dense_mlp_finegrained_up_base_calls: int = 0
+    dense_mlp_finegrained_down_base_calls: int = 0
+    dense_mlp_finegrained_stage_concat_columns_calls: int = 0
+    dense_mlp_finegrained_gpu_silu_bwd_calls: int = 0
+    dense_mlp_finegrained_cpu_silu_bwd_calls: int = 0
     reference_fallback_count: int = 0
     fallback_reasons: Dict[str, int] = field(default_factory=dict)
 
@@ -116,6 +124,7 @@ class AsymExecutionStats:
             + self.cpu_left_lora_a_calls
             + self.expact_lora_a_forward_hbm_grouped_calls
             + self.attn_act_hbm_forward_calls
+            + self.dense_mlp_finegrained_forward_calls
         )
 
     @property
@@ -130,6 +139,7 @@ class AsymExecutionStats:
             + self.expact_stage_low_rank_calls
             + self.attn_act_hbm_backward_calls
             + self.attn_act_stage_low_rank_calls
+            + self.dense_mlp_finegrained_backward_calls
         )
 
     @property

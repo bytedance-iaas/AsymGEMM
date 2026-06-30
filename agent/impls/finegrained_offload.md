@@ -230,6 +230,33 @@ holds the `[M,I]` and whether the **silu actually ran on CPU / the offload actua
 "engine isn't offloading inside the recompute" or "weight-offload zeroed a LoRA bank". It is opt-in detail (off the hot
 path) — enable only when a number looks wrong, then turn it back off.
 
+**Execution notes (verified live, Stage 0):**
+- **No `[asym] surgical installed` print exists** (the lf.py surgical block at `:1992-2020` only bumps
+  `report.dense_mlp_act_offload_wrapped`). Confirm install by **step time ≫ plain unsloth** (s2048 b8 = 17.8 s/step vs
+  ~1–2 s plain) or the per-module stats — NOT by grepping for a banner.
+- **`ASYMM_EXPERT_SILU_BWD_GPU` is NOT forwarded** to the python subprocess by the runner's `RUN_ENV`, so python sees
+  it UNSET → `_use_gpu_silu_bwd()` returns **False → CPU silu** (`qwen3_moe.py:921`). This is the **peak lever we
+  want**, so `recomp-off` gets it for free. (The test harness sets `=1` but it's dropped at the runner boundary — a
+  latent harness gap. If GPU silu is ever wanted, add the var to the runner `RUN_ENV` AND override the harness default.)
+- **lf.py's "runs the FULL dense MLP forward/backward on CPU" comment (`:1977`) is imprecise** — the **base gate_up/down
+  GEMMs run on GPU via `@^R`** (proven: s2048 forward = 3.7 s; a CPU `[16384,5120]@[51200,5120]` alone would exceed
+  that). Only the **silu + LoRA-grad** path is CPU. The "stalls at scale" warning is a *latency* caveat (accepted), not
+  an OOM — the chunked MLP it replaces ran at 371 s/step and completed.
+- The surgical engine is the documented dense opt-in (`ASYMM_DENSE_MLP_SURGICAL_OFFLOAD`); weight-offload is forced OFF
+  by the `recomp-off` harness arm.
+
+**Stage 1 RESULT (s45k, measured):** surgical MLP offload **works** — `mlp_dense` saved activation = **3.5 GiB** (was
+~74 on GPU), real seq 45000 verified, CPU RSS 391 GiB. **But s45k OOM'd** (tried +34.33 GiB = the `[M,2I]` gate_up GEMM
+on top of 162 GiB). The exact peak breakdown (`memory_actual_peak_breakdown.csv`) pinned **two** GPU hogs the design
+must offload, neither of which Stage-1-as-written touched:
+  1. **Attention recompute on GPU** (attn offload OFF) — the q/k/v/o LoRA + norms, ~70+ GiB. → **`attnact=true`**.
+  2. **MLP down-proj LoRA-A materializing the act on GPU** — `model.layers.N.mlp.engine.lora_dropout` shape
+     `[M,I]=360000×25600=18 GiB` live — because the run used **`ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm`** (harness
+     default). With **`=cpu`** the LoRA-A runs on the CPU-offloaded act (`@^L`), no `[M,I]` on GPU. → **set lora_a_fwd=cpu**.
+So the working recomp-off config needs **both** `attnact=true` AND `ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu` (fold both
+into the `recomp-off` label once confirmed). Stage-1 lesson: the surgical base-act offload alone is not enough — the
+LoRA-A input is a second `[M,I]` that must also go to CPU.
+
 **Stage 0 — implement the `recomp-off` label (so you write the config name, not the raw combo).** Add `recomp-off` to
 `recompute_label()` in `scripts/lf/profile_lora_lf_test_*.sh` and the recompute-name parser in `run_lf_lora_sft.sh`,
 expanding it to: `USE_UNSLOTH_GC=true` + `GRADIENT_CHECKPOINTING=true` + `ASYMM_DENSE_MLP_SURGICAL_OFFLOAD=1`

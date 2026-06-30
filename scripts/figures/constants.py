@@ -105,7 +105,7 @@ FIGURE_PARAMS = {
     "lora_timing": {
         "height": 6,
         "bar_width": 0.10,    # bar thickness only (independent)
-        "pair_gap": 0.18,     # spacing of the 2 bars WITHIN a group
+        "pair_gap": 0.19,     # spacing of the 2 bars WITHIN a group
         "group_gap": 0.25,    # spacing BETWEEN groups (independent of pair_gap)
         "x_margin": 0.11,     # padding beyond the outermost bar edges
         "x_tick_label_pad": 10,  # PyTorch/SuperOffload label distance from x-axis
@@ -119,7 +119,7 @@ FIGURE_PARAMS = {
     "memory": {
         "height": 6,
         "bar_width": 0.1,    # bar thickness only (independent)
-        "pair_gap": 0.18,     # PyTorch vs SuperOffload within one model
+        "pair_gap": 0.19,     # PyTorch vs SuperOffload within one model
         "group_gap": 0.25,    # spacing BETWEEN model groups
         "x_margin": 0.11,     # padding beyond the outermost bar edges
         "x_tick_label_pad": 10,  # PyTorch/SuperOffload label distance from x-axis

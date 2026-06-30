@@ -96,6 +96,20 @@ def test_linear_forward_matches_current_without_dropout() -> None:
     torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
 
 
+def test_linear_no_grad_uses_plain_forward_without_offload_stats() -> None:
+    current, offload = _make_pair()
+    current.train()
+    offload.train()
+    x = torch.randn(3, 5, 16, dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        expected = current(x)
+        actual = offload(x)
+
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+    assert offload._last_activation_offload_stats == {}
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA SDPA")
 def test_attention_saved_tensor_offload_preserves_sdpa_backward_strides() -> None:
     torch.manual_seed(307)

@@ -263,6 +263,8 @@ class LFAsymReport:
     dense_lora_wrapped: int = 0
     dense_mlp_act_offload_enabled: bool = False
     dense_mlp_act_offload_wrapped: int = 0
+    dense_mlp_finegrained_offload_enabled: bool = False
+    dense_mlp_finegrained_offload_wrapped: int = 0
     trainable_lora_params: int = 0
     cpu_resident_base_bytes: int = 0
     gpu_resident_base_bytes: int = 0
@@ -328,6 +330,7 @@ class LFAsymReport:
             f"llama4_moes_wrapped={self.llama4_moes_wrapped}, "
             f"dense_lora_wrapped={self.dense_lora_wrapped}, "
             f"dense_mlp_act_offload_wrapped={self.dense_mlp_act_offload_wrapped}, "
+            f"dense_mlp_finegrained_offload_wrapped={self.dense_mlp_finegrained_offload_wrapped}, "
             f"trainable_lora_params={self.trainable_lora_params}, "
             f"cpu_resident_base_bytes={self.cpu_resident_base_bytes}, "
             f"gpu_resident_base_bytes={self.gpu_resident_base_bytes}, "
@@ -346,6 +349,8 @@ class LFAsymReport:
             f"layer_act_offload_wrapped={self.layer_act_offload_wrapped}, "
             f"layer_glue_gc_enabled={self.layer_glue_gc_enabled}, "
             f"layer_glue_gc_wrapped={self.layer_glue_gc_wrapped}, "
+            f"dense_mlp_finegrained_offload_enabled={self.dense_mlp_finegrained_offload_enabled}, "
+            f"dense_mlp_finegrained_offload_wrapped={self.dense_mlp_finegrained_offload_wrapped}, "
             f"attention_saved_tensor_offload_wrapped={self.attention_saved_tensor_offload_wrapped}, "
             f"linear_attention_saved_tensor_offload_wrapped={self.linear_attention_saved_tensor_offload_wrapped}, "
             f"router_mode={self.router_mode}, "
@@ -383,6 +388,8 @@ class LFAsymReport:
             f"layer_act_offload_wrapped={self.layer_act_offload_wrapped}, "
             f"layer_glue_gc_enabled={self.layer_glue_gc_enabled}, "
             f"layer_glue_gc_wrapped={self.layer_glue_gc_wrapped}, "
+            f"dense_mlp_finegrained_offload_enabled={self.dense_mlp_finegrained_offload_enabled}, "
+            f"dense_mlp_finegrained_offload_wrapped={self.dense_mlp_finegrained_offload_wrapped}, "
             f"attention_saved_tensor_offload_wrapped={self.attention_saved_tensor_offload_wrapped}, "
             f"linear_attention_saved_tensor_offload_wrapped={self.linear_attention_saved_tensor_offload_wrapped}, "
             f"router_mode={self.router_mode}, "
@@ -1969,6 +1976,50 @@ def apply_lf_asym_lora(
         elif not expert_prefixes and strict:
             raise ValueError("AsymGEMM requested routed expert LoRA but found no supported packed expert/MoE modules.")
 
+    dense_mlp_finegrained_enabled = (
+        backend == "asym"
+        and not expert_prefixes
+        and (
+            _env_true(os.environ.get("ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD"))
+            or _env_true(os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD"))
+        )
+    )
+    report.dense_mlp_finegrained_offload_enabled = bool(dense_mlp_finegrained_enabled)
+    if dense_mlp_finegrained_enabled:
+        from asym_gemm.training.dense_mlp import is_dense_mlp_module
+        from asym_gemm.training.dense_mlp_finegrained import build_finegrained_dense_mlp
+
+        dense_mlp_names = [
+            name
+            for name, module in model.named_modules()
+            if name
+            and not _is_under(name, expert_prefixes)
+            and not _is_router_module_name(name)
+            and not _is_vision_or_multimodal_path(name)
+            and is_dense_mlp_module(module)
+        ]
+        for name in dense_mlp_names:
+            module = model.get_submodule(name)
+            wrapped = build_finegrained_dense_mlp(
+                module,
+                backend=backend,
+                precision=precision,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                stats=stats,
+                strict=strict,
+                profile_prefix=_qwen3_profile_prefix_from_module_name(name),
+            )
+            parent, child_name = _parent_and_child(model, name)
+            _replace_child(parent, child_name, wrapped)
+            expert_prefixes.append(name)
+            report.dense_mlp_finegrained_offload_wrapped += 1
+            report.cpu_resident_base_bytes += int(getattr(wrapped, "cpu_resident_base_bytes", 0))
+            report.gpu_resident_base_bytes += int(getattr(wrapped, "gpu_resident_base_bytes", 0))
+            del module
+            _release_replaced_module_memory()
+
     # Dense-MLP surgical activation offload. On a DENSE model the MLP is the analog of routed
     # experts, so `ASYMM_EXPERT_ACT_OFFLOAD` should offload its `silu(gate)*up` intermediate to
     # CPU and run the down-proj LoRA backward on CPU via AsymGEMM (reusing the expert engine as a
@@ -1983,6 +2034,7 @@ def apply_lf_asym_lora(
     dense_mlp_act_enabled = (
         backend == "asym"
         and not expert_prefixes
+        and not dense_mlp_finegrained_enabled
         and (
             _env_true(os.environ.get("ASYMM_DENSE_MLP_SURGICAL_OFFLOAD"))
             or _env_true(os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_SURGICAL_OFFLOAD"))
