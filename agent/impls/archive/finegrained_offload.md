@@ -1,292 +1,346 @@
-# Fine-Grained Activation Offload via AsymGEMM Placement (long-sequence LoRA-SFT)
+# Recompute-then-Offload via AsymGEMM Placement (`asym|recomp-off|ligerloss1`)
 
-## GOAL (read first)
+## GOAL (unchanged)
 
-Extend the **maximum trainable sequence length** of dense **Qwen3-32B** LoRA-SFT on a single GPU **beyond the
-`superoffload_mem | unsloth | ligerloss1` baseline**, at the same batch size, by using AsymGEMM's actual capability:
-**run the big GEMMs on GPU with CPU-resident operands (`@^R`), and run the wide non-GEMM (elementwise) ops on CPU**,
-so the large `[M,I]` intermediates never sit on GPU and the per-layer HBM peak collapses.
-
-Concrete target / acceptance:
-- Hardware envelope (measured): **GPU = 184 GiB** (1× Blackwell), **CPU = 958 GiB** (`numactl --membind=0,1`, two
-  Grace nodes; shared with other jobs → treat ~870 GiB as the activation budget).
-- Baseline to beat: `q3-32b | superoffload_mem | unsloth | ligerloss1 | b8` → peak **178 GiB reserved**, ceiling
-  ≈ **s45000** (HBM-bound; OOMs above ~s45k). `profiling/.../superoffload_mem__source__unsloth__.../b8_s45000_ga1/`.
-- **Win = train a strictly longer real sequence than s45000 at b8** with finite `loss`, GPU < 184 GiB, CPU < ~870 GiB.
-  Latency may be worse (accepted), not pathological. Target ceiling (projection): **~s120–150k** (CPU-bound).
-
-Backend / harness contract:
+Train dense **Qwen3-32B** LoRA-SFT at a **strictly longer real sequence length than the
+`superoffload_mem | unsloth | ligerloss1` baseline** (peak **178 GiB reserved**, ceiling ≈ **s45000** at b8, on a
+**184 GiB** GPU / **958 GiB** CPU `--membind=0,1` ≈ ~870 GiB usable). Latency may be worse (accepted), not pathological.
+Target ceiling (projection, must measure): **~s120–150k**, CPU-bound. Config name:
 ```
-q3-32b | asym | norecompute | ligerloss1 | <seq>|8|1 | none|false|false|false|false|false
+q3-32b | asym[_cpuadamwds] | recomp-off | ligerloss1 | <seq>|8|1 | none|false|false|false|false|false
 ```
-- `asym` backend: frozen base weights CPU-resident, fetched per-GEMM via CPU-right AsymGEMM `@^R`.
-- **Optimizer is an INDEPENDENT choice** (see "Optimizer + contention rule"): CPU AdamW (`asym_cpuadamwds`) **or**
-  GPU AdamW (plain `asym`). For the max-seq regime, GPU AdamW is mildly preferred (kills the grad-offload C2C
-  contention that slows the CPU silu) at the cost of ~8 GiB HBM; either works.
-- `norecompute` = **AsymGEMM owns the offload/recompute itself** (no HF/Unsloth GC, no `ASYMM_LAYER_GC`).
-- `ligerloss1` stays on — fused CE removes the `[M,V]` logits apex (≈102 GiB at this M); without it nothing fits.
+- `asym_cpuadamwds` = base weights CPU-resident (per-GEMM `@^R`) **+ CPU AdamW** (optimizer state on CPU — an HBM
+  saving for max-seq). Plain `asym` (GPU AdamW) is the orthogonal alternative. CPU AdamW + grad-offload are fine in the
+  recompute; only the LoRA **weight**-offload sub-flag (`ASYM_CPU_ADAMW_WEIGHT_OFFLOAD`) must be OFF (or gather-in-
+  closure) to dodge the gather hazard — LoRA weights are tiny so this costs ~0 HBM.
+- `recomp-off` = the recompute-mode **label you always write** (never `unsloth`). It expands internally to: **unsloth's
+  whole-layer GC** (REUSED — recomputes each layer in backward, offloads `X_in` correctly) **+ AsymGEMM's surgical
+  MLP/attn engines inside the recompute** (offload `[M,I]`/X + **silu on CPU** + `@^R`) = `unsloth +
+  ASYMM_DENSE_MLP_SURGICAL_OFFLOAD=1 [+ ASYMM_ATTN_ACT_OFFLOAD=1]`. A *composition of existing pieces*, not new
+  recompute/backward code (see the reuse map). The harness label is implemented in Stage 0.
+- `ligerloss1` stays on — fused CE removes the `[M,V]` logits apex (≈102 GiB); without it nothing fits.
 
-What was tried and why this is the design (see `MEMORY: asym-unsloth-beats-superoffload`, `finegrained-offload-design`):
-- `none|T|T|F|T|T` (offload **everything**, hold all layers) → CPU ~5 TB → OOMs CPU at ~T6.6k. **Wrong.**
-- `unsloth` / `asym|unsloth` (recompute **everything** on GPU) → HBM-bound at the whole-layer GPU recompute
-  transient (~178 GiB) → ceiling s45k. **No win** (measured `asym|unsloth ≈ superoffload`).
-- **This design:** keep the GEMMs on GPU but **do the wide elementwise on CPU and hold only what's cheap**, so the
-  per-layer GPU transient is ~one `[M,I]` (~17 GiB), not ~6 (~100 GiB). That is the actual peak lever.
+## The design in one paragraph
 
-### Two corrections to earlier drafts of this doc (do not regress)
-1. **`@^R` + CPU-elementwise DOES reduce the `[M,I]` peak.** Earlier text said offload can't touch the `[M,I]`. That
-   was wrong: the GEMMs (`fc1`/`fc2`) must run on GPU (CPU GEMM at M=360k is hours/layer), but their `[M,I]` outputs
-   are **offloaded immediately** and the consuming **silu/mul run on CPU** (`mlp_math_real.md` / the expert engine),
-   so only **1×`[M,I]` is ever live on GPU**. The MLP transient drops ~100 GiB → ~17 GiB. This is the lever.
-2. **"Base weights off HBM" is NOT an asym-specific win.** superoffload_mem (ZeRO-3 `offload_param`) already keeps
-   the 64 GiB base on CPU and streams ~1 GiB/layer — its 178 GiB GPU peak is **all activations, `weights … 0.00 MiB`**
-   in the breakdown. So base-weight placement is **common, ~1 GiB transient, not the differentiator**. The asym
-   advantage is the **activation-side asymmetric ops** (`@^R`-fetch + CPU elementwise), which ZeRO-3 lacks.
+**Forward:** run each layer, **offload only its input `X_in`** `[M,H]` to CPU, **discard everything else** (no
+autograd graph for the wide tensors). **Backward (layer 64→1):** stage `X_in` back, **recompute the layer**, but with
+**AsymGEMM placement** — every big GEMM (qkv/o/fc1/fc2 base) runs on GPU reading its frozen weight from CPU (`@^R`),
+each `[M,I]` GEMM output is **offloaded the instant it's produced**, and the **silu/mul run on CPU** on those copies
+so the `[M,I]` never pile up; then the layer's backward runs, using `@^R` to **fetch the just-offloaded activations
+as CPU operands** for the weight-grads (`dA = dS.ᵀ @^R act_cpu`) and base input-grad (`@^R W_cpu`) — **no
+re-materialization**. Free the layer, move on. Invariant: **≤ 1 `[M,I]` tensor on GPU at any instant**.
 
----
+## Why both halves are needed (recompute solves CPU; AsymGEMM placement solves the GPU peak)
+
+`m` = measured (real 45891-tok q3-32b b8); `p` = projected.
+
+| approach | GPU peak @s45k | CPU | verdict |
+|---|---:|---:|---|
+| recompute on **GPU** = plain `unsloth` (hold/offload X_in, recompute, **silu on GPU**) | **179 GiB OOM** `m` (≈6×`[M,I]`) | ~392 | ❌ = superoffload (178) |
+| offload **all**, no recompute (`none\|T\|T\|F\|T\|T`) | tiny | **~5 TB** | ❌ CPU blows up (~T6.6k) |
+| unsloth + **chunked MLP** (now removed) | 129 `m` (MLP capped `[chunk,I]`; attn ~68 still on GPU) | 394 | ⚠️ win but slow (371 s/step, nested double-recompute) |
+| unsloth + **surgical MLP engine** (Stage 1) | < 129 `p` (MLP `[M,I]` offloaded; attn-bound ~70–90) | ~400 | ✅ single recompute |
+| unsloth + surgical MLP + **attn offload** (Stage 2, this design) | **~35–40 `p`** (≤1×`[M,I]`) | ~400 | ✅ the target |
+
+Recompute (the unsloth whole-layer GC) solves **CPU** (don't hold `[M,I]` ×64). The AsymGEMM placement — offload each
+`[M,I]` + **silu on CPU** + `@^R` fetch, run *inside* that recompute — solves the **GPU peak** (6×`[M,I]`→1). Plain
+unsloth keeps the silu on GPU and lands at 179. The CPU-elementwise placement is the entire win and is not optional.
+We **reuse unsloth's recompute scaffolding** (it offloads `X_in` correctly) and swap its on-GPU MLP for the surgical
+engine — strictly better than the chunked MLP (full offload, single recompute) it replaces.
 
 ## The peak lever: AsymGEMM placement (which op runs where)
 
 | op kind | examples | where | rule |
 |---|---|---|---|
-| **big GEMM** | qkv, o_proj, fc1, fc2 (base) | **GPU**, frozen weight streamed via `@^R` | CPU GEMM is ~10⁴× too slow at dense M; output is one tensor on GPU, offloaded right after |
-| **dA (weight-grad GEMM)** | `dA = dS.ᵀ @^R X_cpu` | **GPU**, activation operand on **CPU** | activation **fetched into the GEMM, never materialized** (no-remat) |
-| **dB** | `dY.ᵀ @ stage(S)` | GPU | `S` is `[M,r]`, tiny |
-| **SDPA** | FlashAttention | **GPU** | fused kernel, O(M) mem, no CPU form |
-| **elementwise / norm** | **silu, the `*`**, RMSNorm, RoPE, residual add | **CPU** (on the already-offloaded copies) | memory-bound; doing them on CPU means the `[M,I]` results **never touch GPU** |
+| **big GEMM (base)** | qkv, o_proj, fc1, fc2 | **GPU**, frozen weight via `@^R` | CPU GEMM ~10⁴× too slow at dense M; output offloaded right after |
+| **weight-grad `dA`** | `dS.ᵀ @^R X_cpu`/`N2_cpu`/`act_cpu` | **GPU**, activation operand on **CPU** | activation **fetched into the GEMM, never materialized** |
+| **`dB`** | `dY.ᵀ @ stage(S)` | GPU | `S` is `[M,r]`, tiny, regenerated by recompute |
+| **SDPA** | FlashAttention | **GPU** | fused, O(M) mem, no CPU form |
+| **elementwise/norm** | **silu, `*`**, RMSNorm, RoPE, residual | **CPU** (on the offloaded copies) | doing them on CPU is why the `[M,I]` results never touch GPU |
 
-**The boundary = (a GEMM-output offload) FUSED WITH the CPU elementwise that consumes it.** A big GEMM's `[M,I]`
-output is offloaded D2H *immediately*; the silu/mul that reads it runs **on CPU on that copy (no stage-back)**; the
-result is staged to GPU only to feed the *next* GEMM. So at any instant **only one `[M,I]` is live on GPU**.
+`[M,I]` ≈ 17 GiB/layer (M=tokens × I=25600) is the memory hog; `[M,H]` ≈ 3.4 GiB. The MLP math (`@^R` base + LoRA +
+CPU silu) is exactly `AsymQwen3Experts` (`mlp_math_real.md`); `dense_mlp.py` wraps a dense MLP as an E=1 expert. The
+attention math (`@^R` base, `@^L` LoRA-A on offloaded X, `@^R` dA, SDPA-recompute) is exactly
+`AsymActivationOffloadLoRALinear` (`attn_math_real.md`). **Reuse both engines** — `recomp-off` is "run them, but per
+layer in backward so their offloaded activations stay transient (×1), holding only `X_in`."
 
-**Why it cuts the *peak* (trace `mlp_math_real.md` backward, devices annotated):**
+## The per-layer chain (boundaries + devices + LoRA)
+
+`⬇`=offload GPU→CPU+free, `⬆`=stage CPU→GPU.
 ```
-dY[M,H] GPU
-dact  = dY @^R W_down_cpu                 GPU GEMM   -> dact[M,I] on GPU ........ 1 live [M,I]
-dA_down = dS_down.ᵀ @^R act_cpu           GPU GEMM, act stays CPU (no remat)
-⬇ offload dact -> dact_cpu ; free GPU                                            0 live [M,I]
-dgate = silu_bwd(dact_cpu*up_cpu, gate_cpu) ; dup = dact_cpu*silu(gate_cpu)   CPU  (born/consumed on CPU)
-⬆ stage dgate ; dX = dgate @^R W_gate_cpu  GPU GEMM .......................... 1 live [M,I]
-⬆ stage dup   ; dX += dup   @^R W_up_cpu   GPU GEMM .......................... 1 live [M,I]
-dA_gate = dS_gate.ᵀ @^R N2_cpu ; dA_up = dS_up.ᵀ @^R N2_cpu   GPU GEMM, N2 on CPU
+Attention (no big elementwise → only the dA-input offload):
+  X_in ⬆ -> qkv (GPU @^R) ; RoPE/SDPA (GPU) ; AttnOut ⬇ ; o_proj (GPU @^R)
+  dA: qkv = dS.ᵀ @^R X_in_cpu ;  o = dS.ᵀ @^R AttnOut_cpu
+MLP (offload each [M,I] right after its GEMM; split fc1 so only 1×[M,I] on GPU):
+  N2 = RMSNorm(H_mid) [CPU] ; ⬆ N2
+  gate = N2 @^R W_gate (+LoRA)  -> ⬇ gate_cpu
+  up   = N2 @^R W_up   (+LoRA)  -> ⬇ up_cpu
+  act  = silu(gate_cpu)·up_cpu  [CPU]                 <- the fused boundary (no stage-back)
+  Mout = act @^R W_down (+LoRA) [⬆ act for base; LoRA = act_cpu @^L A_down]
+  (bwd) dact ⬇ -> dgate,dup = silu_bwd [CPU] -> ⬆ -> dX = dgate@^R W_gate + dup@^R W_up
+  dA: fc1 = dS.ᵀ @^R N2_cpu ;  down = dS.ᵀ @^R act_cpu ;  dB = d*.ᵀ @ regenerated S
 ```
-`gate, up, act, dgate, dup` are never on GPU. Forward is symmetric (`fc1 -> gate_up[M,2I] GPU -> offload -> act=silu*up CPU`).
-MLP GPU transient ≈ **1×`[M,I]` (17 GiB)** vs ~100 GiB if all `[M,I]` were GPU-resident.
+LoRA: **LoRA-A** reads the projection input (`X_cpu @^L A` or GPU); **LoRA-B** small; the low-rank `S` is
+**regenerated by the recompute** (not held); **dA fetches the input via `@^R`** (no remat).
 
-**Cost (measured, accepted):** the CPU SwiGLU backward is **~640 ms/layer** (`qwen3_moe.py:923` — bandwidth-bound,
-contends with grad-offload D2H). ×64×(fwd+bwd) ≈ +80 s/step. `ASYMM_EXPERT_SILU_BWD_GPU` is the **peak↔speed dial**:
-GPU-silu = sub-ms but stages `[M,I]` back (higher peak, lower seq); CPU-silu = the peak lever. We take CPU-silu.
+## Three tiers (this is "which to offload vs recompute")
 
-The MLP math (`@^R` base + LoRA + CPU silu) is exactly `AsymQwen3Experts` (`mlp_math_real.md`). For a **dense** MLP,
-`dense_mlp.py` already wraps it as an E=1 expert. The attention math (`@^R` base, `@^L` LoRA-A on offloaded X, `@^R`
-dA, SDPA recompute) is exactly `AsymActivationOffloadLoRALinear` (`attn_math_real.md`). **Reuse both** — this design
-is "run them, but recompute per layer so their offloaded activations stay transient".
+1. **Forced recompute** — the `[M,I]` (`fc1`/`mlp_act`). Hold-×64 = 1099–2197 GiB (impossible). Recompute (CPU-silu).
+   The bulk of the recompute latency, unavoidable. **Rejected** from any hold/offload list.
+2. **Forced hold** — `X_in` `[M,H]` (220 GiB ×64). The recompute **root** → *cannot be recomputed* → must persist.
+3. **Optional hold = `ASYMM_OFFLOAD_PRODUCERS`** (default empty). Subset of `{attn_norm, mlp_norm, core_attn(AttnOut),
+   post_attn_resid}`, all `[M,H]`/`[M,Dq]`. **Holding one skips its recompute** (e.g. hold `AttnOut` → skip the
+   SDPA+qkv recompute → lower latency) at +220/352 GiB CPU. **It does NOT change the peak** (the peak is the forced
+   `[M,I]` transient); it is a **latency↔CPU knob**. For max-seq, leave **empty** (min CPU).
+
+## Storage hierarchy — NVMe is capacity, NOT speed
+
+Per-layer fetch cost of a wide tensor: **CPU-stage ≈ 38 ms** (17 GiB @ ~450 GB/s C2C) **< recompute ≈ 700 ms** (GEMM +
+640 ms CPU silu) **≪ NVMe-stage ≈ 2.5–3.4 s** (17 GiB @ 5–7 GB/s). So: hold-in-CPU what is small *and*
+expensive-to-recompute (`X_in` always; `AttnOut` if CPU allows → faster); **recompute the big `[M,I]`** (faster than
+NVMe-stage). **NVMe earns its place only for the un-recomputable held boundaries (`X_in`) once CPU itself overflows**
+(~s195k) — spill the *cold* early-layer `X_in` to NVMe purely to fit, accepting it's slower. Never NVMe the `[M,I]`.
+
+## Accounting (do not conflate)
+
+- **held → ×64** (lives on CPU all layers): `X_in` = 220 GiB; each optional `[M,H]` held = +220, `[M,Dq]` = +352.
+- **recompute-transient → ×1** (one layer live, freed after its bwd): the `[M,I]` GEMM transient (~17 GiB) is NOT ×64.
+- **optimizer/params → single all-model total** (~8 GiB), not per-layer.
+
+Envelope @ s45k (projection — Stage 1 must confirm): GPU peak ≈ 1×`[M,I]` (17) + attn FA (~12) + dX (~3) + ~8 GiB
+optimizer ≈ **~35–40 GiB**; CPU ≈ `X_in`×64 (220) + base 64 + one-layer `[M,I]` (~100) ≈ **~400 GiB**.
+
+## Optimizer + contention rule
+
+*Offload/CPU-compute ONLY what reduces the peak; keep peak-irrelevant work on GPU.* Two supported optimizer options
+(orthogonal to the recompute — same `recomp-off` label, same peak):
+
+- **Option 1 (primary) — `asym_cpuadamwds | recomp-off | ligerloss1`** (CPU AdamW): optimizer state on CPU, ~8 GiB HBM
+  saved → directly buys max-seq. Risk: CPU AdamW's grad-offload D2H **contends on C2C with the CPU silu**
+  (`qwen3_moe.py:923`, ~640 ms/layer) and could disrupt the backward flow.
+- **Option 2 (fallback) — `asym | recomp-off | ligerloss1`** (GPU AdamW): keep the 8 GiB optimizer on HBM
+  (peak-irrelevant) to **free C2C for the silu**. Use this if Option 1's grad-offload contention dominates latency.
+
+Validate Option 1 first; if its step time is gated by grad↔silu C2C contention, re-run Option 2 and compare. Either
+way keep the LoRA **weight**-offload OFF in the recompute (`ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false`; the JIT release
+bypasses the recompute's gather pre-hook). Base weights (64 GiB) and the wide activations *are* worth their
+contention (they cut the peak).
+
+## The config / arg + plumbing
+
+- `recomp-off` label (wired in Stage 0): `scripts/lf/profile_lora_lf_test_*.sh` `recompute_label()` +
+  `run_lf_lora_sft.sh` recompute parser → **`USE_UNSLOTH_GC=true`, `GRADIENT_CHECKPOINTING=true`,
+  `ASYMM_DENSE_MLP_SURGICAL_OFFLOAD=1`** (+ `ASYMM_ATTN_ACT_OFFLOAD=1` from Stage 2) + `ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=
+  false`. **No custom wrapper** — the recompute IS unsloth GC; the offload IS the surgical engine. Ensure those engine
+  envs are forwarded in `RUN_ENV`.
+- *(Post-v1, optional latency knob — NOT in the target run.)* `ASYMM_OFFLOAD_PRODUCERS` ⊆ `{attn_norm, mlp_norm,
+  core_attn, post_attn_resid}`: hold a chosen boundary ×64 on CPU to *skip its recompute* (Megatron-style). `X_in`
+  always held (not listable); `fc1`/`mlp_act` rejected (→ NVMe). Out-dir tag `offprod-<letters>`, empty = `offprod-none`.
+  Default empty ⇒ hold only `X_in`. Implementing the hold under unsloth's whole-layer recompute is non-trivial; defer.
+- Token-chunked MLP is **commented out** (`lf.py` install + import; `chunked_mlp.py` header note);
+  `ASYMM_MLP_RECOMPUTE_CHUNK` is now a no-op. **Do not re-enable.**
+
+## Megatron reference (offload mechanism; our boundaries are fused with CPU compute)
+
+Megatron-Core v0.18 `--fine-grained-activation-offloading` is the mechanical reference for *offload-a-saved-tensor +
+reload-in-backward*. **Ours differs:** the offloaded `[M,I]` is consumed by a **CPU silu, not staged back**, and we
+add `@^R`/`@^L`. But copy its offload plumbing exactly:
+`with off_interface(flag, x, name) as x: <module>` … `group_commit(out, name, forced_released_tensors=[x])`.
+`GroupStart` fwd opens a group + pushes `saved_tensors_hooks`; **bwd triggers H2D reload**. `GroupCommit` fwd does
+**D2H on a side stream + `tensor.untyped_storage().resize_(0)` free** (torch GC won't drop it); **bwd waits the reload
+event**. D2H **deferred past the last forward consumer** (`attn_norm` committed only after the residual add). Files:
+`megatron/core/pipeline_parallel/fine_grained_activation_offload.py`; `tensor_parallel/random.py:555-829`;
+`transformer/moe/experts.py:769-787`; `transformer/transformer_layer.py:617-693`;
+`transformer_config.py:1120-1138,1658-1685`. **Drop** the PP/microbatch/double-buffer/VPP/CUDA-graph machinery.
+
+**CRITICAL — explicit autograd op, NOT `torch.utils.checkpoint`.** Its internal input-holder **bypasses
+`saved_tensors_hooks`** → boundaries piled on GPU → **forward OOM at ~42 layers** (we hit this). Do the D2H +
+`resize_(0)` free **explicitly** inside our own Function (Megatron's `GroupCommit` / Unsloth's
+`UnslothGradientCheckpointing`, `LlamaFactory/.../checkpointing.py:44-77`). Run the original forward under `no_grad`.
+
+**Recompute determinism:** bit-exact only because `lora_dropout = attention_dropout = 0` (enforced) and
+`@^R`/FlashAttention(0) are deterministic → no RNG op per layer. Do not add RNG ops without save/restore; the parity
+test (Stage 1) guards this.
 
 ---
 
-## The per-layer chain — boundaries, devices, LoRA
+## Implementation reuse map — what is NEW vs REUSED (answers "do we rewrite recompute+backward?")
 
-`⬇`=offload GPU→CPU, `⬆`=stage CPU→GPU. `[T]`=per-layer transient (×1), `[H×64]`=held all layers.
+**No new recompute/backward math.** Code review (file:line) shows every piece already exists; `recomp-off` is a
+*composition* of proven pieces plus one 1-line guard. So **forward ≈ unsloth-fc forward** (hold `X_in`, plain GPU
+forward — the engine SKIPS offload under `no_grad`), and **backward = unsloth's whole-layer recompute, but the MLP/attn
+submodules ARE the AsymGEMM engines** (offload `[M,I]`/X + CPU silu + `@^R`); their existing backward fires under
+`autograd.backward`.
 
-**Attention** (no big elementwise → no silu-boundary; only dA-input offloads):
+| piece | status | where |
+|---|---|---|
+| whole-layer recompute + **offload `X_in` to CPU** | **REUSE** unsloth GC (measured: fwd fits ~85 GiB, offloads `[M,H]` correctly) | `UnslothGradientCheckpointing` `LlamaFactory/.../checkpointing.py:44-77` |
+| MLP `@^R` GEMMs + **CPU silu** + offload `[M,I]` | **REUSE** dense surgical engine (E=1 ⇒ **one grouped `@^R` GEMM**, no small GEMMs/loops) | `AsymDenseMLP`/`AsymQwen3Experts`, env `ASYMM_DENSE_MLP_SURGICAL_OFFLOAD=1` `lf.py:1983`; GEMM `frozen_linear.py:710`, E=1 group `moe.py:263` |
+| attention `@^R` base + dA + offload X/S | **REUSE** attn engine, env `ASYMM_ATTN_ACT_OFFLOAD=1` | `AsymActivationOffloadLoRALinear` |
+| MLP engine **skips offload under `no_grad`** (unsloth's no_grad fwd ⇒ plain GPU fwd, nothing held but `X_in`) | **ALREADY TRUE** | `_uses_activation_offload = requested AND training AND is_grad_enabled` `qwen3_moe.py:2476` |
+| MLP engine offloads `[M,I]` **transiently** in the enable_grad recompute, fires own backward, frees | **ALREADY SAFE TO NEST** (per-call `ctx.manager`, not global) | `qwen3_moe.py:1013,1174` |
+| **attn engine fwd offloads UNCONDITIONALLY** ⇒ wasted D2H under no_grad | **NEW — 1-line guard** | `attention_activation_offload.py:966`: prepend `if not (self.training and torch.is_grad_enabled()): return self._plain_forward(x)` |
+| JIT weight-offload bypasses the gather pre-hook in recompute ⇒ reads 0-numel LoRA | **AVOID** in v1: `ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false` (CPU AdamW itself is fine) | `qwen3_moe.py:2564,2587` |
+
+You always write the config as **`asym_cpuadamwds|recomp-off|ligerloss1`** (or `asym|...` for GPU AdamW). The harness
+expands the `recomp-off` label to `unsloth GC + ASYMM_DENSE_MLP_SURGICAL_OFFLOAD=1 [+ ASYMM_ATTN_ACT_OFFLOAD=1]`
+(Stage 0). It **replaces the removed chunked MLP** (measured 129 GiB win but slow from *nested double-recompute*) with
+a **single-recompute CPU-silu offload** — lower peak, no nest. *Why not the native glue-GC recompute?* It OOMs at scale:
+`torch.utils.checkpoint` holds its inputs via a holder that **bypasses `saved_tensors_hooks`**, so `[M,H]` boundaries
+never offload → forward OOM ~42 layers (measured). Unsloth's explicit D2H Function does the offload correctly, so we
+reuse it.
+
+## Staged plan — each stage gated on a memory+latency profile (do not advance until it passes)
+
+**Validation harness (every run-stage)** — once the `recomp-off` label exists (Stage 0) it sets the engine envs, so
+you only write the label:
 ```
-N1 = RMSNorm(X_in)            CPU              ⬆ N1
-Q,K,V = qkv(N1) (+LoRA)       GPU @^R          (Q,K,V[M,Dq/Dkv] [T])
-Q',K' = qk_norm/RoPE(Q,K)     GPU              (feeds SDPA)
-AttnOut = SDPA(Q',K',V)       GPU FlashAttn    ⬇ AttnOut (for o dA)
-A = o_proj(AttnOut) (+LoRA)   GPU @^R
-H_mid = X_in + A              CPU add (X_in on CPU)
-  dA: qkv = dS.ᵀ @^R X_in_cpu ;  o = dS.ᵀ @^R AttnOut_cpu     GPU GEMM, no remat
+cd third_party/AsymGEMM
+GPU_POOL=<free gpu> PROFILERS=source PLOT=false PREPARE_DATASETS=true OVERWRITE=true \
+  MAX_STEPS=<m> WARMUP_STEPS=<w> ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false \
+  RUNS="q3-32b|1 ; asym_cpuadamwds|recomp-off|ligerloss1 ; <seq>|8|1 ; none|false|false|false|false|false" \
+  bash scripts/lf/profile_lora_lf_test_both.sh
 ```
-**MLP** (the peak driver; offload each `[M,I]` right after its GEMM):
+(Before the label is wired, the equivalent raw form is `asym_cpuadamwds|unsloth|ligerloss1` +
+`ASYMM_DENSE_MLP_SURGICAL_OFFLOAD=1 [ASYMM_ATTN_ACT_OFFLOAD=1]` — that is what `recomp-off` expands to.)
+Read from `.../b8_s<seq>_ga1/`:
+- **MEMORY** — `summary.md`:`Whole-process peak allocated/reserved HBM`; `memory_breakdown.md`: per-component (the
+  **MLP/dense component must be small** = `[M,I]` offloaded, not ~74 GiB); `process_memory` RSS. Gate: reserved
+  HBM **< 184**, CPU RSS **< 870 GiB**.
+- **LATENCY** — `summary.md`:`trainer.e2e.measured_step` ms, `Throughput tokens/sec`. Use `MAX_STEPS=3 WARMUP_STEPS=2`
+  for stable timing (`MAX_STEPS=1 WARMUP_STEPS=1` for a quick fit/peak check). Compare to chunked-MLP **371 s/step @s45k**.
+- **CORRECTNESS** — finite `loss`; **verify real seq length** = count `input_ids` in `train.log` (identical HBM across
+  two seqs ⇒ stale/capped dataset, invalid — the prior 20.8 GiB false win).
+Guardrails: run sequentially; watch `numactl -H` node-0/1 free; stop with `kill -TERM` (never `-9`); the single-GPU asym
+proc is a bare `python` (kill by PID).
+
+**Artifact discipline (do this every stage — never accept one peak number).** *During* the run, watch both HBM
+(`nvidia-smi`/the live profiler — reserved AND allocated) and CPU (`numactl -H` per-node free). *After*, read the
+whole artifact set, not just `summary.md`: (1) peak **reserved AND allocated** HBM + CPU RSS in `process_memory`;
+(2) `memory_breakdown.md` per-component — confirm the **MLP/dense component is small** (the `[M,I]` left the GPU) and
+the **unattributed/“gap” bucket isn’t hiding it** (a large gap = a transient the profiler didn’t attribute, suspect the
+recompute `[M,2I]`); (3) `train.log` real `input_ids` length + finite `loss`. Cross-check breakdown-sum vs peak.
+
+**Debugging escape hatch — fine-grained per-module activation accounting (keep in mind; sometimes needed).** If a
+stage's HBM/CPU disagrees with the projection, turn on the per-module byte accounting to localize it before guessing.
+The engines already write **`layer._last_activation_offload_stats = manager.snapshot()`** per module
+(`cpu_owned_bytes`, `cpu_peak_bytes_live`, released bytes — `activation_offload.py:308`, `qwen3_moe.py:1213/1475`), and
+**`profiling.py:memory_snapshot()`** gives the GPU+CPU split. Dumping these per decoder layer shows *which* module
+holds the `[M,I]` and whether the **silu actually ran on CPU / the offload actually freed** — the fastest way to catch
+"engine isn't offloading inside the recompute" or "weight-offload zeroed a LoRA bank". It is opt-in detail (off the hot
+path) — enable only when a number looks wrong, then turn it back off.
+
+**Execution notes (verified live, Stage 0):**
+- **No `[asym] surgical installed` print exists** (the lf.py surgical block at `:1992-2020` only bumps
+  `report.dense_mlp_act_offload_wrapped`). Confirm install by **step time ≫ plain unsloth** (s2048 b8 = 17.8 s/step vs
+  ~1–2 s plain) or the per-module stats — NOT by grepping for a banner.
+- **`ASYMM_EXPERT_SILU_BWD_GPU` is NOT forwarded** to the python subprocess by the runner's `RUN_ENV`, so python sees
+  it UNSET → `_use_gpu_silu_bwd()` returns **False → CPU silu** (`qwen3_moe.py:921`). This is the **peak lever we
+  want**, so `recomp-off` gets it for free. (The test harness sets `=1` but it's dropped at the runner boundary — a
+  latent harness gap. If GPU silu is ever wanted, add the var to the runner `RUN_ENV` AND override the harness default.)
+- **lf.py's "runs the FULL dense MLP forward/backward on CPU" comment (`:1977`) is imprecise** — the **base gate_up/down
+  GEMMs run on GPU via `@^R`** (proven: s2048 forward = 3.7 s; a CPU `[16384,5120]@[51200,5120]` alone would exceed
+  that). Only the **silu + LoRA-grad** path is CPU. The "stalls at scale" warning is a *latency* caveat (accepted), not
+  an OOM — the chunked MLP it replaces ran at 371 s/step and completed.
+- The surgical engine is the documented dense opt-in (`ASYMM_DENSE_MLP_SURGICAL_OFFLOAD`); weight-offload is forced OFF
+  by the `recomp-off` harness arm.
+
+**Stage 1 RESULT (s45k, measured):** surgical MLP offload **works** — `mlp_dense` saved activation = **3.5 GiB** (was
+~74 on GPU), real seq 45000 verified, CPU RSS 391 GiB. **But s45k OOM'd** (tried +34.33 GiB = the `[M,2I]` gate_up GEMM
+on top of 162 GiB). The exact peak breakdown (`memory_actual_peak_breakdown.csv`) pinned **two** GPU hogs the design
+must offload, neither of which Stage-1-as-written touched:
+  1. **Attention recompute on GPU** (attn offload OFF) — the q/k/v/o LoRA + norms, ~70+ GiB. → **`attnact=true`**.
+  2. **MLP down-proj LoRA-A materializing the act on GPU** — `model.layers.N.mlp.engine.lora_dropout` shape
+     `[M,I]=360000×25600=18 GiB` live — because the run used **`ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm`** (harness
+     default). With **`=cpu`** the LoRA-A runs on the CPU-offloaded act (`@^L`), no `[M,I]` on GPU. → **set lora_a_fwd=cpu**.
+So the working recomp-off config needs **both** `attnact=true` AND `ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu` (fold both
+into the `recomp-off` label once confirmed). Stage-1 lesson: the surgical base-act offload alone is not enough — the
+LoRA-A input is a second `[M,I]` that must also go to CPU.
+
+**Stage 0 — implement the `recomp-off` label (so you write the config name, not the raw combo).** Add `recomp-off` to
+`recompute_label()` in `scripts/lf/profile_lora_lf_test_*.sh` and the recompute-name parser in `run_lf_lora_sft.sh`,
+expanding it to: `USE_UNSLOTH_GC=true` + `GRADIENT_CHECKPOINTING=true` + `ASYMM_DENSE_MLP_SURGICAL_OFFLOAD=1`
+(+ `ASYMM_ATTN_ACT_OFFLOAD=1` from Stage 2) + `ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false`. Confirm those engine envs are in
+`run_lf_lora_sft.sh` `RUN_ENV` (add any missing). Pseudocode:
 ```
-N2 = RMSNorm(H_mid)          CPU              ⬆ N2
-gate = N2 @^R W_gate (+LoRA) GPU @^R   ⬇ gate_cpu        | split fc1 into gate/up so only 1×[M,I] on GPU
-up   = N2 @^R W_up   (+LoRA) GPU @^R   ⬇ up_cpu          |
-act  = silu(gate_cpu)·up_cpu                 CPU  ← attached to the two ⬇ (NOT staged back)
-Mout = act @^R W_down (+LoRA) GPU @^R  (⬆ act for base; LoRA = act_cpu @^L A_down)
---- backward: dact ⬇ -> CPU silu_bwd -> dgate,dup ⬆ -> dX GEMMs (as in the trace above) ---
+recompute_label():  recomp-off) echo "recomp-off" ;;        # new arm, alongside unsloth/recomp/norecompute
+run_lf_lora_sft.sh: if [recompute == recomp-off]:
+    USE_UNSLOTH_GC=true; GRADIENT_CHECKPOINTING=true
+    export ASYMM_DENSE_MLP_SURGICAL_OFFLOAD=1
+    [stage2] export ASYMM_ATTN_ACT_OFFLOAD=1
+    export ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false   # dodge the recompute gather hazard
 ```
-LoRA everywhere: **LoRA-A** consumes the projection input on CPU (`X_cpu @^L A`) or GPU; **LoRA-B** is small; the
-**low-rank `S` is held** (`[M,r]`) for `dB`; **dA fetches the input via `@^R`** (no remat).
+**Gate (1-step s2048 smoke):** the run logs `[asym] dense MLP surgical offload installed on N modules` (`lf.py:2019`)
+and the layers are unsloth-wrapped; finite loss. The config string in the out-dir reads `recomp-off`, not `unsloth`.
 
----
+**Stage 1 — surgical MLP under unsloth (the MLP `[M,I]` leaves the recompute transient).** No code beyond Stage 0 for
+the MLP path. Pseudocode of what runs (all existing):
+```
+# fwd (unsloth no_grad):  AsymDenseMLP.forward -> _uses_activation_offload()==False -> PLAIN GPU MLP, discarded
+# bwd (unsloth enable_grad recompute of the layer):
+#   AsymDenseMLP.forward -> _ActivationOffloadQwen3ExpertFunction.apply:
+#     gate_up = N2 @^R W_gate_up        # ONE grouped @^R GEMM (E=1), [M,2I] on GPU briefly
+#     gate_cpu,up_cpu = offload(gate_up) # D2H + free -> [M,2I] leaves GPU
+#     act_cpu = silu(gate_cpu)*up_cpu    # CPU
+#     out = act_cpu(staged) @^R W_down   # ONE grouped @^R GEMM
+#   ...its .backward: dA = dS^T @^R {N2_cpu, act_cpu}; silu_bwd on CPU; frees -> transient (1 layer)
+```
+- **Gate-correctness:** finite loss; spot-check `dense_mlp.py` is numerically exact (its tests) so loss tracks a no-offload
+  reference at small seq.
+- **Gate-memory+latency (q3-32b b8, real data, `MAX_STEPS=3 WARMUP_STEPS=2`):** at **s45k** reserved HBM **< 129**
+  (beats chunked) with the **MLP/dense breakdown component small** (was ~74 GiB on GPU; now offloaded); at **s60k** must
+  **fit < 184** (chunked hit 172 here). Record step ms vs 371 (single-recompute should be ≤ chunked; CPU silu may
+  offset). **PASS = s60k fits, finite loss, real len verified, MLP component small.** If HBM ~129 and MLP component is
+  still large ⇒ surgical offload not firing in recompute (check `_uses_activation_offload` under enable_grad / weight-
+  offload hazard). Remaining peak here is **attention** (unsloth recomputes it on GPU, ~68 GiB) → Stage 2.
 
-## Bounding CPU: per-layer recompute + the offload list (two tiers)
+**Stage 2 — add attention offload + push sequence length (the goal).** Apply the **1-line no_grad guard** to
+`AsymActivationOffloadLoRALinear.forward` (`attention_activation_offload.py:966`), then add `ASYMM_ATTN_ACT_OFFLOAD=1`.
+Now attention X/S also offload transiently in the recompute → drop the ~68 GiB attention peak toward the ~35–40 GiB
+projection. Climb seq (s90k, s120k…), one run at a time, until reserved HBM→184 **or** CPU RSS→870; record (seq, HBM,
+CPU, step ms, tok/s, real len). **PASS = real seq > 60000 fits with finite loss** (beats both superoffload s45k and the
+chunked s60k); keep climbing to the ceiling. **STOP** per the NVMe condition below.
 
-Holding all of a layer's activations to backward is the `none|T|T|F|T|T` blowup: the `[M,I]` alone is
-**1099–2197 GiB ×64 = TBs**. So:
-
-- **`[M,I]` (`fc1`/`mlp_act`): never held — regenerated per layer in backward** with the CPU-silu placement above.
-  CPU footprint = **one layer's** `[M,I]` (~6×17 ≈ 100 GiB), freed after that layer's bwd. This is fixed, not a choice.
-- **Everything else: the offload list picks what to HOLD on CPU (`@^R`-fetch) vs recompute.** Held → skip a recompute
-  (speed) at a CPU cost (×64). Recomputed → regenerated from the nearest held boundary.
-
-### Producer ledger (q3-32b: H=5120, Dq=8192, Dkv=1024, I=25600, r=64, L=64; bytes bf16; M=360000 @ s45k)
-
-| producer | shape | GiB/layer | **held×64** | consumer device | disposition |
-|---|---|---:|---:|---|---|
-| **`layer_input` X_in** | [M,H] | 3.43 | **220** | qkv `dA` (CPU `@^R`) | **mandatory held** (recompute root) |
-| **LoRA `S_{q,k,v,o,gate,up,down}`** | [M,r]×7 | 0.30 | **19** | `dB` staged (GPU) | **mandatory held** (small but ×7×64) |
-| **`gate`/`up`/`act`/`dact`/`dgate`/`dup`** | [M,I] | 17.2 | — (×1) | **silu on CPU** | **fixed CPU-silu boundary, transient** |
-| `mlp_act` act (=down input) | [M,I] | 17.2 | — (×1) | down `dA` CPU `@^R` | recomputed, fetched no-remat |
-| `attn_norm` N1 | [M,H] | 3.43 | 220 | qkv `dA` `@^R` | **optional held** vs recompute(CPU norm) |
-| `mlp_norm` N2 | [M,H] | 3.43 | 220 | fc1/up `dA` `@^R` | **optional held** vs recompute |
-| `core_attn` AttnOut | [M,Dq] | 5.49 | 352 | o_proj `dA` `@^R` | **optional held** vs recompute(SDPA) |
-| `post_attn_resid` H_mid | [M,H] | 3.43 | 220 | mlp recompute root | **optional held** (= 2-segment split) |
-| `fc1`/`mlp_act` as **held** | [M,2I]/[M,I] | 34/17 | **2197/1099** | — | **forbidden** → NVMe |
-| **LoRA optimizer + grads** | total | — | **~8 (GPU)** | — | **keep on GPU** (peak-irrelevant; avoids contention) |
-
-`ASYMM_OFFLOAD_PRODUCERS ⊆ {attn_norm, mlp_norm, core_attn, post_attn_resid}` — a **CPU↔speed** knob (does NOT change
-the peak; the peak is the fixed `[M,I]` CPU-silu transient). Default `{}` = hold only `X_in`+`S`, recompute the rest →
-min CPU, the ~35–40 GiB peak. `fc1`/`mlp_act` are **rejected** with an NVMe message.
-
----
-
-## Accounting: ×64 held vs ×1 transient (do not conflate)
-
-- **held / offloaded → ×64** (lives on CPU all layers): always quote the total. `X_in` = 220 GiB; the 7 LoRA `S` =
-  **19 GiB** (not "tiny"); each optional `[M,H]` held = +220.
-- **recompute-transient → ×1** (one layer live at a time on GPU, freed after its bwd): the `[M,I]` GEMM transient
-  (~17 GiB) is NOT ×64.
-- **optimizer / params → single all-model total** (~8 GiB), not per-layer.
-
-Envelope @ s45k (projection, must measure):
-- **GPU peak** ≈ 1×`[M,I]` (17) + attn FA (~12) + dX (~3) + **8 GiB GPU optimizer/grads** ≈ **~35–40 GiB**.
-- **CPU** ≈ `X_in`×64 (220) + `S`×64 (19) + base 64 + one-layer `[M,I]` (~100) ≈ **~400 GiB**; each optional `[M,H]`
-  held adds +220 → drives the **NVMe wall** (~s120–150k, where `X_in`×64 + the held list saturates ~870 GiB).
-
----
-
-## The optimizer + the contention rule
-
-**Rule:** *offload / CPU-compute ONLY what reduces the peak; keep peak-irrelevant work on GPU.* CPU work is not free —
-it consumes C2C/CPU bandwidth that the *necessary* offloads (base-weight `@^R` streaming + the `[M,I]` D2H/H2D)
-already contend for; the CPU silu is explicitly measured as "contended with the concurrent gradient-offload D2H"
-(`qwen3_moe.py:923`). So:
-- base weights (64 GiB → CPU) and the wide activations (the `[M,I]`) — **worth the contention** (they cut the peak).
-- LoRA optimizer + grads (~8 GiB total, fixed, peak-irrelevant) — **keep on GPU**, *unless* you specifically need the
-  HBM. CPU AdamW (`asym_cpuadamwds`, grad-offload) and GPU AdamW (plain `asym`) are an **orthogonal toggle**:
-  `USE_ASYM_CPU_ADAMW` + `ASYM_CPU_ADAMW_{GRAD,WEIGHT}_OFFLOAD`. For max-seq, GPU AdamW (no grad-offload) frees C2C
-  for the peak-reducing silu — small HBM cost, better latency. Both are valid; pick per run.
-
----
-
-## The config / arg
-
-`ASYMM_OFFLOAD_PRODUCERS` (comma-separated, `⊆ {attn_norm, mlp_norm, core_attn, post_attn_resid}`), forwarded like the
-other `ASYMM_*` via `run_lf_lora_sft.sh` `RUN_ENV`, read in `lf.py`. Rules: `X_in` + LoRA `S` always held (not in the
-list); `fc1`/`mlp_act` rejected (NVMe); unknown names error; **uniform across all layers**. Output-dir tag:
-`offprod-<letters>` in fixed order (`attn_norm=n, qkv=q, core_attn=c, attn_proj=p, post_attn_resid=r, mlp_norm=m`),
-empty = `offprod-none`. Leave `ASYMM_MLP_RECOMPUTE_CHUNK` (chunked MLP) and `ASYMM_LAYER_GC*` registered but **unused**.
-
----
-
-## Megatron reference (the offload×recompute interleaving — our boundaries differ)
-
-Megatron-Core v0.18 `--fine-grained-activation-offloading` is the mechanical reference for *offloading saved tensors
-and reloading in backward*. **Our boundaries are not its "dummy" offload/recompute** — ours are **fused with CPU
-compute** (the offloaded `[M,I]` is consumed by a CPU silu, not staged back), and we add `@^R`/`@^L`. But the offload
-plumbing is the same; copy it.
-
-Files: `megatron/core/pipeline_parallel/fine_grained_activation_offload.py` (manager + group ops);
-`tensor_parallel/random.py:555-829` (`checkpoint` / `CheckpointWithoutOutput`); `transformer/moe/experts.py:769-787`
-(the `moe_act` input-offload × output-recompute example); `transformer/transformer_layer.py:617-693` (the `attn_norm`
-bracket); `transformer_config.py:1120-1138,1658-1685` (config + valid names `attn_norm,qkv_linear,core_attn,attn_proj,
-mlp_norm,expert_fc1,moe_act`).
-
-Mechanism (verified): `with off_interface(flag, x, name) as x: <module>` … `group_commit(out, name,
-forced_released_tensors=[x])`. `GroupStart` fwd opens a group + pushes `saved_tensors_hooks`; **bwd triggers H2D
-reload**. `GroupCommit` fwd does **D2H on a side stream + `tensor.untyped_storage().resize_(0)` free** (torch GC won't
-drop it); **bwd waits the reload event**. The D2H is **deferred past the last forward consumer** (`attn_norm` is
-committed only after the residual add "because the residual is needed in self_attn_bda"). Synchronous v1: D2H on a
-side stream, `record_stream`, wait the event before `resize_(0)`; reload H2D at the top of backward. **Drop** the PP /
-microbatch / double-buffer / VPP / CUDA-graph machinery.
-
-**CRITICAL — explicit autograd op, NOT `torch.utils.checkpoint`.** A prior attempt used `torch.utils.checkpoint`,
-whose internal input-holder **bypasses `saved_tensors_hooks`** → the `[M,H]` boundaries piled on GPU (~4.3 GiB/layer)
-→ **forward OOM at ~42 layers**. Do the D2H + `resize_(0)` free **explicitly** inside our own Function (Megatron's
-`GroupCommit` / Unsloth's `UnslothGradientCheckpointing`, `LlamaFactory/.../checkpointing.py:44-77`). Run the original
-forward under `no_grad` per layer so nothing is saved on the forward pass.
-
-**Recompute determinism:** the recompute must be bit-exact. OK here only because `lora_dropout = attention_dropout = 0`
-(enforced) and `@^R`/FlashAttention(0) are deterministic → no RNG op in a layer. Do not add RNG-bearing ops without
-RNG save/restore. The parity test (below) guards this.
-
----
-
-## Staged implementation plan (each stage independently testable)
-
-**Stage 0 — plumbing.** Producer enum + `[M,*]` byte table (one place); parse/validate `ASYMM_OFFLOAD_PRODUCERS` in
-`lf.py` (reject `fc1`/`mlp_act` → NVMe msg, unknown names); forward via `run_lf` `RUN_ENV`; install gated on `asym`
-backend + env. Unit-test parse + no-op-when-unset.
-
-**Stage 1 — per-layer AsymGEMM-placed processing + recompute, parity floor.** Implement the per-layer wrapper: hold
-`X_in` + LoRA `S`; recompute the layer in backward via the **expert-engine CPU-silu path for the MLP** (reuse
-`dense_mlp.py` / `AsymQwen3Experts` with CPU silu, `@^R` base, `@^L`/`@^R` LoRA) and the **attn `@^R` path** (reuse
-`AsymActivationOffloadLoRALinear`). Use the explicit offload Function (not `torch.checkpoint`).
-- **Test (CPU, tiny):** reuse `tests/training/test_decoder_layer_glue_gc.py` fakes; `loss`, `dX`, **all param grads**
-  match the unwrapped layer in bf16 tol; on CUDA confirm `resize_(0)` actually frees (`memory_allocated` drops).
-- **Run (q3-32b s45k b8, `PREPARE_DATASETS=true`, verify real `input_ids` length):** measure GPU peak (expect ~35–40
-  GiB) and CPU (~400 GiB). This already beats s45k if it fits — push seq.
-
-**Stage 2 — push seq + optional held list.** Climb seq; if GPU has headroom but CPU is tight, *reduce* the held list
-(recompute more); if CPU has headroom but a recompute is slow, *add* an optional `[M,H]` hold. Find the max real seq
-with GPU<184, CPU<870, finite loss. Sweep via `scripts/lf/profile_lora_lf_test_both.sh`
-(`MAX_STEPS=1 WARMUP_STEPS=1 PROFILERS=source PLOT=false PREPARE_DATASETS=true GPU_POOL=<free>`), one run at a time.
-
-**Stage 3 — record.** `profile.json` + memory breakdown; winning rows into the test script; seq-vs-(GPU,CPU,list,step)
-Pareto into MEMORY.
-
-### Guardrails
-- Run sequentially; watch `numactl -H` node-0/1 free; if combined < ~6 GiB, **`kill -TERM`** (never `-9` — corrupts
-  cpu_adam JIT) to protect other users. Single-GPU asym proc is a bare `python` (kill by PID).
-- Always verify real `input_ids` length; identical GPU peak across two seq lengths = stale/capped dataset.
-
----
+**Stage 3 — record.** Emit `profile.json`/breakdown; add the winning rows to `profile_lora_lf_test_both.sh`; write the
+seq-vs-(HBM, CPU, step ms) Pareto + the max real seq into MEMORY ([[asym-unsloth-beats-superoffload]]).
 
 ## NVMe stop condition (STOP, do not keep going)
 
-CPU (the held `X_in`×64 + `S`×64 + one-layer `[M,I]`) is the binding constraint. **Stop and escalate to NVMe** when:
-1. `X_in`×64 + the minimal held list overflows ~870 GiB before HBM (184) binds — i.e. around **~s120–150k**.
-2. The sweep needs to hold an `[M,I]`/`[M,2I]` producer (1099–2197 GiB) — never CPU-fittable here.
-3. Single-run CPU RSS (minus base/opt) approaches ~870 GiB.
-
-When triggered: **do not implement NVMe inline, do not keep pushing CPU.** Hand off to `agent/impls/nvme_offload.md`
-(139 KB, drafted) + the ZeRO-NVMe configs. The refactor: make the activation-offload storage tier pluggable
-(HBM→pinned-CPU→NVMe), spill **coldest-first** (early layers, used last in bwd) at ~5–7 GB/s under the long backward.
-Record in MEMORY what seq NVMe unlocks, **then stop the autonomous loop**. Until then, **keep going** (climb seq,
-tune the held list) until the goal is comfortably beaten or this condition fires.
-
----
+Stop and flag NVMe when: (1) `X_in`×64 (+ any held list) saturates ~870 GiB CPU before HBM (184) binds — i.e. around
+**~s195k** with empty list; (2) the only way forward needs holding an `[M,I]` (never CPU-fittable); (3) single-run CPU
+RSS approaches ~870 GiB. **Do not implement NVMe inline.** Hand off to `agent/impls/nvme_offload.md` (drafted) + the
+ZeRO-NVMe configs — make the offload storage tier pluggable (HBM→pinned-CPU→NVMe), spill **coldest-first** `X_in`
+(early layers, used last in bwd) at ~5–7 GB/s under the long backward. Record what seq NVMe unlocks, **then stop the
+autonomous loop.** Otherwise **keep going** (climb seq) until the goal is comfortably beaten or this fires.
 
 ## Constraints / non-goals (v1)
 
-- Backend `asym` (base `@^R`) + `norecompute` + `ligerloss1`. Optimizer CPU-or-GPU AdamW (orthogonal). No HF/Unsloth
-  GC, no `ASYMM_LAYER_GC`.
-- **MLP elementwise (silu/mul) on CPU; GEMMs on GPU via `@^R`.** This is the peak lever — do NOT "recompute the dense
-  MLP on GPU" (that was the stale, peak-bound design).
-- **Do NOT use token-chunked MLP** (`ASYMM_MLP_RECOMPUTE_CHUNK`/`chunked_mlp.py`) — registered, unused (different lever).
-- No prefetch / async double-buffer / CUDA-graph retention in v1. Synchronous D2H/H2D. Correctness + "fits + finite
-  loss" first.
-- Uniform across all layers. No NVMe in v1 (hitting its condition is a STOP).
-
----
+- Config `asym_cpuadamwds | recomp-off | ligerloss1`: base `@^R` + **CPU AdamW** + the `recomp-off` label (**unsloth GC**
+  whole-layer recompute + `X_in` offload, REUSED) + surgical MLP/attn engines + `ligerloss1`. Keep LoRA
+  **weight**-offload OFF (`ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false`) in the recompute; plain `asym` (GPU AdamW) is the
+  orthogonal fallback if C2C contention dominates.
+- **MLP silu/mul on CPU; GEMMs on GPU via `@^R`** (the surgical engine). The peak lever — do NOT let the MLP recompute
+  on GPU (that is plain `unsloth` = 178 GiB).
+- **Token-chunked MLP is commented out / unused** (`chunked_mlp.py`, `ASYMM_MLP_RECOMPUTE_CHUNK`). Do not re-enable;
+  the surgical engine supersedes it.
+- The **native glue-GC recompute** (`ASYMM_LAYER_GC_RECOMPUTE`) is NOT used — it OOMs at scale (`torch.checkpoint`
+  bypasses `saved_tensors_hooks`). No prefetch/async/double-buffer/CUDA-graph in v1 (synchronous D2H/H2D).
+- Uniform across all layers. No NVMe in v1 (its condition is a STOP). v1 is a *composition* — the only new code is the
+  attn no_grad guard (+ optional `recomp-off` label sugar).
 
 ## Code hooks & references
 
 - `asym_gemm/training/qwen3_moe.py` — `AsymQwen3Experts` + `_activation_offload_cpu_silu_mul/_backward` (`:885,:900`),
-  `_silu_backward_gpu` (`:930`, the speed dial); the MLP `@^R`+CPU-silu engine (= `mlp_math_real.md`).
-- `asym_gemm/training/dense_mlp.py` — wraps a dense MLP as an E=1 expert through that engine. **Use this for the MLP.**
-- `asym_gemm/training/attention_activation_offload.py` — `AsymActivationOffloadLoRALinear` (`@^R` base, `@^L` LoRA-A on
-  offloaded X, `@^R` dA, q/k/v X-sharing). **Use this for attention** (= `attn_math_real.md`).
-- `asym_gemm/training/activation_offload.py` — `ActivationOffloadManager` (pinned D2H/H2D/release + byte accounting);
-  add the `untyped_storage().resize_(0)` free if it doesn't truly drop GPU storage.
-- `asym_gemm/training/decoder_layer_glue_gc.py` `_manual_forward` — per-layer manual forward, the host for the wrapper.
-- `asym_gemm/integrations/lf.py` `apply_lf_asym_lora` — install + gate (mirror the `install_chunked_mlp_on_dense_mlps`
-  site); `scripts/lf/run_lf_lora_sft.sh` `RUN_ENV` — forward the env.
-- `LlamaFactory/.../model_utils/checkpointing.py:44-77` — `UnslothGradientCheckpointing`, the explicit D2H+recompute op.
-- `agent/math/mlp_math_real.md`, `attn_math_real.md`, `module_ops.md` — the op placement (which GEMMs are `@^R`/`@^L`,
-  which elementwise are CPU). **The math docs ARE the per-op device map; this design is wiring them per-layer + recompute.**
-- Megatron: `third_party/megatron-lm/megatron/core/pipeline_parallel/fine_grained_activation_offload.py` and the files
-  listed in the Megatron-reference section above.
+  `_silu_backward_gpu` (`:930`, the peak↔speed dial `ASYMM_EXPERT_SILU_BWD_GPU`); = `mlp_math_real.md`.
+- `asym_gemm/training/dense_mlp.py` — dense MLP as E=1 expert through that engine. **Use for the MLP recompute.**
+- `asym_gemm/training/attention_activation_offload.py` — `AsymActivationOffloadLoRALinear`; = `attn_math_real.md`.
+  **Use for the attention recompute.**
+- `asym_gemm/training/activation_offload.py` — `ActivationOffloadManager` (pinned D2H/H2D/release + accounting);
+  ensure the `untyped_storage().resize_(0)` free truly drops GPU storage.
+- `asym_gemm/integrations/lf.py` `apply_lf_asym_lora` — dense-MLP surgical install + gate (`:1983,:2019`);
+  `scripts/lf/run_lf_lora_sft.sh` `RUN_ENV` — forward `ASYMM_DENSE_MLP_SURGICAL_OFFLOAD`/`ASYMM_ATTN_ACT_OFFLOAD`/
+  `ASYM_CPU_ADAMW_WEIGHT_OFFLOAD` and the `recomp-off` recompute-label arm.
+- `LlamaFactory/.../model_utils/checkpointing.py:44-77` — `UnslothGradientCheckpointing` = the reused recompute
+  scaffolding (D2H `X_in`, `enable_grad` recompute, `autograd.backward`). The `recomp-off` label turns this on.
+- `agent/math/mlp_math_real.md`, `attn_math_real.md`, `module_ops.md` — the per-op device map this design wires up.
+- Megatron files in the Megatron-reference section above.

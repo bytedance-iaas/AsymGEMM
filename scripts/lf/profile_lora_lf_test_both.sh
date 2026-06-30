@@ -70,20 +70,20 @@ else
     # "q3-30b-a3b|1 ; zero3_offload_mem_panvme|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
     # "q3-32b|1 ; zero3_offload_mem_panvme|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false"
 
-    # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
+    "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
     # "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # x55k
     # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x50k
     # "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # x10k
     # "q2.5-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # 55k
     # "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # x45k
 
-    "q3-32b|1 ; zero3_offload_mem_panvme|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false"
-
     # "q3-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # x25k
     # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x50k
     # "llama3.3-70b|1 ; superoffload_mem|recomp|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false" # x15k
     # "llama4-scout|1 ; superoffload_mem|recomp|ligerloss1 ; 8000|8|1 ; none|false|false|false|false|false" # x9k
     # "q2.5-72b|1 ; superoffload_mem|recomp|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false" # x15k
+
+    # "q3-32b|1 ; zero3_offload_mem_panvme|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false"
   )
 fi
 
