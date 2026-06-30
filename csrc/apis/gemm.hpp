@@ -124,7 +124,7 @@ static void m_grouped_fp8_asym_gemm_nt_contiguous(const std::pair<torch::Tensor,
                                          a.second.contiguous(), b.second.contiguous());
         } else {
             m_grouped_fp8_asym_gemm_sm89(a.first, b.first, d, offsets, experts, list_size,
-                                         1.0f, 1.0f, a.second.reshape(-1).contiguous(), b.second,
+                                         1.0f, 1.0f, a.second.reshape(-1).contiguous(), b.second.contiguous(),
                                          std::nullopt, std::nullopt);
         }
         return;
@@ -204,7 +204,7 @@ static void m_grouped_fp8_asym_gemm_nt_masked(const std::pair<torch::Tensor, tor
                                                 a.second.contiguous(), b.second.contiguous());
         } else {
             m_grouped_fp8_asym_gemm_sm89_masked(a.first, b.first, d, masked_m, expected_m,
-                                                1.0f, 1.0f, a.second.reshape(-1).contiguous(), b.second,
+                                                1.0f, 1.0f, a.second.reshape(-1).contiguous(), b.second.contiguous(),
                                                 std::nullopt, std::nullopt);
         }
         return;

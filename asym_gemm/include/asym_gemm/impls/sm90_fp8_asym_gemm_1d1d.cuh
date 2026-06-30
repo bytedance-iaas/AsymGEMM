@@ -230,7 +230,7 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
                 // SFB is laid out per-group along the K-outer dim (see make_tma_sf_desc),
                 // so the group offset goes into the K coordinate, NOT the MN coordinate.
                 const uint32_t sfb_n_idx = blockIdx.x * BLOCK_N;
-                const uint32_t sfb_k_idx = scheduler.current_group_idx * ceil_div(shape_k, BLOCK_K) + sf_k_idx;
+                const uint32_t sfb_k_idx = scheduler.current_group_idx * block_k + sf_k_idx;
                 tma_copy<BLOCK_N, 1, 0>(&tensor_map_sfb, full_barriers_b[0], smem_sfb[0], sfb_n_idx, sfb_k_idx);
 
                 if (is_leader_cta) {
@@ -270,7 +270,7 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
 
                     // Load SFA (per M-block per K-block) — one float per row of A
                     const uint32_t sfa_k_idx = (kGemmType == GemmType::MGroupedMasked)
-                        ? scheduler.current_group_idx * ceil_div(shape_k, BLOCK_K) + sf_k_idx
+                        ? scheduler.current_group_idx * block_k + sf_k_idx
                         : sf_k_idx;
                     tma_copy<BLOCK_M, 1, 0>(&tensor_map_sfa, full_barriers[stage_idx], smem_sfa[stage_idx], local_m_idx, sfa_k_idx);
 
