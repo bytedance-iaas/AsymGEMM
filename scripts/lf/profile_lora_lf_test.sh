@@ -1,1 +1,0 @@
-profile_lora_lf_test_source.sh

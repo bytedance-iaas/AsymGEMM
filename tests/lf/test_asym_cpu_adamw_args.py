@@ -226,7 +226,7 @@ def test_profile_lora_lf_dry_run_asym_cpuadamwtorch_label_and_flags(tmp_path: Pa
     output_root = tmp_path / "dryrun"
 
     run_cmd(
-        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
+        ["scripts/lf/profile_lora_lf_test_source.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
         env={
             "LF_DIR": str(lf_dir),
             "BACKEND_SPECS": "asym_cpuadamwtorch|recomp",
@@ -265,7 +265,7 @@ def test_profile_lora_lf_dry_run_sweeps_asym_cpuadamw_grad_offload_modes(tmp_pat
     output_root = tmp_path / "dryrun"
 
     run_cmd(
-        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
+        ["scripts/lf/profile_lora_lf_test_source.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
         env={
             "LF_DIR": str(lf_dir),
             "BACKEND_SPECS": "asym_cpuadamwtorch|recomp",
@@ -307,7 +307,7 @@ def test_profile_lora_lf_dry_run_wires_liger_loss_axis(tmp_path: Path) -> None:
     output_root = tmp_path / "dryrun"
 
     run_cmd(
-        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
+        ["scripts/lf/profile_lora_lf_test_source.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
         env={
             "LF_DIR": str(lf_dir),
             "BACKEND_SPECS": "asym_cpuadamwds|norecomp|ligerloss0,zero3_offload|recomp|ligerloss1",
@@ -406,7 +406,7 @@ def test_profile_lora_lf_dry_run_rejects_multi_qwen_expert_lora_impls(tmp_path: 
     output_root = tmp_path / "dryrun"
 
     result = run_cmd(
-        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
+        ["scripts/lf/profile_lora_lf_test_source.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
         env={
             "LF_DIR": str(lf_dir),
             "BACKEND_SPECS": "zero3_offload|recomp",
@@ -436,7 +436,7 @@ def test_profile_lora_lf_dry_run_labels_expert_lora_a_hbm_mode(tmp_path: Path) -
     output_root = tmp_path / "dryrun"
 
     run_cmd(
-        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
+        ["scripts/lf/profile_lora_lf_test_source.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
         env={
             "LF_DIR": str(lf_dir),
             "BACKEND_SPECS": "asym_cpuadamwds|norecomp",
@@ -474,7 +474,7 @@ def test_profile_lora_lf_dry_run_labels_expert_lora_a_hbm_mode(tmp_path: Path) -
 def test_profile_lora_lf_rejects_non_exact_expert_lora_a_modes(tmp_path: Path, bad_value: str) -> None:
     lf_dir = make_fake_lf(tmp_path)
     result = run_cmd(
-        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(tmp_path / "dryrun")],
+        ["scripts/lf/profile_lora_lf_test_source.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(tmp_path / "dryrun")],
         env={
             "LF_DIR": str(lf_dir),
             "BACKEND_SPECS": "asym_cpuadamwds|norecomp",
@@ -498,7 +498,7 @@ def test_profile_lora_lf_rejects_non_exact_expert_lora_a_modes(tmp_path: Path, b
 def test_profile_lora_lf_rejects_three_field_exp_act_policy_tuple(tmp_path: Path) -> None:
     lf_dir = make_fake_lf(tmp_path)
     result = run_cmd(
-        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(tmp_path / "dryrun")],
+        ["scripts/lf/profile_lora_lf_test_source.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(tmp_path / "dryrun")],
         env={
             "LF_DIR": str(lf_dir),
             "BACKEND_SPECS": "asym_cpuadamwds|norecomp",
@@ -524,7 +524,7 @@ def test_profile_lora_lf_four_field_exp_attn_axis_dry_run(tmp_path: Path) -> Non
     output_root = tmp_path / "dryrun"
 
     run_cmd(
-        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
+        ["scripts/lf/profile_lora_lf_test_source.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
         env={
             "LF_DIR": str(lf_dir),
             "BACKEND_SPECS": "asym_cpuadamwds|norecomp",
@@ -588,7 +588,7 @@ def test_profile_lora_lf_rejects_selective_gc_with_global_recomp(tmp_path: Path)
     output_root = tmp_path / "dryrun"
 
     result = run_cmd(
-        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
+        ["scripts/lf/profile_lora_lf_test_source.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
         env={
             "LF_DIR": str(lf_dir),
             "BACKEND_SPECS": "asym_cpuadamwds|recomp",
@@ -617,7 +617,7 @@ def test_profile_lora_lf_rejects_activation_offload_with_global_recomp(tmp_path:
     output_root = tmp_path / "dryrun"
 
     result = run_cmd(
-        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
+        ["scripts/lf/profile_lora_lf_test_source.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
         env={
             "LF_DIR": str(lf_dir),
             "BACKEND_SPECS": "asym_cpuadamwds|recomp",
@@ -646,7 +646,7 @@ def test_profile_lora_lf_four_part_layer_axis_dry_run(tmp_path: Path) -> None:
     output_root = tmp_path / "dryrun"
 
     run_cmd(
-        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
+        ["scripts/lf/profile_lora_lf_test_source.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
         env={
             "LF_DIR": str(lf_dir),
             "BACKEND_SPECS": "asym_cpuadamwds|norecomp",
@@ -699,7 +699,7 @@ def test_profile_lora_lf_mixed_dry_run_does_not_leak_cpuadamw_to_zero(tmp_path: 
     output_root = tmp_path / "dryrun"
 
     run_cmd(
-        ["scripts/lf/profile_lora_lf.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
+        ["scripts/lf/profile_lora_lf_test_source.sh", "--model-specs", "Qwen/Qwen3-30B-A3B|1", "--output-root", str(output_root)],
         env={
             "LF_DIR": str(lf_dir),
             "BACKEND_SPECS": "asym_cpuadamwtorch|recomp,zero3_offload|recomp",
@@ -733,7 +733,7 @@ def test_profile_lora_lf_test_wrapper_preserves_output_root(tmp_path: Path) -> N
 
     run_cmd(
         [
-            "scripts/lf/profile_lora_lf_test.sh",
+            "scripts/lf/profile_lora_lf_test_source.sh",
             "--model-specs",
             "Qwen/Qwen3-30B-A3B|1",
             "--output-root",
@@ -773,7 +773,7 @@ def test_profile_lora_lf_default_e2e_shape_uses_asym_cpuadamwds(tmp_path: Path) 
     output_root = tmp_path / "dryrun"
 
     run_cmd(
-        ["scripts/lf/profile_lora_lf.sh", "--output-root", str(output_root)],
+        ["scripts/lf/profile_lora_lf_test_source.sh", "--output-root", str(output_root)],
         env={
             "LF_DIR": str(lf_dir),
             "DEEPSPEED_DIR": str(deepspeed_dir),
@@ -835,7 +835,7 @@ def test_profile_lora_lf_dry_run_three_model_families_preserves_offload_modules(
 
     run_cmd(
         [
-            "scripts/lf/profile_lora_lf.sh",
+            "scripts/lf/profile_lora_lf_test_source.sh",
             "--model-specs",
             "Qwen/Qwen3-30B-A3B|1,Qwen/Qwen3.5-122B-A10B|1,meta-llama/Llama-4-Scout-17B-16E|1",
             "--output-root",

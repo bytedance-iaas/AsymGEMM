@@ -1436,7 +1436,7 @@ def test_profile_lora_lf_dry_run_accepts_superoffload(tmp_path: Path) -> None:
 
     run_cmd(
         [
-            "scripts/lf/profile_lora_lf.sh",
+            "scripts/lf/profile_lora_lf_test_source.sh",
             "--model-specs",
             "Qwen/Qwen3-30B-A3B|2",
             "--output-root",
@@ -1485,7 +1485,7 @@ def test_profile_lora_lf_dry_run_accepts_zero3_cpuadam(tmp_path: Path) -> None:
 
     run_cmd(
         [
-            "scripts/lf/profile_lora_lf.sh",
+            "scripts/lf/profile_lora_lf_test_source.sh",
             "--model-specs",
             "Qwen/Qwen3-30B-A3B|1",
             "--output-root",
@@ -1531,7 +1531,7 @@ def test_profile_lora_lf_skips_kt_arm_nsys_without_source_ok(tmp_path: Path) -> 
 
     result = run_cmd(
         [
-            "scripts/lf/profile_lora_lf.sh",
+            "scripts/lf/profile_lora_lf_test_source.sh",
             "--model-specs",
             "Qwen/Qwen3-30B-A3B|1",
             "--output-root",
@@ -1566,7 +1566,7 @@ def test_profile_lora_lf_skips_kt_arm_nsys_without_matching_source_profile(tmp_p
 
     result = run_cmd(
         [
-            "scripts/lf/profile_lora_lf.sh",
+            "scripts/lf/profile_lora_lf_test_source.sh",
             "--model-specs",
             "Qwen/Qwen3-30B-A3B|1",
             "--output-root",
@@ -1677,7 +1677,7 @@ def test_profile_lora_lf_passes_matching_source_profile_to_kt_arm_nsys(tmp_path:
 
     result = run_cmd(
         [
-            "scripts/lf/profile_lora_lf.sh",
+            "scripts/lf/profile_lora_lf_test_source.sh",
             "--model-specs",
             "Qwen/Qwen3-30B-A3B|1",
             "--output-root",
@@ -1717,7 +1717,7 @@ def test_profile_lora_lf_dry_run_rejects_kt_arm_large_route_rank(tmp_path: Path)
 
     result = subprocess.run(
         [
-            "scripts/lf/profile_lora_lf.sh",
+            "scripts/lf/profile_lora_lf_test_source.sh",
             "--model-specs",
             "Qwen/Qwen3-30B-A3B|1",
             "--output-root",
@@ -1759,7 +1759,7 @@ def test_profile_lora_lf_dry_run_allows_kt_arm_large_route_rank_with_token_chunk
 
     result = subprocess.run(
         [
-            "scripts/lf/profile_lora_lf.sh",
+            "scripts/lf/profile_lora_lf_test_source.sh",
             "--model-specs",
             "Qwen/Qwen3-30B-A3B|1",
             "--output-root",
@@ -1821,7 +1821,7 @@ def test_profile_lora_lf_rejects_stale_kt_profile_missing_update_health(tmp_path
             [
                 "set -Eeuo pipefail",
                 f"ENV_PYTHON={sys.executable!r}",
-                "eval \"$(awk '/^existing_profile_complete\\(\\)/,/^kt_arm_route_rank_limit\\(\\)/ { if ($0 !~ /^kt_arm_route_rank_limit\\(\\)/) print }' scripts/lf/profile_lora_lf.sh)\"",
+                "eval \"$(awk '/^existing_profile_complete\\(\\)/,/^kt_arm_route_rank_limit\\(\\)/ { if ($0 !~ /^kt_arm_route_rank_limit\\(\\)/) print }' scripts/lf/profile_lora_lf_test_source.sh)\"",
                 "existing_profile_complete \"$1\"",
                 "",
             ]
@@ -1877,7 +1877,7 @@ def test_profile_lora_lf_rejects_stale_kt_profile_passed_update_health(tmp_path:
             [
                 "set -Eeuo pipefail",
                 f"ENV_PYTHON={sys.executable!r}",
-                "eval \"$(awk '/^existing_profile_complete\\(\\)/,/^kt_arm_route_rank_limit\\(\\)/ { if ($0 !~ /^kt_arm_route_rank_limit\\(\\)/) print }' scripts/lf/profile_lora_lf.sh)\"",
+                "eval \"$(awk '/^existing_profile_complete\\(\\)/,/^kt_arm_route_rank_limit\\(\\)/ { if ($0 !~ /^kt_arm_route_rank_limit\\(\\)/) print }' scripts/lf/profile_lora_lf_test_source.sh)\"",
                 "existing_profile_complete \"$1\"",
                 "",
             ]
@@ -1923,7 +1923,7 @@ def test_profile_lora_lf_rejects_nested_partial_source_profile(tmp_path: Path) -
             [
                 "set -Eeuo pipefail",
                 f"ENV_PYTHON={sys.executable!r}",
-                "eval \"$(awk '/^existing_profile_complete\\(\\)/,/^kt_arm_route_rank_limit\\(\\)/ { if ($0 !~ /^kt_arm_route_rank_limit\\(\\)/) print }' scripts/lf/profile_lora_lf.sh)\"",
+                "eval \"$(awk '/^existing_profile_complete\\(\\)/,/^kt_arm_route_rank_limit\\(\\)/ { if ($0 !~ /^kt_arm_route_rank_limit\\(\\)/) print }' scripts/lf/profile_lora_lf_test_source.sh)\"",
                 "existing_profile_complete \"$1\"",
                 "",
             ]
@@ -1989,7 +1989,7 @@ def test_profile_lora_lf_rejects_kt_arm_profile_token_chunk_mismatch(tmp_path: P
                 "KT_ARM_SFT_MAX_ROUTE_RANK_WORK=",
                 "KT_ARM_SFT_DEFAULT_MAX_ROUTE_RANK_WORK=1048576",
                 "KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK=0",
-                "eval \"$(awk '/^existing_profile_complete\\(\\)/,/^kt_arm_route_rank_limit\\(\\)/ { if ($0 !~ /^kt_arm_route_rank_limit\\(\\)/) print }' scripts/lf/profile_lora_lf.sh)\"",
+                "eval \"$(awk '/^existing_profile_complete\\(\\)/,/^kt_arm_route_rank_limit\\(\\)/ { if ($0 !~ /^kt_arm_route_rank_limit\\(\\)/) print }' scripts/lf/profile_lora_lf_test_source.sh)\"",
                 "existing_profile_complete \"$1\" kt_armbf16 7168 Qwen/Qwen3-30B-A3B all",
                 "",
             ]
@@ -2031,7 +2031,7 @@ def test_profile_lora_lf_rejects_existing_profile_backend_mismatch(tmp_path: Pat
             [
                 "set -Eeuo pipefail",
                 f"ENV_PYTHON={sys.executable!r}",
-                "eval \"$(awk '/^existing_profile_complete\\(\\)/,/^kt_arm_route_rank_limit\\(\\)/ { if ($0 !~ /^kt_arm_route_rank_limit\\(\\)/) print }' scripts/lf/profile_lora_lf.sh)\"",
+                "eval \"$(awk '/^existing_profile_complete\\(\\)/,/^kt_arm_route_rank_limit\\(\\)/ { if ($0 !~ /^kt_arm_route_rank_limit\\(\\)/) print }' scripts/lf/profile_lora_lf_test_source.sh)\"",
                 "existing_profile_complete \"$1\" kt_armbf16 128 Qwen/Qwen3-30B-A3B all",
                 "",
             ]
@@ -2074,7 +2074,7 @@ def test_profile_lora_lf_rejects_existing_asym_offload_modules_mismatch(tmp_path
             [
                 "set -Eeuo pipefail",
                 f"ENV_PYTHON={sys.executable!r}",
-                "eval \"$(awk '/^existing_profile_complete\\(\\)/,/^kt_arm_route_rank_limit\\(\\)/ { if ($0 !~ /^kt_arm_route_rank_limit\\(\\)/) print }' scripts/lf/profile_lora_lf.sh)\"",
+                "eval \"$(awk '/^existing_profile_complete\\(\\)/,/^kt_arm_route_rank_limit\\(\\)/ { if ($0 !~ /^kt_arm_route_rank_limit\\(\\)/) print }' scripts/lf/profile_lora_lf_test_source.sh)\"",
                 "existing_profile_complete \"$1\" asym_cpuadamwds 128 Qwen/Qwen3-30B-A3B all recomp \"${EXPECTED_OFFLOAD_MODULES:-all}\"",
                 "",
             ]
@@ -2176,7 +2176,7 @@ def test_profile_lora_lf_rejects_zero_exit_wrong_shape_profile_after_run(tmp_pat
 
     result = subprocess.run(
         [
-            "scripts/lf/profile_lora_lf.sh",
+            "scripts/lf/profile_lora_lf_test_source.sh",
             "--model-specs",
             "Qwen/Qwen3-30B-A3B|1",
             "--output-root",
@@ -2217,7 +2217,7 @@ def test_profile_lora_lf_rejects_legacy_superoffload_alias(tmp_path: Path) -> No
     deepspeed_dir = make_fake_deepspeed(tmp_path)
     result = subprocess.run(
         [
-            "scripts/lf/profile_lora_lf.sh",
+            "scripts/lf/profile_lora_lf_test_source.sh",
             "--model-specs",
             "Qwen/Qwen3-30B-A3B|1",
             "--output-root",
@@ -2556,7 +2556,7 @@ def test_profile_lora_lf_skips_expert_policy_for_superoffload(tmp_path: Path) ->
 
     run_cmd(
         [
-            "scripts/lf/profile_lora_lf.sh",
+            "scripts/lf/profile_lora_lf_test_source.sh",
             "--model-specs",
             "Qwen/Qwen3-30B-A3B|2",
             "--output-root",
@@ -2596,7 +2596,7 @@ def test_profile_lora_lf_keeps_superoffload_recompute_modes(tmp_path: Path) -> N
 
     run_cmd(
         [
-            "scripts/lf/profile_lora_lf.sh",
+            "scripts/lf/profile_lora_lf_test_source.sh",
             "--model-specs",
             "Qwen/Qwen3-30B-A3B|1",
             "--output-root",

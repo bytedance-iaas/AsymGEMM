@@ -3,7 +3,7 @@ set -euo pipefail
 set -o pipefail
 
 if (($# > 0)); then
-  echo "run_lf_lora_sft.sh does not accept command-line arguments; set environment variables or use profile_lora_lf.sh." >&2
+  echo "run_lf_lora_sft.sh does not accept command-line arguments; set environment variables or use profile_lora_lf_test_source.sh." >&2
   echo "Unexpected arguments: $*" >&2
   exit 2
 fi
@@ -178,6 +178,13 @@ PROFILE_NSYS_PREFIX=${PROFILE_NSYS_PREFIX:-}
 PROFILE_NSYS_SQLITE=${PROFILE_NSYS_SQLITE:-}
 PROFILE_NSYS_CAPTURE_RANGE=${PROFILE_NSYS_CAPTURE_RANGE:-cudaProfilerApi} # cudaProfilerApi | none
 PROFILE_NSYS_GPU_METRICS_DEVICES=${PROFILE_NSYS_GPU_METRICS_DEVICES:-${GPU_ID}}
+# NVMe-offload I/O monitoring. osrt traces the libaio reader threads so the param swap-in cost is
+# attributable; override NSYS_TRACE=cuda,nvtx to drop it. RECORD_IO samples /sys/block/<dev>/stat
+# once a second so an agent reads real NVMe bandwidth without parsing the multi-100MB nsys sqlite.
+NSYS_TRACE=${NSYS_TRACE:-cuda,nvtx,osrt}
+RECORD_IO=${RECORD_IO:-1}
+NVME_OFFLOAD_IO_DEVICE=${NVME_OFFLOAD_IO_DEVICE:-md0}
+OFFLOAD_SUMMARY_SCRIPT=${OFFLOAD_SUMMARY_SCRIPT:-${ROOT}/scripts/lf/summarize_nvme_offload.py}
 PROFILE_JSON=${PROFILE_JSON:-}
 PROFILE_SUMMARY_MD=${PROFILE_SUMMARY_MD:-}
 PROFILE_HEARTBEAT_JSON=${PROFILE_HEARTBEAT_JSON:-}
@@ -2381,13 +2388,44 @@ if is_torch_run; then
   fi
 fi
 
+# --- NVMe offload I/O sampler -------------------------------------------------
+# Records a per-second /sys/block/<dev>/stat timeseries (sectors read/written) for the whole run.
+# summarize_nvme_offload.py turns it into offload_io.json so an agent reads the real NVMe offload
+# bandwidth without parsing the nsys sqlite. Cheap (1 read/sec), best-effort.
+IO_SAMPLER_PID=""
+IO_SAMPLES_CSV=""
+start_io_sampler() {
+  IO_SAMPLER_PID=""
+  [[ "${RECORD_IO}" == "1" && "${PROFILE}" == "1" ]] || return 0
+  local statf="/sys/block/${NVME_OFFLOAD_IO_DEVICE}/stat"
+  [[ -r "${statf}" ]] || { echo "RECORD_IO: ${statf} not readable; skipping io sampler" | tee -a "${LOG_FILE}"; return 0; }
+  [[ -n "${PROFILE_OUTPUT_DIR}" ]] || return 0
+  mkdir -p "${PROFILE_OUTPUT_DIR}"
+  IO_SAMPLES_CSV="${PROFILE_OUTPUT_DIR}/io_samples.csv"
+  echo "epoch_s,sectors_read,sectors_written" > "${IO_SAMPLES_CSV}"
+  ( while :; do
+      read -r _r1 _r2 _sread _r4 _r5 _r6 _swrite _rest < "${statf}" || break
+      printf '%s,%s,%s\n' "$(date +%s.%N)" "${_sread}" "${_swrite}" >> "${IO_SAMPLES_CSV}"
+      sleep 1
+    done ) &
+  IO_SAMPLER_PID=$!
+  echo "RECORD_IO: sampling ${statf} -> ${IO_SAMPLES_CSV} (pid ${IO_SAMPLER_PID})" | tee -a "${LOG_FILE}"
+}
+stop_io_sampler() {
+  [[ -n "${IO_SAMPLER_PID}" ]] || return 0
+  kill "${IO_SAMPLER_PID}" 2>/dev/null || true
+  wait "${IO_SAMPLER_PID}" 2>/dev/null || true
+  IO_SAMPLER_PID=""
+}
+
 TRAIN_STATUS=0
 SOURCE_PROFILE_POSTPROCESSED=0
+start_io_sampler
 if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "nsys" ]]; then
   NSYS_CMD=(
     "${NSYS_BIN}"
     profile
-    --trace=cuda,nvtx
+    --trace=${NSYS_TRACE}
     --sample=none
     --cpuctxsw=none
     --resolve-symbols=false
@@ -2411,6 +2449,7 @@ else
   TRAIN_STATUS=$?
   set -e
 fi
+stop_io_sampler
 
 if [[ "${TRAIN_STATUS}" != "0" ]] && source_profile_completion_proven; then
   echo "Training launcher command returned status ${TRAIN_STATUS}, but final source_profile_written heartbeat and ${PROFILE_SOURCE_JSON} exist; accepting the completed source-profile run." | tee -a "${LOG_FILE}"
@@ -2694,6 +2733,13 @@ if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "nsys" ]]; then
     --force-overwrite=true \
     --output="${PROFILE_NSYS_SQLITE}" \
     "${PROFILE_NSYS_PREFIX}.nsys-rep" 2>&1 | tee -a "${LOG_FILE}"
+  # Compact, agent-readable CSV summaries so downstream agents skip the multi-100MB sqlite.
+  "${NSYS_BIN}" stats --format csv \
+    --report cuda_gpu_kern_sum --report cuda_gpu_mem_time_sum \
+    --report cuda_gpu_mem_size_sum --report osrt_sum \
+    --output "${PROFILE_OUTPUT_DIR}/nsys_stats" \
+    "${PROFILE_NSYS_SQLITE}" 2>&1 | tee -a "${LOG_FILE}" \
+    || echo "nsys stats failed (non-fatal)" | tee -a "${LOG_FILE}"
   if [[ ! -f "${PROFILE_NSYS_POSTPROCESS_SCRIPT}" ]]; then
     echo "Missing Nsight postprocess script ${PROFILE_NSYS_POSTPROCESS_SCRIPT}" >&2
     exit 2
@@ -2706,6 +2752,15 @@ if [[ "${PROFILE}" == "1" && "${PROFILE_PROFILER}" == "nsys" ]]; then
   "${ENV_PYTHON}" "${PROFILE_POSTPROCESS_SCRIPT}" \
     --profile-json "${PROFILE_JSON}" \
     --output-dir "${PROFILE_OUTPUT_DIR}" 2>&1 | tee -a "${LOG_FILE}"
+  # NVMe-offload cost summary (NVTX swap-in wait + GPU compute/H2D + md0 bandwidth) -> flat JSON.
+  if [[ -f "${OFFLOAD_SUMMARY_SCRIPT}" ]]; then
+    "${ENV_PYTHON}" "${OFFLOAD_SUMMARY_SCRIPT}" \
+      "${PROFILE_NSYS_SQLITE}" \
+      --io-samples "${IO_SAMPLES_CSV:-}" \
+      --profile-json "${PROFILE_JSON}" \
+      --output-json "${PROFILE_OUTPUT_DIR}/offload_io.json" 2>&1 | tee -a "${LOG_FILE}" \
+      || echo "offload summary failed (non-fatal)" | tee -a "${LOG_FILE}"
+  fi
   check_trainable_surface_if_requested 2>&1 | tee -a "${LOG_FILE}"
   echo "Wrote Nsight profile artifacts to ${PROFILE_JSON} and ${PROFILE_SUMMARY_MD}" | tee -a "${LOG_FILE}"
 fi
