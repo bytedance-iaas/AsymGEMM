@@ -656,6 +656,34 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
             "ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS",
             os.environ.get("ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS", "0"),
         ),
+        "asymm_qwen3_moe_route_mapped_gemm": os.environ.get(
+            "ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_ROUTE_MAPPED_GEMM",
+            os.environ.get("ASYMM_QWEN3_MOE_ROUTE_MAPPED_GEMM", "0"),
+        ),
+        "asymm_qwen3_moe_route_fwd_scatter": os.environ.get(
+            "ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_ROUTE_FWD_SCATTER",
+            os.environ.get("ASYMM_QWEN3_MOE_ROUTE_FWD_SCATTER", "0"),
+        ),
+        "asymm_qwen3_moe_route_down_dx_gather": os.environ.get(
+            "ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER",
+            os.environ.get("ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER", "0"),
+        ),
+        "asymm_qwen3_moe_route_gateup_dx_scatter": os.environ.get(
+            "ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_ROUTE_GATEUP_DX_SCATTER",
+            os.environ.get("ASYMM_QWEN3_MOE_ROUTE_GATEUP_DX_SCATTER", "0"),
+        ),
+        "asymm_qwen3_moe_route_lora": os.environ.get(
+            "ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_ROUTE_LORA",
+            os.environ.get("ASYMM_QWEN3_MOE_ROUTE_LORA", "0"),
+        ),
+        "asymm_qwen3_moe_route_accum_dtype": os.environ.get(
+            "ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE",
+            os.environ.get("ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE", "fp32"),
+        ),
+        "asymm_qwen3_moe_route_kernel_debug": os.environ.get(
+            "ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG",
+            os.environ.get("ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG", "0"),
+        ),
         "asymm_layer_act_offload": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD", "false"),
         "asymm_layer_gc": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_GC", "false"),
         "attention_gc_enabled": attention_gc_enabled,

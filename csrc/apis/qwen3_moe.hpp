@@ -29,6 +29,42 @@ pybind11::tuple qwen3_gate_up_recompute_bwd_sm100_bf16_windowed(
     const torch::Tensor& down_mask_packed,
     double down_dropout_p);
 
+void qwen3_moe_bf16_down_forward_scatter_add_(
+    const torch::Tensor& act,
+    const torch::Tensor& weight_cpu,
+    const torch::Tensor& out_fp32,
+    const torch::Tensor& offsets,
+    const torch::Tensor& experts,
+    const torch::Tensor& token_indices,
+    const torch::Tensor& routing_weights,
+    int64_t list_size,
+    bool weighted,
+    const std::string& compiled_dims);
+
+void qwen3_moe_bf16_down_dx_gather_left_(
+    const torch::Tensor& grad_token,
+    const torch::Tensor& weight_cpu,
+    const torch::Tensor& grad_act,
+    const torch::Tensor& offsets,
+    const torch::Tensor& experts,
+    const torch::Tensor& token_indices,
+    const torch::Tensor& routing_weights,
+    int64_t list_size,
+    bool weighted,
+    const std::string& compiled_dims);
+
+void qwen3_moe_bf16_gateup_dx_scatter_add_(
+    const torch::Tensor& grad_expert,
+    const torch::Tensor& weight_cpu,
+    const torch::Tensor& grad_hidden_fp32,
+    const torch::Tensor& offsets,
+    const torch::Tensor& experts,
+    const torch::Tensor& token_indices,
+    const torch::Tensor& routing_weights,
+    int64_t list_size,
+    bool weighted,
+    const std::string& compiled_dims);
+
 static void register_apis(pybind11::module_& m) {
     namespace py = pybind11;
     m.def(
@@ -153,6 +189,45 @@ static void register_apis(pybind11::module_& m) {
         py::arg("lora_scale") = 1.0,
         py::arg("mode") = "cache_first_window",
         py::arg("return_stats") = true);
+    m.def(
+        "qwen3_moe_bf16_down_forward_scatter_add_",
+        &qwen3_moe_bf16_down_forward_scatter_add_,
+        py::arg("act"),
+        py::arg("weight_cpu"),
+        py::arg("out_fp32"),
+        py::arg("offsets"),
+        py::arg("experts"),
+        py::arg("token_indices"),
+        py::arg("routing_weights"),
+        py::arg("list_size"),
+        py::arg("weighted"),
+        py::arg("compiled_dims") = "nk");
+    m.def(
+        "qwen3_moe_bf16_down_dx_gather_left_",
+        &qwen3_moe_bf16_down_dx_gather_left_,
+        py::arg("grad_token"),
+        py::arg("weight_cpu"),
+        py::arg("grad_act"),
+        py::arg("offsets"),
+        py::arg("experts"),
+        py::arg("token_indices"),
+        py::arg("routing_weights"),
+        py::arg("list_size"),
+        py::arg("weighted"),
+        py::arg("compiled_dims") = "nk");
+    m.def(
+        "qwen3_moe_bf16_gateup_dx_scatter_add_",
+        &qwen3_moe_bf16_gateup_dx_scatter_add_,
+        py::arg("grad_expert"),
+        py::arg("weight_cpu"),
+        py::arg("grad_hidden_fp32"),
+        py::arg("offsets"),
+        py::arg("experts"),
+        py::arg("token_indices"),
+        py::arg("routing_weights"),
+        py::arg("list_size"),
+        py::arg("weighted"),
+        py::arg("compiled_dims") = "nk");
 }
 
 }  // namespace asym_gemm::qwen3_moe

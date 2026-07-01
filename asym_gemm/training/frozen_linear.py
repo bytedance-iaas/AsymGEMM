@@ -92,6 +92,13 @@ class AsymExecutionStats:
     qwen3_moe_finegrained_down_scatter_max_block_rows: int = 0
     qwen3_moe_finegrained_hidden_route_global_tensors_avoided: int = 0
     qwen3_moe_finegrained_stage_rows_calls: int = 0
+    qwen3_moe_routed_base_forward_scatter_calls: int = 0
+    qwen3_moe_routed_base_gather_left_calls: int = 0
+    qwen3_moe_routed_base_dx_scatter_calls: int = 0
+    qwen3_moe_routed_lora_b_forward_scatter_calls: int = 0
+    qwen3_moe_routed_lora_b_backward_from_tokens_calls: int = 0
+    qwen3_moe_routed_lora_dx_scatter_calls: int = 0
+    qwen3_moe_routed_route_space_h_tensors_avoided: int = 0
     reference_fallback_count: int = 0
     fallback_reasons: Dict[str, int] = field(default_factory=dict)
 

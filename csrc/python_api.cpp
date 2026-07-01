@@ -13,6 +13,8 @@
 #include "apis/qwen3_moe.hpp"
 #include "apis/runtime.hpp"
 
+#include "qwen3/qwen3_moe_routed_gemm.cpp"
+
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME _C
 #endif

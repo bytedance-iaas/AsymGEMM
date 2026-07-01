@@ -24,6 +24,12 @@ from .exp_act_offload_lora import (
 from .frozen_linear import AsymGroupedFrozenLinear
 from .lora import grouped_expert_lora, prepare_grouped_lora_metadata
 from .profile_ranges import prof_range
+from .qwen3_moe_routed_gemm import (
+    down_dx_gather_left,
+    down_forward_scatter_add_,
+    gateup_dx_scatter_add_,
+    routed_kernel_flags,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from .qwen3_moe import AsymQwen3Experts
@@ -89,6 +95,12 @@ def _route_grad_from_tokens(
 
 def _record_manager_peaks(layer: "AsymQwen3Experts", manager: ActivationOffloadManager) -> dict[str, Any]:
     snapshot = manager.snapshot()
+    route_flags = routed_kernel_flags()
+    snapshot["qwen3_moe_route_fwd_scatter"] = bool(route_flags.fwd_scatter)
+    snapshot["qwen3_moe_route_down_dx_gather"] = bool(route_flags.down_dx_gather)
+    snapshot["qwen3_moe_route_gateup_dx_scatter"] = bool(route_flags.gateup_dx_scatter)
+    snapshot["qwen3_moe_route_lora"] = bool(route_flags.lora)
+    snapshot["qwen3_moe_route_accum_dtype"] = route_flags.accum_dtype
     layer.stats.qwen3_moe_finegrained_saved_cpu_bytes = max(
         int(layer.stats.qwen3_moe_finegrained_saved_cpu_bytes),
         int(snapshot.get("cpu_peak_bytes_live", 0)),
@@ -109,6 +121,16 @@ def _down_scatter_block_experts() -> int:
         return max(0, int(str(raw).strip() or "0"))
     except ValueError:
         return 0
+
+
+def _validate_routed_flags_for_current_path(*, down_scatter_block_experts: int) -> None:
+    route_flags = routed_kernel_flags()
+    if not (route_flags.any_base or route_flags.lora):
+        return
+    if route_flags.accum_dtype != "fp32":
+        raise RuntimeError("Qwen3 routed kernels currently require ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE=fp32")
+    if int(down_scatter_block_experts) != 0:
+        raise RuntimeError("Qwen3 routed kernels must not be combined with ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS")
 
 
 def _expert_blocks(
@@ -366,6 +388,8 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
         manager = ActivationOffloadManager(pin_memory=True)
         layer.stats.qwen3_moe_finegrained_forward_calls += 1
         down_scatter_block_experts = _down_scatter_block_experts()
+        _validate_routed_flags_for_current_path(down_scatter_block_experts=down_scatter_block_experts)
+        route_flags = routed_kernel_flags()
         down_scatter_blocks = _expert_blocks(offsets, experts, down_scatter_block_experts)
         _record_down_scatter_block(layer, down_scatter_block_experts, down_scatter_blocks)
 
@@ -510,7 +534,27 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
             else:
                 act_stage = manager.stage(act_cpu, tag="moe.act_for_down_base")
                 layer.stats.qwen3_moe_finegrained_down_base_calls += 1
-                output = _base_forward(layer, layer.down_base, act_stage, offsets, experts, part="down")
+                if route_flags.fwd_scatter:
+                    base_scattered_fp32 = torch.zeros(
+                        (int(num_tokens), int(layer.hidden_dim)),
+                        device=hidden_states.device,
+                        dtype=torch.float32,
+                    )
+                    down_forward_scatter_add_(
+                        layer.down_base,
+                        act_stage,
+                        base_scattered_fp32,
+                        offsets,
+                        experts,
+                        token_indices,
+                        routing_weights,
+                        weighted=bool(output_weighted),
+                    )
+                    scattered.add_(base_scattered_fp32.to(dtype=scattered.dtype))
+                    del base_scattered_fp32
+                    output = None
+                else:
+                    output = _base_forward(layer, layer.down_base, act_stage, offsets, experts, part="down")
                 manager.release_stage(act_stage, drop_cache=True)
                 del act_stage
 
@@ -544,7 +588,7 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
         ctx.down_low_rank_cpu = down_low_rank_cpu
         ctx.input_dtype = input_dtype
         layer._last_activation_offload_stats = _record_manager_peaks(layer, manager)
-        if down_scatter_block_experts <= 0:
+        if down_scatter_block_experts <= 0 and not route_flags.fwd_scatter:
             with prof_range(layer._forward_range("moe_finegrained", "scatter_down_base")):
                 _scatter_routes_add_(
                     scattered,
@@ -587,10 +631,14 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
         gate_base, up_base = layer._ensure_qwen3_moe_finegrained_bases()
         layer.stats.qwen3_moe_finegrained_backward_calls += 1
         down_scatter_block_experts = _down_scatter_block_experts()
+        _validate_routed_flags_for_current_path(down_scatter_block_experts=down_scatter_block_experts)
+        route_flags = routed_kernel_flags()
         down_scatter_blocks = _expert_blocks(offsets, experts, down_scatter_block_experts)
         _record_down_scatter_block(layer, down_scatter_block_experts, down_scatter_blocks)
         grad_packed = None
         grad_hidden = None
+        grad_hidden_base_fp32 = None
+        grad_hidden_lora = None
         grad_gate_cpu = None
         grad_up_cpu = None
         grad_gate_lora_A = grad_gate_lora_B = None
@@ -683,6 +731,23 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                         del grad_block, d_s_down, down_lora_dx, grad_act_block
                 manager.release_cpu(ctx.down_low_rank_cpu)
             else:
+                if route_flags.down_dx_gather:
+                    with prof_range(layer._forward_range("moe_finegrained_backward", "down_base_dx")):
+                        grad_token = grad_output.reshape(int(ctx.num_tokens), -1)
+                        layer.stats.qwen3_moe_finegrained_down_base_calls += 1
+                        grad_act = down_dx_gather_left(
+                            layer.down_base,
+                            grad_token,
+                            (int(token_indices.numel()), int(layer.intermediate_dim)),
+                            offsets,
+                            experts,
+                            token_indices,
+                            routing_weights,
+                            weighted=bool(getattr(ctx, "output_weighted", True)),
+                        )
+                else:
+                    grad_act = None
+
                 with prof_range(layer._forward_range("moe_finegrained_backward", "scatter_grad")):
                     grad_2d = _route_grad_from_tokens(
                         grad_output,
@@ -725,16 +790,17 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     )
 
                 with prof_range(layer._forward_range("moe_finegrained_backward", "down_base_dx")):
-                    layer.stats.qwen3_moe_finegrained_down_base_calls += 1
-                    grad_act = _base_dx(
-                        layer,
-                        layer.down_base,
-                        grad_2d,
-                        offsets,
-                        experts,
-                        part="down",
-                        input_dtype=ctx.input_dtype,
-                    )
+                    if grad_act is None:
+                        layer.stats.qwen3_moe_finegrained_down_base_calls += 1
+                        grad_act = _base_dx(
+                            layer,
+                            layer.down_base,
+                            grad_2d,
+                            offsets,
+                            experts,
+                            part="down",
+                            input_dtype=ctx.input_dtype,
+                        )
                     down_lora_dx = grouped_expert_lora(
                         d_s_down,
                         down_lora_A.transpose(-1, -2),
@@ -947,6 +1013,18 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                 manager.release_cpu(grad_up_cpu)
                 grad_up_cpu = None
             else:
+                if route_flags.gateup_dx_scatter and ctx.needs_input_grad[0]:
+                    grad_hidden_base_fp32 = torch.zeros(
+                        (int(ctx.num_tokens), int(layer.hidden_dim)),
+                        device=grad_output.device,
+                        dtype=torch.float32,
+                    )
+                    grad_hidden_lora = torch.zeros(
+                        (int(ctx.num_tokens), int(layer.hidden_dim)),
+                        device=grad_output.device,
+                        dtype=ctx.input_dtype,
+                    )
+
                 with prof_range(layer._forward_range("moe_finegrained_backward", "gate")):
                     grad_gate_stage = manager.stage(grad_gate_cpu, tag="moe.dgate")
                     gate_low_rank = manager.stage(ctx.gate_low_rank_cpu, tag="moe.S_gate_for_dB")
@@ -981,15 +1059,27 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     )
                     if ctx.needs_input_grad[0]:
                         layer.stats.qwen3_moe_finegrained_gate_base_calls += 1
-                        grad_packed = _base_dx(
-                            layer,
-                            gate_base,
-                            grad_gate_stage,
-                            offsets,
-                            experts,
-                            part="gate",
-                            input_dtype=ctx.input_dtype,
-                        )
+                        if route_flags.gateup_dx_scatter:
+                            gateup_dx_scatter_add_(
+                                gate_base,
+                                grad_gate_stage,
+                                grad_hidden_base_fp32,
+                                offsets,
+                                experts,
+                                token_indices,
+                                routing_weights,
+                                weighted=bool(getattr(ctx, "input_weighted", False)),
+                            )
+                        else:
+                            grad_packed = _base_dx(
+                                layer,
+                                gate_base,
+                                grad_gate_stage,
+                                offsets,
+                                experts,
+                                part="gate",
+                                input_dtype=ctx.input_dtype,
+                            )
                         gate_lora_dx = grouped_expert_lora(
                             d_s_gate,
                             gate_lora_A.transpose(-1, -2),
@@ -997,7 +1087,16 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                             experts,
                             metadata=metadata,
                         )
-                        grad_packed.add_(gate_lora_dx.to(dtype=grad_packed.dtype))
+                        if route_flags.gateup_dx_scatter:
+                            _scatter_routes_add_(
+                                grad_hidden_lora,
+                                gate_lora_dx,
+                                token_indices,
+                                routing_weights,
+                                weighted=bool(getattr(ctx, "input_weighted", False)),
+                            )
+                        else:
+                            grad_packed.add_(gate_lora_dx.to(dtype=grad_packed.dtype))
                         del gate_lora_dx
                     del d_s_gate
                     manager.release_stage(grad_gate_stage, drop_cache=True)
@@ -1037,24 +1136,36 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                         tag="moe.up",
                     )
                     if ctx.needs_input_grad[0]:
-                        if grad_packed is None:
+                        if grad_packed is None and not route_flags.gateup_dx_scatter:
                             grad_packed = torch.zeros(
                                 (int(grad_up_stage.shape[0]), int(layer.hidden_dim)),
                                 device=grad_up_stage.device,
                                 dtype=ctx.input_dtype,
                             )
                         layer.stats.qwen3_moe_finegrained_up_base_calls += 1
-                        up_dx = _base_dx(
-                            layer,
-                            up_base,
-                            grad_up_stage,
-                            offsets,
-                            experts,
-                            part="up",
-                            input_dtype=ctx.input_dtype,
-                        )
-                        grad_packed.add_(up_dx.to(dtype=grad_packed.dtype))
-                        del up_dx
+                        if route_flags.gateup_dx_scatter:
+                            gateup_dx_scatter_add_(
+                                up_base,
+                                grad_up_stage,
+                                grad_hidden_base_fp32,
+                                offsets,
+                                experts,
+                                token_indices,
+                                routing_weights,
+                                weighted=bool(getattr(ctx, "input_weighted", False)),
+                            )
+                        else:
+                            up_dx = _base_dx(
+                                layer,
+                                up_base,
+                                grad_up_stage,
+                                offsets,
+                                experts,
+                                part="up",
+                                input_dtype=ctx.input_dtype,
+                            )
+                            grad_packed.add_(up_dx.to(dtype=grad_packed.dtype))
+                            del up_dx
                         up_lora_dx = grouped_expert_lora(
                             d_s_up,
                             up_lora_A.transpose(-1, -2),
@@ -1062,12 +1173,28 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                             experts,
                             metadata=metadata,
                         )
-                        grad_packed.add_(up_lora_dx.to(dtype=grad_packed.dtype))
+                        if route_flags.gateup_dx_scatter:
+                            _scatter_routes_add_(
+                                grad_hidden_lora,
+                                up_lora_dx,
+                                token_indices,
+                                routing_weights,
+                                weighted=bool(getattr(ctx, "input_weighted", False)),
+                            )
+                        else:
+                            grad_packed.add_(up_lora_dx.to(dtype=grad_packed.dtype))
                         del up_lora_dx
                     del d_s_up
                     manager.release_stage(grad_up_stage, drop_cache=True)
                     manager.release_cpu(grad_up_cpu)
                     grad_up_cpu = None
+
+                if route_flags.gateup_dx_scatter and ctx.needs_input_grad[0]:
+                    grad_hidden = grad_hidden_base_fp32.to(dtype=ctx.input_dtype)
+                    grad_hidden.add_(grad_hidden_lora)
+                    del grad_hidden_base_fp32, grad_hidden_lora
+                    grad_hidden_base_fp32 = None
+                    grad_hidden_lora = None
 
             manager.release_cpu(ctx.x_cpu)
             if grad_packed is not None:
@@ -1173,6 +1300,8 @@ def qwen3_moe_finegrained_nograd_forward(
     gate_base, up_base = layer._ensure_qwen3_moe_finegrained_bases()
     layer.stats.qwen3_moe_finegrained_nograd_forward_calls += 1
     down_scatter_block_experts = _down_scatter_block_experts()
+    _validate_routed_flags_for_current_path(down_scatter_block_experts=down_scatter_block_experts)
+    route_flags = routed_kernel_flags()
     down_scatter_blocks = _expert_blocks(offsets, experts, down_scatter_block_experts)
     _record_down_scatter_block(layer, down_scatter_block_experts, down_scatter_blocks)
 
@@ -1283,10 +1412,30 @@ def qwen3_moe_finegrained_nograd_forward(
             del act
         else:
             layer.stats.qwen3_moe_finegrained_down_base_calls += 1
-            output = _base_forward(layer, layer.down_base, act, offsets, experts, part="down")
+            if route_flags.fwd_scatter:
+                base_scattered_fp32 = torch.zeros(
+                    (int(num_tokens), int(layer.hidden_dim)),
+                    device=act.device,
+                    dtype=torch.float32,
+                )
+                down_forward_scatter_add_(
+                    layer.down_base,
+                    act,
+                    base_scattered_fp32,
+                    offsets,
+                    experts,
+                    token_indices,
+                    routing_weights,
+                    weighted=bool(output_weighted),
+                )
+                scattered.add_(base_scattered_fp32.to(dtype=scattered.dtype))
+                del base_scattered_fp32
+                output = None
+            else:
+                output = _base_forward(layer, layer.down_base, act, offsets, experts, part="down")
             del act
 
-    if down_scatter_block_experts <= 0:
+    if down_scatter_block_experts <= 0 and not route_flags.fwd_scatter:
         with prof_range(layer._forward_range("moe_finegrained_nograd", "scatter_down_base")):
             _scatter_routes_add_(
                 scattered,

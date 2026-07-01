@@ -68,6 +68,9 @@ try:
             "sm100_grouped_lora_b_backward_bf16_cpu_source",
             # Qwen3 selected-recompute backward
             "qwen3_gate_up_recompute_bwd_sm100_bf16_windowed",
+            "qwen3_moe_bf16_down_forward_scatter_add_",
+            "qwen3_moe_bf16_down_dx_gather_left_",
+            "qwen3_moe_bf16_gateup_dx_scatter_add_",
             # Dropout mask helpers
             "pack_bool_mask_2d",
             "unpack_bool_mask_2d",

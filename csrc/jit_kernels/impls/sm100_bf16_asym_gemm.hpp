@@ -76,6 +76,93 @@ static void __instantiate_kernel() {{
     }
 };
 
+class SM100BF16Qwen3RoutedAsymGemmRuntime final: public LaunchRuntime<SM100BF16Qwen3RoutedAsymGemmRuntime> {
+public:
+    struct Args {
+        int m, n, k, num_groups;
+        const std::string& compiled_dims;
+
+        GemmConfig gemm_config;
+        LaunchArgs launch_args;
+
+        void* offsets;
+        void* experts;
+
+        CUtensorMap tensor_map_a;
+        CUtensorMap tensor_map_b;
+        CUtensorMap tensor_map_cd;
+
+        void* route_token_indices;
+        void* route_weights;
+        int route_weights_is_bf16;
+        int route_weighted;
+        void* route_scatter_out;
+        int route_scatter_stride;
+        void* route_gather_left;
+        int route_gather_stride;
+
+        bool gather_left;
+        bool scatter_add;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#define ASYM_BF16_KERNEL_NAME qwen3_moe_bf16_asym_routed_impl
+#define ASYM_BF16_ROUTE_GATHER_LEFT {}
+#define ASYM_BF16_ROUTE_SCATTER_ADD {}
+#define ASYM_BF16_KERNEL_EXTRA_ARGS , const int64_t* route_token_indices, const void* route_weights, uint32_t route_weights_is_bf16, uint32_t route_weighted, float* route_scatter_out, uint32_t route_scatter_stride, const cutlass::bfloat16_t* route_gather_left, uint32_t route_gather_stride
+#include <asym_gemm/impls/sm100_bf16_asym_gemm.cuh>
+
+using namespace asym_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&qwen3_moe_bf16_asym_routed_impl<
+        {}, {},
+        {}, {}, {},
+        {}, {}, {},
+        {},
+        {}, {}, {},
+        {},
+        {}, {},
+        {}, {},
+        {},
+        {}, {}, {},
+        {}
+    >);
+}};
+)",
+        args.gather_left ? 1 : 0,
+        args.scatter_add ? 1 : 0,
+        to_string(args.gemm_config.major_a), to_string(args.gemm_config.major_b),
+        get_compiled_dim(args.m, 'm', args.compiled_dims), get_compiled_dim(args.n, 'n', args.compiled_dims), get_compiled_dim(args.k, 'k', args.compiled_dims),
+        args.gemm_config.block_m, args.gemm_config.block_n, args.gemm_config.block_k,
+        args.num_groups,
+        args.gemm_config.smem_config.swizzle_a_mode, args.gemm_config.smem_config.swizzle_b_mode, args.gemm_config.smem_config.swizzle_cd_mode,
+        args.gemm_config.num_stages,
+        args.gemm_config.thread_config.num_non_epilogue_threads, args.gemm_config.thread_config.num_epilogue_threads,
+        args.gemm_config.multicast_config.num_multicast, args.gemm_config.multicast_config.is_multicast_on_a,
+        args.gemm_config.num_sms,
+        to_string(args.gemm_config.gemm_type), args.gemm_config.with_accumulation, to_string(args.gemm_config.cd_dtype),
+        args.gemm_config.tc_util);
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+            args.offsets, args.experts,
+            args.m, args.n, args.k,
+            args.tensor_map_a, args.tensor_map_b,
+            args.tensor_map_cd,
+            args.route_token_indices,
+            args.route_weights,
+            args.route_weights_is_bf16,
+            args.route_weighted,
+            args.route_scatter_out,
+            args.route_scatter_stride,
+            args.route_gather_left,
+            args.route_gather_stride));
+    }
+};
+
 class SM100BF16CpuLeftAsymGemmRuntime final: public LaunchRuntime<SM100BF16CpuLeftAsymGemmRuntime> {
 public:
     struct Args {
@@ -308,6 +395,102 @@ static void sm100_m_grouped_bf16_asym_gemm_contiguous(const torch::Tensor& a,
     const auto& code = SM100BF16AsymGemmRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_bf16_m_grouped_asym_gemm_contiguous", code);
     SM100BF16AsymGemmRuntime::launch(runtime, args);
+}
+
+static void sm100_m_grouped_bf16_asym_gemm_qwen3_routed(
+                                                 const torch::Tensor& a,
+                                                 const torch::Tensor& b,
+                                                 const torch::Tensor& d,
+                                                 const torch::Tensor& offsets_t,
+                                                 const torch::Tensor& experts_t,
+                                                 const torch::Tensor& token_indices_t,
+                                                 const torch::Tensor& route_weights_t,
+                                                 const int& grid_y,
+                                                 const int& num_groups, const int& m, const int& n, const int& k,
+                                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                                 const std::string& compiled_dims,
+                                                 const int b_outer_stride,
+                                                 const bool gather_left,
+                                                 const bool scatter_add,
+                                                 const bool route_weighted,
+                                                 const bool route_weights_is_bf16,
+                                                 const int route_scatter_stride,
+                                                 const int route_gather_stride,
+                                                 const torch::Tensor& route_scatter_out,
+                                                 const torch::Tensor& route_gather_left) {
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(gather_left || scatter_add);
+    DG_HOST_ASSERT(!(gather_left && scatter_add));
+    if (scatter_add)
+        DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
+
+    const int block_m = (major_b == cute::UMMA::Major::MN)
+        ? get_env<int>("DG_BF16_TRANSPOSE_BLOCK_M", 64)
+        : get_env<int>("DG_BF16_BLOCK_M", 64);
+    const int block_n = (major_b == cute::UMMA::Major::MN)
+        ? get_env<int>("DG_BF16_TRANSPOSE_BLOCK_N", 64)
+        : get_env<int>("DG_BF16_BLOCK_N", 64);
+    const int default_transpose_block_k = (k >= 768) ? 256 : 64;
+    const int block_k = (major_b == cute::UMMA::Major::MN)
+        ? get_env<int>("DG_BF16_TRANSPOSE_BLOCK_K", default_transpose_block_k)
+        : get_env<int>("DG_BF16_BLOCK_K", 512);
+    const auto& aligned_k = align(k, block_k);
+
+    DG_HOST_ASSERT(block_m > 0 and block_n > 0 and block_k > 0);
+    const auto& config = get_manual_config_asym<SM100ArchSpec>(
+        GemmType::MGroupedContiguous, KernelType::KernelNoSF,
+        m, n, k, 1, major_a, major_b,
+        torch::kBFloat16, d.scalar_type(), false,
+        device_runtime->get_num_sms(),
+        block_m, block_n, block_k);
+    if (gather_left)
+        DG_HOST_ASSERT(config.multicast_config.num_multicast == 1);
+
+    const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
+                                               SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),
+                                               config.block_k,
+                                               static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
+                                               config.smem_config.swizzle_a_mode);
+    const auto& tensor_map_b = make_tma_b_desc(major_b, b, n, k,
+                                               SM100ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n),
+                                               config.block_k,
+                                               b_outer_stride, num_groups,
+                                               config.smem_config.swizzle_b_mode);
+    const auto& tensor_map_cd = make_tma_cd_desc(d, m, n,
+                                                 SM100ArchSpec::get_cd_store_block_m(config.block_m),
+                                                 SM100ArchSpec::get_cd_store_block_n(config.block_n),
+                                                 static_cast<int>(d.stride(-2)), 1,
+                                                 config.smem_config.swizzle_cd_mode);
+
+    if (grid_y <= 0)
+        return;
+
+    const SM100BF16Qwen3RoutedAsymGemmRuntime::Args& args = {
+        .m = m, .n = n, .k = aligned_k, .num_groups = num_groups,
+        .compiled_dims = compiled_dims,
+        .gemm_config = config,
+        .launch_args = LaunchArgs({ceil_div(n, config.block_n), grid_y}, config.thread_config.num_threads,
+                                  config.smem_config.smem_size,
+                                  config.multicast_config.num_multicast),
+        .offsets = offsets_t.data_ptr<int>(),
+        .experts = experts_t.data_ptr<int>(),
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tensor_map_b,
+        .tensor_map_cd = tensor_map_cd,
+        .route_token_indices = const_cast<void*>(reinterpret_cast<const void*>(token_indices_t.data_ptr<int64_t>())),
+        .route_weights = route_weights_t.defined() ? const_cast<void*>(route_weights_t.data_ptr()) : nullptr,
+        .route_weights_is_bf16 = route_weights_is_bf16 ? 1 : 0,
+        .route_weighted = route_weighted ? 1 : 0,
+        .route_scatter_out = scatter_add ? route_scatter_out.data_ptr<float>() : nullptr,
+        .route_scatter_stride = route_scatter_stride,
+        .route_gather_left = gather_left ? const_cast<void*>(reinterpret_cast<const void*>(route_gather_left.data_ptr<at::BFloat16>())) : nullptr,
+        .route_gather_stride = route_gather_stride,
+        .gather_left = gather_left,
+        .scatter_add = scatter_add
+    };
+    const auto& code = SM100BF16Qwen3RoutedAsymGemmRuntime::generate(args);
+    const auto& runtime = compiler->build("sm100_bf16_qwen3_moe_routed_asym_gemm", code);
+    SM100BF16Qwen3RoutedAsymGemmRuntime::launch(runtime, args);
 }
 
 static void sm100_m_grouped_bf16_cpu_left_asym_gemm_contiguous(const torch::Tensor& a,
