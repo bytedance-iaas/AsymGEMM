@@ -65,6 +65,10 @@ if [[ "${_RUNS_ENV_SET}" == "true" ]]; then
     [[ -n "${_run}" ]] && RUNS+=("${_run}")
   done <<< "${_runs_env_lines}"
 else
+  # # 1 CPU
+  # RUNS=(
+  # )
+  # 2 CPUs
   RUNS=(
     # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" 
     # "llama3.3-70b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" 

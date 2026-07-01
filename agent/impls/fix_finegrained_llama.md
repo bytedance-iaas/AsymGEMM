@@ -5,9 +5,9 @@
 Compare these rows at the same Llama3.3-70B LoRA-SFT workload:
 
 ```text
-llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false
-llama3.3-70b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false
-llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false
+llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false
+llama3.3-70b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false
+llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false
 ```
 
 The comparison must be apples-to-apples on the CPUAdamW / optimizer-offload axis:
@@ -62,7 +62,7 @@ MLPs. So the likely work is not a brand-new dense algorithm. The likely work is:
 2. prove it fires under the same `recomp-off-full-fg` semantics;
 3. prove attention and Liger-loss paths are active for Llama3.3;
 4. add Llama-specific tests / validators for the path;
-5. only then run the requested s45000 comparison.
+5. only then run the requested s30000 comparison.
 
 Treat dense Qwen3 and dense Qwen2.5 full-fg as the reference behavior, not as proof that
 Llama3.3 is already correct. The Llama path must earn its own artifacts.
@@ -131,7 +131,7 @@ These are stage gates. Do not skip them.
 9. Does `asym_cpuadamwds` prove CPUAdamW, grad offload, and weight offload state in
    `profile.json.config` and logs?
 
-10. At the same `s45000,b8,ga1,ligerloss1` workload, is the Asym row lower HBM than
+10. At the same `s30000,b8,ga1,ligerloss1` workload, is the Asym row lower HBM than
     `superoffload_mem|unsloth-off`, or is the remaining peak owner named concretely?
 
 ## Evidence Discipline
@@ -227,7 +227,7 @@ Do not add chunked MLP, producer-list policies, layer activation offload, layer 
 SDPA recompute while proving this path. Keep the same fixed `recomp-off-full-fg`
 semantics used by dense Qwen.
 
-Do not jump straight to s45000 before the Llama3.3 small and medium gates prove module
+Do not jump straight to s30000 before the Llama3.3 small and medium gates prove module
 replacement and counters.
 
 ## Current Code Truth
@@ -484,10 +484,10 @@ Impl 4: s2048 real-model config gate
 Impl 5: s8192 and s16384 memory-shape gates
   prove scaling and inspect owners before tuning
 
-Impl 6: s30000 bottleneck gate
-  run Asym first, then baselines only if Asym is clean
+Impl 6: s30000 Asym acceptance gate
+  run Asym first and inspect the artifact before spending baseline GPU time
 
-Impl 7: s45000 final comparison
+Impl 7: s30000 final comparison
   compare the three requested CPUAdamW-family rows
 ```
 
@@ -769,7 +769,7 @@ Purpose:
 
 ```text
 Prove the implementation scales and identify peak owners before the requested
-s45000 comparison.
+s30000 comparison.
 ```
 
 Implementation:
@@ -777,7 +777,7 @@ Implementation:
 ```text
 Run s8192 dense-fg/full-fg.
 Run s16384 superoffload unsloth, superoffload unsloth-off, and Asym full-fg.
-Run s30000 Asym first; run baselines only if Asym is clean.
+Run s30000 Asym first; defer baselines until Asym is clean.
 ```
 
 Pass criteria:
@@ -803,7 +803,7 @@ memory breakdown and top-level peak disagree and no explanation is written
 Purpose:
 
 ```text
-Answer the exact requested comparison at s45000.
+Answer the exact requested comparison at s30000.
 ```
 
 Implementation:
@@ -1003,7 +1003,7 @@ qwen3_moe_finegrained flags remain false
 Liger dense bridge supports model_type=llama
 ```
 
-Do not run s45000 before Stage 0 passes.
+Do not run s30000 before Stage 0 passes.
 
 ### Stage 1: s2048 config truth
 
@@ -1116,9 +1116,9 @@ allocator reserved-unallocated
 Liger/lm_head
 ```
 
-### Stage 4: s30000 bottleneck gate
+### Stage 4: s30000 Asym acceptance gate
 
-Goal: run the first meaningful long-context Llama3.3 gate before the requested s45000.
+Goal: prove the final-sequence Asym row is clean before spending baseline GPU time.
 
 Run Asym first:
 
@@ -1126,41 +1126,35 @@ Run Asym first:
 llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false
 ```
 
-Only if it completes cleanly, run baselines:
-
-```text
-llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false
-llama3.3-70b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false
-```
-
 Stage pass criteria:
 
 ```text
-all compared rows are complete
+Asym row is complete
 Asym config/counters remain clean
 Liger proof remains present
 Asym saved HBM activations = 0.0 GiB
-Asym peak is below superoffload_mem|unsloth-off, or the remaining owner is named
+Asym peak owner is named if the row fails or looks unexpectedly high
 ```
 
-If Asym fails at s30000, do not run s45000. Debug from the peak/partial artifact.
+If Asym fails at s30000, do not run the final comparison baselines. Debug from the
+peak/partial artifact.
 
-### Stage 5: requested s45000 comparison
+### Stage 5: requested s30000 CPUAdamW comparison
 
 Goal: answer the user's comparison directly.
 
 Run serially:
 
 ```text
-llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false
-llama3.3-70b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false
-llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false
+llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false
+llama3.3-70b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false
+llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false
 ```
 
 Optional parity row:
 
 ```text
-llama3.3-70b|1 ; zero3_offload_mem|unsloth-off|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false
+llama3.3-70b|1 ; zero3_offload_mem|unsloth-off|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false
 ```
 
 The final table should include:
@@ -1277,7 +1271,7 @@ A successful Llama3.3 result should produce a validation log analogous to
 `fix_finegrained_offload_validation.md`:
 
 ```text
-## Llama3.3 Stage 5: s45000 CPUAdamW Final
+## Llama3.3 Stage 5: s30000 CPUAdamW Final
 
 run labels:
 - superoffload_mem|unsloth|ligerloss1
@@ -1312,3 +1306,119 @@ conclusion:
 
 Only after this exists should the Llama3.3 row be placed next to the dense Qwen3 /
 Qwen2.5 full-fg results as the same class of evidence.
+
+## Llama3.3 Execution Summary, 2026-07-01
+
+Final target was changed to `30000|8|1`. The Llama3.3 dense design is the
+same class as the dense Qwen2.5 and dense Qwen3 full-fg design: dense MLP
+fine-grained offload plus attention activation/saved-tensor offload, Liger
+loss-only, and CPUAdamW weight/grad offload for the Asym row. The Llama-specific
+differences are model/template detection, Llama dense-MLP matching, the Asym
+Liger lm-head bridge for `model_type=llama`, and the absence of Qwen/MoE/router
+expert wrappers. Qwen3 MoE is not the same path because it also has routed expert
+logic.
+
+### Stage 0: unit and integration coverage
+
+Status: passed.
+
+- Added fake Llama dense-MLP coverage to the dense fine-grained forward/backward
+  parity tests.
+- Added fake Llama3 backend wrapping coverage for full-fg dense MLP plus
+  attention activation/saved-tensor offload.
+- Added Llama Liger loss-only and Asym Liger bridge coverage.
+- Verification: `17 passed` for
+  `tests/training/test_dense_mlp_finegrained.py`
+  and `tests/lf/test_liger_loss_only_qwen3_moe.py`; `139 passed` for
+  `tests/training/test_lf_qwen3_asym_backend.py`.
+
+### Stage 1: s2048 profiler gate
+
+Status: passed.
+
+| label | backend | loss | peak_alloc_H | peak_reserved_H | dense_fg | attn_act | attn_saved | qwen_fg | fallbacks | asym_fwd | asym_dx | superoffload |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| base | asym_cpuadamwds | 1.9049 | 5.45 | 6.94 | 0 | 0 | 0 | 0 | 0 | 1120 | 560 | false |
+| dense-fg | asym_cpuadamwds | 1.9049 | 4.55 | 5.69 | 80 | 0 | 0 | 0 | 0 | 1120 | 560 | false |
+| full-fg | asym_cpuadamwds | 1.9049 | 4.55 | 5.69 | 80 | 320 | 80 | 0 | 0 | 1120 | 880 | false |
+| unsloth-off | superoffload_mem | 1.9067 | 5.46 | 7.33 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | true |
+| unsloth | superoffload_mem | 1.9067 | 8.85 | 10.65 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | true |
+
+### Stage 2: s8192 profiler gate
+
+Status: passed after regenerating the dataset with `DATASET_OVERWRITE=true`.
+
+| label | backend | loss | peak_alloc_H | peak_reserved_H | dense_fg | attn_act | attn_saved | qwen_fg | fallbacks | asym_fwd | asym_dx | superoffload |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| dense-fg | asym_cpuadamwds | 1.4045 | 18.06 | 20.33 | 80 | 0 | 0 | 0 | 0 | 1120 | 560 | false |
+| full-fg | asym_cpuadamwds | 1.4045 | 18.06 | 20.33 | 80 | 320 | 80 | 0 | 0 | 1120 | 880 | false |
+| unsloth-off | superoffload_mem | 1.4009 | 21.59 | 25.22 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | true |
+
+### Stage 3: s16384 profiler gate
+
+Status: passed.
+
+| label | backend | loss | peak_alloc_H | peak_reserved_H | dense_fg | attn_act | attn_saved | qwen_fg | fallbacks | asym_fwd | asym_dx | superoffload |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| full-fg | asym_cpuadamwds | 1.2189 | 36.07 | 39.88 | 80 | 320 | 80 | 0 | 0 | 1120 | 880 | false |
+| unsloth-off | superoffload_mem | 1.2202 | 43.09 | 49.71 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | true |
+| unsloth | superoffload_mem | 1.2202 | 67.16 | 74.71 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | true |
+
+### Stage 4: s30000 Asym acceptance gate
+
+Status: passed.
+
+- Dataset validation passed with 512 train rows, `concat_active=True`,
+  `train_p50=35691.50`, and `train_p75=38330.50`.
+- Asym full-fg setup installed `dense_mlp_finegrained_offload_wrapped=80`,
+  `attention_act_offload_wrapped=320`,
+  `attention_saved_tensor_offload_wrapped=80`, and
+  `qwen3_moe_finegrained_offload_wrapped=0`.
+- Asym Liger bridge proof: `enabled=True`, `model_type=llama`,
+  `bridge_kind=causal_lm`, `weight_source=asym_host_staged`.
+- Runtime proof: `asym_forward_calls=1120`, `asym_dx_calls=880`,
+  `reference_fallback_count=0`.
+- Memory: `peak_alloc_H=66.01`, `peak_reserved_H=72.33`,
+  `saved_H=0.00`, `loss=1.2023`, `step_s=562.05`.
+
+### Stage 5: s30000 CPUAdamW final comparison
+
+Status: validated. The Asym row is the clean Stage 4 row reused with matching
+model/workload/config evidence; the two SuperOffload rows were run serially
+after Asym passed.
+
+| label | backend | fwd_s | bwd_s | opt_s | step_s | top_H | breakdown_H | act_H | saved_H | live_H | temp_H | reserved_H | RAM | loss | status |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| unsloth | superoffload_mem | 65.89 | 107.67 | 0.08 | 176.19 | 122.54 | 122.54 | 86.11 | 82.45 | 3.66 | 36.42 | 138.67 | 487.16 | 1.2001 | clean |
+| unsloth-off | superoffload_mem | 66.18 | 308.18 | 0.08 | 377.05 | 78.84 | 78.84 | 16.48 | 0.00 | 16.48 | 62.36 | 88.77 | 657.89 | 1.2001 | clean |
+| full-fg | asym_cpuadamwds | 92.51 | 463.12 | 2.41 | 562.05 | 66.01 | 66.01 | 3.66 | 0.00 | 3.66 | 62.35 | 72.33 | 726.70 | 1.2023 | clean; reused Stage 4 Asym row |
+
+Final audit:
+
+- All rows resolve to `meta-llama/Llama-3.3-70B-Instruct` with `ligerloss1`.
+- SuperOffload rows prove `SuperOffloadOptimizer_Stage3`,
+  `DeepSpeedCPUAdam`, and SuperOffload runtime enabled.
+- Asym row proves CPUAdamW `backend=deepspeed`, grad offload, weight offload,
+  `recomp_off_stage=full-fg`, dense fine-grained wrappers, attention wrappers,
+  and Llama Liger bridge.
+- Asym counters: dense fg forward/backward `160/80`,
+  dense concat columns `0`, attention forward/backward `320/960`,
+  Qwen MoE forward `0`, fallbacks `0`.
+- Asym full-fg beats `superoffload_mem|unsloth-off` on allocated/breakdown HBM:
+  `66.01 GiB` versus `78.84 GiB`.
+- Remaining Asym peak owner is temporary workspace, led by `mlp_dense`
+  `33.77 GiB`, `norms` `17.34 GiB`, and `attention` `7.79 GiB`; saved HBM is
+  `0.00 GiB`.
+
+Final local verification:
+
+```text
+.venv/bin/python -m pytest tests/training/test_dense_mlp_finegrained.py tests/lf/test_liger_loss_only_qwen3_moe.py -q
+17 passed
+
+.venv/bin/python -m pytest tests/training/test_lf_qwen3_asym_backend.py -q
+139 passed
+
+git diff --check
+passed
+```
