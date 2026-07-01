@@ -51,11 +51,6 @@ if [[ -n "${RUNS+x}" ]]; then
   unset RUNS
 fi
 _RUNS_LOG="${RUNS_LOG:-${ROOT}/scripts/lf/runs.log}"
-# RUNS=(
-#   # "q3-30b-a3b|1 ; zero3_offload_opnvme|recomp|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-#   # "q3-30b-a3b|1 ; zero3_offload_panvme|recomp|ligerloss1  ; 4092|8|1 ; none|false|false|false|false|false"
-#   "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-# )
 if [[ "${_RUNS_ENV_SET}" == "true" ]]; then
   RUNS=()
   _runs_env_lines="${_RUNS_ENV_SPEC//||/$'\n'}"

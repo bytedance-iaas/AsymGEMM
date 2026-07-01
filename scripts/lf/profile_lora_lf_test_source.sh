@@ -51,11 +51,6 @@ if [[ -n "${RUNS+x}" ]]; then
   unset RUNS
 fi
 _RUNS_LOG="${RUNS_LOG:-${ROOT}/scripts/lf/runs.log}"
-# RUNS=(
-#   # "q3-30b-a3b|1 ; zero3_offload_opnvme|recomp|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false"
-#   # "q3-30b-a3b|1 ; zero3_offload_panvme|recomp|ligerloss1  ; 4092|8|1 ; none|false|false|false|false|false"
-#   "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false"
-# )
 if [[ "${_RUNS_ENV_SET}" == "true" ]]; then
   RUNS=()
   _runs_env_lines="${_RUNS_ENV_SPEC//||/$'\n'}"
@@ -65,12 +60,22 @@ if [[ "${_RUNS_ENV_SET}" == "true" ]]; then
     [[ -n "${_run}" ]] && RUNS+=("${_run}")
   done <<< "${_runs_env_lines}"
 else
+  # # 1 CPU
+  # RUNS=(
+  # )
+  # 2 CPUs
   RUNS=(
-    # "q3-235b-a22b|1 ; superoffload_mem_panvme|unsloth|ligerloss1 ; 1000|8|1 ; none|false|false|false|false|false"
-    # "q3-30b-a3b|1 ; zero3_offload_mem_panvme|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
-    # "q3-32b|1 ; zero3_offload_mem_panvme|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false"
+    # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" 
+    # "llama3.3-70b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" 
+    # "llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" 
 
-    "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 90k
+    # "q3-30b-a3b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 130000|8|1 ; none|false|false|false|false|false" # C-OOM 140k
+    # "q3-32b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # C-OOM 55k
+    # "llama3.3-70b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false" # C-OOM 35k
+    # "q2.5-32b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # C-OOM 55k
+    # "q2.5-72b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false" # C-OOM 35k
+
+    # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 90k
     # "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 55k
     # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 50k
     # "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
@@ -81,7 +86,7 @@ else
     # "q3-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # G-OOM 25k
     # "llama3.3-70b|1 ; superoffload_mem|recomp|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false" # G-OOM 15k
     # "llama4-scout|1 ; superoffload_mem|recomp|ligerloss1 ; 8000|8|1 ; none|false|false|false|false|false" # G-OOM 9k
-    # "q2.5-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 25000|8|1 ; none|false|false|false|false|false" # G-OOM 25k
+    # "q2.5-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # G-OOM 25k
     # "q2.5-72b|1 ; superoffload_mem|recomp|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false" # G-OOM 15k
   )
 fi
