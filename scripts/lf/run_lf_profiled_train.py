@@ -648,6 +648,14 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
             "ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD",
             os.environ.get("ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD", "0"),
         ),
+        "asymm_qwen3_moe_finegrained_offload": os.environ.get(
+            "ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD",
+            os.environ.get("ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD", "0"),
+        ),
+        "asymm_qwen3_moe_down_scatter_block_experts": os.environ.get(
+            "ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS",
+            os.environ.get("ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS", "0"),
+        ),
         "asymm_layer_act_offload": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD", "false"),
         "asymm_layer_gc": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_GC", "false"),
         "attention_gc_enabled": attention_gc_enabled,

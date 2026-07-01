@@ -653,3 +653,285 @@ Stage 4  Run small LF smoke; verify counters, wrapper counts, and no old paths.
 Stage 5  Run s30000/s45000 memory-shape gates; fix real live-activation blockers only when proven.
 Stage 6  Run final s80000 target and compare directly against the two named baselines.
 ```
+
+## Addendum: Remaining Implementation After Current MoE Full-FG Artifacts
+
+The current `qwen3_moe_finegrained.py` path already proves that the new MoE-owned
+`moefg1` path can run, but the s80000 artifacts show the remaining blocker:
+hidden-width route-expanded tensors are still materialized before scatter.
+
+For q3-30b-a3b at s80000/b8/top_k=8:
+
+```text
+M = batch * seq = 640,000
+R = M * top_k  = 5,120,000
+H = 2048
+I = 768
+
+[M,H] bf16 ~= 2.44 GiB
+[R,I] bf16 ~= 7.32 GiB
+[R,H] bf16 ~= 19.53 GiB
+```
+
+The next fix must remove global `[R,H]` tensors. It should not rewrite all MoE
+projections as naive per-expert loops. Keep grouped AsymGEMM where the memory shape is
+acceptable, and only split the hidden-width down/hidden-gradient work.
+
+### Design Decision: block-wise hidden scatter
+
+Add a block-wise hidden scatter mode:
+
+```text
+ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=8
+ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=8
+```
+
+Semantics:
+
+- `0` or unset: current behavior, useful only as a control.
+- `1`: closest to torch memory behavior; per active expert segment.
+- `8`: recommended first target; about 1.2 GiB average `[R_block,H]` at s80000.
+- `16`: faster diagnostic; about 2.4 GiB average `[R_block,H]` at s80000.
+
+The mode should be enabled by the `recomp-off-full-fg` MoE target after smoke testing,
+and the output path tag should include the value, for example:
+
+```text
+moefg1__dscatter8
+```
+
+This is not route chunking or chunked MLP. It uses natural expert groups already
+created by routing. The purpose is to scatter hidden-width outputs at the same
+granularity that torch's expert loop scatters, while preserving some grouped AsymGEMM
+amortization.
+
+### Required helper primitives
+
+Files:
+
+- `asym_gemm/training/activation_offload.py`
+- `asym_gemm/training/qwen3_moe_finegrained.py`
+
+Add an `ActivationOffloadManager` row-slice staging helper:
+
+```text
+stage_rows(handle, start, end, tag) -> CUDA tensor with handle.tensor[start:end]
+```
+
+Requirements:
+
+1. it waits for the CPU handle to be ready;
+2. it allocates/caches only `(end - start, width)`, not the full handle shape;
+3. it records staged bytes under the supplied tag;
+4. `release_stage(..., drop_cache=True)` must release the slice staging buffer;
+5. it should be used only for contiguous row ranges.
+
+The Qwen3 MoE packed representation already has contiguous grouped rows. Use
+`offsets` and `experts[:-1]` to build block ranges:
+
+```text
+group range:    [g0, g1)
+row range:      [offsets[g0], offsets[g1])
+block_offsets:  offsets[g0:g1+1] - offsets[g0]
+block_experts:  concat(experts[g0:g1], sentinel -1)
+block_tokens:   token_indices[row0:row1]
+block_weights:  routing_weights[row0:row1]
+```
+
+Skip empty groups. Do not reorder rows inside the block.
+
+### Stage A: forward down scatter
+
+Current bad forward shape:
+
+```text
+down_delta = _lora_b_forward(...)        # [R,H]
+output     = _base_forward(down_base...) # [R,H]
+scatter both into [M,H] only after the large tensors exist
+```
+
+Replace only the down path:
+
+```text
+scattered = zeros([M,H])
+
+for each expert block:
+  stage act rows [row0:row1] from act_cpu
+  compute down LoRA-B chunk from down_low_rank[row0:row1] -> [R_block,H]
+  weighted index_add into scattered using block_tokens/block_weights
+  release down LoRA-B chunk
+  compute down base chunk with block_offsets/block_experts -> [R_block,H]
+  weighted index_add into scattered
+  release down base chunk and act stage
+```
+
+Keep full `[R,r]` `down_low_rank` for the first implementation. It is much smaller than
+`[R,H]`, and changing it at the same time would obscure the main result.
+
+Expected artifact movement:
+
+- no live routed expert `[5120000,2048]` down output at peak;
+- `qwen3_moe_finegrained_stage_hbm_peak_bytes` should show block-sized down stages;
+- `memory_live_activation_details.csv` should not show `down_base [R,H]` as a live
+  activation.
+
+### Stage B: backward down without global `grad_2d [R,H]`
+
+Current bad backward shape:
+
+```text
+grad_2d = _route_grad_from_tokens(...) # [R,H]
+d_s_down, grad_down_lora_B, down_base_dx all consume grad_2d
+```
+
+Replace the down-gradient section with block-wise route gather:
+
+```text
+grad_act = allocate [R,I] or CPU-offloaded equivalent
+
+for each expert block:
+  grad_block = grad_output.index_select(0, block_tokens) -> [R_block,H]
+  apply block routing weights if output_weighted
+  compute down LoRA dS chunk and accumulate down LoRA-B grad
+  compute down base dX chunk -> [R_block,I]
+  compute down LoRA dX chunk -> [R_block,I]
+  write/add the result into grad_act[row0:row1]
+  release grad_block and hidden-width chunks
+```
+
+For the first version, keeping `grad_act [R,I]` in HBM is acceptable because it is
+about 7.3 GiB at s80000, not 19.5 GiB. If artifacts later prove `[R,I]` is the peak
+blocker, add CPU-offloaded `grad_act` as a separate stage.
+
+Important implementation detail: LoRA-B weight gradients must accumulate across
+blocks. Initialize `grad_down_lora_B` once, add each block's contribution, and only
+return the final tensor.
+
+Expected artifact movement:
+
+- no `scatter_grad` global `[R,H]`;
+- no `grad_2d [5120000,2048]` live tensor;
+- routed-expert temporary workspace should drop by roughly one hidden-width routed
+  tensor, subject to allocator reserve.
+
+### Stage C: backward gate/up dX direct scatter
+
+After Stage A/B, the peak may move to input-gradient reconstruction:
+
+```text
+grad_packed = gate dx [R,H] + up dx [R,H] + LoRA dx [R,H]
+grad_hidden.index_add_(..., grad_packed)
+```
+
+Replace this with direct scatter into `[M,H]`:
+
+```text
+grad_hidden = zeros([M,H])
+
+for each expert block:
+  stage grad_gate rows for block
+  compute gate base dX chunk -> [R_block,H]
+  compute gate LoRA dX chunk -> [R_block,H]
+  apply input routing weights if input_weighted
+  index_add into grad_hidden, release chunks
+
+  stage grad_up rows for block
+  compute up base dX chunk -> [R_block,H]
+  compute up LoRA dX chunk -> [R_block,H]
+  apply input routing weights if input_weighted
+  index_add into grad_hidden, release chunks
+```
+
+This should remove the remaining global `[R,H]` backward tensor. It is acceptable for
+`grad_gate` and `grad_up` themselves to remain CPU handles with block staging. Do not
+restore a fused `[R,2I]` gradient path.
+
+### Stage D: counters and artifact proof
+
+Add counters to `AsymExecutionStats` and profile output:
+
+```text
+qwen3_moe_finegrained_down_scatter_block_experts
+qwen3_moe_finegrained_down_scatter_blocks
+qwen3_moe_finegrained_down_scatter_max_block_rows
+qwen3_moe_finegrained_hidden_route_global_tensors_avoided
+qwen3_moe_finegrained_stage_rows_calls
+```
+
+Required target expectations:
+
+```text
+qwen3_moe_finegrained_down_scatter_block_experts == 8
+qwen3_moe_finegrained_down_scatter_blocks > 0
+qwen3_moe_finegrained_down_scatter_max_block_rows << R
+qwen3_moe_finegrained_stage_concat_columns_calls == 0
+old expact counters == 0
+dense fine-grained counters == 0 for MoE
+```
+
+The validation doc must record whether the peak still contains any of these shapes:
+
+```text
+[5120000,2048]  # global [R,H], should disappear
+[5120000,768]   # [R,I], acceptable for the first pass
+[640000,2048]   # final [M,H], expected
+```
+
+### Stage E: validation sequence for this addendum
+
+Do not run experiments in parallel.
+
+1. Unit/parity tests:
+   - block size 1, 8, 16;
+   - balanced routes;
+   - skewed routes;
+   - empty expert groups;
+   - LoRA gradients for down/gate/up.
+
+2. LF smoke:
+
+```text
+q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false
+q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false
+```
+
+3. Meaningful memory gate:
+
+```text
+q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false
+```
+
+4. Target comparison:
+
+```text
+q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false
+q3-30b-a3b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false
+q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false
+```
+
+The expected result is not necessarily torch-level runtime. The first success criterion
+is memory: remove global `[R,H]` while keeping the runtime within a plausible range.
+If block size 8 is too slow, try block size 16 only after proving block size 8 removes
+the peak. If block size 8 still uses too much HBM, try block size 1 before changing the
+algorithm.
+
+### Longer-term kernel, not the next step
+
+If block-wise scatter proves the memory fix but runtime is unacceptable, the principled
+final kernel is:
+
+```text
+grouped_asym_gemm_scatter_add(
+  a_block_or_full,
+  weight_cpu,
+  offsets,
+  experts,
+  token_indices,
+  routing_weights,
+  out[M,H],
+)
+```
+
+That kernel should write directly into `[M,H]` without creating `[R,H]`, while keeping
+the grouped launch shape. Do not start with this kernel. First use block-wise hidden
+scatter to prove the memory mechanism and expected peak movement.

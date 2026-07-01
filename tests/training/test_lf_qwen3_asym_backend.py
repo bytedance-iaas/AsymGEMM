@@ -31,7 +31,7 @@ from asym_gemm.training.attention_activation_offload import (
 from asym_gemm.training.attention_checkpoint import attention_checkpoint_module_names, is_attention_checkpoint_wrapper
 from asym_gemm.training.decoder_activation_offload import is_decoder_saved_tensor_offload_wrapper
 from asym_gemm.training.decoder_checkpoint import decoder_checkpoint_module_names, is_decoder_checkpoint_wrapper
-from asym_gemm.training.exp_act_offload_lora import require_expert_activation_offload_kernels
+from asym_gemm.training.exp_act_offload_lora import LORA_A_GRAD_CPU_RIGHT, _missing_symbol, require_expert_activation_offload_kernels
 from asym_gemm.training.frozen_linear import AsymFrozenLinear, TorchGroupedFrozenLinear
 from asym_gemm.training.llama4_experts import AsymLlama4Experts
 from asym_gemm.training.llama4_moe import AsymLlama4Moe, AsymLlama4Router, is_llama4_moe
@@ -2045,6 +2045,102 @@ def test_qwen3_gc_exp_uses_torch_checkpoint_not_custom_functions(monkeypatch: py
             assert param.grad is not None, f"{name} missing grad"
 
 
+def test_qwen3_moe_finegrained_uses_separate_nograd_and_grad_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(42)
+    source = FakeQwen3Experts()
+    wrapped = AsymQwen3Experts(
+        source,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        init_lora_weights="peft",
+    )
+    wrapped.train()
+    wrapped._qwen3_moe_finegrained_enabled = True
+    calls: list[str] = []
+    original = wrapped._forward_expert_body
+
+    def fake_body(
+        hidden_states: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        token_indices: torch.Tensor,
+        routing_weights: torch.Tensor,
+        *,
+        input_weighted: bool,
+        output_weighted: bool,
+    ) -> torch.Tensor:
+        packed = hidden_states.index_select(0, token_indices.to(dtype=torch.long)).contiguous()
+        if input_weighted:
+            packed = packed * routing_weights.reshape(-1, 1).to(device=packed.device, dtype=packed.dtype)
+        down = original(packed, offsets, experts, dense_experts=True)
+        flat = down.reshape(int(token_indices.numel()), -1)
+        if output_weighted:
+            flat = flat * routing_weights.reshape(-1, 1).to(device=flat.device, dtype=flat.dtype)
+        out = torch.zeros((int(hidden_states.shape[0]), int(flat.shape[1])), device=flat.device, dtype=flat.dtype)
+        out.index_add_(0, token_indices.to(device=flat.device, dtype=torch.long), flat)
+        return out.reshape(int(hidden_states.shape[0]), *down.shape[1:])
+
+    def fake_finegrained(
+        hidden_states: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        token_indices: torch.Tensor,
+        routing_weights: torch.Tensor,
+        *,
+        input_weighted: bool,
+        output_weighted: bool,
+    ) -> torch.Tensor:
+        calls.append("grad" if torch.is_grad_enabled() else "nograd-via-grad")
+        return fake_body(
+            hidden_states,
+            offsets,
+            experts,
+            token_indices,
+            routing_weights,
+            input_weighted=input_weighted,
+            output_weighted=output_weighted,
+        )
+
+    def fake_nograd(
+        hidden_states: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        token_indices: torch.Tensor,
+        routing_weights: torch.Tensor,
+        *,
+        input_weighted: bool,
+        output_weighted: bool,
+    ) -> torch.Tensor:
+        calls.append("nograd" if not torch.is_grad_enabled() else "grad-via-nograd")
+        return fake_body(
+            hidden_states,
+            offsets,
+            experts,
+            token_indices,
+            routing_weights,
+            input_weighted=input_weighted,
+            output_weighted=output_weighted,
+        )
+
+    monkeypatch.setattr(wrapped, "_forward_qwen3_moe_finegrained_offload", fake_finegrained)
+    monkeypatch.setattr(wrapped, "_forward_qwen3_moe_finegrained_nograd", fake_nograd)
+    x = torch.randn(5, source.hidden_dim, dtype=torch.bfloat16, requires_grad=True)
+    top_k_index, top_k_weights = _routing()
+
+    with torch.no_grad():
+        _ = wrapped(x.detach(), top_k_index, top_k_weights)
+    assert calls == ["nograd"]
+
+    loss = wrapped(x, top_k_index, top_k_weights).float().square().mean()
+    loss.backward()
+    assert calls == ["nograd", "grad"]
+    assert x.grad is not None
+
+
 def test_qwen3_gc_exp_reruns_grouped_expert_body_in_backward() -> None:
     torch.manual_seed(43)
     source = FakeQwen3Experts()
@@ -2376,6 +2472,30 @@ def test_apply_lf_asym_lora_whole_wraps_qwen3_moe_and_freezes_router() -> None:
     router_trainable = [name for name, param in model.named_parameters() if ".mlp.gate." in name and param.requires_grad]
     assert router_trainable == []
     assert sum(1 for module in model.modules() if isinstance(module, AsymQwen3Experts)) == 2
+
+
+def test_apply_lf_asym_lora_marks_qwen3_moe_finegrained_only_for_asym_offload(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD", "1")
+    model = FakeModel()
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["all"],
+        dense_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="routed_experts",
+        expert_recompute_policy="none",
+        router_mode="whole",
+        strict=True,
+    )
+
+    assert report.qwen3_moe_finegrained_offload_enabled
+    assert report.qwen3_moe_finegrained_offload_wrapped == 2
+    assert isinstance(model.layers[0].mlp, AsymQwen3MoeBlock)
+    assert getattr(model.layers[0].mlp.experts, "_qwen3_moe_finegrained_enabled", False)
 
 
 def test_apply_lf_asym_lora_whole_rejects_router_logits_config() -> None:
@@ -3121,6 +3241,90 @@ def test_asym_qwen3_experts_sm100_activation_offload_matches_torch_backend(
         assert asym_backend.stats.expact_lora_a_forward_grouped_calls == 2
         assert asym_backend.stats.expact_lora_a_forward_cpu_left_grouped_calls == 0
         assert asym_backend.stats.expact_lora_a_forward_hbm_grouped_calls == 2
+
+
+@pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")
+def test_asym_qwen3_experts_sm100_moe_finegrained_matches_torch_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(72)
+    source_torch = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128).cuda()
+    source_asym = FakeQwen3Experts(hidden_dim=128, intermediate_dim=128)
+    source_asym.load_state_dict(source_torch.state_dict())
+    torch_backend = AsymQwen3Experts(
+        source_torch,
+        backend="torch",
+        precision="bf16",
+        offload=False,
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        init_lora_weights="peft",
+    )
+    asym_backend = AsymQwen3Experts(
+        source_asym,
+        backend="asym",
+        precision="bf16",
+        offload=True,
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        init_lora_weights="peft",
+    )
+    asym_backend.cuda()
+    asym_backend._qwen3_moe_finegrained_enabled = True
+    _copy_random_lora_params(torch_backend, asym_backend)
+
+    x_torch = torch.randn(5, source_torch.hidden_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_asym = x_torch.detach().clone().requires_grad_(True)
+    top_k_index, top_k_weights = _routing()
+    top_k_index = top_k_index.cuda()
+    top_k_weights = top_k_weights.cuda()
+
+    monkeypatch.delenv("ASYMM_EXPERT_ACT_OFFLOAD", raising=False)
+    forward_reason = require_expert_activation_offload_kernels(scope="forward", check_only=True)
+    grad_reason = _missing_symbol(LORA_A_GRAD_CPU_RIGHT)
+    unsupported_reason = forward_reason or grad_reason
+    out_torch = torch_backend(x_torch, top_k_index, top_k_weights)
+    if unsupported_reason is not None:
+        with pytest.raises(NotImplementedError, match=unsupported_reason):
+            asym_backend(x_asym, top_k_index, top_k_weights)
+        return
+
+    out_asym = asym_backend(x_asym, top_k_index, top_k_weights)
+    _assert_tensor_close_l2("qwen3 moe finegrained output", out_asym, out_torch, max_abs_tol=6e-3, rel_l2_tol=2e-2)
+
+    grad_out = torch.randn_like(out_torch)
+    out_torch.backward(grad_out)
+    out_asym.backward(grad_out)
+
+    _assert_tensor_close_l2("qwen3 moe finegrained input grad", x_asym.grad, x_torch.grad, max_abs_tol=8e-3, rel_l2_tol=3e-2)
+    asym_params = dict(asym_backend.named_parameters())
+    for name, param in torch_backend.named_parameters():
+        if "lora_" not in name:
+            continue
+        _assert_tensor_close_l2(f"qwen3 moe finegrained {name}", asym_params[name].grad, param.grad, max_abs_tol=8e-3, rel_l2_tol=3e-2)
+
+    stats = asym_backend._last_activation_offload_stats
+    assert stats["offload_bytes_by_tag"]["moe.X"] > 0
+    assert stats["offload_bytes_by_tag"]["moe.gate"] > 0
+    assert stats["offload_bytes_by_tag"]["moe.up"] > 0
+    assert stats["offload_bytes_by_tag"]["moe.S_gate"] > 0
+    assert stats["offload_bytes_by_tag"]["moe.S_up"] > 0
+    assert stats["offload_bytes_by_tag"]["moe.S_down"] > 0
+    assert stats["stage_peak_by_tag"]["moe.act_for_down_base"] > 0
+    assert "dgate_up_for_gate_up_base" not in stats["stage_peak_by_tag"]
+    assert stats["cpu_owned_bytes"] == 0
+    assert asym_backend.stats.qwen3_moe_finegrained_forward_calls == 1
+    assert asym_backend.stats.qwen3_moe_finegrained_backward_calls == 1
+    assert asym_backend.stats.qwen3_moe_finegrained_stage_concat_columns_calls == 0
+    assert asym_backend.stats.qwen3_moe_finegrained_lora_a_forward_calls == 3
+    assert asym_backend.stats.qwen3_moe_finegrained_lora_a_grad_calls == 3
+    assert asym_backend.stats.qwen3_moe_finegrained_lora_b_backward_calls == 3
+    assert asym_backend.stats.expact_lora_a_forward_grouped_calls == 0
+    assert asym_backend.stats.expact_lora_a_grad_grouped_calls == 0
+    assert asym_backend.stats.expact_lora_b_backward_grouped_calls == 0
+    assert asym_backend.stats.expact_stage_low_rank_calls == 0
+    assert asym_backend.stats.dense_mlp_finegrained_forward_calls == 0
+    assert asym_backend.stats.dense_mlp_finegrained_backward_calls == 0
 
 
 @pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernel")

@@ -2468,7 +2468,127 @@ class AsymQwen3Experts(nn.Module):
         # ops, so AccumulateGrad needs the parameters to stay full-shaped until
         # the optimizer's post-accumulate hooks release them. The custom expert
         # paths below gather in their backward and can release after forward.
-        return bool(self._uses_activation_offload() or self._uses_expert_gc() or self._uses_expert_recompute())
+        return bool(
+            self._uses_qwen3_moe_finegrained_offload()
+            or self._uses_activation_offload()
+            or self._uses_expert_gc()
+            or self._uses_expert_recompute()
+        )
+
+    def _uses_qwen3_moe_finegrained_offload(self) -> bool:
+        return bool(
+            getattr(self, "_qwen3_moe_finegrained_enabled", False)
+            and self.training
+            and torch.is_grad_enabled()
+        )
+
+    def _uses_qwen3_moe_finegrained_nograd_forward(self) -> bool:
+        return bool(
+            getattr(self, "_qwen3_moe_finegrained_enabled", False)
+            and self.training
+            and not torch.is_grad_enabled()
+        )
+
+    def _ensure_qwen3_moe_finegrained_bases(self) -> tuple[AsymGroupedFrozenLinear, AsymGroupedFrozenLinear]:
+        gate_base = getattr(self, "_qwen3_moe_finegrained_gate_base", None)
+        up_base = getattr(self, "_qwen3_moe_finegrained_up_base", None)
+        if isinstance(gate_base, AsymGroupedFrozenLinear) and isinstance(up_base, AsymGroupedFrozenLinear):
+            return gate_base, up_base
+        if not isinstance(self.gate_up_base, AsymGroupedFrozenLinear):
+            raise NotImplementedError("Qwen3 MoE fine-grained offload requires an AsymGroupedFrozenLinear gate/up base")
+        fused = self.gate_up_base.host_weight.weight
+        gate_weight = fused[:, : self.intermediate_dim, :].contiguous()
+        up_weight = fused[:, self.intermediate_dim :, :].contiguous()
+        gate_base = AsymGroupedFrozenLinear(
+            gate_weight,
+            backend=self.gate_up_base.backend,
+            pin_memory=torch.cuda.is_available(),
+            clone=False,
+            precision=self.gate_up_base.precision,
+            stats=self.stats,
+            compiled_dims=self.gate_up_base.compiled_dims,
+            bf16_output_dtype=self.gate_up_base.bf16_output_dtype,
+            weight_layout=self.gate_up_base.weight_layout,
+        )
+        up_base = AsymGroupedFrozenLinear(
+            up_weight,
+            backend=self.gate_up_base.backend,
+            pin_memory=torch.cuda.is_available(),
+            clone=False,
+            precision=self.gate_up_base.precision,
+            stats=self.stats,
+            compiled_dims=self.gate_up_base.compiled_dims,
+            bf16_output_dtype=self.gate_up_base.bf16_output_dtype,
+            weight_layout=self.gate_up_base.weight_layout,
+        )
+        self._qwen3_moe_finegrained_gate_base = gate_base
+        self._qwen3_moe_finegrained_up_base = up_base
+        return gate_base, up_base
+
+    def _qwen3_moe_finegrained_unsupported_reasons(self, packed: torch.Tensor) -> list[str]:
+        from .qwen3_moe_finegrained import qwen3_moe_finegrained_unsupported_reasons
+
+        return qwen3_moe_finegrained_unsupported_reasons(self, packed)
+
+    def _check_qwen3_moe_finegrained_supported(self, packed: torch.Tensor) -> None:
+        reasons = self._qwen3_moe_finegrained_unsupported_reasons(packed)
+        if reasons:
+            joined = "; ".join(dict.fromkeys(reasons))
+            raise NotImplementedError(f"Qwen3 MoE fine-grained offload is unsupported for this configuration: {joined}")
+
+    def _forward_qwen3_moe_finegrained_offload(
+        self,
+        hidden_states: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        token_indices: torch.Tensor,
+        routing_weights: torch.Tensor,
+        *,
+        input_weighted: bool,
+        output_weighted: bool,
+    ) -> torch.Tensor:
+        from .qwen3_moe_finegrained import qwen3_moe_finegrained_forward
+
+        if routing_weights.requires_grad:
+            raise NotImplementedError("Qwen3 MoE fine-grained offload requires detached router weights")
+        self._check_qwen3_moe_finegrained_supported(hidden_states)
+        return qwen3_moe_finegrained_forward(
+            self,
+            hidden_states,
+            offsets,
+            experts,
+            token_indices,
+            routing_weights,
+            input_weighted=bool(input_weighted),
+            output_weighted=bool(output_weighted),
+        )
+
+    def _forward_qwen3_moe_finegrained_nograd(
+        self,
+        hidden_states: torch.Tensor,
+        offsets: torch.Tensor,
+        experts: torch.Tensor,
+        token_indices: torch.Tensor,
+        routing_weights: torch.Tensor,
+        *,
+        input_weighted: bool,
+        output_weighted: bool,
+    ) -> torch.Tensor:
+        from .qwen3_moe_finegrained import qwen3_moe_finegrained_nograd_forward
+
+        if routing_weights.requires_grad:
+            raise NotImplementedError("Qwen3 MoE fine-grained no-grad forward requires detached router weights")
+        self._check_qwen3_moe_finegrained_supported(hidden_states)
+        return qwen3_moe_finegrained_nograd_forward(
+            self,
+            hidden_states,
+            offsets,
+            experts,
+            token_indices,
+            routing_weights,
+            input_weighted=bool(input_weighted),
+            output_weighted=bool(output_weighted),
+        )
 
     def _activation_offload_requested(self) -> bool:
         return _env_flag("ASYMM_EXPERT_ACT_OFFLOAD", False)
@@ -2664,14 +2784,34 @@ class AsymQwen3Experts(nn.Module):
         input_dtype = hidden_states.dtype
         with prof_range(self._forward_range("route_metadata")):
             metadata = build_contiguous_route_metadata(top_k_index, top_k_weights, num_experts=self.num_experts)
-        with prof_range(self._forward_range("pack_tokens")):
-            packed = pack_tokens_contiguous(hidden_states, metadata)
         with prof_range(self._forward_range("route_metadata", "dense_groups")):
             offsets, experts = make_dense_group_metadata(
                 metadata.expert_offsets,
                 num_groups=self.num_experts,
-                device=packed.device,
+                device=hidden_states.device,
             )
+        if self._uses_qwen3_moe_finegrained_offload():
+            return self._forward_qwen3_moe_finegrained_offload(
+                hidden_states,
+                offsets,
+                experts,
+                metadata.token_indices,
+                metadata.routing_weights,
+                input_weighted=False,
+                output_weighted=True,
+            ).to(dtype=input_dtype)
+        if self._uses_qwen3_moe_finegrained_nograd_forward():
+            return self._forward_qwen3_moe_finegrained_nograd(
+                hidden_states,
+                offsets,
+                experts,
+                metadata.token_indices,
+                metadata.routing_weights,
+                input_weighted=False,
+                output_weighted=True,
+            ).to(dtype=input_dtype)
+        with prof_range(self._forward_range("pack_tokens")):
+            packed = pack_tokens_contiguous(hidden_states, metadata)
         if self._uses_activation_offload():
             x_src_hidden = None
             x_token_indices = None
@@ -2717,16 +2857,36 @@ class AsymQwen3Experts(nn.Module):
         input_dtype = hidden_states.dtype
         with prof_range(self._forward_range("route_metadata")):
             metadata = build_contiguous_route_metadata(top_k_index, input_weights, num_experts=self.num_experts)
-        with prof_range(self._forward_range("pack_tokens")):
-            packed = pack_tokens_contiguous(hidden_states, metadata)
-            route_scale = metadata.routing_weights.reshape(metadata.num_routes, *([1] * (packed.dim() - 1)))
-            packed = packed * route_scale.to(device=packed.device, dtype=packed.dtype)
         with prof_range(self._forward_range("route_metadata", "dense_groups")):
             offsets, experts = make_dense_group_metadata(
                 metadata.expert_offsets,
                 num_groups=self.num_experts,
-                device=packed.device,
+                device=hidden_states.device,
             )
+        if self._uses_qwen3_moe_finegrained_offload():
+            return self._forward_qwen3_moe_finegrained_offload(
+                hidden_states,
+                offsets,
+                experts,
+                metadata.token_indices,
+                metadata.routing_weights,
+                input_weighted=True,
+                output_weighted=False,
+            ).to(dtype=input_dtype)
+        if self._uses_qwen3_moe_finegrained_nograd_forward():
+            return self._forward_qwen3_moe_finegrained_nograd(
+                hidden_states,
+                offsets,
+                experts,
+                metadata.token_indices,
+                metadata.routing_weights,
+                input_weighted=True,
+                output_weighted=False,
+            ).to(dtype=input_dtype)
+        with prof_range(self._forward_range("pack_tokens")):
+            packed = pack_tokens_contiguous(hidden_states, metadata)
+            route_scale = metadata.routing_weights.reshape(metadata.num_routes, *([1] * (packed.dim() - 1)))
+            packed = packed * route_scale.to(device=packed.device, dtype=packed.dtype)
         if self._uses_activation_offload():
             x_src_hidden = None
             x_token_indices = None

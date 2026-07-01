@@ -265,6 +265,8 @@ class LFAsymReport:
     dense_mlp_act_offload_wrapped: int = 0
     dense_mlp_finegrained_offload_enabled: bool = False
     dense_mlp_finegrained_offload_wrapped: int = 0
+    qwen3_moe_finegrained_offload_enabled: bool = False
+    qwen3_moe_finegrained_offload_wrapped: int = 0
     trainable_lora_params: int = 0
     cpu_resident_base_bytes: int = 0
     gpu_resident_base_bytes: int = 0
@@ -331,6 +333,7 @@ class LFAsymReport:
             f"dense_lora_wrapped={self.dense_lora_wrapped}, "
             f"dense_mlp_act_offload_wrapped={self.dense_mlp_act_offload_wrapped}, "
             f"dense_mlp_finegrained_offload_wrapped={self.dense_mlp_finegrained_offload_wrapped}, "
+            f"qwen3_moe_finegrained_offload_wrapped={self.qwen3_moe_finegrained_offload_wrapped}, "
             f"trainable_lora_params={self.trainable_lora_params}, "
             f"cpu_resident_base_bytes={self.cpu_resident_base_bytes}, "
             f"gpu_resident_base_bytes={self.gpu_resident_base_bytes}, "
@@ -351,6 +354,8 @@ class LFAsymReport:
             f"layer_glue_gc_wrapped={self.layer_glue_gc_wrapped}, "
             f"dense_mlp_finegrained_offload_enabled={self.dense_mlp_finegrained_offload_enabled}, "
             f"dense_mlp_finegrained_offload_wrapped={self.dense_mlp_finegrained_offload_wrapped}, "
+            f"qwen3_moe_finegrained_offload_enabled={self.qwen3_moe_finegrained_offload_enabled}, "
+            f"qwen3_moe_finegrained_offload_wrapped={self.qwen3_moe_finegrained_offload_wrapped}, "
             f"attention_saved_tensor_offload_wrapped={self.attention_saved_tensor_offload_wrapped}, "
             f"linear_attention_saved_tensor_offload_wrapped={self.linear_attention_saved_tensor_offload_wrapped}, "
             f"router_mode={self.router_mode}, "
@@ -390,6 +395,8 @@ class LFAsymReport:
             f"layer_glue_gc_wrapped={self.layer_glue_gc_wrapped}, "
             f"dense_mlp_finegrained_offload_enabled={self.dense_mlp_finegrained_offload_enabled}, "
             f"dense_mlp_finegrained_offload_wrapped={self.dense_mlp_finegrained_offload_wrapped}, "
+            f"qwen3_moe_finegrained_offload_enabled={self.qwen3_moe_finegrained_offload_enabled}, "
+            f"qwen3_moe_finegrained_offload_wrapped={self.qwen3_moe_finegrained_offload_wrapped}, "
             f"attention_saved_tensor_offload_wrapped={self.attention_saved_tensor_offload_wrapped}, "
             f"linear_attention_saved_tensor_offload_wrapped={self.linear_attention_saved_tensor_offload_wrapped}, "
             f"router_mode={self.router_mode}, "
@@ -1318,6 +1325,12 @@ def _attention_act_offload_enabled() -> bool:
     )
 
 
+def _qwen3_moe_finegrained_offload_enabled() -> bool:
+    return _env_true(os.environ.get("ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD")) or _env_true(
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD")
+    )
+
+
 def _layer_act_offload_enabled() -> bool:
     return _env_true(os.environ.get("ASYMM_LAYER_ACT_OFFLOAD")) or _env_true(
         os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD")
@@ -1728,9 +1741,11 @@ def apply_lf_asym_lora(
     attention_act_enabled = _attention_act_offload_enabled()
     layer_act_enabled = _layer_act_offload_enabled()
     layer_glue_gc_enabled = _layer_glue_gc_enabled()
+    qwen3_moe_finegrained_enabled = _qwen3_moe_finegrained_offload_enabled()
     report.attention_act_offload_enabled = bool(attention_act_enabled)
     report.layer_act_offload_enabled = bool(layer_act_enabled)
     report.layer_glue_gc_enabled = bool(layer_glue_gc_enabled)
+    report.qwen3_moe_finegrained_offload_enabled = bool(qwen3_moe_finegrained_enabled)
     wrap_experts = _targets_experts(raw_lora_target)
     offload_experts = backend == "asym" and selection.routed_experts
     offload_router = backend == "asym" and selection.router
@@ -1901,6 +1916,9 @@ def apply_lf_asym_lora(
                 )
                 wrapped.profile_prefix = _layer_profile_prefix_from_module_name(name, "mlp")
                 wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
+                if qwen3_moe_finegrained_enabled and offload_experts:
+                    wrapped.experts._qwen3_moe_finegrained_enabled = True
+                    report.qwen3_moe_finegrained_offload_wrapped += 1
                 _install_expert_replacement(name, wrapped, f"{name}.experts")
             elif kind in {"llama4_whole", "llama4_hf"}:
                 if not is_llama4_moe(module):
@@ -1957,6 +1975,9 @@ def apply_lf_asym_lora(
                     wrapped.profile_prefix = _gemma4_profile_prefix_from_module_name(name)
                 else:
                     wrapped.profile_prefix = _qwen3_profile_prefix_from_module_name(name)
+                if family != "gemma4" and qwen3_moe_finegrained_enabled and offload_experts:
+                    wrapped._qwen3_moe_finegrained_enabled = True
+                    report.qwen3_moe_finegrained_offload_wrapped += 1
                 _install_expert_replacement(name, wrapped, name)
             else:
                 raise AssertionError(f"unknown expert candidate kind: {kind}")

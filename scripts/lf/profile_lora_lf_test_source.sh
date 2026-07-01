@@ -70,18 +70,19 @@ else
     # "q3-30b-a3b|1 ; zero3_offload_mem_panvme|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
     # "q3-32b|1 ; zero3_offload_mem_panvme|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false"
 
-    "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false"
-    # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # x90k
-    # "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # x55k
-    # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x50k
-    # "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # x10k
-    # "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # x45k
+    "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 90k
+    # "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 55k
+    # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 50k
+    # "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
+    # "q2.5-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 55k
+    # "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # G-OOM 45k
 
-    # "q3-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # x25k
-    # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # x50k
-    # "llama3.3-70b|1 ; superoffload_mem|recomp|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false" # x15k
-    # "llama4-scout|1 ; superoffload_mem|recomp|ligerloss1 ; 8000|8|1 ; none|false|false|false|false|false" # x9k
-    # "q2.5-72b|1 ; superoffload_mem|recomp|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false" # x15k
+    # "q3-30b-a3b|1 ; superoffload_mem|recomp|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 50k
+    # "q3-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # G-OOM 25k
+    # "llama3.3-70b|1 ; superoffload_mem|recomp|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false" # G-OOM 15k
+    # "llama4-scout|1 ; superoffload_mem|recomp|ligerloss1 ; 8000|8|1 ; none|false|false|false|false|false" # G-OOM 9k
+    # "q2.5-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 25000|8|1 ; none|false|false|false|false|false" # G-OOM 25k
+    # "q2.5-72b|1 ; superoffload_mem|recomp|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false" # G-OOM 15k
   )
 fi
 
@@ -148,6 +149,8 @@ SEED=${SEED:-42}
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
 ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD=${ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD:-0}
 ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD=${ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD:-0}
+ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD=${ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD:-0}
+ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS:-0}
 # Diagnostic only. Keep at 0 for final comparisons; nonzero values move some
 # outer Unsloth checkpoint roots from CPU RAM back to HBM.
 UNSLOTH_GC_OUTER_HBM_EVERY_N=${UNSLOTH_GC_OUTER_HBM_EVERY_N:-0}
@@ -513,6 +516,19 @@ xunpack_tag() {
   esac
 }
 
+moefg_tag() {
+  case "$(bool_value "$1")" in
+    true) printf 'moefg1\n' ;;
+    false) printf 'moefg0\n' ;;
+  esac
+}
+
+dscatter_tag() {
+  local value="${1:-0}"
+  [[ "${value}" =~ ^[0-9]+$ ]] || die "ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS must be a nonnegative integer, got '${value}'"
+  printf 'dscatter%s\n' "${value}"
+}
+
 is_recomp_off_recompute() {
   case "${1,,}" in
     recomp-off|recomp-off-base|recomp-off-attn|recomp-off-dense|recomp-off-full|recomp-off-dense-fg|recomp-off-full-fg) return 0 ;;
@@ -739,6 +755,8 @@ canonicalize_policy_axis_for_inert_run() {
   ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=hbm; expact_lora_a_fwd_label="$(expact_lora_a_fwd_tag hbm)"
   ASYM_OFFLOAD_ACT_RECOMPUTE=0; actrecomp_label="$(actrecomp_tag 0)"
   ASYM_OFFLOAD_X_UNPACKED=0; xunpack_label="$(xunpack_tag 0)"
+  ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD=0; moefg_label="$(moefg_tag 0)"
+  ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=0; dscatter_label="$(dscatter_tag 0)"
 }
 
 recompute_label() {
@@ -1222,6 +1240,14 @@ if expected_recomp_off_stage:
             "profile asymm_dense_mlp_finegrained_offload mismatch: "
             f"expected {expected_dense_finegrained}, got {actual_dense_finegrained or '<missing>'}"
         )
+    qwen3_moe_target = "Qwen3-30B-A3B" in str(expected_model_name)
+    expected_moefg = "true" if expected_recomp_off_stage == "full-fg" and qwen3_moe_target else "false"
+    actual_moefg = normalize_bool(config.get("asymm_qwen3_moe_finegrained_offload", "false"))
+    if actual_moefg != expected_moefg:
+        raise SystemExit(
+            "profile asymm_qwen3_moe_finegrained_offload mismatch: "
+            f"expected {expected_moefg}, got {actual_moefg or '<missing>'}"
+        )
     if normalize_bool(config.get("asym_offload_act_recompute")) != "false":
         raise SystemExit("profile asym_offload_act_recompute must be false for recomp-off stages")
     if normalize_bool(config.get("asym_offload_x_unpacked")) != "false":
@@ -1590,7 +1616,7 @@ job_root_path() {
   if [[ "${UNSLOTH_GC_OUTER_HBM_EVERY_N:-0}" != "0" ]]; then
     outer_hbm_suffix="__outerhbm${UNSLOTH_GC_OUTER_HBM_EVERY_N}"
   fi
-  path_label="${path_label}__${expact_lora_a_fwd_label}__${actrecomp_label}__${xunpack_label}__${liger_loss}${grad_offload_suffix}${outer_hbm_suffix}"
+  path_label="${path_label}__${expact_lora_a_fwd_label}__${actrecomp_label}__${xunpack_label}__${moefg_label}__${dscatter_label}__${liger_loss}${grad_offload_suffix}${outer_hbm_suffix}"
   printf '%s/%s\n' "${config_root}" "$(safe_label "${path_label}")"
 }
 
@@ -1627,7 +1653,7 @@ kt_arm_resolve_matching_source_profile_json() {
   local model_name="$8"
   # Canonicalize the policy axes so the matched source path and expected values agree with run_job.
   local source_profile_json
-  local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" sdparecomp_label="${sdparecomp_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}"
+  local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" sdparecomp_label="${sdparecomp_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}" moefg_label="${moefg_label}" dscatter_label="${dscatter_label}"
   local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_LAYER_GC="${ASYMM_LAYER_GC}" ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
   local ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}" ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
   canonicalize_policy_axis_for_inert_run "${backend}" "${recompute}"
@@ -2434,6 +2460,8 @@ ASYMM_EXPERT_ACT_OFFLOAD="${expact_values[0]}"
 expact_label="$(expact_tag "${ASYMM_EXPERT_ACT_OFFLOAD}")"
 actrecomp_label="$(actrecomp_tag "${ASYM_OFFLOAD_ACT_RECOMPUTE}")"
 xunpack_label="$(xunpack_tag "${ASYM_OFFLOAD_X_UNPACKED}")"
+moefg_label="$(moefg_tag "${ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD}")"
+dscatter_label="$(dscatter_tag "${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}")"
 ASYMM_ATTN_ACT_OFFLOAD="${attnact_values[0]}"
 attnact_label="$(attnact_tag "${ASYMM_ATTN_ACT_OFFLOAD}")"
 ASYMM_LAYER_ACT_OFFLOAD="${layeract_values[0]}"
@@ -2757,9 +2785,11 @@ run_job() {
   local grad_offload="${12:-false}"
   local weight_offload="${13:-false}"
   # Canonicalize the policy axes for inert runs; local shadows feed run_id, the folder, the env, and the check.
-  local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" sdparecomp_label="${sdparecomp_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}"
+  local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" sdparecomp_label="${sdparecomp_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}" moefg_label="${moefg_label}" dscatter_label="${dscatter_label}"
   local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_LAYER_GC="${ASYMM_LAYER_GC}" ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
   local ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}" ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
+  local ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD="${ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD}"
+  local ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS="${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}"
   local ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU:-1}"
   local ASYMM_MLP_RECOMPUTE_CHUNK="${ASYMM_MLP_RECOMPUTE_CHUNK:-0}"
   local requested_policy_tuple="${expert_policy}|${ASYMM_EXPERT_ACT_OFFLOAD}|${ASYMM_ATTN_ACT_OFFLOAD}|${ASYMM_LAYER_ACT_OFFLOAD}|${ASYMM_LAYER_GC}|${ASYMM_ATTN_SDPA_RECOMPUTE}"
@@ -2777,6 +2807,7 @@ run_job() {
   local layer_gc_enabled=false
   local dense_mlp_surgical="${ASYMM_DENSE_MLP_SURGICAL_OFFLOAD:-0}"
   local dense_mlp_finegrained="${ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD:-0}"
+  local requested_qwen3_moe_down_scatter_block_experts="${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}"
   local recomp_off_stage=""
   [[ "${recompute}" == "recomp" ]] && gradient_checkpointing=true
   [[ "${recompute}" == "unsloth" || "${recompute}" == "unsloth-off" ]] && { gradient_checkpointing=true; use_unsloth_gc=true; }
@@ -2793,6 +2824,8 @@ run_job() {
     expert_policy=none
     ASYM_OFFLOAD_ACT_RECOMPUTE=0; actrecomp_label="$(actrecomp_tag 0)"
     ASYM_OFFLOAD_X_UNPACKED=0; xunpack_label="$(xunpack_tag 0)"
+    ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD=0; moefg_label="$(moefg_tag 0)"
+    ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=0; dscatter_label="$(dscatter_tag 0)"
     ASYMM_LAYER_ACT_OFFLOAD=false; layeract_label="$(layeract_tag false)"
     if [[ "$(bool_value "${ASYMM_RECOMP_OFF_ALLOW_LAYER_GC:-false}")" != "true" ]]; then
       ASYMM_LAYER_GC=false; layergc_label="$(layergc_tag false)"
@@ -2836,6 +2869,11 @@ run_job() {
         ASYMM_EXPERT_ACT_OFFLOAD=false; expact_label="$(expact_tag false)"
         ASYMM_ATTN_ACT_OFFLOAD=true; attnact_label="$(attnact_tag true)"
         ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu; expact_lora_a_fwd_label="$(expact_lora_a_fwd_tag cpu)"
+        if [[ "${current_model_name}" == *"Qwen3-30B-A3B"* ]]; then
+          ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD=1; moefg_label="$(moefg_tag 1)"
+          ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS="${requested_qwen3_moe_down_scatter_block_experts}"
+          dscatter_label="$(dscatter_tag "${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}")"
+        fi
         ;;
     esac
   fi
@@ -2882,7 +2920,7 @@ run_job() {
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
     grad_offload_run_label="_gradoff${grad_offload}_weightoff${weight_offload}"
   fi
-  run_id="lf_${backend}_${run_profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${layergc_label}_${sdparecomp_label}_${expact_lora_a_fwd_label}_${actrecomp_label}_${xunpack_label}_${liger_loss}${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${lora_dropout_label_value}"
+  run_id="lf_${backend}_${run_profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${layergc_label}_${sdparecomp_label}_${expact_lora_a_fwd_label}_${actrecomp_label}_${xunpack_label}_${moefg_label}_${dscatter_label}_${liger_loss}${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
   local run_log_payload
   run_log_payload="${_M_REV[${current_model_name}]:-${current_model_name}} ; ${backend}|${recompute}|${liger_loss} ; ${seq_len}|${PER_DEVICE_TRAIN_BATCH_SIZE}|${GRADIENT_ACCUMULATION_STEPS} ; ${effective_policy_tuple} ; lora=${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|${LORA_TARGET}"
@@ -3083,6 +3121,8 @@ run_job() {
     ASYMM_DENSE_MLP_SURGICAL_OFFLOAD="${dense_mlp_surgical}"
     ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD="${dense_mlp_finegrained}"
     ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD="${ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD:-0}"
+    ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD="${ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD}"
+    ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS="${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}"
     ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
     ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
     ASYMM_LAYER_GC="${ASYMM_LAYER_GC}"
@@ -3135,6 +3175,8 @@ run_job() {
 	    ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD="${dense_mlp_finegrained}"
 	    ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FINEGRAINED_CPU_ACT="${ASYMM_DENSE_MLP_FINEGRAINED_CPU_ACT:-0}"
 	    ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD="${ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD:-0}"
+	    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD="${ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD}"
+	    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS="${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}"
 	    ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_GC="${ASYMM_LAYER_GC}"

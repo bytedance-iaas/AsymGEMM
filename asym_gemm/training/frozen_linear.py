@@ -72,6 +72,26 @@ class AsymExecutionStats:
     dense_mlp_finegrained_stage_concat_columns_calls: int = 0
     dense_mlp_finegrained_gpu_silu_bwd_calls: int = 0
     dense_mlp_finegrained_cpu_silu_bwd_calls: int = 0
+    qwen3_moe_finegrained_forward_calls: int = 0
+    qwen3_moe_finegrained_nograd_forward_calls: int = 0
+    qwen3_moe_finegrained_backward_calls: int = 0
+    qwen3_moe_finegrained_gate_base_calls: int = 0
+    qwen3_moe_finegrained_up_base_calls: int = 0
+    qwen3_moe_finegrained_down_base_calls: int = 0
+    qwen3_moe_finegrained_stage_concat_columns_calls: int = 0
+    qwen3_moe_finegrained_gpu_silu_bwd_calls: int = 0
+    qwen3_moe_finegrained_cpu_silu_bwd_calls: int = 0
+    qwen3_moe_finegrained_lora_a_forward_calls: int = 0
+    qwen3_moe_finegrained_lora_a_grad_calls: int = 0
+    qwen3_moe_finegrained_lora_b_backward_calls: int = 0
+    qwen3_moe_finegrained_fused_gate_up_hbm_bytes: int = 0
+    qwen3_moe_finegrained_saved_cpu_bytes: int = 0
+    qwen3_moe_finegrained_stage_hbm_peak_bytes: int = 0
+    qwen3_moe_finegrained_down_scatter_block_experts: int = 0
+    qwen3_moe_finegrained_down_scatter_blocks: int = 0
+    qwen3_moe_finegrained_down_scatter_max_block_rows: int = 0
+    qwen3_moe_finegrained_hidden_route_global_tensors_avoided: int = 0
+    qwen3_moe_finegrained_stage_rows_calls: int = 0
     reference_fallback_count: int = 0
     fallback_reasons: Dict[str, int] = field(default_factory=dict)
 
@@ -125,6 +145,8 @@ class AsymExecutionStats:
             + self.expact_lora_a_forward_hbm_grouped_calls
             + self.attn_act_hbm_forward_calls
             + self.dense_mlp_finegrained_forward_calls
+            + self.qwen3_moe_finegrained_forward_calls
+            + self.qwen3_moe_finegrained_nograd_forward_calls
         )
 
     @property
@@ -140,6 +162,7 @@ class AsymExecutionStats:
             + self.attn_act_hbm_backward_calls
             + self.attn_act_stage_low_rank_calls
             + self.dense_mlp_finegrained_backward_calls
+            + self.qwen3_moe_finegrained_backward_calls
         )
 
     @property

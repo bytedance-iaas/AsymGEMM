@@ -249,6 +249,26 @@ class ActivationOffloadManager:
         self._mark_stage_live(stage, stage_tag)
         return stage
 
+    def stage_rows(self, handle: CPUActivationHandle, start: int, end: int, *, tag: str | None = None) -> torch.Tensor:
+        self.wait_cpu_ready(handle)
+        row_start = int(start)
+        row_end = int(end)
+        if row_start < 0 or row_end < row_start or row_end > int(handle.tensor.shape[0]):
+            raise ValueError(f"invalid row range [{row_start}, {row_end}) for {handle.tag} with shape {tuple(handle.tensor.shape)}")
+        stage_tag = handle.tag if tag is None else tag
+        shape = (row_end - row_start, *tuple(int(dim) for dim in handle.tensor.shape[1:]))
+        key = (str(handle.original_device), handle.tensor.dtype, shape, stage_tag)
+        stage = self._stage_cache.get(key)
+        if stage is None:
+            stage = torch.empty(shape, device=handle.original_device, dtype=handle.tensor.dtype)
+            self._stage_cache[key] = stage
+            self._stage_keys_by_ptr[int(stage.data_ptr())] = key
+        source = handle.tensor.narrow(0, row_start, row_end - row_start)
+        with torch.no_grad():
+            stage.copy_(source, non_blocking=handle.tensor.is_pinned())
+        self._mark_stage_live(stage, stage_tag)
+        return stage
+
     def stage_concat_columns(
         self,
         left: CPUActivationHandle,
