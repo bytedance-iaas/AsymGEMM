@@ -192,6 +192,7 @@ class RunRecord:
             self.metadata.get("layeract", ""),
             self.metadata.get("layergc", ""),
             self.metadata.get("sdparecomp", ""),
+            self.metadata.get("route", ""),
             self.metadata.get("liger_loss", ""),
             self.metadata.get("recompute", ""),
             self.metadata.get("expert_policy", ""),
@@ -461,6 +462,7 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
     layergc = "layergc0"
     sdparecomp_value = "false"
     sdparecomp = "sdparecomp0"
+    route = "route_missing"
     liger_loss = "ligerloss0"
 
     if tail:
@@ -493,6 +495,9 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         if parsed_liger_loss is not None:
             liger_loss = parsed_liger_loss
             continue
+        if part.startswith("route"):
+            route = part
+            continue
         # Unknown tail parts are config axes. Plotting should not reject a run
         # just because the driver grew a new folder label.
         continue
@@ -513,6 +518,7 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         "layergc": layergc,
         "asymm_attn_sdpa_recompute": sdparecomp_value,
         "sdparecomp": sdparecomp,
+        "route": route,
         "liger_loss": liger_loss,
     }
 
@@ -585,6 +591,7 @@ def _infer_metadata(run_dir: Path, summary: dict[str, Any]) -> dict[str, str] | 
         "layergc": layergc,
         "asymm_attn_sdpa_recompute": sdparecomp_value,
         "sdparecomp": sdparecomp,
+        "route": job_meta.get("route", "route_missing"),
         "liger_loss": liger_loss,
         "seq_len": str(config.get("seq_len") or (run_dir_match.group("seq_len") if run_dir_match else "")),
         "precision": str(config.get("precision") or ""),
@@ -660,7 +667,16 @@ def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
         if not _matches_filters(record, args):
             continue
         runs.append(record)
-    return sorted(runs, key=lambda run: (run.metadata.get("workload", ""), run.metadata.get("seq_len", ""), run.label, str(run.run_dir)))
+    return sorted(
+        runs,
+        key=lambda run: (
+            run.metadata.get("workload", ""),
+            run.metadata.get("seq_len", ""),
+            run.metadata.get("route", ""),
+            run.label,
+            str(run.run_dir),
+        ),
+    )
 
 
 def _no_runs_message(args: argparse.Namespace) -> str:

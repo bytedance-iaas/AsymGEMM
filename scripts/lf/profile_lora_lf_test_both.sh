@@ -151,27 +151,34 @@ LORA_PARAMS=${LORA_PARAMS:-"${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|all"}
 # LORA_PARAMS=${LORA_PARAMS:-"0.00|64|128|all,0.00|16|32|all"}
 SEED=${SEED:-42}
 
+# Recompute-offload module controls
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
 ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD=${ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD:-0}
 ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD=${ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD:-0}
+
+# Qwen3 MoE fine-grained/routed kernels. The three route bits are intentionally
+# left unset here so Qwen3-30B-A3B + asym* + recomp-off-full-fg can auto-enable them.
 ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD=${ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD:-0}
 ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS:-0}
 ASYMM_QWEN3_MOE_ROUTE_MAPPED_GEMM=${ASYMM_QWEN3_MOE_ROUTE_MAPPED_GEMM:-0}
 ASYMM_QWEN3_MOE_ROUTE_LORA=${ASYMM_QWEN3_MOE_ROUTE_LORA:-0}
 ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE=${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE:-fp32}
 ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG=${ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG:-0}
-# Diagnostic only. Keep at 0 for final comparisons; nonzero values move some
-# outer Unsloth checkpoint roots from CPU RAM back to HBM.
+
+# Outer checkpoint placement. Keep at 0 for final comparisons; nonzero values
+# move some outer Unsloth checkpoint roots from CPU RAM back to HBM.
 UNSLOTH_GC_OUTER_HBM_EVERY_N=${UNSLOTH_GC_OUTER_HBM_EVERY_N:-0}
+
+# CUDA allocator
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
 
-# Kernel / SwiGLU-backward toggles (1=on, 0=off)
+# Kernel implementation toggles (1=on, 0=off)
 ASYMM_EXPERT_SILU_BWD_GPU=${ASYMM_EXPERT_SILU_BWD_GPU:-1}
 ASYMM_MLP_RECOMPUTE_CHUNK=${ASYMM_MLP_RECOMPUTE_CHUNK:-0}
 DG_BF16_CPU_LEFT_COMPACT_GRID=${DG_BF16_CPU_LEFT_COMPACT_GRID:-0}
 ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE=${ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE:-0}
 
-# Backend checks and AsymGEMM options
+# AsymGEMM backend/offload controls
 # ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-all}
 ASYM_STRICT=${ASYM_STRICT:-true}
@@ -206,7 +213,6 @@ MAX_SAMPLES=${MAX_SAMPLES:-256}
 # Expert activation-backfetch toggles (default off)
 ASYM_OFFLOAD_ACT_RECOMPUTE=${ASYM_OFFLOAD_ACT_RECOMPUTE:-0}
 ASYM_OFFLOAD_X_UNPACKED=${ASYM_OFFLOAD_X_UNPACKED:-0}
-
 
 # Output and profiling
 OUTPUT_ROOT=${OUTPUT_ROOT:-}
@@ -460,6 +466,21 @@ bool_value() {
   esac
 }
 
+bool_tag() {
+  local prefix="$1"
+  case "$(bool_value "$2")" in
+    true) printf '%s1\n' "${prefix}" ;;
+    false) printf '%s0\n' "${prefix}" ;;
+  esac
+}
+
+truthy_digit() {
+  case "${1,,}" in
+    1|true|yes|y|on) printf '1\n' ;;
+    *) printf '0\n' ;;
+  esac
+}
+
 normalize_expact_lora_a_fwd() {
   case "${1}" in
     cpu) printf 'cpu\n' ;;
@@ -476,60 +497,36 @@ expact_lora_a_fwd_tag() {
 }
 
 expact_tag() {
-  case "$(bool_value "$1")" in
-    true) printf 'expact1\n' ;;
-    false) printf 'expact0\n' ;;
-  esac
+  bool_tag expact "$1"
 }
 
 attnact_tag() {
-  case "$(bool_value "$1")" in
-    true) printf 'attnact1\n' ;;
-    false) printf 'attnact0\n' ;;
-  esac
+  bool_tag attnact "$1"
 }
 
 layeract_tag() {
-  case "$(bool_value "$1")" in
-    true) printf 'layeract1\n' ;;
-    false) printf 'layeract0\n' ;;
-  esac
+  bool_tag layeract "$1"
 }
 
 layergc_tag() {
-  case "$(bool_value "$1")" in
-    true) printf 'layergc1\n' ;;
-    false) printf 'layergc0\n' ;;
-  esac
+  bool_tag layergc "$1"
 }
 
 sdparecomp_tag() {
-  case "$(bool_value "$1")" in
-    true) printf 'sdparecomp1\n' ;;
-    false) printf 'sdparecomp0\n' ;;
-  esac
+  bool_tag sdparecomp "$1"
 }
 
 # Lever-2 toggles (AsymGEMM-only). Encoded in the run dir so each setting gets its own folder.
 actrecomp_tag() {
-  case "${1,,}" in
-    1|true|yes|on) printf 'actrecomp1\n' ;;
-    *) printf 'actrecomp0\n' ;;
-  esac
+  printf 'actrecomp%s\n' "$(truthy_digit "$1")"
 }
 
 xunpack_tag() {
-  case "${1,,}" in
-    1|true|yes|on) printf 'xunpack1\n' ;;
-    *) printf 'xunpack0\n' ;;
-  esac
+  printf 'xunpack%s\n' "$(truthy_digit "$1")"
 }
 
 moefg_tag() {
-  case "$(bool_value "$1")" in
-    true) printf 'moefg1\n' ;;
-    false) printf 'moefg0\n' ;;
-  esac
+  bool_tag moefg "$1"
 }
 
 dscatter_tag() {
@@ -548,7 +545,7 @@ qwen3_route_bool() {
 qwen3_route_effective_flag() {
   local name="$1"
   local raw
-  if [[ -n "${!name+x}" ]]; then
+  if [[ -n "${!name+x}" && -n "${!name}" ]]; then
     raw="${!name}"
   else
     raw="${ASYMM_QWEN3_MOE_ROUTE_MAPPED_GEMM:-0}"
@@ -559,7 +556,7 @@ qwen3_route_effective_flag() {
 qwen3_route_tag() {
   local fwd="$1" gather="$2" dx="$3" lora="$4" accum="$5"
   [[ -n "${accum}" ]] || accum=fp32
-  printf 'q3rt_fwd%s_gather%s_dx%s_lora%s_acc%s\n' \
+  printf 'route%s%s%s_lora%s_acc%s\n' \
     "$(qwen3_route_bool "${fwd}")" \
     "$(qwen3_route_bool "${gather}")" \
     "$(qwen3_route_bool "${dx}")" \
@@ -568,8 +565,26 @@ qwen3_route_tag() {
 }
 
 qwen3_route_any_enabled() {
-  local fwd="$1" gather="$2" dx="$3" lora="$4"
-  [[ "$(qwen3_route_bool "${fwd}")" == "1" || "$(qwen3_route_bool "${gather}")" == "1" || "$(qwen3_route_bool "${dx}")" == "1" || "$(qwen3_route_bool "${lora}")" == "1" ]]
+  local value
+  for value in "$@"; do
+    [[ "$(qwen3_route_bool "${value}")" == "1" ]] && return 0
+  done
+  return 1
+}
+
+is_qwen3_moe_routed_model() {
+  case "$1" in
+    *"Qwen3-30B-A3B"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+qwen3_moe_routed_auto_default() {
+  local backend="$1" recomp_stage="$2" model="$3" expert_act="$4"
+  [[ "${backend}" == asym* ]] || return 1
+  [[ "${recomp_stage}" == "full-fg" ]] || return 1
+  [[ "${expert_act}" == "false" ]] || return 1
+  is_qwen3_moe_routed_model "${model}"
 }
 
 is_recomp_off_recompute() {
@@ -2839,6 +2854,9 @@ run_job() {
   local ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD="${ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD}"
   local ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS="${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}"
   local ASYMM_QWEN3_MOE_ROUTE_MAPPED_GEMM="${ASYMM_QWEN3_MOE_ROUTE_MAPPED_GEMM:-0}"
+  local ASYMM_QWEN3_MOE_ROUTE_FWD_SCATTER="${ASYMM_QWEN3_MOE_ROUTE_FWD_SCATTER-}"
+  local ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER="${ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER-}"
+  local ASYMM_QWEN3_MOE_ROUTE_GATEUP_DX_SCATTER="${ASYMM_QWEN3_MOE_ROUTE_GATEUP_DX_SCATTER-}"
   local ASYMM_QWEN3_MOE_ROUTE_LORA="${ASYMM_QWEN3_MOE_ROUTE_LORA:-0}"
   local ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE="${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE:-fp32}"
   local ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG="${ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG:-0}"
@@ -2922,13 +2940,21 @@ run_job() {
         ASYMM_EXPERT_ACT_OFFLOAD=false; expact_label="$(expact_tag false)"
         ASYMM_ATTN_ACT_OFFLOAD=true; attnact_label="$(attnact_tag true)"
         ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu; expact_lora_a_fwd_label="$(expact_lora_a_fwd_tag cpu)"
-        if [[ "${current_model_name}" == *"Qwen3-30B-A3B"* ]]; then
+        if is_qwen3_moe_routed_model "${current_model_name}"; then
           ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD=1; moefg_label="$(moefg_tag 1)"
           ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS="${requested_qwen3_moe_down_scatter_block_experts}"
           dscatter_label="$(dscatter_tag "${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}")"
         fi
         ;;
     esac
+  fi
+  if qwen3_moe_routed_auto_default "${backend}" "${recomp_off_stage}" "${current_model_name}" "${ASYMM_EXPERT_ACT_OFFLOAD}"; then
+    ASYMM_QWEN3_MOE_ROUTE_FWD_SCATTER="${ASYMM_QWEN3_MOE_ROUTE_FWD_SCATTER:-1}"
+    ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER="${ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER:-1}"
+    ASYMM_QWEN3_MOE_ROUTE_GATEUP_DX_SCATTER="${ASYMM_QWEN3_MOE_ROUTE_GATEUP_DX_SCATTER:-1}"
+    ASYMM_QWEN3_MOE_ROUTE_LORA="${ASYMM_QWEN3_MOE_ROUTE_LORA:-0}"
+    ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE="${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE:-fp32}"
+    ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=0; dscatter_label="$(dscatter_tag 0)"
   fi
   q3rt_fwd_flag="$(qwen3_route_effective_flag ASYMM_QWEN3_MOE_ROUTE_FWD_SCATTER)"
   q3rt_gather_flag="$(qwen3_route_effective_flag ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER)"
@@ -2939,7 +2965,7 @@ run_job() {
     [[ "${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE,,}" == "fp32" ]] || die "Qwen3 routed kernels currently require ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE=fp32, got '${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE}'"
     [[ "${backend}" == asym* ]] || die "Qwen3 routed kernels are only valid for asym* backends, got backend='${backend}'"
     [[ "${recomp_off_stage}" == "full-fg" ]] || die "Qwen3 routed kernels require recomp-off-full-fg, got recompute='${recompute}'"
-    [[ "${current_model_name}" == *"Qwen3-30B-A3B"* ]] || die "Qwen3 routed kernels are scoped to Qwen3-30B-A3B, got model='${current_model_name}'"
+    is_qwen3_moe_routed_model "${current_model_name}" || die "Qwen3 routed kernels are scoped to Qwen3-30B-A3B, got model='${current_model_name}'"
     [[ "$(qwen3_route_bool "${ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD}")" == "1" ]] || die "Qwen3 routed kernels require ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD=1"
     [[ "${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}" == "0" ]] || die "Qwen3 routed kernels must not use ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}"
   fi
@@ -2986,7 +3012,7 @@ run_job() {
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
     grad_offload_run_label="_gradoff${grad_offload}_weightoff${weight_offload}"
   fi
-  run_id="lf_${backend}_${run_profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${layergc_label}_${sdparecomp_label}_${expact_lora_a_fwd_label}_${actrecomp_label}_${xunpack_label}_${moefg_label}_${dscatter_label}_${liger_loss}${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${lora_dropout_label_value}"
+  run_id="lf_${backend}_${run_profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${layergc_label}_${sdparecomp_label}_${expact_lora_a_fwd_label}_${actrecomp_label}_${xunpack_label}_${moefg_label}_${dscatter_label}_${q3rt_label}_${liger_loss}${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
   local run_log_payload
   run_log_payload="${_M_REV[${current_model_name}]:-${current_model_name}} ; ${backend}|${recompute}|${liger_loss} ; ${seq_len}|${PER_DEVICE_TRAIN_BATCH_SIZE}|${GRADIENT_ACCUMULATION_STEPS} ; ${effective_policy_tuple} ; lora=${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|${LORA_TARGET}"

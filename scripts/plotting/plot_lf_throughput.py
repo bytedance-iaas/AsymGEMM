@@ -34,6 +34,7 @@ _META_FIELDS = [
     "layeract",
     "asymm_layer_gc",
     "layergc",
+    "route",
     "liger_loss",
     "profiler",
     "recompute",
@@ -96,6 +97,7 @@ class RunRecord:
             self.metadata.get("attnact", ""),
             self.metadata.get("layeract", ""),
             self.metadata.get("layergc", ""),
+            self.metadata.get("route", ""),
             self.metadata.get("liger_loss", ""),
             self.metadata.get("recompute", ""),
             self.metadata.get("expert_policy", ""),
@@ -225,6 +227,7 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
     attnact_value, attnact = "false", "attnact0"
     layeract_value, layeract = "false", "layeract0"
     layergc_value, layergc = "false", "layergc0"
+    route = "route_missing"
     liger_loss = "ligerloss0"
 
     if tail:
@@ -253,6 +256,9 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         if parsed_liger_loss is not None:
             liger_loss = parsed_liger_loss
             continue
+        if part.startswith("route"):
+            route = part
+            continue
         continue
 
     return {
@@ -269,6 +275,7 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         "layeract": layeract,
         "asymm_layer_gc": layergc_value,
         "layergc": layergc,
+        "route": route,
         "liger_loss": liger_loss,
     }
 
@@ -396,6 +403,7 @@ def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, st
         "layeract": layeract,
         "asymm_layer_gc": layergc_value,
         "layergc": layergc,
+        "route": job_meta.get("route", "route_missing"),
         "liger_loss": liger_loss,
         "profiler": str(profiler_part),
         "recompute": recompute_part,
@@ -520,6 +528,7 @@ def _load_runs(args: argparse.Namespace) -> list[RunRecord]:
             int(run.metadata.get("seq_len") or 0),
             run.metadata.get("backend", ""),
             run.metadata.get("router_mode", ""),
+            run.metadata.get("route", ""),
             run.metadata.get("liger_loss", ""),
             run.metadata.get("recompute", ""),
             run.metadata.get("expert_policy", ""),

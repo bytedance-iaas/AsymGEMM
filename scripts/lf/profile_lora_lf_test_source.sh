@@ -572,6 +572,17 @@ qwen3_route_any_enabled() {
   [[ "$(qwen3_route_bool "${fwd}")" == "1" || "$(qwen3_route_bool "${gather}")" == "1" || "$(qwen3_route_bool "${dx}")" == "1" || "$(qwen3_route_bool "${lora}")" == "1" ]]
 }
 
+qwen3_moe_routed_auto_default() {
+  local backend="$1" recomp_stage="$2" model="$3" expert_act="$4"
+  [[ "${backend}" == asym* ]] || return 1
+  [[ "${recomp_stage}" == "full-fg" ]] || return 1
+  [[ "${expert_act}" == "false" ]] || return 1
+  case "${model}" in
+    *"Qwen3-30B-A3B"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 is_recomp_off_recompute() {
   case "${1,,}" in
     recomp-off|recomp-off-base|recomp-off-attn|recomp-off-dense|recomp-off-full|recomp-off-dense-fg|recomp-off-full-fg) return 0 ;;
@@ -2929,6 +2940,14 @@ run_job() {
         fi
         ;;
     esac
+  fi
+  if qwen3_moe_routed_auto_default "${backend}" "${recomp_off_stage}" "${current_model_name}" "${ASYMM_EXPERT_ACT_OFFLOAD}"; then
+    ASYMM_QWEN3_MOE_ROUTE_FWD_SCATTER="${ASYMM_QWEN3_MOE_ROUTE_FWD_SCATTER:-1}"
+    ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER="${ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER:-1}"
+    ASYMM_QWEN3_MOE_ROUTE_GATEUP_DX_SCATTER="${ASYMM_QWEN3_MOE_ROUTE_GATEUP_DX_SCATTER:-1}"
+    ASYMM_QWEN3_MOE_ROUTE_LORA="${ASYMM_QWEN3_MOE_ROUTE_LORA:-0}"
+    ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE="${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE:-fp32}"
+    ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=0; dscatter_label="$(dscatter_tag 0)"
   fi
   q3rt_fwd_flag="$(qwen3_route_effective_flag ASYMM_QWEN3_MOE_ROUTE_FWD_SCATTER)"
   q3rt_gather_flag="$(qwen3_route_effective_flag ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER)"

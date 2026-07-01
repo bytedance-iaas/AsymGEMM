@@ -466,6 +466,7 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
     layergc = str(job_meta["layergc"])
     sdparecomp_value = str(job_meta["asymm_attn_sdpa_recompute"])
     sdparecomp = str(job_meta["sdparecomp"])
+    route = str(job_meta.get("route") or "route_missing")
     liger_loss = str(job_meta.get("liger_loss") or "ligerloss0")
     # Any recompute/optimization token is accepted (norecomp, recomp, unsloth, ...);
     # the polNNN anchor below still validates the directory layout.
@@ -502,6 +503,7 @@ def parse_flat_result_dir(path: Path) -> dict[str, Any] | None:
         "layergc": layergc,
         "asymm_attn_sdpa_recompute": sdparecomp_value,
         "sdparecomp": sdparecomp,
+        "route": route,
         "backend": backend,
         "router_mode": router_mode,
         "profiler": profiler,
@@ -758,6 +760,7 @@ def parse_job_dir_parts(job_dir_name: str) -> dict[str, Any] | None:
     layergc = "layergc0"
     sdparecomp_value = "false"
     sdparecomp = "sdparecomp0"
+    route = "route_missing"
     liger_loss = "ligerloss0"
 
     if tail:
@@ -791,6 +794,9 @@ def parse_job_dir_parts(job_dir_name: str) -> dict[str, Any] | None:
         if parsed_liger_loss is not None:
             liger_loss = parsed_liger_loss
             continue
+        if part.startswith("route") and not part.startswith("router"):
+            route = part
+            continue
         # Unknown tail parts are config axes. Plotting should not reject a run
         # just because the driver grew a new folder label.
         continue
@@ -811,6 +817,7 @@ def parse_job_dir_parts(job_dir_name: str) -> dict[str, Any] | None:
         "layergc": layergc,
         "asymm_attn_sdpa_recompute": sdparecomp_value,
         "sdparecomp": sdparecomp,
+        "route": route,
         "liger_loss": liger_loss,
     }
 
@@ -997,6 +1004,7 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
     liger_loss = str(config.get("liger_loss") or meta.get("liger_loss") or "ligerloss0").lower()
     if liger_loss not in {"ligerloss0", "ligerloss1"}:
         liger_loss = "ligerloss0"
+    route = str(meta.get("route") or "route_missing")
     # Expert-policy sweeps are an AsymGEMM feature.  Zero/KT comparison runs
     # may live under policy-named directories for pairing, but the policy is not
     # applied to those backends.  Canonicalize them to one baseline series so
@@ -1060,6 +1068,7 @@ def row_from_result_dir(args: argparse.Namespace, result_dir: Path) -> dict[str,
         "backend": meta["backend"],
         "router_mode": router_mode,
         "profiler": meta["profiler"],
+        "route": route,
         "liger_loss": liger_loss,
         "trainable_surface_available": trainable_surface_available,
         "trainable_surface": trainable_surface_label,
@@ -1201,6 +1210,7 @@ def trainable_surface_comparison_key(row: dict[str, Any]) -> tuple[Any, ...]:
         row.get("layeract", "layeract0"),
         row.get("layergc", "layergc0"),
         row.get("sdparecomp", "sdparecomp0"),
+        row.get("route", "route_missing"),
         row["profiler"],
         row["liger_loss"],
         row["mode"],
@@ -1261,6 +1271,7 @@ def collect_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row.get("attnact", "attnact0"),
             row.get("layeract", "layeract0"),
             row.get("layergc", "layergc0"),
+            row.get("route", "route_missing"),
             row["profiler"],
             row["liger_loss"],
             row["mode"],
@@ -1285,6 +1296,7 @@ def collect_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row.get("attnact", "attnact0"),
             row.get("layeract", "layeract0"),
             row.get("layergc", "layergc0"),
+            row.get("route", "route_missing"),
             row["profiler"],
             row["liger_loss"],
             row["seq_len"],
@@ -1431,6 +1443,7 @@ def collect_step_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row.get("attnact", "attnact0"),
             row.get("layeract", "layeract0"),
             row.get("layergc", "layergc0"),
+            row.get("route", "route_missing"),
             row["profiler"],
             row["liger_loss"],
             row["mode"],
@@ -1455,6 +1468,7 @@ def collect_step_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             row.get("attnact", "attnact0"),
             row.get("layeract", "layeract0"),
             row.get("layergc", "layergc0"),
+            row.get("route", "route_missing"),
             row["profiler"],
             row["liger_loss"],
             row["seq_len"],
@@ -1482,6 +1496,7 @@ def group_key(row: dict[str, Any]) -> tuple[str, ...]:
         str(row.get("attnact", "attnact0")),
         str(row.get("layeract", "layeract0")),
         str(row.get("layergc", "layergc0")),
+        str(row.get("route", "route_missing")),
         str(row["profiler"]),
         str(row.get("liger_loss", "ligerloss0")),
     )
@@ -1501,23 +1516,24 @@ def threshold_group_key(row: dict[str, Any]) -> tuple[str, ...]:
         str(row.get("attnact", "attnact0")),
         str(row.get("layeract", "layeract0")),
         str(row.get("layergc", "layergc0")),
+        str(row.get("route", "route_missing")),
         str(row["profiler"]),
         str(row.get("liger_loss", "ligerloss0")),
     )
 
 
 def varied_fields(rows: list[dict[str, Any]]) -> set[str]:
-    fields = ("workload", "precision", "batch_size", "gradient_accumulation_steps", "lora_dropout", "backend", "router_mode", "expact", "attnact", "layeract", "layergc", "profiler", "liger_loss", "mode")
+    fields = ("workload", "precision", "batch_size", "gradient_accumulation_steps", "lora_dropout", "backend", "router_mode", "expact", "attnact", "layeract", "layergc", "route", "profiler", "liger_loss", "mode")
     return {field for field in fields if len({row[field] for row in rows}) > 1}
 
 
 def varied_threshold_fields(rows: list[dict[str, Any]]) -> set[str]:
-    fields = ("workload", "precision", "batch_size", "gradient_accumulation_steps", "lora_dropout", "seq_len", "backend", "router_mode", "expact", "attnact", "layeract", "layergc", "profiler", "liger_loss", "mode")
+    fields = ("workload", "precision", "batch_size", "gradient_accumulation_steps", "lora_dropout", "seq_len", "backend", "router_mode", "expact", "attnact", "layeract", "layergc", "route", "profiler", "liger_loss", "mode")
     return {field for field in fields if len({row[field] for row in rows}) > 1}
 
 
 def combined_label(group: tuple[str, ...], mode: str, varied: set[str]) -> str:
-    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = group
+    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, route, profiler, liger_loss = group
     mode_labels = {"no_recompute": "No recompute", "recompute": "Activation recompute"}
     parts: list[str] = []
     if "workload" in varied:
@@ -1542,6 +1558,8 @@ def combined_label(group: tuple[str, ...], mode: str, varied: set[str]) -> str:
         parts.append(layeract)
     if "layergc" in varied:
         parts.append(layergc)
+    if "route" in varied:
+        parts.append(route)
     if "profiler" in varied:
         parts.append(profiler)
     if "liger_loss" in varied:
@@ -1550,11 +1568,11 @@ def combined_label(group: tuple[str, ...], mode: str, varied: set[str]) -> str:
         parts.append(mode_labels.get(mode, mode))
     if parts:
         return " / ".join(parts)
-    return f"{backend} / router={router_mode} / {expact} / {attnact} / {layeract} / {layergc} / {liger_loss} / {mode_labels.get(mode, mode)}"
+    return f"{backend} / router={router_mode} / {expact} / {attnact} / {layeract} / {layergc} / {route} / {liger_loss} / {mode_labels.get(mode, mode)}"
 
 
 def combined_threshold_label(group: tuple[str, ...], mode: str, varied: set[str]) -> str:
-    workload, precision, batch_size, grad_accum, lora_dropout, seq_len, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = group
+    workload, precision, batch_size, grad_accum, lora_dropout, seq_len, backend, router_mode, expact, attnact, layeract, layergc, route, profiler, liger_loss = group
     mode_labels = {"no_recompute": "No layer recompute", "recompute": "Layer recompute"}
     parts: list[str] = []
     if "workload" in varied:
@@ -1581,6 +1599,8 @@ def combined_threshold_label(group: tuple[str, ...], mode: str, varied: set[str]
         parts.append(layeract)
     if "layergc" in varied:
         parts.append(layergc)
+    if "route" in varied:
+        parts.append(route)
     if "profiler" in varied:
         parts.append(profiler)
     if "liger_loss" in varied:
@@ -1589,7 +1609,7 @@ def combined_threshold_label(group: tuple[str, ...], mode: str, varied: set[str]
         parts.append(mode_labels.get(mode, mode))
     if parts:
         return " / ".join(parts)
-    return f"s{seq_len} / {backend} / router={router_mode} / {expact} / {attnact} / {layeract} / {layergc} / {liger_loss} / {mode_labels.get(mode, mode)}"
+    return f"s{seq_len} / {backend} / router={router_mode} / {expact} / {attnact} / {layeract} / {layergc} / {route} / {liger_loss} / {mode_labels.get(mode, mode)}"
 
 
 def write_table(rows: list[dict[str, Any]], output_dir: Path, name: str) -> None:
@@ -2704,9 +2724,9 @@ def plot_combined_policy_metric(
 
 
 def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, ...]) -> None:
-    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = key
+    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, route, profiler, liger_loss = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, grad accum {grad_accum}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}, {layeract}, {layergc}, {liger_loss}"
+    suffix = f", batch size {batch_size}, grad accum {grad_accum}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}, {layeract}, {layergc}, {route}, {liger_loss}"
     plot_paired_metric(
         rows,
         output_dir,
@@ -2758,9 +2778,9 @@ def write_group_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[s
 def write_group_step_plots(rows: list[dict[str, Any]], output_dir: Path, key: tuple[str, ...]) -> None:
     if not rows:
         return
-    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = key
+    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, route, profiler, liger_loss = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, grad accum {grad_accum}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}, {layeract}, {layergc}, {liger_loss}"
+    suffix = f", batch size {batch_size}, grad accum {grad_accum}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}, {layeract}, {layergc}, {route}, {liger_loss}"
     write_table(rows, output_dir, "step_samples")
     plot_paired_step_metric(
         rows,
@@ -2801,9 +2821,9 @@ def write_group_threshold_plots(
     key: tuple[str, ...],
     seq_len: int,
 ) -> None:
-    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = key
+    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, route, profiler, liger_loss = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, grad accum {grad_accum}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}, {layeract}, {layergc}, {liger_loss}"
+    suffix = f", batch size {batch_size}, grad accum {grad_accum}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}, {layeract}, {layergc}, {route}, {liger_loss}"
     plot_paired_threshold_metric(
         rows,
         output_dir,
@@ -2859,9 +2879,9 @@ def write_group_policy_plots(
     seq_len: int,
     family: str,
 ) -> None:
-    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = key
+    workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, route, profiler, liger_loss = key
     title_base = f"{workload} LoRA SFT"
-    suffix = f", batch size {batch_size}, grad accum {grad_accum}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}, {layeract}, {layergc}, {liger_loss}"
+    suffix = f", batch size {batch_size}, grad accum {grad_accum}, seq {seq_len}, {dropout_label(lora_dropout)}, {precision}, {backend}/{profiler}, router={router_mode}, {expact}, {attnact}, {layeract}, {layergc}, {route}, {liger_loss}"
     name = policy_filename_suffix(family)
     title = {
         "tok": "expert token threshold",
@@ -3212,12 +3232,12 @@ def main() -> None:
         for key in sorted(group_keys):
             group_rows = groups.get(key, [])
             group_step_rows = step_groups.get(key, [])
-            workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = key
+            workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, route, profiler, liger_loss = key
             if args.skip_combined:
                 group_dir = root
             else:
                 group_dir = root / safe_label(
-                    f"{workload}-b{batch_size}-ga{grad_accum}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}-{layeract}-{layergc}-{liger_loss}"
+                    f"{workload}-b{batch_size}-ga{grad_accum}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}-{layeract}-{layergc}-{route}-{liger_loss}"
                 )
             if group_rows:
                 write_table(group_rows, group_dir, "sweep_summary")
@@ -3242,12 +3262,12 @@ def main() -> None:
             raise SystemExit("--skip-combined expects one timing policy group; use --combined-only for multi-group metric roots")
         suffix = policy_filename_suffix(family)
         for (key, seq_len), group_rows in sorted(family_groups.items()):
-            workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, profiler, liger_loss = key
+            workload, precision, batch_size, grad_accum, lora_dropout, backend, router_mode, expact, attnact, layeract, layergc, route, profiler, liger_loss = key
             if args.skip_combined:
                 group_dir = root
             else:
                 group_dir = root / safe_label(
-                    f"{workload}-b{batch_size}-ga{grad_accum}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}-{layeract}-{layergc}-{liger_loss}"
+                    f"{workload}-b{batch_size}-ga{grad_accum}-{dropout_label(lora_dropout)}-{precision}-{backend}-{profiler}-router{router_mode}-{expact}-{attnact}-{layeract}-{layergc}-{route}-{liger_loss}"
                 )
             write_table(group_rows, group_dir, f"{suffix}_summary_s{seq_len}")
             write_group_policy_plots(group_rows, group_dir, key, seq_len, family)

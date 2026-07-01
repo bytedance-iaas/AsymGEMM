@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Show LF source-profile timing + memory metrics as one table per model/LoRA config.
 
-Same layout as show_status.py, but each row reports the measured numbers:
+Each row reports:
     Workload | Backend | Config |
     fwd_s | bwd_s | opt_s | step_s |          # seconds
     fwd_H | bwd_H | step_H |                   # GPU HBM peak GiB
@@ -14,10 +14,10 @@ remain. step_s is always computed as fwd_s + bwd_s + opt_s from those same
 averages. The script does not fall back to alternate fields; completed profiles
 missing required raw fields are treated as malformed and abort the report.
 
-The Config column carries a compact "[lg± sd±]" tag for liger-loss / sdpa-recompute
-usage (+ on, - off). Numbers are printed as x.x (1 decimal) to keep the table narrow.
-Configs that did not produce a profile (OOM / failed / not run) show a status marker
-in the first timing column.
+The Config column carries the Qwen3 MoE route tag plus compact "[lg± sd±]" usage
+for liger-loss / sdpa-recompute (+ on, - off). Numbers are printed as x.x
+(1 decimal) to keep the table narrow. Configs that did not produce a profile
+(OOM / failed / not run) show a status marker in the first timing column.
 
 Usage:
     show_metrics.py [PROFILING_DIR]      # default profiling_both
@@ -27,17 +27,124 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import signal
 import sys
+import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import show_status as S  # noqa: E402  (shared parsing: config_label, _tok, REPO, SKIP_DIRS)
-
 GIB = 1024 ** 3
+REPO = Path(__file__).resolve().parents[2]
+SKIP_DIRS = {"combined", "metrics", "memory_combined", "c2c_combined", "utilization_combined", "throughput_combined"}
+OOM_GPU_MARKERS = ("CUDA out of memory", "OutOfMemoryError")
+OOM_HOST_MARKERS = (
+    "HOST_OOM_EVIDENCE=true",
+    "Out of memory: Killed process",
+    "Memory cgroup out of memory",
+    "cgroup out of memory",
+)
+CONFIG_ORDER = [
+    "none (no offload)", "none+expert-offload", "none+exp+attn-offload",
+    "none+exp+attn-offload+layerGC", "GC-experts", "GC-attn+experts", "GC-layer",
+]
 
 
 class MetricError(RuntimeError):
     pass
+
+
+def config_label(policy: str, expact: bool, attnact: bool, layeract: bool, layergc: bool, sdparecomp: bool = False) -> str:
+    sdpa = "+SDPArecomp" if sdparecomp else ""
+    gc_map = {"gc-exp": "GC-experts", "gc-attn-exp": "GC-attn+experts", "gc-layer": "GC-layer"}
+    if policy in gc_map:
+        return gc_map[policy] + sdpa
+    if policy and policy != "none":
+        return policy + sdpa
+    offs = [n for n, on in (("exp", expact), ("attn", attnact), ("layer", layeract)) if on]
+    if not offs:
+        label = "none (no offload)"
+    elif offs == ["exp"]:
+        label = "none+expert-offload"
+    else:
+        label = "none+" + "+".join(offs) + "-offload"
+    if layergc:
+        label += "+layerGC" if offs else " (layerGC)"
+    return label + sdpa
+
+
+def _tok(tokens: list[str], prefix: str, default: str = "") -> str:
+    for token in tokens:
+        if token.startswith(prefix):
+            return token[len(prefix):]
+    return default
+
+
+def route_token(tokens: list[str], default: str = "route_missing") -> str:
+    for token in tokens:
+        if token.startswith("route") and not token.startswith("router"):
+            return token
+    return default
+
+
+def _failure_codes(text: str) -> list[int]:
+    codes: list[int] = []
+    for pattern in (
+        r"Training command failed with status\s+(-?\d+)",
+        r"failed with status\s+(-?\d+)",
+        r"exitcode\s*[:=]\s*(-?\d+)",
+    ):
+        for match in re.findall(pattern, text):
+            try:
+                codes.append(int(match))
+            except ValueError:
+                pass
+    return codes
+
+
+def _signal_status(code: int) -> str | None:
+    sig = None
+    if code >= 128:
+        sig = code - 128
+    elif code < 0:
+        sig = -code
+    if sig is None:
+        return None
+    try:
+        name = signal.Signals(sig).name
+    except ValueError:
+        name = f"SIG{sig}"
+    return f"{name}/{code}"
+
+
+def classify(leaf: Path | None) -> tuple[str, float]:
+    if leaf is None:
+        return "NOT RUN", 0.0
+    if (leaf / "profile.json").exists():
+        return "OK", (leaf / "profile.json").stat().st_mtime
+    log = leaf / "train.log"
+    if not log.exists():
+        return "NOT RUN", 0.0
+    mtime = log.stat().st_mtime
+    try:
+        size = log.stat().st_size
+        with open(log, "r", errors="ignore") as handle:
+            if size > 2_000_000:
+                handle.seek(size - 2_000_000)
+            text = handle.read()
+    except OSError:
+        text = ""
+    if any(marker in text for marker in OOM_GPU_MARKERS):
+        return "OOM (GPU)", mtime
+    if any(marker in text for marker in OOM_HOST_MARKERS):
+        return "OOM (host RAM)", mtime
+    for code in reversed(_failure_codes(text)):
+        signal_status = _signal_status(code)
+        if signal_status is not None:
+            return signal_status, mtime
+    if any(marker in text for marker in ("Training command failed", "Traceback", "ChildFailedError", "failed with status")):
+        return "FAILED (non-OOM)", mtime
+    if time.time() - mtime < 600:
+        return "RUNNING", mtime
+    return "INCOMPLETE", mtime
 
 
 def _require(condition: bool, leaf: Path, message: str) -> None:
@@ -128,7 +235,7 @@ def collect_leaves(root: Path) -> dict:
     """Return {logical_key: leaf_path} for the run with the most max_steps (ties: newest)."""
     runs: dict[tuple, dict] = {}
     for dataset_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-        for cr in sorted(p for p in dataset_dir.iterdir() if p.is_dir() and p.name not in S.SKIP_DIRS):
+        for cr in sorted(p for p in dataset_dir.iterdir() if p.is_dir() and p.name not in SKIP_DIRS):
             model = cr.name.split("__gpus")[0]
             m = re.search(r"b(\d+)_s(\d+)_ga(\d+)", cr.name)
             if not model or not m:
@@ -141,19 +248,20 @@ def collect_leaves(root: Path) -> dict:
                 toks = rd.name.split("__")
                 if len(toks) < 3 or toks[1] not in ("nsys", "source"):
                     continue
-                config = S.config_label(
-                    S._tok(toks, "pol"),
-                    S._tok(toks, "expact", "0") == "1",
-                    S._tok(toks, "attnact", "0") == "1",
-                    S._tok(toks, "layeract", "0") == "1",
-                    S._tok(toks, "layergc", "0") == "1",
+                config = config_label(
+                    _tok(toks, "pol"),
+                    _tok(toks, "expact", "0") == "1",
+                    _tok(toks, "attnact", "0") == "1",
+                    _tok(toks, "layeract", "0") == "1",
+                    _tok(toks, "layergc", "0") == "1",
                 )
                 config = config.replace("layer-offload", "layerOF")  # compact label
                 # Compact liger / sdpa-recompute usage tag (replaces config_label's long
                 # "+SDPArecomp"): [lg± sd±], + on / - off.
-                liger_on = S._tok(toks, "ligerloss", "0") == "1"
-                sdpa_on = S._tok(toks, "sdparecomp", "0") == "1"
-                config += f"  [lg{'+' if liger_on else '-'} sd{'+' if sdpa_on else '-'}]"
+                liger_on = _tok(toks, "ligerloss", "0") == "1"
+                sdpa_on = _tok(toks, "sdparecomp", "0") == "1"
+                route = route_token(toks)
+                config += f"  {route} [lg{'+' if liger_on else '-'} sd{'+' if sdpa_on else '-'}]"
                 leaf = next((p for p in rd.iterdir() if p.is_dir() and p.name.startswith("b")), None)
                 if leaf is None:
                     continue
@@ -185,7 +293,7 @@ NUM_KEYS = ["fwd_s", "bwd_s", "opt_s", "step_s", "fwd_g", "bwd_g", "step_g", "ra
 # Start from the shared semantic order, then slot the layer-offload family (renamed
 # "layerOF") right after its exp+attn+layerGC sibling so the "none+exp+attn..." configs
 # stay adjacent instead of the unranked layerOF falling to the end of the backend group.
-_CFG_ORDER = list(S.CONFIG_ORDER)
+_CFG_ORDER = list(CONFIG_ORDER)
 _anchor = "none+exp+attn-offload+layerGC"
 if _anchor in _CFG_ORDER:
     _CFG_ORDER.insert(_CFG_ORDER.index(_anchor) + 1, "none+exp+attn+layerOF")
@@ -194,6 +302,10 @@ MARKER = {  # shown (in the first metric column) for configs with no metrics
     "OOM (GPU)": "🔴", "OOM (host RAM)": "🟠", "FAILED (non-OOM)": "⚠️",
     "RUNNING": "🔵", "INCOMPLETE": "·", "NOT RUN": "—",
 }
+
+
+def base_config_label(config: str) -> str:
+    return config.split("  route", 1)[0].split("  [", 1)[0]
 
 
 def status_marker(status: str) -> str:
@@ -217,7 +329,7 @@ def main() -> None:
     args = ap.parse_args()
     root = Path(args.root)
     if not root.is_absolute():
-        root = S.REPO / args.root
+        root = REPO / args.root
     if not root.is_dir():
         sys.exit(f"show_metrics: not a directory: {root}")
 
@@ -233,7 +345,7 @@ def main() -> None:
         if metrics is not None:
             nums = [fmt(metrics.get(k)) for k in NUM_KEYS]
         else:
-            status = S.classify(leaf)[0] if leaf is not None else "NOT RUN"
+            status = classify(leaf)[0] if leaf is not None else "NOT RUN"
             nums = [status_marker(status)] + [""] * (len(NUM_KEYS) - 1)
         cells = [wl, be, config] + nums
         by_group.setdefault((model, lora), []).append((seq, batch, be, config, cells))
@@ -245,10 +357,9 @@ def main() -> None:
           " (strict fields: forward_milliseconds, backward_milliseconds, optimizer_milliseconds;"
           " step_s = fwd_s + bwd_s + opt_s)"
           " | _H GPU HBM peak GiB | RAM host RSS peak GiB (whole step)"
-          " | Config [lg± sd±] = liger / sdpa-recompute on(+)/off(-)\n")
+          " | Config routeXYZ_loraN_accTYPE [lg± sd±] = routed kernels / liger / sdpa-recompute\n")
     for model, lora in sorted(by_group):
-        # Rank on the base config label (strip the trailing "  [lg± sd±]" usage tag).
-        recs = sorted(by_group[(model, lora)], key=lambda r: (r[0], r[1], r[2], CFG_RANK.get(r[3].split("  [")[0], 99), r[3]))
+        recs = sorted(by_group[(model, lora)], key=lambda r: (r[0], r[1], r[2], CFG_RANK.get(base_config_label(r[3]), 99), r[3]))
         data = [r[4] for r in recs]
         w = [max(len(HEAD[i]), max((len(d[i]) for d in data), default=0)) for i in range(len(HEAD))]
         just = lambda i, s: s.ljust(w[i]) if i < 3 else s.rjust(w[i])  # text left, numbers right
