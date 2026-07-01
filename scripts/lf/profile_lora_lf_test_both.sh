@@ -26,7 +26,10 @@ GPU_POOL=${GPU_POOL:-3}
 # Models use the M shorthand. To override the default list from the environment, pass:
 #   RUNS='q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false || q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true'
 #   backend  : asym_cpuadamwds | zero3_offload | zero3_offload_mem | zero3_offload_opnvme | zero3_offload_panvme | zero3_offload_mem_opnvme | zero3_offload_mem_panvme | superoffload | superoffload_mem | superoffload_mem_opnvme | superoffload_mem_panvme
-#   recompute: recomp | norecomp | unsloth        liger: ligerloss0 | ligerloss1
+#   recompute: recomp | norecomp | unsloth | unsloth-off | recomp-off-full-fg
+#              recomp-off-full-fg artifacts are labeled recomp-off-full-fg-kerXYZ from the effective routed-kernel bits.
+#              Dense/non-routed runs use ker000; Qwen3-30B-A3B MoE auto-default is ker101 unless route env vars override it.
+#   liger    : ligerloss0 | ligerloss1
 #   policy   : none|false|false|false|false|false (off)  |  none|true|true|false|true|true (offload+gc)
 declare -A M=(
   # MoE                                          (key = family-version + total size + active size)
@@ -562,6 +565,22 @@ qwen3_route_tag() {
     "$(qwen3_route_bool "${dx}")" \
     "$(qwen3_route_bool "${lora}")" \
     "$(safe_label "${accum}")"
+}
+
+qwen3_route_kernel_code() {
+  local fwd="$1" gather="$2" dx="$3"
+  printf '%s%s%s\n' \
+    "$(qwen3_route_bool "${fwd}")" \
+    "$(qwen3_route_bool "${gather}")" \
+    "$(qwen3_route_bool "${dx}")"
+}
+
+recompute_run_label() {
+  local recompute="$1" kernel_code="${2:-000}"
+  case "${recompute}" in
+    recomp-off-full-fg) printf '%s-ker%s\n' "${recompute}" "${kernel_code}" ;;
+    *) printf '%s\n' "${recompute}" ;;
+  esac
 }
 
 qwen3_route_any_enabled() {
@@ -2860,7 +2879,7 @@ run_job() {
   local ASYMM_QWEN3_MOE_ROUTE_LORA="${ASYMM_QWEN3_MOE_ROUTE_LORA:-0}"
   local ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE="${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE:-fp32}"
   local ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG="${ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG:-0}"
-  local q3rt_fwd_flag q3rt_gather_flag q3rt_dx_flag q3rt_lora_flag
+  local q3rt_fwd_flag q3rt_gather_flag q3rt_dx_flag q3rt_lora_flag q3rt_kernel_code recompute_artifact_label
   local ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU:-1}"
   local ASYMM_MLP_RECOMPUTE_CHUNK="${ASYMM_MLP_RECOMPUTE_CHUNK:-0}"
   local requested_policy_tuple="${expert_policy}|${ASYMM_EXPERT_ACT_OFFLOAD}|${ASYMM_ATTN_ACT_OFFLOAD}|${ASYMM_LAYER_ACT_OFFLOAD}|${ASYMM_LAYER_GC}|${ASYMM_ATTN_SDPA_RECOMPUTE}"
@@ -2950,7 +2969,7 @@ run_job() {
   fi
   if qwen3_moe_routed_auto_default "${backend}" "${recomp_off_stage}" "${current_model_name}" "${ASYMM_EXPERT_ACT_OFFLOAD}"; then
     ASYMM_QWEN3_MOE_ROUTE_FWD_SCATTER="${ASYMM_QWEN3_MOE_ROUTE_FWD_SCATTER:-1}"
-    ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER="${ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER:-1}"
+    ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER="${ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER:-0}"
     ASYMM_QWEN3_MOE_ROUTE_GATEUP_DX_SCATTER="${ASYMM_QWEN3_MOE_ROUTE_GATEUP_DX_SCATTER:-1}"
     ASYMM_QWEN3_MOE_ROUTE_LORA="${ASYMM_QWEN3_MOE_ROUTE_LORA:-0}"
     ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE="${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE:-fp32}"
@@ -2961,6 +2980,8 @@ run_job() {
   q3rt_dx_flag="$(qwen3_route_effective_flag ASYMM_QWEN3_MOE_ROUTE_GATEUP_DX_SCATTER)"
   q3rt_lora_flag="$(qwen3_route_bool "${ASYMM_QWEN3_MOE_ROUTE_LORA}")"
   q3rt_label="$(qwen3_route_tag "${q3rt_fwd_flag}" "${q3rt_gather_flag}" "${q3rt_dx_flag}" "${q3rt_lora_flag}" "${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE}")"
+  q3rt_kernel_code="$(qwen3_route_kernel_code "${q3rt_fwd_flag}" "${q3rt_gather_flag}" "${q3rt_dx_flag}")"
+  recompute_artifact_label="$(recompute_run_label "${recompute}" "${q3rt_kernel_code}")"
   if qwen3_route_any_enabled "${q3rt_fwd_flag}" "${q3rt_gather_flag}" "${q3rt_dx_flag}" "${q3rt_lora_flag}"; then
     [[ "${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE,,}" == "fp32" ]] || die "Qwen3 routed kernels currently require ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE=fp32, got '${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE}'"
     [[ "${backend}" == asym* ]] || die "Qwen3 routed kernels are only valid for asym* backends, got backend='${backend}'"
@@ -2991,14 +3012,14 @@ run_job() {
   local source_materialized_job_root="" source_materialized_seq_root="" source_materialized_profile_json="" source_materialized_source_profile="" source_materialized_log_file=""
   local kt_arm_source_ok_profile_json=""
   config_root="$(config_root_path "${seq_len}")"
-  job_root="$(job_root_path "${config_root}" "${backend}" "${run_profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${grad_offload}" "${weight_offload}")"
+  job_root="$(job_root_path "${config_root}" "${backend}" "${run_profiler}" "${recompute_artifact_label}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${grad_offload}" "${weight_offload}")"
   run_dir_name="$(workload_run_dir_name "${seq_len}")"
   seq_root="${job_root}/${run_dir_name}"
   source_profile="${seq_root}/source_profile.json"
   lf_out="${seq_root}/lf_run"
   log_file="${seq_root}/train.log"
   if [[ "${materialize_source_from_nsys}" == "true" ]]; then
-    source_materialized_job_root="$(job_root_path "${config_root}" "${backend}" "source" "${recompute}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${grad_offload}" "${weight_offload}")"
+    source_materialized_job_root="$(job_root_path "${config_root}" "${backend}" "source" "${recompute_artifact_label}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${grad_offload}" "${weight_offload}")"
     source_materialized_seq_root="${source_materialized_job_root}/${run_dir_name}"
     source_materialized_source_profile="${source_materialized_seq_root}/source_profile.json"
     source_materialized_profile_json="${source_materialized_seq_root}/profile.json"
@@ -3012,7 +3033,7 @@ run_job() {
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
     grad_offload_run_label="_gradoff${grad_offload}_weightoff${weight_offload}"
   fi
-  run_id="lf_${backend}_${run_profiler}_${recompute}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${layergc_label}_${sdparecomp_label}_${expact_lora_a_fwd_label}_${actrecomp_label}_${xunpack_label}_${moefg_label}_${dscatter_label}_${q3rt_label}_${liger_loss}${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${lora_dropout_label_value}"
+  run_id="lf_${backend}_${run_profiler}_${recompute_artifact_label}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${layergc_label}_${sdparecomp_label}_${expact_lora_a_fwd_label}_${actrecomp_label}_${xunpack_label}_${moefg_label}_${dscatter_label}_${q3rt_label}_${liger_loss}${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
   local run_log_payload
   run_log_payload="${_M_REV[${current_model_name}]:-${current_model_name}} ; ${backend}|${recompute}|${liger_loss} ; ${seq_len}|${PER_DEVICE_TRAIN_BATCH_SIZE}|${GRADIENT_ACCUMULATION_STEPS} ; ${effective_policy_tuple} ; lora=${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|${LORA_TARGET}"
@@ -3261,6 +3282,7 @@ run_job() {
     MASTER_PORT="${master_port}"
     ASYM_GEMM_LF_CONFIG_ASYM_STRICT="${ASYM_STRICT}"
     ASYM_GEMM_LF_CONFIG_LIGER_LOSS="${liger_loss}"
+    ASYM_GEMM_LF_CONFIG_RECOMP_LABEL="${recompute_artifact_label}"
     ASYM_GEMM_LF_CONFIG_RECOMP_OFF_STAGE="${recomp_off_stage}"
     ASYM_GEMM_LF_CONFIG_USE_UNSLOTH_GC="${use_unsloth_gc}"
     ASYM_GEMM_LF_CONFIG_UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU="${unsloth_recompute_save_on_cpu}"
@@ -3282,6 +3304,7 @@ run_job() {
 	    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_ROUTE_GATEUP_DX_SCATTER="${q3rt_dx_flag}"
 	    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_ROUTE_LORA="${q3rt_lora_flag}"
 	    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE="${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE}"
+	    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_ROUTE_KERNEL_CODE="${q3rt_kernel_code}"
 	    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG="${ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG}"
 	    ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}"
@@ -3345,7 +3368,7 @@ run_job() {
   local -a run_cmd=(env)
   run_cmd+=("${run_env[@]}" "${RUN_LF_SCRIPT}")
 
-  echo "Running backend=${backend} profiler=${profiler} run_profiler=${run_profiler} recompute=${recompute} liger_loss=${liger_loss} expert_policy=${expert_policy} router_mode=${router_mode} grad_offload=${grad_offload} qwen_expert_lora_impl=${lf_expert_lora_impl} lora_a_fwd=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD} ${expact_label} ${attnact_label} ${layeract_label} ${layergc_label} ${expact_lora_a_fwd_label} ${q3rt_label} seq=${seq_len} batch=${PER_DEVICE_TRAIN_BATCH_SIZE} grad_accum=${GRADIENT_ACCUMULATION_STEPS} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
+  echo "Running backend=${backend} profiler=${profiler} run_profiler=${run_profiler} recompute=${recompute} recompute_label=${recompute_artifact_label} liger_loss=${liger_loss} expert_policy=${expert_policy} router_mode=${router_mode} grad_offload=${grad_offload} qwen_expert_lora_impl=${lf_expert_lora_impl} lora_a_fwd=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD} ${expact_label} ${attnact_label} ${layeract_label} ${layergc_label} ${expact_lora_a_fwd_label} ${q3rt_label} seq=${seq_len} batch=${PER_DEVICE_TRAIN_BATCH_SIZE} grad_accum=${GRADIENT_ACCUMULATION_STEPS} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
   echo "  dir=${seq_root}"
   if [[ "${materialize_source_from_nsys}" == "true" ]]; then
     echo "  source_dir=${source_materialized_seq_root}"
