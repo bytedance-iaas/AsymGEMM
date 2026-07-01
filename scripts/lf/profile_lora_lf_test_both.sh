@@ -26,8 +26,8 @@ GPU_POOL=${GPU_POOL:-3}
 # Models use the M shorthand. To override the default list from the environment, pass:
 #   RUNS='q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false || q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true'
 #   backend  : asym_cpuadamwds | zero3_offload | zero3_offload_mem | zero3_offload_opnvme | zero3_offload_panvme | zero3_offload_mem_opnvme | zero3_offload_mem_panvme | superoffload | superoffload_mem | superoffload_mem_opnvme | superoffload_mem_panvme
-#   recompute: recomp | norecomp | unsloth | unsloth-off | recomp-off-full-fg
-#              recomp-off-full-fg artifacts are labeled recomp-off-full-fg-kerXYZ from the effective routed-kernel bits.
+#   recompute: recomp | norecomp | unsloth | unsloth-off | recomp-off-full-fg | recomp-off-full-fg-kerXYZ
+#              recomp-off-full-fg-kerXYZ pins the effective routed-kernel bits in the run spec.
 #              Dense/non-routed runs use ker000; Qwen3-30B-A3B MoE auto-default is ker101 unless route env vars override it.
 #   liger    : ligerloss0 | ligerloss1
 #   policy   : none|false|false|false|false|false (off)  |  none|true|true|false|true|true (offload+gc)
@@ -40,6 +40,7 @@ declare -A M=(
   [llama4-scout]="meta-llama/Llama-4-Scout-17B-16E"
   # dense
   [q3-32b]="Qwen/Qwen3-32B"
+  [q3.5-27b]="Qwen/Qwen3.5-27B"
   [q2.5-32b]="Qwen/Qwen2.5-32B-Instruct"
   [q2.5-72b]="Qwen/Qwen2.5-72B-Instruct"
   [llama3.3-70b]="meta-llama/Llama-3.3-70B-Instruct"
@@ -84,6 +85,7 @@ else
     # "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
     # "q2.5-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 55k
     # "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # G-OOM 45k
+    
 
     # "q3-30b-a3b|1 ; superoffload_mem|recomp|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 50k
     # "q3-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # G-OOM 25k
@@ -598,6 +600,24 @@ is_qwen3_moe_routed_model() {
   esac
 }
 
+is_known_dense_recompute_model() {
+  case "$1" in
+    *"Qwen3-32B"*|*"Qwen3.5-27B"*|*"Qwen2.5-32B"*|*"Qwen2.5-72B"*|*"Llama-3.3-70B"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_recompute_kernel_for_model() {
+  local model="$1" kernel_code="$2" lora_flag="${3:-0}"
+  if is_known_dense_recompute_model "${model}" &&
+    [[ "${kernel_code}" != "000" || "$(qwen3_route_bool "${lora_flag}")" != "0" ]]; then
+    die "dense model '${model}' cannot use Qwen3 MoE routed kernels; use recomp-off-full-fg-ker000 with route000_lora0 (got kernel_code=${kernel_code}, lora=$(qwen3_route_bool "${lora_flag}"))"
+  fi
+  if [[ "${kernel_code}" != "000" ]] && ! is_qwen3_moe_routed_model "${model}"; then
+    die "recomp-off-full-fg-ker${kernel_code} is only supported for Qwen3-30B-A3B routed MoE; dense/non-routed model '${model}' must use recomp-off-full-fg-ker000"
+  fi
+}
+
 qwen3_moe_routed_auto_default() {
   local backend="$1" recomp_stage="$2" model="$3" expert_act="$4"
   [[ "${backend}" == asym* ]] || return 1
@@ -836,7 +856,26 @@ canonicalize_policy_axis_for_inert_run() {
   ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=0; dscatter_label="$(dscatter_tag 0)"
 }
 
+recompute_kernel_code_label() {
+  local norm="${1,,}"
+  norm="${norm//_/-}"
+  case "${norm}" in
+    recomp-off-full-fg-ker[01][01][01]|recompoff-full-fg-ker[01][01][01])
+      printf '%s\n' "${norm: -3}"
+      ;;
+    recomp-off-full-fg-ker*|recompoff-full-fg-ker*)
+      die "expected recomp-off-full-fg-kerXYZ with X/Y/Z in {0,1}, got '${1}'"
+      ;;
+  esac
+}
+
 recompute_label() {
+  local kernel_code
+  kernel_code="$(recompute_kernel_code_label "$1")"
+  if [[ -n "${kernel_code}" ]]; then
+    printf 'recomp-off-full-fg\n'
+    return
+  fi
   case "${1,,}" in
     norecomp|recomp|unsloth|unsloth-off) printf '%s\n' "${1,,}" ;;
     unslothgc|unsloth_gc|unsloth-gc) printf 'unsloth\n' ;;
@@ -893,7 +932,7 @@ router_mode_label() {
 
 append_backend_spec() {
   local raw="$1"
-  local backend_part recompute_part liger_loss_part backend recompute_token recompute_mode liger_loss
+  local backend_part recompute_part liger_loss_part backend recompute_token recompute_mode recompute_kernel_code liger_loss
   local pipe_chars
   local -a recompute_tokens
 
@@ -949,7 +988,12 @@ append_backend_spec() {
       continue
     fi
     recompute_mode="$(recompute_label "${recompute_token}")"
-    backend_specs_raw+=("${backend}|${recompute_mode}|${liger_loss}")
+    recompute_kernel_code="$(recompute_kernel_code_label "${recompute_token}")"
+    if [[ -n "${recompute_kernel_code}" ]]; then
+      backend_specs_raw+=("${backend}|${recompute_mode}|${liger_loss}|${recompute_kernel_code}")
+    else
+      backend_specs_raw+=("${backend}|${recompute_mode}|${liger_loss}")
+    fi
   done
 }
 
@@ -2866,6 +2910,7 @@ run_job() {
   local lf_expert_lora_impl="${11}"
   local grad_offload="${12:-false}"
   local weight_offload="${13:-false}"
+  local requested_recompute_kernel_code="${14:-}"
   # Canonicalize the policy axes for inert runs; local shadows feed run_id, the folder, the env, and the check.
   local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" sdparecomp_label="${sdparecomp_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}" moefg_label="${moefg_label}" dscatter_label="${dscatter_label}" q3rt_label="${q3rt_label}"
   local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_LAYER_GC="${ASYMM_LAYER_GC}" ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
@@ -2967,7 +3012,13 @@ run_job() {
         ;;
     esac
   fi
-  if qwen3_moe_routed_auto_default "${backend}" "${recomp_off_stage}" "${current_model_name}" "${ASYMM_EXPERT_ACT_OFFLOAD}"; then
+  if [[ -n "${requested_recompute_kernel_code}" ]]; then
+    ASYMM_QWEN3_MOE_ROUTE_FWD_SCATTER="${requested_recompute_kernel_code:0:1}"
+    ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER="${requested_recompute_kernel_code:1:1}"
+    ASYMM_QWEN3_MOE_ROUTE_GATEUP_DX_SCATTER="${requested_recompute_kernel_code:2:1}"
+    ASYMM_QWEN3_MOE_ROUTE_LORA="${ASYMM_QWEN3_MOE_ROUTE_LORA:-0}"
+    ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE="${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE:-fp32}"
+  elif qwen3_moe_routed_auto_default "${backend}" "${recomp_off_stage}" "${current_model_name}" "${ASYMM_EXPERT_ACT_OFFLOAD}"; then
     ASYMM_QWEN3_MOE_ROUTE_FWD_SCATTER="${ASYMM_QWEN3_MOE_ROUTE_FWD_SCATTER:-1}"
     ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER="${ASYMM_QWEN3_MOE_ROUTE_DOWN_DX_GATHER:-0}"
     ASYMM_QWEN3_MOE_ROUTE_GATEUP_DX_SCATTER="${ASYMM_QWEN3_MOE_ROUTE_GATEUP_DX_SCATTER:-1}"
@@ -2981,6 +3032,7 @@ run_job() {
   q3rt_lora_flag="$(qwen3_route_bool "${ASYMM_QWEN3_MOE_ROUTE_LORA}")"
   q3rt_label="$(qwen3_route_tag "${q3rt_fwd_flag}" "${q3rt_gather_flag}" "${q3rt_dx_flag}" "${q3rt_lora_flag}" "${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE}")"
   q3rt_kernel_code="$(qwen3_route_kernel_code "${q3rt_fwd_flag}" "${q3rt_gather_flag}" "${q3rt_dx_flag}")"
+  validate_recompute_kernel_for_model "${current_model_name}" "${q3rt_kernel_code}" "${q3rt_lora_flag}"
   recompute_artifact_label="$(recompute_run_label "${recompute}" "${q3rt_kernel_code}")"
   if qwen3_route_any_enabled "${q3rt_fwd_flag}" "${q3rt_gather_flag}" "${q3rt_dx_flag}" "${q3rt_lora_flag}"; then
     [[ "${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE,,}" == "fp32" ]] || die "Qwen3 routed kernels currently require ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE=fp32, got '${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE}'"
@@ -3996,7 +4048,7 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
         layergc_label="$(layergc_tag "${ASYMM_LAYER_GC}")"
         sdparecomp_label="$(sdparecomp_tag "${ASYMM_ATTN_SDPA_RECOMPUTE}")"
 
-        IFS='|' read -r backend recompute liger_loss backend_spec_extra <<< "${backend_recompute}"
+        IFS='|' read -r backend recompute liger_loss recompute_kernel_code backend_spec_extra <<< "${backend_recompute}"
         [[ -n "${backend}" && -n "${recompute}" && -n "${liger_loss}" && -z "${backend_spec_extra:-}" ]] || die "internal error: malformed normalized backend spec '${backend_recompute}'"
         if { is_policy_independent_backend "${backend}" || [[ "${recompute}" == "recomp" ]]; } && [[ "${exp_act_policy_pair}" != "${exp_act_policy_pairs[0]}" ]]; then
           if [[ "${expert_policy}" != "off-layer" && "${ASYMM_EXPERT_ACT_OFFLOAD}" != "true" && "${ASYMM_ATTN_ACT_OFFLOAD}" != "true" && "${ASYMM_LAYER_GC}" != "true" ]]; then
@@ -4048,7 +4100,7 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
                 if [[ "${weight_offload}" == "true" && "${grad_offload}" != "true" ]]; then
                   die "internal error: weight offload requires grad offload"
                 fi
-                if ! run_job "${backend}" "${profiler}" "${recompute}" "${liger_loss}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}" "${lf_expert_lora_impl}" "${grad_offload}" "${weight_offload}"; then
+                if ! run_job "${backend}" "${profiler}" "${recompute}" "${liger_loss}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}" "${lf_expert_lora_impl}" "${grad_offload}" "${weight_offload}" "${recompute_kernel_code:-}"; then
                   failures=$((failures + 1))
                   if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
                     exit 1
