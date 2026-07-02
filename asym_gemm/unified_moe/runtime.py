@@ -254,6 +254,11 @@ class Layer:
         cached_slot[:n] = torch.arange(n, dtype=torch.int64, device=dev)
         self.cached_slot = cached_slot
         self.cache_n = n
+        # Constant expert list (+ sentinel) for the fully-cached any-T path.
+        self._experts_all = torch.cat((
+            torch.arange(s.num_experts, dtype=torch.int32, device=dev),
+            torch.tensor([-1], dtype=torch.int32, device=dev),
+        ))
 
     def _cached_gpu_decode(
         self,
@@ -355,6 +360,81 @@ class Layer:
         w = route_w.reshape(-1) * valid.to(torch.float32)
         y_items = d_down.index_select(0, dest_safe) * w[:, None]
         return y_items.view(T, K, H).sum(dim=1)                 # [T, H] fp32
+
+    def _cached_gpu_forward_any(
+        self,
+        x_bf16: torch.Tensor,       # [T, H] bf16 device
+        expert_ids: torch.Tensor,   # [T, K] int64 device (clamped >= 0)
+        route_w: torch.Tensor,      # [T, K] fp32 device (masked slots = 0)
+    ) -> torch.Tensor:              # [T, H] bf16
+        """Fully-cached eager forward for ANY batch size, with zero host syncs.
+
+        Used when every expert is VRAM-cached: the whole layout (per-expert
+        counts, BLOCK_M-padded offsets, item destinations) is computed on the
+        device, so consecutive layers pipeline without the per-layer
+        counts-D2H stall of the bucketed forward. Buffers are sized to the
+        worst case T*K + G*BLOCK_M rows; the kernel only touches the ranges
+        named by the device-computed offsets. (Unlike _cached_gpu_decode's
+        fixed 256-row segments, per-expert row counts here are unbounded, so
+        offsets derive from a padded cumsum.)
+        """
+        slab = self.slab
+        dev = x_bf16.device
+        G = slab.num_experts
+        H, I = slab.hidden, slab.inter
+        kb_h, kb_i = slab.kb_hidden, slab.kb_inter
+        T, K = expert_ids.shape
+        TK = T * K
+
+        flat_e = expert_ids.reshape(-1)
+        counts = torch.bincount(flat_e, minlength=G)            # [G] device
+        padded = ((counts + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
+        pad_start = padded.cumsum(0) - padded
+        seg_start = counts.cumsum(0) - counts
+        order = torch.argsort(flat_e, stable=True)
+        rows_sorted = torch.div(order, K, rounding_mode="floor")
+        e_sel = flat_e[order]
+        pos = torch.arange(TK, dtype=torch.int64, device=dev)
+        dest = pad_start[e_sel] + (pos - seg_start[e_sel])      # [TK]
+
+        M_alloc = TK + G * BLOCK_M                              # >= padded.sum()
+        offsets = torch.empty(2 * G, dtype=torch.int32, device=dev)
+        offsets[0::2] = pad_start.to(torch.int32)
+        offsets[1::2] = (pad_start + counts).to(torch.int32)
+
+        x_items = x_bf16.index_select(0, rows_sorted)           # [TK, H]
+        q_items, s_items = quantize_per_token_int8_gpu(x_items)
+        a_int8 = torch.zeros(M_alloc, H, dtype=torch.int8, device=dev)
+        a_int8.index_copy_(0, dest, q_items)
+        sfa = torch.zeros(M_alloc, kb_h, dtype=torch.float32, device=dev)
+        sfa.index_copy_(0, dest, s_items.unsqueeze(1).expand(TK, kb_h).contiguous())
+
+        d_gu = torch.empty(M_alloc, 2 * I, dtype=torch.float32, device=dev)
+        asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
+            (a_int8, sfa), (self.cache_gateup_int8, self.cache_gateup_sfb),
+            d_gu, offsets, self._experts_all, G + 1, recipe=(1, 1, GRAN_K),
+        )
+        act = torch.nn.functional.silu(d_gu[:, :I]) * d_gu[:, I:]
+
+        a2_items, s2_items = quantize_per_token_int8_gpu(
+            act.to(torch.bfloat16).index_select(0, dest)
+        )
+        a2_int8 = torch.zeros(M_alloc, I, dtype=torch.int8, device=dev)
+        a2_int8.index_copy_(0, dest, a2_items)
+        sfa2 = torch.zeros(M_alloc, kb_i, dtype=torch.float32, device=dev)
+        sfa2.index_copy_(0, dest, s2_items.unsqueeze(1).expand(TK, kb_i).contiguous())
+
+        d_down = torch.empty(M_alloc, H, dtype=torch.float32, device=dev)
+        asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
+            (a2_int8, sfa2), (self.cache_down_int8, self.cache_down_sfb),
+            d_down, offsets, self._experts_all, G + 1, recipe=(1, 1, GRAN_K),
+        )
+
+        w = route_w.reshape(-1).index_select(0, order)
+        y_items = d_down.index_select(0, dest) * w[:, None]     # [TK, H] fp32
+        out = torch.zeros(T, H, dtype=torch.float32, device=dev)
+        out.index_add_(0, rows_sorted, y_items)
+        return out.to(torch.bfloat16)
 
     # -----------------------------------------------------------
     # construction
@@ -734,6 +814,13 @@ class Layer:
         in_device = x_bf16.device
         G = self.slab.num_experts
         K = self.top_k
+
+        if self.cache_n == G and torch.cuda.is_available():
+            # Every expert is VRAM-cached: take the sync-free all-device path.
+            eids = expert_ids
+            if eids.dtype != torch.int64:
+                eids = eids.to(torch.int64)
+            return self._cached_gpu_forward_any(x_bf16, eids, route_w)
 
         # ---- routing dispatch, vectorized on the device ----
         # Sort the T*K routed items by expert id; each expert's items form one
