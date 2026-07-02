@@ -1060,7 +1060,9 @@ def move_lf_asym_cpu_first_model_to_device(
 
 
 def _is_stateless_module(module: nn.Module) -> bool:
-    return not any(module.parameters(recurse=False)) and not any(module.buffers(recurse=False))
+    has_param = next(module.parameters(recurse=False), None) is not None
+    has_buffer = next(module.buffers(recurse=False), None) is not None
+    return not has_param and not has_buffer
 
 
 def _is_all_target(raw_lora_target: Sequence[str] | str | None) -> bool:
@@ -1893,6 +1895,9 @@ def apply_lf_asym_lora(
                 )
                 wrapped.profile_prefix = _layer_profile_prefix_from_module_name(name, "mlp")
                 wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
+                if qwen3_moe_finegrained_enabled and offload_experts:
+                    wrapped.experts._qwen3_moe_finegrained_enabled = True
+                    report.qwen3_moe_finegrained_offload_wrapped += 1
                 if isinstance(wrapped.shared_expert, AsymQwen35SharedMLP):
                     wrapped.shared_expert.profile_prefix = f"{wrapped.profile_prefix}.shared_expert"
                     report.dense_lora_wrapped += max(0, 3 - int(wrapped.shared_expert.preexisting_lora_leaf_count))

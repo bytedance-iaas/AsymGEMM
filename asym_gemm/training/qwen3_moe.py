@@ -89,13 +89,28 @@ def is_qwen3_experts(module: nn.Module) -> bool:
     for attr in ("num_experts", "hidden_dim", "intermediate_dim"):
         if not isinstance(getattr(module, attr, None), int):
             return False
-    if not callable(getattr(module, "act_fn", None)):
+    if not callable(_resolve_qwen3_expert_act_fn(module)):
         return False
     try:
         params = inspect.signature(module.forward).parameters
     except (TypeError, ValueError):
         return False
     return all(name in params for name in ("hidden_states", "top_k_index", "top_k_weights"))
+
+
+def _resolve_qwen3_expert_act_fn(module: nn.Module):
+    act_fn = getattr(module, "act_fn", None)
+    if callable(act_fn):
+        return act_fn
+    hidden_act = str(getattr(getattr(module, "config", None), "hidden_act", "")).lower()
+    if hidden_act in {"silu", "swish"}:
+        return F.silu
+    # Liger's packed Experts module stores the same Qwen3/Qwen3.5 weight layout
+    # but does not carry act_fn/config; its constructor has already rejected
+    # non-SiLU activations.
+    if type(module).__name__ == "LigerExperts":
+        return F.silu
+    return None
 
 
 def is_qwen3_moe_block(module: nn.Module) -> bool:
@@ -2076,7 +2091,9 @@ class AsymQwen3Experts(nn.Module):
         self.has_bias = False
         self.is_transposed = False
         self.is_concatenated = True
-        self.act_fn = getattr(source, "act_fn")
+        self.act_fn = _resolve_qwen3_expert_act_fn(source)
+        if not callable(self.act_fn):
+            raise TypeError(f"source expert module does not expose a supported activation: {type(source).__name__}")
         self.backend = backend
         self.precision = precision
         self.offload = bool(offload)

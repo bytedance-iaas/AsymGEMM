@@ -607,7 +607,7 @@ qwen3_route_any_enabled() {
 
 is_qwen3_moe_routed_model() {
   case "$1" in
-    *"Qwen3-30B-A3B"*) return 0 ;;
+    *"Qwen3-30B-A3B"*|*"Qwen3.5-35B-A3B"*|*"Qwen3.5-122B-A10B"*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -626,7 +626,7 @@ validate_recompute_kernel_for_model() {
     die "dense model '${model}' cannot use Qwen3 MoE routed kernels; use recomp-off-full-fg-ker000 with route000_lora0 (got kernel_code=${kernel_code}, lora=$(qwen3_route_bool "${lora_flag}"))"
   fi
   if [[ "${kernel_code}" != "000" ]] && ! is_qwen3_moe_routed_model "${model}"; then
-    die "recomp-off-full-fg-ker${kernel_code} is only supported for Qwen3-30B-A3B routed MoE; dense/non-routed model '${model}' must use recomp-off-full-fg-ker000"
+    die "recomp-off-full-fg-ker${kernel_code} is only supported for Qwen3/Qwen3.5 routed MoE; dense/non-routed model '${model}' must use recomp-off-full-fg-ker000"
   fi
 }
 
@@ -3120,7 +3120,7 @@ run_job() {
     [[ "${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE,,}" == "fp32" ]] || die "Qwen3 routed kernels currently require ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE=fp32, got '${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE}'"
     [[ "${backend}" == asym* ]] || die "Qwen3 routed kernels are only valid for asym* backends, got backend='${backend}'"
     [[ "${recomp_off_stage}" == "full-fg" ]] || die "Qwen3 routed kernels require recomp-off-full-fg, got recompute='${recompute}'"
-    is_qwen3_moe_routed_model "${current_model_name}" || die "Qwen3 routed kernels are scoped to Qwen3-30B-A3B, got model='${current_model_name}'"
+    is_qwen3_moe_routed_model "${current_model_name}" || die "Qwen3 routed kernels are scoped to Qwen3/Qwen3.5 routed MoE, got model='${current_model_name}'"
     [[ "$(qwen3_route_bool "${ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD}")" == "1" ]] || die "Qwen3 routed kernels require ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD=1"
     [[ "${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}" == "0" ]] || die "Qwen3 routed kernels must not use ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}"
   fi
