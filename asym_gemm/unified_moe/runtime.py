@@ -1121,7 +1121,7 @@ class Layer:
             if self is _ALL_LAYERS[0]:
                 global _stats_step
                 _stats_step += 1
-                if _stats_step % 100 == 0:
+                if _stats_step % 20 == 0:
                     _dump_expert_stats()
 
         counts_np = counts.cpu().numpy()                      # one small D2H
