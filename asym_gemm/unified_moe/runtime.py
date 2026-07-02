@@ -37,6 +37,13 @@ import torch
 import asym_gemm
 from .. import _cpu_C as _C
 
+try:  # fused kernels for the VRAM-cached paths (optional dependency)
+    from . import _triton as _tk
+    _HAS_TRITON = True
+except Exception:  # pragma: no cover - triton missing or broken
+    _tk = None
+    _HAS_TRITON = False
+
 # Granularity required by sm90_int8_asym_gemm_1d1d (one scale per 128 K elems).
 GRAN_K = 128
 # Per-expert M alignment for the SM90 INT8 1D1D contiguous-layout kernel.
@@ -285,47 +292,61 @@ class Layer:
         S = min(TK, Nc)                     # max simultaneously-active experts
         M = S * BLOCK_M
 
-        slot = self.cached_slot[expert_ids.reshape(-1)]        # [TK]
-        valid = slot >= 0
-        sc = slot.clamp_min(0)
+        if _HAS_TRITON and TK <= 2048:
+            # One fused kernel builds dest/offsets/experts (vs ~18 tensor ops).
+            dest, offsets, experts_t = _tk.decode_layout(
+                expert_ids.reshape(-1), self.cached_slot, Nc, S, BLOCK_M
+            )
+            valid = dest < M                        # parking rows sit past M
+            dest_safe = dest.clamp_max(M - 1)
+        else:
+            slot = self.cached_slot[expert_ids.reshape(-1)]    # [TK]
+            valid = slot >= 0
+            sc = slot.clamp_min(0)
 
-        # rank of each item within its expert; per-slot counts.
-        onehot = torch.zeros(TK, Nc, dtype=torch.int32, device=dev)
-        onehot.scatter_(1, sc.unsqueeze(1), valid.to(torch.int32).unsqueeze(1))
-        cum = onehot.cumsum(0)                                  # int64 (promoted)
-        rank = cum.gather(1, sc.unsqueeze(1)).squeeze(1) - 1
-        counts = cum[-1]                                        # [Nc] int64
+            # rank of each item within its expert; per-slot counts.
+            onehot = torch.zeros(TK, Nc, dtype=torch.int32, device=dev)
+            onehot.scatter_(1, sc.unsqueeze(1), valid.to(torch.int32).unsqueeze(1))
+            cum = onehot.cumsum(0)                              # int64 (promoted)
+            rank = cum.gather(1, sc.unsqueeze(1)).squeeze(1) - 1
+            counts = cum[-1]                                    # [Nc] int64
 
-        # Pack active experts into segments [seg*256, seg*256+count).
-        active = counts > 0
-        seg_of = active.to(torch.int64).cumsum(0) - 1           # [Nc]
-        dump = torch.full_like(seg_of, S)                       # park inactive
-        seg_idx = torch.where(active, seg_of, dump)
-        seg_counts = torch.zeros(S + 1, dtype=torch.int64, device=dev)
-        seg_counts.scatter_(0, seg_idx, counts)
-        experts_t = torch.zeros(S + 1, dtype=torch.int32, device=dev)
-        experts_t.scatter_(
-            0, seg_idx, torch.arange(Nc, dtype=torch.int32, device=dev)
-        )
-        experts_t.narrow(0, S, 1).fill_(-1)                     # sentinel
-        starts = (
-            torch.arange(S, dtype=torch.int32, device=dev) * BLOCK_M
-        )
-        offsets = torch.empty(2 * S, dtype=torch.int32, device=dev)
-        offsets[0::2] = starts
-        offsets[1::2] = starts + seg_counts[:S].to(torch.int32)
+            # Pack active experts into segments [seg*256, seg*256+count).
+            active = counts > 0
+            seg_of = active.to(torch.int64).cumsum(0) - 1       # [Nc]
+            dump = torch.full_like(seg_of, S)                   # park inactive
+            seg_idx = torch.where(active, seg_of, dump)
+            seg_counts = torch.zeros(S + 1, dtype=torch.int64, device=dev)
+            seg_counts.scatter_(0, seg_idx, counts)
+            experts_t = torch.zeros(S + 1, dtype=torch.int32, device=dev)
+            experts_t.scatter_(
+                0, seg_idx, torch.arange(Nc, dtype=torch.int32, device=dev)
+            )
+            experts_t.narrow(0, S, 1).fill_(-1)                 # sentinel
+            starts = (
+                torch.arange(S, dtype=torch.int32, device=dev) * BLOCK_M
+            )
+            offsets = torch.empty(2 * S, dtype=torch.int32, device=dev)
+            offsets[0::2] = starts
+            offsets[1::2] = starts + seg_counts[:S].to(torch.int32)
 
-        # Item destinations in the grouped layout; invalid items park past M.
-        arange_tk = torch.arange(TK, dtype=torch.int64, device=dev)
-        dest_valid = seg_of.index_select(0, sc) * BLOCK_M + rank
-        dest = torch.where(valid, dest_valid, M + arange_tk)
-        dest_safe = torch.where(valid, dest_valid, torch.zeros_like(dest_valid))
+            # Item destinations; invalid items park past M.
+            arange_tk = torch.arange(TK, dtype=torch.int64, device=dev)
+            dest_valid = seg_of.index_select(0, sc) * BLOCK_M + rank
+            dest = torch.where(valid, dest_valid, M + arange_tk)
+            dest_safe = torch.where(valid, dest_valid, torch.zeros_like(dest_valid))
 
         # Gather + quantize only the TK routed rows, scatter into the layout
         # (quantizing the full padded buffer would read ~30x the bytes).
-        tok = torch.div(arange_tk, K, rounding_mode="floor")
+        tok = torch.div(
+            torch.arange(TK, dtype=torch.int64, device=dev), K,
+            rounding_mode="floor",
+        )
         x_items = x_bf16.index_select(0, tok)                   # [TK, H]
-        q_items, s_items = quantize_per_token_int8_gpu(x_items)
+        q_items, s_items = (
+            _tk.quant_rows(x_items) if _HAS_TRITON
+            else quantize_per_token_int8_gpu(x_items)
+        )
         a_int8 = torch.zeros(M + TK, H, dtype=torch.int8, device=dev)
         a_int8.index_copy_(0, dest, q_items)
         sfa = torch.zeros(M + TK, kb_h, dtype=torch.float32, device=dev)
@@ -337,14 +358,17 @@ class Layer:
             (self.cache_gateup_int8, self.cache_gateup_sfb),
             d_gu, offsets, experts_t, S + 1, recipe=(1, 1, GRAN_K),
         )
-        act = torch.nn.functional.silu(d_gu[:, :I]) * d_gu[:, I:]
-        act_bf16 = act.to(torch.bfloat16)
 
-        # Down: re-quantize the routed rows (BF16 round-trip matches the CPU
-        # path). Rows of inactive segments are uninitialized — gather via
-        # dest_safe so invalid items read a real row and land in parking.
-        a2_items, s2_items = quantize_per_token_int8_gpu(
-            act_bf16.index_select(0, dest_safe)
+        # Gather the routed rows FIRST, then activate: SwiGLU runs on TK rows
+        # instead of the whole padded buffer. Rows of inactive segments are
+        # uninitialized — gather via dest_safe so invalid items read a real
+        # row (their weight is 0) and land in parking on the scatter back.
+        gu_sel = d_gu.index_select(0, dest_safe)                # [TK, 2I]
+        act_sel = torch.nn.functional.silu(gu_sel[:, :I]) * gu_sel[:, I:]
+        # Down: re-quantize (BF16 round-trip matches the CPU path).
+        a2_items, s2_items = (
+            _tk.quant_rows(act_sel.to(torch.bfloat16)) if _HAS_TRITON
+            else quantize_per_token_int8_gpu(act_sel.to(torch.bfloat16))
         )
         a2_int8 = torch.zeros(M + TK, I, dtype=torch.int8, device=dev)
         a2_int8.index_copy_(0, dest, a2_items)
@@ -403,7 +427,10 @@ class Layer:
         offsets[1::2] = (pad_start + counts).to(torch.int32)
 
         x_items = x_bf16.index_select(0, rows_sorted)           # [TK, H]
-        q_items, s_items = quantize_per_token_int8_gpu(x_items)
+        q_items, s_items = (
+            _tk.quant_rows(x_items) if _HAS_TRITON
+            else quantize_per_token_int8_gpu(x_items)
+        )
         a_int8 = torch.zeros(M_alloc, H, dtype=torch.int8, device=dev)
         a_int8.index_copy_(0, dest, q_items)
         sfa = torch.zeros(M_alloc, kb_h, dtype=torch.float32, device=dev)
@@ -414,10 +441,14 @@ class Layer:
             (a_int8, sfa), (self.cache_gateup_int8, self.cache_gateup_sfb),
             d_gu, offsets, self._experts_all, G + 1, recipe=(1, 1, GRAN_K),
         )
-        act = torch.nn.functional.silu(d_gu[:, :I]) * d_gu[:, I:]
 
-        a2_items, s2_items = quantize_per_token_int8_gpu(
-            act.to(torch.bfloat16).index_select(0, dest)
+        # Gather the routed rows first, then activate — SwiGLU runs on TK rows
+        # instead of the whole padded buffer (~2x fewer bytes at prefill).
+        gu_sel = d_gu.index_select(0, dest)                     # [TK, 2I]
+        act_sel = torch.nn.functional.silu(gu_sel[:, :I]) * gu_sel[:, I:]
+        a2_items, s2_items = (
+            _tk.quant_rows(act_sel.to(torch.bfloat16)) if _HAS_TRITON
+            else quantize_per_token_int8_gpu(act_sel.to(torch.bfloat16))
         )
         a2_int8 = torch.zeros(M_alloc, I, dtype=torch.int8, device=dev)
         a2_int8.index_copy_(0, dest, a2_items)
