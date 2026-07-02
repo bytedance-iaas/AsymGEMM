@@ -27,6 +27,7 @@ See docs unified_kernel_pinned_CPU_memory.md for the full design.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -45,6 +46,28 @@ GRAN_K = 128
 # are {64, 128, 256} — we pad to the maximum so the layout is safe regardless
 # of which the heuristic picks for the live (M, N, K) shape.
 BLOCK_M = 256
+
+# Fraction of routed rows the CPU bucket takes at prefill (large batches),
+# where the two buckets run concurrently: the GPU streams each of its experts'
+# weights over PCIe (cost ~per expert), the CPU cost scales ~per row, so the
+# CPU takes the smallest-count experts. 0 disables the split (GPU-only
+# prefill, CPU idle). Override via ASYMGEMM_CPU_PREFILL_FRACTION.
+#
+# Default from a sweep on 2x8457C (48-thread pool, node-bound) + H200,
+# Qwen3-30B-A3B, 3500-token prefill — TTFT: 0.0 -> 867 ms, 0.05 -> 710 ms,
+# 0.07 -> 728 ms, 0.10 -> 748 ms, 0.15 -> 805 ms, 0.25+ -> CPU-bound and
+# worse. Small fractions win twice over: the smallest experts also carry the
+# worst BLOCK_M padding waste in the GPU contiguous layout.
+_CPU_PREFILL_FRACTION: Optional[float] = None
+
+
+def _cpu_prefill_fraction() -> float:
+    global _CPU_PREFILL_FRACTION
+    if _CPU_PREFILL_FRACTION is None:
+        _CPU_PREFILL_FRACTION = float(
+            os.getenv("ASYMGEMM_CPU_PREFILL_FRACTION", "0.05")
+        )
+    return _CPU_PREFILL_FRACTION
 
 
 # ---------------------------------------------------------------------------
@@ -515,8 +538,23 @@ class Layer:
 
         counts_np = counts.cpu().numpy()                      # one small D2H
         active = np.nonzero(counts_np)[0]
-        cpu_experts = active[counts_np[active] <= self.m_cpu]
-        gpu_experts = active[counts_np[active] > self.m_cpu]
+        cpu_frac = _cpu_prefill_fraction()
+        if cpu_frac > 0.0 and int(counts_np.sum()) > self.m_cpu * max(1, len(active)):
+            # Large-batch (prefill) split: the GPU bucket's cost is dominated
+            # by streaming each expert's weights over PCIe (per-expert, not
+            # per-row), the CPU bucket's by rows. Give the CPU the
+            # smallest-count experts until it holds ~cpu_frac of the routed
+            # rows, and run the two buckets concurrently (GPU kernels are
+            # launched before the blocking AMX call below). This engages the
+            # otherwise-idle CPU during prefill.
+            by_count = active[np.argsort(counts_np[active], kind="stable")]
+            csum = np.cumsum(counts_np[by_count])
+            n_cpu = int(np.searchsorted(csum, cpu_frac * csum[-1], side="right"))
+            cpu_experts = np.sort(by_count[:n_cpu])
+            gpu_experts = np.sort(by_count[n_cpu:])
+        else:
+            cpu_experts = active[counts_np[active] <= self.m_cpu]
+            gpu_experts = active[counts_np[active] > self.m_cpu]
 
         # Per-expert start of its segment in the sorted order.
         seg_start_np = np.zeros(G, dtype=np.int64)
@@ -524,38 +562,25 @@ class Layer:
 
         out_fp32 = torch.zeros((T, H), dtype=torch.float32, device=in_device)
 
-        # ---- CPU bucket: all experts in one worker-pool job ----
-        # Gather the routed rows on the GPU, land them on the host in one copy,
-        # run the batched AMX kernel, then apply routing weights and scatter-add
-        # back on the GPU (np.add.at on the host was another prefill hotspot).
+        # ---- CPU bucket, stage 1: gather routed rows and land them on the
+        # host NOW, before any GPU-bucket kernel is enqueued — the D2H copy is
+        # stream-ordered, so issuing it later would serialize the CPU bucket
+        # behind the GPU bucket's grouped GEMMs instead of overlapping them.
+        rows_cpu = slots_cpu = x_cat = None
         if len(cpu_experts):
-            slab = self.slab
             cpu_e_t = torch.from_numpy(cpu_experts).to(in_device)
             is_cpu_item = torch.isin(sorted_e, cpu_e_t)
             rows_cpu = rows_sorted[is_cpu_item]
             slots_cpu = slots_sorted[is_cpu_item]
-
             x_cat_t = (
                 x_bf16.index_select(0, rows_cpu).to("cpu").contiguous()
             )
             x_cat = torch_bf16_to_np_bits(x_cat_t)
 
-            m_offsets = np.zeros(len(cpu_experts) + 1, dtype=np.int64)
-            np.cumsum(counts_np[cpu_experts], out=m_offsets[1:])
-            out_cat = np.empty((int(m_offsets[-1]), H), dtype=np.float32)
-            _C.moe_expert_forward_batch(
-                self.rt, x_cat, m_offsets, cpu_experts.astype(np.int64),
-                slab.gate_int8.numpy(), slab.gate_scales.numpy(),
-                slab.up_int8.numpy(),   slab.up_scales.numpy(),
-                slab.down_int8.numpy(), slab.down_scales.numpy(),
-                out_cat, slab.inter, slab.hidden,
-            )
-
-            y_cpu = torch.from_numpy(out_cat).to(in_device, non_blocking=True)
-            w = route_w[rows_cpu, slots_cpu].to(torch.float32)
-            out_fp32.index_add_(0, rows_cpu, y_cpu * w[:, None])
-
-        # ---- GPU bucket (grouped INT8 over pinned weights) ----
+        # ---- GPU bucket (grouped INT8 over pinned weights): enqueue first,
+        # asynchronously; the AMX bucket below then runs on the host while the
+        # GPU works through these kernels.
+        gpu_rows = gpu_y = None
         if len(gpu_experts):
             if not torch.cuda.is_available():
                 raise RuntimeError("GPU bucket non-empty but no CUDA device available.")
@@ -604,10 +629,30 @@ class Layer:
 
             x_gpu_bf16 = x_bf16.to(in_device, dtype=torch.bfloat16).contiguous()
             route_w_gpu = route_w.to(in_device, dtype=torch.float32)
-            orig_rows, y_w = self._gpu_grouped_forward(
+            gpu_rows, gpu_y = self._gpu_grouped_forward(
                 x_gpu_bf16, layout, route_w_gpu,
             )
-            if orig_rows is not None:
-                out_fp32.index_add_(0, orig_rows, y_w)
+
+        # ---- CPU bucket, stage 2: the blocking AMX call. The GIL and the
+        # CUDA stream are both free here, so this host work overlaps the GPU
+        # bucket's grouped GEMMs enqueued above.
+        if x_cat is not None:
+            slab = self.slab
+            m_offsets = np.zeros(len(cpu_experts) + 1, dtype=np.int64)
+            np.cumsum(counts_np[cpu_experts], out=m_offsets[1:])
+            out_cat = np.empty((int(m_offsets[-1]), H), dtype=np.float32)
+            _C.moe_expert_forward_batch(
+                self.rt, x_cat, m_offsets, cpu_experts.astype(np.int64),
+                slab.gate_int8.numpy(), slab.gate_scales.numpy(),
+                slab.up_int8.numpy(),   slab.up_scales.numpy(),
+                slab.down_int8.numpy(), slab.down_scales.numpy(),
+                out_cat, slab.inter, slab.hidden,
+            )
+            y_cpu = torch.from_numpy(out_cat).to(in_device, non_blocking=True)
+            w = route_w[rows_cpu, slots_cpu].to(torch.float32)
+            out_fp32.index_add_(0, rows_cpu, y_cpu * w[:, None])
+
+        if gpu_rows is not None:
+            out_fp32.index_add_(0, gpu_rows, gpu_y)
 
         return out_fp32.to(torch.bfloat16)
