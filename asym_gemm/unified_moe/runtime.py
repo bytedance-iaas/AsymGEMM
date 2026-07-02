@@ -235,13 +235,19 @@ class Layer:
         s = self.slab
         n = min(n, s.num_experts)
         dev = f"cuda:{self.cuda_device}"
-        self.cache_gate_int8 = s.gate_int8[:n].to(dev)
-        self.cache_up_int8 = s.up_int8[:n].to(dev)
+        # gate and up are fused along the output dim ([n, 2*inter, hidden],
+        # gate rows first): per-channel scales make the concat exact, and one
+        # grouped call replaces two — one less launch and one less pass over
+        # the quantized activations per layer.
+        self.cache_gateup_int8 = torch.cat(
+            (s.gate_int8[:n], s.up_int8[:n]), dim=1
+        ).to(dev)
         self.cache_down_int8 = s.down_int8[:n].to(dev)
-        # SFBs are already device-resident; slice a contiguous copy so the
-        # kernel indexes them 0..n-1 like the cached INT8 slabs.
-        self.cache_gate_sfb = s.gate_sfb[:n].contiguous()
-        self.cache_up_sfb = s.up_sfb[:n].contiguous()
+        # SFBs are already device-resident; build contiguous copies the kernel
+        # can index 0..n-1 like the cached INT8 slabs.
+        self.cache_gateup_sfb = torch.cat(
+            (s.gate_sfb[:n], s.up_sfb[:n]), dim=1
+        ).contiguous()
         self.cache_down_sfb = s.down_sfb[:n].contiguous()
         cached_slot = torch.full((s.num_experts,), -1, dtype=torch.int64,
                                  device=dev)
@@ -320,17 +326,13 @@ class Layer:
         sfa = torch.zeros(M + TK, kb_h, dtype=torch.float32, device=dev)
         sfa.index_copy_(0, dest, s_items.unsqueeze(1).expand(TK, kb_h).contiguous())
 
-        d_gate = torch.empty(M, I, dtype=torch.float32, device=dev)
+        d_gu = torch.empty(M, 2 * I, dtype=torch.float32, device=dev)
         asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
-            (a_int8[:M], sfa[:M]), (self.cache_gate_int8, self.cache_gate_sfb),
-            d_gate, offsets, experts_t, S + 1, recipe=(1, 1, GRAN_K),
+            (a_int8[:M], sfa[:M]),
+            (self.cache_gateup_int8, self.cache_gateup_sfb),
+            d_gu, offsets, experts_t, S + 1, recipe=(1, 1, GRAN_K),
         )
-        d_up = torch.empty(M, I, dtype=torch.float32, device=dev)
-        asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
-            (a_int8[:M], sfa[:M]), (self.cache_up_int8, self.cache_up_sfb),
-            d_up, offsets, experts_t, S + 1, recipe=(1, 1, GRAN_K),
-        )
-        act = torch.nn.functional.silu(d_gate) * d_up
+        act = torch.nn.functional.silu(d_gu[:, :I]) * d_gu[:, I:]
         act_bf16 = act.to(torch.bfloat16)
 
         # Down: re-quantize the routed rows (BF16 round-trip matches the CPU
@@ -656,15 +658,6 @@ class Layer:
         if M_grouped == 0:
             return None, None
 
-        if cached:
-            gate_b, gate_sfb = self.cache_gate_int8, self.cache_gate_sfb
-            up_b, up_sfb = self.cache_up_int8, self.cache_up_sfb
-            down_b, down_sfb = self.cache_down_int8, self.cache_down_sfb
-        else:
-            gate_b, gate_sfb = slab.gate_int8, slab.gate_sfb
-            up_b, up_sfb = slab.up_int8, slab.up_sfb
-            down_b, down_sfb = slab.down_int8, slab.down_sfb
-
         # Gather activations into the contiguous layout. Padding rows (idx=-1)
         # stay zero so their activation amax → 0 → scale clamped to 1e-12.
         valid_mask = (idx_to_orig >= 0)
@@ -678,22 +671,33 @@ class Layer:
         # SFA for gate/up: broadcast per-token scale across kb_h K-blocks.
         sfa_h = sA.unsqueeze(1).expand(M_grouped, kb_h).contiguous()
 
-        # gate
-        d_gate = torch.empty(M_grouped, I, device=dev, dtype=torch.float32)
-        asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
-            (a_int8, sfa_h), (gate_b, gate_sfb),
-            d_gate, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
-        )
+        if cached:
+            # Fused gate+up: one grouped call over the [Nc, 2I, H] cache.
+            d_gu = torch.empty(M_grouped, 2 * I, device=dev, dtype=torch.float32)
+            asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
+                (a_int8, sfa_h), (self.cache_gateup_int8, self.cache_gateup_sfb),
+                d_gu, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
+            )
+            act = torch.nn.functional.silu(d_gu[:, :I]) * d_gu[:, I:]
+            down_b, down_sfb = self.cache_down_int8, self.cache_down_sfb
+        else:
+            # gate
+            d_gate = torch.empty(M_grouped, I, device=dev, dtype=torch.float32)
+            asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
+                (a_int8, sfa_h), (slab.gate_int8, slab.gate_sfb),
+                d_gate, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
+            )
 
-        # up
-        d_up = torch.empty(M_grouped, I, device=dev, dtype=torch.float32)
-        asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
-            (a_int8, sfa_h), (up_b, up_sfb),
-            d_up, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
-        )
+            # up
+            d_up = torch.empty(M_grouped, I, device=dev, dtype=torch.float32)
+            asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
+                (a_int8, sfa_h), (slab.up_int8, slab.up_sfb),
+                d_up, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
+            )
 
-        # SwiGLU
-        act = torch.nn.functional.silu(d_gate) * d_up
+            # SwiGLU
+            act = torch.nn.functional.silu(d_gate) * d_up
+            down_b, down_sfb = slab.down_int8, slab.down_sfb
 
         # Down: re-quantize act (BF16 round-trip to match the CPU path).
         act_bf16 = act.to(torch.bfloat16)
