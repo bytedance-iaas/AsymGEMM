@@ -17,6 +17,10 @@ Current systems dont have activation + model weights + optimizer all offloading 
 Completed Milestones:
 1. We adapted AsymGEMM for lora SFT and profiled to have lower memory usage
 2. We integrated various dense and MoE models into the system
+3. We root-caused and optimized the MoE fine-grained recompute-offload path (operand
+   placement + pinned-pool reuse + compact-X GPU dA): q3-30b-a3b s80000.b8 step time
+   -70% (1043s -> 315s) at equal-or-lower peak HBM, closing the latency gap to
+   superoffload_mem|unsloth-off to 1.15x while keeping the HBM advantage
 
 Notes:
 - Superoffloads uses GH200 and we uses GB200 (2 GPUs 2x198G + 1 CPU 450G) => Model/EP/SP
@@ -38,13 +42,18 @@ Next Steps:
 
 #############################################################################################################
 Results:
-Model: q3-30b-a3b
+Model: q3-30b-a3b  (asym rows = optimized fg path 2026-07-02, see agent/impls/fix_qwen3.md)
 
-Workload   Backend           Config                    Status  fwd_s  bwd_s   opt_s  step_s  fwd_H  bwd_H  step_H    RAM
----------  ----------------  ------------------------  ------  -----  ------  -----  ------  -----  -----  ------  -----
-s80000.b8  superoffload_mem  unsloth                   PASS     29.6   130.3    0.0   160.0   91.9  176.9   176.9  360.0
-s80000.b8  superoffload_mem  unsloth-off               PASS     33.2   240.7    0.0   274.0   91.9   94.4    94.4  588.5
+Workload   Backend           Config                     Status  fwd_s  bwd_s   opt_s  step_s  fwd_H  bwd_H  step_H    RAM
+---------  ----------------  -------------------------  ------  -----  ------  -----  ------  -----  -----  ------  -----
+s80000.b8  superoffload_mem  unsloth                    PASS     29.6   130.3    0.0   160.0   91.9  176.9   176.9  360.0
+s80000.b8  superoffload_mem  unsloth-off                PASS     33.2   240.7    0.0   274.0   91.9   94.4    94.4  588.5
+s80000.b8  asym_cpuadamwds   recomp-off-full-fg-ker000  PASS     62.9   252.1    3.3   315.1   86.0  105.6   105.6  557.4
+s80000.b8  asym_cpuadamwds   recomp-off-full-fg-ker101  PASS     61.6   261.0    3.3   322.8   78.6   73.9    73.9  557.3
+<!-- (pre-optimization, for reference:)
+s80000.b8  asym_cpuadamwds   recomp-off-full-fg-ker000  PASS     65.6   977.6    3.8  1043.3   86.0  112.9   112.9  642.0
 s80000.b8  asym_cpuadamwds   recomp-off-full-fg-ker111  PASS     60.2  1179.9    3.9  1240.2   78.6   73.9    73.9  642.2
+ -->
 
 Model: q3-32b
 

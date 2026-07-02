@@ -30,16 +30,36 @@ FONT_SIZE_SEGMENT = 18      # in-bar per-segment % labels
 FONT_SIZE_MODEL = 24        # per-group model-name labels under the x-axis
 # (no figure title anywhere)
 
+# --- Line-figure colors (blues + red): the c2c/util line plots, timeline
+# shading, and dark in-bar text annotations. Bars use the BAR_* palette below.
+BLUE = "#5B8FB9"          # line: C2C RX / CPU, timeline forward shading
+DARK_BLUE = "#1F4E79"     # dark-blue text annotation (Optim. States %)
+ACCENT_RED = "#B3261E"    # line/accent: C2C TX / GPU, OOM/speedup/saving text
+SUBTLE_TEXT = "#444444"   # secondary labels (token-count line, reference curves)
+GRID_COLOR = "#d1d5db"    # y-grid in every figure
+SPINE_COLOR = "#1a1a1a"   # full box frame (main figure)
+
+# --- Bar palette: grouped/stacked bar FILLS only (line figures keep the blues/
+# red above). Two muted neutrals for baselines, a bold navy hero, plus a cool
+# teal and warm orange for stacked segments; two pale tints held in reserve.
+BAR_NEUTRAL      = "#B3BBBE"   # muted baseline
+BAR_NEUTRAL_CYAN = "#ABC3C7"   # muted baseline (2nd, cooler)
+BAR_RED_SOFT     = "#EAA2A3"   # soft red (reserve)
+BAR_NAVY         = "#1B4583"   # bold hero / dark base (white in-bar labels read)
+BAR_TEAL         = "#3398A7"   # saturated cool
+BAR_ORANGE       = "#E8A35C"   # warm highlight (optimizer / activations slice)
+BAR_APRICOT      = "#F7D1AB"   # light warm (reserve)
+
 # --- Colors: phase/segment -> color (legend reuses these exact colors) ----
 PHASE_COLORS = {
-    "Forward": "#5B8FB9",    # compute (light blue)
-    "Backward": "#1F4E79",   # compute (dark blue)
-    "Optimizer": "#E07B39",  # highlighted slice (orange)
+    "Forward": BAR_TEAL,
+    "Backward": BAR_NAVY,
+    "Optimizer": BAR_ORANGE,
 }
 PHASE_EDGE = {
     "Forward": "#ffffff",
     "Backward": "#ffffff",
-    "Optimizer": "#7a3e16",
+    "Optimizer": "#9C6320",   # darker orange: hatch + above-bar % label
 }
 PHASE_HATCH = {
     "Optimizer": "////",
@@ -47,17 +67,28 @@ PHASE_HATCH = {
 
 # Memory-breakdown segment colors (legend == stacked-bar colors)
 MEMORY_COLORS = {
-    "Model Weights": "#34495E",   # large fixed base (dark slate)
-    "Optim. States": "#5B8FB9",   # LoRA weights+grads (blue sliver)
-    "Activations": "#E07B39",     # grows with seq length (orange)
+    "Model Weights": BAR_NAVY,    # large fixed base (dark -> white % reads)
+    "Optim. States": BAR_TEAL,    # LoRA weights+grads (thin sliver)
+    "Activations": BAR_ORANGE,    # grows with seq length
 }
 MEMORY_EDGE = {k: "#ffffff" for k in MEMORY_COLORS}
 
-# Timeline colors reuse the existing paper palette where possible.
+# --- Memory-saving grouped-bar palette (plot_main) ------------------------
+# Three saturated bars per model group (navy / teal / orange) for high contrast;
+# the warm orange "Ours" bar pops against the two cool baselines. color/edge/
+# hatch/label are kept together so the legend swatches match the drawn bars.
+MEMSAVE_SERIES = [
+    {"key": "superoffload",     "label": "SuperOffload + Recompute",    "color": BAR_NAVY,   "edge": "#ffffff", "hatch": None},
+    {"key": "superoffload_off", "label": "SuperOffload + Act. Offload", "color": BAR_TEAL,   "edge": "#ffffff", "hatch": None},
+    {"key": "ours",             "label": "AsymLoRA (Ours)",             "color": BAR_ORANGE, "edge": "#ffffff", "hatch": None},
+]
+MEMSAVE_OOM_COLOR = ACCENT_RED  # "OOM" annotation color where a bar is absent
+
+# Timeline (line-figure) colors: blue RX + red TX, decoupled from the bar palette.
 C2C_COLORS = {
-    "ctc_rx": PHASE_COLORS["Forward"],
-    "ctc_tx": "#B3261E",
-    "reference": "#444444",
+    "ctc_rx": BLUE,
+    "ctc_tx": ACCENT_RED,
+    "reference": SUBTLE_TEXT,
 }
 C2C_LABELS = {
     "ctc_rx": "C2C RX",
@@ -72,8 +103,8 @@ UTIL_LABELS = {
     "cpu": "CPU",
 }
 TIMELINE_PHASE_COLORS = {
-    "forward": "#5B8FB9",
-    "backward": "#B3261E",
+    "forward": BLUE,
+    "backward": ACCENT_RED,
     "optimizer": "#D9A300",
 }
 TIMELINE_PHASE_LABELS = {
@@ -105,11 +136,11 @@ FIGURE_PARAMS = {
     "lora_timing": {
         "height": 6,
         "bar_width": 0.10,    # bar thickness only (independent)
-        "pair_gap": 0.19,     # spacing of the 2 bars WITHIN a group
+        "pair_gap": 0.2,     # spacing of the 2 bars WITHIN a group
         "group_gap": 0.25,    # spacing BETWEEN groups (independent of pair_gap)
         "x_margin": 0.11,     # padding beyond the outermost bar edges
-        "x_tick_label_pad": 10,  # PyTorch/SuperOffload label distance from x-axis
-        "model_label_y": -0.2,  # model-name y position in x-axis coords
+        "x_tick_label_pad": 13,  # PyTorch/SuperOffload label distance from x-axis
+        "model_label_y": -0.16,  # model-name y position in x-axis coords
         "axes_left": 0.12,
         "axes_right": 0.985,
         "axes_bottom": 0.22,
@@ -122,11 +153,25 @@ FIGURE_PARAMS = {
         "pair_gap": 0.19,     # PyTorch vs SuperOffload within one model
         "group_gap": 0.25,    # spacing BETWEEN model groups
         "x_margin": 0.11,     # padding beyond the outermost bar edges
-        "x_tick_label_pad": 10,  # PyTorch/SuperOffload label distance from x-axis
-        "model_label_y": -0.2,  # model-name y position in x-axis coords
+        "x_tick_label_pad": 13,  # PyTorch/SuperOffload label distance from x-axis
+        "model_label_y": -0.16,  # model-name y position in x-axis coords
         "axes_left": 0.12,
         "axes_right": 0.985,
         "axes_bottom": 0.22,
+        "axes_top": 0.86,
+        "dpi": 200,
+    },
+    "main": {
+        "height": 6,
+        "bar_width": 0.07,      # thickness of each of the 3 bars in a group
+        "intra_gap": 0.012,     # gap between adjacent bars WITHIN a model group
+        "group_gap": 0.085,     # gap between model groups
+        "x_margin": 0.05,       # padding beyond the outermost bar edges
+        "model_label_y": -0.045,   # model-name line, in axis-fraction below x-axis
+        "seq_label_y": -0.135,     # seq-length line, just under the model name
+        "axes_left": 0.072,
+        "axes_right": 0.995,
+        "axes_bottom": 0.20,
         "axes_top": 0.86,
         "dpi": 200,
     },
@@ -140,7 +185,7 @@ FIGURE_PARAMS = {
         "axes_top": 0.86,
         "dpi": 200,
         "line_width": 3,
-        "grid_color": "#d1d5db",
+        "grid_color": GRID_COLOR,
         "boundary_color": "#9ca3af",
     },
 }
@@ -216,6 +261,27 @@ def horizontal_legend(ax, handles, legend_key="default"):
     kw = dict(LEGEND_PARAMS[legend_key])
     kw["ncol"] = len(handles)   # one horizontal row
     return ax.legend(handles=handles, **kw)
+
+
+def grouped_layout(n_groups, n_series, bar_width, intra_gap, group_gap):
+    """x-positions for N bars per group (generalizes layout() beyond 2 bars).
+
+    Orthogonal knobs, all in data units:
+      bar_width = drawn width of each bar (also its footprint here).
+      intra_gap = edge-to-edge gap between adjacent bars WITHIN a group.
+      group_gap = edge-to-edge gap between the facing bars of adjacent groups.
+
+    Returns (bars, centers): bars[g] is the list of n_series x-positions for
+    group g (left -> right), centers[g] is that group's center. Flatten bars for
+    xlim_from_positions(): [x for grp in bars for x in grp].
+    """
+    series_step = bar_width + intra_gap                 # center-to-center within a group
+    group_span = (n_series - 1) * series_step           # edge bar center-to-center
+    group_step = group_span + bar_width + group_gap     # center-to-center between groups
+    centers = [g * group_step for g in range(n_groups)]
+    bars = [[c - group_span / 2.0 + s * series_step for s in range(n_series)]
+            for c in centers]
+    return bars, centers
 
 
 def layout(pair_gap, group_gap, n_groups):

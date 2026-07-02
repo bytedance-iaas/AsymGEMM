@@ -1,3 +1,5 @@
+bash scripts/figures/plot_main.sh
+
 bash scripts/figures/plot_c2c.sh
 
 bash scripts/figures/plot_lora_timing.sh

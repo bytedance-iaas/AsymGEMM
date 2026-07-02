@@ -86,7 +86,7 @@ def build_figure():
             if comp == "Optim. States":
                 ax.text(x, total + ymax * 0.015, f"{pct:.1f}%",
                         ha="center", va="bottom", fontsize=C.FONT_SIZE_SEGMENT,
-                        color="#1F4E79", fontweight="bold", zorder=4)
+                        color=C.DARK_BLUE, fontweight="bold", zorder=4)
             elif seg >= ymax * 0.07:
                 ax.text(x, bottom + seg / 2.0, f"{pct:.1f}%",
                         ha="center", va="center", fontsize=C.FONT_SIZE_SEGMENT,
@@ -102,7 +102,7 @@ def build_figure():
         a, b = 2 * g, 2 * g + 1
         y = BARS[a]["Activations"]
         ax.plot([xpos[a] - bar_w / 2.0, xpos[b] + bar_w / 2.0], [y, y],
-                lw=1.7, color="#B3261E", zorder=3.4)
+                lw=1.7, color=C.ACCENT_RED, zorder=3.4)
 
     ax.set_ylim(0, ymax * 1.24)
     tick_top = int(((ymax + 49) // 50) * 50)
@@ -120,7 +120,7 @@ def build_figure():
                 fontweight="bold", clip_on=False)
 
     ax.set_ylabel("HBM Usage (GiB)")
-    ax.grid(axis="y", color="#d1d5db", linewidth=0.6, alpha=0.8, zorder=0)
+    ax.grid(axis="y", color=C.GRID_COLOR, linewidth=0.6, alpha=0.8, zorder=0)
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
 

@@ -98,7 +98,7 @@ def build_figure():
         ax.text(
             xpos[2 * g + 1], _total(so) + ymax * 0.13, f"{speedup:.2f}× Speedup",
             ha="center", va="bottom", fontsize=C.FONT_SIZE_SEGMENT,
-            fontweight="bold", color="#B3261E",
+            fontweight="bold", color=C.ACCENT_RED,
         )
 
     # x ticks = backend; model group labels underneath
@@ -112,7 +112,7 @@ def build_figure():
                 fontweight="bold", clip_on=False)
 
     ax.set_ylabel("Time per step (ms)")
-    ax.grid(axis="y", color="#d1d5db", linewidth=0.6, alpha=0.8, zorder=0)
+    ax.grid(axis="y", color=C.GRID_COLOR, linewidth=0.6, alpha=0.8, zorder=0)
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
 
