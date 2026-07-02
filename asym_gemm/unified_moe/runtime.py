@@ -408,78 +408,17 @@ class Layer:
     # GPU bucket — grouped INT8 over pinned weights, one launch / projection
     # -----------------------------------------------------------
 
-    def _build_contiguous_layout(
-        self,
-        gpu_experts: list[int],
-        per_expert: list[list[int]],
-        per_expert_slot: list[list[int]],
-        device: torch.device,
-        block_m: int = BLOCK_M,
-    ):
-        """Pack the GPU-bucket experts into the AsymGEMM contiguous layout.
-
-        Returns:
-            M_grouped     : total padded row count
-            idx_to_orig   : [M_grouped] long device — original token row per
-                            grouped row (-1 if padding)
-            slot_to_orig  : [M_grouped] long device — original top-k slot per
-                            grouped row (-1 if padding)
-            offsets       : [2*K] int32 device — flat (start, end) per expert
-            experts       : [K+1] int32 device — expert ids + -1 sentinel
-            list_size     : int                   — len(experts)
-
-        Each expert's m_e is padded up to a multiple of block_m so the kernel's
-        per-expert row range satisfies its alignment requirement.
-        """
-        idx_list:  list[int] = []
-        slot_list: list[int] = []
-        offsets:   list[int] = []
-        experts:   list[int] = []
-        cur = 0
-        for e in gpu_experts:
-            rows  = per_expert[e]
-            slots = per_expert_slot[e]
-            m_e = len(rows)
-            if m_e == 0:
-                continue
-            m_padded = ((m_e + block_m - 1) // block_m) * block_m
-            idx_list.extend(rows)
-            slot_list.extend(slots)
-            if m_padded > m_e:
-                idx_list.extend([-1] * (m_padded - m_e))
-                slot_list.extend([-1] * (m_padded - m_e))
-            offsets.append(cur)
-            offsets.append(cur + m_padded)
-            experts.append(e)
-            cur += m_padded
-        experts.append(-1)
-
-        if cur == 0:
-            empty = torch.empty(0, dtype=torch.long, device=device)
-            return (0, empty, empty,
-                    torch.empty(0, dtype=torch.int32, device=device),
-                    torch.tensor([-1], dtype=torch.int32, device=device), 1)
-
-        return (
-            cur,
-            torch.tensor(idx_list,  dtype=torch.long, device=device),
-            torch.tensor(slot_list, dtype=torch.long, device=device),
-            torch.tensor(offsets,   dtype=torch.int32, device=device),
-            torch.tensor(experts,   dtype=torch.int32, device=device),
-            len(experts),
-        )
-
     def _gpu_grouped_forward(
         self,
         x_gpu: torch.Tensor,        # [T, H] bf16 device
-        gpu_experts: list[int],
-        per_expert: list[list[int]],
-        per_expert_slot: list[list[int]],
+        layout,                     # contiguous layout built in forward()
         route_w_gpu: torch.Tensor,  # [T, top_k] fp32 device
     ):
         """Run gate/up/down for all GPU-bucket experts in three grouped calls.
 
-        Returns (orig_rows_for_valid, y_weighted_fp32) where
+        ``layout`` is (M_grouped, idx_to_orig, slot_to_orig, offsets, experts,
+        list_size): the AsymGEMM contiguous layout, built vectorized on the
+        GPU in forward(). Returns (orig_rows_for_valid, y_weighted_fp32) where
         orig_rows_for_valid is a [n_valid] long tensor of source rows in the
         original [T, H] activations, and y_weighted_fp32 is [n_valid, H] fp32
         ready for ``out_fp32.index_add_(0, orig_rows, y_weighted_fp32)``.
@@ -489,9 +428,7 @@ class Layer:
         H, I = slab.hidden, slab.inter
         kb_h, kb_i = slab.kb_hidden, slab.kb_inter
 
-        M_grouped, idx_to_orig, slot_to_orig, offsets, experts, list_size = (
-            self._build_contiguous_layout(gpu_experts, per_expert,
-                                          per_expert_slot, dev))
+        M_grouped, idx_to_orig, slot_to_orig, offsets, experts, list_size = layout
         if M_grouped == 0:
             return None, None
 
@@ -558,66 +495,117 @@ class Layer:
         assert expert_ids.shape == (T, self.top_k)
         assert route_w.shape    == (T, self.top_k)
         in_device = x_bf16.device
+        G = self.slab.num_experts
+        K = self.top_k
 
-        # Per-expert token / slot lists (host-side dispatch decisions).
-        expert_ids_cpu = expert_ids.to("cpu").to(torch.int64)
-        per_expert:      list[list[int]] = [[] for _ in range(self.slab.num_experts)]
-        per_expert_slot: list[list[int]] = [[] for _ in range(self.slab.num_experts)]
-        ei = expert_ids_cpu.numpy()
-        for t in range(T):
-            for j in range(self.top_k):
-                e = int(ei[t, j])
-                per_expert[e].append(t)
-                per_expert_slot[e].append(j)
+        # ---- routing dispatch, vectorized on the device ----
+        # Sort the T*K routed items by expert id; each expert's items form one
+        # contiguous segment of the sorted order (stable sort keeps token order
+        # within an expert). The only host round-trip is the [G] counts vector
+        # — everything per-item stays on the GPU. (The old per-token Python
+        # loop here cost ~10 ms/layer at prefill.)
+        flat_e = expert_ids.reshape(-1)
+        if flat_e.dtype != torch.int64:
+            flat_e = flat_e.to(torch.int64)
+        counts = torch.bincount(flat_e, minlength=G)          # [G] device
+        order = torch.argsort(flat_e, stable=True)            # [T*K] device
+        rows_sorted = torch.div(order, K, rounding_mode="floor")
+        slots_sorted = order - rows_sorted * K
+        sorted_e = flat_e[order]
 
-        cpu_experts, gpu_experts = [], []
-        for e, rows in enumerate(per_expert):
-            if not rows:
-                continue
-            (cpu_experts if len(rows) <= self.m_cpu else gpu_experts).append(e)
+        counts_np = counts.cpu().numpy()                      # one small D2H
+        active = np.nonzero(counts_np)[0]
+        cpu_experts = active[counts_np[active] <= self.m_cpu]
+        gpu_experts = active[counts_np[active] > self.m_cpu]
+
+        # Per-expert start of its segment in the sorted order.
+        seg_start_np = np.zeros(G, dtype=np.int64)
+        np.cumsum(counts_np[:-1], out=seg_start_np[1:])
 
         out_fp32 = torch.zeros((T, H), dtype=torch.float32, device=in_device)
 
         # ---- CPU bucket: all experts in one worker-pool job ----
-        # One parallel_for over the CPU experts (each runs gate/up/silu/down on
-        # a single pool thread) instead of a Python loop of per-expert cg_gemm
-        # launches — recovers cross-expert parallelism that dominated at decode,
-        # where every expert holds one row.
-        if cpu_experts:
-            x_cpu_bf16 = x_bf16.to("cpu", dtype=torch.bfloat16).contiguous()
-            x_bits_all = torch_bf16_to_np_bits(x_cpu_bf16)
-            route_w_cpu = route_w.to("cpu", dtype=torch.float32).numpy()
+        # Gather the routed rows on the GPU, land them on the host in one copy,
+        # run the batched AMX kernel, then apply routing weights and scatter-add
+        # back on the GPU (np.add.at on the host was another prefill hotspot).
+        if len(cpu_experts):
             slab = self.slab
+            cpu_e_t = torch.from_numpy(cpu_experts).to(in_device)
+            is_cpu_item = torch.isin(sorted_e, cpu_e_t)
+            rows_cpu = rows_sorted[is_cpu_item]
+            slots_cpu = slots_sorted[is_cpu_item]
 
-            rows_cat  = np.concatenate([per_expert[e] for e in cpu_experts])
-            slots_cat = np.concatenate([per_expert_slot[e] for e in cpu_experts])
+            x_cat_t = (
+                x_bf16.index_select(0, rows_cpu).to("cpu").contiguous()
+            )
+            x_cat = torch_bf16_to_np_bits(x_cat_t)
+
             m_offsets = np.zeros(len(cpu_experts) + 1, dtype=np.int64)
-            np.cumsum([len(per_expert[e]) for e in cpu_experts], out=m_offsets[1:])
-            expert_ids = np.asarray(cpu_experts, dtype=np.int64)
-
-            x_cat = np.ascontiguousarray(x_bits_all[rows_cat])
-            out_cat = np.empty((rows_cat.shape[0], H), dtype=np.float32)
+            np.cumsum(counts_np[cpu_experts], out=m_offsets[1:])
+            out_cat = np.empty((int(m_offsets[-1]), H), dtype=np.float32)
             _C.moe_expert_forward_batch(
-                self.rt, x_cat, m_offsets, expert_ids,
+                self.rt, x_cat, m_offsets, cpu_experts.astype(np.int64),
                 slab.gate_int8.numpy(), slab.gate_scales.numpy(),
                 slab.up_int8.numpy(),   slab.up_scales.numpy(),
                 slab.down_int8.numpy(), slab.down_scales.numpy(),
                 out_cat, slab.inter, slab.hidden,
             )
 
-            cpu_out = np.zeros((T, H), dtype=np.float32)
-            w = route_w_cpu[rows_cat, slots_cat][:, None]
-            np.add.at(cpu_out, rows_cat, out_cat * w)
-            out_fp32 += torch.from_numpy(cpu_out).to(in_device, non_blocking=True)
+            y_cpu = torch.from_numpy(out_cat).to(in_device, non_blocking=True)
+            w = route_w[rows_cpu, slots_cpu].to(torch.float32)
+            out_fp32.index_add_(0, rows_cpu, y_cpu * w[:, None])
 
         # ---- GPU bucket (grouped INT8 over pinned weights) ----
-        if gpu_experts:
+        if len(gpu_experts):
             if not torch.cuda.is_available():
                 raise RuntimeError("GPU bucket non-empty but no CUDA device available.")
+
+            # Contiguous layout, vectorized: expert g's items land at
+            # pad_start[g] + rank-within-segment; every expert's block is
+            # padded to BLOCK_M for the kernel's per-expert row alignment.
+            m_padded = ((counts_np[gpu_experts] + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
+            pad_start_np = np.zeros(G, dtype=np.int64)
+            pad_start_np[gpu_experts] = np.concatenate(
+                ([0], np.cumsum(m_padded[:-1]))
+            )
+            M_grouped = int(m_padded.sum())
+
+            offsets_np = np.empty(2 * len(gpu_experts), dtype=np.int32)
+            offsets_np[0::2] = pad_start_np[gpu_experts]
+            offsets_np[1::2] = pad_start_np[gpu_experts] + m_padded
+            experts_np = np.concatenate(
+                (gpu_experts, [-1])
+            ).astype(np.int32)
+
+            gpu_e_t = torch.from_numpy(gpu_experts).to(in_device)
+            seg_start = torch.from_numpy(seg_start_np).to(in_device)
+            pad_start = torch.from_numpy(pad_start_np).to(in_device)
+
+            is_gpu_item = torch.isin(sorted_e, gpu_e_t)
+            pos = torch.nonzero(is_gpu_item, as_tuple=False).squeeze(-1)
+            e_sel = sorted_e[pos]
+            dest = pad_start[e_sel] + (pos - seg_start[e_sel])
+
+            idx_to_orig = torch.full(
+                (M_grouped,), -1, dtype=torch.long, device=in_device
+            )
+            slot_to_orig = torch.full_like(idx_to_orig, -1)
+            idx_to_orig[dest] = rows_sorted[pos]
+            slot_to_orig[dest] = slots_sorted[pos]
+
+            layout = (
+                M_grouped,
+                idx_to_orig,
+                slot_to_orig,
+                torch.from_numpy(offsets_np).to(in_device),
+                torch.from_numpy(experts_np).to(in_device),
+                len(experts_np),
+            )
+
             x_gpu_bf16 = x_bf16.to(in_device, dtype=torch.bfloat16).contiguous()
             route_w_gpu = route_w.to(in_device, dtype=torch.float32)
             orig_rows, y_w = self._gpu_grouped_forward(
-                x_gpu_bf16, gpu_experts, per_expert, per_expert_slot, route_w_gpu,
+                x_gpu_bf16, layout, route_w_gpu,
             )
             if orig_rows is not None:
                 out_fp32.index_add_(0, orig_rows, y_w)
