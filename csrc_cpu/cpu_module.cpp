@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -177,13 +178,42 @@ void gemm_bf16_int8_packed_py(
 /*
  * Per-expert batched MoE compute over a concatenated [sum_m, hidden] layout.
  *
- * One parallel_for over the E experts (each on its own single-thread serial
- * runtime): gate/up -> SiLU*up -> down, writing expert e's [m_e, hidden] block
- * into out_base[off[e]..]. NO routing weights / reduce (the caller applies
- * those). Drives the worker pool directly; the caller must already hold no GIL
- * (pybind wrapper releases it; the CUDA host node has none). Returns false on
- * the first failing expert.
+ * Work is split at (expert, N-tile) granularity in two pool phases so a small
+ * expert count still engages the whole pool. At decode (8 experts, m_e = 1)
+ * the old one-task-per-expert layout left every expert on a single thread,
+ * bound by one core's memory bandwidth (~50 GB/s total); N-tiling the weight
+ * reads across the pool reaches the socket's full bandwidth.
+ *
+ *   phase 1: tasks = (expert, tile of `inter`)  — gate/up GEMMs for the tile's
+ *            output channels, fused SiLU*up, bf16 round into the shared act
+ *            workspace (elementwise in the tiled dim, so no cross-tile deps).
+ *   phase 2: tasks = (expert, tile of `hidden`) — down GEMM for the tile,
+ *            reading the expert's full act rows (a K-dim read, needs phase 1
+ *            complete — hence the two parallel_for barriers).
+ *
+ * Each task runs its GEMM on its own single-thread serial runtime (inline, no
+ * nested pool wake). NO routing weights / reduce (the caller applies those).
+ * The caller must already hold no GIL (pybind wrapper releases it; the CUDA
+ * host node has none).
  */
+
+// Lower bound of tile `i` of `t` even tiles over `n`, aligned down to 32
+// (a multiple of the AMX 16-column tile). tile_lo(n, t, t) == n.
+static inline size_t tile_lo(size_t n, int t, int i) {
+  if (i >= t) return n;
+  return (n * (size_t)i / (size_t)t) & ~(size_t)31;
+}
+
+// Tiles per expert for an N-dim of `n`: enough that E experts yield ~4 tasks
+// per pool thread (diminishing returns beyond), capped so tiles stay >= 64
+// columns (128 B rows — cache-line aligned, and wide enough for the AMX
+// kernel to stay efficient).
+static inline int pick_tiles(size_t n, int E, int threads) {
+  const int max_t = (int)std::max<size_t>(1, n / 64);
+  const long want = (4L * threads + E - 1) / E;
+  return (int)std::min<long>(max_t, std::max(1L, want));
+}
+
 bool moe_compute_core(
     RuntimeHandle& rt,
     const uint16_t* x_base,      // [sum_m, hidden] bf16 bits
@@ -195,53 +225,98 @@ bool moe_compute_core(
     const int8_t* down_b, const float* down_s,   // [G, hidden, inter], [G, hidden]
     int64_t G, float* out_base, size_t inter, size_t hidden) {
   if (E <= 0) return true;
-  rt.ensure_serial((size_t)E);
-  std::atomic<int> first_err{-1};
-  rt.rt->pool->parallel_for(E, [&](int e) {
-    const int64_t g = eid[(size_t)e];
-    if (g < 0 || g >= G) { first_err.store(e); return; }
+  for (int e = 0; e < E; ++e)
+    if (eid[e] < 0 || eid[e] >= G) return false;
+
+  const int threads = rt.threads();
+  const int t1 = pick_tiles(inter, E, threads);
+  const int t2 = pick_tiles(hidden, E, threads);
+  rt.ensure_serial((size_t)E * (size_t)std::max(t1, t2));
+
+  // Shared act workspace [sum_m, inter] (bf16 bits), indexed by off[e]*inter.
+  // One MoE layer runs at a time (graph nodes are stream-ordered; the eager
+  // path is serialized by the caller), so a single growable buffer suffices;
+  // the mutex makes an unexpected concurrent caller safe rather than corrupt.
+  static std::mutex ws_mu;
+  static std::vector<uint16_t> act_ws;
+  std::lock_guard<std::mutex> ws_lk(ws_mu);
+  const size_t act_elems = (size_t)off[E] * inter;
+  if (act_ws.size() < act_elems) act_ws.resize(act_elems);
+  uint16_t* act_base = act_ws.data();
+
+  std::atomic<bool> ok{true};
+
+  // ---- phase 1: gate/up tiles + fused SiLU*up -> act ----
+  rt.rt->pool->parallel_for(E * t1, [&](int task) {
+    const int e = task / t1, ti = task % t1;
+    const int64_t g = eid[e];
     const ssize_t m = off[e + 1] - off[e];
     if (m <= 0) return;
-    cg_runtime_t* srt = rt.serial_rts[(size_t)e]->rt;
-    const size_t mi = (size_t)m * inter;
+    const size_t ts = tile_lo(inter, t1, ti);
+    const size_t te = tile_lo(inter, t1, ti + 1);
+    if (te <= ts) return;
+    const size_t tn = te - ts;
+    cg_runtime_t* srt = rt.serial_rts[(size_t)task]->rt;
 
-    std::vector<float>    c_gate(mi), c_up(mi);
-    std::vector<uint16_t> act(mi);
+    std::vector<float> c_gate((size_t)m * tn), c_up((size_t)m * tn);
 
     auto d = cpu_gemm::make_desc();
     d.alpha = 1.0f; d.beta = 0.0f;
     d.dtype_a = CG_BF16; d.dtype_b = CG_INT8; d.dtype_c = CG_F32;
 
-    // gate = x @ Wgate^T   [m, inter]
-    d.m = (size_t)m; d.k = hidden; d.n = inter;
+    // gate tile = x @ Wgate[ts:te]^T   [m, tn]
+    d.m = (size_t)m; d.k = hidden; d.n = tn;
     d.a = x_base + off[e] * (ssize_t)hidden; d.lda = hidden;
-    d.b = gate_b + (size_t)g * inter * hidden; d.ldb = hidden;
-    d.b_scales = gate_s + (size_t)g * inter;
-    d.c = c_gate.data(); d.ldc = inter;
-    if (cg_gemm(srt, &d) != CG_OK) { first_err.store(e); return; }
+    d.b = gate_b + ((size_t)g * inter + ts) * hidden; d.ldb = hidden;
+    d.b_scales = gate_s + (size_t)g * inter + ts;
+    d.c = c_gate.data(); d.ldc = tn;
+    if (cg_gemm(srt, &d) != CG_OK) { ok.store(false); return; }
 
-    // up = x @ Wup^T   [m, inter]
-    d.b = up_b + (size_t)g * inter * hidden;
-    d.b_scales = up_s + (size_t)g * inter;
+    // up tile = x @ Wup[ts:te]^T   [m, tn]
+    d.b = up_b + ((size_t)g * inter + ts) * hidden;
+    d.b_scales = up_s + (size_t)g * inter + ts;
     d.c = c_up.data();
-    if (cg_gemm(srt, &d) != CG_OK) { first_err.store(e); return; }
+    if (cg_gemm(srt, &d) != CG_OK) { ok.store(false); return; }
 
-    // act = silu(gate) * up, rounded to bf16 (matches the GPU path's round-trip)
-    for (size_t i = 0; i < mi; ++i) {
-      float gg = c_gate[i];
-      float a = (gg / (1.0f + std::exp(-gg))) * c_up[i];
-      act[i] = fp32_to_bf16_rne(a);
+    // act tile = silu(gate) * up, rounded to bf16 (matches the GPU path)
+    uint16_t* act_e = act_base + (size_t)off[e] * inter;
+    for (ssize_t r = 0; r < m; ++r) {
+      const float* pg = &c_gate[(size_t)r * tn];
+      const float* pu = &c_up[(size_t)r * tn];
+      uint16_t* pa = act_e + (size_t)r * inter + ts;
+      for (size_t i = 0; i < tn; ++i) {
+        const float gg = pg[i];
+        pa[i] = fp32_to_bf16_rne((gg / (1.0f + std::exp(-gg))) * pu[i]);
+      }
     }
-
-    // down = act @ Wdown^T   [m, hidden]
-    d.m = (size_t)m; d.k = inter; d.n = hidden;
-    d.a = act.data(); d.lda = inter;
-    d.b = down_b + (size_t)g * hidden * inter; d.ldb = inter;
-    d.b_scales = down_s + (size_t)g * hidden;
-    d.c = out_base + off[e] * (ssize_t)hidden; d.ldc = hidden;
-    if (cg_gemm(srt, &d) != CG_OK) { first_err.store(e); return; }
   });
-  return first_err.load() < 0;
+  if (!ok.load()) return false;
+
+  // ---- phase 2: down tiles ----
+  rt.rt->pool->parallel_for(E * t2, [&](int task) {
+    const int e = task / t2, ti = task % t2;
+    const int64_t g = eid[e];
+    const ssize_t m = off[e + 1] - off[e];
+    if (m <= 0) return;
+    const size_t ts = tile_lo(hidden, t2, ti);
+    const size_t te = tile_lo(hidden, t2, ti + 1);
+    if (te <= ts) return;
+    const size_t tn = te - ts;
+    cg_runtime_t* srt = rt.serial_rts[(size_t)task]->rt;
+
+    auto d = cpu_gemm::make_desc();
+    d.alpha = 1.0f; d.beta = 0.0f;
+    d.dtype_a = CG_BF16; d.dtype_b = CG_INT8; d.dtype_c = CG_F32;
+
+    // down tile = act @ Wdown[ts:te]^T   [m, tn]
+    d.m = (size_t)m; d.k = inter; d.n = tn;
+    d.a = act_base + (size_t)off[e] * inter; d.lda = inter;
+    d.b = down_b + ((size_t)g * hidden + ts) * inter; d.ldb = inter;
+    d.b_scales = down_s + (size_t)g * hidden + ts;
+    d.c = out_base + off[e] * (ssize_t)hidden + ts; d.ldc = hidden;
+    if (cg_gemm(srt, &d) != CG_OK) { ok.store(false); return; }
+  });
+  return ok.load();
 }
 
 /*
