@@ -132,26 +132,104 @@ def init_capturable_decode(layer, batch_sizes) -> None:
             cap[t] = _DecodeBuffers(layer, t)
     layer._capturable = cap
 
+    # With a VRAM expert cache, the capturable path launches the grouped INT8
+    # kernel with min(T*K, cache_n)+1 groups. Run each distinct shape once now,
+    # eagerly, so the JIT ensure-compile (which synchronizes the stream) never
+    # fires inside graph capture. The compile cache is process-global — warm
+    # only once, on the first layer.
+    if getattr(layer, "cache_n", 0) > 0 and _warm_cached_shapes(layer):
+        dev = f"cuda:{layer.cuda_device}"
+        H, K = layer.slab.hidden, layer.top_k
+        for t in sorted({int(b) for b in batch_sizes}):
+            x = torch.zeros(t, H, dtype=torch.bfloat16, device=dev)
+            eids = torch.zeros(t, K, dtype=torch.int64, device=dev)
+            rw = torch.ones(t, K, dtype=torch.float32, device=dev)
+            layer._cached_gpu_decode(x, eids, rw)
+        torch.cuda.synchronize()
+
+
+_warmed_cache_keys = set()
+
+
+def _warm_cached_shapes(layer) -> bool:
+    key = (layer.cache_n, layer.slab.hidden, layer.slab.inter, layer.top_k)
+    if key in _warmed_cache_keys:
+        return False
+    _warmed_cache_keys.add(key)
+    return True
+
 
 def capturable_decode_supported(layer, T: int) -> bool:
     return int(T) in getattr(layer, "_capturable", {})
 
 
 def capturable_decode_forward(layer, x_bf16, expert_ids, route_w):
-    """Issue the capturable [D2H -> host node -> H2D] chain; return out_gpu.
+    """Issue the capturable decode MoE; return the layer output.
 
     ``expert_ids`` [T,K] must be clamped >= 0; ``route_w`` [T,K] must already be
-    masked (invalid slots = 0) and scaled. The returned tensor is a fixed,
-    per-layer device buffer — safe to wire into the captured graph.
+    masked (invalid slots = 0) and scaled.
+
+    Without a VRAM expert cache this is the pure [D2H -> host node -> H2D]
+    chain over fixed pinned buffers. With a cache (layer.cache_n > 0) the two
+    engines run concurrently inside the graph: the CPU chain is forked onto a
+    side stream (cached items' route weights zeroed so the host node skips
+    them) while the main stream computes the cached experts with the grouped
+    INT8 kernel over HBM-resident weights; an event join then sums the two
+    partial outputs. All of it is stream-ordered, so capture/replay works
+    exactly as before.
     """
     T = x_bf16.shape[0]
+    Nc = getattr(layer, "cache_n", 0)
+    if Nc >= layer.slab.num_experts and Nc > 0:
+        # Every expert is cached: pure-GPU decode, no host node at all.
+        return layer._cached_gpu_decode(x_bf16, expert_ids, route_w)
+
     buf = layer._capturable[int(T)]
-    # copy_ casts dtype in-kernel (no Python temp); sources are decode
-    # intermediates with stable addresses inside the capture mempool.
-    buf.x_cpu.copy_(x_bf16, non_blocking=True)
-    buf.eid_cpu.copy_(expert_ids, non_blocking=True)
-    buf.rw_cpu.copy_(route_w, non_blocking=True)
-    stream = torch.cuda.current_stream(x_bf16.device).cuda_stream
-    _launch_host_func(stream, _host_fn_ptr(), buf.args)
-    buf.out_gpu.copy_(buf.out_cpu, non_blocking=True)
-    return buf.out_gpu
+    if Nc == 0:
+        # copy_ casts dtype in-kernel (no Python temp); sources are decode
+        # intermediates with stable addresses inside the capture mempool.
+        buf.x_cpu.copy_(x_bf16, non_blocking=True)
+        buf.eid_cpu.copy_(expert_ids, non_blocking=True)
+        buf.rw_cpu.copy_(route_w, non_blocking=True)
+        stream = torch.cuda.current_stream(x_bf16.device).cuda_stream
+        _launch_host_func(stream, _host_fn_ptr(), buf.args)
+        buf.out_gpu.copy_(buf.out_cpu, non_blocking=True)
+        return buf.out_gpu
+
+    # ---- hybrid: CPU chain on a side stream, cached experts on the main ----
+    slot = layer.cached_slot[expert_ids]                  # [T, K]
+    on_gpu = slot >= 0
+    rw_cpu = torch.where(on_gpu, torch.zeros_like(route_w), route_w)
+
+    main = torch.cuda.current_stream(x_bf16.device)
+    side = _side_stream(x_bf16.device)
+    ev_fork = torch.cuda.Event()
+    ev_join = torch.cuda.Event()
+    ev_fork.record(main)
+    side.wait_event(ev_fork)
+    with torch.cuda.stream(side):
+        buf.x_cpu.copy_(x_bf16, non_blocking=True)
+        buf.eid_cpu.copy_(expert_ids, non_blocking=True)
+        buf.rw_cpu.copy_(rw_cpu, non_blocking=True)
+        _launch_host_func(side.cuda_stream, _host_fn_ptr(), buf.args)
+        buf.out_gpu.copy_(buf.out_cpu, non_blocking=True)
+        ev_join.record(side)
+    if not torch.cuda.is_current_stream_capturing():
+        # Eager: keep the temp alive for the side stream's async copy.
+        rw_cpu.record_stream(side)
+
+    # Runs on the main stream, concurrent with the host node above.
+    y_gpu = layer._cached_gpu_decode(x_bf16, expert_ids, route_w)
+
+    main.wait_event(ev_join)
+    return y_gpu + buf.out_gpu
+
+
+_side = None
+
+
+def _side_stream(device):
+    global _side
+    if _side is None:
+        _side = torch.cuda.Stream(device=device)
+    return _side
