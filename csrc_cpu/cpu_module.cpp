@@ -11,13 +11,18 @@
  * on the Python boundary (auto-converting where safe; rejecting otherwise).
  * Arrays are required C-contiguous via py::array::c_style.
  */
+#include <sched.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <stdexcept>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include <pybind11/numpy.h>
@@ -40,8 +45,60 @@ void check(cg_status_t s, const char* where) {
   throw std::runtime_error(std::string(where) + " failed: status=" + std::to_string((int)s));
 }
 
+// ---------------------------------------------------------------------------
+// NUMA helpers (no libnuma dependency)
+// ---------------------------------------------------------------------------
+
+// CPUs of a NUMA node, parsed from sysfs ("48-95,144-191" style).
+static std::vector<int> numa_node_cpus(int node) {
+  std::vector<int> cpus;
+  std::ifstream f("/sys/devices/system/node/node" + std::to_string(node) +
+                  "/cpulist");
+  std::string s;
+  if (!f || !std::getline(f, s)) return cpus;
+  size_t i = 0;
+  while (i < s.size()) {
+    size_t j = s.find(',', i);
+    std::string tok = s.substr(i, j == std::string::npos ? std::string::npos
+                                                         : j - i);
+    size_t dash = tok.find('-');
+    try {
+      if (dash == std::string::npos) {
+        cpus.push_back(std::stoi(tok));
+      } else {
+        int a = std::stoi(tok.substr(0, dash));
+        int b = std::stoi(tok.substr(dash + 1));
+        for (int c = a; c <= b; ++c) cpus.push_back(c);
+      }
+    } catch (...) { return {}; }
+    if (j == std::string::npos) break;
+    i = j + 1;
+  }
+  return cpus;
+}
+
+// Temporarily restrict the calling thread to `cpus`; spawned std::threads
+// inherit the creator's affinity, which is how a WorkerPool gets bound to a
+// node without any change to the (portable) pool itself.
+struct ScopedAffinity {
+  cpu_set_t old_{};
+  bool active_ = false;
+  explicit ScopedAffinity(const std::vector<int>& cpus) {
+    if (cpus.empty()) return;
+    if (sched_getaffinity(0, sizeof(old_), &old_) != 0) return;
+    cpu_set_t st;
+    CPU_ZERO(&st);
+    for (int c : cpus) CPU_SET(c, &st);
+    active_ = (sched_setaffinity(0, sizeof(st), &st) == 0);
+  }
+  ~ScopedAffinity() {
+    if (active_) sched_setaffinity(0, sizeof(old_), &old_);
+  }
+};
+
 struct RuntimeHandle {
-  cg_runtime_t* rt = nullptr;
+  cg_runtime_t* rt = nullptr;      // primary pool (node A's in NUMA-TP mode)
+  cg_runtime_t* rt_b = nullptr;    // node B's pool (NUMA-TP mode only)
   // One single-thread runtime per concurrent MoE work item. A 1-thread
   // runtime executes cg_gemm fully inline (no pool wake) and owns its own
   // scratch arena, so concurrent use from distinct pool workers is safe.
@@ -51,8 +108,35 @@ struct RuntimeHandle {
     rt = cg_runtime_create(n_threads);
     if (!rt) throw std::runtime_error("cg_runtime_create returned NULL");
   }
-  ~RuntimeHandle() { if (rt) cg_runtime_destroy(rt); }
-  int threads() const { return cg_runtime_threads(rt); }
+
+  // NUMA tensor-parallel mode: two pools, each with its worker threads bound
+  // to one node (threads inherit the creator's affinity at spawn). Expert
+  // weights are split into node-local halves by the caller; each pool only
+  // reads its own node's bytes, so the MoE gets both sockets' local memory
+  // bandwidth instead of one node's (or half-remote interleaved) bandwidth.
+  RuntimeHandle(int n_threads, int node_a, int node_b) {
+    const int na = std::max(1, n_threads / 2);
+    const int nb = std::max(1, n_threads - na);
+    {
+      ScopedAffinity aff(numa_node_cpus(node_a));
+      rt = cg_runtime_create(na);
+    }
+    if (!rt) throw std::runtime_error("cg_runtime_create returned NULL");
+    {
+      ScopedAffinity aff(numa_node_cpus(node_b));
+      rt_b = cg_runtime_create(nb);
+    }
+    if (!rt_b) throw std::runtime_error("cg_runtime_create (node B) returned NULL");
+  }
+
+  ~RuntimeHandle() {
+    if (rt) cg_runtime_destroy(rt);
+    if (rt_b) cg_runtime_destroy(rt_b);
+  }
+  int threads() const {
+    return cg_runtime_threads(rt) + (rt_b ? cg_runtime_threads(rt_b) : 0);
+  }
+  bool numa_tp() const { return rt_b != nullptr; }
 
   void ensure_serial(size_t count) {
     while (serial_rts.size() < count)
@@ -214,19 +298,37 @@ static inline int pick_tiles(size_t n, int E, int threads) {
   return (int)std::min<long>(max_t, std::max(1L, want));
 }
 
+// One slab half's base pointers. In NUMA-TP mode experts [0, g_split) live in
+// half A (node A local pages) and experts [g_split, G) in half B (node B),
+// indexed by g - g_split. Without NUMA-TP, half A holds all G experts and
+// half B is null.
+struct SlabHalf {
+  const int8_t* gate_b = nullptr; const float* gate_s = nullptr;
+  const int8_t* up_b   = nullptr; const float* up_s   = nullptr;
+  const int8_t* down_b = nullptr; const float* down_s = nullptr;
+};
+
 bool moe_compute_core(
     RuntimeHandle& rt,
     const uint16_t* x_base,      // [sum_m, hidden] bf16 bits
     const int64_t* off,          // [E+1]
     const int64_t* eid,          // [E] global expert id per item
     int E,
-    const int8_t* gate_b, const float* gate_s,   // [G, inter, hidden], [G, inter]
-    const int8_t* up_b,   const float* up_s,
-    const int8_t* down_b, const float* down_s,   // [G, hidden, inter], [G, hidden]
+    const SlabHalf& ha, const SlabHalf& hb, int64_t g_split,
     int64_t G, float* out_base, size_t inter, size_t hidden) {
   if (E <= 0) return true;
   for (int e = 0; e < E; ++e)
     if (eid[e] < 0 || eid[e] >= G) return false;
+
+  const bool tp = rt.numa_tp() && hb.gate_b != nullptr;
+
+  // Partition work items by owning node (everything to pool A without TP).
+  std::vector<int> items_a, items_b;
+  items_a.reserve(E);
+  for (int e = 0; e < E; ++e) {
+    if (tp && eid[e] >= g_split) items_b.push_back(e);
+    else items_a.push_back(e);
+  }
 
   const int threads = rt.threads();
   const int t1 = pick_tiles(inter, E, threads);
@@ -246,9 +348,15 @@ bool moe_compute_core(
 
   std::atomic<bool> ok{true};
 
-  // ---- phase 1: gate/up tiles + fused SiLU*up -> act ----
-  rt.rt->pool->parallel_for(E * t1, [&](int task) {
-    const int e = task / t1, ti = task % t1;
+  auto half_of = [&](int64_t g) -> const SlabHalf& {
+    return (g < g_split || hb.gate_b == nullptr) ? ha : hb;
+  };
+  auto local_g = [&](int64_t g) -> size_t {
+    return (size_t)((g < g_split || hb.gate_b == nullptr) ? g : g - g_split);
+  };
+
+  // ---- phase 1 body: gate/up tiles + fused SiLU*up -> act ----
+  auto phase1 = [&](int e, int ti) {
     const int64_t g = eid[e];
     const ssize_t m = off[e + 1] - off[e];
     if (m <= 0) return;
@@ -256,7 +364,9 @@ bool moe_compute_core(
     const size_t te = tile_lo(inter, t1, ti + 1);
     if (te <= ts) return;
     const size_t tn = te - ts;
-    cg_runtime_t* srt = rt.serial_rts[(size_t)task]->rt;
+    cg_runtime_t* srt = rt.serial_rts[(size_t)e * t1 + ti]->rt;
+    const SlabHalf& hf = half_of(g);
+    const size_t lg = local_g(g);
 
     std::vector<float> c_gate((size_t)m * tn), c_up((size_t)m * tn);
 
@@ -267,14 +377,14 @@ bool moe_compute_core(
     // gate tile = x @ Wgate[ts:te]^T   [m, tn]
     d.m = (size_t)m; d.k = hidden; d.n = tn;
     d.a = x_base + off[e] * (ssize_t)hidden; d.lda = hidden;
-    d.b = gate_b + ((size_t)g * inter + ts) * hidden; d.ldb = hidden;
-    d.b_scales = gate_s + (size_t)g * inter + ts;
+    d.b = hf.gate_b + (lg * inter + ts) * hidden; d.ldb = hidden;
+    d.b_scales = hf.gate_s + lg * inter + ts;
     d.c = c_gate.data(); d.ldc = tn;
     if (cg_gemm(srt, &d) != CG_OK) { ok.store(false); return; }
 
     // up tile = x @ Wup[ts:te]^T   [m, tn]
-    d.b = up_b + ((size_t)g * inter + ts) * hidden;
-    d.b_scales = up_s + (size_t)g * inter + ts;
+    d.b = hf.up_b + (lg * inter + ts) * hidden;
+    d.b_scales = hf.up_s + lg * inter + ts;
     d.c = c_up.data();
     if (cg_gemm(srt, &d) != CG_OK) { ok.store(false); return; }
 
@@ -289,12 +399,10 @@ bool moe_compute_core(
         pa[i] = fp32_to_bf16_rne((gg / (1.0f + std::exp(-gg))) * pu[i]);
       }
     }
-  });
-  if (!ok.load()) return false;
+  };
 
-  // ---- phase 2: down tiles ----
-  rt.rt->pool->parallel_for(E * t2, [&](int task) {
-    const int e = task / t2, ti = task % t2;
+  // ---- phase 2 body: down tiles ----
+  auto phase2 = [&](int e, int ti) {
     const int64_t g = eid[e];
     const ssize_t m = off[e + 1] - off[e];
     if (m <= 0) return;
@@ -302,7 +410,9 @@ bool moe_compute_core(
     const size_t te = tile_lo(hidden, t2, ti + 1);
     if (te <= ts) return;
     const size_t tn = te - ts;
-    cg_runtime_t* srt = rt.serial_rts[(size_t)task]->rt;
+    cg_runtime_t* srt = rt.serial_rts[(size_t)e * t2 + ti]->rt;
+    const SlabHalf& hf = half_of(g);
+    const size_t lg = local_g(g);
 
     auto d = cpu_gemm::make_desc();
     d.alpha = 1.0f; d.beta = 0.0f;
@@ -311,11 +421,43 @@ bool moe_compute_core(
     // down tile = act @ Wdown[ts:te]^T   [m, tn]
     d.m = (size_t)m; d.k = inter; d.n = tn;
     d.a = act_base + (size_t)off[e] * inter; d.lda = inter;
-    d.b = down_b + ((size_t)g * hidden + ts) * inter; d.ldb = inter;
-    d.b_scales = down_s + (size_t)g * hidden + ts;
+    d.b = hf.down_b + (lg * hidden + ts) * inter; d.ldb = inter;
+    d.b_scales = hf.down_s + lg * hidden + ts;
     d.c = out_base + off[e] * (ssize_t)hidden + ts; d.ldc = hidden;
     if (cg_gemm(srt, &d) != CG_OK) { ok.store(false); return; }
-  });
+  };
+
+  // Run one phase over both pools concurrently: pool A chews its node's
+  // items on this thread while a helper thread drives pool B (each pool's
+  // workers are affinity-bound to their node and read node-local weights).
+  auto run_phase = [&](int tiles, auto&& body) {
+    if (!tp || items_b.empty()) {
+      const std::vector<int>& it = items_a.empty() ? items_b : items_a;
+      rt.rt->pool->parallel_for((int)it.size() * tiles, [&](int task) {
+        body(it[task / tiles], task % tiles);
+      });
+      return;
+    }
+    if (items_a.empty()) {
+      rt.rt_b->pool->parallel_for((int)items_b.size() * tiles, [&](int task) {
+        body(items_b[task / tiles], task % tiles);
+      });
+      return;
+    }
+    std::thread tb([&] {
+      rt.rt_b->pool->parallel_for((int)items_b.size() * tiles, [&](int task) {
+        body(items_b[task / tiles], task % tiles);
+      });
+    });
+    rt.rt->pool->parallel_for((int)items_a.size() * tiles, [&](int task) {
+      body(items_a[task / tiles], task % tiles);
+    });
+    tb.join();
+  };
+
+  run_phase(t1, phase1);
+  if (!ok.load()) return false;
+  run_phase(t2, phase2);
   return ok.load();
 }
 
@@ -334,6 +476,14 @@ void moe_expert_forward_batch_py(
     py::array_t<float,    py::array::c_style> up_scales,   // [G, inter]
     py::array_t<int8_t,   py::array::c_style> down_int8,   // [G, hidden, inter]
     py::array_t<float,    py::array::c_style> down_scales, // [G, hidden]
+    // Optional node-B half (NUMA-TP): experts [g_split, G) with local index
+    // g - g_split. Pass size-0 arrays when not split.
+    py::array_t<int8_t,   py::array::c_style> gate_int8_b,
+    py::array_t<float,    py::array::c_style> gate_scales_b,
+    py::array_t<int8_t,   py::array::c_style> up_int8_b,
+    py::array_t<float,    py::array::c_style> up_scales_b,
+    py::array_t<int8_t,   py::array::c_style> down_int8_b,
+    py::array_t<float,    py::array::c_style> down_scales_b,
     py::array_t<float,    py::array::c_style> out_cat,     // [sum_m, hidden] fp32
     size_t inter, size_t hidden) {
   if (x_cat.ndim() != 2 || out_cat.ndim() != 2 ||
@@ -350,24 +500,29 @@ void moe_expert_forward_batch_py(
     throw std::invalid_argument("expert_ids length != len(m_offsets)-1");
   if (E == 0) return;
 
-  const int64_t  G          = gate_int8.shape(0);
+  const int64_t g_split     = gate_int8.shape(0);
+  const bool has_b          = gate_int8_b.size() > 0;
+  const int64_t G           = g_split + (has_b ? gate_int8_b.shape(0) : 0);
   const int64_t* off        = m_offsets.data();
   const int64_t* eid        = expert_ids.data();
   const uint16_t* x_base    = x_cat.data();
   float*          out_base  = out_cat.mutable_data();
-  const int8_t*  gate_b     = gate_int8.data();
-  const float*   gate_s     = gate_scales.data();
-  const int8_t*  up_b       = up_int8.data();
-  const float*   up_s       = up_scales.data();
-  const int8_t*  down_b     = down_int8.data();
-  const float*   down_s     = down_scales.data();
+
+  SlabHalf ha{gate_int8.data(), gate_scales.data(),
+              up_int8.data(),   up_scales.data(),
+              down_int8.data(), down_scales.data()};
+  SlabHalf hb;
+  if (has_b) {
+    hb = SlabHalf{gate_int8_b.data(), gate_scales_b.data(),
+                  up_int8_b.data(),   up_scales_b.data(),
+                  down_int8_b.data(), down_scales_b.data()};
+  }
 
   bool ok;
   {
     py::gil_scoped_release rel;
     ok = moe_compute_core(rt, x_base, off, eid, (int)E,
-                          gate_b, gate_s, up_b, up_s, down_b, down_s,
-                          G, out_base, inter, hidden);
+                          ha, hb, g_split, G, out_base, inter, hidden);
   }
   if (!ok)
     throw std::runtime_error("moe_expert_forward_batch: expert compute failed");
@@ -399,14 +554,14 @@ void moe_expert_forward_batch_py(
 // path offloads big experts to the GPU, so capture should be limited to a
 // moderate batch via --cuda-graph-max-bs and larger batches left to eager.
 struct DecodeArgs {
-  RuntimeHandle* rth = nullptr;      // shared pool + serial runtimes
+  RuntimeHandle* rth = nullptr;      // shared pool(s) + serial runtimes
   const uint16_t* x = nullptr;       // [T, H] bf16 bits
   const int64_t*  eid = nullptr;     // [T, K] int64 (clamped >= 0)
   const float*    rw = nullptr;      // [T, K] fp32 (masked: invalid = 0)
   uint16_t*       out = nullptr;     // [T, H] bf16 bits
-  const int8_t*   gate_b = nullptr;  const float* gate_s = nullptr;  // [G,I,H],[G,I]
-  const int8_t*   up_b = nullptr;    const float* up_s = nullptr;    // [G,I,H],[G,I]
-  const int8_t*   down_b = nullptr;  const float* down_s = nullptr;  // [G,H,I],[G,H]
+  SlabHalf ha;                       // experts [0, g_split)
+  SlabHalf hb;                       // experts [g_split, G) (NUMA-TP) or null
+  int64_t g_split = 0;
   int T = 0, K = 0, G = 0, H = 0, I = 0;
 };
 
@@ -495,7 +650,7 @@ void moe_decode_host(void* user) {
   if (sum_m > 0) {
     moe_compute_core(*a->rth, w.x_cat.data(), w.m_offsets.data(),
                      w.expert_ids.data(), E,
-                     a->gate_b, a->gate_s, a->up_b, a->up_s, a->down_b, a->down_s,
+                     a->ha, a->hb, a->g_split,
                      (int64_t)G, w.out_scratch.data(), (size_t)I, (size_t)H);
   }
 
@@ -530,6 +685,10 @@ std::intptr_t make_decode_args_py(
     std::uintptr_t gate_b, std::uintptr_t gate_s,
     std::uintptr_t up_b, std::uintptr_t up_s,
     std::uintptr_t down_b, std::uintptr_t down_s,
+    std::uintptr_t gate_b2, std::uintptr_t gate_s2,
+    std::uintptr_t up_b2, std::uintptr_t up_s2,
+    std::uintptr_t down_b2, std::uintptr_t down_s2,
+    std::int64_t g_split,
     int T, int K, int G, int H, int I) {
   if (T <= 0 || K <= 0 || G <= 0 || H <= 0 || I <= 0)
     throw std::invalid_argument("make_decode_args: dims must be positive");
@@ -542,12 +701,19 @@ std::intptr_t make_decode_args_py(
   a->eid = reinterpret_cast<const int64_t*>(eid);
   a->rw = reinterpret_cast<const float*>(rw);
   a->out = reinterpret_cast<uint16_t*>(out);
-  a->gate_b = reinterpret_cast<const int8_t*>(gate_b);
-  a->gate_s = reinterpret_cast<const float*>(gate_s);
-  a->up_b = reinterpret_cast<const int8_t*>(up_b);
-  a->up_s = reinterpret_cast<const float*>(up_s);
-  a->down_b = reinterpret_cast<const int8_t*>(down_b);
-  a->down_s = reinterpret_cast<const float*>(down_s);
+  a->ha = SlabHalf{reinterpret_cast<const int8_t*>(gate_b),
+                   reinterpret_cast<const float*>(gate_s),
+                   reinterpret_cast<const int8_t*>(up_b),
+                   reinterpret_cast<const float*>(up_s),
+                   reinterpret_cast<const int8_t*>(down_b),
+                   reinterpret_cast<const float*>(down_s)};
+  a->hb = SlabHalf{reinterpret_cast<const int8_t*>(gate_b2),
+                   reinterpret_cast<const float*>(gate_s2),
+                   reinterpret_cast<const int8_t*>(up_b2),
+                   reinterpret_cast<const float*>(up_s2),
+                   reinterpret_cast<const int8_t*>(down_b2),
+                   reinterpret_cast<const float*>(down_s2)};
+  a->g_split = g_split ? g_split : (std::int64_t)G;
   a->T = T; a->K = K; a->G = G; a->H = H; a->I = I;
   return reinterpret_cast<std::intptr_t>(a);
 }
@@ -565,6 +731,10 @@ PYBIND11_MODULE(_cpu_C, m) {
 
   py::class_<RuntimeHandle>(m, "Runtime")
       .def(py::init<int>(), py::arg("n_threads") = 0)
+      .def(py::init<int, int, int>(), py::arg("n_threads"),
+           py::arg("node_a"), py::arg("node_b"),
+           "NUMA-TP: two pools with worker threads bound to node_a / node_b")
+      .def_property_readonly("numa_tp", &RuntimeHandle::numa_tp)
       .def_property_readonly("threads", &RuntimeHandle::threads);
 
   m.def("caps", &caps_dict, "Host CPU capabilities (AMX, AVX-512, ...)");
@@ -590,6 +760,9 @@ PYBIND11_MODULE(_cpu_C, m) {
         py::arg("gate_int8"), py::arg("gate_scales"),
         py::arg("up_int8"), py::arg("up_scales"),
         py::arg("down_int8"), py::arg("down_scales"),
+        py::arg("gate_int8_b"), py::arg("gate_scales_b"),
+        py::arg("up_int8_b"), py::arg("up_scales_b"),
+        py::arg("down_int8_b"), py::arg("down_scales_b"),
         py::arg("out_cat"), py::arg("inter"), py::arg("hidden"));
 
   // Capturable single-token decode (CUDA-graph host-node path).
@@ -601,6 +774,10 @@ PYBIND11_MODULE(_cpu_C, m) {
         py::arg("gate_int8"), py::arg("gate_scales"),
         py::arg("up_int8"), py::arg("up_scales"),
         py::arg("down_int8"), py::arg("down_scales"),
+        py::arg("gate_int8_b"), py::arg("gate_scales_b"),
+        py::arg("up_int8_b"), py::arg("up_scales_b"),
+        py::arg("down_int8_b"), py::arg("down_scales_b"),
+        py::arg("g_split"),
         py::arg("T"), py::arg("K"), py::arg("G"), py::arg("H"), py::arg("I"));
   m.def("free_decode_args", &free_decode_args_py, py::arg("args"));
 }

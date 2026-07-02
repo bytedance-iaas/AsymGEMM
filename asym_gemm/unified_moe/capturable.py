@@ -96,6 +96,7 @@ class _DecodeBuffers:
         self.rw_cpu = torch.zeros(T, K, dtype=torch.float32, pin_memory=True)
         self.out_cpu = torch.zeros(T, H, dtype=torch.bfloat16, pin_memory=True)
         self.out_gpu = torch.zeros(T, H, dtype=torch.bfloat16, device=dev)
+        bp = lambda t: (t.data_ptr() if t is not None else 0)
         self.args = _C.make_decode_args(
             layer.rt,
             self.x_cpu.data_ptr(), self.eid_cpu.data_ptr(),
@@ -103,6 +104,10 @@ class _DecodeBuffers:
             slab.gate_int8.data_ptr(), slab.gate_scales.data_ptr(),
             slab.up_int8.data_ptr(), slab.up_scales.data_ptr(),
             slab.down_int8.data_ptr(), slab.down_scales.data_ptr(),
+            bp(slab.gate_int8_b), bp(slab.gate_scales_b),
+            bp(slab.up_int8_b), bp(slab.up_scales_b),
+            bp(slab.down_int8_b), bp(slab.down_scales_b),
+            slab.g_split,
             T, K, G, H, I,
         )
         self.T = T
