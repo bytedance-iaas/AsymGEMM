@@ -82,7 +82,10 @@ class AsymExecutionStats:
     qwen3_moe_finegrained_gpu_silu_bwd_calls: int = 0
     qwen3_moe_finegrained_cpu_silu_bwd_calls: int = 0
     qwen3_moe_finegrained_lora_a_forward_calls: int = 0
+    qwen3_moe_finegrained_lora_a_forward_gpu_calls: int = 0
     qwen3_moe_finegrained_lora_a_grad_calls: int = 0
+    qwen3_moe_finegrained_da_gpu_calls: int = 0
+    qwen3_moe_finegrained_dgrads_hbm_kept: int = 0
     qwen3_moe_finegrained_lora_b_backward_calls: int = 0
     qwen3_moe_finegrained_fused_gate_up_hbm_bytes: int = 0
     qwen3_moe_finegrained_saved_cpu_bytes: int = 0

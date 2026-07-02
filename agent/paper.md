@@ -23,19 +23,6 @@ Notes:
 - CPU accelerator kernels that might be used 4x128-bit 8 SVE2 to speed up CPU computations
 - Next gen's chips e.g. VERA cpu-side accelerators => even larger bandwidths
 
-
-llama-4-scout-17b-16e
-Workload  Backend                      Config                                    fwd_s  bwd_s  opt_s  step_s  fwd_H  bwd_H  step_H    RAM
---------  ---------------------------  ----------------------------------------  ---------------------------  --------------------  -----
-s4096·b4  asym_cpuadamwds (norecomp)   none+exp+attn-offload+layerGC  [lg- sd+]    6.5   58.4    5.8    70.7   19.7   19.3    19.7  802.
-s4096·b4  zero3_offload (recomp)       none (no offload)  [lg- sd-]                8.3   18.1    1.6    28.0   39.0   52.1    52.1  525.9
-
-Model: qwen3-30b-a3b    LoRA: r64/a16/d0.00
-Workload    Backend                      Config                                    fwd_s  bwd_s  opt_s  step_s  fwd_H  bwd_H  step_H    RAM
---------  ---------------------------  ----------------------------------------  ---------------------------  --------------------  
-s4096·b4    asym_cpuadamwds (norecomp)   none+exp+attn+layerOF  [lg- sd+]            2.7   34.6    3.7    41.1   23.8   28.3    28.3  343.5
-s4096·b4    zero3_offload (recomp)       none (no offload)  [lg- sd-]                1.8    7.5    0.7    10.0   28.5   33.1    33.1  196.2
-
 Setting:
 - 1-2 GPUs (2x198G) + (1x450G)
 
@@ -45,6 +32,51 @@ Next Steps:
 2. [WIP] Find the OOM scenarios for current systems (larger model, longer seq) that ours can accomodate
 3. [TODO] Improve the system throughput with scheduling based on the required model size + sequence length
 
+
+
+
+
+#############################################################################################################
+Results:
+Model: q3-30b-a3b
+
+Workload   Backend           Config                    Status  fwd_s  bwd_s   opt_s  step_s  fwd_H  bwd_H  step_H    RAM
+---------  ----------------  ------------------------  ------  -----  ------  -----  ------  -----  -----  ------  -----
+s80000.b8  superoffload_mem  unsloth                   PASS     29.6   130.3    0.0   160.0   91.9  176.9   176.9  360.0
+s80000.b8  superoffload_mem  unsloth-off               PASS     33.2   240.7    0.0   274.0   91.9   94.4    94.4  588.5
+s80000.b8  asym_cpuadamwds   recomp-off-full-fg-ker111  PASS     60.2  1179.9    3.9  1240.2   78.6   73.9    73.9  642.2
+
+Model: q3-32b
+
+Workload   Backend           Config                    Status  fwd_s  bwd_s   opt_s  step_s  fwd_H  bwd_H  step_H    RAM
+---------  ----------------  ------------------------  ------  -----  ------  -----  ------  -----  -----  ------  -----
+s50000.b8  superoffload_mem  unsloth                   PASS     57.0   219.2    0.1   276.4   91.6  180.9   180.9  340.4
+s50000.b8  superoffload_mem  unsloth-off               PASS     56.7   368.3    0.1   425.2   91.6  110.7   110.7  644.4
+s50000.b8  asym_cpuadamwds   recomp-off-full-fg-ker000  PASS    101.0   561.6    2.5   662.9   91.7   96.4    96.4  657.7
+
+Model: q2.5-32b
+
+Workload   Backend           Config                    Status  fwd_s  bwd_s   opt_s  step_s  fwd_H  bwd_H  step_H    RAM
+---------  ----------------  ------------------------  ------  -----  ------  -----  ------  -----  -----  ------  -----
+s50000.b8  superoffload_mem  unsloth                   PASS     49.2   114.7    0.1   164.1   97.7  171.6   171.6  382.7
+s50000.b8  superoffload_mem  unsloth-off               PASS     48.5   307.5    0.1   356.2   97.7  118.4   118.4  633.0
+s50000.b8  asym_cpuadamwds   recomp-off-full-fg-ker000  PASS     89.2   520.2    1.9   609.7   97.8   81.2    81.2  617.0
+
+Model: q2.5-72b
+
+Workload   Backend           Config                    Status  fwd_s  bwd_s   opt_s  step_s  fwd_H  bwd_H  step_H    RAM
+---------  ----------------  ------------------------  ------  -----  ------  -----  ------  -----  -----  ------  -----
+s30000.b8  superoffload_mem  unsloth                   PASS     64.3   108.6    0.1   173.1   67.6  125.0   125.0  492.2
+s30000.b8  superoffload_mem  unsloth-off               PASS     64.1   308.1    0.1   372.5   67.6   80.8    80.8  662.7
+s30000.b8  asym_cpuadamwds   recomp-off-full-fg-ker000  PASS    105.4   498.7    2.5   604.4   67.6   62.5    62.5  733.6
+
+Model: llama3.3-70b
+
+Workload   Backend           Config                     Status  fwd_s  bwd_s   opt_s  step_s  fwd_H  bwd_H  step_H    RAM
+---------  ----------------  -------------------------  ------  -----  ------  -----  ------  -----  -----  ------  -----
+s25000.b8  superoffload_mem  unsloth                    PASS     34.5    87.0    0.1   122.7   57.0  102.2   102.2  489.6
+s25000.b8  superoffload_mem  unsloth-off                PASS     64.2   215.8    0.1   280.2   55.0   65.7    65.7  657.6
+s25000.b8  asym_cpuadamwds   recomp-off-full-fg-ker000  PASS     77.7   960.4    3.2  1038.4   55.0   52.1    52.1  730.4
 
 #############################################################################################################
 
@@ -65,9 +97,11 @@ Motivations:
 - [?] Why does it have issues with extending to 2 GPUs (Superoffload + deepspeed / Superoffload + seq parallel)?
 
 System Design:
-- AsymGEMM-enabled design for lora forward/backward during recompute. Utilizing more CPU computes based on module/op heterogenuity
-- Multi-tier activation storage system / NVME-based activation offload and prefetching
-- Intgeration with SP/deepspeed for multiple superchips
+- AsymGEMM-based design for lora forward/backward. Activation recompute-then-offload to utilize large C2C bandwiths. Present the forward+backward algorithms. 
+Utilize more CPU computes for memory bound modules/ops.
+- AsumGEMMM-based kernels for LoRA backward and MoEs.
+- Multi-tier activation offload system using CPU and NVME. Enable spilling into NVME using FIFO and prefetching based on LILO.
+- Intgeration with deepspeed / SP for multiple superchips
 
 Baselines:
 - KTransformers
@@ -81,15 +115,14 @@ Baselines:
 - Superoffload (Optimizer State + Model Params)
 <!-- - Megatron (Optimizer State) -->
 
-Exps:
-- 
--
--
+<!-- Exps:
+- 1 GPU + Dense / MoEs
+- 2 GPUs + Dense / MoEs
 
 Ablations:
 - 
 -
--
+- -->
 
 
 

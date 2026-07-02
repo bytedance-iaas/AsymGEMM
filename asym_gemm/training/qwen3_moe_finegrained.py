@@ -123,6 +123,88 @@ def _down_scatter_block_experts() -> int:
         return 0
 
 
+def _fg_lora_a_fwd_gpu_enabled() -> bool:
+    """Compute recompute-forward LoRA-A on GPU from the in-HBM operands.
+
+    The grad-enabled fg forward only runs inside backward recompute, where
+    packed X and the GPU act tensor are live anyway, so the GPU grouped GEMM
+    adds no HBM lifetime while skipping the CPU-left kernel + its pinned
+    padding copies. Backward dA stays on the CPU-right kernel.
+    """
+    raw = os.environ.get(
+        "ASYMM_QWEN3_MOE_FG_LORA_A_FWD_GPU",
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_FG_LORA_A_FWD_GPU", "0"),
+    )
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_flag_default_off(name: str) -> bool:
+    raw = os.environ.get(name, os.environ.get(f"ASYM_GEMM_LF_CONFIG_{name}", "0"))
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _fg_da_gpu_enabled() -> bool:
+    """Offload compact X ([M,H], not the topk-expanded [R,H]) and compute the
+    gate/up LoRA-A weight grads on GPU from chunked re-gathered rows instead of
+    the CPU-right kernel. Requires the GPU LoRA-A recompute-forward."""
+    return _env_flag_default_off("ASYMM_QWEN3_MOE_FG_DA_GPU")
+
+
+def _fg_keep_dgrads_hbm_enabled() -> bool:
+    """Keep dgate/dup in HBM across the layer backward instead of the CPU
+    round trip; they are consumed within the same backward and their stage
+    buffers were the same size, so live HBM is ~unchanged."""
+    return _env_flag_default_off("ASYMM_QWEN3_MOE_FG_KEEP_DGRADS_HBM")
+
+
+def _grouped_da_gpu(
+    layer: "AsymQwen3Experts",
+    d_s: torch.Tensor,
+    x_compact: torch.Tensor,
+    token_indices: torch.Tensor,
+    routing_weights: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    *,
+    input_weighted: bool,
+    num_experts: int,
+    out_dtype: torch.dtype,
+    chunks: int = 8,
+) -> torch.Tensor:
+    """dA[E,r,H] = sum_e dS_e^T @ X_e with X re-gathered on GPU per group-chunk."""
+    from .qwen3_moe import _grouped_lora_weight_grads_torch
+
+    groups = max(int(offsets.numel()) - 1, 0)
+    block_experts = max(1, (groups + int(chunks) - 1) // int(chunks))
+    grad_a = None
+    for row_start, row_end, block_offsets, block_expert_ids, row_slice in _expert_blocks(offsets, experts, block_experts):
+        block_metadata = prepare_grouped_lora_metadata(block_offsets, block_expert_ids, dense_experts=True)
+        x_rows = x_compact.index_select(
+            0,
+            token_indices[row_slice].to(device=x_compact.device, dtype=torch.long, non_blocking=True),
+        )
+        if input_weighted:
+            x_rows = x_rows * routing_weights[row_slice].reshape(-1, 1).to(device=x_rows.device, dtype=x_rows.dtype)
+        part = _grouped_lora_weight_grads_torch(
+            d_s[row_slice].contiguous(),
+            x_rows,
+            block_offsets,
+            block_expert_ids,
+            int(num_experts),
+            out_dtype=out_dtype,
+            metadata=block_metadata,
+            stats=None,
+            record_lora_b_backward=False,
+        )
+        del x_rows
+        grad_a = part if grad_a is None else grad_a.add_(part)
+    if grad_a is None:
+        grad_a = torch.zeros((int(num_experts), int(d_s.shape[1]), int(x_compact.shape[1])), device=d_s.device, dtype=out_dtype)
+    layer.stats.qwen3_moe_finegrained_lora_a_grad_calls += 1
+    layer.stats.qwen3_moe_finegrained_da_gpu_calls += 1
+    return grad_a
+
+
 def _validate_routed_flags_for_current_path(*, down_scatter_block_experts: int) -> None:
     route_flags = routed_kernel_flags()
     if not (route_flags.any_base or route_flags.lora):
@@ -232,6 +314,20 @@ def _lora_a_forward_cpu(
         tag=tag,
     )
     layer.stats.qwen3_moe_finegrained_lora_a_forward_calls += 1
+    return out
+
+
+def _lora_a_forward_gpu(
+    layer: "AsymQwen3Experts",
+    source_gpu: torch.Tensor,
+    lora_a: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    metadata,
+) -> torch.Tensor:
+    out = grouped_expert_lora(source_gpu, lora_a, offsets, experts, metadata=metadata)
+    layer.stats.qwen3_moe_finegrained_lora_a_forward_calls += 1
+    layer.stats.qwen3_moe_finegrained_lora_a_forward_gpu_calls += 1
     return out
 
 
@@ -386,29 +482,39 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
         metadata = prepare_grouped_lora_metadata(offsets, experts, dense_experts=True)
         gate_base, up_base = layer._ensure_qwen3_moe_finegrained_bases()
         manager = ActivationOffloadManager(pin_memory=True)
+        lora_a_fwd_gpu = _fg_lora_a_fwd_gpu_enabled()
         layer.stats.qwen3_moe_finegrained_forward_calls += 1
         down_scatter_block_experts = _down_scatter_block_experts()
         _validate_routed_flags_for_current_path(down_scatter_block_experts=down_scatter_block_experts)
         route_flags = routed_kernel_flags()
         down_scatter_blocks = _expert_blocks(offsets, experts, down_scatter_block_experts)
         _record_down_scatter_block(layer, down_scatter_block_experts, down_scatter_blocks)
+        # Compact-X dA needs the GPU LoRA-A forward (nothing reads expanded X on
+        # CPU then) and is row-sliced per expert block, so exclude the block path.
+        da_gpu = _fg_da_gpu_enabled() and lora_a_fwd_gpu and down_scatter_block_experts == 0
 
         with prof_range(layer._forward_range("moe_finegrained", "x_to_cpu")):
-            x_cpu = manager.offload(packed, "moe.X")
+            if da_gpu:
+                x_cpu = manager.offload(hidden_states.detach().contiguous(), "moe.X")
+            else:
+                x_cpu = manager.offload(packed, "moe.X")
 
         with prof_range(layer._forward_range("moe_finegrained", "gate")):
             layer.stats.qwen3_moe_finegrained_gate_base_calls += 1
             gate = _base_forward(layer, gate_base, packed, offsets, experts, part="gate")
-            manager.wait_cpu_ready(x_cpu)
-            gate_low_rank = _lora_a_forward_cpu(
-                layer,
-                x_cpu.tensor,
-                gate_lora_A,
-                offsets,
-                experts,
-                metadata,
-                tag="moe.gate",
-            )
+            if lora_a_fwd_gpu:
+                gate_low_rank = _lora_a_forward_gpu(layer, packed, gate_lora_A, offsets, experts, metadata)
+            else:
+                manager.wait_cpu_ready(x_cpu)
+                gate_low_rank = _lora_a_forward_cpu(
+                    layer,
+                    x_cpu.tensor,
+                    gate_lora_A,
+                    offsets,
+                    experts,
+                    metadata,
+                    tag="moe.gate",
+                )
             gate_delta = _lora_b_forward(
                 gate_low_rank,
                 gate_lora_B,
@@ -425,16 +531,19 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
         with prof_range(layer._forward_range("moe_finegrained", "up")):
             layer.stats.qwen3_moe_finegrained_up_base_calls += 1
             up = _base_forward(layer, up_base, packed, offsets, experts, part="up")
-            manager.wait_cpu_ready(x_cpu)
-            up_low_rank = _lora_a_forward_cpu(
-                layer,
-                x_cpu.tensor,
-                up_lora_A,
-                offsets,
-                experts,
-                metadata,
-                tag="moe.up",
-            )
+            if lora_a_fwd_gpu:
+                up_low_rank = _lora_a_forward_gpu(layer, packed, up_lora_A, offsets, experts, metadata)
+            else:
+                manager.wait_cpu_ready(x_cpu)
+                up_low_rank = _lora_a_forward_cpu(
+                    layer,
+                    x_cpu.tensor,
+                    up_lora_A,
+                    offsets,
+                    experts,
+                    metadata,
+                    tag="moe.up",
+                )
             up_delta = _lora_b_forward(
                 up_low_rank,
                 up_lora_B,
@@ -449,27 +558,33 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
             del up, up_delta, up_low_rank
         del packed
 
+        down_low_rank = None
         with prof_range(layer._forward_range("moe_finegrained", "activation")):
             gate_stage = manager.stage(gate_cpu, tag="moe.gate_for_act")
             F.silu(gate_stage, inplace=True)
             up_stage = manager.stage(up_cpu, tag="moe.up_for_act")
             gate_stage.mul_(up_stage)
-            act_cpu = manager.offload(gate_stage.to(dtype=torch.bfloat16).contiguous(), "moe.act")
+            act_gpu = gate_stage.to(dtype=torch.bfloat16).contiguous()
+            act_cpu = manager.offload(act_gpu, "moe.act")
+            if lora_a_fwd_gpu:
+                down_low_rank = _lora_a_forward_gpu(layer, act_gpu, down_lora_A, offsets, experts, metadata)
+            del act_gpu
             manager.release_stage(gate_stage, drop_cache=True)
             manager.release_stage(up_stage, drop_cache=True)
             del gate_stage, up_stage
 
         with prof_range(layer._forward_range("moe_finegrained", "down_lora")):
-            manager.wait_cpu_ready(act_cpu)
-            down_low_rank = _lora_a_forward_cpu(
-                layer,
-                act_cpu.tensor,
-                down_lora_A,
-                offsets,
-                experts,
-                metadata,
-                tag="moe.down",
-            )
+            if down_low_rank is None:
+                manager.wait_cpu_ready(act_cpu)
+                down_low_rank = _lora_a_forward_cpu(
+                    layer,
+                    act_cpu.tensor,
+                    down_lora_A,
+                    offsets,
+                    experts,
+                    metadata,
+                    tag="moe.down",
+                )
             down_low_rank_cpu = manager.offload(down_low_rank, "moe.S_down")
             scattered = torch.zeros(
                 (int(num_tokens), int(layer.hidden_dim)),
@@ -579,6 +694,7 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
         ctx.num_tokens = int(num_tokens)
         ctx.input_weighted = bool(input_weighted)
         ctx.output_weighted = bool(output_weighted)
+        ctx.x_compact = bool(da_gpu)
         ctx.x_cpu = x_cpu
         ctx.gate_cpu = gate_cpu
         ctx.up_cpu = up_cpu
@@ -641,9 +757,14 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
         grad_hidden_lora = None
         grad_gate_cpu = None
         grad_up_cpu = None
+        grad_gate_hbm = None
+        grad_up_hbm = None
+        x_stage = None
         grad_gate_lora_A = grad_gate_lora_B = None
         grad_up_lora_A = grad_up_lora_B = None
         grad_down_lora_A = grad_down_lora_B = None
+        x_compact = bool(getattr(ctx, "x_compact", False))
+        keep_dgrads_hbm = _fg_keep_dgrads_hbm_enabled() and down_scatter_block_experts == 0
 
         try:
             if down_scatter_block_experts > 0:
@@ -816,7 +937,12 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                 gate_stage = manager.stage(ctx.gate_cpu, tag="moe.gate_for_silu_bwd_dup")
                 F.silu(gate_stage, inplace=True)
                 gate_stage.mul_(grad_act)
-                grad_up_cpu = manager.offload(gate_stage.to(dtype=torch.bfloat16).contiguous(), "moe.dup")
+                if keep_dgrads_hbm:
+                    # drop_cache release below makes this reference the sole owner
+                    grad_up_hbm = gate_stage.to(dtype=torch.bfloat16).contiguous()
+                    layer.stats.qwen3_moe_finegrained_dgrads_hbm_kept += 1
+                else:
+                    grad_up_cpu = manager.offload(gate_stage.to(dtype=torch.bfloat16).contiguous(), "moe.dup")
                 manager.release_stage(gate_stage, drop_cache=True)
                 del gate_stage
 
@@ -829,7 +955,11 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                 gate_stage = manager.stage(ctx.gate_cpu, tag="moe.gate_for_silu_bwd_dgate")
                 grad_gate = torch.ops.aten.silu_backward(grad_act, gate_stage)
                 del grad_act
-                grad_gate_cpu = manager.offload(grad_gate.to(dtype=torch.bfloat16).contiguous(), "moe.dgate")
+                if keep_dgrads_hbm:
+                    grad_gate_hbm = grad_gate.to(dtype=torch.bfloat16).contiguous()
+                    layer.stats.qwen3_moe_finegrained_dgrads_hbm_kept += 1
+                else:
+                    grad_gate_cpu = manager.offload(grad_gate.to(dtype=torch.bfloat16).contiguous(), "moe.dgate")
                 manager.release_stage(gate_stage, drop_cache=True)
                 manager.release_cpu(ctx.gate_cpu)
                 del gate_stage, grad_gate
@@ -1026,7 +1156,10 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     )
 
                 with prof_range(layer._forward_range("moe_finegrained_backward", "gate")):
-                    grad_gate_stage = manager.stage(grad_gate_cpu, tag="moe.dgate")
+                    if keep_dgrads_hbm:
+                        grad_gate_stage = grad_gate_hbm
+                    else:
+                        grad_gate_stage = manager.stage(grad_gate_cpu, tag="moe.dgate")
                     gate_low_rank = manager.stage(ctx.gate_low_rank_cpu, tag="moe.S_gate_for_dB")
                     d_s_gate = _lora_ds(
                         grad_gate_stage,
@@ -1047,16 +1180,31 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     )
                     manager.release_stage(gate_low_rank, drop_cache=True)
                     manager.release_cpu(ctx.gate_low_rank_cpu)
-                    manager.wait_cpu_ready(ctx.x_cpu)
-                    grad_gate_lora_A = _lora_a_grad_cpu(
-                        layer,
-                        d_s_gate,
-                        ctx.x_cpu.tensor,
-                        gate_lora_A,
-                        offsets,
-                        experts,
-                        tag="moe.gate",
-                    )
+                    if x_compact:
+                        x_stage = manager.stage(ctx.x_cpu, tag="moe.X_for_dA")
+                        grad_gate_lora_A = _grouped_da_gpu(
+                            layer,
+                            d_s_gate,
+                            x_stage,
+                            token_indices,
+                            routing_weights,
+                            offsets,
+                            experts,
+                            input_weighted=bool(getattr(ctx, "input_weighted", False)),
+                            num_experts=int(gate_lora_A.shape[0]),
+                            out_dtype=gate_lora_A.dtype,
+                        )
+                    else:
+                        manager.wait_cpu_ready(ctx.x_cpu)
+                        grad_gate_lora_A = _lora_a_grad_cpu(
+                            layer,
+                            d_s_gate,
+                            ctx.x_cpu.tensor,
+                            gate_lora_A,
+                            offsets,
+                            experts,
+                            tag="moe.gate",
+                        )
                     if ctx.needs_input_grad[0]:
                         layer.stats.qwen3_moe_finegrained_gate_base_calls += 1
                         if route_flags.gateup_dx_scatter:
@@ -1099,12 +1247,19 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                             grad_packed.add_(gate_lora_dx.to(dtype=grad_packed.dtype))
                         del gate_lora_dx
                     del d_s_gate
-                    manager.release_stage(grad_gate_stage, drop_cache=True)
-                    manager.release_cpu(grad_gate_cpu)
-                    grad_gate_cpu = None
+                    if keep_dgrads_hbm:
+                        grad_gate_hbm = None
+                        grad_gate_stage = None
+                    else:
+                        manager.release_stage(grad_gate_stage, drop_cache=True)
+                        manager.release_cpu(grad_gate_cpu)
+                        grad_gate_cpu = None
 
                 with prof_range(layer._forward_range("moe_finegrained_backward", "up")):
-                    grad_up_stage = manager.stage(grad_up_cpu, tag="moe.dup")
+                    if keep_dgrads_hbm:
+                        grad_up_stage = grad_up_hbm
+                    else:
+                        grad_up_stage = manager.stage(grad_up_cpu, tag="moe.dup")
                     up_low_rank = manager.stage(ctx.up_low_rank_cpu, tag="moe.S_up_for_dB")
                     d_s_up = _lora_ds(
                         grad_up_stage,
@@ -1125,16 +1280,32 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     )
                     manager.release_stage(up_low_rank, drop_cache=True)
                     manager.release_cpu(ctx.up_low_rank_cpu)
-                    manager.wait_cpu_ready(ctx.x_cpu)
-                    grad_up_lora_A = _lora_a_grad_cpu(
-                        layer,
-                        d_s_up,
-                        ctx.x_cpu.tensor,
-                        up_lora_A,
-                        offsets,
-                        experts,
-                        tag="moe.up",
-                    )
+                    if x_compact:
+                        grad_up_lora_A = _grouped_da_gpu(
+                            layer,
+                            d_s_up,
+                            x_stage,
+                            token_indices,
+                            routing_weights,
+                            offsets,
+                            experts,
+                            input_weighted=bool(getattr(ctx, "input_weighted", False)),
+                            num_experts=int(up_lora_A.shape[0]),
+                            out_dtype=up_lora_A.dtype,
+                        )
+                        manager.release_stage(x_stage, drop_cache=True)
+                        x_stage = None
+                    else:
+                        manager.wait_cpu_ready(ctx.x_cpu)
+                        grad_up_lora_A = _lora_a_grad_cpu(
+                            layer,
+                            d_s_up,
+                            ctx.x_cpu.tensor,
+                            up_lora_A,
+                            offsets,
+                            experts,
+                            tag="moe.up",
+                        )
                     if ctx.needs_input_grad[0]:
                         if grad_packed is None and not route_flags.gateup_dx_scatter:
                             grad_packed = torch.zeros(
@@ -1185,9 +1356,13 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                             grad_packed.add_(up_lora_dx.to(dtype=grad_packed.dtype))
                         del up_lora_dx
                     del d_s_up
-                    manager.release_stage(grad_up_stage, drop_cache=True)
-                    manager.release_cpu(grad_up_cpu)
-                    grad_up_cpu = None
+                    if keep_dgrads_hbm:
+                        grad_up_hbm = None
+                        grad_up_stage = None
+                    else:
+                        manager.release_stage(grad_up_stage, drop_cache=True)
+                        manager.release_cpu(grad_up_cpu)
+                        grad_up_cpu = None
 
                 if route_flags.gateup_dx_scatter and ctx.needs_input_grad[0]:
                     grad_hidden = grad_hidden_base_fp32.to(dtype=ctx.input_dtype)
@@ -1216,6 +1391,8 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
             elif grad_hidden is None:
                 grad_hidden = None
         finally:
+            if x_stage is not None:
+                manager.release_stage(x_stage, drop_cache=True)
             for handle in (
                 ctx.x_cpu,
                 ctx.gate_cpu,
