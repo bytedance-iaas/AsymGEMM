@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 import asym_gemm
 from asym_gemm.integrations.lf import (
+    _infer_adapter_config,
     apply_lf_asym_lora,
     audit_lf_frozen_cuda_residue,
     classify_lf_component,
@@ -1212,6 +1213,38 @@ def test_qwen35_layer_activation_offload_wraps_linear_attention_saved_tensors(mo
     assert linear_attention_saved_tensor_offload_module_names(model) == ("layers.0.linear_attn",)
     assert is_linear_attention_saved_tensor_offload_wrapper(model.layers[0].linear_attn)
     assert getattr(model, "_asym_linear_attention_saved_tensor_offload_modules") == ("layers.0.linear_attn",)
+
+
+def test_qwen35_full_fg_wraps_linear_attention_without_layer_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASYM_GEMM_LF_CONFIG_RECOMP_OFF_STAGE", "full-fg")
+    monkeypatch.setenv("ASYMM_ATTN_ACT_OFFLOAD", "1")
+    model = FakeQwen3_5DecoderModel(layer_mixers=("linear_attn", "self_attn"))
+    model, report = apply_lf_asym_lora(
+        model,
+        raw_lora_target=["experts"],
+        dense_target_modules=[],
+        lora_rank=2,
+        lora_alpha=4.0,
+        lora_dropout=0.0,
+        backend="asym",
+        precision="bf16",
+        offload_modules="linear_attention",
+        expert_recompute_policy="none",
+        router_mode="whole",
+        strict=False,
+    )
+
+    assert report.attention_act_offload_enabled
+    assert not report.layer_act_offload_enabled
+    assert not report.layer_glue_gc_enabled
+    assert report.linear_attention_saved_tensor_offload_wrapped == 1
+    assert report.linear_attention_saved_tensor_offload_modules == ("layers.0.linear_attn",)
+    assert linear_attention_saved_tensor_offload_module_names(model) == ("layers.0.linear_attn",)
+    assert is_linear_attention_saved_tensor_offload_wrapper(model.layers[0].linear_attn)
+    assert getattr(model, "_asym_linear_attention_saved_tensor_offload_modules") == ("layers.0.linear_attn",)
+
+    config = _infer_adapter_config(model, {})
+    assert config["asym_linear_attention_saved_tensor_offload_modules"] == ["layers.0.linear_attn"]
 
 
 def test_apply_lf_asym_lora_hf_wraps_only_qwen35_experts() -> None:

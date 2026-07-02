@@ -1325,6 +1325,10 @@ def _attention_act_offload_enabled() -> bool:
     )
 
 
+def _recomp_off_full_fg_enabled() -> bool:
+    return str(os.environ.get("ASYM_GEMM_LF_CONFIG_RECOMP_OFF_STAGE") or "").strip().lower() == "full-fg"
+
+
 def _qwen3_moe_finegrained_offload_enabled() -> bool:
     return _env_true(os.environ.get("ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD")) or _env_true(
         os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD")
@@ -1739,6 +1743,7 @@ def apply_lf_asym_lora(
     stats = AsymExecutionStats()
     report.stats = stats
     attention_act_enabled = _attention_act_offload_enabled()
+    recomp_off_full_fg_enabled = _recomp_off_full_fg_enabled()
     layer_act_enabled = _layer_act_offload_enabled()
     layer_glue_gc_enabled = _layer_glue_gc_enabled()
     qwen3_moe_finegrained_enabled = _qwen3_moe_finegrained_offload_enabled()
@@ -2354,7 +2359,8 @@ def apply_lf_asym_lora(
             model,
             strict=strict,
         )
-    if (layer_act_enabled or layer_glue_gc_enabled) and selection.linear_attention:
+    linear_attention_full_fg_enabled = backend == "asym" and recomp_off_full_fg_enabled and attention_act_enabled
+    if (layer_act_enabled or layer_glue_gc_enabled or linear_attention_full_fg_enabled) and selection.linear_attention:
         linear_attention_saved_modules, linear_attention_saved_skipped = _wrap_linear_attention_saved_tensor_offload_modules(
             model,
             strict=strict,
@@ -2544,14 +2550,14 @@ def _infer_adapter_config(model: nn.Module, metadata: Mapping[str, Any] | None) 
         config["asym_layer_act_offload_modules"] = list(layer_act_modules)
         config["asym_layer_act_offload_skipped"] = list(getattr(model, "_asym_layer_act_offload_skipped", ()))
         config["asym_decoder_saved_tensor_offload_modules"] = list(layer_saved_modules)
-        linear_attention_saved_modules = tuple(
-            getattr(model, "_asym_linear_attention_saved_tensor_offload_modules", ())
-        ) or linear_attention_saved_tensor_offload_module_names(model)
-        if linear_attention_saved_modules:
-            config["asym_linear_attention_saved_tensor_offload_modules"] = list(linear_attention_saved_modules)
-            config["asym_linear_attention_saved_tensor_offload_skipped"] = list(
-                getattr(model, "_asym_linear_attention_saved_tensor_offload_skipped", ())
-            )
+    linear_attention_saved_modules = tuple(
+        getattr(model, "_asym_linear_attention_saved_tensor_offload_modules", ())
+    ) or linear_attention_saved_tensor_offload_module_names(model)
+    if linear_attention_saved_modules:
+        config["asym_linear_attention_saved_tensor_offload_modules"] = list(linear_attention_saved_modules)
+        config["asym_linear_attention_saved_tensor_offload_skipped"] = list(
+            getattr(model, "_asym_linear_attention_saved_tensor_offload_skipped", ())
+        )
     if metadata:
         config.update(_jsonable(dict(metadata)))
     return config

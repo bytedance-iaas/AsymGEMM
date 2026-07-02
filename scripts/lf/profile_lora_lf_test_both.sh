@@ -76,6 +76,7 @@ else
     # "q3-30b-a3b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 130000|8|1 ; none|false|false|false|false|false" # C-OOM 140k
     # "q3-32b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # C-OOM 55k
     # "llama3.3-70b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false" # C-OOM 35k
+    # "llama4-scout|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 14000|8|1 ; none|false|false|false|false|false" # G-OOM 15k
     # "q2.5-32b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # C-OOM 55k
     # "q2.5-72b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false" # C-OOM 35k
 
@@ -86,7 +87,6 @@ else
     # "q2.5-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 55k
     # "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # G-OOM 45k
     
-
     # "q3-30b-a3b|1 ; superoffload_mem|recomp|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 50k
     # "q3-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # G-OOM 25k
     # "llama3.3-70b|1 ; superoffload_mem|recomp|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false" # G-OOM 15k

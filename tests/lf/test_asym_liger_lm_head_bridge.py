@@ -10,8 +10,11 @@ from transformers.modeling_outputs import MoeModelOutputWithPast
 from asym_gemm.integrations import liger_loss
 from asym_gemm.integrations.liger_loss import (
     asym_liger_lm_head_bridge_metadata,
+    asym_qwen3_5_conditional_lce_forward,
     asym_qwen3_5_moe_conditional_lce_forward,
     asym_qwen3_moe_lce_forward,
+    install_asym_liger_loss_bridge,
+    install_asym_liger_qwen3_5_loss_bridge,
     install_asym_liger_qwen3_5_moe_loss_bridge,
     install_asym_liger_qwen3_moe_loss_bridge,
 )
@@ -130,6 +133,80 @@ def test_install_bridge_skips_unvalidated_model_when_not_strict() -> None:
     model.config = SimpleNamespace(model_type="llama4")
 
     assert install_asym_liger_qwen3_moe_loss_bridge(model, strict=False) is False
+
+
+# ---------------------------------------------------------------------------
+# Qwen3.5 dense conditional-generation bridge (Qwen3_5ForConditionalGeneration).
+# ---------------------------------------------------------------------------
+class TinyQwen3_5ForConditionalGeneration(nn.Module):
+    def __init__(self, lm_head: nn.Module, hidden_states: torch.Tensor) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(
+            model_type="qwen3_5",
+            use_return_dict=True,
+            text_config=SimpleNamespace(
+                hidden_size=hidden_states.shape[-1],
+                vocab_size=lm_head.out_features,
+            ),
+        )
+        self.model = TinyCondBackbone(hidden_states)
+        self.lm_head = lm_head
+
+    def loss_function(self, **kwargs):  # pragma: no cover - must not run in training skip_logits path
+        raise AssertionError("loss_function must not be called when fused CE fires")
+
+
+def test_install_qwen3_5_dense_conditional_bridge_stages_weight(monkeypatch) -> None:
+    hidden_states = torch.randn(1, 3, 4, dtype=torch.bfloat16)
+    lm_head = AsymFrozenLinear(torch.randn(5, 4, dtype=torch.bfloat16), bias=None, pin_memory=False)
+    model = TinyQwen3_5ForConditionalGeneration(lm_head, hidden_states)
+    model.train()
+
+    calls: list[dict[str, object]] = []
+
+    def fake_liger_loss(**kwargs):
+        calls.append(kwargs)
+        return kwargs["hidden_states"].float().sum()
+
+    monkeypatch.setattr(liger_loss, "LigerForCausalLMLoss", fake_liger_loss)
+
+    assert install_asym_liger_qwen3_5_loss_bridge(model, strict=True) is True
+    assert model.forward.__func__ is asym_qwen3_5_conditional_lce_forward
+    assert TinyQwen3_5ForConditionalGeneration.forward is not asym_qwen3_5_conditional_lce_forward
+
+    labels = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    output = model(labels=labels)
+
+    assert output.loss is not None
+    assert len(calls) == 1
+    assert calls[0]["lm_head_weight"].device.type == "cpu"
+    assert calls[0]["lm_head_weight"].dtype == torch.bfloat16
+    assert calls[0]["hidden_size"] == 4
+
+    metadata = asym_liger_lm_head_bridge_metadata(model)
+    assert metadata["enabled"] is True
+    assert metadata["weight_source"] == "asym_host_staged"
+    assert metadata["bridge_kind"] == "conditional_generation"
+    assert metadata["model_type"] == "qwen3_5"
+    assert metadata["lm_head_type"] == "AsymFrozenLinear"
+
+
+def test_generic_liger_bridge_dispatches_to_qwen3_5_dense_conditional_bridge() -> None:
+    hidden_states = torch.randn(1, 3, 4, dtype=torch.bfloat16)
+    lm_head = AsymFrozenLinear(torch.randn(5, 4, dtype=torch.bfloat16), bias=None, pin_memory=False)
+    model = TinyQwen3_5ForConditionalGeneration(lm_head, hidden_states)
+
+    assert install_asym_liger_loss_bridge(model, strict=True) is True
+    assert model.forward.__func__ is asym_qwen3_5_conditional_lce_forward
+
+
+def test_install_qwen3_5_dense_conditional_bridge_rejects_trainable_lm_head() -> None:
+    hidden_states = torch.randn(1, 3, 4, dtype=torch.bfloat16)
+    trainable = nn.Linear(4, 5, bias=False, dtype=torch.bfloat16)
+    model = TinyQwen3_5ForConditionalGeneration(trainable, hidden_states)
+
+    with pytest.raises(RuntimeError, match="frozen lm_head"):
+        install_asym_liger_qwen3_5_loss_bridge(model, strict=True)
 
 
 # ---------------------------------------------------------------------------

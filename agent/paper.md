@@ -63,11 +63,9 @@ Motivations:
 - Show hardware specs difference between GH200 and GB200 in a table 
     - More scheduling needed to achieve better throughput + storage needed form nvme
 - [?] Why does it have issues with extending to 2 GPUs (Superoffload + deepspeed / Superoffload + seq parallel)?
-<!-- - CPU + GPU computes vs. GPU-only computes (Run superoffload directly) -->
 
 System Design:
-- AsymGEMM-enabled design for selective activation offload+recompute. 
-- Utilizing more CPU computes based on module/op heterogenuity
+- AsymGEMM-enabled design for lora forward/backward during recompute. Utilizing more CPU computes based on module/op heterogenuity
 - Multi-tier activation storage system / NVME-based activation offload and prefetching
 - Intgeration with SP/deepspeed for multiple superchips
 
