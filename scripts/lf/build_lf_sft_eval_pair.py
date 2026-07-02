@@ -19,6 +19,19 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, Seq2SeqTrainingArguments
 
 
+TEXT_ONLY_MM_PLACEHOLDER_REPLACEMENTS = (
+    ("<image>", "[image]"),
+    ("<video>", "[video]"),
+    ("<audio>", "[audio]"),
+    ("{{image}}", "[image]"),
+    ("{{video}}", "[video]"),
+    ("{{audio}}", "[audio]"),
+    ("<|image_pad|>", "[image_pad]"),
+    ("<|video_pad|>", "[video_pad]"),
+    ("<|audio_pad|>", "[audio_pad]"),
+)
+
+
 @dataclass
 class TokenStats:
     count: int
@@ -219,6 +232,8 @@ def _normalize_messages(row: dict[str, Any]) -> tuple[list[dict[str, str]], str]
         if not isinstance(content, str) or not content.strip():
             continue
         content = content.strip()
+        for placeholder, replacement in TEXT_ONLY_MM_PLACEHOLDER_REPLACEMENTS:
+            content = content.replace(placeholder, replacement)
         if role == "system":
             system = content
         elif role == "user":

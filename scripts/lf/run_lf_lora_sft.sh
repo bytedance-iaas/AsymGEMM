@@ -16,7 +16,15 @@ fi
 # Repo root = AsymGEMM-SFT (../.. from the AsymGEMM dir you run in). Override with SFT_ROOT=...
 SFT_ROOT=${SFT_ROOT:-$(cd ../.. && pwd)}
 ROOT=${ROOT:-${SFT_ROOT}/third_party/AsymGEMM}
+_LF_DIR_ENV_SET=false
+_ENV_DIR_ENV_SET=false
+_FLASH_ATTN_ENV_SET=false
+[[ -n "${LF_DIR+x}" ]] && _LF_DIR_ENV_SET=true
+[[ -n "${ENV_DIR+x}" ]] && _ENV_DIR_ENV_SET=true
+[[ -n "${FLASH_ATTN+x}" ]] && _FLASH_ATTN_ENV_SET=true
 LF_DIR=${LF_DIR:-${SFT_ROOT}/third_party/LlamaFactory}
+LF_FA4_DIR=${LF_FA4_DIR:-${SFT_ROOT}/third_party/LlamaFactory-fa4}
+LF_DS_CONFIG_DIR=${LF_DS_CONFIG_DIR:-${SFT_ROOT}/third_party/LlamaFactory/examples/deepspeed}
 KT_KERNEL_DIR=${KT_KERNEL_DIR:-${SFT_ROOT}/third_party/ktransformers/kt-kernel}
 DEEPSPEED_DIR=${DEEPSPEED_DIR:-${SFT_ROOT}/third_party/deepspeed}
 CONDA_EXE=${CONDA_EXE:-conda}
@@ -42,6 +50,8 @@ fi
 # Workload and placement
 MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-Qwen/Qwen3-30B-A3B}
 BACKEND=${BACKEND:-asym}              # torch | zero2 | zero3 | zero3_offload | zero3_offload_mem | zero3_offload_opnvme | zero3_offload_panvme | zero3_offload_mem_opnvme | zero3_offload_mem_panvme | zero3_cpuadam | superoffload | superoffload_mem | superoffload_mem_opnvme | superoffload_mem_panvme | asym_torch | asym | kt_torchbf16 | kt_armbf16
+ASYM_QWEN35_FA4_AUTO=${ASYM_QWEN35_FA4_AUTO:-1}
+FLASH_ATTN=${FLASH_ATTN:-auto}
 GPU_ID=${GPU_ID:-0}
 NUM_GPUS=${NUM_GPUS:-1}
 NUMACTL_ENABLE=${NUMACTL_ENABLE:-1}
@@ -208,6 +218,20 @@ KT_GGUF_PYTHONPATH_ENTRY=""
 if [[ -f "${KT_GGUF_PY_DIR}/gguf/gguf_reader.py" ]]; then
   KT_GGUF_PYTHONPATH_ENTRY="${KT_GGUF_PY_DIR}:"
 fi
+
+is_qwen35_model_name() {
+  case "${1,,}" in
+    *qwen3.5*|*qwen3_5*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if [[ "${ASYM_QWEN35_FA4_AUTO}" == "1" ]] && is_qwen35_model_name "${MODEL_NAME_OR_PATH}"; then
+  [[ "${_LF_DIR_ENV_SET}" == "true" ]] || LF_DIR="${LF_FA4_DIR}"
+  [[ "${_ENV_DIR_ENV_SET}" == "true" ]] || ENV_DIR="${ASYM_DIR}/.venv-fa4"
+  [[ "${_FLASH_ATTN_ENV_SET}" == "true" ]] || FLASH_ATTN=fa4
+fi
+
 KT_RUN_PYTHONPATH="${KT_TOOLS_DIR}:${ASYM_DIR}:${KT_KERNEL_DIR}:${KT_GGUF_PYTHONPATH_ENTRY}${LF_DIR}/src:${PYTHONPATH:-}"
 ENV_DIR=${ENV_DIR:-${ASYM_DIR}/.venv}
 ENV_PYTHON=${ENV_PYTHON:-${ENV_DIR}/bin/python}
@@ -227,24 +251,30 @@ ACCELERATE_CMD=()
 DEEPSPEED_CMD=()
 
 zero_deepspeed_config() {
+  local _name
   case "${1}" in
-    zero2) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z2_config.json" ;;
-    zero3) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_config.json" ;;
-    zero3_offload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json" ;;
-    zero3_offload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_config.json" ;;
-    zero3_offload_mem_nocpuadamw) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_nocpuadamw_config.json" ;;
-    zero3_offload_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_opnvme_config.json" ;;
-    zero3_offload_panvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_panvme_config.json" ;;
-    zero3_offload_mem_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_opnvme_config.json" ;;
-    zero3_offload_mem_panvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_panvme_config.json" ;;
-    zero3_cpuadam) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_cpuadam_config.json" ;;
-    superoffload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_config.json" ;;
-    superoffload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_config.json" ;;
-    superoffload_mem_nocpuadamw) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_nocpuadamw_config.json" ;;
-    superoffload_mem_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_opnvme_config.json" ;;
-    superoffload_mem_panvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_panvme_config.json" ;;
+    zero2) _name=ds_z2_config.json ;;
+    zero3) _name=ds_z3_config.json ;;
+    zero3_offload) _name=ds_z3_offload_config.json ;;
+    zero3_offload_mem) _name=ds_z3_offload_mem_config.json ;;
+    zero3_offload_mem_nocpuadamw) _name=ds_z3_offload_mem_nocpuadamw_config.json ;;
+    zero3_offload_opnvme) _name=ds_z3_offload_opnvme_config.json ;;
+    zero3_offload_panvme) _name=ds_z3_offload_panvme_config.json ;;
+    zero3_offload_mem_opnvme) _name=ds_z3_offload_mem_opnvme_config.json ;;
+    zero3_offload_mem_panvme) _name=ds_z3_offload_mem_panvme_config.json ;;
+    zero3_cpuadam) _name=ds_z3_cpuadam_config.json ;;
+    superoffload) _name=ds_z3_superoffload_config.json ;;
+    superoffload_mem) _name=ds_z3_superoffload_mem_config.json ;;
+    superoffload_mem_nocpuadamw) _name=ds_z3_superoffload_mem_nocpuadamw_config.json ;;
+    superoffload_mem_opnvme) _name=ds_z3_superoffload_mem_opnvme_config.json ;;
+    superoffload_mem_panvme) _name=ds_z3_superoffload_mem_panvme_config.json ;;
     *) return 1 ;;
   esac
+  if [[ -f "${LF_DIR}/examples/deepspeed/${_name}" ]]; then
+    printf '%s\n' "${LF_DIR}/examples/deepspeed/${_name}"
+  else
+    printf '%s\n' "${LF_DS_CONFIG_DIR}/${_name}"
+  fi
 }
 
 case "${BACKEND,,}" in
@@ -1152,7 +1182,11 @@ if [[ ! -f "${DATASET_FILE}" ]]; then
 fi
 
 if [[ ! -d "${ENV_DIR}" ]]; then
-  echo "Missing env ${ENV_DIR}. Run ${ASYM_DIR}/scripts/lf/bootstrap_lf_venv.sh first." >&2
+  if [[ "${FLASH_ATTN}" == "fa4" ]]; then
+    echo "Missing env ${ENV_DIR}. Run ${ASYM_DIR}/scripts/lf/bootstrap_lf_venv_fa4.sh first." >&2
+  else
+    echo "Missing env ${ENV_DIR}. Run ${ASYM_DIR}/scripts/lf/bootstrap_lf_venv.sh first." >&2
+  fi
   exit 2
 fi
 
@@ -1164,6 +1198,29 @@ fi
 if [[ ! -x "${ENV_PYTHON}" ]]; then
   echo "Missing environment Python ${ENV_PYTHON}" >&2
   exit 2
+fi
+
+case "${FLASH_ATTN}" in
+  auto|disabled|sdpa|fa2|fa3|fa4) ;;
+  *) echo "FLASH_ATTN must be one of auto, disabled, sdpa, fa2, fa3, fa4; got '${FLASH_ATTN}'" >&2; exit 2 ;;
+esac
+if [[ "${FLASH_ATTN}" == "fa4" ]]; then
+  if [[ ! -d "${LF_DIR}" ]]; then
+    echo "FLASH_ATTN=fa4 requires LlamaFactory-fa4 checkout at LF_DIR=${LF_DIR}" >&2
+    exit 2
+  fi
+  if ! PYTHONPATH="${LF_DIR}/src:${PYTHONPATH:-}" "${ENV_PYTHON}" - <<'PY' >/dev/null; then
+import importlib.metadata as md
+from transformers.utils import is_flash_attn_4_available
+from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
+assert is_flash_attn_4_available()
+assert md.version("flash-attn-4")
+assert flash_attn_func is not None and flash_attn_varlen_func is not None
+PY
+    echo "FLASH_ATTN=fa4 validation failed for ENV_DIR=${ENV_DIR} LF_DIR=${LF_DIR}." >&2
+    echo "Run ${ASYM_DIR}/scripts/lf/bootstrap_lf_venv_fa4.sh or set ASYM_QWEN35_FA4_AUTO=0 to opt out." >&2
+    exit 2
+  fi
 fi
 if [[ "${PROFILE}" != "1" ]] && ! is_torch_run && [[ ! -x "${LF_CLI_BIN}" ]]; then
   echo "Missing LlamaFactory CLI ${LF_CLI_BIN}" >&2
@@ -1846,6 +1903,9 @@ CMD_ARGS=(
   --enable_liger_kernel "${ENABLE_LIGER_KERNEL}"
   --use_unsloth_gc "${USE_UNSLOTH_GC}"
 )
+if [[ "${FLASH_ATTN}" != "auto" ]]; then
+  CMD_ARGS+=(--flash_attn "${FLASH_ATTN}")
+fi
 if [[ "${FINETUNING_TYPE}" == "lora" ]]; then
   _lora_target_arg="${LORA_TARGET:-all}"
   CMD_ARGS+=(
@@ -1907,6 +1967,9 @@ log_kv OUT_DIR "${OUT_DIR}"
 log_kv MODEL_NAME_OR_PATH "${MODEL_NAME_OR_PATH}"
 log_kv TEMPLATE "${TEMPLATE}"
 log_kv BACKEND "${BACKEND}"
+log_kv LF_DIR "${LF_DIR}"
+log_kv ENV_DIR "${ENV_DIR}"
+log_kv FLASH_ATTN "${FLASH_ATTN}"
 log_kv_if_set PROFILE_BACKEND_LABEL "${PROFILE_BACKEND_LABEL}"
 log_kv GPU_ID "${GPU_ID}"
 log_kv NUM_GPUS "${NUM_GPUS}"

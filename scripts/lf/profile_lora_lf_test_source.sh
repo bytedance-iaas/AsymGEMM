@@ -9,7 +9,15 @@ set -Eeuo pipefail
 # Repo root = AsymGEMM-SFT; override with SFT_ROOT=
 SFT_ROOT=${SFT_ROOT:-$(cd ../.. && pwd)}
 ROOT=${ROOT:-${SFT_ROOT}/third_party/AsymGEMM}
+_LF_DIR_ENV_SET=false
+_ENV_DIR_ENV_SET=false
+_FLASH_ATTN_ENV_SET=false
+[[ -n "${LF_DIR+x}" ]] && _LF_DIR_ENV_SET=true
+[[ -n "${ENV_DIR+x}" ]] && _ENV_DIR_ENV_SET=true
+[[ -n "${FLASH_ATTN+x}" ]] && _FLASH_ATTN_ENV_SET=true
 LF_DIR=${LF_DIR:-${SFT_ROOT}/third_party/LlamaFactory}
+LF_FA4_DIR=${LF_FA4_DIR:-${SFT_ROOT}/third_party/LlamaFactory-fa4}
+LF_DS_CONFIG_DIR=${LF_DS_CONFIG_DIR:-${SFT_ROOT}/third_party/LlamaFactory/examples/deepspeed}
 KT_KERNEL_DIR=${KT_KERNEL_DIR:-${SFT_ROOT}/third_party/ktransformers/kt-kernel}
 DEEPSPEED_DIR=${DEEPSPEED_DIR:-${SFT_ROOT}/third_party/deepspeed}
 CONDA_EXE=${CONDA_EXE:-conda}
@@ -73,26 +81,27 @@ else
     # "llama3.3-70b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" 
     # "llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" 
 
-    # "q3-30b-a3b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 130000|8|1 ; none|false|false|false|false|false" # C-OOM 140k
-    # "q3-32b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # C-OOM 55k
-    # "llama3.3-70b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false" # C-OOM 35k
-    # "llama4-scout|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 14000|8|1 ; none|false|false|false|false|false" # G-OOM 15k
-    # "q2.5-32b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # C-OOM 55k
-    # "q2.5-72b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false" # C-OOM 35k
+    # "q3-30b-a3b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 131000|8|1 ; none|false|false|false|false|false" # C-OOM 132k
+    # "q3-32b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 52000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
+    # "llama3.3-70b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
+    # "llama4-scout|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 14500|8|1 ; none|false|false|false|false|false" # G-OOM 15k
+    # "q2.5-32b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 52000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
+    # "q2.5-72b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
 
-    # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 90k
-    # "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 55k
-    # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 50k
+    # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
+    # "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
+    # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
     # "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
-    # "q2.5-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 55k
-    # "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # G-OOM 45k
-    
-    # "q3-30b-a3b|1 ; superoffload_mem|recomp|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 50k
-    # "q3-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # G-OOM 25k
-    # "llama3.3-70b|1 ; superoffload_mem|recomp|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false" # G-OOM 15k
+    # "q2.5-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
+    # "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # G-OOM 41k
+    # "q3.5-35b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
+
+    # "q3-30b-a3b|1 ; superoffload_mem|recomp|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
+    # "q3-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # G-OOM 21k
+    # "llama3.3-70b|1 ; superoffload_mem|recomp|ligerloss1 ; 12000|8|1 ; none|false|false|false|false|false" # G-OOM 13k
     # "llama4-scout|1 ; superoffload_mem|recomp|ligerloss1 ; 8000|8|1 ; none|false|false|false|false|false" # G-OOM 9k
-    # "q2.5-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # G-OOM 25k
-    # "q2.5-72b|1 ; superoffload_mem|recomp|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false" # G-OOM 15k
+    # "q2.5-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 21000|8|1 ; none|false|false|false|false|false" # G-OOM 22k
+    # "q2.5-72b|1 ; superoffload_mem|recomp|ligerloss1 ; 12000|8|1 ; none|false|false|false|false|false" # G-OOM 13k
   )
 fi
 
@@ -156,27 +165,34 @@ LORA_PARAMS=${LORA_PARAMS:-"${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|all"}
 # LORA_PARAMS=${LORA_PARAMS:-"0.00|64|128|all,0.00|16|32|all"}
 SEED=${SEED:-42}
 
+# Recompute-offload module controls
 ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD-hbm}
 ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD=${ASYMM_DENSE_MLP_FINEGRAINED_OFFLOAD:-0}
 ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD=${ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD:-0}
+
+# Qwen3 MoE fine-grained/routed kernels. The three route bits are intentionally
+# left unset here so Qwen3-30B-A3B + asym* + recomp-off-full-fg can auto-enable them.
 ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD=${ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD:-0}
 ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS:-0}
 ASYMM_QWEN3_MOE_ROUTE_MAPPED_GEMM=${ASYMM_QWEN3_MOE_ROUTE_MAPPED_GEMM:-0}
 ASYMM_QWEN3_MOE_ROUTE_LORA=${ASYMM_QWEN3_MOE_ROUTE_LORA:-0}
 ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE=${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE:-fp32}
 ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG=${ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG:-0}
-# Diagnostic only. Keep at 0 for final comparisons; nonzero values move some
-# outer Unsloth checkpoint roots from CPU RAM back to HBM.
+
+# Outer checkpoint placement. Keep at 0 for final comparisons; nonzero values
+# move some outer Unsloth checkpoint roots from CPU RAM back to HBM.
 UNSLOTH_GC_OUTER_HBM_EVERY_N=${UNSLOTH_GC_OUTER_HBM_EVERY_N:-0}
+
+# CUDA allocator
 EXPANDABLE_SEG=${EXPANDABLE_SEG:-true}
 
-# Kernel / SwiGLU-backward toggles (1=on, 0=off)
+# Kernel implementation toggles (1=on, 0=off)
 ASYMM_EXPERT_SILU_BWD_GPU=${ASYMM_EXPERT_SILU_BWD_GPU:-1}
 ASYMM_MLP_RECOMPUTE_CHUNK=${ASYMM_MLP_RECOMPUTE_CHUNK:-0}
 DG_BF16_CPU_LEFT_COMPACT_GRID=${DG_BF16_CPU_LEFT_COMPACT_GRID:-0}
 ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE=${ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE:-0}
 
-# Backend checks and AsymGEMM options
+# AsymGEMM backend/offload controls
 # ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-routed_experts}
 ASYM_OFFLOAD_MODULES=${ASYM_OFFLOAD_MODULES:-all}
 ASYM_STRICT=${ASYM_STRICT:-true}
@@ -211,7 +227,6 @@ MAX_SAMPLES=${MAX_SAMPLES:-256}
 # Expert activation-backfetch toggles (default off)
 ASYM_OFFLOAD_ACT_RECOMPUTE=${ASYM_OFFLOAD_ACT_RECOMPUTE:-0}
 ASYM_OFFLOAD_X_UNPACKED=${ASYM_OFFLOAD_X_UNPACKED:-0}
-
 
 # Output and profiling
 OUTPUT_ROOT=${OUTPUT_ROOT:-}
@@ -270,6 +285,9 @@ PLOT_OUTPUT_DIR=${PLOT_OUTPUT_DIR:-}
 # Derived Parameters
 # =============================================================================
 ASYM_DIR=${ASYM_DIR:-${ROOT}}
+ASYM_QWEN35_FA4_AUTO=${ASYM_QWEN35_FA4_AUTO:-1}
+FLASH_ATTN=${FLASH_ATTN:-auto}
+FA4_ENV_DIR=${FA4_ENV_DIR:-${ASYM_DIR}/.venv-fa4}
 KT_TOOLS_DIR=${KT_TOOLS_DIR:-${ASYM_DIR}}
 KT_REPO_DIR_ENV_SET=${KT_REPO_DIR+x}
 KT_REPO_DIR=${KT_REPO_DIR:-$(dirname "${KT_KERNEL_DIR}")}
@@ -465,6 +483,21 @@ bool_value() {
   esac
 }
 
+bool_tag() {
+  local prefix="$1"
+  case "$(bool_value "$2")" in
+    true) printf '%s1\n' "${prefix}" ;;
+    false) printf '%s0\n' "${prefix}" ;;
+  esac
+}
+
+truthy_digit() {
+  case "${1,,}" in
+    1|true|yes|y|on) printf '1\n' ;;
+    *) printf '0\n' ;;
+  esac
+}
+
 normalize_expact_lora_a_fwd() {
   case "${1}" in
     cpu) printf 'cpu\n' ;;
@@ -481,60 +514,36 @@ expact_lora_a_fwd_tag() {
 }
 
 expact_tag() {
-  case "$(bool_value "$1")" in
-    true) printf 'expact1\n' ;;
-    false) printf 'expact0\n' ;;
-  esac
+  bool_tag expact "$1"
 }
 
 attnact_tag() {
-  case "$(bool_value "$1")" in
-    true) printf 'attnact1\n' ;;
-    false) printf 'attnact0\n' ;;
-  esac
+  bool_tag attnact "$1"
 }
 
 layeract_tag() {
-  case "$(bool_value "$1")" in
-    true) printf 'layeract1\n' ;;
-    false) printf 'layeract0\n' ;;
-  esac
+  bool_tag layeract "$1"
 }
 
 layergc_tag() {
-  case "$(bool_value "$1")" in
-    true) printf 'layergc1\n' ;;
-    false) printf 'layergc0\n' ;;
-  esac
+  bool_tag layergc "$1"
 }
 
 sdparecomp_tag() {
-  case "$(bool_value "$1")" in
-    true) printf 'sdparecomp1\n' ;;
-    false) printf 'sdparecomp0\n' ;;
-  esac
+  bool_tag sdparecomp "$1"
 }
 
 # Lever-2 toggles (AsymGEMM-only). Encoded in the run dir so each setting gets its own folder.
 actrecomp_tag() {
-  case "${1,,}" in
-    1|true|yes|on) printf 'actrecomp1\n' ;;
-    *) printf 'actrecomp0\n' ;;
-  esac
+  printf 'actrecomp%s\n' "$(truthy_digit "$1")"
 }
 
 xunpack_tag() {
-  case "${1,,}" in
-    1|true|yes|on) printf 'xunpack1\n' ;;
-    *) printf 'xunpack0\n' ;;
-  esac
+  printf 'xunpack%s\n' "$(truthy_digit "$1")"
 }
 
 moefg_tag() {
-  case "$(bool_value "$1")" in
-    true) printf 'moefg1\n' ;;
-    false) printf 'moefg0\n' ;;
-  esac
+  bool_tag moefg "$1"
 }
 
 dscatter_tag() {
@@ -589,8 +598,11 @@ recompute_run_label() {
 }
 
 qwen3_route_any_enabled() {
-  local fwd="$1" gather="$2" dx="$3" lora="$4"
-  [[ "$(qwen3_route_bool "${fwd}")" == "1" || "$(qwen3_route_bool "${gather}")" == "1" || "$(qwen3_route_bool "${dx}")" == "1" || "$(qwen3_route_bool "${lora}")" == "1" ]]
+  local value
+  for value in "$@"; do
+    [[ "$(qwen3_route_bool "${value}")" == "1" ]] && return 0
+  done
+  return 1
 }
 
 is_qwen3_moe_routed_model() {
@@ -724,6 +736,60 @@ infer_template() {
   esac
 }
 
+is_qwen35_model_name() {
+  case "${1,,}" in
+    *qwen3.5*|*qwen3_5*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+flash_attn_tag() {
+  case "${1}" in
+    auto|"") printf 'attnauto\n' ;;
+    disabled) printf 'attndisabled\n' ;;
+    sdpa) printf 'attnsdpa\n' ;;
+    fa2) printf 'attnfa2\n' ;;
+    fa3) printf 'attnfa3\n' ;;
+    fa4) printf 'attnfa4\n' ;;
+    *) printf 'attn%s\n' "$(safe_label "${1}")" ;;
+  esac
+}
+
+resolve_current_runtime_for_model() {
+  local model="$1"
+  CURRENT_LF_DIR="${LF_DIR}"
+  CURRENT_ENV_DIR="${ENV_DIR}"
+  CURRENT_ENV_PYTHON="${ENV_PYTHON}"
+  CURRENT_FLASH_ATTN="${FLASH_ATTN}"
+  if [[ "${ASYM_QWEN35_FA4_AUTO}" == "1" ]] && is_qwen35_model_name "${model}"; then
+    [[ "${_LF_DIR_ENV_SET}" == "true" ]] || CURRENT_LF_DIR="${LF_FA4_DIR}"
+    [[ "${_ENV_DIR_ENV_SET}" == "true" ]] || CURRENT_ENV_DIR="${FA4_ENV_DIR}"
+    [[ "${_FLASH_ATTN_ENV_SET}" == "true" ]] || CURRENT_FLASH_ATTN=fa4
+  fi
+  CURRENT_ENV_PYTHON="${CURRENT_ENV_DIR}/bin/python"
+  CURRENT_FLASH_ATTN_LABEL="$(flash_attn_tag "${CURRENT_FLASH_ATTN}")"
+}
+
+validate_current_fa4_runtime() {
+  local model="$1"
+  [[ "${CURRENT_FLASH_ATTN}" == "fa4" ]] || return 0
+  [[ "${DRY_RUN}" == "true" || "${COLLECT_EXISTING}" == "true" ]] && return 0
+  [[ -d "${CURRENT_LF_DIR}" ]] || die "qwen3.5 FA4 path missing LF_DIR=${CURRENT_LF_DIR}"
+  [[ -x "${CURRENT_ENV_PYTHON}" ]] || die "qwen3.5 FA4 path missing Python ${CURRENT_ENV_PYTHON}; run ${ASYM_DIR}/scripts/lf/bootstrap_lf_venv_fa4.sh"
+  PYTHONPATH="${CURRENT_LF_DIR}/src:${PYTHONPATH:-}" "${CURRENT_ENV_PYTHON}" - "${model}" <<'PY' >/dev/null
+import importlib.metadata as md
+import sys
+from transformers.utils import is_flash_attn_4_available
+from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
+
+model = sys.argv[1]
+if not is_flash_attn_4_available():
+    raise SystemExit(f"FlashAttention-4 unavailable for {model}")
+md.version("flash-attn-4")
+assert flash_attn_func is not None and flash_attn_varlen_func is not None
+PY
+}
+
 nonnegative_int() {
   local name="$1"
   local value="$2"
@@ -798,24 +864,30 @@ backend_gpu_count() {
 }
 
 zero_deepspeed_config() {
+  local _name
   case "${1}" in
-    zero2) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z2_config.json" ;;
-    zero3) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_config.json" ;;
-    zero3_offload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_config.json" ;;
-    zero3_offload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_config.json" ;;
-    zero3_offload_mem_nocpuadamw) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_nocpuadamw_config.json" ;;
-    zero3_offload_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_opnvme_config.json" ;;
-    zero3_offload_panvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_panvme_config.json" ;;
-    zero3_offload_mem_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_opnvme_config.json" ;;
-    zero3_offload_mem_panvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_offload_mem_panvme_config.json" ;;
-    zero3_cpuadam) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_cpuadam_config.json" ;;
-    superoffload) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_config.json" ;;
-    superoffload_mem) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_config.json" ;;
-    superoffload_mem_nocpuadamw) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_nocpuadamw_config.json" ;;
-    superoffload_mem_opnvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_opnvme_config.json" ;;
-    superoffload_mem_panvme) printf '%s\n' "${LF_DIR}/examples/deepspeed/ds_z3_superoffload_mem_panvme_config.json" ;;
+    zero2) _name=ds_z2_config.json ;;
+    zero3) _name=ds_z3_config.json ;;
+    zero3_offload) _name=ds_z3_offload_config.json ;;
+    zero3_offload_mem) _name=ds_z3_offload_mem_config.json ;;
+    zero3_offload_mem_nocpuadamw) _name=ds_z3_offload_mem_nocpuadamw_config.json ;;
+    zero3_offload_opnvme) _name=ds_z3_offload_opnvme_config.json ;;
+    zero3_offload_panvme) _name=ds_z3_offload_panvme_config.json ;;
+    zero3_offload_mem_opnvme) _name=ds_z3_offload_mem_opnvme_config.json ;;
+    zero3_offload_mem_panvme) _name=ds_z3_offload_mem_panvme_config.json ;;
+    zero3_cpuadam) _name=ds_z3_cpuadam_config.json ;;
+    superoffload) _name=ds_z3_superoffload_config.json ;;
+    superoffload_mem) _name=ds_z3_superoffload_mem_config.json ;;
+    superoffload_mem_nocpuadamw) _name=ds_z3_superoffload_mem_nocpuadamw_config.json ;;
+    superoffload_mem_opnvme) _name=ds_z3_superoffload_mem_opnvme_config.json ;;
+    superoffload_mem_panvme) _name=ds_z3_superoffload_mem_panvme_config.json ;;
     *) return 1 ;;
   esac
+  if [[ -f "${LF_DIR}/examples/deepspeed/${_name}" ]]; then
+    printf '%s\n' "${LF_DIR}/examples/deepspeed/${_name}"
+  else
+    printf '%s\n' "${LF_DS_CONFIG_DIR}/${_name}"
+  fi
 }
 
 is_zero_backend() {
@@ -1730,7 +1802,11 @@ job_root_path() {
   local weight_offload="${9:-false}"
   local grad_offload_suffix=""
   local outer_hbm_suffix=""
-  local path_label="${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__${layergc_label}__${sdparecomp_label}"
+  local flash_attn_suffix=""
+  if [[ "${flashattn_label:-attnauto}" != "attnauto" ]]; then
+    flash_attn_suffix="__${flashattn_label}"
+  fi
+  local path_label="${backend}__${profiler}__${recompute}__pol${expert_policy}__router${router_mode}__${expact_label}__${attnact_label}__${layeract_label}__${layergc_label}__${sdparecomp_label}${flash_attn_suffix}"
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
     grad_offload_suffix="__gradoff${grad_offload}__weightoff${weight_offload}"
   fi
@@ -2071,6 +2147,8 @@ prepare_dataset_for_seq() {
   local seq_len="$1"
   local dataset_name="$2"
   local min_tokens
+  local dataset_lf_dir="${CURRENT_LF_DIR:-${LF_DIR}}"
+  local dataset_env_python="${CURRENT_ENV_PYTHON:-${ENV_PYTHON}}"
   min_tokens="$(dataset_min_tokens_for_seq "${seq_len}")"
 
   local -a tools_dir_arg=(--asym-dir "${ASYM_DIR}")
@@ -2079,8 +2157,8 @@ prepare_dataset_for_seq() {
   fi
 
   local -a dataset_cmd=(
-    "${ENV_PYTHON}" "${BUILD_DATASET_SCRIPT}"
-    --lf-dir "${LF_DIR}"
+    "${dataset_env_python}" "${BUILD_DATASET_SCRIPT}"
+    --lf-dir "${dataset_lf_dir}"
     "${tools_dir_arg[@]}"
     --model-name-or-path "${current_model_name}"
     --template "${TEMPLATE}"
@@ -2100,7 +2178,7 @@ prepare_dataset_for_seq() {
     dataset_cmd+=(--overwrite)
   fi
 
-  echo "Preparing LF dataset=${dataset_name} model=${current_model_name} seq=${seq_len} min_tokens=${min_tokens}"
+  echo "Preparing LF dataset=${dataset_name} model=${current_model_name} seq=${seq_len} min_tokens=${min_tokens} lf_dir=${dataset_lf_dir}"
   if [[ "${DRY_RUN}" == "true" ]]; then
     print_command "${dataset_cmd[@]}"
     return 0
@@ -2927,6 +3005,10 @@ run_job() {
   local q3rt_fwd_flag q3rt_gather_flag q3rt_dx_flag q3rt_lora_flag q3rt_kernel_code recompute_artifact_label
   local ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU:-1}"
   local ASYMM_MLP_RECOMPUTE_CHUNK="${ASYMM_MLP_RECOMPUTE_CHUNK:-0}"
+  local job_lf_dir="${CURRENT_LF_DIR:-${LF_DIR}}"
+  local job_env_dir="${CURRENT_ENV_DIR:-${ENV_DIR}}"
+  local job_flash_attn="${CURRENT_FLASH_ATTN:-${FLASH_ATTN}}"
+  local flashattn_label="${CURRENT_FLASH_ATTN_LABEL:-$(flash_attn_tag "${job_flash_attn}")}"
   local requested_policy_tuple="${expert_policy}|${ASYMM_EXPERT_ACT_OFFLOAD}|${ASYMM_ATTN_ACT_OFFLOAD}|${ASYMM_LAYER_ACT_OFFLOAD}|${ASYMM_LAYER_GC}|${ASYMM_ATTN_SDPA_RECOMPUTE}"
   canonicalize_policy_axis_for_inert_run "${backend}" "${recompute}"
   local run_log_extra_tag=""
@@ -3085,10 +3167,10 @@ run_job() {
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
     grad_offload_run_label="_gradoff${grad_offload}_weightoff${weight_offload}"
   fi
-  run_id="lf_${backend}_${run_profiler}_${recompute_artifact_label}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${layergc_label}_${sdparecomp_label}_${expact_lora_a_fwd_label}_${actrecomp_label}_${xunpack_label}_${moefg_label}_${dscatter_label}_${q3rt_label}_${liger_loss}${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${lora_dropout_label_value}"
+  run_id="lf_${backend}_${run_profiler}_${recompute_artifact_label}_pol${expert_policy}_router${router_mode}_${expact_label}_${attnact_label}_${layeract_label}_${layergc_label}_${sdparecomp_label}_${flashattn_label}_${expact_lora_a_fwd_label}_${actrecomp_label}_${xunpack_label}_${moefg_label}_${dscatter_label}_${q3rt_label}_${liger_loss}${grad_offload_run_label}_b${PER_DEVICE_TRAIN_BATCH_SIZE}_s${seq_len}_ga${GRADIENT_ACCUMULATION_STEPS}_${lora_dropout_label_value}"
   profile_json="${seq_root}/profile.json"
   local run_log_payload
-  run_log_payload="${_M_REV[${current_model_name}]:-${current_model_name}} ; ${backend}|${recompute}|${liger_loss} ; ${seq_len}|${PER_DEVICE_TRAIN_BATCH_SIZE}|${GRADIENT_ACCUMULATION_STEPS} ; ${effective_policy_tuple} ; lora=${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|${LORA_TARGET}"
+  run_log_payload="${_M_REV[${current_model_name}]:-${current_model_name}} ; ${backend}|${recompute}|${liger_loss} ; ${seq_len}|${PER_DEVICE_TRAIN_BATCH_SIZE}|${GRADIENT_ACCUMULATION_STEPS} ; ${effective_policy_tuple} ; lora=${LORA_DROPOUT}|${LORA_RANK}|${LORA_ALPHA}|${LORA_TARGET} ; flash_attn=${job_flash_attn}"
   local profile_memory_breakdown deepspeed_dir_for_profile
   local profile_backend_label job_use_asym_cpu_adamw job_asym_cpu_adamw_backend cpuadam_backend
   local master_port
@@ -3238,15 +3320,16 @@ run_job() {
 	    ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD="${ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD:-0}"
 	    DG_BF16_CPU_LEFT_COMPACT_GRID="${DG_BF16_CPU_LEFT_COMPACT_GRID:-0}"
     ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE="${ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE:-0}"
-    LF_DIR="${LF_DIR}"
+    LF_DIR="${job_lf_dir}"
     ASYM_DIR="${ASYM_DIR}"
-    ENV_DIR="${ENV_DIR}"
+    ENV_DIR="${job_env_dir}"
     CONDA_EXE="${CONDA_EXE}"
     NSYS_BIN="${NSYS_BIN}"
     EXPANDABLE_SEG="${EXPANDABLE_SEG}"
     PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF_EFFECTIVE}"
     DIST_LAUNCHER="${DIST_LAUNCHER}"
     DEEPSPEED_DIR="${DEEPSPEED_DIR}"
+    FLASH_ATTN="${job_flash_attn}"
     CHECK_SUPEROFFLOAD="${CHECK_SUPEROFFLOAD}"
     CHECK_CPUADAM="${CHECK_CPUADAM}"
     MODEL_NAME_OR_PATH="${current_model_name}"
@@ -3375,6 +3458,7 @@ run_job() {
     ASYM_GEMM_LF_CONFIG_MEASURE_STEPS="${MAX_STEPS}"
     ASYM_GEMM_LF_CONFIG_TOTAL_STEPS="${TOTAL_STEPS}"
     ASYM_GEMM_LF_CONFIG_DEEPSPEED_DIR="${deepspeed_dir_for_profile}"
+    ASYM_GEMM_LF_CONFIG_FLASH_ATTN="${job_flash_attn}"
     OUT_DIR="${lf_out}"
     LOG_FILE="${log_file}"
     RUN_ID="${run_id}"
@@ -3420,7 +3504,7 @@ run_job() {
   local -a run_cmd=(env)
   run_cmd+=("${run_env[@]}" "${RUN_LF_SCRIPT}")
 
-  echo "Running backend=${backend} profiler=${profiler} run_profiler=${run_profiler} recompute=${recompute} recompute_label=${recompute_artifact_label} liger_loss=${liger_loss} expert_policy=${expert_policy} router_mode=${router_mode} grad_offload=${grad_offload} qwen_expert_lora_impl=${lf_expert_lora_impl} lora_a_fwd=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD} ${expact_label} ${attnact_label} ${layeract_label} ${layergc_label} ${expact_lora_a_fwd_label} ${q3rt_label} seq=${seq_len} batch=${PER_DEVICE_TRAIN_BATCH_SIZE} grad_accum=${GRADIENT_ACCUMULATION_STEPS} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
+  echo "Running backend=${backend} profiler=${profiler} run_profiler=${run_profiler} recompute=${recompute} recompute_label=${recompute_artifact_label} liger_loss=${liger_loss} expert_policy=${expert_policy} router_mode=${router_mode} grad_offload=${grad_offload} qwen_expert_lora_impl=${lf_expert_lora_impl} flash_attn=${job_flash_attn} lora_a_fwd=${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD} ${expact_label} ${attnact_label} ${layeract_label} ${layergc_label} ${flashattn_label} ${expact_lora_a_fwd_label} ${q3rt_label} seq=${seq_len} batch=${PER_DEVICE_TRAIN_BATCH_SIZE} grad_accum=${GRADIENT_ACCUMULATION_STEPS} lora_dropout=${LORA_DROPOUT} gpu=${gpu} num_gpus=${gpu_count}"
   echo "  dir=${seq_root}"
   if [[ "${materialize_source_from_nsys}" == "true" ]]; then
     echo "  source_dir=${source_materialized_seq_root}"
@@ -4002,12 +4086,14 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
       current_model_name="${parsed_model_name}"
       current_model_gpu_count="${parsed_model_gpu_count}"
       current_model_tag=$(basename "${current_model_name}" | tr '/:' '__')
+      resolve_current_runtime_for_model "${current_model_name}"
+      validate_current_fa4_runtime "${current_model_name}"
       workload_label="$(safe_label "${current_model_tag}")"
       TEMPLATE="${template_spec}"
       if [[ "${TEMPLATE}" == "auto" ]]; then
         TEMPLATE="$(infer_template "${current_model_name}")"
       fi
-      echo "Using template: ${TEMPLATE} for model ${current_model_name} requesting ${current_model_gpu_count} GPU(s), recompute from RUNS"
+      echo "Using template: ${TEMPLATE} for model ${current_model_name} requesting ${current_model_gpu_count} GPU(s), recompute from RUNS, flash_attn=${CURRENT_FLASH_ATTN}, lf_dir=${CURRENT_LF_DIR}, env_dir=${CURRENT_ENV_DIR}"
 
       IFS='|' read -r seq_len PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS <<< "${workload}"
       batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}"
