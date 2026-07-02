@@ -78,6 +78,146 @@ def _cpu_prefill_fraction() -> float:
 
 
 # ---------------------------------------------------------------------------
+# NUMA tensor-parallelism (ASYMGEMM_NUMA_TP=1)
+#
+# Expert weights split into two pinned host halves — experts [0, G/2) on
+# node 0's memory, [G/2, G) on node 1's — and the shared CPU runtime runs two
+# worker pools, each affinity-bound to its node (see _cpu_C.Runtime(threads,
+# node_a, node_b)). Every MoE call then reads expert weights at BOTH sockets'
+# local bandwidth; a single pool bound to one node gets one socket's, and an
+# interleaved slab pays ~50% remote (UPI) accesses.
+# ---------------------------------------------------------------------------
+
+def _numa_tp_enabled() -> bool:
+    return os.getenv("ASYMGEMM_NUMA_TP", "0") == "1"
+
+
+def _num_numa_nodes() -> int:
+    import glob as _glob
+    return len(_glob.glob("/sys/devices/system/node/node[0-9]*"))
+
+
+_libc = None
+
+
+_pin_keepalive: list = []      # mmap objects backing node-bound pinned tensors
+_cudart_handle = None
+
+
+def _libc_handle():
+    global _libc
+    import ctypes
+    if _libc is None:
+        _libc = ctypes.CDLL(None, use_errno=True)
+    return _libc
+
+
+def _cudart():
+    global _cudart_handle
+    if _cudart_handle is not None:
+        return _cudart_handle
+    import ctypes
+    import glob as _glob
+    for name in ("libcudart.so", "libcudart.so.12", "libcudart.so.11.0"):
+        try:
+            _cudart_handle = ctypes.CDLL(name)
+            return _cudart_handle
+        except OSError:
+            continue
+    for so in _glob.glob(os.path.join(os.path.dirname(torch.__file__), "lib",
+                                      "libcudart*")):
+        _cudart_handle = ctypes.CDLL(so)
+        return _cudart_handle
+    raise RuntimeError("could not locate libcudart for cudaHostRegister")
+
+
+def _pin_on_node(t: torch.Tensor, node: int) -> torch.Tensor:
+    """Copy `t` into pinned host memory whose pages live on NUMA `node`.
+
+    torch's pin_memory() goes through the caching host allocator, which
+    recycles previously-created pinned segments — their pages keep whatever
+    node they were first faulted on, so a mempolicy at allocation time is
+    ignored (verified: a long-lived server ends up with every slab half on
+    one node). Instead: anonymous mmap -> mbind(MPOL_BIND, node) -> copy in
+    (faults the pages on `node`) -> cudaHostRegister (pin + UVA mapping for
+    the GPU's PCIe/TMA reads). Falls back to plain pin_memory() on any
+    failure.
+    """
+    import ctypes
+    import mmap as _mmap
+
+    t = t.contiguous()
+    nbytes = t.numel() * t.element_size()
+    try:
+        mm = _mmap.mmap(-1, nbytes)
+        addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+        mask = ctypes.c_ulong(1 << node)
+        rc = _libc_handle().syscall(
+            237,                                   # mbind (x86_64)
+            ctypes.c_void_p(addr), ctypes.c_size_t(nbytes),
+            2,                                     # MPOL_BIND
+            ctypes.byref(mask), 65, 0,
+        )
+        if rc != 0:
+            raise OSError("mbind failed")
+        dst = torch.frombuffer(mm, dtype=t.dtype, count=t.numel()).view(t.shape)
+        dst.copy_(t)                               # faults pages on `node`
+        cr = _cudart()
+        err = cr.cudaHostRegister(ctypes.c_void_p(addr),
+                                  ctypes.c_size_t(nbytes), 0)
+        if err != 0:
+            raise OSError(f"cudaHostRegister returned {err}")
+        _pin_keepalive.append(mm)
+        return dst
+    except Exception as e:  # pragma: no cover - fallback keeps things working
+        import logging
+        logging.getLogger(__name__).warning(
+            "AsymGEMM NUMA-TP: node-bound pinned alloc failed (%s); falling "
+            "back to pin_memory() with unknown placement.", e)
+        return t.pin_memory()
+
+
+# ---------------------------------------------------------------------------
+# Expert routing statistics (for hot-expert cache selection)
+#
+# ASYMGEMM_RECORD_EXPERT_STATS=<path.pt>: eager forwards accumulate per-layer
+# expert counts; dumped at exit, keyed by layer creation order. Feed the file
+# back via ASYMGEMM_CACHE_HOT_EXPERTS=<path.pt> to cache each layer's top-N
+# most-routed experts instead of experts 0..N-1.
+# ---------------------------------------------------------------------------
+
+_ALL_LAYERS: list = []
+_stats_atexit_registered = False
+_stats_step = 0
+
+
+def _record_stats_path():
+    return os.getenv("ASYMGEMM_RECORD_EXPERT_STATS", "")
+
+
+def _dump_expert_stats():
+    path = _record_stats_path()
+    if not path:
+        return
+    out = {}
+    for idx, layer in enumerate(_ALL_LAYERS):
+        c = getattr(layer, "_stat_counts", None)
+        if c is not None:
+            out[idx] = c.cpu()
+    if out:
+        torch.save(out, path)
+
+
+def _maybe_register_stats(layer) -> None:
+    global _stats_atexit_registered
+    _ALL_LAYERS.append(layer)
+    if _record_stats_path() and not _stats_atexit_registered:
+        import atexit
+        atexit.register(_dump_expert_stats)
+        _stats_atexit_registered = True
+
+
+# ---------------------------------------------------------------------------
 # Quantization helpers (the unified INT8 contract)
 # ---------------------------------------------------------------------------
 
@@ -174,6 +314,28 @@ class ExpertSlab:
     up_sfb:   Optional[torch.Tensor] = None   # [G, inter, kb_hidden] fp32 on CUDA
     down_sfb: Optional[torch.Tensor] = None   # [G, hidden, kb_inter] fp32 on CUDA
 
+    # NUMA-TP: when split, the *_int8/*_scales tensors above hold experts
+    # [0, g_split) (pinned on node 0) and the *_b tensors below hold experts
+    # [g_split, G) (pinned on node 1, local index g - g_split). Unsplit:
+    # g_split == num_experts and the *_b tensors are None.
+    g_split: int = 0
+    gate_int8_b: Optional[torch.Tensor] = None
+    gate_scales_b: Optional[torch.Tensor] = None
+    up_int8_b: Optional[torch.Tensor] = None
+    up_scales_b: Optional[torch.Tensor] = None
+    down_int8_b: Optional[torch.Tensor] = None
+    down_scales_b: Optional[torch.Tensor] = None
+
+    def expert_rows(self, name: str, ids) -> torch.Tensor:
+        """Gather experts `ids` (iterable of global ids) for tensor `name`
+        ('gate_int8', 'up_scales', ...) across the split halves."""
+        a = getattr(self, name)
+        b = getattr(self, name + "_b")
+        if b is None:
+            return a[list(ids)]
+        rows = [a[i] if i < self.g_split else b[i - self.g_split] for i in ids]
+        return torch.stack(rows)
+
 
 # ---------------------------------------------------------------------------
 # Layer
@@ -218,6 +380,7 @@ class Layer:
         self.rt = runtime if runtime is not None else _C.Runtime(cpu_threads)
         self.m_cpu = m_cpu
         self.cache_n = 0
+        _maybe_register_stats(self)
         self._build_gpu_cache()
 
     # -----------------------------------------------------------
@@ -240,32 +403,66 @@ class Layer:
         if n <= 0 or not torch.cuda.is_available():
             return
         s = self.slab
-        n = min(n, s.num_experts)
+        G = s.num_experts
+        n = min(n, G)
         dev = f"cuda:{self.cuda_device}"
+        ids = self._pick_cache_ids(n, G)
+        idx_t = torch.tensor(ids, dtype=torch.int64, device=dev)
         # gate and up are fused along the output dim ([n, 2*inter, hidden],
         # gate rows first): per-channel scales make the concat exact, and one
         # grouped call replaces two — one less launch and one less pass over
         # the quantized activations per layer.
         self.cache_gateup_int8 = torch.cat(
-            (s.gate_int8[:n], s.up_int8[:n]), dim=1
+            (s.expert_rows("gate_int8", ids), s.expert_rows("up_int8", ids)),
+            dim=1,
         ).to(dev)
-        self.cache_down_int8 = s.down_int8[:n].to(dev)
+        self.cache_down_int8 = s.expert_rows("down_int8", ids).to(dev)
         # SFBs are already device-resident; build contiguous copies the kernel
         # can index 0..n-1 like the cached INT8 slabs.
         self.cache_gateup_sfb = torch.cat(
-            (s.gate_sfb[:n], s.up_sfb[:n]), dim=1
+            (s.gate_sfb.index_select(0, idx_t),
+             s.up_sfb.index_select(0, idx_t)), dim=1,
         ).contiguous()
-        self.cache_down_sfb = s.down_sfb[:n].contiguous()
-        cached_slot = torch.full((s.num_experts,), -1, dtype=torch.int64,
-                                 device=dev)
-        cached_slot[:n] = torch.arange(n, dtype=torch.int64, device=dev)
+        self.cache_down_sfb = s.down_sfb.index_select(0, idx_t).contiguous()
+        cached_slot = torch.full((G,), -1, dtype=torch.int64, device=dev)
+        cached_slot[idx_t] = torch.arange(n, dtype=torch.int64, device=dev)
         self.cached_slot = cached_slot
         self.cache_n = n
-        # Constant expert list (+ sentinel) for the fully-cached any-T path.
+        # Host-side companions for the prefill partition split.
+        self._cached_mask_np = np.zeros(G, dtype=bool)
+        self._cached_mask_np[ids] = True
+        self._slot_np = np.full(G, -1, dtype=np.int64)
+        self._slot_np[ids] = np.arange(n, dtype=np.int64)
+        # Constant expert list (+ sentinel) for the fully-cached any-T path
+        # (only used when n == G, where slot i == expert i by construction).
         self._experts_all = torch.cat((
-            torch.arange(s.num_experts, dtype=torch.int32, device=dev),
+            torch.arange(G, dtype=torch.int32, device=dev),
             torch.tensor([-1], dtype=torch.int32, device=dev),
         ))
+
+    def _pick_cache_ids(self, n: int, G: int) -> list:
+        """Expert ids to cache, ascending (slot = rank among cached ids).
+
+        With ASYMGEMM_CACHE_HOT_EXPERTS=<stats.pt> (a file produced by a
+        profiling run under ASYMGEMM_RECORD_EXPERT_STATS), pick this layer's
+        top-n most-routed experts; otherwise — or for a full cache, where
+        selection is moot and the any-T path assumes slot i == expert i —
+        experts 0..n-1.
+        """
+        path = os.getenv("ASYMGEMM_CACHE_HOT_EXPERTS", "")
+        if path and n < G:
+            try:
+                stats = torch.load(path)
+                counts = stats.get(len(_ALL_LAYERS) - 1)
+                if counts is not None and counts.numel() == G:
+                    top = torch.argsort(counts, descending=True)[:n]
+                    return sorted(int(i) for i in top)
+            except Exception as e:  # pragma: no cover - fall back to first-n
+                import logging
+                logging.getLogger(__name__).warning(
+                    "AsymGEMM: failed to load expert stats from %s (%s); "
+                    "caching experts 0..%d", path, e, n - 1)
+        return list(range(n))
 
     def _cached_gpu_decode(
         self,
@@ -636,14 +833,44 @@ class Layer:
         else:
             gate_sfb = up_sfb = down_sfb = None
 
-        slab = ExpertSlab(
-            num_experts=G, hidden=K_hidden, inter=N_inter,
-            kb_hidden=kb_h, kb_inter=kb_i,
-            gate_int8=gate_int8, gate_scales=gate_s,
-            up_int8=up_int8,     up_scales=up_s,
-            down_int8=down_int8, down_scales=down_s,
-            gate_sfb=gate_sfb, up_sfb=up_sfb, down_sfb=down_sfb,
-        )
+        # NUMA-TP: repin the slab as two node-local halves (experts [0, G/2)
+        # on node 0, the rest on node 1). Pinned pages can't migrate, so this
+        # must happen at (re)pin time; the sources may be pinned or plain CPU
+        # tensors — contiguous().pin_memory() under a bound mempolicy copies
+        # either way.
+        if _numa_tp_enabled() and _num_numa_nodes() >= 2 and G >= 2:
+            g_split = G // 2
+            halves = {}
+            for name, t in (("gate_int8", gate_int8), ("gate_scales", gate_s),
+                            ("up_int8", up_int8), ("up_scales", up_s),
+                            ("down_int8", down_int8), ("down_scales", down_s)):
+                halves[name] = _pin_on_node(t[:g_split], 0)
+                halves[name + "_b"] = _pin_on_node(t[g_split:], 1)
+            slab = ExpertSlab(
+                num_experts=G, hidden=K_hidden, inter=N_inter,
+                kb_hidden=kb_h, kb_inter=kb_i,
+                gate_int8=halves["gate_int8"], gate_scales=halves["gate_scales"],
+                up_int8=halves["up_int8"],     up_scales=halves["up_scales"],
+                down_int8=halves["down_int8"], down_scales=halves["down_scales"],
+                gate_sfb=gate_sfb, up_sfb=up_sfb, down_sfb=down_sfb,
+                g_split=g_split,
+                gate_int8_b=halves["gate_int8_b"],
+                gate_scales_b=halves["gate_scales_b"],
+                up_int8_b=halves["up_int8_b"],
+                up_scales_b=halves["up_scales_b"],
+                down_int8_b=halves["down_int8_b"],
+                down_scales_b=halves["down_scales_b"],
+            )
+        else:
+            slab = ExpertSlab(
+                num_experts=G, hidden=K_hidden, inter=N_inter,
+                kb_hidden=kb_h, kb_inter=kb_i,
+                gate_int8=gate_int8, gate_scales=gate_s,
+                up_int8=up_int8,     up_scales=up_s,
+                down_int8=down_int8, down_scales=down_s,
+                gate_sfb=gate_sfb, up_sfb=up_sfb, down_sfb=down_sfb,
+                g_split=G,
+            )
         return cls(slab, top_k=top_k, cpu_threads=cpu_threads,
                    cuda_device=cuda_device, m_cpu=m_cpu, runtime=runtime)
 
@@ -689,7 +916,8 @@ class Layer:
 
     @staticmethod
     def _build_layout(
-        part_experts: np.ndarray,   # expert ids in this partition (sorted)
+        part_experts: np.ndarray,   # global expert ids in this partition (sorted)
+        kernel_ids: np.ndarray,     # ids the kernel uses to index its B tensor
         counts_np: np.ndarray,      # [G] routed item count per expert
         seg_start_np: np.ndarray,   # [G] start of each expert's sorted segment
         sorted_e: torch.Tensor,     # [T*K] expert id per sorted item (device)
@@ -702,8 +930,10 @@ class Layer:
 
         Expert g's items land at pad_start[g] + rank-within-segment; every
         expert's block is padded to BLOCK_M for the kernel's per-expert row
-        alignment. Returns the (M_grouped, idx_to_orig, slot_to_orig, offsets,
-        experts, list_size) tuple consumed by _gpu_grouped_forward.
+        alignment. ``kernel_ids`` decouples routing ids from weight-tensor
+        ids (cache slots, or half-local ids under NUMA-TP). Returns the
+        (M_grouped, idx_to_orig, slot_to_orig, offsets, experts, list_size)
+        tuple consumed by _gpu_grouped_forward.
         """
         m_padded = ((counts_np[part_experts] + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
         pad_start_np = np.zeros(G, dtype=np.int64)
@@ -715,7 +945,7 @@ class Layer:
         offsets_np = np.empty(2 * len(part_experts), dtype=np.int32)
         offsets_np[0::2] = pad_start_np[part_experts]
         offsets_np[1::2] = pad_start_np[part_experts] + m_padded
-        experts_np = np.concatenate((part_experts, [-1])).astype(np.int32)
+        experts_np = np.concatenate((kernel_ids, [-1])).astype(np.int32)
 
         part_t = torch.from_numpy(part_experts).to(device)
         seg_start = torch.from_numpy(seg_start_np).to(device)
@@ -745,20 +975,19 @@ class Layer:
         x_gpu: torch.Tensor,        # [T, H] bf16 device
         layout,                     # contiguous layout built in forward()
         route_w_gpu: torch.Tensor,  # [T, top_k] fp32 device
-        cached: bool = False,       # weights from the VRAM cache vs pinned host
+        kind: str = "slab_a",       # 'cached' | 'slab_a' | 'slab_b'
     ):
-        """Run gate/up/down for one GPU-bucket partition in three grouped calls.
+        """Run one GPU-bucket partition's grouped GEMMs.
 
         ``layout`` is (M_grouped, idx_to_orig, slot_to_orig, offsets, experts,
         list_size): the AsymGEMM contiguous layout, built vectorized on the
-        GPU in forward(). With ``cached`` the kernels read the VRAM expert
-        cache (HBM, ~14x the bandwidth of the pinned-host PCIe path); the
-        cache holds experts 0..cache_n-1, so global expert ids double as
-        cache-local ids and the same layout format works for both. Returns
-        (orig_rows_for_valid, y_weighted_fp32) where orig_rows_for_valid is a
-        [n_valid] long tensor of source rows in the original [T, H]
-        activations, and y_weighted_fp32 is [n_valid, H] fp32 ready for
-        ``out_fp32.index_add_(0, orig_rows, y_weighted_fp32)``.
+        GPU in forward(), with the layout's expert ids already remapped to
+        this partition's weight tensor ('cached' -> cache slots with the
+        fused gate+up slab from HBM; 'slab_a'/'slab_b' -> the pinned-host
+        halves read over PCIe). Returns (orig_rows_for_valid, y_weighted_fp32)
+        where orig_rows_for_valid is a [n_valid] long tensor of source rows in
+        the original [T, H] activations, and y_weighted_fp32 is [n_valid, H]
+        fp32 ready for ``out_fp32.index_add_(0, orig_rows, y_w)``.
         """
         slab = self.slab
         dev = x_gpu.device
@@ -782,7 +1011,7 @@ class Layer:
         # SFA for gate/up: broadcast per-token scale across kb_h K-blocks.
         sfa_h = sA.unsqueeze(1).expand(M_grouped, kb_h).contiguous()
 
-        if cached:
+        if kind == "cached":
             # Fused gate+up: one grouped call over the [Nc, 2I, H] cache.
             d_gu = torch.empty(M_grouped, 2 * I, device=dev, dtype=torch.float32)
             asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
@@ -792,23 +1021,38 @@ class Layer:
             act = torch.nn.functional.silu(d_gu[:, :I]) * d_gu[:, I:]
             down_b, down_sfb = self.cache_down_int8, self.cache_down_sfb
         else:
+            gs = slab.g_split
+            if kind == "slab_b":
+                gate_b, up_b, dn_b = (slab.gate_int8_b, slab.up_int8_b,
+                                      slab.down_int8_b)
+                gate_sfb = slab.gate_sfb[gs:]
+                up_sfb = slab.up_sfb[gs:]
+                down_sfb = slab.down_sfb[gs:]
+            else:
+                gate_b, up_b, dn_b = (slab.gate_int8, slab.up_int8,
+                                      slab.down_int8)
+                # Under NUMA-TP half A holds only [0, gs); the SFBs stay full.
+                gate_sfb = slab.gate_sfb[:gs]
+                up_sfb = slab.up_sfb[:gs]
+                down_sfb = slab.down_sfb[:gs]
+
             # gate
             d_gate = torch.empty(M_grouped, I, device=dev, dtype=torch.float32)
             asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
-                (a_int8, sfa_h), (slab.gate_int8, slab.gate_sfb),
+                (a_int8, sfa_h), (gate_b, gate_sfb),
                 d_gate, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
             )
 
             # up
             d_up = torch.empty(M_grouped, I, device=dev, dtype=torch.float32)
             asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
-                (a_int8, sfa_h), (slab.up_int8, slab.up_sfb),
+                (a_int8, sfa_h), (up_b, up_sfb),
                 d_up, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
             )
 
             # SwiGLU
             act = torch.nn.functional.silu(d_gate) * d_up
-            down_b, down_sfb = slab.down_int8, slab.down_sfb
+            down_b, down_sfb = dn_b, down_sfb
 
         # Down: re-quantize act (BF16 round-trip to match the CPU path).
         act_bf16 = act.to(torch.bfloat16)
@@ -868,6 +1112,18 @@ class Layer:
         slots_sorted = order - rows_sorted * K
         sorted_e = flat_e[order]
 
+        if _record_stats_path():
+            if getattr(self, "_stat_counts", None) is None:
+                self._stat_counts = torch.zeros_like(counts)
+            self._stat_counts += counts
+            # Periodic dump via the first layer (atexit never runs when the
+            # scheduler dies to SIGTERM).
+            if self is _ALL_LAYERS[0]:
+                global _stats_step
+                _stats_step += 1
+                if _stats_step % 100 == 0:
+                    _dump_expert_stats()
+
         counts_np = counts.cpu().numpy()                      # one small D2H
         active = np.nonzero(counts_np)[0]
         cpu_frac = _cpu_prefill_fraction()
@@ -875,7 +1131,10 @@ class Layer:
         # prefill split: the CPU's job there is to relieve the PCIe weight
         # stream, and cached experts read HBM. With a full cache the CPU
         # share drops to zero automatically.
-        streamed = active[active >= self.cache_n]
+        if self.cache_n > 0:
+            streamed = active[~self._cached_mask_np[active]]
+        else:
+            streamed = active
         if (
             cpu_frac > 0.0
             and len(streamed)
@@ -892,8 +1151,12 @@ class Layer:
             csum = np.cumsum(counts_np[by_count])
             n_cpu = int(np.searchsorted(csum, cpu_frac * csum[-1], side="right"))
             cpu_experts = np.sort(by_count[:n_cpu])
+            cached_active = (
+                active[self._cached_mask_np[active]] if self.cache_n > 0
+                else active[:0]
+            )
             gpu_experts = np.sort(np.concatenate(
-                (by_count[n_cpu:], active[active < self.cache_n])
+                (by_count[n_cpu:], cached_active)
             ))
         else:
             cpu_experts = active[counts_np[active] <= self.m_cpu]
@@ -933,22 +1196,36 @@ class Layer:
 
             x_gpu_bf16 = x_bf16.to(in_device, dtype=torch.bfloat16).contiguous()
             route_w_gpu = route_w.to(in_device, dtype=torch.float32)
+            # Partition: cached experts (HBM, fused gate+up), then the
+            # streamed remainder by slab half (each half is a separate pinned
+            # tensor in NUMA-TP mode, with half-local kernel expert ids).
+            partitions = []
+            rest = gpu_experts
             if self.cache_n > 0:
-                partitions = (
-                    (gpu_experts[gpu_experts < self.cache_n], True),
-                    (gpu_experts[gpu_experts >= self.cache_n], False),
-                )
+                cm = self._cached_mask_np[gpu_experts]
+                partitions.append((gpu_experts[cm], "cached"))
+                rest = gpu_experts[~cm]
+            gs = self.slab.g_split
+            if self.slab.gate_int8_b is not None:
+                partitions.append((rest[rest < gs], "slab_a"))
+                partitions.append((rest[rest >= gs], "slab_b"))
             else:
-                partitions = ((gpu_experts, False),)
-            for part, cached in partitions:
+                partitions.append((rest, "slab_a"))
+            for part, kind in partitions:
                 if not len(part):
                     continue
+                if kind == "cached":
+                    kernel_ids = self._slot_np[part]
+                elif kind == "slab_b":
+                    kernel_ids = part - gs
+                else:
+                    kernel_ids = part
                 layout = self._build_layout(
-                    part, counts_np, seg_start_np, sorted_e,
+                    part, kernel_ids, counts_np, seg_start_np, sorted_e,
                     rows_sorted, slots_sorted, G, in_device,
                 )
                 rows_p, y_p = self._gpu_grouped_forward(
-                    x_gpu_bf16, layout, route_w_gpu, cached=cached,
+                    x_gpu_bf16, layout, route_w_gpu, kind=kind,
                 )
                 if rows_p is not None:
                     gpu_parts.append((rows_p, y_p))
@@ -961,11 +1238,24 @@ class Layer:
             m_offsets = np.zeros(len(cpu_experts) + 1, dtype=np.int64)
             np.cumsum(counts_np[cpu_experts], out=m_offsets[1:])
             out_cat = np.empty((int(m_offsets[-1]), H), dtype=np.float32)
+            if slab.gate_int8_b is not None:
+                half_b = (
+                    slab.gate_int8_b.numpy(), slab.gate_scales_b.numpy(),
+                    slab.up_int8_b.numpy(), slab.up_scales_b.numpy(),
+                    slab.down_int8_b.numpy(), slab.down_scales_b.numpy(),
+                )
+            else:
+                half_b = (
+                    np.empty(0, np.int8), np.empty(0, np.float32),
+                    np.empty(0, np.int8), np.empty(0, np.float32),
+                    np.empty(0, np.int8), np.empty(0, np.float32),
+                )
             _C.moe_expert_forward_batch(
                 self.rt, x_cat, m_offsets, cpu_experts.astype(np.int64),
                 slab.gate_int8.numpy(), slab.gate_scales.numpy(),
                 slab.up_int8.numpy(),   slab.up_scales.numpy(),
                 slab.down_int8.numpy(), slab.down_scales.numpy(),
+                *half_b,
                 out_cat, slab.inter, slab.hidden,
             )
             y_cpu = torch.from_numpy(out_cat).to(in_device, non_blocking=True)
