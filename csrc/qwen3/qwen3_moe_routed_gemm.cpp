@@ -180,6 +180,7 @@ void qwen3_moe_bf16_down_forward_scatter_add_(
         torch::Tensor());
 }
 
+// Not on the current best benchmark paths; ker101 leaves down-dx gather disabled.
 void qwen3_moe_bf16_down_dx_gather_left_(
     const torch::Tensor& grad_token,
     const torch::Tensor& weight_cpu,

@@ -50,10 +50,6 @@ s80000.b8  superoffload_mem  unsloth                    PASS     29.6   130.3   
 s80000.b8  superoffload_mem  unsloth-off                PASS     33.2   240.7    0.0   274.0   91.9   94.4    94.4  588.5
 s80000.b8  asym_cpuadamwds   recomp-off-full-fg-ker000  PASS     62.9   252.1    3.3   315.1   86.0  105.6   105.6  557.4
 s80000.b8  asym_cpuadamwds   recomp-off-full-fg-ker101  PASS     61.6   261.0    3.3   322.8   78.6   73.9    73.9  557.3
-<!-- (pre-optimization, for reference:)
-s80000.b8  asym_cpuadamwds   recomp-off-full-fg-ker000  PASS     65.6   977.6    3.8  1043.3   86.0  112.9   112.9  642.0
-s80000.b8  asym_cpuadamwds   recomp-off-full-fg-ker111  PASS     60.2  1179.9    3.9  1240.2   78.6   73.9    73.9  642.2
- -->
 
 Model: q3-32b
 
@@ -106,11 +102,25 @@ Motivations:
 - [?] Why does it have issues with extending to 2 GPUs (Superoffload + deepspeed / Superoffload + seq parallel)?
 
 System Design:
-- AsymGEMM-based design for lora forward/backward. Activation recompute-then-offload to utilize large C2C bandwiths. Present the forward+backward algorithms. 
-Utilize more CPU computes for memory bound modules/ops.
-- AsumGEMMM-based kernels for LoRA backward and MoEs.
-- Multi-tier activation offload system using CPU and NVME. Enable spilling into NVME using FIFO and prefetching based on LILO.
-- Intgeration with deepspeed / SP for multiple superchips
+- AsymLoRA kernels: Enable efficient ops with cpu-resifent weights and activation tensors
+    - MoE routing kernels
+        fused routed GEMM epilogues that scatter-add directly into token-space accumulators
+    - LoRA offload kernels
+        CPU-left LoRA-A forward and CPU-right LoRA-A gradient kernels that operate directly on pinned offloaded activations
+
+- AsymGEMM-guided activation offloading and scheduling for LoRA SFT: Decompose LoRA MLP/MoE forward and backward into fine-grained operators so large activations are recomputed, offloaded, or consumed directly from pinned CPU memory.
+    - Operator-aware activation policy
+        split gate/up/activation/down/LoRA paths and retain only the tensors each later operator truly needs.
+    - C2C-aware execution and GEMM
+        stream offloaded activations through NVLink-C2C into AsymGEMM/LoRA kernels and briefly stage tensors only at point of use.
+    - Heterogeneous compute
+        move memory-bound elementwise and low-rank work to CPU/offload-aware kernels, while keeping compute-dense GEMMs on GPU.
+
+- New hardware arichiecture/new module/how to do GB200 diffeent than GH200? Hardware-aware/GB200-aware module?
+
+- Multi-tier activation offload system using CPU and NVME: Enable spilling into NVME using FIFO asynchronously and prefetching based on LILO as efficient additional storage for activations.
+- Intgeration with deepspeed / SP for multiple superchips: Extend AsymLoRA with deepspeed and SP to accomodate longer sequences
+
 
 Baselines:
 - KTransformers
@@ -124,14 +134,16 @@ Baselines:
 - Superoffload (Optimizer State + Model Params)
 <!-- - Megatron (Optimizer State) -->
 
-<!-- Exps:
-- 1 GPU + Dense / MoEs
-- 2 GPUs + Dense / MoEs
+Exps:
+- 1 GPU, Dense / MoEs
+    - Throughput vs seq length where each legend is a method
+    - Memory saving vs seq length where each legend is a method 
+    - C2C Utilization where each legend is a method 
+    - GPU Utilization where each legend is a method 
+- 2 GPUs, Dense / MoEs
+    - The same as above
 
-Ablations:
+Ablations
 - 
--
-- -->
-
-
+- 
 

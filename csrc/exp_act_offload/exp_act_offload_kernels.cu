@@ -407,6 +407,7 @@ void sm100_grouped_lora_a_grad_bf16_cpu_right(
         stream);
 }
 
+// Not on the current best benchmark paths; retained for experimental paired gate/up LoRA-A dA runs.
 void sm100_grouped_lora_a_pair_grad_bf16_cpu_right(
     const torch::Tensor& dS_gate,
     const torch::Tensor& dS_up,
@@ -480,6 +481,7 @@ void sm100_grouped_lora_a_pair_grad_bf16_cpu_right(
         stream);
 }
 
+// Not on the current best benchmark paths; LoRA-B grads there use grouped GPU/Torch paths.
 void sm100_grouped_lora_b_backward_bf16_cpu_source(
     const torch::Tensor& grad_out_cpu,
     const torch::Tensor& low_rank,

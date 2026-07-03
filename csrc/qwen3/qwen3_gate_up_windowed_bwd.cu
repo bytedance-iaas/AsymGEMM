@@ -332,6 +332,7 @@ pybind11::dict empty_stats() {
 
 }  // namespace
 
+// Not on the current best benchmark paths; retained for native Qwen3 windowed recompute experiments.
 pybind11::tuple qwen3_gate_up_recompute_bwd_sm100_bf16_windowed(
     const torch::Tensor& x_sel,
     const torch::Tensor& dact_sel,

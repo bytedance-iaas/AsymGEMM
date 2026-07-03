@@ -567,6 +567,7 @@ static void sm100_m_grouped_bf16_cpu_left_asym_gemm_contiguous(const torch::Tens
     SM100BF16CpuLeftAsymGemmRuntime::launch(runtime, args);
 }
 
+// Not on the current best benchmark paths; retained for experimental paired CPU-left LoRA-A runs.
 static void sm100_m_grouped_bf16_cpu_left_pair_asym_gemm_contiguous(const torch::Tensor& a,
                                                  const torch::Tensor& b_gate,
                                                  const torch::Tensor& b_up,
