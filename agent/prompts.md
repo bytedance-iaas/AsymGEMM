@@ -116,3 +116,14 @@ DONT check those documents: agent/notes.md agent/paper.md agent/status.md agent/
 
 
 
+ we are trying to fully implement q3.5-35b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 for qwen3.5 however check the current artifacts i beleive the
+  imepvoemtns were very very marginal last time from q3.5-35b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 to  q3.5-35b-a3b|1 ; superoffload_mem|unsloth-off|ligerloss1. For all other models we can achieve more than 20% memory saving, but not this:
+
+"q3.5-35b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false"
+"q3.5-35b-a3b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false"
+"q3.5-35b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false"
+
+So chekc the artifacts careufll tnad  investiage is tehre somthing wrong? and if we can improve q3.5-35b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1  for better memory suage wihitout breaking other preexisintg code paths for other models.
+
+
+

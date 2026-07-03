@@ -115,6 +115,25 @@ the exact attention wrapper from Qwen3-32B. Inspect the setup report and runtime
 counters. The dense MLP path is the required `ker000` proof; attention counters are
 allowed only if `recomp-off-full-fg` explicitly enabled the matching attention wrapper.
 
+## Zero-Centered RMSNorm Caveat (root cause of the historical loss~13 runs)
+
+Every asym q3.5-27b artifact before 2026-07-03 trains at loss ~13.0–13.3 with sane
+grad_norm and correct memory. Root cause (fixed 2026-07-03): `Qwen3_5RMSNorm` is
+zero-centered — `y = normalize(x) * (1 + w)` (`modeling_qwen3_5.py:724`) — but
+`AsymFrozenRMSNorm` keyed the `(1 + w)` handling on the exact class name
+`Qwen3_5MoeRMSNorm` only (`asym_gemm/training/offload.py:402`). The dense class fell
+through to plain `w * normalize(x)`; with near-zero zero-centered checkpoint weights
+every normed output collapsed to ~0, so token mixers and MLPs contributed nothing and
+the residual stream carried only embeddings. Fix = include `Qwen3_5RMSNorm` (and
+`Qwen3_5RMSNormGated`) in the class-name sets. Validated: s2048 loss 13.27 → 1.715
+(baseline 1.718), grad_norm 0.29; probes in
+`scripts/testing/qwen35_dense_integration_probe.py` (pre-wrap vs wrapped forward,
+all-zeros → MATCH) and `scripts/testing/qwen35_dense_shapes_probe.py` (per-shape
+kernel parity — clean before and after, which is what exonerated the kernels).
+Liger, dense-fg, attention wrappers and the recomp-off scaffold were each bisected
+and exonerated (`profiling_dense27b_bisect_*`). If a future qwen3.5-family class is
+added, check its norm convention before trusting any loss.
+
 ## Stage 0: Alias And Label Ownership
 
 Required script alias:
@@ -370,7 +389,9 @@ bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 Success criteria:
 
 ```text
-target completes with finite loss
+target completes with loss INSIDE THE BASELINE BAND (within ~0.05 of the
+  superoffload rows at the same workload; finite-but-wrong ~13.x = the
+  zero-centered-RMSNorm signature, see the norm caveat below)
 target artifact label is recomp-off-full-fg-ker000
 target peak HBM is below superoffload_mem|unsloth-off at s50000.b8.ga1
 target is also reported against superoffload_mem|unsloth

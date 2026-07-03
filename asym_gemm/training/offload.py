@@ -399,8 +399,9 @@ class AsymFrozenRMSNorm(nn.Module):
             pin_memory_policy="none" if not pin_memory else "none",
         )
         self.eps = float(getattr(source, "variance_epsilon", getattr(source, "eps", 1e-6)))
-        self.shifted_weight = source_class == "Qwen3_5MoeRMSNorm"
-        self.gated = source_class == "Qwen3_5MoeRMSNormGated"
+        # Qwen3.5 dense and MoE non-gated norms are zero-centered: y = normalize(x) * (1 + w).
+        self.shifted_weight = source_class in {"Qwen3_5MoeRMSNorm", "Qwen3_5RMSNorm"}
+        self.gated = source_class in {"Qwen3_5MoeRMSNormGated", "Qwen3_5RMSNormGated"}
 
     @property
     def weight(self) -> torch.Tensor:

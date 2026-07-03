@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 import time
 from typing import Any, Callable, Literal, Sequence
 
@@ -681,12 +682,27 @@ class AsymCPUAdamW(torch.optim.Optimizer):
                 total += torch.sum(torch.abs(chunk_f32) ** norm_type_f, dtype=torch.float64).cpu()
         return total.pow(1.0 / norm_type_f).to(dtype=torch.float32)
 
+    def _debug_per_param_grad_norms(self) -> None:
+        # Gated diagnostic: top offenders by grad norm, for localizing anomalous
+        # global norms (e.g. the >1e10 norms seen at long sequence lengths).
+        raw = os.environ.get("ASYM_CPU_ADAMW_PER_PARAM_NORM_DEBUG", "0")
+        if str(raw).strip().lower() not in {"1", "true", "yes", "on"}:
+            return
+        norms = []
+        for mapping in self._mappings:
+            if mapping.grad_buffer_has_data and mapping.grad_buffer is not None:
+                norms.append((float(mapping.grad_buffer.detach().float().norm().item()), mapping.name))
+        norms.sort(reverse=True)
+        top = ", ".join(f"{name}={value:.3e}" for value, name in norms[:16])
+        print(f"[asym_cpu_adamw] per-param grad norms (top {min(16, len(norms))} of {len(norms)}): {top}", flush=True)
+
     def asym_cpu_adamw_clip_grad_norm_(
         self,
         max_norm: float,
         norm_type: float = 2.0,
         chunk_elements: int = 8_388_608,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        self._debug_per_param_grad_norms()
         total_norm = self.asym_cpu_adamw_grad_norm(norm_type=norm_type, chunk_elements=chunk_elements)
         max_norm_f = float(max_norm)
         total_norm_value = float(total_norm.item())

@@ -36,7 +36,7 @@ from asym_gemm.training.frozen_linear import AsymFrozenLinear, TorchGroupedFroze
 from asym_gemm.training.llama4_experts import AsymLlama4Experts
 from asym_gemm.training.llama4_moe import AsymLlama4Moe, AsymLlama4Router, is_llama4_moe
 from asym_gemm.training.llama4_shared_mlp import AsymLlama4SharedMLP
-from asym_gemm.training.lora import AsymLoRALinear
+from asym_gemm.training.lora import AsymLoRALinear, TorchLoRALinear
 from asym_gemm.training.moe import (
     build_contiguous_route_metadata,
     make_dense_group_metadata,
@@ -1137,10 +1137,12 @@ def test_attention_activation_offload_excludes_vision_attention(monkeypatch: pyt
     assert isinstance(model.layers[0].self_attn.k_proj, AsymActivationOffloadLoRALinear)
     assert isinstance(model.layers[0].self_attn.v_proj, AsymActivationOffloadLoRALinear)
     assert isinstance(model.layers[0].self_attn.o_proj, AsymActivationOffloadLoRALinear)
-    assert isinstance(model.vision_model.self_attn.q_proj, AsymLoRALinear)
+    # Vision attention stays LoRA-trainable but is excluded from BOTH the act-offload
+    # wrapper and the asym CPU base offload (it sits outside offload_modules=attention).
+    assert isinstance(model.vision_model.self_attn.q_proj, TorchLoRALinear)
     assert not isinstance(model.vision_model.self_attn.q_proj, AsymActivationOffloadLoRALinear)
     assert report.attention_act_offload_wrapped == 4
-    assert "vision_model.self_attn.q_proj:vision_or_multimodal" in report.attention_act_offload_skipped
+    assert not any("vision_model" in name for name in report.attention_act_offload_modules)
 
 
 def test_attention_activation_offload_adapter_config_records_modules(
