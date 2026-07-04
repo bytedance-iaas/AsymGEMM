@@ -298,6 +298,7 @@ def _known_optional_job_axis(part: str) -> bool:
         }
         or value in {"actrecomp0", "actrecomp1", "actrecompfalse", "actrecomptrue"}
         or value in {"xunpack0", "xunpack1", "xunpackfalse", "xunpacktrue"}
+        or value.startswith("ohbm")
         or value.startswith("loraafwd")
         or value.startswith("gradoff")
         or value.startswith("weightoff")
@@ -321,6 +322,7 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
     layergc = "layergc0"
     route = "route_missing"
     liger_loss = "ligerloss0"
+    ohbm = "ohbm0"
 
     if tail:
         router_part = tail.pop(0)
@@ -348,6 +350,9 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         if parsed_liger_loss is not None:
             liger_loss = parsed_liger_loss
             continue
+        if part.startswith("ohbm"):
+            ohbm = part
+            continue
         if part.startswith("route"):
             route = part
             continue
@@ -355,10 +360,16 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         # just because the driver grew a new folder label.
         continue
 
+    # Fold the outer-HBM tag into the recompute axis so ohbm variants stay
+    # distinct series (matches the RUNS token spelling, e.g. unsloth-off-ohbm4).
+    if ohbm != "ohbm0":
+        recompute_part = f"{recompute_part}-{ohbm}"
+
     return {
         "backend": backend_part,
         "profiler": profiler_part,
         "recompute": recompute_part,
+        "ohbm": ohbm,
         "policy_part": policy_part,
         "router_part": router_part,
         "asymm_expert_act_offload": expact_value,
@@ -459,7 +470,7 @@ def _infer_metadata(profile_path: Path, profile: dict[str, Any]) -> dict[str, st
     layergc = job_meta["layergc"]
     if not policy_part.startswith("pol") or not router_part.startswith("router"):
         return None
-    if recompute_part not in {"norecomp", "recomp", "unsloth"}:
+    if recompute_part.split("-ohbm", 1)[0] not in {"norecomp", "recomp", "unsloth"}:
         return None
 
     expert_policy = str(config.get("expert_policy") or policy_part[len("pol") :] or "none")
@@ -547,6 +558,8 @@ def _matches_filters(record: RunRecord, args: argparse.Namespace) -> bool:
             config_workload = record.metadata.get("config", "").split("__", 1)[0].lower()
             if value in allowed or config_workload in allowed:
                 continue
+        if key == "recompute" and value.split("-ohbm", 1)[0] in allowed:
+            continue
         if value not in allowed:
             return False
     return True

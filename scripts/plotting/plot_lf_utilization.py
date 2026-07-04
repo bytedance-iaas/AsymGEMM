@@ -27,6 +27,7 @@ from scripts.plotting.plot_lf_interconnect_ctc import (
     PHASE_SHADE_ALPHA,
     _apply_workload_filters,
     _find_profile_paths,
+    _parse_job_dir_parts,
     _phase_spans,
     _infer_metadata,
     _matches_filters,

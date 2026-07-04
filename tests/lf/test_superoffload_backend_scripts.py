@@ -2625,3 +2625,113 @@ def test_profile_lora_lf_keeps_superoffload_recompute_modes(tmp_path: Path) -> N
     command_paths = "\n".join(str(path) for path in command_files)
     assert "superoffload__source__norecomp__polnone" in command_paths
     assert "superoffload__source__recomp__polnone" in command_paths
+
+
+def _ohbm_dry_run_env(lf_dir: Path, deepspeed_dir: Path, backend_specs: str) -> dict[str, str]:
+    return {
+        "LF_DIR": str(lf_dir),
+        "DEEPSPEED_DIR": str(deepspeed_dir),
+        "BACKEND_SPECS": backend_specs,
+        "GPU_POOL": "0",
+        "PROFILERS": "source",
+        "WORKLOADS": "128|1|1",
+        "MAX_STEPS": "1",
+        "WARMUP_STEPS": "0",
+        "PREPARE_DATASETS": "false",
+        "DRY_RUN": "true",
+        "LORA_DROPOUT": "0.00",
+        "ASYMM_EXP_ACT_POLICIES": "none|false|false|false",
+        "PLOT": "false",
+        "PLOT_MEMORY_BREAKDOWN": "false",
+    }
+
+
+def test_profile_lora_lf_ohbm_suffix_sets_env_and_dir(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    deepspeed_dir = make_fake_deepspeed(tmp_path)
+    output_root = tmp_path / "dryrun"
+
+    run_cmd(
+        [
+            "scripts/lf/profile_lora_lf_test_source.sh",
+            "--model-specs",
+            "Qwen/Qwen3-30B-A3B|1",
+            "--output-root",
+            str(output_root),
+        ],
+        env=_ohbm_dry_run_env(lf_dir, deepspeed_dir, "superoffload|unsloth-off-ohbm4"),
+    )
+
+    command_files = list(output_root.rglob("command.txt"))
+    assert len(command_files) == 1
+    command_path = str(command_files[0])
+    # The recompute path segment stays the base mode; the outer-HBM tag is a
+    # standalone __ohbm<N> suffix on the job dir.
+    assert "superoffload__source__unsloth-off__polnone" in command_path
+    assert "__ohbm4" in command_path
+    command = command_files[0].read_text(encoding="utf-8")
+    assert "UNSLOTH_GC_OUTER_HBM_EVERY_N=4" in command
+    assert "UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU=true" in command
+    assert "USE_UNSLOTH_GC=true" in command
+
+
+def test_profile_lora_lf_ohbm_zero_suffix_keeps_canonical_dir(tmp_path: Path) -> None:
+    lf_dir = make_fake_lf(tmp_path)
+    deepspeed_dir = make_fake_deepspeed(tmp_path)
+    output_root = tmp_path / "dryrun"
+
+    run_cmd(
+        [
+            "scripts/lf/profile_lora_lf_test_source.sh",
+            "--model-specs",
+            "Qwen/Qwen3-30B-A3B|1",
+            "--output-root",
+            str(output_root),
+        ],
+        env=_ohbm_dry_run_env(lf_dir, deepspeed_dir, "superoffload|unsloth-off-ohbm0"),
+    )
+
+    command_files = list(output_root.rglob("command.txt"))
+    assert len(command_files) == 1
+    command_path = str(command_files[0])
+    # ohbm0 == unspecified: the job dir must stay byte-identical to canonical runs.
+    assert "superoffload__source__unsloth-off__polnone" in command_path
+    assert "__ohbm" not in command_path
+    command = command_files[0].read_text(encoding="utf-8")
+    assert "UNSLOTH_GC_OUTER_HBM_EVERY_N=0" in command
+
+
+def _run_profile_script_expect_failure(tmp_path: Path, backend_specs: str) -> subprocess.CompletedProcess[str]:
+    lf_dir = make_fake_lf(tmp_path)
+    deepspeed_dir = make_fake_deepspeed(tmp_path)
+    return subprocess.run(
+        [
+            "scripts/lf/profile_lora_lf_test_source.sh",
+            "--model-specs",
+            "Qwen/Qwen3-30B-A3B|1",
+            "--output-root",
+            str(tmp_path / "dryrun"),
+        ],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "ROOT": str(ROOT),
+            "ASYM_DIR": str(ROOT),
+            **_ohbm_dry_run_env(lf_dir, deepspeed_dir, backend_specs),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_profile_lora_lf_rejects_ohbm_on_non_unsloth_recompute(tmp_path: Path) -> None:
+    result = _run_profile_script_expect_failure(tmp_path, "superoffload|recomp-ohbm4")
+    assert result.returncode != 0
+    assert "-ohbm<N> requires an Unsloth-GC recompute mode" in result.stderr
+
+
+def test_profile_lora_lf_rejects_malformed_ohbm_suffix(tmp_path: Path) -> None:
+    result = _run_profile_script_expect_failure(tmp_path, "superoffload|unsloth-off-ohbm")
+    assert result.returncode != 0
+    assert "expected trailing -ohbm<N> with a nonnegative integer N" in result.stderr

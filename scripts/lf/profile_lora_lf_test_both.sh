@@ -40,21 +40,24 @@ GPU_POOL=${GPU_POOL:-3}
 #   recompute: recomp | norecomp | unsloth | unsloth-off | recomp-off-full-fg | recomp-off-full-fg-kerXYZ
 #              recomp-off-full-fg-kerXYZ pins the effective routed-kernel bits in the run spec.
 #              Dense/non-routed runs use ker000; Qwen3-30B-A3B MoE auto-default is ker101 unless route env vars override it.
+#              Unsloth-GC modes accept a trailing -ohbm<N> suffix (e.g. unsloth-off-ohbm4,
+#              recomp-off-full-fg-ker101-ohbm6): keep every Nth outer checkpoint root in HBM
+#              (UNSLOTH_GC_OUTER_HBM_EVERY_N). Omitted = ohbm0 = all roots offloaded to CPU.
 #   liger    : ligerloss0 | ligerloss1
 #   policy   : none|false|false|false|false|false (off)  |  none|true|true|false|true|true (offload+gc)
 declare -A M=(
   # MoE                                          (key = family-version + total size + active size)
-  [q3-30b-a3b]="Qwen/Qwen3-30B-A3B"
-  [q3-235b-a22b]="Qwen/Qwen3-235B-A22B"
-  [q3.5-35b-a3b]="Qwen/Qwen3.5-35B-A3B"
-  [q3.5-122b-a10b]="Qwen/Qwen3.5-122B-A10B"
-  [llama4-scout]="meta-llama/Llama-4-Scout-17B-16E"
+  [q3-30b-a3b]="Qwen/Qwen3-30B-A3B"                  # layers: 48
+  [q3-235b-a22b]="Qwen/Qwen3-235B-A22B"              # layers: 94
+  [q3.5-35b-a3b]="Qwen/Qwen3.5-35B-A3B"              # layers: 40
+  [q3.5-122b-a10b]="Qwen/Qwen3.5-122B-A10B"          # layers: 48
+  [llama4-scout]="meta-llama/Llama-4-Scout-17B-16E"  # layers: 48
   # dense
-  [q3-32b]="Qwen/Qwen3-32B"
-  [q3.5-27b]="Qwen/Qwen3.5-27B"
-  [q2.5-32b]="Qwen/Qwen2.5-32B-Instruct"
-  [q2.5-72b]="Qwen/Qwen2.5-72B-Instruct"
-  [llama3.3-70b]="meta-llama/Llama-3.3-70B-Instruct"
+  [q3-32b]="Qwen/Qwen3-32B"                          # layers: 64
+  [q3.5-27b]="Qwen/Qwen3.5-27B"                      # layers: 64
+  [q2.5-32b]="Qwen/Qwen2.5-32B-Instruct"             # layers: 64
+  [q2.5-72b]="Qwen/Qwen2.5-72B-Instruct"             # layers: 80
+  [llama3.3-70b]="meta-llama/Llama-3.3-70B-Instruct" # layers: 80
 )
 declare -A _M_REV=()
 for _k in "${!M[@]}"; do _M_REV["${M[$_k]%%|*}"]="${_k}"; done
@@ -75,15 +78,20 @@ if [[ "${_RUNS_ENV_SET}" == "true" ]]; then
     [[ -n "${_run}" ]] && RUNS+=("${_run}")
   done <<< "${_runs_env_lines}"
 else
-  # # 1 CPU
-  # RUNS=(
-  # )
-  # # 2 CPUs
-  # RUNS=(
-  #   # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" 
-  #   # "llama3.3-70b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" 
-  #   # "llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" 
+  RUNS=(
+    "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 60000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
+    # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 55000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
+    # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 52000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
 
+    # "llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
+    # "llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 34000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
+
+    # "llama4-scout|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 14500|8|1 ; none|false|false|false|false|false" # G-OOM 15k
+    # "q2.5-32b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 52000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
+    # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 131000|8|1 ; none|false|false|false|false|false" # C-OOM 132k
+    # "q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
+  )
+  # RUNS=(
   #   # "q3-30b-a3b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 131000|8|1 ; none|false|false|false|false|false" # C-OOM 132k
   #   # "q3-32b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 52000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
   #   # "llama3.3-70b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
@@ -92,7 +100,7 @@ else
   #   # "q2.5-72b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
 
   #   # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
-  #   # "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
+  #   # "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 49000|8|1 ; none|false|false|false|false|false" # G-OOM 50k
   #   # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
   #   # "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
   #   # "q2.5-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
@@ -105,43 +113,36 @@ else
   #   # "llama4-scout|1 ; superoffload_mem|recomp|ligerloss1 ; 8000|8|1 ; none|false|false|false|false|false" # G-OOM 9k
   #   # "q2.5-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 21000|8|1 ; none|false|false|false|false|false" # G-OOM 22k
   #   # "q2.5-72b|1 ; superoffload_mem|recomp|ligerloss1 ; 12000|8|1 ; none|false|false|false|false|false" # G-OOM 13k
-
-
-  #   # "q2.5-32b|2 ; superoffload_mem|recomp|ligerloss1 ; 21000|8|1 ; none|false|false|false|false|false" # G-OOM 22k
-  #   # "q2.5-72b|2 ; superoffload_mem|recomp|ligerloss1 ; 12000|8|1 ; none|false|false|false|false|false" # G-OOM 13k
-  #   "q3.5-35b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false"
-  #   "q3.5-35b-a3b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false"
-  #   "q3.5-35b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false"
   # )
-  RUNS=(
-    "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
-    "q3-30b-a3b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
-    "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
+  # RUNS=(
+  #   # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
+  #   # "q3-30b-a3b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
+  #   # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
 
-    "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
-    "q3-32b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
-    "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
+  #   # "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 49000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
+  #   # "q3-32b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 49000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
+  #   # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 49000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
 
-    "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
-    "llama3.3-70b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
-    "llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
+  #   # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
+  #   # "llama3.3-70b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
+  #   # "llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
 
-    "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
-    "llama4-scout|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
-    "llama4-scout|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
+  #   # "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
+  #   # "llama4-scout|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
+  #   # "llama4-scout|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
 
-    "q2.5-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
-    "q2.5-32b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
-    "q2.5-32b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
+  #   # "q2.5-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
+  #   # "q2.5-32b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
+  #   # "q2.5-32b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
 
-    "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # G-OOM 41k
-    "q2.5-72b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # G-OOM 41k
-    "q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # G-OOM 41k
+  #   # "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 41k
+  #   # "q2.5-72b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 41k
+  #   # "q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 41k
     
-    "q3.5-35b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 70000|8|1 ; none|false|false|false|false|false" # fla illegal memory 75k
-    "q3.5-35b-a3b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 70000|8|1 ; none|false|false|false|false|false" # fla illegal memory 75k
-    "q3.5-35b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 70000|8|1 ; none|false|false|false|false|false" # fla illegal memory 75k
-  )
+  #   # "q3.5-35b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 70000|8|1 ; none|false|false|false|false|false" # fla illegal memory 75k
+  #   # "q3.5-35b-a3b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 70000|8|1 ; none|false|false|false|false|false" # fla illegal memory 75k
+  #   # "q3.5-35b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 70000|8|1 ; none|false|false|false|false|false" # fla illegal memory 75k
+  # )
 fi
 
 # Iterate and parse the rows into scheduler metadata. Each RUNS item remains one scheduled run.
@@ -182,14 +183,14 @@ PRECISION=${PRECISION:-bf16}
 LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 
 # Training
-MAX_STEPS=${MAX_STEPS:-3}
-WARMUP_STEPS=${WARMUP_STEPS:-1}
+# MAX_STEPS=${MAX_STEPS:-3}
+# WARMUP_STEPS=${WARMUP_STEPS:-1}
 # MAX_STEPS=${MAX_STEPS:-6}
 # WARMUP_STEPS=${WARMUP_STEPS:-6}
 # MAX_STEPS=${MAX_STEPS:-7}
 # WARMUP_STEPS=${WARMUP_STEPS:-3}
-# MAX_STEPS=${MAX_STEPS:-1}
-# WARMUP_STEPS=${WARMUP_STEPS:-1}
+MAX_STEPS=${MAX_STEPS:-1}
+WARMUP_STEPS=${WARMUP_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 # LORA_PARAMS is the canonical LoRA knob: sweep tuples, each "dropout|rank|alpha[|target]".
 # Older LORA_DROPOUT/LORA_RANK/LORA_ALPHA knobs still seed the default tuple.
@@ -218,8 +219,10 @@ ASYMM_QWEN3_MOE_ROUTE_LORA=${ASYMM_QWEN3_MOE_ROUTE_LORA:-0}
 ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE=${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE:-fp32}
 ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG=${ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG:-0}
 
-# Outer checkpoint placement. Keep at 0 for final comparisons; nonzero values
-# move some outer Unsloth checkpoint roots from CPU RAM back to HBM.
+# Outer checkpoint placement: keep every Nth outer Unsloth checkpoint root in HBM
+# instead of CPU RAM. Sweep-wide default; a per-run -ohbm<N> recompute suffix in
+# RUNS overrides it. Keep 0 for fixed-seq apples-to-apples comparisons; nonzero
+# is for max-seq ceiling hunting (runs gain an __ohbm<N> dir suffix).
 UNSLOTH_GC_OUTER_HBM_EVERY_N=${UNSLOTH_GC_OUTER_HBM_EVERY_N:-0}
 
 # CUDA allocator
@@ -247,7 +250,7 @@ ASYM_CPU_ADAMW_PIN_MEMORY=${ASYM_CPU_ADAMW_PIN_MEMORY:-true}
 ASYM_CPU_ADAMW_FP32_MASTER=${ASYM_CPU_ADAMW_FP32_MASTER:-true}
 
 # Execution
-OVERWRITE=${OVERWRITE:-false}
+OVERWRITE=${OVERWRITE:-true}
 CONTINUE_ON_ERROR=${CONTINUE_ON_ERROR:-true}
 DRY_RUN=${DRY_RUN:-false}
 COLLECT_EXISTING=${COLLECT_EXISTING:-false}
@@ -255,11 +258,11 @@ INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
 RUN_NAME=${RUN_NAME:-}
 
 # Dataset
+DATASET_OVERWRITE=${DATASET_OVERWRITE:-true}
 DATASET=${DATASET:-asym_long_sft_smoke}
 PREPARE_DATASETS=${PREPARE_DATASETS:-true}
 DATASET_MIN_TOKENS=${DATASET_MIN_TOKENS:-auto}
 DATASET_EVAL_ROWS=${DATASET_EVAL_ROWS:-1}
-DATASET_OVERWRITE=${DATASET_OVERWRITE:-false}
 TEMPLATE=${TEMPLATE:-auto}
 MAX_SAMPLES=${MAX_SAMPLES:-256}
 
@@ -363,6 +366,8 @@ Defaults:
 Options:
   RUNS is the job list. Each row is:
     model ; backend|recompute|ligerloss ; seq|batch|grad_accum ; policy|expact|attnact|layeract|layergc|sdparecomp
+  Unsloth-GC recompute modes take an optional trailing -ohbm<N> suffix (keep every Nth
+  outer checkpoint root in HBM; omitted = ohbm0 = all roots to CPU), e.g. unsloth-off-ohbm4.
   Override it from the environment with rows separated by '||':
     RUNS='q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false || q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true'
 
@@ -980,6 +985,26 @@ recompute_kernel_code_label() {
   esac
 }
 
+# Trailing -ohbm<N> recompute suffix -> UNSLOTH_GC_OUTER_HBM_EVERY_N for the run.
+recompute_outer_hbm_n() {
+  local norm="${1,,}"
+  norm="${norm//_/-}"
+  case "${norm}" in
+    *-ohbm*)
+      local n="${norm##*-ohbm}"
+      [[ "${n}" =~ ^[0-9]+$ ]] || die "expected trailing -ohbm<N> with a nonnegative integer N (after any -kerXYZ), got '${1}'"
+      printf '%s\n' "${n}"
+      ;;
+    *) printf '0\n' ;;
+  esac
+}
+
+recompute_token_without_ohbm() {
+  local norm="${1,,}"
+  norm="${norm//_/-}"
+  printf '%s\n' "${norm%-ohbm*}"
+}
+
 recompute_label() {
   local kernel_code
   kernel_code="$(recompute_kernel_code_label "$1")"
@@ -1044,6 +1069,7 @@ router_mode_label() {
 append_backend_spec() {
   local raw="$1"
   local backend_part recompute_part liger_loss_part backend recompute_token recompute_mode recompute_kernel_code liger_loss
+  local recompute_token_base recompute_outer_hbm_every_n norm_kernel_code norm_outer_hbm
   local pipe_chars
   local -a recompute_tokens
 
@@ -1056,6 +1082,16 @@ append_backend_spec() {
     2)
       IFS='|' read -r backend_part recompute_part liger_loss_part <<< "${raw}"
       [[ -n "${liger_loss_part}" ]] || die "empty Liger-loss mode in backend spec '${raw}'"
+      ;;
+    3|4)
+      # Already-normalized spec (backend|mode|liger|ker[|ohbm]) looping back
+      # through the axis expansion; reassemble the recompute token and reparse.
+      IFS='|' read -r backend_part recompute_part liger_loss_part norm_kernel_code norm_outer_hbm <<< "${raw}"
+      [[ -n "${liger_loss_part}" ]] || die "empty Liger-loss mode in backend spec '${raw}'"
+      [[ -n "${norm_kernel_code}" ]] && recompute_part="${recompute_part}-ker${norm_kernel_code}"
+      if [[ -n "${norm_outer_hbm:-}" && "${norm_outer_hbm}" != "0" ]]; then
+        recompute_part="${recompute_part}-ohbm${norm_outer_hbm}"
+      fi
       ;;
     *)
       die "backend spec must be backend|recompute or backend|recompute|ligerloss0/ligerloss1, got '${raw}'"
@@ -1098,9 +1134,17 @@ append_backend_spec() {
       backend_specs_raw+=("${backend}|norecomp|${liger_loss}" "${backend}|recomp|${liger_loss}")
       continue
     fi
-    recompute_mode="$(recompute_label "${recompute_token}")"
-    recompute_kernel_code="$(recompute_kernel_code_label "${recompute_token}")"
-    if [[ -n "${recompute_kernel_code}" ]]; then
+    recompute_outer_hbm_every_n="$(recompute_outer_hbm_n "${recompute_token}")"
+    recompute_token_base="$(recompute_token_without_ohbm "${recompute_token}")"
+    recompute_mode="$(recompute_label "${recompute_token_base}")"
+    recompute_kernel_code="$(recompute_kernel_code_label "${recompute_token_base}")"
+    if (( recompute_outer_hbm_every_n > 0 )); then
+      if [[ "${recompute_mode}" != "unsloth" && "${recompute_mode}" != "unsloth-off" ]] &&
+        ! is_recomp_off_recompute "${recompute_mode}"; then
+        die "-ohbm<N> requires an Unsloth-GC recompute mode (unsloth, unsloth-off, or recomp-off-*); got '${recompute_token}'"
+      fi
+      backend_specs_raw+=("${backend}|${recompute_mode}|${liger_loss}|${recompute_kernel_code}|${recompute_outer_hbm_every_n}")
+    elif [[ -n "${recompute_kernel_code}" ]]; then
       backend_specs_raw+=("${backend}|${recompute_mode}|${liger_loss}|${recompute_kernel_code}")
     else
       backend_specs_raw+=("${backend}|${recompute_mode}|${liger_loss}")
@@ -1274,6 +1318,7 @@ existing_profile_complete() {
   local expected_liger_loss="${15:-}"
   local expected_unsloth_recompute_save_on_cpu="${16:-}"
   local current_profile_sync="${PROFILE_SYNC:-}"
+  local current_outer_hbm_every_n="${UNSLOTH_GC_OUTER_HBM_EVERY_N:-0}"
   local current_batch="${PER_DEVICE_TRAIN_BATCH_SIZE:-}"
   local current_grad_accum="${GRADIENT_ACCUMULATION_STEPS:-}"
   local current_lora_rank="${LORA_RANK:-}"
@@ -1296,7 +1341,7 @@ existing_profile_complete() {
     "${current_route_rank_limit}" "${current_default_route_rank_limit}" \
     "${current_allow_unvalidated_route_rank}" "${expected_offload_modules}" "${expected_expact}" "${expected_attnact}" "${expected_layeract}" "${expected_layergc}" \
     "${expected_lf_expert_lora_impl}" "${expected_expact_lora_a_fwd}" "${expected_grad_offload}" "${expected_liger_loss}" \
-    "${expected_unsloth_recompute_save_on_cpu}" "${current_profile_sync}" <<'PY' >/dev/null 2>&1
+    "${expected_unsloth_recompute_save_on_cpu}" "${current_profile_sync}" "${current_outer_hbm_every_n}" <<'PY' >/dev/null 2>&1
 import json
 import math
 import sys
@@ -1328,6 +1373,7 @@ expected_grad_offload = sys.argv[24] if len(sys.argv) > 24 else ""
 expected_liger_loss = sys.argv[25] if len(sys.argv) > 25 else ""
 expected_unsloth_recompute_save_on_cpu = sys.argv[26] if len(sys.argv) > 26 else ""
 expected_profile_sync = sys.argv[27] if len(sys.argv) > 27 else ""
+expected_outer_hbm_every_n = sys.argv[28] if len(sys.argv) > 28 else ""
 source_profile = profile.get("source_profile", {})
 source_profile = source_profile if isinstance(source_profile, dict) and source_profile else profile
 if profile.get("partial") is True:
@@ -1437,6 +1483,18 @@ if expected_unsloth_recompute_save_on_cpu:
         raise SystemExit(
             "profile unsloth_gc_recompute_save_on_cpu mismatch: "
             f"expected {wanted_unsloth_off}, got {actual_unsloth_off}"
+        )
+if expected_outer_hbm_every_n != "":
+    raw_outer_hbm = config.get("unsloth_gc_outer_hbm_every_n")
+    try:
+        # Profiles predating the knob lack the key; treat missing as 0.
+        actual_outer_hbm = int(raw_outer_hbm) if raw_outer_hbm not in (None, "") else 0
+    except (TypeError, ValueError):
+        actual_outer_hbm = None
+    if actual_outer_hbm is None or actual_outer_hbm != int(expected_outer_hbm_every_n):
+        raise SystemExit(
+            "profile unsloth_gc_outer_hbm_every_n mismatch: "
+            f"expected {expected_outer_hbm_every_n}, got {raw_outer_hbm!r}"
         )
 if expected_recomp_off_stage:
     actual_stage = str(config.get("recomp_off_stage") or "").strip()
@@ -1850,7 +1908,7 @@ job_root_path() {
     grad_offload_suffix="__gradoff${grad_offload}__weightoff${weight_offload}"
   fi
   if [[ "${UNSLOTH_GC_OUTER_HBM_EVERY_N:-0}" != "0" ]]; then
-    outer_hbm_suffix="__outerhbm${UNSLOTH_GC_OUTER_HBM_EVERY_N}"
+    outer_hbm_suffix="__ohbm${UNSLOTH_GC_OUTER_HBM_EVERY_N}"
   fi
   path_label="${path_label}__${expact_lora_a_fwd_label}__${actrecomp_label}__${xunpack_label}__${moefg_label}__${dscatter_label}__${q3rt_label}__${liger_loss}${grad_offload_suffix}${outer_hbm_suffix}"
   printf '%s/%s\n' "${config_root}" "$(safe_label "${path_label}")"
@@ -3028,6 +3086,7 @@ run_job() {
   local grad_offload="${12:-false}"
   local weight_offload="${13:-false}"
   local requested_recompute_kernel_code="${14:-}"
+  local requested_outer_hbm_every_n="${15:-0}"
   # Canonicalize the policy axes for inert runs; local shadows feed run_id, the folder, the env, and the check.
   local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" sdparecomp_label="${sdparecomp_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}" moefg_label="${moefg_label}" dscatter_label="${dscatter_label}" q3rt_label="${q3rt_label}"
   local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_LAYER_GC="${ASYMM_LAYER_GC}" ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
@@ -3041,9 +3100,22 @@ run_job() {
   local ASYMM_QWEN3_MOE_ROUTE_LORA="${ASYMM_QWEN3_MOE_ROUTE_LORA:-0}"
   local ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE="${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE:-fp32}"
   local ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG="${ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG:-0}"
-  local q3rt_fwd_flag q3rt_gather_flag q3rt_dx_flag q3rt_lora_flag q3rt_kernel_code recompute_artifact_label
+  local q3rt_fwd_flag q3rt_gather_flag q3rt_dx_flag q3rt_lora_flag q3rt_kernel_code recompute_artifact_label recompute_plot_filter
   local ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU:-1}"
   local ASYMM_MLP_RECOMPUTE_CHUNK="${ASYMM_MLP_RECOMPUTE_CHUNK:-0}"
+  # Per-run -ohbm<N> wins over the sweep-wide env; the dynamic scope feeds
+  # job_root_path, the launch env, and the profile completeness checks.
+  local UNSLOTH_GC_OUTER_HBM_EVERY_N="${UNSLOTH_GC_OUTER_HBM_EVERY_N:-0}"
+  if [[ "${requested_outer_hbm_every_n:-0}" != "0" ]]; then
+    UNSLOTH_GC_OUTER_HBM_EVERY_N="${requested_outer_hbm_every_n}"
+  fi
+  # Non-Unsloth-GC modes ignore a sweep-wide env value: run_lf rejects
+  # UNSLOTH_GC_OUTER_HBM_EVERY_N>0 with USE_UNSLOTH_GC=false, and the dir
+  # suffix would misdescribe the run.
+  case "${recompute}" in
+    unsloth|unsloth-off) ;;
+    *) is_recomp_off_recompute "${recompute}" || UNSLOTH_GC_OUTER_HBM_EVERY_N=0 ;;
+  esac
   local job_lf_dir="${CURRENT_LF_DIR:-${LF_DIR}}"
   local job_env_dir="${CURRENT_ENV_DIR:-${ENV_DIR}}"
   local job_flash_attn="${CURRENT_FLASH_ATTN:-${FLASH_ATTN}}"
@@ -3161,6 +3233,13 @@ run_job() {
   q3rt_kernel_code="$(qwen3_route_kernel_code "${q3rt_fwd_flag}" "${q3rt_gather_flag}" "${q3rt_dx_flag}")"
   validate_recompute_kernel_for_model "${current_model_name}" "${q3rt_kernel_code}" "${q3rt_lora_flag}"
   recompute_artifact_label="$(recompute_run_label "${recompute}" "${q3rt_kernel_code}")"
+  # Full recompute token for per-run plot filters (matches the plotters'
+  # folded metadata axis, e.g. recomp-off-full-fg-ker101-ohbm6); base tokens
+  # would drop ker/ohbm runs from their own per-run plots.
+  recompute_plot_filter="${recompute_artifact_label}"
+  if [[ "${UNSLOTH_GC_OUTER_HBM_EVERY_N:-0}" != "0" ]]; then
+    recompute_plot_filter="${recompute_plot_filter}-ohbm${UNSLOTH_GC_OUTER_HBM_EVERY_N}"
+  fi
   if qwen3_route_any_enabled "${q3rt_fwd_flag}" "${q3rt_gather_flag}" "${q3rt_dx_flag}" "${q3rt_lora_flag}"; then
     [[ "${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE,,}" == "fp32" ]] || die "Qwen3 routed kernels currently require ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE=fp32, got '${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE}'"
     [[ "${backend}" == asym* ]] || die "Qwen3 routed kernels are only valid for asym* backends, got backend='${backend}'"
@@ -3294,7 +3373,7 @@ run_job() {
       append_job_record "${config_root}" ok \
         "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" source "${liger_loss}" "${grad_offload}" "${source_materialized_seq_root}" "${source_materialized_profile_json}" "${source_materialized_log_file}" "${lf_expert_lora_impl}"
       if profiler_selected_for_plots source; then
-        plot_single_run "${config_root}" "${seq_len}" "${backend}" source "${recompute}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${source_materialized_seq_root}"
+        plot_single_run "${config_root}" "${seq_len}" "${backend}" source "${recompute_plot_filter}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${source_materialized_seq_root}"
       fi
       if [[ "${profile_memory_breakdown}" == "true" ]]; then
         plot_memory_single_run "${source_materialized_seq_root}"
@@ -3329,10 +3408,10 @@ run_job() {
         postprocess_existing_nsys_artifacts "${seq_root}" "${source_profile}" "${profile_json}" || return $?
       fi
       if profiler_selected_for_plots "${run_profiler}"; then
-        plot_single_run "${config_root}" "${seq_len}" "${backend}" "${run_profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${seq_root}"
+        plot_single_run "${config_root}" "${seq_len}" "${backend}" "${run_profiler}" "${recompute_plot_filter}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${seq_root}"
       fi
       if [[ "${materialize_source_from_nsys}" == "true" ]] && profiler_selected_for_plots source; then
-        plot_single_run "${config_root}" "${seq_len}" "${backend}" source "${recompute}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${source_materialized_seq_root}"
+        plot_single_run "${config_root}" "${seq_len}" "${backend}" source "${recompute_plot_filter}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${source_materialized_seq_root}"
       fi
       if [[ "${profile_memory_breakdown}" == "true" ]]; then
         if [[ "${materialize_source_from_nsys}" == "true" ]]; then
@@ -3641,10 +3720,10 @@ run_job() {
         "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" source "${liger_loss}" "${grad_offload}" "${source_materialized_seq_root}" "${source_materialized_profile_json}" "${source_materialized_log_file}" "${lf_expert_lora_impl}"
     fi
     if profiler_selected_for_plots "${run_profiler}"; then
-      plot_single_run "${config_root}" "${seq_len}" "${backend}" "${run_profiler}" "${recompute}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${seq_root}"
+      plot_single_run "${config_root}" "${seq_len}" "${backend}" "${run_profiler}" "${recompute_plot_filter}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${seq_root}"
     fi
     if [[ "${materialize_source_from_nsys}" == "true" ]] && profiler_selected_for_plots source; then
-      plot_single_run "${config_root}" "${seq_len}" "${backend}" source "${recompute}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${source_materialized_seq_root}"
+      plot_single_run "${config_root}" "${seq_len}" "${backend}" source "${recompute_plot_filter}" "${expert_policy}" "${router_mode}" "${liger_loss}" "${source_materialized_seq_root}"
     fi
     if [[ "${profile_memory_breakdown}" == "true" ]]; then
       if [[ "${materialize_source_from_nsys}" == "true" ]]; then
@@ -4187,8 +4266,9 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
         layergc_label="$(layergc_tag "${ASYMM_LAYER_GC}")"
         sdparecomp_label="$(sdparecomp_tag "${ASYMM_ATTN_SDPA_RECOMPUTE}")"
 
-        IFS='|' read -r backend recompute liger_loss recompute_kernel_code backend_spec_extra <<< "${backend_recompute}"
+        IFS='|' read -r backend recompute liger_loss recompute_kernel_code recompute_outer_hbm_n backend_spec_extra <<< "${backend_recompute}"
         [[ -n "${backend}" && -n "${recompute}" && -n "${liger_loss}" && -z "${backend_spec_extra:-}" ]] || die "internal error: malformed normalized backend spec '${backend_recompute}'"
+        recompute_outer_hbm_n="${recompute_outer_hbm_n:-0}"
         if { is_policy_independent_backend "${backend}" || [[ "${recompute}" == "recomp" ]]; } && [[ "${exp_act_policy_pair}" != "${exp_act_policy_pairs[0]}" ]]; then
           if [[ "${expert_policy}" != "off-layer" && "${ASYMM_EXPERT_ACT_OFFLOAD}" != "true" && "${ASYMM_ATTN_ACT_OFFLOAD}" != "true" && "${ASYMM_LAYER_GC}" != "true" ]]; then
             echo "Skipping backend=${backend} recompute=${recompute} policy=${exp_act_policy_pair}; inert policy axes run once (canonicalized to none|false|false|false|false|false)."
@@ -4239,7 +4319,7 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
                 if [[ "${weight_offload}" == "true" && "${grad_offload}" != "true" ]]; then
                   die "internal error: weight offload requires grad offload"
                 fi
-                if ! run_job "${backend}" "${profiler}" "${recompute}" "${liger_loss}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}" "${lf_expert_lora_impl}" "${grad_offload}" "${weight_offload}" "${recompute_kernel_code:-}"; then
+                if ! run_job "${backend}" "${profiler}" "${recompute}" "${liger_loss}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}" "${lf_expert_lora_impl}" "${grad_offload}" "${weight_offload}" "${recompute_kernel_code:-}" "${recompute_outer_hbm_n:-0}"; then
                   failures=$((failures + 1))
                   if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
                     exit 1

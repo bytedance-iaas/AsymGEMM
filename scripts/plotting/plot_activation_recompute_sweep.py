@@ -740,6 +740,7 @@ def known_optional_job_axis(part: str) -> bool:
         or value.startswith("loraafwd")
         or value.startswith("gradoff")
         or value.startswith("weightoff")
+        or value.startswith("ohbm")
     )
 
 
@@ -762,6 +763,7 @@ def parse_job_dir_parts(job_dir_name: str) -> dict[str, Any] | None:
     sdparecomp = "sdparecomp0"
     route = "route_missing"
     liger_loss = "ligerloss0"
+    ohbm = "ohbm0"
 
     if tail:
         router_part = tail.pop(0)
@@ -794,6 +796,9 @@ def parse_job_dir_parts(job_dir_name: str) -> dict[str, Any] | None:
         if parsed_liger_loss is not None:
             liger_loss = parsed_liger_loss
             continue
+        if part.startswith("ohbm"):
+            ohbm = part
+            continue
         if part.startswith("route") and not part.startswith("router"):
             route = part
             continue
@@ -801,10 +806,16 @@ def parse_job_dir_parts(job_dir_name: str) -> dict[str, Any] | None:
         # just because the driver grew a new folder label.
         continue
 
+    # Fold the outer-HBM tag into the recompute axis so ohbm variants stay
+    # distinct series (matches the RUNS token spelling, e.g. unsloth-off-ohbm4).
+    if ohbm != "ohbm0":
+        recompute = f"{recompute}-{ohbm}"
+
     return {
         "backend": backend,
         "profiler": profiler,
         "recompute": recompute,
+        "ohbm": ohbm,
         "policy_part": policy_part,
         "router_mode": router_mode,
         "asymm_expert_act_offload": expact_value,
@@ -890,7 +901,12 @@ def passes_filters(args: argparse.Namespace, meta: dict[str, Any]) -> bool:
     liger_loss_filter = getattr(args, "liger_loss", [])
     if liger_loss_filter and meta.get("liger_loss", "ligerloss0") not in set(liger_loss_filter):
         return False
-    if recompute_modes and meta["mode"] not in recompute_modes:
+    mode_value = str(meta["mode"])
+    if (
+        recompute_modes
+        and mode_value not in recompute_modes
+        and mode_value.split("-ohbm", 1)[0] not in recompute_modes
+    ):
         return False
     if getattr(args, "workload_tuples", set()):
         workload_tuple = (

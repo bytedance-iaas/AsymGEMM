@@ -442,6 +442,7 @@ def _known_optional_job_axis(part: str) -> bool:
         or value.startswith("loraafwd")
         or value.startswith("gradoff")
         or value.startswith("weightoff")
+        or value.startswith("ohbm")
     )
 
 
@@ -464,6 +465,7 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
     sdparecomp = "sdparecomp0"
     route = "route_missing"
     liger_loss = "ligerloss0"
+    ohbm = "ohbm0"
 
     if tail:
         router_part = tail.pop(0)
@@ -495,6 +497,9 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         if parsed_liger_loss is not None:
             liger_loss = parsed_liger_loss
             continue
+        if part.startswith("ohbm"):
+            ohbm = part
+            continue
         if part.startswith("route"):
             route = part
             continue
@@ -502,10 +507,16 @@ def _parse_job_dir_parts(job_dir_name: str) -> dict[str, str] | None:
         # just because the driver grew a new folder label.
         continue
 
+    # Fold the outer-HBM tag into the recompute axis so ohbm variants stay
+    # distinct series (matches the RUNS token spelling, e.g. unsloth-off-ohbm4).
+    if ohbm != "ohbm0":
+        recompute_part = f"{recompute_part}-{ohbm}"
+
     return {
         "backend": backend_part,
         "profiler": profiler_part,
         "recompute": recompute_part,
+        "ohbm": ohbm,
         "policy_part": policy_part,
         "router_part": router_part,
         "asymm_expert_act_offload": expact_value,

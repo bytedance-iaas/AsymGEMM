@@ -262,6 +262,9 @@ def collect_leaves(root: Path) -> dict:
                 sdpa_on = _tok(toks, "sdparecomp", "0") == "1"
                 route = route_token(toks)
                 config += f"  {route} [lg{'+' if liger_on else '-'} sd{'+' if sdpa_on else '-'}]"
+                ohbm_n = _tok(toks, "ohbm", "0")
+                if ohbm_n != "0":
+                    config += f" ohbm{ohbm_n}"
                 leaf = next((p for p in rd.iterdir() if p.is_dir() and p.name.startswith("b")), None)
                 if leaf is None:
                     continue

@@ -43,7 +43,7 @@ def migrated_name(name: str) -> str | None:
 
     insert_at = len(parts)
     for index, part in enumerate(parts):
-        if part.startswith("gradoff") or part.startswith("weightoff"):
+        if part.startswith("gradoff") or part.startswith("weightoff") or part.startswith("ohbm"):
             insert_at = index
             break
     parts.insert(insert_at, "ligerloss0")
