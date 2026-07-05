@@ -209,6 +209,19 @@ PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-}
 PROFILE_EXPERT_POLICY=${PROFILE_EXPERT_POLICY:-${ASYM_EXPERT_RECOMPUTE_POLICY}}
 INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
 
+# Host-OOM guards (GB200 nvidia-imex wedge mitigation):
+# - TRAIN_OOM_SCORE_ADJ marks the training tree as the kernel OOM killer's preferred
+#   victim, so a host OOM can never take system daemons (nvidia-imex/persistenced)
+#   down with it. Raising the score needs no privileges. Empty string disables.
+# - HOST_MEM_WATCHDOG interrupts training gracefully (SIGSTOP+SIGINT+SIGCONT) before
+#   the kernel OOM killer fires: it polls available memory on the CPU NUMA nodes and
+#   triggers below HOST_MEM_WATCHDOG_FLOOR_GB. false or FLOOR_GB=0 disables.
+TRAIN_OOM_SCORE_ADJ=${TRAIN_OOM_SCORE_ADJ:-1000}
+HOST_MEM_WATCHDOG=${HOST_MEM_WATCHDOG:-true}
+HOST_MEM_WATCHDOG_FLOOR_GB=${HOST_MEM_WATCHDOG_FLOOR_GB:-35}
+HOST_MEM_WATCHDOG_POLL_SECONDS=${HOST_MEM_WATCHDOG_POLL_SECONDS:-0.05}
+HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS=${HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS:-60}
+
 # =============================================================================
 # Derived Parameters
 # =============================================================================
@@ -1427,15 +1440,25 @@ append_host_oom_diagnostics() {
   local signal_label evidence=false reason="no cgroup memory kill counter increase observed"
   local oom_after="" oom_kill_after="" failcnt_after="" under_oom_after=""
   local oom_delta="NA" oom_kill_delta="NA" failcnt_delta="NA"
+  local watchdog_fired=false
+  if [[ -n "${LOG_FILE:-}" && -f "${LOG_FILE}.host_mem_watchdog_fired" ]]; then
+    watchdog_fired=true
+  fi
   signal_label="$(signal_label_from_status "${status}")"
   {
     printf '===== host memory OOM diagnostics =====\n'
     printf 'exit_status=%s\n' "${status}"
     printf 'exit_signal=%s\n' "${signal_label}"
+    printf 'HOST_MEM_WATCHDOG_FIRED=%s\n' "${watchdog_fired}"
     if [[ -z "${host_oom_cgroup_path}" ]]; then
       printf 'cgroup_memory_monitor=unavailable\n'
-      printf 'HOST_OOM_EVIDENCE=false\n'
-      printf 'HOST_OOM_EVIDENCE_REASON=no readable cgroup memory counters\n'
+      if [[ "${watchdog_fired}" == "true" ]]; then
+        printf 'HOST_OOM_EVIDENCE=true\n'
+        printf 'HOST_OOM_EVIDENCE_REASON=host memory watchdog interrupted the run before kernel OOM (soft host OOM)\n'
+      else
+        printf 'HOST_OOM_EVIDENCE=false\n'
+        printf 'HOST_OOM_EVIDENCE_REASON=no readable cgroup memory counters\n'
+      fi
     else
       printf 'cgroup_memory_monitor=%s\n' "${host_oom_cgroup_kind}"
       printf 'cgroup_memory_path=%s\n' "${host_oom_cgroup_path}"
@@ -1463,6 +1486,14 @@ append_host_oom_diagnostics() {
           evidence=true
           reason="cgroup v1 memory.oom_control oom_kill increased during run"
         fi
+      fi
+      if [[ "${watchdog_fired}" == "true" ]]; then
+        if [[ "${evidence}" == "true" ]]; then
+          reason="host memory watchdog fired and ${reason}"
+        else
+          reason="host memory watchdog interrupted the run before kernel OOM (soft host OOM)"
+        fi
+        evidence=true
       fi
       printf 'HOST_OOM_EVIDENCE=%s\n' "${evidence}"
       printf 'HOST_OOM_EVIDENCE_REASON=%s\n' "${reason}"
@@ -1576,6 +1607,79 @@ cleanup_managed_child() {
   fi
 }
 
+host_mem_watchdog_enabled() {
+  case "${HOST_MEM_WATCHDOG,,}" in
+    1|true|yes|on) ;;
+    *) return 1 ;;
+  esac
+  [[ "${HOST_MEM_WATCHDOG_FLOOR_GB}" =~ ^[0-9]+$ ]] || return 1
+  (( HOST_MEM_WATCHDOG_FLOOR_GB > 0 )) || return 1
+}
+
+# Available memory (kB) summed over CPU NUMA nodes only. Training is membind to the
+# CPU nodes, so the GPU HBM NUMA nodes (memory-only on GB200) must not count: global
+# MemAvailable includes free HBM the trainer cannot allocate, which would let the
+# kernel OOM killer fire before the watchdog. Falls back to global MemAvailable.
+host_mem_watchdog_avail_kb() {
+  local node cpus free_kb file_kb shmem_kb total=0 seen=0
+  for node in /sys/devices/system/node/node*; do
+    [[ -r "${node}/cpulist" && -r "${node}/meminfo" ]] || continue
+    cpus="$(tr -d '[:space:]' < "${node}/cpulist" 2>/dev/null || true)"
+    [[ -n "${cpus}" ]] || continue
+    free_kb="$(awk '$3 == "MemFree:" {s += $4} END {print s+0}' "${node}/meminfo" 2>/dev/null || echo 0)"
+    file_kb="$(awk '$3 == "FilePages:" {s += $4} END {print s+0}' "${node}/meminfo" 2>/dev/null || echo 0)"
+    shmem_kb="$(awk '$3 == "Shmem:" {s += $4} END {print s+0}' "${node}/meminfo" 2>/dev/null || echo 0)"
+    if (( file_kb > shmem_kb )); then
+      free_kb=$(( free_kb + file_kb - shmem_kb ))
+    fi
+    total=$(( total + free_kb ))
+    seen=1
+  done
+  if (( seen == 0 )); then
+    awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo ""
+    return 0
+  fi
+  printf '%s\n' "${total}"
+}
+
+# Poll available CPU-node memory while the managed child runs; on breach, freeze the
+# process group (stops allocation instantly), queue SIGINT, resume so the normal
+# graceful-interrupt path runs, and escalate through kill_managed_child only if the
+# run does not exit within HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS.
+host_mem_watchdog_loop() {
+  local floor_kb=$(( HOST_MEM_WATCHDOG_FLOOR_GB * 1024 * 1024 ))
+  local avail_kb deadline
+  local -a targets=()
+  while :; do
+    mapfile -t targets < <(managed_child_targets)
+    ((${#targets[@]} > 0)) || return 0
+    managed_process_alive "${targets[@]}" || return 0
+    avail_kb="$(host_mem_watchdog_avail_kb 2>/dev/null || true)"
+    if [[ "${avail_kb}" =~ ^[0-9]+$ ]] && (( avail_kb < floor_kb )); then
+      printf '[host-mem-watchdog] CPU-node available memory %s GiB dropped below floor %s GiB; interrupting training before the kernel OOM killer fires (soft host OOM).\n' \
+        "$(( avail_kb / 1024 / 1024 ))" "${HOST_MEM_WATCHDOG_FLOOR_GB}" >&2
+      if [[ -n "${LOG_FILE:-}" ]]; then
+        printf 'fired_at=%s avail_kb=%s floor_gb=%s\n' "$(date -Is 2>/dev/null || true)" "${avail_kb}" "${HOST_MEM_WATCHDOG_FLOOR_GB}" \
+          > "${LOG_FILE}.host_mem_watchdog_fired" 2>/dev/null || true
+      fi
+      signal_managed_targets STOP "${targets[@]}"
+      signal_managed_targets INT "${targets[@]}"
+      signal_managed_targets CONT "${targets[@]}"
+      deadline=$(( SECONDS + HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS ))
+      while (( SECONDS < deadline )); do
+        managed_process_alive "${targets[@]}" || return 0
+        sleep 1
+      done
+      if managed_process_alive "${targets[@]}"; then
+        echo "[host-mem-watchdog] training did not exit within ${HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS}s of soft-OOM interrupt; escalating." >&2
+        kill_managed_child
+      fi
+      return 0
+    fi
+    sleep "${HOST_MEM_WATCHDOG_POLL_SECONDS}"
+  done
+}
+
 run_managed_command() {
   local status=0 wait_pid="" child_pid="" pid_file="" attempt
   local watchdog_started_at=0 watchdog_status=0 watchdog_stage=""
@@ -1585,7 +1689,10 @@ run_managed_command() {
   if command -v setsid >/dev/null 2>&1 && setsid --help 2>&1 | grep -q -- '--wait' && setsid --help 2>&1 | grep -q -- '--fork'; then
     pid_file="$(mktemp "${TMPDIR:-/tmp}/run_lf_lora_sft_child.XXXXXX")"
     managed_child_pid_file="${pid_file}"
-    setsid --fork --wait bash -c 'pid_file="$1"; shift; echo "$$" > "${pid_file}"; exec "$@"' _ "${pid_file}" "$@" &
+    # Wrapper: record the session pid, mark the tree as the OOM killer's preferred
+    # victim, and restore default SIGINT/SIGQUIT (ignored in &-launched trees, which
+    # would silently disable KeyboardInterrupt in the trainer) before exec.
+    setsid --fork --wait bash -c 'pid_file="$1"; oom_adj="$2"; shift 2; echo "$$" > "${pid_file}"; if [[ -n "${oom_adj}" ]]; then { echo "${oom_adj}" > /proc/self/oom_score_adj; } 2>/dev/null || true; fi; if env --default-signal=SIGINT,SIGQUIT true 2>/dev/null; then exec env --default-signal=SIGINT,SIGQUIT "$@"; fi; exec "$@"' _ "${pid_file}" "${TRAIN_OOM_SCORE_ADJ}" "$@" &
     wait_pid=$!
     managed_wait_pid="${wait_pid}"
     managed_child_pid="${wait_pid}"
@@ -1601,10 +1708,19 @@ run_managed_command() {
       sleep 0.02
     done
   else
-    "$@" &
+    bash -c 'oom_adj="$1"; shift; if [[ -n "${oom_adj}" ]]; then { echo "${oom_adj}" > /proc/self/oom_score_adj; } 2>/dev/null || true; fi; if env --default-signal=SIGINT,SIGQUIT true 2>/dev/null; then exec env --default-signal=SIGINT,SIGQUIT "$@"; fi; exec "$@"' _ "${TRAIN_OOM_SCORE_ADJ}" "$@" &
     wait_pid=$!
     managed_wait_pid="${wait_pid}"
     managed_child_pid="${wait_pid}"
+  fi
+
+  local host_mem_watchdog_pid=""
+  if [[ -n "${LOG_FILE:-}" ]]; then
+    rm -f "${LOG_FILE}.host_mem_watchdog_fired" 2>/dev/null || true
+  fi
+  if host_mem_watchdog_enabled; then
+    host_mem_watchdog_loop &
+    host_mem_watchdog_pid=$!
   fi
 
   if first_step_watchdog_enabled; then
@@ -1629,6 +1745,10 @@ run_managed_command() {
     done
   fi
   wait "${wait_pid}" || status=$?
+  if [[ -n "${host_mem_watchdog_pid}" ]]; then
+    kill "${host_mem_watchdog_pid}" 2>/dev/null || true
+    wait "${host_mem_watchdog_pid}" 2>/dev/null || true
+  fi
   if [[ "${watchdog_status}" != "0" ]]; then
     status="${watchdog_status}"
   fi
