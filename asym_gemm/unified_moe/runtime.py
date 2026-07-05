@@ -92,6 +92,93 @@ def _numa_tp_enabled() -> bool:
     return os.getenv("ASYMGEMM_NUMA_TP", "0") == "1"
 
 
+# ---------------------------------------------------------------------------
+# Copy-engine staging for streamed (non-VRAM-cached) expert weights
+#
+# The SM90 asym kernel's in-kernel TMA reads of pinned host memory top out at
+# ~21.5 GB/s on PCIe Gen5 (single-slot B smem: the fetch of tile k+1 waits for
+# tile k to be consumed), while a plain copy-engine H2D on the same buffers
+# reaches ~50 GB/s. Staging swaps the transport: the streamed partition's
+# expert weights are copied into a double-buffered HBM ring on a side stream
+# (overlapping the cached-partition GEMMs and the CPU bucket), and the grouped
+# GEMMs read HBM (~320 GB/s) after a stream-ordered event wait. Same bytes
+# over the link, ~2.3x the bandwidth (measured end-to-end: 28.8 -> 13.5 ms for
+# a 654 MB layer partition).
+# ---------------------------------------------------------------------------
+
+def _stage_streamed() -> bool:
+    """ASYMGEMM_STAGE_STREAMED=0 disables copy-engine staging of streamed
+    expert weights (falls back to in-kernel TMA reads of pinned host)."""
+    return os.getenv("ASYMGEMM_STAGE_STREAMED", "1") == "1"
+
+
+class _StageRing:
+    """Double-buffered HBM staging slots for one slab geometry.
+
+    Two slots so layer L+1's copies can start (on the side stream) while
+    layer L's staged GEMMs are still reading the other slot; ``free_ev[i]``
+    is recorded on the compute stream after the last GEMM that reads slot i,
+    and the side stream waits on it before overwriting the slot.
+    """
+
+    def __init__(self, slab: "ExpertSlab", cache_n: int, device: str):
+        n = slab.num_experts - cache_n if cache_n > 0 else slab.num_experts
+        opts = dict(dtype=torch.int8, device=device)
+        sf = dict(dtype=torch.float32, device=device)
+        # The buffers keep their FULL [n, ...] shape every call (a partition
+        # only fills and schedules the first P groups): num_groups is a JIT
+        # compile-time constant, so a varying first dim would mint a new
+        # kernel variant per partition size — an unbounded set, each costing
+        # seconds of NVRTC mid-serving. Fixed shapes = one variant per
+        # projection, compiled once at warmup.
+        self.slots = [
+            {
+                "gate": torch.empty(n, slab.inter, slab.hidden, **opts),
+                "up":   torch.empty(n, slab.inter, slab.hidden, **opts),
+                "down": torch.empty(n, slab.hidden, slab.inter, **opts),
+                "gate_sfb": torch.empty(n, slab.inter, slab.kb_hidden, **sf),
+                "up_sfb":   torch.empty(n, slab.inter, slab.kb_hidden, **sf),
+                "down_sfb": torch.empty(n, slab.hidden, slab.kb_inter, **sf),
+            }
+            for _ in range(2)
+        ]
+        self.stream = torch.cuda.Stream(device=device)
+        self.free_ev = [torch.cuda.Event(), torch.cuda.Event()]
+        for ev in self.free_ev:
+            ev.record()
+        self._i = 0
+
+    def next_slot(self) -> int:
+        i = self._i
+        self._i ^= 1
+        return i
+
+
+_STAGE_RINGS: dict = {}
+_STAGE_DISABLED = False    # set on OOM: fall back to direct TMA for the session
+
+
+def _get_stage_ring(slab: "ExpertSlab", cache_n: int, device: str):
+    """Shared ring per (device, geometry) — every layer of a model reuses it."""
+    global _STAGE_DISABLED
+    if _STAGE_DISABLED or not _stage_streamed():
+        return None
+    key = (device, slab.num_experts, cache_n, slab.inter, slab.hidden)
+    ring = _STAGE_RINGS.get(key)
+    if ring is None:
+        try:
+            ring = _StageRing(slab, cache_n, device)
+        except torch.cuda.OutOfMemoryError:
+            import logging
+            logging.getLogger(__name__).warning(
+                "AsymGEMM: not enough HBM for the streamed-weight staging "
+                "ring; falling back to in-kernel TMA reads of pinned host.")
+            _STAGE_DISABLED = True
+            return None
+        _STAGE_RINGS[key] = ring
+    return ring
+
+
 def _num_numa_nodes() -> int:
     import glob as _glob
     return len(_glob.glob("/sys/devices/system/node/node[0-9]*"))
@@ -970,12 +1057,56 @@ class Layer:
             len(experts_np),
         )
 
+    def _stage_src_views(self):
+        """Per-expert pinned-host source views for staging copies, resolved
+        across the NUMA-TP slab halves once and cached (the per-call loop then
+        only issues ``copy_`` on prebuilt views)."""
+        views = getattr(self, "_stage_srcs", None)
+        if views is None:
+            s = self.slab
+            gs = s.g_split
+
+            def per_expert(name):
+                a = getattr(s, name)
+                b = getattr(s, name + "_b")
+                if b is None:
+                    return [a[i] for i in range(s.num_experts)]
+                return [a[i] if i < gs else b[i - gs]
+                        for i in range(s.num_experts)]
+
+            views = (per_expert("gate_int8"), per_expert("up_int8"),
+                     per_expert("down_int8"))
+            self._stage_srcs = views
+        return views
+
+    def _stage_copy(self, part: np.ndarray, ring: "_StageRing"):
+        """Issue async copy-engine H2D copies of partition ``part``'s expert
+        weights into the next ring slot, on the ring's side stream (overlaps
+        the cached-partition GEMMs and the CPU bucket). Returns the context
+        consumed by ``_gpu_grouped_forward(kind='staged')``."""
+        dev = f"cuda:{self.cuda_device}"
+        gate_src, up_src, down_src = self._stage_src_views()
+        slot_i = ring.next_slot()
+        slot = ring.slots[slot_i]
+        ids_t = torch.from_numpy(part.astype(np.int64)).to(dev)
+        with torch.cuda.stream(ring.stream):
+            # Don't clobber a slot the compute stream may still be reading.
+            torch.cuda.current_stream().wait_event(ring.free_ev[slot_i])
+            for k, g in enumerate(part.tolist()):
+                slot["gate"][k].copy_(gate_src[g], non_blocking=True)
+                slot["up"][k].copy_(up_src[g], non_blocking=True)
+                slot["down"][k].copy_(down_src[g], non_blocking=True)
+            ready = torch.cuda.Event()
+            ready.record(ring.stream)
+        return ring, slot_i, ready, ids_t
+
     def _gpu_grouped_forward(
         self,
         x_gpu: torch.Tensor,        # [T, H] bf16 device
         layout,                     # contiguous layout built in forward()
         route_w_gpu: torch.Tensor,  # [T, top_k] fp32 device
-        kind: str = "slab_a",       # 'cached' | 'slab_a' | 'slab_b'
+        kind: str = "slab_a",       # 'cached' | 'staged' | 'slab_a' | 'slab_b'
+        staged=None,                # (_StageRing, slot_i, ready_ev, ids_t)
     ):
         """Run one GPU-bucket partition's grouped GEMMs.
 
@@ -1022,7 +1153,25 @@ class Layer:
             down_b, down_sfb = self.cache_down_int8, self.cache_down_sfb
         else:
             gs = slab.g_split
-            if kind == "slab_b":
+            if kind == "staged":
+                ring, slot_i, ready_ev, ids_t = staged
+                P = int(ids_t.numel())
+                slot = ring.slots[slot_i]
+                # Gather this partition's SFB rows into the slot's fixed-size
+                # SFB buffers (compute stream: stream order both protects the
+                # slot from the layer still reading it and sequences these
+                # before the GEMMs). Independent of the weight copies, which
+                # only the GEMMs must wait for.
+                slot["gate_sfb"][:P].copy_(slab.gate_sfb.index_select(0, ids_t))
+                slot["up_sfb"][:P].copy_(slab.up_sfb.index_select(0, ids_t))
+                slot["down_sfb"][:P].copy_(slab.down_sfb.index_select(0, ids_t))
+                torch.cuda.current_stream().wait_event(ready_ev)
+                # Full-shape views — see _StageRing on why never sliced by P.
+                gate_b, up_b, dn_b = slot["gate"], slot["up"], slot["down"]
+                gate_sfb = slot["gate_sfb"]
+                up_sfb = slot["up_sfb"]
+                down_sfb = slot["down_sfb"]
+            elif kind == "slab_b":
                 gate_b, up_b, dn_b = (slab.gate_int8_b, slab.up_int8_b,
                                       slab.down_int8_b)
                 gate_sfb = slab.gate_sfb[gs:]
@@ -1064,6 +1213,11 @@ class Layer:
             (a2_int8, sfa_i), (down_b, down_sfb),
             d_down, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
         )
+
+        if kind == "staged":
+            # The down GEMM above is the last reader of this ring slot; let
+            # the side stream reuse it once the compute stream gets here.
+            staged[0].free_ev[staged[1]].record()
 
         # Apply routing weights, return for scatter-add.
         orig_rows  = idx_to_orig[valid_idx]
@@ -1187,8 +1341,8 @@ class Layer:
         # AMX bucket below then runs on the host while the GPU works through
         # these kernels. When a VRAM expert cache exists, the bucket splits
         # into a cached partition (kernels read HBM) and a streamed partition
-        # (kernels read pinned host over PCIe) — the cache holds experts
-        # 0..cache_n-1 so the split is a simple id threshold.
+        # (weights copy-engine-staged into an HBM ring, or read from pinned
+        # host over PCIe when staging is off/OOM).
         gpu_parts = []
         if len(gpu_experts):
             if not torch.cuda.is_available():
@@ -1206,7 +1360,19 @@ class Layer:
                 partitions.append((gpu_experts[cm], "cached"))
                 rest = gpu_experts[~cm]
             gs = self.slab.g_split
-            if self.slab.gate_int8_b is not None:
+            staged_ctx = None
+            ring = (
+                _get_stage_ring(self.slab, self.cache_n,
+                                f"cuda:{self.cuda_device}")
+                if len(rest) else None
+            )
+            if ring is not None:
+                # Copy-engine staging: issue the async H2D copies NOW (side
+                # stream) so they overlap the cached partition's GEMMs and
+                # the CPU bucket; the staged GEMMs event-wait on them.
+                partitions.append((rest, "staged"))
+                staged_ctx = self._stage_copy(rest, ring)
+            elif self.slab.gate_int8_b is not None:
                 partitions.append((rest[rest < gs], "slab_a"))
                 partitions.append((rest[rest >= gs], "slab_b"))
             else:
@@ -1216,6 +1382,8 @@ class Layer:
                     continue
                 if kind == "cached":
                     kernel_ids = self._slot_np[part]
+                elif kind == "staged":
+                    kernel_ids = np.arange(len(part), dtype=np.int64)
                 elif kind == "slab_b":
                     kernel_ids = part - gs
                 else:
@@ -1226,6 +1394,7 @@ class Layer:
                 )
                 rows_p, y_p = self._gpu_grouped_forward(
                     x_gpu_bf16, layout, route_w_gpu, kind=kind,
+                    staged=staged_ctx if kind == "staged" else None,
                 )
                 if rows_p is not None:
                     gpu_parts.append((rows_p, y_p))
