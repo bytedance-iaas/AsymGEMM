@@ -23,7 +23,7 @@ _FLASH_ATTN_ENV_SET=false
 [[ -n "${ENV_DIR+x}" ]] && _ENV_DIR_ENV_SET=true
 [[ -n "${FLASH_ATTN+x}" ]] && _FLASH_ATTN_ENV_SET=true
 LF_DIR=${LF_DIR:-${SFT_ROOT}/third_party/LlamaFactory}
-LF_FA4_DIR=${LF_FA4_DIR:-${SFT_ROOT}/third_party/LlamaFactory-fa4}
+LF_FA4_DIR=${LF_FA4_DIR:-${SFT_ROOT}/third_party/LlamaFactory}
 LF_DS_CONFIG_DIR=${LF_DS_CONFIG_DIR:-${SFT_ROOT}/third_party/LlamaFactory/examples/deepspeed}
 KT_KERNEL_DIR=${KT_KERNEL_DIR:-${SFT_ROOT}/third_party/ktransformers/kt-kernel}
 DEEPSPEED_DIR=${DEEPSPEED_DIR:-${SFT_ROOT}/third_party/deepspeed}
@@ -218,8 +218,8 @@ INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
 #   triggers below HOST_MEM_WATCHDOG_FLOOR_GB. false or FLOOR_GB=0 disables.
 TRAIN_OOM_SCORE_ADJ=${TRAIN_OOM_SCORE_ADJ:-1000}
 HOST_MEM_WATCHDOG=${HOST_MEM_WATCHDOG:-true}
-HOST_MEM_WATCHDOG_FLOOR_GB=${HOST_MEM_WATCHDOG_FLOOR_GB:-35}
-HOST_MEM_WATCHDOG_POLL_SECONDS=${HOST_MEM_WATCHDOG_POLL_SECONDS:-0.05}
+HOST_MEM_WATCHDOG_FLOOR_GB=${HOST_MEM_WATCHDOG_FLOOR_GB:-50}
+HOST_MEM_WATCHDOG_POLL_SECONDS=${HOST_MEM_WATCHDOG_POLL_SECONDS:-0.1}
 HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS=${HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS:-60}
 
 # =============================================================================
@@ -1225,7 +1225,7 @@ case "${FLASH_ATTN}" in
 esac
 if [[ "${FLASH_ATTN}" == "fa4" ]]; then
   if [[ ! -d "${LF_DIR}" ]]; then
-    echo "FLASH_ATTN=fa4 requires LlamaFactory-fa4 checkout at LF_DIR=${LF_DIR}" >&2
+    echo "FLASH_ATTN=fa4 requires a LlamaFactory checkout at LF_DIR=${LF_DIR}" >&2
     exit 2
   fi
   if ! PYTHONPATH="${LF_DIR}/src:${PYTHONPATH:-}" "${ENV_PYTHON}" - <<'PY' >/dev/null; then
