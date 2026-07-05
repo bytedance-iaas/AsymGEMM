@@ -55,16 +55,22 @@ GRAN_K = 128
 BLOCK_M = 256
 
 # Fraction of routed rows the CPU bucket takes at prefill (large batches),
-# where the two buckets run concurrently: the GPU streams each of its experts'
-# weights over PCIe (cost ~per expert), the CPU cost scales ~per row, so the
-# CPU takes the smallest-count experts. 0 disables the split (GPU-only
-# prefill, CPU idle). Override via ASYMGEMM_CPU_PREFILL_FRACTION.
+# where the two buckets run concurrently: the GPU's streamed-expert cost is
+# ~per expert (weight transport), the CPU cost scales ~per row, so the
+# CPU takes the smallest-count streamed experts. 0 disables the split
+# (GPU-only prefill, CPU idle). Override via ASYMGEMM_CPU_PREFILL_FRACTION.
 #
-# Default from a sweep on 2x8457C (48-thread pool, node-bound) + H200,
-# Qwen3-30B-A3B, 3500-token prefill — TTFT: 0.0 -> 867 ms, 0.05 -> 710 ms,
-# 0.07 -> 728 ms, 0.10 -> 748 ms, 0.15 -> 805 ms, 0.25+ -> CPU-bound and
-# worse. Small fractions win twice over: the smallest experts also carry the
-# worst BLOCK_M padding waste in the GPU contiguous layout.
+# Default from a sweep with copy-engine staging on 2x8457C (64 threads,
+# NUMA-TP) + H200, Qwen3-235B, cache=24 hot, chunked 4096 + mixed:
+#   single 3500-tok TTFT:  0.0 -> 2179, 0.1 -> 2281, 0.2 -> 2512,
+#                          0.3 -> 2762 ms
+#   32x3500 conc16 r.25:   E2E 0.0 -> 15.4, 0.1 -> 10.1, 0.2 -> 9.5,
+#                          0.3 -> 17.9 s
+#   32x10K  conc16 r.1:    E2E 0.0 -> 9.0, 0.1 -> 7.3, 0.2 -> 9.4,
+#                          0.3 -> 22.4 s
+# 0.1 is best or within noise everywhere. Larger fractions starve decode
+# tokens (mixed chunks queue behind CPU prefill rows); before staging the
+# balance sat near 0.3 because the GPU streamed path was 2.3x slower.
 _CPU_PREFILL_FRACTION: Optional[float] = None
 
 
@@ -72,7 +78,7 @@ def _cpu_prefill_fraction() -> float:
     global _CPU_PREFILL_FRACTION
     if _CPU_PREFILL_FRACTION is None:
         _CPU_PREFILL_FRACTION = float(
-            os.getenv("ASYMGEMM_CPU_PREFILL_FRACTION", "0.05")
+            os.getenv("ASYMGEMM_CPU_PREFILL_FRACTION", "0.1")
         )
     return _CPU_PREFILL_FRACTION
 
