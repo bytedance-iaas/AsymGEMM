@@ -23,6 +23,9 @@ INSTALL_KT_KERNEL=${INSTALL_KT_KERNEL:-0}
 INSTALL_LIGER=${INSTALL_LIGER:-1}
 INSTALL_FLA=${INSTALL_FLA:-1}
 INSTALL_CAUSAL_CONV1D=${INSTALL_CAUSAL_CONV1D:-1}
+# Provision the libaio sidecar (${ASYMGEMM_DIR}/.aioenv) that DeepSpeed NVMe offload
+# (*opnvme/*panvme backends) needs. Idempotent; set SETUP_AIO=0 to skip.
+SETUP_AIO=${SETUP_AIO:-1}
 
 # Torch stack, pinned to the known-good venv (torch 2.12.0 built against CUDA 13.0).
 # Override any var to retarget CUDA/versions. A non-empty TORCH_INSTALL_CMD wins
@@ -69,6 +72,24 @@ if [[ "${INSTALL_DEEPSPEED}" == "1" ]]; then
   DS_BUILD_OPS=${DS_BUILD_OPS:-0} python -m pip install --no-build-isolation -e "${DEEPSPEED_DIR}"
 fi
 
+if [[ "${SETUP_AIO}" == "1" ]]; then
+  # Provision ${ASYMGEMM_DIR}/.aioenv (libaio.h + libaio.so) so DeepSpeed can JIT-build the
+  # async_io op that the NVMe-offload backends need. run_lf_lora_sft.sh auto-detects this
+  # sidecar and exports CPATH/LIBRARY_PATH/LD_LIBRARY_PATH at run time. Idempotent; verify
+  # only when DeepSpeed is installed (the check imports AsyncIOBuilder). Fatal on failure —
+  # this env is for NVMe-offload runs, so a broken sidecar means a broken env; pass
+  # SETUP_AIO=0 to deliberately skip on a host that cannot build it (air-gapped, no curl).
+  AIO_SETUP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/setup_aioenv.sh"
+  aio_args=(); [[ "${INSTALL_DEEPSPEED}" == "1" ]] || aio_args=(--no-verify)
+  if ! ROOT="${ASYMGEMM_DIR}" ENV_PYTHON="${ENV_DIR}/bin/python" \
+        bash "${AIO_SETUP}" "${aio_args[@]}"; then
+    echo "ERROR: setup_aioenv.sh failed — libaio sidecar not provisioned." >&2
+    echo "       DeepSpeed NVMe *opnvme/*panvme backends require it. Fix the failure above," >&2
+    echo "       or re-run the bootstrap with SETUP_AIO=0 to intentionally skip it." >&2
+    exit 1
+  fi
+fi
+
 if [[ "${INSTALL_KT}" == "1" ]]; then
   # Skip ktransformers dependencies so kt-kernel comes from local source, not PyPI.
   python -m pip install --no-deps -e "${KT_DIR}"
@@ -106,40 +127,46 @@ if [[ "${INSTALL_CAUSAL_CONV1D}" == "1" ]]; then
   python -m pip install --no-build-isolation "causal_conv1d==1.6.2.post1"
 fi
 
+INSTALL_LF="${INSTALL_LF}" INSTALL_DEEPSPEED="${INSTALL_DEEPSPEED}" \
+INSTALL_LIGER="${INSTALL_LIGER}" INSTALL_FLA="${INSTALL_FLA}" \
+INSTALL_CAUSAL_CONV1D="${INSTALL_CAUSAL_CONV1D}" \
 python - <<'PY'
+import os
 import sys
+
+# A package that was requested (INSTALL_*=1) but fails to import means a broken env:
+# record it and exit non-zero at the end. Packages not requested are only reported.
+failures = []
 print("python", sys.executable)
+
+# torch is the base of the whole stack — always required.
 try:
     import torch
     print("torch", torch.__version__)
     print("cuda", torch.cuda.is_available())
 except Exception as exc:
-    print("torch import failed:", repr(exc))
-try:
-    import llamafactory
-    print("llamafactory", getattr(llamafactory, "__version__", "unknown"))
-except Exception as exc:
-    print("llamafactory import failed:", repr(exc))
-try:
-    import deepspeed
-    print("deepspeed", getattr(deepspeed, "__version__", "unknown"))
-except Exception as exc:
-    print("deepspeed import failed:", repr(exc))
-try:
-    import liger_kernel
-    print("liger_kernel", getattr(liger_kernel, "__version__", "ok"))
-except Exception as exc:
-    print("liger_kernel import failed:", repr(exc))
-try:
-    import fla
-    print("flash-linear-attention", getattr(fla, "__version__", "unknown"))
-except Exception as exc:
-    print("flash-linear-attention import failed:", repr(exc))
-try:
-    import causal_conv1d
-    print("causal_conv1d", getattr(causal_conv1d, "__version__", "unknown"))
-except Exception as exc:
-    print("causal_conv1d import failed:", repr(exc))
+    print("torch import failed [REQUIRED]:", repr(exc))
+    failures.append("torch")
+
+for label, mod, flag in [
+    ("llamafactory", "llamafactory", "INSTALL_LF"),
+    ("deepspeed", "deepspeed", "INSTALL_DEEPSPEED"),
+    ("liger_kernel", "liger_kernel", "INSTALL_LIGER"),
+    ("flash-linear-attention", "fla", "INSTALL_FLA"),
+    ("causal_conv1d", "causal_conv1d", "INSTALL_CAUSAL_CONV1D"),
+]:
+    required = os.environ.get(flag, "0") == "1"
+    try:
+        m = __import__(mod)
+        print(label, getattr(m, "__version__", "ok"))
+    except Exception as exc:
+        print("%s import failed [%s]:" % (label, "REQUIRED" if required else "optional/not-requested"), repr(exc))
+        if required:
+            failures.append(label)
+
+if failures:
+    print("ERROR: requested packages failed to import:", ", ".join(failures), file=sys.stderr)
+    sys.exit(1)
 PY
 
 echo

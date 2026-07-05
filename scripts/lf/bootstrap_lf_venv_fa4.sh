@@ -36,6 +36,9 @@ INSTALL_FLA=${INSTALL_FLA:-1}
 INSTALL_CAUSAL_CONV1D=${INSTALL_CAUSAL_CONV1D:-0}
 INSTALL_ASYMGEMM=${INSTALL_ASYMGEMM:-1}
 INSTALL_KT_KERNEL=${INSTALL_KT_KERNEL:-0}
+# Provision the libaio sidecar (${ASYMGEMM_DIR}/.aioenv) that DeepSpeed NVMe offload
+# (*opnvme/*panvme backends) needs. Idempotent; set SETUP_AIO=0 to skip.
+SETUP_AIO=${SETUP_AIO:-1}
 
 # Pinned to the locally validated LlamaFactory-fa4 environment.
 TORCH_VERSION=${TORCH_VERSION:-2.12.0+cu130}
@@ -92,6 +95,24 @@ if [[ "${INSTALL_DEEPSPEED}" == "1" ]]; then
   DS_BUILD_OPS=${DS_BUILD_OPS:-0} python -m pip install --no-build-isolation -e "${DEEPSPEED_DIR}"
 fi
 
+if [[ "${SETUP_AIO}" == "1" ]]; then
+  # Provision ${ASYMGEMM_DIR}/.aioenv (libaio.h + libaio.so) so DeepSpeed can JIT-build the
+  # async_io op that the NVMe-offload backends need. run_lf_lora_sft.sh auto-detects this
+  # sidecar and exports CPATH/LIBRARY_PATH/LD_LIBRARY_PATH at run time. One .aioenv is shared
+  # by .venv and .venv-fa4 (it is just native libs). Idempotent; verify only when DeepSpeed is
+  # installed. Fatal on failure — pass SETUP_AIO=0 to deliberately skip on a host that cannot
+  # build it (air-gapped, no curl) and only needs non-NVMe backends.
+  AIO_SETUP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/setup_aioenv.sh"
+  aio_args=(); [[ "${INSTALL_DEEPSPEED}" == "1" ]] || aio_args=(--no-verify)
+  if ! ROOT="${ASYMGEMM_DIR}" ENV_PYTHON="${ENV_DIR}/bin/python" \
+        bash "${AIO_SETUP}" "${aio_args[@]}"; then
+    echo "ERROR: setup_aioenv.sh failed — libaio sidecar not provisioned." >&2
+    echo "       DeepSpeed NVMe *opnvme/*panvme backends require it. Fix the failure above," >&2
+    echo "       or re-run the bootstrap with SETUP_AIO=0 to intentionally skip it." >&2
+    exit 1
+  fi
+fi
+
 if [[ "${INSTALL_KT}" == "1" ]]; then
   python -m pip install --no-deps -e "${KT_DIR}"
 fi
@@ -123,11 +144,18 @@ if [[ -f "${LF_DIR}/fa4_probes/patch_transformers_fa4.py" ]]; then
   python "${LF_DIR}/fa4_probes/patch_transformers_fa4.py"
 fi
 
+INSTALL_LF="${INSTALL_LF}" INSTALL_FLA="${INSTALL_FLA}" \
+INSTALL_CAUSAL_CONV1D="${INSTALL_CAUSAL_CONV1D}" \
 python - <<'PY'
 import importlib.metadata as md
 import inspect
+import os
 import sys
 
+# A package that was requested (INSTALL_*=1) but fails to import means a broken env:
+# record it and exit non-zero at the end. Packages not requested are only reported.
+# (torch / transformers / flash_attn below are unconditional, so they abort on failure.)
+failures = []
 print("python", sys.executable)
 
 import torch
@@ -161,19 +189,32 @@ try:
     import llamafactory
     print("llamafactory", getattr(llamafactory, "__version__", "unknown"), llamafactory.__file__)
 except Exception as exc:
-    print("llamafactory import failed:", repr(exc))
+    required = os.environ.get("INSTALL_LF", "0") == "1"
+    print("llamafactory import failed [%s]:" % ("REQUIRED" if required else "optional/not-requested"), repr(exc))
+    if required:
+        failures.append("llamafactory")
 
 try:
     import fla
     print("flash-linear-attention", getattr(fla, "__version__", md.version("flash-linear-attention")))
 except Exception as exc:
-    print("flash-linear-attention import failed:", repr(exc))
+    required = os.environ.get("INSTALL_FLA", "0") == "1"
+    print("flash-linear-attention import failed [%s]:" % ("REQUIRED" if required else "optional/not-requested"), repr(exc))
+    if required:
+        failures.append("flash-linear-attention")
 
 try:
     import causal_conv1d
     print("causal_conv1d", getattr(causal_conv1d, "__version__", "unknown"))
 except Exception as exc:
-    print("causal_conv1d import failed:", repr(exc))
+    required = os.environ.get("INSTALL_CAUSAL_CONV1D", "0") == "1"
+    print("causal_conv1d import failed [%s]:" % ("REQUIRED" if required else "optional/not-requested"), repr(exc))
+    if required:
+        failures.append("causal_conv1d")
+
+if failures:
+    print("ERROR: requested packages failed to import:", ", ".join(failures), file=sys.stderr)
+    sys.exit(1)
 PY
 
 echo

@@ -247,6 +247,13 @@ if [[ "${ASYM_QWEN35_FA4_AUTO}" == "1" ]] && is_qwen35_model_name "${MODEL_NAME_
   [[ "${_FLASH_ATTN_ENV_SET}" == "true" ]] || FLASH_ATTN=fa4
 fi
 
+# Persist FA4 cute JIT kernels across runs (flash-attn-4 defaults this off; default dir is gitignored).
+if [[ "${FLASH_ATTN}" == "fa4" ]]; then
+  export FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED="${FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED:-1}"
+  export FLASH_ATTENTION_CUTE_DSL_CACHE_DIR="${FLASH_ATTENTION_CUTE_DSL_CACHE_DIR:-${ROOT}/.cache/fa4_cute_dsl}"
+  mkdir -p "${FLASH_ATTENTION_CUTE_DSL_CACHE_DIR}" 2>/dev/null || true
+fi
+
 KT_RUN_PYTHONPATH="${KT_TOOLS_DIR}:${ASYM_DIR}:${KT_KERNEL_DIR}:${KT_GGUF_PYTHONPATH_ENTRY}${LF_DIR}/src:${PYTHONPATH:-}"
 ENV_DIR=${ENV_DIR:-${ASYM_DIR}/.venv}
 ENV_PYTHON=${ENV_PYTHON:-${ENV_DIR}/bin/python}
