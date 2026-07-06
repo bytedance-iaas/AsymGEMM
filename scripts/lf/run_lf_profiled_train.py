@@ -603,6 +603,10 @@ def _config_from_args(args: list[str]) -> dict[str, Any]:
         "model_name_or_path": model_name,
         "backend": backend,
         "liger_loss": liger_loss,
+        "asym_nvme_roles": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYM_NVME_ROLES") or os.environ.get("ASYM_NVME_ROLES", ""),
+        "asym_nvme_path": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYM_NVME_PATH") or os.environ.get("ASYM_NVME_PATH", ""),
+        "asym_nvme_sync": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYM_NVME_SYNC") or os.environ.get("ASYM_NVME_SYNC", ""),
+        "asym_nvme_act_cpu_budget_bytes": os.environ.get("ASYM_GEMM_LF_CONFIG_ASYM_NVME_ACT_CPU_BUDGET_BYTES") or os.environ.get("ASYM_NVME_ACT_CPU_BUDGET_BYTES", ""),
         "kt_backend": os.environ.get("ASYM_GEMM_LF_CONFIG_KT_BACKEND") or _option_value(args, "--kt_backend"),
         "precision": os.environ.get("ASYM_GEMM_LF_CONFIG_PRECISION") or _option_value(args, "--asym_precision") or "bf16",
         "dataset": _option_value(args, "--dataset"),
@@ -967,6 +971,49 @@ def _model_and_base_model() -> tuple[Any | None, Any | None]:
         except Exception:
             base_model = None
     return model, base_model
+
+
+def _asym_nvme_summary_from_model() -> dict[str, Any]:
+    """NVMe store (+ Stage 3 governor / Stage 7 pager) summary for the profile ``asym_nvme``
+    block. Returns ``{"enabled": False}`` when the store is disabled — rule 7. Every import is
+    guarded so this never breaks the report if a later-stage module is absent."""
+    try:
+        from asym_gemm.training.nvme_store import get_nvme_store
+    except Exception as exc:
+        return {"enabled": False, "reason": repr(exc)}
+    store = get_nvme_store()
+    if store is None:
+        return {"enabled": False}
+    out: dict[str, Any] = {
+        "enabled": True,
+        "roles": sorted(store.cfg.roles),
+        "path": store.cfg.path,
+        "sync": store.cfg.sync,
+        "alignment": store.align,
+        **store.stats.as_dict(),
+    }
+    try:  # Stage 3+
+        from asym_gemm.training.act_spill_governor import get_act_spill_governor
+
+        gov = get_act_spill_governor()
+        if gov is not None:
+            out["act_governor"] = gov.summary()
+    except Exception:
+        pass
+    try:  # Stage 3+
+        from asym_gemm.training.gc_boundary_offload import get_boundary_offload_stats
+
+        out["gc_boundary"] = get_boundary_offload_stats()
+    except Exception:
+        pass
+    try:  # Stage 7+
+        model, _ = _model_and_base_model()
+        pager = getattr(model, "_asym_base_weight_pager", None)
+        if pager is not None:
+            out["base_weight_pager"] = pager.summary()
+    except Exception:
+        pass
+    return out
 
 
 def _find_kt_wrappers(model: Any | None, base_model: Any | None) -> list[Any] | None:
@@ -1464,6 +1511,16 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
                             extra={"optimizer_memory": summary, "error": repr(exc)},
                         )
                         raise
+                    # panvme (Stage 7): step boundary for the base-weight pager's trace machine
+                    # (DeepSpeed reset_step analog). No-op unless the pager exists; never raises.
+                    try:
+                        from asym_gemm.training.base_weight_pager import get_base_weight_pager
+
+                        _bw_pager = get_base_weight_pager()
+                        if _bw_pager is not None:
+                            _bw_pager.mark_step()
+                    except Exception:
+                        pass
                     process_memory_after = _process_memory_snapshot()
                     kt_lora_after = _kt_fused_lora_update_snapshot(
                         getattr(self, "model", None),
@@ -2906,6 +2963,7 @@ class LFProfileRecorder:
             "lora": lora,
             "kt": kt,
             "activation_offload": activation_offload,
+            "asym_nvme": _asym_nvme_summary_from_model(),
             "asym_execution_stats": asym_execution_stats,
             "asym_liger_lm_head_bridge": asym_liger_lm_head_bridge,
             "grad_clip": _GRAD_CLIP_MARKER,
