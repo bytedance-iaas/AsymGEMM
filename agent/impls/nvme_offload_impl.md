@@ -10,8 +10,9 @@ Goal recap: three opt-in backend tokens on ONE local NVMe store reusing DeepSpee
 - `asym_cpuadamwds_actnvme` — **activation spill** (the capacity lever). Primary target = the unsloth-GC
   cross-layer boundary stream (**Substrate A**, ~342 GiB @ q3-32b s70k); secondary = the fine-grained
   engine handles (**Substrate B**). One watermark governor, FIFO spill / LIFO consume.
-- `asym_cpuadamwds_panvme` — frozen base weights (`HostWeight`) → NVMe with a trace-prefetch pinned cache.
-  Frees 61 GiB (q3-32b) / 105 GiB (q3.5-35b-a3b) of CPU.
+- `asym_cpuadamwds_panvme` — frozen base weights (`HostWeight`) → NVMe with a trace-prefetch pinned cache; a
+  re-implementation of DeepSpeed ZeRO-Infinity's param-NVMe swapper + coordinator (see Stage 7 §7.0). Frees
+  61 GiB (q3-32b) / 105 GiB (q3.5-35b-a3b) of CPU. **← current implementation priority (2026-07-05).**
 - `asym_cpuadamwds_bothnvme` — both roles, compound, for the max-seq hero result.
 
 Delivery ladder (locked): **v1 SYNC (bit-exact) → v2 async writer → v3 reverse-order read prefetch →
@@ -57,6 +58,54 @@ runs; (b) size ALL pinned pools to fit inside the 2-node LPDDR minus the floor �
 asserts `governor.hi + pager.cache_bytes + ASYM_EXPACT_CPU_POOL_MAX_BYTES + prefetch(act+base) +
 max_inflight_spill_bytes + 35 GiB floor + slack < MemTotal (1325 GiB)`; (c) the NVMe store path stays on
 `/scratch_local` (`md0`, not RAM/tmpfs) so spilled bytes actually leave host RAM.
+
+---
+
+## Dev/debug operating point — light workload + artificial ceiling (use for actnvme bring-up gates 3–6)
+
+**The whole trick:** a spill is triggered by **`budget < spillable footprint`**, NOT by absolute RAM pressure. So we never grow the workload to force offload — we shrink `ASYM_NVME_ACT_CPU_BUDGET_BYTES` (the governor `hi` watermark). A small budget *mimics a smaller-RAM machine* while the box stays far from OOM; it decouples **"exercise the spill/fetch path"** from **"stress the box."** Dev keeps the first realistic and the second near zero. **This replaces the heavier `s30000 b8 / budget 120 GiB` sizing in the Stage 3–6 e2e examples during bring-up** — same gate, dev-safe numbers.
+
+**Spillable footprint in Stage 3 = the unsloth-GC boundary stream only** (the sole sealed substrate until Stage 4): `layers × (seq×batch) × hidden × 2 B`. q3-32b is `64 × 5120`:
+
+| q3-32b @ b8 | boundary (spillable) | est. baseline RSS† |
+|---|---|---|
+| **s20000** | **97.7 GiB** | ~230 GiB |
+| s25000 | 122 GiB | ~270 GiB |
+| s30000 | 147 GiB | ~310 GiB |
+
+†extrapolated from the measured s70000 b8 = 648 GiB (boundary 342 GiB) anchor (§0.2); confirm from the actual run. Even at 2× the estimate the box (1325 GiB, floor 35) is safe and the watchdog referees.
+
+**Recommended dev point — `q3-32b|1 ; … ; 20000|8|1`:**
+
+| `ASYM_NVME_ACT_CPU_BUDGET_BYTES` | offloaded/step (write≈read) | est. candidate RSS | exercises |
+|---|---|---|---|
+| **`$((32*1024*1024*1024))`** ← primary | ~66–82 GiB (hysteresis `lo = hi−16`) | ~150–165 GiB | watermark + oldest-first + partial residency |
+| `0` (eager) | ~98 GiB (all boundary) | ~130 GiB | full spill/fetch path, max IO + coverage |
+
+Both are **≪ the ~700 GiB working ceiling and ≫ the 35 GiB watchdog floor ⇒ zero OOM risk** (baseline ~230 GiB included). NVMe traffic ≈ 66–98 GiB each way/step on `/scratch_local` (12 TB free, 26/14 GB/s) ⇒ single-digit seconds of IO/step — enough to debug, not stressing CPU or NVMe.
+
+**Do NOT use a ~500 GiB ceiling here:** at `20000|8` the *entire* spillable boundary is ~98 GiB, so a 500 GiB budget never spills. A ~500 GiB budget only bites at ~`s60000 b8` (~600 GiB footprint) — the ceiling-probe / stress regime that took the machine down; never use it for routine dev. Correct dev budgets are *tens of GiB*.
+
+```bash
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)                        # unique per session ⇒ prior artifacts never overwritten
+GPU_POOL=<gpu> OUTPUT_ROOT=profiling_nvme/dev/${STAMP}_q3-32b_s20000b8_bud32 \
+PROFILERS=source PLOT=false PREPARE_DATASETS=true WARMUP_STEPS=1 MAX_STEPS=4 \
+ASYM_NVME_ACT_CPU_BUDGET_BYTES=$((32*1024*1024*1024)) \
+RUNS='q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 20000|8|1 ; none|false|true|false|false|false || q3-32b|1 ; asym_cpuadamwds_actnvme|recomp-off-full-fg|ligerloss1 ; 20000|8|1 ; none|false|true|false|false|false' \
+scripts/lf/profile_lora_lf_test_source.sh --overwrite true
+$LF_PY scripts/lf/compare_nvme_profiles.py \
+  --baseline profiling_nvme/dev/${STAMP}_*/<asym_cpuadamwds dir> --candidate <…_actnvme dir> \
+  --target activation_cpu --expect-nvme-role activation --max-loss-delta 0.02 \
+  --min-memory-drop-gib 30 --max-step-ratio 1.5 --max-forward-ratio 1.5 --max-backward-ratio 1.5
+```
+
+**Observed at bring-up (2026-07-05, this exact config):** gate PASSED — `median_loss_delta 0.00043`, RSS drop **41.6 GiB** (348.2→306.6), NVMe write==read 360 GB, `open_recs=0`, `step_ratio 1.066`. Two learnings baked into the numbers above: (1) **use `--max-loss-delta 0.02`, not 0** — flash-attn/fused kernels aren't bit-deterministic across processes, so two runs of identical code differ by a ~0.003 median-loss floor; a *lossless* spill lands at that floor, a corrupt spill diverges by ≫0.02, so the gate still cleanly separates them. (2) The RSS drop (42 GiB) is smaller than the spill volume (66 GiB/step) because **freed pinned boundary buffers return to the `_CPU_BUFFER_POOL` (cap `ASYM_EXPACT_CPU_POOL_MAX_BYTES`, default 32 GiB) and stay resident** — for a larger drop / max-seq capacity, lower that cap (trading re-alloc churn). It enters the Stage-8 RAM ledger.
+
+**Must-pass (dev-sized Stage-3 gate):** `--max-loss-delta 0.02` (loss within the ~0.003 GPU-nondeterminism floor vs the no-NVMe baseline — NOT exactly 0; see the observation above); `--expect-nvme-role activation` (asserts `bytes_written>0 AND bytes_read>0` — proves BOTH directions were recorded); governor `open_recs==0` at step end. Step-ratio is informational in sync mode.
+
+**Artifact retention:** each dev session writes under a **timestamped** `profiling_nvme/dev/<UTC>_<label>/` (baseline + candidate side-by-side); `--overwrite true` only overwrites *within* that session's dir, never a prior session. Per-role NVMe read/write ⇒ `asym_nvme.csv` (app-level, authoritative), cross-checked by the device-level md0 sampler ⇒ `offload_io.json` (already wired; O_DIRECT ⇒ page-cache-free).
+
+**Never run the max-seq headline probe during dev** — that's the deliberate "raise seq until the baseline OOM-dies" run (Stage 3/8, end-stage only); it is exactly what takes the machine down.
 
 ---
 
@@ -181,7 +230,9 @@ runs, per-call rows don't); model-shape drift (single dict).
 
 **Scope:** NEW `asym_gemm/training/nvme_store.py` + NEW `tests/training/test_nvme_store.py`. Zero edits
 elsewhere ⇒ **isolated unit gate suffices** (the one exception to the e2e rule — pure IO plumbing, no
-training-visible behavior). AIO facts baked in from re-verification (C1-C3, C8).
+training-visible behavior). AIO facts baked in from re-verification (C1-C3, C8). NB: the store's AIO ctor
+knobs (block 1 MiB, qd 16, intra_op 4) match the validated DS baseline `ds_z3_offload_panvme_config.json`
+(`"aio": {block_size 1048576, queue_depth 16, thread_count 4, single_submit false, overlap_events true}`).
 
 ```python
 # asym_gemm/training/nvme_store.py
@@ -1156,6 +1207,41 @@ governor counts LIVE handles) — both enter the Stage-8 RAM ledger.
 
 ## Stage 7 — `panvme`: base weights → NVMe (trace-prefetch pinned cache)
 
+**`panvme` is a faithful re-implementation of DeepSpeed ZeRO-Infinity's parameter-NVMe path**
+(`AsyncPartitionedParameterSwapper` + `PartitionedParameterCoordinator`), specialized to **frozen** `HostWeight`
+blobs and keyed by `HostWeight` identity instead of `ds_id`/`ds_tensor`. Frozen ⇒ **write-once at startup,
+read-many** — strictly simpler than DeepSpeed, which re-`swap_out`s params after every optimizer step
+(`partitioned_param_swapper.py:259-277`): panvme has no dirty tracking, no swap-out-after-use, no
+write-after-read hazard. Every performance-critical part (the AIO engine, the pinned buffer pool, the
+trace→freeze→prefetch machine, the 2×-in-flight lookahead, Belady release) is **reused or mirrored 1:1 from
+DeepSpeed**, so we inherit its measured NVMe throughput. The one thing we cannot drop in is the top-level
+`AsyncPartitionedParameterSwapper` object itself (welded to `zero.Init`) — we reuse its parts and re-implement
+its logic instead.
+
+### 7.0 DeepSpeed lineage — the reuse ladder (all refs verified in `third_party/deepspeed`, v0.19.2)
+
+| DeepSpeed mechanism | ref | panvme (`BaseWeightPager` / `NVMeStore`) |
+|---|---|---|
+| **AIO engine** — `aio_handle` + `swap_in_tensors`/`swap_out_tensors` (each `assert async_pread/pwrite==0`) | `swap_tensor/utils.py:20-27` | **imported verbatim** — these ARE the store's `submit_pread`/`spill_sync` rc==0 primitives (C2). Same handle ctor + `_io_aligned_numel` round-up as the swapper (`partitioned_param_swapper.py:111-121,:386`). |
+| **Pinned buffer pool** — `SwapBufferManager` (fixed `count` pinned bufs, `allocate`/`free` free-list) / `SwapBufferPool` (bump arena) | `utils.py:181-227` / `:97-178` | **reusable pattern.** The pager's size-keyed `_free[(dtype,shape)]` IS this free-list, cloned to (a) drop the sole DeepSpeed coupling — a rank-0 `print_object` (`:195`) that calls `dist.get_rank()`, unsafe because `deepspeed.comm` may not be initialized under the asym backend (`is_zero_backend_run==False`, no ZeRO engine — verify once), and (b) hold **heterogeneous** frozen blobs (KB router → GB expert bank), where DeepSpeed's uniform max-`buffer_size` slots (`:124`, `buffer_count=5`) would waste RAM. Guard the print and it imports directly. |
+| **Param status machine** — `PartitionedParamStatus{AVAILABLE, NOT_AVAILABLE, INFLIGHT}` | `partitioned_param_swapper.py:26-34` | **mirrored 1:1** → pager `{RESIDENT, ABSENT, INFLIGHT}`. Fetch-before-use = `synchronize_reads` flips `.status=AVAILABLE` and rebinds `ds_tensor.data` before any consume (`:213-225`); pager's `touch()` drains reads before returning a view. |
+| **Swap-in into a caller buffer** — `swap_into_buffer` (zero-copy if dest pinned+aligned, else bounce+copy) | `:326-349` | `touch()`→`store.fetch_into(ref, e.buf)`; `alloc_padded_pinned` bufs are always pinned+aligned ⇒ we always hit the zero-copy branch. |
+| **Trace machine** — RECORD→COMPLETE→INVALID; `record_module`; `reset_step`→freeze `tuple(...)`; `trace_prologue` invalidate-on-mismatch | `partitioned_param_coordinator.py:44-50,:207,:236-256,:187-204` | **mirrored** → `_record_or_advance` builds the step-1 touch trace, freezes on the 3rd first-key recurrence, then cursor-advances with a jitter window; a beyond-window mismatch ⇒ `_disabled` (miss-driven sync fallback) = `_invalidate_trace`. |
+| **Byte-budgeted prefetch** — `fetch_sub_module` lookahead up to `prefetch_bucket_sz` | `:295,:428-461` | `_issue_prefetches` — byte-budgeted lookahead over the frozen trace. |
+| **2×-in-flight NVMe depth** — `__prefetch_nvme_param_partitions`: read-ahead while `numel_considered ≤ 2*numel_in_flight`, capped by `available_swap_in_buffers()` | `:606-630` (`:622`) | pager `prefetch_bytes` default `2×largest blob` — a static form of DeepSpeed's dynamic `2×numel_in_flight`; both keep ≥1 blob prefetched while one is consumed (**true double-buffering**), capped by free cache bytes. |
+| **Belady-ish release** — `__params_to_release`: keep params reused within `max_reuse_dist_in_numel`, release far-future | `:572-604` | `_take_buffer` evicts the RESIDENT entry with the **farthest next-use on the frozen trace** — exact Belady for a fixed cache. |
+| **Bounded in-flight events** — `__max_ongoing_fetch_events = 2` (host-thread backpressure) | `:133,:377-387` | event-gated quarantine (rule 6): a buffer a kernel may still stream is recycled only after a post-launch CUDA event completes. |
+| **Separate read/write handles** — `aio_read_handle`/`aio_write_handle`; pipelined swapper's read/write handles | `partitioned_param_swapper.py:111-121`; `pipelined_optimizer_swapper.py:52-60` | store's single-owner read + write handles (design contract 5). |
+
+**Why not import `AsyncPartitionedParameterSwapper` wholesale:** it is constructed **only inside `zero.Init`**
+(`partition_parameters.py:1095`: `self.param_swapper = ... AsyncPartitionedParameterSwapper(_ds_config,
+self.dtype)`), needs a full `_ds_config` (`zero_config.offload_param` + `aio_config`), and every method
+dereferences `param.ds_id` / `param.ds_tensor.ds_numel` / `.status` / `.data` / `param.nvme_swapper`
+(`:139,:176,:224-225,:293`). Forging a `ds_tensor`-shaped shim per `HostWeight` is more code and more fragile
+than the pager, and it would drag in the ZeRO-3 partitioning engine we deliberately do not run (asym backend ⇒
+`BACKEND=asym`). So we reuse its **parts** (AIO engine + buffer pool) and **re-implement its logic** (status
+machine + coordinator prefetch) — which is exactly what delivers "just like DeepSpeed" throughput.
+
 **Scope:** `host_weight.py` (property surgery, ~15 lines), NEW `asym_gemm/training/base_weight_pager.py`,
 `integrations/lf.py` (registration walk before `return model, report` at **`:2426`**, after
 `_release_replaced_module_memory()` `:2425`), `qwen3_moe.py` (force the eager fine-grained split `:2509`).
@@ -1215,10 +1301,13 @@ class _Entry:
 
 class BaseWeightPager:
     def __init__(self, store, *, cache_bytes=_env_int("ASYM_NVME_BASE_WEIGHT_CACHE_BYTES", 16<<30),
-                 prefetch_bytes=_env_int("ASYM_NVME_BASE_WEIGHT_PREFETCH_BYTES", 0)):   # 0 → auto: 2×largest blob
+                 prefetch_bytes=_env_int("ASYM_NVME_BASE_WEIGHT_PREFETCH_BYTES", 0)):
+        # prefetch_bytes 0 → auto 2×largest blob = static form of DeepSpeed's 2×numel_in_flight double-buffer
+        #   (partitioned_param_coordinator.py::__prefetch_nvme_param_partitions :622).
         self._store = store; self.cache_bytes = cache_bytes; self.prefetch_bytes = prefetch_bytes
         self._entries = {}; self._by_ref_id = {}
-        self._free = {}                          # (dtype,shape) → [padded pinned bufs] free list
+        self._free = {}                          # (dtype,shape)→[padded pinned bufs]: SwapBufferManager free-list
+                                                 #   (swap_tensor/utils.py:181-227) cloned, size-keyed for het. blobs
         self._quarantine = []                    # (buf, cuda_event, (dtype,shape)) — event-gated reuse (rule 6)
         self._trace = []; self._frozen = False; self._disabled = False
         self._cursor = -1; self._last_key = None; self._resident_bytes = 0
@@ -1256,9 +1345,10 @@ class BaseWeightPager:
     #   window of 8; a mismatch beyond the window → self._disabled = True (miss-driven sync fallback, counted,
     #   loud in summary()).
     # _issue_prefetches: byte-budgeted lookahead over the frozen trace (uniform lead TIME under mixed blob sizes
-    #   — MoE 3D groups vs dense 2D); guarded by _would_evict_nearer_than (tight-cache DS max_live analog):
-    #   for the next entries on the trace, if free/growable and not already INFLIGHT/RESIDENT, alloc buf, mark
-    #   INFLIGHT, submit_pread; stop at prefetch_bytes.
+    #   — MoE 3D groups vs dense 2D), depth = prefetch_bytes ≈ 2×in-flight (DeepSpeed __prefetch_nvme_param_
+    #   partitions :622); guarded by _would_evict_nearer_than (never prefetch a blob that would evict a nearer
+    #   next-use — the coordinator's __params_to_release invariant :572-604): for the next trace entries, if
+    #   free/growable and not already INFLIGHT/RESIDENT, alloc buf, mark INFLIGHT, submit_pread; stop at prefetch_bytes.
     # _take_buffer(e): pop free-list by (dtype,shape) → else grow while _resident_bytes+padded ≤ cache_bytes →
     #   else evict the RESIDENT entry with the farthest next-use on the frozen trace (exact Belady); the
     #   evictee's buf → _quarantine with a post-launch CUDA event; _sweep_quarantine returns event-complete
@@ -1291,16 +1381,41 @@ if store is not None and store.has_role("base_weight"):
     model._asym_base_weight_pager = pager
 ```
 
-**Correctness anchors:** fwd+bwd interleaved trace ⇒ farthest-next-use is exact Belady (late layers, reused
-first in backward, survive after forward); event-gated quarantine per rule 6 (`_asym_bf16_nt` launches return
-immediately while streaming the pinned weight, `frozen_linear.py:726-728,:807-809`); `touch` dedupe absorbs the
-multi-read pattern (`.weight.is_pinned()` predicate + kernel read within one Function); reporting reads metadata
-(never fetches); step-1 is miss-driven by design (⇒ `WARMUP_STEPS≥1` mandatory); grouped 3D expert blobs are
-GB-scale — `assert cache_bytes ≥ 2×largest_padded_nbytes` at registration.
+**Why this design is CORRECT (grounded in DeepSpeed):**
+1. **Frozen ⇒ immutable blob.** A base weight is written once at `register()` and never mutated, so every fetch
+   returns bit-identical bytes. DeepSpeed must re-`swap_out` params after each optimizer step
+   (`partitioned_param_swapper.py:259-277`) and carries the whole write-after-read hazard; panvme deletes that
+   class entirely (unit test: bit-exact 2D + grouped-3D roundtrip).
+2. **Fetch-before-use.** The `.weight`/`.tensor` property drains reads (`drain_reads`) and returns only a
+   RESIDENT view, so a GEMM never streams an INFLIGHT buffer — identical to `synchronize_reads` flipping
+   `.status=AVAILABLE` and rebinding `ds_tensor.data` before consume (`:213-225`).
+3. **Mismatch degrades to a correct miss, never a wrong value.** If the touch trace ever diverges (jitter beyond
+   the window), the pager sets `_disabled` and falls back to a synchronous fetch — the exact contract of
+   `trace_prologue`/`_invalidate_trace` (`coordinator :187-204`). Prefetch is a latency optimization; correctness
+   never depends on it (design contract 9).
+4. **Exact Belady + event-gated reuse.** The fwd+bwd-interleaved trace makes farthest-next-use exact (late
+   layers, reused first in backward, survive after forward); the evictee's buffer is quarantined behind a
+   post-launch CUDA event (rule 6) — mirroring the coordinator's `__ongoing_fetch_events`
+   (`:133,:377-387`) — because `_asym_bf16_nt` returns immediately while still streaming the pinned weight
+   (`frozen_linear.py:726-728,:807-809`). `touch` dedupe absorbs the multi-read pattern (`.weight.is_pinned()`
+   predicate + kernel read in one Function); reporting reads `_metadata` (never fetches); step-1 is miss-driven
+   by design (⇒ `WARMUP_STEPS≥1` mandatory); `assert cache_bytes ≥ 2×largest_padded_nbytes` at registration.
+5. **Off = byte-identical.** `_pager is None` ⇒ today's exact `return self._tensor` (design contract 7).
 
-**Efficiency:** whole-blob IO (a 2 GiB expert bank is ONE pread, internally 4×16-parallel); grouped weights
-stay grouped — **no per-expert loops introduced anywhere**; prefetch keeps the compute stream fed with zero HBM
-change; `touch` fast path = one dict get + one identity compare.
+**Why this design is EFFICIENT (grounded in DeepSpeed):**
+1. **Whole-blob, internally-parallel IO.** A 2 GiB expert bank is ONE `async_pread`, split intra_op×queue_depth
+   across libaio rings — DeepSpeed's exact mechanism (`deepspeed_cpu_op.cpp:67-83`) — and a single pread
+   saturates the RAID (~26 GB/s read). Grouped weights stay grouped: **no per-expert loops anywhere**.
+2. **2×-in-flight double-buffering hides read latency behind compute.** `prefetch_bytes = 2×in-flight`
+   (DeepSpeed `__prefetch_nvme_param_partitions :622`) keeps ~2 read waves outstanding, so the compute stream is
+   never starved while read-bw ≥ consumption rate. 61 GiB base re-read once/fwd + once/bwd ÷ 26 GB/s ≪ step time
+   at the target seqs (same feasibility math as the Stage-0 census; the async gate targets overlap ≥ 0.95).
+3. **Pin once, reuse forever.** The pinned pool is a free-list (`SwapBufferManager` pattern) — pinning happens at
+   `register()`, never per step, exactly as DeepSpeed pins `self.buffers` once at init (`:124-131`). Belady
+   eviction on the frozen trace = provably fewest misses for the cache size.
+4. **Zero HBM change, zero compute change.** The weight lands in the same pinned CPU buffer the GEMM streams from
+   today; only its *backing residency between uses* moves to NVMe. `touch` fast path = one dict get + one
+   identity compare.
 
 **Validation (Stage 7 gate):**
 
@@ -1331,6 +1446,47 @@ order above prevents it. If ≤5% fails at short seq (weight reads / step_second
 reclassify panvme as capacity-mode-only for short seq. Any future `.weight` reader must pick compute (fetch) vs
 reporting (metadata) — **grep `\.weight` / `\.tensor` / `\._tensor` on rebase** (Agent-3 map is the baseline).
 Checkpoint-time `_save_to_state_dict` (`:1681/:2078`) fetches under paging — acceptable (rare); note it.
+
+**Observed at bring-up (2026-07-06, q3-32b s20000 b8 flagship policy, attnact=true) — three learnings baked
+into the implementation:**
+1. **Freeze on step boundaries, NOT key recurrence.** Under recomp-off-full-fg each weight is touched ~3
+   clusters/step (fwd, bwd-recompute, bwd-inner; deduped trace period 8015 over 449 blobs) — a
+   "first key's 3rd occurrence" freeze fires mid-backward of step 1 and invalidates at the layer-63 wrap.
+   Landed design: `pager.mark_step()` wired from `run_lf_profiled_train.py`'s optimizer-step wrapper (the
+   DeepSpeed `reset_step` analog): step 1 warms miss-driven, step 2 RECORDs, freeze at its boundary
+   (⇒ `WARMUP_STEPS≥2`). If the hook never fires the pager just stays miss-driven-sync (correct).
+2. **Never CUDA-event-sync on the buffer hot path.** Eviction reuse-guard events record at the CPU-side
+   stream tail while the GPU runs seconds behind ⇒ inline `event.synchronize()` cost a measured
+   `quarantine_block_ms` ≈ 33 s/step. Landed design: at most ONE Belady eviction per acquisition, then a
+   *transient* over-cap alloc (`cache_bytes + max(2×largest, 4 GiB)`) while quarantined buffers ripen — the
+   DeepSpeed `buffer_count`-slack analog; surplus frees are dropped as events complete; hard sync only at the
+   overshoot ceiling. Fix took steady-state step 279 s → 258 s.
+3. **Observers must never fetch — the "compute vs reporting" grep-warning above, confirmed as a live bug at
+   gate.** The source profiler's forced partial writes each ran full-model memory walks
+   (`lf_trace._collect_persistent_bytes:1261` + `_model_memory_summary:2105`) that read `HostWeight.tensor`
+   on every paged blob: 7–10 walks/step ⇒ ~6 TB/run of phantom NVMe reads (87% of all read traffic; trace
+   period was 8015 touches of which only 1280 were compute), tripling the inter-step gap (6.3→17 s,
+   py-spy-attributed). Landed: `HostWeight.is_paged` + both walk sites skip paged homes (their host residency
+   is the pager cache, reported via `asym_nvme.base_weight_pager.resident_bytes`).
+4. **Belady next-use must be O(1), not a rescan.** Per-eviction full scans (449 entries × ~18 positions)
+   measured 0.93 ms × ~6.9k evictions/step = 6.4 s/step of main-thread time. Landed: successor-gap clock at
+   freeze (`_Entry.next_gap`/`next_abs` vs the pager's `_abs` touch counter, lazy exact-rescan heal on
+   jitter-window skips) — 0.04 ms/eviction, semantics unchanged (brute-force-equivalence unit test).
+5. **Knob probes (negative results, keep defaults):** raising `ASYM_NVME_BASE_WEIGHT_PREFETCH_BYTES` to
+   12 GiB *regressed* ×1.16 — deep lookahead into a 16 GiB cache makes Belady evict the just-prefetched
+   far-future entries (evict-before-use, +13% bytes_read). `ASYM_NVME_AIO_QUEUE_DEPTH=64` + `INTRA_OP=8` was
+   neutral (waits are submission-cadence-bound, not device-bound: md0 RAID0 measured 25.2 GB/s aggregate /
+   16.8 GB/s single-stream vs ~4.3 GB/s consumed). Auto prefetch (2×largest) + DS-baseline aio (16/4) stand.
+6. **Gate PASSED — inside the enroot container (2026-07-06, `compare_nvme_profiles.py --target
+   base_weight_cpu` ⇒ `ok:true`, 0 failures; same-session baseline, WARMUP 2 / MAX 5, paired_steps 5,
+   q3-32b s20000 b8, GPU 2, artifacts `profiling_nvme/stage7_panvme/20260706T053034Z_*_container` (baseline)
+   + `..._container_final` (candidate)):** registration 449 blobs / 64.0 GB written once; **step_ratio
+   1.0003** (211.35 s/it vs 211.3) ✓; fwd 1.0000 / bwd 1.0008 ✓; **memory_drop 40.49 GiB** ✓ (352.3→311.8
+   peak RSS); **median loss Δ 0.00085 / max 0.0032** ✓; `trace_frozen=true, trace_disabled=false,
+   step_marks=7, period=1280, misses_after_freeze=501, quarantine_block 131 ms/run` (was 231 s pre-no-sync
+   fix, 2.8 s pre-walk-removal), reads 914 GB/run (~130 GB/step ≈ 2×base) fully hidden (`fetch_wait`
+   12 s/run ≈ 1.7 s/step). Earlier substrate-invalid numbers (×1.085 with the profiler-walk traffic) are in
+   `..._container`/`..._container_qd64` dirs for the record.
 
 ---
 

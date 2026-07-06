@@ -383,6 +383,25 @@ def _asym_cpu_adamw_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
     return [row] if row else []
 
 
+def _asym_nvme_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten the source_profile ``asym_nvme`` block to one row; per-role byte/op dicts become
+    ``<key>_<role>`` columns. Returns [] when the store was disabled (no CSV emitted)."""
+    nvme = profile.get("asym_nvme", {})
+    if not isinstance(nvme, dict) or not nvme.get("enabled"):
+        return []
+    row: dict[str, Any] = {}
+    for key, value in nvme.items():
+        if isinstance(value, dict):
+            for sub, subval in value.items():
+                if not isinstance(subval, (dict, list)):
+                    row[f"{key}_{sub}"] = subval
+        elif isinstance(value, list):
+            row[key] = ",".join(str(v) for v in value)
+        else:
+            row[key] = value
+    return [row] if row else []
+
+
 _RUNTIME_COUNT_KEYS = (
     "asym_forward_calls",
     "asym_dx_calls",
@@ -2226,6 +2245,9 @@ def _write_source_artifacts(source_profile_json: Path, output_dir: Path, profile
     asym_cpu_adamw_rows = _asym_cpu_adamw_rows(profile)
     if asym_cpu_adamw_rows:
         _write_csv(output_dir / "asym_cpu_adamw.csv", asym_cpu_adamw_rows)
+    asym_nvme_rows = _asym_nvme_rows(profile)
+    if asym_nvme_rows:
+        _write_csv(output_dir / "asym_nvme.csv", asym_nvme_rows)
     trainable_surface_rows = _trainable_surface_rows(profile)
     if trainable_surface_rows:
         _write_csv(output_dir / "trainable_surface.csv", trainable_surface_rows)

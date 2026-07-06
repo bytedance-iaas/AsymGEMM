@@ -209,12 +209,21 @@ def read_metrics(leaf: Path) -> dict | None:
     step_ms = fwd_ms + bwd_ms + opt_ms
     sec = lambda ms: None if ms is None else ms / 1000.0
     gib = lambda b: None if b is None else b / GIB
+    # loss: average over ALL measured (non-warmup) steps; lenient — old profiles may lack it.
+    loss_vals = [row["loss"] for row in peak_samples if isinstance(row.get("loss"), (int, float))]
+    loss = sum(loss_vals) / len(loss_vals) if loss_vals else None
+    # grad_norm: the profile records a single final-step clip snapshot (no per-step norms).
+    grad_clip = sp.get("grad_clip")
+    grad_norm = grad_clip.get("total_norm") if isinstance(grad_clip, dict) else None
+    if not isinstance(grad_norm, (int, float)):
+        grad_norm = None
     return {
         "fwd_s": sec(fwd_ms), "bwd_s": sec(bwd_ms), "opt_s": sec(opt_ms), "step_s": sec(step_ms),
         "fwd_g": gib(mx(peak_samples, "forward_peak_allocated_bytes")),
         "bwd_g": gib(mx(peak_samples, "backward_peak_allocated_bytes")),
         "step_g": gib(mx(peak_samples, "peak_allocated_hbm_bytes")),
         "ram_g": gib(mx(peak_samples, "process_rss_peak_bytes")),
+        "loss": loss, "grad_norm": grad_norm,
     }
 
 
@@ -232,7 +241,7 @@ def lora_label(config_root_name: str) -> str:
 
 
 def collect_leaves(root: Path) -> dict:
-    """Return {logical_key: leaf_path} for the run with the most max_steps (ties: newest)."""
+    """Return {logical_key: (leaf_path, warmup, max_steps)} for the run with the most max_steps (ties: newest)."""
     runs: dict[tuple, dict] = {}
     for dataset_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         for cr in sorted(p for p in dataset_dir.iterdir() if p.is_dir() and p.name not in SKIP_DIRS):
@@ -242,8 +251,8 @@ def collect_leaves(root: Path) -> dict:
                 continue
             lora = lora_label(cr.name)
             batch, seq, ga = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            ws = re.search(r"_w\d+_s(\d+)", cr.name)
-            steps = int(ws.group(1)) if ws else 0
+            ws = re.search(r"_w(\d+)_s(\d+)", cr.name)
+            warmup, steps = (int(ws.group(1)), int(ws.group(2))) if ws else (None, 0)
             for rd in sorted(p for p in cr.iterdir() if p.is_dir()):
                 toks = rd.name.split("__")
                 if len(toks) < 3 or toks[1] not in ("nsys", "source"):
@@ -265,6 +274,8 @@ def collect_leaves(root: Path) -> dict:
                 ohbm_n = _tok(toks, "ohbm", "0")
                 if ohbm_n != "0":
                     config += f" ohbm{ohbm_n}"
+                if "attnfa4" in toks:
+                    config += " fa4"  # non-canonical FA4-fork runtime stack
                 leaf = next((p for p in rd.iterdir() if p.is_dir() and p.name.startswith("b")), None)
                 if leaf is None:
                     continue
@@ -275,24 +286,26 @@ def collect_leaves(root: Path) -> dict:
                 lkey = (model, lora, seq, batch, ga, f"{toks[0]} ({toks[2]})", config)
                 run = runs.get((lkey, cr.name))
                 if run is None:
-                    runs[(lkey, cr.name)] = {"lkey": lkey, "steps": steps, "has": has, "mtime": mtime, "leaf": leaf}
+                    runs[(lkey, cr.name)] = {"lkey": lkey, "warmup": warmup, "steps": steps, "has": has, "mtime": mtime, "leaf": leaf}
                 elif (has, mtime) > (run["has"], run["mtime"]):
                     run.update(has=has, mtime=mtime, leaf=leaf)
     chosen: dict[tuple, tuple] = {}
-    out: dict[tuple, Path] = {}
+    out: dict[tuple, tuple] = {}
     for run in runs.values():
         lk = run["lkey"]
         key = (run["steps"], run["mtime"])
         if lk not in chosen or key > chosen[lk]:
             chosen[lk] = key
-            out[lk] = run["leaf"]
+            out[lk] = (run["leaf"], run["warmup"], run["steps"])
     return out
 
 
-HEAD = ["Workload", "Backend", "Config",
+HEAD = ["Workload", "Backend", "Config", "steps",
         "fwd_s", "bwd_s", "opt_s", "step_s",
-        "fwd_H", "bwd_H", "step_H", "RAM"]
-NUM_KEYS = ["fwd_s", "bwd_s", "opt_s", "step_s", "fwd_g", "bwd_g", "step_g", "ram_g"]
+        "fwd_H", "bwd_H", "step_H", "RAM",
+        "loss", "grad_norm"]
+NUM_KEYS = ["fwd_s", "bwd_s", "opt_s", "step_s", "fwd_g", "bwd_g", "step_g", "ram_g", "loss", "grad_norm"]
+KEY_DECIMALS = {"loss": 3, "grad_norm": 3}
 # Start from the shared semantic order, then slot the layer-offload family (renamed
 # "layerOF") right after its exp+attn+layerGC sibling so the "none+exp+attn..." configs
 # stay adjacent instead of the unranked layerOF falling to the end of the backend group.
@@ -321,8 +334,8 @@ def status_marker(status: str) -> str:
     return MARKER.get(status, "—")
 
 
-def fmt(v) -> str:
-    return f"{v:.1f}" if isinstance(v, (int, float)) else "-"
+def fmt(v, decimals: int = 1) -> str:
+    return f"{v:.{decimals}f}" if isinstance(v, (int, float)) else "-"
 
 
 def main() -> None:
@@ -342,24 +355,27 @@ def main() -> None:
         return
 
     by_group: dict[tuple[str, str], list] = {}
-    for (model, lora, seq, batch, ga, be, config), leaf in leaves.items():
+    for (model, lora, seq, batch, ga, be, config), (leaf, warmup, steps) in leaves.items():
         metrics = read_metrics(leaf) if leaf is not None else None
         wl = f"s{seq}·b{batch}" + (f"·ga{ga}" if ga != 1 else "")
+        steps_cell = f"{warmup}/{steps}" if warmup is not None else "-"
         if metrics is not None:
-            nums = [fmt(metrics.get(k)) for k in NUM_KEYS]
+            nums = [fmt(metrics.get(k), KEY_DECIMALS.get(k, 1)) for k in NUM_KEYS]
         else:
             status = classify(leaf)[0] if leaf is not None else "NOT RUN"
             nums = [status_marker(status)] + [""] * (len(NUM_KEYS) - 1)
-        cells = [wl, be, config] + nums
+        cells = [wl, be, config, steps_cell] + nums
         by_group.setdefault((model, lora), []).append((seq, batch, be, config, cells))
 
     print(f"Profiling metrics: {root}")
     print("Legend: 🔴 GPU OOM   🟠 explicit host OOM   TERM SIGTERM/143   KILL SIGKILL/137"
           "   ⚠️ failed   🔵 running   — not run")
-    print("Cols: _s seconds, avg over non-warmup raw steps excluding first/final measured steps"
+    print("Cols: steps = warmup/max_steps (from the config-root w<X>_s<Y> label)"
+          " | _s seconds, avg over non-warmup raw steps excluding first/final measured steps"
           " (strict fields: forward_milliseconds, backward_milliseconds, optimizer_milliseconds;"
           " step_s = fwd_s + bwd_s + opt_s)"
           " | _H GPU HBM peak GiB | RAM host RSS peak GiB (whole step)"
+          " | loss avg over measured (non-warmup) steps | grad_norm final measured step's clip snapshot"
           " | Config routeXYZ_loraN_accTYPE [lg± sd±] = routed kernels / liger / sdpa-recompute\n")
     for model, lora in sorted(by_group):
         recs = sorted(by_group[(model, lora)], key=lambda r: (r[0], r[1], r[2], CFG_RANK.get(base_config_label(r[3]), 99), r[3]))
@@ -368,16 +384,18 @@ def main() -> None:
         just = lambda i, s: s.ljust(w[i]) if i < 3 else s.rjust(w[i])  # text left, numbers right
         group_width = lambda start, end: sum(w[start:end]) + 2 * max(0, end - start - 1)
         separator = [
-            *("-" * w[i] for i in range(3)),
-            "-" * group_width(3, 7),
-            "-" * group_width(7, 10),
-            "-" * w[10],
+            *("-" * w[i] for i in range(4)),
+            "-" * group_width(4, 8),
+            "-" * group_width(8, 11),
+            "-" * w[11],
+            "-" * group_width(12, 14),
         ]
         workload_separator = [
-            *("=" * w[i] for i in range(3)),
-            "=" * group_width(3, 7),
-            "=" * group_width(7, 10),
-            "=" * w[10],
+            *("=" * w[i] for i in range(4)),
+            "=" * group_width(4, 8),
+            "=" * group_width(8, 11),
+            "=" * w[11],
+            "=" * group_width(12, 14),
         ]
         print(f"Model: {model}    LoRA: {lora}")
         print("  ".join(just(i, HEAD[i]) for i in range(len(HEAD))))

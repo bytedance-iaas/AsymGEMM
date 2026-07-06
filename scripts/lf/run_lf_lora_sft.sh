@@ -408,6 +408,23 @@ case "${BACKEND,,}" in
     CPUADAM_ALIAS_SELECTED=1
     BACKEND=asym
     ;;
+  asym_cpuadamwds_panvme|asym_cpuadamwds_actnvme|asym_cpuadamwds_bothnvme)
+    # asym_cpuadamwds + one/both NVMe roles (activation spill and/or base-weight paging).
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-${BACKEND,,}}
+    USE_ASYM_CPU_ADAMW=true
+    ASYM_CPU_ADAMW_BACKEND=deepspeed
+    CPUADAM_ALIAS_SELECTED=1
+    case "${BACKEND,,}" in
+      *_panvme)   ASYM_NVME_ROLES="base_weight" ;;
+      *_actnvme)  ASYM_NVME_ROLES="activation" ;;
+      *_bothnvme) ASYM_NVME_ROLES="base_weight,activation" ;;
+    esac
+    export ASYM_NVME_ROLES
+    export ASYM_NVME_PATH="${ASYM_NVME_PATH:-/scratch_local/asym_nvme}"
+    # Stage 3: enable the LF checkpointing.py boundary-offload hook when activation spill is on.
+    if [[ ",${ASYM_NVME_ROLES}," == *",activation,"* ]]; then export ASYM_UNSLOTH_GC_NVME=1; fi
+    BACKEND=asym
+    ;;
   asym_torch) BACKEND=asym_torch ;;
   asym) BACKEND=asym ;;
   kt_torchbf16)
@@ -2492,6 +2509,20 @@ if [[ "${PROFILE}" == "1" ]]; then
     ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD="${ASYM_CPU_ADAMW_GRAD_OFFLOAD}"
     ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${ASYM_CPU_ADAMW_WEIGHT_OFFLOAD}"
   )
+  if [[ -n "${ASYM_NVME_ROLES:-}" ]]; then
+    # raw ASYM_NVME_* for the store; ASYM_GEMM_LF_CONFIG_* mirror for the profile report.
+    RUN_ENV+=(
+      ASYM_NVME_ROLES="${ASYM_NVME_ROLES}"
+      ASYM_NVME_PATH="${ASYM_NVME_PATH:-/scratch_local/asym_nvme}"
+      ASYM_NVME_SYNC="${ASYM_NVME_SYNC:-1}"
+      ASYM_NVME_ACT_CPU_BUDGET_BYTES="${ASYM_NVME_ACT_CPU_BUDGET_BYTES:-auto}"
+      ASYM_UNSLOTH_GC_NVME="${ASYM_UNSLOTH_GC_NVME:-}"
+      ASYM_GEMM_LF_CONFIG_ASYM_NVME_ROLES="${ASYM_NVME_ROLES}"
+      ASYM_GEMM_LF_CONFIG_ASYM_NVME_PATH="${ASYM_NVME_PATH:-/scratch_local/asym_nvme}"
+      ASYM_GEMM_LF_CONFIG_ASYM_NVME_SYNC="${ASYM_NVME_SYNC:-1}"
+      ASYM_GEMM_LF_CONFIG_ASYM_NVME_ACT_CPU_BUDGET_BYTES="${ASYM_NVME_ACT_CPU_BUDGET_BYTES:-auto}"
+    )
+  fi
   if [[ "${BACKEND}" == kt_* ]]; then
     RUN_ENV+=(
       ASYM_GEMM_LF_CONFIG_KT_BACKEND="${KT_BACKEND_INTERNAL:-}"

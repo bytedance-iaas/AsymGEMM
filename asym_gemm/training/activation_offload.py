@@ -12,6 +12,10 @@ _CPU_BUFFER_POOL_EVICTIONS = 0
 _CPU_BUFFER_POOL_MAX_CACHED_BYTES = 0
 _DEFAULT_CPU_POOL_MAX_BYTES = 32 * 1024**3
 
+# actnvme governor (Stage 3): None unless ASYM_NVME_ROLES contains "activation" (rule 7).
+# Bound at module bottom by get_act_spill_governor(); every hook below is inert while it is None.
+_GOV = None
+
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
     return int(tensor.numel() * tensor.element_size())
@@ -80,6 +84,9 @@ def _alloc_cpu(shape: tuple[int, ...], dtype: torch.dtype, *, pin_memory: bool) 
         if not pool:
             _CPU_BUFFER_POOL.pop(key, None)
         return tensor
+    if _GOV is not None and pinned:
+        # C8: aligned, padded pinned storage so io_ready() is True (spill-eligible); exact-shape view.
+        return _GOV.alloc_cpu(key[1], dtype)
     try:
         return torch.empty(key[1], device="cpu", dtype=dtype, pin_memory=pinned)
     except RuntimeError:
@@ -182,6 +189,8 @@ class ActivationOffloadManager:
             original_shape=tuple(int(dim) for dim in shape),
         )
         self._mark_cpu_live(handle)
+        if _GOV is not None:
+            _GOV.on_offload(self, handle)
         return handle
 
     def offload(self, tensor: torch.Tensor, tag: str) -> CPUActivationHandle:
@@ -225,11 +234,15 @@ class ActivationOffloadManager:
             original_shape=tuple(int(dim) for dim in source.shape),
         )
         self._mark_cpu_live(handle)
+        if _GOV is not None:
+            _GOV.on_offload(self, handle)
         return handle
 
     def wait_cpu_ready(self, handle: CPUActivationHandle | None) -> None:
         if handle is None:
             return
+        if _GOV is not None:
+            _GOV.ensure_local(handle)          # un-spill if DURABLE, before reading the D2H event
         event = self._pending_cpu_ready_events.pop(int(handle.tensor.data_ptr()), None)
         if event is not None:
             event.synchronize()
@@ -315,6 +328,8 @@ class ActivationOffloadManager:
     def release_cpu(self, handle: CPUActivationHandle | None) -> int:
         if handle is None:
             return 0
+        if _GOV is not None:
+            _GOV.on_release(handle)            # BEFORE wait_cpu_ready: never fetch a spilled-then-freed handle
         self.wait_cpu_ready(handle)
         entry = self._active_cpu_bytes.pop(int(handle.tensor.data_ptr()), None)
         if entry is None:
@@ -324,6 +339,24 @@ class ActivationOffloadManager:
         self.stats.cpu_bytes_by_tag[tag] = max(0, self.stats.cpu_bytes_by_tag.get(tag, 0) - nbytes)
         _return_cpu(handle.tensor, pin_memory=self.pin_memory)
         return nbytes
+
+    def seal(self, *handles: "CPUActivationHandle | None") -> None:
+        """Mark handles spill-eligible (governor); one call at the end of a Function.forward. Inert
+        without the governor. Handles failing io_ready/min-size stay resident (pressure-only)."""
+        if _GOV is not None:
+            _GOV.on_seal(self, [h for h in handles if h is not None])
+
+    def _pop_active(self, handle: CPUActivationHandle) -> None:
+        """Governor-only: drop cpu-owned accounting for the handle's CURRENT data_ptr WITHOUT pool
+        return, and drop the stale D2H event for that ptr (mirrors release_cpu's stat decrements)."""
+        ptr = int(handle.tensor.data_ptr())
+        self._pending_cpu_ready_events.pop(ptr, None)
+        entry = self._active_cpu_bytes.pop(ptr, None)
+        if entry is None:
+            return
+        nbytes, tag = entry
+        self.stats.cpu_owned_bytes = max(0, self.stats.cpu_owned_bytes - nbytes)
+        self.stats.cpu_bytes_by_tag[tag] = max(0, self.stats.cpu_bytes_by_tag.get(tag, 0) - nbytes)
 
     def snapshot(self) -> dict[str, Any]:
         return self.stats.as_dict()
@@ -356,3 +389,11 @@ class ActivationOffloadManager:
         self.stats.max_stage_bytes_live = max(self.stats.max_stage_bytes_live, self.stats.staged_bytes)
         self.stats.stage_bytes_by_tag[tag] = self.stats.stage_bytes_by_tag.get(tag, 0) + nbytes
         self.stats.stage_peak_by_tag[tag] = max(self.stats.stage_peak_by_tag.get(tag, 0), nbytes)
+
+
+# Bind the actnvme governor AFTER all pool functions + the manager are defined, so act_spill_governor
+# (which lazy-imports _alloc_cpu/_return_cpu) resolves without an import cycle. None unless
+# ASYM_NVME_ROLES contains "activation" (rule 7): no deepspeed import, no store, no hooks.
+from .act_spill_governor import get_act_spill_governor  # noqa: E402
+
+_GOV = get_act_spill_governor()

@@ -1343,6 +1343,55 @@ def _layer_act_offload_enabled() -> bool:
     )
 
 
+def _install_base_weight_pager(model: nn.Module) -> None:
+    """asym_cpuadamwds_panvme (agent/impls/nvme_offload_impl.md Stage 7): page eligible frozen
+    base weights to NVMe behind a trace-prefetching pinned cache. No-op (zero imports beyond the
+    env check, zero allocations) unless the NVMe store carries the ``base_weight`` role."""
+    from ..training.nvme_store import get_nvme_store
+
+    store = get_nvme_store()
+    if store is None or not store.has_role("base_weight"):
+        return
+    from ..training.base_weight_pager import BaseWeightPager
+    from ..training.frozen_linear import AsymFrozenLinear, AsymGroupedFrozenLinear
+    from ..training.host_weight import HostWeight
+
+    if _qwen3_moe_finegrained_offload_enabled():
+        # Force the lazy fused gate_up -> gate/up split (qwen3_moe.py:2509) BEFORE any home is
+        # freed — the split slices the fused parent's resident ``_tensor``.
+        for module in model.modules():
+            ensure = getattr(module, "_ensure_qwen3_moe_finegrained_bases", None)
+            if callable(ensure):
+                try:
+                    ensure()
+                except NotImplementedError:
+                    pass
+
+    pager = BaseWeightPager(store)
+    registered = 0
+    for name, module in model.named_modules():
+        # Eligible: bf16 AsymFrozenLinear (attn + dense MLP) and AsymGroupedFrozenLinear
+        # (experts/shared/router). EXCLUDED by policy: AsymFrozenEmbedding (CPU-side F.embedding
+        # per microbatch), norms (tiny, unpinned), and precision != bf16 (the quantized cache
+        # builds from ``.weight``, frozen_linear.py:356-380).
+        if not isinstance(module, (AsymFrozenLinear, AsymGroupedFrozenLinear)):
+            continue
+        if str(getattr(module, "precision", "bf16")) != "bf16":
+            continue
+        host_weight = getattr(module, "host_weight", None)
+        if not isinstance(host_weight, HostWeight):
+            continue
+        if pager.register(f"{name}.host_weight", host_weight):
+            registered += 1
+    pager.finalize()
+    setattr(model, "_asym_base_weight_pager", pager)
+    print(
+        f"asym panvme: paged {registered} base-weight blobs "
+        f"({pager.registered_bytes / (1 << 30):.2f} GiB) to NVMe at {store.cfg.path}",
+        flush=True,
+    )
+
+
 def _layer_glue_gc_enabled() -> bool:
     return _env_true(os.environ.get("ASYMM_LAYER_GC")) or _env_true(
         os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_LAYER_GC")
@@ -2423,6 +2472,9 @@ def apply_lf_asym_lora(
     _register_runtime_report(report)
     # Drop any orphaned pre-conversion modules/reference cycles before the first trainer step.
     _release_replaced_module_memory()
+    # asym_cpuadamwds_panvme (Stage 7): page frozen base weights to NVMe. No-op without the
+    # base_weight NVMe role; runs LAST so every HostWeight (incl. lazy moefg splits) exists.
+    _install_base_weight_pager(model)
     return model, report
 
 

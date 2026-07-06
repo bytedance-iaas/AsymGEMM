@@ -703,6 +703,7 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
         ctx.up_low_rank_cpu = up_low_rank_cpu
         ctx.down_low_rank_cpu = down_low_rank_cpu
         ctx.input_dtype = input_dtype
+        manager.seal(x_cpu, gate_cpu, up_cpu, act_cpu, gate_low_rank_cpu, up_low_rank_cpu, down_low_rank_cpu)
         layer._last_activation_offload_stats = _record_manager_peaks(layer, manager)
         if down_scatter_block_experts <= 0 and not route_flags.fwd_scatter:
             with prof_range(layer._forward_range("moe_finegrained", "scatter_down_base")):

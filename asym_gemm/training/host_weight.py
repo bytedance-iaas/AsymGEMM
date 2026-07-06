@@ -227,6 +227,10 @@ class HostWeight:
         self._tensor = cpu_tensor
         self._name = name
         self._metadata = _make_metadata(cpu_tensor, pin_error=pin_error)
+        # NVMe pager hooks (asym_cpuadamwds_panvme, agent/impls/nvme_offload_impl.md Stage 7).
+        # None ⇒ every property below takes today's exact path — off is byte-identical.
+        self._pager: Any | None = None
+        self._pager_key: str | None = None
         _record_profile_event(
             "host_weight_init",
             name=name,
@@ -242,7 +246,17 @@ class HostWeight:
         )
 
     @property
+    def is_paged(self) -> bool:
+        """True when the home lives on NVMe behind the base-weight pager. Observers (profilers,
+        reporters) MUST branch on this and use metadata — reading ``.tensor``/``.weight`` on a
+        paged HostWeight fetches from NVMe (measured: per-step full-model profiler walks
+        re-streamed ~64 GiB each, dominating the panvme step-time regression)."""
+        return self._pager is not None
+
+    @property
     def tensor(self) -> torch.Tensor:
+        if self._pager is not None:                       # COMPUTE read: fetch/ensure resident
+            return self._pager.touch(self._pager_key)
         return self._tensor
 
     @classmethod
@@ -269,14 +283,20 @@ class HostWeight:
 
     @property
     def shape(self) -> torch.Size:
+        if self._pager is not None:                       # reporting/predicate: NEVER fetches
+            return torch.Size(self._metadata.shape)
         return self._tensor.shape
 
     @property
     def dtype(self) -> torch.dtype:
+        if self._pager is not None:
+            return self._metadata.dtype
         return self._tensor.dtype
 
     @property
     def device(self) -> torch.device:
+        if self._pager is not None:
+            return torch.device(self._metadata.device)    # metadata stores device as str
         return self._tensor.device
 
     @property
@@ -289,18 +309,26 @@ class HostWeight:
 
     @property
     def out_features(self) -> int:
+        if self._pager is not None:
+            return int(self._metadata.shape[0])
         return int(self._tensor.shape[0])
 
     @property
     def in_features(self) -> int:
+        if self._pager is not None:
+            return int(self._metadata.shape[1])
         return int(self._tensor.shape[1])
 
     @property
     def grad(self) -> None:
+        if self._pager is not None:                       # frozen: no grad is ever set
+            return None
         return self._tensor.grad
 
     @property
     def weight(self) -> torch.Tensor:
+        if self._pager is not None:                       # COMPUTE read: fetch/ensure resident
+            return self._pager.touch(self._pager_key)
         return self._tensor
 
     @property
@@ -309,9 +337,13 @@ class HostWeight:
 
     @property
     def pinned_cpu_bytes(self) -> int:
+        if self._pager is not None:
+            return 0                                      # home freed; pager cache reports separately
         return self.nbytes if self.is_pinned else 0
 
     def grouped_nt_tensor(self) -> torch.Tensor:
+        if self._pager is not None:                       # compute path: fetch is correct
+            return self._pager.touch(self._pager_key).unsqueeze(0)
         return self._tensor.unsqueeze(0)
 
     def to(self, *args: Any, **kwargs: Any) -> "HostWeight":
@@ -335,6 +367,8 @@ class HostWeight:
         raise RuntimeError("HostWeight is CPU-resident and cannot be moved to CUDA")
 
     def pin_memory(self) -> "HostWeight":
+        if self._pager is not None:                       # pager buffers are pinned already
+            return self
         if self.is_pinned:
             return self
         return HostWeight(self._tensor, pin_memory=True, clone=True, name=self._name)

@@ -1258,6 +1258,8 @@ class LFMemoryBreakdownProfiler:
                 component = _component_from_module_name(module_name) or _component_from_param_name(module_name)
                 for attr in ("host_weight", "weight_host"):
                     host = getattr(module, attr, None)
+                    if getattr(host, "is_paged", False):
+                        continue  # NVMe-paged: no persistent host bytes; .tensor would fetch from NVMe
                     tensor = getattr(host, "tensor", None)
                     if isinstance(tensor, torch.Tensor):
                         add(component, "host_weight", tensor)
@@ -2102,6 +2104,8 @@ def _model_memory_summary(model: nn.Module | None) -> dict[str, Any]:
         component = _component_from_module_name(module_name) or _component_from_param_name(module_name)
         for attr in ("host_weight", "weight_host"):
             host = getattr(module, attr, None)
+            if getattr(host, "is_paged", False):
+                continue  # NVMe-paged: pager cache reports residency; .tensor would fetch from NVMe
             tensor = getattr(host, "tensor", None)
             if isinstance(tensor, torch.Tensor):
                 storage_key = _tensor_storage_key(tensor)

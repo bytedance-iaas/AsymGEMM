@@ -297,6 +297,7 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
         ctx.down_low_rank_cpu = down_low_rank_cpu
         ctx.input_shape = tuple(int(dim) for dim in x.shape)
         ctx.input_dtype = x.dtype
+        manager.seal(x_cpu, gate_cpu, up_cpu, act_cpu, gate_low_rank_cpu, up_low_rank_cpu, down_low_rank_cpu)
         layer._last_activation_offload_stats = manager.snapshot()
         if weight_offload and bool(getattr(layer, "_weight_offload_release_after_forward", True)):
             layer.release_lora_weights()
