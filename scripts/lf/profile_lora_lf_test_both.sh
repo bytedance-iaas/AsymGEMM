@@ -43,6 +43,14 @@ GPU_POOL=${GPU_POOL:-0}
 #              Unsloth-GC modes accept a trailing -ohbm<N> suffix (e.g. unsloth-off-ohbm4,
 #              recomp-off-full-fg-ker101-ohbm6): keep every Nth outer checkpoint root in HBM
 #              (UNSLOTH_GC_OUTER_HBM_EVERY_N). Omitted = ohbm0 = all roots offloaded to CPU.
+#              A -ceil<N> suffix (between -kerXYZ and -ohbm<N>, e.g. recomp-off-full-fg-ker000-ceil250)
+#              sets the per-run CPU activation budget ASYM_NVME_ACT_CPU_BUDGET_BYTES to N GiB.
+#              ceil000 (or omitting the tag) = no explicit ceiling (sweep env override or 'auto');
+#              N > 0 requires an asym NVMe backend (asym_cpuadamwds_actnvme/_panvme/_bothnvme).
+#              The -ohbm<N> tag is ALWAYS shown on every backend's Unsloth-GC modes: asym_* run/config
+#              dirs carry the full -ker<XYZ>-ceil<NNNN>-ohbm<N> triple (ker000/ceil0000/ohbm0 =
+#              defaults; ceil zero-padded to 4 digits), while non-asym GC dirs carry -ohbm<N> only
+#              (e.g. unsloth-off-ohbm0), no -ceil. Non-GC modes (norecomp/recomp) carry no -ohbm.
 #   liger    : ligerloss0 | ligerloss1
 #   policy   : none|false|false|false|false|false (off)  |  none|true|true|false|true|true (offload+gc)
 declare -A M=(
@@ -92,7 +100,7 @@ else
   #   # "q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
   # )
   RUNS=(
-    "q3.5-35b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 4000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
+    "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg|ligerloss1 ; 65000|8|1 ; none|false|false|false|false|false" # G-OOM 66k
 
     # "q3-30b-a3b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 131000|8|1 ; none|false|false|false|false|false" # C-OOM 132k
     # "q3-32b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 52000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
@@ -100,14 +108,13 @@ else
     # "llama4-scout|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 14500|8|1 ; none|false|false|false|false|false" # G-OOM 15k
     # "q2.5-32b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 52000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
     # "q2.5-72b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
-    
+
     # "q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
     # "q3-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 49000|8|1 ; none|false|false|false|false|false" # G-OOM 50k
     # "llama3.3-70b|1 ; superoffload_mem|unsloth|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
     # "llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
     # "q2.5-32b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
     # "q2.5-72b|1 ; superoffload_mem|unsloth|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # G-OOM 41k
-    # "q3.5-35b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
 
     # "q3-30b-a3b|1 ; superoffload_mem|recomp|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
     # "q3-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # G-OOM 21k
@@ -224,7 +231,8 @@ ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG=${ASYMM_QWEN3_MOE_ROUTE_KERNEL_DEBUG:-0}
 # Outer checkpoint placement: keep every Nth outer Unsloth checkpoint root in HBM
 # instead of CPU RAM. Sweep-wide default; a per-run -ohbm<N> recompute suffix in
 # RUNS overrides it. Keep 0 for fixed-seq apples-to-apples comparisons; nonzero
-# is for max-seq ceiling hunting (runs gain an __ohbm<N> dir suffix).
+# is for max-seq ceiling hunting. The effective value is folded into the recompute
+# label as the -ohbm<N> tag (asym_* always shows it, incl. ohbm0).
 UNSLOTH_GC_OUTER_HBM_EVERY_N=${UNSLOTH_GC_OUTER_HBM_EVERY_N:-0}
 
 # CUDA allocator
@@ -370,6 +378,11 @@ Options:
     model ; backend|recompute|ligerloss ; seq|batch|grad_accum ; policy|expact|attnact|layeract|layergc|sdparecomp
   Unsloth-GC recompute modes take an optional trailing -ohbm<N> suffix (keep every Nth
   outer checkpoint root in HBM; omitted = ohbm0 = all roots to CPU), e.g. unsloth-off-ohbm4.
+  Recompute tokens also take a -ceil<N> suffix (between -kerXYZ and -ohbm<N>): per-run CPU
+  activation budget ASYM_NVME_ACT_CPU_BUDGET_BYTES = N GiB, e.g. recomp-off-full-fg-ker000-ceil250.
+  ceil000 / omitted = no explicit ceiling; N > 0 requires an asym NVMe backend
+  (asym_cpuadamwds_actnvme/_panvme/_bothnvme). asym_* run dirs always show -ker<XYZ>-ceil<NNNN>-ohbm<N>
+  (ceil zero-padded to 4 digits; ohbm always present, default ohbm0).
   Override it from the environment with rows separated by '||':
     RUNS='q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false || q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true'
 
@@ -636,9 +649,23 @@ qwen3_route_kernel_code() {
 }
 
 recompute_run_label() {
-  local recompute="$1" kernel_code="${2:-000}"
+  # asym_* run/config dirs ALWAYS carry the -ker<XYZ>-ceil<NNNN>-ohbm<N> tags (ker000 = no
+  # routed-kernel override, ceil0000 = no explicit per-run CPU activation budget, ohbm0 = all
+  # outer Unsloth checkpoint roots to CPU). ker is the EFFECTIVE kernel code; ceil is the -ceil<N>
+  # tag value zero-padded to 4 digits (a sweep-wide env budget stays ceil0000); ohbm is the
+  # effective UNSLOTH_GC_OUTER_HBM_EVERY_N. The -ohbm<N> tag is emitted for EVERY backend on the
+  # Unsloth-GC recompute modes (unsloth, unsloth-off, recomp-off-*): asym_* carries the full
+  # -ker<XYZ>-ceil<NNNN>-ohbm<N> triple; non-asym carries -ohbm<N> (plus -ker<XYZ> for full-fg,
+  # never -ceil, which is asym-NVMe-only). Non-GC modes (norecomp/recomp/torch/kt) carry no -ohbm.
+  local recompute="$1" kernel_code="${2:-000}" backend="${3:-}" ceil_gib="${4:-0}" outer_hbm="${5:-0}"
+  local ohbm_norm="$(( 10#${outer_hbm:-0} ))"
+  if [[ "${backend}" == asym* ]]; then
+    printf '%s-ker%s-ceil%04d-ohbm%s\n' "${recompute}" "${kernel_code:-000}" "$(( 10#${ceil_gib:-0} ))" "${ohbm_norm}"
+    return
+  fi
   case "${recompute}" in
-    recomp-off-full-fg) printf '%s-ker%s\n' "${recompute}" "${kernel_code}" ;;
+    recomp-off-full-fg) printf '%s-ker%s-ohbm%s\n' "${recompute}" "${kernel_code}" "${ohbm_norm}" ;;
+    unsloth|unsloth-off|recomp-off*) printf '%s-ohbm%s\n' "${recompute}" "${ohbm_norm}" ;;
     *) printf '%s\n' "${recompute}" ;;
   esac
 }
@@ -749,7 +776,16 @@ abs_path() {
 }
 
 safe_label() {
-  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]_-' '_' | sed -e 's/^[_-]*//' -e 's/[_-]*$//'
+  # NAME_MAX guard: dir labels grew past 255 bytes once asym_* labels always carry
+  # -ker<XYZ>-ceil<NNN> (e.g. the attnfa4 family). Deterministic truncate+hash keeps overlong
+  # labels unique AND reproducible, so cached-run lookups and the historical-dir renamer agree.
+  local s
+  s="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]_-' '_' | sed -e 's/^[_-]*//' -e 's/[_-]*$//')"
+  if (( ${#s} > 255 )); then
+    printf '%s_h%s' "${s:0:243}" "$(printf '%s' "${s}" | sha1sum | cut -c1-10)"
+    return
+  fi
+  printf '%s' "${s}"
 }
 
 lora_dropout_label() {
@@ -902,7 +938,7 @@ backend_gpu_count() {
   local backend="$1"
   local model_gpu_count="$2"
   case "${backend}" in
-    asym|asym_torch|asym_cpuadamwtorch|asym_cpuadamwds) printf '1\n' ;;
+    asym|asym_torch|asym_cpuadamwtorch|asym_cpuadamwds|asym_cpuadamwds_panvme|asym_cpuadamwds_actnvme|asym_cpuadamwds_bothnvme) printf '1\n' ;;
     torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_mem_nocpuadamw|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam|superoffload|superoffload_mem|superoffload_mem_nocpuadamw|superoffload_mem_opnvme|superoffload_mem_panvme) printf '%s\n' "${model_gpu_count}" ;;
     kt_torchbf16|kt_armbf16) printf '1\n' ;;
     *) die "internal backend label must be torch, asym, asym_torch, asym_cpuadamwtorch, asym_cpuadamwds, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_offload_mem_nocpuadamw, zero3_offload_opnvme, zero3_offload_panvme, zero3_offload_mem_opnvme, zero3_offload_mem_panvme, zero3_cpuadam, superoffload, superoffload_mem, superoffload_mem_nocpuadamw, superoffload_mem_opnvme, superoffload_mem_panvme, kt_torchbf16, or kt_armbf16, got '${backend}'" ;;
@@ -1007,6 +1043,31 @@ recompute_token_without_ohbm() {
   printf '%s\n' "${norm%-ohbm*}"
 }
 
+# -ceil<N> recompute suffix (after any -kerXYZ, before any trailing -ohbm<N>) -> per-run CPU
+# activation budget ASYM_NVME_ACT_CPU_BUDGET_BYTES = N GiB. Prints the normalized integer (no
+# leading zeros) or empty when the tag is absent. ceil000 == canonical "no explicit ceiling"
+# (fall back to the sweep-wide env / 'auto'); N > 0 requires an asym NVMe backend (validated in
+# append_backend_spec). Callers pass the already-ohbm-stripped token.
+recompute_ceil_gib() {
+  local norm="${1,,}"
+  norm="${norm//_/-}"
+  norm="${norm%-ohbm*}"
+  case "${norm}" in
+    *-ceil*)
+      local n="${norm##*-ceil}"
+      [[ "${n}" =~ ^[0-9]+$ ]] || die "expected -ceil<N> with a nonnegative integer N (GiB; after any -kerXYZ, before any -ohbm<N>), got '${1}'"
+      printf '%s\n' "$(( 10#${n} ))"
+      ;;
+    *) printf '\n' ;;
+  esac
+}
+
+recompute_token_without_ceil() {
+  local norm="${1,,}"
+  norm="${norm//_/-}"
+  printf '%s\n' "${norm%-ceil*}"
+}
+
 recompute_label() {
   local kernel_code
   kernel_code="$(recompute_kernel_code_label "$1")"
@@ -1056,7 +1117,7 @@ normalize_expert_policy() {
 cpuadam_backend_for_label() {
   case "${1}" in
     asym_cpuadamwtorch) printf 'torch\n' ;;
-    asym_cpuadamwds) printf 'deepspeed\n' ;;
+    asym_cpuadamwds|asym_cpuadamwds_panvme|asym_cpuadamwds_actnvme|asym_cpuadamwds_bothnvme) printf 'deepspeed\n' ;;
     *) return 1 ;;
   esac
 }
@@ -1072,6 +1133,7 @@ append_backend_spec() {
   local raw="$1"
   local backend_part recompute_part liger_loss_part backend recompute_token recompute_mode recompute_kernel_code liger_loss
   local recompute_token_base recompute_outer_hbm_every_n norm_kernel_code norm_outer_hbm
+  local recompute_act_ceil_gib norm_act_ceil
   local pipe_chars
   local -a recompute_tokens
 
@@ -1085,12 +1147,15 @@ append_backend_spec() {
       IFS='|' read -r backend_part recompute_part liger_loss_part <<< "${raw}"
       [[ -n "${liger_loss_part}" ]] || die "empty Liger-loss mode in backend spec '${raw}'"
       ;;
-    3|4)
-      # Already-normalized spec (backend|mode|liger|ker[|ohbm]) looping back
+    3|4|5)
+      # Already-normalized spec (backend|mode|liger|ker[|ohbm[|ceil]]) looping back
       # through the axis expansion; reassemble the recompute token and reparse.
-      IFS='|' read -r backend_part recompute_part liger_loss_part norm_kernel_code norm_outer_hbm <<< "${raw}"
+      IFS='|' read -r backend_part recompute_part liger_loss_part norm_kernel_code norm_outer_hbm norm_act_ceil <<< "${raw}"
       [[ -n "${liger_loss_part}" ]] || die "empty Liger-loss mode in backend spec '${raw}'"
       [[ -n "${norm_kernel_code}" ]] && recompute_part="${recompute_part}-ker${norm_kernel_code}"
+      if [[ -n "${norm_act_ceil:-}" && "${norm_act_ceil}" != "0" ]]; then
+        recompute_part="${recompute_part}-ceil${norm_act_ceil}"
+      fi
       if [[ -n "${norm_outer_hbm:-}" && "${norm_outer_hbm}" != "0" ]]; then
         recompute_part="${recompute_part}-ohbm${norm_outer_hbm}"
       fi
@@ -1108,6 +1173,9 @@ append_backend_spec() {
     asym_torch) backend=asym_torch ;;
     asym_cpuadamwtorch) backend=asym_cpuadamwtorch ;;
     asym_cpuadamwds) backend=asym_cpuadamwds ;;
+    asym_cpuadamwds_panvme) backend=asym_cpuadamwds_panvme ;;
+    asym_cpuadamwds_actnvme) backend=asym_cpuadamwds_actnvme ;;
+    asym_cpuadamwds_bothnvme) backend=asym_cpuadamwds_bothnvme ;;
     zero2) backend=zero2 ;;
     zero3) backend=zero3 ;;
     zero3_offload) backend=zero3_offload ;;
@@ -1138,6 +1206,26 @@ append_backend_spec() {
     fi
     recompute_outer_hbm_every_n="$(recompute_outer_hbm_n "${recompute_token}")"
     recompute_token_base="$(recompute_token_without_ohbm "${recompute_token}")"
+    recompute_act_ceil_gib="$(recompute_ceil_gib "${recompute_token_base}")"
+    recompute_token_base="$(recompute_token_without_ceil "${recompute_token_base}")"
+    if [[ "${recompute_act_ceil_gib}" == "0" ]]; then
+      recompute_act_ceil_gib=""            # ceil000 == canonical "no explicit ceiling" tag
+    fi
+    if [[ -n "${recompute_act_ceil_gib}" ]]; then
+      case "${backend}" in
+        asym_cpuadamwds_actnvme|asym_cpuadamwds_panvme|asym_cpuadamwds_bothnvme) ;;
+        *) die "-ceil<N> with N > 0 (per-run CPU activation budget, GiB) requires an asym NVMe backend (asym_cpuadamwds_actnvme/_panvme/_bothnvme); got backend='${backend_part}' recompute='${recompute_token}'" ;;
+      esac
+    fi
+    # -ker000 is the canonical "no routed-kernel override" tag on asym_* run dirs and must
+    # round-trip from dir names for ANY recompute mode; nonzero codes (and full-fg's explicit
+    # pin-to-000 form) still go through recompute_kernel_code_label.
+    if [[ "${backend}" == asym* && "${recompute_token_base}" == *-ker000 ]]; then
+      case "${recompute_token_base}" in
+        recomp-off-full-fg-ker000|recompoff-full-fg-ker000) ;;
+        *) recompute_token_base="${recompute_token_base%-ker000}" ;;
+      esac
+    fi
     recompute_mode="$(recompute_label "${recompute_token_base}")"
     recompute_kernel_code="$(recompute_kernel_code_label "${recompute_token_base}")"
     if (( recompute_outer_hbm_every_n > 0 )); then
@@ -1145,6 +1233,10 @@ append_backend_spec() {
         ! is_recomp_off_recompute "${recompute_mode}"; then
         die "-ohbm<N> requires an Unsloth-GC recompute mode (unsloth, unsloth-off, or recomp-off-*); got '${recompute_token}'"
       fi
+    fi
+    if [[ -n "${recompute_act_ceil_gib}" ]]; then
+      backend_specs_raw+=("${backend}|${recompute_mode}|${liger_loss}|${recompute_kernel_code}|${recompute_outer_hbm_every_n}|${recompute_act_ceil_gib}")
+    elif (( recompute_outer_hbm_every_n > 0 )); then
       backend_specs_raw+=("${backend}|${recompute_mode}|${liger_loss}|${recompute_kernel_code}|${recompute_outer_hbm_every_n}")
     elif [[ -n "${recompute_kernel_code}" ]]; then
       backend_specs_raw+=("${backend}|${recompute_mode}|${liger_loss}|${recompute_kernel_code}")
@@ -1443,7 +1535,7 @@ def require_int_config_any(keys, expected, label):
     raise SystemExit(f"profile {label} missing or invalid")
 require_int_config_any(("per_device_train_batch_size", "batch_size"), expected_batch, "batch_size")
 require_int_config_any(("gradient_accumulation_steps",), expected_grad_accum, "gradient_accumulation_steps")
-if expected_offload_modules and backend in {"asym", "asym_torch", "asym_cpuadamwtorch", "asym_cpuadamwds"}:
+if expected_offload_modules and backend in {"asym", "asym_torch", "asym_cpuadamwtorch", "asym_cpuadamwds", "asym_cpuadamwds_panvme", "asym_cpuadamwds_actnvme", "asym_cpuadamwds_bothnvme"}:
     def normalize_selector(value):
         return ",".join(
             sorted(
@@ -1572,7 +1664,7 @@ if expected_profile_sync:
             "profile profile_sync mismatch: "
             f"expected {wanted_profile_sync}, got {actual_profile_sync}"
         )
-if expected_grad_offload and backend in {"asym_cpuadamwtorch", "asym_cpuadamwds"}:
+if expected_grad_offload and backend in {"asym_cpuadamwtorch", "asym_cpuadamwds", "asym_cpuadamwds_panvme", "asym_cpuadamwds_actnvme", "asym_cpuadamwds_bothnvme"}:
     actual_grad_offload = normalize_bool(config.get("asym_cpu_adamw_grad_offload"))
     wanted_grad_offload = normalize_bool(expected_grad_offload)
     if not actual_grad_offload:
@@ -1900,7 +1992,6 @@ job_root_path() {
   local grad_offload="${8:-false}"
   local weight_offload="${9:-false}"
   local grad_offload_suffix=""
-  local outer_hbm_suffix=""
   local flash_attn_suffix=""
   if [[ "${flashattn_label:-attnauto}" != "attnauto" ]]; then
     flash_attn_suffix="__${flashattn_label}"
@@ -1909,10 +2000,9 @@ job_root_path() {
   if cpuadam_backend_for_label "${backend}" >/dev/null; then
     grad_offload_suffix="__gradoff${grad_offload}__weightoff${weight_offload}"
   fi
-  if [[ "${UNSLOTH_GC_OUTER_HBM_EVERY_N:-0}" != "0" ]]; then
-    outer_hbm_suffix="__ohbm${UNSLOTH_GC_OUTER_HBM_EVERY_N}"
-  fi
-  path_label="${path_label}__${expact_lora_a_fwd_label}__${actrecomp_label}__${xunpack_label}__${moefg_label}__${dscatter_label}__${q3rt_label}__${liger_loss}${grad_offload_suffix}${outer_hbm_suffix}"
+  # -ohbm<N> is folded into the recompute label (${recompute}) itself, so it is no longer
+  # appended as a separate __ohbm<N> path component.
+  path_label="${path_label}__${expact_lora_a_fwd_label}__${actrecomp_label}__${xunpack_label}__${moefg_label}__${dscatter_label}__${q3rt_label}__${liger_loss}${grad_offload_suffix}"
   printf '%s/%s\n' "${config_root}" "$(safe_label "${path_label}")"
 }
 
@@ -2631,14 +2721,14 @@ selected_has_superoffload=false
 selected_has_non_asym=false
 for backend in "${backends[@]}"; do
   case "${backend}" in
-    asym|asym_torch|asym_cpuadamwtorch|asym_cpuadamwds) selected_has_asym=true ;;
+    asym|asym_torch|asym_cpuadamwtorch|asym_cpuadamwds|asym_cpuadamwds_panvme|asym_cpuadamwds_actnvme|asym_cpuadamwds_bothnvme) selected_has_asym=true ;;
     zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_mem_nocpuadamw|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam) selected_has_zero=true ;;
     superoffload|superoffload_mem|superoffload_mem_opnvme|superoffload_mem_panvme) selected_has_zero=true; selected_has_superoffload=true ;;
     superoffload_mem_nocpuadamw) selected_has_zero=true ;;
     kt_*) selected_has_kt=true ;;
   esac
   case "${backend}" in
-    asym|asym_torch|asym_cpuadamwtorch|asym_cpuadamwds) ;;
+    asym|asym_torch|asym_cpuadamwtorch|asym_cpuadamwds|asym_cpuadamwds_panvme|asym_cpuadamwds_actnvme|asym_cpuadamwds_bothnvme) ;;
     *) selected_has_non_asym=true ;;
   esac
 done
@@ -3089,6 +3179,7 @@ run_job() {
   local weight_offload="${13:-false}"
   local requested_recompute_kernel_code="${14:-}"
   local requested_outer_hbm_every_n="${15:-0}"
+  local requested_act_ceil_gib="${16:-}"
   # Canonicalize the policy axes for inert runs; local shadows feed run_id, the folder, the env, and the check.
   local expact_label="${expact_label}" attnact_label="${attnact_label}" layeract_label="${layeract_label}" layergc_label="${layergc_label}" sdparecomp_label="${sdparecomp_label}" expact_lora_a_fwd_label="${expact_lora_a_fwd_label}" actrecomp_label="${actrecomp_label}" xunpack_label="${xunpack_label}" moefg_label="${moefg_label}" dscatter_label="${dscatter_label}" q3rt_label="${q3rt_label}"
   local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_LAYER_GC="${ASYMM_LAYER_GC}" ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
@@ -3118,6 +3209,15 @@ run_job() {
     unsloth|unsloth-off) ;;
     *) is_recomp_off_recompute "${recompute}" || UNSLOTH_GC_OUTER_HBM_EVERY_N=0 ;;
   esac
+  # Per-run -ceil<N> (GiB) wins over the sweep-wide ASYM_NVME_ACT_CPU_BUDGET_BYTES env; the
+  # dynamic scope feeds the asym_* run/dir labels and the launch env. ceil000 / no tag = no
+  # explicit ceiling (keep the env value or 'auto'); the label's ceil<NNN> reflects the tag
+  # only, never the env.
+  local ASYM_NVME_ACT_CPU_BUDGET_BYTES="${ASYM_NVME_ACT_CPU_BUDGET_BYTES-}"
+  local job_act_ceil_gib="${requested_act_ceil_gib:-0}"
+  if [[ -n "${requested_act_ceil_gib}" ]]; then
+    ASYM_NVME_ACT_CPU_BUDGET_BYTES="$(( 10#${requested_act_ceil_gib} * 1024 * 1024 * 1024 ))"
+  fi
   local job_lf_dir="${CURRENT_LF_DIR:-${LF_DIR}}"
   local job_env_dir="${CURRENT_ENV_DIR:-${ENV_DIR}}"
   local job_flash_attn="${CURRENT_FLASH_ATTN:-${FLASH_ATTN}}"
@@ -3234,14 +3334,11 @@ run_job() {
   q3rt_label="$(qwen3_route_tag "${q3rt_fwd_flag}" "${q3rt_gather_flag}" "${q3rt_dx_flag}" "${q3rt_lora_flag}" "${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE}")"
   q3rt_kernel_code="$(qwen3_route_kernel_code "${q3rt_fwd_flag}" "${q3rt_gather_flag}" "${q3rt_dx_flag}")"
   validate_recompute_kernel_for_model "${current_model_name}" "${q3rt_kernel_code}" "${q3rt_lora_flag}"
-  recompute_artifact_label="$(recompute_run_label "${recompute}" "${q3rt_kernel_code}")"
-  # Full recompute token for per-run plot filters (matches the plotters'
-  # folded metadata axis, e.g. recomp-off-full-fg-ker101-ohbm6); base tokens
-  # would drop ker/ohbm runs from their own per-run plots.
+  recompute_artifact_label="$(recompute_run_label "${recompute}" "${q3rt_kernel_code}" "${backend}" "${job_act_ceil_gib}" "${UNSLOTH_GC_OUTER_HBM_EVERY_N}")"
+  # Full recompute token for per-run plot filters. The artifact label now carries the -ohbm<N>
+  # tag inline (asym_* always; non-asym GC modes when N>0), so it already matches the plotters'
+  # folded metadata axis (e.g. recomp-off-full-fg-ker101-ceil0000-ohbm0).
   recompute_plot_filter="${recompute_artifact_label}"
-  if [[ "${UNSLOTH_GC_OUTER_HBM_EVERY_N:-0}" != "0" ]]; then
-    recompute_plot_filter="${recompute_plot_filter}-ohbm${UNSLOTH_GC_OUTER_HBM_EVERY_N}"
-  fi
   if qwen3_route_any_enabled "${q3rt_fwd_flag}" "${q3rt_gather_flag}" "${q3rt_dx_flag}" "${q3rt_lora_flag}"; then
     [[ "${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE,,}" == "fp32" ]] || die "Qwen3 routed kernels currently require ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE=fp32, got '${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE}'"
     [[ "${backend}" == asym* ]] || die "Qwen3 routed kernels are only valid for asym* backends, got backend='${backend}'"
@@ -3597,6 +3694,25 @@ run_job() {
     LOG_FILE="${log_file}"
     RUN_ID="${run_id}"
   )
+  # --- asym NVMe store role plumbing (opt-in; empty roles => store stays None, rule 7) ---
+  local job_nvme_roles=""
+  case "${backend}" in
+    asym_cpuadamwds_panvme)   job_nvme_roles="base_weight" ;;
+    asym_cpuadamwds_actnvme)  job_nvme_roles="activation" ;;
+    asym_cpuadamwds_bothnvme) job_nvme_roles="base_weight,activation" ;;
+  esac
+  if [[ -n "${job_nvme_roles}" ]]; then
+    run_env+=(
+      ASYM_NVME_ROLES="${job_nvme_roles}"
+      ASYM_NVME_PATH="${ASYM_NVME_PATH:-/scratch_local/asym_nvme}"
+      ASYM_NVME_SYNC="${ASYM_NVME_SYNC:-1}"
+      ASYM_NVME_ACT_CPU_BUDGET_BYTES="${ASYM_NVME_ACT_CPU_BUDGET_BYTES:-auto}"
+      ASYM_GEMM_LF_CONFIG_ASYM_NVME_ROLES="${job_nvme_roles}"
+      ASYM_GEMM_LF_CONFIG_ASYM_NVME_PATH="${ASYM_NVME_PATH:-/scratch_local/asym_nvme}"
+      ASYM_GEMM_LF_CONFIG_ASYM_NVME_SYNC="${ASYM_NVME_SYNC:-1}"
+      ASYM_GEMM_LF_CONFIG_ASYM_NVME_ACT_CPU_BUDGET_BYTES="${ASYM_NVME_ACT_CPU_BUDGET_BYTES:-auto}"
+    )
+  fi
   if [[ "${backend}" == kt_* ]]; then
     local kt_num_threads_for_job="${KT_NUM_THREADS}"
     if [[ "${backend}" == "kt_armbf16" && -z "${kt_num_threads_for_job}" ]]; then
@@ -4268,9 +4384,10 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
         layergc_label="$(layergc_tag "${ASYMM_LAYER_GC}")"
         sdparecomp_label="$(sdparecomp_tag "${ASYMM_ATTN_SDPA_RECOMPUTE}")"
 
-        IFS='|' read -r backend recompute liger_loss recompute_kernel_code recompute_outer_hbm_n backend_spec_extra <<< "${backend_recompute}"
+        IFS='|' read -r backend recompute liger_loss recompute_kernel_code recompute_outer_hbm_n recompute_act_ceil_gib backend_spec_extra <<< "${backend_recompute}"
         [[ -n "${backend}" && -n "${recompute}" && -n "${liger_loss}" && -z "${backend_spec_extra:-}" ]] || die "internal error: malformed normalized backend spec '${backend_recompute}'"
         recompute_outer_hbm_n="${recompute_outer_hbm_n:-0}"
+        recompute_act_ceil_gib="${recompute_act_ceil_gib:-}"
         if { is_policy_independent_backend "${backend}" || [[ "${recompute}" == "recomp" ]]; } && [[ "${exp_act_policy_pair}" != "${exp_act_policy_pairs[0]}" ]]; then
           if [[ "${expert_policy}" != "off-layer" && "${ASYMM_EXPERT_ACT_OFFLOAD}" != "true" && "${ASYMM_ATTN_ACT_OFFLOAD}" != "true" && "${ASYMM_LAYER_GC}" != "true" ]]; then
             echo "Skipping backend=${backend} recompute=${recompute} policy=${exp_act_policy_pair}; inert policy axes run once (canonicalized to none|false|false|false|false|false)."
@@ -4294,7 +4411,7 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
               continue
             fi
             job_router_mode="${router_mode}"
-            if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" && "${backend}" != "asym_cpuadamwtorch" && "${backend}" != "asym_cpuadamwds" ]]; then
+            if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" && "${backend}" != "asym_cpuadamwtorch" && "${backend}" != "asym_cpuadamwds" && "${backend}" != "asym_cpuadamwds_panvme" && "${backend}" != "asym_cpuadamwds_actnvme" && "${backend}" != "asym_cpuadamwds_bothnvme" ]]; then
               if [[ "${router_hf_selected}" != "true" ]]; then
                 job_router_mode=hf
               else
@@ -4321,7 +4438,7 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
                 if [[ "${weight_offload}" == "true" && "${grad_offload}" != "true" ]]; then
                   die "internal error: weight offload requires grad offload"
                 fi
-                if ! run_job "${backend}" "${profiler}" "${recompute}" "${liger_loss}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}" "${lf_expert_lora_impl}" "${grad_offload}" "${weight_offload}" "${recompute_kernel_code:-}" "${recompute_outer_hbm_n:-0}"; then
+                if ! run_job "${backend}" "${profiler}" "${recompute}" "${liger_loss}" "${seq_len}" "${gpu}" "${gpu_count}" "${expert_policy}" "${job_router_mode}" "${current_dataset}" "${lf_expert_lora_impl}" "${grad_offload}" "${weight_offload}" "${recompute_kernel_code:-}" "${recompute_outer_hbm_n:-0}" "${recompute_act_ceil_gib:-}"; then
                   failures=$((failures + 1))
                   if [[ "${CONTINUE_ON_ERROR}" != "true" ]]; then
                     exit 1
