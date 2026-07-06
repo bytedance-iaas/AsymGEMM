@@ -12,13 +12,32 @@ KT_DIR=${KT_DIR:-${SFT_ROOT}/third_party/ktransformers}
 DEEPSPEED_DIR=${DEEPSPEED_DIR:-${SFT_ROOT}/third_party/deepspeed}
 LIGER_DIR=${LIGER_DIR:-${SFT_ROOT}/third_party/Liger-Kernel}
 ENV_DIR=${ENV_DIR:-${ASYMGEMM_DIR}/.venv}
-PYTHON_BIN=${PYTHON_BIN:-python3}
+# Pinned interpreter: Python 3.12.3 is the only allowed/validated version for this env.
+REQUIRED_PYTHON_VERSION=${REQUIRED_PYTHON_VERSION:-3.12.3}
+if [[ -z "${PYTHON_BIN+x}" ]]; then
+  if command -v python3.12 >/dev/null 2>&1; then
+    PYTHON_BIN=python3.12
+  else
+    PYTHON_BIN=python3
+  fi
+fi
+
+_py_ver="$("${PYTHON_BIN}" -c 'import platform; print(platform.python_version())' 2>/dev/null || true)"
+if [[ "${_py_ver}" != "${REQUIRED_PYTHON_VERSION}" ]]; then
+  echo "ERROR: this environment requires Python ${REQUIRED_PYTHON_VERSION}, but PYTHON_BIN=${PYTHON_BIN} reports '${_py_ver:-not found}'." >&2
+  echo "       Install Python ${REQUIRED_PYTHON_VERSION} (or set PYTHON_BIN to a ${REQUIRED_PYTHON_VERSION} interpreter) and re-run." >&2
+  exit 1
+fi
 
 RECREATE_ENV=${RECREATE_ENV:-0}
 INSTALL_LF=${INSTALL_LF:-1}
 INSTALL_KT=${INSTALL_KT:-1}
 INSTALL_DEEPSPEED=${INSTALL_DEEPSPEED:-1}
-INSTALL_ASYMGEMM=${INSTALL_ASYMGEMM:-0}
+# asym_gemm is imported unconditionally by run_lf_profiled_train.py (the profiling
+# entrypoint that runs against this .venv), and asym_gemm/__init__.py resolves its
+# version via importlib.metadata, which requires the package to be pip-installed
+# (importable-from-source is not enough). Install it by default; set =0 to skip.
+INSTALL_ASYMGEMM=${INSTALL_ASYMGEMM:-1}
 INSTALL_KT_KERNEL=${INSTALL_KT_KERNEL:-0}
 INSTALL_LIGER=${INSTALL_LIGER:-1}
 INSTALL_FLA=${INSTALL_FLA:-1}
@@ -130,6 +149,7 @@ fi
 INSTALL_LF="${INSTALL_LF}" INSTALL_DEEPSPEED="${INSTALL_DEEPSPEED}" \
 INSTALL_LIGER="${INSTALL_LIGER}" INSTALL_FLA="${INSTALL_FLA}" \
 INSTALL_CAUSAL_CONV1D="${INSTALL_CAUSAL_CONV1D}" \
+INSTALL_ASYMGEMM="${INSTALL_ASYMGEMM}" \
 python - <<'PY'
 import os
 import sys
@@ -154,6 +174,9 @@ for label, mod, flag in [
     ("liger_kernel", "liger_kernel", "INSTALL_LIGER"),
     ("flash-linear-attention", "fla", "INSTALL_FLA"),
     ("causal_conv1d", "causal_conv1d", "INSTALL_CAUSAL_CONV1D"),
+    # asym_gemm: importing it triggers importlib.metadata.version('asym_gemm'),
+    # so this fails at bootstrap if the package was not actually pip-installed.
+    ("asym_gemm", "asym_gemm", "INSTALL_ASYMGEMM"),
 ]:
     required = os.environ.get(flag, "0") == "1"
     try:
