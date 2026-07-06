@@ -6,20 +6,31 @@ set -Eeuo pipefail
 
 SFT_ROOT=${SFT_ROOT:-$(cd ../.. && pwd)}
 ASYMGEMM_DIR=${ASYMGEMM_DIR:-${SFT_ROOT}/third_party/AsymGEMM}
-LF_DIR=${LF_DIR:-${SFT_ROOT}/third_party/LlamaFactory-fa4}
+# FA4 support was ported into canonical LlamaFactory; the separate LlamaFactory-fa4
+# fork is retired. This env (.venv-fa4) is still distinct — it adds flash-attn-4,
+# cutlass-dsl, and the pinned transformers — but it builds from the same LlamaFactory.
+LF_DIR=${LF_DIR:-${SFT_ROOT}/third_party/LlamaFactory}
 KT_DIR=${KT_DIR:-${SFT_ROOT}/third_party/ktransformers}
 DEEPSPEED_DIR=${DEEPSPEED_DIR:-${SFT_ROOT}/third_party/deepspeed}
 LIGER_DIR=${LIGER_DIR:-${SFT_ROOT}/third_party/Liger-Kernel}
 ENV_DIR=${ENV_DIR:-${ASYMGEMM_DIR}/.venv-fa4}
 
+# Pinned interpreter: Python 3.12.3 is the only allowed/validated version for this env.
+REQUIRED_PYTHON_VERSION=${REQUIRED_PYTHON_VERSION:-3.12.3}
+
 if [[ -z "${PYTHON_BIN+x}" ]]; then
-  if [[ -x "${LF_DIR}/.conda-lf-fa4/bin/python" ]]; then
-    PYTHON_BIN="${LF_DIR}/.conda-lf-fa4/bin/python"
-  elif command -v python3.11 >/dev/null 2>&1; then
-    PYTHON_BIN=python3.11
+  if command -v python3.12 >/dev/null 2>&1; then
+    PYTHON_BIN=python3.12
   else
     PYTHON_BIN=python3
   fi
+fi
+
+_py_ver="$("${PYTHON_BIN}" -c 'import platform; print(platform.python_version())' 2>/dev/null || true)"
+if [[ "${_py_ver}" != "${REQUIRED_PYTHON_VERSION}" ]]; then
+  echo "ERROR: this environment requires Python ${REQUIRED_PYTHON_VERSION}, but PYTHON_BIN=${PYTHON_BIN} reports '${_py_ver:-not found}'." >&2
+  echo "       Install Python ${REQUIRED_PYTHON_VERSION} (or set PYTHON_BIN to a ${REQUIRED_PYTHON_VERSION} interpreter) and re-run." >&2
+  exit 1
 fi
 
 RECREATE_ENV=${RECREATE_ENV:-0}
@@ -40,7 +51,7 @@ INSTALL_KT_KERNEL=${INSTALL_KT_KERNEL:-0}
 # (*opnvme/*panvme backends) needs. Idempotent; set SETUP_AIO=0 to skip.
 SETUP_AIO=${SETUP_AIO:-1}
 
-# Pinned to the locally validated LlamaFactory-fa4 environment.
+# Pinned to the locally validated FA4 (.venv-fa4) environment.
 TORCH_VERSION=${TORCH_VERSION:-2.12.0+cu130}
 TORCHVISION_VERSION=${TORCHVISION_VERSION:-0.27.0}
 TORCHAUDIO_VERSION=${TORCHAUDIO_VERSION:-2.11.0}
@@ -55,7 +66,7 @@ TORCH_INDEX_URL=${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu130}
 TORCH_INSTALL_CMD=${TORCH_INSTALL_CMD:-}
 
 if [[ ! -d "${LF_DIR}" ]]; then
-  echo "Missing FA4 LlamaFactory checkout: ${LF_DIR}" >&2
+  echo "Missing LlamaFactory checkout: ${LF_DIR}" >&2
   exit 2
 fi
 
@@ -140,12 +151,20 @@ if [[ "${INSTALL_CAUSAL_CONV1D}" == "1" ]]; then
     python -m pip install --no-build-isolation "causal_conv1d==${CAUSAL_CONV1D_VERSION}"
 fi
 
-if [[ -f "${LF_DIR}/fa4_probes/patch_transformers_fa4.py" ]]; then
-  python "${LF_DIR}/fa4_probes/patch_transformers_fa4.py"
+# Patch the Transformers FA4 wrapper for the s_aux=None case. The patch lives in
+# this repo next to this script (the retired LlamaFactory-fa4 fork used to host it
+# under ${LF_DIR}/fa4_probes/). The .venv-fa4 verify below hard-requires the guard,
+# so this step is mandatory — fail loudly rather than silently skipping.
+FA4_PATCH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fa4_probes/patch_transformers_fa4.py"
+if [[ ! -f "${FA4_PATCH}" ]]; then
+  echo "ERROR: missing FA4 transformers patch at ${FA4_PATCH}" >&2
+  exit 1
 fi
+python "${FA4_PATCH}"
 
 INSTALL_LF="${INSTALL_LF}" INSTALL_FLA="${INSTALL_FLA}" \
 INSTALL_CAUSAL_CONV1D="${INSTALL_CAUSAL_CONV1D}" \
+INSTALL_ASYMGEMM="${INSTALL_ASYMGEMM}" \
 python - <<'PY'
 import importlib.metadata as md
 import inspect
@@ -211,6 +230,15 @@ except Exception as exc:
     print("causal_conv1d import failed [%s]:" % ("REQUIRED" if required else "optional/not-requested"), repr(exc))
     if required:
         failures.append("causal_conv1d")
+
+try:
+    import asym_gemm
+    print("asym_gemm", getattr(asym_gemm, "__version__", "unknown"))
+except Exception as exc:
+    required = os.environ.get("INSTALL_ASYMGEMM", "0") == "1"
+    print("asym_gemm import failed [%s]:" % ("REQUIRED" if required else "optional/not-requested"), repr(exc))
+    if required:
+        failures.append("asym_gemm")
 
 if failures:
     print("ERROR: requested packages failed to import:", ", ".join(failures), file=sys.stderr)
