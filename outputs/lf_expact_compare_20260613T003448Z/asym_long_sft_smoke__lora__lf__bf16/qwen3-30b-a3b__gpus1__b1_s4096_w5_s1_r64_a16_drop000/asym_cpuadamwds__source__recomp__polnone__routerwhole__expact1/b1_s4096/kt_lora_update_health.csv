@@ -1,2 +1,0 @@
-available,passed,reason,sampled_tensors,total_fused_tensors,after_sampled_tensors,after_total_fused_tensors,exhaustive,exhaustive_elements,requested_max_tensors,requested_max_elements,compared_tensors,missing_after_tensors,unexpected_after_tensors,grad_nonzero_tensors,updated_grad_tensors,grad_nonzero_unchanged_tensors,changed_tensors,input_passed,input_reason
-False,False,KT fused LoRA update health unavailable,,,,,False,False,,,,,,,0,0,,False,before unavailable: KT wrappers unavailable; after unavailable: KT wrappers unavailable

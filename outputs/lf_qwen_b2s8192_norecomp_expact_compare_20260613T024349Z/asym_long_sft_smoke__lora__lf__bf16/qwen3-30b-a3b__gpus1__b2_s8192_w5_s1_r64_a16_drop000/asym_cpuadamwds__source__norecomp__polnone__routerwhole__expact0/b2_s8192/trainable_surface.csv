@@ -1,2 +1,0 @@
-available,surface,comparison_note,trainable_parameters,trainable_parameters_source,peft_lora_parameters,non_expert_peft_lora_parameters,expert_lora_parameters,peft_expert_lora_parameters,lf_fused_expert_lora_parameters,kt_expert_lora_parameters,kt_peft_expert_lora_parameters,kt_fused_expert_lora_parameters
-True,attention+expert LoRA,requires a baseline that also trains expert LoRA,3375366144,structured_lora,3375366144,53477376,3321888768,3321888768,0,0,0,0

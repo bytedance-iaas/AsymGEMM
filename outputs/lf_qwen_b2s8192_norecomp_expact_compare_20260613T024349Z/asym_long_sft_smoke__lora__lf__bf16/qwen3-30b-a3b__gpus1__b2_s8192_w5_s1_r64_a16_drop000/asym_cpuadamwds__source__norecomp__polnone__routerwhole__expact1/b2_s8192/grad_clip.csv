@@ -1,2 +1,0 @@
-available,elapsed_ms,enabled,global_step,method,operation,path,result_norm,timestamp,trainer_class
-True,34.026955952867866,False,5,CustomSeq2SeqTrainer._get_grad_norm,norm,default,817889280.0,2026-06-13T02:53:28Z,CustomSeq2SeqTrainer
