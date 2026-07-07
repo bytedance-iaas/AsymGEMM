@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# Build and run the vendored cpu_gemm test suite. Maintainer use — confirms
-# the third-party/cpu_gemm snapshot is healthy after sync_cpu_gemm.sh.
+# Build and run the cpu_gemm test suite (csrc_cpu/cpu_gemm).
 #
 # Independent of the asym_gemm pip install: invokes cpu_gemm's own CMake.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-SRC="$ROOT/third-party/cpu_gemm"
+SRC="$ROOT/csrc_cpu/cpu_gemm"
 BLD="$ROOT/build/cpu_gemm_tests"
 
 if [[ ! -d "$SRC" ]]; then
-  echo "[FATAL] Vendored cpu_gemm not found at: $SRC" >&2
+  echo "[FATAL] cpu_gemm sources not found at: $SRC" >&2
   exit 1
 fi
 
