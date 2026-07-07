@@ -916,23 +916,6 @@ static void register_apis(pybind11::module_& m) {
 #endif
 
 #if DG_TENSORMAP_COMPATIBLE
-    // SM90 (Hopper / H20) INT8 asymmetric grouped GEMM (native S8 WGMMA, FP32 output)
-    m.def("m_grouped_int8_asym_gemm_sm90_masked",
-          static_cast<void(*)(const torch::Tensor&, const torch::Tensor&,
-                              const torch::Tensor&, const torch::Tensor&,
-                              const int&, const torch::Tensor&, const torch::Tensor&)>(
-              &m_grouped_int8_asym_gemm_sm90_masked),
-          py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("masked_m"), py::arg("expected_m"),
-          py::arg("sfa"), py::arg("sfb"));
-    m.def("m_grouped_int8_asym_gemm_sm90_contiguous",
-          static_cast<void(*)(const torch::Tensor&, const torch::Tensor&,
-                              const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
-                              const int&, const torch::Tensor&, const torch::Tensor&)>(
-              &m_grouped_int8_asym_gemm_sm90_contiguous),
-          py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
-          py::arg("sfa"), py::arg("sfb"));
     // Architecture-agnostic INT8 asym GEMM (routes to SM90/H20 today)
     m.def("m_grouped_int8_asym_gemm_nt_contiguous",
           static_cast<void(*)(const std::pair<torch::Tensor, torch::Tensor>&,
