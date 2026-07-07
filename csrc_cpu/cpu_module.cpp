@@ -427,9 +427,13 @@ bool moe_compute_core(
     if (cg_gemm(srt, &d) != CG_OK) { ok.store(false); return; }
   };
 
-  // Run one phase over both pools concurrently: pool A chews its node's
-  // items on this thread while a helper thread drives pool B (each pool's
-  // workers are affinity-bound to their node and read node-local weights).
+  // Run one phase over both pools concurrently: pool B's job is published
+  // asynchronously (its node-bound workers run it alone) while this thread
+  // participates in pool A's job, then joins B. No helper std::thread — a
+  // pthread_create+join pair per phase costs ~50-100us, which at decode
+  // (m_e = 1, ~50us of actual GEMM work) dominated the whole phase; the
+  // transient thread was also unbound, so its share of pool B's tasks read
+  // node-B weights from the wrong socket.
   auto run_phase = [&](int tiles, auto&& body) {
     if (!tp || items_b.empty()) {
       const std::vector<int>& it = items_a.empty() ? items_b : items_a;
@@ -444,15 +448,15 @@ bool moe_compute_core(
       });
       return;
     }
-    std::thread tb([&] {
-      rt.rt_b->pool->parallel_for((int)items_b.size() * tiles, [&](int task) {
-        body(items_b[task / tiles], task % tiles);
-      });
-    });
+    // Named object: submit() stores a pointer to it until wait_done().
+    std::function<void(int)> body_b = [&](int task) {
+      body(items_b[task / tiles], task % tiles);
+    };
+    rt.rt_b->pool->submit((int)items_b.size() * tiles, body_b);
     rt.rt->pool->parallel_for((int)items_a.size() * tiles, [&](int task) {
       body(items_a[task / tiles], task % tiles);
     });
-    tb.join();
+    rt.rt_b->pool->wait_done();
   };
 
   run_phase(t1, phase1);
