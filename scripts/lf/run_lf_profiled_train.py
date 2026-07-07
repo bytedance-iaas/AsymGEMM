@@ -152,6 +152,42 @@ def _process_memory_value(snapshot: dict[str, Any], key: str) -> int:
     return int(value) if isinstance(value, (int, float)) else 0
 
 
+def _write_rank_memstats(out_dir: Path) -> None:
+    # Multi-rank visibility (gb200_dp.md G-D0.2/G-D0.3): profile.json is rank0-only, so every
+    # rank writes its own rank<R>_memstats.json with per-device HBM peaks + process RSS.
+    rank_raw = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+    try:
+        rank = int(rank_raw)
+    except ValueError:
+        rank = 0
+    record: dict[str, Any] = {
+        "rank": rank,
+        "local_rank": _safe_int(os.environ.get("LOCAL_RANK", "0")),
+        "world_size": _safe_int(os.environ.get("WORLD_SIZE", "1")),
+        "pid": os.getpid(),
+        "timestamp": _utc_timestamp(),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "process_memory": _process_memory_snapshot(),
+        "devices": [],
+    }
+    try:
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            current = int(torch.cuda.current_device())
+            record["current_device"] = current
+            record["current_device_name"] = torch.cuda.get_device_name(current)
+            for device_index in range(torch.cuda.device_count()):
+                record["devices"].append(
+                    {
+                        "index": device_index,
+                        "peak_allocated_hbm_bytes": int(torch.cuda.max_memory_allocated(device_index)),
+                        "peak_reserved_hbm_bytes": int(torch.cuda.max_memory_reserved(device_index)),
+                    }
+                )
+    except Exception as exc:
+        record["devices_error"] = repr(exc)
+    _atomic_write_json(out_dir / f"rank{rank}_memstats.json", record)
+
+
 class LFHeartbeat:
     def __init__(self, path: str | None, config: dict[str, Any]):
         self.path = Path(path) if path and _is_rank0() else None
@@ -1293,6 +1329,42 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
     except Exception:
         return
 
+    if os.environ.get("ASYM_STP") == "1" and not getattr(Trainer.__init__, "_asym_stp_ngpu_patch", False):
+        # sTP is single-process model-parallel over 2 visible GPUs: HF Trainer must neither
+        # DataParallel-wrap the surgered model nor double _train_batch_size. _setup_devices is a
+        # cached_property, so force it FIRST, then pin _n_gpu=1 BEFORE __init__ freezes
+        # _train_batch_size (gb200_tp.md I0 step 4).
+        _orig_trainer_init = Trainer.__init__
+
+        def _stp_trainer_init(self: Any, *args: Any, **kwargs: Any) -> None:
+            training_args = kwargs.get("args") or (args[1] if len(args) > 1 else None)
+            if training_args is not None:
+                _ = training_args.n_gpu  # materialize cached _setup_devices (sets _n_gpu=2)
+                training_args._n_gpu = 1  # sticks; Trainer.__init__ then reads n_gpu==1
+            _orig_trainer_init(self, *args, **kwargs)
+            if training_args is not None:
+                expected = training_args.per_device_train_batch_size
+                actual = getattr(self, "_train_batch_size", None)
+                if actual != expected:
+                    raise RuntimeError(
+                        f"ASYM_STP: _train_batch_size={actual} != per_device_train_batch_size={expected};"
+                        " the n_gpu patch ran too late"
+                    )
+
+        _stp_trainer_init._asym_stp_ngpu_patch = True  # type: ignore[attr-defined]
+        Trainer.__init__ = _stp_trainer_init
+
+        _orig_wrap_model = Trainer._wrap_model
+
+        def _stp_wrap_model(self: Any, model: Any, *args: Any, **kwargs: Any) -> Any:
+            wrapped = _orig_wrap_model(self, model, *args, **kwargs)
+            if isinstance(wrapped, torch.nn.DataParallel):
+                raise RuntimeError("ASYM_STP: nn.DataParallel wrap leaked through the n_gpu patch")
+            return wrapped
+
+        _stp_wrap_model._asym_stp_ngpu_patch = True  # type: ignore[attr-defined]
+        Trainer._wrap_model = _stp_wrap_model
+
     def _result_to_float(result: Any) -> Any:
         if hasattr(result, "item"):
             try:
@@ -1373,11 +1445,95 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
         wrapped_grad_norm_method._asym_gemm_heartbeat = True  # type: ignore[attr-defined]
         setattr(owner, method_name, wrapped_grad_norm_method)
 
+    grad_dump_dir = os.environ.get("ASYM_DUMP_ADAPTER_GRADS", "")
+    stp_full_tp = os.environ.get("ASYM_STP") == "1" and os.environ.get("ASYM_STP_PHASE_A") != "1"
+    if (grad_dump_dir or stp_full_tp) and not getattr(Trainer.training_step, "_asym_grad_dump", False):
+        # Order matters: (1) sTP mirror-grad merge (dA = dA0 + to0(dA1)) so clip/optimizer
+        # and any dump see the TRUE logical grads; (2) G-D2.1 / I4 parity dump at optimizer
+        # step N (default 2 — step 1 is vacuous for dA: PEFT B=0 at init). Runs AFTER
+        # training_step returns (backward done, DDP reduce finalized), BEFORE clip/step.
+        # state.global_step == N-1 here.
+        grad_dump_step = int(os.environ.get("ASYM_DUMP_ADAPTER_GRADS_STEP", "2"))
+        _orig_training_step = Trainer.training_step
+
+        def _grad_dump_training_step(self: Any, *args: Any, **kwargs: Any) -> Any:
+            result = _orig_training_step(self, *args, **kwargs)
+            if stp_full_tp:
+                try:
+                    from asym_gemm.training.stp_wrap import (
+                        stp_post_backward_merge,
+                        stp_register_optimizer_resync,
+                    )
+
+                    inner_model = getattr(self, "model", None)
+                    if inner_model is not None:
+                        stp_post_backward_merge(inner_model)
+                        optimizer = getattr(self, "optimizer", None)
+                        if optimizer is not None:
+                            stp_register_optimizer_resync(inner_model, optimizer)
+                except Exception as exc:
+                    heartbeat.emit("stp_mirror_merge_failed", error=repr(exc))
+                    raise
+            if not grad_dump_dir:
+                return result
+            try:
+                step_now = int(getattr(self.state, "global_step", -1))
+                if step_now == grad_dump_step - 1 and not getattr(self, "_asym_grads_dumped", False):
+                    self._asym_grads_dumped = True
+                    rank = os.environ.get("RANK", "0")
+                    grads = {}
+                    model = getattr(self, "model", None)
+                    if model is not None:
+                        for param_name, param in model.named_parameters():
+                            if param.requires_grad and param.grad is not None:
+                                grads[param_name] = param.grad.detach().float().cpu()
+                    out_dir = Path(grad_dump_dir)
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    torch.save(
+                        {"step": grad_dump_step, "loss": float(result) if result is not None else None,
+                         "grads": grads,
+                         "stp_param_map": getattr(model, "_asym_stp_param_map", None)},
+                        out_dir / f"adapter_grads_step{grad_dump_step}_rank{rank}.pt",
+                    )
+                    heartbeat.emit("adapter_grads_dumped", step=grad_dump_step, count=len(grads))
+            except Exception as exc:
+                heartbeat.emit("adapter_grads_dump_failed", error=repr(exc))
+            return result
+
+        _grad_dump_training_step._asym_grad_dump = True  # type: ignore[attr-defined]
+        Trainer.training_step = _grad_dump_training_step
+
     if not getattr(Trainer.train, "_asym_gemm_heartbeat", False):
         original_train = Trainer.train
 
         def wrapped_train(self: Any, *args: Any, **kwargs: Any) -> Any:
-            heartbeat.emit("trainer_start", trainer_class=self.__class__.__name__)
+            init_dump_path = os.environ.get("ASYM_DUMP_ADAPTER_INIT", "")
+            if init_dump_path and not Path(init_dump_path).exists():
+                model_obj = getattr(self, "model", None)
+                if model_obj is not None:
+                    params = {
+                        name: param.detach().float().cpu()
+                        for name, param in model_obj.named_parameters()
+                        if param.requires_grad
+                    }
+                    Path(init_dump_path).parent.mkdir(parents=True, exist_ok=True)
+                    torch.save({"params": params}, init_dump_path)
+                    heartbeat.emit("adapter_init_dumped", count=len(params))
+            init_load_path = os.environ.get("ASYM_STP_LOAD_ADAPTER_INIT", "")
+            if init_load_path:  # plain |1 runs use the name-to-name fallback path
+                model_obj = getattr(self, "model", None)
+                if model_obj is not None and not getattr(self, "_asym_stp_init_loaded", False):
+                    from asym_gemm.training.stp_wrap import stp_load_adapter_init
+
+                    loaded = stp_load_adapter_init(model_obj, init_load_path)
+                    self._asym_stp_init_loaded = True
+                    heartbeat.emit("stp_adapter_init_loaded", count=loaded)
+            heartbeat.emit(
+                "trainer_start",
+                trainer_class=self.__class__.__name__,
+                train_batch_size=getattr(self, "_train_batch_size", None),
+                n_gpu=getattr(getattr(self, "args", None), "n_gpu", None),
+            )
             partial_writer.write("trainer_start", force=True)
             try:
                 result = original_train(self, *args, **kwargs)
@@ -2587,6 +2743,26 @@ class LFProfileRecorder:
     records: dict[str, list[StageRecord]] = field(default_factory=dict)
     global_peak_allocated_bytes: int = 0
     global_peak_reserved_bytes: int = 0
+    per_device_peak_allocated_bytes: dict[int, int] = field(default_factory=dict)
+    per_device_peak_reserved_bytes: dict[int, int] = field(default_factory=dict)
+
+    def _sample_per_device_peaks(self) -> None:
+        # Multi-device (sTP) visibility: a dev1 peak blowup must reach the gates even though
+        # the legacy scalars are current-device only (gb200_tp.md I0 step 5).
+        try:
+            device_count = torch.cuda.device_count()
+        except RuntimeError:
+            return
+        for device_index in range(device_count):
+            try:
+                allocated = int(torch.cuda.max_memory_allocated(device_index))
+                reserved = int(torch.cuda.max_memory_reserved(device_index))
+            except RuntimeError:
+                continue
+            if allocated > self.per_device_peak_allocated_bytes.get(device_index, 0):
+                self.per_device_peak_allocated_bytes[device_index] = allocated
+            if reserved > self.per_device_peak_reserved_bytes.get(device_index, 0):
+                self.per_device_peak_reserved_bytes[device_index] = reserved
 
     @contextmanager
     def stage(self, name: str, *, sync: bool = False) -> Iterator[None]:
@@ -2600,10 +2776,16 @@ class LFProfileRecorder:
             allocated_start = int(torch.cuda.memory_allocated())
             reserved_start = int(torch.cuda.memory_reserved())
             if self.reset_stage_peak_stats:
+                self._sample_per_device_peaks()  # capture before reset so peaks are never lost
                 try:
-                    torch.cuda.reset_peak_memory_stats()
+                    device_count = torch.cuda.device_count()
                 except RuntimeError:
-                    pass
+                    device_count = 0
+                for device_index in range(device_count):
+                    try:
+                        torch.cuda.reset_peak_memory_stats(device_index)
+                    except RuntimeError:
+                        pass
         try:
             with prof_range(name):
                 yield
@@ -2623,6 +2805,7 @@ class LFProfileRecorder:
                 global_peak_reserved = max(peak_reserved, reserved_end)
                 self.global_peak_allocated_bytes = max(self.global_peak_allocated_bytes, global_peak_allocated)
                 self.global_peak_reserved_bytes = max(self.global_peak_reserved_bytes, global_peak_reserved)
+                self._sample_per_device_peaks()
             self.records.setdefault(name, []).append(
                 StageRecord(
                     milliseconds=elapsed_ms,
@@ -2925,6 +3108,12 @@ class LFProfileRecorder:
                     "reserved_unallocated_bytes": max(
                         0, self.global_peak_reserved_bytes - self.global_peak_allocated_bytes
                     ),
+                    "per_device_peak_allocated_hbm_bytes": {
+                        str(k): v for k, v in sorted(self.per_device_peak_allocated_bytes.items())
+                    },
+                    "per_device_peak_reserved_hbm_bytes": {
+                        str(k): v for k, v in sorted(self.per_device_peak_reserved_bytes.items())
+                    },
                 },
                 "process": process_memory,
                 "peak_allocated_hbm_bytes": self.global_peak_allocated_bytes,
@@ -3020,6 +3209,26 @@ def main() -> None:
     snapshot_enabled = _env_enabled(PROFILE_MEMORY_SNAPSHOT_ENV, default=False) and _is_rank0()
     snapshot_info = _start_memory_snapshot_recording(snapshot_enabled)
 
+    if os.environ.get("ASYM_STP") == "1":
+        # sTP is SINGLE-PROCESS over 2 visible GPUs. HF derives n_gpu (and thus
+        # parallel_mode) from _setup_devices at ARG-PARSE time — long before
+        # Trainer.__init__ — and LlamaFactory's parser rejects CPU-AdamW when
+        # parallel_mode != NOT_PARALLEL. Pin n_gpu=1 at the source.
+        from functools import cached_property
+
+        from transformers import TrainingArguments
+
+        _orig_setup_devices = TrainingArguments.__dict__["_setup_devices"].func
+
+        def _stp_setup_devices(self):  # type: ignore[no-untyped-def]
+            device = _orig_setup_devices(self)
+            self._n_gpu = 1
+            return device
+
+        _patched = cached_property(_stp_setup_devices)
+        _patched.__set_name__(TrainingArguments, "_setup_devices")
+        TrainingArguments._setup_devices = _patched  # type: ignore[assignment]
+
     set_profile_enabled(True)
     trace_handle = install_lf_trace(trace_config, recorder=recorder)
     heartbeat = LFHeartbeat(heartbeat_path, config)
@@ -3053,6 +3262,11 @@ def main() -> None:
         heartbeat.emit("profile_launcher_finally", success=run_succeeded)
         partial_writer.write("profile_launcher_finally", force=True)
         utilization_sampler.stop()
+        if source_json:
+            try:
+                _write_rank_memstats(Path(source_json).parent)
+            except Exception:
+                pass
         if source_json and _is_rank0():
             path = Path(source_json)
             write_path = path if run_succeeded else path.with_name("source_profile.partial.json")

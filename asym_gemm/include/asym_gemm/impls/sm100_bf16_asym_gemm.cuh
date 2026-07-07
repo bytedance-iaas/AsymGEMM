@@ -136,6 +136,30 @@ ASYM_BF16_KERNEL_NAME(uint32_t* offsets, uint32_t* experts,
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
 
+#ifdef ASYM_BF16_EP_QUEUED
+    // sEP (gb200_ep.md E3): claim a work item from the shared coherent host counters at
+    // KERNEL ENTRY — before ANY barrier/TMEM initialization — so a CTA that finds the list
+    // empty exits at ~atomic cost. ep_queue: [0]=claimed, [1]=head_taken, [2]=tail_taken.
+    // Linearizable: claims are capped at ep_total_items, so front [0..head) and back
+    // (total-tail..total-1] can never overlap.
+    static_assert(kNumMulticast == 1, "sEP queued kernel must not cluster-launch (HC-EP2)");
+    __shared__ int s_ep_item;
+    if (threadIdx.x == 0) {
+        int ep_ticket = atomicAdd_system(ep_queue + 0, 1);
+        int ep_claimed_item = -1;
+        if (ep_ticket < static_cast<int>(ep_total_items)) {
+            ep_claimed_item = (ep_side == 0)
+                ? atomicAdd_system(ep_queue + 1, 1)
+                : static_cast<int>(ep_total_items) - 1 - atomicAdd_system(ep_queue + 2, 1);
+        }
+        s_ep_item = ep_claimed_item;
+    }
+    __syncthreads();
+    const int ep_item = s_ep_item;
+    if (ep_item < 0)
+        return;
+#endif
+
     // if (threadIdx.x == 0 && blockIdx.y == 3)
     //     printf("blockIdx.x: %d, blockIdx.y: %d \n", blockIdx.x, blockIdx.y);           
 
@@ -293,7 +317,15 @@ ASYM_BF16_KERNEL_NAME(uint32_t* offsets, uint32_t* experts,
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
+#ifdef ASYM_BF16_EP_QUEUED
+    const uint32_t ep_num_n_blocks = ceil_div_device(shape_n, BLOCK_N);
+    auto scheduler = asymScheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs>(
+        shape_m, shape_n, experts, offsets,
+        static_cast<uint32_t>(ep_item) / ep_num_n_blocks,
+        static_cast<uint32_t>(ep_item) % ep_num_n_blocks);
+#else
     auto scheduler = asymScheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs>(shape_m, shape_n, experts, offsets);
+#endif
     // Sentinel block (inactive expert or empty M range): skip without entering
     // any TMA / barrier wait paths. All CTAs in a cluster share blockIdx.y, so
     // they all early-exit together and don't deadlock cluster-wide barriers.
@@ -342,7 +374,7 @@ ASYM_BF16_KERNEL_NAME(uint32_t* offsets, uint32_t* experts,
             uint32_t b_n_idx = n_idx;
             uint32_t b_k_idx = k_idx;
             if constexpr (kGemmType == GemmType::MGroupedContiguous and kMajorB == cute::UMMA::Major::MN) {
-                b_n_idx = blockIdx.x * BLOCK_N;
+                b_n_idx = scheduler.n_blk * BLOCK_N;
                 b_k_idx += scheduler.current_group_idx * shape_k;
             }
             
@@ -912,7 +944,7 @@ ASYM_BF16_KERNEL_NAME(uint32_t* offsets, uint32_t* experts,
                         const auto m_idx = (kGemmType == GemmType::MGroupedMasked)
                             ? (scheduler.current_group_idx * shape_m + (block_m_iter - scheduler.m_start) * BLOCK_M + w * WAVE_BLOCK_M)
                             : (BLOCK_M * block_m_iter + w * WAVE_BLOCK_M);
-                        const auto n_idx = blockIdx.x * BLOCK_N + s * STORE_BLOCK_N;
+                        const auto n_idx = scheduler.n_blk * BLOCK_N + s * STORE_BLOCK_N;
 
                         // Store into shared memory
                         #pragma unroll

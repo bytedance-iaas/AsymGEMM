@@ -287,6 +287,12 @@ class AsymLlama4Moe(nn.Module):
             router_logits = router_logits.detach()
             top_k_index = top_k_index.detach()
             input_weights = input_weights.detach()
+        # gb200_ep.md E0: natural-skew histogram collection (shared collector; llama4 site)
+        from .qwen3_moe import _EP_STATS
+
+        if _EP_STATS is not None:
+            n_exp = getattr(self, "num_experts", None) or getattr(self.experts, "num_experts")
+            _EP_STATS.record(self.profile_prefix, top_k_index, int(n_exp))
         return top_k_index, input_weights, router_logits
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

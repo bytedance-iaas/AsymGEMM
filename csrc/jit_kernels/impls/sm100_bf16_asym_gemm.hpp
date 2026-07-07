@@ -76,6 +76,77 @@ static void __instantiate_kernel() {{
     }
 };
 
+class SM100BF16EpQueuedAsymGemmRuntime final: public LaunchRuntime<SM100BF16EpQueuedAsymGemmRuntime> {
+public:
+    struct Args {
+        int m, n, k, num_groups;
+        const std::string& compiled_dims;
+
+        GemmConfig gemm_config;
+        LaunchArgs launch_args;
+
+        void* offsets;
+        void* experts;
+
+        CUtensorMap tensor_map_a;
+        CUtensorMap tensor_map_b;
+        CUtensorMap tensor_map_cd;
+
+        // sEP queued scheduling (gb200_ep.md E3): 3 int32 counters in PINNED HOST memory
+        // shared by both devices ([0]=claimed, [1]=head_taken, [2]=tail_taken).
+        void* ep_queue;
+        uint32_t ep_total_items;
+        uint32_t ep_side;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#define ASYM_BF16_KERNEL_NAME sm100_bf16_asym_gemm_ep_queued_impl
+#define ASYM_BF16_EP_QUEUED 1
+#define ASYM_BF16_KERNEL_EXTRA_ARGS , int* ep_queue, uint32_t ep_total_items, uint32_t ep_side
+#include <asym_gemm/impls/sm100_bf16_asym_gemm.cuh>
+
+using namespace asym_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sm100_bf16_asym_gemm_ep_queued_impl<
+        {}, {},
+        {}, {}, {},
+        {}, {}, {},
+        {},
+        {}, {}, {},
+        {},
+        {}, {},
+        {}, {},
+        {},
+        {}, {}, {},
+        {}
+    >);
+}};
+)",
+        to_string(args.gemm_config.major_a), to_string(args.gemm_config.major_b),
+        get_compiled_dim(args.m, 'm', args.compiled_dims), get_compiled_dim(args.n, 'n', args.compiled_dims), get_compiled_dim(args.k, 'k', args.compiled_dims),
+        args.gemm_config.block_m, args.gemm_config.block_n, args.gemm_config.block_k,
+        args.num_groups,
+        args.gemm_config.smem_config.swizzle_a_mode, args.gemm_config.smem_config.swizzle_b_mode, args.gemm_config.smem_config.swizzle_cd_mode,
+        args.gemm_config.num_stages,
+        args.gemm_config.thread_config.num_non_epilogue_threads, args.gemm_config.thread_config.num_epilogue_threads,
+        args.gemm_config.multicast_config.num_multicast, args.gemm_config.multicast_config.is_multicast_on_a,
+        args.gemm_config.num_sms,
+        to_string(args.gemm_config.gemm_type), args.gemm_config.with_accumulation, to_string(args.gemm_config.cd_dtype),
+        args.gemm_config.tc_util);
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+            args.offsets, args.experts,
+            args.m, args.n, args.k,
+            args.tensor_map_a, args.tensor_map_b,
+            args.tensor_map_cd,
+            args.ep_queue, args.ep_total_items, args.ep_side));
+    }
+};
+
 class SM100BF16Qwen3RoutedAsymGemmRuntime final: public LaunchRuntime<SM100BF16Qwen3RoutedAsymGemmRuntime> {
 public:
     struct Args {
@@ -395,6 +466,101 @@ static void sm100_m_grouped_bf16_asym_gemm_contiguous(const torch::Tensor& a,
     const auto& code = SM100BF16AsymGemmRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_bf16_m_grouped_asym_gemm_contiguous", code);
     SM100BF16AsymGemmRuntime::launch(runtime, args);
+}
+
+static void sm100_m_grouped_bf16_asym_gemm_contiguous_ep_queued(const torch::Tensor& a,
+                                                 const torch::Tensor& b,
+                                                 const torch::Tensor& d,
+                                                 const torch::Tensor& offsets_t,
+                                                 const torch::Tensor& experts_t,
+                                                 const torch::Tensor& ep_queue_t,
+                                                 const int& ep_side,
+                                                 const int& grid_y,
+                                                 const int& num_groups, const int& m, const int& n, const int& k,
+                                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                                 const std::string& compiled_dims,
+                                                 const int b_outer_stride = -1) {
+    // sEP queued launch (gb200_ep.md E3): identical config/grid to the static launcher; the
+    // kernel claims (segment, n-block) items from ep_queue_t (pinned host int32[>=3]).
+    const int block_m = (major_b == cute::UMMA::Major::MN)
+        ? get_env<int>("DG_BF16_TRANSPOSE_BLOCK_M", 64)
+        : get_env<int>("DG_BF16_BLOCK_M", 64);
+    const int block_n = (major_b == cute::UMMA::Major::MN)
+        ? get_env<int>("DG_BF16_TRANSPOSE_BLOCK_N", 64)
+        : get_env<int>("DG_BF16_BLOCK_N", 64);
+    const int default_transpose_block_k = (k >= 768) ? 256 : 64;
+    const int block_k = (major_b == cute::UMMA::Major::MN)
+        ? get_env<int>("DG_BF16_TRANSPOSE_BLOCK_K", default_transpose_block_k)
+        : get_env<int>("DG_BF16_BLOCK_K", 512);
+    const auto& aligned_k = align(k, block_k);
+
+    const bool use_manual_config = block_m > 0 or block_n > 0 or block_k > 0;
+    if (use_manual_config)
+        DG_HOST_ASSERT(block_m > 0 and block_n > 0 and block_k > 0);
+    const auto& config = use_manual_config
+        ? get_manual_config_asym<SM100ArchSpec>(
+            GemmType::MGroupedContiguous, KernelType::KernelNoSF,
+            m, n, k, 1, major_a, major_b,
+            torch::kBFloat16, d.scalar_type(), false,
+            device_runtime->get_num_sms(),
+            block_m, block_n, block_k)
+        : get_best_config_asym<SM100ArchSpec>(
+            GemmType::MGroupedContiguous, KernelType::KernelNoSF,
+            m, n, k, 1, major_a, major_b,
+            torch::kBFloat16, d.scalar_type(), false,
+            device_runtime->get_num_sms());
+    // HC-EP2: the queued kernel must not cluster-launch.
+    DG_HOST_ASSERT(config.multicast_config.num_multicast == 1);
+
+    const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
+                                               SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),
+                                               config.block_k,
+                                               static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
+                                               config.smem_config.swizzle_a_mode);
+    const int outer_b = (b_outer_stride >= 0)
+        ? b_outer_stride
+        : static_cast<int>(b.stride(get_non_contiguous_dim(major_b)));
+    const auto& tensor_map_b = make_tma_b_desc(major_b, b, n, k,
+                                               SM100ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n),
+                                               config.block_k,
+                                               outer_b, num_groups,
+                                               config.smem_config.swizzle_b_mode);
+    const auto& tensor_map_cd = make_tma_cd_desc(d, m, n,
+                                                 SM100ArchSpec::get_cd_store_block_m(config.block_m),
+                                                 SM100ArchSpec::get_cd_store_block_n(config.block_n),
+                                                 static_cast<int>(d.stride(-2)), 1,
+                                                 config.smem_config.swizzle_cd_mode);
+
+    if (grid_y <= 0)
+        return;
+
+    const int num_n_blocks = ceil_div(n, config.block_n);
+    const uint32_t ep_total_items = static_cast<uint32_t>(grid_y) * static_cast<uint32_t>(num_n_blocks);
+    // Per-device CTA budget: a fraction of the item count. Both devices together must cover
+    // >= 100% of items (any CTA can claim any item); the excess above 50% per device is the
+    // steal margin. 0.75 x 2 = 1.5x coverage; no-ticket CTAs exit at ~atomic cost.
+    const int grid_pct = std::max(50, std::min(100, get_env<int>("DG_EP_QUEUE_GRID_PCT", 75)));
+    const int grid_y_local = std::max(1, std::min(grid_y, (grid_y * grid_pct + 99) / 100));
+
+    const SM100BF16EpQueuedAsymGemmRuntime::Args& args = {
+        .m = m, .n = n, .k = aligned_k,
+        .compiled_dims = compiled_dims,
+        .gemm_config = config,
+        .launch_args = LaunchArgs({num_n_blocks, grid_y_local}, config.thread_config.num_threads,
+                                  config.smem_config.smem_size,
+                                  config.multicast_config.num_multicast),
+        .offsets = offsets_t.data_ptr<int>(),
+        .experts = experts_t.data_ptr<int>(),
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tensor_map_b,
+        .tensor_map_cd = tensor_map_cd,
+        .ep_queue = ep_queue_t.data_ptr<int>(),
+        .ep_total_items = ep_total_items,
+        .ep_side = static_cast<uint32_t>(ep_side)
+    };
+    const auto& code = SM100BF16EpQueuedAsymGemmRuntime::generate(args);
+    const auto& runtime = compiler->build("sm100_bf16_m_grouped_asym_gemm_contiguous_ep_queued", code);
+    SM100BF16EpQueuedAsymGemmRuntime::launch(runtime, args);
 }
 
 static void sm100_m_grouped_bf16_asym_gemm_qwen3_routed(

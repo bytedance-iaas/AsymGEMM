@@ -622,6 +622,61 @@ static void m_grouped_bf16_asym_gemm_nt_contiguous(const torch::Tensor& a, const
     }
 }
 
+static void m_grouped_bf16_asym_gemm_nt_contiguous_ep_queued(const torch::Tensor& a, const torch::Tensor& b,
+                                              const torch::Tensor& d,
+                                              const torch::Tensor& offsets, const torch::Tensor& experts,
+                                              const int& list_size,
+                                              const torch::Tensor& ep_queue,
+                                              const int& ep_side,
+                                              const std::string& compiled_dims,
+                                              const bool transpose_b = false) {
+    // sEP (gb200_ep.md E3): queued variant of the contiguous grouped GEMM. ep_queue is a
+    // PINNED HOST int32[>=3] counter block SHARED by both devices' launches; ep_side selects
+    // front (0) or back (1) popping so cold segments stay device-local (affinity).
+    const auto& major_a = get_major_type_ab(a);
+    cute::UMMA::Major major_b;
+    if (transpose_b) {
+        major_check(b);
+        major_b = cute::UMMA::Major::MN;
+    } else {
+        major_b = get_major_type_ab(b);
+    }
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
+
+    const auto& [m, k_a] = get_shape<2>(a);
+    const auto& [num_groups, n_phys, k_phys] = get_shape<3>(b);
+    const int n = transpose_b ? k_phys : n_phys;
+    const int k = transpose_b ? n_phys : k_phys;
+    const auto& [m_, n_] = get_shape<2>(d);
+    DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_a);
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(offsets.is_cuda() && experts.is_cuda());
+    DG_HOST_ASSERT(offsets.is_contiguous() && experts.is_contiguous());
+    DG_HOST_ASSERT(offsets.scalar_type() == torch::kInt && experts.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(offsets.numel() >= list_size && experts.numel() >= list_size);
+    DG_HOST_ASSERT(ep_queue.device().is_cpu() && ep_queue.is_pinned());
+    DG_HOST_ASSERT(ep_queue.scalar_type() == torch::kInt && ep_queue.numel() >= 3);
+    DG_HOST_ASSERT(ep_side == 0 or ep_side == 1);
+    check_major_type_cd(d);
+    if (m == 0)
+        return;
+
+    const int b_outer_stride = transpose_b
+        ? static_cast<int>(b.stride(-2))
+        : static_cast<int>(b.stride(get_non_contiguous_dim(major_b)));
+    const int grid_y = list_size - 1;
+
+    const auto& arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10 && "sEP queued GEMM is SM100-only");
+    sm100_m_grouped_bf16_asym_gemm_contiguous_ep_queued(a, b, d,
+                                              offsets, experts, ep_queue, ep_side, grid_y,
+                                              num_groups, m, n, k, major_a, major_b, compiled_dims,
+                                              b_outer_stride);
+}
+
 static void sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous(
                                               const torch::Tensor& a,
                                               const torch::Tensor& b,
@@ -1104,6 +1159,17 @@ static void register_apis(pybind11::module_& m) {
               &m_grouped_bf16_asym_gemm_nt_contiguous),
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
+          py::arg("compiled_dims") = "nk",
+          py::arg("transpose_b") = false);
+    m.def("m_grouped_bf16_asym_gemm_nt_contiguous_ep_queued",
+          static_cast<void(*)(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+                              const torch::Tensor&, const torch::Tensor&, const int&,
+                              const torch::Tensor&, const int&,
+                              const std::string&, const bool)>(
+              &m_grouped_bf16_asym_gemm_nt_contiguous_ep_queued),
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
+          py::arg("ep_queue"), py::arg("ep_side"),
           py::arg("compiled_dims") = "nk",
           py::arg("transpose_b") = false);
     m.def("sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous",

@@ -124,17 +124,19 @@ System Design:
 
 Baselines:
 - KTransformers
-- FSDP
-- FSDP Offload (Optimizer State + Model Params)
+- FSDP2
+- FSDP2 Offload (Optimizer State + Model Params)
 - Zero2
 - Zero2 Offload (Optimizer State)
 - Zero3
 - Zero3 Offload (Optimizer State)
 - Zero3 Offload (Optimizer State + Model Params)
 - Superoffload (Optimizer State + Model Params)
+- *Superoffload (Optimizer State + Model Params + Act)
 <!-- - Megatron (Optimizer State) -->
 
 Exps:
+GB200
 - 1 GPU, Dense / MoEs
     - Throughput vs seq length where each legend is a method
     - Memory saving vs seq length where each legend is a method 
@@ -142,6 +144,19 @@ Exps:
     - GPU Utilization where each legend is a method 
 - 2 GPUs, Dense / MoEs
     - The same as above
+GB200 + NVME
+- 1 GPU, Dense / MoEs
+- 2 GPUs, Dense / MoEs
+<!-- GH200
+- 1 GPU, Dense / MoEs
+    - Throughput vs seq length where each legend is a method
+    - Memory saving vs seq length where each legend is a method 
+    - C2C Utilization where each legend is a method 
+    - GPU Utilization where each legend is a method 
+- 2 GPUs, Dense / MoEs
+    - The same as above
+GH200 + NVME
+-  -->
 
 Ablations
 - 

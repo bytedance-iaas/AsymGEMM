@@ -302,9 +302,14 @@ def down_dx_gather_left(
     compiled_dims: str = "nk",
 ) -> torch.Tensor:
     """Compute down-base dX from token-space gradient without materializing grad_routes [R,H]."""
+    import os as _os
+    import time as _time
+    _t = _time.perf_counter if _os.environ.get("ASYM_EP_DXTIME") == "1" else None
+    _t0 = _t() if _t else 0
     _check_supported_base(base, grad_token.device, compiled_dims=compiled_dims)
     grad_token = _normalize_left(grad_token)
     output_m, output_n = int(output_shape[0]), int(output_shape[1])
+    _t1 = _t() if _t else 0
     offsets_kernel, token_kernel, weights_kernel, route_unpad = _pad_route_metadata_for_asym(
         offsets,
         experts,
@@ -312,9 +317,11 @@ def down_dx_gather_left(
         routing_weights,
         device=grad_token.device,
     )
+    _t2 = _t() if _t else 0
     padded_m = int(token_kernel.numel())
     grad_act_padded = torch.empty((padded_m, output_n), device=grad_token.device, dtype=torch.bfloat16)
     offsets_i32, experts_i32, list_size = _group_metadata_for_kernel(offsets_kernel, experts, device=grad_token.device)
+    _t3 = _t() if _t else 0
     _require_symbol("qwen3_moe_bf16_down_dx_gather_left_")(
         grad_token,
         _packed_cpu_weight(base),
@@ -327,7 +334,12 @@ def down_dx_gather_left(
         bool(weighted),
         compiled_dims,
     )
+    _t4 = _t() if _t else 0
     grad_act = _unpad_grouped_output(grad_act_padded, route_unpad, output_m=output_m)
+    if _t:
+        _t5 = _t()
+        print(f"[dxtime] norm={1e3*(_t1-_t0):.1f} pad={1e3*(_t2-_t1):.1f} meta={1e3*(_t3-_t2):.1f} "
+              f"launch={1e3*(_t4-_t3):.1f} unpad={1e3*(_t5-_t4):.1f} ms", flush=True)
     stats = getattr(base, "stats", None)
     if stats is not None:
         stats.qwen3_moe_routed_base_gather_left_calls += 1

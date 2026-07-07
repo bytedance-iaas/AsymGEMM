@@ -58,6 +58,8 @@ try:
             # FP4 GEMMs
             "m_grouped_fp4_asym_gemm_nt_contiguous",
             "m_grouped_fp4_asym_gemm_nt_masked",
+            # sEP queued grouped GEMM (gb200_ep.md E3)
+            "m_grouped_bf16_asym_gemm_nt_contiguous_ep_queued",
             # BF16 GEMMs
             "m_grouped_bf16_asym_gemm_nt_contiguous",
             "m_grouped_bf16_asym_gemm_nt_masked",

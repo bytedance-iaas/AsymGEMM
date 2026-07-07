@@ -394,6 +394,35 @@ case "${BACKEND,,}" in
     BACKEND=torch
     TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config superoffload_mem_panvme)"
     ;;
+  asym_stp|asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds)
+    # GB200 sTP family (gb200_tp.md): single-process TP-2 over a same-superchip GPU pair.
+    # BACKEND stays asym so is_torch_run remains false => ONE process drives both GPUs.
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-${BACKEND,,}}
+    STP_BACKEND_RAW="${BACKEND,,}"
+    USE_ASYM_CPU_ADAMW=true
+    ASYM_CPU_ADAMW_BACKEND=deepspeed
+    CPUADAM_ALIAS_SELECTED=1
+    ASYM_STP=1
+    # Post-accumulate hooks (grad D2H + weight release) fire BEFORE the sTP mirror merge;
+    # LoRA banks stay GPU-resident (adapter-scale).
+    ASYM_CPU_ADAMW_GRAD_OFFLOAD=false
+    ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false
+    BACKEND=asym
+    ;;
+  asym_dp2_cpuadamwds)
+    # GB200 real-DP pair (gb200_dp.md D2 Route A): torchrun 2-proc + HF DDP over the LoRA params.
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-asym_dp2_cpuadamwds}
+    USE_ASYM_CPU_ADAMW=true
+    ASYM_CPU_ADAMW_BACKEND=deepspeed
+    CPUADAM_ALIAS_SELECTED=1
+    ASYM_DP=1
+    # Route A ordering hazard: DDP's bucketed all-reduce completes at backward END; the
+    # per-param post-accumulate grad-offload hooks would D2H PRE-reduction grads. Hook-based
+    # offload stays OFF; CPUAdamW's step-time path reads param.grad after DDP finalization.
+    ASYM_CPU_ADAMW_GRAD_OFFLOAD=false
+    ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false
+    BACKEND=asym
+    ;;
   asym_cpuadamwtorch)
     PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-asym_cpuadamwtorch}
     USE_ASYM_CPU_ADAMW=true
@@ -452,6 +481,95 @@ fi
 if [[ "${BACKEND}" == kt_* && "${NUM_GPUS}" != "1" ]]; then
   echo "KT SFT profiling is single-process/single-GPU for this script; got NUM_GPUS=${NUM_GPUS}" >&2
   exit 2
+fi
+
+# ---- sEP guards (gb200_ep.md E0/HC-EP4) ----
+if [[ -n "${ASYM_EP_MODE:-}" && "${ASYM_EP_E2E_LANDED:-0}" != "1" ]]; then
+  echo "ASYM_EP_MODE='${ASYM_EP_MODE}' locked until sEP e2e stages land (gb200_ep.md)" >&2
+  exit 2
+fi
+if [[ -n "${ASYM_EP_SKEW_HOT:-}" && "${ASYM_EP_SKEW_ACK:-0}" != "1" ]]; then
+  echo "ASYM_EP_SKEW_HOT is loss-INVALID (HC-EP1); set ASYM_EP_SKEW_ACK=1" >&2
+  exit 2
+fi
+
+# ---- GB200 |2 guards (gb200_tp.md HC1-HC3/I0; gb200_dp.md HC4) ----
+if [[ "${ASYM_STP:-0}" == "1" && "${ASYM_DP:-0}" == "1" ]]; then
+  echo "ASYM_STP and ASYM_DP are mutually exclusive (gb200_dp.md HC4)" >&2
+  exit 2
+fi
+if [[ "${ASYM_STP:-0}" == "1" || "${ASYM_DP:-0}" == "1" ]]; then
+  if [[ "${NUM_GPUS}" != "2" ]]; then
+    echo "|2 backends (ASYM_STP/ASYM_DP) require NUM_GPUS=2, got ${NUM_GPUS}" >&2
+    exit 2
+  fi
+  if [[ "${TRAIN_OOM_SCORE_ADJ}" != "1000" ]]; then
+    echo "HC2: TRAIN_OOM_SCORE_ADJ must stay 1000 under |2 backends, got '${TRAIN_OOM_SCORE_ADJ}'" >&2
+    exit 2
+  fi
+  case "${HOST_MEM_WATCHDOG,,}" in
+    1|true|yes|y|on) ;;
+    *) echo "HC2: HOST_MEM_WATCHDOG must be enabled under |2 backends, got '${HOST_MEM_WATCHDOG}'" >&2; exit 2 ;;
+  esac
+  case "${GPU_ID}" in
+    0,1|2,3) ;;
+    *)
+      if [[ "${ALLOW_CROSS_SUPERCHIP:-0}" != "1" ]]; then
+        echo "|2 rows must use a same-superchip pair (GPU_ID=0,1 or 2,3); got '${GPU_ID}'." \
+             "Set ALLOW_CROSS_SUPERCHIP=1 only for the contention study." >&2
+        exit 2
+      fi
+      ;;
+  esac
+fi
+if [[ "${ASYM_STP:-0}" == "1" ]]; then
+  ASYM_STP_TP_SIZE="${ASYM_STP_TP_SIZE:-2}"
+  _stp_mode_for_backend() {
+    case "${1}" in
+      asym_stp*) echo stream ;;
+      tp2_resident*) echo resident ;;
+      tp2_offstage*) echo stage ;;
+      *) echo stream ;;
+    esac
+  }
+  _stp_derived_mode="$(_stp_mode_for_backend "${STP_BACKEND_RAW:-asym_stp_cpuadamwds}")"
+  ASYM_STP_WEIGHT_MODE="${ASYM_STP_WEIGHT_MODE:-${_stp_derived_mode}}"
+  if [[ "${ASYM_STP_WEIGHT_MODE}" != "${_stp_derived_mode}" ]]; then
+    echo "ASYM_STP_WEIGHT_MODE='${ASYM_STP_WEIGHT_MODE}' mismatches backend '${STP_BACKEND_RAW:-}' (derived '${_stp_derived_mode}')" >&2
+    exit 2
+  fi
+  case "${STP_BACKEND_RAW:-}" in
+    tp2_*)
+      # Rung purity: arena/coord CLAIMS are ablated on asym_stp only; tp2_* pins both off.
+      ASYM_STP_SHARED_ARENA=0
+      ASYM_STP_COORD=0
+      ;;
+    *)
+      ASYM_STP_SHARED_ARENA="${ASYM_STP_SHARED_ARENA:-1}"
+      ASYM_STP_COORD="${ASYM_STP_COORD:-1}"
+      ;;
+  esac
+  case "${LORA_DROPOUT}" in
+    0|0.0|0.00) ;;
+    *) echo "ASYM_STP requires LORA_DROPOUT=0.00 (x0==x1 bit-identity; gb200_tp.md I0)" >&2; exit 2 ;;
+  esac
+  case "${MODEL_NAME_OR_PATH}" in
+    *A3B*|*a3b*|*A22B*|*a22b*|*Llama-4*|*llama-4*|*16E*)
+      if [[ "${ASYM_STP_MOE:-0}" != "1" ]]; then
+        echo "ASYM_STP on MoE model '${MODEL_NAME_OR_PATH}' is locked until Stage I7 lands (needs ASYM_STP_MOE=1)" >&2
+        exit 2
+      fi
+      ;;
+  esac
+  if [[ "${MODEL_NAME_OR_PATH}" == *Llama-4* && "${ASYM_ROUTER_MODE:-whole}" != "whole" ]]; then
+    echo "ASYM_STP on llama4 requires ASYM_ROUTER_MODE=whole (router stays detached)" >&2
+    exit 2
+  fi
+  export ASYM_STP ASYM_STP_TP_SIZE ASYM_STP_WEIGHT_MODE ASYM_STP_SHARED_ARENA ASYM_STP_COORD
+  export ASYM_STP_MOE="${ASYM_STP_MOE:-0}"
+fi
+if [[ "${ASYM_DP:-0}" == "1" ]]; then
+  export ASYM_DP
 fi
 
 if [[ "${BACKEND}" == "kt_armbf16" && -z "${KT_NUM_THREADS}" ]]; then
@@ -726,7 +844,9 @@ PY
 }
 
 is_torch_run() {
-  [[ "${BACKEND}" == "torch" ]]
+  # ASYM_DP=1 (asym_dp2, gb200_dp.md D2) keeps BACKEND=asym for the LF surgery but launches
+  # torchrun 2-proc so HF DDP shards data + all-reduces the LoRA grads.
+  [[ "${BACKEND}" == "torch" || "${ASYM_DP:-0}" == "1" ]]
 }
 
 is_zero_backend_run() {
@@ -1185,6 +1305,11 @@ PY
 fi
 PROFILE_LOGICAL_QLEN=$((PER_DEVICE_TRAIN_BATCH_SIZE * CUTOFF_LEN))
 PROFILE_GLOBAL_BATCH_SIZE=$((PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * NUM_GPUS))
+if [[ "${ASYM_STP:-0}" == "1" ]]; then
+  # sTP is model-parallel: both GPUs process the SAME batch, so the global batch does NOT
+  # multiply by NUM_GPUS (gb200_tp.md I0 step 3).
+  PROFILE_GLOBAL_BATCH_SIZE=$((PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))
+fi
 KT_ARM_LOGICAL_QLEN=""
 KT_ARM_EFFECTIVE_ROUTE_QLEN=""
 KT_ARM_TOKEN_CHUNKS=""
@@ -2067,6 +2192,12 @@ if [[ "${FINETUNING_TYPE}" == "lora" ]]; then
 fi
 [[ -z "${MAX_GRAD_NORM}" ]] || CMD_ARGS+=(--max_grad_norm "${MAX_GRAD_NORM}")
 
+if [[ "${ASYM_DP:-0}" == "1" ]]; then
+  # Dense DP rows: no unused params; buffers identical across ranks (frozen base is not a
+  # Parameter, DDP only sees the LoRA adapters). MoE rows flip find_unused at D2.5.
+  CMD_ARGS+=(--ddp_find_unused_parameters false --ddp_broadcast_buffers false)
+fi
+
 if is_zero_backend_run; then
   CMD_ARGS+=(--pure_bf16 false)
 else
@@ -2123,6 +2254,22 @@ log_kv FLASH_ATTN "${FLASH_ATTN}"
 log_kv_if_set PROFILE_BACKEND_LABEL "${PROFILE_BACKEND_LABEL}"
 log_kv GPU_ID "${GPU_ID}"
 log_kv NUM_GPUS "${NUM_GPUS}"
+if [[ "${ASYM_STP:-0}" == "1" ]]; then
+  log_kv ASYM_STP "${ASYM_STP}"
+  log_kv ASYM_STP_TP_SIZE "${ASYM_STP_TP_SIZE}"
+  log_kv ASYM_STP_WEIGHT_MODE "${ASYM_STP_WEIGHT_MODE}"
+  log_kv ASYM_STP_SHARED_ARENA "${ASYM_STP_SHARED_ARENA}"
+  log_kv ASYM_STP_COORD "${ASYM_STP_COORD}"
+  log_kv ASYM_STP_MOE "${ASYM_STP_MOE:-0}"
+  log_kv TRAIN_OOM_SCORE_ADJ "${TRAIN_OOM_SCORE_ADJ}"
+  log_kv HOST_MEM_WATCHDOG "${HOST_MEM_WATCHDOG}"
+  log_kv PROFILE_GLOBAL_BATCH_SIZE_STP "$((PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))"
+fi
+if [[ "${ASYM_DP:-0}" == "1" ]]; then
+  log_kv ASYM_DP "${ASYM_DP}"
+  log_kv TRAIN_OOM_SCORE_ADJ "${TRAIN_OOM_SCORE_ADJ}"
+  log_kv HOST_MEM_WATCHDOG "${HOST_MEM_WATCHDOG}"
+fi
 log_kv NUMACTL_ENABLE "${NUMACTL_ENABLE}"
 if [[ "${NUMACTL_ENABLE}" == "1" ]]; then
   log_kv NUMACTL_MEMBIND "${NUMACTL_MEMBIND}"
@@ -2394,6 +2541,32 @@ elif [[ "${BACKEND}" == "torch" ]]; then
   :
 else
   RUN_ENV+=(USE_ASYM_GEMM=1 ASYM_GEMM_LF_LOG_RUNTIME_STATS=1)
+fi
+
+if [[ "${ASYM_STP:-0}" == "1" ]]; then
+  RUN_ENV+=(
+    ASYM_STP=1
+    ASYM_STP_TP_SIZE="${ASYM_STP_TP_SIZE}"
+    ASYM_STP_WEIGHT_MODE="${ASYM_STP_WEIGHT_MODE}"
+    ASYM_STP_SHARED_ARENA="${ASYM_STP_SHARED_ARENA}"
+    ASYM_STP_COORD="${ASYM_STP_COORD}"
+    ASYM_STP_MOE="${ASYM_STP_MOE:-0}"
+    ASYM_GEMM_LF_CONFIG_ASYM_STP=1
+    ASYM_GEMM_LF_CONFIG_ASYM_STP_TP_SIZE="${ASYM_STP_TP_SIZE}"
+    ASYM_GEMM_LF_CONFIG_ASYM_STP_WEIGHT_MODE="${ASYM_STP_WEIGHT_MODE}"
+    ASYM_GEMM_LF_CONFIG_ASYM_STP_SHARED_ARENA="${ASYM_STP_SHARED_ARENA}"
+    ASYM_GEMM_LF_CONFIG_ASYM_STP_COORD="${ASYM_STP_COORD}"
+    ASYM_GEMM_LF_CONFIG_TRAIN_OOM_SCORE_ADJ="${TRAIN_OOM_SCORE_ADJ}"
+    ASYM_GEMM_LF_CONFIG_HOST_MEM_WATCHDOG="${HOST_MEM_WATCHDOG}"
+  )
+fi
+if [[ "${ASYM_DP:-0}" == "1" ]]; then
+  RUN_ENV+=(
+    ASYM_DP=1
+    ASYM_GEMM_LF_CONFIG_ASYM_DP=1
+    ASYM_GEMM_LF_CONFIG_TRAIN_OOM_SCORE_ADJ="${TRAIN_OOM_SCORE_ADJ}"
+    ASYM_GEMM_LF_CONFIG_HOST_MEM_WATCHDOG="${HOST_MEM_WATCHDOG}"
+  )
 fi
 
 if is_torch_run; then

@@ -1014,6 +1014,12 @@ def move_lf_asym_cpu_first_model_to_device(
         if should_keep_cpu(name, param):
             kept_cpu_bytes_by_component["vision_or_projector"] += tensor_nbytes(param)
             continue
+        if param.device.type == "cuda":
+            # Already deliberately placed (LoRA params are created on-device at wrap time;
+            # sTP branch1 params live on cuda:1). Re-moving would flatten multi-device
+            # placement onto target_device. No-op for |1 (everything CUDA is target already).
+            moved_bytes_by_reason["already_on_device"] += 0
+            continue
         if should_force_cuda(name, param):
             _move_tensor_data_in_place(param, target_device)
             moved_bytes_by_reason["trainable_or_text_runtime"] += tensor_nbytes(param)
@@ -2394,6 +2400,29 @@ def apply_lf_asym_lora(
     if attention_act_skipped:
         report.skipped.extend(attention_act_skipped)
     report.attention_saved_tensor_offload_wrapped = len(attention_saved_modules)
+
+    if os.environ.get("ASYM_STP") == "1" and os.environ.get("ASYM_STP_PHASE_A") != "1":
+        # gb200_tp.md I4: convert every wrapped dense decoder layer into a two-branch
+        # StpDecoderLayer over the sharded arena. Runs after the standard wrap (so the
+        # full-weight HostWeights + LoRA params exist to slice from) and before
+        # freeze/validate (branch params must be visible to both).
+        from asym_gemm.training.stp_runtime import get_runtime as _stp_get_runtime
+        from asym_gemm.training.stp_wrap import build_stp_full_tp
+
+        _stp_get_runtime()
+        stp_full_counts = build_stp_full_tp(
+            model,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            backend=backend,
+            stats=stats,
+            strict=strict,
+        )
+        setattr(model, "_asym_stp_full_counts", stp_full_counts)
+        # branch1 saved-tensor offload is installed inside build_stp_full_tp (the name-based
+        # helper rejects the self_attn_stp1 leaf).
+        _release_replaced_module_memory()
     report.attention_saved_tensor_offload_modules = tuple(attention_saved_modules)
     report.attention_saved_tensor_offload_skipped = tuple(attention_saved_skipped)
     if attention_saved_skipped:
@@ -2470,6 +2499,35 @@ def apply_lf_asym_lora(
     if report.trainable_lora_params == 0 and strict:
         raise ValueError("AsymGEMM setup produced zero trainable LoRA parameters.")
     _register_runtime_report(report)
+    if os.environ.get("ASYM_STP") == "1" and os.environ.get("ASYM_STP_PHASE_A") != "1":
+        # gb200_tp.md I4 (placement, deferred past residency validation): move all
+        # still-CPU params/buffers to dev0, keep branch1 on dev1, and advertise model
+        # parallelism so the HF Trainer skips its blanket cuda:0 move.
+        from asym_gemm.training.stp_runtime import get_runtime as _stp_rt
+        from asym_gemm.training.stp_wrap import finalize_stp_placement
+
+        finalize_stp_placement(model, _stp_rt().d[0])
+    if os.environ.get("ASYM_STP") == "1" and os.environ.get("ASYM_STP_PHASE_A") == "1":
+        # Phase-A fallback/ablation path (gb200_tp.md I3): model stays on dev0; ONLY the
+        # base GEMMs split via the _stp routing in asym_bf16_cpu_right_matmul.
+        # gb200_tp.md I1/I2: bring up the pair runtime (peer enable + JIT prewarm on BOTH
+        # devices) and repack every wrapped frozen weight into contiguous per-device shards
+        # BEFORE the first forward. Runs after all shape-consuming setup; repack transient
+        # stays under one layer (row carriers swap in place, col shards are views).
+        from asym_gemm.training.stp_layout import repack_model_for_stp
+        from asym_gemm.training.stp_runtime import get_runtime
+
+        get_runtime()
+        stp_named_host_weights = []
+        seen_host_weight_ids: set[int] = set()
+        for stp_mod_name, stp_module in model.named_modules():
+            candidate_hw = getattr(stp_module, "host_weight", None)
+            if candidate_hw is None or id(candidate_hw) in seen_host_weight_ids:
+                continue
+            seen_host_weight_ids.add(id(candidate_hw))
+            stp_named_host_weights.append((stp_mod_name, candidate_hw))
+        stp_repack_counts = repack_model_for_stp(stp_named_host_weights)
+        setattr(model, "_asym_stp_repack_counts", stp_repack_counts)
     # Drop any orphaned pre-conversion modules/reference cycles before the first trainer step.
     _release_replaced_module_memory()
     # asym_cpuadamwds_panvme (Stage 7): page frozen base weights to NVMe. No-op without the

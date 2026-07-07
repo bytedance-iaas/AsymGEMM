@@ -1,42 +1,100 @@
 # GB200 sTP: Streamed Tensor Parallelism for LoRA (`|2`) — Staged Implementation Plan
 
-**What we are building.** `asym_stp` — a single-process, two-GPU (TP-2) LoRA fine-tuning
-backend for one GB200 superchip. Two Blackwell GPUs (0,1) share one Grace CPU. The frozen
-base model lives **once** in a pinned Grace arena; each GPU streams its **own weight shard's
-tiles** over its **own C2C lane** using the existing AsymGEMM cpu-right kernels (the weight is
-the host-resident operand, pulled tile-wise by in-kernel TMA — no HBM residency, no copy
-engines). LoRA adapters + CPUAdamW are unchanged from the validated `|1` path. This is classic
-tensor parallelism made runnable on GB200 *because* AsymGEMM removes TP's usual blocker
-(weights resident in HBM).
-
-**Why a separate plan.** This changes the unit of parallelism. It lands entirely behind a new
-backend name + `ASYM_STP=1`; it must never touch the `|1` defaults. Non-goal: do not regress
-the validated `|1` `recomp-off-full-fg-ker000/101` paths.
-
-Style/discipline mirror `agent/impls/fix_finegrained_*.md`: staged, gated, one experiment at a
-time, artifacts never overwritten. (The old design-derivation `agent/gb200.md` is archived and
-stale — this doc is self-contained.)
+**What/why.** `asym_stp` = single-process TP-2 LoRA backend for one GB200 superchip: the frozen
+base lives ONCE in a pinned Grace arena; each GPU streams its own shard's tiles over its own C2C
+lane (AsymGEMM cpu-right; zero weight-HBM); LoRA + CPUAdamW unchanged from `|1`. Lands behind
+`ASYM_STP=1` + new backend names; never touches `|1` defaults. Discipline mirrors
+`fix_finegrained_*`: staged, gated, one experiment at a time, artifacts never overwritten.
 
 ```text
-system:       asym_stp_cpuadamwds = TP-2 across GPUs 0,1 of ONE superchip; frozen base
-              weights stream tile-wise from ONE pinned Grace arena (existing asym cpu-right
-              kernels, per-device shard slices); LoRA + CPUAdamW unchanged.
-FLAGSHIP:     the ONE flagship row is `asym_stp_cpuadamwds` (canonical name; NOT asym_cpuadamds_stp).
-              "stp" = STREAMED tensor parallelism. "_cpuadamwds" = DeepSpeed CPU-AdamW, optimizer
-              masters in HOST DRAM (HC1) — NOT NVMe. The NVMe variants (opnvme/panvme,
-              run_lf_lora_sft.sh:276-285) are OUT OF SCOPE and unnecessary here (the whole model +
-              optimizer already fit in the ~960 GB two-node host pool).
-primary row:  llama3.3-70b | 25000|8|1 | ligerloss1 | recomp-off-full-fg-ker000
-matrix:       q3-32b 50000|8|1, q2.5-72b 30000|8|1, q3-30b-a3b 80000|8|1 (ker101),
-              llama4-scout 9500|8|1
+FLAGSHIP:     asym_stp_cpuadamwds ("stp" = streamed TP; "_cpuadamwds" = DeepSpeed CPU-AdamW,
+              masters in host DRAM per HC1; NVMe variants opnvme/panvme OUT OF SCOPE).
 paper names:  TP-Resident (tp2_resident_*), TP-Staged (tp2_offstage_*),
-              AsymLoRA-DP (asym_dp2, attribution row), AsymLoRA-sTP (asym_stp_*)
+              AsymLoRA-DP (asym_dp2 — owned by gb200_dp.md), AsymLoRA-sTP (asym_stp_*)
+EXACT dev/test workloads + baselines-to-beat: next section (copy-paste RUNS lines).
 target models (verified: scripts/lf/profile_lora_lf_test_source.sh:50-60):
   llama3.3-70b = meta-llama/Llama-3.3-70B-Instruct   (80L, H=8192, I=28672, q64/kv8, hd128)
   q2.5-72b     = Qwen/Qwen2.5-72B-Instruct           (80L, H=8192, I=29568, q64/kv8, hd128, QKV-bias)
   q3-32b       = Qwen/Qwen3-32B                       (64L, H=5120, I=25600, q64/kv8, hd128, q/k-norm)
   q3-30b-a3b   = Qwen/Qwen3-30B-A3B                   (48L, H=2048, I=768,  E=128 top8, q32/kv4, no shared expert)
   llama4-scout = meta-llama/Llama-4-Scout-17B-16E     (48L, H=5120, E=16, q40/kv8, hd128, HAS shared expert)
+```
+
+## STATUS (2026-07-06 — read this first; details in the Decision Log)
+
+```text
+DONE + VALIDATED: I0 (harness/guards; dry-run + 9 negative gates), I1 (JIT FIX A
+  -DDG_JIT_USE_RUNTIME_API — dev1 GEMMs work; probe: P2P 778/774 GB/s, dual-lane shared-pinned
+  174.7 GB/s/lane, allreduce2 3 GiB 6.11 ms; |1 zero-regression), I2 (arena repack: col =
+  zero-copy views, row = shape-preserving carrier + _dispatch_nt guard), I3 kernel parity
+  (gather BIT-IDENTICAL; partial-sum within fp32-ref band), I4 FULL TP e2e — built as a
+  TWO-INSTANCE design (StpDecoderLayer runs two copies of the |1 machinery over shard
+  HostWeights, joined only by boundary Fns; per-layer Bcast01/Join01 => GC-safe; mirrors for
+  replicated LoRA pieces + post-bwd merge + post-step resync). Trains s2048+s20000 through the
+  harness; LOSS TRACKS |1 to ~1e-3. Pace car #2 built standalone (fsdp2_tp_baseline.py:
+  head-split TP2 + FSDP2 CPUOffload + save_on_cpu).
+DEV-ROW NUMBERS (s20000 b8): stp 234.9 s / 27.4+25.2 GiB / RSS 395 | |1 b8 251.8 / 38.6 / 352
+  | superoffload b4x2 134.6 / 22.2 | fsdp2-tp2 26.8 / 133.4 (GPU-OOM at s32k b8).
+REMAINING / OPEN ISSUES (priority order):
+  1. I5 NOT BUILT — THE step_s/RSS lever: each branch currently offloads its OWN full-width
+     [M,H] copy of U/X/GC-roots (dup => bwd 209 s barely beats |1's 216.6, RSS +43 GiB).
+     Dedup = offload once on dev0, restage both lanes; + row-split dA; + BWD SCHEDULING RULE +
+     de-sync (a)-(d) (still inherited |1 host-blocking order per branch).
+  2. LoRA-bank offload disabled under sTP (mirror-merge ordering) -> step_H 27.4 not <=~20;
+     re-enable or fold into I5.
+  3. lm_head/loss segment: dev1 idles through final-norm+CE (fwd 22.3 vs |1 33.2 = 0.67x, not
+     0.5x) — measure share, split only if >5%.
+  4. P-DEV REVISION NEEDED: step_s-vs-pace-car is structurally unwinnable at fits-in-HBM rows
+     (pace car 26.8 s); evaluate step_s at a FRONTIER row, keep s20000 for step_H/loss. The
+     winning rows: step_H 4.9x under fsdp2-tp2; frontier (it dies s32k; stp headroom multi-x);
+     b1 ladder + actnvme vs SuperOffload forms (SP baseline: build DS-Ulysses-on-HF, days —
+     NOT the Megatron-DS port).
+  5. PARITY METHOD (binding lesson): 64-layer bf16 step-2 adapter grads are ~O(1) sensitive to
+     ANY reduction-order change (measured |1-vs-|1 envelope p50 0.46 / max 1.72) — gates MUST
+     use the measured-envelope method; sharp instruments = mini-parity
+     (stp_full_tp_mini_parity.py) + loss overlay + cross-rank bit-identity.
+  6. Phase-A ablation currently FAILS at s2048 AND its artifact label collides with full-TP
+     (needs its own tag). I6 ladder rungs, I7 MoE, I8 matrix: untouched.
+```
+
+## Dev Workloads & Baselines-To-Beat (EXACT configs — copy-paste into RUNS)
+
+```text
+DEV RULES: ONE model (q3-32b — DENSE first; MoE deferred), ONE decently-sized workload
+(s20000 b8 ~ 160k tokens — well inside every boundary: |1 asym C-OOM ~53k, SO|unsloth-off
+C-OOM ~53k), and host RSS comfortably under the watchdog floor at ALL times (HC2). No heavy
+rows, no multi-model matrix during dev.
+
+# ============ DEV TARGET (ours; TP: ONE job on pair 0,1; b8 = global 8) ============
+q3-32b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false
+# small parity/loss-gate row (I3/I4 grad-parity + logits dumps):
+q3-32b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false
+
+# ============ DEV LADDER RUNGS (ablations; same row, one WEIGHT_MODE knob apart) ============
+q3-32b|2 ; tp2_offstage_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false
+q3-32b|2 ; tp2_resident_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false
+
+# ============ DEV BASELINE #1 — TP apples-to-apples (THE one to beat) ============
+# FSDP2(CPUOffloadPolicy) x TP-2 DeviceMesh + LoRA, q3-32b s20000 b8 global.
+# NOT in the RUNS grammar -> NEW scripts/testing/fsdp2_tp_baseline.py (torchrun 2-proc +
+# profile.json metrics shim). NeMo Automodel ON HOLD.
+
+# ============ DEV BASELINE #2 — best DP (owned by gb200_dp.md) ============
+q3-32b|2 ; superoffload_mem|unsloth-off|ligerloss1 ; 20000|4|1 ; none|false|false|false|false|false
+q3-32b|2 ; asym_dp2_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 20000|4|1 ; none|false|false|false|false|false
+
+# ============ |1 DEV REFERENCES ============
+q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false
+q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 20000|4|1 ; none|false|false|false|false|false
+
+# BEAT relation (dev) = P-DEV: asym_stp beats FSDP2+TP2 (b8) AND superoffload-DP2 (b4) on
+# step_s AND step_H at the dev row; ladder ordering step_H resident > offstage > stream;
+# loss in band everywhere.
+# NOTE: per-stage e2e validation commands below are TEMPLATES (some written against
+# llama3.3-70b) — during dev SUBSTITUTE this q3-32b row (s20000 target; s2048 parity).
+# PAPER PHASE (DEFERRED until dense dev passes): the 5-model matrix at target rows
+# (llama3.3-70b 25000, q2.5-72b 30000, q3-30b-a3b 80000 ker101, llama4-scout 9500, q3-32b
+# 50000), zero3 + unsloth-variant rows, b4 boundaries, b1 frontiers, Stage I7 MoE, NeMo FW rows.
 ```
 
 ## HARD CONSTRAINTS (non-negotiable — a violation risks a machine-wide host OOM, not just a failed run)
@@ -70,6 +128,25 @@ HC3  LAUNCH ONLY through scripts/lf/profile_*  OR  scripts/lf/run_lf_*  — thos
 ## Why This Design Is Correct & Efficient (derived + reused from `third_party/`, verified against source)
 
 ```text
+POSITIONING — the claims (REVISED per the live paper-story analysis: headline baseline =
+one-copy STAGED TP-2 (tp2_offstage, kills the TP-vs-DP confound), the streamed~staged tie at
+dense large-M is PREDECLARED, and the M3'/M4 mechanisms + qualified flip-boundary claim live in
+the paper-story doc; receipts archived in archive/gb200_angle.md):
+- The SOTA offloaded-training baseline SuperOffload (= superoffload_mem) is ZeRO-3 DATA-PARALLEL
+  (TP=1), assumes 1 GPU:1 Grace, prefetches 64 MB weight BUCKETS into HBM, is full-FT + MoE-agnostic.
+  Ported to GB200's shared Grace it duplicates + contends (2 ranks, 1 Grace). sTP IS the redesign
+  that 2:1 penalty forces: ONE copy, disjoint TP, shared arena, tile-wise streaming — a structure
+  DP/1:1 cannot express. That is the GB200-specific contribution.
+- NOVELTY is narrow + honest: (1) tile-wise, NEVER-in-HBM weight streaming on the fwd AND
+  BACKWARD/LoRA-grad path (predecessors are inference-only or prefetch whole units to HBM);
+  (2) TP (not DP) offloaded streaming on a shared-Grace arena; (3) frozen-base + LoRA; (4) MoE-aware
+  ownerless-expert streaming. Do NOT claim as novel: "stream from Grace" (SuperOffload does it),
+  "save a copy" (weak), or FP4/quantization (Hopper does int4 QLoRA).
+- HONESTY GUARD: the win is HBM-CAPACITY / no CPU->HBM->SM round-trip / SHARED-GRACE SCALING, NEVER
+  a raw C2C-BANDWIDTH claim (tile-wise does NOT beat 64 MB buckets on C2C BW — SuperOffload Fig 7).
+- COROLLARY (cheap, clean): equal-COUNT token slices make per-GPU compute skew-immune, so the MoE
+  load-balance aux loss / capacity-factor token-drop are unnecessary for frozen+LoRA (zero drop).
+
 CORRECT — the TP math is NOT invented; it is copied from proven multi-process SPMD TP, and only the
 TRANSPORT changes (NCCL collectives -> single-process P2P allreduce2 on copy streams):
 - col/row f/g duality copied verbatim from Megatron-Core (third_party/megatron-lm/megatron/core/
@@ -256,6 +333,9 @@ C3 shared-arena dedup: arena=1 vs 0; residual host bytes + D2H ~0.5x.        [I5
 C4 tile-wise act consumption: asym_stp vs tp2_offstage boundary (2-3x).      [I5, I6, I8]
 C5 coordination: coord=1 vs 0; 10-30% step_s or DROP the claim.             [I5]
 C6 scaling: {|1 b8} vs {asym_dp2 b4x2} vs {asym_stp b8}; dp2 <=1.2x, stp 1.6-2x. [I6]
+C7 aux-loss-free MoE (corollary): equal-count token slices -> skew-immune compute -> the MoE
+   load-balance aux loss / capacity-factor token-drop are unnecessary for frozen+LoRA; loss/quality
+   parity vs the aux-loss baseline, zero dropped tokens. [I7]
 ```
 
 ## Profiling Goals (dev; real models, real workloads)
@@ -265,15 +345,21 @@ Isolated micro-tests are acceptable ONLY for I1 (pure stream/P2P plumbing) and k
 probes; they never accept a stage on their own.
 
 ```text
-|1 pace car (established): superoffload_mem|unsloth-off|ligerloss1  b8
-|2 memory pace car (expect): zero3_offload_mem|unsloth-off   b4/GPU
-|2 time   pace car (expect): superoffload_mem|unsloth-off    b4/GPU
-Crown via P0; record winners here:  |2 mem pace car = [TBD]   |2 time pace car = [TBD]
+DEV pace cars (ONLY two; everything else deferred to paper phase):
+  DP: superoffload_mem|unsloth-off  q3-32b 20000|4|1        (the shipping-SOTA reference)
+  TP: FSDP2(CPUOffloadPolicy)+TP-2  q3-32b s20000 b8-global (apples-to-apples; own script)
+Paper-phase pace-car crowning (zero3, unsloth variant, per-model winners) = DEFERRED.
 ```
 
-Dev goals (ALL must hold before the paper phase):
+Dev goals:
 
 ```text
+P-DEV (THE dev gate — every stage validates on THIS row ONLY; q3-32b 20000|8|1 ker000):
+   step_H(stp) < step_H(superoffload-DP2 b4)  AND  step_s(stp) < step_s(FSDP2+TP2 b8)
+   AND step_s(stp) < step_s(superoffload-DP2 b4); loss in band; host RSS well under the
+   watchdog floor at all times (HC2). P6's mechanism-health checks (both lanes >= 170 GB/s
+   in streamed windows, dup_factor 1.0) also evaluate at P-DEV.
+PAPER-PHASE acceptance (full matrix; run ONLY after every stage passes P-DEV):
 P1 llama3.3-70b 25000|8|1: step_H(stp) < step_H(mem pace car b4) AND
    step_s(stp) < step_s(time pace car b4); loss in band.            [I4 then I5]
 P2 q3-32b 50000|8|1: same       P3 q2.5-72b 30000|8|1: same          [I4/I5]
@@ -286,20 +372,18 @@ DECIDABILITY RULE (P1-P4): prior |1 boundaries make b4 completion at these rows 
    at b4, and the stp row is reported as beyond-frontier — the P goal stays decidable.
 ```
 
-P0 pace-car sweep (runnable BEFORE any sTP code; each row separately, pair 0,1). Evidence
-Discipline forbids improvising pace cars at gate time, so P0 produces every row the later
-gates consume:
+P0 (DEV; runnable BEFORE any sTP code; each row separately, pair 0,1) — exactly TWO baseline
+rows, nothing else:
 
 ```bash
-RUNS='llama3.3-70b|2 ; superoffload_mem|unsloth-off|ligerloss1 ; 25000|4|1 ; none|false|false|false|false|false' \
+# DEV pace car #1 (DP; owned by gb200_dp.md D0):
+RUNS='q3-32b|2 ; superoffload_mem|unsloth-off|ligerloss1 ; 20000|4|1 ; none|false|false|false|false|false' \
 OUTPUT_ROOT=profiling_gb200tp_p0 MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
-# repeat: superoffload_mem|unsloth-off (time car) AND zero3_offload_mem|unsloth-off (mem car).
-# b4 boundary probes for the two winners: seq 30000->40000->50000, stop at first OOM.
-# PLUS every later gate's pace-car row at b4/GPU per the RUNS grammar:
-#   q3-32b 50000|4|1, q2.5-72b 30000|4|1, q3-30b-a3b 80000|4|1  (+ max-runnable-seq b4 probes
-#   per model, since prior |1 b8 boundaries — q3-32b 20k, q2.5-72b 10k — make b4 completion at
-#   these rows non-certain), AND the mem-car b4/GPU boundary for q3-32b (consumed by P5).
+# DEV pace car #2 (TP): scripts/testing/fsdp2_tp_baseline.py — q3-32b s20000 b8 global,
+#   torchrun 2-proc, profile.json metrics shim (same reporting format).
+# PAPER PHASE (deferred): multi-model pace-car sweep, zero3 rows, unsloth variant, b4
+#   boundary probes, b1 frontiers.
 ```
 
 ## Baselines (rules unchanged; full ladder is one knob apart)
@@ -534,7 +618,7 @@ shared-Grace contention evidence: each rank hosts ~2x weights over the SAME node
 
 ```bash
 # positive dry run (DRY_RUN prints the command + writes command.txt; never launches training):
-RUNS='llama3.3-70b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 128|8|1 ; none|false|false|false|false|false' \
+RUNS='q3-32b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 128|8|1 ; none|false|false|false|false|false' \
 DRY_RUN=true PREPARE_DATASETS=false PLOT=false RUN_POST=false \
 OUTPUT_ROOT=profiling_gb200tp_dryrun RUNS_LOG=profiling_gb200tp_dryrun/runs.log \
 GPU_POOL=0,1 PROFILERS=source MAX_STEPS=1 WARMUP_STEPS=1 \
@@ -891,13 +975,13 @@ defensive). Matrix models checked: 28672/2, 25600/2, 29568/2 are all 64-multiple
 ```bash
 python scripts/testing/stp_gemm_parity_probe.py --model llama3.3-70b --cases col,row --mode stream
 # e2e loss gate (small):
-RUNS='llama3.3-70b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false' \
+RUNS='q3-32b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false' \
 OUTPUT_ROOT=profiling_gb200tp_I3_s2048 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
 # e2e target profiling (PROFILERS=both — the lane_bw/nsys gates need the nsys pass; EVERY later
 # gate that reads lane_bw/nvlink/class-byte artifacts inherits this convention):
-RUNS='llama3.3-70b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 25000|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_gb200tp_I3_s25000 MAX_STEPS=3 WARMUP_STEPS=1 PROFILERS=both PLOT=false RUN_POST=false \
+RUNS='q3-32b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false' \
+OUTPUT_ROOT=profiling_gb200tp_I3_s20000 MAX_STEPS=3 WARMUP_STEPS=1 PROFILERS=both PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
 ```
 
@@ -907,7 +991,7 @@ PASS:
   s2048 loss within ~0.05 of |1 asym at same global workload.
   I0 RECEIPTS land HERE: command.txt PROFILE_GLOBAL_BATCH_SIZE=8 AND train.log step-1 heartbeat
     trainer._train_batch_size == 8 (the Trainer.__init__ patch beat the :591 freeze).
-  s25000: nsys/lane_bw shows BOTH lanes active in base-GEMM windows; the base-GEMM component of
+  s20000: nsys/lane_bw shows BOTH lanes active in base-GEMM windows; the base-GEMM component of
     bwd_s ~halves vs the |1 run; step_H(dev0) <= |1 step_H (Phase A adds no residency).
 FAIL SIGNATURES: lane1 ~0 -> silent fallback bug -> inconclusive_unexpected_path.
 ```
@@ -1069,12 +1153,12 @@ nsys gate: host-sync count per layer ~0 in steady state.
 
 ```bash
 # parity (own declared pair — MAX_STEPS=5, dump on BOTH the |1 reference and the stp run):
-RUNS='llama3.3-70b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false' \
+RUNS='q3-32b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false' \
 OUTPUT_ROOT=profiling_gb200tp_I4_parity MAX_STEPS=5 WARMUP_STEPS=0 ASYM_STP_DUMP_GRADS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
 # e2e P1 (PROFILERS=both):
-RUNS='llama3.3-70b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 25000|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_gb200tp_I4_s25000 MAX_STEPS=3 WARMUP_STEPS=1 PROFILERS=both PLOT=false RUN_POST=false \
+RUNS='q3-32b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false' \
+OUTPUT_ROOT=profiling_gb200tp_I4_s20000 MAX_STEPS=3 WARMUP_STEPS=1 PROFILERS=both PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
 ```
 
@@ -1193,7 +1277,7 @@ coord=0 = none of the above. If C5 measures ~0 under this definition, DROP the c
 
 ```bash
 # arena ablation (fresh roots), P1 workload:
-RUNS='llama3.3-70b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 25000|8|1 ; none|false|false|false|false|false' \
+RUNS='q3-32b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false' \
 OUTPUT_ROOT=profiling_gb200tp_I5_arena1 ASYM_STP_SHARED_ARENA=1 MAX_STEPS=3 WARMUP_STEPS=1 PROFILERS=both PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
 # repeat with OUTPUT_ROOT=..._arena0 ASYM_STP_SHARED_ARENA=0; and coord1 vs coord0 similarly.
@@ -1423,7 +1507,150 @@ prefetch/slab budget blown; RSS on the wrong NUMA node. Only then propose a chan
 ## Decision Log (append-only; date + decision + evidence path)
 
 ```text
-(empty — first entry lands with the first gate deviation; e.g. the I4 parity ENVELOPE value.)
+2026-07-06 I0 VALIDATED. Harness plumbing landed (backend_gpu_count |2 arm with die-guards both
+  ways, mode_for_backend derivation + per-knob override semantics, TP global-batch override,
+  Trainer.__init__ n_gpu=1 patch + _wrap_model DP assert keyed on ASYM_STP, per-device peak
+  tracking in the recorder, rank<R>_memstats.json emission, HC2/HC4 guards, stp artifact tag).
+  Positive dry-run + 9 negative guards + asym_dp2 dry-run all pass. NOTE: the stp tag is placed
+  right after the backend name inside job_root_path's path_label (safe_label truncates overlong
+  labels to the FIRST 243 chars + hash — a trailing tag would vanish).
+2026-07-06 I1 VALIDATED. FIX A chosen: -DDG_JIT_USE_RUNTIME_API added to setup.py cxx+nvcc,
+  _C rebuilt in-place. Probe (profiling_gb200tp_i1/stp_runtime_probe_node0.json): real asym GEMM
+  on dev1 OK (rel err ~1.2e-2 vs torch both devices), P2P 778 GB/s/dir + TRUE duplex 774.6/dir,
+  BOTH lanes pull the SAME pinned buffer at 174.7 GB/s/lane (>=170 floor), allreduce2 3 GiB in
+  6.11 ms (<8), enqueue 9.9 us (<30). |1 zero-regression: D1 solo b4 clean (gb200_dp.md log).
+  CUDA_DEVICE_MAX_CONNECTIONS pinned UNSET. STREAM-DISCIPLINE LESSON: composing two exchange
+  primitives back-to-back through ambient entry/exit events SERIALIZES them (duplex halved) ->
+  primitives take an explicit producer_event; fused allreduce2 unaffected.
+2026-07-06 I1 COORD EVIDENCE (free): a bare probe run first-touched its pinned buffer on the
+  REMOTE NUMA node -> lanes 122 solo / 61 shared GB/s vs 211/175 pair-local. The coord knob's
+  pair-local first-touch premise is real (~1.7-2.9x lane BW).
+2026-07-06 I2 VALIDATED (unit). Splits 64/8-clean for all 5 targets (q/kv/gate-up/o/down);
+  col = zero-copy dim0 views on the original pinned tensor; ROW DESIGN DEVIATION: instead of
+  freeing the original and breaking [N,K] consumers, the repack swaps hw._tensor to a SAME-SIZE
+  pinned carrier reshaped [N,K] whose element order is shard-major; shard views ride tensor._stp;
+  _dispatch_nt hard-errors if an sTP-sharded weight arrives unrouted (no silent garbage).
+  RSS==|1 by construction (same bytes); e2e RSS receipt lands with the I3 s20000 run.
+2026-07-06 I3 KERNEL PARITY PASS. Gather cases (col fwd, row dX) BIT-IDENTICAL to the unsplit
+  kernel; partial-sum cases (col dX, row fwd) gated vs an fp32 reference at <=2.5x the unsplit
+  kernel's own bf16 error — measured ratios 0.61-1.27 (halved fp32 accumulation chains make the
+  split path MOSTLY MORE accurate). This is the intrinsic TP bf16 partial-sum band (Megatron's
+  bf16 all-reduce pays the same); bit-equality is only demanded of gather cases.
+2026-07-06 I4 ARCHITECTURE (major deviation, replaces the two-branch-region-Function restructure;
+  same math, different factoring). TWO-INSTANCE design: each StpDecoderLayer runs two copies of
+  the EXISTING |1 machinery — branch0 (dev0, shard-0) reuses the original wrapped self_attn/fg-mlp
+  classes; branch1 (dev1, shard-1) is a fresh Qwen3Attention + fg-MLP built over shard-shaped
+  HostWeights — connected ONLY by the boundary Functions. Consequences verified before build:
+  (a) LoRA slicing falls out of construction (col B=[N_i,r] auto, row A=[r,K_i] auto); logical
+      trainable numel == |1 exactly.
+  (b) Replicated pieces (col-A, row-B): branch1 copy DEMOTED to a plain-tensor mirror (invisible
+      to optimizer/grad-norm); dA = dA0 + to0(dA1) merged post-backward in the training_step
+      wrapper; mirrors resynced from owners via an optimizer step_post_hook.
+  (c) PER-LAYER Bcast01Fn-in / Join01Fn-out instead of a residual sidecar: +1 [M,H] NVLink copy
+      each way per layer (~2 ms/layer at the dev row) buys gradient-checkpointing safety
+      (recompute recreates x1 from the saved x0 — exact, x0==x1) and zero model-level state.
+      g1-drop stays correct: every region boundary summed both branches' contributions into BOTH
+      outputs, so g_x1 == g_x0 at every layer input by construction.
+  (d) StpDecoderLayer subclasses GradientCheckpointingLayer (unsloth GC checkpoints the whole
+      two-branch layer; offload Functions take their no-grad fast path in the outer pass and do
+      real offload during recompute — inherited |1 behavior).
+  (e) HF Trainer's blanket cuda:0 move defeated via model.is_parallelizable/model_parallel=True +
+      finalize_stp_placement (runs AFTER residency validation, which expects |1's CPU-first view).
+  (f) Under full-TP the Phase-A _stp routing is INERT by construction (branch HostWeights carry
+      no _stp attr); Phase A remains available via ASYM_STP_PHASE_A=1.
+  NOT yet implemented from the I4 spec (perf, not correctness; pending first nsys): BWD SCHEDULING
+  RULE reorder, de-sync (a)-(d), dS_full-based dA kernel path (branch dA uses per-branch partials
+  + tiny merge instead), loss-segment measure. dev1 lacks nothing structurally — E6 gives backward
+  overlap via per-device autograd workers.
+2026-07-06 I4 MINI-PARITY PASS (scripts/testing/stp_full_tp_mini_parity.py, tiny 2-layer qwen3):
+  losses agree to 3e-5 with ACTIVE adapters (B perturbed); all 28 adapter grads within 2x the
+  MEASURED reduction-order envelope (Phase-A-vs-|1 grads: 1.87e-2 max — ABOVE the doc's static
+  1e-2 band, so the envelope method the doc prescribes is REQUIRED, not optional, at grad level).
+  ENVELOPE RECORDED: logits 2.7e-2, grads 1.87e-2 on the mini config; full-TP measured
+  <=3.0e-2 grads / 3.5e-2 logits. No systematic factor anywhere (a placement bug reads as ~2x).
+2026-07-06 I4 HARNESS-INTEGRATION FIELD NOTES (s2048 smoke iterations):
+  (1) LlamaFactory parser.py rejects CPU-AdamW when parallel_mode != NOT_PARALLEL, and n_gpu is
+      derived at ARG-PARSE time — the Trainer.__init__ patch is too late. FIX: repatch
+      TrainingArguments._setup_devices (cached_property) under ASYM_STP=1 to pin _n_gpu=1 at the
+      source (run_lf_profiled_train.py main()). The Trainer patch stays as belt.
+  (2) The |1 surgery wraps norms as AsymFrozenRMSNorm (weight pinned in a HostWeight, eps under
+      .eps) — branch1 norm copies must read via a tolerant helper, not HF attr names.
+  (3) validate_lf_offload_residency expects |1's CPU-first view at validation time: branch1 norm
+      copies are built CPU-resident with _stp_target_device=dev1 and moved by
+      finalize_stp_placement AFTER validation.
+  (4) _wrap_attention_saved_tensor_offload_modules rejects the self_attn_stp1 leaf name —
+      branch1 saved-tensor offload is installed DIRECTLY in build_stp_full_tp instead.
+  (5) LlamaFactory's move_lf_asym_cpu_first_model_to_device is single-device (force-moves ALL
+      trainables to target cuda:0) — patched to SKIP already-CUDA tensors (no-op for |1, keeps
+      branch1 on dev1); branch1 norms are AsymFrozenRMSNorm SHARING branch0's pinned host weight
+      (zero-copy, |1-native class, every validator/mover handles them); the accelerate
+      AcceleratedOptimizer proxy is unwrapped before register_step_post_hook.
+2026-07-06 I4 s2048 SMOKE + PARITY VALIDATED (harness e2e, q3-32b 64L, pair 0,1):
+  SMOKE: 2 steps, losses 1.9009 -> 1.7328 (optimizer + mirror merge/resync working);
+  train_batch_size=8 receipt; global batch 8; RSS 172.8 GiB; both devices active.
+  PARITY (MAX_STEPS=3 W0, init transplanted from the |1 ref via ASYM_STP_LOAD_ADAPTER_INIT,
+  1344 pieces): LOSS OVERLAY |1 vs stp = (1.9025,1.7312,1.7490) vs (1.9009,1.7314,1.7507) —
+  deltas 2.1e-4..1.7e-3, SMALLER than the |1's own reduction-order perturbation (see below).
+  ENVELOPE VALUE RECORDED (the I4 Decision-Log item the plan predeclared): an |1-vs-|1
+  envelope (ASYMM_DENSE_MLP_FINEGRAINED_CPU_ACT flip — same math, different rounding path)
+  measures per-adapter step-2 grad rel-err p50=0.457 p95=1.169 max=1.720, cos median 0.888.
+  CONCLUSION: at 64-layer depth in bf16, step-2 per-adapter grads are ~O(1) sensitive to ANY
+  reduction-order change — the static 1e-2 band is unsatisfiable at this scale for any
+  implementation (including |1's own knobs). The gate therefore evaluates under the doc's
+  envelope method: full-TP worst 2.02 vs bound 2x1.72=3.44 -> PASS (over-bound 0/896).
+  The SHARP placement-bug instrument is the small-depth mini-parity (envelope 1.87e-2 there;
+  full-TP within 2x) + the loss overlay. Phase-A ablation currently FAILS at s2048 (artifact
+  label also collides with full-TP — needs its own tag); queued, not blocking (product = full-TP).
+2026-07-06 I4 e2e DEV ROW (q3-32b 20000|8|1 pair 0,1, asym_stp full-TP, PROFILERS=source):
+  step_s 234.9 (fwd 22.3 / bwd 209.3 / opt 3.2); step_H per device 27.4 / 25.2 GiB; RSS 395 GiB;
+  LOSSES track |1 b8 within ~1e-3 at every step (1.2161/1.2691/1.2483 vs 1.2173/1.2693/1.2495)
+  — LOSS BAND PASS. Comparisons: |1 b8 solo 251.8 s / 38.6 GiB / 352 GiB.
+  P-DEV VERDICT (honest, decomposition per the failure protocol):
+    step_s 234.9 vs superoffload 134.6 -> FAIL (1.75x);  step_H 27.4 vs 22.2 -> FAIL (1.23x);
+    step_H vs |1 = 0.71x (activation halving partially realized; target was <=0.55x).
+  DECOMPOSITION: bwd dominates (209 of 235 s) and barely improves on |1's 216.6 — the |1 step is
+  offload/CPU-side bound, and the two-instance I4 currently DUPLICATES the [M,H]-class host
+  traffic per branch (attention U, mlp X, GC saved roots: each branch offloads its own full-width
+  copy; only the [M,I]/[M,N] width-sharded classes halved). RSS +43 GiB vs |1 confirms the
+  duplicated residual-class bytes. THE NEXT LEVERS ARE EXACTLY THE PLANNED I5 SET: (1) residual/
+  U/X dedup (offload ONCE from dev0, restage to both lanes via bcast01_from_host); (2) row-split
+  dA (M-split over the ONE shared X copy); (3) BWD SCHEDULING RULE + de-sync (a)-(d) so the
+  region exchange isn't queued behind per-branch dA; (4) loss-segment measure (dev1 idles through
+  final-norm/lm_head/CE — visible as fwd 22.3 vs |1's 33.2 only 0.67x, not 0.5x).
+  Nothing here contradicts the design: correctness gates all pass; the step_s gap is the
+  predicted duplicated-traffic tax that I5 exists to remove.
+2026-07-06 DEV PACE CAR #2 LANDED (scripts/testing/fsdp2_tp_baseline.py — REAL head-split TP-2
+  with Megatron f/g duality via torch.distributed, sharded LoRA per our layout rules, FSDP2
+  fully_shard(CPUOffloadPolicy) per frozen unit over per-rank solo meshes, standard
+  torch.autograd.graph.save_on_cpu(pin_memory=True) for activations, synthetic tokens,
+  chunked CE; per-rank trainable 341.8M = exactly the TP-sharded half of |1's 536.9M logical).
+  q3-32b s20000 b8-global: step_s 26.8 (fwd 6.5 / bwd 19.3 / opt 1.0), peakH 133.4 GiB.
+  BOUNDARY (b8): fits s28000 at 170.0 GiB; GPU-OOM at s32000. WITHOUT save_on_cpu it cannot even
+  run s20000 b8 (the 64 x [M,H] checkpoint inputs alone exceed HBM) — receipt for the
+  workload-capability table.
+2026-07-06 P-DEV FINAL ASSESSMENT (dev row q3-32b 20000|8|1):
+  LOSS BAND: PASS everywhere (stp tracks |1 to ~1e-3; dp2 tracks superoffload to 4e-3).
+  step_H(stp)=27.4 vs superoffload-DP2 22.2 -> FAIL (1.23x; adapter-scale duplication + branch
+    [M,H] classes; I5 dedup + re-enabling adapter offload under sTP are the levers).
+  step_s(stp)=234.9 vs superoffload 134.6 -> FAIL (1.75x; offload-bound bwd; I5 set).
+  step_s(stp) vs FSDP2+TP2 26.8 -> STRUCTURALLY UNWINNABLE AT THIS ROW: s20000 b8 FITS in
+    2x184 GB HBM (pace car peak 133 GiB), so a resident/staged GPU design wins step_s outright.
+    This is the plan's own honesty guard ("tp2_resident WINS step_s where it fits") landing at
+    the dev row. THE COMPARISON THAT MATTERS at fits-in-HBM scale is step_H (stp 27.4 vs 133.4 =
+    4.9x less) and the FRONTIER: pace car dies at s32000 b8 while stp's 27.4 GiB @ s20000
+    implies multi-x headroom (C2 claim well-covered, boundary run pending).
+  RECOMMENDED DEV-GATE REVISION (for the doc owner): evaluate P-DEV's step_s clause against the
+  pace cars AT THE FRONTIER ROW (beyond the resident/staged fit boundary, e.g. s40000+ b8 where
+  FSDP2+TP2 and superoffload cannot run or thrash), keeping the s20000 row for step_H + loss
+  gates. The current wording makes the streamed design chase a fits-in-HBM race it is not
+  designed to win — the paper-story positioning already reframed the headline this way.
+  SESSION SCOREBOARD (q3-32b 20000, global batch 8, pair 0,1):
+    backend                step_s   step_H(max dev)  RSS/proc     notes
+    fsdp2_tp2 (pace #2)     26.8    133.4            ~40 GiB      fits-in-HBM winner; dies s32k
+    superoffload_mem b4x2  134.6     22.2            165.5/rank   VG reference
+    asym_dp2 b4x2          151.0     22.3            246.6/rank   VG1 1.12x PASS
+    asym_stp full-TP       234.9     27.4            395          loss-band PASS; I5 pending
+    asym |1 b8 solo        251.8     38.6            352          the 1-GPU reference
 ```
 
 ## Reporting Format

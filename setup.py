@@ -35,6 +35,10 @@ def get_ext_modules():
         '-std=c++17', '-O3', '-fPIC',
         '-Wno-psabi', '-Wno-deprecated-declarations',
         f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}',
+        # gb200_tp.md I1 FIX A: context-INDEPENDENT runtime-API kernel loading
+        # (cudaLibraryLoadFromFile -> cudaKernel_t, materialized per-device on demand), so one
+        # process can launch the same JIT'd GEMM on BOTH GPUs. Requires CUDART >= 12.8.
+        '-DDG_JIT_USE_RUNTIME_API',
     ]
 
     return [CUDAExtension(
@@ -59,6 +63,7 @@ def get_ext_modules():
             'nvcc': [
                 '-std=c++17', '-O3', '-Xcompiler', '-fPIC',
                 f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}',
+                '-DDG_JIT_USE_RUNTIME_API',
             ],
         },
     )]

@@ -1062,6 +1062,13 @@ def _dispatch_nt(
     profile_label: str = "",
     bf16_output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
+    if getattr(b_cpu, "_stp", None) is not None:
+        # A ROW carrier's element order is shard-major, NOT logical [N,K]; consuming it here
+        # would silently compute garbage. Every sTP-sharded weight must route through
+        # asym_bf16_cpu_right_matmul (the I3 choke point), which dispatches per-shard.
+        raise RuntimeError(
+            "sTP-sharded weight reached _dispatch_nt unrouted; route via asym_bf16_cpu_right_matmul"
+        )
     _check_backend(backend)
     precision = _normalize_precision(precision)
 
@@ -1182,6 +1189,21 @@ def asym_bf16_cpu_right_matmul(
                     transpose_b=transpose_b,
                 )
             )
+    stp_info = getattr(right_cpu, "_stp", None)
+    if stp_info is not None:
+        out = _stp_base_gemm(
+            left,
+            stp_info,
+            backend=backend,
+            stats=stats,
+            phase=phase,
+            compiled_dims=compiled_dims,
+            transpose_b=transpose_b,
+            output_dtype=output_dtype,
+            tag=tag,
+        )
+        _record_attention_cpu_right_call(stats, phase=phase, tag=tag)
+        return out
     out = _dispatch_nt(
         left,
         right_cpu,
@@ -1196,6 +1218,81 @@ def asym_bf16_cpu_right_matmul(
     )
     _record_attention_cpu_right_call(stats, phase=phase, tag=tag)
     return out
+
+
+def _stp_base_gemm(
+    left: torch.Tensor,
+    info,
+    *,
+    backend: str,
+    stats: Optional[AsymExecutionStats],
+    phase: str,
+    compiled_dims: str,
+    transpose_b: bool,
+    output_dtype: torch.dtype,
+    tag: str,
+) -> torch.Tensor:
+    """Stage I3 Phase A (gb200_tp.md): ONE logical base GEMM -> two back-to-back async
+    device GEMMs over the I2 shard views + one NVLink exchange. The model/residual stays
+    on dev0; dev1 receives its operand via bcast01 and returns its piece via to0/to0_sum.
+    RAW op — the calling fine-grained Functions own autograd (frozen base => dgrad only).
+
+    dev1 launch order is FIRST so both GEMMs overlap (E4); the dev1 kernel runs under
+    torch.cuda.device(dev1) + rt.compute[1] (JIT launches ride the CURRENT device's
+    current stream); bcast01's exit contract lands its wait on compute[1] because that is
+    dev1's current stream inside the with-block.
+    """
+    from asym_gemm.training.stp_runtime import get_runtime, _record
+
+    rt = get_runtime()
+    s0, s1 = info.shards
+
+    def shard_gemm(operand: torch.Tensor, shard: torch.Tensor, label: str) -> torch.Tensor:
+        return _dispatch_nt(
+            operand,
+            shard,
+            backend=backend,
+            stats=stats,
+            phase=phase,
+            compiled_dims=compiled_dims,
+            transpose_b=transpose_b,
+            precision="bf16",
+            profile_label=label,
+            bf16_output_dtype=output_dtype,
+        )
+
+    def dev1_branch(operand: torch.Tensor):
+        with torch.cuda.device(rt.d[1]), torch.cuda.stream(rt.compute[1]):
+            x1 = rt.bcast01(operand)
+            y1 = shard_gemm(x1, s1, f"{tag}.stp1")
+            ready = _record(rt.compute[1])
+        return y1, ready
+
+    if info.kind == "col":
+        if not transpose_b:
+            # fwd: y = x @ W^T, output split on N -> gather [M, N] on dev0
+            y1, ev1 = dev1_branch(left)
+            y0 = shard_gemm(left, s0, f"{tag}.stp0")
+            return torch.cat([y0, rt.to0(y1, producer_event=ev1)], dim=1)
+        # dX: dx = g @ W, contraction over the split N -> partial sum
+        n0 = info.split
+        g1 = left[:, n0:].contiguous()
+        y1, ev1 = dev1_branch(g1)
+        dx0 = shard_gemm(left[:, :n0].contiguous(), s0, f"{tag}.stp0")
+        return rt.to0_sum(dx0, y1, producer_event=ev1)
+    if info.kind != "row":
+        raise RuntimeError(f"unsupported stp shard kind '{info.kind}' (grouped is Stage I7)")
+    k0 = info.split
+    if not transpose_b:
+        # fwd: y = x @ W^T, contraction over the split K -> partial sum
+        x1 = left[:, k0:].contiguous()
+        y1, ev1 = dev1_branch(x1)
+        y0 = shard_gemm(left[:, :k0].contiguous(), s0, f"{tag}.stp0")
+        return rt.to0_sum(y0, y1, producer_event=ev1)
+    # dX: dx = g @ W, output split on K -> gather [M, K] on dev0
+    y1, ev1 = dev1_branch(left)
+    dx0 = shard_gemm(left, s0, f"{tag}.stp0")
+    return torch.cat([dx0, rt.to0(y1, producer_event=ev1)], dim=1)
 
 
 def _dispatch_grouped_nt(

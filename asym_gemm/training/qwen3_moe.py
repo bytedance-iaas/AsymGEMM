@@ -2799,8 +2799,22 @@ class AsymQwen3Experts(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
+        ep_range = getattr(self, "ep_expert_range", None)
         with prof_range(self._forward_range("route_metadata")):
-            metadata = build_contiguous_route_metadata(top_k_index, top_k_weights, num_experts=self.num_experts)
+            metadata = build_contiguous_route_metadata(
+                top_k_index, top_k_weights,
+                num_experts=getattr(self, "ep_num_experts_full", None) or self.num_experts,
+            )
+            if ep_range is not None:
+                # sEP static EP-2 (gb200_ep.md E1/tp.md I7): contiguous slice to this
+                # device's expert range; scatter output becomes the device-local PARTIAL.
+                from .stp_moe import ep_slice_route_metadata
+
+                metadata = ep_slice_route_metadata(metadata, ep_range[0], ep_range[1])
+                if metadata.num_routes == 0:
+                    # no tokens routed to this device's experts this microbatch: the
+                    # partial is exactly zero (dX contribution zero; combine adds peer's).
+                    return hidden_states.new_zeros(metadata.num_tokens, self.hidden_dim)
         with prof_range(self._forward_range("route_metadata", "dense_groups")):
             offsets, experts = make_dense_group_metadata(
                 metadata.expert_offsets,
@@ -2989,6 +3003,74 @@ class AsymQwen3Router(nn.Module):
         return router_logits, router_top_value, router_indices
 
 
+class _EpBalanceStats:
+    """gb200_ep.md E0: per-layer expert token histograms + hypothetical static-E/2 device
+    shares, accumulated across the run and dumped at exit (ASYM_EP_STATS=1;
+    path via ASYM_EP_STATS_PATH). Cheap: one bincount per MoE forward."""
+
+    def __init__(self) -> None:
+        self.counts: dict[str, torch.Tensor] = {}
+        self.dev_share_max: dict[str, list[float]] = {}
+        self.calls = 0
+        import atexit
+
+        atexit.register(self.dump)
+
+    def record(self, key: str, top_k_index: torch.Tensor, num_experts: int) -> None:
+        counts = torch.bincount(top_k_index.reshape(-1), minlength=num_experts).cpu()
+        acc = self.counts.get(key)
+        self.counts[key] = counts if acc is None else acc + counts
+        half = num_experts // 2
+        d0 = int(counts[:half].sum())
+        total = int(counts.sum())
+        if total > 0:
+            self.dev_share_max.setdefault(key, []).append(max(d0, total - d0) / total)
+        self.calls += 1
+
+    def dump(self) -> None:
+        if not self.counts:
+            return
+        path = os.environ.get("ASYM_EP_STATS_PATH", "ep_balance_stats.json")
+        try:
+            import json
+
+            layers = {}
+            for key, counts in sorted(self.counts.items()):
+                c = counts.to(torch.float64)
+                total = float(c.sum())
+                if total <= 0:
+                    continue
+                shares = self.dev_share_max.get(key, [])
+                layers[key] = {
+                    "tokens": int(total),
+                    "hottest_expert_share": float(c.max() / total),
+                    "static_e2_device_share_mean": (sum(shares) / len(shares)) if shares else None,
+                    "static_e2_device_share_max": max(shares) if shares else None,
+                    "counts": [int(x) for x in counts.tolist()],
+                }
+            agg = [v["static_e2_device_share_max"] for v in layers.values() if v["static_e2_device_share_max"]]
+            report = {
+                "calls": self.calls,
+                "skew_hot": _EP_SKEW_HOT,
+                "loss_invalid": _EP_SKEW_HOT > 0,
+                "worst_layer_static_e2_device_share": max(agg) if agg else None,
+                "layers": layers,
+            }
+            with open(path, "w") as fh:
+                json.dump(report, fh, indent=2, sort_keys=True)
+        except Exception as exc:  # pragma: no cover - atexit best-effort
+            print(f"[asym-ep] stats dump failed: {exc}")
+
+
+_EP_SKEW_HOT = float(os.environ.get("ASYM_EP_SKEW_HOT", "0") or 0.0)
+_EP_STATS = _EpBalanceStats() if os.environ.get("ASYM_EP_STATS") == "1" else None
+if _EP_SKEW_HOT > 0 and os.environ.get("ASYM_EP_SKEW_ACK") != "1":
+    raise RuntimeError(
+        "ASYM_EP_SKEW_HOT forces routing (loss-INVALID, timing-only rows; HC-EP1). "
+        "Set ASYM_EP_SKEW_ACK=1 to acknowledge."
+    )
+
+
 class AsymQwen3MoeBlock(nn.Module):
     """Qwen3 MoE block wrapper that owns frozen router execution."""
 
@@ -3086,6 +3168,17 @@ class AsymQwen3MoeBlock(nn.Module):
                 top_k_index = top_k_index.detach()
             if top_k_weights.dtype != hidden_states_2d.dtype:
                 top_k_weights = top_k_weights.to(dtype=hidden_states_2d.dtype)
+            if _EP_SKEW_HOT > 0.0:
+                # HC-EP1: synthetic hot-expert skew AFTER detach — forward values garbage,
+                # kernel work real. First ceil(alpha * slots) routed slots -> expert 0.
+                flat_idx = top_k_index.reshape(-1)
+                n_force = int(_EP_SKEW_HOT * flat_idx.numel())
+                if n_force > 0:
+                    top_k_index = top_k_index.clone()
+                    top_k_index.reshape(-1)[:n_force] = 0
+            if _EP_STATS is not None:
+                num_experts = getattr(self.config, "num_experts", None) or int(top_k_index.max()) + 1
+                _EP_STATS.record(self.profile_prefix, top_k_index, int(num_experts))
             return top_k_index, top_k_weights, None
 
         raise TypeError(
