@@ -256,14 +256,40 @@ class Int8ExpertConverter:
             # Expect a down-like and a gate_up-like fused tensor.
             gate_up_name = next(p for p in projs if "gate_up" in p)
             down_name = next(p for p in projs if "down" in p)
-            gate_up = self._load(f"{prefix}{gate_up_name}").to(torch.bfloat16)  # [E,H,2I]
-            down_fused = self._load(f"{prefix}{down_name}").to(torch.bfloat16)  # [E,I,H]
-            E, H, twoI = gate_up.shape
-            assert twoI == 2 * self.inter, f"unexpected fused 2I={twoI}"
-            gate_up_t = gate_up.transpose(1, 2).contiguous()  # [E, 2I, H]
-            gate = gate_up_t[:, : self.inter, :].contiguous()
-            up = gate_up_t[:, self.inter:, :].contiguous()
-            down = down_fused.transpose(1, 2).contiguous()    # [E, H, I]
+            gate_up = self._load(f"{prefix}{gate_up_name}").to(torch.bfloat16)
+            down_fused = self._load(f"{prefix}{down_name}").to(torch.bfloat16)
+            # Two fused-expert conventions exist, both with gate in the first
+            # `inter` slots of the 2I axis (contiguous halves, not interleaved):
+            #   [E, H, 2I] / [E, I, H] — activation-dim-last (transformers 4.x
+            #                            packed experts, Qwen3-Next era)
+            #   [E, 2I, H] / [E, H, I] — nn.Linear weight order (transformers
+            #                            5.x Qwen3-Next / Qwen3.5:
+            #                            F.linear(x, w[e]).chunk(2, dim=-1))
+            # Detect by shape; refuse the ambiguous H == 2I / H == I cases.
+            H, I, twoI = self.hidden, self.inter, 2 * self.inter
+            if H == twoI or H == I:
+                raise ValueError(
+                    f"fused layout is ambiguous when hidden ({H}) equals "
+                    f"2*inter ({twoI}) or inter ({I}); split manually"
+                )
+            if tuple(gate_up.shape[1:]) == (H, twoI):
+                gate_up = gate_up.transpose(1, 2)             # -> [E, 2I, H]
+            elif tuple(gate_up.shape[1:]) != (twoI, H):
+                raise ValueError(
+                    f"unrecognized fused gate_up shape {tuple(gate_up.shape)}; "
+                    f"expected [E, {H}, {twoI}] or [E, {twoI}, {H}]"
+                )
+            gate = gate_up[:, :I, :].contiguous()
+            up = gate_up[:, I:, :].contiguous()
+            if tuple(down_fused.shape[1:]) == (I, H):
+                down = down_fused.transpose(1, 2).contiguous()  # -> [E, H, I]
+            elif tuple(down_fused.shape[1:]) == (H, I):
+                down = down_fused.contiguous()
+            else:
+                raise ValueError(
+                    f"unrecognized fused down shape {tuple(down_fused.shape)}; "
+                    f"expected [E, {I}, {H}] or [E, {H}, {I}]"
+                )
             return gate, up, down
 
         gate_list, up_list, down_list = [], [], []
