@@ -40,11 +40,6 @@ namespace py = pybind11;
 
 namespace {
 
-void check(cg_status_t s, const char* where) {
-  if (s == CG_OK) return;
-  throw std::runtime_error(std::string(where) + " failed: status=" + std::to_string((int)s));
-}
-
 // ---------------------------------------------------------------------------
 // NUMA helpers (no libnuma dependency)
 // ---------------------------------------------------------------------------
