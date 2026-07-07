@@ -75,26 +75,50 @@ def clear_activation_offload_cpu_pool() -> None:
     _CPU_BUFFER_POOL_MAX_CACHED_BYTES = 0
 
 
+_POOL_ROW_BUCKET = 65536  # dim-0 bucket for >=2D buffers: variable routed-row counts (they
+# differ per layer/branch/step under EP sharding) must collapse onto few reusable keys, or
+# every allocation is a fresh cudaHostAlloc (measured: ~7 GB/layer of pinned allocs = 100s+
+# of backward). Buffers are allocated at the bucketed size; callers receive an exact-shape
+# dim-0 narrow (contiguous); _return_cpu recovers the base via `_asym_pool_base`.
+
+
 def _alloc_cpu(shape: tuple[int, ...], dtype: torch.dtype, *, pin_memory: bool) -> torch.Tensor:
     pinned = bool(pin_memory and torch.cuda.is_available())
-    key = (dtype, tuple(int(dim) for dim in shape), pinned)
+    shape = tuple(int(dim) for dim in shape)
+    bucket_rows = 0
+    if _GOV is None and len(shape) >= 2 and shape[0] > 0:
+        granule = _POOL_ROW_BUCKET if shape[0] > _POOL_ROW_BUCKET else max(8192, 1)
+        bucket_rows = ((shape[0] + granule - 1) // granule) * granule
+    alloc_shape = (bucket_rows,) + shape[1:] if bucket_rows else shape
+    key = (dtype, alloc_shape, pinned)
+
+    def _narrow(base: torch.Tensor) -> torch.Tensor:
+        if not bucket_rows or base.shape[0] == shape[0]:
+            return base
+        view = base.narrow(0, 0, shape[0])
+        view._asym_pool_base = base  # type: ignore[attr-defined]
+        return view
+
     pool = _CPU_BUFFER_POOL.get(key)
     if pool:
         tensor = pool.pop()
         if not pool:
             _CPU_BUFFER_POOL.pop(key, None)
-        return tensor
+        return _narrow(tensor)
     if _GOV is not None and pinned:
         # C8: aligned, padded pinned storage so io_ready() is True (spill-eligible); exact-shape view.
         return _GOV.alloc_cpu(key[1], dtype)
     try:
-        return torch.empty(key[1], device="cpu", dtype=dtype, pin_memory=pinned)
+        return _narrow(torch.empty(alloc_shape, device="cpu", dtype=dtype, pin_memory=pinned))
     except RuntimeError:
-        return torch.empty(key[1], device="cpu", dtype=dtype)
+        return _narrow(torch.empty(alloc_shape, device="cpu", dtype=dtype))
 
 
 def _return_cpu(tensor: torch.Tensor, *, pin_memory: bool) -> None:
     global _CPU_BUFFER_POOL_EVICTIONS, _CPU_BUFFER_POOL_MAX_CACHED_BYTES
+    base = getattr(tensor, "_asym_pool_base", None)
+    if base is not None:
+        tensor = base  # return the full bucketed buffer, keyed by its own shape
     if tensor.device.type != "cpu" or not tensor.is_contiguous():
         return
     pinned = bool(pin_memory and torch.cuda.is_available() and tensor.is_pinned())
@@ -245,7 +269,12 @@ class ActivationOffloadManager:
             _GOV.ensure_local(handle)          # un-spill if DURABLE, before reading the D2H event
         event = self._pending_cpu_ready_events.pop(int(handle.tensor.data_ptr()), None)
         if event is not None:
-            event.synchronize()
+            if torch.cuda.is_available():
+                # never block the host (Megatron rule): downstream copies/kernels on the
+                # current stream order themselves behind the producing D2H via this wait.
+                torch.cuda.current_stream().wait_event(event)
+            else:
+                event.synchronize()
 
     def stage(self, handle: CPUActivationHandle, *, tag: str | None = None) -> torch.Tensor:
         self.wait_cpu_ready(handle)
@@ -257,8 +286,23 @@ class ActivationOffloadManager:
             stage = torch.empty(shape, device=handle.original_device, dtype=handle.tensor.dtype)
             self._stage_cache[key] = stage
             self._stage_keys_by_ptr[int(stage.data_ptr())] = key
-        with torch.no_grad():
-            stage.copy_(handle.tensor, non_blocking=handle.tensor.is_pinned())
+        if handle.tensor.is_pinned() and handle.original_device.type == "cuda":
+            # H2D restage on the side stream; the compute stream waits on the EVENT so the
+            # copy overlaps preceding compute instead of serializing the compute stream.
+            from .attention_activation_offload import _h2d_restage_stream
+
+            compute_stream = torch.cuda.current_stream(handle.original_device)
+            side = _h2d_restage_stream(handle.original_device)
+            side.wait_stream(compute_stream)
+            with torch.no_grad(), torch.cuda.stream(side):
+                stage.copy_(handle.tensor, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(side)
+            compute_stream.wait_event(done)
+            stage.record_stream(side)
+        else:
+            with torch.no_grad():
+                stage.copy_(handle.tensor, non_blocking=handle.tensor.is_pinned())
         self._mark_stage_live(stage, stage_tag)
         return stage
 

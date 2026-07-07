@@ -1,0 +1,1 @@
+{"name": "q3-32b__asym_cpuadamwds__recomp-off-full-fg-ker000-ceil0000", "ceiling_seq": 68000, "ohbm": 8, "confirmed": true, "note": "", "live_probes": 16, "wall_s": 16576, "row": "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm8|ligerloss1 ; 68000|8|1 ; none|false|false|false|false|false"}

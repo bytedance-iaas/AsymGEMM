@@ -781,6 +781,9 @@ def prepare_grouped_lora_metadata(
     *,
     dense_experts: bool = False,
 ) -> GroupedLoRAMetadata:
+    memo = getattr(offsets, "_asym_lora_meta_memo", None)
+    if memo is not None and bool(dense_experts) in memo:
+        return memo[bool(dense_experts)]
     starts = offsets[:-1]
     ends = offsets[1:]
     active = ends > starts
@@ -788,20 +791,29 @@ def prepare_grouped_lora_metadata(
     active_offsets = ends[active].to(dtype=torch.int32).contiguous()
     if dense_experts:
         dense_expert_weights = int(active_offsets.numel()) == int(ends.numel())
-        return GroupedLoRAMetadata(
+        result = GroupedLoRAMetadata(
             offsets=offsets,
             experts=experts,
             active_experts=active_experts,
             active_offsets=active_offsets,
             dense_expert_weights=dense_expert_weights,
         )
-    return GroupedLoRAMetadata(
-        offsets=offsets,
-        experts=experts,
-        active_experts=active_experts,
-        active_offsets=active_offsets,
-        dense_expert_weights=False,
-    )
+    else:
+        result = GroupedLoRAMetadata(
+            offsets=offsets,
+            experts=experts,
+            active_experts=active_experts,
+            active_offsets=active_offsets,
+            dense_expert_weights=False,
+        )
+    if memo is None:
+        try:
+            offsets._asym_lora_meta_memo = {bool(dense_experts): result}  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    else:
+        memo[bool(dense_experts)] = result
+    return result
 
 
 def _metadata_or_prepare(

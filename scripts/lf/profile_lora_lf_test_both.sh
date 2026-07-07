@@ -100,12 +100,8 @@ else
   #   # "q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
   # )
   RUNS=(
-    # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # G-OOM 66k
-    # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 130000|8|1 ; none|false|false|false|false|false"
-    # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 135000|8|1 ; none|false|false|false|false|false"
-    # "q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false"
-    "q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 33000|8|1 ; none|false|false|false|false|false"
-    "q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 34000|8|1 ; none|false|false|false|false|false"
+    # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm8|ligerloss1 ; 68000|8|1 ; none|false|false|false|false|false" # ceiling (confirmed); C-OOM 69k, ohbm0 C-OOM 66k
+    # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 172000|8|1 ; none|false|false|false|false|false" # ceiling (max OK); G-OOM 188k
 
     # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 65000|8|1 ; none|false|false|false|false|false" # G-OOM 66k
 
@@ -3270,6 +3266,9 @@ run_job() {
     gradient_checkpointing=true
     use_unsloth_gc=true
     unsloth_recompute_save_on_cpu=true
+    # fix_gb200_ep.md F1: recompute-side save_on_cpu round-trips ~3TB/step pointlessly;
+    # allow explicit override for the A/B (apply to BOTH |1 and |2 for fairness).
+    [[ -n "${ASYM_GC_SAVE_ON_CPU_OVERRIDE:-}" ]] && unsloth_recompute_save_on_cpu="${ASYM_GC_SAVE_ON_CPU_OVERRIDE}"
     expert_policy=none
     ASYM_OFFLOAD_ACT_RECOMPUTE=0; actrecomp_label="$(actrecomp_tag 0)"
     ASYM_OFFLOAD_X_UNPACKED=0; xunpack_label="$(xunpack_tag 0)"
@@ -3615,6 +3614,15 @@ run_job() {
   local -a run_env=(
     ROOT="${ROOT}"
     NUMACTL_MODE="${NUMACTL_MODE:-membind}"
+    ASYM_EP_MODE="${ASYM_EP_MODE:-}"
+    ASYM_EP_DXTIME="${ASYM_EP_DXTIME:-}"
+    ASYM_EP_DXTIME_PATH="${ASYM_EP_DXTIME_PATH:-}"
+    ASYM_EP_STATS="${ASYM_EP_STATS:-}"
+    ASYM_EP_STATS_PATH="${ASYM_EP_STATS_PATH:-}"
+    ASYM_EP_SKEW_HOT="${ASYM_EP_SKEW_HOT:-}"
+    ASYM_EP_SKEW_ACK="${ASYM_EP_SKEW_ACK:-}"
+    EP_HOT_CHUNK_ROWS="${EP_HOT_CHUNK_ROWS:-}"
+    DG_EP_QUEUE_GRID_PCT="${DG_EP_QUEUE_GRID_PCT:-}"
     ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE:-0}"
     ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED:-0}"
 	    ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU}"

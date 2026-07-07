@@ -594,39 +594,67 @@ def _pad_grouped_input_for_asym(
         return a, offsets, None
 
     num_groups = int(experts.numel() - 1)
-    offsets_long = offsets.to(device=a.device, dtype=torch.long, non_blocking=True)
-    starts = offsets_long[:-1]
-    counts = (offsets_long[1:] - starts).clamp_min(0)
-    padded_counts = torch.div(counts + int(block_m) - 1, int(block_m), rounding_mode="floor") * int(block_m)
-    padded_offsets_long = torch.cat(
-        (
-            torch.zeros(1, device=a.device, dtype=torch.long),
-            torch.cumsum(padded_counts, dim=0),
-        ),
-        dim=0,
-    )
+    # The SAME offsets tensor serves every grouped call of a layer (fwd base/LoRA + all
+    # backward variants). The pad METADATA depends only on (offsets, block_m) — memoize it
+    # on the tensor so the .item() host sync (which drains deep async queues under sTP:
+    # measured as the top backward hotspot) happens once per layer instead of ~6-12x.
+    memo = getattr(offsets, "_asym_pad_memo", None)
+    memo_key = (int(block_m), int(a.shape[0]), str(a.device))
+    cached = None if memo is None else memo.get(memo_key)
+    if cached is not None:
+        total_padded, padded_offsets_long, safe_source_rows, valid_rows = cached
+        if total_padded == int(a.shape[0]):
+            return a, offsets, None
+    else:
+        offsets_long = offsets.to(device=a.device, dtype=torch.long, non_blocking=True)
+        starts = offsets_long[:-1]
+        counts = (offsets_long[1:] - starts).clamp_min(0)
+        padded_counts = torch.div(counts + int(block_m) - 1, int(block_m), rounding_mode="floor") * int(block_m)
+        padded_offsets_long = torch.cat(
+            (
+                torch.zeros(1, device=a.device, dtype=torch.long),
+                torch.cumsum(padded_counts, dim=0),
+            ),
+            dim=0,
+        )
 
-    # PyTorch allocations still require a Python integer shape. Keep this to one
-    # scalar read instead of the previous full offsets D2H copy and Python loops.
-    total_padded = int(padded_offsets_long[-1].item())
-    if total_padded == int(a.shape[0]):
-        return a, offsets, None
+        # PyTorch allocations still require a Python integer shape. Keep this to one
+        # scalar read instead of the previous full offsets D2H copy and Python loops.
+        total_padded = int(padded_offsets_long[-1].item())
+        if total_padded == int(a.shape[0]):
+            if memo is None:
+                memo = {}
+                try:
+                    offsets._asym_pad_memo = memo  # type: ignore[attr-defined]
+                except Exception:
+                    memo = None
+            if memo is not None:
+                memo[memo_key] = (total_padded, offsets, None, None)
+            return a, offsets, None
 
-    padded_rows = torch.arange(total_padded, device=a.device, dtype=torch.long)
-    group_idx = torch.bucketize(padded_rows, padded_offsets_long[1:], right=True)
-    group_idx = group_idx.clamp_max(max(num_groups - 1, 0))
-    group_starts = starts.index_select(0, group_idx)
-    group_counts = counts.index_select(0, group_idx)
-    local_rows = padded_rows - padded_offsets_long.index_select(0, group_idx)
-    valid_rows = local_rows < group_counts
-    source_rows = group_starts + local_rows
-    safe_source_rows = torch.where(valid_rows, source_rows, torch.zeros_like(source_rows))
+        padded_rows = torch.arange(total_padded, device=a.device, dtype=torch.long)
+        group_idx = torch.bucketize(padded_rows, padded_offsets_long[1:], right=True)
+        group_idx = group_idx.clamp_max(max(num_groups - 1, 0))
+        group_starts = starts.index_select(0, group_idx)
+        group_counts = counts.index_select(0, group_idx)
+        local_rows = padded_rows - padded_offsets_long.index_select(0, group_idx)
+        valid_rows = local_rows < group_counts
+        source_rows = group_starts + local_rows
+        safe_source_rows = torch.where(valid_rows, source_rows, torch.zeros_like(source_rows))
+        if memo is None:
+            memo = {}
+            try:
+                offsets._asym_pad_memo = memo  # type: ignore[attr-defined]
+            except Exception:
+                memo = None
+        if memo is not None:
+            memo[memo_key] = (total_padded, padded_offsets_long, safe_source_rows, valid_rows)
     padded = a.index_select(0, safe_source_rows)
     if padded.numel() > 0:
         padded = padded * valid_rows.reshape(-1, *([1] * (padded.dim() - 1))).to(dtype=padded.dtype)
 
     valid_padded_rows = torch.nonzero(valid_rows, as_tuple=False).flatten()
-    original_rows = source_rows.index_select(0, valid_padded_rows)
+    original_rows = safe_source_rows.index_select(0, valid_padded_rows)
     return (
         padded,
         padded_offsets_long.to(device=offsets.device, dtype=offsets.dtype),

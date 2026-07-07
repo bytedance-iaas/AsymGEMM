@@ -108,7 +108,7 @@ System Design:
     - LoRA offload kernels
         CPU-left LoRA-A forward and CPU-right LoRA-A gradient kernels that operate directly on pinned offloaded activations
 
-- AsymGEMM-guided activation offloading and scheduling for LoRA SFT: Decompose LoRA MLP/MoE forward and backward into fine-grained operators so large activations are recomputed, offloaded, or consumed directly from pinned CPU memory.
+- AsymGEMM-guided activation offloading and scheduling: Decompose LoRA MLP/MoE forward and backward into fine-grained operators so large activations are recomputed, offloaded, or consumed directly from pinned CPU memory.
     - Operator-aware activation policy
         split gate/up/activation/down/LoRA paths and retain only the tensors each later operator truly needs.
     - C2C-aware execution and GEMM
@@ -116,11 +116,13 @@ System Design:
     - Heterogeneous compute
         move memory-bound elementwise and low-rank work to CPU/offload-aware kernels, while keeping compute-dense GEMMs on GPU.
 
-- New hardware arichiecture/new module/how to do GB200 diffeent than GH200? Hardware-aware/GB200-aware module?
-
-- Multi-tier activation offload system using CPU and NVME: Enable spilling into NVME using FIFO asynchronously and prefetching based on LILO as efficient additional storage for activations.
-- Intgeration with deepspeed / SP for multiple superchips: Extend AsymLoRA with deepspeed and SP to accomodate longer sequences
-
+- [?]New hardware arichiecture/new module/how to do GB200 diffeent than GH200? Hardware-aware/GB200-aware module?
+- Ownerless EP on 2 GPUs for balancing MoE models' expert computes
+    - Debugging.....
+- Intgeration with TP on 2 GPUs for dense models
+    - Extend with TP for longer sequences
+- Multi-tier activation offload system using CPU and NVME
+    - Enable spilling into NVME using FIFO asynchronously and prefetching based on LILO as efficient additional storage for activations.
 
 Baselines:
 - KTransformers

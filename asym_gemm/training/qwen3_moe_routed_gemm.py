@@ -86,6 +86,9 @@ def _group_metadata_for_kernel(
     if experts.numel() < 2:
         raise ValueError("grouped metadata requires at least one group and a sentinel")
     num_groups = int(experts.numel() - 1)
+    memo = getattr(offsets, "_asym_kernel_meta_memo", None)
+    if memo is not None and str(device) in memo:
+        return memo[str(device)]
     if offsets.numel() == experts.numel():
         starts = offsets[:-1]
         ends = offsets[1:]
@@ -99,7 +102,15 @@ def _group_metadata_for_kernel(
         )
     offsets_i32 = pair_offsets.to(device=device, dtype=torch.int32, non_blocking=True).contiguous()
     experts_i32 = experts.to(device=device, dtype=torch.int32, non_blocking=True).contiguous()
-    return offsets_i32, experts_i32, int(experts_i32.numel())
+    result = (offsets_i32, experts_i32, int(experts_i32.numel()))
+    if memo is None:
+        try:
+            offsets._asym_kernel_meta_memo = {str(device): result}  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    else:
+        memo[str(device)] = result
+    return result
 
 
 def _check_supported_base(base, device: torch.device, *, compiled_dims: str) -> None:
@@ -192,6 +203,28 @@ def _pad_route_metadata_for_asym(
     if offsets.numel() != experts.numel():
         return offsets, token_indices, routing_weights, None
 
+    # The SAME (offsets, token_indices, routing_weights) trio serves every routed call of a
+    # layer (fwd + all backward variants): memoize the padded forms on the offsets tensor.
+    # Rebuilding per call cost one .item() sync + several GPU derivations each — measured as
+    # the dominant host time in the sTP backward. Downstream memos (pad/group-metadata) hit
+    # BECAUSE the returned tensors are now stable objects per layer.
+    memo = getattr(offsets, "_asym_route_pad_memo", None)
+    memo_key = (str(device), int(block_m), int(token_indices.numel()))
+    cached = None if memo is None else memo.get(memo_key)
+    if cached is not None:
+        return cached
+
+    def _remember(result):
+        holder = getattr(offsets, "_asym_route_pad_memo", None)
+        if holder is None:
+            holder = {}
+            try:
+                offsets._asym_route_pad_memo = holder  # type: ignore[attr-defined]
+            except Exception:
+                return result
+        holder[memo_key] = result
+        return result
+
     num_groups = int(experts.numel() - 1)
     offsets_long = offsets.to(device=device, dtype=torch.long, non_blocking=True)
     starts = offsets_long[:-1]
@@ -206,7 +239,7 @@ def _pad_route_metadata_for_asym(
     )
     total_padded = int(padded_offsets_long[-1].item())
     if total_padded == int(token_indices.numel()):
-        return offsets, token_indices, routing_weights, None
+        return _remember((offsets, token_indices, routing_weights, None))
 
     padded_rows = torch.arange(total_padded, device=device, dtype=torch.long)
     group_idx = torch.bucketize(padded_rows, padded_offsets_long[1:], right=True)
@@ -226,12 +259,12 @@ def _pad_route_metadata_for_asym(
         padded_weights = torch.zeros((total_padded,), device=device, dtype=routing_weights.dtype)
         padded_weights.index_copy_(0, valid_padded_rows, routing_weights.index_select(0, original_rows))
 
-    return (
+    return _remember((
         padded_offsets_long.to(device=offsets.device, dtype=offsets.dtype),
         padded_tokens,
         padded_weights,
         _RoutePadding(padded_rows=valid_padded_rows, original_rows=original_rows, output_m=int(token_indices.numel())),
-    )
+    ))
 
 
 def _routing_weights_arg(routing_weights: Optional[torch.Tensor], *, device: torch.device) -> torch.Tensor:
@@ -338,8 +371,10 @@ def down_dx_gather_left(
     grad_act = _unpad_grouped_output(grad_act_padded, route_unpad, output_m=output_m)
     if _t:
         _t5 = _t()
-        print(f"[dxtime] norm={1e3*(_t1-_t0):.1f} pad={1e3*(_t2-_t1):.1f} meta={1e3*(_t3-_t2):.1f} "
-              f"launch={1e3*(_t4-_t3):.1f} unpad={1e3*(_t5-_t4):.1f} ms", flush=True)
+        _p = _os.environ.get("ASYM_EP_DXTIME_PATH", "/tmp/asym_dxtime.log")
+        with open(_p, "a") as _fh:
+            _fh.write(f"norm={1e3*(_t1-_t0):.1f} pad={1e3*(_t2-_t1):.1f} meta={1e3*(_t3-_t2):.1f} "
+                      f"launch={1e3*(_t4-_t3):.1f} unpad={1e3*(_t5-_t4):.1f}\n")
     stats = getattr(base, "stats", None)
     if stats is not None:
         stats.qwen3_moe_routed_base_gather_left_calls += 1

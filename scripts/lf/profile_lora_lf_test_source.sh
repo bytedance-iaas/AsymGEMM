@@ -3270,6 +3270,9 @@ run_job() {
     gradient_checkpointing=true
     use_unsloth_gc=true
     unsloth_recompute_save_on_cpu=true
+    # fix_gb200_ep.md F1: recompute-side save_on_cpu round-trips ~3TB/step pointlessly;
+    # allow explicit override for the A/B (apply to BOTH |1 and |2 for fairness).
+    [[ -n "${ASYM_GC_SAVE_ON_CPU_OVERRIDE:-}" ]] && unsloth_recompute_save_on_cpu="${ASYM_GC_SAVE_ON_CPU_OVERRIDE}"
     expert_policy=none
     ASYM_OFFLOAD_ACT_RECOMPUTE=0; actrecomp_label="$(actrecomp_tag 0)"
     ASYM_OFFLOAD_X_UNPACKED=0; xunpack_label="$(xunpack_tag 0)"
@@ -3630,6 +3633,7 @@ run_job() {
     NUMACTL_MODE="${NUMACTL_MODE:-membind}"
     ASYM_EP_MODE="${ASYM_EP_MODE:-}"
     ASYM_EP_DXTIME="${ASYM_EP_DXTIME:-}"
+    ASYM_EP_DXTIME_PATH="${ASYM_EP_DXTIME_PATH:-}"
     ASYM_EP_STATS="${ASYM_EP_STATS:-}"
     ASYM_EP_STATS_PATH="${ASYM_EP_STATS_PATH:-}"
     ASYM_EP_SKEW_HOT="${ASYM_EP_SKEW_HOT:-}"

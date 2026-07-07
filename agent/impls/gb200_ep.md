@@ -37,12 +37,30 @@ WHY ONLY US / ONLY HERE: (a) weights STREAM per tile from the shared arena — a
     — the shared token pool is a layout change, not new traffic; (c) GB200 C2C coherence
     gives system-scope atomics on host memory to both GPUs + CPU (PCIe cannot; GH200 has one
     GPU per Grace; multi-process NCCL stacks have no shared queue and owned resident experts).
-MODES (one knob apart, the in-stack ladder): ASYM_EP_MODE = static | hostsplit | sep1 | sep.
-    static    = tp.md I7 (per-device E/2, owned)          -> vanilla-EP attribution rung
-    hostsplit = per-step exact-optimal host split          -> strongest scheduler rung
-    sep1      = queue over REPLICATED tokens (sTP shape)   -> mechanism ablation
-    sep       = queue over SHARDED batches + shared pool   -> THE HEADLINE (sEP-v2)
-paper names: EP-Static, EP-HostSplit, AsymLoRA-sEP (v1 reported only as an ablation).
+DATA-LAYOUT CORRECTION (user 2026-07-07 — critical for baseline validity):
+  REAL/deployed EP (Megatron, DeepSpeed) is laid on top of DP: each GPU holds a DIFFERENT
+  batch shard, experts are OWNED, tokens ALL-TO-ALL to their expert's owner (token on GPU0
+  needing GPU1's expert is shipped to GPU1 and back). So the REPRESENTATIVE vanilla-EP
+  baseline MUST be sharded-batch + owned + a2a — NOT the replicated-batch shape.
+  The replicated-batch static-EP we first built (same batch both GPUs, owned E/2, no a2a) is
+  numerically correct BUT is a SUBSTRATE-COMPOSITION ABLATION (it drops onto the sTP
+  replicated residual), not the real deployment shape. Demoted accordingly below.
+
+MODES (ASYM_EP_MODE), grouped by DATA LAYOUT:
+  REPLICATED-batch shapes (sTP substrate; ABLATION lane — same tokens on both GPUs):
+    static_rep = per-device E/2, owned (was 'static')     -> substrate ablation ONLY
+    sep1       = queue over replicated tokens              -> mechanism-isolation ablation
+  SHARDED-batch shapes (real EP layout; THE JUDGMENT LANE — different batch per GPU):
+    static     = owned E/2 + all-to-all dispatch           -> THE REAL vanilla-EP BASELINE
+    hostsplit  = per-step exact-optimal host split (sharded)-> strongest scheduler baseline
+    sep        = ownerless queue + shared host token pool   -> THE HEADLINE (sEP-v2)
+paper names: EP-Static (sharded, the real baseline), EP-HostSplit, AsymLoRA-sEP;
+  static_rep/sep1 reported ONLY as substrate/mechanism ablations, never as the EP baseline.
+KEY DIFFERENCE the headline turns on: real vanilla EP pays UNCONDITIONAL all-to-all (every
+  token to its expert-owner, every step) AND straggles under skew (owner of hot experts is
+  overloaded); sEP-v2 has NO owner and NO a2a — a tile's tokens are pulled from the shared
+  host pool by whichever GPU grabs it, so cross-GPU traffic is PROPORTIONAL TO IMBALANCE
+  REPAIRED (zero when balanced) and no device can straggle.
 pair 0,1 only. EXACT configs: next section.
 ```
 
@@ -290,10 +308,18 @@ TIER 1 (run-as-is, exists today): superoffload_mem / zero3_offload_mem on the Mo
   they pay full expert-bank host bytes per rank (2x)... and they are NOT balance-relevant
   (no EP) — never present them as an EP baseline, only as the system row.
 TIER 2 (in-stack rungs, OURS, one knob apart — the attribution ladder):
-  EP-Static (I7): the honest default everyone builds; its floor is provable + measurable.
-    BEATABLE BY CONSTRUCTION under skew (EG2 math); TIES at balanced routing (EG4 must show
-    we don't regress). This is the load-bearing comparison — same kernels, same offload,
-    same LoRA, ONLY the assignment differs => attribution is airtight.
+  EP-Static (SHARDED — the REAL vanilla-EP baseline, per the data-layout correction above):
+    different batch per GPU + owned E/2 + all-to-all token dispatch to expert-owners. This
+    is what Megatron/DeepSpeed actually deploy; it is THE load-bearing comparison for the
+    headline. BEATABLE ON TWO AXES: (1) unconditional a2a every step (sEP-v2 pays steal
+    traffic only ~ imbalance, zero when balanced); (2) owner-of-hot-experts straggles under
+    skew (EG2 math). Same kernels/offload/LoRA, only assignment+dispatch differ =>
+    attribution airtight. BUILD alongside v2 (a2a dispatch = the one extra mechanism vs the
+    replicated ablation; DispatchFn already exists in the sTP substrate).
+  EP-Static-rep + sep1 (REPLICATED ablations, NOT the EP baseline): same-batch-both-GPUs
+    variants used to isolate the substrate (static_rep) and the queue mechanism (sep1) from
+    the sharded-batch plumbing. Reported as ablations only; the paper's "vanilla EP" number
+    is ALWAYS the sharded EP-Static above.
   EP-HostSplit (E2): the STRONGEST scheduler-class baseline (FEPLB/ES-MoE-style, upgraded:
     per-step EXACT optimal split — counts are known host-side before launch, and it may
     split within an expert via duplicated expert ids in the metadata, which the grouped
@@ -437,6 +463,22 @@ IMPLEMENTATION SKETCH: branch keeps its E/2 slice for LoRA; base fwd/dX calls sw
   (full bank ref + FULL pre-slice metadata + ep_queued kernel, side=branch, SHARED pinned
   counters reset per launch-pair; d zero-initialized so unclaimed rows contribute zero).
   Thread metadata_full alongside the sliced metadata through the fg path for base calls.
+VERIFIED CONSTRAINTS (2026-07-07 scouting):
+  - fg FWD base calls (_base_forward -> AsymGroupedFrozenLinear.forward -> _asym_grouped_
+    bf16_nt frozen_linear.py:732/:753) use the PLAIN contiguous grouped kernel — the
+    ep_queued variant applies DIRECTLY (add ep_queue/ep_side kwargs + zero-init d).
+  - bwd dX uses the ROUTED kernel family (down_dx_gather_left -> qwen3_moe_bf16_down_dx_
+    gather_left_) — needs the SAME EP_QUEUED codegen treatment on the routed runtime class
+    (mechanical mirror of SM100BF16EpQueuedAsymGemmRuntime; n_blk fix already in the shared
+    kernel .cuh).
+  - THE REAL RESTRUCTURE: base-queued needs FULL-metadata packing while LoRA keeps sliced
+    packing — the fg chain interleaves base+LoRA per stage over ONE packed layout, so sep1
+    must pack FULL rows once (identical on both branches) and give the LORA stages sliced
+    ROW-RANGE views into the full pack (expert-sorted rows make branch d's rows one
+    contiguous range [off_full[lo_d], off_full[hi_d]) — a VIEW, no repack). Outputs: LoRA
+    delta scatters into the full-row buffer slice; base outputs queued-disjoint; act/mul
+    chain runs on full rows per branch (2x elementwise vs static — negligible) OR sliced
+    (needs range views only). This is the v1 wiring plan.
 GATES: unchanged (EG1/EG2/EG4/EG5); plus assert claimed==total_items per launch pair.
 ```
 
@@ -512,6 +554,14 @@ fwd_s bwd_s opt_s step_s  step_H(g0/g1)  RAM  moe_seg_s  busy0/busy1(%)  imb(%) 
 ## Decision Log (append-only; date + decision + evidence path)
 
 ```text
+2026-07-07 DATA-LAYOUT CORRECTION (user): the representative vanilla-EP baseline is
+  SHARDED-batch (different batch/GPU + owned experts + all-to-all), matching real
+  Megatron/DeepSpeed deployment AND matching sEP-v2's layout. The replicated-batch
+  static-EP first built is demoted to a substrate-composition ablation (static_rep); sep1
+  stays a mechanism-isolation ablation. ACTION: build the sharded EP-Static baseline
+  alongside v2 (E5) — a2a dispatch is the one extra mechanism (DispatchFn exists). The
+  paper's 'vanilla EP' row = sharded EP-Static, never the replicated one. Modes + TIER 2
+  updated above.
 2026-07-06 E3-KERNEL LANDED + PROBE PASS (G-E3.1 at probe level, incl. probe-level G-E1.3/G-E2.2).
   Kernel: NOT a persistent in-CTA loop — each CTA CLAIMS one (segment, n-block) item at KERNEL
   ENTRY (before any barrier/TMEM init; no-ticket CTAs exit at ~atomic cost) via 3 pinned-host
@@ -619,6 +669,40 @@ fwd_s bwd_s opt_s step_s  step_H(g0/g1)  RAM  moe_seg_s  busy0/busy1(%)  imb(%) 
   RULE ADOPTED: never quote first-run step times for a new kernel-variant config; verify JIT
   cache warm (rerun) before recording any timing row. The s20000 245s-bwd row must be RERUN
   warm before use.
+2026-07-07 WARM s20000 STATIC (steady-state rule: drop warmup + last step): steps
+  [158.0, 184.5]s; fwd 9.6-10.5s HEALTHY; bwd 118-169s. VERDICT REFINED: s2048's blowup was
+  JIT-cold (warm bwd 14-18s ~ 1.4x |1), but s20000's bwd is REAL and TOKEN-LINEAR (14s at
+  16k tokens -> ~140s at 160k = the duplicated per-branch [M,H] offload, 200-400 GB/step) —
+  tp.md I5 DEDUP IS NOW THE UNAVOIDABLE CRITICAL PATH to the e2e goal (bwd target: ~1x |1
+  via shared host copies + dual-lane split). MEASUREMENT RULE ADOPTED (user): timing rows
+  exclude the warmup AND the final step; MAX_STEPS=4 so 3 steady middle steps remain.
+2026-07-07 I5-LITE MECHANISM (design, next build): dedup the REPLICATED [M,H] saved
+  tensors (attention input h, mlp input g, residuals — bit-identical across branches by
+  Bcast01Fn/TPRegionFn construction) via a per-layer REPLICA REGISTRY + saved-tensor pack
+  hooks: StpDecoderLayer.forward tags branch tensors with a replica key (layer, slot);
+  branch0's pack hook offloads ONCE and registers the host handle; branch1's hook looks up
+  the key and returns a restager that H2Ds from the SAME host buffer to dev1 (dual-lane
+  reads of one pinned buffer proven at 174.7 GB/s/lane). Halves the duplicated D2H AND host
+  RSS for those tensors. Disjoint per-branch tensors (q/k/v shards, packed expert rows)
+  stay as-is. Target: s20000 bwd 118-169s -> ~|1's (~10-13s) + margin.
+2026-07-07 SUBSTRATE FIX ROUNDS (static s20000 bwd, steady-state): 245s(cold-JIT) ->
+  122-145(warm) -> 97-104 [R1: bucketed pinned pool — offload buffers keyed by exact shape
+  never reused under EP's variable routed counts; two-tier granule 8k/64k in
+  activation_offload._alloc_cpu] -> 72-86 [R2: async event-based unpack in
+  attention_activation_offload (was non_blocking=False + event.synchronize per restage);
+  side-stream + compute waits event] -> ~same [R3: same treatment in
+  ActivationOffloadManager.stage/wait_cpu_ready] -> 58-65 [R4: memoized pad/group metadata
+  on offsets tensors: _pad_grouped_input_for_asym, _pad_cpu_left_grouped_input_for_asym
+  (+pool for its pinned buffer), _expert_blocks, prepare_grouped_lora_metadata — each call
+  was paying .item()/sync-D2H/mask-size syncs] -> 49-67 [R5: memoized the SOURCE producers
+  (_pad_route_metadata_for_asym, _group_metadata_for_kernel, build_contiguous_route_metadata)
+  so downstream memos key on stable per-layer objects]. Loss stable at 4 decimals across ALL
+  rounds; block parity re-verified after each. METHODOLOGY: stack-census (py-spy burst) ->
+  fix top frame -> steady-state rerun; Megatron-LM deep-read receipts guide the discipline
+  (three streams, zero host sync, prefetch-1, uncapped pool; their EP pads to capacity —
+  our bucketing gets reuse without padded FLOPs). REMAINING gap vs |1 (~15-20s step): fresh
+  nsys decomposition in flight; named levers left: backward prefetch-1, fp32 SDPA save
+  volume, fwd d2h side-streaming.
 2026-07-06 DEVIATION (scope, honest): probe-level static/hostsplit rows stand in for
   G-E1.3/G-E2.2 until I7 lands the e2e substrate; E1/E2 e2e gates remain OPEN.
 ```

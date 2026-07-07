@@ -37,6 +37,13 @@ CONFIRM_TIMEOUT_S=${CONFIRM_TIMEOUT_S:-${PROBE_TIMEOUT_S}}
 MAX_PROBES=${MAX_PROBES:-40}               # live-run budget per config
 MAX_CONFIRM_ATTEMPTS=${MAX_CONFIRM_ATTEMPTS:-10}
 
+# run_lf host-mem watchdog (soft C-OOM before the kernel OOM killer). Injected
+# into every row's env{} so it is part of the config FINGERPRINT: the floor
+# moves the C-OOM boundary, so changing it must invalidate old ledger entries.
+# Floor is integer GB; poll accepts fractional seconds.
+WATCHDOG_FLOOR_GB=${WATCHDOG_FLOOR_GB:-35}
+WATCHDOG_POLL_S=${WATCHDOG_POLL_S:-0.05}
+
 # Driver safety knobs.
 GPU_MAX_USED_MIB=${GPU_MAX_USED_MIB:-6000}   # preflight: GPUs must be this empty
 MIN_RAM_AVAIL_GIB=${MIN_RAM_AVAIL_GIB:-64}   # preflight: MemAvailable floor
@@ -95,6 +102,9 @@ for _nv in SEQ_STEP SEQ_RESOLUTION SEQ_MIN SEQ_MAX PROBE_STEPS CONFIRM_STEPS WAR
 done
 (( PROBE_STEPS >= 1 )) || die "PROBE_STEPS must be >= 1 (0 measured steps would fake-OK probes)"
 (( CONFIRM_STEPS >= PROBE_STEPS )) || die "CONFIRM_STEPS must be >= PROBE_STEPS"
+[[ "${WATCHDOG_FLOOR_GB}" =~ ^(0|[1-9][0-9]*)$ ]] || die "WATCHDOG_FLOOR_GB must be an integer GB (run_lf validates ^[0-9]+$), got '${WATCHDOG_FLOOR_GB}'"
+(( WATCHDOG_FLOOR_GB >= 1 )) || die "WATCHDOG_FLOOR_GB=0 disables the watchdog; the search relies on its soft C-OOM"
+[[ "${WATCHDOG_POLL_S}" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] || die "WATCHDOG_POLL_S must be seconds (fractions ok), got '${WATCHDOG_POLL_S}'"
 OHBM_LADDER="${OHBM_LADDER// /}"
 [[ "${OHBM_LADDER}" =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]] || die "OHBM_LADDER must be comma-separated ints without leading zeros, got '${OHBM_LADDER}'"
 
@@ -141,6 +151,9 @@ for row in "${CONFIGS[@]}"; do
   line+=", \"warmup_steps\": ${WARMUP_STEPS}"
   line+=", \"probe_timeout_s\": ${PROBE_TIMEOUT_S}, \"confirm_timeout_s\": ${CONFIRM_TIMEOUT_S}"
   line+=", \"max_probes\": ${MAX_PROBES}, \"max_confirm_attempts\": ${MAX_CONFIRM_ATTEMPTS}"
+  # NOTE: an extra-json "env":{...} REPLACES this block (JSON last-key-wins) --
+  # re-include the watchdog keys there if you override env per row.
+  line+=", \"env\": {\"HOST_MEM_WATCHDOG_FLOOR_GB\": \"${WATCHDOG_FLOOR_GB}\", \"HOST_MEM_WATCHDOG_POLL_SECONDS\": \"${WATCHDOG_POLL_S}\"}"
   [[ -n "${extra}" ]] && line+=", ${extra}"
   line+="}"
   printf '%s\n' "${line}" >> "${GEN}"

@@ -119,60 +119,77 @@ def _pad_cpu_left_grouped_input_for_asym(
         return x_cpu, offsets, None, 0
 
     num_groups = int(experts.numel() - 1)
-    offsets_cpu = offsets.detach().to(device="cpu", dtype=torch.long)
-    starts = offsets_cpu[:-1]
-    counts = (offsets_cpu[1:] - starts).clamp_min(0)
-    padded_counts = torch.div(counts + int(block_m) - 1, int(block_m), rounding_mode="floor") * int(block_m)
-    kernel_block_m = _cpu_left_kernel_block_m()
-    compact_m_blocks = int(
-        torch.div(
-            padded_counts.max() + int(kernel_block_m) - 1,
-            int(kernel_block_m),
-            rounding_mode="floor",
-        ).item()
-    ) if int(padded_counts.numel()) > 0 else 0
-    padded_offsets_cpu = torch.cat(
-        (
-            torch.zeros(1, dtype=torch.long),
-            torch.cumsum(padded_counts, dim=0),
-        ),
-        dim=0,
-    )
+    # metadata (group starts/counts/padded offsets/index maps) depends only on
+    # (offsets, block_m): memoize on the offsets tensor. The un-memoized version cost one
+    # sync D2H + ~4 .item()s PER GROUP per call — a top backward hotspot under sTP.
+    memo = getattr(offsets, "_asym_cpuleft_pad_memo", None)
+    memo_key = (int(block_m), int(x_cpu.shape[0]), str(index_device))
+    cached = None if memo is None else memo.get(memo_key)
+    if cached is None:
+        offsets_cpu = offsets.detach().to(device="cpu", dtype=torch.long)
+        starts = offsets_cpu[:-1]
+        counts = (offsets_cpu[1:] - starts).clamp_min(0)
+        padded_counts = torch.div(counts + int(block_m) - 1, int(block_m), rounding_mode="floor") * int(block_m)
+        kernel_block_m = _cpu_left_kernel_block_m()
+        compact_m_blocks = int(
+            torch.div(
+                padded_counts.max() + int(kernel_block_m) - 1,
+                int(kernel_block_m),
+                rounding_mode="floor",
+            ).item()
+        ) if int(padded_counts.numel()) > 0 else 0
+        padded_offsets_cpu = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.long),
+                torch.cumsum(padded_counts, dim=0),
+            ),
+            dim=0,
+        )
+        total_padded = int(padded_offsets_cpu[-1])
+        copy_plan = []
+        padded_row_chunks: list[torch.Tensor] = []
+        original_row_chunks: list[torch.Tensor] = []
+        if total_padded != int(x_cpu.shape[0]):
+            for group in range(num_groups):
+                rows = int(counts[group])
+                if rows <= 0:
+                    continue
+                src_start = int(starts[group])
+                dst_start = int(padded_offsets_cpu[group])
+                copy_plan.append((dst_start, src_start, rows))
+                padded_row_chunks.append(torch.arange(dst_start, dst_start + rows, dtype=torch.long))
+                original_row_chunks.append(torch.arange(src_start, src_start + rows, dtype=torch.long))
+        if padded_row_chunks:
+            padded_rows = torch.cat(padded_row_chunks).to(device=index_device, non_blocking=True)
+            original_rows = torch.cat(original_row_chunks).to(device=index_device, non_blocking=True)
+        else:
+            padded_rows = torch.empty((0,), device=index_device, dtype=torch.long)
+            original_rows = torch.empty((0,), device=index_device, dtype=torch.long)
+        padded_offsets_dev = padded_offsets_cpu.to(device=offsets.device, dtype=offsets.dtype, non_blocking=True)
+        cached = (total_padded, compact_m_blocks, copy_plan, padded_rows, original_rows, padded_offsets_dev)
+        if memo is None:
+            memo = {}
+            try:
+                offsets._asym_cpuleft_pad_memo = memo  # type: ignore[attr-defined]
+            except Exception:
+                memo = None
+        if memo is not None:
+            memo[memo_key] = cached
 
-    total_padded = int(padded_offsets_cpu[-1].item())
+    total_padded, compact_m_blocks, copy_plan, padded_rows, original_rows, padded_offsets_dev = cached
     if total_padded == int(x_cpu.shape[0]):
         return x_cpu, offsets, None, compact_m_blocks
 
-    padded = torch.empty(
-        (total_padded, int(x_cpu.shape[1])),
-        device="cpu",
-        dtype=x_cpu.dtype,
-        pin_memory=True,
-    )
+    from .activation_offload import _alloc_cpu
+
+    padded = _alloc_cpu((total_padded, int(x_cpu.shape[1])), x_cpu.dtype, pin_memory=True)
     padded.zero_()
-
-    padded_row_chunks: list[torch.Tensor] = []
-    original_row_chunks: list[torch.Tensor] = []
-    for group in range(num_groups):
-        rows = int(counts[group].item())
-        if rows <= 0:
-            continue
-        src_start = int(starts[group].item())
-        dst_start = int(padded_offsets_cpu[group].item())
+    for dst_start, src_start, rows in copy_plan:
         padded[dst_start : dst_start + rows].copy_(x_cpu[src_start : src_start + rows])
-        padded_row_chunks.append(torch.arange(dst_start, dst_start + rows, dtype=torch.long))
-        original_row_chunks.append(torch.arange(src_start, src_start + rows, dtype=torch.long))
-
-    if padded_row_chunks:
-        padded_rows = torch.cat(padded_row_chunks).to(device=index_device, non_blocking=True)
-        original_rows = torch.cat(original_row_chunks).to(device=index_device, non_blocking=True)
-    else:
-        padded_rows = torch.empty((0,), device=index_device, dtype=torch.long)
-        original_rows = torch.empty((0,), device=index_device, dtype=torch.long)
 
     return (
         padded,
-        padded_offsets_cpu.to(device=offsets.device, dtype=offsets.dtype, non_blocking=True),
+        padded_offsets_dev,
         _GroupedPadding(padded_rows=padded_rows, original_rows=original_rows),
         compact_m_blocks,
     )

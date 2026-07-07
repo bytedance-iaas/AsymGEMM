@@ -223,6 +223,9 @@ def _expert_blocks(
     groups = max(int(offsets.numel()) - 1, 0)
     if groups == 0 or int(block_experts) <= 0:
         return []
+    memo = getattr(offsets, "_asym_expert_blocks_memo", None)
+    if memo is not None and int(block_experts) in memo:
+        return memo[int(block_experts)]
     blocks: list[tuple[int, int, torch.Tensor, torch.Tensor, slice]] = []
     for group_start in range(0, groups, int(block_experts)):
         group_end = min(groups, group_start + int(block_experts))
@@ -236,6 +239,13 @@ def _expert_blocks(
             dim=0,
         ).contiguous()
         blocks.append((row_start, row_end, block_offsets, block_expert_ids, slice(row_start, row_end)))
+    if memo is None:
+        try:
+            offsets._asym_expert_blocks_memo = {int(block_experts): blocks}  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    else:
+        memo[int(block_experts)] = blocks
     return blocks
 
 

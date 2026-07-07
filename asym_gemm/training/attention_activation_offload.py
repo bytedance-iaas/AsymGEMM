@@ -157,6 +157,21 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.lower() in {"1", "true", "yes", "y", "on"}
 
 
+_H2D_RESTAGE_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _h2d_restage_stream(device: torch.device) -> torch.cuda.Stream:
+    """Per-device side stream for backward restage copies (Megatron-style: the host never
+    blocks on a copy; the compute stream waits on an EVENT instead)."""
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    stream = _H2D_RESTAGE_STREAMS.get(idx)
+    if stream is None:
+        with torch.cuda.device(idx):
+            stream = torch.cuda.Stream()
+        _H2D_RESTAGE_STREAMS[idx] = stream
+    return stream
+
+
 def _empty_strided_cpu_like(tensor: torch.Tensor, *, pin_memory: bool) -> torch.Tensor:
     shape = tuple(int(dim) for dim in tensor.shape)
     stride = tuple(int(value) for value in tensor.stride())
@@ -308,16 +323,34 @@ class AttentionSavedTensorOffloadWrapper:
     def _unpack(self, packed: torch.Tensor | _SavedTensorOffloadHandle) -> torch.Tensor:
         if not isinstance(packed, _SavedTensorOffloadHandle):
             return packed
-        if packed.ready_event is not None:
-            packed.ready_event.synchronize()
         staged = torch.empty_strided(
             packed.original_shape,
             packed.original_stride,
             device=packed.original_device,
             dtype=packed.original_dtype,
         )
-        with torch.no_grad():
-            staged.copy_(packed.tensor, non_blocking=False)
+        compute_stream = torch.cuda.current_stream(packed.original_device)
+        if packed.tensor.is_pinned():
+            # Async restage on the side stream; compute waits on the EVENT, the host never
+            # blocks (the old non_blocking=False sync serialized the entire backward:
+            # measured ~97s of host-blocked copies at s20000 under sTP).
+            side = _h2d_restage_stream(packed.original_device)
+            if packed.ready_event is not None:
+                side.wait_event(packed.ready_event)
+            side.wait_stream(compute_stream)  # staged alloc ordering
+            with torch.no_grad(), torch.cuda.stream(side):
+                staged.copy_(packed.tensor, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(side)
+            compute_stream.wait_event(done)
+            staged.record_stream(side)
+            # keep the cpu buffer alive until the staged tensor dies (async copy source)
+            staged._asym_restage_keepalive = packed.tensor  # type: ignore[attr-defined]
+        else:
+            if packed.ready_event is not None:
+                packed.ready_event.synchronize()
+            with torch.no_grad():
+                staged.copy_(packed.tensor, non_blocking=False)
         self.unpack_calls += 1
         self.staged_bytes += packed.nbytes
         self.max_stage_bytes_live = max(self.max_stage_bytes_live, self.staged_bytes)

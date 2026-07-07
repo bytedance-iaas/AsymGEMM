@@ -314,6 +314,10 @@ def build_contiguous_route_metadata(
 ) -> ContiguousRouteMetadata:
     """Build compact expert-sorted route metadata with stable within-expert order."""
 
+    memo = getattr(topk_indices, "_asym_route_meta_memo", None)
+    if memo is not None and int(num_experts) in memo:
+        return memo[int(num_experts)]
+    source_indices = topk_indices
     weights = _validate_route_inputs(topk_indices, routing_weights, num_experts)
     topk_indices = topk_indices.to(dtype=torch.long)
     num_tokens, top_k = int(topk_indices.shape[0]), int(topk_indices.shape[1])
@@ -337,7 +341,7 @@ def build_contiguous_route_metadata(
         dim=0,
     )
 
-    return ContiguousRouteMetadata(
+    result = ContiguousRouteMetadata(
         token_indices=flat_tokens.index_select(0, sort_order),
         expert_indices=sorted_experts,
         route_indices=flat_routes.index_select(0, sort_order),
@@ -348,6 +352,14 @@ def build_contiguous_route_metadata(
         top_k=top_k,
         num_experts=num_experts,
     )
+    if memo is None:
+        try:
+            source_indices._asym_route_meta_memo = {int(num_experts): result}  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    else:
+        memo[int(num_experts)] = result
+    return result
 
 
 def build_masked_route_metadata(
