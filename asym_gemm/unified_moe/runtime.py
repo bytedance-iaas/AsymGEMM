@@ -345,27 +345,9 @@ def quantize_per_token_int8_gpu(
 # BF16 ↔ FP32 helpers (BF16 carried as uint16 bit pattern for CPU path)
 # ---------------------------------------------------------------------------
 
-def fp32_to_bf16_bits(x: np.ndarray) -> np.ndarray:
-    """Round-to-nearest-even fp32 → bf16. Returns uint16."""
-    x = np.ascontiguousarray(x, dtype=np.float32)
-    u32 = x.view(np.uint32)
-    rounding_bias = 0x7FFF + ((u32 >> 16) & 1)
-    return ((u32 + rounding_bias) >> 16).astype(np.uint16)
-
-
-def bf16_bits_to_fp32(u16: np.ndarray) -> np.ndarray:
-    u16 = np.ascontiguousarray(u16, dtype=np.uint16)
-    u32 = (u16.astype(np.uint32) << 16)
-    return u32.view(np.float32)
-
-
 def torch_bf16_to_np_bits(t: torch.Tensor) -> np.ndarray:
     assert t.dtype == torch.bfloat16 and not t.is_cuda
     return t.contiguous().view(torch.uint16).numpy(force=True)
-
-
-def silu_fp32(x: np.ndarray) -> np.ndarray:
-    return x / (1.0 + np.exp(-x))
 
 
 # ---------------------------------------------------------------------------
@@ -969,39 +951,6 @@ class Layer:
 
     def set_m_cpu(self, m_cpu: int) -> None:
         self.m_cpu = int(m_cpu)
-
-    # -----------------------------------------------------------
-    # CPU bucket — reads the same pinned row-major bytes as the GPU path
-    # -----------------------------------------------------------
-
-    def _cpu_expert_forward(
-        self,
-        e: int,
-        x_bf16_bits: np.ndarray,    # [m_e, hidden] uint16
-    ) -> np.ndarray:                # [m_e, hidden] fp32
-        slab = self.slab
-        m_e = x_bf16_bits.shape[0]
-        H, I = slab.hidden, slab.inter
-
-        # numpy views into the pinned tensors — same bytes, no copy.
-        gate_b   = slab.gate_int8[e].numpy()
-        gate_s   = slab.gate_scales[e].numpy()
-        up_b     = slab.up_int8[e].numpy()
-        up_s     = slab.up_scales[e].numpy()
-        down_b   = slab.down_int8[e].numpy()
-        down_s   = slab.down_scales[e].numpy()
-
-        c_gate = np.empty((m_e, I), dtype=np.float32)
-        c_up   = np.empty((m_e, I), dtype=np.float32)
-        _C.gemm_bf16_int8(self.rt, x_bf16_bits, gate_b, gate_s, c_gate, 1.0, 0.0)
-        _C.gemm_bf16_int8(self.rt, x_bf16_bits, up_b,   up_s,   c_up,   1.0, 0.0)
-
-        act = silu_fp32(c_gate) * c_up
-        act_bf16_bits = fp32_to_bf16_bits(act)
-
-        c_down = np.empty((m_e, H), dtype=np.float32)
-        _C.gemm_bf16_int8(self.rt, act_bf16_bits, down_b, down_s, c_down, 1.0, 0.0)
-        return c_down
 
     # -----------------------------------------------------------
     # GPU bucket — grouped INT8 over pinned weights, one launch / projection
