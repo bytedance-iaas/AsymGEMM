@@ -31,13 +31,13 @@ third_party_include_dirs = [
 
 
 # --------------------------------------------------------------------------- #
-# CPU extension (asym_gemm._cpu_C): vendored cpu_gemm (AMX INT8) + pybind11
+# CPU extension (asym_gemm._cpu_C): first-party cpu_gemm (AMX INT8) + pybind11
 # wrapper. Built via a CMake sub-step that produces libcpu_gemm.a, which the
 # Extension then links statically. Independent of the CUDA build: hosts
 # without CUDA still produce a working _cpu_C and unified_moe sub-package.
 # --------------------------------------------------------------------------- #
 
-CPU_GEMM_SRC = os.path.join(current_dir, 'third-party', 'cpu_gemm')
+CPU_GEMM_SRC = os.path.join(current_dir, 'csrc_cpu', 'cpu_gemm')
 CPU_GEMM_BUILD = os.path.join(current_dir, 'build', 'cpu_gemm')
 CPU_GEMM_LIB = os.path.join(CPU_GEMM_BUILD, 'libcpu_gemm.a')
 
@@ -86,14 +86,11 @@ def _sources_mtime(root):
 
 
 def build_cpu_gemm_lib():
-    """Build third-party/cpu_gemm via its own CMakeLists, producing
+    """Build csrc_cpu/cpu_gemm via its own CMakeLists, producing
     libcpu_gemm.a at a deterministic path. Idempotent — skips when the .a
     is newer than the newest cpu_gemm source file."""
     if not os.path.isdir(CPU_GEMM_SRC):
-        raise RuntimeError(
-            f"Vendored cpu_gemm not found at {CPU_GEMM_SRC}. Run "
-            "scripts/sync_cpu_gemm.sh or restore the snapshot."
-        )
+        raise RuntimeError(f"cpu_gemm sources not found at {CPU_GEMM_SRC}.")
 
     if os.path.isfile(CPU_GEMM_LIB):
         lib_mtime = os.path.getmtime(CPU_GEMM_LIB)
