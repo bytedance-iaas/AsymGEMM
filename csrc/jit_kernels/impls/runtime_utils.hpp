@@ -70,6 +70,7 @@ static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const at::ScalarType& 
         case torch::kBFloat16:      return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
         case torch::kFloat8_e4m3fn: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
         case torch::kUInt8:         return CU_TENSOR_MAP_DATA_TYPE_UINT8;
+        case torch::kChar:          return CU_TENSOR_MAP_DATA_TYPE_UINT8;  // INT8: raw byte move
         default: DG_HOST_UNREACHABLE("Unsupported dtype");
     }
 }
