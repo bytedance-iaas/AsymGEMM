@@ -31,20 +31,14 @@ fi
 
 RECREATE_ENV=${RECREATE_ENV:-0}
 INSTALL_LF=${INSTALL_LF:-1}
-INSTALL_KT=${INSTALL_KT:-1}
 INSTALL_DEEPSPEED=${INSTALL_DEEPSPEED:-1}
-# asym_gemm is imported unconditionally by run_lf_profiled_train.py (the profiling
-# entrypoint that runs against this .venv), and asym_gemm/__init__.py resolves its
-# version via importlib.metadata, which requires the package to be pip-installed
-# (importable-from-source is not enough). Install it by default; set =0 to skip.
-INSTALL_ASYMGEMM=${INSTALL_ASYMGEMM:-1}
+INSTALL_KT=${INSTALL_KT:-1}
 INSTALL_KT_KERNEL=${INSTALL_KT_KERNEL:-0}
 INSTALL_LIGER=${INSTALL_LIGER:-1}
 INSTALL_FLA=${INSTALL_FLA:-1}
 INSTALL_CAUSAL_CONV1D=${INSTALL_CAUSAL_CONV1D:-1}
-# Provision the libaio sidecar (${ASYMGEMM_DIR}/.aioenv) that DeepSpeed NVMe offload
-# (*opnvme/*panvme backends) needs. Idempotent; set SETUP_AIO=0 to skip.
 SETUP_AIO=${SETUP_AIO:-1}
+INSTALL_ASYMGEMM=${INSTALL_ASYMGEMM:-1}
 
 # Torch stack, pinned to the known-good venv (torch 2.12.0 built against CUDA 13.0).
 # Override any var to retarget CUDA/versions. A non-empty TORCH_INSTALL_CMD wins
