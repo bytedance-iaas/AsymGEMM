@@ -1,0 +1,1 @@
+{"name": "llama3.3-70b__asym_cpuadamwds__recomp-off-full-fg-ker000-ceil0000", "ceiling_seq": 32000, "ohbm": 0, "confirmed": true, "note": "", "live_probes": 1, "wall_s": 1314, "row": "llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false"}
