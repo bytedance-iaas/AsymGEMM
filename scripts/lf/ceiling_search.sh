@@ -27,9 +27,9 @@ SEQ_STEP=${SEQ_STEP:-4000}                 # first gallop stride (doubles each h
 SEQ_RESOLUTION=${SEQ_RESOLUTION:-1000}     # final ceiling granularity
 SEQ_MIN=${SEQ_MIN:-4000}
 SEQ_MAX=${SEQ_MAX:-300000}
-OHBM_LADDER=${OHBM_LADDER:-0,8,4,2,1}      # searched by HBM share: 0 < 1/8 < 1/4 < 1/2 < 1
-PROBE_STEPS=${PROBE_STEPS:-1}              # MAX_STEPS for probes (warmup 1 + 1 measured step)
-CONFIRM_STEPS=${CONFIRM_STEPS:-1}          # MAX_STEPS for the confirm re-run of the winner;
+OHBM_LADDER=${OHBM_LADDER:-0,8,4,3,2,1}    # searched by HBM share: 0 < 1/8 < 1/4 < 1/3 < 1/2 < 1
+PROBE_STEPS=${PROBE_STEPS:-2}              # MAX_STEPS for probes (warmup 1 + 2 measured = 3 total steps)
+CONFIRM_STEPS=${CONFIRM_STEPS:-3}          # MAX_STEPS for the confirm re-run of the winner;
                                            # raise (e.g. 8) to also catch late host-RAM creep
 WARMUP_STEPS=${WARMUP_STEPS:-1}
 PROBE_TIMEOUT_S=${PROBE_TIMEOUT_S:-5400}
@@ -57,9 +57,9 @@ SETTLE_S=${SETTLE_S:-20}                     # pause after a failed probe
 # configs stay at ohbm0 anyway (more HBM share never helps a G-OOM).
 CONFIGS=(
   # ---- asym_cpuadamwds | recomp-off-full-fg (dense ker000, routed MoE ker101) ----
-  # "50000 : 0 : q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"           # C-OOM 53k
-  # "128000 : 0 : q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"    # C-OOM 132k
-  "30000 : 0 : llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false : \"env\":{\"PROFILERS\":\"both\",\"HOST_MEM_WATCHDOG_FLOOR_GB\":\"35\",\"HOST_MEM_WATCHDOG_POLL_SECONDS\":\"0.05\"}"   # C-OOM 33k
+  "50000 : 0 : q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"           # C-OOM 53k
+  "128000 : 0 : q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"    # C-OOM 132k
+  "32000 : 0 : llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"   # C-OOM 33k
   # "13000 : 0 : llama4-scout|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"   # G-OOM 15k
   # "50000 : 0 : q2.5-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"       # C-OOM 53k
   # "30000 : 0 : q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"       # C-OOM 33k
