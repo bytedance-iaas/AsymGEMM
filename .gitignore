@@ -37,3 +37,14 @@ extern/
 external/
 vendor/
 submodules/
+
+# In-source CMake configure residue (never commit build state)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+
+# Benchmark result logs
+sglang_*.jsonl
+*.bak*
