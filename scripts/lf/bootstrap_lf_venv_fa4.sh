@@ -37,6 +37,7 @@ RECREATE_ENV=${RECREATE_ENV:-0}
 INSTALL_LF=${INSTALL_LF:-1}
 INSTALL_DEEPSPEED=${INSTALL_DEEPSPEED:-1}
 INSTALL_KT=${INSTALL_KT:-1}
+INSTALL_KT_KERNEL=${INSTALL_KT_KERNEL:-0}
 INSTALL_LIGER=${INSTALL_LIGER:-1}
 INSTALL_FLA=${INSTALL_FLA:-1}
 # Optional qwen3.5 linear-attention conv acceleration. The model has a torch
@@ -44,12 +45,12 @@ INSTALL_FLA=${INSTALL_FLA:-1}
 # fused gated-delta kernels. Keep this opt-in because the upstream build script
 # currently compiles many CUDA architectures even when TORCH_CUDA_ARCH_LIST is
 # restricted to SM100.
-INSTALL_CAUSAL_CONV1D=${INSTALL_CAUSAL_CONV1D:-0}
+INSTALL_CAUSAL_CONV1D=${INSTALL_CAUSAL_CONV1D:-1}
+SETUP_AIO=${SETUP_AIO:-1}
 INSTALL_ASYMGEMM=${INSTALL_ASYMGEMM:-1}
-INSTALL_KT_KERNEL=${INSTALL_KT_KERNEL:-0}
+
 # Provision the libaio sidecar (${ASYMGEMM_DIR}/.aioenv) that DeepSpeed NVMe offload
 # (*opnvme/*panvme backends) needs. Idempotent; set SETUP_AIO=0 to skip.
-SETUP_AIO=${SETUP_AIO:-1}
 
 # Pinned to the locally validated FA4 (.venv-fa4) environment.
 TORCH_VERSION=${TORCH_VERSION:-2.12.0+cu130}
