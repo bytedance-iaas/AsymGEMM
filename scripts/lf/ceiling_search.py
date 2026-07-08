@@ -14,7 +14,7 @@ Algorithm per config:
   3. Bisect the bracket on the seq_resolution grid.
   4. Inner feasibility at a given seq: endpoint-first ladder search over ohbm.
      The ladder is ordered by HBM share, NOT by N:
-       share(0) = 0 (all roots to CPU), share(N) = 1/N  =>  0 < 8 < 4 < 2 < 1.
+       share(0) = 0 (all roots to CPU), share(N) = 1/N  =>  0 < 8 < 4 < 3 < 2 < 1.
      C_OOM -> jump to the max-share end (if that still C_OOMs, seq infeasible);
      G_OOM -> jump to share 0 (if that still G_OOMs, seq infeasible);
      otherwise shrink the window.
@@ -164,7 +164,7 @@ class Config:
     template: str
     seq0: int
     ohbm0: int = 0
-    ohbm_ladder: list = field(default_factory=lambda: [0, 8, 4, 2, 1])
+    ohbm_ladder: list = field(default_factory=lambda: [0, 8, 4, 3, 2, 1])
     seq_step: int = 4000
     seq_resolution: int = 1000
     seq_min: int = 4000
@@ -197,7 +197,7 @@ class Config:
             self.ohbm_ladder.append(self.ohbm0)
         if any(int(n) != n or n < 0 for n in self.ohbm_ladder):
             raise ValueError(f"[{self.name}] ohbm_ladder must be nonnegative ints")
-        # ladder sorted by HBM share ascending: 0, ..., 8, 4, 2, 1
+        # ladder sorted by HBM share ascending: 0, ..., 8, 4, 3, 2, 1
         self.ladder = sorted(set(int(n) for n in self.ohbm_ladder), key=share)
         grid = self.seq_resolution
         if grid <= 0:
@@ -315,13 +315,13 @@ class Driver:
 
     def build_env(self, seq: int, ohbm: int, steps: int) -> dict:
         env = os.environ.copy()
-        # Probe-critical wrapper knobs: ambient shell exports must NOT leak in
-        # (an exported PROFILERS=both or PLOT=true would change probe behavior
-        # silently). Override per config via the row's env{} field instead.
+        # Probe-critical wrapper knobs: pinned so ambient shell exports can't leak
+        # in and silently change probe behavior. Override per config via the row's
+        # env{} field instead. PROFILERS is deliberately NOT pinned here -- it
+        # inherits the wrapper's own default.
         env.update({
             "SFT_ROOT": str(ROOT.parents[1]),
-            "PLOT": "false",
-            "PROFILERS": "source",
+            "PLOT": "true",
             "RUN_POST": "false",
             "OVERWRITE": "true",
             # isolate probe artifacts from curated sweep runs: OVERWRITE=true
