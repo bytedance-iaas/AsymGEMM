@@ -103,10 +103,8 @@ else
     # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm8|ligerloss1 ; 68000|8|1 ; none|false|false|false|false|false" # ceiling (confirmed); C-OOM 69k, ohbm0 C-OOM 66k
     # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 172000|8|1 ; none|false|false|false|false|false" # ceiling (max OK); G-OOM 188k
 
-    # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 65000|8|1 ; none|false|false|false|false|false" # G-OOM 66k
-
     # "q3-30b-a3b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 131000|8|1 ; none|false|false|false|false|false" # C-OOM 132k
-    # "q3-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 52000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
+    "q3-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 68000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
     # "llama3.3-70b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
     # "llama4-scout|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 14500|8|1 ; none|false|false|false|false|false" # G-OOM 15k
     # "q2.5-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 52000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
@@ -263,7 +261,7 @@ ASYM_CPU_ADAMW_PIN_MEMORY=${ASYM_CPU_ADAMW_PIN_MEMORY:-true}
 ASYM_CPU_ADAMW_FP32_MASTER=${ASYM_CPU_ADAMW_FP32_MASTER:-true}
 
 # Execution
-OVERWRITE=${OVERWRITE:-true}
+OVERWRITE=${OVERWRITE:-false}
 CONTINUE_ON_ERROR=${CONTINUE_ON_ERROR:-true}
 DRY_RUN=${DRY_RUN:-false}
 COLLECT_EXISTING=${COLLECT_EXISTING:-false}
@@ -1385,7 +1383,10 @@ job_profile_complete() {
   local expected_unsloth_recompute_save_on_cpu="${17:-}"
   if [[ -z "${expected_unsloth_recompute_save_on_cpu}" ]]; then
     if [[ "${expected_recompute}" == "unsloth-off" ]] || is_recomp_off_recompute "${expected_recompute}"; then
-      expected_unsloth_recompute_save_on_cpu=true
+      # recomp-off stages force save_on_cpu=true unless ASYM_GC_SAVE_ON_CPU_OVERRIDE (fix_gb200_ep.md
+      # F1) overrode it; the expectation must track the override or overridden rows are
+      # misreported as incomplete.
+      expected_unsloth_recompute_save_on_cpu="${ASYM_GC_SAVE_ON_CPU_OVERRIDE:-true}"
     fi
   fi
 
@@ -1440,7 +1441,10 @@ existing_profile_complete() {
   local current_allow_unvalidated_route_rank="${KT_ARM_ALLOW_UNVALIDATED_ROUTE_RANK_WORK:-0}"
   if [[ -z "${expected_unsloth_recompute_save_on_cpu}" ]]; then
     if [[ "${expected_recompute}" == "unsloth-off" ]] || is_recomp_off_recompute "${expected_recompute}"; then
-      expected_unsloth_recompute_save_on_cpu=true
+      # recomp-off stages force save_on_cpu=true unless ASYM_GC_SAVE_ON_CPU_OVERRIDE (fix_gb200_ep.md
+      # F1) overrode it; the expectation must track the override or overridden rows are
+      # misreported as incomplete.
+      expected_unsloth_recompute_save_on_cpu="${ASYM_GC_SAVE_ON_CPU_OVERRIDE:-true}"
     fi
   fi
   [[ -f "${profile_json}" ]] || return 1
@@ -3851,7 +3855,7 @@ run_job() {
     )
   fi
   if ((dp2_enable)); then
-    run_env+=(ASYM_DP=1)
+    run_env+=(ASYM_DP=1 ASYM_DP_FIND_UNUSED="${ASYM_DP_FIND_UNUSED:-}")
   fi
 
   local -a run_cmd=(env)

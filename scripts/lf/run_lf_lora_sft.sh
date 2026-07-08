@@ -218,8 +218,8 @@ INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
 #   triggers below HOST_MEM_WATCHDOG_FLOOR_GB. false or FLOOR_GB=0 disables.
 TRAIN_OOM_SCORE_ADJ=${TRAIN_OOM_SCORE_ADJ:-1000}
 HOST_MEM_WATCHDOG=${HOST_MEM_WATCHDOG:-true}
-HOST_MEM_WATCHDOG_FLOOR_GB=${HOST_MEM_WATCHDOG_FLOOR_GB:-50}
-HOST_MEM_WATCHDOG_POLL_SECONDS=${HOST_MEM_WATCHDOG_POLL_SECONDS:-0.1}
+HOST_MEM_WATCHDOG_FLOOR_GB=${HOST_MEM_WATCHDOG_FLOOR_GB:-35}
+HOST_MEM_WATCHDOG_POLL_SECONDS=${HOST_MEM_WATCHDOG_POLL_SECONDS:-0.05}
 HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS=${HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS:-60}
 
 # =============================================================================
@@ -2194,8 +2194,14 @@ fi
 
 if [[ "${ASYM_DP:-0}" == "1" ]]; then
   # Dense DP rows: no unused params; buffers identical across ranks (frozen base is not a
-  # Parameter, DDP only sees the LoRA adapters). MoE rows flip find_unused at D2.5.
-  CMD_ARGS+=(--ddp_find_unused_parameters false --ddp_broadcast_buffers false)
+  # Parameter, DDP only sees the LoRA adapters). MoE rows (gb200_dp.md D2.5) must run with
+  # ASYM_DP_FIND_UNUSED=true: an expert LoRA slice can receive zero routes in a step and
+  # the DDP reducer hangs waiting on its grad otherwise.
+  case "${ASYM_DP_FIND_UNUSED:-false}" in
+    true|false) ;;
+    *) echo "error: ASYM_DP_FIND_UNUSED must be true or false (got '${ASYM_DP_FIND_UNUSED}')" >&2; exit 2 ;;
+  esac
+  CMD_ARGS+=(--ddp_find_unused_parameters "${ASYM_DP_FIND_UNUSED:-false}" --ddp_broadcast_buffers false)
 fi
 
 if is_zero_backend_run; then

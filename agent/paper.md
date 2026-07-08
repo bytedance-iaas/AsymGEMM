@@ -1,4 +1,5 @@
-AsymLoRA: A Superchip-based Offloading System for LoRA SFT
+####################################OLD VERSION##############################################
+AsymLoRA: A Superchip-based Offloading System for Long Context LoRA SFT
 
 Background:
 1. Full FT has optimizer states as significant memory/timing footprint but LoRA has litte optimizer footprints and a lot of activation memory instead, especially in long sequences.
@@ -28,16 +29,7 @@ Notes:
 - Next gen's chips e.g. VERA cpu-side accelerators => even larger bandwidths
 
 Setting:
-- 1-2 GPUs (2x198G) + (1x450G)
-
-Next Steps:
-0. Seq Parallelism / Context Parallelism
-1. [WIP] Implement and test various finegrained activation offloading strategies (to not stress CPU but still saves HBM). Then add NVME to accomodate even more offloading.
-2. [WIP] Find the OOM scenarios for current systems (larger model, longer seq) that ours can accomodate
-3. [TODO] Improve the system throughput with scheduling based on the required model size + sequence length
-
-
-
+- 1-2 GPUs (2x198G)
 
 
 #############################################################################################################
@@ -85,6 +77,7 @@ s25000.b8  asym_cpuadamwds   recomp-off-full-fg-ker000  PASS     77.7   960.4   
 
 #############################################################################################################
 
+#########################################NEW VERSION#########################################################
 Motivations:
 - RuntimOptimizer is trivial in timing
     - Euperoffload does not target the truth bottleneck in LoRA SFT
@@ -108,17 +101,26 @@ System Design:
     - LoRA offload kernels
         CPU-left LoRA-A forward and CPU-right LoRA-A gradient kernels that operate directly on pinned offloaded activations
 
+<!-- # This is the current design but can be a bit tooo restrictive or old. I am trying to make the scheudlker more comprehensive and adaptive tho so dont need to stick wiht this
 - AsymGEMM-guided activation offloading and scheduling: Decompose LoRA MLP/MoE forward and backward into fine-grained operators so large activations are recomputed, offloaded, or consumed directly from pinned CPU memory.
     - Operator-aware activation policy
         split gate/up/activation/down/LoRA paths and retain only the tensors each later operator truly needs.
     - C2C-aware execution and GEMM
         stream offloaded activations through NVLink-C2C into AsymGEMM/LoRA kernels and briefly stage tensors only at point of use.
     - Heterogeneous compute
-        move memory-bound elementwise and low-rank work to CPU/offload-aware kernels, while keeping compute-dense GEMMs on GPU.
+        move memory-bound elementwise and low-rank work to CPU/offload-aware kernels, while keeping compute-dense GEMMs on GPU. -->
+- AsymGEMM-guided activation offloading and scheduling: 
+<!-- [Help me think of a comprehensive formulation to our modifications/additions to current baselines. The scheduler needs to be easilt understood and tractable on a high level and then can be more complicate din the implementation details
+For example, we could say that we scheduile/execute ops based on its compute device {cpu, gpu} x storage device {cpu, gpu, nvme} x gemms {torch GEMMs, AsymGEMM}. This can be high level motif.
+We can also we do nnonGEMM on cpus and GEMMs on GPus and thats why we schuedl silu on CPUs etc and since some tensors are alos on CPus we jsut run ops on them on GPUs etc. These are all formulation examples.
+And then we introduce more things lile we choose to recompute some activations or offload some actviations selective or we aim to save the least amout of activations whatsoever and choose the recompute-offload approach to maximize HBM+CPU saving. Or we save every few layers etc.  These are all different implemetnation angles. True tradeoffs among complicated approaches can be brufe force and profiled so that we knoe the tradeoffs but teh genral searhc space needs to be idenified and formated explicitly.
+But u dont have to stick to all these formulations still, These are jhust some examples from me that might be useful/informative/inspiring. The goal is that we formualte a scheudler that makes sense and is decelt comprehensivle towards our goal.] -->
 
-- [?]New hardware arichiecture/new module/how to do GB200 diffeent than GH200? Hardware-aware/GB200-aware module?
+# This point needs to touch up new hardware arichiecture/how to do GB200 diffeent than GH200? Hardware-aware/GB200-aware module? 
+# But the issue is that 
 - Ownerless EP on 2 GPUs for balancing MoE models' expert computes
-    - Debugging.....
+
+# These 2 points are more incremental but kept for system completeness
 - Intgeration with TP on 2 GPUs for dense models
     - Extend with TP for longer sequences
 - Multi-tier activation offload system using CPU and NVME
@@ -135,7 +137,7 @@ Baselines:
 - Zero3 Offload (Optimizer State + Model Params)
 - Superoffload (Optimizer State + Model Params)
 - *Superoffload (Optimizer State + Model Params + Act)
-<!-- - Megatron (Optimizer State) -->
+- Megatron (Optimizer State)
 
 Exps:
 GB200

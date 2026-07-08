@@ -433,7 +433,12 @@ dp2_probe artifacts carry the `dp2_probe` tag and never appear in the DP trainin
     asym pinned pools). The asym memory posture pays at longer sequences (b1/boundary rows,
     paper phase), not at s20000. Panel framing must lead with VG1+capacity-at-frontier, not a
     blanket memory win at the dev row.
-```
+2026-07-07 (late) D2.5 UNBLOCKED: ASYM_DP_FIND_UNUSED knob landed (run_lf_lora_sft.sh DDP
+  block, default false = dense rows unchanged; both drivers pass it through on dp2 rows).
+  The MoE row is PULLED FORWARD out of "paper phase": q3-30b-a3b|2 asym_dp2 b8/rank
+  (global 16, find_unused=true, save-on-cpu OFF) runs as row 2 of fix_gb200_ep.md's SG
+  gap pair vs the |1 clean bar — the runnable-now different-batches EP-2-vs-1-GPU verdict
+  (replicated-batch |2 rows retired by user 2026-07-07).
 
 ## Stage Dependency Summary
 

@@ -57,9 +57,9 @@ SETTLE_S=${SETTLE_S:-20}                     # pause after a failed probe
 # configs stay at ohbm0 anyway (more HBM share never helps a G-OOM).
 CONFIGS=(
   # ---- asym_cpuadamwds | recomp-off-full-fg (dense ker000, routed MoE ker101) ----
-  "50000 : 0 : q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"           # C-OOM 53k
-  "128000 : 0 : q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"    # C-OOM 132k
-  "30000 : 0 : llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"   # C-OOM 33k
+  # "50000 : 0 : q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"           # C-OOM 53k
+  # "128000 : 0 : q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"    # C-OOM 132k
+  "30000 : 0 : llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false : \"env\":{\"PROFILERS\":\"both\",\"HOST_MEM_WATCHDOG_FLOOR_GB\":\"35\",\"HOST_MEM_WATCHDOG_POLL_SECONDS\":\"0.05\"}"   # C-OOM 33k
   # "13000 : 0 : llama4-scout|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"   # G-OOM 15k
   # "50000 : 0 : q2.5-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"       # C-OOM 53k
   # "30000 : 0 : q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"       # C-OOM 33k
