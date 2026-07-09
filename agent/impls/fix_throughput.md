@@ -217,47 +217,159 @@ experiment. The real gap (109.6 → 66.6) is the asym GEMM tax + act-offload pat
 Ranking below re-ordered accordingly; #0 kept for its CORRECTNESS fix (cross-step grad
 accumulation bug), expected wall win only ~≤7 s/step.
 
-1′. **[REAL #1 — both models] asym GEMM engine tax + act-offload forward/backward path**
-   (control fwd 19.0 s vs superoffload 8.1 s with no optimizer involved): see item 1
-   (ncu + hybrid dispatch) and item 2 (act prefetch) — these are now the whole game.
+Ranked fix list (C0–C5; expected s/step recovery @ q3-30b 32k×8 in brackets; gap to
+close: 111.7 → 66.6 s post-C0):
 
-0. **[DONE 2026-07-09, validated] Kill the synchronous per-param grad-D2H hooks** —
+C0. **[DONE 2026-07-09, validated] Kill the synchronous per-param grad-D2H hooks** —
    v3 A/B (q3-30b @32k×8): hook block 30.4 → **0.033 s/step**; step 117.0 → **111.7 s**
    (+4.7% tok/s, within 2.1 s of the no-cpu-adam control floor 109.6 s). Implementation:
    bf16 pinned staging for true async D2H + CPU-side fp32 widening at a single per-step
    drain + `step()` now self-clears `grad_buffer_has_data` (also fixes the cross-step
    grad ACCUMULATION correctness bug — zero_grad never reached this optimizer under LF).
-   Env kill-switch: `ASYM_CPU_ADAMW_ASYNC_GRAD_OFFLOAD=0`. Original description follows: —
-   `asym_gemm/training/cpu_adam.py:413,417` use `copy_(…, non_blocking=False)` in the
-   AccumulateGrad hook: 672 stream-draining syncs/step. Self-measured cost
-   (`asym_cpu_adamw.csv → hook_grad_copy_ms`): **269.2 s/step** at q3-30b@131k
-   (810 s step) for 13.5 GB moved (~50 MB/s effective; buffers already pinned).
-   Fix: async copy on a dedicated D2H stream + CUDA event per param/bucket; the CPU-Adam
-   step (and the `staging.add_` accumulate path) waits on the event before reading.
-   Expected recovery ~200–250 s/step (upper bound 269 — some drain overlapped real work).
-   Zero memory cost. Validate with the 32k A/B protocol.
-1. **[dense #1] Attack `sm100_bf16_asym_gemm_impl` efficiency (F1, ~90 s/step on
-   llama@32k, ~⅓ of cuBLAS peak)**: (a) ncu the kernel in isolation
-   (`scripts/lora/profile_ncu_asymgemm.py`); (b) **hybrid dispatch** — route
-   HBM-resident operands to stock cuBLAS/nvjet, keep the asym kernel only for genuinely
-   CPU-resident operands (mid-seq headroom makes this free capacity→speed trade).
-2. **Shave the periodic ~147 ms per-layer gaps (F3, ~80 s/step)**: prefetch/double-buffer
-   offloaded acts + roots one layer ahead on a dedicated H2D stream — reuse the existing
-   `base_weight_pager.py` 2×-in-flight pattern (weight-side prefetch exists; act-side
-   has none).
-3. **Deepen grad-offload/adam overlap** (H2): bucket sizing, dedicated D2H stream,
-   adam threads pinned to CPU-node cores.
-4. **Adaptive offload level vs seq** (product-level): below a seq threshold switch to
-   lighter offload config automatically → throughput parity at short seq without losing
-   the long-seq ceiling story. (Pairs naturally with 1b.)
-5. Re-validate after each fix with the Phase A protocol (same slots, same rules), and
-   re-run `python3 scripts/lf/ceiling_table.py scripts/lf/ceiling_table_configs.txt`.
+   Env kill-switch: `ASYM_CPU_ADAMW_ASYNC_GRAD_OFFLOAD=0`.
+C1. **GEMM engine tax — the real #1, both models** [10–20 s; llama: most of its 3.7×]:
+   (a) kernel work: ncu `sm100_bf16_asym_gemm_impl` in isolation
+   (`scripts/lora/profile_ncu_asymgemm.py`); tune tiles/block sizes (`DG_BF16_BLOCK_M`,
+   cpu-left variants), L2/TMA prefetch depth, occupancy (agent/notes.md engineering
+   list). Uncertain ceiling — treat ⅓→½–⅔ peak as the realistic range.
+   (b) **hybrid dispatch with STAGED-native as the default at training M**: per-GEMM-site
+   choice {stage-once + stock nvjet | asym-stream}. Staging is hidden at SFT shapes
+   (1.2 GB/layer ≈ 6 ms @200 GB/s vs 100s-of-ms layer compute; double-buffer ≈ 2–3 GB
+   HBM TOTAL — works at every s incl. ceiling, per-expert M ≥ ~10k rows even @173k).
+   Residency-cache variant (pin panels in headroom) is the mid-seq special case;
+   asym-stream stays the fallback for small-M/zero-headroom. gb200_story T3/B3 math.
+   (c) **W-panel reuse across recompute→dX** within one layer backward: stream/stage the
+   gate/up panel once, reuse for the dX GEMM (weight reads 2.0×→1.0×; agent/notes.md).
+C2. **fg kernel-work diet** [5–8 s]: `ASYMM_QWEN3_MOE_ROUTE_LORA=1` A/B (kills the
+   2.27 s/step token-space LoRA fill/index/scatter measured in fwd alone); skip padded
+   M=0 expert-group launches; trim MLP wrapper-scope kernels (12.5 vs so 3.6 s bwd);
+   per-model ker bits (101 wrong on qwen3.5 — profile, don't hardcode).
+C3. **τ discipline: async unpack + prefetch** [5–8 s @32k; ~tens of s at long seq where
+   the ~80 s attention-boundary waits live]: decoder/linear-attn `_unpack` are host-
+   blocking `ready_event.synchronize()` (attention wrapper already async — unify);
+   `stage_concat_columns` is synchronous; prefetch/double-buffer offloaded acts + GC
+   roots one layer ahead on the existing restage side stream (LIFO order known;
+   `weight_offload.py` prefetch stream allocated, unused; reuse the
+   `base_weight_pager.py` 2×-in-flight pattern).
+C4. **Within-layer round-trip short-circuit** [8–20 s @32k — A/B decides: the transfer
+   itself is overlapped (memcpy is a wash vs so), so the win is sync/stage waits + pool
+   overhead + C2C slack, growing with s; the mechanized form of old "adaptive offload vs
+   seq"]: in recomp-off-full-fg the outer fwd is the no-grad pure-GPU path — X/gate/up/
+   act are offloaded during the *backward recompute* and fetched back within the SAME
+   layer's backward. Transient to keep them in HBM ≈ 18 GB @32k, linear in s (~73 GB
+   @131k) → config-gated by a per-model threshold s* from the linear memory model: below
+   s* skip the round trip (fg code path kept), above s* today's behavior. Ceilings
+   preserved by construction.
+C5. **Adam overlap depth** (H2, small): bucket sizing, adam threads pinned to CPU-node
+   cores (`ASYM_CPU_ADAMW_STEP_THREADS`).
+
+Non-lever (documented so nobody re-derives it): **batch size**. T(B) = c_fix + c_var·B;
+only c_fix (~10–15% of step: t0, per-layer orchestration, per-pass weight bytes)
+amortizes with B — cannot close a 1.59× per-token gap. Keep B at the knee (per-expert
+rows ≥ ~4–8k; b8 suffices at s ≥ 32k); B's value is capacity (maxB/ceiling rows), not
+tok/s.
+
+Expected landing @32k: C0 done (111.7) + C2/C3/C4 ≈ 85–100 s (the Phase D A/Bs decide
+the exact split — the per-item brackets overlap); **strict parity with so's 66.6 requires
+C1b (staged-native dispatch) or C1a reaching near-native** — the streamed-kernel gap is
+the irreducible remainder. Re-validate each fix with the Phase A protocol and re-run
+`python3 scripts/lf/ceiling_table.py scripts/lf/ceiling_table_configs.txt`.
 
 **Success criteria**
 - Backward stall fraction < 20% (from ~63%) on q3-30b @32k.
 - asym tok/s ≥ superoffload unsloth-off at equal (s=32k, B=8) for q3-30b; within 15%
   for the dense models — while ceilings stay within 1k of current confirmed values
   (re-run ceiling search after any memory-relevant change; fingerprints will move).
+- Timing protocol upgrade (owner request): ≥5 total steps; drop warmup + FIRST measured
+  + last measured; NVMe (`-ceil`/`_actnvme`) stays out of scope for this workstream.
+
+---
+
+## Phase D — Diagnose-first, flag-gated A/B execution plan (the order to actually do it)
+
+Principle (from the C0 lesson): **no fix is believed until (a) a pre-build diagnostic
+pins the culprit from artifacts or an isolated bench, and (b) a one-flag A/B on the
+pinned baseline measures it.** Every fix ships behind an env flag whose default is
+today's behavior; the default flips only after gate + loss parity + (if memory-relevant)
+ceiling re-search.
+
+### D0. Standing rules for every stage
+
+- Pinned baseline row: `RUNS="q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false"`
+  (primary point 32k×8; long-seq confirmation point 131k×8 = so's ceiling seq).
+- Timing: ≥5 total steps (`MAX_STEPS=5 WARMUP_STEPS=1`), drop warmup + FIRST measured +
+  LAST measured; strictly serial on the node; healthy-margin rule; `PROFILERS=source`
+  (nsys only where the stage needs a timeline).
+- ONE flag flips per A/B. After each accepted stage, re-run the **cumulative stack**
+  (all accepted flags ON) — interactions are measured, not assumed.
+- Loss parity gate for numerics-touching flags (D1 fp32-accum route, D5 staged path):
+  loss max/last/train within run-to-run noise of baseline.
+- Record every result in the table at the end of this section.
+
+### D1. C2a — ROUTE_LORA A/B  [zero build; flag EXISTS]
+- Culprit receipt (already in hand): 2.27 s/step of token-space LoRA fill/index/scatter
+  in fwd alone (nsys bin), ×~2–3 in bwd.
+- Flag: `ASYMM_QWEN3_MOE_ROUTE_LORA=0|1` (default 0 today).
+- Gate: ≥2 s/step @32k + loss parity → flip default for Qwen3-MoE; also decide ker
+  label extension (`route101_lora1` already in dir grammar).
+
+### D2. C1 — engine microbench + ncu  [zero build; NO training runs]
+- The decisive engine diagnostic, run in isolation: for the flagship's real shapes
+  (grouped experts: R≈2.05M rows × [N=768,K=2048]/[2048,768]; dense attention:
+  M=256k × [512..4096,2048]), measure the SAME GEMM three ways:
+  (i) asym kernel (weights pinned-CPU), (ii) **staged**: H2D copy + stock
+  nvjet/`torch._grouped_mm`, (iii) resident nvjet (floor). Plus
+  `scripts/lora/profile_ncu_asymgemm.py` on (i) for stall reasons (expect: not enough
+  weight tiles in flight to hide C2C latency, not raw-BW-bound at these M).
+- Output: per-shape engine-tax table → sizes C1a (kernel tuning) vs C1b (staged
+  dispatch) upside BEFORE any integration work. If staged ≈ resident (expected: copy
+  6 ms/layer ≪ compute), C1b is confirmed as the parity path.
+- Also sweep existing kernel knobs on (i): `DG_BF16_BLOCK_M`, cpu-left variants — the
+  free part of C1a.
+
+### D3. C4 — within-layer round-trip short-circuit  [small build]
+- Pre-build receipt: `profile.json → activation_offload` per-tag bytes (moe.X/gate/up/
+  act) ≈ linear-model prediction (~18 GB/layer-set @32k); nsys stage-wait share.
+- Build flag: `ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM=0|1` (+ dense twin
+  `ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM`): when 1, fg skips offload of X/gate/up/act and
+  keeps the handles as HBM tensors — sequencing, kernels, everything else identical.
+  Default 0 (= today, byte-identical).
+- A/B at 32k (transient fits) — do NOT enable near ceiling; the eventual auto rule is
+  the s* threshold from the memory model.
+- Gate: ≥5 s/step @32k with peak-HBM +≤20 GB → keep flag, wire s* into the launcher.
+
+### D4. C3 — async unpack + prefetch-k  [small build]
+- Pre-build receipt: nsys @131k boundary-aligned gaps (~80 s/step family) + the +8 s
+  host-gap delta @32k; decoder/lin-attn `_unpack` blocking `synchronize()` in code.
+- Build flags: `ASYM_SAVED_TENSOR_ASYNC_UNPACK=0|1` (decoder/linear-attn unpack goes
+  event-ordered on the restage side stream, mirroring the attention wrapper) and
+  `ASYM_ACT_PREFETCH_LAYERS=0|1|2` (LIFO restage prefetch, reusing the
+  base_weight_pager 2×-in-flight pattern). Defaults 0.
+- Gate: measured mostly at the 131k point (host gap −50%, boundary gaps gone in
+  timeline); @32k expect small (+3–8 s). HBM cost ≤ k × one-layer staged bytes.
+
+### D5. C1b — staged-native dispatch  [the big build; only if D2 confirms]
+- Build flag: `ASYM_GEMM_DISPATCH=asym|staged` (+ `ASYM_STAGED_BUFFER_MB`, default
+  ~2×largest panel ≈ 2–3 GB), site-class rollout in two steps: dense attention
+  projections first (largest per-site tax per D2), then grouped experts.
+- Gate: fwd 19.0 → ≤11 s @32k; cumulative step ≤ ~85 s; loss parity; ceilings unchanged
+  (re-search — buffers move the fingerprint). C1a kernel tuning continues in parallel
+  off D2's ncu findings; per-shape winner becomes the `auto` policy.
+
+### D6. Cumulative close-out
+- Full stack (all accepted flags) at {32k, 131k, ceiling−2k} ×8 + the q3-32b and llama
+  rows; refresh `ceiling_table.py`; update §2.4 with the final stall budget; declare
+  against §3 success criteria.
+
+### Result ledger (fill as stages land)
+
+| stage | flag | Δstep @32k | Δstep @131k | loss parity | ceiling ok | verdict |
+|---|---|---|---|---|---|---|
+| D1 ROUTE_LORA | `ASYMM_QWEN3_MOE_ROUTE_LORA=1` | . | . | . | n/a | . |
+| D2 microbench | (none — bench table) | . | . | n/a | n/a | . |
+| D3 keep-acts-HBM | `ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM=1` | . | skip | . | flag-off | . |
+| D4 async+prefetch | `ASYM_SAVED_TENSOR_ASYNC_UNPACK=1`, `ASYM_ACT_PREFETCH_LAYERS=k` | . | . | . | . | . |
+| D5 staged dispatch | `ASYM_GEMM_DISPATCH=staged` | . | . | . | re-search | . |
 
 ---
 
