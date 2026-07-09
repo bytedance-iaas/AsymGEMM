@@ -89,11 +89,23 @@ def load_model_config(input_path: str) -> Dict:
 
     num_experts = text_cfg.get("num_experts", text_cfg.get("n_routed_experts"))
     hidden = text_cfg.get("hidden_size")
-    inter = text_cfg.get("moe_intermediate_size", text_cfg.get("intermediate_size"))
     top_k = text_cfg.get("num_experts_per_tok", 2)
+
+    # AsymGEMM INT8 only converts routed MoE expert GEMMs. A dense model has no
+    # experts to convert, so reject it up front with a clear message instead of
+    # a cryptic "missing field" error further down.
+    if num_experts is None:
+        raise ValueError(
+            f"{input_path} is not a MoE model: config has no 'num_experts' "
+            f"(nor 'n_routed_experts'). AsymGEMM INT8 conversion only supports "
+            f"routed-MoE checkpoints; dense models are not supported."
+        )
+
+    # Only trust the MoE FFN width here; the dense 'intermediate_size' fallback
+    # is deliberately excluded so a dense model can never slip through above.
+    inter = text_cfg.get("moe_intermediate_size")
     missing = [k for k, v in {
-        "num_experts": num_experts, "hidden_size": hidden,
-        "moe_intermediate_size": inter,
+        "hidden_size": hidden, "moe_intermediate_size": inter,
     }.items() if v is None]
     if missing:
         raise ValueError(f"Missing required config fields: {missing}")
@@ -256,14 +268,47 @@ class Int8ExpertConverter:
             # Expect a down-like and a gate_up-like fused tensor.
             gate_up_name = next(p for p in projs if "gate_up" in p)
             down_name = next(p for p in projs if "down" in p)
-            gate_up = self._load(f"{prefix}{gate_up_name}").to(torch.bfloat16)  # [E,H,2I]
-            down_fused = self._load(f"{prefix}{down_name}").to(torch.bfloat16)  # [E,I,H]
-            E, H, twoI = gate_up.shape
-            assert twoI == 2 * self.inter, f"unexpected fused 2I={twoI}"
-            gate_up_t = gate_up.transpose(1, 2).contiguous()  # [E, 2I, H]
+            gate_up = self._load(f"{prefix}{gate_up_name}").to(torch.bfloat16)
+            down_fused = self._load(f"{prefix}{down_name}").to(torch.bfloat16)
+
+            # Normalize gate_up to [E, 2I, H] regardless of stored orientation.
+            # Natural HF layout is [E, 2I, H] ([out, in]); the KTransformers
+            # transposed convention stores [E, H, 2I]. Disambiguate by matching
+            # the known hidden / 2*inter dims.
+            twoI = 2 * self.inter
+            # Shape-based disambiguation breaks down when the two candidate
+            # orientations coincide: gate_up is [E, H, H] when H == 2I, down is
+            # [E, H, H] when H == I. Guessing wrong would silently corrupt the
+            # weights, so refuse up front.
+            if self.hidden in (twoI, self.inter):
+                raise ValueError(
+                    f"Cannot disambiguate fused-tensor orientation when "
+                    f"hidden_size ({self.hidden}) equals moe_intermediate_size "
+                    f"({self.inter}) or 2x it; convert from the unfused HF "
+                    f"checkpoint instead."
+                )
+            if gate_up.shape[1:] == (twoI, self.hidden):
+                gate_up_t = gate_up.contiguous()                    # [E, 2I, H]
+            elif gate_up.shape[1:] == (self.hidden, twoI):
+                gate_up_t = gate_up.transpose(1, 2).contiguous()    # [E, H, 2I] -> [E, 2I, H]
+            else:
+                raise AssertionError(
+                    f"unexpected fused gate_up shape {tuple(gate_up.shape)}; "
+                    f"expected [E, {twoI}, {self.hidden}] or [E, {self.hidden}, {twoI}]"
+                )
             gate = gate_up_t[:, : self.inter, :].contiguous()
             up = gate_up_t[:, self.inter:, :].contiguous()
-            down = down_fused.transpose(1, 2).contiguous()    # [E, H, I]
+
+            # Normalize down to [E, H, I] regardless of stored orientation.
+            if down_fused.shape[1:] == (self.hidden, self.inter):
+                down = down_fused.contiguous()                      # [E, H, I]
+            elif down_fused.shape[1:] == (self.inter, self.hidden):
+                down = down_fused.transpose(1, 2).contiguous()      # [E, I, H] -> [E, H, I]
+            else:
+                raise AssertionError(
+                    f"unexpected fused down shape {tuple(down_fused.shape)}; "
+                    f"expected [E, {self.hidden}, {self.inter}] or [E, {self.inter}, {self.hidden}]"
+                )
             return gate, up, down
 
         gate_list, up_list, down_list = [], [], []
