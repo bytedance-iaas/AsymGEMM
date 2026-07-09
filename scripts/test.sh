@@ -33,7 +33,7 @@ PY
 
 case "$SM" in
   89)  TESTS=(tests/test_sm89_moe.py) ;;
-  90)  TESTS=(tests/test_bf16_asym_gemm.py tests/test_fp8_asym_gemm.py) ;;
+  90)  TESTS=(tests/test_bf16_asym_gemm.py tests/test_fp8_asym_gemm.py tests/test_sm90_int8.py) ;;
   100) TESTS=(tests/test_bf16_asym_gemm.py tests/test_fp8_asym_gemm.py tests/test_fp4_asym_gemm.py) ;;
   none)
     echo "[FATAL] No CUDA GPU detected. AsymGEMM tests require a CUDA device." >&2
@@ -44,6 +44,9 @@ case "$SM" in
     exit 0
     ;;
 esac
+
+# Unified MoE parity tests — always run; internal-skip when AMX is absent.
+TESTS+=(tests/test_unified_moe.py)
 
 echo "Detected sm_${SM} — running ${#TESTS[@]} test file(s):"
 printf "  - %s\n" "${TESTS[@]}"

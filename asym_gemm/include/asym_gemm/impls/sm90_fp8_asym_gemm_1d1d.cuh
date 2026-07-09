@@ -318,7 +318,7 @@ sm90_fp8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
         //   r_0 = (warp_idx % 4) * 16 + lane_idx / 4   (first 8 rows of this thread)
         //   r_1 = r_0 + 8                                (second 8 rows)
         //   col_idx = lane_idx % 4
-        const uint32_t wg_local_warp_idx = warp_idx;
+        const uint32_t wg_local_warp_idx = warp_idx % 4;
         const uint32_t row_idx = lane_idx / 4, col_idx_scale = lane_idx % 4;
         const uint32_t r_0 = wg_local_warp_idx * 16 + row_idx;
         const uint32_t r_1 = r_0 + 8;

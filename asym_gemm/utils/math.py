@@ -55,6 +55,29 @@ def per_block_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128) -
     return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(x_view.size(0), x_view.size(2))
 
 
+def per_token_cast_to_int8(x: torch.Tensor, gran_k: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric per-token, per-K-block INT8 quantization.
+
+    x: [M, K] -> (int8 [M, K], fp32 sf [M, K // gran_k]). sf = amax / 127.
+    """
+    assert x.dim() == 2
+    m, n = x.shape
+    padded_n = align(n, gran_k)
+    x_padded = torch.empty((m, padded_n), dtype=x.dtype, device=x.device).fill_(0)
+    x_padded[:, :n] = x
+    x_view = x_padded.view(m, -1, gran_k)
+    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+    sf = x_amax / 127.0
+    q = (x_view / sf.unsqueeze(2)).round().clamp(-127, 127).to(torch.int8)
+    return q.view(m, padded_n)[:, :n].contiguous(), sf
+
+
+def per_channel_cast_to_int8(x: torch.Tensor, gran_k: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-output-channel (row), per-K-block INT8 quantization for B. Identical math
+    to ``per_token_cast_to_int8`` but named to document B's semantics."""
+    return per_token_cast_to_int8(x, gran_k)
+
+
 def per_custom_dims_cast_to_fp8(x: torch.Tensor, dims: Tuple, use_ue8m0: bool) -> Tuple[torch.Tensor, torch.Tensor]:
     excluded_dims = tuple([i for i in range(x.dim()) if i not in set(dims)])
     x_amax = x.abs().float().amax(dim=excluded_dims, keepdim=True).clamp(1e-4)
