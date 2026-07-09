@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Print the ceiling/latency/throughput table for a list of ceiling-search configs.
+
+Usage:
+  python3 scripts/lf/ceiling_table.py <config-list>          # print table + write scripts/lf/ceiling_table.md
+  python3 scripts/lf/ceiling_table.py <config-list> -v       # + fit diagnostics
+  python3 scripts/lf/ceiling_table.py <config-list> --md PATH   # write the markdown elsewhere
+  python3 scripts/lf/ceiling_table.py <config-list> --no-md     # stdout only
+
+<config-list> is either:
+  - a text file with rows in the ceiling_search.sh CONFIGS format
+      seq0 : ohbm0 : model|gpus ; backend|recompute|liger ; {seq}|batch|ga ; flags[ : extra-json]
+    ('#' comments and blank lines ignored), or
+  - ceiling_search.sh itself (the active rows of its CONFIGS array are parsed).
+
+Row sort order: model, backend, config.
+Cell format: maxB / sec-per-step (tok/s) at maxB.
+  'a' suffix = directly measured steady-state anchor (>=3 measured steps;
+  warmup and the last measured step dropped). Other latencies come from the
+  per-config anchor + the analytic attention split
+      t_step(B, s) = t0 + c_g * T * (1 + k*s),   T = B*s,
+      k = (2*L*h) / (2*P_active)   (attention-vs-GEMM FLOPs per seq-token)
+  '.' = not derivable from current artifacts (no ceiling yet / no anchor run).
+  'x' = slot above max seq (memory at B=1) or model context.
+"""
+import csv, json, re, sys
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_MD = Path(__file__).resolve().parent / "ceiling_table.md"
+ART = ROOT / "profiling_both" / "asym_long_sft_smoke__lora__lf__bf16"
+STATE = ROOT / "scripts" / "lf" / "ceiling_search_state"
+
+SLOTS = [8000, 12000, 16000, 32000, 48000, 64000, 128000]
+# model shorthand -> (layers, hidden, active matmul params) for the attention split
+ARCH = {
+    "llama3.3-70b": (80, 8192, 70.6e9),
+    "llama3_3-70b": (80, 8192, 70.6e9),
+    "q3-32b": (64, 5120, 32.8e9),
+    "q3-30b-a3b": (48, 2048, 3.34e9),
+    "q2.5-32b": (64, 5120, 32.8e9),
+    "q2.5-72b": (80, 8192, 72.7e9),
+    "llama4-scout": (48, 5120, 17e9),
+}
+CTX = {  # model context caps for the 'x' rule (adjust when rope config changes)
+    "llama3.3-70b": 131072,
+}
+
+
+def parse_config_rows(path: Path):
+    """Yield dicts {model, backend, recomp_base, batch, name} from a row list or .sh."""
+    text = path.read_text()
+    if path.suffix == ".sh":
+        m = re.search(r"CONFIGS=\((.*?)\n\)", text, re.S)
+        if not m:
+            sys.exit(f"error: no CONFIGS=( ... ) array found in {path}")
+        lines = [l for l in m.group(1).splitlines()]
+        rows = [re.match(r'\s*"(.+)"\s*(#.*)?$', l) for l in lines]
+        rows = [r.group(1) for r in rows if r]
+    else:
+        rows = [l.strip() for l in text.splitlines()
+                if l.strip() and not l.strip().startswith("#")]
+    for row in rows:
+        parts = row.split(" : ")
+        if len(parts) < 3:
+            sys.exit(f"error: bad config row (need 'seq0 : ohbm0 : template'): {row!r}")
+        template = parts[2]
+        f = template.split(" ; ")
+        model = f[0].split("|")[0].strip()
+        backend = f[1].split("|")[0].strip()
+        recomp = f[1].split("|")[1].strip()
+        recomp_base = re.sub(r"-ohbm\{ohbm\}$", "", recomp)
+        batch = int(f[2].split("|")[1])
+        name = f"{model}__{backend}__{recomp_base}".replace("/", "_")
+        yield {"model": model, "backend": backend, "recomp": recomp_base,
+               "batch": batch, "name": name}
+
+
+def load_results():
+    """name -> (ceiling_seq, ohbm, confirmed) — last confirmed line wins."""
+    out = {}
+    f = STATE / "results.jsonl"
+    if f.exists():
+        for line in f.read_text().splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if r.get("confirmed") or r["name"] not in out:
+                out[r["name"]] = (r["ceiling_seq"], r["ohbm"], bool(r.get("confirmed")))
+    return out
+
+
+def leaf_dirs(run_dir):
+    """{ohbm: {profiler: leaf}} for one ceiling__ run dir."""
+    leaves = {}
+    for inner in run_dir.iterdir():
+        if not inner.is_dir():
+            continue
+        m = re.search(r"__(source|nsys)__", inner.name)
+        mo = re.search(r"-ohbm(\d+)__", inner.name)
+        if not m:
+            continue
+        for leaf in inner.glob("b*_s*_ga*"):
+            leaves.setdefault(int(mo.group(1)) if mo else 0, {})[m.group(1)] = leaf
+    return leaves
+
+
+def steady_step_seconds(leaf):
+    """User rule: >=3 measured steps; drop warmups and the last measured step."""
+    f = leaf / "step_samples.csv"
+    if not f.exists():
+        return None, 0
+    rows = list(csv.DictReader(f.open()))
+    meas = [r for r in rows if r.get("is_warmup", "").strip() in ("False", "false", "0")]
+    if len(meas) < 3:
+        return None, len(meas)
+    meas.sort(key=lambda r: int(float(r["measured_step"])))
+    vals = [float(r["step_milliseconds"]) / 1000.0 for r in meas[:-1]]
+    return sum(vals) / len(vals), len(meas)
+
+
+def t0_from_lat(leaf):
+    f = leaf / "lat.md"
+    if f and f.exists():
+        for line in f.read_text().splitlines():
+            if "optimizer/update side" in line:
+                try:
+                    return float(line.split("|")[2].strip()) / 1000.0
+                except (IndexError, ValueError):
+                    pass
+    return 10.0
+
+
+def find_anchor(name, batch):
+    """Largest-seq compliant steady-state anchor for this config: (seq, ohbm, sec, t0)."""
+    dir_name = name.replace(".", "_")
+    best = None
+    for run_dir in ART.glob(f"ceiling__{dir_name}__b{batch}_s*_ga*"):
+        m = re.search(rf"__b{batch}_s(\d+)_ga", run_dir.name)
+        if not m:
+            continue
+        seq = int(m.group(1))
+        for ohbm, profs in leaf_dirs(run_dir).items():
+            for leaf in profs.values():
+                sec, nmeas = steady_step_seconds(leaf)
+                if sec and nmeas >= 3 and (best is None or seq >= best[0]):
+                    best = (seq, ohbm, sec, t0_from_lat(profs.get("source") or leaf))
+    return best
+
+
+def main():
+    argv = sys.argv[1:]
+    verbose = any(a in ("-v", "--verbose") for a in argv)
+    md_path = None if "--no-md" in argv else DEFAULT_MD
+    if "--md" in argv:
+        md_path = Path(argv[argv.index("--md") + 1])
+    args = [a for i, a in enumerate(argv)
+            if not a.startswith("-") and (i == 0 or argv[i - 1] != "--md")]
+    if not args:
+        sys.exit(__doc__.strip())
+    cfgs = list(parse_config_rows(Path(args[0])))
+    results = load_results()
+
+    fit_notes = []
+    rows, trows = [], []
+    for c in sorted(cfgs, key=lambda c: (c["model"], c["backend"], c["recomp"])):
+        res = results.get(c["name"])
+        anchor = find_anchor(c["name"], c["batch"])
+        arch = ARCH.get(c["model"])
+        fit = None
+        if anchor and arch:
+            aseq, aohbm, asec, t0 = anchor
+            L, H, P = arch
+            k = (2 * L * H) / (2 * P)
+            cg = (asec - t0) / ((c["batch"] * aseq) * (1 + k * aseq))
+            fit = (t0, cg, k)
+            fit_notes.append(f"`{c['name']}`: anchor s={aseq:,} ohbm{aohbm} {asec:.1f}s/step, "
+                             f"t0={t0:.1f}s, c_g={cg:.4e} s/tok, k={k:.3e} "
+                             f"(attn@anchor={k*aseq/(1+k*aseq)*100:.0f}%)")
+            if verbose:
+                print(f"# fit {fit_notes[-1]}")
+        config_label = c["recomp"] + (f"-ohbm{res[1]}" if res else "")
+        cells, tcells = [], []
+        for s in SLOTS:
+            if res:
+                tmax = c["batch"] * res[0]
+                if s > min(tmax, CTX.get(c["model"], 10 ** 9)):
+                    cells.append("x"); tcells.append("x")
+                    continue
+                maxb = tmax // s
+                if fit:
+                    t0, cg, k = fit
+                    T = maxb * s
+                    t = t0 + cg * T * (1 + k * s)
+                    tag = "a" if (anchor and anchor[0] == s and maxb == c["batch"]) else ""
+                    if tag:
+                        t = anchor[2]
+                    cells.append(f"{maxb} / {t:,.0f}s ({T / t:,.0f}){tag}")
+                    tcells.append(f"{T / t:,.0f}{tag}")
+                else:
+                    cells.append(f"{maxb} / . (.)"); tcells.append(".")
+            else:
+                cells.append(". / . (.)"); tcells.append(".")
+        note = "" if (res and res[2]) else ("  [unconfirmed]" if res else "  [no ceiling yet]")
+        rows.append([c["model"], c["backend"], config_label + note] + cells)
+        trows.append([c["model"], c["backend"], config_label + note] + tcells)
+
+    hdr = ["model", "backend", "config"] + [f"{s // 1000}k" for s in SLOTS]
+    w = [max(len(r[i]) for r in rows + [hdr]) for i in range(len(hdr))]
+    print(" | ".join(h.ljust(w[i]) for i, h in enumerate(hdr)))
+    print("-+-".join("-" * w[i] for i in range(len(hdr))))
+    for r in rows:
+        print(" | ".join(cell.ljust(w[i]) for i, cell in enumerate(r)))
+    print("\ncell = maxB / sec-per-step (tok/s) at maxB;  a = measured anchor;  "
+          ". = pending artifacts;  x = above max seq or context")
+
+    print("\nTHROUGHPUT (tok/s) at fixed sequence length (at maxB; ~batch-independent, t0 amortized)")
+    tw = [max(len(r[i]) for r in trows + [hdr]) for i in range(len(hdr))]
+    print(" | ".join(h.ljust(tw[i]) for i, h in enumerate(hdr)))
+    print("-+-".join("-" * tw[i] for i in range(len(hdr))))
+    for r in trows:
+        print(" | ".join(cell.ljust(tw[i]) for i, cell in enumerate(r)))
+
+    if md_path:
+        lines = [
+            "# Ceiling Table",
+            "",
+            f"Generated by `scripts/lf/ceiling_table.py {args[0]}` on "
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M')}.",
+            "",
+            "Cell = `maxB / sec-per-step (tok/s)` at maxB. `a` = measured steady-state anchor "
+            "(≥3 measured steps; warmup and last measured step dropped). Other latencies = "
+            "anchor + analytic attention split `t = t0 + c_g·T·(1 + k·s)`, `T = B·s`. "
+            "`.` = pending artifacts. `x` = above max seq (B=1) or model context.",
+            "",
+            "| " + " | ".join(hdr) + " |",
+            "|" + "|".join("---" for _ in hdr) + "|",
+        ]
+        lines += ["| " + " | ".join(r) + " |" for r in rows]
+        lines += ["", "## Throughput (tok/s) at fixed sequence length", "",
+                  "At maxB; ~batch-independent since t0 is negligible. `a` = measured anchor.", "",
+                  "| " + " | ".join(hdr) + " |",
+                  "|" + "|".join("---" for _ in hdr) + "|"]
+        lines += ["| " + " | ".join(r) + " |" for r in trows]
+        if fit_notes:
+            lines += ["", "## Fit constants", ""] + [f"- {n}" for n in fit_notes]
+        lines += ["", "Sources: ceilings from `ceiling_search_state/results.jsonl`; "
+                      "anchors and fits from `profiling_both/` artifacts. Re-run the "
+                      "command above to refresh after new runs land.", ""]
+        md_path.write_text("\n".join(lines))
+        print(f"wrote {md_path}")
+
+
+if __name__ == "__main__":
+    main()

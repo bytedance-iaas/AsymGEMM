@@ -164,7 +164,7 @@ class Config:
     template: str
     seq0: int
     ohbm0: int = 0
-    ohbm_ladder: list = field(default_factory=lambda: [0, 8, 4, 3, 2, 1])
+    ohbm_ladder: list = field(default_factory=lambda: [0, 8, 6, 4, 3, 2, 1])
     seq_step: int = 4000
     seq_resolution: int = 1000
     seq_min: int = 4000

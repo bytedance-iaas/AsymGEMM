@@ -107,15 +107,15 @@ else
     # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 172000|8|1 ; none|false|false|false|false|false" # ceiling (max OK); G-OOM 188k
 
     # "q3-30b-a3b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 131000|8|1 ; none|false|false|false|false|false" # C-OOM 132k
-    "q3-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 68000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
+    # "q3-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 68000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
     # "llama3.3-70b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
     # "llama4-scout|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 14500|8|1 ; none|false|false|false|false|false" # G-OOM 15k
     # "q2.5-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 52000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
     # "q2.5-72b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
 
-    # "q3-30b-a3b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # C-xxx, G-xxx, G-OOM 81k
-    # "q3-32b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 49000|8|1 ; none|false|false|false|false|false" # G-OOM 50k
-    # "llama3.3-70b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
+    "q3-30b-a3b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # C-xxx, G-xxx, G-OOM 81k
+    "q3-32b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 49000|8|1 ; none|false|false|false|false|false" # G-OOM 50k
+    "llama3.3-70b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
     # "llama4-scout|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
     # "q2.5-32b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
     # "q2.5-72b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # G-OOM 41k
@@ -196,14 +196,14 @@ PRECISION=${PRECISION:-bf16}
 LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 
 # Training
-# MAX_STEPS=${MAX_STEPS:-3}
-# WARMUP_STEPS=${WARMUP_STEPS:-1}
+MAX_STEPS=${MAX_STEPS:-3}
+WARMUP_STEPS=${WARMUP_STEPS:-1}
 # MAX_STEPS=${MAX_STEPS:-6}
 # WARMUP_STEPS=${WARMUP_STEPS:-6}
 # MAX_STEPS=${MAX_STEPS:-7}
 # WARMUP_STEPS=${WARMUP_STEPS:-3}
-MAX_STEPS=${MAX_STEPS:-1}
-WARMUP_STEPS=${WARMUP_STEPS:-1}
+# MAX_STEPS=${MAX_STEPS:-1}
+# WARMUP_STEPS=${WARMUP_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 # LORA_PARAMS is the canonical LoRA knob: sweep tuples, each "dropout|rank|alpha[|target]".
 # Older LORA_DROPOUT/LORA_RANK/LORA_ALPHA knobs still seed the default tuple.

@@ -1,0 +1,8 @@
+# Config list for ceiling_table.py — same row format as CONFIGS in ceiling_search.sh.
+# seq0/ohbm0 are ignored by the table (ceilings come from results.jsonl); kept for format parity.
+30000 : 0 : llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false
+68000 : 0 : q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false
+131000 : 0 : q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false
+30000 : 0 : llama3.3-70b|1 ; superoffload_mem|unsloth-off-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false
+50000 : 0 : q3-32b|1 ; superoffload_mem|unsloth-off-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false
+128000 : 0 : q3-30b-a3b|1 ; superoffload_mem|unsloth-off-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false
