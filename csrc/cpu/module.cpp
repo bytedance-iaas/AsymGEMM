@@ -198,8 +198,10 @@ py::dict caps_dict() {
   d["has_avx512f"]     = (bool)c.has_avx512f;
   d["has_avx512_bf16"] = (bool)c.has_avx512_bf16;
   d["has_avx_vnni"]    = (bool)c.has_avx_vnni;
+  d["has_avx512_vnni"] = (bool)c.has_avx512_vnni;
   d["has_amx_bf16"]    = (bool)c.has_amx_bf16;
   d["has_amx_int8"]    = (bool)c.has_amx_int8;
+  d["int8_rm_backend"] = std::string(cg_int8_rm_backend_name());
   return d;
 }
 
