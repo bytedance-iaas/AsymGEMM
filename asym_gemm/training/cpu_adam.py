@@ -169,6 +169,19 @@ class AsymCPUAdamW(torch.optim.Optimizer):
         self.pin_memory = bool(pin_memory)
         self.fp32_master = bool(fp32_master)
         self.grad_offload = bool(grad_offload)
+        # Async grad D2H (agent/fix_throughput.md fix #0): the per-param sync copies in
+        # the AccumulateGrad hook drained the stream 672x/step (23-26% of step time).
+        # Async path enqueues on the producing stream and drains ONCE before any read.
+        self.async_grad_offload = os.environ.get(
+            "ASYM_CPU_ADAMW_ASYNC_GRAD_OFFLOAD", "1"
+        ).strip().lower() not in ("0", "false", "off")
+        self._inflight_grad_srcs: list[torch.Tensor] = []
+        # Same-dtype pinned staging is REQUIRED for a truly async D2H: the fp32 master
+        # grad buffers force a cross-dtype copy, which synchronizes regardless of
+        # non_blocking. Stage bf16 grads verbatim; widen to fp32 on CPU at drain.
+        self._grad_staging_flat: torch.Tensor | None = None
+        self._grad_staging_views: dict[str, torch.Tensor] = {}
+        self._pending_grad_converts: list[_ParamMapping] = []
         self.weight_offload = bool(weight_offload)
         # fix_gb200_ep.md P6: under torchrun the ranks pin the torch/OMP pool small for
         # the bwd host ops, starving DeepSpeedCPUAdam's OMP region (measured 5.7 s @1
@@ -340,6 +353,22 @@ class AsymCPUAdamW(torch.optim.Optimizer):
             numel = int(mapping.cpu_param.numel())
             mapping.grad_buffer = flat.narrow(0, offset, numel).view_as(mapping.cpu_param.data)
             offset += numel
+
+        if self.async_grad_offload:
+            stage_specs = [m for m in self._mappings if m.model_dtype == torch.bfloat16]
+            stage_total = sum(int(m.cpu_param.numel()) for m in stage_specs)
+            if stage_total:
+                stage = torch.empty(stage_total, device="cpu", dtype=torch.bfloat16)
+                stage, pin_error = _pin_if_requested(stage, pin_memory=self.pin_memory)
+                if pin_error is not None:
+                    self._pin_memory_failures.append(f"grad_bf16_staging: {pin_error}")
+                self._grad_staging_flat = stage
+                self._grad_staging_views = {}
+                off = 0
+                for m in stage_specs:
+                    numel = int(m.cpu_param.numel())
+                    self._grad_staging_views[m.name] = stage.narrow(0, off, numel).view_as(m.cpu_param.data)
+                    off += numel
         return flat
 
     def _ensure_grad_accum_staging_buffer(self, numel: int) -> torch.Tensor:
@@ -400,6 +429,19 @@ class AsymCPUAdamW(torch.optim.Optimizer):
             # No-op for non-offloaded params (e.g. attention LoRA).
             self._coordinator.release(mapping.cuda_param)
 
+    def _drain_grad_offload_copies(self) -> None:
+        """Wait for in-flight async grad D2H copies: ONE device sync per step instead of
+        one blocking copy per param, then widen staged bf16 grads to the fp32 buffers on
+        CPU (exact). Must run before anything reads the CPU grad buffers (step /
+        grad-norm / clip / zero_grad / accumulate)."""
+        if not self._inflight_grad_srcs and not self._pending_grad_converts:
+            return
+        torch.cuda.synchronize()
+        self._inflight_grad_srcs.clear()
+        for mapping in self._pending_grad_converts:
+            mapping.grad_buffer.copy_(self._grad_staging_views[mapping.name])
+        self._pending_grad_converts.clear()
+
     def _copy_or_accumulate_grad_to_cpu(self, mapping: _ParamMapping, cuda_grad: torch.Tensor) -> None:
         grad_buffer = self._ensure_grad_buffer(mapping)
         if not grad_buffer.is_contiguous():
@@ -410,9 +452,39 @@ class AsymCPUAdamW(torch.optim.Optimizer):
                 f"expected {mapping.cpu_param.dtype}"
             )
         if not mapping.grad_buffer_has_data:
-            grad_buffer.copy_(cuda_grad, non_blocking=False)
+            staging = self._grad_staging_views.get(mapping.name) if self.async_grad_offload else None
+            if (staging is not None and cuda_grad.is_cuda
+                    and cuda_grad.dtype == staging.dtype and staging.is_pinned()):
+                # Same-dtype pinned DMA: enqueued on the producing stream, no host block,
+                # no stream drain. bf16->fp32 widening happens on CPU at drain time.
+                # Keep the CUDA source alive until drained (the hook nulls
+                # cuda_param.grad right after this call).
+                staging.copy_(cuda_grad, non_blocking=True)
+                self._inflight_grad_srcs.append(cuda_grad)
+                self._pending_grad_converts.append(mapping)
+            elif (self.async_grad_offload and cuda_grad.is_cuda
+                    and cuda_grad.dtype == grad_buffer.dtype and grad_buffer.is_pinned()):
+                grad_buffer.copy_(cuda_grad, non_blocking=True)
+                self._inflight_grad_srcs.append(cuda_grad)
+            else:
+                if self.async_grad_offload and not getattr(self, "_async_diag_printed", False):
+                    self._async_diag_printed = True
+                    import sys
+                    print(
+                        f"[asym-cpu-adamw] async grad offload FELL BACK to sync for {mapping.name}: "
+                        f"staging={'None' if staging is None else 'set'} "
+                        f"views={len(self._grad_staging_views)} "
+                        f"grad(dtype={cuda_grad.dtype},cuda={cuda_grad.is_cuda},contig={cuda_grad.is_contiguous()}) "
+                        f"staging_pinned={staging.is_pinned() if staging is not None else 'n/a'} "
+                        f"model_dtype={mapping.model_dtype}",
+                        file=sys.stderr, flush=True,
+                    )
+                grad_buffer.copy_(cuda_grad, non_blocking=False)
             return
 
+        # Grad-accumulation path (ga > 1): drain first so the async first-write of this
+        # buffer has landed, then keep the original synchronous staging semantics.
+        self._drain_grad_offload_copies()
         staging = self._ensure_grad_accum_staging_buffer(int(cuda_grad.numel())).view_as(grad_buffer)
         staging.copy_(cuda_grad, non_blocking=False)
         grad_buffer.add_(staging)
@@ -447,6 +519,7 @@ class AsymCPUAdamW(torch.optim.Optimizer):
         if not self._post_prepare_checked:
             self._check_post_prepare_devices()
 
+        self._drain_grad_offload_copies()
         self._copy_group_hyperparameters_to_inner()
         grad_param_count = 0
         skipped_no_grad = 0
@@ -525,9 +598,22 @@ class AsymCPUAdamW(torch.optim.Optimizer):
         self._last_step_grad_param_count = grad_param_count
         self._last_step_copyback_param_count = copyback_count
         self._last_step_skipped_copyback_no_grad_param_count = skipped_no_grad
+        if self.grad_offload:
+            # Make step() self-contained: the trainer's zero_grad may never reach this
+            # optimizer (wrappers), which previously left grad_buffer_has_data=True so
+            # (a) later steps ACCUMULATED onto stale grads (add_) and (b) every later
+            # step took the sync accumulate path, defeating the async D2H offload.
+            # Clearing after consumption preserves ga>1 (multiple backwards, one step).
+            for mapping in self._mappings:
+                mapping.grad_buffer_has_data = False
+                mapping.hook_calls = 0
+                mapping.offloaded_grad_numel = 0
+            self._current_hook_grad_copy_ms = 0.0
         return loss
 
     def zero_grad(self, set_to_none: bool = True) -> None:
+        # Buffers get reused next step: never let an in-flight copy land after a zero.
+        self._drain_grad_offload_copies()
         super().zero_grad(set_to_none=True if self.grad_offload else set_to_none)
         try:
             self.inner_optimizer.zero_grad(set_to_none=True if self.grad_offload else set_to_none)
@@ -662,6 +748,7 @@ class AsymCPUAdamW(torch.optim.Optimizer):
         return bool(self.grad_offload)
 
     def asym_cpu_adamw_grad_buffers(self) -> list[torch.Tensor]:
+        self._drain_grad_offload_copies()
         return [
             mapping.grad_buffer
             for mapping in self._mappings
