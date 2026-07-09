@@ -91,6 +91,46 @@ struct ScopedAffinity {
   }
 };
 
+// Scratch for the host node's grouping / concat / reduce, owned by RuntimeHandle
+// (below). ONE instance per handle, shared by every layer's host node: layers
+// replay sequentially on the handle's stream, so their host nodes never overlap.
+// It lives on the handle (not a global) so that concurrent decode graphs driven
+// by *distinct* handles each get their own workspace -- a single global would be
+// raced by two concurrent replays. Grown to the largest captured T outside
+// capture in make_decode_args. Non-pinned (CPU-only), so per-handle sharing
+// still avoids an O(num_layers) memory blow-up.
+// NOTE: this is only race-free under the handle's existing contract -- one
+// RuntimeHandle per concurrent stream. Two streams sharing one handle would race
+// here (and on the pool), which is already unsupported.
+struct DecodeWorkspace {
+  int cap_T = 0, K = 0, G = 0, H = 0, I = 0;
+  std::vector<int64_t>  cnt;         // [G]   tokens routed to each expert
+  std::vector<int64_t>  m_offsets;   // [G+1] concat offsets for active experts
+  std::vector<int64_t>  expert_ids;  // [G]   active expert ids
+  std::vector<int64_t>  wcursor;     // [G]   per-expert write head
+  std::vector<uint16_t> x_cat;       // [cap_T*K, H]  gathered activations
+  std::vector<int>      cat_token;   // [cap_T*K]     source token per concat row
+  std::vector<float>    cat_w;       // [cap_T*K]     route weight per concat row
+  std::vector<float>    out_scratch; // [cap_T*K, H]  per-expert output (pre-reduce)
+  std::vector<float>    acc;         // [cap_T, H]    fp32 accumulator
+
+  void ensure(int T, int K_, int G_, int H_, int I_) {
+    K = K_; G = G_; H = H_; I = I_;
+    if (T <= cap_T && !x_cat.empty()) return;
+    cap_T = std::max(cap_T, T);
+    const size_t sm = (size_t)cap_T * K;
+    cnt.assign((size_t)G, 0);
+    m_offsets.assign((size_t)G + 1, 0);
+    expert_ids.assign((size_t)G, 0);
+    wcursor.assign((size_t)G, 0);
+    x_cat.assign(sm * (size_t)H, 0);
+    cat_token.assign(sm, 0);
+    cat_w.assign(sm, 0.0f);
+    out_scratch.assign(sm * (size_t)H, 0.0f);
+    acc.assign((size_t)cap_T * H, 0.0f);
+  }
+};
+
 struct RuntimeHandle {
   cg_runtime_t* rt = nullptr;      // primary pool (node A's in NUMA-TP mode)
   cg_runtime_t* rt_b = nullptr;    // node B's pool (NUMA-TP mode only)
@@ -98,6 +138,10 @@ struct RuntimeHandle {
   // runtime executes cg_gemm fully inline (no pool wake) and owns its own
   // scratch arena, so concurrent use from distinct pool workers is safe.
   std::vector<std::unique_ptr<RuntimeHandle>> serial_rts;
+
+  // Host-node scratch for decode grouping/concat/reduce. Only the top-level
+  // handle passed to make_decode_args uses it; serial_rts carry an empty one.
+  DecodeWorkspace ws;
 
   explicit RuntimeHandle(int n_threads) {
     rt = cg_runtime_create(n_threads);
@@ -469,44 +513,10 @@ struct DecodeArgs {
   int T = 0, K = 0, G = 0, H = 0, I = 0;
 };
 
-// Scratch for the host node's grouping / concat / reduce. ONE instance shared by
-// every layer's host node (layers run sequentially in the captured graph, so no
-// overlap), grown to the largest captured T outside capture in make_decode_args.
-// Non-pinned (CPU-only), so sharing avoids an O(num_layers) memory blow-up.
-struct DecodeWorkspace {
-  int cap_T = 0, K = 0, G = 0, H = 0, I = 0;
-  std::vector<int64_t>  cnt;         // [G]   tokens routed to each expert
-  std::vector<int64_t>  m_offsets;   // [G+1] concat offsets for active experts
-  std::vector<int64_t>  expert_ids;  // [G]   active expert ids
-  std::vector<int64_t>  wcursor;     // [G]   per-expert write head
-  std::vector<uint16_t> x_cat;       // [cap_T*K, H]  gathered activations
-  std::vector<int>      cat_token;   // [cap_T*K]     source token per concat row
-  std::vector<float>    cat_w;       // [cap_T*K]     route weight per concat row
-  std::vector<float>    out_scratch; // [cap_T*K, H]  per-expert output (pre-reduce)
-  std::vector<float>    acc;         // [cap_T, H]    fp32 accumulator
-
-  void ensure(int T, int K_, int G_, int H_, int I_) {
-    K = K_; G = G_; H = H_; I = I_;
-    if (T <= cap_T && !x_cat.empty()) return;
-    cap_T = std::max(cap_T, T);
-    const size_t sm = (size_t)cap_T * K;
-    cnt.assign((size_t)G, 0);
-    m_offsets.assign((size_t)G + 1, 0);
-    expert_ids.assign((size_t)G, 0);
-    wcursor.assign((size_t)G, 0);
-    x_cat.assign(sm * (size_t)H, 0);
-    cat_token.assign(sm, 0);
-    cat_w.assign(sm, 0.0f);
-    out_scratch.assign(sm * (size_t)H, 0.0f);
-    acc.assign((size_t)cap_T * H, 0.0f);
-  }
-};
-DecodeWorkspace g_ws;
-
 void moe_decode_host(void* user) {
   DecodeArgs* a = static_cast<DecodeArgs*>(user);
   const int T = a->T, K = a->K, G = a->G, H = a->H, I = a->I;
-  DecodeWorkspace& w = g_ws;
+  DecodeWorkspace& w = a->rth->ws;
 
   // 1. Count tokens routed to each expert (skip masked / invalid slots).
   std::fill_n(w.cnt.data(), G, (int64_t)0);
@@ -596,7 +606,7 @@ std::intptr_t make_decode_args_py(
     int T, int K, int G, int H, int I) {
   if (T <= 0 || K <= 0 || G <= 0 || H <= 0 || I <= 0)
     throw std::invalid_argument("make_decode_args: dims must be positive");
-  g_ws.ensure(T, K, G, H, I);
+  rt.ws.ensure(T, K, G, H, I);
   // At most min(G, T*K) experts are active in one decode step.
   rt.ensure_serial((size_t)std::min<int64_t>(G, (int64_t)T * K));
   auto* a = new DecodeArgs();
