@@ -12,7 +12,8 @@ Both backends compute the same INT8 → INT32 → FP32 dequant contract:
     C_fp32      = sA · sB · C_int32       (outer broadcast)
 """
 
+from .dispatch_model import DispatchModel
 from .runtime import Layer
 from .. import _cpu_C as _C  # re-exported for tests / debugging
 
-__all__ = ["Layer", "_C"]
+__all__ = ["Layer", "DispatchModel", "_C"]
