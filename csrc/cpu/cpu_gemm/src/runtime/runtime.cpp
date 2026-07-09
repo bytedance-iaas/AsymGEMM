@@ -44,6 +44,7 @@ struct CapsProbe {
       bits.has_avx2          = (b & (1u << 5))  != 0;
       bits.has_avx512f       = (b & (1u << 16)) != 0;
       bits.has_avx512_bf16   = 0;  /* leaf 7 subleaf 1 */
+      bits.has_avx512_vnni   = (c & (1u << 11)) != 0;
       bits.has_amx_bf16      = (d & (1u << 22)) != 0;
       bits.has_amx_int8      = (d & (1u << 25)) != 0;
     }

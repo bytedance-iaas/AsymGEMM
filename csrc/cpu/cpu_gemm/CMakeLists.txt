@@ -19,7 +19,7 @@ option(CPU_GEMM_BUILD_EXAMPLES "Build example programs"          ON)
 
 # Backend toggles (default ON if compiler can target them; user can override).
 option(CPU_GEMM_WITH_AVX2      "Build AVX2 backend"              ON)
-option(CPU_GEMM_WITH_AVX512    "Build AVX-512 backend"           OFF)
+option(CPU_GEMM_WITH_AVX512    "Build AVX-512 backend"           ON)
 option(CPU_GEMM_WITH_AMX       "Build Intel AMX backend"         ON)
 option(CPU_GEMM_WITH_AOCL      "Build AMD AOCL/BLIS bridge"      OFF)
 
@@ -41,6 +41,7 @@ set(CPU_GEMM_SOURCES
   src/runtime/runtime.cpp
   src/dispatch/gemm.cpp
   src/dispatch/dtype.cpp
+  src/dispatch/int8_rm_backend.cpp
 )
 
 set(CPU_GEMM_BACKEND_LIBS "")
@@ -74,6 +75,19 @@ if(CPU_GEMM_WITH_AMX)
   list(APPEND CPU_GEMM_BACKEND_LIBS cpu_gemm_amx)
 endif()
 
+if(CPU_GEMM_WITH_AVX512)
+  add_library(cpu_gemm_avx512 OBJECT
+    src/kernels/avx512/int8_gemm_rm.cpp
+  )
+  target_compile_options(cpu_gemm_avx512 PRIVATE
+    -mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mfma
+  )
+  target_compile_definitions(cpu_gemm_avx512 PRIVATE CPU_GEMM_HAS_AVX512_VNNI=1)
+  target_include_directories(cpu_gemm_avx512 PRIVATE include src)
+  target_link_libraries(cpu_gemm_avx512 PRIVATE cpu_gemm_common_flags)
+  list(APPEND CPU_GEMM_BACKEND_LIBS cpu_gemm_avx512)
+endif()
+
 # Placeholders for the other backends — they'll be wired in by their own
 # steps in cpu_gemm.md. Each one becomes an OBJECT library with the right
 # -march flags, and the dispatcher selects among them.
@@ -98,6 +112,11 @@ endif()
 if(CPU_GEMM_WITH_AMX)
   target_compile_definitions(cpu_gemm PRIVATE CPU_GEMM_HAS_AMX=1)
   target_sources(cpu_gemm PRIVATE $<TARGET_OBJECTS:cpu_gemm_amx>)
+endif()
+
+if(CPU_GEMM_WITH_AVX512)
+  target_compile_definitions(cpu_gemm PRIVATE CPU_GEMM_HAS_AVX512_VNNI=1)
+  target_sources(cpu_gemm PRIVATE $<TARGET_OBJECTS:cpu_gemm_avx512>)
 endif()
 
 # --------------------------------------------------------------------------
