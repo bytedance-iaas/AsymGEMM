@@ -1,8 +1,15 @@
 """Unified INT8 MoE layer (asym_gemm.unified_moe.Layer) — v3.
 
-Per-expert dispatch on routed token count:
-- m_e <= m_cpu  → CPU AMX INT8 path (cpu_gemm, stride-aware row-major B)
-- m_e >  m_cpu  → SM90 INT8 grouped-MoE WGMMA kernel (asym_gemm)
+Per-expert dispatch, two modes:
+- static (default): routed token count vs threshold —
+    m_e <= m_cpu  → CPU AMX INT8 path (cpu_gemm, stride-aware row-major B)
+    m_e >  m_cpu  → SM90 INT8 grouped-MoE WGMMA kernel (asym_gemm)
+  plus the ASYMGEMM_CPU_PREFILL_FRACTION large-batch heuristic below.
+- adaptive (``adaptive=True`` or ``set_adaptive()``): a runtime cost model
+  partitions the streamed experts to balance the two buckets' predicted
+  finish times (they execute concurrently); VRAM-cached experts always
+  stay on the GPU. See ``dispatch_model.py`` and ``adaptive_dispatch.md``.
+  ``layer.calibrate()`` seeds the model.
 
 **All expert parameters live in pinned host memory** — no VRAM weight mirror.
 The GPU path reads weights from pinned host via Hopper TMA over PCIe (UVA).
@@ -28,6 +35,7 @@ See docs unified_kernel_pinned_CPU_memory.md for the full design.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -36,6 +44,7 @@ import torch
 
 import asym_gemm
 from .. import _cpu_C as _C
+from .dispatch_model import DispatchModel
 
 try:  # fused kernels for the VRAM-cached paths (optional dependency)
     from . import _triton as _tk
@@ -444,7 +453,9 @@ class Layer:
         cpu_threads: int = 0,
         cuda_device: int = 0,
         m_cpu: int = 16,
+        adaptive: bool = False,
         runtime: Optional["_C.Runtime"] = None,
+        dispatch_model: Optional[DispatchModel] = None,
     ):
         self.slab = slab
         self.top_k = top_k
@@ -454,6 +465,29 @@ class Layer:
         # for the build-your-own default and is ignored when `runtime` is given.
         self.rt = runtime if runtime is not None else _C.Runtime(cpu_threads)
         self.m_cpu = m_cpu
+        # Adaptive dispatch: cost-model makespan partition of the streamed
+        # experts instead of the static m_cpu threshold / cpu_frac heuristic
+        # (VRAM-cached experts always stay on the GPU). Observations are
+        # recorded in both modes so a calibrated/warmed model carries over
+        # when adaptive is enabled. An injected `dispatch_model` (one
+        # instance shared by every same-shape MoE layer, pooling their
+        # observations) takes precedence over the shape-aware default.
+        # Cross-shape warm start: build it via
+        # DispatchModel.from_rates(other.rates(), hidden=…, inter=…).
+        self.adaptive = adaptive
+        if dispatch_model is not None:
+            if dispatch_model.hidden is not None:
+                assert (dispatch_model.hidden, dispatch_model.inter) == \
+                    (slab.hidden, slab.inter), \
+                    "shared dispatch_model shape mismatch: " \
+                    f"{(dispatch_model.hidden, dispatch_model.inter)} vs " \
+                    f"{(slab.hidden, slab.inter)}"
+            self.dispatch = dispatch_model
+        else:
+            self.dispatch = DispatchModel(block_m=BLOCK_M,
+                                          hidden=slab.hidden,
+                                          inter=slab.inter)
+        self._gpu_bucket_calls = 0   # first GPU call is JIT warm-up; not recorded
         self.cache_n = 0
         _maybe_register_stats(self)
         self._build_gpu_cache()
@@ -754,7 +788,9 @@ class Layer:
         cpu_threads: int = 0,
         cuda_device: int = 0,
         m_cpu: int = 16,
+        adaptive: bool = False,
         runtime: Optional["_C.Runtime"] = None,
+        dispatch_model: Optional[DispatchModel] = None,
     ) -> "Layer":
         assert gate.shape == up.shape
         G, N_inter, K_hidden = gate.shape
@@ -800,7 +836,8 @@ class Layer:
             up_int8=up_int8, up_s=up_s,
             down_int8=down_int8, down_s=down_s,
             top_k=top_k, cpu_threads=cpu_threads,
-            cuda_device=cuda_device, m_cpu=m_cpu, runtime=runtime,
+            cuda_device=cuda_device, m_cpu=m_cpu, adaptive=adaptive,
+            runtime=runtime, dispatch_model=dispatch_model,
         )
 
     @classmethod
@@ -817,7 +854,9 @@ class Layer:
         cpu_threads: int = 0,
         cuda_device: int = 0,
         m_cpu: int = 16,
+        adaptive: bool = False,
         runtime: Optional["_C.Runtime"] = None,
+        dispatch_model: Optional[DispatchModel] = None,
     ) -> "Layer":
         """Build a layer from **pre-quantized** INT8 expert weights.
 
@@ -870,7 +909,8 @@ class Layer:
             up_int8=_pin(up_int8), up_s=_pin(up_scales),
             down_int8=_pin(down_int8), down_s=_pin(down_scales),
             top_k=top_k, cpu_threads=cpu_threads,
-            cuda_device=cuda_device, m_cpu=m_cpu, runtime=runtime,
+            cuda_device=cuda_device, m_cpu=m_cpu, adaptive=adaptive,
+            runtime=runtime, dispatch_model=dispatch_model,
         )
 
     @classmethod
@@ -887,7 +927,9 @@ class Layer:
         cpu_threads: int = 0,
         cuda_device: int = 0,
         m_cpu: int = 16,
+        adaptive: bool = False,
         runtime: Optional["_C.Runtime"] = None,
+        dispatch_model: Optional[DispatchModel] = None,
     ) -> "Layer":
         """Assemble the device SFB broadcasts, the ExpertSlab and the Layer from
         the six pinned-host INT8/scale tensors. Shared by ``from_bf16`` (which
@@ -947,10 +989,70 @@ class Layer:
                 g_split=G,
             )
         return cls(slab, top_k=top_k, cpu_threads=cpu_threads,
-                   cuda_device=cuda_device, m_cpu=m_cpu, runtime=runtime)
+                   cuda_device=cuda_device, m_cpu=m_cpu, adaptive=adaptive,
+                   runtime=runtime, dispatch_model=dispatch_model)
 
     def set_m_cpu(self, m_cpu: int) -> None:
+        """Force the static threshold (also disables adaptive dispatch)."""
         self.m_cpu = int(m_cpu)
+        self.adaptive = False
+
+    def set_adaptive(self, adaptive: bool = True) -> None:
+        self.adaptive = bool(adaptive)
+
+    def calibrate(self, t_points: tuple[int, ...] = (1, 4, 16, 64),
+                  repeats: int = 2, seed: int = 0) -> dict:
+        """Seed the dispatch cost model with forced all-CPU / all-GPU runs.
+
+        Runs synthetic forwards through the *real* bucket code paths (so
+        Python/gather/quant overheads are included in the observations).
+        Optional — priors plus online refit converge without it, but this
+        removes the warm-up period. Returns the model snapshot.
+        """
+        global _CPU_PREFILL_FRACTION
+        prev_adaptive, prev_m_cpu = self.adaptive, self.m_cpu
+        prev_frac = _CPU_PREFILL_FRACTION
+        self.adaptive = False
+        # Zero the prefill fraction so the m_cpu extremes really force the
+        # buckets (the cpu_frac heuristic would otherwise siphon rows to the
+        # CPU during the all-GPU runs).
+        _CPU_PREFILL_FRACTION = 0.0
+        G, H = self.slab.num_experts, self.slab.hidden
+        rng = torch.Generator().manual_seed(seed)
+        try:
+            for T in t_points:
+                x = torch.randn(T, H, generator=rng, dtype=torch.float32)
+                x = x.to(torch.bfloat16)
+                ids = torch.empty(T, self.top_k, dtype=torch.int64)
+                for j in range(self.top_k):
+                    ids[:, j] = (torch.arange(T) + j) % G
+                w = torch.full((T, self.top_k), 1.0 / self.top_k)
+
+                # One unrecorded warm-up forward per shape and backend:
+                # first-touch effects (per-shape kernel JIT, worker-pool /
+                # allocator warm-up) inflate that run 5-10x, and a single
+                # outlier in rings this small wrecks the ridge fit.
+                self.m_cpu = 10**9                  # force all-CPU
+                self.dispatch.paused = True
+                self.forward(x, ids, w)
+                self.dispatch.paused = False
+                for _ in range(repeats):
+                    self.forward(x, ids, w)
+                if torch.cuda.is_available():
+                    dev = f"cuda:{self.cuda_device}"
+                    x_d, ids_d, w_d = x.to(dev), ids.to(dev), w.to(dev)
+                    self.m_cpu = 0                  # force all-GPU
+                    self.dispatch.paused = True
+                    self.forward(x_d, ids_d, w_d)
+                    self.dispatch.paused = False
+                    for _ in range(repeats):
+                        self.forward(x_d, ids_d, w_d)
+            self.dispatch.harvest(wait=True)
+        finally:
+            self.adaptive, self.m_cpu = prev_adaptive, prev_m_cpu
+            self.dispatch.paused = False
+            _CPU_PREFILL_FRACTION = prev_frac
+        return self.dispatch.snapshot()
 
     # -----------------------------------------------------------
     # GPU bucket — grouped INT8 over pinned weights, one launch / projection
@@ -1242,9 +1344,35 @@ class Layer:
         # share drops to zero automatically.
         if self.cache_n > 0:
             streamed = active[~self._cached_mask_np[active]]
+            cached_active = active[self._cached_mask_np[active]]
         else:
             streamed = active
-        if (
+            cached_active = active[:0]
+        self.dispatch.harvest()          # fold in completed GPU timings
+        if self.adaptive:
+            # Cost-model makespan partition of the streamed experts (see
+            # dispatch_model.py / adaptive_dispatch.md): both buckets run
+            # concurrently, so the solver balances their predicted finish
+            # times instead of applying a fixed threshold or row fraction.
+            # Cached experts always stay on the GPU.
+            gpu_ok = torch.cuda.is_available() and x_bf16.is_cuda
+            if not gpu_ok:
+                # GPU unusable (CPU-resident input): everything — cached
+                # experts included — runs on the CPU bucket, which reads
+                # the same pinned weight bytes.
+                cpu_experts = active
+                gpu_experts = active[:0]
+            else:
+                m_list = counts_np[streamed].tolist()
+                cpu_sel, gpu_sel = self.dispatch.partition(
+                    m_list, gpu_available=True)
+                cpu_experts = np.sort(
+                    streamed[np.asarray(cpu_sel, dtype=np.int64)])
+                gpu_experts = np.sort(np.concatenate((
+                    streamed[np.asarray(gpu_sel, dtype=np.int64)],
+                    cached_active,
+                )))
+        elif (
             cpu_frac > 0.0
             and len(streamed)
             and int(counts_np.sum()) > self.m_cpu * max(1, len(active))
@@ -1260,10 +1388,6 @@ class Layer:
             csum = np.cumsum(counts_np[by_count])
             n_cpu = int(np.searchsorted(csum, cpu_frac * csum[-1], side="right"))
             cpu_experts = np.sort(by_count[:n_cpu])
-            cached_active = (
-                active[self._cached_mask_np[active]] if self.cache_n > 0
-                else active[:0]
-            )
             gpu_experts = np.sort(np.concatenate(
                 (by_count[n_cpu:], cached_active)
             ))
@@ -1282,7 +1406,9 @@ class Layer:
         # stream-ordered, so issuing it later would serialize the CPU bucket
         # behind the GPU bucket's grouped GEMMs instead of overlapping them.
         rows_cpu = slots_cpu = x_cat = None
+        t_gather = 0.0
         if len(cpu_experts):
+            t0 = time.perf_counter()
             cpu_e_t = torch.from_numpy(cpu_experts).to(in_device)
             is_cpu_item = torch.isin(sorted_e, cpu_e_t)
             rows_cpu = rows_sorted[is_cpu_item]
@@ -1291,6 +1417,7 @@ class Layer:
                 x_bf16.index_select(0, rows_cpu).to("cpu").contiguous()
             )
             x_cat = torch_bf16_to_np_bits(x_cat_t)
+            t_gather = time.perf_counter() - t0
 
         # ---- GPU bucket (grouped INT8): enqueue first, asynchronously; the
         # AMX bucket below then runs on the host while the GPU works through
@@ -1332,9 +1459,21 @@ class Layer:
                 partitions.append((rest[rest >= gs], "slab_b"))
             else:
                 partitions.append((rest, "slab_a"))
+            # Time the streamed partitions with a CUDA event pair for the
+            # dispatch cost model. The bracket opens just before the first
+            # streamed (non-cached) partition's work is enqueued, so the
+            # cached partition's HBM GEMMs — a different cost regime the
+            # model must not learn from — stay outside it. Stream order
+            # makes elapsed(start→end) cover exactly the streamed work,
+            # including any event-waits on the staging ring's copies (that
+            # wait IS the PCIe transfer cost the model should see).
+            ev_start = ev_end = None
             for part, kind in partitions:
                 if not len(part):
                     continue
+                if kind != "cached" and ev_start is None:
+                    ev_start = torch.cuda.Event(enable_timing=True)
+                    ev_start.record()
                 if kind == "cached":
                     kernel_ids = self._slot_np[part]
                 elif kind == "staged":
@@ -1353,11 +1492,25 @@ class Layer:
                 )
                 if rows_p is not None:
                     gpu_parts.append((rows_p, y_p))
+            if ev_start is not None:
+                ev_end = torch.cuda.Event(enable_timing=True)
+                ev_end.record()
+                self._gpu_bucket_calls += 1
+                if self._gpu_bucket_calls > 1:   # first call is JIT warm-up
+                    streamed_gpu = np.concatenate(
+                        [p for p, kind in partitions
+                         if kind != "cached" and len(p)])
+                    total_padded = int(sum(
+                        self.dispatch.padded(int(c))
+                        for c in counts_np[streamed_gpu]))
+                    self.dispatch.record_gpu_events(
+                        ev_start, ev_end, len(streamed_gpu), total_padded)
 
         # ---- CPU bucket, stage 2: the blocking AMX call. The GIL and the
         # CUDA stream are both free here, so this host work overlaps the GPU
         # bucket's grouped GEMMs enqueued above.
         if x_cat is not None:
+            t1 = time.perf_counter()
             slab = self.slab
             m_offsets = np.zeros(len(cpu_experts) + 1, dtype=np.int64)
             np.cumsum(counts_np[cpu_experts], out=m_offsets[1:])
@@ -1382,6 +1535,9 @@ class Layer:
                 *half_b,
                 out_cat, slab.inter, slab.hidden,
             )
+            self.dispatch.record_cpu(
+                len(cpu_experts), int(m_offsets[-1]),
+                t_gather + (time.perf_counter() - t1))
             y_cpu = torch.from_numpy(out_cat).to(in_device, non_blocking=True)
             w = route_w[rows_cpu, slots_cpu].to(torch.float32)
             out_fp32.index_add_(0, rows_cpu, y_cpu * w[:, None])

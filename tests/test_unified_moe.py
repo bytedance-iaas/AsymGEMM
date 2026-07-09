@@ -241,6 +241,122 @@ def test_mixed_bucket_parity():
     assert r <= 1.5e-2, f"mixed-bucket scale_rel {r:.3e} > 1.5e-2"
 
 
+def test_adaptive_dispatch_parity():
+    """Adaptive (cost-model) dispatch must be numerically indistinguishable
+    from static dispatch: calibrate, run several adaptive forwards, compare
+    each against the all-CPU baseline within the mixed-bucket envelope."""
+    torch.manual_seed(5)
+    G, H, I, top_k = 4, 256, 512, 2
+    gate = torch.randn(G, I, H, dtype=torch.bfloat16) * 0.07
+    up   = torch.randn(G, I, H, dtype=torch.bfloat16) * 0.07
+    down = torch.randn(G, H, I, dtype=torch.bfloat16) * 0.05
+    layer = Layer.from_bf16(gate, up, down, top_k=top_k, cpu_threads=8)
+
+    snap = layer.calibrate(t_points=(1, 8, 32), repeats=2)
+    assert snap["cpu_obs"] > 0, f"calibration recorded no CPU obs: {snap}"
+    assert snap["gpu_obs"] > 0, f"calibration recorded no GPU obs: {snap}"
+    assert snap["pending_gpu"] == 0
+
+    layer.set_adaptive(True)
+    for T in (4, 32, 96):
+        x_cpu = torch.randn(T, H, dtype=torch.bfloat16)
+        expert_ids = unique_topk_routing(T, G, top_k)
+        route_w    = torch.softmax(torch.randn(T, top_k), dim=-1).float()
+
+        y_adapt = layer.forward(x_cpu.to("cuda"), expert_ids.cuda(),
+                                route_w.cuda()).cpu()
+        layer.set_m_cpu(10**9)                       # all-CPU baseline
+        y_cpu = layer.forward(x_cpu, expert_ids, route_w)
+        layer.set_adaptive(True)                     # restore for next T
+
+        r = scale_rel(y_adapt, y_cpu)
+        print(f"  [test_adaptive_dispatch_parity] T={T:3d} adaptive vs "
+              f"all_cpu scale_rel={r:.3e}")
+        assert r <= 1.5e-2, f"T={T}: adaptive scale_rel {r:.3e} > 1.5e-2"
+
+    # CPU-resident input in adaptive mode must route everything to the CPU
+    # bucket (the GPU kernels need device tensors) and still be correct.
+    x_cpu = torch.randn(16, H, dtype=torch.bfloat16)
+    expert_ids = unique_topk_routing(16, G, top_k)
+    route_w    = torch.softmax(torch.randn(16, top_k), dim=-1).float()
+    y_adapt_cpu = layer.forward(x_cpu, expert_ids, route_w)
+    layer.set_m_cpu(10**9)
+    y_ref = layer.forward(x_cpu, expert_ids, route_w)
+    r = scale_rel(y_adapt_cpu, y_ref)
+    assert r <= 1e-6, f"CPU-input adaptive path diverged: {r:.3e}"
+    print(f"  [test_adaptive_dispatch_parity] model snapshot: "
+          f"{layer.dispatch.snapshot()}")
+
+
+def test_adaptive_mixed_split_parity():
+    """Adaptive dispatch with a *guaranteed mixed* CPU+GPU split.
+
+    The plain parity test lets the fitted model choose the split, and on a
+    fast host it may legitimately choose all-CPU for every T — leaving the
+    mixed adaptive path untested. Here we plant coefficients with a known
+    crossover and clear the observation rings (refit needs >= 4 obs, and we
+    run fewer forwards than that), so the partition is deterministic:
+    skewed routing (two 1-token experts, two heavy experts) must split
+    2 CPU / 2 GPU.
+    """
+    torch.manual_seed(6)
+    G, H, I, top_k = 4, 256, 512, 2
+    gate = torch.randn(G, I, H, dtype=torch.bfloat16) * 0.07
+    up   = torch.randn(G, I, H, dtype=torch.bfloat16) * 0.07
+    down = torch.randn(G, H, I, dtype=torch.bfloat16) * 0.05
+    layer = Layer.from_bf16(gate, up, down, top_k=top_k, cpu_threads=8)
+    layer.set_m_cpu(0)  # force the warm-up through the GPU bucket
+    layer.forward(      # absorb the GPU JIT warm-up call (its timing is skipped)
+        torch.randn(4, H, dtype=torch.bfloat16, device="cuda"),
+        unique_topk_routing(4, G, top_k).cuda(),
+        torch.full((4, top_k), 1.0 / top_k, device="cuda"))
+
+    dm = layer.dispatch
+    dm.harvest(wait=True)
+    dm.cpu.coef = np.array([100e-6, 30e-6, 8e-6])     # per-row cost dominates
+    dm.gpu.coef = np.array([150e-6, 120e-6, 0.05e-6]) # per-expert cost dominates
+    dm.cpu.obs.clear()
+    dm.gpu.obs.clear()
+    dm.cpu._dirty = dm.gpu._dirty = False
+
+    # Routing histogram [1, 1, T-1, T-1]: rows 0/1 hit the tiny experts once,
+    # every row hits both heavy experts 2 and 3.
+    T = 96
+    expert_ids = torch.empty(T, top_k, dtype=torch.int64)
+    expert_ids[:, 0] = 2
+    expert_ids[:, 1] = 3
+    expert_ids[0, 0] = 0
+    expert_ids[1, 0] = 1
+    m_list = [1, 1, T - 1, T - 1]
+
+    # The planted model must choose a genuinely mixed split for this batch,
+    # and forward() must see the same decision (rings are frozen).
+    cpu_sel, gpu_sel = dm.partition(m_list)
+    assert cpu_sel == [0, 1] and gpu_sel == [2, 3], \
+        f"expected 2cpu/2gpu split, got {cpu_sel} / {gpu_sel}"
+
+    x_cpu   = torch.randn(T, H, dtype=torch.bfloat16)
+    route_w = torch.softmax(torch.randn(T, top_k), dim=-1).float()
+
+    layer.set_adaptive(True)
+    y_mixed = layer.forward(x_cpu.to("cuda"), expert_ids.cuda(),
+                            route_w.cuda()).cpu()
+
+    # Both backends really ran: the forward recorded one CPU observation and
+    # one GPU event pair (obs rings were empty before it).
+    dm.harvest(wait=True)
+    snap = dm.snapshot()
+    assert snap["cpu_obs"] == 1, f"CPU bucket did not run: {snap}"
+    assert snap["gpu_obs"] == 1, f"GPU bucket did not run: {snap}"
+
+    layer.set_m_cpu(10**9)                            # all-CPU baseline
+    y_cpu = layer.forward(x_cpu, expert_ids, route_w)
+    r = scale_rel(y_mixed, y_cpu)
+    print(f"  [test_adaptive_mixed_split_parity] split={cpu_sel}cpu/{gpu_sel}gpu "
+          f"scale_rel={r:.3e}")
+    assert r <= 1.5e-2, f"mixed adaptive scale_rel {r:.3e} > 1.5e-2"
+
+
 # --------------------------------------------------------------------------- #
 # Pinned-residency tests (added with the SM90 INT8 grouped backend switch).
 #
@@ -337,6 +453,8 @@ if __name__ == "__main__":
     test_cpu_vs_gpu_single_expert()
     test_dispatch_invariance()
     test_mixed_bucket_parity()
+    test_adaptive_dispatch_parity()
+    test_adaptive_mixed_split_parity()
     test_pinned_weight_pointer_identity()
     test_no_vram_weight_residency()
     print("All unified_moe parity + pinned-residency tests passed.")
