@@ -22,6 +22,10 @@
 #include "../jit_kernels/impls/sm80_moe_gemm.hpp"
 #include "../jit_kernels/impls/sm89_fp8_asym_gemm.hpp"
 
+#if DG_TENSORMAP_COMPATIBLE
+#include "../jit_kernels/impls/sm90_int8_asym_gemm_1d1d.hpp"
+#endif
+
 #include "layout.hpp"
 
 namespace asym_gemm::gemm {
@@ -410,7 +414,7 @@ static void m_grouped_bf16_asym_gemm_nt_contiguous(const torch::Tensor& a, const
         return;
     }
     DG_HOST_UNREACHABLE("BF16 contiguous asym GEMM is not supported on this architecture "
-                        "(supported: SM90/H20, SM100)");
+                        "(supported: SM90, SM100)");
 }
 
 static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const torch::Tensor& b,
@@ -447,7 +451,7 @@ static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const tor
         return;
 
     const auto& [arch_major, arch_minor] = device_runtime->get_arch_pair();
-    // Hopper (SM90/H20): native WGMMA asym kernel (sm90_bf16_asym_gemm.cuh).
+    // Hopper (SM90): native WGMMA asym kernel (sm90_bf16_asym_gemm.cuh).
     if (arch_major == 9) {
         sm90_m_grouped_bf16_asym_gemm_masked(a, b, d, masked_m, expected_m,
                                              num_groups, m, n, k, major_a, major_b, compiled_dims);
@@ -478,7 +482,7 @@ static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const tor
     }
 
     DG_HOST_UNREACHABLE("BF16 masked asym GEMM is not supported on this architecture "
-                        "(supported: SM89, SM90/H20, SM100)");
+                        "(supported: SM89, SM90, SM100)");
 }
 #endif
 
@@ -552,6 +556,81 @@ static void m_grouped_moe_gemm_nt_contiguous(
         element_type_str);
 }
 
+#if DG_TENSORMAP_COMPATIBLE
+// -----------------------------------------------------------------------------
+// Architecture-agnostic INT8 asym GEMM facades.
+//
+// Callers pass `(int8_data, fp32_scale)` pairs with scales in the *natural*
+// per-token / per-channel layout. The facade checks the device architecture and
+// routes to the arch-specific downlevel kernel, transforming the scale factors
+// into the K-major layout that kernel expects. Only SM90 (Hopper/H20) is wired
+// up today; new architectures add another branch here.
+// -----------------------------------------------------------------------------
+static void m_grouped_int8_asym_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                                   const std::pair<torch::Tensor, torch::Tensor>& b,
+                                                   const torch::Tensor& d,
+                                                   const torch::Tensor& offsets, const torch::Tensor& experts,
+                                                   const int& list_size,
+                                                   std::optional<std::tuple<int, int, int>> recipe,
+                                                   const std::string& compiled_dims) {
+    // recipe/compiled_dims accepted for API parity with the other dtypes; INT8
+    // uses a fixed (1,1,128) block recipe and "nk" compiled dims.
+    (void)recipe;
+    (void)compiled_dims;
+
+    const auto& a_data = a.first;
+    const auto& sfa    = a.second;   // [M, Kb]    per-token
+    const auto& b_data = b.first;
+    const auto& sfb    = b.second;   // [G, N, Kb] per-channel
+    const int64_t num_groups = b_data.size(0);
+    const int64_t n          = b_data.size(1);
+    const int64_t kb         = sfa.size(-1);
+
+    const auto& arch_major = device_runtime->get_arch_major();
+    if (arch_major == 9) {
+        // SM90 kernel consumes K-major scales: sfa [M,Kb]->[Kb,M], sfb [G,N,Kb]->[Kb,G*N].
+        const auto& sfa_k = sfa.transpose(0, 1).contiguous();
+        const auto& sfb_k = sfb.permute({2, 0, 1}).reshape({kb, num_groups * n}).contiguous();
+        m_grouped_int8_asym_gemm_sm90_contiguous(a_data, b_data, d, offsets, experts,
+                                                 list_size, sfa_k, sfb_k);
+        return;
+    }
+    DG_HOST_UNREACHABLE("INT8 contiguous asym GEMM is not supported on this architecture "
+                        "(supported: SM90)");
+}
+
+static void m_grouped_int8_asym_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                               const std::pair<torch::Tensor, torch::Tensor>& b,
+                                               const torch::Tensor& d,
+                                               const torch::Tensor& masked_m,
+                                               const int& expected_m,
+                                               std::optional<std::tuple<int, int, int>> recipe,
+                                               const std::string& compiled_dims) {
+    (void)recipe;
+    (void)compiled_dims;
+
+    const auto& a_data = a.first;
+    const auto& sfa    = a.second;   // [G, M, Kb] per-token
+    const auto& b_data = b.first;
+    const auto& sfb    = b.second;   // [G, N, Kb] per-channel
+    const int64_t num_groups = b_data.size(0);
+    const int64_t n          = b_data.size(1);
+    const int64_t kb         = sfa.size(-1);
+
+    const auto& arch_major = device_runtime->get_arch_major();
+    if (arch_major == 9) {
+        // SM90 kernel consumes K-major scales: sfa [G,M,Kb]->[G,Kb,M], sfb [G,N,Kb]->[Kb,G*N].
+        const auto& sfa_k = sfa.transpose(1, 2).contiguous();
+        const auto& sfb_k = sfb.permute({2, 0, 1}).reshape({kb, num_groups * n}).contiguous();
+        m_grouped_int8_asym_gemm_sm90_masked(a_data, b_data, d, masked_m, expected_m, sfa_k, sfb_k);
+        return;
+    }
+    DG_HOST_UNREACHABLE("INT8 masked asym GEMM is not supported on this architecture "
+                        "(supported: SM90)");
+}
+
+#endif
+
 static void register_apis(pybind11::module_& m) {
 
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
@@ -616,6 +695,29 @@ static void register_apis(pybind11::module_& m) {
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("masked_m"), py::arg("expected_m"),
           py::arg("compiled_dims") = "nk");
+#endif
+
+#if DG_TENSORMAP_COMPATIBLE
+    // Architecture-agnostic INT8 asym GEMM (routes to SM90 today)
+    m.def("m_grouped_int8_asym_gemm_nt_contiguous",
+          static_cast<void(*)(const std::pair<torch::Tensor, torch::Tensor>&,
+                              const std::pair<torch::Tensor, torch::Tensor>&,
+                              const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+                              const int&, std::optional<std::tuple<int, int, int>>, const std::string&)>(
+              &m_grouped_int8_asym_gemm_nt_contiguous),
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
+          py::arg("recipe") = std::nullopt, py::arg("compiled_dims") = "nk");
+    m.def("m_grouped_int8_asym_gemm_nt_masked",
+          static_cast<void(*)(const std::pair<torch::Tensor, torch::Tensor>&,
+                              const std::pair<torch::Tensor, torch::Tensor>&,
+                              const torch::Tensor&, const torch::Tensor&, const int&,
+                              std::optional<std::tuple<int, int, int>>, const std::string&)>(
+              &m_grouped_int8_asym_gemm_nt_masked),
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("masked_m"), py::arg("expected_m"),
+          py::arg("recipe") = std::nullopt, py::arg("compiled_dims") = "nk");
+
 #endif
 
     // SM89 FP8 MoE GEMM helpers are now internal-only (dispatched from the

@@ -62,6 +62,9 @@ try:
             # BF16 GEMMs
             "m_grouped_bf16_asym_gemm_nt_contiguous",
             "m_grouped_bf16_asym_gemm_nt_masked",
+            # INT8 GEMMs (SM90)
+            "m_grouped_int8_asym_gemm_nt_contiguous",
+            "m_grouped_int8_asym_gemm_nt_masked",
             # SM80 MoE GEMM (FP16 + BF16, JIT)
             "m_grouped_moe_gemm_nt_contiguous",
             # Einsum kernels
@@ -105,6 +108,20 @@ try:
 except ImportError:
     import warnings
     warnings.warn("CUDA extension (_C) not available. CUDA kernels will not be accessible.")
+
+# Unified MoE sub-package (CPU AMX via _cpu_C + GPU INT8 via torch._int_mm).
+# Independent of the CUDA extension above: a host without CUDA still gets the
+# CPU bucket; a host without AMX gets a clear error at first use.
+try:
+    from . import _cpu_C            # noqa: F401 — register the CPU extension
+    from . import unified_moe       # noqa: F401 — Layer + helpers
+except ImportError as _e:
+    import warnings
+    warnings.warn(
+        "asym_gemm CPU extension (_cpu_C) not available — unified_moe disabled. "
+        f"Cause: {_e}"
+    )
+    unified_moe = None              # explicit sentinel for callers
 
 from importlib.metadata import version as _get_version
 __version__ = _get_version('asym_gemm')
