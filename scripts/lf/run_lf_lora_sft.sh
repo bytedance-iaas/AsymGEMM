@@ -423,6 +423,41 @@ case "${BACKEND,,}" in
     ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false
     BACKEND=asym
     ;;
+  asym_ep2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds|asym_sqeq2_cpuadamwds)
+    # GB200 rank-per-GPU EP family (fix_gb200_ep.md; NAMING EPOCH 2026-07-08 — the
+    # backend NAME selects the EP mode and flips the flags automatically):
+    #   asym_ep2_cpuadamwds   = VANILLA EP  (owned expert slices, allgather dispatch +
+    #                           reduce-scatter combine; private per-rank pins, no queue)
+    #   asym_sep2_cpuadamwds  = sEP plain   (ownerless shared /dev/shm fabric, each rank
+    #                           runs ALL experts for its own shard; no queue)
+    #   asym_sqep2_cpuadamwds = sEP + QUEUE (the final system: ownerless fabric + queued
+    #                           launches; asym_sqeq2_* accepted as an alias spelling)
+    # Common shape: torchrun 2 ranks, each rank the |1 asym stack VERBATIM on its own
+    # DistributedSampler shard; NO DDP wrapper — run_lf_profiled_train.py bypasses
+    # Accelerator.prepare_model and does ONE manual grad allreduce per step.
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-${BACKEND,,}}
+    USE_ASYM_CPU_ADAMW=true
+    ASYM_CPU_ADAMW_BACKEND=deepspeed
+    CPUADAM_ALIAS_SELECTED=1
+    ASYM_DP=1          # reuse the torchrun launch path + the LF parser distributed unlock
+    ASYM_EP2=1
+    case "${BACKEND,,}" in
+      asym_ep2_cpuadamwds)
+        ASYM_EP_VANILLA=1; ASYM_ARENA_SHM=0; ASYM_EP_QUEUED=0
+        echo "[runlf] backend asym_ep2 -> VANILLA EP (owned+dispatch): ASYM_EP_VANILLA=1 ASYM_ARENA_SHM=0 ASYM_EP_QUEUED=0" ;;
+      asym_sep2_cpuadamwds)
+        ASYM_EP_VANILLA=0; ASYM_ARENA_SHM=1; ASYM_EP_QUEUED=0
+        echo "[runlf] backend asym_sep2 -> sEP plain (ownerless, no queue): ASYM_ARENA_SHM=1 ASYM_EP_QUEUED=0" ;;
+      asym_sqep2_cpuadamwds|asym_sqeq2_cpuadamwds)
+        ASYM_EP_VANILLA=0; ASYM_ARENA_SHM=1; ASYM_EP_QUEUED=1
+        echo "[runlf] backend asym_sqep2 -> sEP+queue (final): ASYM_ARENA_SHM=1 ASYM_EP_QUEUED=1" ;;
+    esac
+    # same hook-offload hazard as dp2: grads must be reduced BEFORE any D2H copy; the
+    # CPUAdamW step-time path reads param.grad after the manual allreduce.
+    ASYM_CPU_ADAMW_GRAD_OFFLOAD=false
+    ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false
+    BACKEND=asym
+    ;;
   asym_cpuadamwtorch)
     PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-asym_cpuadamwtorch}
     USE_ASYM_CPU_ADAMW=true
@@ -570,6 +605,15 @@ if [[ "${ASYM_STP:-0}" == "1" ]]; then
 fi
 if [[ "${ASYM_DP:-0}" == "1" ]]; then
   export ASYM_DP
+fi
+if [[ "${ASYM_EP2:-0}" == "1" ]]; then
+  # rank-per-GPU sEP (fix_gb200_ep.md S1): the trainer reads these to bypass the DDP
+  # wrap, run the manual grad allreduce, and build/seal the shared /dev/shm fabric.
+  export ASYM_EP2
+  export ASYM_ARENA_SHM="${ASYM_ARENA_SHM:-1}"
+  export ASYM_ARENA_SHM_CAP_GB="${ASYM_ARENA_SHM_CAP_GB:-160}"
+  [[ -z "${ASYM_EP_QUEUED:-}" ]] || export ASYM_EP_QUEUED  # S2a queued base GEMMs
+  [[ -z "${ASYM_EP_VANILLA:-}" ]] || export ASYM_EP_VANILLA  # S5b vanilla-EP baseline rung
 fi
 
 if [[ "${BACKEND}" == "kt_armbf16" && -z "${KT_NUM_THREADS}" ]]; then

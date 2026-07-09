@@ -12,6 +12,14 @@ from .host_weight import HostWeight, tensor_nbytes
 from .profile_ranges import is_profile_enabled, prof_range
 
 
+# process-constant (fix_gb200_ep.md S2a): |1 rows never set this — the hot grouped-GEMM
+# path must pay ZERO per-call env reads for the queued branch check.
+import os as _os
+
+_EP_QUEUED_ENABLED = _os.environ.get("ASYM_EP_QUEUED") == "1"
+# S5b diagnostics: host-block probe on the per-launch pad scalar read (ep_vanilla.py)
+_PAD_TIMING = bool(int(_os.environ.get("ASYM_EP_VANILLA_TIMING", "0") or 0))
+
 VALID_BACKENDS = ("asym", "torch")
 VALID_ASYM_PRECISIONS = ("bf16", "fp8", "fp4")
 VALID_BF16_OUTPUT_DTYPES = ("bf16", "bfloat16", "fp32", "float32")
@@ -620,7 +628,16 @@ def _pad_grouped_input_for_asym(
 
         # PyTorch allocations still require a Python integer shape. Keep this to one
         # scalar read instead of the previous full offsets D2H copy and Python loops.
-        total_padded = int(padded_offsets_long[-1].item())
+        if _PAD_TIMING:
+            import time as _time
+
+            _t0 = _time.perf_counter()
+            total_padded = int(padded_offsets_long[-1].item())
+            from .ep_vanilla import _timing_add as _ep_timing_add
+
+            _ep_timing_add("pad_item_s", _time.perf_counter() - _t0)
+        else:
+            total_padded = int(padded_offsets_long[-1].item())
         if total_padded == int(a.shape[0]):
             if memo is None:
                 memo = {}
@@ -778,9 +795,23 @@ def _asym_grouped_bf16_nt(
     a_kernel, offsets_kernel, unpad = _pad_grouped_input_for_asym(a, offsets, experts)
     d = torch.empty((int(a_kernel.shape[0]), n), device=a.device, dtype=output_dtype)
     offsets_i32, experts_i32, list_size = _group_metadata_tensors(offsets_kernel, experts, device=a.device)
-    asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous(
-        a_kernel, b_cpu, d, offsets_i32, experts_i32, list_size, compiled_dims, transpose_b
-    )
+    if _EP_QUEUED_ENABLED:
+        # fix_gb200_ep.md S2a: entry-pop queued variant over THIS rank's own list with a
+        # private counter block (side fixed per rank; steal arrives at S2b). Zero-steal
+        # claims every item, so d is fully written — validated one step later
+        # (head+tail == n_items per launch) instead of zero-initializing d.
+        from .ep_queue import get_state
+
+        state = get_state()
+        counters = state.next_block(list_size - 1)
+        asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous_ep_queued(
+            a_kernel, b_cpu, d, offsets_i32, experts_i32, list_size, counters, state.side,
+            compiled_dims, transpose_b
+        )
+    else:
+        asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous(
+            a_kernel, b_cpu, d, offsets_i32, experts_i32, list_size, compiled_dims, transpose_b
+        )
     d = _unpad_grouped_output(d, unpad, output_m=m)
     return d
 

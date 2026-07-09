@@ -52,4 +52,4 @@ outputs/
 .aioenv/
 agent/overleaf/
 outputs/
-ceiling_search_state/
+lf/ceiling_search_state/

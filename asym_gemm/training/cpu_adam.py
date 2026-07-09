@@ -170,6 +170,12 @@ class AsymCPUAdamW(torch.optim.Optimizer):
         self.fp32_master = bool(fp32_master)
         self.grad_offload = bool(grad_offload)
         self.weight_offload = bool(weight_offload)
+        # fix_gb200_ep.md P6: under torchrun the ranks pin the torch/OMP pool small for
+        # the bwd host ops, starving DeepSpeedCPUAdam's OMP region (measured 5.7 s @1
+        # thread vs 0.53 s). When set, the pool is raised ONLY around inner step() and
+        # restored after (scoped; |1 runs leave this unset => byte-identical behavior).
+        step_threads = os.environ.get("ASYM_CPU_ADAMW_STEP_THREADS", "").strip()
+        self._step_threads = int(step_threads) if step_threads.isdigit() else 0
         self._coordinator = coordinator
         self._mappings: list[_ParamMapping] = []
         self._pin_memory_failures: list[str] = []
@@ -495,7 +501,15 @@ class AsymCPUAdamW(torch.optim.Optimizer):
 
             step_start = time.perf_counter()
             if grad_param_count:
-                self.inner_optimizer.step()
+                if self._step_threads > 0:
+                    _prev_threads = torch.get_num_threads()
+                    torch.set_num_threads(self._step_threads)
+                    try:
+                        self.inner_optimizer.step()
+                    finally:
+                        torch.set_num_threads(_prev_threads)
+                else:
+                    self.inner_optimizer.step()
             self._last_cpu_adam_step_ms = (time.perf_counter() - step_start) * 1000.0
 
             self._refresh_visible_state()

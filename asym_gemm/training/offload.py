@@ -197,18 +197,22 @@ def adopt_host_weight(
         require_2d=require_2d,
         name=name or component,
     )
+    # asym_ep2 shared-fabric banks are UNpinned until the collective seal() registers the
+    # /dev/shm range (fix_gb200_ep.md S1) — the not-pinned/copy strict checks do not apply.
+    fabric_bank = bool(getattr(host_weight, "_fabric_bank", False))
     if strict and pin_memory_policy == "none" and storage_key(host_weight.weight) != source_key:
         raise RuntimeError(f"{name} selected for CPU offload but HostWeight adoption would require a CPU copy")
     if (
         strict
+        and not fabric_bank
         and pin_memory_policy == "auto"
         and not host_weight.weight.is_pinned()
         and storage_key(host_weight.weight) != source_key
     ):
         raise RuntimeError(f"{name} selected for CPU offload but HostWeight adoption would require a CPU copy")
-    if strict and pin_memory_policy == "require" and not host_weight.weight.is_pinned():
+    if strict and not fabric_bank and pin_memory_policy == "require" and not host_weight.weight.is_pinned():
         raise RuntimeError(f"{name} selected for AsymGEMM CPU offload but host weight could not be pinned")
-    if strict and pin_memory_policy == "auto" and torch.cuda.is_available() and not host_weight.weight.is_pinned():
+    if strict and not fabric_bank and pin_memory_policy == "auto" and torch.cuda.is_available() and not host_weight.weight.is_pinned():
         raise RuntimeError(f"{name} selected for AsymGEMM CPU offload but host weight could not be pinned")
     return host_weight
 

@@ -237,6 +237,10 @@ ASYM_BF16_KERNEL_NAME(uint32_t* offsets, uint32_t* experts,
 #else
         cute::prefetch_tma_descriptor(&tensor_map_cd);
 #endif
+#ifdef ASYM_BF16_EP_STEAL
+        cute::prefetch_tma_descriptor(&tensor_map_a_peer);
+        cute::prefetch_tma_descriptor(&tensor_map_cd_peer);
+#endif
     }
 
     // D/A/B shared memory
@@ -325,6 +329,22 @@ ASYM_BF16_KERNEL_NAME(uint32_t* offsets, uint32_t* experts,
         static_cast<uint32_t>(ep_item) % ep_num_n_blocks);
 #else
     auto scheduler = asymScheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs>(shape_m, shape_n, experts, offsets);
+#endif
+#ifdef ASYM_BF16_EP_STEAL
+    // sEP steal (fix_gb200_ep.md S2b): items in the PEER's section of the union list
+    // read A from the fabric pack and store D to the fabric staging (sysmem TMA both
+    // ways — the B path proves host descriptors). ep_n_own is in SEGMENT units: n_blk
+    // is a JIT tile choice the host cannot know, and the section boundary is a segment
+    // boundary by construction. Side 0 owns the FRONT section, side 1 the BACK.
+    const uint32_t ep_segment = static_cast<uint32_t>(ep_item) / ep_num_n_blocks;
+    const bool ep_local = (ep_side == 0) ? (ep_segment < ep_n_own) : (ep_segment >= ep_n_own);
+    const cute::TmaDescriptor* ep_desc_a = ep_local ? &tensor_map_a : &tensor_map_a_peer;
+    const cute::TmaDescriptor* ep_desc_cd = ep_local ? &tensor_map_cd : &tensor_map_cd_peer;
+#define ASYM_DESC_A ep_desc_a
+#define ASYM_DESC_CD ep_desc_cd
+#else
+#define ASYM_DESC_A (&tensor_map_a)
+#define ASYM_DESC_CD (&tensor_map_cd)
 #endif
     // Sentinel block (inactive expert or empty M range): skip without entering
     // any TMA / barrier wait paths. All CTAs in a cluster share blockIdx.y, so
@@ -485,10 +505,10 @@ ASYM_BF16_KERNEL_NAME(uint32_t* offsets, uint32_t* experts,
                     if (cute::elect_one_sync()) {
                         if constexpr (kMajorA == cute::UMMA::Major::K)
                             tma_copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, cutlass::bfloat16_t, kIsBatchedMM>(
-                                &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx, kNumMulticast, batch_idx);
+                                ASYM_DESC_A, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx, kNumMulticast, batch_idx);
                         if constexpr (kMajorA == cute::UMMA::Major::MN)
                             tma_copy<LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, cutlass::bfloat16_t, kIsBatchedMM>(
-                                &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], m_idx, k_idx, kNumMulticast, batch_idx);
+                                ASYM_DESC_A, full_barriers[stage_idx], smem_a[stage_idx], m_idx, k_idx, kNumMulticast, batch_idx);
                     }
                 }
 #endif
@@ -1169,7 +1189,7 @@ ASYM_BF16_KERNEL_NAME(uint32_t* offsets, uint32_t* experts,
                                 // }
                                 using cute_tma_t = cute::conditional_t<kWithAccumulation,
                                     cute::SM90_TMA_REDUCE_ADD_3D, cute::SM90_TMA_STORE_3D>;
-                                cute_tma_t::copy(&tensor_map_cd, smem_cd[tma_stage_idx],
+                                cute_tma_t::copy(ASYM_DESC_CD, smem_cd[tma_stage_idx],
                                                 n_idx, m_idx, scheduler.current_group_idx);
                             } else {
                           
@@ -1180,7 +1200,7 @@ ASYM_BF16_KERNEL_NAME(uint32_t* offsets, uint32_t* experts,
                                     // }
                                     using cute_tma_t = cute::conditional_t<false,
                                         cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
-                                    cute_tma_t::copy(&tensor_map_cd, smem_cd[tma_stage_idx], n_idx, m_idx);
+                                    cute_tma_t::copy(ASYM_DESC_CD, smem_cd[tma_stage_idx], n_idx, m_idx);
                                 }
                                 else
                                 {
@@ -1192,7 +1212,7 @@ ASYM_BF16_KERNEL_NAME(uint32_t* offsets, uint32_t* experts,
                                     // }
                                     using cute_tma_t = cute::conditional_t<true,
                                         cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
-                                    cute_tma_t::copy(&tensor_map_cd, smem_cd[tma_stage_idx], n_idx, m_idx);
+                                    cute_tma_t::copy(ASYM_DESC_CD, smem_cd[tma_stage_idx], n_idx, m_idx);
                                 }
                              
                             }

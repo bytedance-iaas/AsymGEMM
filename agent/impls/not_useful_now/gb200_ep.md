@@ -705,6 +705,28 @@ fwd_s bwd_s opt_s step_s  step_H(g0/g1)  RAM  moe_seg_s  busy0/busy1(%)  imb(%) 
   volume, fwd d2h side-streaming.
 2026-07-06 DEVIATION (scope, honest): probe-level static/hostsplit rows stand in for
   G-E1.3/G-E2.2 until I7 lands the e2e substrate; E1/E2 e2e gates remain OPEN.
+2026-07-08 SG SANITY GATE PASSED (fix_gb200_ep.md O2; the EP=2-must-beat-EP=1 interlock
+  is CLEARED): asym_ep2 rank-per-GPU sEP shape (torchrun 2 ranks, sharded batches 8+8 =
+  global 16, ONE shared /dev/shm pinned fabric 99.1 GB, no all-to-all, manual LoRA-grad
+  allreduce) measured T_ep2 = 64.1 s vs the |1 clean bar T1 = 60.5 s at s20000 =>
+  1.06xT1 at 2x tokens = 1.89x one-GPU throughput (94.4% perfect scaling). Parity gates
+  passed (shard receipts disjoint; step-2 master-norm parity to 4+ decimals; loss
+  envelope). Cross-process union-queue probe (PR-3) PASS with the E3 kernel unchanged.
+  The sEP ladder (E4-level rows) is now unblocked on a FAIR substrate; queued-kernel
+  e2e (S2a/S2b) next.
+2026-07-08 S1-FINAL after two mandate iterations (OMP for CPUAdam; torch pool pinned):
+  T_ep2 = 58.5 s = 0.967xT1 at 2x tokens = 2.07x one-GPU throughput — weak scaling at
+  or beyond perfect (ep2's bwd legitimately skips |1's grad-offload hook cost; receipts
+  in fix_gb200_ep.md). EG-V2's data-layout invariants hold on the REAL trainer: shard
+  receipts disjoint/union-16, zero token movement, one shared arena.
+2026-07-07 EXECUTION HANDOFF (user GO): the sanity gate + E5-headline build proceed under
+  fix_gb200_ep.md's S-track — the user-approved rank-per-GPU redesign of E5's shape
+  (torchrun 2 ranks, sharded batches 8+8, ONE shared pinned fabric in /dev/shm, NO
+  all-to-all, manual LoRA-grad allreduce instead of DDP; backend asym_ep2_cpuadamwds;
+  Megatron-LM deep-read receipts recorded there). E5's "single process" phrasing is
+  SUPERSEDED; its mechanism/goals are unchanged (shared token pool, affinity ordering,
+  steal accounting, EG-V2 receipts) and the E3 queue kernel is reused as-is (counters
+  already atomicAdd_system). sep1/static_rep remain replicated-lane ablations only.
 ```
 
 ## Stage Dependency Summary (build order)
@@ -722,3 +744,25 @@ E5 sEP-v2: sharded batches + shared token pool   (THE HEADLINE — EP invariants
                                                   parity anchor = asym_dp2)
 E6 paper rows + receipts + freeze                (feeds the paper-story D2 claims)
 ```
+
+2026-07-08 E4-CLASS VERDICTS LANDED VIA fix_gb200_ep.md S5 (the skew-sweep evidence this
+  stage wanted, measured against the REAL vanilla-EP rung instead of the retired
+  replicated vehicle — user N2: different data per GPU on BOTH sides):
+  MICRO (S5a, transport-identical, real q3 routing histograms; artifact
+  profiling_gb200ep_sg/s5a_balance_bench.json): owned-static costs the TOKEN FLOOR
+  (natural 1.09-1.14x, alpha=0.75 tuned 1.72-1.78x = ON the (1+a)/2 arithmetic);
+  ownerless queue cures imbalance 0.78-0.835 -> <=0.7%; queue never slower (EG1/EG2/
+  EG4 micro PASS; 4.24x-8.58x banked class re-attributed to vanilla per-expert
+  enumeration pathology, NOT policy — gate adjustment logged).
+  E2E (S5b, allgather-dispatch vanilla-EP = Megatron shape, owned bank slices,
+  loss overlays sEP <=0.008 every step; artifacts profiling_gb200ep_s5b/*):
+    s2048 skew ladder (within-session):  sEP-queue 11.28/13.80/16.83 s vs
+    vanilla 14.17/47.50/43.91 s at natural/0.5/0.75 => 1.26x/3.44x/2.61x —
+    the queue absorbs skew that detonates ownership (EG1/EG4 e2e PASS).
+    s20000: sEP-queue 56.4 s vs vanilla 146-160 s (2.6-2.9x) — ROOT-CAUSED to the
+    one-layer host stagger (per-layer collectives x host-synced offload stack;
+    nsys receipts in fix_gb200_ep.md); fwd-only proxy (stagger-free) = +8.8% =
+    the honest dispatch cost. QUOTE the 3-level ladder, never the bare 2.9x.
+  DESIGN RECEIPT for the thesis: sEP's zero-per-layer-collective shape avoids the
+  entire coupling class BY CONSTRUCTION — on host-offload stacks this is not an
+  optimization but a structural requirement.

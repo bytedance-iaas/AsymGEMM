@@ -35,8 +35,18 @@ def ep_slice_route_metadata(metadata: ContiguousRouteMetadata, lo: int, hi: int)
     the resulting scatter produces the device-local PARTIAL output (zeros elsewhere) —
     the cross-device sum (allreduce2) completes it.
     """
-    start = int(metadata.expert_offsets[lo])
-    end = int(metadata.expert_offsets[hi])
+    import time as _time
+
+    _t0 = _time.perf_counter()
+    # one fused D2H read instead of two .item() syncs
+    start, end = metadata.expert_offsets[[lo, hi]].tolist()
+    start, end = int(start), int(end)
+    try:
+        from .ep_vanilla import _timing_add
+
+        _timing_add("slice_item_s", _time.perf_counter() - _t0)
+    except Exception:
+        pass
     return EpSlicedRouteMetadata(
         token_indices=metadata.token_indices[start:end],
         expert_indices=metadata.expert_indices[start:end] - lo,

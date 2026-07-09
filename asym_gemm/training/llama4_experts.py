@@ -875,7 +875,10 @@ class AsymLlama4Experts(AsymQwen3Experts):
                 weight_layout=self.down_weight_layout,
             )
             if strict and torch.cuda.is_available():
-                if not self.gate_up_base.host_weight.weight.is_pinned() or not self.down_base.host_weight.weight.is_pinned():
+                def _hw_ok(hw) -> bool:  # fabric banks pin at seal() (fix_gb200_ep.md S1)
+                    return hw.weight.is_pinned() or bool(getattr(hw, "_fabric_bank", False))
+
+                if not _hw_ok(self.gate_up_base.host_weight) or not _hw_ok(self.down_base.host_weight):
                     raise RuntimeError("Llama4 expert CPU offload requires pinned CPU HostWeights for AsymGEMM")
         else:
             device = _resolve_device(gate_up)

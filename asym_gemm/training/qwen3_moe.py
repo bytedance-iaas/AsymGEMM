@@ -2134,14 +2134,21 @@ class AsymQwen3Experts(nn.Module):
                 precision=precision,
                 stats=self.stats,
             )
+            def _hw_pinned_or_fabric(hw) -> bool:
+                # asym_ep2 shared-fabric banks (fix_gb200_ep.md S1) are independent /dev/shm
+                # copies that become pinned at the collective seal() BEFORE the first GEMM —
+                # treat them as pinned here (both for the strict gate and the source release).
+                return hw.weight.is_pinned() or bool(getattr(hw, "_fabric_bank", False))
+
             if strict and torch.cuda.is_available():
-                if not self.gate_up_base.host_weight.weight.is_pinned() or not self.down_base.host_weight.weight.is_pinned():
+                if not _hw_pinned_or_fabric(self.gate_up_base.host_weight) or not _hw_pinned_or_fabric(self.down_base.host_weight):
                     raise RuntimeError("Qwen3 expert CPU offload requires pinned CPU HostWeights for AsymGEMM")
             # Release the duplicated source base weights now that the pinned HostWeight copies are
-            # independent (pin_memory() always copies). Frozen experts would otherwise stay resident a
-            # second time (~1.2 GiB/layer, ~58 GiB total). Gated on the copies actually being pinned so
-            # a silent pin failure (HostWeight swallows the error) cannot drop weights still aliased.
-            if self.gate_up_base.host_weight.weight.is_pinned() and self.down_base.host_weight.weight.is_pinned():
+            # independent (pin_memory() always copies; the fabric path copies into /dev/shm). Frozen
+            # experts would otherwise stay resident a second time (~1.2 GiB/layer, ~58 GiB total).
+            # Gated on the copies actually being pinned (or fabric) so a silent pin failure
+            # (HostWeight swallows the error) cannot drop weights still aliased.
+            if _hw_pinned_or_fabric(self.gate_up_base.host_weight) and _hw_pinned_or_fabric(self.down_base.host_weight):
                 for _src_attr in ("gate_up_proj", "down_proj"):
                     _src = getattr(source, _src_attr, None)
                     if isinstance(_src, torch.nn.Parameter):
@@ -2798,6 +2805,19 @@ class AsymQwen3Experts(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
+        if not getattr(self, "ep_vanilla_a2a", False):
+            return self._forward_impl(hidden_states, top_k_index, top_k_weights)
+        # S5b VANILLA-EP rung (ep_vanilla.py): allgather-dispatch -> owned-slice
+        # partial over GLOBAL tokens -> reduce-scatter combine. Collectives are
+        # unconditional per call so both ranks stay lockstep through GC recompute.
+        from .ep_vanilla import gather_moe_inputs, reduce_scatter_partial
+
+        local_tokens = hidden_states.shape[0]
+        hidden_g, idx_g, w_g = gather_moe_inputs(hidden_states, top_k_index, top_k_weights)
+        partial = self._forward_impl(hidden_g, idx_g, w_g)
+        return reduce_scatter_partial(partial, local_tokens)
+
+    def _forward_impl(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         ep_range = getattr(self, "ep_expert_range", None)
         with prof_range(self._forward_range("route_metadata")):
@@ -3070,6 +3090,23 @@ if _EP_SKEW_HOT > 0 and os.environ.get("ASYM_EP_SKEW_ACK") != "1":
         "Set ASYM_EP_SKEW_ACK=1 to acknowledge."
     )
 
+_SKEW_SEED = 42  # fixed by design (2026-07-08): not configurable, not in run labels
+_SKEW_HOT_CACHE: dict[str, int] = {}
+
+
+def _skew_hot_expert_for_layer(layer_key: str, num_experts: int) -> int:
+    """Deterministic per-layer hot-expert target: sha256(seed, layer name) % E.
+    Same on every rank and across fwd/GC-recompute; varies across layers so the
+    forced hotspot lands on different owner-halves (no always-expert-0 bias)."""
+    hot = _SKEW_HOT_CACHE.get(layer_key)
+    if hot is None:
+        import hashlib
+
+        digest = hashlib.sha256(f"{_SKEW_SEED}:{layer_key}".encode()).digest()
+        hot = int.from_bytes(digest[:8], "little") % max(1, num_experts)
+        _SKEW_HOT_CACHE[layer_key] = hot
+    return hot
+
 
 class AsymQwen3MoeBlock(nn.Module):
     """Qwen3 MoE block wrapper that owns frozen router execution."""
@@ -3170,12 +3207,20 @@ class AsymQwen3MoeBlock(nn.Module):
                 top_k_weights = top_k_weights.to(dtype=hidden_states_2d.dtype)
             if _EP_SKEW_HOT > 0.0:
                 # HC-EP1: synthetic hot-expert skew AFTER detach — forward values garbage,
-                # kernel work real. First ceil(alpha * slots) routed slots -> expert 0.
+                # kernel work real. First ceil(alpha * slots) routed slots -> ONE hot
+                # expert chosen PER LAYER by a fixed-seed(42) hash of the layer name:
+                # deterministic, identical on every rank and across fwd/recompute, and
+                # the hotspot lands on different owner-halves across layers (no
+                # always-rank0 bias). Seed is intentionally NOT configurable.
                 flat_idx = top_k_index.reshape(-1)
                 n_force = int(_EP_SKEW_HOT * flat_idx.numel())
                 if n_force > 0:
+                    num_experts = getattr(self.config, "num_experts", None) or int(
+                        getattr(self.gate, "num_experts", 0)
+                    )
+                    hot = _skew_hot_expert_for_layer(self.profile_prefix, int(num_experts))
                     top_k_index = top_k_index.clone()
-                    top_k_index.reshape(-1)[:n_force] = 0
+                    top_k_index.reshape(-1)[:n_force] = hot
             if _EP_STATS is not None:
                 num_experts = getattr(self.config, "num_experts", None) or int(top_k_index.max()) + 1
                 _EP_STATS.record(self.profile_prefix, top_k_index, int(num_experts))

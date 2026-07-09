@@ -216,13 +216,30 @@ class HostWeight:
 
         pin_error: str | None = None
         pin_seconds = 0.0
+        self._fabric_bank = False
         if pin_memory and torch.cuda.is_available() and not cpu_tensor.is_pinned():
-            pin_start = time.perf_counter()
-            try:
-                cpu_tensor = cpu_tensor.pin_memory()
-            except RuntimeError as exc:
-                pin_error = str(exc)
-            pin_seconds = time.perf_counter() - pin_start
+            from .shared_fabric import fabric_enabled, get_fabric
+
+            fabric_view = None
+            if fabric_enabled():
+                # asym_ep2 shared fabric (fix_gb200_ep.md S1 DELTA 2): the bank lives ONCE
+                # in /dev/shm for ALL ranks; pinning happens collectively at seal() via one
+                # cudaHostRegister of the whole used range. is_pinned() stays False until
+                # seal — no GEMM may stream a fabric bank pre-seal (seal runs pre-train).
+                # Post-seal latecomers get None back and take the private pin path below.
+                pin_start = time.perf_counter()
+                fabric_view = get_fabric().get_or_create(name or "bank", cpu_tensor)
+                pin_seconds = time.perf_counter() - pin_start
+            if fabric_view is not None:
+                cpu_tensor = fabric_view
+                self._fabric_bank = True
+            else:
+                pin_start = time.perf_counter()
+                try:
+                    cpu_tensor = cpu_tensor.pin_memory()
+                except RuntimeError as exc:
+                    pin_error = str(exc)
+                pin_seconds = time.perf_counter() - pin_start
 
         self._tensor = cpu_tensor
         self._name = name

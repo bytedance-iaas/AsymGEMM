@@ -677,6 +677,73 @@ static void m_grouped_bf16_asym_gemm_nt_contiguous_ep_queued(const torch::Tensor
                                               b_outer_stride);
 }
 
+static int m_grouped_bf16_asym_gemm_nt_contiguous_ep_steal(const torch::Tensor& a, const torch::Tensor& b,
+                                              const torch::Tensor& d,
+                                              const torch::Tensor& a_peer, const torch::Tensor& d_peer,
+                                              const torch::Tensor& offsets, const torch::Tensor& experts,
+                                              const int& list_size,
+                                              const torch::Tensor& ep_queue,
+                                              const int& ep_side,
+                                              const int& ep_n_own,
+                                              const std::string& compiled_dims,
+                                              const bool transpose_b = false) {
+    // sEP S2b (fix_gb200_ep.md): union queue + steal. The union list is
+    // [side-0 segments | side-1 segments]; ep_n_own is the boundary in SEGMENT units.
+    // a_peer = the PEER's packed X in the shared pinned fabric (sysmem TMA loads);
+    // d_peer = THIS launch's fabric D staging for the items it steals (sysmem TMA
+    // stores); the owner gathers exactly the stolen contiguous row range back.
+    const auto& major_a = get_major_type_ab(a);
+    cute::UMMA::Major major_b;
+    if (transpose_b) {
+        major_check(b);
+        major_b = cute::UMMA::Major::MN;
+    } else {
+        major_b = get_major_type_ab(b);
+    }
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
+
+    const auto& [m, k_a] = get_shape<2>(a);
+    const auto& [num_groups, n_phys, k_phys] = get_shape<3>(b);
+    const int n = transpose_b ? k_phys : n_phys;
+    const int k = transpose_b ? n_phys : k_phys;
+    const auto& [m_, n_] = get_shape<2>(d);
+    DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_a);
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(offsets.is_cuda() && experts.is_cuda());
+    DG_HOST_ASSERT(offsets.is_contiguous() && experts.is_contiguous());
+    DG_HOST_ASSERT(offsets.scalar_type() == torch::kInt && experts.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(offsets.numel() >= list_size && experts.numel() >= list_size);
+    DG_HOST_ASSERT(ep_queue.device().is_cpu() && ep_queue.is_pinned());
+    DG_HOST_ASSERT(ep_queue.scalar_type() == torch::kInt && ep_queue.numel() >= 3);
+    DG_HOST_ASSERT(ep_side == 0 or ep_side == 1);
+    DG_HOST_ASSERT(a_peer.device().is_cpu() && a_peer.is_pinned() && a_peer.is_contiguous());
+    DG_HOST_ASSERT(d_peer.device().is_cpu() && d_peer.is_pinned() && d_peer.is_contiguous());
+    DG_HOST_ASSERT(a_peer.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(d_peer.scalar_type() == d.scalar_type());
+    const auto& [m_peer, k_peer] = get_shape<2>(a_peer);
+    const auto& [mp_, np_] = get_shape<2>(d_peer);
+    DG_HOST_ASSERT(k_peer == k and mp_ == m_peer and np_ == n);
+    DG_HOST_ASSERT(ep_n_own >= 0 and ep_n_own <= list_size - 1);
+    check_major_type_cd(d);
+    if (m == 0)
+        return 0;
+
+    const int b_outer_stride = transpose_b
+        ? static_cast<int>(b.stride(-2))
+        : static_cast<int>(b.stride(get_non_contiguous_dim(major_b)));
+    const int grid_y = list_size - 1;
+
+    const auto& arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10 && "sEP steal GEMM is SM100-only");
+    return sm100_m_grouped_bf16_asym_gemm_contiguous_ep_steal(a, b, d, a_peer, d_peer,
+                                              offsets, experts, ep_queue, ep_side, ep_n_own, grid_y,
+                                              num_groups, m, n, k, m_peer, major_a, major_b, compiled_dims,
+                                              b_outer_stride);
+}
+
 static void sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous(
                                               const torch::Tensor& a,
                                               const torch::Tensor& b,
@@ -1170,6 +1237,19 @@ static void register_apis(pybind11::module_& m) {
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
           py::arg("ep_queue"), py::arg("ep_side"),
+          py::arg("compiled_dims") = "nk",
+          py::arg("transpose_b") = false);
+    m.def("m_grouped_bf16_asym_gemm_nt_contiguous_ep_steal",
+          static_cast<int(*)(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+                             const torch::Tensor&, const torch::Tensor&,
+                             const torch::Tensor&, const torch::Tensor&, const int&,
+                             const torch::Tensor&, const int&, const int&,
+                             const std::string&, const bool)>(
+              &m_grouped_bf16_asym_gemm_nt_contiguous_ep_steal),
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("a_peer"), py::arg("d_peer"),
+          py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
+          py::arg("ep_queue"), py::arg("ep_side"), py::arg("ep_n_own"),
           py::arg("compiled_dims") = "nk",
           py::arg("transpose_b") = false);
     m.def("sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous",

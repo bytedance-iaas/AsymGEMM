@@ -56,10 +56,19 @@ SETTLE_S=${SETTLE_S:-20}                     # pause after a failed probe
 # start at ohbm0 so the inner search shows how much ohbm buys; G-OOM-bound
 # configs stay at ohbm0 anyway (more HBM share never helps a G-OOM).
 CONFIGS=(
+
+  "40000 : 0 : q3-32b|2 ; asym_ep2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"         
+  "100000 : 0 : q3-30b-a3b|2 ; asym_ep2_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"   
+  "30000 : 0 : llama3.3-70b|2 ; asym_ep2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
+  # "13000 : 0 : llama4-scout|2 ; asym_ep2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
+  # "50000 : 0 : q2.5-32b|2 ; asym_ep2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"   
+  # "30000 : 0 : q2.5-72b|2 ; asym_ep2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"   
+
+
   # ---- asym_cpuadamwds | recomp-off-full-fg (dense ker000, routed MoE ker101) ----
-  "50000 : 0 : q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"           # C-OOM 53k
-  "128000 : 0 : q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"    # C-OOM 132k
-  "32000 : 0 : llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"   # C-OOM 33k
+  # "50000 : 0 : q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"           # C-OOM 53k
+  # "128000 : 0 : q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"    # C-OOM 132k
+  # "32000 : 0 : llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"   # C-OOM 33k
   # "13000 : 0 : llama4-scout|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"   # G-OOM 15k
   # "50000 : 0 : q2.5-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"       # C-OOM 53k
   # "30000 : 0 : q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"       # C-OOM 33k
@@ -152,8 +161,10 @@ for row in "${CONFIGS[@]}"; do
   line+=", \"probe_timeout_s\": ${PROBE_TIMEOUT_S}, \"confirm_timeout_s\": ${CONFIRM_TIMEOUT_S}"
   line+=", \"max_probes\": ${MAX_PROBES}, \"max_confirm_attempts\": ${MAX_CONFIRM_ATTEMPTS}"
   # NOTE: an extra-json "env":{...} REPLACES this block (JSON last-key-wins) --
-  # re-include the watchdog keys there if you override env per row.
-  line+=", \"env\": {\"HOST_MEM_WATCHDOG_FLOOR_GB\": \"${WATCHDOG_FLOOR_GB}\", \"HOST_MEM_WATCHDOG_POLL_SECONDS\": \"${WATCHDOG_POLL_S}\"}"
+  # re-include the watchdog + GPU_POOL keys there if you override env per row.
+  # GPU_POOL=0,1 serves both shapes: |1 rows take GPU 0, |2 rows (asym_ep2, fix_gb200_ep.md
+  # S4) need the same-superchip pair or the driver's pair guard kills the probe.
+  line+=", \"env\": {\"HOST_MEM_WATCHDOG_FLOOR_GB\": \"${WATCHDOG_FLOOR_GB}\", \"HOST_MEM_WATCHDOG_POLL_SECONDS\": \"${WATCHDOG_POLL_S}\", \"GPU_POOL\": \"${CEIL_GPU_POOL:-0,1}\"}"
   [[ -n "${extra}" ]] && line+=", ${extra}"
   line+="}"
   printf '%s\n' "${line}" >> "${GEN}"
@@ -177,6 +188,7 @@ if [[ "${VALIDATE_ROWS}" == "true" ]]; then
     if ! ( cd "${ASYM_ROOT_DIR}" && \
            SFT_ROOT="$(cd "${ASYM_ROOT_DIR}/../.." && pwd)" RUNS="${_row}" DRY_RUN=true \
            PLOT=false PROFILERS=source RUN_POST=false CONTINUE_ON_ERROR=false \
+           GPU_POOL="${CEIL_GPU_POOL:-0,1}" \
            COLLECT_EXISTING=false UNSLOTH_GC_OUTER_HBM_EVERY_N=0 RUN_NAME="ceiling_validate" \
            timeout 120 bash "${SCRIPT_DIR}/profile_lora_lf_test_both.sh" ) >> "${_vlog}" 2>&1; then
       echo "---- last lines of ${_vlog}:" >&2

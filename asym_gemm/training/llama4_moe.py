@@ -239,7 +239,10 @@ class AsymLlama4Moe(nn.Module):
             strict=False,
         )
         if backend == "asym" and offload and strict and torch.cuda.is_available():
-            if not self.experts.gate_up_base.host_weight.weight.is_pinned() or not self.experts.down_base.host_weight.weight.is_pinned():
+            def _hw_ok(hw) -> bool:  # fabric banks pin at seal() (fix_gb200_ep.md S1)
+                return hw.weight.is_pinned() or bool(getattr(hw, "_fabric_bank", False))
+
+            if not _hw_ok(self.experts.gate_up_base.host_weight) or not _hw_ok(self.experts.down_base.host_weight):
                 raise RuntimeError("Llama 4 expert CPU offload requires pinned CPU HostWeights for AsymGEMM")
         if backend == "asym" and offload:
             _drop_parameter_storage(source_experts, "gate_up_proj", "down_proj")

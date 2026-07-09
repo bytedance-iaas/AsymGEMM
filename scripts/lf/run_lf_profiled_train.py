@@ -1365,6 +1365,28 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
         _stp_wrap_model._asym_stp_ngpu_patch = True  # type: ignore[attr-defined]
         Trainer._wrap_model = _stp_wrap_model
 
+    if os.environ.get("ASYM_EP2") == "1" and not getattr(Trainer, "_asym_ep2_nowrap", False):
+        # asym_ep2 (fix_gb200_ep.md S1 DELTA 3): rank-per-GPU with MANUAL grad allreduce —
+        # the model must NEVER be DDP-wrapped. The vendored Trainer wraps via
+        # accelerator.prepare(self.model) (trainer.py:1590-1599), which dispatches
+        # nn.Modules to Accelerator.prepare_model — bypass it for the MODEL only;
+        # optimizer/dataloader prepare stay untouched (DistributedSampler still shards).
+        from accelerate import Accelerator
+
+        _orig_prepare_model = Accelerator.prepare_model
+
+        def _ep2_prepare_model(self: Any, model: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(model, torch.nn.Module):
+                return model
+            return _orig_prepare_model(self, model, *args, **kwargs)
+
+        Accelerator.prepare_model = _ep2_prepare_model
+        Trainer._asym_ep2_nowrap = True
+        # OMP_NUM_THREADS=32 feeds DeepSpeedCPUAdam's OMP region (P6 fix), but torch's
+        # intra-op pool defaults to the same value and 32-thread teams CHURN the
+        # backward's many tiny host ops (measured bwd 42->49 s). Pin torch small.
+        torch.set_num_threads(int(os.environ.get("ASYM_EP2_TORCH_THREADS", "2")))
+
     def _result_to_float(result: Any) -> Any:
         if hasattr(result, "item"):
             try:
@@ -1447,7 +1469,160 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
 
     grad_dump_dir = os.environ.get("ASYM_DUMP_ADAPTER_GRADS", "")
     stp_full_tp = os.environ.get("ASYM_STP") == "1" and os.environ.get("ASYM_STP_PHASE_A") != "1"
-    if (grad_dump_dir or stp_full_tp) and not getattr(Trainer.training_step, "_asym_grad_dump", False):
+    ep2_active = os.environ.get("ASYM_EP2") == "1"
+
+    def _ep2_shard_receipt(ts_args: Any, ts_kwargs: Any) -> None:
+        # G-S1.a shard receipt (fix_gb200_ep.md): per-rank first-step row hashes; the
+        # gate asserts disjointness + union == the global batch across ranks.
+        try:
+            from collections.abc import Mapping as _Mapping
+
+            inputs = None
+            if len(ts_args) > 1 and isinstance(ts_args[1], _Mapping):
+                inputs = ts_args[1]  # dict OR transformers BatchEncoding (UserDict)
+            elif isinstance(ts_kwargs.get("inputs"), _Mapping):
+                inputs = ts_kwargs["inputs"]
+            ids = inputs.get("input_ids") if inputs is not None else None
+            if ids is None:
+                heartbeat.emit(
+                    "ep2_shard_receipt_skipped",
+                    arg_types=[type(a).__name__ for a in ts_args[:3]],
+                    kwarg_keys=sorted(ts_kwargs.keys()),
+                    input_keys=sorted(inputs.keys()) if inputs is not None else None,
+                )
+                return
+            import hashlib as _hashlib
+
+            rows = [
+                _hashlib.sha1(row.detach().to("cpu").numpy().tobytes()).hexdigest()[:16]
+                for row in ids
+            ]
+            rank = os.environ.get("RANK", "0")
+            src_json = os.environ.get("ASYM_GEMM_LF_PROFILE_SOURCE_JSON", "")
+            default_dir = str(Path(src_json).parent) if src_json else os.getcwd()
+            out_dir = Path(os.environ.get("ASYM_EP2_RECEIPT_DIR") or default_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / f"rank{rank}_shards.json").write_text(
+                json.dumps({"rank": rank, "shape": list(ids.shape), "row_sha1_16": rows})
+            )
+            heartbeat.emit("ep2_shard_receipt", rows=len(rows))
+        except Exception as exc:
+            heartbeat.emit("ep2_shard_receipt_failed", error=repr(exc))
+
+    def _emit_update_probe(trainer: Any) -> None:
+        # update-application receipt (any backend; auto-on under ep2, or
+        # ASYM_UPDATE_PROBE=1): BEFORE this step's optimizer runs, the tracked param
+        # reflects k-1 applied updates — gpu vs cpu-master norms split "step never ran" /
+        # "copyback broken" / "all fine" in one trajectory.
+        try:
+            model = getattr(trainer, "model", None)
+            if model is None:
+                return
+            probe = getattr(trainer, "_ep2_probe_param", None)
+            if probe is None:
+                for _name, _p in model.named_parameters():
+                    if _p.requires_grad and "lora_B" in _name:
+                        probe = (_name, _p)
+                        trainer._ep2_probe_param = probe
+                        break
+            if probe is not None:
+                _name, _p = probe
+                master_norm = None
+                opt = getattr(trainer, "optimizer", None)
+                while hasattr(opt, "optimizer"):
+                    opt = opt.optimizer
+                for mapping in getattr(opt, "_mappings", []) or []:
+                    if mapping.cuda_param is _p:
+                        master_norm = float(mapping.cpu_param.data.float().norm())
+                        break
+                heartbeat.emit(
+                    "ep2_update_probe",
+                    param=_name,
+                    gpu_norm=float(_p.detach().float().norm()),
+                    master_norm=master_norm,
+                    grad_norm=float(_p.grad.detach().float().norm()) if _p.grad is not None else None,
+                )
+        except Exception as exc:
+            heartbeat.emit("ep2_update_probe_failed", error=repr(exc))
+
+    def _ep2_post_backward(trainer: Any, ts_args: Any, ts_kwargs: Any) -> None:
+        # fix_gb200_ep.md S1 DELTA 3: ONE coalesced allreduce (mean) of the trainable
+        # grads per step — AFTER backward, BEFORE clip/optimizer. No DDP wrapper exists;
+        # every rank's CPU AdamW then steps identical averaged grads (elementwise =>
+        # identical masters, no param sync). None grads are materialized as zeros so the
+        # collective shape is identical on every rank every step.
+        import torch.distributed as dist
+
+        if not (dist.is_available() and dist.is_initialized()):
+            raise RuntimeError("ASYM_EP2=1 but torch.distributed is not initialized")
+        model = getattr(trainer, "model", None)
+        if model is None:
+            return
+        ga = int(getattr(getattr(trainer, "args", None), "gradient_accumulation_steps", 1) or 1)
+        if ga != 1:
+            raise RuntimeError("ASYM_EP2 grad allreduce requires gradient_accumulation_steps==1")
+        if not getattr(trainer, "_ep2_shard_receipt_done", False):
+            trainer._ep2_shard_receipt_done = True
+            _ep2_shard_receipt(ts_args, ts_kwargs)
+        if os.environ.get("ASYM_EP_QUEUED") == "1":
+            from asym_gemm.training.ep_queue import validate_previous_step
+
+            report = validate_previous_step()
+            if report.get("claim_mismatches") or report.get("overflow"):
+                heartbeat.emit("ep2_queue_claims_BAD", **report)
+                raise RuntimeError(f"S2a queued-launch claim validation failed: {report}")
+            if report.get("launches"):
+                heartbeat.emit("ep2_queue_claims", **report)
+        state = getattr(trainer, "_ep2_state", None)
+        if state is None:
+            groups: dict = {}
+            owner_scaled: list = []
+            for _name, param in model.named_parameters():  # deterministic order per rank
+                if not param.requires_grad:
+                    continue
+                if getattr(param, "_asym_ep_owner_scaled", False):
+                    # S5b vanilla-EP: expert-LoRA grads live on the OWNER as the sum
+                    # over BOTH shards' tokens — scale by 1/world instead of the mean
+                    # allreduce (vanilla EP shards expert params; no replica to sync).
+                    owner_scaled.append(param)
+                    continue
+                groups.setdefault((param.dtype, param.device), []).append(param)
+            state = []
+            for (dtype, device), plist in groups.items():
+                total = sum(p.numel() for p in plist)
+                flat = torch.empty(total, dtype=dtype, device=device)
+                views, off = [], 0
+                for p in plist:
+                    views.append(flat.narrow(0, off, p.numel()).view_as(p))
+                    off += p.numel()
+                state.append((plist, flat, views))
+            trainer._ep2_state = state
+            trainer._ep2_owner_scaled = owner_scaled
+            heartbeat.emit(
+                "ep2_grad_bucket_built",
+                buckets=len(state),
+                numel=sum(flat.numel() for _, flat, _ in state),
+                owner_scaled_numel=sum(p.numel() for p in owner_scaled),
+            )
+        world = dist.get_world_size()
+        for plist, flat, views in state:
+            grads = []
+            for p in plist:
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p)
+                grads.append(p.grad)
+            torch._foreach_copy_(views, grads)
+            dist.all_reduce(flat)
+            flat.div_(world)
+            torch._foreach_copy_(grads, views)
+        for p in getattr(trainer, "_ep2_owner_scaled", ()):
+            if p.grad is not None:
+                p.grad.div_(world)
+        _emit_update_probe(trainer)
+
+    update_probe = os.environ.get("ASYM_UPDATE_PROBE") == "1"
+
+    if (grad_dump_dir or stp_full_tp or ep2_active or update_probe) and not getattr(Trainer.training_step, "_asym_grad_dump", False):
         # Order matters: (1) sTP mirror-grad merge (dA = dA0 + to0(dA1)) so clip/optimizer
         # and any dump see the TRUE logical grads; (2) G-D2.1 / I4 parity dump at optimizer
         # step N (default 2 — step 1 is vacuous for dA: PEFT B=0 at init). Runs AFTER
@@ -1458,6 +1633,10 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
 
         def _grad_dump_training_step(self: Any, *args: Any, **kwargs: Any) -> Any:
             result = _orig_training_step(self, *args, **kwargs)
+            if ep2_active:
+                _ep2_post_backward(self, args, kwargs)
+            elif update_probe:
+                _emit_update_probe(self)
             if stp_full_tp:
                 try:
                     from asym_gemm.training.stp_wrap import (
@@ -1507,6 +1686,36 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
         original_train = Trainer.train
 
         def wrapped_train(self: Any, *args: Any, **kwargs: Any) -> Any:
+            if os.environ.get("ASYM_EP_VANILLA") == "1" and not getattr(self, "_asym_ep_vanilla_swapped", False):
+                # S5b/N2 vanilla-EP rung: owned-slice branch swap MUST precede optimizer
+                # creation (branch LoRA params replace full-E params in the module tree).
+                from asym_gemm.training.ep_vanilla import install_vanilla_ep
+
+                receipt = install_vanilla_ep(self.model)
+                heartbeat.emit("ep_vanilla_installed", **receipt)
+                self._asym_ep_vanilla_swapped = True
+            if os.environ.get("ASYM_EP2") == "1" and not getattr(self, "_asym_fabric_sealed", False):
+                # fix_gb200_ep.md S1 DELTA 2: (1) pre-build every LAZY weight bank so it
+                # lands in the fabric (the fg split gate/up banks are built on first
+                # forward otherwise = post-seal); (2) barrier + manifest/hash cross-check
+                # + ONE cudaHostRegister — all BEFORE the first forward streams any bank.
+                from asym_gemm.training.shared_fabric import get_fabric
+
+                if os.environ.get("ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD", "0") == "1":
+                    model_obj = getattr(self, "model", None)
+                    if model_obj is not None:
+                        prebuilt = 0
+                        for module in model_obj.modules():
+                            ensure = getattr(module, "_ensure_qwen3_moe_finegrained_bases", None)
+                            if callable(ensure):
+                                ensure()
+                                prebuilt += 1
+                        heartbeat.emit("ep2_fg_bases_prebuilt", blocks=prebuilt)
+                fabric = get_fabric()
+                if fabric is not None:
+                    fabric.seal()
+                    heartbeat.emit("ep2_fabric_sealed", **fabric.stats())
+                self._asym_fabric_sealed = True
             init_dump_path = os.environ.get("ASYM_DUMP_ADAPTER_INIT", "")
             if init_dump_path and not Path(init_dump_path).exists():
                 model_obj = getattr(self, "model", None)

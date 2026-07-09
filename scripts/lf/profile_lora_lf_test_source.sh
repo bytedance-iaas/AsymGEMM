@@ -34,6 +34,9 @@ RUN_POST=${RUN_POST:-false}
 GPU_POOL=${GPU_POOL:-0}
 
 # RUNS: model ; backend|recompute|liger ; seq|batch|grad_accum ; policy|expact|attnact|layeract|layergc|sdparecomp
+#   model    : shorthand-or-path|num_gpus[|skew] — optional skew = artificial hot-expert
+#              fraction in [0,1) (e.g. q3-30b-a3b|2|0.10): row-scoped ASYM_EP_SKEW_HOT with
+#              implicit ACK; timing-only (loss INVALID), run dir gets _skewNNN.
 # Models use the M shorthand. To override the default list from the environment, pass:
 #   RUNS='q3-30b-a3b|1 ; superoffload_mem|unsloth|ligerloss1 ; 4092|8|1 ; none|false|false|false|false|false || q3-30b-a3b|1 ; asym_cpuadamwds|norecompute|ligerloss1 ; 4092|8|1 ; none|true|true|false|true|true'
 #   backend  : asym_cpuadamwds | zero3_offload | zero3_offload_mem | zero3_offload_opnvme | zero3_offload_panvme | zero3_offload_mem_opnvme | zero3_offload_mem_panvme | superoffload | superoffload_mem | superoffload_mem_opnvme | superoffload_mem_panvme
@@ -100,17 +103,11 @@ else
   #   # "q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
   # )
   RUNS=(
-    # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # G-OOM 66k
-    # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 130000|8|1 ; none|false|false|false|false|false"
-    # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 135000|8|1 ; none|false|false|false|false|false"
-    # "q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false"
-    "q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 33000|8|1 ; none|false|false|false|false|false"
-    "q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 34000|8|1 ; none|false|false|false|false|false"
-
-    # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 65000|8|1 ; none|false|false|false|false|false" # G-OOM 66k
+    # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm8|ligerloss1 ; 68000|8|1 ; none|false|false|false|false|false" # ceiling (confirmed); C-OOM 69k, ohbm0 C-OOM 66k
+    # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 172000|8|1 ; none|false|false|false|false|false" # ceiling (max OK); G-OOM 188k
 
     # "q3-30b-a3b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 131000|8|1 ; none|false|false|false|false|false" # C-OOM 132k
-    # "q3-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 52000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
+    "q3-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 68000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
     # "llama3.3-70b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
     # "llama4-scout|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 14500|8|1 ; none|false|false|false|false|false" # G-OOM 15k
     # "q2.5-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 52000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
@@ -267,7 +264,7 @@ ASYM_CPU_ADAMW_PIN_MEMORY=${ASYM_CPU_ADAMW_PIN_MEMORY:-true}
 ASYM_CPU_ADAMW_FP32_MASTER=${ASYM_CPU_ADAMW_FP32_MASTER:-true}
 
 # Execution
-OVERWRITE=${OVERWRITE:-true}
+OVERWRITE=${OVERWRITE:-false}
 CONTINUE_ON_ERROR=${CONTINUE_ON_ERROR:-true}
 DRY_RUN=${DRY_RUN:-false}
 COLLECT_EXISTING=${COLLECT_EXISTING:-false}
@@ -915,13 +912,27 @@ parse_model_spec() {
   local -a fields
 
   IFS='|' read -r -a fields <<< "${spec}"
-  ((${#fields[@]} <= 2)) || die "model spec must be model|num_gpus, got '${spec}'"
+  ((${#fields[@]} <= 3)) || die "model spec must be model|num_gpus[|skew], got '${spec}'"
 
   parsed_model_name="${fields[0]}"
   if ((${#fields[@]} >= 2)); then
     parsed_model_gpu_count="${fields[1]}"
   else
     parsed_model_gpu_count=1
+  fi
+  # optional 3rd field: artificial hot-expert skew alpha in [0,1) (HC-EP1 timing-only
+  # rows; 0/absent = natural routing). Row-scoped ASYM_EP_SKEW_HOT with implicit ACK.
+  parsed_model_skew=""
+  if ((${#fields[@]} == 3)); then
+    local skew="${fields[2]}"
+    case "${skew}" in
+      0|0.0|0.00|"") ;;  # natural
+      *)
+        [[ "${skew}" =~ ^(0\.[0-9]+|\.[0-9]+)$ ]] ||
+          die "model-spec skew must be a fraction in [0,1) (e.g. 0.10), got '${skew}' in '${spec}'"
+        parsed_model_skew="${skew}"
+        ;;
+    esac
   fi
 
   [[ -n "${parsed_model_name}" ]] || die "empty model name in model spec '${spec}'"
@@ -945,12 +956,12 @@ backend_gpu_count() {
   local backend="$1"
   local model_gpu_count="$2"
   case "${backend}" in
-    asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds|asym_dp2_cpuadamwds)
+    asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds|asym_dp2_cpuadamwds|asym_ep2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds)
       # GB200 |2 family honors 2 GPUs (gb200_tp.md I0 un-collapses the cap).
       ((model_gpu_count == 2)) || die "backend '${backend}' requires a |2 model spec, got |${model_gpu_count}"
       printf '2\n' ;;
     asym|asym_torch|asym_cpuadamwtorch|asym_cpuadamwds|asym_cpuadamwds_panvme|asym_cpuadamwds_actnvme|asym_cpuadamwds_bothnvme)
-      ((model_gpu_count == 1)) || die "backend '${backend}' is single-GPU; use asym_dp2_cpuadamwds or asym_stp_cpuadamwds for |2 rows (got |${model_gpu_count})"
+      ((model_gpu_count == 1)) || die "backend '${backend}' is single-GPU; use asym_ep2_cpuadamwds / asym_dp2_cpuadamwds / asym_stp_cpuadamwds for |2 rows (got |${model_gpu_count})"
       printf '1\n' ;;
     torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_mem_nocpuadamw|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam|superoffload|superoffload_mem|superoffload_mem_nocpuadamw|superoffload_mem_opnvme|superoffload_mem_panvme) printf '%s\n' "${model_gpu_count}" ;;
     kt_torchbf16|kt_armbf16) printf '1\n' ;;
@@ -1131,7 +1142,7 @@ cpuadam_backend_for_label() {
   case "${1}" in
     asym_cpuadamwtorch) printf 'torch\n' ;;
     asym_cpuadamwds|asym_cpuadamwds_panvme|asym_cpuadamwds_actnvme|asym_cpuadamwds_bothnvme) printf 'deepspeed\n' ;;
-    asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds|asym_dp2_cpuadamwds) printf 'deepspeed\n' ;;
+    asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds|asym_dp2_cpuadamwds|asym_ep2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds) printf 'deepspeed\n' ;;
     *) return 1 ;;
   esac
 }
@@ -1195,6 +1206,12 @@ append_backend_spec() {
     tp2_resident_cpuadamwds) backend=tp2_resident_cpuadamwds ;;
     tp2_offstage_cpuadamwds) backend=tp2_offstage_cpuadamwds ;;
     asym_dp2_cpuadamwds) backend=asym_dp2_cpuadamwds ;;
+    asym_ep2) backend=asym_ep2_cpuadamwds ;;
+    asym_ep2_cpuadamwds) backend=asym_ep2_cpuadamwds ;;
+    asym_sep2) backend=asym_sep2_cpuadamwds ;;
+    asym_sep2_cpuadamwds) backend=asym_sep2_cpuadamwds ;;
+    asym_sqep2|asym_sqeq2) backend=asym_sqep2_cpuadamwds ;;
+    asym_sqep2_cpuadamwds|asym_sqeq2_cpuadamwds) backend=asym_sqep2_cpuadamwds ;;
     zero2) backend=zero2 ;;
     zero3) backend=zero3 ;;
     zero3_offload) backend=zero3_offload ;;
@@ -1295,7 +1312,8 @@ normalize_run_spec_entry() {
     die "RUNS unknown model shorthand '${model_part%%|*}' (add it to M or use model/path|num_gpus)"
   fi
   parse_model_spec "${model_part}"
-  normalized_model="${parsed_model_name}|${parsed_model_gpu_count}"
+  # skew appended only when set so skewless rows keep their historical normalized form
+  normalized_model="${parsed_model_name}|${parsed_model_gpu_count}${parsed_model_skew:+|${parsed_model_skew}}"
   parsed_workload="$(parse_workload_tuple "${workload_part}")"
   parsed_policy="$(parse_exp_act_policy_tuple "${policy_part}")"
 
@@ -3381,13 +3399,14 @@ run_job() {
     grad_offload=false
     weight_offload=false
   fi
-  # ---- GB200 |2 backend derivation (gb200_tp.md I0; gb200_dp.md D2) ----
-  local stp_enable=0 dp2_enable=0 stp_weight_mode="" stp_arena="" stp_coord="" stp_tag=""
+  # ---- GB200 |2 backend derivation (gb200_tp.md I0; gb200_dp.md D2; fix_gb200_ep.md S1) ----
+  local stp_enable=0 dp2_enable=0 ep2_enable=0 stp_weight_mode="" stp_arena="" stp_coord="" stp_tag=""
   case "${backend}" in
     asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds) stp_enable=1 ;;
     asym_dp2_cpuadamwds) dp2_enable=1 ;;
+    asym_ep2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds) ep2_enable=1 ;;
   esac
-  if ((stp_enable || dp2_enable)); then
+  if ((stp_enable || dp2_enable || ep2_enable)); then
     case "${gpu}" in
       0,1|2,3) ;;
       *)
@@ -3395,9 +3414,10 @@ run_job() {
         ;;
     esac
   fi
-  if ((dp2_enable)); then
-    # Route A: hook-based grad offload would D2H PRE-reduction grads (DDP reduces at bwd END).
-    # Forced off here so the artifact label matches the runtime behavior.
+  if ((dp2_enable || ep2_enable)); then
+    # Route A / ep2: grads must be REDUCED before any D2H copy (DDP reduces at bwd END;
+    # ep2's manual allreduce runs post-backward). Hook-based offload forced off so the
+    # artifact label matches the runtime behavior.
     grad_offload=false
     weight_offload=false
   fi
@@ -3875,6 +3895,21 @@ run_job() {
   fi
   if ((dp2_enable)); then
     run_env+=(ASYM_DP=1 ASYM_DP_FIND_UNUSED="${ASYM_DP_FIND_UNUSED:-}")
+  fi
+  if ((ep2_enable)); then
+    # rank-per-GPU sEP (fix_gb200_ep.md S1): torchrun launch path + no-DDP manual
+    # allreduce + shared /dev/shm weight fabric.
+    # NAMING EPOCH 2026-07-08: the EP mode flags (ASYM_EP_VANILLA / ASYM_ARENA_SHM /
+    # ASYM_EP_QUEUED) are derived AUTHORITATIVELY from the backend NAME inside
+    # run_lf_lora_sft.sh (asym_ep2=vanilla, asym_sep2=ownerless-plain, asym_sqep2=queue);
+    # the driver passes only the non-mode knobs.
+    run_env+=(ASYM_DP=1 ASYM_EP2=1 ASYM_ARENA_SHM_CAP_GB="${ASYM_ARENA_SHM_CAP_GB:-160}")
+    # torchrun defaults OMP_NUM_THREADS=1, starving each rank's DeepSpeedCPUAdam
+    # (measured 5.7 s vs 0.53 s CPU step — fix_gb200_ep.md P6). 32/rank on the pair.
+    run_env+=(OMP_NUM_THREADS="${ASYM_EP2_OMP_THREADS:-32}")
+    # P6 L1: torch pool stays small for bwd host ops; ONLY the CPU-Adam inner step
+    # raises it (scoped in cpu_adam.py). Measured: opt 4.2 s at 2 threads.
+    run_env+=(ASYM_CPU_ADAMW_STEP_THREADS="${ASYM_CPU_ADAMW_STEP_THREADS:-32}")
   fi
 
   local -a run_cmd=(env)
@@ -4461,6 +4496,15 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
       parse_model_spec "${model_spec_entry}"
       current_model_name="${parsed_model_name}"
       current_model_gpu_count="${parsed_model_gpu_count}"
+      # row-scoped skew: |skew field wins (implicit ACK — explicit param IS the intent);
+      # rows without the field fall back to the invocation env (old behavior, ACK gated).
+      [[ -n "${_ROW_SKEW_ENV_DEFAULT+x}" ]] || _ROW_SKEW_ENV_DEFAULT="${ASYM_EP_SKEW_HOT:-}"
+      if [[ -n "${parsed_model_skew}" ]]; then
+        ASYM_EP_SKEW_HOT="${parsed_model_skew}"
+        ASYM_EP_SKEW_ACK=1
+      else
+        ASYM_EP_SKEW_HOT="${_ROW_SKEW_ENV_DEFAULT}"
+      fi
       current_model_tag=$(basename "${current_model_name}" | tr '/:' '__')
       resolve_current_runtime_for_model "${current_model_name}"
       validate_current_fa4_runtime "${current_model_name}"
@@ -4537,7 +4581,7 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
               continue
             fi
             job_router_mode="${router_mode}"
-            if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" && "${backend}" != "asym_cpuadamwtorch" && "${backend}" != "asym_cpuadamwds" && "${backend}" != "asym_cpuadamwds_panvme" && "${backend}" != "asym_cpuadamwds_actnvme" && "${backend}" != "asym_cpuadamwds_bothnvme" && "${backend}" != "asym_stp_cpuadamwds" && "${backend}" != "asym_dp2_cpuadamwds" && "${backend}" != "tp2_resident_cpuadamwds" && "${backend}" != "tp2_offstage_cpuadamwds" ]]; then
+            if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" && "${backend}" != "asym_cpuadamwtorch" && "${backend}" != "asym_cpuadamwds" && "${backend}" != "asym_cpuadamwds_panvme" && "${backend}" != "asym_cpuadamwds_actnvme" && "${backend}" != "asym_cpuadamwds_bothnvme" && "${backend}" != "asym_stp_cpuadamwds" && "${backend}" != "asym_dp2_cpuadamwds" && "${backend}" != "asym_ep2_cpuadamwds" && "${backend}" != "asym_sep2_cpuadamwds" && "${backend}" != "asym_sqep2_cpuadamwds" && "${backend}" != "tp2_resident_cpuadamwds" && "${backend}" != "tp2_offstage_cpuadamwds" ]]; then
               if [[ "${router_hf_selected}" != "true" ]]; then
                 job_router_mode=hf
               else
