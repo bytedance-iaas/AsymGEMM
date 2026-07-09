@@ -29,3 +29,13 @@ if(CPU_GEMM_WITH_AMX)
   target_include_directories(test_amx_int8_rm PRIVATE ${CMAKE_SOURCE_DIR}/include)
   add_test(NAME test_amx_int8_rm COMMAND test_amx_int8_rm)
 endif()
+
+if(CPU_GEMM_WITH_AMX AND CPU_GEMM_WITH_AVX512)
+  add_executable(test_int8_rm_parity test_int8_rm_parity.cpp)
+  target_compile_definitions(test_int8_rm_parity PRIVATE
+    CPU_GEMM_HAS_AMX=1 CPU_GEMM_HAS_AVX512_VNNI=1)
+  target_link_libraries(test_int8_rm_parity PRIVATE cpu_gemm)
+  target_include_directories(test_int8_rm_parity PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+  add_test(NAME test_int8_rm_parity COMMAND test_int8_rm_parity)
+endif()

@@ -32,12 +32,19 @@ typedef struct cg_caps {
   int has_fma;
   int has_avx512f;
   int has_avx512_bf16;
-  int has_avx_vnni;
+  int has_avx_vnni;       /* AVX-VNNI (256-bit, leaf 7.1 EAX[4]) */
+  int has_avx512_vnni;    /* AVX-512-VNNI (leaf 7.0 ECX[11]) */
   int has_amx_bf16;
   int has_amx_int8;
 } cg_caps_t;
 
 cg_caps_t cg_query_caps(void);
+
+/* Diagnostics for the runtime-selected INT8 row-major backend
+ * (dispatch/int8_rm_backend). Name is one of "amx_int8_rm",
+ * "avx512_vnni_int8_rm", "none"; ok is 0 when no backend is usable. */
+const char* cg_int8_rm_backend_name(void);
+int cg_int8_rm_backend_ok(void);
 
 #ifdef __cplusplus
 } /* extern "C" */
