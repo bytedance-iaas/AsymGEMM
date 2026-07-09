@@ -270,7 +270,7 @@ sm90_int8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
 
                     // Load SFA (per M-block per K-block) — one float per row of A
                     const uint32_t sfa_k_idx = (kGemmType == GemmType::MGroupedMasked)
-                        ? scheduler.current_group_idx * ceil_div(shape_k, BLOCK_K) + sf_k_idx
+                        ? scheduler.current_group_idx * block_k + sf_k_idx
                         : sf_k_idx;
                     tma_copy<BLOCK_M, 1, 0>(&tensor_map_sfa, full_barriers[stage_idx], smem_sfa[stage_idx], local_m_idx, sfa_k_idx);
 
@@ -372,12 +372,17 @@ sm90_int8_asym_gemm_1d1d_impl(uint32_t* offsets, uint32_t* experts,
 
                 // Load per-token (row) scale factors for rows owned by this thread
                 // m_offset accounts for multiple M waves (kNumMWaves==1 here, but kept general)
-                float scale_a_0[kNumMWaves], scale_a_1[kNumMWaves];
-                #pragma unroll
-                for (uint32_t local_idx = 0; local_idx < kNumMWaves; ++local_idx) {
-                    auto m_offset = local_idx * WAVE_BLOCK_M;
-                    scale_a_0[local_idx] = ld_shared(smem_sfa[stage_idx] + m_offset + r_0);
-                    scale_a_1[local_idx] = ld_shared(smem_sfa[stage_idx] + m_offset + r_1);
+                // Only warps that participate in the WGMMA store need these scales.
+                // For BLOCK_M < 64, warps with warp_idx >= kNumWGMMAStoreThreads/32
+                // have r_0/r_1 >= BLOCK_M, so guarding avoids OOB reads of smem_sfa.
+                float scale_a_0[kNumMWaves] = {0.0f}, scale_a_1[kNumMWaves] = {0.0f};
+                if (do_wgmma_store) {
+                    #pragma unroll
+                    for (uint32_t local_idx = 0; local_idx < kNumMWaves; ++local_idx) {
+                        auto m_offset = local_idx * WAVE_BLOCK_M;
+                        scale_a_0[local_idx] = ld_shared(smem_sfa[stage_idx] + m_offset + r_0);
+                        scale_a_1[local_idx] = ld_shared(smem_sfa[stage_idx] + m_offset + r_1);
+                    }
                 }
 
                 // Issue WGMMA
