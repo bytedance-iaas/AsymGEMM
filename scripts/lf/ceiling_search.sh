@@ -29,8 +29,8 @@ SEQ_MIN=${SEQ_MIN:-4000}
 SEQ_MAX=${SEQ_MAX:-300000}
 OHBM_LADDER=${OHBM_LADDER:-0,8,4,3,2,1}    # searched by HBM share: 0 < 1/8 < 1/4 < 1/3 < 1/2 < 1
 PROBE_STEPS=${PROBE_STEPS:-2}              # MAX_STEPS for probes (warmup 1 + 2 measured = 3 total steps)
-CONFIRM_STEPS=${CONFIRM_STEPS:-3}          # MAX_STEPS for the confirm re-run of the winner;
-                                           # raise (e.g. 8) to also catch late host-RAM creep
+CONFIRM_STEPS=${CONFIRM_STEPS:-4}          # confirm MAX_STEPS; 4 gives the steady stat
+                                           # (drop 1st+last measured) 2 steps to average
 WARMUP_STEPS=${WARMUP_STEPS:-1}
 PROBE_TIMEOUT_S=${PROBE_TIMEOUT_S:-5400}
 CONFIRM_TIMEOUT_S=${CONFIRM_TIMEOUT_S:-${PROBE_TIMEOUT_S}}
@@ -57,9 +57,10 @@ SETTLE_S=${SETTLE_S:-20}                     # pause after a failed probe
 # configs stay at ohbm0 anyway (more HBM share never helps a G-OOM).
 CONFIGS=(
 
-  "40000 : 0 : q3-32b|2 ; asym_ep2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"         
-  "100000 : 0 : q3-30b-a3b|2 ; asym_ep2_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"   
-  "30000 : 0 : llama3.3-70b|2 ; asym_ep2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
+  # asym_ep2 (vanilla EP) is MoE-only: dense models crash at init
+  "100000 : 0 : q3-30b-a3b|2 ; asym_ep2_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
+  # "40000 : 0 : q3-32b|2 ; asym_ep2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
+  # "30000 : 0 : llama3.3-70b|2 ; asym_ep2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
   # "13000 : 0 : llama4-scout|2 ; asym_ep2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
   # "50000 : 0 : q2.5-32b|2 ; asym_ep2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"   
   # "30000 : 0 : q2.5-72b|2 ; asym_ep2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"   
@@ -189,7 +190,8 @@ if [[ "${VALIDATE_ROWS}" == "true" ]]; then
            SFT_ROOT="$(cd "${ASYM_ROOT_DIR}/../.." && pwd)" RUNS="${_row}" DRY_RUN=true \
            PLOT=false PROFILERS=source RUN_POST=false CONTINUE_ON_ERROR=false \
            GPU_POOL="${CEIL_GPU_POOL:-0,1}" \
-           COLLECT_EXISTING=false UNSLOTH_GC_OUTER_HBM_EVERY_N=0 RUN_NAME="ceiling_validate" \
+           COLLECT_EXISTING=false UNSLOTH_GC_OUTER_HBM_EVERY_N=0 \
+           RUN_NAME= OUTPUT_ROOT="${ASYM_ROOT_DIR}/profiling_both_ceiling" \
            timeout 120 bash "${SCRIPT_DIR}/profile_lora_lf_test_both.sh" ) >> "${_vlog}" 2>&1; then
       echo "---- last lines of ${_vlog}:" >&2
       tail -n 15 "${_vlog}" >&2

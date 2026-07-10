@@ -580,6 +580,70 @@ GATE S3 (artifact-named or not closed):
   T_ep2; sharded EP-Static / hostsplit are mechanism ablations, NOT SG blockers).
 ```
 
+### S6 — TRUE sEP: dynamic expert-work partitioning over the shared bank (2026-07-09)
+
+```text
+PITCH (user): weights NEVER move (one shared fabric, streaming identical to sdp2);
+  the "partition" is per-layer MENTAL MATH — an ephemeral assignment of the UNION of
+  both shards' expert-segments deciding WHICH GPU's kernels stream WHICH banks into
+  their SMEM this layer. Cluster tokens onto few experts per GPU => each bank is
+  streamed ONCE across the pair (vs twice in sdp2) => wins where streaming binds
+  (small M-per-expert); residual imbalance absorbed by the union queue/steal (the
+  PR-3/4 kernels finally doing the job they were built for). Only ACTIVATIONS move
+  (X staged async to fabric, peer reads via TMA sysmem; Y back via staging + gather —
+  the host-sync-free PR-4 transport; NO collectives in the token path).
+NAMING: asym_sep2/asym_sqep2 are REPURPOSED for this system once code lands (the
+  alias-canonicalization to sdp2 from epoch 3 gets removed then): sep2 = dynamic
+  partition (planner flavor), sqep2 = + steal queue (residue flavor). sdp2/sqdp2/ep2
+  unchanged.
+ON-PAR-BY-CONSTRUCTION RULE (user requirement: never another vanilla): sdp2 IS a
+  point in sEP's assignment space (assignment := own-tokens-only => zero cross
+  traffic, zero staging). The planner takes cross-GPU work ONLY when projected
+  bank-streaming saving > projected X/Y transport cost (per-layer cost model from
+  routing counts). Worst case = sdp2 wall +- the measured 0-2% counter overhead.
+DESIGNS NEEDED:
+  D-A union work list over BOTH shards with STATIC-CAPACITY slots (fix_vanilla_ep
+      D1/D3 substrate: shapes never depend on routing => no per-layer metadata
+      exchange, no .item()s — the anti-stagger discipline).
+  D-B X/Y transport via fabric staging: async D2H stage of cross-assigned rows'
+      X, peer TMA-reads sysmem (PR-2 lanes 156 GB/s), Y to staging + spin_gather
+      (PR-4, bitwise-proven), st.release/ld.acquire flags. Zero NCCL in-layer.
+  D-C the planner: greedy LPT over per-expert counts with the sdp-floor cost rule;
+      ALTERNATIVE flavor: no planner — partition EMERGES from union-queue pops
+      (micro decides which flavor e2e gets first).
+  D-D sqep2 = + steal for residue + per-step steal/transport accounting (EG-V2).
+  D-E grad semantics: executor computes lora for rows it runs; allreduce-mean is
+      location-independent (same proof as the vanilla rung's overlay) => no fork.
+  D-F instrumentation: per-rank STREAMED-BANK-BYTES counter, cross-assigned-rows +
+      transport-bytes counters, host-block probes, antiphase canary.
+METRICS + MODELS/WORKLOADS (the eval matrix):
+  MICRO (extend ep_balance_bench: third mode "sdp" = own rows x all experts; new
+  axis M-per-expert sweep 10k -> ~200 rows/expert; report walls + per-rank bank
+  bytes + imbalance):
+    MG-A balance: union cures alpha-skew (have: 0.835 -> <=0.7%);
+    MG-B streaming: union < sdp wall in the small-M/expert regime with bank-bytes
+         receipt ~= half per GPU; MG-C no regression at compute-bound (within 2%).
+  E2E rows (all steady raw2-4, natural + alpha {0.10, 0.15}):
+    q3-30b-a3b|2  2048|8|1   — streaming-lean showcase (M/expert ~1k): EXPECT the
+                               bank-once win to show (>=5% vs sdp2, growing shorter);
+    q3-30b-a3b|2  20000|8|1  — compute-bound parity row: MUST tie sdp2 within 2%;
+    q3-30b-a3b|2  60000|8|1  — sweet-spot parity row: tie within 2%;
+    llama4-scout|2 9500|8|1  — STRUCTURAL-skew showcase (E=16, banked dev-share up
+                               to 0.87): natural routing alone should show the
+                               partition+steal absorbing real imbalance (needs the
+                               scout fwd hook — currently qwen3-only, port needed);
+    (frontier, optional) q3-235b-a22b short-seq — the large-E streaming-bound case.
+  METRICS per row: step wall + tokens/s; per-GPU streamed-bank GB (THE mechanism
+  receipt: ~1x total vs sdp2's ~2x); cross-assigned rows + transport GB; per-rank
+  busy imbalance; host-block probe ~=0 + no antiphase (quotability bar); loss
+  overlay <=0.01 vs sdp2 on natural rows; HBM peak + host RSS.
+GATES: G1 overlay; G2 parity rows tie sdp2 +-2%; G3 streaming rows win with the
+  bank-bytes receipt; G4 skew ladder flat (like sdp2) AND scout-natural improves;
+  G5 sync hygiene green. Any red = stop, diagnose to receipt (B1), never quote.
+BUILD ORDER: micro third-mode + M-sweep (GPUs 2,3, cheap) -> D-A/B substrate ->
+  D-C planner-vs-queue decision from micro -> e2e parity rows -> showcase rows.
+```
+
 ## STATUS + HISTORY (receipts; pre-pivot numbers are from the RETIRED replicated vehicle)
 
 ```text
@@ -1487,6 +1551,168 @@ S5b SKEW-LADDER B1 EXPECTATION (logged before launch; s2048|8|1, MAX_STEPS=8, st
   The sEP skew curve at 20k is now complete and LINEAR with no coupling term —
   contrast vanilla-EP's +141% at alpha=0.10 (s2048). Kernel m-chunking remains the
   staged lever to flatten the line.
+S6 MICRO v2 B1 EXPECTATION (logged before build/run; bench gains modes sdp
+  [own half-rows x all experts] + sep [chunked-LPT planner over union counts] next
+  to owned/queue, plus analytic per-rank B-bytes [executed segments x 3.1 MB
+  gate-bank; chunked segments re-stream per chunk] and an M-per-expert sweep
+  {40k, 10k, 2.5k rows/expert at E=128}):
+  EXPECT: (i) B-bytes receipt — sdp ~403 MB/rank (all 128 banks BOTH ranks = 2x
+  total) vs sep ~200 MB/rank (bank-once split), queue in between (affinity ends
+  meet in the middle + hot chunks split); (ii) walls at 40k/10k rows/expert:
+  sep ~= sdp ~= queue (compute-bound, B hidden — MG-C within 2%); (iii) walls at
+  2.5k rows/expert: compute ~0.7 ms < B-stream ~2.6 ms => STREAMING-BOUND: sep
+  should beat sdp toward ~1.5-2x (MG-B, the bank-once money receipt), queue
+  partial win; (iv) alpha=0.15: sep stays balanced (LPT+chunking) within <=5%
+  imbalance (MG-A). RED FLAGS: sep slower than sdp at compute-bound (planner
+  overhead leak), no sep win at 2.5k/expert (streaming model wrong — re-derive
+  before building ANY e2e), event-floor artifacts at small M (walls < 1.5 ms:
+  raise reps to 5, keep barrier alignment).
+2026-07-09 ===== S6 MICRO v2 BANKED: QUEUE FLAVOR WINS; STREAMING WIN = 2.6x =====
+  (artifacts profiling_gb200ep_sg/s6_micro_m{5120000,1280000,320000}.json; modes
+  owned/sdp/sep-planner/queue x {natural, 0.15} x worst/median x M-sweep.)
+  B-BYTES RECEIPTS (the mechanism): sdp streams EVERY bank on BOTH ranks (402.7 +
+  402.7 MB); sep-planner streams each bank ONCE (201.3 + 201.3) — the bank-once
+  consolidation is real and exactly halves weight traffic.
+  WALLS: (i) STREAMING-BOUND regime (2.5k rows/expert): sep 2.01 ms vs sdp 5.27 =
+  2.6x FASTER (exceeds the predicted 1.5-2x); queue 2.80 = 1.9x (partial — pops
+  interleave banks); MG-B PASS. (ii) COMPUTE-BOUND (40k rows/expert) natural:
+  queue 15.55 ~= sdp 15.96 (MG-C PASS for queue) BUT sep-planner 19.11 = +20%
+  RED FLAG, and at alpha=0.15 sep = 48.5 ms (3x, imb 0.635) — DIAGNOSIS: whole-
+  expert LPT hands hot experts to ONE rank as UNCHUNKED mega-segments => the
+  known kernel-tail pathology; the planner flavor is structurally tail-prone.
+  (iii) THE SLEEPER RESULT: queue at 40k/expert alpha=0.15 = 15.20 ms vs sdp
+  25.02 — the queue's (segment, n_block) interleaving CURES the mega-segment
+  tail INTRA-rank (the same mechanism behind e2e's +12.6%@0.15) — the queue
+  helps WITHIN a rank at micro even where cross-rank balance is moot.
+  DECISION (D-C resolved): e2e true-sEP = QUEUE-EMERGENT partition (no planner),
+  + a BANK-AFFINITY ORDERING pass on the union list (cluster same-expert items
+  per pop-end; distribute hot chunks across both ends) to close the remaining
+  2.80 -> 2.01 streaming gap and the small-item-count side-affinity artifacts
+  (queue imb up to 0.57 at small M + front-loaded hot expert). Also: fix the
+  queue counter reconciliation so per-side B-bytes report (head+tail != claimed
+  in all runs -> NA fallback fired).
+2026-07-09 S6 PR-5 (ep_sep_probe.py): armed-launch protocol validated the hard way —
+  TWO REAL BUGS found and fixed before any e2e exposure:
+  (1) DECLINE DEADLOCK: the sdp-floor arming decision was per-rank local; one rank
+      declining while the peer armed => peer spun forever on a header that never
+      came. FIX: declines are PUBLISHED (host-written flag=2); if EITHER side
+      declines BOTH fall back; every eligible call consumes one seq on both ranks
+      (launch alignment under any arm/decline mix). Decline cost = one host store.
+  (2) TMA-SYSMEM VISIBILITY RACE (the money receipt): the thief's GPU-side release
+      flag (ep_steal_flag_set after the GEMM) could beat its FINAL TMA sysmem
+      stores' arrival as observed by the PEER GPU'S gather — corruption signature:
+      only the thief's LAST-executed stolen items, first M-tile intact, rows >=64
+      stale (~50% zeros), victim side random per run. PR-4 never caught it (timing
+      + luck class). FIX: the done flag is published THROUGH THE HOST (CUDA event
+      synchronize, then a host store to the pinned flag) — host observation of
+      kernel completion guarantees global visibility of all its writes to any
+      observer of host memory. The wait is a LOCAL drain (own GPU), never
+      peer-coupled => cannot re-create the stagger class. NOTE: this receipt also
+      applies to the parked S2b armed path's flag ordering if ever revived.
+  (2b) SAME CLASS, SECOND INSTANCE: the hdr/X-ready flag (side-stream flag_set
+      after the async D2H copy) — the copy is executed by the DMA ENGINE, and an
+      SM-thread's st.release.sys does NOT order another agent's writes; stream
+      order only gates kernel START. Fixed identically (copy-event synchronize ->
+      host store). RULE OF THE RECEIPT: any cross-GPU handoff through host memory
+      must be published by the HOST after event-synchronize, never by a GPU flag.
+  (3) BLOCK_M ALIGNMENT CONTRACT: unaligned segments corrupt NEIGHBOR segments
+      through store-tile overhang — harmless intra-rank (later writes win,
+      deterministic) but CROSS-SIDE under the union split (the 25-89-row boundary
+      corruption with side-dependent stage/armed signatures). The e2e path is safe
+      by construction (_pad_grouped_input_for_asym BLOCK_M-aligns every segment);
+      the armed path MUST consume post-pad offsets, and the probe now does.
+  VERDICT: PR-5 PASS 8/8 runs, BITWISE on every case — balanced, 3:1 skew with
+  real cross-rank stealing + gather, published-decline fallback, ring/flag reuse.
+  The collective-free true-sEP transport is validated at kernel level.
+2026-07-09 S6 E2E WIRED + SMOKE B1 (logged before launch): frozen_linear armed hook
+  (post-pad pairs -> ep_sep.try_armed; falls through to queued/plain on decline),
+  fabric prebuild of sep_ctrl + X/D ring slots pre-seal (ASYM_EP_SEP_SLOT_ROWS
+  default 655360 x kmax 2048 = 43 GB fabric extra; oversize m => decline = sdp
+  floor), backends REPURPOSED per the plan: asym_sep2_cpuadamwds = TRUE sEP
+  (ASYM_EP_SEP=1), asym_sqep2_cpuadamwds = + queued unarmed launches; sdp2/sqdp2/
+  ep2 unchanged; drivers re-list sep2/sqep2 as their own canonicals (alias map,
+  family/deepspeed/ep2_enable lists, router allow-list), _source.sh synced.
+  SMOKE (asym_sep2 2048|8|1, MAX_STEPS=4): EXPECT ep_sep_installed both ranks;
+  armed > 0 (m/seg ~1k <= 4096 floor); steps 9-13 s (sdp2-natural 8.27 s + X-stage
+  D2H ~0.3-0.5 GB/launch + host event waits; the streaming win is NOT expected at
+  e2e s2048 — fwd GEMMs are a small step fraction; this smoke is about CORRECTNESS
+  + protocol overhead); loss overlay vs the study's sdp2 s2048 rows <= 0.01.
+  RED FLAGS: NaN/overlay miss (transport corruption — kill immediately), > 15 s
+  (serialization — check spin_wait_s + declined stats), sEP hdr spin timeout,
+  ep_sep_install_FAILED, C-OOM (fabric cap: 99+43=142 < 160).
+2026-07-09 ===== S6 E2E MILESTONE: FIRST TRUE-sEP TRAINING RUN PASSES =====
+  asym_sep2_cpuadamwds @ 2048|8|1 (install fix: slots CREATED pre-seal, INSTALLED
+  post-seal — pinnedness arrives with the fabric's single register):
+  ep_sep_installed both ranks; steps 13.4/11.5/13.0/9.8 s (B1 band 9-13 ✓;
+  protocol overhead over sdp2's 8.27 as predicted); LOSS OVERLAY <= 0.0035 at
+  EVERY step vs the canonical s2048 reference — with union work-sharing live in
+  the training loop. The collective-free true-sEP stack now exists end to end:
+  micro receipts -> PR-5 bitwise transport -> e2e correctness.
+  REMAINING (staged in S6, next session): armed/steal stats into the heartbeat;
+  bank-affinity ordering (close the 2.80->2.01 micro gap); parity rows 20k/60k
+  (must tie sdp2 within 2% via the decline floor); the STREAMING-WIN rows
+  (short-seq / large-E, where the 2.6x micro receipt predicts the e2e payoff);
+  sqep2 combined mode; scout port; per-rank streamed-bank-bytes receipt.
+2026-07-09 S6 20K PARITY ROW BANKED: asym_sep2 @ 20000|8|1 = 56.9 s steady
+  (56.7/56.9/57.2) vs sdp2 natural 55.7 (+2.2%, inside session noise; vs banked
+  56.4 queue-era +0.9%); losses overlay <= 0.004. THE DECLINE FLOOR HOLDS AT
+  COMPUTE-BOUND SCALE (every launch declines via two host stores — no vanilla-
+  class behavior possible by construction). G2 parity gate: PASS-within-noise.
+  NEXT (S6 continues): streaming-win rows (short-seq / large-E), armed-stats
+  heartbeat, bank-affinity ordering, sqep2 mode, 60k parity, scout port.
+2026-07-10 ===== TIER-2 GAMMA SWEEP BANKED: QUEUE FLAT ACROSS THE SEVERITY LADDER ====
+  (user directive: 3-tier imbalance methodology — tier 1 real-trace replay [have],
+  tier 2 gamma-sharpened real distribution [NEW: counts^gamma renorm — the
+  literature-standard Zipf-shaping, preserves the recorded gradual multi-expert
+  shape; RUNS token form gX in the bench alphas list], tier 3 single-hot-alpha
+  bound [have]. Real-shape receipt: q3 natural is GRADUAL tilt — top1 only
+  2.9-4.2% (3.7-5.4x uniform), top-32 experts ~= half the traffic; gamma ladder:
+  top1 4->8->15->37% at gamma 1/1.5/2/3.)
+  RESULTS (worst layer, 5.12M rows; wall ms | imbalance; s6_micro_gamma.json):
+    gamma  owned         sdp           sep-planner    QUEUE
+    1.0    16.7 | .25    16.0 | .003   19.2 | .03     15.1 | .038
+    1.5    17.8 | .36    19.0 | .003   30.9 | .22     14.8 | .004
+    2.0    19.4 | .48    28.1 | .010   48.9 | .40     14.6 | .004
+    3.0    22.0 | .70    58.0 | .002   109.9| .63     14.7 | .001
+  READS: (1) QUEUE DEAD FLAT 15.1->14.7 ms across the whole realistic ladder
+  (slightly faster at high gamma — fewer hot banks = streaming locality);
+  (2) sdp collapses 3.6x at gamma=3 DESPITE perfect row balance (imb .002) — the
+  mega-segment kernel tail: intra-rank scheduling matters independently of
+  cross-rank balance, and only the queue provides it; (3) owned hot-side B
+  balloons to 1.3 GB (chunk re-streaming) vs queue consolidation; (4) planner
+  flavor confirmed structurally tail-prone (6.6x) — the queue-flavor decision
+  re-validated on the realistic knob. The 3-tier composite (real anchor +
+  gamma curve + alpha bound) is now fully measured at micro level; e2e gamma
+  knob (sharpened resampling in _compute_routing + |gX RUNS form) staged next.
+2026-07-10 GAMMA SWEEP v2 — ROUTER-REALIZABLE CAP (user correction: with topk=8 an
+  expert appears at most once per token => top-1 share ceiling = 1/8 = 12.5%; the
+  gamma>=2 rows [15%/37%] exceed it and are RELABELED beyond-physical stress, never
+  quotable as routing): reran gamma in {1, 1.25, 1.5, 1.65, 1.8} = top1 {4.2, 6,
+  8.3, 10, 12}% (s6_micro_gamma_capped.json). WORST LAYER (wall ms | imb):
+    top1    owned          sdp            QUEUE
+    4.2%    16.7 | .25     16.0 | .000    14.6 | .008
+    6.0%    17.1 | .30     16.9 | .003    15.3 | .067
+    8.3%    17.8 | .36     19.0 | .004    14.8 | .003
+    10%     18.1 | .39     21.2 | .006    15.7 | .062
+    12%     18.6 | .42     23.9 | .005    15.2 | .099
+  VERDICT WITHIN PHYSICAL BOUNDS: queue flat ~15 ms across the ENTIRE realizable
+  range; sdp degrades 1.57x at the routing ceiling despite perfect row balance
+  (the mega-segment tail); owned 1.24x with idle up to 42%. Median layer milder
+  (all within ~10% — the advantage grows with tilt, costs ~nothing when calm).
+  Same cap applies to the alpha knob (alpha <= ~0.12 realizable): the banked
+  e2e 0.15/0.20 rows remain valid TIMING data but get the same stress label.
+2026-07-09 NAMING EPOCH 3 (user directive — honest taxonomy): asym_sep2/asym_sqep2
+  RENAMED to asym_sdp2_cpuadamwds / asym_sqdp2_cpuadamwds ("shared-bank streaming
+  DP" — the system is DP in compute; the EP-flavored parts are the single shared
+  expert bank + the dormant steal capability, and calling it EP was misleading).
+  Old names (sep2/sqep2/sqeq2, short + long) remain ACCEPTED ALIASES that
+  canonicalize to the new labels in run_lf_lora_sft.sh, so future runs land under
+  sdp2/sqdp2 dirs regardless of alias used. asym_ep2 (vanilla, owned+dispatch)
+  KEEPS its name — it is actually EP-shaped. Applied to both profile drivers
+  (alias map, family/deepspeed/ep2_enable lists, router allow-list) + runlf;
+  user's live _source.sh scratch preserved (surgical edits, no full copy).
+  ARTIFACT NOTE: every asym_sep2*/asym_sqep2* run dir predates this entry; new
+  runs produce asym_sdp2*/asym_sqdp2* dirs (no skip-collision across the rename).
 O4 DP2-ANCHOR B1 EXPECTATION (logged before launch): T_dp2 row (DDP, per-rank arenas,
   find_unused=true, save-on-cpu OFF throughput posture). EXPECT wall 62-78 s
   (~1.02-1.28xT1: dense precedent 1.12x-class + the MoE reducer over 3.375e9 grads;

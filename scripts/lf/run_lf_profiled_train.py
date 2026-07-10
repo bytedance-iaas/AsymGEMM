@@ -1712,9 +1712,40 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
                                 prebuilt += 1
                         heartbeat.emit("ep2_fg_bases_prebuilt", blocks=prebuilt)
                 fabric = get_fabric()
+                if fabric is not None and os.environ.get("ASYM_EP_SEP") == "1":
+                    # S6 true-sEP: ctrl + X/D staging slots MUST join the fabric
+                    # PRE-seal (one registered range; both ranks map the same file).
+                    from asym_gemm.training import ep_sep
+
+                    sep_rows = int(os.environ.get("ASYM_EP_SEP_SLOT_ROWS", "655360") or 655360)
+                    sep_kmax = 2048
+                    sep_ctrl = fabric.get_or_create(
+                        "sep_ctrl", torch.zeros(ep_sep.ctrl_ints_needed(), dtype=torch.int32))
+                    sep_xs = [[fabric.get_or_create(f"sep_x_{r}_{i}",
+                               torch.zeros(sep_rows * sep_kmax, dtype=torch.bfloat16))
+                               for i in range(ep_sep.RING)] for r in range(2)]
+                    sep_ds = [[fabric.get_or_create(f"sep_d_{r}_{i}",
+                               torch.zeros(sep_rows * sep_kmax, dtype=torch.bfloat16))
+                               for i in range(ep_sep.RING)] for r in range(2)]
+                    sep_all = [sep_ctrl] + [t for row_ in (sep_xs + sep_ds) for t in row_]
+                    self._asym_sep_pending = (sep_ctrl, sep_xs, sep_ds, sep_rows) \
+                        if all(t is not None for t in sep_all) else None
+                    if self._asym_sep_pending is None:
+                        heartbeat.emit("ep_sep_install_FAILED", reason="fabric slots unavailable")
                 if fabric is not None:
                     fabric.seal()
                     heartbeat.emit("ep2_fabric_sealed", **fabric.stats())
+                # install AFTER seal: the views become pinned only once the fabric's
+                # single cudaHostRegister covers the used range.
+                if getattr(self, "_asym_sep_pending", None) is not None:
+                    from asym_gemm.training import ep_sep as _ep_sep
+                    import torch.distributed as dist
+
+                    sc, sx, sd, sr = self._asym_sep_pending
+                    _ep_sep.install_buffers(rank=dist.get_rank(), world=dist.get_world_size(),
+                                            ctrl=sc, x_slots=sx, d_slots=sd)
+                    heartbeat.emit("ep_sep_installed", slot_rows=sr, ring=_ep_sep.RING)
+                    self._asym_sep_pending = None
                 self._asym_fabric_sealed = True
             init_dump_path = os.environ.get("ASYM_DUMP_ADAPTER_INIT", "")
             if init_dump_path and not Path(init_dump_path).exists():

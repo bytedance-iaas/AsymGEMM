@@ -956,7 +956,7 @@ backend_gpu_count() {
   local backend="$1"
   local model_gpu_count="$2"
   case "${backend}" in
-    asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds|asym_dp2_cpuadamwds|asym_ep2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds)
+    asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds|asym_dp2_cpuadamwds|asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds)
       # GB200 |2 family honors 2 GPUs (gb200_tp.md I0 un-collapses the cap).
       ((model_gpu_count == 2)) || die "backend '${backend}' requires a |2 model spec, got |${model_gpu_count}"
       printf '2\n' ;;
@@ -1142,7 +1142,7 @@ cpuadam_backend_for_label() {
   case "${1}" in
     asym_cpuadamwtorch) printf 'torch\n' ;;
     asym_cpuadamwds|asym_cpuadamwds_panvme|asym_cpuadamwds_actnvme|asym_cpuadamwds_bothnvme) printf 'deepspeed\n' ;;
-    asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds|asym_dp2_cpuadamwds|asym_ep2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds) printf 'deepspeed\n' ;;
+    asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds|asym_dp2_cpuadamwds|asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds) printf 'deepspeed\n' ;;
     *) return 1 ;;
   esac
 }
@@ -1208,6 +1208,10 @@ append_backend_spec() {
     asym_dp2_cpuadamwds) backend=asym_dp2_cpuadamwds ;;
     asym_ep2) backend=asym_ep2_cpuadamwds ;;
     asym_ep2_cpuadamwds) backend=asym_ep2_cpuadamwds ;;
+    asym_sdp2) backend=asym_sdp2_cpuadamwds ;;
+    asym_sdp2_cpuadamwds) backend=asym_sdp2_cpuadamwds ;;
+    asym_sqdp2) backend=asym_sqdp2_cpuadamwds ;;
+    asym_sqdp2_cpuadamwds) backend=asym_sqdp2_cpuadamwds ;;
     asym_sep2) backend=asym_sep2_cpuadamwds ;;
     asym_sep2_cpuadamwds) backend=asym_sep2_cpuadamwds ;;
     asym_sqep2|asym_sqeq2) backend=asym_sqep2_cpuadamwds ;;
@@ -3404,7 +3408,7 @@ run_job() {
   case "${backend}" in
     asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds) stp_enable=1 ;;
     asym_dp2_cpuadamwds) dp2_enable=1 ;;
-    asym_ep2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds) ep2_enable=1 ;;
+    asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds) ep2_enable=1 ;;
   esac
   if ((stp_enable || dp2_enable || ep2_enable)); then
     case "${gpu}" in
@@ -4581,7 +4585,7 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
               continue
             fi
             job_router_mode="${router_mode}"
-            if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" && "${backend}" != "asym_cpuadamwtorch" && "${backend}" != "asym_cpuadamwds" && "${backend}" != "asym_cpuadamwds_panvme" && "${backend}" != "asym_cpuadamwds_actnvme" && "${backend}" != "asym_cpuadamwds_bothnvme" && "${backend}" != "asym_stp_cpuadamwds" && "${backend}" != "asym_dp2_cpuadamwds" && "${backend}" != "asym_ep2_cpuadamwds" && "${backend}" != "asym_sep2_cpuadamwds" && "${backend}" != "asym_sqep2_cpuadamwds" && "${backend}" != "tp2_resident_cpuadamwds" && "${backend}" != "tp2_offstage_cpuadamwds" ]]; then
+            if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" && "${backend}" != "asym_cpuadamwtorch" && "${backend}" != "asym_cpuadamwds" && "${backend}" != "asym_cpuadamwds_panvme" && "${backend}" != "asym_cpuadamwds_actnvme" && "${backend}" != "asym_cpuadamwds_bothnvme" && "${backend}" != "asym_stp_cpuadamwds" && "${backend}" != "asym_dp2_cpuadamwds" && "${backend}" != "asym_ep2_cpuadamwds" && "${backend}" != "asym_sdp2_cpuadamwds" && "${backend}" != "asym_sqdp2_cpuadamwds" && "${backend}" != "asym_sep2_cpuadamwds" && "${backend}" != "asym_sqep2_cpuadamwds" && "${backend}" != "tp2_resident_cpuadamwds" && "${backend}" != "tp2_offstage_cpuadamwds" ]]; then
               if [[ "${router_hf_selected}" != "true" ]]; then
                 job_router_mode=hf
               else

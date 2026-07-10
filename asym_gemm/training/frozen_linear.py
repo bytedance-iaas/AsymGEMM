@@ -17,6 +17,7 @@ from .profile_ranges import is_profile_enabled, prof_range
 import os as _os
 
 _EP_QUEUED_ENABLED = _os.environ.get("ASYM_EP_QUEUED") == "1"
+_EP_SEP_ENABLED = _os.environ.get("ASYM_EP_SEP") == "1"  # S6 true-sEP union sharing
 # S5b diagnostics: host-block probe on the per-launch pad scalar read (ep_vanilla.py)
 _PAD_TIMING = bool(int(_os.environ.get("ASYM_EP_VANILLA_TIMING", "0") or 0))
 
@@ -795,6 +796,21 @@ def _asym_grouped_bf16_nt(
     a_kernel, offsets_kernel, unpad = _pad_grouped_input_for_asym(a, offsets, experts)
     d = torch.empty((int(a_kernel.shape[0]), n), device=a.device, dtype=output_dtype)
     offsets_i32, experts_i32, list_size = _group_metadata_tensors(offsets_kernel, experts, device=a.device)
+    if _EP_SEP_ENABLED:
+        # fix_gb200_ep.md S6 true-sEP: union work sharing over the shared bank.
+        # Consumes POST-PAD pairs (BLOCK_M-aligned — the PR-5 alignment contract).
+        # The .tolist() is a LOCAL drain (sdp-benign; no collective sits upstream).
+        from .ep_sep import state as _sep_state
+
+        _st = _sep_state()
+        if _st is not None:
+            pairs_cpu = offsets_i32[: 2 * (list_size - 1)].cpu().tolist()
+            ids_cpu = experts_i32[: list_size - 1].cpu().tolist()
+            segs = [(ids_cpu[i], pairs_cpu[2 * i], pairs_cpu[2 * i + 1])
+                    for i in range(list_size - 1)]
+            if _st.try_armed(asym_gemm, a_kernel, b_cpu, d, segs, compiled_dims, transpose_b):
+                d = _unpad_grouped_output(d, unpad, output_m=m)
+                return d
     if _EP_QUEUED_ENABLED:
         # fix_gb200_ep.md S2a: entry-pop queued variant over THIS rank's own list with a
         # private counter block (side fixed per rank; steal arrives at S2b). Zero-steal
