@@ -2,7 +2,7 @@
 
 Dispatches per-expert work between the CPU AMX path (via asym_gemm._cpu_C,
 which wraps the vendored cpu_gemm) and a GPU INT8 path (torch._int_mm,
-CUTLASS-backed). See docs/unified_moe.md for the design.
+CUTLASS-backed). See adaptive_dispatch.md at the repo root for the design.
 
 Both backends compute the same INT8 → INT32 → FP32 dequant contract:
 

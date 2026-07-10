@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Arch-aware AsymGEMM test runner.
 # Detects the current GPU's compute capability and runs only the test files
-# that apply to that arch. Prints a pass/fail summary at the end. See
-# docs/e2e_test.md for the full design rationale and arch→tests table.
+# that apply to that arch. Prints a pass/fail summary at the end. The
+# arch→tests table below is also documented in the top-level README.
 
 set -euo pipefail
 

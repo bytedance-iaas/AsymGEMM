@@ -10,7 +10,7 @@ Large MoE models (hundreds of billions of parameters) require many GPUs simply t
 
 ### Our Approach
 
-AsymGEMM eliminates this waste by keeping expert weights in CPU DRAM and fetching only active weight tiles into GPU shared memory on demand. The kernel issues direct loads from CPU memory (PCIe `cp.async` on SM89, NVLink-C2C TMA on SM100) — no host-side orchestration, no staging copies, no CPU involvement at runtime. The GPU drives the entire data movement autonomously at peak hardware bandwidth.
+AsymGEMM eliminates this waste by keeping expert weights in CPU DRAM and fetching only active weight tiles into GPU shared memory on demand. The kernel issues direct loads from CPU memory (PCIe `cp.async` on SM89, TMA over PCIe or NVLink-C2C on SM90 and SM100) — no host-side orchestration, no staging copies, no CPU involvement at runtime. The GPU drives the entire data movement autonomously at peak hardware bandwidth.
 
 To sustain high compute utilization despite the lower CPU→GPU bandwidth, we designed a **K-outer, M-inner kernel loop** that loads each weight tile exactly once and reuses it across all tokens assigned to that expert. The longer the input sequence, the more compute we extract per byte fetched from CPU — making the GPU nearly as efficient as if the weights were local.
 
@@ -73,6 +73,16 @@ AsymGEMM fixes pipeline depth to **2 stages** for asymmetric kernels and uses th
 
 For example, on SM100 with FP8 (229 KB smem), this allows BLOCK_K up to 512 elements — processing half the K dimension of a typical MoE layer (K=7168) in just ~14 tiles.
 
+### 4. Unified CPU + GPU MoE Execution — the Host as a Second Backend
+
+Once expert weights live in CPU DRAM, the CPU sitting next to them can compute too. The unified MoE runtime (`asym_gemm.unified_moe`) splits each MoE forward into two buckets that run **concurrently** over the same pinned INT8 weight bytes:
+
+- **CPU bucket** — experts with few routed tokens run on the host via the bundled `cpu_gemm` library (AMX INT8, with an AVX-512-VNNI fallback selected at runtime), on a work-stealing thread pool.
+- **GPU bucket** — the remaining experts run on the GPU INT8 asymmetric kernel; the GPU bucket is enqueued first so host AMX work hides under the GPU stream.
+
+This matters most at decode-like batch sizes, where the GPU's per-expert weight-fetch constant dominates: an expert with 4 routed tokens costs the GPU a full PCIe weight transfer, while the CPU reads the same bytes from local DRAM. Because the buckets overlap, the objective is not "pick the faster backend per expert" but minimizing the **makespan** — `max(T_cpu, T_gpu)` — over the whole routing histogram.
+
+Dispatch is a static token-count threshold by default (`m_cpu = 16`). In **adaptive mode**, a linear wall-time cost model per backend (intercept + per-expert + per-row terms, priors derived from the layer shape and nominal hardware rates) is fitted online from observed bucket timings, and each forward scans all prefix splits of the experts (sorted by token count) for the minimum predicted makespan. See [`adaptive_dispatch.md`](../adaptive_dispatch.md) for the full design.
 
 ---
 
