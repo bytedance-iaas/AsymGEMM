@@ -21,7 +21,7 @@ Cell format: maxB / sec-per-step (tok/s) at maxB.
   latencies come from the per-config anchor + the analytic attention split
       t_step(B, s) = t0 + c_g * T * (1 + k*s),   T = B*s,
       k = (2*L*h) / (2*P_active)   (attention-vs-GEMM FLOPs per seq-token)
-  '.' = not derivable from current artifacts (no ceiling yet / no anchor run).
+  '.' = not derivable yet (no ceiling / no confirm metrics recorded).
   'x' = slot above max seq (memory at B=1) or model context.
 """
 import json, re, sys
@@ -78,7 +78,9 @@ def parse_config_rows(path: Path):
 
 
 def load_results():
-    """name -> full results.jsonl row (dict) — last confirmed line wins."""
+    """name -> full results.jsonl row (dict) — last confirmed line wins.
+    FAILED rows (null ceiling_seq, written by aborted searches) are skipped:
+    they carry nothing the table can use and must not shadow real rows."""
     out = {}
     f = STATE / "results.jsonl"
     if f.exists():
@@ -86,6 +88,8 @@ def load_results():
             if not line.strip():
                 continue
             r = json.loads(line)
+            if r.get("ceiling_seq") is None:
+                continue
             if r.get("confirmed") or r["name"] not in out:
                 out[r["name"]] = r
     return out
@@ -93,7 +97,7 @@ def load_results():
 
 def t0_from_lat(leaf):
     f = leaf / "lat.md"
-    if f and f.exists():
+    if f.exists():
         for line in f.read_text().splitlines():
             if "optimizer/update side" in line:
                 try:
@@ -177,7 +181,7 @@ def main():
     for r in rows:
         print(" | ".join(cell.ljust(w[i]) for i, cell in enumerate(r)))
     print("\ncell = maxB / sec-per-step (tok/s) at maxB;  a = measured anchor;  "
-          ". = pending artifacts;  x = above max seq or context")
+          ". = pending confirm metrics;  x = above max seq or context")
 
     print("\nTHROUGHPUT (tok/s) at fixed sequence length (at maxB; ~batch-independent, t0 amortized)")
     tw = [max(len(r[i]) for r in trows + [hdr]) for i in range(len(hdr))]

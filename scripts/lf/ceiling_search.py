@@ -14,7 +14,7 @@ Algorithm per config:
   3. Bisect the bracket on the seq_resolution grid.
   4. Inner feasibility at a given seq: endpoint-first ladder search over ohbm.
      The ladder is ordered by HBM share, NOT by N:
-       share(0) = 0 (all roots to CPU), share(N) = 1/N  =>  0 < 8 < 4 < 3 < 2 < 1.
+       share(0) = 0 (all roots to CPU), share(N) = 1/N  =>  0 < 8 < 6 < 4 < 3 < 2 < 1.
      C_OOM -> jump to the max-share end (if that still C_OOMs, seq infeasible);
      G_OOM -> jump to share 0 (if that still G_OOMs, seq infeasible);
      otherwise shrink the window.
@@ -377,8 +377,8 @@ class Driver:
             "RUN_POST": "false",
             "OVERWRITE": "true",
             # dedicated root isolates probe artifacts from curated sweeps
-            # (normal profiling_both/ naming inside; OVERWRITE=true can only
-            # clobber other probes). RUN_NAME empty so an export can't relabel.
+            # (normal wrapper naming inside; OVERWRITE=true can only clobber
+            # other probes). RUN_NAME empty so an export can't relabel.
             "OUTPUT_ROOT": str(ROOT / "profiling_both_ceiling"),
             "RUN_NAME": "",
         })

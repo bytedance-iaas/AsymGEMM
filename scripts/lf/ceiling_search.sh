@@ -163,8 +163,8 @@ for row in "${CONFIGS[@]}"; do
   line+=", \"max_probes\": ${MAX_PROBES}, \"max_confirm_attempts\": ${MAX_CONFIRM_ATTEMPTS}"
   # NOTE: an extra-json "env":{...} REPLACES this block (JSON last-key-wins) --
   # re-include the watchdog + GPU_POOL keys there if you override env per row.
-  # GPU_POOL=0,1 serves both shapes: |1 rows take GPU 0, |2 rows (asym_ep2, fix_gb200_ep.md
-  # S4) need the same-superchip pair or the driver's pair guard kills the probe.
+  # GPU_POOL=0,1 serves both shapes: |1 rows take GPU 0; |2 rows (asym_ep2) need
+  # the same-superchip pair or the run_lf pair guard kills the probe.
   line+=", \"env\": {\"HOST_MEM_WATCHDOG_FLOOR_GB\": \"${WATCHDOG_FLOOR_GB}\", \"HOST_MEM_WATCHDOG_POLL_SECONDS\": \"${WATCHDOG_POLL_S}\", \"GPU_POOL\": \"${CEIL_GPU_POOL:-0,1}\"}"
   [[ -n "${extra}" ]] && line+=", ${extra}"
   line+="}"

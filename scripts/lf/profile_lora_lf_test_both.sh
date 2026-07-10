@@ -273,6 +273,23 @@ ASYM_OFFLOAD_X_UNPACKED=${ASYM_OFFLOAD_X_UNPACKED:-0}
 
 # Output and profiling
 OUTPUT_ROOT=${OUTPUT_ROOT:-}
+# ASYM_EP_STATS runs are capture runs, never quotable for timing: they get their
+# OWN output root (suffix _epstats) so stats and clean trees never mix; a
+# user-provided ASYM_EP_STATS_PATH becomes a post-run COPY target — the
+# histogram's canonical home is INSIDE the run dir (provenance).
+# Skewness experiments (env skew OR any RUNS row carrying a |<alpha>/|z<s> model
+# field) land in ONE dedicated tree so skewed and natural runs never mix.
+if [[ "${ASYM_EP_SKEW_HOT:-}" != "" || "${ASYM_EP_SKEW_ZIPF:-}" != "" ]] \
+   || [[ "${RUNS:-}" =~ [\|][0-9]+[\|](z[0-9.]+|0?[.][0-9]+)[[:space:]]*\; ]]; then
+  OUTPUT_ROOT="${SKEW_OUTPUT_ROOT:-$(pwd)/profiling_both_skew}"
+  echo "[driver] skew experiment detected -> output root '${OUTPUT_ROOT}'"
+fi
+ASYM_EP_STATS_COPY_TARGET=""
+if [[ "${ASYM_EP_STATS:-}" == "1" ]]; then
+  ASYM_EP_STATS_COPY_TARGET="${ASYM_EP_STATS_PATH:-}"
+  OUTPUT_ROOT="${EPSTATS_OUTPUT_ROOT:-$(pwd)/profiling_both_epstats}"
+  echo "[driver] ASYM_EP_STATS=1 -> output root '${OUTPUT_ROOT}' (capture run; timings not quotable)"
+fi
 PROFILE_LEVEL=${PROFILE_LEVEL:-op}
 PROFILE_LAYERS=${PROFILE_LAYERS:-all}
 PROFILE_MEMORY_BREAKDOWN=${PROFILE_MEMORY_BREAKDOWN:-true}
@@ -3903,6 +3920,9 @@ run_job() {
     run_env+=(ASYM_CPU_ADAMW_STEP_THREADS="${ASYM_CPU_ADAMW_STEP_THREADS:-32}")
   fi
 
+  if [[ "${ASYM_EP_STATS:-}" == "1" ]]; then
+    run_env+=(ASYM_EP_STATS_PATH="${seq_root}/ep_hist.json")
+  fi
   local -a run_cmd=(env)
   run_cmd+=("${run_env[@]}" "${RUN_LF_SCRIPT}")
 
@@ -3957,6 +3977,11 @@ run_job() {
   if [[ "${status}" == "130" || "${status}" == "143" ]]; then
     echo "Interrupted run; exiting without scheduling more jobs." >&2
     exit "${status}"
+  fi
+  if [[ "${ASYM_EP_STATS:-}" == "1" && -n "${ASYM_EP_STATS_COPY_TARGET}" && -f "${seq_root}/ep_hist.json" ]]; then
+    mkdir -p "$(dirname "${ASYM_EP_STATS_COPY_TARGET}")"
+    cp -f "${seq_root}/ep_hist.json" "${ASYM_EP_STATS_COPY_TARGET}" \
+      && echo "  ep_hist copied -> ${ASYM_EP_STATS_COPY_TARGET}"
   fi
   if ((status == 0)); then
     if [[ ! -f "${profile_json}" ]]; then

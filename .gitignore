@@ -45,7 +45,7 @@ submodules/
 agent/archive/
 profiling*/
 test_profiling*/
-results/
+datasets/
 reports/
 third-party/
 outputs/

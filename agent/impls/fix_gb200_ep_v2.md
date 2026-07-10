@@ -86,16 +86,24 @@ C4  E2E ZIPF SAMPLER (asym_gemm/training/qwen3_moe.py, _compute_routing)
       loss finite; no shape/recompute errors.
 
 C5  FILL TABLE 1 (after C1+C2; GPUs 2,3; ~25 min):
-      HIST=profiling_gb200ep_sg/ep_hist_q3_s20000.json \
+      HIST=profiling_both_epstats/ep_hist_q3_s20000.json \
       ALPHAS=z0,z0.5,z0.8,z1.0,z1.5,z2.0,natural \
       MODES=owned,owned_smart,queue SEEDS=3 MTOTAL=5120000 REPS=3 GPUS=2,3 \
-      OUT=profiling_gb200ep_sg/table1_micro.json \
+      OUT=profiling_both_skew/table1_micro.json \
       bash scripts/testing/ep_balance_bench.sh
-    (natural columns = worst + median layers of HIST, as today.)
+    (natural columns = worst + median layers of HIST, as today. Regenerate the
+    histogram any time: ASYM_EP_STATS=1 on a |1 capture run — artifacts land in
+    profiling_both_epstats/ automatically; ASYM_EP_STATS_PATH is an optional
+    extra COPY destination, the canonical file lives inside the run dir.)
 
 C6  FILL TABLE 2 (after C3+C4; GPUs 0,1; one invocation per system, z-rows
-    chained in one RUNS string; /dev/shm cleanup before/after each):
-      OUTPUT_ROOT=$PWD/profiling_gb200ep_sg MAX_STEPS=4 WARMUP_STEPS=1 \
+    chained in one RUNS string; /dev/shm cleanup before/after each).
+    OUTPUT ROUTING (driver-automatic, 2026-07-10): any invocation whose RUNS rows
+    carry a |<alpha> or |z<s> model field (or skew envs) is AUTO-routed to
+    profiling_both_skew/ (override: SKEW_OUTPUT_ROOT); ASYM_EP_STATS=1 capture
+    runs are auto-routed to profiling_both_epstats/. Plain runs use OUTPUT_ROOT
+    as given — skewed, capture, and natural trees can never mix.
+      OUTPUT_ROOT=$PWD/profiling_both_skew MAX_STEPS=4 WARMUP_STEPS=1 \
       PROFILERS=source ASYM_GC_SAVE_ON_CPU_OVERRIDE=false \
       ASYM_EXPACT_CPU_POOL_MAX_BYTES=96000000000 GPU_POOL=0,1 \
       RUNS='q3-30b-a3b|2|z0.5 ; asym_sqdp2_cpuadamwds|recomp-off-full-fg-ker101|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false || q3-30b-a3b|2|z0.8 ; ... || q3-30b-a3b|2|z1.0 ; ... || q3-30b-a3b|2|z2.0 ; ...' \
@@ -104,7 +112,7 @@ C6  FILL TABLE 2 (after C3+C4; GPUs 0,1; one invocation per system, z-rows
     - natural cells for sdp2/sqdp2 already exist; ep2's natural row carries the
       host-sync footnote (or waits for the sync-free rebuild).
 
-C7  ASSEMBLY: scripts/testing/print_skew_tables.py — reads table1_micro.json +
+C7  ASSEMBLY: scripts/testing/print_skew_tables.py — reads profiling_both_skew/table1_micro.json +
     the e2e run dirs, prints both tables as markdown (mean/worst for zipf cells,
     steady-mean steps 2-4 for e2e cells, tokens/s = 320000 x 2? NO — tokens/step
     = seq x batch x 2 ranks = 320k; tokens/s = 320000 / step_seconds).

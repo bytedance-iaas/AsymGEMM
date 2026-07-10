@@ -62,7 +62,7 @@ def _parse_args() -> argparse.Namespace:
     paths = parser.add_argument_group("paths")
     paths.add_argument("--lf-dir", required=True)
     paths.add_argument("--asym-dir", default=str(Path(__file__).resolve().parents[2]))
-    paths.add_argument("--results-root", default="")
+    paths.add_argument("--datasets-root", default="")
 
     model = parser.add_argument_group("model")
     model.add_argument("--model-name-or-path", default="Qwen/Qwen3-30B-A3B")
@@ -101,7 +101,7 @@ def _parse_args() -> argparse.Namespace:
     output.add_argument(
         "--audit-only",
         action="store_true",
-        help="Require existing train/eval files and only reprint validation/stats/results.",
+        help="Require existing train/eval files and only reprint validation/stats/records.",
     )
     output.add_argument(
         "--concat-to-len",
@@ -807,22 +807,22 @@ def _print_compact_samples(split: str, records: list[dict[str, Any]], limit: int
         )
 
 
-def _write_results(
+def _write_dataset_records(
     args: argparse.Namespace,
     manifest: dict[str, Any],
     token_stats: dict[str, Any],
     validation: dict[str, Any],
 ) -> Path:
-    results_root = Path(args.results_root) if args.results_root else Path(args.asym_dir) / "results"
+    datasets_root = Path(args.datasets_root) if args.datasets_root else Path(args.asym_dir) / "datasets"
     model_tag = _model_tag(args.model_name_or_path)
     dataset_root = f"{_dataset_family(args.train_name)}__lora__lf__{args.precision}"
     config = (
         f"{model_tag}__{args.train_name}__b{args.batch_size}_s{args.cutoff_len}_"
         f"r{args.lora_rank}_a{args.lora_alpha}"
     )
-    config_root = results_root / dataset_root / config
+    config_root = datasets_root / dataset_root / config
     dataset_dir = config_root / "dataset"
-    combined_dir = results_root / dataset_root / "combined"
+    combined_dir = datasets_root / dataset_root / "combined"
 
     _write_json(dataset_dir / "manifest.json", manifest)
     _write_json(dataset_dir / "token_stats.json", token_stats)
@@ -1120,13 +1120,13 @@ def main() -> None:
         "validation_ok": validation["ok"],
     }
     _write_manifest_file(data_dir, manifest)
-    config_root = _write_results(args, manifest, token_stats, validation)
+    config_root = _write_dataset_records(args, manifest, token_stats, validation)
 
     print(f"train_dataset={args.train_name}")
     print(f"eval_dataset={args.eval_name}")
     print(f"train_file={train_path}")
     print(f"eval_file={eval_path}")
-    print(f"results_config_dir={config_root}")
+    print(f"datasets_config_dir={config_root}")
     print(f"validation_ok={validation['ok']}")
     print(f"dataset_pool_rows={len(train_records)} min_dataset_rows={args.min_dataset_rows} (per-run count = LF --max_samples post-cap)")
     print(f"concat_to_len={args.concat_to_len} concat_active={concat_active}")
