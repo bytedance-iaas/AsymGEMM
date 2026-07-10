@@ -262,7 +262,7 @@ class CustomBuildExt(build_ext):
 if __name__ == '__main__':
     setuptools.setup(
         name='asym_gemm',
-        version='0.1.0',
+        version='0.2.0',
         ext_modules=get_ext_modules(),
         cmdclass={'build_py': CustomBuildPy, 'build_ext': CustomBuildExt},
     )
