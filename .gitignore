@@ -54,5 +54,6 @@ agent/overleaf/
 outputs/
 scripts/lf/ceiling_search_state/
 scripts/lf/ceiling_confirm_state/
+scripts/lf/ceiling_reconfirm_state/
 scripts/lf/ceiling_table.md
 scripts/lf/ceiling_table_record.md
