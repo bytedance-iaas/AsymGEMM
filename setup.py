@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import platform
 import setuptools
 import torch
 from setuptools import find_packages, Extension
@@ -14,8 +15,9 @@ from setuptools.command.build_ext import build_ext
 from pathlib import Path
 
 try:
-    from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME, include_paths as _torch_include_paths
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME, include_paths as _torch_include_paths
 except ImportError:
+    BuildExtension = None
     CUDAExtension = None
     CUDA_HOME = None
     _torch_include_paths = lambda: []
@@ -89,6 +91,9 @@ def build_cpu_gemm_lib():
     """Build csrc/cpu/cpu_gemm via its own CMakeLists, producing
     libcpu_gemm.a at a deterministic path. Idempotent — skips when the .a
     is newer than the newest cpu_gemm source file."""
+    if platform.machine() not in ('x86_64', 'AMD64', 'x64'):
+        print(f"[cpu_gemm] non-x86 host ({platform.machine()}) — skipping AMX/AVX CPU extension.")
+        return
     if not os.path.isdir(CPU_GEMM_SRC):
         raise RuntimeError(f"cpu_gemm sources not found at {CPU_GEMM_SRC}.")
 
@@ -162,31 +167,51 @@ def get_ext_modules():
         '-std=c++17', '-O3', '-fPIC',
         '-Wno-psabi', '-Wno-deprecated-declarations',
         f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}',
+        # gb200_tp.md I1 FIX A: context-INDEPENDENT runtime-API kernel loading
+        # (cudaLibraryLoadFromFile -> cudaKernel_t, materialized per-device on demand), so one
+        # process can launch the same JIT'd GEMM on BOTH GPUs. Requires CUDART >= 12.8.
+        '-DDG_JIT_USE_RUNTIME_API',
     ]
 
     exts = []
 
-    # CUDA extension (existing). Skipped if no CUDA toolkit is found, so the
-    # CPU-only path still produces an installable package.
+    # CUDA extension. Skipped if no CUDA toolkit is found, so the CPU-only path
+    # still produces an installable package. Includes the first-party SFT kernels
+    # (dropout / ep-steal / exp-act-offload / qwen3) compiled at build time.
     if CUDA_HOME is not None and CUDAExtension is not None:
         exts.append(CUDAExtension(
             name='asym_gemm._C',
-            sources=['csrc/python_api.cpp'],
+            sources=[
+                'csrc/python_api.cpp',
+                'csrc/dropout/dropout_mask.cu',
+                'csrc/ep_steal/ep_steal_sync.cu',
+                'csrc/exp_act_offload/exp_act_offload_kernels.cu',
+                'csrc/qwen3/qwen3_gate_up_windowed_bwd.cu',
+            ],
             include_dirs=[
                 f'{CUDA_HOME}/include',
                 f'{CUDA_HOME}/include/cccl',
-                'asym_gemm/include',
-                'third-party/cutlass/include',
-                'third-party/fmt/include',
+                os.path.join(current_dir, 'asym_gemm/include'),
+                os.path.join(current_dir, 'third-party/cutlass/include'),
+                os.path.join(current_dir, 'third-party/fmt/include'),
             ],
             libraries=['cudart', 'nvrtc'],
             library_dirs=[f'{CUDA_HOME}/lib64'],
-            extra_compile_args=cxx_flags,
+            extra_compile_args={
+                'cxx': cxx_flags,
+                'nvcc': [
+                    '-std=c++17', '-O3', '-Xcompiler', '-fPIC',
+                    f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}',
+                    '-DDG_JIT_USE_RUNTIME_API',
+                ],
+            },
         ))
 
-    # CPU extension (new). Always emitted; loads on any host, gates the AMX
-    # path at runtime via caps()['has_amx_int8'].
-    exts.append(get_cpu_extension())
+    # CPU extension (AMX INT8): x86-only. Skipped on non-x86 hosts (e.g. ARM /
+    # Grace-Blackwell) where the AVX/AMX intrinsics don't compile; the CUDA +
+    # SFT path is unaffected.
+    if platform.machine() in ('x86_64', 'AMD64', 'x64'):
+        exts.append(get_cpu_extension())
 
     return exts
 
@@ -246,7 +271,7 @@ class CustomBuildPy(build_py):
             shutil.copytree(source_asym_gemm_inc_dir, build_asym_gemm_inc_dir, dirs_exist_ok=True)
             print(f"Bundled project headers: {source_asym_gemm_inc_dir} -> {build_asym_gemm_inc_dir}")
 
-class CustomBuildExt(build_ext):
+class CustomBuildExt(BuildExtension):
     """Ensure libcpu_gemm.a exists before the _cpu_C extension is linked.
 
     `build_py` also calls build_cpu_gemm_lib(), but editable installs may
@@ -263,6 +288,8 @@ if __name__ == '__main__':
     setuptools.setup(
         name='asym_gemm',
         version='0.2.0',
+        packages=find_packages(),
         ext_modules=get_ext_modules(),
+        package_data={'asym_gemm': ['include/**/*']},
         cmdclass={'build_py': CustomBuildPy, 'build_ext': CustomBuildExt},
     )
