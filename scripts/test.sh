@@ -6,11 +6,24 @@
 
 set -euo pipefail
 
+# =============================================================================
+# User Parameters
+# =============================================================================
+PYTHON_BIN="${PYTHON_BIN:-python}"
+ACTIVATE_VENV="${ACTIVATE_VENV:-1}"
+
+# =============================================================================
+# Derived Parameters
+# =============================================================================
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TEST_DIR="$ROOT_DIR/tests"
+
+# =============================================================================
+# Main Logic
+# =============================================================================
 cd "$ROOT_DIR"
 
-if [[ -f .venv/bin/activate ]]; then
+if [[ "${ACTIVATE_VENV}" == "1" && -f .venv/bin/activate ]]; then
   source .venv/bin/activate
 fi
 
@@ -18,7 +31,7 @@ export PYTHONPATH="$ROOT_DIR:$TEST_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 # Detect SM via torch — already a hard dependency of asym_gemm, so this avoids
 # parsing nvidia-smi text and matches what asym_gemm.testing.get_arch_major uses.
-SM=$(python - <<'PY'
+SM=$("${PYTHON_BIN}" - <<'PY'
 try:
     import torch
     if torch.cuda.is_available():
@@ -57,7 +70,7 @@ for f in "${TESTS[@]}"; do
   echo "=========================================================="
   echo "Running: $f"
   echo "=========================================================="
-  if python "$f"; then
+  if "${PYTHON_BIN}" "$f"; then
     PASSED+=("$f")
   else
     FAILED+=("$f")

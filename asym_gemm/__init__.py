@@ -48,9 +48,6 @@ try:
                 )
             return _raise_missing
 
-        def _export_kernel_alias(alias_name, target_name):
-            globals()[alias_name] = globals().get(target_name, _missing_kernel(target_name))
-
         # DeepGEMM Kernels (may vary by build flags / arch)
         _maybe_import_from_C([
             # FP8 GEMMs
@@ -59,9 +56,28 @@ try:
             # FP4 GEMMs
             "m_grouped_fp4_asym_gemm_nt_contiguous",
             "m_grouped_fp4_asym_gemm_nt_masked",
+            # sEP queued grouped GEMM (gb200_ep.md E3)
+            "m_grouped_bf16_asym_gemm_nt_contiguous_ep_queued",
+            # sEP union-queue + steal grouped GEMM (fix_gb200_ep.md S2b)
+            "m_grouped_bf16_asym_gemm_nt_contiguous_ep_steal",
             # BF16 GEMMs
             "m_grouped_bf16_asym_gemm_nt_contiguous",
             "m_grouped_bf16_asym_gemm_nt_masked",
+            "sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous",
+            "sm100_m_grouped_bf16_cpu_left_pair_asym_gemm_nt_contiguous",
+            "sm100_grouped_lora_a_grad_bf16_cpu_right",
+            "sm100_grouped_lora_a_pair_grad_bf16_cpu_right",
+            "sm100_grouped_lora_b_backward_bf16_cpu_source",
+            # Qwen3 selected-recompute backward
+            "qwen3_gate_up_recompute_bwd_sm100_bf16_windowed",
+            "qwen3_moe_bf16_down_forward_scatter_add_",
+            "qwen3_moe_bf16_down_dx_gather_left_",
+            "qwen3_moe_bf16_gateup_dx_scatter_add_",
+            # Dropout mask helpers
+            "pack_bool_mask_2d",
+            "unpack_bool_mask_2d",
+            "apply_packed_dropout",
+            "apply_packed_dropout_",
             # INT8 GEMMs (SM90)
             "m_grouped_int8_asym_gemm_nt_contiguous",
             "m_grouped_int8_asym_gemm_nt_masked",
@@ -78,13 +94,6 @@ try:
             "transform_sf_into_required_layout",
             "get_mk_alignment_for_contiguous_layout",
         ])
-
-        # Some alias for legacy supports
-        # TODO: remove these later
-        _export_kernel_alias("fp8_m_grouped_asym_gemm_nt_masked", "m_grouped_fp8_asym_gemm_nt_masked")
-        _export_kernel_alias("fp8_m_grouped_gemm_nt_masked", "m_grouped_fp8_asym_gemm_nt_masked")
-        _export_kernel_alias("bf16_m_grouped_asym_gemm_nt_masked", "m_grouped_bf16_asym_gemm_nt_masked")
-        _export_kernel_alias("bf16_m_grouped_gemm_nt_masked", "m_grouped_bf16_asym_gemm_nt_masked")
 
     # Initialize CPP modules
     def _find_cuda_home() -> str:

@@ -8,10 +8,12 @@ dist
 *.pyc
 *.log
 *.ncu-rep
+*.nsys-rep
+*.sqlite
 __pycache__/
 
 # UV / venv
-.venv/
+.venv*/
 uv.lock
 
 # Third-party links created by `setup.py develop`
@@ -37,6 +39,25 @@ extern/
 external/
 vendor/
 submodules/
+# tests/
+
+# Local research/notes + profiling artifacts (kept on disk, not shipped)
+agent/
+archive/
+profiling*/
+datasets/
+reports/
+outputs/
+.aioenv/
+
+# third-party/: build submodules (cutlass, fmt), the README, and the bundled
+# LlamaFactory source are tracked; the user-installed dep repos (deepspeed,
+# Liger-Kernel) are not.
+third-party/*
+!third-party/README.md
+!third-party/cutlass
+!third-party/fmt
+!third-party/LlamaFactory
 
 # In-source CMake configure residue (never commit build state)
 CMakeCache.txt
