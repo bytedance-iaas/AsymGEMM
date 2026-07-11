@@ -166,7 +166,7 @@ class Config:
     template: str
     seq0: int
     ohbm0: int = 0
-    ohbm_ladder: list = field(default_factory=lambda: [0, 8, 6, 4, 3, 2, 1])
+    ohbm_ladder: list = field(default_factory=lambda: [0, 16, 8, 7, 6, 5, 4, 3, 2, 1])
     seq_step: int = 4000
     seq_resolution: int = 1000
     seq_min: int = 4000
@@ -359,6 +359,13 @@ class Driver:
         self.kill_grace = (120, 60)
         self.probe_dir = Path(args.state_dir) / "probes" / cfg.name
         self.probe_dir.mkdir(parents=True, exist_ok=True)
+        # Artifacts root follows the row's pinned profiler + host tag (both
+        # injected into env{} by ceiling_search_{source,both}.sh), so per-host
+        # searches never mix artifact roots. Fallbacks: wrapper default (both)
+        # and the local hostname.
+        _prof = str(cfg.env.get("PROFILERS") or "both")
+        _host = str(cfg.env.get("HOST_TAG") or os.uname().nodename.split(".")[0])
+        self.artifacts_root = ROOT / f"profiling_{_prof}_ceiling_{_host}"
 
     def say(self, msg: str):
         print(f"[{self.cfg.name}] {msg}", flush=True)
@@ -379,7 +386,7 @@ class Driver:
             # dedicated root isolates probe artifacts from curated sweeps
             # (normal wrapper naming inside; OVERWRITE=true can only clobber
             # other probes). RUN_NAME empty so an export can't relabel.
-            "OUTPUT_ROOT": str(ROOT / "profiling_both_ceiling"),
+            "OUTPUT_ROOT": str(self.artifacts_root),
             "RUN_NAME": "",
         })
         env.update({k: str(v) for k, v in self.cfg.env.items()})
@@ -734,7 +741,7 @@ class Driver:
             leaf = None
             for prof in ("source", "nsys"):
                 cands = sorted(
-                    (ROOT / "profiling_both_ceiling").glob(
+                    self.artifacts_root.glob(
                         f"{run_glob}/{backend}*__{prof}__{recompute}__*/b{batch}_s{seq}_ga{ga}"),
                     key=lambda p: p.stat().st_mtime)
                 if cands:
@@ -800,7 +807,8 @@ def load_configs(path: Path) -> list[Config]:
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("configs", type=Path, help="JSONL config list")
-    ap.add_argument("--state-dir", default=str(ROOT / "scripts" / "lf" / "ceiling_search_state"))
+    ap.add_argument("--state-dir", required=True,
+                    help="ledger/probe state dir, e.g. scripts/lf/ceiling_search_state_<profiler>_<host>")
     ap.add_argument("--only", nargs="+", help="run only these config names")
     ap.add_argument("--dry-run", action="store_true", help="print plan + prior probe rows, no runs")
     ap.add_argument("--single", nargs=3, metavar=("NAME", "SEQ", "OHBM"),
