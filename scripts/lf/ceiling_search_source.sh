@@ -38,10 +38,13 @@ CONFIRM_TIMEOUT_S=${CONFIRM_TIMEOUT_S:-${PROBE_TIMEOUT_S}}
 MAX_PROBES=${MAX_PROBES:-40}               # live-run budget per config
 MAX_CONFIRM_ATTEMPTS=${MAX_CONFIRM_ATTEMPTS:-3}
 
-# run_lf host-mem watchdog (soft C-OOM). Injected into row env{} so it is part
-# of the config fingerprint: the floor moves the C-OOM boundary.
-WATCHDOG_FLOOR_GB=${WATCHDOG_FLOOR_GB:-35}
-WATCHDOG_POLL_S=${WATCHDOG_POLL_S:-0.05}
+# run_lf host-mem watchdog (soft C-OOM). Empty floor (default) = the per-model
+# map in run_lf_lora_sft.sh picks it (35/50/60G by model size) and the key is
+# omitted from row env{}; setting WATCHDOG_FLOOR_GB pins one value for all rows
+# and fingerprints it (the floor moves the C-OOM boundary). NOTE: map changes in
+# run_lf do NOT invalidate ledgers -- use a fresh state dir if you change it.
+WATCHDOG_FLOOR_GB=${WATCHDOG_FLOOR_GB:-}
+WATCHDOG_POLL_S=${WATCHDOG_POLL_S:-}   # empty = run_lf default; set to pin+fingerprint
 
 # Driver preflight.
 GPU_MAX_USED_MIB=${GPU_MAX_USED_MIB:-6000}
@@ -54,16 +57,16 @@ SETTLE_S=${SETTLE_S:-20}                     # pause after a failed probe
 # share never helps a G-OOM.
 CONFIGS=(
   # ---- asym_cpuadamwds | recomp-off-full-fg (dense ker000, routed MoE ker101) ----
-  # "65000 : 6 : q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
-  "165000 : 16 : q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
+  "174000 : 16 : q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"   # 1103s, C-898, G-183, C-OOM 175k [DONE]
+  # "65000 : 6 : q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false" # 1659s, C-897, G-183, C-OOM 66k [DONE]
   # "32000 : 0 : llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
   # "13000 : 0 : llama4-scout|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
   # "50000 : 0 : q2.5-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
   # "30000 : 0 : q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
 
   # ---- superoffload_mem | unsloth-off ----
-  # "128000 : 0 : q3-30b-a3b|1 ; superoffload_mem|unsloth-off-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
-  # "50000 : 0 : q3-32b|1 ; superoffload_mem|unsloth-off-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
+  # "128000 : 0 : q3-30b-a3b|1 ; superoffload_mem|unsloth-off-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false" # 532s, C-618, G-153, C-OOM 132k [DONE]
+  # "56000 : 5 : q3-32b|1 ; superoffload_mem|unsloth-off-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false" # 469s, C-874, G-181, G-OOM 57k [DONE]
   # "30000 : 0 : llama3.3-70b|1 ; superoffload_mem|unsloth-off-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
   # "13000 : 0 : llama4-scout|1 ; superoffload_mem|unsloth-off-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
   # "50000 : 0 : q2.5-32b|1 ; superoffload_mem|unsloth-off-ohbm{ohbm}|ligerloss1 ; {seq}|8|1 ; none|false|false|false|false|false"
@@ -96,9 +99,13 @@ for _nv in SEQ_STEP SEQ_RESOLUTION SEQ_MIN SEQ_MAX PROBE_STEPS CONFIRM_STEPS WAR
 done
 (( PROBE_STEPS >= 1 )) || die "PROBE_STEPS must be >= 1 (0 measured steps would fake-OK probes)"
 (( CONFIRM_STEPS >= PROBE_STEPS )) || die "CONFIRM_STEPS must be >= PROBE_STEPS"
-[[ "${WATCHDOG_FLOOR_GB}" =~ ^(0|[1-9][0-9]*)$ ]] || die "WATCHDOG_FLOOR_GB must be an integer GB, got '${WATCHDOG_FLOOR_GB}'"
-(( WATCHDOG_FLOOR_GB >= 1 )) || die "WATCHDOG_FLOOR_GB=0 disables the watchdog; the search relies on its soft C-OOM"
-[[ "${WATCHDOG_POLL_S}" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] || die "WATCHDOG_POLL_S must be seconds (fractions ok), got '${WATCHDOG_POLL_S}'"
+if [[ -n "${WATCHDOG_FLOOR_GB}" ]]; then
+  [[ "${WATCHDOG_FLOOR_GB}" =~ ^(0|[1-9][0-9]*)$ ]] || die "WATCHDOG_FLOOR_GB must be an integer GB, got '${WATCHDOG_FLOOR_GB}'"
+  (( WATCHDOG_FLOOR_GB >= 1 )) || die "WATCHDOG_FLOOR_GB=0 disables the watchdog; the search relies on its soft C-OOM"
+fi
+if [[ -n "${WATCHDOG_POLL_S}" ]]; then
+  [[ "${WATCHDOG_POLL_S}" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] || die "WATCHDOG_POLL_S must be seconds (fractions ok), got '${WATCHDOG_POLL_S}'"
+fi
 [[ "${PROFILERS}" =~ ^(source|nsys|both)$ ]] || die "PROFILERS must be source|nsys|both (single value), got '${PROFILERS}'"
 [[ "${HOST_TAG}" =~ ^[A-Za-z0-9._-]+$ ]] || die "HOST_TAG must be [A-Za-z0-9._-]+ (lands in dir names + env JSON), got '${HOST_TAG}'"
 OHBM_LADDER="${OHBM_LADDER// /}"
@@ -147,7 +154,10 @@ for row in "${CONFIGS[@]}"; do
   line+=", \"max_probes\": ${MAX_PROBES}, \"max_confirm_attempts\": ${MAX_CONFIRM_ATTEMPTS}"
   # extra-json "env":{...} REPLACES this block (last-key-wins): re-include the
   # watchdog + GPU_POOL + PROFILERS keys there. GPU_POOL=0,1 covers |1 and |2 rows.
-  line+=", \"env\": {\"HOST_MEM_WATCHDOG_FLOOR_GB\": \"${WATCHDOG_FLOOR_GB}\", \"HOST_MEM_WATCHDOG_POLL_SECONDS\": \"${WATCHDOG_POLL_S}\", \"GPU_POOL\": \"${CEIL_GPU_POOL:-0,1}\", \"PROFILERS\": \"${PROFILERS}\", \"HOST_TAG\": \"${HOST_TAG}\", \"DATASET_OVERWRITE\": \"false\"}"
+  wd_floor_kv=""
+  [[ -n "${WATCHDOG_FLOOR_GB}" ]] && wd_floor_kv="\"HOST_MEM_WATCHDOG_FLOOR_GB\": \"${WATCHDOG_FLOOR_GB}\", "
+  [[ -n "${WATCHDOG_POLL_S}" ]] && wd_floor_kv+="\"HOST_MEM_WATCHDOG_POLL_SECONDS\": \"${WATCHDOG_POLL_S}\", "
+  line+=", \"env\": {${wd_floor_kv}\"GPU_POOL\": \"${CEIL_GPU_POOL:-0,1}\", \"PROFILERS\": \"${PROFILERS}\", \"HOST_TAG\": \"${HOST_TAG}\", \"DATASET_OVERWRITE\": \"false\"}"
   [[ -n "${extra}" ]] && line+=", ${extra}"
   line+="}"
   printf '%s\n' "${line}" >> "${GEN}"

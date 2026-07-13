@@ -107,6 +107,10 @@ GENERIC_G_OOM = [
     # a failed cudaHostAlloc returns exactly this code, so it must rank BELOW
     # the host-side signatures; alone it still reads as device OOM
     r"cudaErrorMemoryAllocation",
+    # cuDNN workspace alloc failing at full HBM surfaces as INTERNAL_ERROR, not
+    # ALLOC_FAILED (seen at 184.0/184 GiB peak); ambiguous, so ranked last --
+    # host-side C-OOM signatures above always win when co-present
+    r"CUDNN_STATUS_INTERNAL_ERROR",
 ]
 
 
@@ -177,7 +181,7 @@ class Config:
     probe_timeout_s: int = 5400
     confirm_timeout_s: int = 10800
     max_probes: int = 40
-    max_confirm_attempts: int = 10  # budget of LIVE confirm-length runs
+    max_confirm_attempts: int = 10  # max CONSECUTIVE failed confirm-length runs (a confirm OK resets the streak)
     env: dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -575,6 +579,11 @@ class Driver:
                 raise SearchAbort(f"UNKNOWN twice at seq={seq} ohbm={ohbm} ({entry['signal']}); "
                                   f"inspect {entry['log']}")
         self.ledger.record(entry)
+        if kind == "confirm" and outcome == OK:
+            # consecutive-failure budget: a confirmed OK proves the boundary is
+            # workable, so the failure streak resets instead of counting toward
+            # the give-up threshold (only continuous confirm failures abort)
+            self.live_confirms = 0
         return outcome
 
     # ---------------- inner ohbm feasibility ----------------
