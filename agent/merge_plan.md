@@ -178,3 +178,37 @@ So this is a textbook 3-way merge with merge-base c70c9a1:
   improvising.
 
 ## RUN LOG (append-only: iteration -> what failed -> what changed)
+
+  2026-07-13 EXECUTED (Claude, host + asym_sft_39 container):
+  - S1 pre-merge commit 240be99, tag pre-merge-sft38. S2 fetch OK
+    (merge-base = c70c9a1 as predicted). S3 merge: ONLY .gitignore
+    conflicted, as predicted. S4: took THEIRS' .gitignore verbatim;
+    `git check-ignore` confirmed their `ceiling*/**` covers our
+    ceiling_confirm_state/ (our line dropped). S6 merge commit d31e522,
+    parents 240be99 + ead5d01.
+  - DEVIATION at S5: the two whitelisted scripts (ceiling_reconfirm_state/
+    extract_metrics.py, numa_leak_monitor.sh) do NOT exist in SFT-38 at
+    all — neither tracked in ead5d01 nor on its disk. Nothing to verify or
+    copy; their .gitignore whitelist lines are anticipatory. Skipped all
+    host-specific run-state dirs per S5.
+  - Verification round 1: all host checks OK; all 17 container syntax
+    checks OK (bash -n x6, py_compile x11); watchdog block eyeballed —
+    unmapped model hard-errors exit 2 at run_lf_lora_sft.sh:240.
+  - Verification round 2: all host checks OK; 17/17 container checks OK.
+    CHECKLIST PASSED TWICE IN A ROW.
+  - Post-merge WORKLOAD TESTS (user-requested, all inside asym_sft_39,
+    GPUs 2,3; torch 2.12.0+cu130, 4 GPUs visible):
+      * import smoke: ep_sep/ep_vanilla/frozen_linear/qwen3_moe all import
+        clean under .venv python.
+      * arg-parse smoke: ceiling_search.py --help and
+        build_lf_sft_eval_pair.py --help OK. ceiling_table.py exits 1
+        "no ceiling_search_state_*/results.jsonl" — its own graceful
+        no-data path (state dirs deliberately not copied), NOT a bug.
+      * ep_sep_probe.py --gpus 2,3: PR5_PASS bitwise=True for BOTH
+        --mode queue and --mode plan (arm/decline/steal/gather all fire).
+      * ep_balance_bench.sh (q3-30b-a3b, worst layer, natural+a0.15,
+        modes owned/plan/queue, m=1.28M smoke): completes rc=0, sane
+        imbalance/timing numbers, JSON written.
+      * merged watchdog negative test: MODEL_NAME_OR_PATH=fake/Unmapped
+        HOST_MEM_WATCHDOG=true -> error + exit 2 before any launch.
+    ALL WORKLOAD TESTS PASS.
