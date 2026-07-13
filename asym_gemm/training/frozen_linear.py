@@ -20,6 +20,38 @@ _EP_QUEUED_ENABLED = _os.environ.get("ASYM_EP_QUEUED") == "1"
 _EP_SEP_ENABLED = _os.environ.get("ASYM_EP_SEP") == "1"  # S6 true-sEP union sharing
 # S5b diagnostics: host-block probe on the per-launch pad scalar read (ep_vanilla.py)
 _PAD_TIMING = bool(int(_os.environ.get("ASYM_EP_VANILLA_TIMING", "0") or 0))
+# fix_ep (2026-07-11): sync-free padding — allocate at the host-computable upper
+# bound (m + groups*(BLOCK_M-1)) instead of reading the true padded total back
+# with .item(). TRIED AND REJECTED for ep2 (220.2 s vs 169.6 at 32k): losing the
+# already-padded early-return forces full pad work + fresh index tensors on
+# every backward call — allocator churn worse than the sync. Kept as a
+# receipted dead end; default OFF.
+_PAD_UPPER_BOUND = _os.environ.get("ASYM_PAD_UPPER_BOUND") == "1"
+# fix_ep miss probe: print one stack per unique pad-memo MISS site (diagnosis).
+_PAD_DEBUG = _os.environ.get("ASYM_PAD_DEBUG") == "1"
+_PAD_MISS_STACKS: set = set()
+
+# fix_ep (2026-07-11): LAYER-SCOPED pad-memo context. The fg entry points
+# rebuild offsets tensors per layer/phase (probe receipt: has_memo=False with
+# fresh tensor ids at qwen3_moe:2579/2606 + frozen_linear:1884), so
+# tensor-attached memos cannot hit there. Within ONE expert-layer invocation
+# every grouped call shares the same (m, offsets VALUES) — the vanilla branch
+# opens this context and the padder consults it by (block_m, m, device),
+# tensor identity be damned. Cleared on layer exit; GC-recompute re-opens it.
+import contextlib as _contextlib
+import threading as _threading
+
+_PAD_CTX = _threading.local()
+
+
+@_contextlib.contextmanager
+def pad_memo_context():
+    prev = getattr(_PAD_CTX, "memo", None)
+    _PAD_CTX.memo = {}
+    try:
+        yield
+    finally:
+        _PAD_CTX.memo = prev
 
 VALID_BACKENDS = ("asym", "torch")
 VALID_ASYM_PRECISIONS = ("bf16", "fp8", "fp4")
@@ -610,11 +642,25 @@ def _pad_grouped_input_for_asym(
     memo = getattr(offsets, "_asym_pad_memo", None)
     memo_key = (int(block_m), int(a.shape[0]), str(a.device))
     cached = None if memo is None else memo.get(memo_key)
+    ctx_memo = getattr(_PAD_CTX, "memo", None)
+    if cached is None and ctx_memo is not None:
+        # layer-scoped fallback (fix_ep): same layer => same offsets VALUES,
+        # even when the fg path rebuilt the tensor object.
+        cached = ctx_memo.get(memo_key)
     if cached is not None:
         total_padded, padded_offsets_long, safe_source_rows, valid_rows = cached
         if total_padded == int(a.shape[0]):
             return a, offsets, None
     else:
+        if _PAD_DEBUG:
+            import traceback
+
+            stack = "".join(traceback.format_stack(limit=8)[:-1])
+            key = hash(stack)
+            if key not in _PAD_MISS_STACKS:
+                _PAD_MISS_STACKS.add(key)
+                print(f"[pad-miss] m={int(a.shape[0])} offsets_id={id(offsets)} "
+                      f"has_memo={memo is not None}\n{stack}", flush=True)
         offsets_long = offsets.to(device=a.device, dtype=torch.long, non_blocking=True)
         starts = offsets_long[:-1]
         counts = (offsets_long[1:] - starts).clamp_min(0)
@@ -629,7 +675,18 @@ def _pad_grouped_input_for_asym(
 
         # PyTorch allocations still require a Python integer shape. Keep this to one
         # scalar read instead of the previous full offsets D2H copy and Python loops.
-        if _PAD_TIMING:
+        if _PAD_UPPER_BOUND:
+            # fix_ep (2026-07-11): host-computable ALLOCATION BOUND instead of the
+            # .item() sync (receipt: pad_item_s ~15 s/48-call window in ep2
+            # backward — memo misses on derived offsets tensors — feeding the
+            # inter-rank oscillation). The kernel reads TRUE segment bounds from
+            # the device offsets tensor; rows in [true_total, bound) are dead
+            # slack past the last segment (masked to zero, untouched by the
+            # kernel, dropped by unpad). Cost: the no-pad early-return cannot
+            # trigger (true total unknown host-side), so already-aligned inputs
+            # pay one extra masked copy per call.
+            total_padded = int(a.shape[0]) + num_groups * (int(block_m) - 1)
+        elif _PAD_TIMING:
             import time as _time
 
             _t0 = _time.perf_counter()
@@ -639,7 +696,7 @@ def _pad_grouped_input_for_asym(
             _ep_timing_add("pad_item_s", _time.perf_counter() - _t0)
         else:
             total_padded = int(padded_offsets_long[-1].item())
-        if total_padded == int(a.shape[0]):
+        if not _PAD_UPPER_BOUND and total_padded == int(a.shape[0]):
             if memo is None:
                 memo = {}
                 try:
@@ -648,6 +705,8 @@ def _pad_grouped_input_for_asym(
                     memo = None
             if memo is not None:
                 memo[memo_key] = (total_padded, offsets, None, None)
+            if ctx_memo is not None:
+                ctx_memo[memo_key] = (total_padded, offsets, None, None)
             return a, offsets, None
 
         padded_rows = torch.arange(total_padded, device=a.device, dtype=torch.long)
@@ -667,17 +726,47 @@ def _pad_grouped_input_for_asym(
                 memo = None
         if memo is not None:
             memo[memo_key] = (total_padded, padded_offsets_long, safe_source_rows, valid_rows)
+        if ctx_memo is not None:
+            ctx_memo[memo_key] = (total_padded, padded_offsets_long, safe_source_rows, valid_rows)
+
     padded = a.index_select(0, safe_source_rows)
     if padded.numel() > 0:
         padded = padded * valid_rows.reshape(-1, *([1] * (padded.dim() - 1))).to(dtype=padded.dtype)
 
     valid_padded_rows = torch.nonzero(valid_rows, as_tuple=False).flatten()
     original_rows = safe_source_rows.index_select(0, valid_padded_rows)
+    offsets_out = padded_offsets_long.to(device=offsets.device, dtype=offsets.dtype)
+    # fix_ep (2026-07-11): PRE-SEED the RETURNED padded-offsets tensor's memo
+    # with its aligned-case entry — backward re-pads saved (padded a, padded
+    # offsets) pairs OUTSIDE the layer context, and each such tensor paid one
+    # first-touch .item() drain mid-backward (oscillation food). The padded
+    # tensor is BLOCK_M-aligned by construction: the check is free.
+    try:
+        offsets_out._asym_pad_memo = {
+            (int(block_m), int(total_padded), str(a.device)):
+                (total_padded, offsets_out, None, None)
+        }
+    except Exception:
+        pass
     return (
         padded,
-        padded_offsets_long.to(device=offsets.device, dtype=offsets.dtype),
+        offsets_out,
         _GroupedPadding(padded_rows=valid_padded_rows, original_rows=original_rows),
     )
+
+
+def prewarm_pad_memo(offsets: torch.Tensor, experts: torch.Tensor, m_rows: int,
+                     *, device, dtype, block_m: int = 128) -> None:
+    """fix_ep D2: populate the pad memo BEFORE the vanilla-EP hidden allgather
+    enqueues. Runs the production padder on a ZERO-WIDTH dummy (m_rows, 0) — the
+    memo key is (block_m, m_rows, device), so every later real grouped call of
+    the layer (fwd base/LoRA + all bwd variants incl. GC recompute) hits the
+    cache and never host-syncs. The one .item() this costs happens while only
+    µs-class tiny-gather work is in the queue."""
+    if m_rows <= 0:
+        return
+    dummy = torch.empty((int(m_rows), 0), device=device, dtype=dtype)
+    _pad_grouped_input_for_asym(dummy, offsets, experts, block_m=block_m)
 
 
 def _unpad_grouped_output(
@@ -803,7 +892,11 @@ def _asym_grouped_bf16_nt(
         from .ep_sep import state as _sep_state
 
         _st = _sep_state()
-        if _st is not None:
+        # pre_gate declines on host ints BEFORE the .tolist() GPU sync — at
+        # decline-regime workloads (m/n_segs > MAX_MPE) the sync cost the whole
+        # backend +6.7 s/step at 20k for launches that could never arm.
+        if _st is not None and _st.pre_gate(int(a_kernel.shape[0]), int(a_kernel.shape[1]),
+                                            list_size - 1):
             pairs_cpu = offsets_i32[: 2 * (list_size - 1)].cpu().tolist()
             ids_cpu = experts_i32[: list_size - 1].cpu().tolist()
             segs = [(ids_cpu[i], pairs_cpu[2 * i], pairs_cpu[2 * i + 1])

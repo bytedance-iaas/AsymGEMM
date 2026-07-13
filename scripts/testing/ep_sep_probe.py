@@ -4,7 +4,10 @@ steal + gather, BITWISE check vs the plain contiguous kernel on each rank's own
 segments. Case 2 forces cross-rank imbalance (rank0 3x rows) so stealing + gather
 actually fire; 3 iterations exercise the ring + rotating flags.
 
-  .venv/bin/python scripts/testing/ep_sep_probe.py [--gpus 2,3]
+  .venv/bin/python scripts/testing/ep_sep_probe.py [--gpus 2,3] [--mode queue|plan]
+
+--mode plan validates the asym_sepplan2 flavor (count-computed cut, private
+counter blocks, fabricated meet point) over the SAME cases and bitwise check.
 """
 from __future__ import annotations
 
@@ -169,12 +172,13 @@ def parent(args) -> int:
     fd = os.open(shm(tag), os.O_CREAT | os.O_RDWR | os.O_EXCL, 0o600)
     os.ftruncate(fd, total)
     os.close(fd)
-    print(f"[parent] shm {total/1e9:.1f} GB, spawning on GPUs {args.gpus}")
+    print(f"[parent] shm {total/1e9:.1f} GB, mode={args.mode}, spawning on GPUs {args.gpus}")
     procs = []
     for rank in range(2):
         env = dict(os.environ)
         env["CUDA_VISIBLE_DEVICES"] = args.gpus.split(",")[rank]
         env["ASYM_EP_SEP"] = "1"
+        env["ASYM_EP_SEP_MODE"] = args.mode
         procs.append(subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), "--role", "child",
              "--rank", str(rank), "--tag", tag], env=env, cwd=REPO))
@@ -185,7 +189,7 @@ def parent(args) -> int:
         for r in range(2):
             verdict[f"rank{r}"] = json.load(open(shm(tag) + f".res{r}.json"))
         allbit = all(v["bitwise"] for r in verdict.values() for k, v in r.items() if k != "stats")
-        print(f"PR5_{'PASS' if (ok and allbit) else 'FAIL'} bitwise={allbit}")
+        print(f"PR5_{'PASS' if (ok and allbit) else 'FAIL'} mode={args.mode} bitwise={allbit}")
     finally:
         for f in os.listdir("/dev/shm"):
             if f.startswith(os.path.basename(shm(tag))):
@@ -202,6 +206,7 @@ def main() -> int:
     ap.add_argument("--rank", type=int, default=0)
     ap.add_argument("--tag", default="")
     ap.add_argument("--gpus", default="2,3")
+    ap.add_argument("--mode", default="queue", choices=["queue", "plan"])
     args = ap.parse_args()
     return child(args) if args.role == "child" else parent(args)
 

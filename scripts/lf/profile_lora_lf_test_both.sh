@@ -280,7 +280,7 @@ OUTPUT_ROOT=${OUTPUT_ROOT:-}
 # Skewness experiments (env skew OR any RUNS row carrying a |<alpha>/|z<s> model
 # field) land in ONE dedicated tree so skewed and natural runs never mix.
 if [[ "${ASYM_EP_SKEW_HOT:-}" != "" || "${ASYM_EP_SKEW_ZIPF:-}" != "" ]] \
-   || [[ "${RUNS:-}" =~ [\|][0-9]+[\|](z[0-9.]+|0?[.][0-9]+)[[:space:]]*\; ]]; then
+   || [[ "${RUNS[*]:-}" =~ [\|][0-9]+[\|](z[0-9.]+|0?[.][0-9]+)[[:space:]]*\; ]]; then
   OUTPUT_ROOT="${SKEW_OUTPUT_ROOT:-$(pwd)/profiling_both_skew}"
   echo "[driver] skew experiment detected -> output root '${OUTPUT_ROOT}'"
 fi
@@ -924,16 +924,23 @@ parse_model_spec() {
   else
     parsed_model_gpu_count=1
   fi
-  # optional 3rd field: artificial hot-expert skew alpha in [0,1) (HC-EP1 timing-only
-  # rows; 0/absent = natural routing). Row-scoped ASYM_EP_SKEW_HOT with implicit ACK.
+  # optional 3rd field: skew injection, timing-only rows with implicit ACK.
+  #   numeric fraction (0.10) -> legacy one-hot alpha (ASYM_EP_SKEW_HOT)
+  #   z<s>            (z0.8)  -> paper-standard Zipf draw (ASYM_EP_SKEW_ZIPF)
   parsed_model_skew=""
+  parsed_model_zipf=""
   if ((${#fields[@]} == 3)); then
     local skew="${fields[2]}"
     case "${skew}" in
       0|0.0|0.00|"") ;;  # natural
+      z*)
+        [[ "${skew}" =~ ^z([0-9]+(\.[0-9]+)?)$ ]] ||
+          die "model-spec zipf must be z<s> with s >= 0 (e.g. z0.8), got '${skew}' in '${spec}'"
+        parsed_model_zipf="${BASH_REMATCH[1]}"
+        ;;
       *)
         [[ "${skew}" =~ ^(0\.[0-9]+|\.[0-9]+)$ ]] ||
-          die "model-spec skew must be a fraction in [0,1) (e.g. 0.10), got '${skew}' in '${spec}'"
+          die "model-spec skew must be a fraction in [0,1) or z<s>, got '${skew}' in '${spec}'"
         parsed_model_skew="${skew}"
         ;;
     esac
@@ -960,7 +967,7 @@ backend_gpu_count() {
   local backend="$1"
   local model_gpu_count="$2"
   case "${backend}" in
-    asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds|asym_dp2_cpuadamwds|asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds)
+    asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds|asym_dp2_cpuadamwds|asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sepqueue2_cpuadamwds|asym_sepplan2_cpuadamwds)
       # GB200 |2 family honors 2 GPUs (gb200_tp.md I0 un-collapses the cap).
       ((model_gpu_count == 2)) || die "backend '${backend}' requires a |2 model spec, got |${model_gpu_count}"
       printf '2\n' ;;
@@ -1146,7 +1153,7 @@ cpuadam_backend_for_label() {
   case "${1}" in
     asym_cpuadamwtorch) printf 'torch\n' ;;
     asym_cpuadamwds|asym_cpuadamwds_panvme|asym_cpuadamwds_actnvme|asym_cpuadamwds_bothnvme) printf 'deepspeed\n' ;;
-    asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds|asym_dp2_cpuadamwds|asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds) printf 'deepspeed\n' ;;
+    asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds|asym_dp2_cpuadamwds|asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sepqueue2_cpuadamwds|asym_sepplan2_cpuadamwds) printf 'deepspeed\n' ;;
     *) return 1 ;;
   esac
 }
@@ -1216,10 +1223,13 @@ append_backend_spec() {
     asym_sdp2_cpuadamwds) backend=asym_sdp2_cpuadamwds ;;
     asym_sqdp2) backend=asym_sqdp2_cpuadamwds ;;
     asym_sqdp2_cpuadamwds) backend=asym_sqdp2_cpuadamwds ;;
-    asym_sep2) backend=asym_sep2_cpuadamwds ;;
-    asym_sep2_cpuadamwds) backend=asym_sep2_cpuadamwds ;;
-    asym_sqep2|asym_sqeq2) backend=asym_sqep2_cpuadamwds ;;
-    asym_sqep2_cpuadamwds|asym_sqeq2_cpuadamwds) backend=asym_sqep2_cpuadamwds ;;
+    asym_sepqueue2) backend=asym_sepqueue2_cpuadamwds ;;
+    asym_sepqueue2_cpuadamwds) backend=asym_sepqueue2_cpuadamwds ;;
+    asym_sepplan2) backend=asym_sepplan2_cpuadamwds ;;
+    asym_sepplan2_cpuadamwds) backend=asym_sepplan2_cpuadamwds ;;
+    # NAMING EPOCH 4 (2026-07-10): legacy sEP spellings canonicalize to sepqueue2
+    asym_sep2|asym_sqep2|asym_sqeq2) backend=asym_sepqueue2_cpuadamwds ;;
+    asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds|asym_sqeq2_cpuadamwds) backend=asym_sepqueue2_cpuadamwds ;;
     zero2) backend=zero2 ;;
     zero3) backend=zero3 ;;
     zero3_offload) backend=zero3_offload ;;
@@ -1321,7 +1331,7 @@ normalize_run_spec_entry() {
   fi
   parse_model_spec "${model_part}"
   # skew appended only when set so skewless rows keep their historical normalized form
-  normalized_model="${parsed_model_name}|${parsed_model_gpu_count}${parsed_model_skew:+|${parsed_model_skew}}"
+  normalized_model="${parsed_model_name}|${parsed_model_gpu_count}${parsed_model_skew:+|${parsed_model_skew}}${parsed_model_zipf:+|z${parsed_model_zipf}}"
   parsed_workload="$(parse_workload_tuple "${workload_part}")"
   parsed_policy="$(parse_exp_act_policy_tuple "${policy_part}")"
 
@@ -3412,7 +3422,7 @@ run_job() {
   case "${backend}" in
     asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds) stp_enable=1 ;;
     asym_dp2_cpuadamwds) dp2_enable=1 ;;
-    asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds) ep2_enable=1 ;;
+    asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sepqueue2_cpuadamwds|asym_sepplan2_cpuadamwds) ep2_enable=1 ;;
   esac
   if ((stp_enable || dp2_enable || ep2_enable)); then
     case "${gpu}" in
@@ -3482,6 +3492,10 @@ run_job() {
   if [[ -n "${ASYM_EP_SKEW_HOT:-}" ]]; then
     [[ "${ASYM_EP_SKEW_ACK:-0}" == "1" ]] || die "ASYM_EP_SKEW_HOT rows are loss-INVALID timing rows (HC-EP1); set ASYM_EP_SKEW_ACK=1"
     stp_tag="${stp_tag}_skew${ASYM_EP_SKEW_HOT//./}"
+  fi
+  if [[ -n "${ASYM_EP_SKEW_ZIPF:-}" ]]; then
+    [[ "${ASYM_EP_SKEW_ACK:-0}" == "1" ]] || die "ASYM_EP_SKEW_ZIPF rows are loss-INVALID timing rows; set ASYM_EP_SKEW_ACK=1"
+    stp_tag="${stp_tag}_zipf${ASYM_EP_SKEW_ZIPF//./}"
   fi
   local effective_policy_tuple="${expert_policy}|${ASYMM_EXPERT_ACT_OFFLOAD}|${ASYMM_ATTN_ACT_OFFLOAD}|${ASYMM_LAYER_ACT_OFFLOAD}|${ASYMM_LAYER_GC}|${ASYMM_ATTN_SDPA_RECOMPUTE}"
   if [[ "${effective_policy_tuple}" != "${requested_policy_tuple}" ]] && ! is_recomp_off_recompute "${recompute}"; then
@@ -3671,6 +3685,7 @@ run_job() {
     ASYM_EP_STATS="${ASYM_EP_STATS:-}"
     ASYM_EP_STATS_PATH="${ASYM_EP_STATS_PATH:-}"
     ASYM_EP_SKEW_HOT="${ASYM_EP_SKEW_HOT:-}"
+    ASYM_EP_SKEW_ZIPF="${ASYM_EP_SKEW_ZIPF:-}"
     ASYM_EP_SKEW_ACK="${ASYM_EP_SKEW_ACK:-}"
     EP_HOT_CHUNK_ROWS="${EP_HOT_CHUNK_ROWS:-}"
     DG_EP_QUEUE_GRID_PCT="${DG_EP_QUEUE_GRID_PCT:-}"
@@ -3909,7 +3924,7 @@ run_job() {
     # allreduce + shared /dev/shm weight fabric.
     # NAMING EPOCH 2026-07-08: the EP mode flags (ASYM_EP_VANILLA / ASYM_ARENA_SHM /
     # ASYM_EP_QUEUED) are derived AUTHORITATIVELY from the backend NAME inside
-    # run_lf_lora_sft.sh (asym_ep2=vanilla, asym_sep2=ownerless-plain, asym_sqep2=queue);
+    # run_lf_lora_sft.sh (asym_ep2=vanilla, asym_sepqueue2=raced steal, asym_sepplan2=planned cut);
     # the driver passes only the non-mode knobs.
     run_env+=(ASYM_DP=1 ASYM_EP2=1 ASYM_ARENA_SHM_CAP_GB="${ASYM_ARENA_SHM_CAP_GB:-160}")
     # torchrun defaults OMP_NUM_THREADS=1, starving each rank's DeepSpeedCPUAdam
@@ -4515,11 +4530,21 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
       # row-scoped skew: |skew field wins (implicit ACK — explicit param IS the intent);
       # rows without the field fall back to the invocation env (old behavior, ACK gated).
       [[ -n "${_ROW_SKEW_ENV_DEFAULT+x}" ]] || _ROW_SKEW_ENV_DEFAULT="${ASYM_EP_SKEW_HOT:-}"
+      [[ -n "${_ROW_ZIPF_ENV_DEFAULT+x}" ]] || _ROW_ZIPF_ENV_DEFAULT="${ASYM_EP_SKEW_ZIPF:-}"
       if [[ -n "${parsed_model_skew}" ]]; then
         ASYM_EP_SKEW_HOT="${parsed_model_skew}"
         ASYM_EP_SKEW_ACK=1
       else
         ASYM_EP_SKEW_HOT="${_ROW_SKEW_ENV_DEFAULT}"
+      fi
+      if [[ -n "${parsed_model_zipf}" ]]; then
+        ASYM_EP_SKEW_ZIPF="${parsed_model_zipf}"
+        ASYM_EP_SKEW_ACK=1
+      else
+        ASYM_EP_SKEW_ZIPF="${_ROW_ZIPF_ENV_DEFAULT}"
+      fi
+      if [[ -n "${ASYM_EP_SKEW_HOT}" && -n "${ASYM_EP_SKEW_ZIPF}" ]]; then
+        die "one-hot skew and zipf skew are mutually exclusive on a row"
       fi
       current_model_tag=$(basename "${current_model_name}" | tr '/:' '__')
       resolve_current_runtime_for_model "${current_model_name}"
@@ -4597,7 +4622,7 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
               continue
             fi
             job_router_mode="${router_mode}"
-            if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" && "${backend}" != "asym_cpuadamwtorch" && "${backend}" != "asym_cpuadamwds" && "${backend}" != "asym_cpuadamwds_panvme" && "${backend}" != "asym_cpuadamwds_actnvme" && "${backend}" != "asym_cpuadamwds_bothnvme" && "${backend}" != "asym_stp_cpuadamwds" && "${backend}" != "asym_dp2_cpuadamwds" && "${backend}" != "asym_ep2_cpuadamwds" && "${backend}" != "asym_sdp2_cpuadamwds" && "${backend}" != "asym_sqdp2_cpuadamwds" && "${backend}" != "asym_sep2_cpuadamwds" && "${backend}" != "asym_sqep2_cpuadamwds" && "${backend}" != "tp2_resident_cpuadamwds" && "${backend}" != "tp2_offstage_cpuadamwds" ]]; then
+            if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" && "${backend}" != "asym_cpuadamwtorch" && "${backend}" != "asym_cpuadamwds" && "${backend}" != "asym_cpuadamwds_panvme" && "${backend}" != "asym_cpuadamwds_actnvme" && "${backend}" != "asym_cpuadamwds_bothnvme" && "${backend}" != "asym_stp_cpuadamwds" && "${backend}" != "asym_dp2_cpuadamwds" && "${backend}" != "asym_ep2_cpuadamwds" && "${backend}" != "asym_sdp2_cpuadamwds" && "${backend}" != "asym_sqdp2_cpuadamwds" && "${backend}" != "asym_sepqueue2_cpuadamwds" && "${backend}" != "asym_sepplan2_cpuadamwds" && "${backend}" != "tp2_resident_cpuadamwds" && "${backend}" != "tp2_offstage_cpuadamwds" ]]; then
               if [[ "${router_hf_selected}" != "true" ]]; then
                 job_router_mode=hf
               else
