@@ -73,7 +73,7 @@ public:
                             get_env<int>("DG_JIT_CPP_STANDARD", 20));
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0) or get_env("DG_JIT_PTXAS_CHECK", 0))
             flags += " --ptxas-options=--verbose,--warn-on-local-memory-usage";
-        if (get_env("DG_JIT_WITH_LINEINFO", 0))
+        if (get_env("DG_JIT_WITH_LINEINFO", 1))
             flags += " -Xcompiler -rdynamic -lineinfo";
     }
 
