@@ -174,8 +174,9 @@ So this is a textbook 3-way merge with merge-base c70c9a1:
 ## ROLLBACK
 
   Anything unrecoverable goes wrong -> `git merge --abort` (mid-merge) or
-  `git reset --hard pre-merge-sft38` (post-commit), then report instead of
-  improvising.
+  `git reset --hard ep` (post-commit; the pre-merge tag was RENAMED
+  pre-merge-sft38 -> `ep` on 2026-07-13, see agent/tags.md), then report
+  instead of improvising.
 
 ## RUN LOG (append-only: iteration -> what failed -> what changed)
 
