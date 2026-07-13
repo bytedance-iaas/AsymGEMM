@@ -1559,8 +1559,18 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
         if model is None:
             return
         ga = int(getattr(getattr(trainer, "args", None), "gradient_accumulation_steps", 1) or 1)
-        if ga != 1:
-            raise RuntimeError("ASYM_EP2 grad allreduce requires gradient_accumulation_steps==1")
+        if ga > 1:
+            # ga>1 support (2026-07-10): micro-batch backwards accumulate LOCALLY;
+            # the ONE mean allreduce belongs on the accumulation boundary only
+            # (exactly DDP's no_sync-then-sync semantics: mean over ranks of each
+            # rank's accumulated sum). accelerate flips sync_gradients on the
+            # boundary micro-batch.
+            sync = getattr(getattr(trainer, "accelerator", None), "sync_gradients", None)
+            if sync is None:
+                raise RuntimeError(
+                    "ASYM_EP2 ga>1 requires trainer.accelerator.sync_gradients to gate the allreduce")
+            if not sync:
+                return
         if not getattr(trainer, "_ep2_shard_receipt_done", False):
             trainer._ep2_shard_receipt_done = True
             _ep2_shard_receipt(ts_args, ts_kwargs)
@@ -1717,7 +1727,15 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
                     # PRE-seal (one registered range; both ranks map the same file).
                     from asym_gemm.training import ep_sep
 
-                    sep_rows = int(os.environ.get("ASYM_EP_SEP_SLOT_ROWS", "655360") or 655360)
+                    # DEFAULT RIGHT-SIZED 2026-07-10 (was 655360 = the arming
+                    # ceiling): pinned slot bytes tax EVERY backward step even when
+                    # nothing arms — measured +5.9 s/step at 20k from the ~43 GB of
+                    # slots (fix_gb200_ep_v2 RUN LOG). 163840 = the 2k-class armed
+                    # regime (131072 slots) + 25% BLOCK_M-padding headroom — 131072
+                    # exactly was falsified: padding pushed 2k's m to ~139k and the
+                    # capacity check silently declined the backend's OWN home
+                    # regime. Raise the env for bigger armed workloads deliberately.
+                    sep_rows = int(os.environ.get("ASYM_EP_SEP_SLOT_ROWS", "163840") or 163840)
                     sep_kmax = 2048
                     sep_ctrl = fabric.get_or_create(
                         "sep_ctrl", torch.zeros(ep_sep.ctrl_ints_needed(), dtype=torch.int32))

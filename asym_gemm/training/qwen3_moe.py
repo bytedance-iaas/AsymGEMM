@@ -2810,14 +2810,44 @@ class AsymQwen3Experts(nn.Module):
         # S5b VANILLA-EP rung (ep_vanilla.py): allgather-dispatch -> owned-slice
         # partial over GLOBAL tokens -> reduce-scatter combine. Collectives are
         # unconditional per call so both ranks stay lockstep through GC recompute.
-        from .ep_vanilla import gather_moe_inputs, reduce_scatter_partial
+        # fix_ep D1 (Megatron-grade sync schedule, agent/impls/fix_ep.md): the BIG
+        # hidden allgather is deferred via hidden_provider until AFTER the layer's
+        # host reads (slice bounds + pad prewarm) — no CPU ever blocks on the peer
+        # mid-layer, which was the entire stagger pathology. Legacy order kept
+        # behind ASYM_EP_VANILLA_LEGACY_ORDER=1 for the A/B receipt.
+        import os as _os
+
+        from .ep_vanilla import (
+            gather_moe_hidden,
+            gather_moe_inputs,
+            gather_moe_routing,
+            reduce_scatter_partial,
+        )
+
+        from .frozen_linear import pad_memo_context
 
         local_tokens = hidden_states.shape[0]
-        hidden_g, idx_g, w_g = gather_moe_inputs(hidden_states, top_k_index, top_k_weights)
-        partial = self._forward_impl(hidden_g, idx_g, w_g)
+        if _os.environ.get("ASYM_EP_VANILLA_LEGACY_ORDER") == "1":
+            hidden_g, idx_g, w_g = gather_moe_inputs(hidden_states, top_k_index, top_k_weights)
+            partial = self._forward_impl(hidden_g, idx_g, w_g)
+        else:
+            idx_g, w_g = gather_moe_routing(top_k_index, top_k_weights)
+            # fix_ep: one pad .item() per LAYER — the context lets every grouped
+            # call of this invocation (fg entries rebuild offsets tensors) reuse
+            # the prewarm's metadata by VALUE key instead of tensor identity.
+            with pad_memo_context():
+                partial = self._forward_impl(
+                    hidden_states, idx_g, w_g,
+                    hidden_provider=lambda: gather_moe_hidden(hidden_states),
+                )
         return reduce_scatter_partial(partial, local_tokens)
 
-    def _forward_impl(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor, hidden_provider=None) -> torch.Tensor:
+        # fix_ep D1: with hidden_provider set (vanilla EP), `hidden_states` arrives
+        # as the LOCAL tensor (dtype/device donors only) and the GLOBAL gathered
+        # hidden is produced by the provider strictly AFTER the metadata host
+        # reads below — the layer's contract is "no host sync after the big
+        # collective enqueues".
         input_dtype = hidden_states.dtype
         ep_range = getattr(self, "ep_expert_range", None)
         with prof_range(self._forward_range("route_metadata")):
@@ -2834,6 +2864,11 @@ class AsymQwen3Experts(nn.Module):
                 if metadata.num_routes == 0:
                     # no tokens routed to this device's experts this microbatch: the
                     # partial is exactly zero (dX contribution zero; combine adds peer's).
+                    # The peer STILL enqueues its allgather — ours must too (NCCL
+                    # collectives must stay call-count aligned) even though the
+                    # result is unused.
+                    if hidden_provider is not None:
+                        hidden_provider()
                     return hidden_states.new_zeros(metadata.num_tokens, self.hidden_dim)
         with prof_range(self._forward_range("route_metadata", "dense_groups")):
             offsets, experts = make_dense_group_metadata(
@@ -2841,6 +2876,16 @@ class AsymQwen3Experts(nn.Module):
                 num_groups=self.num_experts,
                 device=hidden_states.device,
             )
+        if hidden_provider is not None:
+            # fix_ep D2: the pad memo's one .item() fires NOW (pre-collective,
+            # drains µs of tiny-gather work) via a zero-width dummy through the
+            # production padder; every later grouped call hits the memo.
+            from .frozen_linear import prewarm_pad_memo
+
+            prewarm_pad_memo(offsets, experts, int(metadata.num_routes),
+                             device=hidden_states.device, dtype=hidden_states.dtype)
+            with prof_range(self._forward_range("vanilla_hidden_allgather")):
+                hidden_states = hidden_provider()
         if self._uses_qwen3_moe_finegrained_offload():
             return self._forward_qwen3_moe_finegrained_offload(
                 hidden_states,
@@ -3072,7 +3117,8 @@ class _EpBalanceStats:
             report = {
                 "calls": self.calls,
                 "skew_hot": _EP_SKEW_HOT,
-                "loss_invalid": _EP_SKEW_HOT > 0,
+                "skew_zipf": _EP_SKEW_ZIPF,
+                "loss_invalid": _EP_SKEW_HOT > 0 or _EP_SKEW_ZIPF is not None,
                 "worst_layer_static_e2_device_share": max(agg) if agg else None,
                 "layers": layers,
             }
@@ -3083,12 +3129,24 @@ class _EpBalanceStats:
 
 
 _EP_SKEW_HOT = float(os.environ.get("ASYM_EP_SKEW_HOT", "0") or 0.0)
+_EP_SKEW_ZIPF_RAW = (os.environ.get("ASYM_EP_SKEW_ZIPF") or "").strip()
+_EP_SKEW_ZIPF: float | None = float(_EP_SKEW_ZIPF_RAW) if _EP_SKEW_ZIPF_RAW else None
 _EP_STATS = _EpBalanceStats() if os.environ.get("ASYM_EP_STATS") == "1" else None
 if _EP_SKEW_HOT > 0 and os.environ.get("ASYM_EP_SKEW_ACK") != "1":
     raise RuntimeError(
         "ASYM_EP_SKEW_HOT forces routing (loss-INVALID, timing-only rows; HC-EP1). "
         "Set ASYM_EP_SKEW_ACK=1 to acknowledge."
     )
+if _EP_SKEW_ZIPF is not None:
+    if os.environ.get("ASYM_EP_SKEW_ACK") != "1":
+        raise RuntimeError(
+            "ASYM_EP_SKEW_ZIPF forces routing (loss-INVALID, timing-only rows). "
+            "Set ASYM_EP_SKEW_ACK=1 to acknowledge."
+        )
+    if _EP_SKEW_HOT > 0:
+        raise RuntimeError("ASYM_EP_SKEW_HOT and ASYM_EP_SKEW_ZIPF are mutually exclusive")
+    if _EP_SKEW_ZIPF < 0:
+        raise RuntimeError(f"ASYM_EP_SKEW_ZIPF must be >= 0, got {_EP_SKEW_ZIPF}")
 
 _SKEW_SEED = 42  # fixed by design (2026-07-08): not configurable, not in run labels
 _SKEW_HOT_CACHE: dict[str, int] = {}
@@ -3106,6 +3164,31 @@ def _skew_hot_expert_for_layer(layer_key: str, num_experts: int) -> int:
         hot = int.from_bytes(digest[:8], "little") % max(1, num_experts)
         _SKEW_HOT_CACHE[layer_key] = hot
     return hot
+
+
+_SKEW_ZIPF_CACHE: dict[str, tuple[int, torch.Tensor]] = {}
+
+
+def _skew_zipf_state_for_layer(layer_key: str, num_experts: int) -> tuple[int, torch.Tensor]:
+    """Deterministic per-layer Zipf state: (draw seed, per-expert-ID weight vector).
+    Popularity ranks (share ~ 1/rank^s) are assigned to a fixed seed-42 shuffle of
+    the expert IDs — identical on every rank and across fwd/GC-recompute, and the
+    hot experts land on different owner-halves across layers."""
+    state = _SKEW_ZIPF_CACHE.get(layer_key)
+    if state is None:
+        import hashlib
+
+        digest = hashlib.sha256(f"{_SKEW_SEED}:zipf:{layer_key}".encode()).digest()
+        seed = int.from_bytes(digest[:8], "little") >> 1
+        gen = torch.Generator()
+        gen.manual_seed(seed)
+        perm = torch.randperm(num_experts, generator=gen)
+        shares = torch.arange(1, num_experts + 1, dtype=torch.float64).pow_(-float(_EP_SKEW_ZIPF or 0.0))
+        weights = torch.empty(num_experts, dtype=torch.float32)
+        weights[perm] = (shares / shares.sum()).to(torch.float32)
+        state = (seed, weights)
+        _SKEW_ZIPF_CACHE[layer_key] = state
+    return state
 
 
 class AsymQwen3MoeBlock(nn.Module):
@@ -3221,6 +3304,24 @@ class AsymQwen3MoeBlock(nn.Module):
                     hot = _skew_hot_expert_for_layer(self.profile_prefix, int(num_experts))
                     top_k_index = top_k_index.clone()
                     top_k_index.reshape(-1)[:n_force] = hot
+            if _EP_SKEW_ZIPF is not None:
+                # Paper-standard Zipf skew AFTER detach — forward values garbage, kernel
+                # work real. Expert popularity ~ 1/rank^s over a fixed seed-42 per-layer
+                # ID shuffle; every token draws top_k DISTINCT experts (multinomial
+                # without replacement), so routing stays legal at any s and the busiest
+                # expert self-saturates toward top_k/E. The generator is re-seeded per
+                # call from (seed, layer): fwd and GC-recompute draw identical picks.
+                num_experts = getattr(self.config, "num_experts", None) or int(
+                    getattr(self.gate, "num_experts", 0)
+                )
+                seed, weights = _skew_zipf_state_for_layer(self.profile_prefix, int(num_experts))
+                dev = top_k_index.device
+                gen = torch.Generator(device=dev)
+                gen.manual_seed(seed)
+                probs = weights.to(dev).expand(top_k_index.shape[0], -1)
+                top_k_index = torch.multinomial(
+                    probs, top_k_index.shape[-1], replacement=False, generator=gen
+                ).to(dtype=top_k_index.dtype)
             if _EP_STATS is not None:
                 num_experts = getattr(self.config, "num_experts", None) or int(top_k_index.max()) + 1
                 _EP_STATS.record(self.profile_prefix, top_k_index, int(num_experts))
