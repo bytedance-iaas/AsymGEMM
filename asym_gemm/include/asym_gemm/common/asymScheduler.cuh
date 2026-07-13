@@ -69,6 +69,10 @@ struct asymScheduler {
     uint32_t current_group_idx = 0;
     uint32_t blocks_perExpert = 0;
     uint32_t n_idx = 0;
+    // Local n-block index of THIS CTA's work item. Equals blockIdx.x in the static path;
+    // equals the popped item's n-block under the sEP queued kernel. All kernel-side uses of
+    // blockIdx.x-as-n-position must read this instead (epilogue store, transpose-B path).
+    uint32_t n_blk = 0;
     // Only used for masked layout
     uint32_t current_m_cumsum = 0;
     // Only used for k-grouped layout
@@ -77,33 +81,44 @@ struct asymScheduler {
 
     // ReSharper disable once CppPossiblyUninitializedMember
     __device__ __forceinline__ explicit asymScheduler(const uint32_t& shape_m, const uint32_t& shape_n,
-                                                  uint32_t* experts, uint32_t* offsets) {
+                                                  uint32_t* experts, uint32_t* offsets)
+        : asymScheduler(shape_m, shape_n, experts, offsets, blockIdx.y, blockIdx.x) {}
+
+    // sEP (gb200_ep.md E3): explicit-ids variant — the queued kernel pops a work item
+    // (segment, n-block) from shared coherent host counters instead of reading blockIdx.
+    // The default ctor above delegates with (blockIdx.y, blockIdx.x), so the static path
+    // is byte-identical.
+    // ReSharper disable once CppPossiblyUninitializedMember
+    __device__ __forceinline__ asymScheduler(const uint32_t& shape_m, const uint32_t& shape_n,
+                                                  uint32_t* experts, uint32_t* offsets,
+                                                  const uint32_t seg_idx, const uint32_t nblk_idx) {
         blocks_perExpert = ceil_div_device(shape_n, BLOCK_N);
+        n_blk = nblk_idx;
 
         if constexpr (kGemmType == GemmType::MGroupedMasked) {
             // DeepGEMM-style masked scheduler: `offsets` is reused as int32 masked_m[num_groups]
             // (token counts per group). `experts` is unused.
             // gridDim.y == num_groups (compile-time constant) so blockIdx.y IS the expert id.
             // shape_m == max_m (the fixed per-group M allocation, same for every group).
-            expert_id = blockIdx.y;
-            current_group_idx = blockIdx.y;
-            n_idx = blockIdx.x * BLOCK_N + shape_n * expert_id;
-            const int m_count = reinterpret_cast<const int*>(offsets)[blockIdx.y];
+            expert_id = seg_idx;
+            current_group_idx = seg_idx;
+            n_idx = nblk_idx * BLOCK_N + shape_n * expert_id;
+            const int m_count = reinterpret_cast<const int*>(offsets)[seg_idx];
             m_start = 0;
             m_end = ceil_div_device(static_cast<uint32_t>(m_count > 0 ? m_count : 0), BLOCK_M);
         } else {
-            expert_id = experts[blockIdx.y];
+            expert_id = experts[seg_idx];
             n_start = expert_id * blocks_perExpert;
 
             // offsets array is laid out as pairs: [start_0, end_0, start_1, end_1, ...]
-            // blockIdx.y indexes into the experts array; multiply by 2 to get offset pair index
-            uint32_t offset_pair_idx = blockIdx.y * 2;
+            // seg_idx indexes into the experts array; multiply by 2 to get offset pair index
+            uint32_t offset_pair_idx = seg_idx * 2;
             m_start = ceil_div_device(offsets[offset_pair_idx], BLOCK_M);
             m_end = ceil_div_device(offsets[offset_pair_idx + 1], BLOCK_M);
 
             // B is laid out as [group, n, k], so N offset must use expert_id (group id),
-            // not blockIdx.y (segment id in offsets/experts list).
-            n_idx = blockIdx.x * BLOCK_N + shape_n * expert_id;
+            // not seg_idx (segment id in offsets/experts list).
+            n_idx = nblk_idx * BLOCK_N + shape_n * expert_id;
             current_group_idx = expert_id;
         }
     }

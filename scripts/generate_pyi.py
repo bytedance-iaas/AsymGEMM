@@ -869,9 +869,12 @@ def generate_pyi_file_content(enhanced_results, module_name: str = 'my_module'):
     return '\n'.join(lines)
 
 
-def generate_pyi_file(name, root, output_dir='.'):
+def generate_pyi_file(name, root, output_dir='.', exclude_parts=()):
     func_index = build_cpp_function_index(root)
     results = extract_m_def_statements(root)
+    if exclude_parts:
+        results = [r for r in results
+                   if not any(part in Path(r.get('file', '')).parts for part in exclude_parts)]
 
     cpp_results = []
     for item in results:
