@@ -8,3 +8,5 @@ bash scripts/figures/plot_memory.sh
 
 bash scripts/figures/plot_util.sh
 
+bash scripts/figures/plot_ep_balance.sh
+

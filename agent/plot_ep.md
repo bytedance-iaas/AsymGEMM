@@ -141,6 +141,10 @@ Parse recipe (all eight files share the schema, verified 2026-07-13):
          z1.0: EP 255.8  sDP 199.0  plan 200.4  queue 198.5   imb 46%
          z1.5: EP 294.5  sDP 198.3  plan 208.8  queue 200.3   imb 66%
          z2.0: EP 328.7  sDP 202.5  plan 210.6  queue 201.6   imb 79%
+    MoE  z0.5: EP 527.6  sDP 492.3  plan 490.3  queue 491.6   imb 16%
+         z1.0: EP 582.6  sDP 491.0  plan 490.4  queue 489.3   imb 34%
+         z1.5: EP 644.6  sDP 493.0  plan 500.0  queue 490.4   imb 50%
+         z2.0: EP 706.1  sDP 498.8  plan 506.2  queue 494.2   imb 62%
 
   The visual story every figure must convey at a glance: EP's bars climb
   steeply with skew while ours (navy plan / teal queue) stay near-flat and
@@ -151,3 +155,46 @@ Parse recipe (all eight files share the schema, verified 2026-07-13):
   before touching the data.
 
 ## RUN LOG (append-only)
+
+- 2026-07-13 iter 1: installed fonts-urw-base35 (Nimbus Sans was missing ->
+  would have silently fallen back to DejaVu and failed the font check);
+  added FIGURE_PARAMS["ep_balance"] to constants.py; wrote plot_ep_balance.py
+  + .sh. Rendered 8/8 files, exit 0. Parsed means == answer key (two 0.1 ms
+  boundary-rounding diffs: q3-30b MoE z0.5 queue 86.5 vs 86.4, q3-235b GEMM
+  z0.5 queue 43.2 vs 43.3 — within the stated ±0.1). Imbalance labels kept
+  (13pt gray above EP bars — uncluttered). FAIL: left "Wall time (ms)" y-label
+  clipped at the figure edge on l4scout (3-digit y ticks eat the margin).
+- 2026-07-13 iter 2: constants ep_balance side_left_in 0.95->1.15,
+  mid_extra_in 0.35->0.55. Re-rendered; checklist PASS #1 on all four figures
+  (visual, item-by-item; edge-crop zoom confirmed no stray text; fonts
+  compared side-by-side vs memory_saving_hbm.png — same face/sizes).
+- 2026-07-13 pass #2 (independent re-verification): pixel-sampled all four
+  PNGs — exact BAR_NEUTRAL/BAR_NEUTRAL_CYAN/BAR_NAVY/BAR_TEAL hexes present in
+  bulk; all PNGs identical 3652x1200 (layout pixel-consistent across models);
+  all four PDFs render via pdftoppm and match the PNG content. Checklist has
+  passed twice in a row -> DONE. Also appended plot_ep_balance.sh to plot.sh.
+
+### 2026-07-13 addendum: per-bar reduction % labels (user request)
+
+- memory_saving_hbm: annotation changed from ours-only to CHAINED arrows —
+  every bar after the first shows red bold arrow-% vs the bar to its LEFT
+  (Act.Offload vs Recompute: 47/39/31/35/36 percent down; Ours vs Act.Offload:
+  unchanged 22/13/31/23/21). Sign-aware (up-arrow if a bar regresses). DRAM
+  figure deliberately untouched (annotate_saving stays False — it is the cost
+  figure). All five chain values hand-verified against MODELS data.
+- ep_balance figures: every non-EP bar gets reduction labels; colors = the
+  reference (in-panel key, left panel only): red = vs EP, dark blue = vs sDP.
+  sDP bar: one red label. sEP plan/queue: two label columns (red left, blue
+  right, +-0.010 data-unit offset). EP keeps its gray imbalance %. "0%" when
+  |delta| < 0.5%; sign-aware arrows (e.g. q35 GEMM z2.0 queue: dn16% vs EP,
+  up2% vs sDP — both verified by hand from the means).
+- iter 3 (horizontal 2-line stacks) FAILED visual check: adjacent stacks merge
+  into one blob when plan/queue bar tops are equal (all MoE panels).
+- iter 4: rotated all annotation text 90 deg (incl. the gray imbalance %),
+  y-headroom 1.15 -> 1.20, cap-to-label pad 0.014. Rotation makes each label
+  column ~1 glyph wide -> no collisions at any bar height. PASS #1: all four
+  read cleanly incl. worst case (q3-235b GEMM z2.0: three near-equal bars,
+  five distinct columns legible). PASS #2: re-render + pixel check (bar hexes
+  exact-match in bulk; ACCENT_RED/DARK_BLUE present — exact-match only in the
+  horizontal key since rotated glyphs are fully anti-aliased, as expected);
+  all PDFs re-render via pdftoppm and match; DRAM png confirmed unchanged.

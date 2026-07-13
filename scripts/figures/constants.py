@@ -175,6 +175,21 @@ FIGURE_PARAMS = {
         "axes_top": 0.86,
         "dpi": 200,
     },
+    "ep_balance": {
+        "height": 6,
+        "bar_width": 0.036,     # thickness of each of the 4 bars in a z-cluster
+        "intra_gap": 0.006,     # gap between adjacent bars WITHIN a cluster
+        "group_gap": 0.05,      # gap between z-clusters
+        "x_margin": 0.028,      # padding beyond the outermost bar edges
+        "panel_label_y": -0.155,  # "Expert GEMM"/"MoE Block" caption line (axes fraction)
+        "legend_y": 0.875,      # shared figure-level legend anchor (figure fraction)
+        "side_left_in": 1.15,   # left margin of panel A (y-label + 3-digit ticks), inches
+        "side_right_in": 0.18,  # right padding of panel B, inches
+        "mid_extra_in": 0.55,   # widens the mid gap so panel B's y-label fits
+        "axes_bottom": 0.21,
+        "axes_top": 0.86,
+        "dpi": 200,
+    },
     "timeline": {
         "width": 12,
         "c2c_width": 12,
