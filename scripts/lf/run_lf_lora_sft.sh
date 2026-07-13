@@ -218,9 +218,35 @@ INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
 #   triggers below HOST_MEM_WATCHDOG_FLOOR_GB. false or FLOOR_GB=0 disables.
 TRAIN_OOM_SCORE_ADJ=${TRAIN_OOM_SCORE_ADJ:-1000}
 HOST_MEM_WATCHDOG=${HOST_MEM_WATCHDOG:-true}
-HOST_MEM_WATCHDOG_FLOOR_GB=${HOST_MEM_WATCHDOG_FLOOR_GB:-35}
+# exact per-model floor (GB); unlisted model without an exported floor = hard error
+declare -A WATCHDOG_FLOOR_GB_BY_MODEL=(
+  ["Qwen/Qwen3-30B-A3B"]=35
+  ["Qwen/Qwen3-32B"]=35
+  ["Qwen/Qwen3.5-27B"]=35
+  ["Qwen/Qwen3.5-35B-A3B"]=35
+  ["Qwen/Qwen2.5-32B-Instruct"]=35
+  ["Qwen/Qwen2.5-72B-Instruct"]=50
+  ["meta-llama/Llama-3.3-70B-Instruct"]=50
+  ["meta-llama/Llama-4-Scout-17B-16E"]=50
+  ["Qwen/Qwen3.5-122B-A10B"]=50
+  ["Qwen/Qwen3-235B-A22B"]=60
+)
+if [[ -z "${HOST_MEM_WATCHDOG_FLOOR_GB:-}" ]]; then
+  if [[ "${HOST_MEM_WATCHDOG,,}" == "true" ]]; then
+    HOST_MEM_WATCHDOG_FLOOR_GB="${WATCHDOG_FLOOR_GB_BY_MODEL[${MODEL_NAME_OR_PATH}]:-}"
+    if [[ -z "${HOST_MEM_WATCHDOG_FLOOR_GB}" ]]; then
+      echo "error: no watchdog floor mapped for model '${MODEL_NAME_OR_PATH}'; add it to" \
+           "WATCHDOG_FLOOR_GB_BY_MODEL in run_lf_lora_sft.sh or export HOST_MEM_WATCHDOG_FLOOR_GB" >&2
+      exit 2
+    fi
+  else
+    HOST_MEM_WATCHDOG_FLOOR_GB=0  # watchdog disabled: floor unused
+  fi
+fi
 HOST_MEM_WATCHDOG_POLL_SECONDS=${HOST_MEM_WATCHDOG_POLL_SECONDS:-0.05}
-HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS=${HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS:-60}
+# kill fast: the watchdog line already recorded the C-OOM; a long grace lets the
+# kernel OOM killer win the race and wedge the GPU driver
+HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS=${HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS:-1}
 
 # =============================================================================
 # Derived Parameters

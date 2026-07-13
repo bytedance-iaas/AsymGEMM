@@ -6,12 +6,16 @@ Usage:
   python3 scripts/lf/ceiling_table.py <config-list> -v       # + fit diagnostics
   python3 scripts/lf/ceiling_table.py <config-list> --md PATH   # write the markdown elsewhere
   python3 scripts/lf/ceiling_table.py <config-list> --no-md     # stdout only
+  python3 scripts/lf/ceiling_table.py <config-list> --state-dir PATH  # read results from a
+      specific ceiling_search_state_<profiler>_<host> dir (default: the sole
+      state dir holding a results.jsonl; errors if none or several)
 
 <config-list> is either:
-  - a text file with rows in the ceiling_search.sh CONFIGS format
+  - a text file with rows in the ceiling_search_{source,both}.sh CONFIGS format
       seq0 : ohbm0 : model|gpus ; backend|recompute|liger ; {seq}|batch|ga ; flags[ : extra-json]
     ('#' comments and blank lines ignored), or
-  - ceiling_search.sh itself (the active rows of its CONFIGS array are parsed).
+  - ceiling_search_source.sh / ceiling_search_both.sh itself (the active rows
+    of its CONFIGS array are parsed).
 
 Row sort order: model, backend, config.
 Cell format: maxB / sec-per-step (tok/s) at maxB.
@@ -30,7 +34,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MD = Path(__file__).resolve().parent / "ceiling_table.md"
-STATE = ROOT / "scripts" / "lf" / "ceiling_search_state"
+STATE = None  # resolved in main(): --state-dir, else the sole ceiling_search_state_*/ with results
 
 SLOTS = [8000, 12000, 16000, 32000, 48000, 64000, 128000]
 # model shorthand -> (layers, hidden, active matmul params) for the attention split
@@ -118,13 +122,27 @@ def find_anchor(res):
 
 
 def main():
+    global STATE
     argv = sys.argv[1:]
     verbose = any(a in ("-v", "--verbose") for a in argv)
     md_path = None if "--no-md" in argv else DEFAULT_MD
     if "--md" in argv:
         md_path = Path(argv[argv.index("--md") + 1])
+    if "--state-dir" in argv:
+        STATE = Path(argv[argv.index("--state-dir") + 1])
+    else:
+        # auto-pick the sole ceiling_search_state_<profiler>_<host> with results
+        cands = sorted((ROOT / "scripts" / "lf").glob("ceiling_search_state_*/results.jsonl"))
+        if len(cands) == 1:
+            STATE = cands[0].parent
+        elif not cands:
+            sys.exit("error: no ceiling_search_state_*/results.jsonl found; pass --state-dir")
+        else:
+            sys.exit("error: multiple state dirs have results.jsonl; pass --state-dir:\n  "
+                     + "\n  ".join(str(c.parent) for c in cands))
     args = [a for i, a in enumerate(argv)
-            if not a.startswith("-") and (i == 0 or argv[i - 1] != "--md")]
+            if not a.startswith("-")
+            and (i == 0 or argv[i - 1] not in ("--md", "--state-dir"))]
     if not args:
         sys.exit(__doc__.strip())
     cfgs = list(parse_config_rows(Path(args[0])))
@@ -214,7 +232,7 @@ def main():
         lines += ["| " + " | ".join(r) + " |" for r in trows]
         if fit_notes:
             lines += ["", "## Fit constants", ""] + [f"- {n}" for n in fit_notes]
-        lines += ["", "Sources: everything from `ceiling_search_state/results.jsonl` "
+        lines += ["", f"Sources: everything from `{STATE.name}/results.jsonl` "
                       "(ceilings + recorded confirm metrics; each row's `artifact_dir` "
                       "points at the confirm artifacts). Re-run the command above to "
                       "refresh after new runs land.", ""]

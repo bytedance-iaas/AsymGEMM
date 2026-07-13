@@ -91,7 +91,7 @@ if [[ "${_RUNS_ENV_SET}" == "true" ]]; then
 else
   RUNS=(
     # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm8|ligerloss1 ; 68000|8|1 ; none|false|false|false|false|false" # xs, C-x, G-x, C-OOM 66k [DONE]
-    # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 172000|8|1 ; none|false|false|false|false|false" # xs, C-896, G-181, G-OOM 188k [IP]
+    # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false" # xs, C-896, G-181, G-OOM 188k [IP]
 
     # "q3-30b-a3b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 131000|8|1 ; none|false|false|false|false|false" # 532s, C-618, G-153, C-OOM 132k [DONE]
     # "q3-32b|1 ; superoffload_mem|unsloth-off-ohbm4|ligerloss1 ; 53000|8|1 ; none|false|false|false|false|false" # 444s, C-845, G-181, C-OOM 54k [DONE]
@@ -100,9 +100,9 @@ else
     # "q2.5-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 52000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
     # "q2.5-72b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
 
-    "q3-30b-a3b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # C-xxx, G-xxx, G-OOM 81k
-    "q3-32b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 49000|8|1 ; none|false|false|false|false|false" # G-OOM 50k
-    "llama3.3-70b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
+    # "q3-30b-a3b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # C-xxx, G-xxx, G-OOM 81k
+    # "q3-32b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 49000|8|1 ; none|false|false|false|false|false" # G-OOM 50k
+    # "llama3.3-70b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
     # "llama4-scout|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
     # "q2.5-32b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
     # "q2.5-72b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # G-OOM 41k

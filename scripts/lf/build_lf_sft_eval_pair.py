@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
+import os
 import csv
 import hashlib
 import io
@@ -436,10 +438,14 @@ def _concat_split(
 
 
 def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
+    # tmp + atomic replace: a concurrent reader (e.g. a trainer on another
+    # host tokenizing this dataset) never sees a truncated/partial file.
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    with tmp.open("w", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -589,7 +595,13 @@ def _write_stats_files(
 
 
 def _update_dataset_info(lf_dir: Path, train_name: str, eval_name: str) -> None:
+    # dataset_info.json is shared across machines (NFS repo): take an exclusive
+    # lock, re-read inside it, and replace atomically so concurrent builders
+    # on different hosts cannot drop each other's entries.
     info_path = lf_dir / "data" / "dataset_info.json"
+    lock_path = info_path.with_suffix(".json.lock")
+    lock_handle = lock_path.open("a+")
+    fcntl.flock(lock_handle, fcntl.LOCK_EX)
     info = json.loads(info_path.read_text(encoding="utf-8")) if info_path.exists() else {}
     entry = {
         "formatting": "sharegpt",
@@ -607,7 +619,11 @@ def _update_dataset_info(lf_dir: Path, train_name: str, eval_name: str) -> None:
     }
     info[train_name] = {"file_name": f"{train_name}.jsonl", **entry}
     info[eval_name] = {"file_name": f"{eval_name}.jsonl", **entry}
-    _write_json(info_path, info)
+    tmp_path = info_path.with_suffix(f".json.tmp.{os.getpid()}")
+    _write_json(tmp_path, info)
+    os.replace(tmp_path, info_path)
+    fcntl.flock(lock_handle, fcntl.LOCK_UN)
+    lock_handle.close()
 
 
 def _load_existing_jsonl(path: Path, tokenizer: Any) -> tuple[list[dict[str, Any]], list[int]]:
@@ -975,6 +991,13 @@ def main() -> None:
     train_build_rows = max(args.train_rows, args.min_dataset_rows)
     lf_dir = Path(args.lf_dir).resolve()
     data_dir = lf_dir / "data"
+    # Serialize concurrent builders of the same dataset name (shared NFS repo,
+    # e.g. two hosts probing the same model+seq): the loser blocks here, then
+    # sees the finished files and takes the use_existing path below instead of
+    # rewriting them mid-read. Lock is released on process exit.
+    data_dir.mkdir(parents=True, exist_ok=True)
+    build_lock = (data_dir / f".{args.train_name}.build.lock").open("a+")
+    fcntl.flock(build_lock, fcntl.LOCK_EX)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
     used_ids: set[str] = set()
     train_path = data_dir / f"{args.train_name}.jsonl"
