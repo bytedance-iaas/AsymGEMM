@@ -107,9 +107,7 @@ GENERIC_G_OOM = [
     # a failed cudaHostAlloc returns exactly this code, so it must rank BELOW
     # the host-side signatures; alone it still reads as device OOM
     r"cudaErrorMemoryAllocation",
-    # cuDNN workspace alloc failing at full HBM surfaces as INTERNAL_ERROR, not
-    # ALLOC_FAILED (seen at 184.0/184 GiB peak); ambiguous, so ranked last --
-    # host-side C-OOM signatures above always win when co-present
+    # cuDNN workspace alloc at full HBM reports INTERNAL_ERROR; ranked last
     r"CUDNN_STATUS_INTERNAL_ERROR",
 ]
 
@@ -580,10 +578,7 @@ class Driver:
                                   f"inspect {entry['log']}")
         self.ledger.record(entry)
         if kind == "confirm" and outcome == OK:
-            # consecutive-failure budget: a confirmed OK proves the boundary is
-            # workable, so the failure streak resets instead of counting toward
-            # the give-up threshold (only continuous confirm failures abort)
-            self.live_confirms = 0
+            self.live_confirms = 0  # streak budget: a confirm OK resets it
         return outcome
 
     # ---------------- inner ohbm feasibility ----------------

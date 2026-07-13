@@ -38,11 +38,8 @@ CONFIRM_TIMEOUT_S=${CONFIRM_TIMEOUT_S:-${PROBE_TIMEOUT_S}}
 MAX_PROBES=${MAX_PROBES:-40}               # live-run budget per config
 MAX_CONFIRM_ATTEMPTS=${MAX_CONFIRM_ATTEMPTS:-3}
 
-# run_lf host-mem watchdog (soft C-OOM). Empty floor (default) = the per-model
-# map in run_lf_lora_sft.sh picks it (35/50/60G by model size) and the key is
-# omitted from row env{}; setting WATCHDOG_FLOOR_GB pins one value for all rows
-# and fingerprints it (the floor moves the C-OOM boundary). NOTE: map changes in
-# run_lf do NOT invalidate ledgers -- use a fresh state dir if you change it.
+# empty = per-model map in run_lf_lora_sft.sh decides; set to pin one value for
+# all rows (fingerprinted; map changes do NOT invalidate ledgers)
 WATCHDOG_FLOOR_GB=${WATCHDOG_FLOOR_GB:-}
 WATCHDOG_POLL_S=${WATCHDOG_POLL_S:-}   # empty = run_lf default; set to pin+fingerprint
 

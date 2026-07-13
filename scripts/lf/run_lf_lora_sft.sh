@@ -218,12 +218,7 @@ INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
 #   triggers below HOST_MEM_WATCHDOG_FLOOR_GB. false or FLOOR_GB=0 disables.
 TRAIN_OOM_SCORE_ADJ=${TRAIN_OOM_SCORE_ADJ:-1000}
 HOST_MEM_WATCHDOG=${HOST_MEM_WATCHDOG:-true}
-# Per-model soft-OOM floor (GB): EXACT allowlist keyed by MODEL_NAME_OR_PATH.
-# Deliberately NO pattern/size matching -- fuzzy rules mislabel models. If the
-# model is not listed and no HOST_MEM_WATCHDOG_FLOOR_GB is exported, this is a
-# HARD ERROR: add the model below or export an explicit floor (explicit always
-# wins). The cushion must absorb the model's host-allocation bursts between
-# watchdog polls, which scale with total param count.
+# exact per-model floor (GB); unlisted model without an exported floor = hard error
 declare -A WATCHDOG_FLOOR_GB_BY_MODEL=(
   ["Qwen/Qwen3-30B-A3B"]=35
   ["Qwen/Qwen3-32B"]=35
@@ -249,10 +244,8 @@ if [[ -z "${HOST_MEM_WATCHDOG_FLOOR_GB:-}" ]]; then
   fi
 fi
 HOST_MEM_WATCHDOG_POLL_SECONDS=${HOST_MEM_WATCHDOG_POLL_SECONDS:-0.05}
-# 1s: once the watchdog fires, the C-OOM verdict is already recorded (classifier
-# reads the watchdog line, not trainer output), so kill fast -- a long grace lets
-# the interrupted trainer eat the remaining floor cushion and the kernel OOM
-# killer wins the race (wedges the GPU driver on 70B-class runs)
+# kill fast: the watchdog line already recorded the C-OOM; a long grace lets the
+# kernel OOM killer win the race and wedge the GPU driver
 HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS=${HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS:-1}
 
 # =============================================================================
