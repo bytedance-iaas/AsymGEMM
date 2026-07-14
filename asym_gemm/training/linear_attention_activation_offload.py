@@ -10,6 +10,9 @@ import torch
 from torch import nn
 from torch.autograd.graph import saved_tensors_hooks
 
+from .attention_activation_offload import _h2d_restage_stream
+from .decoder_activation_offload import _async_unpack_enabled
+
 
 _DEFAULT_SAVED_TENSOR_OFFLOAD_MIN_BYTES = 1 * 1024**2
 _DEFAULT_SAVED_TENSOR_OFFLOAD_DTYPES = frozenset({torch.bfloat16, torch.float16, torch.float32})
@@ -220,16 +223,31 @@ class LinearAttentionSavedTensorOffloadWrapper:
     def _unpack(self, packed: torch.Tensor | _SavedTensorOffloadHandle) -> torch.Tensor:
         if not isinstance(packed, _SavedTensorOffloadHandle):
             return packed
-        if packed.ready_event is not None:
-            packed.ready_event.synchronize()
         staged = torch.empty_strided(
             packed.original_shape,
             packed.original_stride,
             device=packed.original_device,
             dtype=packed.original_dtype,
         )
-        with torch.no_grad():
-            staged.copy_(packed.tensor, non_blocking=False)
+        if _async_unpack_enabled() and packed.tensor.is_pinned():
+            compute_stream = torch.cuda.current_stream(packed.original_device)
+            side = _h2d_restage_stream(packed.original_device)
+            if packed.ready_event is not None:
+                side.wait_event(packed.ready_event)
+            side.wait_stream(compute_stream)  # staged alloc ordering
+            with torch.no_grad(), torch.cuda.stream(side):
+                staged.copy_(packed.tensor, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(side)
+            compute_stream.wait_event(done)
+            staged.record_stream(side)
+            # keep the cpu buffer alive until the staged tensor dies (async copy source)
+            staged._asym_restage_keepalive = packed.tensor  # type: ignore[attr-defined]
+        else:
+            if packed.ready_event is not None:
+                packed.ready_event.synchronize()
+            with torch.no_grad():
+                staged.copy_(packed.tensor, non_blocking=False)
         self.unpack_calls += 1
         self.staged_bytes += packed.nbytes
         self.max_stage_bytes_live = max(self.max_stage_bytes_live, self.staged_bytes)

@@ -2988,7 +2988,11 @@ if is_cpuadam_zero_run && [[ "${CHECK_CPUADAM}" == "1" ]]; then
 fi
 
 if [[ "${BACKEND}" == "asym" && "${CHECK_ASYM_CALLS}" == "1" ]]; then
-  ASYM_CALL_CHECK_OUTPUT=$(python3 - "${LOG_FILE}" <<'PY'
+  # Under ASYM_GEMM_DISPATCH=staged every asym GEMM site intentionally dispatches to
+  # the native torch path (asym_*_calls==0 by design) — verify torch calls instead.
+  _asym_dispatch_effective="${ASYM_GEMM_DISPATCH:-${ASYM_GEMM_LF_CONFIG_ASYM_GEMM_DISPATCH:-}}"
+  ASYM_CALL_CHECK_OUTPUT=$(ASYM_CALL_CHECK_DISPATCH="${_asym_dispatch_effective}" python3 - "${LOG_FILE}" <<'PY'
+import os
 import re
 import sys
 
@@ -2996,7 +3000,8 @@ log_file = sys.argv[1]
 text = open(log_file, encoding="utf-8").read()
 matches = list(
     re.finditer(
-        r"AsymGEMM LoRA-SFT runtime: .*?asym_forward_calls=(\d+), asym_dx_calls=(\d+)",
+        r"AsymGEMM LoRA-SFT runtime: .*?asym_forward_calls=(\d+), asym_dx_calls=(\d+), .*?"
+        r"torch_forward_calls=(\d+), torch_dx_calls=(\d+)",
         text,
     )
 )
@@ -3004,12 +3009,26 @@ if not matches:
     raise SystemExit(f"Missing AsymGEMM runtime call report in {log_file}")
 forward_calls = int(matches[-1].group(1))
 dx_calls = int(matches[-1].group(2))
-if forward_calls <= 0 or dx_calls <= 0:
+torch_forward_calls = int(matches[-1].group(3))
+torch_dx_calls = int(matches[-1].group(4))
+staged = os.environ.get("ASYM_CALL_CHECK_DISPATCH", "").strip().lower() == "staged"
+if staged:
+    if torch_forward_calls <= 0 or torch_dx_calls <= 0:
+        raise SystemExit(
+            f"Expected positive staged (torch-dispatch) forward and dx calls, got "
+            f"torch_forward_calls={torch_forward_calls} torch_dx_calls={torch_dx_calls}"
+        )
+    print(
+        f"Verified staged-dispatch runtime calls: torch_forward_calls={torch_forward_calls} "
+        f"torch_dx_calls={torch_dx_calls} (asym calls 0 by design)"
+    )
+elif forward_calls <= 0 or dx_calls <= 0:
     raise SystemExit(
         f"Expected positive AsymGEMM forward and dx calls, got "
         f"asym_forward_calls={forward_calls} asym_dx_calls={dx_calls}"
     )
-print(f"Verified AsymGEMM runtime calls: asym_forward_calls={forward_calls} asym_dx_calls={dx_calls}")
+else:
+    print(f"Verified AsymGEMM runtime calls: asym_forward_calls={forward_calls} asym_dx_calls={dx_calls}")
 PY
   )
   echo "${ASYM_CALL_CHECK_OUTPUT}" | tee -a "${LOG_FILE}"

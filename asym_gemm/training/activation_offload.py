@@ -31,6 +31,40 @@ def _cpu_pool_max_bytes() -> int:
         return _DEFAULT_CPU_POOL_MAX_BYTES
 
 
+_DEFAULT_FG_ELEMENTWISE_CHUNK_MB = 1024  # probe-swept 2026-07-12: 1024 minimizes
+# reserved (fragmentation gap 21→5 GiB @120k); 512 and 2048 are both worse.
+
+
+def fg_elementwise_chunk_bytes() -> int:
+    """Staging-buffer byte budget for row-chunked fg elementwise phases (silu/mul,
+    silu backward, LoRA-B delta adds). 0 disables chunking (legacy full-width
+    staging). Chunking trades nothing but launch count: same copied bytes, same
+    FLOPs, but only chunk-sized HBM transients instead of full-width ones."""
+    raw = os.environ.get(
+        "ASYMM_FG_ELEMENTWISE_CHUNK_MB",
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_FG_ELEMENTWISE_CHUNK_MB"),
+    )
+    if raw is None or str(raw).strip() == "":
+        mb = _DEFAULT_FG_ELEMENTWISE_CHUNK_MB
+    else:
+        try:
+            mb = int(str(raw).strip())
+        except ValueError:
+            mb = _DEFAULT_FG_ELEMENTWISE_CHUNK_MB
+    return max(0, mb) * 1024 * 1024
+
+
+def fg_chunk_rows(total_rows: int, row_width: int, element_size: int = 2) -> int:
+    """Rows per chunk for fg elementwise chunking; 0 means do not chunk."""
+    budget = fg_elementwise_chunk_bytes()
+    if budget <= 0 or total_rows <= 0 or row_width <= 0:
+        return 0
+    rows = budget // max(1, row_width * element_size)
+    if rows >= total_rows:
+        return 0
+    return max(8192, int(rows))
+
+
 def _cpu_pool_cached_bytes() -> int:
     return sum(_tensor_nbytes(tensor) for tensors in _CPU_BUFFER_POOL.values() for tensor in tensors)
 
@@ -305,6 +339,15 @@ class ActivationOffloadManager:
                 stage.copy_(handle.tensor, non_blocking=handle.tensor.is_pinned())
         self._mark_stage_live(stage, stage_tag)
         return stage
+
+    def record_cpu_ready(self, handle: CPUActivationHandle) -> None:
+        """Register a cpu-ready event for a handle whose pinned tensor was filled by
+        chunked async D2H copies on the current stream (offload() records this event
+        itself; direct row writes must call this once after the last chunk)."""
+        if torch.cuda.is_available() and handle.tensor.is_pinned():
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream())
+            self._pending_cpu_ready_events[int(handle.tensor.data_ptr())] = event
 
     def stage_rows(self, handle: CPUActivationHandle, start: int, end: int, *, tag: str | None = None) -> torch.Tensor:
         self.wait_cpu_ready(handle)

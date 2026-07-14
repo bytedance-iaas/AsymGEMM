@@ -160,6 +160,40 @@ def _env_bool(name: str, default: bool) -> bool:
 _H2D_RESTAGE_STREAMS: dict[int, torch.cuda.Stream] = {}
 
 
+def _attn_lora_chunk_enabled() -> bool:
+    """Chunk the attention LoRA full-width delta/dx adds (probe flag, default off):
+    fwd `out = base + s@B^T` and bwd `d_u += dS@A` each materialize a [rows, width]
+    tensor (7.3 GiB for q_proj @120k b8). Chunking reuses fg_chunk_rows sizing."""
+    raw = os.environ.get(
+        "ASYMM_ATTN_ACT_LORA_CHUNK",
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_LORA_CHUNK"),
+    )
+    if raw is None or raw == "":
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _add_matmul_rows_(dest: torch.Tensor, lhs: torch.Tensor, rhs_t: torch.Tensor, *, scale: float = 1.0) -> None:
+    """dest += (lhs @ rhs_t) * scale, chunked over rows when the chunk budget allows."""
+    from .activation_offload import fg_chunk_rows
+
+    rows = int(dest.shape[0])
+    chunk = fg_chunk_rows(rows, int(dest.shape[1]), dest.element_size()) if _attn_lora_chunk_enabled() else 0
+    if chunk <= 0:
+        part = lhs @ rhs_t
+        if float(scale) != 1.0:
+            part = part * float(scale)
+        dest.add_(part.to(dtype=dest.dtype))
+        return
+    for row_start in range(0, rows, chunk):
+        row_end = min(rows, row_start + chunk)
+        part = lhs[row_start:row_end] @ rhs_t
+        if float(scale) != 1.0:
+            part = part * float(scale)
+        dest[row_start:row_end].add_(part.to(dtype=dest.dtype))
+        del part
+
+
 def _h2d_restage_stream(device: torch.device) -> torch.cuda.Stream:
     """Per-device side stream for backward restage copies (Megatron-style: the host never
     blocks on a copy; the compute stream waits on an EVENT instead)."""
@@ -657,8 +691,8 @@ class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function):
             backend=backend,
         )
         _record_attn_hbm_gemm(stats, f"{projection_role}.lora_b_forward")
-        delta = s @ b.t()
-        out = base + (delta * float(scaling)).to(dtype=base.dtype)
+        out = base
+        _add_matmul_rows_(out, s, b.t(), scale=float(scaling))
         s_handle = manager.offload(s.contiguous(), f"{projection_role}.S")
         _update_snapshot(snapshot, manager, attention_context)
 
@@ -735,7 +769,7 @@ class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function):
                 )
                 if d_s is not None:
                     _record_attn_hbm_gemm(stats, f"{role}.lora_input_grad")
-                    d_u = d_u + (d_s @ a).to(dtype=d_u.dtype)
+                    _add_matmul_rows_(d_u, d_s, a)
                 grad_x = d_u.to(dtype=ctx.input_dtype).reshape(ctx.input_shape)
 
             if needs_grad_a:

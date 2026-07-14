@@ -20,6 +20,14 @@ v2 changes (2026-07-09, after artifact re-verification):
 
 ---
 
+> **2026-07-09 UPDATE — Phase D executed (see `agent/impls/fix_throughput.md` Phase D
+> ledger + D6 close-out): flag-gated A/Bs landed. @32k×8 q3-30b the stack
+> `ASYM_GEMM_DISPATCH=staged` (+18.4 s solo, 0 HBM) + `ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM=1`
+> (+14.9 s solo, +1.7 GiB in-stack) + async GC unpack (null @32k, held for long-seq)
+> = **109.45 → 76.45 s (−30.2%), asym backward now faster than superoffload's**, gap
+> 1.64×→1.148×. U1/U2/U3 of §6 are now measured; the §0 numbers below are the pre-D
+> baseline kept for context.**
+
 ## 0. Ground truth (verified in artifacts, healthy-margin runs)
 
 ### 0.1 Standings (q3-30b-a3b b8; `lat.md`/`summary.md`, 4-sample means)
@@ -204,6 +212,75 @@ this orientation provably right.
   (blocking `synchronize()` today), per-phase direction budgets.
 
 ---
+
+## 2.5 THE TRADEOFF LEDGER — every memory↔latency decision axis, with measured prices
+
+The scheduler's raw material. Each axis: what it moves, which budget it charges, the
+measured price tag (q3-30b 80k×8 ohbm0 anchor unless noted), and its mode assignment.
+(2026-07-10; sources: Phase D/D11 ledger in `agent/impls/fix_throughput.md`, paper.md
+historical tables, status.md, D8/D9/D10 probes.)
+
+```text
+#  axis (knob)                          latency effect            memory effect            mode rule
+── ─────────────────────────────────── ───────────────────────── ──────────────────────── ─────────────
+A1 GEMM engine per site                 −46 s @80k / −18 @32k     +0 HBM measured, even    latency: staged
+   ASYM_GEMM_DISPATCH=asym|staged       (native vs ⅓-peak stream) at 3 GiB margin (D8)     memory: either (0-cost!)
+A2 Route-fused kernels (ker XYZ)        under staged: ker000      same HBM; ker101 avoids  follow dispatch:
+                                        −28 s @80k; under asym:   [R,H] intermediates      asym→101, staged→000
+                                        ker101 wins               under asym dispatch      (fp32-accum caveat A13)
+A3 Within-layer act round trip          −15 s @32k (bwd only)     +transient ≈ 3·[R,I]+    latency: on below s*
+   ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM     (skip D2H→H2D + waits)    [M,H]: 10 GB@32k,        (fit-check from linear
+                                                                  ~29@80k, ~73@131k        model); memory: off
+A4 GC-root share (ohbm N; share=1/N)    unsloth vs unsloth-off:   ±4.9 GB/layer-class      THE host↔HBM dial;
+                                        −87 s @80k (so rows)      HBM↔host; 60k q3-32b:    per-model winner from
+                                                                  ohbm8=host-OOM,          ceiling search
+                                                                  ohbm4=179 GiB HBM
+A5 Whole-layer recompute (unsloth GC)   +~1 fwd pass in bwd       −inner acts per layer    both modes today;
+   + save_on_cpu of recompute saves     (bwd/fwd 4–8×)            (the ceiling enabler)    finer λ = future
+A6 Per-class liveness λ                 small each                class bytes each:        memory: off/derive;
+   (X_UNPACKED/FG_DA_GPU compact X;     (FG_DA_GPU also           X [R,H]→[M,H] = 1/topk;  latency: derive+keep
+   ACT_RECOMPUTE; KEEP_DGRADS_HBM;      changes dA engine)        act one [R,I]            per headroom
+   S_* derive)
+A7 Optimizer/master/grad placement      GPU adam −7.4 s/step;     GPU adam +~40 GB HBM     latency: cpuadamw +
+   (asym_cpuadamwds vs GPU adam;        C0 async staging −5 s     (opt states); C0 staging async staging;
+   ASYM_CPU_ADAMW_ASYNC_GRAD_OFFLOAD)   class                     +7 GB pinned host        memory: + ASYNC=0
+                                                                  (broke the 60k probe!)   (the D9 fix)
+A8 Weight residency per module class    routed_experts vs all:    ±22.9 GiB persistent     memory: all;
+   (ASYM_OFFLOAD_MODULES)               −35% step (llama4 hist)   HBM (llama4 hist)        latency@short-s: subset
+A9 Transfer sync discipline             0 @32k (shadowed);        0 (pinned↔pageable       latency: on (free
+   (ASYM_SAVED_TENSOR_ASYNC_UNPACK:     candidate at long s       neutral, D8)             insurance); memory: off
+   pinned roots + side-stream restage)  (147 ms/layer fetches)
+A10 Host budgets & thrash guard         near-wall thrash: 2×      host caps: pool bytes,   both: margin ≥ 2×
+   (EXPACT_CPU_POOL_MAX_BYTES,          step (q3-32b 65k)         watchdog floor 35 GB     watchdog floor rule
+   HOST_MEM_WATCHDOG_FLOOR_GB)
+A11 Batch size B                        ~flat tok/s past knee     linear act bytes in B    B = B_knee(s) always;
+                                        (≤10–15% fixed-cost       (maxB ceiling = capacity maxB is a CAPACITY
+                                        amortization)             metric, not a lever)     metric only
+A12 Chunking (block-experts,            +launch overhead          caps live transients     memory extreme only
+   MLP_RECOMPUTE_CHUNK, liger loss)     (usually small)           below working-set floor; (past full offload);
+                                                                  liger: [M,V] never built liger: always on
+A13 Accum precision (ker101 fp32        ker000 faster under       same bytes               verify loss curves
+   scatter vs ker000 bf16 index_add)    staged (−28 s @80k)                                before promoting ker000
+A14 LoRA-A/dA compute placement         hbm vs cpu-left:          ~0 (transient)           latency: GPU;
+   (LORA_A_FWD, FG_DA_GPU)              −8.3 s hist @b4_4k        X compact home           memory: cpu-left ok
+```
+
+Composition rules (measured; load-bearing for any solver):
+1. **Peaks don't add across time**: A3's +9.9 GiB solo became +1.7 GiB in the stack —
+   A1 removed the asym padded-operand copies from the same peak window. Cost a schedule
+   by simulating the live-set timeline, never by summing per-knob price tags.
+2. **Wall-time counters ≠ critical path**: grad hooks, the LoRA scatter bin, and the
+   pageable root fetch all had large counters and null A/Bs at 32k — the GPU queue
+   shadows host blocking. Only one-flag A/Bs (or timeline subtraction) price an axis.
+3. **HBM and host are SEPARATE walls** (q3-32b 60k: host-OOM at ohbm8 AND HBM-wedged at
+   ohbm4): carry two budgets; A4/A7/A10 move load between them, A1/A9 are ~free on
+   both, A3/A8/A11 charge HBM only, A5/A12 buy memory with FLOPs/overhead.
+4. **Time-additivity holds when mechanisms are disjoint** (A1+A3: −33.0 measured vs
+   −33.3 predicted @32k) but must be re-verified per anchor (D11 re-measures at 80k).
+5. **Anchor discipline**: price latency axes at the memory-differentiating anchor
+   (q3-30b 80k×8 ohbm0; q3-32b 49k×8) — never at small workloads where backends
+   converge — and every latency flag must hold the asym memory class (< so-off's peak)
+   at that anchor or it gets a threshold rule (A3's s*).
 
 ## 3. Search space, explicitly
 

@@ -1107,6 +1107,20 @@ def _torch_grouped_nt(
     return _grouped_torch_chunks(a, b, offsets, experts, transpose_b=transpose_b, dense_experts=dense_experts)
 
 
+def _gemm_dispatch_staged() -> bool:
+    """Phase D5 (agent/impls/fix_throughput.md C1b): route CPU-weight GEMMs to the
+    stage-once + native-mm path (`_torch_nt`/`_torch_grouped_nt`) instead of the
+    asym streaming kernel. D2 bench receipts: dense attention shapes run at
+    6-40x resident on the asym kernel vs 1.06x staged; grouped experts 2.7-3.6x
+    vs 1.7x staged (per-call bank copy 3.2 ms). Route-fused ker-bit kernels are
+    separate call sites and unaffected. Default off = byte-identical."""
+    raw = _os.environ.get(
+        "ASYM_GEMM_DISPATCH",
+        _os.environ.get("ASYM_GEMM_LF_CONFIG_ASYM_GEMM_DISPATCH", "asym"),
+    )
+    return str(raw).strip().lower() == "staged"
+
+
 def _dispatch_nt(
     a: torch.Tensor,
     b_cpu: torch.Tensor,
@@ -1130,6 +1144,8 @@ def _dispatch_nt(
         )
     _check_backend(backend)
     precision = _normalize_precision(precision)
+    if backend != "torch" and precision == "bf16" and _gemm_dispatch_staged():
+        backend = "torch"  # D5: stage-once + native mm; counted in torch_* stats
 
     if backend != "torch":
         reason = (
@@ -1372,6 +1388,8 @@ def _dispatch_grouped_nt(
 ) -> torch.Tensor:
     _check_backend(backend)
     precision = _normalize_precision(precision)
+    if backend != "torch" and precision == "bf16" and _gemm_dispatch_staged():
+        backend = "torch"  # D5: stage-once + native grouped mm; counted in torch_* stats
 
     if backend != "torch":
         reason = (

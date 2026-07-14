@@ -17,7 +17,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .activation_offload import ActivationOffloadManager, CPUActivationHandle
+from .activation_offload import ActivationOffloadManager, CPUActivationHandle, fg_chunk_rows
 from .exp_act_offload_lora import (
     grouped_lora_a_forward_cpu_left,
     grouped_lora_a_grad_cpu_right,
@@ -51,6 +51,17 @@ def _finegrained_cpu_activation_enabled() -> bool:
 def _finegrained_nograd_cpu_offload_enabled() -> bool:
     return _env_enabled("ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD") or _env_enabled(
         "ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FINEGRAINED_NOGRAD_CPU_OFFLOAD"
+    )
+
+
+def _finegrained_keep_acts_hbm_enabled() -> bool:
+    """Dense twin of ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM (fix_throughput D12 nsys receipt:
+    dense backward was 69% host-gap at the fg staging boundaries — tensors here are
+    [M, inter] = 20 GB-class on q3-32b). Keep X/gate/up/act/S_* as HBM tensors across
+    the within-layer fwd->bwd window; LoRA-A fwd and dA fall through to plain GPU
+    matmuls via the is_cuda branches in _cpu_left_lora_a/_cpu_right_lora_a_grad."""
+    return _env_enabled("ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM") or _env_enabled(
+        "ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM"
     )
 
 
@@ -107,6 +118,28 @@ def _asym_base_dx(
 def _lora_b_forward(low_rank: torch.Tensor, b: torch.Tensor, *, scale: float) -> torch.Tensor:
     out = low_rank @ b.t()
     return out.mul(float(scale)) if float(scale) != 1.0 else out
+
+
+def _add_lora_b_delta_(dest: torch.Tensor, low_rank: torch.Tensor, b: torch.Tensor, *, scale: float) -> None:
+    """dest += (low_rank @ b^T) * scale without materializing a full-width delta:
+    the [M, out] product is the same size as dest (20 GB-class at long seq), so
+    compute and add it in row chunks."""
+    rows = int(dest.shape[0])
+    chunk = fg_chunk_rows(rows, int(dest.shape[1]), dest.element_size())
+    if chunk <= 0:
+        dest.add_(_lora_b_forward(low_rank, b, scale=scale).to(dtype=dest.dtype))
+        return
+    for row_start in range(0, rows, chunk):
+        row_end = min(rows, row_start + chunk)
+        delta = _lora_b_forward(low_rank[row_start:row_end], b, scale=scale)
+        dest[row_start:row_end].add_(delta.to(dtype=dest.dtype))
+        del delta
+
+
+def _release_chunk_stages(manager: ActivationOffloadManager, stages: dict[int, torch.Tensor]) -> None:
+    for staged in stages.values():
+        manager.release_stage(staged, drop_cache=True)
+    stages.clear()
 
 
 def _lora_b_grad(grad_output: torch.Tensor, low_rank: torch.Tensor, *, scale: float, out_dtype: torch.dtype) -> torch.Tensor:
@@ -210,6 +243,16 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
             raise ValueError(f"fine-grained dense MLP requires bf16 input, got {flat.dtype}")
 
         manager = ActivationOffloadManager(pin_memory=True)
+        if _finegrained_keep_acts_hbm_enabled():
+            if layer.cpu_activation:
+                raise RuntimeError(
+                    "ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM requires "
+                    "ASYMM_DENSE_MLP_FINEGRAINED_CPU_ACT=0 (the CPU silu paths read "
+                    "pinned CPU handles and are not rerouted)."
+                )
+            from .qwen3_moe_finegrained import _HBMKeepManager
+
+            manager = _HBMKeepManager()
         layer.stats.dense_mlp_finegrained_forward_calls += 1
 
         with prof_range(layer._forward_range("finegrained", "x_to_cpu")):
@@ -225,11 +268,10 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
             )
             manager.wait_cpu_ready(x_cpu)
             gate_low_rank = layer._cpu_left_lora_a(x_cpu, gate_a, tag="gate")
-            gate_delta = _lora_b_forward(gate_low_rank, gate_b, scale=layer.lora_scale)
-            gate.add_(gate_delta.to(dtype=gate.dtype))
+            _add_lora_b_delta_(gate, gate_low_rank, gate_b, scale=layer.lora_scale)
             gate_cpu = manager.offload(gate, "mlp.gate")
             gate_low_rank_cpu = manager.offload(gate_low_rank, "mlp.S_gate")
-            del gate, gate_delta, gate_low_rank
+            del gate, gate_low_rank
 
         with prof_range(layer._forward_range("finegrained", "up")):
             layer.stats.dense_mlp_finegrained_up_base_calls += 1
@@ -241,15 +283,38 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
             )
             manager.wait_cpu_ready(x_cpu)
             up_low_rank = layer._cpu_left_lora_a(x_cpu, up_a, tag="up")
-            up_delta = _lora_b_forward(up_low_rank, up_b, scale=layer.lora_scale)
-            up.add_(up_delta.to(dtype=up.dtype))
+            _add_lora_b_delta_(up, up_low_rank, up_b, scale=layer.lora_scale)
             up_cpu = manager.offload(up, "mlp.up")
             up_low_rank_cpu = manager.offload(up_low_rank, "mlp.S_up")
-            del up, up_delta, up_low_rank
+            del up, up_low_rank
 
+        act_rows = int(gate_cpu.tensor.shape[0])
+        act_width = int(gate_cpu.tensor.shape[1])
+        act_chunk = fg_chunk_rows(act_rows, act_width) if hasattr(manager, "stage_rows") else 0
         if layer.cpu_activation:
             with prof_range(layer._forward_range("finegrained", "activation_cpu")):
                 act_cpu = _cpu_silu_mul(gate_cpu, up_cpu, manager, tag="mlp.act")
+        elif act_chunk > 0:
+            with prof_range(layer._forward_range("finegrained", "activation")):
+                # Row-chunked silu·mul: never stage full-width gate AND up together.
+                act_cpu = manager.empty_cpu((act_rows, act_width), torch.bfloat16, gate_cpu.original_device, "mlp.act")
+                manager.wait_cpu_ready(gate_cpu)
+                manager.wait_cpu_ready(up_cpu)
+                chunk_stages: dict[int, torch.Tensor] = {}
+                for row_start in range(0, act_rows, act_chunk):
+                    row_end = min(act_rows, row_start + act_chunk)
+                    gate_chunk = manager.stage_rows(gate_cpu, row_start, row_end, tag="mlp.gate_for_act_chunk")
+                    chunk_stages[int(gate_chunk.data_ptr())] = gate_chunk
+                    F.silu(gate_chunk, inplace=True)
+                    up_chunk = manager.stage_rows(up_cpu, row_start, row_end, tag="mlp.up_for_act_chunk")
+                    chunk_stages[int(up_chunk.data_ptr())] = up_chunk
+                    gate_chunk.mul_(up_chunk)
+                    act_cpu.tensor[row_start:row_end].copy_(
+                        gate_chunk.to(dtype=torch.bfloat16), non_blocking=bool(act_cpu.tensor.is_pinned())
+                    )
+                    del gate_chunk, up_chunk
+                manager.record_cpu_ready(act_cpu)
+                _release_chunk_stages(manager, chunk_stages)
         else:
             with prof_range(layer._forward_range("finegrained", "activation")):
                 gate_stage = manager.stage(gate_cpu, tag="mlp.gate_for_act")
@@ -264,9 +329,7 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
         with prof_range(layer._forward_range("finegrained", "down_lora")):
             manager.wait_cpu_ready(act_cpu)
             down_low_rank = layer._cpu_left_lora_a(act_cpu, down_a, tag="down")
-            down_delta = _lora_b_forward(down_low_rank, down_b, scale=layer.lora_scale)
             down_low_rank_cpu = manager.offload(down_low_rank, "mlp.S_down")
-            del down_low_rank
 
         with prof_range(layer._forward_range("finegrained", "down_base")):
             act_stage = manager.stage(act_cpu, tag="mlp.act_for_down_base")
@@ -278,8 +341,8 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                 tag=layer._profile_name("down", "base_forward"),
             )
             manager.release_stage(act_stage, drop_cache=True)
-            out.add_(down_delta.to(dtype=out.dtype))
-            del act_stage, down_delta
+            _add_lora_b_delta_(out, down_low_rank, down_b, scale=layer.lora_scale)
+            del act_stage, down_low_rank
 
         if weight_offload:
             ctx.save_for_backward()
@@ -358,29 +421,67 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                     manager.release_cpu(ctx.gate_cpu)
                     manager.release_cpu(ctx.up_cpu)
             else:
-                with prof_range(layer._backward_range("finegrained", "activation_bwd_gpu")):
-                    layer.stats.dense_mlp_finegrained_gpu_silu_bwd_calls += 1
-                    # Stage gate twice instead of keeping gate and up live together.
-                    gate_stage = manager.stage(ctx.gate_cpu, tag="mlp.gate_for_silu_bwd_dup")
-                    F.silu(gate_stage, inplace=True)
-                    gate_stage.mul_(grad_act)
-                    grad_up_cpu = manager.offload(gate_stage.to(dtype=torch.bfloat16).contiguous(), "mlp.dup")
-                    manager.release_stage(gate_stage, drop_cache=True)
-                    del gate_stage
+                bwd_rows = int(grad_act.shape[0])
+                bwd_width = int(grad_act.shape[1])
+                bwd_chunk = fg_chunk_rows(bwd_rows, bwd_width) if hasattr(manager, "stage_rows") else 0
+                if bwd_chunk > 0:
+                    with prof_range(layer._backward_range("finegrained", "activation_bwd_gpu")):
+                        layer.stats.dense_mlp_finegrained_gpu_silu_bwd_calls += 1
+                        # Row-chunked silu backward: grad_act stays full-width (it is the
+                        # down-dx GEMM output) but gate/up are staged per chunk and dgate/dup
+                        # are written straight to their pinned CPU rows.
+                        grad_up_cpu = manager.empty_cpu((bwd_rows, bwd_width), torch.bfloat16, grad_act.device, "mlp.dup")
+                        grad_gate_cpu = manager.empty_cpu((bwd_rows, bwd_width), torch.bfloat16, grad_act.device, "mlp.dgate")
+                        manager.wait_cpu_ready(ctx.gate_cpu)
+                        manager.wait_cpu_ready(ctx.up_cpu)
+                        chunk_stages: dict[int, torch.Tensor] = {}
+                        dup_nb = bool(grad_up_cpu.tensor.is_pinned())
+                        dgate_nb = bool(grad_gate_cpu.tensor.is_pinned())
+                        for row_start in range(0, bwd_rows, bwd_chunk):
+                            row_end = min(bwd_rows, row_start + bwd_chunk)
+                            grad_slice = grad_act[row_start:row_end]
+                            gate_chunk = manager.stage_rows(ctx.gate_cpu, row_start, row_end, tag="mlp.gate_for_silu_bwd_chunk")
+                            chunk_stages[int(gate_chunk.data_ptr())] = gate_chunk
+                            dup_chunk = F.silu(gate_chunk)
+                            dup_chunk.mul_(grad_slice)
+                            grad_up_cpu.tensor[row_start:row_end].copy_(dup_chunk.to(dtype=torch.bfloat16), non_blocking=dup_nb)
+                            del dup_chunk
+                            up_chunk = manager.stage_rows(ctx.up_cpu, row_start, row_end, tag="mlp.up_for_silu_bwd_chunk")
+                            chunk_stages[int(up_chunk.data_ptr())] = up_chunk
+                            grad_slice.mul_(up_chunk)
+                            dgate_chunk = torch.ops.aten.silu_backward(grad_slice, gate_chunk)
+                            grad_gate_cpu.tensor[row_start:row_end].copy_(dgate_chunk.to(dtype=torch.bfloat16), non_blocking=dgate_nb)
+                            del dgate_chunk, gate_chunk, up_chunk, grad_slice
+                        manager.record_cpu_ready(grad_up_cpu)
+                        manager.record_cpu_ready(grad_gate_cpu)
+                        _release_chunk_stages(manager, chunk_stages)
+                        manager.release_cpu(ctx.gate_cpu)
+                        manager.release_cpu(ctx.up_cpu)
+                        del grad_act
+                else:
+                    with prof_range(layer._backward_range("finegrained", "activation_bwd_gpu")):
+                        layer.stats.dense_mlp_finegrained_gpu_silu_bwd_calls += 1
+                        # Stage gate twice instead of keeping gate and up live together.
+                        gate_stage = manager.stage(ctx.gate_cpu, tag="mlp.gate_for_silu_bwd_dup")
+                        F.silu(gate_stage, inplace=True)
+                        gate_stage.mul_(grad_act)
+                        grad_up_cpu = manager.offload(gate_stage.to(dtype=torch.bfloat16).contiguous(), "mlp.dup")
+                        manager.release_stage(gate_stage, drop_cache=True)
+                        del gate_stage
 
-                    up_stage = manager.stage(ctx.up_cpu, tag="mlp.up_for_silu_bwd_dgate")
-                    grad_act.mul_(up_stage)
-                    manager.release_stage(up_stage, drop_cache=True)
-                    manager.release_cpu(ctx.up_cpu)
-                    del up_stage
+                        up_stage = manager.stage(ctx.up_cpu, tag="mlp.up_for_silu_bwd_dgate")
+                        grad_act.mul_(up_stage)
+                        manager.release_stage(up_stage, drop_cache=True)
+                        manager.release_cpu(ctx.up_cpu)
+                        del up_stage
 
-                    gate_stage = manager.stage(ctx.gate_cpu, tag="mlp.gate_for_silu_bwd_dgate")
-                    grad_gate = torch.ops.aten.silu_backward(grad_act, gate_stage)
-                    del grad_act
-                    grad_gate_cpu = manager.offload(grad_gate.to(dtype=torch.bfloat16).contiguous(), "mlp.dgate")
-                    manager.release_stage(gate_stage, drop_cache=True)
-                    manager.release_cpu(ctx.gate_cpu)
-                    del gate_stage, grad_gate
+                        gate_stage = manager.stage(ctx.gate_cpu, tag="mlp.gate_for_silu_bwd_dgate")
+                        grad_gate = torch.ops.aten.silu_backward(grad_act, gate_stage)
+                        del grad_act
+                        grad_gate_cpu = manager.offload(grad_gate.to(dtype=torch.bfloat16).contiguous(), "mlp.dgate")
+                        manager.release_stage(gate_stage, drop_cache=True)
+                        manager.release_cpu(ctx.gate_cpu)
+                        del gate_stage, grad_gate
 
             with prof_range(layer._backward_range("finegrained", "gate")):
                 grad_gate_stage = manager.stage(grad_gate_cpu, tag="mlp.dgate")
@@ -492,9 +593,8 @@ def _finegrained_dense_mlp_no_grad_gpu_forward(layer: "AsymFinegrainedDenseMLP",
                 tag=layer._profile_name("gate", "base_forward"),
             )
             gate_low_rank = _gpu_lora_a_forward(flat, gate_a, tag="gate")
-            gate_delta = _lora_b_forward(gate_low_rank, gate_b, scale=layer.lora_scale)
-            gate.add_(gate_delta.to(dtype=gate.dtype))
-            del gate_low_rank, gate_delta
+            _add_lora_b_delta_(gate, gate_low_rank, gate_b, scale=layer.lora_scale)
+            del gate_low_rank
 
         with prof_range(layer._forward_range("finegrained_nograd_gpu", "up")):
             layer.stats.dense_mlp_finegrained_up_base_calls += 1
@@ -505,9 +605,8 @@ def _finegrained_dense_mlp_no_grad_gpu_forward(layer: "AsymFinegrainedDenseMLP",
                 tag=layer._profile_name("up", "base_forward"),
             )
             up_low_rank = _gpu_lora_a_forward(flat, up_a, tag="up")
-            up_delta = _lora_b_forward(up_low_rank, up_b, scale=layer.lora_scale)
-            up.add_(up_delta.to(dtype=up.dtype))
-            del up_low_rank, up_delta, flat
+            _add_lora_b_delta_(up, up_low_rank, up_b, scale=layer.lora_scale)
+            del up_low_rank, flat
 
         with prof_range(layer._forward_range("finegrained_nograd_gpu", "activation")):
             F.silu(gate, inplace=True)
@@ -517,8 +616,6 @@ def _finegrained_dense_mlp_no_grad_gpu_forward(layer: "AsymFinegrainedDenseMLP",
 
         with prof_range(layer._forward_range("finegrained_nograd_gpu", "down_lora")):
             down_low_rank = _gpu_lora_a_forward(act, down_a, tag="down")
-            down_delta = _lora_b_forward(down_low_rank, down_b, scale=layer.lora_scale)
-            del down_low_rank
 
         with prof_range(layer._forward_range("finegrained_nograd_gpu", "down_base")):
             layer.stats.dense_mlp_finegrained_down_base_calls += 1
@@ -528,8 +625,9 @@ def _finegrained_dense_mlp_no_grad_gpu_forward(layer: "AsymFinegrainedDenseMLP",
                 stats=layer.stats,
                 tag=layer._profile_name("down", "base_forward"),
             )
-            out.add_(down_delta.to(dtype=out.dtype))
-            del act, down_delta
+            del act
+            _add_lora_b_delta_(out, down_low_rank, down_b, scale=layer.lora_scale)
+            del down_low_rank
 
         stats = manager.snapshot()
         stats["finegrained_no_grad_gpu_forward"] = True
@@ -790,6 +888,9 @@ class AsymFinegrainedDenseMLP(nn.Module):
 
     def _cpu_left_lora_a(self, source: CPUActivationHandle, lora_a: torch.Tensor, *, tag: str) -> torch.Tensor:
         lora_a = _dense_lora_a(lora_a, tag=tag)
+        if source.tensor.is_cuda:
+            # keep-acts-HBM: the "offloaded" handle is an HBM tensor — plain GPU matmul.
+            return _gpu_lora_a_forward(source.tensor, lora_a, tag=tag)
         if self.backend == "torch":
             return source.tensor.to(device=lora_a.device, dtype=lora_a.dtype, non_blocking=source.tensor.is_pinned()).matmul(lora_a.t())
         plan = self._one_expert_plan(int(source.tensor.shape[0]), lora_a.device)
@@ -812,6 +913,10 @@ class AsymFinegrainedDenseMLP(nn.Module):
         tag: str,
     ) -> torch.Tensor:
         lora_a = _dense_lora_a(lora_a, tag=tag)
+        if source.tensor.is_cuda:
+            # keep-acts-HBM: dA = dS^T @ source directly on GPU.
+            src = source.tensor if source.tensor.dtype == dS.dtype else source.tensor.to(dtype=dS.dtype)
+            return dS.t().contiguous().matmul(src).to(dtype=lora_a.dtype)
         if self.backend == "torch":
             return dS.t().contiguous().matmul(
                 source.tensor.to(device=dS.device, dtype=dS.dtype, non_blocking=source.tensor.is_pinned())
