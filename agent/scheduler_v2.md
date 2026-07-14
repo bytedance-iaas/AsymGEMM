@@ -1,11 +1,14 @@
 # Scheduler v2 — the memory↔latency dial, formulated to convergence
 
-2026-07-13 (v2.2 after two critique passes). Supersedes `agent/scheduler.md` (v1) and
-`agent/scheduler/knob.md` where they conflict; v1's laws and meter model survive inside
-§2. Impl+probe evidence: `agent/impls/memory_mode.md`. Jobs of this doc:
+2026-07-13 (v2.2 after two critique passes). **This is the single working scheduler
+doc.** It absorbs the retired `scheduler.md` (v1) and `scheduler_knob.md`; v1's laws
+and meter model survive inside §2, its A1–A14 axis ledger is condensed into §3's D1–D6
++ the class-1 pins. Full A1–A14 detail + the frozen per-model metric snapshot live in
+`agent/archive/scheduler_knob.md` (record only). Impl+probe evidence:
+`agent/impls/memory_mode.md`. Jobs of this doc:
 (A) the formulation — one objective, one admission rule, all knobs classified;
 (B) the transferable knob table (memory→latency, gradual and clean);
-(C) the measured dial ladder (running) and operating procedure.
+(C) the measured dial ladder + per-model records (§3b, §7) and operating procedure.
 
 ---
 
@@ -163,7 +166,7 @@ each shed returns its exact ΔM. Nothing else changes — that is the "clean" pr
 class-1 knobs never flip, class-4 never enter, and the admission order never reorders
 (§2.3 scale invariance).
 
-## 3b. Measured dial ladder — 30B-A3B @120k×8, §5 protocol (RUNNING, 2026-07-13)
+## 3b. Measured dial ladder — 30B-A3B @120k×8, §5 protocol (CONFIRMED)
 
 MEASURED 2026-07-13 (steady = middle-2 of 4; loss parity on every rung, spread ≤0.007):
 
@@ -293,3 +296,61 @@ better mathematical frame. If a future probe contradicts a prediction (a config 
 a floor, or an out-of-order admission wins), §2.4/§4 say exactly which assumption to
 re-open — the formulation is falsifiable, which is the strongest convergence claim a
 measurement-driven frame can make.
+
+---
+
+## 7. Per-model measured dials + capacity (records)
+
+Absorbed from the retired `scheduler_knob.md`; the frozen full-detail snapshot (incl.
+the A1–A14 ledger) is `agent/archive/scheduler_knob.md`. Protocol §5 unless noted.
+
+### 7a. q3-30b-a3b (MoE) @80000|8|1 ohbm0 — the dial
+
+```text
+dial point                                    s/step   tok/s   peak HBM   what the step trades
+LATENCY MODE (staged+ker000+keep-acts+async)  175.7    3,642   84.7 GiB   —
+ - keep-acts (ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM=0)  200.0   3,200   80.0    +24.3 s buys −4.7 GiB
+ - ker000 → ker101                            227.6    2,813   80.1       +27.6 s buys ~0 (follows dispatch)
+ - staged → asym engine                       273.5    2,340   80.1       +45.9 s buys ~0.4 GB transient
+MEMORY MODE (+ASYM_CPU_ADAMW_ASYNC_GRAD_OFFLOAD=0)  ~278  ~2,300  80.1     −7 GB HOST (pinned staging off)
+references:  superoffload_mem|unsloth-off 228.1/94.4 · unsloth (hist) 186.9/176.9
+```
+Entire asym dial sits LEFT of both baselines in memory; fast end beats both in speed.
+
+### 7b. q3-32b (dense) @49000|8|1 ohbm0 — the dial
+
+```text
+DENSE LATENCY MODE (staged + keep-acts)       277.6    132.2 GiB  —
+ - keep-acts (ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM=0)  836.7   95.5   +559 s buys −36.7 GiB (!!)
+ - staged → asym engine                       964.5     95.5     +128 s buys ~0
+references:  superoffload-off 373.1/108.5 · unsloth 221.0/177.3
+```
+Dense keep-acts lever is 20× the MoE one (tensors [392k,25600] = 20 GB each). Latency
+mode 1.34× faster than so-off at +24 GiB. At 49k keep-acts EXCEEDS so-off memory (near
+dense s*); at smaller s the +37 GiB shrinks and stays under. Loss parity Δ ≤ 0.0013.
+
+### 7c. llama3.3-70b (dense) @32000|8|1 ohbm0 — post-merge (2026-07-14), w1+m1
+
+| mode | alloc | reserved | s/it | loss | vs superoffload |
+|---|---|---|---|---|---|
+| memory (keep-acts off)  | 67.0  | 82.7  | 476 | 1.207 | −23 GiB HBM; +39% time |
+| latency (staged+keep-acts) | 111.0 | 135.2 | 199 | 1.206 | 1.72× faster; +21 GiB |
+| superoffload (control)  | 90.3  | 101.5 | 343 | 1.206 | baseline |
+
+Both goals hold on merged main_kevin: memory mode beats so on HBM (67 vs 90), latency
+mode beats so on speed (199 vs 343 = 1.72×); smooth (+44 GiB buys −277 s), loss parity.
+
+### 7d. Post-merge re-verification of §3b (2026-07-14, w1+m4)
+
+The §3b 120k ladder reproduces on merged main_kevin: memory 104.6 alloc / 483.8 s,
+latency 126.7 / 352.6 s, superoffload 150.1 / 474.1 s — s/it matches the banked ladder
+exactly; a UNIFORM ~+8–10 GiB HBM / +40 GB RSS offset appears across ALL three configs
+INCLUDING superoffload (independent path) ⇒ system-wide measurement/env baseline drift
+vs the 2026-07-12 bank, NOT a regression. Relationship + ordering unchanged.
+
+### 7e. Sequence-capacity ceilings (post-merge, w1+m1) — of ~185 GiB GB200
+
+| run | alloc | reserved | CPU RSS | s/it | verdict |
+|---|---|---|---|---|---|
+| q3-32b @65k ker000 ohbm8      | 154.2 | 166.8 | 882 GB | 1281 | FITS (record C-OOM ~66k) |
+| q3-30b-a3b @174k ker101 ohbm16 | 153.6 | 170.9 | 825 GB | 878  | FITS (record 172k max-OK / G-OOM 188k) |
