@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPT = ROOT / "scripts/lf/compare_liger_loss_profiles.py"
+SCRIPT = ROOT / "scripts/lf/archive/compare_liger_loss_profiles.py"
 GIB = 1024**3
 
 

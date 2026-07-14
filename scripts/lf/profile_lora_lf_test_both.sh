@@ -372,7 +372,7 @@ UTILIZATION_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_utilization.py"
 usage() {
   cat <<USAGE
 Usage:
-  scripts/lf/profile_lora_lf.sh [options]
+  scripts/lf/profile_lora_lf_test_both.sh [options]
 
 Defaults:
   --gpus ${GPU_POOL}

@@ -7,7 +7,7 @@ stay isolated from the shared LF scripts in `scripts/lf/`.
 - `profile_lora_lf_kt.sh` -> `agent/kt/scripts/profile_lora_lf_kt.sh`
 - `run_lf_lora_sft_kt.sh` -> `agent/kt/scripts/run_lf_lora_sft_kt.sh`
 
-Do not edit `scripts/lf/run_lf_lora_sft.sh` or `scripts/lf/profile_lora_lf.sh`
+Do not edit `scripts/lf/run_lf_lora_sft.sh` or `scripts/lf/profile_lora_lf_test_{source,both}.sh`
 for KT ARM BF16 work. Use GPU 1 first and GPU 2 only as fallback.
 The kt_armbf16 production path is grouped packed SVE/BF16 forward and grouped
 dropout-0 backward. The base backward grads run as register-blocked SVE BFDOT
