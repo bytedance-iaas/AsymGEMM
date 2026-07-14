@@ -23,7 +23,7 @@ Small KT source smoke:
 
 ```bash
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
-ART=profiling_kt_codex_smoke/kt_smoke_qwen3_s64_b1_r8_source
+ART=profiling_results/profiling_kt_codex_smoke/kt_smoke_qwen3_s64_b1_r8_source
 mkdir -p "$ART"
 taskset -c 0-143 env \
   SFT_ROOT=/workspace/AsymGEMM-SFT \
@@ -50,5 +50,5 @@ taskset -c 0-143 env \
   --require-native-kv backward_lora_kernel=grouped_sve_tile_dropout0
 ```
 
-Use `profiling_kt_codex_smoke/v5_*` artifact directories for this KT work.
+Use `profiling_results/profiling_kt_codex_smoke/v5_*` artifact directories for this KT work.
 Use physical GPU 1 first, physical GPU 2 only as fallback, and never GPU 0 or 3.

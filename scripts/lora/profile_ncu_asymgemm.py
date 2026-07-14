@@ -105,7 +105,7 @@ def main() -> None:
     parser.add_argument("--preset", choices=["quick", "paper"], default="paper")
     parser.add_argument("--section", action="append", dest="sections")
     parser.add_argument("--ncu-bin", default="ncu")
-    parser.add_argument("--output-root", type=Path, default=Path("profiling"))
+    parser.add_argument("--output-root", type=Path, default=Path("profiling_results/profiling"))
     parser.add_argument("--output-dir", type=Path, help="Exact output directory. Overrides --output-root/<workload>/ncu.")
     parser.add_argument("--clear-jit-cache", action="store_true")
     parser.add_argument("--jit-cache-dir", type=Path)

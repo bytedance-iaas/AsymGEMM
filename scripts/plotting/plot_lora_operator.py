@@ -116,13 +116,13 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="Default: profiling/lora_ops_<precision>/plots.",
+        help="Default: profiling_results/profiling/lora_ops_<precision>/plots.",
     )
     parser.add_argument(
         "--combined-output-dir",
         type=Path,
         default=None,
-        help="Default: profiling/lora_ops_<precision>/combined unless --output-dir is set, then <output-dir>/combined.",
+        help="Default: profiling_results/profiling/lora_ops_<precision>/combined unless --output-dir is set, then <output-dir>/combined.",
     )
     parser.add_argument("--operation", action="append", default=[])
     parser.add_argument("--backend", action="append", default=[])
@@ -177,20 +177,20 @@ def precision_label(args: argparse.Namespace) -> str:
 def input_root(args: argparse.Namespace) -> Path:
     if args.input_root is not None:
         return resolve_path(args.input_root)
-    return ROOT / "profiling" / f"lora_ops_{precision_label(args)}"
+    return ROOT / "profiling_results/profiling" / f"lora_ops_{precision_label(args)}"
 
 
 def output_root(args: argparse.Namespace) -> Path:
     if args.output_dir is not None:
         return resolve_path(args.output_dir)
-    return ROOT / "profiling" / f"lora_ops_{precision_label(args)}" / "plots"
+    return ROOT / "profiling_results/profiling" / f"lora_ops_{precision_label(args)}" / "plots"
 
 
 def combined_output_root(args: argparse.Namespace, root: Path) -> Path:
     if args.combined_output_dir is not None:
         return resolve_path(args.combined_output_dir)
     if args.output_dir is None:
-        return ROOT / "profiling" / f"lora_ops_{precision_label(args)}" / "combined"
+        return ROOT / "profiling_results/profiling" / f"lora_ops_{precision_label(args)}" / "combined"
     return root / "combined"
 
 

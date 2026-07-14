@@ -55,7 +55,7 @@ def main() -> None:
     parser.add_argument("--lora-alpha", metavar="FLOAT", type=float, default=128.0)
     parser.add_argument("--vocab-rows", metavar="N", type=int, default=4096)
     parser.add_argument("--expert-recompute-policy", default="none")
-    parser.add_argument("--output-root", type=Path, default=Path("profiling"))
+    parser.add_argument("--output-root", type=Path, default=Path("profiling_results/profiling"))
     parser.add_argument("--output-dir", type=Path, help="Exact output directory. Overrides --output-root/<workload>/cpu_gaps.")
     parser.add_argument("--nsys-bin", default="nsys")
     parser.add_argument("--trace", default="cuda,nvtx")

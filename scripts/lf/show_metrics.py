@@ -20,7 +20,7 @@ for liger-loss / sdpa-recompute (+ on, - off). Numbers are printed as x.x
 (OOM / failed / not run) show a status marker in the first timing column.
 
 Usage:
-    show_metrics.py [PROFILING_DIR]      # default profiling_both
+    show_metrics.py [PROFILING_DIR]      # default profiling_results/profiling_both
 """
 from __future__ import annotations
 
@@ -340,8 +340,8 @@ def fmt(v, decimals: int = 1) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Show LF profiling timing/memory metrics, one table per model.")
-    ap.add_argument("root", nargs="?", default="profiling_both",
-                    help="profiling output dir (default: profiling_both); relative to repo root or absolute")
+    ap.add_argument("root", nargs="?", default="profiling_results/profiling_both",
+                    help="profiling output dir (default: profiling_results/profiling_both); relative to repo root or absolute")
     args = ap.parse_args()
     root = Path(args.root)
     if not root.is_absolute():

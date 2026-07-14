@@ -21,7 +21,7 @@ carries its own oom_score_adj + assumes the caller watches host memory; host foo
 ~32 GB pinned per rank):
   torchrun --nproc_per_node 2 scripts/testing/fsdp2_tp_baseline.py \
       --model Qwen/Qwen3-32B --seq 20000 --batch 8 --steps 3 --warmup 1 \
-      --out profiling_gb200tp_p0/fsdp2_tp_baseline.json
+      --out profiling_results/profiling_gb200tp_p0/fsdp2_tp_baseline.json
 """
 from __future__ import annotations
 

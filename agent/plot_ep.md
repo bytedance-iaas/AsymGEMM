@@ -25,7 +25,7 @@ only IF it stays uncluttered — drop it if it crowds (visual check decides).
 
 ## DATA SOURCES (already measured — do NOT re-run benchmarks)
 
-All under profiling_both_skew/. Use these top-level files ONLY —
+All under profiling_results/profiling_both_skew/. Use these top-level files ONLY —
 archive_3mode/ and archive_4mode_noDP/ hold stale same-named copies.
 
   model key      display name (figure label)   GEMM json               MoE json

@@ -367,7 +367,7 @@ class Driver:
         # and the local hostname.
         _prof = str(cfg.env.get("PROFILERS") or "both")
         _host = str(cfg.env.get("HOST_TAG") or os.uname().nodename.split(".")[0])
-        self.artifacts_root = ROOT / f"profiling_{_prof}_ceiling_{_host}"
+        self.artifacts_root = ROOT / "profiling_results" / f"profiling_{_prof}_ceiling_{_host}"
 
     def say(self, msg: str):
         print(f"[{self.cfg.name}] {msg}", flush=True)

@@ -14,11 +14,11 @@
 #           below ~4M: the 1.28M first attempt was launch-floor-dominated)
 #   REPS    timed reps per mode (default 3; rep0 JIT warm is always dropped)
 #   GPUS    two comma GPUs (default 2,3 — keeps the training pair 0,1 free)
-#   OUT     output json (default profiling_both_skew/ep_balance_bench_<ts>.json)
+#   OUT     output json (default profiling_results/profiling_both_skew/ep_balance_bench_<ts>.json)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-HIST="${HIST:-profiling_both_epstats/ep_hist_q3_s20000.json}"
+HIST="${HIST:-profiling_results/profiling_both_epstats/ep_hist_q3_s20000.json}"
 LAYERS="${LAYERS:-worst,median}"
 ALPHAS="${ALPHAS:-natural,0.10,0.15,0.5,0.75}"
 MTOTAL="${MTOTAL:-}"
@@ -27,7 +27,7 @@ SEEDS="${SEEDS:-3}"
 MODES="${MODES:-owned,sdp,plan,queue}"   # "sep" accepted as a legacy alias of "plan"
 SCOPE="${SCOPE:-gemm}"   # gemm | experts | moe | layer (attention + MoE block)
 GPUS="${GPUS:-2,3}"
-OUT="${OUT:-profiling_both_skew/ep_balance_bench_$(date +%Y%m%d_%H%M%S).json}"
+OUT="${OUT:-profiling_results/profiling_both_skew/ep_balance_bench_$(date +%Y%m%d_%H%M%S).json}"
 
 # MODEL presets: MoE geometry VERIFIED from the HF configs (2026-07-10).
 # GEOM=E,N,K; TOPK; FUSED (llama4 single gate_up GEMM); SHARED_N (shared-expert

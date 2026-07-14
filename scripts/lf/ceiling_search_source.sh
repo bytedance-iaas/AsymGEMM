@@ -178,7 +178,7 @@ if [[ "${VALIDATE_ROWS}" == "true" ]]; then
            PLOT=false PROFILERS="${PROFILERS}" RUN_POST=false CONTINUE_ON_ERROR=false \
            GPU_POOL="${CEIL_GPU_POOL:-0,1}" \
            COLLECT_EXISTING=false UNSLOTH_GC_OUTER_HBM_EVERY_N=0 \
-           RUN_NAME= OUTPUT_ROOT="${ASYM_ROOT_DIR}/profiling_${PROFILERS}_ceiling_${HOST_TAG}" \
+           RUN_NAME= OUTPUT_ROOT="${ASYM_ROOT_DIR}/profiling_results/profiling_${PROFILERS}_ceiling_${HOST_TAG}" \
            timeout 120 bash "${SCRIPT_DIR}/profile_lora_lf_test_both.sh" ) >> "${_vlog}" 2>&1; then
       echo "---- last lines of ${_vlog}:" >&2
       tail -n 15 "${_vlog}" >&2

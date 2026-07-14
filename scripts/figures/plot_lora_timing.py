@@ -13,7 +13,7 @@ Shared fonts/sizes/colors/figure params come from constants.py.
 NOTE: the timings below are ILLUSTRATIVE PLACEHOLDERS. To plot measured data,
 replace the numbers in BARS with forward/backward/optimizer milliseconds from
 the per-run step_samples.csv files, e.g.:
-  profiling_both*/asym_long_sft_smoke__lora__lf__bf16/<model>__*/<backend>__*/b*/step_samples.csv
+  profiling_results/profiling_both*/asym_long_sft_smoke__lora__lf__bf16/<model>__*/<backend>__*/b*/step_samples.csv
 (columns: forward_milliseconds, backward_milliseconds, optimizer_milliseconds).
 """
 from __future__ import annotations

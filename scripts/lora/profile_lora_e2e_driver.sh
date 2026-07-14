@@ -19,7 +19,7 @@ BACKENDS="asym,torch"
 PROFILERS="nsys"
 
 JOBS_PER_GPU=1
-OUTPUT_ROOT="profiling"
+OUTPUT_ROOT="profiling_results/profiling"
 RUN_NAME=""
 PRECISION="bf16"
 ATTENTION_IMPL="sdpa"

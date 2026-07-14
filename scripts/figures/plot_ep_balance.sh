@@ -11,7 +11,7 @@
 #   ep_balance_q35122b.{pdf,png}  Qwen3.5-122B-A10B
 #   ep_balance_l4scout.{pdf,png}  Llama-4-Scout
 #
-# Numbers are the banked ep_balance_bench sweeps (profiling_both_skew/, see
+# Numbers are the banked ep_balance_bench sweeps (profiling_results/profiling_both_skew/, see
 # MODELS in plot_ep_balance.py). Fonts/sizes/colors/layout via constants.py.
 #
 # Usage: ./plot_ep_balance.sh [OUTPUT_DIR] [--model q3-30b-a3b|...|all]
