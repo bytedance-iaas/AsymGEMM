@@ -78,3 +78,19 @@ ceiling it must turn off. Loss parity exact across all arms (Δ ≤ 0.0013).
 Implementation: `ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM` (dense_mlp_finegrained.py — the
 MoE _HBMKeepManager shim + is_cuda reroutes in _cpu_left_lora_a/_cpu_right_lora_a_grad;
 subsumes all four MoE levers on dense; guard vs CPU_ACT; bit-exact toy parity).
+
+## llama3.3-70b (dense) dial — post-merge verification (2026-07-14, main_kevin)
+
+@32000|8|1 ohbm0, PROFILERS=source w1+m1. Confirms the dense dial generalizes to
+llama3.3-70b and both goals vs superoffload hold on merged main_kevin.
+
+| mode | alloc HBM | reserved | s/it | loss | note |
+|---|---|---|---|---|---|
+| memory (dense-fg, keep-acts off)        | 67.0  | 82.7  | 476 | 1.207 | −23 GiB vs so; +39% time |
+| latency (staged + ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM=1) | 111.0 | 135.2 | 199 | 1.206 | 1.72× faster than so; +21 GiB |
+| superoffload_mem\|unsloth-off (control) | 90.3  | 101.5 | 343 | 1.206 | baseline (record: G-95 / 359 s) |
+
+- GOAL 1 met: memory mode beats superoffload on HBM (67 vs 90 GiB alloc).
+- GOAL 2 met: latency mode beats superoffload on speed (199 vs 343 s = 1.72x).
+- Smooth transition: memory->latency trades +44 GiB HBM for -277 s/step (monotone).
+- Loss parity across all three (1.206-1.207); zero torch fallback on asym modes.
