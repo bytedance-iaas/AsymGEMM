@@ -11,7 +11,7 @@ reference, keyed in the left panel): gray on EP = its mean GPU-imbalance %
 bars); dark blue = reduction vs sDP (second column on the sEP bars).
 Arrows are sign-aware: ↓ faster, ↑ slower, 0% = under half a percent.
 
-Data is the banked ep_balance_bench sweep under profiling_both_skew/ (see the
+Data is the banked ep_balance_bench sweep under profiling_results/profiling_both_skew/ (see the
 per-model json pairs in MODELS; archive_*/ subdirs hold stale copies). Nothing
 is re-measured here. Shared fonts/sizes/colors/figure params + the grouped-bar
 layout helper all come from constants.py.
@@ -32,7 +32,7 @@ from matplotlib.patches import Patch  # noqa: E402
 import constants as C  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = REPO_ROOT / "profiling_both_skew"
+DATA_DIR = REPO_ROOT / "profiling_results/profiling_both_skew"
 
 # --- Banked benchmark files (top-level ONLY; archive_*/ are stale) ---------
 MODELS = [

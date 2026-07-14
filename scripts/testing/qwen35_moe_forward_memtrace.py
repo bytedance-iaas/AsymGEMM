@@ -17,8 +17,9 @@ import sys
 
 import torch
 
-sys.path.insert(0, "/workspace/AsymGEMM-SFT/third_party/AsymGEMM")
-sys.path.insert(0, "/workspace/AsymGEMM-SFT/third_party/LlamaFactory/src")
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, _REPO_ROOT)
+sys.path.insert(0, os.path.join(os.path.dirname(_REPO_ROOT), "LlamaFactory", "src"))
 
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeTextConfig,

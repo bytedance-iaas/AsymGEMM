@@ -40,7 +40,7 @@ seq_resolution, seq_min, seq_max, probe_steps, confirm_steps, warmup_steps,
 probe_timeout_s, confirm_timeout_s, max_probes, max_confirm_attempts, env{}.
 
 Usage:
-  python scripts/lf/ceiling_search.py scripts/lf/ceiling_configs.jsonl
+  python scripts/lf/ceiling_search.py <configs>.jsonl   # normally generated + passed by ceiling_search_{both,source}.sh
   python scripts/lf/ceiling_search.py cfgs.jsonl --dry-run
   # validate the classifier on a point you already know C-OOMs:
   python scripts/lf/ceiling_search.py cfgs.jsonl --single q3-32b_asymds 55000 0
@@ -367,7 +367,7 @@ class Driver:
         # and the local hostname.
         _prof = str(cfg.env.get("PROFILERS") or "both")
         _host = str(cfg.env.get("HOST_TAG") or os.uname().nodename.split(".")[0])
-        self.artifacts_root = ROOT / f"profiling_{_prof}_ceiling_{_host}"
+        self.artifacts_root = ROOT / "profiling_results" / f"profiling_{_prof}_ceiling_{_host}"
 
     def say(self, msg: str):
         print(f"[{self.cfg.name}] {msg}", flush=True)

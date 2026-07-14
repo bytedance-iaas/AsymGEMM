@@ -969,7 +969,7 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Measured steps for the separate memory-only attribution pass. One step is enough for fixed-shape profiles.",
     )
-    parser.add_argument("--output-root", type=Path, default=Path("profiling"))
+    parser.add_argument("--output-root", type=Path, default=Path("profiling_results/profiling"))
     parser.add_argument("--run-name", default="", help="Optional subdirectory under --output-root. Default writes directly into --output-root.")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--dry-run", action="store_true")

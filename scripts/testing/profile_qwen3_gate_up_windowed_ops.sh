@@ -14,7 +14,7 @@ R_DOWN="${R_DOWN:-8}"
 DOWN_DROPOUT_P="${DOWN_DROPOUT_P:-0.0}"
 WARMUP_ITERS="${WARMUP_ITERS:-3}"
 LATENCY_ITERS="${LATENCY_ITERS:-10}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-profiling/qwen3_gate_up_windowed_bwd/op_profile}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-profiling_results/profiling/qwen3_gate_up_windowed_bwd/op_profile}"
 
 IFS=',' read -r -a CASE_LIST <<< "${CASES}"
 IFS=',' read -r -a MODE_LIST <<< "${MODES}"

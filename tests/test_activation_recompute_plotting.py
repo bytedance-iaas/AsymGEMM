@@ -46,7 +46,7 @@ def test_activation_recompute_plot_policy_parser_accepts_lf_gc_labels() -> None:
 
 def test_activation_recompute_plot_policy_filter_matches_gc_attn_folder_label() -> None:
     result_dir = Path(
-        "profiling_both/asym_long_sft_smoke__lora__lf__bf16/"
+        "profiling_results/profiling_both/asym_long_sft_smoke__lora__lf__bf16/"
         "qwen3_5-35b-a3b__gpus1__b2_s2048_ga1_w1_s1_r64_a16_drop000/"
         "asym_cpuadamwds__source__norecomp__polgc-attn-exp__routerwhole__"
         "expact0__attnact0__layeract0__layergc0__loraafwdhbm__actrecomp0__"
@@ -62,7 +62,7 @@ def test_activation_recompute_plot_policy_filter_matches_gc_attn_folder_label() 
 
 def test_activation_recompute_plot_filters_layer_gc_axis() -> None:
     result_dir = Path(
-        "profiling_both/asym_long_sft_smoke__lora__lf__bf16/"
+        "profiling_results/profiling_both/asym_long_sft_smoke__lora__lf__bf16/"
         "qwen3_5-35b-a3b__gpus1__b2_s2048_ga1_w1_s1_r64_a16_drop000/"
         "asym_cpuadamwds__source__norecomp__polnone__routerwhole__"
         "expact1__attnact1__layeract0__layergc1__loraafwdhbm__actrecomp0__"

@@ -24,7 +24,7 @@ Do not treat the same-config run below as final acceptance because it was
 interrupted after the first complete warmup step. It is still the best guide for
 the next optimization priority.
 
-- Artifact: `profiling_kt_codex_smoke/v5_sameconfig_qwen3_s4096_b4_r64_w5_s10_source`
+- Artifact: `profiling_results/profiling_kt_codex_smoke/v5_sameconfig_qwen3_s4096_b4_r64_w5_s10_source`
 - Shape: `Qwen/Qwen3-30B-A3B`, `seq_len=4096`, `batch=4`, `rank=64`,
   `dropout=0.00`
 - Run state: physical GPU 1, `CUDA_VISIBLE_DEVICES=1`, `KT_NUM_THREADS=8`
@@ -82,7 +82,7 @@ Accepted comparison shape for all meaningful LF profiling from here:
 Completed and validated through Stage 4 on the accepted short e2e shape:
 
 - Artifact:
-  `profiling_kt_codex_smoke/v6_stage4_tilebalanced_qwen3_s4096_b4_r64_t64_source`
+  `profiling_results/profiling_kt_codex_smoke/v6_stage4_tilebalanced_qwen3_s4096_b4_r64_t64_source`
 - Validation:
   `PASS KT ARM profile: gpu_id=1 affinity_count=144 wrappers=48 fw=288 bw=144`
 - Shape: `Qwen/Qwen3-30B-A3B`, `seq_len=4096`, `batch=4`,
@@ -127,7 +127,7 @@ Completed and validated through Stage 4 on the accepted short e2e shape:
   trainer `1.8459`
 
 Same short e2e comparison against the Stage 1/2/3 grouped artifact
-`profiling_kt_codex_smoke/v6_stage123_grouped_qwen3_s4096_b4_r64_t64_source`:
+`profiling_results/profiling_kt_codex_smoke/v6_stage123_grouped_qwen3_s4096_b4_r64_t64_source`:
 
 - measured e2e step improved from `311.745 s` to `275.536 s`
   (`-36.209 s`, `-11.6%`)
@@ -163,7 +163,7 @@ Decision after Stage 4:
 Stage 7 full same-config LF acceptance is complete:
 
 - Artifact:
-  `profiling_kt_codex_smoke/v6_accept_qwen3_s4096_b4_r64_w5_s10_t64_source/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a128_drop000/kt_armbf16__source__recomp__polnone__routerhf__expact0/b4_s4096`
+  `profiling_results/profiling_kt_codex_smoke/v6_accept_qwen3_s4096_b4_r64_w5_s10_t64_source/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a128_drop000/kt_armbf16__source__recomp__polnone__routerhf__expact0/b4_s4096`
 - Validation:
   `PASS KT ARM profile: gpu_id=1 affinity_count=144 wrappers=48 fw=1440 bw=720`
 - Shape: `Qwen/Qwen3-30B-A3B`, `seq_len=4096`, `batch=4`,
@@ -300,7 +300,7 @@ One-step same-shape sweep:
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 
 for T in 8 16 32 64; do
-  ART="profiling_kt_codex_smoke/v6_stage0_threads_t${T}_qwen3_s4096_b4_r64_1step"
+  ART="profiling_results/profiling_kt_codex_smoke/v6_stage0_threads_t${T}_qwen3_s4096_b4_r64_1step"
   taskset -c 0-143 env \
     GPU_ID=1 CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
     BACKEND=kt_armbf16 KT_BACKEND=armbf16 KT_PRECISION=bf16 \
@@ -459,7 +459,7 @@ LF validation, using the best thread count from Stage 0:
 ```bash
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 BEST_T=64
-ART="profiling_kt_codex_smoke/v6_stage1_base_qwen3_s4096_b4_r64_t${BEST_T}_source"
+ART="profiling_results/profiling_kt_codex_smoke/v6_stage1_base_qwen3_s4096_b4_r64_t${BEST_T}_source"
 
 taskset -c 0-143 env \
   GPU_ID=1 CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
@@ -637,7 +637,7 @@ LF validation:
 ```bash
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 BEST_T=64
-ART="profiling_kt_codex_smoke/v6_stage2_lora_bwd_qwen3_s4096_b4_r64_t${BEST_T}_source"
+ART="profiling_results/profiling_kt_codex_smoke/v6_stage2_lora_bwd_qwen3_s4096_b4_r64_t${BEST_T}_source"
 
 taskset -c 0-143 env \
   GPU_ID=1 CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
@@ -805,7 +805,7 @@ LF validation:
 ```bash
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 BEST_T=64
-ART="profiling_kt_codex_smoke/v6_stage3_lora_fwd_qwen3_s4096_b4_r64_t${BEST_T}_source"
+ART="profiling_results/profiling_kt_codex_smoke/v6_stage3_lora_fwd_qwen3_s4096_b4_r64_t${BEST_T}_source"
 
 taskset -c 0-143 env \
   GPU_ID=1 CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
@@ -928,7 +928,7 @@ Thread scaling validation:
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 
 for T in 16 32 64; do
-  ART="profiling_kt_codex_smoke/v6_stage4_shards_t${T}_qwen3_s4096_b4_r64_source"
+  ART="profiling_results/profiling_kt_codex_smoke/v6_stage4_shards_t${T}_qwen3_s4096_b4_r64_source"
   taskset -c 0-143 env \
     GPU_ID=1 CUDA_VISIBLE_DEVICES=1 NVIDIA_VISIBLE_DEVICES=1 \
     BACKEND=kt_armbf16 KT_BACKEND=armbf16 KT_PRECISION=bf16 \
@@ -1041,7 +1041,7 @@ LF validation must include:
 - average step time
 
 Use the same Stage 1 LF command shape and artifact naming:
-`profiling_kt_codex_smoke/v6_stage5_repack_qwen3_s4096_b4_r64_t${BEST_T}_source`.
+`profiling_results/profiling_kt_codex_smoke/v6_stage5_repack_qwen3_s4096_b4_r64_t${BEST_T}_source`.
 
 ## Stage 6: Low-Priority Cleanup Only After Math Wins
 
@@ -1151,7 +1151,7 @@ MAX_SAMPLES=60 \
 PROFILE=1 \
 PROFILE_LEVEL=module \
 PROFILE_SYNC=1 \
-OUTPUT_ROOT=profiling_kt_codex_smoke/v6_accept_qwen3_s4096_b4_r64_w5_s10_t${BEST_T}_source \
+OUTPUT_ROOT=profiling_results/profiling_kt_codex_smoke/v6_accept_qwen3_s4096_b4_r64_w5_s10_t${BEST_T}_source \
 scripts/kt/profile_lora_lf_kt.sh
 ```
 
@@ -1162,7 +1162,7 @@ Acceptance validation:
 
 ```bash
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
-ART="profiling_kt_codex_smoke/v6_accept_qwen3_s4096_b4_r64_w5_s10_t${BEST_T}_source"
+ART="profiling_results/profiling_kt_codex_smoke/v6_accept_qwen3_s4096_b4_r64_w5_s10_t${BEST_T}_source"
 PROFILE_JSON="$(find "${ART}" -path '*/b4_s4096/profile.json' -print -quit)"
 TRAIN_LOG="$(dirname "${PROFILE_JSON}")/train.log"
 

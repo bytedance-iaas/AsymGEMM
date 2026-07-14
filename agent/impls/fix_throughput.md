@@ -38,7 +38,7 @@ Three findings that reframe the problem:
 
 ### 0.2 The prize (why this is worth fixing)
 
-Per-token cost after attention-normalization (fitted `c_g`, see `scripts/lf/ceiling_table.py -v`):
+Per-token cost after attention-normalization (fitted `c_g`, see `scripts/lf/ceiling_estimate.py -v`):
 
 - q3-30b asym: `1.65e-4 s/tok` vs superoffload: `1.04e-4 s/tok` (+59%)
 - If the backward stall were fully removed: step ≈ 229.6 + 460 + 12 ≈ 700 s
@@ -63,17 +63,17 @@ Per-token cost after attention-normalization (fitted `c_g`, see `scripts/lf/ceil
 ### 1.1 Rules (same for both backends)
 
 - Steady-state rule: `WARMUP_STEPS=1`, `MAX_STEPS=4` → 4 measured; **drop warmup + last
-  measured step**; report mean of the middle steps (matches `ceiling_table.py`).
+  measured step**; report mean of the middle steps (matches `ceiling_estimate.py`).
 - **`PROFILERS=source` for timing runs** (nsys adds overhead; keep nsys for Phase B only).
-  Note this means timing leaves land under `profiling/` output root — pass
-  `OUTPUT_ROOT=$PWD/profiling_both` (or extend the table script) so anchors stay discoverable.
+  Note this means timing leaves land under `profiling_results/profiling/` output root — pass
+  `OUTPUT_ROOT=$PWD/profiling_results/profiling_both` (or extend the table script) so anchors stay discoverable.
 - **Strictly serial — one experiment on the whole NODE at a time** (not just one per
   GPU): host RAM bandwidth, CPU cores (adam/offload workers), and C2C paths are shared,
   so even different-GPU runs contaminate each other's latency. 30 s settle between runs.
 - Healthy-margin criterion: host `MemAvailable` never within 2× watchdog floor (70 GB)
   during measured steps → else re-run 2–4k lower. Near-wall points get a `thrash` flag,
   not a throughput row.
-- `RUN_NAME="ceiling__<model>__<backend>__<recompute-base>"` so `ceiling_table.py`
+- `RUN_NAME="ceiling__<model>__<backend>__<recompute-base>"` so `ceiling_estimate.py`
   auto-discovers anchors.
 
 ### 1.2 The grid
@@ -273,7 +273,7 @@ Expected landing @32k: C0 done (111.7) + C2/C3/C4 ≈ 85–100 s (the Phase D A/
 the exact split — the per-item brackets overlap); **strict parity with so's 66.6 requires
 C1b (staged-native dispatch) or C1a reaching near-native** — the streamed-kernel gap is
 the irreducible remainder. Re-validate each fix with the Phase A protocol and re-run
-`python3 scripts/lf/ceiling_table.py scripts/lf/ceiling_table_configs.txt`.
+`python3 scripts/lf/ceiling_estimate.py scripts/lf/ceiling_search_both.sh`.
 
 **Success criteria**
 - Backward stall fraction < 20% (from ~63%) on q3-30b @32k.
@@ -445,7 +445,7 @@ ceiling re-search.
 
 ### D6. Cumulative close-out
 - Full stack (all accepted flags) at {32k, 131k, ceiling−2k} ×8 + the q3-32b and llama
-  rows; refresh `ceiling_table.py`; update §2.4 with the final stall budget; declare
+  rows; refresh `ceiling_estimate.py`; update §2.4 with the final stall budget; declare
   against §3 success criteria.
 
 ### Result ledger (fill as stages land)
@@ -511,15 +511,15 @@ close most of it), ceiling re-search (fingerprints move), attention twin of D3
 
 Baselines this pass (5-step protocol, 2026-07-09): run A `d1base__*` = 109.45 s
 (fwd 18.84 / bwd 86.17, 36.8 GiB); superoffload-off reference 66.6 s. D1/D3/D4 runs:
-`d1routelora__*`, `d3keepacts__*`, `d4asyncgc__*` under `profiling_both/`.
+`d1routelora__*`, `d3keepacts__*`, `d4asyncgc__*` under `profiling_results/profiling_both/`.
 
 ---
 
 ## 4. Bookkeeping
 
-- Throughput/ceiling tables: `scripts/lf/ceiling_table.py` (auto) → `ceiling_table.md`;
+- Throughput/ceiling tables: `scripts/lf/ceiling_estimate.py` (auto) → `ceiling_table.md`;
   estimates + manual notes → `ceiling_table_record.md`.
-- Existing per-run artifacts: `profiling_both/asym_long_sft_smoke__lora__lf__bf16/ceiling__*/…/b*_s*_ga*/`.
+- Existing per-run artifacts: `profiling_results/profiling_both/asym_long_sft_smoke__lora__lf__bf16/ceiling__*/…/b*_s*_ga*/`.
 - The ~"198 GB buffer": `ASYM_EXPACT_CPU_POOL_MAX_BYTES` ran at 192 GiB (206 GB) in these
   runs — pool, not a hard activation cap; NVMe spill (`-ceil<N>` + `_actnvme`) stayed OFF.
 - Don't run two jobs on one GPU; driver lock is currently degraded (deleted-inode flock),

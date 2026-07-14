@@ -72,7 +72,7 @@ completed 2+ steps first); the re-run completed cleanly with the numbers above.
 
 ### Full 15-step acceptance (GPU 1) — ACCEPTED, strict validation PASS
 
-Artifact: `profiling_kt_codex_smoke/v11_accept_fwdMB4_qwen3_s4096_b4_r64_w5_s10_t64_source/.../b4_s4096`
+Artifact: `profiling_results/profiling_kt_codex_smoke/v11_accept_fwdMB4_qwen3_s4096_b4_r64_w5_s10_t64_source/.../b4_s4096`
 `PASS gpu_id=1 affinity_count=144 wrappers=48 fw=1440 bw=720`.
 
 | Metric | v10_accept | v11_accept | Delta |

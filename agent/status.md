@@ -179,8 +179,8 @@ Result:
 
 Artifacts:
 
-- A/B root: `profiling/lf_lora_split_accept/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a16_drop000`
-- default smoke: `profiling/lf_lora_split_default_smoke/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s2_r64_a16_drop000/zero3_offload__source__recomp__polnone__routerhf__expact0__attnact0__layeract0__loraafwdcpu__qwenexpertsplit-target-parameters/b4_s4096/source_profile.json`
+- A/B root: `profiling_results/profiling/lf_lora_split_accept/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a16_drop000`
+- default smoke: `profiling_results/profiling/lf_lora_split_default_smoke/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s2_r64_a16_drop000/zero3_offload__source__recomp__polnone__routerhf__expact0__attnact0__layeract0__loraafwdcpu__qwenexpertsplit-target-parameters/b4_s4096/source_profile.json`
 
 ## Qwen3 Attention and Expert Activation Offload Snapshot
 

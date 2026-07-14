@@ -191,7 +191,7 @@ the stagger SCALES with collective bytes, so bigger = more visible pathology.
 Loss-identity checks stay at 20k 2-step (correctness is size-independent).
 No stage advances until its gate passes on the 32k profile.
 
-  BASE32='OUTPUT_ROOT=$PWD/profiling_smoke_fixep PROFILERS=source \
+  BASE32='OUTPUT_ROOT=$PWD/profiling_results/profiling_smoke_fixep PROFILERS=source \
         ASYM_GC_SAVE_ON_CPU_OVERRIDE=false \
         ASYM_EXPACT_CPU_POOL_MAX_BYTES=96000000000 GPU_POOL=0,1 \
         RUNS="q3-30b-a3b|2 ; asym_ep2_cpuadamwds|recomp-off-full-fg-ker101|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" \

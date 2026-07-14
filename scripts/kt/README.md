@@ -7,7 +7,7 @@ stay isolated from the shared LF scripts in `scripts/lf/`.
 - `profile_lora_lf_kt.sh` -> `agent/kt/scripts/profile_lora_lf_kt.sh`
 - `run_lf_lora_sft_kt.sh` -> `agent/kt/scripts/run_lf_lora_sft_kt.sh`
 
-Do not edit `scripts/lf/run_lf_lora_sft.sh` or `scripts/lf/profile_lora_lf.sh`
+Do not edit `scripts/lf/run_lf_lora_sft.sh` or `scripts/lf/profile_lora_lf_test_{source,both}.sh`
 for KT ARM BF16 work. Use GPU 1 first and GPU 2 only as fallback.
 The kt_armbf16 production path is grouped packed SVE/BF16 forward and grouped
 dropout-0 backward. The base backward grads run as register-blocked SVE BFDOT
@@ -23,7 +23,7 @@ Small KT source smoke:
 
 ```bash
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
-ART=profiling_kt_codex_smoke/kt_smoke_qwen3_s64_b1_r8_source
+ART=profiling_results/profiling_kt_codex_smoke/kt_smoke_qwen3_s64_b1_r8_source
 mkdir -p "$ART"
 taskset -c 0-143 env \
   SFT_ROOT=/workspace/AsymGEMM-SFT \
@@ -50,5 +50,5 @@ taskset -c 0-143 env \
   --require-native-kv backward_lora_kernel=grouped_sve_tile_dropout0
 ```
 
-Use `profiling_kt_codex_smoke/v5_*` artifact directories for this KT work.
+Use `profiling_results/profiling_kt_codex_smoke/v5_*` artifact directories for this KT work.
 Use physical GPU 1 first, physical GPU 2 only as fallback, and never GPU 0 or 3.

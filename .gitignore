@@ -41,6 +41,9 @@ vendor/
 submodules/
 # tests/
 
+# NFS silly-rename ghosts (deleted-but-open files)
+.nfs*
+
 # Local profiling/report artifacts
 agent/archive/
 profiling*/

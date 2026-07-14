@@ -37,7 +37,7 @@ SCOPE (--scope / env SCOPE) widens the timed pipeline; same modes/cases:
 
 Usage: scripts/testing/ep_balance_bench.sh (wrapper) or:
   .venv/bin/python scripts/testing/ep_balance_bench.py \
-      --hist profiling_both_epstats/ep_hist_q3_s20000.json \
+      --hist profiling_results/profiling_both_epstats/ep_hist_q3_s20000.json \
       [--modes owned,sdp,plan,queue] [--m-total 5120000] [--alphas natural,0.15]
       [--layers worst,median] [--reps 3] [--gpus 2,3] [--out bench.json]
 """

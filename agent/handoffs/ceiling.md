@@ -33,7 +33,7 @@ for n in 2 10 18 26; do awk -v n=$n '/MemUsed/{print "node"n": "$4/1048576" GiB 
 If a GPU-HBM node grows during training, binding is NOT working — stop and debug; do not trust numbers.
 
 ## TASK — reconfirm two asym ceilings, bound
-Both rows are already active (uncommented) in `scripts/lf/ceiling_search.sh` CONFIGS:
+Both rows are already active (uncommented) in `scripts/lf/ceiling_search_both.sh` CONFIGS:
 1. `q3-32b     | asym_cpuadamwds | recomp-off-full-fg-ker000-ceil0000` (seq0 50000)
 2. `q3-30b-a3b | asym_cpuadamwds | recomp-off-full-fg-ker101-ceil0000` (seq0 128000)
 
@@ -43,7 +43,7 @@ cd <repo>/third_party/AsymGEMM
 STATE_DIR=scripts/lf/ceiling_bound_state \
 CONFIRM_STEPS=4 WARMUP_STEPS=1 PROBE_STEPS=2 PROFILERS=source \
 CEIL_GPU_POOL=<a clean GPU idx> \
-bash scripts/lf/ceiling_search.sh
+bash scripts/lf/ceiling_search_both.sh
 ```
 `NUMACTL_ENABLE` defaults to 1 and the container's numactl binds to 0,1 automatically — **do NOT set
 `NUMACTL_ENABLE=0`**. Set `HF_HOME` / `ENV_DIR` / `CUDA_HOME` as the container needs (see Env below).
@@ -75,7 +75,7 @@ Write bound results into `scripts/lf/profile_lora_lf_test_both.sh` RUNS comments
 - q3-30b-a3b asym (unbound/host): `1110s, C-899, G-183` ← re-verify bound
 
 ## Reference / artifacts
-- Prior unbound (host) artifacts: `profiling_both_ceiling/asym_long_sft_smoke__lora__lf__bf16/qwen3-{32b,30b-a3b}__gpus1__b8_s{68000,172000}_ga1_*`.
+- Prior unbound (host) artifacts: `profiling_results/profiling_both_ceiling/asym_long_sft_smoke__lora__lf__bf16/qwen3-{32b,30b-a3b}__gpus1__b8_s{68000,172000}_ga1_*`.
 - Recovered original in-container ceiling records: `scripts/lf/ceiling_search_state/{ledger,results}.jsonl` + `driver.log`.
 - Host-only numactl workaround (ONLY if forced to run on host; prefer the container's system numactl):
   `scripts/lf/setup_numaenv.sh` provisions gitignored `${ROOT}/.numaenv/{bin,lib}`.

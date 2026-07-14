@@ -281,13 +281,13 @@ OUTPUT_ROOT=${OUTPUT_ROOT:-}
 # field) land in ONE dedicated tree so skewed and natural runs never mix.
 if [[ "${ASYM_EP_SKEW_HOT:-}" != "" || "${ASYM_EP_SKEW_ZIPF:-}" != "" ]] \
    || [[ "${RUNS[*]:-}" =~ [\|][0-9]+[\|](z[0-9.]+|0?[.][0-9]+)[[:space:]]*\; ]]; then
-  OUTPUT_ROOT="${SKEW_OUTPUT_ROOT:-$(pwd)/profiling_both_skew}"
+  OUTPUT_ROOT="${SKEW_OUTPUT_ROOT:-$(pwd)/profiling_results/profiling_both_skew}"
   echo "[driver] skew experiment detected -> output root '${OUTPUT_ROOT}'"
 fi
 ASYM_EP_STATS_COPY_TARGET=""
 if [[ "${ASYM_EP_STATS:-}" == "1" ]]; then
   ASYM_EP_STATS_COPY_TARGET="${ASYM_EP_STATS_PATH:-}"
-  OUTPUT_ROOT="${EPSTATS_OUTPUT_ROOT:-$(pwd)/profiling_both_epstats}"
+  OUTPUT_ROOT="${EPSTATS_OUTPUT_ROOT:-$(pwd)/profiling_results/profiling_both_epstats}"
   echo "[driver] ASYM_EP_STATS=1 -> output root '${OUTPUT_ROOT}' (capture run; timings not quotable)"
 fi
 PROFILE_LEVEL=${PROFILE_LEVEL:-op}
@@ -372,7 +372,7 @@ UTILIZATION_PLOT_SCRIPT="${ASYM_DIR}/scripts/plotting/plot_lf_utilization.py"
 usage() {
   cat <<USAGE
 Usage:
-  scripts/lf/profile_lora_lf.sh [options]
+  scripts/lf/profile_lora_lf_test_source.sh [options]
 
 Defaults:
   --gpus ${GPU_POOL}
@@ -2834,9 +2834,9 @@ if [[ "${both_profiler_selected}" == "true" && "${#profilers[@]}" != "1" ]]; the
 fi
 if [[ -z "${output_root}" ]]; then
   if [[ "${both_profiler_selected}" == "true" ]]; then
-    output_root="${ASYM_DIR}/profiling_both"
+    output_root="${ASYM_DIR}/profiling_results/profiling_both"
   else
-    output_root="${ASYM_DIR}/profiling"
+    output_root="${ASYM_DIR}/profiling_results/profiling"
   fi
 fi
 mapfile -t asym_cpu_adamw_grad_offload_modes < <(

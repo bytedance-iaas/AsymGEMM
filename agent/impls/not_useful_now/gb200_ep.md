@@ -348,7 +348,7 @@ WHY THIS SET IS SAFE: every mechanism class is represented (none "conveniently m
 ## Evidence Discipline
 
 Same as `gb200_tp.md`. One experiment at a time; new `OUTPUT_ROOT` per stage
-(`profiling_gb200ep_e<N>`); pre-run declaration {model, pair, mode, skew, workload, artifact
+(`profiling_results/profiling_gb200ep_e<N>`); pre-run declaration {model, pair, mode, skew, workload, artifact
 tag, comparison row, likely failure}; after: command.txt (ASYM_EP_* echoed), per-device
 step_H, busy-time counters, expert histograms, loss band (non-skew rows only), watchdog
 sentinels. Skew rows carry `loss_invalid=true`. Labels: `validated | blocked_by_stage_bug |
@@ -582,7 +582,7 @@ fwd_s bwd_s opt_s step_s  step_H(g0/g1)  RAM  moe_seg_s  busy0/busy1(%)  imb(%) 
   (c) granularity co-design: whole-expert segments for average experts + hot-expert (>2x avg,
       cap 8) chunks at EP_HOT_CHUNK_ROWS=8192 (wall-minimizing sweep 2048/4096/8192/16384/32768;
       16384 lowers the alpha=0.75 wall further but breaks the <=5% balance gate at alpha=0.5).
-2026-07-06 G-E3.1 VERDICT (validated; profiling_gb200ep_e3/ep_queue_probe_final.json,
+2026-07-06 G-E3.1 VERDICT (validated; profiling_results/profiling_gb200ep_e3/ep_queue_probe_final.json,
   M=1.28M ~= per-layer routed rows of the s20000|8 ker101 dev row):
   numerics: queue union BITWISE == static reference; zero double-compute; counters exact.
   balance: queue imb 2.1/2.2/4.0% at alpha=0.25/0.5/0.75 (static floor: 82/91/94%).
@@ -596,7 +596,7 @@ fwd_s bwd_s opt_s step_s  step_H(g0/g1)  RAM  moe_seg_s  busy0/busy1(%)  imb(%) 
   DEV-PROCESS NOTE: an sglang server (180 GiB) is resident on GPU 3 — pair 0,1 clean; all
     probe runs under numactl --membind=0,1 --cpunodebind=0,1 (HC1).
 2026-07-06 G-E1.2 NATURAL-SKEW MEASURED (validated; |1 q3-30b-a3b s2048|8 ker101, real
-  smoke data, ASYM_EP_STATS=1 -> profiling_gb200ep_e1/ep_balance_natural_s2048.json):
+  smoke data, ASYM_EP_STATS=1 -> profiling_results/profiling_gb200ep_e1/ep_balance_natural_s2048.json):
   hottest single expert 2.4% mean / 5.5% max share (E=128 top-8; mean expert = 0.78%);
   static-E/2 device share: mean 0.530 (=6% imbalance), worst layer mean 0.567, worst
   layer-step 0.631 (slow device +26%); per-layer max >> mean = temporally VOLATILE skew
@@ -619,7 +619,7 @@ fwd_s bwd_s opt_s step_s  step_H(g0/g1)  RAM  moe_seg_s  busy0/busy1(%)  imb(%) 
   bf16 logits, stable sort) — spread router explicitly; default-init tiny models underflow
   bf16 to vacuous zeros — scale weights + guard signal.
 2026-07-06 G-E1.2b SCOUT NATURAL SKEW MEASURED (validated; |1 llama4-scout s2048|8 ker000,
-  real data, first run after auto-download; profiling_gb200ep_e1b/ep_balance_scout_s2048.json):
+  real data, first run after auto-download; profiling_results/profiling_gb200ep_e1b/ep_balance_scout_s2048.json):
   static-E/2 device share MEAN 0.608 across 48 layers (busier GPU +22% on the expert
   segment EVERY step on average); WORST layer-step 0.872 (1.74x the balanced time);
   PERSISTENTLY skewed layers exist (layer 40 mean 0.783; layers 0/20/43 all >0.72 mean);
@@ -642,7 +642,7 @@ fwd_s bwd_s opt_s step_s  step_H(g0/g1)  RAM  moe_seg_s  busy0/busy1(%)  imb(%) 
 2026-07-07 I7-STATIC E2E LANDED (validated; the first two-GPU MoE run through the real
   trainer): q3-30b-a3b|2 asym_stp_cpuadamwds recomp-off-full-fg-ker101 s2048|8, ASYM_STP_MOE=1
   ASYM_EP_MODE=static. LOSS PARITY vs |1 reference: deltas 0.0040/0.0014/0.0049/0.0088
-  across 4 steps (I4 bf16 envelope class). Artifacts: profiling_gb200ep_e2e.
+  across 4 steps (I4 bf16 envelope class). Artifacts: profiling_results/profiling_gb200ep_e2e.
   SHAKE-OUT FIXES (all landed): (a) router-mode whole->hf downgrade allow-list was missing
   the |2 asym family in BOTH driver copies (profile_lora_lf_test_source.sh AND _both.sh
   ~:4529) -> MoE blocks were never asymized under sTP; (b) build_ep_branch_block must SHARE
@@ -749,13 +749,13 @@ E6 paper rows + receipts + freeze                (feeds the paper-story D2 claim
   stage wanted, measured against the REAL vanilla-EP rung instead of the retired
   replicated vehicle — user N2: different data per GPU on BOTH sides):
   MICRO (S5a, transport-identical, real q3 routing histograms; artifact
-  profiling_gb200ep_sg/s5a_balance_bench.json): owned-static costs the TOKEN FLOOR
+  profiling_results/profiling_gb200ep_sg/s5a_balance_bench.json): owned-static costs the TOKEN FLOOR
   (natural 1.09-1.14x, alpha=0.75 tuned 1.72-1.78x = ON the (1+a)/2 arithmetic);
   ownerless queue cures imbalance 0.78-0.835 -> <=0.7%; queue never slower (EG1/EG2/
   EG4 micro PASS; 4.24x-8.58x banked class re-attributed to vanilla per-expert
   enumeration pathology, NOT policy — gate adjustment logged).
   E2E (S5b, allgather-dispatch vanilla-EP = Megatron shape, owned bank slices,
-  loss overlays sEP <=0.008 every step; artifacts profiling_gb200ep_s5b/*):
+  loss overlays sEP <=0.008 every step; artifacts profiling_results/profiling_gb200ep_s5b/*):
     s2048 skew ladder (within-session):  sEP-queue 11.28/13.80/16.83 s vs
     vanilla 14.17/47.50/43.91 s at natural/0.5/0.75 => 1.26x/3.44x/2.61x —
     the queue absorbs skew that detonates ownership (EG1/EG4 e2e PASS).

@@ -50,7 +50,7 @@ constrains CPU capacity for activation offload. Re-stated with steady RSS:
 
 ### Stage 1 (v9) ACCEPTED — short 3-step e2e profile (GPU 1, 64 threads)
 
-Artifact: `profiling_kt_codex_smoke/v9_deadAt_qwen3_s4096_b4_r64_t64_source`
+Artifact: `profiling_results/profiling_kt_codex_smoke/v9_deadAt_qwen3_s4096_b4_r64_t64_source`
 
 | Metric | v8 short | v9 short | Delta |
 |---|---:|---:|---:|

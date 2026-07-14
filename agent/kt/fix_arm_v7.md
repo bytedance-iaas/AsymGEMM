@@ -19,7 +19,7 @@ Keep this work isolated:
 ## Accepted v6 Baseline (the row to beat)
 
 Artifact:
-`profiling_kt_codex_smoke/v6_accept_qwen3_s4096_b4_r64_w5_s10_t64_source/.../b4_s4096`
+`profiling_results/profiling_kt_codex_smoke/v6_accept_qwen3_s4096_b4_r64_w5_s10_t64_source/.../b4_s4096`
 
 Shape: `Qwen/Qwen3-30B-A3B`, `seq_len=4096`, `batch=4`, `rank=64`,
 `dropout=0.00`, `warmup=5`, `measure=10`, `trainer_max_steps=15`, GPU 1,
@@ -197,7 +197,7 @@ in `fix_arm_v6.md` (same shape, GPU 1, `KT_NUM_THREADS=64`).
 ### Stage 1 ACCEPTED — full 15-step LF source profile (GPU 1, KT_NUM_THREADS=64)
 
 Artifact:
-`profiling_kt_codex_smoke/v7_accept_bfdot_qwen3_s4096_b4_r64_w5_s10_t64_source/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a128_drop000/kt_armbf16__source__recomp__polnone__routerhf__expact0/b4_s4096`
+`profiling_results/profiling_kt_codex_smoke/v7_accept_bfdot_qwen3_s4096_b4_r64_w5_s10_t64_source/asym_long_sft_smoke__lora__lf__bf16/qwen3-30b-a3b__gpus1__b4_s4096_w5_s10_r64_a128_drop000/kt_armbf16__source__recomp__polnone__routerhf__expact0/b4_s4096`
 
 Strict validation: `PASS KT ARM profile: gpu_id=1 affinity_count=144 wrappers=48 fw=1440 bw=720`
 (all native KV labels verified, including `backward_base_kernel=grouped_sve_bfdot_tile`).
@@ -244,7 +244,7 @@ Notes:
 Command lines (build / unit tests / short / full acceptance) are in the
 "Canonical commands" section above; the full acceptance used
 `scripts/kt/profile_lora_lf_kt.sh` with
-`OUTPUT_ROOT=profiling_kt_codex_smoke/v7_accept_bfdot_qwen3_s4096_b4_r64_w5_s10_t64_source`,
+`OUTPUT_ROOT=profiling_results/profiling_kt_codex_smoke/v7_accept_bfdot_qwen3_s4096_b4_r64_w5_s10_t64_source`,
 `SEQ_LENS=4096 PER_DEVICE_TRAIN_BATCH_SIZE=4 BACKEND_SPECS='kt_armbf16|recomp'
 GPU_POOL=1 PROFILERS=source WARMUP_STEPS=5 MAX_STEPS=10 LORA_DROPOUT=0.00
 KT_NUM_THREADS=64`.

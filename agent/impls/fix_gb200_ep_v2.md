@@ -14,7 +14,7 @@ FIXED WORKLOAD everywhere:
 
 TABLE 1 — MICRO (each cell: wall ms / GPU-imbalance % / weight-GB streamed per GPU)
 FILLED 2026-07-10, RE-BANKED same day under the final grid-aware chunk policy
-(artifact profiling_both_skew/table1_micro.json; assembled by
+(artifact profiling_results/profiling_both_skew/table1_micro.json; assembled by
 scripts/testing/print_skew_tables.py; zipf wall = mean/worst over 3 ID shuffles)
 
   system            | uniform        | zipf 0.5       | zipf 0.8       | zipf 1.0       | zipf 1.5       | zipf 2.0       | real median   | real worst
@@ -28,7 +28,7 @@ scripts/testing/print_skew_tables.py; zipf wall = mean/worst over 3 ID shuffles)
   ours (queue)      | 14.6/14.6 · 4% · 0.20 | 15.4/15.6 · 3% · 0.44 | 16.3/16.5 · 7% · 0.67 | 15.9/16.3 · 4% · 0.79 | 16.1/16.4 · 1% · 0.97 | 18.2/19.0 · 7% · 1.07 | 15.5 · 3% · 0.43 | 15.4 · 6% · 0.38
 
 TABLE 1b — MICRO, EXPERTS BLOCK (gate+up GEMMs + SiLU*mul + down GEMM; all banks
-streamed; same cells). FILLED 2026-07-10 (profiling_both_skew/table1b_experts.json)
+streamed; same cells). FILLED 2026-07-10 (profiling_results/profiling_both_skew/table1b_experts.json)
 
   system            | uniform        | zipf 0.5       | zipf 0.8       | zipf 1.0       | zipf 1.5       | zipf 2.0        | real median   | real worst
   ------------------|----------------|----------------|----------------|----------------|----------------|-----------------|---------------|---------------
@@ -40,7 +40,7 @@ streamed; same cells). FILLED 2026-07-10 (profiling_both_skew/table1b_experts.js
 TABLE 1c — MICRO, MOE BLOCK (+ router + token gather + weighted combine; combine
 charged at m/2 rows per rank in EVERY mode — post-return combine is balanced in
 all real systems; no cross-GPU token movement, favors EP). FILLED 2026-07-10
-(profiling_both_skew/table1c_moe.json)
+(profiling_results/profiling_both_skew/table1c_moe.json)
 
   system            | uniform        | zipf 0.5       | zipf 0.8       | zipf 1.0        | zipf 1.5        | zipf 2.0        | real median   | real worst
   ------------------|----------------|----------------|----------------|-----------------|-----------------|-----------------|---------------|---------------
@@ -51,7 +51,7 @@ all real systems; no cross-GPU token movement, favors EP). FILLED 2026-07-10
 
 TABLES 1d-1l — MULTI-MODEL MICRO (same modes/columns, pure-z only — no real-trace
 capture exists for these models). FILLED 2026-07-10; artifacts
-profiling_both_skew/table1_{q3235b,q35122b,l4scout}_{gemm,experts,moe}.json;
+profiling_results/profiling_both_skew/table1_{q3235b,q35122b,l4scout}_{gemm,experts,moe}.json;
 full cell grids render via scripts/testing/print_skew_tables.py. Geometry
 verified from the HF configs; workload row-counts scale to fit HBM.
 Summary (mean wall ms · imbalance, uniform -> zipf 2.0):
@@ -92,7 +92,7 @@ Summary (mean wall ms · imbalance, uniform -> zipf 2.0):
     bin-packing (placement cannot split an expert). "ours" has no split to choose.
 
 TABLE 2 — E2E (each cell: step seconds / tokens per second)
-FILLED 2026-07-10 (run dirs in profiling_both_skew/; steady = mean steps 2-4)
+FILLED 2026-07-10 (run dirs in profiling_results/profiling_both_skew/; steady = mean steps 2-4)
 
   system            | natural       | zipf 0.5      | zipf 0.8      | zipf 1.0      | zipf 2.0
   ------------------|---------------|---------------|---------------|---------------|---------------
@@ -161,24 +161,24 @@ C4  E2E ZIPF SAMPLER (asym_gemm/training/qwen3_moe.py, _compute_routing)
       loss finite; no shape/recompute errors.
 
 C5  FILL TABLE 1 (after C1+C2; GPUs 2,3; ~25 min):
-      HIST=profiling_both_epstats/ep_hist_q3_s20000.json \
+      HIST=profiling_results/profiling_both_epstats/ep_hist_q3_s20000.json \
       ALPHAS=z0,z0.5,z0.8,z1.0,z1.5,z2.0,natural \
       MODES=owned,owned_smart,plan,queue SEEDS=3 MTOTAL=5120000 REPS=3 GPUS=2,3 \
-      OUT=profiling_both_skew/table1_micro.json \
+      OUT=profiling_results/profiling_both_skew/table1_micro.json \
       bash scripts/testing/ep_balance_bench.sh
     (natural columns = worst + median layers of HIST, as today. Regenerate the
     histogram any time: ASYM_EP_STATS=1 on a |1 capture run — artifacts land in
-    profiling_both_epstats/ automatically; ASYM_EP_STATS_PATH is an optional
+    profiling_results/profiling_both_epstats/ automatically; ASYM_EP_STATS_PATH is an optional
     extra COPY destination, the canonical file lives inside the run dir.)
 
 C6  FILL TABLE 2 (after C3+C4; GPUs 0,1; one invocation per system, z-rows
     chained in one RUNS string; /dev/shm cleanup before/after each).
     OUTPUT ROUTING (driver-automatic, 2026-07-10): any invocation whose RUNS rows
     carry a |<alpha> or |z<s> model field (or skew envs) is AUTO-routed to
-    profiling_both_skew/ (override: SKEW_OUTPUT_ROOT); ASYM_EP_STATS=1 capture
-    runs are auto-routed to profiling_both_epstats/. Plain runs use OUTPUT_ROOT
+    profiling_results/profiling_both_skew/ (override: SKEW_OUTPUT_ROOT); ASYM_EP_STATS=1 capture
+    runs are auto-routed to profiling_results/profiling_both_epstats/. Plain runs use OUTPUT_ROOT
     as given — skewed, capture, and natural trees can never mix.
-      OUTPUT_ROOT=$PWD/profiling_both_skew MAX_STEPS=4 WARMUP_STEPS=1 \
+      OUTPUT_ROOT=$PWD/profiling_results/profiling_both_skew MAX_STEPS=4 WARMUP_STEPS=1 \
       PROFILERS=source ASYM_GC_SAVE_ON_CPU_OVERRIDE=false \
       ASYM_EXPACT_CPU_POOL_MAX_BYTES=96000000000 GPU_POOL=0,1 \
       RUNS='q3-30b-a3b|2|z0.5 ; asym_sqdp2_cpuadamwds|recomp-off-full-fg-ker101|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false || q3-30b-a3b|2|z0.8 ; ... || q3-30b-a3b|2|z1.0 ; ... || q3-30b-a3b|2|z2.0 ; ...' \
@@ -187,7 +187,7 @@ C6  FILL TABLE 2 (after C3+C4; GPUs 0,1; one invocation per system, z-rows
     - natural cells for sdp2/sqdp2 already exist; ep2's natural row carries the
       host-sync footnote (or waits for the sync-free rebuild).
 
-C7  ASSEMBLY: scripts/testing/print_skew_tables.py — reads profiling_both_skew/table1_micro.json +
+C7  ASSEMBLY: scripts/testing/print_skew_tables.py — reads profiling_results/profiling_both_skew/table1_micro.json +
     the e2e run dirs, prints both tables as markdown (mean/worst for zipf cells,
     steady-mean steps 2-4 for e2e cells, tokens/s = 320000 x 2? NO — tokens/step
     = seq x batch x 2 ranks = 320k; tokens/s = 320000 / step_seconds).
@@ -253,7 +253,7 @@ Facts that matter to us, from a full read of megatron-lm/megatron/core/transform
 ## FULL 4x4x4 MICRO MATRIX (2026-07-13; user-set deliverable): 4 models x
 ## {gemm, experts block, MoE block, WHOLE LAYER (attention seq20k + MoE)} x
 ## {EP owned, DP, plan, queue}, full zipf dial, 3 seeds. Artifacts:
-## profiling_both_skew/table1_* (+ *_layer.json); renders via
+## profiling_results/profiling_both_skew/table1_* (+ *_layer.json); renders via
 ## print_skew_tables.py (rows now EP/DP/plan/queue; oracle dropped per
 ## 2026-07-10 decision). Attention + router + combine are mode-flat by
 ## construction (every scheme shards attention by tokens). Layer-scope
@@ -349,7 +349,7 @@ O7  STREAM-OVERLAP POLISH (low priority)
   - never edit driver scripts while a driver is running (bash reads by offset).
 
 ## RUN LOG (append-only)
-2026-07-10 TABLE-1 FILLED (4 iterations, artifact profiling_both_skew/table1_micro.json):
+2026-07-10 TABLE-1 FILLED (4 iterations, artifact profiling_results/profiling_both_skew/table1_micro.json):
   (r1) wrapper dropped MODES -> silently ran default modes; env passthrough added.
   (r2) owned_smart 35-183 ms from z0.8 up: LPT hands rank0 few/one segment(s) ->
   kernel grid (n_block, segment) starvation (~12 CTAs on 148 SMs) — a kernel-shape
@@ -382,7 +382,7 @@ O7  STREAM-OVERLAP POLISH (low priority)
   prediction 10.43% (raw 18.4% compressed by 8-distinct draws toward the 12.5%
   cap); rank curve [10.45, 7.55, 5.74, 4.60]% == unit draw; ep_hist.json records
   skew_zipf=1.0 + loss_invalid=true; loss finite (9.50->9.14, garbage by design);
-  no shape/recompute errors; run auto-routed to profiling_both_epstats/ with label
+  no shape/recompute errors; run auto-routed to profiling_results/profiling_both_epstats/ with label
   asym_cpuadamwds_zipf10 (stats routing wins over skew routing for capture runs —
   capture timings are never quotable).
 2026-07-10 TABLE-2 EXPECTATIONS (pre-run, B1): sdp2/sqdp2 FLAT across every z
@@ -394,13 +394,13 @@ O7  STREAM-OVERLAP POLISH (low priority)
   (z rows loss-invalid by design). Natural cells REMEASURED here (old parity runs
   lived in the deleted stale trees).
 2026-07-10 TABLE-2 FILLED (15 runs, 3 ladders, ~2.5 h; artifacts
-  profiling_both_skew/.../qwen3-30b-a3b__gpus2__b8_s20000_ga1_w1_s4_r64_a16_drop000/).
-  ROUTE BUG + FIX: the 15 runs first landed in profiling/ — the skew auto-route
+  profiling_results/profiling_both_skew/.../qwen3-30b-a3b__gpus2__b8_s20000_ga1_w1_s4_r64_a16_drop000/).
+  ROUTE BUG + FIX: the 15 runs first landed in profiling_results/profiling/ — the skew auto-route
   tested "${RUNS:-}", but the driver rebuilds RUNS as an ARRAY before that block,
   so only row 1 (natural) was tested. Fix: match on "${RUNS[*]:-}" (both drivers,
   synced); validated — natural-first multi-row RUNS now prints "skew experiment
-  detected -> profiling_both_skew" under DRY_RUN=true. Run dirs moved (mv, model-dir
-  level) into profiling_both_skew/; nothing else in profiling/ touched.
+  detected -> profiling_results/profiling_both_skew" under DRY_RUN=true. Run dirs moved (mv, model-dir
+  level) into profiling_results/profiling_both_skew/; nothing else in profiling_results/profiling/ touched.
   VERDICTS vs expectations: ours-no-queue/queue FLAT-ISH 57.7 -> 62.6 s (+8% at
   z2.0, all of it fwd+bwd expert-GEMM segment-shape cost — identical with and
   without queue, opt flat; band was 55.5-58, actual base 57.7-57.8 OK, the +8%
@@ -496,7 +496,7 @@ O7  STREAM-OVERLAP POLISH (low priority)
   AND balanced at every s, on every scope, on every model.
 2026-07-10 SEP ROW ADDED (user ask): full 12-sweep re-run with
   MODES=owned,owned_smart,sep,queue (3-mode jsons archived in
-  profiling_both_skew/archive_3mode/). sep = "ours (plan)": chunked-LPT over the
+  profiling_results/profiling_both_skew/archive_3mode/). sep = "ours (plan)": chunked-LPT over the
   union with mega-expert splitting (placement cannot split, the plan CAN — union
   A is rank-local), _chunk_local execution courtesy applied like the other
   placed modes; NO per-unit steal costs, NO runtime correction. READINGS: with
@@ -540,7 +540,7 @@ O7  STREAM-OVERLAP POLISH (low priority)
   --mode plan PASS (bitwise, incl. the 3:1 skew case where the cut lands inside
   rank0's section and side1 executes 43 stolen segments); e2e 2-step smoke of
   both backends in flight (loss parity + label check).
-2026-07-10 SEP RENAME E2E VALIDATION (receipts; smokes in profiling_smoke_seprename/):
+2026-07-10 SEP RENAME E2E VALIDATION (receipts; smokes in profiling_results/profiling_smoke_seprename/):
   CORRECTNESS all green: loss overlay sepplan2 vs sepqueue2 <=0.006 at every
   step (1.5408/1.5460 class at 20k step5); run-dir labels carry the canonicals;
   legacy aliases resolve at the driver (asym_sqep2_cpuadamwds and bare asym_sep2

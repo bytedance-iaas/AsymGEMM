@@ -61,7 +61,7 @@ reference/dropout tests + e2e loss. HBM peaks must stay flat.
 
 ### Stage 1 (v8) ACCEPTED — full 15-step LF source acceptance (GPU 1, 64 threads)
 
-Artifact: `profiling_kt_codex_smoke/v8_accept_sharedT_qwen3_s4096_b4_r64_w5_s10_t64_source/.../b4_s4096`
+Artifact: `profiling_results/profiling_kt_codex_smoke/v8_accept_sharedT_qwen3_s4096_b4_r64_w5_s10_t64_source/.../b4_s4096`
 Strict validation: `PASS gpu_id=1 affinity_count=144 wrappers=48 fw=1440 bw=720`
 (BFDOT label intact, `backward_base_transpose_ms` present).
 

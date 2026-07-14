@@ -166,7 +166,7 @@ any qwen3.5 run without attnfa4 in the path = inconclusive_wrong_config (history
 ```
 
 This retroactively demotes ALL existing dense artifacts: the 2026-07-03 canonical-
-attention gate (`profiling_dense27b_fixed_s30000_*`: asym_cpuadamwds 71,228.31 MiB,
+attention gate (`profiling_results/profiling_dense27b_fixed_s30000_*`: asym_cpuadamwds 71,228.31 MiB,
 loss 1.143, −38.7% vs superoffload_mem|unsloth 116,170.70 MiB — same CPUAdamW family
 as this plan) proved the dense fg MECHANISM and the norm fix, but it is non-FA4 and
 it was never compared against `unsloth-off`. It is background evidence, not this
@@ -226,7 +226,7 @@ Dry-run proof (also proves the FA4 auto-default and the CPUAdamW family):
 ```bash
 RUNS='q3.5-27b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 128|1|1 ; none|false|false|false|false|false' \
 DRY_RUN=true PREPARE_DATASETS=false PLOT=false RUN_POST=false \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_dryrun RUNS_LOG=profiling_fix_qwen35dense_fa4_dryrun/runs.log \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_dryrun RUNS_LOG=profiling_results/profiling_fix_qwen35dense_fa4_dryrun/runs.log \
 GPU_POOL=0 PROFILERS=source MAX_STEPS=1 WARMUP_STEPS=1 \
 bash scripts/lf/profile_lora_lf_test_source.sh
 ```
@@ -254,13 +254,13 @@ Negative guard proofs (each must fail loudly):
 # 1. routed kernels on a dense model
 RUNS='q3.5-27b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101|ligerloss1 ; 128|1|1 ; none|false|false|false|false|false' \
 DRY_RUN=true PREPARE_DATASETS=false PLOT=false RUN_POST=false \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_dryrun_bad GPU_POOL=0 PROFILERS=source MAX_STEPS=1 WARMUP_STEPS=1 \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_dryrun_bad GPU_POOL=0 PROFILERS=source MAX_STEPS=1 WARMUP_STEPS=1 \
 bash scripts/lf/profile_lora_lf_test_source.sh
 
 # 2. a nonzero activation ceiling on a non-NVMe backend
 RUNS='q3.5-27b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil32|ligerloss1 ; 128|1|1 ; none|false|false|false|false|false' \
 DRY_RUN=true PREPARE_DATASETS=false PLOT=false RUN_POST=false \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_dryrun_bad GPU_POOL=0 PROFILERS=source MAX_STEPS=1 WARMUP_STEPS=1 \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_dryrun_bad GPU_POOL=0 PROFILERS=source MAX_STEPS=1 WARMUP_STEPS=1 \
 bash scripts/lf/profile_lora_lf_test_source.sh
 ```
 
@@ -280,8 +280,8 @@ Run experiments one at a time. Do not run baselines and targets in parallel whil
 validating this path, and do not run ANY of this concurrently with a host-RAM-heavy
 job on the same box (e.g. NVMe pager bring-up runs): the host-OOM watchdog referees
 both and will kill the wrong one. Use a new `OUTPUT_ROOT` per stage (the
-`profiling_fix_qwen35dense_fa4_*` names below) so artifacts are never overwritten and
-never confused with the pre-FA4 `profiling_dense27b_*` history.
+`profiling_results/profiling_fix_qwen35dense_fa4_*` names below) so artifacts are never overwritten and
+never confused with the pre-FA4 `profiling_results/profiling_dense27b_*` history.
 
 Before each run, write down:
 
@@ -332,7 +332,7 @@ dense_mlp_finegrained_offload_wrapped == 0
 USE_ASYM_CPU_ADAMW=true missing from the target row (wrong family)
 a _nocpuadamw/asym row leaked onto this scoreboard (wrong family)
 only one bar was run or reported (BOTH superoffload_mem rows are required)
-stale artifact was reused (anything under profiling_dense27b_* or pre-2026-07-03)
+stale artifact was reused (anything under profiling_results/profiling_dense27b_* or pre-2026-07-03)
 ```
 
 Conclusion labels:
@@ -357,11 +357,11 @@ Run each row separately:
 
 ```bash
 RUNS='q3.5-27b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_s2048 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_s2048 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 
 RUNS='q3.5-27b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_s2048 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_s2048 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 ```
 
@@ -388,15 +388,15 @@ Run each row separately:
 
 ```bash
 RUNS='q3.5-27b|1 ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_s8192 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_s8192 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 
 RUNS='q3.5-27b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_s8192 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_s8192 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 
 RUNS='q3.5-27b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_s8192 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_s8192 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 ```
 
@@ -437,15 +437,15 @@ Run each row separately:
 
 ```bash
 RUNS='q3.5-27b|1 ; superoffload_mem|unsloth|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_s30000 MAX_STEPS=2 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_s30000 MAX_STEPS=2 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 
 RUNS='q3.5-27b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_s30000 MAX_STEPS=2 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_s30000 MAX_STEPS=2 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 
 RUNS='q3.5-27b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 30000|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_s30000 MAX_STEPS=2 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_s30000 MAX_STEPS=2 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 ```
 
@@ -474,15 +474,15 @@ Run each row separately:
 
 ```bash
 RUNS='q3.5-27b|1 ; superoffload_mem|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_s50000 MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_s50000 MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 
 RUNS='q3.5-27b|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_s50000 MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_s50000 MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 
 RUNS='q3.5-27b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_s50000 MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_s50000 MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 ```
 
@@ -516,15 +516,15 @@ never merged with the main one):
 
 ```bash
 RUNS='q3.5-27b|1 ; superoffload_mem_nocpuadamw|unsloth|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_s50000_nocpuadamw MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_s50000_nocpuadamw MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 
 RUNS='q3.5-27b|1 ; superoffload_mem_nocpuadamw|unsloth-off|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_s50000_nocpuadamw MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_s50000_nocpuadamw MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 
 RUNS='q3.5-27b|1 ; asym|recomp-off-full-fg-ker000|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_qwen35dense_fa4_s50000_nocpuadamw MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_qwen35dense_fa4_s50000_nocpuadamw MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 ```
 

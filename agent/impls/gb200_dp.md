@@ -153,7 +153,7 @@ NEW scripts/lf/aggregate_dp_ranks.py    tiny: collect per-rank profile.json/trai
 
 ```bash
 RUNS='q3-32b|2 ; superoffload_mem|unsloth-off|ligerloss1 ; 20000|4|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_gb200dp_d0 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
+OUTPUT_ROOT=profiling_results/profiling_gb200dp_d0 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
 # PAPER PHASE (deferred): zero3 rows, the other 4 models, b4 boundary probes, b1 max-seq
 # probes (b1 = DP's structural frontier: each rank carries the FULL sequence).
 ```
@@ -209,7 +209,7 @@ REFERENCE solo rows: the SAME |1 b4 row run ALONE (fresh, same day) — the cont
 # solo references first (q3-32b 20000|4|1 and 20000|8|1), then the pair (DEV row only):
 bash scripts/lf/run_dp2_pair.sh --model q3-32b --row '20000|4|1' \
   --backend asym_cpuadamwds --recomp recomp-off-full-fg-ker000 --loss ligerloss1 \
-  --output-root profiling_gb200dp_d1
+  --output-root profiling_results/profiling_gb200dp_d1
 ```
 
 **Metrics to emit/check (D1):**
@@ -383,7 +383,7 @@ dp2_probe artifacts carry the `dp2_probe` tag and never appear in the DP trainin
   oom_adj 1000): step_s 134.6 (fwd 9.4 / bwd 125.2 / opt 0.1 — SuperOffload folds optimizer work
   into bwd), step_H(rank0) 22.2 GiB, RSS ~165.5 GiB PER RANK (both ranks confirmed via external
   sampler; summed ~331 GiB), losses 1.21-1.25. G-D0.1..3 PASS. Evidence:
-  profiling_gb200dp_d0/{dp_row.json,external_sampler.csv,PRERUN.md}.
+  profiling_results/profiling_gb200dp_d0/{dp_row.json,external_sampler.csv,PRERUN.md}.
 2026-07-06 G-D0.2 FIX: profile/heartbeat writes are rank0-gated, so every rank now writes
   rank<R>_memstats.json (per-device HBM peaks + RSS) from run_lf_profiled_train.py's finally
   block; THIS D0 run used an external /proc+nvidia-smi sampler instead (already running).
@@ -410,7 +410,7 @@ dp2_probe artifacts carry the `dp2_probe` tag and never appear in the DP trainin
   explicitly); second bug: $(launch_rank) command substitution reparents the child so wait()
   fails instantly -> launch via function-in-background. Concurrent host-weight pinning of two
   64 GB arenas is slow (~10+ min vs ~5 solo) — cudaHostAlloc serializes; a contention datum.
-  Evidence: profiling_gb200dp_d1/dp2_probe_merged.json.
+  Evidence: profiling_results/profiling_gb200dp_d1/dp2_probe_merged.json.
 2026-07-06 D2 VALIDATED (Route A works; LlamaFactory guards relaxed under ASYM_DP=1 at
   parser.py:252/:517). PARITY (s2048, 8 samples, b8 vs b4x2, init transplanted):
   rank0-vs-rank1 post-reduce grads BIT-IDENTICAL (DDP mechanics exact); dp2-vs-|1 grad-norm

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Assemble the two skew tables (fix_gb200_ep_v2.md GOALS) as markdown.
 
-Table 1 (micro): profiling_both_skew/table1_micro.json from ep_balance_bench.
-Table 2 (e2e):   run dirs under profiling_both_skew/ (and any extra roots passed
+Table 1 (micro): profiling_results/profiling_both_skew/table1_micro.json from ep_balance_bench.
+Table 2 (e2e):   run dirs under profiling_results/profiling_both_skew/ (and any extra roots passed
                  via --e2e-root) written by profile_lora_lf_test_both/_source.
 
 Usage:
   python3 scripts/testing/print_skew_tables.py \
-      [--micro profiling_both_skew/table1_micro.json] \
-      [--e2e-root profiling_both_skew] [--warmup 1]
+      [--micro profiling_results/profiling_both_skew/table1_micro.json] \
+      [--e2e-root profiling_results/profiling_both_skew] [--warmup 1]
 """
 
 from __future__ import annotations
@@ -134,37 +134,37 @@ def e2e_table(roots: list[str], warmup: int) -> list[str]:
 
 
 MICRO_TABLES = [
-    ("profiling_both_skew/table1_micro.json",
+    ("profiling_results/profiling_both_skew/table1_micro.json",
      "Table 1 — q3-30b-a3b micro, one expert GEMM (128E top-8, N=768 K=2048, 5.12M rows)"),
-    ("profiling_both_skew/table1b_experts.json",
+    ("profiling_results/profiling_both_skew/table1b_experts.json",
      "Table 1b — q3-30b-a3b micro, experts block: gate+up GEMMs, SiLU*mul, down GEMM"),
-    ("profiling_both_skew/table1c_moe.json",
+    ("profiling_results/profiling_both_skew/table1c_moe.json",
      "Table 1c — q3-30b-a3b micro, MoE block: router + gather + experts block + combine"),
-    ("profiling_both_skew/table1_q3235b_gemm.json",
+    ("profiling_results/profiling_both_skew/table1_q3235b_gemm.json",
      "Table 1d — q3-235b-a22b micro, one expert GEMM (128E top-8, N=1536 K=4096, 3.84M rows)"),
-    ("profiling_both_skew/table1_q3235b_experts.json",
+    ("profiling_results/profiling_both_skew/table1_q3235b_experts.json",
      "Table 1e — q3-235b-a22b micro, experts block"),
-    ("profiling_both_skew/table1_q3235b_moe.json",
+    ("profiling_results/profiling_both_skew/table1_q3235b_moe.json",
      "Table 1f — q3-235b-a22b micro, MoE block"),
-    ("profiling_both_skew/table1_q35122b_gemm.json",
+    ("profiling_results/profiling_both_skew/table1_q35122b_gemm.json",
      "Table 1g — q3.5-122b-a10b micro, one expert GEMM (256E top-8, N=1024 K=3072, 5.12M rows)"),
-    ("profiling_both_skew/table1_q35122b_experts.json",
+    ("profiling_results/profiling_both_skew/table1_q35122b_experts.json",
      "Table 1h — q3.5-122b-a10b micro, experts block"),
-    ("profiling_both_skew/table1_q35122b_moe.json",
+    ("profiling_results/profiling_both_skew/table1_q35122b_moe.json",
      "Table 1i — q3.5-122b-a10b micro, MoE block (+ shared expert N=1024, mode-flat)"),
-    ("profiling_both_skew/table1_l4scout_gemm.json",
+    ("profiling_results/profiling_both_skew/table1_l4scout_gemm.json",
      "Table 1j — llama4-scout micro, fused gate_up GEMM (16E top-1, N=8192 K=5120, 1.28M rows)"),
-    ("profiling_both_skew/table1_l4scout_experts.json",
+    ("profiling_results/profiling_both_skew/table1_l4scout_experts.json",
      "Table 1k — llama4-scout micro, experts block (fused gate_up + SiLU*mul + down)"),
-    ("profiling_both_skew/table1_l4scout_moe.json",
+    ("profiling_results/profiling_both_skew/table1_l4scout_moe.json",
      "Table 1l — llama4-scout micro, MoE block (+ shared expert N=8192, mode-flat)"),
-    ("profiling_both_skew/table1_q330b_layer.json",
+    ("profiling_results/profiling_both_skew/table1_q330b_layer.json",
      "Table 1m — q3-30b-a3b micro, WHOLE LAYER (attention seq20k + MoE block)"),
-    ("profiling_both_skew/table1_q3235b_layer.json",
+    ("profiling_results/profiling_both_skew/table1_q3235b_layer.json",
      "Table 1n — q3-235b-a22b micro, WHOLE LAYER"),
-    ("profiling_both_skew/table1_q35122b_layer.json",
+    ("profiling_results/profiling_both_skew/table1_q35122b_layer.json",
      "Table 1o — q3.5-122b-a10b micro, WHOLE LAYER"),
-    ("profiling_both_skew/table1_l4scout_layer.json",
+    ("profiling_results/profiling_both_skew/table1_l4scout_layer.json",
      "Table 1p — llama4-scout micro, WHOLE LAYER"),
 ]
 
@@ -176,7 +176,7 @@ def main() -> None:
     ap.add_argument("--e2e-root", action="append", default=None)
     ap.add_argument("--warmup", type=int, default=1)
     args = ap.parse_args()
-    roots = args.e2e_root or ["profiling_both_skew"]
+    roots = args.e2e_root or ["profiling_results/profiling_both_skew"]
     micros = [(p, f"Table 1 — micro ({p})") for p in args.micro] if args.micro else MICRO_TABLES
 
     for path, title in micros:

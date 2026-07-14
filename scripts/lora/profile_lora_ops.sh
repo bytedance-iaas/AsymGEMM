@@ -12,7 +12,7 @@ BACKENDS="torch,asym"
 OPERATIONS="full_lora"
 BATCH_SIZES="1"
 SEQ_LENS="4096"
-# Same default tensor sizes as scripts/lora/profile_transpose.sh, expressed as
+# Same default tensor sizes as the former scripts/lora/profile_transpose.sh (removed), expressed as
 # LoRA feature pairs IN|OUT with tokens=M=2048:
 #   gate/up: X[M,H] @ W[I,H].T -> Y[M,I]
 #   down:    X[M,I] @ W[H,I].T -> Y[M,H]
@@ -29,7 +29,7 @@ BACKWARD="both"
 CUDA_GRAPH=true
 
 PYTHON_BIN="${PYTHON_BIN:-${PYTHON:-python3}}"
-OUTPUT_ROOT="${ROOT}/profiling"
+OUTPUT_ROOT="${ROOT}/profiling_results/profiling"
 OUTPUT_DIR=""
 RUN_NAME=""
 SAVE_RESULTS=true
@@ -72,7 +72,7 @@ Options:
   --iters N
   --backward true|false|both
   --cuda-graph true|false
-  --output-root DIR     base output root; default: third_party/AsymGEMM/profiling
+  --output-root DIR     base output root; default: third_party/AsymGEMM/profiling_results/profiling
                        default layout: <root>/lora_ops_<precision>/<operation>__b<batch>_s<seq>_r<rank>
   --output-dir DIR      exact config root; overrides the default config directory
   --run-name NAME       optional config directory under lora_ops_<precision>
@@ -89,7 +89,7 @@ Default MoE-shaped LoRA tensors:
   tokens = batch_size * seq_len = 1 * 2048 = 2048
   gate/up: 2048|768 and 4096|1536
   down:    768|2048 and 1536|4096
-  These correspond to profile_transpose.sh shapes:
+  These correspond to the former profile_transpose.sh shapes:
     2048|2048|768 2048|4096|1536 2048|768|2048 2048|1536|4096
 USAGE
 }
