@@ -304,3 +304,30 @@ keep only as a fallback if the staged path misbehaves.
   lever there is CPU-side (actnvme / -ceil budget), not HBM.
 - 160k 30B needs a real >131k-token dataset for loss-valid runs (smoke source maxes
   ~131k; tokenizer warning at build time; labels fully masked → loss 0.0).
+
+---
+
+## Post-merge dial verification (2026-07-13, main_kevin merge 36af646)
+
+After merging EP work (SFT-38) into main_kevin, re-ran the 120k dial (source
+profiler, w1+m4) to check the memory/latency modes vs the banked records. `_C`
+rebuilt against venv torch 2.12 (scripts/lf/rebuild_asymgemm.sh).
+
+| config | s/it mine→rec | alloc HBM mine→rec | reserved mine→rec | CPU RSS mine→rec | loss |
+|---|---|---|---|---|---|
+| memory (L0, ker101)          | 483.8 → 483.6 | 104.6 → 97.3  | 116.2 → 100.3 | 614 → 572 | 1.647 |
+| latency (L3, ker000+staged+keepacts) | 352.6 → 352.5 | 126.7 → 118.0 | 193.3 → 180.0 | 555 → 517 | 1.644 |
+| REF superoffload_mem         | 474.1 → ~475  | 150.1 → 139.8 | 151.0 → 140.7 | 662 → 617 | 1.642 |
+
+Findings:
+- **Speed matches records exactly** for all three (Δs/it < 0.3 s). Relationship
+  intact: memory = lower HBM + slower; latency = higher HBM + 27% faster; both
+  dominate superoffload. Loss parity across all three.
+- Every config sits ~+7–10 GiB HBM / +40–45 GB CPU RSS above its own record by a
+  **uniform** amount — INCLUDING superoffload_mem, a fully independent code path
+  (unsloth GC, roots-HBM, no asym fg kernels / pad path / chunking). Because the
+  non-asym baseline shifted by the same amount, the offset is a system-wide
+  measurement/env baseline drift vs the 2026-07-12 bank, NOT a merge regression in
+  the asym memory/latency machinery.
+- torch_fallback=0 on both asym modes; L3 shows torch_forward via the staged
+  native-mm dispatch (expected, ASYM_GEMM_DISPATCH=staged).
