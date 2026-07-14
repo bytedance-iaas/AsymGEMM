@@ -90,8 +90,8 @@ if [[ "${_RUNS_ENV_SET}" == "true" ]]; then
   done <<< "${_runs_env_lines}"
 else
   RUNS=(
-    # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm8|ligerloss1 ; 68000|8|1 ; none|false|false|false|false|false" # xs, C-x, G-x, C-OOM 66k [DONE]
-    # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false" # xs, C-896, G-181, G-OOM 188k [IP]
+    "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm8|ligerloss1 ; 65000|8|1 ; none|false|false|false|false|false"
+    "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm16|ligerloss1 ; 174000|8|1 ; none|false|false|false|false|false"
 
     # "q3-30b-a3b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 131000|8|1 ; none|false|false|false|false|false" # 532s, C-618, G-153, C-OOM 132k [DONE]
     # "q3-32b|1 ; superoffload_mem|unsloth-off-ohbm4|ligerloss1 ; 53000|8|1 ; none|false|false|false|false|false" # 444s, C-845, G-181, C-OOM 54k [DONE]
@@ -183,14 +183,14 @@ PRECISION=${PRECISION:-bf16}
 LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 
 # Training
-MAX_STEPS=${MAX_STEPS:-3}
-WARMUP_STEPS=${WARMUP_STEPS:-1}
+# MAX_STEPS=${MAX_STEPS:-3}
+# WARMUP_STEPS=${WARMUP_STEPS:-1}
 # MAX_STEPS=${MAX_STEPS:-6}
 # WARMUP_STEPS=${WARMUP_STEPS:-6}
 # MAX_STEPS=${MAX_STEPS:-7}
 # WARMUP_STEPS=${WARMUP_STEPS:-3}
-# MAX_STEPS=${MAX_STEPS:-1}
-# WARMUP_STEPS=${WARMUP_STEPS:-1}
+MAX_STEPS=${MAX_STEPS:-1}
+WARMUP_STEPS=${WARMUP_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 # LORA_PARAMS is the canonical LoRA knob: sweep tuples, each "dropout|rank|alpha[|target]".
 # Older LORA_DROPOUT/LORA_RANK/LORA_ALPHA knobs still seed the default tuple.
