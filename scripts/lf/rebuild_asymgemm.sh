@@ -23,10 +23,16 @@
 #     both).
 #
 # USAGE
-#   asym40_enroot_run                               # then, inside the container:
-#   bash third_party/AsymGEMM/scripts/lf/rebuild_asymgemm.sh
-#   # or non-interactively via a wrapper: bash .../scripts/lf/rebuild_asymgemm.sh
-#   BUILD_VENV=.venv-fa4 bash .../scripts/lf/rebuild_asymgemm.sh   # build via fa4 env
+#   * MUST run INSIDE the enroot container (asym40_enroot_run). NOT on the host.
+#   * Do NOT activate a venv first — the script calls the venv's python by absolute
+#     path (.venv/bin/python -m pip ...), which installs into that venv. Activation
+#     is unnecessary; being in the container is what matters.
+#
+#   asym40_enroot_run                               # enter the container, then:
+#   bash third_party/AsymGEMM/scripts/lf/rebuild_asymgemm.sh          # build via .venv
+#   BUILD_VENV=.venv-fa4 bash third_party/AsymGEMM/scripts/lf/rebuild_asymgemm.sh
+#   # (.venv and .venv-fa4 share the same py3.12 + torch 2.12 ABI, so one built .so
+#   #  serves both; the script verifies it loads under each.)
 # =============================================================================
 set -euo pipefail
 
