@@ -99,7 +99,7 @@ Shell options:
   --expert-recompute-policies LIST     MoE expert policies: none,tok-le128,tok-ge128,tok64-256, and -act variants.
   --jobs-per-gpu N                    Concurrent Python driver jobs per GPU.
   --python-bin PATH                   Python interpreter. Default: PYTHON or python3.
-  --output-root PATH                  Base output root. Default: profiling.
+  --output-root PATH                  Base output root. Default: profiling_results/profiling.
                                       Default layout: <root>/lora__e2e__<precision>/<workload>__b<batch>_s<seqs>_r<rank>_a<alpha>
   --run-name NAME                     Optional config directory under lora__e2e__<precision>.
   --precision NAME                    Result precision label and output precision directory suffix.

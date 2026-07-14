@@ -63,7 +63,7 @@ All file paths in this section are under `/home/shutianluo/kevin/AsymGEMM-SFT/th
 0. Create the isolated repository directory `/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM-SO`.
 
    - Copy from `/home/shutianluo/kevin/AsymGEMM-SFT/third_party/AsymGEMM/` with `rsync -a --delete`.
-   - Exclude `.git/`, `.venv/`, `build/`, `dist/`, `*.egg-info/`, `__pycache__/`, `.pytest_cache/`, `profiling/`, `profiling_kt/`, `wandb/`, and generated trace files.
+   - Exclude `.git/`, `.venv/`, `build/`, `dist/`, `*.egg-info/`, `__pycache__/`, `.pytest_cache/`, `profiling_results/profiling/`, `profiling_results/profiling_kt/`, `wandb/`, and generated trace files.
    - Initialize a new Git repository in `AsymGEMM-SO` with `git init`.
    - Commit the copied baseline in `AsymGEMM-SO` before SuperOffload edits.
    - Do not create symlinks from `AsymGEMM-SO` back into production `AsymGEMM`.
@@ -190,8 +190,8 @@ rsync -a --delete \
   --exclude '*.egg-info/' \
   --exclude '__pycache__/' \
   --exclude '.pytest_cache/' \
-  --exclude 'profiling/' \
-  --exclude 'profiling_kt/' \
+  --exclude 'profiling_results/profiling/' \
+  --exclude 'profiling_results/profiling_kt/' \
   --exclude 'wandb/' \
   --exclude '*.nsys-rep' \
   --exclude '*.sqlite' \
@@ -416,8 +416,8 @@ rsync -a --delete \
   --exclude '*.egg-info/' \
   --exclude '__pycache__/' \
   --exclude '.pytest_cache/' \
-  --exclude 'profiling/' \
-  --exclude 'profiling_kt/' \
+  --exclude 'profiling_results/profiling/' \
+  --exclude 'profiling_results/profiling_kt/' \
   --exclude 'wandb/' \
   --exclude '*.nsys-rep' \
   --exclude '*.sqlite' \

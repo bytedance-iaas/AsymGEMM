@@ -54,7 +54,7 @@ llama4-scout|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 9500|8|1
 Baseline freshness rules:
 
 1. A completed `superoffload_mem|unsloth|ligerloss1` llama4-scout artifact exists at
-   s9500.b8 (`profiling_both/.../llama-4-scout-17b-16e__gpus1__b8_s9500_ga1_w1_s3_r64_a128_drop000/...`):
+   s9500.b8 (`profiling_results/profiling_both/.../llama-4-scout-17b-16e__gpus1__b8_s9500_ga1_w1_s3_r64_a128_drop000/...`):
    step_H 177018.35 MiB (~172.9 GiB), peak reserved 184508 MiB (at the HBM edge; the
    s10000 attempt failed G-OOM), RSS peak ~539 GiB. It was produced with `r64/a128`
    under an older harness. Treat it as context only. The scoreboard rows must all be
@@ -200,7 +200,7 @@ the reason Phase A must be measured before any implementation work:
 
 Precedent that a ker000 MoE target is legitimate: `qwen3_5-35b-a3b` (MoE) completed
 `asym_cpuadamwds|recomp-off-full-fg-ker000` with `moefg=0` at s45000.b8
-(step_H 112133.00 MiB, RSS 395095.56 MiB, `profiling_q35_35b_a3b_*`). Phase A for
+(step_H 112133.00 MiB, RSS 395095.56 MiB, `profiling_results/profiling_q35_35b_a3b_*`). Phase A for
 llama4-scout is the same composition; the routed experts rely on CPU-resident banks plus
 outer `unsloth-off` coverage of the recompute graph.
 
@@ -350,7 +350,7 @@ misread the model topology.
      run — never bundled into a scoreboard row.
 2. CPU RSS budget. The box has ~958 GiB usable CPU RAM across the two Grace nodes. The
    only completed llama4 asym ligerloss1 artifact (s4096.b8, old-style label,
-   `profiling_both_c/...`) already peaked at RSS ~904353 MiB (~883 GiB). Phase A adds
+   `profiling_results/profiling_both_c/...`) already peaked at RSS ~904353 MiB (~883 GiB). Phase A adds
    `unsloth-off` CPU saved tensors and CPUAdamW state on top of the CPU-resident base
    weights (~218 GB of frozen banks at bf16, more if host copies are wider under
    `training_bf16=false`). Run rows STRICTLY sequentially, never in parallel with any
@@ -398,7 +398,7 @@ Positive dry-run proof:
 ```bash
 RUNS='llama4-scout|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 128|1|1 ; none|false|false|false|false|false' \
 DRY_RUN=true PREPARE_DATASETS=false PLOT=false RUN_POST=false \
-OUTPUT_ROOT=profiling_fix_llama4_dryrun RUNS_LOG=profiling_fix_llama4_dryrun/runs.log \
+OUTPUT_ROOT=profiling_results/profiling_fix_llama4_dryrun RUNS_LOG=profiling_results/profiling_fix_llama4_dryrun/runs.log \
 GPU_POOL=0 PROFILERS=source MAX_STEPS=1 WARMUP_STEPS=1 \
 bash scripts/lf/profile_lora_lf_test_source.sh
 ```
@@ -422,7 +422,7 @@ Negative guard proof:
 ```bash
 RUNS='llama4-scout|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101|ligerloss1 ; 128|1|1 ; none|false|false|false|false|false' \
 DRY_RUN=true PREPARE_DATASETS=false PLOT=false RUN_POST=false \
-OUTPUT_ROOT=profiling_fix_llama4_dryrun_bad RUNS_LOG=profiling_fix_llama4_dryrun_bad/runs.log \
+OUTPUT_ROOT=profiling_results/profiling_fix_llama4_dryrun_bad RUNS_LOG=profiling_results/profiling_fix_llama4_dryrun_bad/runs.log \
 GPU_POOL=0 PROFILERS=source MAX_STEPS=1 WARMUP_STEPS=1 \
 bash scripts/lf/profile_lora_lf_test_source.sh
 ```
@@ -525,11 +525,11 @@ Run each row separately:
 
 ```bash
 RUNS='llama4-scout|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_llama4_s2048 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_llama4_s2048 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 
 RUNS='llama4-scout|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_llama4_s2048 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_llama4_s2048 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 ```
 
@@ -560,15 +560,15 @@ Run each row separately:
 
 ```bash
 RUNS='llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_llama4_s8192 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_llama4_s8192 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 
 RUNS='llama4-scout|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_llama4_s8192 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_llama4_s8192 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 
 RUNS='llama4-scout|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 8192|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_llama4_s8192 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_llama4_s8192 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 ```
 
@@ -610,15 +610,15 @@ Run each row separately:
 
 ```bash
 RUNS='llama4-scout|1 ; superoffload_mem|unsloth|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_llama4_s9500 MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_llama4_s9500 MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 
 RUNS='llama4-scout|1 ; superoffload_mem|unsloth-off|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_llama4_s9500 MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_llama4_s9500 MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 
 RUNS='llama4-scout|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_llama4_s9500 MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_llama4_s9500 MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 ```
 
@@ -662,15 +662,15 @@ Only use this if evaluating `asym|recomp-off-full-fg-ker000` without CPUAdamW:
 
 ```bash
 RUNS='llama4-scout|1 ; superoffload_mem_nocpuadamw|unsloth|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_llama4_s9500_nocpuadamw MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_llama4_s9500_nocpuadamw MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 
 RUNS='llama4-scout|1 ; superoffload_mem_nocpuadamw|unsloth-off|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_llama4_s9500_nocpuadamw MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_llama4_s9500_nocpuadamw MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 
 RUNS='llama4-scout|1 ; asym|recomp-off-full-fg-ker000|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_fix_llama4_s9500_nocpuadamw MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_fix_llama4_s9500_nocpuadamw MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0 --overwrite false
 ```
 

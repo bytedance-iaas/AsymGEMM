@@ -24,9 +24,9 @@ full-asym and keeps its +20–32% max-seq advantage. One backend, best of both.
   to wall time (GPU overlaps it). The gap is the GEMM engine + activation offload path.
 - Ceilings (confirmed, b=8): asym: llama 34k@ohbm3, q3-32b 65k@ohbm8, q3-30b 173k@ohbm0;
   superoffload unsloth-off: 32k / 53k@ohbm4 / 131k. Memory is linear in T=B×s
-  (validated R²=1.00); per-config fits + maxB/latency tables: `scripts/lf/ceiling_table.py`
+  (validated R²=1.00); per-config fits + maxB/latency tables: `scripts/lf/ceiling_estimate.py`
   → `scripts/lf/ceiling_table.md` (+ `ceiling_table_record.md` incl. estimates).
-- nsys traces (existing, `profiling_both/.../ceiling__*32000*/...__nsys__*/trace.sqlite`):
+- nsys traces (existing, `profiling_results/profiling_both/.../ceiling__*32000*/...__nsys__*/trace.sqlite`):
   asym = 64-70% kernel-busy, custom `sm100_bf16_asym_gemm_impl` ≈ ⅓ of cuBLAS peak
   (llama: ~137 s/step vs ~43 s ideal); superoffload = 36-43% busy, 2-3× copy volume,
   stock nvjet at peak. Decompose with `scripts/lf/analyze_stp_bwd.py <trace.sqlite>`.
@@ -131,7 +131,7 @@ implement incrementally:
   measured step; `PROFILERS=source` for timing, `both` only for diagnosis; never anchor
   near the memory wall (thrash: q3-32b @65k ran 2× slower than @64k, one grid step).
 - **Ceiling re-verification**: memory-relevant changes move the config fingerprint in
-  `scripts/lf/ceiling_search.sh` → re-run the ceiling search for changed configs (the
+  `scripts/lf/ceiling_search_both.sh` → re-run the ceiling search for changed configs (the
   ledger replays unchanged ones). Never launch two ceiling drivers (the flock file was
   deleted once — mutual exclusion is broken; `pgrep -f ceiling_search.py` first).
 - **Known fixed bug (KEEP the fix)**: `asym_gemm/training/cpu_adam.py` — `zero_grad`

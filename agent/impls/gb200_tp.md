@@ -378,7 +378,7 @@ rows, nothing else:
 ```bash
 # DEV pace car #1 (DP; owned by gb200_dp.md D0):
 RUNS='q3-32b|2 ; superoffload_mem|unsloth-off|ligerloss1 ; 20000|4|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_gb200tp_p0 MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_gb200tp_p0 MAX_STEPS=3 WARMUP_STEPS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
 # DEV pace car #2 (TP): scripts/testing/fsdp2_tp_baseline.py — q3-32b s20000 b8 global,
 #   torchrun 2-proc, profile.json metrics shim (same reporting format).
@@ -620,7 +620,7 @@ shared-Grace contention evidence: each rank hosts ~2x weights over the SAME node
 # positive dry run (DRY_RUN prints the command + writes command.txt; never launches training):
 RUNS='q3-32b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 128|8|1 ; none|false|false|false|false|false' \
 DRY_RUN=true PREPARE_DATASETS=false PLOT=false RUN_POST=false \
-OUTPUT_ROOT=profiling_gb200tp_dryrun RUNS_LOG=profiling_gb200tp_dryrun/runs.log \
+OUTPUT_ROOT=profiling_results/profiling_gb200tp_dryrun RUNS_LOG=profiling_results/profiling_gb200tp_dryrun/runs.log \
 GPU_POOL=0,1 PROFILERS=source MAX_STEPS=1 WARMUP_STEPS=1 \
 bash scripts/lf/profile_lora_lf_test_source.sh
 ```
@@ -976,12 +976,12 @@ defensive). Matrix models checked: 28672/2, 25600/2, 29568/2 are all 64-multiple
 python scripts/testing/stp_gemm_parity_probe.py --model llama3.3-70b --cases col,row --mode stream
 # e2e loss gate (small):
 RUNS='q3-32b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_gb200tp_I3_s2048 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_gb200tp_I3_s2048 MAX_STEPS=1 WARMUP_STEPS=0 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
 # e2e target profiling (PROFILERS=both — the lane_bw/nsys gates need the nsys pass; EVERY later
 # gate that reads lane_bw/nvlink/class-byte artifacts inherits this convention):
 RUNS='q3-32b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_gb200tp_I3_s20000 MAX_STEPS=3 WARMUP_STEPS=1 PROFILERS=both PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_gb200tp_I3_s20000 MAX_STEPS=3 WARMUP_STEPS=1 PROFILERS=both PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
 ```
 
@@ -1154,11 +1154,11 @@ nsys gate: host-sync count per layer ~0 in steady state.
 ```bash
 # parity (own declared pair — MAX_STEPS=5, dump on BOTH the |1 reference and the stp run):
 RUNS='q3-32b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_gb200tp_I4_parity MAX_STEPS=5 WARMUP_STEPS=0 ASYM_STP_DUMP_GRADS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_gb200tp_I4_parity MAX_STEPS=5 WARMUP_STEPS=0 ASYM_STP_DUMP_GRADS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
 # e2e P1 (PROFILERS=both):
 RUNS='q3-32b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_gb200tp_I4_s20000 MAX_STEPS=3 WARMUP_STEPS=1 PROFILERS=both PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_gb200tp_I4_s20000 MAX_STEPS=3 WARMUP_STEPS=1 PROFILERS=both PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
 ```
 
@@ -1278,7 +1278,7 @@ coord=0 = none of the above. If C5 measures ~0 under this definition, DROP the c
 ```bash
 # arena ablation (fresh roots), P1 workload:
 RUNS='q3-32b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_gb200tp_I5_arena1 ASYM_STP_SHARED_ARENA=1 MAX_STEPS=3 WARMUP_STEPS=1 PROFILERS=both PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_gb200tp_I5_arena1 ASYM_STP_SHARED_ARENA=1 MAX_STEPS=3 WARMUP_STEPS=1 PROFILERS=both PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
 # repeat with OUTPUT_ROOT=..._arena0 ASYM_STP_SHARED_ARENA=0; and coord1 vs coord0 similarly.
 ```
@@ -1322,7 +1322,7 @@ stage    -> per layer: slab[dev].copy_(shard_view(dev), non_blocking=True) into 
 (run_dp2_pair.sh + extract_lane_bw.py already landed in I0/I1.)
 ```
 
-**Validation (E2E ladder at P1, each row separately, fresh root `profiling_gb200tp_I6`):**
+**Validation (E2E ladder at P1, each row separately, fresh root `profiling_results/profiling_gb200tp_I6`):**
 
 ```text
 PASS:
@@ -1415,15 +1415,15 @@ routed-expert LoRA under EP-2: adapters for dev_i's experts are LOCAL to dev_i (
 ```bash
 # q3-30b-a3b parity (own pair — MAX_STEPS=5, dump on BOTH |1 ref and stp with ASYM_STP_MOE=1):
 RUNS='q3-30b-a3b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker101|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_gb200tp_I7_parity MAX_STEPS=5 WARMUP_STEPS=0 ASYM_STP_DUMP_GRADS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_gb200tp_I7_parity MAX_STEPS=5 WARMUP_STEPS=0 ASYM_STP_DUMP_GRADS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
 # scout parity (the ONLY shared-expert model — exercises the shared-expert backward-only failure):
 RUNS='llama4-scout|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker000|ligerloss1 ; 2048|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_gb200tp_I7_parity_scout MAX_STEPS=5 WARMUP_STEPS=0 ASYM_STP_DUMP_GRADS=1 PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_gb200tp_I7_parity_scout MAX_STEPS=5 WARMUP_STEPS=0 ASYM_STP_DUMP_GRADS=1 PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
 # e2e P4:
 RUNS='q3-30b-a3b|2 ; asym_stp_cpuadamwds|recomp-off-full-fg-ker101|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false' \
-OUTPUT_ROOT=profiling_gb200tp_I7_s80000 MAX_STEPS=3 WARMUP_STEPS=1 PROFILERS=both PLOT=false RUN_POST=false \
+OUTPUT_ROOT=profiling_results/profiling_gb200tp_I7_s80000 MAX_STEPS=3 WARMUP_STEPS=1 PROFILERS=both PLOT=false RUN_POST=false \
 bash scripts/lf/profile_lora_lf_test_source.sh --gpus 0,1 --overwrite false
 ```
 
@@ -1515,7 +1515,7 @@ prefetch/slab budget blown; RSS on the wrong NUMA node. Only then propose a chan
   right after the backend name inside job_root_path's path_label (safe_label truncates overlong
   labels to the FIRST 243 chars + hash — a trailing tag would vanish).
 2026-07-06 I1 VALIDATED. FIX A chosen: -DDG_JIT_USE_RUNTIME_API added to setup.py cxx+nvcc,
-  _C rebuilt in-place. Probe (profiling_gb200tp_i1/stp_runtime_probe_node0.json): real asym GEMM
+  _C rebuilt in-place. Probe (profiling_results/profiling_gb200tp_i1/stp_runtime_probe_node0.json): real asym GEMM
   on dev1 OK (rel err ~1.2e-2 vs torch both devices), P2P 778 GB/s/dir + TRUE duplex 774.6/dir,
   BOTH lanes pull the SAME pinned buffer at 174.7 GB/s/lane (>=170 floor), allreduce2 3 GiB in
   6.11 ms (<8), enqueue 9.9 us (<30). |1 zero-regression: D1 solo b4 clean (gb200_dp.md log).

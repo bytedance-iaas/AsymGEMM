@@ -29,7 +29,7 @@ BACKWARD="both"
 CUDA_GRAPH=true
 
 PYTHON_BIN="${PYTHON_BIN:-${PYTHON:-python3}}"
-OUTPUT_ROOT="${ROOT}/profiling"
+OUTPUT_ROOT="${ROOT}/profiling_results/profiling"
 OUTPUT_DIR=""
 RUN_NAME=""
 SAVE_RESULTS=true
@@ -72,7 +72,7 @@ Options:
   --iters N
   --backward true|false|both
   --cuda-graph true|false
-  --output-root DIR     base output root; default: third_party/AsymGEMM/profiling
+  --output-root DIR     base output root; default: third_party/AsymGEMM/profiling_results/profiling
                        default layout: <root>/lora_ops_<precision>/<operation>__b<batch>_s<seq>_r<rank>
   --output-dir DIR      exact config root; overrides the default config directory
   --run-name NAME       optional config directory under lora_ops_<precision>

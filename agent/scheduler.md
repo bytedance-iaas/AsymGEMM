@@ -236,7 +236,7 @@ length s, (#ranks)**. B (per-device micro-batch) and ga are outputs:
 
 - Training semantics are carried by the *global* batch = B·ga·ranks — ga is free in memory,
   so B is purely a system-efficiency variable.
-- Step time is empirically ~linear in tokens at fixed s (`ceiling_table.py` fit
+- Step time is empirically ~linear in tokens at fixed s (`ceiling_estimate.py` fit
   `t = t0 + c_g·B·s·(1+k·s)` with t0 ≈ 3–13 s ≪ step): **tok/s is ~flat in B** once fixed
   per-step costs amortize. Raising B multiplies work and time together; it does not touch
   c_g. Sanity: so-off @131k b8 measured 554 s ⇒ 1.9k tok/s ≈ its fitted flat curve.
@@ -285,7 +285,7 @@ confirm with a controlled A/B (one knob) or a timeline subtraction before rankin
 Solver: (1) analytic seed — laws + dominance fill λ; budget scalar fills the W-cache then the
 tier vector greedily by calibrated Δt/ΔGiB (fractional across panels/layers ⇒ greedy ≈
 optimal); (2) one steady-state probe run re-ranks with measured marginals (contention
-coupling); (3) offline certification on the named-config grid (existing ceiling_table
+coupling); (3) offline certification on the named-config grid (existing ceiling_estimate
 protocol). The controller replaces hand-picked configs with derived ones.
 
 ---
