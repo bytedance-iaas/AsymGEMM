@@ -12,7 +12,7 @@ Keep this work isolated:
 
 - Kernel/runtime edits: `../ktransformers/kt-kernel/**`
 - KT-only LF launcher/profile edits: `agent/kt/scripts/**` and `scripts/kt/**`
-- Do not edit `scripts/lf/run_lf_lora_sft.sh` or `scripts/lf/profile_lora_lf.sh`
+- Do not edit `scripts/lf/run_lf_lora_sft.sh` or `scripts/lf/profile_lora_lf_test_{source,both}.sh`
 - KT validation must use physical GPU 1 first, physical GPU 2 only as fallback.
   Never GPU 0 or GPU 3 for accepted KT results.
 

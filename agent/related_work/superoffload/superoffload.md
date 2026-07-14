@@ -1,3 +1,5 @@
+> NOTE (2026-07-13): `scripts/lf/profile_lora_lf.sh` mentioned throughout was later renamed/split into `profile_lora_lf_test_{source,both}.sh`; path mentions below predate that split and are kept as written.
+
 # AsymGEMM-SO SuperOffload LF Backend Integration Plan
 
 ## Goal

@@ -1,3 +1,5 @@
+> NOTE (2026-07-13): `scripts/lf/profile_lora_lf.sh` mentioned below was later renamed/split into `profile_lora_lf_test_{source,both}.sh`; historical paths/evidence lines are kept as written.
+
 # LF LoRA-SFT Memory Status
 
 Date: 2026-06-14
