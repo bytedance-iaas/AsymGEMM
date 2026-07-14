@@ -64,3 +64,32 @@ Only 2 textual conflicts, both auto/easily resolvable (no human surgery needed):
 6. Rebuild the extension INSIDE `asym40_enroot_run` (NEVER on host).
 7. Large-workload smoke tests INSIDE the container (NEVER on host).
 8. main_kevin_scheduler remains the frozen backup throughout.
+
+---
+
+# Post-merge verification (2026-07-13) — run inside asym_sft_40 enroot container
+
+Merge landed: main_kevin = `36af646` (merge of scheduler `7dc22dd` + EP `f1b18a4`).
+main_kevin_scheduler frozen at `3b8361d`. All runs via the container (never host).
+
+Results:
+- BUILD: clean rebuild of `asym_gemm._C` (all 5 objects incl python_api.o, which
+  pulls in the merged jit/compiler.hpp multi-rank rename-race fix). Fresh .so; `_C`
+  loads + init OK; JIT bf16 GEMM runs. (Had to CLEAN-build — setuptools doesn't
+  track header deps, so a compiler.hpp-only change won't recompile without it.)
+- SEP QUEUE (asym_sepqueue2): `PR5_PASS mode=queue bitwise=True` — all cases
+  (bal/skew/decline/bal2) bitwise-identical to plain kernel (max_diff 0.0); armed
+  launch + steal + gather fired (armed=3, declined=1).
+- SEP PLAN (asym_sepplan2): `PR5_PASS mode=plan bitwise=True` — planned=3, all
+  cases bitwise-identical. => scaling via sep plan AND queue verified post-merge.
+- FINEGRAINED MoE (the merged A<->B interface: AsymQwen3Experts x
+  qwen3_moe_finegrained_forward/backward + expert offload + LoRA), synthetic 65536
+  tokens / 128 experts / H2048: loss cpu==gpu (absdiff 8e-9), out/dx/grad rel diffs
+  ~8e-3 (bf16 noise), no NaN, exit 0. No regression.
+- Kernel unit pytest tests/m_grouped/... fails at COLLECTION (missing test_nvfp4.py)
+  — PRE-EXISTING (absent at base 4936ad1, untouched by either side), NOT merge-
+  caused; kernel correctness already covered bitwise by the sep probes.
+
+NOT DONE (needs decision): full SFT training on a REAL model as the "large
+workload" — Qwen3-30B-A3B / Qwen3-32B weights are NOT cached in the container
+(~60 GB download, possibly HF-gated). Deferred pending Kevin's go-ahead.
