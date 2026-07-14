@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # =============================================================================
 
 # Paths and tools
-# Repo root = AsymGEMM-SFT; override with SFT_ROOT=
+# Repo root = the AsymGEMM-SFT* workspace (../.. from this repo); override with SFT_ROOT=
 SFT_ROOT=${SFT_ROOT:-$(cd ../.. && pwd)}
 ROOT=${ROOT:-${SFT_ROOT}/third_party/AsymGEMM}
 _LF_DIR_ENV_SET=false

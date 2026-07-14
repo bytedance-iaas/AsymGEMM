@@ -1,3 +1,5 @@
+> NOTE (2026-07-13): `scripts/lf/profile_lora_lf.sh` mentioned throughout was later renamed/split into `profile_lora_lf_test_{source,both}.sh`; path mentions below predate that split and are kept as written.
+
 # Long-Context LoRA-SFT Data and Evaluation Plan
 
 ## Goal
