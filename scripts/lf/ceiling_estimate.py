@@ -6,31 +6,35 @@ Usage:
   python3 scripts/lf/ceiling_table.py <config-list> -v       # + fit diagnostics
   python3 scripts/lf/ceiling_table.py <config-list> --md PATH   # write the markdown elsewhere
   python3 scripts/lf/ceiling_table.py <config-list> --no-md     # stdout only
+  python3 scripts/lf/ceiling_table.py <config-list> --state-dir PATH  # read results from a
+      specific ceiling_search_state_<profiler>_<host> dir (default: the sole
+      state dir holding a results.jsonl; errors if none or several)
 
 <config-list> is either:
-  - a text file with rows in the ceiling_search.sh CONFIGS format
+  - a text file with rows in the ceiling_search_{source,both}.sh CONFIGS format
       seq0 : ohbm0 : model|gpus ; backend|recompute|liger ; {seq}|batch|ga ; flags[ : extra-json]
     ('#' comments and blank lines ignored), or
-  - ceiling_search.sh itself (the active rows of its CONFIGS array are parsed).
+  - ceiling_search_source.sh / ceiling_search_both.sh itself (the active rows
+    of its CONFIGS array are parsed).
 
 Row sort order: model, backend, config.
 Cell format: maxB / sec-per-step (tok/s) at maxB.
-  'a' suffix = directly measured steady-state anchor (>=3 measured steps;
-  warmup and the last measured step dropped). Other latencies come from the
-  per-config anchor + the analytic attention split
+  'a' suffix = directly measured steady-state anchor: the confirm run's
+  steady step seconds recorded on the results row (warmup, first and last
+  measured steps dropped -- see ceiling_search.py confirm_metrics). Other
+  latencies come from the per-config anchor + the analytic attention split
       t_step(B, s) = t0 + c_g * T * (1 + k*s),   T = B*s,
       k = (2*L*h) / (2*P_active)   (attention-vs-GEMM FLOPs per seq-token)
-  '.' = not derivable from current artifacts (no ceiling yet / no anchor run).
+  '.' = not derivable yet (no ceiling / no confirm metrics recorded).
   'x' = slot above max seq (memory at B=1) or model context.
 """
-import csv, json, re, sys
+import json, re, sys
 from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MD = Path(__file__).resolve().parent / "ceiling_table.md"
-ART = ROOT / "profiling_both" / "asym_long_sft_smoke__lora__lf__bf16"
-STATE = ROOT / "scripts" / "lf" / "ceiling_search_state"
+STATE = None  # resolved in main(): --state-dir, else the sole ceiling_search_state_*/ with results
 
 SLOTS = [8000, 12000, 16000, 32000, 48000, 64000, 128000]
 # model shorthand -> (layers, hidden, active matmul params) for the attention split
@@ -78,7 +82,9 @@ def parse_config_rows(path: Path):
 
 
 def load_results():
-    """name -> (ceiling_seq, ohbm, confirmed) — last confirmed line wins."""
+    """name -> full results.jsonl row (dict) — last confirmed line wins.
+    FAILED rows (null ceiling_seq, written by aborted searches) are skipped:
+    they carry nothing the table can use and must not shadow real rows."""
     out = {}
     f = STATE / "results.jsonl"
     if f.exists():
@@ -86,43 +92,16 @@ def load_results():
             if not line.strip():
                 continue
             r = json.loads(line)
+            if r.get("ceiling_seq") is None:
+                continue
             if r.get("confirmed") or r["name"] not in out:
-                out[r["name"]] = (r["ceiling_seq"], r["ohbm"], bool(r.get("confirmed")))
+                out[r["name"]] = r
     return out
-
-
-def leaf_dirs(run_dir):
-    """{ohbm: {profiler: leaf}} for one ceiling__ run dir."""
-    leaves = {}
-    for inner in run_dir.iterdir():
-        if not inner.is_dir():
-            continue
-        m = re.search(r"__(source|nsys)__", inner.name)
-        mo = re.search(r"-ohbm(\d+)__", inner.name)
-        if not m:
-            continue
-        for leaf in inner.glob("b*_s*_ga*"):
-            leaves.setdefault(int(mo.group(1)) if mo else 0, {})[m.group(1)] = leaf
-    return leaves
-
-
-def steady_step_seconds(leaf):
-    """User rule: >=3 measured steps; drop warmups and the last measured step."""
-    f = leaf / "step_samples.csv"
-    if not f.exists():
-        return None, 0
-    rows = list(csv.DictReader(f.open()))
-    meas = [r for r in rows if r.get("is_warmup", "").strip() in ("False", "false", "0")]
-    if len(meas) < 3:
-        return None, len(meas)
-    meas.sort(key=lambda r: int(float(r["measured_step"])))
-    vals = [float(r["step_milliseconds"]) / 1000.0 for r in meas[:-1]]
-    return sum(vals) / len(vals), len(meas)
 
 
 def t0_from_lat(leaf):
     f = leaf / "lat.md"
-    if f and f.exists():
+    if f.exists():
         for line in f.read_text().splitlines():
             if "optimizer/update side" in line:
                 try:
@@ -132,31 +111,38 @@ def t0_from_lat(leaf):
     return 10.0
 
 
-def find_anchor(name, batch):
-    """Largest-seq compliant steady-state anchor for this config: (seq, ohbm, sec, t0)."""
-    dir_name = name.replace(".", "_")
-    best = None
-    for run_dir in ART.glob(f"ceiling__{dir_name}__b{batch}_s*_ga*"):
-        m = re.search(rf"__b{batch}_s(\d+)_ga", run_dir.name)
-        if not m:
-            continue
-        seq = int(m.group(1))
-        for ohbm, profs in leaf_dirs(run_dir).items():
-            for leaf in profs.values():
-                sec, nmeas = steady_step_seconds(leaf)
-                if sec and nmeas >= 3 and (best is None or seq >= best[0]):
-                    best = (seq, ohbm, sec, t0_from_lat(profs.get("source") or leaf))
-    return best
+def find_anchor(res):
+    """(seq, ohbm, sec, t0) from the confirm metrics recorded on the results
+    row: `confirm_steady_step_s` is the anchor step time and `artifact_dir`
+    points at the confirm leaf (its lat.md supplies t0)."""
+    if not res or not res.get("confirm_steady_step_s") or not res.get("artifact_dir"):
+        return None
+    return (res["ceiling_seq"], res["ohbm"], res["confirm_steady_step_s"],
+            t0_from_lat(ROOT / res["artifact_dir"]))
 
 
 def main():
+    global STATE
     argv = sys.argv[1:]
     verbose = any(a in ("-v", "--verbose") for a in argv)
     md_path = None if "--no-md" in argv else DEFAULT_MD
     if "--md" in argv:
         md_path = Path(argv[argv.index("--md") + 1])
+    if "--state-dir" in argv:
+        STATE = Path(argv[argv.index("--state-dir") + 1])
+    else:
+        # auto-pick the sole ceiling_search_state_<profiler>_<host> with results
+        cands = sorted((ROOT / "scripts" / "lf").glob("ceiling_search_state_*/results.jsonl"))
+        if len(cands) == 1:
+            STATE = cands[0].parent
+        elif not cands:
+            sys.exit("error: no ceiling_search_state_*/results.jsonl found; pass --state-dir")
+        else:
+            sys.exit("error: multiple state dirs have results.jsonl; pass --state-dir:\n  "
+                     + "\n  ".join(str(c.parent) for c in cands))
     args = [a for i, a in enumerate(argv)
-            if not a.startswith("-") and (i == 0 or argv[i - 1] != "--md")]
+            if not a.startswith("-")
+            and (i == 0 or argv[i - 1] not in ("--md", "--state-dir"))]
     if not args:
         sys.exit(__doc__.strip())
     cfgs = list(parse_config_rows(Path(args[0])))
@@ -166,7 +152,7 @@ def main():
     rows, trows = [], []
     for c in sorted(cfgs, key=lambda c: (c["model"], c["backend"], c["recomp"])):
         res = results.get(c["name"])
-        anchor = find_anchor(c["name"], c["batch"])
+        anchor = find_anchor(res)
         arch = ARCH.get(c["model"])
         fit = None
         if anchor and arch:
@@ -180,11 +166,11 @@ def main():
                              f"(attn@anchor={k*aseq/(1+k*aseq)*100:.0f}%)")
             if verbose:
                 print(f"# fit {fit_notes[-1]}")
-        config_label = c["recomp"] + (f"-ohbm{res[1]}" if res else "")
+        config_label = c["recomp"] + (f"-ohbm{res['ohbm']}" if res else "")
         cells, tcells = [], []
         for s in SLOTS:
             if res:
-                tmax = c["batch"] * res[0]
+                tmax = c["batch"] * res["ceiling_seq"]
                 if s > min(tmax, CTX.get(c["model"], 10 ** 9)):
                     cells.append("x"); tcells.append("x")
                     continue
@@ -202,7 +188,7 @@ def main():
                     cells.append(f"{maxb} / . (.)"); tcells.append(".")
             else:
                 cells.append(". / . (.)"); tcells.append(".")
-        note = "" if (res and res[2]) else ("  [unconfirmed]" if res else "  [no ceiling yet]")
+        note = "" if (res and res.get("confirmed")) else ("  [unconfirmed]" if res else "  [no ceiling yet]")
         rows.append([c["model"], c["backend"], config_label + note] + cells)
         trows.append([c["model"], c["backend"], config_label + note] + tcells)
 
@@ -213,7 +199,7 @@ def main():
     for r in rows:
         print(" | ".join(cell.ljust(w[i]) for i, cell in enumerate(r)))
     print("\ncell = maxB / sec-per-step (tok/s) at maxB;  a = measured anchor;  "
-          ". = pending artifacts;  x = above max seq or context")
+          ". = pending confirm metrics;  x = above max seq or context")
 
     print("\nTHROUGHPUT (tok/s) at fixed sequence length (at maxB; ~batch-independent, t0 amortized)")
     tw = [max(len(r[i]) for r in trows + [hdr]) for i in range(len(hdr))]
@@ -229,10 +215,11 @@ def main():
             f"Generated by `scripts/lf/ceiling_table.py {args[0]}` on "
             f"{datetime.now().strftime('%Y-%m-%d %H:%M')}.",
             "",
-            "Cell = `maxB / sec-per-step (tok/s)` at maxB. `a` = measured steady-state anchor "
-            "(≥3 measured steps; warmup and last measured step dropped). Other latencies = "
+            "Cell = `maxB / sec-per-step (tok/s)` at maxB. `a` = measured steady-state anchor: "
+            "the confirm run's steady step (warmup, first and last measured steps dropped), "
+            "as recorded in results.jsonl. Other latencies = "
             "anchor + analytic attention split `t = t0 + c_g·T·(1 + k·s)`, `T = B·s`. "
-            "`.` = pending artifacts. `x` = above max seq (B=1) or model context.",
+            "`.` = pending confirm metrics. `x` = above max seq (B=1) or model context.",
             "",
             "| " + " | ".join(hdr) + " |",
             "|" + "|".join("---" for _ in hdr) + "|",
@@ -245,9 +232,10 @@ def main():
         lines += ["| " + " | ".join(r) + " |" for r in trows]
         if fit_notes:
             lines += ["", "## Fit constants", ""] + [f"- {n}" for n in fit_notes]
-        lines += ["", "Sources: ceilings from `ceiling_search_state/results.jsonl`; "
-                      "anchors and fits from `profiling_both/` artifacts. Re-run the "
-                      "command above to refresh after new runs land.", ""]
+        lines += ["", f"Sources: everything from `{STATE.name}/results.jsonl` "
+                      "(ceilings + recorded confirm metrics; each row's `artifact_dir` "
+                      "points at the confirm artifacts). Re-run the command above to "
+                      "refresh after new runs land.", ""]
         md_path.write_text("\n".join(lines))
         print(f"wrote {md_path}")
 

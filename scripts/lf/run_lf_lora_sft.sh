@@ -218,9 +218,35 @@ INTERRUPT_GRACE_SECONDS=${INTERRUPT_GRACE_SECONDS:-2}
 #   triggers below HOST_MEM_WATCHDOG_FLOOR_GB. false or FLOOR_GB=0 disables.
 TRAIN_OOM_SCORE_ADJ=${TRAIN_OOM_SCORE_ADJ:-1000}
 HOST_MEM_WATCHDOG=${HOST_MEM_WATCHDOG:-true}
-HOST_MEM_WATCHDOG_FLOOR_GB=${HOST_MEM_WATCHDOG_FLOOR_GB:-35}
+# exact per-model floor (GB); unlisted model without an exported floor = hard error
+declare -A WATCHDOG_FLOOR_GB_BY_MODEL=(
+  ["Qwen/Qwen3-30B-A3B"]=35
+  ["Qwen/Qwen3-32B"]=35
+  ["Qwen/Qwen3.5-27B"]=35
+  ["Qwen/Qwen3.5-35B-A3B"]=35
+  ["Qwen/Qwen2.5-32B-Instruct"]=35
+  ["Qwen/Qwen2.5-72B-Instruct"]=50
+  ["meta-llama/Llama-3.3-70B-Instruct"]=50
+  ["meta-llama/Llama-4-Scout-17B-16E"]=50
+  ["Qwen/Qwen3.5-122B-A10B"]=50
+  ["Qwen/Qwen3-235B-A22B"]=60
+)
+if [[ -z "${HOST_MEM_WATCHDOG_FLOOR_GB:-}" ]]; then
+  if [[ "${HOST_MEM_WATCHDOG,,}" == "true" ]]; then
+    HOST_MEM_WATCHDOG_FLOOR_GB="${WATCHDOG_FLOOR_GB_BY_MODEL[${MODEL_NAME_OR_PATH}]:-}"
+    if [[ -z "${HOST_MEM_WATCHDOG_FLOOR_GB}" ]]; then
+      echo "error: no watchdog floor mapped for model '${MODEL_NAME_OR_PATH}'; add it to" \
+           "WATCHDOG_FLOOR_GB_BY_MODEL in run_lf_lora_sft.sh or export HOST_MEM_WATCHDOG_FLOOR_GB" >&2
+      exit 2
+    fi
+  else
+    HOST_MEM_WATCHDOG_FLOOR_GB=0  # watchdog disabled: floor unused
+  fi
+fi
 HOST_MEM_WATCHDOG_POLL_SECONDS=${HOST_MEM_WATCHDOG_POLL_SECONDS:-0.05}
-HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS=${HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS:-60}
+# kill fast: the watchdog line already recorded the C-OOM; a long grace lets the
+# kernel OOM killer win the race and wedge the GPU driver
+HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS=${HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS:-1}
 
 # =============================================================================
 # Derived Parameters
@@ -423,18 +449,28 @@ case "${BACKEND,,}" in
     ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false
     BACKEND=asym
     ;;
-  asym_ep2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds|asym_sqeq2_cpuadamwds)
-    # GB200 rank-per-GPU EP family (fix_gb200_ep.md; NAMING EPOCH 2026-07-08 — the
-    # backend NAME selects the EP mode and flips the flags automatically):
-    #   asym_ep2_cpuadamwds   = VANILLA EP  (owned expert slices, allgather dispatch +
-    #                           reduce-scatter combine; private per-rank pins, no queue)
-    #   asym_sep2_cpuadamwds  = sEP plain   (ownerless shared /dev/shm fabric, each rank
-    #                           runs ALL experts for its own shard; no queue)
-    #   asym_sqep2_cpuadamwds = sEP + QUEUE (the final system: ownerless fabric + queued
-    #                           launches; asym_sqeq2_* accepted as an alias spelling)
+  asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sepqueue2_cpuadamwds|asym_sepplan2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds|asym_sqeq2_cpuadamwds)
+    # GB200 rank-per-GPU EP family (fix_gb200_ep.md; the backend NAME selects the
+    # EP mode and flips the flags automatically). NAMING EPOCH 4 (2026-07-10):
+    #   asym_ep2_cpuadamwds       = VANILLA EP (owned expert slices, allgather dispatch
+    #                               + reduce-scatter combine; private pins, no queue)
+    #   asym_sdp2_cpuadamwds      = shared-bank streaming DP, plain launches
+    #   asym_sqdp2_cpuadamwds     = shared-bank streaming DP, queued launches
+    #   asym_sepqueue2_cpuadamwds = TRUE sEP, counter-raced union steal (S6 queue
+    #                               flavor; legacy spellings sep2/sqep2/sqeq2 alias here)
+    #   asym_sepplan2_cpuadamwds  = TRUE sEP, count-computed union cut
+    #                               (ASYM_EP_SEP_MODE=plan; no counter racing)
     # Common shape: torchrun 2 ranks, each rank the |1 asym stack VERBATIM on its own
     # DistributedSampler shard; NO DDP wrapper — run_lf_profiled_train.py bypasses
     # Accelerator.prepare_model and does ONE manual grad allreduce per step.
+    # NAMING EPOCH 4 (2026-07-10, fix_gb200_ep_v2): descriptive canonicals —
+    #   asym_sepqueue2 = union sharing, counter-raced steal (old sep2/sqep2/sqeq2)
+    #   asym_sepplan2  = union sharing, count-computed cut (ASYM_EP_SEP_MODE=plan)
+    case "${BACKEND,,}" in
+      asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds|asym_sqeq2_cpuadamwds)
+        echo "[runlf] legacy backend name '${BACKEND}' -> canonical asym_sepqueue2_cpuadamwds (naming epoch 2026-07-10)"
+        BACKEND=asym_sepqueue2_cpuadamwds ;;
+    esac
     PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-${BACKEND,,}}
     USE_ASYM_CPU_ADAMW=true
     ASYM_CPU_ADAMW_BACKEND=deepspeed
@@ -444,13 +480,25 @@ case "${BACKEND,,}" in
     case "${BACKEND,,}" in
       asym_ep2_cpuadamwds)
         ASYM_EP_VANILLA=1; ASYM_ARENA_SHM=0; ASYM_EP_QUEUED=0
-        echo "[runlf] backend asym_ep2 -> VANILLA EP (owned+dispatch): ASYM_EP_VANILLA=1 ASYM_ARENA_SHM=0 ASYM_EP_QUEUED=0" ;;
-      asym_sep2_cpuadamwds)
+        # fix_ep detox defaults (agent/impls/fix_ep.md, 2026-07-11): fused
+        # persistent collective rings + comm-stream enqueue decoupling (code
+        # default) + 16-call periodic rank re-alignment. Ladder receipts:
+        # 216.3 -> 149.1 s at 32k. Env overrides still win.
+        ASYM_EP_VANILLA_FUSED="${ASYM_EP_VANILLA_FUSED:-1}"
+        ASYM_EP_VANILLA_ALIGN_EVERY="${ASYM_EP_VANILLA_ALIGN_EVERY:-16}"
+        echo "[runlf] backend asym_ep2 -> VANILLA EP (owned+dispatch, DETOXED): ASYM_EP_VANILLA=1 FUSED=${ASYM_EP_VANILLA_FUSED} ALIGN_EVERY=${ASYM_EP_VANILLA_ALIGN_EVERY}" ;;
+      asym_sdp2_cpuadamwds)
         ASYM_EP_VANILLA=0; ASYM_ARENA_SHM=1; ASYM_EP_QUEUED=0
-        echo "[runlf] backend asym_sep2 -> sEP plain (ownerless, no queue): ASYM_ARENA_SHM=1 ASYM_EP_QUEUED=0" ;;
-      asym_sqep2_cpuadamwds|asym_sqeq2_cpuadamwds)
+        echo "[runlf] backend asym_sdp2 -> shared-bank streaming DP (no queue): ASYM_ARENA_SHM=1 ASYM_EP_QUEUED=0" ;;
+      asym_sqdp2_cpuadamwds)
         ASYM_EP_VANILLA=0; ASYM_ARENA_SHM=1; ASYM_EP_QUEUED=1
-        echo "[runlf] backend asym_sqep2 -> sEP+queue (final): ASYM_ARENA_SHM=1 ASYM_EP_QUEUED=1" ;;
+        echo "[runlf] backend asym_sqdp2 -> shared-bank streaming DP + queue: ASYM_ARENA_SHM=1 ASYM_EP_QUEUED=1" ;;
+      asym_sepqueue2_cpuadamwds)
+        ASYM_EP_VANILLA=0; ASYM_ARENA_SHM=1; ASYM_EP_QUEUED=1; ASYM_EP_SEP=1; ASYM_EP_SEP_MODE=queue
+        echo "[runlf] backend asym_sepqueue2 -> TRUE sEP, counter-raced steal: ASYM_EP_SEP=1 ASYM_EP_SEP_MODE=queue ASYM_EP_QUEUED=1" ;;
+      asym_sepplan2_cpuadamwds)
+        ASYM_EP_VANILLA=0; ASYM_ARENA_SHM=1; ASYM_EP_QUEUED=0; ASYM_EP_SEP=1; ASYM_EP_SEP_MODE=plan
+        echo "[runlf] backend asym_sepplan2 -> TRUE sEP, count-computed cut: ASYM_EP_SEP=1 ASYM_EP_SEP_MODE=plan" ;;
     esac
     # same hook-offload hazard as dp2: grads must be reduced BEFORE any D2H copy; the
     # CPUAdamW step-time path reads param.grad after the manual allreduce.
@@ -614,6 +662,14 @@ if [[ "${ASYM_EP2:-0}" == "1" ]]; then
   export ASYM_ARENA_SHM_CAP_GB="${ASYM_ARENA_SHM_CAP_GB:-160}"
   [[ -z "${ASYM_EP_QUEUED:-}" ]] || export ASYM_EP_QUEUED  # S2a queued base GEMMs
   [[ -z "${ASYM_EP_VANILLA:-}" ]] || export ASYM_EP_VANILLA  # S5b vanilla-EP baseline rung
+  [[ -z "${ASYM_EP_SEP:-}" ]] || export ASYM_EP_SEP          # S6 true-sEP union sharing
+  [[ -z "${ASYM_EP_SEP_MODE:-}" ]] || export ASYM_EP_SEP_MODE  # queue (sepqueue2) | plan (sepplan2)
+  [[ -z "${ASYM_EP_VANILLA_FUSED:-}" ]] || export ASYM_EP_VANILLA_FUSED        # fix_ep D4
+  [[ -z "${ASYM_EP_VANILLA_COMM_STREAM:-}" ]] || export ASYM_EP_VANILLA_COMM_STREAM  # fix_ep D3
+  [[ -z "${ASYM_EP_VANILLA_ALIGN_EVERY:-}" ]] || export ASYM_EP_VANILLA_ALIGN_EVERY  # fix_ep damper
+  [[ -z "${ASYM_EP_VANILLA_LEGACY_ORDER:-}" ]] || export ASYM_EP_VANILLA_LEGACY_ORDER  # fix_ep D1 A/B
+  [[ -z "${ASYM_EP_SEP_SLOT_ROWS:-}" ]] || export ASYM_EP_SEP_SLOT_ROWS
+  [[ -z "${ASYM_EP_SEP_MAX_MPE:-}" ]] || export ASYM_EP_SEP_MAX_MPE
 fi
 
 if [[ "${BACKEND}" == "kt_armbf16" && -z "${KT_NUM_THREADS}" ]]; then

@@ -63,7 +63,7 @@ METRICS = {
         "ylabel": "Peak HBM (GiB)",
         "tick_step": 50,
         "filename": "memory_saving_hbm",
-        "annotate_saving": True,   # down-arrow % over the Ours bar
+        "annotate_saving": True,   # arrow % over each bar vs the bar to its left
     },
     "dram": {
         "ylabel": "Host DRAM (GiB)",
@@ -115,14 +115,17 @@ def build_figure(metric):
                    edgecolor=series["edge"], linewidth=0.8,
                    hatch=series["hatch"], zorder=3)
 
-        # down-arrow % saving of Ours vs the strongest baseline, over Ours bar
+        # chained arrow %: every bar after the first is annotated vs the bar
+        # to its left (Act.Offload vs Recompute, Ours vs Act.Offload)
         if cfg["annotate_saving"]:
-            base = model[metric][_BEST_BASELINE]
-            ours = model[metric][_OURS_KEY]
-            if base and ours is not None:
-                ours_x = bars[g][[sr["key"] for sr in _SERIES].index(_OURS_KEY)]
-                pct = (base - ours) / base * 100.0
-                ax.text(ours_x, ours + ymax * 0.02, f"↓{pct:.0f}%",
+            for s in range(1, len(_SERIES)):
+                base = model[metric][_SERIES[s - 1]["key"]]
+                val = model[metric][_SERIES[s]["key"]]
+                if base is None or val is None:
+                    continue
+                pct = (base - val) / base * 100.0
+                arrow = "↓" if pct >= 0 else "↑"
+                ax.text(bars[g][s], val + ymax * 0.02, f"{arrow}{abs(pct):.0f}%",
                         ha="center", va="bottom", fontsize=C.FONT_SIZE_SEGMENT,
                         color=C.ACCENT_RED, fontweight="bold", zorder=4)
 

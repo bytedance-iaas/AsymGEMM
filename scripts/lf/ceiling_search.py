@@ -14,7 +14,7 @@ Algorithm per config:
   3. Bisect the bracket on the seq_resolution grid.
   4. Inner feasibility at a given seq: endpoint-first ladder search over ohbm.
      The ladder is ordered by HBM share, NOT by N:
-       share(0) = 0 (all roots to CPU), share(N) = 1/N  =>  0 < 8 < 4 < 3 < 2 < 1.
+       share(0) = 0 (all roots to CPU), share(N) = 1/N  =>  0 < 8 < 6 < 4 < 3 < 2 < 1.
      C_OOM -> jump to the max-share end (if that still C_OOMs, seq infeasible);
      G_OOM -> jump to share 0 (if that still G_OOMs, seq infeasible);
      otherwise shrink the window.
@@ -48,6 +48,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import fcntl
 import hashlib
 import json
@@ -57,6 +58,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -105,6 +107,8 @@ GENERIC_G_OOM = [
     # a failed cudaHostAlloc returns exactly this code, so it must rank BELOW
     # the host-side signatures; alone it still reads as device OOM
     r"cudaErrorMemoryAllocation",
+    # cuDNN workspace alloc at full HBM reports INTERNAL_ERROR; ranked last
+    r"CUDNN_STATUS_INTERNAL_ERROR",
 ]
 
 
@@ -164,7 +168,7 @@ class Config:
     template: str
     seq0: int
     ohbm0: int = 0
-    ohbm_ladder: list = field(default_factory=lambda: [0, 8, 6, 4, 3, 2, 1])
+    ohbm_ladder: list = field(default_factory=lambda: [0, 16, 8, 7, 6, 5, 4, 3, 2, 1])
     seq_step: int = 4000
     seq_resolution: int = 1000
     seq_min: int = 4000
@@ -175,7 +179,7 @@ class Config:
     probe_timeout_s: int = 5400
     confirm_timeout_s: int = 10800
     max_probes: int = 40
-    max_confirm_attempts: int = 10  # budget of LIVE confirm-length runs
+    max_confirm_attempts: int = 10  # max CONSECUTIVE failed confirm-length runs (a confirm OK resets the streak)
     env: dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -290,6 +294,56 @@ class Ledger:
         return None
 
 
+class PeakSampler(threading.Thread):
+    """Samples per-GPU HBM (nvidia-smi, all pool GPUs) and the probe tree's
+    summed RSS (/proc of marker-carrying pids) while a probe runs. ~1 Hz, so
+    peaks are lower bounds, but they cover OOM-killed probes whose fatal
+    spike never reaches step_samples.csv."""
+
+    def __init__(self, gpus: list, marker: bytes, interval_s: float = 1.0):
+        super().__init__(daemon=True)
+        self.gpu_peak_mib = {g: 0.0 for g in gpus}
+        self.rss_peak_kib = 0.0
+        self.marker = marker
+        self.interval_s = interval_s
+        self._halt = threading.Event()  # not _stop: shadows Thread._stop(), breaks join()
+
+    def stop(self):
+        self._halt.set()
+        self.join(timeout=15)
+
+    def run(self):
+        while not self._halt.wait(self.interval_s):
+            try:
+                r = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=index,memory.used",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=10)
+                for line in r.stdout.strip().splitlines():
+                    idx, used = [t.strip() for t in line.split(",")]
+                    if idx in self.gpu_peak_mib:
+                        self.gpu_peak_mib[idx] = max(self.gpu_peak_mib[idx], float(used))
+            except Exception:
+                pass  # sampling is advisory; never disturb the probe
+            rss = 0.0
+            for pid in marked_pids(self.marker):
+                if pid == os.getpid():
+                    continue
+                try:
+                    with open(f"/proc/{pid}/status") as f:
+                        for ln in f:
+                            if ln.startswith("VmRSS:"):
+                                rss += float(ln.split()[1])  # kB
+                                break
+                except OSError:
+                    continue
+            self.rss_peak_kib = max(self.rss_peak_kib, rss)
+
+    def peaks(self) -> dict:
+        return {"peak_hbm_gib": {g: round(v / 1024, 1) for g, v in self.gpu_peak_mib.items()},
+                "peak_rss_gib": round(self.rss_peak_kib / (1024 ** 2), 1)}
+
+
 class Driver:
     def __init__(self, cfg: Config, ledger: Ledger, args):
         self.cfg = cfg
@@ -307,6 +361,13 @@ class Driver:
         self.kill_grace = (120, 60)
         self.probe_dir = Path(args.state_dir) / "probes" / cfg.name
         self.probe_dir.mkdir(parents=True, exist_ok=True)
+        # Artifacts root follows the row's pinned profiler + host tag (both
+        # injected into env{} by ceiling_search_{source,both}.sh), so per-host
+        # searches never mix artifact roots. Fallbacks: wrapper default (both)
+        # and the local hostname.
+        _prof = str(cfg.env.get("PROFILERS") or "both")
+        _host = str(cfg.env.get("HOST_TAG") or os.uname().nodename.split(".")[0])
+        self.artifacts_root = ROOT / f"profiling_{_prof}_ceiling_{_host}"
 
     def say(self, msg: str):
         print(f"[{self.cfg.name}] {msg}", flush=True)
@@ -324,12 +385,11 @@ class Driver:
             "PLOT": "true",
             "RUN_POST": "false",
             "OVERWRITE": "true",
-            # isolate probe artifacts from curated sweep runs: OVERWRITE=true
-            # must never clobber a real run dir at the same coordinates. The
-            # config name is included because RUN_NAME-style labels drop the
-            # model tag -- without it, different models probing the same seq
-            # would share one artifact dir.
-            "RUN_NAME": f"ceiling__{self.cfg.name}",
+            # dedicated root isolates probe artifacts from curated sweeps
+            # (normal wrapper naming inside; OVERWRITE=true can only clobber
+            # other probes). RUN_NAME empty so an export can't relabel.
+            "OUTPUT_ROOT": str(self.artifacts_root),
+            "RUN_NAME": "",
         })
         env.update({k: str(v) for k, v in self.cfg.env.items()})
         env.update({
@@ -380,11 +440,14 @@ class Driver:
                 continue
         self.sweep_leftovers()
 
+    def pool_gpus(self) -> list:
+        return [g for g in re.split(r"[,\s]+", str(self.cfg.env.get("GPU_POOL", os.environ.get("GPU_POOL", "0")))) if g]
+
     def preflight(self):
         """Wait until GPUs and host RAM are back to baseline; abort if stuck."""
         self.sweep_leftovers()
         deadline = time.time() + self.args.preflight_timeout_s
-        gpus = [g for g in re.split(r"[,\s]+", str(self.cfg.env.get("GPU_POOL", os.environ.get("GPU_POOL", "0")))) if g]
+        gpus = self.pool_gpus()
         while True:
             problems = []
             try:
@@ -453,20 +516,26 @@ class Driver:
         self.preflight()
         t0 = time.time()
         timed_out = False
-        with log_path.open("wb") as f:
-            p = subprocess.Popen(["bash", str(WRAPPER)], cwd=ROOT,
-                                 env=self.build_env(seq, ohbm, steps),
-                                 stdout=f, stderr=subprocess.STDOUT,
-                                 start_new_session=True)
-            try:
-                rc = p.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                self._kill_probe(p)
-                rc = None
-            except (KeyboardInterrupt, SystemExit):  # Ctrl-C or SIGTERM handler
-                self._kill_probe(p)
-                raise
+        sampler = PeakSampler(self.pool_gpus(),
+                              f"CEILING_SEARCH_MARK={self.mark}".encode() + b"\x00")
+        sampler.start()
+        try:
+            with log_path.open("wb") as f:
+                p = subprocess.Popen(["bash", str(WRAPPER)], cwd=ROOT,
+                                     env=self.build_env(seq, ohbm, steps),
+                                     stdout=f, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
+                try:
+                    rc = p.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    self._kill_probe(p)
+                    rc = None
+                except (KeyboardInterrupt, SystemExit):  # Ctrl-C or SIGTERM handler
+                    self._kill_probe(p)
+                    raise
+        finally:
+            sampler.stop()
         dur = int(time.time() - t0)
         with log_path.open("rb") as lf:  # tail only: hang logs can be huge
             lf.seek(max(0, log_path.stat().st_size - 4_000_000))
@@ -474,7 +543,8 @@ class Driver:
         outcome, sig = self.classify(rc, text, timed_out)
         entry = {"ts": int(time.time()), "name": self.cfg.name, "fp": self.cfg.fp,
                  "seq": seq, "ohbm": ohbm, "kind": kind, "outcome": outcome,
-                 "signal": sig, "rc": rc, "secs": dur, "log": str(log_path)}
+                 "signal": sig, "rc": rc, "secs": dur, "log": str(log_path),
+                 **sampler.peaks()}
         self.say(f"  -> {outcome} {('[' + sig + ']') if sig else ''} in {dur}s")
         if outcome != OK:
             time.sleep(self.args.settle_s)
@@ -507,6 +577,8 @@ class Driver:
                 raise SearchAbort(f"UNKNOWN twice at seq={seq} ohbm={ohbm} ({entry['signal']}); "
                                   f"inspect {entry['log']}")
         self.ledger.record(entry)
+        if kind == "confirm" and outcome == OK:
+            self.live_confirms = 0  # streak budget: a confirm OK resets it
         return outcome
 
     # ---------------- inner ohbm feasibility ----------------
@@ -656,11 +728,61 @@ class Driver:
                                     f"confirmed before abort ({e}); ceiling may be conservative")
             return self._result(lo_seq, lo_w, False, t0, f"ABORTED: {e}")
 
+    def confirm_metrics(self, seq: int, ohbm: int) -> dict:
+        """Steady-state + peak metrics and an artifact pointer from the confirm
+        run's step_samples.csv (source leaf preferred, nsys fallback). Best
+        effort: extraction trouble leaves fields null, never fails the search.
+        Peaks are rank0's (multi-GPU rows understate the peer)."""
+        out = {"artifact_dir": None, "confirm_steady_step_s": None,
+               "confirm_peak_hbm_gib": None, "confirm_peak_cpu_rss_gib": None}
+        try:
+            fields = [p.strip() for p in self.cfg.row(seq, ohbm).split(";")]
+            backend, recompute = [t.strip() for t in fields[1].split("|")[:2]]
+            _, batch, ga = [t.strip() for t in fields[2].split("|")[:3]]
+            # the w/s step label pins this to the confirm run; probes differ in _s<steps>
+            run_glob = (f"*/*__b{batch}_s{seq}_ga{ga}"
+                        f"_w{self.cfg.warmup_steps}_s{self.cfg.confirm_steps}_*")
+            leaf = None
+            for prof in ("source", "nsys"):
+                cands = sorted(
+                    self.artifacts_root.glob(
+                        f"{run_glob}/{backend}*__{prof}__{recompute}__*/b{batch}_s{seq}_ga{ga}"),
+                    key=lambda p: p.stat().st_mtime)
+                if cands:
+                    leaf = cands[-1]
+                    break
+            if leaf is None:
+                return out
+            out["artifact_dir"] = str(leaf.relative_to(ROOT))
+            with (leaf / "step_samples.csv").open() as f:
+                rows = list(csv.DictReader(f))
+            gib = 1024 ** 3
+            hbm = [float(r["peak_reserved_hbm_bytes"]) for r in rows
+                   if r.get("peak_reserved_hbm_bytes")]
+            rss = [float(r["process_rss_peak_bytes"]) for r in rows
+                   if r.get("process_rss_peak_bytes")]
+            if hbm:
+                out["confirm_peak_hbm_gib"] = round(max(hbm) / gib, 1)
+            if rss:
+                out["confirm_peak_cpu_rss_gib"] = round(max(rss) / gib, 1)
+            meas = sorted((r for r in rows
+                           if r.get("is_warmup", "").strip() in ("False", "false", "0")),
+                          key=lambda r: int(float(r["measured_step"])))
+            if len(meas) >= 3:  # steady state: drop first and last measured step
+                mid = [float(r["step_milliseconds"]) / 1000.0 for r in meas[1:-1]]
+                out["confirm_steady_step_s"] = round(sum(mid) / len(mid), 1)
+        except Exception as e:
+            self.say(f"confirm-metrics extraction failed (fields left null): {e}")
+        return out
+
     def _result(self, seq, ohbm, confirmed, t0, note) -> dict:
         r = {"name": self.cfg.name, "ceiling_seq": seq, "ohbm": ohbm,
              "confirmed": confirmed, "note": note,
              "live_probes": self.live_probes, "wall_s": int(time.time() - t0),
              "row": self.cfg.row(seq, ohbm) if seq is not None else None}
+        r.update(self.confirm_metrics(seq, ohbm) if confirmed and seq is not None else
+                 {"artifact_dir": None, "confirm_steady_step_s": None,
+                  "confirm_peak_hbm_gib": None, "confirm_peak_cpu_rss_gib": None})
         status = "CONFIRMED" if confirmed else ("PARTIAL" if seq else "FAILED")
         self.say(f"result: {status} ceiling_seq={seq} ohbm={ohbm} "
                  f"({self.live_probes} live probes, {r['wall_s']}s) {note}")
@@ -689,7 +811,8 @@ def load_configs(path: Path) -> list[Config]:
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("configs", type=Path, help="JSONL config list")
-    ap.add_argument("--state-dir", default=str(ROOT / "scripts" / "lf" / "ceiling_search_state"))
+    ap.add_argument("--state-dir", required=True,
+                    help="ledger/probe state dir, e.g. scripts/lf/ceiling_search_state_<profiler>_<host>")
     ap.add_argument("--only", nargs="+", help="run only these config names")
     ap.add_argument("--dry-run", action="store_true", help="print plan + prior probe rows, no runs")
     ap.add_argument("--single", nargs=3, metavar=("NAME", "SEQ", "OHBM"),

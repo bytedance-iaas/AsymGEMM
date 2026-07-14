@@ -110,8 +110,15 @@ public:
         DG_HOST_ASSERT(out.write(data.data(), data.size()));
         out.close();
 
-        // Atomically replace
-        std::filesystem::rename(tmp_file_path, path);
+        // Atomically replace. MULTI-RANK RACE (fix_ep 2026-07-11): two ranks
+        // building the SAME cold kernel race these renames; tolerate a loss as
+        // long as SOMEONE installed the file (contents are hash-identical).
+        std::error_code ec;
+        std::filesystem::rename(tmp_file_path, path, ec);
+        if (ec) {
+            DG_HOST_ASSERT(std::filesystem::exists(path) and "JIT put(): rename failed and no winner file exists");
+            std::filesystem::remove(tmp_file_path, ec);
+        }
     }
 
     std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code) const {
@@ -129,9 +136,19 @@ public:
         const auto tmp_cubin_path = get_tmp_file_path();
         compile(code, dir_path, tmp_cubin_path);
 
-        // Replace into the cache directory
+        // Replace into the cache directory. MULTI-RANK RACE (fix_ep 2026-07-11,
+        // receipt: two 40k-shape D0 runs died on `cannot rename ENOENT` when both
+        // ranks cold-compiled the same kernels): on rename failure accept a
+        // winner's already-installed cubin; if none exists, recompile ONCE into a
+        // fresh tmp and install that.
         make_dirs(dir_path);
-        std::filesystem::rename(tmp_cubin_path, dir_path / "kernel.cubin");
+        std::error_code rename_ec;
+        std::filesystem::rename(tmp_cubin_path, dir_path / "kernel.cubin", rename_ec);
+        if (rename_ec and not std::filesystem::exists(dir_path / "kernel.cubin")) {
+            const auto retry_cubin_path = get_tmp_file_path();
+            compile(code, dir_path, retry_cubin_path);
+            std::filesystem::rename(retry_cubin_path, dir_path / "kernel.cubin");
+        }
 
         // Put into the runtime cache
         const auto& runtime = kernel_runtime_cache->get(dir_path);
