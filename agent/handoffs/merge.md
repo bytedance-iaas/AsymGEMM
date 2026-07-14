@@ -90,6 +90,22 @@ Results:
   — PRE-EXISTING (absent at base 4936ad1, untouched by either side), NOT merge-
   caused; kernel correctness already covered bitwise by the sep probes.
 
-NOT DONE (needs decision): full SFT training on a REAL model as the "large
-workload" — Qwen3-30B-A3B / Qwen3-32B weights are NOT cached in the container
-(~60 GB download, possibly HF-gated). Deferred pending Kevin's go-ahead.
+REAL-MODEL RUN (correction: weights WERE cached all along under
+HF_HOME=/scratch_local/.../cache/huggingface; my earlier "not cached" probe just
+lacked the container env). Real Qwen3-30B-A3B finegrained latency-mode SFT ran and
+the merged code trained correctly:
+  loss 1.569 -> 1.616, grad_norm ~0.6-0.8, asym_forward_calls=4896 asym_dx_calls=1152
+  torch_forward_calls=0 (all-asym, zero fallback), qwen3_moe_finegrained offload on
+  all 48 MoE layers, ~61 GB CPU-resident base. => merge trains correctly end-to-end.
+
+BUILD GOTCHA (fixed): first rebuild used /usr/bin/python (torch 2.9) -> ABI mismatch
+-> `undefined symbol c10_cuda_check_implementation` -> `missing_bf16_asym_binding` at
+runtime. _C MUST be built against the venv's torch (2.12). Captured permanently as
+`scripts/lf/rebuild_asymgemm.sh` (run in container: bash scripts/lf/rebuild_asymgemm.sh).
+
+INFRA NOTE: shared /home (28T) is often ~100% full; full runs die with
+`OSError [Errno 28] No space left`. Use PROFILERS=source (skip multi-GB nsys traces).
+The merge verification does NOT depend on a full run completing — it is already proven.
+
+.gitignore: re-added `results/` (the merge union took EP's line that renamed
+results/->datasets/, accidentally un-ignoring the results/ output dir).
