@@ -4,7 +4,7 @@
 doc.** It absorbs the retired `scheduler.md` (v1) and `scheduler_knob.md`; v1's laws
 and meter model survive inside §2, its A1–A14 axis ledger is condensed into §3's D1–D6
 + the class-1 pins. Full A1–A14 detail + the frozen per-model metric snapshot live in
-`agent/archive/scheduler_knob.md` (record only). Impl+probe evidence:
+`agent/impls/archive/scheduler_knob.md` (record only). Impl+probe evidence:
 `agent/impls/memory_mode.md`. Jobs of this doc:
 (A) the formulation — one objective, one admission rule, all knobs classified;
 (B) the transferable knob table (memory→latency, gradual and clean);
@@ -302,7 +302,7 @@ measurement-driven frame can make.
 ## 7. Per-model measured dials + capacity (records)
 
 Absorbed from the retired `scheduler_knob.md`; the frozen full-detail snapshot (incl.
-the A1–A14 ledger) is `agent/archive/scheduler_knob.md`. Protocol §5 unless noted.
+the A1–A14 ledger) is `agent/impls/archive/scheduler_knob.md`. Protocol §5 unless noted.
 
 ### 7a. q3-30b-a3b (MoE) @80000|8|1 ohbm0 — the dial
 

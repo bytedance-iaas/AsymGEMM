@@ -54,7 +54,7 @@ full-asym and keeps its +20–32% max-seq advantage. One backend, best of both.
 
 Your first deliverable is analysis, not code. Concretely:
 
-1. **Read `agent/scheduler.md`** (370-line formulation + latency-recovery plan, v2,
+1. **Read `agent/impls/scheduler_v2.md`** (370-line formulation + latency-recovery plan, v2,
    already exists) — it formalizes homes {HBM, DRAM}, the memory↔latency dial, and a
    steady-state timing protocol (≥5 steps, drop warmup + first + last measured). Treat
    it as the theoretical frame; reconcile anything below that disagrees with it.
@@ -143,7 +143,7 @@ implement incrementally:
 - Loss comparisons vs pre-fix runs are NOT bit-comparable (old trajectories carried the
   accumulation bug); validate loss sanity/convergence, or vs plain `asym`.
 - Full context: `agent/fix_throughput.md` (stall budgets, trace decomposition, fix
-  ranking + control result), `scripts/lf/ceiling_table*.md`, `agent/scheduler.md`
+  ranking + control result), `scripts/lf/ceiling_table*.md`, `agent/impls/scheduler_v2.md`
   (earlier planning notes).
 
 ## Success criteria

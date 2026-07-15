@@ -292,7 +292,7 @@ keep only as a fallback if the staged path misbehaves.
   `build_contiguous_route_metadata` bincount with GPU 100%; config had completed 3×
   before → system-level. Ladder runner now wraps rungs in timeout+retry
   (`scripts/lf/run_dial_ladder.sh`).
-- Latency↔memory dial work continues in `agent/scheduler_v2.md` (formulation + ladder).
+- Latency↔memory dial work continues in `agent/impls/scheduler_v2.md` (formulation + ladder).
 
 ## History / provenance
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dial ladder (scheduler_v2.md §3): memory→latency rungs @ q3-30b-a3b 120k b8.
+# Dial ladder (agent/impls/scheduler_v2.md §3): memory→latency rungs @ q3-30b-a3b 120k b8.
 # Steady protocol: w1+m4; per-run timeout + one retry (rare router-bincount hang,
 # see memory_mode.md 2026-07-13).
 set -uo pipefail

@@ -2428,7 +2428,10 @@ profiler_selected_for_plots() {
 
 dataset_name_for_seq() {
   local seq_len="$1"
-  safe_label "${DATASET}__${workload_label}__s${seq_len}"
+  # Pool identity includes the row count (MAX_SAMPLES) so different pool sizes never
+  # collide on one name: with DATASET_OVERWRITE=false a new size just builds its own
+  # pool once and is reused thereafter; a larger batch later only needs a bigger n.
+  safe_label "${DATASET}__${workload_label}__s${seq_len}__n${MAX_SAMPLES}"
 }
 
 dataset_min_tokens_for_seq() {

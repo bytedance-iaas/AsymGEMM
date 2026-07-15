@@ -289,7 +289,7 @@ the irreducible remainder. Re-validate each fix with the Phase A protocol and re
 ## THE TWO MODES (canonical config record — 2026-07-10 regroup)
 
 > The full memory↔latency decision-axis catalog (14 axes, measured prices, composition
-> rules for a scheduler) lives in **`agent/scheduler.md` §2.5 "THE TRADEOFF LEDGER"** —
+> rules for a scheduler) lives in **`agent/impls/scheduler_v2.md` §3 (D1–D6; full A1–A14 in `agent/impls/archive/scheduler_knob.md`)** —
 > the modes below are two named points in that space.
 
 **MEMORY MODE** (headline = lowest memory / highest ceiling; latency not a goal).
@@ -366,7 +366,7 @@ RESULTS 2026-07-10 (w1+max1 probes, current tree):
   latency mode now **1.34× FASTER than so-off** (373.1/108.5) at +24 GiB, 45 GiB leaner
   than unsloth (221.0/177.3). At 49k the +36.7 GiB exceeds so-off's memory (near dense
   s*) — a true memory↔latency trade; fit-check like the MoE twin. Dial in
-  agent/scheduler/knob.md.
+  agent/impls/archive/scheduler_knob.md.
 - D13 owner ceiling probes (q3-32b, memmode env, w1+max1): **65k@ohbm0 PASS**
   (125.3 GiB HBM — ~60 GiB slack — RSS 891.6 GB: host-bound) and **68k@ohbm8 PASS**
   (161.0 GiB, RSS 598.3 GB) → the recorded 65k ceiling is stale-LOW on the current
