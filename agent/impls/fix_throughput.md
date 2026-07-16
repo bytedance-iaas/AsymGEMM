@@ -455,10 +455,43 @@ ceiling re-search.
 | D1 ROUTE_LORA | `ASYMM_QWEN3_MOE_ROUTE_LORA=1` | **+0.06 s (null)** | — | yes | n/a | REJECT (keep 0); the 2.27 s scatter bin is shadowed — 2nd counter refuted by A/B |
 | D2 microbench | (bench: `scripts/gemm/bench_engine_tax.py`) | — | — | n/a | n/a | **GO for D5**: dense attn asym 6–40× resident, staged 1.06×; grouped asym 2.7–3.6×, staged 1.7× (copy 3.2 ms/bank) |
 | D3 keep-acts-HBM | `ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM=1` | **−14.9 s (109.45→94.51; bwd −14.7)** | pending (auto-off above s\*) | yes (+bit-exact toy parity; guard raises) | +9.9 GiB, flag-off default | **ACCEPT** (gate ≥5 s ✓) |
-| D4 async GC unpack | `ASYM_SAVED_TENSOR_ASYNC_UNPACK=1` (decoder/lin-attn unpack + pinned GC root + async save_on_cpu) | **+0.08 s (null)** | pending (its case: 4× root sizes + the 131k boundary gaps) | yes (+roundtrip/grad-parity sanity; engagement verified: root saved pinned) | 0 GiB | HOLD for long-seq gate; 3rd shadowed-counter lesson: pageable root fetch + save_on_cpu unpacks are hidden by GPU queue at 32k |
+| D4 async GC unpack | `ASYM_SAVED_TENSOR_ASYNC_UNPACK=1` (decoder/lin-attn unpack + pinned GC root; **NOT async save_on_cpu — see correction**) | **+0.08 s (null)** | pending (its case: 4× root sizes + the 131k boundary gaps) | yes (+roundtrip/grad-parity sanity; "root saved pinned" was satisfied by the pre-existing `gc_boundary_offload.py` path, NOT by this flag) | 0 GiB | HOLD for long-seq gate; but the null is now EXPLAINED, not mysterious — see correction below |
 | D5 staged dispatch | `ASYM_GEMM_DISPATCH=staged` | **−18.4 s (109.45→91.01; fwd 18.84→12.50, bwd −11.8)** | pending | yes | **+0 GiB** (transient staging); ceiling re-search pending | **ACCEPT** — engagement: asym_calls=0, torch 3360 fwd / 2160 dX; route-fused ker kernels unaffected |
 | D0 flag-off sanity | (all flags off, patched tree) | 109.47 ≈ 109.45 baseline | — | yes | ✓ | patched tree byte-inert with flags off |
 | **D6 cumulative** | D3+D4+D5 flags on | **76.45 s (fwd 12.55 / bwd 59.89)** = **−30.2%**; D3+D5 additive (33.0 vs 33.3 predicted) | pending | yes | **38.4 GiB (+1.7 vs baseline!)** | **asym bwd 59.9 now BEATS so-off's 76.1; step 1.148× of so-off's 66.6 (was 1.64×); tok/s 3,349 vs 3,845 (−12.9%)** |
+
+### D4 CORRECTION (2026-07-15, code audit during the SFT-39 merge) — the null is explained, and part of D4 measured nothing
+
+Two errors in the D4 row above, both found by reading, neither by re-running:
+
+1. **`async save_on_cpu` was never reachable.** `asym_gemm/training/gc_async_offload.py`
+   (93 lines) has **zero external callers** — `git log -S "async_save_on_cpu" --all`
+   returns only the commit that added it, and no flag wires it in. So the D4 A/B could
+   not have exercised that half. The "engagement verified: root saved pinned"
+   observation is real but was satisfied by the **pre-existing**
+   `gc_boundary_offload.py:69-70,90` path, which already offloads the root through the
+   pinned pool. (The file's own docstring premise — "the stock LF path saves the
+   per-layer root via `hidden.to('cpu', non_blocking=True)`, an UNPINNED destination" —
+   does not describe this repo's boundary path.) => Either wire it or delete it; do not
+   leave a recorded result pointing at unreachable code.
+2. **The +0.08 s null was structural, not a measurement mystery.** The async restage
+   delivers **zero copy/compute overlap by construction**: `side.wait_stream(compute)`
+   makes the copy wait on all preceding compute, `compute.wait_event(done)` makes all
+   following compute wait on the copy, and nothing is enqueued between — so device-side
+   ordering equals issuing the copy on the compute stream. The only gain is host
+   run-ahead. A null is the *expected* result, so the "3rd shadowed-counter lesson"
+   framing is the wrong read: nothing was shadowed, there was nothing to overlap.
+   `activation_offload.py` now says this in-place (the old comment claimed overlap).
+   Real overlap needs `stage` allocated ON the side stream, no `wait_stream`, and
+   `record_stream(compute_stream)`.
+
+Fixed alongside this correction: `ASYM_SAVED_TENSOR_ASYNC_UNPACK` is now forwarded as
+`ASYM_GEMM_LF_CONFIG_*` by the driver (it worked before via bare-env inheritance, but
+`_env_config()` only harvests the prefixed form, so **no D4 artifact recorded whether
+the flag was on**); and `linear_attention_activation_offload` now reports
+`pin_fallback_calls`, since a failed pin silently returns a pageable buffer and forces
+the host-blocking unpack — the exact thing the flag exists to remove, previously with
+no signal. Re-read any D4 row with `pin_fallback_calls` in hand before trusting it.
 
 ### D6 close-out (2026-07-09, 32k×8, 5-step protocol)
 

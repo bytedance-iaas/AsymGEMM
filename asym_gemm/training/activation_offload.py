@@ -321,8 +321,15 @@ class ActivationOffloadManager:
             self._stage_cache[key] = stage
             self._stage_keys_by_ptr[int(stage.data_ptr())] = key
         if handle.tensor.is_pinned() and handle.original_device.type == "cuda":
-            # H2D restage on the side stream; the compute stream waits on the EVENT so the
-            # copy overlaps preceding compute instead of serializing the compute stream.
+            # H2D restage on a side stream. NB: this buys host run-ahead only, NOT
+            # copy/compute overlap — wait_stream below makes the copy wait on all
+            # preceding compute, and wait_event makes all following compute wait on
+            # the copy, with nothing enqueued between, so the device-side ordering is
+            # the same as issuing the copy on the compute stream. The win is that the
+            # host never blocks (no .synchronize()). Measured accordingly: +0.08 s,
+            # null (fix_throughput.md D4). For real overlap, `stage` would have to be
+            # allocated ON the side stream, the wait_stream dropped, and record_stream
+            # taken against the compute stream instead.
             from .attention_activation_offload import _h2d_restage_stream
 
             compute_stream = torch.cuda.current_stream(handle.original_device)

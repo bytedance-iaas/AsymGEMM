@@ -85,7 +85,13 @@ def _tensor_storage_nbytes(tensor: torch.Tensor) -> int:
         return int(tensor.numel() * tensor.element_size())
 
 
+# Times a pin request fell back to pageable. Module-global: the fallback happens in a
+# free function, and "did ANY pin fail this run" is the question worth answering.
+_PIN_FALLBACK_CALLS = 0
+
+
 def _empty_strided_cpu_like(tensor: torch.Tensor, *, pin_memory: bool) -> torch.Tensor:
+    global _PIN_FALLBACK_CALLS
     shape = tuple(int(dim) for dim in tensor.shape)
     stride = tuple(int(value) for value in tensor.stride())
     try:
@@ -97,6 +103,14 @@ def _empty_strided_cpu_like(tensor: torch.Tensor, *, pin_memory: bool) -> torch.
             pin_memory=bool(pin_memory and torch.cuda.is_available()),
         )
     except RuntimeError:
+        # Pinning failed (typically host pinned-pool exhaustion). Returning a pageable
+        # buffer keeps the step alive, but it silently DOWNGRADES the path: _pack then
+        # leaves ready_event=None and _unpack takes the host-blocking pageable branch —
+        # precisely what ASYM_SAVED_TENSOR_ASYNC_UNPACK exists to remove. Count it, so a
+        # run can distinguish "async unpack on" from "async unpack silently degraded";
+        # without this the two are indistinguishable in the artifacts. Most likely to
+        # fire under pinned pressure at the long-seq (120k/131k) sizes this targets.
+        _PIN_FALLBACK_CALLS += 1
         return torch.empty_strided(shape, stride, device="cpu", dtype=tensor.dtype)
 
 
@@ -295,6 +309,10 @@ class LinearAttentionSavedTensorOffloadWrapper:
             "require_grad": self.require_grad,
             "skip_in_backward": self.skip_in_backward,
             "skipped_backward_calls": self.skipped_backward_calls,
+            # >0 means some saved tensors are pageable, so their unpack blocked the host
+            # regardless of ASYM_SAVED_TENSOR_ASYNC_UNPACK — read any async-unpack A/B
+            # with this in hand.
+            "pin_fallback_calls": _PIN_FALLBACK_CALLS,
             "allowed_dtypes": [str(dtype).replace("torch.", "") for dtype in sorted(self.allowed_dtypes, key=str)],
             "offloaded_bytes": self.offloaded_bytes,
             "cpu_owned_bytes": self.cpu_owned_bytes,
