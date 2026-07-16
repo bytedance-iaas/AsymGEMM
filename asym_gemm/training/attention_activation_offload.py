@@ -157,6 +157,16 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _in_backward_graph_task() -> bool:
+    # >= 0 exactly while a backward graph task is executing on this thread,
+    # i.e. during GC recompute forwards. See the same helper in
+    # linear_attention_activation_offload.py for the full rationale.
+    try:
+        return torch._C._current_graph_task_id() != -1
+    except AttributeError:
+        return False
+
+
 _H2D_RESTAGE_STREAMS: dict[int, torch.cuda.Stream] = {}
 
 
@@ -259,6 +269,14 @@ class AttentionSavedTensorOffloadWrapper:
             if require_grad is None
             else bool(require_grad)
         )
+        self.skip_in_backward = _env_bool(
+            "ASYM_ATTN_SAVED_TENSOR_OFFLOAD_SKIP_IN_BACKWARD",
+            # default AUTO: when the LF unsloth-GC save_on_cpu recompute wrapper is
+            # active, the in-backward offload here is a redundant duplicate round
+            # trip (fix_qwen3.5.md §10b C3) — skip it; explicit env overrides.
+            _env_bool("UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU", False),
+        )
+        self.skipped_backward_calls = 0
         self.calls = 0
         self.offload_calls = 0
         self.unpack_calls = 0
@@ -285,6 +303,13 @@ class AttentionSavedTensorOffloadWrapper:
     def run(self, *args: Any, **kwargs: Any) -> Any:
         self.calls += 1
         if not self.module.training or not torch.is_grad_enabled():
+            return self.original_forward(*args, **kwargs)
+        if self.skip_in_backward and _in_backward_graph_task():
+            # Grad-enabled forwards inside an active backward graph task are GC
+            # recomputes: offloading there is a same-step D2H+H2D round trip that
+            # doubles saved-tensor residency instead of shrinking the peak.
+            self.skipped_backward_calls += 1
+            self._sync_module_stats()
             return self.original_forward(*args, **kwargs)
         with saved_tensors_hooks(self._pack, self._unpack):
             return self.original_forward(*args, **kwargs)
@@ -402,6 +427,8 @@ class AttentionSavedTensorOffloadWrapper:
             "calls": self.calls,
             "min_bytes": self.min_bytes,
             "require_grad": self.require_grad,
+            "skip_in_backward": self.skip_in_backward,
+            "skipped_backward_calls": self.skipped_backward_calls,
             "allowed_dtypes": [str(dtype).replace("torch.", "") for dtype in sorted(self.allowed_dtypes, key=str)],
             "offloaded_bytes": self.offloaded_bytes,
             "cpu_owned_bytes": self.cpu_owned_bytes,

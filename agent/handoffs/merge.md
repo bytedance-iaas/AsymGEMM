@@ -109,3 +109,57 @@ The merge verification does NOT depend on a full run completing — it is alread
 
 .gitignore: re-added `results/` (the merge union took EP's line that renamed
 results/->datasets/, accidentally un-ignoring the results/ output dir).
+
+---
+
+# Merge 2: SFT-39 (qwen3.5 memory) <- SFT (memory/latency) — 2026-07-15
+
+## Repo relationship — trivial, unlike merge 1
+SFT's `main_kevin` (c62aef3) ALREADY CONTAINED SFT-39's HEAD (1896825), so the
+committed side was a pure fast-forward. ALL merge risk was in SFT-39's UNCOMMITTED
+qwen3.5 work. Backed up first: branch `main_kevin_qwen35` (5a81335), pushed to origin.
+
+## Conflicts: 2 files, 1 root cause
+Auto-merged clean AND verified semantically orthogonal (not merely marker-free):
+`attention_activation_offload.py` (qwen35 skip-in-backward vs SFT LoRA-chunking),
+`linear_attention_activation_offload.py` (vs SFT async-unpack), `profile_lora_lf_test_both.sh`
+(QWEN35_DELTA_CHUNK_SIZE plumbing vs SFT knob forwarding). No conflict: `lf_trace.py`,
+`qwen3_moe.py`, `fix_qwen3.5.md`, `fix_reserved.md`.
+
+`qwen3_moe_finegrained.py` — 9 hunks, all ONE cause: **both machines independently
+implemented row-blocked fg forward**. qwen3.5 side = `_fg_fwd_block_experts` /
+`fwd_blocked` (opt-in knob `ASYMM_QWEN3_MOE_FG_FWD_BLOCK_EXPERTS`, default off);
+SFT side = `_fg_elementwise_blocks` / `gateup_act_blocked` (auto-on, byte-budgeted).
+
+## Resolution: took SFT's, kept 2 things from qwen3.5's
+NOT a coin flip — `_fg_elementwise_blocks` ends in `return _expert_blocks(...)`, the
+SAME function the qwen3.5 knob called. It is the same technique with the expert-count
+DERIVED from `ASYMM_FG_ELEMENTWISE_CHUNK_MB` instead of hand-set, and its 1024 MB
+default was probe-swept (reserved fragmentation gap 21->5 GiB @120k; 512 and 2048 both
+worse => finer blocking is NON-MONOTONIC). Plus it is validated (30B@120k, loss parity)
+and the rest of the SFT diff (down_dx_staged, keep_acts_hbm, attn LoRA chunk) depends
+on its infra. So: `--ours` on the file, qwen3.5's blocked impl + both its helpers dropped,
+`ASYMM_QWEN3_MOE_FG_FWD_BLOCK_EXPERTS` retired (only ref was fix_qwen3.5.md, no scripts).
+
+Kept from qwen3.5 side:
+1. `ASYMM_QWEN3_MOE_FG_RELEASE_FUSED_HOME` + the unsupported_reasons pin-check
+   relaxation — SFT does not have it at all; re-applied by hand after `--ours`.
+2. **A REAL BUG IN THE SFT PATH, now fixed at source**: `offload()` records
+   num_offloads/offloaded_bytes/offload_bytes_by_tag; `empty_cpu()` records only
+   num_cpu_allocs. The SFT blocked paths fill via `empty_cpu` + `record_cpu_ready`, so
+   EVERY blocked write was invisible to offloaded_bytes — and it is auto-on in the
+   flagship config, right as memory experiments resume. qwen3.5's `_account_blocked_offload`
+   fixed this locally; instead folded the accounting INTO `record_cpu_ready`
+   (activation_offload.py), since every caller is by definition a manual offload. That
+   also fixes `dense_mlp_finegrained.py` (316/455/456), which had the same silent gap.
+   Safe: each handle calls it exactly once, and `_HBMKeepManager` deliberately lacks the
+   method (hence the `hasattr(manager,'record_cpu_ready')` gate).
+
+## Known gaps carried forward (NOT regressions from the merge)
+- SFT's blocked path is gated on `da_gpu`, which is forced off by
+  `DOWN_SCATTER_BLOCK_EXPERTS>0` => **no fg fwd blocking under dscatter**, whereas
+  H3b covered that case. Check which ker* codes set dscatter before reading a
+  fwd_peak regression as merge-caused.
+- nograd forward keeps a full-R `act` [R, I] bf16 (~1.4 GiB @30B-a3b/120k/b8) that
+  H3b's blocked down+scatter avoided. Live path under GC (outer forward is no-grad).
+  Deferred deliberately: unvalidated code on a validated base; land + measure first.

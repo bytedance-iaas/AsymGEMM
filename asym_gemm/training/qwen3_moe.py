@@ -2547,6 +2547,27 @@ class AsymQwen3Experts(nn.Module):
         )
         self._qwen3_moe_finegrained_gate_base = gate_base
         self._qwen3_moe_finegrained_up_base = up_base
+        # The full-fg path runs every base GEMM (fwd, nograd-fwd, and backward dX)
+        # through the SPLIT gate/up bases above — the fused [E, 2I, H] home is then
+        # only read by capability checks, yet its pinned copy stays resident: with
+        # the split copies that is 5*I*H per expert instead of 3 (measured 5/3 of
+        # the experts' bf16 bytes on qwen3-30b/35B/122B; +144 GiB host at 122B).
+        # ASYMM_QWEN3_MOE_FG_RELEASE_FUSED_HOME frees the fused pinned storage once
+        # the splits are pinned. DEFAULT ON since 2026-07-15 (clear bug fix; set 0
+        # to keep the old duplicated-home behavior).
+        if (
+            os.environ.get("ASYMM_QWEN3_MOE_FG_RELEASE_FUSED_HOME", "1").strip().lower() in {"1", "true", "yes", "on"}
+            and gate_base.host_weight.weight.is_pinned()
+            and up_base.host_weight.weight.is_pinned()
+        ):
+            fused_hw = self.gate_up_base.host_weight
+            released = torch.empty(0, dtype=fused_hw.weight.dtype, device="cpu")
+            fused_hw._tensor = released
+            setattr(fused_hw, "_asym_released_fused_home", True)
+            setattr(self.gate_up_base, "_asym_released_fused_home", True)
+            self.stats.qwen3_moe_finegrained_fused_home_released = (
+                getattr(self.stats, "qwen3_moe_finegrained_fused_home_released", 0) + 1
+            )
         return gate_base, up_base
 
     def _qwen3_moe_finegrained_unsupported_reasons(self, packed: torch.Tensor) -> list[str]:

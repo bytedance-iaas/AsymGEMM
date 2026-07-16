@@ -18,6 +18,30 @@ from asym_gemm.training.profile_ranges import current_profile_range, prof_range,
 _PATCH_ATTR = "_asym_lf_profile_wrapped"
 _HOOK_ATTR = "_asym_lf_profile_hooks_installed"
 _MEMORY_HOOK_ATTR = "_asym_lf_memory_breakdown_hooks_installed"
+
+# Phase-boundary allocator release (agent/impls/fix_reserved.md). Under
+# expandable segments, peak RESERVED is the union of each stream-pool's own
+# high-water across phases; releasing free pages at phase boundaries makes each
+# phase re-grow from ~allocated instead. Default OFF; enable per run with e.g.
+# ASYM_EMPTY_CACHE_PHASES=forward_end,backward_end. Applied here (the source
+# profiler wraps every backend identically) so scoreboards stay apples-to-apples.
+_EMPTY_CACHE_PHASES = frozenset(
+    token.strip()
+    for token in os.environ.get("ASYM_EMPTY_CACHE_PHASES", "").split(",")
+    if token.strip()
+)
+
+
+def _maybe_release_cached_blocks(phase: str) -> None:
+    if phase not in _EMPTY_CACHE_PHASES:
+        return
+    try:
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 # Stock MoE classes whose forward mutates a child's output in place — Llama4TextMoe does `out.add_(...)`
 # on its shared_expert output. A full backward hook wraps a module's output in a custom autograd
 # Function, and autograd forbids in-place edits of that wrapped output ("Output 0 of
@@ -1872,6 +1896,7 @@ def _patch_training_phases(handle: LFTraceHandle) -> None:
                                     )
                             except Exception:
                                 pass
+                    _maybe_release_cached_blocks("forward_end")
                     return result
                 except BaseException:
                     if handle.memory_breakdown_profiler is not None:
@@ -1936,6 +1961,7 @@ def _patch_training_phases(handle: LFTraceHandle) -> None:
                         result = original(self, *args, **kwargs)
                         if handle.memory_breakdown_profiler is not None:
                             handle.memory_breakdown_profiler.record_phase("after_backward", model=handle.model, optimizer=None)
+                        _maybe_release_cached_blocks("backward_end")
                         return result
                     finally:
                         _maybe_stop_nsys_capture(handle)

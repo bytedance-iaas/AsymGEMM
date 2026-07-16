@@ -341,9 +341,18 @@ class ActivationOffloadManager:
         return stage
 
     def record_cpu_ready(self, handle: CPUActivationHandle) -> None:
-        """Register a cpu-ready event for a handle whose pinned tensor was filled by
-        chunked async D2H copies on the current stream (offload() records this event
-        itself; direct row writes must call this once after the last chunk)."""
+        """Seal a handle whose tensor was filled by direct row writes rather than by
+        offload(): register its cpu-ready event and mirror offload()'s byte accounting
+        (direct row writes must call this once after the last chunk).
+
+        The accounting matters as much as the event: empty_cpu() only counts
+        num_cpu_allocs, so without this the row-blocked paths would move their bytes
+        to CPU invisibly and report offloaded_bytes ~0 for the tags they dominate.
+        Called once per handle, so the counters stay in step with the copies."""
+        nbytes = handle.nbytes
+        self.stats.num_offloads += 1
+        self.stats.offloaded_bytes += nbytes
+        self.stats.offload_bytes_by_tag[handle.tag] = self.stats.offload_bytes_by_tag.get(handle.tag, 0) + nbytes
         if torch.cuda.is_available() and handle.tensor.is_pinned():
             event = torch.cuda.Event()
             event.record(torch.cuda.current_stream())

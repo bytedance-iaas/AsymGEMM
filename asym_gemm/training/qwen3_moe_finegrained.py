@@ -2257,7 +2257,13 @@ def qwen3_moe_finegrained_unsupported_reasons(layer: "AsymQwen3Experts", hidden_
     if isinstance(layer.gate_up_base, AsymGroupedFrozenLinear):
         if layer.gate_up_base.precision != "bf16" or layer.gate_up_base.backend != "asym":
             reasons.append("gate/up base must use direct bf16 AsymGEMM")
-        if torch.cuda.is_available() and not layer.gate_up_base.host_weight.weight.is_pinned():
+        # Once ASYMM_QWEN3_MOE_FG_RELEASE_FUSED_HOME freed the fused home, the fg
+        # path runs entirely off the (pinned) split bases; the fused pin check is moot.
+        if (
+            torch.cuda.is_available()
+            and not getattr(layer.gate_up_base, "_asym_released_fused_home", False)
+            and not layer.gate_up_base.host_weight.weight.is_pinned()
+        ):
             reasons.append("gate/up host weight must be pinned CPU memory")
     if isinstance(layer.down_base, AsymGroupedFrozenLinear):
         if layer.down_base.precision != "bf16" or layer.down_base.backend != "asym":
