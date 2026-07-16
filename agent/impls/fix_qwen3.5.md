@@ -288,6 +288,42 @@ calls stay under the ≥75k fault length). Artifacts:
 | 80000×8 | **A tuned+chunk** | 428–433 | 554 | **78.9** | **91.7** | 0.80–0.93 ✓ |
 | 80000×8 | B superoffload+chunk | 359.7–360.5 | 685 | 100.4 | 103.0 | 0.77–0.93 ✓ |
 
+### 9c. `qwen35_fg_numeric_probe.py --qwen3 --tokens 655360` "BROKEN: fg101" is a PROBE BUG (2026-07-15)
+
+**The kernel is fine. The harness contaminates itself. Do not chase this again.**
+
+The Stage-1 cross-model gate reports `verdict: BROKEN: fg101` (`fg101 out` rel_fro
+**0.170918** vs the 0.05 bar). It is NOT a ker101 defect and NOT merge-caused:
+
+| run | rel_fro | verdict |
+|---|---:|---|
+| canonical 5-case order (plain → fg000 → fg101 → +v2 …) | **0.170918** | BROKEN |
+| **fg101 ALONE, same shapes/inputs/commit** | **0.006273** | **PASS** |
+
+27× better in isolation. The only variable is whether `plain`/`fg000` ran first, so the
+error is **cross-case contamination**: the probe reuses ONE `engine` across five
+`run_case` calls, mutating `os.environ` between them, while tensor-attached memos
+(`_asym_pad_memo`; `_asym_kernel_meta_memo`, keyed only by `str(device)` —
+`qwen3_moe_routed_gemm.py:89-91`) and the module-global `_CPU_BUFFER_POOL` persist.
+That also explains the determinism that first made the "race" theory untenable: pool
+LIFO order and memo population are fully deterministic, so the wrong answer reproduces
+to six decimals across commits and processes.
+
+Corroborating: byte-identical `0.170918` at `1896825`, `c62aef3` and `fd2eb57` (probe
+script md5-identical since 2026-07-03); `s80000·b8` trains in band (loss 1.689 ± 0.05)
+at R≈5.12M, essentially the probe's R=5.24M regime — impossible if ker101 miscomputed
+there. Two hypotheses were tested and REFUTED with evidence, record them as dead ends:
+int32 overflow (R*I=4.03e9 > int32 max — but the kernel never forms a 32-bit linear
+index: TMA row coords fit `uint32_t`, scatter is `static_cast<uint64_t>`,
+`sm100_bf16_asym_gemm.cuh:1043-1045`) and pool bucketing (R=5,242,880 = exactly
+80×65536 → exact-shape alloc, no narrow/alias).
+
+TODO (probe, not kernel): give each `run_case` a fresh engine + cleared CPU pool, or
+run one case per process. Until then the ≤4096-token shape sets are trustworthy and
+this one is not — `archive/fix_finegrained_qwen3.5_moe.md:74-78` recorded it passing
+all five cases at ≤0.8% on 2026-07-03, so the contamination regressed in some
+pre-1896825 change.
+
 ### 9b-post-merge (2026-07-15): SFT memory/latency line merged in — G1 MET at 80k
 
 Post-merge `main_kevin` = `fd2eb57` (merge of the SFT memory/latency line + this
