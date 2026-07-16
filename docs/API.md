@@ -153,8 +153,8 @@ out = layer.forward(x_bf16, expert_ids, route_w)   # [T, hidden] bf16
 
 | Method | Description |
 |--------|-------------|
-| `Layer.from_bf16(gate, up, down, *, top_k, cpu_threads=0, cuda_device=0, m_cpu=16, adaptive=False, dispatch_model=None)` | Quantize BF16 expert masters (`gate`/`up`: `[G, inter, hidden]`, `down`: `[G, hidden, inter]`) to per-channel INT8 and build both backends |
-| `Layer.from_int8(...)` | Load pre-quantized weights (see `scripts/convert_int8_weights.py`) |
+| `Layer.from_bf16(gate, up, down, *, top_k, cpu_threads=0, cuda_device=0, m_cpu=16, adaptive=False, runtime=None, dispatch_model=None)` | Quantize BF16 expert masters (`gate`/`up`: `[G, inter, hidden]`, `down`: `[G, hidden, inter]`) to per-channel INT8 and build both backends. `runtime=` injects a shared `_C.Runtime` CPU worker pool (instead of building one per layer from `cpu_threads`) |
+| `Layer.from_int8(gate_int8, gate_scales, up_int8, up_scales, down_int8, down_scales, *, top_k, ...)` | Load pre-quantized weights (see `scripts/convert_int8_weights.py`); same keyword arguments as `from_bf16` |
 | `layer.forward(x_bf16, expert_ids, route_w)` | One MoE forward: `x_bf16 [T, hidden]`, `expert_ids [T, top_k]` int, `route_w [T, top_k]` fp32 |
 | `layer.set_m_cpu(k)` | Static dispatch: experts with ≤ k routed tokens run on the CPU |
 | `layer.set_adaptive(True)` | Enable cost-model-based adaptive dispatch |
@@ -173,9 +173,13 @@ Per-backend linear cost models with a makespan partition solver. One instance ca
 
 Transform scale factor tensors into TMA-aligned layout required by SM90/SM100 kernels.
 
-#### `asym_gemm.fp8_einsum(equation, a, b, scale_a, scale_b)`
+#### `asym_gemm.einsum(expr, a, b, d, c=None, use_cublaslt=False)`
 
-FP8 tensor contraction (einsum-style interface).
+BF16 tensor contraction (einsum-style interface) writing into a preallocated output `d`.
+
+#### `asym_gemm.fp8_einsum(expr, a, b, d, c=None, recipe=(1, 128, 128))`
+
+FP8 tensor contraction. `a` and `b` are `(data, scales)` tuples as in the FP8 GEMMs; `recipe` sets the quantization granularity.
 
 ---
 
@@ -190,7 +194,16 @@ FP8 tensor contraction (einsum-style interface).
 | `SGLANG_MASKED_GEMM_CHUNK_SIZE` | `0` | Expert group chunk size (0 = no chunking) |
 | `SGLANG_MASKED_GEMM_FAST_ACT` | `False` | Fused SiLU + quantization path |
 | `SGLANG_ASYMGEMM_SANITY_CHECK` | `False` | Enable input validation checks |
-| `SGLANG_ENABLE_SM89_ASYMGEMM` | `False` | Force SM89 path on non-Ada GPUs (testing) |
+
+Unified CPU + GPU MoE in SGLang (experimental — env-var configured until CLI
+options land; see [Quick Start](quick_start.md#unified-cpu--gpu-moe-in-sglang-experimental)):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SGLANG_ASYMGEMM_UNIFIED_MOE` | `False` | Enable the unified CPU(AMX INT8) + GPU(SM90 INT8) MoE path; requires SM90 + AMX-INT8, falls back with a logged reason otherwise |
+| `SGLANG_ASYMGEMM_UNIFIED_M_CPU` | `16` | Dispatch threshold: experts with ≤ this many routed tokens run on the CPU bucket |
+| `SGLANG_ASYMGEMM_UNIFIED_CPU_THREADS` | `0` | Total threads for the process-wide CPU worker pool shared by all MoE layers (0 = hardware concurrency) |
+| `SGLANG_ASYMGEMM_UNIFIED_INT8_PATH` | unset | Directory of offline INT8 weights (`scripts/convert_int8_weights.py`); skips online quantization at load time, required for FP8 checkpoints |
 
 Unified MoE runtime (`asym_gemm.unified_moe`):
 
@@ -203,5 +216,6 @@ Unified MoE runtime (`asym_gemm.unified_moe`):
 | `ASYMGEMM_STAGE_STREAMED` | `1` | Stage streamed expert weights through the copy engine; `0` disables |
 | `ASYMGEMM_NUMA_TP` | `0` | `1` enables NUMA-aware tensor-parallel CPU thread placement |
 | `ASYM_GEMM_FORCE_BACKEND` | unset | Force the CPU INT8 backend: `amx`, `avx512`, or `none` (testing) |
+| `CG_POOL_SPIN_US` | `200` | CPU worker pool spin-wait window (µs) before falling back to condition-variable sleep; `0` = pure condvar waiting |
 
 ---
