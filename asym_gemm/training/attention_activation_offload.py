@@ -53,11 +53,21 @@ def _restore_last_dim(x: torch.Tensor, input_shape: tuple[int, ...], out_feature
     return x.reshape(*input_shape[:-1], int(out_features))
 
 
+# Times a REQUESTED pin fell back to pageable in this module (process-wide, across all
+# wrapper instances — read as max-across-rows in artifacts, never summed). A pageable
+# buffer silently downgrades every later touch of it to the host-blocking path.
+_PIN_FALLBACK_CALLS = 0
+
+
 def _empty_cpu_like_rows(source: torch.Tensor, rows: int) -> torch.Tensor:
+    global _PIN_FALLBACK_CALLS
     shape = (int(rows), int(source.shape[1]))
+    want_pin = bool(source.is_pinned())
     try:
-        return torch.empty(shape, device="cpu", dtype=source.dtype, pin_memory=bool(source.is_pinned()))
+        return torch.empty(shape, device="cpu", dtype=source.dtype, pin_memory=want_pin)
     except RuntimeError:
+        if want_pin:
+            _PIN_FALLBACK_CALLS += 1
         return torch.empty(shape, device="cpu", dtype=source.dtype)
 
 
@@ -217,17 +227,24 @@ def _h2d_restage_stream(device: torch.device) -> torch.cuda.Stream:
 
 
 def _empty_strided_cpu_like(tensor: torch.Tensor, *, pin_memory: bool) -> torch.Tensor:
+    global _PIN_FALLBACK_CALLS
     shape = tuple(int(dim) for dim in tensor.shape)
     stride = tuple(int(value) for value in tensor.stride())
+    want_pin = bool(pin_memory and torch.cuda.is_available())
     try:
         return torch.empty_strided(
             shape,
             stride,
             device="cpu",
             dtype=tensor.dtype,
-            pin_memory=bool(pin_memory and torch.cuda.is_available()),
+            pin_memory=want_pin,
         )
     except RuntimeError:
+        # Pageable fallback: _pack leaves ready_event=None, so _unpack takes the
+        # host-blocking branch — count it (only when a pin was actually requested)
+        # so async-unpack A/Bs can distinguish "on" from "silently degraded".
+        if want_pin:
+            _PIN_FALLBACK_CALLS += 1
         return torch.empty_strided(shape, stride, device="cpu", dtype=tensor.dtype)
 
 
@@ -429,6 +446,8 @@ class AttentionSavedTensorOffloadWrapper:
             "require_grad": self.require_grad,
             "skip_in_backward": self.skip_in_backward,
             "skipped_backward_calls": self.skipped_backward_calls,
+            # module-global (same value on every row): max across rows, never sum
+            "pin_fallback_calls_module_global": _PIN_FALLBACK_CALLS,
             "allowed_dtypes": [str(dtype).replace("torch.", "") for dtype in sorted(self.allowed_dtypes, key=str)],
             "offloaded_bytes": self.offloaded_bytes,
             "cpu_owned_bytes": self.cpu_owned_bytes,
@@ -580,6 +599,8 @@ class AttentionActivationOffloadContext:
         data = self.manager.snapshot()
         data.update(
             {
+                # module-global (same value on every row): max across rows, never sum
+                "pin_fallback_calls_module_global": _PIN_FALLBACK_CALLS,
                 "source_share_hits": self.source_share_hits,
                 "source_share_misses": self.source_share_misses,
                 "source_share_duplicate_bytes_avoided": self.source_share_duplicate_bytes_avoided,
@@ -710,6 +731,12 @@ class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function):
         else:
             shared_source = attention_context.acquire_source(x, flat_lora, projection_role)
             u_handle = shared_source.handle
+        # _dense_lora_a_cpu_left host-pads u_handle.tensor whenever M % 128 != 0
+        # (flagship 45k×8 → M=360000, not a multiple of 128) — a HOST read of a
+        # buffer just filled by a non-blocking D2H. Wait on the manager that OWNS
+        # the handle's ready event: the shared q/k/v source was offloaded by the
+        # attention context's manager, not this call's fresh one.
+        (attention_context.manager if shared_source is not None else manager).wait_cpu_ready_host(u_handle)
         s = _dense_lora_a_cpu_left(
             u_handle.tensor,
             a.contiguous(),
@@ -806,6 +833,12 @@ class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function):
                 if m_grad == 0:
                     grad_a = torch.zeros_like(a)
                 else:
+                    # _pad_cpu_rows_to is a HOST memcpy of u_handle.tensor; nothing
+                    # upstream host-orders it after the D2H that filled the handle
+                    # (fix_merged.md V1 — race proven in vitro 2026-07-16). Shared
+                    # q/k/v sources were offloaded by the attention context's
+                    # manager — that map holds the ready event, not ctx.manager's.
+                    (ctx.attention_context.manager if ctx.shared_source is not None else manager).wait_cpu_ready_host(u_handle)
                     u_source = _pad_cpu_rows_to(u_handle.tensor, m_grad)
                     d_s_rows = _pad_hbm_rows_to(d_s, m_grad)
                     d_s_t = d_s_rows.t().contiguous()

@@ -12,9 +12,11 @@ ROOT=${ROOT:-${SFT_ROOT}/third_party/AsymGEMM}
 _LF_DIR_ENV_SET=false
 _ENV_DIR_ENV_SET=false
 _FLASH_ATTN_ENV_SET=false
+_QWEN35_DELTA_CHUNK_ENV_SET=false
 [[ -n "${LF_DIR+x}" ]] && _LF_DIR_ENV_SET=true
 [[ -n "${ENV_DIR+x}" ]] && _ENV_DIR_ENV_SET=true
 [[ -n "${FLASH_ATTN+x}" ]] && _FLASH_ATTN_ENV_SET=true
+[[ -n "${QWEN35_DELTA_CHUNK_SIZE+x}" ]] && _QWEN35_DELTA_CHUNK_ENV_SET=true
 LF_DIR=${LF_DIR:-${SFT_ROOT}/third_party/LlamaFactory}
 # FA4 support is ported into the canonical LlamaFactory (2026-07-03); the qwen3.5
 # auto-switch keeps the canonical LF (loss-only liger + save-on-cpu machinery) and
@@ -348,6 +350,11 @@ ASYM_DIR=${ASYM_DIR:-${ROOT}}
 ASYM_QWEN35_FA4_AUTO=${ASYM_QWEN35_FA4_AUTO:-1}
 FLASH_ATTN=${FLASH_ATTN:-auto}
 FA4_ENV_DIR=${FA4_ENV_DIR:-${ASYM_DIR}/.venv-fa4}
+# qwen3.5 runtime also includes the model-level seq-chunked delta-net (ported from
+# both.sh 2026-07-16 — source.sh previously had NO delta-chunk plumbing, so qwen3.5
+# rows >=75k launched here hit the fla illegal-memory fault the chunk exists to avoid).
+# Explicit QWEN35_DELTA_CHUNK_SIZE (incl. 0 = stock unchunked) overrides.
+QWEN35_DELTA_CHUNK_DEFAULT=${QWEN35_DELTA_CHUNK_DEFAULT:-16000}
 KT_TOOLS_DIR=${KT_TOOLS_DIR:-${ASYM_DIR}}
 KT_REPO_DIR_ENV_SET=${KT_REPO_DIR+x}
 KT_REPO_DIR=${KT_REPO_DIR:-$(dirname "${KT_KERNEL_DIR}")}
@@ -851,10 +858,12 @@ resolve_current_runtime_for_model() {
   CURRENT_ENV_DIR="${ENV_DIR}"
   CURRENT_ENV_PYTHON="${ENV_PYTHON}"
   CURRENT_FLASH_ATTN="${FLASH_ATTN}"
+  CURRENT_QWEN35_DELTA_CHUNK_SIZE="${QWEN35_DELTA_CHUNK_SIZE:-0}"
   if [[ "${ASYM_QWEN35_FA4_AUTO}" == "1" ]] && is_qwen35_model_name "${model}"; then
     [[ "${_LF_DIR_ENV_SET}" == "true" ]] || CURRENT_LF_DIR="${LF_FA4_DIR}"
     [[ "${_ENV_DIR_ENV_SET}" == "true" ]] || CURRENT_ENV_DIR="${FA4_ENV_DIR}"
     [[ "${_FLASH_ATTN_ENV_SET}" == "true" ]] || CURRENT_FLASH_ATTN=fa4
+    [[ "${_QWEN35_DELTA_CHUNK_ENV_SET}" == "true" ]] || CURRENT_QWEN35_DELTA_CHUNK_SIZE="${QWEN35_DELTA_CHUNK_DEFAULT}"
   fi
   CURRENT_ENV_PYTHON="${CURRENT_ENV_DIR}/bin/python"
   CURRENT_FLASH_ATTN_LABEL="$(flash_attn_tag "${CURRENT_FLASH_ATTN}")"
@@ -3285,6 +3294,7 @@ run_job() {
   local job_lf_dir="${CURRENT_LF_DIR:-${LF_DIR}}"
   local job_env_dir="${CURRENT_ENV_DIR:-${ENV_DIR}}"
   local job_flash_attn="${CURRENT_FLASH_ATTN:-${FLASH_ATTN}}"
+  local job_qwen35_delta_chunk="${CURRENT_QWEN35_DELTA_CHUNK_SIZE:-${QWEN35_DELTA_CHUNK_SIZE:-0}}"
   local flashattn_label="${CURRENT_FLASH_ATTN_LABEL:-$(flash_attn_tag "${job_flash_attn}")}"
   local requested_policy_tuple="${expert_policy}|${ASYMM_EXPERT_ACT_OFFLOAD}|${ASYMM_ATTN_ACT_OFFLOAD}|${ASYMM_LAYER_ACT_OFFLOAD}|${ASYMM_LAYER_GC}|${ASYMM_ATTN_SDPA_RECOMPUTE}"
   canonicalize_policy_axis_for_inert_run "${backend}" "${recompute}"
@@ -3714,6 +3724,7 @@ run_job() {
     DIST_LAUNCHER="${DIST_LAUNCHER}"
     DEEPSPEED_DIR="${DEEPSPEED_DIR}"
     FLASH_ATTN="${job_flash_attn}"
+    QWEN35_DELTA_CHUNK_SIZE="${job_qwen35_delta_chunk}"
     CHECK_SUPEROFFLOAD="${CHECK_SUPEROFFLOAD}"
     CHECK_CPUADAM="${CHECK_CPUADAM}"
     MODEL_NAME_OR_PATH="${current_model_name}"
@@ -3805,6 +3816,15 @@ run_job() {
     ASYM_GEMM_LF_CONFIG_RECOMP_OFF_STAGE="${recomp_off_stage}"
     ASYM_GEMM_LF_CONFIG_USE_UNSLOTH_GC="${use_unsloth_gc}"
     ASYM_GEMM_LF_CONFIG_UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU="${unsloth_recompute_save_on_cpu}"
+    # Provenance mirrors ported from both.sh (2026-07-16): without these, runs launched
+    # via source.sh record none of the merge-era knobs (readers are empty-safe).
+    ASYM_GEMM_LF_CONFIG_ASYMM_FG_ELEMENTWISE_CHUNK_MB="${ASYMM_FG_ELEMENTWISE_CHUNK_MB:-}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_LORA_CHUNK="${ASYMM_ATTN_ACT_LORA_CHUNK:-}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_DOWN_DX_STAGED="${ASYMM_QWEN3_MOE_DOWN_DX_STAGED:-}"
+    ASYM_GEMM_LF_CONFIG_ASYM_SAVED_TENSOR_ASYNC_UNPACK="${ASYM_SAVED_TENSOR_ASYNC_UNPACK:-}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_FG_RELEASE_FUSED_HOME="${ASYMM_QWEN3_MOE_FG_RELEASE_FUSED_HOME:-}"
+    ASYM_GEMM_LF_CONFIG_ASYM_EMPTY_CACHE_PHASES="${ASYM_EMPTY_CACHE_PHASES:-}"
+    ASYM_GEMM_LF_CONFIG_QWEN35_DELTA_CHUNK_SIZE="${job_qwen35_delta_chunk:-${QWEN35_DELTA_CHUNK_SIZE:-}}"
     ASYM_GEMM_LF_CONFIG_UNSLOTH_GC_OUTER_HBM_EVERY_N="${UNSLOTH_GC_OUTER_HBM_EVERY_N}"
     ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU}"
     ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD="${grad_offload}"

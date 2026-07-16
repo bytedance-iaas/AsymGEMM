@@ -288,9 +288,33 @@ calls stay under the ≥75k fault length). Artifacts:
 | 80000×8 | **A tuned+chunk** | 428–433 | 554 | **78.9** | **91.7** | 0.80–0.93 ✓ |
 | 80000×8 | B superoffload+chunk | 359.7–360.5 | 685 | 100.4 | 103.0 | 0.77–0.93 ✓ |
 
-### 9c. `qwen35_fg_numeric_probe.py --qwen3 --tokens 655360` "BROKEN: fg101" is a PROBE BUG (2026-07-15)
+### 9c. `qwen35_fg_numeric_probe.py --qwen3 --tokens 655360` "BROKEN: fg101" is ORDER-DEPENDENT (2026-07-15; reframed 2026-07-16)
 
-**The kernel is fine. The harness contaminates itself. Do not chase this again.**
+**CORRECTION (2026-07-16, strong-model re-audit): the original headline here ("the
+kernel is fine, the harness contaminates itself") was overstated.** What the isolation
+A/B proves is ORDER-DEPENDENCE, not kernel innocence. Code reading has since EXCLUDED
+every Python-level contamination mechanism in the probe: the tensor-attached memos are
+rebuilt per case (the fg Function detaches offsets/indices/weights on entry,
+`qwen3_moe_finegrained.py:668-671`) and are pure functions of tensor content anyway;
+env flags are re-read per call, never cached; the plain path mutates no engine state
+that fg reads; and every Python-visible read of a recycled CPU-pool buffer is a
+stream-ordered full overwrite. The SURVIVING suspect is **CUDA caching-allocator
+recycling of DEVICE memory across cases**: fg101-run-3rd lands its ~8.6 GB padded act
++ accumulators in blocks dirtied by plain/fg000, so an out-of-contract device-memory
+read in the ker101/asym-engine path would reproduce to six decimals (fixed allocation
+sequence), pass when run alone (driver-zeroed fresh pages), and pass as fg101+v2 (same
+kernel, different allocation pattern) — matching every observation. That would be a
+KERNEL-SIDE bug (benign only while the recycled bytes happen to be right).
+**DISCRIMINATOR RUN 2026-07-16 — allocator recycling CONFIRMED.** Canonical 5-case
+order with `PYTORCH_NO_CUDA_MEMORY_CACHING=1`: `fg101 out rel_fro = 0.006273`
+(byte-identical to the isolation value; full verdict "all forward paths within 5% of
+fp32 reference") vs 0.170918 with caching on. Only the allocator changed. So the
+ker101/asym-engine path reads recycled DEVICE memory it does not own — correct on
+fresh driver-zeroed pages, wrong on dirtied recycled blocks. A real kernel-hygiene
+defect that training tolerates; in-band losses do not certify it. Next step is a code
+hunt (no run): unmasked padded tail rows of act/X (R padded to block_m), route
+metadata slack, TMA over-read, uninitialized workspace — see fix_merged.md §V3.
+Log: `/workspace/qwen35_local/probe_nocache_655360.log`.
 
 The Stage-1 cross-model gate reports `verdict: BROKEN: fg101` (`fg101 out` rel_fro
 **0.170918** vs the 0.05 bar). It is NOT a ker101 defect and NOT merge-caused:
@@ -355,11 +379,20 @@ CAVEATS (do not over-read these rows):
   Post-merge carries the whole SFT family (down_dx_staged default-on, act row-chunking,
   attn LoRA chunking, async unpack). 80k reserved 57.37 vs H3b's 83.8 (−31.5%) says the
   FAMILY beats H3b, not that their blocked forward alone does.
-- In this flagship row (`ker101` + `loraafwdcpu`) the SFT *blocked forward* does NOT
-  engage at all: it needs `da_gpu and lora_a_fwd_gpu`, and lora_a_fwd is cpu here.
-  What engages is the sibling `act_chunk` branch (gated on `not lora_a_fwd_gpu`) plus
-  the silu-bwd chunking — confirmed by `stage_rows_calls=2880` at 45k. So the win here
-  is the chunking family, not blocked gate/up/act.
+- ~~In this flagship row (`ker101` + `loraafwdcpu`) the SFT *blocked forward* does NOT
+  engage at all~~ **RETRACTED 2026-07-16 — this bullet was wrong.** The `loraafwdcpu`
+  run-dir tag encodes `ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu`, a knob of the DISABLED
+  (`expact0`) expert-act-offload module. The driver defaults
+  `ASYMM_QWEN3_MOE_FG_LORA_A_FWD_GPU=1`, `FG_DA_GPU=1`, `FG_KEEP_DGRADS_HBM=1` for
+  routed MoE under `recomp-off-full-fg` (`profile_lora_lf_test_both.sh` full-fg case),
+  and the artifacts prove it: 80k `lora_a_forward_gpu_calls=2400` with
+  `cpu_left_calls=0`, `da_gpu_calls=320`, `hidden_route_global_tensors_avoided=800`.
+  **The SFT blocked forward DID engage in these rows**, so these numbers validate it at
+  45k/80k directly, and the `act_chunk` sibling (gated on `not lora_a_fwd_gpu`) is the
+  branch that CANNOT run here. `stage_rows_calls` was never a blocked-forward signal
+  (that branch stages nothing through stage_rows — the calls come from silu-bwd chunks
+  + down-LoRA backward blocks); the discriminating signals are
+  `hidden_route_global_tensors_avoided` and the `gateup_act_blocked` prof range.
 
 **Savings (pre-merge 9b rows): 45k = 32% reserved (25% alloc); 80k = 11.0% reserved / 21.4% alloc.**
 User-relaxed goal (>10% saving) MET at both workloads incl. the literal
