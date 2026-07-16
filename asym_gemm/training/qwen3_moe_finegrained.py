@@ -123,6 +123,35 @@ def _down_scatter_block_experts() -> int:
         return 0
 
 
+def _fg_fwd_block_experts() -> int:
+    # Row-blocked fg FORWARD (pack/gate/up/act + backward silu phase): process the
+    # routed rows in expert blocks so no full-R GPU transient is ever materialized
+    # (packed X [R,H], gate/up/act [R,I], silu stages). Complements
+    # ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS (which blocks the down/dX loops);
+    # both together remove every full-R GPU term from the fg path. Requires the
+    # plain-kernel path (route bits off) and the GPU LoRA-A forward. Default off.
+    raw = os.environ.get(
+        "ASYMM_QWEN3_MOE_FG_FWD_BLOCK_EXPERTS",
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_FG_FWD_BLOCK_EXPERTS", "0"),
+    )
+    try:
+        return max(0, int(str(raw).strip() or "0"))
+    except ValueError:
+        return 0
+
+
+def _account_blocked_offload(manager: ActivationOffloadManager, *handles) -> None:
+    # Row-blocked paths fill empty_cpu handles with per-block copies; mirror the
+    # byte accounting manager.offload() would have recorded for the full tensor.
+    for handle in handles:
+        if handle is None:
+            continue
+        nbytes = handle.nbytes
+        manager.stats.num_offloads += 1
+        manager.stats.offloaded_bytes += nbytes
+        manager.stats.offload_bytes_by_tag[handle.tag] = manager.stats.offload_bytes_by_tag.get(handle.tag, 0) + nbytes
+
+
 def _fg_lora_a_fwd_gpu_enabled() -> bool:
     """Compute recompute-forward LoRA-A on GPU from the in-HBM operands.
 
@@ -482,13 +511,15 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
         routing_weights = routing_weights.detach().contiguous()
         input_dtype = hidden_states.dtype
         num_tokens = int(hidden_states.shape[0])
-        with prof_range(layer._forward_range("moe_finegrained", "pack_tokens")):
-            packed = hidden_states.index_select(
-                0,
-                token_indices.to(device=hidden_states.device, dtype=torch.long, non_blocking=True),
-            ).contiguous()
-            if input_weighted:
-                packed.mul_(routing_weights.reshape(-1, 1).to(device=packed.device, dtype=packed.dtype))
+        packed = None
+        if _fg_fwd_block_experts() <= 0:
+            with prof_range(layer._forward_range("moe_finegrained", "pack_tokens")):
+                packed = hidden_states.index_select(
+                    0,
+                    token_indices.to(device=hidden_states.device, dtype=torch.long, non_blocking=True),
+                ).contiguous()
+                if input_weighted:
+                    packed.mul_(routing_weights.reshape(-1, 1).to(device=packed.device, dtype=packed.dtype))
         metadata = prepare_grouped_lora_metadata(offsets, experts, dense_experts=True)
         gate_base, up_base = layer._ensure_qwen3_moe_finegrained_bases()
         manager = ActivationOffloadManager(pin_memory=True)
@@ -503,85 +534,151 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
         # CPU then) and is row-sliced per expert block, so exclude the block path.
         da_gpu = _fg_da_gpu_enabled() and lora_a_fwd_gpu and down_scatter_block_experts == 0
 
-        with prof_range(layer._forward_range("moe_finegrained", "x_to_cpu")):
-            if da_gpu:
-                x_cpu = manager.offload(hidden_states.detach().contiguous(), "moe.X")
-            else:
-                x_cpu = manager.offload(packed, "moe.X")
+        fg_fwd_block_experts = _fg_fwd_block_experts()
+        fg_fwd_blocks = []
+        if fg_fwd_block_experts > 0:
+            if route_flags.any_base or route_flags.lora:
+                raise RuntimeError("ASYMM_QWEN3_MOE_FG_FWD_BLOCK_EXPERTS requires the plain kernel path (route bits off)")
+            if not lora_a_fwd_gpu:
+                raise RuntimeError("ASYMM_QWEN3_MOE_FG_FWD_BLOCK_EXPERTS requires ASYMM_QWEN3_MOE_FG_LORA_A_FWD_GPU=1")
+            fg_fwd_blocks = _expert_blocks(offsets, experts, fg_fwd_block_experts)
+        if fg_fwd_blocks:
+            # full-R X was never gathered (pack_tokens skipped); blocks gather their own rows
+            layer.stats.qwen3_moe_finegrained_hidden_route_global_tensors_avoided += 1
+            num_rows = int(token_indices.numel())
+            rank = int(gate_lora_A.shape[-2]) if gate_lora_A.dim() >= 2 else int(layer.lora_rank)
+            lora_dtype = gate_lora_A.dtype
+            x_cpu = manager.empty_cpu((num_rows, int(layer.hidden_dim)), input_dtype, hidden_states.device, "moe.X")
+            gate_cpu = manager.empty_cpu((num_rows, int(layer.intermediate_dim)), input_dtype, hidden_states.device, "moe.gate")
+            up_cpu = manager.empty_cpu((num_rows, int(layer.intermediate_dim)), input_dtype, hidden_states.device, "moe.up")
+            act_cpu = manager.empty_cpu((num_rows, int(layer.intermediate_dim)), torch.bfloat16, hidden_states.device, "moe.act")
+            gate_low_rank_cpu = manager.empty_cpu((num_rows, rank), lora_dtype, hidden_states.device, "moe.S_gate")
+            up_low_rank_cpu = manager.empty_cpu((num_rows, rank), lora_dtype, hidden_states.device, "moe.S_up")
+            down_low_rank = torch.empty((num_rows, rank), device=hidden_states.device, dtype=lora_dtype)
+            with prof_range(layer._forward_range("moe_finegrained", "fwd_blocked")):
+                for row_start, row_end, block_offsets, block_experts_t, row_slice in fg_fwd_blocks:
+                    block_metadata = prepare_grouped_lora_metadata(block_offsets, block_experts_t, dense_experts=True)
+                    packed_b = hidden_states.index_select(
+                        0,
+                        token_indices[row_slice].to(device=hidden_states.device, dtype=torch.long, non_blocking=True),
+                    ).contiguous()
+                    if input_weighted:
+                        packed_b.mul_(routing_weights[row_slice].reshape(-1, 1).to(device=packed_b.device, dtype=packed_b.dtype))
+                    nb = bool(x_cpu.tensor.is_pinned())
+                    with torch.no_grad():
+                        x_cpu.tensor[row_start:row_end].copy_(packed_b, non_blocking=nb)
+                    layer.stats.qwen3_moe_finegrained_gate_base_calls += 1
+                    gate_b = _base_forward(layer, gate_base, packed_b, block_offsets, block_experts_t, part="gate")
+                    s_gate_b = _lora_a_forward_gpu(layer, packed_b, gate_lora_A, block_offsets, block_experts_t, block_metadata)
+                    gate_b.add_(
+                        _lora_b_forward(s_gate_b, gate_lora_B, block_offsets, block_experts_t, block_metadata, scale=layer.lora_scale).to(dtype=gate_b.dtype)
+                    )
+                    layer.stats.qwen3_moe_finegrained_up_base_calls += 1
+                    up_b = _base_forward(layer, up_base, packed_b, block_offsets, block_experts_t, part="up")
+                    s_up_b = _lora_a_forward_gpu(layer, packed_b, up_lora_A, block_offsets, block_experts_t, block_metadata)
+                    up_b.add_(
+                        _lora_b_forward(s_up_b, up_lora_B, block_offsets, block_experts_t, block_metadata, scale=layer.lora_scale).to(dtype=up_b.dtype)
+                    )
+                    del packed_b
+                    with torch.no_grad():
+                        gate_cpu.tensor[row_start:row_end].copy_(gate_b, non_blocking=nb)
+                        up_cpu.tensor[row_start:row_end].copy_(up_b, non_blocking=nb)
+                        gate_low_rank_cpu.tensor[row_start:row_end].copy_(s_gate_b, non_blocking=nb)
+                        up_low_rank_cpu.tensor[row_start:row_end].copy_(s_up_b, non_blocking=nb)
+                    del s_gate_b, s_up_b
+                    act_b = F.silu(gate_b).mul_(up_b).to(dtype=torch.bfloat16).contiguous()
+                    del gate_b, up_b
+                    with torch.no_grad():
+                        act_cpu.tensor[row_start:row_end].copy_(act_b, non_blocking=nb)
+                    down_low_rank[row_slice] = _lora_a_forward_gpu(layer, act_b, down_lora_A, block_offsets, block_experts_t, block_metadata)
+                    del act_b
+                if torch.cuda.is_available():
+                    ready = torch.cuda.Event()
+                    ready.record(torch.cuda.current_stream(hidden_states.device))
+                    for _h in (x_cpu, gate_cpu, up_cpu, act_cpu, gate_low_rank_cpu, up_low_rank_cpu):
+                        manager._pending_cpu_ready_events[int(_h.tensor.data_ptr())] = ready
+                _account_blocked_offload(manager, x_cpu, gate_cpu, up_cpu, act_cpu, gate_low_rank_cpu, up_low_rank_cpu)
+        else:
+            with prof_range(layer._forward_range("moe_finegrained", "x_to_cpu")):
+                if da_gpu:
+                    x_cpu = manager.offload(hidden_states.detach().contiguous(), "moe.X")
+                else:
+                    x_cpu = manager.offload(packed, "moe.X")
 
-        with prof_range(layer._forward_range("moe_finegrained", "gate")):
-            layer.stats.qwen3_moe_finegrained_gate_base_calls += 1
-            gate = _base_forward(layer, gate_base, packed, offsets, experts, part="gate")
-            if lora_a_fwd_gpu:
-                gate_low_rank = _lora_a_forward_gpu(layer, packed, gate_lora_A, offsets, experts, metadata)
-            else:
-                manager.wait_cpu_ready(x_cpu)
-                gate_low_rank = _lora_a_forward_cpu(
-                    layer,
-                    x_cpu.tensor,
-                    gate_lora_A,
+        if not fg_fwd_blocks:
+            with prof_range(layer._forward_range("moe_finegrained", "gate")):
+                layer.stats.qwen3_moe_finegrained_gate_base_calls += 1
+                gate = _base_forward(layer, gate_base, packed, offsets, experts, part="gate")
+                if lora_a_fwd_gpu:
+                    gate_low_rank = _lora_a_forward_gpu(layer, packed, gate_lora_A, offsets, experts, metadata)
+                else:
+                    manager.wait_cpu_ready(x_cpu)
+                    gate_low_rank = _lora_a_forward_cpu(
+                        layer,
+                        x_cpu.tensor,
+                        gate_lora_A,
+                        offsets,
+                        experts,
+                        metadata,
+                        tag="moe.gate",
+                    )
+                gate_delta = _lora_b_forward(
+                    gate_low_rank,
+                    gate_lora_B,
                     offsets,
                     experts,
                     metadata,
-                    tag="moe.gate",
+                    scale=layer.lora_scale,
                 )
-            gate_delta = _lora_b_forward(
-                gate_low_rank,
-                gate_lora_B,
-                offsets,
-                experts,
-                metadata,
-                scale=layer.lora_scale,
-            )
-            gate.add_(gate_delta.to(dtype=gate.dtype))
-            gate_cpu = manager.offload(gate, "moe.gate")
-            gate_low_rank_cpu = manager.offload(gate_low_rank, "moe.S_gate")
-            del gate, gate_delta, gate_low_rank
+                gate.add_(gate_delta.to(dtype=gate.dtype))
+                gate_cpu = manager.offload(gate, "moe.gate")
+                gate_low_rank_cpu = manager.offload(gate_low_rank, "moe.S_gate")
+                del gate, gate_delta, gate_low_rank
 
-        with prof_range(layer._forward_range("moe_finegrained", "up")):
-            layer.stats.qwen3_moe_finegrained_up_base_calls += 1
-            up = _base_forward(layer, up_base, packed, offsets, experts, part="up")
-            if lora_a_fwd_gpu:
-                up_low_rank = _lora_a_forward_gpu(layer, packed, up_lora_A, offsets, experts, metadata)
-            else:
-                manager.wait_cpu_ready(x_cpu)
-                up_low_rank = _lora_a_forward_cpu(
-                    layer,
-                    x_cpu.tensor,
-                    up_lora_A,
+            with prof_range(layer._forward_range("moe_finegrained", "up")):
+                layer.stats.qwen3_moe_finegrained_up_base_calls += 1
+                up = _base_forward(layer, up_base, packed, offsets, experts, part="up")
+                if lora_a_fwd_gpu:
+                    up_low_rank = _lora_a_forward_gpu(layer, packed, up_lora_A, offsets, experts, metadata)
+                else:
+                    manager.wait_cpu_ready(x_cpu)
+                    up_low_rank = _lora_a_forward_cpu(
+                        layer,
+                        x_cpu.tensor,
+                        up_lora_A,
+                        offsets,
+                        experts,
+                        metadata,
+                        tag="moe.up",
+                    )
+                up_delta = _lora_b_forward(
+                    up_low_rank,
+                    up_lora_B,
                     offsets,
                     experts,
                     metadata,
-                    tag="moe.up",
+                    scale=layer.lora_scale,
                 )
-            up_delta = _lora_b_forward(
-                up_low_rank,
-                up_lora_B,
-                offsets,
-                experts,
-                metadata,
-                scale=layer.lora_scale,
-            )
-            up.add_(up_delta.to(dtype=up.dtype))
-            up_cpu = manager.offload(up, "moe.up")
-            up_low_rank_cpu = manager.offload(up_low_rank, "moe.S_up")
-            del up, up_delta, up_low_rank
-        del packed
+                up.add_(up_delta.to(dtype=up.dtype))
+                up_cpu = manager.offload(up, "moe.up")
+                up_low_rank_cpu = manager.offload(up_low_rank, "moe.S_up")
+                del up, up_delta, up_low_rank
+            del packed
 
-        down_low_rank = None
-        with prof_range(layer._forward_range("moe_finegrained", "activation")):
-            gate_stage = manager.stage(gate_cpu, tag="moe.gate_for_act")
-            F.silu(gate_stage, inplace=True)
-            up_stage = manager.stage(up_cpu, tag="moe.up_for_act")
-            gate_stage.mul_(up_stage)
-            act_gpu = gate_stage.to(dtype=torch.bfloat16).contiguous()
-            act_cpu = manager.offload(act_gpu, "moe.act")
-            if lora_a_fwd_gpu:
-                down_low_rank = _lora_a_forward_gpu(layer, act_gpu, down_lora_A, offsets, experts, metadata)
-            del act_gpu
-            manager.release_stage(gate_stage, drop_cache=True)
-            manager.release_stage(up_stage, drop_cache=True)
-            del gate_stage, up_stage
+            down_low_rank = None
+            with prof_range(layer._forward_range("moe_finegrained", "activation")):
+                gate_stage = manager.stage(gate_cpu, tag="moe.gate_for_act")
+                F.silu(gate_stage, inplace=True)
+                up_stage = manager.stage(up_cpu, tag="moe.up_for_act")
+                gate_stage.mul_(up_stage)
+                act_gpu = gate_stage.to(dtype=torch.bfloat16).contiguous()
+                act_cpu = manager.offload(act_gpu, "moe.act")
+                if lora_a_fwd_gpu:
+                    down_low_rank = _lora_a_forward_gpu(layer, act_gpu, down_lora_A, offsets, experts, metadata)
+                del act_gpu
+                manager.release_stage(gate_stage, drop_cache=True)
+                manager.release_stage(up_stage, drop_cache=True)
+                del gate_stage, up_stage
 
         with prof_range(layer._forward_range("moe_finegrained", "down_lora")):
             if down_low_rank is None:
@@ -943,37 +1040,71 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     grad_act.add_(down_lora_dx.to(dtype=grad_act.dtype))
                     del down_lora_dx, d_s_down, grad_2d
 
-            with prof_range(layer._forward_range("moe_finegrained_backward", "activation")):
-                layer.stats.qwen3_moe_finegrained_gpu_silu_bwd_calls += 1
-                gate_stage = manager.stage(ctx.gate_cpu, tag="moe.gate_for_silu_bwd_dup")
-                F.silu(gate_stage, inplace=True)
-                gate_stage.mul_(grad_act)
-                if keep_dgrads_hbm:
-                    # drop_cache release below makes this reference the sole owner
-                    grad_up_hbm = gate_stage.to(dtype=torch.bfloat16).contiguous()
-                    layer.stats.qwen3_moe_finegrained_dgrads_hbm_kept += 1
-                else:
-                    grad_up_cpu = manager.offload(gate_stage.to(dtype=torch.bfloat16).contiguous(), "moe.dup")
-                manager.release_stage(gate_stage, drop_cache=True)
-                del gate_stage
+            silu_blocks = _expert_blocks(offsets, experts, _fg_fwd_block_experts()) if _fg_fwd_block_experts() > 0 else []
+            if silu_blocks and not keep_dgrads_hbm:
+                # Row-blocked silu backward: never stage full-R gate/up or hold a
+                # full-R fp32 grad on GPU; dgrads land row-wise in pinned handles
+                # that the (blocked) gate/up dX loops below stage back per block.
+                with prof_range(layer._forward_range("moe_finegrained_backward", "activation_blocked")):
+                    layer.stats.qwen3_moe_finegrained_gpu_silu_bwd_calls += 1
+                    num_rows = int(token_indices.numel())
+                    grad_up_cpu = manager.empty_cpu((num_rows, int(layer.intermediate_dim)), torch.bfloat16, grad_output.device, "moe.dup")
+                    grad_gate_cpu = manager.empty_cpu((num_rows, int(layer.intermediate_dim)), torch.bfloat16, grad_output.device, "moe.dgate")
+                    nb = bool(grad_up_cpu.tensor.is_pinned())
+                    for row_start, row_end, _bo, _be, row_slice in silu_blocks:
+                        gate_b = _stage_rows(manager, layer, ctx.gate_cpu, row_start, row_end, tag="moe.gate_for_silu_bwd_block")
+                        up_b = _stage_rows(manager, layer, ctx.up_cpu, row_start, row_end, tag="moe.up_for_silu_bwd_block")
+                        ga_b = grad_act[row_slice]
+                        with torch.no_grad():
+                            grad_up_cpu.tensor[row_start:row_end].copy_(
+                                (F.silu(gate_b) * ga_b).to(dtype=torch.bfloat16), non_blocking=nb
+                            )
+                            dg_b = torch.ops.aten.silu_backward(ga_b * up_b, gate_b)
+                            grad_gate_cpu.tensor[row_start:row_end].copy_(dg_b.to(dtype=torch.bfloat16), non_blocking=nb)
+                        manager.release_stage(gate_b, drop_cache=True)
+                        manager.release_stage(up_b, drop_cache=True)
+                        del gate_b, up_b, ga_b, dg_b
+                    if torch.cuda.is_available():
+                        ready = torch.cuda.Event()
+                        ready.record(torch.cuda.current_stream(grad_output.device))
+                        for _h in (grad_up_cpu, grad_gate_cpu):
+                            manager._pending_cpu_ready_events[int(_h.tensor.data_ptr())] = ready
+                    _account_blocked_offload(manager, grad_up_cpu, grad_gate_cpu)
+                    del grad_act
+                    manager.release_cpu(ctx.up_cpu)
+                    manager.release_cpu(ctx.gate_cpu)
+            else:
+                with prof_range(layer._forward_range("moe_finegrained_backward", "activation")):
+                    layer.stats.qwen3_moe_finegrained_gpu_silu_bwd_calls += 1
+                    gate_stage = manager.stage(ctx.gate_cpu, tag="moe.gate_for_silu_bwd_dup")
+                    F.silu(gate_stage, inplace=True)
+                    gate_stage.mul_(grad_act)
+                    if keep_dgrads_hbm:
+                        # drop_cache release below makes this reference the sole owner
+                        grad_up_hbm = gate_stage.to(dtype=torch.bfloat16).contiguous()
+                        layer.stats.qwen3_moe_finegrained_dgrads_hbm_kept += 1
+                    else:
+                        grad_up_cpu = manager.offload(gate_stage.to(dtype=torch.bfloat16).contiguous(), "moe.dup")
+                    manager.release_stage(gate_stage, drop_cache=True)
+                    del gate_stage
 
-                up_stage = manager.stage(ctx.up_cpu, tag="moe.up_for_silu_bwd_dgate")
-                grad_act.mul_(up_stage)
-                manager.release_stage(up_stage, drop_cache=True)
-                manager.release_cpu(ctx.up_cpu)
-                del up_stage
+                    up_stage = manager.stage(ctx.up_cpu, tag="moe.up_for_silu_bwd_dgate")
+                    grad_act.mul_(up_stage)
+                    manager.release_stage(up_stage, drop_cache=True)
+                    manager.release_cpu(ctx.up_cpu)
+                    del up_stage
 
-                gate_stage = manager.stage(ctx.gate_cpu, tag="moe.gate_for_silu_bwd_dgate")
-                grad_gate = torch.ops.aten.silu_backward(grad_act, gate_stage)
-                del grad_act
-                if keep_dgrads_hbm:
-                    grad_gate_hbm = grad_gate.to(dtype=torch.bfloat16).contiguous()
-                    layer.stats.qwen3_moe_finegrained_dgrads_hbm_kept += 1
-                else:
-                    grad_gate_cpu = manager.offload(grad_gate.to(dtype=torch.bfloat16).contiguous(), "moe.dgate")
-                manager.release_stage(gate_stage, drop_cache=True)
-                manager.release_cpu(ctx.gate_cpu)
-                del gate_stage, grad_gate
+                    gate_stage = manager.stage(ctx.gate_cpu, tag="moe.gate_for_silu_bwd_dgate")
+                    grad_gate = torch.ops.aten.silu_backward(grad_act, gate_stage)
+                    del grad_act
+                    if keep_dgrads_hbm:
+                        grad_gate_hbm = grad_gate.to(dtype=torch.bfloat16).contiguous()
+                        layer.stats.qwen3_moe_finegrained_dgrads_hbm_kept += 1
+                    else:
+                        grad_gate_cpu = manager.offload(grad_gate.to(dtype=torch.bfloat16).contiguous(), "moe.dgate")
+                    manager.release_stage(gate_stage, drop_cache=True)
+                    manager.release_cpu(ctx.gate_cpu)
+                    del gate_stage, grad_gate
 
             if down_scatter_block_experts > 0:
                 manager.wait_cpu_ready(ctx.x_cpu)
@@ -1493,6 +1624,65 @@ def qwen3_moe_finegrained_nograd_forward(
     down_scatter_blocks = _expert_blocks(offsets, experts, down_scatter_block_experts)
     _record_down_scatter_block(layer, down_scatter_block_experts, down_scatter_blocks)
 
+    fg_fwd_block_experts = _fg_fwd_block_experts()
+    if fg_fwd_block_experts > 0:
+        if route_flags.any_base or route_flags.lora:
+            raise RuntimeError("ASYMM_QWEN3_MOE_FG_FWD_BLOCK_EXPERTS requires the plain kernel path (route bits off)")
+        fg_fwd_blocks = _expert_blocks(offsets, experts, fg_fwd_block_experts)
+        layer.stats.qwen3_moe_finegrained_hidden_route_global_tensors_avoided += 1
+        scattered = torch.zeros(
+            (int(num_tokens), int(layer.hidden_dim)),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        with prof_range(layer._forward_range("moe_finegrained_nograd", "fwd_blocked")):
+            for row_start, row_end, block_offsets, block_experts_t, row_slice in fg_fwd_blocks:
+                block_metadata = prepare_grouped_lora_metadata(block_offsets, block_experts_t, dense_experts=True)
+                packed_b = hidden_states.index_select(
+                    0,
+                    token_indices[row_slice].to(device=hidden_states.device, dtype=torch.long, non_blocking=True),
+                ).contiguous()
+                if input_weighted:
+                    packed_b.mul_(routing_weights[row_slice].reshape(-1, 1).to(device=packed_b.device, dtype=packed_b.dtype))
+                layer.stats.qwen3_moe_finegrained_gate_base_calls += 1
+                gate_b = _base_forward(layer, gate_base, packed_b, block_offsets, block_experts_t, part="gate")
+                gate_b.add_(
+                    _lora_b_forward(
+                        grouped_expert_lora(packed_b, layer.gate_lora_A, block_offsets, block_experts_t, metadata=block_metadata),
+                        layer.gate_lora_B, block_offsets, block_experts_t, block_metadata, scale=layer.lora_scale,
+                    ).to(dtype=gate_b.dtype)
+                )
+                layer.stats.qwen3_moe_finegrained_up_base_calls += 1
+                up_b = _base_forward(layer, up_base, packed_b, block_offsets, block_experts_t, part="up")
+                up_b.add_(
+                    _lora_b_forward(
+                        grouped_expert_lora(packed_b, layer.up_lora_A, block_offsets, block_experts_t, metadata=block_metadata),
+                        layer.up_lora_B, block_offsets, block_experts_t, block_metadata, scale=layer.lora_scale,
+                    ).to(dtype=up_b.dtype)
+                )
+                del packed_b
+                F.silu(gate_b, inplace=True)
+                gate_b.mul_(up_b)
+                act_b = gate_b
+                del up_b
+                down_delta_b = _lora_b_forward(
+                    grouped_expert_lora(act_b, layer.down_lora_A, block_offsets, block_experts_t, metadata=block_metadata),
+                    layer.down_lora_B, block_offsets, block_experts_t, block_metadata, scale=layer.lora_scale,
+                )
+                _scatter_routes_add_(
+                    scattered, down_delta_b, token_indices[row_slice], routing_weights[row_slice],
+                    weighted=bool(output_weighted),
+                )
+                del down_delta_b
+                layer.stats.qwen3_moe_finegrained_down_base_calls += 1
+                output_b = _base_forward(layer, layer.down_base, act_b, block_offsets, block_experts_t, part="down")
+                _scatter_routes_add_(
+                    scattered, output_b, token_indices[row_slice], routing_weights[row_slice],
+                    weighted=bool(output_weighted),
+                )
+                del act_b, output_b
+        return scattered
+
     with prof_range(layer._forward_range("moe_finegrained_nograd", "pack_tokens")):
         packed = hidden_states.index_select(
             0,
@@ -1678,7 +1868,13 @@ def qwen3_moe_finegrained_unsupported_reasons(layer: "AsymQwen3Experts", hidden_
     if isinstance(layer.gate_up_base, AsymGroupedFrozenLinear):
         if layer.gate_up_base.precision != "bf16" or layer.gate_up_base.backend != "asym":
             reasons.append("gate/up base must use direct bf16 AsymGEMM")
-        if torch.cuda.is_available() and not layer.gate_up_base.host_weight.weight.is_pinned():
+        # Once ASYMM_QWEN3_MOE_FG_RELEASE_FUSED_HOME freed the fused home, the fg
+        # path runs entirely off the (pinned) split bases; the fused pin check is moot.
+        if (
+            torch.cuda.is_available()
+            and not getattr(layer.gate_up_base, "_asym_released_fused_home", False)
+            and not layer.gate_up_base.host_weight.weight.is_pinned()
+        ):
             reasons.append("gate/up host weight must be pinned CPU memory")
     if isinstance(layer.down_base, AsymGroupedFrozenLinear):
         if layer.down_base.precision != "bf16" or layer.down_base.backend != "asym":
