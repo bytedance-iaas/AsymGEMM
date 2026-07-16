@@ -288,7 +288,44 @@ calls stay under the ≥75k fault length). Artifacts:
 | 80000×8 | **A tuned+chunk** | 428–433 | 554 | **78.9** | **91.7** | 0.80–0.93 ✓ |
 | 80000×8 | B superoffload+chunk | 359.7–360.5 | 685 | 100.4 | 103.0 | 0.77–0.93 ✓ |
 
-**Savings: 45k = 32% reserved (25% alloc); 80k = 11.0% reserved / 21.4% alloc.**
+### 9b-post-merge (2026-07-15): SFT memory/latency line merged in — G1 MET at 80k
+
+Post-merge `main_kevin` = `fd2eb57` (merge of the SFT memory/latency line + this
+qwen3.5 line). Same tuned env as the rows above; `QWEN35_DELTA_CHUNK_SIZE` now
+auto-defaults to 16000 for qwen3.5 from the driver. RULES protocol, `PROFILERS=source`,
+1 GPU, artifacts `/workspace/qwen35_local/profiling_postmerge_{smoke,45k,80k}`.
+
+| workload | row | lat (s) | C (GiB) | G alloc (GiB) | G reserved (GiB) | loss band |
+|---|---|---:|---:|---:|---:|---|
+| 2048×8 (smoke) | A post-merge | — | — | 3.1 | **19.09** | 1.61–1.82 ✓ |
+| 45000×8 | A post-merge | 291.1 | 357 | **31.39** | **34.24** | 0.89–0.95 ✓ |
+| 80000×8 | A post-merge | 415.0 | 500.5 | **47.28** | **57.37** | 0.84–0.93 ✓ |
+
+vs the 9b rows above: 45k **−29.8% alloc / −32.5% reserved**; 80k **−40.1% alloc /
+−37.4% reserved**, RSS −9.7%, lat −3.6%. Smoke reproduced the 2026-07-13 19.1 GiB
+row to the MiB (pipeline gate).
+
+**G1 (reserved ≤ 0.80× B) NOW MET AT BOTH:** 45k 34.24/72.4 = **0.473×**; 80k
+57.37/103.0 = **0.557×** — the literal `80000|8|1` target that §9b recorded as
+MISSED at 0.89. The 80k reserved-over-alloc gap that §9b (and fix_reserved.md §8)
+called irreducible is now **10.09 GiB** (was 12.8) — but reserved fell 37% anyway,
+so the gap was never the binding constraint it was read as.
+
+CAVEATS (do not over-read these rows):
+- B was NOT re-measured post-merge; ratios use §9b's recorded B (72.4 / 103.0). B is
+  `superoffload_mem|unsloth-off` and does not touch the asym fg path this merge
+  changed, so it should be unaffected — but it is a pre-merge number.
+- This is NOT a clean A/B of H3b's blocking vs the SFT `_fg_elementwise_blocks`.
+  Post-merge carries the whole SFT family (down_dx_staged default-on, act row-chunking,
+  attn LoRA chunking, async unpack). 80k reserved 57.37 vs H3b's 83.8 (−31.5%) says the
+  FAMILY beats H3b, not that their blocked forward alone does.
+- In this flagship row (`ker101` + `loraafwdcpu`) the SFT *blocked forward* does NOT
+  engage at all: it needs `da_gpu and lora_a_fwd_gpu`, and lora_a_fwd is cpu here.
+  What engages is the sibling `act_chunk` branch (gated on `not lora_a_fwd_gpu`) plus
+  the silu-bwd chunking — confirmed by `stage_rows_calls=2880` at 45k. So the win here
+  is the chunking family, not blocked gate/up/act.
+
+**Savings (pre-merge 9b rows): 45k = 32% reserved (25% alloc); 80k = 11.0% reserved / 21.4% alloc.**
 User-relaxed goal (>10% saving) MET at both workloads incl. the literal
 `80000|8|1` target. The strict 0.80× reserved bar is met at 45k (0.68) and
 missed at 80k (0.89) solely due to the +12.8 GiB reserved-over-alloc allocator
