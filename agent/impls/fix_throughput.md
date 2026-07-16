@@ -465,15 +465,23 @@ ceiling re-search.
 Two errors in the D4 row above, both found by reading, neither by re-running:
 
 1. **`async save_on_cpu` was never reachable.** `asym_gemm/training/gc_async_offload.py`
-   (93 lines) has **zero external callers** — `git log -S "async_save_on_cpu" --all`
-   returns only the commit that added it, and no flag wires it in. So the D4 A/B could
-   not have exercised that half. The "engagement verified: root saved pinned"
-   observation is real but was satisfied by the **pre-existing**
-   `gc_boundary_offload.py:69-70,90` path, which already offloads the root through the
-   pinned pool. (The file's own docstring premise — "the stock LF path saves the
-   per-layer root via `hidden.to('cpu', non_blocking=True)`, an UNPINNED destination" —
-   does not describe this repo's boundary path.) => Either wire it or delete it; do not
-   leave a recorded result pointing at unreachable code.
+   (93 lines) has **zero external callers** in the tree and in every commit in history —
+   no flag wires it in. So the D4 A/B could not have exercised that half.
+   **AMENDED 2026-07-16 (strong-model re-audit):** my first correction here itself
+   over-corrected, twice. (a) The file's docstring premise IS accurate for the flagship
+   rows: the workspace LlamaFactory (`checkpointing.py:114`) saves the unsloth-GC
+   boundary root to an **unpinned** CPU tensor via `hidden.to("cpu", non_blocking=True)`;
+   the pinned `gc_boundary_offload` path replaces it only under `ASYM_UNSLOTH_GC_NVME=1`,
+   which `run_lf_lora_sft.sh:537` exports solely for the `_actnvme`/`_bothnvme` backends.
+   Plain `asym_cpuadamwds` rows — every active profiling row — save the root unpinned,
+   exactly as the docstring says. (b) Therefore my attribution of the "root saved
+   pinned" engagement to `gc_boundary_offload` was wrong for those runs too (it cannot
+   have been active); that observation is UNEXPLAINED for plain-backend runs, and since
+   no artifact recorded the flag (the forwarding hole fixed alongside), the D4
+   engagement claim should be treated as unverified. => The wire-or-delete decision now
+   leans **wire**: the dead file targets a real, active bottleneck (unpinned boundary
+   root save + blocking per-tensor unpack on flagship rows) — but it needs its own A/B
+   with the new `pin_fallback_calls_module_global` counters in hand.
 2. **The +0.08 s null was structural, not a measurement mystery.** The async restage
    delivers **zero copy/compute overlap by construction**: `side.wait_stream(compute)`
    makes the copy wait on all preceding compute, `compute.wait_event(done)` makes all

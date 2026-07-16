@@ -14,10 +14,13 @@ R000_OHBM='q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohb
 RSO='q3-30b-a3b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 120000|8|1 ; none|false|false|false|false|false'
 
 rung_ok() {
-  # the driver exits 0 even on failed jobs (CONTINUE_ON_ERROR); trust jobs.tsv only
+  # the driver exits 0 even on failed jobs (CONTINUE_ON_ERROR); trust jobs.tsv only.
+  # NB: outputs moved under profiling_results/ (2649023); the old bare profiling/
+  # glob never matches at HEAD, which made every rung look not-done and re-run.
   local name="$1"
   local tsv
-  tsv=$(ls profiling/asym_long_sft_smoke__lora__lf__bf16/"${name}"__*/jobs.tsv 2>/dev/null | head -1)
+  tsv=$(ls profiling_results/profiling*/asym_long_sft_smoke__lora__lf__bf16/"${name}"__*/jobs.tsv \
+        profiling/asym_long_sft_smoke__lora__lf__bf16/"${name}"__*/jobs.tsv 2>/dev/null | head -1)
   [[ -n "${tsv}" ]] && awk -F'\t' 'NR>1 && $1=="ok"{found=1} END{exit !found}' "${tsv}"
 }
 

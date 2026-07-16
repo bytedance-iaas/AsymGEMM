@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dataclass_replace
 import inspect
 import math
 import os
@@ -904,8 +904,8 @@ def _activation_offload_cpu_silu_mul(
     *,
     tag: str,
 ) -> CPUActivationHandle:
-    manager.wait_cpu_ready(gate)
-    manager.wait_cpu_ready(up)
+    manager.wait_cpu_ready_host(gate)
+    manager.wait_cpu_ready_host(up)
     out = manager.empty_cpu(tuple(gate.tensor.shape), gate.tensor.dtype, gate.original_device, tag)
     with torch.no_grad():
         out.tensor.copy_(F.silu(gate.tensor).mul(up.tensor), non_blocking=False)
@@ -919,9 +919,9 @@ def _activation_offload_cpu_silu_backward(
     manager: ActivationOffloadManager,
 ) -> tuple[CPUActivationHandle, CPUActivationHandle]:
     with prof_range("backward.mlp.activation_offload.activation_cpu.wait"):
-        manager.wait_cpu_ready(gate)
-        manager.wait_cpu_ready(up)
-        manager.wait_cpu_ready(grad_act)
+        manager.wait_cpu_ready_host(gate)
+        manager.wait_cpu_ready_host(up)
+        manager.wait_cpu_ready_host(grad_act)
     with prof_range("backward.mlp.activation_offload.activation_cpu.alloc"):
         grad_gate = manager.empty_cpu(tuple(gate.tensor.shape), gate.tensor.dtype, gate.original_device, "dgate")
         grad_up = manager.empty_cpu(tuple(up.tensor.shape), up.tensor.dtype, up.original_device, "dup")
@@ -993,7 +993,7 @@ def _rebuild_qwen3_packed_x_cpu(
     if token_indices is None:
         raise RuntimeError("Qwen3 unpacked-X reconstruction requires token indices")
 
-    manager.wait_cpu_ready(ctx.x_cpu)
+    manager.wait_cpu_ready_host(ctx.x_cpu)
     rebuilt = manager.empty_cpu(
         (int(token_indices.numel()), int(hidden_cpu.shape[1])),
         hidden_cpu.dtype,
@@ -2555,14 +2555,31 @@ class AsymQwen3Experts(nn.Module):
         # ASYMM_QWEN3_MOE_FG_RELEASE_FUSED_HOME frees the fused pinned storage once
         # the splits are pinned. DEFAULT ON since 2026-07-15 (clear bug fix; set 0
         # to keep the old duplicated-home behavior).
+        # NB: the LF driver forwards unset knobs as EMPTY strings — empty must mean
+        # "default (on)", not "off" (same convention as DOWN_DX_STAGED's reader).
+        _release_raw = os.environ.get("ASYMM_QWEN3_MOE_FG_RELEASE_FUSED_HOME")
+        if _release_raw is None or _release_raw.strip() == "":
+            _release_raw = os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_FG_RELEASE_FUSED_HOME", "")
+        _release_on = (_release_raw or "").strip().lower() not in {"0", "false", "no", "off"}
         if (
-            os.environ.get("ASYMM_QWEN3_MOE_FG_RELEASE_FUSED_HOME", "1").strip().lower() in {"1", "true", "yes", "on"}
+            _release_on
+            # Never release a shared-fabric bank view (multi-rank arena-shm backends):
+            # the fused "home" there is a view into SharedFabric's persistent bank —
+            # swapping _tensor frees nothing and desyncs the bank's accounting.
+            and not getattr(self.gate_up_base.host_weight, "_fabric_bank", False)
             and gate_base.host_weight.weight.is_pinned()
             and up_base.host_weight.weight.is_pinned()
         ):
             fused_hw = self.gate_up_base.host_weight
             released = torch.empty(0, dtype=fused_hw.weight.dtype, device="cpu")
             fused_hw._tensor = released
+            # Zero the byte telemetry (nbytes -> pinned_cpu_bytes/weight_nbytes) so the
+            # freed fused bytes stop being reported as pinned-resident — otherwise the
+            # memory summaries hide exactly the savings this release delivers. is_pinned
+            # is deliberately LEFT TRUE: _load_from_state_dict (frozen_linear.py) reads
+            # it as the pin intent for a reloaded fused weight, and a good pre-release
+            # checkpoint restored onto a released module must come back pinned.
+            fused_hw._metadata = _dataclass_replace(fused_hw._metadata, nbytes=0)
             setattr(fused_hw, "_asym_released_fused_home", True)
             setattr(self.gate_up_base, "_asym_released_fused_home", True)
             self.stats.qwen3_moe_finegrained_fused_home_released = (

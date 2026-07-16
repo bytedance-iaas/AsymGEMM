@@ -181,8 +181,8 @@ def _cpu_silu_mul(
     *,
     tag: str,
 ) -> CPUActivationHandle:
-    manager.wait_cpu_ready(gate)
-    manager.wait_cpu_ready(up)
+    manager.wait_cpu_ready_host(gate)
+    manager.wait_cpu_ready_host(up)
     out = manager.empty_cpu(tuple(gate.tensor.shape), gate.tensor.dtype, gate.original_device, tag)
     with torch.no_grad():
         out.tensor.copy_(F.silu(gate.tensor).mul(up.tensor), non_blocking=False)
@@ -195,9 +195,9 @@ def _cpu_silu_backward(
     grad_act: CPUActivationHandle,
     manager: ActivationOffloadManager,
 ) -> tuple[CPUActivationHandle, CPUActivationHandle]:
-    manager.wait_cpu_ready(gate)
-    manager.wait_cpu_ready(up)
-    manager.wait_cpu_ready(grad_act)
+    manager.wait_cpu_ready_host(gate)
+    manager.wait_cpu_ready_host(up)
+    manager.wait_cpu_ready_host(grad_act)
     grad_gate = manager.empty_cpu(tuple(gate.tensor.shape), gate.tensor.dtype, gate.original_device, "mlp.dgate")
     grad_up = manager.empty_cpu(tuple(up.tensor.shape), up.tensor.dtype, up.original_device, "mlp.dup")
     with torch.no_grad():
@@ -266,7 +266,7 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                 stats=layer.stats,
                 tag=layer._profile_name("gate", "base_forward"),
             )
-            manager.wait_cpu_ready(x_cpu)
+            manager.wait_cpu_ready_host(x_cpu)
             gate_low_rank = layer._cpu_left_lora_a(x_cpu, gate_a, tag="gate")
             _add_lora_b_delta_(gate, gate_low_rank, gate_b, scale=layer.lora_scale)
             gate_cpu = manager.offload(gate, "mlp.gate")
@@ -281,7 +281,7 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                 stats=layer.stats,
                 tag=layer._profile_name("up", "base_forward"),
             )
-            manager.wait_cpu_ready(x_cpu)
+            manager.wait_cpu_ready_host(x_cpu)
             up_low_rank = layer._cpu_left_lora_a(x_cpu, up_a, tag="up")
             _add_lora_b_delta_(up, up_low_rank, up_b, scale=layer.lora_scale)
             up_cpu = manager.offload(up, "mlp.up")
@@ -327,7 +327,7 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                 del gate_stage, up_stage
 
         with prof_range(layer._forward_range("finegrained", "down_lora")):
-            manager.wait_cpu_ready(act_cpu)
+            manager.wait_cpu_ready_host(act_cpu)
             down_low_rank = layer._cpu_left_lora_a(act_cpu, down_a, tag="down")
             down_low_rank_cpu = manager.offload(down_low_rank, "mlp.S_down")
 
@@ -395,7 +395,7 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                 grad_down_b = _lora_b_grad(grad_2d, down_low_rank, scale=layer.lora_scale, out_dtype=down_b.dtype)
                 manager.release_stage(down_low_rank, drop_cache=True)
                 manager.release_cpu(ctx.down_low_rank_cpu)
-                manager.wait_cpu_ready(ctx.act_cpu)
+                manager.wait_cpu_ready_host(ctx.act_cpu)
                 grad_down_a = layer._cpu_right_lora_a_grad(dS_down, ctx.act_cpu, down_a, tag="down")
 
             with prof_range(layer._backward_range("finegrained", "down_base_dx")):
@@ -495,7 +495,7 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                 )
                 manager.release_stage(gate_low_rank, drop_cache=True)
                 manager.release_cpu(ctx.gate_low_rank_cpu)
-                manager.wait_cpu_ready(ctx.x_cpu)
+                manager.wait_cpu_ready_host(ctx.x_cpu)
                 grad_gate_a = layer._cpu_right_lora_a_grad(dS_gate, ctx.x_cpu, gate_a, tag="gate")
                 layer.stats.dense_mlp_finegrained_gate_base_calls += 1
                 grad_x = _asym_base_dx(
@@ -519,7 +519,7 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                 grad_up_b = _lora_b_grad(grad_up_stage, up_low_rank, scale=layer.lora_scale, out_dtype=up_b.dtype)
                 manager.release_stage(up_low_rank, drop_cache=True)
                 manager.release_cpu(ctx.up_low_rank_cpu)
-                manager.wait_cpu_ready(ctx.x_cpu)
+                manager.wait_cpu_ready_host(ctx.x_cpu)
                 grad_up_a = layer._cpu_right_lora_a_grad(dS_up, ctx.x_cpu, up_a, tag="up")
                 layer.stats.dense_mlp_finegrained_up_base_calls += 1
                 up_dx = _asym_base_dx(
@@ -671,7 +671,7 @@ def _finegrained_dense_mlp_no_grad_cpu_offload_forward(layer: "AsymFinegrainedDe
                 stats=layer.stats,
                 tag=layer._profile_name("gate", "base_forward"),
             )
-            manager.wait_cpu_ready(x_cpu)
+            manager.wait_cpu_ready_host(x_cpu)
             gate_low_rank = layer._cpu_left_lora_a(x_cpu, gate_a, tag="gate")
             gate_delta = _lora_b_forward(gate_low_rank, gate_b, scale=layer.lora_scale)
             gate.add_(gate_delta.to(dtype=gate.dtype))
@@ -687,7 +687,7 @@ def _finegrained_dense_mlp_no_grad_cpu_offload_forward(layer: "AsymFinegrainedDe
                 stats=layer.stats,
                 tag=layer._profile_name("up", "base_forward"),
             )
-            manager.wait_cpu_ready(x_cpu)
+            manager.wait_cpu_ready_host(x_cpu)
             up_low_rank = layer._cpu_left_lora_a(x_cpu, up_a, tag="up")
             up_delta = _lora_b_forward(up_low_rank, up_b, scale=layer.lora_scale)
             up.add_(up_delta.to(dtype=up.dtype))
@@ -730,6 +730,9 @@ def _finegrained_dense_mlp_no_grad_cpu_offload_forward(layer: "AsymFinegrainedDe
                 gate_cpu = up_cpu = None
 
         with prof_range(layer._forward_range("finegrained_nograd", "down_lora")):
+            # act_cpu was offloaded (non-blocking D2H) just above; the cpu-left
+            # LoRA-A pads it with a HOST memcpy — this site had NO wait at all.
+            manager.wait_cpu_ready_host(act_cpu)
             down_low_rank = layer._cpu_left_lora_a(act_cpu, down_a, tag="down")
             down_delta = _lora_b_forward(down_low_rank, down_b, scale=layer.lora_scale)
             del down_low_rank

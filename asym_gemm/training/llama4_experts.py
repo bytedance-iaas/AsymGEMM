@@ -124,7 +124,7 @@ def _rebuild_packed_x_cpu(
     token_indices = getattr(ctx, "x_token_indices_cpu", None)
     if token_indices is None:
         raise RuntimeError("Llama4 gate/up recompute from unpacked X requires token indices")
-    manager.wait_cpu_ready(ctx.x_cpu)
+    manager.wait_cpu_ready_host(ctx.x_cpu)
     rebuilt = manager.empty_cpu(
         (int(token_indices.shape[0]), int(hidden_cpu.shape[1])),
         hidden_cpu.dtype,
