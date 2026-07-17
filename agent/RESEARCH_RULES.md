@@ -1,1 +1,1 @@
-../../../../agent/RESEARCH_RULES.md
+../../../../env/agent/RESEARCH_RULES.md

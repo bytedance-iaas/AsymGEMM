@@ -1,1 +1,1 @@
-/home/kevinni/agent/throughput_prompt.md
+../../../../../env/agent/throughput_prompt.md

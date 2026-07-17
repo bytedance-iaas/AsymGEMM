@@ -1,1 +1,1 @@
-../../../../agent/project_rules.md
+../../../../env/agent/project_rules.md
