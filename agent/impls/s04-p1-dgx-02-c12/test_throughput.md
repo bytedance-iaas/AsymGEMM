@@ -1,5 +1,11 @@
 # test_throughput — measuring max throughput per (model × config × seq)
 
+HOST: s04-p1-dgx-02-c12 | GPU: GB200 (189471 MiB = 185.0 GiB HBM) | container asym_sft_40, venv torch 2.12.
+Per-host isolation: this dir = this machine's record; other machines write agent/impls/<hostname>/
+(handoff prompt: agent/impls/throughput_prompt.md). Raw artifacts (gitignored) are archived per host:
+profiling_results/profiling_tp_s04-p1-dgx-02-c12/asym_long_sft_smoke__lora__lf__bf16/ — live runs
+write to profiling_results/profiling/... and get mv'd there after each campaign.
+
 Running doc + probe log for the AsymGEMM-backend throughput study. Companion to
 `fix_estimator.md`. This doc = the measurement protocol, the BEHAVIORAL RULES the agent
 must follow autonomously, and the results.
@@ -137,6 +143,29 @@ Configs under study:
 ================================================================================
 ## PLAN — remaining sweeps (write-up; run after current interpolation)
 ================================================================================
+### GOAL UPDATE (2026-07-16): GAP-SEARCH, not max-tp squeeze
+Target = seqs where superoffload's max FITTING batch (B_max) is small AND sits BELOW its knee:
+  gap condition: (a) B_max <= ~4  AND  (b) MFU(B_max) < plateau MFU (q3-32b ~31%, q3-30b ~13-14%, llama ~40%).
+  severity = saturation deficit = 1 - MFU(B_max)/plateau. Rank seqs by deficit.
+There, asym (leaner HBM/sample) can fit a LARGER batch at higher %HBM and win tok/s while both fit.
+Counterexample: llama recomp 48k caps at b2 but MFU 40.1% = saturated -> NO gap (small B_max alone
+is not enough). Exemplar: llama unsloth 128k b2 = 32.6% vs 40% plateau (~18% deficit, 80% HBM).
+Keep MAX labels in tables, but stop spending runs pinning peaks at short saturated seqs.
+
+### QUEUE (in order)
+1. [RUNNING] capQ: q3-30b 50k/56k/64k, both configs -> B_max + deficit per seq (q3-32b arm done:
+   45k uns B_max=8 deficit ~4%; 45k rc B_max=3 deficit ~6% -> dense gap needs longer seqs).
+2. Extend gap-search per config until B_max<=2 with deficit mapped (q3-32b 50k/56k+; q3-30b 80k+
+   if needed) — 2-3 runs/seq (B_max bracket + measure), NO dense sweeps.
+3. llama localize the terminal events:
+   - unsloth deficit onset: 104k/112k/120k @ b2 (bracketed 96k healthy -> 128k 18% deficit).
+   - recomp wall: 56k @ b2 (48k fits saturated -> 64k OOM; deficit may never appear = fails by OOM
+     not knee — itself a finding).
+4. Phase B head-to-head: asym LATENCY at the top-deficit seqs (llama 128k first; Qwen per capQ)
+   — show asym fits bigger batch and beats superoffload tok/s while both fit. Also finish asym
+   24k (q3-32b b16; q3-30b b16/24/32) for the mid-seq reference.
+5. (optional, deprioritized) peak refinements: q3-32b 32k|12 uns, 32k|6 rc.
+
 Batch grids set from N_max ~= ceiling_seq * ceiling_batch (max tokens that fit).
 At each test seq, start batch past the knee, climb toward ~N_max/seq; R1 interpolates
 and R2 lets OOM bracket the peak. Bigger/denser model => LOWER batch starts.
@@ -205,7 +234,28 @@ Near-ceiling (>=~96% HBM) => allocator thrash: tok/s DROPS then OOMs.
 | 16000 | 16 |  82.4 | 128.0 |  69% | 3107  | 31.5 | |
 | 16000 | 20 | 101.9 | 161.0 |  87% | 3140  | 31.9 | MAX |
 | 16000 | 24 | 162.6 | 181.2 |  98% | 2362  | 24.0 | thrash |
-PEAKS: 8k=3447(b44) 12k=3274(b30) 16k=3140(b20). tok/s DECLINES with seq (attention).
+| 20000 | 16 | 106.5 | 161.0 |  87% | 3005  | 31.5 | MAX |
+| 20000 | 20 | 177.9 | 181.4 |  98% | 2249  | 23.6 | thrash |
+| 24000 |  8 |  67.8 |  96.2 |  52% | 2830  | 30.7 | |
+| 24000 | 12 | 100.4 | 143.1 |  77% | 2870  | 31.1 | |
+| 24000 | 14 | 116.3 | 168.9 |  91% | 2889  | 31.3 | MAX |
+| 24000 | 16 | 180.8 | 181.4 |  98% | 2124  | 23.0 | thrash |
+| 28000 |  8 |  82.4 | 112.1 |  61% | 2718  | 30.4 | |
+| 28000 | 10 | 101.7 | 139.7 |  76% | 2754  | 30.8 | |
+| 28000 | 12 | 121.2 | 168.9 |  91% | 2772  | 31.0 | MAX |
+| 30000 |  8 |  89.8 | 120.3 |  65% | 2672  | 30.4 | |
+| 30000 | 10 | 110.9 | 149.0 |  81% | 2706  | 30.8 | |
+| 30000 | 12 | 132.6 | 178.4 |  96% | 2714  | 30.9 | MAX |
+| 32000 |  8 |  95.6 | 128.0 |  69% | 2679  | 30.9 | |
+| 32000 | 10 | 118.5 | 161.0 |  87% | 2700  | 31.2 | MAX (b12 refine) |
+| 36000 |  6 |  86.2 | 108.2 |  58% | 2507  | 29.8 | |
+| 36000 |  8 | 113.4 | 143.1 |  77% | 2540  | 30.2 | |
+| 36000 | 10 | 140.8 | 178.4 |  96% | 2556  | 30.4 | MAX |
+| 40000 |  6 |  99.1 | 120.0 |  65% | 2422  | 29.6 | |
+| 40000 |  8 | 130.7 | 161.0 |  87% | 2449  | 30.0 | MAX |
+| 45000 |  6 | 115.4 | 134.9 |  73% | 2339  | 29.7 | |
+| 45000 |  8 | 152.8 | 178.4 |  96% | 2356  | 29.9 | MAX |
+PEAKS: 8k=3447(b44) 12k=3274(b30) 16k=3140(b20) 20k=3005(b16) 24k=2889(b14) 28k=2772(b12) 30k=2714(b12) 32k=2700(b10) 36k=2556(b10) 40k=2449(b8) 45k=2356(b8). tok/s DECLINES w/ seq; MFU ~30% flat -> NO plateau break through 45k (unlike llama@128k).
 
 ### q3-30b-a3b (MoE)
 | seq   | B  | s/it | resv  | %HBM | tok/s | MFU% |     |
@@ -220,7 +270,22 @@ PEAKS: 8k=3447(b44) 12k=3274(b30) 16k=3140(b20). tok/s DECLINES with seq (attent
 | 24000 | 24 | 68.5 | 167.8 |  91% | 8411  | 12.8 | MAX |
 | 24000 | 26 | 84.9 | 180.6 |  98% | 7349  | 11.2 | thrash |
 | 24000 | 28 | FAIL | 175.1 |   -  |  -    |  -   | OOM |
-PEAKS: 16k=9320(b36) 24k=8411(b24). MoE ~2.7x tok/s of dense but ~12% MFU vs ~32%.
+| 32000 | 12 | 49.9 | 113.6 |  61% | 7700  | 13.3 | |
+| 32000 | 16 | 65.0 | 149.9 |  81% | 7877  | 13.6 | MAX |
+| 32000 | 20 |109.3 | 181.4 |  98% | 5856  | 10.1 | thrash |
+| 40000 |  8 | 46.6 |  94.8 |  51% | 6873  | 13.3 | |
+| 40000 | 12 | 67.5 | 140.7 |  76% | 7114  | 13.8 | MAX |
+| 40000 | 16 |117.3 | 181.3 |  98% | 5455  | 10.6 | thrash |
+| 45000 |  8 | 54.4 | 106.6 |  58% | 6619  | 13.7 | |
+| 45000 | 12 | 79.2 | 157.4 |  85% | 6817  | 14.1 | MAX (b16 OOM) |
+| 50000 |  8 | 63.3 | 117.9 |  64% | 6321  | 13.9 | |
+| 50000 | 10 | 77.7 | 146.5 |  79% | 6433  | 14.2 | |
+| 50000 | 12 | 92.3 | 174.8 |  94% | 6499  | 14.3 | MAX |
+| 56000 |  8 | 73.8 | 131.4 |  71% | 6073  | 14.3 | |
+| 56000 | 10 | 91.0 | 163.2 |  88% | 6157  | 14.5 | MAX |
+PEAKS: 16k=9320(b36) 24k=8411(b24) 32k=7877(b16) 40k=7114(b12) 45k=6817(b12) 50k=6499(b12) 56k=6157(b10).
+unsloth fits 45k/50k/56k; MFU RISES with seq (12.2->14.5%) — MoE unsloth shows NO deficit yet (B_max*seq
+stays >>knee ~63k tokens): the gap regime needs B_max to collapse (walk 64k->80k->96k...).
 
 R0 in action (this run): filling found HIGHER peaks than the coarse sweep —
 q3-30b 16k 9261(b32)->9320(b36); pinned q3-32b 16k=3140(b20); confirmed thrash edges.
@@ -265,7 +330,7 @@ can't extend seq), (b) iso-effective-batch MFU where a baseline forced below the
 ================================================================================
 ## FINAL — superoffload_mem|recomp, fully pinned (R0), GiB. phys=185.0
 ================================================================================
-### q3-32b (dense) recomp — peaks: 8k=3303(b20) 12k=3197(b14) 16k=3055(b10) 20k=2905(b8,ceiling)
+### q3-32b (dense) recomp — peaks: 8k=3303(b20) 12k=3197(b14) 16k=3055(b10) 20k=2905(b8) 24k=2819(b6,ceiling)
 | seq  | B  | s/it  | resv  | %HBM | tok/s | MFU% | flag |
 |------|----|-------|-------|------|-------|------|------|
 | 8000 | 12 |  31.8 | 104.9 | 57%  | 3022  | 28.5 | |
@@ -278,6 +343,18 @@ can't extend seq), (b) iso-effective-batch MFU where a baseline forced below the
 | 16000| 8  |  42.8 | 139.3 | 75%  | 2993  | 30.4 | |
 | 16000| 10 |  52.4 | 173.5 | 94%  | 3055  | 31.0 | MAX |
 | 20000| 8  |  55.1 | 173.5 | 94%  | 2905  | 30.5 | MAX (ceiling) |
+| 24000| 4  |  35.7 | 105.0 | 57%  | 2685  | 29.1 | |
+| 24000| 6  |  51.1 | 156.3 | 84%  | 2819  | 30.6 | MAX (b8 OOM) |
+| 28000| 4  |  42.6 | 122.1 | 66%  | 2630  | 29.4 | |
+| 28000| 6  |  61.7 | 180.8 | 98%  | 2725  | 30.5 | MAX |
+| 30000| 4  |  46.1 | 130.7 | 71%  | 2601  | 29.6 | MAX (b6 OOM) |
+| 32000| 4  |  48.7 | 139.3 | 75%  | 2631  | 30.4 | MAX (b6 refine) |
+| 36000| 3  |  44.3 | 117.8 | 64%  | 2440  | 29.0 | |
+| 36000| 4  |  57.2 | 156.6 | 85%  | 2519  | 30.0 | MAX |
+| 40000| 3  |  50.6 | 130.7 | 71%  | 2372  | 29.0 | |
+| 40000| 4  |  65.7 | 173.7 | 94%  | 2436  | 29.8 | MAX |
+| 45000| 2  |  41.0 |  98.4 | 53%  | 2195  | 27.8 | |
+| 45000| 3  |  58.5 | 146.7 | 79%  | 2309  | 29.3 | MAX |
 
 ### q3-30b-a3b (MoE) recomp — peaks: 8k=9953(b48) 16k=9103(b24) 24k=8244(b16) 45k=6655(b8,ceiling)
 | seq  | B  | s/it | resv  | %HBM | tok/s | MFU% | flag |
@@ -296,10 +373,82 @@ can't extend seq), (b) iso-effective-batch MFU where a baseline forced below the
 | 24000| 12 | 36.7 | 135.6 | 73%  | 7848  | 11.9 | |
 | 24000| 15 | 43.9 | 169.7 | 92%  | 8201  | 12.5 | |
 | 24000| 16 | 46.6 | 181.0 | 98%  | 8244  | 12.5 | MAX |
-| 45000| 8  | 54.1 | 169.7 | 92%  | 6655  | 13.8 | MAX (ceiling) |
+| 32000| 10 | 41.9 | 150.5 | 81%  | 7645  | 13.2 | |
+| 32000| 12 | 49.2 | 181.0 | 98%  | 7804  | 13.5 | MAX (b14 OOM) |
+| 40000| 8  | 45.9 | 150.5 | 81%  | 6973  | 13.5 | MAX (b12 OOM) |
+| 45000| 8  | 54.1 | 169.7 | 92%  | 6655  | 13.8 | MAX (b12 OOM; unsloth fits b12) |
 
-### recomp vs unsloth-ohbm0 (both superoffload_mem)
-- recomp peak tok/s slightly LOWER at matched seq (dense 8k: 3303 vs 3447) but reached at
-  MUCH smaller batch (recomp uses more HBM/token -> fewer batches fit). Same compute-bound
-  MFU (~31% dense, ~11-14% MoE). recomp lets q3-30b reach 45k seq (unsloth OOM past 24k)
-  = capacity edge. R0 fills beat the coarse grid everywhere (q3-30b recomp 8k 9638->9953).
+### recomp vs unsloth-ohbm0 (both superoffload_mem) — CORRECTED 2026-07-16
+- Peak tok/s ~EQUAL (±2%): dense ~30% MFU, MoE ~13% MFU, both compute-bound, decline w/ seq.
+- **CAPACITY: unsloth-ohbm0 fits MORE, not less** (earlier "unsloth OOM past 24k" was NEVER
+  measured -> FALSE). unsloth offloads activations to host -> leaner HBM -> higher batch AND
+  longer seq: q3-30b @45k unsloth b12@85% vs recomp b8@92%; q3-32b @30k unsloth b12@96% fits
+  while recomp b6 OOMs. recomp's edge is HOST RAM only (RSS 142-204GB vs unsloth 364-382GB),
+  since it keeps activations in HBM (HBM-heavy) instead of offloading.
+- R0 fills beat the coarse grid everywhere (q3-30b recomp 8k 9638->9953).
+
+================================================================================
+## FINAL — llama3.3-70b (both configs), pinned incl odd batches. GiB HBM / GB RSS.
+================================================================================
+
+### llama3.3-70b — UNSLOTH-ohbm0
+| seq | B | s/it | resv GiB | %HBM | RSS GB | tok/s | MFU% | flag |
+|---|---|---|---|---|---|---|---|---|
+| 8000 | 8 | 37.1 | 37.1 | 20% | 300 | 1727 | 34.9 |  |
+| 8000 | 12 | 51.6 | 55.5 | 30% | 350 | 1860 | 37.6 |  |
+| 8000 | 16 | 67.0 | 73.2 | 40% | 350 | 1912 | 38.7 |  |
+| 8000 | 24 | 97.0 | 111.1 | 60% | 522 | 1980 | 40.0 |  |
+| 8000 | 32 | 130.9 | 147.7 | 80% | 522 | 1956 | 39.6 |  |
+| 8000 | 40 | 160.1 | 181.0 | 98% | 865 | 1998 | 40.4 | MAX |
+| 8000 | 48 | OOM | 181 | 98% | 862 | — | — | OOM |
+| 16000 | 6 | 54.4 | 55.5 | 30% | 350 | 1763 | 38.1 |  |
+| 16000 | 8 | 70.9 | 73.2 | 40% | 350 | 1806 | 39.1 |  |
+| 16000 | 12 | 103.3 | 111.1 | 60% | 522 | 1858 | 40.2 |  |
+| 16000 | 16 | 138.6 | 147.7 | 80% | 522 | 1847 | 39.9 |  |
+| 16000 | 20 | 170.5 | 181.0 | 98% | 865 | 1877 | 40.6 | MAX |
+| 16000 | 24 | OOM | 181 | 98% | 863 | — | — | OOM |
+| 24000 | 10 | 138.9 | 138.7 | 75% | 522 | 1728 | 39.8 |  |
+| 24000 | 13 | 177.3 | 180.1 | 97% | 865 | 1759 | 40.5 | MAX |
+| 32000 | 4 | 79.4 | 73.2 | 40% | 350 | 1613 | 39.4 |  |
+| 32000 | 6 | 116.8 | 111.1 | 60% | 522 | 1644 | 40.2 |  |
+| 32000 | 8 | 156.4 | 147.7 | 80% | 522 | 1637 | 40.0 |  |
+| 32000 | 10 | 192.5 | 181.0 | 98% | 865 | 1663 | 40.6 | MAX |
+| 32000 | 12 | OOM | 181 | 98% | 863 | — | — | OOM |
+| 40000 | 6 | 157.0 | 138.7 | 75% | 522 | 1529 | 39.5 |  |
+| 40000 | 8 | 204.9 | 181.0 | 98% | 865 | 1562 | 40.3 | MAX |
+| 48000 | 6 | 196.1 | 165.9 | 90% | 866 | 1469 | 40.0 | MAX |
+| 48000 | 7 | 253.0 | 181.4 | 98% | 865 | 1328 | 36.1 | thrash |
+| 48000 | 8 | OOM | 181 | 98% | 863 | — | — | OOM |
+| 64000 | 4 | 192.1 | 147.7 | 80% | 522 | 1333 | 40.0 |  |
+| 64000 | 5 | 237.7 | 181.0 | 98% | 865 | 1346 | 40.4 | MAX |
+| 64000 | 6 | OOM | 181 | 98% | 863 | — | — | OOM |
+| 96000 | 2 | 168.0 | 110.2 | 60% | 522 | 1143 | 40.7 | MAX (saturated) |
+| 96000 | 3 | 253.7 | 165.9 | 90% | 865 | 1135 | 40.4 |  |
+| 128000 | 2 | 323.3 | 147.7 | 80% | 522 | 792 | 32.6 | MAX; MFU falls off 40% plateau |
+
+### llama3.3-70b — RECOMP
+| seq | B | s/it | resv GiB | %HBM | RSS GB | tok/s | MFU% | flag |
+|---|---|---|---|---|---|---|---|---|
+| 8000 | 4 | 24.5 | 57.1 | 31% | 300 | 1305 | 26.4 |  |
+| 8000 | 8 | 36.5 | 113.3 | 61% | 300 | 1755 | 35.5 |  |
+| 8000 | 12 | 50.6 | 169.9 | 92% | 300 | 1896 | 38.3 | MAX |
+| 8000 | 13 | 54.9 | 181.3 | 98% | 300 | 1895 | 38.3 | thrash |
+| 8000 | 16 | OOM | 180 | 98% | 300 | — | — | OOM |
+| 16000 | 4 | 38.2 | 113.3 | 61% | 300 | 1674 | 36.2 |  |
+| 16000 | 6 | 53.3 | 169.9 | 92% | 300 | 1802 | 39.0 | MAX |
+| 16000 | 7 | OOM | 180 | 97% | 300 | — | — | OOM |
+| 16000 | 8 | OOM | 180 | 98% | 300 | — | — | OOM |
+| 24000 | 3 | 44.2 | 127.1 | 69% | 300 | 1627 | 37.5 |  |
+| 24000 | 4 | 56.3 | 169.9 | 92% | 300 | 1706 | 39.3 | MAX |
+| 32000 | 2 | 42.3 | 113.3 | 61% | 300 | 1513 | 36.9 |  |
+| 32000 | 3 | 59.6 | 169.9 | 92% | 300 | 1610 | 39.3 | MAX |
+| 32000 | 4 | OOM | 180 | 98% | 300 | — | — | OOM |
+| 32000 | 6 | OOM | 181 | 98% | 300 | — | — | OOM |
+| 48000 | 2 | 65.2 | 169.9 | 92% | 300 | 1472 | 40.1 | MAX |
+| 64000 | 2 | OOM | — | — | 300 | — | — | OOM (recomp ceiling 48k-64k; unsloth reaches 128k+) |
+
+Notes: MFU steady ~40% (highest of 3 models, big dense GEMMs). tok/s declines with
+seq (O(s^2)): unsloth 8k=1998/16k=1877/32k=1663/48k=1469/64k=1333. unsloth reaches
+64k context; recomp caps ~32k. unsloth co-bound (98% HBM + 865GB host at peak);
+recomp HBM-heavy (OOMs small batch) but tiny host (300GB). odd-batch fill found a
+higher recomp 32k peak (b3=1610 > b2=1513) - odd batches matter at coarse brackets.

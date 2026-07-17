@@ -91,25 +91,9 @@ if [[ "${_RUNS_ENV_SET}" == "true" ]]; then
     [[ -n "${_run}" ]] && RUNS+=("${_run}")
   done <<< "${_runs_env_lines}"
 else
-  # (merge 2026-07-13: scheduler-side commented history block kept below; EP-side
-  #  block kept after it; the ACTIVE RUNS is the uncommented block further down.)
-  # RUNS=(
-  #   # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 60000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
-  #   # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 55000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
-  #   # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 52000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
-
-  #   # "llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
-  #   # "llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 34000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
-
-  #   # "llama4-scout|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 14500|8|1 ; none|false|false|false|false|false" # G-OOM 15k
-  #   # "q2.5-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 52000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
-  #   # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 131000|8|1 ; none|false|false|false|false|false" # C-OOM 132k
-  #   # "q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
-  # )
-  # --- EP-side (SFT-38) run-queue history (all rows commented) ---
   RUNS=(
-    # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm8|ligerloss1 ; 68000|8|1 ; none|false|false|false|false|false" # xs, C-x, G-x, C-OOM 66k [DONE]
-    # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 10000|8|1 ; none|false|false|false|false|false" # xs, C-896, G-181, G-OOM 188k [IP]
+    "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm8|ligerloss1 ; 65000|8|1 ; none|false|false|false|false|false"
+    "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm16|ligerloss1 ; 174000|8|1 ; none|false|false|false|false|false"
 
     # "q3-30b-a3b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 131000|8|1 ; none|false|false|false|false|false" # 532s, C-618, G-153, C-OOM 132k [DONE]
     # "q3-32b|1 ; superoffload_mem|unsloth-off-ohbm4|ligerloss1 ; 53000|8|1 ; none|false|false|false|false|false" # 444s, C-845, G-181, C-OOM 54k [DONE]
@@ -133,65 +117,34 @@ else
     # "q2.5-72b|1 ; superoffload_mem|recomp|ligerloss1 ; 12000|8|1 ; none|false|false|false|false|false" # G-OOM 13k
   )
   # RUNS=(
-  #   # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm8|ligerloss1 ; 68000|8|1 ; none|false|false|false|false|false" # ceiling (confirmed); C-OOM 69k, ohbm0 C-OOM 66k
-  #   # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 172000|8|1 ; none|false|false|false|false|false" # ceiling (max OK); G-OOM 188k
+  #   # "q3-30b-a3b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
+  #   # "q3-30b-a3b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
+  #   # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
 
-  #   # "q3-30b-a3b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 131000|8|1 ; none|false|false|false|false|false" # C-OOM 132k
-  #   # "q3-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 68000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
-  #   # "llama3.3-70b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
-  #   # "llama4-scout|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 14500|8|1 ; none|false|false|false|false|false" # G-OOM 15k
-  #   # "q2.5-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 52000|8|1 ; none|false|false|false|false|false" # C-OOM 53k
-  #   # "q2.5-72b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # C-OOM 33k
+  #   # "q3-32b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 49000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
+  #   # "q3-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 49000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
+  #   # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 49000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
 
-  #   "q3-30b-a3b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # C-xxx, G-xxx, G-OOM 81k
-  #   "q3-32b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 49000|8|1 ; none|false|false|false|false|false" # G-OOM 50k
-  #   "llama3.3-70b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
+  #   # "llama3.3-70b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
+  #   # "llama3.3-70b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
+  #   # "llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
+
   #   # "llama4-scout|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
+  #   # "llama4-scout|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
+  #   # "llama4-scout|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
+
   #   # "q2.5-32b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
-  #   # "q2.5-72b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 40000|8|1 ; none|false|false|false|false|false" # G-OOM 41k
+  #   # "q2.5-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
+  #   # "q2.5-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
 
-  #   # "q3-30b-a3b|1 ; superoffload_mem|recomp|ligerloss1 ; 45000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
-  #   # "q3-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 20000|8|1 ; none|false|false|false|false|false" # G-OOM 21k
-  #   # "llama3.3-70b|1 ; superoffload_mem|recomp|ligerloss1 ; 12000|8|1 ; none|false|false|false|false|false" # G-OOM 13k
-  #   # "llama4-scout|1 ; superoffload_mem|recomp|ligerloss1 ; 8000|8|1 ; none|false|false|false|false|false" # G-OOM 9k
-  #   # "q2.5-32b|1 ; superoffload_mem|recomp|ligerloss1 ; 21000|8|1 ; none|false|false|false|false|false" # G-OOM 22k
-  #   # "q2.5-72b|1 ; superoffload_mem|recomp|ligerloss1 ; 12000|8|1 ; none|false|false|false|false|false" # G-OOM 13k
-  # )
-  RUNS=(
-    "q3-30b-a3b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 120000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
-    "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 120000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
-
-    "q3-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 53000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
-    "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 5300|8|1 ; none|false|false|false|false|false" # G-OOM 81k
-
-    # "q3-30b-a3b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
-    # "q3-30b-a3b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
-    # "q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 80000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
-
-    # "q3-32b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 49000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
-    # "q3-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 49000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
-    # "q3-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 49000|8|1 ; none|false|false|false|false|false" # G-OOM 81k
-
-    # "llama3.3-70b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
-    # "llama3.3-70b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
-    # "llama3.3-70b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 46k
-
-    # "llama4-scout|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
-    # "llama4-scout|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
-    # "llama4-scout|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 9500|8|1 ; none|false|false|false|false|false" # G-OOM 10k
-
-    # "q2.5-32b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
-    # "q2.5-32b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
-    # "q2.5-32b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 50000|8|1 ; none|false|false|false|false|false" # G-OOM 51k
-
-    # "q2.5-72b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 41k
-    # "q2.5-72b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 41k
-    # "q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 41k
+  #   # "q2.5-72b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 41k
+  #   # "q2.5-72b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 41k
+  #   # "q2.5-72b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1 ; 32000|8|1 ; none|false|false|false|false|false" # G-OOM 41k
     
-    # "q3.5-35b-a3b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 70000|8|1 ; none|false|false|false|false|false" # fla illegal memory 75k
-    # "q3.5-35b-a3b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 70000|8|1 ; none|false|false|false|false|false" # fla illegal memory 75k
-    # "q3.5-35b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 70000|8|1 ; none|false|false|false|false|false" # fla illegal memory 75k
-  )
+  #   # "q3.5-35b-a3b|1 ; superoffload_mem|unsloth-ohbm0|ligerloss1 ; 70000|8|1 ; none|false|false|false|false|false" # fla illegal memory 75k
+  #   # "q3.5-35b-a3b|1 ; superoffload_mem|unsloth-off-ohbm0|ligerloss1 ; 70000|8|1 ; none|false|false|false|false|false" # fla illegal memory 75k
+  #   # "q3.5-35b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 70000|8|1 ; none|false|false|false|false|false" # fla illegal memory 75k
+  # )
 fi
 
 # Iterate and parse the rows into scheduler metadata. Each RUNS item remains one scheduled run.
@@ -232,14 +185,14 @@ PRECISION=${PRECISION:-bf16}
 LF_EXPERT_LORA_IMPLS=${LF_EXPERT_LORA_IMPLS:-split-target-parameters}
 
 # Training
-MAX_STEPS=${MAX_STEPS:-3}
-WARMUP_STEPS=${WARMUP_STEPS:-1}
+# MAX_STEPS=${MAX_STEPS:-3}
+# WARMUP_STEPS=${WARMUP_STEPS:-1}
 # MAX_STEPS=${MAX_STEPS:-6}
 # WARMUP_STEPS=${WARMUP_STEPS:-6}
 # MAX_STEPS=${MAX_STEPS:-7}
 # WARMUP_STEPS=${WARMUP_STEPS:-3}
-# MAX_STEPS=${MAX_STEPS:-1}
-# WARMUP_STEPS=${WARMUP_STEPS:-1}
+MAX_STEPS=${MAX_STEPS:-1}
+WARMUP_STEPS=${WARMUP_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 # LORA_PARAMS is the canonical LoRA knob: sweep tuples, each "dropout|rank|alpha[|target]".
 # Older LORA_DROPOUT/LORA_RANK/LORA_ALPHA knobs still seed the default tuple.
@@ -397,11 +350,7 @@ ASYM_DIR=${ASYM_DIR:-${ROOT}}
 ASYM_QWEN35_FA4_AUTO=${ASYM_QWEN35_FA4_AUTO:-1}
 FLASH_ATTN=${FLASH_ATTN:-auto}
 FA4_ENV_DIR=${FA4_ENV_DIR:-${ASYM_DIR}/.venv-fa4}
-# Canonical qwen3.5 runtime also includes the model-level seq-chunked delta-net
-# (LF model_utils/qwen35_delta_chunk.py; agent/impls/fix_qwen3.5.md §9b): the
-# 16000-token chunk is backend-agnostic, keeps every fla call under the >=75k
-# fault length, and is memory/latency-neutral vs other sizes at these workloads.
-# Explicit QWEN35_DELTA_CHUNK_SIZE (incl. 0 = stock unchunked) overrides.
+# qwen3.5 seq-chunked delta-net keeps fla calls under the >=75k fault length; QWEN35_DELTA_CHUNK_SIZE (incl. 0 = unchunked) overrides.
 QWEN35_DELTA_CHUNK_DEFAULT=${QWEN35_DELTA_CHUNK_DEFAULT:-16000}
 KT_TOOLS_DIR=${KT_TOOLS_DIR:-${ASYM_DIR}}
 KT_REPO_DIR_ENV_SET=${KT_REPO_DIR+x}
@@ -3306,10 +3255,7 @@ run_job() {
   local ASYMM_EXPERT_ACT_OFFLOAD="${ASYMM_EXPERT_ACT_OFFLOAD}" ASYMM_ATTN_ACT_OFFLOAD="${ASYMM_ATTN_ACT_OFFLOAD}" ASYMM_LAYER_ACT_OFFLOAD="${ASYMM_LAYER_ACT_OFFLOAD}" ASYMM_LAYER_GC="${ASYMM_LAYER_GC}" ASYMM_ATTN_SDPA_RECOMPUTE="${ASYMM_ATTN_SDPA_RECOMPUTE}" ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD="${ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD}"
   local ASYM_OFFLOAD_ACT_RECOMPUTE="${ASYM_OFFLOAD_ACT_RECOMPUTE}" ASYM_OFFLOAD_X_UNPACKED="${ASYM_OFFLOAD_X_UNPACKED}"
   local ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD="${ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD}"
-  # Shadow the full-fg branch's fg knobs too: they are assigned inside this function
-  # with :-defaults; without `local` a recomp-off-full-fg row would leak FG_*=1 and
-  # the 192 GiB pool size into every LATER row of the same driver invocation
-  # (e.g. a following expact or unsloth row would inherit them).
+  # local-shadow the fg knobs: a full-fg row must not leak them into later rows
   local ASYMM_QWEN3_MOE_FG_LORA_A_FWD_GPU="${ASYMM_QWEN3_MOE_FG_LORA_A_FWD_GPU:-}" ASYMM_QWEN3_MOE_FG_DA_GPU="${ASYMM_QWEN3_MOE_FG_DA_GPU:-}" ASYMM_QWEN3_MOE_FG_KEEP_DGRADS_HBM="${ASYMM_QWEN3_MOE_FG_KEEP_DGRADS_HBM:-}" ASYM_EXPACT_CPU_POOL_MAX_BYTES="${ASYM_EXPACT_CPU_POOL_MAX_BYTES:-}"
   local ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS="${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}"
   local ASYMM_QWEN3_MOE_ROUTE_MAPPED_GEMM="${ASYMM_QWEN3_MOE_ROUTE_MAPPED_GEMM:-0}"
@@ -3869,6 +3815,14 @@ run_job() {
     ASYM_GEMM_LF_CONFIG_RECOMP_OFF_STAGE="${recomp_off_stage}"
     ASYM_GEMM_LF_CONFIG_USE_UNSLOTH_GC="${use_unsloth_gc}"
     ASYM_GEMM_LF_CONFIG_UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU="${unsloth_recompute_save_on_cpu}"
+    # Provenance mirrors: record the merge-era knobs in the profile JSON (readers are empty-safe).
+    ASYM_GEMM_LF_CONFIG_ASYMM_FG_ELEMENTWISE_CHUNK_MB="${ASYMM_FG_ELEMENTWISE_CHUNK_MB:-}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_LORA_CHUNK="${ASYMM_ATTN_ACT_LORA_CHUNK:-}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_DOWN_DX_STAGED="${ASYMM_QWEN3_MOE_DOWN_DX_STAGED:-}"
+    ASYM_GEMM_LF_CONFIG_ASYM_SAVED_TENSOR_ASYNC_UNPACK="${ASYM_SAVED_TENSOR_ASYNC_UNPACK:-}"
+    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_FG_RELEASE_FUSED_HOME="${ASYMM_QWEN3_MOE_FG_RELEASE_FUSED_HOME:-}"
+    ASYM_GEMM_LF_CONFIG_ASYM_EMPTY_CACHE_PHASES="${ASYM_EMPTY_CACHE_PHASES:-}"
+    ASYM_GEMM_LF_CONFIG_QWEN35_DELTA_CHUNK_SIZE="${job_qwen35_delta_chunk:-${QWEN35_DELTA_CHUNK_SIZE:-}}"
     ASYM_GEMM_LF_CONFIG_UNSLOTH_GC_OUTER_HBM_EVERY_N="${UNSLOTH_GC_OUTER_HBM_EVERY_N}"
     ASYM_GEMM_LF_CONFIG_ASYMM_EXPERT_SILU_BWD_GPU="${ASYMM_EXPERT_SILU_BWD_GPU}"
     ASYM_GEMM_LF_CONFIG_ASYM_CPU_ADAMW_GRAD_OFFLOAD="${grad_offload}"
@@ -3884,18 +3838,6 @@ run_job() {
 	    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_FG_DA_GPU="${ASYMM_QWEN3_MOE_FG_DA_GPU:-}"
 	    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_FG_KEEP_DGRADS_HBM="${ASYMM_QWEN3_MOE_FG_KEEP_DGRADS_HBM:-}"
 	    ASYM_GEMM_LF_CONFIG_ASYM_EXPACT_CPU_POOL_MAX_BYTES="${ASYM_EXPACT_CPU_POOL_MAX_BYTES:-}"
-	    ASYM_GEMM_LF_CONFIG_ASYMM_FG_ELEMENTWISE_CHUNK_MB="${ASYMM_FG_ELEMENTWISE_CHUNK_MB:-}"
-	    ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_LORA_CHUNK="${ASYMM_ATTN_ACT_LORA_CHUNK:-}"
-	    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_DOWN_DX_STAGED="${ASYMM_QWEN3_MOE_DOWN_DX_STAGED:-}"
-	    # Without this the knob still WORKS (run_cmd=(env) has no -i, so an exported bare
-	    # var is inherited) but _env_config() only harvests ASYM_GEMM_LF_CONFIG_*, so the
-	    # profile JSON never recorded whether async unpack was on for a given D4 A/B row.
-	    ASYM_GEMM_LF_CONFIG_ASYM_SAVED_TENSOR_ASYNC_UNPACK="${ASYM_SAVED_TENSOR_ASYNC_UNPACK:-}"
-	    # Same provenance treatment for the remaining merge-era knobs (readers are all
-	    # empty-safe: empty means "default", never "off").
-	    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_FG_RELEASE_FUSED_HOME="${ASYMM_QWEN3_MOE_FG_RELEASE_FUSED_HOME:-}"
-	    ASYM_GEMM_LF_CONFIG_ASYM_EMPTY_CACHE_PHASES="${ASYM_EMPTY_CACHE_PHASES:-}"
-	    ASYM_GEMM_LF_CONFIG_QWEN35_DELTA_CHUNK_SIZE="${job_qwen35_delta_chunk:-${QWEN35_DELTA_CHUNK_SIZE:-}}"
 	    ASYM_GEMM_LF_CONFIG_ASYM_GEMM_DISPATCH="${ASYM_GEMM_DISPATCH:-}"
 	    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM="${ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM:-}"
 	    ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM="${ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM:-}"
