@@ -48,6 +48,86 @@ python -m sglang.launch_server \
     --mem-fraction-static 0.25
 ```
 
+### Unified CPU + GPU MoE in SGLang (experimental)
+
+The unified MoE kernel turns the host CPU into a second compute engine
+instead of just a weight store. Expert weights are quantized to INT8 once at
+load time and kept pinned in host RAM (no VRAM copy); on every forward each
+expert is dispatched by its routed token count — small experts run on the CPU
+(Intel AMX INT8) while large experts run on the GPU (SM90 INT8 grouped
+kernel, streaming weights over PCIe via TMA). The two buckets execute
+concurrently, so a large MoE model runs in a fraction of the VRAM with the
+CPU absorbing the long tail of lightly-routed experts.
+
+**Why environment variables?** This is an experimental feature. While it
+stabilizes, it is configured entirely through `SGLANG_ASYMGEMM_UNIFIED_*`
+environment variables so the existing `asym_gemm` backend, its CLI surface,
+and its default behavior stay completely untouched — with the variables unset,
+nothing changes. Once the feature matures, these knobs will migrate to proper
+`sglang.launch_server` CLI options.
+
+Requirements: an SM90 (Hopper) GPU, an x86 host with Intel AMX-INT8
+(Sapphire Rapids or newer), a gated-SiLU MoE model whose hidden and
+intermediate sizes are multiples of 128, and no expert parallelism
+(`--ep-size 1`). If any prerequisite is missing, SGLang logs the reason and
+falls back to the regular `asym_gemm` path.
+
+```bash
+# Enable the unified CPU + GPU MoE path (BF16 checkpoint,
+# quantized to INT8 online at load time)
+export SGLANG_ASYMGEMM_UNIFIED_MOE=1
+
+python -m sglang.launch_server \
+    --model Qwen/Qwen3-Coder-30B-A3B-Instruct \
+    --moe-runner-backend asym_gemm \
+    --mem-fraction-static 0.25
+```
+
+Online INT8 quantization is a per-expert loop over every MoE layer and can
+dominate startup on large models. To skip it, convert the checkpoint offline
+once (byte-identical to online quantization) and point the server at the
+result:
+
+```bash
+# One-time offline conversion
+python scripts/convert_int8_weights.py \
+    --input-path /models/Qwen3-Coder-30B-A3B-Instruct \
+    --output     /models/Qwen3-Coder-30B-A3B-Instruct-asymint8
+
+export SGLANG_ASYMGEMM_UNIFIED_MOE=1
+export SGLANG_ASYMGEMM_UNIFIED_INT8_PATH=/models/Qwen3-Coder-30B-A3B-Instruct-asymint8
+
+python -m sglang.launch_server \
+    --model /models/Qwen3-Coder-30B-A3B-Instruct \
+    --moe-runner-backend asym_gemm \
+    --mem-fraction-static 0.25
+```
+
+The offline path is required for block-scaled FP8 checkpoints, which cannot
+be quantized to INT8 online — pass `--input-type fp8` to the converter.
+
+| Environment variable | Default | Meaning |
+|----------------------|---------|---------|
+| `SGLANG_ASYMGEMM_UNIFIED_MOE` | `0` | Master switch. `1` enables the unified CPU + GPU MoE path for the `asym_gemm` backend. Off, the existing paths are untouched. |
+| `SGLANG_ASYMGEMM_UNIFIED_M_CPU` | `16` | Per-expert dispatch threshold: experts with ≤ this many routed tokens run on the CPU AMX bucket, the rest on the GPU INT8 grouped kernel. Raise it to shift more work to the CPU. |
+| `SGLANG_ASYMGEMM_UNIFIED_CPU_THREADS` | `0` | Total worker threads for the CPU bucket. One process-wide pool is shared by all MoE layers (read once when the first layer is built). `0` = use all hardware threads. |
+| `SGLANG_ASYMGEMM_UNIFIED_INT8_PATH` | unset | Directory of pre-quantized INT8 expert weights from `scripts/convert_int8_weights.py`. When a matching `layer_{id}.safetensors` exists, the layer loads it directly instead of quantizing online; any missing file or shape mismatch falls back to online quantization. Empty = always quantize online. |
+
+The lower-level `ASYMGEMM_*` runtime knobs (HBM expert caching, NUMA thread
+placement, expert routing stats, …) also apply — see the
+[environment variable reference](API.md#environment-variables).
+
+Notes:
+
+- Piecewise (prefill) CUDA graph capture is automatically disabled when the
+  unified path is on; decode CUDA graphs work normally via pre-allocated
+  capturable buffers.
+- After conversion the BF16/FP8 master weights are released to reclaim host
+  memory; the unified layer serves every forward for converted layers.
+- Layers that cannot be converted (shape constraints, unsupported config)
+  keep their master weights and continue on the existing `asym_gemm` path —
+  check the server log for per-layer `AsymGEMM unified MoE:` messages.
+
 ## Standalone Usage
 
 ### Asymmetric BF16 GEMM (SM90 / SM100, weights in CPU DRAM)
