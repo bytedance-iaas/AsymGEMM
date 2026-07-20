@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os as _os_early
+
+_os_early.environ.setdefault("TOKENIZERS_PARALLELISM", "true")  # fast-path batch encodes use all cores
 import fcntl
 import os
 import csv
@@ -347,6 +350,25 @@ def _sample_split(
     return records, lengths, skipped
 
 
+def _batch_token_lengths(tokenizer: Any, texts: list[str], chunk_rows: int = 64) -> list[int]:
+    """True token length of each text via the fast tokenizer's Rust-parallel batch encode.
+
+    One batched call per chunk uses all cores (TOKENIZERS_PARALLELISM), vs the legacy
+    one-row-at-a-time encode that made 1M-token-row builds take ~50 min. len(Encoding)
+    avoids materializing the id lists in Python. Chunked to bound resident memory.
+    """
+    backend = getattr(tokenizer, "backend_tokenizer", None) or getattr(tokenizer, "_tokenizer", None)
+    lengths: list[int] = []
+    if backend is not None:
+        for start in range(0, len(texts), chunk_rows):
+            encodings = backend.encode_batch(texts[start : start + chunk_rows], add_special_tokens=False)
+            lengths.extend(len(encoding) for encoding in encodings)
+        return lengths
+    for text in texts:  # slow tokenizer fallback: legacy behavior
+        lengths.append(len(tokenizer.encode(text, add_special_tokens=False)))
+    return lengths
+
+
 def _concat_split(
     dataset_name: str,
     config: str,
@@ -362,7 +384,127 @@ def _concat_split(
 
     Every position is a real token (so MoE routing stays realistic) and rows train as one sequence
     under a normal causal mask, so this faithfully mimics long-context memory without long source rows.
+
+    FAST PATH (2026-07-19, output-identical): row assembly (rng stream, per-conv count cache,
+    dup-id regeneration) is byte-for-byte the legacy logic; only the per-row full-text
+    verification encode is deferred and batched (_batch_token_lengths). If any row lands under
+    cutoff_len (never happens at overshoot>=1.02: junction merges cost ~1 tok per ~700-tok
+    segment vs a 2% margin), we discard and rerun the WHOLE split with the legacy sequential
+    algorithm so the emitted rng-dependent content matches the legacy builder exactly.
     """
+    fast_records, fast_lengths, fast_info = _concat_split_fast(
+        dataset_name, config, split, count, seed, tokenizer, cutoff_len, overshoot, set(used_ids)
+    )
+    if fast_records is not None:
+        used_ids.update(record["id"] for record in fast_records)
+        return fast_records, fast_lengths, fast_info
+    print(f"[concat] fast path bailed (safety loop needed) — legacy sequential rebuild of {split}")
+    return _concat_split_legacy(
+        dataset_name, config, split, count, seed, tokenizer, cutoff_len, overshoot, used_ids
+    )
+
+
+def _concat_split_fast(
+    dataset_name: str,
+    config: str,
+    split: str,
+    count: int,
+    seed: int,
+    tokenizer: Any,
+    cutoff_len: int,
+    overshoot: float,
+    used_ids: set[str],
+) -> tuple[list[dict[str, Any]] | None, list[int], dict[str, Any]]:
+    dataset = load_dataset(dataset_name, config, split=split)
+    rng = random.Random(seed)
+
+    pool: list[list[dict[str, str]]] = []
+    for row in dataset:
+        conversations, _ = _normalize_messages(row)
+        if conversations:
+            pool.append(conversations)
+    if not pool:
+        raise RuntimeError(f"no valid conversations in {dataset_name}/{config}:{split} to concat")
+
+    indices = list(range(len(pool)))
+    target = max(cutoff_len + 1, int(cutoff_len * overshoot))
+    tok_cache: dict[int, int] = {}
+
+    def _conv_tokens(pool_idx: int) -> int:
+        if pool_idx not in tok_cache:
+            tok_cache[pool_idx] = len(
+                tokenizer.encode(_record_text({"conversations": pool[pool_idx]}), add_special_tokens=False)
+            )
+        return tok_cache[pool_idx]
+
+    # Phase A — assembly, identical rng consumption to the legacy loop (cheap picks, then
+    # the dup-id regeneration which never inspects true lengths).
+    merged_rows: list[list[dict[str, str]]] = []
+    row_ids: list[str] = []
+    segments: list[int] = []
+    for _ in range(count):
+        while True:
+            merged: list[dict[str, str]] = []
+            approx = 0
+            n_seg = 0
+            while approx < target:
+                pick = rng.choice(indices)
+                merged += pool[pick]
+                approx += _conv_tokens(pick)
+                n_seg += 1
+            record_id = _stable_id(merged)
+            if record_id not in used_ids:
+                break
+        merged_rows.append(merged)
+        row_ids.append(record_id)
+        segments.append(n_seg)
+        used_ids.add(record_id)
+
+    # Phase B — the expensive verification encodes, batched and parallel.
+    texts = [_record_text({"conversations": merged}) for merged in merged_rows]
+    lengths = _batch_token_lengths(tokenizer, texts)
+    if any(length < cutoff_len for length in lengths):
+        return None, [], {}  # legacy safety loop required — caller reruns sequentially
+
+    records: list[dict[str, Any]] = []
+    for merged, record_id, n_seg, token_length in zip(merged_rows, row_ids, segments, lengths):
+        records.append(
+            {
+                "id": record_id,
+                "conversations": merged,
+                "system": "",
+                "source": dataset_name,
+                "source_config": config,
+                "source_split": split,
+                "concat_segments": n_seg,
+                "token_length": token_length,
+                "truncated_by_cutoff": token_length > cutoff_len,
+            }
+        )
+    info = {
+        "mode": "concat",
+        "pool_size": len(pool),
+        "source_rows": len(dataset),
+        "target_tokens": target,
+        "seed": seed,
+        "segments_min": min(segments),
+        "segments_avg": mean(segments),
+        "segments_max": max(segments),
+    }
+    return records, lengths, info
+
+
+def _concat_split_legacy(
+    dataset_name: str,
+    config: str,
+    split: str,
+    count: int,
+    seed: int,
+    tokenizer: Any,
+    cutoff_len: int,
+    overshoot: float,
+    used_ids: set[str],
+) -> tuple[list[dict[str, Any]], list[int], dict[str, Any]]:
     dataset = load_dataset(dataset_name, config, split=split)
     rng = random.Random(seed)
 

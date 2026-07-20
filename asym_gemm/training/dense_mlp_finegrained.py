@@ -120,17 +120,41 @@ def _lora_b_forward(low_rank: torch.Tensor, b: torch.Tensor, *, scale: float) ->
     return out.mul(float(scale)) if float(scale) != 1.0 else out
 
 
+def _fused_lora_addmm_enabled() -> bool:
+    """C2 elementwise diet (agent/impls/fix_asym.md S2/S0'): fuse `dest += (x@W)*scale`
+    into a single addmm_ epilogue instead of matmul -> scale-mul -> cast -> add_ (two
+    extra full-width elementwise sweeps + a [M,out] temp per call; the launch-bound
+    elementwise_kernel bucket). alpha applies in fp32 accumulation — numerics-touching
+    (slightly BETTER rounding), so flag-gated. Default off = pre-fix behavior."""
+    value = os.environ.get("ASYMM_FUSED_LORA_ADDMM")
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _add_lora_b_delta_(dest: torch.Tensor, low_rank: torch.Tensor, b: torch.Tensor, *, scale: float) -> None:
     """dest += (low_rank @ b^T) * scale without materializing a full-width delta:
     the [M, out] product is the same size as dest (20 GB-class at long seq), so
     compute and add it in row chunks."""
     rows = int(dest.shape[0])
+    fused = (
+        _fused_lora_addmm_enabled()
+        and dest.dim() == 2
+        and low_rank.dim() == 2
+        and dest.dtype == low_rank.dtype == b.dtype
+    )
     chunk = fg_chunk_rows(rows, int(dest.shape[1]), dest.element_size())
     if chunk <= 0:
+        if fused:
+            dest.addmm_(low_rank, b.t(), alpha=float(scale))
+            return
         dest.add_(_lora_b_forward(low_rank, b, scale=scale).to(dtype=dest.dtype))
         return
     for row_start in range(0, rows, chunk):
         row_end = min(rows, row_start + chunk)
+        if fused:
+            dest[row_start:row_end].addmm_(low_rank[row_start:row_end], b.t(), alpha=float(scale))
+            continue
         delta = _lora_b_forward(low_rank[row_start:row_end], b, scale=scale)
         dest[row_start:row_end].add_(delta.to(dtype=dest.dtype))
         del delta

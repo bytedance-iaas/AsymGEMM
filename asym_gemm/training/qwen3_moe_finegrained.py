@@ -157,6 +157,16 @@ def _fg_keep_dgrads_hbm_enabled() -> bool:
     return _env_flag_default_off("ASYMM_QWEN3_MOE_FG_KEEP_DGRADS_HBM")
 
 
+def _fg_reuse_packed_x_enabled() -> bool:
+    """F-A (agent/impls/fix_asym.md twin-trace diff): under keep-acts-HBM the forward
+    builds the route-space packed X ([R,H]) once and frees it; backward dA then
+    re-gathers it per group-chunk (index_select — the +14.9 us/tok index bucket vs sup).
+    Keep the packed tensor via the HBM-keep manager (layer-scoped LIFO) and slice it in
+    _grouped_da_gpu instead. Only engaged when NOT input_weighted (the forward mul_
+    would otherwise leave a weighted copy while dA needs unweighted X). Default off."""
+    return _env_flag_default_off("ASYMM_QWEN3_MOE_FG_REUSE_PACKED_X")
+
+
 def _fg_down_dx_staged_enabled() -> bool:
     """Down base dx via a per-layer-backward HBM stage of the packed down weight
     (~400 MB H2D ≈ 1 ms) + per-expert resident mms inside the blocked down
@@ -253,8 +263,10 @@ def _grouped_da_gpu(
     num_experts: int,
     out_dtype: torch.dtype,
     chunks: int = 8,
+    packed_rows: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """dA[E,r,H] = sum_e dS_e^T @ X_e with X re-gathered on GPU per group-chunk."""
+    """dA[E,r,H] = sum_e dS_e^T @ X_e with X re-gathered on GPU per group-chunk
+    (or sliced from the forward's kept packed X under F-A, see _fg_reuse_packed_x_enabled)."""
     from .qwen3_moe import _grouped_lora_weight_grads_torch
 
     groups = max(int(offsets.numel()) - 1, 0)
@@ -262,10 +274,14 @@ def _grouped_da_gpu(
     grad_a = None
     for row_start, row_end, block_offsets, block_expert_ids, row_slice in _expert_blocks(offsets, experts, block_experts):
         block_metadata = prepare_grouped_lora_metadata(block_offsets, block_expert_ids, dense_experts=True)
-        x_rows = x_compact.index_select(
-            0,
-            token_indices[row_slice].to(device=x_compact.device, dtype=torch.long, non_blocking=True),
-        )
+        if packed_rows is not None:
+            # F-A: route-space rows kept from forward — slice view, no re-gather.
+            x_rows = packed_rows[row_start:row_end]
+        else:
+            x_rows = x_compact.index_select(
+                0,
+                token_indices[row_slice].to(device=x_compact.device, dtype=torch.long, non_blocking=True),
+            )
         if input_weighted:
             x_rows = x_rows * routing_weights[row_slice].reshape(-1, 1).to(device=x_rows.device, dtype=x_rows.dtype)
         part = _grouped_lora_weight_grads_torch(
@@ -721,6 +737,16 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                 if input_weighted:
                     packed.mul_(routing_weights.reshape(-1, 1).to(device=packed.device, dtype=packed.dtype))
 
+        x_packed = None
+        if (
+            packed is not None
+            and keep_acts_hbm
+            and da_gpu
+            and not input_weighted
+            and _fg_reuse_packed_x_enabled()
+        ):
+            # F-A: keep the route-space packed X for backward dA (HBM-keep handle op).
+            x_packed = manager.offload(packed, "moe.Xp")
         with prof_range(layer._forward_range("moe_finegrained", "x_to_cpu")):
             if da_gpu:
                 x_cpu = manager.offload(hidden_states.detach().contiguous(), "moe.X")
@@ -1037,6 +1063,7 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
         ctx.x_compact = bool(da_gpu)
         ctx.keep_acts_hbm = bool(keep_acts_hbm)
         ctx.x_cpu = x_cpu
+        ctx.x_packed = x_packed
         ctx.gate_cpu = gate_cpu
         ctx.up_cpu = up_cpu
         ctx.act_cpu = act_cpu
@@ -1734,6 +1761,7 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                             input_weighted=bool(getattr(ctx, "input_weighted", False)),
                             num_experts=int(gate_lora_A.shape[0]),
                             out_dtype=gate_lora_A.dtype,
+                            packed_rows=(ctx.x_packed.tensor if getattr(ctx, "x_packed", None) is not None else None),
                         )
                     else:
                         manager.wait_cpu_ready_host(ctx.x_cpu)
@@ -1827,6 +1855,7 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                             input_weighted=bool(getattr(ctx, "input_weighted", False)),
                             num_experts=int(up_lora_A.shape[0]),
                             out_dtype=up_lora_A.dtype,
+                            packed_rows=(ctx.x_packed.tensor if getattr(ctx, "x_packed", None) is not None else None),
                         )
                         manager.release_stage(x_stage, drop_cache=True)
                         x_stage = None
@@ -1901,6 +1930,9 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     grad_hidden_lora = None
 
             manager.release_cpu(ctx.x_cpu)
+            if getattr(ctx, "x_packed", None) is not None:
+                manager.release_cpu(ctx.x_packed)
+                ctx.x_packed = None
             if grad_packed is not None:
                 grad_packed = grad_packed.to(dtype=ctx.input_dtype)
                 with prof_range(layer._forward_range("moe_finegrained_backward", "pack_grad")):

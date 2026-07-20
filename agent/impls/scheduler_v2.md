@@ -354,3 +354,201 @@ vs the 2026-07-12 bank, NOT a regression. Relationship + ordering unchanged.
 |---|---|---|---|---|---|
 | q3-32b @65k ker000 ohbm8      | 154.2 | 166.8 | 882 GB | 1281 | FITS (record C-OOM ~66k) |
 | q3-30b-a3b @174k ker101 ohbm16 | 153.6 | 170.9 | 825 GB | 878  | FITS (record 172k max-OK / G-OOM 188k) |
+
+---
+
+## 8. THE FULL-RANGE WORKLOAD SCHEDULER (v3, 2026-07-18) — regimes as OUTPUTS, never branches
+
+§4's solver picks knobs GIVEN a config family. v3 closes the remaining gap the user named:
+selection must span BACKEND FAMILIES too (superoffload fallback included), and the
+fast/batch/ultra "modes" must EMERGE from one pricing computation — an `if seq > X use asym`
+lookup is exactly what this section forbids. Pricing data: the c14 deep-end campaign
+(agent/impls/s04-p1-dgx-02-c14/test_throughput_results.md) + §3b/§7 anchors.
+
+### 8.1 Measured primitives (all falsifiable, all re-fittable from probes)
+
+```text
+FAMILIES f (each = one backend + its class-1 set; asym additionally carries the §3 dial):
+  F1 sup-unsloth  = superoffload_mem|unsloth-ohbm0     F2 sup-recomp = superoffload_mem|recomp
+  F3 asym-L{0..3} = asym_cpuadamwds|recomp-off-full-fg + dial rungs (κ, ker, dispatch)
+CAPACITY  M_f(s,B) = base_f + B·ps_f(s) + bend(M̂) ; ps_f(s) = slope_f·s   [affine, §2.3]
+  measured slopes (GiB per 1k seq per sample), q3-30b: F1 0.286 (base 4.4) · F2 0.4675
+  (base ~0) · F3-L3 0.348 resv / 0.222 alloc (base ~10; resv−alloc gap = fragmentation
+  surcharge, §6-gap-2; GPU-pool build would collapse it to the alloc line)
+  bend(M̂): −3..−5 GiB when M̂ ∈ [phys−15k·slope, phys] (measured 3×: 181.3 vs 186.4 pred;
+  181.4 vs 184.7; walls under-predict) ⇒ predictions within 5 GiB of phys are COIN-FLIPS,
+  resolved only by probe (WALL-PINNING protocol, throughput_prompt v3).
+THROUGHPUT tok/s_f(s,B) = N / (τ_f(s)·N + c_fix,f)  where N = B·s and
+  τ_f(s) = per-token step cost ≈ a_f + b·s  (b = attention term, SHARED across families —
+  measured: attention kernels bit-parity; a_f = family tax)
+  KNEE LAW (measured, the load-bearing fact): for N ≥ N*_model (q3-30b: ~0.4M tokens;
+  dense: ~6k... trivially exceeded), tok/s is BATCH-FLAT (receipts: asym 1883/1867/1864
+  at b2/b4/b5 @208k; sup MFU 13.3 constant across the whole b1 frontier). Below N*, batch
+  buys throughput (receipts: §3b L3 @120k×8 = 23% over sup; §7a 80k×8 asym 3642 vs sup ~3424).
+EDGE PENALTY  M̂/phys ∈ (0.92, 0.98] ⇒ ×(1+ε), ε measured 0–6% (0.0 @95%, +3% @98% deep-b1;
+  +5.9% @98% b2) ; M̂/phys > 0.98 ⇒ INFEASIBLE (OOM or bend-coin-flip — never emitted).
+WALLS (measured, q3-30b): F2 dead > 392k–400k · F1 dead > 640k–660k · F3 ≥ 800k healthy.
+```
+
+### 8.2 The decision procedure (the entire scheduler — no seq-keyed branches anywhere)
+
+```text
+schedule(model, s, B_H, B_D, β_H):
+1  for every family f and B ∈ {1..B_cap}:            # candidate grid, closed-form
+2      M̂ = M_f(s,B); skip if M̂/phys > 0.98 or D_f(s,B) > B_D − m_D     # health filter
+3      t̂ = tok/s_f(s,B) × edge_penalty(M̂)            # knee law inside tok/s_f
+4  x* = argmax t̂ ; ties (< run-noise 1.5%) → min M̂    # β_H prices the tie-break
+5  asym families additionally run §4's knob admission at (s, B*) — the dial nests here
+6  EMIT (backend, B*, knob set) + predicted (M̂, t̂) as the probe hypothesis
+7  one §5 probe validates; |measured − predicted| > tolerance ⇒ re-fit that family's
+   affine coefficients and re-emit (this loop is how the scheduler LEARNS; the 320k bend
+   and the 600k anomaly were both caught exactly here)
+```
+
+Fallback is now a THEOREM, not a branch: wherever F1/F2's t̂ is argmax, the scheduler
+EMITS superoffload — baseline preserved by construction, byte-identical config. Wherever
+asym's t̂ wins, it emits asym. No code path ever asks "which seq is this".
+
+### 8.3 What the procedure OUTPUTS today (q3-30b worked example — derived, not designed)
+
+```text
+s ≤ ~130k   N=B_max·s spans the knee ⇒ batch is a live lever ⇒ F3-L3's leaner ps admits
+            more B below 92% — argmax = ASYM-LATENCY (receipts: 80k×8 +6% vs sup; 120k×8
+            +23%; ALSO strictly-dominating sup-unsloth-off everywhere, §3b REF).
+            This is the user's "fast mode": it does NOT fall back at short s — it WINS there,
+            and every sup 98%-THRASH row (16k b40 ×1.6, 32k b20 ×1.68, 64k b10 ×1.59) is
+            auto-rejected by the health filter and REPLACED by an asym larger-batch point
+            at ≤92% — "accommodate the thrashing setting with more batch", formalized.
+~160k–600k  N ≥ knee ⇒ batch-flat ⇒ argmax = min-τ family = F1 sup-unsloth at HEALTHY B_max
+            (pre-S-mem-fix τ_asym = τ_sup + 143 us/tok backward tax, fix_asym.md §0).
+            The scheduler emits the SUP FALLBACK here — including choosing b1 over the
+            b2-edge at 320k (1436 > 1355·: the edge row is dominated and never emitted).
+            F2 recomp is never argmax while F1 fits (τ ≈ equal, wall earlier) but stays
+            the RSS-arbitrage pick (−175 GB host) under β_D.
+640k        F1's edge: parity (732 vs 731) — tie-break → min M̂ ⇒ ASYM (60% vs 98%).
+> 660k      F1/F2 infeasible ⇒ argmax over feasible set = ASYM (800k: 597 tok/s @80%) —
+            the user's "ultimate memory mode", reached with zero mode-specific logic.
+POST-FIX    when fix_asym S-mem lands (−120 us/tok), τ_asym ≤ τ_sup ⇒ the middle window
+            re-prices to asym AUTOMATICALLY — no scheduler edit; that is the design's point.
+POST-FIX MEASURED (2026-07-18, five fixes shipped — see fix_asym.md §5a): the middle
+            window NARROWED but did not flip: asym now −1.5% @480k (975 vs 990) and
+            −3.9% dense @128k (1067 vs 1110). The procedure still emits SUP FALLBACK in
+            160-600k (correct: baseline preserved), asym everywhere else. User ruling:
+            fix loop closed; fallback covers the residual sliver. The boundaries above
+            re-derive automatically if future fixes (D2H overlap, dX index, M-prefetch)
+            change τ_asym.
+```
+
+### 8.4 Iteration protocol until convergence (standing)
+
+1. Every emitted decision carries its predicted (M̂, t̂); every probe that disagrees beyond
+   tolerance re-fits ONE family's coefficients (never hand-edits a boundary).
+2. New knobs/fixes enter as price-vector updates (S-mem ⇒ Δa_F3; GPU-pool ⇒ kill the
+   fragmentation surcharge ⇒ ps_F3 drops to the alloc line ⇒ +1–3 B at fixed s).
+3. The regime table (8.3) is REGENERATED from the procedure after every re-fit; it is a
+   REPORT, never an input.
+4. Open builds ranked by expected frontier motion: S-mem fix (flips the middle window) >
+   GPU-side buffer pool (batch at the edge) > D5 W-cache > D6 GC-off tier.
+```
+
+---
+
+## 9. THE UNIFIED FORMULA (v3.1, 2026-07-19) — one scalar dial β over families AND modes
+
+Answering "can the mode decisions fold into one principled formula with a continuous
+latency↔memory knob?" — YES; it is one argmax with one price, and every constant in it
+is measured. (β_H from §0 was always this; §9 instantiates it end-to-end with the c14 data.)
+
+### 9.1 The objective (everything is a config x = (backend family f, batch B, knob set κ))
+
+```text
+x*(model, s; β) = argmax_x  U(x) = tok/s_x(s,B)  −  β · M_x(s,B)
+                  s.t.      M_x(s,B) ≤ (1−h)·C            (health filter)
+tok/s_x(s,B) = N / (c_fix,x + N·τ_x(s)) · edge(u)          N = B·s tokens/step
+τ_x(s) = a_x + b_x·s        (per-token step cost; a = family/mode tax, b ≈ attention)
+M_x(s,B) = base_x + B·m_x·s (affine capacity; near-wall bend −3..−5 GiB, coin-flip band)
+edge(u) = 1 / (1+ε(u)),  ε = 0 below u=0.92, 0–6% for u∈(0.92,0.98], ∞ above 0.98
+```
+
+β IS the dial (units: tok/s sacrificed per GiB retained). β→0⁺ = pure latency profile;
+β→∞ = pure memory profile; the profile is CONTINUOUS in β. Family fallback is not a rule:
+sup is simply the argmax when its U is highest — measured 160–600k pre-fix window.
+
+### 9.2 Measured constants (q3-30b b1 deep-end fits; s in 1k tokens; C_eff=181)
+
+```text
+family/mode   τ(s) us/tok        M(s,1) GiB          b1 wall (pred → measured)
+asym-lat      126 + 1.937·s      4.3 + 0.179·s       987k  → (unprobed; 800k healthy ✓)
+sup-unsloth   −63 + 2.236·s      19.9 + 0.253·s      638k  → (640k, 660k] ✓
+sup-recomp     62 + 1.995·s      4.1 + 0.452·s       391k  → (392k, 400k] ✓
+asym-mem      ~3× asym-lat a-tax  ~5 + 0.119·s       1477k → (174k×8 anchor ✓)
+knee: N* ≈ 0.4M tokens (below: batch is a live lever; above: tok/s batch-flat)
+```
+
+The walls, the 640k parity point, the tax dilution (−10.3%→−4.2%→+0.1%), and the 640k
+tie-break-to-lean are all THEOREMS of these five lines — none is hand-coded.
+
+### 9.3 Why the user's desideratum is the DEFAULT output (β ≈ 1–3 tok/s/GiB)
+
+```text
+mid seqs   (s < s_par): argmax = min-τ family that fits = sup → PARITY BY CONSTRUCTION
+                        (post-fix asym within −1.5..−3.9%; fallback covers the sliver)
+s_par ≈ where (a_asym − a_sup) / τ(s) < run noise → parity onset (measured ≈ 600–640k;
+                        every asym fix moves a_asym down ⇒ s_par moves LEFT automatically)
+long       (s_par…wall_sup): asym wins U outright: equal tok/s at 40+ GiB less M
+ultra      (wall_sup…987k): asym-lat is the only feasible x → sole coverage (800k ✓)
+ultra-ultra(987k…~1.5M):    the β·M term + feasibility slide κ down the ρ-ladder →
+                        asym-mem emitted WITHOUT any mode-switch rule (see 9.4)
+```
+
+### 9.4 The mode dial inside asym = the same β against the measured ρ-ladder
+
+Each knob k has exchange rate ρ_k = Δtok/s_k / ΔM_k (its price, conditional in admission
+order; §3b): staged 9.2 → ker000 0.90 → keep-acts 0.87 [s/GiB @120k×8 anchor]. Admit k iff
+ρ_k ≥ β AND the fit constraint still holds. Because every ΔM_k ∝ N, at fixed β the
+admitted set SHRINKS as s grows: lat (all knobs) → balanced (staged only) → mem (none) —
+the "mode" is the tail of the admitted ladder, sliding continuously with s. One β, no
+mode enum, no if-else. Graded per-layer keep-acts (D3-graded, designed) makes the
+staircase fully continuous when built.
+
+### 9.5 Tuning recipe (the hyperparameters, all four) — ⚠ INTERFACE REVISED 2026-07-19:
+β is INTERNAL ONLY. The user-facing contract is the BUDGET FORM — hbm_budget (GiB/%) +
+safety {conservative,normal,aggressive} — see agent/handoffs/prompt.md (supersedes this
+subsection as the user contract; the math below is unchanged, budget-greedy ≡ β-sweep
+by duality).
+
+```text
+β    the profile dial: 0⁺ speed-first (rides edges) · 1–3 DEFAULT (lean tie-breaks;
+     today's behavior) · ≫10 memory-first (lexicographic min-M)
+h    headroom: 0.02 aggressive · 0.08 conservative (moves every wall/boundary in-out)
+N*   knee (per model): sets where batch stops mattering
+fits (a, b, base, m) per family: 2 probes each to (re)fit; probe-vs-predict mismatch
+     > tolerance ⇒ refit that family only (the §8 learning loop)
+```
+
+Verdict: NOT too hard — the continuous knob exists (β), the thresholds are measured
+crossings (s_par, walls, ρ-ladder), the staircase discreteness is the only honest gap
+(4 rungs today; graded-κ closes it), and the whole c14 campaign is the formula's
+validation set: every boundary it predicts was independently measured within one probe.
+
+---
+
+## 10. DESIGN RECORD MAP (2026-07-20) — this doc + three satellites = the full record
+
+THIS FILE = the formulation of record (§0–7 dial, §8 families/fallback, §9 unified
+formula + constants). The remainder lives in:
+- **agent/handoffs/prompt.md** — interface evolution + FINAL FORM: v1 budget → **v2
+  ALLOCATION/WATER-FILL (current: no user knob; batch+residency compete per
+  marginal Δtok/s per GiB; modes = emergent labels)** → v3 hardware-agnosticity
+  (mode selection = byte thresholding from model arch + device capacity; timing =
+  optional 2-probe calibration of the fallback boundary only) + GPU validation log.
+- **scripts/lf/asym_scheduler.py** — executable spec: fitted constants, water-fill,
+  --sweep (regime table generator), --selftest (5 machine-checked cleanness
+  properties: nested shedding, reverse-ρ shed order, monotone tok/s, reserved-HBM
+  nesting, safety monotonicity).
+- **agent/impls/s04-p1-dgx-02-c14/system_summary.md** — tier definitions (T1/T2/T3
+  flag sets + measured prices), defensibility notes (what to claim vs downplay);
+  **test_throughpout_v2.md** — the crossover-point evidence (P1–P5 + 1.6M max-seq)
+  behind every constant.
+Paper skeleton = §9 formulas + prompt.md v2/v3 framing + system_summary tiers +
+the P1–P5/walls tables as the evaluation.

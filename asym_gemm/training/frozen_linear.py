@@ -70,6 +70,42 @@ _SINGLE_GROUP_LAUNCH_TENSOR_CACHE: dict[
 ] = {}
 
 
+from collections import OrderedDict as _OrderedDict
+
+_W_PANEL_CACHE: "_OrderedDict[tuple[int, str, torch.dtype], torch.Tensor]" = _OrderedDict()
+_W_PANEL_CACHE_BYTES = 0
+
+
+def _stage_weight_panel(b_cpu: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """F-B (agent/impls/fix_asym.md twin-trace diff): stage-once LRU for frozen weight
+    panels. Measured: 384-MiB expert stacks staged 12x/layer/step (3 parts x 4 uses,
+    918 GiB per 4 steps) while LIFO backward makes the recompute/dX/dA uses temporally
+    adjacent — a few-GB LRU dedupes 3 of the 4. Keyed by data_ptr (weights are frozen).
+    Disabled (pre-fix behavior) when ASYM_W_PANEL_CACHE_GB is unset/0."""
+    global _W_PANEL_CACHE_BYTES
+    non_blocking = b_cpu.device.type == "cpu" and b_cpu.is_pinned()
+    try:
+        cap = int(float(_os.environ.get("ASYM_W_PANEL_CACHE_GB", "0") or "0") * (1 << 30))
+    except ValueError:
+        cap = 0
+    if cap <= 0 or b_cpu.device.type != "cpu":
+        return b_cpu.to(device=device, dtype=dtype, non_blocking=non_blocking)
+    key = (int(b_cpu.data_ptr()), str(device), dtype)
+    hit = _W_PANEL_CACHE.get(key)
+    if hit is not None:
+        _W_PANEL_CACHE.move_to_end(key)
+        return hit
+    staged = b_cpu.to(device=device, dtype=dtype, non_blocking=non_blocking)
+    nbytes = int(staged.numel() * staged.element_size())
+    if nbytes <= cap:
+        _W_PANEL_CACHE[key] = staged
+        _W_PANEL_CACHE_BYTES += nbytes
+        while _W_PANEL_CACHE_BYTES > cap and _W_PANEL_CACHE:
+            _, evicted = _W_PANEL_CACHE.popitem(last=False)
+            _W_PANEL_CACHE_BYTES -= int(evicted.numel() * evicted.element_size())
+    return staged
+
+
 def _require_torch_grouped_mm():
     if _TORCH_GROUPED_MM is None:
         raise RuntimeError("PyTorch grouped torch baseline requires torch.nn.functional.grouped_mm or torch._grouped_mm")
@@ -1073,7 +1109,7 @@ def _asym_grouped_quantized_nt(
 
 
 def _staged_nt(a: torch.Tensor, b_cpu: torch.Tensor, *, transpose_b: bool = False) -> torch.Tensor:
-    b = b_cpu.to(device=a.device, dtype=a.dtype, non_blocking=b_cpu.is_pinned())
+    b = _stage_weight_panel(b_cpu, a.device, a.dtype)
     return a @ b if transpose_b else a @ b.t()
 
 
@@ -1174,7 +1210,7 @@ def _staged_grouped_nt(
     transpose_b: bool = False,
     dense_experts: bool = False,
 ) -> torch.Tensor:
-    b = b_cpu.to(device=a.device, dtype=a.dtype, non_blocking=b_cpu.is_pinned())
+    b = _stage_weight_panel(b_cpu, a.device, a.dtype)
     return _grouped_torch_chunks(a, b, offsets, experts, transpose_b=transpose_b, dense_experts=dense_experts)
 
 
@@ -1182,7 +1218,7 @@ def _torch_nt(a: torch.Tensor, b_cpu: torch.Tensor, *, transpose_b: bool = False
     if a.device.type == "cpu":
         b = b_cpu.to(dtype=a.dtype)
         return a @ b if transpose_b else a @ b.t()
-    b = b_cpu.to(device=a.device, dtype=a.dtype, non_blocking=b_cpu.is_pinned())
+    b = _stage_weight_panel(b_cpu, a.device, a.dtype)
     return a @ b if transpose_b else a @ b.t()
 
 
@@ -1213,7 +1249,7 @@ def _torch_grouped_nt(
     if a.device.type == "cpu":
         b = b_cpu.to(dtype=a.dtype)
         return _grouped_torch_chunks(a, b, offsets, experts, transpose_b=transpose_b)
-    b = b_cpu.to(device=a.device, dtype=a.dtype, non_blocking=b_cpu.is_pinned())
+    b = _stage_weight_panel(b_cpu, a.device, a.dtype)
     return _grouped_torch_chunks(a, b, offsets, experts, transpose_b=transpose_b, dense_experts=dense_experts)
 
 
