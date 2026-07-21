@@ -199,19 +199,19 @@ tier_expand_backend_spec() {
   fi
 }
 tier_recipe_label_suffix() {
-  # S4 naming fix: the six recipe dials as DESCRIPTIVE label components read
-  # from the FINAL env (merge_scheduler.md §3 step 7 — no opaque tags; the
-  # pre-existing safe_label sha1 stays overflow-guard-only).
-  local mka=0 aka=0 sv=cpu fa=0 xr=0 pc
-  [[ "${ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM:-}" =~ ^(1|true|yes|on)$ ]] && mka=1
-  [[ "${ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM:-}" =~ ^(1|true|yes|on)$ ]] && mka=1
-  [[ "${ASYMM_ATTN_ACT_KEEP_ACTS_HBM:-}" =~ ^(1|true|yes|on)$ ]] && aka=1
-  [[ "${ASYM_GC_SAVE_ON_CPU_OVERRIDE:-}" == "false" ]] && sv=hbm
-  [[ "${ASYMM_FUSED_LORA_ADDMM:-}" =~ ^(1|true|yes|on)$ ]] && fa=1
-  [[ "${ASYMM_QWEN3_MOE_FG_REUSE_PACKED_X:-}" =~ ^(1|true|yes|on)$ ]] && xr=1
-  pc="${ASYM_W_PANEL_CACHE_GB:-0}"; pc="${pc%%.*}"; [[ "${pc}" =~ ^[0-9]+$ ]] || pc=0
-  printf '__mlpka%s__attnka%s__gcsave%s__fadd%s__xreuse%s__pcache%s' \
-    "${mka}" "${aka}" "${sv}" "${fa}" "${xr}" "${pc}"
+  # S4 naming fix v2 (ledger 2026-07-21): recipe dials as DESCRIPTIVE label
+  # components, emitted ONLY when non-default — all-defaults => EMPTY suffix
+  # (historical all-default names stay byte-identical; any flag delta =>
+  # >=1 component => distinct dirs; safe_label sha1 stays the rare >255 guard).
+  local out="" on='^(1|true|yes|on)$'
+  { [[ "${ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM:-}" =~ $on ]] || [[ "${ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM:-}" =~ $on ]]; } && out+="__mlpka1"
+  [[ "${ASYMM_ATTN_ACT_KEEP_ACTS_HBM:-}" =~ $on ]] && out+="__attnka1"
+  [[ "${ASYM_GC_SAVE_ON_CPU_OVERRIDE:-}" == "false" ]] && out+="__gcsavehbm"
+  [[ "${ASYMM_FUSED_LORA_ADDMM:-}" =~ $on ]] && out+="__fadd1"
+  [[ "${ASYMM_QWEN3_MOE_FG_REUSE_PACKED_X:-}" =~ $on ]] && out+="__xreuse1"
+  local pc="${ASYM_W_PANEL_CACHE_GB:-0}"; pc="${pc%%.*}"
+  [[ "${pc}" =~ ^[0-9]+$ && "${pc}" != "0" ]] && out+="__pcache${pc}"
+  printf '%s' "${out}"
 }
 write_config_json() {
   # Full-fidelity per-run manifest (merge_scheduler.md §3 step 7): the FINAL

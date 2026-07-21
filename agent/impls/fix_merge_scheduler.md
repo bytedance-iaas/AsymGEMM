@@ -345,10 +345,10 @@ HBM; RSS where the cell carries it). All asym_cpuadamwds. Rows 1/2 = C1/C2
 |---|---|---|---|---|
 | 1 | q3-32b | T1 128k b2 | short, healthy (63%) | c12 system_summary §1: 906 us/tok = 1104 tok/s, 116.0 GiB |
 | 2 | q3-32b | T2 128k b2 | short, mid-memory | c12 §1: 1044 us/tok, 93.6 GiB |
-| 3 | q3-32b | T3 576k b1 | deep, host-heavy (RSS ~957) | c12: 111.2 GiB, RSS 957; tok/s from test_throughput_results.md |
-| 4 | llama3.3-70b | T1 192k b1 | dense-70B T1 terminal, parity +0.3% | c12 results tables |
-| 5 | llama3.3-70b | T2 384k b1 | deep T2, near-wall (178.6 GiB, the +4.4% drift point) | c12 |
-| 6 | llama3.3-70b | T2 448k b1 | WALL — llama's deepest FIT | c12 W-phase: 275 tok/s · 180.1 GiB (97.3%) · RSS 983. (T3 EXCLUDED for llama BY DESIGN — host inversion; do NOT run llama T3) |
+| 3 | q3-32b | T3 640k b1 | deep, host-heavy (RSS 980 ≈ pool) | tputw4 archives (verified): 226 tok/s · 129.7 GiB. SUBSTITUTED for 576k (no complete tok/s row there) |
+| 4 | llama3.3-70b | T1 96k b1 | dense-70B T1, short/healthy | tputw7 archives (verified): 1066 tok/s · 48.9 GiB · RSS 486. SUBSTITUTED for 192k parity point (no complete T1-192k row) |
+| 5 | llama3.3-70b | T2 192k b2 (KA+AU) | mid T2, near-wall 92% | tputask0 archives (verified): 543 tok/s · 171.1 GiB · RSS 963. SUBSTITUTED for 384k (measured GiB-only, no tok/s) |
+| 6 | llama3.3-70b | T2 448k b1 | WALL — llama's deepest FIT | tputw6 archives (verified): 275 tok/s · 182.4 GiB peak-resv (record text: 180.1 = 97.3%) · RSS 983. (T3 EXCLUDED for llama BY DESIGN — host inversion; do NOT run llama T3) |
 | 7 | q3-30b-a3b | KA dial 120k b8 (= C3) | short-ish, big-batch, KA state | scheduler_v2 §3b L3 (180.0 GiB; s/it in row). SUBSTITUTED for the 80k P1 cell: no archived asym 80k/64k b8 run exists in either tree (audit 2026-07-21) — P1's env is unreproducible verbatim |
 | 8 | q3-30b-a3b | 800k b1 shed = C4b | deep, sole-survivor crossover | c14 P3 / tputasl-c14 archives: 596-597 tok/s · 147.5 GiB · RSS 539. Env verified: staged + ker000 + 5 base pins, NO KA flags |
 | 9 | q3-30b-a3b | 1.1M b1 shed | ultra-deep + heaviest RSS | c14 P4 / tputschedb-c14: 382 tok/s · 151.5 GiB · RSS 906. Env verified: same shed state as row 8 (c14's "T2-BAL" label) |
@@ -384,6 +384,38 @@ exists; c14_old present; §10 present).
 
 ## 7. STATUS LEDGER (append-only; every gate writes a line)
 
+- [S1-V2a C1 PASS 2026-07-21] dense-T1 q3-32b 128k b2 on the merged tree:
+  1091 tok/s (ref 1104, −1.1% = in-band) · peak 116.0 GiB (ref 116.0,
+  EXACT). Run: mrgs1c1 (jobs.tsv ok-row FIT).
+- [S1-V2b C2 PASS 2026-07-21] dense-T2 q3-32b 128k b2: 986 tok/s (ref 958,
+  +2.9% — faster than record) · peak 93.6 GiB (ref 93.6, EXACT). Run:
+  mrgs1c2 FIT. Both dense tiers byte-exact on memory ⇒ port is
+  behavior-identical with features off.
+- [S1-V3 C3 PASS-with-note 2026-07-21] MoE KA dial 120k b8: 347.6 s/it (ref
+  §3b L3 352.5 — in-band, faster) · peak resv 165.7 GiB vs ref 180.0
+  (−14.3) · alloc 109.5 vs 118.0 (−8.5). DIAGNOSED per breach protocol: KA
+  ENGAGED beyond doubt (fg_keep_acts_hbm true; hbm_kept_bytes_peak 39.4 GiB
+  ≈ the dial's +36.4 Δ; clone counters live; −37 s/it vs the L2 no-KA rung
+  = the KA speed signature). The dial's raw artifacts no longer exist in
+  either tree (only the §3b table survives, dated 07-19 = BEFORE donor's
+  final post-dial fixes, which are what we ported) ⇒ lower-memory delta
+  attributed to donor code evolution, not a port defect. Decisive
+  final-code memory gate = C4 (archive-verified 183.0 GiB @900k from the
+  donor's FINAL code). Note: keep_stage_clone_bytes visible in profile ⇒
+  the re-applied noclone counters flow end-to-end.
+- [NAMING FIX-2 2026-07-21] C1's dir showed the flaw: appending all six
+  recipe components pushed the ~250-char label past NAME_MAX → safe_label
+  truncate+hash fired → OPAQUE tail (the exact outcome Kevin rejected).
+  REVISED RULE: append ONLY NON-DEFAULT components (all-defaults ⇒ empty
+  suffix ⇒ historical names byte-identical, pre-merge cached-run lookup
+  works again; any flag delta ⇒ ≥1 non-default component ⇒ distinct dirs
+  still guaranteed; hash remains the rare >255 fallback). Applied AFTER the
+  S1 queue drained (no mid-flight driver edits); S1-queue run dirs carry
+  the old suffix+hash — harmless (verdicts/metrics are name-agnostic).
+- [DATASETS 2026-07-21] copied 3 MoE deep dataset dirs from -39 (800k n1024,
+  900k n512, 1.1M n512 — bit-identical inputs for record reproduction);
+  MAX_SAMPLES per replication run pinned to the archived run's value
+  (rows 3/4/6 + C4 + row 9 = 512; rows 5/7/8 = 1024).
 - [ARCHIVE AUDIT 2026-07-21 — MAJOR CORRECTION] grep over EVERY archived c14
   command.txt: fused-addmm, reuse-packed-x, panel-cache appear in ZERO c14
   runs — 42's ASYM_PINS were never measured; prompt.md's "900k incl.
