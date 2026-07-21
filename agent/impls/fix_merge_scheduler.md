@@ -35,19 +35,19 @@ ASYM_GEMM_DISPATCH=staged ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM=1 ASYMM_FG_ELEMENTWIS
 ```
 - C4 moe-bundle RECORD REPRODUCTION — the tputsched-c14 900k b1 run
   AS-ARCHIVED (env verified from its command.txt 2026-07-21: KA bundle +
-  the 5 base pins; NO panel-cache, NO fused-addmm, NO reuse-packed-x —
+  the 6 base pins incl. KEEP_DGRADS_HBM=1; NO panel-cache, NO fused-addmm, NO reuse-packed-x —
   prompt.md's "incl. panel-cache" claim contradicted the archive; archive
   wins). Ref (recomputed from its step_samples.json): 519 tok/s,
   183.0 GiB. NB ~99% util — the record's own operating point; long steps.
 ```
-ASYM_GEMM_DISPATCH=staged ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM=1 ASYMM_ATTN_ACT_KEEP_ACTS_HBM=1 ASYM_GC_SAVE_ON_CPU_OVERRIDE=false ASYMM_QWEN3_MOE_FG_LORA_A_FWD_GPU=1 ASYMM_QWEN3_MOE_FG_DA_GPU=1 ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=0 ASYMM_FG_ELEMENTWISE_CHUNK_MB=1024 ASYMM_QWEN3_MOE_DOWN_DX_STAGED=1 bash scripts/lf/tp_probe.sh q3-30b-a3b mrgc4 "asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1" 900000 1
+ASYM_GEMM_DISPATCH=staged ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM=1 ASYMM_ATTN_ACT_KEEP_ACTS_HBM=1 ASYM_GC_SAVE_ON_CPU_OVERRIDE=false ASYMM_QWEN3_MOE_FG_LORA_A_FWD_GPU=1 ASYMM_QWEN3_MOE_FG_DA_GPU=1 ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=0 ASYMM_FG_ELEMENTWISE_CHUNK_MB=1024 ASYMM_QWEN3_MOE_DOWN_DX_STAGED=1 ASYMM_QWEN3_MOE_FG_KEEP_DGRADS_HBM=1 bash scripts/lf/tp_probe.sh q3-30b-a3b mrgc4 "asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1" 900000 1
 ```
 - C4b moe deep SHED state — ref c14 P3 (800k b1), archive-verified
   (tputasl-c14 step_samples: 596 tok/s, 147.5 GiB, RSS 539). Env from its
-  command.txt: staged + ker000 + the 5 base pins ONLY (no KA, no GC
+  command.txt: staged + ker000 + the 6 base pins ONLY incl. KEEP_DGRADS_HBM=1 (no KA, no GC
   override, no fused/reuse/panel):
 ```
-ASYM_GEMM_DISPATCH=staged ASYMM_QWEN3_MOE_FG_LORA_A_FWD_GPU=1 ASYMM_QWEN3_MOE_FG_DA_GPU=1 ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=0 ASYMM_FG_ELEMENTWISE_CHUNK_MB=1024 ASYMM_QWEN3_MOE_DOWN_DX_STAGED=1 bash scripts/lf/tp_probe.sh q3-30b-a3b mrgc4b "asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1" 800000 1
+ASYM_GEMM_DISPATCH=staged ASYMM_QWEN3_MOE_FG_LORA_A_FWD_GPU=1 ASYMM_QWEN3_MOE_FG_DA_GPU=1 ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=0 ASYMM_FG_ELEMENTWISE_CHUNK_MB=1024 ASYMM_QWEN3_MOE_DOWN_DX_STAGED=1 ASYMM_QWEN3_MOE_FG_KEEP_DGRADS_HBM=1 bash scripts/lf/tp_probe.sh q3-30b-a3b mrgc4b "asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1" 800000 1
 ```
 - C5 parity — ref 1110 tok/s (DONOR fix_asym ledger :18; after S6, the
   merged fix_asym)
@@ -403,6 +403,37 @@ exists; c14_old present; §10 present).
   final-code memory gate = C4 (archive-verified 183.0 GiB @900k from the
   donor's FINAL code). Note: keep_stage_clone_bytes visible in profile ⇒
   the re-applied noclone counters flow end-to-end.
+- [S1-V4a PASS 2026-07-21] bundle @120k b4 via _source/tp_probe: FIT;
+  attn-KA delivered end-to-end (attn_act_hbm_gemm_calls_by_tag populated —
+  the GPU-GEMM keep path ran; asymm_attn_act_keep_acts_hbm="1" in profile
+  config; MoE-KA engaged 19.7 GiB kept); config.json present + correct.
+  NOTES: (i) MoE config labels exceeded NAME_MAX even PRE-merge (archived
+  c14 dirs are hash-truncated too) — recipe components live in the
+  hashed-over string for MoE; config.json is the readability mitigation
+  (by design). Dense labels stay readable. (ii) cosmetic: config.json's
+  _recompute_token carries the pre-ker base ("recomp-off-full-fg") — full
+  token is in dir name + command.txt; fix deferred (no driver edits while
+  runs in flight).
+- [S1-V4b PASS 2026-07-21] bundle @120k b4 via the _both driver: jobs.tsv
+  ok; attn_act_hbm_gemm calls populated; asymm_attn_act_keep_acts_hbm="1";
+  config.json correct. The ADDED _both forwarding line works — S1-V4 proven
+  under BOTH drivers. (Quirk: _both group dir named `mrgv4b__b4_...` —
+  model segment absent from that driver's RUN_NAME composition; harmless,
+  pre-existing behavior.)
+- [S4-V2 + S4-V3 PASS 2026-07-21] |T2| preset vs raw token at identical
+  (q3-30b, b8, 24k): DISTINCT config dirs (h395758926f vs h03a19740b7),
+  both jobs ok; config.json diff = EXACTLY the 9 recipe keys +
+  _tier_requested='T2|moe'. The raw run's dir hash is BYTE-IDENTICAL to
+  the historical c14 archived dirs (h03a19740b7) ⇒ omit-defaults naming
+  preserves pre-merge names exactly; historical cached-run lookup intact.
+  Gate (e) distinct-dirs + manifest accuracy: satisfied.
+- [S1-V5 C4 PASS-with-note 2026-07-21] 900k b1 bundle record reproduction:
+  537 tok/s (ref 519 from tputsched's own step_samples, +3.6% FASTER) ·
+  peak 177.2 GiB (ref 183.0, −5.8 favorably lower). Bundle residency
+  proven: 177.2 ≫ shed-state ~153 @900k + V4 keep-path counters. Pattern
+  consistent with C3 (merged ≥ archived on speed, ≤ on memory) ⇒ donor
+  post-campaign fixes made the KA path leaner; NO regression. S1 gates all
+  passed (V1-V5).
 - [NAMING FIX-2 2026-07-21] C1's dir showed the flaw: appending all six
   recipe components pushed the ~250-char label past NAME_MAX → safe_label
   truncate+hash fired → OPAQUE tail (the exact outcome Kevin rejected).

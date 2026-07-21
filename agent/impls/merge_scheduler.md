@@ -48,7 +48,7 @@ validation gate renumbered to step 8 with new item (e).
   replaces hand-composed flag sets — backend never auto-picked, names stay
   full-fidelity.
 - PERF: dense unchanged (no-regression gate (c)); MoE recipes = the
-  archived c14 configurations verbatim (5 base pins; T2 adds the KA bundle
+  archived c14 configurations verbatim (6 base pins incl. KEEP_DGRADS_HBM; T2 adds the KA bundle
   incl. attn-KA); parked upside behind named A/Bs: panel-cache,
   fused-addmm, reuse-packed-x (NONE measured in any c14 run — archive
   audit 2026-07-21), async-pack.
@@ -116,8 +116,11 @@ validation gate renumbered to step 8 with new item (e).
   archived c14 command.txt (tputsched 900k, tputasl 800k, tputschedb 1.1M,
   tputasm 1.4/1.6M, + all others) shows ZERO runs with either flag, and none
   with panel-cache. The ASYM_PINS were aspirational (for future emissions),
-  never measured. ⇒ the c14 record embeds exactly FIVE base pins
-  (LORA_A_FWD_GPU=1, DA_GPU=1, DOWN_SCATTER=0, CHUNK_MB=1024, DX_STAGED=1),
+  never measured. ⇒ the c14 record embeds exactly SIX base pins
+  (LORA_A_FWD_GPU=1, DA_GPU=1, DOWN_SCATTER=0, CHUNK_MB=1024, DX_STAGED=1,
+  KEEP_DGRADS_HBM=1 — the sixth found 2026-07-21 via the C4b breach diff;
+  it pre-exists in both trees so no inventory tracked it; set in ALL deep
+  c14 runs, NOT in the 120k dial runs),
   and the 900k bundle adds MoE-KA + attn-KA + GC-save-hbm. RULING (revised):
   ALL FIVE new source features are default-off EVERYWHERE — none rides any
   recipe; attn-KA appears in the T2-MoE recipe ONLY (it IS in the measured

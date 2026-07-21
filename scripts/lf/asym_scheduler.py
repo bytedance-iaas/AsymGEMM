@@ -72,8 +72,11 @@ _DENSE_T2_ENV = {
     "ASYMM_QWEN3_MOE_DOWN_DX_STAGED": "1",
     "ASYMM_FG_ELEMENTWISE_CHUNK_MB": "1024",
 }
-# class-1 MoE pins — the FIVE actually embedded in every archived c14 asym run
-# (command.txt verified 2026-07-21: tputsched/tputasl/tputschedb/tputasm).
+# class-1 MoE pins — the SIX actually embedded in every archived c14 deep run
+# (command.txt verified 2026-07-21: tputsched 900k, tputasl 640k/800k,
+# tputschedb 1.1M, tputasm 1.6M — ALL carry KEEP_DGRADS_HBM=1; found via the
+# C4b breach diff, it was in no doc inventory because the flag pre-exists in
+# BOTH trees and is not a 42 feature. The 120k dial runs did NOT set it.)
 # NB fused-addmm + reuse-packed-x are NOT here: 42's ASYM_PINS listed them but
 # ZERO archived c14 runs carry them (grep over all command.txt = 0 hits) —
 # they stay default-off everywhere pending the 2x2 A/B (merge doc §2d′).
@@ -83,6 +86,7 @@ _MOE_PINS = {
     "ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS": "0",
     "ASYMM_FG_ELEMENTWISE_CHUNK_MB": "1024",
     "ASYMM_QWEN3_MOE_DOWN_DX_STAGED": "1",
+    "ASYMM_QWEN3_MOE_FG_KEEP_DGRADS_HBM": "1",
 }
 _MOE_T2_ENV = {   # the c14 keep-acts bundle, as-measured (no panel-cache)
     **_STAGED, **_MOE_PINS,
