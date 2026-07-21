@@ -120,17 +120,41 @@ def _lora_b_forward(low_rank: torch.Tensor, b: torch.Tensor, *, scale: float) ->
     return out.mul(float(scale)) if float(scale) != 1.0 else out
 
 
+def _fused_lora_addmm_enabled() -> bool:
+    """C2 elementwise diet (agent/impls/fix_asym.md S2/S0'): fuse `dest += (x@W)*scale`
+    into a single addmm_ epilogue instead of matmul -> scale-mul -> cast -> add_ (two
+    extra full-width elementwise sweeps + a [M,out] temp per call; the launch-bound
+    elementwise_kernel bucket). alpha applies in fp32 accumulation — numerics-touching
+    (slightly BETTER rounding), so flag-gated. Default off = pre-fix behavior."""
+    value = os.environ.get("ASYMM_FUSED_LORA_ADDMM")
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _add_lora_b_delta_(dest: torch.Tensor, low_rank: torch.Tensor, b: torch.Tensor, *, scale: float) -> None:
     """dest += (low_rank @ b^T) * scale without materializing a full-width delta:
     the [M, out] product is the same size as dest (20 GB-class at long seq), so
     compute and add it in row chunks."""
     rows = int(dest.shape[0])
+    fused = (
+        _fused_lora_addmm_enabled()
+        and dest.dim() == 2
+        and low_rank.dim() == 2
+        and dest.dtype == low_rank.dtype == b.dtype
+    )
     chunk = fg_chunk_rows(rows, int(dest.shape[1]), dest.element_size())
     if chunk <= 0:
+        if fused:
+            dest.addmm_(low_rank, b.t(), alpha=float(scale))
+            return
         dest.add_(_lora_b_forward(low_rank, b, scale=scale).to(dtype=dest.dtype))
         return
     for row_start in range(0, rows, chunk):
         row_end = min(rows, row_start + chunk)
+        if fused:
+            dest[row_start:row_end].addmm_(low_rank[row_start:row_end], b.t(), alpha=float(scale))
+            continue
         delta = _lora_b_forward(low_rank[row_start:row_end], b, scale=scale)
         dest[row_start:row_end].add_(delta.to(dtype=dest.dtype))
         del delta
@@ -319,7 +343,7 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
             with prof_range(layer._forward_range("finegrained", "activation")):
                 gate_stage = manager.stage(gate_cpu, tag="mlp.gate_for_act")
                 F.silu(gate_stage, inplace=True)
-                up_stage = manager.stage(up_cpu, tag="mlp.up_for_act")
+                up_stage = manager.stage(up_cpu, tag="mlp.up_for_act", mutable=False)
                 gate_stage.mul_(up_stage)
                 act_cpu = manager.offload(gate_stage.to(dtype=torch.bfloat16).contiguous(), "mlp.act")
                 manager.release_stage(gate_stage, drop_cache=True)
@@ -332,7 +356,7 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
             down_low_rank_cpu = manager.offload(down_low_rank, "mlp.S_down")
 
         with prof_range(layer._forward_range("finegrained", "down_base")):
-            act_stage = manager.stage(act_cpu, tag="mlp.act_for_down_base")
+            act_stage = manager.stage(act_cpu, tag="mlp.act_for_down_base", mutable=False)
             layer.stats.dense_mlp_finegrained_down_base_calls += 1
             out = _asym_base_forward(
                 layer.down_proj.base_layer,
@@ -390,7 +414,7 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
             grad_2d = grad_output.reshape(-1, layer.hidden_size).to(dtype=torch.bfloat16).contiguous()
 
             with prof_range(layer._backward_range("finegrained", "down_lora")):
-                down_low_rank = manager.stage(ctx.down_low_rank_cpu, tag="mlp.S_down_for_dB")
+                down_low_rank = manager.stage(ctx.down_low_rank_cpu, tag="mlp.S_down_for_dB", mutable=False)
                 dS_down = _lora_ds(grad_2d, down_b, scale=layer.lora_scale)
                 grad_down_b = _lora_b_grad(grad_2d, down_low_rank, scale=layer.lora_scale, out_dtype=down_b.dtype)
                 manager.release_stage(down_low_rank, drop_cache=True)
@@ -469,13 +493,13 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                         manager.release_stage(gate_stage, drop_cache=True)
                         del gate_stage
 
-                        up_stage = manager.stage(ctx.up_cpu, tag="mlp.up_for_silu_bwd_dgate")
+                        up_stage = manager.stage(ctx.up_cpu, tag="mlp.up_for_silu_bwd_dgate", mutable=False)
                         grad_act.mul_(up_stage)
                         manager.release_stage(up_stage, drop_cache=True)
                         manager.release_cpu(ctx.up_cpu)
                         del up_stage
 
-                        gate_stage = manager.stage(ctx.gate_cpu, tag="mlp.gate_for_silu_bwd_dgate")
+                        gate_stage = manager.stage(ctx.gate_cpu, tag="mlp.gate_for_silu_bwd_dgate", mutable=False)
                         grad_gate = torch.ops.aten.silu_backward(grad_act, gate_stage)
                         del grad_act
                         grad_gate_cpu = manager.offload(grad_gate.to(dtype=torch.bfloat16).contiguous(), "mlp.dgate")
@@ -484,8 +508,8 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                         del gate_stage, grad_gate
 
             with prof_range(layer._backward_range("finegrained", "gate")):
-                grad_gate_stage = manager.stage(grad_gate_cpu, tag="mlp.dgate")
-                gate_low_rank = manager.stage(ctx.gate_low_rank_cpu, tag="mlp.S_gate_for_dB")
+                grad_gate_stage = manager.stage(grad_gate_cpu, tag="mlp.dgate", mutable=False)
+                gate_low_rank = manager.stage(ctx.gate_low_rank_cpu, tag="mlp.S_gate_for_dB", mutable=False)
                 dS_gate = _lora_ds(grad_gate_stage, gate_b, scale=layer.lora_scale)
                 grad_gate_b = _lora_b_grad(
                     grad_gate_stage,
@@ -513,8 +537,8 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                 grad_gate_cpu = None
 
             with prof_range(layer._backward_range("finegrained", "up")):
-                grad_up_stage = manager.stage(grad_up_cpu, tag="mlp.dup")
-                up_low_rank = manager.stage(ctx.up_low_rank_cpu, tag="mlp.S_up_for_dB")
+                grad_up_stage = manager.stage(grad_up_cpu, tag="mlp.dup", mutable=False)
+                up_low_rank = manager.stage(ctx.up_low_rank_cpu, tag="mlp.S_up_for_dB", mutable=False)
                 dS_up = _lora_ds(grad_up_stage, up_b, scale=layer.lora_scale)
                 grad_up_b = _lora_b_grad(grad_up_stage, up_low_rank, scale=layer.lora_scale, out_dtype=up_b.dtype)
                 manager.release_stage(up_low_rank, drop_cache=True)
@@ -711,7 +735,7 @@ def _finegrained_dense_mlp_no_grad_cpu_offload_forward(layer: "AsymFinegrainedDe
                 up_stage_idx: int | None = None
                 try:
                     F.silu(gate_stage, inplace=True)
-                    up_stage = manager.stage(up_cpu, tag="mlp.up_for_act")
+                    up_stage = manager.stage(up_cpu, tag="mlp.up_for_act", mutable=False)
                     up_stage_idx = len(stage_tensors)
                     stage_tensors.append(up_stage)
                     gate_stage.mul_(up_stage)
@@ -740,7 +764,7 @@ def _finegrained_dense_mlp_no_grad_cpu_offload_forward(layer: "AsymFinegrainedDe
             x_cpu = None
 
         with prof_range(layer._forward_range("finegrained_nograd", "down_base")):
-            act_stage = manager.stage(act_cpu, tag="mlp.act_for_down_base")
+            act_stage = manager.stage(act_cpu, tag="mlp.act_for_down_base", mutable=False)
             act_stage_idx = len(stage_tensors)
             stage_tensors.append(act_stage)
             layer.stats.dense_mlp_finegrained_down_base_calls += 1

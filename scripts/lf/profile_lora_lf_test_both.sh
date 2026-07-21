@@ -147,6 +147,88 @@ else
   # )
 fi
 
+# ── tier preset layer (S4, agent/impls/fix_merge_scheduler.md) ──────────────
+# RUNS accepts backend|T{1,2,2B,3}[|liger...] — expanded HERE, before any other
+# parsing, from the scheduler-owned recipe table (scripts/lf/tier_recipes.sh =
+# asym_scheduler.py --emit-recipes). Backend is NEVER auto-picked. Recipe env
+# applies only-if-unset (user env wins = the A/B hook). One tier preset per
+# invocation (tp_probe-style RUNS); a second distinct tier|family dies loudly.
+declare -A TIER_TOKEN TIER_ENV
+_tier_recipes_file="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tier_recipes.sh"
+[[ -f "${_tier_recipes_file}" ]] && source "${_tier_recipes_file}"
+TIER_REQUESTED=""
+tier_model_family() {
+  case "${1,,}" in
+    *q3-30b*|*qwen3-30b*|*30b-a3b*|*q3.5*|*qwen3.5*|*35b-a3b*|*122b*|*llama4*|*scout*) printf 'moe' ;;
+    *) printf 'dense' ;;
+  esac
+}
+tier_expand_backend_spec() {
+  # $1 = model key, $2 = backend spec; result in TIER_EXPANDED_SPEC (exports recipe env)
+  local model_key="$1" spec="$2"
+  TIER_EXPANDED_SPEC="${spec}"
+  [[ "${spec}" == *"|"* ]] || return 0
+  local backend_f rest recompute_f
+  backend_f="${spec%%|*}"; rest="${spec#*|}"; recompute_f="${rest%%|*}"
+  [[ "${recompute_f^^}" =~ ^T(1|2|2B|3)$ ]] || return 0
+  local tier="${recompute_f^^}" fam key
+  fam="$(tier_model_family "${model_key}")"
+  key="${fam}|${tier}"
+  if [[ -z "${TIER_TOKEN[${key}]:-}" ]]; then
+    echo "error: tier preset '${tier}' has no recipe for family '${fam}' (see scripts/lf/tier_recipes.sh)" >&2
+    exit 2
+  fi
+  if [[ -n "${TIER_REQUESTED}" && "${TIER_REQUESTED}" != "${tier}|${fam}" ]]; then
+    echo "error: one tier preset per invocation (got ${TIER_REQUESTED}, then ${tier}|${fam}); split the RUNS" >&2
+    exit 2
+  fi
+  local kv k v applied=0
+  for kv in ${TIER_ENV[${key}]}; do
+    k="${kv%%=*}"; v="${kv#*=}"
+    if [[ -z "${!k+x}" ]]; then export "${k}=${v}"; applied=$((applied+1)); fi
+  done
+  export TIER_REQUESTED="${tier}|${fam}"
+  local tail=""
+  [[ "${rest}" == *"|"* ]] && tail="|${rest#*|}"
+  TIER_EXPANDED_SPEC="${backend_f}|${TIER_TOKEN[${key}]}${tail}"
+  echo "TIER preset: ${model_key} ${tier} (${fam}) -> ${TIER_TOKEN[${key}]} (+${applied} recipe env, user env wins)" >&2
+  if [[ "${TIER_DRY_RUN:-0}" == "1" ]]; then
+    echo "TIER_DRY_RUN expanded_spec=${TIER_EXPANDED_SPEC}"
+    env | grep -E '^(ASYM|UNSLOTH)' | sort
+    exit 0
+  fi
+}
+tier_recipe_label_suffix() {
+  # S4 naming fix: the six recipe dials as DESCRIPTIVE label components read
+  # from the FINAL env (merge_scheduler.md §3 step 7 — no opaque tags; the
+  # pre-existing safe_label sha1 stays overflow-guard-only).
+  local mka=0 aka=0 sv=cpu fa=0 xr=0 pc
+  [[ "${ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM:-}" =~ ^(1|true|yes|on)$ ]] && mka=1
+  [[ "${ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM:-}" =~ ^(1|true|yes|on)$ ]] && mka=1
+  [[ "${ASYMM_ATTN_ACT_KEEP_ACTS_HBM:-}" =~ ^(1|true|yes|on)$ ]] && aka=1
+  [[ "${ASYM_GC_SAVE_ON_CPU_OVERRIDE:-}" == "false" ]] && sv=hbm
+  [[ "${ASYMM_FUSED_LORA_ADDMM:-}" =~ ^(1|true|yes|on)$ ]] && fa=1
+  [[ "${ASYMM_QWEN3_MOE_FG_REUSE_PACKED_X:-}" =~ ^(1|true|yes|on)$ ]] && xr=1
+  pc="${ASYM_W_PANEL_CACHE_GB:-0}"; pc="${pc%%.*}"; [[ "${pc}" =~ ^[0-9]+$ ]] || pc=0
+  printf '__mlpka%s__attnka%s__gcsave%s__fadd%s__xreuse%s__pcache%s' \
+    "${mka}" "${aka}" "${sv}" "${fa}" "${xr}" "${pc}"
+}
+write_config_json() {
+  # Full-fidelity per-run manifest (merge_scheduler.md §3 step 7): the FINAL
+  # ASYM*/UNSLOTH* env at launch + preset provenance. Same scope as command.txt.
+  local dir="$1"
+  TIER_REQUESTED="${TIER_REQUESTED:-}" \
+  RECOMPUTE_TOKEN_RESOLVED="${recompute:-}" \
+  "${ENV_PYTHON:-python3}" - "${dir}" <<'PY' 2>/dev/null || true
+import json, os, sys
+cfg = {k: v for k, v in os.environ.items() if k.startswith(("ASYM", "UNSLOTH"))}
+cfg["_tier_requested"] = os.environ.get("TIER_REQUESTED", "")
+cfg["_recompute_token"] = os.environ.get("RECOMPUTE_TOKEN_RESOLVED", "")
+cfg["_recipes_file"] = "scripts/lf/tier_recipes.sh"
+json.dump(cfg, open(os.path.join(sys.argv[1], "config.json"), "w"), indent=1, sort_keys=True)
+PY
+}
+
 # Iterate and parse the rows into scheduler metadata. Each RUNS item remains one scheduled run.
 _run_models=(); _run_backends=(); _run_workloads=(); _run_policies=(); _run_specs=()
 (( ${#RUNS[@]} > 0 )) || { echo "error: RUNS is empty" >&2; exit 2; }
@@ -158,6 +240,8 @@ for _run in "${RUNS[@]}"; do
     exit 2
   }
   _m_key="${_m%%|*}"
+  tier_expand_backend_spec "${_m_key}" "${_b}"
+  _b="${TIER_EXPANDED_SPEC}"
   if [[ "${_m}" == *"|"* && -n "${M[$_m_key]:-}" ]]; then
     # shorthand|N: resolve the shorthand's path, then apply the GPU count N from the RUNS row.
     _m_spec="${M[$_m_key]%%|*}|${_m#*|}"
@@ -2069,7 +2153,7 @@ job_root_path() {
   fi
   # -ohbm<N> is folded into the recompute label (${recompute}) itself, so it is no longer
   # appended as a separate __ohbm<N> path component.
-  path_label="${path_label}__${expact_lora_a_fwd_label}__${actrecomp_label}__${xunpack_label}__${moefg_label}__${dscatter_label}__${q3rt_label}__${liger_loss}${grad_offload_suffix}"
+  path_label="${path_label}__${expact_lora_a_fwd_label}__${actrecomp_label}__${xunpack_label}__${moefg_label}__${dscatter_label}__${q3rt_label}__${liger_loss}${grad_offload_suffix}$(tier_recipe_label_suffix)"
   printf '%s/%s\n' "${config_root}" "$(safe_label "${path_label}")"
 }
 
@@ -3180,6 +3264,7 @@ materialize_source_artifacts_from_nsys() {
     echo "  nsys_source_profile=${nsys_source_profile}"
     print_command "${postprocess_cmd[@]}"
   } > "${source_seq_root}/command.txt"
+  write_config_json "${source_seq_root}"
   : > "${source_log_file}"
   echo "Materializing source artifacts from ${nsys_source_profile} into ${source_seq_root}"
   run_tracked_command_logged "${source_log_file}" "${postprocess_cmd[@]}"
@@ -3841,6 +3926,7 @@ run_job() {
 	    ASYM_GEMM_LF_CONFIG_ASYM_GEMM_DISPATCH="${ASYM_GEMM_DISPATCH:-}"
 	    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM="${ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM:-}"
 	    ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM="${ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM:-}"
+	    ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_KEEP_ACTS_HBM="${ASYMM_ATTN_ACT_KEEP_ACTS_HBM:-}"
 	    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS="${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}"
 	    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_ROUTE_MAPPED_GEMM="${ASYMM_QWEN3_MOE_ROUTE_MAPPED_GEMM}"
 	    ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_ROUTE_FWD_SCATTER="${q3rt_fwd_flag}"
@@ -3978,6 +4064,7 @@ run_job() {
     {
       print_command "${run_cmd[@]}"
     } > "${seq_root}/command.txt"
+    write_config_json "${seq_root}"
     append_job_record "${config_root}" dry-run \
       "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" "${run_profiler}" "${liger_loss}" "${grad_offload}" "${seq_root}" "${profile_json}" "${log_file}" "${lf_expert_lora_impl}"
     if [[ "${materialize_source_from_nsys}" == "true" ]]; then
@@ -3994,6 +4081,7 @@ run_job() {
         print_command cp "${source_profile}" "${source_materialized_source_profile}"
         print_command "${source_postprocess_cmd[@]}"
       } > "${source_materialized_seq_root}/command.txt"
+      write_config_json "${source_materialized_seq_root}"
       append_job_record "${config_root}" dry-run \
         "${gpu}" "${seq_len}" "${recompute}" "${expert_policy}" "${router_mode}" "${backend}" source "${liger_loss}" "${grad_offload}" "${source_materialized_seq_root}" "${source_materialized_profile_json}" "${source_materialized_log_file}" "${lf_expert_lora_impl}"
     fi
@@ -4005,6 +4093,7 @@ run_job() {
   {
     print_command "${run_cmd[@]}"
   } > "${seq_root}/command.txt"
+  write_config_json "${seq_root}"
 
   local status=0
   append_runs_log_entry "RUN" "${run_log_payload}" "${run_log_inert_reason# }" "${run_log_extra_tag}"

@@ -354,3 +354,210 @@ vs the 2026-07-12 bank, NOT a regression. Relationship + ordering unchanged.
 |---|---|---|---|---|---|
 | q3-32b @65k ker000 ohbm8      | 154.2 | 166.8 | 882 GB | 1281 | FITS (record C-OOM ~66k) |
 | q3-30b-a3b @174k ker101 ohbm16 | 153.6 | 170.9 | 825 GB | 878  | FITS (record 172k max-OK / G-OOM 188k) |
+
+---
+
+## 8. THE REGIME SCHEDULER (v3, 2026-07-18) — formal decision process over the dial
+
+§4's greedy knob solver optimizes WITHIN a mode. This section adds the layer the owner
+asked for: a FORMAL top-level decision process that picks the OPERATING REGIME per
+workload, such that the composed system's throughput ≥ max(all baselines) at every
+(model, s, B) — falling back to a baseline-EQUIVALENT configuration when the workload
+fits (not an if/else between two systems: one system, one config space, three regions).
+
+### 8.0 Inputs, models, constants (all measured on c12/c14, GB200 185.0 GiB)
+```
+workload  w = (model, s, B_req | token-budget)
+memory model    resv_c(s,B) = base_c + k_c·(B·s)          # fitted per (model, config c);
+                validated ±2% on 200+ runs; UNDER-predicts near the wall — treat any
+                prediction within 8% of M_phys as "probe before trusting" (frontier rule).
+throughput model  t_c(s) us/tok = attn(s) + tax_c          # attn(s) shared by ALL configs
+                (proof: rc ≡ uns per-token at 128k/160k: 1101≈1110, 941=942); saturation
+                requires B·s ≥ N*_c (knee); below knee MFU falls (the deficit windows).
+SAFE = 0.92·M_phys = 170 GiB (thrash guard: >97% + irregular allocs = churn; recomp-like
+                regular patterns tolerate 98% — regime-1 configs are irregular ⇒ 0.92).
+```
+
+### 8.1 The three regimes (single config space, three regions)
+```
+R1 FAST  (baseline-equivalent, memory pressure LOW) — REVISED 2026-07-18 after S0':
+    config: `asym_cpuadamwds|unsloth-ohbm<N>` — the driver's EXISTING unsloth-GC recompute
+            mode on the asym backend (+ ASYM_GEMM_DISPATCH=staged for native GEMMs).
+    ⇒ compute shape ≡ superoffload-unsloth (GC recompute, ~336 GB/step boundary traffic
+      only) BUT base weights stream from host (staged per-GEMM at measured parity)
+      ⇒ ~65 GB less HBM than sup at equal (s,B) ⇒ same per-token speed, MORE batch
+      headroom. R1 is a SUPERSET of the baseline, not an imitation.
+    KEY INSIGHT (S0' root cause): the old "latency mode" (recomp-off-*) is NOT the fast
+      mode at long seq — recompute-OFF saves+offloads ~2.2 TB/step of attention tensors
+      (serial tax +286 us/tok bwd) vs recompute's +166. recomp-off is an R2/R3 tool
+      (it frees recompute FLOPs when traffic can hide); unsloth-GC is the R1 spine.
+R2 GAP   (pressure MODERATE: s long, B undersaturated at R1):
+    config: KA + staged + selected fg offload classes admitted by §4's greedy dial —
+            EXACTLY enough offload to fit B_target = min(B_sat(s), B fitting at SAFE).
+    ⇒ trades copy-engine time for batch headroom; wins when the batch gain outruns the
+      offload tax (requires fix_asym S-mem to keep the tax ≤ the deficit it recovers).
+R3 ULTRA (pressure HIGH: even B=1 needs full offload):
+    config: memory mode (full fg offload, ohbm per ceiling ladder, C0 off) —
+            the capacity flagship; objective flips from tok/s to feasibility.
+```
+
+### 8.2 The decision function (formal)
+```
+SCHEDULE(w):
+1  B_sat := ceil(N*_R1 / s)                                  # smallest saturated batch
+2  if resv_R1(s, max(B_req, B_sat)) ≤ SAFE:      return (R1, that B)     # fallback zone
+3  B1_max := max B: resv_R1(s,B) ≤ SAFE
+   B2_max := max B: resv_R2*(s,B) ≤ SAFE          # R2* = R2 with dial-admitted knobs
+   if B2_max > B1_max and t_R2(s)·(1+underSat(B1_max,s)) > t_R2 gain check:
+       # admit R2 iff modeled tok/s(R2, B2_max) > tok/s(R1, B1_max); both from §8.0 models
+       return (R2, B2_max, knobs from §4 dial run to fit B2_max)
+   else: return (R1, B1_max)                      # R1 at its B_max still the best
+4  if resv_R1(s,1) > SAFE and resv_R2*(s,1) > SAFE: return (R3, B=1..)   # capacity zone
+5  Hysteresis: regime switches require the modeled gain > 5% (measurement noise 0.3%,
+   model error ~2%); ties break toward the LOWER regime (simpler config).
+6  One steady-state probe (§5) validates the choice; a probe miss > 8% demotes the
+   model constants for that (model, config) and re-schedules — the same self-correction
+   loop as §4 step 4.
+```
+
+### 8.3 Measured regime boundaries (today's constants)
+| model | R1 zone (fallback) | R2 zone (gap) | R3 zone (ultra) |
+|---|---|---|---|
+| q3-32b | s ≤ ~96k (B_max≥3 sat.) | 96k → ~390k (uns wall) | > ~390k (asym-only to ~490k) |
+| llama-70B | s ≤ ~96-112k | 112k → ~326k | > ~326k |
+| q3-30b MoE | s ≤ ~64-128k | 128k → ~660k | > ~660k (asym-only) |
+
+### 8.3b MEASURED R1 VALIDATION (2026-07-18, q3-32b) — the fallback is real
+| point | R1 (asym|unsloth+staged) | sup unsloth | verdict |
+|---|---|---|---|
+| q3-32b 128k b2 | 1104 tok/s @116.0 GiB | 1110 @127.9 | parity, -12 GiB |
+| q3-32b 160k b2 | 938 @144.8 | 942 @159.1 | parity, -14 GiB |
+| q3-32b 192k b2 | 812 @175.3 | 816 (b1-capped) @96.4 | parity |
+| llama 128k b2 | 786 @128.7 | 792 @147.7 | parity, -19 GiB |
+| llama 192k b1 | **603 @96.3** | 601 @110.2 | **+0.3% (B<=0.92 rule), -14 GiB** |
+| llama 192k b2 | 577 @182.7 (97.7%) | — (sup b2 OOM) | edge-tax -4% — rule's counterexample |
+| q3-32b 384k b1 (R2/KA) | 426 @140.6 | 424 @98% edge | parity AT sup's wall |
+CONVERGENCE LAW (3 independent pairs): at long seq, per-token converges across batch AND
+config for every recompute-shaped system — the deficit is shared attention/regime physics.
+⇒ R2's "bigger batch beats sup" premise is DEAD on dense; R2's real role is narrower:
+fit the batch that R1 cannot (capacity), at parity per-token where possible. The composed
+scheduler therefore delivers: parity everywhere sup lives + sole coverage beyond sup's
+walls + memory superiority (HBM -12 GiB in R1; host-RAM story per config). Strict tok/s
+wins on dense require shared-cost kernel work (C1a), out of scheduler scope.
+
+### 8.4 Success criterion + current status (honest)
+Target: composed(SCHEDULE) ≥ max(sup-unsloth, sup-recomp, memory-mode) tok/s ∀ (s,B).
+- R1 zone: satisfied BY CONSTRUCTION once the R1 config lands (baseline-equivalent
+  fallback; the fg-emission-OFF config = the asym-as-unsloth shape). IMPLEMENTATION GAP:
+  R1 as a single config token does not exist yet — it is ohbm=FULL + KA + staged + the
+  fg-emission kill; the S-mem-a work in fix_asym.md builds exactly that kill switch.
+- R2 zone: TODAY asym trails ohbm0 by -8..-15% mid-window; S0 attribution says the gap
+  is 120 us/tok of copy traffic (fix_asym S-mem a/b/c) + 46 kernels — recoverable ≥ the
+  145 needed. At the far end of R2 the criterion ALREADY holds (384k parity 426 vs 424;
+  640k MoE parity 732 vs 731).
+- R3 zone: satisfied (asym runs where nothing else does; 424→426 handoff is seamless).
+Convergence loop: land one fix_asym item → re-probe the R2 head-to-heads → move the
+measured R1/R2 boundary left/right accordingly → re-emit this table. The scheduler is
+DONE when the R2 row shows ≥ baselines at 128k/160k (dense) and 128k/192k (llama).
+
+---
+
+## 9. THE UNIFIED φ SCHEDULER (v4, 2026-07-19) — one continuous knob, measured frontier
+
+### 9.0 The knob
+φ ∈ [0,1] = fraction of offloadable bytes moved off HBM, admitted in MEASURED-PRICE order
+(cheapest first). No user preference exists: HBM is always saturated up to SAFE = 0.92·M_phys
+(above it the allocator-churn tax is measured: llama 192k b2 @97.7% = −4%). The scheduler
+COMPUTES φ per workload:
+
+    φ*(model, s, B) = clamp( (M₀(s,B) − SAFE·M_phys) / ΔM_offloadable(s,B), 0, 1 )
+    B* = max{ B : M(φ*; s,B) ≤ SAFE·M_phys }     (batch = capacity-only; convergence law)
+
+"Latency-focused vs memory-focused" is the computed φ*, not a setting.
+
+### 9.1 THE LADDER — measured end-to-end at ONE fixed workload (q3-32b, 128k, b2)
+Monotonicity test (2026-07-19, runs tputL1-L4 + prior R1/sup):
+| φ rung (cumulative) | config token | resv GiB | us/tok | marginal ρ (us/tok/GiB) |
+|---|---|---|---|---|
+| 0. weights resident (ref) | superoffload|unsloth-ohbm0 | 127.9 | 901.0 | — |
+| 1. + weights off | asym|unsloth-ohbm0 + staged (**R1**) | 116.0 | 906.1 | 0.4 (≈free) |
+| 1b. roots graded check | asym|unsloth-ohbm8 (⅛ roots kept) | 133.1 | 904.9 | ≈0 (free, graded) |
+| 2. + MLP fg-managed in HBM | recomp-off-full-fg + KEEP_ACTS (**R2/KA**) | 93.6 | 1044.1 | 6.2 |
+| 3. + attention/recompute-tensors off | asym|unsloth-off-ohbm0 | 86.3 | 1158.7 | 15.7 |
+| 4. + everything off (**R3**) | recomp-off-full-fg defaults | 54.8 | 1843.0 | 21.7 |
+
+VERDICTS: M strictly ↓ (127.9→54.8), marginal price strictly ↑ (0.4 → 6.2 → 15.7 → 21.7) ⇒ Θ(φ) convex
+⇒ "smallest φ that fits = fastest" is optimal, no oscillation, deterministic config emission.
+MEASUREMENT-FORCED CORRECTION to the naive byte-class story: the frontier order is
+weights → roots → **KA-MLP-management** → attention-off → full-MLP-offload — KA precedes
+attention (KA both SAVES memory vs pure recompute −22 GiB AND costs less than attn-off).
+Rung 3 (uns-off) is NOT dominated (leaner than KA, slower) — a true rung, kept.
+
+### 9.2 Segment slopes (per-token memory k, GiB per 1k tok per sample, q3-32b)
+R1 0.47-0.51 · KA 0.34 · memory ~0.31(dense)/0.17(MoE) — these + base_c give closed-form
+regime boundaries: attn-onset s* where 0.47s+base>SAFE·M (≈350k dense b1), KA wall ≈480k,
+memory wall ≈915k (L4 slope 0.175 measured; MoE ~1M). All match the measured record (384k ran KA; walls est).
+
+### 9.3 Emission map (φ → env)
+φ ≤ w-frac → R1 flags; + root-frac → UNSLOTH_GC_OUTER_HBM_EVERY_N grading; crossing KA
+segment → recomp-off-full-fg + KEEP_ACTS_HBM=1 (+staged, dx-staged, AU); crossing attn →
+save_on_cpu path; φ→1 → memory defaults.
+GRANULARITY CORRECTION (owner-caught, 2026-07-19): the expensive segments (KA acts,
+attention saved-tensors, MLP acts) are WITHIN-LAYER transients — produced in layer ℓ's
+backward-recompute, consumed in the same layer's backward, so only ~one layer's transient
+is live at once. Peak = window-max ⇒ per-layer %-offload does NOT grade the peak (20% vs
+80% offloaded = same peak, more traffic = DOMINATED — never emitted). These segments are
+inherently BINARY in peak; the earlier "offload first ⌈frac·L⌉ layers" idea is retracted.
+True graded axes: roots (cross-layer liveness — ohbm-N measured proportional, ohbm8 =
++17 GiB), batch B, and chunk size g bounding the offloaded side's window (class-1 pinned
+g=1024). ⇒ the realizable frontier = ~5 discrete rungs + graded roots + B; the φ equation
+picks the cheapest rung that fits — stepping, not sliding, between expensive rungs, and
+that discreteness is forced by window-max memory accounting (§2.1), not implementation.
+
+### 9.4 ULTRA-LONG VALIDATION (2026-07-19) — the scheduler's own picks, predicted then run
+| ctx|B | φ* selection (computed) | predicted resv | measured | err | result |
+|---|---|---|---|---|---|
+| 448k|1 | KA rung (R1 198✗ → KA 159✓) | 159 GiB | 164.2 (89%) | +3.3% | **380 tok/s, fits** |
+| 576k|1 | memory rung (KA 203✗ → mem 111✓) | 111 GiB | **111.2 (60%)** | +0.2% | **245 tok/s, fits** |
+sup-unsloth at both: DNF (wall ~390k). so-recomp: DNF (wall ~176k). END-TO-END: the φ
+equation selected the regime, predicted the footprint within tolerance (8%), and both
+ultra-long runs completed — dense q3-32b now measured to 576k ctx (3.3× sup's ceiling,
+memory-rung wall ~915k est). System design VALIDATED: convex ladder (§9.1) + correct
+regime selection + exact capacity prediction + ultra-long coverage.
+
+
+## 10′. MERGE TOMBSTONE + RECORD MAP (grafted 2026-07-21; merge_scheduler.md is the ruling doc)
+
+TOMBSTONED as runtime decision machinery (kept offline only, behind
+`asym_scheduler.py --predict`): 42's β-dial (§9 v3.1 of the c14 fork) and the
+water-fill allocator. WHY NOT: (a) τ fits are machine/day-flavored and were
+q3-30b-only — Kevin ruled against µs-as-budget and for hardware-agnostic byte
+thresholding (2026-07-20); (b) BEND/edge-penalty as decision input is
+measured-WORSE (would have rejected llama T2 448k, a recorded FIT); (c) the
+probe rule + byte lines reproduced every recorded decision (asym_scheduler.py
+--replay). The merged runtime rule = feasibility-first over rung-prefix tiers
+with the HOST term and knee-capped batch; see asym_scheduler.py + 
+agent/impls/merge_scheduler.md §2/§3.
+
+The c14 fork's §10 record map is preserved below verbatim (its prompt.md is
+archived as agent/handoffs/prompt_v2_c14.md).
+
+## 10. DESIGN RECORD MAP (2026-07-20) — this doc + three satellites = the full record
+
+THIS FILE = the formulation of record (§0–7 dial, §8 families/fallback, §9 unified
+formula + constants). The remainder lives in:
+- **agent/handoffs/prompt.md** — interface evolution + FINAL FORM: v1 budget → **v2
+  ALLOCATION/WATER-FILL (current: no user knob; batch+residency compete per
+  marginal Δtok/s per GiB; modes = emergent labels)** → v3 hardware-agnosticity
+  (mode selection = byte thresholding from model arch + device capacity; timing =
+  optional 2-probe calibration of the fallback boundary only) + GPU validation log.
+- **scripts/lf/asym_scheduler.py** — executable spec: fitted constants, water-fill,
+  --sweep (regime table generator), --selftest (5 machine-checked cleanness
+  properties: nested shedding, reverse-ρ shed order, monotone tok/s, reserved-HBM
+  nesting, safety monotonicity).
+- **agent/impls/s04-p1-dgx-02-c14/system_summary.md** — tier definitions (T1/T2/T3
+  flag sets + measured prices), defensibility notes (what to claim vs downplay);
+  **test_throughpout_v2.md** — the crossover-point evidence (P1–P5 + 1.6M max-seq)
+  behind every constant.
+Paper skeleton = §9 formulas + prompt.md v2/v3 framing + system_summary tiers +
+the P1–P5/walls tables as the evaluation.
