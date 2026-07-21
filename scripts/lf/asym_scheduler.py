@@ -72,15 +72,17 @@ _DENSE_T2_ENV = {
     "ASYMM_QWEN3_MOE_DOWN_DX_STAGED": "1",
     "ASYMM_FG_ELEMENTWISE_CHUNK_MB": "1024",
 }
-# class-1 MoE pins — embedded in every c14 asym measurement (merge doc §1B)
+# class-1 MoE pins — the FIVE actually embedded in every archived c14 asym run
+# (command.txt verified 2026-07-21: tputsched/tputasl/tputschedb/tputasm).
+# NB fused-addmm + reuse-packed-x are NOT here: 42's ASYM_PINS listed them but
+# ZERO archived c14 runs carry them (grep over all command.txt = 0 hits) —
+# they stay default-off everywhere pending the 2x2 A/B (merge doc §2d′).
 _MOE_PINS = {
     "ASYMM_QWEN3_MOE_FG_LORA_A_FWD_GPU": "1",
     "ASYMM_QWEN3_MOE_FG_DA_GPU": "1",
     "ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS": "0",
     "ASYMM_FG_ELEMENTWISE_CHUNK_MB": "1024",
     "ASYMM_QWEN3_MOE_DOWN_DX_STAGED": "1",
-    "ASYMM_FUSED_LORA_ADDMM": "1",
-    "ASYMM_QWEN3_MOE_FG_REUSE_PACKED_X": "1",
 }
 _MOE_T2_ENV = {   # the c14 keep-acts bundle, as-measured (no panel-cache)
     **_STAGED, **_MOE_PINS,
@@ -124,14 +126,19 @@ MODELS = {
         tiers=(
             # T1 (unsloth-ohbm0) deliberately has NO deep line — c12 §4 "fit
             # pending". T1 is reachable only through the anchor zone.
-            TierLine("T2", "latency", _FG000, dict(_MOE_T2_ENV), 6.3, 0.1895,
+            # slopes anchored on the ARCHIVED runs (2026-07-21 verification):
+            # bundle 183.0 GiB @900k (tputsched-c14) -> m=(183.0-6.3)/900;
+            # shed 151.5 @1.1M (tputschedb) -> 0.132; T3 156.1 @1.6M (tputasm)
+            # -> 0.095. The 800k shed point (147.5) is OFF the shed line —
+            # allocator regime, probe rule covers (ledger 2026-07-21).
+            TierLine("T2", "latency", _FG000, dict(_MOE_T2_ENV), 6.3, 0.1963,
                      host_c=539.0, host_h=0.0,     # RSS anchor @800k (c14 P3)
                      valid_k=(160.0, 900.0),
-                     note="c14 KA bundle; 900k record = this +6 GiB panel-cache"),
-            TierLine("T2B", "balanced", _FG000, dict(_MOE_T2B_ENV), 6.3, 0.1375,
+                     note="c14 KA bundle as-measured (NO panel/fused/reuse)"),
+            TierLine("T2B", "balanced", _FG000, dict(_MOE_T2B_ENV), 6.3, 0.132,
                      host_c=906.0, host_h=0.0,     # RSS anchor @1.1M (c14 P4)
                      valid_k=(160.0, 1200.0)),
-            TierLine("T3", "memory", _FG101, dict(_MOE_T3_ENV), 4.3, 0.100,
+            TierLine("T3", "memory", _FG101, dict(_MOE_T3_ENV), 4.3, 0.095,
                      host_c=925.0, host_h=0.0,     # RSS anchor @1.6M
                      valid_k=(160.0, 1700.0)),
         ),

@@ -33,17 +33,22 @@ ASYM_GEMM_DISPATCH=staged ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM=1 ASYM_SAVED_TENSOR_A
 ```
 ASYM_GEMM_DISPATCH=staged ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM=1 ASYMM_FG_ELEMENTWISE_CHUNK_MB=1024 ASYMM_QWEN3_MOE_DOWN_DX_STAGED=1 bash scripts/lf/tp_probe.sh q3-30b-a3b mrgc3 "asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1" 120000 8
 ```
-- C4 moe-bundle RECORD REPRODUCTION — the tputsched 900k b1 latency
-  emission AS-MEASURED (panel-cache ON because the record had it; this is
-  a record replay, NOT a recipe — the panel-cache quarantine stands).
-  Ref (prompt.md v2 / 42's calibration): 519 tok/s, 183.0 GiB. NB ~99%
-  util — the record's own operating point; expect long steps.
+- C4 moe-bundle RECORD REPRODUCTION — the tputsched-c14 900k b1 run
+  AS-ARCHIVED (env verified from its command.txt 2026-07-21: KA bundle +
+  the 5 base pins; NO panel-cache, NO fused-addmm, NO reuse-packed-x —
+  prompt.md's "incl. panel-cache" claim contradicted the archive; archive
+  wins). Ref (recomputed from its step_samples.json): 519 tok/s,
+  183.0 GiB. NB ~99% util — the record's own operating point; long steps.
 ```
-ASYM_GEMM_DISPATCH=staged ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM=1 ASYMM_ATTN_ACT_KEEP_ACTS_HBM=1 ASYM_GC_SAVE_ON_CPU_OVERRIDE=false ASYM_W_PANEL_CACHE_GB=6 ASYMM_QWEN3_MOE_FG_LORA_A_FWD_GPU=1 ASYMM_QWEN3_MOE_FG_DA_GPU=1 ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=0 ASYMM_FG_ELEMENTWISE_CHUNK_MB=1024 ASYMM_QWEN3_MOE_DOWN_DX_STAGED=1 ASYMM_FUSED_LORA_ADDMM=1 ASYMM_QWEN3_MOE_FG_REUSE_PACKED_X=1 bash scripts/lf/tp_probe.sh q3-30b-a3b mrgc4 "asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1" 900000 1
+ASYM_GEMM_DISPATCH=staged ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM=1 ASYMM_ATTN_ACT_KEEP_ACTS_HBM=1 ASYM_GC_SAVE_ON_CPU_OVERRIDE=false ASYMM_QWEN3_MOE_FG_LORA_A_FWD_GPU=1 ASYMM_QWEN3_MOE_FG_DA_GPU=1 ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=0 ASYMM_FG_ELEMENTWISE_CHUNK_MB=1024 ASYMM_QWEN3_MOE_DOWN_DX_STAGED=1 bash scripts/lf/tp_probe.sh q3-30b-a3b mrgc4 "asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1" 900000 1
 ```
-- C4b moe deep SHED state — ref c14 test_throughpout_v2 P3 row (800k b1):
-  597 tok/s, 147.5 GiB. Staged + pins, NO keep-acts flags, NO GC override —
-  read the row's exact env from its archived command.txt before running.
+- C4b moe deep SHED state — ref c14 P3 (800k b1), archive-verified
+  (tputasl-c14 step_samples: 596 tok/s, 147.5 GiB, RSS 539). Env from its
+  command.txt: staged + ker000 + the 5 base pins ONLY (no KA, no GC
+  override, no fused/reuse/panel):
+```
+ASYM_GEMM_DISPATCH=staged ASYMM_QWEN3_MOE_FG_LORA_A_FWD_GPU=1 ASYMM_QWEN3_MOE_FG_DA_GPU=1 ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=0 ASYMM_FG_ELEMENTWISE_CHUNK_MB=1024 ASYMM_QWEN3_MOE_DOWN_DX_STAGED=1 bash scripts/lf/tp_probe.sh q3-30b-a3b mrgc4b "asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1" 800000 1
+```
 - C5 parity — ref 1110 tok/s (DONOR fix_asym ledger :18; after S6, the
   merged fix_asym)
 ```
@@ -344,9 +349,9 @@ HBM; RSS where the cell carries it). All asym_cpuadamwds. Rows 1/2 = C1/C2
 | 4 | llama3.3-70b | T1 192k b1 | dense-70B T1 terminal, parity +0.3% | c12 results tables |
 | 5 | llama3.3-70b | T2 384k b1 | deep T2, near-wall (178.6 GiB, the +4.4% drift point) | c12 |
 | 6 | llama3.3-70b | T2 448k b1 | WALL — llama's deepest FIT | c12 W-phase: 275 tok/s · 180.1 GiB (97.3%) · RSS 983. (T3 EXCLUDED for llama BY DESIGN — host inversion; do NOT run llama T3) |
-| 7 | q3-30b-a3b | T1 80k b8 | short, BIG-BATCH regime (anchor zone) | c14 table P1: 3642 tok/s · 84.7 GiB (46%) |
-| 8 | q3-30b-a3b | 800k b1 (T1-LAT shed) = C4b | deep, sole-survivor crossover | c14 P3: 597 tok/s · 147.5 GiB (80%) · RSS 539 |
-| 9 | q3-30b-a3b | 1.1M b1 (T2-BAL per c14 column) | ultra-deep + heaviest RSS | c14 P4: 382 tok/s · 151.5 GiB (82%) · RSS 906 |
+| 7 | q3-30b-a3b | KA dial 120k b8 (= C3) | short-ish, big-batch, KA state | scheduler_v2 §3b L3 (180.0 GiB; s/it in row). SUBSTITUTED for the 80k P1 cell: no archived asym 80k/64k b8 run exists in either tree (audit 2026-07-21) — P1's env is unreproducible verbatim |
+| 8 | q3-30b-a3b | 800k b1 shed = C4b | deep, sole-survivor crossover | c14 P3 / tputasl-c14 archives: 596-597 tok/s · 147.5 GiB · RSS 539. Env verified: staged + ker000 + 5 base pins, NO KA flags |
+| 9 | q3-30b-a3b | 1.1M b1 shed | ultra-deep + heaviest RSS | c14 P4 / tputschedb-c14: 382 tok/s · 151.5 GiB · RSS 906. Env verified: same shed state as row 8 (c14's "T2-BAL" label) |
 Row env comes from the row's archived command.txt, verbatim. If a chosen
 row's archive entry turns out to lack a complete metric triple, substitute
 the nearest seq that has one and note it in the ledger.
@@ -378,6 +383,22 @@ Validation: grep-checks (`§5a` present exactly once; prompt_v2_c14.md
 exists; c14_old present; §10 present).
 
 ## 7. STATUS LEDGER (append-only; every gate writes a line)
+
+- [ARCHIVE AUDIT 2026-07-21 — MAJOR CORRECTION] grep over EVERY archived c14
+  command.txt: fused-addmm, reuse-packed-x, panel-cache appear in ZERO c14
+  runs — 42's ASYM_PINS were never measured; prompt.md's "900k incl.
+  panel-cache" is contradicted by tputsched-c14's own command.txt. Verified
+  measured envs: 900k bundle = staged+ker000+MoE-KA+attn-KA+GC-save-hbm+5
+  base pins (519 tok/s / 183.0 GiB from its step_samples); 800k + 1.1M =
+  shed (staged+ker000+5 pins, no KA) 596/147.5/539 + 382/151.5/906; 1.6M T3
+  = ker101 no-staged + 5 pins, 287-292 tok/s / 156.1 GiB. Actions: MoE pins
+  in recipes reduced to the 5 measured; T2 recipe = archived bundle env;
+  C4/C4b fences corrected; MoE lines re-anchored on the archived points
+  (T2 m=0.1963, T2B 0.132, T3 0.095); merge_scheduler.md §0/§1B/§2b/§2d′
+  corrected. Selftest 5/5 + replay 18/18 re-PASS after re-anchoring. Also:
+  no archived asym 80k/64k b8 run exists (P1 cell unreproducible verbatim)
+  → S7 row 7 = the 120k×8 dial point; the 800k shed point (147.5) is OFF
+  the shed line fit through 1.1M (allocator regime) — noted, probe covers.
 
 - [S0 2026-07-21] Plan written; reference set C1–C5 fixed; bands defined.
 - [S0 2026-07-21] S7 added (Kevin): 3×3 post-merge no-regression matrix,

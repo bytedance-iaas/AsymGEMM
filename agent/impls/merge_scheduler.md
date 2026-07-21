@@ -47,9 +47,11 @@ validation gate renumbered to step 8 with new item (e).
   forwarding); a `backend|TIER` preset layer in the driver (§3 step 7)
   replaces hand-composed flag sets — backend never auto-picked, names stay
   full-fidelity.
-- PERF: dense unchanged (no-regression gate (c)); MoE gains 42's measured
-  recipes (pins + keep-acts bundle as-measured); parked upside behind named
-  A/Bs: panel-cache short-seq dense, fused-addmm/reuse on dense.
+- PERF: dense unchanged (no-regression gate (c)); MoE recipes = the
+  archived c14 configurations verbatim (5 base pins; T2 adds the KA bundle
+  incl. attn-KA); parked upside behind named A/Bs: panel-cache,
+  fused-addmm, reuse-packed-x (NONE measured in any c14 run — archive
+  audit 2026-07-21), async-pack.
 
 ## 1. Difference inventory
 
@@ -108,15 +110,20 @@ validation gate renumbered to step 8 with new item (e).
   files are the ONLY genuine source-code divergence. Zero CUDA/C++/kernel
   diffs, zero csrc, zero integrations/profiling changes — the compiled engine
   is identical lineage on both sides. Everything else is scripts/docs/figures.
-- MEASUREMENT-EMBEDDING nuance: 42's scheduler pins `ASYMM_FUSED_LORA_ADDMM=1`
-  and `ASYMM_QWEN3_MOE_FG_REUSE_PACKED_X=1` on EVERY asym run (ASYM_PINS) —
-  so all c14 MoE numbers EMBED those two features. They are load-bearing for
-  the MoE recipes (removing them invalidates c14's constants); they were
-  ABSENT from every c12 dense number. Hence the quarantine is SCOPED: MoE
-  recipes keep 42's pins as-measured; dense recipes exclude all five features
-  until A/B'd on the merged tree. Panel-cache was NOT pinned (a dialable rung,
-  measured worth only −3 us/tok for +6 GiB) — quarantined everywhere;
-  async-pack was neither pinned nor a rung (see §2d′ — measured NULL).
+- MEASUREMENT-EMBEDDING — CORRECTED BY ARCHIVE AUDIT (2026-07-21, supersedes
+  the earlier claim): 42's scheduler CODE pins `ASYMM_FUSED_LORA_ADDMM=1` +
+  `ASYMM_QWEN3_MOE_FG_REUSE_PACKED_X=1` (ASYM_PINS) — but grep over EVERY
+  archived c14 command.txt (tputsched 900k, tputasl 800k, tputschedb 1.1M,
+  tputasm 1.4/1.6M, + all others) shows ZERO runs with either flag, and none
+  with panel-cache. The ASYM_PINS were aspirational (for future emissions),
+  never measured. ⇒ the c14 record embeds exactly FIVE base pins
+  (LORA_A_FWD_GPU=1, DA_GPU=1, DOWN_SCATTER=0, CHUNK_MB=1024, DX_STAGED=1),
+  and the 900k bundle adds MoE-KA + attn-KA + GC-save-hbm. RULING (revised):
+  ALL FIVE new source features are default-off EVERYWHERE — none rides any
+  recipe; attn-KA appears in the T2-MoE recipe ONLY (it IS in the measured
+  900k bundle). fused-addmm/reuse-packed-x/panel-cache/async-pack: unwired,
+  each pending its named promotion test (§2d′). This SIMPLIFIES the merge:
+  no feature is load-bearing for any measured constant.
   Dense cross-check from 42's OWN record (fix_asym ledger, q3-32b 128k
   tputask ladder): fg + attn-KA + GC-save-HBM peaked at 1058 tok/s vs T1
   1104 / sup-unsloth 1110 ⇒ the new features do NOT change any dense pick
@@ -228,8 +235,9 @@ only as the offline `--predict` reporter, never the runtime decision.
 ⇒ MERGE RULE: exactly 40's THREE modes, tokens and flags unchanged. 42's
 extra KEEP-ACTS flags (attn-KA + GC-save override) appear in ONE place only:
 the T2-MoE recipe, to reproduce c14's measured keep-acts configuration (the
-fused-addmm/reuse-packed-x PINS ride all MoE asym recipes per §1B — a
-different, wider scope). No new modes. No re-bundling.
+FIVE archive-verified base pins ride all MoE asym recipes per §1B;
+fused-addmm/reuse-packed-x ride NOTHING — archive audit 2026-07-21). No new
+modes. No re-bundling.
 
 ### 2c. The line fits (who predicts better)
 Same linear form both sides; different content. 40: memory-only, per
@@ -254,7 +262,7 @@ accurate and more defensible than either alone, at identical math complexity.
 | noclone (40's) | **NULL in tested context** (q32 128k KA) | one point | keep code UNWIRED — concretely: `_keep_stage_noclone_enabled()` + `mutable=` annotations stay in source; the driver LF-forwarding line is dropped (:3844 resolves to 42's attn-KA line, §1C); no recipe emits it |
 | async-pack D2H (42's, missed by 1st pass) | **NULL** (tputask5: 1056 vs 1058 tok/s, +0.8 us/tok; its unpack twin also NULL) | q3-32b 128k dense, GC-save-HBM b2 (42's fix_asym ledger) | keep code UNWIRED — 42's own ruling ("harmless, flag-gated, may matter under future prefetch"); neither pinned nor a rung ⇒ NOT embedded in c14 numbers |
 | panel-cache (42's) | **SMALL POSITIVE** (−3 us/tok ≈ 0.2%) | c14 120k×8 MoE | quarantine + PROMOTION TEST: at SHORT seq the staging tax is proportionally larger (llama 8k: staging ~0.16s est. vs ~6-8s step ⇒ 2-3% hypothesis) and headroom is plentiful — A/B dense short-seq T1 ± cache before judging |
-| fused-addmm, reuse-packed-x (42's) | unknown INDIVIDUALLY; **embedded in a measured-good bundle** (all c14 asym numbers include them) | c14 MoE | keep in MoE recipes as-measured; isolate later (2×2 A/B at MoE T2 576k); dense: off until measured |
+| fused-addmm, reuse-packed-x (42's) | **UNMEASURED on MoE** (archive audit 2026-07-21: in NO archived c14 run — the "embedded in the bundle" claim was false; 42's ASYM_PINS never ran). Dense: fused-addmm has one positive ledger point (C2 step-1, q3-32b 128k) | c14 archives + 42's ledger | default-off EVERYWHERE, in no recipe; promotion test = 2×2 A/B at MoE T2 (and a dense confirm) |
 | cross-family emission | dense: NULL (parity ±0.7%) · MoE short-seq: at 64k recomp 5919 MEASURED (c12 lead-in row) vs asym ~4200 ANCHOR ESTIMATE (asym never RUN at 64k; the earlier "+29%" figure was unsourced), and measured 80k already flips to asym T1 +6% (3642 vs 3424) | c12 + c14 | scoped: optional anchors-based fallback for MoE <80k only — window at most (64k, 80k), needs a real asym 64k run first (pending Kevin — §4) |
 
 Rule going forward: "drop" is reserved for measured-WORSE or
