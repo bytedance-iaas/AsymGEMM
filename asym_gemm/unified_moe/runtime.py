@@ -2,8 +2,12 @@
 
 Per-expert dispatch, two modes:
 - static (default): routed token count vs threshold —
-    m_e <= m_cpu  → CPU AMX INT8 path (cpu_gemm, stride-aware row-major B)
-    m_e >  m_cpu  → SM90 INT8 grouped-MoE WGMMA kernel (asym_gemm)
+    m_e <= m_cpu  → CPU INT8 path (cpu_gemm, stride-aware row-major B;
+                    AMX when available, else AVX512-VNNI — see
+                    _cpu_C caps()/cg_int8_rm_backend_name)
+    m_e >  m_cpu  → GPU INT8 grouped-MoE kernel (asym_gemm; SM90 WGMMA
+                    1d1d on Hopper, SM80 mma.s8 cp.async kernel on A100 —
+                    routed by the m_grouped_int8_asym_gemm_nt_* facades)
   plus the ASYMGEMM_CPU_PREFILL_FRACTION large-batch heuristic below.
 - adaptive (``adaptive=True`` or ``set_adaptive()``): a runtime cost model
   partitions the streamed experts to balance the two buckets' predicted
@@ -125,6 +129,35 @@ def _stage_streamed() -> bool:
     """ASYMGEMM_STAGE_STREAMED=0 disables copy-engine staging of streamed
     expert weights (falls back to in-kernel TMA reads of pinned host)."""
     return os.getenv("ASYMGEMM_STAGE_STREAMED", "1") == "1"
+
+
+# ---------------------------------------------------------------------------
+# HBM grouped-GEMM kernel selection (hybridGEMM.md Phase A, exit gate A)
+#
+# The cached partition's expert weights live in HBM, where the asym kernel's
+# K-outer loop (single-slot B, per-K-block TMA_REDUCE_ADD round-trips) is the
+# wrong trade: it was shaped for a ~21.5 GB/s PCIe link. The deep-pattern
+# kernel (persistent M-outer, kNumStages-deep A+B pipeline, full-K register
+# accumulation, plain TMA_STORE) streams HBM weights ~2.2x faster at decode
+# and ~1.9x at prefill (H200, G=64/N=2048/K=1024). Streamed (pinned-host)
+# partitions must stay on the asym kernel: the M-outer loop re-reads B per
+# m-block, which is ruinous over PCIe.
+# ---------------------------------------------------------------------------
+
+def _hbm_grouped_gemm():
+    """Grouped-GEMM entry point for HBM-resident (cached-partition) weights.
+
+    ASYMGEMM_HBM_KERNEL=deep (default) | asym. Falls back to the asym kernel
+    when the deep facade is absent from the build or the device is not SM90
+    (the deep persistent kernel is Hopper-only today; on SM80/A100 the
+    cached partition reuses the asym kernel, matching pre-hybridGEMM
+    behavior — unified_kernel_sm80.md Phase 3 will lift this)."""
+    if (os.getenv("ASYMGEMM_HBM_KERNEL", "deep") == "deep"
+            and torch.cuda.get_device_capability()[0] == 9):
+        fn = getattr(asym_gemm, "m_grouped_int8_gemm_nt_contiguous", None)
+        if fn is not None:
+            return fn
+    return asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous
 
 
 class _StageRing:
@@ -439,11 +472,20 @@ class Layer:
         y          : (T, hidden) torch.bfloat16 on the same device as x
 
     ``hidden`` and ``inter`` must each be multiples of ``GRAN_K=128`` (the
-    K-block granularity required by sm90_int8_asym_gemm_1d1d).
+    K-block granularity required by both the SM90 1d1d and SM80 INT8 kernels).
     """
 
     weight_residency = "pinned_host"
-    gpu_backend = "asym_gemm_sm90_int8_1d1d"
+
+    @property
+    def gpu_backend(self) -> str:
+        """Observability tag for the INT8 GPU kernel the facade routes to."""
+        major, minor = torch.cuda.get_device_capability()
+        if major == 9:
+            return "asym_gemm_sm90_int8_1d1d"
+        if (major, minor) == (8, 0):
+            return "asym_gemm_sm80_int8"
+        return f"asym_gemm_unsupported_sm{major}{minor}"
 
     def __init__(
         self,
@@ -1200,15 +1242,18 @@ class Layer:
         sfa_h = sA.unsqueeze(1).expand(M_grouped, kb_h).contiguous()
 
         if kind == "cached":
+            # HBM-resident weights: deep-pattern kernel (ASYMGEMM_HBM_KERNEL).
+            gemm_fn = _hbm_grouped_gemm()
             # Fused gate+up: one grouped call over the [Nc, 2I, H] cache.
             d_gu = torch.empty(M_grouped, 2 * I, device=dev, dtype=torch.float32)
-            asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
+            gemm_fn(
                 (a_int8, sfa_h), (self.cache_gateup_int8, self.cache_gateup_sfb),
                 d_gu, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
             )
             act = torch.nn.functional.silu(d_gu[:, :I]) * d_gu[:, I:]
             down_b, down_sfb = self.cache_down_int8, self.cache_down_sfb
         else:
+            gemm_fn = asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous
             gs = slab.g_split
             if kind == "staged":
                 ring, slot_i, ready_ev, ids_t = staged
@@ -1266,7 +1311,7 @@ class Layer:
         sfa_i = sA2.unsqueeze(1).expand(M_grouped, kb_i).contiguous()
 
         d_down = torch.empty(M_grouped, H, device=dev, dtype=torch.float32)
-        asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
+        gemm_fn(
             (a2_int8, sfa_i), (down_b, down_sfb),
             d_down, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
         )
