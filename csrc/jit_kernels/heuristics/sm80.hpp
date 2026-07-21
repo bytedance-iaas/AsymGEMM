@@ -135,5 +135,32 @@ inline SM80GemmConfig select_sm80_fp8_config(int arch_major, int arch_minor,
     return SM80GemmConfig{128u, block_n, block_k, 4u};
 }
 
+// ── INT8 helpers (SM80 mma.m16n8k32.s8, K-outer M-inner loop) ────────────────
+//
+// BLOCK_K is locked to 128 (the per-128-K scale granularity: one exact S32
+// accumulation + one dequant per K-tile). Smem:
+//   sX: BLOCK_M * 128 * 1 B
+//   sW: BLOCK_N * 128 * 1 B
+//   scales: (BLOCK_M + BLOCK_N) * 4 B
+// For BLOCK_M=BLOCK_N=128 that is 33 KB — fits every SM80+ part without the
+// >48 KB dynamic-smem opt-in, and allows multiple CTAs/SM.
+inline int smem_bytes_int8(uint32_t block_m, uint32_t block_n, uint32_t block_k) {
+    return static_cast<int>((block_m + block_n) * block_k
+                            + (block_m + block_n) * 4);
+}
+
+// Config selector for the INT8 asym kernel. K must be a multiple of 128
+// (asserted at the API boundary). block_n: largest of {128, 64, 32} dividing N.
+inline SM80GemmConfig select_sm80_int8_config(int arch_major, int arch_minor,
+                                              int N, int K) {
+    (void)arch_major; (void)arch_minor;  // smem fits every arch; no cap logic
+    constexpr uint32_t block_k = 128u;
+    uint32_t block_n = 32u;
+    for (uint32_t bn : {128u, 64u, 32u}) {
+        if (N % static_cast<int>(bn) == 0) { block_n = bn; break; }
+    }
+    return SM80GemmConfig{128u, block_n, block_k, 4u};
+}
+
 }  // namespace sm80
 }  // namespace asym_gemm

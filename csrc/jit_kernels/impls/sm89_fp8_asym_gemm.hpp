@@ -12,7 +12,7 @@
 #include "../../utils/exception.hpp"
 #include "../../utils/format.hpp"
 #include "../heuristics/sm80.hpp"
-#include <asym_gemm/impls/sm80_moe_params.h>
+#include <asym_gemm/impls/sm89_fp8_moe_params.h>
 
 namespace asym_gemm {
 
@@ -30,8 +30,8 @@ public:
     static std::string generate_impl(const Args& args) {
         const auto& c = args.gemm_config;
         return fmt::format(R"(
-// sm89 moe fp8 v3: block-scale with multi-group K-tiles
-#include <asym_gemm/impls/sm80_moe_gemm.cuh>
+// sm89 moe fp8 v4: split header (sm89_fp8_moe_gemm.cuh)
+#include <asym_gemm/impls/sm89_fp8_moe_gemm.cuh>
 using namespace asym_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(
@@ -126,8 +126,8 @@ public:
     static std::string generate_impl(const Args& args) {
         const auto& c = args.gemm_config;
         return fmt::format(R"(
-// sm89 moe fp8 v3: block-scale with multi-group K-tiles
-#include <asym_gemm/impls/sm80_moe_gemm.cuh>
+// sm89 moe fp8 v4: split header (sm89_fp8_moe_gemm.cuh)
+#include <asym_gemm/impls/sm89_fp8_moe_gemm.cuh>
 using namespace asym_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(

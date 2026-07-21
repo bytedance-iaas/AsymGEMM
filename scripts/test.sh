@@ -45,8 +45,9 @@ PY
 )
 
 case "$SM" in
+  80)  TESTS=(tests/test_arch_compile_gates.py tests/test_sm80_int8_asym.py) ;;
   89)  TESTS=(tests/test_sm89_moe.py) ;;
-  90)  TESTS=(tests/test_bf16_asym_gemm.py tests/test_fp8_asym_gemm.py tests/test_sm90_int8.py) ;;
+  90)  TESTS=(tests/test_bf16_asym_gemm.py tests/test_fp8_asym_gemm.py tests/test_sm90_int8.py tests/test_sm80_int8_asym.py) ;;
   100) TESTS=(tests/test_bf16_asym_gemm.py tests/test_fp8_asym_gemm.py tests/test_fp4_asym_gemm.py) ;;
   none)
     echo "[FATAL] No CUDA GPU detected. AsymGEMM tests require a CUDA device." >&2
