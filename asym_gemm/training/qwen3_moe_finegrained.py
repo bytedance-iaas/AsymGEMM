@@ -197,14 +197,26 @@ class _HBMKeepHandle:
         self.nbytes = int(tensor.numel()) * tensor.element_size()
 
 
+def _keep_stage_noclone_enabled() -> bool:
+    """fix_asym S-mem-b (2026-07-18): the always-clone stage() moved ~13 TB/step of
+    D2D at q3-32b 128k b3 (nsys receipt). With this flag, stage() returns the kept
+    tensor directly for call sites audited as READ-ONLY (mutable=False) and clones
+    only for in-place consumers. Default off = byte-identical to the original."""
+    return _env_flag_default_off("ASYMM_FG_KEEP_STAGE_NOCLONE")
+
+
 class _HBMKeepManager:
     """ActivationOffloadManager stand-in when keep-acts-HBM is on: offload()
     keeps the GPU tensor; stage() returns a fresh CLONE because staged buffers
-    are mutated in place by the silu/mul consumers; everything else no-ops."""
+    are mutated in place by the silu/mul consumers (or, under
+    ASYMM_FG_KEEP_STAGE_NOCLONE=1, the kept tensor directly for call sites that
+    declare mutable=False); everything else no-ops."""
 
     def __init__(self) -> None:
         self.kept_bytes_peak = 0
         self._live_bytes = 0
+        self.stage_clone_bytes = 0
+        self.stage_noclone_bytes = 0
 
     def offload(self, tensor: torch.Tensor, tag: str) -> _HBMKeepHandle:
         handle = _HBMKeepHandle(tensor)
@@ -212,8 +224,15 @@ class _HBMKeepManager:
         self.kept_bytes_peak = max(self.kept_bytes_peak, self._live_bytes)
         return handle
 
-    def stage(self, handle: _HBMKeepHandle, *, tag: str) -> torch.Tensor:
-        return handle.tensor.clone()
+    def stage(self, handle: _HBMKeepHandle, *, tag: str, mutable: bool = True) -> torch.Tensor:
+        # mutable defaults True so UNAUDITED call sites keep the clone-safe
+        # behavior even with the flag on; audited read-only sites pass
+        # mutable=False explicitly (dense_mlp_finegrained, 2026-07-18).
+        if mutable or not _keep_stage_noclone_enabled():
+            self.stage_clone_bytes += handle.nbytes
+            return handle.tensor.clone()
+        self.stage_noclone_bytes += handle.nbytes
+        return handle.tensor
 
     def wait_cpu_ready(self, handle: _HBMKeepHandle) -> None:
         return None
@@ -237,6 +256,8 @@ class _HBMKeepManager:
         return {
             "fg_keep_acts_hbm": True,
             "hbm_kept_bytes_peak": int(self.kept_bytes_peak),
+            "keep_stage_clone_bytes": int(self.stage_clone_bytes),
+            "keep_stage_noclone_bytes": int(self.stage_noclone_bytes),
         }
 
 

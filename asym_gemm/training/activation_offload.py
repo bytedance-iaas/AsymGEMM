@@ -348,7 +348,10 @@ class ActivationOffloadManager:
         elif torch.cuda.is_available() and handle.original_device.type == "cuda":
             torch.cuda.current_stream(handle.original_device).synchronize()
 
-    def stage(self, handle: CPUActivationHandle, *, tag: str | None = None) -> torch.Tensor:
+    def stage(self, handle: CPUActivationHandle, *, tag: str | None = None, mutable: bool = True) -> torch.Tensor:
+        # mutable is an HBMKeep-manager hint (fix_asym S-mem-b); this CPU manager
+        # always materializes a fresh GPU staging buffer, so it is inherently
+        # mutation-safe and ignores the hint.
         self.wait_cpu_ready(handle)
         stage_tag = handle.tag if tag is None else tag
         shape = tuple(int(dim) for dim in handle.tensor.shape)

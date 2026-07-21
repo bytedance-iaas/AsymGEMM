@@ -12,12 +12,18 @@ import json
 import random
 import sys
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import mean
 from typing import Any
 
 from datasets import load_dataset
+
+# Let the Rust tokenizer parallelize batch encodes across cores (rayon). Batch ids are
+# bit-identical to one-at-a-time encode() (asserted by scripts/lf tests); only wall time changes.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+
 from transformers import AutoTokenizer, Seq2SeqTrainingArguments
 
 
@@ -288,6 +294,17 @@ def _stable_id(conversations: list[dict[str, str]]) -> str:
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
+def _batch_token_lengths(tokenizer: Any, texts: list[str], chunk: int = 64) -> list[int]:
+    # One batched call per chunk parallelizes across cores in Rust; per-text ids (and
+    # therefore lengths) are identical to len(tokenizer.encode(text, add_special_tokens=False)).
+    # Chunking bounds peak RAM (the returned python id lists are the expensive part).
+    lengths: list[int] = []
+    for start in range(0, len(texts), chunk):
+        batch = tokenizer(texts[start : start + chunk], add_special_tokens=False)["input_ids"]
+        lengths.extend(len(ids) for ids in batch)
+    return lengths
+
+
 def _sample_split(
     dataset_name: str,
     config: str,
@@ -306,38 +323,57 @@ def _sample_split(
     records: list[dict[str, Any]] = []
     lengths: list[int] = []
     skipped = {"short": 0, "duplicate": 0, "invalid": 0, "scanned": 0}
-    for idx in indices:
-        skipped["scanned"] += 1
-        row = dataset[int(idx)]
-        conversations, system = _normalize_messages(row)
-        if not conversations:
-            skipped["invalid"] += 1
-            continue
-        record_id = _stable_id(conversations)
-        if record_id in used_ids:
-            skipped["duplicate"] += 1
-            continue
-        record = {
-            "id": record_id,
-            "conversations": conversations,
-            "system": system,
-            "source": row.get("source", dataset_name),
-            "source_config": config,
-            "source_split": split,
-            "source_index": int(idx),
-            "source_tokens": row.get("tokens", row.get("conversation_tokens")),
-        }
-        token_length = len(tokenizer.encode(_record_text(record), add_special_tokens=False))
-        if token_length < min_tokens:
-            skipped["short"] += 1
-            continue
-        record["token_length"] = token_length
-        record["truncated_by_cutoff"] = token_length > cutoff_len
-        records.append(record)
-        lengths.append(token_length)
-        used_ids.add(record_id)
-        if len(records) >= count:
-            break
+    # Chunked scan: normalize a slice of candidates, tokenize them in ONE batched call
+    # (parallel in Rust), then accept in the original stream order — counters, dedup
+    # semantics, and output records are byte-identical to the one-at-a-time loop (a
+    # candidate that the serial loop would dup-skip before encoding is merely encoded
+    # and discarded here; the extra encode changes nothing downstream).
+    pos = 0
+    while len(records) < count and pos < len(indices):
+        batch_indices = indices[pos : pos + 64]
+        pos += 64
+        prepared: list[tuple[dict[str, Any] | None, str | None]] = []
+        texts: list[str] = []
+        for idx in batch_indices:
+            row = dataset[int(idx)]
+            conversations, system = _normalize_messages(row)
+            if not conversations:
+                prepared.append((None, None))
+                continue
+            record = {
+                "id": _stable_id(conversations),
+                "conversations": conversations,
+                "system": system,
+                "source": row.get("source", dataset_name),
+                "source_config": config,
+                "source_split": split,
+                "source_index": int(idx),
+                "source_tokens": row.get("tokens", row.get("conversation_tokens")),
+            }
+            prepared.append((record, record["id"]))
+            texts.append(_record_text(record))
+        token_lengths = _batch_token_lengths(tokenizer, texts)
+        text_pos = 0
+        for record, record_id in prepared:
+            if len(records) >= count:
+                break
+            skipped["scanned"] += 1
+            if record is None:
+                skipped["invalid"] += 1
+                continue
+            token_length = token_lengths[text_pos]
+            text_pos += 1
+            if record_id in used_ids:
+                skipped["duplicate"] += 1
+                continue
+            if token_length < min_tokens:
+                skipped["short"] += 1
+                continue
+            record["token_length"] = token_length
+            record["truncated_by_cutoff"] = token_length > cutoff_len
+            records.append(record)
+            lengths.append(token_length)
+            used_ids.add(record_id)
 
     if len(records) < count:
         raise RuntimeError(
@@ -386,19 +422,35 @@ def _concat_split(
             )
         return tok_cache[pool_idx]
 
+    if count * target >= 32_000_000:
+        # Big builds (e.g. 512 rows x >=64k tokens) draw the pool many times over;
+        # pre-encoding it in one batched pass (parallel) just fills tok_cache early —
+        # cache values are identical to the lazy fills, and the rng stream is untouched.
+        # Small builds skip this: lazily encoding only the drawn conversations is cheaper.
+        pool_lengths = _batch_token_lengths(
+            tokenizer, [_record_text({"conversations": conv}) for conv in pool], chunk=256
+        )
+        tok_cache.update(enumerate(pool_lengths))
+
     records: list[dict[str, Any]] = []
     lengths: list[int] = []
     segments: list[int] = []
-    for _ in range(count):
+
+    def _cheap_plan() -> tuple[list[dict[str, str]], int]:
+        merged: list[dict[str, str]] = []
+        approx = 0
+        n_seg = 0
+        while approx < target:  # cheap pass using cached per-conversation token counts
+            pick = rng.choice(indices)
+            merged += pool[pick]
+            approx += _conv_tokens(pick)
+            n_seg += 1
+        return merged, n_seg
+
+    def _serial_row() -> tuple[list[dict[str, str]], int, int, str]:
+        # The original one-at-a-time algorithm, verbatim (fallback path).
         while True:
-            merged: list[dict[str, str]] = []
-            approx = 0
-            n_seg = 0
-            while approx < target:  # cheap pass using cached per-conversation token counts
-                pick = rng.choice(indices)
-                merged += pool[pick]
-                approx += _conv_tokens(pick)
-                n_seg += 1
+            merged, n_seg = _cheap_plan()
             token_length = len(tokenizer.encode(_record_text({"conversations": merged}), add_special_tokens=False))
             while token_length < cutoff_len:  # safety: guarantee the row truly fills cutoff_len
                 pick = rng.choice(indices)
@@ -407,22 +459,53 @@ def _concat_split(
                 token_length = len(tokenizer.encode(_record_text({"conversations": merged}), add_special_tokens=False))
             record_id = _stable_id(merged)
             if record_id not in used_ids:
-                break  # else (astronomically rare) regenerate a fresh row from the rng stream
-        record = {
-            "id": record_id,
-            "conversations": merged,
-            "system": "",
-            "source": dataset_name,
-            "source_config": config,
-            "source_split": split,
-            "concat_segments": n_seg,
-            "token_length": token_length,
-            "truncated_by_cutoff": token_length > cutoff_len,
-        }
-        records.append(record)
+                return merged, n_seg, token_length, record_id
+            # else (astronomically rare) regenerate a fresh row from the rng stream
+
+    def _emit(merged: list[dict[str, str]], n_seg: int, token_length: int, record_id: str) -> None:
+        records.append(
+            {
+                "id": record_id,
+                "conversations": merged,
+                "system": "",
+                "source": dataset_name,
+                "source_config": config,
+                "source_split": split,
+                "concat_segments": n_seg,
+                "token_length": token_length,
+                "truncated_by_cutoff": token_length > cutoff_len,
+            }
+        )
         lengths.append(token_length)
         segments.append(n_seg)
         used_ids.add(record_id)
+
+    # Fast path: run the cheap planning pass for every row first (the rng draw stream is
+    # exactly the serial one), true-tokenize all planned rows in parallel batches, then
+    # accept rows in order. A planned row is exactly what the serial algorithm would have
+    # produced unless its true length lands under cutoff_len or its id collides (~never:
+    # target has 2% overshoot and ids are sha1s) — on the first such row, rewind the rng
+    # to that row's saved state and continue with the verbatim serial algorithm, so the
+    # output bytes are identical to the original builder in every case.
+    plans: list[tuple[Any, list[dict[str, str]], int]] = []
+    for _ in range(count):
+        rng_state = rng.getstate()
+        merged, n_seg = _cheap_plan()
+        plans.append((rng_state, merged, n_seg))
+    true_lengths = _batch_token_lengths(
+        tokenizer, [_record_text({"conversations": merged}) for _, merged, _ in plans]
+    )
+    fallback_from = -1
+    for row_idx, ((rng_state, merged, n_seg), token_length) in enumerate(zip(plans, true_lengths)):
+        record_id = _stable_id(merged)
+        if token_length < cutoff_len or record_id in used_ids:
+            fallback_from = row_idx
+            rng.setstate(rng_state)
+            break
+        _emit(merged, n_seg, token_length, record_id)
+    if fallback_from >= 0:
+        for _ in range(fallback_from, count):
+            _emit(*_serial_row())
 
     info = {
         "mode": "concat",
@@ -627,15 +710,30 @@ def _update_dataset_info(lf_dir: Path, train_name: str, eval_name: str) -> None:
 
 
 def _load_existing_jsonl(path: Path, tokenizer: Any) -> tuple[list[dict[str, Any]], list[int]]:
+    # Audit/reuse path: runs before EVERY training run on an existing dataset, so it must
+    # not re-tokenize a ~700MB corpus. Our builder stamps token_length (computed with this
+    # same tokenizer/text at build time) into every record — reuse it; batch-tokenize only
+    # records that lack the field (foreign jsonls). Stats derived from these lengths are
+    # byte-identical to a full re-encode.
     records: list[dict[str, Any]] = []
     lengths: list[int] = []
+    missing_pos: list[int] = []
+    missing_texts: list[str] = []
     with path.open(encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
                 continue
             record = json.loads(line)
             records.append(record)
-            lengths.append(len(tokenizer.encode(_record_text_any(record), add_special_tokens=False)))
+            token_length = record.get("token_length")
+            if isinstance(token_length, int) and not isinstance(token_length, bool):
+                lengths.append(token_length)
+            else:
+                missing_pos.append(len(lengths))
+                lengths.append(-1)
+                missing_texts.append(_record_text_any(record))
+    for pos, token_length in zip(missing_pos, _batch_token_lengths(tokenizer, missing_texts)):
+        lengths[pos] = token_length
     return records, lengths
 
 
@@ -1003,6 +1101,7 @@ def main() -> None:
     train_path = data_dir / f"{args.train_name}.jsonl"
     eval_path = data_dir / f"{args.eval_name}.jsonl"
 
+    phase_t = time.time()
     both_files_exist = train_path.exists() and eval_path.exists()
     one_file_exists = train_path.exists() or eval_path.exists()
     use_existing = args.audit_only or (both_files_exist and not args.overwrite)
@@ -1074,6 +1173,8 @@ def main() -> None:
         _write_jsonl(eval_path, eval_records)
         _update_dataset_info(lf_dir, args.train_name, args.eval_name)
 
+    print(f"[build-timing] records={time.time() - phase_t:.1f}s mode={train_skips.get('mode', 'sample')}", flush=True)
+    phase_t = time.time()
     token_stats = {
         "train": asdict(_token_stats(train_lengths, args.cutoff_len, args.min_tokens)),
         "eval": asdict(_token_stats(eval_lengths, args.cutoff_len, args.min_tokens)),
@@ -1100,12 +1201,15 @@ def main() -> None:
         "lf_preprocess": {"ok": None, "skipped": True},
     }
 
+    print(f"[build-timing] validate_jsonl={time.time() - phase_t:.1f}s", flush=True)
+    phase_t = time.time()
     if not args.skip_lf_preprocess_check:
         try:
             validation["lf_preprocess"] = _lf_preprocess_check(args, lf_dir)
         except Exception as exc:
             validation["lf_preprocess"] = {"ok": False, "error": repr(exc)}
         validation["ok"] = validation["ok"] and bool(validation["lf_preprocess"].get("ok"))
+        print(f"[build-timing] lf_preprocess_check={time.time() - phase_t:.1f}s", flush=True)
 
     stats_files = _write_stats_files(
         args=args,
