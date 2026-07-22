@@ -341,6 +341,12 @@ def rope_recompute(tokens: Optional[int] = None) -> bool:
     rebuild sits at the small-class time edge). ``ASYMM_ROPE_RECOMPUTE`` force-arms.
     """
     if model_class() == "dense":
+        # bisect/override knob (merge_cpu_modules S6 breach protocol): dense
+        # default stays ON; ASYM_POLICY_ROPE_DENSE=0 disables for one-variable
+        # A/Bs without touching the recipe layer.
+        if os.environ.get("ASYM_POLICY_ROPE_DENSE", "").strip().lower() in {"0", "false", "off", "no"}:
+            trace("P12.rope_recompute", False, model_class="dense", override="ASYM_POLICY_ROPE_DENSE=0")
+            return False
         trace("P12.rope_recompute", True, model_class="dense")
         return True
     if tokens is None:

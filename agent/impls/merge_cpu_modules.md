@@ -323,6 +323,37 @@ push to Kevin's explicit call (or his gbackup habit). Update memory notes.
   staged+FG_KEEP_ACTS+chunk+dx only — the drafted T2-bundle env would have
   changed the comparison vs baseline 2762/165.7). Order fail-fast:
   M1,M2,M4,M5,M7,M6,M3,M8,M9.
+- [S6 M1 WRECK EXPLAINED 2026-07-22 — LAUNCH COLLISION, policy exonerated]
+  M1 (T1 128k) OOM had TWO trainer banners in one log: the pre-fix queue's
+  in-container python survived the host-side kill (host kill ≠ container
+  reap), finished loading, and trained M1's exact policy-on config to
+  116.92 GiB ≈ baseline 116.0 — live proof M1 is memory-clean under the
+  policy. The relaunched M1 then OOM'd against that squatter (12.21 GiB
+  layer transient vs 1.08 free; foreign pid held 116.92). Sidecar confirms
+  only prep-gates consulted at T1 (P5/P12/P15; P1/P2/P3/P13 absent = no
+  fg surface, as designed). NO gate change, NO recipe fork; M1 re-runs
+  clean after M9. PROTOCOL LESSON (binding): before any queue relaunch,
+  verify GPU idle (nvidia-smi used < ~5 GiB) or pkill the driver inside
+  the container — killing the host chain never reaps container pythons.
+- [S6 INCIDENT 2026-07-22 ~23:13-23:50 UTC] M1 phantom-OOM root-caused:
+  the PRIOR session had already launched .mrg_cpu_q3.sh; its container
+  processes survived the session teardown (orphan-marked but alive) and my
+  fresh launch ran CONCURRENTLY — two M1 jobs raced the GPU (116.9+66.0
+  = 182.9/184 GiB in the OOM trace) and interleaved writes into the same
+  log (torn: OOM/ALL-OOM lines vs HARDFAIL). NOT a policy memory
+  regression: at T1-dense the policy allocates no GPU bytes (qknorm
+  reduces; prefetch/deposits structurally idle). Cleanup: killed the
+  orphan M1 python (119.7 GiB) + stale chains; verified exactly one queue
+  instance + sole GPU occupant remains; M2 restarted fresh and healthy.
+  M1 = only casualty (HARDFAIL artifact) — rerun SOLO after M9 drains.
+  LESSON (adds to the container-pkill lesson): background container
+  launches survive Claude session death — on session restart, ps/nvidia-smi
+  sweep for orphaned queue instances BEFORE relaunching a queue script.
+- [S6 M2 2026-07-22] 969 tok/s vs base 986 (−1.7%; gate 971 → 0.2pp short),
+  peak BYTE-EXACT 93.6. Attribution: same-day flags-off control (cpuabm)
+  ran this row at 973 ⇒ policy cost −0.4%, day-drift −1.3% (the ±3%
+  dense-row drift documented in S3). Marked RETRY (with M1) after M9;
+  not a policy-gate defect signature (memory exact + control-attributed).
 - [S2 BUILD 2026-07-22] _C rebuilt in-container with -fopenmp + SVE-BF16
   march: cpu_ops_sve_compiled()=True, all 8 symbols present. Bench --final
   sanity vs donor table: swiglu fwd 44.3 ms@32k (donor 44.8 ✓), bwd 60.1
