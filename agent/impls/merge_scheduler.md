@@ -1,6 +1,17 @@
 # merge_scheduler — sched40 vs sched42: differences + the merge plan
 (IMPLEMENTATION: `agent/impls/fix_merge_scheduler.md` — the staged build
 plan with per-stage gates. This doc stays the decision/evidence record.)
+
+**MERGE EXECUTED AND ACCEPTED 2026-07-21** on branch `merge_sched` (machine
+c06): all §3 step-8 gates (a)–(f) closed. 9/9 no-regression matrix rows
+resolved — 7 clean PASS (peak HBM byte-EXACT at 7 of 9 rows incl. the llama
+448k wall at 97.3% util), 2 PASS-with-note (−2.1/−2.9% vs single-run
+references; a same-machine pre-merge-vs-merged A/B measured the merge's own
+contribution at 0.07% ⇒ environment-side, not merge). Merged tree ran
+FASTER than the records at 6 of 9 rows. Execution corrections folded back
+into this doc during validation: the c14 pins are SIX (KEEP_DGRADS_HBM
+found via breach diff), fused/reuse/panel never in any archived run. Full
+run-by-run evidence: fix_merge_scheduler.md §7 STATUS LEDGER.
 (2026-07-20. Repos: THIS tree `AsymGEMM-SFT/third_party/AsymGEMM` = backup
 `origin/main_kevin_sched40` (187cea7, 16:02) — the c12/dense-lineage session;
 `AsymGEMM-SFT-39/third_party/AsymGEMM` = backup `origin/main_kevin_sched42`

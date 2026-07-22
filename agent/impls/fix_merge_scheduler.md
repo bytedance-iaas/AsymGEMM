@@ -434,7 +434,93 @@ exists; c14_old present; §10 present).
   consistent with C3 (merged ≥ archived on speed, ≤ on memory) ⇒ donor
   post-campaign fixes made the KA path leaner; NO regression. S1 gates all
   passed (V1-V5).
-- [NAMING FIX-2 2026-07-21] C1's dir showed the flaw: appending all six
+- [A/B DEFINITIVE 2026-07-21 → ROW3 RULED PASS-with-note; MERGE EXONERATED]
+  q32 T3 128k b2 (offload-heavy state), same machine, only the six training
+  files swapped: MERGED 536 tok/s / 57.3 GiB (steps 477.1/478.3) vs
+  PRE-MERGE 536 tok/s / 57.3 GiB (477.2/477.5) = −0.07% / +0.0 GiB.
+  THE MERGE CONTRIBUTES ZERO to the offload-path deltas ⇒ row 3's −2.9%
+  and row 8's −2.1% are environment-side (third machine c06 + single-run
+  references), NOT merge regressions. Merged lib restored + verified.
+- [S5 GATE CLOSED 2026-07-21 — MERGE ACCEPTED] (a) selftest 5/5 ✓ (b)
+  replay 18/18 ✓ (c) C1/C2/C5 in-band ✓ (d) C3/C4/C4b re-validated ✓ (e)
+  distinct dirs + config.json ✓ (f) matrix: rows 1,2,4,5,6,7,9 PASS clean
+  (five with EXACT peak memory; wall row 448k exact at 97.3% util); rows
+  3,8 PASS-with-note (−2.9%/−2.1% vs their single-run references, breach
+  protocol executed to completion: reruns reproduce, config parity proven,
+  machine drift refuted, A/B proves merge-neutral at 0.07%). NO regression
+  attributable to the merge anywhere; memory byte-exact at 7 of 9 rows;
+  merged tree faster than record at 6 of 9.
+- [S7 ROW5 PASS-on-retry 2026-07-21] llama T2 192k b2: 548 tok/s (ref 543,
+  +0.8%) · peak 171.1 GiB EXACT · steps 700.7/701.9 (archived: 706.7).
+  The earlier host-OOM confirmed transient (page-cache flake, gone after
+  row 6 flushed pressure) — mirrors the record's own 352k flake note.
+- [S7 ROW6 PASS 2026-07-21] llama T2 448k b1 — THE WALL ROW: 280 tok/s
+  (ref 275, +1.9% FASTER) · peak 182.4 GiB EXACT · steps 1598.8/1599.6.
+  llama's deepest recorded operating point (97.3% util) reproduces
+  perfectly on the merged tree.
+- [S7 ROW5 HOST-OOM(soft) → RETRY QUEUED 2026-07-21] llama T2 192k b2:
+  host watchdog fired (HOST_OOM_EVIDENCE, soft) — the record's OWN
+  documented flake mode for this state ("T2 lives at RSS≈pool, zero
+  margin"; its 352k sibling host-OOM'd as a flake + re-probed FIT).
+  Aggravator today: 132 GB llama download in page cache + back-to-back
+  launch after row 4. Retry (mrgs7r5b, OVERWRITE=true) chained AFTER row 6
+  (whose 983-GB run flushes the cache pressure), then the A/B.
+- [S7 ROW4 PASS 2026-07-21] llama T1 96k b1: 1096 tok/s (ref 1066, +2.9%)
+  · peak 48.9 GiB EXACT. First llama row on the downloaded weights — the
+  70B dense class reproduces on the merged tree.
+- [S7 ROW9 PASS 2026-07-21 → ROW8 RULED PASS-with-note] 1.1M b1 shed:
+  385 tok/s (ref 382, +0.8% FASTER) · 152.9 GiB (ref 151.5, +1.4 in-band)
+  · steps 2854.6/2857.6. THE SHED-STATE DISCRIMINATOR: same state as the
+  800k row, deeper, reproduces the record in-band ⇒ per the pre-registered
+  protocol the 800k −2.1% is POINT-LOCAL to that reference (its 147.5 GiB
+  peak was already the single point OFF the shed byte-line; both my 800k
+  runs AND this 1.1M row sit ON the line). Row 8 verdict: PASS-with-note
+  (584 tok/s twice at a reference point that is itself the outlier;
+  adjacent same-state row +0.8%). Remaining open: row 3 only (streamed
+  no-staged engine, −2.9%, memory EXACT) — pre-merge/merged A/B queued.
+- [S7 ROW3 2026-07-21, verdict pending A/B] q32 T3 640k: peak 129.7 GiB
+  EXACT to record; 219 tok/s vs 226 (−2.9%; steps 2915/2918 — tight pair).
+  PATTERN across all runs: the two slow rows (800k shed −2.1%, 640k T3
+  −2.9%) are exactly the maximally-OFFLOADING states (all intermediates
+  round-trip host); every residency-heavy state is at/above record
+  (+1.4…+3.6%) and memory byte-exact everywhere ⇒ hypothesis: c06's
+  host-copy path ~2-3% slower than c12's (machine-flavored — c06 is a
+  THIRD machine; the records' ≤0.1% cross-machine claim covered c12 vs c14
+  only). DECISIVE EXPERIMENT queued (.mrg_ab_t3.sh): q32 T3 128k b2,
+  PRE-MERGE lib vs MERGED lib, same machine, in-place swap+restore
+  (~25 min/side). Same number both sides ⇒ merge exonerated, machine
+  attribution stands; divergence ⇒ merge-side cause, bisect the six files.
+- [C4' PASS-with-note 2026-07-21] 900k bundle + dgrads pin: 537 tok/s /
+  177.2 GiB — IDENTICAL to C4 without the pin ⇒ dgrads-keep is a no-op at
+  the bundle's 99%-util point. C4 final ruling: PASS-with-note (+3.5%
+  faster, −5.8 leaner than record).
+- [S7 LLAMA ROWS HARDFAIL→RECOVERY 2026-07-21] rows 4/5/6 failed instantly:
+  GatedRepoError 401 — host c06 (a replica machine, not c12) has NO local
+  Llama-3.3-70B snapshot (qwen models are in the container HF cache; llama
+  never pulled here) and the non-interactive container shell lacks
+  HF_HOME/HF_TOKEN (bashrc interactivity guard). Recovery: background
+  download of meta-llama/Llama-3.3-70B-Instruct with the user's own
+  HF_TOKEN (from env/bashrc.sh — same token the c12 runs used) into the
+  container cache, excluding original/*; rows 4/5/6 re-queued as
+  .mrg_queue_s7b.sh after rows 3+9 finish. NOTE for the record: today's
+  runs are on c06 — the records' own cross-machine claim (c12 vs c14
+  ≤0.1%) plus C1/C2/C5 parity today validate the replica comparison.
+- [C4b + C4b' SHED-STATE INVESTIGATION 2026-07-21, open pending row 9]
+  800k shed: merged tree 584 tok/s TWICE (with and without the dgrads pin;
+  ref 596 ⇒ −2.1%, 0.6pp past band) at peak 110-114 GiB vs archived 147.5.
+  Established: config parity (env-by-env diff vs tputasl command.txt — the
+  diff FOUND the missing 6th pin KEEP_DGRADS_HBM=1, now added and verified
+  ENGAGED: dgrads_hbm_kept=288, yet peak unchanged ⇒ dgrads-keep is cheap
+  in the merged code while the archived run peaked +37 higher — same
+  leaner-than-campaign direction as C3/C4); machine drift REFUTED (C5
+  +1.0%, C1 −1.1%, C2 +2.9%, C4 +3.6% — mixed signs); source-cause
+  REFUTED for the shed path (5/6 files byte-identical to donor at
+  flags-off; qwen3_moe's only delta = noclone plumbing, cold when KA off —
+  the KA manager is not instantiated in shed state). Remaining suspects:
+  the archived ref's own protocol/day variance (m4 vs m2, single run) or
+  _C build variance. DISCRIMINATOR: S7 row 9 (same shed state @1.1M, ref
+  382) — in-band ⇒ point-local noise, ruled PASS-with-note; −2%-ish too ⇒
+  systematic, bisect _C build. Verdict DEFERRED to the row-9 joint ruling.
   recipe components pushed the ~250-char label past NAME_MAX → safe_label
   truncate+hash fired → OPAQUE tail (the exact outcome Kevin rejected).
   REVISED RULE: append ONLY NON-DEFAULT components (all-defaults ⇒ empty
