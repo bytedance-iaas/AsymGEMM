@@ -23,6 +23,7 @@ from .frozen_linear import (
     _grouped_torch_chunks,
 )
 from .activation_offload import ActivationOffloadManager, CPUActivationHandle
+from . import cpu_ops
 from .exp_act_offload_lora import (
     grouped_lora_a_forward_cpu_left,
     grouped_lora_a_forward_hbm,
@@ -904,6 +905,17 @@ def _activation_offload_cpu_silu_mul(
     *,
     tag: str,
 ) -> CPUActivationHandle:
+    fused = cpu_ops.fused_silu_kernels()
+    if fused is not None and cpu_ops.fused_silu_applicable(gate.tensor, up.tensor):
+        fused_fwd, _, num_threads = fused
+        # host math needs a HOST wait on the producing D2H (stream wait is not enough)
+        manager.host_wait_cpu_ready(gate)
+        manager.host_wait_cpu_ready(up)
+        out = manager.empty_cpu(tuple(gate.tensor.shape), gate.tensor.dtype, gate.original_device, tag)
+        fused_fwd(gate.tensor, up.tensor, out.tensor, num_threads)
+        return out
+    # fallback: OUR host-correct waits (fix_merged.md V1 race fix — host reads
+    # below require a HOST wait, not the base's stream wait)
     manager.wait_cpu_ready_host(gate)
     manager.wait_cpu_ready_host(up)
     out = manager.empty_cpu(tuple(gate.tensor.shape), gate.tensor.dtype, gate.original_device, tag)
@@ -918,6 +930,19 @@ def _activation_offload_cpu_silu_backward(
     grad_act: CPUActivationHandle,
     manager: ActivationOffloadManager,
 ) -> tuple[CPUActivationHandle, CPUActivationHandle]:
+    fused = cpu_ops.fused_silu_kernels()
+    if fused is not None and cpu_ops.fused_silu_applicable(gate.tensor, up.tensor, grad_act.tensor):
+        _, fused_bwd, num_threads = fused
+        with prof_range("backward.mlp.activation_offload.activation_cpu.wait"):
+            manager.host_wait_cpu_ready(gate)
+            manager.host_wait_cpu_ready(up)
+            manager.host_wait_cpu_ready(grad_act)
+        with prof_range("backward.mlp.activation_offload.activation_cpu.alloc"):
+            grad_gate = manager.empty_cpu(tuple(gate.tensor.shape), gate.tensor.dtype, gate.original_device, "dgate")
+            grad_up = manager.empty_cpu(tuple(up.tensor.shape), up.tensor.dtype, up.original_device, "dup")
+        with prof_range("backward.mlp.activation_offload.activation_cpu.math"):
+            fused_bwd(gate.tensor, up.tensor, grad_act.tensor, grad_gate.tensor, grad_up.tensor, num_threads)
+        return grad_gate, grad_up
     with prof_range("backward.mlp.activation_offload.activation_cpu.wait"):
         manager.wait_cpu_ready_host(gate)
         manager.wait_cpu_ready_host(up)

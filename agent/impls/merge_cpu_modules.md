@@ -1,0 +1,255 @@
+<!-- I was working on repos on different machines. 
+This repo ~/AsymGEMM-SFT/third_party/AsymGEMM is on merging various scheduler versions and is now complete and pushed to main_kevin.
+During this time i was working on developing/optimizing/testing arm cpu kernels on the same repo (on a verision BEFORE the scheduler was developed): ~/AsymGEMM-SFT-46/third_party/AsymGEMM
+So this other repo's code can be outdated in some aspects BUT its cpu related modules should be up to date and decently complete.
+Therefore I wanna merge that repo's useful parts. mostly should be cpu kernels and ops and codepaths. it is probal very outdated in schuedeling and stuff..
+So lets dive deep into the 2 repos. Explore extensivel the other repo ~/AsymGEMM-SFT-46/third_party/AsymGEMM abd reaons baout every nontrivial conflict. Read /home/kevinni/AsymGEMM-SFT-46/third_party/AsymGEMM/agent/impls/cpu_compute.md to undersand waht it did for cpu computes. This shoud be a decently compreheslve doc that continas the an overview of the cpu modules and some metrics on its evaluations on microbenchmarking and e2e results on small and large workloads. BUT keep this midn that that rei was buulton the pre-scheduler state of this repo soo its code might be outpudate ins ome aspects.
+Reason and judge very critically on how to o this merge efficiently and correctly onto this current repo status. Thnk critical we need optimizations that can help our current verison with differen tiers of scheduling.
+Some aspects wil be to 1. decide what are the useful cpu features or features that repo has? among the useful ones, are they stil relevant / applicable / adoptable wiht some modifications. 
+After u complete the merging we need to test that everying still correct and makes sense
+STILL we DONT run exps outside containers at all. we do asym34_enroot_run this will start the right container and inside that container u cd to third_party/AsymGEMM and then run the validations.
+We first validate that each merged/adopted new cpu component is correct, and that our scheduler adopt these cpu's in the most reasonabel possible way
+And then similar as before lets do 3x3 vlaidation runs for e2e confirmation. list them first sequ=etnila and then execute them.
+I beleive  agent/impls/previous_validation_results.md has the repvious runs; results to show that the scheduler merge (befo rehte cpu compute merge) was successful and correct (is that true?)
+Dont stop until all the cpu modiels vlaidated and e2e reuslts confirmed to be the same at least if not slightly better after using these cpu modules. This is the goal and should be explicitly targeteed.
+
+Aagain use /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM/agent/impls/merge_cpu_modules.md as the record for designs of merign and the needed staged impleatojns/modicaitions needed.
+This p[romt iself is in the doc jsut preserve it at the top as a comment as right now dont erase/dele this prompt. After tjeprmptl,
+write the full implemation olna for mergin here before u start changing anything.
+Explicitly specify the staged design include valiadtions for each stage.
+Here in the doc aslo los the 9 validations runs top prove that htese cpu modueks at least des tno make our repo worse.
+
+make the implementation plan into a staged, implementation-focused plan.
+
+For each stage:
+0. One the top of the doc make sure we have clear goals section with explicitly specified configs to run for comparison, behavior/rules for the agent (involves keep fixing and building and dont stop), and caveats to avoid
+1. Explicitly explain the intended code changes clearly and include concrete pseudocode for all the needed implementations. It needs to be ultra clear and informative for a third person to follow and make the implementations.
+Make sure the imoplementatino is complete and thorough. Reason about it like the actual code and amke sure it is efficient and correct.
+2. Scope the stage to the exact files, functions, and classes that need to be modified. For each stage we need concrete explicit validations to prove the effectiness of this stage before moving on. 
+3. Check for any ambiguity or uncertainty. Do the neeed online search extensivelt and do the needed code exploration to refine the implementation to be more concrete and correct.
+4. Check for risks, unclear assumptions, missing edge cases, or uncertain behavior.
+Resolve uncertainty by doing focused code exploration, small tests, related-work/code searches, or online documentation searches when needed.
+5. If a risk cannot be resolved now, list it under that stage as a specific item to watch later.
+Add explicit validation steps before moving to the next stage. These should include the exact command-line arguments, scripts, commands, or tests needed to confirm that the stage works. We cant rely on small toy profilng to accept changes (unkess it is reallt jsut a kenrle implementaitno that is totallt isolaated) Normaltl we need to run the e2e lora profiling to make sure the change is actually meaningful.
+6. Reason about memory efficiency, lantecy, kernel launch efficiency.  NEVER break computations into small GEMMs. Don't use dumb loops to loop over experts. Dont use damn operations/inefficient kernel launching patters. 
+7. Keep the plan concise and practical. Do not add extra sections unless they directly help implementation. 
+8. Whenver u use subagentseahc needs to be fable5 with max effort reasoning effort.
+After the doc has been finished, read it and execut it fully. Dont ask me to check over jsut go ahead. again dont stop until the goals bave been met. 
+ -->
+
+# merge_cpu_modules — CPU-kernel/ops merge (AsymGEMM-SFT-46 → this tree)
+
+(2026-07-22. DONOR = `~/AsymGEMM-SFT-46/third_party/AsymGEMM`, the cpu_compute
+campaign built on base `ead5d01` — a STRICT ANCESTOR of our `main_kevin`
+(`d22440d`) ⇒ true git 3-way merge. Donor work snapshotted non-destructively
+as `origin/cpu_compute_snapshot` (6b748fc, scratch-index commit; -46 working
+tree untouched). Work branch: `merge_cpu` off main_kevin. Donor evidence:
+`cpu_compute.md` (master table + verdicts), `placement.md` (P1–P15),
+`fix_cpu_compute.md` — all three arrive WITH the merge. Full conflict
+composition spec: `merge_cpu_modules_compspec.md` (appendix, applied in S1).
+CONFIRMED: `previous_validation_results.md` is the accepted scheduler-merge
+record; its "new" column = THIS machine's measured baseline = the reference
+this campaign must meet-or-beat.)
+
+## S0. Goals · references · rules · caveats
+
+GOAL: land the donor's CPU stack (6 new modules + 8 ARM-SVE `_C` kernels +
+hooks in 9 existing files), all default-OFF; rebuild `_C`; prove each module
+correct in-container; adopt into the scheduler as ONE production flag
+(`ASYM_PLACEMENT_POLICY=1` — the policy self-gates per-op from workload
+numbers, so it composes with every tier); then the 9-row e2e matrix vs
+`previous_validation_results.md` with the stack ON — **same-or-better is the
+explicit target** (norm-recompute alone measured −3~4% step time at every
+regime on the donor).
+
+WHAT WE ADOPT (donor verdicts, re-judged for our tiers):
+| Feature | Donor verdict | Our adoption |
+|---|---|---|
+| Placement-policy module | centerpiece, 1 flag | ADOPT — the only flag recipes carry; per-op gates self-adapt (P1 rows/bytes, P3 proj-rows, P12 always, P13 G-guard) |
+| qknorm recompute (P12) | universal win −2.95/−3.57/−4.16%, C −16/−64/−32 | ADOPT everywhere (default-on under policy) |
+| Restage prefetch (P13) | 32k −2.9%, dense −11.9%, 128k self-guarded neutral | ADOPT (G-guard auto-adapts per tier residency) |
+| Expert wgrad deposit (P2) | MoE −2.6%/−0.4% | ADOPT MoE tiers |
+| Attn wgrad deposit (P3) | 32k-class only (auto rows-gate) | ADOPT (self-gating) |
+| SwiGLU fwd CPU (P1) | 32k-class MoE only (auto) | ADOPT (self-gating; cold on our blocked path — see S1 note) |
+| Boundary pin+prefetch (P4), dup-copy removal (P5), fused widen (P6), wgrad 96T (P14) | never-hurts | ADOPT under policy |
+| Rope recompute | memory feature (≥524k tokens / dense) | ADOPT (tokens-gated) |
+| SwiGLU bwd CPU, LoRA-B deposit, byte-diet (P15), save-dedup | rejected/dormant by donor | LAND CODE, stays off (P9/P15 permanent-False) |
+| Batch scaling | measured-negative | not adopted (consistent with our knee cap) |
+
+REFERENCE SET = the 9 rows of `previous_validation_results.md`, baselines =
+its "new" column (measured on THIS machine, w1+m2, mrg* run dirs):
+R1 q32-T1-128k-b2 1091/116.0 · R2 q32-T2-128k-b2 986/93.6 · R3 q32-T3-640k
+219/129.7 · R4 llama-T1-96k 1096/48.9 · R5 llama-T2-192k-b2 548/171.1 ·
+R6 llama-T2-448k 280/182.4 · R7 moe-KAdial-120k×8 2762(347.6 s/it)/165.7 ·
+R8 moe-shed-800k 584/110.4 · R9 moe-shed-1.1M 385/152.9.
+ACCEPT per row: tok/s ≥ baseline×0.985 AND peak HBM ≤ baseline+2 GiB
+(target: tok/s ≥ baseline; C may drop). Protocols: matrix rows = w1+m2
+(comparable to baseline); donor-replication A/Bs (S4) = donor protocol
+w1+m4 steady=middle-2 (comparable to donor numbers). All runs in-container
+(`asym34_enroot_run` → /workspace/AsymGEMM-SFT/third_party/AsymGEMM); serial,
+one GPU; verdicts from jobs.tsv/artifacts never driver exit codes.
+
+AGENT RULES: keep fixing until each gate passes; never end a stage half-done;
+on failure read log tail + jobs.tsv + step_samples + config.json BEFORE code
+changes; one variable per A/B; never fix a regression by disabling a measured
+feature; e2e LoRA profiling is the only perf evidence (unit tests prove
+wiring/parity only); every measured number → §7 ledger with run dirs; NO
+driver/lib edits while any run is in flight; subagents = fable5 max effort.
+
+CAVEATS:
+- Defaults-off invariance is THE S1/S3 acceptance: policy unset ⇒ byte-identical
+  behavior to current main_kevin (every donor branch env-gated; verified).
+- OUR trunk survives unchanged: blocked fg fwd/bwd paths, KA managers,
+  `mutable=` hints, `wait_cpu_ready_host` (get-not-pop race fix — ALL host
+  reads route through it, donor's pop-based wait becomes a delegating alias),
+  fused-addmm/reuse-packed-x/dgrads/async-pack, tier recipes/pins.
+- KA precedence: keep-acts-resident beats every CPU-compute branch (deposits/
+  cpu-act/prefetch need offloaded pinned handles); enforced via `not
+  keep_acts_hbm` gates + `hasattr(manager, ...)` guards + F-0 no-op methods
+  on `_HBMKeepManager`.
+- Efficiency: donor's full-width `_lora_b_forward` deltas + `grouped_expert_
+  lora` full-width dx are REJECTED (our chunked/blocked versions stay); no
+  per-expert loops; chunking only via existing `fg_chunk_rows`/K-4 side-stream
+  mechanisms.
+- `_C` rebuild is REQUIRED for the 8 `cpu_*` symbols (all getattr-guarded —
+  pre-rebuild the stack self-disables, post-rebuild `cpu_ops_sve_compiled()`
+  must be True or kernels are stubs). Rebuild: `MAX_JOBS=8 .venv/bin/python
+  setup.py build_ext --inplace` in-container (setup.py gained `-fopenmp` +
+  `-march=armv8.2-a+fp16+dotprod+sve+bf16` — auto-merged).
+- Known harness quirk: save_dedup + pinned_ledger suites trip an assert in
+  ONE process — run suites as separate pytest processes.
+- Host pool ≈957 GB budget (free's 1.69 TB is fabric-inflated); watchdog
+  SIGSTOPs <35 GB free; CPU microbench only with GPU idle.
+
+## S1 — Land the 3-way merge (resolve 5 files per the composition spec)
+
+State: `git merge --no-commit cpu_compute_snapshot` is in progress on
+`merge_cpu`; auto-merged: 6 new modules, csrc (setup.py flags included),
+tests, cpu_adam (+ledger/fused-widen/deposit buffers), gc_boundary (R5
+one-ahead), integrations/lf (qknorm/rope installs — passthrough until armed),
+`__init__` (8 symbol re-exports), run_lf_* (telemetry + hostmem CSV),
+postprocess. Conflicts (24 hunks/5 files) — resolve EXACTLY per
+`merge_cpu_modules_compspec.md`; the load-bearing rules:
+1. activation_offload: keep BOTH API families; donor `host_wait_cpu_ready`
+   body → delegate to our `wait_cpu_ready_host`; `stage()` keeps OUR
+   `mutable=` signature; keep-both `record_cpu_ready` + `stage_begin/commit`.
+2. attention: pinned-ledger reserve + our `_PIN_FALLBACK_CALLS` compose;
+   forward wrapper = our skip_in_backward guard FIRST then donor dedup/
+   region-prefetch try/finally; dA = KA branch → deposit branch → legacy
+   (deposit unreachable under KA — u_handle None); finally = our None-guards
+   + `deposited_u` deferral.
+3. dense fg: donor defs after ours; fused/async cpu-act branches ahead of
+   OUR chunk/legacy chain with fallback host-waits = OURS; `deposit_ctx=`
+   kwargs grafted; `mutable=False` on all our stage sites; +2 out-of-hunk
+   KA/hasattr guards (:433 async cond, :600 R5 init).
+4. qwen3_moe `_cpu_silu_mul`: donor fused branch first, fallback = our
+   wait_cpu_ready_host pair.
+5. qwen3_moe_finegrained: imports union; defs = ours + F-0 no-ops
+   (`take_cpu_ready_event`/`host_wait_cpu_ready` on `_HBMKeepManager`) +
+   donor's 17 defs; forward: BLOCKED LOOP UNTOUCHED (donor fwd features
+   measured full-width-only ⇒ naturally cold on blocked path — a v2 note,
+   not v1), full-width branch gets donor grafts with `not keep_acts_hbm`
+   gates, 4-way act chain async→fused→our-chunk→legacy(+direct-reuse);
+   backward: our blocked path + `allow_deposit=True` graft (G-D1), our
+   full-width down path (donor's full-width dx REJECTED) + KA-else deposit
+   graft, 5-way silu-bwd chain (K-5 CPU task → R5 commit → mech-4 →
+   our-chunk → legacy), :1762 hasattr guard.
+Commit the merge on `merge_cpu` when V1 passes.
+
+V1 gates (no GPU): `ast.parse`/py_compile all touched files; per-file grep
+checklists from the spec (one `def stage(` w/ mutable; `deposited_u` ×3;
+`mutable=False` ×11 dense; `allow_deposit=True` ×2 fg; no `grouped_expert_
+lora(` in full-width down-dx; `record_cpu_ready` only blocked/chunk paths);
+in-container import of all modules; defaults-off unit sanity (each new
+`_*_enabled()` False with clean env).
+
+## S2 — `_C` rebuild + kernel/unit validation (in-container)
+
+1. `MAX_JOBS=8 .venv/bin/python setup.py build_ext --inplace` (repo root).
+2. V2 gates: `python -c "import asym_gemm; print(asym_gemm.cpu_ops_sve_compiled())"`
+   → True; all 8 symbols present; unit suites EACH IN ITS OWN pytest process:
+   test_cpu_ops (≤1-2 ulp parity), test_cpu_worker, test_placement_policy
+   (13/13 dry-run), test_qknorm_recompute (9/9 bitwise), test_pinned_ledger,
+   test_save_dedup (9/9), test_restage_prefetch, test_moe_direct_reuse
+   (19/19) — all green; `ASYM_CPU_OPS_THREADS=48 .venv/bin/python
+   tests/bench_modules.py --final` (GPU idle) → SwiGLU fwd ≈4.2× class,
+   bwd ≈5.4×, widen 13.3×, rmsnorm ≈7× (sanity vs donor table, ±30%).
+
+## S3 — Flags-off e2e invariance (the do-no-harm gate)
+
+Two rows re-run with NO new env (policy unset): R2 (q32 T2 128k b2, dense +
+KA path) and R8 (moe shed 800k b1, pins+dgrads path) — exact commands from
+previous_validation_results run dirs. ACCEPT: in-band vs baseline (tok/s
+≥×0.985, HBM ±2 GiB — expect ≈identical; this proves the merged code with
+everything off is behaviorally our current tree, e2e).
+
+## S4 — Module-level + donor-replication validation
+
+1. SMOKE parity: donor protocol (8k b4, MAX_STEPS=6, same seed) policy ON vs
+   OFF → loss curves within the 0.67-1.0% rerun envelope, no drift.
+2. Donor-regime A/Bs on the merged tree (donor protocol w1+m4, steady =
+   middle-2; ± `ASYM_PLACEMENT_POLICY=1 ASYM_CPU_OPS_THREADS=48`):
+   a. MoE 32k b8 (donor cfg ker101-ohbm0): expect ON ≈ −10~12% step time
+      (donor: 97.4→85.6 s class) + engagement markers (P1/P2/P3 traces).
+   b. MoE 128k b8: expect −3~4% (norm-recompute dominant; P1/P3 auto-off
+      traces prove the gates).
+   c. Dense 32B 32k b8 (donor cfg ker000-ohbm8): expect −10~14% (prefetch +
+      norm-recompute; P8 kill-switch traced).
+   Verify per-run `placement_policy.json` sidecar decisions match P10
+   acceptance sets; `cpu_worker` job_ms + deposit retention in profile.
+3. Scheduler-tier probes (our recipes, w1+m2, ± policy flag): T2-MoE bundle
+   @640k b1 and dense T2 @128k b2 — expect ≥0% (no harm where donor never
+   measured; norm-recompute should still win) + traces showing correct
+   auto-gating under KA/bundle env.
+V4 accept: all above + no host-OOM (watchdog margin ≥35 GB free at peak;
+hostmem CSV recorded).
+
+## S5 — Scheduler adoption (recipes carry the ONE flag)
+
+`asym_scheduler.py`: add to EVERY asym tier env (dense+moe T1/T2/T2B/T3)
+`ASYM_PLACEMENT_POLICY=1` + `ASYM_CPU_OPS_THREADS=48` (new `_CPU_STACK` dict
+merged into each TierLine env; NOT into `_MOE_PINS` — pins = measured-history
+class). Rationale: the policy self-gates per-op from rows/bytes/tokens/model-
+class + G-guard, so tier recipes need no per-feature flags; T1's surface is
+minimal (boundary/qknorm) and safe. Regenerate `tier_recipes.sh`; docs note
+in scheduler_v2.md §10′ addendum.
+V5 gates: `--selftest` 5/5 + `--replay` 18/18 (env-only change — must be
+untouched); TIER_DRY_RUN expansions show the 2 new vars (T2-moe: 11 env);
+config.json captures them (ASYM* prefix ✓).
+
+## S6 — THE 9-ROW MATRIX (listed first, then executed serially)
+
+Each row = previous_validation_results config VERBATIM + `ASYM_PLACEMENT_
+POLICY=1 ASYM_CPU_OPS_THREADS=48`; w1+m2; MAX_SAMPLES per row as before
+(512: R3/R4/R6/R9; 1024: R5/R7/R8; tp_probe defaults R1/R2).
+| # | run | baseline (tok/s · GiB) | expectation |
+|---|---|---|---|
+| M1 | q32 T1 128k b2 | 1091 · 116.0 | ≈ or − small (policy near-inert at T1; qknorm via lf install) |
+| M2 | q32 T2 128k b2 | 986 · 93.6 | ≥ (norm-recompute + prefetch) |
+| M3 | q32 T3 640k b1 | 219 · 129.7 | ≥ (norm-recompute; rope tokens-gate ON) |
+| M4 | llama T1 96k b1 | 1096 · 48.9 | ≈ |
+| M5 | llama T2 192k b2 | 548 · 171.1 | ≥ (dense P12+P13; P8 kills deposits) |
+| M6 | llama T2 448k b1 | 280 · 182.4 | ≥, watch G-guard (97% util ⇒ prefetch self-offs) |
+| M7 | moe KA-dial 120k×8 | 2762 · 165.7 | ≥ (P2 deposit + P12; P1/P3 rows-gates per traces) |
+| M8 | moe shed 800k b1 | 584 · 110.4 | ≥ (P2 −0.4% + P12 −3.6% class) |
+| M9 | moe shed 1.1M b1 | 385 · 152.9 | ≥ (same class) |
+ACCEPT: 9/9 tok/s ≥ baseline×0.985 with TARGET ≥ baseline; HBM ≤ +2 GiB;
+RSS informational (expect −10~60 GB at C-bound rows). Breach protocol =
+same as the scheduler merge (rerun once → trace/config diff → one-variable
+bisect: policy off vs per-feature manual flags → if a feature hurts a row,
+the POLICY gate gets the fix (threshold/guard), never a silent recipe fork).
+Results table → §7 ledger + appended to previous_validation_results.md.
+
+## S7 — Close-out
+
+Fold results into this doc's ledger + cpu_compute.md addendum (post-merge
+numbers on the tiered tree); commit merge_cpu; leave main_kevin merge +
+push to Kevin's explicit call (or his gbackup habit). Update memory notes.
+
+## §7 STATUS LEDGER (append-only)
+
+- [S0 2026-07-22] Plan written. Snapshot 6b748fc pushed; merge_cpu branch
+  holds the in-progress 3-way merge (24 hunks/5 files enumerated); module
+  map + composition spec produced by max-effort forks (appendix
+  merge_cpu_modules_compspec.md); previous_validation_results.md confirmed
+  as the baseline record.

@@ -18,6 +18,10 @@ from torch import nn
 import torch.nn.functional as F
 
 from .activation_offload import ActivationOffloadManager, CPUActivationHandle, fg_chunk_rows
+from . import activation_offload as _act_offload
+from . import cpu_ops
+from . import cpu_worker
+from . import placement_policy
 from .exp_act_offload_lora import (
     grouped_lora_a_forward_cpu_left,
     grouped_lora_a_grad_cpu_right,
@@ -43,6 +47,10 @@ def _finegrained_enabled() -> bool:
 
 
 def _finegrained_cpu_activation_enabled() -> bool:
+    if placement_policy.enabled():
+        # P8 kill-switch (fix_cpu_compute.md item 1): dense CPU compute stays OFF
+        # until the pinned-bytes cap exists (every 32B arm host-OOM'd).
+        return placement_policy.dense_cpu_compute()
     return _env_enabled("ASYMM_DENSE_MLP_FINEGRAINED_CPU_ACT") or _env_enabled(
         "ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FINEGRAINED_CPU_ACT"
     )
@@ -63,6 +71,89 @@ def _finegrained_keep_acts_hbm_enabled() -> bool:
     return _env_enabled("ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM") or _env_enabled(
         "ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM"
     )
+
+
+def _dense_cpu_act_async_enabled() -> bool:
+    """K-3 (cpu_compute.md): dense SwiGLU on the CPU worker — silu(gate) hidden under the
+    GPU up-block, `*= up` chained after the up D2H (mirrors the MoE FG async path)."""
+    if placement_policy.enabled():
+        return placement_policy.dense_cpu_compute()  # P8 kill-switch
+    return _env_enabled("ASYMM_DENSE_MLP_FG_CPU_ACT_ASYNC") or _env_enabled(
+        "ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FG_CPU_ACT_ASYNC"
+    )
+
+
+def _dense_lora_a_grad_cpu_deposit_enabled() -> bool:
+    """K-3: dense LoRA-A wgrad deposit (same flag as the MoE deposit)."""
+    if placement_policy.enabled():
+        return placement_policy.dense_cpu_compute()  # P8 kill-switch
+    return _env_enabled("ASYMM_LORA_A_GRAD_CPU") or _env_enabled(
+        "ASYM_GEMM_LF_CONFIG_ASYMM_LORA_A_GRAD_CPU"
+    )
+
+
+_DENSE_PAIR_META: dict = {}
+_DENSE_DEPOSIT_DIAG = False
+
+
+def _try_deposit_dense_lora_a_grad(layer, lora_a_2d, d_s, source, tag, deposit_ctx):
+    """Single-group CPU wgrad deposit: dA = dS^T @ source_cpu written fp32 into the
+    optimizer buffer. On success records (handle, task) in deposit_ctx and returns a
+    dummy CUDA grad; the caller must NOT release `source` (deferred sweep owns it)."""
+    import asym_gemm as _ag
+    from . import cpu_adam as _cpu_adam
+    from .qwen3_moe_finegrained import _DS_SLOTS, _DsSlots
+
+    kernel = getattr(_ag, "cpu_grouped_lora_a_grad_bf16", None)
+    adam = _cpu_adam.get_active_adamw()
+    if kernel is None or adam is None or not cpu_worker.enabled():
+        return None
+    # 2026-07-15 fix (32B OOM): sweep the deferred-release list at EVERY dense deposit —
+    # with attention deposits off, the old cadence (attn sites + drain only) retained
+    # up to 64 layers x ~15.7 GB of pinned handles before the step-end sweep.
+    from .attention_activation_offload import _sweep_attn_deposit_releases
+
+    _sweep_attn_deposit_releases()
+    src = source.tensor
+    if d_s.dtype != torch.bfloat16 or src.dtype != torch.bfloat16 or not src.is_contiguous():
+        return None
+    buf = adam.get_grad_deposit_buffer(lora_a_2d)
+    if (
+        buf is None
+        or buf.dtype != torch.float32
+        or tuple(buf.shape) != (int(d_s.shape[1]), int(src.shape[1]))
+    ):
+        return None
+    m = int(d_s.shape[0])
+    meta = _DENSE_PAIR_META.get(m)
+    if meta is None:
+        meta = (torch.tensor([0, m], dtype=torch.long), torch.zeros(1, dtype=torch.long))
+        _DENSE_PAIR_META[m] = meta
+    pairs, ge = meta
+    slots = _DS_SLOTS.setdefault((tuple(d_s.shape), d_s.dtype, f"dense.{tag}"), _DsSlots())
+    slot_i, ds_pin = slots.acquire(d_s)
+    ds_pin.copy_(d_s if d_s.is_contiguous() else d_s.contiguous(), non_blocking=True)
+    ev = torch.cuda.Event()
+    ev.record(torch.cuda.current_stream())
+    nt = int(os.environ.get("ASYM_CPU_OPS_THREADS", "32"))
+    out3d = buf.view(1, int(buf.shape[0]), int(buf.shape[1]))
+
+    def _job(ev=ev, ds=ds_pin, x=src, out=out3d, p=pairs, g=ge, n=nt, k=kernel):
+        ev.synchronize()  # same-stream FIFO also covers the source's earlier D2H
+        k(ds, x, out, p, g, n)
+
+    task = cpu_worker.submit_deposit(_job, tag="deposit.dA.dense")
+    slots.tasks[slot_i] = task
+    if not adam.register_grad_deposit(lora_a_2d, task):
+        cpu_worker.wait(task)
+        return None
+    deposit_ctx[id(source)] = (source, task)  # last task wins (FIFO covers earlier ones)
+    global _DENSE_DEPOSIT_DIAG
+    if not _DENSE_DEPOSIT_DIAG:
+        _DENSE_DEPOSIT_DIAG = True
+        import sys
+        print("[asym-cpu-wgrad] K-3 dense deposit path ENGAGED", file=sys.stderr, flush=True)
+    return torch.empty(lora_a_2d.shape, device=d_s.device, dtype=torch.bfloat16)
 
 
 def _is_silu_activation(fn: Any) -> bool:
@@ -205,6 +296,15 @@ def _cpu_silu_mul(
     *,
     tag: str,
 ) -> CPUActivationHandle:
+    fused = cpu_ops.fused_silu_kernels()
+    if fused is not None and cpu_ops.fused_silu_applicable(gate.tensor, up.tensor):
+        fused_fwd, _, num_threads = fused
+        # host math needs a HOST wait on the producing D2H (stream wait is not enough)
+        manager.host_wait_cpu_ready(gate)
+        manager.host_wait_cpu_ready(up)
+        out = manager.empty_cpu(tuple(gate.tensor.shape), gate.tensor.dtype, gate.original_device, tag)
+        fused_fwd(gate.tensor, up.tensor, out.tensor, num_threads)
+        return out
     manager.wait_cpu_ready_host(gate)
     manager.wait_cpu_ready_host(up)
     out = manager.empty_cpu(tuple(gate.tensor.shape), gate.tensor.dtype, gate.original_device, tag)
@@ -219,6 +319,16 @@ def _cpu_silu_backward(
     grad_act: CPUActivationHandle,
     manager: ActivationOffloadManager,
 ) -> tuple[CPUActivationHandle, CPUActivationHandle]:
+    fused = cpu_ops.fused_silu_kernels()
+    if fused is not None and cpu_ops.fused_silu_applicable(gate.tensor, up.tensor, grad_act.tensor):
+        _, fused_bwd, num_threads = fused
+        manager.host_wait_cpu_ready(gate)
+        manager.host_wait_cpu_ready(up)
+        manager.host_wait_cpu_ready(grad_act)
+        grad_gate = manager.empty_cpu(tuple(gate.tensor.shape), gate.tensor.dtype, gate.original_device, "mlp.dgate")
+        grad_up = manager.empty_cpu(tuple(up.tensor.shape), up.tensor.dtype, up.original_device, "mlp.dup")
+        fused_bwd(gate.tensor, up.tensor, grad_act.tensor, grad_gate.tensor, grad_up.tensor, num_threads)
+        return grad_gate, grad_up
     manager.wait_cpu_ready_host(gate)
     manager.wait_cpu_ready_host(up)
     manager.wait_cpu_ready_host(grad_act)
@@ -252,6 +362,7 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
     ) -> torch.Tensor:
         if x.dim() < 1:
             raise ValueError("fine-grained dense MLP expects a hidden dimension")
+        placement_policy.register_model_class("dense")
         weight_offload = getattr(layer, "_weight_offload", None) is not None
         if weight_offload:
             layer.gather_lora_weights()
@@ -297,6 +408,36 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
             gate_low_rank_cpu = manager.offload(gate_low_rank, "mlp.S_gate")
             del gate, gate_low_rank
 
+        # K-3 async CPU act: silu(gate) on the worker, hidden under the GPU up-block
+        act_task = None
+        act_cpu_async = None
+        _dense_split = None
+        if (
+            not layer.cpu_activation
+            and not _finegrained_keep_acts_hbm_enabled()
+            and _dense_cpu_act_async_enabled()
+            and cpu_worker.enabled()
+            and cpu_ops.fused_silu_applicable(gate_cpu.tensor)
+        ):
+            from .qwen3_moe_finegrained import _cpu_act_max_bytes
+
+            if int(gate_cpu.tensor.numel()) * 2 <= _cpu_act_max_bytes():
+                _dense_split = cpu_ops.split_silu_kernels()
+        if _dense_split is not None:
+            _silu_k, _mul_k, _cpu_nt = _dense_split
+            act_cpu_async = manager.empty_cpu(
+                tuple(gate_cpu.tensor.shape), gate_cpu.tensor.dtype, gate_cpu.original_device, "mlp.act"
+            )
+            _ev_g = manager.take_cpu_ready_event(gate_cpu)
+            _g_t, _a_t = gate_cpu.tensor, act_cpu_async.tensor
+
+            def _dense_silu_job(ev=_ev_g, g=_g_t, o=_a_t, k=_silu_k, n=_cpu_nt):
+                if ev is not None:
+                    ev.synchronize()
+                k(g, o, n)
+
+            act_task = cpu_worker.submit(_dense_silu_job, tag="dense.silu_fwd")
+
         with prof_range(layer._forward_range("finegrained", "up")):
             layer.stats.dense_mlp_finegrained_up_base_calls += 1
             up = _asym_base_forward(
@@ -315,7 +456,22 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
         act_rows = int(gate_cpu.tensor.shape[0])
         act_width = int(gate_cpu.tensor.shape[1])
         act_chunk = fg_chunk_rows(act_rows, act_width) if hasattr(manager, "stage_rows") else 0
-        if layer.cpu_activation:
+        if act_task is not None:
+            _ev_u = manager.take_cpu_ready_event(up_cpu)
+            _u_t, _a_t2 = up_cpu.tensor, act_cpu_async.tensor
+
+            def _dense_mul_job(ev=_ev_u, u=_u_t, o=_a_t2, k=_mul_k, n=_cpu_nt):
+                if ev is not None:
+                    ev.synchronize()
+                k(o, u, n)
+
+            act_task = cpu_worker.submit(_dense_mul_job, tag="dense.mul")
+
+        if act_task is not None:
+            with prof_range(layer._forward_range("finegrained", "activation_cpu_async")):
+                cpu_worker.wait(act_task)
+                act_cpu = act_cpu_async
+        elif layer.cpu_activation:
             with prof_range(layer._forward_range("finegrained", "activation_cpu")):
                 act_cpu = _cpu_silu_mul(gate_cpu, up_cpu, manager, tag="mlp.act")
         elif act_chunk > 0:
@@ -409,6 +565,29 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
         grad_x = None
         grad_gate_a = grad_gate_b = grad_up_a = grad_up_b = grad_down_a = grad_down_b = None
         grad_gate_cpu = grad_up_cpu = None
+        grad_gate_hbm = grad_up_hbm = None
+        deposit_ctx: dict = {}  # K-3: id(source_handle) -> (handle, last worker task)
+
+        # R5 restage prefetch (fix_cpu_compute.md): the dense mlp stage family is the
+        # single largest measured exposed-wait class (~50 s/step of the 32B step, with
+        # ~78 GiB G headroom). Early-issue gate/up H2D on the dedicated prefetch
+        # stream at backward entry (hidden under the down blocks), reuse ONE gate
+        # stage, and keep dgate/dup ON-GPU (skips their offload->restage roundtrip,
+        # the mlp.dgate/mlp.dup classes). G-guarded: needs ~4x gate bytes headroom.
+        _pref_gate = _pref_up = None
+        _keep_dgrads = False
+        if not layer.cpu_activation and _act_offload.restage_prefetch_enabled() and hasattr(manager, "stage_begin"):
+            # guard demand: the two held stages (gate+up). The kept dgrads replace
+            # same-size offload staging transients, so demanding 4x double-counted —
+            # measured on the b32_r5 pair: free flapped at ~64-78 GiB against a
+            # 64.8 GiB requirement => only partial engagement (gap 58.5->54.3 of a
+            # ~50 s/step target). 2x + the min-free floor is the corrected demand.
+            _extra = 2 * int(ctx.gate_cpu.nbytes)
+            if _act_offload.prefetch_free_ok(_extra):
+                _act_offload.prefetch_engaged_once("mlp.silu_bwd")
+                _pref_gate = manager.stage_begin(ctx.gate_cpu, tag="mlp.gate_for_silu_bwd")
+                _pref_up = manager.stage_begin(ctx.up_cpu, tag="mlp.up_for_silu_bwd_dgate")
+                _keep_dgrads = True
 
         try:
             grad_2d = grad_output.reshape(-1, layer.hidden_size).to(dtype=torch.bfloat16).contiguous()
@@ -420,7 +599,7 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                 manager.release_stage(down_low_rank, drop_cache=True)
                 manager.release_cpu(ctx.down_low_rank_cpu)
                 manager.wait_cpu_ready_host(ctx.act_cpu)
-                grad_down_a = layer._cpu_right_lora_a_grad(dS_down, ctx.act_cpu, down_a, tag="down")
+                grad_down_a = layer._cpu_right_lora_a_grad(dS_down, ctx.act_cpu, down_a, tag="down", deposit_ctx=deposit_ctx)
 
             with prof_range(layer._backward_range("finegrained", "down_base_dx")):
                 layer.stats.dense_mlp_finegrained_down_base_calls += 1
@@ -444,6 +623,38 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                     manager.release_cpu(grad_act_cpu)
                     manager.release_cpu(ctx.gate_cpu)
                     manager.release_cpu(ctx.up_cpu)
+            elif _pref_gate is not None:
+                with prof_range(layer._backward_range("finegrained", "activation_bwd_gpu")):
+                    # R5 prefetch path: commit the early-issued stages, reuse ONE gate
+                    # stage (out-of-place silu keeps it intact), and keep dgate/dup
+                    # ON-GPU (skips the mlp.dup/mlp.dgate offload->restage roundtrip).
+                    # Same kernels + operand orders as the legacy sequence => bitwise-
+                    # identical dgrads (unit-gated).
+                    layer.stats.dense_mlp_finegrained_gpu_silu_bwd_calls += 1
+                    gate_stage = manager.stage_commit(
+                        *_pref_gate, nbytes=ctx.gate_cpu.nbytes, tag="mlp.gate_for_silu_bwd"
+                    )
+                    silu_gate = F.silu(gate_stage)
+                    silu_gate.mul_(grad_act)
+                    grad_up_hbm = silu_gate.to(dtype=torch.bfloat16).contiguous()
+                    del silu_gate
+
+                    up_stage = manager.stage_commit(
+                        *_pref_up, nbytes=ctx.up_cpu.nbytes, tag="mlp.up_for_silu_bwd_dgate"
+                    )
+                    grad_act.mul_(up_stage)
+                    manager.release_stage(up_stage, drop_cache=True)
+                    manager.release_cpu(ctx.up_cpu)
+                    del up_stage
+                    _pref_up = None
+
+                    grad_gate = torch.ops.aten.silu_backward(grad_act, gate_stage)
+                    del grad_act
+                    grad_gate_hbm = grad_gate.to(dtype=torch.bfloat16).contiguous()
+                    manager.release_stage(gate_stage, drop_cache=True)
+                    manager.release_cpu(ctx.gate_cpu)
+                    del gate_stage, grad_gate
+                    _pref_gate = None
             else:
                 bwd_rows = int(grad_act.shape[0])
                 bwd_width = int(grad_act.shape[1])
@@ -508,7 +719,10 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                         del gate_stage, grad_gate
 
             with prof_range(layer._backward_range("finegrained", "gate")):
-                grad_gate_stage = manager.stage(grad_gate_cpu, tag="mlp.dgate", mutable=False)
+                if grad_gate_hbm is not None:
+                    grad_gate_stage = grad_gate_hbm  # R5: dgate kept on-GPU, no restage
+                else:
+                    grad_gate_stage = manager.stage(grad_gate_cpu, tag="mlp.dgate", mutable=False)
                 gate_low_rank = manager.stage(ctx.gate_low_rank_cpu, tag="mlp.S_gate_for_dB", mutable=False)
                 dS_gate = _lora_ds(grad_gate_stage, gate_b, scale=layer.lora_scale)
                 grad_gate_b = _lora_b_grad(
@@ -520,7 +734,7 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                 manager.release_stage(gate_low_rank, drop_cache=True)
                 manager.release_cpu(ctx.gate_low_rank_cpu)
                 manager.wait_cpu_ready_host(ctx.x_cpu)
-                grad_gate_a = layer._cpu_right_lora_a_grad(dS_gate, ctx.x_cpu, gate_a, tag="gate")
+                grad_gate_a = layer._cpu_right_lora_a_grad(dS_gate, ctx.x_cpu, gate_a, tag="gate", deposit_ctx=deposit_ctx)
                 layer.stats.dense_mlp_finegrained_gate_base_calls += 1
                 grad_x = _asym_base_dx(
                     layer.gate_proj.base_layer,
@@ -532,19 +746,26 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                 gate_lora_dx = dS_gate @ gate_a
                 grad_x.add_(gate_lora_dx.to(dtype=grad_x.dtype))
                 del gate_lora_dx, dS_gate
-                manager.release_stage(grad_gate_stage, drop_cache=True)
-                manager.release_cpu(grad_gate_cpu)
-                grad_gate_cpu = None
+                if grad_gate_hbm is not None:
+                    del grad_gate_stage
+                    grad_gate_hbm = None
+                else:
+                    manager.release_stage(grad_gate_stage, drop_cache=True)
+                    manager.release_cpu(grad_gate_cpu)
+                    grad_gate_cpu = None
 
             with prof_range(layer._backward_range("finegrained", "up")):
-                grad_up_stage = manager.stage(grad_up_cpu, tag="mlp.dup", mutable=False)
+                if grad_up_hbm is not None:
+                    grad_up_stage = grad_up_hbm  # R5: dup kept on-GPU, no restage
+                else:
+                    grad_up_stage = manager.stage(grad_up_cpu, tag="mlp.dup", mutable=False)
                 up_low_rank = manager.stage(ctx.up_low_rank_cpu, tag="mlp.S_up_for_dB", mutable=False)
                 dS_up = _lora_ds(grad_up_stage, up_b, scale=layer.lora_scale)
                 grad_up_b = _lora_b_grad(grad_up_stage, up_low_rank, scale=layer.lora_scale, out_dtype=up_b.dtype)
                 manager.release_stage(up_low_rank, drop_cache=True)
                 manager.release_cpu(ctx.up_low_rank_cpu)
                 manager.wait_cpu_ready_host(ctx.x_cpu)
-                grad_up_a = layer._cpu_right_lora_a_grad(dS_up, ctx.x_cpu, up_a, tag="up")
+                grad_up_a = layer._cpu_right_lora_a_grad(dS_up, ctx.x_cpu, up_a, tag="up", deposit_ctx=deposit_ctx)
                 layer.stats.dense_mlp_finegrained_up_base_calls += 1
                 up_dx = _asym_base_dx(
                     layer.up_proj.base_layer,
@@ -558,12 +779,17 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                 up_lora_dx = dS_up @ up_a
                 grad_x.add_(up_lora_dx.to(dtype=grad_x.dtype))
                 del up_lora_dx, dS_up
-                manager.release_stage(grad_up_stage, drop_cache=True)
-                manager.release_cpu(grad_up_cpu)
-                grad_up_cpu = None
+                if grad_up_hbm is not None:
+                    del grad_up_stage
+                    grad_up_hbm = None
+                else:
+                    manager.release_stage(grad_up_stage, drop_cache=True)
+                    manager.release_cpu(grad_up_cpu)
+                    grad_up_cpu = None
 
             grad_x = grad_x.to(dtype=ctx.input_dtype).reshape(ctx.input_shape)
         finally:
+            deferred_ids = set(deposit_ctx.keys())
             for handle in (
                 ctx.x_cpu,
                 ctx.gate_cpu,
@@ -575,7 +801,14 @@ class _FinegrainedDenseMLPFunction(torch.autograd.Function):
                 grad_gate_cpu,
                 grad_up_cpu,
             ):
+                if handle is not None and id(handle) in deferred_ids:
+                    continue  # K-3: worker wgrad still reads it; deferred sweep releases
                 manager.release_cpu(handle)
+            if deposit_ctx:
+                from .attention_activation_offload import _defer_deposit_release
+
+                for handle, task in deposit_ctx.values():
+                    _defer_deposit_release(task, manager, handle, None)
             layer._last_activation_offload_stats = manager.snapshot()
 
         return (
@@ -847,6 +1080,9 @@ class AsymFinegrainedDenseMLP(nn.Module):
         self._last_activation_offload_stats: dict[str, Any] = {}
         self._weight_offload = None
         self._weight_offload_release_after_forward = True
+        # P8: dense layers put the whole run in the host-RAM-bound regime — register
+        # BEFORE evaluating any policy-consulting gate helper below.
+        placement_policy.register_model_class("dense")
         self.cpu_activation = _finegrained_cpu_activation_enabled()
         device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -918,7 +1154,12 @@ class AsymFinegrainedDenseMLP(nn.Module):
         if source.tensor.is_cuda:
             # keep-acts-HBM: the "offloaded" handle is an HBM tensor — plain GPU matmul.
             return _gpu_lora_a_forward(source.tensor, lora_a, tag=tag)
-        if self.backend == "torch":
+        if self.backend == "torch" or not source.tensor.is_pinned():
+            # item 4 (fix_cpu_compute.md): a pinned-ledger cap denial yields an
+            # UNPINNED act handle, which the CPU-left C2C kernel cannot read (the GPU
+            # maps page-locked host memory directly). Fall back to the mathematically
+            # identical staged-GPU GEMM (lossless; slower — the cap converts OOM risk
+            # into bounded slowdown as designed).
             return source.tensor.to(device=lora_a.device, dtype=lora_a.dtype, non_blocking=source.tensor.is_pinned()).matmul(lora_a.t())
         plan = self._one_expert_plan(int(source.tensor.shape[0]), lora_a.device)
         return grouped_lora_a_forward_cpu_left(
@@ -938,13 +1179,26 @@ class AsymFinegrainedDenseMLP(nn.Module):
         lora_a: torch.Tensor,
         *,
         tag: str,
+        deposit_ctx: dict | None = None,
     ) -> torch.Tensor:
+        lora_a_param = lora_a  # keep Parameter identity for the deposit lookup
         lora_a = _dense_lora_a(lora_a, tag=tag)
         if source.tensor.is_cuda:
             # keep-acts-HBM: dA = dS^T @ source directly on GPU.
             src = source.tensor if source.tensor.dtype == dS.dtype else source.tensor.to(dtype=dS.dtype)
             return dS.t().contiguous().matmul(src).to(dtype=lora_a.dtype)
-        if self.backend == "torch":
+        if (
+            deposit_ctx is not None
+            and self.backend != "torch"
+            and _dense_lora_a_grad_cpu_deposit_enabled()
+            and lora_a.dim() == 2
+        ):
+            dummy = _try_deposit_dense_lora_a_grad(self, lora_a_param if lora_a_param.dim() == 2 else lora_a, dS, source, tag, deposit_ctx)
+            if dummy is not None:
+                return dummy
+        if self.backend == "torch" or not source.tensor.is_pinned():
+            # item 4: cap-denial fallback (see _cpu_left_lora_a) — the cpu-right wgrad
+            # kernel also reads page-locked host memory from the GPU.
             return dS.t().contiguous().matmul(
                 source.tensor.to(device=dS.device, dtype=dS.dtype, non_blocking=source.tensor.is_pinned())
             ).to(dtype=lora_a.dtype)
