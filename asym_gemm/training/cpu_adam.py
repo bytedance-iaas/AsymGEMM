@@ -36,10 +36,18 @@ def _tensor_view_key(param: torch.Tensor) -> tuple[str, int, int, tuple[int, ...
 def _pin_if_requested(tensor: torch.Tensor, *, pin_memory: bool) -> tuple[torch.Tensor, str | None]:
     if not pin_memory or not torch.cuda.is_available() or tensor.is_pinned():
         return tensor, None
+    from . import pinned_ledger
+
+    nbytes = tensor.numel() * tensor.element_size()
+    if not pinned_ledger.try_reserve("adam", nbytes):
+        return tensor, "pinned-ledger cap denial (item 4): unpinned fallback"
     try:
-        return tensor.pin_memory(), None
+        pinned = tensor.pin_memory()
     except RuntimeError as exc:
+        pinned_ledger.release("adam", nbytes)
         return tensor, str(exc)
+    pinned_ledger.register_tensor(pinned, "adam")
+    return pinned, None
 
 
 def _recursive_cpu_copy(value: Any) -> Any:
@@ -80,6 +88,7 @@ class _ParamMapping:
     grad_buffer_has_data: bool = False
     hook_calls: int = 0
     offloaded_grad_numel: int = 0
+    deposited_task: Any = None  # Stage-3 CpuWorker task that writes grad_buffer directly
 
 
 def _register_post_accumulate_hook(param: torch.nn.Parameter, hook: Callable[[torch.Tensor], None]) -> Any:
@@ -90,6 +99,13 @@ def _register_post_accumulate_hook(param: torch.nn.Parameter, hook: Callable[[to
     param_tmp = param.expand_as(param)
     grad_acc = param_tmp.grad_fn.next_functions[0][0]
     return grad_acc.register_hook(lambda *unused: hook(param))
+
+
+_ACTIVE_ADAMW = None
+
+
+def get_active_adamw():
+    return _ACTIVE_ADAMW
 
 
 class AsymCPUAdamW(torch.optim.Optimizer):
@@ -240,6 +256,8 @@ class AsymCPUAdamW(torch.optim.Optimizer):
         if self.grad_offload:
             self._ensure_grad_offload_flat_buffer()
             self._register_grad_offload_hooks()
+        global _ACTIVE_ADAMW
+        _ACTIVE_ADAMW = self  # Stage-3 deposit path lookup (cpu_compute.md)
 
     @property
     def param_names(self) -> list[str]:
@@ -270,6 +288,7 @@ class AsymCPUAdamW(torch.optim.Optimizer):
     ) -> torch.optim.Optimizer:
         if self.backend == "torch":
             return torch.optim.AdamW(cpu_params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+
 
         try:
             from deepspeed.ops.adam import DeepSpeedCPUAdam
@@ -394,6 +413,55 @@ class AsymCPUAdamW(torch.optim.Optimizer):
                 )
             )
 
+    # ---- Stage-3 deposit path (cpu_compute.md): a CpuWorker task writes the fp32
+    # grad directly into mapping.grad_buffer; the autograd grad is a dummy whose
+    # hook still fires (bank release + bookkeeping) but whose copies are skipped.
+    def get_grad_deposit_buffer(self, cuda_param: torch.Tensor) -> torch.Tensor | None:
+        """fp32 CPU grad buffer for `cuda_param`, or None if deposit is not possible
+        (unknown param, grad accumulation in flight, or grad offload disabled)."""
+        if not self.grad_offload:
+            return None
+        mapping = self._mapping_by_param_id().get(id(cuda_param))
+        if mapping is None or mapping.grad_buffer_has_data:
+            return None
+        return self._ensure_grad_buffer(mapping)
+
+    def direct_gpu_grad_offload(self, cuda_param: torch.Tensor, cuda_grad: torch.Tensor) -> bool:
+        """K-2b arm B: async-copy a GPU-computed grad straight into the pinned bf16
+        staging at the CALL SITE (earlier than the hook), skip the hook's copies; the
+        normal drain widens it. Returns False if not applicable (ga in flight etc.)."""
+        if not self.grad_offload:
+            return False
+        mapping = self._mapping_by_param_id().get(id(cuda_param))
+        if mapping is None or mapping.grad_buffer_has_data:
+            return False
+        self._ensure_grad_buffer(mapping)
+        staging = self._grad_staging_views.get(mapping.name)
+        if staging is None or tuple(staging.shape) != tuple(cuda_grad.shape) or staging.dtype != cuda_grad.dtype:
+            return False
+        staging.copy_(cuda_grad.detach(), non_blocking=True)
+        self._inflight_grad_srcs.append(cuda_grad)
+        self._pending_grad_converts.append(mapping)
+        mapping.grad_buffer_has_data = True
+        mapping.last_had_grad = True
+        mapping.cpu_param.grad = mapping.grad_buffer
+        mapping.direct_offloaded = True
+        return True
+
+    def register_grad_deposit(self, cuda_param: torch.Tensor, task) -> bool:
+        mapping = self._mapping_by_param_id().get(id(cuda_param))
+        if mapping is None or mapping.grad_buffer_has_data:
+            return False
+        mapping.deposited_task = task
+        return True
+
+    def _mapping_by_param_id(self):
+        cache = getattr(self, "_mapping_by_id_cache", None)
+        if cache is None:
+            cache = {id(m.cuda_param): m for m in self._mappings}
+            self._mapping_by_id_cache = cache
+        return cache
+
     @torch.no_grad()
     def _offload_grad_from_hook(self, mapping: _ParamMapping, param: torch.Tensor) -> None:
         if not self.grad_offload:
@@ -434,15 +502,58 @@ class AsymCPUAdamW(torch.optim.Optimizer):
         one blocking copy per param, then widen staged bf16 grads to the fp32 buffers on
         CPU (exact). Must run before anything reads the CPU grad buffers (step /
         grad-norm / clip / zero_grad / accumulate)."""
-        if not self._inflight_grad_srcs and not self._pending_grad_converts:
+        deposited = [m for m in self._mappings if getattr(m, "deposited_task", None) is not None]
+        if not self._inflight_grad_srcs and not self._pending_grad_converts and not deposited:
             return
         torch.cuda.synchronize()
         self._inflight_grad_srcs.clear()
+        _fused_widen = None
+        _fw_on = os.environ.get("ASYM_CPU_ADAMW_FUSED_WIDEN", "").strip().lower() in {"1", "true", "on", "yes"}
+        if not _fw_on:
+            from . import placement_policy as _pol
+
+            _fw_on = _pol.enabled() and _pol.fused_widen()  # P6: never-hurts, always ON
+        if _fw_on:
+            import asym_gemm as _ag
+
+            _fused_widen = getattr(_ag, "cpu_widen_bf16_sqsum", None)
         for mapping in self._pending_grad_converts:
+            if getattr(mapping, "deposited_task", None) is not None:
+                continue  # worker wrote the fp32 grad directly; dummy staging is stale
+            if _fused_widen is not None and not getattr(mapping, "direct_offloaded", False):
+                # K-8: widen + sqsum in one pass (sqsum stashed for diagnostics/clip reuse)
+                mapping._fused_sqsum = float(
+                    _fused_widen(self._grad_staging_views[mapping.name].reshape(-1),
+                                 mapping.grad_buffer.reshape(-1), -1)
+                )
+                continue
             mapping.grad_buffer.copy_(self._grad_staging_views[mapping.name])
+        for mapping in self._mappings:
+            if getattr(mapping, "direct_offloaded", False):
+                mapping.direct_offloaded = False
         self._pending_grad_converts.clear()
+        if deposited:
+            from . import cpu_worker as _cpu_worker
+
+            for mapping in deposited:
+                _cpu_worker.wait(mapping.deposited_task)
+                mapping.deposited_task = None
+            # K-2: release attention U buffers whose worker jobs are now complete
+            # (deferred on the main thread; pool is not thread-safe).
+            try:
+                from .attention_activation_offload import _sweep_attn_deposit_releases
+
+                _sweep_attn_deposit_releases(force=True)
+            except Exception:
+                pass
 
     def _copy_or_accumulate_grad_to_cpu(self, mapping: _ParamMapping, cuda_grad: torch.Tensor) -> None:
+        if getattr(mapping, "direct_offloaded", False):
+            return  # K-2b: grad already staged at the wgrad call site; hook copy skipped
+        if mapping.deposited_task is not None:
+            # Stage-3 deposit: the CpuWorker wrote/will write the fp32 grad into
+            # grad_buffer; the autograd grad is a dummy — skip all copies.
+            return
         grad_buffer = self._ensure_grad_buffer(mapping)
         if not grad_buffer.is_contiguous():
             raise RuntimeError(f"CPU grad buffer for {mapping.name} must be contiguous")

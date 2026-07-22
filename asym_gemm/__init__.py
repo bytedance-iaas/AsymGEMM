@@ -70,6 +70,15 @@ try:
             "sm100_grouped_lora_a_grad_bf16_cpu_right",
             "sm100_grouped_lora_a_pair_grad_bf16_cpu_right",
             "sm100_grouped_lora_b_backward_bf16_cpu_source",
+            # Grace CPU fused ops (agent/impls/cpu_compute.md Stage 1)
+            "cpu_fused_silu_mul_bf16",
+            "cpu_silu_bf16",
+            "cpu_mul_bf16_",
+            "cpu_fused_silu_backward_bf16",
+            "cpu_grouped_lora_a_grad_bf16",
+            "cpu_ops_sve_compiled",
+            "cpu_widen_bf16_sqsum",
+            "cpu_rmsnorm_bf16",
             # Qwen3 selected-recompute backward
             "qwen3_gate_up_recompute_bwd_sm100_bf16_windowed",
             "qwen3_moe_bf16_down_forward_scatter_add_",

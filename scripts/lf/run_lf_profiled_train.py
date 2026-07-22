@@ -1009,6 +1009,64 @@ def _model_and_base_model() -> tuple[Any | None, Any | None]:
     return model, base_model
 
 
+def _cpu_worker_jobs_snapshot():
+    # K-11 (cpu_compute.md): per-tag wall-ms of CPU-worker jobs (invisible to NVTX).
+    try:
+        from asym_gemm.training import cpu_worker
+
+        return cpu_worker.job_ms_snapshot()
+    except Exception:
+        return {}
+
+
+def _placement_policy_snapshot():
+    # P11 (placement.md): one placement_policy block per profile — rule ids, inputs,
+    # decisions, thresholds — plus the P7 deposit-retention high-water.
+    try:
+        from asym_gemm.training import placement_policy
+
+        out = placement_policy.stats()
+    except Exception as exc:
+        return {"enabled": False, "reason": repr(exc)}
+    try:
+        from asym_gemm.training import attention_activation_offload as _aao
+
+        out["deposit_retention"] = _aao.deposit_retention_stats()
+    except Exception:
+        pass
+    try:
+        from asym_gemm.training import save_dedup as _sd
+
+        out["save_dedup"] = {"enabled": _sd.enabled(), **_sd.stats()}
+    except Exception:
+        pass
+    try:
+        from asym_gemm.training import pinned_ledger as _pl
+
+        out["pinned_ledger"] = _pl.stats()
+    except Exception:
+        pass
+    try:
+        from asym_gemm.training import qknorm_recompute as _qkr
+
+        out["qknorm_recompute"] = _qkr.qknorm_recompute_stats()
+    except Exception:
+        pass
+    try:
+        from asym_gemm.training import activation_offload as _ao
+
+        out["restage_gap"] = _ao.restage_gap_stats()
+    except Exception:
+        pass
+    try:
+        from asym_gemm.training import qwen3_moe_finegrained as _fg
+
+        out["direct_reuse"] = _fg.direct_reuse_stats()
+    except Exception:
+        pass
+    return out
+
+
 def _asym_nvme_summary_from_model() -> dict[str, Any]:
     """NVMe store (+ Stage 3 governor / Stage 7 pager) summary for the profile ``asym_nvme``
     block. Returns ``{"enabled": False}`` when the store is disabled — rule 7. Every import is
@@ -3393,6 +3451,8 @@ class LFProfileRecorder:
             "kt": kt,
             "activation_offload": activation_offload,
             "asym_nvme": _asym_nvme_summary_from_model(),
+            "cpu_worker_jobs": _cpu_worker_jobs_snapshot(),
+            "placement_policy": _placement_policy_snapshot(),
             "asym_execution_stats": asym_execution_stats,
             "asym_liger_lm_head_bridge": asym_liger_lm_head_bridge,
             "grad_clip": _GRAD_CLIP_MARKER,
