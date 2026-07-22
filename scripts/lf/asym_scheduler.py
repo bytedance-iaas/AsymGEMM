@@ -64,9 +64,20 @@ class ModelTab:
 
 
 # ── recipe envs (single source of truth; --emit-recipes serializes these) ───
+# CPU stack (merge_cpu_modules S5, 2026-07-22): ONE production flag arms the
+# runtime placement policy (P1-P15 self-gate per-op from rows/bytes/tokens/
+# model-class/free-HBM — see placement.md); thread count is the measured
+# bandwidth-class setting. Deliberately in EVERY asym tier env, NOT in
+# _MOE_PINS (pins = engine-shape flags embedded in archived measurements;
+# the policy is an adoption layer on top and self-disables where cold, e.g.
+# KA bundle / dense deposits / near-wall prefetch).
+_CPU_STACK = {
+    "ASYM_PLACEMENT_POLICY": "1",
+    "ASYM_CPU_OPS_THREADS": "48",
+}
 _STAGED = {"ASYM_GEMM_DISPATCH": "staged"}
 _DENSE_T2_ENV = {
-    **_STAGED,
+    **_STAGED, **_CPU_STACK,
     "ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM": "1",
     "ASYM_SAVED_TENSOR_ASYNC_UNPACK": "1",
     "ASYMM_QWEN3_MOE_DOWN_DX_STAGED": "1",
@@ -89,13 +100,13 @@ _MOE_PINS = {
     "ASYMM_QWEN3_MOE_FG_KEEP_DGRADS_HBM": "1",
 }
 _MOE_T2_ENV = {   # the c14 keep-acts bundle, as-measured (no panel-cache)
-    **_STAGED, **_MOE_PINS,
+    **_STAGED, **_MOE_PINS, **_CPU_STACK,
     "ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM": "1",
     "ASYMM_ATTN_ACT_KEEP_ACTS_HBM": "1",
     "ASYM_GC_SAVE_ON_CPU_OVERRIDE": "false",
 }
-_MOE_T2B_ENV = {**_STAGED, **_MOE_PINS}          # shed prefix (c14 "balanced")
-_MOE_T3_ENV = dict(_MOE_PINS)                     # streamed engine, no staged
+_MOE_T2B_ENV = {**_STAGED, **_MOE_PINS, **_CPU_STACK}   # shed prefix (c14 "balanced")
+_MOE_T3_ENV = {**_MOE_PINS, **_CPU_STACK}         # streamed engine, no staged
 
 _FG000 = "recomp-off-full-fg-ker000-ceil0000-ohbm0"
 _FG101 = "recomp-off-full-fg-ker101-ceil0000-ohbm0"
@@ -104,11 +115,11 @@ MODELS = {
     "q3-32b": ModelTab(
         "q3-32b", "dense",
         tiers=(
-            TierLine("T1", "latency", "unsloth-ohbm0", dict(_STAGED), 0.0, 0.47,
+            TierLine("T1", "latency", "unsloth-ohbm0", {**_STAGED, **_CPU_STACK}, 0.0, 0.47,
                      valid_k=(128.0, 448.0), note="c12 §4 k 0.47-0.51, a clamped 0"),
             TierLine("T2", "balanced", _FG000, dict(_DENSE_T2_ENV), 10.0, 0.34,
                      valid_k=(128.0, 640.0)),
-            TierLine("T3", "memory", _FG000, {}, 0.0, 0.175,
+            TierLine("T3", "memory", _FG000, dict(_CPU_STACK), 0.0, 0.175,
                      host_c=750.2, host_h=0.359,   # fit of RSS 957@576k -> 980@640k
                      valid_k=(128.0, 704.0)),
         ),
@@ -116,7 +127,7 @@ MODELS = {
     "llama3.3-70b": ModelTab(
         "llama3.3-70b", "dense",
         tiers=(
-            TierLine("T1", "latency", "unsloth-ohbm0", dict(_STAGED), 0.0, 0.51,
+            TierLine("T1", "latency", "unsloth-ohbm0", {**_STAGED, **_CPU_STACK}, 0.0, 0.51,
                      valid_k=(128.0, 448.0), note="a=-1 fit artifact clamped to 0"),
             TierLine("T2", "balanced", _FG000, dict(_DENSE_T2_ENV), 30.6, 0.366,
                      host_c=980.0, host_h=0.0,     # 975-984 token-flat (c12 §5)
@@ -432,7 +443,8 @@ def _emit_recipes() -> None:
             # moe T1 has no deep byte line (c12 §4 fit-pending) but the RECIPE
             # is well-defined (anchor zone): unsloth-ohbm0 + staged.
             print(f'TIER_TOKEN[{fam}|T1]="unsloth-ohbm0"')
-            print(f'TIER_ENV[{fam}|T1]="ASYM_GEMM_DISPATCH=staged"')
+            t1_env = " ".join(f"{k}={v}" for k, v in sorted({**_STAGED, **_CPU_STACK}.items()))
+            print(f'TIER_ENV[{fam}|T1]="{t1_env}"')
         for line in m.tiers:
             env = " ".join(f"{k}={v}" for k, v in sorted(line.env.items()))
             print(f'TIER_TOKEN[{fam}|{line.name}]="{line.token}"')
