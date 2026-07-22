@@ -261,52 +261,17 @@ class ActivationOffloadManager:
             _GOV.on_offload(self, handle)
         return handle
 
-    @staticmethod
-    def _async_pack_enabled() -> bool:
-        """S-mem(c) pack side (agent/impls/fix_asym.md S0'): issue the offload D2H on a
-        dedicated side stream. Unlike the stage() H2D (structurally null without true
-        prefetch — see stage()'s comment), the pack D2H is fire-and-forget until the
-        handle's backward consumer waits its ready event, so a side-stream copy genuinely
-        overlaps subsequent forward/backward compute. Default off = pre-fix behavior."""
-        raw = os.environ.get(
-            "ASYM_SAVED_TENSOR_ASYNC_PACK",
-            os.environ.get("ASYM_GEMM_LF_CONFIG_ASYM_SAVED_TENSOR_ASYNC_PACK", "0"),
-        )
-        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-    _MGR_D2H_STREAMS: dict[int, "torch.cuda.Stream"] = {}
-
-    @classmethod
-    def _manager_d2h_stream(cls, device: torch.device) -> "torch.cuda.Stream":
-        idx = device.index if device.index is not None else torch.cuda.current_device()
-        stream = cls._MGR_D2H_STREAMS.get(idx)
-        if stream is None:
-            with torch.cuda.device(idx):
-                stream = torch.cuda.Stream()
-            cls._MGR_D2H_STREAMS[idx] = stream
-        return stream
-
     def offload(self, tensor: torch.Tensor, tag: str) -> CPUActivationHandle:
         if tensor.device.type == "cpu":
             return self.adopt_cpu(tensor, tag, original_device=tensor.device)
         handle = self.empty_cpu(tuple(tensor.shape), tensor.dtype, tensor.device, tag)
         non_blocking = bool(handle.tensor.is_pinned())
-        if self._async_pack_enabled() and non_blocking and tensor.device.type == "cuda":
-            side = self._manager_d2h_stream(tensor.device)
-            side.wait_stream(torch.cuda.current_stream(tensor.device))  # source produced on compute
-            with torch.no_grad(), torch.cuda.stream(side):
-                handle.tensor.copy_(tensor.detach(), non_blocking=True)
+        with torch.no_grad():
+            handle.tensor.copy_(tensor.detach(), non_blocking=non_blocking)
+        if non_blocking and tensor.device.type == "cuda":
             event = torch.cuda.Event()
-            event.record(side)
+            event.record(torch.cuda.current_stream(tensor.device))
             self._pending_cpu_ready_events[int(handle.tensor.data_ptr())] = event
-            tensor.record_stream(side)  # keep the GPU source alive until the side-stream copy drains
-        else:
-            with torch.no_grad():
-                handle.tensor.copy_(tensor.detach(), non_blocking=non_blocking)
-            if non_blocking and tensor.device.type == "cuda":
-                event = torch.cuda.Event()
-                event.record(torch.cuda.current_stream(tensor.device))
-                self._pending_cpu_ready_events[int(handle.tensor.data_ptr())] = event
         nbytes = handle.nbytes
         self.stats.num_offloads += 1
         self.stats.offloaded_bytes += nbytes
@@ -383,10 +348,7 @@ class ActivationOffloadManager:
         elif torch.cuda.is_available() and handle.original_device.type == "cuda":
             torch.cuda.current_stream(handle.original_device).synchronize()
 
-    def stage(self, handle: CPUActivationHandle, *, tag: str | None = None, mutable: bool = True) -> torch.Tensor:
-        # mutable is an HBMKeep-manager hint (fix_asym S-mem-b); this CPU manager
-        # always materializes a fresh GPU staging buffer, so it is inherently
-        # mutation-safe and ignores the hint.
+    def stage(self, handle: CPUActivationHandle, *, tag: str | None = None) -> torch.Tensor:
         self.wait_cpu_ready(handle)
         stage_tag = handle.tag if tag is None else tag
         shape = tuple(int(dim) for dim in handle.tensor.shape)

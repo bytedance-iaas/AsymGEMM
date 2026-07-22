@@ -126,21 +126,6 @@ def _record_attn_hbm_gemm(stats: AsymExecutionStats | None, tag: str) -> None:
     stats.attn_act_hbm_gemm_calls_by_tag[tag] = stats.attn_act_hbm_gemm_calls_by_tag.get(tag, 0) + 1
 
 
-def _attn_keep_acts_hbm_enabled() -> bool:
-    """S-mem fix (agent/impls/fix_asym.md §2.1): keep the attention projection source
-    (U) and low-rank S in HBM across the GC-recompute forward->backward window instead
-    of the per-layer CPU round trip. Under staged dispatch the backward dA GEMM
-    re-stages U to GPU anyway (raw H2D — the nsys +66 us/tok bucket) right after the
-    forward's D2H offload (+55 us/tok bucket); both copies vanish when the tensors stay
-    resident. The wrapper runs inside the unsloth-GC recompute, so everything kept here
-    is consumed by the SAME layer's backward (LIFO): peak cost ~= one layer's qkv+o
-    sources (~8 GB @128k b3). Default off = pre-fix behavior."""
-    value = os.environ.get("ASYMM_ATTN_ACT_KEEP_ACTS_HBM")
-    if value is None:
-        return False
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _tensor_storage_nbytes(tensor: torch.Tensor) -> int:
     try:
         return int(tensor.untyped_storage().nbytes())
@@ -209,24 +194,12 @@ def _attn_lora_chunk_enabled() -> bool:
 
 
 def _add_matmul_rows_(dest: torch.Tensor, lhs: torch.Tensor, rhs_t: torch.Tensor, *, scale: float = 1.0) -> None:
-    """dest += (lhs @ rhs_t) * scale, chunked over rows when the chunk budget allows.
-    C2 diet (fix_asym S2/S0'): under ASYMM_FUSED_LORA_ADDMM=1 the chain fuses into one
-    addmm_ epilogue (kills two full-width elementwise sweeps + the [M,out] temp)."""
+    """dest += (lhs @ rhs_t) * scale, chunked over rows when the chunk budget allows."""
     from .activation_offload import fg_chunk_rows
 
     rows = int(dest.shape[0])
-    fused = (
-        os.environ.get("ASYMM_FUSED_LORA_ADDMM", "").strip().lower() in {"1", "true", "yes", "on"}
-        and dest.dim() == 2
-        and lhs.dim() == 2
-        and rhs_t.dim() == 2
-        and dest.dtype == lhs.dtype == rhs_t.dtype
-    )
     chunk = fg_chunk_rows(rows, int(dest.shape[1]), dest.element_size()) if _attn_lora_chunk_enabled() else 0
     if chunk <= 0:
-        if fused:
-            dest.addmm_(lhs, rhs_t, alpha=float(scale))
-            return
         part = lhs @ rhs_t
         if float(scale) != 1.0:
             part = part * float(scale)
@@ -234,9 +207,6 @@ def _add_matmul_rows_(dest: torch.Tensor, lhs: torch.Tensor, rhs_t: torch.Tensor
         return
     for row_start in range(0, rows, chunk):
         row_end = min(rows, row_start + chunk)
-        if fused:
-            dest[row_start:row_end].addmm_(lhs[row_start:row_end], rhs_t, alpha=float(scale))
-            continue
         part = lhs[row_start:row_end] @ rhs_t
         if float(scale) != 1.0:
             part = part * float(scale)
@@ -756,45 +726,28 @@ class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function):
 
         manager = ActivationOffloadManager(pin_memory=True)
         shared_source = None
-        keep_acts_hbm = _attn_keep_acts_hbm_enabled()
-        if keep_acts_hbm:
-            # S-mem: no U offload, no wait — LoRA-A directly on the HBM-resident source.
-            u_handle = None
-            _record_attn_hbm_gemm(stats, f"{projection_role}.lora_a_forward")
-            s = (flat_lora @ a.contiguous().t()).contiguous()
-            if stats is not None:
-                stats.attn_act_lora_a_forward_calls += 1
+        if attention_context is None:
+            u_handle = manager.offload(flat_lora, f"{projection_role}.U")
         else:
-            if attention_context is None:
-                u_handle = manager.offload(flat_lora, f"{projection_role}.U")
-            else:
-                shared_source = attention_context.acquire_source(x, flat_lora, projection_role)
-                u_handle = shared_source.handle
-            # _dense_lora_a_cpu_left host-pads u_handle.tensor whenever M % 128 != 0
-            # (flagship 45k×8 → M=360000, not a multiple of 128) — a HOST read of a
-            # buffer just filled by a non-blocking D2H. Wait on the manager that OWNS
-            # the handle's ready event: the shared q/k/v source was offloaded by the
-            # attention context's manager, not this call's fresh one.
-            (attention_context.manager if shared_source is not None else manager).wait_cpu_ready_host(u_handle)
-            s = _dense_lora_a_cpu_left(
-                u_handle.tensor,
-                a.contiguous(),
-                stats=stats,
-                tag=f"{projection_role}.lora_a_forward",
-                backend=backend,
-            )
+            shared_source = attention_context.acquire_source(x, flat_lora, projection_role)
+            u_handle = shared_source.handle
+        # _dense_lora_a_cpu_left host-pads u_handle.tensor whenever M % 128 != 0
+        # (flagship 45k×8 → M=360000, not a multiple of 128) — a HOST read of a
+        # buffer just filled by a non-blocking D2H. Wait on the manager that OWNS
+        # the handle's ready event: the shared q/k/v source was offloaded by the
+        # attention context's manager, not this call's fresh one.
+        (attention_context.manager if shared_source is not None else manager).wait_cpu_ready_host(u_handle)
+        s = _dense_lora_a_cpu_left(
+            u_handle.tensor,
+            a.contiguous(),
+            stats=stats,
+            tag=f"{projection_role}.lora_a_forward",
+            backend=backend,
+        )
         _record_attn_hbm_gemm(stats, f"{projection_role}.lora_b_forward")
         out = base
         _add_matmul_rows_(out, s, b.t(), scale=float(scaling))
-        if keep_acts_hbm:
-            s_handle = None
-            ctx._ka_u = flat_lora
-            ctx._ka_s = s
-        else:
-            s_handle = manager.offload(s.contiguous(), f"{projection_role}.S")
-            ctx._ka_u = None
-            ctx._ka_s = None
-        ctx.keep_acts_hbm = keep_acts_hbm
+        s_handle = manager.offload(s.contiguous(), f"{projection_role}.S")
         _update_snapshot(snapshot, manager, attention_context)
 
         if weight_offload_module is None:
@@ -876,61 +829,44 @@ class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function):
             if needs_grad_a:
                 if d_s is None:
                     raise RuntimeError("internal error: dS was not computed for dA")
-                if getattr(ctx, "keep_acts_hbm", False):
-                    # S-mem: dA from the HBM-resident source — native GEMM, no padding,
-                    # no stage-back (kills the raw H2D that mirrored the fwd D2H).
-                    if int(d_s.shape[0]) == 0:
-                        grad_a = torch.zeros_like(a)
-                    else:
-                        _record_attn_hbm_gemm(stats, f"{role}.dA")
-                        grad_a = (d_s.t().contiguous() @ ctx._ka_u).to(dtype=a.dtype)
+                m_grad = _align_up(int(d_s.shape[0]), 64)
+                if m_grad == 0:
+                    grad_a = torch.zeros_like(a)
                 else:
-                    m_grad = _align_up(int(d_s.shape[0]), 64)
-                    if m_grad == 0:
-                        grad_a = torch.zeros_like(a)
-                    else:
-                        # _pad_cpu_rows_to is a HOST memcpy of u_handle.tensor; nothing
-                        # upstream host-orders it after the D2H that filled the handle
-                        # (fix_merged.md V1 — race proven in vitro 2026-07-16). Shared
-                        # q/k/v sources were offloaded by the attention context's
-                        # manager — that map holds the ready event, not ctx.manager's.
-                        (ctx.attention_context.manager if ctx.shared_source is not None else manager).wait_cpu_ready_host(u_handle)
-                        u_source = _pad_cpu_rows_to(u_handle.tensor, m_grad)
-                        d_s_rows = _pad_hbm_rows_to(d_s, m_grad)
-                        d_s_t = d_s_rows.t().contiguous()
-                        grad_a = asym_bf16_cpu_right_matmul(
-                            d_s_t,
-                            u_source,
-                            transpose_b=True,
-                            backend=ctx.backend,
-                            stats=stats,
-                            phase="attn_act_dA",
-                            tag=f"{role}.dA",
-                            compiled_dims=base_layer.compiled_dims,
-                            output_dtype=a.dtype,
-                        ).to(dtype=a.dtype)
+                    # _pad_cpu_rows_to is a HOST memcpy of u_handle.tensor; nothing
+                    # upstream host-orders it after the D2H that filled the handle
+                    # (fix_merged.md V1 — race proven in vitro 2026-07-16). Shared
+                    # q/k/v sources were offloaded by the attention context's
+                    # manager — that map holds the ready event, not ctx.manager's.
+                    (ctx.attention_context.manager if ctx.shared_source is not None else manager).wait_cpu_ready_host(u_handle)
+                    u_source = _pad_cpu_rows_to(u_handle.tensor, m_grad)
+                    d_s_rows = _pad_hbm_rows_to(d_s, m_grad)
+                    d_s_t = d_s_rows.t().contiguous()
+                    grad_a = asym_bf16_cpu_right_matmul(
+                        d_s_t,
+                        u_source,
+                        transpose_b=True,
+                        backend=ctx.backend,
+                        stats=stats,
+                        phase="attn_act_dA",
+                        tag=f"{role}.dA",
+                        compiled_dims=base_layer.compiled_dims,
+                        output_dtype=a.dtype,
+                    ).to(dtype=a.dtype)
 
             if needs_grad_b:
-                if getattr(ctx, "keep_acts_hbm", False):
-                    _record_attn_hbm_gemm(stats, f"{role}.dB")
-                    grad_b = ((d_y.t().contiguous() @ ctx._ka_s).to(dtype=b.dtype) * float(ctx.scaling)).to(dtype=b.dtype)
-                else:
-                    if stats is not None:
-                        stats.attn_act_stage_low_rank_calls += 1
-                    s_stage = manager.stage(s_handle, tag=f"{role}.S_stage")
-                    _record_attn_hbm_gemm(stats, f"{role}.dB")
-                    grad_b = ((d_y.t().contiguous() @ s_stage).to(dtype=b.dtype) * float(ctx.scaling)).to(dtype=b.dtype)
+                if stats is not None:
+                    stats.attn_act_stage_low_rank_calls += 1
+                s_stage = manager.stage(s_handle, tag=f"{role}.S_stage")
+                _record_attn_hbm_gemm(stats, f"{role}.dB")
+                grad_b = ((d_y.t().contiguous() @ s_stage).to(dtype=b.dtype) * float(ctx.scaling)).to(dtype=b.dtype)
         finally:
-            if s_stage is not None:
-                manager.release_stage(s_stage)
-            if s_handle is not None:
-                manager.release_cpu(s_handle)
-            if ctx.shared_source is not None:
-                ctx.shared_source.release()
-            elif u_handle is not None:
+            manager.release_stage(s_stage)
+            manager.release_cpu(s_handle)
+            if ctx.shared_source is None:
                 manager.release_cpu(u_handle)
-            ctx._ka_u = None
-            ctx._ka_s = None
+            else:
+                ctx.shared_source.release()
             _update_snapshot(ctx.snapshot, manager, ctx.attention_context)
 
         return grad_x, grad_a, grad_b, None, None, None, None, None, None, None, None, None, None, None

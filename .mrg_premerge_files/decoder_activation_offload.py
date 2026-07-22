@@ -24,34 +24,6 @@ def _async_unpack_enabled() -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _async_pack_enabled() -> bool:
-    """S-mem(c) pack side (agent/impls/fix_asym.md S0'): issue the saved-tensor D2H on a
-    dedicated side stream instead of the compute stream. Same-stream non_blocking copies
-    are stream-ordered against kernels, so the offload serializes with backward compute
-    (the nsys D2H bucket); a side stream + producer-event + record_stream keepalive makes
-    the copy engine overlap compute. Default off = pre-fix behavior."""
-    raw = os.environ.get(
-        "ASYM_SAVED_TENSOR_ASYNC_PACK",
-        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYM_SAVED_TENSOR_ASYNC_PACK", "0"),
-    )
-    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-_D2H_OFFLOAD_STREAMS: dict[int, torch.cuda.Stream] = {}
-
-
-def _d2h_offload_stream(device: torch.device) -> torch.cuda.Stream:
-    """Per-device side stream for pack-time D2H offload copies (mirror of
-    attention_activation_offload._h2d_restage_stream)."""
-    idx = device.index if device.index is not None else torch.cuda.current_device()
-    stream = _D2H_OFFLOAD_STREAMS.get(idx)
-    if stream is None:
-        with torch.cuda.device(idx):
-            stream = torch.cuda.Stream()
-        _D2H_OFFLOAD_STREAMS[idx] = stream
-    return stream
-
-
 _DEFAULT_SAVED_TENSOR_OFFLOAD_MIN_BYTES = 1 * 1024**2
 _DEFAULT_SAVED_TENSOR_OFFLOAD_DTYPES = frozenset({torch.bfloat16, torch.float16, torch.float32})
 _SAVED_TENSOR_DTYPE_ALIASES = {
@@ -242,21 +214,12 @@ class DecoderSavedTensorOffloadWrapper:
             return tensor
         cpu = _empty_strided_cpu_like(tensor, pin_memory=self.pin_memory)
         non_blocking = bool(cpu.is_pinned())
+        with torch.no_grad():
+            cpu.copy_(tensor.detach(), non_blocking=non_blocking)
         ready_event = None
-        if _async_pack_enabled() and non_blocking:
-            side = _d2h_offload_stream(tensor.device)
-            side.wait_stream(torch.cuda.current_stream(tensor.device))  # source produced on compute
-            with torch.no_grad(), torch.cuda.stream(side):
-                cpu.copy_(tensor.detach(), non_blocking=True)
+        if non_blocking:
             ready_event = torch.cuda.Event()
-            ready_event.record(side)
-            tensor.record_stream(side)  # keep the GPU source alive until the side-stream copy drains
-        else:
-            with torch.no_grad():
-                cpu.copy_(tensor.detach(), non_blocking=non_blocking)
-            if non_blocking:
-                ready_event = torch.cuda.Event()
-                ready_event.record(torch.cuda.current_stream(tensor.device))
+            ready_event.record(torch.cuda.current_stream(tensor.device))
         nbytes = _tensor_storage_nbytes(cpu)
         tag = self._tag_for(tensor)
         self.offload_calls += 1

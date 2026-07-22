@@ -5,7 +5,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 export SFT_ROOT=${SFT_ROOT:-/workspace/AsymGEMM-SFT}
-export PROFILERS=source MAX_STEPS=4 WARMUP_STEPS=1
+export PROFILERS=source MAX_STEPS=2 WARMUP_STEPS=1
 TIMEOUT_S=${TIMEOUT_S:-5400}
 
 R101='q3-30b-a3b|1 ; asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0|ligerloss1 ; 120000|8|1 ; none|false|false|false|false|false'
