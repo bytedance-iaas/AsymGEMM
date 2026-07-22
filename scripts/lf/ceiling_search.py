@@ -768,8 +768,11 @@ class Driver:
             meas = sorted((r for r in rows
                            if r.get("is_warmup", "").strip() in ("False", "false", "0")),
                           key=lambda r: int(float(r["measured_step"])))
-            if len(meas) >= 3:  # steady state: drop first and last measured step
+            if len(meas) >= 3:  # legacy w1+m4 runs: drop first and last measured step
                 mid = [float(r["step_milliseconds"]) / 1000.0 for r in meas[1:-1]]
+            else:  # w1+m2 protocol (2026-07-19): steady = mean of the 2 measured steps
+                mid = [float(r["step_milliseconds"]) / 1000.0 for r in meas]
+            if mid:
                 out["confirm_steady_step_s"] = round(sum(mid) / len(mid), 1)
         except Exception as e:
             self.say(f"confirm-metrics extraction failed (fields left null): {e}")
