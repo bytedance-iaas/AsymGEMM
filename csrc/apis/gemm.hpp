@@ -25,8 +25,16 @@
 
 #if DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/sm90_int8_asym_gemm_1d1d.hpp"
+// hybridGEMM.md Phase A/B kernels — not yet in the tree; compile the deep/hybrid
+// facades only once the headers land.
+#if __has_include("../jit_kernels/impls/sm90_int8_gemm.hpp") && \
+    __has_include("../jit_kernels/impls/sm90_int8_hybrid_gemm.hpp")
+#define DG_HAS_SM90_INT8_DEEP_HYBRID 1
 #include "../jit_kernels/impls/sm90_int8_gemm.hpp"
 #include "../jit_kernels/impls/sm90_int8_hybrid_gemm.hpp"
+#else
+#define DG_HAS_SM90_INT8_DEEP_HYBRID 0
+#endif
 #endif
 
 #include "layout.hpp"
@@ -645,6 +653,7 @@ static void m_grouped_int8_asym_gemm_nt_masked(const std::pair<torch::Tensor, to
                         "(supported: SM80, SM90)");
 }
 
+#if DG_HAS_SM90_INT8_DEEP_HYBRID
 // Deep-pattern INT8 grouped GEMM for HBM-resident expert weights
 // (hybridGEMM.md Phase A). Same calling convention as the asym contiguous
 // facade; routes to the persistent M-outer kernel instead of the K-outer
@@ -727,6 +736,7 @@ static void m_grouped_int8_hybrid_gemm_nt_contiguous(
     DG_HOST_UNREACHABLE("INT8 hybrid grouped GEMM is not supported on this architecture "
                         "(supported: SM90)");
 }
+#endif  // DG_HAS_SM90_INT8_DEEP_HYBRID
 
 #endif
 
@@ -1225,6 +1235,7 @@ static void register_apis(pybind11::module_& m) {
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("masked_m"), py::arg("expected_m"),
           py::arg("recipe") = std::nullopt, py::arg("compiled_dims") = "nk");
+#if DG_HAS_SM90_INT8_DEEP_HYBRID
     m.def("m_grouped_int8_gemm_nt_contiguous",
           static_cast<void(*)(const std::pair<torch::Tensor, torch::Tensor>&,
                               const std::pair<torch::Tensor, torch::Tensor>&,
@@ -1249,6 +1260,7 @@ static void register_apis(pybind11::module_& m) {
           py::arg("offsets_hbm"), py::arg("experts_hbm"), py::arg("list_size_hbm"),
           py::arg("s_host"), py::arg("enable_steal") = false,
           py::arg("recipe") = std::nullopt, py::arg("compiled_dims") = "nk");
+#endif  // DG_HAS_SM90_INT8_DEEP_HYBRID
 
 #endif
 

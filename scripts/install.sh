@@ -5,6 +5,11 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PROJECT_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 cd "$PROJECT_ROOT"
 
+# Vendored cutlass/fmt are git submodules; a fresh clone has them empty.
+if [ -d .git ] && command -v git >/dev/null 2>&1; then
+  git submodule update --init --recursive
+fi
+
 # Allow pip install in PEP 668 externally-managed environments (e.g. containers)
 PYTHON_STDLIB=$(python -c "import sysconfig; print(sysconfig.get_path('stdlib'))")
 if [ -f "${PYTHON_STDLIB}/EXTERNALLY-MANAGED" ]; then

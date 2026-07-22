@@ -1,19 +1,23 @@
 /*
  * dispatch/int8_rm_backend.h — runtime-selected INT8 row-major backend.
  *
- * Both AMX-INT8 (kernels/amx/int8_gemm_rm) and AVX-512-VNNI
- * (kernels/avx512/int8_gemm_rm) consume the **same** canonical weight
- * bytes: row-major INT8 `[N, K]` + per-channel FP32 scales `[N]`
- * (per Stride.md, layout.md). This header exposes a tiny
- * function-pointer table that selects one of them at runtime.
+ * AMX-INT8 (kernels/amx/int8_gemm_rm), AVX-512-VNNI
+ * (kernels/avx512/int8_gemm_rm) and AVX2 (kernels/avx2/int8_gemm_rm)
+ * consume the **same** canonical weight bytes: row-major INT8 `[N, K]`
+ * + per-channel FP32 scales `[N]` (per Stride.md, layout.md). This
+ * header exposes a tiny function-pointer table that selects one of
+ * them at runtime.
  *
  * Design contract (avx_512.md §3):
  *   - Selection runs ONCE on first use, cached in a static lambda.
  *     CPUID + per-thread XSAVE permission decide; no per-call probe.
  *   - AMX wins whenever available (`has_amx_int8 && amx_available()`).
- *   - AVX-512-VNNI is the fallback (`has_avx512_vnni && has_avx512f`).
- *   - `ASYM_GEMM_FORCE_BACKEND={amx,avx512,none}` env var overrides
- *     the autodetect — TESTING-ONLY; production never sets it.
+ *   - AVX-512-VNNI is the first fallback (`has_avx512_vnni &&
+ *     has_avx512f`); AVX2 (`has_avx2`) is the last resort for hosts
+ *     with neither (e.g. AMD Zen 2/3).
+ *   - `ASYM_GEMM_FORCE_BACKEND={amx,avx512,avx2,none}` env var
+ *     overrides the autodetect — TESTING-ONLY; production never sets
+ *     it.
  *
  * Both dispatchers (`cg_gemm` and `cg_moe_int8_amx`) call
  * `select_int8_rm_backend()` and route their per-tile kernel calls
@@ -67,11 +71,12 @@ struct Int8RmBackend {
   scratch_fn  scratch_sizes;
   tile_cfg_fn tile_config_init;   /* called once per thread before run() */
 
-  int  k_step;       /* k alignment (both backends: 64) */
-  int  n_step;       /* n alignment (AMX: 32; VNNI: 16) */
+  int  k_step;       /* k alignment (AMX: 64; VNNI/AVX2: 4) */
+  int  n_step;       /* n alignment (AMX: 32; VNNI: 16; AVX2: 8) */
   int  n_block;      /* per-thread N-stripe granularity */
   bool ok;           /* false → no backend usable on this host */
-  const char* name;  /* "amx_int8_rm" | "avx512_vnni_int8_rm" | "none" */
+  const char* name;  /* "amx_int8_rm" | "avx512_vnni_int8_rm" |
+                      * "avx2_int8_rm" | "none" */
 };
 
 /* Returns the process-wide-cached backend. The first call probes
