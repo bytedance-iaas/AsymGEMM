@@ -284,6 +284,45 @@ push to Kevin's explicit call (or his gbackup habit). Update memory notes.
   Engagement verified in the ON profile: P1 cpu_act True ×336, P2 deposit
   True ×336, P3 attn deposit True ×1344, qknorm norm_offloads=672 —
   the full stack is live and lossless at SMOKE scale.
+- [S4.2a MoE-32k A/B 2026-07-22] donor cfg (ker101, w1+m4 mid-2): OFF 90.95
+  → ON 88.47 s/step = −2.72%, peak 32.8→32.4 GiB. Engagement: P2 ×240,
+  P3 ×960 (960 worker dA jobs), qknorm 480 offloads, prefetch ×240. Donor's
+  −10.7% does NOT fully transfer, measured-explained: (a) our OFF baseline
+  is already 6.6% faster than the donor's OFF at the same config (the sched
+  merge recovered overlapping gains); (b) P1 cpu-act is cold on our engine
+  at this config (rule absent from traces — the S1 "cold path" note; v2
+  item). Verdict: clean composed win, correct self-gating, no regression.
+- [S4.2c dense-32k A/B 2026-07-22] donor cfg (ker000-ohbm8, w1+m4 mid-2):
+  OFF 325.21 → ON 304.82 s/step = −6.27%. P8 correctly kills all dense
+  CPU-compute (False decisions), qknorm 640 offloads, prefetch ×320, rope
+  armed (dense rule). Peak 71.9→96.3 GiB = prefetch SPENDING free HBM by
+  design (guard floor 16 GiB; 89 free here) — wall rows M5/M6 must show
+  the guard self-disabling (watch item). Donor −13.8% partial-transfers
+  for the same two reasons as MoE (our OFF already −14% vs donor OFF).
+  S4 COMPLETE: SMOKE + both A/Bs positive, every gate behaved per design.
+- [S5 DONE 2026-07-22, commit f24b1b4] _CPU_STACK
+  (ASYM_PLACEMENT_POLICY=1 + ASYM_CPU_OPS_THREADS=48) merged into all 7
+  family|TIER envs incl. synthetic moe|T1 (NOT into _MOE_PINS);
+  tier_recipes.sh regenerated 7/7; selftest 5/5; replay 18/18;
+  TIER_DRY_RUN expansion shows both vars. S6 matrix launched
+  (.mrg_cpu_q3.sh, order M1→M2→M4→M5→M7→M6→M3→M8→M9 fail-fast).
+- [S4.2c dense-32k A/B + S4 CLOSE 2026-07-22] OFF 325.2 → ON 304.8 s/step
+  = −6.27% (donor class −10~14%; partially pre-recovered by sched merge).
+  P8 correct (dense CPU-compute all-False); win = qknorm (640 offloads) +
+  restage prefetch (×320). Peak 71.9→96.3 GiB: prefetch pipeline depth
+  under 113 GB free — G-guard behavior at walls is exactly what M6 gates.
+  S4 CLOSED: SMOKE parity + both donor-regime A/Bs green, self-gating
+  correct on every trace.
+- [S5 DONE 2026-07-22] _CPU_STACK dict merged into ALL TierLine envs (incl.
+  q3.5 placeholders now inheriting full T2B/T3 envs); tier_recipes.sh
+  regenerated — 7/7 TIER_ENV entries carry the pair; selftest 5/5, replay
+  18/18. c06 system_summary S5-tense flipped to present.
+- [S6 LAUNCH 2026-07-22] .mrg_cpu_q3.sh (prior-session draft) CORRECTED
+  before launch: llama model key llama3_3→llama3.3 (dot form the probe
+  script expects) and M7 reverted to the R7 dial env VERBATIM (mrgs1c3:
+  staged+FG_KEEP_ACTS+chunk+dx only — the drafted T2-bundle env would have
+  changed the comparison vs baseline 2762/165.7). Order fail-fast:
+  M1,M2,M4,M5,M7,M6,M3,M8,M9.
 - [S2 BUILD 2026-07-22] _C rebuilt in-container with -fopenmp + SVE-BF16
   march: cpu_ops_sve_compiled()=True, all 8 symbols present. Bench --final
   sanity vs donor table: swiglu fwd 44.3 ms@32k (donor 44.8 ✓), bwd 60.1

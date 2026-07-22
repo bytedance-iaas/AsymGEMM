@@ -171,9 +171,9 @@ MODELS = {
         # campaign's command.txt, not from these placeholders.
         "q3.5-35b-a3b", "moe",
         tiers=(
-            TierLine("T2", "balanced", _FG000, {}, 0.0, 0.11,
+            TierLine("T2", "balanced", _FG000, dict(_MOE_T2B_ENV), 0.0, 0.11,
                      valid_k=(128.0, 640.0), note="PENDING-FIT: k implied from 95.7@576k; recipe pending"),
-            TierLine("T3", "memory", _FG101, {}, 0.0, 0.06,
+            TierLine("T3", "memory", _FG101, dict(_MOE_T3_ENV), 0.0, 0.06,
                      valid_k=(128.0, 704.0), note="PENDING-FIT: k implied from 64.4@640k; recipe pending"),
         ),
     ),
