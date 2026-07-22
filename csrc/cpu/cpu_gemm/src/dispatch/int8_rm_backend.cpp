@@ -23,6 +23,10 @@
 #include "kernels/avx512/int8_gemm_rm.h"
 #endif
 
+#if defined(CPU_GEMM_HAS_AVX2_INT8)
+#include "kernels/avx2/int8_gemm_rm.h"
+#endif
+
 namespace cpu_gemm {
 
 namespace {
@@ -96,6 +100,41 @@ Int8RmBackend make_avx512_vnni_backend() {
 
 #endif  /* CPU_GEMM_HAS_AVX512_VNNI */
 
+#if defined(CPU_GEMM_HAS_AVX2_INT8)
+
+/* Adapter from avx2::int8_rm_scratch's struct into the table's
+ * Int8RmScratchSizes. */
+Int8RmScratchSizes avx2_int8_rm_scratch_sizes(int m, int n, int k) {
+  using T = cpu_gemm::kernels::avx2::Int8RmTraits;
+  auto s = cpu_gemm::kernels::avx2::int8_rm_scratch(m, n, k);
+  Int8RmScratchSizes out{};
+  out.bytes_a      = s.bytes_a;
+  out.bytes_c      = s.bytes_c;
+  out.max_m_pad    = (std::size_t)cpu_gemm::kernels::avx2::int8_rm_pad_up(
+      m, T::M_STEP);
+  out.a_scales_off = cpu_gemm::kernels::avx2::int8_rm_a_scales_offset(
+      (int)out.max_m_pad, k);
+  return out;
+}
+
+Int8RmBackend make_avx2_int8_backend() {
+  using T = cpu_gemm::kernels::avx2::Int8RmTraits;
+  Int8RmBackend be{};
+  be.pack_a            = &cpu_gemm::kernels::avx2::int8_rm_pack_a_bf16;
+  be.run               = &cpu_gemm::kernels::avx2::int8_rm_run;
+  be.unpack_transposed = &cpu_gemm::kernels::avx2::int8_rm_unpack_transposed;
+  be.scratch_sizes     = &avx2_int8_rm_scratch_sizes;
+  be.tile_config_init  = &cpu_gemm::kernels::avx2::int8_rm_tile_config_init;
+  be.k_step            = T::K_STEP;       /* 4 — vpmaddubsw consumes 4 K's per dword */
+  be.n_step            = T::N_STEP;       /* 8 */
+  be.n_block           = T::N_BLOCK;
+  be.ok                = true;
+  be.name              = "avx2_int8_rm";
+  return be;
+}
+
+#endif  /* CPU_GEMM_HAS_AVX2_INT8 */
+
 Int8RmBackend make_none_backend() {
   return Int8RmBackend{
       /* pack_a            */ nullptr,
@@ -116,6 +155,7 @@ Int8RmBackend make_none_backend() {
  *    1 = force AMX
  *    2 = force AVX-512-VNNI
  *    3 = force none
+ *    4 = force AVX2
  *
  * Unknown values are treated as 0 (autodetect) — defensive against
  * typos that would otherwise silently force a no-op binary. */
@@ -125,6 +165,7 @@ int parse_force_backend() {
   if (std::strcmp(v, "amx")    == 0) return 1;
   if (std::strcmp(v, "avx512") == 0) return 2;
   if (std::strcmp(v, "none")   == 0) return 3;
+  if (std::strcmp(v, "avx2")   == 0) return 4;
   return 0;
 }
 
@@ -152,7 +193,15 @@ Int8RmBackend select_backend_impl() {
     return make_none_backend();
   }
 
-  /* Autodetect path — AMX first, AVX-512-VNNI second. */
+  if (forced == 4) {
+#if defined(CPU_GEMM_HAS_AVX2_INT8)
+    cg_caps_t caps = cg_query_caps();
+    if (caps.has_avx2) return make_avx2_int8_backend();
+#endif
+    return make_none_backend();
+  }
+
+  /* Autodetect path — AMX first, AVX-512-VNNI second, AVX2 last. */
   cg_caps_t caps = cg_query_caps();
 
 #if defined(CPU_GEMM_HAS_AMX)
@@ -164,6 +213,12 @@ Int8RmBackend select_backend_impl() {
 #if defined(CPU_GEMM_HAS_AVX512_VNNI)
   if (caps.has_avx512_vnni && caps.has_avx512f) {
     return make_avx512_vnni_backend();
+  }
+#endif
+
+#if defined(CPU_GEMM_HAS_AVX2_INT8)
+  if (caps.has_avx2) {
+    return make_avx2_int8_backend();
   }
 #endif
 

@@ -194,6 +194,9 @@ def get_ext_modules():
                 os.path.join(current_dir, 'asym_gemm/include'),
                 os.path.join(current_dir, 'third-party/cutlass/include'),
                 os.path.join(current_dir, 'third-party/fmt/include'),
+                # Some torch builds (e.g. distro packages) don't bundle
+                # pybind11 headers, so resolve them explicitly.
+                _pybind11_include(),
             ],
             libraries=['cudart', 'nvrtc'],
             library_dirs=[f'{CUDA_HOME}/lib64'],

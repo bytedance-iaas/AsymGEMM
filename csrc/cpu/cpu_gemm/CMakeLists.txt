@@ -49,10 +49,12 @@ set(CPU_GEMM_BACKEND_LIBS "")
 if(CPU_GEMM_WITH_AVX2)
   add_library(cpu_gemm_avx2 OBJECT
     src/kernels/avx2/bf16_gemm.cpp
+    src/kernels/avx2/int8_gemm_rm.cpp
   )
   target_compile_options(cpu_gemm_avx2 PRIVATE
     -mavx2 -mfma -mf16c
   )
+  target_compile_definitions(cpu_gemm_avx2 PRIVATE CPU_GEMM_HAS_AVX2_INT8=1)
   target_include_directories(cpu_gemm_avx2 PRIVATE include src)
   target_link_libraries(cpu_gemm_avx2 PRIVATE cpu_gemm_common_flags)
   list(APPEND CPU_GEMM_BACKEND_LIBS cpu_gemm_avx2)
@@ -105,7 +107,8 @@ target_link_libraries(cpu_gemm PRIVATE cpu_gemm_common_flags
 find_package(Threads REQUIRED)
 
 if(CPU_GEMM_WITH_AVX2)
-  target_compile_definitions(cpu_gemm PRIVATE CPU_GEMM_HAS_AVX2=1)
+  target_compile_definitions(cpu_gemm PRIVATE
+    CPU_GEMM_HAS_AVX2=1 CPU_GEMM_HAS_AVX2_INT8=1)
   target_sources(cpu_gemm PRIVATE $<TARGET_OBJECTS:cpu_gemm_avx2>)
 endif()
 

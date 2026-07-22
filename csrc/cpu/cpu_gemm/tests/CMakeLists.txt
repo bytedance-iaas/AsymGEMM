@@ -3,6 +3,13 @@ target_link_libraries(test_avx2_bf16 PRIVATE cpu_gemm)
 target_include_directories(test_avx2_bf16 PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME test_avx2_bf16 COMMAND test_avx2_bf16)
 
+if(CPU_GEMM_WITH_AVX2)
+  add_executable(test_avx2_int8_rm test_avx2_int8_rm.cpp)
+  target_link_libraries(test_avx2_int8_rm PRIVATE cpu_gemm)
+  target_include_directories(test_avx2_int8_rm PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  add_test(NAME test_avx2_int8_rm COMMAND test_avx2_int8_rm)
+endif()
+
 add_executable(test_runtime test_runtime.cpp)
 target_link_libraries(test_runtime PRIVATE cpu_gemm)
 target_include_directories(test_runtime PRIVATE ${CMAKE_SOURCE_DIR}/include)
