@@ -71,7 +71,7 @@ WHAT WE ADOPT (donor verdicts, re-judged for our tiers):
 | Expert wgrad deposit (P2) | MoE −2.6%/−0.4% | ADOPT MoE tiers |
 | Attn wgrad deposit (P3) | 32k-class only (auto rows-gate) | ADOPT (self-gating) |
 | SwiGLU fwd CPU (P1) | 32k-class MoE only (auto) | ADOPT (self-gating; cold on our blocked path — see S1 note) |
-| Boundary pin+prefetch (P4), dup-copy removal (P5), fused widen (P6), wgrad 96T (P14) | never-hurts | ADOPT under policy |
+| Boundary pin+prefetch (P4), dup-copy removal (P5), fused widen (P6), wgrad 96T (P14) | never-hurts | ADOPT under policy (NB P4 engages only on async root paths — dense T2 / NVMe substrate; standard-tier roots are stock pageable) |
 | Rope recompute | memory feature (≥524k tokens / dense) | ADOPT (tokens-gated) |
 | SwiGLU bwd CPU, LoRA-B deposit, byte-diet (P15), save-dedup | rejected/dormant by donor | LAND CODE, stays off (P9/P15 permanent-False) |
 | Batch scaling | measured-negative | not adopted (consistent with our knee cap) |
@@ -253,3 +253,40 @@ push to Kevin's explicit call (or his gbackup habit). Update memory notes.
   map + composition spec produced by max-effort forks (appendix
   merge_cpu_modules_compspec.md); previous_validation_results.md confirmed
   as the baseline record.
+- [S1 DONE 2026-07-22, commit 65cb647] All 24 hunks resolved per spec
+  (3 files by coordinator, dense+moe fg by the spec's author fork — 2
+  documented deviations, both corrections: `del packed` anchor collision
+  fixed, carried_* hoisted to shared scope to avoid NameError on the
+  blocked path). V1 PASS: 0 markers repo-wide; py_compile 16 files;
+  in-container import green; ALL defaults-off asserted (donor + sched
+  flags); spec greps exact (mutable=False ×11, allow_deposit ×2,
+  record_cpu_ready 6=ours' 6, deposited_u wiring).
+- [S2 UNITS 2026-07-22] pytest installed into container venv (was absent —
+  donor ran suites elsewhere); ALL 8 SUITES GREEN, 59 tests: cpu_ops 6,
+  cpu_worker 7, placement_policy 13/13, qknorm 9/9 bitwise, pinned_ledger 9,
+  save_dedup 9, restage_prefetch 3, moe_direct_reuse 3.
+- [S3 2026-07-22] Flags-off invariance: S3b MoE-shed-800k PASS (582 vs 584
+  = −0.4%, peak 111.4 vs 110.4 — clean). S3a dense-T2-128k: 945 vs 986
+  (−4.2%) with peak EXACT 93.6; telemetry proves zero donor features
+  engaged (norm_offloads 0, worker idle, deposits idle; ledger counting
+  only). Not uniform-day (S3b in-band) ⇒ decisive same-day lib A/B
+  launched (.mrg_cpu_ab.sh: merged vs pre-cpu-merge main_kevin files,
+  flags-off, same config). NB the 986 baseline was itself +2.9% above its
+  c12 record — 945 is −1.4% vs the record.
+- [S3 CLOSED 2026-07-22 — INVARIANCE PROVEN] Lib A/B (merged vs pre-cpu-
+  merge main_kevin files, flags-off, same config/hour): 973 vs 974 tok/s =
+  −0.11%, peak IDENTICAL 93.6. The S3a 945 sample was row noise (same
+  merged code measured 973 1 h later; ±3% intra-day drift on the dense
+  128k row under sustained load). With S3b (−0.4%) both invariance paths
+  green. Merged lib restored + verified.
+- [S4.1 SMOKE PASS 2026-07-22] loss parity ON vs OFF (moe 8k b4, 7 steps,
+  fixed seed): max |Δ| = 0.48% (envelope 0.67-1.0%), no drift trend.
+  Engagement verified in the ON profile: P1 cpu_act True ×336, P2 deposit
+  True ×336, P3 attn deposit True ×1344, qknorm norm_offloads=672 —
+  the full stack is live and lossless at SMOKE scale.
+- [S2 BUILD 2026-07-22] _C rebuilt in-container with -fopenmp + SVE-BF16
+  march: cpu_ops_sve_compiled()=True, all 8 symbols present. Bench --final
+  sanity vs donor table: swiglu fwd 44.3 ms@32k (donor 44.8 ✓), bwd 60.1
+  (58.9 ✓), widen 82.9→5.2 (13.3×→15.8× ✓), deposits/norm/restage rows all
+  same class. NOTE: venv had no pytest (donor ran suites elsewhere) —
+  installed pytest into container venv, suites re-running.
