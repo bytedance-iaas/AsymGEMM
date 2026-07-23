@@ -266,11 +266,14 @@ def _stage_fresh(handle: CPUActivationHandle, manager: ActivationOffloadManager)
             restage_gap_commit(gap_wait, gap_done, handle.nbytes, f"qknorm.{handle.tag}")
         # NB deliberately NO staged.record_stream(side): compute_stream.wait_event(done)
         # above already orders every downstream use AND the eventual free behind the
-        # side-stream copy. record_stream(side) additionally tagged each freed restage
-        # buffer with a side-stream dependency, which segregated those bytes from the
-        # compute-stream pool — the caching allocator then served autograd transients
-        # from fresh segments (+10.98 GiB reserved at 176.7 vs 165.7, S6 M7; allocated
-        # peak byte-identical 109.54 in the A/B — pure pool growth, not a hold).
+        # side-stream copy, so the extra allocator constraint is pure overhead.
+        # (S6 M7 forensics note: removing it did NOT shrink the +11 GiB reserved
+        # delta — that is side-stream POOL growth (segments owned by the restage
+        # stream's allocator pool, sized to the in-flight restage window), which
+        # record_stream never influenced. Allocated peak is byte-identical to
+        # no-policy baseline (109.54 GiB) and cached side-pool segments are
+        # reclaimed under memory pressure, so capacity impact is nil; the
+        # near-wall throughput harm was fixed by the 32 GB prefetch floor.)
         # keep the pinned source alive until the staged tensor dies (async copy source)
         staged._asym_qknorm_keepalive = handle.tensor  # type: ignore[attr-defined]
     else:

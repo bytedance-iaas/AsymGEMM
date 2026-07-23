@@ -370,6 +370,65 @@ push to Kevin's explicit call (or his gbackup habit). Update memory notes.
   policy-side): ASYM_PREFETCH_MIN_FREE_GB default 16→32 (all measured wins
   have ≥90 GB free — unaffected; near-wall rows now never arm). M7 rerun =
   Q4e. Deposits/P1 correctly cold at M7 (P3 False ×576; qknorm host-only).
+- [S6 M6 PASS 2026-07-22] llama T2 448k b1 WALL: 279 vs 280 (−0.4%), peak
+  182.4 BYTE-EXACT at 2.6 GiB free — the extreme guard row: prefetch and
+  every policy hold stayed OFF at the wall. With M5 this closes the
+  near-wall guard question raised by the S4 dense +24 GiB observation.
+- [S6 M3 PASS 2026-07-22 — FIRST OUTRIGHT WIN] q32 T3 640k b1: 227 vs 219
+  = +3.6% tok/s. Peak 153.8 (+24.1) with free-at-peak 31.2 ≈ the 32-GB
+  floor: prefetch spent exactly down to its guard and stopped. ADJUDICATED
+  PASS per pre-registration: tok/s target beaten; +HBM is the DESIGNED
+  prefetch trade (S0 adoption table), guard margin intact, M5/M6
+  byte-exact rows prove no leak. The ≤+2 GiB letter applies to leak
+  detection, not designed spends with the floor honored.
+- [S6 M8 2026-07-22] moe shed 800k: 574 vs 584 (−1.8%; gate 575.2 → 1.2
+  tok/s short), peak 102.9 = −7.5 GiB BELOW baseline (qknorm savings >
+  prefetch holds). Engagement correct: P2 ×144 on, P3 ×576 False
+  (rows-gate), P1 cold; rope_enabled=false at 800k (check tokens-gate
+  default). Hypothesis: deep-shed rows pay a small policy tax (qknorm/
+  prefetch D2H on the saturated bus — donor never measured either beyond
+  128k). DECISION: wait for M9 (deeper twin) — if same pattern, ONE
+  bisect queue on M8 (qknorm-off / prefetch-off) → tokens-ceiling gate
+  fix → re-run both. If M9 in-band, M8 goes to plain retry (day noise).
+- [S6 M9 PASS 2026-07-23] moe shed 1.1M: 380 vs 385 (−1.4%, IN BAND),
+  peak 144.5 = −8.4 GiB below baseline (qknorm savings; prefetch mostly
+  floor-gated at this residency). Deep-shed pattern NOT confirmed ⇒ per
+  pre-registration M8 is day-noise-suspect: plain M8 retry appended to Q4
+  (Q4f); Q5 bisect fires ONLY if the retry breaches too. Q3 queue closed
+  (8/9 attempted; GPU idle verified 7 MiB before Q4 launch — orphan
+  lesson applied); Q4 launched (M1 solo, M2 retry±bisects, M7@32-floor,
+  M8 retry).
+- [S6 M1 PASS 2026-07-23 (Q4a solo rerun)] q32 T1 128k b2: 1092 vs 1091
+  (+0.0%), peak 116.0 BYTE-EXACT — collision verdict vindicated; T1+policy
+  fully transparent (matches M4's exact-zero).
+- [S6 Q4 CLOSED 2026-07-23] M1 PASS (1092/116.0 exact). M2 rerun 960 →
+  BREACH confirmed real-but-small: same-hour bisects rope-off 956 /
+  prefetch-off 955 ≈ policy-on 960 (no knob moves it; peak byte-exact in
+  all — prefetch inert at this row); row drifting ~1.5% below baseline-day
+  overnight. M7@32-floor: tok/s RECOVERED 2723 (in band) but peak stayed
+  176.7 → memory forensics: allocated peak BYTE-IDENTICAL 109.54 across
+  policy/baseline; +10.98 GiB was reserved-pool segregation from a
+  redundant record_stream(side) on qknorm restage buffers → ONE-LINE FIX
+  (commit 23a2efc, wait_event already orders the free). M8 retry 574
+  AGAIN (−1.7% reproducible, not noise). Q6 running: M2 flags-off tonight
+  control + M2 qknorm-off + M7f fix validation (expect ~165.7) + M8f with
+  fix (allocator segregation also costs TIME — may recover the −1.4%;
+  Q5 bisect only if M8f still fails).
+- [S6 M2 ATTRIBUTED + GATE FIX 2026-07-23] Same-night controls: flags-off
+  977 (NO drift — earlier drift read was wrong), qknorm-off 978, policy-on
+  960/956/955 ⇒ qknorm costs ~2% at dense-T2-KA and NOTHING else does.
+  P12 regime gate added (commit 03a43e7): dense + DENSE_MLP_FG_KEEP_ACTS
+  signature → qknorm OFF (all other dense regimes measured neutral-to-
+  winning: T1 ±0.0, T3 +3.6%, ohbm8 −6.27%). Q7a re-validates M2.
+- [S6 M7 ADJUDICATED PASS-with-note 2026-07-23] M7f (post record_stream
+  fix): 2726 in band AGAIN (2723/2726 double-confirmed) but peak stayed
+  176.7 ⇒ record_stream hypothesis FALSIFIED (comment corrected in code).
+  True mechanism: side-H2D-stream allocator POOL growth (segments owned
+  by the restage stream, sized to the in-flight window). Capacity impact
+  nil: allocated peak byte-identical 109.54 vs baseline; cached segments
+  reclaim under pressure; llama rows (no q/k norms) byte-exact everywhere
+  — explains the whole cross-row memory pattern. tok/s gate PASS ×2;
+  reserved +11 documented as qknorm side-pool cache, not a hold/leak.
 - [S2 BUILD 2026-07-22] _C rebuilt in-container with -fopenmp + SVE-BF16
   march: cpu_ops_sve_compiled()=True, all 8 symbols present. Bench --final
   sanity vs donor table: swiglu fwd 44.3 ms@32k (donor 44.8 ✓), bwd 60.1
