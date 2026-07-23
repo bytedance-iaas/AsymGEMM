@@ -269,6 +269,18 @@ def moe_wgrad_deposit() -> bool:
     if os.environ.get("ASYM_POLICY_MOE_DEPOSIT", "").strip().lower() in {"0", "false", "off", "no"}:
         trace("P2.moe_wgrad_deposit", False, override="ASYM_POLICY_MOE_DEPOSIT=0")
         return False
+    # Regime gate (S6 M8 attribution, 2026-07-23): with KEEP_DGRADS_HBM active
+    # (the 6-pin MoE shed recipes) the non-deposit path already keeps LoRA
+    # dgrads on-GPU, so the deposit's dS D2H crossing + worker wgrad only adds
+    # bus traffic to the saturated shed pipeline: measured −1.4% @800k
+    # (574×3 policy-on vs 582 deposit-off = flags-off). The donor's deposit
+    # wins (−2.6% @32k, −0.4% @128k·b8 ≈ 1M tokens) were all measured WITHOUT
+    # the pin, so the gate keys on the recipe signature, not on token count.
+    if _env_on("ASYMM_QWEN3_MOE_FG_KEEP_DGRADS_HBM") or _env_on(
+        "ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_FG_KEEP_DGRADS_HBM"
+    ):
+        trace("P2.moe_wgrad_deposit", False, regime="keep-dgrads-hbm")
+        return False
     d = model_class() == "moe"
     trace("P2.moe_wgrad_deposit", d, model_class=model_class())
     return d
