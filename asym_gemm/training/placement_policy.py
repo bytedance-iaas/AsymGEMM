@@ -266,6 +266,9 @@ def moe_wgrad_deposit() -> bool:
     if _dense_regime():
         trace("P8.dense_cpu_compute", False, feature="P2.moe_wgrad_deposit")
         return False
+    if os.environ.get("ASYM_POLICY_MOE_DEPOSIT", "").strip().lower() in {"0", "false", "off", "no"}:
+        trace("P2.moe_wgrad_deposit", False, override="ASYM_POLICY_MOE_DEPOSIT=0")
+        return False
     d = model_class() == "moe"
     trace("P2.moe_wgrad_deposit", d, model_class=model_class())
     return d
@@ -327,6 +330,12 @@ def qknorm_recompute() -> bool:
     **DEFAULT-ON (2026-07-21)** — all gates green: unit bit-parity 9/9, SMOKE,
     e2e 30B@128k -3.57% (C -63.7 GB), 30B@32k -2.95% (C -16), dense 32B -4.16%
     (C -31.8)."""
+    # bisect/override knob (merge_cpu_modules S6 breach protocol, M8/M9):
+    # ASYM_POLICY_QKNORM=0 disables for one-variable A/Bs without touching
+    # the recipe layer or the ASYMM_ QKNORM force-arm.
+    if os.environ.get("ASYM_POLICY_QKNORM", "").strip().lower() in {"0", "false", "off", "no"}:
+        trace("P12.qknorm_recompute", False, override="ASYM_POLICY_QKNORM=0")
+        return False
     trace("P12.qknorm_recompute", True)
     return True
 
