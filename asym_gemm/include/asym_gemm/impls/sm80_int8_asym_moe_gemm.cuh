@@ -220,6 +220,198 @@ CUTE_DEVICE void sm80_int8_asym_moe_gemm_body(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Deep-pattern body for HBM-resident B (hybridGEMM Phase A / SM90 deep kernel
+// pattern, SM80 port — unified_kernel_sm80.md Phase 3).
+//
+// The asym body above is K-outer so a PCIe-streamed W tile is fetched once —
+// but it pays for that with FP32 partial sums round-tripping through HBM once
+// per K-tile: 2*M*N*4*(kb-1) bytes of D traffic, which caps the kernel at
+// ~16-21 INT8 TOPS on HBM-resident B (measured, A100-40GB). This body is
+// M-outer with full-K accumulation in registers: each output tile is written
+// exactly once, at the cost of re-reading W once per M-tile — the right trade
+// when B lives in HBM (staged ring slots, VRAM expert cache), and the wrong
+// one over PCIe (keep the asym body for pinned-host B).
+//
+// The (m, k) iteration space is software-pipelined through 2 cp.async smem
+// stages (issue stage i+1, wait stage i, MMA) so global loads overlap MMA —
+// the single-buffered wait<0> pattern above leaves DRAM idle during math.
+// ──────────────────────────────────────────────────────────────────────────────
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t NWARPS>
+CUTE_DEVICE void sm80_int8_deep_moe_gemm_body(
+    const int8_t* __restrict__ x_e,
+    const int8_t* __restrict__ w_e,
+    float*        __restrict__ o_e,
+    const float*  __restrict__ sfa_e,
+    const float*  __restrict__ sfb_e,
+    int64_t len, int64_t N, int64_t K, int32_t kb,
+    int n_tile, int tidx, char* smem_)
+{
+    static_assert(BLOCK_K == 128,
+                  "BLOCK_K is locked to the 128-element scale granularity");
+    static_assert(BLOCK_M % (NWARPS * 16) == 0,
+                  "BLOCK_M must be divisible by NWARPS*16");
+    static_assert(BLOCK_M <= NWARPS * 32,
+                  "scale staging assumes one thread per BLOCK_M row");
+
+    using SmemLayoutX = Layout<Shape<Int<BLOCK_M>, Int<BLOCK_K>>,
+                               Stride<Int<BLOCK_K>, _1>>;
+    using SmemLayoutW = Layout<Shape<Int<BLOCK_N>, Int<BLOCK_K>>,
+                               Stride<Int<BLOCK_K>, _1>>;
+
+    constexpr int SMEM_X_BYTES = BLOCK_M * BLOCK_K;
+    constexpr int SMEM_W_BYTES = BLOCK_N * BLOCK_K;
+
+    // [2-stage X][2-stage W][2-stage sa][2-stage sb]
+    int8_t* smem_x  = reinterpret_cast<int8_t*>(smem_);
+    int8_t* smem_w  = smem_x + 2 * SMEM_X_BYTES;
+    float*  smem_sa = reinterpret_cast<float*>(smem_ + 2 * (SMEM_X_BYTES + SMEM_W_BYTES));
+    float*  smem_sb = smem_sa + 2 * BLOCK_M;
+
+    using MMA_Op   = SM80_16x8x32_S32S8S8S32_TN;
+    using TiledMma = TiledMMA<
+        MMA_Atom<MMA_Op>,
+        Layout<Shape<Int<NWARPS>, _1, _1>>,
+        Tile<Int<16 * NWARPS>, _16, _32>>;
+
+    TiledMma tiled_mma;
+    auto thr_mma = tiled_mma.get_thread_slice(tidx);
+
+    using SmemCopyAtomS8 = Copy_Atom<SM75_U32x4_LDSM_N, int8_t>;
+    auto smem_copy_A     = make_tiled_copy_A(SmemCopyAtomS8{}, tiled_mma);
+    auto smem_copy_B     = make_tiled_copy_B(SmemCopyAtomS8{}, tiled_mma);
+    auto smem_thr_copy_A = smem_copy_A.get_thread_slice(tidx);
+    auto smem_thr_copy_B = smem_copy_B.get_thread_slice(tidx);
+
+    using GmemCopyAtomS8  = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, int8_t>;
+    using GmemTiledCopyXW = decltype(make_tiled_copy(
+        GmemCopyAtomS8{},
+        Layout<Shape<_32, _4>, Stride<_4, _1>>{},
+        Layout<Shape<_1, _16>>{}));
+    GmemTiledCopyXW gmem_tiled_copy_xw;
+    auto gmem_thr_copy_xw = gmem_tiled_copy_xw.get_thread_slice(tidx);
+
+    Tensor cX   = make_identity_tensor(Shape<Int<BLOCK_M>, Int<BLOCK_K>>{});
+    Tensor tXcX = gmem_thr_copy_xw.partition_S(cX);
+    Tensor tXpX = make_tensor<bool>(
+        make_shape(size<2>(gmem_thr_copy_xw.partition_S(cX))));
+    cute::fill(tXpX, true);
+
+    Tensor cO   = make_identity_tensor(Shape<Int<BLOCK_M>, Int<BLOCK_N>>{});
+    Tensor tScO = thr_mma.partition_C(cO);
+
+    Tensor mX = make_tensor(make_gmem_ptr(x_e),
+                            make_shape(len, K), make_stride(K, Int<1>{}));
+    Tensor mW = make_tensor(make_gmem_ptr(w_e),
+                            make_shape(N,   K), make_stride(K, Int<1>{}));
+    Tensor mO = make_tensor(make_gmem_ptr(o_e),
+                            make_shape(len, N), make_stride(N, Int<1>{}));
+
+    Tensor gX = local_tile(mX, Shape<Int<BLOCK_M>, Int<BLOCK_K>>{}, make_coord(_, _));
+    Tensor gW = local_tile(mW, Shape<Int<BLOCK_N>, Int<BLOCK_K>>{}, make_coord(n_tile, _));
+    Tensor gO = local_tile(mO, Shape<Int<BLOCK_M>, Int<BLOCK_N>>{}, make_coord(_, n_tile));
+
+    const int m_max = static_cast<int>((len + BLOCK_M - 1) / BLOCK_M);
+    const int k_max = static_cast<int>(K / BLOCK_K);
+    const float* sfb_n = sfb_e + (int64_t)n_tile * BLOCK_N * kb;
+
+    // Register accumulators: per-K-tile exact S32 + running FP32 dequant.
+    Tensor sX0    = make_tensor(make_smem_ptr(smem_x), SmemLayoutX{});
+    Tensor tSrX   = thr_mma.partition_fragment_A(sX0);
+    Tensor sW0    = make_tensor(make_smem_ptr(smem_w), SmemLayoutW{});
+    Tensor tOrW   = thr_mma.partition_fragment_B(sW0);
+    Tensor tSrAcc = thr_mma.partition_fragment_C(gO(_, _, 0));
+    Tensor tSrO   = make_tensor<float>(cute::shape(tSrAcc));
+
+    // Issue stage (m, k) -> smem buffer `s` (cp.async tiles + scalar scales).
+    auto issue_stage = [&](int m, int k, int s, int m_actual) {
+        Tensor sX = make_tensor(make_smem_ptr(smem_x + s * SMEM_X_BYTES),
+                                SmemLayoutX{});
+        Tensor sW = make_tensor(make_smem_ptr(smem_w + s * SMEM_W_BYTES),
+                                SmemLayoutW{});
+        Tensor tXsX   = gmem_thr_copy_xw.partition_D(sX);
+        Tensor tWsW   = gmem_thr_copy_xw.partition_D(sW);
+        Tensor tWgW_k = gmem_thr_copy_xw.partition_S(gW(_, _, k));
+        Tensor gX_m   = gX(_, _, m, _);
+        Tensor tXgX   = gmem_thr_copy_xw.partition_S(gX_m(_, _, k));
+        cute::copy(gmem_tiled_copy_xw, tWgW_k, tWsW);
+        if (m_actual == static_cast<int>(BLOCK_M)) {
+            cute::copy(gmem_tiled_copy_xw, tXgX, tXsX);
+        } else {
+            moe_predicated_copy</*Is_even_MN=*/false, /*Is_even_K=*/true,
+                                /*Clear_OOB_MN=*/true,  /*Clear_OOB_K=*/true>(
+                gmem_tiled_copy_xw, tXgX, tXsX, tXcX, tXpX, m_actual);
+        }
+        if (tidx < static_cast<int>(BLOCK_M)) {
+            const int64_t m_global = (int64_t)m * BLOCK_M + tidx;
+            smem_sa[s * BLOCK_M + tidx] = (m_global < len)
+                ? sfa_e[m_global * kb + k] : 0.0f;
+        }
+        for (int i = tidx; i < static_cast<int>(BLOCK_N); i += NWARPS * 32)
+            smem_sb[s * BLOCK_N + i] = sfb_n[(int64_t)i * kb + k];
+        cp_async_fence();
+    };
+
+    auto m_rows = [&](int m) {
+        return static_cast<int>(
+            cute::min((int64_t)BLOCK_M, len - (int64_t)m * BLOCK_M));
+    };
+
+    issue_stage(0, 0, 0, m_rows(0));
+
+    for (int m = 0; m < m_max; ++m) {
+        const int m_actual = m_rows(m);
+        clear(tSrO);
+
+        for (int k = 0; k < k_max; ++k) {
+            const int cur = (m * k_max + k) & 1;
+            const bool has_next = (k + 1 < k_max) || (m + 1 < m_max);
+            if (has_next) {
+                const int nk = (k + 1 < k_max) ? k + 1 : 0;
+                const int nm = (k + 1 < k_max) ? m : m + 1;
+                issue_stage(nm, nk, cur ^ 1, m_rows(nm));
+                cp_async_wait<1>();
+            } else {
+                cp_async_wait<0>();
+            }
+            __syncthreads();
+
+            Tensor sX = make_tensor(make_smem_ptr(smem_x + cur * SMEM_X_BYTES),
+                                    SmemLayoutX{});
+            Tensor sW = make_tensor(make_smem_ptr(smem_w + cur * SMEM_W_BYTES),
+                                    SmemLayoutW{});
+            Tensor tSsX      = smem_thr_copy_A.partition_S(sX);
+            Tensor tOsW      = smem_thr_copy_B.partition_S(sW);
+            Tensor tSrX_view = smem_thr_copy_A.retile_D(tSrX);
+            Tensor tOrW_view = smem_thr_copy_B.retile_D(tOrW);
+            cute::copy(smem_copy_A, tSsX, tSrX_view);
+            cute::copy(smem_copy_B, tOsW, tOrW_view);
+
+            clear(tSrAcc);
+            cute::gemm(tiled_mma, tSrAcc, tSrX, tOrW, tSrAcc);
+
+            const float* sa = smem_sa + cur * BLOCK_M;
+            const float* sb = smem_sb + cur * BLOCK_N;
+            CUTE_UNROLL
+            for (int i = 0; i < size(tSrAcc); ++i) {
+                tSrO(i) += static_cast<float>(tSrAcc(i))
+                         * sa[get<0>(tScO(i))] * sb[get<1>(tScO(i))];
+            }
+            // Free `cur` for the overwrite two stages ahead.
+            __syncthreads();
+        }
+
+        // Single coalesced store per output tile — no HBM partial round-trips.
+        Tensor gO_m = gO(_, _, m);
+        Tensor tSgO = thr_mma.partition_C(gO_m);
+        CUTE_UNROLL
+        for (int i = 0; i < size(tSrO); ++i) {
+            if (get<0>(tScO(i)) < m_actual)
+                tSgO(i) = tSrO(i);
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Contiguous grouped kernel
 //
 // Grid:  (ceil_div(N, BLOCK_N), list_size - 1)
@@ -258,6 +450,43 @@ __global__ void sm80_int8_asym_moe_gemm_impl(SM80MoEInt8Params params) {
 #else
     if (blockIdx.x == 0 && threadIdx.x == 0)
         printf("sm80_int8_asym_moe_gemm_impl: requires __CUDA_ARCH__ >= 800\n");
+#endif
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Deep contiguous grouped kernel (HBM-resident B) — same grid/segment
+// convention as the contiguous asym kernel above.
+// ──────────────────────────────────────────────────────────────────────────────
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t NWARPS>
+__global__ void sm80_int8_deep_moe_gemm_impl(SM80MoEInt8Params params) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+
+    extern __shared__ char smem_[];
+
+    const int     expert_e  = static_cast<int>(blockIdx.y);
+    const int32_t expert_id = params.expert_list[expert_e];
+    const int64_t len_start = static_cast<int64_t>(params.index_list[2 * expert_e]);
+    const int64_t len       = static_cast<int64_t>(params.index_list[2 * expert_e + 1])
+                            - len_start;
+
+    if (expert_id < 0 || len <= 0) return;
+
+    const int64_t N  = params.N;
+    const int64_t K  = params.K;
+    const int32_t kb = params.kb;
+
+    sm80_int8_deep_moe_gemm_body<BLOCK_M, BLOCK_N, BLOCK_K, NWARPS>(
+        reinterpret_cast<const int8_t*>(params.x_ptr) + len_start * K,
+        reinterpret_cast<const int8_t*>(params.w_ptr) + (int64_t)expert_id * N * K,
+        reinterpret_cast<float*>(params.o_ptr) + len_start * N,
+        params.sfa_ptr + len_start * kb,
+        params.sfb_ptr + (int64_t)expert_id * N * kb,
+        len, N, K, kb,
+        static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x), smem_);
+
+#else
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        printf("sm80_int8_deep_moe_gemm_impl: requires __CUDA_ARCH__ >= 800\n");
 #endif
 }
 

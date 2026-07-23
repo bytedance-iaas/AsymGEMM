@@ -162,5 +162,26 @@ inline SM80GemmConfig select_sm80_int8_config(int arch_major, int arch_minor,
     return SM80GemmConfig{128u, block_n, block_k, 4u};
 }
 
+// Deep-pattern (M-outer, full-K register accumulation) INT8 kernel. Two
+// cp.async stages: smem = 2*(BM + BN)*BK + 2*(BM + BN)*4 scale floats.
+// 64x64 tiles keep the dual accumulator fragments (S32 + F32, BM*BN/128
+// elements each per thread) within register budget at 4 warps.
+inline int smem_bytes_int8_deep(uint32_t block_m, uint32_t block_n,
+                                uint32_t block_k) {
+    return static_cast<int>(2 * (block_m + block_n) * block_k
+                            + 2 * (block_m + block_n) * 4);
+}
+
+inline SM80GemmConfig select_sm80_int8_deep_config(int arch_major, int arch_minor,
+                                                   int N, int K) {
+    (void)arch_major; (void)arch_minor; (void)K;
+    constexpr uint32_t block_k = 128u;
+    uint32_t block_n = 32u;
+    for (uint32_t bn : {64u, 32u}) {
+        if (N % static_cast<int>(bn) == 0) { block_n = bn; break; }
+    }
+    return SM80GemmConfig{64u, block_n, block_k, 4u};
+}
+
 }  // namespace sm80
 }  // namespace asym_gemm

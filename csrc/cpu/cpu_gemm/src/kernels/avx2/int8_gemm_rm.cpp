@@ -74,6 +74,112 @@ void int8_rm_pack_a_bf16(int m, int k,
   }
 }
 
+namespace {
+
+inline int32_t hsum_epi32(__m256i v) {
+  __m128i lo = _mm256_castsi256_si128(v);
+  __m128i hi = _mm256_extracti128_si256(v, 1);
+  __m128i s  = _mm_add_epi32(lo, hi);
+  s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
+  s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
+  return _mm_cvtsi128_si32(s);
+}
+
+/* Streaming row-dot micro-block: MB A-rows × NU B-rows, K swept in 32-byte
+ * chunks straight from B's row-major memory — no B pack. Each B byte is
+ * loaded exactly once per call, so for small m the kernel runs at memory
+ * speed instead of the tiled path's scalar-pack speed. Same sign trick as
+ * the tiled path: a×b = |a| × sign(a)·b, both operands in [-127, 127]. */
+template <int MB, int NU>
+inline void dot_block_stream(const int8_t* a_int8, int k_pad,
+                             const int8_t* b_rm, std::size_t ldb,
+                             int n0, int k,
+                             int32_t* c_int32, int n_pad) {
+  const __m256i ones16 = _mm256_set1_epi16(1);
+  const int k32 = k & ~31;
+
+  __m256i acc[MB * NU];
+  for (int i = 0; i < MB * NU; ++i) acc[i] = _mm256_setzero_si256();
+
+  const int8_t* brow[NU];
+  for (int u = 0; u < NU; ++u) brow[u] = b_rm + (std::size_t)(n0 + u) * ldb;
+
+  for (int kb = 0; kb < k32; kb += 32) {
+    __m256i b[NU];
+    for (int u = 0; u < NU; ++u)
+      b[u] = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(brow[u] + kb));
+    for (int j = 0; j < MB; ++j) {
+      const __m256i aj = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(a_int8 + (std::size_t)j * k_pad + kb));
+      const __m256i pa = _mm256_sign_epi8(aj, aj);
+      for (int u = 0; u < NU; ++u) {
+        const __m256i p =
+            _mm256_maddubs_epi16(pa, _mm256_sign_epi8(b[u], aj));
+        acc[j * NU + u] =
+            _mm256_add_epi32(acc[j * NU + u], _mm256_madd_epi16(p, ones16));
+      }
+    }
+  }
+
+  /* K tail (< 32 int8): scalar. A is zero-padded past k, B is valid to k. */
+  int32_t tail[MB * NU] = {};
+  for (int kk = k32; kk < k; ++kk) {
+    for (int j = 0; j < MB; ++j) {
+      const int32_t av = a_int8[(std::size_t)j * k_pad + kk];
+      if (av == 0) continue;
+      for (int u = 0; u < NU; ++u)
+        tail[j * NU + u] += av * (int32_t)brow[u][kk];
+    }
+  }
+
+  for (int j = 0; j < MB; ++j)
+    for (int u = 0; u < NU; ++u)
+      c_int32[(std::size_t)j * n_pad + n0 + u] =
+          hsum_epi32(acc[j * NU + u]) + tail[j * NU + u];
+}
+
+/* Streaming pass over one block of at most 8 A rows: per thread, walk this
+ * thread's slice of output channels in pairs of B rows. The first block
+ * streams B from DRAM; later blocks re-read the same per-thread B slice,
+ * which for MoE tile sizes (~200 KB) is L2-resident. */
+template <int MB>
+void run_stream_m(int n_lo, int n_hi, int k, int k_pad,
+                  const int8_t* a_int8,
+                  const std::int8_t* b_rm, std::size_t ldb,
+                  int32_t* c_int32, int n_pad) {
+  int n0 = n_lo;
+  /* NU=2 for MB <= 4 (8 accumulators), NU=1 above (register pressure). */
+  if (MB <= 4) {
+    for (; n0 + 2 <= n_hi; n0 += 2)
+      dot_block_stream<MB, 2>(a_int8, k_pad, b_rm, ldb, n0, k, c_int32, n_pad);
+  }
+  for (; n0 < n_hi; ++n0)
+    dot_block_stream<MB, 1>(a_int8, k_pad, b_rm, ldb, n0, k, c_int32, n_pad);
+}
+
+void run_stream(int m, int n_lo, int n_hi, int k, int k_pad,
+                const int8_t* a_int8,
+                const std::int8_t* b_rm, std::size_t ldb,
+                int32_t* c_int32, int n_pad) {
+  for (int mb = 0; mb < m; mb += 8) {
+    const int8_t* a = a_int8 + (std::size_t)mb * k_pad;
+    int32_t* c = c_int32 + (std::size_t)mb * n_pad;
+    switch (m - mb >= 8 ? 8 : m - mb) {
+      case 1: run_stream_m<1>(n_lo, n_hi, k, k_pad, a, b_rm, ldb, c, n_pad); break;
+      case 2: run_stream_m<2>(n_lo, n_hi, k, k_pad, a, b_rm, ldb, c, n_pad); break;
+      case 3: run_stream_m<3>(n_lo, n_hi, k, k_pad, a, b_rm, ldb, c, n_pad); break;
+      case 4: run_stream_m<4>(n_lo, n_hi, k, k_pad, a, b_rm, ldb, c, n_pad); break;
+      case 5: run_stream_m<5>(n_lo, n_hi, k, k_pad, a, b_rm, ldb, c, n_pad); break;
+      case 6: run_stream_m<6>(n_lo, n_hi, k, k_pad, a, b_rm, ldb, c, n_pad); break;
+      case 7: run_stream_m<7>(n_lo, n_hi, k, k_pad, a, b_rm, ldb, c, n_pad); break;
+      default: run_stream_m<8>(n_lo, n_hi, k, k_pad, a, b_rm, ldb, c, n_pad); break;
+    }
+  }
+}
+
+}  // namespace
+
 void int8_rm_run(int m, int n, int k,
                  const std::int8_t* b_rm, std::size_t ldb,
                  void* scratch_a, void* scratch_c,
@@ -84,6 +190,22 @@ void int8_rm_run(int m, int n, int k,
 
   const int8_t* a_int8  = static_cast<const int8_t*>(scratch_a);
   int32_t*      c_int32 = static_cast<int32_t*>(scratch_c);
+
+  /* Streaming row-dot path for every m. It reads B rows directly from
+   * their row-major memory (each B byte once per 8-row A block; later
+   * blocks hit L2 for MoE tile sizes) instead of assembling 8×4 B subtiles
+   * through a scalar stack buffer like the tiled path below did — that
+   * pack cost ~30 cycles per 32 B bytes and dominated everything below
+   * m ≈ 50. The tiled path is kept (unreachable) as reference.
+   */
+  {
+    int rows_per_thread = (n + nth - 1) / nth;
+    int n_lo = std::min(ith * rows_per_thread, n);
+    int n_hi = std::min(n_lo + rows_per_thread, n);
+    if (n_lo < n_hi)
+      run_stream(m, n_lo, n_hi, k, k_pad, a_int8, b_rm, ldb, c_int32, n_pad);
+    return;
+  }
 
   /* Distribute N-blocks across threads. */
   int n_blocks = n_pad / N_STEP;
