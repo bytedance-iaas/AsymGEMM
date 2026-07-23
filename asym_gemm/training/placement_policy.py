@@ -336,6 +336,19 @@ def qknorm_recompute() -> bool:
     if os.environ.get("ASYM_POLICY_QKNORM", "").strip().lower() in {"0", "false", "off", "no"}:
         trace("P12.qknorm_recompute", False, override="ASYM_POLICY_QKNORM=0")
         return False
+    # Regime gate (S6 M2 attribution, 2026-07-23): at dense T2 the keep-acts
+    # recipe (ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM=1) already saturates the
+    # D2H/H2D restage path via ASYNC_UNPACK; qknorm's per-norm offload+restage
+    # rides those buses and costs ~2% e2e (bisect: policy-on 960/956/955 vs
+    # qknorm-off 978 ≈ flags-off 977). Every OTHER dense regime measured
+    # neutral-to-winning (T1 ±0.0 M1/M4; T3 +3.6% M3; ohbm8 −6.27% A/B), so
+    # the gate keys on the exact recipe signature, not on dense-class.
+    if model_class() == "dense" and (
+        _env_on("ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM")
+        or _env_on("ASYM_GEMM_LF_CONFIG_ASYMM_DENSE_MLP_FG_KEEP_ACTS_HBM")
+    ):
+        trace("P12.qknorm_recompute", False, regime="dense-T2-keep-acts")
+        return False
     trace("P12.qknorm_recompute", True)
     return True
 
