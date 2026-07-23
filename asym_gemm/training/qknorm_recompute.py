@@ -264,7 +264,13 @@ def _stage_fresh(handle: CPUActivationHandle, manager: ActivationOffloadManager)
         if gap_done is not None:
             gap_done.record(side)
             restage_gap_commit(gap_wait, gap_done, handle.nbytes, f"qknorm.{handle.tag}")
-        staged.record_stream(side)
+        # NB deliberately NO staged.record_stream(side): compute_stream.wait_event(done)
+        # above already orders every downstream use AND the eventual free behind the
+        # side-stream copy. record_stream(side) additionally tagged each freed restage
+        # buffer with a side-stream dependency, which segregated those bytes from the
+        # compute-stream pool — the caching allocator then served autograd transients
+        # from fresh segments (+10.98 GiB reserved at 176.7 vs 165.7, S6 M7; allocated
+        # peak byte-identical 109.54 in the A/B — pure pool growth, not a hold).
         # keep the pinned source alive until the staged tensor dies (async copy source)
         staged._asym_qknorm_keepalive = handle.tensor  # type: ignore[attr-defined]
     else:
