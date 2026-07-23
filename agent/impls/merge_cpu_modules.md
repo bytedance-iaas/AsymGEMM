@@ -354,6 +354,22 @@ push to Kevin's explicit call (or his gbackup habit). Update memory notes.
   ran this row at 973 ⇒ policy cost −0.4%, day-drift −1.3% (the ±3%
   dense-row drift documented in S3). Marked RETRY (with M1) after M9;
   not a policy-gate defect signature (memory exact + control-attributed).
+- [S6 M4 PASS 2026-07-22] llama T1 96k b1 + policy: 1096 tok/s vs base
+  1096 (−0.0%), peak 48.9 BYTE-EXACT. The clean-GPU T1+policy control —
+  empirically seals the M1 collision verdict (T1+policy fully transparent).
+- [S6 M5 PASS 2026-07-22] llama T2 192k b2 + policy: 545 vs 548 (−0.5%),
+  peak 171.1 BYTE-EXACT — first near-wall row: free HBM 13.9 < 16 GiB ⇒
+  prefetch guard held OFF by design (byte-exact peak is the proof).
+- [S6 progress 2026-07-22/23] M4 PASS (1096=base, 48.9 byte-exact — T1
+  policy provably harmless). M5 PASS (−0.5%, 171.1 byte-exact — prefetch
+  guard self-limited at the 13.9 GB-headroom row). M2 969 = −1.7% (0.2pp
+  past band, memory EXACT, engagement correct) → Q4b rerun + conditional
+  rope/prefetch bisects. M7 BREACH −3.3% / +11.0 GiB (176.7): trace-
+  attributed to restage prefetch — 19.3 GB headroom > the 16 GB floor →
+  armed, held ~11 GB of stages, ate the KA margin. GATE FIX (one variable,
+  policy-side): ASYM_PREFETCH_MIN_FREE_GB default 16→32 (all measured wins
+  have ≥90 GB free — unaffected; near-wall rows now never arm). M7 rerun =
+  Q4e. Deposits/P1 correctly cold at M7 (P3 False ×576; qknorm host-only).
 - [S2 BUILD 2026-07-22] _C rebuilt in-container with -fopenmp + SVE-BF16
   march: cpu_ops_sve_compiled()=True, all 8 symbols present. Bench --final
   sanity vs donor table: swiglu fwd 44.3 ms@32k (donor 44.8 ✓), bwd 60.1

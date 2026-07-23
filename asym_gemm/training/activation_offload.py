@@ -142,11 +142,16 @@ def restage_prefetch_enabled() -> bool:
 
 def prefetch_free_ok(extra_bytes: int) -> bool:
     """G guard: allow holding `extra_bytes` of additional stage memory only when
-    the device would still have ASYM_PREFETCH_MIN_FREE_GB (default 16) left."""
+    the device would still have ASYM_PREFETCH_MIN_FREE_GB (default 32) left.
+    Floor raised 16->32 (merge_cpu_modules S6, M7 breach): at a 19 GB-headroom
+    keep-acts row the 16 GB floor armed prefetch, whose held stages then ate
+    11 GB of the margin (-3.3% tok/s, peak past the 0.92 line). Every measured
+    prefetch WIN (32k rows, dense T2 128k) has >=90 GB free, so 32 keeps them
+    all and de-arms only near-wall rows the guard was meant to protect."""
     if not torch.cuda.is_available():
         return False
     try:
-        min_free = float(os.environ.get("ASYM_PREFETCH_MIN_FREE_GB", "16")) * (1 << 30)
+        min_free = float(os.environ.get("ASYM_PREFETCH_MIN_FREE_GB", "32")) * (1 << 30)
         free, _total = torch.cuda.mem_get_info()
     except Exception:
         return False

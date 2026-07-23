@@ -42,4 +42,8 @@ if [ "$R" = "BREACH" ]; then
   env $POL $T2D ASYM_PREFETCH_MIN_FREE_GB=9999 bash scripts/lf/tp_probe.sh q3-32b cpum2np "asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1" 128000 2
   echo "Q4D_EXIT=$?"
 fi
+KA120="ASYM_GEMM_DISPATCH=staged ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM=1 ASYMM_FG_ELEMENTWISE_CHUNK_MB=1024 ASYMM_QWEN3_MOE_DOWN_DX_STAGED=1"
+echo "=== Q4e M7 rerun with 32GB prefetch floor (base 2762/165.7; pass1 2672/176.7) $(date -u +%H:%M:%S)"
+env $POL $KA120 MAX_SAMPLES=1024 bash scripts/lf/tp_probe.sh q3-30b-a3b cpum7r "asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1" 120000 8
+echo "Q4E_EXIT=$?"
 echo "=== CPU-Q4 DONE $(date -u +%H:%M:%S)"
