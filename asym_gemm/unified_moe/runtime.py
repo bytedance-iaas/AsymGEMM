@@ -1173,8 +1173,12 @@ class Layer:
         expert's block is padded to BLOCK_M for the kernel's per-expert row
         alignment. ``kernel_ids`` decouples routing ids from weight-tensor
         ids (cache slots, or half-local ids under NUMA-TP). Returns the
-        (M_grouped, idx_to_orig, slot_to_orig, offsets, experts, list_size)
-        tuple consumed by _gpu_grouped_forward.
+        (M_grouped, dest, rows_items, slots_items, offsets, experts,
+        list_size) tuple consumed by _gpu_grouped_forward: item i of this
+        partition is token rows_items[i] / top-k slot slots_items[i] and
+        lands at grouped row dest[i]. Padding rows carry no mapping — the
+        kernels never read or write them (segment lengths bound every
+        access), so the forward never materializes or zeroes them.
         """
         m_padded = ((counts_np[part_experts] + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
         pad_start_np = np.zeros(G, dtype=np.int64)
@@ -1197,15 +1201,11 @@ class Layer:
         e_sel = sorted_e[pos]
         dest = pad_start[e_sel] + (pos - seg_start[e_sel])
 
-        idx_to_orig = torch.full((M_grouped,), -1, dtype=torch.long, device=device)
-        slot_to_orig = torch.full_like(idx_to_orig, -1)
-        idx_to_orig[dest] = rows_sorted[pos]
-        slot_to_orig[dest] = slots_sorted[pos]
-
         return (
             M_grouped,
-            idx_to_orig,
-            slot_to_orig,
+            dest,
+            rows_sorted[pos],
+            slots_sorted[pos],
             torch.from_numpy(offsets_np).to(device),
             torch.from_numpy(experts_np).to(device),
             len(experts_np),
@@ -1303,8 +1303,8 @@ class Layer:
     ):
         """Run one GPU-bucket partition's grouped GEMMs.
 
-        ``layout`` is (M_grouped, idx_to_orig, slot_to_orig, offsets, experts,
-        list_size): the AsymGEMM contiguous layout, built vectorized on the
+        ``layout`` is (M_grouped, dest, rows_items, slots_items, offsets,
+        experts, list_size): the AsymGEMM contiguous layout, built vectorized on the
         GPU in forward(), with the layout's expert ids already remapped to
         this partition's weight tensor ('cached' -> cache slots with the
         fused gate+up slab from HBM; 'slab_a'/'slab_b' -> the pinned-host
@@ -1318,22 +1318,26 @@ class Layer:
         H, I = slab.hidden, slab.inter
         kb_h, kb_i = slab.kb_hidden, slab.kb_inter
 
-        M_grouped, idx_to_orig, slot_to_orig, offsets, experts, list_size = layout
+        M_grouped, dest, rows_items, slots_items, offsets, experts, list_size = layout
         if M_grouped == 0:
             return None, None
+        n_items = int(dest.numel())
 
-        # Gather activations into the contiguous layout. Padding rows (idx=-1)
-        # stay zero so their activation amax → 0 → scale clamped to 1e-12.
-        valid_mask = (idx_to_orig >= 0)
-        a_bf16 = torch.zeros(M_grouped, H, device=dev, dtype=torch.bfloat16)
-        valid_idx = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
-        a_bf16.index_copy_(0, valid_idx,
-                            x_gpu.index_select(0, idx_to_orig[valid_idx]))
-
-        # Per-token A quant.
-        a_int8, sA = quantize_per_token_int8_gpu(a_bf16)
-        # SFA for gate/up: broadcast per-token scale across kb_h K-blocks.
-        sfa_h = sA.unsqueeze(1).expand(M_grouped, kb_h).contiguous()
+        # Gather only the routed rows, quantize them, scatter into the
+        # contiguous layout. The grouped kernels bound every access by the
+        # segment lengths in `offsets`, so padding rows are never read —
+        # the buffers stay uninitialized (no full-size zero fill) and the
+        # quant runs on n_items rows instead of M_grouped.
+        x_items = x_gpu.index_select(0, rows_items)             # [n_items, H]
+        q_items, s_items = (
+            _tk.quant_rows(x_items) if _HAS_TRITON
+            else quantize_per_token_int8_gpu(x_items)
+        )
+        a_int8 = torch.empty(M_grouped, H, device=dev, dtype=torch.int8)
+        a_int8.index_copy_(0, dest, q_items)
+        sfa_h = torch.empty(M_grouped, kb_h, device=dev, dtype=torch.float32)
+        sfa_h.index_copy_(
+            0, dest, s_items.unsqueeze(1).expand(n_items, kb_h).contiguous())
 
         if kind == "cached":
             # HBM-resident weights: deep-pattern kernel (ASYMGEMM_HBM_KERNEL).
@@ -1344,7 +1348,11 @@ class Layer:
                 (a_int8, sfa_h), (self.cache_gateup_int8, self.cache_gateup_sfb),
                 d_gu, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
             )
-            act = torch.nn.functional.silu(d_gu[:, :I]) * d_gu[:, I:]
+            # Gather routed rows first, then activate: SwiGLU runs on
+            # n_items rows and the uninitialized padding rows never flow
+            # through any math.
+            gu_sel = d_gu.index_select(0, dest)                 # [n_items, 2I]
+            act_sel = (torch.nn.functional.silu(gu_sel[:, :I]) * gu_sel[:, I:])
             down_b, down_sfb = self.cache_down_int8, self.cache_down_sfb
         else:
             # Staged ring slots are HBM-resident — use the deep M-outer kernel
@@ -1409,14 +1417,23 @@ class Layer:
                 d_up, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
             )
 
-            # SwiGLU
-            act = torch.nn.functional.silu(d_gate) * d_up
+            # SwiGLU on the routed rows only (see the cached branch).
+            gate_sel = d_gate.index_select(0, dest)
+            up_sel = d_up.index_select(0, dest)
+            act_sel = torch.nn.functional.silu(gate_sel) * up_sel
             down_b, down_sfb = dn_b, down_sfb
 
-        # Down: re-quantize act (BF16 round-trip to match the CPU path).
-        act_bf16 = act.to(torch.bfloat16)
-        a2_int8, sA2 = quantize_per_token_int8_gpu(act_bf16)
-        sfa_i = sA2.unsqueeze(1).expand(M_grouped, kb_i).contiguous()
+        # Down: re-quantize act (BF16 round-trip to match the CPU path),
+        # scatter into the layout like the A side.
+        a2_items, s2_items = (
+            _tk.quant_rows(act_sel.to(torch.bfloat16)) if _HAS_TRITON
+            else quantize_per_token_int8_gpu(act_sel.to(torch.bfloat16))
+        )
+        a2_int8 = torch.empty(M_grouped, I, device=dev, dtype=torch.int8)
+        a2_int8.index_copy_(0, dest, a2_items)
+        sfa_i = torch.empty(M_grouped, kb_i, device=dev, dtype=torch.float32)
+        sfa_i.index_copy_(
+            0, dest, s2_items.unsqueeze(1).expand(n_items, kb_i).contiguous())
 
         d_down = torch.empty(M_grouped, H, device=dev, dtype=torch.float32)
         gemm_fn(
@@ -1430,11 +1447,9 @@ class Layer:
             staged[0].free_ev[staged[1]].record()
 
         # Apply routing weights, return for scatter-add.
-        orig_rows  = idx_to_orig[valid_idx]
-        orig_slots = slot_to_orig[valid_idx]
-        w = route_w_gpu[orig_rows, orig_slots]              # [n_valid]
-        y_w = d_down[valid_idx] * w[:, None]
-        return orig_rows, y_w
+        w = route_w_gpu[rows_items, slots_items]            # [n_items]
+        y_w = d_down.index_select(0, dest) * w[:, None]
+        return rows_items, y_w
 
     # -----------------------------------------------------------
     # main forward
