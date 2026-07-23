@@ -429,6 +429,24 @@ push to Kevin's explicit call (or his gbackup habit). Update memory notes.
   reclaim under pressure; llama rows (no q/k norms) byte-exact everywhere
   — explains the whole cross-row memory pattern. tok/s gate PASS ×2;
   reserved +11 documented as qknorm side-pool cache, not a hold/leak.
+- [S6 M2 PASS 2026-07-23 (Q7a, gate validated)] 979 vs 986 (−0.7%, in
+  band), peak 93.6 byte-exact; sidecar proves the regime gate live
+  (P12 False ×803 regime=dense-T2-keep-acts). M2 CLOSED. 8/9 green;
+  M8 bisect (qknorm-off @deep-shed) in flight.
+- [S6 CLOSED 2026-07-23 — MATRIX 9/9] M8 attribution completed the chain:
+  policy-on 574×3 / qknorm-off 575 / deposit-off 582 = flags-off level ⇒
+  P2 deposit was the entire deep-shed cost; discriminator = the
+  KEEP_DGRADS_HBM pin (donor's 1M-token deposit WIN had no pin), NOT
+  tokens. P2 regime gate committed (5d39762); M8 FINAL 582 (−0.4%, in
+  band), sidecar P2 False ×144 regime=keep-dgrads-hbm; peak 120.3 =
+  prefetch/side-pool cache at 64.7 GiB free (capacity-nil per M7
+  forensics). M9 not re-run: passed WITH the cost the gate removes
+  (its 380 is conservative). FINAL MATRIX: M1 1092/116.0 · M2 979/93.6
+  · M3 227(+3.6%)/153.8ⁿ · M4 1096/48.9 · M5 545/171.1 · M6 279/182.4
+  · M7 2726/176.7ⁿ · M8 582/120.3ⁿ · M9 380/144.5 (ⁿ = reserved-cache
+  note, allocated ≤ baseline+0). Two policy-gate fixes landed during
+  S6 (dense-T2 qknorm 03a43e7, keep-dgrads P2 5d39762) + prefetch floor
+  32 (738aa70) + record_stream cleanup (23a2efc) — zero recipe forks.
 - [S2 BUILD 2026-07-22] _C rebuilt in-container with -fopenmp + SVE-BF16
   march: cpu_ops_sve_compiled()=True, all 8 symbols present. Bench --final
   sanity vs donor table: swiglu fwd 44.3 ms@32k (donor 44.8 ✓), bwd 60.1
