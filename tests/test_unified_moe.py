@@ -424,9 +424,10 @@ def test_no_vram_weight_residency():
     # Reference sizes
     weight_bytes_per_proj = G * I * H * 1       # int8
     weight_bytes_total = 3 * weight_bytes_per_proj
-    # SFB allocations only (3 projections × G × N × kb × 4 bytes).
-    sfb_bytes = (layer.slab.gate_sfb.numel() + layer.slab.up_sfb.numel()
-                 + layer.slab.down_sfb.numel()) * 4
+    # Compact per-channel scale allocations only (3 projections × G × N × 4
+    # bytes) — the [G, N, Kb] SFB broadcasts are expanded per use, not resident.
+    sfb_bytes = (layer.slab.gate_s_dev.numel() + layer.slab.up_s_dev.numel()
+                 + layer.slab.down_s_dev.numel()) * 4
 
     print(f"  [test_no_vram_weight_residency] VRAM delta = {delta} bytes  "
           f"(SFB only = {sfb_bytes}, weight bytes if mirrored = {weight_bytes_total})")

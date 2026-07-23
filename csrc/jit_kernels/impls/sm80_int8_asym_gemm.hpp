@@ -49,6 +49,37 @@ static void __instantiate_kernel() {{
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Deep-pattern JIT runtime (M-outer, HBM-resident B) — Phase 3
+// ──────────────────────────────────────────────────────────────────────────────
+class SM80MoEInt8DeepGemmRuntime final : public LaunchRuntime<SM80MoEInt8DeepGemmRuntime> {
+public:
+    struct Args {
+        sm80::SM80GemmConfig gemm_config;
+        LaunchArgs           launch_args;
+        SM80MoEInt8Params    params;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        const auto& c = args.gemm_config;
+        return fmt::format(R"(
+// sm80 moe int8 deep v1: M-outer full-K register accumulation, 2-stage cp.async
+#include <asym_gemm/impls/sm80_int8_asym_moe_gemm.cuh>
+using namespace asym_gemm;
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(
+        &sm80_int8_deep_moe_gemm_impl<{}, {}, {}, {}>);
+}};
+)",
+            c.block_m, c.block_n, c.block_k, c.nwarps);
+    }
+
+    static void launch_impl(const KernelHandle& kernel,
+                            const LaunchConfigHandle& config, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.params));
+    }
+};
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Masked JIT runtime — padded [G, M_max, ...] layout, constant grid
 // ──────────────────────────────────────────────────────────────────────────────
 class SM80MoEInt8MaskedGemmRuntime final : public LaunchRuntime<SM80MoEInt8MaskedGemmRuntime> {
@@ -173,6 +204,76 @@ static void sm80_m_grouped_int8_asym_gemm_contiguous(
     const auto& code    = SM80MoEInt8GemmRuntime::generate(runtime_args);
     const auto& runtime = compiler->build(kernel_name, code);
     SM80MoEInt8GemmRuntime::launch(runtime, runtime_args);
+}
+
+// Deep-pattern contiguous entry: identical calling convention to
+// sm80_m_grouped_int8_asym_gemm_contiguous, but B/sfb must be HBM-resident
+// (the M-outer loop re-reads B once per M-tile — ruinous over PCIe, cheap
+// from HBM) and D is written exactly once (no FP32 partial round-trips).
+static void sm80_m_grouped_int8_deep_gemm_contiguous(
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& d,
+    const torch::Tensor& offsets,
+    const torch::Tensor& experts,
+    int32_t list_size,
+    const torch::Tensor& sfa,
+    const torch::Tensor& sfb)
+{
+    const int64_t K = a.size(1);
+    const int64_t E = b.size(0);
+    const int64_t N = b.size(1);
+    check_sm80_int8_common(a, b, d, sfa, sfb, N, K);
+    DG_HOST_ASSERT(b.is_cuda() and sfb.is_cuda());   // HBM-resident B only
+    DG_HOST_ASSERT(b.size(2) == K and d.size(1) == N);
+    DG_HOST_ASSERT(offsets.scalar_type() == torch::kInt and experts.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(offsets.is_cuda() and experts.is_cuda());
+    DG_HOST_ASSERT(offsets.is_contiguous() and experts.is_contiguous());
+    DG_HOST_ASSERT(list_size >= 1);
+    DG_HOST_ASSERT(offsets.numel() >= 2 * (list_size - 1) and experts.numel() >= list_size);
+    const int32_t kb = static_cast<int32_t>(K / 128);
+    DG_HOST_ASSERT(sfa.size(0) == a.size(0) and sfa.size(-1) == kb);
+    DG_HOST_ASSERT(sfb.size(0) == E and sfb.size(1) == N and sfb.size(2) == kb);
+
+    const int32_t num_segments = list_size - 1;
+    if (a.size(0) == 0 or num_segments <= 0)
+        return;
+
+    const auto& [arch_major, arch_minor] = device_runtime->get_arch_pair();
+    const auto cfg = sm80::select_sm80_int8_deep_config(arch_major, arch_minor,
+                                                        static_cast<int>(N),
+                                                        static_cast<int>(K));
+
+    const SM80MoEInt8Params params {
+        .x_ptr       = a.data_ptr(),
+        .w_ptr       = b.data_ptr(),
+        .o_ptr       = d.data_ptr(),
+        .expert_list = experts.data_ptr<int32_t>(),
+        .index_list  = offsets.data_ptr<int32_t>(),
+        .list_size   = list_size,
+        .expert_size = static_cast<int32_t>(E),
+        .N           = N,
+        .K           = K,
+        .sfa_ptr     = sfa.data_ptr<float>(),
+        .sfb_ptr     = sfb.data_ptr<float>(),
+        .kb          = kb,
+    };
+
+    const SM80MoEInt8DeepGemmRuntime::Args runtime_args {
+        .gemm_config = cfg,
+        .launch_args = LaunchArgs({cfg.grid_x(static_cast<int>(N)), num_segments},
+                                  cfg.num_threads(),
+                                  sm80::smem_bytes_int8_deep(cfg.block_m, cfg.block_n,
+                                                             cfg.block_k)),
+        .params      = params,
+    };
+
+    const std::string kernel_name = fmt::format("sm80_moe_int8_deep_gemm_bm{}_bn{}_bk{}",
+        cfg.block_m, cfg.block_n, cfg.block_k);
+
+    const auto& code    = SM80MoEInt8DeepGemmRuntime::generate(runtime_args);
+    const auto& runtime = compiler->build(kernel_name, code);
+    SM80MoEInt8DeepGemmRuntime::launch(runtime, runtime_args);
 }
 
 // a   : int8  [G, M_max, K] HBM            sfa : fp32 [G, M_max, kb] HBM

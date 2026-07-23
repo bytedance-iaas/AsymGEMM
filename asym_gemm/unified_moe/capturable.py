@@ -141,27 +141,26 @@ def init_capturable_decode(layer, batch_sizes) -> None:
     # kernel with min(T*K, cache_n)+1 groups. Run each distinct shape once now,
     # eagerly, so the JIT ensure-compile (which synchronizes the stream) never
     # fires inside graph capture. The compile cache is process-global — warm
-    # only once, on the first layer.
-    if getattr(layer, "cache_n", 0) > 0 and _warm_cached_shapes(layer):
-        dev = f"cuda:{layer.cuda_device}"
-        H, K = layer.slab.hidden, layer.top_k
-        for t in sorted({int(b) for b in batch_sizes}):
-            x = torch.zeros(t, H, dtype=torch.bfloat16, device=dev)
-            eids = torch.zeros(t, K, dtype=torch.int64, device=dev)
-            rw = torch.ones(t, K, dtype=torch.float32, device=dev)
-            layer._cached_gpu_decode(x, eids, rw)
-        torch.cuda.synchronize()
+    # each (geometry, T) once, on whichever layer first asks for it (this may
+    # be called again pre-capture with the runner's final batch list, which
+    # can contain sizes the load-time init never saw).
+    if getattr(layer, "cache_n", 0) > 0:
+        key = (layer.cache_n, layer.slab.hidden, layer.slab.inter, layer.top_k)
+        todo = [t for t in sorted({int(b) for b in batch_sizes})
+                if (key, t) not in _warmed_cache_keys]
+        if todo:
+            dev = f"cuda:{layer.cuda_device}"
+            H, K = layer.slab.hidden, layer.top_k
+            for t in todo:
+                x = torch.zeros(t, H, dtype=torch.bfloat16, device=dev)
+                eids = torch.zeros(t, K, dtype=torch.int64, device=dev)
+                rw = torch.ones(t, K, dtype=torch.float32, device=dev)
+                layer._cached_gpu_decode(x, eids, rw)
+                _warmed_cache_keys.add((key, t))
+            torch.cuda.synchronize()
 
 
 _warmed_cache_keys = set()
-
-
-def _warm_cached_shapes(layer) -> bool:
-    key = (layer.cache_n, layer.slab.hidden, layer.slab.inter, layer.top_k)
-    if key in _warmed_cache_keys:
-        return False
-    _warmed_cache_keys.add(key)
-    return True
 
 
 def capturable_decode_supported(layer, T: int) -> bool:

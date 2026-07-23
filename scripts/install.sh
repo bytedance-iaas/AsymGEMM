@@ -25,8 +25,31 @@ if ! command -v cmake >/dev/null 2>&1; then
   exit 1
 fi
 
+# If CUDA_HOME is unset, prefer a pip-installed CUDA toolkit (nvidia/cuNN in
+# site-packages, e.g. from nvidia-cuda-nvcc) over whatever nvcc is on PATH: it
+# matches the CUDA major version torch was built with, while the system
+# toolkit may not (torch errors out on a major-version mismatch).
+if [ -z "${CUDA_HOME:-}" ]; then
+  PIP_CUDA_HOME=$(python - <<'PY'
+import glob, os, sysconfig
+sp = sysconfig.get_paths()["purelib"]
+for d in sorted(glob.glob(os.path.join(sp, "nvidia", "cu*")), reverse=True):
+    if os.path.exists(os.path.join(d, "bin", "nvcc")):
+        print(d)
+        break
+PY
+)
+  if [ -n "$PIP_CUDA_HOME" ]; then
+    export CUDA_HOME="$PIP_CUDA_HOME"
+    echo "[INFO] Using pip-installed CUDA toolkit: $CUDA_HOME"
+  fi
+fi
+
 rm -rf build dist asym_gemm.egg-info
-python -m pip install --no-build-isolation -e .
+# --use-pep517 is required: without pyproject.toml, older pips fall back to the
+# legacy `setup.py develop` path, which ignores --no-build-isolation (modern
+# setuptools then re-invokes pip WITH isolation and setup.py can't import torch).
+python -m pip install --use-pep517 --no-build-isolation -e .
 
 python - <<'PY'
 import asym_gemm
