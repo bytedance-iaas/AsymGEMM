@@ -213,3 +213,25 @@ launch e2e runs detached (`setsid nohup`) with stall-aware waiters (log-mtime si
   largest 7.7; no scheduling lever can engage at G≈176/184). Campaign paused for user
   review.
 
+
+
+---
+
+## Post-merge addendum (2026-07-23, merged into the sched40×42 tree — see merge_cpu_modules.md)
+
+Adopted as ONE recipe flag (`ASYM_PLACEMENT_POLICY=1` + 48 threads on every
+tier). 9/9 no-regression matrix vs the scheduler-merge record. Two regime
+refinements this table's A/Bs could not see (both measurement-attributed on
+the merged tree, added as policy gates):
+1. **P2 deposit vs KEEP_DGRADS_HBM**: the deposit wins above were measured
+   WITHOUT the keep-dgrads pin. With it (the merged tree's shed recipes),
+   deposit is pure added bus traffic: −1.4% @800k, bisect-exact. Gate:
+   P2 off under the pin.
+2. **P12 qknorm vs dense-T2 keep-acts**: −2% where ASYNC_UNPACK already
+   saturates the restage buses (bisect 960→978=flags-off); wins everywhere
+   else incl. T1 (±0.0) and T3 (+3.6% row). Gate keys on the recipe signature.
+Also: prefetch G-floor raised 16→32 GB (hold-time free must cover the step's
+future peak — bit at a 19-GiB-headroom KA-dial row); the restage side-stream
+grows an allocator pool ≈ the in-flight window (reserved-only, allocated
+byte-identical, reclaimable — visible as +10~24 GiB reserved on norm-bearing
+models with headroom).
