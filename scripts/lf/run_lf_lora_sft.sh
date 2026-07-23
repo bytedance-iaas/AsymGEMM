@@ -1881,18 +1881,35 @@ host_mem_watchdog_avail_kb() {
 # run does not exit within HOST_MEM_WATCHDOG_KILL_GRACE_SECONDS.
 host_mem_watchdog_loop() {
   local floor_kb=$(( HOST_MEM_WATCHDOG_FLOOR_GB * 1024 * 1024 ))
-  local avail_kb deadline
+  local avail_kb deadline mlocked_kb unevictable_kb
+  local sample_every=$(( ${HOST_MEM_WATCHDOG_SAMPLE_SECONDS:-15} )) last_sample=0
   local -a targets=()
+  # item 4 (fix_cpu_compute.md): page-locked attribution — Mlocked/Unevictable are the
+  # node-level pinned truth that process RSS provably does not see (32B diagnosis).
+  if [[ -n "${LOG_FILE:-}" ]]; then
+    printf 'epoch_s,avail_kb,mlocked_kb,unevictable_kb\n' > "${LOG_FILE}.hostmem.csv" 2>/dev/null || true
+  fi
   while :; do
     mapfile -t targets < <(managed_child_targets)
     ((${#targets[@]} > 0)) || return 0
     managed_process_alive "${targets[@]}" || return 0
     avail_kb="$(host_mem_watchdog_avail_kb 2>/dev/null || true)"
+    if [[ -n "${LOG_FILE:-}" ]] && (( SECONDS - last_sample >= sample_every )); then
+      last_sample=${SECONDS}
+      mlocked_kb="$(awk '/^Mlocked:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo '')"
+      unevictable_kb="$(awk '/^Unevictable:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo '')"
+      printf '%s,%s,%s,%s\n' "$(date +%s)" "${avail_kb}" "${mlocked_kb}" "${unevictable_kb}" \
+        >> "${LOG_FILE}.hostmem.csv" 2>/dev/null || true
+    fi
     if [[ "${avail_kb}" =~ ^[0-9]+$ ]] && (( avail_kb < floor_kb )); then
       printf '[host-mem-watchdog] CPU-node available memory %s GiB dropped below floor %s GiB; interrupting training before the kernel OOM killer fires (soft host OOM).\n' \
         "$(( avail_kb / 1024 / 1024 ))" "${HOST_MEM_WATCHDOG_FLOOR_GB}" >&2
       if [[ -n "${LOG_FILE:-}" ]]; then
-        printf 'fired_at=%s avail_kb=%s floor_gb=%s\n' "$(date -Is 2>/dev/null || true)" "${avail_kb}" "${HOST_MEM_WATCHDOG_FLOOR_GB}" \
+        mlocked_kb="$(awk '/^Mlocked:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo '')"
+        unevictable_kb="$(awk '/^Unevictable:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo '')"
+        printf 'fired_at=%s avail_kb=%s floor_gb=%s mlocked_kb=%s unevictable_kb=%s\n' \
+          "$(date -Is 2>/dev/null || true)" "${avail_kb}" "${HOST_MEM_WATCHDOG_FLOOR_GB}" \
+          "${mlocked_kb}" "${unevictable_kb}" \
           > "${LOG_FILE}.host_mem_watchdog_fired" 2>/dev/null || true
       fi
       signal_managed_targets STOP "${targets[@]}"

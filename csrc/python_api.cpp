@@ -7,6 +7,7 @@
 
 #include "apis/gemm.hpp"
 // #include "apis/asym_gemm.hpp"
+#include "apis/cpu_ops.hpp"
 #include "apis/dropout.hpp"
 #include "apis/exp_act_offload.hpp"
 #include "apis/layout.hpp"
@@ -27,6 +28,7 @@ void register_apis(pybind11::module_& m);
 // ReSharper disable once CppParameterMayBeConstPtrOrRef
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "DeepGEMM C++ library";
+    asym_gemm::cpu_ops::register_apis(m);
     asym_gemm::dropout::register_apis(m);
     asym_gemm::ep_steal::register_apis(m);
     asym_gemm::exp_act_offload::register_apis(m);

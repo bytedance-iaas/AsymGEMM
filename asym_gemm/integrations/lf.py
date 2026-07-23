@@ -1616,10 +1616,20 @@ def _wrap_attention_saved_tensor_offload_modules(
             skipped.append(f"{name}:unsupported_attention_parent:{type(module).__name__}")
             continue
         install_attention_saved_tensor_offload(module)
+        # item 6 (fix_cpu_compute.md R2): wrap q/k-norm for recompute-instead-of-save.
+        # Pure passthrough until ASYMM_QKNORM_RECOMPUTE / policy P12 arms it, so the
+        # install is always safe on the same text-attention parents.
+        from asym_gemm.training.qknorm_recompute import install_qknorm_recompute
+
+        install_qknorm_recompute(module)
         wrapped.append(name)
 
     # SDPA-only recompute pairs with attn_act; self-gated on ASYMM_ATTN_SDPA_RECOMPUTE, text-scoped.
     install_sdpa_recompute(model)
+    # item 6 rope variant (self-gated on ASYMM_ROPE_RECOMPUTE; evidence-off in this graph).
+    from asym_gemm.training.qknorm_recompute import install_rope_recompute
+
+    install_rope_recompute()
 
     if strict and not wrapped:
         raise RuntimeError("attention activation offload requested but no supported text attention parents were found")

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import types
+import weakref
 from collections.abc import Callable
 from typing import Any, Literal
 
@@ -110,6 +111,158 @@ def _single_group_offsets_experts(device: torch.device | str, m: int) -> tuple[t
     return offsets, experts
 
 
+def _attn_lora_a_grad_cpu_deposit_enabled() -> bool:
+    """K-2 (cpu_compute.md): attention LoRA-A wgrad on the CPU worker (deposit design),
+    mirroring the MoE Stage-3 path — removes the per-projection C2C U re-read.
+
+    Policy-ON (fix_cpu_compute.md item 1): placement.md P3 rules — the per-call
+    rows gate in _try_deposit_attn_lora_a_grad closes the manual 32k/128k split."""
+    from . import placement_policy
+
+    if placement_policy.enabled():
+        return placement_policy.attn_wgrad_feature()
+    return os.environ.get(
+        "ASYMM_ATTN_LORA_A_GRAD_CPU",
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_LORA_A_GRAD_CPU", "0"),
+    ).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+# (task, manager, u_handle, shared_source): U buffers whose release is deferred until the
+# worker's wgrad job has consumed them. Swept on the MAIN thread (pool is not thread-safe).
+_ATTN_DEPOSIT_PENDING: list = []
+_ATTN_PAIR_META: dict = {}
+_ATTN_DEPOSIT_DIAG = False
+
+
+_DEPOSIT_PENDING_BUDGET_BYTES = int(
+    float(os.environ.get("ASYM_DEPOSIT_RETAIN_BUDGET_GB", "48")) * (1 << 30)
+)
+_DEPOSIT_RETAINED_BYTES = 0
+_DEPOSIT_RETAINED_HIGH_WATER = 0  # P11: retained-bytes high-water (profile counter)
+
+
+def deposit_retention_stats() -> dict:
+    """P11 counters for the profile: P7 backpressure budget + high-water."""
+    return {
+        "budget_bytes": _DEPOSIT_PENDING_BUDGET_BYTES,
+        "retained_bytes_high_water": _DEPOSIT_RETAINED_HIGH_WATER,
+        "retained_bytes_now": _DEPOSIT_RETAINED_BYTES,
+        "pending_now": len(_ATTN_DEPOSIT_PENDING),
+    }
+
+
+def _handle_bytes(h) -> int:
+    return int(h.tensor.numel()) * int(h.tensor.element_size())
+
+
+def _defer_deposit_release(task, manager, handle, shared) -> None:
+    """BACKPRESSURE (2026-07-15, fixes the 32B 10 GiB/s retention OOM): before
+    deferring a new source, block the PRODUCER on the oldest outstanding deposit
+    until the global retained-bytes budget holds. Converts OOM into bounded
+    slowdown; lossless; FIFO order preserved. Main-thread only (pool rule)."""
+    global _DEPOSIT_RETAINED_BYTES, _DEPOSIT_RETAINED_HIGH_WATER
+    from . import cpu_worker
+
+    new_bytes = _handle_bytes(handle)
+    while _ATTN_DEPOSIT_PENDING and _DEPOSIT_RETAINED_BYTES + new_bytes > _DEPOSIT_PENDING_BUDGET_BYTES:
+        t0, m0, h0, s0 = _ATTN_DEPOSIT_PENDING.pop(0)
+        cpu_worker.wait(t0)
+        _DEPOSIT_RETAINED_BYTES -= _handle_bytes(h0)
+        if s0 is None:
+            m0.release_cpu(h0)
+        else:
+            s0.release()
+    _ATTN_DEPOSIT_PENDING.append((task, manager, handle, shared))
+    _DEPOSIT_RETAINED_BYTES += new_bytes
+    if _DEPOSIT_RETAINED_BYTES > _DEPOSIT_RETAINED_HIGH_WATER:
+        _DEPOSIT_RETAINED_HIGH_WATER = _DEPOSIT_RETAINED_BYTES
+
+
+def _sweep_attn_deposit_releases(force: bool = False) -> None:
+    if not _ATTN_DEPOSIT_PENDING:
+        return
+    from . import cpu_worker
+
+    global _DEPOSIT_RETAINED_BYTES
+    remaining = []
+    retained = 0
+    for entry in _ATTN_DEPOSIT_PENDING:
+        task, manager, u_handle, shared = entry
+        if force:
+            cpu_worker.wait(task)
+        if task.done.is_set():
+            if shared is None:
+                manager.release_cpu(u_handle)
+            else:
+                shared.release()
+        else:
+            retained += _handle_bytes(u_handle)
+            remaining.append(entry)
+    _ATTN_DEPOSIT_PENDING[:] = remaining
+    _DEPOSIT_RETAINED_BYTES = retained
+
+
+def _try_deposit_attn_lora_a_grad(a_param, d_s, u_handle, manager, shared_source, role):
+    """Fire-and-forget CPU wgrad for one attention projection: dA = dS^T @ U_cpu written
+    fp32 into the optimizer's grad buffer. Returns a dummy CUDA grad or None."""
+    import asym_gemm as _ag
+    from . import cpu_adam as _cpu_adam
+    from . import cpu_worker
+    from . import placement_policy
+    from .qwen3_moe_finegrained import _DS_SLOTS, _DsSlots
+
+    if placement_policy.enabled() and not placement_policy.attn_wgrad_deposit(
+        int(d_s.shape[0])
+    ):
+        return None  # P3 rows gate: fall back to the GPU wgrad path
+
+    kernel = getattr(_ag, "cpu_grouped_lora_a_grad_bf16", None)
+    adam = _cpu_adam.get_active_adamw()
+    if kernel is None or adam is None or not cpu_worker.enabled():
+        return None
+    u = u_handle.tensor
+    if d_s.dtype != torch.bfloat16 or u.dtype != torch.bfloat16 or not u.is_contiguous():
+        return None
+    buf = adam.get_grad_deposit_buffer(a_param)
+    if (
+        buf is None
+        or buf.dtype != torch.float32
+        or tuple(buf.shape) != (int(d_s.shape[1]), int(u.shape[1]))
+    ):
+        return None
+    m = int(d_s.shape[0])
+    meta = _ATTN_PAIR_META.get(m)
+    if meta is None:
+        meta = (torch.tensor([0, m], dtype=torch.long), torch.zeros(1, dtype=torch.long))
+        _ATTN_PAIR_META[m] = meta
+    pairs, ge = meta
+    slots = _DS_SLOTS.setdefault((tuple(d_s.shape), d_s.dtype, f"attn.{role}"), _DsSlots())
+    slot_i, ds_pin = slots.acquire(d_s)
+    ds_pin.copy_(d_s if d_s.is_contiguous() else d_s.contiguous(), non_blocking=True)
+    ev = torch.cuda.Event()
+    ev.record(torch.cuda.current_stream())
+    from . import cpu_ops as _cpu_ops
+    nt = _cpu_ops.wgrad_threads()
+    out3d = buf.view(1, int(buf.shape[0]), int(buf.shape[1]))
+
+    def _job(ev=ev, ds=ds_pin, x=u, out=out3d, p=pairs, g=ge, n=nt, k=kernel):
+        ev.synchronize()  # same-stream FIFO: also guarantees U's earlier D2H completed
+        k(ds, x, out, p, g, n)
+
+    task = cpu_worker.submit_deposit(_job, tag="deposit.dA.attn")
+    slots.tasks[slot_i] = task
+    if not adam.register_grad_deposit(a_param, task):
+        cpu_worker.wait(task)
+        return None
+    _defer_deposit_release(task, manager, u_handle, shared_source)
+    global _ATTN_DEPOSIT_DIAG
+    if not _ATTN_DEPOSIT_DIAG:
+        _ATTN_DEPOSIT_DIAG = True
+        import sys
+        print("[asym-cpu-wgrad] K-2 attention deposit path ENGAGED", file=sys.stderr, flush=True)
+    return torch.empty(a_param.shape, device=d_s.device, dtype=torch.bfloat16)
+
+
 def _record_attn_hbm_gemm(stats: AsymExecutionStats | None, tag: str) -> None:
     if stats is None or not tag:
         return
@@ -121,6 +274,21 @@ def _tensor_storage_nbytes(tensor: torch.Tensor) -> int:
         return int(tensor.untyped_storage().nbytes())
     except Exception:
         return int(tensor.numel() * tensor.element_size())
+
+
+def _alias_key(tensor: torch.Tensor):
+    """Identity key for same-storage alias dedup (item 2 attempt #2): two wrappers
+    with equal (storage ptr, offset, dtype, sizes, strides) read the same bytes."""
+    try:
+        return (
+            tensor.untyped_storage().data_ptr(),
+            tensor.storage_offset(),
+            tensor.dtype,
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+        )
+    except Exception:
+        return None
 
 
 def _attention_saved_tensor_min_bytes() -> int:
@@ -175,16 +343,26 @@ def _h2d_restage_stream(device: torch.device) -> torch.cuda.Stream:
 def _empty_strided_cpu_like(tensor: torch.Tensor, *, pin_memory: bool) -> torch.Tensor:
     shape = tuple(int(dim) for dim in tensor.shape)
     stride = tuple(int(value) for value in tensor.stride())
+    pinned = bool(pin_memory and torch.cuda.is_available())
+    if pinned:
+        # item 4 (fix_cpu_compute.md): these per-save fresh pinned allocs are the
+        # largest untracked page-locked class on dense models — book them under the
+        # "saved" family; cap denial degrades to the unpinned (sync-copy) behaviour.
+        from . import pinned_ledger
+
+        nbytes = tensor.numel() * tensor.element_size()
+        pinned = pinned_ledger.try_reserve("saved", int(nbytes))
     try:
-        return torch.empty_strided(
-            shape,
-            stride,
-            device="cpu",
-            dtype=tensor.dtype,
-            pin_memory=bool(pin_memory and torch.cuda.is_available()),
-        )
+        out = torch.empty_strided(shape, stride, device="cpu", dtype=tensor.dtype, pin_memory=pinned)
     except RuntimeError:
+        if pinned:
+            from . import pinned_ledger
+
+            pinned_ledger.release("saved", int(tensor.numel() * tensor.element_size()))
         return torch.empty_strided(shape, stride, device="cpu", dtype=tensor.dtype)
+    if pinned:
+        pinned_ledger.register_tensor(out, "saved")
+    return out
 
 
 @dataclass
@@ -197,6 +375,116 @@ class _SavedTensorOffloadHandle:
     nbytes: int
     tag: str
     ready_event: torch.cuda.Event | None = None
+    # R5 prefetch: fresh staged tensor + its copy-done event, issued at region exit
+    # on the DEDICATED prefetch stream (per-tensor event); consumed once by _unpack.
+    prefetch_staged: "torch.Tensor | None" = None
+    prefetch_done: "torch.cuda.Event | None" = None
+
+
+@dataclass
+class _RopeRecipeSavedHandle:
+    """P2: a saved rope output represented by its recompute recipe (no bytes)."""
+
+    recipe: object
+
+
+_ATTN_DEDUP_ENGAGED = False
+
+
+_ALIAS_MISS_DIAG_SEEN: set = set()
+
+
+def _alias_miss_diag_once(cls: str, reason: str) -> None:
+    key = (cls, reason)
+    if key in _ALIAS_MISS_DIAG_SEEN or len(_ALIAS_MISS_DIAG_SEEN) > 24:
+        return
+    _ALIAS_MISS_DIAG_SEEN.add(key)
+    import sys
+
+    print(f"[attn-alias-miss] {cls}: {reason}", file=sys.stderr, flush=True)
+
+
+_ALIAS_MISS_DIAG_COUNTS: dict = {}
+
+
+def _alias_miss_diag(wrapper, tensor: torch.Tensor, akey, alias_map: dict) -> None:
+    """First THREE lookup-misses per (dtype, shape) class (the first is always the
+    class's initial pack; the second is the informative duplicate near-miss): report
+    the closest near-miss so the exact key component that differs is visible."""
+    cls = f"{tensor.dtype}.{tuple(tensor.shape)}"
+    n = _ALIAS_MISS_DIAG_COUNTS.get(cls, 0)
+    if n >= 3 or len(_ALIAS_MISS_DIAG_COUNTS) > 24:
+        return
+    _ALIAS_MISS_DIAG_COUNTS[cls] = n + 1
+    near = None
+    for k in alias_map.keys():
+        if k[0] == akey[0]:  # same storage ptr
+            near = ("same-sptr", k)
+            break
+        if k[2] == akey[2] and k[3] == akey[3]:  # same dtype+shape
+            near = near or ("same-shape-diff-storage", k)
+    import sys
+
+    if near is None:
+        print(
+            f"[attn-alias-miss] {cls}: no candidate in map (map={len(alias_map)} keys) — "
+            f"first save of this class in window OR lag exceeded FIFO",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        kind, k = near
+        print(
+            f"[attn-alias-miss] {cls}: near-miss {kind}: mine=(sptr={akey[0]},off={akey[1]},"
+            f"strides={akey[4]}) cand=(sptr={k[0]},off={k[1]},strides={k[4]})",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _attn_dedup_engaged_once(tag: str) -> None:
+    global _ATTN_DEDUP_ENGAGED
+    if _ATTN_DEDUP_ENGAGED:
+        return
+    _ATTN_DEDUP_ENGAGED = True
+    import sys
+
+    print(
+        f"[asym-save-dedup] attention saved-tensor dedup ENGAGED (first hit tag={tag})",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+# item-2 diagnosis mode (inert unless ASYM_ATTN_SAVED_TENSOR_DEDUP_DEBUG=1): log the
+# identity signature of the first few packs per shape so production same-shape pairs
+# can be classified (same object / same storage / different tensors).
+_DEDUP_DEBUG = os.environ.get("ASYM_ATTN_SAVED_TENSOR_DEDUP_DEBUG", "").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+_DEDUP_DEBUG_COUNTS: dict = {}
+
+
+def _dedup_debug_log(wrapper, tensor: torch.Tensor) -> None:
+    key = (tuple(tensor.shape), str(tensor.dtype))
+    n = _DEDUP_DEBUG_COUNTS.get(key, 0)
+    if n >= 8:
+        return
+    _DEDUP_DEBUG_COUNTS[key] = n + 1
+    import sys
+
+    try:
+        sptr = tensor.untyped_storage().data_ptr()
+    except Exception:
+        sptr = -1
+    print(
+        f"[attn-dedup-debug] pack shape={key[0]} dtype={key[1]} id={id(tensor)} "
+        f"ver={tensor._version} dptr={tensor.data_ptr()} sptr={sptr} "
+        f"off={tensor.storage_offset()} req={tensor.requires_grad} leaf={tensor.is_leaf} "
+        f"wrapper={id(wrapper)}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 class AttentionSavedTensorOffloadWrapper:
@@ -230,6 +518,25 @@ class AttentionSavedTensorOffloadWrapper:
         self.unpack_calls = 0
         self.skipped_tensors = 0
         self.skipped_bytes = 0
+        # item 2 (fix_cpu_compute.md): lossless dedup of duplicate saves (the fp32
+        # q/k-norm class is saved TWICE per layer through this pack). Map lives only
+        # for one run() (one forward/recompute region); key = (object, _version).
+        # Attempt #2 (2026-07-16, classified from production pack identities): the
+        # big fp32 pairs are SAME-STORAGE ALIASES with different Python wrappers, so
+        # a secondary weakref-ANCHORED alias map keyed by
+        # (storage_ptr, offset, dtype, sizes, strides) catches them. An alias hit is
+        # honoured only while the FIRST wrapper is still alive (anchor: its storage
+        # cannot have been freed/reused) and both wrappers' version counters still
+        # equal the packed version (view-lineage aliases share the counter, so any
+        # in-place write between the saves is refused).
+        self.dedup_hits = 0
+        self.dedup_bytes = 0
+        self.recipe_packs = 0
+        self.recipe_bytes_avoided = 0
+        self.recipe_unpacks = 0
+        self._dedup_seen = None
+        self._dedup_alias = None
+        self._region_handles: "list[_SavedTensorOffloadHandle] | None" = None
         self.offloaded_bytes = 0
         self.cpu_owned_bytes = 0
         self.cpu_peak_bytes_live = 0
@@ -252,8 +559,71 @@ class AttentionSavedTensorOffloadWrapper:
         self.calls += 1
         if not self.module.training or not torch.is_grad_enabled():
             return self.original_forward(*args, **kwargs)
-        with saved_tensors_hooks(self._pack, self._unpack):
-            return self.original_forward(*args, **kwargs)
+        from . import save_dedup as _save_dedup
+
+        prev_seen = self._dedup_seen
+        prev_alias = self._dedup_alias
+        prev_region = self._region_handles
+        if _save_dedup.enabled():
+            from torch.utils.weak import WeakTensorKeyDictionary
+
+            self._dedup_seen = WeakTensorKeyDictionary()
+            self._dedup_alias = {}
+        self._region_handles = []
+        try:
+            with saved_tensors_hooks(self._pack, self._unpack):
+                return self.original_forward(*args, **kwargs)
+        finally:
+            self._prefetch_region(self._region_handles)
+            self._dedup_seen = prev_seen
+            self._dedup_alias = prev_alias
+            self._region_handles = prev_region
+
+    def _prefetch_region(self, handles: "list[_SavedTensorOffloadHandle] | None") -> None:
+        """R5: at region exit (the earliest legal point — these saves are born during
+        the layer's backward-recompute, so one-layer-ahead is impossible by
+        construction), issue every packed tensor's H2D restage on the DEDICATED
+        prefetch stream in REVERSE pack order (last packed ~= first consumed), each
+        with its own done event. Lazily-issued critical copies keep the original
+        side stream, so they never queue behind these. G-guarded."""
+        if not handles:
+            return
+        from .activation_offload import (
+            _h2d_prefetch_stream,
+            prefetch_engaged_once,
+            prefetch_free_ok,
+            restage_prefetch_enabled,
+        )
+
+        if not restage_prefetch_enabled():
+            return
+        total = sum(h.nbytes for h in handles if h.prefetch_staged is None)
+        if total <= 0 or not prefetch_free_ok(total):
+            return
+        prefetch_engaged_once("attn.saved_region")
+        for packed in reversed(handles):
+            if packed.prefetch_staged is not None or not packed.tensor.is_pinned():
+                continue
+            if packed.original_device.type != "cuda":
+                continue
+            staged = torch.empty_strided(
+                packed.original_shape,
+                packed.original_stride,
+                device=packed.original_device,
+                dtype=packed.original_dtype,
+            )
+            pref = _h2d_prefetch_stream(packed.original_device)
+            if packed.ready_event is not None:
+                pref.wait_event(packed.ready_event)
+            pref.wait_stream(torch.cuda.current_stream(packed.original_device))
+            with torch.no_grad(), torch.cuda.stream(pref):
+                staged.copy_(packed.tensor, non_blocking=True)
+            done = torch.cuda.Event(enable_timing=True)
+            done.record(pref)
+            staged.record_stream(pref)
+            staged._asym_restage_keepalive = packed.tensor  # type: ignore[attr-defined]
+            packed.prefetch_staged = staged
+            packed.prefetch_done = done
 
     def _should_offload(self, tensor: torch.Tensor) -> bool:
         if not isinstance(tensor, torch.Tensor):
@@ -284,9 +654,72 @@ class AttentionSavedTensorOffloadWrapper:
         shape = "x".join(str(int(dim)) for dim in tensor.shape) or "scalar"
         return f"saved.{dtype_name}.{shape}"
 
-    def _pack(self, tensor: torch.Tensor) -> torch.Tensor | _SavedTensorOffloadHandle:
+    def _pack(self, tensor: torch.Tensor) -> "torch.Tensor | _SavedTensorOffloadHandle | _RopeRecipeSavedHandle":
+        # P2 (2026-07-21): a rope output carrying a recompute recipe is saved as the
+        # RECIPE (no bytes copied, no pinned buffer) and rebuilt bit-identically at
+        # unpack from the norm wrapper's already-offloaded bf16 input. Explicit
+        # object-attribute identification on the exact tensor SDPA saves — never
+        # anonymous packed-list matching.
+        recipe = getattr(tensor, "_asym_rope_recipe", None)
+        if recipe is not None and getattr(recipe, "shared", None) is not None:
+            tensor._asym_rope_recipe = None  # consumed by this save
+            self.recipe_packs += 1
+            self.recipe_bytes_avoided += int(tensor.numel() * tensor.element_size())
+            return _RopeRecipeSavedHandle(recipe=recipe)
         if not self._should_offload(tensor):
             return tensor
+        # item 2: same-object same-version duplicate saves share ONE handle (skips the
+        # duplicate pinned alloc + D2H). Unpack stays per-consumer (independent staged
+        # copies), so sharing the handle is lossless by construction.
+        if _DEDUP_DEBUG:
+            _dedup_debug_log(self, tensor)
+        seen = self._dedup_seen
+        dedupable = (
+            seen is not None
+            and tensor.layout == torch.strided
+            and not tensor.is_conj()
+            and not tensor.is_neg()
+        )
+        per = None
+        akey = None
+        if dedupable:
+            per = seen.get(tensor)
+            if per is not None:
+                shared = per.get(tensor._version)
+                if shared is not None:
+                    self.dedup_hits += 1
+                    self.dedup_bytes += int(tensor.numel() * tensor.element_size())
+                    _attn_dedup_engaged_once(shared.tag)
+                    return shared
+            # attempt #2b: same-storage alias lookup. The anchor must be a STRONG ref:
+            # production saved-wrappers are EPHEMERAL (a fresh wrapper per save), so a
+            # weakref anchor dies between the two saves (measured: zero alias hits).
+            # Anchors live in a small FIFO (N=4) — the duplicate save arrives within
+            # the same norm a couple of packs later while the tensor is alive anyway,
+            # so the strong ref extends no lifetime in practice; entries pop on hit
+            # and the whole map clears at region exit.
+            # fp32-only: the measured alias-duplicate classes are fp32 (norm upcast
+            # + variance); bf16 packs are never anchored, so the FIFO cannot extend
+            # the life of the big SDPA/rope saves (the +9.6 GiB G regression seen
+            # with dtype-blind anchoring @32k).
+            akey = _alias_key(tensor) if tensor.dtype == torch.float32 else None
+            alias_map = self._dedup_alias
+            if akey is not None and alias_map is not None:
+                ent = alias_map.get(akey)
+                if ent is not None:
+                    anchor, ver0, shared = ent
+                    if anchor._version == ver0 and tensor._version == ver0:
+                        self.dedup_hits += 1
+                        self.dedup_bytes += int(tensor.numel() * tensor.element_size())
+                        _attn_dedup_engaged_once(shared.tag + " [alias]")
+                        alias_map.pop(akey, None)  # served; release the anchor
+                        return shared
+                    alias_map.pop(akey, None)  # mutated -> refuse and drop
+                    _alias_miss_diag_once(self._tag_for(tensor), "version-mismatch")
+                else:
+                    # one-line-per-class diagnosis of WHY big fp32 packs do not alias-hit
+                    # (evidence for item-2 attempt #2b/#2c; prints at most once per class)
+                    _alias_miss_diag(self, tensor, akey, alias_map)
         cpu = _empty_strided_cpu_like(tensor, pin_memory=self.pin_memory)
         non_blocking = bool(cpu.is_pinned())
         with torch.no_grad():
@@ -309,7 +742,7 @@ class AttentionSavedTensorOffloadWrapper:
         shape_key = f"{dtype_key}:{tuple(int(dim) for dim in tensor.shape)}"
         self.shape_counts[shape_key] = self.shape_counts.get(shape_key, 0) + 1
         self._sync_module_stats()
-        return _SavedTensorOffloadHandle(
+        handle = _SavedTensorOffloadHandle(
             tensor=cpu,
             original_device=torch.device(tensor.device),
             original_dtype=tensor.dtype,
@@ -319,10 +752,54 @@ class AttentionSavedTensorOffloadWrapper:
             tag=tag,
             ready_event=ready_event,
         )
+        if self._region_handles is not None:
+            self._region_handles.append(handle)
+        if dedupable:
+            if per is None:
+                per = {}
+                seen[tensor] = per
+            per[tensor._version] = handle
+            if akey is not None and self._dedup_alias is not None:
+                amap = self._dedup_alias
+                amap[akey] = (tensor, tensor._version, handle)  # STRONG anchor (2b)
+                while len(amap) > 2:  # FIFO cap: measured duplicate lag is 2 packs
+                    amap.pop(next(iter(amap)), None)
+        return handle
 
-    def _unpack(self, packed: torch.Tensor | _SavedTensorOffloadHandle) -> torch.Tensor:
+    def _unpack(self, packed: "torch.Tensor | _SavedTensorOffloadHandle | _RopeRecipeSavedHandle") -> torch.Tensor:
+        if isinstance(packed, _RopeRecipeSavedHandle):
+            from .qknorm_recompute import recompute_rope_saved
+
+            self.recipe_unpacks += 1
+            return recompute_rope_saved(packed.recipe)
         if not isinstance(packed, _SavedTensorOffloadHandle):
             return packed
+        if packed.prefetch_staged is not None:
+            # R5: the restage was issued at region exit on the prefetch stream —
+            # wait its OWN event (per-tensor) and account the residual exposure.
+            staged = packed.prefetch_staged
+            done = packed.prefetch_done
+            packed.prefetch_staged = None
+            packed.prefetch_done = None
+            compute_stream = torch.cuda.current_stream(packed.original_device)
+            from .activation_offload import restage_gap_commit, restage_gap_events
+
+            gap_wait, _unused = restage_gap_events(packed.original_device)
+            if gap_wait is not None:
+                gap_wait.record(compute_stream)
+            compute_stream.wait_event(done)
+            if gap_wait is not None and done is not None:
+                restage_gap_commit(gap_wait, done, packed.nbytes, f"prefetch.{packed.tag}")
+            self.unpack_calls += 1
+            self.staged_bytes += packed.nbytes
+            self.max_stage_bytes_live = max(self.max_stage_bytes_live, self.staged_bytes)
+            self.stage_bytes_by_tag[packed.tag] = self.stage_bytes_by_tag.get(packed.tag, 0) + packed.nbytes
+            self.stage_peak_by_tag[packed.tag] = max(self.stage_peak_by_tag.get(packed.tag, 0), packed.nbytes)
+            self.staged_bytes = max(0, self.staged_bytes - packed.nbytes)
+            self.cpu_owned_bytes = max(0, self.cpu_owned_bytes - packed.nbytes)
+            self.cpu_bytes_by_tag[packed.tag] = max(0, self.cpu_bytes_by_tag.get(packed.tag, 0) - packed.nbytes)
+            self._sync_module_stats()
+            return staged
         staged = torch.empty_strided(
             packed.original_shape,
             packed.original_stride,
@@ -342,15 +819,29 @@ class AttentionSavedTensorOffloadWrapper:
                 staged.copy_(packed.tensor, non_blocking=True)
             done = torch.cuda.Event()
             done.record(side)
+            from .activation_offload import restage_gap_commit, restage_gap_events
+
+            gap_wait, gap_done = restage_gap_events(packed.original_device)
+            if gap_wait is not None:
+                gap_wait.record(compute_stream)  # R5: compute-stream arrival before the wait
             compute_stream.wait_event(done)
+            if gap_done is not None:
+                gap_done.record(side)
+                restage_gap_commit(gap_wait, gap_done, packed.nbytes, f"unpack.{packed.tag}")
             staged.record_stream(side)
             # keep the cpu buffer alive until the staged tensor dies (async copy source)
             staged._asym_restage_keepalive = packed.tensor  # type: ignore[attr-defined]
         else:
+            import time as _t
+
             if packed.ready_event is not None:
                 packed.ready_event.synchronize()
+            _t0 = _t.perf_counter()
             with torch.no_grad():
                 staged.copy_(packed.tensor, non_blocking=False)
+            from .activation_offload import restage_gap_host_ms
+
+            restage_gap_host_ms(f"unpack.{packed.tag}", (_t.perf_counter() - _t0) * 1000.0, packed.nbytes)
         self.unpack_calls += 1
         self.staged_bytes += packed.nbytes
         self.max_stage_bytes_live = max(self.max_stage_bytes_live, self.staged_bytes)
@@ -380,6 +871,11 @@ class AttentionSavedTensorOffloadWrapper:
             "num_stages": self.unpack_calls,
             "skipped_tensors": self.skipped_tensors,
             "skipped_bytes": self.skipped_bytes,
+            "dedup_hits": self.dedup_hits,
+            "dedup_bytes": self.dedup_bytes,
+            "recipe_packs": self.recipe_packs,
+            "recipe_bytes_avoided": self.recipe_bytes_avoided,
+            "recipe_unpacks": self.recipe_unpacks,
             "offload_bytes_by_tag": dict(self.offload_bytes_by_tag),
             "cpu_bytes_by_tag": dict(self.cpu_bytes_by_tag),
             "cpu_peak_by_tag": dict(self.cpu_peak_by_tag),
@@ -709,6 +1205,7 @@ class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function):
 
         grad_x = grad_a = grad_b = None
         s_stage = None
+        deposited_u = False
         try:
             d_y = grad_output.reshape(-1, base_layer.out_features).to(dtype=torch.bfloat16).contiguous()
             needs_grad_x = bool(ctx.needs_input_grad[0])
@@ -741,8 +1238,16 @@ class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function):
             if needs_grad_a:
                 if d_s is None:
                     raise RuntimeError("internal error: dS was not computed for dA")
+                if _attn_lora_a_grad_cpu_deposit_enabled():
+                    _sweep_attn_deposit_releases()
+                    grad_a = _try_deposit_attn_lora_a_grad(
+                        a, d_s, u_handle, manager, ctx.shared_source, role
+                    )
+                    deposited_u = grad_a is not None
                 m_grad = _align_up(int(d_s.shape[0]), 64)
-                if m_grad == 0:
+                if grad_a is not None:
+                    pass
+                elif m_grad == 0:
                     grad_a = torch.zeros_like(a)
                 else:
                     u_source = _pad_cpu_rows_to(u_handle.tensor, m_grad)
@@ -769,7 +1274,9 @@ class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function):
         finally:
             manager.release_stage(s_stage)
             manager.release_cpu(s_handle)
-            if ctx.shared_source is None:
+            if deposited_u:
+                pass  # U release deferred until the worker's wgrad job completes (K-2 sweep)
+            elif ctx.shared_source is None:
                 manager.release_cpu(u_handle)
             else:
                 ctx.shared_source.release()

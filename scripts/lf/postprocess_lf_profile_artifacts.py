@@ -550,6 +550,11 @@ def _runtime_counters(profile: dict[str, Any]) -> dict[str, Any]:
         counters["fallback_reasons"] = {}
     elif not isinstance(fallback_reasons, dict):
         counters["fallback_reasons"] = _parse_fallback_reasons(str(fallback_reasons))
+    # P11 (placement.md): surface the placement_policy decision block in
+    # runtime_counters.json whenever the source profile carries one.
+    placement = profile.get("placement_policy")
+    if isinstance(placement, dict) and placement:
+        counters["placement_policy"] = placement
     return counters
 
 
