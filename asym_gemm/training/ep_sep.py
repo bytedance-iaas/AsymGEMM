@@ -1,12 +1,17 @@
 """S6 TRUE sEP (fix_gb200_ep.md S6): union expert-work sharing over the shared
 pinned fabric. TWO flavors share every line of transport (NAMING EPOCH 2026-07-10):
-  queue (asym_sepqueue2, ASYM_EP_SEP_MODE=queue, default) — side 0 pops the union
+  queue (asym_sepqueue2, ASYM_EP_SEP_MODE=queue) — side 0 pops the union
         front, side 1 the back, on a SHARED counter block; the meet point IS the
         split (dynamic, needs no counts).
-  plan  (asym_sepplan2, ASYM_EP_SEP_MODE=plan) — the split is COMPUTED from the
-        union counts (contiguous cut at a segment boundary, both ranks derive it
-        identically); each side launches only its sublist with a PRIVATE counter
-        block, then fabricates the meet point so spin_gather is unchanged.
+  plan  (asym_sepplan2, ASYM_EP_SEP_MODE=plan, DEFAULT since 2026-07-23) — the
+        split is COMPUTED from the union counts (contiguous cut at a segment
+        boundary, both ranks derive it identically); each side launches only its
+        sublist with a PRIVATE counter block, then fabricates the meet point so
+        spin_gather is unchanged. Default flipped queue->plan on the ep_balance
+        microbenchmarks: plan wins from skew z~1.5 up on all three Qwen models
+        (Qwen3.5-122B expert GEMM @z=1.5: 31.2 ms plan vs 39.0 queue vs 42.8
+        sDP; Qwen3-30B @z=2.0: 15.2 vs 18.2), ties at low skew, and only
+        Llama-4-Scout prefers queue -- a model where neither flavor beats sDP.
 
 Per armed grouped launch, BOTH ranks execute ONE union work list (side 0 pops from
 the front, side 1 from the back — the ep_steal kernel family):
@@ -46,7 +51,7 @@ _SPIN_TIMEOUT_S = float(os.environ.get("ASYM_EP_SEP_SPIN_TIMEOUT_S", "120") or 1
 # NAMING EPOCH 2026-07-10 (fix_gb200_ep_v2): backend asym_sepqueue2 -> mode "queue"
 # (counter-raced steal — the original S6 flavor); asym_sepplan2 -> mode "plan"
 # (same union/transport, the cut COMPUTED from counts; no racing).
-_MODE = os.environ.get("ASYM_EP_SEP_MODE", "queue") or "queue"
+_MODE = os.environ.get("ASYM_EP_SEP_MODE", "plan") or "plan"
 if _ENABLED and _MODE not in ("queue", "plan"):
     raise RuntimeError(f"ASYM_EP_SEP_MODE must be 'queue' or 'plan', got '{_MODE}'")
 
