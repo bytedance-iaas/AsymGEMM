@@ -153,6 +153,7 @@ class AsymExecutionStats:
     qwen3_moe_finegrained_nograd_forward_calls: int = 0
     qwen3_moe_finegrained_backward_calls: int = 0
     qwen3_moe_finegrained_gate_base_calls: int = 0
+    qwen3_moe_finegrained_blocked_cpu_act_calls: int = 0
     qwen3_moe_finegrained_up_base_calls: int = 0
     qwen3_moe_finegrained_down_base_calls: int = 0
     qwen3_moe_finegrained_stage_concat_columns_calls: int = 0

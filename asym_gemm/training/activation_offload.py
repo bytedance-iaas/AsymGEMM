@@ -437,6 +437,11 @@ class ActivationOffloadManager:
         self._active_cpu_bytes: dict[int, tuple[int, str]] = {}
         self._active_stage_bytes: dict[int, tuple[int, str]] = {}
         self._pending_cpu_ready_events: dict[int, torch.cuda.Event] = {}
+        # blocked-CPU-act (toconfirm #1 salvage): handles whose CPU bytes are
+        # produced by a cpu_worker task instead of a D2H. Consumers must
+        # host-wait the task before reading handle.tensor; release must wait
+        # too (a running task would write into a recycled pool buffer).
+        self._pending_cpu_tasks: dict[int, object] = {}
 
     def empty_cpu(
         self,
@@ -539,7 +544,25 @@ class ActivationOffloadManager:
             _GOV.on_offload(self, handle)
         return handle
 
+    def attach_cpu_task(self, handle: CPUActivationHandle, task: object) -> None:
+        """Register a cpu_worker task as a PRODUCER of handle.tensor's bytes
+        (frozen dataclass ⇒ registry keyed by data_ptr, like the ready events).
+        May be called several times per handle (per-block pipeline jobs) — the
+        registry keeps a list; the first consumer joins them all."""
+        self._pending_cpu_tasks.setdefault(int(handle.tensor.data_ptr()), []).append(task)
+
+    def _wait_cpu_task(self, handle: "CPUActivationHandle | None") -> None:
+        if handle is None or not self._pending_cpu_tasks:
+            return
+        tasks = self._pending_cpu_tasks.pop(int(handle.tensor.data_ptr()), None)
+        if tasks:
+            from . import cpu_worker
+
+            for task in tasks:
+                cpu_worker.wait(task)
+
     def wait_cpu_ready(self, handle: CPUActivationHandle | None) -> None:
+        self._wait_cpu_task(handle)
         if handle is None:
             return
         if _GOV is not None:
@@ -565,6 +588,7 @@ class ActivationOffloadManager:
         device-side waiter (wait_cpu_ready pops it), falls back to synchronizing
         the original device's current stream — the D2H was enqueued there, so
         the wait is bounded by already-queued work, never by future work."""
+        self._wait_cpu_task(handle)
         if handle is None:
             return
         if _GOV is not None:
@@ -589,6 +613,7 @@ class ActivationOffloadManager:
         host reads prefer wait_cpu_ready_host (get-not-pop + fallback)."""
         if handle is None:
             return None
+        self._wait_cpu_task(handle)
         if _GOV is not None:
             _GOV.ensure_local(handle)
         return self._pending_cpu_ready_events.pop(int(handle.tensor.data_ptr()), None)
@@ -695,6 +720,7 @@ class ActivationOffloadManager:
         consumer calls stage_commit(stage, done) at use time (per-tensor event).
         The copy is ordered after the producing D2H via the handle's ready event
         and after currently-enqueued compute (stage-buffer reuse safety)."""
+        self._wait_cpu_task(handle)
         stage_tag = handle.tag if tag is None else tag
         shape = tuple(int(dim) for dim in handle.tensor.shape)
         key = (str(handle.original_device), handle.tensor.dtype, shape, stage_tag)
@@ -824,6 +850,7 @@ class ActivationOffloadManager:
     def _pop_active(self, handle: CPUActivationHandle) -> None:
         """Governor-only: drop cpu-owned accounting for the handle's CURRENT data_ptr WITHOUT pool
         return, and drop the stale D2H event for that ptr (mirrors release_cpu's stat decrements)."""
+        self._wait_cpu_task(handle)
         ptr = int(handle.tensor.data_ptr())
         self._pending_cpu_ready_events.pop(ptr, None)
         entry = self._active_cpu_bytes.pop(ptr, None)

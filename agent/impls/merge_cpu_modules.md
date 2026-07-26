@@ -447,6 +447,28 @@ push to Kevin's explicit call (or his gbackup habit). Update memory notes.
   note, allocated ≤ baseline+0). Two policy-gate fixes landed during
   S6 (dense-T2 qknorm 03a43e7, keep-dgrads P2 5d39762) + prefetch floor
   32 (738aa70) + record_stream cleanup (23a2efc) — zero recipe forks.
+- [SALVAGE toconfirm#1 2026-07-25] Blocked CPU-act implemented (commit
+  pending): per-block worker jobs rebuild act_cpu = fused_silu_mul(gate_cpu,
+  up_cpu) — act D2H dropped; manager task-registry (attach_cpu_task +
+  central _wait_cpu_task preludes at wait/stage/take/release) per the
+  consumer audit (all sites covered, zero local patches; deadline = the
+  same-forward stage(act) for down_base — hence per-block pipelining).
+  Gates: micro-test PASS (1-ulp vs GPU ref through stage+release);
+  32k-b8 A/B: engagement real (240 calls / 720 jobs), loss parity 0.48%,
+  peak −0.9 GiB, throughput NEUTRAL +0.28% (act D2H already hidden at
+  this row). Deep probe running: M8 cfg + cap override (the saturated-
+  D2H regime where the 470 GB/step saving could show). NB the 8k SMOKE
+  cannot exercise this feature (moefg0 at that scale — fg engine off).
+- [SALVAGE CLOSED 2026-07-25 — NEGATIVE, kept default-off] Deep probe
+  (M8 cfg + caps overridden): 577 vs 582 (−0.9%), engaged 144/1440;
+  peak 104.6 vs 120.3 (−15.7 GiB). With 32k neutral (+0.28%): the act
+  D2H is fully overlapped in EVERY regime here — its removal buys only
+  reserved-memory headroom while worker occupancy costs ~1%. Thesis
+  refinement for the paper: a CPU placement wins only when the transfer
+  it removes is EXPOSED, not merely present. Code stays (default-off,
+  measured-NULL rule); the manager task-registry machinery
+  (attach_cpu_task/_wait_cpu_task) is general and stays for future
+  worker-produced handles. toconfirm #1 → ❌ disproven on this tree.
 - [S2 BUILD 2026-07-22] _C rebuilt in-container with -fopenmp + SVE-BF16
   march: cpu_ops_sve_compiled()=True, all 8 symbols present. Bench --final
   sanity vs donor table: swiglu fwd 44.3 ms@32k (donor 44.8 ✓), bwd 60.1

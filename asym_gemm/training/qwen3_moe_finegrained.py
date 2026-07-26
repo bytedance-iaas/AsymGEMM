@@ -430,6 +430,16 @@ def _cpu_act_fits(rows: int, nbytes: int) -> bool:
     return int(rows) <= _fg_cpu_act_max_rows() and int(nbytes) <= _cpu_act_max_bytes()
 
 
+def _fg_blocked_cpu_act_enabled() -> bool:
+    """toconfirm.md #1 salvage (2026-07-25): on the BLOCKED forward, keep the GPU
+    silu·mul for the forward's own use but DROP the act D2H — a cpu_worker task
+    rebuilds act_cpu = fused_silu_mul(gate_cpu, up_cpu) from the copies that
+    already landed for backward. Kills 1 of 3 blocked-forward D2H streams
+    ([R,I] bf16 per layer) entirely off the critical path (window = fwd→bwd).
+    Default OFF; A/B via this env, policy adoption only after the gate wins."""
+    return _env_flag_default_off("ASYMM_QWEN3_MOE_FG_BLOCKED_CPU_ACT")
+
+
 def _grouped_da_gpu(
     layer: "AsymQwen3Experts",
     d_s: torch.Tensor,
@@ -1136,6 +1146,17 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     (total_rows, int(down_lora_A.shape[1])), device=hidden_states.device, dtype=down_lora_A.dtype
                 )
                 blocked_nb = bool(gate_cpu.tensor.is_pinned())
+                _blk_fused = None
+                if (
+                    _fg_blocked_cpu_act_enabled()
+                    and blocked_nb
+                    and act_cpu.tensor.is_pinned()
+                    and up_cpu.tensor.is_pinned()
+                    and cpu_worker.enabled()
+                    and cpu_ops.fused_silu_applicable(gate_cpu.tensor, up_cpu.tensor, act_cpu.tensor)
+                    and _cpu_act_fits(int(gate_cpu.tensor.shape[0]), int(gate_cpu.tensor.numel()) * 2)
+                ):
+                    _blk_fused = cpu_ops.fused_silu_kernels()
                 for row_start, row_end, block_offsets, block_experts_t, row_slice in fwd_blocks:
                     block_metadata = prepare_grouped_lora_metadata(block_offsets, block_experts_t, dense_experts=True)
                     packed_block = hidden_states.index_select(
@@ -1163,13 +1184,32 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     del packed_block, s_gate, s_up
                     F.silu(gate_blk, inplace=True)
                     gate_blk.mul_(up_blk)
-                    act_cpu.tensor[row_slice].copy_(gate_blk.to(dtype=torch.bfloat16), non_blocking=blocked_nb)
+                    if _blk_fused is None:
+                        act_cpu.tensor[row_slice].copy_(gate_blk.to(dtype=torch.bfloat16), non_blocking=blocked_nb)
+                    else:
+                        # per-block pipeline: CPU rebuilds this block's act from the
+                        # gate/up copies (enqueued above on this stream) while the
+                        # GPU proceeds to the next block; deadline = the same-forward
+                        # stage(act_cpu) for down_base (audit site :1588).
+                        _blk_ev = torch.cuda.Event()
+                        _blk_ev.record(torch.cuda.current_stream(hidden_states.device))
+                        _g_b = gate_cpu.tensor[row_slice]
+                        _u_b = up_cpu.tensor[row_slice]
+                        _a_b = act_cpu.tensor[row_slice]
+
+                        def _blk_act_job(ev=_blk_ev, g=_g_b, u=_u_b, o=_a_b, k=_blk_fused[0], n=_blk_fused[2]):
+                            ev.synchronize()  # host wait: this block's gate/up D2H done
+                            k(g, u, o, n)
+
+                        manager.attach_cpu_task(act_cpu, cpu_worker.submit(_blk_act_job, tag="moe.blocked_silu_fwd"))
                     s_down = _lora_a_forward_gpu(layer, gate_blk, down_lora_A, block_offsets, block_experts_t, block_metadata)
                     down_low_rank[row_slice].copy_(s_down)
                     del gate_blk, up_blk, s_down
                 manager.record_cpu_ready(gate_cpu)
                 manager.record_cpu_ready(up_cpu)
                 manager.record_cpu_ready(act_cpu)
+                if _blk_fused is not None:
+                    layer.stats.qwen3_moe_finegrained_blocked_cpu_act_calls += 1
                 gate_low_rank_cpu = manager.offload(gate_low_rank, "moe.S_gate")
                 up_low_rank_cpu = manager.offload(up_low_rank, "moe.S_up")
                 del gate_low_rank, up_low_rank
