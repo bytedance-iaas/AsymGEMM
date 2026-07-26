@@ -20,4 +20,8 @@ KA120="ASYM_GEMM_DISPATCH=staged ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM=1 ASYMM_FG_ELE
 echo "=== Q6c M7 re-validate after record_stream fix (expect peak ~165.7, tok/s >= 2723) $(date -u +%H:%M:%S)"
 env $POL $KA120 MAX_SAMPLES=1024 bash scripts/lf/tp_probe.sh q3-30b-a3b cpum7f "asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1" 120000 8
 echo "Q6C_EXIT=$?"
+PINS="ASYMM_QWEN3_MOE_FG_LORA_A_FWD_GPU=1 ASYMM_QWEN3_MOE_FG_DA_GPU=1 ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=0 ASYMM_FG_ELEMENTWISE_CHUNK_MB=1024 ASYMM_QWEN3_MOE_DOWN_DX_STAGED=1 ASYMM_QWEN3_MOE_FG_KEEP_DGRADS_HBM=1"
+echo "=== Q6d M8 with record_stream fix (574/574 pre-fix; PASS bar 575.2; Q5 bisect only if this fails) $(date -u +%H:%M:%S)"
+env $POL ASYM_GEMM_DISPATCH=staged $PINS MAX_SAMPLES=1024 bash scripts/lf/tp_probe.sh q3-30b-a3b cpum8f "asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1" 800000 1
+echo "Q6D_EXIT=$?"
 echo "=== CPU-Q6 DONE $(date -u +%H:%M:%S)"

@@ -1,0 +1,133 @@
+# Copyright (c) 2025 DeepSeek. Licensed under the MIT License.
+# Modified by Bytedance Inc., 2026.
+# Original: https://github.com/deepseek-ai/DeepGEMM
+
+import os
+import subprocess
+from pkgutil import extend_path
+
+import torch
+from packaging import version
+from torch.version import cuda as cuda_version
+
+__path__ = extend_path(__path__, __name__)
+
+# Set some default environment provided at setup
+try:
+    # noinspection PyUnresolvedReferences
+    from .envs import persistent_envs
+    for key, value in persistent_envs.items():
+        if key not in os.environ:
+            os.environ[key] = value
+except ImportError:
+    pass
+
+# CUDA extension and kernels (only available when built with CUDA)
+try:
+    from . import _C
+    from ._C import (
+        set_num_sms,
+        get_num_sms,
+        set_tc_util,
+        get_tc_util,
+        set_compile_mode,
+        get_compile_mode,
+    )
+
+    if version.parse(cuda_version) >= version.parse('12.1'):
+        def _maybe_import_from_C(names):
+            for name in names:
+                if hasattr(_C, name):
+                    globals()[name] = getattr(_C, name)
+
+        def _missing_kernel(kernel_name):
+            def _raise_missing(*args, **kwargs):
+                raise RuntimeError(
+                    f"`{kernel_name}` is not available in this build of asym_gemm. "
+                    "Rebuild with matching CUDA/architecture flags to enable this kernel."
+                )
+            return _raise_missing
+
+        # DeepGEMM Kernels (may vary by build flags / arch)
+        _maybe_import_from_C([
+            # FP8 GEMMs
+            "fp8_gemm_nt",
+            "k_grouped_fp8_gemm_nt_contiguous",
+            "m_grouped_fp8_asym_gemm_nt_masked",
+            "m_grouped_fp8_asym_gemm_nt_contiguous",
+            # FP4 GEMMs
+            "m_grouped_fp4_asym_gemm_nt_contiguous",
+            "m_grouped_fp4_asym_gemm_nt_masked",
+            # sEP queued grouped GEMM (gb200_ep.md E3)
+            "m_grouped_bf16_asym_gemm_nt_contiguous_ep_queued",
+            # sEP union-queue + steal grouped GEMM (fix_gb200_ep.md S2b)
+            "m_grouped_bf16_asym_gemm_nt_contiguous_ep_steal",
+            # BF16 GEMMs
+            "m_grouped_bf16_asym_gemm_nt_contiguous",
+            "m_grouped_bf16_asym_gemm_nt_masked",
+            "sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous",
+            "sm100_m_grouped_bf16_cpu_left_pair_asym_gemm_nt_contiguous",
+            "sm100_grouped_lora_a_grad_bf16_cpu_right",
+            "sm100_grouped_lora_a_pair_grad_bf16_cpu_right",
+            "sm100_grouped_lora_b_backward_bf16_cpu_source",
+            # Grace CPU fused ops (agent/impls/cpu_compute.md Stage 1)
+            "cpu_fused_silu_mul_bf16",
+            "cpu_silu_bf16",
+            "cpu_mul_bf16_",
+            "cpu_fused_silu_backward_bf16",
+            "cpu_grouped_lora_a_grad_bf16",
+            "cpu_ops_sve_compiled",
+            "cpu_widen_bf16_sqsum",
+            "cpu_rmsnorm_bf16",
+            # Qwen3 selected-recompute backward
+            "qwen3_gate_up_recompute_bwd_sm100_bf16_windowed",
+            "qwen3_moe_bf16_down_forward_scatter_add_",
+            "qwen3_moe_bf16_down_dx_gather_left_",
+            "qwen3_moe_bf16_gateup_dx_scatter_add_",
+            # Dropout mask helpers
+            "pack_bool_mask_2d",
+            "unpack_bool_mask_2d",
+            "apply_packed_dropout",
+            "apply_packed_dropout_",
+            # SM80 MoE GEMM (FP16 + BF16, JIT)
+            "m_grouped_moe_gemm_nt_contiguous",
+            # SM89 FP8 MoE GEMM (native FP8 MMA, JIT)
+            "m_grouped_fp8_asym_gemm_sm89",
+            "m_grouped_fp8_asym_gemm_sm89_masked",
+            # Einsum kernels
+            "einsum",
+            "fp8_einsum",
+            # Attention kernels
+            "fp8_mqa_logits",
+            "get_paged_mqa_logits_metadata",
+            "fp8_paged_mqa_logits",
+            # Layout kernels
+            "transform_sf_into_required_layout",
+            "get_mk_alignment_for_contiguous_layout",
+        ])
+
+    # Initialize CPP modules
+    def _find_cuda_home() -> str:
+        cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
+        if cuda_home is None:
+            try:
+                with open(os.devnull, 'w') as devnull:
+                    nvcc = subprocess.check_output(['which', 'nvcc'], stderr=devnull).decode().rstrip('\r\n')
+                    cuda_home = os.path.dirname(os.path.dirname(nvcc))
+            except Exception:
+                cuda_home = '/usr/local/cuda'
+                if not os.path.exists(cuda_home):
+                    cuda_home = None
+        assert cuda_home is not None
+        return cuda_home
+
+    _C.init(
+        os.path.dirname(os.path.abspath(__file__)),
+        _find_cuda_home()
+    )
+except ImportError:
+    import warnings
+    warnings.warn("CUDA extension (_C) not available. CUDA kernels will not be accessible.")
+
+from importlib.metadata import version as _get_version
+__version__ = _get_version('asym_gemm')

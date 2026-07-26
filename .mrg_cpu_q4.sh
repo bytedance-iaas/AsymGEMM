@@ -46,4 +46,8 @@ KA120="ASYM_GEMM_DISPATCH=staged ASYMM_QWEN3_MOE_FG_KEEP_ACTS_HBM=1 ASYMM_FG_ELE
 echo "=== Q4e M7 rerun with 32GB prefetch floor (base 2762/165.7; pass1 2672/176.7) $(date -u +%H:%M:%S)"
 env $POL $KA120 MAX_SAMPLES=1024 bash scripts/lf/tp_probe.sh q3-30b-a3b cpum7r "asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1" 120000 8
 echo "Q4E_EXIT=$?"
+PINS="ASYMM_QWEN3_MOE_FG_LORA_A_FWD_GPU=1 ASYMM_QWEN3_MOE_FG_DA_GPU=1 ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=0 ASYMM_FG_ELEMENTWISE_CHUNK_MB=1024 ASYMM_QWEN3_MOE_DOWN_DX_STAGED=1 ASYMM_QWEN3_MOE_FG_KEEP_DGRADS_HBM=1"
+echo "=== Q4f M8 retry (base 584/110.4; pass1 574 = -1.8%, M9 in-band => day-noise check; Q5 bisect only if this breaches too) $(date -u +%H:%M:%S)"
+env $POL ASYM_GEMM_DISPATCH=staged $PINS MAX_SAMPLES=1024 bash scripts/lf/tp_probe.sh q3-30b-a3b cpum8r "asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0|ligerloss1" 800000 1
+echo "Q4F_EXIT=$?"
 echo "=== CPU-Q4 DONE $(date -u +%H:%M:%S)"
