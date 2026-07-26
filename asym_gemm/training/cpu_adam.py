@@ -8,6 +8,7 @@ from typing import Any, Callable, Literal, Sequence
 
 import torch
 
+from .exact_pinned import exact_pinned_enabled, register_inplace
 from .lora import _is_lora_parameter_name
 
 
@@ -36,6 +37,11 @@ def _tensor_view_key(param: torch.Tensor) -> tuple[str, int, int, tuple[int, ...
 def _pin_if_requested(tensor: torch.Tensor, *, pin_memory: bool) -> tuple[torch.Tensor, str | None]:
     if not pin_memory or not torch.cuda.is_available() or tensor.is_pinned():
         return tensor, None
+    if exact_pinned_enabled():
+        # capacity fix 2026-07-25: contiguous CPU tensors page-lock in place at
+        # exact size (exact_pinned.py); pow2-bucketed pin_memory() is the fallback.
+        if tensor.is_contiguous() and register_inplace(tensor) is None:
+            return tensor, None
     try:
         return tensor.pin_memory(), None
     except RuntimeError as exc:

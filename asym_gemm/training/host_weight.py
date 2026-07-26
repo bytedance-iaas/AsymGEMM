@@ -137,6 +137,9 @@ def _cpu_socket_for_numa_node(numa_node: int | None) -> int | None:
         return None
 
 
+from .exact_pinned import exact_pinned_enabled, register_inplace
+
+
 def _make_metadata(tensor: torch.Tensor, pin_error: str | None = None) -> HostWeightMetadata:
     data_ptr = tensor.data_ptr()
     numa_node = _numa_node_for_address(data_ptr)
@@ -235,10 +238,17 @@ class HostWeight:
                 self._fabric_bank = True
             else:
                 pin_start = time.perf_counter()
-                try:
-                    cpu_tensor = cpu_tensor.pin_memory()
-                except RuntimeError as exc:
-                    pin_error = str(exc)
+                exact_err: str | None = "disabled"
+                if exact_pinned_enabled():
+                    # capacity fix 2026-07-25: page-lock the exact-size clone in
+                    # place instead of pin_memory()'s pow2-bucketed copy (see
+                    # exact_pinned.py). Failure falls through to the stock path.
+                    exact_err = register_inplace(cpu_tensor)
+                if exact_err is not None:
+                    try:
+                        cpu_tensor = cpu_tensor.pin_memory()
+                    except RuntimeError as exc:
+                        pin_error = str(exc)
                 pin_seconds = time.perf_counter() - pin_start
 
         self._tensor = cpu_tensor
