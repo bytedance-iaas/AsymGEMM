@@ -4,8 +4,12 @@ over REAL recorded routing, two processes, real bank shapes, tuned-alpha injecti
 MODES (the policy A/B/C/D; transport identical — every rank holds the union A
 locally and B streams from the same pinned host bank — so walls isolate the
 ASSIGNMENT POLICY + its bank-streaming footprint):
-  owned : rank r executes exactly experts [r*E/2,(r+1)*E/2)'s segments (fixed
-          ownership — the classic-EP disease rung).
+  owned : rank r executes exactly experts [r*E/2,(r+1)*E/2)'s ROWS (fixed
+          ownership — the classic-EP disease rung), then the same local
+          grid-fill chunking every placed mode gets. Ownership is the policy;
+          the chunking is a kernel-shape courtesy, so charging EP the queue's
+          8192-row sharing grain (pre-2026-07-26) inflated its bank reads by
+          up to 2.4x against DP/sEP's grid-aware tiling — a harness artifact.
   sdp   : rank r executes its OWN HALF of every expert's rows over ALL experts
           (production shared-bank streaming DP shape).
   sep   : chunked-LPT planner over the UNION counts assigns whole experts (mega
@@ -159,6 +163,20 @@ def chunk_segments(counts: list[int], n_blk_min: int = 1,
             segs.append((e, start, start + take))
             start += take
             c -= take
+    return segs
+
+
+def owned_segments(counts: list[int], rank: int) -> list[tuple[int, int, int]]:
+    """Static EP: the rank's own half of the experts, whole (one segment each).
+    Ownership alone — the caller applies the same _chunk_local grid-fill tiling
+    that sdp/plan get, so modes differ by ASSIGNMENT, not by sharing grain."""
+    lo_e, hi_e = (0, E // 2) if rank == 0 else (E // 2, E)
+    segs, acc = [], 0
+    for e in range(E):
+        c, start = counts[e], acc
+        acc += c
+        if lo_e <= e < hi_e and c > 0:
+            segs.append((e, start, start + c))
     return segs
 
 
@@ -345,7 +363,6 @@ def child_main(args) -> int:
                 ws_down = torch.randn(K, SHARED_N, device=dev, dtype=torch.bfloat16) * 0.02
         counters = base[ALIGN * (1 + ci): ALIGN * (1 + ci) + 144].view(torch.int32)
 
-        own_lo, own_hi = (0, E // 2) if rank == 0 else (E // 2, E)
         _stages_for_scope = gemm_stages[:1] if scope == "gemm" else gemm_stages
         _n_blk_min = min((n_out + 63) // 64 for _, _, _, n_out in _stages_for_scope)
         _pieces = max(1, -(-296 // _n_blk_min))
@@ -385,7 +402,7 @@ def child_main(args) -> int:
             return out
 
         seg_sets = {
-            "owned": _chunk_local([s for s in segs_all if own_lo <= s[0] < own_hi]),
+            "owned": _chunk_local(owned_segments(counts, rank)),
             "owned_smart": _chunk_local(owned_smart_segments(counts, rank)),
             "sdp": _chunk_local(sdp_segments(counts, rank)),
             "plan": _chunk_local(sep_planner_segments(counts, rank)),
