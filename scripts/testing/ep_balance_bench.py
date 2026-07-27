@@ -245,15 +245,16 @@ def sep_planner_segments(counts: list[int], rank: int) -> list[tuple[int, int, i
         c = counts[e]
         if c <= 0:
             continue
-        if c > target:  # mega-expert: keep target rows whole, spill the excess chunked
+        if c > target:
+            # mega-expert: keep target rows whole and emit the excess as ONE item.
+            # It needs no sub-chunking to balance: bin 0 takes exactly half, so the
+            # spill always lands with the remaining experts in bin 1 whatever its
+            # granularity. Slicing it at HOT_CHUNK (pre-2026-07-27) re-read the same
+            # bank ~69x at z=2.0 — the assignment-vs-grain confusion cured for
+            # `owned` above. _chunk_local grid-tiles it downstream like every
+            # other segment.
             items.append((int(target), e, starts[e]))
-            spill_lo = starts[e] + int(target)
-            spill = c - int(target)
-            while spill > 0:
-                take = min(spill, HOT_CHUNK)
-                items.append((take, e, spill_lo))
-                spill_lo += take
-                spill -= take
+            items.append((c - int(target), e, starts[e] + int(target)))
         else:
             items.append((c, e, starts[e]))
     loads = [0, 0]
