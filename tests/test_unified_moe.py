@@ -1,6 +1,6 @@
 """asym_gemm.unified_moe parity + pinned-residency tests (§9.1 of docs/unified_moe.md).
 
-Runs seven tests:
+Runs nine tests:
     1. test_cpu_vs_fp32              CPU bucket vs FP32 reference (≤ 4% scale-rel, cos ≥ 0.999)
     2. test_gpu_vs_fp32              GPU bucket vs FP32 reference (≤ 4% scale-rel, cos ≥ 0.999)
     3. test_cpu_vs_gpu_single_expert The headline INT8 parity (CPU == GPU bit-exact typical)
@@ -8,6 +8,8 @@ Runs seven tests:
     5. test_mixed_bucket_parity      mid-range m_cpu vs all-CPU (≤ 1.5%)
     6. test_pinned_weight_pointer_identity  GPU reads pinned host weights, no VRAM mirror
     7. test_no_vram_weight_residency        VRAM delta after Layer construction ≈ SFB only
+    8. test_cache_refresh_correctness       update_gpu_cache output-invariance + slot bookkeeping
+    9. test_cache_refresh_stress            repeated random cache swaps vs an all-CPU reference
 
 Designed to run two ways (AsymGEMM convention):
     python tests/test_unified_moe.py          # used by scripts/test.sh
@@ -18,6 +20,7 @@ hosts that don't have both halves of the unified kernel.
 """
 from __future__ import annotations
 
+import os
 import sys
 
 import numpy as np
@@ -443,6 +446,103 @@ def test_no_vram_weight_residency():
     assert layer.gpu_backend == "asym_gemm_sm90_int8_1d1d"
 
 
+# --------------------------------------------------------------------------- #
+# Phase-1 live cache-refresh tests (Layer.update_gpu_cache / refresh_gpu_caches).
+#
+# Caching is a compute-location optimization only: which experts happen to be
+# VRAM-resident must never change the numerical output for a fixed
+# (x, expert_ids, route_w). These tests build a Layer with a real VRAM cache
+# (ASYMGEMM_GPU_CACHED_EXPERTS, set only for the duration of construction —
+# always restored, so later tests in this file/session are unaffected) and
+# exercise update_gpu_cache directly, bypassing the cadence gate.
+# --------------------------------------------------------------------------- #
+
+def _layer_with_cache(gate, up, down, *, top_k, cache_n, m_cpu=0):
+    prev = os.environ.get("ASYMGEMM_GPU_CACHED_EXPERTS")
+    os.environ["ASYMGEMM_GPU_CACHED_EXPERTS"] = str(cache_n)
+    try:
+        return Layer.from_bf16(gate, up, down, top_k=top_k, cpu_threads=8,
+                               m_cpu=m_cpu)
+    finally:
+        if prev is None:
+            os.environ.pop("ASYMGEMM_GPU_CACHED_EXPERTS", None)
+        else:
+            os.environ["ASYMGEMM_GPU_CACHED_EXPERTS"] = prev
+
+
+def test_cache_refresh_correctness():
+    """update_gpu_cache must (a) leave output unchanged for identical inputs
+    regardless of which experts are cached, (b) keep cached_slot/_slot_np/
+    _cached_mask_np mutually consistent, and (c) be a no-op when the target
+    set is unchanged."""
+    torch.manual_seed(13)
+    G, H, I, top_k = 8, 256, 512, 2
+    gate = torch.randn(G, I, H, dtype=torch.bfloat16) * 0.07
+    up   = torch.randn(G, I, H, dtype=torch.bfloat16) * 0.07
+    down = torch.randn(G, H, I, dtype=torch.bfloat16) * 0.05
+    layer = _layer_with_cache(gate, up, down, top_k=top_k, cache_n=3)
+    assert layer.cache_n == 3
+    assert sorted(int(i) for i in np.nonzero(layer._slot_np >= 0)[0]) == [0, 1, 2]
+
+    T = 64
+    x_cpu = torch.randn(T, H, dtype=torch.bfloat16)
+    expert_ids = unique_topk_routing(T, G, top_k)
+    route_w    = torch.softmax(torch.randn(T, top_k), dim=-1).float()
+
+    y_before = layer.forward(x_cpu.to("cuda"), expert_ids.cuda(),
+                             route_w.cuda()).cpu()
+
+    changed = layer.update_gpu_cache([5, 6, 7])
+    assert changed, "update_gpu_cache to a disjoint set should report a change"
+    assert sorted(int(i) for i in np.nonzero(layer._slot_np >= 0)[0]) == [5, 6, 7]
+    cached_slot_cpu = layer.cached_slot.cpu().numpy()
+    assert np.array_equal((cached_slot_cpu >= 0), layer._cached_mask_np)
+    assert np.array_equal(cached_slot_cpu, layer._slot_np)
+
+    y_after = layer.forward(x_cpu.to("cuda"), expert_ids.cuda(),
+                            route_w.cuda()).cpu()
+    r = scale_rel(y_after, y_before)
+    print(f"  [test_cache_refresh_correctness] disjoint-swap scale_rel={r:.3e}")
+    assert r <= 1.5e-2, f"cache-swap scale_rel {r:.3e} > 1.5e-2"
+
+    assert layer.update_gpu_cache([5, 6, 7]) is False, \
+        "re-applying the same cache set must be a no-op"
+
+
+def test_cache_refresh_stress():
+    """20 cycles of random cache-set swaps; each cycle's output must track a
+    fixed all-CPU reference layer built from the same weights."""
+    torch.manual_seed(14)
+    G, H, I, top_k = 16, 256, 512, 2
+    gate = torch.randn(G, I, H, dtype=torch.bfloat16) * 0.07
+    up   = torch.randn(G, I, H, dtype=torch.bfloat16) * 0.07
+    down = torch.randn(G, H, I, dtype=torch.bfloat16) * 0.05
+
+    layer = _layer_with_cache(gate, up, down, top_k=top_k, cache_n=4)
+    ref = Layer.from_bf16(gate, up, down, top_k=top_k, cpu_threads=8,
+                          m_cpu=10**9)
+
+    rng = np.random.default_rng(0)
+    T = 48
+    for cycle in range(20):
+        subset = rng.choice(G, size=4, replace=False).tolist()
+        layer.update_gpu_cache(subset)
+
+        x_cpu = torch.randn(T, H, dtype=torch.bfloat16)
+        expert_ids = unique_topk_routing(T, G, top_k)
+        route_w    = torch.softmax(torch.randn(T, top_k), dim=-1).float()
+
+        y = layer.forward(x_cpu.to("cuda"), expert_ids.cuda(),
+                          route_w.cuda()).cpu()
+        y_ref = ref.forward(x_cpu, expert_ids, route_w)
+
+        assert torch.isfinite(y.float()).all(), f"cycle {cycle}: non-finite output"
+        r = scale_rel(y, y_ref)
+        assert r <= 4e-2, f"cycle {cycle}: scale_rel {r:.3e} > 4e-2 (subset={subset})"
+    print(f"  [test_cache_refresh_stress] 20 cycles vs all-CPU reference: OK "
+          f"(last scale_rel={r:.3e})")
+
+
 # -- Self-run convention (AsymGEMM scripts/test.sh runs `python <file>`) ----
 
 if __name__ == "__main__":
@@ -457,4 +557,6 @@ if __name__ == "__main__":
     test_adaptive_mixed_split_parity()
     test_pinned_weight_pointer_identity()
     test_no_vram_weight_residency()
+    test_cache_refresh_correctness()
+    test_cache_refresh_stress()
     print("All unified_moe parity + pinned-residency tests passed.")

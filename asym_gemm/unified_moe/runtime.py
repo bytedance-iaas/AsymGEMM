@@ -420,6 +420,18 @@ class ExpertSlab:
         rows = [a[i] if i < self.g_split else b[i - self.g_split] for i in ids]
         return torch.stack(rows)
 
+    def expert_row(self, name: str, i: int) -> torch.Tensor:
+        """One expert's slice of `name` as a **view** into pinned host memory
+        (split-aware). Unlike expert_rows this never copies or stacks, so the
+        result is a valid source for a true async H2D DMA — see
+        Layer.update_gpu_cache, where staging through a torch.cat'd (and
+        therefore pageable) temporary cost ~10x the bandwidth."""
+        b = getattr(self, name + "_b")
+        a = getattr(self, name)
+        if b is None or i < self.g_split:
+            return a[i]
+        return b[i - self.g_split]
+
 
 # ---------------------------------------------------------------------------
 # Layer
@@ -572,6 +584,90 @@ class Layer:
                     "AsymGEMM: failed to load expert stats from %s (%s); "
                     "caching experts 0..%d", path, e, n - 1)
         return list(range(n))
+
+    def update_gpu_cache(self, new_expert_ids) -> bool:
+        """Replace the VRAM cache's residents with `new_expert_ids` (a target
+        set — order does not matter, slot assignment for kept experts is
+        preserved).
+
+        Diffs against the currently-cached ids (self._slot_np) and rewrites
+        ONLY the slots whose resident actually changes, via in-place
+        index_copy_/index_fill_ into the SAME tensor objects _build_gpu_cache
+        allocated — never reassigns them. This matters for CUDA-graph replay
+        safety: capturable.py reads cached_slot's live contents fresh on
+        every replay (it is looked up as an ordinary tensor inside the
+        captured region, not baked in as a capture-time constant), so
+        swapping in a new tensor object would leave a captured graph
+        pointing at stale/freed memory, while in-place content mutation is
+        picked up correctly.
+
+        Caller is responsible for cadence gating and for not calling this
+        during CUDA graph capture (see refresh_gpu_caches). Returns True iff
+        anything was actually copied.
+        """
+        G = self.slab.num_experts
+        if self.cache_n <= 0 or self.cache_n >= G:
+            return False  # no cache, or already fully cached: nothing to do
+        new_set = set(int(i) for i in new_expert_ids)
+        cur_ids = np.nonzero(self._slot_np >= 0)[0].tolist()
+        cur_set = set(cur_ids)
+        added = sorted(new_set - cur_set)
+        if not added:
+            return False  # identical residency (or new_set already a subset)
+        evicted = sorted(cur_set - new_set)
+        # |added| may exceed the number of evictable slots if new_set has
+        # fewer distinct entries than cache_n; only evict as many as we have
+        # replacements for, keeping the rest of the cache warm rather than
+        # blanking slots we can't refill this round.
+        evicted = evicted[: len(added)]
+        added = added[: len(evicted)]
+        if not added:
+            return False
+
+        s = self.slab
+        dev = self.cached_slot.device
+        slots = [int(self._slot_np[e]) for e in evicted]
+        slots_t = torch.tensor(slots, dtype=torch.int64, device=dev)
+        added_t = torch.tensor(added, dtype=torch.int64, device=dev)
+        evicted_t = torch.tensor(evicted, dtype=torch.int64, device=dev)
+        I = s.inter
+
+        # INT8 weights: copy each expert's pinned slice STRAIGHT into its
+        # destination slot. The obvious vectorized form —
+        #   torch.cat((expert_rows(gate), expert_rows(up)), 1).to(dev)
+        # — gathers, concatenates into a fresh *pageable* host tensor, and so
+        # the H2D stages through a bounce buffer: measured 3.2 GB/s vs 36.8
+        # GB/s for these per-expert DMAs off the already-pinned slab (11x, and
+        # ~1039ms -> ~92ms for a full 48-layer refresh at Qwen3-30B-A3B
+        # shapes). The Python loop is over at most cache_n experts and is
+        # nowhere near the cost of the bytes it moves.
+        for e, sl in zip(added, slots):
+            self.cache_gateup_int8[sl, :I].copy_(
+                s.expert_row("gate_int8", e), non_blocking=True)
+            self.cache_gateup_int8[sl, I:].copy_(
+                s.expert_row("up_int8", e), non_blocking=True)
+            self.cache_down_int8[sl].copy_(
+                s.expert_row("down_int8", e), non_blocking=True)
+
+        # SFBs are already device-resident, so these are D2D gathers — the
+        # vectorized form is right here.
+        gu_sfb = torch.cat(
+            (s.gate_sfb.index_select(0, added_t),
+             s.up_sfb.index_select(0, added_t)), dim=1,
+        ).contiguous()
+        self.cache_gateup_sfb.index_copy_(0, slots_t, gu_sfb)
+        self.cache_down_sfb.index_copy_(
+            0, slots_t, s.down_sfb.index_select(0, added_t).contiguous()
+        )
+
+        self.cached_slot.index_fill_(0, evicted_t, -1)
+        self.cached_slot.index_copy_(0, added_t, slots_t)
+
+        self._cached_mask_np[evicted] = False
+        self._slot_np[evicted] = -1
+        self._cached_mask_np[added] = True
+        self._slot_np[added] = np.asarray(slots, dtype=np.int64)
+        return True
 
     def _cached_gpu_decode(
         self,
