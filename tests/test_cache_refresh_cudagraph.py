@@ -148,6 +148,8 @@ def test_cache_refresh_visible_across_graph_replay():
         f"replay #2 scale_rel {r2:.3e} > 4e-2 — eviction did not correctly "
         "redirect expert 0's tokens to the CPU bucket"
     )
+
+
 def test_live_counts_accumulate_under_graph_replay():
     """The routing signal must be collected *inside* the captured region.
 

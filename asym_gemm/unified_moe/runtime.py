@@ -286,6 +286,11 @@ def _pin_on_node(t: torch.Tensor, node: int) -> torch.Tensor:
 # expert counts; dumped at exit, keyed by layer creation order. Feed the file
 # back via ASYMGEMM_CACHE_HOT_EXPERTS=<path.pt> to cache each layer's top-N
 # most-routed experts instead of experts 0..N-1.
+#
+# NOTE the eager qualifier. With CUDA graphs on, decode replays never enter
+# Layer.forward(), so these counts are a *prefill* profile rather than a
+# whole-workload one. Profiling runs that want decode routing represented
+# must pass --disable-cuda-graph.
 # ---------------------------------------------------------------------------
 
 _ALL_LAYERS: list = []
@@ -320,16 +325,231 @@ def _maybe_register_stats(layer) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Live per-expert routing counts (decode phase).
+# Live VRAM-cache refresh (Phase 1: frequency-only, no FineMoE)
 #
-# ASYMGEMM_CACHE_TRACK_ROUTING > 0 allocates each Layer's _live_counts and
-# starts accumulating. Nothing consumes the window yet; this is the signal a
-# residency policy needs, kept separate from the policy itself.
+# Re-pick each cached layer's hot experts from a live per-expert routing-count
+# window and mutate its VRAM cache in place, instead of keeping whatever
+# _pick_cache_ids chose at construction time.
+#
+# Two env vars, and they are not interchangeable:
+#
+#   ASYMGEMM_CACHE_TRACK_ROUTING  (this side) arms the machinery: > 0
+#       allocates each Layer's _live_counts and starts accumulating routing
+#       counts. <= 0 (default) disables everything — construction-time
+#       caching only, identical to before. Only its sign is read; the value
+#       is NOT a cadence, despite the name.
+#   SGLANG_ASYMGEMM_CACHE_REFRESH_INTERVAL  (sglang side) is the actual
+#       cadence: sglang calls refresh_gpu_caches() every N forward passes
+#       from its pre-graph-replay hook. That hook is the only trigger, so
+#       both vars must be set for anything to happen.
+#
+# Eviction is NOT free: one expert is (2*inter + hidden)*inter INT8 bytes
+# (4.5 MiB at Qwen3-30B-A3B shapes), so replacing a whole 16-slot cache
+# across 48 layers moves 3.4 GiB. Three knobs keep that bounded, because a
+# naive "top-k of a short counting window" thrashes: at top-8 routing over
+# 128 experts a 5-step window supplies ~40 samples, so the top-k is mostly
+# noise and every refresh replaces nearly every slot.
+#
+#   ASYMGEMM_CACHE_COUNT_DECAY=<f>   per-refresh multiplier on the live
+#       counts (default 0.9). Decaying instead of zeroing keeps a stable
+#       long-horizon estimate; zeroing makes each decision independent and
+#       maximally noisy.
+#   ASYMGEMM_CACHE_MAX_SWAP=<n>      hard cap on slots replaced per layer per
+#       refresh. Bounds worst-case copy cost per refresh.
+#   ASYMGEMM_CACHE_SWAP_MARGIN=<f>   a non-resident expert must be this much
+#       hotter than the coldest resident to displace it (default 0.25 = 25%
+#       hotter). Hysteresis; stops near-ties from ping-ponging.
+#
+# Recommended starting point in serving: INTERVAL in the high hundreds to low
+# thousands. Two reasons. The counters need enough samples to mean anything;
+# and although the refresh itself is now cheap, it is not free (one batched
+# D2H, host-side sorting, a barrier when residency actually moves). Residency
+# converges within a handful of refreshes and then barely moves — measured 98%
+# of the achievable token coverage, with churn falling to well under one slot
+# per layer — so frequent refreshing buys nothing and only adds stalls.
 # ---------------------------------------------------------------------------
+
+# Cumulative observability, readable by tests / smoke checks without parsing
+# logs: (calls that did real work, layers actually mutated).
+_refresh_calls = 0
+_refresh_layers_changed = 0
+_refresh_slots_swapped = 0
 
 
 def _cache_track_routing() -> bool:
     return int(os.getenv("ASYMGEMM_CACHE_TRACK_ROUTING", "0")) > 0
+
+
+def _cache_count_decay() -> float:
+    return float(os.getenv("ASYMGEMM_CACHE_COUNT_DECAY", "0.9"))
+
+
+# Refreshes during which a layer may replace its entire resident set. The
+# construction-time set is arbitrary (experts 0..n-1) unless an offline
+# profile was supplied, so converging off it must not be rate-limited.
+_COLD_REFRESHES = 3
+
+
+def _cache_max_swap() -> int:
+    return int(os.getenv("ASYMGEMM_CACHE_MAX_SWAP", "4"))
+
+
+def _cache_swap_margin() -> float:
+    return float(os.getenv("ASYMGEMM_CACHE_SWAP_MARGIN", "0.25"))
+
+
+def _plan_layer_residency(layer, c, max_swap: int, margin: float):
+    """Pick `layer`'s next resident set from `c`, its live counts as a host
+    numpy array.
+
+    `c` is passed in rather than read off the device here on purpose: doing
+    `layer._live_counts.cpu()` inside this function meant one blocking D2H per
+    layer per refresh (96 across 48 layers once the zero-signal check is
+    counted too), every interval.
+
+    Returns the target id list, or None when nothing should move. Policy
+    only — the mechanism (Layer.update_gpu_cache) stays a dumb "make this
+    the resident set" primitive so Phase 2's predictor can drive it directly
+    without inheriting any of this heuristic.
+
+    Keeps the current residents and swaps in challengers, each of which must
+    be > (1+margin) times as hot as the resident it would displace. The margin
+    exists because eviction costs real PCIe bytes: an unconstrained top-k over
+    a noisy window replaces nearly the whole cache every time.
+
+    The swap *budget* is cold-start aware. The initial resident set is
+    whatever _pick_cache_ids chose — typically experts 0..n-1, i.e. arbitrary
+    — and on a skewed router that captures only ~n/G of routed tokens where
+    the true top-n captures far more (measured on Qwen3-Coder-30B-A3B: 25% vs
+    68% at n=32). Creeping toward that at `max_swap` slots per refresh takes
+    n/max_swap refreshes, which is far too slow to matter inside a benchmark
+    or a short-lived server. So the first `_COLD_REFRESHES` refreshes may
+    replace the whole cache; after that the budget drops to `max_swap` to keep
+    steady-state churn (and its PCIe cost) bounded.
+    """
+    cur = np.nonzero(layer._slot_np >= 0)[0]
+
+    budget = layer.cache_n if layer._refresh_n < _COLD_REFRESHES else max_swap
+
+    resident = sorted(cur.tolist(), key=lambda e: c[e])          # coldest first
+    challengers = sorted((e for e in range(len(c)) if layer._slot_np[e] < 0),
+                         key=lambda e: c[e], reverse=True)       # hottest first
+
+    keep = set(resident)
+    swaps = 0
+    for cand in challengers:
+        if swaps >= budget or not resident:
+            break
+        victim = resident[0]
+        # Strictly hotter by the margin, and never evict for a zero-signal
+        # challenger (that would churn on pure noise during quiet periods).
+        if c[cand] <= 0 or c[cand] <= c[victim] * (1.0 + margin):
+            break                     # challengers only get colder from here
+        resident.pop(0)
+        keep.discard(victim)
+        keep.add(cand)
+        swaps += 1
+    return (sorted(keep), swaps) if swaps else (None, 0)
+
+
+def refresh_gpu_caches(sync_before_mutate: bool = False) -> int:
+    """Re-pick every eligible layer's VRAM-cached experts from live routing
+    counts, and mutate each cache in place.
+
+    The only production trigger is sglang's pre-graph-replay hook, which
+    passes ``sync_before_mutate=True`` so the mutation cannot race the
+    previous replay's in-flight reads of the same tensors. That barrier is
+    taken **lazily**, at most once, and only if some layer actually has work
+    to do — an unconditional sync on every interval boundary was a pure
+    stall on the (common) no-change path.
+
+    ``sync_before_mutate=False`` is correct for any caller already running on
+    the current stream, where program order sequences the mutation for us; it
+    is what the tests use. Note that with no eager trigger, a deployment whose
+    decode batches are never CUDA-graph-captured never refreshes at all.
+
+    No-op during CUDA graph capture. Returns the number of layers whose
+    cache contents actually changed.
+    """
+    global _refresh_calls, _refresh_layers_changed, _refresh_slots_swapped
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return 0
+
+    decay = _cache_count_decay()
+    max_swap = _cache_max_swap()
+    margin = _cache_swap_margin()
+
+    # Candidate layers — host-side checks only, no device traffic.
+    cands = [l for l in _ALL_LAYERS
+             if 0 < l.cache_n < l.slab.num_experts and l._live_counts is not None]
+    if not cands:
+        return 0
+
+    # ONE batched device->host transfer of every layer's counts, instead of a
+    # blocking .cpu() per layer inside the planner (plus a second for the
+    # zero-signal check) — ~96 transfers per refresh at 48 layers. Measured
+    # win on a queue-deep A/B: 1.1x (39.0 -> 34.6 ms per refresh), smaller
+    # than it looks because the first transfer already drains the queue and
+    # leaves the rest cheap. Kept because it is strictly better and bounds
+    # the cost at one drain. cat/split rather than stack so layers of
+    # differing expert counts still work.
+    _flat = torch.cat([l._live_counts for l in cands]).float().cpu().numpy()
+    _off, _counts = 0, []
+    for l in cands:
+        n = l.slab.num_experts
+        _counts.append(_flat[_off:_off + n])
+        _off += n
+
+    n_changed = n_eligible = n_swapped = 0
+    synced = False
+    for layer, c in zip(cands, _counts):
+        if c.sum() <= 0.0:
+            continue  # no signal collected yet (host-side now — free)
+        n_eligible += 1
+        new_ids, swaps = _plan_layer_residency(layer, c, max_swap, margin)
+        layer._refresh_n += 1        # graduates the layer off the cold-start budget
+        # Decay rather than zero: keeps a stable long-horizon estimate so the
+        # next decision isn't made from one short, noisy window.
+        layer._live_counts.mul_(decay)
+        if new_ids is None:
+            continue
+        if sync_before_mutate and not synced:
+            # Lazily paid, once, only because we are about to mutate.
+            torch.cuda.synchronize()
+            synced = True
+        if layer.update_gpu_cache(new_ids):
+            n_changed += 1
+            n_swapped += swaps
+
+    if n_eligible:
+        _refresh_calls += 1
+        _refresh_layers_changed += n_changed
+        _refresh_slots_swapped += n_swapped
+        # ASYMGEMM_CACHE_DEBUG_DUMP=<path.pt>: snapshot each layer's resident
+        # set and live counts so the converged residency can be compared
+        # against an offline profile. Diagnostic only.
+        _dbg = os.getenv("ASYMGEMM_CACHE_DEBUG_DUMP", "")
+        if _dbg and _refresh_calls % 10 == 0:
+            try:
+                snap = {}
+                for i, lay in enumerate(_ALL_LAYERS):
+                    if lay.cache_n <= 0 or lay._live_counts is None:
+                        continue
+                    snap[i] = (
+                        np.nonzero(lay._slot_np >= 0)[0].copy(),
+                        lay._live_counts.detach().cpu().clone(),
+                    )
+                torch.save({"calls": _refresh_calls, "layers": snap}, _dbg)
+            except Exception:  # pragma: no cover - diagnostics must never break serving
+                pass
+        if n_changed:
+            import logging
+            logging.getLogger(__name__).info(
+                "AsymGEMM live cache refresh: %d/%d layers, %d slots swapped "
+                "(cumulative: %d calls, %d layer updates, %d slots)",
+                n_changed, n_eligible, n_swapped,
+                _refresh_calls, _refresh_layers_changed, _refresh_slots_swapped)
+    return n_changed
 
 
 # ---------------------------------------------------------------------------
@@ -516,23 +736,22 @@ class Layer:
         self.cache_n = 0
         _maybe_register_stats(self)
         self._build_gpu_cache()
-        # Live per-expert routing-count window for ASYMGEMM_CACHE_TRACK_ROUTING.
-        # Only meaningful once a VRAM cache exists.
+        # Live per-expert routing-count window for ASYMGEMM_CACHE_TRACK_ROUTING
+        # (see refresh_gpu_caches). Only meaningful once a VRAM cache exists.
         # Read the env once, at build time: _cached_gpu_decode consults this on
         # every decode step (and inside CUDA-graph capture), so an os.getenv
         # there would be wasted work on the hot path.
         self._refresh_enabled = (
             self.cache_n > 0 and _cache_track_routing()
         )
-        # float32, not int: a consumer will want to decay this window rather
-        # than zero it, and mul_(0.9) on an integer tensor truncates to zero.
+        # float32, not int: refresh_gpu_caches decays this window rather than
+        # zeroing it, and mul_(0.9) on an integer tensor truncates to zero.
         self._live_counts = (
             torch.zeros(slab.num_experts, dtype=torch.float32,
                         device=f"cuda:{self.cuda_device}")
             if self._refresh_enabled and torch.cuda.is_available() else None
         )
-        # Refreshes applied so far — drives a cold-start budget once a policy
-        # exists; harmless and unread until then.
+        # Refreshes applied so far — drives the cold-start swap budget.
         self._refresh_n = 0
 
     # -----------------------------------------------------------
@@ -725,14 +944,14 @@ class Layer:
         S = min(TK, Nc)                     # max simultaneously-active experts
         M = S * BLOCK_M
 
-        # Decode-time routing signal. This MUST live here rather than in
-        # Layer.forward(): forward() is skipped entirely under CUDA-graph
-        # replay, so a counter kept there sees prefill only and any consumer
-        # would end up choosing decode residency from prefill statistics.
-        # index_add_ over fixed-shape tensors is capturable, so this
-        # accumulates on every replay. Weighted by (route_w > 0) so padded /
-        # masked slots (expert_ids is clamped >= 0, which would otherwise
-        # inflate expert 0) contribute nothing.
+        # Decode-time routing signal for the live cache refresh. This MUST live
+        # here rather than in Layer.forward(): forward() is skipped entirely
+        # under CUDA-graph replay, so a counter kept there sees prefill only
+        # and the refresh ends up choosing decode residency from prefill
+        # statistics. index_add_ over fixed-shape tensors is capturable, so
+        # this accumulates on every replay. Weighted by (route_w > 0) so
+        # padded / masked slots (expert_ids is clamped >= 0, which would
+        # otherwise inflate expert 0) contribute nothing.
         if self._refresh_enabled and self._live_counts is not None:
             _flat = expert_ids.reshape(-1)
             self._live_counts.index_add_(
@@ -1477,9 +1696,11 @@ class Layer:
                 if _stats_step % 20 == 0:
                     _dump_expert_stats()
 
-        # Live routing-count signal, eager branch. Gated on the feature being
-        # enabled so that with ASYMGEMM_CACHE_TRACK_ROUTING unset this path
-        # costs *nothing* — not even the one small device add. counts is
+        # Live cache-refresh signal (see refresh_gpu_caches). Gated on the
+        # feature actually being enabled so that with
+        # ASYMGEMM_CACHE_TRACK_ROUTING unset this path costs *nothing* —
+        # not even the one small device add — and a refresh-off run is
+        # byte-for-byte the pre-existing static-residency behavior. counts is
         # already computed either way.
         #
         # Under sglang this is the EAGER branch only: asym_gemm_unified.py
@@ -1491,14 +1712,20 @@ class Layer:
         # CAVEAT: prefill and decode both land in the same _live_counts, and
         # prefill dominates it. At 512-in/256-out a request contributes
         # 512*top_k routing events here against 256*top_k from decode, so
-        # residency would be chosen ~2:1 by prefill routing. That is defensible
-        # if the goal is total token coverage (cached experts serve prefill
-        # too), but it is NOT what "pick the hot experts for decode" means, and
+        # residency is chosen ~2:1 by prefill routing. That is defensible if
+        # the goal is total token coverage (cached experts serve prefill too),
+        # but it is NOT what "pick the hot experts for decode" means, and
         # decode is the throughput-limited phase. If decode-only residency is
         # wanted, drop this accumulation (or weight it down) and let
         # _cached_gpu_decode be the sole signal.
         if self._refresh_enabled and self._live_counts is not None:
             self._live_counts += counts
+            # NOTE: no cadence trigger here. Under CUDA graphs an eager
+            # forward means a *prefill*, so an eager heartbeat counts
+            # requests, not decode steps — at interval=200 that needed ~200
+            # requests before the first refresh ever fired. Cadence is driven
+            # by sglang's pre-replay hook (forward_pass_id, which ticks every
+            # step); standalone users call refresh_gpu_caches() directly.
 
         counts_np = counts.cpu().numpy()                      # one small D2H
         active = np.nonzero(counts_np)[0]
