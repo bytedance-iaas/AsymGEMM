@@ -320,6 +320,19 @@ def _maybe_register_stats(layer) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Live per-expert routing counts (decode phase).
+#
+# ASYMGEMM_CACHE_TRACK_ROUTING > 0 allocates each Layer's _live_counts and
+# starts accumulating. Nothing consumes the window yet; this is the signal a
+# residency policy needs, kept separate from the policy itself.
+# ---------------------------------------------------------------------------
+
+
+def _cache_track_routing() -> bool:
+    return int(os.getenv("ASYMGEMM_CACHE_TRACK_ROUTING", "0")) > 0
+
+
+# ---------------------------------------------------------------------------
 # Quantization helpers (the unified INT8 contract)
 # ---------------------------------------------------------------------------
 
@@ -503,6 +516,24 @@ class Layer:
         self.cache_n = 0
         _maybe_register_stats(self)
         self._build_gpu_cache()
+        # Live per-expert routing-count window for ASYMGEMM_CACHE_TRACK_ROUTING.
+        # Only meaningful once a VRAM cache exists.
+        # Read the env once, at build time: _cached_gpu_decode consults this on
+        # every decode step (and inside CUDA-graph capture), so an os.getenv
+        # there would be wasted work on the hot path.
+        self._refresh_enabled = (
+            self.cache_n > 0 and _cache_track_routing()
+        )
+        # float32, not int: a consumer will want to decay this window rather
+        # than zero it, and mul_(0.9) on an integer tensor truncates to zero.
+        self._live_counts = (
+            torch.zeros(slab.num_experts, dtype=torch.float32,
+                        device=f"cuda:{self.cuda_device}")
+            if self._refresh_enabled and torch.cuda.is_available() else None
+        )
+        # Refreshes applied so far — drives a cold-start budget once a policy
+        # exists; harmless and unread until then.
+        self._refresh_n = 0
 
     # -----------------------------------------------------------
     # VRAM expert cache (decode GPU bucket)
@@ -693,6 +724,21 @@ class Layer:
         TK = T * K
         S = min(TK, Nc)                     # max simultaneously-active experts
         M = S * BLOCK_M
+
+        # Decode-time routing signal. This MUST live here rather than in
+        # Layer.forward(): forward() is skipped entirely under CUDA-graph
+        # replay, so a counter kept there sees prefill only and any consumer
+        # would end up choosing decode residency from prefill statistics.
+        # index_add_ over fixed-shape tensors is capturable, so this
+        # accumulates on every replay. Weighted by (route_w > 0) so padded /
+        # masked slots (expert_ids is clamped >= 0, which would otherwise
+        # inflate expert 0) contribute nothing.
+        if self._refresh_enabled and self._live_counts is not None:
+            _flat = expert_ids.reshape(-1)
+            self._live_counts.index_add_(
+                0, _flat,
+                (route_w.reshape(-1) > 0).to(self._live_counts.dtype),
+            )
 
         if _HAS_TRITON and TK <= 2048:
             # One fused kernel builds dest/offsets/experts (vs ~18 tensor ops).
@@ -1430,6 +1476,29 @@ class Layer:
                 _stats_step += 1
                 if _stats_step % 20 == 0:
                     _dump_expert_stats()
+
+        # Live routing-count signal, eager branch. Gated on the feature being
+        # enabled so that with ASYMGEMM_CACHE_TRACK_ROUTING unset this path
+        # costs *nothing* — not even the one small device add. counts is
+        # already computed either way.
+        #
+        # Under sglang this is the EAGER branch only: asym_gemm_unified.py
+        # routes anything captured to capturable_decode_forward, which counts
+        # in _cached_gpu_decode instead. The two sites are mutually exclusive,
+        # so nothing is double-counted. In a graph-enabled server that makes
+        # this line effectively the *prefill* counter -- see the caveat below.
+        #
+        # CAVEAT: prefill and decode both land in the same _live_counts, and
+        # prefill dominates it. At 512-in/256-out a request contributes
+        # 512*top_k routing events here against 256*top_k from decode, so
+        # residency would be chosen ~2:1 by prefill routing. That is defensible
+        # if the goal is total token coverage (cached experts serve prefill
+        # too), but it is NOT what "pick the hot experts for decode" means, and
+        # decode is the throughput-limited phase. If decode-only residency is
+        # wanted, drop this accumulation (or weight it down) and let
+        # _cached_gpu_decode be the sole signal.
+        if self._refresh_enabled and self._live_counts is not None:
+            self._live_counts += counts
 
         counts_np = counts.cpu().numpy()                      # one small D2H
         active = np.nonzero(counts_np)[0]
