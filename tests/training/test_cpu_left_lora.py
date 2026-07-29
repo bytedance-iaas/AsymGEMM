@@ -341,6 +341,9 @@ def test_grouped_expert_lora_cpu_left_records_stats(monkeypatch: pytest.MonkeyPa
 def test_expact_lora_a_forward_wrappers_use_real_cpu_left(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.manual_seed(8)
     _install_reference_binding(monkeypatch)
+    # Pin the two-single-call path: this test exercises the fallback wrapper
+    # plumbing; the native-pair default (flipped 2026-07-27) has its own test.
+    monkeypatch.setenv("ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE", "0")
 
     lengths = [64, 32]
     experts = [0, 1]
@@ -379,6 +382,94 @@ def test_expact_lora_a_forward_wrappers_use_real_cpu_left(monkeypatch: pytest.Mo
     assert stats.expact_lora_a_forward_grouped_calls == 3
     assert stats.expact_lora_a_forward_cpu_left_grouped_calls == 3
     assert stats.expact_lora_a_forward_hbm_grouped_calls == 0
+
+
+def _install_reference_pair_binding(
+    monkeypatch: pytest.MonkeyPatch, calls: list[dict[str, object]] | None = None
+) -> None:
+    def fake_pair_binding(
+        a_cpu: torch.Tensor,
+        b_gate: torch.Tensor,
+        b_up: torch.Tensor,
+        d_gate: torch.Tensor,
+        d_up: torch.Tensor,
+        pair_offsets: torch.Tensor,
+        experts: torch.Tensor,
+        list_size: int,
+        compiled_dims: str,
+    ) -> None:
+        if calls is not None:
+            calls.append({"a_shape": tuple(a_cpu.shape), "list_size": int(list_size)})
+        pair_offsets_cpu = pair_offsets.detach().cpu().tolist()
+        experts_cpu = experts.detach().cpu().tolist()
+        d_gate.zero_()
+        d_up.zero_()
+        for group in range(int(list_size) - 1):
+            start = int(pair_offsets_cpu[2 * group])
+            end = int(pair_offsets_cpu[2 * group + 1])
+            if end <= start:
+                continue
+            expert = int(experts_cpu[group])
+            rows = a_cpu[start:end].to(device=d_gate.device).float()
+            d_gate[start:end].copy_(rows.matmul(b_gate[expert].float().t()).to(dtype=d_gate.dtype))
+            d_up[start:end].copy_(rows.matmul(b_up[expert].float().t()).to(dtype=d_up.dtype))
+
+    monkeypatch.setattr(
+        asym_gemm, cpu_left_impl.CPU_LEFT_BF16_PAIR_BINDING, fake_pair_binding, raising=False
+    )
+
+
+def test_expact_lora_a_pair_forward_defaults_to_native_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Flipped default (2026-07-27): one native pair call, X streamed once."""
+    torch.manual_seed(14)
+    _install_reference_binding(monkeypatch)
+    pair_calls: list[dict[str, object]] = []
+    _install_reference_pair_binding(monkeypatch, pair_calls)
+    monkeypatch.delenv("ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE", raising=False)
+    monkeypatch.delenv("ASYMM_CPU_LEFT_LORA_A_PAIR_CAT", raising=False)
+
+    lengths = [64, 32]
+    experts = [0, 1]
+    offsets, experts_t = _metadata(lengths, experts)
+    x_cpu = _pin_cpu(torch.randn((sum(lengths), 128), device="cuda", dtype=torch.bfloat16))
+    gate_a = torch.randn((2, 16, 128), device="cuda", dtype=torch.bfloat16)
+    up_a = torch.randn((2, 16, 128), device="cuda", dtype=torch.bfloat16)
+    stats = AsymExecutionStats()
+
+    gate, up = expact_impl.grouped_lora_a_pair_forward_cpu_left(
+        x_cpu,
+        gate_a,
+        up_a,
+        offsets,
+        experts_t,
+        metadata=None,
+        stats=stats,
+        tag="gate_up",
+    )
+
+    assert len(pair_calls) == 1
+    torch.testing.assert_close(gate, _reference(x_cpu, gate_a, offsets, experts_t), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(up, _reference(x_cpu, up_a, offsets, experts_t), atol=0.0, rtol=0.0)
+    assert stats.cpu_left_lora_a_calls == 1
+    assert stats.expact_lora_a_forward_grouped_calls == 1
+
+    # Opt-out env falls back to the two-single-call path.
+    monkeypatch.setenv("ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE", "0")
+    stats2 = AsymExecutionStats()
+    gate2, up2 = expact_impl.grouped_lora_a_pair_forward_cpu_left(
+        x_cpu,
+        gate_a,
+        up_a,
+        offsets,
+        experts_t,
+        metadata=None,
+        stats=stats2,
+        tag="gate_up",
+    )
+    assert len(pair_calls) == 1  # no new pair-binding call
+    torch.testing.assert_close(gate2, gate, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(up2, up, atol=0.0, rtol=0.0)
+    assert stats2.cpu_left_lora_a_calls == 2
 
 
 @pytest.mark.skipif(not _grouped_mm_available(), reason="PyTorch grouped_mm required")

@@ -6,6 +6,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -142,6 +143,19 @@ __global__ void lora_a_grad_kernel(
 }
 
 // v13: shared-memory-tiled, atomic-free LoRA-A weight-gradient kernel.
+// v14: pair-salvage rework (goal 2, agent/impls/aymlora_kernels.md):
+//   * PAIR is a compile-time template parameter — the single-output
+//     instantiation carries no acc1/sS1 register or SMEM cost at all.
+//   * RANK_EXACT specialization for the shipped rank (r == RANK_MAX): the
+//     accumulator array has no dead guarded slots and the rank loops unroll
+//     without runtime bounds checks.
+//   * The next row-chunk's X (host-resident) and dS (HBM) tiles are
+//     prefetched into REGISTERS while the current chunk computes, then
+//     spilled to SMEM after the barrier. The NVLink-C2C load latency now
+//     overlaps the FMA phase instead of serializing with it — this is what
+//     lets the pair form add its second accumulator chain without adding
+//     wall time (the "no mid-stream retirement" register-stationary
+//     invariant is untouched: acc lives across the whole segment stream).
 //
 // Computes, per expert group g:  grad[g] = dS_g^T @ X_g   (shape [rank, K]),
 // reducing over the group's rows *inside one CTA* so there are no global
@@ -154,13 +168,24 @@ __global__ void lora_a_grad_kernel(
 // Block: (BN, RY) threads. Thread (tx,ty) owns output column n0+tx and the
 // rank rows r = ty, ty+RY, ... . X (CPU-resident) and dS (HBM) tiles are staged
 // in SMEM and reused across the rank dimension.
-template <int BN, int RY, int BROWS, int RANK_MAX>
-__global__ void lora_a_grad_tiled_kernel(
+// v16 (N0, stream-split): K2's reduction runs OVER the streamed axis, so at
+// few segments the (k-tiles × groups) grid starves the GPU (measured 54 GB/s
+// at one group vs the 211 ceiling). Parallelism must come from SPLITTING THE
+// STREAM ITSELF: gridDim.z = S sub-streams per segment; each CTA keeps its
+// [rank × k-tile] accumulator register-stationary for its WHOLE sub-stream
+// and retires exactly once — hierarchical stream-end retirement (per
+// sub-stream residency + one fp32 merge). S==1 (grid.z==1) takes the
+// original write path unchanged. Upstream never needs this grid: its
+// reduction axis is resident, only LoRA's training dataflow forces it.
+template <int BN, int RY, int BROWS, int RANK_MAX, bool RANK_EXACT, bool PAIR>
+__global__ void __launch_bounds__(BN * RY, 2) lora_a_grad_tiled_kernel(
     const at::BFloat16* __restrict__ dS0,
     const at::BFloat16* __restrict__ dS1,
     const at::BFloat16* __restrict__ source_cpu,
     at::BFloat16* __restrict__ grad0,
     at::BFloat16* __restrict__ grad1,
+    float* __restrict__ part0,      // [S, groups, rank, k_total] when gridDim.z > 1
+    float* __restrict__ part1,
     const int32_t* __restrict__ offsets,
     const int32_t* __restrict__ experts,
     int32_t groups,
@@ -170,9 +195,21 @@ __global__ void lora_a_grad_tiled_kernel(
     if (group >= groups) return;
     const int expert = experts[group];
     if (expert < 0) return;
-    const int start = offsets[2 * group];
-    const int end = offsets[2 * group + 1];
+    const int seg_start = offsets[2 * group];
+    const int seg_end = offsets[2 * group + 1];
+    const int seg_rows = seg_end - seg_start;
+    // Sub-stream slice for this CTA (BROWS-aligned so chunk phases match the
+    // single-split kernel exactly).
+    const int splits = static_cast<int>(gridDim.z);
+    const int split = static_cast<int>(blockIdx.z);
+    const int chunks_total = (seg_rows + BROWS - 1) / BROWS;
+    const int chunks_per_split = (chunks_total + splits - 1) / splits;
+    const int start = seg_start + split * chunks_per_split * BROWS;
+    const int end = min(seg_end, start + chunks_per_split * BROWS);
     const int rows = end - start;
+    // rows<=0 CTAs still fall through: their zero accumulators must land in
+    // the partial slice (the merge sums every split without pre-zeroing).
+    const bool write_partial = splits > 1;
 
     const int tx = static_cast<int>(threadIdx.x);   // column within the tile
     const int ty = static_cast<int>(threadIdx.y);   // rank row-group
@@ -181,78 +218,261 @@ __global__ void lora_a_grad_tiled_kernel(
     const bool col_valid = col < k_total;
     constexpr int NT = BN * RY;
     const int tid = ty * BN + tx;
-    const bool pair = (dS1 != nullptr && grad1 != nullptr);
 
     constexpr int ACC = (RANK_MAX + RY - 1) / RY;
     float acc0[ACC];
-    float acc1[ACC];
+    float acc1[PAIR ? ACC : 1];
     #pragma unroll
-    for (int i = 0; i < ACC; ++i) { acc0[i] = 0.f; acc1[i] = 0.f; }
+    for (int i = 0; i < ACC; ++i) acc0[i] = 0.f;
+    if constexpr (PAIR) {
+        #pragma unroll
+        for (int i = 0; i < ACC; ++i) acc1[i] = 0.f;
+    }
 
-    // sX is staged with 128-bit stores, so it must be 16-byte aligned.
-    __shared__ __align__(16) at::BFloat16 sX[BROWS][BN];
-    __shared__ at::BFloat16 sS0[BROWS][RANK_MAX];
-    __shared__ at::BFloat16 sS1[BROWS][RANK_MAX];
+    // Staged tiles live in SMEM as FP32 and TRANSPOSED (row-minor): the
+    // bf16->f32 conversion happens once per element at staging time, and the
+    // inner loop walks the row (reduction) axis with float4 loads — one
+    // vector load per 4 rows instead of 4 scalar loads. This is what lets the
+    // PAIR form's doubled read stream fit in the same wall time as one X
+    // stream: the per-row instruction budget, not the link, was the pair
+    // bottleneck. RPAD=4 keeps 16-byte float4 alignment while spreading the
+    // lane-varying sX accesses across all 32 banks (stride 36 words: lane l
+    // covers banks 4l..4l+3 mod 32 — conflict-free per 8-lane phase).
+    constexpr int RPAD = 4;
+    constexpr int RSTRIDE = BROWS + RPAD;
+    __shared__ __align__(16) float sX[BN][RSTRIDE];
+    __shared__ __align__(16) float sS0[RANK_MAX][RSTRIDE];
+    __shared__ __align__(16) float sS1[PAIR ? RANK_MAX : 1][RSTRIDE];
 
-    // Vectorized host->SMEM staging of X: 128-bit (8 bf16) loads over NVLink-C2C.
-    // BN is a multiple of 8 and, in every real shape, k_total % 8 == 0, so each
-    // 8-column chunk is either fully in range or fully out (zero). A scalar tail
-    // keeps correctness if some exotic k_total is not a multiple of 8.
+    // Per-thread register slices of one staged chunk. X: 128-bit (8 bf16)
+    // vectors over NVLink-C2C; dS: 32-bit (2 bf16) pieces from HBM. Sizes are
+    // exact for the shipped shapes (BROWS*BN and BROWS*rank both divide NT
+    // evenly); the generic path keeps per-element guards.
     constexpr int VEC = 8;
-    constexpr int VPR = BN / VEC;                 // int4 chunks per tile row
-    for (int r0 = 0; r0 < rows; r0 += BROWS) {
-        const int crows = min(BROWS, rows - r0);
+    constexpr int VPR = BN / VEC;                    // int4 chunks per tile row
+    constexpr int XV = (BROWS * VPR + NT - 1) / NT;  // int4s per thread
+    constexpr int SV_MAX = (BROWS * RANK_MAX / 2 + NT - 1) / NT;  // b32s per thread
+    int4 xreg[XV];
+    uint32_t s0reg[SV_MAX];
+    uint32_t s1reg[PAIR ? SV_MAX : 1];
+    const int sv = RANK_EXACT ? SV_MAX
+                              : (BROWS * static_cast<int>(rank) / 2 + NT - 1) / NT;
+
+    // Issue the global loads for row-chunk [r0, r0+crows) into registers.
+    auto fetch_chunk = [&](int r0, int crows) {
+        #pragma unroll
+        for (int v = 0; v < XV; ++v) {
+            const int e = tid + v * NT;
+            const int rr = e / VPR;
+            const int j = e - rr * VPR;
+            const int c = n0 + j * VEC;
+            if (rr < crows && c + VEC <= k_total) {
+                xreg[v] = *reinterpret_cast<const int4*>(
+                    &source_cpu[static_cast<int64_t>(start + r0 + rr) * k_total + c]);
+            }
+        }
+        const int rank_run = RANK_EXACT ? RANK_MAX : static_cast<int>(rank);
+        const int hpr = rank_run / 2;                // b32 pieces per row
+        #pragma unroll
+        for (int v = 0; v < SV_MAX; ++v) {
+            if (!RANK_EXACT && v >= sv) break;
+            const int e = tid + v * NT;
+            const int rr = e / hpr;
+            const int h = e - rr * hpr;
+            if (rr < crows) {
+                const int64_t base = static_cast<int64_t>(start + r0 + rr) * rank_run + 2 * h;
+                s0reg[v] = *reinterpret_cast<const uint32_t*>(&dS0[base]);
+                if constexpr (PAIR)
+                    s1reg[v] = *reinterpret_cast<const uint32_t*>(&dS1[base]);
+            }
+        }
+    };
+
+    // Spill the registered chunk into SMEM, widening bf16 -> f32 on the way
+    // (stalls until the loads land — by then the previous chunk's compute has
+    // been overlapping them).
+    auto cvt2 = [](uint32_t packed) {
+        return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&packed));
+    };
+    auto store_chunk = [&](int crows) {
+        #pragma unroll
+        for (int v = 0; v < XV; ++v) {
+            const int e = tid + v * NT;
+            const int rr = e / VPR;
+            const int j = e - rr * VPR;
+            if (rr < crows && n0 + j * VEC + VEC <= k_total) {
+                const uint32_t* p = reinterpret_cast<const uint32_t*>(&xreg[v]);
+                #pragma unroll
+                for (int h = 0; h < VEC / 2; ++h) {
+                    const float2 f = cvt2(p[h]);
+                    sX[j * VEC + 2 * h][rr] = f.x;
+                    sX[j * VEC + 2 * h + 1][rr] = f.y;
+                }
+            }
+        }
+        const int rank_run = RANK_EXACT ? RANK_MAX : static_cast<int>(rank);
+        const int hpr = rank_run / 2;
+        #pragma unroll
+        for (int v = 0; v < SV_MAX; ++v) {
+            if (!RANK_EXACT && v >= sv) break;
+            const int e = tid + v * NT;
+            const int rr = e / hpr;
+            const int h = e - rr * hpr;
+            if (rr < crows) {
+                const float2 f0 = cvt2(s0reg[v]);
+                sS0[2 * h][rr] = f0.x;
+                sS0[2 * h + 1][rr] = f0.y;
+                if constexpr (PAIR) {
+                    const float2 f1 = cvt2(s1reg[v]);
+                    sS1[2 * h][rr] = f1.x;
+                    sS1[2 * h + 1][rr] = f1.y;
+                }
+            }
+        }
+    };
+
+    // Scalar-tail staging for exotic k_total not a multiple of 8 (kept off the
+    // fast path; real shapes never take it).
+    auto stage_x_tail = [&](int r0, int crows) {
         for (int e = tid; e < crows * VPR; e += NT) {
             const int rr = e / VPR;
             const int j = e - rr * VPR;
             const int c = n0 + j * VEC;
-            const int64_t xbase = static_cast<int64_t>(start + r0 + rr) * k_total + c;
-            if (c + VEC <= k_total) {
-                *reinterpret_cast<int4*>(&sX[rr][j * VEC]) =
-                    *reinterpret_cast<const int4*>(&source_cpu[xbase]);
-            } else {
-                // Scalar tail (only reachable for exotic k_total not a multiple of 8).
+            if (c + VEC > k_total) {
+                const int64_t xbase = static_cast<int64_t>(start + r0 + rr) * k_total + c;
                 #pragma unroll
                 for (int l = 0; l < VEC; ++l)
-                    sX[rr][j * VEC + l] =
-                        (c + l < k_total) ? source_cpu[xbase + l] : static_cast<at::BFloat16>(0);
+                    sX[j * VEC + l][rr] =
+                        (c + l < k_total) ? static_cast<float>(source_cpu[xbase + l]) : 0.f;
             }
         }
-        for (int e = tid; e < crows * rank; e += NT) {
-            const int rr = e / rank;
-            const int r = e - rr * rank;
-            const int64_t base = static_cast<int64_t>(start + r0 + rr) * rank + r;
-            sS0[rr][r] = dS0[base];
-            if (pair) sS1[rr][r] = dS1[base];
-        }
-        __syncthreads();
+    };
+    const bool has_x_tail = (k_total % VEC) != 0 && (n0 + BN > k_total);
+
+    const int crows0 = min(BROWS, rows);
+    fetch_chunk(0, crows0);
+    store_chunk(crows0);
+    if (has_x_tail) stage_x_tail(0, crows0);
+    __syncthreads();
+
+    for (int r0 = 0; r0 < rows; r0 += BROWS) {
+        const int crows = min(BROWS, rows - r0);
+        const int next_r0 = r0 + BROWS;
+        const int next_crows = min(BROWS, rows - next_r0);
+        if (next_crows > 0)
+            fetch_chunk(next_r0, next_crows);   // in flight during compute below
         if (col_valid) {
-            for (int rr = 0; rr < crows; ++rr) {
-                const float xv = static_cast<float>(sX[rr][tx]);
+            // float4 over 4 rows at a time; per-slot loads are warp-broadcast
+            // (all lanes read the same address). The 4 FMAs stay sequential so
+            // the accumulation order — and thus the output bits — match the
+            // scalar form exactly.
+            const int crows4 = crows & ~3;
+            for (int rr = 0; rr < crows4; rr += 4) {
+                const float4 x4 = *reinterpret_cast<const float4*>(&sX[tx][rr]);
                 #pragma unroll
                 for (int i = 0; i < ACC; ++i) {
                     const int r = ty + i * RY;
-                    if (r < rank) {
-                        acc0[i] += static_cast<float>(sS0[rr][r]) * xv;
-                        if (pair) acc1[i] += static_cast<float>(sS1[rr][r]) * xv;
+                    if (RANK_EXACT || r < rank) {
+                        const float4 s4 = *reinterpret_cast<const float4*>(&sS0[r][rr]);
+                        acc0[i] += s4.x * x4.x;
+                        acc0[i] += s4.y * x4.y;
+                        acc0[i] += s4.z * x4.z;
+                        acc0[i] += s4.w * x4.w;
+                        if constexpr (PAIR) {
+                            const float4 t4 = *reinterpret_cast<const float4*>(&sS1[r][rr]);
+                            acc1[i] += t4.x * x4.x;
+                            acc1[i] += t4.y * x4.y;
+                            acc1[i] += t4.z * x4.z;
+                            acc1[i] += t4.w * x4.w;
+                        }
+                    }
+                }
+            }
+            for (int rr = crows4; rr < crows; ++rr) {
+                const float xv = sX[tx][rr];
+                #pragma unroll
+                for (int i = 0; i < ACC; ++i) {
+                    const int r = ty + i * RY;
+                    if (RANK_EXACT || r < rank) {
+                        acc0[i] += sS0[r][rr] * xv;
+                        if constexpr (PAIR)
+                            acc1[i] += sS1[r][rr] * xv;
                     }
                 }
             }
         }
         __syncthreads();
+        if (next_crows > 0) {
+            store_chunk(next_crows);
+            if (has_x_tail) stage_x_tail(next_r0, next_crows);
+            __syncthreads();
+        }
     }
 
     if (col_valid) {
-        #pragma unroll
-        for (int i = 0; i < ACC; ++i) {
-            const int r = ty + i * RY;
-            if (r < rank) {
-                const int64_t out =
-                    (static_cast<int64_t>(expert) * rank + r) * k_total + col;
-                grad0[out] = static_cast<at::BFloat16>(acc0[i]);
-                if (pair) grad1[out] = static_cast<at::BFloat16>(acc1[i]);
+        if (write_partial) {
+            // Stream-end retirement of this SUB-stream: one fp32 write per
+            // accumulator into the [S, groups, r, K] slice; the merge kernel
+            // performs the single cross-substream reduction.
+            const int64_t base = ((static_cast<int64_t>(split) * groups + group) * rank) * k_total;
+            #pragma unroll
+            for (int i = 0; i < ACC; ++i) {
+                const int r = ty + i * RY;
+                if (RANK_EXACT || r < rank) {
+                    const int64_t out = base + static_cast<int64_t>(r) * k_total + col;
+                    part0[out] = acc0[i];
+                    if constexpr (PAIR)
+                        part1[out] = acc1[i];
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < ACC; ++i) {
+                const int r = ty + i * RY;
+                if (RANK_EXACT || r < rank) {
+                    const int64_t out =
+                        (static_cast<int64_t>(expert) * rank + r) * k_total + col;
+                    grad0[out] = static_cast<at::BFloat16>(acc0[i]);
+                    if constexpr (PAIR)
+                        grad1[out] = static_cast<at::BFloat16>(acc1[i]);
+                }
             }
         }
+    }
+}
+
+// N0 merge: sum the S per-substream fp32 partials for one (group, r, k)
+// position and retire once to bf16 grad (keyed by the group's expert id).
+__global__ void lora_a_grad_split_merge_kernel(
+    const float* __restrict__ part0,
+    const float* __restrict__ part1,
+    at::BFloat16* __restrict__ grad0,
+    at::BFloat16* __restrict__ grad1,
+    const int32_t* __restrict__ experts,
+    int32_t splits,
+    int32_t groups,
+    int32_t rank,
+    int32_t k_total) {
+    const int64_t per_group = static_cast<int64_t>(rank) * k_total;
+    const int64_t total = static_cast<int64_t>(groups) * per_group;
+    const bool pair = (part1 != nullptr && grad1 != nullptr);
+    for (int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int group = static_cast<int>(linear / per_group);
+        const int64_t rk = linear - static_cast<int64_t>(group) * per_group;
+        const int expert = experts[group];
+        if (expert < 0) continue;
+        float s0 = 0.f, s1 = 0.f;
+        const int64_t stride = static_cast<int64_t>(groups) * per_group;
+        const int64_t base = static_cast<int64_t>(group) * per_group + rk;
+        for (int s = 0; s < splits; ++s) {
+            s0 += part0[base + s * stride];
+            if (pair) s1 += part1[base + s * stride];
+        }
+        const int64_t out = static_cast<int64_t>(expert) * per_group + rk;
+        grad0[out] = static_cast<at::BFloat16>(s0);
+        if (pair) grad1[out] = static_cast<at::BFloat16>(s1);
     }
 }
 
@@ -270,11 +490,63 @@ void launch_lora_a_grad_tiled(
     int k_total,
     cudaStream_t stream) {
     TORCH_CHECK(rank <= RANK_MAX, "lora_a_grad_tiled: rank ", rank, " exceeds RANK_MAX ", RANK_MAX);
+    TORCH_CHECK(rank % 2 == 0, "lora_a_grad_tiled: rank must be even, got ", rank);
     dim3 block(BN, RY);
-    dim3 grid(static_cast<unsigned int>((k_total + BN - 1) / BN), static_cast<unsigned int>(groups));
-    lora_a_grad_tiled_kernel<BN, RY, BROWS, RANK_MAX><<<grid, block, 0, stream>>>(
-        dS0, dS1, source_cpu, grad0, grad1, offsets, experts, groups, rank, k_total);
+    const int k_tiles = (k_total + BN - 1) / BN;
+    // N0 adaptive stream-split: fill ~2 CTAs/SM (the kernel's occupancy
+    // limit). The 128-expert grouped cell yields S=1 — byte-identical to the
+    // pre-split kernel. ASYMM_LORA_A_GRAD_SPLIT=1 pins legacy; =N pins S.
+    int splits = 1;
+    {
+        const char* v = std::getenv("ASYMM_LORA_A_GRAD_SPLIT");
+        if (v != nullptr && v[0] != '\0') {
+            splits = std::max(1, std::atoi(v));
+        } else {
+            const auto* props = at::cuda::getCurrentDeviceProperties();
+            const int target = 2 * props->multiProcessorCount;
+            splits = std::max(1, target / std::max(1, k_tiles * groups));
+        }
+    }
+    dim3 grid(static_cast<unsigned int>(k_tiles), static_cast<unsigned int>(groups),
+              static_cast<unsigned int>(splits));
+    const bool pair = (dS1 != nullptr && grad1 != nullptr);
+    float* part0 = nullptr;
+    float* part1 = nullptr;
+    torch::Tensor ws0, ws1;
+    if (splits > 1) {
+        const auto opts = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
+        ws0 = torch::empty({static_cast<int64_t>(splits) * groups * rank * k_total}, opts);
+        part0 = ws0.data_ptr<float>();
+        if (pair) {
+            ws1 = torch::empty_like(ws0);
+            part1 = ws1.data_ptr<float>();
+        }
+    }
+    constexpr int RANK_FAST = 64;  // the shipped LoRA rank — exact specialization
+    if (rank == RANK_FAST) {
+        if (pair) {
+            lora_a_grad_tiled_kernel<BN, RY, BROWS, RANK_FAST, true, true><<<grid, block, 0, stream>>>(
+                dS0, dS1, source_cpu, grad0, grad1, part0, part1, offsets, experts, groups, rank, k_total);
+        } else {
+            lora_a_grad_tiled_kernel<BN, RY, BROWS, RANK_FAST, true, false><<<grid, block, 0, stream>>>(
+                dS0, nullptr, source_cpu, grad0, nullptr, part0, nullptr, offsets, experts, groups, rank, k_total);
+        }
+    } else if (pair) {
+        lora_a_grad_tiled_kernel<BN, RY, BROWS, RANK_MAX, false, true><<<grid, block, 0, stream>>>(
+            dS0, dS1, source_cpu, grad0, grad1, part0, part1, offsets, experts, groups, rank, k_total);
+    } else {
+        lora_a_grad_tiled_kernel<BN, RY, BROWS, RANK_MAX, false, false><<<grid, block, 0, stream>>>(
+            dS0, nullptr, source_cpu, grad0, nullptr, part0, nullptr, offsets, experts, groups, rank, k_total);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (splits > 1) {
+        const int64_t total = static_cast<int64_t>(groups) * rank * k_total;
+        lora_a_grad_split_merge_kernel<<<blocks_for(total), kThreads, 0, stream>>>(
+            part0, part1, grad0, grad1, experts,
+            static_cast<int32_t>(splits), static_cast<int32_t>(groups),
+            static_cast<int32_t>(rank), static_cast<int32_t>(k_total));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
 }
 
 __global__ void lora_b_backward_kernel(

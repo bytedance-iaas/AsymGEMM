@@ -364,6 +364,49 @@ def grouped_expert_lora_pair_cpu_left(
     return out_gate, out_up
 
 
+def grouped_expert_lora_triple_cpu_left(
+    x_cpu: torch.Tensor,
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    *,
+    metadata: Any | None = None,
+    compiled_dims: str = "nk",
+    stats: AsymExecutionStats | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """N1: one host X stream serves three adapters (in-kernel kNumOutputs=3)."""
+    if not (w0.shape == w1.shape == w2.shape):
+        raise RuntimeError("SM100 CPU-left grouped BF16 triple AsymGEMM is unavailable: shape_mismatch")
+    m = int(x_cpu.shape[0])
+    n = int(w0.shape[1])
+    if m == 0:
+        e = torch.empty((0, n), device=w0.device, dtype=torch.bfloat16)
+        return e, torch.empty_like(e), torch.empty_like(e)
+    call_offsets = getattr(metadata, "offsets", offsets) if metadata is not None else offsets
+    call_experts = getattr(metadata, "experts", experts) if metadata is not None else experts
+    reason = cpu_left_grouped_bf16_reason(x_cpu, w0, call_offsets, call_experts)
+    if reason is not None:
+        raise RuntimeError(f"SM100 CPU-left grouped BF16 triple AsymGEMM is unavailable: {reason}")
+    import asym_gemm
+
+    binding = "sm100_m_grouped_bf16_cpu_left_triple_asym_gemm_nt_contiguous"
+    if not hasattr(asym_gemm, binding):
+        raise RuntimeError("SM100 CPU-left grouped BF16 triple AsymGEMM is unavailable: missing_binding")
+    x_kernel, offsets_kernel, unpad, _ = _pad_cpu_left_grouped_input_for_asym(
+        x_cpu, call_offsets, call_experts, index_device=w0.device)
+    outs = [torch.empty((int(x_kernel.shape[0]), n), device=w0.device, dtype=torch.bfloat16) for _ in range(3)]
+    offsets_i32, experts_i32, list_size = _group_metadata_tensors(offsets_kernel, call_experts, device=w0.device)
+    getattr(asym_gemm, binding)(
+        x_kernel, w0, w1, w2, outs[0], outs[1], outs[2],
+        offsets_i32, experts_i32, list_size, compiled_dims)
+    outs = [_unpad_grouped_output(o, unpad, output_m=m) for o in outs]
+    if stats is not None:
+        stats.cpu_left_lora_a_calls += 1
+    return outs[0], outs[1], outs[2]
+
+
 __all__ = [
     "CPU_LEFT_BF16_BINDING",
     "CPU_LEFT_BF16_PAIR_BINDING",
@@ -371,4 +414,5 @@ __all__ = [
     "cpu_left_grouped_bf16_reason",
     "grouped_expert_lora_cpu_left",
     "grouped_expert_lora_pair_cpu_left",
+    "grouped_expert_lora_triple_cpu_left",
 ]

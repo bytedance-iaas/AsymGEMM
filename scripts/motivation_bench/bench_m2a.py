@@ -20,6 +20,7 @@ import torch
 
 import asym_gemm  # noqa: F401  (loads the extension)
 from asym_gemm.training import cpu_left as cpu_left_impl
+from asym_gemm.training.frozen_linear import asym_bf16_cpu_right_matmul
 
 OUT = Path(__file__).resolve().parents[2] / "profiling_results/motivation/m2a.json"
 RANK = 64
@@ -67,26 +68,39 @@ def bench_shape(m: int) -> dict:
     def run_streamed():
         cpu_left_impl.grouped_expert_lora_cpu_left(x_pinned, weight, offsets, experts)
 
-    # correctness spot-check once
+    def run_direct():
+        # naive DIRECT use of the inference-form asym kernel: stream the CPU
+        # operand as the "weight" (the only role it can stream), i.e. compute
+        # S^T = A . X^T with A as the 64-row resident "batch"; the consumer
+        # needs S row-major, so the transpose-back is part of the price.
+        st = asym_bf16_cpu_right_matmul(a, x_pinned, backend="asym", tag="m2a_direct")
+        st.t().contiguous()
+
+    # correctness spot-checks once
     ref = torch.matmul(x_resident, a.t())
     got = cpu_left_impl.grouped_expert_lora_cpu_left(x_pinned, weight, offsets, experts)
     torch.cuda.synchronize()
     rel = (got.float() - ref.float()).norm() / ref.float().norm()
     assert rel < 2e-2, f"streamed kernel mismatch rel={rel:.3e}"
+    got_direct = asym_bf16_cpu_right_matmul(a, x_pinned, backend="asym", tag="m2a_direct").t()
+    torch.cuda.synchronize()
+    rel_d = (got_direct.float() - ref.float()).norm() / ref.float().norm()
+    assert rel_d < 2e-2, f"direct-use mismatch rel={rel_d:.3e}"
 
-    res = {"rows": m, "rel_check": float(rel), "runs": []}
+    res = {"rows": m, "rel_check": float(rel), "rel_check_direct": float(rel_d), "runs": []}
     for _ in range(RUNS):
         res["runs"].append(
             {
                 "resident_ms": _time_loop(run_resident),
                 "staged_ms": _time_loop(run_staged),
                 "streamed_ms": _time_loop(run_streamed),
+                "direct_ms": _time_loop(run_direct),
             }
         )
     # analytic operand bytes (GB) for the memory panel
     xb = m * D * 2 / 1e9
     ab = RANK * D * 2 / 1e9
-    res["mem_gb"] = {"resident": xb + ab, "staged": xb + ab, "streamed": ab}
+    res["mem_gb"] = {"resident": xb + ab, "staged": xb + ab, "streamed": ab, "direct": ab}
     del x_resident, stage_buf
     torch.cuda.empty_cache()
     return res
@@ -116,7 +130,7 @@ def main() -> None:
         print(
             f"rows={sh['rows']:>7}: resident={mean('resident_ms'):7.3f} ms  "
             f"staged={mean('staged_ms'):7.3f} ms  streamed={mean('streamed_ms'):7.3f} ms  "
-            f"(rel={sh['rel_check']:.2e})"
+            f"direct={mean('direct_ms'):7.3f} ms  (rel={sh['rel_check']:.2e})"
         )
 
 

@@ -67,6 +67,7 @@ try:
             "m_grouped_bf16_asym_gemm_nt_masked",
             "sm100_m_grouped_bf16_cpu_left_asym_gemm_nt_contiguous",
             "sm100_m_grouped_bf16_cpu_left_pair_asym_gemm_nt_contiguous",
+            "sm100_m_grouped_bf16_cpu_left_triple_asym_gemm_nt_contiguous",
             "sm100_grouped_lora_a_grad_bf16_cpu_right",
             "sm100_grouped_lora_a_pair_grad_bf16_cpu_right",
             "sm100_grouped_lora_b_backward_bf16_cpu_source",

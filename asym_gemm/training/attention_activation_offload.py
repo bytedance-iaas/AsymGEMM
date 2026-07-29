@@ -121,6 +121,19 @@ def _single_group_offsets_experts(device: torch.device | str, m: int) -> tuple[t
     return offsets, experts
 
 
+def _attn_qkv_fwd_shared_enabled() -> bool:
+    """qkv shared-stream LoRA-A forward (default ON, 2026-07-28): when q/k/v
+    share one offloaded source, ONE CPU-left pass at n=3r computes all three
+    S projections — the host activation is streamed once instead of three
+    times. Bit-identical to the per-projection calls (same kernel, same
+    reduce order per output column block). ASYMM_ATTN_QKV_FWD_SHARED=0 falls
+    back to per-projection streams."""
+    value = os.environ.get("ASYMM_ATTN_QKV_FWD_SHARED")
+    if value is None or value == "":
+        return True
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _attn_lora_a_grad_cpu_deposit_enabled() -> bool:
     """K-2 (cpu_compute.md): attention LoRA-A wgrad on the CPU worker (deposit design),
     mirroring the MoE Stage-3 path — removes the per-projection C2C U re-read.
@@ -1092,6 +1105,118 @@ class AttentionActivationOffloadContext:
         self.source_share_released_bytes = 0
         self._cache: dict[tuple[str, int, int, tuple[int, ...], tuple[int, ...], str], _SharedActivationSource] = {}
         self._seen_roles: set[str] = set()
+        self._lora_modules: dict[str, Any] = {}
+
+    def register_lora_module(self, role: str, module: Any) -> None:
+        """Track the q/k/v modules so the first shared-source consumer can
+        batch all three LoRA-A projections into one streamed pass."""
+        self._lora_modules[str(role)] = module
+
+    @staticmethod
+    def _shared_diag(reason: str) -> None:
+        if os.environ.get("ASYMM_ATTN_QKV_FWD_SHARED_DIAG", "") not in {"1", "true", "on"}:
+            return
+        seen = getattr(AttentionActivationOffloadContext, "_shared_diag_seen", None)
+        if seen is None:
+            seen = set()
+            AttentionActivationOffloadContext._shared_diag_seen = seen
+        if reason in seen:
+            return
+        seen.add(reason)
+        import sys
+
+        print(f"[qkv-shared-diag] declined: {reason}", file=sys.stderr, flush=True)
+
+    def shared_lora_a_forward(
+        self,
+        source: _SharedActivationSource,
+        role: str,
+        a: torch.Tensor,
+        *,
+        stats: AsymExecutionStats | None,
+        backend: str,
+    ) -> torch.Tensor | None:
+        """qkv shared-stream LoRA-A forward: serve `role`'s S from a single
+        CPU-left pass over the shared host source at n=3r. Returns None when
+        the batch cannot be formed (caller falls back per-projection)."""
+        role = str(role)
+        cache = getattr(source, "lora_a_results", None)
+        if cache is not None:
+            s = cache.pop(role, None)
+            if s is None:
+                self._shared_diag(f"cache-miss-role:{role}")
+                return None
+            if stats is not None:
+                stats.attn_act_lora_a_forward_calls += 1
+                stats.attn_act_lora_a_shared_hits += 1
+            return s
+        if role not in _QKV_SHARE_ROLES:
+            self._shared_diag(f"role-not-shared:{role}")
+            return None
+        roles = ("q_proj", "k_proj", "v_proj")
+        mods = self._lora_modules
+        if any(r not in mods for r in roles):
+            self._shared_diag(
+                f"roles-unregistered:{sorted(set(roles) - set(mods))} (have {sorted(mods)})"
+            )
+            return None
+        weights: list[torch.Tensor] = []
+        for r in roles:
+            m = mods[r]
+            # Weight-offload coordinators stage the WHOLE layer group in one
+            # H2D (gather_group is layer-scoped and idempotent), so by the
+            # time the first consumer runs — after its own gather — sibling
+            # lora_a params already point at the staged slab. When a group is
+            # NOT staged, param.data points at the CPU home and the device
+            # check below rejects the batch safely. The cat below copies the
+            # values, so later releases cannot invalidate the batch.
+            w = a if r == role else m.lora_a
+            if (
+                w is None
+                or w.device.type != "cuda"
+                or w.dtype != torch.bfloat16
+                or w.dim() != 2
+            ):
+                self._shared_diag(f"weight-unusable:{r}")
+                return None
+            weights.append(w)
+        r0 = int(weights[0].shape[0])
+        if any(tuple(w.shape) != (r0, int(weights[0].shape[1])) for w in weights):
+            self._shared_diag("weight-shape-mismatch")
+            return None
+        results = None
+        if os.environ.get("ASYMM_ATTN_QKV_FWD_TRIPLE", "1").lower() not in {"0", "false", "off"}:
+            # N1 in-kernel triple: three adapters through the fetch-once slot
+            # in ONE kernel — no A-cat memcpy, no split copies; bit-identical.
+            try:
+                from .cpu_left import grouped_expert_lora_triple_cpu_left
+
+                u = source.handle.tensor
+                offs, exps = _single_group_offsets_experts(weights[0].device, int(u.shape[0]))
+                s0, s1, s2 = grouped_expert_lora_triple_cpu_left(
+                    u, *(w.detach().unsqueeze(0).contiguous() for w in weights),
+                    offsets=offs, experts=exps, stats=stats)
+                results = {rr: t for rr, t in zip(roles, (s0, s1, s2))}
+                if stats is not None:
+                    stats.attn_act_lora_a_forward_calls += 1
+            except RuntimeError:
+                results = None
+        if results is None:
+            a_cat = torch.cat([w.detach().contiguous() for w in weights], dim=0).contiguous()
+            s_cat = _dense_lora_a_cpu_left(
+                source.handle.tensor,
+                a_cat,
+                stats=stats,
+                tag="qkv.lora_a_forward_shared",
+                backend=backend,
+            )
+            parts = s_cat.split(r0, dim=-1)
+            results = {rr: p.contiguous() for rr, p in zip(roles, parts)}
+            del s_cat, parts, a_cat
+        source.lora_a_results = results  # lifetime rides the shared source
+        if stats is not None:
+            stats.attn_act_lora_a_shared_batches += 1
+        return results.pop(role)
 
     def acquire_source(self, source: torch.Tensor, flat_source: torch.Tensor, role: str) -> _SharedActivationSource:
         role = str(role)
@@ -1273,13 +1398,29 @@ class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function):
             # the handle's ready event: the shared q/k/v source was offloaded by the
             # attention context's manager, not this call's fresh one.
             (attention_context.manager if shared_source is not None else manager).wait_cpu_ready_host(u_handle)
-            s = _dense_lora_a_cpu_left(
-                u_handle.tensor,
-                a.contiguous(),
-                stats=stats,
-                tag=f"{projection_role}.lora_a_forward",
-                backend=backend,
-            )
+            s = None
+            if (
+                shared_source is not None
+                and attention_context is not None
+                and backend == "asym"
+                and _attn_qkv_fwd_shared_enabled()
+            ):
+                s = attention_context.shared_lora_a_forward(
+                    shared_source, projection_role, a, stats=stats, backend=backend
+                )
+            elif attention_context is not None:
+                attention_context._shared_diag(
+                    f"hook-skipped:{projection_role} shared={shared_source is not None} "
+                    f"backend={backend} env={_attn_qkv_fwd_shared_enabled()}"
+                )
+            if s is None:
+                s = _dense_lora_a_cpu_left(
+                    u_handle.tensor,
+                    a.contiguous(),
+                    stats=stats,
+                    tag=f"{projection_role}.lora_a_forward",
+                    backend=backend,
+                )
         _record_attn_hbm_gemm(stats, f"{projection_role}.lora_b_forward")
         out = base
         _add_matmul_rows_(out, s, b.t(), scale=float(scaling))
@@ -1611,6 +1752,8 @@ class AsymActivationOffloadLoRALinear(nn.Module):
         self.lora_dropout = nn.Dropout(p=float(lora_dropout)) if float(lora_dropout) > 0.0 else nn.Identity()
         self.projection_role = str(projection_role)
         self.attention_context = attention_context
+        if attention_context is not None and self.projection_role in _QKV_SHARE_ROLES:
+            attention_context.register_lora_module(self.projection_role, self)
         self._last_activation_offload_stats: dict[str, Any] = {}
         self._weight_offload = None
         object.__setattr__(self, "_weight_offload_owner", self)
