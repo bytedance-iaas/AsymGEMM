@@ -657,20 +657,28 @@ class Layer:
         ASYMGEMM_HYBRID_KERNEL block above for the fallback conditions.
 
         Also requires that copy-engine staging would NOT otherwise apply to
-        the streamed partition. Staging (the default transport,
-        ASYMGEMM_STAGE_STREAMED=1) hides the PCIe cost off the critical path
-        by copying pinned-host weights to an HBM ring on a side stream,
-        overlapped with the cached partition's GEMMs and the CPU bucket; the
-        hybrid kernel's fused launch can't use that trick — its host-side
-        CTAs always read pinned host directly, in-kernel, via TMA over PCIe.
-        Measured on an H200 (mixed 32/32-expert residency, T=512): with
-        staging on, the hybrid path was ~1.76x SLOWER than the staged
-        default (10.46ms vs 5.95ms) despite winning modestly (~1.06x)
-        against the equivalent staging-disabled two-launch path (10.46ms vs
-        11.15ms) — so the hybrid path is only worth taking when staging is
-        off or has fallen back (e.g. OOM), where it's the better of the two
-        remaining options rather than a regression against the shipped
-        default.
+        the streamed partition — not just because it measures faster, but
+        because staging removes hybrid's own precondition. Staging (the
+        default transport, ASYMGEMM_STAGE_STREAMED=1) copies the streamed
+        partition's weights from pinned host into an HBM ring *before* any
+        GEMM launches, so by kernel-launch time there is no pinned-host-
+        resident partition left — both the cached and the (now-staged)
+        streamed experts are HBM-resident. Hybrid's whole reason to exist is
+        combining a genuinely pinned-host pipeline with an HBM pipeline in
+        one launch; once staging has already turned the host side into HBM,
+        that precondition doesn't hold, and calling hybrid anyway just means
+        its host-side CTAs redundantly re-read the same weights the slow way
+        (direct in-kernel PCIe/TMA) instead of the HBM copy staging already
+        made. (The right optimization for the staging-on case is a
+        different one we haven't built: merging the cached and staged
+        partitions into one deep-kernel call, since both are HBM by then —
+        not forcing them through hybrid.) Confirmed empirically on an H200
+        (mixed 32/32-expert residency, T=512): with staging on, the hybrid
+        path was ~1.76x SLOWER than the staged default (10.46ms vs 5.95ms),
+        despite winning modestly (~1.06x) against the equivalent staging-
+        disabled two-launch path (10.46ms vs 11.15ms) — consistent with
+        hybrid only being the right tool once staging is off or has fallen
+        back (e.g. OOM).
         """
         return (
             _hybrid_kernel_enabled()

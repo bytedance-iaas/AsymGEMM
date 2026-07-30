@@ -279,17 +279,26 @@ non-SM90 devices, and calls with only cached or only streamed work are
 unaffected by setting the flag.
 
 **Staging interaction (read before enabling this in production).** Staging
-(`ASYMGEMM_STAGE_STREAMED=1`, the default) hides the streamed partition's
-PCIe cost off the critical path by copying pinned-host weights to an HBM
-ring on a side stream; the hybrid kernel's fused launch can't use that
-trick — its host-side CTAs always read pinned host directly, in-kernel, via
-TMA over PCIe. Measured on an H200 (mixed 32/32-expert residency, T=512):
-with staging on, taking the hybrid path anyway would be **~1.76x slower**
-than the staged default (10.46ms vs 5.95ms), despite winning modestly
-(~1.06x) against the equivalent staging-disabled two-launch path (10.46ms
-vs 11.15ms). So `_use_hybrid_path()` only takes the hybrid branch when
-staging is off (`ASYMGEMM_STAGE_STREAMED=0`) or has fallen back (OOM) —
-never as a regression against the shipped default.
+(`ASYMGEMM_STAGE_STREAMED=1`, the default) copies the streamed partition's
+weights from pinned host into an HBM ring *before* any GEMM launches, so by
+kernel-launch time there is no pinned-host-resident partition left — both
+the cached and the (now-staged) streamed experts are HBM-resident. The
+hybrid kernel's whole reason to exist is combining a genuinely pinned-host
+pipeline with an HBM pipeline in one launch; once staging has already
+turned the host side into HBM, that precondition doesn't hold, and calling
+hybrid anyway just makes its host-side CTAs redundantly re-read the same
+weights the slow way (direct in-kernel PCIe/TMA) instead of the HBM copy
+staging already made. (The right optimization for the staging-on case is a
+different one, not yet built: merging the cached and staged partitions into
+one deep-kernel call, since both are HBM by then — not forcing them through
+hybrid.) This is confirmed empirically, not just theoretically: measured on
+an H200 (mixed 32/32-expert residency, T=512), taking the hybrid path with
+staging on was **~1.76x slower** than the staged default (10.46ms vs
+5.95ms), despite winning modestly (~1.06x) against the equivalent staging-
+disabled two-launch path (10.46ms vs 11.15ms). So `_use_hybrid_path()` only
+takes the hybrid branch when staging is off (`ASYMGEMM_STAGE_STREAMED=0`)
+or has fallen back (OOM) — never as a regression against the shipped
+default.
 
 ## 9. What performance to expect (H200, measured)
 
