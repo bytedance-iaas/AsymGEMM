@@ -6,7 +6,11 @@ from typing import Literal
 import torch
 
 from .activation_offload import ActivationOffloadManager, CPUActivationHandle
-from .cpu_left import CPU_LEFT_BF16_BINDING, grouped_expert_lora_pair_cpu_left
+from .cpu_left import (
+    CPU_LEFT_BF16_BINDING,
+    CPU_LEFT_BF16_PAIR_BINDING,
+    grouped_expert_lora_pair_cpu_left,
+)
 from .frozen_linear import AsymExecutionStats, _group_metadata_tensors
 from .lora import GroupedLoRAMetadata, grouped_expert_lora, grouped_expert_lora_cpu_left
 
@@ -19,6 +23,21 @@ LORA_B_BACKWARD_CPU_SOURCE = "sm100_grouped_lora_b_backward_bf16_cpu_source"
 def _env_flag(name: str) -> bool:
     value = os.environ.get(name, "")
     return value.lower() not in {"", "0", "false", "no", "off"}
+
+
+def _pair_native_enabled() -> bool:
+    """Native gate/up pair kernel selector — DEFAULT ON (flipped 2026-07-27).
+
+    Measured on the standard workload (Qwen3-30B-A3B shapes, 7.68M routed
+    rows, X 31.5 GB pinned): pair 224.7 ms vs 2x single 450.9 ms (2.007x;
+    2.000x at link saturation with DG_BF16_CPU_LEFT_COMPACT_GRID=1), outputs
+    bit-identical. Set ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE=0 to fall back to
+    the ASYMM_CPU_LEFT_LORA_A_PAIR_CAT / two-single-call paths.
+    """
+    value = os.environ.get("ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE")
+    if value is None or value == "":
+        return True
+    return value.lower() not in {"0", "false", "no", "off"}
 
 
 def _missing_symbol(name: str) -> str | None:
@@ -163,7 +182,13 @@ def grouped_lora_a_pair_forward_cpu_left(
     stats: AsymExecutionStats | None,
     tag: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if _env_flag("ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE"):
+    import asym_gemm
+
+    if (
+        _pair_native_enabled()
+        and hasattr(asym_gemm, CPU_LEFT_BF16_PAIR_BINDING)
+        and lora_a_gate.shape == lora_a_up.shape
+    ):
         _check_cpu_left_inputs(source_cpu, lora_a_gate, f"{tag}.gate")
         _check_cpu_left_inputs(source_cpu, lora_a_up, f"{tag}.up")
         gate, up = grouped_expert_lora_pair_cpu_left(

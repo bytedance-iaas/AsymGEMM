@@ -138,6 +138,8 @@ class AsymExecutionStats:
     expact_stage_low_rank_calls: int = 0
     attn_act_base_dx_calls: int = 0
     attn_act_lora_a_forward_calls: int = 0
+    attn_act_lora_a_shared_batches: int = 0
+    attn_act_lora_a_shared_hits: int = 0
     attn_act_lora_a_grad_calls: int = 0
     attn_act_stage_low_rank_calls: int = 0
     attn_act_hbm_gemm_calls_by_tag: Dict[str, int] = field(default_factory=dict)
@@ -820,10 +822,47 @@ def _unpad_grouped_output(
     return out
 
 
+def _dense_stream_m_chunks(m: int, n: int) -> int:
+    """Grid-fill chunk count for the single-B streamed dense GEMM (2026-07-28).
+
+    The grouped kernel launches grid {ceil(n/block_n), num_groups}; with one
+    group a training-shaped call (n=2048 -> 32 CTAs) strands ~80% of the SMs
+    while each CTA serially walks thousands of M tiles (measured 14.75 ms vs
+    cuBLAS 1.26 ms at [256K x 2048] x [2048 x 2048]; ncu: 6.25% occupancy).
+    Splitting M into G chunks-as-groups (all mapping to expert 0) fills the
+    grid; the streamed weight is re-read once per chunk — ~8 MB per extra
+    chunk vs >10 ms of idle SMs. Outputs are disjoint row ranges computed in
+    the same k-order, so results stay bit-identical to the single-group
+    launch. ASYMM_DENSE_STREAM_M_CHUNKS=1 restores the legacy launch;
+    ASYMM_DENSE_STREAM_M_CHUNKS=<G> pins a count.
+    """
+    raw = _os.environ.get("ASYMM_DENSE_STREAM_M_CHUNKS", "")
+    if raw.strip():
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    block_n = 64
+    block_m = 64
+    n_tiles = max(1, (int(n) + block_n - 1) // block_n)
+    m_tiles = max(1, (int(m) + block_m - 1) // block_m)
+    try:
+        sms = int(torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count)
+    except Exception:
+        sms = 148
+    # Sweep on GB200 at [256K x 2048] x [2048 x 2048] (2026-07-28): 9 chunks
+    # 4.81 ms, 16 -> 4.09, 32 -> 3.77 (optimum), 128 -> 5.21 (W re-stream
+    # cost); legacy single group 14.76 ms. ~6x SM count of CTAs is the knee.
+    target_ctas = 6 * sms
+    chunks = (target_ctas + n_tiles - 1) // n_tiles
+    return max(1, min(chunks, m_tiles))
+
+
 def _single_group_launch_tensors(
-    device: torch.device, m: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    key = (str(device), int(m))
+    device: torch.device, m: int, n: int | None = None
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    chunks = 1 if n is None else _dense_stream_m_chunks(m, n)
+    key = (str(device), int(m), int(chunks))
     cached = _SINGLE_GROUP_LAUNCH_TENSOR_CACHE.get(key)
     if cached is not None:
         return cached
@@ -831,10 +870,29 @@ def _single_group_launch_tensors(
         raise RuntimeError(
             "single-group AsymGEMM launch tensors must be initialized before CUDA graph capture"
         )
-    offsets = torch.tensor([0, int(m)], device=device, dtype=torch.int32)
-    experts = torch.tensor([0, -1], device=device, dtype=torch.int32)
-    _SINGLE_GROUP_LAUNCH_TENSOR_CACHE[key] = (offsets, experts)
-    return offsets, experts
+    if chunks <= 1:
+        offsets = torch.tensor([0, int(m)], device=device, dtype=torch.int32)
+        experts = torch.tensor([0, -1], device=device, dtype=torch.int32)
+        cached = (offsets, experts, 2)
+    else:
+        block_m = int(_os.environ.get("DG_BF16_BLOCK_M", "64") or 64)
+        m_tiles = (int(m) + block_m - 1) // block_m
+        chunks = min(chunks, m_tiles)
+        bounds = [0]
+        for c in range(1, chunks):
+            bounds.append(min(int(m), (m_tiles * c // chunks) * block_m))
+        bounds.append(int(m))
+        bounds = sorted(set(bounds))
+        # The kernel consumes PAIR offsets: [start_g, end_g] per group.
+        pairs: list[int] = []
+        for lo, hi in zip(bounds[:-1], bounds[1:]):
+            pairs.extend((lo, hi))
+        groups = len(bounds) - 1
+        offsets = torch.tensor(pairs, device=device, dtype=torch.int32)
+        experts = torch.tensor([0] * groups + [-1], device=device, dtype=torch.int32)
+        cached = (offsets, experts, groups + 1)
+    _SINGLE_GROUP_LAUNCH_TENSOR_CACHE[key] = cached
+    return cached
 
 
 def _resolve_launch_tensor_device(device: torch.device | str | int) -> torch.device:
@@ -853,7 +911,8 @@ def initialize_asym_single_group_launch_tensors(
     rows_int = int(rows)
     if rows_int <= 0:
         raise ValueError(f"rows must be positive, got {rows}")
-    return _single_group_launch_tensors(_resolve_launch_tensor_device(device), rows_int)
+    offsets, experts, _ = _single_group_launch_tensors(_resolve_launch_tensor_device(device), rows_int)
+    return offsets, experts
 
 
 def initialize_asym_cuda_graph_state(
@@ -894,10 +953,10 @@ def _asym_bf16_nt(
     m = int(a.shape[0])
     n = int(b_cpu.shape[1] if transpose_b else b_cpu.shape[0])
     d = torch.empty((m, n), device=a.device, dtype=output_dtype)
-    offsets, experts = _single_group_launch_tensors(a.device, m)
+    offsets, experts, list_size = _single_group_launch_tensors(a.device, m, n)
     b_group = b_cpu.unsqueeze(0)
     asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous(
-        a, b_group, d, offsets, experts, 2, compiled_dims, transpose_b
+        a, b_group, d, offsets, experts, list_size, compiled_dims, transpose_b
     )
     return d
 
@@ -1017,7 +1076,9 @@ def _asym_quantized_nt(
     b_scales = _stage_quantized_tensor_for_kernel(qweight.scales, a.device)
     b_group = (b_values.unsqueeze(0), b_scales.unsqueeze(0))
     d = torch.empty((m, n), device=a.device, dtype=_quantized_output_dtype(a, precision=precision))
-    offsets, experts = _single_group_launch_tensors(a.device, m)
+    # Quantized path keeps the legacy single-group launch (n=None): the fp8/fp4
+    # kernels have not been validated with the grid-fill chunked metadata.
+    offsets, experts, _ = _single_group_launch_tensors(a.device, m)
     kernel_compiled_dims = _quantized_compiled_dims(compiled_dims)
 
     if precision == "fp8":
