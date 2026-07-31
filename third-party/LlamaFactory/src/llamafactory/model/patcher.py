@@ -31,6 +31,8 @@ from .model_utils.kv_cache import configure_kv_cache
 from .model_utils.longlora import configure_longlora
 from .model_utils.moe import add_z3_leaf_module, configure_moe
 from .model_utils.quantization import configure_quantization
+from .model_utils.qwen35_attn_chunk import apply_qwen35_attn_chunk
+from .model_utils.qwen35_delta_chunk import apply_qwen35_delta_chunk
 from .model_utils.rope import configure_rope
 from .model_utils.valuehead import prepare_valuehead_model
 from .model_utils.visual import autocast_projector_dtype, configure_visual_model
@@ -395,6 +397,13 @@ def patch_model(
 
     if add_valuehead:
         prepare_valuehead_model(model)
+
+    # Backend-agnostic seq-chunked qwen3.5 gated-deltanet (inert unless
+    # QWEN35_DELTA_CHUNK_SIZE is set; see model_utils/qwen35_delta_chunk.py).
+    apply_qwen35_delta_chunk(model)
+    # Backend-agnostic q-chunked attention BACKWARD for qwen3.5 (inert unless
+    # QWEN35_ATTN_BWD_CHUNK_Q is set; see model_utils/qwen35_attn_chunk.py).
+    apply_qwen35_attn_chunk(model)
 
     if model_args.resize_vocab:
         resize_embedding_layer(
