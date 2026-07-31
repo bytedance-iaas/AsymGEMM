@@ -10,6 +10,47 @@ import torch
 from torch import nn
 from torch.autograd.graph import saved_tensors_hooks
 
+from .attention_activation_offload import _h2d_restage_stream
+
+
+def _async_unpack_enabled() -> bool:
+    """Restage saved tensors on the
+    shared H2D side stream with event ordering (the attention-wrapper pattern)
+    instead of the host-blocking ready_event.synchronize() + sync copy."""
+    raw = os.environ.get(
+        "ASYM_SAVED_TENSOR_ASYNC_UNPACK",
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYM_SAVED_TENSOR_ASYNC_UNPACK", "0"),
+    )
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _async_pack_enabled() -> bool:
+    """Issue the saved-tensor D2H on a
+    dedicated side stream instead of the compute stream. Same-stream non_blocking copies
+    are stream-ordered against kernels, so the offload serializes with backward compute
+    (the nsys D2H bucket); a side stream + producer-event + record_stream keepalive makes
+    the copy engine overlap compute. Default off = pre-fix behavior."""
+    raw = os.environ.get(
+        "ASYM_SAVED_TENSOR_ASYNC_PACK",
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYM_SAVED_TENSOR_ASYNC_PACK", "0"),
+    )
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+_D2H_OFFLOAD_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _d2h_offload_stream(device: torch.device) -> torch.cuda.Stream:
+    """Per-device side stream for pack-time D2H offload copies (mirror of
+    attention_activation_offload._h2d_restage_stream)."""
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    stream = _D2H_OFFLOAD_STREAMS.get(idx)
+    if stream is None:
+        with torch.cuda.device(idx):
+            stream = torch.cuda.Stream()
+        _D2H_OFFLOAD_STREAMS[idx] = stream
+    return stream
+
 
 _DEFAULT_SAVED_TENSOR_OFFLOAD_MIN_BYTES = 1 * 1024**2
 _DEFAULT_SAVED_TENSOR_OFFLOAD_DTYPES = frozenset({torch.bfloat16, torch.float16, torch.float32})
@@ -68,18 +109,29 @@ def _tensor_storage_nbytes(tensor: torch.Tensor) -> int:
         return int(tensor.numel() * tensor.element_size())
 
 
+# Times a REQUESTED pin fell back to pageable in this module (process-wide, across all
+# wrapper instances — read as max-across-rows in artifacts, never summed). The decoder
+# saved-tensor wrapper is live on the same runs that A/B ASYM_SAVED_TENSOR_ASYNC_UNPACK,
+# so without this the flag's "on" is indistinguishable from "silently degraded".
+_PIN_FALLBACK_CALLS = 0
+
+
 def _empty_strided_cpu_like(tensor: torch.Tensor, *, pin_memory: bool) -> torch.Tensor:
+    global _PIN_FALLBACK_CALLS
     shape = tuple(int(dim) for dim in tensor.shape)
     stride = tuple(int(value) for value in tensor.stride())
+    want_pin = bool(pin_memory and torch.cuda.is_available())
     try:
         return torch.empty_strided(
             shape,
             stride,
             device="cpu",
             dtype=tensor.dtype,
-            pin_memory=bool(pin_memory and torch.cuda.is_available()),
+            pin_memory=want_pin,
         )
     except RuntimeError:
+        if want_pin:
+            _PIN_FALLBACK_CALLS += 1
         return torch.empty_strided(shape, stride, device="cpu", dtype=tensor.dtype)
 
 
@@ -190,12 +242,21 @@ class DecoderSavedTensorOffloadWrapper:
             return tensor
         cpu = _empty_strided_cpu_like(tensor, pin_memory=self.pin_memory)
         non_blocking = bool(cpu.is_pinned())
-        with torch.no_grad():
-            cpu.copy_(tensor.detach(), non_blocking=non_blocking)
         ready_event = None
-        if non_blocking:
+        if _async_pack_enabled() and non_blocking:
+            side = _d2h_offload_stream(tensor.device)
+            side.wait_stream(torch.cuda.current_stream(tensor.device))  # source produced on compute
+            with torch.no_grad(), torch.cuda.stream(side):
+                cpu.copy_(tensor.detach(), non_blocking=True)
             ready_event = torch.cuda.Event()
-            ready_event.record(torch.cuda.current_stream(tensor.device))
+            ready_event.record(side)
+            tensor.record_stream(side)  # keep the GPU source alive until the side-stream copy drains
+        else:
+            with torch.no_grad():
+                cpu.copy_(tensor.detach(), non_blocking=non_blocking)
+            if non_blocking:
+                ready_event = torch.cuda.Event()
+                ready_event.record(torch.cuda.current_stream(tensor.device))
         nbytes = _tensor_storage_nbytes(cpu)
         tag = self._tag_for(tensor)
         self.offload_calls += 1
@@ -224,16 +285,31 @@ class DecoderSavedTensorOffloadWrapper:
     def _unpack(self, packed: torch.Tensor | _SavedTensorOffloadHandle) -> torch.Tensor:
         if not isinstance(packed, _SavedTensorOffloadHandle):
             return packed
-        if packed.ready_event is not None:
-            packed.ready_event.synchronize()
         staged = torch.empty_strided(
             packed.original_shape,
             packed.original_stride,
             device=packed.original_device,
             dtype=packed.original_dtype,
         )
-        with torch.no_grad():
-            staged.copy_(packed.tensor, non_blocking=False)
+        if _async_unpack_enabled() and packed.tensor.is_pinned():
+            compute_stream = torch.cuda.current_stream(packed.original_device)
+            side = _h2d_restage_stream(packed.original_device)
+            if packed.ready_event is not None:
+                side.wait_event(packed.ready_event)
+            side.wait_stream(compute_stream)  # staged alloc ordering
+            with torch.no_grad(), torch.cuda.stream(side):
+                staged.copy_(packed.tensor, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(side)
+            compute_stream.wait_event(done)
+            staged.record_stream(side)
+            # keep the cpu buffer alive until the staged tensor dies (async copy source)
+            staged._asym_restage_keepalive = packed.tensor  # type: ignore[attr-defined]
+        else:
+            if packed.ready_event is not None:
+                packed.ready_event.synchronize()
+            with torch.no_grad():
+                staged.copy_(packed.tensor, non_blocking=False)
         self.unpack_calls += 1
         self.staged_bytes += packed.nbytes
         self.max_stage_bytes_live = max(self.max_stage_bytes_live, self.staged_bytes)
@@ -253,6 +329,8 @@ class DecoderSavedTensorOffloadWrapper:
             "calls": self.calls,
             "min_bytes": self.min_bytes,
             "require_grad": self.require_grad,
+            # module-global (same value on every row): max across rows, never sum
+            "pin_fallback_calls_module_global": _PIN_FALLBACK_CALLS,
             "allowed_dtypes": [str(dtype).replace("torch.", "") for dtype in sorted(self.allowed_dtypes, key=str)],
             "offloaded_bytes": self.offloaded_bytes,
             "cpu_owned_bytes": self.cpu_owned_bytes,
