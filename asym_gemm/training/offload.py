@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import os
 from typing import Any
 
 import torch
@@ -388,6 +389,66 @@ class AsymFrozenEmbedding(nn.Module):
         return out_cpu.to(device=target_device, non_blocking=True)
 
 
+def _rmsnorm_chunk_rows(total_rows: int, row_width: int) -> int:
+    """Row chunk for the memory-lean RMSNorm (fp32 transient budget; mirrors
+    ASYMM_FG_ELEMENTWISE_CHUNK_MB, 0 = legacy autograd path). Returns the rows
+    per fp32 working chunk; total_rows means a single chunk."""
+    raw = os.environ.get(
+        "ASYMM_FG_ELEMENTWISE_CHUNK_MB",
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_FG_ELEMENTWISE_CHUNK_MB"),
+    )
+    if raw is None or str(raw).strip() == "":
+        mb = 1024
+    else:
+        try:
+            mb = int(str(raw).strip())
+        except ValueError:
+            mb = 1024
+    if mb <= 0 or total_rows <= 0 or row_width <= 0:
+        return 0
+    rows = (mb * 1024 * 1024) // max(1, row_width * 4)
+    return max(8192, min(int(rows), int(total_rows)))
+
+
+class _RMSNormChunkedFunction(torch.autograd.Function):
+    """RMSNorm with frozen scale: saves only the bf16 input (a reference to
+    storage the caller already holds) plus a [rows,1] fp32 rstd, and runs the
+    fp32 math in row chunks. The stock upcast implementation leaves ~3 full-width
+    fp32 tensors in the autograd graph per call (20 GB-class at long seq)."""
+
+    @staticmethod
+    def forward(ctx: object, x: torch.Tensor, scale_f32: torch.Tensor, eps: float) -> torch.Tensor:
+        flat = x.reshape(-1, int(x.shape[-1]))
+        rows, width = int(flat.shape[0]), int(flat.shape[1])
+        chunk = _rmsnorm_chunk_rows(rows, width) or rows
+        out = torch.empty_like(flat)
+        rstd = torch.empty((rows, 1), device=flat.device, dtype=torch.float32)
+        for row_start in range(0, rows, chunk):
+            row_end = min(rows, row_start + chunk)
+            x_f = flat[row_start:row_end].to(torch.float32)
+            rstd[row_start:row_end] = torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + eps)
+            out[row_start:row_end] = x_f.mul_(rstd[row_start:row_end]).mul_(scale_f32).to(dtype=out.dtype)
+        ctx.save_for_backward(flat, rstd, scale_f32)
+        ctx.rms_chunk = chunk
+        return out.reshape(x.shape)
+
+    @staticmethod
+    def backward(ctx: object, grad_out: torch.Tensor):
+        flat, rstd, scale_f32 = ctx.saved_tensors
+        rows, width = int(flat.shape[0]), int(flat.shape[1])
+        grad_flat = grad_out.reshape(rows, width)
+        chunk = int(ctx.rms_chunk)
+        dx = torch.empty_like(flat)
+        for row_start in range(0, rows, chunk):
+            row_end = min(rows, row_start + chunk)
+            r = rstd[row_start:row_end]
+            wdy = grad_flat[row_start:row_end].to(torch.float32).mul_(scale_f32)
+            x_hat = flat[row_start:row_end].to(torch.float32).mul_(r)
+            m = (x_hat * wdy).mean(-1, keepdim=True)
+            dx[row_start:row_end] = wdy.sub_(x_hat.mul_(m)).mul_(r).to(dtype=dx.dtype)
+        return dx.reshape(grad_out.shape), None, None
+
+
 class AsymFrozenRMSNorm(nn.Module):
     def __init__(self, source: nn.Module, *, host_weight: HostWeight | None = None, pin_memory: bool = False) -> None:
         super().__init__()
@@ -423,9 +484,11 @@ class AsymFrozenRMSNorm(nn.Module):
             out = weight * out.to(input_dtype)
             out = out * F.silu(gate.to(torch.float32))
             return out.to(dtype=input_dtype)
+        scale = 1.0 + weight.float() if self.shifted_weight else weight.float()
+        if x.is_cuda and _rmsnorm_chunk_rows(int(x.numel() // max(1, x.shape[-1])), int(x.shape[-1])) > 0:
+            return _RMSNormChunkedFunction.apply(x, scale, self.eps)
         variance = x.float().pow(2).mean(-1, keepdim=True)
         out = x.float() * torch.rsqrt(variance + self.eps)
-        scale = 1.0 + weight.float() if self.shifted_weight else weight.float()
         return (out * scale).to(dtype=x.dtype)
 
 
