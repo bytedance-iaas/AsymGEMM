@@ -60,6 +60,22 @@ def _env_int(name: str, default: int = 0) -> int:
 
 
 _UNSLOTH_GC_OUTER_SAVE_COUNTER = 0
+_GC_BACKWARD_LAYER_COUNTER = 0
+
+
+def _maybe_release_cached_blocks_per_gc_layer() -> None:
+    # Under expandable segments, peak RESERVED is the
+    # union of per-stream pool high-waters across backward sub-phases (per-layer
+    # chunk recompute / expert / attention transients). Releasing free pages every
+    # N checkpointed-layer backwards lets pools re-grow from ~allocated instead.
+    # Default OFF; backend-agnostic (every backend runs this GC path).
+    every_n = _env_int("ASYM_EMPTY_CACHE_EVERY_GC_LAYERS", 0)
+    if every_n <= 0:
+        return
+    global _GC_BACKWARD_LAYER_COUNTER
+    _GC_BACKWARD_LAYER_COUNTER += 1
+    if _GC_BACKWARD_LAYER_COUNTER % every_n == 0 and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
 
 
 def _should_keep_unsloth_outer_hidden_on_hbm() -> bool:
@@ -81,6 +97,15 @@ def get_unsloth_gradient_checkpointing_func() -> Callable:
 
         return get_asym_unsloth_gc_func()
 
+    try:
+        # Phase D4 (asym fix_throughput C3): pinned root + side-stream restage and an
+        # async save_on_cpu. Gated by ASYM_SAVED_TENSOR_ASYNC_UNPACK (default off) —
+        # the stock path below saves the root to PAGEABLE cpu memory, making the
+        # per-layer backward fetch a host-blocking pageable H2D.
+        from asym_gemm.training import gc_async_offload as _asym_gc_async
+    except Exception:  # pragma: no cover - asym_gemm absent
+        _asym_gc_async = None
+
     class UnslothGradientCheckpointing(torch.autograd.Function):
         r"""Saves VRAM by smartly offloading to RAM."""
 
@@ -92,8 +117,15 @@ def get_unsloth_gradient_checkpointing_func() -> Callable:
             hidden_states: "torch.Tensor",
             *args: Union["torch.Tensor", Any],
         ) -> "torch.Tensor":
+            async_gc = _asym_gc_async is not None and _asym_gc_async.async_gc_offload_enabled()
+            ctx.asym_root_ready = None
+            ctx.asym_root_device = None
             if hidden_states.is_cuda and _should_keep_unsloth_outer_hidden_on_hbm():
                 saved_hidden_states = hidden_states
+            elif async_gc and hidden_states.is_cuda:
+                saved_hidden_states, ready = _asym_gc_async.pack_root_to_pinned_cpu(hidden_states)
+                ctx.asym_root_ready = ready
+                ctx.asym_root_device = hidden_states.device
             else:
                 saved_hidden_states = hidden_states.to("cpu", non_blocking=True)
             with torch.no_grad():
@@ -108,17 +140,28 @@ def get_unsloth_gradient_checkpointing_func() -> Callable:
         @torch.cuda.amp.custom_bwd
         def backward(ctx: "torch.autograd.Function", grad_output: "torch.Tensor") -> "torch.Tensor":
             (hidden_states,) = ctx.saved_tensors
-            hidden_states = hidden_states.to("cuda", non_blocking=True).detach()
+            async_gc = _asym_gc_async is not None and _asym_gc_async.async_gc_offload_enabled()
+            if getattr(ctx, "asym_root_device", None) is not None and not hidden_states.is_cuda:
+                hidden_states = _asym_gc_async.fetch_root_async(
+                    hidden_states, ctx.asym_root_ready, ctx.asym_root_device
+                ).detach()
+            else:
+                hidden_states = hidden_states.to("cuda", non_blocking=True).detach()
             hidden_states.requires_grad_(True)
             with torch.enable_grad():
                 if _env_flag("UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU"):
-                    with torch.autograd.graph.save_on_cpu(pin_memory=True):
+                    if async_gc:
+                        save_ctx = _asym_gc_async.async_save_on_cpu()
+                    else:
+                        save_ctx = torch.autograd.graph.save_on_cpu(pin_memory=True)
+                    with save_ctx:
                         outputs = ctx.forward_function(hidden_states, *ctx.args)
                 else:
                     outputs = ctx.forward_function(hidden_states, *ctx.args)
                 output = outputs[0] if isinstance(outputs, tuple) else outputs
 
             torch.autograd.backward(output, grad_output)
+            _maybe_release_cached_blocks_per_gc_layer()
             return (None, hidden_states.grad) + (None,) * len(ctx.args)
 
     return UnslothGradientCheckpointing.apply
