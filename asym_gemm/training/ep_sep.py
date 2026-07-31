@@ -1,5 +1,12 @@
-"""S6 TRUE sEP (fix_gb200_ep.md S6): union-queue expert-work sharing over the shared
-pinned fabric — the queue-emergent flavor picked by the S6 micro (2026-07-09).
+"""S6 TRUE sEP (fix_gb200_ep.md S6): union expert-work sharing over the shared
+pinned fabric. TWO flavors share every line of transport (NAMING EPOCH 2026-07-10):
+  queue (asym_sepqueue2, ASYM_EP_SEP_MODE=queue, default) — side 0 pops the union
+        front, side 1 the back, on a SHARED counter block; the meet point IS the
+        split (dynamic, needs no counts).
+  plan  (asym_sepplan2, ASYM_EP_SEP_MODE=plan) — the split is COMPUTED from the
+        union counts (contiguous cut at a segment boundary, both ranks derive it
+        identically); each side launches only its sublist with a PRIVATE counter
+        block, then fabricates the meet point so spin_gather is unchanged.
 
 Per armed grouped launch, BOTH ranks execute ONE union work list (side 0 pops from
 the front, side 1 from the back — the ep_steal kernel family):
@@ -36,6 +43,12 @@ import torch
 _ENABLED = os.environ.get("ASYM_EP_SEP") == "1"
 _MAX_MPE = int(os.environ.get("ASYM_EP_SEP_MAX_MPE", "4096") or 4096)
 _SPIN_TIMEOUT_S = float(os.environ.get("ASYM_EP_SEP_SPIN_TIMEOUT_S", "120") or 120)
+# NAMING EPOCH 2026-07-10 (fix_gb200_ep_v2): backend asym_sepqueue2 -> mode "queue"
+# (counter-raced steal — the original S6 flavor); asym_sepplan2 -> mode "plan"
+# (same union/transport, the cut COMPUTED from counts; no racing).
+_MODE = os.environ.get("ASYM_EP_SEP_MODE", "queue") or "queue"
+if _ENABLED and _MODE not in ("queue", "plan"):
+    raise RuntimeError(f"ASYM_EP_SEP_MODE must be 'queue' or 'plan', got '{_MODE}'")
 
 RING = 4
 FLAG_SLOTS = 256          # rotating hdr/done flag indices; far-ahead host zeroing
@@ -71,6 +84,16 @@ class _SepState:
         self.x_slots = x_slots  # x_slots[rank][ring] flat pinned bf16
         self.d_slots = d_slots  # d_slots[rank][ring] flat pinned bf16 (my staging OF PEER rows)
         self.seq = 0
+        self.mode = _MODE
+        if self.mode == "plan":
+            # the steal kernel is ONE ITEM PER CTA; queue mode tolerates the tuned
+            # 75% grid because the two sides' grids overlap on the SHARED counters,
+            # but a private-block sublist launch must cover ALL its items alone —
+            # probe receipt: bad rows began exactly at grid_y_local * n_blk.
+            prior = os.environ.get("DG_EP_QUEUE_GRID_PCT")
+            if prior not in (None, "", "100"):
+                print(f"[ep_sep] plan mode forces DG_EP_QUEUE_GRID_PCT=100 (was {prior})")
+            os.environ["DG_EP_QUEUE_GRID_PCT"] = "100"
         self.side_stream = side_stream or torch.cuda.Stream()
         self.stats = {"armed": 0, "declined": 0, "spin_wait_s": 0.0}
 
@@ -81,8 +104,10 @@ class _SepState:
     def _done_flag_idx(self, rank: int, seq: int) -> int:
         return self._done_flag_base + rank * FLAG_SLOTS + (seq % FLAG_SLOTS)
 
-    def _counters(self, seq: int) -> torch.Tensor:
-        lo = self._ctr_base + (seq % RING) * 8
+    def _counters(self, seq: int, block: int = 0) -> torch.Tensor:
+        # block 0 = the shared queue-race block (both sides). Plan mode gives each
+        # side a PRIVATE block (0/1) inside the same ring slot — 6 of the 8 ints.
+        lo = self._ctr_base + (seq % RING) * 8 + 3 * block
         return self.ctrl[lo:lo + 3]
 
     def _header(self, rank: int, seq: int) -> torch.Tensor:
@@ -90,6 +115,29 @@ class _SepState:
         return self.ctrl[lo:lo + _HDR_INTS]
 
     # ---- the armed launch -----------------------------------------------------
+    def pre_gate(self, m: int, k: int, n_segs: int) -> bool:
+        """Host-int decline check BEFORE the caller pays offsets.cpu().tolist()
+        (a per-call GPU sync — measured +6.7 s/step at 20k where every call
+        declines). Declining here consumes the seq and PUBLISHES flag=2 exactly
+        like try_armed's decline (asymmetric peers resolve via the published
+        flag); passing consumes nothing — try_armed follows and owns the seq."""
+        x_slot = self.x_slots[self.rank][self.seq % RING]
+        decline = (
+            n_segs == 0 or n_segs > MAX_SEGS or m == 0
+            or m / max(1, n_segs) > _MAX_MPE
+            or m * k > x_slot.numel()
+        )
+        if not decline:
+            return True
+        seq = self.seq
+        self.seq += 1
+        ahead = seq + FLAG_SLOTS // 2
+        self.ctrl[self._hdr_flag_idx(self.rank, ahead)] = 0
+        self.ctrl[self._done_flag_idx(self.rank, ahead)] = 0
+        self.stats["declined"] += 1
+        self.ctrl[self._hdr_flag_idx(self.rank, seq)] = 2
+        return False
+
     def try_armed(self, asym_gemm, a: torch.Tensor, b: torch.Tensor, d: torch.Tensor,
                   segs: list[tuple[int, int, int]], compiled_dims: str,
                   transpose_b: bool) -> bool:
@@ -181,6 +229,62 @@ class _SepState:
         peer_x = self.x_slots[peer][ring][: m_peer * k].view(m_peer, k)
         d_peer = d_stage_mine[: m_peer * n].view(m_peer, n)
 
+        if self.mode == "plan":
+            # PLAN flavor (asym_sepplan2): identical union + transport, but the cut
+            # is COMPUTED from the counts — a contiguous prefix/suffix split at a
+            # segment boundary balancing rows (the arming rule caps rows/segment at
+            # _MAX_MPE, so segment granularity is fine). Each side launches ONLY its
+            # sublist with a PRIVATE counter block (zero-steal claims it whole; no
+            # cross-GPU counter traffic at all); one host write then fabricates the
+            # queue-final counter state so the unchanged spin_gather sees the
+            # planned meet point. Both ranks compute the same cut from the same
+            # union — no extra exchange.
+            rows = [hi - lo for _, lo, hi in union]
+            acc, half = 0, sum(rows) / 2.0
+            k_seg, best_gap = 0, float("inf")
+            for i, r in enumerate(rows):
+                acc += r
+                gap = abs(acc - half)
+                if gap < best_gap:
+                    best_gap, k_seg = gap, i + 1
+            # HYSTERESIS: crossing the ownership boundary couples this launch on the
+            # peer's completion (the gather must wait for its done flag). Only pay
+            # that when the cut actually moves meaningful work — under equal-shard
+            # DP the row-balanced cut lands within a segment of n_own, and snapping
+            # to n_own makes the launch fully local (gather early-exits, zero
+            # coupling), exactly like an un-stolen queue launch.
+            own_rows = sum(rows[:n_own])
+            if abs(own_rows - half) <= _MAX_MPE:
+                k_seg = n_own
+            if 0 < k_seg < total:
+                lo_seg, hi_seg = (0, k_seg) if me == 0 else (k_seg, total)
+                sub_pairs = pairs[2 * lo_seg: 2 * hi_seg]
+                sub_ids = torch.cat([ids[lo_seg:hi_seg], ids[total:total + 1]])
+                sub_n_own = max(0, min(n_own, hi_seg) - lo_seg)
+                ctr = self._counters(seq, block=me)
+                ctr.zero_()
+                n_blk = asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous_ep_steal(
+                    a, b, d, peer_x, d_peer, sub_pairs, sub_ids,
+                    (hi_seg - lo_seg) + 1, ctr, me, sub_n_own,
+                    compiled_dims, transpose_b)
+                done_ev = torch.cuda.Event()
+                done_ev.record()
+                done_ev.synchronize()
+                self.ctrl[self._done_flag_idx(me, seq)] = 1
+                # fabricate the meet point on MY private block (host write happens
+                # before the gather kernel launch => visible to its sysmem reads)
+                ctr[1] = k_seg * n_blk
+                ctr[2] = (total - k_seg) * n_blk
+                _C.ep_steal_spin_gather(
+                    d, self.d_slots[peer][ring][: m * n].view(m, n), pairs,
+                    ctr, self.ctrl, self._done_flag_idx(peer, seq),
+                    n_blk, total, n_own, me)
+                self.stats["armed"] += 1
+                self.stats["planned"] = self.stats.get("planned", 0) + 1
+                return True
+            # degenerate cut (one side would idle) => fall through to the queue race
+            # (both ranks compute the same k_seg, so the branch stays symmetric)
+
         n_blk = asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous_ep_steal(
             a, b, d, peer_x, d_peer, pairs, ids, total + 1,
             self._counters(seq), me, n_own, compiled_dims, transpose_b)
@@ -209,6 +313,14 @@ def install_buffers(*, rank: int, world: int, ctrl: torch.Tensor,
                     d_slots: list[list[torch.Tensor]]) -> _SepState:
     global _STATE
     _STATE = _SepState(rank=rank, world=world, ctrl=ctrl, x_slots=x_slots, d_slots=d_slots)
+
+    import atexit
+
+    def _dump_stats(st=_STATE):
+        s = {k: (round(v, 4) if isinstance(v, float) else v) for k, v in st.stats.items()}
+        print(f"[ep_sep] rank{st.rank} mode={st.mode} exit stats: {s}", flush=True)
+
+    atexit.register(_dump_stats)
     return _STATE
 
 
