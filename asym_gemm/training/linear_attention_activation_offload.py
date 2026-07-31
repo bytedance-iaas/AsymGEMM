@@ -10,6 +10,9 @@ import torch
 from torch import nn
 from torch.autograd.graph import saved_tensors_hooks
 
+from .attention_activation_offload import _h2d_restage_stream
+from .decoder_activation_offload import _async_unpack_enabled
+
 
 _DEFAULT_SAVED_TENSOR_OFFLOAD_MIN_BYTES = 1 * 1024**2
 _DEFAULT_SAVED_TENSOR_OFFLOAD_DTYPES = frozenset({torch.bfloat16, torch.float16, torch.float32})
@@ -32,6 +35,20 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None or raw == "":
         return bool(default)
     return raw.lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _in_backward_graph_task() -> bool:
+    # Under unsloth-GC (recomp-off-* / full-fg) the grad-enabled forward of this
+    # module only ever runs as a RECOMPUTE inside the backward pass (the outer
+    # pass is no-grad, so the hooks never fire there). Offloading in that window
+    # is a pure D2H+H2D round trip whose staged unpack copies coexist with the
+    # recomputed originals and the fla backward workspace — it inflates peak HBM
+    # instead of reducing it. torch reports an active backward graph task id
+    # (>= 0) exactly in that window.
+    try:
+        return torch._C._current_graph_task_id() != -1
+    except AttributeError:
+        return False
 
 
 def _linear_attention_saved_tensor_min_bytes() -> int:
@@ -68,18 +85,35 @@ def _tensor_storage_nbytes(tensor: torch.Tensor) -> int:
         return int(tensor.numel() * tensor.element_size())
 
 
+# Times a REQUESTED pin fell back to pageable in this module (process-wide, across all
+# wrapper instances — read as max-across-rows in artifacts, never summed). Same counter
+# pattern in attention_activation_offload.py and decoder_activation_offload.py, whose
+# wrappers are live on the same runs — check all three before trusting an async-unpack A/B.
+_PIN_FALLBACK_CALLS = 0
+
+
 def _empty_strided_cpu_like(tensor: torch.Tensor, *, pin_memory: bool) -> torch.Tensor:
+    global _PIN_FALLBACK_CALLS
     shape = tuple(int(dim) for dim in tensor.shape)
     stride = tuple(int(value) for value in tensor.stride())
+    want_pin = bool(pin_memory and torch.cuda.is_available())
     try:
         return torch.empty_strided(
             shape,
             stride,
             device="cpu",
             dtype=tensor.dtype,
-            pin_memory=bool(pin_memory and torch.cuda.is_available()),
+            pin_memory=want_pin,
         )
     except RuntimeError:
+        # Pinning failed (typically host pinned-pool exhaustion). Returning a pageable
+        # buffer keeps the step alive, but it silently DOWNGRADES the path: _pack then
+        # leaves ready_event=None and _unpack takes the host-blocking pageable branch —
+        # precisely what ASYM_SAVED_TENSOR_ASYNC_UNPACK exists to remove. Count it (only
+        # when a pin was actually requested) so a run can distinguish "async unpack on"
+        # from "silently degraded". Most likely under pinned pressure at 120k/131k.
+        if want_pin:
+            _PIN_FALLBACK_CALLS += 1
         return torch.empty_strided(shape, stride, device="cpu", dtype=tensor.dtype)
 
 
@@ -122,6 +156,14 @@ class LinearAttentionSavedTensorOffloadWrapper:
             if require_grad is None
             else bool(require_grad)
         )
+        self.skip_in_backward = _env_bool(
+            "ASYM_LINEAR_ATTENTION_SAVED_TENSOR_OFFLOAD_SKIP_IN_BACKWARD",
+            # default AUTO: when the LF unsloth-GC save_on_cpu recompute wrapper is
+            # active, the in-backward offload here is a redundant duplicate round
+            # trip (fix_qwen3.5.md §10b C3) — skip it; explicit env overrides.
+            _env_bool("UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU", False),
+        )
+        self.skipped_backward_calls = 0
         self.calls = 0
         self.offload_calls = 0
         self.unpack_calls = 0
@@ -148,6 +190,10 @@ class LinearAttentionSavedTensorOffloadWrapper:
     def run(self, *args: Any, **kwargs: Any) -> Any:
         self.calls += 1
         if not self.module.training or not torch.is_grad_enabled():
+            return self.original_forward(*args, **kwargs)
+        if self.skip_in_backward and _in_backward_graph_task():
+            self.skipped_backward_calls += 1
+            self._sync_module_stats()
             return self.original_forward(*args, **kwargs)
         with saved_tensors_hooks(self._pack, self._unpack):
             return self.original_forward(*args, **kwargs)
@@ -220,16 +266,31 @@ class LinearAttentionSavedTensorOffloadWrapper:
     def _unpack(self, packed: torch.Tensor | _SavedTensorOffloadHandle) -> torch.Tensor:
         if not isinstance(packed, _SavedTensorOffloadHandle):
             return packed
-        if packed.ready_event is not None:
-            packed.ready_event.synchronize()
         staged = torch.empty_strided(
             packed.original_shape,
             packed.original_stride,
             device=packed.original_device,
             dtype=packed.original_dtype,
         )
-        with torch.no_grad():
-            staged.copy_(packed.tensor, non_blocking=False)
+        if _async_unpack_enabled() and packed.tensor.is_pinned():
+            compute_stream = torch.cuda.current_stream(packed.original_device)
+            side = _h2d_restage_stream(packed.original_device)
+            if packed.ready_event is not None:
+                side.wait_event(packed.ready_event)
+            side.wait_stream(compute_stream)  # staged alloc ordering
+            with torch.no_grad(), torch.cuda.stream(side):
+                staged.copy_(packed.tensor, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(side)
+            compute_stream.wait_event(done)
+            staged.record_stream(side)
+            # keep the cpu buffer alive until the staged tensor dies (async copy source)
+            staged._asym_restage_keepalive = packed.tensor  # type: ignore[attr-defined]
+        else:
+            if packed.ready_event is not None:
+                packed.ready_event.synchronize()
+            with torch.no_grad():
+                staged.copy_(packed.tensor, non_blocking=False)
         self.unpack_calls += 1
         self.staged_bytes += packed.nbytes
         self.max_stage_bytes_live = max(self.max_stage_bytes_live, self.staged_bytes)
@@ -249,6 +310,13 @@ class LinearAttentionSavedTensorOffloadWrapper:
             "calls": self.calls,
             "min_bytes": self.min_bytes,
             "require_grad": self.require_grad,
+            "skip_in_backward": self.skip_in_backward,
+            "skipped_backward_calls": self.skipped_backward_calls,
+            # >0 means some saved tensors are pageable, so their unpack blocked the host
+            # regardless of ASYM_SAVED_TENSOR_ASYNC_UNPACK — read any async-unpack A/B
+            # with this in hand. Module-global (same value on every row): max across
+            # rows, never sum.
+            "pin_fallback_calls_module_global": _PIN_FALLBACK_CALLS,
             "allowed_dtypes": [str(dtype).replace("torch.", "") for dtype in sorted(self.allowed_dtypes, key=str)],
             "offloaded_bytes": self.offloaded_bytes,
             "cpu_owned_bytes": self.cpu_owned_bytes,
