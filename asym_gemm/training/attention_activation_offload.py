@@ -53,11 +53,21 @@ def _restore_last_dim(x: torch.Tensor, input_shape: tuple[int, ...], out_feature
     return x.reshape(*input_shape[:-1], int(out_features))
 
 
+# Times a REQUESTED pin fell back to pageable in this module (process-wide, across all
+# wrapper instances — read as max-across-rows in artifacts, never summed). A pageable
+# buffer silently downgrades every later touch of it to the host-blocking path.
+_PIN_FALLBACK_CALLS = 0
+
+
 def _empty_cpu_like_rows(source: torch.Tensor, rows: int) -> torch.Tensor:
+    global _PIN_FALLBACK_CALLS
     shape = (int(rows), int(source.shape[1]))
+    want_pin = bool(source.is_pinned())
     try:
-        return torch.empty(shape, device="cpu", dtype=source.dtype, pin_memory=bool(source.is_pinned()))
+        return torch.empty(shape, device="cpu", dtype=source.dtype, pin_memory=want_pin)
     except RuntimeError:
+        if want_pin:
+            _PIN_FALLBACK_CALLS += 1
         return torch.empty(shape, device="cpu", dtype=source.dtype)
 
 
@@ -116,6 +126,21 @@ def _record_attn_hbm_gemm(stats: AsymExecutionStats | None, tag: str) -> None:
     stats.attn_act_hbm_gemm_calls_by_tag[tag] = stats.attn_act_hbm_gemm_calls_by_tag.get(tag, 0) + 1
 
 
+def _attn_keep_acts_hbm_enabled() -> bool:
+    """Keep the attention projection source
+    (U) and low-rank S in HBM across the GC-recompute forward->backward window instead
+    of the per-layer CPU round trip. Under staged dispatch the backward dA GEMM
+    re-stages U to GPU anyway (raw H2D — the nsys +66 us/tok bucket) right after the
+    forward's D2H offload (+55 us/tok bucket); both copies vanish when the tensors stay
+    resident. The wrapper runs inside the unsloth-GC recompute, so everything kept here
+    is consumed by the SAME layer's backward (LIFO): peak cost ~= one layer's qkv+o
+    sources (~8 GB @128k b3). Default off = pre-fix behavior."""
+    value = os.environ.get("ASYMM_ATTN_ACT_KEEP_ACTS_HBM")
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _tensor_storage_nbytes(tensor: torch.Tensor) -> int:
     try:
         return int(tensor.untyped_storage().nbytes())
@@ -157,7 +182,66 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _in_backward_graph_task() -> bool:
+    # >= 0 exactly while a backward graph task is executing on this thread,
+    # i.e. during GC recompute forwards. See the same helper in
+    # linear_attention_activation_offload.py for the full rationale.
+    try:
+        return torch._C._current_graph_task_id() != -1
+    except AttributeError:
+        return False
+
+
 _H2D_RESTAGE_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _attn_lora_chunk_enabled() -> bool:
+    """Chunk the attention LoRA full-width delta/dx adds (probe flag, default off):
+    fwd `out = base + s@B^T` and bwd `d_u += dS@A` each materialize a [rows, width]
+    tensor (7.3 GiB for q_proj @120k b8). Chunking reuses fg_chunk_rows sizing."""
+    raw = os.environ.get(
+        "ASYMM_ATTN_ACT_LORA_CHUNK",
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_ATTN_ACT_LORA_CHUNK"),
+    )
+    if raw is None or raw == "":
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _add_matmul_rows_(dest: torch.Tensor, lhs: torch.Tensor, rhs_t: torch.Tensor, *, scale: float = 1.0) -> None:
+    """dest += (lhs @ rhs_t) * scale, chunked over rows when the chunk budget allows.
+    C2 diet (fix_asym S2/S0'): under ASYMM_FUSED_LORA_ADDMM=1 the chain fuses into one
+    addmm_ epilogue (kills two full-width elementwise sweeps + the [M,out] temp)."""
+    from .activation_offload import fg_chunk_rows
+
+    rows = int(dest.shape[0])
+    fused = (
+        os.environ.get("ASYMM_FUSED_LORA_ADDMM", "").strip().lower() in {"1", "true", "yes", "on"}
+        and dest.dim() == 2
+        and lhs.dim() == 2
+        and rhs_t.dim() == 2
+        and dest.dtype == lhs.dtype == rhs_t.dtype
+    )
+    chunk = fg_chunk_rows(rows, int(dest.shape[1]), dest.element_size()) if _attn_lora_chunk_enabled() else 0
+    if chunk <= 0:
+        if fused:
+            dest.addmm_(lhs, rhs_t, alpha=float(scale))
+            return
+        part = lhs @ rhs_t
+        if float(scale) != 1.0:
+            part = part * float(scale)
+        dest.add_(part.to(dtype=dest.dtype))
+        return
+    for row_start in range(0, rows, chunk):
+        row_end = min(rows, row_start + chunk)
+        if fused:
+            dest[row_start:row_end].addmm_(lhs[row_start:row_end], rhs_t, alpha=float(scale))
+            continue
+        part = lhs[row_start:row_end] @ rhs_t
+        if float(scale) != 1.0:
+            part = part * float(scale)
+        dest[row_start:row_end].add_(part.to(dtype=dest.dtype))
+        del part
 
 
 def _h2d_restage_stream(device: torch.device) -> torch.cuda.Stream:
@@ -173,17 +257,24 @@ def _h2d_restage_stream(device: torch.device) -> torch.cuda.Stream:
 
 
 def _empty_strided_cpu_like(tensor: torch.Tensor, *, pin_memory: bool) -> torch.Tensor:
+    global _PIN_FALLBACK_CALLS
     shape = tuple(int(dim) for dim in tensor.shape)
     stride = tuple(int(value) for value in tensor.stride())
+    want_pin = bool(pin_memory and torch.cuda.is_available())
     try:
         return torch.empty_strided(
             shape,
             stride,
             device="cpu",
             dtype=tensor.dtype,
-            pin_memory=bool(pin_memory and torch.cuda.is_available()),
+            pin_memory=want_pin,
         )
     except RuntimeError:
+        # Pageable fallback: _pack leaves ready_event=None, so _unpack takes the
+        # host-blocking branch — count it (only when a pin was actually requested)
+        # so async-unpack A/Bs can distinguish "on" from "silently degraded".
+        if want_pin:
+            _PIN_FALLBACK_CALLS += 1
         return torch.empty_strided(shape, stride, device="cpu", dtype=tensor.dtype)
 
 
@@ -225,6 +316,14 @@ class AttentionSavedTensorOffloadWrapper:
             if require_grad is None
             else bool(require_grad)
         )
+        self.skip_in_backward = _env_bool(
+            "ASYM_ATTN_SAVED_TENSOR_OFFLOAD_SKIP_IN_BACKWARD",
+            # default AUTO: when the LF unsloth-GC save_on_cpu recompute wrapper is
+            # active, the in-backward offload here is a redundant duplicate round
+            # trip (fix_qwen3.5.md §10b C3) — skip it; explicit env overrides.
+            _env_bool("UNSLOTH_GC_RECOMPUTE_SAVE_ON_CPU", False),
+        )
+        self.skipped_backward_calls = 0
         self.calls = 0
         self.offload_calls = 0
         self.unpack_calls = 0
@@ -251,6 +350,13 @@ class AttentionSavedTensorOffloadWrapper:
     def run(self, *args: Any, **kwargs: Any) -> Any:
         self.calls += 1
         if not self.module.training or not torch.is_grad_enabled():
+            return self.original_forward(*args, **kwargs)
+        if self.skip_in_backward and _in_backward_graph_task():
+            # Grad-enabled forwards inside an active backward graph task are GC
+            # recomputes: offloading there is a same-step D2H+H2D round trip that
+            # doubles saved-tensor residency instead of shrinking the peak.
+            self.skipped_backward_calls += 1
+            self._sync_module_stats()
             return self.original_forward(*args, **kwargs)
         with saved_tensors_hooks(self._pack, self._unpack):
             return self.original_forward(*args, **kwargs)
@@ -368,6 +474,10 @@ class AttentionSavedTensorOffloadWrapper:
             "calls": self.calls,
             "min_bytes": self.min_bytes,
             "require_grad": self.require_grad,
+            "skip_in_backward": self.skip_in_backward,
+            "skipped_backward_calls": self.skipped_backward_calls,
+            # module-global (same value on every row): max across rows, never sum
+            "pin_fallback_calls_module_global": _PIN_FALLBACK_CALLS,
             "allowed_dtypes": [str(dtype).replace("torch.", "") for dtype in sorted(self.allowed_dtypes, key=str)],
             "offloaded_bytes": self.offloaded_bytes,
             "cpu_owned_bytes": self.cpu_owned_bytes,
@@ -519,6 +629,8 @@ class AttentionActivationOffloadContext:
         data = self.manager.snapshot()
         data.update(
             {
+                # module-global (same value on every row): max across rows, never sum
+                "pin_fallback_calls_module_global": _PIN_FALLBACK_CALLS,
                 "source_share_hits": self.source_share_hits,
                 "source_share_misses": self.source_share_misses,
                 "source_share_duplicate_bytes_avoided": self.source_share_duplicate_bytes_avoided,
@@ -644,22 +756,45 @@ class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function):
 
         manager = ActivationOffloadManager(pin_memory=True)
         shared_source = None
-        if attention_context is None:
-            u_handle = manager.offload(flat_lora, f"{projection_role}.U")
+        keep_acts_hbm = _attn_keep_acts_hbm_enabled()
+        if keep_acts_hbm:
+            # S-mem: no U offload, no wait — LoRA-A directly on the HBM-resident source.
+            u_handle = None
+            _record_attn_hbm_gemm(stats, f"{projection_role}.lora_a_forward")
+            s = (flat_lora @ a.contiguous().t()).contiguous()
+            if stats is not None:
+                stats.attn_act_lora_a_forward_calls += 1
         else:
-            shared_source = attention_context.acquire_source(x, flat_lora, projection_role)
-            u_handle = shared_source.handle
-        s = _dense_lora_a_cpu_left(
-            u_handle.tensor,
-            a.contiguous(),
-            stats=stats,
-            tag=f"{projection_role}.lora_a_forward",
-            backend=backend,
-        )
+            if attention_context is None:
+                u_handle = manager.offload(flat_lora, f"{projection_role}.U")
+            else:
+                shared_source = attention_context.acquire_source(x, flat_lora, projection_role)
+                u_handle = shared_source.handle
+            # _dense_lora_a_cpu_left host-pads u_handle.tensor whenever M % 128 != 0
+            # (flagship 45k×8 → M=360000, not a multiple of 128) — a HOST read of a
+            # buffer just filled by a non-blocking D2H. Wait on the manager that OWNS
+            # the handle's ready event: the shared q/k/v source was offloaded by the
+            # attention context's manager, not this call's fresh one.
+            (attention_context.manager if shared_source is not None else manager).wait_cpu_ready_host(u_handle)
+            s = _dense_lora_a_cpu_left(
+                u_handle.tensor,
+                a.contiguous(),
+                stats=stats,
+                tag=f"{projection_role}.lora_a_forward",
+                backend=backend,
+            )
         _record_attn_hbm_gemm(stats, f"{projection_role}.lora_b_forward")
-        delta = s @ b.t()
-        out = base + (delta * float(scaling)).to(dtype=base.dtype)
-        s_handle = manager.offload(s.contiguous(), f"{projection_role}.S")
+        out = base
+        _add_matmul_rows_(out, s, b.t(), scale=float(scaling))
+        if keep_acts_hbm:
+            s_handle = None
+            ctx._ka_u = flat_lora
+            ctx._ka_s = s
+        else:
+            s_handle = manager.offload(s.contiguous(), f"{projection_role}.S")
+            ctx._ka_u = None
+            ctx._ka_s = None
+        ctx.keep_acts_hbm = keep_acts_hbm
         _update_snapshot(snapshot, manager, attention_context)
 
         if weight_offload_module is None:
@@ -735,44 +870,67 @@ class _AsymActivationOffloadLoRALinearFunction(torch.autograd.Function):
                 )
                 if d_s is not None:
                     _record_attn_hbm_gemm(stats, f"{role}.lora_input_grad")
-                    d_u = d_u + (d_s @ a).to(dtype=d_u.dtype)
+                    _add_matmul_rows_(d_u, d_s, a)
                 grad_x = d_u.to(dtype=ctx.input_dtype).reshape(ctx.input_shape)
 
             if needs_grad_a:
                 if d_s is None:
                     raise RuntimeError("internal error: dS was not computed for dA")
-                m_grad = _align_up(int(d_s.shape[0]), 64)
-                if m_grad == 0:
-                    grad_a = torch.zeros_like(a)
+                if getattr(ctx, "keep_acts_hbm", False):
+                    # S-mem: dA from the HBM-resident source — native GEMM, no padding,
+                    # no stage-back (kills the raw H2D that mirrored the fwd D2H).
+                    if int(d_s.shape[0]) == 0:
+                        grad_a = torch.zeros_like(a)
+                    else:
+                        _record_attn_hbm_gemm(stats, f"{role}.dA")
+                        grad_a = (d_s.t().contiguous() @ ctx._ka_u).to(dtype=a.dtype)
                 else:
-                    u_source = _pad_cpu_rows_to(u_handle.tensor, m_grad)
-                    d_s_rows = _pad_hbm_rows_to(d_s, m_grad)
-                    d_s_t = d_s_rows.t().contiguous()
-                    grad_a = asym_bf16_cpu_right_matmul(
-                        d_s_t,
-                        u_source,
-                        transpose_b=True,
-                        backend=ctx.backend,
-                        stats=stats,
-                        phase="attn_act_dA",
-                        tag=f"{role}.dA",
-                        compiled_dims=base_layer.compiled_dims,
-                        output_dtype=a.dtype,
-                    ).to(dtype=a.dtype)
+                    m_grad = _align_up(int(d_s.shape[0]), 64)
+                    if m_grad == 0:
+                        grad_a = torch.zeros_like(a)
+                    else:
+                        # _pad_cpu_rows_to is a HOST memcpy of u_handle.tensor; nothing
+                        # upstream host-orders it after the D2H that filled the handle
+                        # (fix_merged.md V1 — race proven in vitro 2026-07-16). Shared
+                        # q/k/v sources were offloaded by the attention context's
+                        # manager — that map holds the ready event, not ctx.manager's.
+                        (ctx.attention_context.manager if ctx.shared_source is not None else manager).wait_cpu_ready_host(u_handle)
+                        u_source = _pad_cpu_rows_to(u_handle.tensor, m_grad)
+                        d_s_rows = _pad_hbm_rows_to(d_s, m_grad)
+                        d_s_t = d_s_rows.t().contiguous()
+                        grad_a = asym_bf16_cpu_right_matmul(
+                            d_s_t,
+                            u_source,
+                            transpose_b=True,
+                            backend=ctx.backend,
+                            stats=stats,
+                            phase="attn_act_dA",
+                            tag=f"{role}.dA",
+                            compiled_dims=base_layer.compiled_dims,
+                            output_dtype=a.dtype,
+                        ).to(dtype=a.dtype)
 
             if needs_grad_b:
-                if stats is not None:
-                    stats.attn_act_stage_low_rank_calls += 1
-                s_stage = manager.stage(s_handle, tag=f"{role}.S_stage")
-                _record_attn_hbm_gemm(stats, f"{role}.dB")
-                grad_b = ((d_y.t().contiguous() @ s_stage).to(dtype=b.dtype) * float(ctx.scaling)).to(dtype=b.dtype)
+                if getattr(ctx, "keep_acts_hbm", False):
+                    _record_attn_hbm_gemm(stats, f"{role}.dB")
+                    grad_b = ((d_y.t().contiguous() @ ctx._ka_s).to(dtype=b.dtype) * float(ctx.scaling)).to(dtype=b.dtype)
+                else:
+                    if stats is not None:
+                        stats.attn_act_stage_low_rank_calls += 1
+                    s_stage = manager.stage(s_handle, tag=f"{role}.S_stage")
+                    _record_attn_hbm_gemm(stats, f"{role}.dB")
+                    grad_b = ((d_y.t().contiguous() @ s_stage).to(dtype=b.dtype) * float(ctx.scaling)).to(dtype=b.dtype)
         finally:
-            manager.release_stage(s_stage)
-            manager.release_cpu(s_handle)
-            if ctx.shared_source is None:
-                manager.release_cpu(u_handle)
-            else:
+            if s_stage is not None:
+                manager.release_stage(s_stage)
+            if s_handle is not None:
+                manager.release_cpu(s_handle)
+            if ctx.shared_source is not None:
                 ctx.shared_source.release()
+            elif u_handle is not None:
+                manager.release_cpu(u_handle)
+            ctx._ka_u = None
+            ctx._ka_s = None
             _update_snapshot(ctx.snapshot, manager, ctx.attention_context)
 
         return grad_x, grad_a, grad_b, None, None, None, None, None, None, None, None, None, None, None

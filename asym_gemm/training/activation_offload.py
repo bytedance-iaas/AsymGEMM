@@ -9,6 +9,7 @@ import torch
 
 _CPU_BUFFER_POOL: dict[tuple[torch.dtype, tuple[int, ...], bool], list[torch.Tensor]] = {}
 _CPU_BUFFER_POOL_EVICTIONS = 0
+_POOL_PIN_FALLBACK_CALLS = 0  # requested-pin allocs that fell back to pageable (process-wide)
 _CPU_BUFFER_POOL_MAX_CACHED_BYTES = 0
 _DEFAULT_CPU_POOL_MAX_BYTES = 32 * 1024**3
 
@@ -29,6 +30,40 @@ def _cpu_pool_max_bytes() -> int:
         return max(0, int(raw))
     except ValueError:
         return _DEFAULT_CPU_POOL_MAX_BYTES
+
+
+_DEFAULT_FG_ELEMENTWISE_CHUNK_MB = 1024  # probe-swept 2026-07-12: 1024 minimizes
+# reserved (fragmentation gap 21→5 GiB @120k); 512 and 2048 are both worse.
+
+
+def fg_elementwise_chunk_bytes() -> int:
+    """Staging-buffer byte budget for row-chunked fg elementwise phases (silu/mul,
+    silu backward, LoRA-B delta adds). 0 disables chunking (legacy full-width
+    staging). Chunking trades nothing but launch count: same copied bytes, same
+    FLOPs, but only chunk-sized HBM transients instead of full-width ones."""
+    raw = os.environ.get(
+        "ASYMM_FG_ELEMENTWISE_CHUNK_MB",
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_FG_ELEMENTWISE_CHUNK_MB"),
+    )
+    if raw is None or str(raw).strip() == "":
+        mb = _DEFAULT_FG_ELEMENTWISE_CHUNK_MB
+    else:
+        try:
+            mb = int(str(raw).strip())
+        except ValueError:
+            mb = _DEFAULT_FG_ELEMENTWISE_CHUNK_MB
+    return max(0, mb) * 1024 * 1024
+
+
+def fg_chunk_rows(total_rows: int, row_width: int, element_size: int = 2) -> int:
+    """Rows per chunk for fg elementwise chunking; 0 means do not chunk."""
+    budget = fg_elementwise_chunk_bytes()
+    if budget <= 0 or total_rows <= 0 or row_width <= 0:
+        return 0
+    rows = budget // max(1, row_width * element_size)
+    if rows >= total_rows:
+        return 0
+    return max(8192, int(rows))
 
 
 def _cpu_pool_cached_bytes() -> int:
@@ -63,6 +98,8 @@ def activation_offload_cpu_pool_stats() -> dict[str, Any]:
         "cpu_pool_cached_bytes_by_shape": cached_by_shape,
         "cpu_pool_num_cached_tensors": sum(len(tensors) for tensors in _CPU_BUFFER_POOL.values()),
         "cpu_pool_evictions": _CPU_BUFFER_POOL_EVICTIONS,
+        # process-wide, same value on every row: max across rows, never sum
+        "cpu_pool_pin_fallback_calls": _POOL_PIN_FALLBACK_CALLS,
         "cpu_pool_max_cached_bytes": _CPU_BUFFER_POOL_MAX_CACHED_BYTES,
         "cpu_pool_limit_bytes": _cpu_pool_max_bytes(),
     }
@@ -111,6 +148,13 @@ def _alloc_cpu(shape: tuple[int, ...], dtype: torch.dtype, *, pin_memory: bool) 
     try:
         return _narrow(torch.empty(alloc_shape, device="cpu", dtype=dtype, pin_memory=pinned))
     except RuntimeError:
+        # Pinned alloc failed (host pinned-pool exhaustion): the pageable buffer keeps
+        # the step alive but silently downgrades every later touch (blocking copies,
+        # no ready events). Count it — same read rule as the saved-tensor modules'
+        # pin_fallback counters: process-wide, max-across-rows, never sum.
+        global _POOL_PIN_FALLBACK_CALLS
+        if pinned:
+            _POOL_PIN_FALLBACK_CALLS += 1
         return _narrow(torch.empty(alloc_shape, device="cpu", dtype=dtype))
 
 
@@ -217,17 +261,53 @@ class ActivationOffloadManager:
             _GOV.on_offload(self, handle)
         return handle
 
+    @staticmethod
+    def _async_pack_enabled() -> bool:
+        """Issue the offload D2H on a dedicated side stream.
+
+        Unlike the stage() H2D (structurally null without true
+        prefetch — see stage()'s comment), the pack D2H is fire-and-forget until the
+        handle's backward consumer waits its ready event, so a side-stream copy genuinely
+        overlaps subsequent forward/backward compute. Default off = pre-fix behavior."""
+        raw = os.environ.get(
+            "ASYM_SAVED_TENSOR_ASYNC_PACK",
+            os.environ.get("ASYM_GEMM_LF_CONFIG_ASYM_SAVED_TENSOR_ASYNC_PACK", "0"),
+        )
+        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    _MGR_D2H_STREAMS: dict[int, "torch.cuda.Stream"] = {}
+
+    @classmethod
+    def _manager_d2h_stream(cls, device: torch.device) -> "torch.cuda.Stream":
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        stream = cls._MGR_D2H_STREAMS.get(idx)
+        if stream is None:
+            with torch.cuda.device(idx):
+                stream = torch.cuda.Stream()
+            cls._MGR_D2H_STREAMS[idx] = stream
+        return stream
+
     def offload(self, tensor: torch.Tensor, tag: str) -> CPUActivationHandle:
         if tensor.device.type == "cpu":
             return self.adopt_cpu(tensor, tag, original_device=tensor.device)
         handle = self.empty_cpu(tuple(tensor.shape), tensor.dtype, tensor.device, tag)
         non_blocking = bool(handle.tensor.is_pinned())
-        with torch.no_grad():
-            handle.tensor.copy_(tensor.detach(), non_blocking=non_blocking)
-        if non_blocking and tensor.device.type == "cuda":
+        if self._async_pack_enabled() and non_blocking and tensor.device.type == "cuda":
+            side = self._manager_d2h_stream(tensor.device)
+            side.wait_stream(torch.cuda.current_stream(tensor.device))  # source produced on compute
+            with torch.no_grad(), torch.cuda.stream(side):
+                handle.tensor.copy_(tensor.detach(), non_blocking=True)
             event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream(tensor.device))
+            event.record(side)
             self._pending_cpu_ready_events[int(handle.tensor.data_ptr())] = event
+            tensor.record_stream(side)  # keep the GPU source alive until the side-stream copy drains
+        else:
+            with torch.no_grad():
+                handle.tensor.copy_(tensor.detach(), non_blocking=non_blocking)
+            if non_blocking and tensor.device.type == "cuda":
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(tensor.device))
+                self._pending_cpu_ready_events[int(handle.tensor.data_ptr())] = event
         nbytes = handle.nbytes
         self.stats.num_offloads += 1
         self.stats.offloaded_bytes += nbytes
@@ -276,7 +356,38 @@ class ActivationOffloadManager:
             else:
                 event.synchronize()
 
-    def stage(self, handle: CPUActivationHandle, *, tag: str | None = None) -> torch.Tensor:
+    def wait_cpu_ready_host(self, handle: CPUActivationHandle | None) -> None:
+        """Host-blocking counterpart of wait_cpu_ready for HOST readers of
+        handle.tensor (host memcpy pads, cpu silu, index_select rebuilds).
+        wait_cpu_ready only orders the CURRENT CUDA STREAM behind the producing
+        D2H — it never orders the host, so a host read straight after it can
+        observe pre-copy bytes (proven in vitro 2026-07-16; fix_merged.md V1/V2).
+        This is a true data dependency, not an added stall: the caller is about
+        to read exactly the bytes the D2H produces. Synchronizes the pending D2H
+        event when present; if the event was already consumed by an earlier
+        device-side waiter (wait_cpu_ready pops it), falls back to synchronizing
+        the original device's current stream — the D2H was enqueued there, so
+        the wait is bounded by already-queued work, never by future work."""
+        if handle is None:
+            return
+        if _GOV is not None:
+            _GOV.ensure_local(handle)
+        # get, NOT pop: leave the (now-complete) event in the map so a SECOND host
+        # wait on the same handle re-synchronizes it instantly instead of falling
+        # into the full-stream-drain fallback (dense hits x_cpu twice per layer:
+        # gate then up). The entry is overwritten by the next fill of this buffer
+        # (offload/record_cpu_ready key by data_ptr) and popped by device-side
+        # wait_cpu_ready / release_cpu, so no staleness or leak.
+        event = self._pending_cpu_ready_events.get(int(handle.tensor.data_ptr()))
+        if event is not None:
+            event.synchronize()
+        elif torch.cuda.is_available() and handle.original_device.type == "cuda":
+            torch.cuda.current_stream(handle.original_device).synchronize()
+
+    def stage(self, handle: CPUActivationHandle, *, tag: str | None = None, mutable: bool = True) -> torch.Tensor:
+        # mutable is an HBMKeep-manager hint (fix_asym S-mem-b); this CPU manager
+        # always materializes a fresh GPU staging buffer, so it is inherently
+        # mutation-safe and ignores the hint.
         self.wait_cpu_ready(handle)
         stage_tag = handle.tag if tag is None else tag
         shape = tuple(int(dim) for dim in handle.tensor.shape)
@@ -287,8 +398,18 @@ class ActivationOffloadManager:
             self._stage_cache[key] = stage
             self._stage_keys_by_ptr[int(stage.data_ptr())] = key
         if handle.tensor.is_pinned() and handle.original_device.type == "cuda":
-            # H2D restage on the side stream; the compute stream waits on the EVENT so the
-            # copy overlaps preceding compute instead of serializing the compute stream.
+            # H2D restage on a side stream. NB: the device-side ordering here is
+            # exactly that of a plain non_blocking copy_ on the compute stream (the
+            # pre-existing else-branch pattern below): wait_stream orders the copy
+            # after all prior compute, wait_event orders all later compute after the
+            # copy, and nothing is enqueued between — so this construction is pure
+            # structural overhead over that equivalent, which the D4 A/B corroborates
+            # (+0.08 s, null; fix_throughput.md). Real overlap would need BOTH the
+            # D2H ready-event re-anchored on the side stream (side.wait_event(ready),
+            # as the saved-tensor unpack siblings do — dropping wait_stream alone
+            # would let the H2D read handle.tensor before its producing D2H finished)
+            # AND a fresh per-call destination (the _stage_cache reuses buffers whose
+            # previous consumer may still be in flight on the compute stream).
             from .attention_activation_offload import _h2d_restage_stream
 
             compute_stream = torch.cuda.current_stream(handle.original_device)
@@ -305,6 +426,28 @@ class ActivationOffloadManager:
                 stage.copy_(handle.tensor, non_blocking=handle.tensor.is_pinned())
         self._mark_stage_live(stage, stage_tag)
         return stage
+
+    def record_cpu_ready(self, handle: CPUActivationHandle) -> None:
+        """Seal a handle whose tensor was filled by direct row writes rather than by
+        offload(): register its cpu-ready event and mirror offload()'s byte accounting
+        (direct row writes must call this once after the last chunk).
+
+        The accounting matters as much as the event: empty_cpu() only counts
+        num_cpu_allocs, so without this the row-blocked paths would move their bytes
+        to CPU invisibly and report offloaded_bytes ~0 for the tags they dominate.
+        Called once per handle, so the counters stay in step with the copies."""
+        nbytes = handle.nbytes
+        self.stats.num_offloads += 1
+        self.stats.offloaded_bytes += nbytes
+        self.stats.offload_bytes_by_tag[handle.tag] = self.stats.offload_bytes_by_tag.get(handle.tag, 0) + nbytes
+        if torch.cuda.is_available() and handle.tensor.is_pinned():
+            event = torch.cuda.Event()
+            # Record on the ORIGINAL device's stream (matching offload(), which uses
+            # current_stream(tensor.device)) — the row-write D2H copies were enqueued
+            # there, and on a multi-device process the ambient current_stream() could
+            # belong to a different device, ordering nothing.
+            event.record(torch.cuda.current_stream(handle.original_device))
+            self._pending_cpu_ready_events[int(handle.tensor.data_ptr())] = event
 
     def stage_rows(self, handle: CPUActivationHandle, start: int, end: int, *, tag: str | None = None) -> torch.Tensor:
         self.wait_cpu_ready(handle)
