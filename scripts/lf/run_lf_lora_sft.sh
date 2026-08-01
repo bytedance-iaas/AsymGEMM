@@ -502,8 +502,16 @@ case "${BACKEND,,}" in
     esac
     # same hook-offload hazard as dp2: grads must be reduced BEFORE any D2H copy; the
     # CPUAdamW step-time path reads param.grad after the manual allreduce.
-    ASYM_CPU_ADAMW_GRAD_OFFLOAD=false
-    ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false
+    # 2026-07-30 (fix_plot_placeholders.md §6): the forced-false pair costs each rank
+    # ~18 GiB resident trainable routed-expert weights + ~18 GiB grads in HBM on
+    # q3.5-122b (rank-1 runs gradofftrue and keeps both host-side) — the difference
+    # that G-OOMs sEP-T1 at 320k. ASYM_EP2_WEIGHT_OFFLOAD=true opts the WEIGHT side
+    # back in (no reduce hazard: weights are never allreduced; bf16 working copies
+    # live pinned on host exactly as rank-1). ASYM_EP2_GRAD_OFFLOAD stays available
+    # for A/B but is UNSAFE with hook-based offload (pre-reduction D2H) — leave
+    # false unless the offload path is verified post-allreduce. Defaults unchanged.
+    ASYM_CPU_ADAMW_GRAD_OFFLOAD="${ASYM_EP2_GRAD_OFFLOAD:-false}"
+    ASYM_CPU_ADAMW_WEIGHT_OFFLOAD="${ASYM_EP2_WEIGHT_OFFLOAD:-false}"
     BACKEND=asym
     ;;
   asym_cpuadamwtorch)

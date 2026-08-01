@@ -1583,6 +1583,70 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
                 raise RuntimeError(f"S2a queued-launch claim validation failed: {report}")
             if report.get("launches"):
                 heartbeat.emit("ep2_queue_claims", **report)
+        # 2026-07-30 (fix_plot_placeholders.md §6): AsymCPUAdamW grad-offload support.
+        # With ASYM_EP2_GRAD_OFFLOAD=true the backward hooks have ALREADY moved every
+        # trainable grad into the optimizer's pinned fp32 flat buffer and nulled
+        # param.grad — the GPU flat reduce below would average ZEROS while the CPU
+        # optimizer steps unreduced local grads (silent rank divergence: the exact
+        # hazard the driver's forced-false guarded against). The correct reduce walks
+        # the CPU flat buffer instead: drain in-flight D2H copies, zero the stale
+        # regions (params with no local grad this step — same semantics as the GPU
+        # path's zeros materialization), then chunked H2D -> all_reduce -> mean ->
+        # D2H through one small persistent GPU staging buffer, and mark every
+        # mapping reduced so BOTH ranks step identical averaged grads (fp32 masters
+        # stay in lockstep; no param sync needed — same invariant as the GPU path).
+        cpuadamw = None
+        _seen_opts: set = set()
+        _node = getattr(trainer, "optimizer", None)
+        while _node is not None and id(_node) not in _seen_opts:
+            _seen_opts.add(id(_node))
+            if hasattr(_node, "_mappings") and getattr(_node, "grad_offload", False):
+                cpuadamw = _node
+                break
+            _node = getattr(_node, "optimizer", None)
+        if cpuadamw is not None:
+            if not getattr(trainer, "_ep2_cpu_reduce_checked", False):
+                trainer._ep2_cpu_reduce_checked = True
+                for _pname, _p in model.named_parameters():
+                    if _p.requires_grad and getattr(_p, "_asym_ep_owner_scaled", False):
+                        raise RuntimeError(
+                            "EP2 CPU-grad reduce does not support owner-scaled (vanilla EP) "
+                            f"params; got {_pname} — run vanilla EP with grad offload OFF")
+            cpuadamw._drain_grad_offload_copies()
+            flat = cpuadamw._ensure_grad_offload_flat_buffer()
+            for mapping in cpuadamw._mappings:
+                if not mapping.grad_buffer_has_data and mapping.grad_buffer is not None:
+                    mapping.grad_buffer.zero_()
+            stage = getattr(trainer, "_ep2_cpu_reduce_stage", None)
+            if stage is None:
+                bucket_mb = int(os.environ.get("ASYM_EP2_CPU_REDUCE_BUCKET_MB", "1024") or "1024")
+                stage_numel = max(1, min(int(flat.numel()), bucket_mb * (1 << 20) // 4))
+                stage = torch.empty(stage_numel, dtype=torch.float32, device=torch.device("cuda", torch.cuda.current_device()))
+                trainer._ep2_cpu_reduce_stage = stage
+                heartbeat.emit(
+                    "ep2_cpu_grad_reduce_built",
+                    flat_numel=int(flat.numel()),
+                    stage_numel=int(stage_numel),
+                    stage_mib=round(stage_numel * 4 / (1 << 20), 1),
+                )
+            world = dist.get_world_size()
+            offset, total_numel = 0, int(flat.numel())
+            while offset < total_numel:
+                span = min(int(stage.numel()), total_numel - offset)
+                gpu_view = stage.narrow(0, 0, span)
+                cpu_view = flat.narrow(0, offset, span)
+                gpu_view.copy_(cpu_view, non_blocking=False)
+                dist.all_reduce(gpu_view)
+                gpu_view.div_(world)
+                cpu_view.copy_(gpu_view, non_blocking=False)
+                offset += span
+            for mapping in cpuadamw._mappings:
+                mapping.grad_buffer_has_data = True
+                mapping.last_had_grad = True
+                mapping.cpu_param.grad = mapping.grad_buffer
+            _emit_update_probe(trainer)
+            return
+
         state = getattr(trainer, "_ep2_state", None)
         if state is None:
             groups: dict = {}
