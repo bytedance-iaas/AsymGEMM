@@ -905,9 +905,44 @@ def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] 
     }
 
 
+def _zero_router_jitter_if_requested(model: Any) -> None:
+    # ASYM_ZERO_ROUTER_JITTER=1 (model_integration.md validation protocol): zero
+    # train-time router/input jitter noise everywhere it appears. Two reasons:
+    # (1) loss-parity A/B requires deterministic routing; (2) HF PhiMoE's router
+    # applies jitter IN-PLACE on a view, which crashes under gradient-checkpoint
+    # backward hooks (view+inplace) — zeroing disables that code path. Generic
+    # duck-typed sweep; no-op unless the env is set and attrs exist.
+    if os.environ.get("ASYM_ZERO_ROUTER_JITTER", "").strip() not in {"1", "true"}:
+        return
+    zeroed = 0
+    seen = set()
+    targets = [model]
+    cfg = getattr(model, "config", None)
+    if cfg is not None:
+        targets.append(cfg)
+        targets.extend(getattr(cfg, "get_text_config", lambda: None)() or [] if False else [])
+    for module in getattr(model, "modules", lambda: [])():
+        targets.append(module)
+    for obj in targets:
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        for attr in ("router_jitter_noise", "input_jitter_noise", "jitter_noise"):
+            if hasattr(obj, attr):
+                try:
+                    if float(getattr(obj, attr) or 0.0) != 0.0:
+                        setattr(obj, attr, 0.0)
+                        zeroed += 1
+                except (TypeError, ValueError):
+                    continue
+    if zeroed:
+        print(f"[asym] ASYM_ZERO_ROUTER_JITTER: zeroed {zeroed} jitter attr(s).", flush=True)
+
+
 def _capture_loaded_model(model: Any) -> Any:
     global _LAST_LF_MODEL
     _LAST_LF_MODEL = model
+    _zero_router_jitter_if_requested(model)
     heartbeat = _MODEL_CAPTURE_HEARTBEAT
     partial_writer = _MODEL_CAPTURE_PARTIAL_WRITER
     if heartbeat is not None:
@@ -2627,7 +2662,8 @@ def _activation_transfer_weight(stats: dict[str, Any]) -> int:
 
 def _activation_source_context_key(row: dict[str, Any]) -> str:
     source = str(row.get("profile_prefix") or row.get("name") or "")
-    for leaf in ("q_proj", "k_proj", "v_proj", "o_proj"):
+    for leaf in ("q_proj", "k_proj", "v_proj", "o_proj",
+                 "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"):
         suffix = f".{leaf}"
         if source.endswith(suffix):
             return source[: -len(suffix)]

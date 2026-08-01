@@ -230,6 +230,12 @@ declare -A WATCHDOG_FLOOR_GB_BY_MODEL=(
   ["meta-llama/Llama-4-Scout-17B-16E"]=50
   ["Qwen/Qwen3.5-122B-A10B"]=50
   ["Qwen/Qwen3-235B-A22B"]=60
+  ["mistralai/Mixtral-8x22B-v0.1"]=50
+  ["microsoft/Phi-3.5-MoE-instruct"]=35
+  ["tencent/Hunyuan-A13B-Instruct"]=50
+  ["zai-org/GLM-4.5-Air"]=50
+  ["zai-org/GLM-4.7-Flash"]=35
+  ["openai/gpt-oss-120b"]=50
 )
 if [[ -z "${HOST_MEM_WATCHDOG_FLOOR_GB:-}" ]]; then
   if [[ "${HOST_MEM_WATCHDOG,,}" == "true" ]]; then
@@ -2247,7 +2253,7 @@ fi
 
 CMD_ARGS=(
   --model_name_or_path "${MODEL_NAME_OR_PATH}"
-  --trust_remote_code true
+  --trust_remote_code "${TRUST_REMOTE_CODE:-true}"
   --stage sft
   --do_train true
   --finetuning_type "${FINETUNING_TYPE}"
@@ -2277,6 +2283,7 @@ CMD_ARGS=(
   --bf16 "${TRAINING_BF16}"
   --enable_liger_kernel "${ENABLE_LIGER_KERNEL}"
   --use_unsloth_gc "${USE_UNSLOTH_GC}"
+  --ddp_timeout "${DDP_TIMEOUT:-7200}"
 )
 if [[ "${FLASH_ATTN}" != "auto" ]]; then
   CMD_ARGS+=(--flash_attn "${FLASH_ATTN}")

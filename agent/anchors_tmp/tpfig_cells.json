@@ -1,0 +1,222 @@
+[
+ {
+  "tag": "a2b_rc16-c14_glm4_5-air__b8_s16000_ga1_drop000",
+  "model": "phi",
+  "backend": "superoffload_mem",
+  "token": "recomp",
+  "seq": 16000,
+  "batch": 8,
+  "eff_tps": 2365,
+  "resv_gib": 163.0,
+  "rss_gb": 479
+ },
+ {
+  "tag": "a2b_rc32-c14_glm4_5-air__b4_s32000_ga1_drop000",
+  "model": "phi",
+  "backend": "superoffload_mem",
+  "token": "recomp",
+  "seq": 32000,
+  "batch": 4,
+  "eff_tps": 2081,
+  "resv_gib": 163.0,
+  "rss_gb": 486
+ },
+ {
+  "tag": "a2b_rc48-c14_glm4_5-air__b2_s48000_ga1_drop000",
+  "model": "phi",
+  "backend": "superoffload_mem",
+  "token": "recomp",
+  "seq": 48000,
+  "batch": 2,
+  "eff_tps": 1663,
+  "resv_gib": 127.5,
+  "rss_gb": 481
+ },
+ {
+  "tag": "a2b_rc64-c14_glm4_5-air__b2_s64000_ga1_drop000",
+  "model": "phi",
+  "backend": "superoffload_mem",
+  "token": "recomp",
+  "seq": 64000,
+  "batch": 2,
+  "eff_tps": 1664,
+  "resv_gib": 163.0,
+  "rss_gb": 481
+ },
+ {
+  "tag": "a2b_rc96-c14_glm4_5-air__b1_s96000_ga1_drop000",
+  "model": "phi",
+  "backend": "superoffload_mem",
+  "token": "recomp",
+  "seq": 96000,
+  "batch": 1,
+  "eff_tps": 1282,
+  "resv_gib": 128.2,
+  "rss_gb": 481
+ },
+ {
+  "tag": "a2c_rc128-c14_glm4_5-air__b1_s128000_ga1_drop000",
+  "model": "phi",
+  "backend": "superoffload_mem",
+  "token": "recomp",
+  "seq": 128000,
+  "batch": 1,
+  "eff_tps": 943,
+  "resv_gib": 163.0,
+  "rss_gb": 478
+ },
+ {
+  "tag": "a2b_t116-c14_glm4_5-air__b16_s16000_ga1_drop000",
+  "model": "phi",
+  "backend": "asym_sdp2_cpuadamwds",
+  "token": "unsloth-ker000-ceil0000-ohbm0",
+  "seq": 16000,
+  "batch": 16,
+  "eff_tps": 3422,
+  "resv_gib": 162.9,
+  "rss_gb": 575
+ },
+ {
+  "tag": "a2b_t132-c14_glm4_5-air__b8_s32000_ga1_drop000",
+  "model": "phi",
+  "backend": "asym_sdp2_cpuadamwds",
+  "token": "unsloth-ker000-ceil0000-ohbm0",
+  "seq": 32000,
+  "batch": 8,
+  "eff_tps": 2823,
+  "resv_gib": 166.4,
+  "rss_gb": 567
+ },
+ {
+  "tag": "fp_a2t148-c14_glm4_5-air__b4_s48000_ga1_drop000",
+  "model": "phi",
+  "backend": "asym_sdp2_cpuadamwds",
+  "token": "unsloth-ker000-ceil0000-ohbm0",
+  "seq": 48000,
+  "batch": 4,
+  "eff_tps": 2365,
+  "resv_gib": 135.0,
+  "rss_gb": 567
+ },
+ {
+  "tag": "a2b_t164-c14_glm4_5-air__b4_s64000_ga1_drop000",
+  "model": "phi",
+  "backend": "asym_sdp2_cpuadamwds",
+  "token": "unsloth-ker000-ceil0000-ohbm0",
+  "seq": 64000,
+  "batch": 4,
+  "eff_tps": 2078,
+  "resv_gib": 156.8,
+  "rss_gb": 567
+ },
+ {
+  "tag": "fp_a2t196-c14_glm4_5-air__b2_s96000_ga1_drop000",
+  "model": "phi",
+  "backend": "asym_sdp2_cpuadamwds",
+  "token": "unsloth-ker000-ceil0000-ohbm0",
+  "seq": 96000,
+  "batch": 2,
+  "eff_tps": 1651,
+  "resv_gib": 132.1,
+  "rss_gb": 567
+ },
+ {
+  "tag": "a2c_t1128-c14_glm4_5-air__b2_s128000_ga1_drop000",
+  "model": "phi",
+  "backend": "asym_sdp2_cpuadamwds",
+  "token": "unsloth-ker000-ceil0000-ohbm0",
+  "seq": 128000,
+  "batch": 2,
+  "eff_tps": 1081,
+  "resv_gib": 162.2,
+  "rss_gb": 567
+ },
+ {
+  "tag": "fp_a2uo32-c14_glm4_5-air__b2_s32000_ga1_drop000",
+  "model": "phi",
+  "backend": "superoffload_mem",
+  "token": "unsloth-off-ohbm0",
+  "seq": 32000,
+  "batch": 2,
+  "eff_tps": 671,
+  "resv_gib": 42.1,
+  "rss_gb": 483
+ },
+ {
+  "tag": "fp_a2uo64-c14_glm4_5-air__b1_s64000_ga1_drop000",
+  "model": "phi",
+  "backend": "superoffload_mem",
+  "token": "unsloth-off-ohbm0",
+  "seq": 64000,
+  "batch": 1,
+  "eff_tps": 623,
+  "resv_gib": 42.1,
+  "rss_gb": 483
+ },
+ {
+  "tag": "fp_a2un16-c14_glm4_5-air__b8_s16000_ga1_drop000",
+  "model": "phi",
+  "backend": "superoffload_mem",
+  "token": "unsloth-ohbm0",
+  "seq": 16000,
+  "batch": 8,
+  "eff_tps": 2322,
+  "resv_gib": 120.4,
+  "rss_gb": 487
+ },
+ {
+  "tag": "fp_a2un32-c14_glm4_5-air__b4_s32000_ga1_drop000",
+  "model": "phi",
+  "backend": "superoffload_mem",
+  "token": "unsloth-ohbm0",
+  "seq": 32000,
+  "batch": 4,
+  "eff_tps": 2073,
+  "resv_gib": 121.0,
+  "rss_gb": 481
+ },
+ {
+  "tag": "fp_a2un48-c14_glm4_5-air__b2_s48000_ga1_drop000",
+  "model": "phi",
+  "backend": "superoffload_mem",
+  "token": "unsloth-ohbm0",
+  "seq": 48000,
+  "batch": 2,
+  "eff_tps": 1654,
+  "resv_gib": 96.0,
+  "rss_gb": 485
+ },
+ {
+  "tag": "fp_a2un64-c14_glm4_5-air__b2_s64000_ga1_drop000",
+  "model": "phi",
+  "backend": "superoffload_mem",
+  "token": "unsloth-ohbm0",
+  "seq": 64000,
+  "batch": 2,
+  "eff_tps": 1689,
+  "resv_gib": 121.0,
+  "rss_gb": 483
+ },
+ {
+  "tag": "fp_a2un96-c14_glm4_5-air__b1_s96000_ga1_drop000",
+  "model": "phi",
+  "backend": "superoffload_mem",
+  "token": "unsloth-ohbm0",
+  "seq": 96000,
+  "batch": 1,
+  "eff_tps": 1291,
+  "resv_gib": 96.0,
+  "rss_gb": 472
+ },
+ {
+  "tag": "a2b_un128-c14_glm4_5-air__b1_s128000_ga1_drop000",
+  "model": "phi",
+  "backend": "superoffload_mem",
+  "token": "unsloth-ohbm0",
+  "seq": 128000,
+  "batch": 1,
+  "eff_tps": 957,
+  "resv_gib": 120.4,
+  "rss_gb": 532
+ }
+]

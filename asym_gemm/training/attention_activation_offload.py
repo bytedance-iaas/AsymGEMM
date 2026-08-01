@@ -18,6 +18,14 @@ from .lora import _reset_lora_weights, grouped_expert_lora_cpu_left, normalize_l
 
 _SINGLE_GROUP_METADATA_CACHE: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
 _QKV_SHARE_ROLES = frozenset({"q_proj", "k_proj", "v_proj"})
+# MLA attention (glm4_moe_lite): q_a_proj and kv_a_proj_with_mqa consume the
+# SAME layer input — share one CPU copy exactly like the q/k/v trio. The
+# b-projections consume distinct latents and stay independent (role.U).
+_MLA_SHARE_ROLES = frozenset({"q_a_proj", "kv_a_proj_with_mqa"})
+_ALL_SHARE_ROLES = _QKV_SHARE_ROLES | _MLA_SHARE_ROLES
+# The role that completes each share group in module-forward order (v_proj is
+# last of the trio; kv_a_proj_with_mqa is last of the MLA pair).
+_SHARE_FLUSH_ROLES = frozenset({"v_proj", "kv_a_proj_with_mqa"})
 _DEFAULT_SAVED_TENSOR_OFFLOAD_MIN_BYTES = 1 * 1024**2
 _DEFAULT_SAVED_TENSOR_OFFLOAD_DTYPES = frozenset({torch.bfloat16, torch.float16, torch.float32})
 _SAVED_TENSOR_DTYPE_ALIASES = {
@@ -598,7 +606,7 @@ class AttentionActivationOffloadContext:
 
     def acquire_source(self, source: torch.Tensor, flat_source: torch.Tensor, role: str) -> _SharedActivationSource:
         role = str(role)
-        if role not in _QKV_SHARE_ROLES:
+        if role not in _ALL_SHARE_ROLES:
             handle = self.manager.offload(flat_source, f"{role}.U")
             self.source_share_misses += 1
             return _SharedActivationSource(self, handle).retain()
@@ -617,7 +625,11 @@ class AttentionActivationOffloadContext:
             self.source_share_retained_bytes += handle.nbytes
 
         self._seen_roles.add(role)
-        if role == "v_proj" or _QKV_SHARE_ROLES <= self._seen_roles:
+        if (
+            role in _SHARE_FLUSH_ROLES
+            or _QKV_SHARE_ROLES <= self._seen_roles
+            or _MLA_SHARE_ROLES <= self._seen_roles
+        ):
             self._cache.clear()
             self._seen_roles.clear()
         return shared

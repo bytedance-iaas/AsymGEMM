@@ -65,6 +65,12 @@ declare -A M=(
   [q3.5-35b-a3b]="Qwen/Qwen3.5-35B-A3B"              # layers: 40
   [q3.5-122b-a10b]="Qwen/Qwen3.5-122B-A10B"          # layers: 48
   [llama4-scout]="meta-llama/Llama-4-Scout-17B-16E"  # layers: 48
+  [mixtral-8x22b]="mistralai/Mixtral-8x22B-v0.1"     # layers: 56 (model_integration.md #1)
+  [phi3.5-moe]="microsoft/Phi-3.5-MoE-instruct"      # layers: 32 (model_integration.md #2)
+  [hunyuan-a13b]="tencent/Hunyuan-A13B-Instruct"     # layers: 32 (model_integration.md #3)
+  [glm4.5-air]="zai-org/GLM-4.5-Air"                 # layers: 46 (model_integration.md #4)
+  [glm4.7-flash]="zai-org/GLM-4.7-Flash"             # layers: 47 (model_integration.md #5)
+  [gpt-oss-120b]="openai/gpt-oss-120b"               # layers: 36 (model_integration.md #6)
   # dense
   [q3-32b]="Qwen/Qwen3-32B"                          # layers: 64
   [q3.5-27b]="Qwen/Qwen3.5-27B"                      # layers: 64
@@ -159,7 +165,7 @@ _tier_recipes_file="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tier_recipes.s
 TIER_REQUESTED=""
 tier_model_family() {
   case "${1,,}" in
-    *q3-30b*|*qwen3-30b*|*30b-a3b*|*q3.5*|*qwen3.5*|*35b-a3b*|*122b*|*llama4*|*scout*) printf 'moe' ;;
+    *q3-30b*|*qwen3-30b*|*30b-a3b*|*q3.5*|*qwen3.5*|*35b-a3b*|*122b*|*llama4*|*scout*|*mixtral*|*phi3.5-moe*|*phi-3.5-moe*|*hunyuan*|*glm4*|*gpt-oss*) printf 'moe' ;;
     *) printf 'dense' ;;
   esac
 }
@@ -781,6 +787,17 @@ is_qwen3_moe_routed_model() {
   esac
 }
 
+# model_integration.md families whose experts run the SAME AsymQwen3Experts
+# engine (mixtral/phimoe/hunyuan/glm4.5/glm4.7 — NOT gpt-oss, own engine).
+# Used to extend full-fg's moefg enablement to them WITHOUT widening
+# is_qwen3_moe_routed_model (which also gates qwen3-shape-tuned ker101).
+is_shared_engine_moe_family_model() {
+  case "$1" in
+    *"Mixtral-8x22B"*|*"Phi-3.5-MoE"*|*"Hunyuan-A13B"*|*"GLM-4.5-Air"*|*"GLM-4.7-Flash"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 is_known_dense_recompute_model() {
   case "$1" in
     *"Qwen3-32B"*|*"Qwen3.5-27B"*|*"Qwen2.5-32B"*|*"Qwen2.5-72B"*|*"Llama-3.3-70B"*) return 0 ;;
@@ -898,6 +915,12 @@ infer_template() {
     gemma-4-*|gemma4-*) printf 'gemma4\n' ;;
     llama-4-*|llama4-*) printf 'llama4\n' ;;
     llama-3*|llama3-*|meta-llama-3*) printf 'llama3\n' ;;
+    mixtral-*) printf 'mistral\n' ;;
+    phi-3.5-moe*|phi3.5-moe*) printf 'phi\n' ;;
+    hunyuan-a13b*) printf 'hunyuan\n' ;;
+    glm-4.5*|glm4.5*|glm-4.7*|glm4.7*) printf 'glm4_moe\n' ;;
+    gpt-oss*) printf 'gpt_oss\n' ;;
+    glm-4*|glm4*) printf 'glm4\n' ;;
     llama-2*|llama2-*) printf 'llama2\n' ;;
     qwen2-vl-*|qwen2.5-vl-*|qvq-*) printf 'qwen2_vl\n' ;;
     qwen2-audio-*) printf 'qwen2_audio\n' ;;
@@ -1775,7 +1798,10 @@ if expected_recomp_off_stage:
             "profile asymm_dense_mlp_finegrained_offload mismatch: "
             f"expected {expected_dense_finegrained}, got {actual_dense_finegrained or '<missing>'}"
         )
-    qwen3_moe_target = "Qwen3-30B-A3B" in str(expected_model_name)
+    qwen3_moe_target = "Qwen3-30B-A3B" in str(expected_model_name) or any(
+        t in str(expected_model_name)
+        for t in ("Mixtral-8x22B", "Phi-3.5-MoE", "Hunyuan-A13B", "GLM-4.5-Air", "GLM-4.7-Flash")
+    )  # shared-engine families run moefg under full-fg too (is_shared_engine_moe_family_model)
     expected_moefg = "true" if expected_recomp_off_stage == "full-fg" and qwen3_moe_target else "false"
     actual_moefg = normalize_bool(config.get("asymm_qwen3_moe_finegrained_offload", "false"))
     if actual_moefg != expected_moefg:
@@ -3460,7 +3486,7 @@ run_job() {
         ASYMM_EXPERT_ACT_OFFLOAD=false; expact_label="$(expact_tag false)"
         ASYMM_ATTN_ACT_OFFLOAD=true; attnact_label="$(attnact_tag true)"
         ASYMM_EXPERT_ACT_OFFLOAD_LORA_A_FWD=cpu; expact_lora_a_fwd_label="$(expact_lora_a_fwd_tag cpu)"
-        if is_qwen3_moe_routed_model "${current_model_name}"; then
+        if is_qwen3_moe_routed_model "${current_model_name}" || is_shared_engine_moe_family_model "${current_model_name}"; then
           ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD=1; moefg_label="$(moefg_tag 1)"
           ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS="${requested_qwen3_moe_down_scatter_block_experts}"
           dscatter_label="$(dscatter_tag "${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}")"

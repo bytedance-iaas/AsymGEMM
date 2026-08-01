@@ -2363,8 +2363,13 @@ class AsymFrozenLinear(nn.Module):
     def bias(self) -> Optional[torch.Tensor]:
         return self.bias_cpu
 
-    def asym_liger_lm_head_weight(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        if self.bias_cpu is not None:
+    def asym_liger_lm_head_weight(
+        self, *, device: torch.device, dtype: torch.dtype, allow_bias: bool = False
+    ) -> torch.Tensor:
+        if self.bias_cpu is not None and not allow_bias:
+            # Callers that pass allow_bias=True (the generic-MoE bridge) resolve
+            # and thread bias_cpu into the fused CE themselves; everyone else
+            # would silently drop it, so keep refusing.
             raise RuntimeError("Asym Liger lm_head bridge currently requires a bias-free lm_head.")
         weight = self.host_weight.weight
         if weight.requires_grad:
