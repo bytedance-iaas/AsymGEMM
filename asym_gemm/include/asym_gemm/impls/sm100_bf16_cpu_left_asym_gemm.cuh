@@ -7,6 +7,12 @@
 #include <asym_gemm/common/asymScheduler.cuh>
 #include <asym_gemm/common/utils.cuh>
 #include <asym_gemm/common/sm100_utils.cuh>
+#include <asym_gemm/impls/asym_lora_dataflow.cuh>
+
+// K1's coordinates in the training-dataflow design space (see the header):
+// fetch-once streamed slot, stream(row)-keyed grid, ≤3 consumers per stream.
+static_assert(asym_gemm::lora_dataflow::K1ForwardLoRA::reuse ==
+              asym_gemm::lora_dataflow::StreamReuse::kFetchOnce, "");
 
 namespace asym_gemm {
 
@@ -24,7 +30,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t,
           uint64_t kTensorCoreUtilControl,
           bool kCompactMBlockGrid,
-          bool kPairOutput>
+          uint32_t kNumOutputs>
 __global__ void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_bf16_cpu_left_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -32,7 +38,9 @@ sm100_bf16_cpu_left_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_cd,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_b_pair,
-                     const __grid_constant__ cute::TmaDescriptor tensor_map_cd_pair) {
+                     const __grid_constant__ cute::TmaDescriptor tensor_map_cd_pair,
+                     const __grid_constant__ cute::TmaDescriptor tensor_map_b_third,
+                     const __grid_constant__ cute::TmaDescriptor tensor_map_cd_third) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     // Enlarge `BLOCK_K` for some cases
     // NOTES: this is for reducing the `umma_arrive()` overhead
@@ -215,7 +223,7 @@ sm100_bf16_cpu_left_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
     // and reuses that host-resident A tile across all CUDA-resident B/N tiles.
     if (warp_idx == 0 and cute::elect_one_sync()) {
         const uint32_t num_n_blocks_per_output = ceil_div_device(shape_n, BLOCK_N);
-        const uint32_t num_n_blocks = kPairOutput ? num_n_blocks_per_output * 2 : num_n_blocks_per_output;
+        const uint32_t num_n_blocks = num_n_blocks_per_output * kNumOutputs;
         const uint32_t m_idx = block_m_iter * BLOCK_M;
 
         for (int block_k_iter = 0; block_k_iter < block_k; ++block_k_iter) {
@@ -233,10 +241,11 @@ sm100_bf16_cpu_left_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
             }
 
             for (uint32_t block_n_iter = 0; block_n_iter < num_n_blocks; advance_pipeline(block_n_iter)) {
-                const uint32_t pair_output_idx = kPairOutput ? block_n_iter / num_n_blocks_per_output : 0;
-                const uint32_t local_block_n_iter = kPairOutput ? block_n_iter - pair_output_idx * num_n_blocks_per_output : block_n_iter;
+                const uint32_t pair_output_idx = kNumOutputs > 1 ? block_n_iter / num_n_blocks_per_output : 0;
+                const uint32_t local_block_n_iter = kNumOutputs > 1 ? block_n_iter - pair_output_idx * num_n_blocks_per_output : block_n_iter;
                 const uint32_t n_idx = local_block_n_iter * BLOCK_N + shape_n * scheduler.current_group_idx;
-                const auto* selected_tensor_map_b = (kPairOutput && pair_output_idx != 0) ? &tensor_map_b_pair : &tensor_map_b;
+                const auto* selected_tensor_map_b = (pair_output_idx == 2) ? &tensor_map_b_third
+                                                  : (pair_output_idx == 1) ? &tensor_map_b_pair : &tensor_map_b;
 
                 empty_barriers[stage_idx]->wait(phase ^ 1);
                 tma_copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, cutlass::bfloat16_t, false>(
@@ -285,7 +294,7 @@ sm100_bf16_cpu_left_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
         };
 
         const uint32_t num_n_blocks_per_output = ceil_div_device(shape_n, BLOCK_N);
-        const uint32_t num_n_blocks = kPairOutput ? num_n_blocks_per_output * 2 : num_n_blocks_per_output;
+        const uint32_t num_n_blocks = num_n_blocks_per_output * kNumOutputs;
         for (int block_k_iter = 0; block_k_iter < block_k; ++block_k_iter) {
             full_barriers_a[0]->wait(phase_a);
             phase_a ^= 1;
@@ -369,7 +378,7 @@ sm100_bf16_cpu_left_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
         };
 
         const uint32_t num_n_blocks_per_output = ceil_div_device(shape_n, BLOCK_N);
-        const uint32_t num_n_blocks = kPairOutput ? num_n_blocks_per_output * 2 : num_n_blocks_per_output;
+        const uint32_t num_n_blocks = num_n_blocks_per_output * kNumOutputs;
         for (int block_k_iter = 0; block_k_iter < block_k; ++block_k_iter) {
             for (uint32_t block_n_iter = 0; block_n_iter < num_n_blocks; ++block_n_iter, advance_accum_pipeline()) {
                 tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
@@ -389,10 +398,11 @@ sm100_bf16_cpu_left_asym_gemm_impl(uint32_t* offsets, uint32_t* experts,
                         cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
                         const auto m_idx = BLOCK_M * block_m_iter + w * WAVE_BLOCK_M;
-                        const uint32_t pair_output_idx = kPairOutput ? block_n_iter / num_n_blocks_per_output : 0;
-                        const uint32_t local_block_n_iter = kPairOutput ? block_n_iter - pair_output_idx * num_n_blocks_per_output : block_n_iter;
+                        const uint32_t pair_output_idx = kNumOutputs > 1 ? block_n_iter / num_n_blocks_per_output : 0;
+                        const uint32_t local_block_n_iter = kNumOutputs > 1 ? block_n_iter - pair_output_idx * num_n_blocks_per_output : block_n_iter;
                         const auto n_idx = local_block_n_iter * BLOCK_N + s * STORE_BLOCK_N;
-                        const auto* selected_tensor_map_cd = (kPairOutput && pair_output_idx != 0) ? &tensor_map_cd_pair : &tensor_map_cd;
+                        const auto* selected_tensor_map_cd = (pair_output_idx == 2) ? &tensor_map_cd_third
+                                                           : (pair_output_idx == 1) ? &tensor_map_cd_pair : &tensor_map_cd;
 
                         #pragma unroll
                         for (uint32_t i = 0; i < STORE_BLOCK_N / kNumElemsPerBankGroup; ++i) {

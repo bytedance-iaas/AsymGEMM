@@ -137,6 +137,9 @@ def _cpu_socket_for_numa_node(numa_node: int | None) -> int | None:
         return None
 
 
+from .exact_pinned import exact_pinned_enabled, register_inplace
+
+
 def _make_metadata(tensor: torch.Tensor, pin_error: str | None = None) -> HostWeightMetadata:
     data_ptr = tensor.data_ptr()
     numa_node = _numa_node_for_address(data_ptr)
@@ -202,15 +205,19 @@ class HostWeight:
 
         copy_start = time.perf_counter()
         cpu_tensor = tensor.detach()
+        exclusively_owned = False
         if cpu_tensor.device.type != "cpu":
             cpu_tensor = cpu_tensor.to(device="cpu", non_blocking=False)
+            exclusively_owned = True
         copy_seconds = time.perf_counter() - copy_start
 
         clone_start = time.perf_counter()
         if clone:
             cpu_tensor = cpu_tensor.clone(memory_format=torch.contiguous_format)
+            exclusively_owned = True
         elif not cpu_tensor.is_contiguous():
             cpu_tensor = cpu_tensor.contiguous()
+            exclusively_owned = True
         clone_seconds = time.perf_counter() - clone_start
         cpu_tensor.requires_grad_(False)
 
@@ -235,10 +242,24 @@ class HostWeight:
                 self._fabric_bank = True
             else:
                 pin_start = time.perf_counter()
-                try:
-                    cpu_tensor = cpu_tensor.pin_memory()
-                except RuntimeError as exc:
-                    pin_error = str(exc)
+                exact_err: str | None = "disabled"
+                if exact_pinned_enabled() and exclusively_owned:
+                    # capacity fix 2026-07-25: page-lock the exact-size clone in
+                    # place instead of pin_memory()'s pow2-bucketed copy (see
+                    # exact_pinned.py). Failure falls through to the stock path.
+                    # 39-merge guard (mrg38on incident, 2026-08-01): ONLY when this
+                    # HostWeight exclusively owns the buffer (we cloned/copied it).
+                    # clone=False aliases of loader-owned params (qwen3 bank path)
+                    # died mid-lifecycle when registered in place — copies stayed
+                    # valid at registration (491/491 probes OK) but the aliased
+                    # storage became uncopyable (sync AND async invalid-argument)
+                    # by first forward. pin_memory() copy = stock, release-safe.
+                    exact_err = register_inplace(cpu_tensor)
+                if exact_err is not None:
+                    try:
+                        cpu_tensor = cpu_tensor.pin_memory()
+                    except RuntimeError as exc:
+                        pin_error = str(exc)
                 pin_seconds = time.perf_counter() - pin_start
 
         self._tensor = cpu_tensor

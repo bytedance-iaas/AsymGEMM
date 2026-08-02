@@ -52,7 +52,7 @@ reports/
 third-party/
 outputs/
 .aioenv/
-agent/overleaf/
+overleaf/
 outputs/
 scripts/lf/ceiling*/**
 !scripts/lf/ceiling_reconfirm_state/extract_metrics.py

@@ -83,9 +83,13 @@ def _is_llama4_conditional_generation(model: nn.Module) -> bool:
 # ---------------------------------------------------------------------------
 # lm_head weight resolution + validation (shared across model types).
 # ---------------------------------------------------------------------------
-def _resolve_liger_lm_head_weight(lm_head: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+def _resolve_liger_lm_head_weight(
+    lm_head: nn.Module, hidden_states: torch.Tensor, *, allow_bias: bool = False
+) -> torch.Tensor:
     resolver = getattr(lm_head, "asym_liger_lm_head_weight", None)
     if callable(resolver):
+        if allow_bias:
+            return resolver(device=hidden_states.device, dtype=hidden_states.dtype, allow_bias=True)
         return resolver(device=hidden_states.device, dtype=hidden_states.dtype)
 
     weight = getattr(lm_head, "weight", None)
@@ -102,7 +106,7 @@ def _lm_head_weight_source(lm_head: nn.Module) -> str:
     return "unavailable"
 
 
-def _validate_liger_lm_head(lm_head: nn.Module | None, *, model_label: str, strict: bool):
+def _validate_liger_lm_head(lm_head: nn.Module | None, *, model_label: str, strict: bool, allow_bias: bool = False):
     if lm_head is None:
         if strict:
             raise RuntimeError(f"{model_label} model has no lm_head.")
@@ -117,7 +121,8 @@ def _validate_liger_lm_head(lm_head: nn.Module | None, *, model_label: str, stri
         return None
 
     if getattr(lm_head, "bias", None) is not None or getattr(lm_head, "bias_cpu", None) is not None:
-        raise RuntimeError("Liger loss bridge currently requires a bias-free lm_head.")
+        if not allow_bias:
+            raise RuntimeError("Liger loss bridge currently requires a bias-free lm_head.")
 
     if any(param.requires_grad for param in lm_head.parameters(recurse=True)):
         raise RuntimeError("Liger loss bridge supports frozen lm_head only.")
@@ -857,6 +862,35 @@ def install_asym_liger_qwen3_5_loss_bridge(model: nn.Module, *, strict: bool = T
 # ---------------------------------------------------------------------------
 _ASYM_LIGER_DENSE_MODEL_TYPES = {"qwen2", "llama", "qwen3", "qwen3_5_text"}
 
+# model_integration.md families (2026-07-27): vanilla `*ForCausalLM` MoE archs
+# whose loss path is the standard hidden→lm_head→CE. Their vocabs make full
+# logits the peak-HBM driver (phi T3 128k·b3: loss saved 45.9 GiB + CE
+# workspace 33.7 GiB of a 158.6 peak), so the fused-LCE bridge is the memory
+# fix, not an optimization. Aux/router loss is NOT computed here — tf-5.6
+# drops router-logit threading for these types and the wave-1 parity A/Bs
+# confirmed reference and asym losses agree without it.
+_ASYM_LIGER_GENERIC_MOE_MODEL_TYPES = {
+    "phimoe",
+    "mixtral",
+    "hunyuan_v1_moe",
+    "glm4_moe",
+    "glm4_moe_lite",
+    "gpt_oss",
+}
+
+
+def _resolve_liger_lm_head_bias(lm_head: nn.Module, reference: torch.Tensor) -> torch.Tensor | None:
+    # Phi-3.5-MoE is the one family with a real lm_head bias; an Asym-staged
+    # lm_head keeps it host-side as bias_cpu. Tiny (vocab-length), fetched per
+    # call. liger's functional supports bias natively.
+    bias = getattr(lm_head, "bias", None)
+    if bias is None:
+        bias = getattr(lm_head, "bias_cpu", None)
+    if bias is None:
+        return None
+    with torch.no_grad():
+        return bias.detach().to(device=reference.device, dtype=reference.dtype, non_blocking=True)
+
 
 def asym_dense_causal_lce_forward(
     self,
@@ -947,6 +981,129 @@ def asym_dense_causal_lce_forward(
     )
 
 
+def asym_generic_moe_causal_lce_forward(
+    self,
+    input_ids: Optional[torch.LongTensor] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[list[torch.FloatTensor]] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    labels: Optional[torch.LongTensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    logits_to_keep: Union[int, torch.Tensor] = 0,
+    skip_logits: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+    **kwargs: Any,
+) -> LigerCausalLMOutputWithPast:
+    # Generic-MoE twin of asym_dense_causal_lce_forward: duck-typed hidden-state
+    # access (Moe*OutputWithPast vs BaseModelOutputWithPast), lm_head bias
+    # threaded into the fused CE (phimoe), router/aux outputs not requested.
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_hidden_states = (
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    )
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    outputs = self.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        cache_position=cache_position,
+        **kwargs,
+    )
+
+    hidden_states = getattr(outputs, "last_hidden_state", None)
+    if hidden_states is None:
+        hidden_states = outputs[0]
+    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    kept_hidden_states = hidden_states[:, slice_indices, :]
+
+    shift_labels = kwargs.pop("shift_labels", None)
+    logits = None
+    loss = None
+    token_accuracy = None
+    predicted_tokens = None
+
+    if skip_logits is None:
+        skip_logits = self.training and (labels is not None or shift_labels is not None)
+
+    if skip_logits:
+        lm_head_weight = _resolve_liger_lm_head_weight(self.lm_head, kept_hidden_states, allow_bias=True)
+        lm_head_bias = _resolve_liger_lm_head_bias(self.lm_head, kept_hidden_states)
+        if lm_head_bias is not None:
+            kwargs["bias"] = lm_head_bias
+        result = LigerForCausalLMLoss(
+            hidden_states=kept_hidden_states,
+            lm_head_weight=lm_head_weight,
+            labels=labels,
+            shift_labels=shift_labels,
+            hidden_size=self.config.hidden_size,
+            **kwargs,
+        )
+        loss, _, token_accuracy, predicted_tokens = unpack_cross_entropy_result(result)
+    else:
+        logits = self.lm_head(kept_hidden_states)
+        if labels is not None or shift_labels is not None:
+            loss = self.loss_function(
+                logits=logits,
+                labels=labels,
+                shift_labels=shift_labels,
+                vocab_size=self.config.vocab_size,
+                **kwargs,
+            )
+
+    if not return_dict:
+        output = (logits,) + outputs[1:]
+        output = ((loss,) + output) if loss is not None else output
+        output = output + (token_accuracy,) if token_accuracy is not None else output
+        output = output + (predicted_tokens,) if predicted_tokens is not None else output
+        return output
+
+    return LigerCausalLMOutputWithPast(
+        loss=loss,
+        logits=logits,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+        token_accuracy=token_accuracy,
+        predicted_tokens=predicted_tokens,
+    )
+
+
+def install_asym_liger_generic_moe_loss_bridge(model: nn.Module, *, strict: bool = True) -> bool:
+    target_model = _base_causal_lm_model(model)
+    config = getattr(target_model, "config", None)
+    model_type = getattr(config, "model_type", None)
+    if model_type not in _ASYM_LIGER_GENERIC_MOE_MODEL_TYPES:
+        if strict:
+            raise ValueError(
+                f"Asym generic-MoE Liger loss bridge does not support model_type={model_type!r}."
+            )
+        return False
+
+    validated = _validate_liger_lm_head(
+        getattr(target_model, "lm_head", None),
+        model_label=str(model_type),
+        strict=strict,
+        allow_bias=True,
+    )
+    if validated is None:
+        return False
+    lm_head, weight_source = validated
+
+    target_model.forward = MethodType(asym_generic_moe_causal_lce_forward, target_model)
+    _mark_liger_bridge_installed(target_model, lm_head, weight_source, str(model_type), "causal_lm")
+    return True
+
+
 def install_asym_liger_dense_loss_bridge(model: nn.Module, *, strict: bool = True) -> bool:
     target_model = _base_causal_lm_model(model)
     config = getattr(target_model, "config", None)
@@ -986,6 +1143,8 @@ def install_asym_liger_loss_bridge(model: nn.Module, *, strict: bool = True) -> 
         return install_asym_liger_qwen3_moe_loss_bridge(model, strict=strict)
     if causal_type in _ASYM_LIGER_DENSE_MODEL_TYPES:
         return install_asym_liger_dense_loss_bridge(model, strict=strict)
+    if causal_type in _ASYM_LIGER_GENERIC_MOE_MODEL_TYPES:
+        return install_asym_liger_generic_moe_loss_bridge(model, strict=strict)
     return False
 
 
@@ -997,10 +1156,12 @@ __all__ = [
     "asym_llama4_causal_lm_lce_forward",
     "asym_llama4_conditional_lce_forward",
     "asym_dense_causal_lce_forward",
+    "asym_generic_moe_causal_lce_forward",
     "install_asym_liger_qwen3_moe_loss_bridge",
     "install_asym_liger_qwen3_5_loss_bridge",
     "install_asym_liger_qwen3_5_moe_loss_bridge",
     "install_asym_liger_llama4_loss_bridge",
     "install_asym_liger_dense_loss_bridge",
+    "install_asym_liger_generic_moe_loss_bridge",
     "install_asym_liger_loss_bridge",
 ]

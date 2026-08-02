@@ -25,6 +25,16 @@ void sm100_grouped_lora_a_pair_grad_bf16_cpu_right(
     const torch::Tensor& experts,
     int64_t list_size);
 
+void sm100_grouped_lora_a_dual_bf16_cpu_right(
+    const torch::Tensor& grad_low_rank,
+    const torch::Tensor& source_cpu,
+    const torch::Tensor& lora_a,
+    const torch::Tensor& s_out,
+    const torch::Tensor& grad_a,
+    const torch::Tensor& offsets,
+    const torch::Tensor& experts,
+    int64_t list_size);
+
 void sm100_grouped_lora_b_backward_bf16_cpu_source(
     const torch::Tensor& grad_out_cpu,
     const torch::Tensor& low_rank,
@@ -43,6 +53,17 @@ static void register_apis(pybind11::module_& m) {
         &sm100_grouped_lora_a_grad_bf16_cpu_right,
         py::arg("grad_low_rank"),
         py::arg("source_cpu"),
+        py::arg("grad_a"),
+        py::arg("offsets"),
+        py::arg("experts"),
+        py::arg("list_size"));
+    m.def(
+        "sm100_grouped_lora_a_dual_bf16_cpu_right",
+        &sm100_grouped_lora_a_dual_bf16_cpu_right,
+        py::arg("grad_low_rank"),
+        py::arg("source_cpu"),
+        py::arg("lora_a"),
+        py::arg("s_out"),
         py::arg("grad_a"),
         py::arg("offsets"),
         py::arg("experts"),

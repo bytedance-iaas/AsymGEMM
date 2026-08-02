@@ -328,9 +328,11 @@ public:
         CUtensorMap tensor_map_cd;
         CUtensorMap tensor_map_b_pair;
         CUtensorMap tensor_map_cd_pair;
+        CUtensorMap tensor_map_b_third;
+        CUtensorMap tensor_map_cd_third;
 
         bool compact_m_block_grid;
-        bool pair_output;
+        int num_outputs;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -369,7 +371,7 @@ static void __instantiate_kernel() {{
         to_string(args.gemm_config.gemm_type), args.gemm_config.with_accumulation, to_string(args.gemm_config.cd_dtype),
         args.gemm_config.tc_util,
         args.compact_m_block_grid,
-        args.pair_output);
+        args.num_outputs);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -379,7 +381,9 @@ static void __instantiate_kernel() {{
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_cd,
             args.tensor_map_b_pair,
-            args.tensor_map_cd_pair));
+            args.tensor_map_cd_pair,
+            args.tensor_map_b_third,
+            args.tensor_map_cd_third));
     }
 };
 
@@ -913,8 +917,10 @@ static void sm100_m_grouped_bf16_cpu_left_asym_gemm_contiguous(const torch::Tens
         .tensor_map_cd = tensor_map_cd,
         .tensor_map_b_pair = tensor_map_b,
         .tensor_map_cd_pair = tensor_map_cd,
+        .tensor_map_b_third = tensor_map_b,
+        .tensor_map_cd_third = tensor_map_cd,
         .compact_m_block_grid = compact_m_block_grid,
-        .pair_output = false
+        .num_outputs = 1
     };
     const auto& code = SM100BF16CpuLeftAsymGemmRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_bf16_m_grouped_cpu_left_asym_gemm_contiguous", code);
@@ -1000,11 +1006,100 @@ static void sm100_m_grouped_bf16_cpu_left_pair_asym_gemm_contiguous(const torch:
         .tensor_map_cd = tensor_map_d_gate,
         .tensor_map_b_pair = tensor_map_b_up,
         .tensor_map_cd_pair = tensor_map_d_up,
+        .tensor_map_b_third = tensor_map_b_up,
+        .tensor_map_cd_third = tensor_map_d_up,
         .compact_m_block_grid = compact_m_block_grid,
-        .pair_output = true
+        .num_outputs = 2
     };
     const auto& code = SM100BF16CpuLeftAsymGemmRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_bf16_m_grouped_cpu_left_pair_asym_gemm_contiguous", code);
+    SM100BF16CpuLeftAsymGemmRuntime::launch(runtime, args);
+}
+
+// N1 (2026-07-29): qkv shared-stream triple — one host-activation stream
+// serves THREE adapter weight/output sets through the same fetch-once slot.
+static void sm100_m_grouped_bf16_cpu_left_triple_asym_gemm_contiguous(const torch::Tensor& a,
+                                                 const torch::Tensor& b0,
+                                                 const torch::Tensor& b1,
+                                                 const torch::Tensor& b2,
+                                                 const torch::Tensor& d0,
+                                                 const torch::Tensor& d1,
+                                                 const torch::Tensor& d2,
+                                                 const torch::Tensor& offsets_t,
+                                                 const torch::Tensor& experts_t,
+                                                 const int& grid_y,
+                                                 const int& num_groups, const int& m, const int& n, const int& k,
+                                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                                 const std::string& compiled_dims,
+                                                 const int b_outer_stride = -1,
+                                                 const int compact_m_blocks = 0) {
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+
+    const int block_m = get_env<int>("DG_BF16_CPU_LEFT_BLOCK_M", get_env<int>("DG_BF16_BLOCK_M", 64));
+    const int block_n = get_env<int>("DG_BF16_CPU_LEFT_BLOCK_N", get_env<int>("DG_BF16_BLOCK_N", 64));
+    const int block_k = get_env<int>("DG_BF16_CPU_LEFT_BLOCK_K", get_env<int>("DG_BF16_BLOCK_K", 512));
+    const auto& aligned_k = align(k, block_k);
+
+    DG_HOST_ASSERT(block_m > 0 and block_n > 0 and block_k > 0);
+    const auto& config = get_manual_config_asym<SM100ArchSpec>(
+        GemmType::MGroupedContiguous, KernelType::KernelNoSF,
+        m, n, k, 1, major_a, major_b,
+        torch::kBFloat16, d0.scalar_type(), false,
+        device_runtime->get_num_sms(),
+        block_m, block_n, block_k);
+    DG_HOST_ASSERT(config.multicast_config.num_multicast == 1);
+
+    const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
+                                               SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),
+                                               config.block_k,
+                                               static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
+                                               config.smem_config.swizzle_a_mode);
+    const int outer_b = (b_outer_stride >= 0)
+        ? b_outer_stride
+        : static_cast<int>(b0.stride(get_non_contiguous_dim(major_b)));
+    auto make_b = [&](const torch::Tensor& b) {
+        return make_tma_b_desc(major_b, b, n, k,
+                               SM100ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n),
+                               config.block_k, outer_b, num_groups,
+                               config.smem_config.swizzle_b_mode);
+    };
+    auto make_d = [&](const torch::Tensor& d) {
+        return make_tma_cd_desc(d, m, n,
+                                SM100ArchSpec::get_cd_store_block_m(config.block_m),
+                                SM100ArchSpec::get_cd_store_block_n(config.block_n),
+                                static_cast<int>(d.stride(-2)), 1,
+                                config.smem_config.swizzle_cd_mode);
+    };
+    const auto& tb0 = make_b(b0); const auto& tb1 = make_b(b1); const auto& tb2 = make_b(b2);
+    const auto& td0 = make_d(d0); const auto& td1 = make_d(d1); const auto& td2 = make_d(d2);
+
+    if (grid_y <= 0)
+        return;
+
+    const bool compact_m_block_grid = compact_m_blocks > 0;
+    const int grid_x = compact_m_block_grid ? compact_m_blocks : ceil_div(m, config.block_m);
+
+    const SM100BF16CpuLeftAsymGemmRuntime::Args& args = {
+        .m = m, .n = n, .k = aligned_k, .num_groups = num_groups,
+        .compiled_dims = compiled_dims,
+        .gemm_config = config,
+        .launch_args = LaunchArgs({grid_x, grid_y}, config.thread_config.num_threads,
+                                  config.smem_config.smem_size,
+                                  config.multicast_config.num_multicast),
+        .offsets = offsets_t.data_ptr<int>(),
+        .experts = experts_t.data_ptr<int>(),
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tb0,
+        .tensor_map_cd = td0,
+        .tensor_map_b_pair = tb1,
+        .tensor_map_cd_pair = td1,
+        .tensor_map_b_third = tb2,
+        .tensor_map_cd_third = td2,
+        .compact_m_block_grid = compact_m_block_grid,
+        .num_outputs = 3
+    };
+    const auto& code = SM100BF16CpuLeftAsymGemmRuntime::generate(args);
+    const auto& runtime = compiler->build("sm100_bf16_m_grouped_cpu_left_triple_asym_gemm_contiguous", code);
     SM100BF16CpuLeftAsymGemmRuntime::launch(runtime, args);
 }
 

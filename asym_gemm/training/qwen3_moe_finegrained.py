@@ -14,6 +14,10 @@ import torch
 import torch.nn.functional as F
 
 from .activation_offload import ActivationOffloadManager, fg_chunk_rows
+from . import activation_offload as _act_offload
+from . import cpu_ops
+from . import cpu_worker
+from . import placement_policy
 from .exp_act_offload_lora import (
     LORA_A_GRAD_CPU_RIGHT,
     _missing_symbol,
@@ -251,6 +255,13 @@ class _HBMKeepManager:
         # HBM-kept tensors were never copied anywhere; nothing to wait for.
         return None
 
+    def take_cpu_ready_event(self, handle: "_HBMKeepHandle | None"):
+        # HBM-kept: nothing was copied; no event exists.
+        return None
+
+    def host_wait_cpu_ready(self, handle: "_HBMKeepHandle | None") -> None:
+        return None
+
     def release_stage(self, staged: torch.Tensor, *, drop_cache: bool = False) -> None:
         return None
 
@@ -269,6 +280,164 @@ class _HBMKeepManager:
             "keep_stage_clone_bytes": int(self.stage_clone_bytes),
             "keep_stage_noclone_bytes": int(self.stage_noclone_bytes),
         }
+
+_DIRECT_REUSE_COUNTS = {
+    "up_direct": 0,
+    "act_direct": 0,
+    "gate_direct": 0,
+    "silu_bwd_single_stage": 0,
+    "guard_denied": 0,
+}
+_DIRECT_REUSE_ENGAGED = False
+
+
+def direct_reuse_stats() -> dict:
+    """P15 (byte-diet) per-mechanism engage counters for the profile."""
+    out = dict(_DIRECT_REUSE_COUNTS)
+    out["enabled"] = _fg_direct_reuse_enabled()
+    return out
+
+
+def _fg_direct_reuse_enabled() -> bool:
+    """128k moe-backward byte-diet (fix_cpu_compute.md, accepted round): DIRECT
+    REUSE of the GPU-born gate/up/act tensors in place of their offload->restage
+    roundtrips (bit-identical by construction: the skipped roundtrip is lossless).
+    Env ``ASYMM_MOE_FG_DIRECT_REUSE`` force-arms; else policy rule P15 (False
+    until gated). Every mechanism is additionally G-guarded per call."""
+    raw = os.environ.get(
+        "ASYMM_MOE_FG_DIRECT_REUSE",
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_MOE_FG_DIRECT_REUSE", ""),
+    )
+    if raw.strip().lower() in {"1", "true", "yes", "y", "on"}:
+        return True
+    return placement_policy.enabled() and placement_policy.moe_direct_reuse()
+
+
+def _direct_reuse_ok(mech: str, extra_bytes: int) -> bool:
+    """Per-mechanism gate: flag + G headroom (holding the GPU tensor through the
+    mechanism's window costs `extra_bytes` of HBM the roundtrip would have freed)."""
+    global _DIRECT_REUSE_ENGAGED
+    if not _fg_direct_reuse_enabled():
+        return False
+    if not _act_offload.prefetch_free_ok(int(extra_bytes)):
+        _DIRECT_REUSE_COUNTS["guard_denied"] += 1
+        return False
+    _DIRECT_REUSE_COUNTS[mech] += 1
+    if not _DIRECT_REUSE_ENGAGED:
+        _DIRECT_REUSE_ENGAGED = True
+        import sys
+
+        print(f"[asym-direct-reuse] moe fg direct-reuse ENGAGED (first={mech})",
+              file=sys.stderr, flush=True)
+    return True
+
+
+
+# NOTE: helpers below this point consult asym_gemm.training.placement_policy when the
+# ASYM_PLACEMENT_POLICY master switch is ON (fix_cpu_compute.md item 1); the env flags
+# remain the manual mechanism for policy-OFF runs.
+
+
+def _cpu_act_max_bytes() -> int:
+    """Bytes-based CPU-act guard (2026-07-15): the rows-only threshold missed dense-32B
+    ([256k, 25600] = 13.1 GB with few rows). Cap = rows*cols*2 bytes; default 6.4 GB
+    (the measured 30B win regime is <=3.2 GB/tensor; 128k loss regime is 12.6 GB)."""
+    raw = os.environ.get(
+        "ASYMM_CPU_ACT_MAX_BYTES",
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_CPU_ACT_MAX_BYTES", "6400000000"),
+    )
+    try:
+        return int(str(raw).strip() or "6400000000")
+    except ValueError:
+        return 6400000000
+
+
+def _fg_cpu_act_max_rows() -> int:
+    """Routed-rows ceiling for the CPU act placement (cpu_compute.md CEIL findings,
+    2026-07-13): CPU act WINS at R≈2.1M (32k×b8, −2.3%) and LOSES at R≈8.2M
+    (128k×b8, −0.7%; 16T worse) — the CPU sweep outgrows the GPU up-block window.
+    Above this threshold the GPU act path is used regardless of the flags."""
+    raw = os.environ.get(
+        "ASYMM_QWEN3_MOE_FG_CPU_ACT_MAX_ROWS",
+        os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_QWEN3_MOE_FG_CPU_ACT_MAX_ROWS", "4194304"),
+    )
+    try:
+        return int(str(raw).strip() or "4194304")
+    except ValueError:
+        return 4194304
+
+
+def _fg_cpu_silu_bwd_enabled() -> bool:
+    """K-5 (cpu_compute.md): SwiGLU backward on the CPU worker — dgrads born on CPU
+    (enables dB deposits with zero new transfers). Window analysis predicts the silu-bwd
+    itself is exposed (~73 ms/layer @32k); measured gate decides."""
+    if placement_policy.enabled():
+        return placement_policy.moe_cpu_silu_bwd()  # P9: rejected (+7.7% measured)
+    return _env_flag_default_off("ASYMM_QWEN3_MOE_FG_CPU_SILU_BWD")
+
+
+def _fg_lora_b_grad_cpu_deposit_enabled() -> bool:
+    """K-5: grouped dB deposit (dB = dgrad^T @ S, both CPU-resident; same kernel with
+    swapped operands). Requires CPU-born dgrads (ASYMM_QWEN3_MOE_FG_CPU_SILU_BWD)."""
+    if placement_policy.enabled():
+        return placement_policy.moe_lora_b_deposit()  # P9: rejected
+    return _env_flag_default_off("ASYMM_LORA_B_GRAD_CPU")
+
+
+def _fg_stage_dedup_enabled() -> bool:
+    """K-9 (cpu_compute.md): reuse ONE act stage for down_lora AND down_base."""
+    if placement_policy.enabled():
+        return placement_policy.stage_dedup()  # P5: never-hurts, always ON
+    return _env_flag_default_off("ASYMM_QWEN3_MOE_FG_STAGE_DEDUP")
+
+
+def _fg_cpu_act_chunked_enabled() -> bool:
+    """K-4 (cpu_compute.md): worker computes the mul in row-chunks and fills the
+    down_base stage buffer per-chunk on the restage side stream (H2D rides the mul)."""
+    if placement_policy.enabled():
+        return placement_policy.moe_cpu_act_chunked()  # rides P1's gate
+    return _env_flag_default_off("ASYMM_QWEN3_MOE_FG_CPU_ACT_CHUNKED")
+
+
+def _fg_cpu_act_async_enabled() -> bool:
+    """Stage-2 (cpu_compute.md): run the CPU SwiGLU on the CpuWorker thread, split
+    into silu(gate) — overlapped with the whole GPU up-block — and ``*= up`` after
+    the up D2H (worker FIFO chains the passes). Requires ASYMM_QWEN3_MOE_FG_CPU_ACT
+    + ASYMM_CPU_WORKER + the split kernels; falls back to the sync fused path."""
+    if placement_policy.enabled():
+        return placement_policy.moe_cpu_act_async()  # the winning P1 arm
+    return _env_flag_default_off("ASYMM_QWEN3_MOE_FG_CPU_ACT_ASYNC")
+
+
+def _fg_cpu_act_enabled() -> bool:
+    """Compute the recompute-forward SwiGLU on the Grace CPU with the fused
+    SVE kernel (cpu_compute.md Stage 1): gate_cpu/up_cpu are already pinned-CPU
+    right after their D2H, so the CPU act skips the gate+up H2D stages and the
+    act D2H (3 of 4 stage copies of [R, I]); only the act H2D for the down
+    block remains. Requires ASYMM_CPU_FUSED_SILU + a build with the kernels;
+    falls back to the GPU path otherwise."""
+    if placement_policy.enabled():
+        return placement_policy.moe_cpu_act_feature()  # P1 (per-call guard below)
+    return _env_flag_default_off("ASYMM_QWEN3_MOE_FG_CPU_ACT")
+
+
+def _cpu_act_fits(rows: int, nbytes: int) -> bool:
+    """P1's per-call automatic gate: rows/bytes window fit. Policy-ON routes through
+    the policy module (single authority + P11 tracing); policy-OFF keeps the legacy
+    env-threshold behaviour bit-for-bit."""
+    if placement_policy.enabled():
+        return placement_policy.moe_cpu_act(rows, nbytes)
+    return int(rows) <= _fg_cpu_act_max_rows() and int(nbytes) <= _cpu_act_max_bytes()
+
+
+def _fg_blocked_cpu_act_enabled() -> bool:
+    """toconfirm.md #1 salvage (2026-07-25): on the BLOCKED forward, keep the GPU
+    silu·mul for the forward's own use but DROP the act D2H — a cpu_worker task
+    rebuilds act_cpu = fused_silu_mul(gate_cpu, up_cpu) from the copies that
+    already landed for backward. Kills 1 of 3 blocked-forward D2H streams
+    ([R,I] bf16 per layer) entirely off the critical path (window = fwd→bwd).
+    Default OFF; A/B via this env, policy adoption only after the gate wins."""
+    return _env_flag_default_off("ASYMM_QWEN3_MOE_FG_BLOCKED_CPU_ACT")
 
 
 def _grouped_da_gpu(
@@ -630,6 +799,114 @@ def _lora_b_grad(
     return grad_b
 
 
+def _lora_a_grad_cpu_deposit_enabled() -> bool:
+    """Stage-3 (cpu_compute.md): compute LoRA-A wgrad on the Grace CPU (CpuWorker,
+    fire-and-forget) writing fp32 directly into the optimizer's grad buffer. The
+    returned autograd grad is a dummy; the grad hook still fires (bank release),
+    but its copies are skipped and the drain waits the worker task. Removes the
+    per-layer C2C X-read of the GPU cpu-right wgrad kernel."""
+    if placement_policy.enabled():
+        return placement_policy.moe_wgrad_deposit()  # P2: ON for MoE, all contexts
+    return _env_flag_default_off("ASYMM_LORA_A_GRAD_CPU")
+
+
+def _cpu_group_meta(offsets: torch.Tensor, experts: torch.Tensor):
+    cached = getattr(offsets, "_asym_cpu_wgrad_meta", None)
+    if cached is not None:
+        return cached
+    off = offsets.detach().to(device="cpu", dtype=torch.long)
+    num_groups = int(off.numel()) - 1
+    pairs = torch.stack([off[:-1], off[1:]], dim=1).reshape(-1).contiguous()
+    exp = experts.detach().to(device="cpu", dtype=torch.long)
+    ge = exp[:num_groups].contiguous() if int(exp.numel()) >= num_groups else torch.arange(num_groups)
+    meta = (pairs, ge)
+    try:
+        offsets._asym_cpu_wgrad_meta = meta
+    except Exception:
+        pass
+    return meta
+
+
+class _DsSlots:
+    """Two rotating pinned dS staging buffers per shape (double-buffer; waiting the
+    slot's previous worker task before reuse makes the fire-and-forget safe)."""
+
+    def __init__(self) -> None:
+        self.bufs: list = [None, None]
+        self.tasks: list = [None, None]
+        self.i = 0
+
+    def acquire(self, like: torch.Tensor):
+        self.i ^= 1
+        if self.tasks[self.i] is not None:
+            cpu_worker.wait(self.tasks[self.i])
+            self.tasks[self.i] = None
+        buf = self.bufs[self.i]
+        if buf is None or buf.shape != like.shape or buf.dtype != like.dtype:
+            from . import pinned_ledger
+
+            nbytes = like.numel() * like.element_size()
+            pin = pinned_ledger.try_reserve("deposit", nbytes)
+            buf = torch.empty(like.shape, dtype=like.dtype, device="cpu", pin_memory=pin)
+            if pin:
+                pinned_ledger.register_tensor(buf, "deposit")
+            self.bufs[self.i] = buf
+        return self.i, buf
+
+
+_DS_SLOTS: dict = {}
+_DEPOSIT_DIAG_PRINTED = False
+
+
+def _try_deposit_lora_a_grad(layer, d_s, source_cpu, lora_a, offsets, experts, ctx):
+    import asym_gemm as _ag
+    from . import cpu_adam as _cpu_adam
+
+    kernel = getattr(_ag, "cpu_grouped_lora_a_grad_bf16", None)
+    adam = _cpu_adam.get_active_adamw()
+    if kernel is None or adam is None or not cpu_worker.enabled():
+        return None
+    buf = adam.get_grad_deposit_buffer(lora_a)
+    if buf is None or buf.dtype != torch.float32 or tuple(buf.shape) != (
+        int(lora_a.shape[0]), int(d_s.shape[1]), int(source_cpu.shape[1])
+    ):
+        return None
+    pairs, ge = _cpu_group_meta(offsets, experts)
+    slots = _DS_SLOTS.setdefault((tuple(d_s.shape), d_s.dtype), _DsSlots())
+    slot_i, ds_pin = slots.acquire(d_s)
+    d_s_src = d_s if d_s.is_contiguous() else d_s.contiguous()
+    ds_pin.copy_(d_s_src, non_blocking=True)
+    ev = torch.cuda.Event()
+    ev.record(torch.cuda.current_stream())
+    nt = cpu_ops.wgrad_threads()
+
+    def _job(ev=ev, ds=ds_pin, x=source_cpu, out=buf, p=pairs, g=ge, n=nt, k=kernel):
+        ev.synchronize()  # host wait: dS D2H must be complete
+        k(ds, x, out, p, g, n)
+
+    task = cpu_worker.submit_deposit(_job, tag="deposit.dA.moe")
+    slots.tasks[slot_i] = task
+    global _DEPOSIT_DIAG_PRINTED
+    if not _DEPOSIT_DIAG_PRINTED:
+        _DEPOSIT_DIAG_PRINTED = True
+        import sys
+        print("[asym-cpu-wgrad] Stage-3 deposit path ENGAGED (CPU LoRA-A wgrad -> optimizer grad buffer)",
+              file=sys.stderr, flush=True)
+    if not adam.register_grad_deposit(lora_a, task):
+        cpu_worker.wait(task)  # defensive; single-threaded caller makes this unreachable
+        return None
+    if ctx is not None:
+        tasks = getattr(ctx, "_asym_deposit_tasks", None)
+        if tasks is None:
+            tasks = []
+            ctx._asym_deposit_tasks = tasks
+        tasks.append(task)
+    layer.stats.qwen3_moe_finegrained_lora_a_grad_calls += 1
+    # dummy CUDA grad keeps the autograd/hook contract; its content is never read
+    # (the hook's copies are skipped for deposited mappings)
+    return torch.empty(buf.shape, device=d_s.device, dtype=torch.bfloat16)
+
+
 def _lora_a_grad_cpu(
     layer: "AsymQwen3Experts",
     d_s: torch.Tensor,
@@ -639,7 +916,36 @@ def _lora_a_grad_cpu(
     experts: torch.Tensor,
     *,
     tag: str,
+    allow_deposit: bool = False,
+    ctx: Any = None,
 ) -> torch.Tensor:
+    _mode = os.environ.get(
+        "ASYMM_LORA_A_GRAD_CPU", os.environ.get("ASYM_GEMM_LF_CONFIG_ASYMM_LORA_A_GRAD_CPU", "0")
+    ).strip().lower()
+    if placement_policy.enabled():
+        _mode = "policy"  # K-2b arm-B (gpu_d2h) is an ablation arm; policy picks deposit
+    if allow_deposit and _mode == "gpu_d2h":
+        # K-2b arm B: GPU wgrad kernel + direct async D2H into the optimizer staging
+        from . import cpu_adam as _cpu_adam
+
+        grad_a = grouped_lora_a_grad_cpu_right(
+            d_s.contiguous(), source_cpu, offsets, experts,
+            num_experts=int(lora_a.shape[0]), stats=None, tag=tag,
+        )
+        layer.stats.qwen3_moe_finegrained_lora_a_grad_calls += 1
+        adam = _cpu_adam.get_active_adamw()
+        if adam is not None and adam.direct_gpu_grad_offload(lora_a, grad_a):
+            global _DEPOSIT_DIAG_PRINTED
+            if not _DEPOSIT_DIAG_PRINTED:
+                _DEPOSIT_DIAG_PRINTED = True
+                import sys
+                print("[asym-cpu-wgrad] K-2b arm-B (GPU wgrad + direct D2H) ENGAGED", file=sys.stderr, flush=True)
+            return torch.empty(grad_a.shape, device=d_s.device, dtype=torch.bfloat16)
+        return grad_a
+    if allow_deposit and _lora_a_grad_cpu_deposit_enabled():
+        deposited = _try_deposit_lora_a_grad(layer, d_s, source_cpu, lora_a, offsets, experts, ctx)
+        if deposited is not None:
+            return deposited
     grad_a = grouped_lora_a_grad_cpu_right(
         d_s.contiguous(),
         source_cpu,
@@ -651,6 +957,50 @@ def _lora_a_grad_cpu(
     )
     layer.stats.qwen3_moe_finegrained_lora_a_grad_calls += 1
     return grad_a
+
+
+def _try_deposit_lora_b_grad(layer, dgrad_cpu, s_cpu, lora_b, offsets, experts, ctx, manager):
+    """K-5: grouped dB deposit — dB[e] = dgrad_g^T @ S_g (both operands CPU-resident,
+    zero new transfers; same kernel as dA with swapped operands), scaled by lora_scale,
+    written fp32 into the optimizer buffer on the background worker."""
+    import asym_gemm as _ag
+    from . import cpu_adam as _cpu_adam
+
+    kernel = getattr(_ag, "cpu_grouped_lora_a_grad_bf16", None)
+    adam = _cpu_adam.get_active_adamw()
+    if kernel is None or adam is None or not cpu_worker.enabled():
+        return None
+    dg, sc = dgrad_cpu.tensor, s_cpu.tensor
+    if dg.dtype != torch.bfloat16 or sc.dtype != torch.bfloat16 or not sc.is_contiguous() or not dg.is_contiguous():
+        return None
+    buf = adam.get_grad_deposit_buffer(lora_b)
+    if buf is None or buf.dtype != torch.float32 or tuple(buf.shape) != (
+        int(lora_b.shape[0]), int(dg.shape[1]), int(sc.shape[1])
+    ):
+        return None
+    pairs, ge = _cpu_group_meta(offsets, experts)
+    nt = cpu_ops.wgrad_threads()
+    scale = float(layer.lora_scale)
+
+    def _job(dg=dg, sc=sc, out=buf, p=pairs, g=ge, n=nt, k=kernel, s=scale):
+        k(dg, sc, out, p, g, n)
+        if s != 1.0:
+            out.mul_(s)
+
+    task = cpu_worker.submit_deposit(_job, tag="deposit.dB.moe")
+    if not adam.register_grad_deposit(lora_b, task):
+        cpu_worker.wait(task)
+        return None
+    tasks = getattr(ctx, "_asym_deposit_tasks", None)
+    if tasks is None:
+        tasks = []
+        ctx._asym_deposit_tasks = tasks
+    tasks.append(task)
+    # defer the S handle release until the job is done (drain force-sweeps)
+    from .attention_activation_offload import _defer_deposit_release
+
+    _defer_deposit_release(task, manager, s_cpu, None)
+    return torch.empty(buf.shape, device="cuda", dtype=torch.bfloat16), task
 
 
 def _base_dx(
@@ -696,6 +1046,7 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
         input_weighted: bool,
         output_weighted: bool,
     ) -> torch.Tensor:
+        placement_policy.register_model_class("moe")
         weight_offload = getattr(layer, "_weight_offload", None) is not None
         if weight_offload:
             layer.gather_lora_weights()
@@ -795,6 +1146,17 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     (total_rows, int(down_lora_A.shape[1])), device=hidden_states.device, dtype=down_lora_A.dtype
                 )
                 blocked_nb = bool(gate_cpu.tensor.is_pinned())
+                _blk_fused = None
+                if (
+                    _fg_blocked_cpu_act_enabled()
+                    and blocked_nb
+                    and act_cpu.tensor.is_pinned()
+                    and up_cpu.tensor.is_pinned()
+                    and cpu_worker.enabled()
+                    and cpu_ops.fused_silu_applicable(gate_cpu.tensor, up_cpu.tensor, act_cpu.tensor)
+                    and _cpu_act_fits(int(gate_cpu.tensor.shape[0]), int(gate_cpu.tensor.numel()) * 2)
+                ):
+                    _blk_fused = cpu_ops.fused_silu_kernels()
                 for row_start, row_end, block_offsets, block_experts_t, row_slice in fwd_blocks:
                     block_metadata = prepare_grouped_lora_metadata(block_offsets, block_experts_t, dense_experts=True)
                     packed_block = hidden_states.index_select(
@@ -822,17 +1184,38 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     del packed_block, s_gate, s_up
                     F.silu(gate_blk, inplace=True)
                     gate_blk.mul_(up_blk)
-                    act_cpu.tensor[row_slice].copy_(gate_blk.to(dtype=torch.bfloat16), non_blocking=blocked_nb)
+                    if _blk_fused is None:
+                        act_cpu.tensor[row_slice].copy_(gate_blk.to(dtype=torch.bfloat16), non_blocking=blocked_nb)
+                    else:
+                        # per-block pipeline: CPU rebuilds this block's act from the
+                        # gate/up copies (enqueued above on this stream) while the
+                        # GPU proceeds to the next block; deadline = the same-forward
+                        # stage(act_cpu) for down_base (audit site :1588).
+                        _blk_ev = torch.cuda.Event()
+                        _blk_ev.record(torch.cuda.current_stream(hidden_states.device))
+                        _g_b = gate_cpu.tensor[row_slice]
+                        _u_b = up_cpu.tensor[row_slice]
+                        _a_b = act_cpu.tensor[row_slice]
+
+                        def _blk_act_job(ev=_blk_ev, g=_g_b, u=_u_b, o=_a_b, k=_blk_fused[0], n=_blk_fused[2]):
+                            ev.synchronize()  # host wait: this block's gate/up D2H done
+                            k(g, u, o, n)
+
+                        manager.attach_cpu_task(act_cpu, cpu_worker.submit(_blk_act_job, tag="moe.blocked_silu_fwd"))
                     s_down = _lora_a_forward_gpu(layer, gate_blk, down_lora_A, block_offsets, block_experts_t, block_metadata)
                     down_low_rank[row_slice].copy_(s_down)
                     del gate_blk, up_blk, s_down
                 manager.record_cpu_ready(gate_cpu)
                 manager.record_cpu_ready(up_cpu)
                 manager.record_cpu_ready(act_cpu)
+                if _blk_fused is not None:
+                    layer.stats.qwen3_moe_finegrained_blocked_cpu_act_calls += 1
                 gate_low_rank_cpu = manager.offload(gate_low_rank, "moe.S_gate")
                 up_low_rank_cpu = manager.offload(up_low_rank, "moe.S_up")
                 del gate_low_rank, up_low_rank
 
+        carried_act_stage = None  # K-9: one act stage reused by down_lora AND down_base
+        carried_act_gpu = None    # byte-diet mech 2: act kept on-GPU for down_base
         if not fwd_blocks:
             with prof_range(layer._forward_range("moe_finegrained", "gate")):
                 layer.stats.qwen3_moe_finegrained_gate_base_calls += 1
@@ -860,8 +1243,55 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     scale=layer.lora_scale,
                 )
                 gate_cpu = manager.offload(gate, "moe.gate")
+                # byte-diet mech 3 (gate-direct): provisional keep; committed after
+                # the act-path decision. Cold under keep-acts (manager already keeps).
+                _dr_gate_cand = gate if (_fg_direct_reuse_enabled() and not keep_acts_hbm) else None
                 gate_low_rank_cpu = manager.offload(gate_low_rank, "moe.S_gate")
                 del gate, gate_low_rank
+
+            # Stage-2 async CPU act: start silu(gate) on the worker NOW so it overlaps
+            # the whole GPU up-block below; `*= up` is chained after the up D2H.
+            act_task = None
+            act_cpu_async = None
+            split_silu = None
+            if (
+                not keep_acts_hbm
+                and _fg_cpu_act_enabled()
+                and _fg_cpu_act_async_enabled()
+                and cpu_worker.enabled()
+                and cpu_ops.fused_silu_applicable(gate_cpu.tensor)
+                and _cpu_act_fits(
+                    int(gate_cpu.tensor.shape[0]), int(gate_cpu.tensor.numel()) * 2
+                )
+            ):
+                split_silu = cpu_ops.split_silu_kernels()
+            if split_silu is not None:
+                _silu_k, _mul_k, _cpu_nt = split_silu
+                act_cpu_async = manager.empty_cpu(
+                    tuple(gate_cpu.tensor.shape), gate_cpu.tensor.dtype, gate_cpu.original_device, "moe.act"
+                )
+                _ev_g = manager.take_cpu_ready_event(gate_cpu)
+                _g_t, _a_t = gate_cpu.tensor, act_cpu_async.tensor
+
+                def _silu_job(ev=_ev_g, g=_g_t, o=_a_t, k=_silu_k, n=_cpu_nt):
+                    if ev is not None:
+                        ev.synchronize()  # host wait: D2H of gate must be complete
+                    k(g, o, n)
+
+                act_task = cpu_worker.submit(_silu_job, tag="moe.silu_fwd")
+
+            # mech 3 commit point: keep gate only if the GPU-act path will consume it
+            # (out-of-place silu writes a fresh tensor, so demand 2x for the window).
+            _dr_gate = (
+                _dr_gate_cand
+                if (
+                    _dr_gate_cand is not None
+                    and act_task is None
+                    and _direct_reuse_ok("gate_direct", 2 * gate_cpu.nbytes)
+                )
+                else None
+            )
+            _dr_gate_cand = None
 
             with prof_range(layer._forward_range("moe_finegrained", "up")):
                 layer.stats.qwen3_moe_finegrained_up_base_calls += 1
@@ -890,9 +1320,58 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                 )
                 up_cpu = manager.offload(up, "moe.up")
                 up_low_rank_cpu = manager.offload(up_low_rank, "moe.S_up")
+                _dr_up = (
+                    up
+                    if (act_task is None and not keep_acts_hbm
+                        and _direct_reuse_ok("up_direct", up_cpu.nbytes))
+                    else None
+                )
                 del up, up_low_rank
+
             del packed
 
+            act_stage_prefilled = None
+            act_stage_done_ev = None
+            if act_task is not None:
+                # chain `act *= up` behind the silu pass (worker FIFO orders them)
+                _ev_u = manager.take_cpu_ready_event(up_cpu)
+                _u_t, _a_t2 = up_cpu.tensor, act_cpu_async.tensor
+                if _fg_cpu_act_chunked_enabled() and lora_a_fwd_gpu:
+                    # K-4: the worker fills the down_base stage buffer chunk-by-chunk on the
+                    # restage side stream while computing the mul — the [R,I] H2D never
+                    # appears as a separate serialized copy, and K-9 reuses this buffer for
+                    # BOTH down_lora and down_base (single stage per layer).
+                    from .attention_activation_offload import _h2d_restage_stream
+
+                    act_stage_prefilled = manager.stage_buffer(act_cpu_async, tag="moe.act_for_down_base")
+                    _side = _h2d_restage_stream(gate_cpu.original_device)
+                    act_stage_done_ev = torch.cuda.Event()
+
+                    def _mul_stage_job(
+                        ev=_ev_u, u=_u_t, o=_a_t2, k=_mul_k, n=_cpu_nt,
+                        stage_buf=act_stage_prefilled, side=_side, done_ev=act_stage_done_ev,
+                    ):
+                        if ev is not None:
+                            ev.synchronize()
+                        rows = int(o.shape[0])
+                        step = max(65536, -(-rows // 4))  # ~4 chunks, floor 64Ki rows
+                        with torch.cuda.stream(side):
+                            for c0 in range(0, rows, step):
+                                c1 = min(rows, c0 + step)
+                                k(o[c0:c1], u[c0:c1], n)
+                                stage_buf[c0:c1].copy_(o[c0:c1], non_blocking=True)
+                            done_ev.record(side)
+
+                    act_task = cpu_worker.submit(_mul_stage_job, tag="moe.mul_stage")
+                else:
+                    def _mul_job(ev=_ev_u, u=_u_t, o=_a_t2, k=_mul_k, n=_cpu_nt):
+                        if ev is not None:
+                            ev.synchronize()
+                        k(o, u, n)
+
+                    act_task = cpu_worker.submit(_mul_job, tag="moe.mul")
+
+            fused_silu = cpu_ops.fused_silu_kernels() if (_fg_cpu_act_enabled() and not keep_acts_hbm) else None
             with prof_range(layer._forward_range("moe_finegrained", "activation")):
                 act_rows = int(gate_cpu.tensor.shape[0])
                 act_width = int(gate_cpu.tensor.shape[1])
@@ -901,7 +1380,49 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     if (not lora_a_fwd_gpu and hasattr(manager, "stage_rows"))
                     else 0
                 )
-                if act_chunk > 0:
+                if act_task is not None:
+                    # Stage-2 async path: the worker computed act while the GPU ran the
+                    # up block; only the residual tail (if any) blocks here.
+                    cpu_worker.wait(act_task)
+                    act_cpu = act_cpu_async
+                    if act_stage_prefilled is not None:
+                        # K-4: worker already filled the stage buffer chunk-by-chunk
+                        torch.cuda.current_stream().wait_event(act_stage_done_ev)
+                        carried_act_stage = act_stage_prefilled
+                        down_low_rank = _lora_a_forward_gpu(layer, carried_act_stage, down_lora_A, offsets, experts, metadata)
+                    elif lora_a_fwd_gpu:
+                        _st = manager.stage(act_cpu, tag="moe.act_for_down_base")
+                        down_low_rank = _lora_a_forward_gpu(layer, _st, down_lora_A, offsets, experts, metadata)
+                        if _fg_stage_dedup_enabled():
+                            carried_act_stage = _st
+                        else:
+                            manager.release_stage(_st)
+                        del _st
+                elif (
+                    fused_silu is not None
+                    and cpu_ops.fused_silu_applicable(gate_cpu.tensor, up_cpu.tensor)
+                    and _cpu_act_fits(
+                        int(gate_cpu.tensor.shape[0]), int(gate_cpu.tensor.numel()) * 2
+                    )
+                ):
+                    # CPU fused SwiGLU on the already-resident pinned gate/up
+                    # (skips gate+up H2D stages and the act D2H entirely).
+                    fused_fwd, _, cpu_act_threads = fused_silu
+                    manager.host_wait_cpu_ready(gate_cpu)
+                    manager.host_wait_cpu_ready(up_cpu)
+                    act_cpu = manager.empty_cpu(
+                        tuple(gate_cpu.tensor.shape), gate_cpu.tensor.dtype, gate_cpu.original_device, "moe.act"
+                    )
+                    fused_fwd(gate_cpu.tensor, up_cpu.tensor, act_cpu.tensor, cpu_act_threads)
+                    if lora_a_fwd_gpu:
+                        _st = manager.stage(act_cpu, tag="moe.act_for_down_base")
+                        down_low_rank = _lora_a_forward_gpu(layer, _st, down_lora_A, offsets, experts, metadata)
+                        if _fg_stage_dedup_enabled():
+                            carried_act_stage = _st
+                        else:
+                            manager.release_stage(_st)
+                        del _st
+                elif act_chunk > 0:
                     # Row-chunked silu·mul: never stage full-width gate AND up together,
                     # and skip the full-width act_gpu contiguous copy (chunks are written
                     # straight to the pinned act rows).
@@ -923,18 +1444,42 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     manager.record_cpu_ready(act_cpu)
                     _release_chunk_stages(manager, chunk_stages)
                 else:
-                    gate_stage = manager.stage(gate_cpu, tag="moe.gate_for_act")
-                    F.silu(gate_stage, inplace=True)
-                    up_stage = manager.stage(up_cpu, tag="moe.up_for_act")
+                    if _dr_gate is not None:
+                        # mech 3: out-of-place silu — the kept gate is the source of an
+                        # in-flight side-stream D2H, so it must never be written to.
+                        gate_stage = F.silu(_dr_gate)
+                        _dr_gate = None
+                        _gate_was_stage = False
+                    else:
+                        gate_stage = manager.stage(gate_cpu, tag="moe.gate_for_act")
+                        F.silu(gate_stage, inplace=True)
+                        _gate_was_stage = True
+                    if _dr_up is not None:
+                        up_stage = _dr_up
+                        _dr_up = None
+                        _up_was_stage = False
+                    else:
+                        up_stage = manager.stage(up_cpu, tag="moe.up_for_act")
+                        _up_was_stage = True
                     gate_stage.mul_(up_stage)
                     act_gpu = gate_stage.to(dtype=torch.bfloat16).contiguous()
                     act_cpu = manager.offload(act_gpu, "moe.act")
                     if lora_a_fwd_gpu:
                         down_low_rank = _lora_a_forward_gpu(layer, act_gpu, down_lora_A, offsets, experts, metadata)
+                    # byte-diet mech 2 (act-direct): keep act_gpu for the down_base GEMM
+                    # (the act D2H above STAYS — backward's dA deposit host-reads it).
+                    if down_scatter_block_experts == 0 and _direct_reuse_ok(
+                        "act_direct", act_cpu.nbytes
+                    ):
+                        carried_act_gpu = act_gpu
                     del act_gpu
-                    manager.release_stage(gate_stage, drop_cache=True)
-                    manager.release_stage(up_stage, drop_cache=True)
+                    if _gate_was_stage:
+                        manager.release_stage(gate_stage, drop_cache=True)
+                    if _up_was_stage:
+                        manager.release_stage(up_stage, drop_cache=True)
                     del gate_stage, up_stage
+
+            _dr_gate = _dr_gate_cand = _dr_up = None  # drop unused byte-diet keeps
 
         with prof_range(layer._forward_range("moe_finegrained", "down_lora")):
             if down_low_rank is None:
@@ -1019,6 +1564,9 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
 
         with prof_range(layer._forward_range("moe_finegrained", "down_base")):
             if down_scatter_block_experts > 0:
+                if carried_act_stage is not None:
+                    manager.release_stage(carried_act_stage, drop_cache=True)
+                    carried_act_stage = None
                 layer.stats.qwen3_moe_finegrained_hidden_route_global_tensors_avoided += 1
                 for row_start, row_end, block_offsets, block_experts, row_slice in down_scatter_blocks:
                     act_stage = _stage_rows(manager, layer, act_cpu, row_start, row_end, tag="moe.act_for_down_base_block")
@@ -1034,7 +1582,12 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     manager.release_stage(act_stage, drop_cache=True)
                     del act_stage, output
             else:
-                act_stage = manager.stage(act_cpu, tag="moe.act_for_down_base")
+                if carried_act_gpu is not None:
+                    act_stage = carried_act_gpu  # byte-diet mech 2: no restage at all
+                elif carried_act_stage is not None:
+                    act_stage = carried_act_stage  # K-9: reuse, skip the second H2D copy
+                else:
+                    act_stage = manager.stage(act_cpu, tag="moe.act_for_down_base")
                 layer.stats.qwen3_moe_finegrained_down_base_calls += 1
                 if route_flags.fwd_scatter:
                     base_scattered_fp32 = torch.zeros(
@@ -1057,7 +1610,10 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     output = None
                 else:
                     output = _base_forward(layer, layer.down_base, act_stage, offsets, experts, part="down")
-                manager.release_stage(act_stage, drop_cache=True)
+                if carried_act_gpu is not None:
+                    carried_act_gpu = None  # plain GPU tensor, not a managed stage
+                else:
+                    manager.release_stage(act_stage, drop_cache=True)
                 del act_stage
 
         if weight_offload:
@@ -1155,6 +1711,28 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
         grad_down_lora_A = grad_down_lora_B = None
         x_compact = bool(getattr(ctx, "x_compact", False))
         keep_dgrads_hbm = _fg_keep_dgrads_hbm_enabled() and down_scatter_block_experts == 0
+
+        # R5 restage prefetch (fix_cpu_compute.md): early-issue the gate/up H2D
+        # restages on the DEDICATED prefetch stream at backward entry so they run
+        # under the multi-GEMM down blocks instead of stalling the silu-bwd block
+        # (measured 3x ~0.71 s/step exposed @32k, ~21.6 @128k). Per-tensor events;
+        # consumers commit at use. G-guarded (holds the two stage buffers through
+        # the down blocks): live @32k, auto-off @128k (G~180/186).
+        _pref_gate = _pref_up = None
+        if down_scatter_block_experts == 0 and _act_offload.restage_prefetch_enabled() and hasattr(manager, "stage_begin"):
+            _will_cpu_silu = False
+            if _fg_cpu_silu_bwd_enabled():
+                _fp = cpu_ops.fused_silu_kernels()
+                _will_cpu_silu = (
+                    _fp is not None
+                    and cpu_worker.enabled()
+                    and cpu_ops.fused_silu_applicable(ctx.gate_cpu.tensor, ctx.up_cpu.tensor)
+                )
+            _extra = 2 * int(ctx.gate_cpu.nbytes)
+            if not _will_cpu_silu and _act_offload.prefetch_free_ok(_extra):
+                _act_offload.prefetch_engaged_once("moe.silu_bwd")
+                _pref_gate = manager.stage_begin(ctx.gate_cpu, tag="moe.gate_for_silu_bwd")
+                _pref_up = manager.stage_begin(ctx.up_cpu, tag="moe.up_for_silu_bwd_dgate")
 
         try:
             if down_scatter_block_experts > 0:
@@ -1376,6 +1954,8 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                             offsets,
                             experts,
                             tag="moe.down",
+                            allow_deposit=True,
+                            ctx=ctx,
                         )
                         del d_s_down_full
                         manager.release_cpu(ctx.down_low_rank_cpu)
@@ -1439,6 +2019,8 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                                 offsets,
                                 experts,
                                 tag="moe.down",
+                                allow_deposit=True,
+                                ctx=ctx,
                             )
 
                     with prof_range(layer._forward_range("moe_finegrained_backward", "down_base_dx")):
@@ -1470,7 +2052,119 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
             silu_bwd_rows = int(grad_act.shape[0])
             silu_bwd_width = int(grad_act.shape[1])
             silu_bwd_chunk = fg_chunk_rows(silu_bwd_rows, silu_bwd_width) if hasattr(manager, "stage_rows") else 0
-            if silu_bwd_chunk > 0:
+            cpu_silu_bwd_task = None
+            _fused_pair = (
+                cpu_ops.fused_silu_kernels()
+                if (_fg_cpu_silu_bwd_enabled() and not getattr(ctx, "keep_acts_hbm", False))
+                else None
+            )
+            if (
+                _fused_pair is not None
+                and cpu_worker.enabled()
+                and down_scatter_block_experts == 0
+                and ctx.gate_cpu.tensor.device.type == "cpu"
+                and cpu_ops.fused_silu_applicable(ctx.gate_cpu.tensor, ctx.up_cpu.tensor)
+            ):
+                with prof_range(layer._forward_range("moe_finegrained_backward", "activation")):
+                    _, _fused_bwd_k, _nt5 = _fused_pair
+                    dact_cpu = manager.offload(grad_act.to(dtype=torch.bfloat16).contiguous(), "moe.dact")
+                    del grad_act
+                    grad_gate_cpu = manager.empty_cpu(
+                        tuple(ctx.gate_cpu.tensor.shape), torch.bfloat16, ctx.gate_cpu.original_device, "moe.dgate"
+                    )
+                    grad_up_cpu = manager.empty_cpu(
+                        tuple(ctx.up_cpu.tensor.shape), torch.bfloat16, ctx.up_cpu.original_device, "moe.dup"
+                    )
+                    _ev_d = manager.take_cpu_ready_event(dact_cpu)
+                    _g5, _u5, _d5 = ctx.gate_cpu.tensor, ctx.up_cpu.tensor, dact_cpu.tensor
+                    _dg5, _du5 = grad_gate_cpu.tensor, grad_up_cpu.tensor
+
+                    def _silu_bwd_job(ev=_ev_d, g=_g5, u=_u5, d=_d5, dg=_dg5, du=_du5, k=_fused_bwd_k, n=_nt5):
+                        if ev is not None:
+                            ev.synchronize()
+                        k(g, u, d, dg, du, n)
+
+                    cpu_silu_bwd_task = cpu_worker.submit(_silu_bwd_job, tag="moe.silu_bwd")
+                    keep_dgrads_hbm = False
+                    # K-5 dB deposits: same kernel, swapped operands, both CPU-resident.
+                    if _fg_lora_b_grad_cpu_deposit_enabled():
+                        ctx._asym_db_plan = (cpu_silu_bwd_task, grad_gate_cpu, grad_up_cpu)
+                    # dact handle: released in the cleanup path after task waits
+                    ctx._asym_dact_cpu = dact_cpu
+            elif _pref_gate is not None:
+              with prof_range(layer._forward_range("moe_finegrained_backward", "activation")):
+                # R5 prefetch path: commit the early-issued stages (per-tensor events)
+                # and reuse ONE gate stage for both dup and dgate (out-of-place silu
+                # keeps gate intact) — same kernels, same operand orders as the legacy
+                # sequence, bitwise-identical dgrads (unit-gated); eliminates the
+                # third H2D restage entirely.
+                layer.stats.qwen3_moe_finegrained_gpu_silu_bwd_calls += 1
+                gate_stage = manager.stage_commit(
+                    *_pref_gate, nbytes=ctx.gate_cpu.nbytes, tag="moe.gate_for_silu_bwd"
+                )
+                silu_gate = F.silu(gate_stage)
+                silu_gate.mul_(grad_act)
+                if keep_dgrads_hbm:
+                    grad_up_hbm = silu_gate.to(dtype=torch.bfloat16).contiguous()
+                    layer.stats.qwen3_moe_finegrained_dgrads_hbm_kept += 1
+                else:
+                    grad_up_cpu = manager.offload(silu_gate.to(dtype=torch.bfloat16).contiguous(), "moe.dup")
+                del silu_gate
+
+                up_stage = manager.stage_commit(
+                    *_pref_up, nbytes=ctx.up_cpu.nbytes, tag="moe.up_for_silu_bwd_dgate"
+                )
+                grad_act.mul_(up_stage)
+                manager.release_stage(up_stage, drop_cache=True)
+                manager.release_cpu(ctx.up_cpu)
+                del up_stage
+                _pref_up = None
+
+                grad_gate = torch.ops.aten.silu_backward(grad_act, gate_stage)
+                del grad_act
+                if keep_dgrads_hbm:
+                    grad_gate_hbm = grad_gate.to(dtype=torch.bfloat16).contiguous()
+                    layer.stats.qwen3_moe_finegrained_dgrads_hbm_kept += 1
+                else:
+                    grad_gate_cpu = manager.offload(grad_gate.to(dtype=torch.bfloat16).contiguous(), "moe.dgate")
+                manager.release_stage(gate_stage, drop_cache=True)
+                manager.release_cpu(ctx.gate_cpu)
+                del gate_stage, grad_gate
+                _pref_gate = None
+            elif _direct_reuse_ok("silu_bwd_single_stage", ctx.gate_cpu.nbytes):
+              with prof_range(layer._forward_range("moe_finegrained_backward", "activation")):
+                # byte-diet mech 4 (128k-sized): ONE gate stage held across the up
+                # window (demand 1x, unlike P13's 2x early-issue guard); out-of-place
+                # silu keeps it intact for silu_backward — same kernels + operand
+                # orders as the legacy sequence, bitwise-identical dgrads.
+                layer.stats.qwen3_moe_finegrained_gpu_silu_bwd_calls += 1
+                gate_stage = manager.stage(ctx.gate_cpu, tag="moe.gate_for_silu_bwd")
+                silu_gate = F.silu(gate_stage)
+                silu_gate.mul_(grad_act)
+                if keep_dgrads_hbm:
+                    grad_up_hbm = silu_gate.to(dtype=torch.bfloat16).contiguous()
+                    layer.stats.qwen3_moe_finegrained_dgrads_hbm_kept += 1
+                else:
+                    grad_up_cpu = manager.offload(silu_gate.to(dtype=torch.bfloat16).contiguous(), "moe.dup")
+                del silu_gate
+
+                up_stage = manager.stage(ctx.up_cpu, tag="moe.up_for_silu_bwd_dgate")
+                grad_act.mul_(up_stage)
+                manager.release_stage(up_stage, drop_cache=True)
+                manager.release_cpu(ctx.up_cpu)
+                del up_stage
+
+                grad_gate = torch.ops.aten.silu_backward(grad_act, gate_stage)
+                del grad_act
+                if keep_dgrads_hbm:
+                    grad_gate_hbm = grad_gate.to(dtype=torch.bfloat16).contiguous()
+                    layer.stats.qwen3_moe_finegrained_dgrads_hbm_kept += 1
+                else:
+                    grad_gate_cpu = manager.offload(grad_gate.to(dtype=torch.bfloat16).contiguous(), "moe.dgate")
+                manager.release_stage(gate_stage, drop_cache=True)
+                manager.release_cpu(ctx.gate_cpu)
+                del gate_stage, grad_gate
+            elif silu_bwd_chunk > 0:
                 with prof_range(layer._forward_range("moe_finegrained_backward", "activation")):
                     layer.stats.qwen3_moe_finegrained_gpu_silu_bwd_calls += 1
                     # Row-chunked silu backward: grad_act stays full-width (down-dx
@@ -1550,6 +2244,13 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                     manager.release_stage(gate_stage, drop_cache=True)
                     manager.release_cpu(ctx.gate_cpu)
                     del gate_stage, grad_gate
+
+            if cpu_silu_bwd_task is not None:
+                cpu_worker.wait(cpu_silu_bwd_task)
+                _d = getattr(ctx, "_asym_dact_cpu", None)
+                if _d is not None:
+                    manager.release_cpu(_d)
+                    ctx._asym_dact_cpu = None
 
             if down_scatter_block_experts > 0:
                 manager.wait_cpu_ready_host(ctx.x_cpu)
@@ -1749,7 +2450,6 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                         grad_gate_stage = grad_gate_hbm
                     else:
                         grad_gate_stage = manager.stage(grad_gate_cpu, tag="moe.dgate")
-                    gate_low_rank = manager.stage(ctx.gate_low_rank_cpu, tag="moe.S_gate_for_dB")
                     d_s_gate = _lora_ds(
                         grad_gate_stage,
                         gate_lora_B,
@@ -1758,17 +2458,26 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                         metadata,
                         scale=layer.lora_scale,
                     )
-                    grad_gate_lora_B = _lora_b_grad(
-                        layer,
-                        grad_gate_stage,
-                        gate_low_rank,
-                        gate_lora_B,
-                        offsets,
-                        experts,
-                        metadata,
-                    )
-                    manager.release_stage(gate_low_rank, drop_cache=True)
-                    manager.release_cpu(ctx.gate_low_rank_cpu)
+                    _db_gate = None
+                    if getattr(ctx, "_asym_db_plan", None) is not None and not keep_dgrads_hbm:
+                        _db_gate = _try_deposit_lora_b_grad(
+                            layer, grad_gate_cpu, ctx.gate_low_rank_cpu, gate_lora_B, offsets, experts, ctx, manager
+                        )
+                    if _db_gate is not None:
+                        grad_gate_lora_B, _db_gate_task = _db_gate
+                    else:
+                        gate_low_rank = manager.stage(ctx.gate_low_rank_cpu, tag="moe.S_gate_for_dB")
+                        grad_gate_lora_B = _lora_b_grad(
+                            layer,
+                            grad_gate_stage,
+                            gate_low_rank,
+                            gate_lora_B,
+                            offsets,
+                            experts,
+                            metadata,
+                        )
+                        manager.release_stage(gate_low_rank, drop_cache=True)
+                        manager.release_cpu(ctx.gate_low_rank_cpu)
                     if x_compact:
                         x_stage = manager.stage(ctx.x_cpu, tag="moe.X_for_dA")
                         grad_gate_lora_A = _grouped_da_gpu(
@@ -1836,7 +2545,11 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                         grad_gate_stage = None
                     else:
                         manager.release_stage(grad_gate_stage, drop_cache=True)
-                        manager.release_cpu(grad_gate_cpu)
+                        if _db_gate is not None:
+                            from .attention_activation_offload import _defer_deposit_release
+                            _defer_deposit_release(_db_gate_task, manager, grad_gate_cpu, None)
+                        else:
+                            manager.release_cpu(grad_gate_cpu)
                         grad_gate_cpu = None
 
                 with prof_range(layer._forward_range("moe_finegrained_backward", "up")):
@@ -1844,7 +2557,6 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                         grad_up_stage = grad_up_hbm
                     else:
                         grad_up_stage = manager.stage(grad_up_cpu, tag="moe.dup")
-                    up_low_rank = manager.stage(ctx.up_low_rank_cpu, tag="moe.S_up_for_dB")
                     d_s_up = _lora_ds(
                         grad_up_stage,
                         up_lora_B,
@@ -1853,17 +2565,26 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                         metadata,
                         scale=layer.lora_scale,
                     )
-                    grad_up_lora_B = _lora_b_grad(
-                        layer,
-                        grad_up_stage,
-                        up_low_rank,
-                        up_lora_B,
-                        offsets,
-                        experts,
-                        metadata,
-                    )
-                    manager.release_stage(up_low_rank, drop_cache=True)
-                    manager.release_cpu(ctx.up_low_rank_cpu)
+                    _db_up = None
+                    if getattr(ctx, "_asym_db_plan", None) is not None and not keep_dgrads_hbm:
+                        _db_up = _try_deposit_lora_b_grad(
+                            layer, grad_up_cpu, ctx.up_low_rank_cpu, up_lora_B, offsets, experts, ctx, manager
+                        )
+                    if _db_up is not None:
+                        grad_up_lora_B, _db_up_task = _db_up
+                    else:
+                        up_low_rank = manager.stage(ctx.up_low_rank_cpu, tag="moe.S_up_for_dB")
+                        grad_up_lora_B = _lora_b_grad(
+                            layer,
+                            grad_up_stage,
+                            up_low_rank,
+                            up_lora_B,
+                            offsets,
+                            experts,
+                            metadata,
+                        )
+                        manager.release_stage(up_low_rank, drop_cache=True)
+                        manager.release_cpu(ctx.up_low_rank_cpu)
                     if x_compact:
                         grad_up_lora_A = _grouped_da_gpu(
                             layer,
@@ -1940,7 +2661,11 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
                         grad_up_stage = None
                     else:
                         manager.release_stage(grad_up_stage, drop_cache=True)
-                        manager.release_cpu(grad_up_cpu)
+                        if _db_up is not None:
+                            from .attention_activation_offload import _defer_deposit_release
+                            _defer_deposit_release(_db_up_task, manager, grad_up_cpu, None)
+                        else:
+                            manager.release_cpu(grad_up_cpu)
                         grad_up_cpu = None
 
                 if route_flags.gateup_dx_scatter and ctx.needs_input_grad[0]:
@@ -1973,6 +2698,10 @@ class _Qwen3MoeFinegrainedFunction(torch.autograd.Function):
             elif grad_hidden is None:
                 grad_hidden = None
         finally:
+            # Stage-3 deposit: the worker may still be reading act_cpu / dS — wait
+            # before the handles go back to the (non-thread-safe) pinned pool.
+            for _task in getattr(ctx, "_asym_deposit_tasks", ()):
+                cpu_worker.wait(_task)
             if x_stage is not None:
                 manager.release_stage(x_stage, drop_cache=True)
             for handle in (

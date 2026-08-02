@@ -20,6 +20,7 @@ from asym_gemm.training.attention_activation_offload import (
     attention_saved_tensor_offload_module_names,
     install_attention_saved_tensor_offload,
 )
+from asym_gemm.training.qchunked_attention import install_qchunked_attention
 from asym_gemm.training.sdpa_recompute import install_sdpa_recompute
 from asym_gemm.training.attention_checkpoint import (
     attention_checkpoint_module_names,
@@ -81,6 +82,36 @@ from asym_gemm.training.qwen35_moe import (
 from asym_gemm.training.qwen35_shared_mlp import AsymQwen35SharedMLP, is_qwen35_shared_mlp_leaf
 from asym_gemm.training.llama4_moe import AsymLlama4Moe, AsymLlama4Router, is_llama4_moe, wrap_llama4_moe
 from asym_gemm.training.llama4_shared_mlp import AsymLlama4SharedMLP, is_llama4_shared_mlp_leaf
+from asym_gemm.training.mixtral_moe import (
+    AsymMixtralMoeBlock,
+    is_mixtral_moe_block,
+    wrap_mixtral_moe_block,
+)
+from asym_gemm.training.phimoe_moe import (
+    AsymPhimoeMoeBlock,
+    is_phimoe_moe_block,
+    wrap_phimoe_moe_block,
+)
+from asym_gemm.training.hunyuan_moe import (
+    AsymHunyuanMoeBlock,
+    is_hunyuan_moe_block,
+    wrap_hunyuan_moe_block,
+)
+from asym_gemm.training.glm45_moe import (
+    AsymGlm45MoeBlock,
+    is_glm45_moe_block,
+    wrap_glm45_moe_block,
+)
+from asym_gemm.training.glm47_moe import (
+    AsymGlm47MoeBlock,
+    is_glm47_moe_block,
+    wrap_glm47_moe_block,
+)
+from asym_gemm.training.gptoss_moe import (
+    AsymGptOssMoeBlock,
+    is_gptoss_moe_block,
+    wrap_gptoss_moe_block,
+)
 
 
 ASYM_LF_ADAPTER_FORMAT = "asym_gemm_lf_v1"
@@ -141,6 +172,11 @@ def _release_replaced_module_memory() -> None:
     except Exception:
         return
 _ATTENTION_TARGETS = frozenset({"q_proj", "k_proj", "v_proj", "o_proj"})
+# GLM-4.7-Flash (glm4_moe_lite) uses DeepSeek-style MLA attention: low-rank
+# q/kv compressions instead of the standard triple. Kept separate from
+# _ATTENTION_TARGETS because module recognizers require ALL members of a set
+# as children (an MLA module has none of q/k/v/o except o_proj).
+_MLA_ATTENTION_TARGETS = frozenset({"q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"})
 _LINEAR_ATTENTION_LEAVES = frozenset({"in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"})
 _VISION_PATH_MARKERS = (
     ".visual.",
@@ -260,6 +296,12 @@ class LFAsymReport:
     qwen3_moes_wrapped: int = 0
     qwen35_moes_wrapped: int = 0
     llama4_moes_wrapped: int = 0
+    mixtral_moes_wrapped: int = 0
+    phimoe_moes_wrapped: int = 0
+    hunyuan_moes_wrapped: int = 0
+    glm45_moes_wrapped: int = 0
+    glm47_moes_wrapped: int = 0
+    gptoss_moes_wrapped: int = 0
     dense_lora_wrapped: int = 0
     dense_mlp_act_offload_enabled: bool = False
     dense_mlp_act_offload_wrapped: int = 0
@@ -362,6 +404,12 @@ class LFAsymReport:
             f"router_no_grad={self.router_no_grad}, "
             f"qwen3_moes_wrapped={self.qwen3_moes_wrapped}, "
             f"qwen35_moes_wrapped={self.qwen35_moes_wrapped}, "
+            f"mixtral_moes_wrapped={self.mixtral_moes_wrapped}, "
+            f"phimoe_moes_wrapped={self.phimoe_moes_wrapped}, "
+            f"hunyuan_moes_wrapped={self.hunyuan_moes_wrapped}, "
+            f"glm45_moes_wrapped={self.glm45_moes_wrapped}, "
+            f"glm47_moes_wrapped={self.glm47_moes_wrapped}, "
+            f"gptoss_moes_wrapped={self.gptoss_moes_wrapped}, "
             f"skipped={skipped}"
         )
 
@@ -476,7 +524,7 @@ def parse_lf_offload_modules(selector: Sequence[str] | str | None) -> LFOffloadS
         "whole_model": "all",
         "model": "all",
     }
-    known = _ALL_LF_OFFLOAD_COMPONENTS | {"all", "none"} | _ATTENTION_TARGETS | set(aliases)
+    known = _ALL_LF_OFFLOAD_COMPONENTS | {"all", "none"} | _ATTENTION_TARGETS | _MLA_ATTENTION_TARGETS | set(aliases)
     expanded: set[str] = set()
     attention_targets: set[str] = set()
     for token in tokens:
@@ -492,8 +540,9 @@ def parse_lf_offload_modules(selector: Sequence[str] | str | None) -> LFOffloadS
         if token == "attention":
             expanded.add("attention")
             attention_targets.update(_ATTENTION_TARGETS)
+            attention_targets.update(_MLA_ATTENTION_TARGETS)
             continue
-        if token in _ATTENTION_TARGETS:
+        if token in _ATTENTION_TARGETS or token in _MLA_ATTENTION_TARGETS:
             expanded.add("attention")
             attention_targets.add(token)
             continue
@@ -509,6 +558,7 @@ def parse_lf_offload_modules(selector: Sequence[str] | str | None) -> LFOffloadS
 
     if "attention" in expanded and not attention_targets:
         attention_targets.update(_ATTENTION_TARGETS)
+        attention_targets.update(_MLA_ATTENTION_TARGETS)
     if "attention" not in expanded:
         attention_targets.clear()
     return LFOffloadSelection(
@@ -544,7 +594,7 @@ def classify_lf_component(name: str, module: nn.Module | None = None) -> str:
             parent_leaf = leaf
         if parent_leaf in _LINEAR_ATTENTION_LEAVES or ".linear_attn." in lower or lower.endswith(".linear_attn"):
             return "linear_attention"
-    if ".mlp.shared_expert" in lower or ".shared_expert." in lower or ".shared_experts." in lower:
+    if ".mlp.shared_expert" in lower or ".shared_expert." in lower or ".shared_experts." in lower or ".shared_mlp." in lower or lower.endswith(".shared_mlp"):
         return "shared_experts"
     if lower == "shared_expert_gate" or lower.endswith(".shared_expert_gate") or ".shared_expert_gate." in lower:
         return "shared_experts"
@@ -563,7 +613,7 @@ def classify_lf_component(name: str, module: nn.Module | None = None) -> str:
         parent_leaf = lower.rsplit(".", 1)[0].rsplit(".", 1)[-1]
     else:
         parent_leaf = leaf
-    attention_leaves = {"q_proj", "k_proj", "v_proj", "o_proj"}
+    attention_leaves = {"q_proj", "k_proj", "v_proj", "o_proj"} | set(_MLA_ATTENTION_TARGETS)
     if parent_leaf in attention_leaves or any(
         lower == target or lower.endswith(f".{target}") or f".{target}." in lower for target in attention_leaves
     ):
@@ -646,8 +696,17 @@ def audit_lf_frozen_cuda_residue(
     offload_modules: Sequence[str] | str | None,
     strict: bool = True,
     max_allowed_unselected_cuda_bytes: int = 8 * 1024 * 1024,
-    allowed_components: set[str] | frozenset[str] = frozenset({"linear_attention"}),
+    allowed_components: set[str] | frozenset[str] = frozenset({"linear_attention", "router"}),
 ) -> dict[str, int]:
+    # "router" is always allowed: whole-mode families (model_integration.md) keep
+    # the HF router intact on GPU by design (mirrors the mover's router_whole_gpu
+    # placement). Tied-weight models additionally keep embed/lm_head on GPU: the
+    # offload stage rejects tied weights by construction, so their residue is the
+    # designed outcome, not a miss.
+    allowed_components = set(allowed_components)
+    _cfg = getattr(model, "config", None)
+    if bool(getattr(_cfg, "tie_word_embeddings", False)):
+        allowed_components |= {"embed_tokens", "lm_head"}
     selection = parse_lf_offload_modules(offload_modules)
     rows = collect_lf_offload_residency(model, selection, classify_component=classify_lf_component)
     residue: dict[str, int] = defaultdict(int)
@@ -1027,6 +1086,14 @@ def move_lf_asym_cpu_first_model_to_device(
 
         component = classify_lf_component(name)
         leaf = name.rsplit(".", 1)[-1]
+        if component == "router":
+            # Whole-mode routers (model_integration.md families keep the HF router
+            # intact inside the Asym block) always EXECUTE on GPU; their params are
+            # tiny (≤ a few MB per layer). Deliberate GPU residency, not a miss —
+            # e.g. PhiMoE's `.mlp.router` nn.Linear stays a raw parameter by design.
+            _move_tensor_data_in_place(param, target_device)
+            moved_bytes_by_reason["router_whole_gpu"] += tensor_nbytes(param)
+            continue
         selected = component_is_selected(component, leaf, selection)
         if selected and strict:
             raise RuntimeError(
@@ -1055,7 +1122,7 @@ def move_lf_asym_cpu_first_model_to_device(
         offload_modules=selection.raw,
         strict=strict,
         max_allowed_unselected_cuda_bytes=8 * 1024 * 1024,
-        allowed_components=frozenset({"linear_attention"}),
+        allowed_components=frozenset({"linear_attention", "router"}),
     )
     return {
         "moved_bytes_by_reason": dict(moved_bytes_by_reason),
@@ -1290,6 +1357,13 @@ def _wrap_lf_router_module(
     if ".feed_forward.router" in lower or lower.endswith(".router") or lower == "router":
         return AsymLlama4Router(module, backend=backend, precision=precision, stats=stats, strict=strict)
     if lower.endswith(".mlp.gate") or ".mlp.gate." in lower:
+        if getattr(module, "e_score_correction_bias", None) is not None:
+            # DS-V3-style router (glm4_moe/glm4_moe_lite): the wrapped block's
+            # verbatim routing reads gate.e_score_correction_bias, which the
+            # projection-only AsymQwen3Router would drop (its 2D-weight check
+            # accepts these gates by accident). Keep the original module intact —
+            # the mover's router_whole_gpu bucket + buffer pass place it on GPU.
+            return None
         return AsymQwen3Router(module, backend=backend, precision=precision, stats=stats, strict=strict)
     return None
 
@@ -1414,7 +1488,8 @@ def _is_text_attention_projection_name(name: str) -> bool:
         return False
     if _has_attention_excluded_path_marker(name):
         return False
-    return name.rsplit(".", 1)[-1] in _ATTENTION_TARGETS
+    leaf = name.rsplit(".", 1)[-1]
+    return leaf in _ATTENTION_TARGETS or leaf in _MLA_ATTENTION_TARGETS
 
 
 def _attention_parent_name(name: str) -> str | None:
@@ -1444,7 +1519,7 @@ def _build_attention_activation_contexts(
         leaf = name.rsplit(".", 1)[-1]
         if (
             component != "attention"
-            or leaf not in {"q_proj", "k_proj", "v_proj"}
+            or leaf not in {"q_proj", "k_proj", "v_proj", "q_a_proj", "kv_a_proj_with_mqa"}
             or not component_is_selected(component, leaf, selection)
             or not _matches_target(name, module, dense_target_modules)
             or _direct_bf16_linear_shape_reason(module, require_backward=True) is not None
@@ -1457,7 +1532,10 @@ def _build_attention_activation_contexts(
     return {
         parent: AttentionActivationOffloadContext()
         for parent, roles in roles_by_parent.items()
+        # standard q/k/v trio, or the MLA input pair (glm4_moe_lite) — both
+        # share one layer-input source per parent.
         if {"q_proj", "k_proj", "v_proj"} <= roles
+        or {"q_a_proj", "kv_a_proj_with_mqa"} <= roles
     }
 
 
@@ -1470,7 +1548,15 @@ def _is_text_attention_module_name(name: str, module: nn.Module) -> bool:
     if leaf not in {"self_attn", "self_attention", "attention", "attn"} and not leaf.endswith("attention"):
         return False
     children = dict(module.named_children())
-    return all(target in children for target in _ATTENTION_TARGETS)
+    if all(target in children for target in _ATTENTION_TARGETS):
+        return True
+    # MLA (glm4_moe_lite): kv_a/kv_b always present; the query side is either
+    # q_proj (q_lora_rank unset) or the q_a/q_b pair.
+    return (
+        "kv_a_proj_with_mqa" in children
+        and "kv_b_proj" in children
+        and ("q_proj" in children or ("q_a_proj" in children and "q_b_proj" in children))
+    )
 
 
 def _is_qwen3_decoder_layer_module_name(name: str, module: nn.Module) -> bool:
@@ -1503,6 +1589,38 @@ def _is_qwen3_decoder_layer_module_name(name: str, module: nn.Module) -> bool:
         if "qwen3" in class_name or "qwen3" in module_name or model_type in {"qwen3_moe", "qwen3_vl_moe"}:
             return True
         if hasattr(children["mlp"], "_is_asym_qwen3_moe_block") or is_qwen3_moe_block(children["mlp"]):
+            return True
+    # Mixtral decoder layer (same child shape as Qwen3; model_integration.md family #1).
+    if qwen3_required <= child_names:
+        if "mixtral" in class_name or "mixtral" in module_name or model_type == "mixtral":
+            return True
+        if hasattr(children["mlp"], "_is_asym_mixtral_moe_block") or is_mixtral_moe_block(children["mlp"]):
+            return True
+    # Phi-MoE decoder layer (same child shape; model_integration.md family #2).
+    if qwen3_required <= child_names:
+        if "phimoe" in class_name or "phimoe" in module_name or model_type == "phimoe":
+            return True
+        if hasattr(children["mlp"], "_is_asym_phimoe_moe_block") or is_phimoe_moe_block(children["mlp"]):
+            return True
+    # Hunyuan MoE decoder layer (same child shape; model_integration.md family #3).
+    if qwen3_required <= child_names:
+        if "hunyuan" in class_name or "hunyuan" in module_name or model_type in {"hunyuan_v1_moe", "hunyuan_moe"}:
+            return True
+        if hasattr(children["mlp"], "_is_asym_hunyuan_moe_block") or is_hunyuan_moe_block(children["mlp"]):
+            return True
+    # GLM-4.5/4.7 MoE decoder layers (same child shape; model_integration.md #4/#5).
+    if qwen3_required <= child_names:
+        if "glm4moe" in class_name or "glm4moe" in module_name or model_type in {"glm4_moe", "glm4_moe_lite"}:
+            return True
+        if hasattr(children["mlp"], "_is_asym_glm45_moe_block") or hasattr(children["mlp"], "_is_asym_glm47_moe_block"):
+            return True
+        if is_glm47_moe_block(children["mlp"]) or is_glm45_moe_block(children["mlp"]):
+            return True
+    # gpt-oss decoder layer (same child shape; model_integration.md family #6).
+    if qwen3_required <= child_names:
+        if "gptoss" in class_name or "gptoss" in module_name or model_type == "gpt_oss":
+            return True
+        if hasattr(children["mlp"], "_is_asym_gptoss_moe_block") or is_gptoss_moe_block(children["mlp"]):
             return True
     # Generic DENSE decoder layer (Qwen2 / Qwen2.5 / Llama-3.x / Mistral / etc.): standard
     # {self_attn, mlp, input_layernorm, post_attention_layernorm} with a dense FFN whose `mlp`
@@ -1616,10 +1734,25 @@ def _wrap_attention_saved_tensor_offload_modules(
             skipped.append(f"{name}:unsupported_attention_parent:{type(module).__name__}")
             continue
         install_attention_saved_tensor_offload(module)
+        # item 6 (fix_cpu_compute.md R2): wrap q/k-norm for recompute-instead-of-save.
+        # Pure passthrough until ASYMM_QKNORM_RECOMPUTE / policy P12 arms it, so the
+        # install is always safe on the same text-attention parents.
+        from asym_gemm.training.qknorm_recompute import install_qknorm_recompute
+
+        install_qknorm_recompute(module)
         wrapped.append(name)
 
     # SDPA-only recompute pairs with attn_act; self-gated on ASYMM_ATTN_SDPA_RECOMPUTE, text-scoped.
     install_sdpa_recompute(model)
+    # item 6 rope variant (self-gated on ASYMM_ROPE_RECOMPUTE; evidence-off in this graph).
+    from asym_gemm.training.qknorm_recompute import install_rope_recompute
+
+    install_rope_recompute()
+    # Query-chunked flex attention (self-gated on ASYMM_ATTN_QCHUNK_ROWS>0):
+    # caps attention-backward liveness at ~K/V + one q-chunk — the recorded
+    # lever for the MLA (glm4_moe_lite) 83-GiB bwd transient; also the Air
+    # attention-workspace lever. Fail-loud off the plain causal path.
+    install_qchunked_attention(model)
 
     if strict and not wrapped:
         raise RuntimeError("attention activation offload requested but no supported text attention parents were found")
@@ -1757,7 +1890,7 @@ def count_lora_wrapped_modules(model: nn.Module) -> int:
         for module in model.modules()
         if hasattr(module, "lora_A")
         and hasattr(module, "lora_B")
-        and not isinstance(module, (AsymQwen3Experts, AsymQwen3MoeBlock, AsymQwen35MoeBlock))
+        and not isinstance(module, (AsymQwen3Experts, AsymQwen3MoeBlock, AsymQwen35MoeBlock, AsymMixtralMoeBlock, AsymPhimoeMoeBlock, AsymHunyuanMoeBlock, AsymGlm45MoeBlock, AsymGlm47MoeBlock, AsymGptOssMoeBlock))
     )
 
 
@@ -1891,6 +2024,18 @@ def apply_lf_asym_lora(
             report.llama4_moes_wrapped += 1
         elif isinstance(new_module, AsymQwen3MoeBlock):
             report.qwen3_moes_wrapped += 1
+        elif isinstance(new_module, AsymMixtralMoeBlock):
+            report.mixtral_moes_wrapped += 1
+        elif isinstance(new_module, AsymPhimoeMoeBlock):
+            report.phimoe_moes_wrapped += 1
+        elif isinstance(new_module, AsymHunyuanMoeBlock):
+            report.hunyuan_moes_wrapped += 1
+        elif isinstance(new_module, AsymGlm47MoeBlock):
+            report.glm47_moes_wrapped += 1
+        elif isinstance(new_module, AsymGlm45MoeBlock):
+            report.glm45_moes_wrapped += 1
+        elif isinstance(new_module, AsymGptOssMoeBlock):
+            report.gptoss_moes_wrapped += 1
         else:
             report.packed_experts_wrapped += 1
         report.cpu_resident_base_bytes += new_module.cpu_resident_base_bytes
@@ -1902,6 +2047,18 @@ def apply_lf_asym_lora(
             for name, module in model.named_modules():
                 if is_qwen35_moe_block(module):
                     expert_candidates.append((name, "qwen35_whole"))
+                elif is_mixtral_moe_block(module):
+                    expert_candidates.append((name, "mixtral_whole"))
+                elif is_phimoe_moe_block(module):
+                    expert_candidates.append((name, "phimoe_whole"))
+                elif is_hunyuan_moe_block(module):
+                    expert_candidates.append((name, "hunyuan_whole"))
+                elif is_glm47_moe_block(module):
+                    expert_candidates.append((name, "glm47_whole"))
+                elif is_glm45_moe_block(module):
+                    expert_candidates.append((name, "glm45_whole"))
+                elif is_gptoss_moe_block(module):
+                    expert_candidates.append((name, "gptoss_whole"))
                 elif is_qwen3_moe_block(module):
                     expert_candidates.append((name, "qwen3_whole"))
                 elif is_llama4_moe(module):
@@ -1984,6 +2141,153 @@ def apply_lf_asym_lora(
                 if qwen3_moe_finegrained_enabled and offload_experts:
                     wrapped.experts._qwen3_moe_finegrained_enabled = True
                     report.qwen3_moe_finegrained_offload_wrapped += 1
+                _install_expert_replacement(name, wrapped, f"{name}.experts")
+            elif kind == "mixtral_whole":
+                if not is_mixtral_moe_block(module):
+                    if strict:
+                        raise RuntimeError(f"{name} no longer looks like a Mixtral MoE block")
+                    report.skipped.append(f"{name}:stale_mixtral_moe_block")
+                    continue
+                wrapped = wrap_mixtral_moe_block(
+                        module,
+                        backend=backend,
+                        precision=precision,
+                        offload=offload_experts,
+                        lora_rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=lora_dropout,
+                        lora_dtype=torch.bfloat16,
+                        expert_recompute_policy=recompute_config.label,
+                        router_mode="whole",
+                        router_debug_grad=False,
+                        stats=stats,
+                        strict=strict,
+                )
+                wrapped.profile_prefix = _layer_profile_prefix_from_module_name(name, "mlp")
+                wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
+                if qwen3_moe_finegrained_enabled and offload_experts:
+                    # Shared-engine fg path (phi T3 memory campaign, 2026-07-27): the
+                    # flag is per-instance on AsymQwen3Experts and family-agnostic;
+                    # qwen3 branches set it above, new families mirror it here.
+                    wrapped.experts._qwen3_moe_finegrained_enabled = True
+                    report.qwen3_moe_finegrained_offload_wrapped += 1
+                _install_expert_replacement(name, wrapped, f"{name}.experts")
+            elif kind == "phimoe_whole":
+                if not is_phimoe_moe_block(module):
+                    if strict:
+                        raise RuntimeError(f"{name} no longer looks like a Phi-MoE block")
+                    report.skipped.append(f"{name}:stale_phimoe_moe_block")
+                    continue
+                wrapped = wrap_phimoe_moe_block(
+                        module,
+                        backend=backend,
+                        precision=precision,
+                        offload=offload_experts,
+                        lora_rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=lora_dropout,
+                        lora_dtype=torch.bfloat16,
+                        expert_recompute_policy=recompute_config.label,
+                        router_mode="whole",
+                        router_debug_grad=False,
+                        stats=stats,
+                        strict=strict,
+                )
+                wrapped.profile_prefix = _layer_profile_prefix_from_module_name(name, "mlp")
+                wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
+                if qwen3_moe_finegrained_enabled and offload_experts:
+                    # Shared-engine fg path (phi T3 memory campaign, 2026-07-27): the
+                    # flag is per-instance on AsymQwen3Experts and family-agnostic;
+                    # qwen3 branches set it above, new families mirror it here.
+                    wrapped.experts._qwen3_moe_finegrained_enabled = True
+                    report.qwen3_moe_finegrained_offload_wrapped += 1
+                _install_expert_replacement(name, wrapped, f"{name}.experts")
+            elif kind == "hunyuan_whole":
+                if not is_hunyuan_moe_block(module):
+                    if strict:
+                        raise RuntimeError(f"{name} no longer looks like a Hunyuan MoE block")
+                    report.skipped.append(f"{name}:stale_hunyuan_moe_block")
+                    continue
+                wrapped = wrap_hunyuan_moe_block(
+                        module,
+                        backend=backend,
+                        precision=precision,
+                        offload=offload_experts,
+                        lora_rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=lora_dropout,
+                        lora_dtype=torch.bfloat16,
+                        expert_recompute_policy=recompute_config.label,
+                        router_mode="whole",
+                        router_debug_grad=False,
+                        stats=stats,
+                        strict=strict,
+                )
+                wrapped.profile_prefix = _layer_profile_prefix_from_module_name(name, "mlp")
+                wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
+                if qwen3_moe_finegrained_enabled and offload_experts:
+                    # Shared-engine fg path (phi T3 memory campaign, 2026-07-27): the
+                    # flag is per-instance on AsymQwen3Experts and family-agnostic;
+                    # qwen3 branches set it above, new families mirror it here.
+                    wrapped.experts._qwen3_moe_finegrained_enabled = True
+                    report.qwen3_moe_finegrained_offload_wrapped += 1
+                _install_expert_replacement(name, wrapped, f"{name}.experts")
+            elif kind in {"glm45_whole", "glm47_whole"}:
+                _is_glm47 = kind == "glm47_whole"
+                _glm_is = is_glm47_moe_block if _is_glm47 else is_glm45_moe_block
+                _glm_wrap = wrap_glm47_moe_block if _is_glm47 else wrap_glm45_moe_block
+                if not _glm_is(module):
+                    if strict:
+                        raise RuntimeError(f"{name} no longer looks like a GLM MoE block")
+                    report.skipped.append(f"{name}:stale_glm_moe_block")
+                    continue
+                wrapped = _glm_wrap(
+                        module,
+                        backend=backend,
+                        precision=precision,
+                        offload=offload_experts,
+                        lora_rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=lora_dropout,
+                        lora_dtype=torch.bfloat16,
+                        expert_recompute_policy=recompute_config.label,
+                        router_mode="whole",
+                        router_debug_grad=False,
+                        stats=stats,
+                        strict=strict,
+                )
+                wrapped.profile_prefix = _layer_profile_prefix_from_module_name(name, "mlp")
+                wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
+                if qwen3_moe_finegrained_enabled and offload_experts:
+                    # Shared-engine fg path (phi T3 memory campaign, 2026-07-27): the
+                    # flag is per-instance on AsymQwen3Experts and family-agnostic;
+                    # qwen3 branches set it above, new families mirror it here.
+                    wrapped.experts._qwen3_moe_finegrained_enabled = True
+                    report.qwen3_moe_finegrained_offload_wrapped += 1
+                _install_expert_replacement(name, wrapped, f"{name}.experts")
+            elif kind == "gptoss_whole":
+                if not is_gptoss_moe_block(module):
+                    if strict:
+                        raise RuntimeError(f"{name} no longer looks like a GptOss MLP block")
+                    report.skipped.append(f"{name}:stale_gptoss_moe_block")
+                    continue
+                wrapped = wrap_gptoss_moe_block(
+                        module,
+                        backend=backend,
+                        precision=precision,
+                        offload=offload_experts,
+                        lora_rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=lora_dropout,
+                        lora_dtype=torch.bfloat16,
+                        expert_recompute_policy=recompute_config.label,
+                        router_mode="whole",
+                        router_debug_grad=False,
+                        stats=stats,
+                        strict=strict,
+                )
+                wrapped.profile_prefix = _layer_profile_prefix_from_module_name(name, "mlp")
+                wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
                 _install_expert_replacement(name, wrapped, f"{name}.experts")
             elif kind in {"llama4_whole", "llama4_hf"}:
                 if not is_llama4_moe(module):
@@ -2204,6 +2508,12 @@ def apply_lf_asym_lora(
             module = model.get_submodule(name)
             if isinstance(module, (AsymQwen3Router, AsymLlama4Router)):
                 continue
+            if getattr(module, "e_score_correction_bias", None) is not None:
+                # DS-V3-style gate (glm4_moe/_lite): deliberately kept intact —
+                # the block's verbatim routing reads its bias buffer and the
+                # mover places the whole gate on GPU (router_whole_gpu).
+                report.skipped.append(f"{name}:router_kept_intact_ds_bias")
+                continue
             wrapped_router = _wrap_lf_router_module(
                 name,
                 module,
@@ -2354,7 +2664,7 @@ def apply_lf_asym_lora(
                 attention_act_skipped.append(f"{name}:vision_or_multimodal")
             attention_context = (
                 attention_contexts.get(_attention_parent_name(name) or "")
-                if leaf in {"q_proj", "k_proj", "v_proj"}
+                if leaf in {"q_proj", "k_proj", "v_proj", "q_a_proj", "kv_a_proj_with_mqa"}
                 else None
             )
             new_module = _wrap_lf_linear_leaf(
