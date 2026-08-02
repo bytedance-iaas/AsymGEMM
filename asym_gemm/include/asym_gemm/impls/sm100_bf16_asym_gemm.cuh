@@ -2,6 +2,7 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
+#include <cuda_bf16.h>
 #include <cutlass/arch/barrier.h>
 
 #include <asym_gemm/common/asymScheduler.cuh>
@@ -92,6 +93,34 @@ __device__ __forceinline__ void qwen3_moe_store_k_major_smem(
         tensor(row, col) = value;
     } else {
         smem[row * BLOCK_K + col] = value;
+    }
+}
+
+// 16-byte (8 x bf16) variant of the swizzled store: every SW32/SW64/SW128
+// swizzle permutes 16-byte units but keeps their contents contiguous, so 8
+// consecutive k of one row (col % 8 == 0) land as one int4 at the first
+// element's swizzled address. This is what makes the gather-left staging
+// vectorizable (v2 2026-07-28): the scalar per-element form was the routed
+// kernel's dominant cost at training M.
+template <uint32_t BLOCK_MN, uint32_t BLOCK_K, uint32_t kSwizzleMode, typename dtype_t>
+__device__ __forceinline__ void qwen3_moe_store_k_major_smem_vec8(
+    dtype_t* smem,
+    uint32_t row,
+    uint32_t col,
+    int4 value) {
+    static_assert(sizeof(dtype_t) == 2, "vec8 store expects 16-bit elements");
+    if constexpr (kSwizzleMode == 128 || kSwizzleMode == 64 || kSwizzleMode == 32) {
+        auto layout = cute::tile_to_shape(
+            cute::conditional_t<kSwizzleMode == 128,
+                                cute::GMMA::Layout_K_SW128_Atom<dtype_t>,
+                                cute::conditional_t<kSwizzleMode == 64,
+                                                    cute::GMMA::Layout_K_SW64_Atom<dtype_t>,
+                                                    cute::GMMA::Layout_K_SW32_Atom<dtype_t>>>{},
+            cute::make_shape(cute::Int<BLOCK_MN>{}, cute::Int<BLOCK_K>{}));
+        auto tensor = cute::make_tensor(cute::make_smem_ptr(smem), layout);
+        *reinterpret_cast<int4*>(&tensor(row, col)) = value;
+    } else {
+        *reinterpret_cast<int4*>(&smem[row * BLOCK_K + col]) = value;
     }
 }
 
@@ -478,24 +507,64 @@ ASYM_BF16_KERNEL_NAME(uint32_t* offsets, uint32_t* experts,
                 constexpr uint32_t DESC_ATOM_K_FOR_GATHER = (BLOCK_K > (kSwizzleAMode / sizeof(cutlass::bfloat16_t)))
                     ? (kSwizzleAMode / sizeof(cutlass::bfloat16_t)) : BLOCK_K;
                 constexpr uint32_t NUM_GATHER_K_ATOMS = BLOCK_K / DESC_ATOM_K_FOR_GATHER;
+                // v2 (2026-07-28): vectorized gather staging. The scalar form
+                // did a token-index load, a scale lookup, and a 2-byte
+                // load/store PER ELEMENT (65K iterations per tile through one
+                // warp) and dominated the routed GEMM's runtime at training M.
+                // Here each lane moves 8 consecutive k of one row per
+                // iteration: one int4 global load, one fused fp32 scale
+                // (identical multiply-then-round math, so results are
+                // bit-identical), one int4 swizzled store — 8x fewer
+                // iterations and per-vector rather than per-element index
+                // arithmetic. Real shapes always take the vector path; the
+                // scalar tail keeps exotic strides correct.
+                constexpr uint32_t GVEC = 8;
+                DG_STATIC_ASSERT(DESC_ATOM_K_FOR_GATHER % GVEC == 0, "gather atom must be 16-byte divisible");
+                constexpr uint32_t GATHER_VECS_PER_ROW = DESC_ATOM_K_FOR_GATHER / GVEC;
                 #pragma unroll
                 for (uint32_t atom = 0; atom < NUM_GATHER_K_ATOMS; ++atom) {
-                    for (uint32_t linear = lane_idx; linear < LOAD_BLOCK_M * DESC_ATOM_K_FOR_GATHER; linear += 32) {
-                        const uint32_t atom_k = linear / LOAD_BLOCK_M;
-                        const uint32_t local_m = linear - atom_k * LOAD_BLOCK_M;
+                    for (uint32_t linear = lane_idx; linear < LOAD_BLOCK_M * GATHER_VECS_PER_ROW; linear += 32) {
+                        const uint32_t local_m = linear / GATHER_VECS_PER_ROW;
+                        const uint32_t vj = linear - local_m * GATHER_VECS_PER_ROW;
                         const uint32_t route_row = m_idx + local_m;
-                        const uint32_t k_col = k_idx + atom * DESC_ATOM_K_FOR_GATHER + atom_k;
-                        cutlass::bfloat16_t value = cutlass::bfloat16_t(0.0f);
-                        if (route_row < shape_m and k_col < route_gather_stride) {
+                        const uint32_t k_col = k_idx + atom * DESC_ATOM_K_FOR_GATHER + vj * GVEC;
+                        const uint32_t out_col = atom * DESC_ATOM_K_FOR_GATHER + vj * GVEC;
+                        if (route_row < shape_m and k_col + GVEC <= route_gather_stride) {
                             const int64_t token_row = route_token_indices[route_row];
-                            const float scale = qwen3_moe_route_weight_or_one(
-                                route_weights, route_weights_is_bf16, route_weighted, route_row);
-                            value = cutlass::bfloat16_t(
-                                static_cast<float>(route_gather_left[static_cast<uint64_t>(token_row) * route_gather_stride + k_col]) * scale);
+                            int4 vec = *reinterpret_cast<const int4*>(
+                                &route_gather_left[static_cast<uint64_t>(token_row) * route_gather_stride + k_col]);
+                            if (route_weighted) {
+                                const float scale = qwen3_moe_route_weight_or_one(
+                                    route_weights, route_weights_is_bf16, route_weighted, route_row);
+                                auto* halves = reinterpret_cast<__nv_bfloat162*>(&vec);
+                                #pragma unroll
+                                for (uint32_t h = 0; h < GVEC / 2; ++h) {
+                                    float2 f = __bfloat1622float2(halves[h]);
+                                    f.x *= scale;
+                                    f.y *= scale;
+                                    halves[h] = __float22bfloat162_rn(f);
+                                }
+                            }
+                            qwen3_moe_store_k_major_smem_vec8<
+                                LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, cutlass::bfloat16_t>(
+                                    smem_a[stage_idx], local_m, out_col, vec);
+                        } else {
+                            #pragma unroll
+                            for (uint32_t l = 0; l < GVEC; ++l) {
+                                const uint32_t kc = k_col + l;
+                                cutlass::bfloat16_t value = cutlass::bfloat16_t(0.0f);
+                                if (route_row < shape_m and kc < route_gather_stride) {
+                                    const int64_t token_row = route_token_indices[route_row];
+                                    const float scale = qwen3_moe_route_weight_or_one(
+                                        route_weights, route_weights_is_bf16, route_weighted, route_row);
+                                    value = cutlass::bfloat16_t(
+                                        static_cast<float>(route_gather_left[static_cast<uint64_t>(token_row) * route_gather_stride + kc]) * scale);
+                                }
+                                qwen3_moe_store_k_major_smem<
+                                    LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, cutlass::bfloat16_t>(
+                                        smem_a[stage_idx], local_m, out_col + l, value);
+                            }
                         }
-                        qwen3_moe_store_k_major_smem<
-                            LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, cutlass::bfloat16_t>(
-                                smem_a[stage_idx], local_m, atom * DESC_ATOM_K_FOR_GATHER + atom_k, value);
                     }
                 }
                 __syncwarp();

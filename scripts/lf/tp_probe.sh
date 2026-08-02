@@ -21,7 +21,7 @@ model="$1"; tag="$2"; cfg="$3"; seq="$4"; shift 4
 [ $# -ge 1 ] || { echo "usage: tp_probe.sh <model> <tag> <config> <seq> <b...>"; exit 3; }
 
 # self-heal dataset registrations (LF git syncs wipe them -> validation_ok=False hardfails)
-python3 /workspace/AsymGEMM-SFT/.repair_dataset_info.py >/dev/null 2>&1 || true
+python3 "${SFT_ROOT}/.repair_dataset_info.py" >/dev/null 2>&1 || true
 
 for b in "$@"; do
   echo "########## RUN ${model} ${tag} seq=${seq} b=${b} $(date -u +%H:%M:%S)"

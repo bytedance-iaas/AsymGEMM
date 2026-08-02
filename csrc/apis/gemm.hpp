@@ -919,6 +919,57 @@ static void sm100_m_grouped_bf16_cpu_left_pair_asym_gemm_nt_contiguous(
                                                             compact_m_blocks);
 }
 
+// N1: qkv shared-stream triple (one host X stream, three adapters).
+static void sm100_m_grouped_bf16_cpu_left_triple_asym_gemm_nt_contiguous(
+                                              const torch::Tensor& a,
+                                              const torch::Tensor& b0,
+                                              const torch::Tensor& b1,
+                                              const torch::Tensor& b2,
+                                              const torch::Tensor& d0,
+                                              const torch::Tensor& d1,
+                                              const torch::Tensor& d2,
+                                              const torch::Tensor& offsets, const torch::Tensor& experts,
+                                              const int& list_size,
+                                              const std::string& compiled_dims,
+                                              const int& compact_m_blocks = 0) {
+    check_cpu_left_condition(device_runtime->get_arch_major() == 10, "requires_sm100");
+    check_cpu_left_condition(a.device().is_cpu() && a.is_pinned(), "input_not_pinned_cpu");
+    for (const auto* t : {&b0, &b1, &b2})
+        check_cpu_left_condition(t->is_cuda() && t->dim() == 3 && t->is_contiguous() &&
+                                 t->scalar_type() == torch::kBFloat16 && t->sizes() == b0.sizes(),
+                                 "bad_triple_weight");
+    for (const auto* t : {&d0, &d1, &d2})
+        check_cpu_left_condition(t->is_cuda() && t->dim() == 2 && t->is_contiguous() &&
+                                 (t->scalar_type() == torch::kBFloat16 || t->scalar_type() == torch::kFloat) &&
+                                 t->sizes() == d0.sizes(), "bad_triple_output");
+    check_cpu_left_condition(a.dim() == 2 && a.is_contiguous() && a.scalar_type() == torch::kBFloat16,
+                             "bad_input");
+    const auto& major_a = get_major_type_ab(a);
+    const auto& major_b = get_major_type_ab(b0);
+    check_cpu_left_condition(major_a == cute::UMMA::Major::K && major_b == cute::UMMA::Major::K,
+                             "requires_k_major_operands");
+    const auto& [m, k_a] = get_shape<2>(a);
+    const auto& [num_groups, n, k] = get_shape<3>(b0);
+    const auto& [m_, n_] = get_shape<2>(d0);
+    check_cpu_left_condition(num_groups > 0 && n > 0 && k > 0, "requires_positive_shape");
+    check_cpu_left_condition(m == m_ && n == n_ && k == k_a, "shape_mismatch");
+    check_cpu_left_condition(n % 8 == 0 && k % 8 == 0, "requires_8_aligned_nk");
+    const int grid_y = list_size - 1;
+    check_cpu_left_condition(list_size >= 1 && offsets.is_cuda() && experts.is_cuda() &&
+                             offsets.is_contiguous() && experts.is_contiguous() &&
+                             offsets.scalar_type() == torch::kInt && experts.scalar_type() == torch::kInt &&
+                             offsets.numel() >= 2 * grid_y && experts.numel() >= list_size,
+                             "metadata_mismatch");
+    if (m == 0 || grid_y <= 0)
+        return;
+    sm100_m_grouped_bf16_cpu_left_triple_asym_gemm_contiguous(a, b0, b1, b2, d0, d1, d2,
+                                                              offsets, experts, grid_y,
+                                                              num_groups, m, n, k,
+                                                              major_a, major_b, compiled_dims,
+                                                              static_cast<int>(b0.stride(get_non_contiguous_dim(major_b))),
+                                                              compact_m_blocks);
+}
+
 static void m_grouped_bf16_asym_gemm_nt_masked(const torch::Tensor& a, const torch::Tensor& b,
                                                const torch::Tensor& d,
                                                const torch::Tensor& masked_m,
@@ -1274,6 +1325,13 @@ static void register_apis(pybind11::module_& m) {
           &sm100_m_grouped_bf16_cpu_left_pair_asym_gemm_nt_contiguous,
           py::arg("a"), py::arg("b_gate"), py::arg("b_up"),
           py::arg("d_gate"), py::arg("d_up"),
+          py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
+          py::arg("compiled_dims") = "nk",
+          py::arg("compact_m_blocks") = 0);
+    m.def("sm100_m_grouped_bf16_cpu_left_triple_asym_gemm_nt_contiguous",
+          &sm100_m_grouped_bf16_cpu_left_triple_asym_gemm_nt_contiguous,
+          py::arg("a"), py::arg("b0"), py::arg("b1"), py::arg("b2"),
+          py::arg("d0"), py::arg("d1"), py::arg("d2"),
           py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
           py::arg("compiled_dims") = "nk",
           py::arg("compact_m_blocks") = 0);

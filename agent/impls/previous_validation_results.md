@@ -54,3 +54,41 @@ both my runs and row 9 sit on.
   why the records keep host lines anchor-grade rather than a gate.
 - Conclusion: NO regression attributable to the merge anywhere; merge
   accepted 2026-07-21 (all gates (a)–(f), fix_merge_scheduler.md §7).
+
+
+---
+
+# CPU-modules merge validation (2026-07-23, merge_cpu branch)
+
+The 9-row matrix re-run with the CPU stack ON (`ASYM_PLACEMENT_POLICY=1
+ASYM_CPU_OPS_THREADS=48` on every tier recipe; see
+agent/impls/merge_cpu_modules.md for the full campaign ledger).
+Baseline = the "new" column of the scheduler-merge table above.
+
+| # | Config | Baseline tok/s · GiB | +CPU stack tok/s · GiB | Δ tok/s | Verdict |
+|---|--------|----------------------|------------------------|---------|---------|
+| 1 | q32 T1 128k b2 | 1091 · 116.0 | 1092 · 116.0 | +0.0% | PASS (byte-exact) |
+| 2 | q32 T2 128k b2 | 986 · 93.6 | 979 · 93.6 | −0.7% | PASS (qknorm regime-gated) |
+| 3 | q32 T3 640k b1 | 219 · 129.7 | 227 · 153.8ⁿ | **+3.6%** | PASS (prefetch win) |
+| 4 | llama T1 96k b1 | 1096 · 48.9 | 1096 · 48.9 | ±0.0% | PASS (byte-exact) |
+| 5 | llama T2 192k b2 | 548 · 171.1 | 545 · 171.1 | −0.5% | PASS (guard off @13.9 free) |
+| 6 | llama T2 448k b1 wall | 280 · 182.4 | 279 · 182.4 | −0.4% | PASS (byte-exact @2.6 free) |
+| 7 | moe KA-dial 120k b8 | 2762 · 165.7 | 2726 · 176.7ⁿ | −1.3% | PASS ×2 (in band) |
+| 8 | moe shed 800k b1 | 584 · 110.4 | 582 · 120.3ⁿ | −0.4% | PASS (P2 regime-gated) |
+| 9 | moe shed 1.1M b1 | 385 · 152.9 | 380 · 144.5 | −1.4% | PASS (−8.4 GiB memory) |
+
+ⁿ Reserved-cache note: allocated peak ≤ baseline in every row (M7 forensics:
+byte-identical 109.54 GiB); the reserved deltas are prefetch spends within the
+32 GB floor + side-stream pool cache, reclaimed under pressure — capacity nil.
+
+Breaches found and fixed during the matrix (policy gates, zero recipe forks):
+prefetch floor 16→32 GB (738aa70); qknorm OFF under dense-T2 keep-acts
+(03a43e7: bisect 960/956/955 → 978 = flags-off 977); P2 deposit OFF under
+KEEP_DGRADS_HBM (5d39762: bisect 574×3/575/582 = flags-off; the donor's
+deposit wins were measured without the pin). M1's first attempt was a launch
+collision (orphan container python), not a defect — solo rerun byte-exact.
+
+Component gates: 59/59 unit tests; SVE build verified; flags-off invariance
+−0.11%/−0.4% with identical memory; SMOKE loss parity 0.48% max (envelope
+1.0%); donor-regime A/Bs −2.7% (MoE 32k) / −6.3% (dense 32k) with correct
+self-gating; scheduler selftest 5/5 + replay 18/18 after adoption.

@@ -3,6 +3,7 @@
 # Original: https://github.com/deepseek-ai/DeepGEMM
 
 import os
+import platform
 import shutil
 import setuptools
 import torch
@@ -41,15 +42,22 @@ def get_ext_modules():
         '-DDG_JIT_USE_RUNTIME_API',
     ]
 
+    # Grace CPU fused ops (csrc/cpu_ops): OpenMP + SVE-BF16 (agent/impls/cpu_compute.md)
+    cxx_flags.append('-fopenmp')
+    if platform.machine() == 'aarch64':
+        cxx_flags.append('-march=armv8.2-a+fp16+dotprod+sve+bf16')
+
     return [CUDAExtension(
         name='asym_gemm._C',
         sources=[
             os.path.join(current_dir, 'csrc/python_api.cpp'),
+            os.path.join(current_dir, 'csrc/cpu_ops/cpu_ops.cpp'),
             os.path.join(current_dir, 'csrc/dropout/dropout_mask.cu'),
             os.path.join(current_dir, 'csrc/ep_steal/ep_steal_sync.cu'),
             os.path.join(current_dir, 'csrc/exp_act_offload/exp_act_offload_kernels.cu'),
             os.path.join(current_dir, 'csrc/qwen3/qwen3_gate_up_windowed_bwd.cu'),
         ],
+        extra_link_args=['-fopenmp'],
         include_dirs=[
             f'{CUDA_HOME}/include',
             f'{CUDA_HOME}/include/cccl',

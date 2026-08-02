@@ -313,6 +313,101 @@ def test_linear_sm100_asym_backend_forward_backward_matches_current_asym() -> No
 
 
 @pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 BF16 AsymGEMM kernels")
+@pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 asym kernels")
+def test_qkv_shared_lora_a_forward_batches_one_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """qkv shared-stream fwd (2026-07-28): one CPU-left pass serves q/k/v,
+    bit-identical to the per-projection path, grads unchanged."""
+
+    def build(context: AttentionActivationOffloadContext, stats: AsymExecutionStats):
+        torch.manual_seed(212)
+        weight = torch.randn(64, 64, dtype=torch.bfloat16)
+        modules = []
+        for role in ("q_proj", "k_proj", "v_proj"):
+            modules.append(
+                AsymActivationOffloadLoRALinear.from_host_weight(
+                    HostWeight(weight, pin_memory=True, clone=True),
+                    rank=8,
+                    alpha=16.0,
+                    backend="asym",
+                    stats=stats,
+                    device=torch.device("cuda:0"),
+                    lora_dtype=torch.bfloat16,
+                    init_lora_weights="peft",
+                    lora_dropout=0.0,
+                    projection_role=role,
+                    attention_context=context,
+                )
+            )
+        return modules
+
+    def run(modules):
+        torch.manual_seed(300)
+        x = torch.randn(128, 64, device="cuda:0", dtype=torch.bfloat16, requires_grad=True)
+        outs = [module(x) for module in modules]
+        loss = sum(out.float().square().mean() for out in outs)
+        loss.backward()
+        return outs, x.grad, [m.lora_a.grad for m in modules]
+
+    monkeypatch.delenv("ASYMM_ATTN_QKV_FWD_SHARED", raising=False)
+    stats_shared = AsymExecutionStats()
+    outs_shared, xg_shared, ag_shared = run(build(AttentionActivationOffloadContext(), stats_shared))
+    assert stats_shared.attn_act_lora_a_shared_batches == 1
+    assert stats_shared.attn_act_lora_a_shared_hits == 2
+    assert stats_shared.cpu_left_lora_a_calls == 1
+
+    monkeypatch.setenv("ASYMM_ATTN_QKV_FWD_SHARED", "0")
+    stats_single = AsymExecutionStats()
+    outs_single, xg_single, ag_single = run(build(AttentionActivationOffloadContext(), stats_single))
+    assert stats_single.attn_act_lora_a_shared_batches == 0
+    assert stats_single.cpu_left_lora_a_calls == 3
+
+    for s, t in zip(outs_shared, outs_single):
+        torch.testing.assert_close(s, t, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(xg_shared, xg_single, atol=0.0, rtol=0.0)
+    for s, t in zip(ag_shared, ag_single):
+        torch.testing.assert_close(s, t, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not _sm100_bf16_available(), reason="requires SM100 asym kernels")
+def test_dual_da_backward_matches_legacy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """N2 dual-dataflow (ASYMM_ATTN_DUAL_DA=1): grads match the legacy
+    offload-S + dA path within bf16 tolerance; S is never offloaded."""
+
+    def run(env_on: bool):
+        torch.manual_seed(321)
+        weight = torch.randn(128, 128, dtype=torch.bfloat16)
+        if env_on:
+            monkeypatch.setenv("ASYMM_ATTN_DUAL_DA", "1")
+        else:
+            monkeypatch.delenv("ASYMM_ATTN_DUAL_DA", raising=False)
+        module = AsymActivationOffloadLoRALinear.from_host_weight(
+            HostWeight(weight, pin_memory=True, clone=True),
+            rank=64,
+            alpha=16.0,
+            backend="asym",
+            stats=AsymExecutionStats(),
+            device=torch.device("cuda:0"),
+            lora_dtype=torch.bfloat16,
+            init_lora_weights="peft",
+            lora_dropout=0.0,
+            projection_role="q_proj",
+        )
+        with torch.no_grad():
+            module.lora_a.normal_(std=0.02)
+            module.lora_b.normal_(std=0.02)
+        x = torch.randn(512, 128, device="cuda:0", dtype=torch.bfloat16, requires_grad=True)
+        out = module(x)
+        out.float().square().mean().backward()
+        return out.detach(), x.grad, module.lora_a.grad, module.lora_b.grad
+
+    out0, xg0, ag0, bg0 = run(False)
+    out1, xg1, ag1, bg1 = run(True)
+    torch.testing.assert_close(out1, out0, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(xg1, xg0, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(ag1.float(), ag0.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(bg1.float(), bg0.float(), atol=2e-2, rtol=2e-2)
+
+
 def test_qkv_wrappers_share_one_source_handle() -> None:
     torch.manual_seed(211)
     context = AttentionActivationOffloadContext()

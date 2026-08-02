@@ -905,9 +905,44 @@ def _kt_optimizer_memory_preflight(lora: dict[str, Any], config: dict[str, Any] 
     }
 
 
+def _zero_router_jitter_if_requested(model: Any) -> None:
+    # ASYM_ZERO_ROUTER_JITTER=1 (model_integration.md validation protocol): zero
+    # train-time router/input jitter noise everywhere it appears. Two reasons:
+    # (1) loss-parity A/B requires deterministic routing; (2) HF PhiMoE's router
+    # applies jitter IN-PLACE on a view, which crashes under gradient-checkpoint
+    # backward hooks (view+inplace) — zeroing disables that code path. Generic
+    # duck-typed sweep; no-op unless the env is set and attrs exist.
+    if os.environ.get("ASYM_ZERO_ROUTER_JITTER", "").strip() not in {"1", "true"}:
+        return
+    zeroed = 0
+    seen = set()
+    targets = [model]
+    cfg = getattr(model, "config", None)
+    if cfg is not None:
+        targets.append(cfg)
+        targets.extend(getattr(cfg, "get_text_config", lambda: None)() or [] if False else [])
+    for module in getattr(model, "modules", lambda: [])():
+        targets.append(module)
+    for obj in targets:
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        for attr in ("router_jitter_noise", "input_jitter_noise", "jitter_noise"):
+            if hasattr(obj, attr):
+                try:
+                    if float(getattr(obj, attr) or 0.0) != 0.0:
+                        setattr(obj, attr, 0.0)
+                        zeroed += 1
+                except (TypeError, ValueError):
+                    continue
+    if zeroed:
+        print(f"[asym] ASYM_ZERO_ROUTER_JITTER: zeroed {zeroed} jitter attr(s).", flush=True)
+
+
 def _capture_loaded_model(model: Any) -> Any:
     global _LAST_LF_MODEL
     _LAST_LF_MODEL = model
+    _zero_router_jitter_if_requested(model)
     heartbeat = _MODEL_CAPTURE_HEARTBEAT
     partial_writer = _MODEL_CAPTURE_PARTIAL_WRITER
     if heartbeat is not None:
@@ -1007,6 +1042,64 @@ def _model_and_base_model() -> tuple[Any | None, Any | None]:
         except Exception:
             base_model = None
     return model, base_model
+
+
+def _cpu_worker_jobs_snapshot():
+    # K-11 (cpu_compute.md): per-tag wall-ms of CPU-worker jobs (invisible to NVTX).
+    try:
+        from asym_gemm.training import cpu_worker
+
+        return cpu_worker.job_ms_snapshot()
+    except Exception:
+        return {}
+
+
+def _placement_policy_snapshot():
+    # P11 (placement.md): one placement_policy block per profile — rule ids, inputs,
+    # decisions, thresholds — plus the P7 deposit-retention high-water.
+    try:
+        from asym_gemm.training import placement_policy
+
+        out = placement_policy.stats()
+    except Exception as exc:
+        return {"enabled": False, "reason": repr(exc)}
+    try:
+        from asym_gemm.training import attention_activation_offload as _aao
+
+        out["deposit_retention"] = _aao.deposit_retention_stats()
+    except Exception:
+        pass
+    try:
+        from asym_gemm.training import save_dedup as _sd
+
+        out["save_dedup"] = {"enabled": _sd.enabled(), **_sd.stats()}
+    except Exception:
+        pass
+    try:
+        from asym_gemm.training import pinned_ledger as _pl
+
+        out["pinned_ledger"] = _pl.stats()
+    except Exception:
+        pass
+    try:
+        from asym_gemm.training import qknorm_recompute as _qkr
+
+        out["qknorm_recompute"] = _qkr.qknorm_recompute_stats()
+    except Exception:
+        pass
+    try:
+        from asym_gemm.training import activation_offload as _ao
+
+        out["restage_gap"] = _ao.restage_gap_stats()
+    except Exception:
+        pass
+    try:
+        from asym_gemm.training import qwen3_moe_finegrained as _fg
+
+        out["direct_reuse"] = _fg.direct_reuse_stats()
+    except Exception:
+        pass
+    return out
 
 
 def _asym_nvme_summary_from_model() -> dict[str, Any]:
@@ -1583,6 +1676,70 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
                 raise RuntimeError(f"S2a queued-launch claim validation failed: {report}")
             if report.get("launches"):
                 heartbeat.emit("ep2_queue_claims", **report)
+        # 2026-07-30 (fix_plot_placeholders.md §6): AsymCPUAdamW grad-offload support.
+        # With ASYM_EP2_GRAD_OFFLOAD=true the backward hooks have ALREADY moved every
+        # trainable grad into the optimizer's pinned fp32 flat buffer and nulled
+        # param.grad — the GPU flat reduce below would average ZEROS while the CPU
+        # optimizer steps unreduced local grads (silent rank divergence: the exact
+        # hazard the driver's forced-false guarded against). The correct reduce walks
+        # the CPU flat buffer instead: drain in-flight D2H copies, zero the stale
+        # regions (params with no local grad this step — same semantics as the GPU
+        # path's zeros materialization), then chunked H2D -> all_reduce -> mean ->
+        # D2H through one small persistent GPU staging buffer, and mark every
+        # mapping reduced so BOTH ranks step identical averaged grads (fp32 masters
+        # stay in lockstep; no param sync needed — same invariant as the GPU path).
+        cpuadamw = None
+        _seen_opts: set = set()
+        _node = getattr(trainer, "optimizer", None)
+        while _node is not None and id(_node) not in _seen_opts:
+            _seen_opts.add(id(_node))
+            if hasattr(_node, "_mappings") and getattr(_node, "grad_offload", False):
+                cpuadamw = _node
+                break
+            _node = getattr(_node, "optimizer", None)
+        if cpuadamw is not None:
+            if not getattr(trainer, "_ep2_cpu_reduce_checked", False):
+                trainer._ep2_cpu_reduce_checked = True
+                for _pname, _p in model.named_parameters():
+                    if _p.requires_grad and getattr(_p, "_asym_ep_owner_scaled", False):
+                        raise RuntimeError(
+                            "EP2 CPU-grad reduce does not support owner-scaled (vanilla EP) "
+                            f"params; got {_pname} — run vanilla EP with grad offload OFF")
+            cpuadamw._drain_grad_offload_copies()
+            flat = cpuadamw._ensure_grad_offload_flat_buffer()
+            for mapping in cpuadamw._mappings:
+                if not mapping.grad_buffer_has_data and mapping.grad_buffer is not None:
+                    mapping.grad_buffer.zero_()
+            stage = getattr(trainer, "_ep2_cpu_reduce_stage", None)
+            if stage is None:
+                bucket_mb = int(os.environ.get("ASYM_EP2_CPU_REDUCE_BUCKET_MB", "1024") or "1024")
+                stage_numel = max(1, min(int(flat.numel()), bucket_mb * (1 << 20) // 4))
+                stage = torch.empty(stage_numel, dtype=torch.float32, device=torch.device("cuda", torch.cuda.current_device()))
+                trainer._ep2_cpu_reduce_stage = stage
+                heartbeat.emit(
+                    "ep2_cpu_grad_reduce_built",
+                    flat_numel=int(flat.numel()),
+                    stage_numel=int(stage_numel),
+                    stage_mib=round(stage_numel * 4 / (1 << 20), 1),
+                )
+            world = dist.get_world_size()
+            offset, total_numel = 0, int(flat.numel())
+            while offset < total_numel:
+                span = min(int(stage.numel()), total_numel - offset)
+                gpu_view = stage.narrow(0, 0, span)
+                cpu_view = flat.narrow(0, offset, span)
+                gpu_view.copy_(cpu_view, non_blocking=False)
+                dist.all_reduce(gpu_view)
+                gpu_view.div_(world)
+                cpu_view.copy_(gpu_view, non_blocking=False)
+                offset += span
+            for mapping in cpuadamw._mappings:
+                mapping.grad_buffer_has_data = True
+                mapping.last_had_grad = True
+                mapping.cpu_param.grad = mapping.grad_buffer
+            _emit_update_probe(trainer)
+            return
+
         state = getattr(trainer, "_ep2_state", None)
         if state is None:
             groups: dict = {}
@@ -2627,7 +2784,8 @@ def _activation_transfer_weight(stats: dict[str, Any]) -> int:
 
 def _activation_source_context_key(row: dict[str, Any]) -> str:
     source = str(row.get("profile_prefix") or row.get("name") or "")
-    for leaf in ("q_proj", "k_proj", "v_proj", "o_proj"):
+    for leaf in ("q_proj", "k_proj", "v_proj", "o_proj",
+                 "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"):
         suffix = f".{leaf}"
         if source.endswith(suffix):
             return source[: -len(suffix)]
@@ -3411,6 +3569,8 @@ class LFProfileRecorder:
             "kt": kt,
             "activation_offload": activation_offload,
             "asym_nvme": _asym_nvme_summary_from_model(),
+            "cpu_worker_jobs": _cpu_worker_jobs_snapshot(),
+            "placement_policy": _placement_policy_snapshot(),
             "asym_execution_stats": asym_execution_stats,
             "asym_liger_lm_head_bridge": asym_liger_lm_head_bridge,
             "grad_clip": _GRAD_CLIP_MARKER,

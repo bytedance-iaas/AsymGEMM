@@ -1,0 +1,2153 @@
+No Buffer, No Bottleneck: Efficient Zero-Copy KV
+Cache Offloading for Long-Context LLMs
+Shutian Luo and Haiying Shen,
+University of Virginia
+https://www.usenix.org/conference/osdi26/presentation/luo
+This paper is included in the Proceedings of the 20th USENIX
+Symposium on Operating Systems Design and Implementation.
+July 1315, 2026  Seattle, WA, USA
+ISBN 978-1-939133-55-7
+Open access to the Proceedings of the 20th USENIX Symposium on
+Operating Systems Design and Implementation is sponsored by
+No Buffer, No Bottleneck: Efcient Zero-Copy KV Cache Ofoading for
+Long-Context LLMs
+Shutian Luo Haiying Shen
+Department of Computer Science, University of Virginia
+Abstract Long-context large language models (LLMs) store computed attention key and value (KV) 
+matrices from previous decod- ing steps to avoid full-sequence recomputation. While this reuse 
+reduces computation, the KV cache grows linearly with sequence length, exerting signicant pressure 
+on GPU mem- ory capacity. Existing ofoading stores KV blocks in CPU memory but requires extra GPU 
+buffers, wasting GPU mem- ory and doubling CPUGPU transfers, which creates capacity and bandwidth 
+bottlenecks. We present DirectKV, to our knowledge, the rst zero- copy KV cache ofoading system for 
+modern heterogeneous CPUGPU platforms such as NVIDIA GH200/GB200 with high-bandwidth NVLink-C2C 
+interconnects. By leveraging NVLink-C2C instead of PCIe, DirectKV makes CPU mem- ory a practical 
+extension of GPU KV-cache capacity during long-context inference. DirectKV eliminates the GPU 
+staging buffer (no buffer) by enabling GPU kernels to directly access CPU-resident KV cache, and 
+substantially reduces the CPU GPU data-movement bottleneck (no bottleneck) through CPU- 
+memory-aware CUDA kernels tailored for heterogeneous CPUGPU platforms. It further fuses KV 
+generation with at- tention computation into a single CUDA kernel and employs warp-level pipelining 
+to overlap KV fetching, computation, and write-back, thereby hiding stalls caused by CPU memory 
+access. On GH200, DirectKV reduces CPUGPU transfer volume by up to 50%, cuts GPU memory usage by 
+43%, and improves end-to-end performance by up to 1
+:
+2
+ compared to existing solutions.
+1 IntroductionLarge language models (LLMs) with long-context capabilitiesunderpin applications such 
+as multi-turn dialogue, in-contextlearning, and long-horizon code generation [18, 35, 50, 51].To 
+sustain throughput, modern inference engines maintain akeyvalue (KV) cachethat stores previously 
+computed K / Vtensors [37]. During attention, each new query Q must at- tend to all prior K and V 
+entries; caching avoids recompu- tation and reduces compute cost from quadratic to linear in 
+sequence length. However, this efciency comes at the ex- pense of memory: KV cache size grows 
+linearly with both sequence length and model dimension. For billion-parameter LLMs with 128K 
+tokens, the cache alone can demand hun- dreds of gigabytes [28], far exceeding high-bandwidth GPU 
+memory (HBM) capacity. To address this issue, existing systems explore several CPU ofoading 
+strategies. Swap-based approaches [46, 53  55] place KV blocks in CPU memory (or SSD) and use large 
+GPU staging buffers to overlap transfers with computation. Other systems store KV in remote or 
+disaggregated memory and fetch it on demand [39,42], but still follow a swap-like model in which 
+storage and computation are separated: KV must be staged into GPU memory before attention. 
+Crucially, all of these designs still stage KV cache into GPU memory along the critical path and 
+depend on extra GPU-resident buffers during attention computation, because their attention kernels 
+assume that all operands (including KV) reside in HBM. A third line of work partially ofoads 
+attention com- putation and KV cache to CPUs [27, 34, 41, 57], or moves the entire attention 
+computation onto CPUs to avoid repeated PCIe transfers [31], but in doing so sacrices the full 
+compute capability of the GPU. In short, none of these systems strikes the ideal balance of using 
+CPU memory as low-cost KV storage without additional HBM-resident KV buffers while fully exploiting 
+GPU compute for high-performance attention . They remain fundamentally limited by the large 
+bandwidth gap between CPUGPU in- terconnects (4060 GB/s over PCIe) and HBM (34 TB/s), which leaves 
+GPU compute units underutilized and exacer- bates the GPU memory wall [30]. Recent CPUGPU 
+superchips such as NVIDIA GH200 and GB200 [14,15] provide up to 900 GB/s bidirectional band- width 
+via NVLink-C2C7  higher than PCIe Gen5 [16]. This creates new opportunities for efcient KV cache 
+ofoad- ing. However, existing systems such as Pie [53] still depend on staging buffers in HBM, 
+consuming scarce GPU memory
+USENIX Association
+20th USENIX Symposium on Operating Systems Design and Implementation    39
+and preventing full exploitation of this capability. A more promising direction is zero-copy , 
+where GPU ker- nels directly access CPU-resident KV tensors [2, 4]. Zero- copy eliminates staging 
+buffers and reduces HBM usage, but naive application performs poorly: matrix multiplication ker- 
+nels are tuned for HBM-resident tensors, so repeatedly fetch- ing operands from CPU memory exposes 
+the bandwidth gap and further lowers GPU L2 hit rate. Our measurements show that nave zero-copy can 
+be over 20
+ slower on PCIe and still 2
+
+slower on NVLink-C2C (see  2.3). Our key observation is that shared memory (SMEM) within each 
+streaming multiprocessor (SM) can be leveraged to make zero-copy practical. Acting as a fast 
+on-chip buffer, SMEM enables exible tiling strategies that restructure data access in matrix 
+multiplication. By tiling through SMEM, we shift bandwidth pressure from the CPUGPU intercon- nect 
+to HBM, fully exploiting NVLink-C2C while maintain- ing GPU compute efciency. This makes near-HBM 
+perfor- mance achievable without staging buffers, moving closer to the ideal design: CPU memory for 
+cheap storage, GPU for high-performance computation
+. Building on this insight, we propose DirectKV, to our knowledge the rst efcient zero-copy KV 
+cache ofoad- ing system for NVIDIA GH200 Superchips. DirectKV targets long-context, 
+latency-sensitive decoding workloads that re- quire large effective batch sizes under tight GPU 
+memory bud- gets. To relieve GPU memory pressure and fully exploit host DRAM, DirectKV centers on a 
+CPU-memory-aware tiling strategy for matrix multiplication that deliberately shifts band- width 
+demand from the CPUGPU interconnect to HBM, us- ing shared memory to stream CPU-resident tensors 
+efciently and reuse them across tiles. This design allows zero-copy access to CPU-resident KV to 
+approach HBM-resident per- formance without relying on GPU staging buffers. Beyond optimized 
+tiling, DirectKV integrates two com- plementary techniques: (i) ne-grained warp-level pipelining 
+that overlaps data transfer with computation, and (ii) kernel fusion of KV projection and attention 
+that keeps K / V tensors in SMEM rather than round-tripping them through CPU mem- ory. Together, 
+these optimizations eliminate redundant KV transfers, hide interconnect latency, conserve HBM 
+capacity, and deliver high throughput. We build DirectKV 1 on FlashAttention-3 [44], but fun- 
+damentally extend it from GPU-resident execution to het- erogeneous CPUGPU settings on GH200, where 
+intercon- nect bottlenecks emerge as the key challenge. Compared to prior ofoading approaches [34, 
+46, 53], DirectKV reducesCPUGPU transfer volume by up to 50%, lowers GPU mem-ory usage by 43%, and 
+improves end-to-end performance byup to 1
+:
+2
+
+, all while maintaining full attention accuracy.
+In summary, this paper makes the following contributions:
+A new design for KV cache ofoading. We propose Di-
+1
+Source code: https://github.com/shutianluo/DirectKV. rectKV , to our knowledge the rst zero-copy 
+ofoading system for NVIDIA superchips. DirectKV eliminates staging buffers (no buffer) and 
+substantially reduces the dominant CPUGPU data-movement bottleneck (no bot- tleneck).
+ Kernelmemory co-design. We identify why nave zero- copy underperformsrepeated CPU-memory fetches 
+and poor L2 localityand introduce three optimizations: (i) CPU-memory-aware tiling to shift the 
+bottleneck to HBM, (ii) warp-level pipelining to overlap transfer and compute, and (iii) kernel 
+fusion to eliminate redundant KV refetching.
+2 Background and Motivations
+2.1 Attention Module in LLM Inference LLM inference consists of multiple Transformer blocks, each 
+containing an attention mechanism followed by a feed- forward network [28,50,51,56]. The input to a 
+Transformer block is a tensor X
+2
+R
+N
+
+D , where N is the number of tokens and D is the model dimension. The attention module projects X 
+into three matrices: query ( Q ), key ( K ), and value ( V ), using separate weight matrices
+W
+Q
+,
+W
+K
+, and
+W
+V
+:
+Q
+;
+K
+;
+V
+=
+XW
+Q
+;
+XW
+K
+;
+XW
+V
+;
+W
+Q
+;
+W
+K
+;
+W
+V
+2
+R
+D
+
+d
+k
+: For multi-head attention [45], Q , K , and V are reshaped into R
+H
+
+N
+
+d , where H is the number of heads and d
+=
+D
+=
+H is the per-head dimension. A common variant is grouped-query attention (GQA) [20], where multiple 
+query heads share the same key and value heads to improve efciency. For LLM models that incorporate 
+rotary positional embed- dings (e.g., LLaMA [28,50]), the queries and keys are further augmented 
+with
+rotary transformations
+:
+
+Q
+;
+
+K
+=
+RoPE
+(
+Q
+;
+K
+)
+; where RoPE applies position-dependent rotations in the query/key space to encode relative 
+positional information. In contrast, other models (e.g., OPT [56]) omit this step and rely on 
+alternative positional encodings. Finally, for each head, the scaled dot-product attention is 
+computed as:
+Attention
+(
+Q
+;
+K
+;
+V
+) =
+softmax
+
+QK
+>
+p
+d
+
+V
+: LLM inference proceeds in two phases [59]: the prell phase, where the full input sequence is 
+processed in parallel to initialize the KV cache, and the decode phase, where tokens are generated 
+autoregressively, each new query attending to all cached
+K
+/
+V
+.
+40    20th USENIX Symposium on Operating Systems Design and Implementation
+USENIX Association
+Figure 1: KV cache ofoading via swapping and zero copy.
+2.2 KV Cache Ofoading During autoregressive inference, the KV cache stores K and V tensors from 
+prior decoding steps, reducing attention cost from quadratic to linear in sequence length. Yet the 
+cache grows linearly with context length and model dimension, quickly exhausting GPU memory. 
+Existing systems ofoad KV blocks to CPU memory through HBM staging buffers.
+2.2.1 Swap-based KV Cache Ofoading As shown by the red path in Fig. 1, KV blocks are stored in CPU 
+memory and are copied to GPU memory before use via a GPU copy engine [13]. To reduce stalls, 
+systems overlap these transfers with computation. However, PCIe bandwidth (64 GB/s) is far lower 
+than HBM bandwidth (4 TB/s), making data movement a bottleneck. To hide transfer latency, a large 
+GPU buffer is required, wasting valuable GPU memory. Even then, poor prefetch coordination can 
+still cause GPU stalls. Moreover, swap-based designs perform layer-by-layer swap- in and swap-out 
+of KV blocks, doubling interconnect trafc and further constraining scalability. Swap-based ofoading 
+can prevent CUDA Graphs from being replayed unchanged. CUDA Graphs reduce per-token launch overhead 
+by capturing and replaying a xed sequence of GPU operations. However, swap-based KV ofoading in- 
+troduces explicit cudaMemcpyAsync [17] operations for KV swap-in/out, whose addresses vary across 
+decoding steps as different KV blocks are selected. These dynamic transfer ad- dresses can force 
+graph updates or re-capture, reducing the benets of CUDA Graphs in practical serving systems.
+2.2.2 Zero-Copy KV Cache Ofoading As shown by the green path in Fig. 1, zero-copy KV cache ofoading 
+[4] allows GPU kernels to directly access CPU-resident KV blocks. This eliminates explicit 
+transfers andHBM staging buffers. Once KV blocks are device-accessible,the attention kernel can 
+fetch them directly and use asyn-chronous tiled data movement to bring KV tiles into SMEMfor 
+computation.Compared with swap-based ofoading, zero-copy is bet-ter suited for CUDA Graph 
+execution. Because KV blocks
+(a) Latency comparison.
+(b) Memory usage. Figure 2: Comparison among three mechanisms for matrix multiplication. are loaded 
+inside the attention kernel rather than through ex- plicit memory-copy operations, dynamic KV-block 
+selection changes only the kernel inputs or internal address resolution, not the captured graph 
+topology. This allows the graph to be replayed without per-step updates or re-capture. The 
+effectiveness of zero-copy primarily depends on CPU GPU bandwidth rather than access latency. 
+KV-cache access in long-context attention is naturally coarse-grained: each SM fetches KV tiles of 
+around 100 KB, aligned with its SMEM capacity, and more than 100 SMs can fetch such tiles con- 
+currently. This creates MB-scale aggregate data movement from CPU memory to the GPU. In this 
+regime, sustained CPUGPU bandwidth becomes the dominant bottleneck. Re- cent CPUGPU platforms such 
+as NVIDIA GH200 make this direction practical with NVLink-C2C, which provides up to 900 GB/s 
+bidirectional bandwidth and allows CPU memory to act as an effective extension of GPU KV-cache 
+capacity.
+2.3 Challenges in KV Cache Ofoading Even with NVLink-C2C, a signicant bandwidth gap remains between 
+the CPUGPU interconnect (900 GB/s bidirectional) and HBM bandwidth (4 TB/s). In the GEMM case 
+study, re- peated operand reuse across the O
+(
+n
+3
+) computation amplies remote-memory trafc. In attention, a similar effect appears when CPU-resident 
+KV tiles are repeatedly fetched across query, head, and batch dimensions. To illustrate this 
+challenge, we conduct a case study com- paring swap-based and zero-copy KV cache ofoading using a 
+matrix multiplication benchmark, C
+=
+A
+
+B , where A , B , and C are square matrices of size n
+
+n ( n
+=
+10240 , each 400 MB). We evaluate three congurations: (i) Baseline , where both A and B reside 
+entirely in GPU memory; (ii) Swap , where a 200 MB GPU buffer is allocated to temporarily store 
+portions of B transferred from CPU memory via PCIe or NVLink-C2C during multiplication; and (iii) 
+Zero-Copy , where B resides entirely in CPU memory and is accessed directly by the GPU over PCIe or 
+NVLink-C2C without intermediate buffering. Experiments are conducted on two hardware platforms: an 
+NVIDIA H100 connected to the host via PCIe and an NVIDIA GH200, where an H100 GPU is tightly 
+coupled to a Grace
+USENIX Association
+20th USENIX Symposium on Operating Systems Design and Implementation    41
+Figure 3: Data fetching and L2 cache hit rate.
+CPU via NVLink-C2C. Zero-Copy saves GPU memory but still incurs performance penalties. As shown in 
+Fig. 2(a), the Swap conguration adds less than 10% overhead on PCIe and about 5% on NVLink- C2C due 
+to asynchronous data transfer. In contrast, Zero-Copy incurs over a 20
+ slowdown on PCIe (1122 ms vs. 56 ms) and a 2
+ slowdown on NVLink-C2C (106 ms vs. 52 ms). This penalty arises because Zero-Copy repeatedly 
+fetches B from CPU memory throughout the O
+(
+n
+3
+) computation, fully expos- ing the bandwidth gap between CPUGPU interconnects and HBM. While 
+costly in performance, Zero-Copy eliminates the need for a large GPU buffer, reducing memory usage 
+by 50% compared to Baseline and by 33% compared to Swap , as shown in Fig. 2(b). Zero-Copy further 
+reduces GPU L2 cache efciency. To quantify this effect, we measure data trafc and L2 hit rate on 
+GH200 (Fig. 3). Baseline and Swap perform similarly since both A and B reside in GPU memory, 
+achieving high L2 hit rates (  77%) and 21.1 GB of HBM-to-L2 trafcwell above the matrix size due to 
+repeated accesses in the O
+(
+n
+3
+) compu- tation. In contrast, Zero-Copy suffers frequent stalls because CPUGPU transfers (900 GB/s, 
+450 GB/s per direction) are much slower than HBM-to-L2 transfers (4 TB/s), increasing CPU-to-GPU 
+trafc to 22.7 GB while reducing the L2 hit rate to 32.3%a 58% drop compared to Baseline / Swap . 
+This shows that reduced cache locality, in addition to limited band- width, compounds the 
+performance gap of nave zero-copy ofoading.
+2.4 Opportunity: Kernel-memory Co-Design GPU kernels support exible data access patterns, enabling 
+customized CUDA implementations that can optimize zero- copy KV cache access from CPU memory. This 
+exibility cre- ates opportunities to mitigate the challenges discussed above. In particular, we 
+focus on two key techniques  tiling and warp-level pipelining  to improve data locality, reduce 
+re-dundant transfers, and better exploit the available CPUGPUbandwidth.
+2.4.1 Tiling Technology for Asymmetric BandwidthTo better understand optimization opportunities, we 
+revisit ma-trix multiplication with a focus on tiling technology . Modern
+Figure 4: Data movement breakdown across three matrix multiplication strategies. GPUs have much 
+smaller cache capacity than global mem- ory but provide high-bandwidth shared memory within each 
+streaming multiprocessor (SM). CUDA kernels can explicitly control shared memory usage, enabling 
+computation to be or- ganized in tiles : small submatrices of A and B are fetched from global 
+memory into shared memory, multiplied to produce a partial tile of C , and the partial results are 
+accumulated in shared memory before writing the nal output to global mem- ory. This tiling 
+mechanism reduces global memory accesses and provides exibility to redesign the computation pattern 
+for cases where one input matrix resides in CPU memory. Figure 4 shows the baseline access pattern. 
+In Baseline (both A and B in GPU memory), the bottleneck is fetching A and B from GPU memory to L2 
+cache, each at 10.6 GB, while writing only 0.4 GB of C back to GPU memory. CUTLASS- based matrix 
+multiplication iterates over tiles of A and B inde- pendently to compute each tile of C , with no 
+data dependency between tiles. However, in Zero-Copy , where B resides in CPU memory, the 
+asymmetric bandwidth between NVLink- C2C (900 GB/s, 450 GB/s per direction) and HBM (4 TB/s) causes 
+the data fetched from CPU memory to be amplied by repeated accesses, reaching 33.5 GBover 3
+ the original tile sizemaking CPU-to-GPU transfers the bottleneck. To address this, we develop a 
+CPU-memory-aware tiling strategy for matrix multiplication (details in  5.1). The key idea is to 
+shift bandwidth pressure away from the CPUGPU interconnect onto on-device HBM. Instead of iterating 
+over tiles of A and B , our optimized kernel iterates over tiles of A and C , while keeping the 
+current B tile resident in SM shared memory. This reduces CPU-to-GPU trafc for B from 33.5 GB to 
+just 0.4 GB, directly attacking the main bottle- neck, since HBM bandwidth is roughly an order of 
+magnitude higher than CPUGPU interconnect bandwidth. The trade- off is that C must now be read from 
+and written to HBM more frequently for accumulation, increasing HBM trafc by about 2  (from 33.5 GB 
+over the CPUGPU interconnect to 61.8 GB + 33.9 GB in HBM). However, this extra load can be absorbed 
+by HBM's higher bandwidth while substantially relieving the CPUGPU bottleneck. As shown in Fig. 5, 
+this optimization reduces latency from 106 ms to 54 ms (a 49% performance improvement) and 
+increases the L2 cache hit
+42    20th USENIX Symposium on Operating Systems Design and Implementation
+USENIX Association
+Figure 5: Performance and GPU L2 cache hit rate across three matrix multiplication strategies.
+rate from 32.3% to 75.1%. Takeaway: By leveraging tiling, we can design a CPU- memory-aware 
+Zero-Copy scheme that accommodates asym- metric bandwidth. Iterating over GPU-resident matrices 
+rather than CPU-resident ones shifts bandwidth demand to HBM, fully exploiting its capacity and 
+improving L2 cache efciency for signicantly better performance.
+2.4.2 Warp-Level Pipelining for Communication and Computation Overlapping Modern GPUs such as 
+NVIDIA's Hopper architecture (H100/GH200) support multiple warp groups within a thread block that 
+can execute distinct tasks concurrently. This capa- bility enables warp-level pipelining , where 
+different warps overlap communication (data fetching) and computation (ma- trix multiplication) to 
+hide memory latency ( 5). To quantify its impact, we compare matrix multiplication with and without 
+pipeline fetching. In the baseline (no over- lap), the kernel fetches one tile at a time, 
+synchronizes all threads, performs computation, and then repeats. In contrast, pipeline fetching 
+allows the SM to prefetch the next tile while simultaneously computing on the current tile. As 
+shown in Fig. 6, both approaches transfer nearly identical data volumes. However, warp-level 
+pipelining sustains 4.3  higher HBM throughput (1.3 TB/s vs. 0.3 TB/s) and reduces latency by 11% 
+(48 ms vs. 54 ms), demonstrating effective communica- tioncomputation overlap. Takeaway: Warp-level 
+pipelining effectively hides memory latency by overlapping data transfer and computation, yield- 
+ing signicantly higher throughput and lower latency without increasing data movement.
+2.4.3 Fused Kernel for High ThroughputIn conventional implementations, projection and 
+attentionscore computation are launched as separate CUDA kernels.This separation forces the K and V 
+tensors generated by theprojection kernel to be written back to CPU memory (to up-date the KV 
+cache) and then re-read by the attention kernel creating redundant CPUGPU transfers and 
+exacerbating thebandwidth gap between NVLink-C2C (900GB/s aggregate,
+(a) Data fetching & HBM throughput.
+(b) Performance. Figure 6: Data fetching and performance under baseline (no overlap) vs. warp-level 
+overlap.
+(a) Data fetching & HBM throughput.
+(b) Performance. Figure 7: Data fetching and performance under separate ker- nel vs. fused kernel. 
+Hatched bars (bottom) denote the rst kernel. 450GB/s per direction) and HBM (4 TB/s per direction). 
+This motivates us to fuse the projection and attention score compu- tation into a single CUDA 
+kernel to improve the throughput of data transfer (details in  5.3 and  5.4). We evaluate this idea 
+using a simplied case study. Speci- cally, the rst kernel generates K via a matrix multiplication K
+=
+XW
+k and the second kernel consumes K for another ma- trix multiplication P
+=
+QK
+> . Rather than separate it into different kernels, we fuse them into one kernel using two stages. 
+The rst stage fetches X and W
+k from HBM, generates K in registers, and writes the newly generated K back to CPU memory for 
+KV-cache updates. The second stage immedi- ately consumes K for QK
+> score computation. The tensor X , W
+k and Q reside in the SMEM. This design breaks the strict readwrite dependency in traditional 
+Zero-Copy , minimizes stalls, and increases effective throughput utilization. As shown in Fig.7(a), 
+the separate-kernel design transfers a similar amount of data as the fused kernel but sustains 
+15.8% lower HBM throughput due to redundant writes of K back to CPU memory and the subsequent 
+re-fetching in the next kernel. In contrast, the fused kernel eliminates these redun- dant 
+transfers, achieving 1.9TB/s throughput. This directly translates to performance gains: latency 
+drops from 85ms to 57 ms, a 49% speedup as shown in Fig.7(b), by improving memory locality and 
+bandwidth utilization. Takeaway: Kernel fusion eliminates redundant memory transfers and improves 
+data locality, further delivering higher throughput and performance.
+USENIX Association
+20th USENIX Symposium on Operating Systems Design and Implementation    43
+Figure 8: The system architecture of DirectKV.
+3 Overview of DirectKV Architecture This section outlines the overall architecture of DirectKV, a 
+KV cache decoding system for LLM serving by reducing GPU memory pressure and improving runtime 
+efciency. Di- rectKV integrates zero-copy KV cache ofoading with fused projection-attention kernels 
+, dynamically adapting to input precision and execution phases (prell or decode) as shown in Fig. 
+8. Both phases utilize a shared kernel execution frame- work that includes the following core 
+components: The Kernel Generator  compiles a rich set of CUDA ker- nel candidates ofine, 
+specialized for different tensor preci- sions (e.g., FP16, BF16), tiling congurations, and 
+execution modes (prell vs. decode). It serves as an ofine repository, ensuring that optimized 
+kernels are pre-built and ready for runtime dispatch. The Kernel Adaptor  dynamically selects an 
+appropriate CUDA kernel at runtime based on tensor precision (e.g., FP16, BF16), head dimension, 
+and current execution phase (multi- token prell vs. single-token decode). It allows the system to 
+exibly dispatch to optimized implementations without manual intervention or recompilation. The 
+Attention Fusion Engine  fuses K/V projection and attention computation into a single CUDA launch 
+to eliminate redundant KV cache transfers. It leverages shared memory within the SM and warp-level 
+programming to overlap KV cache transfer with attention score computation.TheKV Cache Manager  
+stores the key and value ten-sors in host-pinned memory using zero-copy access. Ratherthan using 
+explicit cudaMemcpyAsync to move KV tensorsbetween host and device, we utilize pinned memory to 
+allowdirect GPU access to host-resident tensors within SM. Thisdesign avoids redundant transfers 
+and supports long-sequenceinference without increasing GPU memory usage.
+4 Kernel Generation and Adaptation Typically, CUDA requires kernel specialization for input pre- 
+cision and tiling to fully exploit hardware, so multiple kernels must be compiled ofine and 
+selected at runtime. Accordingly, DirectKV introduces a Kernel Generator to generate candi- date 
+kernels ofine and Kernel Adaptor a runtime component that chooses the most efcient kernel online.
+4.1 SMEM Partitioning and Reuse In DirectKV, SMEM serves as the on-chip buffer for matrix 
+multiplications in the attention module. Its limited capacity is a primary hardware constraint that 
+directly shapes kernel design. To balance projection and attention workloads, the SMEM within each 
+SM is logically divided into two regions: 1. Projection buffers: used to store tiles of the input X 
+and projection weights
+W
+k
+and
+W
+v
+during KV projection.
+2. Attention buffers: used to store intermediate K , V , the query Q , and the output O during 
+attention computation. To alleviate SMEM pressure, DirectKV overlaps the usage of these two 
+regions. Specically, K reuses the buffer origi- nally allocated for W
+k , and V reuses the buffer allocated for W
+v . Phase-specic optimizations further reduce demand: in the decode phase, O is written directly 
+from registers to HBM (see  5.3), while in the prell phase, O reuses the buffer allocated for W
+v in shared memory (see  5.4). This partition- and-reuse strategy maximizes SMEM utilization and 
+enables larger tiles under xed hardware limits. By default, DirectKV adopts two pipeline stages to 
+overlap computation and communication at the warp level, which doubles the buffering requirement. 
+Since SMEM is carved from the unied L1/SMEM pool (e.g., 256 KB on GH200) [7], we conservatively 
+reserve a fraction a (80% by default) for SMEM and leave the remainder to L1 cache. The SMEM 
+allocation must therefore satisfy:
+a
+
+P
+
+3
+
+m
+
+size(T)
+
+(
+Dim
+
+N
+)
+;
+(1) where P is the total L1/SMEM pool size, the factor 3 accounts for buffering three tensors in 
+projection and attention, m is the number of pipeline stages (2 by default), T is the tensor data 
+type with size
+(
+T
+) denoting its element size in bytes, Dim
+is the KV head dimension, and
+N
+is the tile size. Given a specic conguration <T, Dim, N> , we compute the maximum feasible N that 
+satises this constraint. These valid congurations are collected into a candidate set that guides 
+kernel pre-building.
+4.2 Ofine Kernel Pre-Building From this candidate set, the Kernel Generator pre-compiles fused 
+kernels (details in  5) using C++ template instantia- tions. Listing 1 illustrates the prell 
+kernel; the decode kernel
+44    20th USENIX Symposium on Operating Systems Design and Implementation
+USENIX Association
+Listing 1: Ofine Kernel Pre-building using C++ Templates. template
+<
+typename
+T,
+int
+Dim,
+int
+N>
+__global__
+void
+prefill_kernel(
+T* X,
+const
+T* Wq,
+const
+T* Wk,
+const
+T* Wv, T* Q, T* O,
+int
+seq_len);
+// Offline instantiations
+template
+__global__
+void
+prefill_kernel<
+int
+, 128,
+64>(...);
+template
+__global__
+void
+prefill_kernel<
+float
+, 64,
+64>(...); is constructed analogously but specialized for its execution phase. Template syntax 
+allows kernels to be specialized at compile time with respect to <T, Dim, N> , ensuring each 
+variant is fully optimized by the compiler while avoiding run- time code generation overhead. This 
+approach also keeps the codebase maintainable, as the same kernel logic can be reused across 
+multiple congurations. All such instantiations are compiled ofine into a candidate pool of fused 
+kernels.
+4.3 Online Kernel Choosing At runtime, the Kernel Adaptor selects the most suitable ker- nel for 
+the current phase ( prell or decode ) by matching the requested <T, Dim, N> conguration to the 
+closest available instantiation in the candidate pool. This process is lightweight, as it only 
+requires substituting the template parameters with the pre-compiled kernels. As a result, DirectKV 
+can dynami- cally adapt to workload characteristics while guaranteeing that each kernel execution 
+leverages a carefully tuned, hardware- efcient implementation.
+5 KernelMemory Co-Design Attention We design the CUDA kernel to fully exploit tiling and warp- 
+level programming , adapting the data access pattern to ef- ciently support zero-copy KV cache 
+ofoading. In this section, we detail how these techniques enable a high-performance fused kernel 
+tailored for tightly coupled CPUGPU superchip architectures.
+5.1 CPU-Memory Aware Matrix Multiplica- tion To exploit HBM bandwidth and relieve pressure on the 
+CPU GPU interconnect, our key idea is to shift data-fetching over-head from host to device memory. 
+This requires rethinkingmatrix multiplication access patterns, which conventionallyassume all 
+operands reside in GPU memory. Tiling tech-niques [5,26] offer a natural solution: by decomposing 
+largematrices into smaller submatrices (tiles) that t within SMEM,CUDA kernels can exibly control 
+data movement, maximizereuse and minimize redundant accesses. Building on this, we
+Algorithm 1: Tiled data-fetching patterns for matrix multiplication (Native vs. CPU-aware).
+1
+Procedure
+NativeTiling
+(
+A
+2
+R
+M
+
+K
+, B
+2
+R
+K
+
+N
+, C
+2
+R
+M
+
+N
+)
+:
+2
+Initialize
+C
+i
+;
+j
+;
+3
+for
+k
+1
+to
+T
+K
+do
+4
+Load
+A
+i
+;
+k
+;
+/* HBM
+!
+SMEM */
+5
+Load
+B
+k
+;
+j
+;
+/* HBM
+!
+SMEM */
+6
+C
+i
+;
+j
+C
+i
+;
+j
++
+A
+i
+;
+k
+
+B
+k
+;
+j
+;
+/* reuse stationary
+C
+*/
+7
+Store
+C
+i
+;
+j
+;
+/* registers/SMEM
+!
+HBM */
+8 Procedure CpuAwareTiling
+(
+A
+2
+R
+M
+
+K , B
+2
+R
+K
+
+N , C
+2
+R
+M
+
+N
+) :
+9
+Load
+B
+k
+;
+j
+;
+/* CPU Memory
+!
+SMEM (zero copy) */
+10
+for
+i
+1
+to
+T
+M
+do
+11
+Load
+A
+i
+;
+k
+;
+/* HBM
+!
+SMEM */
+12
+Load
+C
+i
+;
+j
+;
+/* HBM
+!
+SMEM */
+13
+C
+i
+;
+j
+C
+i
+;
+j
++
+A
+i
+;
+k
+
+B
+k
+;
+j
+;
+/* reuse stationary
+B
+*/
+14
+Store
+C
+i
+;
+j
+;
+/* registers/SMEM
+!
+HBM */
+design a CPU-memory aware tiling strategy that reuses CPU- fetched tiles efciently while leveraging 
+HBM's bandwidth for repeated accesses. We use a matrix multiplication kernel C
+=
+A
+
+B to il- lustrate the distinction between conventional tiling and our CPU-aware tiling as shown in 
+Algorithm 1. The key differ- ence lies in which operand is reused and, consequently, where the 
+bandwidth pressure is concentrated within the memory hierarchy. In NativeTiling (Step 1), both A 
+and B tiles are re- peatedly fetched from GPU HBM into shared memory, while C remains stationary in 
+registers or SMEM until the nal write-back. This design is efcient when all operands reside in GPU 
+memory but requires frequent HBM accesses for both A and B . In particular, each multiplication 
+step reloads B tiles for every (
+i
+;
+j
+;
+k
+) triple, so the data movement on B scales with the O
+(
+n
+3
+) computation. In contrast, CpuAwareTiling (Step 8) adapts to zero-copy ofoading by treating B as 
+stationary: each B tile is fetched once per (
+k
+;
+j
+) pair and reused across all i , reducing the trafc from O
+(
+n
+3
+) to O
+(
+n
+2
+) . The trade-off is that C must be reloaded and updated from HBM at every step, increasing its 
+trafc cost from 2
+
+O
+(
+n
+3
+) in NativeTiling to 3
+
+O
+(
+n
+3
+) in CpuAwareTiling . This design shifts bandwidth de- mand away from the constrained CPUGPU 
+interconnect and onto HBM, where the additional overhead can be efciently absorbed. This trade-off 
+directly inuences the design of attention score computation. Since SMEM is insufcient to hold all 
+tensors, there are two possible iteration strategies: (i) iterate over Q for each (
+K
+;
+V
+) pair, or (ii) iterate over (
+K
+;
+V
+) for a given Q . In our design, we adopt the rst strategy during the prell phase ( 5.3), where the 
+KV cache resides in CPU memory and is expensive to reload, making it preferable to iterate over Q 
+stored in HBM. This scheme corresponds to CpuAwareTiling . In contrast, during the decode phase ( 
+5.4), the length of Q is only a single token, so we instead iterate over (
+K
+;
+V
+) to avoid repeatedly reading intermediate output
+USENIX Association
+20th USENIX Symposium on Operating Systems Design and Implementation    45
+Figure 9: KV Projection and attention fusing.
+scores. This scheme corresponds to
+NativeTiling
+.
+5.2 Warp-Level Parallelism for Overlapping On NVIDIA's Hopper architecture [22], SM threads can be 
+divided into multiple warp groups, with each group indepen- dently handling tasks such as 
+computation or communica- tion. To maximize efciency in the fused kernel, we employ warp-level 
+pipelining for both projection and attention: while one set of warps fetches the next tiles from 
+memory, oth- ers concurrently compute on the current tiles. This overlap hides memory latency and 
+sustains high throughput, akin to asynchronous data copy in swap-based KV ofoading where hostdevice 
+transfers overlap with computation. On Hopper GPUs, this mechanism is further reinforced by the 
+Tensor Memory Accelerator (TMA) [10], a hardware copy engine within each SM that supports 
+asynchronous data movement and frees compute warps to focus on arithmetic.
+5.3 Fused Kernel for Prell Phase Rather than launching separate kernels for each projection 
+followed by a standalone attention kernel, our fused approach executes the entire sequence in a 
+single pass (Fig. 9). The key insight is that the generated K and V tiles are retained in SMEM and 
+immediately consumed by the subsequent atten- tion computation, eliminating redundant writes to and 
+reads from CPU memory. Algorithm 2 outlines the design of the fused pre- ll kernel. The kernel 
+initializes three specialized warp groups producer , consumer , and storer (Step 3). The pro- ducer 
+warps fetch tiles from HBM, the consumer warps per- form the computation, and the storer warps 
+handle writing intermediate results (e.g., K / V ) back to CPU memory when re- quired. This 
+division enables overlap between data movement and computation. The projection stage is decomposed 
+into two sub- operations that generate K and V tiles, respectively. For each sub-operation, we 
+employ pipeline parallelism acrosswarp groups. For example, during K tile generation, whileconsumer 
+warps compute on the current tile (Step 7), pro-ducer warps simultaneously prefetch the next tile 
+from HBM(Step 6), thereby overlapping computation with data move-ment. Once the projection of K and 
+V for a given tile is com-plete, the storer warps transfer the results to CPU memory,while the 
+consumer warps proceed with attention computation
+Algorithm 2:
+Fused Prell Kernel
+Input:
+Input embeddings
+X
+2
+R
+N
+
+D
+, projection
+weights
+W
+k
+;
+W
+v
+2
+R
+D
+
+d
+, query
+Q
+2
+R
+S
+
+d
+, head
+dimension
+d
+, sequence length
+S
+, tile sizes
+B
+kv
+and
+B
+q
+for KV cache and query, respectively.
+1
+Initialize output tensor
+O
+2
+R
+S
+
+d
+2
+Initialize streaming-softmax state
+(
+`
+=
+0
+;
+m
+=
+
+
+)
+3
+Initialize three Warp Groups including Producer,
+Consumer and Storer
+4
+for
+j
+1
+to
+T
+s
+=
+l
+S
+B
+kv
+m
+do
+/* KV Projection Stage */
+5
+for
+i
+1
+to
+T
+d
+=
+
+D
+d
+
+do
+6
+Producer
+: Load
+X
+ij
+;
+W
+k
+i
+from HBM
+7
+Consumer
+:
+K
+j
+=
+X
+ij
+W
+k
+i
++
+K
+j
+8
+if
+use_rope
+then
+9
+K
+j
+RoPE
+(
+K
+j
+)
+10
+Storer
+: Zero-copy write
+K
+j
+to CPU Memory
+11
+for
+i
+1
+to
+T
+d
+=
+
+D
+d
+
+do
+12
+Producer
+: Load
+X
+ij
+;
+W
+v
+i
+from HBM
+13
+Consumer
+:
+V
+j
+=
+X
+ij
+W
+v
+i
++
+V
+j
+14
+Storer
+: Zero-copy write
+V
+j
+to CPU Memory
+/* Attention Stage */
+15
+for
+i
+1
+to
+T
+s
+=
+l
+S
+B
+q
+m
+do
+16
+Producer
+: Load
+Q
+i
+;
+O
+i
+;
+m
+i
+;`
+i
+from HBM ;
+17
+Consumer
+:
+18
+S
+ij
+Q
+i
+K
+>
+j
+19
+(
+m
+i
+;`
+i
+;
+O
+i
+)
+StreamSoftmax
+(
+m
+;`
+i
+;
+O
+i
+;
+S
+ij
+;
+V
+j
+)
+20
+Write
+O
+i
+;
+m
+i
+back to HBM
+on previously generated tiles. After generating the K tiles, we optionally apply rotary position 
+embeddings (RoPE) [28,48] (Step 8). Because RoPE relies only on precomputed sine and cosine 
+functions determined by token positions, each K tile can be transformed independently, enabling 
+efcient paral- lelization across SMs without inter-tile dependencies. For attention score 
+computation, we adopt the strategy of it- erating over Q (Step 15), which is precomputed before 
+launch- ing the fused attention kernel and resides in HBM. For each (
+K
+;
+V
+) tile, this design allows SMs to process different tiles independently, thereby maximizing 
+parallelism. A trade-off of this design is that intermediate outputs O
+i and auxiliary statistics m
+i
+;`
+i must be repeatedly fetched for accumulation and streaming softmax updates [26,36,40] (Step 19). 
+These updates are standard in long-sequence attention to ensure nu- merical stability and are 
+retained without modication. Impor- tantly, the additional HBM trafc introduced by these updates 
+remains modest compared to CPUGPU transfers, and thus does not become the dominant bottleneck. To 
+avoid write
+46    20th USENIX Symposium on Operating Systems Design and Implementation
+USENIX Association
+read dependencies on O
+i across SMs, we assign different attention heads and batches to different SMs. Since the prod- uct 
+of the number of heads (e.g., 8) and batch size (e.g., 32) typically exceeds the number of SMs 
+(e.g., 132 on GH200), this scheduling ensures that no two SMs simultaneously op- erate on the same 
+headbatch pair with different (
+K
+;
+V
+) tiles. Finally, similar to the projection stage, we employ pipeline parallelism: producer warps 
+prefetch the next Q tiles from HBM (Step 16), while consumer warps concurrently perform 
+computations on the current tiles (Step 18), thereby overlap- ping data movement with computation.
+5.4 Fused Kernel for Decode Phase In contrast to the prell phase, where avoiding repeated KV cache 
+fetching from CPU memory dominates the cost, the decode phase reuses the cached K
+;
+V heavily while comput- ing projections and attention scores for only a single newly generated 
+query token. To fully utilize parallelism in this set- ting, we adopt the complementary strategy of 
+iterating over all cached (
+K
+;
+V
+) given the single query q
+t . Since only one token is processed, each (
+K
+;
+V
+) pair needs to be traversed just once, avoiding additional CPUGPU memory transfers. Further- more, 
+this design eliminates redundant reloads of the output attention scores: o
+t can be retained in registers and reused across iterations, rather than repeatedly fetched from 
+HBM. This optimization minimizes overhead while preserving high throughput as illustrated in 
+Algorithm 3. The fused decode kernel requires only two warp groups, producer and consumer , since 
+only a single newly generated (
+K
+;
+V
+) pair is written back to CPU memory. In this case, a ded- icated storer group is unnecessary, and 
+the consumer warps handle the write-back after completing the new (
+K
+;
+V
+) projec- tion. Specically, the producer rst fetches the query q
+t from HBM (Step 2) to prepare for subsequent iterations. During the attention stage, the producer 
+loads (
+K
+;
+V
+) tiles from CPU memory into SMEM via zero-copy, while the consumer per- forms computation over 
+these tiles. Pipeline parallelism is em- ployed to overlap communication and computation: while the 
+producer fetches the next tile (Step 5), the consumer concur- rently computes on the current tile 
+(Step 6), thereby sustaining throughput and reducing stalls.
+6 Efcient KV Cache Management The KV cache grows linearly with sequence length and quickly exceeds 
+GPU capacity. To address this, we introducetheKV Cache Manager, which ofoads KV tensors to 
+CPUmemory and enables direct GPU access via zero-copy.The manager allocates CPU buffers with 
+cudaHostAllocas pinned memory [9], making host memory page-locked anddirectly accessible to the GPU 
+without staging. Once written,KV tensors remain in pinned buffers and are reused acrossiterations 
+without recomputation or redundant transfers.
+Algorithm 3: Fused Decode Kernel (token-by-token)
+Input :
+New token
+x
+t
+2
+R
+1
+
+d
+model
+, weights
+W
+k
+;
+W
+v
+,
+head dim
+d
+, cached KV length
+S
+kv
+, ags
+use_rope
+, tile sizes
+B
+kv
+for KV cache.
+1
+Initialize output tensor
+o
+t
+2
+Initialize streaming-softmax state
+(
+`
+=
+0
+;
+m
+=
+
+
+)
+3
+Producer
+: Load
+q
+t
+from HBM
+/* Attention over cached KV */
+4
+for
+j
+1
+to
+T
+s
+=
+l
+S
+kv
+B
+kv
+m
+do
+5
+Producer
+: zero-copy load cached tiles
+(
+K
+j
+;
+V
+j
+)
+from CPU memory
+6
+Consumer
+:
+7
+S
+j
+q
+t
+K
+>
+j
+8
+(
+m
+;`;
+o
+t
+)
+StreamSoftmax
+(
+m
+;`;
+o
+t
+;
+S
+j
+;
+V
+j
+)
+/* Project current token's KV */
+9
+for
+i
+1
+to
+T
+d
+=
+
+D
+d
+
+do
+10
+Producer
+: Load
+X
+i
+;
+W
+k
+i
+;
+W
+v
+i
+from HBM
+11
+Consumer
+:
+k
+t
+=
+X
+i
+W
+k
+i
++
+k
+t
+;
+v
+t
+=
+X
+i
+W
+v
+i
++
+v
+t
+12
+if
+use_rope
+then
+13
+Consumer
+:
+k
+t
+RoPE
+(
+k
+t
+)
+14
+Consumer
+: Append
+(
+k
+t
+;
+v
+t
+)
+to KV cache in CPU
+memory
+/* Attention with new KV */
+15
+Consumer
+:
+16
+s
+t
+q
+t
+k
+>
+t
+17
+(
+m
+;`;
+o
+t
+)
+StreamSoftmax
+(
+m
+;`;
+o
+t
+;
+s
+t
+;
+v
+t
+)
+18
+Write
+o
+t
+back to HBM
+During prell , the manager stores the initial K
+;
+V entries from each layer in CPU memory. During decode , the GPU reuses these cached entries 
+directly, while only appending new
+K
+;
+V
+for the latest token. Integrated with the Kernel Adaptor and Attention Fusion Engine (Fig. 8), the 
+KV Cache Manager reduces interconnect trafc, relieves GPU memory pressure, and enables scalable 
+long-context generation beyond GPU-only caching.
+7 Implementation and Evaluation
+7.1 System Implementation Prototype. We implement DirectKV in CUDA 12.4, build- ing on NVIDIA's 
+CUTLASS library for matrix multiplica- tion [12] and extending FlashAttention-3 [44]. The imple- 
+mentation integrates three key techniques: (i) CPU-aware matrix multiplication, (ii) warp-level 
+pipelining, and (iii) ker- nel fusion of projection and attention. In total, our prototype 
+contributes roughly 5,300 lines of CUDA/C++ code on top of FlashAttention-3, with additional Python 
+bindings to en- able integration into PyTorch 2.2. For kernel-level analysis,
+USENIX Association
+20th USENIX Symposium on Operating Systems Design and Implementation    47
+we use NVIDIA Nsight Compute to report hardware metrics, including L2 cache hit rate and memory 
+throughput, in order to quantify efciency gains. KV cache management. DirectKV includes a 
+lightweight KV cache manager (  in Fig. 8) to support direct attention over CPU-resident KV blocks. 
+The manager allocates KV buffers in pinned host memory using cudaHostAlloc [9]. Since these buffers 
+are page-locked and GPU-accessible, Di- rectKV kernels can access CPU-resident KV blocks through 
+device-visible pointers without staging them in GPU memory. Once generated, KV tensors remain in 
+the pinned buffers and are reused across decoding iterations, avoiding recomputation and redundant 
+CPUGPU transfers.
+7.2 Evaluation Setup Server Congurations. We evaluate DirectKV on an NVIDIA GH200 GraceHopper 
+Superchip with a Hopper GPU, 96 GB of HBM3, and LPDDR5X CPU memory [15]. The system runs CUDA 12.4 
+and PyTorch 2.3, and our cus- tom kernels are implemented using CUTLASS 3.0+ with Hopper support 
+via CuTe. For baseline comparison, we use the H100 (PCIe Gen5) to quantify the benets of NVLink- 
+C2C (  7.4.3), since both GH200 and H100 employ the same H100 GPU architecture. LLM models. We 
+evaluate Llama-3.1-8B [11] and OPT [56] models with 13B and 30B parameters. Workloads. Following 
+prior work on LLM serving [37], we evaluate on real-world datasets including ShareGPT [6,8] 
+(user-shared ChatGPT conversations) and Alpaca [49, 52] (instruction-following data generated by 
+GPT-3.5). Since re- quest timestamps are not provided, we generate arrivals as a Poisson process 
+parameterized by the request rate [37]. Our main experiments use request rates up to 30 req/s and 
+context lengths from 1k to 32K tokens, representing a stable operating region where systems can be 
+compared un- der reasonable latency. We further add stress-case workloads with higher request rates 
+and longer context lengths to eval- uate behavior under saturation and memory pressure. These 
+workloads show when baseline systems run out of GPU mem- ory or experience severe latency 
+degradation from KV-cache movement and staging overheads. We also vary batch size to cover both 
+latency-critical interactive serving and throughput- oriented batch scenarios. Baseline schemes: We 
+compare DirectKV against three KV cache ofoading systems:
+ SGLang [58] is a high-performance serving framework forlarge language and multimodal models. We 
+use SGLang asan HBM-resident baseline, where the KV cache is stored inGPU memory.
+Pie[53] uses a large GPU staging buffer to swap KV blocksfrom CPU memory to GPU via NVLink-C2C, 
+overlappingtransfers with compute.
+Figure 10: Per-token latency under varying request rate for different models.
+ FlexGen [46] uses GPU, CPU memory, and disk with a cost-model search and 4-bit compression to 
+reduce mem- ory footprint and enable LLM inference under tight GPU memory constraints.
+ Neo [34] ofoads part of attention computation and KV cache to CPUs, using asymmetric GPUCPU 
+pipelining and load-aware scheduling to increase throughput.
+7.3 End-to-end Performance
+7.3.1 Per-token Latency We evaluate three models under varying request rates, as shown in Fig. 10. 
+SGLang achieves the lowest latency when the model and KV cache t entirely in GPU memory, as it 
+serves both parameters and KV cache from HBM without ofoading overhead. However, this design is 
+constrained by GPU memory capacity: SGLang supports all request rates for Llama-3.1-8B, but runs 
+out of memory at the highest re- quest rate for OPT-13B and beyond low request rates for OPT- 30B. 
+DirectKV achieves the lowest latency among ofoading- based systems and remains close to SGLang when 
+SGLang is feasible. On Llama-3.1-8B, DirectKV is slightly slower than SGLang but substantially 
+faster than Neo, Pie, and Flex- Gen, reducing latency at 30 req/s from 1.552.95s to 0.75s. For 
+OPT-13B, DirectKV remains competitive with SGLang at moderate loads and continues to support 30 
+req/s, where SGLang OOMs; at this load, DirectKV achieves 0.75s latency, compared with 1.553.95s 
+for other ofoading systems. For OPT-30B, SGLang only supports low request rates, while Di- rectKV 
+scales to 30 req/s and maintains much lower latency than Neo, Pie, and FlexGen under high load. 
+These results show that SGLang provides the best perfor- mance when sufcient HBM is available, 
+whereas DirectKV offers a better performancecapacity tradeoff. By using zero- copy KV ofoading, 
+DirectKV avoids staging buffers and redundant CPUGPU copies, reducing ofoading overhead and 
+enabling graceful scaling when GPU-resident systems exceed HBM capacity.
+48    20th USENIX Symposium on Operating Systems Design and Implementation
+USENIX Association
+Figure 11: Performance and memory usage under different sequence length.
+7.3.2 Impact of Context Length on Latency We evaluate per-token latency under different sequence 
+lengths, as shown in Fig. 11(a).DirectKV consistently achieves the lowest latency among systems 
+that support each context length, with a 1.2  average speedup. Its advantage increases as the 
+sequence length grows: at 16k tokens, Direc- tKV is about 1.3  faster than Neo and Pie and about 
+1.7  faster than FlexGen. At 32k tokens, DirectKV remains ef- cient, while Neo, Pie, and SGLang run 
+out of memory and FlexGen incurs much higher latency. SGLang is fast when all data ts in GPU 
+memory, but fails at longer contexts due to GPU memory pressure. FlexGen supports longer contexts 
+but suffers from explicit data movement and multi-tier ofoad- ing overhead. By keeping KV cache in 
+CPU memory and directly accessing it through zero-copy execution, DirectKV reduces GPU memory usage 
+while sustaining low latency for long-context serving.
+7.3.3 GPU and CPU Memory Savings We evaluate average GPU and CPU memory usage under vary- ing 
+sequence lengths across different LLM models on GH200, which has 96GB of GPU memory as shown in 
+Fig.11(b). SGLang keeps both model parameters and KV cache in GPU memory, consuming 92GB on average 
+and approaching the GPU memory limit as the sequence length grows. Although Neo, Pie, and FlexGen 
+ofoad data to CPU memory, they still consume substantial GPU memory due to additional runtime 
+buffers for KV-cache movement, using 86GB, 88GB, and 74 GB, respectively. In contrast, DirectKV 
+uses only 47GB of GPU memory, saving 35GB on average compared with these ofoading-based systems, 
+which corresponds to a 43%reduction in GPU memory usage. This saving comes fromstoring the KV cache 
+in CPU-pinned memory and allowingthe attention kernel to directly consume CPU-resident KVblocks. As 
+a result, DirectKV stays well below the 96 GBGPU memory ceiling and avoids SGLang's OOM 
+behaviorwhile achieving lower latency than other ofoading-basedsystems.
+Figure 12: Data fetching and latency per token comparison between naive zero-copy and CPU-aware 
+zero-copy.
+7.4 Component-Level Evaluation
+7.4.1 Benets of CPU-Memory-Aware Matrix Multipli- cation Nave zero-copy attention performs matrix 
+multiplications directly on KV blocks fetched from CPU memory, leading to repeated transfers of the 
+same operands and excessive com- munication overhead. We evaluate our CPU-aware zero-copy 
+mechanism, which reorganizes data access so that each KV block fetched from CPU memory is maximally 
+reused in GPU registers and HBM before eviction. This design shifts the dominant pressure from the 
+CPU-GPU interconnect to the GPU-side memory hierarchy, where HBM bandwidth is much higher and can 
+better absorb the additional trafc. As shown in Fig. 12(a), CPU-aware zero-copy reduces CPUGPU 
+trans- fer volume by up to 50% compared with naive zero-copy. This reduction translates into up to 
+70% lower inference la- tency across LLaMA-8B, OPT-13B, and OPT-30B, as shown in Fig. 12(b). 
+Overall, CPU-aware zero copy consistently im- proves end-to-end throughput by reducing 
+communication cost and fully exploiting GPU compute.
+7.4.2 Advantage of Fused Kernel In existing ofoading approaches K , and V projections are launched 
+as separate kernels, followed by an attention ker- nel. This separation forces repeated refetching 
+of KV blocks from CPU memory, inating interconnect trafc and under- utilizing GPU bandwidth. Our 
+fused kernel addresses this inefciency by combining QKV projection and attention into a single 
+pass. Projected tensors remain in shared memory and are immediately consumed by attention, 
+eliminating redun- dant global memory accesses. As shown in Fig. 13, the fused design sustains up 
+to 3.5  higher HBM throughput and deliv- ers 2.53.0  lower latency across Llama-8B, OPT-13B, and 
+OPT-30B. These results demonstrate that kernelmemory co- design is essential to making zero-copy 
+ofoading practical and efcient on heterogeneous CPUGPU platforms.
+USENIX Association
+20th USENIX Symposium on Operating Systems Design and Implementation    49
+Figure 13: HBM throughput and latency per token comparison between separate kernel and fused kernel.
+7.4.3 Impact of High-bandwidth Interconnection The efciency of zero-copy ofoading is fundamentally 
+lim- ited by the bandwidth of the CPUGPU interconnect. With PCIe, KV blocks must traverse a 
+lower-bandwidth channel, which can quickly become the system bottleneck and cause GPUs to stall 
+while waiting for data. In contrast, NVLink- C2C provides much higher bandwidth, allowing DirectKV 
+to sustain higher HBM utilization and better overlap communi- cation with computation. Thus, on 
+PCIe, DirectKV should be viewed primarily as a capacity-extension mechanism: it elim- inates GPU 
+staging buffers, but its performance advantage remains bounded by CPUGPU interconnect bandwidth. As 
+shown in Fig. 14, DirectKV consistently achieves the lowest latency on both interconnects, with the 
+gap especially pronounced under NVLink-C2C. Relative to PCIe, NVLink- C2C reduces attention latency 
+by up to 4.2  and improves throughput stability under long contexts. Competing systems such as Neo, 
+Pie, and FlexGen remain bottlenecked by stag- ing overheads, yielding only modest improvements 
+under NVLink-C2C.
+8 Discussion
+8.1 Integration with Existing Serving Systems DirectKV is intended to complement, rather than 
+replace, full- featured LLM serving systems such as vLLM and SGLang. These systems already provide 
+mature mechanisms for con- tinuous batching, prex reuse, eviction, and hierarchical KV caching 
+[23,24,32,37,58]. Such mechanisms determine how requests are scheduled, which KV blocks are reused 
+or shared, and when blocks are retained, evicted, or promoted across memory tiers. DirectKV 
+addresses a separate concern: how to execute attention efciently once the relevant KV blocks reside 
+in CPU memory.This separation makes DirectKV naturally compatible withexisting serving stacks. 
+DirectKV does not change schedul-ing, batching, or KV-management policies; instead, it pro-vides an 
+efcient execution path for CPU-resident KV blocks.A serving system can integrate DirectKV by 
+extending itsKV allocator to support CPU-pinned storage for ofoadedblocks, while leaving the 
+scheduler, model execution graph,
+Figure 14: Latency per-token under 512 sequence length when using PCIe and NVLink-C2C. and frontend 
+API unchanged. Therefore, DirectKV can di- rectly benet existing KV-cache optimizations that 
+already place KV blocks in CPU memory, including prex caching, eviction, and hierarchical KV 
+management, by avoiding the copy back to HBM before attention.
+8.2 Hardware Applicability DirectKV is best suited to CPUGPU platforms with high-bandwidth 
+interconnects, such as NVLink-C2C on GH200/GB200. Its coarse-grained access pattern  100 KB KV 
+blocks accessed concurrently by over 100 SMscreates MB-scale aggregate transfers, making 
+performance primarily limited by sustained CPUGPU bandwidth rather than indi- vidual remote-load 
+latency. Thus, on PCIe-only platforms, DirectKV may still reduce GPU memory usage, but through- put 
+benets are often limited by interconnect bandwidth. Importantly, this bandwidth-oriented design 
+does not rely on platform-specic coherence mechanisms. DirectKV uses zero-copy pinned memory rather 
+than GH200's unied page table (UPT). Although UPT provides a coherent CPUGPU virtual address space, 
+DirectKV does not require coherence because KV blocks are not concurrently updated by the CPU. In 
+our setting, zero-copy achieves comparable NVLink-C2C bandwidth while relying only on standard 
+pinned host mem- ory and device-visible pointers, making DirectKV applicable beyond UPT-specic 
+platforms.
+8.3 Scalability and Distributed Serving DirectKV is primarily a node-local heterogeneous-memory 
+optimization, but it composes with common LLM-serving parallelism strategies and distributed KV 
+layouts. Under ten- sor parallelism, each GPU maintains its own attention-head shard and CPU-pinned 
+KV pool; under pipeline parallelism, KV pools partition naturally by layer. When KV cache is 
+partitioned across servers, each server can apply DirectKV to its local CPU-resident KV blocks, 
+while the distributed runtime still handles query and partial-output communication. Thus, DirectKV 
+improves per-server KV capacity, but does not eliminate inter-server communication costs. DirectKV 
+also benets disaggregated prelldecode serv- ing because CPU-pinned KV blocks can be transferred via
+50    20th USENIX Symposium on Operating Systems Design and Implementation
+USENIX Association
+RDMA without GPU staging. Its main limitations are context- parallel scale-out and host-memory 
+pressure: coordinating remotely owned KV blocks or integrating with a multi-tier KV hierarchy would 
+require additional runtime support, and zero-copy benets diminish once accesses fall back to page- 
+able or disk-backed tiers. We leave these extensions to future work.
+9 Related Work Efcient LLM Inference. A rich line of work has optimized transformer inference for 
+latency and throughput. Systems such as TensorRT-LLM [3], vLLM [37], and DeepSpeed- Inference [21] 
+accelerate execution through operator fusion, batching, and kernel optimizations. DistServe [59] 
+disaggre- gates prell and decode to reduce interference, while Tur- boTransformers [29] and 
+HuggingFace [1] provide widely adopted runtimes. Sarathi-Serve [19] dynamically allocates 
+prell/decode resources, ZeRO-Ofoad [43] shifts optimizer states to CPU memory, PowerInfer [47] 
+exploits activation sparsity, SGLang [58] optimizes multi-turn interaction, and FlashDecoding++ 
+[33] provides low-latency decoding ker- nels. While effective within GPU memory constraints, none 
+address KV cache ofoading across CPUGPU memory, the focus of DirectKV. KV Cache Ofoading. Many 
+recent systems propose ofoad- ing the KV cache from GPU to CPU memory to support longer contexts. 
+FlexGen [46] formulates tensor placement as a linear programming problem across GPU, CPU, and disk, 
+using compression to increase throughput under resource con- straints. NEO [34] employs asymmetric 
+GPUCPU pipelining and load-aware scheduling to balance computation and mem- ory usage, achieving 
+higher throughput under batch-serving settings. Pie [53] adopts a swap-based design, staging KV 
+blocks in large GPU buffers transferred over NVLink-C2C. Innite-LLM [38] orchestrates all available 
+GPU and CPU memories across the data center to store the KV cache, but ap- plications may 
+experience degraded performance when data resides in CPU or remote memory. FastDecode [31] ofoads 
+the entire attention computation onto CPUs to avoid repeated PCIe transfers, but is constrained by 
+limited CPU through- put. HeteGen [57] adopts heterogeneous parallelism with asynchronous overlap 
+to mitigate I/O bottlenecks and reduce inference latency. While effective, these approaches either 
+in- cur staging overhead, depend on software-level scheduling, or expose applications to 
+unpredictable performance when CPU memory is involved. DirectKV instead eliminates stagingbuffers 
+through a kernelmemory co-design, making zero-copy practical for attention computation.GPU Kernels 
+Optimization for Attention. FlashAttention-1and 2 [25,25] optimize GPU kernel execution by tiling 
+data inHBM, substantially reducing memory trafc and improvingthroughput. FlashAttention-3 [44] 
+further improves perfor-mance on Hopper GPUs with advanced pipelining strategies. FlashInfer [54] 
+targets heterogeneous KV-cache layouts with specialized CUDA kernels, leveraging block-sparse and 
+com- posable formats to enhance memory efciency and minimize redundancy. However, all of these 
+optimizations assume that KV caches reside entirely in GPU memory and are not de- signed for 
+zero-copy access to CPU-resident KV without HBM-resident buffers. When applied naively in a 
+zero-copy setting (i.e., directly pointing K/V to host memory), these ker- nels suffer severe 
+performance degradation because they do not account for the large bandwidth gap between CPUGPU 
+interconnects and HBM. In contrast, DirectKV adapts FlashAttention-3-style kernels to heterogeneous 
+CPUGPU settings in which KV caches are stored in CPU memory, and mitigates the interconnect 
+bottleneck through a kernelmemory co-design.
+10 Conclusion We proposed DirectKV, an efcient zero-copy KV cache of- oading system for 
+heterogeneous CPUGPU architectures. Nave zero-copy exacerbates the bandwidth gap between CPUGPU 
+interconnects and HBM, severely limiting per- formance. DirectKV addresses this by redesigning 
+matrix multiplication access patterns to shift the bottleneck to HBM, while further improving 
+efciency through warp-level pipelin- ing that overlaps communication with computation and fused 
+kernels that eliminate redundant KV refetching. Evaluated on NVIDIA GH200, DirectKV reduces GPU 
+memory usage by 43% and improves end-to-end performance by up to 1
+:
+2
+
+over state-of-the-art systems.
+Acknowledgements We sincerely thank the anonymous reviewers and the shep- herd, for their valuable 
+feedback and suggestions. This work was supported in part by U.S. NSF grants NSF-2421782, 
+NSF-2350425, NSF-2319988, and NSF-2206522; Microsoft Research Faculty Fellowship 8300751; an Amazon 
+Research Award; AWS Cloud Credits for Research; and cloud comput- ing credits provided by Lambda, 
+Voltage Park and Vultr.
+References
+[1] Hugging face accelerate. https://huggingface.co/docs/ accelerate/index, 2022.
+[2] Nvidia pinned memory. https://docs. nvidia.com/cuda/cuda-c-programming-guide/ 
+#page-locked-host-memory, 2022.
+[3] Nvidia tensorrt-llm. https://github.com/NVIDIA/ TensorRT-LLM, 2022.
+USENIX Association
+20th USENIX Symposium on Operating Systems Design and Implementation    51
+[4] Nvidia zero copy memory. https://docs. nvidia.com/cuda/cuda-c-programming-guide/ 
+#zero-copy-memory, 2022.
+[5] Cuda tiling. https://docs.nvidia.com/cuda/ cuda-c-programming-guide/index.html# 
+programming-interface, 2023.
+[6] Huggingface dataset. https://huggingface.co/datasets, 2023.
+[7] Nvidia l1/smem. https://developer.nvidia.com/blog/ nvidia-hopper-architecture-in-depth/, 2023.
+[8] Sharegpt. https://sharegpt.com/, 2023.
+[9] Cuda memory management. https://docs.nvidia. com/cuda/cuda-runtime-api/group__CUDART_ 
+_MEMORY.html, 2025.
+[10] Hopper tensor memory accelerator. https://developer. 
+nvidia.com/blog/nvidia-hopper-architecture-in-depth/, 2025.
+[11] Meta llama-3-8b. https://huggingface.co/meta-llama/ Meta-Llama-3-8B, 2025.
+[12] Nvidia cutlass. https://github.com/NVIDIA/cutlass, 2025.
+[13] Nvidia direct memory access engine ten- sor. https://docs.nvidia.com/gpudirect-storage/ 
+design-guide/index.html, 2025.
+[14] Nvidia gb200. https://www.nvidia.com/en-us/ data-center/gb200-nvl72, 2025.
+[15] Nvidia gh200. https://www.nvidia.com/en-us/ data-center/grace-hopper-superchip/, 2025.
+[16] Nvidia h100. https://www.nvidia.com/en-us/ data-center/h100/, 2025.
+[17] Nvidia cuda copy operation. https://docs.nvidia.com/ cuda/parallel-thread-execution/, 2026.
+[18] Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Aleman, 
+Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical report. 
+arXiv preprintarXiv:2303.08774
+, 2023.
+[19]Amey Agrawal, Nitin Kedia, Ashish Panwar, JayashreeMohan, Nipun Kwatra, Bhargav Gulavani, 
+AlexeyTumanov, and Ramachandran Ramjee. TamingfThroughput-Latency g tradeoff in f LLM g 
+inferencewith
+f
+Sarathi-Serve
+g
+. In
+Proceedings of OSDI
+, 2024.
+[20] Joshua Ainslie, James Lee-Thorp, Michiel De Jong, Yury Zemlyanskiy, Federico Lebrn, and Sumit 
+Sang- hai. Gqa: Training generalized multi-query transformer models from multi-head checkpoints. 
+arXiv preprint arXiv:2305.13245
+, 2023.
+[21] Reza Yazdani Aminabadi, Samyam Rajbhandari, Am- mar Ahmad Awan, Cheng Li, Du Li, Elton Zheng, 
+Olatunji Ruwase, Shaden Smith, Minjia Zhang, Jeff Rasley, et al. Deepspeed-inference: enabling 
+efcient inference of transformer models at unprecedented scale. In
+Proceedings of IEEE SC
+, 2022.
+[22] Hopper GPU Architecture. https://docs.nvidia.com/ cuda/hopper-tuning-guide/index.html, 2025.
+[23] Automatic Prex Caching. https://docs.vllm.ai/en/v0. 18.0/features/automatic_prex_caching/, 
+2026.
+[24] Yihua Cheng, Yuhan Liu, Jiayi Yao, Yuwei An, Xiaokun Chen, Shaoting Feng, Yuyang Huang, Samuel 
+Shen, Kuntai Du, and Junchen Jiang. Lmcache: An efcient kv cache layer for enterprise-scale llm 
+inference. arXiv preprint arXiv:2510.09665
+, 2025.
+[25] Tri Dao. Flashattention-2: Faster attention with better parallelism and work partitioning. 
+2024.
+[26] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher R. Flashattention: Fast and 
+memory- efcient exact attention with io-awareness. 2022.
+[27] Weishu Deng, Yujie Yang, Peiran Du, Lingfeng Xiang, Zhen Lin, Chen Zhong, Song Jiang, Hui Lu, 
+and Jia Rao. Hgca: Hybrid gpu-cpu attention for long context llm inference.
+arXiv preprint arXiv:2507.03153
+, 2025.
+[28] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha 
+Letman, Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The llama 3 herd of models. arXiv 
+e-prints , 2024. [29] Jiarui Fang, Yang Yu, Chengduo Zhao, and Jie Zhou. Turbotransformers: an 
+efcient gpu serving system for transformer models. In
+Proceedings of PPoPP
+, 2021.
+[30] Amir Gholami, Zhewei Yao, Sehoon Kim, Coleman Hooper, Michael W Mahoney, and Kurt Keutzer. Ai 
+and memory wall.
+IEEE Micro
+, 2024.
+[31] Jiaao He and Jidong Zhai. Fastdecode: High-throughput gpu-efcient llm serving using 
+heterogeneous pipelines. arXiv preprint arXiv:2403.11421
+, 2024.
+[32] Hierarchical KV Caching (HiCache). https://docs. sglang.io/docs/advanced_features/hicache, 
+2026.
+52    20th USENIX Symposium on Operating Systems Design and Implementation
+USENIX Association
+[33] Ke Hong, Guohao Dai, Jiaming Xu, Qiuli Mao, Xiuhong Li, Jun Liu, Kangdi Chen, Yuhan Dong, and 
+Yu Wang. Flashdecoding++: Faster large language model infer- ence with asynchronization, at gemm 
+optimization, and heuristics.
+Proceedings of MLSys
+, 2024.
+[34] Xuanlin Jiang, Yang Zhou, Shiyi Cao, Ion Stoica, and Minlan Yu. Neo: Saving gpu memory crisis 
+with cpu ofoading for online llm inference. 2025.
+[35] Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B Brown, Benjamin Chess, Rewon Child, Scott 
+Gray, Alec Radford, Jeffrey Wu, and Dario Amodei. Scal- ing laws for neural language models. arXiv 
+preprint arXiv:2001.08361
+, 2020.
+[36] Nikita Kitaev, ukasz Kaiser, and Anselm Levskaya. Reformer: The efcient transformer. 2020.
+[37] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph 
+Gonzalez, Hao Zhang, and Ion Stoica. Efcient memory manage- ment for large language model serving 
+with pagedatten- tion. In
+Proceedings of SOSP
+, 2023.
+[38] Bin Lin, Chen Zhang, Tao Peng, Hanyu Zhao, Wencong Xiao, Minmin Sun, Anmin Liu, Zhipeng Zhang, 
+Lanbo Li, Xiafei Qiu, et al. Innite-llm: Efcient llm service for long context with distattention 
+and distributed kv- cache.
+arXiv preprint arXiv:2401.02669
+, 2024.
+[39] Yuhan Liu, Hanchen Li, Yihua Cheng, Siddhant Ray, Yuyang Huang, Qizheng Zhang, Kuntai Du, 
+Jiayi Yao, Shan Lu, Ganesh Ananthanarayanan, et al. Cachegen: Kv cache compression and streaming 
+for fast large lan- guage model serving. In Proceedings of SIGCOMM , 2024.
+[40] Maxim Milakov and Natalia Gimelshein. Online normalizer calculation for softmax. arXiv 
+preprint arXiv:1805.02867
+, 2018.
+[41] Daon Park and Bernhard Egger. Improving throughput- oriented llm inference with cpu 
+computations. In Pro- ceedings of PACT
+, 2024.
+[42] Ruoyu Qin, Zheming Li, Weiran He, Jialei Cui, Feng Ren, Mingxing Zhang, Yongwei Wu, Weimin 
+Zheng, and Xinran Xu. Mooncake: Trading more storage for less computationa f KVCache-centric g 
+architecture for serving f LLM g chatbot. In Proceedings of FAST ,pages 155170, 2025.
+[43]Jie Ren, Samyam Rajbhandari, Reza Yazdani Am-inabadi, Olatunji Ruwase, Shuangyan Yang, 
+MinjiaZhang, Dong Li, and Yuxiong He. f Zero-ofoad g : De-mocratizingfbillion-scale g model 
+training. In Proceed-ings of ATC
+, 2021.
+[44] Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, and Tri Dao. 
+Flashattention- 3: Fast and accurate attention with asynchrony and low- precision. 2024.
+[45] Noam Shazeer. Fast transformer decoding: One write- head is all you need.
+arXiv preprint arXiv:1911.02150
+,
+2019.
+[46] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang, 
+Christopher R, Ion Stoica, and Ce Zhang. Flexgen: High-throughput generative inference of large 
+language models with a single gpu. In
+Proceedings of ICML
+, 2023.
+[47] Yixin Song, Zeyu Mi, Haotong Xie, and Haibo Chen. Powerinfer: Fast large language model 
+serving with a consumer-grade gpu. In
+Proceedings of SOSP
+, 2024.
+[48] Jianlin Su, Murtadha Ahmed, Yu Lu, Shengfeng Pan, Wen Bo, and Yunfeng Liu. Roformer: Enhanced 
+trans- former with rotary position embedding. Neurocomput- ing
+, 2024.
+[49] Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos Guestrin, Percy 
+Liang, and Tatsunori B. Hashimoto. Stanford alpaca: An instruction-following llama model. 
+https://github.com/ tatsu-lab/stanford_alpaca, 2023.
+[50] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothe 
+Lacroix, Bap- tiste Rozire, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open and efcient 
+foundation language models.
+arXiv preprint arXiv:2302.13971
+, 2023.
+[51] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, ukasz 
+Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural information processing 
+systems
+, 30, 2017.
+[52] Yizhong Wang, Yeganeh Kordi, Swaroop Mishra, Alisa Liu, Noah A. Smith, Daniel Khashabi, and 
+Hannaneh Hajishirzi. Self-instruct: Aligning language model with self generated instructions, 2022.
+[53] Yi Xu, Ziming Mao, Xiangxi Mo, Shu Liu, and Ion Sto- ica. Pie: Pooling cpu memory for llm 
+inference. arXiv preprint arXiv:2411.09317
+, 2024.
+[54] Zihao Ye, Lequn Chen, Ruihang Lai, Wuwei Lin, Yineng Zhang, Stephanie Wang, Tianqi Chen, Baris 
+Kasikci, Vinod Grover, Arvind Krishnamurthy, et al. Flashin- fer: Efcient and customizable 
+attention engine for llm
+inference serving. 2025.
+USENIX Association
+20th USENIX Symposium on Operating Systems Design and Implementation    53
+[55] Chengye Yu, Tianyu Wang, Zili Shao, Linjie Zhu, Xu Zhou, and Song Jiang. Twinpilots: A new 
+com- puting paradigm for gpu-cpu parallel llm inference. In Proceedings of Systor
+, 2024.
+[56] Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen, Shuohui Chen, Christopher 
+De- wan, Mona Diab, Xian Li, Xi Victoria Lin, et al. Opt: Open pre-trained transformer language 
+models. arXiv preprint arXiv:2205.01068
+, 2022.
+[57] Xuanlei Zhao, Bin Jia, Haotian Zhou, Ziming Liu, Shenggan Cheng, and Yang You. Hetegen: 
+Efcient heterogeneous parallel inference for large language mod- els on resource-constrained 
+devices. In Proceedings of MLSys
+, 2024.
+[58] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Livia Sun, Jeff Huang, Cody Hao Yu, Shiyi 
+Cao, Christos Kozyrakis, Ion Stoica, Joseph E Gonzalez, et al. Sglang: Efcient execution of 
+structured language model programs. 2024.
+[59] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xuanzhe Liu, Xin Jin, and Hao 
+Zhang. f DistServe g : Disaggregating prell and decoding for goodput-optimized large language model 
+serving. In Proceedings of OSDI
+, 2024.
+54    20th USENIX Symposium on Operating Systems Design and Implementation
+USENIX Association
+GPU
+Memory
+(Bu
+!
+er)
+GPU L2
+Cache
+GPU SM
+CPU
+Memory
+KV Blocks Copy
+GPU DMA
+Engine
+KV Blocks Zero Copy
+PCIe (64GB/s)
+Swap-based O
+"
+oading
+Zero Copy (Proposed)
+SMEM
+NVLink-C2C  (900GB/s)
+Baseline
+Swap
+Zero Copy
+1
+0
+1
+1
+0
+2
+1
+0
+3
+Latency (ms)
+56
+65
+1122
+52
+54
+106
+PCIe
+NVLink-C2C
+Baseline
+Swap
+Zero Copy
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Data Size (GB)
+GPU Memory
+CPU Memory
+Baseline
+Swap
+Zero Copy
+0
+20
+40
+60
+Data Size (GB)
+21.1
+21.1
+56.3
+22.7
+0
+20
+40
+60
+80
+L2 Cache Hit Rate (%)
+77.0
+76.8
+32.3
+GPU Memory
+GPU L2
+CPU Memory
+GPU L2
+Hit Rate
+Baseline
+Zero Copy
+Zero Copy
+(CPU-memory Aware Tiling)
+1
+0
+0
+1
+0
+1
+1
+0
+2
+1
+0
+3
+Data Size (GB)
+10.6
+22.7
+27.8
+10.6
+33.5
+0.4
+33.9
+0.4
+0.4
+61.8
+Memory Access
+GPU Memory
+GPU L2
+GPU L2
+GPU Memory
+CPU Memory
+GPU L2
+Matrix
+A
+B
+C
+Matrix
+A
+B
+C
+Separate Kernel
+Fused Kernel
+0
+50
+100
+150
+Data Transfer (GB)
+37.3
+125.2
+125.2
+GPU Memory
+GPU L2
+0
+1
+2
+3
+Throughput (TB/s)
+0.3
+1.6
+1.9
+Throughput
+Separate Kernel
+Fused Kernel
+0
+25
+50
+75
+Latency (ms)
+56
+85
+57
+Baseline
+Zero Copy
+Zero Copy
+(CPU-memory Aware Tiling)
+0
+20
+40
+60
+80
+100
+Latency (ms)
+53
+106
+54
+0
+20
+40
+60
+80
+100
+GPU L2 Cache Hit Rate (%)
+78.1
+32.3
+75.1
+Latency
+Hit Rate
+Baseline
+Overlap
+0
+20
+40
+60
+Data Transfer (GB)
+37.1
+37.3
+GPU Memory
+GPU L2
+0.0
+0.5
+1.0
+1.5
+Throughput (TB/s)
+0.3
+1.3
+Throughput
+Baseline
+Overlap
+0
+20
+40
+60
+Latency (ms)
+54
+48
+Kernel
+Adaptor
+Attention
+Fusion
+Engine
+2
+3
+FFN
+Layer 1
+
+
+Kernel
+Adaptor
+Attention
+Fusion
+Engine
+2
+3
+FFN
+Layer 1
+
+
+Kernel
+Adaptor
+Attention
+Fusion
+Engine
+2
+3
+FFN
+Layer 1
+
+Iteration 1
+Iteration 2
+.9&DFKH0DQDJHU=HUR&RS\$FFHVV&380HPRU\
+Prell Phase
+Decode Phase
+4
+Store KV
+Store KV
+Reuse KV
+Iteration 3
+Store KV
+Reuse KV
+
+.HUQHO*HQHUDWRU2LQH5HSRVLWRU\
+1
+P
+A
+Projection
+P : Projection
+A : Attention
+Projection + Attention
+W : Write
+D2H
+D2H: KV Cache Copy from Device to Host
+(a) Separate Kernel
+(b) Fused Kernel (DirectKV)
+W
+R
+R : Read
+Attention
+Kernel 1
+Kernel 2
+One Kernel
+P_K
+W_K
+P_V
+W_V
+A
+10
+20
+30
+Request rate (req/s)
+0
+2
+4
+Latency (s)
+(a) Llama-8B
+10
+20
+30
+Request rate (req/s)
+0
+2
+4
+Latency (s)
+(b) OPT-13B
+10
+20
+30
+Request rate (req/s)
+0
+2
+4
+Latency (s)
+(c) OPT-30B
+DirectKV
+Neo
+Pie
+FlexGen
+SGLang
+1k
+2k
+4k
+8k
+16k
+32k
+0
+2
+4
+6
+Per-token latency (s)
+OOM
+OOM
+OOM
+OOM
+OOM
+OOM
+(a) Latency
+DirectKV
+Neo
+Pie
+FlexGen
+SGLang
+DirectKV
+Neo
+Pie
+FlexGen
+SGLang
+0
+50
+100
+150
+Memory (GB)
+GPU Mem
+Ceiling
+(b) Memory Usage
+GPU Mem
+CPU Mem
+Llama-8B
+OPT-13B
+OPT-30B
+0
+20
+40
+CPU
+GPU Transfer (GB)
+(a)
+Llama-8B
+OPT-13B
+OPT-30B
+0
+200
+400
+Latency (ms)
+(b)
+Naive Zero Copy
+CPU-aware Zero Copy
+Llama-8B
+OPT-13B
+OPT-30B
+0
+1
+2
+3
+HBM Throughput (TB/s)
+(a)
+Llama-8B
+OPT-13B
+OPT-30B
+0
+100
+200
+Latency (ms)
+(b)
+Separate Kernel
+Fused Kernel
+DirectKV
+Neo
+Pie
+FlexGen
+0
+1
+2
+Latency (s)
+PCIe
+NVLink-C2C
