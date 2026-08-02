@@ -72,6 +72,20 @@ Git facts (verified):
 ## Docs-completeness pass (user ask, 2026-08-02)
 Directory-level sweep of `agent/` (md/txt/pdf/png) across 46/SFT/38 vs 39 — beyond the git deltas already merged. Gaps found + taken: `agent/archive/results/activation_saving.md` + `agent/archive/results/archive/mm_profiling.md` (untracked leftover records present in all three older checkouts, never git-tracked — 39's checkout predates them), SFT's `agent/prompt.md` + `agent/impls/tmp.md` (working notes, previously skipped as scratch — taken per completeness directive), 2 screenshots, `agent/AsymLoRA (8).pdf`. Re-sweep: ZERO missing. Campaign/design docs already merged earlier: cpu_compute.md, previous_validation_results.md (SFT-updated), aymlora_kernels.md, ep.md, system_tier_justification.md, writing_prompt.md, archive/{fix_cpu_compute,merge_cpu_modules,merge_cpu_modules_compspec,placement}.md, related_work/*, fix_qwen3.5_tp.md, fix_plot_placeholders.md, model_capacity.md, overleaf archive, recovered-sessions, capacity_push_c17 evidence.
 
+## Phase 3-ext (user directive 2026-08-02): 4 more models × 2 near-capacity cells
+Queue: `agent/anchors_tmp/mrg_validation_queue2.sh` (X1–X8, serial GPU0, fresh tags). References:
+| cell | config | recorded ref (tok/s · peak GiB · RSS; s/it where recorded) |
+|---|---|---|
+| X1 | llama3.3-70b T2 192k·b2 (MS=1024) | 548 sched-c06 / 545 CPU-matrix / 543 archived · 171.1 EXACT-line · RSS 963–982 |
+| X2 | llama3.3-70b T2 448k·b1 WALL 97% | 280 / 279 / 275 · 182.4 EXACT-line · RSS 976–983 |
+| X3 | glm4.7-flash T3TOK 192k·b5 | 158.8 · RSS 723 · losses 1.322/1.226/1.235 (c14; +V3 replication 157.9·719) |
+| X4 | glm4.7-flash T1 192k·b2 | f1s_t1192 artifacts (c14): 812 compute / 845 wall tok/s · 93.5 · RSS 273 |
+| X5 | mixtral-8x22b T2 320k·b1 | mxt2320 artifacts (c14): 670 compute / 685 wall · 173.8 · RSS 882 |
+| X6 | mixtral-8x22b T3TOK 64k·b2 | tier-ladder anchor at3b2 (c14, current-code era): 58.7 · 2534 compute · RSS 908 |
+| X7 | q3.5-122b T2 448k·b1 | c18 §8: 520.2 s/it · 861 · 171.3 (93%) · 846 (cross-node band) |
+| X8 | q3.5-122b T2 480k·b1 | c18 §8: 563.6 s/it · 852 · 177.8 (96% EDGE — c14/c18 fragile-edge caveat on record) · 849 |
+Dataset prep: llama 192k·n1024 + 448k·n512 copied from SFT LF/data; 122b 480k present; 122b ≥512k datasets never existed on this host (c18-only) — 480k is the deepest reproducible cell here.
+
 ## FINAL STATE (2026-08-01 ~21:0x)
 - Phases 1, 1b, 2, 2b, 3 (5/5 PASS), 4 — ALL COMPLETE. This repo + this workspace's LlamaFactory now carry the full union of 39 + 46 + SFT + 38 (selective, gated), validated near-capacity with no regression.
 - Uncommitted per house rule (Kevin commits): ~101 AsymGEMM paths + 6 LF files (dataset_info.json, parser.py, adapter.py, checkpointing.py, liger_kernel.py, moe.py) + Liger-Kernel's pre-existing 39 deltas.
