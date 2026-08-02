@@ -86,6 +86,26 @@ Queue: `agent/anchors_tmp/mrg_validation_queue2.sh` (X1–X8, serial GPU0, fresh
 | X8 | q3.5-122b T2 480k·b1 | c18 §8: 563.6 s/it · 852 · 177.8 (96% EDGE — c14/c18 fragile-edge caveat on record) · 849 |
 Dataset prep: llama 192k·n1024 + 448k·n512 copied from SFT LF/data; 122b 480k present; 122b ≥512k datasets never existed on this host (c18-only) — 480k is the deepest reproducible cell here.
 
+### X1 COOM INCIDENT (2026-08-02, diagnosed NOT-a-regression; fix = watchdog floor for llama cells)
+x1llt2 + x1b both COOM'd (watchdog: avail 48 < floor 50) while the TRAINER was reference-grade: peak reserved **171.1 GiB = the exact recorded byte-line**, RSS 890–893 (LEANER than refs 963–982), steps ~716s (−2% band-edge). Attribution (host sampler + probes):
+- The node "consumption" was **847 GB of Shmem** with Mlocked=0 — EXPERIMENT-PROVEN cause: on this stack (torch 2.12 + CUDA 13 + GB200), `pin_memory` allocations are **Shmem/memfd-backed** (4 GiB pinned ⇒ +5 GB Shmem; pageable ⇒ +0). The 847 GB = the run's normal pinned working set (banks + offload pools), same class as the refs — NOT a leak (managed pool block byte-identical to c06 refs: limit 32 / cached 12 / live 6 GB; flow-per-step tags proportional).
+- Node accounting: **MemAvailable on c14 ≈ the 960-GB Grace zones only** — the idle GPUs' HBM NUMA free (~550 GB) is not CPU-available. The llama refs' own RSS (963–983, c06) would not fit c14's CPU pool at all; our leaner 893 leaves a NORMAL operating point of ~50–60 GB avail — the default watchdog floor (50) sits inside it and fired on the ~1 GB/step creep.
+- Verdict: node-class capacity boundary + watchdog-config artifact, not a merge regression. FIX: X1/X2 rerun with explicit `HOST_MEM_WATCHDOG_FLOOR_GB=25` (still OOM-protected, below the natural operating point; watchdog is ops tooling, not a perf lever — fair-comparison rule unaffected). Queue relaunched (tags x1d/x2d).
+
+### Phase 3-ext RESULTS
+| cell | ref | merged tree | verdict |
+|---|---|---|---|
+| X1 llama T2 192k·b2 | 543–548 · 171.1 · 963–982 | **535 · 171.1 EXACT · 906** (717.7s ×2; 3 replicates 716–718s) | **PASS** — in-band vs archived 543 (−1.5% floor 534.9); −1.8% vs c06 CPU-matrix = the record's cross-node environment class (HBM byte-exact, RSS leaner, replicate-stable) |
+| X2 llama T2 448k·b1 WALL | 275–280 · 182.4 exact-line (97%) · 976–983 | **274 · 180.1 (−2.3 leaner) · 906** (1634.6s ×2) | **PASS** — in-band vs archived 275 (−0.4%); memory LEANER than the wall line; RSS −70 |
+| X3 flash T3 192k·b5 | 158.8 · 723 · 1.322/1.226/1.235 (c14) | **730 tok/s (1314.9s) · 157.9 · 719 · 1.3209/1.2245/1.2350** | **PASS** — 3rd exact replication (V3: 157.9·719·721); losses ≤0.12%; +1.2% faster |
+| X4 flash T1 192k·b2 | 812 · 93.5 · 273 (c14 artifacts) | **812 · 93.5 · 273** (473.2s) | **PASS — EXACT match on all three axes** |
+| X5 mixtral T2 320k·b1 | 670 · 173.8 · 882 (c14 artifacts) | **671 · 170.5 (−3.3) · 837 (−45)** (477.0s) | **PASS** — +0.1% tok/s, leaner on both memory axes |
+| X6 mixtral T3 64k·b2 | at3b2 anchor ARTIFACTS: fwd+bwd 151.5s (845 tok/s) · 58.7 · 908 | **fwd+bwd 138.1s (927 tok/s, +9.7%) · 59.1 (+0.4) · 887 (−21)** | **PASS** — faster, memory in band. (Doc-table "2534" = 3-step-total bookkeeping: 128000×3/151.5 ≈ 2535; artifact-vs-artifact is the protocol) |
+| X7 q3.5-122b T2 448k·b1 | 861 · 520.2 s/it · 171.3 (93%) · 846 (c18) | **875 (+1.6%) · 512.2 s/it · 156.8 (−14.5) · 800 (−46)**; jobs.tsv failed:1 with COMPLETE artifacts (3/3 losses 0.649/0.710/0.642) = the recorded q3.5 teardown flake | **PASS** — faster + leaner on every axis vs c18 |
+| X8 q3.5-122b T2 480k·b1 | 852 · 563.6 s/it · 177.8 (96% edge) · 849 (c18) | **870 (+2.1%) · 551.6 s/it · 167.9 (−9.9) · 798 (−51)**; teardown-flake exit, artifacts complete (losses 0.696/0.676/0.679) | **PASS** — faster + leaner; edge caveat not even needed |
+
+**PHASE 3-ext VERDICT (2026-08-02 12:25): 8/8 near-capacity cells PASS — llama3.3-70B (T2 192k·b2 + 448k WALL), glm4.7-flash (T3 + T1), mixtral-8x22b (T2 320k + T3 64k), q3.5-122b (T2 448k + 480k). Combined with Phase 3: 13/13 validation cells across 8 models, ZERO regressions in throughput / latency / peak HBM / RSS / loss.** Two incidents en route, both diagnosed to root cause and fixed/attributed: (1) X1 watchdog COOM = c14 node-accounting (pinned=Shmem, Grace-only avail) + floor artifact — trainer was reference-grade; (2) X7/X8 teardown-flake = pre-existing recorded q3.5 behavior. Post-push uncommitted (for Kevin): merge_progress.md, merge_validation.md, anchors_tmp queue2 scripts/logs/artifacts, LF-data llama/122b dataset copies.
+
 ## FINAL STATE (2026-08-01 ~21:0x)
 - Phases 1, 1b, 2, 2b, 3 (5/5 PASS), 4 — ALL COMPLETE. This repo + this workspace's LlamaFactory now carry the full union of 39 + 46 + SFT + 38 (selective, gated), validated near-capacity with no regression.
 - Uncommitted per house rule (Kevin commits): ~101 AsymGEMM paths + 6 LF files (dataset_info.json, parser.py, adapter.py, checkpointing.py, liger_kernel.py, moe.py) + Liger-Kernel's pre-existing 39 deltas.

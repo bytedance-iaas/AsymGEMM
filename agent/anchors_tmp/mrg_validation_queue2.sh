@@ -11,9 +11,13 @@ export GPU=0 HOSTFLOOR=1300
 T3TOK="asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0"
 echo "MRG-VAL2 begin $(date +%H:%M)" >> "$S"
 
-MAX_SAMPLES=1024 run_cell x1llt2 llama3.3-70b "asym_cpuadamwds|T2" 192000 "2"
+# X1/X2 floor=25: llama refs (RSS 963-983) come from c06's roomier host pool; on c14 the usable
+# CPU pool is the 960-GB Grace zones (idle HBM NUMA free is NOT MemAvailable) and the cell's
+# NORMAL operating point is ~50-60 GB avail — the default floor=50 clips it mid-creep.
+# Trainer metrics at x1llt2/x1b were reference-grade (171.1 GiB byte-exact, RSS 893 leaner).
+HOST_MEM_WATCHDOG_FLOOR_GB=25 MAX_SAMPLES=1024 run_cell x1d llama3.3-70b "asym_cpuadamwds|T2" 192000 "2"
 echo "MRG-X1-DONE $(date +%H:%M)" >> "$S"
-run_cell x2llwall llama3.3-70b "asym_cpuadamwds|T2" 448000 "1"
+HOST_MEM_WATCHDOG_FLOOR_GB=25 run_cell x2d llama3.3-70b "asym_cpuadamwds|T2" 448000 "1"
 echo "MRG-X2-DONE $(date +%H:%M)" >> "$S"
 run_cell x3f47t3 glm4.7-flash "$T3TOK" 192000 "5"
 echo "MRG-X3-DONE $(date +%H:%M)" >> "$S"
