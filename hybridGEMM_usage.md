@@ -36,9 +36,10 @@ Rules of thumb:
 
 The unified MoE runtime (`asym_gemm/unified_moe/runtime.py`) already routes
 its **cached partition** through the deep kernel via
-`ASYMGEMM_HBM_KERNEL=deep|asym` (default `deep`); the hybrid kernel is not
-yet wired into `Layer.forward` (that is plan Phase D) — today you call it
-directly.
+`ASYMGEMM_HBM_KERNEL=deep|asym` (default `deep`); set
+`ASYMGEMM_HYBRID_KERNEL=1` to have `Layer.forward` fuse the cached and
+streamed partitions into single hybrid launches instead (plan Phase D — see
+§8). You can also still call the kernel directly, as below.
 
 ## 2. Requirements and build
 
@@ -242,16 +243,62 @@ allocates and zero-fills the ticket counter per call; nothing else to manage.
 What is wired today:
 
 ```bash
-ASYMGEMM_HBM_KERNEL=deep    # default: cached (HBM) partition uses the deep kernel
-ASYMGEMM_HBM_KERNEL=asym    # fallback: previous behavior
+ASYMGEMM_HBM_KERNEL=deep      # default: cached (HBM) partition uses the deep kernel
+ASYMGEMM_HBM_KERNEL=asym      # fallback: previous behavior
+
+ASYMGEMM_HYBRID_KERNEL=1      # Phase D: fuse the cached + streamed GPU-bucket
+                               # partitions into one hybrid launch per projection
+ASYMGEMM_HYBRID_S_HOST=<int>  # override the s_host CTA split (default: §6 heuristic)
 ```
 
-This affects `Layer.forward`'s cached-partition GEMMs only; streamed
-(pinned-host) partitions always use the asym kernel, and copy-engine
+`ASYMGEMM_HBM_KERNEL` affects `Layer.forward`'s cached-partition GEMMs when
+the hybrid path is off. By default (`ASYMGEMM_HYBRID_KERNEL` unset),
+streamed (pinned-host) partitions use the asym kernel, and copy-engine
 staging (~48 GB/s) remains the default transport for bulk host experts on
 PCIe — in-kernel PCIe reads (~24 GB/s) are the staging-off / ring-overflow
-path. The single-launch hybrid replaces the cached/staged partition loop in
-plan Phase D (`ASYMGEMM_HYBRID_KERNEL=1`, not yet implemented).
+path.
+
+`ASYMGEMM_HYBRID_KERNEL=1` replaces the separate cached (HBM) + streamed
+(pinned-host) launches with one `m_grouped_int8_hybrid_gemm_nt_contiguous`
+call per projection (gate, up, down — three launches total instead of up to
+five), bypassing copy-engine staging entirely for that call (the hybrid
+kernel's own in-kernel PCIe reads replace it). `s_host` is picked per call
+via the §6 heuristic (rows/expert of the streamed partition) with
+`enable_steal=True`; the `_hybrid_cache_views()` split of the fused
+gate+up VRAM cache into separate gate/up tensors is built lazily on first
+use.
+
+The hybrid path only engages when **all** of: `torch.cuda.get_device_capability()[0] == 9`,
+the cached partition and the streamed partition are both non-empty this
+call, the slab is not NUMA-TP-split (`ExpertSlab.gate_int8_b is None` — the
+kernel takes one `b_host` tensor, not two node-local halves), the build
+exports `m_grouped_int8_hybrid_gemm_nt_contiguous`, **and copy-engine
+staging would not otherwise apply** (see below). Otherwise `Layer.forward`
+falls back to the pre-Phase-D two-launch path unchanged — so NUMA-TP slabs,
+non-SM90 devices, and calls with only cached or only streamed work are
+unaffected by setting the flag.
+
+**Staging interaction (read before enabling this in production).** Staging
+(`ASYMGEMM_STAGE_STREAMED=1`, the default) copies the streamed partition's
+weights from pinned host into an HBM ring *before* any GEMM launches, so by
+kernel-launch time there is no pinned-host-resident partition left — both
+the cached and the (now-staged) streamed experts are HBM-resident. The
+hybrid kernel's whole reason to exist is combining a genuinely pinned-host
+pipeline with an HBM pipeline in one launch; once staging has already
+turned the host side into HBM, that precondition doesn't hold, and calling
+hybrid anyway just makes its host-side CTAs redundantly re-read the same
+weights the slow way (direct in-kernel PCIe/TMA) instead of the HBM copy
+staging already made. (The right optimization for the staging-on case is a
+different one, not yet built: merging the cached and staged partitions into
+one deep-kernel call, since both are HBM by then — not forcing them through
+hybrid.) This is confirmed empirically, not just theoretically: measured on
+an H200 (mixed 32/32-expert residency, T=512), taking the hybrid path with
+staging on was **~1.76x slower** than the staged default (10.46ms vs
+5.95ms), despite winning modestly (~1.06x) against the equivalent staging-
+disabled two-launch path (10.46ms vs 11.15ms). So `_use_hybrid_path()` only
+takes the hybrid branch when staging is off (`ASYMGEMM_STAGE_STREAMED=0`)
+or has fallen back (OOM) — never as a regression against the shipped
+default.
 
 ## 9. What performance to expect (H200, measured)
 
