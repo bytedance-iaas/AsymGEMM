@@ -1010,6 +1010,13 @@ def _install_model_capture_hook() -> None:
         return
 
     def wrapped_load_model(*args: Any, **kwargs: Any) -> Any:
+        # (2026-08-06: an ASYM_STAGGER_RANK_LOAD serialization experiment for
+        # the mixtral 2-rank load transient lived here briefly and was
+        # REMOVED — the zero3 load is collective (per-param
+        # GatheredParameters), so whole-load serialization mispairs
+        # collectives, and both ranks must hold their converted state dicts
+        # simultaneously anyway. The real fix is a pre-fused checkpoint (no
+        # load-time expert conversion); see motivation_plots_v2.md 08-06.)
         return _capture_loaded_model(original_load_model(*args, **kwargs))
 
     wrapped_load_model._asym_gemm_profile_capture = True  # type: ignore[attr-defined]

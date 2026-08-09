@@ -1,0 +1,97 @@
+# DEFERRED tex hunks — fig 3 (m6-tradeoff) real-value campaign 2026-08-02/03
+# (per the propagation rule: the FIGURE PDF is synced+pushed immediately; these
+# PROSE/caption hunks wait for the writing pass. Apply to
+# agent/overleaf/[MLSys 26 Sub] Superchip-based LoRA/sections/motivations.tex.)
+#
+# Campaign record: profiling_results/motivation/m6_v2.json (all cells + walls
+# + the three findings that moved the top-row lengths 800K/1.1M/1.4M ->
+# 80K/1.1M/1.6M). 2026-08-05 evening (Kevin): the MIXTRAL ROW IS REMOVED
+# from the figure (the qwen row alone shows the benefits; pushed 5dddf1e) —
+# fig 3 is single-model again. The measured mixtral cells/walls stay banked
+# (m6_v2.json, f1settle192 + m6mx* tags).
+#
+# 2026-08-05 (FINAL): SHORT COLUMN = 256K b1 (after 80K-b8 -> 800K-b1
+# detours; 800K was T1-parity +0.3%). Kevin's criteria: T1 meaningfully
+# above T2, absolute scale not dwarfing the 1.1M ~387 bars. Fresh same-day
+# trio (m6qmt1256/m6qmt2b256/m6qmt3256, w1+m2): T1 1764.5 tok/s · 67.3 GiB
+# > T2 1498.5 · 38.7 > T3 1356.1 · 33.1 — T1 crown +17.8%, T2 over T3
+# +10.5%, scale 4.6x the 1.1M column. ALL cells measured (the estimate/
+# black-border clause is GONE from the caption). Figure pushed 11fd912;
+# bank entry short_column_256k_2026_08_05 in m6_v2.json.
+
+── HUNK 1: §2.4.2 prose sentence (currently ~line 246) ────────────────────────
+OLD:
+Figure~\ref{fig:motivation-m6} plots training throughput and peak GPU
+memory for T1, T2, and T3 at 800K, 1.1M, and 1.4M tokens on
+Qwen3-30B-A3B, with capacity walls marked.
+NEW:
+Figure~\ref{fig:motivation-m6} plots training throughput and peak GPU
+memory for T1, T2, and T3 at 256K, 1.1M, and 1.6M tokens on
+Qwen3-30B-A3B, with capacity walls marked.
+# (FINAL 08-05, 256K column: the crown sentence HOLDS again — measured
+#  margins 1764.5 > 1498.5 > 1356.1 (T1 +17.8% over T2); 1.1M T2 crowns
+#  +3.5% over T3 (same-day pair); 1.6M T3=292 sole-healthy. Memory ladder
+#  at 256K: 67.3 > 38.7 > 33.1.)
+
+── HUNK 3 (REV 08-04, v3 layout — supersedes the 08-03 version of this hunk):
+── fig 1 caption (fig:motivation, ~line 27) ───────────────────────────────────
+# fig 1 real-value campaigns (bank: profiling_results/motivation/fig1_v2.json;
+# 1a pushed b642f83, 1b v3 pushed f5214c6). Caption updates REQUIRED:
+# (i) "a few percent" -> measured share is under half a percent;
+# (ii) panel (b) is now per-model short/long bars under SuperOffload (r16),
+#      hatched = CPU-offloaded (estimated), plain = GPU-measured; models are
+#      Qwen3-30B-A3B (192K/640K) and Mixtral-8x22B (128K/256K), batch 1.
+OLD:
+  \caption{Model-state offloading's premise under LoRA. (a) The
+  optimizer step is a few percent of step time for dense (Qwen3-32B)
+  and MoE (Qwen3-30B-A3B) LoRA fine-tuning, so runtime machinery
+  centered on it moves little. (b) With model states off the GPU,
+  activations dominate the remaining memory peak at long context.}
+NEW:
+  \caption{Model-state offloading's premise under LoRA. (a) The
+  optimizer step is at most a tenth of a percent of step time for
+  Qwen3-30B-A3B and Mixtral-8x22B LoRA fine-tuning at 128K tokens
+  (batch 1) under both ZeRO-3 Offload and SuperOffload (the
+  optimizer band is drawn at a minimum visible height; labels give
+  the measured share), and each model's two steps are near-identical
+  ($0.99\times$ both) --- runtime machinery centered on the
+  optimizer moves nothing end-to-end. (b) Peak training memory under
+  SuperOffload (rank-16 adapters, batch 1) at a shorter and a longer
+  sequence length: the offloaded model states (hatched: frozen
+  weights and adapter/optimizer state, CPU-resident) are constant in
+  sequence length, while the GPU-resident activation footprint (saved
+  activations and transient working set) grows with context ---
+  Qwen3-30B-A3B 55$\to$177~GiB from 192K to 640K tokens,
+  Mixtral-8x22B 85$\to$161~GiB from 128K to 256K --- until the GPU
+  share alone overflows the device (OOM marks: measured capacity
+  walls at 800K and 320K): at long context, activations are the
+  memory problem offloading does not solve.}
+# (CPU segments are arithmetic estimates from the runs' exact trainable
+#  counts — 843.8M / 519.3M params, fp32 W+G+m+v — + frozen bf16 bytes;
+#  GPU segments are measured allocator-peak breakdowns.)
+
+── HUNK 2: fig 3 caption (currently ~line 316) ────────────────────────────────
+OLD:
+  \caption{Memory--throughput tradeoff (Qwen3-30B-A3B, batch 1):
+  training throughput and peak GPU memory across the configuration
+  ladder of increasing intra-layer swap and streaming-kernel usage
+  (T1 to T3; exact compositions in Table~\ref{tab:tiers},
+  \S\ref{sec:design-profiler}) at 800K, 1.1M, and 1.4M tokens. Plain
+  bars are measured campaign cells; black-bordered bars are estimates
+  extrapolated from the same configuration's measured cells; OOM
+  marks are capacity determinations rather than attempted runs. Each
+  length crowns a different configuration.}
+NEW:
+  \caption{Memory--throughput tradeoff (Qwen3-30B-A3B, batch 1):
+  training throughput and peak GPU memory across the configuration
+  ladder of increasing intra-layer swap and streaming-kernel usage
+  (T1 to T3; exact compositions in Table~\ref{tab:tiers},
+  \S\ref{sec:design-profiler}) at 256K, 1.1M, and 1.6M tokens.
+  Every bar is a measured cell; every OOM mark is an empirical capacity wall:
+  an attempted run that aborts, a longer length past one (peak memory
+  being monotone in tokens), or a run that completes only at 99\% of
+  device memory, outside the Selector's safety band
+  (\S\ref{sec:design-profiler}). Each length crowns a different
+  configuration.}
+# (08-05 FINAL: the closing crown sentence is TRUE at every column of the
+#  256K/1.1M/1.6M row — margins in HUNK 1's comment.)

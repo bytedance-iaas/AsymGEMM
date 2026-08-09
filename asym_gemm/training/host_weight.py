@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import re
+import threading
 import time
 from typing import Any
 
@@ -139,6 +140,45 @@ def _cpu_socket_for_numa_node(numa_node: int | None) -> int | None:
 
 from .exact_pinned import exact_pinned_enabled, register_inplace
 
+# ── FORCE_CLONE slab (capacity fix 2026-08-05 rev B) ─────────────────────────
+# Round-15 finding (m6mxg1t2b416/m6mxg1t3416): per-tensor clone+register of the
+# mixtral bank (~672 registrations) later collides with the driver's own
+# pinning on GB200 — cudaErrorAlreadyMapped at the first save_on_cpu pack.
+# Rev B follows the shared_fabric precedent: ALL force-cloned homes live in ONE
+# pageable slab page-locked by a single cudaHostRegister. Slab size:
+# ASYM_EXACT_PINNED_CLONE_SLAB_GB (default 284 — the mixtral pinned-home total
+# is ~281 GB). Exhaustion or register failure falls back to the stock
+# pin_memory() path (pow2-billed, correct).
+_CLONE_SLAB: "torch.Tensor | bool | None" = None
+_CLONE_SLAB_OFF = 0
+_CLONE_SLAB_LOCK = threading.Lock()
+
+
+def _force_clone_enabled() -> bool:
+    return os.environ.get("ASYM_EXACT_PINNED_FORCE_CLONE", "").strip().lower() in {
+        "1", "true", "yes", "y", "on"
+    }
+
+
+def _clone_slab_take(nbytes: int) -> "torch.Tensor | None":
+    global _CLONE_SLAB, _CLONE_SLAB_OFF
+    with _CLONE_SLAB_LOCK:
+        if _CLONE_SLAB is None:
+            gb = float(os.environ.get("ASYM_EXACT_PINNED_CLONE_SLAB_GB", "284"))
+            slab = torch.empty(int(gb * (1 << 30)), dtype=torch.uint8)
+            if register_inplace(slab) is not None:
+                _CLONE_SLAB = False
+                return None
+            _CLONE_SLAB = slab
+        if _CLONE_SLAB is False:
+            return None
+        aligned = (_CLONE_SLAB_OFF + 4095) // 4096 * 4096
+        if aligned + nbytes > _CLONE_SLAB.numel():
+            return None
+        view = _CLONE_SLAB.narrow(0, aligned, nbytes)
+        _CLONE_SLAB_OFF = aligned + nbytes
+        return view
+
 
 def _make_metadata(tensor: torch.Tensor, pin_error: str | None = None) -> HostWeightMetadata:
     data_ptr = tensor.data_ptr()
@@ -242,6 +282,21 @@ class HostWeight:
                 self._fabric_bank = True
             else:
                 pin_start = time.perf_counter()
+                if exact_pinned_enabled() and not exclusively_owned and _force_clone_enabled():
+                    # capacity fix 2026-08-05 rev B (mixtral bank pow2 tax): copy
+                    # the loader-owned alias into the single pre-registered clone
+                    # slab (one cudaHostRegister process-wide — see _clone_slab_take).
+                    # Slab miss falls through to the stock pin_memory() path.
+                    src = cpu_tensor.contiguous()
+                    nbytes = src.numel() * src.element_size()
+                    slab_view = _clone_slab_take(nbytes)
+                    if slab_view is not None:
+                        dst = slab_view.view(src.dtype).view(src.shape)
+                        with torch.no_grad():
+                            dst.copy_(src)
+                        dst.requires_grad_(False)
+                        cpu_tensor = dst
+                        exclusively_owned = True
                 exact_err: str | None = "disabled"
                 if exact_pinned_enabled() and exclusively_owned:
                     # capacity fix 2026-07-25: page-lock the exact-size clone in
