@@ -876,6 +876,13 @@ _ASYM_LIGER_GENERIC_MOE_MODEL_TYPES = {
     "glm4_moe",
     "glm4_moe_lite",
     "gpt_oss",
+    # Jamba2-Mini (model_integration.md #7) is deliberately ABSENT: the
+    # instance bridge's FLCE hits a Triton IMA in liger_cross_entropy_kernel
+    # under every asym tier on Jamba (jgate_t3*/jab_t1f, 2026-08-09), while
+    # the CLASS-level vendored applier (apply_liger_kernel_to_jamba — the
+    # DS-safe mechanism, LF resolver) runs the same fused math cleanly on
+    # BOTH asym and baseline backends (T3 20.5 GiB vs uns-off 24.7 @32k·b1,
+    # loss parity). Jamba therefore rides the class patch only.
 }
 
 

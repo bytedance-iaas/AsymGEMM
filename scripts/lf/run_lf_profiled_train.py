@@ -3584,8 +3584,29 @@ class LFProfileRecorder:
         }
 
 
+def _install_fsdp2_multibackend_pg() -> None:
+    # run_baselines.md §8 (ported): with ASYM_FSDP2_MULTIBACKEND=1, rewrite the process-group
+    # backend to torch's multi-backend spec so CPU-DTensor collectives (FSDP2 CPU-offload
+    # grad-norm) get gloo while cuda keeps nccl. Choke point: accelerate calls
+    # torch.distributed.init_process_group.
+    if os.environ.get("ASYM_FSDP2_MULTIBACKEND", "").strip() not in {"1", "true"}:
+        return
+    import torch.distributed as _dist
+
+    _orig_init = _dist.init_process_group
+
+    def _patched_init(backend=None, *args, **kwargs):
+        if backend is None or backend == "nccl":
+            backend = "cpu:gloo,cuda:nccl"
+        return _orig_init(backend, *args, **kwargs)
+
+    _dist.init_process_group = _patched_init
+    print("[asym] ASYM_FSDP2_MULTIBACKEND: init_process_group -> cpu:gloo,cuda:nccl", flush=True)
+
+
 def main() -> None:
     global _GRAD_CLIP_MARKER, _MODEL_CAPTURE_HEARTBEAT, _MODEL_CAPTURE_PARTIAL_WRITER
+    _install_fsdp2_multibackend_pg()
 
     lf_args = sys.argv[1:]
     if lf_args and lf_args[0] == "train":

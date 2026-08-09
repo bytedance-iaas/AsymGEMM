@@ -11,7 +11,9 @@ S="$LOGD/tpfig_status.log"
 B=profiling_results/profiling/asym_long_sft_smoke__lora__lf__bf16
 
 guard() { for i in $(seq 1 180); do
-    n=$(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l)
+    # count only LIVE holders — c14's driver keeps ghost entries for dead pids
+    n=0; for p in $(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do
+      p=${p//,/}; [ -d "/proc/$p" ] && n=$((n+1)); done
     a=$(free -g | awk 'NR==2{print $7}')
     if [ "$n" -eq 0 ] && [ "$a" -ge "${HOSTFLOOR:?}" ]; then return 0; fi
     if [ $((i % 9)) -eq 0 ]; then

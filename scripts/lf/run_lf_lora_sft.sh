@@ -236,6 +236,7 @@ declare -A WATCHDOG_FLOOR_GB_BY_MODEL=(
   ["zai-org/GLM-4.5-Air"]=50
   ["zai-org/GLM-4.7-Flash"]=35
   ["openai/gpt-oss-120b"]=50
+  ["ai21labs/AI21-Jamba2-Mini"]=50
 )
 if [[ -z "${HOST_MEM_WATCHDOG_FLOOR_GB:-}" ]]; then
   if [[ "${HOST_MEM_WATCHDOG,,}" == "true" ]]; then
@@ -299,6 +300,8 @@ unset KT_BACKEND                      # Not user-facing; derive the KT enum only
 KT_BACKEND_INTERNAL=""
 ZERO_BACKEND_LABEL=""
 TORCH_DEEPSPEED_CONFIG=""
+FSDP_BACKEND_LABEL=""
+FSDP_CONFIG_JSON=""
 CPUADAM_ALIAS_SELECTED=0
 TORCHRUN_CMD=()
 ACCELERATE_CMD=()
@@ -395,6 +398,22 @@ case "${BACKEND,,}" in
     ZERO_BACKEND_LABEL=zero3_cpuadam
     BACKEND=torch
     TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero3_cpuadam)"
+    ;;
+  fsdp2_offload)
+    # run_baselines.md §2 (ported to the 39 base 2026-08-03; validated on the 46 tree first):
+    # FSDP2 CPU-offload baseline — plain BACKEND token like zero3*/superoffload*, true FSDP2
+    # (fully_shard, fsdp_version 2) via HF-native --fsdp + fsdp_config json. Offloads
+    # params+grads+optimizer to host (sanity band: ≈ superoffload). No DeepSpeed involvement.
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-fsdp2_offload}
+    FSDP_BACKEND_LABEL=fsdp2_offload
+    BACKEND=torch
+    if [[ -f "${LF_DIR}/examples/deepspeed/fsdp2_offload_config.json" ]]; then
+      FSDP_CONFIG_JSON="${LF_DIR}/examples/deepspeed/fsdp2_offload_config.json"
+    else
+      FSDP_CONFIG_JSON="${LF_DS_CONFIG_DIR}/fsdp2_offload_config.json"
+    fi
+    CHECK_SUPEROFFLOAD=0
+    CHECK_CPUADAM=0
     ;;
   superoffload)
     PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-superoffload}
@@ -2746,6 +2765,20 @@ if is_zero_backend_run; then
   CMD_ARGS+=(--deepspeed "${TORCH_DEEPSPEED_CONFIG}")
 fi
 assert_deepspeed_scope
+
+if [[ -n "${FSDP_BACKEND_LABEL}" ]]; then
+  if [[ ! -f "${FSDP_CONFIG_JSON}" ]]; then
+    echo "fsdp2_offload requires its config json; missing: ${FSDP_CONFIG_JSON}" >&2
+    exit 2
+  fi
+  CMD_ARGS+=(--fsdp "full_shard offload auto_wrap" --fsdp_config "${FSDP_CONFIG_JSON}")
+  # rank-2: CPU-DTensor grad-norm needs a cpu-capable pg backend (wrapper rewrites
+  # init_process_group under this env); CPU-side model load (LF patcher opt-in) avoids
+  # the loader's half-model GPU warmup alloc (122B incident).
+  RUN_ENV+=(ASYM_FSDP2_MULTIBACKEND=1)
+  RUN_ENV+=(ASYM_FSDP2_CPU_LOAD=1)
+  RUN_ENV+=(ASYM_FSDP2_LOAD_FP32=1)
+fi
 
 if [[ "${PROFILE}" == "1" ]]; then
   profile_precision="${ASYM_PRECISION}"
