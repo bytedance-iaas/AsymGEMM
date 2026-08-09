@@ -1,17 +1,31 @@
 #!/bin/bash
 # Shared library for the tp-vs-seq figure campaign chains (sourced).
-# Env expected: GPU (index), HOSTFLOOR (GB available required to start).
-cd /workspace/AsymGEMM-SFT-39/third_party/AsymGEMM
+# c18 COPY of the SFT-39 template (run_glms.md §4): paths -> SFT-46 tree,
+# RUN_NAME/dirname suffix -c18_, NUMACTL pinning added (c18 house protocol;
+# GPU HBM = NUMA nodes 2/10/18/26 — never bind those, CPU = 0,1).
+# Env expected: GPU (index or "0,1"), HOSTFLOOR (GB available required to start).
+cd /workspace/AsymGEMM-SFT-46/third_party/AsymGEMM
 export PROFILERS=source MAX_STEPS=2 WARMUP_STEPS=1 MAX_SAMPLES=512 DATASET_OVERWRITE=false OVERWRITE=false
 export ASYM_ZERO_ROUTER_JITTER=1 TRUST_REMOTE_CODE=false
 export HF_HOME=/scratch_local/user_data/shutian/kevin/cache/huggingface
+export NUMACTL_ENABLE=1 NUMACTL_MODE=membind NUMACTL_MEMBIND=0,1 NUMACTL_CPUNODEBIND=0,1
 export CUDA_VISIBLE_DEVICES=${GPU:?}
-LOGD=/workspace/AsymGEMM-SFT-39/third_party/AsymGEMM/agent/anchors_tmp
+LOGD=/workspace/AsymGEMM-SFT-46/third_party/AsymGEMM/agent/anchors_tmp
 S="$LOGD/tpfig_status.log"
 B=profiling_results/profiling/asym_long_sft_smoke__lora__lf__bf16
 
 guard() { for i in $(seq 1 180); do
-    n=$(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l)
+    # count only LIVE holders — the driver keeps ghost entries for dead pids
+    n=0; for p in $(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do
+      p=${p//,/}; [ -d "/proc/$p" ] && n=$((n+1)); done
+    # stale fabric arenas from SIGBUS/killed teardowns hold tmpfs pages that
+    # count against MemAvailable (2026-08-05: a full 479G shm pinned avail
+    # below the floor and wedged this guard for 40 min) — clean when no
+    # trainer is alive to own them.
+    if [ "$n" -eq 0 ] && ls /dev/shm/asym_* >/dev/null 2>&1; then
+      echo "GUARD-SHM-CLEAN $(ls /dev/shm | head -3 | tr '\n' ' ') $(date +%H:%M)" >> "$S"
+      rm -f /dev/shm/asym_* 2>/dev/null || true
+    fi
     a=$(free -g | awk 'NR==2{print $7}')
     if [ "$n" -eq 0 ] && [ "$a" -ge "${HOSTFLOOR:?}" ]; then return 0; fi
     if [ $((i % 9)) -eq 0 ]; then
@@ -39,10 +53,10 @@ run_cell() { local tag="$1" model="$2" systok="$3" seq="$4" blist="$5" policy="$
   for b in $blist; do
     guard || return 1
     echo "START $tag $model $systok s=$seq b=$b r=$ranks $(date +%H:%M)" >> "$S"
-    RUN_NAME="${tag}-c14_${model}" RUNS="${model}|${ranks} ; ${systok}|ligerloss1 ; ${seq}|${b}|1 ; ${policy}" \
+    RUN_NAME="${tag}-c18_${model}" RUNS="${model}|${ranks} ; ${systok}|ligerloss1 ; ${seq}|${b}|1 ; ${policy}" \
       bash scripts/lf/profile_lora_lf_test_source.sh >> "$LOGD/r_${tag}_b${b}.log" 2>&1
     local dmodel=${model//./_}
-    v=$(verdict "${tag}-c14_${dmodel}__b${b}_s${seq}_ga1_drop000" "$LOGD/r_${tag}_b${b}.log")
+    v=$(verdict "${tag}-c18_${dmodel}__b${b}_s${seq}_ga1_drop000" "$LOGD/r_${tag}_b${b}.log")
     echo "CELL $tag $systok s=$seq b=$b -> $v $(date +%H:%M)" >> "$S"
     [ "$v" = "TRAINED" ] && break
     [ "$v" = "FAIL" ] && break

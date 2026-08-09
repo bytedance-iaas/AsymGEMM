@@ -2158,6 +2158,28 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
                     global_step=step,
                     error=repr(exc),
                 )
+                # 2026-08-05 (run_glms.md rc-2r FAIL class): on multi-rank runs
+                # a fatal forward error (e.g. a routing-dependent OOM on one
+                # rank only) must hard-exit HERE, and BEFORE partial_writer —
+                # its write path hangs on an OOM'd rank (verified by mtimes:
+                # heartbeat lands at the exception moment, partial_profile
+                # only at teardown 26 min later). Re-raising is no better:
+                # the DeepSpeed unwind stalls in collective cleanup while the
+                # healthy peer keeps issuing ZeRO-3 fetches, so the run dies
+                # only via the 25-minute NCCL watchdog SIGABRT with the real
+                # verdict unlogged. Print for the chain's verdict grep,
+                # flush, exit; torchrun reaps the peer within its monitor
+                # interval.
+                print(
+                    f"[asym] model_forward fatal on rank {os.environ.get('RANK', '0')}: {exc!r}",
+                    flush=True,
+                )
+                if int(os.environ.get("WORLD_SIZE", "1") or "1") > 1:
+                    try:
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+                    finally:
+                        os._exit(13)
                 partial_writer.write("model_forward_exception", force=True, extra={"error": repr(exc)})
                 raise
             heartbeat.emit("model_forward_exit", trainer_class=self.__class__.__name__, global_step=step)
@@ -3489,7 +3511,16 @@ class LFProfileRecorder:
                 )
         return rows
 
-    def report(self, trace_handle: LFTraceHandle | None = None) -> dict[str, Any]:
+    def report(self, trace_handle: LFTraceHandle | None = None, model_walk: bool = True) -> dict[str, Any]:
+        # model_walk=False (2026-08-05, run_glms.md rc-2r desync): the counter
+        # helpers below walk model modules and touch parameters; under live
+        # multi-rank ZeRO-3 a partitioned-param touch triggers a BLOCKING
+        # rank-local allgather (ZeROOrderedDict auto-gather). report() runs
+        # rank0-only in main()'s finally, so on an exception path (e.g. this
+        # rank's CUDA OOM) that solo collective interleaves with the peer's
+        # still-running forward fetches -> NCCL SeqNum mismatch -> 25-min
+        # watchdog SIGABRT that masks the real verdict. Callers pass
+        # model_walk=False when the run failed with world_size > 1.
         forward_ms = self._stage_total_ms("step.forward")
         backward_ms = self._stage_total_ms("step.backward")
         stage_rows = self._stage_rows()
@@ -3503,11 +3534,18 @@ class LFProfileRecorder:
             trainer_records, self.config
         )
         losses = self._loss_rows(trainer_records)
-        lora = _lora_counters_from_model()
-        kt = _kt_counters_from_model(self.config)
-        activation_offload = _activation_offload_counters_from_model()
-        asym_execution_stats = _asym_execution_stats_from_model()
-        asym_liger_lm_head_bridge = _asym_liger_lm_head_bridge_from_model()
+        if model_walk:
+            lora = _lora_counters_from_model()
+            kt = _kt_counters_from_model(self.config)
+            activation_offload = _activation_offload_counters_from_model()
+            asym_execution_stats = _asym_execution_stats_from_model()
+            asym_liger_lm_head_bridge = _asym_liger_lm_head_bridge_from_model()
+        else:
+            lora = {}
+            kt = {}
+            activation_offload = {}
+            asym_execution_stats = {}
+            asym_liger_lm_head_bridge = {}
         process_memory = _process_memory_snapshot()
         return {
             "workload": self.config.get("workload", "lf"),
@@ -3591,8 +3629,29 @@ class LFProfileRecorder:
         }
 
 
+def _install_fsdp2_multibackend_pg() -> None:
+    # run_baselines.md §8 (ff2a384): with ASYM_FSDP2_MULTIBACKEND=1, rewrite the
+    # process-group backend to torch's native multi-backend spec so CPU-DTensor
+    # collectives (FSDP2 CPU-offload grad-norm) get gloo while cuda keeps nccl.
+    # Single choke point: accelerate calls torch.distributed.init_process_group.
+    if os.environ.get("ASYM_FSDP2_MULTIBACKEND", "").strip() not in {"1", "true"}:
+        return
+    import torch.distributed as _dist
+
+    _orig_init = _dist.init_process_group
+
+    def _patched_init(backend=None, *args, **kwargs):
+        if backend is None or backend == "nccl":
+            backend = "cpu:gloo,cuda:nccl"
+        return _orig_init(backend, *args, **kwargs)
+
+    _dist.init_process_group = _patched_init
+    print("[asym] ASYM_FSDP2_MULTIBACKEND: init_process_group -> cpu:gloo,cuda:nccl", flush=True)
+
+
 def main() -> None:
     global _GRAD_CLIP_MARKER, _MODEL_CAPTURE_HEARTBEAT, _MODEL_CAPTURE_PARTIAL_WRITER
+    _install_fsdp2_multibackend_pg()
 
     lf_args = sys.argv[1:]
     if lf_args and lf_args[0] == "train":
@@ -3682,6 +3741,23 @@ def main() -> None:
         run_exception = exc
         heartbeat.emit("profile_launcher_exception", error=repr(exc))
         partial_writer.write("profile_launcher_exception", force=True, extra={"error": repr(exc)})
+        # 2026-08-05 (run_glms.md rc-2r FAIL class): print the fatal error to
+        # stdout so the chain's verdict grep sees it (heartbeat alone is not
+        # scraped), then on multi-rank runs hard-exit. An asymmetrically dying
+        # rank (e.g. a routing-dependent OOM on one rank only) otherwise
+        # leaves the peer blocked in its next ZeRO-3 allgather until the
+        # 25-minute NCCL watchdog SIGABRT buries the real verdict; a hard
+        # exit lets torchrun reap the peer within its monitor interval.
+        print(
+            f"[asym] profile_launcher fatal on rank {os.environ.get('RANK', '0')}: {exc!r}",
+            flush=True,
+        )
+        if int(os.environ.get("WORLD_SIZE", "1") or "1") > 1:
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            finally:
+                os._exit(13)
         raise
     finally:
         heartbeat.emit("profile_launcher_finally", success=run_succeeded)
@@ -3699,7 +3775,10 @@ def main() -> None:
             snapshot_path_raw = os.environ.get(PROFILE_MEMORY_SNAPSHOT_PATH_ENV, "").strip()
             snapshot_path = Path(snapshot_path_raw) if snapshot_path_raw else write_path.parent / "memory_snapshot.pickle"
             snapshot_info = _dump_memory_snapshot(snapshot_info, snapshot_path)
-            report = recorder.report(trace_handle)
+            report = recorder.report(
+                trace_handle,
+                model_walk=(run_succeeded or int(os.environ.get("WORLD_SIZE", "1") or "1") <= 1),
+            )
             if not run_succeeded:
                 report["partial"] = True
                 report["partial_reason"] = "profile_launcher_exception"

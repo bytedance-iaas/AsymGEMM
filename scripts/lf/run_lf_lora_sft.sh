@@ -301,6 +301,8 @@ unset KT_BACKEND                      # Not user-facing; derive the KT enum only
 KT_BACKEND_INTERNAL=""
 ZERO_BACKEND_LABEL=""
 TORCH_DEEPSPEED_CONFIG=""
+FSDP_BACKEND_LABEL=""
+FSDP_CONFIG_JSON=""
 CPUADAM_ALIAS_SELECTED=0
 TORCHRUN_CMD=()
 ACCELERATE_CMD=()
@@ -397,6 +399,25 @@ case "${BACKEND,,}" in
     ZERO_BACKEND_LABEL=zero3_cpuadam
     BACKEND=torch
     TORCH_DEEPSPEED_CONFIG="$(zero_deepspeed_config zero3_cpuadam)"
+    ;;
+  fsdp2_offload)
+    # run_baselines.md §2 (2026-08-02): FSDP2 CPU-offload baseline. Interface contract:
+    # plain BACKEND token exactly like zero3*/superoffload* — same RUNS grammar, same
+    # recompute-token semantics, torchrun |1 and |2 via the normal model|N spec. True
+    # FSDP2 (torch fully_shard): HF-native --fsdp "full_shard offload" + fsdp_config
+    # json with fsdp_version: 2 (LF forces use_reentrant_gc=False under fsdp2 itself).
+    # Offloads params+grads+optimizer to host = the ZeRO3-Offload placement class
+    # (sanity band: results ≈ superoffload). No DeepSpeed involvement.
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-fsdp2_offload}
+    FSDP_BACKEND_LABEL=fsdp2_offload
+    BACKEND=torch
+    if [[ -f "${LF_DIR}/examples/deepspeed/fsdp2_offload_config.json" ]]; then
+      FSDP_CONFIG_JSON="${LF_DIR}/examples/deepspeed/fsdp2_offload_config.json"
+    else
+      FSDP_CONFIG_JSON="${LF_DS_CONFIG_DIR}/fsdp2_offload_config.json"
+    fi
+    CHECK_SUPEROFFLOAD=0
+    CHECK_CPUADAM=0
     ;;
   superoffload)
     PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-superoffload}
@@ -2748,6 +2769,24 @@ if is_zero_backend_run; then
   CMD_ARGS+=(--deepspeed "${TORCH_DEEPSPEED_CONFIG}")
 fi
 assert_deepspeed_scope
+
+if [[ -n "${FSDP_BACKEND_LABEL}" ]]; then
+  if [[ ! -f "${FSDP_CONFIG_JSON}" ]]; then
+    echo "fsdp2_offload requires its config json; missing: ${FSDP_CONFIG_JSON}" >&2
+    exit 2
+  fi
+  # HF-native FSDP: the "offload" flag carries param/grad/optimizer CPU offload;
+  # fsdp_version 2 in the json selects torch fully_shard (accelerate >= 1.11).
+  CMD_ARGS+=(--fsdp "full_shard offload auto_wrap" --fsdp_config "${FSDP_CONFIG_JSON}")
+  # rank-2 fix (run_baselines.md §8, ff2a384): FSDP2 CPU-offload keeps grads on host;
+  # grad-norm clipping reduces the total norm over CPU DTensors, which needs a CPU-capable
+  # process-group backend. --ddp_backend rejects torch's multi-backend syntax (choices
+  # metadata), so run_lf_profiled_train.py rewrites init_process_group under this env
+  # (nccl -> "cpu:gloo,cuda:nccl"). Harmless at |1.
+  RUN_ENV+=(ASYM_FSDP2_MULTIBACKEND=1)
+  RUN_ENV+=(ASYM_FSDP2_CPU_LOAD=1)
+  RUN_ENV+=(ASYM_FSDP2_LOAD_FP32=1)
+fi
 
 if [[ "${PROFILE}" == "1" ]]; then
   profile_precision="${ASYM_PRECISION}"
