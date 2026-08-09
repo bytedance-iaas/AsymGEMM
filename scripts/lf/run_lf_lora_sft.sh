@@ -231,6 +231,8 @@ declare -A WATCHDOG_FLOOR_GB_BY_MODEL=(
   ["Qwen/Qwen3.5-122B-A10B"]=50
   ["Qwen/Qwen3-235B-A22B"]=60
   ["mistralai/Mixtral-8x22B-v0.1"]=50
+  # fused-format local copy (2026-08-06, bit-identical weights; same floor)
+  ["/scratch_local/user_data/shutian/kevin/cache/fused/Mixtral-8x22B-v0.1"]=50
   ["microsoft/Phi-3.5-MoE-instruct"]=35
   ["tencent/Hunyuan-A13B-Instruct"]=50
   ["zai-org/GLM-4.5-Air"]=50

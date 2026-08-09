@@ -254,15 +254,26 @@ def _cpu_pool_shape_key(key: tuple[torch.dtype, tuple[int, ...], bool]) -> str:
 
 
 def _trim_cpu_pool(max_cached_bytes: int) -> None:
+    # Exact-registered buffers (ASYM_EXACT_PINNED_SAVED) are never evicted:
+    # their cudaHostRegister is process-lifetime, so freeing the storage would
+    # leave a dangling registration on reused/unmapped pages.
     global _CPU_BUFFER_POOL_EVICTIONS
     while _cpu_pool_cached_bytes() > max_cached_bytes and _CPU_BUFFER_POOL:
-        key = next(iter(_CPU_BUFFER_POOL))
-        tensors = _CPU_BUFFER_POOL[key]
-        if tensors:
-            tensors.pop()
-            _CPU_BUFFER_POOL_EVICTIONS += 1
-        if not tensors:
-            _CPU_BUFFER_POOL.pop(key, None)
+        evicted = False
+        for key in list(_CPU_BUFFER_POOL):
+            tensors = _CPU_BUFFER_POOL[key]
+            for i in range(len(tensors) - 1, -1, -1):
+                if not getattr(tensors[i], "_asym_exact_registered", False):
+                    tensors.pop(i)
+                    _CPU_BUFFER_POOL_EVICTIONS += 1
+                    evicted = True
+                    break
+            if not tensors:
+                _CPU_BUFFER_POOL.pop(key, None)
+            if evicted:
+                break
+        if not evicted:
+            return
 
 
 def activation_offload_cpu_pool_stats() -> dict[str, Any]:
@@ -335,11 +346,24 @@ def _alloc_cpu(
         for dim in alloc_shape:
             nbytes *= int(dim)
         if pinned_ledger.try_reserve(fam, nbytes):
-            try:
-                base = torch.empty(alloc_shape, device="cpu", dtype=dtype, pin_memory=True)
-            except RuntimeError:
-                pinned_ledger.release(fam, nbytes)
-                return _narrow(torch.empty(alloc_shape, device="cpu", dtype=dtype))
+            base = None
+            from . import exact_pinned
+
+            if exact_pinned.exact_saved_enabled():
+                # capacity fix 2026-08-05 (mixtral >349k): exact cudaHostRegister
+                # instead of the CachingHostAllocator's pow2-bucketed pinning.
+                # Registered buffers carry a marker so _return_cpu never evicts
+                # them (registration is process-lifetime; freeing would dangle it).
+                candidate = torch.empty(alloc_shape, device="cpu", dtype=dtype)
+                if exact_pinned.register_inplace(candidate) is None:
+                    candidate._asym_exact_registered = True  # type: ignore[attr-defined]
+                    base = candidate
+            if base is None:
+                try:
+                    base = torch.empty(alloc_shape, device="cpu", dtype=dtype, pin_memory=True)
+                except RuntimeError:
+                    pinned_ledger.release(fam, nbytes)
+                    return _narrow(torch.empty(alloc_shape, device="cpu", dtype=dtype))
             pinned_ledger.register_tensor(base, fam)
             return _narrow(base)
         return _narrow(torch.empty(alloc_shape, device="cpu", dtype=dtype))
@@ -365,13 +389,19 @@ def _return_cpu(tensor: torch.Tensor, *, pin_memory: bool) -> None:
         return
     pinned = bool(pin_memory and torch.cuda.is_available() and tensor.is_pinned())
     key = (tensor.dtype, tuple(int(dim) for dim in tensor.shape), pinned)
+    registered = bool(getattr(tensor, "_asym_exact_registered", False))
     returned = tensor.detach()
+    if registered:
+        # detach() drops python attrs — re-mark so the recycled buffer keeps its
+        # never-evict status across pool round trips.
+        returned._asym_exact_registered = True  # type: ignore[attr-defined]
     nbytes = _tensor_nbytes(returned)
     max_cached_bytes = _cpu_pool_max_bytes()
-    if nbytes > max_cached_bytes:
+    if not registered and nbytes > max_cached_bytes:
         _CPU_BUFFER_POOL_EVICTIONS += 1
         return
-    _trim_cpu_pool(max_cached_bytes - nbytes)
+    if not registered:
+        _trim_cpu_pool(max_cached_bytes - nbytes)
     _CPU_BUFFER_POOL.setdefault(key, []).append(returned)
     _CPU_BUFFER_POOL_MAX_CACHED_BYTES = max(_CPU_BUFFER_POOL_MAX_CACHED_BYTES, _cpu_pool_cached_bytes())
 

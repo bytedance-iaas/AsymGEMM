@@ -52,6 +52,18 @@ def exact_roots_enabled() -> bool:
     return _env_flag("ASYM_EXACT_PINNED_ROOTS")
 
 
+def exact_saved_enabled() -> bool:
+    """ASYM_EXACT_PINNED_SAVED=1: activation-offload pool buffers (_alloc_cpu)
+    are exact-registered instead of allocator-pinned. Mixtral 2026-08-05: past
+    S=349,525 (H=6144 bf16) every [S,H]-class save crosses the 4-GiB pow2
+    bucket and bills double (q/o_proj.U 4.33->8 GiB, moe.X 8.65->16 GiB) —
+    the same tax exact roots fixed for GC boundaries. Registered pool buffers
+    are never evicted/freed (registration is process-lifetime, matching every
+    other call site); the pool free-list converges to per-shape max-live like
+    the RootPool."""
+    return _env_flag("ASYM_EXACT_PINNED_SAVED")
+
+
 def _min_bytes() -> int:
     try:
         mb = float(os.environ.get("ASYM_EXACT_PINNED_MIN_MB", "8") or 8)
