@@ -489,6 +489,127 @@ driver shorthand/weights/records here; c14-native row). A glm4.7-flash R2 row
 appeared from the parallel campaign, already 6-column-conformant (the
 structural filter applies to it automatically).
 
+## §8 FULL DE-PLACEHOLDERING: OOM* SWEEP + ZERO3 + FSDP2 (2026-07-31, user)
+
+USER: (a) asym's short-seq TP lead questioned → answered, no bug: max-TP-over-
+batch convention + freed-HBM batch capacity; matched-batch parity measured
+(122b 32k×b8 +0.9%; 35b 128k b4 1928-vs-1831). (b) ALL remaining black items
+must become real: black OOMs (OOM*) AND the derived FSDP2/ZeRO3 bars. Order:
+OOM sweep → ZeRO3-offload cells (driver already has zero3_offload_mem; wire
+like superoffload if gaps) → FSDP2-offload (wire; ~equivalent offload set to
+zero3-offload). Don't stop until no placeholders remain.
+
+PLAN: chain Y = 36 OOM*-confirm runs (R1: 32b×2, llama×3, 122b×8, 35b×8;
+R2: 35b×7, 122b×8; expected OOM, surprise fits banked). chain Z = ZeRO3 real
+cells: zero3_offload_mem + recomp token at every rendered lean column where
+recompute-class lives, batches seeded from rc's measured max (first-fit
+descending), + first-OOM wall confirm per model/rank (~25 runs). Then FSDP2:
+recon LF/HF fsdp plumbing, wire a fsdp2_offload backend (full-shard +
+cpu-offload = zero3-offload-equivalent placement), loss-smoke, then the same
+cell set as ZeRO3. Mixtral panel: still c18-unfillable (flag stands).
+
+### §8 SWEEP COMPLETE (08-03 14:2xZ) — 36/36, zero surprise fits
+
+Every rendered beyond-wall baseline cell in BOTH rank figures is now an
+individually-probed, measured OOM: 20× G-OOM (incl. 2 NCCL@edge-class rank-2
+deaths) + 16× HOST-C-OOM. The two flagged SIGKILL anomalies (fy2b640uns
+attempt-1, fy1rc672 attempt-1) both re-ran to genuine CUDA-OOM verdicts —
+transient external kills, not systemic. DATA dicts: 36 cells flipped
+OOM*→OOM (residual OOM* markers exist ONLY at non-rendered record positions
++ the tp_complete_* mid-columns of 122b/35b — repo-side full-record variants,
+NOT the paper figures; flagged as optional future probes). 34 figures
+regenerated; Overleaf push e176565. Ops fixes that got the sweep through:
+file-capture (orphan-pipe wedge), 3h timeout + orphan cleanup, reaper-guard
+(teardown stragglers), log-and-continue on hardfail, train.log verdict
+rescue, R2 early-terminate watchdog (saves ~2h per NCCL wedge; NOTE its
+verdict-grep is fooled by stale verdicts in APPENDED logs — use fresh logs).
+**CHAIN-Z (ZeRO3, 25 cells, Y5-hardened machinery) LAUNCHED 14:35Z**; GLM
+weights downloading in parallel (GLM zero3 cells follow chainZ). FSDP2 =
+other agent (run_baselines.md). (chainZ labels fits "SURPRISE-FIT" — Y-sweep
+label semantics, cosmetic only; cell values parse normally.)
+
+### §8 ZERO3 SERIES CLOSED (08-04 23:xx, Overleaf 5d8935f)
+
+**ZeRO3-Offload is now a fully MEASURED series for all 7 runnable models,
+both ranks** (mixtral = the standing derived exception): 52 fit cells + the
+complete probe-everything OOM coverage (Z2: 37 confirms, all died as banked;
+the 35b-256k est resolved to 844 measured; llama-128k OOM* resolved to
+measured OOM → zero3 wall (96k,128k]). Verdict quality: qwen/llama fits
+within ~±5% of rc (two cells step-identical — SuperOffload's extras are
+noise at R2 b1); GLM fits +2-8% vs their c14-native rc rows (cross-node
+band, user waiver). GLM enablement: liger glm4_moe port from the SFT-39
+checkout (1 file + clean diff at the same upstream commit; import-verified).
+Ops: one post-process wedge ate a completed run's artifacts (fzg5r1-128k —
+timeout-cleanup killed the post-processor before lat.md/step_samples were
+written; re-ran clean). Next in the armed sequencer: chain F2REV — the
+user's reverse FSDP2 queue (70 cells, blocks 8→1, dedupe-vs-forward-agent,
+pool-scoped guard); fsdp2_offload backend confirmed wired by the baseline
+agent.
+
+### §8 verdicts (as they land)
+
+- [08-02] chain-Y 1-10/36: ALL as predicted — 122b R2 uns-OFF 192k/256k/288k/
+  320k/336k = HOST-C-OOM ×5; 122b R2 rc 320k/336k + uns 336k = G-OOM ×3;
+  35b R2 rc 512k/576k = G-OOM ×2. Zero surprises.
+- [08-03 01:5x] cell 11 (35b R2 rc @640k) POST-MORTEM: trainer died 17:16Z —
+  rank-1 allocation death → peer NCCL watchdog SIGABRT "collective operation
+  timeout" = the R2A-codified **NCCL@edge G-OOM class → banked as measured
+  G-OOM** (rc massively beyond its (384k,400k]-class wall; no re-run needed).
+  The 8.5h stall after death: the trainer's orphaned multiprocessing spawn
+  worker (reparented to init, 18 pipe fds) held tp_probe_fill's $()-capture
+  open — killed by exact PID; wrapper then classified the stale capture
+  HARDFAIL → chain aborted by design. **chain-Y2 launched** with the 25
+  remaining cells + two hardenings: (a) probe output captured to a FILE
+  (orphan writers can't wedge it), (b) 3h timeout per probe, (c) NCCL-
+  timeout/SIGABRT classified G-OOM (NCCL@edge) instead of HARDFAIL.
+  OPS LORE: on OOM-kills under torchrun, spawn workers can outlive the tree
+  holding inherited stdout fds — never $()-capture a probe that manages its
+  own children; file-capture always.
+
+## §9 FSDP2 REVERSE QUEUE — CLOSED 2026-08-04 (user-ordered stop after
+## cross-machine convergence)
+
+Chain F2rev3 ran the user's 8-block queue in REVERSE (blocks 8→1) while the
+forward baseline agent ran it forward from the SFT-39 checkout. **Stopped by
+the user at cell ff30-80k** once the two tables were shown consistent — every
+remaining reverse cell was already measured forward.
+
+**Measured by this chain (c18, pool 0/1):**
+- GLM-4.7-Flash R1 [3609, 2103, 1535, 1187, 955, 806] + R2 [7287, 4322, 3072,
+  2375, 1934, 1608] — all 12 FIT.
+- GLM-4.5-Air R1+R2 = **HOST-C-OOM ×12** (fp32 host residency ~2× the 106B
+  model ≫ 957 GB; measured zero3 fits every rung — the host-efficiency
+  contrast between the two "equivalent" offload stacks is the §8/§9 finding).
+- 35b: 512k G-OOM, 256k FIT 1046 @b1 (65% HBM; +24% over rc's 844).
+- 30b: 1.12M-r2, 720k-r2, 1.6M, 480k = G-OOM ×4 (wall from 480k confirmed).
+- SO-confirm 35b@384k pair: accepted standing measured rc G-OOMs (both ranks).
+
+**Cross-machine consistency (SFT-39 forward vs this chain):** every overlap
+agrees ≤2.2% — GLM-4.7 R1 to ±2 tok/s (3609/2104/1533/1186/954/805 fwd),
+GLM-4.5 identical all-host-OOM verdicts, 35b 256k 1037 vs 1046 (+0.9%),
+identical 512k/480k walls. Cross-backend sanity: forward fsdp2 32b R1
+1097/936 vs my zero3 1093/937 (0.4%) — fsdp2≈zero3 on dense, as expected.
+
+**Not run by me (forward table stands, banked in DATA with fc* provenance):**
+30b fits (5204@80k b4 / 3038@128k b2 / 1446@320k), 32b R1 1097/936 + R2
+2178@128k (wall 168k — edge-flip vs SO's 1738 fit), llama R1 1091@96k + R2
+all-OOM (edge-flip: SO fits 104k), 122b all-host-OOM both ranks, mixtral
+all-host-OOM, 35b 128k@b2 1166 + the **starred non-monotonic 384k fits
+(R1 1321 > 256k's 1037; R2 2547 > 2090)** — flagged to the user, shipped on
+their stop order. My batch-blind DEDUPE-SKIP of ff35-128kb2 is superseded by
+the forward b2 measurement (f2_catchup.list retired).
+
+**Close-out ops:** chain sequencer + current cell + stale r2oomwatch watchers
+killed by exact PID (the /proc scanner matched my own tool-shell AGAIN via the
+pgrep line in the same script — third occurrence; lesson re-learned: bracket-
+class patterns or separate commands). GPUs 0/1 clean; 2/3 hold ~3.7 GB dead
+ghosts (no live owner, harmless). Both plot scripts had DUPLICATE
+fsdp2_offload keys (mine + forward's in one dict literal, Python last-wins
+silently rendering forward's) — deduped to the c18 chain values with forward
+replication noted in comments; glm4.5 pairs were identical. Figures
+regenerated (host python3.11 + user-site matplotlib 3.11.1 — container venvs
+are py3.12-only) and pushed figures-only to Overleaf as **2596e25**.
+
 ## §4 CAMPAIGN VERDICTS (2026-07-29)
 
 **37 runs, 0 hardfails, every placeholder resolved.** Per-figure state:

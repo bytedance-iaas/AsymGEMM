@@ -818,14 +818,27 @@ is_known_dense_recompute_model() {
   esac
 }
 
+# GLM true-T3 enablement (fix_glm_t3.md 2026-08-08): the routed-GEMM kernels
+# are layout-generic (packed [E,2I,H] + group metadata) and numerics-
+# validated on the GLM shapes as part of that task — ker!=000 is therefore
+# legal for these two models specifically. Mixtral/Phi/Hunyuan stay outside
+# this gate until someone validates them the same way.
+is_glm_family_model() {
+  case "$1" in
+    *"GLM-4.5-Air"*|*"GLM-4.7-Flash"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 validate_recompute_kernel_for_model() {
   local model="$1" kernel_code="$2" lora_flag="${3:-0}"
   if is_known_dense_recompute_model "${model}" &&
     [[ "${kernel_code}" != "000" || "$(qwen3_route_bool "${lora_flag}")" != "0" ]]; then
     die "dense model '${model}' cannot use Qwen3 MoE routed kernels; use recomp-off-full-fg-ker000 with route000_lora0 (got kernel_code=${kernel_code}, lora=$(qwen3_route_bool "${lora_flag}"))"
   fi
-  if [[ "${kernel_code}" != "000" ]] && ! is_qwen3_moe_routed_model "${model}"; then
-    die "recomp-off-full-fg-ker${kernel_code} is only supported for Qwen3/Qwen3.5 routed MoE; dense/non-routed model '${model}' must use recomp-off-full-fg-ker000"
+  if [[ "${kernel_code}" != "000" ]] && ! is_qwen3_moe_routed_model "${model}" \
+      && ! is_glm_family_model "${model}"; then
+    die "recomp-off-full-fg-ker${kernel_code} is only supported for Qwen3/Qwen3.5 routed MoE and the GLM family (fix_glm_t3.md); model '${model}' must use recomp-off-full-fg-ker000"
   fi
 }
 
@@ -1100,9 +1113,9 @@ backend_gpu_count() {
     asym|asym_torch|asym_cpuadamwtorch|asym_cpuadamwds|asym_cpuadamwds_panvme|asym_cpuadamwds_actnvme|asym_cpuadamwds_bothnvme)
       ((model_gpu_count == 1)) || die "backend '${backend}' is single-GPU; use asym_ep2_cpuadamwds / asym_dp2_cpuadamwds / asym_stp_cpuadamwds for |2 rows (got |${model_gpu_count})"
       printf '1\n' ;;
-    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_mem_nocpuadamw|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam|superoffload|superoffload_mem|superoffload_mem_nocpuadamw|superoffload_mem_opnvme|superoffload_mem_panvme) printf '%s\n' "${model_gpu_count}" ;;
+    torch|zero2|zero3|zero3_offload|zero3_offload_mem|zero3_offload_mem_nocpuadamw|zero3_offload_opnvme|zero3_offload_panvme|zero3_offload_mem_opnvme|zero3_offload_mem_panvme|zero3_cpuadam|fsdp2_offload|superoffload|superoffload_mem|superoffload_mem_nocpuadamw|superoffload_mem_opnvme|superoffload_mem_panvme) printf '%s\n' "${model_gpu_count}" ;;
     kt_torchbf16|kt_armbf16) printf '1\n' ;;
-    *) die "internal backend label must be torch, asym, asym_torch, asym_cpuadamwtorch, asym_cpuadamwds, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_offload_mem_nocpuadamw, zero3_offload_opnvme, zero3_offload_panvme, zero3_offload_mem_opnvme, zero3_offload_mem_panvme, zero3_cpuadam, superoffload, superoffload_mem, superoffload_mem_nocpuadamw, superoffload_mem_opnvme, superoffload_mem_panvme, kt_torchbf16, or kt_armbf16, got '${backend}'" ;;
+    *) die "internal backend label must be torch, asym, asym_torch, asym_cpuadamwtorch, asym_cpuadamwds, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_offload_mem_nocpuadamw, zero3_offload_opnvme, zero3_offload_panvme, zero3_offload_mem_opnvme, zero3_offload_mem_panvme, zero3_cpuadam, fsdp2_offload, superoffload, superoffload_mem, superoffload_mem_nocpuadamw, superoffload_mem_opnvme, superoffload_mem_panvme, kt_torchbf16, or kt_armbf16, got '${backend}'" ;;
   esac
 }
 
@@ -1367,13 +1380,14 @@ append_backend_spec() {
     zero3_offload_mem_panvme) backend=zero3_offload_mem_panvme ;;
     zero3_cpuadam) backend=zero3_cpuadam ;;
     superoffload) backend=superoffload ;;
+    fsdp2_offload) backend=fsdp2_offload ;;
     superoffload_mem) backend=superoffload_mem ;;
     superoffload_mem_nocpuadamw) backend=superoffload_mem_nocpuadamw ;;
     superoffload_mem_opnvme) backend=superoffload_mem_opnvme ;;
     superoffload_mem_panvme) backend=superoffload_mem_panvme ;;
     kt_torchbf16) backend=kt_torchbf16 ;;
     kt_armbf16) backend=kt_armbf16 ;;
-    *) die "backend must be torch, asym, asym_torch, asym_cpuadamwtorch, asym_cpuadamwds, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_offload_mem_nocpuadamw, zero3_offload_opnvme, zero3_offload_panvme, zero3_offload_mem_opnvme, zero3_offload_mem_panvme, zero3_cpuadam, superoffload, superoffload_mem, superoffload_mem_nocpuadamw, superoffload_mem_opnvme, superoffload_mem_panvme, kt_torchbf16, or kt_armbf16, got '${backend_part}'" ;;
+    *) die "backend must be torch, asym, asym_torch, asym_cpuadamwtorch, asym_cpuadamwds, zero2, zero3, zero3_offload, zero3_offload_mem, zero3_offload_mem_nocpuadamw, zero3_offload_opnvme, zero3_offload_panvme, zero3_offload_mem_opnvme, zero3_offload_mem_panvme, zero3_cpuadam, fsdp2_offload, superoffload, superoffload_mem, superoffload_mem_nocpuadamw, superoffload_mem_opnvme, superoffload_mem_panvme, kt_torchbf16, or kt_armbf16, got '${backend_part}'" ;;
   esac
   liger_loss="$(liger_loss_label "${liger_loss_part}")"
 
@@ -3509,6 +3523,13 @@ run_job() {
           # fix_qwen3 v2: compact-X GPU dA + dgate/dup kept in HBM
           ASYMM_QWEN3_MOE_FG_DA_GPU="${ASYMM_QWEN3_MOE_FG_DA_GPU:-1}"
           ASYMM_QWEN3_MOE_FG_KEEP_DGRADS_HBM="${ASYMM_QWEN3_MOE_FG_KEEP_DGRADS_HBM:-1}"
+          # fix_glm_t3 (2026-08-08): GLM attn LoRA-A must not take the dead
+          # native cpu-left branch (segfault class — see the reroute guard in
+          # attention_activation_offload._dense_lora_a_cpu_left). GLM-only.
+          if is_glm_family_model "${current_model_name}"; then
+            ASYMM_ATTN_LORA_A_CPU_LEFT_TORCH_STAGE="${ASYMM_ATTN_LORA_A_CPU_LEFT_TORCH_STAGE:-1}"
+            export ASYMM_ATTN_LORA_A_CPU_LEFT_TORCH_STAGE
+          fi
         fi
         ;;
     esac
@@ -3543,7 +3564,7 @@ run_job() {
     [[ "${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE,,}" == "fp32" ]] || die "Qwen3 routed kernels currently require ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE=fp32, got '${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE}'"
     [[ "${backend}" == asym* ]] || die "Qwen3 routed kernels are only valid for asym* backends, got backend='${backend}'"
     [[ "${recomp_off_stage}" == "full-fg" ]] || die "Qwen3 routed kernels require recomp-off-full-fg, got recompute='${recompute}'"
-    is_qwen3_moe_routed_model "${current_model_name}" || die "Qwen3 routed kernels are scoped to Qwen3/Qwen3.5 routed MoE, got model='${current_model_name}'"
+    is_qwen3_moe_routed_model "${current_model_name}" || is_glm_family_model "${current_model_name}" || die "Qwen3 routed kernels are scoped to Qwen3/Qwen3.5 routed MoE + the GLM family (fix_glm_t3.md), got model='${current_model_name}'"
     [[ "$(qwen3_route_bool "${ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD}")" == "1" ]] || die "Qwen3 routed kernels require ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD=1"
     [[ "${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}" == "0" ]] || die "Qwen3 routed kernels must not use ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}"
   fi

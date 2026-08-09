@@ -1310,6 +1310,17 @@ def _dense_lora_a_cpu_left(
     """Compute dense LoRA-A as one logical CPU-left grouped projection."""
 
     _check_backend(backend)
+    # fix_glm_t3.md (2026-08-08): the asym branch below hands CUDA-resident
+    # LoRA-A weights to the native CPU-left binding, which segfaults on EVERY
+    # such call (48/48 isolated repros incl. qwen shapes) — it is reachable
+    # only when the shared q/k/v LoRA-A source path does not engage (e.g.
+    # Flash's MLA projection pair), which no qwen run ever hits. Env-gated
+    # reroute to the existing torch staging math; the GLM driver branch sets
+    # the env, qwen paths see no change.
+    if backend == "asym" and os.environ.get(
+        "ASYMM_ATTN_LORA_A_CPU_LEFT_TORCH_STAGE", ""
+    ).strip() == "1":
+        backend = "torch"
     if u_drop_cpu.dim() != 2 or a.dim() != 2:
         raise ValueError(f"dense LoRA-A expects U=[M,in] and A=[r,in], got {tuple(u_drop_cpu.shape)} and {tuple(a.shape)}")
     if u_drop_cpu.dtype != torch.bfloat16 or a.dtype != torch.bfloat16:
