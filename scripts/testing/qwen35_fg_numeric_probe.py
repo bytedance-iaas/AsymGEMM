@@ -99,13 +99,22 @@ def run_case(engine, x0, idx, w, grad_out, label):
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--qwen3", action="store_true", help="use qwen3-30b shapes (E=128,I=768) instead of qwen3.5-35b")
+    ap.add_argument("--hunyuan", action="store_true", help="use hunyuan-a13b shapes (E=64,H=4096,I=3072,top-8)")
+    ap.add_argument("--mixtral", action="store_true", help="use mixtral-8x22b shapes (E=8,H=6144,I=16384,top-2)")
     ap.add_argument("--tokens", type=int, default=4096)
     ap.add_argument("--zero-b", action="store_true", help="zero-init LoRA-B (step-1 condition)")
     args = ap.parse_args()
 
     torch.manual_seed(7)
     dev = torch.device("cuda:0")
-    E, H, I, K = (128, 2048, 768, 8) if args.qwen3 else (256, 2048, 512, 8)
+    if args.mixtral:
+        E, H, I, K = (8, 6144, 16384, 2)
+    elif args.hunyuan:
+        E, H, I, K = (64, 4096, 3072, 8)
+    elif args.qwen3:
+        E, H, I, K = (128, 2048, 768, 8)
+    else:
+        E, H, I, K = (256, 2048, 512, 8)
     T = args.tokens
     print(f"shapes: E={E} H={H} I={I} top_k={K} T={T} zero_b={args.zero_b}")
 

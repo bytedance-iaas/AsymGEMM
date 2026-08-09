@@ -818,14 +818,31 @@ is_known_dense_recompute_model() {
   esac
 }
 
+# Families whose ROUTED experts satisfy the ker101 route-kernel contract:
+# AsymQwen3Experts engine + packed [E,2I,H]/[E,H,I] + silu·mul + detached
+# top-k router + OUTPUT-weighted combine + H,I %64==0 (hunyuan validated
+# 2026-08-08: E=64 H=4096 I=3072 top-8; kernels are shape-generic JIT — see
+# HY_T3 campaign). Deliberately SEPARATE from is_qwen3_moe_routed_model so
+# the ker101 AUTO-DEFAULT (qwen3_moe_routed_auto_default) stays qwen-only and
+# bare `recomp-off-full-fg` tokens keep their historical ker000 meaning for
+# every other family.
+is_route_kernel_capable_model() {
+  is_qwen3_moe_routed_model "$1" && return 0
+  case "$1" in
+    *"Hunyuan-A13B"*) return 0 ;;
+    *"Mixtral-8x22B"*) return 0 ;;  # validated 2026-08-08: E=8 H=6144 I=16384 top-2 (MX_T3)
+    *) return 1 ;;
+  esac
+}
+
 validate_recompute_kernel_for_model() {
   local model="$1" kernel_code="$2" lora_flag="${3:-0}"
   if is_known_dense_recompute_model "${model}" &&
     [[ "${kernel_code}" != "000" || "$(qwen3_route_bool "${lora_flag}")" != "0" ]]; then
     die "dense model '${model}' cannot use Qwen3 MoE routed kernels; use recomp-off-full-fg-ker000 with route000_lora0 (got kernel_code=${kernel_code}, lora=$(qwen3_route_bool "${lora_flag}"))"
   fi
-  if [[ "${kernel_code}" != "000" ]] && ! is_qwen3_moe_routed_model "${model}"; then
-    die "recomp-off-full-fg-ker${kernel_code} is only supported for Qwen3/Qwen3.5 routed MoE; dense/non-routed model '${model}' must use recomp-off-full-fg-ker000"
+  if [[ "${kernel_code}" != "000" ]] && ! is_route_kernel_capable_model "${model}"; then
+    die "recomp-off-full-fg-ker${kernel_code} is only supported for Qwen3/Qwen3.5/Hunyuan routed MoE; dense/non-routed model '${model}' must use recomp-off-full-fg-ker000"
   fi
 }
 
@@ -3543,7 +3560,7 @@ run_job() {
     [[ "${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE,,}" == "fp32" ]] || die "Qwen3 routed kernels currently require ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE=fp32, got '${ASYMM_QWEN3_MOE_ROUTE_ACCUM_DTYPE}'"
     [[ "${backend}" == asym* ]] || die "Qwen3 routed kernels are only valid for asym* backends, got backend='${backend}'"
     [[ "${recomp_off_stage}" == "full-fg" ]] || die "Qwen3 routed kernels require recomp-off-full-fg, got recompute='${recompute}'"
-    is_qwen3_moe_routed_model "${current_model_name}" || die "Qwen3 routed kernels are scoped to Qwen3/Qwen3.5 routed MoE, got model='${current_model_name}'"
+    is_route_kernel_capable_model "${current_model_name}" || die "Qwen3 routed kernels are scoped to Qwen3/Qwen3.5/Hunyuan routed MoE, got model='${current_model_name}'"
     [[ "$(qwen3_route_bool "${ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD}")" == "1" ]] || die "Qwen3 routed kernels require ASYMM_QWEN3_MOE_FINEGRAINED_OFFLOAD=1"
     [[ "${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}" == "0" ]] || die "Qwen3 routed kernels must not use ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS=${ASYMM_QWEN3_MOE_DOWN_SCATTER_BLOCK_EXPERTS}"
   fi
