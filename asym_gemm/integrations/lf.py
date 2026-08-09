@@ -87,6 +87,11 @@ from asym_gemm.training.mixtral_moe import (
     is_mixtral_moe_block,
     wrap_mixtral_moe_block,
 )
+from asym_gemm.training.jamba_moe import (
+    AsymJambaMoeBlock,
+    is_jamba_moe_block,
+    wrap_jamba_moe_block,
+)
 from asym_gemm.training.phimoe_moe import (
     AsymPhimoeMoeBlock,
     is_phimoe_moe_block,
@@ -297,6 +302,7 @@ class LFAsymReport:
     qwen35_moes_wrapped: int = 0
     llama4_moes_wrapped: int = 0
     mixtral_moes_wrapped: int = 0
+    jamba_moes_wrapped: int = 0
     phimoe_moes_wrapped: int = 0
     hunyuan_moes_wrapped: int = 0
     glm45_moes_wrapped: int = 0
@@ -405,6 +411,7 @@ class LFAsymReport:
             f"qwen3_moes_wrapped={self.qwen3_moes_wrapped}, "
             f"qwen35_moes_wrapped={self.qwen35_moes_wrapped}, "
             f"mixtral_moes_wrapped={self.mixtral_moes_wrapped}, "
+            f"jamba_moes_wrapped={self.jamba_moes_wrapped}, "
             f"phimoe_moes_wrapped={self.phimoe_moes_wrapped}, "
             f"hunyuan_moes_wrapped={self.hunyuan_moes_wrapped}, "
             f"glm45_moes_wrapped={self.glm45_moes_wrapped}, "
@@ -581,6 +588,11 @@ def classify_lf_component(name: str, module: nn.Module | None = None) -> str:
     module_name = type(module).__name__.lower() if module is not None else ""
     if _is_vision_or_multimodal_path(lower):
         return "vision"
+    # Jamba's Mamba mixer (child name `mamba`, JambaMambaMixer): the hybrid
+    # stack's linear-time token mixer — same GPU-resident residency class as
+    # qwen3.5's GatedDeltaNet `linear_attn` (allowed_components covers it).
+    if lower == "mamba" or lower.endswith(".mamba") or ".mamba." in lower or "mambamixer" in module_name:
+        return "linear_attention"
     if (
         lower == "linear_attn"
         or lower.endswith(".linear_attn")
@@ -708,6 +720,15 @@ def audit_lf_frozen_cuda_residue(
     if bool(getattr(_cfg, "tie_word_embeddings", False)):
         allowed_components |= {"embed_tokens", "lm_head"}
     selection = parse_lf_offload_modules(offload_modules)
+    # Unselected embed/lm_head are resident BY DESIGN (e.g. Jamba keeps both on
+    # GPU — no staged lm_head wrap for that family; ~0.5 GB each): the audit
+    # hunts params that should have moved but didn't, and an unselected head
+    # was never supposed to move. Tied models reject the selection outright,
+    # so this subsumes the tie branch above.
+    if not selection.embed_tokens:
+        allowed_components.add("embed_tokens")
+    if not selection.lm_head:
+        allowed_components.add("lm_head")
     rows = collect_lf_offload_residency(model, selection, classify_component=classify_lf_component)
     residue: dict[str, int] = defaultdict(int)
     examples: dict[str, list[str]] = defaultdict(list)
@@ -1355,6 +1376,12 @@ def _wrap_lf_router_module(
         return None
     lower = name.lower()
     if ".feed_forward.router" in lower or lower.endswith(".router") or lower == "router":
+        # Jamba's router is a BARE nn.Linear owned by AsymJambaMoeBlock (frozen,
+        # routing replicated inside the block) — it has no top_k/num_experts and
+        # must NOT be wrapped as a Llama4 router. Leave it intact; the mover's
+        # router_whole_gpu bucket places it on GPU like the DS-V3-style gates.
+        if type(module) is nn.Linear:
+            return None
         return AsymLlama4Router(module, backend=backend, precision=precision, stats=stats, strict=strict)
     if lower.endswith(".mlp.gate") or ".mlp.gate." in lower:
         if getattr(module, "e_score_correction_bias", None) is not None:
@@ -1596,6 +1623,17 @@ def _is_qwen3_decoder_layer_module_name(name: str, module: nn.Module) -> bool:
             return True
         if hasattr(children["mlp"], "_is_asym_mixtral_moe_block") or is_mixtral_moe_block(children["mlp"]):
             return True
+    # Jamba decoder layers (model_integration.md family #7): hybrid stack —
+    # mixer is `self_attn` (attention layers) or `mamba` (Mamba layers), FFN
+    # child is `feed_forward` (sparse MoE on expert_layer_period layers, dense
+    # JambaMLP elsewhere), norms are input_layernorm + pre_ff_layernorm.
+    jamba_required = {"feed_forward", "input_layernorm", "pre_ff_layernorm"}
+    jamba_has_mixer = "self_attn" in child_names or "mamba" in child_names
+    if jamba_required <= child_names and jamba_has_mixer:
+        if "jamba" in class_name or "jamba" in module_name or model_type == "jamba":
+            return True
+        if hasattr(children["feed_forward"], "_is_asym_jamba_moe_block") or is_jamba_moe_block(children["feed_forward"]):
+            return True
     # Phi-MoE decoder layer (same child shape; model_integration.md family #2).
     if qwen3_required <= child_names:
         if "phimoe" in class_name or "phimoe" in module_name or model_type == "phimoe":
@@ -1810,6 +1848,12 @@ def _wrap_linear_attention_saved_tensor_offload_modules(
             install_linear_attention_saved_tensor_offload(module)
             wrapped.append(name)
             continue
+        # NOTE (jamba, 2026-08-09): the Mamba mixers deliberately do NOT get
+        # this wrap. It was tried (28 modules) on the saved-acts hypothesis —
+        # zero measured benefit (the resident saves were unfused loss logits,
+        # incident 6) — and is the prime suspect for the asym-side Mamba-path
+        # IMA at 320k (uo without it reaches 384k; j1t2_320 et al.). Under
+        # full recompute the in-region mamba saves are transient anyway.
         lower = f".{name.lower()}."
         leaf = name.rsplit(".", 1)[-1].lower()
         if leaf == "linear_attn" and any(marker in lower for marker in _ATTENTION_GC_EXCLUDED_PATH_MARKERS):
@@ -1890,7 +1934,7 @@ def count_lora_wrapped_modules(model: nn.Module) -> int:
         for module in model.modules()
         if hasattr(module, "lora_A")
         and hasattr(module, "lora_B")
-        and not isinstance(module, (AsymQwen3Experts, AsymQwen3MoeBlock, AsymQwen35MoeBlock, AsymMixtralMoeBlock, AsymPhimoeMoeBlock, AsymHunyuanMoeBlock, AsymGlm45MoeBlock, AsymGlm47MoeBlock, AsymGptOssMoeBlock))
+        and not isinstance(module, (AsymQwen3Experts, AsymQwen3MoeBlock, AsymQwen35MoeBlock, AsymMixtralMoeBlock, AsymJambaMoeBlock, AsymPhimoeMoeBlock, AsymHunyuanMoeBlock, AsymGlm45MoeBlock, AsymGlm47MoeBlock, AsymGptOssMoeBlock))
     )
 
 
@@ -2036,6 +2080,8 @@ def apply_lf_asym_lora(
             report.glm45_moes_wrapped += 1
         elif isinstance(new_module, AsymGptOssMoeBlock):
             report.gptoss_moes_wrapped += 1
+        elif isinstance(new_module, AsymJambaMoeBlock):
+            report.jamba_moes_wrapped += 1
         else:
             report.packed_experts_wrapped += 1
         report.cpu_resident_base_bytes += new_module.cpu_resident_base_bytes
@@ -2049,6 +2095,8 @@ def apply_lf_asym_lora(
                     expert_candidates.append((name, "qwen35_whole"))
                 elif is_mixtral_moe_block(module):
                     expert_candidates.append((name, "mixtral_whole"))
+                elif is_jamba_moe_block(module):
+                    expert_candidates.append((name, "jamba_whole"))
                 elif is_phimoe_moe_block(module):
                     expert_candidates.append((name, "phimoe_whole"))
                 elif is_hunyuan_moe_block(module):
@@ -2169,6 +2217,37 @@ def apply_lf_asym_lora(
                     # Shared-engine fg path (phi T3 memory campaign, 2026-07-27): the
                     # flag is per-instance on AsymQwen3Experts and family-agnostic;
                     # qwen3 branches set it above, new families mirror it here.
+                    wrapped.experts._qwen3_moe_finegrained_enabled = True
+                    report.qwen3_moe_finegrained_offload_wrapped += 1
+                _install_expert_replacement(name, wrapped, f"{name}.experts")
+            elif kind == "jamba_whole":
+                if not is_jamba_moe_block(module):
+                    if strict:
+                        raise RuntimeError(f"{name} no longer looks like a Jamba MoE block")
+                    report.skipped.append(f"{name}:stale_jamba_moe_block")
+                    continue
+                wrapped = wrap_jamba_moe_block(
+                        module,
+                        backend=backend,
+                        precision=precision,
+                        offload=offload_experts,
+                        lora_rank=lora_rank,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=lora_dropout,
+                        lora_dtype=torch.bfloat16,
+                        expert_recompute_policy=recompute_config.label,
+                        router_mode="whole",
+                        router_debug_grad=False,
+                        stats=stats,
+                        strict=strict,
+                )
+                # Jamba's FFN child is `feed_forward` (not `mlp`) on both
+                # decoder-layer classes — the profile prefix follows it.
+                wrapped.profile_prefix = _layer_profile_prefix_from_module_name(name, "feed_forward")
+                wrapped.experts.profile_prefix = f"{wrapped.profile_prefix}.experts"
+                if qwen3_moe_finegrained_enabled and offload_experts:
+                    # Shared-engine fg path: per-instance, family-agnostic (see
+                    # the mixtral branch note).
                     wrapped.experts._qwen3_moe_finegrained_enabled = True
                     report.qwen3_moe_finegrained_offload_wrapped += 1
                 _install_expert_replacement(name, wrapped, f"{name}.experts")
@@ -2513,6 +2592,12 @@ def apply_lf_asym_lora(
                 # the block's verbatim routing reads its bias buffer and the
                 # mover places the whole gate on GPU (router_whole_gpu).
                 report.skipped.append(f"{name}:router_kept_intact_ds_bias")
+                continue
+            if type(module) is nn.Linear and name.lower().endswith(".feed_forward.router"):
+                # Jamba: bare-Linear router owned by AsymJambaMoeBlock (frozen,
+                # routing replicated in the block) — kept intact like the DS-V3
+                # gates; the mover's router_whole_gpu bucket places it on GPU.
+                report.skipped.append(f"{name}:router_kept_intact_jamba_linear")
                 continue
             wrapped_router = _wrap_lf_router_module(
                 name,

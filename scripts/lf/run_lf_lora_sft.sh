@@ -238,6 +238,7 @@ declare -A WATCHDOG_FLOOR_GB_BY_MODEL=(
   ["zai-org/GLM-4.5-Air"]=50
   ["zai-org/GLM-4.7-Flash"]=35
   ["openai/gpt-oss-120b"]=50
+  ["ai21labs/AI21-Jamba2-Mini"]=50
 )
 if [[ -z "${HOST_MEM_WATCHDOG_FLOOR_GB:-}" ]]; then
   if [[ "${HOST_MEM_WATCHDOG,,}" == "true" ]]; then
@@ -408,6 +409,7 @@ case "${BACKEND,,}" in
     # json with fsdp_version: 2 (LF forces use_reentrant_gc=False under fsdp2 itself).
     # Offloads params+grads+optimizer to host = the ZeRO3-Offload placement class
     # (sanity band: results ≈ superoffload). No DeepSpeed involvement.
+    # (4way-merge 2026-08-09: identical port existed on the 39 tree — deduped.)
     PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-fsdp2_offload}
     FSDP_BACKEND_LABEL=fsdp2_offload
     BACKEND=torch
@@ -2782,7 +2784,9 @@ if [[ -n "${FSDP_BACKEND_LABEL}" ]]; then
   # grad-norm clipping reduces the total norm over CPU DTensors, which needs a CPU-capable
   # process-group backend. --ddp_backend rejects torch's multi-backend syntax (choices
   # metadata), so run_lf_profiled_train.py rewrites init_process_group under this env
-  # (nccl -> "cpu:gloo,cuda:nccl"). Harmless at |1.
+  # (nccl -> "cpu:gloo,cuda:nccl"). Harmless at |1. CPU-side model load (LF patcher
+  # opt-in ASYM_FSDP2_CPU_LOAD) avoids the loader's half-model GPU warmup alloc
+  # (122B incident).
   RUN_ENV+=(ASYM_FSDP2_MULTIBACKEND=1)
   RUN_ENV+=(ASYM_FSDP2_CPU_LOAD=1)
   RUN_ENV+=(ASYM_FSDP2_LOAD_FP32=1)

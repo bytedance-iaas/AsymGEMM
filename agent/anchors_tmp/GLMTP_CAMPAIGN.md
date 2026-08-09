@@ -39,7 +39,18 @@ render: plot_tp_vs_seq.py single-model outputs + tp2r variants from
 plot_tp_vs_seq_2r.py). Cells = eff tok/s (step_samples, w1+m2). Walls red
 OOM; est cells only where house-legal.
 
+## EXT phase (2026-08-04, run_baselines session) — TURNING POINTS
+User: GLM panels must show the walls + asym-last-standing like every other
+model; the in-context cap above was wrong for the paper (qwen/llama panels
+run far beyond native ctx). glmext.sh (anchors_tmp) extends: Flash 1r
+256/320/384/448k, Flash 2r 256/320/416/512k, Air 1r+2r 160/192/256/320k;
+systems rc/un/uo + fsdp2 (Flash only — Air fsdp2 is load-phase host-dead
+at 16k, seq-independent) + asym T1→T2→T3. Tags x1/x2/y1/y2 + sys + sk.
+Same lib/verdicts/status log; SOLO serial. Banking after: extend seqs +
+all series in both DATA dicts, LEAN_DROP re-pick ~6 rendered cols.
+
 ## State — CAMPAIGN COMPLETE 2026-07-31 16:4x (~330 cells over ~35 h)
+   (superseded on seq range by the EXT phase above)
 - [x] F1 + solo redo (lane contention lesson: throughput cells must run
   SOLO; the parallel-lane originals were off by up to -44%)
 - [x] F2 + patches (NCCL: ddp_timeout 7200 for slow steps, 1500 for A2

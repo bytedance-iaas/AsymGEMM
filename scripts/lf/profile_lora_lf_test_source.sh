@@ -84,6 +84,7 @@ declare -A M=(
   [glm4.5-air]="zai-org/GLM-4.5-Air"                 # layers: 46 (model_integration.md #4)
   [glm4.7-flash]="zai-org/GLM-4.7-Flash"             # layers: 47 (model_integration.md #5)
   [gpt-oss-120b]="openai/gpt-oss-120b"               # layers: 36 (model_integration.md #6)
+  [jamba2-mini]="ai21labs/AI21-Jamba2-Mini"          # layers: 32 (model_integration.md #7; hybrid Mamba+attn, MoE odd layers)
   # dense
   [q3-32b]="Qwen/Qwen3-32B"                          # layers: 64
   [q3.5-27b]="Qwen/Qwen3.5-27B"                      # layers: 64
@@ -178,7 +179,7 @@ _tier_recipes_file="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tier_recipes.s
 TIER_REQUESTED=""
 tier_model_family() {
   case "${1,,}" in
-    *q3-30b*|*qwen3-30b*|*30b-a3b*|*q3.5*|*qwen3.5*|*35b-a3b*|*122b*|*llama4*|*scout*|*mixtral*|*phi3.5-moe*|*phi-3.5-moe*|*hunyuan*|*glm4*|*gpt-oss*) printf 'moe' ;;
+    *q3-30b*|*qwen3-30b*|*30b-a3b*|*q3.5*|*qwen3.5*|*35b-a3b*|*122b*|*llama4*|*scout*|*mixtral*|*phi3.5-moe*|*phi-3.5-moe*|*hunyuan*|*glm4*|*gpt-oss*|*jamba*) printf 'moe' ;;
     *) printf 'dense' ;;
   esac
 }
@@ -806,7 +807,7 @@ is_qwen3_moe_routed_model() {
 # is_qwen3_moe_routed_model (which also gates qwen3-shape-tuned ker101).
 is_shared_engine_moe_family_model() {
   case "$1" in
-    *"Mixtral-8x22B"*|*"Phi-3.5-MoE"*|*"Hunyuan-A13B"*|*"GLM-4.5-Air"*|*"GLM-4.7-Flash"*) return 0 ;;
+    *"Mixtral-8x22B"*|*"Phi-3.5-MoE"*|*"Hunyuan-A13B"*|*"GLM-4.5-Air"*|*"GLM-4.7-Flash"*|*"AI21-Jamba2-Mini"*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -959,6 +960,7 @@ infer_template() {
     llama-4-*|llama4-*) printf 'llama4\n' ;;
     llama-3*|llama3-*|meta-llama-3*) printf 'llama3\n' ;;
     mixtral-*) printf 'mistral\n' ;;
+    ai21-jamba*|jamba*) printf 'chatml\n' ;;  # Jamba2 chat_template.jinja = ChatML (im_start/im_end)
     phi-3.5-moe*|phi3.5-moe*) printf 'phi\n' ;;
     hunyuan-a13b*) printf 'hunyuan\n' ;;
     glm-4.5*|glm4.5*|glm-4.7*|glm4.7*) printf 'glm4_moe\n' ;;
@@ -4717,6 +4719,14 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
       parse_model_spec "${model_spec_entry}"
       current_model_name="${parsed_model_name}"
       current_model_gpu_count="${parsed_model_gpu_count}"
+      # Jamba (model_integration.md #7): keep lm_head+embed GPU-resident (0.5 GB
+      # each) — the staged AsymFrozenLinear lm_head wrap does not cover Jamba, so
+      # "all" would raw-host the lm_head and feed liger's fused CE a CPU pointer
+      # (CUBLAS_STATUS_EXECUTION_FAILED, jgate_t3 2026-08-08). Conservative
+      # against asym (costs it ~1 GB HBM); explicit user env still wins.
+      if [[ "${current_model_name}" == *"AI21-Jamba2-Mini"* && "${ASYM_OFFLOAD_MODULES}" == "all" ]]; then
+        ASYM_OFFLOAD_MODULES="routed_experts,router,attention,norms,mlp_dense"
+      fi
       # row-scoped skew: |skew field wins (implicit ACK — explicit param IS the intent);
       # rows without the field fall back to the invocation env (old behavior, ACK gated).
       [[ -n "${_ROW_SKEW_ENV_DEFAULT+x}" ]] || _ROW_SKEW_ENV_DEFAULT="${ASYM_EP_SKEW_HOT:-}"
