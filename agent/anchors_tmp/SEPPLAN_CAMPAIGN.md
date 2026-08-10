@@ -43,3 +43,4 @@ variant; queue flavor only if sepplan shows pathology or time remains).
 - [08-10 17:57Z] c17 DONE sepplan mixtral-8x22b s=288000 (spmx288) -> TRAINED | spmx288    mixtral-8x22b  s= 288000 b1   sepplan= 1062 sdp2=1129 delta=  -6.0% resv= 181.8G rss= 722G
 - [08-10 17:57Z] c17 CLAIM sepplan mixtral-8x22b s=256000 (spmx256)
 - [08-10 18:19Z] c17 DONE sepplan mixtral-8x22b s=256000 (spmx256) -> TRAINED | spmx256    mixtral-8x22b  s= 256000 b1   sepplan= 1591 sdp2=1635 delta=  -2.7% resv= 175.7G rss= 722G
+- [08-10 18:20Z] c17 CLAIM sepplan mixtral-8x22b s=192000 (spmx192)
