@@ -31,3 +31,4 @@ variant; queue flavor only if sepplan shows pathology or time remains).
 
 ## Log (append-only; c17 = this runner)
 - [08-10 00:53Z] c17 NOTE c17 fused mixtral ckpt absent on this node — rebuilding (mx_fuse_local.py) before mixtral cells
+- [08-10 00:53Z] c17 CLAIM sepplan glm4.7-flash s=1024000 (spgf1024)
