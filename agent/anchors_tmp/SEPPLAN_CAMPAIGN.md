@@ -37,3 +37,4 @@ variant; queue flavor only if sepplan shows pathology or time remains).
 - [08-10 12:10Z] c17 DONE sepplan glm4.7-flash s=960000 (spgf960) -> TRAINED | spgf960    glm4.7-flash   s= 960000 b1   sepplan=  317 sdp2=313 delta=  +1.3% resv= 181.5G rss= 479G
 - [08-10 12:10Z] c17 CLAIM sepplan glm4.7-flash s=896000 (spgf896)
 - [08-10 16:47Z] c17 DONE sepplan glm4.7-flash s=896000 (spgf896) -> TRAINED | spgf896    glm4.7-flash   s= 896000 b1   sepplan=  340 sdp2=340 delta=  +0.0% resv= 181.4G rss= 483G
+- [08-10 16:47Z] c17 CLAIM sepplan mixtral-8x22b s=304000 (spmx304)
