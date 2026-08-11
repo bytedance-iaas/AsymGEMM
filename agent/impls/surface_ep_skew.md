@@ -415,6 +415,101 @@ vs the 50% ideal), no dataset skews naturally at pack level ->
    signature" — real samples, real routing, selection disclosed.
    Never present the curated set as a representative dataset.
 
+## Log (append-only)
+
+- [2026-08-11] **Stage-1 screen + stage-2 replay COMPLETE** (runners: c11
+  this entry = Agent C then A backfill; a peer runner on another node
+  covered Agent B incl. gated GPQA — shared NFS manifest merged cleanly).
+  **Probe built**: `scripts/ep_skew/route_skew_probe.py` (vanilla
+  transformers 5.3, bf16, backbone-only forward, capture = forward-pre-hook
+  on each MoE layer's `experts` module -> the model's ACTUAL selected
+  indices post sigmoid/bias/group logic; 16k packs, eos-sep, per-dataset
+  seeds; per-sample + per-doc counts; JSON + flock'd manifest; OOM ->
+  batch-halving; `--max-memory` because device_map=auto reserves no
+  activation headroom). Summaries: `scripts/ep_skew/summarize_skew.py`;
+  replay converter: `scripts/ep_skew/trace_to_hist.py`. Runner:
+  `agent/anchors_tmp/skew_in39.sh` (NOTE: enroot renumbers
+  NVIDIA_VISIBLE_DEVICES to 0..n-1 inside — CVD must use renumbered ids).
+  Dataset pins: dapo=BytedTsinghua-SIA/DAPO-Math-17k;
+  codeforces=open-r1/codeforces; sft_mix=smoltalk:longalign (the LF SFT
+  source); megamath=IFM/MegaMath megamath-web-pro/* ("Megatron-Math" (Du
+  et al.'25) is NOT on HF — substitution recorded in every spec);
+  swebench=princeton-nlp/SWE-bench train; openscience=nvidia/OpenScience
+  OS-Q3-235B-4; longbench=THUDM/LongBench data.zip; gpqa=Idavidrein/gpqa
+  (gated — ran only on the token-bearing peer node).
+  **Screen results** (104 x 16k packs/cell; median | P95 of max-over-layers
+  hot-GPU share under contiguous E/2; z = median Zipf fit at max layer):
+  ```text
+  model          dataset       medHot  p95Hot  domHot     z  topE%
+  glm4.7-flash   dapo          0.7011  0.7102  0.7019  0.95  19.6   <- strongest cell
+  glm4.7-flash   codeforces    0.6709  0.6858  0.6727  0.95  21.6
+  glm4.7-flash   openscience   0.6599  0.6892  0.6630  0.60  14.5
+  glm4.7-flash   swebench      0.6554  0.7592  0.6590  0.65  15.1
+  glm4.7-flash   gpqa          0.6509  0.6933  0.6692  0.75  16.7   (S=3 only — GPQA too small for 16k packs; indicative)
+  glm4.7-flash   longbench     0.6394  0.8650  0.5795  0.60  13.5
+  glm4.7-flash   megamath      0.6374  0.8435  0.5945  0.70  15.0
+  glm4.7-flash   sft_mix       0.6354  0.7511  0.5743  0.65  13.0
+  qwen3.5-122b   codeforces    0.6578  0.6737  0.6676  0.70  11.4   <- EP-microbench model winner
+  qwen3.5-122b   dapo          0.6343  0.6444  0.6326  0.75   8.5
+  qwen3.5-122b   sft_mix       0.6143  0.6639  0.5730  0.65   6.5
+  qwen3-30b      longbench     0.6547  0.7241  0.5971  0.70   9.6
+  qwen3-30b      swebench      0.6508  0.6968  0.6277  0.75  11.0
+  qwen3-30b      openscience   0.6412  0.6732  0.6374  0.70   9.5
+  qwen3-30b      sft_mix       0.6342  0.6937  0.5597  0.65   8.4
+  qwen3-30b      dapo          0.6290  0.6377  0.6364  0.65  10.3
+  qwen3-30b      codeforces    0.6128  0.6345  0.6066  0.75  11.8
+  qwen3-30b      megamath      0.5999  0.7416  0.5789  0.55   8.8
+  glm4.5-air     codeforces    0.6107  0.6217  0.6160  0.73  10.6
+  glm4.5-air     dapo          0.5855  0.5918  0.5868  0.50   8.4
+  glm4.5-air     sft_mix       0.5761  0.6072  0.5221  0.50   6.5
+  hunyuan-a13b   sft_mix       0.5465  0.5733  0.5399  0.30   3.5   <- negative case (balances)
+  hunyuan-a13b   dapo          0.5404  0.5497  0.5416  0.30   3.8
+  hunyuan-a13b   codeforces    0.5361  0.5457  0.5274  0.35   3.7
+  ```
+  Verdicts: (1) EVERY Balancer-claim model clears the >=55% natural-skew
+  gate on real public data — curated-skew fallback NOT needed. (2) domHot
+  (mean histogram over docs = §1.5a analytic 1M-pack prediction) stays
+  ~= per-pack median for math/code (e.g. flash dapo 0.702, 122b
+  codeforces 0.668) -> natural long packs KEEP the skew; controls collapse
+  toward balance (sft_mix domHot 0.52-0.57) as expected. (3) Long-doc
+  purity lever measured: longbench/longalign at ~1.7 docs/pack run hot on
+  every model regardless of domain — pack purity is a co-driver of skew
+  alongside domain (disclose when presenting). (4) hunyuan-a13b is the
+  honest counter-row: per-batch aux-loss recipe balances (z~=0.3,
+  topE ~3.6% ~= 2.3/64 uniform-ish) — mirrors the Mixtral prior. (5) Real-z
+  anchors for Figs 5/12: flash-class ~z0.95, Qwen-class ~z0.7, air ~z0.7,
+  vs the paper's synthetic z in {0.5,1.0,1.5,2.0}.
+  **Stage-2 replay MEASURED** (UltraEP record-and-replay: real per-layer
+  counts -> `ep_balance_bench.py` via `--hist`, q35-122b geom 256,1024,3072
+  topk8 shared1024, m=5.12M, scope=gemm, natural alpha, repo .venv build
+  — container-installed asym_gemm lacks the new `transpose_b` kernel arg):
+  ```text
+  sample(worst layer)        owned   sdp   plan  queue  ownedImb
+  codeforces median L26       39.7  41.7   31.5   31.4     0.410
+  codeforces P95    L26       41.0  41.9   32.8   31.7     0.443
+  dapo       median L27       38.5  40.4   31.2   32.1     0.397
+  dapo       P95    L27       37.2  40.9   31.3   32.8     0.394
+  (median layers: owned 31.5-33.3, plan 29.1-31.7 -> +4..8%)
+  ```
+  -> at REAL code/math routing the static-EP worst-layer wall is
+  **+19-26% over our planned cut** (39.7 vs 31.5 ms etc.), landing between
+  synthetic z=1.5 (37.9) and z=2.0 (45.1) walls even though the marginal
+  histogram fits z~=0.7: synthetic Zipf sprays hot experts uniformly over
+  the halves, real hot experts CLUSTER on one half — the synthetic axis
+  UNDERSELLS real skew at matched z. This is the measured "real routing"
+  group for Figs 5/12.
+  **Artifacts** (gitignored, on shared FS):
+  `profiling_results/ep_skew/route_skew_<model>_<dataset>.json` (+docs.gz,
+  +topk gz for median/P95), `manifest.json`,
+  `profiling_results/ep_skew/replay/ep_real_replay_q35122b_*.json`.
+  **Open**: qwen3-30b|gpqa needs a token-bearing env (manifest has the
+  failed claim; peer can fill); GPQA cells generally too small for >=100
+  16k packs (only ~3) — treat as indicative or drop; e2e on/off pair
+  (stage 3) still pending Kevin's R2 balancer-on answer — natural
+  candidate: 122b x codeforces packs @ ~320k, balancer on/off; consider a
+  short-doc control config of smoltalk to decouple the purity lever from
+  domain in the control row.
+
 ## Recommendation
 
 C (keep the z-sweep as the sensitivity axis) + B (run the search
@@ -427,3 +522,42 @@ Separately, the ablation still wants one measured e2e on/off pair
 (2-rank Qwen3.5-122B @ ~320k) to replace the estimated anchor in
 Fig 12's right panel — confirm whether the R2 campaign ran
 balancer-on.
+
+## §RESULTS LOG (append-only)
+
+- [2026-08-11, c12] SCREEN COMPLETE — stage-1 grid done for the full three-agent
+  split (order run: B -> C -> A; C/A partially executed by the parallel session,
+  merged via the flock'd manifest). Probe: scripts/ep_skew/route_skew_probe.py
+  (capture = pre-hook on `experts` modules -> ACTUAL selected indices; 16384-token
+  packs, 104 samples x B=8, contiguous E/2 partition; chat kinds via each model's
+  chat template). Outputs: profiling_results/ep_skew/ (per-cell JSON + per-doc
+  sidecars + median/P95 token-level topk gz + manifest.json); summarizer:
+  scripts/ep_skew/summarize.py. Dataset substitutions: megamath = IFM/MegaMath
+  megamath-web-pro (LLEP's "Megatron-Math" has no public release); sft_mix =
+  smoltalk/longalign (public balanced control); gpqa capacity = 3 full 16k packs
+  (n=3, thin-tail caveat). Hunyuan tokenizer/model native in venv transformers.
+- KEY NUMBERS (median max-over-layers hot-GPU share / P95; Zipf z at worst layer;
+  "1M pred" = hot share of the domain-mean histogram, §1.5):
+  - GLM-4.7-Flash x DAPO-Math: 0.7011/0.7102, z=0.95, 1M pred 0.7019  <- flagship
+    (codeforces 0.6709 z=0.95; controls ~0.635-0.639)
+  - Qwen3.5-122B x Codeforces: 0.6578/0.6737, z=0.70, 1M pred 0.6676
+    (dapo 0.6343; sft_mix 0.6143) <- the EP-microbench model's real-z anchor
+  - Qwen3-30B: swebench 0.6508 (robust winner), longbench 0.6547, control 0.6342 —
+    domain deltas small; skew mostly INHERENT (LLEP-style) but mean-persistent
+  - GLM-4.5-Air x Codeforces: 0.6107/0.6217, z=0.73, 1M pred 0.6160
+  - Hunyuan-A13B: ~0.54 everywhere, z=0.30 — BALANCED (negative; aux-loss recipe,
+    mirrors Mixtral's known weak topic skew)
+- READINGS: (1) decision gate (<~55% -> curated fallback) PASSES for all
+  Balancer-claim models — natural real-data skew exists, no curation needed;
+  (2) real skew z in [0.5, 0.95] — the paper's synthetic z sweep brackets it
+  (z=1.0 point ~= flash math; 1.5/2.0 = stress tail); (3) controls at 0.54-0.64
+  = inherent post-training routing imbalance on OUR checkpoints, per-pack
+  granularity; (4) §1.5 verdict: domain-pure skew survives doc-averaging (1M pred
+  ~= per-pack median for math/code cells; controls collapse toward 0.5) ->
+  natural long packs are viable for stages 2-3.
+- NEXT (decision-gated, per Recommendation): trace replay of the winners into the
+  ep_owned_fair harness (counts-from-file loader; 122B inputs already extracted
+  to profiling_results/ep_skew/replay/ep_hist_real_*.json) -> measured EP/sDP/
+  Dynamic-EP walls at real routing for Figs 5/12; then ONE e2e balancer on/off
+  pair (2r Qwen3.5-122B ~320k, codeforces packs) — pending Kevin's R2
+  balancer-on confirmation (open item).
