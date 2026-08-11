@@ -62,3 +62,4 @@ variant; queue flavor only if sepplan shows pathology or time remains).
 - [08-11 07:42Z] c17 CLAIM sepplan glm4.7-flash s=576000 (spgf576)
 - [08-11 09:37Z] c17 DONE sepplan glm4.7-flash s=576000 (spgf576) -> TRAINED | spgf576    glm4.7-flash   s= 576000 b1   sepplan=  546 sdp2=548 delta=  -0.3% resv= 146.9G rss= 352G
 - [08-11 09:37Z] c17 CLAIM sepplan glm4.7-flash s=512000 (spgf512)
+- [08-11 11:02Z] c17 HALT by user — sweep stopped after 15 DONE cells (spgf512 killed mid-run, no result); flash T2-trio+T1 832k-576k and full mixtral ladder banked above; flash 512k-32k and all air cells NOT run by c17
