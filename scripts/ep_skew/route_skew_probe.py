@@ -708,6 +708,7 @@ def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base
             tok_topk = _forward_all(B)
             break
         except torch.OutOfMemoryError:
+            cap.take()  # flush partial captures from the aborted batch
             torch.cuda.empty_cache()
             if B <= 1:
                 raise
