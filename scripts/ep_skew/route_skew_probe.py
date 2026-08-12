@@ -267,6 +267,13 @@ def build_packs(ds_key, tokenizer, seq_len, n_samples, max_docs=200000):
                 if len(packs) >= n_samples:
                     return packs, n_docs
             # A doc longer than one pack keeps spilling into the next pack.
+    if len(packs) >= min(100, max(1, n_samples // 2)):
+        print(
+            f"[pack] {ds_key} exhausted at {len(packs)}/{n_samples} full packs "
+            f"({n_docs} docs) — proceeding with what exists",
+            flush=True,
+        )
+        return packs, n_docs
     raise RuntimeError(
         f"dataset {ds_key} exhausted after {n_docs} docs with only "
         f"{len(packs)}/{n_samples} full {seq_len}-token packs"
@@ -409,16 +416,38 @@ def zipf_fit(counts_sorted_desc):
 
 
 def cell_metrics(sample_layer_counts, partition_a):
-    """sample_layer_counts: [S][L][E] torch int64. partition_a: expert ids on GPU0."""
+    """sample_layer_counts: [S][L][E] torch int64. partition_a: expert ids on
+    GPU0 — either one flat list (same split every layer) or a per-layer list
+    of lists (real EP places each layer's experts independently; the
+    build_placed_sets.py partitions are per-layer)."""
     import numpy as np
 
     arr = sample_layer_counts.numpy()  # S,L,E
     S, L, E = arr.shape
+    if partition_a and isinstance(partition_a[0], (list, tuple)):
+        if len(partition_a) != L:
+            raise ValueError(
+                f"per-layer partition has {len(partition_a)} layers, model captured {L}"
+            )
+        mask_a = np.zeros((L, E), dtype=bool)
+        for l, ids in enumerate(partition_a):
+            mask_a[l, list(ids)] = True
+        tot = arr.sum(-1)
+        tot_safe = np.maximum(tot, 1)
+        share_a = (arr * mask_a[None]).sum(-1) / tot_safe
+        return _metrics_from_shares(arr, share_a, tot_safe)
     mask_a = np.zeros(E, dtype=bool)
     mask_a[list(partition_a)] = True
     tot = arr.sum(-1)  # S,L
     tot_safe = np.maximum(tot, 1)
     share_a = arr[..., mask_a].sum(-1) / tot_safe
+    return _metrics_from_shares(arr, share_a, tot_safe)
+
+
+def _metrics_from_shares(arr, share_a, tot_safe):
+    import numpy as np
+
+    S = arr.shape[0]
     hot = np.maximum(share_a, 1.0 - share_a)  # S,L
     top_share = arr.max(-1) / tot_safe
     max_hot = hot.max(1)  # S
