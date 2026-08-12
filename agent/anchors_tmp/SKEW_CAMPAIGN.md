@@ -170,3 +170,10 @@ chat template; capture = pre-hook on `experts` modules (actual selected indices)
   every pack >=0.65. code + mathmix verifying now. Note: deep traces done for
   all 5 datasets (dapo 17k docs / codeforces 9.5k / swebench 2.5k /
   openscience 4.2k / megamath 8.8k).
+- [08-12] c11 QWEN3-30B COMPLETE — 4 verified sets (target 2-3), each 6x ~1M b=1
+  packs, MEASURED layer-avg hot (>=0.65 bar): code(codeforces+swebench) 0.857 ·
+  math(dapo) 0.824 · mathmix(dapo+megamath, full-1M distinct docs) 0.810 ·
+  science(openscience) 0.757. Max-layer per pack 0.93-0.99. Artifacts:
+  profiling_results/ep_skew_deep/placed/{packs,partition,route_skew}_qwen3-30b_*.
+  122B lane started: deep n=256 dapo DONE (13.9k docs), codeforces + openscience
+  tracing on both GPU pairs.
