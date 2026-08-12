@@ -177,3 +177,33 @@ chat template; capture = pre-hook on `experts` modules (actual selected indices)
   profiling_results/ep_skew_deep/placed/{packs,partition,route_skew}_qwen3-30b_*.
   122B lane started: deep n=256 dapo DONE (13.9k docs), codeforces + openscience
   tracing on both GPU pairs.
+- [08-12] 1M VERIFICATION (flash, 6 packs/set, 2-GPU shard, ~2h/set):
+  codemix MEASURED layer-avg 0.5875 (pred 0.6512), med max-layer 0.7589
+  mathmix MEASURED layer-avg 0.5812 (pred 0.6491), med max-layer 0.7800
+  Time-weighted (MoE-time fallback): 0.5936 / 0.5884. layers>=0.65: 7 & 4 of 46.
+  => doc-signature ADDITIVITY BREAKS at 1M (-6pp): long-context attention
+  homogenizes hidden states, softening routing vs 16k-measured signatures.
+  Curated still beats natural 16k layer-avg (0.553) by +3pp. Worst-layer skew
+  at 1M is STRONG and verified (0.76-0.78 sustained over 6 packs).
+  ITERATION 2 LIVE: natural-1M screens (dapo,codeforces | swebench,openscience;
+  6x1M packs each, out=ep_skew_1m) to harvest IN-REGIME per-doc signatures ->
+  re-curate from those -> re-verify. If iter-2 plateaus ~0.60, that is the
+  measured curation ceiling at EP=2/1M for flash (report honestly to Kevin).
+- [08-12] c11 -> c12 FLASH HANDOFF NOTE: your codemix/mathmix 1M plateau (0.58-0.59
+  measured) is the CONTIGUOUS-split ceiling from the 08-12 pivotal entry (perfect-
+  align bound 0.594 for flash) — additivity break makes it worse, iter-2 in-regime
+  signatures cannot beat the bound. The PLACEMENT construction sidesteps it:
+  per-layer top-E/2 partition from calibration-half traces (your held-out eval:
+  flash dapo .821 / codeforces .763). Placed sets NOW BUILT from your deep pools:
+  packs_glm4.7-flash_{math .8207, code .7260, science .8315}.json + partition_*.json
+  in ep_skew_deep/placed/ (calibration/pack docs disjoint via hash parity).
+  Expected 1M landing after observed attenuation (30b -.07..-.17, 122b ~-.02 at
+  131k-window): math/science comfortably >=0.65, code borderline (fallback:
+  frac-tightened selection). Verify with probe --pack-file + --partition (per-layer
+  dict format supported) — c11 will run these if GPUs free first; manifest dedupes.
+  Also: 122b MEASURED (131k-window aggregate on 1M packs, spec-recorded): math
+  0.8223 ✓ code 0.8085 ✓ (science leg re-running after the stale-capture fix
+  e231319; true-1M single-shot infeasible in vanilla HF for the hybrid — deltanet
+  live-set ~100GiB/GPU; window mode is the bounded-memory proxy). NOTE for this
+  node (c11, 64k-page ARM kernel): expandable_segments correlated with
+  12-16GiB-alloc failures at 40+GiB free — dropped here; your node may differ.
