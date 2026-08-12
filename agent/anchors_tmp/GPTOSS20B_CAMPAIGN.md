@@ -95,3 +95,44 @@ ported from the 46-tree working diff). DO NOT STOP until all goals met.
   as the eager escape hatch for numeric cross-checks. a_eag cell added to
   chain A (FA4-vs-eager step-1 loss, bf16-noise gate) since both parity dev
   cells share FA4 and could not catch a wrong sink integration alone.
+- [2026-08-12 03:36] DEV PAIR PASS (8k·b1 w1+m1, both FA4): uns 1.791→1.469
+  vs asym T1 1.803→1.480 — Δ 0.67%/0.75%, parallel (family band: mixtral
+  0.35/0.69, phi 0.50/0.10, air 0.91/1.24). gptoss_moes_wrapped=24/24;
+  routers skipped whole-GPU (24×); sinks = 3072 B unselected_other moved,
+  residue 3328 B ≪ 8MB allowance — no incident; staged dispatch verified
+  (torch_forward_calls=384, asym 0 by design at T1). MXFP4-free bf16 local
+  checkpoint loads clean. Eager cross-check next.
+- [2026-08-12 03:38] EAGER CROSS-CHECK PASS: uns-eager 1.794→1.466 vs
+  uns-FA4 1.791→1.469 (Δ 0.17%/0.20% = bf16 noise) — FA4 learnable_sink +
+  window_size integration numerically correct on gpt-oss. PHASE-A COMPLETE.
+- [2026-08-12 03:56] PHASE-B COMPLETE — ALL FOUR TIERS TRAINED @64k·b1:
+  | cell | tok/s | resv | rss | losses |
+  | uns    | 8301 | 22.0G |  83G | 0.878/0.9486/1.162 |
+  | uns-off| 5428 | 18.4G |  85G | 0.878/0.9483/1.162 |
+  | T1     | 3646 | 12.0G | 106G | 0.8801/0.9409/1.159 |
+  | T2     | 3913 | 12.5G | 107G | 0.8801/0.9416/1.158 |
+  | T2B    | 4267 |  9.5G | 121G | 0.8801/0.943/1.157 |
+  | T3     | 4125 |  9.0G | 120G | 0.8801/0.9435/1.16 |
+  Loss in-band everywhere (≤0.5%/step vs baseline, parallel). Engagement
+  verified: T1 staged+unsloth+attnact0; T2/T2B staged full-fg attnact1;
+  T3 DIRECT dispatch (asym_forward_calls=576) full-fg attnact1; moefg0 all
+  (own engine). T3 already 49% of uns-off resv at the shared 64k workload.
+  GPT-OSS TIER FINDING: T2B BEATS T1 on BOTH axes (4267>3646 tok/s, 9.5<12.0
+  resv) — unlike hy/glm where T1 is the speed tier. gpt-oss T1's unsloth-GC
+  soc traffic outweighs its recompute savings at this scale; the tp ladders
+  therefore run DUAL-TRACK asym (T1 AND T2B per rung while each fits, T3
+  after T2B walls; T2 dominated by T2B — quartet-validated, excluded from
+  ladders).
+- [2026-08-12 04:16] PHASE-C MEMORY VERDICT (same-workload row, 128k·b4
+  w1+m2): uns-off walked 8→GOOM, 6→GOOM, 4→TRAINED 135.8 GiB (73% —
+  probative band) RSS 349G tok/s 4660, losses 1.167/1.098/1.135. asym T3:
+  **49.8 GiB (27%) = 36.7% of baseline**, RSS 300G, tok/s 5970 (+28%
+  FASTER), losses 1.171/1.098/1.128 (Δ≤0.6%/step). T3 beats uns-off on
+  EVERY axis at the verdict workload — beyond the phi win (49.6%).
+  Baseline wall bracketed (b4,b6]; T3 dominance probe at b6 in flight.
+- [2026-08-12 04:26] PHASE-C COMPLETE — VERDICT: **WIN+DOMINANCE**.
+  Capacity: uns-off GOOMs 128k·b6 while **T3 TRAINS it @72.8 GiB (38%)**,
+  RSS 472G, tok/s 5644, losses in-band (+50% workload only asym runs).
+  Full verdict row: same-workload 128k·b4 T3 49.8 (27%) vs uns-off 135.8
+  (73%) = 36.7%, T3 +28% faster, RSS 300 vs 349. CHAIN-A COMPLETE (13
+  cells: dev trio + quartet + refs + walker). Chain D (1r ladder) next.

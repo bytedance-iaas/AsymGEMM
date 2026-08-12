@@ -39,7 +39,8 @@ done
 note "PROBE GATE PASSED (host+nvlink plan PR5)"
 
 dead_rc=0; dead_un=0; dead_uo=0
-asym_tier=T1
+# dual-track asym per the Phase-B tier finding (T2B beats T1 both axes)
+dead_t1=0; dead_t2b=0
 
 blist_for() { local s=$1
   if   [ "$s" -le 64000 ];  then echo "8 6 4 2 1"
@@ -56,7 +57,7 @@ run_t3() { local v; shmclean
 
 for seq in 32000 64000 128000 192000 256000 320000 384000 512000 640000 768000 896000 1024000; do
   sk=$((seq/1000)); bl=$(blist_for "$seq")
-  note "RUNG2 ${sk}k begin (asym_tier=$asym_tier)"
+  note "RUNG2 ${sk}k begin (t1dead=$dead_t1 t2bdead=$dead_t2b)"
   if [ "$dead_rc" = 0 ]; then
     v=$(run_sys "e2rc${sk}" "$RC" "$seq" "$bl"); [ "$v" = "TRAINED" ] || dead_rc=1
   fi
@@ -67,21 +68,20 @@ for seq in 32000 64000 128000 192000 256000 320000 384000 512000 640000 768000 8
     v=$(run_sys "e2uo${sk}" "$UO" "$seq" "$bl"); [ "$v" = "TRAINED" ] || dead_uo=1
   fi
   va=FAIL
-  if [ "$asym_tier" = "T1" ]; then
-    va=$(run_sys "e2t1${sk}" "${SEP}|T1" "$seq" "$bl")
-    [ "$va" = "TRAINED" ] || { asym_tier=T2; note "PROMOTE 2r T1->T2 at ${sk}k"; }
+  if [ "$dead_t1" = 0 ]; then
+    v=$(run_sys "e2t1${sk}" "${SEP}|T1" "$seq" "$bl")
+    [ "$v" = "TRAINED" ] || { dead_t1=1; note "2r T1 WALL at ${sk}k"; }
+    [ "$v" = "TRAINED" ] && va=TRAINED
   fi
-  if [ "$va" != "TRAINED" ] && [ "$asym_tier" = "T2" ]; then
-    va=$(run_sys "e2t2${sk}" "${SEP}|T2" "$seq" "$bl")
-    [ "$va" = "TRAINED" ] || { asym_tier=T2B; note "PROMOTE 2r T2->T2B at ${sk}k"; }
+  if [ "$dead_t2b" = 0 ]; then
+    v=$(run_sys "e2a2b${sk}" "${SEP}|T2B" "$seq" "$bl")
+    [ "$v" = "TRAINED" ] || { dead_t2b=1; note "2r T2B WALL at ${sk}k"; }
+    [ "$v" = "TRAINED" ] && va=TRAINED
   fi
-  if [ "$va" != "TRAINED" ] && [ "$asym_tier" = "T2B" ]; then
-    va=$(run_sys "e2a2b${sk}" "${SEP}|T2B" "$seq" "$bl")
-    [ "$va" = "TRAINED" ] || { asym_tier=T3; note "PROMOTE 2r T2B->T3 at ${sk}k"; }
-  fi
-  if [ "$va" != "TRAINED" ] && [ "$asym_tier" = "T3" ]; then
-    va=$(run_t3 "e2t3${sk}" x "$seq" "$bl")
-    if [ "$va" != "TRAINED" ]; then
+  if [ "$dead_t2b" = 1 ]; then
+    v=$(run_t3 "e2t3${sk}" x "$seq" "$bl")
+    [ "$v" = "TRAINED" ] && va=TRAINED
+    if [ "$v" != "TRAINED" ] && [ "$va" != "TRAINED" ]; then
       note "2R ASYM WALL at ${sk}k — CEILING BRACKETED, ladder ends"
       break
     fi

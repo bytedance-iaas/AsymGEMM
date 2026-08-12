@@ -12,7 +12,9 @@ run_dirs = sorted(glob.glob(f"{BASE}/{TAG}-c17_gpt-oss-20b__b*_s*_ga1_drop000"))
 if not run_dirs:
     print(f"{TAG}\tNO_RUN_DIR")
     sys.exit(0)
-rd = run_dirs[-1]
+# a walked tag leaves OOM'd dirs too — prefer dirs holding a complete profile.json
+complete = [d for d in run_dirs if glob.glob(f"{d}/*/b*_s*_ga1/profile.json")]
+rd = (complete or run_dirs)[-1]
 m = re.search(r"__b(\d+)_s(\d+)_ga1", rd)
 b, s = int(m.group(1)), int(m.group(2))
 leaves = [p for p in glob.glob(f"{rd}/*/b*_s*_ga1") if os.path.isdir(p)]

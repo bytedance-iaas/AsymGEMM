@@ -24,7 +24,9 @@ harv() { /workspace/AsymGEMM-SFT-38/third_party/AsymGEMM/.venv/bin/python \
            agent/anchors_tmp/gptoss_harvest.py "$1" "${2:-1}" 2>/dev/null | tee -a "$S2"; }
 
 dead_rc=0; dead_un=0; dead_uo=0
-asym_tier=T1   # promotes T1 -> T2B -> T3; ladder ends when T3 walls
+# Phase-B finding: T2B beats T1 on BOTH axes for gpt-oss -> dual-track asym:
+# T1 and T2B measured per rung while each fits; T3 takes over when T2B walls.
+dead_t1=0; dead_t2b=0
 
 blist_for() { # $1 seq -> batch walk list
   local s=$1
@@ -43,7 +45,7 @@ run_t3() { local v; v=$( (export "${T3ENV[@]}"; run_cell "$1" "$MODEL" "$T3TOK" 
 note "CHAIN-D begin (1r ladder)"
 for seq in 32000 64000 96000 128000 192000 256000 320000 384000 448000 512000 640000 768000 896000 1024000; do
   sk=$((seq/1000)); bl=$(blist_for "$seq")
-  note "RUNG ${sk}k begin (asym_tier=$asym_tier)"
+  note "RUNG ${sk}k begin (t1dead=$dead_t1 t2bdead=$dead_t2b)"
   if [ "$dead_rc" = 0 ]; then
     v=$(run_sys "d1rc${sk}" "$RC" "$seq" "$bl"); [ "$v" = "TRAINED" ] || dead_rc=1
   fi
@@ -53,24 +55,23 @@ for seq in 32000 64000 96000 128000 192000 256000 320000 384000 448000 512000 64
   if [ "$dead_uo" = 0 ]; then
     v=$(run_sys "d1uo${sk}" "$UO" "$seq" "$bl"); [ "$v" = "TRAINED" ] || dead_uo=1
   fi
-  # asym with tier promotion inside the rung (T1 -> T2 -> T2B -> T3)
+  # dual-track asym: T1 + T2B while each fits, T3 after T2B walls
   va=FAIL
-  if [ "$asym_tier" = "T1" ]; then
-    va=$(run_sys "d1t1${sk}" "asym_cpuadamwds|T1" "$seq" "$bl")
-    [ "$va" = "TRAINED" ] || { asym_tier=T2; note "PROMOTE asym T1->T2 at ${sk}k"; }
+  if [ "$dead_t1" = 0 ]; then
+    v=$(run_sys "d1t1${sk}" "asym_cpuadamwds|T1" "$seq" "$bl")
+    [ "$v" = "TRAINED" ] || { dead_t1=1; note "T1 WALL at ${sk}k"; }
+    [ "$v" = "TRAINED" ] && va=TRAINED
   fi
-  if [ "$va" != "TRAINED" ] && [ "$asym_tier" = "T2" ]; then
-    va=$(run_sys "d1t2${sk}" "asym_cpuadamwds|T2" "$seq" "$bl")
-    [ "$va" = "TRAINED" ] || { asym_tier=T2B; note "PROMOTE asym T2->T2B at ${sk}k"; }
+  if [ "$dead_t2b" = 0 ]; then
+    v=$(run_sys "d1a2b${sk}" "asym_cpuadamwds|T2B" "$seq" "$bl")
+    [ "$v" = "TRAINED" ] || { dead_t2b=1; note "T2B WALL at ${sk}k"; }
+    [ "$v" = "TRAINED" ] && va=TRAINED
   fi
-  if [ "$va" != "TRAINED" ] && [ "$asym_tier" = "T2B" ]; then
-    va=$(run_sys "d1a2b${sk}" "asym_cpuadamwds|T2B" "$seq" "$bl")
-    [ "$va" = "TRAINED" ] || { asym_tier=T3; note "PROMOTE asym T2B->T3 at ${sk}k"; }
-  fi
-  if [ "$va" != "TRAINED" ] && [ "$asym_tier" = "T3" ]; then
-    va=$(run_t3 "d1t3${sk}" x "$seq" "$bl")
-    if [ "$va" != "TRAINED" ]; then
-      note "ASYM WALL at ${sk}k (T3 failed) — CEILING BRACKETED, ladder ends"
+  if [ "$dead_t2b" = 1 ]; then
+    v=$(run_t3 "d1t3${sk}" x "$seq" "$bl")
+    [ "$v" = "TRAINED" ] && va=TRAINED
+    if [ "$v" != "TRAINED" ] && [ "$va" != "TRAINED" ]; then
+      note "ASYM WALL at ${sk}k (all tiers failed) — CEILING BRACKETED, ladder ends"
       break
     fi
   fi
