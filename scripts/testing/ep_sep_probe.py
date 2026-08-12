@@ -47,7 +47,11 @@ def child(args) -> int:
 
     rank = args.rank
     torch.manual_seed(7 + rank)
-    dev = torch.device("cuda", 0)
+    if args.transport == "nvlink":
+        dev = torch.device("cuda", rank)
+        torch.cuda.set_device(dev)
+    else:
+        dev = torch.device("cuda", 0)
 
     ctrl_ints = ep_sep.ctrl_ints_needed()
     ctrl_bytes = (ctrl_ints * 4 + 4095) // 4096 * 4096
@@ -63,17 +67,47 @@ def child(args) -> int:
     assert int(rc) == 0, f"cudaHostRegister rc={rc}"
 
     ctrl = base[:ctrl_ints * 4].view(torch.int32)
+    # D staging is CPU-pinned shm for BOTH transports (D0 verdict: the steal
+    # kernel + gather assert pinned d staging); nvlink moves only X.
     off = ctrl_bytes
-    x_slots, d_slots = [[], []], [[], []]
+    x_shm, d_slots = [[], []], [[], []]
     for r in range(2):
         for i in range(ep_sep.RING):
-            x_slots[r].append(base[off:off + slot_bytes].view(torch.bfloat16))
+            x_shm[r].append(base[off:off + slot_bytes].view(torch.bfloat16))
             off += slot_bytes
     for r in range(2):
         for i in range(ep_sep.RING):
             d_slots[r].append(base[off:off + dslot_bytes].view(torch.bfloat16))
             off += dslot_bytes
-    st = ep_sep.install_buffers(rank=rank, world=2, ctrl=ctrl, x_slots=x_slots, d_slots=d_slots)
+    x_scratch = None
+    if args.transport == "nvlink":
+        # fix_dynamic_ep.md D0-revised: per-rank DEVICE X rings exchanged as
+        # CUDA IPC tensors + private pinned x-scratch for the kernel's
+        # CPU-pinned a_peer contract; ctrl + D stay pinned shm.
+        import pickle
+        from torch.multiprocessing.reductions import reduce_tensor
+
+        mine_x = [torch.zeros(MAX_ROWS * K, dtype=torch.bfloat16, device=dev)
+                  for _ in range(ep_sep.RING)]
+        payload = [reduce_tensor(t) for t in mine_x]
+        with open(shm(args.tag) + f".ipc{rank}.tmp", "wb") as fh:
+            pickle.dump(payload, fh)
+        os.replace(shm(args.tag) + f".ipc{rank}.tmp", shm(args.tag) + f".ipc{rank}")
+        barrier(args.tag, "ipc", rank)
+        with open(shm(args.tag) + f".ipc{1 - rank}", "rb") as fh:
+            peer_payload = pickle.load(fh)
+        peer_x_rings = [fn(*a) for fn, a in peer_payload]
+        x_slots = [None, None]
+        x_slots[rank], x_slots[1 - rank] = mine_x, peer_x_rings
+        x_scratch = [torch.zeros(MAX_ROWS * K, dtype=torch.bfloat16, pin_memory=True)
+                     for _ in range(ep_sep.RING)]
+        x_scratch[0][:1].copy_(peer_x_rings[0][:1])  # warm the P2P mapping
+        torch.cuda.synchronize()
+    else:
+        x_slots = x_shm
+    st = ep_sep.install_buffers(rank=rank, world=2, ctrl=ctrl, x_slots=x_slots,
+                                d_slots=d_slots, transport=args.transport,
+                                x_scratch=x_scratch)
 
     gen = torch.Generator(device="cpu").manual_seed(1234)
     b_bank = (torch.randn(E, N, K, generator=gen, dtype=torch.bfloat16) * 0.02).pin_memory()
@@ -136,7 +170,7 @@ def child(args) -> int:
                 in_seg = sorted(set(int(r) % max(per, 1) for r in bad[:200]))[:16]
                 # split the world: is the PEER'S STAGE correct for the bad rows?
                 ring_used = (st.seq - 1) % 4
-                stage = st.d_slots[1 - rank][ring_used][: m * N].view(m, N)
+                stage = st._d_ring_for_gather(ring_used)[: m * N].view(m, N)
                 stage_rows = stage[bad.cpu()].cuda()
                 stage_match_ref = float((stage_rows == d_ref[bad]).float().mean())
                 stage_match_armed = float((stage_rows == d_armed[bad]).float().mean())
@@ -176,12 +210,21 @@ def parent(args) -> int:
     procs = []
     for rank in range(2):
         env = dict(os.environ)
-        env["CUDA_VISIBLE_DEVICES"] = args.gpus.split(",")[rank]
+        # nvlink: BOTH children see BOTH GPUs (identical enumeration) — CUDA
+        # IPC rebuild maps the peer tensor by device index, so the peer's
+        # device must exist in this process. host: one GPU each (unchanged).
+        env["CUDA_VISIBLE_DEVICES"] = args.gpus if args.transport == "nvlink" \
+            else args.gpus.split(",")[rank]
         env["ASYM_EP_SEP"] = "1"
         env["ASYM_EP_SEP_MODE"] = args.mode
+        env["ASYM_EP_SEP_TRANSPORT"] = args.transport
+        # pin the arming ceiling so the case calibration (decline at 4608
+        # rows/seg) is deterministic across transports
+        env.setdefault("ASYM_EP_SEP_MAX_MPE", "4096")
         procs.append(subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), "--role", "child",
-             "--rank", str(rank), "--tag", tag], env=env, cwd=REPO))
+             "--rank", str(rank), "--tag", tag, "--transport", args.transport],
+            env=env, cwd=REPO))
     rcs = [p.wait() for p in procs]
     ok = all(rc == 0 for rc in rcs)
     verdict = {}
@@ -207,6 +250,7 @@ def main() -> int:
     ap.add_argument("--tag", default="")
     ap.add_argument("--gpus", default="2,3")
     ap.add_argument("--mode", default="queue", choices=["queue", "plan"])
+    ap.add_argument("--transport", default="host", choices=["host", "nvlink"])
     args = ap.parse_args()
     return child(args) if args.role == "child" else parent(args)
 

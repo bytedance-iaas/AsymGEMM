@@ -981,6 +981,56 @@ def _asym_bf16_nt(
     return d
 
 
+def _try_ep_sep_grouped(
+    a: torch.Tensor,
+    b_cpu: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    *,
+    compiled_dims: str,
+    transpose_b: bool,
+    output_dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    """fix_dynamic_ep.md §3.1a: the sEP union attempt, extracted from
+    `_asym_grouped_bf16_nt` so `_dispatch_grouped_nt` can fire it BEFORE the
+    staged flip (every tier recipe pins staged dispatch — the old inline
+    placement made sEP unreachable there, a measured -11% entry fee via the
+    direct-dispatch override). Owns its own pad+metadata prep and unpads on
+    armed success. Returns None on ANY decline; the caller falls through to
+    the unchanged staged/direct logic. One call site => one seq consumed."""
+    if not _EP_SEP_ENABLED:
+        return None
+    from .ep_sep import state as _sep_state
+
+    _st = _sep_state()
+    if _st is None:
+        return None
+    # the armed kernel is direct-family: same eligibility as the direct path
+    if _direct_grouped_bf16_reason(a, b_cpu, transpose_b=transpose_b) is not None:
+        return None
+    import asym_gemm
+
+    m = int(a.shape[0])
+    n = int(b_cpu.shape[2] if transpose_b else b_cpu.shape[1])
+    a_kernel, offsets_kernel, unpad = _pad_grouped_input_for_asym(a, offsets, experts)
+    offsets_i32, experts_i32, list_size = _group_metadata_tensors(
+        offsets_kernel, experts, device=a.device)
+    # pre_gate declines on host ints BEFORE the .tolist() GPU sync — at
+    # decline-regime workloads (m/n_segs > max_mpe) the sync cost the whole
+    # backend +6.7 s/step at 20k for launches that could never arm.
+    if not _st.pre_gate(int(a_kernel.shape[0]), int(a_kernel.shape[1]),
+                        list_size - 1):
+        return None
+    pairs_cpu = offsets_i32[: 2 * (list_size - 1)].cpu().tolist()
+    ids_cpu = experts_i32[: list_size - 1].cpu().tolist()
+    segs = [(ids_cpu[i], pairs_cpu[2 * i], pairs_cpu[2 * i + 1])
+            for i in range(list_size - 1)]
+    d = torch.empty((int(a_kernel.shape[0]), n), device=a.device, dtype=output_dtype)
+    if _st.try_armed(asym_gemm, a_kernel, b_cpu, d, segs, compiled_dims, transpose_b):
+        return _unpad_grouped_output(d, unpad, output_m=m)
+    return None
+
+
 def _asym_grouped_bf16_nt(
     a: torch.Tensor,
     b_cpu: torch.Tensor,
@@ -1002,25 +1052,10 @@ def _asym_grouped_bf16_nt(
     a_kernel, offsets_kernel, unpad = _pad_grouped_input_for_asym(a, offsets, experts)
     d = torch.empty((int(a_kernel.shape[0]), n), device=a.device, dtype=output_dtype)
     offsets_i32, experts_i32, list_size = _group_metadata_tensors(offsets_kernel, experts, device=a.device)
-    if _EP_SEP_ENABLED:
-        # fix_gb200_ep.md S6 true-sEP: union work sharing over the shared bank.
-        # Consumes POST-PAD pairs (BLOCK_M-aligned — the PR-5 alignment contract).
-        # The .tolist() is a LOCAL drain (sdp-benign; no collective sits upstream).
-        from .ep_sep import state as _sep_state
-
-        _st = _sep_state()
-        # pre_gate declines on host ints BEFORE the .tolist() GPU sync — at
-        # decline-regime workloads (m/n_segs > MAX_MPE) the sync cost the whole
-        # backend +6.7 s/step at 20k for launches that could never arm.
-        if _st is not None and _st.pre_gate(int(a_kernel.shape[0]), int(a_kernel.shape[1]),
-                                            list_size - 1):
-            pairs_cpu = offsets_i32[: 2 * (list_size - 1)].cpu().tolist()
-            ids_cpu = experts_i32[: list_size - 1].cpu().tolist()
-            segs = [(ids_cpu[i], pairs_cpu[2 * i], pairs_cpu[2 * i + 1])
-                    for i in range(list_size - 1)]
-            if _st.try_armed(asym_gemm, a_kernel, b_cpu, d, segs, compiled_dims, transpose_b):
-                d = _unpad_grouped_output(d, unpad, output_m=m)
-                return d
+    # fix_dynamic_ep.md §3.1b: the inline sEP attempt moved OUT of this
+    # function into `_try_ep_sep_grouped`, fired once from
+    # `_dispatch_grouped_nt` before the staged flip (one call site, one seq
+    # consumed, all dispatch modes covered — no direct-path entry fee).
     if _EP_QUEUED_ENABLED:
         # fix_gb200_ep.md S2a: entry-pop queued variant over THIS rank's own list with a
         # private counter block (side fixed per rank; steal arrives at S2b). Zero-steal
@@ -1616,6 +1651,27 @@ def _dispatch_grouped_nt(
 ) -> torch.Tensor:
     _check_backend(backend)
     precision = _normalize_precision(precision)
+    # fix_dynamic_ep.md §3.1c: sEP union attempt BEFORE the staged flip so
+    # every tier's recipe-pinned staged dispatch still sees it (the old
+    # placement lived only inside the direct path — a measured -11% entry
+    # fee to reach it on GLM-Flash). Decline => fall through UNCHANGED.
+    if backend != "torch" and precision == "bf16" and _EP_SEP_ENABLED:
+        _sep_out = _try_ep_sep_grouped(
+            a,
+            b_cpu,
+            offsets,
+            experts,
+            compiled_dims=compiled_dims,
+            transpose_b=transpose_b,
+            output_dtype=bf16_output_dtype,
+        )
+        if _sep_out is not None:
+            if stats is not None:
+                if phase == "forward":
+                    stats.asym_forward_calls += 1
+                else:
+                    stats.asym_dx_calls += 1
+            return _sep_out
     if backend != "torch" and precision == "bf16" and _gemm_dispatch_staged():
         backend = "torch"  # D5: stage-once + native grouped mm; counted in torch_* stats
 

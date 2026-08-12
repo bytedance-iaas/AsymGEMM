@@ -84,6 +84,7 @@ declare -A M=(
   [glm4.5-air]="zai-org/GLM-4.5-Air"                 # layers: 46 (model_integration.md #4)
   [glm4.7-flash]="zai-org/GLM-4.7-Flash"             # layers: 47 (model_integration.md #5)
   [gpt-oss-120b]="openai/gpt-oss-120b"               # layers: 36 (model_integration.md #6)
+  [gpt-oss-20b]="/scratch_local/user_data/shutian/kevin/cache/fused/gpt-oss-20b-bf16" # layers: 24 (gpt_oss family, 32E top-4; DEQUANTIZED bf16 local copy 2026-08-12 — MXFP4 source dequants on every load without the kernels pkg; mixtral fused-copy precedent. was openai/gpt-oss-20b)
   [jamba2-mini]="ai21labs/AI21-Jamba2-Mini"          # layers: 32 (model_integration.md #7; hybrid Mamba+attn, MoE odd layers)
   # dense
   [q3-32b]="Qwen/Qwen3-32B"                          # layers: 64
@@ -989,6 +990,13 @@ is_qwen35_model_name() {
   esac
 }
 
+is_gptoss_model_name() {
+  case "${1,,}" in
+    *gpt-oss*|*gpt_oss*|*gptoss*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 flash_attn_tag() {
   case "${1}" in
     auto|"") printf 'attnauto\n' ;;
@@ -1013,6 +1021,15 @@ resolve_current_runtime_for_model() {
     [[ "${_ENV_DIR_ENV_SET}" == "true" ]] || CURRENT_ENV_DIR="${FA4_ENV_DIR}"
     [[ "${_FLASH_ATTN_ENV_SET}" == "true" ]] || CURRENT_FLASH_ATTN=fa4
     [[ "${_QWEN35_DELTA_CHUNK_ENV_SET}" == "true" ]] || CURRENT_QWEN35_DELTA_CHUNK_SIZE="${QWEN35_DELTA_CHUNK_DEFAULT}"
+  fi
+  # gpt-oss FA4 auto-switch (model_integration.md #6, 2026-08-12): gpt_oss has
+  # _supports_sdpa=False (attention sinks) — the plain .venv (no flash-attn)
+  # falls back to eager O(S^2). FA4 4.0.0b16 takes learnable_sink + window_size,
+  # so gpt-oss rides the qwen3.5 FA4 stack. Same env-override escape hatches.
+  if [[ "${ASYM_GPTOSS_FA4_AUTO:-1}" == "1" ]] && is_gptoss_model_name "${model}"; then
+    [[ "${_LF_DIR_ENV_SET}" == "true" ]] || CURRENT_LF_DIR="${LF_FA4_DIR}"
+    [[ "${_ENV_DIR_ENV_SET}" == "true" ]] || CURRENT_ENV_DIR="${FA4_ENV_DIR}"
+    [[ "${_FLASH_ATTN_ENV_SET}" == "true" ]] || CURRENT_FLASH_ATTN=fa4
   fi
   CURRENT_ENV_PYTHON="${CURRENT_ENV_DIR}/bin/python"
   CURRENT_FLASH_ATTN_LABEL="$(flash_attn_tag "${CURRENT_FLASH_ATTN}")"
@@ -1125,7 +1142,7 @@ backend_gpu_count() {
   local backend="$1"
   local model_gpu_count="$2"
   case "${backend}" in
-    asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds|asym_dp2_cpuadamwds|asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sepqueue2_cpuadamwds|asym_sepplan2_cpuadamwds)
+    asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds|asym_dp2_cpuadamwds|asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sepqueue2_cpuadamwds|asym_sepplan2_cpuadamwds|asym_sepplanlink2_cpuadamwds)
       # GB200 |2 family honors 2 GPUs (gb200_tp.md I0 un-collapses the cap).
       ((model_gpu_count == 2)) || die "backend '${backend}' requires a |2 model spec, got |${model_gpu_count}"
       printf '2\n' ;;
@@ -1311,7 +1328,7 @@ cpuadam_backend_for_label() {
   case "${1}" in
     asym_cpuadamwtorch) printf 'torch\n' ;;
     asym_cpuadamwds|asym_cpuadamwds_panvme|asym_cpuadamwds_actnvme|asym_cpuadamwds_bothnvme) printf 'deepspeed\n' ;;
-    asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds|asym_dp2_cpuadamwds|asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sepqueue2_cpuadamwds|asym_sepplan2_cpuadamwds) printf 'deepspeed\n' ;;
+    asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds|asym_dp2_cpuadamwds|asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sepqueue2_cpuadamwds|asym_sepplan2_cpuadamwds|asym_sepplanlink2_cpuadamwds) printf 'deepspeed\n' ;;
     *) return 1 ;;
   esac
 }
@@ -1385,6 +1402,8 @@ append_backend_spec() {
     asym_sepqueue2_cpuadamwds) backend=asym_sepqueue2_cpuadamwds ;;
     asym_sepplan2) backend=asym_sepplan2_cpuadamwds ;;
     asym_sepplan2_cpuadamwds) backend=asym_sepplan2_cpuadamwds ;;
+    asym_sepplanlink2) backend=asym_sepplanlink2_cpuadamwds ;;
+    asym_sepplanlink2_cpuadamwds) backend=asym_sepplanlink2_cpuadamwds ;;
     # NAMING EPOCH 4 (2026-07-10): legacy sEP spellings canonicalize to sepqueue2
     asym_sep2|asym_sqep2|asym_sqeq2) backend=asym_sepqueue2_cpuadamwds ;;
     asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds|asym_sqeq2_cpuadamwds) backend=asym_sepqueue2_cpuadamwds ;;
@@ -3598,7 +3617,7 @@ run_job() {
   case "${backend}" in
     asym_stp_cpuadamwds|tp2_resident_cpuadamwds|tp2_offstage_cpuadamwds) stp_enable=1 ;;
     asym_dp2_cpuadamwds) dp2_enable=1 ;;
-    asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sepqueue2_cpuadamwds|asym_sepplan2_cpuadamwds) ep2_enable=1 ;;
+    asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sepqueue2_cpuadamwds|asym_sepplan2_cpuadamwds|asym_sepplanlink2_cpuadamwds) ep2_enable=1 ;;
   esac
   if ((stp_enable || dp2_enable || ep2_enable)); then
     case "${gpu}" in
@@ -4822,7 +4841,7 @@ for _lp_idx in "${!lora_dropouts[@]}"; do
               continue
             fi
             job_router_mode="${router_mode}"
-            if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" && "${backend}" != "asym_cpuadamwtorch" && "${backend}" != "asym_cpuadamwds" && "${backend}" != "asym_cpuadamwds_panvme" && "${backend}" != "asym_cpuadamwds_actnvme" && "${backend}" != "asym_cpuadamwds_bothnvme" && "${backend}" != "asym_stp_cpuadamwds" && "${backend}" != "asym_dp2_cpuadamwds" && "${backend}" != "asym_ep2_cpuadamwds" && "${backend}" != "asym_sdp2_cpuadamwds" && "${backend}" != "asym_sqdp2_cpuadamwds" && "${backend}" != "asym_sepqueue2_cpuadamwds" && "${backend}" != "asym_sepplan2_cpuadamwds" && "${backend}" != "tp2_resident_cpuadamwds" && "${backend}" != "tp2_offstage_cpuadamwds" ]]; then
+            if [[ "${router_mode}" == "whole" && "${backend}" != "asym" && "${backend}" != "asym_torch" && "${backend}" != "asym_cpuadamwtorch" && "${backend}" != "asym_cpuadamwds" && "${backend}" != "asym_cpuadamwds_panvme" && "${backend}" != "asym_cpuadamwds_actnvme" && "${backend}" != "asym_cpuadamwds_bothnvme" && "${backend}" != "asym_stp_cpuadamwds" && "${backend}" != "asym_dp2_cpuadamwds" && "${backend}" != "asym_ep2_cpuadamwds" && "${backend}" != "asym_sdp2_cpuadamwds" && "${backend}" != "asym_sqdp2_cpuadamwds" && "${backend}" != "asym_sepqueue2_cpuadamwds" && "${backend}" != "asym_sepplan2_cpuadamwds" && "${backend}" != "asym_sepplanlink2_cpuadamwds" && "${backend}" != "tp2_resident_cpuadamwds" && "${backend}" != "tp2_offstage_cpuadamwds" ]]; then
               if [[ "${router_hf_selected}" != "true" ]]; then
                 job_router_mode=hf
               else

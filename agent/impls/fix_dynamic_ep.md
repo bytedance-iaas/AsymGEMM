@@ -2,8 +2,9 @@
 
 ## §GOAL (Kevin, 2026-08-10 — the DON'T-STOP criterion)
 Build asym_sepplanlink2 and KEEP FIXING AND IMPROVING IT until, for EACH
-MoE model in scope (GLM-4.7-Flash, GLM-4.5-Air, then Mixtral, then Hunyuan,
-then Qwen3-30B / Qwen3.5-35B / Qwen3.5-122B), measured on REAL NEAR-CEILING
+MoE model in scope (Hunyuan-A13B first, then Mixtral, then GLM-4.7-Flash +
+GLM-4.5-Air, then Qwen3-30B / Qwen3.5-35B / Qwen3.5-122B — reordered per
+Kevin 2026-08-10), measured on REAL NEAR-CEILING
 2-rank workloads (the §5 ceiling cells — the same cells the throughput
 plots bank):
   1. sepplanlink2 is STRICTLY BETTER than the original asym_sepplan2
@@ -20,12 +21,13 @@ AND tok/s == sdp2 within noise AND better-than-sepplan2 — which satisfies
 1+2 by making the new backend the safe default). Every fix goes through the
 §5 comparison discipline (vs sdp2 AND sepplan2, tok/s+HBM+RSS+loss).
 
-STRICT MODEL SEQUENCE (hard gate — no skipping, no parallelizing ahead):
-  1. GLM-4.7-Flash and GLM-4.5-Air   (the GLM pair = stage 1)
-  2. Mixtral-8x22B                    (only after BOTH GLMs fully meet §GOAL)
-  3. Hunyuan-A13B                     (only after Mixtral fully meets §GOAL)
-  4. Qwen3-30B, Qwen3.5-35B, Qwen3.5-122B (only after Hunyuan; regression +
-     upside on the paper's existing sEP rows)
+STRICT MODEL SEQUENCE (hard gate — no skipping, no parallelizing ahead;
+reordered per Kevin 2026-08-10, Hunyuan first):
+  1. Hunyuan-A13B                     (stage 1 — dev + first §GOAL gate)
+  2. Mixtral-8x22B                    (only after Hunyuan fully meets §GOAL)
+  3. GLM-4.7-Flash and GLM-4.5-Air   (only after Mixtral fully meets §GOAL)
+  4. Qwen3-30B, Qwen3.5-35B, Qwen3.5-122B (only after BOTH GLMs; regression
+     + upside on the paper's existing sEP rows)
 DO NOT move to the next model until the CURRENT model's §GOAL criteria are
 FULLY met on its near-ceiling cells and logged in §8 with the comparison
 table (sepplanlink2 vs sepplan2 vs sdp2: tok/s, peak HBM, peak RSS, loss,
@@ -38,12 +40,15 @@ the two measured artifacts that make sEP lose on fat-expert models:
 (2) the hook exists only in the DIRECT GEMM path while every tier recipe pins
 STAGED dispatch (−11% entry fee measured on GLM-Flash).
 New backend: **asym_sepplanlink2_cpuadamwds** (sep + plan + link).
-DO NOT START until Kevin says go. Build on c14, dev on SMALL cells, validate
-on NEAR-CEILING cells (§5). Jamba is OUT of scope.
+DO NOT START until Kevin says go. HOST-AGNOSTIC: build on WHATEVER GB200
+node this doc is handed to you on — dev on SMALL cells, validate on
+NEAR-CEILING cells (§5). Jamba is OUT of scope.
 
 ## §0 RESOLVED FACTS (measured/verified 2026-08-10 — no open questions)
-- GPU0<->GPU1 on c14: **NV18** (18 NVLink links, `nvidia-smi topo -m`);
-  warmed peer copy_ = **718 GB/s** (first touch pays ~
+- GPU0<->GPU1 (measured on the doc-authoring GB200 node; the class is
+  uniform across these nodes but RE-VERIFY on YOUR node before D0 with
+  `nvidia-smi topo -m` + a warmed peer-copy microbench): **NV18** (18
+  NVLink links); warmed peer copy_ = **718 GB/s** (first touch pays a
   mapping cost — warm up in install). `torch.cuda.can_device_access_peer`
   True both ways.
 - Arm-rate diagnosis (run_glms.md §Log 2026-08-09): sepplan2 with the hook
@@ -184,7 +189,7 @@ b. Grep for every alternation naming `asym_sepplan2` and mirror the new
 - §8 log here (append-only), run_glms.md pointer entry, tier_recipes.sh NOT
   touched (recipes stay staged — that is the point of hook change B).
 
-## §4 DEV STEPS (small workloads; c14; strict order)
+## §4 DEV STEPS (small workloads; your node; strict order)
 D0 KERNEL/PEER PROBE (closes the last unknown): `ep_sep_probe.py
    --transport nvlink` — synthetic segs, both ranks, verify
    `m_grouped_bf16_asym_gemm_nt_contiguous_ep_steal` reads peer-HBM X and
@@ -196,10 +201,11 @@ D0 KERNEL/PEER PROBE (closes the last unknown): `ep_sep_probe.py
    done. Costs one extra hop each way but stays >=20x faster than host
    staging; ownership convention in 3.2b already accommodates it.
 D1 BREAK-EVEN MICROBENCH: ep_balance-style sweep on ONE model cell
-   (glm4.7-flash 2r 64k b2, T2) with MAX_MPE forced high — measure armed
-   step time vs declined across segment sizes; set `_MAX_MPE_DEFAULTS
-   ["nvlink"]` at the crossover. Bank the number + receipts in ep_sep.py.
-D2 SMALL-CELL SANITY (dev workloads): flash 2r 32k b2 T1 and T2 —
+   (hunyuan-a13b 2r 64k b2 — stage-1 model per the reorder) with MAX_MPE
+   forced high — measure armed step time vs declined across segment sizes;
+   set `_MAX_MPE_DEFAULTS["nvlink"]` at the crossover. Bank the number +
+   receipts in ep_sep.py.
+D2 SMALL-CELL SANITY (dev workloads): hunyuan 2r 32k b2 T1 and T2B —
    loss parity vs sdp2 (Δ<=0.02), un-armed overhead <=2%, arm counter >0
    at forced-low MAX_MPE (mechanism live), no step-time inflation with
    MAX_MPE=0 (stagger check).
@@ -208,19 +214,20 @@ D2 SMALL-CELL SANITY (dev workloads): flash 2r 32k b2 T1 and T2 —
    compare sepplanlink2 vs BOTH banked sdp2 AND a fresh sepplan2 twin on
    tok/s + peak HBM + peak RSS + loss; /dev/shm/asym_fabric_* cleaned
    before EVERY cell; arena caps per model; floors per model table)
-V1 GLMs:
-   - glm4.7-flash: dev 64k b2 (T2) then CEILING 1.02M b1 (T2 — banked
-     asym 294 global) and 192k b4 (T1 97%-HBM cell, banked 1526-class).
-   - glm4.5-air (arena 400 for T2-class, 240 for T1): dev 64k b2, then
-     CEILING 320k b1 (T1 — banked 989, 98% HBM).
+V1 Hunyuan (stage 1 per the 2026-08-10 reorder; arena per its row):
+   dev 64k b2, CEILING 320k b1 (T2B — banked 1375).
    PASS = every cell: loss parity, tok/s >= max(sdp2, sepplan2) - 2%, and
    HBM/RSS within +3% of sdp2 (the rings must not sink the edge cells);
    plus armed>0 somewhere OR an explicit all-declined verdict (which is a
    legitimate finding: bank nothing, stop the ladder for that model).
+   (The same PASS definition applies to every tier below.)
 V2 Mixtral (only if V1 passes; arena 285): dev 64k b1, CEILING 304k b1
    (T1 — banked 1110).
-V3 Hunyuan (only if V2 passes; arena per its row): dev 64k b2, CEILING
-   320k b1 (T2B — banked 1375).
+V3 GLMs (only if V2 passes):
+   - glm4.7-flash: dev 64k b2 (T2) then CEILING 1.02M b1 (T2 — banked
+     asym 294 global) and 192k b4 (T1 97%-HBM cell, banked 1526-class).
+   - glm4.5-air (arena 400 for T2-class, 240 for T1): dev 64k b2, then
+     CEILING 320k b1 (T1 — banked 989, 98% HBM).
 V4 Qwen3/3.5 (regression + upside; their sEP rows are the paper's):
    - q3-30b-a3b CEILING 1.04M (T2 — banked 901)
    - q3.5-35b-a3b CEILING 896k (T2 — banked 2640)
@@ -243,11 +250,15 @@ V5 Re-ladder + rebank ONLY models with measured wins (standing banking
 - First-touch P2P cost (~30 ms): paid once in install warm-up handshake.
 
 ## §7 RUNBOOK (self-contained ops — how to actually run every cell)
-- MACHINE: c14 only (this session's machine). NEVER run on the host: every
-  command goes through the enroot container `asym_sft_42` with the 39 tree
-  mounted at /workspace/AsymGEMM-SFT-39 (one-shot runner pattern: enroot
-  start --rw --root with the workspace + /scratch_local cache mounts; see
-  agent/anchors_tmp/*.sh chains for working examples).
+- MACHINE: YOUR machine, YOUR repo tree — this doc is host-agnostic.
+  NEVER run on the host: every command goes through YOUR machine's asym
+  enroot container (Kevin supplies the container name if you don't know
+  it) with YOUR tree mounted at /workspace/<your-tree>/third_party/
+  AsymGEMM (one-shot runner pattern: enroot start --rw --root with the
+  workspace + /scratch_local cache mounts; see agent/anchors_tmp/*.sh
+  chains in your tree for working examples). Do NOT ssh to other nodes or
+  touch other machines' trees; the shared artifacts are the HF weight
+  cache and the ledger docs (shared disk).
 - ONE CELL =
     export HF_HOME=/scratch_local/user_data/shutian/kevin/cache/huggingface
     export NUMACTL_ENABLE=1 NUMACTL_MODE=membind NUMACTL_MEMBIND=0,1 NUMACTL_CPUNODEBIND=0,1
@@ -289,3 +300,76 @@ V5 Re-ladder + rebank ONLY models with measured wins (standing banking
   pre-approved fallback). Validation ladder per Kevin: GLMs -> Mixtral ->
   Hunyuan -> Qwen3/3.5, dev-small + near-ceiling cells, vs sdp2 AND
   sepplan2 on tok/s+HBM+RSS+loss. BUILD NOT STARTED (awaiting go).
+- [2026-08-10] Kevin REORDERED the ladder: Hunyuan FIRST, then Mixtral,
+  then the GLM pair, then Qwen3/3.5. §GOAL sequence, D1/D2 dev cells
+  (now hunyuan 64k/32k), and §5 V1-V4 updated to match. Gate discipline
+  unchanged: a stage must fully meet §GOAL before the next starts.
+- [2026-08-10] Doc made HOST-AGNOSTIC per Kevin: machine/container names
+  removed (any GB200 node; the agent's own enroot container + tree; Kevin
+  supplies the container name if needed); NV18/718 GB/s kept as authoring-
+  node measurements with a mandatory re-verify step before D0.
+- [2026-08-10] EXECUTION START (Kevin go; this node's container per Kevin).
+  §0 re-verify: NV18, peer access both ways, warmed peer copy 771 GB/s.
+  §3 IMPLEMENTED (all additive; sepplan2/sdp2 byte-identical): helper
+  extraction + dispatch-level hook before the staged flip; ep_sep transport
+  param + per-transport max_mpe + x-scratch; trainer nvlink install (device
+  X rings via CUDA-IPC pickle exchange on /dev/shm + private pinned
+  x-scratch); backend token asym_sepplanlink2_cpuadamwds in both drivers
+  (case lists, normalization, 2r alternations, router-mode list).
+  D0 VERDICT: the steal kernel asserts a_peer/d_peer CPU-pinned and
+  spin_gather asserts pinned staging => direct peer-HBM kernel I/O is out
+  without csrc changes. NVLINK V1 (fallback per doc): X path only — owner
+  stages X D2D into its DEVICE ring (its host write disappears); stealer
+  pulls the slice over NVLink into private pinned x-scratch (SYNCHRONOUS
+  copy_ — a side-stream-fenced non_blocking pull raced: probe caught 56%-
+  zero stolen rows, the event was on the wrong device's stream); D path
+  byte-identical to host transport. PROBES: host-plan PR5_PASS (refactor
+  regression clean) AND nvlink-plan PR5_PASS bitwise=True. Probe now pins
+  ASYM_EP_SEP_MAX_MPE=4096 for case determinism.
+- [08-10 10:09Z] D1 dep1m0 MPE=0 b=2 -> FAIL | - | ep_sep 
+- [08-10 10:11Z] D1 dep1m4k MPE=4096 b=2 -> FAIL | - | ep_sep 
+- [08-10 10:14Z] D1 dep1m16k MPE=16384 b=2 -> FAIL | - | ep_sep 
+- [08-10 10:16Z] D1 dep1m64k MPE=65536 b=2 -> FAIL | - | ep_sep 
+- [08-10 18:48Z] D1 dep1n0 MPE=0 b=2 -> FAIL | - | ep_sep 
+- [08-10 18:51Z] D1 dep1n4k MPE=4096 b=2 -> FAIL | - | ep_sep 
+- [08-10 18:53Z] D1 dep1n16k MPE=16384 b=2 -> FAIL | - | ep_sep 
+- [08-10 18:56Z] D1 dep1n64k MPE=65536 b=2 -> FAIL | - | ep_sep 
+- [08-10 20:29Z] D1 dep1p0 MPE=0 b=2 -> FAIL | - | ep_sep 
+- [08-10 20:34Z] D1 dep1p4k MPE=4096 b=2 -> FAIL | - | ep_sep 
+- [08-10 20:38Z] D1 dep1p16k MPE=16384 b=2 -> FAIL | - | ep_sep 
+- [08-10 20:43Z] D1 dep1p64k MPE=65536 b=2 -> FAIL | - | ep_sep 
+- [2026-08-10] MICROBENCH GATE (Kevin: beat the micro before e2e). v1
+  whole-slice sync pull LOST to host (skew 88.4 vs 60.6 ms, +46%; bal +6..50%
+  — serial 1.8 GB copy of 100% of peer X for a ~17% stolen set). v1.5 =
+  RANGE-PULL: only the stolen segments' rows, non_blocking on the SOURCE
+  device's stream (the correct cross-device D2H fence), event-synced pre-
+  launch; empty-steal launches skip the pull entirely. A/B (probe, plan,
+  both PR5_PASS bitwise): bal 10.90 vs 15.45 (-29%) · skew 59.83 vs 62.33
+  (-4%) · bal2 8.31 vs 12.24 (-32%) · decline parity. NVLINK WINS EVERY
+  ARMED CASE; note the probe has NO weight-streaming contention (the host
+  path's e2e artifact), so these margins are conservative. Hunyuan model
+  profile discovered en route: tied embed/lm_head + custom gate =>
+  ASYM_OFFLOAD_MODULES=routed_experts,shared_experts,attention,
+  linear_attention,norms,mlp_dense for ALL hunyuan asym cells (twins incl.).
+- [08-11 00:53Z] D1 dep1q0 MPE=0 b=2 -> FAIL | - | ep_sep 
+- [08-11 00:57Z] D1 dep1q4k MPE=4096 b=2 -> FAIL | - | ep_sep 
+- [08-11 01:02Z] D1 dep1q16k MPE=16384 b=2 -> FAIL | - | ep_sep 
+- [08-11 01:07Z] D1 dep1q64k MPE=65536 b=2 -> FAIL | - | ep_sep 
+- [08-11 09:37Z] D1 dep1r0 MPE=0 b=2 -> FAIL | - | ep_sep 
+- [08-11 09:42Z] D1 dep1r4k MPE=4096 b=2 -> FAIL | - | ep_sep 
+- [08-11 09:47Z] D1 dep1r16k MPE=16384 b=2 -> FAIL | - | ep_sep 
+- [08-11 09:51Z] D1 dep1r64k MPE=65536 b=2 -> FAIL | - | ep_sep 
+- [08-11 10:05Z] D1 dep1s0 MPE=0 b=2 -> FAIL | - | ep_sep 
+- [08-11 10:11Z] D1 dep1s4k MPE=4096 b=2 -> FAIL | - | ep_sep 
+- [08-11 10:28Z] D1 dep1t0 MPE=0 b=2 -> TRAINED | 93.0	2752	66.7	36	567	0.3 | ep_sep {'armed': 0, 'declined': 2688, 'spin_wait_s': 0.0}
+- [08-11 10:39Z] D1 dep1t4k MPE=4096 b=2 -> TRAINED | 92.0	2783	65.9	36	567	0.6 | ep_sep {'armed': 0, 'declined': 2688, 'spin_wait_s': 0.0}
+- [08-11 10:51Z] D1 dep1t16k MPE=16384 b=2 -> TRAINED | 93.4	2740	65.9	36	566	0.4 | ep_sep {'armed': 0, 'declined': 2688, 'spin_wait_s': 0.0}
+- [08-11 11:02Z] D1 dep1t64k MPE=65536 b=2 -> TRAINED | 92.1	2779	67.5	36	567	0.6 | ep_sep {'armed': 0, 'declined': 2688, 'spin_wait_s': 0.0}
+- [08-11 18:08Z] D1 dep1u0 MPE=0 b=2 -> TRAINED | 93.0	2754	67.8	37	579	0.9 | ep_sep {'armed': 0, 'declined': 2688, 'spin_wait_s': 0.0}
+- [08-11 18:20Z] D1 dep1u4k MPE=4096 b=2 -> TRAINED | 93.1	2748	68.7	37	579	0.5 | ep_sep {'armed': 0, 'declined': 2688, 'spin_wait_s': 0.0}
+- [08-11 18:31Z] D1 dep1u16k MPE=16384 b=2 -> TRAINED | 102.9	2487	69.4	37	579	0.6 | ep_sep {'armed': 1194, 'declined': 1494, 'spin_wait_s': 1.2832, 'planned': 1194, 'peer_declined':
+- [08-11 18:43Z] D1 dep1u64k MPE=65536 b=2 -> TRAINED | 103.4	2476	70.3	38	579	0.5 | ep_sep {'armed': 2068, 'declined': 620, 'spin_wait_s': 1.7609, 'planned': 2068, 'peer_declined': 
+- [08-11 21:43Z] D2/V1dev d2sdp64 s=64000 b=2 -> TRAINED | 90.7	2823	59.3	32	557	0.9 | loss= | ep_sep n/a
+- [08-11 21:55Z] D2/V1dev d2plan64 s=64000 b=2 -> TRAINED | 93.8	2729	63.3	34	583	0.3 | loss= | ep_sep {'armed': 0, 'declined': 2688, 'spin_wait_s': 0.0}
+- [08-11 22:02Z] D2/V1dev d2link32 s=32000 b=2 -> TRAINED | 23.3	5502	66.5	36	414	1.7 | loss= | ep_sep {'armed': 0, 'declined': 576, 'spin_wait_s': 0.0}
+- [08-11 22:09Z] D2/V1dev d2sdp32 s=32000 b=2 -> TRAINED | 21.6	5916	56.5	31	391	1.5 | loss= | ep_sep n/a
