@@ -207,3 +207,35 @@ chat template; capture = pre-hook on `experts` modules (actual selected indices)
   live-set ~100GiB/GPU; window mode is the bounded-memory proxy). NOTE for this
   node (c11, 64k-page ARM kernel): expandable_segments correlated with
   12-16GiB-alloc failures at 40+GiB free — dropped here; your node may differ.
+- [08-12] NATURAL-1M baselines (flash, 6x1M each): dapo layer-avg .5886 (med-max
+  .8681!) | codeforces .5787 | openscience .5725 | swebench .5630. ITERATION-2
+  curation from IN-REGIME (1M) signatures: codemix1m pred .6612, mathmix1m pred
+  .6507 (3-doc clusters, frac .45; disjoint sets). VERIFY LIVE on both GPU pairs
+  (out=ep_skew_1m, cells curated_codemix1m/curated_mathmix1m). If measured >=.65:
+  2 sets banked for flash -> build 3rd (allmix1m needs exclusion rerun) -> move
+  to qwen3-30b deep screens. If short: gap = self-context vs natural-mix-context
+  signature drift; next lever = signatures FROM curated-pack verifications
+  (iterate once more) or accept measured ceiling.
+- [08-12] ITER-2 MEASURED (in-regime signatures): codemix1m 0.5651 (pred .6612),
+  mathmix1m 0.5823 (pred .6507) — NO better than iter-1; predictions overshoot
+  in both regimes. 8 measured 1M configs span 0.563-0.589; natural dapo best
+  (0.5886, med-max 0.8681). VERDICT: ~0.59 = data-side layer-avg ceiling for
+  flash @1M/EP=2; 0.65 all-layer avg unreachable by packing (balanced early
+  layers + long-context homogenization). Doc updated with verdict + savings
+  columns (f_moe/f_e2e placeholders; measurement task handed off in
+  measure_moe_time_fractions.md). AWAITING Kevin decision: accept 0.588 avg +
+  0.72-0.87 worst-layer as the stress deliverable (=> ~15% expert-GEMM, ~5%
+  e2e est.) or redefine target before starting 30B/122B grind (their previews
+  cap LOWER: 30b ~0.56, 122b ~0.54 at 16k).
+- [08-12] QWEN3-30B natural-1M DONE (6x1M each): swebench gemm-avg .5782
+  med-max .7106 | dapo .5742/.7559 | codeforces .5691/.7405 | openscience
+  .5585/.7374. 1M RAISES 30B skew vs 16k (.54->.58) — same direction as flash;
+  same ~0.58 plateau. No curation round (flash proved it mispredicts).
+  QWEN3.5-122B natural-1M launched (codeforces,dapo | openscience,sft_mix;
+  2-GPU shards, max-mem 115,170) — the last model stage.
+- [08-12] c11 FLASH placed 1M VERIFIED (true 1M single-shot, 2-GPU shard, experts
+  row-sliced; fwd ~8.7ks/set): math gemm-avg 0.7933 (packs 0.7929-0.7939, med-max
+  0.9715, z1.15) ✓ · science 0.6682 (packs 0.661-0.678, ALL >=0.65, med-max 0.9023)
+  ✓ — science attenuated -0.16 from pred vs math -0.03. code (pred 0.726) running.
+  122b science also VERIFIED: 0.7656 (w131k). Report rows in skewness_results_39.md
+  (gemm-avg terminology per Kevin).
