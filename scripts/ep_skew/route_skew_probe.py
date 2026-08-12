@@ -364,6 +364,44 @@ def wrap_experts_row_sliced(model, rows_per_slice):
     return n
 
 
+MOE_BLOCK_CLASSES = {
+    "Qwen3MoeSparseMoeBlock",
+    "Qwen3_5MoeSparseMoeBlock",
+    "Glm4MoeMoE",
+    "Glm4MoeLiteMoE",
+    "HunYuanMoEV1Moe",
+}
+
+
+def wrap_moe_block_seq_sliced(model, tokens_per_slice):
+    """Slice each whole MoE BLOCK over sequence tokens (batch==1 only).
+
+    The 122B hybrid OOMs on a 24 GiB fp32 [seq, hidden] buffer created
+    INSIDE the sparse block (router/shared-expert path) before the experts
+    call, so experts-level slicing cannot help. Every path in these blocks
+    is per-token, so slicing the block input over dim 1 is exact. The
+    experts pre-hook then fires once per slice — RouterCapture concatenates
+    slices in order (valid because batch==1 keeps row order = token order).
+    """
+    n = 0
+    for _, mod in model.named_modules():
+        if type(mod).__name__ in MOE_BLOCK_CLASSES:
+            orig = mod.forward
+
+            def sliced(hidden, *a, _orig=orig, _n=tokens_per_slice, **kw):
+                if hidden.dim() != 3 or hidden.shape[0] != 1 or hidden.shape[1] <= _n:
+                    return _orig(hidden, *a, **kw)
+                outs = [
+                    _orig(hidden[:, i : i + _n], *a, **kw)
+                    for i in range(0, hidden.shape[1], _n)
+                ]
+                return torch.cat(outs, dim=1)
+
+            mod.forward = sliced
+            n += 1
+    return n
+
+
 class RouterCapture:
     def __init__(self, model):
         self.layer_of = {}
@@ -394,13 +432,18 @@ class RouterCapture:
                 sel = a
                 break
         if sel is not None:
-            self.captured[self.layer_of[id(mod)]] = sel.detach().to(
-                "cpu", torch.int32
+            # MoE-block slicing (wrap_moe_block_seq_sliced) makes the experts
+            # module fire once per slice — collect and concat in order.
+            self.captured.setdefault(self.layer_of[id(mod)], []).append(
+                sel.detach().to("cpu", torch.int32)
             )
         return None
 
     def take(self):
-        out = dict(self.captured)
+        out = {
+            li: (parts[0] if len(parts) == 1 else torch.cat(parts, dim=0))
+            for li, parts in self.captured.items()
+        }
         self.captured = {}
         return out
 
@@ -421,6 +464,45 @@ def forward_backbone(backbone, model, input_ids):
     except TypeError:
         model(input_ids=input_ids, use_cache=False)
         return "full"
+
+
+def forward_backbone_chunked(backbone, model, input_ids, chunk):
+    """Chunked prefill with the model cache carrying cross-chunk state.
+
+    The 122B hybrid's per-layer live transients at 1M tokens (~100 GiB on
+    one shard GPU) don't fit any static split; prefilling in chunks caps
+    transients at chunk scale while the cache holds KV for the few
+    full-attention layers plus the tiny linear-attention recurrent state.
+    Causal identity: routing counts equal the single-shot forward.
+    RouterCapture concatenates the per-chunk experts fires in order
+    (batch==1 keeps row order == token order)."""
+    assert input_ids.shape[0] == 1, "chunked prefill requires batch==1"
+    tgt = backbone
+    try:
+        past = None
+        for i in range(0, input_ids.shape[1], chunk):
+            out = tgt(
+                input_ids=input_ids[:, i : i + chunk],
+                use_cache=True,
+                past_key_values=past,
+            )
+            past = getattr(out, "past_key_values", None)
+            if past is None and i + chunk < input_ids.shape[1]:
+                raise RuntimeError("backbone returned no cache — cannot chunk")
+        return f"backbone_chunked_{chunk}"
+    except TypeError:
+        past = None
+        for i in range(0, input_ids.shape[1], chunk):
+            out = model(
+                input_ids=input_ids[:, i : i + chunk],
+                use_cache=True,
+                past_key_values=past,
+                logits_to_keep=1,
+            )
+            past = getattr(out, "past_key_values", None)
+            if past is None and i + chunk < input_ids.shape[1]:
+                raise RuntimeError("model returned no cache — cannot chunk")
+        return f"model_chunked_{chunk}"
 
 
 # ---------------------------------------------------------------------------
@@ -556,13 +638,32 @@ def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base
 
     t0 = time.time()
     if packs_override is not None:
-        packs, n_docs_scanned = packs_override
+        if isinstance(packs_override, tuple):
+            packs, n_docs_scanned = packs_override
+        else:  # bare pack list from build_packs_from_file
+            packs, n_docs_scanned = packs_override, len(packs_override)
     else:
         packs, n_docs_scanned = build_packs(
             ds_key, tokenizer, args.seq_len, args.num_samples
         )
     t_pack = time.time() - t0
     S, T, B = len(packs), args.seq_len, args.batch_size
+
+    # Window mode: forward each long pack as independent W-token windows and
+    # aggregate counts back per source pack. Routing then reflects W-token
+    # context (recorded in spec) — the bounded-memory proxy for models whose
+    # full-context transients fit no static split (122B hybrid at 1M).
+    win_of, n_src_packs = None, None
+    if getattr(args, "window_tokens", 0) and packs and len(packs[0].tokens) > args.window_tokens:
+        W = args.window_tokens
+        wpacks, win_of = [], []
+        for pi, p in enumerate(packs):
+            for i in range(0, len(p.tokens) - W + 1, W):
+                wpacks.append(Pack(tokens=p.tokens[i : i + W], spans=[]))
+                win_of.append(pi)
+        n_src_packs = len(packs)
+        packs = wpacks
+        S, T = len(packs), W
 
     dev = next(backbone.parameters()).device
     doc_counts = {}  # (doc_id) -> L,E accumulated over its spans
@@ -576,7 +677,12 @@ def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base
                 ids = torch.tensor(
                     [p.tokens for p in batch], dtype=torch.long, device=dev
                 )
-                state["fwd_path"] = forward_backbone(backbone, model, ids)
+                if args.prefill_chunk_tokens > 0 and ids.shape[0] == 1:
+                    state["fwd_path"] = forward_backbone_chunked(
+                        backbone, model, ids, args.prefill_chunk_tokens
+                    )
+                else:
+                    state["fwd_path"] = forward_backbone(backbone, model, ids)
                 got = cap.take()
                 if not got:
                     raise RuntimeError(
@@ -638,6 +744,12 @@ def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base
             doc_meta.append(
                 {"doc": doc_id, "sample": s, "start": st, "end": en, "truncated": trunc}
             )
+    if win_of is not None:
+        agg = torch.zeros((n_src_packs, L, E), dtype=torch.int64)
+        for w, pi in enumerate(win_of):
+            agg[pi] += sample_counts[w]
+        sample_counts = agg
+        S = n_src_packs
     t_fwd = time.time() - t1
 
     partition_a = list(range(E // 2)) if args.partition == "contiguous" else json.load(open(args.partition))
@@ -650,13 +762,18 @@ def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base
     keep = {int(order[len(order) // 2]): "median", int(order[max(0, int(round(0.95 * (len(order) - 1))))]): "p95"}
     os.makedirs(out_dir, exist_ok=True)
     gz_paths = {}
-    for s, tag in keep.items():
-        gz = os.path.join(out_dir, f"route_skew_{model_key}_{ds_key}_topk_{tag}_s{s}.npz.gz")
-        with gzip.open(gz, "wb") as f:
-            torch.save(tok_topk[s].to(torch.int16), f)
-        gz_paths[tag] = os.path.basename(gz)
+    if win_of is None:  # window mode: tok_topk keys are windows, skip gz
+        for s, tag in keep.items():
+            gz = os.path.join(out_dir, f"route_skew_{model_key}_{ds_key}_topk_{tag}_s{s}.npz.gz")
+            with gzip.open(gz, "wb") as f:
+                torch.save(tok_topk[s].to(torch.int16), f)
+            gz_paths[tag] = os.path.basename(gz)
 
-    dom_mean = torch.stack(list(doc_counts.values())).to(torch.float64)
+    dom_mean = (
+        torch.stack(list(doc_counts.values())).to(torch.float64)
+        if doc_counts
+        else torch.zeros((L, E), dtype=torch.float64).unsqueeze(0)
+    )
     dom_mean = (dom_mean / dom_mean.sum(-1, keepdim=True).clamp(min=1)).mean(0)  # L,E
 
     out = {
@@ -668,6 +785,8 @@ def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base
             "dataset_split": DATASETS.get(ds_key, (None,) * 5)[2],
             "dataset_seed": DATASETS.get(ds_key, (None,) * 5)[3],
             "seq_len": T,
+            "window_tokens": getattr(args, "window_tokens", 0) or None,
+            "pack_tokens_total": args.seq_len if win_of is not None else None,
             "batch_size": B,
             "num_samples": S,
             "docs_scanned": n_docs_scanned,
@@ -765,6 +884,28 @@ def main():
                     help="curate_packs.py JSON: run its exact packs as one cell; "
                     "--datasets then supplies the cell LABEL (e.g. curated_mathmix)")
     ap.add_argument(
+        "--window-tokens", type=int, default=0,
+        help="verify long packs as independent W-token windows (counts "
+        "aggregated per source pack; routing context = W, recorded in spec); "
+        "bounded-memory proxy when full-context transients fit no split",
+    )
+    ap.add_argument(
+        "--max-packs", type=int, default=0,
+        help="pack-file mode: cap number of packs (0 = all)",
+    )
+    ap.add_argument(
+        "--prefill-chunk-tokens", type=int, default=0,
+        help="chunked prefill with cache (batch==1): caps per-layer live "
+        "transients at chunk scale — required for the 122B hybrid at 1M "
+        "whose deltanet live-set (~100 GiB/GPU) fits no static split; 0 = off",
+    )
+    ap.add_argument(
+        "--moe-block-tokens-per-slice", type=int, default=0,
+        help="slice whole MoE blocks over sequence tokens (batch==1 only; "
+        "exact; kills the fp32 [seq,hidden] router/shared transients that "
+        "OOM hybrids at 1M); takes precedence over --moe-rows-per-slice",
+    )
+    ap.add_argument(
         "--moe-rows-per-slice", type=int, default=0,
         help="slice experts-module calls over token rows (exact; caps the "
         "fp32 [rows,hidden] transient that OOMs at 1M tokens); 0 = off",
@@ -826,7 +967,10 @@ def main():
     model, load_path = load_model(repo, max_memory=max_memory)
     backbone, bb_path = resolve_backbone(model)
     cap = RouterCapture(model)
-    if args.moe_rows_per_slice > 0:
+    if args.moe_block_tokens_per_slice > 0:
+        nb = wrap_moe_block_seq_sliced(model, args.moe_block_tokens_per_slice)
+        print(f"[probe] MoE-block seq-slicing at {args.moe_block_tokens_per_slice} tokens on {nb} blocks", flush=True)
+    elif args.moe_rows_per_slice > 0:
         nw = wrap_experts_row_sliced(model, args.moe_rows_per_slice)
         print(f"[probe] experts row-slicing at {args.moe_rows_per_slice} rows on {nw} modules", flush=True)
     print(
@@ -860,9 +1004,19 @@ def main():
         try:
             packs_override = None
             if args.pack_file:
-                packs_override = build_packs_from_file(
+                res = build_packs_from_file(
                     args.pack_file, tokenizer, args.seq_len
-                )[:2]
+                )
+                # co-edited helper has returned a list, a 2-tuple and a
+                # 3-tuple (packs, n_docs, spec) at different times — accept all
+                if isinstance(res, tuple):
+                    plist = res[0]
+                    n_found = res[1] if len(res) > 1 else len(res[0])
+                else:
+                    plist, n_found = res, len(res)
+                if args.max_packs > 0:
+                    plist = plist[: args.max_packs]
+                packs_override = (plist, n_found)
                 spec_base["pack_file"] = os.path.basename(args.pack_file)
             path, met, extra = run_cell(
                 model, backbone, cap, tokenizer, args.model, d, args, spec_base, out_dir,
