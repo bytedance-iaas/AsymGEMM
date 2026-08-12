@@ -333,6 +333,37 @@ def resolve_backbone(model):
     return m, path
 
 
+def wrap_experts_row_sliced(model, rows_per_slice):
+    """Slice each experts-module call over token rows.
+
+    At 1M tokens the HF experts modules materialize fp32 buffers of
+    [tokens*top_k, hidden] (~64 GiB measured on qwen3-30b) in one shot.
+    Output rows depend only on their own input rows, so computing in
+    slices is exact while capping the transient at rows_per_slice scale.
+    Capture is untouched: forward_pre_hooks fire at __call__ with the
+    FULL tensors; the wrapper slices inside forward and calls the
+    original directly (no per-slice hook fire).
+    """
+    n = 0
+    for _, mod in model.named_modules():
+        if type(mod).__name__.endswith(EXPERT_CLASS_SUFFIXES):
+            orig = mod.forward
+
+            def sliced(hidden, sel, w, _orig=orig, _n=rows_per_slice, **kw):
+                rows = hidden.shape[0]
+                if rows <= _n:
+                    return _orig(hidden, sel, w, **kw)
+                outs = [
+                    _orig(hidden[i : i + _n], sel[i : i + _n], w[i : i + _n], **kw)
+                    for i in range(0, rows, _n)
+                ]
+                return torch.cat(outs, dim=0)
+
+            mod.forward = sliced
+            n += 1
+    return n
+
+
 class RouterCapture:
     def __init__(self, model):
         self.layer_of = {}
@@ -610,6 +641,8 @@ def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base
     t_fwd = time.time() - t1
 
     partition_a = list(range(E // 2)) if args.partition == "contiguous" else json.load(open(args.partition))
+    if isinstance(partition_a, dict):
+        partition_a = partition_a["layers"]  # build_placed_sets.py per-layer format
     met = cell_metrics(sample_counts, partition_a)
 
     # token-level gzip for median + P95 samples (by max hot share)
@@ -732,6 +765,11 @@ def main():
                     help="curate_packs.py JSON: run its exact packs as one cell; "
                     "--datasets then supplies the cell LABEL (e.g. curated_mathmix)")
     ap.add_argument(
+        "--moe-rows-per-slice", type=int, default=0,
+        help="slice experts-module calls over token rows (exact; caps the "
+        "fp32 [rows,hidden] transient that OOMs at 1M tokens); 0 = off",
+    )
+    ap.add_argument(
         "--max-memory",
         default=None,
         help="per-visible-GPU GiB caps, comma list (e.g. '115,170') — leaves "
@@ -788,6 +826,9 @@ def main():
     model, load_path = load_model(repo, max_memory=max_memory)
     backbone, bb_path = resolve_backbone(model)
     cap = RouterCapture(model)
+    if args.moe_rows_per_slice > 0:
+        nw = wrap_experts_row_sliced(model, args.moe_rows_per_slice)
+        print(f"[probe] experts row-slicing at {args.moe_rows_per_slice} rows on {nw} modules", flush=True)
     print(
         f"[probe] loaded in {time.time() - t0:.0f}s via {load_path}; backbone={bb_path}; "
         f"moe_layers={cap.n_moe_layers}",

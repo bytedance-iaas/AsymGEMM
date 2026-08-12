@@ -129,3 +129,44 @@ chat template; capture = pre-hook on `experts` modules (actual selected indices)
   1M packs + probe --pack-file verification with PER-LAYER partition support
   (probe patch incoming, backward-compat). EPLB-style variant (balance placement
   on sft_mix, eval on domains) being computed as the defensible framing check.
+- [08-12] FLASH deep screens r1 done (n=200-500): dapo .7011 (FULL 17k corpus,
+  8.2M tok) | codeforces .6720 p95 .939 (5826 docs) | openscience .6657 p95 .918 |
+  swebench .6588 | megamath .6402 | longbench .6398 | sft_mix .6336. Pool 36k docs
+  40.9M tok. Greedy disjoint 1M packs (curate_packs.py): 0.554-0.611 avg — DILUTION
+  kills it. Aligned-cluster ceiling (sign power-iteration): 0.6447 @50k unique.
+  -> v2 (curate_v2.py): aligned cluster + alignment-weighted REPETITION to 1M
+  (house pipeline already concat/repeats; some layers structurally ~0.50).
+  Expanded screens launched --overwrite: swebench n1500 gpu0, openscience n1500
+  gpu1, megamath n1000 gpu2, codeforces n500 gpu3. Next: rerun v2 on bigger pool;
+  if >=0.65 pred -> verify via probe --pack-file (NEW, additive) at seq 1M B=1
+  n=6/set; metric = summary.mean_layer_avg_hot_gpu_share (NEW). Then 30B, 122B.
+- [08-12] Expanded screens DONE: swebench n1500 .7543(!) 2532 docs | openscience
+  n1500 .6660 12287 | megamath n1000 .6220 18637 | codeforces FULL .6711 9548.
+  curate_v2 run on ~60k-doc pool — results in packs2_*.json; verify next via
+  probe --pack-file seq 1M B=1 (3 GPUs, one set each), metric mean_layer_avg_hot.
+- [08-12] CURATE v2 (flash, expanded pool): codemix pred 0.6512 >=0.65 TARGET MET
+  (44 uniq docs ~30k tok, weighted repeats); allmix 0.6512 (SAME cluster — must
+  exclude codemix docs for a distinct 3rd set); mathmix 0.6474 (short by 0.3pp —
+  try deeper dapo/openscience tails or per-layer seed refinement). min_l ~0.50
+  layers are structural. NEXT: (1) verify codemix packs REAL: driver.sh
+  glm4.7-flash <gpu> curated_codemix --pack-file .../packs2_glm4.7-flash_codemix.json
+  --seq-len 1000000 --batch-size 1 --out .../ep_skew_deep — check
+  summary.mean_layer_avg_hot_gpu_share >= 0.65 in the cell JSON; (2) allmix rerun
+  with codemix-cluster docs EXCLUDED (edit curate_v2 pool filter) for set #3;
+  (3) push mathmix over 0.65; then qwen3-30b (top_k=8), then qwen3.5-122b.
+- [08-12] SET STATUS (flash, analytic): codemix packs2 0.6512 MET | mathmix
+  packs4 0.6518 MET (frac 0.45) | allmix2-excluded 0.6466 short — needs deeper
+  megamath n3000 + openscience n4000 screens (unbounded corpora) once GPUs free,
+  then re-curate. swemix capped 0.6411 (its .754 was single-layer). VERIFY RUNS
+  LIVE: codemix packs2 (GPUs 0,1) + mathmix packs3 0.6491-pred (GPUs 2,3;
+  doubles as predictor calibration; rerun packs4 after). OOM fix: 2-GPU shard +
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (now default in run_cell.sh).
+- [08-12] c11 qwen3-30b 1M VERIFICATION (real forwards, b=1, seq=1048576, 2-GPU
+  shard, experts row-sliced at 256k rows — the HF experts module allocates a
+  64 GiB fp32 [rows,hidden] transient at 1M unsliced; slicing is exact):
+    science (openscience): 6/6 packs layer-avg 0.753-0.760 MEAN 0.757 ✓ (max-layer .989)
+    math (dapo):           6/6 packs layer-avg 0.821-0.826 MEAN 0.824 ✓ (max-layer .928)
+  Analytic->1M attenuation: science .933->.757, math .897->.824 — margin holds
+  every pack >=0.65. code + mathmix verifying now. Note: deep traces done for
+  all 5 datasets (dapo 17k docs / codeforces 9.5k / swebench 2.5k /
+  openscience 4.2k / megamath 8.8k).
