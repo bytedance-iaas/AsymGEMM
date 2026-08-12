@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import json
 import os
 import random
@@ -159,11 +160,22 @@ def doc_iterator(ds_key: str, tokenizer, streaming_buffer: int = 5000):
                 yield doc_id, txt
         return
 
-    stream_big = ds_key in ("codeforces", "megamath", "openscience")
+    # 2026-08-12: streaming re-resolves via the hub API every run and 429s
+    # under concurrent runners — download once into the shared cache instead
+    # (codeforces/openscience/megamath are all disk-cheap vs 12T free).
+    stream_big = False
     load_kw = {"split": split, "streaming": stream_big}
     if ds_key in DATA_FILES:
         load_kw["data_files"] = DATA_FILES[ds_key]
-    ds = hfds.load_dataset(repo, config, **load_kw)
+    ds = None
+    for attempt in range(4):  # hub 429s under concurrent runners
+        try:
+            ds = hfds.load_dataset(repo, config, **load_kw)
+            break
+        except Exception:
+            if attempt == 3:
+                raise
+            time.sleep(20 * (attempt + 1))
     if stream_big:
         ds = ds.shuffle(seed=seed, buffer_size=streaming_buffer)
         rows = enumerate(iter(ds))
@@ -200,7 +212,6 @@ def doc_iterator(ds_key: str, tokenizer, streaming_buffer: int = 5000):
             doc_id = str(row.get("instance_id", i))
             txt = _join_fields(row, ["problem_statement", "patch"])
         elif kind == "qa":
-            doc_id = str(i)
             txt = _join_fields(
                 row,
                 [
@@ -209,9 +220,12 @@ def doc_iterator(ds_key: str, tokenizer, streaming_buffer: int = 5000):
                     "text", "content",
                 ],
             )
+            # content-hash id: streamed rows have no stable row index, and
+            # pack rebuilding must find docs again in any iteration order
+            doc_id = "h" + hashlib.sha1(txt.encode()).hexdigest()[:16]
         else:  # generic text
-            doc_id = str(i)
             txt = str(row.get("text") or row.get("content") or "")
+            doc_id = "h" + hashlib.sha1(txt.encode()).hexdigest()[:16]
         if txt and len(txt.strip()) > 64:
             yield doc_id, txt
 
@@ -277,19 +291,23 @@ def load_model(repo, max_memory=None):
     from transformers import AutoModelForCausalLM, AutoModel
 
     last_err = None
-    for loader in (AutoModel, AutoModelForCausalLM):
-        for attn in (None, "sdpa", "eager"):
-            kw = dict(dtype=torch.bfloat16, device_map="auto")
-            if max_memory:
-                kw["max_memory"] = max_memory
-            if attn:
-                kw["attn_implementation"] = attn
-            try:
-                m = loader.from_pretrained(repo, **kw)
-                m.eval()
-                return m, f"{loader.__name__}/attn={attn or 'auto'}"
-            except Exception as e:  # noqa: BLE001
-                last_err = e
+    # local_files_only first: the hub API 429s under concurrent
+    # unauthenticated runners, and cached models need no network at all.
+    for local in (True, False):
+        for loader in (AutoModel, AutoModelForCausalLM):
+            for attn in (None, "sdpa", "eager"):
+                kw = dict(dtype=torch.bfloat16, device_map="auto",
+                          local_files_only=local)
+                if max_memory:
+                    kw["max_memory"] = max_memory
+                if attn:
+                    kw["attn_implementation"] = attn
+                try:
+                    m = loader.from_pretrained(repo, **kw)
+                    m.eval()
+                    return m, f"{loader.__name__}/attn={attn or 'auto'}/local={local}"
+                except Exception as e:  # noqa: BLE001
+                    last_err = e
     raise RuntimeError(f"could not load {repo}: {last_err}")
 
 
@@ -404,6 +422,7 @@ def cell_metrics(sample_layer_counts, partition_a):
     hot = np.maximum(share_a, 1.0 - share_a)  # S,L
     top_share = arr.max(-1) / tot_safe
     max_hot = hot.max(1)  # S
+    layer_avg = hot.mean(1)  # S — per-sample hot share averaged over ALL MoE layers
     med_layer_hot = np.median(hot, axis=0)  # L
     # Zipf on the per-sample layer with max hot share
     zs = []
@@ -414,6 +433,8 @@ def cell_metrics(sample_layer_counts, partition_a):
     return {
         "hot_share": hot,
         "max_hot_per_sample": max_hot,
+        "layer_avg_hot_per_sample": layer_avg,
+        "mean_layer_avg_hot": float(layer_avg.mean()),
         "median_max_hot": float(np.median(max_hot)),
         "p95_max_hot": float(np.percentile(max_hot, 95)),
         "mean_max_hot": float(max_hot.mean()),
@@ -428,13 +449,58 @@ def cell_metrics(sample_layer_counts, partition_a):
 # Main per-cell run
 # ---------------------------------------------------------------------------
 
-def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base, out_dir):
+def build_packs_from_file(pack_file, tokenizer, seq_len):
+    """Rebuild curated packs from a curate_packs.py JSON: exact doc lists,
+    refetched deterministically; short packs repeat their own docs to fill."""
+    spec = json.load(open(pack_file))
+    needed = {}  # ds -> set(doc_id)
+    for p in spec["packs"]:
+        for ds, did in p["docs"]:
+            needed.setdefault(ds, set()).add(str(did))
+    texts = {}  # (ds, did) -> text
+    for ds, want in needed.items():
+        got = 0
+        for did, txt in doc_iterator(ds, tokenizer):
+            if str(did) in want and (ds, str(did)) not in texts:
+                texts[(ds, str(did))] = txt
+                got += 1
+                if got == len(want):
+                    break
+        print(f"[pack-file] {ds}: found {got}/{len(want)} docs", flush=True)
+    eos = tokenizer.eos_token_id or 0
+    packs = []
+    for p in spec["packs"]:
+        cur = Pack()
+        doc_cycle = [(ds, str(did)) for ds, did in p["docs"] if (ds, str(did)) in texts]
+        ci = 0
+        while len(cur.tokens) < seq_len and doc_cycle:
+            ds, did = doc_cycle[ci % len(doc_cycle)]
+            ids = tokenizer.encode(texts[(ds, did)], add_special_tokens=False)
+            ids.append(eos)
+            room = seq_len - len(cur.tokens)
+            take = min(room, len(ids))
+            start = len(cur.tokens)
+            cur.tokens.extend(ids[:take])
+            cur.spans.append((f"{ds}:{did}", start, start + take, take < len(ids)))
+            ci += 1
+        if len(cur.tokens) == seq_len:
+            packs.append(cur)
+        else:
+            print(f"[pack-file] WARNING: pack underfilled ({len(cur.tokens)}) — skipped", flush=True)
+    return packs, sum(len(v) for v in needed.values()), spec
+
+
+def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base, out_dir,
+             packs_override=None):
     import numpy as np
 
     t0 = time.time()
-    packs, n_docs_scanned = build_packs(
-        ds_key, tokenizer, args.seq_len, args.num_samples
-    )
+    if packs_override is not None:
+        packs, n_docs_scanned = packs_override
+    else:
+        packs, n_docs_scanned = build_packs(
+            ds_key, tokenizer, args.seq_len, args.num_samples
+        )
     t_pack = time.time() - t0
     S, T, B = len(packs), args.seq_len, args.batch_size
 
@@ -535,10 +601,10 @@ def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base
         "spec": {
             **spec_base,
             "dataset_key": ds_key,
-            "dataset_id": DATASETS[ds_key][0],
-            "dataset_config": DATASETS[ds_key][1],
-            "dataset_split": DATASETS[ds_key][2],
-            "dataset_seed": DATASETS[ds_key][3],
+            "dataset_id": DATASETS.get(ds_key, (None,) * 5)[0],
+            "dataset_config": DATASETS.get(ds_key, (None,) * 5)[1],
+            "dataset_split": DATASETS.get(ds_key, (None,) * 5)[2],
+            "dataset_seed": DATASETS.get(ds_key, (None,) * 5)[3],
             "seq_len": T,
             "batch_size": B,
             "num_samples": S,
@@ -552,6 +618,8 @@ def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base
             "note_megamath": "MegaMath (IFM/MegaMath) substitutes LLEP's 'Megatron-Math' (not on HF)" if ds_key == "megamath" else None,
         },
         "summary": {
+            "mean_layer_avg_hot_gpu_share": met["mean_layer_avg_hot"],
+            "layer_avg_hot_per_sample": [round(float(x), 4) for x in met["layer_avg_hot_per_sample"]],
             "median_max_hot_gpu_share": met["median_max_hot"],
             "p95_max_hot_gpu_share": met["p95_max_hot"],
             "mean_max_hot_gpu_share": met["mean_max_hot"],
@@ -631,6 +699,9 @@ def main():
     ap.add_argument("--partition", default="contiguous")
     ap.add_argument("--out", default=None)
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--pack-file", default=None,
+                    help="curate_packs.py JSON: run its exact packs as one cell; "
+                    "--datasets then supplies the cell LABEL (e.g. curated_mathmix)")
     ap.add_argument(
         "--max-memory",
         default=None,
@@ -644,9 +715,12 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     ds_keys = [d.strip() for d in args.datasets.split(",") if d.strip()]
-    for d in ds_keys:
-        if d not in DATASETS:
-            sys.exit(f"unknown dataset key {d}")
+    if not args.pack_file:
+        for d in ds_keys:
+            if d not in DATASETS:
+                sys.exit(f"unknown dataset key {d}")
+    elif len(ds_keys) != 1:
+        sys.exit("--pack-file mode takes exactly one label in --datasets")
 
     # Skip cells already in the manifest (idempotent restart) before loading.
     mpath = os.path.join(out_dir, "manifest.json")
@@ -672,7 +746,10 @@ def main():
     t0 = time.time()
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(repo)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(repo, local_files_only=True)
+    except Exception:  # hub API 429s under concurrent unauthenticated runners
+        tokenizer = AutoTokenizer.from_pretrained(repo)
     max_memory = None
     if args.max_memory:
         max_memory = {
@@ -711,8 +788,15 @@ def main():
         cell = f"{args.model}|{d}"
         print(f"[cell] {cell} starting", flush=True)
         try:
+            packs_override = None
+            if args.pack_file:
+                packs_override = build_packs_from_file(
+                    args.pack_file, tokenizer, args.seq_len
+                )[:2]
+                spec_base["pack_file"] = os.path.basename(args.pack_file)
             path, met, extra = run_cell(
-                model, backbone, cap, tokenizer, args.model, d, args, spec_base, out_dir
+                model, backbone, cap, tokenizer, args.model, d, args, spec_base, out_dir,
+                packs_override=packs_override,
             )
             update_manifest(
                 out_dir,

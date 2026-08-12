@@ -97,3 +97,35 @@ chat template; capture = pre-hook on `experts` modules (actual selected indices)
   post-training imbalance replicated on our checkpoints. Stage-1.5: domain-pure
   skew SURVIVES doc-averaging (pred ~= per-pack median) while controls collapse
   -> natural 1M packs viable; no curation for winners. AGENTS 2, 3, 1 COMPLETE.
+- [08-12] NEW MISSION (Kevin, prompt.md): curate 2-3 dataset sets per model whose
+  1M-token b=1 packs sustain >=65/35 hot-GPU share AVERAGED OVER ALL MoE LAYERS
+  (not worst-layer) for >=6 packs/set, EP=2. Analytic packing from per-doc router
+  traces + real-forward verification. Order: flash -> qwen3-30b -> qwen3.5-122b.
+  Plan: deep screens (n=200-500/dataset -> profiling_results/ep_skew_deep/, own
+  manifest) -> greedy signed-signature pack construction (curate_packs.py,
+  objective = mean over layers of |token-weighted signed half-deviation|) ->
+  probe --pack-file real 1M forwards. Known bar: natural launch-avg ~0.55,
+  kmeans-curated ~0.57-0.63 on small pools; pushing via bigger pools + direct
+  greedy + cross-dataset mixes.
+- [08-12] c11 CLAIM (parallel session, same mission): qwen3-30b lane — deep traces
+  n=512 x {dapo,codeforces,swebench,openscience,megamath} -> profiling_results/
+  ep_skew_deep/ (unified dir), then curate_packs.py sets + probe --pack-file 1M
+  verification on this node. c12 keeps flash lane; 122b = whoever's first (check
+  this ledger + ep_skew_deep/manifest.json before spending GPU). Probe patched:
+  tokenizer/model local_files_only-first + dataset-load retry (4x, 429 storm from
+  concurrent unauthenticated runners measured), content-hash doc ids for qa/text
+  kinds (stable rebuild keys for streamed corpora).
+- [08-12] c11 PIVOTAL ANALYSIS — doc-mix curation at the CONTIGUOUS split cannot
+  reach 0.65 layer-avg: perfect-alignment ceilings from real per-doc traces are
+  0.554-0.594 (30b/flash/122b; per-doc mean|lean| p50 ~0.05-0.08). BUT real EP
+  fixes placement PER LAYER, and a fixed per-layer placement calibrated on HALF
+  the stage-1 samples, evaluated on the HELD-OUT half (16k packs, layer-AVG hot):
+    qwen3-30b: dapo .898 · codeforces .898 · swebench .909 · openscience .933 · sft_mix .703
+    glm4.7-flash: dapo .821 · codeforces .763 · sft_mix .639
+    qwen3.5-122b: dapo .848 · codeforces .820 · sft_mix .656
+  (contiguous same-eval ~.53-.56 everywhere; p10 ~= median -> transfer robust).
+  => the 65/35 target falls out of PLACEMENT x domain-pure data, not doc mixing.
+  Plan: per-(model,set) partition JSON from deep-trace calibration + held-out-doc
+  1M packs + probe --pack-file verification with PER-LAYER partition support
+  (probe patch incoming, backward-compat). EPLB-style variant (balance placement
+  on sft_mix, eval on domains) being computed as the defensible framing check.
