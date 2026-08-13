@@ -239,3 +239,13 @@ chat template; capture = pre-hook on `experts` modules (actual selected indices)
   ✓ — science attenuated -0.16 from pred vs math -0.03. code (pred 0.726) running.
   122b science also VERIFIED: 0.7656 (w131k). Report rows in skewness_results_39.md
   (gemm-avg terminology per Kevin).
+- [08-12] c11 CAMPAIGN COMPLETE — flash code VERIFIED 0.7396 gemm-avg (packs
+  0.728-0.755, med-max 0.929, landed +0.01 ABOVE pred). Final tally, all true-1M
+  b=1 measured (122b via w131k proxy), every one of 60 packs >=0.65:
+    qwen3-30b   : code .857 · math .824 · mathmix .810 · science .757  (4 sets)
+    qwen3.5-122b: math .822 · code .809 · science .766                 (3 sets)
+    glm4.7-flash: math .793 · code .740 · science .668                 (3 sets)
+  Full report: agent/impls/s04-p1-dgx-02-c06/skewness_results_39.md (gemm-avg
+  terms). Artifacts: ep_skew_deep/placed/{packs,partition,route_skew}_*.json —
+  packs rebuildable from doc ids; partitions are the per-layer placements the
+  6-step e2e runs should install.
