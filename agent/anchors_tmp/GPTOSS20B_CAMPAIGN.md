@@ -136,3 +136,26 @@ ported from the 46-tree working diff). DO NOT STOP until all goals met.
   Full verdict row: same-workload 128k·b4 T3 49.8 (27%) vs uns-off 135.8
   (73%) = 36.7%, T3 +28% faster, RSS 300 vs 349. CHAIN-A COMPLETE (13
   cells: dev trio + quartet + refs + walker). Chain D (1r ladder) next.
+- [2026-08-12 09:12] 1R TURNING POINT #1: superoffload_mem|recomp G-OOM at
+  448k·b1 — rc wall (384k,448k] MEASURED (384k·b1 trained ~172G). rc dead;
+  un/uo/T1/T2B continue.
+- [2026-08-12 10:59] 1R TURNING POINT #2: superoffload_mem|unsloth G-OOM at
+  640k·b1 — un wall (512k,640k] MEASURED. Survivors: uo + asym T1/T2B.
+- [2026-08-12 11:56] 1R CROSSOVER MEASURED: from 512k the asym tiers lead
+  uo on tok/s too (512k: T1 3256 vs uo 2541; 640k: T1 2756/T2B 2524 vs uo
+  2203) at 44-65% less HBM. uo 640k·b1 = 169.5G → wall projected next rung.
+  T1 projects ~150G @1.02M — plan: extend rungs past 1.02M if asym alive
+  (flash 1r went to 1.15M) so the CEILING is measured, not assumed.
+- [2026-08-12 12:04] 1R TURNING POINT #3: superoffload_mem|unsloth-off-ohbm0
+  G-OOM at 768k·b1 — uo wall (640k,768k] MEASURED (640k·b1 169.5G).
+  ALL THREE BASELINES DEAD; asym T1+T2B alone from 768k on. Baseline walls:
+  rc (384k,448k], un (512k,640k], uo (640k,768k].
+- [2026-08-12 18:55] 1R ASYM T1 CEILING: G-OOM at 1408k·b1 — T1 wall
+  (1280k,1408k] MEASURED (1.28M·b1 trained). T2B continues.
+- [2026-08-12 22:56] 1R LADDER BANKED (chains D/D2/D3, 60 cells): baseline
+  walls rc (384k,448k] / un (512k,640k] / uo (640k,768k] all G-OOM measured;
+  asym T1 ceiling (1.28M,1.41M] G-OOM measured (182.7G @1.28M); T2B deepest
+  fit 1.664M·b1 TRAINED (1089 tok/s, 158.4G, RSS 829G — 2.2× uo's wall;
+  ceiling OPEN per flash deepest-fit precedent; optional deeper cells queued
+  behind 2r). Crossover: asym leads all baselines on tok/s from 512k.
+  Chain E (2r sepplanlink) launched.
