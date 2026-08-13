@@ -159,3 +159,73 @@ ported from the 46-tree working diff). DO NOT STOP until all goals met.
   ceiling OPEN per flash deepest-fit precedent; optional deeper cells queued
   behind 2r). Crossover: asym leads all baselines on tok/s from 512k.
   Chain E (2r sepplanlink) launched.
+- [2026-08-12 22:56] SEPPLANLINK PROBE GATE PASSED on c17/38-tree: host-plan
+  PR5 bitwise=True (bal/skew/decline/bal2 all bitwise, armed=3 declined=1)
+  AND nvlink-plan PR5_PASS bitwise=True (device X rings + CUDA-IPC exchange
+  + range-pull scratch). Ported code validated end-to-end; 2r ladder begins.
+- [2026-08-13 03:42] 2R TURNING POINT #1: rc G-OOM at 512k·b1 — 2r wall
+  (384k,512k] (grid skips 448k; consistent with 1r (384k,448k]).
+- [2026-08-13 04:46] 2R TURNING POINT #2: un G-OOM at 640k·b1 — 2r wall
+  (512k,640k], replicating the 1r wall (per-rank memory ≡ at b1).
+- [2026-08-13 05:53] 2R TURNING POINT #3: uo G-OOM at 768k·b1 — 2r wall
+  (640k,768k] ≡ 1r wall. ALL 2R BASELINES WALLED (rc 512k / un 640k /
+  uo 768k); sepplanlink T1+T2B alone to 1.02M.
+- [2026-08-13 08:40] 2R CROWN + T2B CEILING: sepplanlink T1 TRAINS 1.02M·b1
+  (3617 global tok/s, 157.3G resv, RSS 300G) — deepest 2r rung, 1.33× past
+  uo's wall; T2B host-COOMs 1.02M → 2r T2B ceiling (896k,1024k] MEASURED
+  (896k: 3753 tok/s, 86.8G, RSS 465G; per-rank pools ≈2× the 1r host
+  footprint). T3 fallback probing 1.02M. ep_sep armed=0 declined=0 at every
+  rung (own-engine expectation, disclosed).
+
+## FINAL RESULTS (all cells MEASURED, w1+m2, best-over-batch; tok/s global)
+
+### 1-rank ladder (chains D/D2/D3)
+| seq | rc | un | uo | asym T1 | asym T2B |
+|---|---|---|---|---|---|
+| 32k  | 13818·114G | 13607·83G | 6878·68G | 9829·40G | 8289·26G |
+| 64k  | 11871·168G | 11813·170G | 5391·136G | 9676·79G | 7533·48G |
+| 96k  | 10109·168G | 8574·181G | 4945·153G | 8608·87G | 6815·56G |
+| 128k | 8650·114G | 8793·170G | 4661·136G | 7571·116G | 5861·74G |
+| 192k | 7007·168G | 6957·128G | 4081·102G | 6082·57G | 5252·36G |
+| 256k | 5757·112G | 5818·170G | 3658·136G | 5258·76G | 4551·47G |
+| 320k | 4957·143G | 4934·108G | 3593·85G | 4395·47G | 4027·32G |
+| 384k | 4348·172G | 4326·127G | 2992·102G | 3968·57G | 3558·36G |
+| 448k | G-OOM | 3852·153G | 2755·119G | 3567·68G | 3255·42G |
+| 512k | — | 3468·170G | 2541·136G | 3256·77G | 2969·47G |
+| 640k | — | G-OOM | 2203·170G | 2756·94G | 2524·60G |
+| 768k | — | — | G-OOM | 2351·115G | 2154·73G |
+| 896k | — | — | — | 2072·132G | 1914·86G |
+| 1.02M| — | — | — | 1842·159G | 1714·97G |
+| 1.15M| — | — | — | 1652·170G | 1547·108G |
+| 1.28M| — | — | — | 1483·183G | 1400·120G |
+| 1.41M| — | — | — | G-OOM | 1275·133G |
+| 1.54M| — | — | — | — | 1182·151G |
+| 1.66M| — | — | — | — | 1089·158G (RSS 829G; deepest fit) |
+
+### 2-rank ladder (chain E, backend asym_sepplanlink2_cpuadamwds)
+| seq | rc | un | uo | SEP T1 | SEP T2B |
+|---|---|---|---|---|---|
+| 32k  | 26723·115G | 26288·85G | 12816·68G | 20094·43G | 16739·30G |
+| 64k  | 22937·173G | 22942·176G | 7605·137G | 19396·82G | 14819·52G |
+| 128k | 16785·115G | 17093·176G | 6914·137G | 14944·121G | 10998·77G |
+| 192k | 13684·173G | 13557·132G | 6317·103G | 12189·60G | 10284·41G |
+| 256k | 11232·115G | 11376·176G | 5755·137G | 10499·80G | 8994·53G |
+| 320k | 9688·147G | 9652·110G | 6932·85G | 8813·51G | 8062·35G |
+| 384k | 8523·170G | 8468·132G | 4874·103G | 7885·60G | 7072·41G |
+| 512k | G-OOM | 6800·176G | 4282·136G | 6463·79G | 5909·50G |
+| 640k | — | G-OOM | 3712·170G | 5457·98G | 4997·63G |
+| 768k | — | — | G-OOM | 4662·118G | 4217·77G |
+| 896k | — | — | — | 4086·138G | 3753·87G |
+| 1.02M| — | — | — | 3617·157G | host-COOM (T3 probe also COOM) |
+
+Walls: 1r rc (384k,448k] G / un (512k,640k] G / uo (640k,768k] G / T1
+(1.28M,1.41M] G / T2B open >1.66M. 2r rc (384k,512k] / un (512k,640k] /
+uo (640k,768k] all G / T2B+T3 (896k,1.02M] host / T1 alive at 1.02M crown.
+ep_sep exit stats armed=0 declined=0 on every 2r asym cell (own-engine).
+- [2026-08-13 09:10] CAMPAIGN COMPLETE — ALL GOALS MET. Figure DATA blocks
+  landed in /home/kevinni/env/figures/plot_tp_vs_seq.py (+_2r.py): the
+  reserved gpt-oss-20b placeholders filled (19-rung 1r / 12-rung 2r
+  panels + OOM_TIP/LEAN_DROP), tp*/tp2r* combined PNG+PDF re-rendered and
+  verified (lean 1r: 32k/384k/448k/640k/768k/1.28M/1.66M; lean 2r:
+  32k/384k/512k/640k/768k/1.02M). env/figures changes left UNCOMMITTED for
+  Kevin's review per the overleaf-sync convention. ~95 measured cells total.
