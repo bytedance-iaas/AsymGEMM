@@ -249,3 +249,24 @@ chat template; capture = pre-hook on `experts` modules (actual selected indices)
   terms). Artifacts: ep_skew_deep/placed/{packs,partition,route_skew}_*.json —
   packs rebuildable from doc ids; partitions are the per-layer placements the
   6-step e2e runs should install.
+- [08-13] c11 FIG13 (fig:ablation-balancer) REFRESHED WITH REAL MEASUREMENTS —
+  ep_balance_bench scope=experts timed EVERY MoE layer's grouped launch on the
+  actual routed counts of one held-out curated pack per (model x math/code/
+  science), at each model's banked 2-rank anchor (30b 384k b1 m=6.14M · 122b
+  320k b1 m=5.12M · flash 320k b2 m=5.12M). Arms: owned@placed partition
+  (Static EP, hot share .67-.86) · plan (DSEP) · owned@hindsight-balanced
+  (Oracle) · owned@contig (banked reference). RESULTS (sweep-sum walls):
+  DSEP recovers 25.1-38.3% of expert-GEMM time vs static — matches the
+  analytic (h-0.5)/h at each pack's measured gemm-avg to 0-3pp (flash EXACT:
+  25.1/25.1, 32.4/32.2, 37.2/37.0; 30b/122b ~3pp under = plan chunking
+  overhead). DSEP ≈ oracle everywhere and BEATS oracle 4.7% on flash-code
+  (E=64 + z~1: hindsight split cannot balance; per-launch cut can). e2e row:
+  at ceiling lengths attention dominates (expert sweep ~2% of step measured)
+  -> +0.2..1.3% e2e; caption/body updated to the honest composition (F=2
+  fwd+dgrad, solo streaming = conservative). THEORY CHECK PASSED. Artifacts:
+  fig13/{fig13_*,walls_*,fig13_data.json}; scripts fig13_hists.py,
+  fig13_aggregate.py, fig13_bench_driver.sh; plot_balancer_e2e.py rewritten
+  (3-model measured). Overleaf pushed 832ecee (figure+caption+body).
+  BENCH BUGFIX: ep_balance_bench parent tag was clobbered to "nat" by the
+  alphas loop -> concurrent parents collided on /dev/shm/asym_epbench_nat;
+  loop var renamed (pid-unique shm restored).
