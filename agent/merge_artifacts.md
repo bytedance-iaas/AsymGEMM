@@ -21,7 +21,7 @@ env/outputs/<machine>` symlink pattern, extended.
 | 38  | profiling_results | 13G |
 | 39  | profiling_results | 94G |
 | 46  | profiling_results + profiling/ + profiling_fixcpu/ + profiling_both_ceiling/ + profiling_both_ceiling_s04-p1-dgx-02-c18/ + profiling_source_ceiling_s04-p1-dgx-02-c18/ | ~59G |
-| SFT | profiling_results + outputs/ (171G — July qwen35 ckpt dirs) + results/ + test_profiling_direct/ | ~293G |
+| SFT | profiling_results + outputs/ (171G — July qwen35 ckpt dirs, DELETE per Kevin 08-14) + results/ + test_profiling_direct/ | ~293G (→ ~122G after ckpt deletion) |
 
 Deliberately staying put: `datasets/` dirs + LF `data/*.jsonl` (tiny,
 registry-referenced), `agent/anchors_tmp/` ledgers+logs (small, tag-named,
@@ -88,6 +88,10 @@ still works.
    (three registry growths observed 08-14). Symlink-back makes the move
    safe even mid-run, but prefer a quiet window. Re-run the LF
    dataset_info union sweep after it quiets (self-healing entries).
+   At this step DELETE (not migrate) the July qwen35 checkpoint dirs in
+   SFT outputs/ — fa4_qwen35_* (105G + 65G + 210M, 2026-07-01/02) —
+   authorized by Kevin 2026-08-14 ("we don't need them"). The small June
+   diag_* dirs in outputs/ still migrate to history/sft/outputs/.
 5. Generalize the lib tag `-c17` → `-$(hostname -s)`.
 6. Verify: one smoke cell writes through the new symlink; harvest globs
    still resolve; `runs/` browse links list all history.
@@ -100,11 +104,13 @@ insufficient — skip until then.
 
 ## §8 OPEN DECISIONS (Kevin)
 - [ ] Green-light Phase 1 (§4-§6)?
-- [ ] SFT outputs/ 171G July qwen35 checkpoints: archive as-is into
-      history/, or delete after review?
+- [x] SFT outputs/ 171G July qwen35 checkpoints: DELETE (Kevin 08-14) —
+      executed at the §6 step-4 SFT migration.
 - [ ] Seed live/ fresh (recommended) or with 38's current 13G?
 - [ ] Freeze history/ read-only (chmod -w) after migration?
 
 ## §Log
 - [2026-08-14] Plan drafted post-mrg4c (regression ALL PASS). Nothing
   moved; awaiting the §8 calls.
+- [2026-08-14] Kevin: qwen35 ckpts (171G) NOT needed → §2/§6 updated to
+  DELETE at SFT-migration time; footprint to migrate drops to ~290G.
