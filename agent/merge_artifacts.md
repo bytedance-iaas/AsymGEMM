@@ -84,9 +84,38 @@ runs/
 ```
 Browse paths: runs/history/sft39/profiling_results/..., runs/live/...,
 runs/docs/s04-p1-dgx-02-c14/...
-Symlinks RELATIVE at exactly these depths — that is what makes them resolve
-both on the host (/home/kevinni/...) and inside enroot (/workspace/...);
-the agent/impls links prove the pattern in-container.
+
+RULE — RELATIVE LINKS ONLY, NEVER ABSOLUTE: /home/kevinni/... does not
+exist inside enroot (tree mounts at /workspace/...); an absolute link
+dangles there. A relative link climbs to the common layer
+(/home/kevinni <-> /workspace) and resolves in BOTH worlds — the proven
+agent/impls pattern. Up-count = link's own depth inside the tree + 3
+(AsymGEMM -> third_party -> <tree> -> common root).
+
+EXPLICIT SYMLINK TABLE (every link, exact target):
+# repo 38 (link depth 0 -> 3 ups; inside runs/ -> 4; inside runs/docs/ -> 5)
+profiling_results -> ../../../env/outputs/asym_artifacts/live/profiling_results
+runs/live         -> ../../../../env/outputs/asym_artifacts/live
+runs/history      -> ../../../../env/outputs/asym_artifacts/history
+runs/docs/s04-p1-dgx-02-c06 -> ../../../../../env/outputs/s04-p1-dgx-02-c06
+runs/docs/s04-p1-dgx-02-c12 -> ../../../../../env/outputs/s04-p1-dgx-02-c12
+runs/docs/s04-p1-dgx-02-c14 -> ../../../../../env/outputs/s04-p1-dgx-02-c14
+# sibling symlink-backs (each old root, depth 0 -> 3 ups)
+39:  profiling_results -> ../../../env/outputs/asym_artifacts/history/sft39/profiling_results
+46:  profiling_results -> ../../../env/outputs/asym_artifacts/history/sft46/profiling_results
+46:  profiling         -> ../../../env/outputs/asym_artifacts/history/sft46/profiling
+46:  profiling_fixcpu  -> ../../../env/outputs/asym_artifacts/history/sft46/profiling_fixcpu
+46:  profiling_both_ceiling -> ../../../env/outputs/asym_artifacts/history/sft46/profiling_both_ceiling
+46:  profiling_both_ceiling_s04-p1-dgx-02-c18 -> ../../../env/outputs/asym_artifacts/history/sft46/profiling_both_ceiling_s04-p1-dgx-02-c18
+46:  profiling_source_ceiling_s04-p1-dgx-02-c18 -> ../../../env/outputs/asym_artifacts/history/sft46/profiling_source_ceiling_s04-p1-dgx-02-c18
+SFT: profiling_results -> ../../../env/outputs/asym_artifacts/history/sft/profiling_results
+SFT: outputs           -> ../../../env/outputs/asym_artifacts/history/sft/outputs
+SFT: results           -> ../../../env/outputs/asym_artifacts/history/sft/results
+38:  (own history browse only via runs/history/sft38 — live root replaces the old dir)
+
+Post-create verification: `readlink` each link must start with ../ (no
+absolute paths), then resolve each THROUGH enroot (ls inside asym_sft_45)
+before declaring done.
 
 History is namespaced by SOURCE TREE, not machine — honest provenance:
 historical runs mix machines, and the machine already lives in each run
