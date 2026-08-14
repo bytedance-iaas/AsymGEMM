@@ -1,0 +1,191 @@
+== venv .venv ==
+torch 2.12.0+cu130 cuda_avail True dev_count 4
+bf16 asym binding: True
+ep_steal binding: True
+ep_sep count_skip graft: True
+ep_sep pre_gate: True
+ep_sep transports: ['host', 'nvlink']
+frozen_linear _try_ep_sep_grouped: False
+frozen_linear ALLOW_DENSE flag: False
+cpu_left lora_kernels_mode default: ''
+jamba_moe import OK: True
+classify mamba: linear_attention
+classify rotary: rotary
+liger appliers OK
+mamba_ssm 2.3.2.post1
+LF jamba resolver: True
+VENV-SANITY-PASS
+== venv .venv-fa4 ==
+torch 2.12.0+cu130 cuda_avail True dev_count 4
+bf16 asym binding: True
+ep_steal binding: True
+ep_sep count_skip graft: True
+ep_sep pre_gate: True
+ep_sep transports: ['host', 'nvlink']
+frozen_linear _try_ep_sep_grouped: False
+frozen_linear ALLOW_DENSE flag: False
+cpu_left lora_kernels_mode default: ''
+jamba_moe import OK: True
+classify mamba: linear_attention
+classify rotary: rotary
+liger appliers OK
+mamba_ssm 2.3.2.post1
+LF jamba resolver: True
+VENV-SANITY-PASS
+== numeric probe hunyuan (fg101 vs fp32) ==
+shapes: E=64 H=4096 I=3072 top_k=8 T=2048 zero_b=False
+
+== forward vs fp32 torch reference ==
+  plain out                          max|d|=    0.009680 rel_fro=  0.009013 nan=0 ref_absmax=    0.7350 got_absmax=    0.7383
+  fg000 out                          max|d|=    0.008850 rel_fro=  0.008885 nan=0 ref_absmax=    0.7350 got_absmax=    0.7305
+  fg101 out                          max|d|=    0.005546 rel_fro=  0.007402 nan=0 ref_absmax=    0.7350 got_absmax=    0.7383
+  fg101+v2 out                       max|d|=    0.005542 rel_fro=  0.007396 nan=0 ref_absmax=    0.7350 got_absmax=    0.7383
+  fg000+v2 out                       max|d|=    0.008850 rel_fro=  0.008883 nan=0 ref_absmax=    0.7350 got_absmax=    0.7305
+
+== per-bank grad norms (explosion localizer) ==
+  plain      down_lora_A=5.783e+01 down_lora_B=5.774e+01 dx=8.274e+01 gate_lora_A=5.907e+01 gate_lora_B=5.920e+01 up_lora_A=5.767e+01 up_lora_B=5.776e+01
+  fg000      down_lora_A=5.783e+01 down_lora_B=5.774e+01 dx=8.274e+01 gate_lora_A=5.908e+01 gate_lora_B=5.920e+01 up_lora_A=5.767e+01 up_lora_B=5.776e+01
+  fg101      down_lora_A=5.783e+01 down_lora_B=5.774e+01 dx=8.275e+01 gate_lora_A=5.908e+01 gate_lora_B=5.920e+01 up_lora_A=5.767e+01 up_lora_B=5.776e+01
+  fg101+v2   down_lora_A=5.783e+01 down_lora_B=5.774e+01 dx=8.275e+01 gate_lora_A=5.907e+01 gate_lora_B=5.920e+01 up_lora_A=5.767e+01 up_lora_B=5.776e+01
+  fg000+v2   down_lora_A=5.783e+01 down_lora_B=5.774e+01 dx=8.274e+01 gate_lora_A=5.907e+01 gate_lora_B=5.920e+01 up_lora_A=5.767e+01 up_lora_B=5.776e+01
+
+== forward/grads vs plain-asym path (known good) ==
+  fg000 out~plain                    max|d|=    0.009766 rel_fro=  0.006866 nan=0 ref_absmax=    0.7383 got_absmax=    0.7305
+  fg000 down_lora_A                  max|d|=    0.000977 rel_fro=  0.002065 nan=0 ref_absmax=    0.2070 got_absmax=    0.2070
+  fg000 down_lora_B                  max|d|=    0.000488 rel_fro=  0.004779 nan=0 ref_absmax=    0.0889 got_absmax=    0.0889
+  fg000 dx                           max|d|=    0.003906 rel_fro=  0.008671 nan=0 ref_absmax=    0.1934 got_absmax=    0.1943
+  fg000 gate_lora_A                  max|d|=    0.000488 rel_fro=  0.002829 nan=0 ref_absmax=    0.0938 got_absmax=    0.0938
+  fg000 gate_lora_B                  max|d|=    0.001465 rel_fro=  0.005042 nan=0 ref_absmax=    0.2168 got_absmax=    0.2168
+  fg000 up_lora_A                    max|d|=    0.000488 rel_fro=  0.002731 nan=0 ref_absmax=    0.0869 got_absmax=    0.0869
+  fg000 up_lora_B                    max|d|=    0.001465 rel_fro=  0.005021 nan=0 ref_absmax=    0.1973 got_absmax=    0.1973
+  fg101 out~plain                    max|d|=    0.007812 rel_fro=  0.006264 nan=0 ref_absmax=    0.7383 got_absmax=    0.7383
+  fg101 down_lora_A                  max|d|=    0.000977 rel_fro=  0.002065 nan=0 ref_absmax=    0.2070 got_absmax=    0.2070
+  fg101 down_lora_B                  max|d|=    0.000488 rel_fro=  0.004779 nan=0 ref_absmax=    0.0889 got_absmax=    0.0889
+  fg101 dx                           max|d|=    0.003906 rel_fro=  0.007904 nan=0 ref_absmax=    0.1934 got_absmax=    0.1943
+  fg101 gate_lora_A                  max|d|=    0.000488 rel_fro=  0.002829 nan=0 ref_absmax=    0.0938 got_absmax=    0.0938
+  fg101 gate_lora_B                  max|d|=    0.001465 rel_fro=  0.005042 nan=0 ref_absmax=    0.2168 got_absmax=    0.2168
+  fg101 up_lora_A                    max|d|=    0.000488 rel_fro=  0.002731 nan=0 ref_absmax=    0.0869 got_absmax=    0.0869
+  fg101 up_lora_B                    max|d|=    0.001465 rel_fro=  0.005021 nan=0 ref_absmax=    0.1973 got_absmax=    0.1973
+  fg101+v2 out~plain                 max|d|=    0.007812 rel_fro=  0.006127 nan=0 ref_absmax=    0.7383 got_absmax=    0.7383
+  fg101+v2 down_lora_A               max|d|=    0.000488 rel_fro=  0.000044 nan=0 ref_absmax=    0.2070 got_absmax=    0.2070
+  fg101+v2 down_lora_B               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.0889 got_absmax=    0.0889
+  fg101+v2 dx                        max|d|=    0.003906 rel_fro=  0.007836 nan=0 ref_absmax=    0.1934 got_absmax=    0.1943
+  fg101+v2 gate_lora_A               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.0938 got_absmax=    0.0938
+  fg101+v2 gate_lora_B               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.2168 got_absmax=    0.2168
+  fg101+v2 up_lora_A                 max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.0869 got_absmax=    0.0869
+  fg101+v2 up_lora_B                 max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.1973 got_absmax=    0.1973
+  fg000+v2 out~plain                 max|d|=    0.009766 rel_fro=  0.005862 nan=0 ref_absmax=    0.7383 got_absmax=    0.7305
+  fg000+v2 down_lora_A               max|d|=    0.000488 rel_fro=  0.000044 nan=0 ref_absmax=    0.2070 got_absmax=    0.2070
+  fg000+v2 down_lora_B               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.0889 got_absmax=    0.0889
+  fg000+v2 dx                        max|d|=    0.002930 rel_fro=  0.008042 nan=0 ref_absmax=    0.1934 got_absmax=    0.1943
+  fg000+v2 gate_lora_A               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.0938 got_absmax=    0.0938
+  fg000+v2 gate_lora_B               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.2168 got_absmax=    0.2168
+  fg000+v2 up_lora_A                 max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.0869 got_absmax=    0.0869
+  fg000+v2 up_lora_B                 max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.1973 got_absmax=    0.1973
+
+verdict: all forward paths within 5% of fp32 reference
+== numeric probe mixtral ==
+shapes: E=8 H=6144 I=16384 top_k=2 T=2048 zero_b=False
+
+== forward vs fp32 torch reference ==
+  plain out                          max|d|=    0.067125 rel_fro=  0.011079 nan=0 ref_absmax=    3.9329 got_absmax=    3.9062
+  fg000 out                          max|d|=    0.068573 rel_fro=  0.011023 nan=0 ref_absmax=    3.9329 got_absmax=    3.9375
+  fg101 out                          max|d|=    0.031607 rel_fro=  0.008320 nan=0 ref_absmax=    3.9329 got_absmax=    3.9531
+  fg101+v2 out                       max|d|=    0.035893 rel_fro=  0.008312 nan=0 ref_absmax=    3.9329 got_absmax=    3.9531
+  fg000+v2 out                       max|d|=    0.071534 rel_fro=  0.011017 nan=0 ref_absmax=    3.9329 got_absmax=    3.9219
+
+== per-bank grad norms (explosion localizer) ==
+  plain      down_lora_A=4.760e+02 down_lora_B=4.754e+02 dx=6.834e+02 gate_lora_A=4.904e+02 gate_lora_B=4.896e+02 up_lora_A=4.739e+02 up_lora_B=4.764e+02
+  fg000      down_lora_A=4.760e+02 down_lora_B=4.754e+02 dx=6.834e+02 gate_lora_A=4.904e+02 gate_lora_B=4.896e+02 up_lora_A=4.739e+02 up_lora_B=4.764e+02
+  fg101      down_lora_A=4.760e+02 down_lora_B=4.754e+02 dx=6.835e+02 gate_lora_A=4.904e+02 gate_lora_B=4.896e+02 up_lora_A=4.739e+02 up_lora_B=4.764e+02
+  fg101+v2   down_lora_A=4.760e+02 down_lora_B=4.754e+02 dx=6.835e+02 gate_lora_A=4.904e+02 gate_lora_B=4.896e+02 up_lora_A=4.739e+02 up_lora_B=4.764e+02
+  fg000+v2   down_lora_A=4.760e+02 down_lora_B=4.754e+02 dx=6.834e+02 gate_lora_A=4.904e+02 gate_lora_B=4.896e+02 up_lora_A=4.739e+02 up_lora_B=4.764e+02
+
+== forward/grads vs plain-asym path (known good) ==
+  fg000 out~plain                    max|d|=    0.062500 rel_fro=  0.006970 nan=0 ref_absmax=    3.9062 got_absmax=    3.9375
+  fg000 down_lora_A                  max|d|=    0.005859 rel_fro=  0.002225 nan=0 ref_absmax=    1.0859 got_absmax=    1.0859
+  fg000 down_lora_B                  max|d|=    0.011719 rel_fro=  0.007815 nan=0 ref_absmax=    1.4453 got_absmax=    1.4453
+  fg000 dx                           max|d|=    0.035156 rel_fro=  0.014408 nan=0 ref_absmax=    1.1016 got_absmax=    1.0938
+  fg000 gate_lora_A                  max|d|=    0.007812 rel_fro=  0.002924 nan=0 ref_absmax=    1.3750 got_absmax=    1.3750
+  fg000 gate_lora_B                  max|d|=    0.007812 rel_fro=  0.005617 nan=0 ref_absmax=    1.0781 got_absmax=    1.0781
+  fg000 up_lora_A                    max|d|=    0.007812 rel_fro=  0.002822 nan=0 ref_absmax=    1.3906 got_absmax=    1.3906
+  fg000 up_lora_B                    max|d|=    0.009766 rel_fro=  0.005604 nan=0 ref_absmax=    0.9805 got_absmax=    0.9805
+  fg101 out~plain                    max|d|=    0.070312 rel_fro=  0.008164 nan=0 ref_absmax=    3.9062 got_absmax=    3.9531
+  fg101 down_lora_A                  max|d|=    0.005859 rel_fro=  0.002225 nan=0 ref_absmax=    1.0859 got_absmax=    1.0859
+  fg101 down_lora_B                  max|d|=    0.011719 rel_fro=  0.007815 nan=0 ref_absmax=    1.4453 got_absmax=    1.4453
+  fg101 dx                           max|d|=    0.035156 rel_fro=  0.014093 nan=0 ref_absmax=    1.1016 got_absmax=    1.1016
+  fg101 gate_lora_A                  max|d|=    0.007812 rel_fro=  0.002924 nan=0 ref_absmax=    1.3750 got_absmax=    1.3750
+  fg101 gate_lora_B                  max|d|=    0.007812 rel_fro=  0.005617 nan=0 ref_absmax=    1.0781 got_absmax=    1.0781
+  fg101 up_lora_A                    max|d|=    0.007812 rel_fro=  0.002822 nan=0 ref_absmax=    1.3906 got_absmax=    1.3906
+  fg101 up_lora_B                    max|d|=    0.009766 rel_fro=  0.005604 nan=0 ref_absmax=    0.9805 got_absmax=    0.9805
+  fg101+v2 out~plain                 max|d|=    0.070312 rel_fro=  0.008041 nan=0 ref_absmax=    3.9062 got_absmax=    3.9531
+  fg101+v2 down_lora_A               max|d|=    0.003906 rel_fro=  0.000057 nan=0 ref_absmax=    1.0859 got_absmax=    1.0859
+  fg101+v2 down_lora_B               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    1.4453 got_absmax=    1.4453
+  fg101+v2 dx                        max|d|=    0.035156 rel_fro=  0.014048 nan=0 ref_absmax=    1.1016 got_absmax=    1.1016
+  fg101+v2 gate_lora_A               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    1.3750 got_absmax=    1.3750
+  fg101+v2 gate_lora_B               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    1.0781 got_absmax=    1.0781
+  fg101+v2 up_lora_A                 max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    1.3906 got_absmax=    1.3906
+  fg101+v2 up_lora_B                 max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.9805 got_absmax=    0.9805
+  fg000+v2 out~plain                 max|d|=    0.031250 rel_fro=  0.003766 nan=0 ref_absmax=    3.9062 got_absmax=    3.9219
+  fg000+v2 down_lora_A               max|d|=    0.003906 rel_fro=  0.000057 nan=0 ref_absmax=    1.0859 got_absmax=    1.0859
+  fg000+v2 down_lora_B               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    1.4453 got_absmax=    1.4453
+  fg000+v2 dx                        max|d|=    0.035156 rel_fro=  0.013547 nan=0 ref_absmax=    1.1016 got_absmax=    1.0938
+  fg000+v2 gate_lora_A               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    1.3750 got_absmax=    1.3750
+  fg000+v2 gate_lora_B               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    1.0781 got_absmax=    1.0781
+  fg000+v2 up_lora_A                 max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    1.3906 got_absmax=    1.3906
+  fg000+v2 up_lora_B                 max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.9805 got_absmax=    0.9805
+
+verdict: all forward paths within 5% of fp32 reference
+== numeric probe qwen3 ==
+shapes: E=128 H=2048 I=768 top_k=8 T=2048 zero_b=False
+
+== forward vs fp32 torch reference ==
+  plain out                          max|d|=    0.001849 rel_fro=  0.007642 nan=0 ref_absmax=    0.1630 got_absmax=    0.1641
+  fg000 out                          max|d|=    0.001626 rel_fro=  0.007487 nan=0 ref_absmax=    0.1630 got_absmax=    0.1631
+  fg101 out                          max|d|=    0.001084 rel_fro=  0.006260 nan=0 ref_absmax=    0.1630 got_absmax=    0.1631
+  fg101+v2 out                       max|d|=    0.001109 rel_fro=  0.006258 nan=0 ref_absmax=    0.1630 got_absmax=    0.1631
+  fg000+v2 out                       max|d|=    0.001626 rel_fro=  0.007487 nan=0 ref_absmax=    0.1630 got_absmax=    0.1631
+
+== per-bank grad norms (explosion localizer) ==
+  plain      down_lora_A=9.557e+00 down_lora_B=9.561e+00 dx=1.361e+01 gate_lora_A=9.718e+00 gate_lora_B=9.709e+00 up_lora_A=9.541e+00 up_lora_B=9.562e+00
+  fg000      down_lora_A=9.557e+00 down_lora_B=9.561e+00 dx=1.361e+01 gate_lora_A=9.718e+00 gate_lora_B=9.709e+00 up_lora_A=9.541e+00 up_lora_B=9.562e+00
+  fg101      down_lora_A=9.557e+00 down_lora_B=9.561e+00 dx=1.361e+01 gate_lora_A=9.718e+00 gate_lora_B=9.709e+00 up_lora_A=9.541e+00 up_lora_B=9.562e+00
+  fg101+v2   down_lora_A=9.557e+00 down_lora_B=9.561e+00 dx=1.361e+01 gate_lora_A=9.718e+00 gate_lora_B=9.709e+00 up_lora_A=9.541e+00 up_lora_B=9.562e+00
+  fg000+v2   down_lora_A=9.557e+00 down_lora_B=9.561e+00 dx=1.361e+01 gate_lora_A=9.718e+00 gate_lora_B=9.709e+00 up_lora_A=9.541e+00 up_lora_B=9.562e+00
+
+== forward/grads vs plain-asym path (known good) ==
+  fg000 out~plain                    max|d|=    0.001953 rel_fro=  0.006357 nan=0 ref_absmax=    0.1641 got_absmax=    0.1631
+  fg000 down_lora_A                  max|d|=    0.000153 rel_fro=  0.001864 nan=0 ref_absmax=    0.0535 got_absmax=    0.0535
+  fg000 down_lora_B                  max|d|=    0.000061 rel_fro=  0.003810 nan=0 ref_absmax=    0.0151 got_absmax=    0.0151
+  fg000 dx                           max|d|=    0.000488 rel_fro=  0.006575 nan=0 ref_absmax=    0.0430 got_absmax=    0.0430
+  fg000 gate_lora_A                  max|d|=    0.000061 rel_fro=  0.002652 nan=0 ref_absmax=    0.0150 got_absmax=    0.0150
+  fg000 gate_lora_B                  max|d|=    0.000244 rel_fro=  0.004292 nan=0 ref_absmax=    0.0396 got_absmax=    0.0396
+  fg000 up_lora_A                    max|d|=    0.000061 rel_fro=  0.002555 nan=0 ref_absmax=    0.0145 got_absmax=    0.0145
+  fg000 up_lora_B                    max|d|=    0.000244 rel_fro=  0.004272 nan=0 ref_absmax=    0.0476 got_absmax=    0.0476
+  fg101 out~plain                    max|d|=    0.001953 rel_fro=  0.005619 nan=0 ref_absmax=    0.1641 got_absmax=    0.1631
+  fg101 down_lora_A                  max|d|=    0.000153 rel_fro=  0.001864 nan=0 ref_absmax=    0.0535 got_absmax=    0.0535
+  fg101 down_lora_B                  max|d|=    0.000061 rel_fro=  0.003810 nan=0 ref_absmax=    0.0151 got_absmax=    0.0151
+  fg101 dx                           max|d|=    0.000610 rel_fro=  0.005976 nan=0 ref_absmax=    0.0430 got_absmax=    0.0432
+  fg101 gate_lora_A                  max|d|=    0.000061 rel_fro=  0.002652 nan=0 ref_absmax=    0.0150 got_absmax=    0.0150
+  fg101 gate_lora_B                  max|d|=    0.000244 rel_fro=  0.004292 nan=0 ref_absmax=    0.0396 got_absmax=    0.0396
+  fg101 up_lora_A                    max|d|=    0.000061 rel_fro=  0.002555 nan=0 ref_absmax=    0.0145 got_absmax=    0.0145
+  fg101 up_lora_B                    max|d|=    0.000244 rel_fro=  0.004272 nan=0 ref_absmax=    0.0476 got_absmax=    0.0476
+  fg101+v2 out~plain                 max|d|=    0.001953 rel_fro=  0.005498 nan=0 ref_absmax=    0.1641 got_absmax=    0.1631
+  fg101+v2 down_lora_A               max|d|=    0.000061 rel_fro=  0.000028 nan=0 ref_absmax=    0.0535 got_absmax=    0.0535
+  fg101+v2 down_lora_B               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.0151 got_absmax=    0.0151
+  fg101+v2 dx                        max|d|=    0.000610 rel_fro=  0.005906 nan=0 ref_absmax=    0.0430 got_absmax=    0.0432
+  fg101+v2 gate_lora_A               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.0150 got_absmax=    0.0150
+  fg101+v2 gate_lora_B               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.0396 got_absmax=    0.0396
+  fg101+v2 up_lora_A                 max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.0145 got_absmax=    0.0145
+  fg101+v2 up_lora_B                 max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.0476 got_absmax=    0.0476
+  fg000+v2 out~plain                 max|d|=    0.001953 rel_fro=  0.005857 nan=0 ref_absmax=    0.1641 got_absmax=    0.1631
+  fg000+v2 down_lora_A               max|d|=    0.000061 rel_fro=  0.000028 nan=0 ref_absmax=    0.0535 got_absmax=    0.0535
+  fg000+v2 down_lora_B               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.0151 got_absmax=    0.0151
+  fg000+v2 dx                        max|d|=    0.000610 rel_fro=  0.006125 nan=0 ref_absmax=    0.0430 got_absmax=    0.0430
+  fg000+v2 gate_lora_A               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.0150 got_absmax=    0.0150
+  fg000+v2 gate_lora_B               max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.0396 got_absmax=    0.0396
+  fg000+v2 up_lora_A                 max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.0145 got_absmax=    0.0145
+  fg000+v2 up_lora_B                 max|d|=    0.000000 rel_fro=  0.000000 nan=0 ref_absmax=    0.0476 got_absmax=    0.0476
+
+verdict: all forward paths within 5% of fp32 reference
+SANITY-DONE
