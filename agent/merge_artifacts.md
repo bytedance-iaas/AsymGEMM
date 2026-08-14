@@ -138,7 +138,12 @@ Same-FS rename is atomic+instant; open FDs survive; new path lookups
 resolve through the symlink — even a LIVE run keeps writing correctly.
 Same trick applied inside the sibling trees (their old paths become
 symlinks into history/), so any legacy script pointed at a sibling tree
-still works.
+still works — reads AND writes, scripts run as if nothing changed.
+Nuance (accepted): a NEW run launched from a sibling tree writes through
+its symlink-back into history/<tree>/ (that tree's slice), not live/ —
+nothing breaks, the run stays attributable, re-file if desired. New runs
+are expected from repo 38 (-> live/) post-merge; "frozen" history is a
+convention, not an enforcement.
 
 ## §6 MIGRATION ORDER + LIVE-SESSION CAUTIONS
 1. Create env/outputs/asymlora skeleton + INDEX.md; move the three
