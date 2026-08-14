@@ -16,22 +16,31 @@ env/outputs/<machine>` symlink pattern, extended.
   resolving unchanged.
 
 ## §2 INVENTORY (audited 08-14; all same filesystem dev=61 → mv = instant rename)
+Principle (Kevin 08-14): store ACTUAL RUN RESULTS only — no checkpoints,
+no test junk, no scratch. Everything below is the complete top-level
+census of all four trees; every entry is KEEP (migrate), DELETE, or
+EXCLUDED (rebuildable).
+
+KEEP — actual run results, ~285G total:
 | tree | roots | size |
 |---|---|---|
 | 38  | profiling_results | 13G |
 | 39  | profiling_results | 94G |
-| 46  | profiling_results + profiling/ + profiling_fixcpu/ + profiling_both_ceiling/ + profiling_both_ceiling_s04-p1-dgx-02-c18/ + profiling_source_ceiling_s04-p1-dgx-02-c18/ | ~59G |
-| SFT | profiling_results + outputs/ (171G — July qwen35 ckpt dirs, DELETE per Kevin 08-14) + results/ + test_profiling_direct/ | ~293G (→ ~122G after ckpt deletion) |
+| 46  | profiling_results (21G) + profiling (144M) + profiling_fixcpu (2.8G) + profiling_both_ceiling (7.4G) + profiling_both_ceiling_s04-p1-dgx-02-c18 (27G) + profiling_source_ceiling_s04-p1-dgx-02-c18 (895M) — all campaign profiling outputs, same class as profiling_results | ~59G |
+| SFT | profiling_results | 119G |
 
-Census addendum (full top-level sweep, 08-14): also migrating the tiny
-extras 39/`test_profiling_venv` (12K), SFT/`test_profiling` (16K),
-SFT/`.figtmp` (140K). EXCLUDED as rebuildable, verified non-artifacts:
-`.venv*`/`.aioenv`/`build/` (environments), `.cache`/`.pytest_cache`/
-`.ruff_cache` (tool caches), `stubs/_C.pyi` (regenerated per _C build —
-differs per tree by design). `Screenshot 2026-08-10*.png` is byte-identical
-in all four trees (38 already has it).
+DELETE at migration time (Kevin 08-14 — not run results):
+- SFT `outputs/` (171G July qwen35 ckpt dirs + June diag scratch)
+- SFT `results/` (3.4M), `test_profiling_direct/` (4.4M),
+  `test_profiling/` (16K), `.figtmp/` (140K)
+- 39 `test_profiling_venv/` (12K)
 
-Deliberately staying put: `datasets/` dirs + LF `data/*.jsonl` (tiny,
+EXCLUDED — rebuildable, verified non-artifacts: `.venv*`/`.aioenv`/`build/`
+(environments), `.cache`/`.pytest_cache`/`.ruff_cache` (tool caches),
+`stubs/_C.pyi` (regenerated per _C build). `Screenshot 2026-08-10*.png`
+byte-identical in all four trees (38 already has it).
+
+Staying put: `datasets/` dirs + LF `data/*.jsonl` (tiny,
 registry-referenced), `agent/anchors_tmp/` ledgers+logs (small, tag-named,
 belong with the repo), node-local /scratch_local caches.
 
@@ -96,10 +105,10 @@ still works.
    (three registry growths observed 08-14). Symlink-back makes the move
    safe even mid-run, but prefer a quiet window. Re-run the LF
    dataset_info union sweep after it quiets (self-healing entries).
-   At this step DELETE (not migrate) the July qwen35 checkpoint dirs in
-   SFT outputs/ — fa4_qwen35_* (105G + 65G + 210M, 2026-07-01/02) —
-   authorized by Kevin 2026-08-14 ("we don't need them"). The small June
-   diag_* dirs in outputs/ still migrate to history/sft/outputs/.
+   At this step execute the §2 DELETE list (SFT outputs/, results/,
+   test_profiling_direct/, test_profiling/, .figtmp/; 39
+   test_profiling_venv/) — authorized by Kevin 2026-08-14 ("actual run
+   results only"). Only SFT profiling_results/ migrates from this tree.
 5. Generalize the lib tag `-c17` → `-$(hostname -s)`.
 6. Verify: one smoke cell writes through the new symlink; harvest globs
    still resolve; `runs/` browse links list all history.
@@ -112,8 +121,9 @@ insufficient — skip until then.
 
 ## §8 OPEN DECISIONS (Kevin)
 - [ ] Green-light Phase 1 (§4-§6)?
-- [x] SFT outputs/ 171G July qwen35 checkpoints: DELETE (Kevin 08-14) —
-      executed at the §6 step-4 SFT migration.
+- [x] Non-run-result dirs (SFT outputs/171G + results + test_* + .figtmp;
+      39 test_profiling_venv): DELETE (Kevin 08-14, "actual run results
+      only") — executed at the §6 step-4 SFT migration.
 - [ ] Seed live/ fresh (recommended) or with 38's current 13G?
 - [ ] Freeze history/ read-only (chmod -w) after migration?
 
@@ -122,3 +132,7 @@ insufficient — skip until then.
   moved; awaiting the §8 calls.
 - [2026-08-14] Kevin: qwen35 ckpts (171G) NOT needed → §2/§6 updated to
   DELETE at SFT-migration time; footprint to migrate drops to ~290G.
+- [2026-08-14] Kevin: "actual run results only" — §2 rewritten as
+  KEEP/DELETE/EXCLUDED census; SFT results/test_*/.figtmp + 39
+  test_profiling_venv moved to DELETE alongside outputs/; migrate
+  footprint ~285G (profiling* roots only).
