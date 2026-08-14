@@ -1,0 +1,110 @@
+# Artifact merge plan — 4-way trees → central store (PROPOSED 2026-08-14, nothing moved yet)
+
+Companion to the mrg4b source merge (main_kevin @14ea670). Source/docs are
+fully merged and regression-validated; this plan covers the RUN ARTIFACTS
+(~460G) still sitting per-tree. Model: the proven `agent/impls/<machine> ->
+env/outputs/<machine>` symlink pattern, extended.
+
+## §1 GOAL
+- One repo (SFT-38) used by every machine; artifacts OUT of the repo tree,
+  centrally managed under /home/kevinni/env/outputs/, visible from the repo
+  via stable symlinks.
+- All four trees' historical artifacts preserved and browsable from 38.
+- ZERO breakage: writers and readers hardcode
+  `${ASYM_DIR}/profiling_results/profiling/...` (profile_lora_lf_test_source.sh
+  :3021/:3023, every harvest/plot/verdict script) — those paths must keep
+  resolving unchanged.
+
+## §2 INVENTORY (audited 08-14; all same filesystem dev=61 → mv = instant rename)
+| tree | roots | size |
+|---|---|---|
+| 38  | profiling_results | 13G |
+| 39  | profiling_results | 94G |
+| 46  | profiling_results + profiling/ + profiling_fixcpu/ + profiling_both_ceiling/ + profiling_both_ceiling_s04-p1-dgx-02-c18/ + profiling_source_ceiling_s04-p1-dgx-02-c18/ | ~59G |
+| SFT | profiling_results + outputs/ (171G — July qwen35 ckpt dirs) + results/ + test_profiling_direct/ | ~293G |
+
+Deliberately staying put: `datasets/` dirs + LF `data/*.jsonl` (tiny,
+registry-referenced), `agent/anchors_tmp/` ledgers+logs (small, tag-named,
+belong with the repo), node-local /scratch_local caches.
+
+## §3 KEY CONSTRAINT (why the naive per-machine symlink fails)
+A static symlink cannot dispatch by hostname: the repo is ONE shared NFS
+path seen identically by all machines, so `profiling_results ->
+<this-machine>` is unexpressible. Per-machine WRITE dirs would need writer +
+~6 reader base-path changes (Phase 2, optional). The zero-change design:
+ONE shared live root + machine identity in the RUN TAG (the lib already
+stamps `-c17`; generalize to `-$(hostname -s)` — 1 line in
+tpfig_lib_c17.sh, readers unaffected since they glob the tag they created).
+
+## §4 TARGET LAYOUT
+```
+/home/kevinni/env/outputs/
+  s04-p1-dgx-02-cNN/                  # existing per-machine doc dirs (unchanged)
+  asym_artifacts/
+    INDEX.md                          # provenance + migration record
+    history/                          # frozen post-migration (read-only by convention)
+      sft38/profiling_results/...
+      sft39/profiling_results/...
+      sft46/{profiling_results,profiling,profiling_fixcpu,
+             profiling_both_ceiling*,profiling_source_ceiling*}/...
+      sft/{profiling_results,outputs,results,test_profiling_direct}/...
+    live/
+      profiling_results/...           # single shared write root, all machines
+```
+In repo 38:
+```
+profiling_results -> ../../../env/outputs/asym_artifacts/live/profiling_results
+runs/
+  live              -> ../../../../env/outputs/asym_artifacts/live
+  sft38-history     -> ../../../../env/outputs/asym_artifacts/history/sft38
+  sft39-history     -> ../../../../env/outputs/asym_artifacts/history/sft39
+  sft46-history     -> ../../../../env/outputs/asym_artifacts/history/sft46
+  sft-history       -> ../../../../env/outputs/asym_artifacts/history/sft
+  s04-p1-dgx-02-cNN -> ../../../../env/outputs/s04-p1-dgx-02-cNN
+```
+Symlinks RELATIVE at exactly these depths — that is what makes them resolve
+both on the host (/home/kevinni/...) and inside enroot (/workspace/...);
+the agent/impls links prove the pattern in-container.
+
+History is namespaced by SOURCE TREE, not machine — honest provenance:
+historical runs mix machines, and the machine already lives in each run
+dir's tag (`-c17_`, `a1rc128-c14_`, `..._s04-p1-dgx-02-c18`). Per-machine
+namespacing applies to NEW runs via the generalized tag.
+
+## §5 NON-BREAKING MECHANICS
+For every root: `mv <root> <central>/ && ln -s <relative-central> <root>`.
+Same-FS rename is atomic+instant; open FDs survive; new path lookups
+resolve through the symlink — even a LIVE run keeps writing correctly.
+Same trick applied inside the sibling trees (their old paths become
+symlinks into history/), so any legacy script pointed at a sibling tree
+still works.
+
+## §6 MIGRATION ORDER + LIVE-SESSION CAUTIONS
+1. Create env/outputs/asym_artifacts skeleton + INDEX.md.
+2. Migrate 39 + 46 (idle) → history/, symlink-back in their trees.
+3. Migrate 38's 13G → history/sft38; create live/ + repo symlinks. Do this
+   with no cell running (rename window is ms, but don't race a writer).
+4. SFT LAST — a live session is registering datasets/running smokes there
+   (three registry growths observed 08-14). Symlink-back makes the move
+   safe even mid-run, but prefer a quiet window. Re-run the LF
+   dataset_info union sweep after it quiets (self-healing entries).
+5. Generalize the lib tag `-c17` → `-$(hostname -s)`.
+6. Verify: one smoke cell writes through the new symlink; harvest globs
+   still resolve; `runs/` browse links list all history.
+
+## §7 PHASE 2 (OPTIONAL, LATER)
+True per-machine write dirs (`runs/<machine>/profiling_results/...`):
+writer path + base-path constants in tpfig_lib, mrg4/gptoss/fig harvests
+(~6 files, one commit). Only if tag-level separation ever proves
+insufficient — skip until then.
+
+## §8 OPEN DECISIONS (Kevin)
+- [ ] Green-light Phase 1 (§4-§6)?
+- [ ] SFT outputs/ 171G July qwen35 checkpoints: archive as-is into
+      history/, or delete after review?
+- [ ] Seed live/ fresh (recommended) or with 38's current 13G?
+- [ ] Freeze history/ read-only (chmod -w) after migration?
+
+## §Log
+- [2026-08-14] Plan drafted post-mrg4c (regression ALL PASS). Nothing
+  moved; awaiting the §8 calls.
