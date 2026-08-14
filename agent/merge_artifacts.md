@@ -77,11 +77,13 @@ profiling_results -> ../../../env/outputs/asym_artifacts/live/profiling_results
 runs/
   live     -> ../../../../env/outputs/asym_artifacts/live
   history  -> ../../../../env/outputs/asym_artifacts/history
-  machines/
+  docs/                               # per-machine WRITE-UPS (same dirs the
     s04-p1-dgx-02-cNN -> ../../../../../env/outputs/s04-p1-dgx-02-cNN
+                                      # agent/impls/<machine> links point at —
+                                      # reports/system_summary/figures, not runs)
 ```
 Browse paths: runs/history/sft39/profiling_results/..., runs/live/...,
-runs/machines/s04-p1-dgx-02-c14/...
+runs/docs/s04-p1-dgx-02-c14/...
 Symlinks RELATIVE at exactly these depths — that is what makes them resolve
 both on the host (/home/kevinni/...) and inside enroot (/workspace/...);
 the agent/impls links prove the pattern in-container.
@@ -147,3 +149,5 @@ insufficient — skip until then.
 - [2026-08-14] Kevin: group histories -> runs/ now has exactly three
   entries (live, history = ONE symlink to central history/, machines/);
   runs/history/<tree>/... mirrors the store 1:1.
+- [2026-08-14] Kevin: runs/machines/ renamed runs/docs/ — those dirs hold
+  per-machine WRITE-UPS (reports/summaries/figures), not runs.
