@@ -557,13 +557,16 @@ def parent_main(args) -> int:
                 f"hist has {len(counts)} experts but --geom says E={E} — real-routing "
                 f"columns need a capture from the SAME model")
             if tok == "natural":
-                a, g, tag = 0.0, 1.0, "nat"
+                # NOTE: this tuple used to rebind `tag` (the shm namespace,
+                # pid-unique) to "nat", making concurrent parents collide on
+                # /dev/shm/asym_epbench_nat — case tag is its own variable now.
+                a, g, atag = 0.0, 1.0, "nat"
             elif tok.startswith("g"):   # gamma variant (appendix)
-                a, g, tag = 0.0, float(tok[1:]), tok
+                a, g, atag = 0.0, float(tok[1:]), tok
             else:                        # legacy one-hot alpha (appendix)
-                a, g, tag = float(tok), 1.0, f"a{tok}"
+                a, g, atag = float(tok), 1.0, f"a{tok}"
             cases.append({
-                "name": f"{lname}|{tag}",
+                "name": f"{lname}|{atag}",
                 "alpha": a,
                 "counts": scale_counts(counts, args.m_total, a, gamma=g),
             })

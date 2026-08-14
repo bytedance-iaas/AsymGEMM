@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import json
 import os
 import random
@@ -159,11 +160,22 @@ def doc_iterator(ds_key: str, tokenizer, streaming_buffer: int = 5000):
                 yield doc_id, txt
         return
 
-    stream_big = ds_key in ("codeforces", "megamath", "openscience")
+    # 2026-08-12: streaming re-resolves via the hub API every run and 429s
+    # under concurrent runners — download once into the shared cache instead
+    # (codeforces/openscience/megamath are all disk-cheap vs 12T free).
+    stream_big = False
     load_kw = {"split": split, "streaming": stream_big}
     if ds_key in DATA_FILES:
         load_kw["data_files"] = DATA_FILES[ds_key]
-    ds = hfds.load_dataset(repo, config, **load_kw)
+    ds = None
+    for attempt in range(4):  # hub 429s under concurrent runners
+        try:
+            ds = hfds.load_dataset(repo, config, **load_kw)
+            break
+        except Exception:
+            if attempt == 3:
+                raise
+            time.sleep(20 * (attempt + 1))
     if stream_big:
         ds = ds.shuffle(seed=seed, buffer_size=streaming_buffer)
         rows = enumerate(iter(ds))
@@ -200,7 +212,6 @@ def doc_iterator(ds_key: str, tokenizer, streaming_buffer: int = 5000):
             doc_id = str(row.get("instance_id", i))
             txt = _join_fields(row, ["problem_statement", "patch"])
         elif kind == "qa":
-            doc_id = str(i)
             txt = _join_fields(
                 row,
                 [
@@ -209,9 +220,12 @@ def doc_iterator(ds_key: str, tokenizer, streaming_buffer: int = 5000):
                     "text", "content",
                 ],
             )
+            # content-hash id: streamed rows have no stable row index, and
+            # pack rebuilding must find docs again in any iteration order
+            doc_id = "h" + hashlib.sha1(txt.encode()).hexdigest()[:16]
         else:  # generic text
-            doc_id = str(i)
             txt = str(row.get("text") or row.get("content") or "")
+            doc_id = "h" + hashlib.sha1(txt.encode()).hexdigest()[:16]
         if txt and len(txt.strip()) > 64:
             yield doc_id, txt
 
@@ -253,6 +267,13 @@ def build_packs(ds_key, tokenizer, seq_len, n_samples, max_docs=200000):
                 if len(packs) >= n_samples:
                     return packs, n_docs
             # A doc longer than one pack keeps spilling into the next pack.
+    if len(packs) >= min(100, max(1, n_samples // 2)):
+        print(
+            f"[pack] {ds_key} exhausted at {len(packs)}/{n_samples} full packs "
+            f"({n_docs} docs) — proceeding with what exists",
+            flush=True,
+        )
+        return packs, n_docs
     raise RuntimeError(
         f"dataset {ds_key} exhausted after {n_docs} docs with only "
         f"{len(packs)}/{n_samples} full {seq_len}-token packs"
@@ -277,19 +298,23 @@ def load_model(repo, max_memory=None):
     from transformers import AutoModelForCausalLM, AutoModel
 
     last_err = None
-    for loader in (AutoModel, AutoModelForCausalLM):
-        for attn in (None, "sdpa", "eager"):
-            kw = dict(dtype=torch.bfloat16, device_map="auto")
-            if max_memory:
-                kw["max_memory"] = max_memory
-            if attn:
-                kw["attn_implementation"] = attn
-            try:
-                m = loader.from_pretrained(repo, **kw)
-                m.eval()
-                return m, f"{loader.__name__}/attn={attn or 'auto'}"
-            except Exception as e:  # noqa: BLE001
-                last_err = e
+    # local_files_only first: the hub API 429s under concurrent
+    # unauthenticated runners, and cached models need no network at all.
+    for local in (True, False):
+        for loader in (AutoModel, AutoModelForCausalLM):
+            for attn in (None, "sdpa", "eager"):
+                kw = dict(dtype=torch.bfloat16, device_map="auto",
+                          local_files_only=local)
+                if max_memory:
+                    kw["max_memory"] = max_memory
+                if attn:
+                    kw["attn_implementation"] = attn
+                try:
+                    m = loader.from_pretrained(repo, **kw)
+                    m.eval()
+                    return m, f"{loader.__name__}/attn={attn or 'auto'}/local={local}"
+                except Exception as e:  # noqa: BLE001
+                    last_err = e
     raise RuntimeError(f"could not load {repo}: {last_err}")
 
 
@@ -306,6 +331,75 @@ def resolve_backbone(model):
         else:
             break
     return m, path
+
+
+def wrap_experts_row_sliced(model, rows_per_slice):
+    """Slice each experts-module call over token rows.
+
+    At 1M tokens the HF experts modules materialize fp32 buffers of
+    [tokens*top_k, hidden] (~64 GiB measured on qwen3-30b) in one shot.
+    Output rows depend only on their own input rows, so computing in
+    slices is exact while capping the transient at rows_per_slice scale.
+    Capture is untouched: forward_pre_hooks fire at __call__ with the
+    FULL tensors; the wrapper slices inside forward and calls the
+    original directly (no per-slice hook fire).
+    """
+    n = 0
+    for _, mod in model.named_modules():
+        if type(mod).__name__.endswith(EXPERT_CLASS_SUFFIXES):
+            orig = mod.forward
+
+            def sliced(hidden, sel, w, _orig=orig, _n=rows_per_slice, **kw):
+                rows = hidden.shape[0]
+                if rows <= _n:
+                    return _orig(hidden, sel, w, **kw)
+                outs = [
+                    _orig(hidden[i : i + _n], sel[i : i + _n], w[i : i + _n], **kw)
+                    for i in range(0, rows, _n)
+                ]
+                return torch.cat(outs, dim=0)
+
+            mod.forward = sliced
+            n += 1
+    return n
+
+
+MOE_BLOCK_CLASSES = {
+    "Qwen3MoeSparseMoeBlock",
+    "Qwen3_5MoeSparseMoeBlock",
+    "Glm4MoeMoE",
+    "Glm4MoeLiteMoE",
+    "HunYuanMoEV1Moe",
+}
+
+
+def wrap_moe_block_seq_sliced(model, tokens_per_slice):
+    """Slice each whole MoE BLOCK over sequence tokens (batch==1 only).
+
+    The 122B hybrid OOMs on a 24 GiB fp32 [seq, hidden] buffer created
+    INSIDE the sparse block (router/shared-expert path) before the experts
+    call, so experts-level slicing cannot help. Every path in these blocks
+    is per-token, so slicing the block input over dim 1 is exact. The
+    experts pre-hook then fires once per slice — RouterCapture concatenates
+    slices in order (valid because batch==1 keeps row order = token order).
+    """
+    n = 0
+    for _, mod in model.named_modules():
+        if type(mod).__name__ in MOE_BLOCK_CLASSES:
+            orig = mod.forward
+
+            def sliced(hidden, *a, _orig=orig, _n=tokens_per_slice, **kw):
+                if hidden.dim() != 3 or hidden.shape[0] != 1 or hidden.shape[1] <= _n:
+                    return _orig(hidden, *a, **kw)
+                outs = [
+                    _orig(hidden[:, i : i + _n], *a, **kw)
+                    for i in range(0, hidden.shape[1], _n)
+                ]
+                return torch.cat(outs, dim=1)
+
+            mod.forward = sliced
+            n += 1
+    return n
 
 
 class RouterCapture:
@@ -338,13 +432,18 @@ class RouterCapture:
                 sel = a
                 break
         if sel is not None:
-            self.captured[self.layer_of[id(mod)]] = sel.detach().to(
-                "cpu", torch.int32
+            # MoE-block slicing (wrap_moe_block_seq_sliced) makes the experts
+            # module fire once per slice — collect and concat in order.
+            self.captured.setdefault(self.layer_of[id(mod)], []).append(
+                sel.detach().to("cpu", torch.int32)
             )
         return None
 
     def take(self):
-        out = dict(self.captured)
+        out = {
+            li: (parts[0] if len(parts) == 1 else torch.cat(parts, dim=0))
+            for li, parts in self.captured.items()
+        }
         self.captured = {}
         return out
 
@@ -365,6 +464,45 @@ def forward_backbone(backbone, model, input_ids):
     except TypeError:
         model(input_ids=input_ids, use_cache=False)
         return "full"
+
+
+def forward_backbone_chunked(backbone, model, input_ids, chunk):
+    """Chunked prefill with the model cache carrying cross-chunk state.
+
+    The 122B hybrid's per-layer live transients at 1M tokens (~100 GiB on
+    one shard GPU) don't fit any static split; prefilling in chunks caps
+    transients at chunk scale while the cache holds KV for the few
+    full-attention layers plus the tiny linear-attention recurrent state.
+    Causal identity: routing counts equal the single-shot forward.
+    RouterCapture concatenates the per-chunk experts fires in order
+    (batch==1 keeps row order == token order)."""
+    assert input_ids.shape[0] == 1, "chunked prefill requires batch==1"
+    tgt = backbone
+    try:
+        past = None
+        for i in range(0, input_ids.shape[1], chunk):
+            out = tgt(
+                input_ids=input_ids[:, i : i + chunk],
+                use_cache=True,
+                past_key_values=past,
+            )
+            past = getattr(out, "past_key_values", None)
+            if past is None and i + chunk < input_ids.shape[1]:
+                raise RuntimeError("backbone returned no cache — cannot chunk")
+        return f"backbone_chunked_{chunk}"
+    except TypeError:
+        past = None
+        for i in range(0, input_ids.shape[1], chunk):
+            out = model(
+                input_ids=input_ids[:, i : i + chunk],
+                use_cache=True,
+                past_key_values=past,
+                logits_to_keep=1,
+            )
+            past = getattr(out, "past_key_values", None)
+            if past is None and i + chunk < input_ids.shape[1]:
+                raise RuntimeError("model returned no cache — cannot chunk")
+        return f"model_chunked_{chunk}"
 
 
 # ---------------------------------------------------------------------------
@@ -391,19 +529,42 @@ def zipf_fit(counts_sorted_desc):
 
 
 def cell_metrics(sample_layer_counts, partition_a):
-    """sample_layer_counts: [S][L][E] torch int64. partition_a: expert ids on GPU0."""
+    """sample_layer_counts: [S][L][E] torch int64. partition_a: expert ids on
+    GPU0 — either one flat list (same split every layer) or a per-layer list
+    of lists (real EP places each layer's experts independently; the
+    build_placed_sets.py partitions are per-layer)."""
     import numpy as np
 
     arr = sample_layer_counts.numpy()  # S,L,E
     S, L, E = arr.shape
+    if partition_a and isinstance(partition_a[0], (list, tuple)):
+        if len(partition_a) != L:
+            raise ValueError(
+                f"per-layer partition has {len(partition_a)} layers, model captured {L}"
+            )
+        mask_a = np.zeros((L, E), dtype=bool)
+        for l, ids in enumerate(partition_a):
+            mask_a[l, list(ids)] = True
+        tot = arr.sum(-1)
+        tot_safe = np.maximum(tot, 1)
+        share_a = (arr * mask_a[None]).sum(-1) / tot_safe
+        return _metrics_from_shares(arr, share_a, tot_safe)
     mask_a = np.zeros(E, dtype=bool)
     mask_a[list(partition_a)] = True
     tot = arr.sum(-1)  # S,L
     tot_safe = np.maximum(tot, 1)
     share_a = arr[..., mask_a].sum(-1) / tot_safe
+    return _metrics_from_shares(arr, share_a, tot_safe)
+
+
+def _metrics_from_shares(arr, share_a, tot_safe):
+    import numpy as np
+
+    S = arr.shape[0]
     hot = np.maximum(share_a, 1.0 - share_a)  # S,L
     top_share = arr.max(-1) / tot_safe
     max_hot = hot.max(1)  # S
+    layer_avg = hot.mean(1)  # S — per-sample hot share averaged over ALL MoE layers
     med_layer_hot = np.median(hot, axis=0)  # L
     # Zipf on the per-sample layer with max hot share
     zs = []
@@ -414,6 +575,8 @@ def cell_metrics(sample_layer_counts, partition_a):
     return {
         "hot_share": hot,
         "max_hot_per_sample": max_hot,
+        "layer_avg_hot_per_sample": layer_avg,
+        "mean_layer_avg_hot": float(layer_avg.mean()),
         "median_max_hot": float(np.median(max_hot)),
         "p95_max_hot": float(np.percentile(max_hot, 95)),
         "mean_max_hot": float(max_hot.mean()),
@@ -428,15 +591,79 @@ def cell_metrics(sample_layer_counts, partition_a):
 # Main per-cell run
 # ---------------------------------------------------------------------------
 
-def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base, out_dir):
+def build_packs_from_file(pack_file, tokenizer, seq_len):
+    """Rebuild curated packs from a curate_packs.py JSON: exact doc lists,
+    refetched deterministically; short packs repeat their own docs to fill."""
+    spec = json.load(open(pack_file))
+    needed = {}  # ds -> set(doc_id)
+    for p in spec["packs"]:
+        for ds, did in p["docs"]:
+            needed.setdefault(ds, set()).add(str(did))
+    texts = {}  # (ds, did) -> text
+    for ds, want in needed.items():
+        got = 0
+        for did, txt in doc_iterator(ds, tokenizer):
+            if str(did) in want and (ds, str(did)) not in texts:
+                texts[(ds, str(did))] = txt
+                got += 1
+                if got == len(want):
+                    break
+        print(f"[pack-file] {ds}: found {got}/{len(want)} docs", flush=True)
+    eos = tokenizer.eos_token_id or 0
+    packs = []
+    for p in spec["packs"]:
+        cur = Pack()
+        doc_cycle = [(ds, str(did)) for ds, did in p["docs"] if (ds, str(did)) in texts]
+        ci = 0
+        while len(cur.tokens) < seq_len and doc_cycle:
+            ds, did = doc_cycle[ci % len(doc_cycle)]
+            ids = tokenizer.encode(texts[(ds, did)], add_special_tokens=False)
+            ids.append(eos)
+            room = seq_len - len(cur.tokens)
+            take = min(room, len(ids))
+            start = len(cur.tokens)
+            cur.tokens.extend(ids[:take])
+            cur.spans.append((f"{ds}:{did}", start, start + take, take < len(ids)))
+            ci += 1
+        if len(cur.tokens) == seq_len:
+            packs.append(cur)
+        else:
+            print(f"[pack-file] WARNING: pack underfilled ({len(cur.tokens)}) — skipped", flush=True)
+    return packs, sum(len(v) for v in needed.values()), spec
+
+
+def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base, out_dir,
+             packs_override=None):
     import numpy as np
 
     t0 = time.time()
-    packs, n_docs_scanned = build_packs(
-        ds_key, tokenizer, args.seq_len, args.num_samples
-    )
+    if packs_override is not None:
+        if isinstance(packs_override, tuple):
+            packs, n_docs_scanned = packs_override
+        else:  # bare pack list from build_packs_from_file
+            packs, n_docs_scanned = packs_override, len(packs_override)
+    else:
+        packs, n_docs_scanned = build_packs(
+            ds_key, tokenizer, args.seq_len, args.num_samples
+        )
     t_pack = time.time() - t0
     S, T, B = len(packs), args.seq_len, args.batch_size
+
+    # Window mode: forward each long pack as independent W-token windows and
+    # aggregate counts back per source pack. Routing then reflects W-token
+    # context (recorded in spec) — the bounded-memory proxy for models whose
+    # full-context transients fit no static split (122B hybrid at 1M).
+    win_of, n_src_packs = None, None
+    if getattr(args, "window_tokens", 0) and packs and len(packs[0].tokens) > args.window_tokens:
+        W = args.window_tokens
+        wpacks, win_of = [], []
+        for pi, p in enumerate(packs):
+            for i in range(0, len(p.tokens) - W + 1, W):
+                wpacks.append(Pack(tokens=p.tokens[i : i + W], spans=[]))
+                win_of.append(pi)
+        n_src_packs = len(packs)
+        packs = wpacks
+        S, T = len(packs), W
 
     dev = next(backbone.parameters()).device
     doc_counts = {}  # (doc_id) -> L,E accumulated over its spans
@@ -450,7 +677,12 @@ def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base
                 ids = torch.tensor(
                     [p.tokens for p in batch], dtype=torch.long, device=dev
                 )
-                state["fwd_path"] = forward_backbone(backbone, model, ids)
+                if args.prefill_chunk_tokens > 0 and ids.shape[0] == 1:
+                    state["fwd_path"] = forward_backbone_chunked(
+                        backbone, model, ids, args.prefill_chunk_tokens
+                    )
+                else:
+                    state["fwd_path"] = forward_backbone(backbone, model, ids)
                 got = cap.take()
                 if not got:
                     raise RuntimeError(
@@ -476,6 +708,7 @@ def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base
             tok_topk = _forward_all(B)
             break
         except torch.OutOfMemoryError:
+            cap.take()  # flush partial captures from the aborted batch
             torch.cuda.empty_cache()
             if B <= 1:
                 raise
@@ -512,9 +745,17 @@ def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base
             doc_meta.append(
                 {"doc": doc_id, "sample": s, "start": st, "end": en, "truncated": trunc}
             )
+    if win_of is not None:
+        agg = torch.zeros((n_src_packs, L, E), dtype=torch.int64)
+        for w, pi in enumerate(win_of):
+            agg[pi] += sample_counts[w]
+        sample_counts = agg
+        S = n_src_packs
     t_fwd = time.time() - t1
 
     partition_a = list(range(E // 2)) if args.partition == "contiguous" else json.load(open(args.partition))
+    if isinstance(partition_a, dict):
+        partition_a = partition_a["layers"]  # build_placed_sets.py per-layer format
     met = cell_metrics(sample_counts, partition_a)
 
     # token-level gzip for median + P95 samples (by max hot share)
@@ -522,24 +763,31 @@ def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base
     keep = {int(order[len(order) // 2]): "median", int(order[max(0, int(round(0.95 * (len(order) - 1))))]): "p95"}
     os.makedirs(out_dir, exist_ok=True)
     gz_paths = {}
-    for s, tag in keep.items():
-        gz = os.path.join(out_dir, f"route_skew_{model_key}_{ds_key}_topk_{tag}_s{s}.npz.gz")
-        with gzip.open(gz, "wb") as f:
-            torch.save(tok_topk[s].to(torch.int16), f)
-        gz_paths[tag] = os.path.basename(gz)
+    if win_of is None:  # window mode: tok_topk keys are windows, skip gz
+        for s, tag in keep.items():
+            gz = os.path.join(out_dir, f"route_skew_{model_key}_{ds_key}_topk_{tag}_s{s}.npz.gz")
+            with gzip.open(gz, "wb") as f:
+                torch.save(tok_topk[s].to(torch.int16), f)
+            gz_paths[tag] = os.path.basename(gz)
 
-    dom_mean = torch.stack(list(doc_counts.values())).to(torch.float64)
+    dom_mean = (
+        torch.stack(list(doc_counts.values())).to(torch.float64)
+        if doc_counts
+        else torch.zeros((L, E), dtype=torch.float64).unsqueeze(0)
+    )
     dom_mean = (dom_mean / dom_mean.sum(-1, keepdim=True).clamp(min=1)).mean(0)  # L,E
 
     out = {
         "spec": {
             **spec_base,
             "dataset_key": ds_key,
-            "dataset_id": DATASETS[ds_key][0],
-            "dataset_config": DATASETS[ds_key][1],
-            "dataset_split": DATASETS[ds_key][2],
-            "dataset_seed": DATASETS[ds_key][3],
+            "dataset_id": DATASETS.get(ds_key, (None,) * 5)[0],
+            "dataset_config": DATASETS.get(ds_key, (None,) * 5)[1],
+            "dataset_split": DATASETS.get(ds_key, (None,) * 5)[2],
+            "dataset_seed": DATASETS.get(ds_key, (None,) * 5)[3],
             "seq_len": T,
+            "window_tokens": getattr(args, "window_tokens", 0) or None,
+            "pack_tokens_total": args.seq_len if win_of is not None else None,
             "batch_size": B,
             "num_samples": S,
             "docs_scanned": n_docs_scanned,
@@ -552,6 +800,8 @@ def run_cell(model, backbone, cap, tokenizer, model_key, ds_key, args, spec_base
             "note_megamath": "MegaMath (IFM/MegaMath) substitutes LLEP's 'Megatron-Math' (not on HF)" if ds_key == "megamath" else None,
         },
         "summary": {
+            "mean_layer_avg_hot_gpu_share": met["mean_layer_avg_hot"],
+            "layer_avg_hot_per_sample": [round(float(x), 4) for x in met["layer_avg_hot_per_sample"]],
             "median_max_hot_gpu_share": met["median_max_hot"],
             "p95_max_hot_gpu_share": met["p95_max_hot"],
             "mean_max_hot_gpu_share": met["mean_max_hot"],
@@ -631,6 +881,36 @@ def main():
     ap.add_argument("--partition", default="contiguous")
     ap.add_argument("--out", default=None)
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--pack-file", default=None,
+                    help="curate_packs.py JSON: run its exact packs as one cell; "
+                    "--datasets then supplies the cell LABEL (e.g. curated_mathmix)")
+    ap.add_argument(
+        "--window-tokens", type=int, default=0,
+        help="verify long packs as independent W-token windows (counts "
+        "aggregated per source pack; routing context = W, recorded in spec); "
+        "bounded-memory proxy when full-context transients fit no split",
+    )
+    ap.add_argument(
+        "--max-packs", type=int, default=0,
+        help="pack-file mode: cap number of packs (0 = all)",
+    )
+    ap.add_argument(
+        "--prefill-chunk-tokens", type=int, default=0,
+        help="chunked prefill with cache (batch==1): caps per-layer live "
+        "transients at chunk scale — required for the 122B hybrid at 1M "
+        "whose deltanet live-set (~100 GiB/GPU) fits no static split; 0 = off",
+    )
+    ap.add_argument(
+        "--moe-block-tokens-per-slice", type=int, default=0,
+        help="slice whole MoE blocks over sequence tokens (batch==1 only; "
+        "exact; kills the fp32 [seq,hidden] router/shared transients that "
+        "OOM hybrids at 1M); takes precedence over --moe-rows-per-slice",
+    )
+    ap.add_argument(
+        "--moe-rows-per-slice", type=int, default=0,
+        help="slice experts-module calls over token rows (exact; caps the "
+        "fp32 [rows,hidden] transient that OOMs at 1M tokens); 0 = off",
+    )
     ap.add_argument(
         "--max-memory",
         default=None,
@@ -644,9 +924,12 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     ds_keys = [d.strip() for d in args.datasets.split(",") if d.strip()]
-    for d in ds_keys:
-        if d not in DATASETS:
-            sys.exit(f"unknown dataset key {d}")
+    if not args.pack_file:
+        for d in ds_keys:
+            if d not in DATASETS:
+                sys.exit(f"unknown dataset key {d}")
+    elif len(ds_keys) != 1:
+        sys.exit("--pack-file mode takes exactly one label in --datasets")
 
     # Skip cells already in the manifest (idempotent restart) before loading.
     mpath = os.path.join(out_dir, "manifest.json")
@@ -672,7 +955,10 @@ def main():
     t0 = time.time()
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(repo)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(repo, local_files_only=True)
+    except Exception:  # hub API 429s under concurrent unauthenticated runners
+        tokenizer = AutoTokenizer.from_pretrained(repo)
     max_memory = None
     if args.max_memory:
         max_memory = {
@@ -682,6 +968,12 @@ def main():
     model, load_path = load_model(repo, max_memory=max_memory)
     backbone, bb_path = resolve_backbone(model)
     cap = RouterCapture(model)
+    if args.moe_block_tokens_per_slice > 0:
+        nb = wrap_moe_block_seq_sliced(model, args.moe_block_tokens_per_slice)
+        print(f"[probe] MoE-block seq-slicing at {args.moe_block_tokens_per_slice} tokens on {nb} blocks", flush=True)
+    elif args.moe_rows_per_slice > 0:
+        nw = wrap_experts_row_sliced(model, args.moe_rows_per_slice)
+        print(f"[probe] experts row-slicing at {args.moe_rows_per_slice} rows on {nw} modules", flush=True)
     print(
         f"[probe] loaded in {time.time() - t0:.0f}s via {load_path}; backbone={bb_path}; "
         f"moe_layers={cap.n_moe_layers}",
@@ -711,8 +1003,25 @@ def main():
         cell = f"{args.model}|{d}"
         print(f"[cell] {cell} starting", flush=True)
         try:
+            packs_override = None
+            if args.pack_file:
+                res = build_packs_from_file(
+                    args.pack_file, tokenizer, args.seq_len
+                )
+                # co-edited helper has returned a list, a 2-tuple and a
+                # 3-tuple (packs, n_docs, spec) at different times — accept all
+                if isinstance(res, tuple):
+                    plist = res[0]
+                    n_found = res[1] if len(res) > 1 else len(res[0])
+                else:
+                    plist, n_found = res, len(res)
+                if args.max_packs > 0:
+                    plist = plist[: args.max_packs]
+                packs_override = (plist, n_found)
+                spec_base["pack_file"] = os.path.basename(args.pack_file)
             path, met, extra = run_cell(
-                model, backbone, cap, tokenizer, args.model, d, args, spec_base, out_dir
+                model, backbone, cap, tokenizer, args.model, d, args, spec_base, out_dir,
+                packs_override=packs_override,
             )
             update_manifest(
                 out_dir,
