@@ -282,3 +282,18 @@ chat template; capture = pre-hook on `experts` modules (actual selected indices)
   dominated by its fixed per-step weight-streaming floor at b1 token counts.
   Earlier 320-384k row confirmed: share ~2%, e2e +0.2-1.3%. fig13_data_128k.json
   banked; figure kept at anchor lengths (measured style, no est borders).
+- [08-14] c11 SHARE-VS-LENGTH SWEEP (Kevin: 48/64/80/100k, b1) — 12 real 2-step
+  anchor cells + walls at each true launch size (wallsS*_math_placed).
+  Expert-GEMM share of step / DSEP e2e gain (F=2, math domain):
+    qwen3-30b   : 48k 7.9%/3.6% · 64k 7.6%/3.7% · 80k 7.0%/3.6% · 100k 6.2%/3.3% · 128k 4.4%/2.4%
+    glm4.7-flash: 48k 3.5%/1.4% · 64k 2.9%/1.4% · 80k 2.5%/1.2% · 100k 2.1%/1.0% · 128k 1.7%/0.9%
+    qwen3.5-122b: 48k 0.7%/0.2% · 64k 0.9%/0.3% · 80k 1.0%/0.4% · 100k 1.1%/0.6% · 128k 1.4%/0.8%
+  READING: (1) 30b/flash shares RISE as seq shrinks (attention quadratic) but
+  plateau near 8%/3.5% — the asym per-step weight-streaming floor + attention
+  (crossover ~5-9k) cap it; (2) 122b is floor-FLAT: step ~250s from 48k to
+  128k (fixed ~230GB/step weight streaming; share INVERTS — shrinks at shorter
+  seq; tok/s 384@48k vs 964@128k — b1 short-seq is the wrong operating point
+  for it); (3) the "MoE ~40% of step" regime needs ~4-8k seq AND deep batch
+  (streaming amortized) — pretraining-shaped, outside this paper's long-ctx
+  b1 cells. DSEP e2e gain peaks ~3.6-3.7% at 30b 48-64k b1.
+  Data: fig13/share_vs_length.json; cells fs{48,64,80,100}{q30b,gflash,q122b}.
