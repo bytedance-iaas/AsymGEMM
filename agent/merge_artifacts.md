@@ -55,12 +55,17 @@ ONE shared live root + machine identity in the RUN TAG (the lib already
 stamps `-c17`; generalize to `-$(hostname -s)` — 1 line in
 tpfig_lib_c17.sh, readers unaffected since they glob the tag they created).
 
-## §4 TARGET LAYOUT
+## §4 TARGET LAYOUT (rev 2, Kevin 08-14: store named `asymlora`; the
+per-machine write-up dirs MOVE INSIDE it under docs/ — nothing floats at
+env/outputs/ top level anymore)
 ```
 /home/kevinni/env/outputs/
-  s04-p1-dgx-02-cNN/                  # existing per-machine doc dirs (unchanged)
-  asym_artifacts/
+  asymlora/
     INDEX.md                          # provenance + migration record
+    docs/                             # per-machine WRITE-UPS (moved from
+      s04-p1-dgx-02-c06/              #   env/outputs/<machine>; reports/
+      s04-p1-dgx-02-c12/              #   summaries/figures, not runs)
+      s04-p1-dgx-02-c14/
     history/                          # frozen post-migration (read-only by convention)
       sft38/profiling_results/...
       sft39/profiling_results/...
@@ -70,20 +75,23 @@ tpfig_lib_c17.sh, readers unaffected since they glob the tag they created).
     live/
       profiling_results/...           # single shared write root, all machines
 ```
-In repo 38 (three clean entries — history is ONE symlink to the whole
-central history/, so runs/history/<tree>/... mirrors the store 1:1):
+In repo 38 (three clean entries — history and docs are each ONE symlink to
+the central dir, mirroring the store 1:1):
 ```
-profiling_results -> ../../../env/outputs/asym_artifacts/live/profiling_results
+profiling_results -> ../../../env/outputs/asymlora/live/profiling_results
 runs/
-  live     -> ../../../../env/outputs/asym_artifacts/live
-  history  -> ../../../../env/outputs/asym_artifacts/history
-  docs/                               # per-machine WRITE-UPS (same dirs the
-    s04-p1-dgx-02-cNN -> ../../../../../env/outputs/s04-p1-dgx-02-cNN
-                                      # agent/impls/<machine> links point at —
-                                      # reports/system_summary/figures, not runs)
+  live     -> ../../../../env/outputs/asymlora/live
+  history  -> ../../../../env/outputs/asymlora/history
+  docs     -> ../../../../env/outputs/asymlora/docs
 ```
 Browse paths: runs/history/sft39/profiling_results/..., runs/live/...,
 runs/docs/s04-p1-dgx-02-c14/...
+Because the machine dirs move, the EXISTING agent/impls/<machine> links in
+ALL FOUR trees must be re-pointed at the new location (same relative
+depth): agent/impls/s04-p1-dgx-02-cNN ->
+../../../../../env/outputs/asymlora/docs/s04-p1-dgx-02-cNN.
+(agent/impls/throughput_prompt.md -> ../../../../../env/agent/... is
+untouched — it points at env/agent, not env/outputs.)
 
 RULE — RELATIVE LINKS ONLY, NEVER ABSOLUTE: /home/kevinni/... does not
 exist inside enroot (tree mounts at /workspace/...); an absolute link
@@ -93,24 +101,26 @@ agent/impls pattern. Up-count = link's own depth inside the tree + 3
 (AsymGEMM -> third_party -> <tree> -> common root).
 
 EXPLICIT SYMLINK TABLE (every link, exact target):
-# repo 38 (link depth 0 -> 3 ups; inside runs/ -> 4; inside runs/docs/ -> 5)
-profiling_results -> ../../../env/outputs/asym_artifacts/live/profiling_results
-runs/live         -> ../../../../env/outputs/asym_artifacts/live
-runs/history      -> ../../../../env/outputs/asym_artifacts/history
-runs/docs/s04-p1-dgx-02-c06 -> ../../../../../env/outputs/s04-p1-dgx-02-c06
-runs/docs/s04-p1-dgx-02-c12 -> ../../../../../env/outputs/s04-p1-dgx-02-c12
-runs/docs/s04-p1-dgx-02-c14 -> ../../../../../env/outputs/s04-p1-dgx-02-c14
+# repo 38 (link depth 0 -> 3 ups; inside runs/ -> 4; inside agent/impls/ -> 5)
+profiling_results -> ../../../env/outputs/asymlora/live/profiling_results
+runs/live         -> ../../../../env/outputs/asymlora/live
+runs/history      -> ../../../../env/outputs/asymlora/history
+runs/docs         -> ../../../../env/outputs/asymlora/docs
+# agent/impls machine links RE-POINTED in ALL FOUR trees (dirs moved into docs/)
+agent/impls/s04-p1-dgx-02-c06 -> ../../../../../env/outputs/asymlora/docs/s04-p1-dgx-02-c06
+agent/impls/s04-p1-dgx-02-c12 -> ../../../../../env/outputs/asymlora/docs/s04-p1-dgx-02-c12
+agent/impls/s04-p1-dgx-02-c14 -> ../../../../../env/outputs/asymlora/docs/s04-p1-dgx-02-c14
 # sibling symlink-backs (each old root, depth 0 -> 3 ups)
-39:  profiling_results -> ../../../env/outputs/asym_artifacts/history/sft39/profiling_results
-46:  profiling_results -> ../../../env/outputs/asym_artifacts/history/sft46/profiling_results
-46:  profiling         -> ../../../env/outputs/asym_artifacts/history/sft46/profiling
-46:  profiling_fixcpu  -> ../../../env/outputs/asym_artifacts/history/sft46/profiling_fixcpu
-46:  profiling_both_ceiling -> ../../../env/outputs/asym_artifacts/history/sft46/profiling_both_ceiling
-46:  profiling_both_ceiling_s04-p1-dgx-02-c18 -> ../../../env/outputs/asym_artifacts/history/sft46/profiling_both_ceiling_s04-p1-dgx-02-c18
-46:  profiling_source_ceiling_s04-p1-dgx-02-c18 -> ../../../env/outputs/asym_artifacts/history/sft46/profiling_source_ceiling_s04-p1-dgx-02-c18
-SFT: profiling_results -> ../../../env/outputs/asym_artifacts/history/sft/profiling_results
-SFT: outputs           -> ../../../env/outputs/asym_artifacts/history/sft/outputs
-SFT: results           -> ../../../env/outputs/asym_artifacts/history/sft/results
+39:  profiling_results -> ../../../env/outputs/asymlora/history/sft39/profiling_results
+46:  profiling_results -> ../../../env/outputs/asymlora/history/sft46/profiling_results
+46:  profiling         -> ../../../env/outputs/asymlora/history/sft46/profiling
+46:  profiling_fixcpu  -> ../../../env/outputs/asymlora/history/sft46/profiling_fixcpu
+46:  profiling_both_ceiling -> ../../../env/outputs/asymlora/history/sft46/profiling_both_ceiling
+46:  profiling_both_ceiling_s04-p1-dgx-02-c18 -> ../../../env/outputs/asymlora/history/sft46/profiling_both_ceiling_s04-p1-dgx-02-c18
+46:  profiling_source_ceiling_s04-p1-dgx-02-c18 -> ../../../env/outputs/asymlora/history/sft46/profiling_source_ceiling_s04-p1-dgx-02-c18
+SFT: profiling_results -> ../../../env/outputs/asymlora/history/sft/profiling_results
+SFT: outputs           -> ../../../env/outputs/asymlora/history/sft/outputs
+SFT: results           -> ../../../env/outputs/asymlora/history/sft/results
 38:  (own history browse only via runs/history/sft38 — live root replaces the old dir)
 
 Post-create verification: `readlink` each link must start with ../ (no
@@ -131,7 +141,10 @@ symlinks into history/), so any legacy script pointed at a sibling tree
 still works.
 
 ## §6 MIGRATION ORDER + LIVE-SESSION CAUTIONS
-1. Create env/outputs/asym_artifacts skeleton + INDEX.md.
+1. Create env/outputs/asymlora skeleton + INDEX.md; move the three
+   env/outputs/<machine> dirs into asymlora/docs/ and re-point the
+   agent/impls/<machine> links in ALL FOUR trees (leave a symlink-back at
+   env/outputs/<machine> too, in case anything else references it).
 2. Migrate 39 + 46 (idle) → history/, symlink-back in their trees.
 3. Migrate 38's 13G → history/sft38; create live/ + repo symlinks. Do this
    with no cell running (rename window is ms, but don't race a writer).
@@ -180,3 +193,8 @@ insufficient — skip until then.
   runs/history/<tree>/... mirrors the store 1:1.
 - [2026-08-14] Kevin: runs/machines/ renamed runs/docs/ — those dirs hold
   per-machine WRITE-UPS (reports/summaries/figures), not runs.
+- [2026-08-14] Kevin: store renamed asym_artifacts -> asymlora; the
+  env/outputs/<machine> write-up dirs move INSIDE it as asymlora/docs/
+  (nothing floats at env/outputs top level); runs/docs becomes ONE
+  symlink; agent/impls/<machine> links re-pointed in all four trees
+  (+ symlink-backs at the old env/outputs/<machine> paths).
