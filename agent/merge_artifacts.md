@@ -21,18 +21,20 @@ no test junk, no scratch. Everything below is the complete top-level
 census of all four trees; every entry is KEEP (migrate), DELETE, or
 EXCLUDED (rebuildable).
 
-KEEP — actual run results, ~285G total:
+KEEP — ~456G total (outputs/ + results/ REINSTATED per Kevin 08-14 second
+pass — "these are needed actually"; the earlier ckpt-deletion call is
+RESCINDED since the ckpts live inside outputs/ and deletion is
+irreversible — re-decide later if wanted, disk is the only cost):
 | tree | roots | size |
 |---|---|---|
 | 38  | profiling_results | 13G |
 | 39  | profiling_results | 94G |
 | 46  | profiling_results (21G) + profiling (144M) + profiling_fixcpu (2.8G) + profiling_both_ceiling (7.4G) + profiling_both_ceiling_s04-p1-dgx-02-c18 (27G) + profiling_source_ceiling_s04-p1-dgx-02-c18 (895M) — all campaign profiling outputs, same class as profiling_results | ~59G |
-| SFT | profiling_results | 119G |
+| SFT | profiling_results (119G) + outputs (171G, incl. July qwen35 ckpts) + results (3.4M) | ~290G |
 
-DELETE at migration time (Kevin 08-14 — not run results):
-- SFT `outputs/` (171G July qwen35 ckpt dirs + June diag scratch)
-- SFT `results/` (3.4M), `test_profiling_direct/` (4.4M),
-  `test_profiling/` (16K), `.figtmp/` (140K)
+DELETE at migration time (test/scratch junk only):
+- SFT `test_profiling_direct/` (4.4M), `test_profiling/` (16K),
+  `.figtmp/` (140K)
 - 39 `test_profiling_venv/` (12K)
 
 EXCLUDED — rebuildable, verified non-artifacts: `.venv*`/`.aioenv`/`build/`
@@ -64,7 +66,7 @@ tpfig_lib_c17.sh, readers unaffected since they glob the tag they created).
       sft39/profiling_results/...
       sft46/{profiling_results,profiling,profiling_fixcpu,
              profiling_both_ceiling*,profiling_source_ceiling*}/...
-      sft/profiling_results/...
+      sft/{profiling_results,outputs,results}/...
     live/
       profiling_results/...           # single shared write root, all machines
 ```
@@ -105,10 +107,10 @@ still works.
    (three registry growths observed 08-14). Symlink-back makes the move
    safe even mid-run, but prefer a quiet window. Re-run the LF
    dataset_info union sweep after it quiets (self-healing entries).
-   At this step execute the §2 DELETE list (SFT outputs/, results/,
-   test_profiling_direct/, test_profiling/, .figtmp/; 39
-   test_profiling_venv/) — authorized by Kevin 2026-08-14 ("actual run
-   results only"). Only SFT profiling_results/ migrates from this tree.
+   At this step: migrate SFT profiling_results/ + outputs/ + results/ to
+   history/sft/, and execute the §2 DELETE list (test/scratch junk only:
+   SFT test_profiling_direct/, test_profiling/, .figtmp/; 39
+   test_profiling_venv/) — Kevin 08-14.
 5. Generalize the lib tag `-c17` → `-$(hostname -s)`.
 6. Verify: one smoke cell writes through the new symlink; harvest globs
    still resolve; `runs/` browse links list all history.
@@ -121,9 +123,10 @@ insufficient — skip until then.
 
 ## §8 OPEN DECISIONS (Kevin)
 - [ ] Green-light Phase 1 (§4-§6)?
-- [x] Non-run-result dirs (SFT outputs/171G + results + test_* + .figtmp;
-      39 test_profiling_venv): DELETE (Kevin 08-14, "actual run results
-      only") — executed at the §6 step-4 SFT migration.
+- [x] SFT outputs/ + results/: KEEP (Kevin 08-14 second pass; earlier
+      ckpt-delete rescinded — re-decide later if wanted). Test/scratch
+      junk (SFT test_*/.figtmp, 39 test_profiling_venv): DELETE at §6
+      step 4.
 - [ ] Seed live/ fresh (recommended) or with 38's current 13G?
 - [ ] Freeze history/ read-only (chmod -w) after migration?
 
@@ -136,3 +139,7 @@ insufficient — skip until then.
   KEEP/DELETE/EXCLUDED census; SFT results/test_*/.figtmp + 39
   test_profiling_venv moved to DELETE alongside outputs/; migrate
   footprint ~285G (profiling* roots only).
+- [2026-08-14] Kevin reversal: SFT outputs/ + results/ ARE needed ->
+  reinstated to KEEP (migrate to history/sft/); ckpt-deletion rescinded
+  (irreversibility rule); DELETE list now test/scratch junk only;
+  migrate footprint back to ~456G.
