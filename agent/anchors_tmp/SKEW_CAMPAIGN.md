@@ -270,3 +270,15 @@ chat template; capture = pre-hook on `experts` modules (actual selected indices)
   BENCH BUGFIX: ep_balance_bench parent tag was clobbered to "nat" by the
   alphas loop -> concurrent parents collided on /dev/shm/asym_epbench_nat;
   loop var renamed (pid-unique shm restored).
+- [08-13] c11 128k b1 MoE-SHARE MEASUREMENT (Kevin's question "is expert time
+  really ~2% at long ctx"). Real 2-step 2-rank anchor cells run on this node
+  (asym_sdp2, b1, 128000): 30b T2 step 48.62s = 5265 tok/s · 122b T1 265.4s =
+  964 tok/s · flash T1 109.1s = 2347 tok/s. Walls re-measured at the b1 launch
+  scale (m=2.05M/2.05M/1.02M; walls128_*): mechanism savings 22-38% still
+  tracks (h-0.5)/h (compressed ~3pp by small-m launch floor). MEASURED expert-
+  GEMM share of step at 128k b1 (F=2): 30b 4.4% · flash 1.7% · 122b 1.4% ->
+  DSEP e2e worth +2.4% / +0.9% / +0.8% at 128k b1. Physics: attention is still
+  10-30x expert FLOPs at 128k (crossover ~5-9k tok), and 122b's step is
+  dominated by its fixed per-step weight-streaming floor at b1 token counts.
+  Earlier 320-384k row confirmed: share ~2%, e2e +0.2-1.3%. fig13_data_128k.json
+  banked; figure kept at anchor lengths (measured style, no est borders).
