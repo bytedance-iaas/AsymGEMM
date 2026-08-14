@@ -380,18 +380,26 @@ V5 Re-ladder + rebank ONLY models with measured wins (standing banking
   08-14). The PARALLEL GLM-FIRST instance (39-tree: V1 GLMs/V2 Mixtral/V3
   Hunyuan/V4 Qwen chains + full §8 ledger, 809 lines) is preserved verbatim
   at agent/impls/archive/fix_dynamic_ep_39tree.md. Source outcome:
-  - LIVE in this tree: the D0-revised X-only nvlink v1.5 (device X rings +
-    pinned x-scratch + targeted _pull_peer_rows; ep_sep.py/driver/probe as
-    ported 08-12 — the implementation the banked gptoss 2r ladder and the
-    active D2/V1dev cells run) + 46's frozen_linear §3.1a-c extraction with
-    pre-gate-first + 39's ORTHOGONAL bits grafted: count_skip diagnostics
-    (ep_sep.py + frozen_linear), ASYM_EP_SEP_ALLOW_DENSE, dispatch-site
-    gate-skip counters, ASYM_EP_SEP_SLOT_KMAX env (wide-hidden families),
-    lf.py rotary component + Hunyuan module-gate handling, csrc ep_steal
-    assert relaxations (dormant input-widening; enabler for the archived
-    flavor — _C rebuilt to match).
-  - ARCHIVED: the 39-instance FULL-nvlink flavor (device D rings, ownership
-    flip, lazy-open peer blobs, NO_SNAP) as
-    agent/impls/archive/sepplanlink2_39tree_full_nvlink.patch (applies onto
-    this tree's ep_sep.py/run_lf_profiled_train.py/ep_sep_probe.py; NOT
-    line-composable with the live X-only flavor — rival designs).
+  - LIVE in this tree (REVISED 08-14 after the flavor review): the
+    39-instance FULL-nvlink flavor (device X+D rings, ownership flip,
+    LAZY-OPEN peer blobs, NO_SNAP) — chosen after a critical read of both
+    ledgers: its 5-model c14 ladder passed §GOAL (hunyuan FULL unamended,
+    qwen wins), and the measured ceiling wins are STRUCTURAL (payload
+    rings out of the pinned fabric; the winning cells never armed), which
+    X-only cannot collect (pinned D rings + x-scratch + eager IPC). Flip
+    verified on THIS node (c17): PR5_PASS bitwise plan/host +
+    plan/nvlink (peer_opened_at_seq=1) + queue/nvlink. Plus 46's
+    frozen_linear §3.1a-c extraction with pre-gate-first and the
+    orthogonal grafts: count_skip diagnostics, ASYM_EP_SEP_ALLOW_DENSE,
+    dispatch-site gate-skip counters, ASYM_EP_SEP_SLOT_KMAX env, lf.py
+    rotary + Hunyuan module-gate handling, csrc ep_steal assert
+    relaxations (_C rebuilt).
+  - FALLBACK: the D0-revised X-only v1.5 (what the banked gptoss 2r
+    ladder and the 46-tree D2/V1dev cells ran) = reverse-apply
+    agent/impls/archive/sepplanlink2_39tree_full_nvlink.patch
+    (`git apply -R`; the patch documents exactly the flavor delta on
+    ep_sep.py/run_lf_profiled_train.py/ep_sep_probe.py).
+  - CAVEAT for banking: the c14 win margins (hunyuan +1.7% mean/+3.3%
+    best, q122 +3.7%, q35 +2.6%-vs-banked) still need the ledger's own
+    re-bank protocol (same-machine trios: c17 hunyuan 320k, c18
+    q122/q35) before entering figures.

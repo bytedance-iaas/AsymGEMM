@@ -814,6 +814,7 @@ V5 Re-ladder + rebank ONLY models with measured wins (standing banking
   agent/impls/fix_dynamic_ep.md. This instance's ORTHOGONAL source bits
   (count_skip, ALLOW_DENSE, gate-skip counters, SLOT_KMAX env, lf.py
   rotary/Hunyuan-gate, csrc assert relaxations) are LIVE in the merged
-  tree; its FULL-nvlink transport flavor (device D rings + lazy-open,
-  rival to the live X-only v1.5) is preserved as
+  tree — and as of 08-14 (flavor review) its FULL-nvlink transport is
+  the LIVE flavor too (PR5_PASS bitwise on c17, all three combos); the
+  X-only v1.5 fallback = reverse-apply
   agent/impls/archive/sepplanlink2_39tree_full_nvlink.patch.

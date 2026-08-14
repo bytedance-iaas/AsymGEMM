@@ -47,11 +47,9 @@ def child(args) -> int:
 
     rank = args.rank
     torch.manual_seed(7 + rank)
-    if args.transport == "nvlink":
-        dev = torch.device("cuda", rank)
-        torch.cuda.set_device(dev)
-    else:
-        dev = torch.device("cuda", 0)
+    nvlink = args.transport == "nvlink"
+    dev = torch.device("cuda", rank if nvlink else 0)
+    torch.cuda.set_device(dev)
 
     ctrl_ints = ep_sep.ctrl_ints_needed()
     ctrl_bytes = (ctrl_ints * 4 + 4095) // 4096 * 4096
@@ -67,47 +65,55 @@ def child(args) -> int:
     assert int(rc) == 0, f"cudaHostRegister rc={rc}"
 
     ctrl = base[:ctrl_ints * 4].view(torch.int32)
-    # D staging is CPU-pinned shm for BOTH transports (D0 verdict: the steal
-    # kernel + gather assert pinned d staging); nvlink moves only X.
     off = ctrl_bytes
-    x_shm, d_slots = [[], []], [[], []]
-    for r in range(2):
-        for i in range(ep_sep.RING):
-            x_shm[r].append(base[off:off + slot_bytes].view(torch.bfloat16))
-            off += slot_bytes
-    for r in range(2):
-        for i in range(ep_sep.RING):
-            d_slots[r].append(base[off:off + dslot_bytes].view(torch.bfloat16))
-            off += dslot_bytes
-    x_scratch = None
-    if args.transport == "nvlink":
-        # fix_dynamic_ep.md D0-revised: per-rank DEVICE X rings exchanged as
-        # CUDA IPC tensors + private pinned x-scratch for the kernel's
-        # CPU-pinned a_peer contract; ctrl + D stay pinned shm.
-        import pickle
-        from torch.multiprocessing.reductions import reduce_tensor
-
+    if not nvlink:
+        x_slots, d_slots = [[], []], [[], []]
+        for r in range(2):
+            for i in range(ep_sep.RING):
+                x_slots[r].append(base[off:off + slot_bytes].view(torch.bfloat16))
+                off += slot_bytes
+        for r in range(2):
+            for i in range(ep_sep.RING):
+                d_slots[r].append(base[off:off + dslot_bytes].view(torch.bfloat16))
+                off += dslot_bytes
+    else:
+        # fix_dynamic_ep.md D0: device rings, IPC-shared. My rings live on MY
+        # device; the peer's are rebuilt from its published CUDA IPC handles.
+        import base64, pickle
+        from torch.multiprocessing.reductions import rebuild_cuda_tensor
         mine_x = [torch.zeros(MAX_ROWS * K, dtype=torch.bfloat16, device=dev)
                   for _ in range(ep_sep.RING)]
-        payload = [reduce_tensor(t) for t in mine_x]
-        with open(shm(args.tag) + f".ipc{rank}.tmp", "wb") as fh:
-            pickle.dump(payload, fh)
-        os.replace(shm(args.tag) + f".ipc{rank}.tmp", shm(args.tag) + f".ipc{rank}")
+        mine_d = [torch.zeros(MAX_ROWS * N, dtype=torch.bfloat16, device=dev)
+                  for _ in range(ep_sep.RING)]
+        def _export(t):
+            stor = t.untyped_storage()
+            (sdev, handle, sbytes, soff, rc_handle, rc_off, ev_handle, ev_req) = stor._share_cuda_()
+            return dict(size=list(t.size()), stride=list(t.stride()), toff=t.storage_offset(),
+                        dtype="bfloat16", dev=int(sdev), handle=base64.b64encode(handle).decode(),
+                        sbytes=int(sbytes), soff=int(soff),
+                        rc_handle=base64.b64encode(rc_handle).decode(), rc_off=int(rc_off),
+                        ev_handle=base64.b64encode(ev_handle).decode(), ev_req=bool(ev_req))
+        def _import(dct):
+            return rebuild_cuda_tensor(
+                torch.Tensor, tuple(dct["size"]), tuple(dct["stride"]), int(dct["toff"]),
+                torch.UntypedStorage, torch.bfloat16, int(dct["dev"]),
+                base64.b64decode(dct["handle"]), int(dct["sbytes"]), int(dct["soff"]),
+                False, base64.b64decode(dct["rc_handle"]), int(dct["rc_off"]),
+                base64.b64decode(dct["ev_handle"]), bool(dct["ev_req"]))
+        json.dump({"x": [_export(t) for t in mine_x], "d": [_export(t) for t in mine_d]},
+                  open(shm(args.tag) + f".ipc{rank}.json", "w"))
         barrier(args.tag, "ipc", rank)
-        with open(shm(args.tag) + f".ipc{1 - rank}", "rb") as fh:
-            peer_payload = pickle.load(fh)
-        peer_x_rings = [fn(*a) for fn, a in peer_payload]
-        x_slots = [None, None]
-        x_slots[rank], x_slots[1 - rank] = mine_x, peer_x_rings
-        x_scratch = [torch.zeros(MAX_ROWS * K, dtype=torch.bfloat16, pin_memory=True)
-                     for _ in range(ep_sep.RING)]
-        x_scratch[0][:1].copy_(peer_x_rings[0][:1])  # warm the P2P mapping
-        torch.cuda.synchronize()
-    else:
-        x_slots = x_shm
-    st = ep_sep.install_buffers(rank=rank, world=2, ctrl=ctrl, x_slots=x_slots,
-                                d_slots=d_slots, transport=args.transport,
-                                x_scratch=x_scratch)
+        peer_blob = json.load(open(shm(args.tag) + f".ipc{1 - rank}.json"))
+        peer_x_rings = [_import(d_) for d_ in peer_blob["x"]]
+        peer_d_rings = [_import(d_) for d_ in peer_blob["d"]]
+        # warm the P2P mapping (first-touch cost) before timed cases
+        peer_x_rings[0][:1024].float().sum().item()
+        x_slots = [None, None]; d_slots = [None, None]
+        x_slots[rank], d_slots[rank] = mine_x, mine_d
+        x_slots[1 - rank], d_slots[1 - rank] = peer_x_rings, peer_d_rings
+    st = ep_sep.install_buffers(rank=rank, world=2, ctrl=ctrl,
+                                x_slots=x_slots, d_slots=d_slots,
+                                transport=args.transport)
 
     gen = torch.Generator(device="cpu").manual_seed(1234)
     b_bank = (torch.randn(E, N, K, generator=gen, dtype=torch.bfloat16) * 0.02).pin_memory()
@@ -170,7 +176,7 @@ def child(args) -> int:
                 in_seg = sorted(set(int(r) % max(per, 1) for r in bad[:200]))[:16]
                 # split the world: is the PEER'S STAGE correct for the bad rows?
                 ring_used = (st.seq - 1) % 4
-                stage = st._d_ring_for_gather(ring_used)[: m * N].view(m, N)
+                stage = st.d_slots[1 - rank][ring_used][: m * N].view(m, N)
                 stage_rows = stage[bad.cpu()].cuda()
                 stage_match_ref = float((stage_rows == d_ref[bad]).float().mean())
                 stage_match_armed = float((stage_rows == d_armed[bad]).float().mean())
@@ -206,25 +212,23 @@ def parent(args) -> int:
     fd = os.open(shm(tag), os.O_CREAT | os.O_RDWR | os.O_EXCL, 0o600)
     os.ftruncate(fd, total)
     os.close(fd)
-    print(f"[parent] shm {total/1e9:.1f} GB, mode={args.mode}, spawning on GPUs {args.gpus}")
+    print(f"[parent] shm {total/1e9:.1f} GB, mode={args.mode}, transport={args.transport}, spawning on GPUs {args.gpus}")
     procs = []
     for rank in range(2):
         env = dict(os.environ)
-        # nvlink: BOTH children see BOTH GPUs (identical enumeration) — CUDA
-        # IPC rebuild maps the peer tensor by device index, so the peer's
-        # device must exist in this process. host: one GPU each (unchanged).
-        env["CUDA_VISIBLE_DEVICES"] = args.gpus if args.transport == "nvlink" \
-            else args.gpus.split(",")[rank]
+        # nvlink transport needs BOTH devices visible (peer IPC open); each
+        # child then binds cuda:<rank>. Host transport keeps 1-device isolation.
+        env["CUDA_VISIBLE_DEVICES"] = args.gpus if args.transport == "nvlink" else args.gpus.split(",")[rank]
         env["ASYM_EP_SEP"] = "1"
         env["ASYM_EP_SEP_MODE"] = args.mode
         env["ASYM_EP_SEP_TRANSPORT"] = args.transport
-        # pin the arming ceiling so the case calibration (decline at 4608
-        # rows/seg) is deterministic across transports
-        env.setdefault("ASYM_EP_SEP_MAX_MPE", "4096")
+        # probe tests PROTOCOL, not economics: pin the decline threshold so the
+        # 'decline' case behaves identically on every transport.
+        env["ASYM_EP_SEP_MAX_MPE"] = "4096"
         procs.append(subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), "--role", "child",
-             "--rank", str(rank), "--tag", tag, "--transport", args.transport],
-            env=env, cwd=REPO))
+             "--rank", str(rank), "--tag", tag,
+             "--transport", args.transport], env=env, cwd=REPO))
     rcs = [p.wait() for p in procs]
     ok = all(rc == 0 for rc in rcs)
     verdict = {}
@@ -232,7 +236,7 @@ def parent(args) -> int:
         for r in range(2):
             verdict[f"rank{r}"] = json.load(open(shm(tag) + f".res{r}.json"))
         allbit = all(v["bitwise"] for r in verdict.values() for k, v in r.items() if k != "stats")
-        print(f"PR5_{'PASS' if (ok and allbit) else 'FAIL'} mode={args.mode} bitwise={allbit}")
+        print(f"PR5_{'PASS' if (ok and allbit) else 'FAIL'} mode={args.mode} transport={args.transport} bitwise={allbit}")
     finally:
         for f in os.listdir("/dev/shm"):
             if f.startswith(os.path.basename(shm(tag))):

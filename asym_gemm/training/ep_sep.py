@@ -46,19 +46,24 @@ import time
 import torch
 
 _ENABLED = os.environ.get("ASYM_EP_SEP") == "1"
-_MAX_MPE = int(os.environ.get("ASYM_EP_SEP_MAX_MPE", "4096") or 4096)
-# fix_dynamic_ep.md (sepplanlink2): per-transport arming ceilings. "host" =
-# the measured streaming-bound default (unchanged). "nvlink" = 4096 BANKED
-# from the D1 crossover (hunyuan 2r 64k b2, 2026-08-11): balanced-shard
-# cells decline everything at 4096 and sit at sdp2-parity (2748 vs 2754
-# tok/s, zero un-armed overhead); forcing arming (16k/64k MPE) fires
-# 1194-2068 armed launches and LOSES ~10% (2476-2487) — stealing pays only
-# under real imbalance, so the gate stays conservative (env always wins).
+_TRANSPORT = os.environ.get("ASYM_EP_SEP_TRANSPORT", "host") or "host"
+if _TRANSPORT not in ("host", "nvlink"):
+    raise RuntimeError(f"ASYM_EP_SEP_TRANSPORT must be 'host' or 'nvlink', got '{_TRANSPORT}'")
+# Break-even (rows/segment): D1 measured (fix_dynamic_ep.md, flash 64k b2 T2,
+# 2026-08-10) — fat whole-layer launches NEVER pay on tiny-bank models even
+# over NVLink (armed = -2% vs floor at every skew, snap AND no-snap: rows are
+# always DP-equal so there is no row imbalance to fix, and 0.14GB/layer banks
+# leave bank-once nothing to save). nvlink default therefore matches host:
+# arm only thin-segment regimes (compute-balance, qwen-class). Wide-bank
+# models (Air 4.4GB/layer, Mixtral 2.8GB) test bank-once per-cell via
+# ASYM_EP_SEP_MAX_MPE + ASYM_EP_SEP_NO_SNAP overrides in V1/V2.
 _MAX_MPE_DEFAULTS = {"host": 4096, "nvlink": 4096}
+_MAX_MPE = int(os.environ.get("ASYM_EP_SEP_MAX_MPE", "") or _MAX_MPE_DEFAULTS[_TRANSPORT])
 _SPIN_TIMEOUT_S = float(os.environ.get("ASYM_EP_SEP_SPIN_TIMEOUT_S", "120") or 120)
 # NAMING EPOCH 2026-07-10 (fix_gb200_ep_v2): backend asym_sepqueue2 -> mode "queue"
 # (counter-raced steal — the original S6 flavor); asym_sepplan2 -> mode "plan"
 # (same union/transport, the cut COMPUTED from counts; no racing).
+_NO_SNAP = os.environ.get("ASYM_EP_SEP_NO_SNAP", "") in ("1", "true")
 _MODE = os.environ.get("ASYM_EP_SEP_MODE", "plan") or "plan"
 if _ENABLED and _MODE not in ("queue", "plan"):
     raise RuntimeError(f"ASYM_EP_SEP_MODE must be 'queue' or 'plan', got '{_MODE}'")
@@ -79,20 +84,18 @@ class _SepState:
     def __init__(self, *, rank: int, world: int, ctrl: torch.Tensor,
                  x_slots: list[list[torch.Tensor]], d_slots: list[list[torch.Tensor]],
                  side_stream: torch.cuda.Stream | None = None,
-                 transport: str = "host",
-                 x_scratch: list[torch.Tensor] | None = None) -> None:
+                 transport: str = "host", peer_blobs: dict | None = None) -> None:
         assert world == 2, "S6 true-sEP v1 is EP=2 only"
         assert ctrl.is_pinned() and ctrl.dtype == torch.int32
         assert transport in ("host", "nvlink"), transport
         if transport == "nvlink":
-            assert x_scratch is not None and len(x_scratch) == RING
-            assert all(t.device.type == "cpu" and t.is_pinned() for t in x_scratch)
-        self.x_scratch = x_scratch
-        self.rank, self.world = rank, world
+            # payload rings live in DEVICE memory; with lazy-open the peer's
+            # entries stay unopened blobs until the first armed launch, so only
+            # the OWN rank's rings are asserted here. ctrl stays host-pinned.
+            for t in x_slots[rank] + d_slots[rank]:
+                assert t.is_cuda, "nvlink transport requires device-resident rings"
         self.transport = transport
-        # per-transport arming ceiling (env override always wins)
-        env_mpe = os.environ.get("ASYM_EP_SEP_MAX_MPE", "").strip()
-        self.max_mpe = int(env_mpe) if env_mpe else _MAX_MPE_DEFAULTS[transport]
+        self.rank, self.world = rank, world
         self.ctrl = ctrl
         # ctrl layout (int32 indices):
         #   [0,               2*FLAG_SLOTS)                       hdr flags   [rank][slot]
@@ -105,8 +108,14 @@ class _SepState:
         self._done_flag_base = 2 * FLAG_SLOTS
         self._ctr_base = 4 * FLAG_SLOTS
         self._hdr_base = self._ctr_base + RING * 8
-        self.x_slots = x_slots  # x_slots[rank][ring] flat pinned bf16
-        self.d_slots = d_slots  # d_slots[rank][ring] flat pinned bf16 (my staging OF PEER rows)
+        self.x_slots = x_slots  # x_slots[rank][ring] flat bf16 (rank's OWN A staging)
+        # d-ring OWNERSHIP differs by transport (fix_dynamic_ep.md §3.2b):
+        #   host:   d_slots[me] = MY pinned staging where I write PEER rows;
+        #           the gather reads d_slots[peer] (peer wrote MY rows there).
+        #   nvlink: d_slots[r] lives ON rank r's GPU and is where THE PEER
+        #           remote-writes rank r's stolen rows; the kernel writes
+        #           d_slots[peer] (remote), the gather reads d_slots[me] (local).
+        self.d_slots = d_slots
         self.seq = 0
         self.mode = _MODE
         if self.mode == "plan":
@@ -119,7 +128,43 @@ class _SepState:
                 print(f"[ep_sep] plan mode forces DG_EP_QUEUE_GRID_PCT=100 (was {prior})")
             os.environ["DG_EP_QUEUE_GRID_PCT"] = "100"
         self.side_stream = side_stream or torch.cuda.Stream()
+        # nvlink transport (fix_dynamic_ep.md D0b receipt 2026-08-10): the
+        # ep_steal TMA path is bitwise-correct on LOCAL device operands but
+        # faults on legacy-IPC REMOTE mappings — so the kernel always gets
+        # local tensors, and the cross-GPU legs ride the copy engines
+        # (NVLink, 718 GB/s measured): peer-X -> local scratch before the
+        # launch; local d-scratch -> owner's ring before the done flag.
+        self._x_scratch: torch.Tensor | None = None
+        self._d_scratch: torch.Tensor | None = None
+        # LAZY-OPEN (fix_dynamic_ep.md 2026-08-12): merely OPENING the peer's
+        # IPC handles + the warm-touch at install measurably slows host<->device
+        # streaming for the whole run (mixtral 288k ceiling: -4% with the hook
+        # never arming). Install stores the peer's serialized handles only; the
+        # open + scratch alloc happen at the FIRST launch where BOTH ranks armed
+        # (launch-aligned, so the peers open in lockstep). Hook-dead cells never
+        # create a single peer mapping.
+        self._peer_blobs = peer_blobs
+        self._peer_open = transport != "nvlink"
         self.stats = {"armed": 0, "declined": 0, "spin_wait_s": 0.0}
+
+    def _ensure_peer_open(self) -> None:
+        """First-armed-launch open of the nvlink transport (both ranks reach
+        this together only when both published armed headers)."""
+        if self._peer_open:
+            return
+        peer = 1 - self.rank
+        if self._peer_blobs is not None:
+            self.x_slots[peer] = [_import_cuda_blob(d_) for d_ in self._peer_blobs["x"]]
+            self.d_slots[peer] = [_import_cuda_blob(d_) for d_ in self._peer_blobs["d"]]
+            self._peer_blobs = None
+        self.x_slots[peer][0][:1024].float().sum().item()  # warm the P2P mapping
+        slot_x = self.x_slots[self.rank][0].numel()
+        slot_d = self.d_slots[self.rank][0].numel()
+        dev = self.x_slots[self.rank][0].device
+        self._x_scratch = torch.zeros(slot_x, dtype=torch.bfloat16, device=dev)
+        self._d_scratch = torch.zeros(slot_d, dtype=torch.bfloat16, device=dev)
+        self._peer_open = True
+        self.stats["peer_opened_at_seq"] = self.seq
 
     # ---- ctrl accessors -------------------------------------------------------
     def _hdr_flag_idx(self, rank: int, seq: int) -> int:
@@ -138,38 +183,16 @@ class _SepState:
         lo = self._hdr_base + (rank * RING + (seq % RING)) * _HDR_INTS
         return self.ctrl[lo:lo + _HDR_INTS]
 
-    # ---- transport ring selection (fix_dynamic_ep.md §3.2b, D0-revised) -------
-    # D0 verdict (2026-08-10): the steal kernel asserts a_peer/d_peer CPU-pinned
-    # and the gather asserts pinned staging — the D path therefore stays on the
-    # HOST convention for BOTH transports (d_slots[me] = my pinned staging where
-    # I write PEER rows; gather reads d_slots[peer]). nvlink v1 moves only the
-    # X path to NVLink: device x-rings + a private pinned x-scratch the stealer
-    # fills by peer-pull before the kernel. (A future v2 that lifts the kernel
-    # asserts would flip these helpers to the device-D convention.)
+    # ---- transport-aware d-ring selection (see ownership note in __init__) ----
     def _d_ring_for_kernel(self, ring: int) -> torch.Tensor:
-        return self.d_slots[self.rank][ring]
+        """The ring the ep_steal kernel writes PEER rows into."""
+        owner = (1 - self.rank) if self.transport == "nvlink" else self.rank
+        return self.d_slots[owner][ring]
 
     def _d_ring_for_gather(self, ring: int) -> torch.Tensor:
-        return self.d_slots[1 - self.rank][ring]
-
-    def _pull_peer_rows(self, segs) -> None:
-        """nvlink: copy ONLY the given (expert, lo, hi) peer-coordinate row
-        ranges from the peer's device X ring into my pinned scratch, fenced
-        on the SOURCE device's stream (cross-device D2H is enqueued there)."""
-        pending = getattr(self, "_pending_pull", None)
-        if pending is None:
-            return
-        src_view, dst_view, _k = pending
-        if not segs:
-            self._pending_pull = None
-            return
-        with torch.cuda.device(src_view.device):
-            for _e, lo, hi in segs:
-                dst_view[lo:hi].copy_(src_view[lo:hi], non_blocking=True)
-            ev = torch.cuda.Event()
-            ev.record(torch.cuda.current_stream())
-        ev.synchronize()
-        self._pending_pull = None
+        """The ring spin_gather reads MY stolen rows back from."""
+        owner = self.rank if self.transport == "nvlink" else (1 - self.rank)
+        return self.d_slots[owner][ring]
 
     # ---- the armed launch -----------------------------------------------------
     def count_skip(self, reason: str) -> None:
@@ -189,7 +212,7 @@ class _SepState:
         x_slot = self.x_slots[self.rank][self.seq % RING]
         decline = (
             n_segs == 0 or n_segs > MAX_SEGS or m == 0
-            or m / max(1, n_segs) > self.max_mpe
+            or m / max(1, n_segs) > _MAX_MPE
             or m * k > x_slot.numel()
         )
         if not decline:
@@ -219,8 +242,10 @@ class _SepState:
         ring = seq % RING
         me, peer = self.rank, 1 - self.rank
         x_slot = self.x_slots[me][ring]
-        d_stage_mine = self._d_ring_for_kernel(ring)  # where I write PEER rows
-        # (host: my pinned staging; nvlink: the peer's HBM ring via IPC view)
+        # NOTE: the kernel-side d ring is looked up LAZILY in the branches below —
+        # under nvlink it lives in the PEER's slot list, which stays empty until
+        # _ensure_peer_open() (first armed launch); an eager lookup here was the
+        # h_splt2b IndexError.
 
         # far-ahead flag hygiene (host writes; slots FLAG_SLOTS/2 ahead are idle)
         ahead = seq + FLAG_SLOTS // 2
@@ -229,7 +254,7 @@ class _SepState:
 
         decline = (
             n_segs == 0 or n_segs > MAX_SEGS or m == 0
-            or m / max(1, n_segs) > self.max_mpe      # sdp-floor: compute-bound
+            or m / max(1, n_segs) > _MAX_MPE          # sdp-floor: compute-bound
             or m * k > x_slot.numel()
         )
         if decline:
@@ -293,23 +318,16 @@ class _SepState:
                            device=a.device)
 
         if self.transport == "nvlink":
-            # nvlink X path v1.5 (micro-A/B receipt: the v1 whole-slice sync
-            # pull LOST to host staging by 46% at skew — 1.8 GB serial copy
-            # of 100% of peer X when the stolen sublist needs ~17%): expose
-            # views now, DEFER the pull — _pull_peer_rows() copies ONLY the
-            # requested segment ranges, enqueued non_blocking on the SOURCE
-            # device's stream (the correct fence; a my-side-stream event
-            # does not cover cross-device D2H — probe receipt: 56%-zero
-            # stolen rows) and event-synced before the kernel launch.
-            scratch = self.x_scratch[ring]
-            assert m_peer * k <= scratch.numel(), (m_peer, k, scratch.numel())
-            peer_ring_view = self.x_slots[peer][ring][: m_peer * k].view(m_peer, k)
-            peer_x = scratch[: m_peer * k].view(m_peer, k)
-            self._pending_pull = (peer_ring_view, peer_x, k)
+            self._ensure_peer_open()  # first armed launch only; lockstep on both ranks
+            # pull the peer's staged X across NVLink into LOCAL scratch (the
+            # hdr flag we just spun on guarantees the source is complete).
+            peer_x = self._x_scratch[: m_peer * k].view(m_peer, k)
+            peer_x.copy_(self.x_slots[peer][ring][: m_peer * k].view(m_peer, k),
+                         non_blocking=True)
+            d_peer = self._d_scratch[: m_peer * n].view(m_peer, n)
         else:
             peer_x = self.x_slots[peer][ring][: m_peer * k].view(m_peer, k)
-            self._pending_pull = None
-        d_peer = d_stage_mine[: m_peer * n].view(m_peer, n)
+            d_peer = self._d_ring_for_kernel(ring)[: m_peer * n].view(m_peer, n)
 
         if self.mode == "plan":
             # PLAN flavor (asym_sepplan2): identical union + transport, but the cut
@@ -336,18 +354,17 @@ class _SepState:
             # to n_own makes the launch fully local (gather early-exits, zero
             # coupling), exactly like an un-stolen queue launch.
             own_rows = sum(rows[:n_own])
-            if abs(own_rows - half) <= self.max_mpe:
+            # ASYM_EP_SEP_NO_SNAP=1 (fix_dynamic_ep.md D1b): keep the TRUE
+            # row-balanced cut even when it lands near n_own. Under equal-DP
+            # shards own_rows==half ALWAYS (m is tokens*topk, identical per
+            # rank), so the snap otherwise makes every launch fully local and
+            # bank-once consolidation NEVER fires — on streaming-bound
+            # fat-expert models the banks-split-once effect IS the win, and
+            # nvlink transport makes the cross-coupling it costs cheap.
+            if not _NO_SNAP and abs(own_rows - half) <= _MAX_MPE:
                 k_seg = n_own
             if 0 < k_seg < total:
                 lo_seg, hi_seg = (0, k_seg) if me == 0 else (k_seg, total)
-                if self.transport == "nvlink":
-                    # peer-owned segments inside MY sublist = the stolen set;
-                    # union layout: [rank0 segs (n_own) | rank1 segs]
-                    if me == 0:
-                        stolen = [union[i] for i in range(lo_seg, hi_seg) if i >= n_own]
-                    else:
-                        stolen = [union[i] for i in range(lo_seg, hi_seg) if i < n_own]
-                    self._pull_peer_rows(stolen)
                 sub_pairs = pairs[2 * lo_seg: 2 * hi_seg]
                 sub_ids = torch.cat([ids[lo_seg:hi_seg], ids[total:total + 1]])
                 sub_n_own = max(0, min(n_own, hi_seg) - lo_seg)
@@ -360,6 +377,10 @@ class _SepState:
                 done_ev = torch.cuda.Event()
                 done_ev.record()
                 done_ev.synchronize()
+                if self.transport == "nvlink":
+                    self._d_ring_for_kernel(ring)[: m_peer * n].view(m_peer, n).copy_(
+                        d_peer, non_blocking=True)
+                    torch.cuda.current_stream().synchronize()
                 self.ctrl[self._done_flag_idx(me, seq)] = 1
                 # fabricate the meet point on MY private block (host write happens
                 # before the gather kernel launch => visible to its sysmem reads)
@@ -375,11 +396,6 @@ class _SepState:
             # degenerate cut (one side would idle) => fall through to the queue race
             # (both ranks compute the same k_seg, so the branch stays symmetric)
 
-        if self.transport == "nvlink":
-            # queue race / degenerate cut: the stolen set is dynamic — pull
-            # the peer's full slice (v1 behavior) so any raced item is valid.
-            peer_all = [(0, 0, int(self._header(peer, seq)[0]))]
-            self._pull_peer_rows(peer_all)
         n_blk = asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous_ep_steal(
             a, b, d, peer_x, d_peer, pairs, ids, total + 1,
             self._counters(seq), me, n_own, compiled_dims, transpose_b)
@@ -391,6 +407,10 @@ class _SepState:
         done_ev = torch.cuda.Event()
         done_ev.record()
         done_ev.synchronize()
+        if self.transport == "nvlink":
+            self._d_ring_for_kernel(ring)[: m_peer * n].view(m_peer, n).copy_(
+                d_peer, non_blocking=True)
+            torch.cuda.current_stream().synchronize()
         self.ctrl[self._done_flag_idx(me, seq)] = 1
         _C.ep_steal_spin_gather(
             d, self._d_ring_for_gather(ring)[: m * n].view(m, n), pairs,
@@ -400,6 +420,22 @@ class _SepState:
         return True
 
 
+def _import_cuda_blob(dct: dict) -> torch.Tensor:
+    """Rebuild a peer's exported CUDA-IPC tensor (serialized by the installer).
+    This is the call that actually opens the IPC mapping — deferred to the
+    first armed launch on purpose (see _ensure_peer_open)."""
+    import base64
+    from torch.multiprocessing.reductions import rebuild_cuda_tensor
+
+    return rebuild_cuda_tensor(
+        torch.Tensor, tuple(dct["size"]), tuple(dct["stride"]),
+        int(dct["toff"]), torch.UntypedStorage, torch.bfloat16,
+        int(dct["dev"]), base64.b64decode(dct["handle"]),
+        int(dct["sbytes"]), int(dct["soff"]), False,
+        base64.b64decode(dct["rc_h"]), int(dct["rc_off"]),
+        base64.b64decode(dct["ev_h"]), bool(dct["ev_req"]))
+
+
 _STATE: _SepState | None = None
 
 
@@ -407,17 +443,16 @@ def install_buffers(*, rank: int, world: int, ctrl: torch.Tensor,
                     x_slots: list[list[torch.Tensor]],
                     d_slots: list[list[torch.Tensor]],
                     transport: str = "host",
-                    x_scratch: list[torch.Tensor] | None = None) -> _SepState:
+                    peer_blobs: dict | None = None) -> _SepState:
     global _STATE
-    _STATE = _SepState(rank=rank, world=world, ctrl=ctrl, x_slots=x_slots,
-                       d_slots=d_slots, transport=transport, x_scratch=x_scratch)
+    _STATE = _SepState(rank=rank, world=world, ctrl=ctrl, x_slots=x_slots, d_slots=d_slots,
+                       transport=transport, peer_blobs=peer_blobs)
 
     import atexit
 
     def _dump_stats(st=_STATE):
         s = {k: (round(v, 4) if isinstance(v, float) else v) for k, v in st.stats.items()}
-        print(f"[ep_sep] rank{st.rank} mode={st.mode} transport={st.transport} "
-              f"max_mpe={st.max_mpe} exit stats: {s}", flush=True)
+        print(f"[ep_sep] rank{st.rank} mode={st.mode} transport={st.transport} exit stats: {s}", flush=True)
 
     atexit.register(_dump_stats)
     return _STATE

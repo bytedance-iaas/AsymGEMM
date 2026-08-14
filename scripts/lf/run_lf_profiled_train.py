@@ -1904,31 +1904,28 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
                     # (Air/Mixtral 4096) pre-decline every launch on m*k>slot
                     # without a bigger K budget (fix_dynamic_ep.md D0 notes).
                     sep_kmax = int(os.environ.get("ASYM_EP_SEP_SLOT_KMAX", "2048") or 2048)
-                    sep_transport = os.environ.get("ASYM_EP_SEP_TRANSPORT", "host").strip() or "host"
+                    sep_transport = os.environ.get("ASYM_EP_SEP_TRANSPORT", "host") or "host"
                     sep_ctrl = fabric.get_or_create(
                         "sep_ctrl", torch.zeros(ep_sep.ctrl_ints_needed(), dtype=torch.int32))
-                    # D path stays fabric-pinned for BOTH transports (D0 verdict:
-                    # steal kernel + gather assert CPU-pinned d staging). nvlink
-                    # moves only the X rings device-side (allocated post-seal).
-                    sep_ds = [[fabric.get_or_create(f"sep_d_{r}_{i}",
-                               torch.zeros(sep_rows * sep_kmax, dtype=torch.bfloat16))
-                               for i in range(ep_sep.RING)] for r in range(2)]
                     if sep_transport == "nvlink":
-                        # fix_dynamic_ep.md §3.3c (sepplanlink2, D0-revised): X
-                        # rings live in DEVICE memory, exchanged as CUDA-IPC
-                        # tensors post-seal; a private pinned x-scratch feeds the
-                        # kernel's CPU-pinned a_peer contract.
-                        sep_xs = None
-                        sep_all = [sep_ctrl] + [t for row_ in sep_ds for t in row_]
+                        # sepplanlink2 (fix_dynamic_ep.md §3.3c): payload rings in
+                        # DEVICE memory; only ctrl rides the fabric. Peer ring
+                        # views are exchanged ONCE via CUDA IPC handles over a
+                        # dist object collective (install-time setup only — the
+                        # steal path itself stays collective-free).
+                        self._asym_sep_pending = ("nvlink", sep_ctrl, sep_rows, sep_kmax)
                     else:
                         sep_xs = [[fabric.get_or_create(f"sep_x_{r}_{i}",
                                    torch.zeros(sep_rows * sep_kmax, dtype=torch.bfloat16))
                                    for i in range(ep_sep.RING)] for r in range(2)]
+                        sep_ds = [[fabric.get_or_create(f"sep_d_{r}_{i}",
+                                   torch.zeros(sep_rows * sep_kmax, dtype=torch.bfloat16))
+                                   for i in range(ep_sep.RING)] for r in range(2)]
                         sep_all = [sep_ctrl] + [t for row_ in (sep_xs + sep_ds) for t in row_]
-                    self._asym_sep_pending = (sep_ctrl, sep_xs, sep_ds, sep_rows) \
-                        if all(t is not None for t in sep_all) else None
-                    if self._asym_sep_pending is None:
-                        heartbeat.emit("ep_sep_install_FAILED", reason="fabric slots unavailable")
+                        self._asym_sep_pending = ("host", sep_ctrl, sep_xs, sep_ds, sep_rows) \
+                            if all(t is not None for t in sep_all) else None
+                        if self._asym_sep_pending is None:
+                            heartbeat.emit("ep_sep_install_FAILED", reason="fabric slots unavailable")
                 if fabric is not None:
                     fabric.seal()
                     heartbeat.emit("ep2_fabric_sealed", **fabric.stats())
@@ -1938,58 +1935,55 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
                     from asym_gemm.training import ep_sep as _ep_sep
                     import torch.distributed as dist
 
-                    sc, sx, sd, sr = self._asym_sep_pending
-                    _sep_transport = os.environ.get("ASYM_EP_SEP_TRANSPORT", "host").strip() or "host"
-                    if _sep_transport == "nvlink":
-                        # fix_dynamic_ep.md §3.3c: per-rank DEVICE rings, exchanged
-                        # as CUDA-IPC tensors so try_armed sees real peer tensors.
-                        # Handles travel as pickle files on /dev/shm (the same
-                        # shared medium as the fabric; guards clean asym_* between
-                        # cells). Post-exchange warm-up pays the P2P mapping cost.
-                        import pickle
-                        import time as _time
-                        from torch.multiprocessing.reductions import reduce_tensor
+                    pend = self._asym_sep_pending
+                    if pend[0] == "nvlink":
+                        import base64
+                        from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
-                        _rank = dist.get_rank()
-                        _dev = torch.cuda.current_device()
-                        _kmax = int(os.environ.get("ASYM_EP_SEP_SLOT_KMAX", "2048") or 2048)
-                        _mine_x = [torch.zeros(sr * _kmax, dtype=torch.bfloat16,
-                                               device=f"cuda:{_dev}")
-                                   for _ in range(_ep_sep.RING)]
-                        _payload = [reduce_tensor(t) for t in _mine_x]
-                        _my_f = f"/dev/shm/asym_sep_ipc_rank{_rank}.pkl"
-                        with open(_my_f + ".tmp", "wb") as _fh:
-                            pickle.dump(_payload, _fh)
-                        os.replace(_my_f + ".tmp", _my_f)
-                        _peer = 1 - _rank
-                        _peer_f = f"/dev/shm/asym_sep_ipc_rank{_peer}.pkl"
-                        _t0 = _time.perf_counter()
-                        while not os.path.exists(_peer_f):
-                            if _time.perf_counter() - _t0 > 120.0:
-                                raise RuntimeError("sep nvlink IPC exchange timeout")
-                            _time.sleep(0.05)
-                        _time.sleep(0.2)  # writer's rename is atomic; settle
-                        with open(_peer_f, "rb") as _fh:
-                            _peer_payload = pickle.load(_fh)
-                        _peer_x = [fn(*args) for fn, args in _peer_payload]
-                        sx = [None, None]
-                        sx[_rank], sx[_peer] = _mine_x, _peer_x
-                        # private pinned x-scratch: the kernel's CPU-pinned
-                        # a_peer lands here after the NVLink pull
-                        _x_scratch = [torch.zeros(sr * _kmax, dtype=torch.bfloat16,
-                                                  pin_memory=True)
-                                      for _ in range(_ep_sep.RING)]
-                        # warm-up handshake: one tiny peer read per direction
-                        _x_scratch[0][:1].copy_(_peer_x[0][:1])
-                        torch.cuda.synchronize()
+                        _, sc, sr, skm = pend
+                        rank = dist.get_rank()
+                        dev = torch.device("cuda", torch.cuda.current_device())
+                        mine_x = [torch.zeros(sr * skm, dtype=torch.bfloat16, device=dev)
+                                  for _ in range(_ep_sep.RING)]
+                        mine_d = [torch.zeros(sr * skm, dtype=torch.bfloat16, device=dev)
+                                  for _ in range(_ep_sep.RING)]
+
+                        def _export(t):
+                            (sdev, handle, sbytes, soff, rc_h, rc_off, ev_h, ev_req) = \
+                                t.untyped_storage()._share_cuda_()
+                            return dict(size=list(t.size()), stride=list(t.stride()),
+                                        toff=t.storage_offset(), dev=int(sdev),
+                                        handle=base64.b64encode(handle).decode(),
+                                        sbytes=int(sbytes), soff=int(soff),
+                                        rc_h=base64.b64encode(rc_h).decode(), rc_off=int(rc_off),
+                                        ev_h=base64.b64encode(ev_h).decode(), ev_req=bool(ev_req))
+
+                        # LAZY-OPEN (fix_dynamic_ep.md 2026-08-12): exchange handle
+                        # BYTES only. Opening the peer's IPC mappings at install
+                        # cost -4% ambient on streaming-bound ceilings with the
+                        # hook never arming; the state opens them at the first
+                        # armed launch instead (lockstep by launch alignment).
+                        blob = {"x": [_export(t) for t in mine_x],
+                                "d": [_export(t) for t in mine_d]}
+                        gathered: list = [None, None]
+                        dist.all_gather_object(gathered, blob)
+                        peer = 1 - rank
+                        sx = [None, None]; sd = [None, None]
+                        sx[rank], sd[rank] = mine_x, mine_d
+                        sx[peer], sd[peer] = [], []  # opened lazily from blobs
+                        _ep_sep.install_buffers(rank=rank, world=dist.get_world_size(),
+                                                ctrl=sc, x_slots=sx, d_slots=sd,
+                                                transport="nvlink",
+                                                peer_blobs=gathered[peer])
+                        heartbeat.emit("ep_sep_installed", transport="nvlink",
+                                       slot_rows=sr, slot_kmax=skm, ring=_ep_sep.RING,
+                                       lazy_open=True)
                     else:
-                        _x_scratch = None
-                    _ep_sep.install_buffers(rank=dist.get_rank(), world=dist.get_world_size(),
-                                            ctrl=sc, x_slots=sx, d_slots=sd,
-                                            transport=_sep_transport,
-                                            x_scratch=_x_scratch)
-                    heartbeat.emit("ep_sep_installed", slot_rows=sr, ring=_ep_sep.RING,
-                                   transport=_sep_transport)
+                        _, sc, sx, sd, sr = pend
+                        _ep_sep.install_buffers(rank=dist.get_rank(), world=dist.get_world_size(),
+                                                ctrl=sc, x_slots=sx, d_slots=sd)
+                        heartbeat.emit("ep_sep_installed", transport="host",
+                                       slot_rows=sr, ring=_ep_sep.RING)
                     self._asym_sep_pending = None
                 self._asym_fabric_sealed = True
             init_dump_path = os.environ.get("ASYM_DUMP_ADAPTER_INIT", "")
