@@ -203,3 +203,10 @@ insufficient — skip until then.
   (nothing floats at env/outputs top level); runs/docs becomes ONE
   symlink; agent/impls/<machine> links re-pointed in all four trees
   (+ symlink-backs at the old env/outputs/<machine> paths).
+- [2026-08-14] EXECUTED (Kevin go): all stages complete — asymlora store
+  created; docs/ move + impls re-point (4 trees); 39/46/38/SFT roots
+  migrated with symlink-backs; junk deleted (except uid-1158-owned
+  test_profiling_direct, immovable under NFS root-squash — documented in
+  INDEX.md); lib tag generalized -c17 -> -${ASYM_HOSTTAG:-hostname};
+  LF registry re-unioned (+4, 1370, pushed ff3bb5ec); readlink audit all
+  relative + in-container write-through/browse VERIFY-PASS.

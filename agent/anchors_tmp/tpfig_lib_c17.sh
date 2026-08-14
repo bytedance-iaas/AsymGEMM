@@ -38,10 +38,10 @@ run_cell() { local tag="$1" model="$2" systok="$3" seq="$4" blist="$5" policy="$
   for b in $blist; do
     guard || return 1
     echo "START $tag $model $systok s=$seq b=$b r=$ranks $(date +%H:%M)" >> "$S"
-    RUN_NAME="${tag}-c17_${model}" RUNS="${model}|${ranks} ; ${systok}|ligerloss1 ; ${seq}|${b}|1 ; ${policy}" \
+    RUN_NAME="${tag}-${ASYM_HOSTTAG:-${HOSTNAME##*-}}_${model}" RUNS="${model}|${ranks} ; ${systok}|ligerloss1 ; ${seq}|${b}|1 ; ${policy}" \
       bash scripts/lf/profile_lora_lf_test_source.sh >> "$LOGD/r_${tag}_b${b}.log" 2>&1
     local dmodel=${model//./_}
-    v=$(verdict "${tag}-c17_${dmodel}__b${b}_s${seq}_ga1_drop000" "$LOGD/r_${tag}_b${b}.log")
+    v=$(verdict "${tag}-${ASYM_HOSTTAG:-${HOSTNAME##*-}}_${dmodel}__b${b}_s${seq}_ga1_drop000" "$LOGD/r_${tag}_b${b}.log")
     echo "CELL $tag $systok s=$seq b=$b -> $v $(date +%H:%M)" >> "$S"
     [ "$v" = "TRAINED" ] && break
     [ "$v" = "FAIL" ] && break
