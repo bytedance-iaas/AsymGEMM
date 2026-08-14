@@ -123,7 +123,7 @@
      # ---- ctrl accessors -------------------------------------------------------
      def _hdr_flag_idx(self, rank: int, seq: int) -> int:
          return self._hdr_flag_base + rank * FLAG_SLOTS + (seq % FLAG_SLOTS)
-@@ -138,40 +183,26 @@
+@@ -138,38 +183,16 @@
          lo = self._hdr_base + (rank * RING + (seq % RING)) * _HDR_INTS
          return self.ctrl[lo:lo + _HDR_INTS]
  
@@ -168,18 +168,8 @@
 +        return self.d_slots[owner][ring]
  
      # ---- the armed launch -----------------------------------------------------
-+    def count_skip(self, reason: str) -> None:
-+        """Launches that bail BEFORE pre_gate (direct-family precheck) consume no
-+        seq and were previously invisible — a whole tier can silently never
-+        engage (V1 192k T1: armed=0 declined=0 with 4212 launches). Count them
-+        so exit stats distinguish 'hook dead' from 'hook declining'."""
-+        key = f"skip_{reason}"
-+        self.stats[key] = self.stats.get(key, 0) + 1
-+
-     def pre_gate(self, m: int, k: int, n_segs: int) -> bool:
-         """Host-int decline check BEFORE the caller pays offsets.cpu().tolist()
-         (a per-call GPU sync — measured +6.7 s/step at 20k where every call
-@@ -181,7 +212,7 @@
+     def count_skip(self, reason: str) -> None:
+@@ -189,7 +212,7 @@
          x_slot = self.x_slots[self.rank][self.seq % RING]
          decline = (
              n_segs == 0 or n_segs > MAX_SEGS or m == 0
@@ -188,7 +178,7 @@
              or m * k > x_slot.numel()
          )
          if not decline:
-@@ -211,8 +242,10 @@
+@@ -219,8 +242,10 @@
          ring = seq % RING
          me, peer = self.rank, 1 - self.rank
          x_slot = self.x_slots[me][ring]
@@ -201,7 +191,7 @@
  
          # far-ahead flag hygiene (host writes; slots FLAG_SLOTS/2 ahead are idle)
          ahead = seq + FLAG_SLOTS // 2
-@@ -221,7 +254,7 @@
+@@ -229,7 +254,7 @@
  
          decline = (
              n_segs == 0 or n_segs > MAX_SEGS or m == 0
@@ -210,7 +200,7 @@
              or m * k > x_slot.numel()
          )
          if decline:
-@@ -285,23 +318,16 @@
+@@ -293,23 +318,16 @@
                             device=a.device)
  
          if self.transport == "nvlink":
@@ -242,7 +232,7 @@
  
          if self.mode == "plan":
              # PLAN flavor (asym_sepplan2): identical union + transport, but the cut
-@@ -328,18 +354,17 @@
+@@ -336,18 +354,17 @@
              # to n_own makes the launch fully local (gather early-exits, zero
              # coupling), exactly like an un-stolen queue launch.
              own_rows = sum(rows[:n_own])
@@ -269,7 +259,7 @@
                  sub_pairs = pairs[2 * lo_seg: 2 * hi_seg]
                  sub_ids = torch.cat([ids[lo_seg:hi_seg], ids[total:total + 1]])
                  sub_n_own = max(0, min(n_own, hi_seg) - lo_seg)
-@@ -352,6 +377,10 @@
+@@ -360,6 +377,10 @@
                  done_ev = torch.cuda.Event()
                  done_ev.record()
                  done_ev.synchronize()
@@ -280,7 +270,7 @@
                  self.ctrl[self._done_flag_idx(me, seq)] = 1
                  # fabricate the meet point on MY private block (host write happens
                  # before the gather kernel launch => visible to its sysmem reads)
-@@ -367,11 +396,6 @@
+@@ -375,11 +396,6 @@
              # degenerate cut (one side would idle) => fall through to the queue race
              # (both ranks compute the same k_seg, so the branch stays symmetric)
  
@@ -292,7 +282,7 @@
          n_blk = asym_gemm.m_grouped_bf16_asym_gemm_nt_contiguous_ep_steal(
              a, b, d, peer_x, d_peer, pairs, ids, total + 1,
              self._counters(seq), me, n_own, compiled_dims, transpose_b)
-@@ -383,6 +407,10 @@
+@@ -391,6 +407,10 @@
          done_ev = torch.cuda.Event()
          done_ev.record()
          done_ev.synchronize()
@@ -303,7 +293,7 @@
          self.ctrl[self._done_flag_idx(me, seq)] = 1
          _C.ep_steal_spin_gather(
              d, self._d_ring_for_gather(ring)[: m * n].view(m, n), pairs,
-@@ -392,6 +420,22 @@
+@@ -400,6 +420,22 @@
          return True
  
  
@@ -326,7 +316,7 @@
  _STATE: _SepState | None = None
  
  
-@@ -399,17 +443,16 @@
+@@ -407,17 +443,16 @@
                      x_slots: list[list[torch.Tensor]],
                      d_slots: list[list[torch.Tensor]],
                      transport: str = "host",
@@ -350,16 +340,11 @@
      return _STATE
 --- a/scripts/lf/run_lf_profiled_train.py
 +++ b/scripts/lf/run_lf_profiled_train.py
-@@ -1900,32 +1900,32 @@
-                     # capacity check silently declined the backend's OWN home
-                     # regime. Raise the env for bigger armed workloads deliberately.
-                     sep_rows = int(os.environ.get("ASYM_EP_SEP_SLOT_ROWS", "163840") or 163840)
--                    sep_kmax = 2048
+@@ -1904,31 +1904,28 @@
+                     # (Air/Mixtral 4096) pre-decline every launch on m*k>slot
+                     # without a bigger K budget (fix_dynamic_ep.md D0 notes).
+                     sep_kmax = int(os.environ.get("ASYM_EP_SEP_SLOT_KMAX", "2048") or 2048)
 -                    sep_transport = os.environ.get("ASYM_EP_SEP_TRANSPORT", "host").strip() or "host"
-+                    # kmax was hardwired 2048 (qwen hidden); wide-hidden families
-+                    # (Air/Mixtral 4096) pre-decline every launch on m*k>slot
-+                    # without a bigger K budget (fix_dynamic_ep.md D0 notes).
-+                    sep_kmax = int(os.environ.get("ASYM_EP_SEP_SLOT_KMAX", "2048") or 2048)
 +                    sep_transport = os.environ.get("ASYM_EP_SEP_TRANSPORT", "host") or "host"
                      sep_ctrl = fabric.get_or_create(
                          "sep_ctrl", torch.zeros(ep_sep.ctrl_ints_needed(), dtype=torch.int32))
@@ -401,7 +386,7 @@
                  if fabric is not None:
                      fabric.seal()
                      heartbeat.emit("ep2_fabric_sealed", **fabric.stats())
-@@ -1935,58 +1935,55 @@
+@@ -1938,58 +1935,55 @@
                      from asym_gemm.training import ep_sep as _ep_sep
                      import torch.distributed as dist
  
@@ -441,7 +426,7 @@
  
 -                        _rank = dist.get_rank()
 -                        _dev = torch.cuda.current_device()
--                        _kmax = 2048
+-                        _kmax = int(os.environ.get("ASYM_EP_SEP_SLOT_KMAX", "2048") or 2048)
 -                        _mine_x = [torch.zeros(sr * _kmax, dtype=torch.bfloat16,
 -                                               device=f"cuda:{_dev}")
 -                                   for _ in range(_ep_sep.RING)]
