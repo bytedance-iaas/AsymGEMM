@@ -23,6 +23,14 @@ env/outputs/<machine>` symlink pattern, extended.
 | 46  | profiling_results + profiling/ + profiling_fixcpu/ + profiling_both_ceiling/ + profiling_both_ceiling_s04-p1-dgx-02-c18/ + profiling_source_ceiling_s04-p1-dgx-02-c18/ | ~59G |
 | SFT | profiling_results + outputs/ (171G — July qwen35 ckpt dirs, DELETE per Kevin 08-14) + results/ + test_profiling_direct/ | ~293G (→ ~122G after ckpt deletion) |
 
+Census addendum (full top-level sweep, 08-14): also migrating the tiny
+extras 39/`test_profiling_venv` (12K), SFT/`test_profiling` (16K),
+SFT/`.figtmp` (140K). EXCLUDED as rebuildable, verified non-artifacts:
+`.venv*`/`.aioenv`/`build/` (environments), `.cache`/`.pytest_cache`/
+`.ruff_cache` (tool caches), `stubs/_C.pyi` (regenerated per _C build —
+differs per tree by design). `Screenshot 2026-08-10*.png` is byte-identical
+in all four trees (38 already has it).
+
 Deliberately staying put: `datasets/` dirs + LF `data/*.jsonl` (tiny,
 registry-referenced), `agent/anchors_tmp/` ledgers+logs (small, tag-named,
 belong with the repo), node-local /scratch_local caches.
