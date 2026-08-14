@@ -1400,10 +1400,10 @@ append_backend_spec() {
     asym_sqdp2_cpuadamwds) backend=asym_sqdp2_cpuadamwds ;;
     asym_sepqueue2) backend=asym_sepqueue2_cpuadamwds ;;
     asym_sepqueue2_cpuadamwds) backend=asym_sepqueue2_cpuadamwds ;;
-    asym_sepplan2) backend=asym_sepplan2_cpuadamwds ;;
-    asym_sepplan2_cpuadamwds) backend=asym_sepplan2_cpuadamwds ;;
     asym_sepplanlink2) backend=asym_sepplanlink2_cpuadamwds ;;
     asym_sepplanlink2_cpuadamwds) backend=asym_sepplanlink2_cpuadamwds ;;
+    asym_sepplan2) backend=asym_sepplan2_cpuadamwds ;;
+    asym_sepplan2_cpuadamwds) backend=asym_sepplan2_cpuadamwds ;;
     # NAMING EPOCH 4 (2026-07-10): legacy sEP spellings canonicalize to sepqueue2
     asym_sep2|asym_sqep2|asym_sqeq2) backend=asym_sepqueue2_cpuadamwds ;;
     asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds|asym_sqeq2_cpuadamwds) backend=asym_sepqueue2_cpuadamwds ;;

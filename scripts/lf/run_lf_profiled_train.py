@@ -1900,7 +1900,10 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
                     # capacity check silently declined the backend's OWN home
                     # regime. Raise the env for bigger armed workloads deliberately.
                     sep_rows = int(os.environ.get("ASYM_EP_SEP_SLOT_ROWS", "163840") or 163840)
-                    sep_kmax = 2048
+                    # kmax was hardwired 2048 (qwen hidden); wide-hidden families
+                    # (Air/Mixtral 4096) pre-decline every launch on m*k>slot
+                    # without a bigger K budget (fix_dynamic_ep.md D0 notes).
+                    sep_kmax = int(os.environ.get("ASYM_EP_SEP_SLOT_KMAX", "2048") or 2048)
                     sep_transport = os.environ.get("ASYM_EP_SEP_TRANSPORT", "host").strip() or "host"
                     sep_ctrl = fabric.get_or_create(
                         "sep_ctrl", torch.zeros(ep_sep.ctrl_ints_needed(), dtype=torch.int32))
@@ -1949,7 +1952,7 @@ def _install_trainer_heartbeat_hooks(heartbeat: LFHeartbeat, partial_writer: Par
 
                         _rank = dist.get_rank()
                         _dev = torch.cuda.current_device()
-                        _kmax = 2048
+                        _kmax = int(os.environ.get("ASYM_EP_SEP_SLOT_KMAX", "2048") or 2048)
                         _mine_x = [torch.zeros(sr * _kmax, dtype=torch.bfloat16,
                                                device=f"cuda:{_dev}")
                                    for _ in range(_ep_sep.RING)]

@@ -253,6 +253,80 @@ def _native_symbol(name: str):
     return getattr(asym_gemm, name)
 
 
+_REAIM_GRAD_CHUNK = 8192  # house staging grain (M2a-v2 DIRECT_CHUNK)
+_REAIM_STAGE_BUFS: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _staged_grouped_grad(
+    grads_low_rank: tuple[torch.Tensor, ...],
+    source_cpu: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    num_experts: int,
+    site: str,
+) -> tuple[torch.Tensor, ...]:
+    """Swap-back dA (M2a-v2 'swap' / table middle row): one full H2D re-stage
+    of X per leg call, then native per-group weight-grad GEMMs on the staged
+    copy. Re-buys the offloaded bytes at the backward peak."""
+    from .cpu_left import _reaim_groups_cpu, _reaim_log_once
+
+    _reaim_log_once(f"staged:{site}")
+    dev = grads_low_rank[0].device
+    x_stage = source_cpu.to(dev, non_blocking=source_cpu.is_pinned())
+    k = int(source_cpu.shape[1])
+    # bf16 GEMMs on the staged copy (cuBLAS fp32 accumulate) — M2a-v2 'swap'
+    outs = tuple(
+        torch.zeros((int(num_experts), int(g.shape[1]), k), device=dev, dtype=grads_low_rank[0].dtype)
+        for g in grads_low_rank
+    )
+    for start, end, eid in _reaim_groups_cpu(offsets, experts):
+        seg = x_stage[start:end]
+        for g, out in zip(grads_low_rank, outs):
+            torch.matmul(g[start:end].t(), seg, out=out[eid])
+    if os.environ.get("ASYMM_LORA_KERNELS_DEBUG", "") == "1":
+        bad = [int(torch.isnan(o).sum()) + int(torch.isinf(o).sum()) for o in outs]
+        gbad = [int(torch.isnan(g).sum()) for g in grads_low_rank]
+        xbad = int(torch.isnan(x_stage).sum())
+        print(f"[staged-dbg] {site} out_nan_inf={bad} dS_nan={gbad} x_nan={xbad}", flush=True)
+    del x_stage
+    return outs
+
+
+def _reaim_grouped_grad(
+    grad_low_rank: torch.Tensor,
+    source_cpu: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    num_experts: int,
+    site: str,
+) -> torch.Tensor:
+    """Re-aim of the adapter gradient: chunked stage+accumulate (M2a-v2
+    'reaim2'), segment-sliced for the grouped site. dA's reduction runs over
+    the streamed axis, which no operand mapping of the inference kernel
+    expresses — the upstream-expressible low-memory fallback re-stages X in
+    chunks and accumulates dA_e = dS_e^T X_e in fp32 on the staged copy."""
+    from .cpu_left import _reaim_groups_cpu, _reaim_log_once
+
+    _reaim_log_once(site)
+    k = int(source_cpu.shape[1])
+    r = int(grad_low_rank.shape[1])
+    dev = grad_low_rank.device
+    grad = torch.zeros((int(num_experts), r, k), device=dev, dtype=torch.float32)
+    key = (k, dev.index or 0)
+    buf = _REAIM_STAGE_BUFS.get(key)
+    if buf is None:
+        buf = torch.empty((_REAIM_GRAD_CHUNK, k), device=dev, dtype=torch.bfloat16)
+        _REAIM_STAGE_BUFS[key] = buf
+    for start, end, eid in _reaim_groups_cpu(offsets, experts):
+        for c0 in range(start, end, _REAIM_GRAD_CHUNK):
+            c1 = min(end, c0 + _REAIM_GRAD_CHUNK)
+            n_rows = c1 - c0
+            stage = buf[:n_rows]
+            stage.copy_(source_cpu[c0:c1], non_blocking=True)
+            grad[eid].addmm_(grad_low_rank[c0:c1].t().float(), stage.float())
+    return grad.to(grad_low_rank.dtype)
+
+
 def grouped_lora_a_grad_cpu_right(
     grad_low_rank: torch.Tensor,
     source_cpu: torch.Tensor,
@@ -269,6 +343,18 @@ def grouped_lora_a_grad_cpu_right(
         raise RuntimeError(f"{tag}: LoRA-A grad requires contiguous CUDA BF16 dS")
     if grad_low_rank.dim() != 2 or int(grad_low_rank.shape[0]) != int(source_cpu.shape[0]):
         raise RuntimeError(f"{tag}: LoRA-A grad expects dS [M,r] and source [M,K]")
+    from .cpu_left import _reaim_enabled, _staged_enabled
+
+    if _reaim_enabled():
+        grad_a = _reaim_grouped_grad(grad_low_rank, source_cpu, offsets, experts, num_experts, f"lora_a_grad.{tag}")
+        if stats is not None:
+            stats.expact_lora_a_grad_grouped_calls += 1
+        return grad_a
+    if _staged_enabled():
+        (grad_a,) = _staged_grouped_grad((grad_low_rank,), source_cpu, offsets, experts, num_experts, f"lora_a_grad.{tag}")
+        if stats is not None:
+            stats.expact_lora_a_grad_grouped_calls += 1
+        return grad_a
     offsets_i32, experts_i32, list_size = _group_metadata_tensors(offsets, experts, device=grad_low_rank.device)
     grad_a = torch.empty(
         (int(num_experts), int(grad_low_rank.shape[1]), int(source_cpu.shape[1])),
@@ -301,6 +387,20 @@ def grouped_lora_a_pair_grad_cpu_right(
     _check_pinned_cpu_bf16_2d(x_cpu, "gate/up LoRA-A grad")
     if dS_gate.dim() != 2 or dS_gate.shape != dS_up.shape or int(dS_gate.shape[0]) != int(x_cpu.shape[0]):
         raise RuntimeError("gate/up LoRA-A grad expects dS tensors [M,r] and X [M,H]")
+    from .cpu_left import _reaim_enabled, _staged_enabled
+
+    if _reaim_enabled():
+        # X re-staged once per adapter: the upstream mapping has one consumer per pass
+        grad_gate = _reaim_grouped_grad(dS_gate, x_cpu, offsets, experts, num_experts, "lora_a_pair_grad.gate")
+        grad_up = _reaim_grouped_grad(dS_up, x_cpu, offsets, experts, num_experts, "lora_a_pair_grad.up")
+        if stats is not None:
+            stats.expact_lora_a_grad_grouped_calls += 1
+        return grad_gate, grad_up
+    if _staged_enabled():
+        grad_gate, grad_up = _staged_grouped_grad((dS_gate, dS_up), x_cpu, offsets, experts, num_experts, "lora_a_pair_grad")
+        if stats is not None:
+            stats.expact_lora_a_grad_grouped_calls += 1
+        return grad_gate, grad_up
     offsets_i32, experts_i32, list_size = _group_metadata_tensors(offsets, experts, device=dS_gate.device)
     grad_gate = torch.empty(
         (int(num_experts), int(dS_gate.shape[1]), int(x_cpu.shape[1])),

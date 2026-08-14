@@ -483,7 +483,7 @@ case "${BACKEND,,}" in
     ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false
     BACKEND=asym
     ;;
-  asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sepqueue2_cpuadamwds|asym_sepplan2_cpuadamwds|asym_sepplanlink2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds|asym_sqeq2_cpuadamwds)
+  asym_ep2_cpuadamwds|asym_sdp2_cpuadamwds|asym_sqdp2_cpuadamwds|asym_sepqueue2_cpuadamwds|asym_sepplan2_cpuadamwds|asym_sep2_cpuadamwds|asym_sqep2_cpuadamwds|asym_sqeq2_cpuadamwds|asym_sepplanlink2_cpuadamwds)
     # GB200 rank-per-GPU EP family (fix_gb200_ep.md; the backend NAME selects the
     # EP mode and flips the flags automatically). NAMING EPOCH 4 (2026-07-10):
     #   asym_ep2_cpuadamwds       = VANILLA EP (owned expert slices, allgather dispatch
@@ -494,8 +494,6 @@ case "${BACKEND,,}" in
     #                               flavor; legacy spellings sep2/sqep2/sqeq2 alias here)
     #   asym_sepplan2_cpuadamwds  = TRUE sEP, count-computed union cut
     #                               (ASYM_EP_SEP_MODE=plan; no counter racing)
-    #   asym_sepplanlink2_cpuadamwds = sepplan2 over NVLink peer-HBM rings +
-    #                               dispatch-level hook (fix_dynamic_ep.md)
     # Common shape: torchrun 2 ranks, each rank the |1 asym stack VERBATIM on its own
     # DistributedSampler shard; NO DDP wrapper — run_lf_profiled_train.py bypasses
     # Accelerator.prepare_model and does ONE manual grad allreduce per step.
@@ -532,13 +530,13 @@ case "${BACKEND,,}" in
       asym_sepqueue2_cpuadamwds)
         ASYM_EP_VANILLA=0; ASYM_ARENA_SHM=1; ASYM_EP_QUEUED=1; ASYM_EP_SEP=1; ASYM_EP_SEP_MODE=queue
         echo "[runlf] backend asym_sepqueue2 -> TRUE sEP, counter-raced steal: ASYM_EP_SEP=1 ASYM_EP_SEP_MODE=queue ASYM_EP_QUEUED=1" ;;
+      asym_sepplanlink2_cpuadamwds)
+        # user env wins on transport (A/B hook, same convention as tier presets)
+        export ASYM_EP_SEP=1 ASYM_EP_SEP_MODE=plan ASYM_EP_SEP_TRANSPORT="${ASYM_EP_SEP_TRANSPORT:-nvlink}"
+        echo "[runlf] backend asym_sepplanlink2 -> planned sEP over NVLink: ASYM_EP_SEP=1 MODE=plan TRANSPORT=nvlink" ;;
       asym_sepplan2_cpuadamwds)
         ASYM_EP_VANILLA=0; ASYM_ARENA_SHM=1; ASYM_EP_QUEUED=0; ASYM_EP_SEP=1; ASYM_EP_SEP_MODE=plan
         echo "[runlf] backend asym_sepplan2 -> TRUE sEP, count-computed cut: ASYM_EP_SEP=1 ASYM_EP_SEP_MODE=plan" ;;
-      asym_sepplanlink2_cpuadamwds)
-        ASYM_EP_VANILLA=0; ASYM_ARENA_SHM=1; ASYM_EP_QUEUED=0; ASYM_EP_SEP=1; ASYM_EP_SEP_MODE=plan
-        ASYM_EP_SEP_TRANSPORT=nvlink
-        echo "[runlf] backend asym_sepplanlink2 -> planned sEP over NVLink rings: ASYM_EP_SEP=1 MODE=plan TRANSPORT=nvlink" ;;
     esac
     # same hook-offload hazard as dp2: grads must be reduced BEFORE any D2H copy; the
     # CPUAdamW step-time path reads param.grad after the manual allreduce.
@@ -586,6 +584,16 @@ case "${BACKEND,,}" in
     BACKEND=asym
     ;;
   asym_torch) BACKEND=asym_torch ;;
+  asym_torch_cpuadamwds)
+    # AsymLoRA runtime with the GEMM kernels swapped to torch ("AsymLoRA
+    # without its kernels" — the fig-11/tab-ablation middle row): identical
+    # cpu-adam/offload machinery to asym_cpuadamwds, torch grouped GEMMs.
+    PROFILE_BACKEND_LABEL=${PROFILE_BACKEND_LABEL:-asym_torch_cpuadamwds}
+    USE_ASYM_CPU_ADAMW=true
+    ASYM_CPU_ADAMW_BACKEND=deepspeed
+    CPUADAM_ALIAS_SELECTED=1
+    BACKEND=asym_torch
+    ;;
   asym) BACKEND=asym ;;
   kt_torchbf16)
     BACKEND=kt_torchbf16
@@ -712,7 +720,6 @@ if [[ "${ASYM_EP2:-0}" == "1" ]]; then
   [[ -z "${ASYM_EP_VANILLA:-}" ]] || export ASYM_EP_VANILLA  # S5b vanilla-EP baseline rung
   [[ -z "${ASYM_EP_SEP:-}" ]] || export ASYM_EP_SEP          # S6 true-sEP union sharing
   [[ -z "${ASYM_EP_SEP_MODE:-}" ]] || export ASYM_EP_SEP_MODE  # queue (sepqueue2) | plan (sepplan2)
-  [[ -z "${ASYM_EP_SEP_TRANSPORT:-}" ]] || export ASYM_EP_SEP_TRANSPORT  # host | nvlink (sepplanlink2)
   [[ -z "${ASYM_EP_VANILLA_FUSED:-}" ]] || export ASYM_EP_VANILLA_FUSED        # fix_ep D4
   [[ -z "${ASYM_EP_VANILLA_COMM_STREAM:-}" ]] || export ASYM_EP_VANILLA_COMM_STREAM  # fix_ep D3
   [[ -z "${ASYM_EP_VANILLA_ALIGN_EVERY:-}" ]] || export ASYM_EP_VANILLA_ALIGN_EVERY  # fix_ep damper

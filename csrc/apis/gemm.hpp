@@ -719,8 +719,12 @@ static int m_grouped_bf16_asym_gemm_nt_contiguous_ep_steal(const torch::Tensor& 
     DG_HOST_ASSERT(ep_queue.device().is_cpu() && ep_queue.is_pinned());
     DG_HOST_ASSERT(ep_queue.scalar_type() == torch::kInt && ep_queue.numel() >= 3);
     DG_HOST_ASSERT(ep_side == 0 or ep_side == 1);
-    DG_HOST_ASSERT(a_peer.device().is_cpu() && a_peer.is_pinned() && a_peer.is_contiguous());
-    DG_HOST_ASSERT(d_peer.device().is_cpu() && d_peer.is_pinned() && d_peer.is_contiguous());
+    // sepplanlink2 (fix_dynamic_ep.md): peer payloads may be HOST-PINNED
+    // (original sEP staging) or PEER-GPU HBM reached over NVLink — both are
+    // plain global-address-space pointers to the kernel's TMA/global ops.
+    // The transport invariant (pinned XOR cuda, contiguous) is what we check.
+    DG_HOST_ASSERT(((a_peer.device().is_cpu() && a_peer.is_pinned()) || a_peer.is_cuda()) && a_peer.is_contiguous());
+    DG_HOST_ASSERT(((d_peer.device().is_cpu() && d_peer.is_pinned()) || d_peer.is_cuda()) && d_peer.is_contiguous());
     DG_HOST_ASSERT(a_peer.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(d_peer.scalar_type() == d.scalar_type());
     const auto& [m_peer, k_peer] = get_shape<2>(a_peer);

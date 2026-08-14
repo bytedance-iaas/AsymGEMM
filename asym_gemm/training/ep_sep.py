@@ -172,6 +172,14 @@ class _SepState:
         self._pending_pull = None
 
     # ---- the armed launch -----------------------------------------------------
+    def count_skip(self, reason: str) -> None:
+        """Launches that bail BEFORE pre_gate (direct-family precheck) consume no
+        seq and were previously invisible — a whole tier can silently never
+        engage (V1 192k T1: armed=0 declined=0 with 4212 launches). Count them
+        so exit stats distinguish 'hook dead' from 'hook declining'."""
+        key = f"skip_{reason}"
+        self.stats[key] = self.stats.get(key, 0) + 1
+
     def pre_gate(self, m: int, k: int, n_segs: int) -> bool:
         """Host-int decline check BEFORE the caller pays offsets.cpu().tolist()
         (a per-call GPU sync — measured +6.7 s/step at 20k where every call

@@ -588,6 +588,11 @@ def classify_lf_component(name: str, module: nn.Module | None = None) -> str:
     module_name = type(module).__name__.lower() if module is not None else ""
     if _is_vision_or_multimodal_path(lower):
         return "vision"
+    # Rotary position caches (e.g. Hunyuan-A13B: per-layer precomputed cos/sin,
+    # ~16MB x 32 layers): read by every attention op — GPU residency is the
+    # design, mirroring "router"/"linear_attention" (audit allows the component).
+    if "rotary_emb" in lower or "rotary_pos_emb" in lower or "rotaryembedding" in module_name:
+        return "rotary"
     # Jamba's Mamba mixer (child name `mamba`, JambaMambaMixer): the hybrid
     # stack's linear-time token mixer — same GPU-resident residency class as
     # qwen3.5's GatedDeltaNet `linear_attn` (allowed_components covers it).
@@ -708,7 +713,7 @@ def audit_lf_frozen_cuda_residue(
     offload_modules: Sequence[str] | str | None,
     strict: bool = True,
     max_allowed_unselected_cuda_bytes: int = 8 * 1024 * 1024,
-    allowed_components: set[str] | frozenset[str] = frozenset({"linear_attention", "router"}),
+    allowed_components: set[str] | frozenset[str] = frozenset({"linear_attention", "router", "rotary"}),
 ) -> dict[str, int]:
     # "router" is always allowed: whole-mode families (model_integration.md) keep
     # the HF router intact on GPU by design (mirrors the mover's router_whole_gpu
@@ -1143,7 +1148,7 @@ def move_lf_asym_cpu_first_model_to_device(
         offload_modules=selection.raw,
         strict=strict,
         max_allowed_unselected_cuda_bytes=8 * 1024 * 1024,
-        allowed_components=frozenset({"linear_attention", "router"}),
+        allowed_components=frozenset({"linear_attention", "router", "rotary"}),
     )
     return {
         "moved_bytes_by_reason": dict(moved_bytes_by_reason),
@@ -1391,8 +1396,49 @@ def _wrap_lf_router_module(
             # accepts these gates by accident). Keep the original module intact —
             # the mover's router_whole_gpu bucket + buffer pass place it on GPU.
             return None
+        gate_weight = getattr(module, "weight", None)
+        if not isinstance(gate_weight, torch.Tensor) or gate_weight.dim() != 2:
+            # Module-shaped gates (HunYuanTopKGate / HunYuanMoEV1Gate: inner fp32
+            # wg Linear, logits-only forward) — the wrapped MoE block replicates
+            # routing itself; leave the gate intact exactly like the DS-V3-style
+            # gates above instead of failing AsymQwen3Router's 2D-weight check.
+            return None
         return AsymQwen3Router(module, backend=backend, precision=precision, stats=stats, strict=strict)
     return None
+
+
+def _untie_lm_head_for_offload(model: nn.Module, selection: LFOffloadSelection) -> None:
+    """Tied embed/lm_head (e.g. Hunyuan-A13B: tie_word_embeddings=true, the
+    checkpoint ships only model.embed_tokens.weight) is storage-shared after
+    load on current transformers, which the embed/lm_head offload stages
+    cannot host. Both weights are FROZEN under LoRA, so cloning the output
+    head apart is numerically identical — it only severs the storage tie.
+    Applied uniformly on the shared wrap path (every backend pays the same)."""
+    if not (selection.lm_head or selection.embed_tokens):
+        return
+    get_input = getattr(model, "get_input_embeddings", None)
+    get_output = getattr(model, "get_output_embeddings", None)
+    if not callable(get_input) or not callable(get_output):
+        return
+    input_embeddings = get_input()
+    output_embeddings = get_output()
+    input_weight = getattr(input_embeddings, "weight", None)
+    output_weight = getattr(output_embeddings, "weight", None)
+    if not (isinstance(input_weight, torch.Tensor) and isinstance(output_weight, torch.Tensor)):
+        return
+    if storage_key(input_weight) != storage_key(output_weight):
+        return
+    # requires_grad may still be True here — LF freezes the base AFTER the asym
+    # wrap. Preserve the flag on the clone; the LoRA freeze pass and the offload
+    # stage's own frozen-ness asserts enforce that no base head ever trains
+    # (and if one did, storage-tied training was already impossible to offload).
+    output_embeddings.weight = nn.Parameter(
+        output_weight.detach().clone(),
+        requires_grad=bool(output_weight.requires_grad))
+    if hasattr(model, "config"):
+        model.config.tie_word_embeddings = False  # post-load state, keeps save/load honest
+    print("[asym][lf] untied embed/lm_head by cloning the output head "
+          "(frozen weights; offload stages need distinct storages)", flush=True)
 
 
 def _reject_tied_lm_head_offload(model: nn.Module, selection: LFOffloadSelection, *, strict: bool) -> None:
@@ -1960,6 +2006,7 @@ def apply_lf_asym_lora(
     if precision != "bf16":
         raise ValueError("AsymGEMM LLaMA-Factory integration supports bf16 only")
     selection = parse_lf_offload_modules(offload_modules)
+    _untie_lm_head_for_offload(model, selection)
     _reject_tied_lm_head_offload(model, selection, strict=strict)
     if router_mode not in {"hf", "whole"}:
         raise ValueError("router_mode must be 'hf' or 'whole'")
@@ -2598,6 +2645,14 @@ def apply_lf_asym_lora(
                 # routing replicated in the block) — kept intact like the DS-V3
                 # gates; the mover's router_whole_gpu bucket places it on GPU.
                 report.skipped.append(f"{name}:router_kept_intact_jamba_linear")
+                continue
+            gate_weight = getattr(module, "weight", None)
+            if not isinstance(gate_weight, torch.Tensor) or gate_weight.dim() != 2:
+                # Module-shaped gate (HunYuanTopKGate / HunYuanMoEV1Gate: inner
+                # fp32 wg Linear, logits-only forward) — AsymHunyuanMoeBlock
+                # replicates routing itself; kept intact like the DS-V3 gates,
+                # the mover's router_whole_gpu bucket places it on GPU.
+                report.skipped.append(f"{name}:router_kept_intact_module_gate")
                 continue
             wrapped_router = _wrap_lf_router_module(
                 name,

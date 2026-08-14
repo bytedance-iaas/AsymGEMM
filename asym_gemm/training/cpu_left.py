@@ -41,6 +41,137 @@ def _compact_grid_enabled() -> bool:
     return _env_positive_int("DG_BF16_CPU_LEFT_COMPACT_GRID", 0) != 0
 
 
+def _lora_kernels_mode() -> str:
+    """Fig-12 kernel ablation arm-B selector (ASYMM_LORA_KERNELS):
+    - ""       : shipped AsymLoRA kernels (arm A).
+    - "reaim"  : re-aimed inference-form mapping (M2a/M2a-v2 'direct'/'reaim2'):
+      fwd = operand-swapped upstream call per adapter per expert segment
+      (S_e^T = A_e . X_e^T, transpose-back included); grad = chunked
+      stage+accumulate (the only upstream-expressible low-memory dA mapping).
+    - "staged" : the component table's middle row ('swap-backs'): stage the
+      whole CPU-resident operand back to HBM once per leg call and run native
+      GEMMs on the staged copy (M2a-v2 'swap'). Fast but re-buys the offloaded
+      bytes at the peak — the capacity cost the kernels remove.
+    Everything else (offload schedule, base GEMMs, optimizer) is untouched."""
+    return os.environ.get("ASYMM_LORA_KERNELS", "").strip().lower()
+
+
+def _reaim_enabled() -> bool:
+    return _lora_kernels_mode() == "reaim"
+
+
+def _staged_enabled() -> bool:
+    return _lora_kernels_mode() == "staged"
+
+
+def _staged_grouped_forward(
+    x_cpu: torch.Tensor,
+    weights: tuple[torch.Tensor, ...],
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    out_dtype: torch.dtype,
+    site: str,
+) -> tuple[torch.Tensor, ...]:
+    """Swap-back fwd: one full H2D stage of X per leg call, then native GEMMs
+    per group per adapter on the staged copy (M2a-v2 'swap' semantics)."""
+    _reaim_log_once(f"staged:{site}")
+    dev = weights[0].device
+    x_stage = x_cpu.to(dev, non_blocking=x_cpu.is_pinned())
+    m = int(x_cpu.shape[0])
+    outs = tuple(
+        torch.empty((m, int(w.shape[1])), device=dev, dtype=out_dtype) for w in weights
+    )
+    covered = 0
+    for start, end, eid in _reaim_groups_cpu(offsets, experts):
+        seg = x_stage[start:end]
+        covered += end - start
+        for w, out in zip(weights, outs):
+            out[start:end] = (seg @ w[eid].t()).to(out_dtype)
+    if os.environ.get("ASYMM_LORA_KERNELS_DEBUG", "") == "1":
+        bad = [int(torch.isnan(o).sum()) + int(torch.isinf(o).sum()) for o in outs]
+        xbad = int(torch.isnan(x_stage).sum())
+        print(f"[staged-dbg] {site} m={m} covered={covered} out_nan_inf={bad} x_nan={xbad}", flush=True)
+    del x_stage
+    return outs
+
+
+_REAIM_LOGGED: set[str] = set()
+
+
+def _reaim_log_once(site: str) -> None:
+    if site not in _REAIM_LOGGED:
+        _REAIM_LOGGED.add(site)
+        print(f"[asym-reaim] ENGAGED {site}", flush=True)
+
+
+def _reaim_groups_cpu(offsets: torch.Tensor, experts: torch.Tensor) -> list[tuple[int, int, int]]:
+    """Memoized (start, end, expert_id) triples for the contiguous-group layout."""
+    memo = getattr(offsets, "_asym_reaim_groups_memo", None)
+    if memo is not None:
+        return memo
+    if offsets.numel() != experts.numel():
+        raise RuntimeError("reaim grouped mapping requires the contiguous offsets layout")
+    offs = offsets.detach().to("cpu", torch.long).tolist()
+    exps = experts.detach().to("cpu", torch.long).tolist()
+    groups: list[tuple[int, int, int]] = []
+    for g in range(len(exps) - 1):
+        start, end, eid = int(offs[g]), int(offs[g + 1]), int(exps[g])
+        if end > start and eid >= 0:
+            groups.append((start, end, eid))
+    try:
+        offsets._asym_reaim_groups_memo = groups  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return groups
+
+
+_REAIM_TAIL_BUFS: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _reaim_grouped_forward(
+    x_cpu: torch.Tensor,
+    weight: torch.Tensor,
+    offsets: torch.Tensor,
+    experts: torch.Tensor,
+    out_dtype: torch.dtype,
+    site: str,
+) -> torch.Tensor:
+    """Direct re-aim of the inference-form kernel at the LoRA-A fwd site.
+
+    Per expert segment: S_e^T = A_e . X_e^T with A_e as the resident "batch"
+    and the pinned CPU rows streamed in the kernel's weight role, then the
+    transpose-back the consumer needs (row-major S). Segments are ragged, so
+    each expert is its own launch (the grouped inference form requires uniform
+    weights); rows beyond the 8-row alignment the binding requires are staged.
+    """
+    from .frozen_linear import asym_bf16_cpu_right_matmul
+
+    _reaim_log_once(site)
+    m = int(x_cpu.shape[0])
+    n = int(weight.shape[1])
+    out = torch.empty((m, n), device=weight.device, dtype=out_dtype)
+    for start, end, eid in _reaim_groups_cpu(offsets, experts):
+        rows = end - start
+        body = rows - (rows % 8)
+        a_e = weight[eid]
+        if body > 0:
+            seg = x_cpu[start : start + body]
+            st = asym_bf16_cpu_right_matmul(
+                a_e, seg, backend="asym", tag=f"{site}.reaim_direct"
+            )
+            out[start : start + body] = st.t().to(out_dtype)
+        if body < rows:
+            key = (int(x_cpu.shape[1]), weight.device.index or 0)
+            buf = _REAIM_TAIL_BUFS.get(key)
+            if buf is None or buf.shape[0] < 8:
+                buf = torch.empty((8, int(x_cpu.shape[1])), device=weight.device, dtype=torch.bfloat16)
+                _REAIM_TAIL_BUFS[key] = buf
+            tail = rows - body
+            buf[:tail].copy_(x_cpu[start + body : end], non_blocking=True)
+            out[start + body : end] = (buf[:tail] @ a_e.t()).to(out_dtype)
+    return out
+
+
 def _binding_supports_compact_m_blocks(native: Any, min_argcount: int = 8) -> bool:
     code = getattr(native, "__code__", None)
     if code is None:
@@ -237,6 +368,17 @@ def grouped_expert_lora_cpu_left(
     if reason is not None:
         raise RuntimeError(f"SM100 CPU-left grouped BF16 AsymGEMM is unavailable: {reason}")
 
+    if _reaim_enabled():
+        out = _reaim_grouped_forward(x_cpu, weight, call_offsets, call_experts, out_dtype, "lora_a_fwd")
+        if stats is not None:
+            stats.cpu_left_lora_a_calls += 1
+        return out
+    if _staged_enabled():
+        (out,) = _staged_grouped_forward(x_cpu, (weight,), call_offsets, call_experts, out_dtype, "lora_a_fwd")
+        if stats is not None:
+            stats.cpu_left_lora_a_calls += 1
+        return out
+
     import asym_gemm
 
     x_kernel, offsets_kernel, unpad, compact_m_blocks = _pad_cpu_left_grouped_input_for_asym(
@@ -317,6 +459,20 @@ def grouped_expert_lora_pair_cpu_left(
     if reason is not None:
         raise RuntimeError(f"SM100 CPU-left grouped BF16 pair AsymGEMM is unavailable: {reason}")
 
+    if _reaim_enabled():
+        # one stream per adapter: the inference form serves one consumer per pass
+        out_gate = _reaim_grouped_forward(x_cpu, weight_gate, call_offsets, call_experts, out_dtype, "lora_a_pair_fwd.gate")
+        out_up = _reaim_grouped_forward(x_cpu, weight_up, call_offsets, call_experts, out_dtype, "lora_a_pair_fwd.up")
+        if stats is not None:
+            stats.cpu_left_lora_a_calls += 1
+        return out_gate, out_up
+    if _staged_enabled():
+        out_gate, out_up = _staged_grouped_forward(
+            x_cpu, (weight_gate, weight_up), call_offsets, call_experts, out_dtype, "lora_a_pair_fwd")
+        if stats is not None:
+            stats.cpu_left_lora_a_calls += 1
+        return out_gate, out_up
+
     import asym_gemm
 
     if not hasattr(asym_gemm, CPU_LEFT_BF16_PAIR_BINDING):
@@ -389,6 +545,20 @@ def grouped_expert_lora_triple_cpu_left(
     reason = cpu_left_grouped_bf16_reason(x_cpu, w0, call_offsets, call_experts)
     if reason is not None:
         raise RuntimeError(f"SM100 CPU-left grouped BF16 triple AsymGEMM is unavailable: {reason}")
+    if _reaim_enabled():
+        outs_reaim = tuple(
+            _reaim_grouped_forward(x_cpu, w, call_offsets, call_experts, torch.bfloat16, f"lora_a_triple_fwd.{i}")
+            for i, w in enumerate((w0, w1, w2))
+        )
+        if stats is not None:
+            stats.cpu_left_lora_a_calls += 1
+        return outs_reaim
+    if _staged_enabled():
+        outs_staged = _staged_grouped_forward(
+            x_cpu, (w0, w1, w2), call_offsets, call_experts, torch.bfloat16, "lora_a_triple_fwd")
+        if stats is not None:
+            stats.cpu_left_lora_a_calls += 1
+        return outs_staged
     import asym_gemm
 
     binding = "sm100_m_grouped_bf16_cpu_left_triple_asym_gemm_nt_contiguous"

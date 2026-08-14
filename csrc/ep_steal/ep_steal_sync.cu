@@ -113,7 +113,10 @@ void spin_gather(const torch::Tensor& d, const torch::Tensor& staging,
                  const int64_t n_blk, const int64_t n_segments,
                  const int64_t n_own_segments, const int64_t side) {
     TORCH_CHECK(d.is_cuda() && d.scalar_type() == torch::kBFloat16 && d.is_contiguous());
-    TORCH_CHECK(staging.device().is_cpu() && staging.is_pinned() && staging.is_contiguous());
+    // sepplanlink2 (fix_dynamic_ep.md): staging is host-pinned (original sEP)
+    // or LOCAL-GPU HBM (nvlink transport — the peer remote-wrote our rows
+    // there); both are global-address-space reads for the gather kernel.
+    TORCH_CHECK(((staging.device().is_cpu() && staging.is_pinned()) || staging.is_cuda()) && staging.is_contiguous());
     TORCH_CHECK(staging.scalar_type() == torch::kBFloat16);
     TORCH_CHECK(staging.sizes() == d.sizes(), "staging must mirror d's shape");
     TORCH_CHECK(offsets.is_cuda() && offsets.scalar_type() == torch::kInt);

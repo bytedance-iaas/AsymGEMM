@@ -9,6 +9,7 @@ if [ -z "${HF_TOKEN:-}" ] && [ -f /workspace/env/bashrc.sh ]; then
 fi
 export HF_HUB_ENABLE_HF_TRANSFER=0
 export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 cd /workspace/AsymGEMM-SFT/third_party/AsymGEMM
 exec .venv/bin/python scripts/ep_skew/route_skew_probe.py \
   --model "$MODEL" --datasets "$DATASETS" "$@"

@@ -373,3 +373,25 @@ V5 Re-ladder + rebank ONLY models with measured wins (standing banking
 - [08-11 21:55Z] D2/V1dev d2plan64 s=64000 b=2 -> TRAINED | 93.8	2729	63.3	34	583	0.3 | loss= | ep_sep {'armed': 0, 'declined': 2688, 'spin_wait_s': 0.0}
 - [08-11 22:02Z] D2/V1dev d2link32 s=32000 b=2 -> TRAINED | 23.3	5502	66.5	36	414	1.7 | loss= | ep_sep {'armed': 0, 'declined': 576, 'spin_wait_s': 0.0}
 - [08-11 22:09Z] D2/V1dev d2sdp32 s=32000 b=2 -> TRAINED | 21.6	5916	56.5	31	391	1.5 | loss= | ep_sep n/a
+- [08-14 11:01Z] D2/V1dev d3link64 s=64000 b=2 -> TRAINED | 90.5	2828	63.3	34	570	0.2 | loss= | ep_sep {'armed': 0, 'declined': 2688, 'spin_wait_s': 0.0}
+- [08-14 11:07Z] D2/V1dev d3link32 s=32000 b=2 -> TRAINED | 21.9	5839	60.5	33	405	1.4 | loss= | ep_sep {'armed': 0, 'declined': 576, 'spin_wait_s': 0.0}
+- [2026-08-14] 4-way merge cross-note: this file is the HUNYUAN-FIRST
+  instance (Kevin's 08-10 reorder; 46-tree lineage, D2/V1dev active through
+  08-14). The PARALLEL GLM-FIRST instance (39-tree: V1 GLMs/V2 Mixtral/V3
+  Hunyuan/V4 Qwen chains + full §8 ledger, 809 lines) is preserved verbatim
+  at agent/impls/archive/fix_dynamic_ep_39tree.md. Source outcome:
+  - LIVE in this tree: the D0-revised X-only nvlink v1.5 (device X rings +
+    pinned x-scratch + targeted _pull_peer_rows; ep_sep.py/driver/probe as
+    ported 08-12 — the implementation the banked gptoss 2r ladder and the
+    active D2/V1dev cells run) + 46's frozen_linear §3.1a-c extraction with
+    pre-gate-first + 39's ORTHOGONAL bits grafted: count_skip diagnostics
+    (ep_sep.py + frozen_linear), ASYM_EP_SEP_ALLOW_DENSE, dispatch-site
+    gate-skip counters, ASYM_EP_SEP_SLOT_KMAX env (wide-hidden families),
+    lf.py rotary component + Hunyuan module-gate handling, csrc ep_steal
+    assert relaxations (dormant input-widening; enabler for the archived
+    flavor — _C rebuilt to match).
+  - ARCHIVED: the 39-instance FULL-nvlink flavor (device D rings, ownership
+    flip, lazy-open peer blobs, NO_SNAP) as
+    agent/impls/archive/sepplanlink2_39tree_full_nvlink.patch (applies onto
+    this tree's ep_sep.py/run_lf_profiled_train.py/ep_sep_probe.py; NOT
+    line-composable with the live X-only flavor — rival designs).

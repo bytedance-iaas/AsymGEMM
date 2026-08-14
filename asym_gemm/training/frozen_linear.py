@@ -18,6 +18,10 @@ import os as _os
 
 _EP_QUEUED_ENABLED = _os.environ.get("ASYM_EP_QUEUED") == "1"
 _EP_SEP_ENABLED = _os.environ.get("ASYM_EP_SEP") == "1"  # S6 true-sEP union sharing
+# Whole-layer (T1-class) grouped launches carry dense_experts=True — one group
+# per expert, identity order, token-grouped rows — which the plan cut consumes
+# fine; excluded by default only because the hook predates the dense audit.
+_EP_SEP_ALLOW_DENSE = _os.environ.get("ASYM_EP_SEP_ALLOW_DENSE") == "1"
 # S5b diagnostics: host-block probe on the per-launch pad scalar read (ep_vanilla.py)
 _PAD_TIMING = bool(int(_os.environ.get("ASYM_EP_VANILLA_TIMING", "0") or 0))
 # fix_ep (2026-07-11): sync-free padding — allocate at the host-computable upper
@@ -1006,21 +1010,28 @@ def _try_ep_sep_grouped(
     if _st is None:
         return None
     # the armed kernel is direct-family: same eligibility as the direct path
-    if _direct_grouped_bf16_reason(a, b_cpu, transpose_b=transpose_b) is not None:
+    _skip_reason = _direct_grouped_bf16_reason(a, b_cpu, transpose_b=transpose_b)
+    if _skip_reason is not None:
+        _st.count_skip(_skip_reason)
         return None
     import asym_gemm
 
     m = int(a.shape[0])
     n = int(b_cpu.shape[2] if transpose_b else b_cpu.shape[1])
+    # pre_gate FIRST, on raw metadata (D2 receipt: paying pad+metadata prep
+    # before the gate cost -2.4%/-7% vs sdp2 on declined-everything cells —
+    # the staged fallback re-stages anyway, so pre-gate prep is pure waste).
+    # padded m is bounded by m + BLOCK_M*n_segs (per-segment pad ceiling);
+    # using the bound instead of the exact padded m only ever declines
+    # EARLIER (conservative), and the decline still consumes+publishes the
+    # seq exactly like before — launch alignment across ranks is unchanged.
+    n_segs_raw = int(offsets.numel()) // 2  # (lo,hi) pairs; sentinel-immune
+    m_bound = m + 128 * max(n_segs_raw, 1)
+    if not _st.pre_gate(m_bound, int(a.shape[1]), n_segs_raw):
+        return None
     a_kernel, offsets_kernel, unpad = _pad_grouped_input_for_asym(a, offsets, experts)
     offsets_i32, experts_i32, list_size = _group_metadata_tensors(
         offsets_kernel, experts, device=a.device)
-    # pre_gate declines on host ints BEFORE the .tolist() GPU sync — at
-    # decline-regime workloads (m/n_segs > max_mpe) the sync cost the whole
-    # backend +6.7 s/step at 20k for launches that could never arm.
-    if not _st.pre_gate(int(a_kernel.shape[0]), int(a_kernel.shape[1]),
-                        list_size - 1):
-        return None
     pairs_cpu = offsets_i32[: 2 * (list_size - 1)].cpu().tolist()
     ids_cpu = experts_i32[: list_size - 1].cpu().tolist()
     segs = [(ids_cpu[i], pairs_cpu[2 * i], pairs_cpu[2 * i + 1])
@@ -1655,7 +1666,9 @@ def _dispatch_grouped_nt(
     # every tier's recipe-pinned staged dispatch still sees it (the old
     # placement lived only inside the direct path — a measured -11% entry
     # fee to reach it on GLM-Flash). Decline => fall through UNCHANGED.
-    if backend != "torch" and precision == "bf16" and _EP_SEP_ENABLED:
+    if (backend != "torch" and precision == "bf16" and _EP_SEP_ENABLED
+            and quantized_weight is None
+            and (not dense_experts or _EP_SEP_ALLOW_DENSE)):
         _sep_out = _try_ep_sep_grouped(
             a,
             b_cpu,
@@ -1672,6 +1685,21 @@ def _dispatch_grouped_nt(
                 else:
                     stats.asym_dx_calls += 1
             return _sep_out
+    elif _EP_SEP_ENABLED:
+        # Diagnosis counters (fix_dynamic_ep.md §8 V1: T1 cells show armed=0
+        # declined=0 with zero skip keys — this tells "gate rejected" apart from
+        # "wrapper never called"). Same stats dict, near-zero cost.
+        from .ep_sep import state as _sep_state_diag
+        _st_diag = _sep_state_diag()
+        if _st_diag is not None:
+            if backend == "torch":
+                _st_diag.count_skip("gate_backend_torch")
+            elif precision != "bf16":
+                _st_diag.count_skip("gate_precision")
+            elif quantized_weight is not None:
+                _st_diag.count_skip("gate_quantized")
+            elif dense_experts:
+                _st_diag.count_skip("gate_dense")
     if backend != "torch" and precision == "bf16" and _gemm_dispatch_staged():
         backend = "torch"  # D5: stage-once + native grouped mm; counted in torch_* stats
 
