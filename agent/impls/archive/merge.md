@@ -1,20 +1,18 @@
-1. /home/kevinni/AsymGEMM-SFT-39/third_party/AsymGEMM this current repo has a lot to new model additions 
-2. /home/kevinni/AsymGEMM-SFT-46/third_party/AsymGEMM this toehr repo has some chagns to run qwwn3.5 thprgith resutls not sure if tehra re changes made tho might be only scripts level changes please amke sures
-3. /home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM here are some kenrel changes mainly i believe.
+This is the current repo: /home/kevinni/AsymGEMM-SFT-38/third_party/AsymGEMM
 
-The goal is to merge all 3 together here so that /home/kevinni/AsymGEMM-SFT-39/third_party/AsymGEMM
-this serves as the base for alll the new changes. After u merge these 3, lets run some heavy (near capacity) worklaod for Qwnw3 30b and Qwen3.5 35b and GLM's 2 MoEs near capacity. 
-The goal is to confirm no regression in memory / latency / throughput. We had extenisvle records form vaiour repos abotut past perforamnce so just ensure that all these new changes will merge correctl wihtout regression. If there is we need to diagnose them carefullt and try to fix all the issues. Dont stop util this repo is a clear merge of  AsymGEMM-SFT-39/third_party/AsymGEMM and AsymGEMM-SFT-46/third_party/AsymGEMM and AsymGEMM-SFT/third_party/AsymGEMM
+There are other sibling repos that have other small devs indepdeont (to speeedup multipel features impletnaiton adn then merge later), but i dont think they have tooo many different cahnges anymore
+/home/kevinni/AsymGEMM-SFT-39/third_party/AsymGEMM
+/home/kevinni/AsymGEMM-SFT-46/third_party/AsymGEMM
+/home/kevinni/AsymGEMM-SFT/third_party/AsymGEMM
 
-Remember when testing the code run asym42_enroot_run this starts the current container so that u can run the testing code.
-NEVER run on the host directly.
-After these merges are done u can contnue to merge this dir as well
-DOnt miss any critical details/features but alos dont keep old/stale paths that is not used annymore at all.
-use /home/kevinni/AsymGEMM-SFT-39/third_party/AsymGEMM/agent/impls/merge_progress.md
-as a record for the merging. for conflcit resolving decision etc dont ask me, do ur best judgsment to resolve conflicts and to move forward. 
-Dont stop until all these merges are confirmed to be correct / no regression on these MoE models with near capacity workload.
+The goal is to merge all 4 together here so that /home/kevinni/AsymGEMM-SFT-38/third_party/AsymGEMM this serves as the base for alll the new changes. 
+After u merge these, lets run some heavy (near capacity) worklaod for Qwnw3 30b and Qwen3.5 35b and GLM's 2 MoEs near capacity. The goal is to confirm no regression in memory / latency / throughput. We had extenisvle records form vaiour repos abotut past perforamnce so just ensure that all these new changes will merge correctl wihtout regression. If there is, we need to diagnose them carefullt and try to fix all the issues. If the code change re very light we might not even need such validations for now.
+When u run vaiaditons need to use asym45_enroot_run this starts the correct container that u will run the ssytem.
 
-4. /home/kevinni/AsymGEMM-SFT-38/third_party/AsymGEMM this was working on a very old path. 
-it was trying to improve the model capacity it ahd some code tjhat assists laoding large models but not sure it stil applcaitbi or how to adapt ont the current repo. Be very caretuf cauwe this repo was branhc off a ver old aoth. Just chek what the its nchange smade to bebakbl to load larger models otherwise dont take any old / stale paths.
+But again i dont think there is much deep code cahnges but stil be vry careult and careuflt make ur we retian 1. all the soruce code changes. no features should be lost. 2. improat scritps adn docs cahgnes no informatio shoud be lost.
 
 
+But before u start the merging first do the disano and elt kenow how diffiucl is this 4 way merge i dont thi too nay cahnges too but assess carefully and let meknow.
+
+
+Dont stop util this repo is a clear merge of all these individual repos.
