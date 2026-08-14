@@ -70,17 +70,18 @@ tpfig_lib_c17.sh, readers unaffected since they glob the tag they created).
     live/
       profiling_results/...           # single shared write root, all machines
 ```
-In repo 38:
+In repo 38 (three clean entries — history is ONE symlink to the whole
+central history/, so runs/history/<tree>/... mirrors the store 1:1):
 ```
 profiling_results -> ../../../env/outputs/asym_artifacts/live/profiling_results
 runs/
-  live              -> ../../../../env/outputs/asym_artifacts/live
-  sft38-history     -> ../../../../env/outputs/asym_artifacts/history/sft38
-  sft39-history     -> ../../../../env/outputs/asym_artifacts/history/sft39
-  sft46-history     -> ../../../../env/outputs/asym_artifacts/history/sft46
-  sft-history       -> ../../../../env/outputs/asym_artifacts/history/sft
-  s04-p1-dgx-02-cNN -> ../../../../env/outputs/s04-p1-dgx-02-cNN
+  live     -> ../../../../env/outputs/asym_artifacts/live
+  history  -> ../../../../env/outputs/asym_artifacts/history
+  machines/
+    s04-p1-dgx-02-cNN -> ../../../../../env/outputs/s04-p1-dgx-02-cNN
 ```
+Browse paths: runs/history/sft39/profiling_results/..., runs/live/...,
+runs/machines/s04-p1-dgx-02-c14/...
 Symlinks RELATIVE at exactly these depths — that is what makes them resolve
 both on the host (/home/kevinni/...) and inside enroot (/workspace/...);
 the agent/impls links prove the pattern in-container.
@@ -143,3 +144,6 @@ insufficient — skip until then.
   reinstated to KEEP (migrate to history/sft/); ckpt-deletion rescinded
   (irreversibility rule); DELETE list now test/scratch junk only;
   migrate footprint back to ~456G.
+- [2026-08-14] Kevin: group histories -> runs/ now has exactly three
+  entries (live, history = ONE symlink to central history/, machines/);
+  runs/history/<tree>/... mirrors the store 1:1.
