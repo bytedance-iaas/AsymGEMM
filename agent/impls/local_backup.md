@@ -2,7 +2,9 @@
 
 SELF-CONTAINED runbook for an agent running ON THE LOCAL (destination) machine.
 Everything you need is in this file: what to ssh into, what to pull, in which
-waves, and how to verify. All commands are resumable (`rsync -P`) and
+waves, how to verify — plus two standing duties: **always assess existing
+progress before transferring anything (§2)** and **always report per-wave
+ETAs while running (§3)**. All transfers are resumable (`--partial`) and
 re-runnable (incremental delta on re-run). Device/tunnel background lives in
 the repo's `agent/devices.md`; you do not need it to execute this.
 
@@ -71,21 +73,61 @@ by construction. Therefore:
   intentionally-dead links) and never `--safe-links` (drops the links);
 - the store itself has zero symlinks/hardlinks — plain rsync = complete data.
 
-## 2. The waves
+## 2. ALWAYS FIRST: assess current progress — never start blind
+
+`DEST` may already hold a partial backup from an earlier session. Before any
+transfer, determine per wave what is already downloaded and what remains, and
+REPORT it. The probe is each wave's exact rsync command with `-n --stats`
+appended (dry run — transfers nothing):
 
 ```bash
 DEST=~/asymsft; mkdir -p "$DEST"; cd "$DEST"
+OPT=(-az --partial --info=progress2 --no-inc-recursive)
 EXC=(--exclude='.venv*' --exclude='.aioenv' --exclude='build/'
      --exclude='__pycache__/' --exclude='*.egg-info' --exclude='stubs/'
      --exclude='.cache/' --exclude='.pytest_cache/' --exclude='.ruff_cache/')
 
+ls -la .; du -sh AsymGEMM-SFT-38 env 2>/dev/null      # what exists at all?
+# then for EACH wave below: rsync -n --stats <that wave's exact arguments>
+#   "Number of regular files transferred: 0"  → wave already COMPLETE
+#   "Total transferred file size: X bytes"    → X bytes still to pull
+```
+
+Then report a status table BEFORE starting, e.g.:
+
+    wave 1 code:      partial — 2.1G of 18G remaining
+    wave 2 env:       complete
+    wave 3 LF data:   not started (84G)
+    wave 4 history:   not started (455G) — confirm wanted before pulling
+
+Only after this report, start transferring (remaining waves only).
+
+## 3. The waves — with mandatory ETA reporting
+
+`OPT` above gives one live overall-progress line per transfer
+(`--info=progress2` = total %, rate, ETA; `--no-inc-recursive` makes the %
+and ETA truthful by scanning the full file list upfront — expect a short
+pause before numbers appear; `-v` is deliberately omitted so the progress
+line stays readable).
+
+**ETA protocol (do this for every wave):**
+- BEFORE the wave: state bytes remaining (from the §2 dry run) and expected
+  duration. Until a rate is measured, say "rate unknown — measuring"; after
+  ~2 min of the first transfer, use the observed MB/s to give ETAs for this
+  AND all remaining waves.
+- DURING: relay rsync's progress2 line (%, MB/s, ETA) at the start and then
+  every ~5 minutes or every 10% step, whichever is coarser.
+- AFTER: report actual duration + average rate, and refresh the ETAs of the
+  waves still to come using the measured rate.
+
+```bash
 # WAVE 0 — refresh the clean-repo manifest on the remote (fast)
 $RSH $N 'bash env/agent/third_party_patches/regen.sh'
 # In its output, every listed repo must show dirty_files=0. If any is >0,
 # that repo has NEW local work: add it to the wave-1 list below.
 
 # WAVE 1 — SOURCE CODE (~18G): the 5 modified repos, whole, incl. .git
-rsync -avzPR "${EXC[@]}" --exclude='LlamaFactory/data/' -e "$RSH" \
+rsync "${OPT[@]}" -R "${EXC[@]}" --exclude='LlamaFactory/data/' -e "$RSH" \
   "$N:AsymGEMM-SFT-38/.repair_dataset_info.py" \
   "$N:AsymGEMM-SFT-38/third_party/AsymGEMM" \
   "$N:AsymGEMM-SFT-38/third_party/LlamaFactory" \
@@ -97,27 +139,28 @@ rsync -avzPR "${EXC[@]}" --exclude='LlamaFactory/data/' -e "$RSH" \
 
 # WAVE 2 — ARTIFACTS, current (~1.6G): env/ = live store, docs, figures,
 # overleaf, rules, scripts, third_party_patches manifest
-rsync -avzP --exclude='outputs/asymlora/history/' \
+rsync "${OPT[@]}" --exclude='outputs/asymlora/history/' \
   --exclude='outputs/asymlora/.trash_root_owned/' -e "$RSH" \
   "$N:env" .
 
 # WAVE 3 — OPTIONAL, LF DATASETS (+84G): registered jsonl packs
-rsync -avzP -e "$RSH" \
+rsync "${OPT[@]}" -e "$RSH" \
   "$N:AsymGEMM-SFT-38/third_party/LlamaFactory/data/" \
   AsymGEMM-SFT-38/third_party/LlamaFactory/data/
 
 # WAVE 4 — OPTIONAL, RUN HISTORY (+455G): the frozen archive; makes
 # runs/history resolve. Selective slices work: append e.g. history/sft38/
 # (13G; sft 290G, sft39 94G, sft46 ~59G) to both paths.
-rsync -avzP --exclude='.trash_root_owned/' -e "$RSH" \
+rsync "${OPT[@]}" --exclude='.trash_root_owned/' -e "$RSH" \
   "$N:env/outputs/asymlora/history" env/outputs/asymlora/
 ```
 
-Waves are independent: any order, any subset, re-run any time. Nothing needs
-fixing up afterwards — the moment wave 2 lands, wave-1 symlinks start
-resolving on their own.
+Waves are independent: any order, any subset, re-run any time (a re-run
+transfers only the delta — that is also how you resume after interruption).
+Nothing needs fixing up afterwards — the moment wave 2 lands, wave-1
+symlinks start resolving on their own.
 
-## 3. Verify
+## 4. Verify
 
 ```bash
 # symlinks alive (only after wave 2):
@@ -129,6 +172,8 @@ git -C AsymGEMM-SFT-38/third_party/AsymGEMM stash list          # 1 entry
 git -C AsymGEMM-SFT-38/third_party/Megatron-Bridge log --oneline -1  # dev: Mixtral bridge + TE compat
 # clean-repo manifest present:
 column -t env/agent/third_party_patches/MANIFEST.tsv | head
+# final progress statement: re-run the §2 dry-run probes — every wave you
+# pulled must now show "Number of regular files transferred: 0".
 ```
 
 Known-good quirks — do NOT "repair" these:
