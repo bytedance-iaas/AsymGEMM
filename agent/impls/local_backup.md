@@ -164,6 +164,40 @@ transfers only the delta — that is also how you resume after interruption).
 Nothing needs fixing up afterwards — the moment wave 2 lands, wave-1
 symlinks start resolving on their own.
 
+### Parallel sessions — encouraged, with rules
+
+rsync is single-threaded and uses ONE TCP/ssh stream, which rarely fills a
+long WAN path on its own — so DO run waves concurrently, one rsync per
+session (tmux pane / separate shell), each logging its own progress2 line.
+
+- **Concurrency cap: 3–5 streams.** Beyond that you strain the shared
+  bastion and the NFS server for little gain. If per-stream rate barely
+  drops as you add streams, you're still under the link capacity; if it
+  halves, you've saturated — back off.
+- **Disjointness rule (absolute):** one stream per source/dest pair; NEVER
+  two rsyncs on the same slice at once (duplicate transfers, wasted
+  bandwidth). The waves as written are already disjoint.
+- **Suggested stream plan** (balanced so streams finish together; wave-4
+  slices use the per-tree layout — `mkdir -p` the dest parent first):
+
+      S1  wave 1 then wave 2 (~20G, sequential in one session)
+      S2  wave 3 LF data (84G)
+      S3  wave 4 slice history/sft/outputs (171G)
+      S4  wave 4 slice history/sft/profiling_results (119G)
+      S5  wave 4 slices history/sft39 + sft46 + sft38 (94+59+13G, sequential)
+
+  Slice command template (same OPT/excludes as wave 4):
+
+      mkdir -p env/outputs/asymlora/history/sft
+      rsync "${OPT[@]}" --exclude='.trash_root_owned/' -e "$RSH" \
+        "$N:env/outputs/asymlora/history/sft/outputs" \
+        env/outputs/asymlora/history/sft/
+
+- **ETA protocol still applies per session**; the backup's overall ETA is
+  the max across running sessions — report that too when summarizing.
+- After parallel slicing, the §4 final dry-run probes (run once, whole
+  waves) are what prove nothing fell between the slices.
+
 ## 4. Verify
 
 ```bash
