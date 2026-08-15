@@ -839,7 +839,7 @@ def infer_num_experts(model):
     for c in (getattr(cfg, "text_config", None), cfg):
         if c is None:
             continue
-        for k in ("num_experts", "n_routed_experts"):
+        for k in ("num_experts", "n_routed_experts", "num_local_experts"):
             v = getattr(c, k, None)
             if isinstance(v, int):
                 return v

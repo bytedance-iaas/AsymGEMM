@@ -309,3 +309,17 @@ chat template; capture = pre-hook on `experts` modules (actual selected indices)
   -> "obvious" gains land: 30b +6.5%, flash +5.1%; 4k b32 rung running.
   gpt-oss-20b lane opened: ckpt downloaded (24L/32E/top4/ctx128k, MXFP4->bf16),
   probe registry entry added (GptOssExperts hook-compatible).
+- [08-15] c11 GPT-OSS-20B LANE COMPLETE (same drill, one day): deep traces
+  n=512 x {dapo .850, megamath .887, codeforces .893, openscience .612
+  med-max contig — the LLEP inherent-imbalance model confirmed on our probe};
+  placed sets at ctx-max 128k packs: math/code/science pred .867/.867/.877,
+  VERIFIED .868/.866/.877 (16k-window aggregate — hf eager-sinks attention
+  cannot single-shot 128k; ZERO attenuation). fig13 hists + walls (geom
+  32,2880,2880 topk4, m=256k union) + vanilla-PEFT LoRA reference step
+  (4k b8 GC, 9.51s, eager attention — gpt-oss NOT in the LF stack; F=3
+  fwd+recompute+dgrad documented): mechanism 38.7-41.0% (theory 42.5%),
+  share 10.3-10.5%, E2E GAIN +6.6/+7.0/+7.2% (math/code/science) — DSEP
+  BEATS the hindsight oracle on ALL 3 domains (E=32 concentrated routing).
+  Probe fixes en route: num_local_experts in infer, eager-OOM lessons.
+  CAMPAIGN GOAL MET — obvious e2e gains: gpt-oss +7.2%, 30b +6.5-6.7%,
+  flash +5.1-6.0% (short-seq deep-batch), 122b ~1% (streaming-floor, honest).
