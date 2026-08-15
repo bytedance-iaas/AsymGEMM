@@ -49,6 +49,7 @@ MODELS = {
     "glm4.5-air": ("zai-org/GLM-4.5-Air", "glm4_moe"),
     "glm4.7-flash": ("zai-org/GLM-4.7-Flash", "glm4_moe_lite"),
     "hunyuan-a13b": ("tencent/Hunyuan-A13B-Instruct", "hunyuan_v1_moe"),
+    "gpt-oss-20b": ("openai/gpt-oss-20b", "gpt_oss"),  # 24L, 32 experts top-4, ctx 128k; MXFP4 experts dequant to bf16 on load
 }
 
 # Per-dataset fixed seeds: every model sees the IDENTICAL document order.

@@ -297,3 +297,15 @@ chat template; capture = pre-hook on `experts` modules (actual selected indices)
   (streaming amortized) — pretraining-shaped, outside this paper's long-ctx
   b1 cells. DSEP e2e gain peaks ~3.6-3.7% at 30b 48-64k b1.
   Data: fig13/share_vs_length.json; cells fs{48,64,80,100}{q30b,gflash,q122b}.
+- [08-15] c11 NOTE: peer artifact migration (08-14) froze profiling_results into
+  asymlora/history/sft and re-pointed the repo path at the empty live root —
+  ep_skew{,_deep,_1m}+motivation hardlinked back into live (zero-copy) so all
+  campaign scripts/paths work; new writes land in live as real files.
+- [08-15] c11 SHORT-SEQ DEEP-BATCH (tokens/step fixed at 256k -> walls128 reuse,
+  same launch size): measured share / DSEP e2e gain:
+    qwen3-30b   : 32k b4 9.8%/5.3% · 16k b8 11.2%/6.1% · 8k b16 11.9%/6.5%
+    glm4.7-flash: 32k b4 5.0%/2.5% · 16k b8 7.5%/3.8% · 8k b16 10.0%/5.1%
+    qwen3.5-122b: 16k b8 1.4%/0.8% (streaming-floor-bound at every shape)
+  -> "obvious" gains land: 30b +6.5%, flash +5.1%; 4k b32 rung running.
+  gpt-oss-20b lane opened: ckpt downloaded (24L/32E/top4/ctx128k, MXFP4->bf16),
+  probe registry entry added (GptOssExperts hook-compatible).
