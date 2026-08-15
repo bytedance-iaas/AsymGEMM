@@ -30,6 +30,8 @@ PREFLIGHT (do not skip):
 ```bash
 $RSH $N hostname          # must print: s04-p1-dgx-02-c17
 df -h .                   # local free space: ≥25G for waves 1+2; +90G wave 3; +460G wave 4
+rsync --version | head -1 # need rsync ≥ 3.1 for --info=progress2
+                          # (macOS stock rsync/openrsync is too old: brew install rsync)
 ```
 
 ## 1. What is being backed up — two sources of truth on the remote
@@ -144,6 +146,7 @@ rsync "${OPT[@]}" --exclude='outputs/asymlora/history/' \
   "$N:env" .
 
 # WAVE 3 — OPTIONAL, LF DATASETS (+84G): registered jsonl packs
+mkdir -p AsymGEMM-SFT-38/third_party/LlamaFactory/data
 rsync "${OPT[@]}" -e "$RSH" \
   "$N:AsymGEMM-SFT-38/third_party/LlamaFactory/data/" \
   AsymGEMM-SFT-38/third_party/LlamaFactory/data/
@@ -151,6 +154,7 @@ rsync "${OPT[@]}" -e "$RSH" \
 # WAVE 4 — OPTIONAL, RUN HISTORY (+455G): the frozen archive; makes
 # runs/history resolve. Selective slices work: append e.g. history/sft38/
 # (13G; sft 290G, sft39 94G, sft46 ~59G) to both paths.
+mkdir -p env/outputs/asymlora
 rsync "${OPT[@]}" --exclude='.trash_root_owned/' -e "$RSH" \
   "$N:env/outputs/asymlora/history" env/outputs/asymlora/
 ```
