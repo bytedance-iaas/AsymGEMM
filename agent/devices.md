@@ -46,7 +46,7 @@ get there) must print `s04-p1-dgx-02-c17`. `/home` is one NFS export
 
 ## Backing up / syncing to a local machine
 
-The canonical, self-contained runbook is **`agent/impls/sync.md`** — hand that ONE file
+The canonical, self-contained runbook is **`agent/impls/local_backup.md`** — hand that ONE file
 to the agent on the destination machine. It contains the access details above plus the
 wave structure (wave 1 source code = the 5 locally-modified repos WITH `.git`; wave 2
 current artifacts = `env/`; optional waves 3–4 = LF datasets 84G / run history 455G),
