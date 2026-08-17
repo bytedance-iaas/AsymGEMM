@@ -334,3 +334,9 @@ chat template; capture = pre-hook on `experts` modules (actual selected indices)
   flash), y-axis titles pinned at equal offset (set_label_coords -0.26); tick
   formatter fixed (decimals when step<1). Plot header rebuilt (earlier doc
   patch had duplicated the docstring mid-file). Overleaf e25316c.
+- [08-17] fig13 layout parity with figs 11/12 (Kevin): 'Expert Time (s)'
+  single-line ylabel; house triple-bar width 0.312 + left 0.125/wspace 0.22
+  (was left .195/wspace .34 -> panels ~20% narrower than siblings); ylabels
+  pinned -0.21 flush at canvas edge (the dead left strip made the figure
+  render narrower than its caption in the compiled paper). Overleaf 33ef4bb
+  -> latest push.
