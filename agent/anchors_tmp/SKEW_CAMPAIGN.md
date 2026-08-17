@@ -329,3 +329,8 @@ chat template; capture = pre-hook on `experts` modules (actual selected indices)
   e2e +6.5/7.2/5.1% (30b) +5.1/4.1/2.9% (flash). 122b dropped from the panel
   (floor-bound ~1%, stated in body); gpt-oss +6.6-7.2% cited in body text.
   fig13_data_shortseq.json (aggregate --shortseq); overleaf cc96f7e.
+- [08-17] c11 fig13 polish (Kevin): bottom row switched Throughput -> E2E step
+  TIME (lower-is-better both rows; DSEP -6.1/-6.7/-4.9% 30b, -4.8/-3.9/-2.8%
+  flash), y-axis titles pinned at equal offset (set_label_coords -0.26); tick
+  formatter fixed (decimals when step<1). Plot header rebuilt (earlier doc
+  patch had duplicated the docstring mid-file). Overleaf e25316c.
