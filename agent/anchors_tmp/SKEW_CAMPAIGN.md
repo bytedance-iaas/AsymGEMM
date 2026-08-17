@@ -323,3 +323,9 @@ chat template; capture = pre-hook on `experts` modules (actual selected indices)
   Probe fixes en route: num_local_experts in infer, eager-OOM lessons.
   CAMPAIGN GOAL MET — obvious e2e gains: gpt-oss +7.2%, 30b +6.5-6.7%,
   flash +5.1-6.0% (short-seq deep-batch), 122b ~1% (streaming-floor, honest).
+- [08-17] c11 FIG13 -> 2x2 (Kevin): Qwen3-30B + GLM-4.7-Flash at the 8k x b16
+  cell (256k tok/step; measured steps 17.85s/18.25s; walls128 reuse, same
+  launch size). Bars: DSEP -35/38/30% (30b) -22..34% (flash) expert-GEMM;
+  e2e +6.5/7.2/5.1% (30b) +5.1/4.1/2.9% (flash). 122b dropped from the panel
+  (floor-bound ~1%, stated in body); gpt-oss +6.6-7.2% cited in body text.
+  fig13_data_shortseq.json (aggregate --shortseq); overleaf cc96f7e.
