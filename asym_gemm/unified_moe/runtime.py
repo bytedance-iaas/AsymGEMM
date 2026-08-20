@@ -2,8 +2,12 @@
 
 Per-expert dispatch, two modes:
 - static (default): routed token count vs threshold —
-    m_e <= m_cpu  → CPU AMX INT8 path (cpu_gemm, stride-aware row-major B)
-    m_e >  m_cpu  → SM90 INT8 grouped-MoE WGMMA kernel (asym_gemm)
+    m_e <= m_cpu  → CPU INT8 path (cpu_gemm, stride-aware row-major B;
+                    AMX when available, else AVX512-VNNI — see
+                    _cpu_C caps()/cg_int8_rm_backend_name)
+    m_e >  m_cpu  → GPU INT8 grouped-MoE kernel (asym_gemm; SM90 WGMMA
+                    1d1d on Hopper, SM80 mma.s8 cp.async kernel on A100 —
+                    routed by the m_grouped_int8_asym_gemm_nt_* facades)
   plus the ASYMGEMM_CPU_PREFILL_FRACTION large-batch heuristic below.
 - adaptive (``adaptive=True`` or ``set_adaptive()``): a runtime cost model
   partitions the streamed experts to balance the two buckets' predicted
@@ -125,6 +129,71 @@ def _stage_streamed() -> bool:
     """ASYMGEMM_STAGE_STREAMED=0 disables copy-engine staging of streamed
     expert weights (falls back to in-kernel TMA reads of pinned host)."""
     return os.getenv("ASYMGEMM_STAGE_STREAMED", "1") == "1"
+
+
+# ---------------------------------------------------------------------------
+# HBM grouped-GEMM kernel selection (hybridGEMM.md Phase A, exit gate A)
+#
+# The cached partition's expert weights live in HBM, where the asym kernel's
+# K-outer loop (single-slot B, per-K-block TMA_REDUCE_ADD round-trips) is the
+# wrong trade: it was shaped for a ~21.5 GB/s PCIe link. The deep-pattern
+# kernel (persistent M-outer, kNumStages-deep A+B pipeline, full-K register
+# accumulation, plain TMA_STORE) streams HBM weights ~2.2x faster at decode
+# and ~1.9x at prefill (H200, G=64/N=2048/K=1024). Streamed (pinned-host)
+# partitions must stay on the asym kernel: the M-outer loop re-reads B per
+# m-block, which is ruinous over PCIe.
+# ---------------------------------------------------------------------------
+
+def _hbm_grouped_gemm():
+    """Grouped-GEMM entry point for HBM-resident (cached-partition) weights.
+
+    ASYMGEMM_HBM_KERNEL=deep (default) | asym. Falls back to the asym kernel
+    when the deep facade is absent from the build or the device is not SM90
+    (the deep persistent kernel is Hopper-only today; on SM80/A100 the
+    cached partition reuses the asym kernel, matching pre-hybridGEMM
+    behavior — unified_kernel_sm80.md Phase 3 will lift this)."""
+    if (os.getenv("ASYMGEMM_HBM_KERNEL", "deep") == "deep"
+            and torch.cuda.get_device_capability()[0] == 9):
+        fn = getattr(asym_gemm, "m_grouped_int8_gemm_nt_contiguous", None)
+        if fn is not None:
+            return fn
+    return asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous
+
+
+# ---------------------------------------------------------------------------
+# Hybrid single-launch kernel (hybridGEMM.md Phase D)
+#
+# ASYMGEMM_HYBRID_KERNEL=1 fuses the cached (HBM) and streamed (pinned-host)
+# GPU-bucket partitions into one m_grouped_int8_hybrid_gemm_nt_contiguous
+# launch per projection, instead of the separate 'cached' (deep/asym kernel)
+# + 'slab_a'/'staged' (asym kernel) launches _gpu_grouped_forward issues.
+# Requires SM90, the hybrid facade in the build, and a single unsplit pinned
+# host slab; NUMA-TP-split slabs (two independent pinned halves — the hybrid
+# kernel takes one b_host tensor) and copy-engine staging (which already
+# turns the streamed partition into a second HBM buffer, leaving nothing to
+# pair with the cached partition over PCIe) fall back to the existing
+# two-launch path. See hybridGEMM_usage.md for the kernel's API contract.
+# ---------------------------------------------------------------------------
+
+def _hybrid_kernel_enabled() -> bool:
+    return os.getenv("ASYMGEMM_HYBRID_KERNEL", "0") == "1"
+
+
+def _pick_s_host(rows_per_expert: float, n_host: int, n_hbm: int,
+                  num_sms: int) -> int:
+    """CTA split for the hybrid kernel: the two-regime rule validated on
+    H200 + PCIe Gen5 (hybridGEMM_usage.md §6). Override via
+    ASYMGEMM_HYBRID_S_HOST for manual tuning."""
+    override = os.getenv("ASYMGEMM_HYBRID_S_HOST", "")
+    if override:
+        return int(override)
+    asym_tflops, deep_tflops, link_bw = 182e12, 337e12, 24e9
+    rows_link_bound = asym_tflops / (2 * link_bw)     # ~3.7k rows/expert on Gen5
+    if rows_per_expert <= rows_link_bound:
+        return 32                                     # host side is LINK-bound
+    w = 1.85 * n_host                                 # asym pipeline is ~1.85x
+    return max(16, min(num_sms - 16,                  #   less TFLOPS-efficient
+                       round(num_sms * w / (w + n_hbm))))
 
 
 class _StageRing:
@@ -684,11 +753,20 @@ class Layer:
         y          : (T, hidden) torch.bfloat16 on the same device as x
 
     ``hidden`` and ``inter`` must each be multiples of ``GRAN_K=128`` (the
-    K-block granularity required by sm90_int8_asym_gemm_1d1d).
+    K-block granularity required by both the SM90 1d1d and SM80 INT8 kernels).
     """
 
     weight_residency = "pinned_host"
-    gpu_backend = "asym_gemm_sm90_int8_1d1d"
+
+    @property
+    def gpu_backend(self) -> str:
+        """Observability tag for the INT8 GPU kernel the facade routes to."""
+        major, minor = torch.cuda.get_device_capability()
+        if major == 9:
+            return "asym_gemm_sm90_int8_1d1d"
+        if (major, minor) == (8, 0):
+            return "asym_gemm_sm80_int8"
+        return f"asym_gemm_unsupported_sm{major}{minor}"
 
     def __init__(
         self,
@@ -918,6 +996,63 @@ class Layer:
         self._cached_mask_np[added] = True
         self._slot_np[added] = np.asarray(slots, dtype=np.int64)
         return True
+
+    def _use_hybrid_path(self, cached_len: int, streamed_len: int) -> bool:
+        """Whether this call's GPU bucket should use the single fused hybrid
+        launch instead of separate cached + streamed launches. See the
+        ASYMGEMM_HYBRID_KERNEL block above for the fallback conditions.
+
+        Also requires that copy-engine staging would NOT otherwise apply to
+        the streamed partition — not just because it measures faster, but
+        because staging removes hybrid's own precondition. Staging (the
+        default transport, ASYMGEMM_STAGE_STREAMED=1) copies the streamed
+        partition's weights from pinned host into an HBM ring *before* any
+        GEMM launches, so by kernel-launch time there is no pinned-host-
+        resident partition left — both the cached and the (now-staged)
+        streamed experts are HBM-resident. Hybrid's whole reason to exist is
+        combining a genuinely pinned-host pipeline with an HBM pipeline in
+        one launch; once staging has already turned the host side into HBM,
+        that precondition doesn't hold, and calling hybrid anyway just means
+        its host-side CTAs redundantly re-read the same weights the slow way
+        (direct in-kernel PCIe/TMA) instead of the HBM copy staging already
+        made. (The right optimization for the staging-on case is a
+        different one we haven't built: merging the cached and staged
+        partitions into one deep-kernel call, since both are HBM by then —
+        not forcing them through hybrid.) Confirmed empirically on an H200
+        (mixed 32/32-expert residency, T=512): with staging on, the hybrid
+        path was ~1.76x SLOWER than the staged default (10.46ms vs 5.95ms),
+        despite winning modestly (~1.06x) against the equivalent staging-
+        disabled two-launch path (10.46ms vs 11.15ms) — consistent with
+        hybrid only being the right tool once staging is off or has fallen
+        back (e.g. OOM).
+        """
+        return (
+            _hybrid_kernel_enabled()
+            and cached_len > 0 and streamed_len > 0
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] == 9
+            and self.slab.gate_int8_b is None
+            and hasattr(asym_gemm, "m_grouped_int8_hybrid_gemm_nt_contiguous")
+            and not (_stage_streamed() and not _STAGE_DISABLED)
+        )
+
+    def _hybrid_cache_views(self):
+        """Lazily split the fused cache_gateup_{int8,sfb} into separate
+        gate/up views: the hybrid kernel takes one B tensor per projection,
+        unlike the cached path's single fused gate+up call. Built once on
+        first use and cached, so the extra HBM only costs when the hybrid
+        path actually runs."""
+        views = getattr(self, "_hybrid_cache", None)
+        if views is None:
+            I = self.slab.inter
+            views = (
+                self.cache_gateup_int8[:, :I].contiguous(),
+                self.cache_gateup_int8[:, I:].contiguous(),
+                self.cache_gateup_sfb[:, :I].contiguous(),
+                self.cache_gateup_sfb[:, I:].contiguous(),
+            )
+            self._hybrid_cache = views
+        return views
 
     def _cached_gpu_decode(
         self,
@@ -1561,15 +1696,18 @@ class Layer:
         sfa_h = sA.unsqueeze(1).expand(M_grouped, kb_h).contiguous()
 
         if kind == "cached":
+            # HBM-resident weights: deep-pattern kernel (ASYMGEMM_HBM_KERNEL).
+            gemm_fn = _hbm_grouped_gemm()
             # Fused gate+up: one grouped call over the [Nc, 2I, H] cache.
             d_gu = torch.empty(M_grouped, 2 * I, device=dev, dtype=torch.float32)
-            asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
+            gemm_fn(
                 (a_int8, sfa_h), (self.cache_gateup_int8, self.cache_gateup_sfb),
                 d_gu, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
             )
             act = torch.nn.functional.silu(d_gu[:, :I]) * d_gu[:, I:]
             down_b, down_sfb = self.cache_down_int8, self.cache_down_sfb
         else:
+            gemm_fn = asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous
             gs = slab.g_split
             if kind == "staged":
                 ring, slot_i, ready_ev, ids_t = staged
@@ -1627,7 +1765,7 @@ class Layer:
         sfa_i = sA2.unsqueeze(1).expand(M_grouped, kb_i).contiguous()
 
         d_down = torch.empty(M_grouped, H, device=dev, dtype=torch.float32)
-        asym_gemm.m_grouped_int8_asym_gemm_nt_contiguous(
+        gemm_fn(
             (a2_int8, sfa_i), (down_b, down_sfb),
             d_down, offsets, experts, list_size, recipe=(1, 1, GRAN_K),
         )
@@ -1641,6 +1779,89 @@ class Layer:
         orig_rows  = idx_to_orig[valid_idx]
         orig_slots = slot_to_orig[valid_idx]
         w = route_w_gpu[orig_rows, orig_slots]              # [n_valid]
+        y_w = d_down[valid_idx] * w[:, None]
+        return orig_rows, y_w
+
+    def _gpu_hybrid_forward(
+        self,
+        x_gpu: torch.Tensor,        # [T, H] bf16 device
+        layout_host,                # AsymGEMM layout for the streamed (pinned host) partition
+        layout_hbm,                 # AsymGEMM layout for the cached (HBM) partition
+        route_w_gpu: torch.Tensor,  # [T, top_k] fp32 device
+        n_host: int,                # expert count backing layout_host
+        n_hbm: int,                 # expert count backing layout_hbm
+    ):
+        """One GPU-bucket call via the single-launch hybrid kernel, replacing
+        the separate cached + streamed launches _gpu_grouped_forward issues
+        (ASYMGEMM_HYBRID_KERNEL=1). Host and HBM segments occupy disjoint row
+        ranges of one shared activation/output buffer per projection — host
+        rows first ([0, M_host)), HBM rows after ([M_host, M_host+M_hbm)) —
+        so layout_hbm's offsets are rebased by M_host; expert ids stay
+        side-local (host -> pinned slab, hbm -> the GPU cache), matching the
+        kernel's contract (hybridGEMM_usage.md §4). Returns the same
+        (orig_rows, y_weighted) pair as _gpu_grouped_forward.
+        """
+        slab = self.slab
+        dev = x_gpu.device
+        H, I = slab.hidden, slab.inter
+        kb_h, kb_i = slab.kb_hidden, slab.kb_inter
+
+        M_h, idx_h, slot_h, off_h, exp_h, ls_h = layout_host
+        M_d, idx_d, slot_d, off_d, exp_d, ls_d = layout_hbm
+        M = M_h + M_d
+        if M == 0:
+            return None, None
+
+        idx_to_orig = torch.cat((idx_h, idx_d))
+        slot_to_orig = torch.cat((slot_h, slot_d))
+        offsets_hbm = off_d + M_h
+
+        valid_mask = idx_to_orig >= 0
+        valid_idx = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+        a_bf16 = torch.zeros(M, H, device=dev, dtype=torch.bfloat16)
+        a_bf16.index_copy_(0, valid_idx,
+                            x_gpu.index_select(0, idx_to_orig[valid_idx]))
+        a_int8, sA = quantize_per_token_int8_gpu(a_bf16)
+        sfa_h = sA.unsqueeze(1).expand(M, kb_h).contiguous()
+
+        host_rows = M_h  # padded row count is a fine proxy for the s_host regime pick
+        rows_per_expert = (host_rows / n_host) if n_host else 0.0
+        num_sms = torch.cuda.get_device_properties(dev).multi_processor_count
+        s_host = _pick_s_host(rows_per_expert, n_host, n_hbm, num_sms)
+
+        cache_gate, cache_up, cache_gate_sfb, cache_up_sfb = self._hybrid_cache_views()
+
+        d_gate = torch.empty(M, I, device=dev, dtype=torch.float32)
+        asym_gemm.m_grouped_int8_hybrid_gemm_nt_contiguous(
+            (a_int8, sfa_h),
+            (slab.gate_int8, slab.gate_sfb), (cache_gate, cache_gate_sfb),
+            d_gate, off_h, exp_h, ls_h, offsets_hbm, exp_d, ls_d,
+            s_host=s_host, enable_steal=True, recipe=(1, 1, GRAN_K),
+        )
+        d_up = torch.empty(M, I, device=dev, dtype=torch.float32)
+        asym_gemm.m_grouped_int8_hybrid_gemm_nt_contiguous(
+            (a_int8, sfa_h),
+            (slab.up_int8, slab.up_sfb), (cache_up, cache_up_sfb),
+            d_up, off_h, exp_h, ls_h, offsets_hbm, exp_d, ls_d,
+            s_host=s_host, enable_steal=True, recipe=(1, 1, GRAN_K),
+        )
+
+        act_bf16 = (torch.nn.functional.silu(d_gate) * d_up).to(torch.bfloat16)
+        a2_int8, sA2 = quantize_per_token_int8_gpu(act_bf16)
+        sfa_i = sA2.unsqueeze(1).expand(M, kb_i).contiguous()
+
+        d_down = torch.empty(M, H, device=dev, dtype=torch.float32)
+        asym_gemm.m_grouped_int8_hybrid_gemm_nt_contiguous(
+            (a2_int8, sfa_i),
+            (slab.down_int8, slab.down_sfb),
+            (self.cache_down_int8, self.cache_down_sfb),
+            d_down, off_h, exp_h, ls_h, offsets_hbm, exp_d, ls_d,
+            s_host=s_host, enable_steal=True, recipe=(1, 1, GRAN_K),
+        )
+
+        orig_rows = idx_to_orig[valid_idx]
+        orig_slots = slot_to_orig[valid_idx]
+        w = route_w_gpu[orig_rows, orig_slots]
         y_w = d_down[valid_idx] * w[:, None]
         return orig_rows, y_w
 
@@ -1829,28 +2050,48 @@ class Layer:
             # tensor in NUMA-TP mode, with half-local kernel expert ids).
             partitions = []
             rest = gpu_experts
+            cached_part = gpu_experts[:0]
             if self.cache_n > 0:
                 cm = self._cached_mask_np[gpu_experts]
-                partitions.append((gpu_experts[cm], "cached"))
+                cached_part = gpu_experts[cm]
                 rest = gpu_experts[~cm]
             gs = self.slab.g_split
             staged_ctx = None
-            ring = (
-                _get_stage_ring(self.slab, self.cache_n,
-                                f"cuda:{self.cuda_device}")
-                if len(rest) else None
-            )
-            if ring is not None:
-                # Copy-engine staging: issue the async H2D copies NOW (side
-                # stream) so they overlap the cached partition's GEMMs and
-                # the CPU bucket; the staged GEMMs event-wait on them.
-                partitions.append((rest, "staged"))
-                staged_ctx = self._stage_copy(rest, ring)
-            elif self.slab.gate_int8_b is not None:
-                partitions.append((rest[rest < gs], "slab_a"))
-                partitions.append((rest[rest >= gs], "slab_b"))
+            hybrid_ctx = None
+            if self._use_hybrid_path(len(cached_part), len(rest)):
+                # Single fused launch replaces the separate cached + slab_a
+                # launches below (ASYMGEMM_HYBRID_KERNEL=1; see the
+                # _hybrid_kernel_enabled block near the top of this file).
+                layout_hbm = self._build_layout(
+                    cached_part, self._slot_np[cached_part], counts_np,
+                    seg_start_np, sorted_e, rows_sorted, slots_sorted, G,
+                    in_device,
+                )
+                layout_host = self._build_layout(
+                    rest, rest, counts_np, seg_start_np, sorted_e,
+                    rows_sorted, slots_sorted, G, in_device,
+                )
+                hybrid_ctx = (layout_host, layout_hbm)
             else:
-                partitions.append((rest, "slab_a"))
+                if len(cached_part):
+                    partitions.append((cached_part, "cached"))
+                ring = (
+                    _get_stage_ring(self.slab, self.cache_n,
+                                    f"cuda:{self.cuda_device}")
+                    if len(rest) else None
+                )
+                if ring is not None:
+                    # Copy-engine staging: issue the async H2D copies NOW
+                    # (side stream) so they overlap the cached partition's
+                    # GEMMs and the CPU bucket; the staged GEMMs event-wait
+                    # on them.
+                    partitions.append((rest, "staged"))
+                    staged_ctx = self._stage_copy(rest, ring)
+                elif self.slab.gate_int8_b is not None:
+                    partitions.append((rest[rest < gs], "slab_a"))
+                    partitions.append((rest[rest >= gs], "slab_b"))
+                else:
+                    partitions.append((rest, "slab_a"))
             # Time the streamed partitions with a CUDA event pair for the
             # dispatch cost model. The bracket opens just before the first
             # streamed (non-cached) partition's work is enqueued, so the
@@ -1858,40 +2099,54 @@ class Layer:
             # model must not learn from — stay outside it. Stream order
             # makes elapsed(start→end) cover exactly the streamed work,
             # including any event-waits on the staging ring's copies (that
-            # wait IS the PCIe transfer cost the model should see).
+            # wait IS the PCIe transfer cost the model should see). The
+            # hybrid path runs both sides in one launch, so its bracket
+            # covers that single call.
             ev_start = ev_end = None
-            for part, kind in partitions:
-                if not len(part):
-                    continue
-                if kind != "cached" and ev_start is None:
-                    ev_start = torch.cuda.Event(enable_timing=True)
-                    ev_start.record()
-                if kind == "cached":
-                    kernel_ids = self._slot_np[part]
-                elif kind == "staged":
-                    kernel_ids = np.arange(len(part), dtype=np.int64)
-                elif kind == "slab_b":
-                    kernel_ids = part - gs
-                else:
-                    kernel_ids = part
-                layout = self._build_layout(
-                    part, kernel_ids, counts_np, seg_start_np, sorted_e,
-                    rows_sorted, slots_sorted, G, in_device,
-                )
-                rows_p, y_p = self._gpu_grouped_forward(
-                    x_gpu_bf16, layout, route_w_gpu, kind=kind,
-                    staged=staged_ctx if kind == "staged" else None,
+            if hybrid_ctx is not None:
+                ev_start = torch.cuda.Event(enable_timing=True)
+                ev_start.record()
+                rows_p, y_p = self._gpu_hybrid_forward(
+                    x_gpu_bf16, hybrid_ctx[0], hybrid_ctx[1], route_w_gpu,
+                    n_host=len(rest), n_hbm=len(cached_part),
                 )
                 if rows_p is not None:
                     gpu_parts.append((rows_p, y_p))
+            else:
+                for part, kind in partitions:
+                    if not len(part):
+                        continue
+                    if kind != "cached" and ev_start is None:
+                        ev_start = torch.cuda.Event(enable_timing=True)
+                        ev_start.record()
+                    if kind == "cached":
+                        kernel_ids = self._slot_np[part]
+                    elif kind == "staged":
+                        kernel_ids = np.arange(len(part), dtype=np.int64)
+                    elif kind == "slab_b":
+                        kernel_ids = part - gs
+                    else:
+                        kernel_ids = part
+                    layout = self._build_layout(
+                        part, kernel_ids, counts_np, seg_start_np, sorted_e,
+                        rows_sorted, slots_sorted, G, in_device,
+                    )
+                    rows_p, y_p = self._gpu_grouped_forward(
+                        x_gpu_bf16, layout, route_w_gpu, kind=kind,
+                        staged=staged_ctx if kind == "staged" else None,
+                    )
+                    if rows_p is not None:
+                        gpu_parts.append((rows_p, y_p))
             if ev_start is not None:
                 ev_end = torch.cuda.Event(enable_timing=True)
                 ev_end.record()
                 self._gpu_bucket_calls += 1
                 if self._gpu_bucket_calls > 1:   # first call is JIT warm-up
-                    streamed_gpu = np.concatenate(
-                        [p for p, kind in partitions
-                         if kind != "cached" and len(p)])
+                    streamed_gpu = (
+                        rest if hybrid_ctx is not None else np.concatenate(
+                            [p for p, kind in partitions
+                             if kind != "cached" and len(p)])
+                    )
                     total_padded = int(sum(
                         self.dispatch.padded(int(c))
                         for c in counts_np[streamed_gpu]))

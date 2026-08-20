@@ -1,0 +1,98 @@
+{
+  "device": "NVIDIA H200",
+  "cc": "9.0",
+  "total_mem_gb": 150.1,
+  "torch": "2.9.1+cu129",
+  "date": "2026-07-21",
+  "pcie_copy_h2d_gbs": 47.39,
+  "benches": {
+    "prefill_up_pinned": {
+      "ms_min": 6.2477,
+      "ms_med": 6.2961,
+      "tops": 5.5,
+      "pcie_gbs": 10.74,
+      "hbm_gbs_est": 167.16,
+      "M": 2048,
+      "N": 4096,
+      "K": 2048,
+      "S": 8
+    },
+    "prefill_down_pinned": {
+      "ms_min": 7.9721,
+      "ms_med": 8.1204,
+      "tops": 4.31,
+      "pcie_gbs": 8.42,
+      "hbm_gbs_est": 133.63,
+      "M": 2048,
+      "N": 2048,
+      "K": 4096,
+      "S": 8
+    },
+    "decode_pinned": {
+      "ms_min": 5.442,
+      "ms_med": 5.4647,
+      "tops": 0.39,
+      "pcie_gbs": 12.33,
+      "hbm_gbs_est": 11.99,
+      "M": 128,
+      "N": 4096,
+      "K": 2048,
+      "S": 8
+    },
+    "deep_k_pinned": {
+      "ms_min": 14.4268,
+      "ms_med": 14.6339,
+      "tops": 4.17,
+      "pcie_gbs": 8.14,
+      "hbm_gbs_est": 129.59,
+      "M": 1024,
+      "N": 4096,
+      "K": 7168,
+      "S": 4
+    },
+    "prefill_up_hbm": {
+      "ms_min": 0.9711,
+      "ms_med": 0.9742,
+      "tops": 35.38,
+      "pcie_gbs": 0.0,
+      "hbm_gbs_est": 1144.56,
+      "M": 2048,
+      "N": 4096,
+      "K": 2048,
+      "S": 8
+    },
+    "prefill_down_hbm": {
+      "ms_min": 1.1013,
+      "ms_med": 1.1052,
+      "tops": 31.2,
+      "pcie_gbs": 0.0,
+      "hbm_gbs_est": 1028.25,
+      "M": 2048,
+      "N": 2048,
+      "K": 4096,
+      "S": 8
+    },
+    "decode_hbm": {
+      "ms_min": 0.2002,
+      "ms_med": 0.2044,
+      "tops": 10.73,
+      "pcie_gbs": 0.0,
+      "hbm_gbs_est": 661.38,
+      "M": 128,
+      "N": 4096,
+      "K": 2048,
+      "S": 8
+    },
+    "deep_k_hbm": {
+      "ms_min": 1.9554,
+      "ms_med": 1.9609,
+      "tops": 30.75,
+      "pcie_gbs": 0.0,
+      "hbm_gbs_est": 1016.21,
+      "M": 1024,
+      "N": 4096,
+      "K": 7168,
+      "S": 4
+    }
+  }
+}

@@ -81,6 +81,11 @@ try:
             # INT8 GEMMs (SM90)
             "m_grouped_int8_asym_gemm_nt_contiguous",
             "m_grouped_int8_asym_gemm_nt_masked",
+            "m_grouped_int8_gemm_nt_contiguous",
+            "m_grouped_int8_hybrid_gemm_nt_contiguous",
+            # INT8 GEMMs (SM80/A100 direct entry points; also run on SM90+)
+            "m_grouped_int8_asym_gemm_sm80_contiguous",
+            "m_grouped_int8_asym_gemm_sm80_masked",
             # SM80 MoE GEMM (FP16 + BF16, JIT)
             "m_grouped_moe_gemm_nt_contiguous",
             # Einsum kernels
