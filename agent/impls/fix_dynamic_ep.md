@@ -403,3 +403,26 @@ V5 Re-ladder + rebank ONLY models with measured wins (standing banking
     best, q122 +3.7%, q35 +2.6%-vs-banked) still need the ledger's own
     re-bank protocol (same-machine trios: c17 hunyuan 320k, c18
     q122/q35) before entering figures.
+- [2026-08-14 ~19:00] FIG-11 FINAL (T3-only semantics per Kevin): pushed
+  d634d97. Middle row = SO+Unsloth-GC-Offload, asym row = STRICTLY T3
+  (30B plain-T3 ohbm0 row; 35B plain-T3). GLM-4.7-Flash panel REPLACED
+  by Qwen3.5-35B after measurement showed flash T3 never undercuts uo in
+  HBM at any SO-fitting length (T3 50.6@320K/96.8@640K complete-run vs
+  uo 48.0/92.5; T3o8 105@640K; flash's long-seq survival is host-side
+  economy — it spends MORE HBM (182) to dodge uo's host wall). Final
+  all-measured panels (peak reserved GiB, 1r b1, solo, membind 0,1 for
+  the big-footprint cells):
+    Qwen3-30B  (320K/1.1M/1.6M):  SO 151/OOM/OOM · uo 50/157/OOM ·
+                                  T3 38/119/156
+    Qwen3.5-35B(256K/896K/1.15M): SO 114/OOM/OOM · uo 62/183/OOM ·
+                                  T3 36/84/108
+  Rhetoric verified: 3-way cascade at short cols (-75%/-68% total),
+  -24%/-54% T3-vs-uo at mid cols (35B uo grazes the 184 ceiling at 183),
+  both baselines' OOM walls measured/banked at the long cols with T3
+  alone standing (156 / 108 — 35B T3 at just 59% of HBM where uo died).
+  MEASUREMENT PITFALLS BANKED: (1) killed-cell warmup peaks UNDERSTATE
+  the true peak (ft3o8_640: 80 warmup vs 105 complete) — only complete
+  runs bank; (2) NUMACTL_MEMBIND=0 halves the host budget and fake-OOMs
+  T3-family cells (both flash 640K host-OOMs were binding artifacts);
+  (3) the qwen3.5-family jobs.tsv failed:1 completeness quirk also hits
+  qwen3-30B T3 cells — step_samples is the source of truth.

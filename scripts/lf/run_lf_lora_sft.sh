@@ -241,6 +241,7 @@ declare -A WATCHDOG_FLOOR_GB_BY_MODEL=(
   ["openai/gpt-oss-20b"]=35
   # dequantized-bf16 local copy (2026-08-12, mixtral fused-copy precedent; same floor)
   ["/scratch_local/user_data/shutian/kevin/cache/fused/gpt-oss-20b-bf16"]=35
+  ["/scratch_local/user_data/shutian/kevin/cache/fused/gpt-oss-120b-bf16"]=35
   ["ai21labs/AI21-Jamba2-Mini"]=50
 )
 if [[ -z "${HOST_MEM_WATCHDOG_FLOOR_GB:-}" ]]; then

@@ -83,7 +83,7 @@ declare -A M=(
   [hunyuan-a13b]="tencent/Hunyuan-A13B-Instruct"     # layers: 32 (model_integration.md #3)
   [glm4.5-air]="zai-org/GLM-4.5-Air"                 # layers: 46 (model_integration.md #4)
   [glm4.7-flash]="zai-org/GLM-4.7-Flash"             # layers: 47 (model_integration.md #5)
-  [gpt-oss-120b]="openai/gpt-oss-120b"               # layers: 36 (model_integration.md #6)
+  [gpt-oss-120b]="/scratch_local/user_data/shutian/kevin/cache/fused/gpt-oss-120b-bf16" # layers: 36 (model_integration.md #6; DEQUANTIZED bf16 local copy 2026-08-15, 218G, 20b/mixtral precedent — MXFP4 source dequants on every load; machine-local path. was openai/gpt-oss-120b)
   [gpt-oss-20b]="/scratch_local/user_data/shutian/kevin/cache/fused/gpt-oss-20b-bf16" # layers: 24 (gpt_oss family, 32E top-4; DEQUANTIZED bf16 local copy 2026-08-12 — MXFP4 source dequants on every load without the kernels pkg; mixtral fused-copy precedent. was openai/gpt-oss-20b)
   [jamba2-mini]="ai21labs/AI21-Jamba2-Mini"          # layers: 32 (model_integration.md #7; hybrid Mamba+attn, MoE odd layers)
   # dense
