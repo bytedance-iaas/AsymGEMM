@@ -69,3 +69,6 @@ Makefile
 # Benchmark result logs
 sglang_*.jsonl
 *.bak*
+
+# Session scratch dirs
+scratchpad/
