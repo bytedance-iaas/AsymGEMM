@@ -20,10 +20,13 @@
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
 #include "../jit_kernels/impls/sm89_bf16_asym_gemm.hpp"
 #include "../jit_kernels/impls/sm80_moe_gemm.hpp"
+#include "../jit_kernels/impls/sm80_int8_asym_gemm.hpp"
 #include "../jit_kernels/impls/sm89_fp8_asym_gemm.hpp"
 
 #if DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/sm90_int8_asym_gemm_1d1d.hpp"
+#include "../jit_kernels/impls/sm90_int8_gemm.hpp"
+#include "../jit_kernels/impls/sm90_int8_hybrid_gemm.hpp"
 #endif
 
 #include "layout.hpp"
@@ -595,8 +598,15 @@ static void m_grouped_int8_asym_gemm_nt_contiguous(const std::pair<torch::Tensor
                                                  list_size, sfa_k, sfb_k);
         return;
     }
+    // Ampere data-center (SM80/A100): K-outer cp.async kernel; consumes the
+    // natural scale layouts directly (no K-major transform).
+    if (arch_major == 8 and device_runtime->get_arch_pair().second == 0) {
+        sm80_m_grouped_int8_asym_gemm_contiguous(a_data, b_data, d, offsets, experts,
+                                                 list_size, sfa, sfb);
+        return;
+    }
     DG_HOST_UNREACHABLE("INT8 contiguous asym GEMM is not supported on this architecture "
-                        "(supported: SM90)");
+                        "(supported: SM80, SM90)");
 }
 
 static void m_grouped_int8_asym_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -625,7 +635,96 @@ static void m_grouped_int8_asym_gemm_nt_masked(const std::pair<torch::Tensor, to
         m_grouped_int8_asym_gemm_sm90_masked(a_data, b_data, d, masked_m, expected_m, sfa_k, sfb_k);
         return;
     }
+    // Ampere data-center (SM80/A100): natural scale layouts, no transform.
+    if (arch_major == 8 and device_runtime->get_arch_pair().second == 0) {
+        (void)expected_m;  // grid is constant; expected_m is an SM90 tuning hint
+        sm80_m_grouped_int8_asym_gemm_masked(a_data, b_data, d, masked_m, sfa, sfb);
+        return;
+    }
     DG_HOST_UNREACHABLE("INT8 masked asym GEMM is not supported on this architecture "
+                        "(supported: SM80, SM90)");
+}
+
+// Deep-pattern INT8 grouped GEMM for HBM-resident expert weights
+// (hybridGEMM.md Phase A). Same calling convention as the asym contiguous
+// facade; routes to the persistent M-outer kernel instead of the K-outer
+// PCIe-oriented one.
+static void m_grouped_int8_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                              const std::pair<torch::Tensor, torch::Tensor>& b,
+                                              const torch::Tensor& d,
+                                              const torch::Tensor& offsets, const torch::Tensor& experts,
+                                              const int& list_size,
+                                              std::optional<std::tuple<int, int, int>> recipe,
+                                              const std::string& compiled_dims) {
+    (void)recipe;
+    (void)compiled_dims;
+
+    const auto& a_data = a.first;
+    const auto& sfa    = a.second;   // [M, Kb]    per-token
+    const auto& b_data = b.first;
+    const auto& sfb    = b.second;   // [G, N, Kb] per-channel
+    const int64_t num_groups = b_data.size(0);
+    const int64_t n          = b_data.size(1);
+    const int64_t kb         = sfa.size(-1);
+
+    const auto& arch_major = device_runtime->get_arch_major();
+    if (arch_major == 9) {
+        // Kernel reads K-block row 0 of the K-major scale layouts (scales are
+        // constant along K): sfa [M,Kb]->[Kb,M], sfb [G,N,Kb]->[Kb,G*N].
+        const auto& sfa_k = sfa.transpose(0, 1).contiguous();
+        const auto& sfb_k = sfb.permute({2, 0, 1}).reshape({kb, num_groups * n}).contiguous();
+        m_grouped_int8_deep_gemm_sm90_contiguous(a_data, b_data, d, offsets, experts,
+                                                 list_size, sfa_k, sfb_k);
+        return;
+    }
+    DG_HOST_UNREACHABLE("INT8 deep grouped GEMM is not supported on this architecture "
+                        "(supported: SM90)");
+}
+
+// Fused hybrid INT8 grouped GEMM (hybridGEMM.md Phase B): ONE launch computes
+// host-resident segments with the asym K-outer pipeline on CTA ranks
+// [0, s_host) and HBM-resident segments with the deep M-outer pipeline on the
+// remaining ranks. Same per-side layout convention as the contiguous facades;
+// the two segment lists must cover disjoint row ranges of a/d.
+static void m_grouped_int8_hybrid_gemm_nt_contiguous(
+        const std::pair<torch::Tensor, torch::Tensor>& a,       // (a [M,K] int8, sfa [M,Kb] fp32)
+        const std::pair<torch::Tensor, torch::Tensor>& b_host,  // ([Gh,N,K] int8 pinned/cuda, sfb [Gh,N,Kb])
+        const std::pair<torch::Tensor, torch::Tensor>& b_hbm,   // ([Gd,N,K] int8 cuda, sfb [Gd,N,Kb])
+        const torch::Tensor& d,
+        const torch::Tensor& offsets_host, const torch::Tensor& experts_host, const int& list_size_host,
+        const torch::Tensor& offsets_hbm, const torch::Tensor& experts_hbm, const int& list_size_hbm,
+        const int& s_host, const bool& enable_steal,
+        std::optional<std::tuple<int, int, int>> recipe,
+        const std::string& compiled_dims) {
+    (void)recipe;
+    (void)compiled_dims;
+
+    const auto& a_data = a.first;
+    const auto& sfa         = a.second;   // [M, Kb]     per-token
+    const auto& b_host_data = b_host.first;
+    const auto& sfb_host    = b_host.second;
+    const auto& b_hbm_data  = b_hbm.first;
+    const auto& sfb_hbm     = b_hbm.second;
+    const int64_t gh = b_host_data.size(0);
+    const int64_t gd = b_hbm_data.size(0);
+    const int64_t n  = b_host_data.size(1);
+    const int64_t kb = sfa.size(-1);
+
+    const auto& arch_major = device_runtime->get_arch_major();
+    if (arch_major == 9) {
+        // Pre-transpose scales K-major (the layout both parents consume):
+        // sfa [M,Kb]->[Kb,M], sfb [G,N,Kb]->[Kb,G*N].
+        const auto& sfa_k = sfa.transpose(0, 1).contiguous();
+        const auto& sfb_host_k = sfb_host.permute({2, 0, 1}).reshape({kb, gh * n}).contiguous();
+        const auto& sfb_hbm_k = sfb_hbm.permute({2, 0, 1}).reshape({kb, gd * n}).contiguous();
+        m_grouped_int8_hybrid_gemm_sm90_contiguous(
+            a_data, b_host_data, b_hbm_data, d,
+            offsets_host, experts_host, list_size_host,
+            offsets_hbm, experts_hbm, list_size_hbm,
+            s_host, enable_steal, sfa_k, sfb_host_k, sfb_hbm_k);
+        return;
+    }
+    DG_HOST_UNREACHABLE("INT8 hybrid grouped GEMM is not supported on this architecture "
                         "(supported: SM90)");
 }
 
@@ -1093,6 +1192,19 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk");
 #endif
 
+    // Direct SM80 INT8 asym entry points (kernel guard is >= 800, so these also
+    // run on SM90+ — used by tests to exercise the A100 code path on H100 boxes;
+    // production code should go through m_grouped_int8_asym_gemm_nt_* instead).
+    m.def("m_grouped_int8_asym_gemm_sm80_contiguous",
+          &sm80_m_grouped_int8_asym_gemm_contiguous,
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
+          py::arg("sfa"), py::arg("sfb"));
+    m.def("m_grouped_int8_asym_gemm_sm80_masked",
+          &sm80_m_grouped_int8_asym_gemm_masked,
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("masked_m"), py::arg("sfa"), py::arg("sfb"));
+
 #if DG_TENSORMAP_COMPATIBLE
     // Architecture-agnostic INT8 asym GEMM (routes to SM90 today)
     m.def("m_grouped_int8_asym_gemm_nt_contiguous",
@@ -1112,6 +1224,30 @@ static void register_apis(pybind11::module_& m) {
               &m_grouped_int8_asym_gemm_nt_masked),
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("masked_m"), py::arg("expected_m"),
+          py::arg("recipe") = std::nullopt, py::arg("compiled_dims") = "nk");
+    m.def("m_grouped_int8_gemm_nt_contiguous",
+          static_cast<void(*)(const std::pair<torch::Tensor, torch::Tensor>&,
+                              const std::pair<torch::Tensor, torch::Tensor>&,
+                              const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+                              const int&, std::optional<std::tuple<int, int, int>>, const std::string&)>(
+              &m_grouped_int8_gemm_nt_contiguous),
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("offsets"), py::arg("experts"), py::arg("list_size"),
+          py::arg("recipe") = std::nullopt, py::arg("compiled_dims") = "nk");
+    m.def("m_grouped_int8_hybrid_gemm_nt_contiguous",
+          static_cast<void(*)(const std::pair<torch::Tensor, torch::Tensor>&,
+                              const std::pair<torch::Tensor, torch::Tensor>&,
+                              const std::pair<torch::Tensor, torch::Tensor>&,
+                              const torch::Tensor&,
+                              const torch::Tensor&, const torch::Tensor&, const int&,
+                              const torch::Tensor&, const torch::Tensor&, const int&,
+                              const int&, const bool&,
+                              std::optional<std::tuple<int, int, int>>, const std::string&)>(
+              &m_grouped_int8_hybrid_gemm_nt_contiguous),
+          py::arg("a"), py::arg("b_host"), py::arg("b_hbm"), py::arg("d"),
+          py::arg("offsets_host"), py::arg("experts_host"), py::arg("list_size_host"),
+          py::arg("offsets_hbm"), py::arg("experts_hbm"), py::arg("list_size_hbm"),
+          py::arg("s_host"), py::arg("enable_steal") = false,
           py::arg("recipe") = std::nullopt, py::arg("compiled_dims") = "nk");
 
 #endif
