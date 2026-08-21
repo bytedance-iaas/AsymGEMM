@@ -10,7 +10,7 @@ After u merge these, lets run some heavy (near capacity) worklaod for Qwnw3 30b 
 When u run vaiaditons need to use asym40_enroot_run this starts the correct container that u will run the ssytem.
 
 But again i dont think there is much deep code cahnges but stil be vry careult and careuflt make ur we retian 1. all the soruce code changes. no features should be lost. 2. incorporate scritps and docs cahgnes no informatio shoud be lost.
-All the repos are alreuad dmeo prignal to relev the same strufu so they hsjldnbe easilt merged. Afain dont lose any nontrial features and docs and artifacts (results of runs).
+All the repos are alreuad dmeo prignal to relev the same strufu so they hsjldnbe easilt merged. Afain dont lose any nontrial features and docs and artifacts (results of runs). If there is no reaon to rerurn vlaidatinos tho (liek mostl jsut trivial code chaneg and scfrip changes we dont need validation runs)
 
 Dont stop util this repo is a clear merge of all these individual repos.
 

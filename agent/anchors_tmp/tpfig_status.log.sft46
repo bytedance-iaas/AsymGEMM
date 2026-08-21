@@ -1,0 +1,448 @@
+GLMEXT-REV begin 23:41
+START by2rc160 glm4.5-air superoffload_mem|recomp s=160000 b=1 r=2 23:41
+GLMEXT-REV begin 23:45
+START by1rc160 glm4.5-air superoffload_mem|recomp s=160000 b=2 r=1 23:45
+CELL by1rc160 superoffload_mem|recomp s=160000 b=2 -> GOOM 23:49
+START by1rc160 glm4.5-air superoffload_mem|recomp s=160000 b=1 r=1 23:49
+CELL by1rc160 superoffload_mem|recomp s=160000 b=1 -> GOOM 23:53
+START by1un160 glm4.5-air superoffload_mem|unsloth s=160000 b=2 r=1 23:53
+CELL by1un160 superoffload_mem|unsloth s=160000 b=2 -> GOOM 23:57
+START by1un160 glm4.5-air superoffload_mem|unsloth s=160000 b=1 r=1 23:57
+CELL by1un160 superoffload_mem|unsloth s=160000 b=1 -> TRAINED 00:10
+START by1uo160 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=160000 b=1 r=1 00:10
+CELL by1uo160 superoffload_mem|unsloth-off-ohbm0 s=160000 b=1 -> TRAINED 00:25
+START by1t1160 glm4.5-air asym_cpuadamwds|T1 s=160000 b=2 r=1 00:25
+CELL by1t1160 asym_cpuadamwds|T1 s=160000 b=2 -> TRAINED 00:51
+EXT-RUNG-DONE by1 glm4.5-air s=160000 00:51
+START by1rc192 glm4.5-air superoffload_mem|recomp s=192000 b=1 r=1 00:51
+CELL by1rc192 superoffload_mem|recomp s=192000 b=1 -> GOOM 00:56
+START by1un192 glm4.5-air superoffload_mem|unsloth s=192000 b=1 r=1 00:56
+CELL by1un192 superoffload_mem|unsloth s=192000 b=1 -> TRAINED 01:12
+START by1uo192 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=192000 b=1 r=1 01:12
+CELL by1uo192 superoffload_mem|unsloth-off-ohbm0 s=192000 b=1 -> TRAINED 01:32
+START by1t1192 glm4.5-air asym_cpuadamwds|T1 s=192000 b=2 r=1 01:32
+CELL by1t1192 asym_cpuadamwds|T1 s=192000 b=2 -> GOOM 01:45
+START by1t1192 glm4.5-air asym_cpuadamwds|T1 s=192000 b=1 r=1 01:45
+CELL by1t1192 asym_cpuadamwds|T1 s=192000 b=1 -> TRAINED 02:04
+EXT-RUNG-DONE by1 glm4.5-air s=192000 02:04
+START by1rc256 glm4.5-air superoffload_mem|recomp s=256000 b=1 r=1 02:04
+CELL by1rc256 superoffload_mem|recomp s=256000 b=1 -> GOOM 02:10
+START by1un256 glm4.5-air superoffload_mem|unsloth s=256000 b=1 r=1 02:10
+CELL by1un256 superoffload_mem|unsloth s=256000 b=1 -> GOOM 02:15
+START by1uo256 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=256000 b=1 r=1 02:15
+CELL by1uo256 superoffload_mem|unsloth-off-ohbm0 s=256000 b=1 -> TRAINED 02:44
+START by1t1256 glm4.5-air asym_cpuadamwds|T1 s=256000 b=1 r=1 02:44
+CELL by1t1256 asym_cpuadamwds|T1 s=256000 b=1 -> TRAINED 03:16
+EXT-RUNG-DONE by1 glm4.5-air s=256000 03:16
+START by1rc320 glm4.5-air superoffload_mem|recomp s=320000 b=1 r=1 03:16
+CELL by1rc320 superoffload_mem|recomp s=320000 b=1 -> GOOM 03:22
+START by1un320 glm4.5-air superoffload_mem|unsloth s=320000 b=1 r=1 03:22
+CELL by1un320 superoffload_mem|unsloth s=320000 b=1 -> GOOM 03:27
+START by1uo320 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=320000 b=1 r=1 03:27
+CELL by1uo320 superoffload_mem|unsloth-off-ohbm0 s=320000 b=1 -> COOM 03:43
+START by1t1320 glm4.5-air asym_cpuadamwds|T1 s=320000 b=1 r=1 03:44
+CELL by1t1320 asym_cpuadamwds|T1 s=320000 b=1 -> TRAINED 04:28
+EXT-RUNG-DONE by1 glm4.5-air s=320000 04:28
+Y1-DONE(rev) 04:28
+START by2rc160 glm4.5-air superoffload_mem|recomp s=160000 b=1 r=2 04:28
+CELL by2rc160 superoffload_mem|recomp s=160000 b=1 -> GOOM 04:32
+START by2un160 glm4.5-air superoffload_mem|unsloth s=160000 b=2 r=2 04:32
+CELL by2un160 superoffload_mem|unsloth s=160000 b=2 -> COOM 04:36
+START by2un160 glm4.5-air superoffload_mem|unsloth s=160000 b=1 r=2 04:36
+CELL by2un160 superoffload_mem|unsloth s=160000 b=1 -> TRAINED 04:50
+START by2uo160 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=160000 b=1 r=2 04:50
+CELL by2uo160 superoffload_mem|unsloth-off-ohbm0 s=160000 b=1 -> COOM 04:54
+START by2t1160 glm4.5-air asym_sdp2_cpuadamwds|T1 s=160000 b=3 r=2 04:54
+CELL by2t1160 asym_sdp2_cpuadamwds|T1 s=160000 b=3 -> GOOM 05:04
+START by2t1160 glm4.5-air asym_sdp2_cpuadamwds|T1 s=160000 b=2 r=2 05:04
+CELL by2t1160 asym_sdp2_cpuadamwds|T1 s=160000 b=2 -> TRAINED 05:30
+EXT-RUNG-DONE by2 glm4.5-air s=160000 05:30
+START by2rc192 glm4.5-air superoffload_mem|recomp s=192000 b=1 r=2 05:30
+CELL by2rc192 superoffload_mem|recomp s=192000 b=1 -> GOOM 05:35
+START by2un192 glm4.5-air superoffload_mem|unsloth s=192000 b=1 r=2 05:35
+CELL by2un192 superoffload_mem|unsloth s=192000 b=1 -> TRAINED 05:52
+START by2uo192 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=192000 b=1 r=2 05:52
+CELL by2uo192 superoffload_mem|unsloth-off-ohbm0 s=192000 b=1 -> COOM 05:56
+START by2t1192 glm4.5-air asym_sdp2_cpuadamwds|T1 s=192000 b=2 r=2 05:56
+CELL by2t1192 asym_sdp2_cpuadamwds|T1 s=192000 b=2 -> GOOM 06:05
+START by2t1192 glm4.5-air asym_sdp2_cpuadamwds|T1 s=192000 b=1 r=2 06:05
+CELL by2t1192 asym_sdp2_cpuadamwds|T1 s=192000 b=1 -> TRAINED 06:24
+EXT-RUNG-DONE by2 glm4.5-air s=192000 06:24
+START by2rc256 glm4.5-air superoffload_mem|recomp s=256000 b=1 r=2 06:24
+CELL by2rc256 superoffload_mem|recomp s=256000 b=1 -> FAIL 06:55
+GUARD-REAPED orphan 3266422 gpu=0,1 06:58
+GUARD-REAPED orphan 3266423 gpu=0,1 06:58
+START by2un256 glm4.5-air superoffload_mem|unsloth s=256000 b=1 r=2 06:58
+CELL by2un256 superoffload_mem|unsloth s=256000 b=1 -> GOOM 07:04
+START by2uo256 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=256000 b=1 r=2 07:04
+CELL by2uo256 superoffload_mem|unsloth-off-ohbm0 s=256000 b=1 -> COOM 07:09
+START by2t1256 glm4.5-air asym_sdp2_cpuadamwds|T1 s=256000 b=2 r=2 07:09
+CELL by2t1256 asym_sdp2_cpuadamwds|T1 s=256000 b=2 -> GOOM 07:16
+START by2t1256 glm4.5-air asym_sdp2_cpuadamwds|T1 s=256000 b=1 r=2 07:16
+CELL by2t1256 asym_sdp2_cpuadamwds|T1 s=256000 b=1 -> TRAINED 07:44
+EXT-RUNG-DONE by2 glm4.5-air s=256000 07:44
+START by2rc320 glm4.5-air superoffload_mem|recomp s=320000 b=1 r=2 07:44
+CELL by2rc320 superoffload_mem|recomp s=320000 b=1 -> FAIL 08:16
+GUARD-REAPED orphan 2784197 gpu=0,1 08:18
+START by2un320 glm4.5-air superoffload_mem|unsloth s=320000 b=1 r=2 08:19
+CELL by2un320 superoffload_mem|unsloth s=320000 b=1 -> COOM 08:24
+START by2uo320 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=320000 b=1 r=2 08:24
+CELL by2uo320 superoffload_mem|unsloth-off-ohbm0 s=320000 b=1 -> COOM 08:29
+START by2t1320 glm4.5-air asym_sdp2_cpuadamwds|T1 s=320000 b=1 r=2 08:29
+CELL by2t1320 asym_sdp2_cpuadamwds|T1 s=320000 b=1 -> TRAINED 09:09
+EXT-RUNG-DONE by2 glm4.5-air s=320000 09:09
+Y2-DONE(rev) 09:09
+START bx1rc256 glm4.7-flash superoffload_mem|recomp s=256000 b=2 r=1 09:09
+PAUSE for Air debt (rc desync fix + reruns + by1 384k ext) before X phases 09:10
+RCREDO begin 09:19
+START by2rc256r glm4.5-air superoffload_mem|recomp s=256000 b=1 r=2 09:19
+CELL by2rc256r superoffload_mem|recomp s=256000 b=1 -> FAIL 09:50
+RCREDO begin 10:07
+GUARD-REAPED orphan 2798479 gpu=0,1 10:10
+START by2rc256f glm4.5-air superoffload_mem|recomp s=256000 b=1 r=2 10:10
+CELL by2rc256f superoffload_mem|recomp s=256000 b=1 -> FAIL 10:41
+RCREDO begin 10:44
+GUARD-REAPED orphan 458312 gpu=0,1 10:44
+START by2rc256g glm4.5-air superoffload_mem|recomp s=256000 b=1 r=2 10:44
+START by2rc320f glm4.5-air superoffload_mem|recomp s=320000 b=1 r=2 10:44
+CELL by2rc320f superoffload_mem|recomp s=320000 b=1 -> COOM 10:47
+RCREDO done 10:47
+CELL by2rc256g superoffload_mem|recomp s=256000 b=1 -> COOM 10:47
+START by2rc320g glm4.5-air superoffload_mem|recomp s=320000 b=1 r=2 10:47
+RCREDO begin 10:48
+START by2rc256h glm4.5-air superoffload_mem|recomp s=256000 b=1 r=2 10:48
+CELL by2rc256h superoffload_mem|recomp s=256000 b=1 -> FAIL 11:20
+GUARD-REAPED orphan 2305449 gpu=0,1 11:22
+START by2rc320h glm4.5-air superoffload_mem|recomp s=320000 b=1 r=2 11:23
+CELL by2rc320h superoffload_mem|recomp s=320000 b=1 -> FAIL 11:54
+RCREDO done 11:54
+RCREDO begin 11:57
+GUARD-REAPED orphan 3892762 gpu=0,1 12:00
+START by2rc256i glm4.5-air superoffload_mem|recomp s=256000 b=1 r=2 12:00
+CELL by2rc256i superoffload_mem|recomp s=256000 b=1 -> GOOM 12:05
+GUARD-REAPED orphan 1232790 gpu=0,1 12:08
+START by2rc320i glm4.5-air superoffload_mem|recomp s=320000 b=1 r=2 12:08
+CELL by2rc320i superoffload_mem|recomp s=320000 b=1 -> GOOM 12:13
+RCREDO done 12:13
+BY1EXT384 begin 12:14
+GUARD-REAPED orphan 1445581 gpu=0 12:16
+START by1t1384 glm4.5-air asym_cpuadamwds|T1 s=384000 b=1 r=1 12:17
+CELL by1t1384 asym_cpuadamwds|T1 s=384000 b=1 -> GOOM 12:37
+START by1t2384 glm4.5-air asym_cpuadamwds|T2 s=384000 b=1 r=1 12:37
+CELL by1t2384 asym_cpuadamwds|T2 s=384000 b=1 -> TRAINED 13:31
+BY1EXT384 done 13:31
+GLMEXT-REV begin 13:32
+RUNG-SKIP by1 s=160000 (rung already logged for y1/by1 t*160) 13:32
+RUNG-SKIP by1 s=192000 (rung already logged for y1/by1 t*192) 13:32
+RUNG-SKIP by1 s=256000 (rung already logged for y1/by1 t*256) 13:32
+RUNG-SKIP by1 s=320000 (rung already logged for y1/by1 t*320) 13:32
+Y1-DONE(rev) 13:32
+RUNG-SKIP by2 s=160000 (rung already logged for y2/by2 t*160) 13:32
+RUNG-SKIP by2 s=192000 (rung already logged for y2/by2 t*192) 13:32
+RUNG-SKIP by2 s=256000 (rung already logged for y2/by2 t*256) 13:32
+RUNG-SKIP by2 s=320000 (rung already logged for y2/by2 t*320) 13:32
+Y2-DONE(rev) 13:32
+START bx1rc256 glm4.7-flash superoffload_mem|recomp s=256000 b=2 r=1 13:32
+CELL bx1rc256 superoffload_mem|recomp s=256000 b=2 -> GOOM 13:39
+START bx1rc256 glm4.7-flash superoffload_mem|recomp s=256000 b=1 r=1 13:39
+FLASH-DEFERRED 13:48 — user: finish Air to 6 extension rungs/rank first
+AIR-EXT6 begin 13:48
+GUARD-REAPED orphan 1227314 gpu=0,1 13:51
+START by2t1384 glm4.5-air asym_sdp2_cpuadamwds|T1 s=384000 b=1 r=2 13:51
+CELL by2t1384 asym_sdp2_cpuadamwds|T1 s=384000 b=1 -> GOOM 14:02
+START by2t2384 glm4.5-air asym_sdp2_cpuadamwds|T2 s=384000 b=1 r=2 14:02
+CELL by2t2384 asym_sdp2_cpuadamwds|T2 s=384000 b=1 -> FAIL 14:08
+START by2t3384 glm4.5-air asym_sdp2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=384000 b=1 r=2 14:08
+AIR-EXT6 begin 14:10
+START by2t2384b glm4.5-air asym_sdp2_cpuadamwds|T2 s=384000 b=1 r=2 14:10
+CELL by2t2384b asym_sdp2_cpuadamwds|T2 s=384000 b=1 -> FAIL 14:16
+START by2t3384b glm4.5-air asym_sdp2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=384000 b=1 r=2 14:16
+AIR-EXT6 begin 14:18
+START by2t2384c glm4.5-air asym_sdp2_cpuadamwds|T2 s=384000 b=1 r=2 14:18
+CELL by2t2384c asym_sdp2_cpuadamwds|T2 s=384000 b=1 -> COOM 14:36
+START by2t3384c glm4.5-air asym_sdp2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=384000 b=1 r=2 14:36
+CELL by2t3384c asym_sdp2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=384000 b=1 -> FAIL 14:41
+AIR-EXT6B begin 14:43
+START by2t1352 glm4.5-air asym_sdp2_cpuadamwds|T1 s=352000 b=1 r=2 14:43
+CELL by2t1352 asym_sdp2_cpuadamwds|T1 s=352000 b=1 -> GOOM 15:04
+START by2t2352 glm4.5-air asym_sdp2_cpuadamwds|T2 s=352000 b=1 r=2 15:04
+CELL by2t2352 asym_sdp2_cpuadamwds|T2 s=352000 b=1 -> FAIL 15:12
+START by2t3352 glm4.5-air asym_sdp2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=352000 b=1 r=2 15:51
+CELL by2t3352 asym_sdp2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=352000 b=1 -> FAIL 16:03
+AIR-EXT6B 2r done 16:03
+START by1t2448 glm4.5-air asym_cpuadamwds|T2 s=448000 b=1 r=1 16:03
+CELL by1t2448 asym_cpuadamwds|T2 s=448000 b=1 -> TRAINED 17:16
+AIR-EXT6B done 17:16
+AIR-EXT6C begin 17:17
+START by2t1336 glm4.5-air asym_sdp2_cpuadamwds|T1 s=336000 b=1 r=2 17:17
+CELL by2t1336 asym_sdp2_cpuadamwds|T1 s=336000 b=1 -> GOOM 17:46
+AIR-EXT6C done 17:46
+FLASH-X2 begin 17:48
+GUARD-SHM-CLEAN asym_fabric_54671 asym_fabric_54671.done asym_fabric_54671.manifest.json  17:48
+START bx2rc256 glm4.7-flash superoffload_mem|recomp s=256000 b=2 r=2 17:48
+CELL bx2rc256 superoffload_mem|recomp s=256000 b=2 -> GOOM 17:54
+GUARD-REAPED orphan 2491386 gpu=0,1 17:56
+START bx2rc256 glm4.7-flash superoffload_mem|recomp s=256000 b=1 r=2 17:57
+CELL bx2rc256 superoffload_mem|recomp s=256000 b=1 -> TRAINED 18:21
+START bx2un256 glm4.7-flash superoffload_mem|unsloth s=256000 b=2 r=2 18:21
+CELL bx2un256 superoffload_mem|unsloth s=256000 b=2 -> TRAINED 19:06
+START bx2uo256 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=256000 b=2 r=2 19:06
+CELL bx2uo256 superoffload_mem|unsloth-off-ohbm0 s=256000 b=2 -> TRAINED 19:58
+START bx2fd256 glm4.7-flash fsdp2_offload|recomp s=256000 b=2 r=2 19:58
+CELL bx2fd256 fsdp2_offload|recomp s=256000 b=2 -> GOOM 20:05
+START bx2fd256 glm4.7-flash fsdp2_offload|recomp s=256000 b=1 r=2 20:05
+CELL bx2fd256 fsdp2_offload|recomp s=256000 b=1 -> TRAINED 20:29
+START bx2t1256 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=256000 b=3 r=2 20:29
+CELL bx2t1256 asym_sdp2_cpuadamwds|T1 s=256000 b=3 -> TRAINED 21:41
+X2-RUNG-DONE s=256000 rc=live un=live uo=live fd=live 21:41
+GUARD-SHM-CLEAN asym_fabric_40553.done asym_fabric_40553.manifest.json sem.NSys-process_waiter-3692816-4026531836-2026.2.1  21:41
+START bx2rc320 glm4.7-flash superoffload_mem|recomp s=320000 b=1 r=2 21:41
+CELL bx2rc320 superoffload_mem|recomp s=320000 b=1 -> TRAINED 22:19
+START bx2un320 glm4.7-flash superoffload_mem|unsloth s=320000 b=1 r=2 22:19
+CELL bx2un320 superoffload_mem|unsloth s=320000 b=1 -> TRAINED 22:55
+START bx2uo320 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=320000 b=1 r=2 22:55
+CELL bx2uo320 superoffload_mem|unsloth-off-ohbm0 s=320000 b=1 -> TRAINED 23:36
+START bx2fd320 glm4.7-flash fsdp2_offload|recomp s=320000 b=1 r=2 23:36
+CELL bx2fd320 fsdp2_offload|recomp s=320000 b=1 -> TRAINED 00:13
+START bx2t1320 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=320000 b=2 r=2 00:13
+CELL bx2t1320 asym_sdp2_cpuadamwds|T1 s=320000 b=2 -> TRAINED 01:24
+X2-RUNG-DONE s=320000 rc=live un=live uo=live fd=live 01:24
+GUARD-SHM-CLEAN asym_fabric_52097.done asym_fabric_52097.manifest.json sem.NSys-process_waiter-3692816-4026531836-2026.2.1  01:24
+START bx2rc416 glm4.7-flash superoffload_mem|recomp s=416000 b=1 r=2 01:24
+CELL bx2rc416 superoffload_mem|recomp s=416000 b=1 -> GOOM 01:33
+GUARD-REAPED orphan 504802 gpu=0,1 01:36
+START bx2un416 glm4.7-flash superoffload_mem|unsloth s=416000 b=1 r=2 01:36
+CELL bx2un416 superoffload_mem|unsloth s=416000 b=1 -> TRAINED 02:35
+START bx2uo416 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=416000 b=1 r=2 02:35
+CELL bx2uo416 superoffload_mem|unsloth-off-ohbm0 s=416000 b=1 -> TRAINED 03:40
+START bx2fd416 glm4.7-flash fsdp2_offload|recomp s=416000 b=1 r=2 03:40
+CELL bx2fd416 fsdp2_offload|recomp s=416000 b=1 -> GOOM 03:48
+START bx2t1416 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=416000 b=2 r=2 03:48
+CELL bx2t1416 asym_sdp2_cpuadamwds|T1 s=416000 b=2 -> TRAINED 05:51
+X2-RUNG-DONE s=416000 rc=walled un=live uo=live fd=walled 05:51
+GUARD-SHM-CLEAN asym_fabric_50959.done asym_fabric_50959.manifest.json sem.NSys-process_waiter-3692816-4026531836-2026.2.1  05:51
+START bx2un512 glm4.7-flash superoffload_mem|unsloth s=512000 b=1 r=2 05:51
+CELL bx2un512 superoffload_mem|unsloth s=512000 b=1 -> TRAINED 07:20
+START bx2uo512 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=512000 b=1 r=2 07:20
+CELL bx2uo512 superoffload_mem|unsloth-off-ohbm0 s=512000 b=1 -> TRAINED 08:56
+START bx2t1512 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=512000 b=1 r=2 08:56
+CELL bx2t1512 asym_sdp2_cpuadamwds|T1 s=512000 b=1 -> TRAINED 10:27
+X2-RUNG-DONE s=512000 rc=walled un=live uo=live fd=walled 10:27
+GUARD-SHM-CLEAN asym_fabric_32965.done asym_fabric_32965.manifest.json sem.NSys-process_waiter-3692816-4026531836-2026.2.1  10:27
+START bx2un576 glm4.7-flash superoffload_mem|unsloth s=576000 b=1 r=2 10:27
+CELL bx2un576 superoffload_mem|unsloth s=576000 b=1 -> TRAINED 12:21
+START bx2uo576 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=576000 b=1 r=2 12:21
+CELL bx2uo576 superoffload_mem|unsloth-off-ohbm0 s=576000 b=1 -> COOM 12:32
+START bx2t1576 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=576000 b=1 r=2 12:32
+CELL bx2t1576 asym_sdp2_cpuadamwds|T1 s=576000 b=1 -> TRAINED 14:25
+X2-RUNG-DONE s=576000 rc=walled un=live uo=walled fd=walled 14:25
+GUARD-SHM-CLEAN asym_fabric_38931.done asym_fabric_38931.manifest.json sem.NSys-process_waiter-3692816-4026531836-2026.2.1  14:25
+START bx2un640 glm4.7-flash superoffload_mem|unsloth s=640000 b=1 r=2 14:25
+CELL bx2un640 superoffload_mem|unsloth s=640000 b=1 -> GOOM 14:42
+GUARD-REAPED orphan 2590244 gpu=0,1 14:44
+START bx2t1640 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=640000 b=1 r=2 14:45
+CELL bx2t1640 asym_sdp2_cpuadamwds|T1 s=640000 b=1 -> TRAINED 17:03
+X2-RUNG-DONE s=640000 rc=walled un=walled uo=walled fd=walled 17:03
+FLASH-X2 done rc=walled un=walled uo=walled fd=walled 17:03
+FLASH-704 begin 17:04
+GUARD-SHM-CLEAN asym_fabric_39945.done asym_fabric_39945.manifest.json sem.NSys-process_waiter-3692816-4026531836-2026.2.1  17:04
+START bx2t1704 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=704000 b=1 r=2 17:04
+CELL bx2t1704 asym_sdp2_cpuadamwds|T1 s=704000 b=1 -> TRAINED 19:52
+FLASH-704 done 19:52
+FLASH-X1 begin 19:54
+GUARD-SHM-CLEAN asym_fabric_50323.done asym_fabric_50323.manifest.json sem.NSys-process_waiter-3692816-4026531836-2026.2.1  19:54
+START bx1rc256 glm4.7-flash superoffload_mem|recomp s=256000 b=2 r=1 19:54
+CELL bx1rc256 superoffload_mem|recomp s=256000 b=2 -> GOOM 20:00
+START bx1rc256 glm4.7-flash superoffload_mem|recomp s=256000 b=1 r=1 20:00
+CELL bx1rc256 superoffload_mem|recomp s=256000 b=1 -> TRAINED 20:24
+START bx1uo256 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=256000 b=2 r=1 20:24
+CELL bx1uo256 superoffload_mem|unsloth-off-ohbm0 s=256000 b=2 -> TRAINED 21:12
+START bx1fd256 glm4.7-flash fsdp2_offload|recomp s=256000 b=2 r=1 21:12
+CELL bx1fd256 fsdp2_offload|recomp s=256000 b=2 -> GOOM 21:17
+START bx1fd256 glm4.7-flash fsdp2_offload|recomp s=256000 b=1 r=1 21:17
+CELL bx1fd256 fsdp2_offload|recomp s=256000 b=1 -> TRAINED 21:42
+START bx1t1256 glm4.7-flash asym_cpuadamwds|T1 s=256000 b=2 r=1 21:42
+CELL bx1t1256 asym_cpuadamwds|T1 s=256000 b=2 -> TRAINED 22:29
+X1-RUNG-DONE s=256000 rc=live uo=live fd=live 22:29
+START bx1rc320 glm4.7-flash superoffload_mem|recomp s=320000 b=1 r=1 22:29
+X1-CANCELLED 22:34 — user: no 1-rank; push asym 2r limits instead
+FLASH-X2-DEEP begin tier=1 22:34
+GUARD-REAPED orphan 1745115 gpu=0,1 22:37
+START bx2t1d768 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=768000 b=1 r=2 22:37
+CELL bx2t1d768 asym_sdp2_cpuadamwds|T1 s=768000 b=1 -> TRAINED 01:58
+GUARD-SHM-CLEAN asym_fabric_39553.done asym_fabric_39553.manifest.json sem.NSys-process_waiter-3692816-4026531836-2026.2.1  01:58
+START bx2t1d832 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=832000 b=1 r=2 01:58
+CELL bx2t1d832 asym_sdp2_cpuadamwds|T1 s=832000 b=1 -> TRAINED 05:55
+GUARD-SHM-CLEAN asym_fabric_58801.done asym_fabric_58801.manifest.json sem.NSys-process_waiter-3692816-4026531836-2026.2.1  05:55
+START bx2t1d896 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=896000 b=1 r=2 05:55
+CELL bx2t1d896 asym_sdp2_cpuadamwds|T1 s=896000 b=1 -> GOOM 07:33
+GUARD-SHM-CLEAN asym_fabric_42189 asym_fabric_42189.done asym_fabric_42189.manifest.json  07:33
+START bx2t2d896 glm4.7-flash asym_sdp2_cpuadamwds|T2 s=896000 b=1 r=2 07:33
+CELL bx2t2d896 asym_sdp2_cpuadamwds|T2 s=896000 b=1 -> TRAINED 12:07
+GUARD-SHM-CLEAN asym_fabric_47905.done asym_fabric_47905.manifest.json sem.NSys-process_waiter-3692816-4026531836-2026.2.1  12:07
+START bx2t2d960 glm4.7-flash asym_sdp2_cpuadamwds|T2 s=960000 b=1 r=2 12:07
+CELL bx2t2d960 asym_sdp2_cpuadamwds|T2 s=960000 b=1 -> TRAINED 17:27
+GUARD-SHM-CLEAN asym_fabric_53155.done asym_fabric_53155.manifest.json sem.NSys-process_waiter-3692816-4026531836-2026.2.1  17:27
+START bx2t2d1024 glm4.7-flash asym_sdp2_cpuadamwds|T2 s=1024000 b=1 r=2 17:27
+CELL bx2t2d1024 asym_sdp2_cpuadamwds|T2 s=1024000 b=1 -> TRAINED 23:30
+GUARD-SHM-CLEAN asym_fabric_41231.done asym_fabric_41231.manifest.json sem.NSys-process_waiter-3692816-4026531836-2026.2.1  23:30
+START bx2t2d1088 glm4.7-flash asym_sdp2_cpuadamwds|T2 s=1088000 b=1 r=2 23:30
+CELL bx2t2d1088 asym_sdp2_cpuadamwds|T2 s=1088000 b=1 -> COOM 00:10
+GUARD-SHM-CLEAN asym_fabric_56635 asym_fabric_56635.done asym_fabric_56635.manifest.json  00:10
+START bx2t3d1088 glm4.7-flash asym_sdp2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=1088000 b=1 r=2 00:10
+CELL bx2t3d1088 asym_sdp2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=1088000 b=1 -> COOM 00:46
+FLASH-X2-DEEP CEILING at s=1088000 (all tiers from T2 walled) 00:46
+FLASH-X2-DEEP done 00:46
+T3GLM-SMOKE begin 03:36
+GUARD-SHM-CLEAN asym_fabric_59755 asym_fabric_59755.done asym_fabric_59755.manifest.json  03:36
+START t3f1s256 glm4.7-flash asym_cpuadamwds|T3 s=256000 b=1 r=1 03:36
+CELL t3f1s256 asym_cpuadamwds|T3 s=256000 b=1 -> FAIL 03:44
+START t3a1s192 glm4.5-air asym_cpuadamwds|T3 s=192000 b=1 r=1 03:44
+CELL t3a1s192 asym_cpuadamwds|T3 s=192000 b=1 -> FAIL 03:54
+START t3f2s256 glm4.7-flash asym_sdp2_cpuadamwds|T3 s=256000 b=1 r=2 03:54
+CELL t3f2s256 asym_sdp2_cpuadamwds|T3 s=256000 b=1 -> FAIL 04:03
+GUARD-SHM-CLEAN asym_fabric_53911 asym_fabric_53911.done asym_fabric_53911.manifest.json  04:03
+START t3a2s192 glm4.5-air asym_sdp2_cpuadamwds|T3 s=192000 b=1 r=2 04:03
+CELL t3a2s192 asym_sdp2_cpuadamwds|T3 s=192000 b=1 -> FAIL 04:13
+T3GLM-SMOKE done 04:13
+T3BISECT begin 15:30
+GUARD-SHM-CLEAN asym_fabric_55727 asym_fabric_55727.done asym_fabric_55727.manifest.json  15:30
+START t3bA glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=64000 b=1 r=1 15:30
+CELL t3bA asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=64000 b=1 -> FAIL 15:36
+BISECT t3bA recomp-off-full-fg-ker000-ceil0000-ohbm0 -> FAIL
+START t3bB glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker100-ceil0000-ohbm0 s=64000 b=1 r=1 15:36
+CELL t3bB asym_cpuadamwds|recomp-off-full-fg-ker100-ceil0000-ohbm0 s=64000 b=1 -> FAIL 15:40
+BISECT t3bB recomp-off-full-fg-ker100-ceil0000-ohbm0 -> FAIL
+START t3bC glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker001-ceil0000-ohbm0 s=64000 b=1 r=1 15:40
+CELL t3bC asym_cpuadamwds|recomp-off-full-fg-ker001-ceil0000-ohbm0 s=64000 b=1 -> FAIL 15:46
+BISECT t3bC recomp-off-full-fg-ker001-ceil0000-ohbm0 -> FAIL
+START t3bD glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0 s=64000 b=1 r=1 15:46
+CELL t3bD asym_cpuadamwds|recomp-off-full-fg-ker101-ceil0000-ohbm0 s=64000 b=1 -> FAIL 15:51
+BISECT t3bD recomp-off-full-fg-ker101-ceil0000-ohbm0 -> FAIL
+T3BISECT done 15:51
+T3PROBE2 begin 16:41
+START t3pA1 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=64000 b=1 r=1 16:41
+CELL t3pA1 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=64000 b=1 -> FAIL 16:46
+PROBE t3pA1 (none) -> FAIL
+START t3pA2 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=64000 b=1 r=1 16:46
+CELL t3pA2 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=64000 b=1 -> FAIL 16:52
+PROBE t3pA2 (ASYM_CPU_OPS_THREADS=48 ASYMM_CPU_LEFT_LORA_A_PAIR_NATIVE=0) -> FAIL
+START t3pA3 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=64000 b=1 r=1 16:52
+CELL t3pA3 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=64000 b=1 -> FAIL 16:57
+PROBE t3pA3 (ASYM_CPU_OPS_THREADS=48 ASYMM_ATTN_ACT_OFFLOAD=false) -> FAIL
+T3PROBE2 done 16:57
+T3GLM-SMOKE begin 18:57
+START t3f1v2 glm4.7-flash asym_cpuadamwds|T3 s=256000 b=1 r=1 18:57
+CELL t3f1v2 asym_cpuadamwds|T3 s=256000 b=1 -> TRAINED 19:26
+START t3a1v2 glm4.5-air asym_cpuadamwds|T3 s=192000 b=1 r=1 19:26
+CELL t3a1v2 asym_cpuadamwds|T3 s=192000 b=1 -> TRAINED 19:55
+START t3f2v2 glm4.7-flash asym_sdp2_cpuadamwds|T3 s=256000 b=1 r=2 19:55
+CELL t3f2v2 asym_sdp2_cpuadamwds|T3 s=256000 b=1 -> TRAINED 20:25
+GUARD-SHM-CLEAN asym_fabric_46249.done asym_fabric_46249.manifest.json sem.NSys-process_waiter-3692816-4026531836-2026.2.1  20:25
+START t3a2v2 glm4.5-air asym_sdp2_cpuadamwds|T3 s=192000 b=1 r=2 20:25
+CELL t3a2v2 asym_sdp2_cpuadamwds|T3 s=192000 b=1 -> COOM 20:40
+T3GLM-SMOKE done 20:40
+D1-MPE-SWEEP begin 03:06
+START dep1m0 hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 03:07
+CELL dep1m0 asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 03:09
+START dep1m4k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 03:09
+CELL dep1m4k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 03:11
+START dep1m16k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 03:11
+CELL dep1m16k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 03:14
+START dep1m64k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 03:14
+CELL dep1m64k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 03:16
+D1-MPE-SWEEP done 03:16
+D1-MPE-SWEEP begin 11:46
+START dep1n0 hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 11:46
+CELL dep1n0 asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 11:48
+START dep1n4k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 11:48
+CELL dep1n4k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 11:51
+START dep1n16k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 11:51
+CELL dep1n16k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 11:53
+START dep1n64k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 11:53
+CELL dep1n64k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 11:56
+D1-MPE-SWEEP done 11:56
+D1-MPE-SWEEP begin 13:25
+START dep1p0 hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 13:25
+CELL dep1p0 asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 13:29
+START dep1p4k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 13:29
+CELL dep1p4k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 13:34
+START dep1p16k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 13:34
+CELL dep1p16k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 13:38
+START dep1p64k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 13:38
+CELL dep1p64k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 13:43
+D1-MPE-SWEEP done 13:43
+D1-MPE-SWEEP begin 17:48
+START dep1q0 hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 17:48
+CELL dep1q0 asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 17:53
+START dep1q4k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 17:53
+CELL dep1q4k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 17:57
+START dep1q16k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 17:57
+CELL dep1q16k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 18:02
+START dep1q64k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 18:02
+CELL dep1q64k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 18:07
+D1-MPE-SWEEP done 18:07
+D1-MPE-SWEEP begin 02:33
+START dep1r0 hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 02:33
+CELL dep1r0 asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 02:37
+START dep1r4k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 02:37
+CELL dep1r4k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 02:42
+START dep1r16k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 02:42
+CELL dep1r16k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 02:47
+START dep1r64k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 02:47
+CELL dep1r64k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 02:51
+D1-MPE-SWEEP done 02:51
+D1-MPE-SWEEP begin 02:59
+START dep1s0 hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 02:59
+CELL dep1s0 asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 03:05
+GUARD-SHM-CLEAN asym_sep_ipc_rank0.pkl asym_sep_ipc_rank1.pkl cuda.shm.0.246c0d.1  03:05
+START dep1s4k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 03:05
+CELL dep1s4k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> FAIL 03:11
+GUARD-SHM-CLEAN asym_sep_ipc_rank0.pkl asym_sep_ipc_rank1.pkl cuda.shm.0.246c0d.1  03:11
+START dep1s16k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 03:11
+D1-MPE-SWEEP begin 03:17
+START dep1t0 hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 03:17
+CELL dep1t0 asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> TRAINED 03:28
+GUARD-SHM-CLEAN asym_sep_ipc_rank0.pkl asym_sep_ipc_rank1.pkl cuda.shm.0.246c0d.1  03:28
+START dep1t4k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 03:28
+CELL dep1t4k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> TRAINED 03:39
+GUARD-SHM-CLEAN asym_sep_ipc_rank0.pkl asym_sep_ipc_rank1.pkl cuda.shm.0.246c0d.1  03:39
+START dep1t16k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 03:39
+CELL dep1t16k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> TRAINED 03:51
+GUARD-SHM-CLEAN asym_sep_ipc_rank0.pkl asym_sep_ipc_rank1.pkl cuda.shm.0.246c0d.1  03:51
+START dep1t64k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 03:51
+CELL dep1t64k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> TRAINED 04:02
+D1-MPE-SWEEP done 04:02
+D1-MPE-SWEEP begin 10:57
+GUARD-SHM-CLEAN asym_sep_ipc_rank0.pkl asym_sep_ipc_rank1.pkl cuda.shm.0.246c0d.1  10:57
+START dep1u0 hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 10:57
+CELL dep1u0 asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> TRAINED 11:08
+GUARD-SHM-CLEAN asym_sep_ipc_rank0.pkl asym_sep_ipc_rank1.pkl cuda.shm.0.1238f3.1  11:08
+START dep1u4k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 11:08
+CELL dep1u4k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> TRAINED 11:20
+GUARD-SHM-CLEAN asym_sep_ipc_rank0.pkl asym_sep_ipc_rank1.pkl cuda.shm.0.1238f3.1  11:20
+START dep1u16k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 11:20
+CELL dep1u16k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> TRAINED 11:31
+GUARD-SHM-CLEAN asym_sep_ipc_rank0.pkl asym_sep_ipc_rank1.pkl cuda.shm.0.1238f3.1  11:31
+START dep1u64k hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 11:31
+CELL dep1u64k asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> TRAINED 11:43
+D1-MPE-SWEEP done 11:43
+D2-TWINS begin 14:32
+GUARD-SHM-CLEAN asym_sep_ipc_rank0.pkl asym_sep_ipc_rank1.pkl cuda.shm.0.1238f3.1  14:32
+START d2sdp64 hunyuan-a13b asym_sdp2_cpuadamwds|T2B s=64000 b=2 r=2 14:32
+CELL d2sdp64 asym_sdp2_cpuadamwds|T2B s=64000 b=2 -> TRAINED 14:43
+START d2plan64 hunyuan-a13b asym_sepplan2_cpuadamwds|T2B s=64000 b=2 r=2 14:43
+CELL d2plan64 asym_sepplan2_cpuadamwds|T2B s=64000 b=2 -> TRAINED 14:55
+START d2link32 hunyuan-a13b asym_sepplanlink2_cpuadamwds|T1 s=32000 b=2 r=2 14:55
+CELL d2link32 asym_sepplanlink2_cpuadamwds|T1 s=32000 b=2 -> TRAINED 15:02
+GUARD-SHM-CLEAN asym_sep_ipc_rank0.pkl asym_sep_ipc_rank1.pkl cuda.shm.0.1238f3.1  15:02
+START d2sdp32 hunyuan-a13b asym_sdp2_cpuadamwds|T1 s=32000 b=2 r=2 15:02
+CELL d2sdp32 asym_sdp2_cpuadamwds|T1 s=32000 b=2 -> TRAINED 15:09
+D2-TWINS done 15:09
+D3-LINK begin 03:50
+START d3link64 hunyuan-a13b asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 r=2 03:50
+CELL d3link64 asym_sepplanlink2_cpuadamwds|T2B s=64000 b=2 -> TRAINED 04:01
+GUARD-SHM-CLEAN asym_sep_ipc_rank0.pkl asym_sep_ipc_rank1.pkl cuda.shm.0.1238f3.1  04:01
+START d3link32 hunyuan-a13b asym_sepplanlink2_cpuadamwds|T1 s=32000 b=2 r=2 04:01
+CELL d3link32 asym_sepplanlink2_cpuadamwds|T1 s=32000 b=2 -> TRAINED 04:07
+D3-LINK done 04:07

@@ -340,3 +340,17 @@ chat template; capture = pre-hook on `experts` modules (actual selected indices)
   pinned -0.21 flush at canvas edge (the dead left strip made the figure
   render narrower than its caption in the compiled paper). Overleaf 33ef4bb
   -> latest push.
+- [08-20] SESSION RESUME: qwen3.5-122b natural-1M cells ALL FAILED (OOM at 1M
+  even 2-GPU shard, caps 115/170 left no activation headroom on 234G model) —
+  RETRY PLAN: 4-GPU single-replica shard (--max-memory ~115,150,150,170), one
+  cell at a time. PARKED: peer session (asymgemm-c8, TP x-axis standardization,
+  standardize_tps.md) has a LIVE serial chain on this node (GPU2, tags s1*) —
+  no GPU launches from this campaign until the node frees (peer ETA ~2-3 days, Jobs 1-4, stdz_status.log; peer will ping when done). Killed my stale
+  8-day watcher shell (PID 2013951, pgrep self-match kept it alive; CPU-only).
+  Confirmed to peer: the 02:36 plot_tp_vs_seq* MAIN_RUNGS edit is not ours.
+- [08-20] Peer (asymgemm-c8) released c12 (its Job 1 done; rest on c18/c11/c14).
+  122B 1M RETRY LAUNCHED: one serial invocation, 4-GPU shard, --max-memory
+  140,140,165,165, cells codeforces->dapo->openscience->sft_mix, 6x1M each
+  (~2-4h/cell). Node was fully clear (xiaoning squatter gone). Watcher armed
+  (bracket-pattern pgrep — no self-match this time). On completion: append
+  rows+savings to skewness_results_40.md => campaign's model ladder complete.
