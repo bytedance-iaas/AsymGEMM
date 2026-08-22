@@ -1,0 +1,180 @@
+== stdtps96 A2 phaseA start 2026-08-21_02:53 occ='2987338 2987339' pair=c12:2+3(same-socket dev.) ==
+START s96air2c128_t1 glm4.5-air asym_sdp2_cpuadamwds|T1 s=128000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=240' 02:53
+CELL s96air2c128_t1 asym_sdp2_cpuadamwds|T1 s=128000 b=1 -> GOOM 03:09
+GUARD-SHM-CLEAN 03:09
+START s96air2c128_t2 glm4.5-air asym_sdp2_cpuadamwds|T2 s=128000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=240' 03:09
+CELL s96air2c128_t2 asym_sdp2_cpuadamwds|T2 s=128000 b=1 -> FAIL 03:15
+NOTE arena 240->400 for GLM ladders (T2 fabric-cap fatal at 239.1G, r_s96air2c128_t2 prev1); T1@128 GOOM verdict stands, cell reruns for chain continuity
+== stdtps96 A2 phaseA start 2026-08-21_03:16 occ='2987338 2987339' pair=c12:2+3(same-socket dev.) ==
+GUARD-SHM-CLEAN 03:16
+START s96air2c128_t1 glm4.5-air asym_sdp2_cpuadamwds|T1 s=128000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 03:16
+CELL s96air2c128_t1 asym_sdp2_cpuadamwds|T1 s=128000 b=1 -> GOOM 03:28
+GUARD-SHM-CLEAN 03:28
+START s96air2c128_t2 glm4.5-air asym_sdp2_cpuadamwds|T2 s=128000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 03:28
+CELL s96air2c128_t2 asym_sdp2_cpuadamwds|T2 s=128000 b=1 -> TRAINED 03:43
+GUARD-SHM-CLEAN 03:43
+START s96air2c144_t1 glm4.5-air asym_sdp2_cpuadamwds|T1 s=144000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 03:43
+CELL s96air2c144_t1 asym_sdp2_cpuadamwds|T1 s=144000 b=1 -> GOOM 03:56
+GUARD-SHM-CLEAN 03:56
+START s96air2c144_t2 glm4.5-air asym_sdp2_cpuadamwds|T2 s=144000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 03:56
+CELL s96air2c144_t2 asym_sdp2_cpuadamwds|T2 s=144000 b=1 -> TRAINED 04:14
+GUARD-SHM-CLEAN 04:14
+START s96air2c160_t1 glm4.5-air asym_sdp2_cpuadamwds|T1 s=160000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 04:14
+CELL s96air2c160_t1 asym_sdp2_cpuadamwds|T1 s=160000 b=1 -> GOOM 04:25
+GUARD-SHM-CLEAN 04:25
+START s96air2c160_t2 glm4.5-air asym_sdp2_cpuadamwds|T2 s=160000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 04:25
+CELL s96air2c160_t2 asym_sdp2_cpuadamwds|T2 s=160000 b=1 -> TRAINED 04:45
+GUARD-SHM-CLEAN 04:45
+START s96air2c176_t1 glm4.5-air asym_sdp2_cpuadamwds|T1 s=176000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 04:45
+== stdtps96 A2 phaseA start 2026-08-21_04:47 occ='2987338 2987339' pair=c12:2+3(same-socket dev.) ==
+START s96air2c176_t2 glm4.5-air asym_sdp2_cpuadamwds|T2 s=176000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 04:47
+CELL s96air2c176_t2 asym_sdp2_cpuadamwds|T2 s=176000 b=1 -> TRAINED 05:09
+GUARD-SHM-CLEAN 05:09
+START s96air2c192_t2 glm4.5-air asym_sdp2_cpuadamwds|T2 s=192000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 05:09
+CELL s96air2c192_t2 asym_sdp2_cpuadamwds|T2 s=192000 b=1 -> TRAINED 05:34
+GUARD-SHM-CLEAN 05:34
+START s96air2c208_t2 glm4.5-air asym_sdp2_cpuadamwds|T2 s=208000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 05:34
+CELL s96air2c208_t2 asym_sdp2_cpuadamwds|T2 s=208000 b=1 -> TRAINED 06:02
+GUARD-SHM-CLEAN 06:02
+START s96air2c224_t2 glm4.5-air asym_sdp2_cpuadamwds|T2 s=224000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 06:02
+CELL s96air2c224_t2 asym_sdp2_cpuadamwds|T2 s=224000 b=1 -> GOOM 06:26
+GUARD-SHM-CLEAN 06:26
+START s96air2c224_t3 glm4.5-air asym_sdp2_cpuadamwds|T3 s=224000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 06:26
+CELL s96air2c224_t3 asym_sdp2_cpuadamwds|T3 s=224000 b=1 -> COOM 06:42
+PHASEA air 2r cap=208K 06:42
+GUARD-SHM-CLEAN 06:42
+START s96fl2c448_t1 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=448000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 06:42
+CELL s96fl2c448_t1 asym_sdp2_cpuadamwds|T1 s=448000 b=1 -> GOOM 07:08
+GUARD-SHM-CLEAN 07:08
+START s96fl2c448_t2 glm4.7-flash asym_sdp2_cpuadamwds|T2 s=448000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 07:08
+CELL s96fl2c448_t2 asym_sdp2_cpuadamwds|T2 s=448000 b=1 -> TRAINED 08:24
+GUARD-SHM-CLEAN 08:24
+START s96fl2c512_t1 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=512000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 08:24
+CELL s96fl2c512_t1 asym_sdp2_cpuadamwds|T1 s=512000 b=1 -> GOOM 08:39
+GUARD-SHM-CLEAN 08:39
+START s96fl2c512_t2 glm4.7-flash asym_sdp2_cpuadamwds|T2 s=512000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 08:39
+CELL s96fl2c512_t2 asym_sdp2_cpuadamwds|T2 s=512000 b=1 -> GOOM 09:46
+GUARD-SHM-CLEAN 09:46
+START s96fl2c512_t3 glm4.7-flash asym_sdp2_cpuadamwds|T3 s=512000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 09:46
+CELL s96fl2c512_t3 asym_sdp2_cpuadamwds|T3 s=512000 b=1 -> TRAINED 11:23
+GUARD-SHM-CLEAN 11:23
+START s96fl2c576_t1 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=576000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 11:23
+== stdtps96 A2 phaseA start 2026-08-21_11:24 occ='2987338 2987339' pair=c12:2+3(same-socket dev.) ==
+PHASEA air SKIP (done, cap=208K)
+START s96air2c112_t1 glm4.5-air asym_sdp2_cpuadamwds|T1 s=112000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 11:24
+CELL s96air2c112_t1 asym_sdp2_cpuadamwds|T1 s=112000 b=1 -> TRAINED 11:37
+GUARD-SHM-CLEAN 11:37
+START s96air2c128_t1 glm4.5-air asym_sdp2_cpuadamwds|T1 s=128000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 11:37
+NOTE s96air2c112_t1 TRAINED (redundant down-walk artifact of the buggy skip; banked as a valid extra Air-2r T1 floor cell)
+== stdtps96 A2 phaseA start 2026-08-21_11:38 occ='2987338 2987339' pair=c12:2+3(same-socket dev.) ==
+PHASEA air SKIP (done, cap=208K)
+PHASEA air 2r cap=208K 11:38
+START s96fl2c576_t3 glm4.7-flash asym_sdp2_cpuadamwds|T3 s=576000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 11:38
+CELL s96fl2c576_t3 asym_sdp2_cpuadamwds|T3 s=576000 b=1 -> COOM 12:24
+GUARD-SHM-CLEAN 12:24
+START s96fl2c544_t3 glm4.7-flash asym_sdp2_cpuadamwds|T3 s=544000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 12:24
+CELL s96fl2c544_t3 asym_sdp2_cpuadamwds|T3 s=544000 b=1 -> COOM 13:07
+GUARD-SHM-CLEAN 13:07
+START s96fl2c528_t3 glm4.7-flash asym_sdp2_cpuadamwds|T3 s=528000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 13:07
+CELL s96fl2c528_t3 asym_sdp2_cpuadamwds|T3 s=528000 b=1 -> COOM 13:48
+PHASEA flash 2r cap=512K 13:48
+GUARD-SHM-CLEAN 13:48
+START s96air1c208 glm4.5-air asym_cpuadamwds|T1 s=208000 b=1 r=1 arm='ASYM_ARENA_SHM_CAP_GB=400' 13:48
+CELL s96air1c208 asym_cpuadamwds|T1 s=208000 b=1 -> GOOM 13:57
+START s96air1c208b glm4.5-air asym_cpuadamwds|T2 s=208000 b=1 r=1 arm='ASYM_ARENA_SHM_CAP_GB=400' 13:57
+CELL s96air1c208b asym_cpuadamwds|T2 s=208000 b=1 -> TRAINED 14:22
+START s96fl1c512 glm4.7-flash asym_cpuadamwds|T1 s=512000 b=1 r=1 arm='' 14:22
+CELL s96fl1c512 asym_cpuadamwds|T1 s=512000 b=1 -> GOOM 14:35
+START s96fl1c512b glm4.7-flash asym_cpuadamwds|T2 s=512000 b=1 r=1 arm='' 14:35
+CELL s96fl1c512b asym_cpuadamwds|T2 s=512000 b=1 -> TRAINED 16:09
+== stdtps96 A2 phaseA DONE air=208K flash=512K 2026-08-21_16:09 ==
+== stdtps96 A2 phaseC 2r start 2026-08-21_16:11 ==
+START s96air2f32a glm4.5-air asym_sdp2_cpuadamwds|T1 s=32000 b=4 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 16:11
+SHM-AUDIT (16:4x): all Phase A COOM verdicts followed guard-cleaned starts (lib rm's /dev/shm/asym_* when only occupiers resident) — Air T3@224 + Flash 576/544/528 stand as physics, not contamination (re Session B all-lanes warning)
+CELL s96air2f32a asym_sdp2_cpuadamwds|T1 s=32000 b=4 -> GOOM 16:22
+GUARD-SHM-CLEAN 16:22
+START s96air2f32a glm4.5-air asym_sdp2_cpuadamwds|T1 s=32000 b=2 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 16:22
+CELL s96air2f32a asym_sdp2_cpuadamwds|T1 s=32000 b=2 -> TRAINED 16:30
+GUARD-SHM-CLEAN 16:30
+START s96air2f64a glm4.5-air asym_sdp2_cpuadamwds|T1 s=64000 b=2 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 16:30
+CELL s96air2f64a asym_sdp2_cpuadamwds|T1 s=64000 b=2 -> TRAINED 16:42
+GUARD-SHM-CLEAN 16:42
+START s96air2f96a glm4.5-air asym_sdp2_cpuadamwds|T1 s=96000 b=2 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 16:42
+CELL s96air2f96a asym_sdp2_cpuadamwds|T1 s=96000 b=2 -> GOOM 16:50
+GUARD-SHM-CLEAN 16:50
+START s96air2f96a glm4.5-air asym_sdp2_cpuadamwds|T1 s=96000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 16:50
+CELL s96air2f96a asym_sdp2_cpuadamwds|T1 s=96000 b=1 -> TRAINED 17:00
+GUARD-SHM-CLEAN 17:00
+START s96air2f128p glm4.5-air asym_sdp2_cpuadamwds|T2 s=128000 b=2 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 17:00
+CELL s96air2f128p asym_sdp2_cpuadamwds|T2 s=128000 b=2 -> GOOM 17:17
+GUARD-SHM-CLEAN 17:17
+START s96air2f160p glm4.5-air asym_sdp2_cpuadamwds|T2 s=160000 b=2 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 17:17
+CELL s96air2f160p asym_sdp2_cpuadamwds|T2 s=160000 b=2 -> GOOM 17:28
+GUARD-SHM-CLEAN 17:28
+START s96air2f192p glm4.5-air asym_sdp2_cpuadamwds|T2 s=192000 b=2 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 17:28
+CELL s96air2f192p asym_sdp2_cpuadamwds|T2 s=192000 b=2 -> GOOM 17:39
+GUARD-SHM-CLEAN 17:39
+START s96air2r32 glm4.5-air superoffload_mem|recomp s=32000 b=4 r=2 arm='' 17:39
+CELL s96air2r32 superoffload_mem|recomp s=32000 b=4 -> GOOM 17:43
+START s96air2r32 glm4.5-air superoffload_mem|recomp s=32000 b=2 r=2 arm='' 17:43
+CELL s96air2r32 superoffload_mem|recomp s=32000 b=2 -> TRAINED 17:49
+START s96air2r64 glm4.5-air superoffload_mem|recomp s=64000 b=2 r=2 arm='' 17:49
+CELL s96air2r64 superoffload_mem|recomp s=64000 b=2 -> GOOM 17:53
+GUARD-REAPED orphan 529292 17:56
+START s96air2r64 glm4.5-air superoffload_mem|recomp s=64000 b=1 r=2 arm='' 17:56
+CELL s96air2r64 superoffload_mem|recomp s=64000 b=1 -> TRAINED 18:03
+START s96air2r96 glm4.5-air superoffload_mem|recomp s=96000 b=1 r=2 arm='' 18:03
+CELL s96air2r96 superoffload_mem|recomp s=96000 b=1 -> GOOM 18:07
+GUARD-REAPED orphan 948314 18:10
+GUARD-REAPED orphan 948315 18:10
+START s96air2u32 glm4.5-air superoffload_mem|unsloth s=32000 b=4 r=2 arm='' 18:10
+CELL s96air2u32 superoffload_mem|unsloth s=32000 b=4 -> GOOM 18:15
+GUARD-REAPED orphan 1084054 18:17
+START s96air2u32 glm4.5-air superoffload_mem|unsloth s=32000 b=2 r=2 arm='' 18:18
+CELL s96air2u32 superoffload_mem|unsloth s=32000 b=2 -> TRAINED 18:24
+START s96air2u64 glm4.5-air superoffload_mem|unsloth s=64000 b=2 r=2 arm='' 18:24
+CELL s96air2u64 superoffload_mem|unsloth s=64000 b=2 -> GOOM 18:28
+GUARD-REAPED orphan 1480452 18:31
+GUARD-REAPED orphan 1480451 18:31
+START s96air2u64 glm4.5-air superoffload_mem|unsloth s=64000 b=1 r=2 arm='' 18:31
+CELL s96air2u64 superoffload_mem|unsloth s=64000 b=1 -> TRAINED 18:37
+START s96air2u96 glm4.5-air superoffload_mem|unsloth s=96000 b=1 r=2 arm='' 18:37
+CELL s96air2u96 superoffload_mem|unsloth s=96000 b=1 -> TRAINED 18:46
+START s96air2u128 glm4.5-air superoffload_mem|unsloth s=128000 b=1 r=2 arm='' 18:46
+CELL s96air2u128 superoffload_mem|unsloth s=128000 b=1 -> GOOM 18:51
+GUARD-REAPED orphan 2296818 18:53
+START s96air2z32 glm4.5-air zero3_offload_mem|recomp s=32000 b=2 r=2 arm='' 18:54
+CELL s96air2z32 zero3_offload_mem|recomp s=32000 b=2 -> TRAINED 19:00
+START s96air2z64 glm4.5-air zero3_offload_mem|recomp s=64000 b=1 r=2 arm='' 19:00
+CELL s96air2z64 zero3_offload_mem|recomp s=64000 b=1 -> TRAINED 19:07
+START s96air2d32 glm4.5-air fsdp2_offload|recomp s=32000 b=2 r=2 arm='' 19:07
+CELL s96air2d32 fsdp2_offload|recomp s=32000 b=2 -> COOM 19:09
+START s96air2d32 glm4.5-air fsdp2_offload|recomp s=32000 b=1 r=2 arm='' 19:09
+CELL s96air2d32 fsdp2_offload|recomp s=32000 b=1 -> COOM 19:11
+START s96air2o32 glm4.5-air superoffload_mem|unsloth-off s=32000 b=1 r=2 arm='' 19:11
+CELL s96air2o32 superoffload_mem|unsloth-off s=32000 b=1 -> TRAINED 19:19
+START s96air2o64 glm4.5-air superoffload_mem|unsloth-off s=64000 b=1 r=2 arm='' 19:19
+CELL s96air2o64 superoffload_mem|unsloth-off s=64000 b=1 -> TRAINED 19:28
+START s96air2o96 glm4.5-air superoffload_mem|unsloth-off s=96000 b=1 r=2 arm='' 19:28
+CELL s96air2o96 superoffload_mem|unsloth-off s=96000 b=1 -> TRAINED 19:41
+START s96air2o128 glm4.5-air superoffload_mem|unsloth-off s=128000 b=1 r=2 arm='' 19:41
+CELL s96air2o128 superoffload_mem|unsloth-off s=128000 b=1 -> TRAINED 19:57
+START s96air2o160 glm4.5-air superoffload_mem|unsloth-off s=160000 b=1 r=2 arm='' 19:57
+CELL s96air2o160 superoffload_mem|unsloth-off s=160000 b=1 -> COOM 20:06
+START s96fl2f192a glm4.7-flash asym_sdp2_cpuadamwds|T1 s=192000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 20:06
+CELL s96fl2f192a asym_sdp2_cpuadamwds|T1 s=192000 b=1 -> TRAINED 20:24
+GUARD-SHM-CLEAN 20:24
+START s96fl2f256a glm4.7-flash asym_sdp2_cpuadamwds|T1 s=256000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 20:24
+CELL s96fl2f256a asym_sdp2_cpuadamwds|T1 s=256000 b=1 -> TRAINED 20:52
+GUARD-SHM-CLEAN 20:52
+START s96fl2f320a glm4.7-flash asym_sdp2_cpuadamwds|T1 s=320000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 20:52
+CELL s96fl2f320a asym_sdp2_cpuadamwds|T1 s=320000 b=1 -> TRAINED 21:32
+GUARD-SHM-CLEAN 21:32
+START s96fl2f384a glm4.7-flash asym_sdp2_cpuadamwds|T1 s=384000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 21:32
+CELL s96fl2f384a asym_sdp2_cpuadamwds|T1 s=384000 b=1 -> FAIL 21:56
+GUARD-SHM-CLEAN 21:56
+START s96fl2f384b glm4.7-flash asym_sdp2_cpuadamwds|T2 s=384000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 21:56
+NOTE s96fl2f384a T1 FAIL = rank-1 SIGABRT mid-train (24min in; no traceback; NCCL-edge-flake suspect, NOT an OOM) — per fail-stop rule the auto-demotion to T2 is NOT a tier verdict; T1@384 retry (s96fl2f384a2) queued after the running T2 cell; if SIGABRT repeats -> runtime investigation (cf. D's sm100 incident class)
+CELL s96fl2f384b asym_sdp2_cpuadamwds|T2 s=384000 b=1 -> FAIL 21:58
+START s96fl2f384c glm4.7-flash asym_sdp2_cpuadamwds|T3 s=384000 b=1 r=2 arm='ASYM_ARENA_SHM_CAP_GB=400' 21:58
+INCIDENT c12 22:2x: CUDA driver wedge (cudaErrorDevicesUnavailable, all GPUs, zero contexts) after s96fl2f384a rank-1 SIGABRT; occupiers dead; cell work paused — see doc LIVE CLAIMS

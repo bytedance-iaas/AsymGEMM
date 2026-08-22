@@ -1,0 +1,267 @@
+=== STDTPS96 c18 status log — Session D, Agent 4 (122B-woff + Hunyuan + gpt-oss-20b), sim pair GPU0+GPU2, occupier PIDs recorded below ===
+G20-BUILD BEGIN 2026-08-21 02:49:27
+G20-BUILD rc=1 2026-08-21 02:49:33
+OCCUPIER-START gpu0 pid=1930808 02:51
+OCCUPIER-START gpu2 pid= 02:52
+OCCUPIER-VERIFY-FAILED 0, 97775 MiB 1, 184623 MiB  02:53
+G20-BUILD BEGIN 2026-08-21 02:54:21
+occupier gpu0 alive (pid 1930808)
+OCCUPIER-START gpu2 pid=1934691 02:54
+OCCUPIERS-VERIFIED free~96G on GPUs 0,2 02:54
+index, memory.free [MiB], memory.used [MiB]
+0, 97775 MiB, 90642 MiB
+1, 188416 MiB, 1 MiB
+2, 97774 MiB, 90643 MiB
+3, 184470 MiB, 3947 MiB
+SMOKE-OK 2026-08-21 02:54:30
+G20-BUILD rc=0 2026-08-21 02:55:01
+occupier gpu0 alive (pid 1930808)
+occupier gpu2 alive (pid 1934691)
+OCCUPIERS-VERIFIED free~96G on GPUs 0,2 02:57
+=== STDTPS96-A4-HY PHASE-A BEGIN 2026-08-21 02:57:30 ===
+GUARD-WAIT gpus=0,2 procs=2 avail=1428G shm=1G 03:00
+GUARD-REAPED orphan 1930808 gpus=0,2 03:00
+GUARD-REAPED orphan 1934691 gpus=0,2 03:00
+OCCUPIER-DEAD gpu0 pid=1930808 03:00
+OCCUPIER-DEAD gpu2 pid=1934691 03:00
+OCCUPIER-START gpu0 pid=1940390 03:00
+OCCUPIER-START gpu2 pid=1940504 03:00
+OCCUPIERS-VERIFIED free~96G on GPUs 0,2 03:00
+LIB-FIX 03:0x: _occ_pids emitted concatenated pids (pidfiles lack newline) -> guard reaped the occupiers as orphans; fixed (newline per pid), chain relaunched
+OCCUPIER-START gpu0 pid=1942328 03:02
+OCCUPIER-START gpu2 pid=1942428 03:02
+OCCUPIERS-VERIFIED free~96G on GPUs 0,2 03:02
+index, memory.free [MiB], memory.used [MiB]
+0, 97775 MiB, 90642 MiB
+1, 188416 MiB, 1 MiB
+2, 97775 MiB, 90642 MiB
+3, 184470 MiB, 3947 MiB
+SMOKE-OK 2026-08-21 03:02:07
+occupier gpu0 alive (pid 1942328)
+occupier gpu2 alive (pid 1942428)
+OCCUPIERS-VERIFIED free~96G on GPUs 0,2 03:02
+=== STDTPS96-A4-HY PHASE-A BEGIN 2026-08-21 03:02:13 ===
+START s96h2t1224 hunyuan-a13b asym_sdp2_cpuadamwds|T1 s=224000 b=1 r=2 gpus=0,2 arm='' 03:02
+CELL s96h2t1224 asym_sdp2_cpuadamwds|T1 s=224000 b=1 r=2 -> FAIL (rc=0; log r_s96h2t1224_b1.try1.log) 03:02
+A4-HY r2 t1@224k -> FAIL
+A4-HY HARDFAIL t1@224k — inspect
+START s96h2t2b224 hunyuan-a13b asym_sdp2_cpuadamwds|T2B s=224000 b=1 r=2 gpus=0,2 arm='ASYM_ARENA_SHM_CAP_GB=320' 03:02
+CELL s96h2t2b224 asym_sdp2_cpuadamwds|T2B s=224000 b=1 r=2 -> FAIL (rc=0; log r_s96h2t2b224_b1.try1.log) 03:02
+A4-HY r2 t2b@224k -> FAIL
+A4-HY HARDFAIL t2b@224k — inspect
+START s96h2t3224 hunyuan-a13b asym_sdp2_cpuadamwds|T3 s=224000 b=1 r=2 gpus=0,2 arm='ASYM_ARENA_SHM_CAP_GB=320' 03:02
+CELL s96h2t3224 asym_sdp2_cpuadamwds|T3 s=224000 b=1 r=2 -> FAIL (rc=0; log r_s96h2t3224_b1.try1.log) 03:02
+A4-HY r2 t3@224k -> FAIL
+A4-HY HARDFAIL t3@224k — inspect
+START s96h2t1192 hunyuan-a13b asym_sdp2_cpuadamwds|T1 s=192000 b=1 r=2 gpus=0,2 arm='' 03:02
+CELL s96h2t1192 asym_sdp2_cpuadamwds|T1 s=192000 b=1 r=2 -> FAIL (rc=0; log r_s96h2t1192_b1.try1.log) 03:02
+A4-HY r2 t1@192k -> FAIL
+A4-HY HARDFAIL t1@192k — inspect
+START s96h2t2b192 hunyuan-a13b asym_sdp2_cpuadamwds|T2B s=192000 b=1 r=2 gpus=0,2 arm='ASYM_ARENA_SHM_CAP_GB=320' 03:02
+CELL s96h2t2b192 asym_sdp2_cpuadamwds|T2B s=192000 b=1 r=2 -> FAIL (rc=0; log r_s96h2t2b192_b1.try1.log) 03:02
+A4-HY r2 t2b@192k -> FAIL
+A4-HY HARDFAIL t2b@192k — inspect
+START s96h2t3192 hunyuan-a13b asym_sdp2_cpuadamwds|T3 s=192000 b=1 r=2 gpus=0,2 arm='ASYM_ARENA_SHM_CAP_GB=320' 03:02
+CELL s96h2t3192 asym_sdp2_cpuadamwds|T3 s=192000 b=1 r=2 -> FAIL (rc=0; log r_s96h2t3192_b1.try1.log) 03:02
+A4-HY r2 t3@192k -> FAIL
+A4-HY HARDFAIL t3@192k — inspect
+START s96h2t1160 hunyuan-a13b asym_sdp2_cpuadamwds|T1 s=160000 b=1 r=2 gpus=0,2 arm='' 03:02
+CELL s96h2t1160 asym_sdp2_cpuadamwds|T1 s=160000 b=1 r=2 -> FAIL (rc=0; log r_s96h2t1160_b1.try1.log) 03:02
+A4-HY r2 t1@160k -> FAIL
+A4-HY HARDFAIL t1@160k — inspect
+START s96h2t2b160 hunyuan-a13b asym_sdp2_cpuadamwds|T2B s=160000 b=1 r=2 gpus=0,2 arm='ASYM_ARENA_SHM_CAP_GB=320' 03:02
+CELL s96h2t2b160 asym_sdp2_cpuadamwds|T2B s=160000 b=1 r=2 -> FAIL (rc=0; log r_s96h2t2b160_b1.try1.log) 03:03
+A4-HY r2 t2b@160k -> FAIL
+A4-HY HARDFAIL t2b@160k — inspect
+START s96h2t3160 hunyuan-a13b asym_sdp2_cpuadamwds|T3 s=160000 b=1 r=2 gpus=0,2 arm='ASYM_ARENA_SHM_CAP_GB=320' 03:03
+CELL s96h2t3160 asym_sdp2_cpuadamwds|T3 s=160000 b=1 r=2 -> FAIL (rc=0; log r_s96h2t3160_b1.try1.log) 03:03
+A4-HY r2 t3@160k -> FAIL
+A4-HY HARDFAIL t3@160k — inspect
+START s96h2t1128 hunyuan-a13b asym_sdp2_cpuadamwds|T1 s=128000 b=1 r=2 gpus=0,2 arm='' 03:03
+CELL s96h2t1128 asym_sdp2_cpuadamwds|T1 s=128000 b=1 r=2 -> FAIL (rc=0; log r_s96h2t1128_b1.try1.log) 03:03
+A4-HY r2 t1@128k -> FAIL
+A4-HY HARDFAIL t1@128k — inspect
+START s96h2t2b128 hunyuan-a13b asym_sdp2_cpuadamwds|T2B s=128000 b=1 r=2 gpus=0,2 arm='ASYM_ARENA_SHM_CAP_GB=320' 03:03
+HF-TOKEN-FIX 03:1x: expired shared token 401s hub calls (hunyuan chat-template list) -> lib now sets HF_HUB_DISABLE_IMPLICIT_TOKEN=1 HF_TOKEN=''
+occupier gpu0 alive (pid 1942328)
+occupier gpu2 alive (pid 1942428)
+OCCUPIERS-VERIFIED free~96G on GPUs 0,2 03:03
+=== STDTPS96-A4-HY PHASE-A BEGIN 2026-08-21 03:03:19 ===
+START s96h2t1224 hunyuan-a13b asym_sdp2_cpuadamwds|T1 s=224000 b=1 r=2 gpus=0,2 arm='' 03:03
+CELL s96h2t1224 asym_sdp2_cpuadamwds|T1 s=224000 b=1 r=2 -> FAIL (rc=2; log r_s96h2t1224_b1.try2.log) 03:04
+A4-HY r2 t1@224k -> FAIL
+A4-HY HARDFAIL t1@224k — inspect
+START s96h2t2b224 hunyuan-a13b asym_sdp2_cpuadamwds|T2B s=224000 b=1 r=2 gpus=0,2 arm='ASYM_ARENA_SHM_CAP_GB=320' 03:04
+CELL s96h2t2b224 asym_sdp2_cpuadamwds|T2B s=224000 b=1 r=2 -> FAIL (rc=2; log r_s96h2t2b224_b1.try2.log) 03:04
+A4-HY r2 t2b@224k -> FAIL
+A4-HY HARDFAIL t2b@224k — inspect
+START s96h2t3224 hunyuan-a13b asym_sdp2_cpuadamwds|T3 s=224000 b=1 r=2 gpus=0,2 arm='ASYM_ARENA_SHM_CAP_GB=320' 03:04
+CELL s96h2t3224 asym_sdp2_cpuadamwds|T3 s=224000 b=1 r=2 -> FAIL (rc=2; log r_s96h2t3224_b1.try2.log) 03:04
+A4-HY r2 t3@224k -> FAIL
+A4-HY HARDFAIL t3@224k — inspect
+START s96h2t1192 hunyuan-a13b asym_sdp2_cpuadamwds|T1 s=192000 b=1 r=2 gpus=0,2 arm='' 03:04
+CROSS-SUPERCHIP 03:2x: driver same-superchip gate blocks the doc-mandated 0,2 pair -> ALLOW_CROSS_SUPERCHIP=1 (pure gate, run_lf 657) exported in lib
+occupier gpu0 alive (pid 1942328)
+occupier gpu2 alive (pid 1942428)
+OCCUPIERS-VERIFIED free~96G on GPUs 0,2 03:05
+=== STDTPS96-A4-HY PHASE-A BEGIN 2026-08-21 03:05:17 ===
+START s96h2t1224 hunyuan-a13b asym_sdp2_cpuadamwds|T1 s=224000 b=1 r=2 gpus=0,2 arm='' 03:05
+CELL s96h2t1224 asym_sdp2_cpuadamwds|T1 s=224000 b=1 r=2 -> GOOM (rc=0; log r_s96h2t1224_b1.try3.log) 03:11
+A4-HY r2 t1@224k -> GOOM
+GUARD-SHM-CLEAN 03:11
+START s96h2t2b224 hunyuan-a13b asym_sdp2_cpuadamwds|T2B s=224000 b=1 r=2 gpus=0,2 arm='ASYM_ARENA_SHM_CAP_GB=320' 03:11
+CELL s96h2t2b224 asym_sdp2_cpuadamwds|T2B s=224000 b=1 r=2 -> FAIL (rc=0; log r_s96h2t2b224_b1.try3.log) 03:19
+A4-HY r2 t2b@224k -> FAIL
+A4-HY HARDFAIL t2b@224k — inspect
+GUARD-SHM-CLEAN 03:19
+START s96h2t3224 hunyuan-a13b asym_sdp2_cpuadamwds|T3 s=224000 b=1 r=2 gpus=0,2 arm='ASYM_ARENA_SHM_CAP_GB=320' 03:19
+occupier gpu0 alive (pid 1942328)
+occupier gpu2 alive (pid 1942428)
+OCCUPIERS-VERIFIED free~96G on GPUs 0,2 03:21
+=== FG-CROSS-SOCKET PROBE BEGIN 2026-08-21 03:21:45 ===
+GUARD-SHM-CLEAN 03:21
+START s96h2t2b064 hunyuan-a13b asym_sdp2_cpuadamwds|T2B s=64000 b=2 r=2 gpus=0,2 arm='ASYM_ARENA_SHM_CAP_GB=320' 03:21
+CELL s96h2t2b064 asym_sdp2_cpuadamwds|T2B s=64000 b=2 r=2 -> FAIL (rc=0; log r_s96h2t2b064_b2.try1.log) 03:27
+FG-PROBE T2B@64k b2 on 0,2 (185G ran 59.3G on 0,1) -> FAIL
+=== FG-CROSS-SOCKET PROBE DONE 2026-08-21 03:27:34 ===
+occupier gpu0 alive (pid 1942328)
+occupier gpu2 alive (pid 1942428)
+OCCUPIERS-VERIFIED free~96G on GPUs 0,2 03:27
+=== FG-PROBE2 (faulthandler) BEGIN 2026-08-21 03:27:47 ===
+GUARD-SHM-CLEAN 03:27
+START s96h2t2b064f hunyuan-a13b asym_sdp2_cpuadamwds|T2B s=64000 b=2 r=2 gpus=0,2 arm='ASYM_ARENA_SHM_CAP_GB=320 PYTHONFAULTHANDLER=1 CUDA_LAUNCH_BLOCKING=1' 03:27
+CELL s96h2t2b064f asym_sdp2_cpuadamwds|T2B s=64000 b=2 r=2 -> FAIL (rc=0; log r_s96h2t2b064f_b2.try1.log) 03:33
+FG-PROBE2 T2B@64k b2 on 0,2 with faulthandler -> FAIL
+=== FG-PROBE2 DONE 2026-08-21 03:33:40 ===
+occupier gpu0 alive (pid 1942328)
+occupier gpu2 alive (pid 1942428)
+OCCUPIERS-VERIFIED free~96G on GPUs 0,2 03:36
+=== FG-PROBE3 (membind flip test: both ranks node 1) BEGIN 2026-08-21 03:36:21 ===
+GUARD-SHM-CLEAN 03:36
+START s96h2t2b064m1 hunyuan-a13b asym_sdp2_cpuadamwds|T2B s=64000 b=2 r=2 gpus=0,2 arm='ASYM_ARENA_SHM_CAP_GB=320 PYTHONFAULTHANDLER=1 NUMACTL_MEMBIND=1 NUMACTL_CPUNODEBIND=1' 03:36
+CELL s96h2t2b064m1 asym_sdp2_cpuadamwds|T2B s=64000 b=2 r=2 -> FAIL (rc=0; log r_s96h2t2b064m1_b2.try1.log) 03:42
+FG-PROBE3 T2B@64k b2 on 0,2 with membind=1 -> FAIL (hypothesis: segv flips to rank 0)
+=== FG-PROBE3 DONE 2026-08-21 03:42:09 ===
+occupier gpu0 alive (pid 1942328)
+occupier gpu2 alive (pid 1942428)
+OCCUPIERS-VERIFIED free~96G on GPUs 0,2 03:42
+=== FG-PROBE4 (solo 1r fg on GPU2) BEGIN 2026-08-21 03:42:41 ===
+GUARD-SHM-CLEAN 03:42
+START s96h1t2b064g2 hunyuan-a13b asym_cpuadamwds|T2B s=64000 b=2 r=1 gpus=2 arm='PYTHONFAULTHANDLER=1' 03:42
+CELL s96h1t2b064g2 asym_cpuadamwds|T2B s=64000 b=2 r=1 -> FAIL (rc=0; log r_s96h1t2b064g2_b2.try1.log) 03:47
+FG-PROBE4 1r T2B@64k b2 SOLO on GPU2 -> FAIL (segv => GPU2+cpu-left broken outright)
+START s96h1t2b064g0 hunyuan-a13b asym_cpuadamwds|T2B s=64000 b=2 r=1 gpus=0 arm='PYTHONFAULTHANDLER=1' 03:47
+CELL s96h1t2b064g0 asym_cpuadamwds|T2B s=64000 b=2 r=1 -> FAIL (rc=0; log r_s96h1t2b064g0_b2.try1.log) 03:52
+FG-PROBE4 control: same cell SOLO on GPU0 -> FAIL
+=== FG-PROBE4 DONE 2026-08-21 03:52:57 ===
+=== FG-PROBE5 (GPU2 solo, NO occupier) BEGIN 2026-08-21 03:53:22 ===
+START s96h1t2b064g2n hunyuan-a13b asym_cpuadamwds|T2B s=64000 b=2 r=1 gpus=2 arm='PYTHONFAULTHANDLER=1' 03:53
+CELL s96h1t2b064g2n asym_cpuadamwds|T2B s=64000 b=2 r=1 -> FAIL (rc=0; log r_s96h1t2b064g2n_b2.try1.log) 03:58
+FG-PROBE5 1r T2B@64k b2 GPU2 NO-occupier -> FAIL (TRAINED => occupier interplay; segv => GPU2 outright)
+=== FG-PROBE5 DONE 2026-08-21 03:58:36 ===
+=== FG-PROBE6 (GPU0 solo, NO occupier — tree-regression test) BEGIN 2026-08-21 03:59:12 ===
+START s96h1t2b064g0n hunyuan-a13b asym_cpuadamwds|T2B s=64000 b=2 r=1 gpus=0 arm='PYTHONFAULTHANDLER=1' 03:59
+CELL s96h1t2b064g0n asym_cpuadamwds|T2B s=64000 b=2 r=1 -> FAIL (rc=0; log r_s96h1t2b064g0n_b2.try1.log) 04:04
+FG-PROBE6 1r T2B@64k b2 GPU0 NO-occupier -> FAIL (segv => -46 TREE regression for hunyuan fg)
+=== FG-PROBE6 DONE 2026-08-21 04:04:29 ===
+=== FG-PROBE7 (fresh JIT cache) BEGIN 2026-08-21 04:05:28 ===
+START s96h1t2b064g0j hunyuan-a13b asym_cpuadamwds|T2B s=64000 b=2 r=1 gpus=0 arm='PYTHONFAULTHANDLER=1 DG_JIT_CACHE_DIR=/tmp/asym_jit_fresh96' 04:05
+CELL s96h1t2b064g0j asym_cpuadamwds|T2B s=64000 b=2 r=1 -> FAIL (rc=0; log r_s96h1t2b064g0j_b2.try1.log) 04:10
+FG-PROBE7 GPU0 no-occ FRESH-JIT-CACHE -> FAIL (TRAINED => poisoned cache; segv => code regression, bisect)
+=== FG-PROBE7 DONE 2026-08-21 04:10:40 ===
+=== BISECT d0b9b2d BEGIN 2026-08-21 04:11:03 ===
+START s96bisd0b9b2d hunyuan-a13b asym_cpuadamwds|T2B s=64000 b=2 r=1 gpus=0 arm='PYTHONFAULTHANDLER=1' 04:11
+CELL s96bisd0b9b2d asym_cpuadamwds|T2B s=64000 b=2 r=1 -> FAIL (rc=0; log r_s96bisd0b9b2d_b2.try1.log) 04:16
+BISECT d0b9b2d -> FAIL
+=== BISECT d0b9b2d DONE 2026-08-21 04:16:14 ===
+=== BISECT 805e082 BEGIN 2026-08-21 04:16:24 ===
+START s96bis805e082 hunyuan-a13b asym_cpuadamwds|T2B s=64000 b=2 r=1 gpus=0 arm='PYTHONFAULTHANDLER=1' 04:16
+CELL s96bis805e082 asym_cpuadamwds|T2B s=64000 b=2 r=1 -> FAIL (rc=0; log r_s96bis805e082_b2.try1.log) 04:18
+BISECT 805e082 -> FAIL
+=== BISECT 805e082 DONE 2026-08-21 04:18:08 ===
+=== FG-PROBE8 (HEAD + hunyuan family offload list) BEGIN 2026-08-21 04:18:59 ===
+START s96h1t2b064hf hunyuan-a13b asym_cpuadamwds|T2B s=64000 b=2 r=1 gpus=0 arm='ASYM_OFFLOAD_MODULES=routed_experts,shared_experts,attention,norms,mlp_dense' 04:18
+CELL s96h1t2b064hf asym_cpuadamwds|T2B s=64000 b=2 r=1 -> FAIL (rc=0; log r_s96h1t2b064hf_b2.try1.log) 04:24
+FG-PROBE8 GPU0 no-occ HEAD + family ASYM_OFFLOAD_MODULES -> FAIL (TRAINED => incident closed: protocol, not regression)
+=== FG-PROBE8 DONE 2026-08-21 04:24:07 ===
+=== FG-PROBE9 (gradoff FALSE — the -46 tree's banked fg protocol) BEGIN 2026-08-21 04:29:58 ===
+START s96h1t2b064gf hunyuan-a13b asym_cpuadamwds|T2B s=64000 b=2 r=1 gpus=0 arm='ASYM_OFFLOAD_MODULES=routed_experts,shared_experts,attention,norms,mlp_dense ASYM_CPU_ADAMW_GRAD_OFFLOAD=false' 04:29
+CELL s96h1t2b064gf asym_cpuadamwds|T2B s=64000 b=2 r=1 -> FAIL (rc=2; log r_s96h1t2b064gf_b2.try1.log) 04:29
+FG-PROBE9 GPU0 no-occ HYOFF + gradofffalse -> FAIL
+=== FG-PROBE9 DONE 2026-08-21 04:29:58 ===
+=== FG-PROBE9 (gradoff FALSE — the -46 tree's banked fg protocol) BEGIN 2026-08-21 04:30:24 ===
+START s96h1t2b064gf hunyuan-a13b asym_cpuadamwds|T2B s=64000 b=2 r=1 gpus=0 arm='ASYM_OFFLOAD_MODULES=routed_experts,shared_experts,attention,norms,mlp_dense ASYM_CPU_ADAMW_GRAD_OFFLOAD=false ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false' 04:30
+CELL s96h1t2b064gf asym_cpuadamwds|T2B s=64000 b=2 r=1 -> FAIL (rc=0; log r_s96h1t2b064gf_b2.try2.log) 04:35
+FG-PROBE9 GPU0 no-occ HYOFF + gradofffalse -> FAIL
+=== FG-PROBE9 DONE 2026-08-21 04:35:30 ===
+=== FG-PROBE10 BEGIN 2026-08-21 04:36:16 ===
+START s96h2t2b064r01 hunyuan-a13b asym_sdp2_cpuadamwds|T2B s=64000 b=2 r=2 gpus=0,1 arm='ASYM_OFFLOAD_MODULES=routed_experts,shared_experts,attention,norms,mlp_dense ASYM_ARENA_SHM_CAP_GB=320' 04:36
+CELL s96h2t2b064r01 asym_sdp2_cpuadamwds|T2B s=64000 b=2 r=2 -> FAIL (rc=0; log r_s96h2t2b064r01_b2.try1.log) 04:42
+FG-PROBE10a d2sdp64 replica (2r sdp2 0,1) -> FAIL
+START s96h1t2b064ff hunyuan-a13b asym_cpuadamwds|T2B s=64000 b=2 r=1 gpus=0 arm='ASYM_OFFLOAD_MODULES=routed_experts,shared_experts,attention,norms,mlp_dense ASYM_CPU_ADAMW_GRAD_OFFLOAD=false ASYM_CPU_ADAMW_WEIGHT_OFFLOAD=false PYTHONFAULTHANDLER=1' 04:42
+=== BISECT2 4546c2f BEGIN 2026-08-21 04:42:33 ===
+START s96b24546c2f hunyuan-a13b asym_sdp2_cpuadamwds|T2B s=64000 b=2 r=2 gpus=0,1 arm='ASYM_OFFLOAD_MODULES=routed_experts,shared_experts,attention,norms,mlp_dense ASYM_ARENA_SHM_CAP_GB=320' 04:42
+CELL s96h1t2b064ff asym_cpuadamwds|T2B s=64000 b=2 r=1 -> FAIL (rc=0; log r_s96h1t2b064ff_b2.try1.log) 04:47
+FG-PROBE10b 1r + faulthandler -> FAIL
+=== FG-PROBE10 DONE 2026-08-21 04:47:20 ===
+CELL s96b24546c2f asym_sdp2_cpuadamwds|T2B s=64000 b=2 r=2 -> FAIL (rc=0; log r_s96b24546c2f_b2.try1.log) 04:50
+BISECT2 4546c2f -> FAIL
+=== BISECT2 4546c2f DONE 2026-08-21 04:50:46 ===
+=== FG-PROBE11 (qwen fg canary) BEGIN 2026-08-21 04:51:40 ===
+START s96q30t2b032 q3-30b-a3b asym_cpuadamwds|T2B s=32000 b=1 r=1 gpus=0 arm='PYTHONFAULTHANDLER=1' 04:51
+CELL s96q30t2b032 asym_cpuadamwds|T2B s=32000 b=1 r=1 -> FAIL (rc=0; log r_s96q30t2b032_b1.try1.log) 04:56
+FG-PROBE11 qwen30B 1r T2B@32k b1 GPU0 -> FAIL (segv => NODE-WIDE fg breakage; TRAINED => hunyuan-specific)
+=== FG-PROBE11 DONE 2026-08-21 04:56:21 ===
+=== FG-PROBE12 (qwen canary on GPU1 — never occupied) BEGIN 2026-08-21 04:56:52 ===
+START s96q30t2b032g1 q3-30b-a3b asym_cpuadamwds|T2B s=32000 b=1 r=1 gpus=1 arm='PYTHONFAULTHANDLER=1' 04:56
+CELL s96q30t2b032g1 asym_cpuadamwds|T2B s=32000 b=1 r=1 -> FAIL (rc=0; log r_s96q30t2b032g1_b1.try1.log) 05:00
+FG-PROBE12 qwen30B T2B@32k b1 GPU1 -> FAIL (TRAINED => GPUs 0/2 wedged; segv => node-wide beyond GPUs)
+=== FG-PROBE12 DONE 2026-08-21 05:00:58 ===
+=== FG-PROBE13 (core dump + native bt) BEGIN 2026-08-21 05:01:07 ===
+START s96q30t2b032c q3-30b-a3b asym_cpuadamwds|T2B s=32000 b=1 r=1 gpus=0 arm='' 05:01
+CELL s96q30t2b032c asym_cpuadamwds|T2B s=32000 b=1 r=1 -> FAIL (rc=1; log r_s96q30t2b032c_b1.try1.log) 05:06
+FG-PROBE13 canary w/ coredump -> FAIL
+--- native backtrace (/workspace/AsymGEMM-SFT-46/third_party/AsymGEMM/core):
+#0  0x0000ffff0f8b1cfc in ?? () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#0  0x0000ffff0f8b1cfc in ?? () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#1  0x0000fffede063dec in ?? () from /usr/lib/aarch64-linux-gnu/libcuda.so.1
+#2  0x0000fffede08e6d4 in ?? () from /usr/lib/aarch64-linux-gnu/libcuda.so.1
+#3  0x0000fffeddfd6160 in ?? () from /usr/lib/aarch64-linux-gnu/libcuda.so.1
+#4  0x0000fffeded12b70 in ?? () from /usr/lib/aarch64-linux-gnu/libcuda.so.1
+#5  0x0000fffeddfb1ddc in ?? () from /usr/lib/aarch64-linux-gnu/libcuda.so.1
+#6  0x0000fffeddfbc798 in ?? () from /usr/lib/aarch64-linux-gnu/libcuda.so.1
+#7  0x0000fffeddfbce90 in ?? () from /usr/lib/aarch64-linux-gnu/libcuda.so.1
+#8  0x0000fffede1568d4 in ??=== FG-PROBE14 (-39 TREE canary on c18) BEGIN 2026-08-21 05:07:51 ===
+FG-PROBE14 -39-tree canary rc=0 jobs_ok=yes (yes => -46 env drifted; no+segv => container/node-wide)
+=== FG-PROBE14 DONE 2026-08-21 05:14:15 ===
+=== FG-PROBE15 (-46 code + -39 VENV) BEGIN 2026-08-21 23:07:30 ===
+START s96q30t2b032xv q3-30b-a3b asym_cpuadamwds|T2B s=32000 b=1 r=1 gpus=0 arm='ENV_DIR=/workspace/AsymGEMM-SFT-39/third_party/AsymGEMM/.venv' 23:07
+CELL s96q30t2b032xv asym_cpuadamwds|T2B s=32000 b=1 r=1 -> FAIL (rc=0; log r_s96q30t2b032xv_b1.try1.log) 23:08
+FG-PROBE15 -46 code + -39 venv -> FAIL (TRAINED => -46 VENV is the culprit)
+=== FG-PROBE15 DONE 2026-08-21 23:08:56 ===
+=== FG-PROBE16 (-46 + LF pinned ebde34d3) BEGIN 2026-08-21 23:09:36 ===
+START s96q30t2b032lf q3-30b-a3b asym_cpuadamwds|T2B s=32000 b=1 r=1 gpus=0 arm='' 23:09
+CELL s96q30t2b032lf asym_cpuadamwds|T2B s=32000 b=1 r=1 -> FAIL (rc=0; log r_s96q30t2b032lf_b1.try1.log) 23:11
+FG-PROBE16 canary with LF@ebde34d3 -> FAIL (TRAINED => root cause = LF 7db8f687 x -46 asym fg path)
+=== FG-PROBE16 DONE 2026-08-21 23:11:03 ===
+=== FG-PROBE17 (LF@ebde34d3 + dataset_info restored) BEGIN 2026-08-21 23:12:56 ===
+START s96q30t2b032lf2 q3-30b-a3b asym_cpuadamwds|T2B s=32000 b=1 r=1 gpus=0 arm='' 23:12
+CELL s96q30t2b032lf2 asym_cpuadamwds|T2B s=32000 b=1 r=1 -> FAIL (rc=0; log r_s96q30t2b032lf2_b1.try1.log) 23:13
+FG-PROBE17 canary, LF@ebde34d3 clean -> FAIL
+=== FG-PROBE17 DONE 2026-08-21 23:13:05 ===
+=== FG-PROBE17 (LF@ebde34d3 + dataset_info restored) BEGIN 2026-08-21 23:13:11 ===
+START s96q30t2b032lf2 q3-30b-a3b asym_cpuadamwds|T2B s=32000 b=1 r=1 gpus=0 arm='' 23:13
+CELL s96q30t2b032lf2 asym_cpuadamwds|T2B s=32000 b=1 r=1 -> FAIL (rc=0; log r_s96q30t2b032lf2_b1.try2.log) 23:14
+FG-PROBE17 canary, LF@ebde34d3 clean -> FAIL
+=== FG-PROBE17 DONE 2026-08-21 23:14:33 ===
+=== FG-PROBE17 (LF@ebde34d3 + dataset_info restored) BEGIN 2026-08-21 23:15:01 ===
+START s96q30t2b032lf2 q3-30b-a3b asym_cpuadamwds|T2B s=32000 b=1 r=1 gpus=0 arm='' 23:15
+CELL s96q30t2b032lf2 asym_cpuadamwds|T2B s=32000 b=1 r=1 -> FAIL (rc=0; log r_s96q30t2b032lf2_b1.try3.log) 23:16
+FG-PROBE17 canary, LF@ebde34d3 clean -> FAIL
+=== FG-PROBE17 DONE 2026-08-21 23:16:24 ===
+=== FG-PROBE17 (LF@ebde34d3 + dataset_info restored) BEGIN 2026-08-21 23:17:00 ===
+START s96q30t2b032lf2 q3-30b-a3b asym_cpuadamwds|T2B s=32000 b=1 r=1 gpus=1 arm='' 23:17
+CELL s96q30t2b032lf2 asym_cpuadamwds|T2B s=32000 b=1 r=1 -> FAIL (rc=0; log r_s96q30t2b032lf2_b1.try4.log) 23:18
+FG-PROBE17 canary, LF@ebde34d3 clean -> FAIL
+=== FG-PROBE17 DONE 2026-08-21 23:18:22 ===
+ALL-STOPPED by Kevin's order 2026-08-21 23:51:57

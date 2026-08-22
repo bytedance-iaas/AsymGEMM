@@ -1,0 +1,51 @@
+"""hbm96_occupy.py — GH200-96GB HBM-budget occupier (standardize_tps_96gb.md).
+
+Per simulated GPU, ONE idle process allocates a single uint8 tensor sized
+(current_free − TARGET) and sleeps, leaving exactly TARGET visible to later
+processes: a 96-GB GH200's visible HBM (97,871 MiB). Target-free sizing (not
+fixed-89G) auto-compensates GPUs with foreign residents (e.g. c18's stray
+driver-held residue). The occupier's own CUDA context is already excluded
+from `free` at sizing time, so trainers get TARGET minus only THEIR context —
+the allocator naturally G-OOMs past the budget. No manual budget checks.
+
+Usage (one per simulated GPU, CUDA_VISIBLE_DEVICES pins the physical GPU):
+    CUDA_VISIBLE_DEVICES=<phys> python hbm96_occupy.py --pidfile <path>
+Runs until SIGTERM/SIGINT; never allocates or frees after startup.
+"""
+import argparse, os, signal, sys, time
+
+TARGET_MIB = 97_871          # 96-GB GH200 visible HBM (= 95.58 GiB)
+
+p = argparse.ArgumentParser()
+p.add_argument("--pidfile", required=True)
+p.add_argument("--target-mib", type=int, default=TARGET_MIB)
+args = p.parse_args()
+
+import torch
+assert torch.cuda.is_available(), "no CUDA device visible"
+torch.cuda.init()
+free, total = torch.cuda.mem_get_info(0)
+target = args.target_mib * 2**20
+occupy = free - target
+if occupy <= 0:
+    print(f"[hbm96] free {free/2**30:.1f} GiB already <= target {target/2**30:.1f} GiB — nothing to occupy", flush=True)
+    blob = None
+else:
+    blob = torch.empty(occupy, dtype=torch.uint8, device="cuda:0")
+    blob.fill_(1)            # touch pages so the allocation is real
+free2, _ = torch.cuda.mem_get_info(0)
+print(f"[hbm96] pid={os.getpid()} dev={os.environ.get('CUDA_VISIBLE_DEVICES','?')} "
+      f"total={total/2**30:.1f}GiB free_before={free/2**30:.1f}GiB "
+      f"occupied={occupy/2**30:.2f}GiB free_now={free2/2**30:.2f}GiB "
+      f"(target {target/2**30:.2f}GiB)", flush=True)
+with open(args.pidfile, "w") as f:
+    f.write(str(os.getpid()) + "\n")
+
+_stop = False
+def _sig(*_):
+    global _stop; _stop = True
+signal.signal(signal.SIGTERM, _sig)
+signal.signal(signal.SIGINT, _sig)
+while not _stop:
+    time.sleep(10)
+print("[hbm96] exiting on signal", flush=True)

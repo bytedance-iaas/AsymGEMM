@@ -1,0 +1,7 @@
+#!/bin/bash
+# stdtps96_smoke.sh — bring up the occupiers on GPUs 0+2 and verify the budget.
+set -uo pipefail
+. /workspace/AsymGEMM-SFT-46/third_party/AsymGEMM/agent/anchors_tmp/stdtps96_lib.sh
+start_occupiers || exit 1
+nvidia-smi --query-gpu=index,memory.free,memory.used --format=csv >> "$S"
+echo "SMOKE-OK $(date '+%F %H:%M:%S')" >> "$S"

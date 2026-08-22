@@ -1,0 +1,301 @@
+STDTPS96-MX-FUSE BEGIN 2026-08-21 02:51:00
+STDTPS96-OCCUPIER phys=0 pid=662682 up 2026-08-21 02:51:58
+STDTPS96-OCCUPIER phys=3 pid=663087 up 2026-08-21 02:51:58
+STDTPS96-OCCUPIER phys=3 pid=663087 EXITED 2026-08-21 02:52:00
+total 274652652
+drwxr-xr-x 2 root root        4096 Aug 21 02:52 .
+drwxr-xr-x 3 root root        4096 Aug 21 02:51 ..
+STDTPS96-MX-FUSE rc=0 2026-08-21 02:52:21
+STDTPS96-OCCUPIER phys=3 pid=664565 up 2026-08-21 02:53:16
+STDTPS96-A1-CAPSEARCH BEGIN 2026-08-21 02:56:05
+START s96q30t2_896 q3-30b-a3b asym_sepplan2_cpuadamwds|T2 s=896000 b=1 r=2 02:56
+CELL s96q30t2_896 asym_sepplan2_cpuadamwds|T2 s=896000 b=1 -> GOOM 03:15
+STDTPS96-A1 CELL s96q30t2_896 r2 T2 s=896000 -> GOOM 03:15:00
+START s96q30t2b_896 q3-30b-a3b asym_sepplan2_cpuadamwds|T2B s=896000 b=1 r=2 03:15
+CELL s96q30t2b_896 asym_sepplan2_cpuadamwds|T2B s=896000 b=1 -> GOOM 03:30
+STDTPS96-A1 CELL s96q30t2b_896 r2 T2B s=896000 -> GOOM 03:30:26
+START s96q30t3_896 q3-30b-a3b asym_sepplan2_cpuadamwds|T3 s=896000 b=1 r=2 03:30
+CELL s96q30t3_896 asym_sepplan2_cpuadamwds|T3 s=896000 b=1 -> COOM 03:45
+STDTPS96-A1 CELL s96q30t3_896 r2 T3 s=896000 -> COOM 03:45:45
+START s96q30t2_768 q3-30b-a3b asym_sepplan2_cpuadamwds|T2 s=768000 b=1 r=2 03:45
+CELL s96q30t2_768 asym_sepplan2_cpuadamwds|T2 s=768000 b=1 -> COOM 04:01
+STDTPS96-A1 CELL s96q30t2_768 r2 T2 s=768000 -> COOM 04:01:28
+GUARD-TIMEOUT gpu=0,1 05:01
+STDTPS96-A1 CELL s96q30t2b_768 r2 T2B s=768000 ->  05:01:33
+STDTPS96-A1-CAPSEARCH-V2 BEGIN (resume 896K@T3 clean) 2026-08-21 05:03:39
+START s96q30t3_896r q3-30b-a3b asym_sepplan2_cpuadamwds|T3 s=896000 b=1 r=2 05:03
+CELL s96q30t3_896r asym_sepplan2_cpuadamwds|T3 s=896000 b=1 -> GOOM 05:40
+STDTPS96-A1 CELL s96q30t3_896r r2 T3 s=896000 -> GOOM 05:40:01
+START s96q30t2_768r q3-30b-a3b asym_sepplan2_cpuadamwds|T2 s=768000 b=1 r=2 05:40
+CELL s96q30t2_768r asym_sepplan2_cpuadamwds|T2 s=768000 b=1 -> GOOM 05:53
+STDTPS96-A1 CELL s96q30t2_768r r2 T2 s=768000 -> GOOM 05:53:07
+START s96q30t2b_768r q3-30b-a3b asym_sepplan2_cpuadamwds|T2B s=768000 b=1 r=2 05:53
+CELL s96q30t2b_768r asym_sepplan2_cpuadamwds|T2B s=768000 b=1 -> GOOM 06:20
+STDTPS96-A1 CELL s96q30t2b_768r r2 T2B s=768000 -> GOOM 06:20:24
+START s96q30t3_768r q3-30b-a3b asym_sepplan2_cpuadamwds|T3 s=768000 b=1 r=2 06:20
+CELL s96q30t3_768r asym_sepplan2_cpuadamwds|T3 s=768000 b=1 -> TRAINED 07:38
+STDTPS96-A1 CELL s96q30t3_768r r2 T3 s=768000 -> TRAINED 07:38:27
+GUARD-SHM-CLEAN 07:38
+START s96q30t2_832 q3-30b-a3b asym_sepplan2_cpuadamwds|T2 s=832000 b=1 r=2 07:38
+CELL s96q30t2_832 asym_sepplan2_cpuadamwds|T2 s=832000 b=1 -> GOOM 07:55
+STDTPS96-A1 CELL s96q30t2_832 r2 T2 s=832000 -> GOOM 07:55:34
+START s96q30t2b_832 q3-30b-a3b asym_sepplan2_cpuadamwds|T2B s=832000 b=1 r=2 07:55
+STDTPS96-A1-CAPSEARCH-V3 BEGIN (bisect (768K,896K] @T3) 2026-08-21 07:56:38
+GUARD-SHM-CLEAN 08:12
+START s96q30t3_832 q3-30b-a3b asym_sepplan2_cpuadamwds|T3 s=832000 b=1 r=2 08:12
+CELL s96q30t3_832 asym_sepplan2_cpuadamwds|T3 s=832000 b=1 -> GOOM 09:14
+STDTPS96-A1 CELL s96q30t3_832 r2 T3 s=832000 -> GOOM 09:14:24
+STDTPS96-A1-CAP ok=768000 bracket=(768000,784000] tier=T3 2026-08-21 09:14:24
+START s96q30cap1r_768 q3-30b-a3b asym_cpuadamwds|T3 s=768000 b=1 r=1 09:14
+CELL s96q30cap1r_768 asym_cpuadamwds|T3 s=768000 b=1 -> TRAINED 10:31
+STDTPS96-A1 CELL s96q30cap1r_768 r1 T3 s=768000 -> TRAINED 10:31:09
+STDTPS96-A1-CAPSEARCH-DONE cap=768000 tier=T3 confirm1r=TRAINED 2026-08-21 10:31:09
+STDTPS96-A1-FILL2R BEGIN 2026-08-21 10:32:33
+START s96q30f2rc_128 q3-30b-a3b superoffload_mem|recomp s=128000 b=1 r=2 10:32
+CELL s96q30f2rc_128 superoffload_mem|recomp s=128000 b=1 -> TRAINED 10:39
+STDTPS96-A1 CELL s96q30f2rc_128 r2 recomp s=128000 -> TRAINED 10:39:05
+START s96q30f2un_128 q3-30b-a3b superoffload_mem|unsloth s=128000 b=2 r=2 10:39
+CELL s96q30f2un_128 superoffload_mem|unsloth s=128000 b=2 -> TRAINED 10:46
+STDTPS96-A1 CELL s96q30f2un_128 r2 unsloth s=128000 -> TRAINED 10:46:41
+START s96q30f2uo_128 q3-30b-a3b superoffload_mem|unsloth-off-ohbm0 s=128000 b=2 r=2 10:46
+CELL s96q30f2uo_128 superoffload_mem|unsloth-off-ohbm0 s=128000 b=2 -> TRAINED 10:55
+STDTPS96-A1 CELL s96q30f2uo_128 r2 unsloth-off-ohbm0 s=128000 -> TRAINED 10:55:42
+START s96q30f2z3_128 q3-30b-a3b zero3_offload_mem|recomp s=128000 b=1 r=2 10:55
+CELL s96q30f2z3_128 zero3_offload_mem|recomp s=128000 b=1 -> TRAINED 11:01
+STDTPS96-A1 CELL s96q30f2z3_128 r2 recomp s=128000 -> TRAINED 11:01:35
+START s96q30f2fd_128 q3-30b-a3b fsdp2_offload|recomp s=128000 b=1 r=2 11:01
+CELL s96q30f2fd_128 fsdp2_offload|recomp s=128000 b=1 -> TRAINED 11:07
+STDTPS96-A1 CELL s96q30f2fd_128 r2 recomp s=128000 -> TRAINED 11:07:16
+START s96q30f2as_128t2 q3-30b-a3b asym_sepplan2_cpuadamwds|T2 s=128000 b=2 r=2 11:07
+CELL s96q30f2as_128t2 asym_sepplan2_cpuadamwds|T2 s=128000 b=2 -> TRAINED 11:19
+STDTPS96-A1 CELL s96q30f2as_128t2 r2 T2 s=128000 -> TRAINED 11:19:30
+GUARD-SHM-CLEAN 11:19
+START s96q30f2rc_256 q3-30b-a3b superoffload_mem|recomp s=256000 b=1 r=2 11:19
+CELL s96q30f2rc_256 superoffload_mem|recomp s=256000 b=1 -> GOOM 11:24
+STDTPS96-A1 CELL s96q30f2rc_256 r2 recomp s=256000 -> GOOM 11:24:46
+STDTPS96-A1 r2 rc WALL at 256000 (GOOM)
+GUARD-REAPED orphan 3904549 gpu=0,1 11:27
+START s96q30f2un_256 q3-30b-a3b superoffload_mem|unsloth s=256000 b=1 r=2 11:27
+CELL s96q30f2un_256 superoffload_mem|unsloth s=256000 b=1 -> TRAINED 11:39
+STDTPS96-A1 CELL s96q30f2un_256 r2 unsloth s=256000 -> TRAINED 11:39:14
+START s96q30f2uo_256 q3-30b-a3b superoffload_mem|unsloth-off-ohbm0 s=256000 b=1 r=2 11:39
+CELL s96q30f2uo_256 superoffload_mem|unsloth-off-ohbm0 s=256000 b=1 -> TRAINED 11:52
+STDTPS96-A1 CELL s96q30f2uo_256 r2 unsloth-off-ohbm0 s=256000 -> TRAINED 11:52:04
+START s96q30f2z3_256 q3-30b-a3b zero3_offload_mem|recomp s=256000 b=1 r=2 11:52
+CELL s96q30f2z3_256 zero3_offload_mem|recomp s=256000 b=1 -> GOOM 11:56
+STDTPS96-A1 CELL s96q30f2z3_256 r2 recomp s=256000 -> GOOM 11:56:20
+STDTPS96-A1 r2 z3 WALL at 256000 (GOOM)
+START s96q30f2fd_256 q3-30b-a3b fsdp2_offload|recomp s=256000 b=1 r=2 11:56
+CELL s96q30f2fd_256 fsdp2_offload|recomp s=256000 b=1 -> GOOM 12:00
+STDTPS96-A1 CELL s96q30f2fd_256 r2 recomp s=256000 -> GOOM 12:00:43
+STDTPS96-A1 r2 fd WALL at 256000 (GOOM)
+START s96q30f2as_256t2 q3-30b-a3b asym_sepplan2_cpuadamwds|T2 s=256000 b=1 r=2 12:00
+CELL s96q30f2as_256t2 asym_sepplan2_cpuadamwds|T2 s=256000 b=1 -> TRAINED 12:16
+STDTPS96-A1 CELL s96q30f2as_256t2 r2 T2 s=256000 -> TRAINED 12:16:08
+GUARD-SHM-CLEAN 12:16
+START s96q30f2un_384 q3-30b-a3b superoffload_mem|unsloth s=384000 b=1 r=2 12:16
+CELL s96q30f2un_384 superoffload_mem|unsloth s=384000 b=1 -> GOOM 12:21
+STDTPS96-A1 CELL s96q30f2un_384 r2 unsloth s=384000 -> GOOM 12:21:13
+STDTPS96-A1 r2 un WALL at 384000 (GOOM)
+GUARD-REAPED orphan 1942809 gpu=0,1 12:23
+START s96q30f2uo_384 q3-30b-a3b superoffload_mem|unsloth-off-ohbm0 s=384000 b=1 r=2 12:24
+CELL s96q30f2uo_384 superoffload_mem|unsloth-off-ohbm0 s=384000 b=1 -> TRAINED 12:47
+STDTPS96-A1 CELL s96q30f2uo_384 r2 unsloth-off-ohbm0 s=384000 -> TRAINED 12:47:05
+START s96q30f2as_384t2 q3-30b-a3b asym_sepplan2_cpuadamwds|T2 s=384000 b=1 r=2 12:47
+CELL s96q30f2as_384t2 asym_sepplan2_cpuadamwds|T2 s=384000 b=1 -> TRAINED 13:11
+STDTPS96-A1 CELL s96q30f2as_384t2 r2 T2 s=384000 -> TRAINED 13:11:50
+GUARD-SHM-CLEAN 13:11
+START s96q30f2uo_512 q3-30b-a3b superoffload_mem|unsloth-off-ohbm0 s=512000 b=1 r=2 13:11
+CELL s96q30f2uo_512 superoffload_mem|unsloth-off-ohbm0 s=512000 b=1 -> TRAINED 13:50
+STDTPS96-A1 CELL s96q30f2uo_512 r2 unsloth-off-ohbm0 s=512000 -> TRAINED 13:50:16
+START s96q30f2as_512t2 q3-30b-a3b asym_sepplan2_cpuadamwds|T2 s=512000 b=1 r=2 13:50
+CELL s96q30f2as_512t2 asym_sepplan2_cpuadamwds|T2 s=512000 b=1 -> TRAINED 14:29
+STDTPS96-A1 CELL s96q30f2as_512t2 r2 T2 s=512000 -> TRAINED 14:29:00
+GUARD-SHM-CLEAN 14:29
+START s96q30f2uo_640 q3-30b-a3b superoffload_mem|unsloth-off-ohbm0 s=640000 b=1 r=2 14:29
+CELL s96q30f2uo_640 superoffload_mem|unsloth-off-ohbm0 s=640000 b=1 -> COOM 14:36
+STDTPS96-A1 CELL s96q30f2uo_640 r2 unsloth-off-ohbm0 s=640000 -> COOM 14:36:17
+STDTPS96-A1 r2 uo WALL at 640000 (COOM)
+START s96q30f2as_640t2 q3-30b-a3b asym_sepplan2_cpuadamwds|T2 s=640000 b=1 r=2 14:36
+CELL s96q30f2as_640t2 asym_sepplan2_cpuadamwds|T2 s=640000 b=1 -> GOOM 14:47
+STDTPS96-A1 CELL s96q30f2as_640t2 r2 T2 s=640000 -> GOOM 14:47:39
+START s96q30f2as_640t2b q3-30b-a3b asym_sepplan2_cpuadamwds|T2B s=640000 b=1 r=2 14:47
+CELL s96q30f2as_640t2b asym_sepplan2_cpuadamwds|T2B s=640000 b=1 -> TRAINED 15:43
+STDTPS96-A1 CELL s96q30f2as_640t2b r2 T2B s=640000 -> TRAINED 15:43:49
+STDTPS96-A1-FILL2R-DONE 2026-08-21 15:43:49
+STDTPS96-A1-FILL1R BEGIN 2026-08-21 15:45:52
+GUARD-SHM-CLEAN 15:45
+START s96q30f1rc_128 q3-30b-a3b superoffload_mem|recomp s=128000 b=2 r=1 15:45
+CELL s96q30f1rc_128 superoffload_mem|recomp s=128000 b=2 -> GOOM 15:49
+START s96q30f1rc_128 q3-30b-a3b superoffload_mem|recomp s=128000 b=1 r=1 15:49
+CELL s96q30f1rc_128 superoffload_mem|recomp s=128000 b=1 -> TRAINED 15:54
+STDTPS96-A1 CELL s96q30f1rc_128 r1 recomp s=128000 -> TRAINED 15:54:20
+START s96q30f1un_128 q3-30b-a3b superoffload_mem|unsloth s=128000 b=2 r=1 15:54
+CELL s96q30f1un_128 superoffload_mem|unsloth s=128000 b=2 -> TRAINED 16:01
+STDTPS96-A1 CELL s96q30f1un_128 r1 unsloth s=128000 -> TRAINED 16:01:01
+START s96q30f1uo_128 q3-30b-a3b superoffload_mem|unsloth-off-ohbm0 s=128000 b=4 r=1 16:01
+CELL s96q30f1uo_128 superoffload_mem|unsloth-off-ohbm0 s=128000 b=4 -> TRAINED 16:15
+STDTPS96-A1 CELL s96q30f1uo_128 r1 unsloth-off-ohbm0 s=128000 -> TRAINED 16:15:40
+START s96q30f1z3_128 q3-30b-a3b zero3_offload_mem|recomp s=128000 b=2 r=1 16:15
+CELL s96q30f1z3_128 zero3_offload_mem|recomp s=128000 b=2 -> GOOM 16:19
+START s96q30f1z3_128 q3-30b-a3b zero3_offload_mem|recomp s=128000 b=1 r=1 16:19
+CELL s96q30f1z3_128 zero3_offload_mem|recomp s=128000 b=1 -> TRAINED 16:24
+STDTPS96-A1 CELL s96q30f1z3_128 r1 recomp s=128000 -> TRAINED 16:24:30
+START s96q30f1fd_128 q3-30b-a3b fsdp2_offload|recomp s=128000 b=2 r=1 16:24
+CELL s96q30f1fd_128 fsdp2_offload|recomp s=128000 b=2 -> GOOM 16:27
+START s96q30f1fd_128 q3-30b-a3b fsdp2_offload|recomp s=128000 b=1 r=1 16:27
+CELL s96q30f1fd_128 fsdp2_offload|recomp s=128000 b=1 -> TRAINED 16:32
+STDTPS96-A1 CELL s96q30f1fd_128 r1 recomp s=128000 -> TRAINED 16:32:58
+START s96q30f1as_128t1 q3-30b-a3b asym_cpuadamwds|T1 s=128000 b=2 r=1 16:32
+CELL s96q30f1as_128t1 asym_cpuadamwds|T1 s=128000 b=2 -> TRAINED 16:42
+STDTPS96-A1 CELL s96q30f1as_128t1 r1 T1 s=128000 -> TRAINED 16:42:40
+START s96q30f1rc_256 q3-30b-a3b superoffload_mem|recomp s=256000 b=1 r=1 16:42
+CELL s96q30f1rc_256 superoffload_mem|recomp s=256000 b=1 -> GOOM 16:46
+STDTPS96-A1 CELL s96q30f1rc_256 r1 recomp s=256000 -> GOOM 16:46:40
+STDTPS96-A1 r1 rc WALL at 256000 (GOOM)
+START s96q30f1un_256 q3-30b-a3b superoffload_mem|unsloth s=256000 b=1 r=1 16:46
+STDTPS96-OCCUPIER phys=3 pid=1055584 up 2026-08-21 16:52:38
+STDTPS96-OCCUPIER phys=3 pid=664565 EXITED 2026-08-21 16:52:44
+CELL s96q30f1un_256 superoffload_mem|unsloth s=256000 b=1 -> TRAINED 16:57
+STDTPS96-A1 CELL s96q30f1un_256 r1 unsloth s=256000 -> TRAINED 16:57:55
+START s96q30f1uo_256 q3-30b-a3b superoffload_mem|unsloth-off-ohbm0 s=256000 b=2 r=1 16:57
+CELL s96q30f1uo_256 superoffload_mem|unsloth-off-ohbm0 s=256000 b=2 -> TRAINED 17:19
+STDTPS96-A1 CELL s96q30f1uo_256 r1 unsloth-off-ohbm0 s=256000 -> TRAINED 17:19:23
+START s96q30f1z3_256 q3-30b-a3b zero3_offload_mem|recomp s=256000 b=1 r=1 17:19
+CELL s96q30f1z3_256 zero3_offload_mem|recomp s=256000 b=1 -> GOOM 17:22
+STDTPS96-A1 CELL s96q30f1z3_256 r1 recomp s=256000 -> GOOM 17:22:57
+STDTPS96-A1 r1 z3 WALL at 256000 (GOOM)
+START s96q30f1fd_256 q3-30b-a3b fsdp2_offload|recomp s=256000 b=1 r=1 17:22
+CELL s96q30f1fd_256 fsdp2_offload|recomp s=256000 b=1 -> GOOM 17:26
+STDTPS96-A1 CELL s96q30f1fd_256 r1 recomp s=256000 -> GOOM 17:26:54
+STDTPS96-A1 r1 fd WALL at 256000 (GOOM)
+START s96q30f1as_256t1 q3-30b-a3b asym_cpuadamwds|T1 s=256000 b=1 r=1 17:26
+CELL s96q30f1as_256t1 asym_cpuadamwds|T1 s=256000 b=1 -> TRAINED 17:40
+STDTPS96-A1 CELL s96q30f1as_256t1 r1 T1 s=256000 -> TRAINED 17:40:34
+START s96q30f1un_384 q3-30b-a3b superoffload_mem|unsloth s=384000 b=1 r=1 17:40
+CELL s96q30f1un_384 superoffload_mem|unsloth s=384000 b=1 -> GOOM 17:45
+STDTPS96-A1 CELL s96q30f1un_384 r1 unsloth s=384000 -> GOOM 17:45:44
+STDTPS96-A1 r1 un WALL at 384000 (GOOM)
+START s96q30f1uo_384 q3-30b-a3b superoffload_mem|unsloth-off-ohbm0 s=384000 b=1 r=1 17:45
+CELL s96q30f1uo_384 superoffload_mem|unsloth-off-ohbm0 s=384000 b=1 -> TRAINED 18:08
+STDTPS96-A1 CELL s96q30f1uo_384 r1 unsloth-off-ohbm0 s=384000 -> TRAINED 18:08:25
+START s96q30f1as_384t1 q3-30b-a3b asym_cpuadamwds|T1 s=384000 b=1 r=1 18:08
+CELL s96q30f1as_384t1 asym_cpuadamwds|T1 s=384000 b=1 -> TRAINED 18:30
+STDTPS96-A1 CELL s96q30f1as_384t1 r1 T1 s=384000 -> TRAINED 18:30:56
+START s96q30f1uo_512 q3-30b-a3b superoffload_mem|unsloth-off-ohbm0 s=512000 b=1 r=1 18:30
+CELL s96q30f1uo_512 superoffload_mem|unsloth-off-ohbm0 s=512000 b=1 -> TRAINED 19:06
+STDTPS96-A1 CELL s96q30f1uo_512 r1 unsloth-off-ohbm0 s=512000 -> TRAINED 19:06:42
+START s96q30f1as_512t1 q3-30b-a3b asym_cpuadamwds|T1 s=512000 b=1 r=1 19:06
+CELL s96q30f1as_512t1 asym_cpuadamwds|T1 s=512000 b=1 -> GOOM 19:15
+STDTPS96-A1 CELL s96q30f1as_512t1 r1 T1 s=512000 -> GOOM 19:15:02
+START s96q30f1as_512t2 q3-30b-a3b asym_cpuadamwds|T2 s=512000 b=1 r=1 19:15
+CELL s96q30f1as_512t2 asym_cpuadamwds|T2 s=512000 b=1 -> TRAINED 19:50
+STDTPS96-A1 CELL s96q30f1as_512t2 r1 T2 s=512000 -> TRAINED 19:50:53
+START s96q30f1uo_640 q3-30b-a3b superoffload_mem|unsloth-off-ohbm0 s=640000 b=1 r=1 19:50
+CELL s96q30f1uo_640 superoffload_mem|unsloth-off-ohbm0 s=640000 b=1 -> GOOM 19:58
+STDTPS96-A1 CELL s96q30f1uo_640 r1 unsloth-off-ohbm0 s=640000 -> GOOM 19:58:58
+STDTPS96-A1 r1 uo WALL at 640000 (GOOM)
+START s96q30f1as_640t2 q3-30b-a3b asym_cpuadamwds|T2 s=640000 b=1 r=1 19:58
+CELL s96q30f1as_640t2 asym_cpuadamwds|T2 s=640000 b=1 -> TRAINED 20:54
+STDTPS96-A1 CELL s96q30f1as_640t2 r1 T2 s=640000 -> TRAINED 20:54:58
+STDTPS96-A1-FILL1R-DONE 2026-08-21 20:54:58
+STDTPS96-G20-DEQUANT BEGIN 2026-08-21 20:58:14
+STDTPS96-G20-DEQUANT rc=0 2026-08-21 20:58:40
+STDTPS96-A4-HYCAP BEGIN 2026-08-21 20:58:41
+START s96hyt1_256 hunyuan-a13b asym_sdp2_cpuadamwds|T1 s=256000 b=1 r=2 20:58
+CELL s96hyt1_256 asym_sdp2_cpuadamwds|T1 s=256000 b=1 -> GOOM 21:05
+STDTPS96-A4 CELL s96hyt1_256 r2 T1 s=256000 -> GOOM 21:05:57
+START s96hyt2b_256 hunyuan-a13b asym_sdp2_cpuadamwds|T2B s=256000 b=1 r=2 21:06
+CELL s96hyt2b_256 asym_sdp2_cpuadamwds|T2B s=256000 b=1 -> TRAINED 21:30
+STDTPS96-A4 CELL s96hyt2b_256 r2 T2B s=256000 -> TRAINED 21:30:32
+GUARD-SHM-CLEAN 21:30
+START s96hyt2b_288 hunyuan-a13b asym_sdp2_cpuadamwds|T2B s=288000 b=1 r=2 21:30
+STDTPS96-OCCUPIER phys=3 pid=1055584 EXITED 2026-08-21 21:57:40
+CELL s96hyt2b_288 INVALID (occupier died) 21:58
+CELL s96hyt2b_288 asym_sdp2_cpuadamwds|T2B s=288000 b=1 -> FAIL 21:58
+STDTPS96-A4 CELL s96hyt2b_288 r2 T2B s=288000 -> FAIL 21:58:50
+STDTPS96-A4 FAIL-STOP verdict='FAIL' s=288000 21:58:50
+STDTPS96-OCCUPIER phys=2 pid=3491082 up 2026-08-21 21:59:12
+STDTPS96-OCCUPIER phys=2 pid=3491082 EXITED 2026-08-21 21:59:14
+STDTPS96-OCCUPIER phys=1 pid=3491694 up 2026-08-21 21:59:41
+STDTPS96-OCCUPIER phys=1 pid=3491694 EXITED 2026-08-21 21:59:42
+STDTPS96-A4-HY1R BEGIN (fabric-degraded, GPU0 only) 2026-08-21 22:01:04
+GUARD-OCCUPIER-DEAD gpu=0 22:01
+STDTPS96-A4 CELL s96hyf1rc_96 r1 recomp s=96000 ->  22:01:16
+STDTPS96-A4 FAIL-STOP rc s=96000 v=''
+STDTPS96-A4-HY1R BEGIN (fabric-degraded, GPU0 only) 2026-08-21 22:01:47
+START s96hyf1rc_96 hunyuan-a13b superoffload_mem|recomp s=96000 b=2 r=1 22:01
+CELL s96hyf1rc_96 superoffload_mem|recomp s=96000 b=2 -> GOOM 22:05
+START s96hyf1rc_96 hunyuan-a13b superoffload_mem|recomp s=96000 b=1 r=1 22:05
+CELL s96hyf1rc_96 superoffload_mem|recomp s=96000 b=1 -> TRAINED 22:11
+STDTPS96-A4 CELL s96hyf1rc_96 r1 recomp s=96000 -> TRAINED 22:11:24
+START s96hyf1un_96 hunyuan-a13b superoffload_mem|unsloth-ohbm0 s=96000 b=2 r=1 22:11
+CELL s96hyf1un_96 superoffload_mem|unsloth-ohbm0 s=96000 b=2 -> GOOM 22:14
+START s96hyf1un_96 hunyuan-a13b superoffload_mem|unsloth-ohbm0 s=96000 b=1 r=1 22:14
+CELL s96hyf1un_96 superoffload_mem|unsloth-ohbm0 s=96000 b=1 -> TRAINED 22:20
+STDTPS96-A4 CELL s96hyf1un_96 r1 unsloth-ohbm0 s=96000 -> TRAINED 22:20:06
+START s96hyf1uo_96 hunyuan-a13b superoffload_mem|unsloth-off-ohbm0 s=96000 b=4 r=1 22:20
+CELL s96hyf1uo_96 superoffload_mem|unsloth-off-ohbm0 s=96000 b=4 -> GOOM 22:22
+START s96hyf1uo_96 hunyuan-a13b superoffload_mem|unsloth-off-ohbm0 s=96000 b=2 r=1 22:22
+CELL s96hyf1uo_96 superoffload_mem|unsloth-off-ohbm0 s=96000 b=2 -> TRAINED 22:33
+STDTPS96-A4 CELL s96hyf1uo_96 r1 unsloth-off-ohbm0 s=96000 -> TRAINED 22:33:52
+START s96hyf1as_96t1 hunyuan-a13b asym_cpuadamwds|T1 s=96000 b=2 r=1 22:33
+CELL s96hyf1as_96t1 asym_cpuadamwds|T1 s=96000 b=2 -> GOOM 22:39
+START s96hyf1as_96t1 hunyuan-a13b asym_cpuadamwds|T1 s=96000 b=1 r=1 22:39
+CELL s96hyf1as_96t1 asym_cpuadamwds|T1 s=96000 b=1 -> TRAINED 22:47
+STDTPS96-A4 CELL s96hyf1as_96t1 r1 T1 s=96000 -> TRAINED 22:47:42
+START s96hyf1rc_128 hunyuan-a13b superoffload_mem|recomp s=128000 b=1 r=1 22:47
+CELL s96hyf1rc_128 superoffload_mem|recomp s=128000 b=1 -> GOOM 22:51
+STDTPS96-A4 CELL s96hyf1rc_128 r1 recomp s=128000 -> GOOM 22:51:40
+STDTPS96-A4 r1 rc WALL at 128000 (GOOM)
+START s96hyf1un_128 hunyuan-a13b superoffload_mem|unsloth-ohbm0 s=128000 b=2 r=1 22:51
+CELL s96hyf1un_128 superoffload_mem|unsloth-ohbm0 s=128000 b=2 -> GOOM 22:55
+START s96hyf1un_128 hunyuan-a13b superoffload_mem|unsloth-ohbm0 s=128000 b=1 r=1 22:55
+CELL s96hyf1un_128 superoffload_mem|unsloth-ohbm0 s=128000 b=1 -> TRAINED 23:03
+STDTPS96-A4 CELL s96hyf1un_128 r1 unsloth-ohbm0 s=128000 -> TRAINED 23:03:27
+START s96hyf1uo_128 hunyuan-a13b superoffload_mem|unsloth-off-ohbm0 s=128000 b=2 r=1 23:03
+CELL s96hyf1uo_128 superoffload_mem|unsloth-off-ohbm0 s=128000 b=2 -> TRAINED 23:18
+STDTPS96-A4 CELL s96hyf1uo_128 r1 unsloth-off-ohbm0 s=128000 -> TRAINED 23:18:38
+START s96hyf1as_128t1 hunyuan-a13b asym_cpuadamwds|T1 s=128000 b=2 r=1 23:18
+CELL s96hyf1as_128t1 asym_cpuadamwds|T1 s=128000 b=2 -> GOOM 23:23
+START s96hyf1as_128t1 hunyuan-a13b asym_cpuadamwds|T1 s=128000 b=1 r=1 23:23
+CELL s96hyf1as_128t1 asym_cpuadamwds|T1 s=128000 b=1 -> TRAINED 23:33
+STDTPS96-A4 CELL s96hyf1as_128t1 r1 T1 s=128000 -> TRAINED 23:33:46
+START s96hyf1un_160 hunyuan-a13b superoffload_mem|unsloth-ohbm0 s=160000 b=1 r=1 23:33
+CELL s96hyf1un_160 superoffload_mem|unsloth-ohbm0 s=160000 b=1 -> FAIL 23:33
+STDTPS96-A4 CELL s96hyf1un_160 r1 unsloth-ohbm0 s=160000 -> FAIL 23:33:58
+STDTPS96-A4 FAIL-STOP un s=160000 v='FAIL'
+STDTPS96-A4-HY1R-B BEGIN (resume 160K) 2026-08-21 23:36:31
+START s96hyf1un_160b hunyuan-a13b superoffload_mem|unsloth-ohbm0 s=160000 b=1 r=1 23:36
+CELL s96hyf1un_160b superoffload_mem|unsloth-ohbm0 s=160000 b=1 -> GOOM 23:40
+STDTPS96-A4 CELL s96hyf1un_160b r1 unsloth-ohbm0 s=160000 -> GOOM 23:40:05
+STDTPS96-A4 r1 un WALL at 160000 (GOOM)
+START s96hyf1uo_160b hunyuan-a13b superoffload_mem|unsloth-off-ohbm0 s=160000 b=2 r=1 23:40
+CELL s96hyf1uo_160b superoffload_mem|unsloth-off-ohbm0 s=160000 b=2 -> GOOM 23:43
+START s96hyf1uo_160b hunyuan-a13b superoffload_mem|unsloth-off-ohbm0 s=160000 b=1 r=1 23:43
+CELL s96hyf1uo_160b superoffload_mem|unsloth-off-ohbm0 s=160000 b=1 -> TRAINED 23:54
+STDTPS96-A4 CELL s96hyf1uo_160b r1 unsloth-off-ohbm0 s=160000 -> TRAINED 23:54:57
+START s96hyf1as_160t1b hunyuan-a13b asym_cpuadamwds|T1 s=160000 b=1 r=1 23:54
+CELL s96hyf1as_160t1b asym_cpuadamwds|T1 s=160000 b=1 -> TRAINED 00:09
+STDTPS96-A4 CELL s96hyf1as_160t1b r1 T1 s=160000 -> TRAINED 00:09:07
+START s96hyf1uo_192b hunyuan-a13b superoffload_mem|unsloth-off-ohbm0 s=192000 b=1 r=1 00:09
+CELL s96hyf1uo_192b superoffload_mem|unsloth-off-ohbm0 s=192000 b=1 -> TRAINED 00:24
+STDTPS96-A4 CELL s96hyf1uo_192b r1 unsloth-off-ohbm0 s=192000 -> TRAINED 00:24:56
+START s96hyf1as_192t1b hunyuan-a13b asym_cpuadamwds|T1 s=192000 b=1 r=1 00:24
+CELL s96hyf1as_192t1b asym_cpuadamwds|T1 s=192000 b=1 -> GOOM 00:31
+STDTPS96-A4 CELL s96hyf1as_192t1b r1 T1 s=192000 -> GOOM 00:31:35
+START s96hyf1as_192t2bb hunyuan-a13b asym_cpuadamwds|T2B s=192000 b=1 r=1 00:31
+CELL s96hyf1as_192t2bb asym_cpuadamwds|T2B s=192000 b=1 -> TRAINED 00:48
+STDTPS96-A4 CELL s96hyf1as_192t2bb r1 T2B s=192000 -> TRAINED 00:48:26
+START s96hyf1uo_224b hunyuan-a13b superoffload_mem|unsloth-off-ohbm0 s=224000 b=1 r=1 00:48
+CELL s96hyf1uo_224b superoffload_mem|unsloth-off-ohbm0 s=224000 b=1 -> FAIL 00:48
+STDTPS96-A4 CELL s96hyf1uo_224b r1 unsloth-off-ohbm0 s=224000 -> FAIL 00:48:39
+STDTPS96-A4 FAIL-STOP uo s=224000 v='FAIL'
+STDTPS96-A4-HY1R-C BEGIN (224K) 2026-08-22 00:49:20
+START s96hyf1uo_224c hunyuan-a13b superoffload_mem|unsloth-off-ohbm0 s=224000 b=1 r=1 00:49
+CELL s96hyf1uo_224c superoffload_mem|unsloth-off-ohbm0 s=224000 b=1 -> TRAINED 01:07
+STDTPS96-A4 CELL s96hyf1uo_224c r1 unsloth-off-ohbm0 s=224000 -> TRAINED 01:07:12
+START s96hyf1as_224t2bc hunyuan-a13b asym_cpuadamwds|T2B s=224000 b=1 r=1 01:07
+CELL s96hyf1as_224t2bc asym_cpuadamwds|T2B s=224000 b=1 -> TRAINED 01:27
+STDTPS96-A4 CELL s96hyf1as_224t2bc r1 T2B s=224000 -> TRAINED 01:27:16
+START s96hyf1uo_256c hunyuan-a13b superoffload_mem|unsloth-off-ohbm0 s=256000 b=1 r=1 01:27

@@ -1,0 +1,1267 @@
+START mxu064 mixtral-8x22b superoffload_mem|unsloth s=64000 b=2 03:47
+START phu128 phi3.5-moe superoffload_mem|unsloth s=128000 b=3 03:47
+CELL mxu064 superoffload_mem|unsloth s=64000 b=2 -> COOM 03:50
+START mxu064 mixtral-8x22b superoffload_mem|unsloth s=64000 b=1 03:50
+CELL phu128 superoffload_mem|unsloth s=128000 b=3 -> TRAINED 03:50
+START phr128 phi3.5-moe superoffload_mem|recomp s=128000 b=1 03:50
+NOTE false-verdicts discarded: mxu064-b2 COOM = host contention (redone in serial v2); phu128-b3 GOOM is genuine (banked as b3 wall for uns@128k)
+SERIAL-CHAIN v2 begin 03:53
+START phu128 phi3.5-moe superoffload_mem|unsloth s=128000 b=2 03:53
+CELL phu128 superoffload_mem|unsloth s=128000 b=2 -> TRAINED 03:58
+START phr128 phi3.5-moe superoffload_mem|recomp s=128000 b=1 03:58
+CELL phr128 superoffload_mem|recomp s=128000 b=1 -> TRAINED 04:01
+START pht1128 phi3.5-moe asym_cpuadamwds|T1 s=128000 b=1 04:01
+CELL pht1128 asym_cpuadamwds|T1 s=128000 b=1 -> TRAINED 04:05
+START pht1256 phi3.5-moe asym_cpuadamwds|T1 s=256000 b=1 04:05
+CELL pht1256 asym_cpuadamwds|T1 s=256000 b=1 -> GOOM 04:08
+START phu256 phi3.5-moe superoffload_mem|unsloth s=256000 b=1 04:08
+CELL phu256 superoffload_mem|unsloth s=256000 b=1 -> GOOM 04:10
+START phr256 phi3.5-moe superoffload_mem|recomp s=256000 b=1 04:10
+CELL phr256 superoffload_mem|recomp s=256000 b=1 -> GOOM 04:12
+START pht2256 phi3.5-moe asym_cpuadamwds|T2 s=256000 b=1 04:12
+CELL pht2256 asym_cpuadamwds|T2 s=256000 b=1 -> GOOM 04:15
+START pht1384 phi3.5-moe asym_cpuadamwds|T1 s=384000 b=1 04:15
+CELL pht1384 asym_cpuadamwds|T1 s=384000 b=1 -> GOOM 04:19
+START pht2384 phi3.5-moe asym_cpuadamwds|T2 s=384000 b=1 04:19
+CELL pht2384 asym_cpuadamwds|T2 s=384000 b=1 -> GOOM 04:22
+START phu384 phi3.5-moe superoffload_mem|unsloth s=384000 b=1 04:22
+CELL phu384 superoffload_mem|unsloth s=384000 b=1 -> GOOM 04:24
+START pho256 phi3.5-moe superoffload_mem|unsloth-off s=256000 b=1 04:24
+CELL pho256 superoffload_mem|unsloth-off s=256000 b=1 -> GOOM 04:26
+START pho384 phi3.5-moe superoffload_mem|unsloth-off s=384000 b=1 04:26
+CELL pho384 superoffload_mem|unsloth-off s=384000 b=1 -> GOOM 04:28
+START pho512 phi3.5-moe superoffload_mem|unsloth-off s=512000 b=1 04:28
+CELL pho512 superoffload_mem|unsloth-off s=512000 b=1 -> GOOM 04:31
+START pht2512 phi3.5-moe asym_cpuadamwds|T2 s=512000 b=1 04:31
+CELL pht2512 asym_cpuadamwds|T2 s=512000 b=1 -> GOOM 04:35
+START pht3512 phi3.5-moe asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=512000 b=1 04:35
+CELL pht3512 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=512000 b=1 -> GOOM 04:39
+PHI-BLOCK-DONE 04:39
+START mxu064 mixtral-8x22b superoffload_mem|unsloth s=64000 b=2 04:39
+CELL mxu064 superoffload_mem|unsloth s=64000 b=2 -> COOM 04:45
+START mxu064 mixtral-8x22b superoffload_mem|unsloth s=64000 b=1 04:45
+CELL mxu064 superoffload_mem|unsloth s=64000 b=1 -> TRAINED 04:49
+START mxr064 mixtral-8x22b superoffload_mem|recomp s=64000 b=1 04:49
+CELL mxr064 superoffload_mem|recomp s=64000 b=1 -> TRAINED 04:53
+START mxu128 mixtral-8x22b superoffload_mem|unsloth s=128000 b=1 04:53
+CELL mxu128 superoffload_mem|unsloth s=128000 b=1 -> TRAINED 05:01
+START mxr128 mixtral-8x22b superoffload_mem|recomp s=128000 b=1 05:01
+CELL mxr128 superoffload_mem|recomp s=128000 b=1 -> TRAINED 05:08
+START mxt1128 mixtral-8x22b asym_cpuadamwds|T1 s=128000 b=1 05:08
+CELL mxt1128 asym_cpuadamwds|T1 s=128000 b=1 -> TRAINED 05:19
+START mxt1192 mixtral-8x22b asym_cpuadamwds|T1 s=192000 b=1 05:19
+CELL mxt1192 asym_cpuadamwds|T1 s=192000 b=1 -> TRAINED 05:35
+START mxu192 mixtral-8x22b superoffload_mem|unsloth s=192000 b=1 05:35
+CELL mxu192 superoffload_mem|unsloth s=192000 b=1 -> TRAINED 05:48
+START mxt1256 mixtral-8x22b asym_cpuadamwds|T1 s=256000 b=1 05:48
+CELL mxt1256 asym_cpuadamwds|T1 s=256000 b=1 -> TRAINED 06:11
+START mxu256 mixtral-8x22b superoffload_mem|unsloth s=256000 b=1 06:11
+CELL mxu256 superoffload_mem|unsloth s=256000 b=1 -> TRAINED 06:30
+START mxt2256 mixtral-8x22b asym_cpuadamwds|T2 s=256000 b=1 06:30
+CELL mxt2256 asym_cpuadamwds|T2 s=256000 b=1 -> TRAINED 06:53
+START mxt2320 mixtral-8x22b asym_cpuadamwds|T2 s=320000 b=1 06:53
+CELL mxt2320 asym_cpuadamwds|T2 s=320000 b=1 -> TRAINED 07:25
+START mxt3320 mixtral-8x22b asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=320000 b=1 07:25
+CELL mxt3320 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=320000 b=1 -> TRAINED 08:06
+START mxt3384 mixtral-8x22b asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=384000 b=1 08:06
+CELL mxt3384 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=384000 b=1 -> COOM 08:17
+START mxr192 mixtral-8x22b superoffload_mem|recomp s=192000 b=1 08:17
+CELL mxr192 superoffload_mem|recomp s=192000 b=1 -> GOOM 08:20
+START mxo128 mixtral-8x22b superoffload_mem|unsloth-off s=128000 b=1 08:20
+CELL mxo128 superoffload_mem|unsloth-off s=128000 b=1 -> TRAINED 08:31
+START mxo192 mixtral-8x22b superoffload_mem|unsloth-off s=192000 b=1 08:31
+CELL mxo192 superoffload_mem|unsloth-off s=192000 b=1 -> COOM 08:34
+MX-BLOCK-DONE 08:34
+START pht3640 phi3.5-moe asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=640000 b=1 08:34
+CELL pht3640 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=640000 b=1 -> GOOM 08:39
+START pht3768 phi3.5-moe asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=768000 b=1 08:39
+CELL pht3768 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=768000 b=1 -> GOOM 08:45
+SOLO-CHAIN-DONE ALL-RUNS-COMPLETE 08:45
+PATCH-CHAIN begin 08:45
+START pht3256 phi3.5-moe asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=256000 b=1 08:45
+CELL pht3256 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=256000 b=1 -> GOOM 08:49
+START pht3384 phi3.5-moe asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=384000 b=1 08:49
+CELL pht3384 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=384000 b=1 -> GOOM 08:52
+START phu192 phi3.5-moe superoffload_mem|unsloth s=192000 b=1 08:52
+CELL phu192 superoffload_mem|unsloth s=192000 b=1 -> TRAINED 09:01
+START phr192 phi3.5-moe superoffload_mem|recomp s=192000 b=1 09:01
+CELL phr192 superoffload_mem|recomp s=192000 b=1 -> GOOM 09:04
+START pht1192 phi3.5-moe asym_cpuadamwds|T1 s=192000 b=1 09:04
+CELL pht1192 asym_cpuadamwds|T1 s=192000 b=1 -> TRAINED 09:14
+START pht2192 phi3.5-moe asym_cpuadamwds|T2 s=192000 b=1 09:14
+CELL pht2192 asym_cpuadamwds|T2 s=192000 b=1 -> TRAINED 09:24
+START pho192 phi3.5-moe superoffload_mem|unsloth-off s=192000 b=1 09:24
+CELL pho192 superoffload_mem|unsloth-off s=192000 b=1 -> TRAINED 09:36
+PATCH-CHAIN-DONE 09:36
+PROBE-CHAIN begin 10:46
+START pht1128 phi3.5-moe asym_cpuadamwds|T1 s=128000 b=3 10:46
+CELL pht1128 asym_cpuadamwds|T1 s=128000 b=3 -> TRAINED 10:54
+START mxu320 mixtral-8x22b superoffload_mem|unsloth s=320000 b=1 10:54
+CELL mxu320 superoffload_mem|unsloth s=320000 b=1 -> GOOM 10:58
+START mxt1320 mixtral-8x22b asym_cpuadamwds|T1 s=320000 b=1 10:58
+CELL mxt1320 asym_cpuadamwds|T1 s=320000 b=1 -> GOOM 11:11
+START mxt2352 mixtral-8x22b asym_cpuadamwds|T2 s=352000 b=1 11:11
+CELL mxt2352 asym_cpuadamwds|T2 s=352000 b=1 -> COOM 11:20
+START mxt3352 mixtral-8x22b asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=352000 b=1 11:21
+CELL mxt3352 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=352000 b=1 -> COOM 11:30
+START mxu064p mixtral-8x22b superoffload_mem|unsloth s=64000 b=3 11:30
+CELL mxu064p superoffload_mem|unsloth s=64000 b=3 -> TRAINED 11:38
+START mxu064p mixtral-8x22b superoffload_mem|unsloth s=64000 b=4 11:38
+CELL mxu064p superoffload_mem|unsloth s=64000 b=4 -> FAIL 11:42
+START mxt1064 mixtral-8x22b asym_cpuadamwds|T1 s=64000 b=3 11:42
+CELL mxt1064 asym_cpuadamwds|T1 s=64000 b=3 -> TRAINED 11:54
+START mxt2064 mixtral-8x22b asym_cpuadamwds|T2 s=64000 b=4 11:54
+CELL mxt2064 asym_cpuadamwds|T2 s=64000 b=4 -> TRAINED 12:07
+START mxt3064 mixtral-8x22b asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=64000 b=3 12:07
+CELL mxt3064 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=64000 b=3 -> TRAINED 12:25
+START mxr064p mixtral-8x22b superoffload_mem|recomp s=64000 b=2 12:25
+CELL mxr064p superoffload_mem|recomp s=64000 b=2 -> TRAINED 12:31
+START mxo128p mixtral-8x22b superoffload_mem|unsloth-off s=128000 b=2 12:31
+CELL mxo128p superoffload_mem|unsloth-off s=128000 b=2 -> COOM 12:33
+PROBE-CHAIN-DONE 12:33
+PATCH2-CHAIN begin 12:33
+START pht3192 phi3.5-moe asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=2 12:33
+CELL pht3192 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=2 -> GOOM 12:36
+START pht3192 phi3.5-moe asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=1 12:36
+CELL pht3192 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=1 -> TRAINED 12:50
+START pht2192p phi3.5-moe asym_cpuadamwds|T2 s=192000 b=2 12:50
+CELL pht2192p asym_cpuadamwds|T2 s=192000 b=2 -> GOOM 12:53
+START pht3224 phi3.5-moe asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=224000 b=2 12:53
+CELL pht3224 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=224000 b=2 -> GOOM 12:57
+START pht3224 phi3.5-moe asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=224000 b=1 12:57
+CELL pht3224 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=224000 b=1 -> TRAINED 13:13
+START pht2224 phi3.5-moe asym_cpuadamwds|T2 s=224000 b=1 13:13
+CELL pht2224 asym_cpuadamwds|T2 s=224000 b=1 -> GOOM 13:19
+START pho224 phi3.5-moe superoffload_mem|unsloth-off s=224000 b=1 13:19
+CELL pho224 superoffload_mem|unsloth-off s=224000 b=1 -> TRAINED 13:34
+START phu224 phi3.5-moe superoffload_mem|unsloth s=224000 b=1 13:34
+CELL phu224 superoffload_mem|unsloth s=224000 b=1 -> GOOM 13:37
+PATCH2-CHAIN-DONE ALL-PROBES-COMPLETE 13:37
+GLM-CHAIN begin 20:34
+START gdev47u glm4.7-flash superoffload_mem|unsloth s=8000 b=1 20:34
+CELL gdev47u superoffload_mem|unsloth s=8000 b=1 -> FAIL 20:36
+START gdev47a glm4.7-flash asym_cpuadamwds|T1 s=8000 b=1 20:36
+GLM-CHAIN begin 20:41
+START g2dev47u glm4.7-flash superoffload_mem|unsloth s=8000 b=1 20:41
+CELL g2dev47u superoffload_mem|unsloth s=8000 b=1 -> TRAINED 20:42
+START g2dev47a glm4.7-flash asym_cpuadamwds|T1 s=8000 b=1 20:42
+CELL g2dev47a asym_cpuadamwds|T1 s=8000 b=1 -> FAIL 20:46
+START g2dev45u glm4.5-air superoffload_mem|unsloth s=8000 b=1 20:46
+CELL g2dev45u superoffload_mem|unsloth s=8000 b=1 -> TRAINED 20:49
+START g2dev45a glm4.5-air asym_cpuadamwds|T1 s=8000 b=1 20:49
+CELL g2dev45a asym_cpuadamwds|T1 s=8000 b=1 -> FAIL 20:59
+GLM-DEV-DONE 20:59
+START g2val47o glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=192000 b=2 20:59
+CELL g2val47o superoffload_mem|unsloth-off-ohbm0 s=192000 b=2 -> TRAINED 21:29
+START g2val47t glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=2 21:29
+CELL g2val47t asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=2 -> FAIL 21:31
+START g2val47o3 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=192000 b=3 21:31
+CELL g2val47o3 superoffload_mem|unsloth-off-ohbm0 s=192000 b=3 -> TRAINED 22:14
+GLM-FLASH-VAL-DONE 22:14
+START g2val45o glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=128000 b=2 22:14
+CELL g2val45o superoffload_mem|unsloth-off-ohbm0 s=128000 b=2 -> TRAINED 22:35
+START g2val45t glm4.5-air asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=2 22:35
+CELL g2val45t asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=2 -> TRAINED 23:03
+START g2val45o3 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=128000 b=3 23:03
+CELL g2val45o3 superoffload_mem|unsloth-off-ohbm0 s=128000 b=3 -> COOM 23:07
+START g2val45t3 glm4.5-air asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=3 23:07
+CELL g2val45t3 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=3 -> TRAINED 23:42
+GLM-CHAIN-DONE ALL-GLM-RUNS-COMPLETE 23:42
+START g3dev47a glm4.7-flash asym_cpuadamwds|T1 s=8000 b=1 23:42
+CELL g3dev47a asym_cpuadamwds|T1 s=8000 b=1 -> FAIL 23:46
+GLMFIX-DONE 23:46
+START g3dev45a glm4.5-air asym_cpuadamwds|T1 s=8000 b=1 23:46
+CELL g3dev45a asym_cpuadamwds|T1 s=8000 b=1 -> TRAINED 23:57
+GLMFIX2-DONE ALL-GLM-DEV-RERUNS-COMPLETE 23:57
+GLM-WALKER begin 23:57
+START gw47o4 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=192000 b=4 23:57
+CELL gw47o4 superoffload_mem|unsloth-off-ohbm0 s=192000 b=4 -> TRAINED 00:54
+START gw47o5 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=192000 b=5 00:54
+CELL gw47o5 superoffload_mem|unsloth-off-ohbm0 s=192000 b=5 -> TRAINED 02:04
+START gw47o6 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=192000 b=6 02:04
+CELL gw47o6 superoffload_mem|unsloth-off-ohbm0 s=192000 b=6 -> COOM 02:11
+WALKER flash uns-off last_fit=b5 02:11
+START gw47t5 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 02:12
+CELL gw47t5 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 -> TRAINED 03:28
+START gw47t6 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=6 03:28
+CELL gw47t6 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=6 -> COOM 04:02
+GLM-WALKER-DONE 04:02
+START g4val47t2 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=2 04:03
+CELL g4val47t2 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=2 -> TRAINED 04:43
+START g4val47t3 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=3 04:53
+CELL g4val47t3 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=3 -> COOM 05:18
+GLM-CATCHUP-DONE GLM-CAMPAIGN-ALL-CELLS-COMPLETE 05:18
+START g4dev47a glm4.7-flash asym_cpuadamwds|T1 s=8000 b=1 05:18
+CELL g4dev47a asym_cpuadamwds|T1 s=8000 b=1 -> FAIL 05:19
+GLM-FINAL-DONE EVERYTHING-COMPLETE 05:19
+START g5dev47a glm4.7-flash asym_cpuadamwds|T1 s=8000 b=1 05:31
+CELL g5dev47a asym_cpuadamwds|T1 s=8000 b=1 -> TRAINED 05:36
+G5-DEV-DONE 05:36
+GLM47-LADDER1 begin 13:22
+START l47sdpa glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 13:22
+CELL l47sdpa asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 -> TRAINED 14:37
+START l47exp glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 14:37
+CELL l47exp asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 -> TRAINED 15:54
+START l47both glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 15:54
+CELL l47both asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 -> TRAINED 17:10
+GLM47-LADDER1-DONE 17:10
+START l47dedup glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 17:10
+CELL l47dedup asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 -> TRAINED 18:26
+GLM47-LADDER2-DONE 18:26
+START l47q24 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 18:26
+CELL l47q24 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 -> FAIL 18:37
+START l47q12 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 18:37
+DESCENT2 begin 18:39
+START l47q24f glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 18:39
+CELL l47q24f asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 -> COOM 19:16
+START l47q12f glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 19:17
+CELL l47q12f asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 -> GOOM 19:27
+START l45q16f glm4.5-air asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=2 19:27
+DESCENT3 begin 19:27
+START l47q24g glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 19:27
+CELL l47q24g asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 -> COOM 20:24
+START l47q12g glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 20:24
+CELL l47q12g asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 -> GOOM 20:34
+START l45q16g glm4.5-air asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=2 20:34
+CELL l45q16g asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=2 -> TRAINED 21:23
+START l45q16b4 glm4.5-air asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=4 21:23
+CELL l45q16b4 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=4 -> GOOM 21:38
+START l45q8g glm4.5-air asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=2 21:38
+CELL l45q8g asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=2 -> TRAINED 22:23
+DESCENT3-DONE ALL-DESCENT-COMPLETE 22:23
+DESCENT4 begin 22:23
+START l47q24p glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 22:23
+CELL l47q24p asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 -> FAIL 22:34
+DESCENT4-DONE 22:34
+GLM45-LADDER2 begin 22:34
+START l45qc256 glm4.5-air asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=2 22:34
+CELL l45qc256 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=2 -> TRAINED 23:21
+START l45qc128 glm4.5-air asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=2 23:21
+CELL l45qc128 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=2 -> TRAINED 00:08
+GLM45-LADDER2-DONE 00:08
+DESCENT5 begin 00:09
+START l47q24k glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 00:09
+CELL l47q24k asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 -> COOM 01:02
+DESCENT5-DONE ALL-DESCENT-COMPLETE-V2 01:02
+F1-LANEA begin 05:32
+START f1rc192 glm4.7-flash superoffload_mem|recomp s=192000 b=4 r=1 05:32
+F1-LANEB begin 05:32
+START f1rc160 glm4.7-flash superoffload_mem|recomp s=160000 b=2 r=1 05:32
+CELL f1rc160 superoffload_mem|recomp s=160000 b=2 -> GOOM 05:36
+START f1rc160 glm4.7-flash superoffload_mem|recomp s=160000 b=1 r=1 05:36
+CELL f1rc192 superoffload_mem|recomp s=192000 b=4 -> GOOM 05:37
+START f1rc192 glm4.7-flash superoffload_mem|recomp s=192000 b=2 r=1 05:47
+CELL f1rc160 superoffload_mem|recomp s=160000 b=1 -> TRAINED 05:47
+START f1un160 glm4.7-flash superoffload_mem|unsloth s=160000 b=2 r=1 05:47
+CELL f1un160 superoffload_mem|unsloth s=160000 b=2 -> GOOM 05:52
+START f1un160 glm4.7-flash superoffload_mem|unsloth s=160000 b=1 r=1 05:52
+CELL f1rc192 superoffload_mem|recomp s=192000 b=2 -> GOOM 05:52
+START f1rc192 glm4.7-flash superoffload_mem|recomp s=192000 b=1 r=1 05:52
+CELL f1un160 superoffload_mem|unsloth s=160000 b=1 -> TRAINED 06:12
+START f1uo160 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=160000 b=2 r=1 06:12
+CELL f1rc192 superoffload_mem|recomp s=192000 b=1 -> TRAINED 06:17
+START f1un192 glm4.7-flash superoffload_mem|unsloth s=192000 b=4 r=1 06:35
+CELL f1uo160 superoffload_mem|unsloth-off-ohbm0 s=160000 b=2 -> TRAINED 06:35
+START f1t1160 glm4.7-flash asym_cpuadamwds|T1 s=160000 b=2 r=1 06:35
+CELL f1un192 superoffload_mem|unsloth s=192000 b=4 -> GOOM 06:41
+START f1un192 glm4.7-flash superoffload_mem|unsloth s=192000 b=2 r=1 06:57
+CELL f1t1160 asym_cpuadamwds|T1 s=160000 b=2 -> TRAINED 06:57
+RUNG-DONE f1 glm4.7-flash s=160000 06:57
+START f1rc128 glm4.7-flash superoffload_mem|recomp s=128000 b=3 r=1 06:57
+CELL f1un192 superoffload_mem|unsloth s=192000 b=2 -> GOOM 07:01
+START f1un192 glm4.7-flash superoffload_mem|unsloth s=192000 b=1 r=1 07:02
+CELL f1rc128 superoffload_mem|recomp s=128000 b=3 -> GOOM 07:02
+START f1rc128 glm4.7-flash superoffload_mem|recomp s=128000 b=2 r=1 07:02
+CELL f1un192 superoffload_mem|unsloth s=192000 b=1 -> GOOM 07:06
+START f1uo192 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=192000 b=4 r=1 07:16
+CELL f1rc128 superoffload_mem|recomp s=128000 b=2 -> TRAINED 07:16
+START f1un128 glm4.7-flash superoffload_mem|unsloth s=128000 b=3 r=1 07:16
+CELL f1un128 superoffload_mem|unsloth s=128000 b=3 -> GOOM 07:21
+START f1un128 glm4.7-flash superoffload_mem|unsloth s=128000 b=2 r=1 07:21
+CELL f1un128 superoffload_mem|unsloth s=128000 b=2 -> GOOM 07:24
+START f1un128 glm4.7-flash superoffload_mem|unsloth s=128000 b=1 r=1 07:24
+CELL f1un128 superoffload_mem|unsloth s=128000 b=1 -> TRAINED 07:38
+START f1uo128 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=128000 b=3 r=1 07:38
+CELL f1uo128 superoffload_mem|unsloth-off-ohbm0 s=128000 b=3 -> COOM 07:43
+START f1uo128 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=128000 b=2 r=1 07:43
+CELL f1uo192 superoffload_mem|unsloth-off-ohbm0 s=192000 b=4 -> COOM 07:43
+START f1uo192 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=192000 b=2 r=1 07:43
+CELL f1uo128 superoffload_mem|unsloth-off-ohbm0 s=128000 b=2 -> TRAINED 08:08
+START f1t1128 glm4.7-flash asym_cpuadamwds|T1 s=128000 b=3 r=1 08:08
+CELL f1uo192 superoffload_mem|unsloth-off-ohbm0 s=192000 b=2 -> TRAINED 08:33
+START f1t1192 glm4.7-flash asym_cpuadamwds|T1 s=192000 b=4 r=1 08:39
+CELL f1t1128 asym_cpuadamwds|T1 s=128000 b=3 -> TRAINED 08:39
+RUNG-DONE f1 glm4.7-flash s=128000 08:39
+START f1rc64 glm4.7-flash superoffload_mem|recomp s=64000 b=6 r=1 08:39
+CELL f1rc64 superoffload_mem|recomp s=64000 b=6 -> GOOM 08:42
+START f1rc64 glm4.7-flash superoffload_mem|recomp s=64000 b=4 r=1 08:42
+CELL f1rc64 superoffload_mem|recomp s=64000 b=4 -> GOOM 08:44
+START f1rc64 glm4.7-flash superoffload_mem|recomp s=64000 b=3 r=1 08:44
+CELL f1t1192 asym_cpuadamwds|T1 s=192000 b=4 -> GOOM 08:44
+START f1t1192 glm4.7-flash asym_cpuadamwds|T1 s=192000 b=2 r=1 08:44
+CELL f1rc64 superoffload_mem|recomp s=64000 b=3 -> TRAINED 08:53
+START f1un64 glm4.7-flash superoffload_mem|unsloth s=64000 b=6 r=1 08:53
+CELL f1un64 superoffload_mem|unsloth s=64000 b=6 -> GOOM 08:56
+START f1un64 glm4.7-flash superoffload_mem|unsloth s=64000 b=4 r=1 08:56
+CELL f1un64 superoffload_mem|unsloth s=64000 b=4 -> TRAINED 09:11
+START f1uo64 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=64000 b=6 r=1 09:11
+CELL f1t1192 asym_cpuadamwds|T1 s=192000 b=2 -> TRAINED 09:29
+RUNG-DONE f1 glm4.7-flash s=192000 09:29
+START f1rc96 glm4.7-flash superoffload_mem|recomp s=96000 b=4 r=1 09:33
+CELL f1uo64 superoffload_mem|unsloth-off-ohbm0 s=64000 b=6 -> TRAINED 09:33
+START f1t164 glm4.7-flash asym_cpuadamwds|T1 s=64000 b=6 r=1 09:33
+CELL f1rc96 superoffload_mem|recomp s=96000 b=4 -> GOOM 09:36
+START f1rc96 glm4.7-flash superoffload_mem|recomp s=96000 b=3 r=1 09:46
+CELL f1t164 asym_cpuadamwds|T1 s=64000 b=6 -> TRAINED 09:47
+RUNG-DONE f1 glm4.7-flash s=64000 09:47
+F1-LANEB-DONE 09:47
+CELL f1rc96 superoffload_mem|recomp s=96000 b=3 -> TRAINED 09:58
+START f1un96 glm4.7-flash superoffload_mem|unsloth s=96000 b=4 r=1 09:58
+CELL f1un96 superoffload_mem|unsloth s=96000 b=4 -> TRAINED 10:12
+START f1uo96 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=96000 b=4 r=1 10:12
+CELL f1uo96 superoffload_mem|unsloth-off-ohbm0 s=96000 b=4 -> TRAINED 10:29
+START f1t196 glm4.7-flash asym_cpuadamwds|T1 s=96000 b=4 r=1 10:29
+CELL f1t196 asym_cpuadamwds|T1 s=96000 b=4 -> TRAINED 10:46
+RUNG-DONE f1 glm4.7-flash s=96000 10:46
+START f1rc32 glm4.7-flash superoffload_mem|recomp s=32000 b=12 r=1 10:46
+CELL f1rc32 superoffload_mem|recomp s=32000 b=12 -> GOOM 10:49
+START f1rc32 glm4.7-flash superoffload_mem|recomp s=32000 b=8 r=1 10:49
+CELL f1rc32 superoffload_mem|recomp s=32000 b=8 -> TRAINED 10:54
+START f1un32 glm4.7-flash superoffload_mem|unsloth s=32000 b=12 r=1 10:54
+CELL f1un32 superoffload_mem|unsloth s=32000 b=12 -> TRAINED 11:01
+START f1uo32 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=32000 b=12 r=1 11:01
+CELL f1uo32 superoffload_mem|unsloth-off-ohbm0 s=32000 b=12 -> TRAINED 11:10
+START f1t132 glm4.7-flash asym_cpuadamwds|T1 s=32000 b=12 r=1 11:10
+CELL f1t132 asym_cpuadamwds|T1 s=32000 b=12 -> TRAINED 11:20
+RUNG-DONE f1 glm4.7-flash s=32000 11:20
+F1-LANEA-DONE 11:20
+F2 begin 11:20
+START f2rc192 glm4.7-flash superoffload_mem|recomp s=192000 b=4 r=2 11:20
+CELL f2rc192 superoffload_mem|recomp s=192000 b=4 -> FAIL 11:56
+GUARD-TIMEOUT gpu=0,1 12:56
+START f2uo192 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=192000 b=4 r=2 12:57
+NOTE f2rc192 aborted by guard-timeout on orphan; needs b2/b1 walk in a redo slot (ddp_timeout now active)
+CELL f2uo192 superoffload_mem|unsloth-off-ohbm0 s=192000 b=4 -> COOM 13:02
+START f2uo192 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=192000 b=2 r=2 13:02
+CELL f2uo192 superoffload_mem|unsloth-off-ohbm0 s=192000 b=2 -> TRAINED 13:34
+START f2t1192 glm4.7-flash asym_cpuadamwds|T1 s=192000 b=4 r=2 13:34
+CELL f2t1192 asym_cpuadamwds|T1 s=192000 b=4 -> FAIL 13:34
+START f2t2192 glm4.7-flash asym_cpuadamwds|T2 s=192000 b=4 r=2 13:34
+CELL f2t2192 asym_cpuadamwds|T2 s=192000 b=4 -> FAIL 13:34
+START f2t3192 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=4 r=2 13:34
+CELL f2t3192 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=4 -> FAIL 13:35
+RUNG-DONE f2 glm4.7-flash s=192000 13:35
+START f2rc160 glm4.7-flash superoffload_mem|recomp s=160000 b=2 r=2 13:35
+CELL f2rc160 superoffload_mem|recomp s=160000 b=2 -> TRAINED 13:54
+START f2un160 glm4.7-flash superoffload_mem|unsloth s=160000 b=2 r=2 13:54
+CELL f2un160 superoffload_mem|unsloth s=160000 b=2 -> TRAINED 14:13
+START f2uo160 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=160000 b=2 r=2 14:13
+CELL f2uo160 superoffload_mem|unsloth-off-ohbm0 s=160000 b=2 -> TRAINED 14:37
+START f2t1160 glm4.7-flash asym_cpuadamwds|T1 s=160000 b=2 r=2 14:37
+CELL f2t1160 asym_cpuadamwds|T1 s=160000 b=2 -> FAIL 14:37
+START f2t2160 glm4.7-flash asym_cpuadamwds|T2 s=160000 b=2 r=2 14:37
+CELL f2t2160 asym_cpuadamwds|T2 s=160000 b=2 -> FAIL 14:37
+START f2t3160 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=160000 b=2 r=2 14:37
+CELL f2t3160 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=160000 b=2 -> FAIL 14:37
+RUNG-DONE f2 glm4.7-flash s=160000 14:37
+START f2rc128 glm4.7-flash superoffload_mem|recomp s=128000 b=3 r=2 14:37
+CELL f2rc128 superoffload_mem|recomp s=128000 b=3 -> GOOM 14:41
+START f2rc128 glm4.7-flash superoffload_mem|recomp s=128000 b=2 r=2 14:41
+CELL f2rc128 superoffload_mem|recomp s=128000 b=2 -> TRAINED 14:54
+START f2un128 glm4.7-flash superoffload_mem|unsloth s=128000 b=3 r=2 14:54
+CELL f2un128 superoffload_mem|unsloth s=128000 b=3 -> TRAINED 15:12
+START f2uo128 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=128000 b=3 r=2 15:12
+CELL f2uo128 superoffload_mem|unsloth-off-ohbm0 s=128000 b=3 -> TRAINED 15:37
+START f2t1128 glm4.7-flash asym_ep2_cpuadamwds|T1 s=128000 b=3 r=2 15:37
+CELL f2t1128 asym_ep2_cpuadamwds|T1 s=128000 b=3 -> FAIL 15:41
+START f2t2128 glm4.7-flash asym_ep2_cpuadamwds|T2 s=128000 b=3 r=2 15:41
+CELL f2t2128 asym_ep2_cpuadamwds|T2 s=128000 b=3 -> FAIL 15:46
+START f2t3128 glm4.7-flash asym_ep2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=3 r=2 15:46
+CELL f2t3128 asym_ep2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=3 -> FAIL 15:50
+START f2rc96 glm4.7-flash superoffload_mem|recomp s=96000 b=4 r=2 15:50
+CELL f2rc96 superoffload_mem|recomp s=96000 b=4 -> GOOM 15:53
+START f2rc96 glm4.7-flash superoffload_mem|recomp s=96000 b=3 r=2 15:53
+CELL f2rc96 superoffload_mem|recomp s=96000 b=3 -> TRAINED 16:05
+START f2un96 glm4.7-flash superoffload_mem|unsloth s=96000 b=4 r=2 16:05
+CELL f2un96 superoffload_mem|unsloth s=96000 b=4 -> TRAINED 16:20
+START f2uo96 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=96000 b=4 r=2 16:20
+CELL f2uo96 superoffload_mem|unsloth-off-ohbm0 s=96000 b=4 -> TRAINED 16:40
+START f2t196 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=96000 b=4 r=2 16:40
+CELL f2t196 asym_sdp2_cpuadamwds|T1 s=96000 b=4 -> TRAINED 16:57
+RUNG-DONE f2 glm4.7-flash s=96000 16:57
+START f2rc64 glm4.7-flash superoffload_mem|recomp s=64000 b=6 r=2 16:57
+CELL f2rc64 superoffload_mem|recomp s=64000 b=6 -> GOOM 17:00
+START f2rc64 glm4.7-flash superoffload_mem|recomp s=64000 b=4 r=2 17:00
+CELL f2rc64 superoffload_mem|recomp s=64000 b=4 -> TRAINED 17:08
+START f2un64 glm4.7-flash superoffload_mem|unsloth s=64000 b=6 r=2 17:08
+CELL f2un64 superoffload_mem|unsloth s=64000 b=6 -> TRAINED 17:19
+START f2uo64 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=64000 b=6 r=2 17:19
+CELL f2uo64 superoffload_mem|unsloth-off-ohbm0 s=64000 b=6 -> TRAINED 17:36
+START f2t164 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=64000 b=6 r=2 17:36
+CELL f2t164 asym_sdp2_cpuadamwds|T1 s=64000 b=6 -> TRAINED 17:49
+RUNG-DONE f2 glm4.7-flash s=64000 17:49
+START f2rc32 glm4.7-flash superoffload_mem|recomp s=32000 b=12 r=2 17:49
+CELL f2rc32 superoffload_mem|recomp s=32000 b=12 -> GOOM 17:51
+START f2rc32 glm4.7-flash superoffload_mem|recomp s=32000 b=8 r=2 17:51
+CELL f2rc32 superoffload_mem|recomp s=32000 b=8 -> TRAINED 17:57
+START f2un32 glm4.7-flash superoffload_mem|unsloth s=32000 b=12 r=2 17:57
+CELL f2un32 superoffload_mem|unsloth s=32000 b=12 -> TRAINED 18:04
+START f2uo32 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=32000 b=12 r=2 18:04
+CELL f2uo32 superoffload_mem|unsloth-off-ohbm0 s=32000 b=12 -> TRAINED 18:17
+START f2t132 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=32000 b=12 r=2 18:17
+CELL f2t132 asym_sdp2_cpuadamwds|T1 s=32000 b=12 -> TRAINED 18:27
+RUNG-DONE f2 glm4.7-flash s=32000 18:27
+F2-DONE 18:27
+F1-REDO begin 18:27
+START f1s_rc64 glm4.7-flash superoffload_mem|recomp s=64000 b=3 r=1 18:27
+CELL f1s_rc64 superoffload_mem|recomp s=64000 b=3 -> TRAINED 18:34
+START f1s_un64 glm4.7-flash superoffload_mem|unsloth s=64000 b=4 r=1 18:34
+CELL f1s_un64 superoffload_mem|unsloth s=64000 b=4 -> TRAINED 18:42
+START f1s_uo64 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=64000 b=6 r=1 18:42
+CELL f1s_uo64 superoffload_mem|unsloth-off-ohbm0 s=64000 b=6 -> TRAINED 18:55
+START f1s_t164 glm4.7-flash asym_cpuadamwds|T1 s=64000 b=6 r=1 18:55
+CELL f1s_t164 asym_cpuadamwds|T1 s=64000 b=6 -> TRAINED 19:08
+START f1s_rc128 glm4.7-flash superoffload_mem|recomp s=128000 b=2 r=1 19:08
+CELL f1s_rc128 superoffload_mem|recomp s=128000 b=2 -> TRAINED 19:21
+START f1s_un128 glm4.7-flash superoffload_mem|unsloth s=128000 b=1 r=1 19:21
+CELL f1s_un128 superoffload_mem|unsloth s=128000 b=1 -> TRAINED 19:29
+START f1s_uo128 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=128000 b=3 r=1 19:29
+CELL f1s_uo128 superoffload_mem|unsloth-off-ohbm0 s=128000 b=3 -> TRAINED 19:50
+START f1s_t1128 glm4.7-flash asym_cpuadamwds|T1 s=128000 b=3 r=1 19:50
+CELL f1s_t1128 asym_cpuadamwds|T1 s=128000 b=3 -> TRAINED 20:11
+START f1s_rc160 glm4.7-flash superoffload_mem|recomp s=160000 b=1 r=1 20:11
+CELL f1s_rc160 superoffload_mem|recomp s=160000 b=1 -> TRAINED 20:22
+START f1s_un160 glm4.7-flash superoffload_mem|unsloth s=160000 b=1 r=1 20:22
+CELL f1s_un160 superoffload_mem|unsloth s=160000 b=1 -> TRAINED 20:33
+START f1s_uo160 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=160000 b=2 r=1 20:33
+CELL f1s_uo160 superoffload_mem|unsloth-off-ohbm0 s=160000 b=2 -> TRAINED 20:53
+START f1s_t1160 glm4.7-flash asym_cpuadamwds|T1 s=160000 b=2 r=1 20:53
+CELL f1s_t1160 asym_cpuadamwds|T1 s=160000 b=2 -> TRAINED 21:15
+START f1s_rc192 glm4.7-flash superoffload_mem|recomp s=192000 b=1 r=1 21:15
+CELL f1s_rc192 superoffload_mem|recomp s=192000 b=1 -> TRAINED 21:29
+START f1s_t1192 glm4.7-flash asym_cpuadamwds|T1 s=192000 b=2 r=1 21:29
+CELL f1s_t1192 asym_cpuadamwds|T1 s=192000 b=2 -> TRAINED 21:58
+F1-REDO-DONE 21:58
+F2-PATCH begin 21:58
+START f2s_rc192 glm4.7-flash superoffload_mem|recomp s=192000 b=1 r=2 21:58
+CELL f2s_rc192 superoffload_mem|recomp s=192000 b=1 -> TRAINED 22:13
+START f2s_un192 glm4.7-flash superoffload_mem|unsloth s=192000 b=1 r=2 22:13
+CELL f2s_un192 superoffload_mem|unsloth s=192000 b=1 -> TRAINED 22:28
+START f2s_t1192 glm4.7-flash asym_ep2_cpuadamwds|T1 s=192000 b=4 r=2 22:28
+CELL f2s_t1192 asym_ep2_cpuadamwds|T1 s=192000 b=4 -> FAIL 22:33
+F2-PATCH-DONE 22:33
+F2-PATCH2B begin 22:33
+START f2s_t1192 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=192000 b=4 r=2 22:33
+CELL f2s_t1192 asym_sdp2_cpuadamwds|T1 s=192000 b=4 -> TRAINED 23:28
+START f2s_t1160 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=160000 b=2 r=2 23:28
+CELL f2s_t1160 asym_sdp2_cpuadamwds|T1 s=160000 b=2 -> TRAINED 23:50
+START f2s_t1128 glm4.7-flash asym_sdp2_cpuadamwds|T1 s=128000 b=3 r=2 23:50
+CELL f2s_t1128 asym_sdp2_cpuadamwds|T1 s=128000 b=3 -> TRAINED 00:11
+F2-PATCH2-DONE 00:11
+A1 begin 00:11
+START a1rc128 glm4.5-air superoffload_mem|recomp s=128000 b=3 r=1 00:11
+CELL a1rc128 superoffload_mem|recomp s=128000 b=3 -> GOOM 00:15
+START a1rc128 glm4.5-air superoffload_mem|recomp s=128000 b=2 r=1 00:15
+CELL a1rc128 superoffload_mem|recomp s=128000 b=2 -> GOOM 00:18
+START a1rc128 glm4.5-air superoffload_mem|recomp s=128000 b=1 r=1 00:18
+CELL a1rc128 superoffload_mem|recomp s=128000 b=1 -> TRAINED 00:27
+START a1un128 glm4.5-air superoffload_mem|unsloth s=128000 b=3 r=1 00:27
+CELL a1un128 superoffload_mem|unsloth s=128000 b=3 -> GOOM 00:31
+START a1un128 glm4.5-air superoffload_mem|unsloth s=128000 b=2 r=1 00:31
+CELL a1un128 superoffload_mem|unsloth s=128000 b=2 -> GOOM 00:35
+START a1un128 glm4.5-air superoffload_mem|unsloth s=128000 b=1 r=1 00:35
+CELL a1un128 superoffload_mem|unsloth s=128000 b=1 -> TRAINED 00:44
+START a1uo128 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=128000 b=3 r=1 00:44
+CELL a1uo128 superoffload_mem|unsloth-off-ohbm0 s=128000 b=3 -> COOM 00:48
+START a1uo128 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=128000 b=2 r=1 00:48
+CELL a1uo128 superoffload_mem|unsloth-off-ohbm0 s=128000 b=2 -> TRAINED 01:08
+START a1t1128 glm4.5-air asym_cpuadamwds|T1 s=128000 b=3 r=1 01:08
+CELL a1t1128 asym_cpuadamwds|T1 s=128000 b=3 -> GOOM 01:22
+START a1t1128 glm4.5-air asym_cpuadamwds|T1 s=128000 b=2 r=1 01:22
+CELL a1t1128 asym_cpuadamwds|T1 s=128000 b=2 -> TRAINED 01:41
+RUNG-DONE a1 glm4.5-air s=128000 01:41
+START a1rc96 glm4.5-air superoffload_mem|recomp s=96000 b=4 r=1 01:41
+CELL a1rc96 superoffload_mem|recomp s=96000 b=4 -> GOOM 01:44
+START a1rc96 glm4.5-air superoffload_mem|recomp s=96000 b=3 r=1 01:44
+CELL a1rc96 superoffload_mem|recomp s=96000 b=3 -> GOOM 01:47
+START a1rc96 glm4.5-air superoffload_mem|recomp s=96000 b=2 r=1 01:47
+CELL a1rc96 superoffload_mem|recomp s=96000 b=2 -> GOOM 01:50
+START a1un96 glm4.5-air superoffload_mem|unsloth s=96000 b=4 r=1 01:50
+CELL a1un96 superoffload_mem|unsloth s=96000 b=4 -> GOOM 01:54
+START a1un96 glm4.5-air superoffload_mem|unsloth s=96000 b=3 r=1 01:54
+CELL a1un96 superoffload_mem|unsloth s=96000 b=3 -> GOOM 01:58
+START a1un96 glm4.5-air superoffload_mem|unsloth s=96000 b=2 r=1 01:58
+CELL a1un96 superoffload_mem|unsloth s=96000 b=2 -> TRAINED 02:06
+START a1uo96 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=96000 b=4 r=1 02:06
+CELL a1uo96 superoffload_mem|unsloth-off-ohbm0 s=96000 b=4 -> COOM 02:10
+START a1uo96 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=96000 b=3 r=1 02:10
+CELL a1uo96 superoffload_mem|unsloth-off-ohbm0 s=96000 b=3 -> COOM 02:17
+START a1uo96 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=96000 b=2 r=1 02:17
+CELL a1uo96 superoffload_mem|unsloth-off-ohbm0 s=96000 b=2 -> TRAINED 02:30
+START a1t196 glm4.5-air asym_cpuadamwds|T1 s=96000 b=4 r=1 02:30
+CELL a1t196 asym_cpuadamwds|T1 s=96000 b=4 -> GOOM 02:40
+START a1t196 glm4.5-air asym_cpuadamwds|T1 s=96000 b=3 r=1 02:40
+CELL a1t196 asym_cpuadamwds|T1 s=96000 b=3 -> TRAINED 02:55
+RUNG-DONE a1 glm4.5-air s=96000 02:55
+START a1rc64 glm4.5-air superoffload_mem|recomp s=64000 b=6 r=1 02:55
+CELL a1rc64 superoffload_mem|recomp s=64000 b=6 -> GOOM 02:58
+START a1rc64 glm4.5-air superoffload_mem|recomp s=64000 b=4 r=1 02:58
+CELL a1rc64 superoffload_mem|recomp s=64000 b=4 -> GOOM 03:01
+START a1rc64 glm4.5-air superoffload_mem|recomp s=64000 b=3 r=1 03:01
+CELL a1rc64 superoffload_mem|recomp s=64000 b=3 -> GOOM 03:04
+START a1rc64 glm4.5-air superoffload_mem|recomp s=64000 b=2 r=1 03:04
+CELL a1rc64 superoffload_mem|recomp s=64000 b=2 -> TRAINED 03:10
+START a1un64 glm4.5-air superoffload_mem|unsloth s=64000 b=6 r=1 03:10
+CELL a1un64 superoffload_mem|unsloth s=64000 b=6 -> GOOM 03:14
+START a1un64 glm4.5-air superoffload_mem|unsloth s=64000 b=4 r=1 03:14
+CELL a1un64 superoffload_mem|unsloth s=64000 b=4 -> GOOM 03:17
+START a1un64 glm4.5-air superoffload_mem|unsloth s=64000 b=3 r=1 03:17
+CELL a1un64 superoffload_mem|unsloth s=64000 b=3 -> TRAINED 03:24
+START a1uo64 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=64000 b=6 r=1 03:24
+CELL a1uo64 superoffload_mem|unsloth-off-ohbm0 s=64000 b=6 -> COOM 03:27
+START a1uo64 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=64000 b=4 r=1 03:28
+CELL a1uo64 superoffload_mem|unsloth-off-ohbm0 s=64000 b=4 -> TRAINED 03:42
+START a1t164 glm4.5-air asym_cpuadamwds|T1 s=64000 b=6 r=1 03:42
+CELL a1t164 asym_cpuadamwds|T1 s=64000 b=6 -> GOOM 03:50
+START a1t164 glm4.5-air asym_cpuadamwds|T1 s=64000 b=4 r=1 03:50
+CELL a1t164 asym_cpuadamwds|T1 s=64000 b=4 -> TRAINED 04:02
+RUNG-DONE a1 glm4.5-air s=64000 04:02
+START a1rc48 glm4.5-air superoffload_mem|recomp s=48000 b=8 r=1 04:02
+CELL a1rc48 superoffload_mem|recomp s=48000 b=8 -> GOOM 04:06
+START a1rc48 glm4.5-air superoffload_mem|recomp s=48000 b=6 r=1 04:06
+CELL a1rc48 superoffload_mem|recomp s=48000 b=6 -> GOOM 04:08
+START a1rc48 glm4.5-air superoffload_mem|recomp s=48000 b=4 r=1 04:08
+CELL a1rc48 superoffload_mem|recomp s=48000 b=4 -> GOOM 04:11
+START a1un48 glm4.5-air superoffload_mem|unsloth s=48000 b=8 r=1 04:11
+CELL a1un48 superoffload_mem|unsloth s=48000 b=8 -> GOOM 04:14
+START a1un48 glm4.5-air superoffload_mem|unsloth s=48000 b=6 r=1 04:14
+CELL a1un48 superoffload_mem|unsloth s=48000 b=6 -> GOOM 04:17
+START a1un48 glm4.5-air superoffload_mem|unsloth s=48000 b=4 r=1 04:17
+CELL a1un48 superoffload_mem|unsloth s=48000 b=4 -> TRAINED 04:24
+START a1uo48 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=48000 b=8 r=1 04:24
+CELL a1uo48 superoffload_mem|unsloth-off-ohbm0 s=48000 b=8 -> COOM 04:27
+START a1uo48 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=48000 b=6 r=1 04:27
+CELL a1uo48 superoffload_mem|unsloth-off-ohbm0 s=48000 b=6 -> COOM 04:33
+START a1uo48 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=48000 b=4 r=1 04:34
+CELL a1uo48 superoffload_mem|unsloth-off-ohbm0 s=48000 b=4 -> TRAINED 04:45
+START a1t148 glm4.5-air asym_cpuadamwds|T1 s=48000 b=8 r=1 04:45
+CELL a1t148 asym_cpuadamwds|T1 s=48000 b=8 -> GOOM 04:56
+START a1t148 glm4.5-air asym_cpuadamwds|T1 s=48000 b=6 r=1 04:56
+CELL a1t148 asym_cpuadamwds|T1 s=48000 b=6 -> TRAINED 05:09
+RUNG-DONE a1 glm4.5-air s=48000 05:09
+START a1rc32 glm4.5-air superoffload_mem|recomp s=32000 b=12 r=1 05:09
+CELL a1rc32 superoffload_mem|recomp s=32000 b=12 -> GOOM 05:12
+START a1rc32 glm4.5-air superoffload_mem|recomp s=32000 b=8 r=1 05:12
+CELL a1rc32 superoffload_mem|recomp s=32000 b=8 -> GOOM 05:15
+START a1rc32 glm4.5-air superoffload_mem|recomp s=32000 b=6 r=1 05:15
+CELL a1rc32 superoffload_mem|recomp s=32000 b=6 -> GOOM 05:18
+START a1rc32 glm4.5-air superoffload_mem|recomp s=32000 b=4 r=1 05:18
+CELL a1rc32 superoffload_mem|recomp s=32000 b=4 -> TRAINED 05:24
+START a1un32 glm4.5-air superoffload_mem|unsloth s=32000 b=12 r=1 05:24
+CELL a1un32 superoffload_mem|unsloth s=32000 b=12 -> GOOM 05:27
+START a1un32 glm4.5-air superoffload_mem|unsloth s=32000 b=8 r=1 05:27
+CELL a1un32 superoffload_mem|unsloth s=32000 b=8 -> GOOM 05:30
+START a1un32 glm4.5-air superoffload_mem|unsloth s=32000 b=6 r=1 05:30
+CELL a1un32 superoffload_mem|unsloth s=32000 b=6 -> TRAINED 05:36
+START a1uo32 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=32000 b=12 r=1 05:36
+CELL a1uo32 superoffload_mem|unsloth-off-ohbm0 s=32000 b=12 -> COOM 05:39
+START a1uo32 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=32000 b=8 r=1 05:39
+CELL a1uo32 superoffload_mem|unsloth-off-ohbm0 s=32000 b=8 -> TRAINED 05:51
+START a1t132 glm4.5-air asym_cpuadamwds|T1 s=32000 b=12 r=1 05:51
+CELL a1t132 asym_cpuadamwds|T1 s=32000 b=12 -> GOOM 05:59
+START a1t132 glm4.5-air asym_cpuadamwds|T1 s=32000 b=8 r=1 05:59
+CELL a1t132 asym_cpuadamwds|T1 s=32000 b=8 -> TRAINED 06:09
+RUNG-DONE a1 glm4.5-air s=32000 06:09
+START a1rc16 glm4.5-air superoffload_mem|recomp s=16000 b=16 r=1 06:09
+CELL a1rc16 superoffload_mem|recomp s=16000 b=16 -> GOOM 06:12
+START a1rc16 glm4.5-air superoffload_mem|recomp s=16000 b=12 r=1 06:12
+CELL a1rc16 superoffload_mem|recomp s=16000 b=12 -> GOOM 06:15
+START a1rc16 glm4.5-air superoffload_mem|recomp s=16000 b=8 r=1 06:15
+CELL a1rc16 superoffload_mem|recomp s=16000 b=8 -> TRAINED 06:19
+START a1un16 glm4.5-air superoffload_mem|unsloth s=16000 b=16 r=1 06:19
+CELL a1un16 superoffload_mem|unsloth s=16000 b=16 -> GOOM 06:22
+START a1un16 glm4.5-air superoffload_mem|unsloth s=16000 b=12 r=1 06:22
+CELL a1un16 superoffload_mem|unsloth s=16000 b=12 -> TRAINED 06:28
+START a1uo16 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=16000 b=16 r=1 06:28
+CELL a1uo16 superoffload_mem|unsloth-off-ohbm0 s=16000 b=16 -> TRAINED 06:39
+START a1t116 glm4.5-air asym_cpuadamwds|T1 s=16000 b=16 r=1 06:39
+CELL a1t116 asym_cpuadamwds|T1 s=16000 b=16 -> TRAINED 06:51
+RUNG-DONE a1 glm4.5-air s=16000 06:51
+A1-DONE 06:51
+A2 begin 06:51
+START a2rc128 glm4.5-air superoffload_mem|recomp s=128000 b=3 r=2 06:51
+CELL a2rc128 superoffload_mem|recomp s=128000 b=3 -> FAIL 08:56
+A2B begin 08:58
+START a2b_rc128 glm4.5-air superoffload_mem|recomp s=128000 b=2 r=2 08:58
+CELL a2b_rc128 superoffload_mem|recomp s=128000 b=2 -> FAIL 09:28
+GUARD-REAPED orphan 2235191 gpu=0,1 09:31
+GUARD-REAPED orphan 2235190 gpu=0,1 09:31
+START a2b_un128 glm4.5-air superoffload_mem|unsloth s=128000 b=2 r=2 09:31
+CELL a2b_un128 superoffload_mem|unsloth s=128000 b=2 -> GOOM 09:35
+START a2b_un128 glm4.5-air superoffload_mem|unsloth s=128000 b=1 r=2 09:35
+CELL a2b_un128 superoffload_mem|unsloth s=128000 b=1 -> TRAINED 09:46
+START a2b_uo128 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=128000 b=2 r=2 09:46
+CELL a2b_uo128 superoffload_mem|unsloth-off-ohbm0 s=128000 b=2 -> COOM 09:50
+START a2b_uo128 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=128000 b=1 r=2 09:50
+CELL a2b_uo128 superoffload_mem|unsloth-off-ohbm0 s=128000 b=1 -> COOM 09:57
+START a2b_t1128 glm4.5-air asym_sdp2_cpuadamwds|T1 s=128000 b=3 r=2 09:57
+CELL a2b_t1128 asym_sdp2_cpuadamwds|T1 s=128000 b=3 -> FAIL 10:00
+START a2b_rc96 glm4.5-air superoffload_mem|recomp s=96000 b=2 r=2 10:00
+A2C begin 10:01
+START a2c_rc128 glm4.5-air superoffload_mem|recomp s=128000 b=1 r=2 10:01
+CELL a2c_rc128 superoffload_mem|recomp s=128000 b=1 -> TRAINED 10:12
+START a2c_t1128 glm4.5-air asym_sdp2_cpuadamwds|T1 s=128000 b=3 r=2 10:12
+CELL a2c_t1128 asym_sdp2_cpuadamwds|T1 s=128000 b=3 -> GOOM 10:20
+START a2c_t1128 glm4.5-air asym_sdp2_cpuadamwds|T1 s=128000 b=2 r=2 10:20
+CELL a2c_t1128 asym_sdp2_cpuadamwds|T1 s=128000 b=2 -> TRAINED 10:39
+START a2b_rc96 glm4.5-air superoffload_mem|recomp s=96000 b=2 r=2 10:39
+CELL a2b_rc96 superoffload_mem|recomp s=96000 b=2 -> GOOM 10:44
+START a2b_rc96 glm4.5-air superoffload_mem|recomp s=96000 b=1 r=2 10:44
+CELL a2b_rc96 superoffload_mem|recomp s=96000 b=1 -> TRAINED 10:52
+START a2b_un96 glm4.5-air superoffload_mem|unsloth s=96000 b=3 r=2 10:52
+CELL a2b_un96 superoffload_mem|unsloth s=96000 b=3 -> COOM 10:55
+START a2b_un96 glm4.5-air superoffload_mem|unsloth s=96000 b=2 r=2 10:55
+CELL a2b_un96 superoffload_mem|unsloth s=96000 b=2 -> COOM 11:01
+START a2b_uo96 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=96000 b=2 r=2 11:01
+CELL a2b_uo96 superoffload_mem|unsloth-off-ohbm0 s=96000 b=2 -> COOM 11:05
+START a2b_uo96 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=96000 b=1 r=2 11:05
+CELL a2b_uo96 superoffload_mem|unsloth-off-ohbm0 s=96000 b=1 -> COOM 11:09
+START a2b_t196 glm4.5-air asym_sdp2_cpuadamwds|T1 s=96000 b=4 r=2 11:09
+CELL a2b_t196 asym_sdp2_cpuadamwds|T1 s=96000 b=4 -> GOOM 11:17
+START a2b_t196 glm4.5-air asym_sdp2_cpuadamwds|T1 s=96000 b=3 r=2 11:17
+CELL a2b_t196 asym_sdp2_cpuadamwds|T1 s=96000 b=3 -> COOM 11:26
+START a2b_rc64 glm4.5-air superoffload_mem|recomp s=64000 b=3 r=2 11:26
+CELL a2b_rc64 superoffload_mem|recomp s=64000 b=3 -> GOOM 11:30
+START a2b_rc64 glm4.5-air superoffload_mem|recomp s=64000 b=2 r=2 11:30
+CELL a2b_rc64 superoffload_mem|recomp s=64000 b=2 -> TRAINED 11:38
+START a2b_un64 glm4.5-air superoffload_mem|unsloth s=64000 b=4 r=2 11:38
+CELL a2b_un64 superoffload_mem|unsloth s=64000 b=4 -> GOOM 11:43
+START a2b_un64 glm4.5-air superoffload_mem|unsloth s=64000 b=3 r=2 11:43
+CELL a2b_un64 superoffload_mem|unsloth s=64000 b=3 -> COOM 11:48
+START a2b_uo64 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=64000 b=4 r=2 11:48
+CELL a2b_uo64 superoffload_mem|unsloth-off-ohbm0 s=64000 b=4 -> COOM 11:52
+START a2b_uo64 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=64000 b=2 r=2 11:52
+CELL a2b_uo64 superoffload_mem|unsloth-off-ohbm0 s=64000 b=2 -> COOM 11:55
+START a2b_t164 glm4.5-air asym_sdp2_cpuadamwds|T1 s=64000 b=6 r=2 11:55
+CELL a2b_t164 asym_sdp2_cpuadamwds|T1 s=64000 b=6 -> GOOM 12:03
+START a2b_t164 glm4.5-air asym_sdp2_cpuadamwds|T1 s=64000 b=4 r=2 12:03
+CELL a2b_t164 asym_sdp2_cpuadamwds|T1 s=64000 b=4 -> TRAINED 12:16
+START a2b_rc48 glm4.5-air superoffload_mem|recomp s=48000 b=4 r=2 12:16
+CELL a2b_rc48 superoffload_mem|recomp s=48000 b=4 -> GOOM 12:20
+START a2b_rc48 glm4.5-air superoffload_mem|recomp s=48000 b=2 r=2 12:20
+CELL a2b_rc48 superoffload_mem|recomp s=48000 b=2 -> TRAINED 12:27
+START a2b_un48 glm4.5-air superoffload_mem|unsloth s=48000 b=6 r=2 12:27
+CELL a2b_un48 superoffload_mem|unsloth s=48000 b=6 -> COOM 12:30
+START a2b_un48 glm4.5-air superoffload_mem|unsloth s=48000 b=4 r=2 12:30
+CELL a2b_un48 superoffload_mem|unsloth s=48000 b=4 -> COOM 12:35
+START a2b_uo48 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=48000 b=4 r=2 12:35
+CELL a2b_uo48 superoffload_mem|unsloth-off-ohbm0 s=48000 b=4 -> COOM 12:39
+START a2b_uo48 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=48000 b=2 r=2 12:39
+CELL a2b_uo48 superoffload_mem|unsloth-off-ohbm0 s=48000 b=2 -> COOM 12:42
+START a2b_t148 glm4.5-air asym_sdp2_cpuadamwds|T1 s=48000 b=8 r=2 12:42
+CELL a2b_t148 asym_sdp2_cpuadamwds|T1 s=48000 b=8 -> GOOM 12:50
+START a2b_t148 glm4.5-air asym_sdp2_cpuadamwds|T1 s=48000 b=6 r=2 12:50
+CELL a2b_t148 asym_sdp2_cpuadamwds|T1 s=48000 b=6 -> COOM 12:58
+START a2b_rc32 glm4.5-air superoffload_mem|recomp s=32000 b=6 r=2 12:58
+CELL a2b_rc32 superoffload_mem|recomp s=32000 b=6 -> GOOM 13:02
+START a2b_rc32 glm4.5-air superoffload_mem|recomp s=32000 b=4 r=2 13:02
+CELL a2b_rc32 superoffload_mem|recomp s=32000 b=4 -> TRAINED 13:09
+START a2b_un32 glm4.5-air superoffload_mem|unsloth s=32000 b=8 r=2 13:09
+CELL a2b_un32 superoffload_mem|unsloth s=32000 b=8 -> GOOM 13:13
+START a2b_un32 glm4.5-air superoffload_mem|unsloth s=32000 b=6 r=2 13:13
+CELL a2b_un32 superoffload_mem|unsloth s=32000 b=6 -> COOM 13:18
+START a2b_uo32 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=32000 b=8 r=2 13:18
+CELL a2b_uo32 superoffload_mem|unsloth-off-ohbm0 s=32000 b=8 -> COOM 13:22
+START a2b_uo32 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=32000 b=4 r=2 13:22
+CELL a2b_uo32 superoffload_mem|unsloth-off-ohbm0 s=32000 b=4 -> COOM 13:25
+START a2b_t132 glm4.5-air asym_sdp2_cpuadamwds|T1 s=32000 b=12 r=2 13:25
+CELL a2b_t132 asym_sdp2_cpuadamwds|T1 s=32000 b=12 -> GOOM 13:32
+START a2b_t132 glm4.5-air asym_sdp2_cpuadamwds|T1 s=32000 b=8 r=2 13:32
+CELL a2b_t132 asym_sdp2_cpuadamwds|T1 s=32000 b=8 -> TRAINED 13:43
+START a2b_rc16 glm4.5-air superoffload_mem|recomp s=16000 b=12 r=2 13:43
+CELL a2b_rc16 superoffload_mem|recomp s=16000 b=12 -> GOOM 13:47
+START a2b_rc16 glm4.5-air superoffload_mem|recomp s=16000 b=8 r=2 13:47
+CELL a2b_rc16 superoffload_mem|recomp s=16000 b=8 -> TRAINED 13:54
+START a2b_un16 glm4.5-air superoffload_mem|unsloth s=16000 b=16 r=2 13:54
+CELL a2b_un16 superoffload_mem|unsloth s=16000 b=16 -> GOOM 13:58
+START a2b_un16 glm4.5-air superoffload_mem|unsloth s=16000 b=12 r=2 13:58
+CELL a2b_un16 superoffload_mem|unsloth s=16000 b=12 -> COOM 14:02
+START a2b_uo16 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=16000 b=16 r=2 14:02
+CELL a2b_uo16 superoffload_mem|unsloth-off-ohbm0 s=16000 b=16 -> COOM 14:06
+START a2b_uo16 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=16000 b=8 r=2 14:06
+CELL a2b_uo16 superoffload_mem|unsloth-off-ohbm0 s=16000 b=8 -> COOM 14:09
+START a2b_t116 glm4.5-air asym_sdp2_cpuadamwds|T1 s=16000 b=16 r=2 14:09
+CELL a2b_t116 asym_sdp2_cpuadamwds|T1 s=16000 b=16 -> TRAINED 14:19
+A2-DONE GLMTP-ALL-DONE 14:19
+FINAL-PATCH begin 14:20
+START fp_a1rc96 glm4.5-air superoffload_mem|recomp s=96000 b=1 r=1 14:20
+CELL fp_a1rc96 superoffload_mem|recomp s=96000 b=1 -> TRAINED 14:26
+START fp_a1rc48 glm4.5-air superoffload_mem|recomp s=48000 b=2 r=1 14:26
+CELL fp_a1rc48 superoffload_mem|recomp s=48000 b=2 -> TRAINED 14:31
+START fp_a2un96 glm4.5-air superoffload_mem|unsloth s=96000 b=1 r=2 14:31
+CELL fp_a2un96 superoffload_mem|unsloth s=96000 b=1 -> TRAINED 14:39
+START fp_a2t196 glm4.5-air asym_sdp2_cpuadamwds|T1 s=96000 b=2 r=2 14:39
+CELL fp_a2t196 asym_sdp2_cpuadamwds|T1 s=96000 b=2 -> TRAINED 14:51
+START fp_a2un64 glm4.5-air superoffload_mem|unsloth s=64000 b=2 r=2 14:51
+CELL fp_a2un64 superoffload_mem|unsloth s=64000 b=2 -> TRAINED 14:59
+START fp_a2uo64 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=64000 b=1 r=2 14:59
+CELL fp_a2uo64 superoffload_mem|unsloth-off-ohbm0 s=64000 b=1 -> TRAINED 15:09
+START fp_a2un48 glm4.5-air superoffload_mem|unsloth s=48000 b=2 r=2 15:09
+CELL fp_a2un48 superoffload_mem|unsloth s=48000 b=2 -> TRAINED 15:16
+START fp_a2uo48 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=48000 b=1 r=2 15:16
+CELL fp_a2uo48 superoffload_mem|unsloth-off-ohbm0 s=48000 b=1 -> COOM 15:20
+START fp_a2t148 glm4.5-air asym_sdp2_cpuadamwds|T1 s=48000 b=4 r=2 15:20
+CELL fp_a2t148 asym_sdp2_cpuadamwds|T1 s=48000 b=4 -> TRAINED 15:31
+START fp_a2un32 glm4.5-air superoffload_mem|unsloth s=32000 b=4 r=2 15:31
+CELL fp_a2un32 superoffload_mem|unsloth s=32000 b=4 -> TRAINED 15:38
+START fp_a2uo32 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=32000 b=2 r=2 15:38
+CELL fp_a2uo32 superoffload_mem|unsloth-off-ohbm0 s=32000 b=2 -> TRAINED 15:47
+START fp_a2un16 glm4.5-air superoffload_mem|unsloth s=16000 b=8 r=2 15:47
+CELL fp_a2un16 superoffload_mem|unsloth s=16000 b=8 -> TRAINED 15:54
+START fp_a2uo16 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=16000 b=8 r=2 15:54
+CELL fp_a2uo16 superoffload_mem|unsloth-off-ohbm0 s=16000 b=8 -> COOM 15:57
+START fp_a2uo16 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=16000 b=4 r=2 15:57
+CELL fp_a2uo16 superoffload_mem|unsloth-off-ohbm0 s=16000 b=4 -> COOM 16:02
+FINALPATCH-DONE EVERYTHING-MEASURED 16:02
+RETRY-ROUND begin 16:03
+START rt_uo48 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=48000 b=1 r=2 16:03
+CELL rt_uo48 superoffload_mem|unsloth-off-ohbm0 s=48000 b=1 -> COOM 16:07
+START rt_uo16 glm4.5-air superoffload_mem|unsloth-off-ohbm0 s=16000 b=4 r=2 16:07
+CELL rt_uo16 superoffload_mem|unsloth-off-ohbm0 s=16000 b=4 -> TRAINED 16:16
+RETRY-DONE TRULY-ALL-MEASURED 16:16
+MRG-VAL-QUEUE begin 14:28
+START mgv1r7 q3-30b-a3b asym_cpuadamwds|T2 s=120000 b=8 r=1 14:28
+MRG-VAL-QUEUE begin 14:33
+START mgv1r7 q3-30b-a3b asym_cpuadamwds|T2 s=120000 b=8 r=1 14:33
+CELL mgv1r7 asym_cpuadamwds|T2 s=120000 b=8 -> TRAINED 14:56
+MRG-V1-DONE 14:56
+START mgv2a45 glm4.5-air asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=3 r=1 14:56
+CELL mgv2a45 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=128000 b=3 -> TRAINED 15:29
+MRG-V2-DONE 15:29
+START mgv3f47 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 r=1 15:29
+CELL mgv3f47 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 -> TRAINED 16:43
+MRG-V3-DONE 16:43
+START mgv4q35 q3.5-35b-a3b asym_cpuadamwds|T2 s=896000 b=1 r=1 16:43
+CELL mgv4q35 asym_cpuadamwds|T2 s=896000 b=1 -> FAIL 16:43
+MRG-V4-DONE 16:43
+START mgv5r9 q3-30b-a3b asym_cpuadamwds|T2B s=1100000 b=1 r=1 16:43
+CELL mgv5r9 asym_cpuadamwds|T2B s=1100000 b=1 -> TRAINED 19:15
+MRG-V5-DONE 19:15
+MRG-VAL-QUEUE-DONE ALL-CELLS-COMPLETE 19:15
+START mgv4q35b q3.5-35b-a3b asym_cpuadamwds|T2 s=896000 b=1 r=1 19:16
+CELL mgv4q35b asym_cpuadamwds|T2 s=896000 b=1 -> FAIL 20:01
+MRG-V4REDO-DONE 20:01
+MRG-VAL2 begin 05:26
+START x1llt2 llama3.3-70b asym_cpuadamwds|T2 s=192000 b=2 r=1 05:26
+CELL x1llt2 asym_cpuadamwds|T2 s=192000 b=2 -> COOM 05:55
+MRG-X1-DONE 05:55
+START x2llwall llama3.3-70b asym_cpuadamwds|T2 s=448000 b=1 r=1 05:55
+START x1b llama3.3-70b asym_cpuadamwds|T2 s=192000 b=2 r=1 06:01
+CELL x1b asym_cpuadamwds|T2 s=192000 b=2 -> COOM 06:20
+X1B-RERUN-DONE 06:20
+START x1c llama3.3-70b asym_cpuadamwds|T2 s=192000 b=2 r=1 06:23
+MRG-VAL2 begin 06:34
+START x1d llama3.3-70b asym_cpuadamwds|T2 s=192000 b=2 r=1 06:34
+CELL x1d asym_cpuadamwds|T2 s=192000 b=2 -> TRAINED 07:16
+MRG-X1-DONE 07:16
+START x2d llama3.3-70b asym_cpuadamwds|T2 s=448000 b=1 r=1 07:16
+CELL x2d asym_cpuadamwds|T2 s=448000 b=1 -> TRAINED 08:44
+MRG-X2-DONE 08:44
+START x3f47t3 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 r=1 08:44
+CELL x3f47t3 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=192000 b=5 -> TRAINED 09:56
+MRG-X3-DONE 09:56
+START x4f47t1 glm4.7-flash asym_cpuadamwds|T1 s=192000 b=2 r=1 09:56
+CELL x4f47t1 asym_cpuadamwds|T1 s=192000 b=2 -> TRAINED 10:25
+MRG-X4-DONE 10:25
+START x5mxt2 mixtral-8x22b asym_cpuadamwds|T2 s=320000 b=1 r=1 10:25
+CELL x5mxt2 asym_cpuadamwds|T2 s=320000 b=1 -> TRAINED 10:57
+MRG-X5-DONE 10:57
+START x6mxt3 mixtral-8x22b asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=64000 b=2 r=1 10:57
+CELL x6mxt3 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=64000 b=2 -> TRAINED 11:13
+MRG-X6-DONE 11:13
+START x7q122 q3.5-122b-a10b asym_cpuadamwds|T2 s=448000 b=1 r=1 11:13
+CELL x7q122 asym_cpuadamwds|T2 s=448000 b=1 -> FAIL 11:48
+MRG-X7-DONE 11:48
+START x8q122 q3.5-122b-a10b asym_cpuadamwds|T2 s=480000 b=1 r=1 11:48
+CELL x8q122 asym_cpuadamwds|T2 s=480000 b=1 -> FAIL 12:25
+MRG-X8-DONE 12:25
+MRG-VAL2-DONE ALL-8-COMPLETE 12:25
+GLMEXT begin 23:13
+GLMEXT begin 23:18
+START x1rc256 glm4.7-flash superoffload_mem|recomp s=256000 b=2 r=1 23:18
+CELL x1rc256 superoffload_mem|recomp s=256000 b=2 -> GOOM 23:26
+START x1rc256 glm4.7-flash superoffload_mem|recomp s=256000 b=1 r=1 23:26
+CELL x1rc256 superoffload_mem|recomp s=256000 b=1 -> TRAINED 23:50
+START x1un256 glm4.7-flash superoffload_mem|unsloth s=256000 b=1 r=1 23:50
+CELL x1un256 superoffload_mem|unsloth s=256000 b=1 -> TRAINED 00:14
+START x1uo256 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=256000 b=2 r=1 00:14
+CELL x1uo256 superoffload_mem|unsloth-off-ohbm0 s=256000 b=2 -> TRAINED 01:02
+START x1fd256 glm4.7-flash fsdp2_offload|recomp s=256000 b=2 r=1 01:02
+CELL x1fd256 fsdp2_offload|recomp s=256000 b=2 -> GOOM 01:08
+START x1fd256 glm4.7-flash fsdp2_offload|recomp s=256000 b=1 r=1 01:08
+CELL x1fd256 fsdp2_offload|recomp s=256000 b=1 -> TRAINED 01:31
+START x1t1256 glm4.7-flash asym_cpuadamwds|T1 s=256000 b=2 r=1 01:31
+CELL x1t1256 asym_cpuadamwds|T1 s=256000 b=2 -> TRAINED 02:19
+EXT-RUNG-DONE x1 glm4.7-flash s=256000 02:19
+START x1rc320 glm4.7-flash superoffload_mem|recomp s=320000 b=1 r=1 02:19
+CELL x1rc320 superoffload_mem|recomp s=320000 b=1 -> TRAINED 02:56
+START x1un320 glm4.7-flash superoffload_mem|unsloth s=320000 b=1 r=1 02:56
+CELL x1un320 superoffload_mem|unsloth s=320000 b=1 -> TRAINED 03:32
+START x1uo320 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=320000 b=1 r=1 03:32
+CELL x1uo320 superoffload_mem|unsloth-off-ohbm0 s=320000 b=1 -> TRAINED 04:10
+START x1fd320 glm4.7-flash fsdp2_offload|recomp s=320000 b=1 r=1 04:10
+CELL x1fd320 fsdp2_offload|recomp s=320000 b=1 -> TRAINED 04:45
+START x1t1320 glm4.7-flash asym_cpuadamwds|T1 s=320000 b=2 r=1 04:45
+CELL x1t1320 asym_cpuadamwds|T1 s=320000 b=2 -> TRAINED 05:57
+EXT-RUNG-DONE x1 glm4.7-flash s=320000 05:57
+START x1rc384 glm4.7-flash superoffload_mem|recomp s=384000 b=1 r=1 05:57
+CELL x1rc384 superoffload_mem|recomp s=384000 b=1 -> GOOM 06:05
+START x1un384 glm4.7-flash superoffload_mem|unsloth s=384000 b=1 r=1 06:05
+CELL x1un384 superoffload_mem|unsloth s=384000 b=1 -> TRAINED 06:55
+START x1uo384 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=384000 b=1 r=1 06:55
+CELL x1uo384 superoffload_mem|unsloth-off-ohbm0 s=384000 b=1 -> TRAINED 07:48
+START x1fd384 glm4.7-flash fsdp2_offload|recomp s=384000 b=1 r=1 07:48
+CELL x1fd384 fsdp2_offload|recomp s=384000 b=1 -> TRAINED 08:38
+START x1t1384 glm4.7-flash asym_cpuadamwds|T1 s=384000 b=1 r=1 08:38
+CELL x1t1384 asym_cpuadamwds|T1 s=384000 b=1 -> TRAINED 09:31
+EXT-RUNG-DONE x1 glm4.7-flash s=384000 09:31
+START x1rc448 glm4.7-flash superoffload_mem|recomp s=448000 b=1 r=1 09:31
+CELL x1rc448 superoffload_mem|recomp s=448000 b=1 -> GOOM 09:41
+START x1un448 glm4.7-flash superoffload_mem|unsloth s=448000 b=1 r=1 09:41
+CELL x1un448 superoffload_mem|unsloth s=448000 b=1 -> TRAINED 10:48
+START x1uo448 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=448000 b=1 r=1 10:48
+CELL x1uo448 superoffload_mem|unsloth-off-ohbm0 s=448000 b=1 -> TRAINED 11:59
+START x1fd448 glm4.7-flash fsdp2_offload|recomp s=448000 b=1 r=1 11:59
+CELL x1fd448 fsdp2_offload|recomp s=448000 b=1 -> GOOM 12:07
+START x1t1448 glm4.7-flash asym_cpuadamwds|T1 s=448000 b=1 r=1 12:07
+CELL x1t1448 asym_cpuadamwds|T1 s=448000 b=1 -> TRAINED 13:17
+EXT-RUNG-DONE x1 glm4.7-flash s=448000 13:17
+X1-DONE 13:17
+START x2rc256 glm4.7-flash superoffload_mem|recomp s=256000 b=2 r=2 13:17
+CELL x2rc256 superoffload_mem|recomp s=256000 b=2 -> GOOM 13:23
+START x2rc256 glm4.7-flash superoffload_mem|recomp s=256000 b=1 r=2 13:23
+GLMEXT2 begin 13:42
+START x1eun192 glm4.7-flash superoffload_mem|unsloth s=192000 b=1 r=1 13:42
+GLM1R begin 13:43
+START x1eun192 glm4.7-flash superoffload_mem|unsloth s=192000 b=1 r=1 13:43
+CELL x1eun192 superoffload_mem|unsloth s=192000 b=1 -> TRAINED 13:58
+START x1eun512 glm4.7-flash superoffload_mem|unsloth s=512000 b=1 r=1 13:58
+CELL x1eun512 superoffload_mem|unsloth s=512000 b=1 -> TRAINED 15:27
+START x1eun576 glm4.7-flash superoffload_mem|unsloth s=576000 b=1 r=1 15:27
+CELL x1eun576 superoffload_mem|unsloth s=576000 b=1 -> TRAINED 17:18
+START x1eun640 glm4.7-flash superoffload_mem|unsloth s=640000 b=1 r=1 17:18
+CELL x1eun640 superoffload_mem|unsloth s=640000 b=1 -> GOOM 17:34
+WALL x1eun glm4.7-flash r1 s=640000 (GOOM) 17:34
+START x1euo512 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=512000 b=1 r=1 17:34
+CELL x1euo512 superoffload_mem|unsloth-off-ohbm0 s=512000 b=1 -> TRAINED 19:05
+START x1euo576 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=576000 b=1 r=1 19:05
+CELL x1euo576 superoffload_mem|unsloth-off-ohbm0 s=576000 b=1 -> TRAINED 20:59
+START x1euo640 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=640000 b=1 r=1 20:59
+CELL x1euo640 superoffload_mem|unsloth-off-ohbm0 s=640000 b=1 -> TRAINED 23:21
+START x1euo704 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=704000 b=1 r=1 23:21
+CELL x1euo704 superoffload_mem|unsloth-off-ohbm0 s=704000 b=1 -> TRAINED 02:11
+START x1euo768 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=768000 b=1 r=1 02:11
+CELL x1euo768 superoffload_mem|unsloth-off-ohbm0 s=768000 b=1 -> TRAINED 05:33
+START x1euo896 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=896000 b=1 r=1 05:33
+CELL x1euo896 superoffload_mem|unsloth-off-ohbm0 s=896000 b=1 -> TRAINED 10:04
+START x1et1512 glm4.7-flash asym_cpuadamwds|T1 s=512000 b=1 r=1 10:04
+GLM1RB begin 10:09
+START x1bt1640 glm4.7-flash asym_cpuadamwds|T1 s=640000 b=1 r=1 10:09
+CELL x1bt1640 asym_cpuadamwds|T1 s=640000 b=1 -> TRAINED 12:27
+START x1euo1024 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=1024000 b=1 r=1 12:27
+CELL x1euo1024 superoffload_mem|unsloth-off-ohbm0 s=1024000 b=1 -> TRAINED 18:16
+START x1euo1152 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=1152000 b=1 r=1 18:16
+CELL x1euo1152 superoffload_mem|unsloth-off-ohbm0 s=1152000 b=1 -> COOM 18:57
+WALL x1euo glm4.7-flash r1 s=1152000 (COOM) 18:57
+START x1bt21024 glm4.7-flash asym_cpuadamwds|T2 s=1024000 b=1 r=1 18:57
+CELL x1bt21024 asym_cpuadamwds|T2 s=1024000 b=1 -> TRAINED 00:49
+START x1bt21152 glm4.7-flash asym_cpuadamwds|T2 s=1152000 b=1 r=1 00:49
+CELL x1bt21152 asym_cpuadamwds|T2 s=1152000 b=1 -> GOOM 03:24
+START x1bt31152 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=1152000 b=1 r=1 03:24
+CELL x1bt31152 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=1152000 b=1 -> COOM 05:58
+WALL x1basym glm4.7-flash r1 s=1152000 05:58
+START x1bt21280 glm4.7-flash asym_cpuadamwds|T2 s=1280000 b=1 r=1 05:58
+CELL x1bt21280 asym_cpuadamwds|T2 s=1280000 b=1 -> GOOM 07:26
+START x1bt31280 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=1280000 b=1 r=1 07:26
+CELL x1bt31280 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=1280000 b=1 -> COOM 10:35
+WALL x1basym glm4.7-flash r1 s=1280000 10:35
+X1B-DONE FLASH-1R-CELLS-DONE 10:35
+GLM1RC begin (floor25 fairness pair) 10:42
+START x1cuo1152 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=1152000 b=1 r=1 10:42
+CELL x1cuo1152 superoffload_mem|unsloth-off-ohbm0 s=1152000 b=1 -> COOM 11:19
+START x1ct3o1152 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm4 s=1152000 b=1 r=1 11:19
+CELL x1ct3o1152 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm4 s=1152000 b=1 -> GOOM 11:59
+SOLO-1152 verdict: GOOM 11:59
+X1C-DONE 11:59
+GLM1RD begin (ohbm5) 12:01
+START x1dt3o1152 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm5 s=1152000 b=1 r=1 12:01
+CELL x1dt3o1152 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm5 s=1152000 b=1 -> GOOM 12:42
+SOLO-1152 verdict: GOOM 12:42
+X1D-DONE 12:42
+GLM1RE begin 12:45
+START x1euo1088 glm4.7-flash superoffload_mem|unsloth-off-ohbm0 s=1088000 b=1 r=1 12:45
+GLM1RE begin (ohbm6) 12:52
+CELL x1euo1088 superoffload_mem|unsloth-off-ohbm0 s=1088000 b=1 -> COOM 13:22
+E-UO-1088: COOM 13:22
+START x1et3r1088 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=1088000 b=1 r=1 13:22
+GLM1RE begin (ohbm6) 13:26
+GUARD-TIMEOUT gpu=0 14:26
+SOLO-1152 verdict:  14:26
+X1E2-DONE 14:26
+CELL x1et3r1088 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=1088000 b=1 -> COOM 16:38
+E-SOLO-1088: COOM 16:38
+X1E2-DONE 16:38
+GLM1RF begin 16:47
+START x1ft3o8_1088 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm8 s=1088000 b=1 r=1 16:47
+CELL x1ft3o8_1088 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm8 s=1088000 b=1 -> TRAINED 23:22
+F-SOLO-1088-ohbm8: TRAINED 23:22
+X1F-DONE 23:22
+GLM1RG begin (Option A) 23:30
+START x1gt3o8_1152 glm4.7-flash asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm8 s=1152000 b=1 r=1 23:30
+CELL x1gt3o8_1152 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm8 s=1152000 b=1 -> TRAINED 06:53
+OPTION-A-1152: TRAINED 06:53
+X1G-DONE 06:53
+JAMBA1R begin 21:14
+START j1rc32 jamba2-mini superoffload_mem|recomp s=32000 b=8 r=1 21:14
+CELL j1rc32 superoffload_mem|recomp s=32000 b=8 -> GOOM 21:17
+START j1rc32 jamba2-mini superoffload_mem|recomp s=32000 b=6 r=1 21:17
+CELL j1rc32 superoffload_mem|recomp s=32000 b=6 -> TRAINED 21:21
+START j1rc64 jamba2-mini superoffload_mem|recomp s=64000 b=4 r=1 21:21
+CELL j1rc64 superoffload_mem|recomp s=64000 b=4 -> GOOM 21:24
+START j1rc64 jamba2-mini superoffload_mem|recomp s=64000 b=3 r=1 21:24
+CELL j1rc64 superoffload_mem|recomp s=64000 b=3 -> TRAINED 21:28
+START j1rc128 jamba2-mini superoffload_mem|recomp s=128000 b=2 r=1 21:28
+CELL j1rc128 superoffload_mem|recomp s=128000 b=2 -> GOOM 21:31
+START j1rc128 jamba2-mini superoffload_mem|recomp s=128000 b=1 r=1 21:31
+CELL j1rc128 superoffload_mem|recomp s=128000 b=1 -> TRAINED 21:36
+START j1rc192 jamba2-mini superoffload_mem|recomp s=192000 b=1 r=1 21:36
+CELL j1rc192 superoffload_mem|recomp s=192000 b=1 -> TRAINED 21:41
+START j1rc256 jamba2-mini superoffload_mem|recomp s=256000 b=1 r=1 21:41
+CELL j1rc256 superoffload_mem|recomp s=256000 b=1 -> GOOM 21:45
+WALL j1rc s=256k (GOOM) 21:45
+START j1un32 jamba2-mini superoffload_mem|unsloth s=32000 b=8 r=1 21:45
+CELL j1un32 superoffload_mem|unsloth s=32000 b=8 -> TRAINED 21:49
+START j1un64 jamba2-mini superoffload_mem|unsloth s=64000 b=4 r=1 21:49
+CELL j1un64 superoffload_mem|unsloth s=64000 b=4 -> TRAINED 21:55
+START j1un128 jamba2-mini superoffload_mem|unsloth s=128000 b=2 r=1 21:55
+CELL j1un128 superoffload_mem|unsloth s=128000 b=2 -> TRAINED 22:00
+START j1un192 jamba2-mini superoffload_mem|unsloth s=192000 b=1 r=1 22:00
+CELL j1un192 superoffload_mem|unsloth s=192000 b=1 -> TRAINED 22:05
+START j1un256 jamba2-mini superoffload_mem|unsloth s=256000 b=1 r=1 22:05
+CELL j1un256 superoffload_mem|unsloth s=256000 b=1 -> TRAINED 22:11
+START j1un320 jamba2-mini superoffload_mem|unsloth s=320000 b=1 r=1 22:11
+CELL j1un320 superoffload_mem|unsloth s=320000 b=1 -> GOOM 22:15
+WALL j1un s=320k (GOOM) 22:15
+START j1uo32 jamba2-mini superoffload_mem|unsloth-off-ohbm0 s=32000 b=8 r=1 22:15
+CELL j1uo32 superoffload_mem|unsloth-off-ohbm0 s=32000 b=8 -> TRAINED 22:22
+START j1uo64 jamba2-mini superoffload_mem|unsloth-off-ohbm0 s=64000 b=4 r=1 22:22
+CELL j1uo64 superoffload_mem|unsloth-off-ohbm0 s=64000 b=4 -> TRAINED 22:30
+START j1uo128 jamba2-mini superoffload_mem|unsloth-off-ohbm0 s=128000 b=2 r=1 22:30
+CELL j1uo128 superoffload_mem|unsloth-off-ohbm0 s=128000 b=2 -> TRAINED 22:37
+START j1uo192 jamba2-mini superoffload_mem|unsloth-off-ohbm0 s=192000 b=1 r=1 22:37
+CELL j1uo192 superoffload_mem|unsloth-off-ohbm0 s=192000 b=1 -> TRAINED 22:44
+START j1uo256 jamba2-mini superoffload_mem|unsloth-off-ohbm0 s=256000 b=1 r=1 22:44
+CELL j1uo256 superoffload_mem|unsloth-off-ohbm0 s=256000 b=1 -> TRAINED 22:52
+START j1uo320 jamba2-mini superoffload_mem|unsloth-off-ohbm0 s=320000 b=1 r=1 22:52
+CELL j1uo320 superoffload_mem|unsloth-off-ohbm0 s=320000 b=1 -> TRAINED 23:03
+START j1uo384 jamba2-mini superoffload_mem|unsloth-off-ohbm0 s=384000 b=1 r=1 23:03
+CELL j1uo384 superoffload_mem|unsloth-off-ohbm0 s=384000 b=1 -> TRAINED 23:17
+START j1uo448 jamba2-mini superoffload_mem|unsloth-off-ohbm0 s=448000 b=1 r=1 23:17
+CELL j1uo448 superoffload_mem|unsloth-off-ohbm0 s=448000 b=1 -> FAIL 23:22
+WALL j1uo s=448k (FAIL) 23:22
+START j1t1_32 jamba2-mini asym_cpuadamwds|T1 s=32000 b=8 r=1 23:22
+CELL j1t1_32 asym_cpuadamwds|T1 s=32000 b=8 -> TRAINED 23:29
+START j1t1_64 jamba2-mini asym_cpuadamwds|T1 s=64000 b=4 r=1 23:29
+CELL j1t1_64 asym_cpuadamwds|T1 s=64000 b=4 -> TRAINED 23:36
+START j1t1_128 jamba2-mini asym_cpuadamwds|T1 s=128000 b=2 r=1 23:36
+CELL j1t1_128 asym_cpuadamwds|T1 s=128000 b=2 -> TRAINED 23:43
+START j1t1_192 jamba2-mini asym_cpuadamwds|T1 s=192000 b=1 r=1 23:43
+CELL j1t1_192 asym_cpuadamwds|T1 s=192000 b=1 -> TRAINED 23:49
+START j1t1_256 jamba2-mini asym_cpuadamwds|T1 s=256000 b=1 r=1 23:49
+CELL j1t1_256 asym_cpuadamwds|T1 s=256000 b=1 -> TRAINED 23:56
+START j1t1_320 jamba2-mini asym_cpuadamwds|T1 s=320000 b=1 r=1 23:56
+CELL j1t1_320 asym_cpuadamwds|T1 s=320000 b=1 -> GOOM 00:01
+START j1t2_320 jamba2-mini asym_cpuadamwds|T2 s=320000 b=1 r=1 00:01
+CELL j1t2_320 asym_cpuadamwds|T2 s=320000 b=1 -> FAIL 00:05
+START j1t2b_320 jamba2-mini asym_cpuadamwds|T2B s=320000 b=1 r=1 00:05
+CELL j1t2b_320 asym_cpuadamwds|T2B s=320000 b=1 -> FAIL 00:17
+START j1t3_320 jamba2-mini asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=320000 b=1 r=1 00:17
+CELL j1t3_320 asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=320000 b=1 -> FAIL 00:29
+WALL j1asym s=320k 00:29
+JAMBA1R-DONE 00:29
+JAMBA2R begin 02:11
+START j2rc32 jamba2-mini superoffload_mem|recomp s=32000 b=8 r=2 02:11
+CELL j2rc32 superoffload_mem|recomp s=32000 b=8 -> GOOM 02:14
+START j2rc32 jamba2-mini superoffload_mem|recomp s=32000 b=6 r=2 02:14
+CELL j2rc32 superoffload_mem|recomp s=32000 b=6 -> TRAINED 02:18
+START j2rc64 jamba2-mini superoffload_mem|recomp s=64000 b=4 r=2 02:18
+CELL j2rc64 superoffload_mem|recomp s=64000 b=4 -> GOOM 02:21
+START j2rc64 jamba2-mini superoffload_mem|recomp s=64000 b=3 r=2 02:21
+CELL j2rc64 superoffload_mem|recomp s=64000 b=3 -> TRAINED 02:26
+START j2rc128 jamba2-mini superoffload_mem|recomp s=128000 b=2 r=2 02:26
+CELL j2rc128 superoffload_mem|recomp s=128000 b=2 -> GOOM 02:29
+START j2rc128 jamba2-mini superoffload_mem|recomp s=128000 b=1 r=2 02:29
+CELL j2rc128 superoffload_mem|recomp s=128000 b=1 -> TRAINED 02:34
+START j2rc192 jamba2-mini superoffload_mem|recomp s=192000 b=1 r=2 02:34
+CELL j2rc192 superoffload_mem|recomp s=192000 b=1 -> TRAINED 02:39
+START j2rc256 jamba2-mini superoffload_mem|recomp s=256000 b=1 r=2 02:39
+CELL j2rc256 superoffload_mem|recomp s=256000 b=1 -> GOOM 02:43
+WALL j2rc s=256k (GOOM) 02:43
+START j2un32 jamba2-mini superoffload_mem|unsloth s=32000 b=8 r=2 02:43
+CELL j2un32 superoffload_mem|unsloth s=32000 b=8 -> TRAINED 02:48
+START j2un64 jamba2-mini superoffload_mem|unsloth s=64000 b=4 r=2 02:48
+CELL j2un64 superoffload_mem|unsloth s=64000 b=4 -> TRAINED 02:53
+START j2un128 jamba2-mini superoffload_mem|unsloth s=128000 b=2 r=2 02:53
+CELL j2un128 superoffload_mem|unsloth s=128000 b=2 -> TRAINED 02:59
+START j2un192 jamba2-mini superoffload_mem|unsloth s=192000 b=1 r=2 02:59
+CELL j2un192 superoffload_mem|unsloth s=192000 b=1 -> TRAINED 03:05
+START j2un256 jamba2-mini superoffload_mem|unsloth s=256000 b=1 r=2 03:05
+CELL j2un256 superoffload_mem|unsloth s=256000 b=1 -> TRAINED 03:11
+START j2un320 jamba2-mini superoffload_mem|unsloth s=320000 b=1 r=2 03:11
+CELL j2un320 superoffload_mem|unsloth s=320000 b=1 -> GOOM 03:15
+WALL j2un s=320k (GOOM) 03:15
+START j2uo32 jamba2-mini superoffload_mem|unsloth-off-ohbm0 s=32000 b=8 r=2 03:15
+CELL j2uo32 superoffload_mem|unsloth-off-ohbm0 s=32000 b=8 -> TRAINED 03:25
+START j2uo64 jamba2-mini superoffload_mem|unsloth-off-ohbm0 s=64000 b=4 r=2 03:25
+CELL j2uo64 superoffload_mem|unsloth-off-ohbm0 s=64000 b=4 -> TRAINED 03:36
+START j2uo128 jamba2-mini superoffload_mem|unsloth-off-ohbm0 s=128000 b=2 r=2 03:36
+CELL j2uo128 superoffload_mem|unsloth-off-ohbm0 s=128000 b=2 -> TRAINED 03:47
+START j2uo192 jamba2-mini superoffload_mem|unsloth-off-ohbm0 s=192000 b=1 r=2 03:47
+CELL j2uo192 superoffload_mem|unsloth-off-ohbm0 s=192000 b=1 -> TRAINED 03:56
+START j2uo256 jamba2-mini superoffload_mem|unsloth-off-ohbm0 s=256000 b=1 r=2 03:56
+CELL j2uo256 superoffload_mem|unsloth-off-ohbm0 s=256000 b=1 -> TRAINED 04:07
+START j2uo320 jamba2-mini superoffload_mem|unsloth-off-ohbm0 s=320000 b=1 r=2 04:07
+CELL j2uo320 superoffload_mem|unsloth-off-ohbm0 s=320000 b=1 -> COOM 04:10
+WALL j2uo s=320k (COOM) 04:10
+START j2t1_32 jamba2-mini asym_sdp2_cpuadamwds|T1 s=32000 b=8 r=2 04:10
+CELL j2t1_32 asym_sdp2_cpuadamwds|T1 s=32000 b=8 -> TRAINED 04:18
+START j2t1_64 jamba2-mini asym_sdp2_cpuadamwds|T1 s=64000 b=4 r=2 04:18
+CELL j2t1_64 asym_sdp2_cpuadamwds|T1 s=64000 b=4 -> TRAINED 04:26
+START j2t1_128 jamba2-mini asym_sdp2_cpuadamwds|T1 s=128000 b=2 r=2 04:26
+CELL j2t1_128 asym_sdp2_cpuadamwds|T1 s=128000 b=2 -> TRAINED 04:35
+START j2t1_192 jamba2-mini asym_sdp2_cpuadamwds|T1 s=192000 b=1 r=2 04:35
+CELL j2t1_192 asym_sdp2_cpuadamwds|T1 s=192000 b=1 -> TRAINED 04:41
+START j2t1_256 jamba2-mini asym_sdp2_cpuadamwds|T1 s=256000 b=1 r=2 04:41
+CELL j2t1_256 asym_sdp2_cpuadamwds|T1 s=256000 b=1 -> TRAINED 04:49
+START j2t1_320 jamba2-mini asym_sdp2_cpuadamwds|T1 s=320000 b=1 r=2 04:49
+CELL j2t1_320 asym_sdp2_cpuadamwds|T1 s=320000 b=1 -> GOOM 04:54
+START j2t2b_320 jamba2-mini asym_sdp2_cpuadamwds|T2B s=320000 b=1 r=2 04:54
+CELL j2t2b_320 asym_sdp2_cpuadamwds|T2B s=320000 b=1 -> COOM 04:58
+START j2t3_320 jamba2-mini asym_sdp2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=320000 b=1 r=2 04:58
+CELL j2t3_320 asym_sdp2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=320000 b=1 -> COOM 05:03
+WALL j2asym s=320k 05:03
+JAMBA2R-DONE 05:03
+START g120smk gpt-oss-120b asym_cpuadamwds|T1 s=32000 b=1 r=1 04:09
+CELL g120smk asym_cpuadamwds|T1 s=32000 b=1 -> FAIL 04:10
+START g120smk gpt-oss-120b asym_cpuadamwds|T1 s=32000 b=1 r=1 04:10
+CELL g120smk asym_cpuadamwds|T1 s=32000 b=1 -> TRAINED 04:17
+START g120rc32 gpt-oss-120b superoffload_mem|recomp s=32000 b=2 r=1 04:17
+CELL g120rc32 superoffload_mem|recomp s=32000 b=2 -> TRAINED 04:20
+START g120rc64 gpt-oss-120b superoffload_mem|recomp s=64000 b=2 r=1 04:20
+CELL g120rc64 superoffload_mem|recomp s=64000 b=2 -> TRAINED 04:25
+START g120rc128 gpt-oss-120b superoffload_mem|recomp s=128000 b=1 r=1 04:25
+CELL g120rc128 superoffload_mem|recomp s=128000 b=1 -> TRAINED 04:29
+START g120rc192 gpt-oss-120b superoffload_mem|recomp s=192000 b=1 r=1 04:29
+CELL g120rc192 superoffload_mem|recomp s=192000 b=1 -> TRAINED 04:36
+START g120rc256 gpt-oss-120b superoffload_mem|recomp s=256000 b=1 r=1 04:36
+CELL g120rc256 superoffload_mem|recomp s=256000 b=1 -> TRAINED 04:44
+START g120rc320 gpt-oss-120b superoffload_mem|recomp s=320000 b=1 r=1 04:44
+CELL g120rc320 superoffload_mem|recomp s=320000 b=1 -> TRAINED 04:54
+START g120rc384 gpt-oss-120b superoffload_mem|recomp s=384000 b=1 r=1 04:54
+CELL g120rc384 superoffload_mem|recomp s=384000 b=1 -> GOOM 05:00
+START g120un32 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=32000 b=2 r=1 05:00
+CELL g120un32 superoffload_mem|unsloth-ohbm0 s=32000 b=2 -> TRAINED 05:03
+START g120un64 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=64000 b=2 r=1 05:03
+CELL g120un64 superoffload_mem|unsloth-ohbm0 s=64000 b=2 -> TRAINED 05:07
+START g120un128 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=128000 b=1 r=1 05:07
+CELL g120un128 superoffload_mem|unsloth-ohbm0 s=128000 b=1 -> TRAINED 05:11
+START g120un192 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=192000 b=1 r=1 05:11
+CELL g120un192 superoffload_mem|unsloth-ohbm0 s=192000 b=1 -> TRAINED 05:16
+START g120un256 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=256000 b=1 r=1 05:16
+CELL g120un256 superoffload_mem|unsloth-ohbm0 s=256000 b=1 -> TRAINED 05:24
+START g120un320 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=320000 b=1 r=1 05:24
+CELL g120un320 superoffload_mem|unsloth-ohbm0 s=320000 b=1 -> TRAINED 05:33
+START g120un384 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=384000 b=1 r=1 05:33
+CELL g120un384 superoffload_mem|unsloth-ohbm0 s=384000 b=1 -> TRAINED 05:44
+START g120un448 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=448000 b=1 r=1 05:44
+CELL g120un448 superoffload_mem|unsloth-ohbm0 s=448000 b=1 -> TRAINED 05:59
+START g120un512 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=512000 b=1 r=1 05:59
+CELL g120un512 superoffload_mem|unsloth-ohbm0 s=512000 b=1 -> TRAINED 06:17
+START g120un640 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=640000 b=1 r=1 06:17
+CELL g120un640 superoffload_mem|unsloth-ohbm0 s=640000 b=1 -> GOOM 06:26
+START g120uo32 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=32000 b=2 r=1 06:26
+CELL g120uo32 superoffload_mem|unsloth-off-ohbm0 s=32000 b=2 -> TRAINED 06:30
+START g120uo64 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=64000 b=2 r=1 06:30
+CELL g120uo64 superoffload_mem|unsloth-off-ohbm0 s=64000 b=2 -> TRAINED 06:35
+START g120uo128 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=128000 b=1 r=1 06:35
+CELL g120uo128 superoffload_mem|unsloth-off-ohbm0 s=128000 b=1 -> TRAINED 06:41
+START g120uo192 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=192000 b=1 r=1 06:41
+CELL g120uo192 superoffload_mem|unsloth-off-ohbm0 s=192000 b=1 -> TRAINED 06:48
+START g120uo256 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=256000 b=1 r=1 06:48
+CELL g120uo256 superoffload_mem|unsloth-off-ohbm0 s=256000 b=1 -> TRAINED 06:58
+START g120uo320 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=320000 b=1 r=1 06:58
+CELL g120uo320 superoffload_mem|unsloth-off-ohbm0 s=320000 b=1 -> TRAINED 07:10
+START g120uo384 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=384000 b=1 r=1 07:10
+CELL g120uo384 superoffload_mem|unsloth-off-ohbm0 s=384000 b=1 -> TRAINED 07:25
+START g120uo448 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=448000 b=1 r=1 07:25
+CELL g120uo448 superoffload_mem|unsloth-off-ohbm0 s=448000 b=1 -> TRAINED 07:42
+START g120uo512 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=512000 b=1 r=1 07:42
+CELL g120uo512 superoffload_mem|unsloth-off-ohbm0 s=512000 b=1 -> TRAINED 08:03
+START g120uo640 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=640000 b=1 r=1 08:03
+CELL g120uo640 superoffload_mem|unsloth-off-ohbm0 s=640000 b=1 -> TRAINED 08:31
+START g120uo768 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=768000 b=1 r=1 08:31
+CELL g120uo768 superoffload_mem|unsloth-off-ohbm0 s=768000 b=1 -> GOOM 08:39
+START g120a32 gpt-oss-120b asym_cpuadamwds|T1 s=32000 b=2 r=1 08:39
+CELL g120a32 asym_cpuadamwds|T1 s=32000 b=2 -> TRAINED 08:46
+START g120a64 gpt-oss-120b asym_cpuadamwds|T1 s=64000 b=2 r=1 08:46
+CELL g120a64 asym_cpuadamwds|T1 s=64000 b=2 -> TRAINED 08:54
+START g120a128 gpt-oss-120b asym_cpuadamwds|T1 s=128000 b=1 r=1 08:54
+CELL g120a128 asym_cpuadamwds|T1 s=128000 b=1 -> TRAINED 09:02
+START g120a192 gpt-oss-120b asym_cpuadamwds|T1 s=192000 b=1 r=1 09:02
+CELL g120a192 asym_cpuadamwds|T1 s=192000 b=1 -> TRAINED 09:12
+START g120a256 gpt-oss-120b asym_cpuadamwds|T1 s=256000 b=1 r=1 09:12
+CELL g120a256 asym_cpuadamwds|T1 s=256000 b=1 -> TRAINED 09:23
+START g120a320 gpt-oss-120b asym_cpuadamwds|T1 s=320000 b=1 r=1 09:23
+CELL g120a320 asym_cpuadamwds|T1 s=320000 b=1 -> TRAINED 09:36
+START g120a384 gpt-oss-120b asym_cpuadamwds|T1 s=384000 b=1 r=1 09:36
+CELL g120a384 asym_cpuadamwds|T1 s=384000 b=1 -> TRAINED 09:51
+START g120a448 gpt-oss-120b asym_cpuadamwds|T1 s=448000 b=1 r=1 09:51
+CELL g120a448 asym_cpuadamwds|T1 s=448000 b=1 -> TRAINED 10:08
+START g120a512 gpt-oss-120b asym_cpuadamwds|T1 s=512000 b=1 r=1 10:08
+CELL g120a512 asym_cpuadamwds|T1 s=512000 b=1 -> TRAINED 10:28
+START g120a640 gpt-oss-120b asym_cpuadamwds|T1 s=640000 b=1 r=1 10:28
+CELL g120a640 asym_cpuadamwds|T1 s=640000 b=1 -> TRAINED 10:54
+START g120a768 gpt-oss-120b asym_cpuadamwds|T1 s=768000 b=1 r=1 10:54
+CELL g120a768 asym_cpuadamwds|T1 s=768000 b=1 -> TRAINED 11:29
+START g120a896 gpt-oss-120b asym_cpuadamwds|T1 s=896000 b=1 r=1 11:29
+CELL g120a896 asym_cpuadamwds|T1 s=896000 b=1 -> TRAINED 12:14
+START g120a1020 gpt-oss-120b asym_cpuadamwds|T1 s=1020000 b=1 r=1 12:15
+CELL g120a1020 asym_cpuadamwds|T1 s=1020000 b=1 -> TRAINED 13:11
+START g120a1150 gpt-oss-120b asym_cpuadamwds|T1 s=1150000 b=1 r=1 13:11
+CELL g120a1150 asym_cpuadamwds|T1 s=1150000 b=1 -> TRAINED 14:20
+START g120a1280 gpt-oss-120b asym_cpuadamwds|T1 s=1280000 b=1 r=1 14:20
+CELL g120a1280 asym_cpuadamwds|T1 s=1280000 b=1 -> TRAINED 15:44
+START g120a1410 gpt-oss-120b asym_cpuadamwds|T1 s=1410000 b=1 r=1 15:44
+CELL g120a1410 asym_cpuadamwds|T1 s=1410000 b=1 -> GOOM 16:06
+START g120a1410b gpt-oss-120b asym_cpuadamwds|T2B s=1410000 b=1 r=1 16:06
+CELL g120a1410b asym_cpuadamwds|T2B s=1410000 b=1 -> COOM 16:57
+START g120a1410c gpt-oss-120b asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=1410000 b=1 r=1 16:57
+CELL g120a1410c asym_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=1410000 b=1 -> COOM 18:27
+START g220smk gpt-oss-120b asym_sepplanlink2_cpuadamwds|T1 s=32000 b=1 r=2 18:28
+START g220smk gpt-oss-120b asym_sepplanlink2_cpuadamwds|T1 s=32000 b=1 r=2 18:29
+CELL g220smk asym_sepplanlink2_cpuadamwds|T1 s=32000 b=1 -> TRAINED 18:37
+GUARD-SHM-CLEAN asym_fabric_48315.done asym_fabric_48315.manifest.json cuda.shm.0.13c989.1  18:37
+START g220rc32 gpt-oss-120b superoffload_mem|recomp s=32000 b=2 r=2 18:37
+CELL g220rc32 superoffload_mem|recomp s=32000 b=2 -> TRAINED 18:40
+START g220rc64 gpt-oss-120b superoffload_mem|recomp s=64000 b=2 r=2 18:40
+CELL g220rc64 superoffload_mem|recomp s=64000 b=2 -> TRAINED 18:43
+START g220rc128 gpt-oss-120b superoffload_mem|recomp s=128000 b=1 r=2 18:43
+CELL g220rc128 superoffload_mem|recomp s=128000 b=1 -> TRAINED 18:47
+START g220rc192 gpt-oss-120b superoffload_mem|recomp s=192000 b=1 r=2 18:47
+CELL g220rc192 superoffload_mem|recomp s=192000 b=1 -> TRAINED 18:52
+START g220rc256 gpt-oss-120b superoffload_mem|recomp s=256000 b=1 r=2 18:52
+CELL g220rc256 superoffload_mem|recomp s=256000 b=1 -> TRAINED 18:59
+START g220rc320 gpt-oss-120b superoffload_mem|recomp s=320000 b=1 r=2 18:59
+CELL g220rc320 superoffload_mem|recomp s=320000 b=1 -> TRAINED 19:08
+START g220rc384 gpt-oss-120b superoffload_mem|recomp s=384000 b=1 r=2 19:08
+CELL g220rc384 superoffload_mem|recomp s=384000 b=1 -> GOOM 19:12
+GUARD-REAPED orphan 572585 gpu=0,1 19:15
+START g220un32 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=32000 b=2 r=2 19:15
+CELL g220un32 superoffload_mem|unsloth-ohbm0 s=32000 b=2 -> FAIL 19:18
+START g220uo32 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=32000 b=2 r=2 19:18
+START g220un32 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=32000 b=2 r=2 19:19
+START g220uo64 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=64000 b=2 r=2 19:19
+CELL g220un32 superoffload_mem|unsloth-ohbm0 s=32000 b=2 -> TRAINED 19:23
+START g220un64 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=64000 b=2 r=2 19:26
+CELL g220uo64 superoffload_mem|unsloth-off-ohbm0 s=64000 b=2 -> TRAINED 19:26
+START g220uo128 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=128000 b=1 r=2 19:26
+CELL g220un64 superoffload_mem|unsloth-ohbm0 s=64000 b=2 -> TRAINED 19:30
+START g220un128 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=128000 b=1 r=2 19:33
+CELL g220uo128 superoffload_mem|unsloth-off-ohbm0 s=128000 b=1 -> TRAINED 19:33
+START g220uo192 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=192000 b=1 r=2 19:33
+START g220un32 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=32000 b=2 r=2 19:35
+CELL g220un32 superoffload_mem|unsloth-ohbm0 s=32000 b=2 -> TRAINED 19:38
+START g220un64 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=64000 b=2 r=2 19:38
+CELL g220un64 superoffload_mem|unsloth-ohbm0 s=64000 b=2 -> TRAINED 19:41
+START g220un128 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=128000 b=1 r=2 19:41
+CELL g220un128 superoffload_mem|unsloth-ohbm0 s=128000 b=1 -> TRAINED 19:45
+START g220un192 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=192000 b=1 r=2 19:45
+CELL g220un192 superoffload_mem|unsloth-ohbm0 s=192000 b=1 -> TRAINED 19:51
+START g220un256 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=256000 b=1 r=2 19:51
+CELL g220un256 superoffload_mem|unsloth-ohbm0 s=256000 b=1 -> TRAINED 19:58
+START g220un320 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=320000 b=1 r=2 19:58
+CELL g220un320 superoffload_mem|unsloth-ohbm0 s=320000 b=1 -> TRAINED 20:07
+START g220un384 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=384000 b=1 r=2 20:07
+CELL g220un384 superoffload_mem|unsloth-ohbm0 s=384000 b=1 -> TRAINED 20:18
+START g220un448 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=448000 b=1 r=2 20:18
+CELL g220un448 superoffload_mem|unsloth-ohbm0 s=448000 b=1 -> TRAINED 20:31
+START g220un512 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=512000 b=1 r=2 20:31
+CELL g220un512 superoffload_mem|unsloth-ohbm0 s=512000 b=1 -> TRAINED 20:48
+START g220un640 gpt-oss-120b superoffload_mem|unsloth-ohbm0 s=640000 b=1 r=2 20:48
+CELL g220un640 superoffload_mem|unsloth-ohbm0 s=640000 b=1 -> GOOM 20:54
+GUARD-REAPED orphan 1144197 gpu=0,1 20:57
+GUARD-REAPED orphan 1144198 gpu=0,1 20:57
+START g220uo32 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=32000 b=2 r=2 20:57
+CELL g220uo32 superoffload_mem|unsloth-off-ohbm0 s=32000 b=2 -> TRAINED 21:01
+START g220uo64 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=64000 b=2 r=2 21:01
+CELL g220uo64 superoffload_mem|unsloth-off-ohbm0 s=64000 b=2 -> TRAINED 21:07
+START g220uo128 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=128000 b=1 r=2 21:07
+CELL g220uo128 superoffload_mem|unsloth-off-ohbm0 s=128000 b=1 -> TRAINED 21:14
+START g220uo192 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=192000 b=1 r=2 21:14
+CELL g220uo192 superoffload_mem|unsloth-off-ohbm0 s=192000 b=1 -> TRAINED 21:23
+START g220uo256 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=256000 b=1 r=2 21:23
+CELL g220uo256 superoffload_mem|unsloth-off-ohbm0 s=256000 b=1 -> TRAINED 21:35
+START g220uo320 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=320000 b=1 r=2 21:35
+CELL g220uo320 superoffload_mem|unsloth-off-ohbm0 s=320000 b=1 -> TRAINED 21:50
+START g220uo384 gpt-oss-120b superoffload_mem|unsloth-off-ohbm0 s=384000 b=1 r=2 21:50
+CELL g220uo384 superoffload_mem|unsloth-off-ohbm0 s=384000 b=1 -> COOM 21:55
+START g220a32 gpt-oss-120b asym_sepplanlink2_cpuadamwds|T1 s=32000 b=2 r=2 21:55
+CELL g220a32 asym_sepplanlink2_cpuadamwds|T1 s=32000 b=2 -> TRAINED 22:03
+GUARD-SHM-CLEAN asym_fabric_36285.done asym_fabric_36285.manifest.json cuda.shm.0.13c989.1  22:03
+START g220a64 gpt-oss-120b asym_sepplanlink2_cpuadamwds|T1 s=64000 b=2 r=2 22:03
+CELL g220a64 asym_sepplanlink2_cpuadamwds|T1 s=64000 b=2 -> TRAINED 22:12
+GUARD-SHM-CLEAN asym_fabric_39089.done asym_fabric_39089.manifest.json cuda.shm.0.13c989.1  22:12
+START g220a128 gpt-oss-120b asym_sepplanlink2_cpuadamwds|T1 s=128000 b=1 r=2 22:12
+CELL g220a128 asym_sepplanlink2_cpuadamwds|T1 s=128000 b=1 -> TRAINED 22:22
+GUARD-SHM-CLEAN asym_fabric_33727.done asym_fabric_33727.manifest.json cuda.shm.0.13c989.1  22:22
+START g220a192 gpt-oss-120b asym_sepplanlink2_cpuadamwds|T1 s=192000 b=1 r=2 22:22
+CELL g220a192 asym_sepplanlink2_cpuadamwds|T1 s=192000 b=1 -> TRAINED 22:32
+GUARD-SHM-CLEAN asym_fabric_42953.done asym_fabric_42953.manifest.json cuda.shm.0.13c989.1  22:32
+START g220a256 gpt-oss-120b asym_sepplanlink2_cpuadamwds|T1 s=256000 b=1 r=2 22:32
+CELL g220a256 asym_sepplanlink2_cpuadamwds|T1 s=256000 b=1 -> TRAINED 22:44
+GUARD-SHM-CLEAN asym_fabric_58699.done asym_fabric_58699.manifest.json cuda.shm.0.13c989.1  22:44
+START g220a320 gpt-oss-120b asym_sepplanlink2_cpuadamwds|T1 s=320000 b=1 r=2 22:44
+CELL g220a320 asym_sepplanlink2_cpuadamwds|T1 s=320000 b=1 -> TRAINED 22:58
+GUARD-SHM-CLEAN asym_fabric_32951.done asym_fabric_32951.manifest.json cuda.shm.0.13c989.1  22:58
+START g220a384 gpt-oss-120b asym_sepplanlink2_cpuadamwds|T1 s=384000 b=1 r=2 22:58
+CELL g220a384 asym_sepplanlink2_cpuadamwds|T1 s=384000 b=1 -> COOM 23:07
+GUARD-SHM-CLEAN asym_fabric_59505 asym_fabric_59505.done asym_fabric_59505.manifest.json  23:07
+START g220a384b gpt-oss-120b asym_sepplanlink2_cpuadamwds|T2B s=384000 b=1 r=2 23:07
+CELL g220a384b asym_sepplanlink2_cpuadamwds|T2B s=384000 b=1 -> COOM 23:13
+GUARD-SHM-CLEAN asym_fabric_49665 asym_fabric_49665.done asym_fabric_49665.manifest.json  23:13
+START g220a384c gpt-oss-120b asym_sepplanlink2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=384000 b=1 r=2 23:13
+CELL g220a384c asym_sepplanlink2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=384000 b=1 -> COOM 23:20
+START g2ga384 gpt-oss-120b asym_sepplanlink2_cpuadamwds|T1 s=384000 b=1 r=2 23:20
+CELL g2ga384 asym_sepplanlink2_cpuadamwds|T1 s=384000 b=1 -> COOM 23:29
+GUARD-SHM-CLEAN asym_fabric_38045 asym_fabric_38045.done asym_fabric_38045.manifest.json  23:29
+START g2ga384b gpt-oss-120b asym_sepplanlink2_cpuadamwds|T2B s=384000 b=1 r=2 23:29
+CELL g2ga384b asym_sepplanlink2_cpuadamwds|T2B s=384000 b=1 -> COOM 23:35
+GUARD-SHM-CLEAN asym_fabric_46797 asym_fabric_46797.done asym_fabric_46797.manifest.json  23:35
+START g2ga384c gpt-oss-120b asym_sepplanlink2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=384000 b=1 r=2 23:35
+CELL g2ga384c asym_sepplanlink2_cpuadamwds|recomp-off-full-fg-ker000-ceil0000-ohbm0 s=384000 b=1 -> COOM 23:41
+START g2ha384 gpt-oss-120b asym_sepplanlink2_cpuadamwds|unsloth-ohbm4 s=384000 b=1 r=2 23:41
+CELL g2ha384 asym_sepplanlink2_cpuadamwds|unsloth-ohbm4 s=384000 b=1 -> TRAINED 23:58
+GUARD-SHM-CLEAN asym_fabric_59613.done asym_fabric_59613.manifest.json cuda.shm.0.13c989.1  23:58
+START g2ha448 gpt-oss-120b asym_sepplanlink2_cpuadamwds|unsloth-ohbm4 s=448000 b=1 r=2 23:58
+CELL g2ha448 asym_sepplanlink2_cpuadamwds|unsloth-ohbm4 s=448000 b=1 -> TRAINED 00:17
+GUARD-SHM-CLEAN asym_fabric_38233.done asym_fabric_38233.manifest.json cuda.shm.0.13c989.1  00:17
+START g2ha512 gpt-oss-120b asym_sepplanlink2_cpuadamwds|unsloth-ohbm4 s=512000 b=1 r=2 00:17
+CELL g2ha512 asym_sepplanlink2_cpuadamwds|unsloth-ohbm4 s=512000 b=1 -> TRAINED 00:38
+GUARD-SHM-CLEAN asym_fabric_51069.done asym_fabric_51069.manifest.json cuda.shm.0.13c989.1  00:38
+START g2ha640 gpt-oss-120b asym_sepplanlink2_cpuadamwds|unsloth-ohbm4 s=640000 b=1 r=2 00:38
+CELL g2ha640 asym_sepplanlink2_cpuadamwds|unsloth-ohbm4 s=640000 b=1 -> TRAINED 01:07
+GUARD-SHM-CLEAN asym_fabric_58127.done asym_fabric_58127.manifest.json cuda.shm.0.13c989.1  01:07
+START g2ha768 gpt-oss-120b asym_sepplanlink2_cpuadamwds|unsloth-ohbm4 s=768000 b=1 r=2 01:07
+CELL g2ha768 asym_sepplanlink2_cpuadamwds|unsloth-ohbm4 s=768000 b=1 -> COOM 01:16
+START g2ia768 gpt-oss-120b asym_sepplanlink2_cpuadamwds|unsloth-ohbm2 s=768000 b=1 r=2 01:16
+CELL g2ia768 asym_sepplanlink2_cpuadamwds|unsloth-ohbm2 s=768000 b=1 -> COOM 01:32

@@ -1,0 +1,202 @@
+#!/bin/bash
+# stdtps96_lib.sh — c18 / SFT-46 lane (Session D) of the GH200-96GB simulated
+# TP campaign (agent/impls/s04-p1-dgx-02-c06/standardize_tps_96gb.md).
+# Derived from stdtps46_lib.sh; deltas: (1) simulated pair = GPU 0 (socket 0)
+# + GPU 2 (socket 1) — 2r cells run on "0,2", 1r cells on ONE_RANK_GPU
+# (default 0); (2) the HBM occupier (hbm96_occupy.py) holds each sim GPU at
+# 97,871 MiB free — guard whitelists the occupier PIDs, preflights free ~=
+# 95-96 GiB, and every run verifies the occupiers SURVIVED (else the cell is
+# INVALID); (3) harvest reports resv as % of 95.6 GiB. Host side unchanged
+# (membind 0,1 launcher defaults; 2x450 = 900 GB budget is an honesty flag,
+# not a mechanism — harvest prints RSS for the flag).
+cd /workspace/AsymGEMM-SFT-46/third_party/AsymGEMM || exit 1
+export PROFILERS=source MAX_STEPS=2 WARMUP_STEPS=1 MAX_SAMPLES=512 DATASET_OVERWRITE=false OVERWRITE=false
+export ASYM_ZERO_ROUTER_JITTER=1 TRUST_REMOTE_CODE=false
+export HF_HOME=/scratch_local/user_data/shutian/kevin/cache/huggingface
+# The shared HF token (env/bashrc.sh + cache/huggingface/token) is EXPIRED
+# (2026-08-21): any hub call with it 401s (hunyuan tokenizer template list
+# -> instant FAIL). All campaign models are public — run anonymously.
+export HF_HUB_DISABLE_IMPLICIT_TOKEN=1 HF_TOKEN=""
+# One-GPU-per-socket pair (0,2) is the 96G doc's MANDATE (each rank gets its
+# own socket/450G pool, mirroring a GH200 node); the driver's same-superchip
+# guard predates it — its escape hatch is the sanctioned path here.
+export ALLOW_CROSS_SUPERCHIP=1
+export HOSTFLOOR=${HOSTFLOOR:-1300}
+export RUN_TIMEOUT=${RUN_TIMEOUT:-10800}
+LOGD=/workspace/AsymGEMM-SFT-46/third_party/AsymGEMM/agent/anchors_tmp
+S="$LOGD/stdtps96_status.log"
+B=profiling_results/profiling/asym_long_sft_smoke__lora__lf__bf16
+NODE=c18
+SIM_GPUS="0,2"                      # one GPU per socket (topo -m verified)
+HBM96_MIB=97871                     # simulated visible HBM per GPU
+
+_occ_pidfile() { echo "$LOGD/stdtps96_occupier_gpu$1.pid"; }
+_occ_pids() { local g; for g in ${SIM_GPUS//,/ }; do [ -f "$(_occ_pidfile $g)" ] && { cat "$(_occ_pidfile $g)"; echo; }; done; }   # newline per pid — pidfiles have no trailing \n
+
+occupiers_alive() { local g p ok=0
+  for g in ${SIM_GPUS//,/ }; do
+    p=$(cat "$(_occ_pidfile $g)" 2>/dev/null)
+    [ -n "$p" ] && [ -d "/proc/$p" ] || { echo "OCCUPIER-DEAD gpu$g pid=${p:-none} $(date +%H:%M)" >> "$S"; ok=1; }
+  done; return $ok; }
+
+# start_occupiers — idempotent; launches one occupier per sim GPU and waits
+# until each GPU's free is within 1500 MiB of the 96G target.
+start_occupiers() { local g p free i
+  for g in ${SIM_GPUS//,/ }; do
+    p=$(cat "$(_occ_pidfile $g)" 2>/dev/null)
+    if [ -n "$p" ] && [ -d "/proc/$p" ]; then echo "occupier gpu$g alive (pid $p)" >> "$S"; continue; fi
+    rm -f "$(_occ_pidfile $g)"
+    ( export CUDA_VISIBLE_DEVICES="$g"
+      nohup .venv/bin/python agent/anchors_tmp/hbm96_occupy.py --pidfile "$(_occ_pidfile $g)" \
+        >> "$LOGD/stdtps96_occupier_gpu$g.log" 2>&1 & )
+    for i in $(seq 1 30); do [ -s "$(_occ_pidfile $g)" ] && break; sleep 2; done
+    echo "OCCUPIER-START gpu$g pid=$(cat "$(_occ_pidfile $g)" 2>/dev/null) $(date +%H:%M)" >> "$S"
+  done
+  for i in $(seq 1 30); do
+    ok=1
+    for g in ${SIM_GPUS//,/ }; do
+      free=$(nvidia-smi -i "$g" --query-gpu=memory.free --format=csv,noheader,nounits)
+      [ "$free" -ge $((HBM96_MIB-1500)) ] && [ "$free" -le $((HBM96_MIB+1500)) ] || ok=0
+    done
+    [ "$ok" = 1 ] && { echo "OCCUPIERS-VERIFIED free~96G on GPUs $SIM_GPUS $(date +%H:%M)" >> "$S"; return 0; }
+    sleep 2
+  done
+  echo "OCCUPIER-VERIFY-FAILED $(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader | tr '\n' ' ') $(date +%H:%M)" >> "$S"
+  return 1
+}
+
+# _gpu_pids GPUS — compute pids on those GPUs EXCLUDING the occupiers
+_gpu_pids() { local occ; occ=" $(_occ_pids | tr '\n' ' ') "
+  local p; for p in $(nvidia-smi -i "$1" --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' ,' | grep -E '^[0-9]+$'); do
+    case "$occ" in *" $p "*) ;; *) echo "$p" ;; esac
+  done; }
+
+guard() { local gpus="$1" i n a p pp used
+  for i in $(seq 1 180); do
+    occupiers_alive || start_occupiers || return 1
+    n=0; for p in $(_gpu_pids "$gpus"); do [ -d "/proc/$p" ] && n=$((n+1)); done
+    if [ "$n" -eq 0 ] && ls /dev/shm/asym_* >/dev/null 2>&1; then
+      echo "GUARD-SHM-CLEAN $(date +%H:%M)" >> "$S"; rm -f /dev/shm/asym_* 2>/dev/null || true
+    fi
+    used=$(df -BG /dev/shm | awk 'NR==2{gsub("G","",$3); print $3}')
+    a=$(free -g | awk 'NR==2{print $7}')
+    if [ "$n" -eq 0 ] && [ "$a" -ge "$HOSTFLOOR" ] && [ "${used:-0}" -lt 5 ]; then return 0; fi
+    if [ $((i % 9)) -eq 0 ]; then
+      echo "GUARD-WAIT gpus=$gpus procs=$n avail=${a}G shm=${used}G $(date +%H:%M)" >> "$S"
+      for p in $(_gpu_pids "$gpus"); do
+        pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d " ")
+        [ "$pp" = "1" ] && kill -9 "$p" 2>/dev/null && echo "GUARD-REAPED orphan $p gpus=$gpus $(date +%H:%M)" >> "$S"
+      done
+    fi
+    sleep 20
+  done; echo "GUARD-TIMEOUT gpus=$gpus $(date +%H:%M)" >> "$S"; return 1; }
+
+cell_trained() { local dtag="$1" tsv="$B/$1/jobs.tsv" ss nm tl
+  [ -f "$tsv" ] && awk -F'\t' 'NR>1 && $1=="ok"{f=1} END{exit !f}' "$tsv" && return 0
+  ss=$(find "$B/$dtag" -name step_samples.csv 2>/dev/null | head -1); [ -n "$ss" ] || return 1
+  nm=$(.venv/bin/python - "$ss" <<'PY' 2>/dev/null
+import csv, sys
+n = 0
+for r in csv.DictReader(open(sys.argv[1])):
+    if r.get("is_warmup", "").lower() in ("true", "1"): continue
+    try:
+        if float(r.get("step_milliseconds") or 0) > 0 and r.get("loss") not in (None, ""): n += 1
+    except ValueError: pass
+print(n)
+PY
+)
+  [ "${nm:-0}" -ge "${MAX_STEPS:-2}" ] || return 1
+  tl="$(dirname "$ss")/train.log"; grep -aq "train_runtime" "$tl" 2>/dev/null || return 1
+  return 0
+}
+
+verdict() { local dtag="$1" log="$2"
+  if cell_trained "$dtag"; then echo TRAINED; return; fi
+  grep -aqE "OutOfMemoryError|CUDA out of memory|ncclUnhandledCudaError" "$log" 2>/dev/null && { echo GOOM; return; }
+  grep -aqE "dropped below floor|HOST-C-OOM|host memory watchdog" "$log" 2>/dev/null && { echo COOM; return; }
+  grep -aqE "collective operation timeout|NCCL watchdog|Watchdog caught collective" "$log" 2>/dev/null && { echo NCCL; return; }
+  grep -aq "RUN-TIMEOUT" "$log" 2>/dev/null && { echo TIMEOUT; return; }
+  echo FAIL
+}
+
+# harvest RUNDIR_TAG RANKS -> eff/resv(% of 95.6G)/rss-per-proc + TOTAL rss (900G flag basis)
+harvest() { local dtag="$1" ranks="$2"
+  .venv/bin/python - "$B/$dtag" "$ranks" <<'PY' 2>/dev/null
+import csv, glob, json, os, re, sys
+root, ranks = sys.argv[1], int(sys.argv[2])
+HBM = 97871 * 2**20
+out = []
+for ss in glob.glob(f"{root}/**/step_samples.csv", recursive=True):
+    rd = os.path.dirname(ss)
+    m = re.match(r"b(\d+)_s(\d+)_ga(\d+)", os.path.basename(rd))
+    if not m: continue
+    b, s, ga = map(int, m.groups())
+    rows = list(csv.DictReader(open(ss)))
+    meas = [float(r["step_milliseconds"]) for r in rows
+            if r.get("is_warmup", "").lower() not in ("true", "1") and float(r.get("step_milliseconds") or 0) > 0]
+    if not meas: continue
+    eff = ranks * len(meas) * b * s * ga / (sum(meas) / 1000.0)
+    resv = rss = 0.0
+    pj = os.path.join(rd, "profile.json")
+    if os.path.exists(pj):
+        try:
+            mem = json.load(open(pj)).get("memory", {})
+            resv = mem.get("peak_reserved_hbm_bytes", 0)
+            rss = mem.get("process", {}).get("rss_peak_bytes", 0) / 2**30
+        except Exception: pass
+    steps = ",".join(f"{float(r['step_milliseconds'])/1000:.1f}" for r in rows)
+    tot = rss * ranks
+    flag = " HOST>900G!" if tot > 900 else ""
+    out.append(f"eff={eff:.0f} resv={resv/2**30:.1f}GiB({resv/HBM*100:.0f}%of96G) rss={rss:.0f}GiB/proc totRSS={tot:.0f}G{flag} steps={steps} nmeas={len(meas)}")
+print(" | ".join(out) if out else "no-step-samples")
+PY
+}
+
+_reap_gpus() { local gpus="$1" p
+  for p in $(_gpu_pids "$gpus"); do kill -TERM "$p" 2>/dev/null; done; sleep 20
+  for p in $(_gpu_pids "$gpus"); do kill -9 "$p" 2>/dev/null && echo "REAPED pid $p after timeout $(date +%H:%M)" >> "$S"; done
+}
+
+# run_cell TAG MODEL SYSTOKEN SEQ "B1 B2 ..." [POLICY] [RANKS]
+#   96G semantics: 2r on SIM_GPUS; 1r on ONE_RANK_GPU (default first sim GPU).
+#   After every live run the occupiers must still be alive, else the attempt
+#   is INVALID (budget was open) and is retried ONCE after restarting them.
+run_cell() { local tag="$1" model="$2" systok="$3" seq="$4" blist="$5" policy="${6:-none|false|false|false|false|false}" ranks="${7:-1}" v=SKIP b gpus log n dtag dmodel rc retried
+  if [ "$ranks" = "2" ]; then gpus="$SIM_GPUS"; else gpus="${ONE_RANK_GPU:-${SIM_GPUS%%,*}}"; fi
+  dmodel=${model//./_}
+  for b in $blist; do
+    retried=0
+    dtag="${tag}-${NODE}_${dmodel}__b${b}_s${seq}_ga1_drop000"
+    if cell_trained "$dtag"; then
+      echo "CELL $tag $systok s=$seq b=$b r=$ranks -> TRAINED (already banked: $(harvest "$dtag" "$ranks")) $(date +%H:%M)" >> "$S"; v=TRAINED; break
+    fi
+    while :; do
+      guard "$gpus" || return 1
+      rm -f /dev/shm/asym_* 2>/dev/null || true
+      n=1; while [ -e "$LOGD/r_${tag}_b${b}.try${n}.log" ]; do n=$((n+1)); done
+      log="$LOGD/r_${tag}_b${b}.try${n}.log"
+      echo "START $tag $model $systok s=$seq b=$b r=$ranks gpus=$gpus arm='${ARM_ENV:-}' $(date +%H:%M)" >> "$S"
+      ( set -a; for kv in ${ARM_ENV:-}; do export "$kv"; done; set +a
+        export CUDA_VISIBLE_DEVICES="$gpus" GPU_POOL="$gpus" DDP_TIMEOUT="${DDP_TIMEOUT:-1500}"
+        RUN_NAME="${tag}-${NODE}_${model}" RUNS="${model}|${ranks} ; ${systok}|ligerloss1 ; ${seq}|${b}|1 ; ${policy}" \
+          timeout -k 60 "$RUN_TIMEOUT" bash scripts/lf/profile_lora_lf_test_source.sh ) > "$log" 2>&1
+      rc=$?
+      if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then echo "RUN-TIMEOUT rc=$rc" >> "$log"; _reap_gpus "$gpus"; fi
+      if ! occupiers_alive; then
+        echo "CELL $tag s=$seq b=$b -> INVALID (occupier died during run; budget open) $(date +%H:%M)" >> "$S"
+        _reap_gpus "$gpus"; start_occupiers || return 1
+        [ "$retried" = 0 ] && { retried=1; continue; }
+        v=FAIL; break
+      fi
+      v=$(verdict "$dtag" "$log")
+      if [ "$v" = "TRAINED" ]; then
+        echo "CELL $tag $systok s=$seq b=$b r=$ranks -> TRAINED $(harvest "$dtag" "$ranks") $(date +%H:%M)" >> "$S"
+      else
+        echo "CELL $tag $systok s=$seq b=$b r=$ranks -> $v (rc=$rc; log $(basename "$log")) $(date +%H:%M)" >> "$S"
+      fi
+      break
+    done
+    [ "$v" = "TRAINED" ] && break
+    [ "$v" = "FAIL" ] && break
+    [ "$v" = "TIMEOUT" ] && break
+  done; echo "$v"; }

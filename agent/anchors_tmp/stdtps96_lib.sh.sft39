@@ -1,0 +1,104 @@
+#!/bin/bash
+# stdtps96_lib.sh — c11 run library for the GH200-96GB simulation campaign
+# (standardize_tps_96gb.md). Same protocol as stdtps_lib.sh with the
+# OCCUPIER-AWARE guard: HBM occupier PIDs (agent/anchors_tmp/
+# stdtps96_occupier.pids) are whitelisted — never counted, never reaped.
+# Env expected: GPU (inside-container index or "0,1"), HOSTFLOOR.
+cd /workspace/AsymGEMM-SFT-39/third_party/AsymGEMM
+export PROFILERS=source MAX_STEPS=2 WARMUP_STEPS=1 MAX_SAMPLES=512 DATASET_OVERWRITE=false OVERWRITE=false
+export ASYM_ZERO_ROUTER_JITTER=1 TRUST_REMOTE_CODE=false
+export HF_HOME=/scratch_local/user_data/shutian/kevin/cache/huggingface
+export CUDA_VISIBLE_DEVICES=${GPU:?}
+LOGD=/workspace/AsymGEMM-SFT-39/third_party/AsymGEMM/agent/anchors_tmp
+S="$LOGD/stdtps96_status.log"
+B=profiling_results/profiling/asym_long_sft_smoke__lora__lf__bf16
+OCCF="$LOGD/stdtps96_occupier.pids"
+
+_occ_pids() { tr -s ' \n' '  ' < "$OCCF" 2>/dev/null; }
+
+# non-occupier compute apps on $GPU
+_napps() { local n=0 p occ=" $(_occ_pids) "
+  for p in $(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do
+    p=${p//,/}
+    case "$occ" in *" $p "*) continue;; esac
+    [ -d "/proc/$p" ] && n=$((n+1))
+  done; echo $n; }
+
+# occupiers alive check (both PIDs in the file must be live)
+occ_alive() { local p ok=1
+  for p in $(_occ_pids); do [ -d "/proc/$p" ] || ok=0; done
+  [ -n "$(_occ_pids)" ] && [ "$ok" = "1" ]; }
+
+guard() { for i in $(seq 1 180); do
+    occ_alive || { echo "GUARD-OCCUPIER-DEAD gpu=$GPU $(date +%H:%M)" >> "$S"; return 1; }
+    n=$(_napps)
+    # stale fabric/arena shm from dead runs poisons host-available AND verdicts
+    # (hy campaign lesson; the 04:0x 410G leak here) — clean when no live run.
+    if [ "$n" -eq 0 ] && ls /dev/shm/asym_* >/dev/null 2>&1; then
+      rm -rf /dev/shm/asym_* 2>/dev/null || true
+      echo "GUARD-SHM-CLEAN $(date +%H:%M)" >> "$S"
+    fi
+    a=$(free -g | awk 'NR==2{print $7}')
+    if [ "$n" -eq 0 ] && [ "$a" -ge "${HOSTFLOOR:?}" ]; then return 0; fi
+    if [ $((i % 9)) -eq 0 ]; then
+      local occ=" $(_occ_pids) "
+      for p in $(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do
+        p=${p//,/}
+        case "$occ" in *" $p "*) continue;; esac   # NEVER reap an occupier
+        pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d " ")
+        if [ "$pp" = "1" ]; then
+          # TERMINATION LADDER (Kevin 2026-08-21: NEVER lead with -9):
+          # INT first (KeyboardInterrupt -> full python unwind, torch/NCCL
+          # destructors), then TERM (launcher-orchestrated shutdown), then
+          # -9 only if both were ignored — hard teardown of NVLink-mapped
+          # pinned memory is the suspected driver-wedge class.
+          kill -INT "$p" 2>/dev/null
+          for w in 1 2; do sleep 5; [ -d "/proc/$p" ] || break; done
+          if [ -d "/proc/$p" ]; then
+            kill -TERM "$p" 2>/dev/null
+            for w in 1 2 3; do sleep 5; [ -d "/proc/$p" ] || break; done
+          fi
+          if [ -d "/proc/$p" ]; then
+            kill -9 "$p" 2>/dev/null
+            echo "GUARD-REAPED orphan $p gpu=$GPU (INT+TERM ignored -> KILL) $(date +%H:%M)" >> "$S"
+          else
+            echo "GUARD-REAPED orphan $p gpu=$GPU (clean INT/TERM) $(date +%H:%M)" >> "$S"
+          fi
+        fi
+      done
+    fi
+    sleep 20
+  done; echo "GUARD-TIMEOUT gpu=$GPU $(date +%H:%M)" >> "$S"; return 1; }
+
+shm_guard() { local used
+  for i in $(seq 1 30); do
+    used=$(df -BG /dev/shm | awk 'NR==2{gsub("G","",$3); print $3}')
+    [ "${used:-0}" -lt 5 ] && return 0
+    rm -rf /dev/shm/asym_* 2>/dev/null || true
+    sleep 10
+  done
+  echo "STDTPS96 shm_guard timeout used=${used}G $(date +%H:%M)" >> "$S"; }
+
+verdict() { local dtag="$1" log="$2"
+  local tsv="$B/${dtag}/jobs.tsv"
+  grep -aqE "OutOfMemoryError|CUDA out of memory" "$log" 2>/dev/null && { echo GOOM; return; }
+  grep -aq "dropped below floor" "$log" 2>/dev/null && { echo COOM; return; }
+  if [ -f "$tsv" ] && awk -F'\t' 'NR>1 && $1=="ok"{f=1} END{exit !f}' "$tsv"; then echo TRAINED; return; fi
+  echo FAIL
+}
+
+# run_cell TAG MODEL SYSTOKEN SEQ "B1 B2 ..." [POLICY] [RANKS]
+run_cell() { local tag="$1" model="$2" systok="$3" seq="$4" blist="$5" policy="${6:-none|false|false|false|false|false}" ranks="${7:-1}" v=SKIP b
+  for b in $blist; do
+    guard || return 1
+    echo "START $tag $model $systok s=$seq b=$b r=$ranks $(date +%H:%M)" >> "$S"
+    RUN_NAME="${tag}-g96${ASYM_HOSTTAG:-${HOSTNAME##*-}}_${model}" RUNS="${model}|${ranks} ; ${systok}|ligerloss1 ; ${seq}|${b}|1 ; ${policy}" \
+      bash scripts/lf/profile_lora_lf_test_source.sh >> "$LOGD/r_${tag}_b${b}.log" 2>&1
+    local dmodel=${model//./_}
+    v=$(verdict "${tag}-g96${ASYM_HOSTTAG:-${HOSTNAME##*-}}_${dmodel}__b${b}_s${seq}_ga1_drop000" "$LOGD/r_${tag}_b${b}.log")
+    # budget audit: occupiers must have been alive through the cell
+    occ_alive || { echo "CELL $tag INVALID (occupier died) $(date +%H:%M)" >> "$S"; v=FAIL; }
+    echo "CELL $tag $systok s=$seq b=$b -> $v $(date +%H:%M)" >> "$S"
+    [ "$v" = "TRAINED" ] && break
+    [ "$v" = "FAIL" ] && break
+  done; echo "$v"; }
