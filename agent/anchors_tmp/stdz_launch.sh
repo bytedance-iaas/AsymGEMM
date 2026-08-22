@@ -17,4 +17,11 @@ exec enroot start --rw --root \
   --mount=/home/kevinni/env:/workspace/env \
   --mount=/scratch_local/user_data/shutian/kevin/cache:/scratch_local/user_data/shutian/kevin/cache \
   --env NVIDIA_VISIBLE_DEVICES="$GPUS" --env CUDA_VISIBLE_DEVICES="$INSIDE" \
+  ${OCC_PIDS:+--env OCC_PIDS="$OCC_PIDS"} \
+  ${AIR_RESUME_CAP:+--env AIR_RESUME_CAP="$AIR_RESUME_CAP"} \
+  ${AIR_RESUME_S:+--env AIR_RESUME_S="$AIR_RESUME_S"} \
+  ${AIR_LADDER:+--env AIR_LADDER="$AIR_LADDER"} \
+  ${AIR_DONE:+--env AIR_DONE="$AIR_DONE"} \
+  ${FL_RESUME_LO:+--env FL_RESUME_LO="$FL_RESUME_LO"} \
+  ${FL_LADDER:+--env FL_LADDER="$FL_LADDER"} \
   asym_sft_40 /bin/bash "/workspace/AsymGEMM-SFT/third_party/AsymGEMM/$SCRIPT"

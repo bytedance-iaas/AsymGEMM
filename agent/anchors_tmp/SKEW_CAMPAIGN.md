@@ -354,3 +354,12 @@ chat template; capture = pre-hook on `experts` modules (actual selected indices)
   (~2-4h/cell). Node was fully clear (xiaoning squatter gone). Watcher armed
   (bracket-pattern pgrep — no self-match this time). On completion: append
   rows+savings to skewness_results_40.md => campaign's model ladder complete.
+- [08-21] 122B 1M RETRY FAILED AGAIN: all 4 cells OOM even on 4-GPU shard
+  (caps 140/140/165/165; failing alloc 7.63G — activation peak + 234G weights
+  don't coexist at 1M b=1). Options for the 122B row, pending Kevin + node:
+  (a) dedicated memory-debug pass (uneven caps favoring the peak-layer GPU,
+  activation-checkpoint-style hooks); (b) 512k fallback row (disclosed);
+  (c) leave 122B at 16k rows only. Node handed back to peer campaign
+  (asymgemm-c8, GH200-sim TP figures, multi-day). NOTE: peer quoted PIDs
+  2916850/2916851 as ours — they are sglang::scheduler_TP0/TP1 (a third
+  party's serving job); corrected the peer, killed nothing.
