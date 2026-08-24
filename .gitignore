@@ -69,3 +69,4 @@ Makefile
 # Benchmark result logs
 sglang_*.jsonl
 *.bak*
+agent/archive/recovered-sessions/
